@@ -21,11 +21,11 @@ COMMON_CFLAGS := \
 
 ifeq ($(ARCH),x86)
 TARGET := x86_64-elf
-ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel
-ARCH_LDFLAGS := -m elf_x86_64
+ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
 ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S
-ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c
+ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c
 else ifeq ($(ARCH),aarch64)
 TARGET := aarch64-elf
 ARCH_CFLAGS := --target=$(TARGET)
@@ -52,6 +52,9 @@ KERNEL_SOURCES := \
 			kernel/fs/initramfs.c \
 			kernel/fs/vfs.c \
 			kernel/dev/virtio_blk.c \
+			kernel/dev/ps2_kbd.c \
+			kernel/dev/compositor.c \
+			kernel/dev/virtio_gpu.c \
 			kernel/net/net.c \
 		kernel/user/process.c \
 		kernel/user/programs.c \

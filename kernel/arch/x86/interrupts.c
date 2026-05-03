@@ -90,6 +90,7 @@ extern void isr29(void);
 extern void isr30(void);
 extern void isr31(void);
 extern void isr32(void);
+extern void isr33(void);
 
 static volatile u64 timer_ticks;
 
@@ -162,6 +163,7 @@ void x86_idt_init(void)
 		idt_set_gate(i, handlers[i]);
 	}
 	idt_set_gate(32, isr32);
+	idt_set_gate(33, isr33);
 
 	struct idt_pointer pointer = {
 		.limit = sizeof(idt) - 1,
@@ -193,7 +195,7 @@ void x86_pic_init(void)
 	outb(PIC2_DATA, 0x01);
 	io_wait();
 
-	outb(PIC1_DATA, 0xfe);
+	outb(PIC1_DATA, 0xfc); // Unmask IRQ0 and IRQ1
 	outb(PIC2_DATA, 0xff);
 }
 
@@ -208,12 +210,20 @@ void x86_timer_init(void)
 	console_write("timer: pit 100hz initialized\n");
 }
 
+extern void ps2_kbd_interrupt_handler(void);
+
 void x86_irq_handler(struct interrupt_frame *frame)
 {
 	if (frame->vector == 32) {
 		timer_ticks++;
 		outb(PIC1_COMMAND, PIC_EOI);
 		scheduler_on_timer_tick();
+		return;
+	}
+
+	if (frame->vector == 33) {
+		ps2_kbd_interrupt_handler();
+		outb(PIC1_COMMAND, PIC_EOI);
 		return;
 	}
 

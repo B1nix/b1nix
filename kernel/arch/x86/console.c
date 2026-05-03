@@ -1,4 +1,7 @@
+#include <string.h>
+#include <tinyunix/bootinfo.h>
 #include <tinyunix/console.h>
+#include <tinyunix/io.h>
 #include <tinyunix/serial.h>
 
 #define VGA_WIDTH 80
@@ -8,6 +11,10 @@
 static usize cursor_row;
 static usize cursor_col;
 static u8 current_color = 0x0f;
+
+extern void fb_console_init(void);
+extern void fb_console_write(const char *str);
+extern void fb_console_putchar(char c);
 
 static u16 vga_entry(char ch)
 {
@@ -61,6 +68,9 @@ void console_putc(char ch)
 	if (ch == '\n') {
 		serial_putc(ch);
 		console_newline();
+		if (bootinfo_get()->has_framebuffer) {
+			fb_console_putchar(ch);
+		}
 		return;
 	}
 
@@ -70,6 +80,10 @@ void console_putc(char ch)
 
 	if (cursor_col >= VGA_WIDTH) {
 		console_newline();
+	}
+
+	if (bootinfo_get()->has_framebuffer) {
+		fb_console_putchar(ch);
 	}
 }
 

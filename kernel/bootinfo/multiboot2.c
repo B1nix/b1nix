@@ -5,6 +5,7 @@
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 #define MULTIBOOT2_TAG_TYPE_END 0
 #define MULTIBOOT2_TAG_TYPE_MMAP 6
+#define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER 8
 
 struct multiboot2_info {
 	u32 total_size;
@@ -28,6 +29,18 @@ struct multiboot2_mmap_entry {
 	u64 len;
 	u32 type;
 	u32 zero;
+} __attribute__((packed));
+
+struct multiboot2_framebuffer_tag {
+	u32 type;
+	u32 size;
+	u64 addr;
+	u32 pitch;
+	u32 width;
+	u32 height;
+	u8 bpp;
+	u8 framebuffer_type;
+	u16 reserved;
 } __attribute__((packed));
 
 static struct boot_info current_boot_info;
@@ -81,6 +94,17 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_MMAP) {
 			parse_mmap_tag((const struct multiboot2_mmap_tag *)tag);
+		}
+
+		if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER) {
+			const struct multiboot2_framebuffer_tag *fb = (const struct multiboot2_framebuffer_tag *)tag;
+			current_boot_info.framebuffer.address = fb->addr;
+			current_boot_info.framebuffer.pitch = fb->pitch;
+			current_boot_info.framebuffer.width = fb->width;
+			current_boot_info.framebuffer.height = fb->height;
+			current_boot_info.framebuffer.bpp = fb->bpp;
+			current_boot_info.framebuffer.type = fb->framebuffer_type;
+			current_boot_info.has_framebuffer = 1;
 		}
 
 		cursor = align_up(cursor + tag->size, 8);

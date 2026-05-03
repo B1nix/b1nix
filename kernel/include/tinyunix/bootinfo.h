@@ -19,9 +19,20 @@ struct boot_memory_region {
 	u32 type;
 };
 
+struct boot_framebuffer {
+	u64 address;
+	u32 pitch;
+	u32 width;
+	u32 height;
+	u8 bpp;
+	u8 type;
+};
+
 struct boot_info {
 	struct boot_memory_region memory_regions[BOOTINFO_MAX_MEMORY_REGIONS];
 	usize memory_region_count;
+	struct boot_framebuffer framebuffer;
+	int has_framebuffer;
 };
 
 void bootinfo_init_from_multiboot2(u32 magic, u32 info_address);

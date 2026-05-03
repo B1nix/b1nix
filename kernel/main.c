@@ -10,6 +10,11 @@
 #include <tinyunix/user.h>
 #include <tinyunix/vfs.h>
 
+extern void ps2_kbd_init(void);
+extern void compositor_init(void);
+extern void virtio_gpu_init(void);
+extern void fb_console_init(void);
+
 void kernel_main(u32 multiboot_magic, u32 multiboot_info)
 {
 	serial_init();
@@ -52,12 +57,20 @@ void kernel_main(u32 multiboot_magic, u32 multiboot_info)
 	console_write_hex64(mapped_frame);
 	console_write("\n");
 
+	if (bootinfo_get()->has_framebuffer) {
+		fb_console_init();
+		console_write("fb_console: initialized\n");
+	}
+
 	scheduler_init();
 	arch_init();
 
 	initramfs_init();
 	vfs_init();
 	net_init();
+	ps2_kbd_init();
+	compositor_init();
+	virtio_gpu_init();
 	userspace_init();
 	user_spawn("/bin/init", 0, 0);
 

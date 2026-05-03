@@ -61,6 +61,13 @@ isr32:
 	pushq $32
 	jmp irq_common
 
+.global isr33
+.type isr33, @function
+isr33:
+	pushq $0
+	pushq $33
+	jmp irq_common
+
 .global isr_common
 .type isr_common, @function
 isr_common:

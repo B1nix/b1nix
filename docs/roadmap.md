@@ -66,8 +66,8 @@
 
 ## M7: Graphics
 
-- [ ] Add boot framebuffer path.
-- [ ] Add graphical console.
-- [ ] Add input.
-- [ ] Add basic compositor.
-- [ ] Explore VirtIO GPU.
+- [x] Add boot framebuffer path.
+- [x] Add graphical console.
+- [x] Add input.
+- [x] Add basic compositor.
+- [x] Explore VirtIO GPU.
