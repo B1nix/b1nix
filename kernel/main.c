@@ -1,0 +1,70 @@
+#include <tinyunix/arch.h>
+#include <tinyunix/bootinfo.h>
+#include <tinyunix/console.h>
+#include <tinyunix/initramfs.h>
+#include <tinyunix/mm.h>
+#include <tinyunix/net.h>
+#include <tinyunix/panic.h>
+#include <tinyunix/sched.h>
+#include <tinyunix/serial.h>
+#include <tinyunix/user.h>
+#include <tinyunix/vfs.h>
+
+void kernel_main(u32 multiboot_magic, u32 multiboot_info)
+{
+	serial_init();
+	console_init();
+
+	console_write("tinyunix kernel\n");
+	serial_write("tinyunix kernel booted\n");
+
+	console_write("multiboot magic: 0x");
+	console_write_hex32(multiboot_magic);
+	console_write("\n");
+
+	console_write("multiboot info:  0x");
+	console_write_hex32(multiboot_info);
+	console_write("\n");
+
+	bootinfo_init_from_multiboot2(multiboot_magic, multiboot_info);
+	pmm_init(bootinfo_get());
+
+	u64 frame = pmm_alloc_frame();
+	console_write("pmm: first allocated frame 0x");
+	console_write_hex64(frame);
+	console_write("\n");
+
+	kheap_init();
+	void *heap_probe = kzalloc(64);
+	console_write("kheap: probe allocation 0x");
+	console_write_hex64((u64)(usize)heap_probe);
+	console_write("\n");
+
+	vmm_init();
+	u64 mapped_frame = pmm_alloc_frame();
+	u64 mapped_virtual = 0x40000000ULL;
+	vmm_map_page(mapped_virtual, mapped_frame, VMM_WRITABLE);
+	volatile u64 *mapped_probe = (volatile u64 *)(usize)mapped_virtual;
+	*mapped_probe = 0x54494e59554e4958ULL;
+	console_write("vmm: mapped 0x");
+	console_write_hex64(mapped_virtual);
+	console_write(" -> 0x");
+	console_write_hex64(mapped_frame);
+	console_write("\n");
+
+	scheduler_init();
+	arch_init();
+
+	initramfs_init();
+	vfs_init();
+	net_init();
+	userspace_init();
+	user_spawn("/bin/init", 0, 0);
+
+	while (scheduler_task_count() > 1) {
+		scheduler_yield();
+	}
+
+	console_write("\nM6 network layer demo complete\n");
+	arch_halt();
+}
