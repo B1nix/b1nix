@@ -33,6 +33,21 @@ int strcmp(const char *left, const char *right)
 	return (unsigned char)*left - (unsigned char)*right;
 }
 
+int strncmp(const char *left, const char *right, size_t n)
+{
+	while (n > 0 && *left != '\0' && *left == *right) {
+		left++;
+		right++;
+		n--;
+	}
+
+	if (n == 0) {
+		return 0;
+	}
+
+	return (unsigned char)*left - (unsigned char)*right;
+}
+
 size_t strlen(const char *text)
 {
 	size_t length = 0;

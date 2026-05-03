@@ -40,6 +40,26 @@ static u64 sys_read_file(const char *path)
 	return file->size;
 }
 
+extern char ps2_kbd_getc(void);
+
+static u64 sys_read_kbd(void)
+{
+	char c = 0;
+	while (c == 0) {
+		c = ps2_kbd_getc();
+		if (c == 0) {
+			scheduler_yield();
+		}
+	}
+	return (u64)c;
+}
+
+static u64 sys_clear(void)
+{
+	console_clear();
+	return 0;
+}
+
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
 	(void)arg3;
@@ -70,6 +90,10 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_NET_DEMO:
 		net_demo();
 		return 0;
+	case SYS_READ_KBD:
+		return sys_read_kbd();
+	case SYS_CLEAR:
+		return sys_clear();
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

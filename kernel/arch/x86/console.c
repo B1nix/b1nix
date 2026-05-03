@@ -61,6 +61,23 @@ void console_init(void)
 	}
 }
 
+void console_clear(void)
+{
+	if (bootinfo_get()->has_framebuffer) {
+		extern void fb_console_clear(void);
+		fb_console_clear();
+	}
+
+	volatile u16 *vga = VGA_MEMORY;
+	for (usize row = 0; row < VGA_HEIGHT; row++) {
+		for (usize col = 0; col < VGA_WIDTH; col++) {
+			vga[row * VGA_WIDTH + col] = vga_entry(' ');
+		}
+	}
+	cursor_row = 0;
+	cursor_col = 0;
+}
+
 void console_putc(char ch)
 {
 	volatile u16 *vga = VGA_MEMORY;
@@ -68,6 +85,17 @@ void console_putc(char ch)
 	if (ch == '\n') {
 		serial_putc(ch);
 		console_newline();
+		if (bootinfo_get()->has_framebuffer) {
+			fb_console_putchar(ch);
+		}
+		return;
+	}
+
+	if (ch == '\b') {
+		if (cursor_col > 0) {
+			cursor_col--;
+			vga[cursor_row * VGA_WIDTH + cursor_col] = vga_entry(' ');
+		}
 		if (bootinfo_get()->has_framebuffer) {
 			fb_console_putchar(ch);
 		}

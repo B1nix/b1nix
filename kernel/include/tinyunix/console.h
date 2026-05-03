@@ -4,6 +4,7 @@
 #include <tinyunix/types.h>
 
 void console_init(void);
+void console_clear(void);
 void console_putc(char ch);
 void console_write(const char *text);
 void console_write_hex32(u32 value);

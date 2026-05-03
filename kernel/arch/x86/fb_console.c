@@ -53,6 +53,21 @@ void fb_console_init(void)
 	}
 }
 
+void fb_console_clear(void)
+{
+    if (!fb_ptr) return;
+
+	cursor_x = 0;
+	cursor_y = 0;
+
+	for (u32 y = 0; y < fb.height; y++) {
+		for (u32 x = 0; x < fb.width; x++) {
+            u8 *pixel = (u8 *)fb_ptr + (y * fb.pitch) + (x * (fb.bpp / 8));
+            *(u32 *)pixel = bg_color;
+		}
+	}
+}
+
 static const u32 FONT_SCALE = 2;
 
 static void fb_draw_char(char c, u32 x, u32 y)
@@ -91,6 +106,10 @@ void fb_console_putchar(char c)
         cursor_y += 8 * FONT_SCALE;
     } else if (c == '\r') {
         cursor_x = 0;
+    } else if (c == '\b') {
+        if (cursor_x >= 8 * FONT_SCALE) {
+            cursor_x -= 8 * FONT_SCALE;
+        }
     } else {
         fb_draw_char(c, cursor_x, cursor_y);
         cursor_x += 8 * FONT_SCALE;
