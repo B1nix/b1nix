@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_SCHED_H
-#define TINYUNIX_SCHED_H
+#ifndef B1NIX_SCHED_H
+#define B1NIX_SCHED_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 typedef void (*kernel_thread_entry)(void *arg);
 

@@ -1,5 +1,5 @@
-#include <tinyunix/console.h>
-#include <tinyunix/serial.h>
+#include <b1nix/console.h>
+#include <b1nix/serial.h>
 
 void panic(const char *message)
 {

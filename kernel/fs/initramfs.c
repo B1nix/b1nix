@@ -1,11 +1,11 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/initramfs.h>
+#include <b1nix/console.h>
+#include <b1nix/initramfs.h>
 
 static const struct initramfs_file files[] = {
 	{ "/bin/init", "builtin:init\n", 13, INITRAMFS_EXECUTABLE },
 	{ "/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE },
-	{ "/etc/motd", "welcome to tinyunix m4\n", 23, 0 },
+	{ "/etc/motd", "welcome to b1nix m4\n", 23, 0 },
 	{ "/README", "initramfs is alive\n", 20, 0 },
 };
 

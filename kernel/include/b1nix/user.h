@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_USER_H
-#define TINYUNIX_USER_H
+#ifndef B1NIX_USER_H
+#define B1NIX_USER_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 typedef int (*user_program_entry)(int argc, const char **argv);
 

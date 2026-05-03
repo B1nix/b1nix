@@ -1,7 +1,7 @@
 ARCH ?= x86
 BUILD_DIR := build/$(ARCH)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
-RUN_ISO := /private/tmp/tinyunix-run.iso
+RUN_ISO := /private/tmp/b1nix-run.iso
 
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
@@ -88,11 +88,11 @@ iso: $(KERNEL_ELF)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
 	cp boot/grub/grub.cfg $(BUILD_DIR)/iso/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/tinyunix.iso $(BUILD_DIR)/iso
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 
 run-x86: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	cp $(BUILD_DIR)/tinyunix.iso $(RUN_ISO)
+	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot
 
 run-aarch64: ARCH=aarch64

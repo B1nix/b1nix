@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_INITRAMFS_H
-#define TINYUNIX_INITRAMFS_H
+#ifndef B1NIX_INITRAMFS_H
+#define B1NIX_INITRAMFS_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 #define INITRAMFS_EXECUTABLE 0x1
 

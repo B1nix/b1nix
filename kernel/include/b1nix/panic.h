@@ -1,5 +1,5 @@
-#ifndef TINYUNIX_PANIC_H
-#define TINYUNIX_PANIC_H
+#ifndef B1NIX_PANIC_H
+#define B1NIX_PANIC_H
 
 void panic(const char *message) __attribute__((noreturn));
 

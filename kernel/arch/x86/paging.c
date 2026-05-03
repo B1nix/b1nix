@@ -1,7 +1,7 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/panic.h>
+#include <b1nix/console.h>
+#include <b1nix/mm.h>
+#include <b1nix/panic.h>
 
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL

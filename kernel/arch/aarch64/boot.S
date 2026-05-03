@@ -34,7 +34,7 @@ putc:
 
 .section .rodata
 message:
-	.asciz "tinyunix aarch64 qemu virt boot\n"
+	.asciz "b1nix aarch64 qemu virt boot\n"
 
 .section .bss
 .align 12

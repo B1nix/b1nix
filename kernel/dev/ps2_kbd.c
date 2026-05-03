@@ -1,6 +1,6 @@
-#include <tinyunix/console.h>
-#include <tinyunix/io.h>
-#include <tinyunix/types.h>
+#include <b1nix/console.h>
+#include <b1nix/io.h>
+#include <b1nix/types.h>
 
 #define KBD_BUFFER_SIZE 256
 

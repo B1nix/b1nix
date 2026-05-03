@@ -1,7 +1,7 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/net.h>
-#include <tinyunix/types.h>
+#include <b1nix/console.h>
+#include <b1nix/net.h>
+#include <b1nix/types.h>
 
 #define ETHERTYPE_ARP 0x0806
 #define ETHERTYPE_IPV4 0x0800
@@ -127,7 +127,7 @@ static void icmp_demo(void)
 
 static void udp_demo(void)
 {
-	const char *payload = "tinyunix udp";
+	const char *payload = "b1nix udp";
 	console_write("net: udp send ");
 	console_write_hex64(strlen(payload));
 	console_write(" bytes to ");

@@ -1,5 +1,5 @@
-#ifndef TINYUNIX_TYPES_H
-#define TINYUNIX_TYPES_H
+#ifndef B1NIX_TYPES_H
+#define B1NIX_TYPES_H
 
 #include <stddef.h>
 #include <stdint.h>

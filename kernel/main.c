@@ -1,14 +1,14 @@
-#include <tinyunix/arch.h>
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/console.h>
-#include <tinyunix/initramfs.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/net.h>
-#include <tinyunix/panic.h>
-#include <tinyunix/sched.h>
-#include <tinyunix/serial.h>
-#include <tinyunix/user.h>
-#include <tinyunix/vfs.h>
+#include <b1nix/arch.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/initramfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/net.h>
+#include <b1nix/panic.h>
+#include <b1nix/sched.h>
+#include <b1nix/serial.h>
+#include <b1nix/user.h>
+#include <b1nix/vfs.h>
 
 extern void ps2_kbd_init(void);
 extern void compositor_init(void);
@@ -20,8 +20,8 @@ void kernel_main(u32 multiboot_magic, u32 multiboot_info)
 	serial_init();
 	console_init();
 
-	console_write("tinyunix kernel\n");
-	serial_write("tinyunix kernel booted\n");
+	console_write("b1nix kernel\n");
+	serial_write("b1nix kernel booted\n");
 
 	console_write("multiboot magic: 0x");
 	console_write_hex32(multiboot_magic);

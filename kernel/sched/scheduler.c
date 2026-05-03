@@ -1,8 +1,8 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/panic.h>
-#include <tinyunix/sched.h>
+#include <b1nix/console.h>
+#include <b1nix/mm.h>
+#include <b1nix/panic.h>
+#include <b1nix/sched.h>
 
 #define MAX_TASKS 16
 #define KERNEL_STACK_SIZE (16 * 1024)

@@ -1,5 +1,5 @@
-#ifndef TINYUNIX_STRING_H
-#define TINYUNIX_STRING_H
+#ifndef B1NIX_STRING_H
+#define B1NIX_STRING_H
 
 #include <stddef.h>
 

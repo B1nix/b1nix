@@ -1,8 +1,8 @@
 #include <string.h>
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/console.h>
-#include <tinyunix/io.h>
-#include <tinyunix/serial.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/io.h>
+#include <b1nix/serial.h>
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25

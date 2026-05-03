@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_BOOTINFO_H
-#define TINYUNIX_BOOTINFO_H
+#ifndef B1NIX_BOOTINFO_H
+#define B1NIX_BOOTINFO_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 #define BOOTINFO_MAX_MEMORY_REGIONS 32
 

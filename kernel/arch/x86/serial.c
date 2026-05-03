@@ -1,5 +1,5 @@
-#include <tinyunix/io.h>
-#include <tinyunix/serial.h>
+#include <b1nix/io.h>
+#include <b1nix/serial.h>
 
 #define COM1 0x3f8
 

@@ -1,5 +1,5 @@
-#ifndef TINYUNIX_SERIAL_H
-#define TINYUNIX_SERIAL_H
+#ifndef B1NIX_SERIAL_H
+#define B1NIX_SERIAL_H
 
 void serial_init(void);
 void serial_putc(char ch);

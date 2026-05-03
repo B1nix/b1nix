@@ -1,8 +1,8 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/initramfs.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/vfs.h>
+#include <b1nix/console.h>
+#include <b1nix/initramfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/vfs.h>
 
 #define MAX_VFS_NODES 32
 #define MAX_VFS_HANDLES 32

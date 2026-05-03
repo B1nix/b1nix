@@ -1,8 +1,8 @@
-#ifndef TINYUNIX_MM_H
-#define TINYUNIX_MM_H
+#ifndef B1NIX_MM_H
+#define B1NIX_MM_H
 
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/types.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/types.h>
 
 #define PAGE_SIZE 4096ULL
 

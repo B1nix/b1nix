@@ -1,11 +1,11 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/initramfs.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/panic.h>
-#include <tinyunix/sched.h>
-#include <tinyunix/syscall.h>
-#include <tinyunix/user.h>
+#include <b1nix/console.h>
+#include <b1nix/initramfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/panic.h>
+#include <b1nix/sched.h>
+#include <b1nix/syscall.h>
+#include <b1nix/user.h>
 
 #define MAX_PROGRAMS 16
 #define USER_STACK_SIZE PAGE_SIZE

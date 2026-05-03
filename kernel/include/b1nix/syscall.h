@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_SYSCALL_H
-#define TINYUNIX_SYSCALL_H
+#ifndef B1NIX_SYSCALL_H
+#define B1NIX_SYSCALL_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 enum syscall_number {
 	SYS_WRITE = 1,

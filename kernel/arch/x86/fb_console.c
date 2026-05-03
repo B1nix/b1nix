@@ -1,7 +1,7 @@
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/console.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/types.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/mm.h>
+#include <b1nix/types.h>
 #include "font8x8.h"
 
 static struct boot_framebuffer fb;

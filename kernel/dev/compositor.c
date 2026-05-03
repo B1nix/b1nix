@@ -1,7 +1,7 @@
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/console.h>
-#include <tinyunix/sched.h>
-#include <tinyunix/mm.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/sched.h>
+#include <b1nix/mm.h>
 
 static void compositor_thread(void *arg)
 {

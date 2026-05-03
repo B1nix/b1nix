@@ -1,8 +1,8 @@
-#include <tinyunix/console.h>
-#include <tinyunix/io.h>
-#include <tinyunix/panic.h>
-#include <tinyunix/sched.h>
-#include <tinyunix/types.h>
+#include <b1nix/console.h>
+#include <b1nix/io.h>
+#include <b1nix/panic.h>
+#include <b1nix/sched.h>
+#include <b1nix/types.h>
 
 #define IDT_ENTRY_COUNT 256
 #define KERNEL_CODE_SELECTOR 0x08

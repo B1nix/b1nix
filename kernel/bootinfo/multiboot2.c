@@ -1,6 +1,6 @@
-#include <tinyunix/bootinfo.h>
-#include <tinyunix/console.h>
-#include <tinyunix/panic.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/panic.h>
 
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 #define MULTIBOOT2_TAG_TYPE_END 0

@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_CONSOLE_H
-#define TINYUNIX_CONSOLE_H
+#ifndef B1NIX_CONSOLE_H
+#define B1NIX_CONSOLE_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 void console_init(void);
 void console_clear(void);

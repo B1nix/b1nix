@@ -1,6 +1,6 @@
 #include <string.h>
-#include <tinyunix/syscall.h>
-#include <tinyunix/user.h>
+#include <b1nix/syscall.h>
+#include <b1nix/user.h>
 
 void user_register_program(const char *path, user_program_entry entry);
 
@@ -40,11 +40,11 @@ static int sh_main(int argc, const char **argv)
 	(void)argc;
 	(void)argv;
 
-	uwrite("Welcome to tinyunix shell!\nType 'help' for a list of commands.\n\n");
+	uwrite("Welcome to b1nix shell!\nType 'help' for a list of commands.\n\n");
 
 	char line[128];
 	while (1) {
-		uwrite("tinyunix> ");
+		uwrite("b1nix> ");
 		readline(line, sizeof(line));
 
 		char *cmd = line;

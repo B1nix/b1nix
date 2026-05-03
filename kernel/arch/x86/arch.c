@@ -1,5 +1,5 @@
-#include <tinyunix/arch.h>
-#include <tinyunix/console.h>
+#include <b1nix/arch.h>
+#include <b1nix/console.h>
 
 void x86_idt_init(void);
 void x86_pic_init(void);

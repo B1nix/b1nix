@@ -1,7 +1,7 @@
-#ifndef TINYUNIX_VFS_H
-#define TINYUNIX_VFS_H
+#ifndef B1NIX_VFS_H
+#define B1NIX_VFS_H
 
-#include <tinyunix/types.h>
+#include <b1nix/types.h>
 
 #define VFS_MAX_PATH 64
 

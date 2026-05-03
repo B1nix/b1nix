@@ -1,10 +1,10 @@
-#include <tinyunix/console.h>
-#include <tinyunix/initramfs.h>
-#include <tinyunix/net.h>
-#include <tinyunix/sched.h>
-#include <tinyunix/syscall.h>
-#include <tinyunix/user.h>
-#include <tinyunix/vfs.h>
+#include <b1nix/console.h>
+#include <b1nix/initramfs.h>
+#include <b1nix/net.h>
+#include <b1nix/sched.h>
+#include <b1nix/syscall.h>
+#include <b1nix/user.h>
+#include <b1nix/vfs.h>
 
 static u64 sys_write(const char *text, usize size)
 {

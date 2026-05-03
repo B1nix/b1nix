@@ -1,4 +1,4 @@
-#include <tinyunix/console.h>
+#include <b1nix/console.h>
 
 void virtio_gpu_init(void)
 {

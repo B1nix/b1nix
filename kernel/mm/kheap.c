@@ -1,7 +1,7 @@
 #include <string.h>
-#include <tinyunix/console.h>
-#include <tinyunix/mm.h>
-#include <tinyunix/panic.h>
+#include <b1nix/console.h>
+#include <b1nix/mm.h>
+#include <b1nix/panic.h>
 
 struct kheap_state {
 	u64 current;
