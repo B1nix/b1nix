@@ -190,18 +190,33 @@ void pmm_init(const struct boot_info *boot_info)
 
 u64 pmm_alloc_frame(void)
 {
+	return pmm_alloc_frames(1);
+}
+
+u64 pmm_alloc_frames(usize count)
+{
 	usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
 
-	for (usize i = 0; i < frame_count; i++) {
-		if (!bitmap_get(i)) {
+	for (usize i = 0; i <= frame_count - count; i++) {
+		int free = 1;
+		for (usize j = 0; j < count; j++) {
+			if (bitmap_get(i + j)) {
+				free = 0;
+				i += j; // Skip past the used frame
+				break;
+			}
+		}
+		if (free) {
 			u64 frame = frame_from_index(i);
-			mark_frame_used(frame);
-			memset((void *)(usize)frame, 0, PAGE_SIZE);
+			for (usize j = 0; j < count; j++) {
+				mark_frame_used(frame_from_index(i + j));
+			}
+			memset((void *)(usize)frame, 0, count * PAGE_SIZE);
 			return frame;
 		}
 	}
 
-	panic("out of physical memory");
+	panic("out of contiguous physical memory");
 }
 
 void pmm_free_frame(u64 frame)

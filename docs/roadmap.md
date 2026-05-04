@@ -71,3 +71,47 @@
 - [x] Add input.
 - [x] Add basic compositor.
 - [x] Explore VirtIO GPU.
+
+## M8: Advanced VFS and Filesystems
+
+- [x] Hierarchical directory structure (`/bin`, `/dev`, etc.).
+- [x] FAT32 or ext2 filesystem driver.
+
+## M9: Hardware Drivers
+
+- [x] virtio-blk (real implementation, replace stub).
+- [x] virtio-net (real implementation, replace stub).
+- [x] input (ps2_kbd fully connected to shell).
+
+## M10: Full Network Stack
+
+- [ ] Ethernet frames parsing and sending.
+- [ ] ARP resolution.
+- [ ] IPv4 routing.
+- [ ] ICMP ping responses.
+- [ ] UDP protocol.
+- [ ] DHCP client.
+- [ ] DNS client.
+
+## M11: Shell and Utilities
+
+- [ ] Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
+- [ ] Pipes and redirection.
+- [ ] Environment variables.
+- [ ] Job control.
+
+## M12: Syscalls and Process Management
+
+- [ ] Task priorities in scheduler.
+- [ ] `exit` syscall.
+- [ ] `exec` syscall.
+- [ ] `wait` syscall.
+- [ ] `mmap` syscall.
+- [ ] `sleep` syscall.
+
+## M13: AArch64 Port Completion
+
+- [ ] Hook up AArch64 to the build (`KERNEL_SOURCES`).
+- [ ] C kernel entry and memory map parsing for AArch64.
+- [ ] Implement AArch64 architecture layer.
+- [ ] Ensure common code compiles for both platforms.

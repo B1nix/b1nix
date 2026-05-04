@@ -15,10 +15,10 @@ static u64 sys_write(const char *text, usize size)
 	return size;
 }
 
-static u64 sys_list(void)
+static u64 sys_list(const char *dir_path)
 {
 	const char *paths[64];
-	usize count = vfs_list(paths, 64);
+	usize count = vfs_list(dir_path, paths, 64);
 
 	for (usize i = 0; i < count; i++) {
 		console_write(paths[i]);
@@ -72,7 +72,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_SPAWN:
 		return (u64)user_spawn((const char *)(usize)arg0, (int)arg1, (const char **)(usize)arg2);
 	case SYS_LIST:
-		return sys_list();
+		return sys_list((const char *)(usize)arg0);
 	case SYS_READ_FILE:
 		return sys_read_file((const char *)(usize)arg0);
 	case SYS_YIELD:

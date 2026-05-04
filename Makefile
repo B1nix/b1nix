@@ -51,6 +51,10 @@ KERNEL_SOURCES := \
 		kernel/syscall/syscall.c \
 			kernel/fs/initramfs.c \
 			kernel/fs/vfs.c \
+			kernel/fs/fat32.c \
+			kernel/dev/pci.c \
+			kernel/dev/blk.c \
+			kernel/dev/virtio.c \
 			kernel/dev/virtio_blk.c \
 			kernel/dev/ps2_kbd.c \
 			kernel/dev/compositor.c \
@@ -92,8 +96,12 @@ iso: $(KERNEL_ELF)
 
 run-x86: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	@mkdir -p $(BUILD_DIR)/fat_dir
+	@echo "Hello from FAT32" > $(BUILD_DIR)/fat_dir/test.txt
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
-	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot
+	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
+		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 run-aarch64: ARCH=aarch64
 run-aarch64: $(KERNEL_ELF)

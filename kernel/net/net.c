@@ -69,9 +69,38 @@ static void print_ipv4(struct ipv4_addr ip)
 	}
 }
 
+#include <b1nix/virtio.h>
+
+#define VIRTIO_VENDOR_ID 0x1AF4
+#define VIRTIO_NET_DEVICE_ID 0x1000
+
+static struct virtio_device net_dev;
+static struct virtqueue net_rx_vq;
+static struct virtqueue net_tx_vq;
+
 static void virtio_net_probe(void)
 {
-	console_write("virtio-net: pci/virtqueue layer pending, using loopback demo device\n");
+	if (!virtio_init_device(&net_dev, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)) {
+		console_write("virtio-net: no device found, using loopback demo device\n");
+		return;
+	}
+
+	virtio_set_guest_features(&net_dev, 0);
+	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+
+	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
+		console_write("virtio-net: failed to init rx virtqueue\n");
+		return;
+	}
+
+	if (!virtq_init(&net_dev, 1, &net_tx_vq)) {
+		console_write("virtio-net: failed to init tx virtqueue\n");
+		return;
+	}
+
+	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
+
+	console_write("virtio-net: initialized successfully on PCI\n");
 }
 
 static void ethernet_parse_demo(void)

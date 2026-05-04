@@ -13,6 +13,7 @@
 
 void pmm_init(const struct boot_info *boot_info);
 u64 pmm_alloc_frame(void);
+u64 pmm_alloc_frames(usize count);
 void pmm_free_frame(u64 frame);
 u64 pmm_total_usable_memory(void);
 u64 pmm_free_memory_estimate(void);
