@@ -313,10 +313,8 @@ static int sh_main(int argc, const char **argv)
 				uwrite(args[0]);
 				uwrite("\n");
 			} else if (!is_bg && !pipe_pos) {
-				// Wait for it. In a real OS we'd use waitpid. Here we just yield.
-				for (int i=0; i<10; i++) {
-					syscall_dispatch(SYS_YIELD, 0, 0, 0, 0);
-				}
+				int status;
+				syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
 			}
 		}
 
@@ -356,9 +354,8 @@ static int sh_main(int argc, const char **argv)
 						pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args2, (u64)(usize)args2, 0);
 					}
 					if (!is_bg) {
-						for (int i=0; i<10; i++) {
-							syscall_dispatch(SYS_YIELD, 0, 0, 0, 0);
-						}
+						int status;
+						syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
 					}
 				}
 			}
@@ -377,7 +374,8 @@ static int init_main(int argc, const char **argv)
 	syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/sh", 0, 0, 0);
 	
 	while (1) {
-		syscall_dispatch(SYS_YIELD, 0, 0, 0, 0);
+		int status;
+		syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0);
 	}
 	
 	return 0;

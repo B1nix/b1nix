@@ -2,39 +2,38 @@
 .global _start
 .type _start, %function
 
-.equ UART0, 0x09000000
-.equ UARTFR, 0x18
-.equ UARTDR, 0x00
+.extern kernel_main
+.extern __bss_start
+.extern __bss_end
 
 _start:
+	// Save DTB address from x0 to x19
+	mov x19, x0
+
+	// Set up stack
 	ldr x0, =stack_top
 	mov sp, x0
-	ldr x0, =message
-	bl puts
+
+	// Clear BSS
+	ldr x0, =__bss_start
+	ldr x1, =__bss_end
+.clear_bss:
+	cmp x0, x1
+	b.eq .bss_cleared
+	str xzr, [x0], #8
+	b .clear_bss
+.bss_cleared:
+
+	// Restore DTB address to x0, arg1 to x1
+	mov x0, x19
+	mov x1, #0
+	
+	// Jump to kernel_main
+	bl kernel_main
 
 .hang:
 	wfe
 	b .hang
-
-puts:
-	ldrb w1, [x0], #1
-	cbz w1, .puts_done
-	bl putc
-	b puts
-.puts_done:
-	ret
-
-putc:
-	ldr x2, =UART0
-.wait:
-	ldr w3, [x2, #UARTFR]
-	tbnz w3, #5, .wait
-	str w1, [x2, #UARTDR]
-	ret
-
-.section .rodata
-message:
-	.asciz "b1nix aarch64 qemu virt boot\n"
 
 .section .bss
 .align 12

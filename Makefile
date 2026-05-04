@@ -31,46 +31,47 @@ TARGET := aarch64-elf
 ARCH_CFLAGS := --target=$(TARGET)
 ARCH_LDFLAGS := -m aarch64elf
 LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
-ASM_SOURCES := kernel/arch/aarch64/boot.S
-ARCH_SOURCES :=
+ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S
+ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/console.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/bootinfo.c
 else
 $(error Unsupported ARCH=$(ARCH). Try ARCH=x86 or ARCH=aarch64)
 endif
 
-ifeq ($(ARCH),aarch64)
-KERNEL_SOURCES :=
-else
 KERNEL_SOURCES := \
 	kernel/main.c \
-	kernel/bootinfo/multiboot2.c \
 	kernel/lib/string.c \
 	kernel/lib/panic.c \
-		kernel/mm/kheap.c \
-		kernel/mm/pmm.c \
-		kernel/sched/scheduler.c \
-		kernel/syscall/syscall.c \
-			kernel/fs/initramfs.c \
-			kernel/fs/vfs.c \
-			kernel/fs/fat32.c \
-			kernel/dev/pci.c \
-			kernel/dev/blk.c \
-			kernel/dev/virtio.c \
-			kernel/dev/virtio_blk.c \
-			kernel/dev/ps2_kbd.c \
-			kernel/dev/compositor.c \
-			kernel/dev/virtio_gpu.c \
-			kernel/net/net.c \
-			kernel/net/ethernet.c \
-			kernel/net/arp.c \
-			kernel/net/ipv4.c \
-			kernel/net/icmp.c \
-			kernel/net/udp.c \
-			kernel/net/dhcp.c \
-			kernel/net/dns.c \
-		kernel/user/process.c \
-		kernel/user/programs.c \
-		$(ARCH_SOURCES)
+	kernel/mm/kheap.c \
+	kernel/mm/pmm.c \
+	kernel/sched/scheduler.c \
+	kernel/syscall/syscall.c \
+	kernel/fs/initramfs.c \
+	kernel/fs/vfs.c \
+	kernel/fs/fat32.c \
+	kernel/user/process.c \
+	kernel/user/programs.c \
+	$(ARCH_SOURCES)
+
+ifeq ($(ARCH),x86)
+KERNEL_SOURCES += \
+	kernel/bootinfo/multiboot2.c \
+	kernel/dev/pci.c \
+	kernel/dev/blk.c \
+	kernel/dev/virtio.c \
+	kernel/dev/virtio_blk.c \
+	kernel/dev/ps2_kbd.c \
+	kernel/dev/compositor.c \
+	kernel/dev/virtio_gpu.c \
+	kernel/net/net.c \
+	kernel/net/ethernet.c \
+	kernel/net/arp.c \
+	kernel/net/ipv4.c \
+	kernel/net/icmp.c \
+	kernel/net/udp.c \
+	kernel/net/dhcp.c \
+	kernel/net/dns.c
 endif
+
 
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \

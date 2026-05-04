@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 
@@ -11,7 +12,5 @@ void panic(const char *message)
 	serial_write(message);
 	serial_write("\n");
 
-	for (;;) {
-		__asm__ volatile("cli; hlt");
-	}
+	arch_halt();
 }

@@ -43,6 +43,10 @@ static void user_process_thread(void *arg)
 
 	int code = start->program->entry(start->argc, start->argv);
 	syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0);
+	
+	while(1) {
+		scheduler_yield();
+	}
 }
 
 void userspace_init(void)

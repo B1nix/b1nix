@@ -15,7 +15,9 @@ extern void compositor_init(void);
 extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
 
-void kernel_main(u32 multiboot_magic, u32 multiboot_info)
+extern void bootinfo_init_from_fdt(u64 dtb_address);
+
+void kernel_main(u64 arg0, u64 arg1)
 {
 	serial_init();
 	console_init();
@@ -23,15 +25,23 @@ void kernel_main(u32 multiboot_magic, u32 multiboot_info)
 	console_write("b1nix kernel\n");
 	serial_write("b1nix kernel booted\n");
 
+#ifdef __aarch64__
+	(void)arg1;
+	console_write("dtb address: 0x");
+	console_write_hex64(arg0);
+	console_write("\n");
+	bootinfo_init_from_fdt(arg0);
+#else
 	console_write("multiboot magic: 0x");
-	console_write_hex32(multiboot_magic);
+	console_write_hex32((u32)arg0);
 	console_write("\n");
 
 	console_write("multiboot info:  0x");
-	console_write_hex32(multiboot_info);
+	console_write_hex32((u32)arg1);
 	console_write("\n");
 
-	bootinfo_init_from_multiboot2(multiboot_magic, multiboot_info);
+	bootinfo_init_from_multiboot2((u32)arg0, (u32)arg1);
+#endif
 	pmm_init(bootinfo_get());
 
 	u64 frame = pmm_alloc_frame();
@@ -57,20 +67,24 @@ void kernel_main(u32 multiboot_magic, u32 multiboot_info)
 	console_write_hex64(mapped_frame);
 	console_write("\n");
 
+#ifndef __aarch64__
 	if (bootinfo_get()->has_framebuffer) {
 		fb_console_init();
 		console_write("fb_console: initialized\n");
 	}
+#endif
 
 	scheduler_init();
 	arch_init();
 
 	initramfs_init();
+#ifndef __aarch64__
 	vfs_init();
 	net_init();
 	ps2_kbd_init();
 	compositor_init();
 	virtio_gpu_init();
+#endif
 	userspace_init();
 	user_spawn("/bin/init", 0, 0);
 

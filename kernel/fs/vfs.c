@@ -170,12 +170,14 @@ void vfs_init(void)
 	add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
 	add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
 	vfs_create("/tmp/hello", "tmpfs says hello\n");
+#ifndef __aarch64__
 	virtio_blk_init();
 
 	struct block_device *blk = blk_get("virtio-blk0");
 	if (blk) {
 		fat32_mount(blk, "/mnt");
 	}
+#endif
 
 	console_write("vfs: nodes 0x");
 	console_write_hex64(node_count);

@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/net.h>
@@ -76,7 +77,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_WRITE:
 		return sys_write((const char *)(usize)arg0, (usize)arg1);
 	case SYS_EXIT:
-		scheduler_exit_current();
+		scheduler_exit_current((int)arg0);
 	case SYS_SPAWN:
 		return (u64)user_spawn((const char *)(usize)arg0, (int)arg1, (const char **)(usize)arg2);
 	case SYS_LIST:
@@ -95,14 +96,10 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_CREATE:
 		return (u64)vfs_create((const char *)(usize)arg0, (const char *)(usize)arg1);
+#ifndef __aarch64__
 	case SYS_NET_PING: {
 		struct ipv4_addr dest;
 		const char *ip_str = (const char *)(usize)arg0;
-		// A real OS would parse the string. For our demo, we just parse a simple string or assume it's an IPv4 string
-		// Since we don't have a generic inet_pton yet, we will just send an ICMP Echo to the given IP
-		// For simplicity, we assume arg0 is actually a pointer to a struct ipv4_addr, OR we parse it.
-		// Wait, the shell will pass a string!
-		// We'll write a quick parser.
 		usize i = 0, j = 0;
 		u8 val = 0;
 		while (ip_str[i] && j < 4) {
@@ -154,6 +151,12 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_READ_KBD:
 		return sys_read_kbd();
+#else
+	case SYS_NET_PING:
+	case SYS_NET_DNS:
+	case SYS_READ_KBD:
+		return (u64)-1;
+#endif
 	case SYS_CLEAR:
 		return sys_clear();
 	case SYS_PS:
@@ -168,14 +171,19 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		console_write(" KB\n");
 		return 0;
 	case SYS_REBOOT:
+#ifdef __aarch64__
+		arch_halt();
+#else
 		outb(0x64, 0xFE);
 		while (1) {
 			__asm__ volatile("hlt");
 		}
+#endif
 		return 0;
 	case SYS_SET_STDOUT:
 		scheduler_set_stdout((int)arg0);
 		return 0;
+#ifndef __aarch64__
 	case SYS_NET_INFO: {
 		struct mac_addr mac = net_get_mac();
 		struct ipv4_addr ip = net_get_ip();
@@ -200,6 +208,31 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		console_write("\n");
 		return 0;
 	}
+#else
+	case SYS_NET_INFO:
+		console_write("Network not available on AArch64 yet.\n");
+		return 0;
+#endif
+	case SYS_EXEC: {
+		const char *path = (const char *)(usize)arg0;
+		int argc = (int)arg1;
+		const char **argv = (const char **)(usize)arg2;
+		
+		const struct user_program *program = user_find_program(path);
+		if (program == 0) {
+			return (u64)-1;
+		}
+		
+		int code = program->entry(argc, argv);
+		scheduler_exit_current(code);
+	}
+	case SYS_WAIT:
+		return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
+	case SYS_MMAP:
+		return (u64)(usize)kmalloc((usize)arg0);
+	case SYS_SLEEP:
+		scheduler_sleep_ticks(arg0);
+		return 0;
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

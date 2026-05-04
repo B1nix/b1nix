@@ -17,6 +17,21 @@ enum task_state {
 };
 
 struct cpu_context {
+#ifdef __aarch64__
+	u64 x19;
+	u64 x20;
+	u64 x21;
+	u64 x22;
+	u64 x23;
+	u64 x24;
+	u64 x25;
+	u64 x26;
+	u64 x27;
+	u64 x28;
+	u64 fp;
+	u64 lr;
+	u64 sp;
+#else
 	u64 rsp;
 	u64 rbp;
 	u64 rbx;
@@ -24,6 +39,7 @@ struct cpu_context {
 	u64 r13;
 	u64 r14;
 	u64 r15;
+#endif
 };
 
 struct task {
@@ -36,6 +52,9 @@ struct task {
 	void *stack;
 	u64 wake_tick;
 	int stdout_fd;
+	int priority;
+	int exit_code;
+	usize parent_id;
 };
 
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
@@ -48,12 +67,20 @@ static int scheduler_started;
 
 static void interrupts_disable(void)
 {
+#ifdef __aarch64__
+	__asm__ volatile("msr daifset, #2" : : : "memory");
+#else
 	__asm__ volatile("cli" : : : "memory");
+#endif
 }
 
 static void interrupts_enable(void)
 {
+#ifdef __aarch64__
+	__asm__ volatile("msr daifclr, #2" : : : "memory");
+#else
 	__asm__ volatile("sti" : : : "memory");
+#endif
 }
 
 static u64 align_down_u64(u64 value, u64 alignment)
@@ -84,16 +111,22 @@ static struct task *pick_next_task(void)
 	}
 
 	usize start = task_index(current_task);
+	int max_priority = -1;
+	struct task *best_task = 0;
 
+	// Find the highest priority among ready tasks
 	for (usize offset = 1; offset <= MAX_TASKS; offset++) {
 		usize index = (start + offset) % MAX_TASKS;
 
 		if (tasks[index].state == TASK_READY) {
-			return &tasks[index];
+			if (tasks[index].priority > max_priority) {
+				max_priority = tasks[index].priority;
+				best_task = &tasks[index];
+			}
 		}
 	}
 
-	return 0;
+	return best_task;
 }
 
 static void wake_sleepers(void)
@@ -115,7 +148,7 @@ static void kernel_thread_trampoline(void)
 	}
 
 	current_task->entry(current_task->arg);
-	scheduler_exit_current();
+	scheduler_exit_current(0);
 }
 
 void scheduler_init(void)
@@ -127,6 +160,8 @@ void scheduler_init(void)
 	boot->name = "boot";
 	boot->state = TASK_RUNNING;
 	boot->stdout_fd = -1;
+	boot->priority = 1;
+	boot->parent_id = 0;
 	current_task = boot;
 	scheduler_started = 1;
 
@@ -153,6 +188,21 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	task->arg = arg;
 	task->stack = stack;
 	task->wake_tick = 0;
+#ifdef __aarch64__
+	task->context.fp = 0;
+	task->context.lr = initial_rsp; // Use lr for entry point on AArch64 trampoline
+	task->context.sp = initial_rsp;
+	task->context.x19 = 0;
+	task->context.x20 = 0;
+	task->context.x21 = 0;
+	task->context.x22 = 0;
+	task->context.x23 = 0;
+	task->context.x24 = 0;
+	task->context.x25 = 0;
+	task->context.x26 = 0;
+	task->context.x27 = 0;
+	task->context.x28 = 0;
+#else
 	task->context.rsp = initial_rsp;
 	task->context.rbp = 0;
 	task->context.rbx = 0;
@@ -160,7 +210,11 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	task->context.r13 = 0;
 	task->context.r14 = 0;
 	task->context.r15 = 0;
+#endif
 	task->stdout_fd = current_task ? current_task->stdout_fd : -1;
+	task->priority = 1;
+	task->parent_id = current_task ? current_task->id : 0;
+	task->exit_code = 0;
 
 	console_write("sched: created task ");
 	console_write(name);
@@ -254,7 +308,7 @@ void scheduler_on_timer_tick(void)
 	}
 }
 
-void scheduler_exit_current(void)
+void scheduler_exit_current(int exit_code)
 {
 	interrupts_disable();
 
@@ -266,9 +320,52 @@ void scheduler_exit_current(void)
 	console_write(current_task->name);
 	console_write("\n");
 
+	current_task->exit_code = exit_code;
 	current_task->state = TASK_DEAD;
+	
+	// Wake up parent if it is blocked waiting for us
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].id == current_task->parent_id && tasks[i].state == TASK_BLOCKED) {
+			tasks[i].state = TASK_READY;
+		}
+	}
+
 	scheduler_yield();
 	panic("dead task resumed");
+}
+
+int scheduler_wait(usize pid, int *status)
+{
+	if (current_task == 0) return -1;
+	
+	while (1) {
+		interrupts_disable();
+		int has_children = 0;
+		for (usize i = 0; i < MAX_TASKS; i++) {
+			if (tasks[i].state != TASK_UNUSED && tasks[i].parent_id == current_task->id) {
+				if (pid == 0 || tasks[i].id == pid) {
+					has_children = 1;
+					if (tasks[i].state == TASK_DEAD) {
+						int code = tasks[i].exit_code;
+						int child_id = tasks[i].id;
+						tasks[i].state = TASK_UNUSED;
+						interrupts_enable();
+						if (status) *status = code;
+						return child_id;
+					}
+				}
+			}
+		}
+		
+		if (!has_children) {
+			interrupts_enable();
+			return -1;
+		}
+		
+		current_task->state = TASK_BLOCKED;
+		scheduler_yield();
+		interrupts_enable();
+	}
 }
 
 usize scheduler_task_count(void)

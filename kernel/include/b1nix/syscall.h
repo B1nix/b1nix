@@ -23,6 +23,10 @@ enum syscall_number {
 	SYS_REBOOT = 17,
 	SYS_SET_STDOUT = 18,
 	SYS_NET_INFO = 19,
+	SYS_EXEC = 20,
+	SYS_WAIT = 21,
+	SYS_MMAP = 22,
+	SYS_SLEEP = 23,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);

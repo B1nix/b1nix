@@ -102,16 +102,16 @@
 
 ## M12: Syscalls and Process Management
 
-- [ ] Task priorities in scheduler.
-- [ ] `exit` syscall.
-- [ ] `exec` syscall.
-- [ ] `wait` syscall.
-- [ ] `mmap` syscall.
-- [ ] `sleep` syscall.
+- [x] Task priorities in scheduler.
+- [x] `exit` syscall.
+- [x] `exec` syscall.
+- [x] `wait` syscall.
+- [x] `mmap` syscall.
+- [x] `sleep` syscall.
 
 ## M13: AArch64 Port Completion
 
-- [ ] Hook up AArch64 to the build (`KERNEL_SOURCES`).
-- [ ] C kernel entry and memory map parsing for AArch64.
-- [ ] Implement AArch64 architecture layer.
-- [ ] Ensure common code compiles for both platforms.
+- [x] Hook up AArch64 to the build (`KERNEL_SOURCES`).
+- [x] C kernel entry and memory map parsing for AArch64.
+- [x] Implement AArch64 architecture layer.
+- [x] Ensure common code compiles for both platforms.
