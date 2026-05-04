@@ -1,5 +1,6 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/console.h>
 #include <string.h>
 
 #define ICMP_TYPE_ECHO_REPLY 0
@@ -34,20 +35,34 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
     return;
   const struct icmp_header *hdr = data;
 
-  if (hdr->type == ICMP_TYPE_ECHO_REQUEST) {
-    u8 *reply = kzalloc(size);
-    if (!reply)
-      return;
+	if (hdr->type == ICMP_TYPE_ECHO_REQUEST) {
+		u8 *reply = kzalloc(size);
+		if (!reply)
+			return;
 
-    memcpy(reply, data, size);
-    struct icmp_header *rhdr = (struct icmp_header *)reply;
-    rhdr->type = ICMP_TYPE_ECHO_REPLY;
-    rhdr->code = 0;
-    rhdr->checksum = 0;
+		memcpy(reply, data, size);
+		struct icmp_header *rhdr = (struct icmp_header *)reply;
+		rhdr->type = ICMP_TYPE_ECHO_REPLY;
+		rhdr->code = 0;
+		rhdr->checksum = 0;
 
-    u16 csum = icmp_checksum(reply, size);
-    rhdr->checksum = bswap16(csum);
+		u16 csum = icmp_checksum(reply, size);
+		rhdr->checksum = bswap16(csum);
 
-    ipv4_send(src, 1 /* ICMP */, reply, size);
-  }
+		ipv4_send(src, 1 /* ICMP */, reply, size);
+	} else if (hdr->type == ICMP_TYPE_ECHO_REPLY) {
+		console_write("ping: reply from ");
+		console_write_dec(src.bytes[0]);
+		console_write(".");
+		console_write_dec(src.bytes[1]);
+		console_write(".");
+		console_write_dec(src.bytes[2]);
+		console_write(".");
+		console_write_dec(src.bytes[3]);
+		console_write(" bytes=");
+		console_write_dec(size);
+		console_write(" seq=");
+		console_write_dec(hdr->seq); // Wait, seq might be swapped? Standard ping uses network byte order or host. Let's assume it's just what we sent.
+		console_write("\n");
+	}
 }

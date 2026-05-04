@@ -35,6 +35,7 @@ struct task {
 	void *arg;
 	void *stack;
 	u64 wake_tick;
+	int stdout_fd;
 };
 
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
@@ -125,6 +126,7 @@ void scheduler_init(void)
 	boot->id = next_task_id++;
 	boot->name = "boot";
 	boot->state = TASK_RUNNING;
+	boot->stdout_fd = -1;
 	current_task = boot;
 	scheduler_started = 1;
 
@@ -158,6 +160,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	task->context.r13 = 0;
 	task->context.r14 = 0;
 	task->context.r15 = 0;
+	task->stdout_fd = current_task ? current_task->stdout_fd : -1;
 
 	console_write("sched: created task ");
 	console_write(name);
@@ -279,4 +282,50 @@ usize scheduler_task_count(void)
 	}
 
 	return count;
+}
+
+void scheduler_dump_tasks(void)
+{
+	console_write("ID\tSTATE\tNAME\n");
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].state != TASK_UNUSED) {
+			console_write_hex64(tasks[i].id);
+			console_write("\t");
+			
+			const char *state_str = "UNKNOWN";
+			switch (tasks[i].state) {
+			case TASK_RUNNING: state_str = "RUNNING"; break;
+			case TASK_READY: state_str = "READY"; break;
+			case TASK_BLOCKED: state_str = "BLOCKED"; break;
+			case TASK_SLEEPING: state_str = "SLEEPING"; break;
+			case TASK_DEAD: state_str = "DEAD"; break;
+			default: break;
+			}
+			
+			console_write(state_str);
+			console_write("\t");
+			console_write(tasks[i].name);
+			console_write("\n");
+		}
+	}
+}
+
+void scheduler_set_stdout(int fd)
+{
+	interrupts_disable();
+	if (current_task != 0) {
+		current_task->stdout_fd = fd;
+	}
+	interrupts_enable();
+}
+
+int scheduler_get_stdout(void)
+{
+	int fd = -1;
+	interrupts_disable();
+	if (current_task != 0) {
+		fd = current_task->stdout_fd;
+	}
+	interrupts_enable();
+	return fd;
 }

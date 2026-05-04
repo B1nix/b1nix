@@ -5,10 +5,17 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/io.h>
 #include <string.h>
 
 static u64 sys_write(const char *text, usize size)
 {
+	int fd = scheduler_get_stdout();
+	if (fd != -1) {
+		return (u64)vfs_write(fd, text, size);
+	}
+
 	for (usize i = 0; i < size; i++) {
 		console_putc(text[i]);
 	}
@@ -116,10 +123,30 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		echo[2] = 0; // Checksum
 		echo[3] = 0;
 		echo[4] = 0; // ID
-		echo[5] = 1; // Seq
+
+		for (int i = 0; i < 4; i++) {
+			echo[2] = 0;
+			echo[3] = 0;
+			echo[5] = i + 1; // Seq
+			
+			u32 sum = 0;
+			for (usize j = 0; j < 64; j += 2) {
+				sum += ((u16)echo[j] << 8) | echo[j + 1];
+			}
+			while ((sum >> 16) != 0) {
+				sum = (sum & 0xffff) + (sum >> 16);
+			}
+			u16 csum = ~sum;
+			echo[2] = (u8)(csum >> 8);
+			echo[3] = (u8)(csum & 0xff);
+
+			ipv4_send(dest, 1 /* ICMP */, echo, sizeof(echo));
+			console_write("ping: sent request seq=");
+			console_write_dec(i + 1);
+			console_write("\n");
+			scheduler_sleep_ticks(100); // Wait approx 1 second
+		}
 		
-		ipv4_send(dest, 1 /* ICMP */, echo, sizeof(echo));
-		console_write("ping: sent request\n");
 		return 0;
 	}
 	case SYS_NET_DNS:
@@ -129,6 +156,50 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return sys_read_kbd();
 	case SYS_CLEAR:
 		return sys_clear();
+	case SYS_PS:
+		scheduler_dump_tasks();
+		return 0;
+	case SYS_MEM:
+		console_write("Total usable memory: ");
+		console_write_dec(pmm_total_usable_memory() / 1024);
+		console_write(" KB\n");
+		console_write("Free memory approx:  ");
+		console_write_dec(pmm_free_memory_estimate() / 1024);
+		console_write(" KB\n");
+		return 0;
+	case SYS_REBOOT:
+		outb(0x64, 0xFE);
+		while (1) {
+			__asm__ volatile("hlt");
+		}
+		return 0;
+	case SYS_SET_STDOUT:
+		scheduler_set_stdout((int)arg0);
+		return 0;
+	case SYS_NET_INFO: {
+		struct mac_addr mac = net_get_mac();
+		struct ipv4_addr ip = net_get_ip();
+		struct ipv4_addr gw = net_get_gateway();
+
+		console_write("MAC Address: ");
+		for (int i = 0; i < 6; i++) {
+			if (mac.bytes[i] < 0x10) console_write("0");
+			console_write_hex32(mac.bytes[i]);
+			if (i < 5) console_write(":");
+		}
+		console_write("\nIP Address:  ");
+		for (int i = 0; i < 4; i++) {
+			console_write_dec(ip.bytes[i]);
+			if (i < 3) console_write(".");
+		}
+		console_write("\nGateway:     ");
+		for (int i = 0; i < 4; i++) {
+			console_write_dec(gw.bytes[i]);
+			if (i < 3) console_write(".");
+		}
+		console_write("\n");
+		return 0;
+	}
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

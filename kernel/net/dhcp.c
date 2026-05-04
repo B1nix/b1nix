@@ -42,7 +42,7 @@ void dhcp_init(void)
 	pkt.htype = 1; // Ethernet
 	pkt.hlen = 6;
 	pkt.xid = current_xid;
-	pkt.magic_cookie = 0x63825363; // 99.130.83.99 network byte order
+	pkt.magic_cookie = 0x63538263; // 99.130.83.99 network byte order
 	
 	struct mac_addr mac = net_get_mac();
 	memcpy(pkt.chaddr, mac.bytes, 6);
@@ -92,7 +92,7 @@ void dhcp_receive(const void *data, usize size)
 		req.htype = 1;
 		req.hlen = 6;
 		req.xid = current_xid;
-		req.magic_cookie = 0x63825363;
+		req.magic_cookie = 0x63538263;
 		
 		struct mac_addr mac = net_get_mac();
 		memcpy(req.chaddr, mac.bytes, 6);
@@ -117,7 +117,7 @@ void dhcp_receive(const void *data, usize size)
 		
 		console_write("net: dhcp bound to ");
 		for (int i = 0; i < 4; i++) {
-			console_write_hex64(pkt->yiaddr.bytes[i]);
+			console_write_dec(pkt->yiaddr.bytes[i]);
 			if (i < 3) console_write(".");
 		}
 		console_write("\n");

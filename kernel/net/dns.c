@@ -107,7 +107,7 @@ void dns_receive(const void *data, usize size)
 		if (type == 1 && rdlength == 4 && ptr + 4 <= (const u8 *)data + size) {
 			console_write("net: dns resolved to ");
 			for (int i = 0; i < 4; i++) {
-				console_write_hex64(ptr[i]);
+				console_write_dec(ptr[i]);
 				if (i < 3) console_write(".");
 			}
 			console_write("\n");

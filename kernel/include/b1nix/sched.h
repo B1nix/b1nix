@@ -14,5 +14,8 @@ void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
 void scheduler_exit_current(void) __attribute__((noreturn));
 usize scheduler_task_count(void);
+void scheduler_dump_tasks(void);
+void scheduler_set_stdout(int fd);
+int scheduler_get_stdout(void);
 
 #endif

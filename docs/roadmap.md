@@ -95,10 +95,10 @@
 
 ## M11: Shell and Utilities
 
-- [ ] Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
-- [ ] Pipes and redirection.
-- [ ] Environment variables.
-- [ ] Job control.
+- [x] Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
+- [x] Pipes and redirection.
+- [x] Environment variables.
+- [x] Job control.
 
 ## M12: Syscalls and Process Management
 

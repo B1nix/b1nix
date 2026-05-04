@@ -139,3 +139,22 @@ void console_write_hex64(u64 value)
 		console_putc(digits[(value >> shift) & 0xf]);
 	}
 }
+
+void console_write_dec(u64 value)
+{
+	if (value == 0) {
+		console_putc('0');
+		return;
+	}
+
+	char buf[20];
+	int i = 0;
+	while (value > 0) {
+		buf[i++] = '0' + (value % 10);
+		value /= 10;
+	}
+
+	for (int j = i - 1; j >= 0; j--) {
+		console_putc(buf[j]);
+	}
+}

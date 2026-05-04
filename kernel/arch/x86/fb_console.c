@@ -97,6 +97,35 @@ static void fb_draw_char(char c, u32 x, u32 y)
     }
 }
 
+static void fb_console_scroll(void)
+{
+    u32 line_height = 8 * FONT_SCALE;
+    if (fb.height < line_height) return;
+
+    u32 bytes_per_line = fb.pitch;
+    u32 scroll_height = fb.height - line_height;
+
+    u8 *dst = (u8 *)fb_ptr;
+    u8 *src = (u8 *)fb_ptr + (line_height * bytes_per_line);
+    
+    // Copy forward since dst < src
+    for (u32 y = 0; y < scroll_height; y++) {
+        for (u32 x = 0; x < bytes_per_line; x++) {
+            dst[y * bytes_per_line + x] = src[y * bytes_per_line + x];
+        }
+    }
+
+    // Clear bottom line
+    for (u32 y = scroll_height; y < fb.height; y++) {
+        for (u32 x = 0; x < fb.width; x++) {
+            u8 *pixel = (u8 *)fb_ptr + (y * fb.pitch) + (x * (fb.bpp / 8));
+            *(u32 *)pixel = bg_color;
+        }
+    }
+
+    cursor_y -= line_height;
+}
+
 void fb_console_putchar(char c)
 {
     if (!fb_ptr) return;
@@ -119,9 +148,8 @@ void fb_console_putchar(char c)
         }
     }
 
-    if (cursor_y >= fb.height) {
-        // Simple scroll (not implemented yet, just wrap around for now)
-        cursor_y = 0;
+    while (cursor_y + 8 * FONT_SCALE > fb.height) {
+        fb_console_scroll();
     }
 }
 
