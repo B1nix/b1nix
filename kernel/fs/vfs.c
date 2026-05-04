@@ -140,6 +140,11 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type, void
 	return 0;
 }
 
+struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type, void *data, usize size, u32 flags)
+{
+	return add_node(path, type, data, size, flags);
+}
+
 static int alloc_handle(struct vfs_node *node)
 {
 	for (usize i = 0; i < MAX_VFS_HANDLES; i++) {
@@ -198,9 +203,17 @@ isize vfs_read(int handle, char *buffer, usize size)
 	struct vfs_handle *h = &handles[handle];
 	struct vfs_node *node = h->node;
 
+	if (node->read_cb) {
+		isize bytes = node->read_cb(node, h->offset, buffer, size);
+		if (bytes > 0) {
+			h->offset += bytes;
+		}
+		return bytes;
+	}
+
 	if (node->type == VFS_DEVICE || node->type == VFS_DIRECTORY) return 0;
 
-	usize remaining = node->size - h->offset;
+	usize remaining = node->size > h->offset ? node->size - h->offset : 0;
 	usize to_read = size < remaining ? size : remaining;
 
 	if (to_read > 0) {
@@ -215,6 +228,15 @@ isize vfs_write(int handle, const char *buffer, usize size)
 	if (handle < 0 || (usize)handle >= MAX_VFS_HANDLES || !handles[handle].used) return -1;
 
 	struct vfs_node *node = handles[handle].node;
+	struct vfs_handle *h = &handles[handle];
+
+	if (node->write_cb) {
+		isize bytes = node->write_cb(node, h->offset, buffer, size);
+		if (bytes > 0) {
+			h->offset += bytes;
+		}
+		return bytes;
+	}
 
 	if (node->type == VFS_DEVICE && strcmp(node->name, "console") == 0) {
 		for (usize i = 0; i < size; i++) {
@@ -238,6 +260,36 @@ int vfs_create(const char *path, const char *data)
 {
 	if (vfs_find_node(path) != 0) return -1;
 
+	usize len = strlen(path);
+	isize last_slash = -1;
+	for (isize i = len - 1; i >= 0; i--) {
+		if (path[i] == '/') {
+			last_slash = i;
+			break;
+		}
+	}
+
+	if (last_slash >= 0) {
+		char parent_path[256];
+		if (last_slash == 0) {
+			parent_path[0] = '/';
+			parent_path[1] = '\0';
+		} else {
+			usize cp_len = last_slash < 255 ? last_slash : 255;
+			memcpy(parent_path, path, cp_len);
+			parent_path[cp_len] = '\0';
+		}
+		
+		struct vfs_node *parent = vfs_find_node(parent_path);
+		if (parent && parent->create_cb) {
+			const char *name = path + last_slash + 1;
+			if (parent->create_cb(parent, name, path) == 0) {
+				return 0;
+			}
+			return -1;
+		}
+	}
+
 	usize size = strlen(data);
 	char *data_copy = kmalloc(size + 1);
 	memcpy(data_copy, data, size + 1);
@@ -255,6 +307,10 @@ usize vfs_list(const char *dir_path, const char **names, usize max_names)
 {
 	struct vfs_node *dir = vfs_find_node(dir_path);
 	if (!dir || dir->type != VFS_DIRECTORY) return 0;
+
+	if (dir->list_cb) {
+		return dir->list_cb(dir, names, max_names);
+	}
 
 	usize count = 0;
 	struct vfs_node *child = dir->first_child;

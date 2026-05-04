@@ -15,4 +15,10 @@ struct block_device {
 void blk_register(struct block_device *dev);
 struct block_device *blk_get(const char *name);
 
+// Block Cache API
+void blk_cache_init(void);
+int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer);
+int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *buffer);
+void blk_cache_flush(struct block_device *dev);
+
 #endif

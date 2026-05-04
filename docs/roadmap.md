@@ -115,3 +115,43 @@
 - [x] C kernel entry and memory map parsing for AArch64.
 - [x] Implement AArch64 architecture layer.
 - [x] Ensure common code compiles for both platforms.
+
+## M14: Advanced Storage, Swap & File Systems
+
+- [x] Block device abstraction layer and caching.
+- [ ] SATA/AHCI driver support.
+- [ ] NVMe driver support.
+- [x] Ext2 filesystem driver (Read-only implemented).
+- [ ] Ext1 (legacy) read-only support (optional).
+- [ ] Page Swapping (Swap space) support.
+- [ ] Demand Paging optimization and OOM killer.
+- [ ] Journaling abstraction for VFS.
+- [ ] Advanced file locking (flock/fcntl).
+
+## M15: IPC, Security & Standard OS Features
+
+- [ ] Process Signals (SIGINT, SIGKILL, SIGSEGV, etc.).
+- [ ] Inter-process communication (UNIX domain sockets, message queues).
+- [ ] POSIX shared memory (`shmget`, `shmat`).
+- [ ] User and Group ID management (UID/GID) and ring transitions.
+- [ ] File permissions, capabilities, and ACLs.
+- [ ] Standard C library (libc) port (e.g., newlib or musl).
+- [ ] Port of standard utilities (GNU coreutils / BusyBox).
+
+## M16: User Space Applications & TUI
+
+- [ ] Mini File Manager (TUI-based, Midnight Commander style).
+- [ ] File tracking and build automation utility (`make` clone).
+- [ ] Text editor (e.g., `vi` or `nano` clone).
+
+## M17: POSIX Syscall Compliance & Self-Hosting
+
+- [ ] POSIX Process Management: `fork()`, standard `execve()`, `waitpid()`.
+- [ ] POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
+- [ ] POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
+- [ ] POSIX Memory: Proper user-space `mmap()`, `munmap()`, `brk()`.
+- [ ] POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()`.
+- [ ] POSIX Terminal: `ioctl()` and `termios` support for proper TTY.
+- [ ] Cross-compile and port GCC (C/C++ compiler) specifically for `x86_64-b1nix`.
+- [ ] Port GNU Binutils (`as`, `ld`) and GNU Make.
+- [ ] Achieve self-hosting: compile the B1NIX kernel *inside* B1NIX using ported GCC.

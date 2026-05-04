@@ -21,6 +21,7 @@ u64 pmm_free_memory_estimate(void);
 void kheap_init(void);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
+void kfree(void *ptr);
 
 void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);

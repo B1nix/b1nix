@@ -9,6 +9,8 @@
 #include <b1nix/serial.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/blk.h>
+#include <b1nix/ext2.h>
 
 extern void ps2_kbd_init(void);
 extern void compositor_init(void);
@@ -76,10 +78,12 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	scheduler_init();
 	arch_init();
+	blk_cache_init();
 
 	initramfs_init();
 #ifndef __aarch64__
 	vfs_init();
+	ext2_init();
 	net_init();
 	ps2_kbd_init();
 	compositor_init();

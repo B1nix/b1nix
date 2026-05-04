@@ -48,6 +48,7 @@ KERNEL_SOURCES := \
 	kernel/fs/initramfs.c \
 	kernel/fs/vfs.c \
 	kernel/fs/fat32.c \
+	kernel/fs/ext2.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	$(ARCH_SOURCES)
@@ -109,6 +110,19 @@ run-x86: iso
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
 		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
+
+run-ext2: iso
+	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	@echo "Generating ext2 image..."
+	@mkdir -p $(BUILD_DIR)/ext2_root
+	@echo "Hello from Ext2!" > $(BUILD_DIR)/ext2_root/hello_ext2.txt
+	@echo "Another file" > $(BUILD_DIR)/ext2_root/test.txt
+	@dd if=/dev/zero of=$(BUILD_DIR)/disk.ext2 bs=1048576 count=8 2>/dev/null
+	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext2 -q -d $(BUILD_DIR)/ext2_root $(BUILD_DIR)/disk.ext2
+	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
+	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
+		-drive file=$(BUILD_DIR)/disk.ext2,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 run-aarch64: ARCH=aarch64

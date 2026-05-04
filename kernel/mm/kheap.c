@@ -81,3 +81,8 @@ void *kzalloc(usize size)
 
 	return ptr;
 }
+
+void kfree(void *ptr)
+{
+	(void)ptr; // Bump allocator does not support freeing
+}
