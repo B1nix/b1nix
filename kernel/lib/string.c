@@ -23,6 +23,17 @@ void *memset(void *dest, int value, size_t count)
 	return dest;
 }
 
+int memcmp(const void *ptr1, const void *ptr2, size_t count)
+{
+	const unsigned char *p1 = ptr1;
+	const unsigned char *p2 = ptr2;
+	for (size_t i = 0; i < count; i++) {
+		if (p1[i] < p2[i]) return -1;
+		if (p1[i] > p2[i]) return 1;
+	}
+	return 0;
+}
+
 int strcmp(const char *left, const char *right)
 {
 	while (*left != '\0' && *left == *right) {

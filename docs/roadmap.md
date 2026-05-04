@@ -85,13 +85,13 @@
 
 ## M10: Full Network Stack
 
-- [ ] Ethernet frames parsing and sending.
-- [ ] ARP resolution.
-- [ ] IPv4 routing.
-- [ ] ICMP ping responses.
-- [ ] UDP protocol.
-- [ ] DHCP client.
-- [ ] DNS client.
+- [x] Ethernet frames parsing and sending.
+- [x] ARP resolution.
+- [x] IPv4 routing.
+- [x] ICMP ping responses.
+- [x] UDP protocol.
+- [x] DHCP client.
+- [x] DNS client.
 
 ## M11: Shell and Utilities
 

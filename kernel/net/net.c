@@ -1,75 +1,9 @@
-#include <string.h>
 #include <b1nix/console.h>
 #include <b1nix/net.h>
-#include <b1nix/types.h>
-
-#define ETHERTYPE_ARP 0x0806
-#define ETHERTYPE_IPV4 0x0800
-#define IP_PROTO_ICMP 1
-#define IP_PROTO_UDP 17
-
-struct mac_addr {
-	u8 bytes[6];
-};
-
-struct ipv4_addr {
-	u8 bytes[4];
-};
-
-struct ethernet_frame {
-	struct mac_addr dst;
-	struct mac_addr src;
-	u16 ethertype;
-	const u8 *payload;
-	usize payload_size;
-};
-
-static struct mac_addr local_mac = { { 0x52, 0x54, 0x00, 0x12, 0x34, 0x56 } };
-static struct ipv4_addr local_ip = { { 10, 0, 2, 15 } };
-static struct ipv4_addr gateway_ip = { { 10, 0, 2, 2 } };
-
-static u16 bswap16(u16 value)
-{
-	return (u16)((value << 8) | (value >> 8));
-}
-
-static u16 ipv4_checksum(const u8 *data, usize size)
-{
-	u32 sum = 0;
-
-	for (usize i = 0; i + 1 < size; i += 2) {
-		sum += ((u16)data[i] << 8) | data[i + 1];
-	}
-
-	if ((size & 1) != 0) {
-		sum += (u16)data[size - 1] << 8;
-	}
-
-	while ((sum >> 16) != 0) {
-		sum = (sum & 0xffff) + (sum >> 16);
-	}
-
-	return (u16)~sum;
-}
-
-static void print_ipv4(struct ipv4_addr ip)
-{
-	for (usize i = 0; i < 4; i++) {
-		u8 value = ip.bytes[i];
-		if (value >= 100) {
-			console_putc((char)('0' + value / 100));
-		}
-		if (value >= 10) {
-			console_putc((char)('0' + (value / 10) % 10));
-		}
-		console_putc((char)('0' + value % 10));
-		if (i != 3) {
-			console_write(".");
-		}
-	}
-}
-
 #include <b1nix/virtio.h>
+#include <b1nix/mm.h>
+#include <b1nix/sched.h>
+#include <string.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_NET_DEVICE_ID 0x1000
@@ -78,113 +12,164 @@ static struct virtio_device net_dev;
 static struct virtqueue net_rx_vq;
 static struct virtqueue net_tx_vq;
 
+static struct mac_addr local_mac;
+static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
+static struct ipv4_addr gateway_ip = { { 0, 0, 0, 0 } };
+
+struct mac_addr net_get_mac(void) { return local_mac; }
+struct ipv4_addr net_get_ip(void) { return local_ip; }
+struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
+void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
+void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
+
+#define RX_BUFFER_SIZE 2048
+#define NUM_RX_BUFFERS 16
+
+struct rx_buffer {
+	struct virtio_net_hdr hdr;
+	u8 data[RX_BUFFER_SIZE];
+} __attribute__((packed));
+
+static struct rx_buffer *rx_buffers;
+
+static void fill_rx_buffer(u16 idx)
+{
+	u16 d0 = idx;
+	net_rx_vq.desc[d0].addr = (u64)(usize)&rx_buffers[idx];
+	net_rx_vq.desc[d0].len = sizeof(struct rx_buffer);
+	net_rx_vq.desc[d0].flags = VRING_DESC_F_WRITE;
+	net_rx_vq.desc[d0].next = 0;
+
+	u16 avail_idx = net_rx_vq.avail->idx % net_rx_vq.queue_size;
+	net_rx_vq.avail->ring[avail_idx] = d0;
+
+	__asm__ volatile("" ::: "memory");
+	net_rx_vq.avail->idx++;
+	__asm__ volatile("" ::: "memory");
+}
+
 static void virtio_net_probe(void)
 {
 	if (!virtio_init_device(&net_dev, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)) {
-		console_write("virtio-net: no device found, using loopback demo device\n");
+		console_write("virtio-net: no device found\n");
 		return;
 	}
 
 	virtio_set_guest_features(&net_dev, 0);
 	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
 
-	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
-		console_write("virtio-net: failed to init rx virtqueue\n");
-		return;
-	}
+	if (!virtq_init(&net_dev, 0, &net_rx_vq)) return;
+	if (!virtq_init(&net_dev, 1, &net_tx_vq)) return;
 
-	if (!virtq_init(&net_dev, 1, &net_tx_vq)) {
-		console_write("virtio-net: failed to init tx virtqueue\n");
-		return;
+	// Read MAC from device config space (ports + 20 for legacy virtio pci)
+	for (int i = 0; i < 6; i++) {
+		// Port I/O read from config space
+		u16 port = net_dev.port_base + 20 + i;
+		u8 val;
+		__asm__ volatile("inb %w1, %b0" : "=a"(val) : "Nd"(port));
+		local_mac.bytes[i] = val;
 	}
 
 	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
 
-	console_write("virtio-net: initialized successfully on PCI\n");
-}
+	// Populate RX queue
+	rx_buffers = kzalloc(sizeof(struct rx_buffer) * NUM_RX_BUFFERS);
+	for (u16 i = 0; i < NUM_RX_BUFFERS; i++) {
+		fill_rx_buffer(i);
+	}
+	virtq_kick(&net_dev, &net_rx_vq);
 
-static void ethernet_parse_demo(void)
-{
-	struct ethernet_frame frame = {
-		.dst = local_mac,
-		.src = local_mac,
-		.ethertype = bswap16(ETHERTYPE_IPV4),
-		.payload = 0,
-		.payload_size = 0,
-	};
-
-	console_write("net: ethernet frame ethertype 0x");
-	console_write_hex64(bswap16(frame.ethertype));
+	console_write("virtio-net: initialized with MAC ");
+	for (int i = 0; i < 6; i++) {
+		if (local_mac.bytes[i] < 0x10) console_write("0");
+		console_write_hex32(local_mac.bytes[i]);
+		if (i < 5) console_write(":");
+	}
 	console_write("\n");
 }
 
-static void arp_demo(void)
+static void net_task(void *arg)
 {
-	console_write("net: arp learned gateway ");
-	print_ipv4(gateway_ip);
-	console_write(" -> 52:54:00:12:34:02\n");
-}
-
-static void ipv4_demo(void)
-{
-	u8 header[20];
-	memset(header, 0, sizeof(header));
-	header[0] = 0x45;
-	header[2] = 0;
-	header[3] = sizeof(header);
-	header[8] = 64;
-	header[9] = IP_PROTO_ICMP;
-	header[12] = local_ip.bytes[0];
-	header[13] = local_ip.bytes[1];
-	header[14] = local_ip.bytes[2];
-	header[15] = local_ip.bytes[3];
-	header[16] = gateway_ip.bytes[0];
-	header[17] = gateway_ip.bytes[1];
-	header[18] = gateway_ip.bytes[2];
-	header[19] = gateway_ip.bytes[3];
-
-	u16 checksum = ipv4_checksum(header, sizeof(header));
-	console_write("net: ipv4 checksum 0x");
-	console_write_hex64(checksum);
-	console_write("\n");
-}
-
-static void icmp_demo(void)
-{
-	console_write("net: icmp echo request -> reply locally synthesized\n");
-}
-
-static void udp_demo(void)
-{
-	const char *payload = "b1nix udp";
-	console_write("net: udp send ");
-	console_write_hex64(strlen(payload));
-	console_write(" bytes to ");
-	print_ipv4(gateway_ip);
-	console_write(":68\n");
-}
-
-static void dhcp_demo(void)
-{
-	console_write("net: dhcp discover -> offer ");
-	print_ipv4(local_ip);
-	console_write(" (demo lease)\n");
+	(void)arg;
+	while (1) {
+		net_poll();
+		scheduler_yield();
+	}
 }
 
 void net_init(void)
 {
 	virtio_net_probe();
-	console_write("net: stack initialized with demo ip ");
-	print_ipv4(local_ip);
-	console_write("\n");
+	arp_init();
+	dhcp_init();
+	
+	// Wait until DHCP gets an IP or a timeout
+	for (int i = 0; i < 50; i++) {
+		net_poll();
+		if (local_ip.bytes[0] != 0) break;
+		for (volatile int j = 0; j < 1000000; j++); // Simple delay
+	}
+
+	kthread_create("net_task", net_task, 0);
 }
 
-void net_demo(void)
+void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
 {
-	ethernet_parse_demo();
-	arp_demo();
-	ipv4_demo();
-	icmp_demo();
-	udp_demo();
-	dhcp_demo();
+	// Allocate TX buffer (simplistic bump allocation for now, no free)
+	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
+	u8 *buffer = kzalloc(packet_size);
+	if (!buffer) return;
+
+	struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
+	hdr->flags = 0;
+	hdr->gso_type = 0;
+
+	u8 *eth_hdr = buffer + sizeof(struct virtio_net_hdr);
+	memcpy(eth_hdr, dst.bytes, 6);
+	memcpy(eth_hdr + 6, local_mac.bytes, 6);
+	eth_hdr[12] = (ethertype >> 8) & 0xFF;
+	eth_hdr[13] = ethertype & 0xFF;
+	memcpy(eth_hdr + 14, payload, size);
+
+	u16 d0 = net_tx_vq.avail->idx % net_tx_vq.queue_size;
+	net_tx_vq.desc[d0].addr = (u64)(usize)buffer;
+	net_tx_vq.desc[d0].len = packet_size;
+	net_tx_vq.desc[d0].flags = 0;
+	net_tx_vq.desc[d0].next = 0;
+
+	net_tx_vq.avail->ring[d0] = d0;
+	__asm__ volatile("" ::: "memory");
+	net_tx_vq.avail->idx++;
+	__asm__ volatile("" ::: "memory");
+
+	virtq_kick(&net_dev, &net_tx_vq);
+
+	// Poll until sent
+	while (net_tx_vq.used->idx == net_tx_vq.last_used_idx) {
+		__asm__ volatile("pause" ::: "memory");
+	}
+	net_tx_vq.last_used_idx++;
+}
+
+void net_poll(void)
+{
+	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx) {
+		u16 used_idx = net_rx_vq.last_used_idx % net_rx_vq.queue_size;
+		u32 id = net_rx_vq.used->ring[used_idx].id;
+		u32 len = net_rx_vq.used->ring[used_idx].len;
+
+		if (id < NUM_RX_BUFFERS) {
+			struct rx_buffer *buf = &rx_buffers[id];
+			if (len > sizeof(struct virtio_net_hdr)) {
+				usize payload_len = len - sizeof(struct virtio_net_hdr);
+				ethernet_receive(buf->data, payload_len);
+			}
+
+			// Re-arm
+			fill_rx_buffer((u16)id);
+			virtq_kick(&net_dev, &net_rx_vq);
+		}
+
+		net_rx_vq.last_used_idx++;
+	}
 }

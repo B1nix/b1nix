@@ -5,6 +5,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <string.h>
 
 static u64 sys_write(const char *text, usize size)
 {
@@ -87,8 +88,42 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_CREATE:
 		return (u64)vfs_create((const char *)(usize)arg0, (const char *)(usize)arg1);
-	case SYS_NET_DEMO:
-		net_demo();
+	case SYS_NET_PING: {
+		struct ipv4_addr dest;
+		const char *ip_str = (const char *)(usize)arg0;
+		// A real OS would parse the string. For our demo, we just parse a simple string or assume it's an IPv4 string
+		// Since we don't have a generic inet_pton yet, we will just send an ICMP Echo to the given IP
+		// For simplicity, we assume arg0 is actually a pointer to a struct ipv4_addr, OR we parse it.
+		// Wait, the shell will pass a string!
+		// We'll write a quick parser.
+		usize i = 0, j = 0;
+		u8 val = 0;
+		while (ip_str[i] && j < 4) {
+			if (ip_str[i] == '.') {
+				dest.bytes[j++] = val;
+				val = 0;
+			} else {
+				val = val * 10 + (ip_str[i] - '0');
+			}
+			i++;
+		}
+		if (j < 4) dest.bytes[j] = val;
+
+		u8 echo[64];
+		memset(echo, 0, 64);
+		echo[0] = 8; // Type: Echo Request
+		echo[1] = 0; // Code
+		echo[2] = 0; // Checksum
+		echo[3] = 0;
+		echo[4] = 0; // ID
+		echo[5] = 1; // Seq
+		
+		ipv4_send(dest, 1 /* ICMP */, echo, sizeof(echo));
+		console_write("ping: sent request\n");
+		return 0;
+	}
+	case SYS_NET_DNS:
+		dns_resolve((const char *)(usize)arg0);
 		return 0;
 	case SYS_READ_KBD:
 		return sys_read_kbd();

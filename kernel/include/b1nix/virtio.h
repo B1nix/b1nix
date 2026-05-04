@@ -57,6 +57,15 @@ struct virtqueue {
 	struct vring_used *used;
 };
 
+struct virtio_net_hdr {
+	u8 flags;
+	u8 gso_type;
+	u16 hdr_len;
+	u16 gso_size;
+	u16 csum_start;
+	u16 csum_offset;
+} __attribute__((packed));
+
 struct virtio_device {
 	u16 port_base;
 	u16 irq;

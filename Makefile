@@ -60,6 +60,13 @@ KERNEL_SOURCES := \
 			kernel/dev/compositor.c \
 			kernel/dev/virtio_gpu.c \
 			kernel/net/net.c \
+			kernel/net/ethernet.c \
+			kernel/net/arp.c \
+			kernel/net/ipv4.c \
+			kernel/net/icmp.c \
+			kernel/net/udp.c \
+			kernel/net/dhcp.c \
+			kernel/net/dns.c \
 		kernel/user/process.c \
 		kernel/user/programs.c \
 		$(ARCH_SOURCES)

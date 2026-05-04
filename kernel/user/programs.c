@@ -83,7 +83,8 @@ static int sh_main(int argc, const char **argv)
 			uwrite("  cat <file> - Read and print a file's content\n");
 			uwrite("  echo <txt> - Print text\n");
 			uwrite("  clear      - Clear the screen\n");
-			uwrite("  net        - Run network demo\n");
+			uwrite("  ping <ip>  - Send ICMP echo request\n");
+			uwrite("  resolve <domain> - Resolve DNS name\n");
 		} else if (strncmp(cmd, "ls", 2) == 0 && (cmd[2] == ' ' || cmd[2] == '\0')) {
 			const char *target = cwd;
 			if (cmd[2] == ' ') {
@@ -96,8 +97,14 @@ static int sh_main(int argc, const char **argv)
 			syscall_dispatch(SYS_LIST, (u64)(usize)abs_path, 0, 0, 0);
 		} else if (strcmp(cmd, "clear") == 0) {
 			syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
-		} else if (strcmp(cmd, "net") == 0) {
-			syscall_dispatch(SYS_NET_DEMO, 0, 0, 0, 0);
+		} else if (strncmp(cmd, "ping ", 5) == 0) {
+			char *target = cmd + 5;
+			while (*target == ' ') target++;
+			syscall_dispatch(SYS_NET_PING, (u64)(usize)target, 0, 0, 0);
+		} else if (strncmp(cmd, "resolve ", 8) == 0) {
+			char *target = cmd + 8;
+			while (*target == ' ') target++;
+			syscall_dispatch(SYS_NET_DNS, (u64)(usize)target, 0, 0, 0);
 		} else if (strncmp(cmd, "echo ", 5) == 0) {
 			uwrite(cmd + 5);
 			uwrite("\n");

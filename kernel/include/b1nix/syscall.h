@@ -14,9 +14,10 @@ enum syscall_number {
 	SYS_READ = 8,
 	SYS_CLOSE = 9,
 	SYS_CREATE = 10,
-	SYS_NET_DEMO = 11,
-	SYS_READ_KBD = 12,
-	SYS_CLEAR = 13,
+	SYS_NET_PING = 11,
+	SYS_NET_DNS = 12,
+	SYS_READ_KBD = 13,
+	SYS_CLEAR = 14,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
