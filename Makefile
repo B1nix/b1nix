@@ -118,6 +118,8 @@ run-x86: iso
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
 		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/ext3.img,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/ext4.img,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 run-ext2: iso

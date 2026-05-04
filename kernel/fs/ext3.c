@@ -681,7 +681,7 @@ static void ext3_populate_vfs(u32 ino, const char *base_path)
 
 void ext3_init(void)
 {
-    ext3_dev = blk_get("virtio-blk0");
+    ext3_dev = blk_get("virtio-blk1");
     if (!ext3_dev) ext3_dev = blk_get("sata0");
     if (!ext3_dev) return;
 

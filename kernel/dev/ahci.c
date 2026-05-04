@@ -361,6 +361,12 @@ void ahci_init(void)
     console_write_hex64(ahci_pci_bar5);
     console_write("\n");
 
+    // If BAR5 is 0, controller is in IDE mode — skip AHCI init
+    if (ahci_pci_bar5 == 0) {
+        console_write("ahci: ABAR is zero (likely IDE mode), skipping\n");
+        return;
+    }
+
     // Map ABAR into kernel's virtual address space via direct map
     u64 abar_virt = vmm_direct_map_base() + ahci_pci_bar5;
     ahci_bar = (volatile struct ahci_hba_mem *)(usize)abar_virt;
