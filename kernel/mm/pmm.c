@@ -237,3 +237,8 @@ u64 pmm_free_memory_estimate(void)
 {
 	return pmm.free_frames * PAGE_SIZE;
 }
+
+usize pmm_free_frame_count(void)
+{
+	return (usize)pmm.free_frames;
+}

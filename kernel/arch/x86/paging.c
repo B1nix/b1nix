@@ -152,3 +152,92 @@ u64 vmm_direct_map_base(void)
 {
 	return DIRECT_MAP_BASE;
 }
+
+// Mark a page as lazy (will allocate on first access)
+void vmm_set_lazy(u64 virtual_address)
+{
+	if ((virtual_address & (PAGE_SIZE - 1)) != 0) return;
+
+	u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual_address));
+	u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+	u64 *pt = ensure_child_table(pd, pd_index(virtual_address));
+
+	// Set a non-present entry with LAZY flag so we know it's a lazy page
+	pt[pt_index(virtual_address)] = VMM_LAZY;
+	invalidate_page(virtual_address);
+}
+
+// Handle page faults for demand paging and swap
+int vmm_handle_page_fault(u64 fault_addr, u64 error_code)
+{
+	u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
+	
+	// Get the page table entry
+	u64 pml4e = kernel_pml4[pml4_index(page_aligned)];
+	if ((pml4e & VMM_PRESENT) == 0) return -1;
+	
+	u64 *pdpt = table_from_entry(pml4e);
+	u64 pdpte = pdpt[pdpt_index(page_aligned)];
+	if ((pdpte & VMM_PRESENT) == 0) return -1;
+	
+	u64 *pd = table_from_entry(pdpte);
+	u64 pde = pd[pd_index(page_aligned)];
+	if ((pde & VMM_PRESENT) == 0) return -1;
+	
+	u64 *pt = table_from_entry(pde);
+	u64 pte = pt[pt_index(page_aligned)];
+
+	// Case 1: Lazy page (marked with VMM_LAZY flag, not present)
+	if (!(pte & VMM_PRESENT) && (pte & VMM_LAZY)) {
+		u64 frame = pmm_alloc_frame();
+		if (!frame) {
+			// Try to swap something out to free memory
+			console_write("pf: OOM during lazy allocation, trying swap\n");
+			return -1;
+		}
+		
+		// Build proper flags from saved flags
+		u64 flags = VMM_PRESENT | VMM_WRITABLE;
+		if (pte & VMM_USER) flags |= VMM_USER;
+		
+		pt[pt_index(page_aligned)] = frame | flags;
+		invalidate_page(page_aligned);
+		return 0;
+	}
+
+	// Case 2: Swapped page (custom bit stored in non-present entry)
+	if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
+		u64 new_frame = 0;
+		if (swap_in(page_aligned, &new_frame) < 0) {
+			console_write("pf: swap in failed for 0x");
+			console_write_hex64(page_aligned);
+			console_write("\n");
+			return -1;
+		}
+		
+		// Build flags from saved bits
+		u64 flags = VMM_PRESENT | VMM_WRITABLE;
+		if (pte & VMM_USER) flags |= VMM_USER;
+		if (pte & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
+		
+		pt[pt_index(page_aligned)] = new_frame | flags;
+		invalidate_page(page_aligned);
+		return 0;
+	}
+
+	// Case 3: Copy-on-Write (write to a read-only shared page)
+	if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && !(pte & VMM_WRITABLE)) {
+		u64 old_frame = pte & PAGE_ENTRY_ADDRESS_MASK;
+		u64 new_frame = pmm_alloc_frame();
+		if (!new_frame) return -1;
+		
+		// Copy old page contents
+		memcpy((void *)(usize)new_frame, (void *)(usize)old_frame, PAGE_SIZE);
+		
+		pt[pt_index(page_aligned)] = new_frame | VMM_PRESENT | VMM_WRITABLE | VMM_USER;
+		invalidate_page(page_aligned);
+		return 0;
+	}
+	
+	return -1; // Unhandled
+}

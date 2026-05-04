@@ -1,5 +1,6 @@
 #include <b1nix/console.h>
 #include <b1nix/io.h>
+#include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
@@ -235,6 +236,16 @@ void x86_irq_handler(struct interrupt_frame *frame)
 
 void x86_exception_handler(struct interrupt_frame *frame)
 {
+	// Page fault handling for Demand Paging
+	if (frame->vector == 14) {
+		u64 fault_addr = read_cr2();
+		u64 error_code = frame->error_code;
+		
+		if (vmm_handle_page_fault(fault_addr, error_code) == 0) {
+			return; // Successfully handled
+		}
+	}
+
 	const char *name = "unknown exception";
 
 	if (frame->vector < 32) {

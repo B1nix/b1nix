@@ -297,6 +297,12 @@ int vfs_create(const char *path, const char *data)
 	return add_node(path, VFS_FILE, data_copy, size, 0) == 0 ? -1 : 0;
 }
 
+struct vfs_node *vfs_find_node_by_fd(int fd)
+{
+	if (fd < 0 || (usize)fd >= MAX_VFS_HANDLES || !handles[fd].used) return 0;
+	return handles[fd].node;
+}
+
 int vfs_mkdir(const char *path)
 {
 	if (vfs_find_node(path) != 0) return -1;

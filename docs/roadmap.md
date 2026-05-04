@@ -119,14 +119,14 @@
 ## M14: Advanced Storage, Swap & File Systems
 
 - [x] Block device abstraction layer and caching.
-- [ ] SATA/AHCI driver support.
-- [ ] NVMe driver support.
-- [x] Ext2 filesystem driver (Read-only implemented).
-- [ ] Ext1 (legacy) read-only support (optional).
-- [ ] Page Swapping (Swap space) support.
-- [ ] Demand Paging optimization and OOM killer.
-- [ ] Journaling abstraction for VFS.
-- [ ] Advanced file locking (flock/fcntl).
+- [x] SATA/AHCI driver support.
+- [x] NVMe driver support.
+- [x] Ext2 filesystem driver (Read + Write).
+- [x] Ext1 (legacy) read-only support.
+- [x] Page Swapping (Swap space) support.
+- [x] Demand Paging optimization and OOM killer.
+- [x] Journaling abstraction for VFS.
+- [x] Advanced file locking (flock/fcntl).
 
 ## M15: IPC, Security & Standard OS Features
 

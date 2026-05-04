@@ -38,5 +38,6 @@ void vfs_close(int handle);
 int vfs_create(const char *path, const char *data);
 int vfs_mkdir(const char *path);
 usize vfs_list(const char *dir_path, const char **names, usize max_names);
+struct vfs_node *vfs_find_node_by_fd(int fd);
 
 #endif

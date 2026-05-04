@@ -11,6 +11,12 @@
 #include <b1nix/vfs.h>
 #include <b1nix/blk.h>
 #include <b1nix/ext2.h>
+#include <b1nix/ext1.h>
+#include <b1nix/ext3.h>
+#include <b1nix/ext4.h>
+#include <b1nix/ahci.h>
+#include <b1nix/nvme.h>
+#include <b1nix/filelock.h>
 
 extern void ps2_kbd_init(void);
 extern void compositor_init(void);
@@ -84,6 +90,13 @@ void kernel_main(u64 arg0, u64 arg1)
 #ifndef __aarch64__
 	vfs_init();
 	ext2_init();
+	ext1_init();
+	ext3_init();
+	ext4_init();
+	ahci_init();
+	nvme_init();
+	filelock_init();
+	swap_init();
 	net_init();
 	ps2_kbd_init();
 	compositor_init();

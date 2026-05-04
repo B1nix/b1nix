@@ -43,12 +43,18 @@ KERNEL_SOURCES := \
 	kernel/lib/panic.c \
 	kernel/mm/kheap.c \
 	kernel/mm/pmm.c \
+	kernel/mm/swap.c \
 	kernel/sched/scheduler.c \
 	kernel/syscall/syscall.c \
 	kernel/fs/initramfs.c \
 	kernel/fs/vfs.c \
 	kernel/fs/fat32.c \
 	kernel/fs/ext2.c \
+	kernel/fs/ext1.c \
+	kernel/fs/ext3.c \
+	kernel/fs/ext4.c \
+	kernel/fs/journal.c \
+	kernel/fs/filelock.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	$(ARCH_SOURCES)
@@ -60,6 +66,8 @@ KERNEL_SOURCES += \
 	kernel/dev/blk.c \
 	kernel/dev/virtio.c \
 	kernel/dev/virtio_blk.c \
+	kernel/dev/ahci.c \
+	kernel/dev/nvme.c \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
