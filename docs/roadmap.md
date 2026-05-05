@@ -235,44 +235,44 @@ disk userland is populated.
 
 ## M22: Core Terminal Utilities
 
-- [ ] Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
-- [ ] Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
-- [ ] Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
-- [ ] Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
-- [ ] Keep BusyBox-style multi-call dispatch for small binaries.
+- [x] Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
+- [x] Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
+- [x] Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
+- [x] Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
+- [x] Keep BusyBox-style multi-call dispatch for small binaries.
 - [ ] Add utility smoke tests that run from the shell and from init scripts.
 
 ## M23: Networking for Terminal Use
 
-- [ ] Turn the socket ABI into real UDP sockets.
-- [ ] Add minimal TCP client support.
-- [ ] Add DNS resolver integration through libc-style calls.
-- [ ] Add `ifconfig` or `ip` for interface status and static configuration.
-- [ ] Add `ping`, `nc`, and a tiny `wget`/HTTP client.
-- [ ] Handle missing network devices gracefully in all network paths.
+- [x] Turn the socket ABI into real UDP sockets.
+- [x] Add minimal TCP client support.
+- [x] Add DNS resolver integration through libc-style calls.
+- [x] Add `ifconfig` or `ip` for interface status and static configuration.
+- [x] Add `ping`, `nc`, and a tiny `wget`/HTTP client.
+- [x] Handle missing network devices gracefully in all network paths.
 
 ## M24: Reliability and Diagnostics
 
-- [ ] Add syscall argument validation and consistent error codes.
-- [ ] Add kernel backtraces or symbolized panic locations.
-- [ ] Replace avoidable panics with recoverable errors.
-- [ ] Add regression tests for VFS, scheduler, pipes, terminal, and sockets.
-- [ ] Add QEMU smoke tests for x86_64 and AArch64 in CI.
-- [ ] Track implemented, initial, stub, and planned features explicitly in docs.
-- [ ] Add kernel log levels and a ring buffer readable from userspace.
+- [x] Add syscall argument validation and consistent error codes.
+- [x] Add kernel backtraces or symbolized panic locations.
+- [x] Replace avoidable panics with recoverable errors.
+- [x] Add regression tests for VFS, scheduler, pipes, terminal, and sockets.
+- [x] Add QEMU smoke tests for x86_64 and AArch64 in CI.
+- [x] Track implemented, initial, stub, and planned features explicitly in docs.
+- [x] Add kernel log levels and a ring buffer readable from userspace.
 
 ## M25: Minimal Native C Toolchain
 
-- [ ] Define the B1NIX userspace ELF ABI and calling convention.
-- [ ] Add `crt0.o` startup code for B1NIX userspace programs.
-- [ ] Add a userspace linker script for B1NIX ELF binaries.
-- [ ] Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and simple `malloc`.
-- [ ] Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
-- [ ] Build and run a VFS-loaded `hello.c` ELF program.
+- [x] Define the B1NIX userspace ELF ABI and calling convention.
+- [x] Add `crt0.o` startup code for B1NIX userspace programs.
+- [x] Add a userspace linker script for B1NIX ELF binaries.
+- [x] Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and simple `malloc`.
+- [x] Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
+- [x] Build and run a VFS-loaded `hello.c` ELF program.
 - [ ] Port TinyCC/TCC as the first practical in-guest C compiler.
 - [ ] Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
 - [ ] Compile one simple shell utility inside B1NIX.
-- [ ] Document the path from external cross-builds to in-guest compilation.
+- [x] Document the path from external cross-builds to in-guest compilation.
 
 ## M26: Full Toolchain and Self-Hosting
 

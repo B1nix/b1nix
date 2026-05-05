@@ -78,6 +78,10 @@ enum syscall_number {
 	SYS_MOUNT = 72,
 	SYS_UMOUNT = 73,
 	SYS_SYNC = 74,
+	SYS_GETCWD = 75,
+	SYS_UNAME = 76,
+	SYS_TIME = 77,
+	SYS_DMESG = 78,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);

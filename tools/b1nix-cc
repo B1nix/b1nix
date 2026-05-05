@@ -1,0 +1,41 @@
+#!/bin/sh
+# b1nix-cc — Cross-compiler wrapper for B1NIX userspace
+# Usage: b1nix-cc source.c -o output
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+USR="$PROJECT_DIR/userspace"
+INCLUDE="$USR/include"
+LIB="$USR/build/libb1nix.a"
+CRT0="$USR/build/crt/crt0.o"
+LINKER="$USR/linker.ld"
+LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+TARGET="x86_64-unknown-elf"
+
+[ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make -C "$USR" -s; }
+
+# Parse: find sources and -o output
+OUTPUT="a.out"
+SOURCES=""
+while [ $# -gt 0 ]; do
+	case "$1" in
+		-o) shift; OUTPUT="$1" ;;
+		-c|-I*|-D*|-O*|-W*|-std=*) ;;  # skip
+		-*) ;;
+		*) SOURCES="$SOURCES $1" ;;
+	esac
+	shift
+done
+
+OBJS=""
+for src in $SOURCES; do
+	obj="${src%.c}.o"
+	clang --target="$TARGET" -ffreestanding -fno-builtin -fno-stack-protector \
+		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" -Wall -O2 -c "$src" -o "$obj"
+	OBJS="$OBJS $obj"
+done
+
+$LD -m elf_x86_64 -T "$LINKER" -o "$OUTPUT" $CRT0 $OBJS --whole-archive "$LIB" --no-whole-archive
+echo "b1nix-cc: $OUTPUT ready" >&2

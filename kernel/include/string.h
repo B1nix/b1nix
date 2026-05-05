@@ -19,5 +19,6 @@ char *strchr(const char *s, int c);
 char *strrchr(const char *s, int c);
 char *strdup(const char *s);
 char *strtok(char *str, const char *delim);
+char *strstr(const char *haystack, const char *needle);
 
 #endif

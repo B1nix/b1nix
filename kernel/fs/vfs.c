@@ -3,6 +3,7 @@
 #include <b1nix/initramfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
+#include <b1nix/net.h>
 #include <b1nix/blk.h>
 #include <b1nix/fat32.h>
 #include <b1nix/sched.h>
@@ -14,6 +15,8 @@
 #define MAX_MOUNTS 16
 #define PIPE_BUFFER_SIZE 512
 #define TTY_INPUT_SIZE 256
+
+static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 
 enum vfs_handle_kind {
 	VFS_HANDLE_NONE = 0,
@@ -41,6 +44,11 @@ struct vfs_socket_state {
 	int connected;
 	struct b1nix_sockaddr_in local;
 	struct b1nix_sockaddr_in peer;
+	/* Receive buffer for UDP */
+	u8 recv_buf[2048];
+	usize recv_len;
+	/* TCP connection pointer (opaque) */
+	void *tcp_conn;
 };
 
 struct vfs_handle {
@@ -709,6 +717,16 @@ void vfs_close(int handle)
 {
 	int raw = scheduler_fd_get(handle);
 	if (raw < 0) return;
+
+	/* Clean up TCP connection if socket */
+	if (raw < MAX_VFS_HANDLES && handles[raw].used &&
+	    handles[raw].kind == VFS_HANDLE_SOCKET &&
+	    handles[raw].socket.type == B1NIX_SOCK_STREAM &&
+	    handles[raw].socket.tcp_conn) {
+		tcp_close((struct tcp_conn *)handles[raw].socket.tcp_conn);
+		handles[raw].socket.tcp_conn = 0;
+	}
+
 	scheduler_fd_close(handle);
 	release_handle(raw);
 }
@@ -1220,6 +1238,25 @@ int vfs_connect(int fd, const void *addr, usize addrlen)
 	if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -1;
 	h->socket.peer = *(const struct b1nix_sockaddr_in *)addr;
 	h->socket.connected = 1;
+
+	/* For TCP, initiate the real TCP connection */
+	if (h->socket.type == B1NIX_SOCK_STREAM) {
+		struct ipv4_addr dst;
+		u32 raw_addr = h->socket.peer.sin_addr;
+		dst.bytes[0] = (u8)(raw_addr & 0xFF);
+		dst.bytes[1] = (u8)((raw_addr >> 8) & 0xFF);
+		dst.bytes[2] = (u8)((raw_addr >> 16) & 0xFF);
+		dst.bytes[3] = (u8)((raw_addr >> 24) & 0xFF);
+
+		u16 port = bswap16(h->socket.peer.sin_port);
+
+		struct tcp_conn *conn = tcp_connect(dst, port);
+		if (!conn) {
+			h->socket.connected = 0;
+			return -1;
+		}
+		h->socket.tcp_conn = conn;
+	}
 	return 0;
 }
 
@@ -1229,7 +1266,27 @@ isize vfs_socket_send(int fd, const void *buf, usize len, int flags)
 	struct vfs_handle *h = get_handle(fd);
 	if (!h || h->kind != VFS_HANDLE_SOCKET || !buf) return -1;
 	if (!h->socket.connected && !h->socket.bound) return -1;
-	return (isize)len;
+
+	if (h->socket.type == B1NIX_SOCK_DGRAM) {
+		/* UDP send */
+		struct ipv4_addr dst;
+		u32 raw_addr = h->socket.peer.sin_addr;
+		dst.bytes[0] = (u8)(raw_addr & 0xFF);
+		dst.bytes[1] = (u8)((raw_addr >> 8) & 0xFF);
+		dst.bytes[2] = (u8)((raw_addr >> 16) & 0xFF);
+		dst.bytes[3] = (u8)((raw_addr >> 24) & 0xFF);
+
+		u16 src_port = bswap16(h->socket.local.sin_port);
+		u16 dst_port = bswap16(h->socket.peer.sin_port);
+
+		udp_send(dst, src_port, dst_port, buf, len);
+		return (isize)len;
+	} else if (h->socket.type == B1NIX_SOCK_STREAM) {
+		/* TCP send */
+		if (!h->socket.tcp_conn) return -1;
+		return (isize)tcp_send((struct tcp_conn *)h->socket.tcp_conn, buf, len);
+	}
+	return -1;
 }
 
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags)
@@ -1237,8 +1294,46 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags)
 	(void)flags;
 	struct vfs_handle *h = get_handle(fd);
 	if (!h || h->kind != VFS_HANDLE_SOCKET || !buf) return -1;
+
+	if (h->socket.type == B1NIX_SOCK_DGRAM) {
+		/* UDP recv — check internal buffer */
+		if (h->socket.recv_len == 0) {
+			/* Poll network to try to get data */
+			net_poll();
+		}
+		if (h->socket.recv_len == 0) return 0;
+
+		usize copy = (len < h->socket.recv_len) ? len : h->socket.recv_len;
+		memcpy(buf, h->socket.recv_buf, copy);
+		h->socket.recv_len = 0;
+		return (isize)copy;
+	} else if (h->socket.type == B1NIX_SOCK_STREAM) {
+		/* TCP recv */
+		if (!h->socket.tcp_conn) return -1;
+		return (isize)tcp_recv((struct tcp_conn *)h->socket.tcp_conn, buf, len);
+	}
+
 	if (len > 0) memset(buf, 0, len);
 	return 0;
+}
+
+/* ── Push data into UDP socket receive buffer (called from udp_receive) ── */
+void vfs_socket_push_udp(u16 local_port, const void *data, usize len)
+{
+	for (int i = 0; i < MAX_VFS_HANDLES; i++) {
+		if (!handles[i].used || handles[i].kind != VFS_HANDLE_SOCKET) continue;
+		if (handles[i].socket.type != B1NIX_SOCK_DGRAM) continue;
+		if (!handles[i].socket.bound) continue;
+
+		u16 sock_port = bswap16(handles[i].socket.local.sin_port);
+		if (sock_port == local_port && handles[i].socket.recv_len == 0) {
+			usize copy = (len > sizeof(handles[i].socket.recv_buf))
+			             ? sizeof(handles[i].socket.recv_buf) : len;
+			memcpy(handles[i].socket.recv_buf, data, copy);
+			handles[i].socket.recv_len = copy;
+			return;
+		}
+	}
 }
 
 /* ── Permission Management Functions ── */

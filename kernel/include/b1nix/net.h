@@ -44,6 +44,15 @@ void dhcp_receive(const void *data, usize size);
 void dns_resolve(const char *domain);
 void dns_receive(const void *data, usize size);
 
+// TCP
+void tcp_receive(struct ipv4_addr src, const void *data, usize size);
+struct tcp_conn;
+struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
+int tcp_send(struct tcp_conn *conn, const void *data, usize len);
+int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len);
+int tcp_close(struct tcp_conn *conn);
+int tcp_network_ready(void);
+
 // Network state
 struct mac_addr net_get_mac(void);
 struct ipv4_addr net_get_ip(void);

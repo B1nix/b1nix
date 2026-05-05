@@ -98,7 +98,7 @@ usize scheduler_get_pid(void);
 struct cred *scheduler_get_current_cred(void);
 const char *scheduler_get_cwd(void);
 int scheduler_set_cwd(const char *path);
-u64 scheduler_brk_get(void);
-u64 scheduler_brk_set(u64 new_brk);
+u64 scheduler_get_uptime_ticks(void);
+usize scheduler_brk_set(u64 new_brk);
 
 #endif

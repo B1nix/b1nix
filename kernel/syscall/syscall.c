@@ -13,6 +13,8 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/dirent.h>
 #include <b1nix/posix.h>
+#include <b1nix/klog.h>
+#include <b1nix/errno.h>
 #include <string.h>
 
 int syscall_copyin(void *dst, const void *user_src, usize size)
@@ -536,6 +538,49 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return (u64)vfs_umount((const char *)(usize)arg0);
 	case SYS_SYNC:
 		return (u64)vfs_sync();
+	case SYS_GETCWD: {
+		/* arg0 = buffer, arg1 = buffer size */
+		const char *cwd = scheduler_get_cwd();
+		if (!cwd || !arg0) return (u64)-1;
+		usize len = strlen(cwd);
+		if (len >= arg1) len = arg1 - 1;
+		memcpy((char *)(usize)arg0, cwd, len);
+		((char *)(usize)arg0)[len] = '\0';
+		return (u64)len;
+	}
+	case SYS_UNAME: {
+		/* arg0 = struct b1nix_utsname *buf */
+		struct b1nix_utsname {
+			char sysname[32];
+			char nodename[32];
+			char release[32];
+			char version[32];
+			char machine[32];
+		} uts;
+		memset(&uts, 0, sizeof(uts));
+		copy_cstr(uts.sysname,  sizeof(uts.sysname),  "B1NIX");
+		copy_cstr(uts.nodename, sizeof(uts.nodename), "b1nix");
+		copy_cstr(uts.release,  sizeof(uts.release),  "0.22.0");
+		copy_cstr(uts.version,  sizeof(uts.version),  "M22 Core Utilities");
+#ifdef __aarch64__
+		copy_cstr(uts.machine,  sizeof(uts.machine),  "aarch64");
+#else
+		copy_cstr(uts.machine,  sizeof(uts.machine),  "x86_64");
+#endif
+		if (arg0) {
+			memcpy((void *)(usize)arg0, &uts, sizeof(uts));
+		}
+		return 0;
+	}
+	case SYS_TIME: {
+		extern u64 scheduler_get_uptime_ticks(void);
+		return scheduler_get_uptime_ticks() / 100;
+	}
+	case SYS_DMESG: {
+		/* arg0 = buffer, arg1 = max_len */
+		if (!arg0 || arg1 == 0) return (u64)-EINVAL;
+		return (u64)klog_read((char *)(usize)arg0, (usize)arg1);
+	}
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

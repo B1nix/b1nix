@@ -3,7 +3,8 @@
 #include <string.h>
 
 #define IP_PROTO_ICMP 1
-#define IP_PROTO_UDP 17
+#define IP_PROTO_TCP  6
+#define IP_PROTO_UDP  17
 
 struct ipv4_header {
 	u8 ihl_version;
@@ -57,6 +58,8 @@ void ipv4_receive(const void *data, usize size)
 		icmp_receive(hdr->src, payload, payload_size);
 	} else if (hdr->protocol == IP_PROTO_UDP) {
 		udp_receive(hdr->src, payload, payload_size);
+	} else if (hdr->protocol == IP_PROTO_TCP) {
+		tcp_receive(hdr->src, payload, payload_size);
 	}
 }
 

@@ -40,7 +40,7 @@ endif
 KERNEL_SOURCES := \
 	kernel/main.c \
 	kernel/lib/string.c \
-	kernel/lib/panic.c \
+	kernel/lib/klog.c \
 	kernel/lib/stdio.c \
 	kernel/lib/stdlib.c \
 	kernel/lib/unistd.c \
@@ -88,6 +88,7 @@ KERNEL_SOURCES += \
 	kernel/net/ipv4.c \
 	kernel/net/icmp.c \
 	kernel/net/udp.c \
+	kernel/net/tcp.c \
 	kernel/net/dhcp.c \
 	kernel/net/dns.c
 endif
@@ -121,6 +122,16 @@ iso: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
 	cp boot/grub/grub.cfg $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
+
+# ── M25 Userspace ──
+userspace:
+	@$(MAKE) -C userspace
+
+userspace-install: userspace
+	@mkdir -p $(BUILD_DIR)/iso/boot
+	cp userspace/build/bin/hello $(BUILD_DIR)/iso/boot/hello
+
+iso-full: userspace-install iso
 
 run-x86: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
@@ -193,3 +204,16 @@ check-tools:
 
 clean:
 	rm -rf build
+
+# ── M24 Smoke Tests ──
+smoke: iso
+	@echo "Running smoke tests..."
+	sh tests/smoke.sh $(ARCH)
+
+smoke-x86: ARCH=x86
+smoke-x86: smoke
+
+smoke-aarch64: ARCH=aarch64
+smoke-aarch64: smoke
+
+.PHONY: all clean run-x86 run-aarch64 run-ext2 run-root root-image iso userspace userspace-install iso-full smoke-m18 smoke smoke-x86 smoke-aarch64 check-tools

@@ -194,3 +194,23 @@ int selfhost_status(struct b1nix_selfhost_status *status)
 {
 	return (int)syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)status, 0, 0, 0);
 }
+
+int getcwd(char *buf, size_t size)
+{
+	return (int)syscall_dispatch(SYS_GETCWD, (u64)(usize)buf, (u64)size, 0, 0);
+}
+
+int uname(struct b1nix_utsname *buf)
+{
+	return (int)syscall_dispatch(SYS_UNAME, (u64)(usize)buf, 0, 0, 0);
+}
+
+long time(void)
+{
+	return (long)syscall_dispatch(SYS_TIME, 0, 0, 0, 0);
+}
+
+int dmesg(char *buf, size_t size)
+{
+	return (int)syscall_dispatch(SYS_DMESG, (u64)(usize)buf, (u64)size, 0, 0);
+}

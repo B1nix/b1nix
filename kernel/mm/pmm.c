@@ -216,13 +216,15 @@ u64 pmm_alloc_frames(usize count)
 		}
 	}
 
-	panic("out of contiguous physical memory");
+	klog_warn("pmm: out of contiguous physical memory");
+	return 0;
 }
 
 void pmm_free_frame(u64 frame)
 {
 	if ((frame & (PAGE_SIZE - 1)) != 0 || frame >= pmm.max_address) {
-		panic("pmm_free_frame received invalid frame");
+		klog_warn("pmm_free_frame: invalid frame");
+		return;
 	}
 
 	mark_frame_free(frame);

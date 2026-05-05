@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <string.h>
 
@@ -29,8 +30,11 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 
 	if (dport == 68) {
 		dhcp_receive(payload, payload_size);
-	} else if (dport > 1024) {
+	} else if (dport == 53) {
 		dns_receive(payload, payload_size);
+	} else {
+		/* Deliver to userspace socket */
+		vfs_socket_push_udp(dport, payload, payload_size);
 	}
 }
 

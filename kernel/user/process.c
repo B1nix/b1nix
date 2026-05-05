@@ -7,7 +7,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 
-#define MAX_PROGRAMS 24
+#define MAX_PROGRAMS 48
 #define ELF_MAGIC0 0x7f
 #define ELF_MAGIC1 'E'
 #define ELF_MAGIC2 'L'
@@ -369,7 +369,8 @@ int user_execve_current(const char *path, const char **argv, const char **envp)
 void user_register_program(const char *path, user_program_entry entry)
 {
 	if (program_count >= MAX_PROGRAMS) {
-		panic("too many builtin user programs");
+		klog_warn("too many builtin user programs, skipping registration");
+		return;
 	}
 
 	programs[program_count].path = path;

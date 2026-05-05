@@ -1,0 +1,37 @@
+#ifndef B1NIX_KLOG_H
+#define B1NIX_KLOG_H
+
+#include <b1nix/types.h>
+
+/* Log levels */
+#define KLOG_DEBUG 0
+#define KLOG_INFO  1
+#define KLOG_WARN  2
+#define KLOG_ERROR 3
+#define KLOG_PANIC 4
+
+/* Core logging functions */
+void klog_debug(const char *msg);
+void klog_info(const char *msg);
+void klog_warn(const char *msg);
+void klog_error(const char *msg);
+
+/* Ring buffer access for userspace (dmesg) */
+usize klog_read(char *buf, usize max_len);
+usize klog_size(void);
+
+/* Symbol table for backtraces */
+void klog_register_symbol(u64 address, const char *name);
+void panic_backtrace(void);
+
+/* Enhanced panic (defined in panic.h, implemented in klog.c) */
+void panic(const char *message) __attribute__((noreturn));
+
+#define ASSERT(condition) \
+	do { \
+		if (!(condition)) { \
+			panic("assertion failed: " #condition); \
+		} \
+	} while (0)
+
+#endif

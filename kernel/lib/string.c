@@ -171,3 +171,17 @@ char *strtok(char *str, const char *delim)
 	
 	return token_start;
 }
+
+char *strstr(const char *haystack, const char *needle)
+{
+	if (!haystack || !needle) return 0;
+	if (*needle == '\0') return (char *)haystack;
+
+	size_t needle_len = strlen(needle);
+	while (*haystack) {
+		if (strncmp(haystack, needle, needle_len) == 0)
+			return (char *)haystack;
+		haystack++;
+	}
+	return 0;
+}

@@ -558,9 +558,53 @@ void user_register_builtin_programs(void)
 	user_register_program("/bin/init", init_main);
 	user_register_program("/bin/sh", sh_main);
 
-	/* BusyBox utilities */
+	/* M22 — Core Terminal Utilities (BusyBox multi-call) */
+
+	/* File/directory utilities */
+	user_register_program("/bin/pwd", busybox_main);
+	user_register_program("/bin/ls", busybox_main);
+	user_register_program("/bin/cp", busybox_main);
+	user_register_program("/bin/mv", busybox_main);
+	user_register_program("/bin/rm", busybox_main);
+	user_register_program("/bin/mkdir", busybox_main);
+	user_register_program("/bin/rmdir", busybox_main);
+	user_register_program("/bin/chmod", busybox_main);
+	user_register_program("/bin/chown", busybox_main);
+	user_register_program("/bin/ln", busybox_main);
+
+	/* System utilities */
+	user_register_program("/bin/ps", busybox_main);
+	user_register_program("/bin/kill", busybox_main);
+	user_register_program("/bin/date", busybox_main);
+	user_register_program("/bin/uname", busybox_main);
+
+	/* Text utilities */
 	user_register_program("/bin/cat", busybox_main);
 	user_register_program("/bin/echo", busybox_main);
+	user_register_program("/bin/head", busybox_main);
+	user_register_program("/bin/tail", busybox_main);
+	user_register_program("/bin/grep", busybox_main);
+	user_register_program("/bin/find", busybox_main);
+	user_register_program("/bin/wc", busybox_main);
+	user_register_program("/bin/sort", busybox_main);
+	user_register_program("/bin/uniq", busybox_main);
+
+	/* Filesystem utilities */
+	user_register_program("/bin/mount", busybox_main);
+	user_register_program("/bin/df", busybox_main);
+	user_register_program("/bin/sync", busybox_main);
+	user_register_program("/bin/hexdump", busybox_main);
+
+	/* M23 — Network utilities */
+	user_register_program("/bin/ifconfig", busybox_main);
+	user_register_program("/bin/ping", busybox_main);
+	user_register_program("/bin/nc", busybox_main);
+	user_register_program("/bin/wget", busybox_main);
+
+	/* M24 — Diagnostics */
+	user_register_program("/bin/dmesg", busybox_main);
+
+	/* Misc */
 	user_register_program("/bin/true", busybox_main);
 	user_register_program("/bin/false", busybox_main);
 	user_register_program("/bin/yes", busybox_main);

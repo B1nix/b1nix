@@ -3,39 +3,865 @@
 #include <stdlib.h>
 #include <unistd.h>
 #include <b1nix/syscall.h>
+#include <b1nix/posix.h>
+#include <b1nix/dirent.h>
 
-/* ── Utility: cat — concatenate files ── */
-static int cat_main(int argc, const char **argv)
+/* ── Helper: open file, return fd or -1 ── */
+static u64 bb_open(const char *path)
 {
-	if (argc < 2) {
-		/* Read from stdin (use console as fallback for now) */
-		char c;
-		while (read(0, &c, 1) > 0) {
-			putchar(c);
-		}
-		return 0;
+	return syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+}
+
+/* ── Helper: read file into buffer, return bytes read ── */
+static usize bb_read_file(const char *path, char *buf, usize max)
+{
+	u64 fd = bb_open(path);
+	if (fd == (u64)-1) return 0;
+	u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	if (n == (u64)-1) return 0;
+	buf[n] = '\0';
+	return (usize)n;
+}
+
+/* ── Helper: write data to file (create/truncate) ── */
+static int bb_write_file(const char *path, const char *data, usize len)
+{
+	/* Try create, then open */
+	syscall_dispatch(SYS_CREATE, (u64)(usize)path, (u64)(usize)"", 0, 0);
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0);
+	if (fd == (u64)-1) return -1;
+	syscall_dispatch(SYS_WRITE, (u64)(usize)data, (u64)len, (u64)fd, 1);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	return 0;
+}
+
+/* ── Helper: resolve relative path against cwd ── */
+static void bb_resolve(const char *rel, char *abs, usize abs_size)
+{
+	if (rel[0] == '/') {
+		usize i = 0;
+		while (rel[i] && i < abs_size - 1) { abs[i] = rel[i]; i++; }
+		abs[i] = '\0';
+		return;
 	}
+	char cwd[128];
+	if (getcwd(cwd, sizeof(cwd)) < 0) {
+		cwd[0] = '/'; cwd[1] = '\0';
+	}
+	usize cl = strlen(cwd);
+	usize rl = strlen(rel);
+	usize total = cl + rl + 2;
+	if (total > abs_size) total = abs_size;
+	memcpy(abs, cwd, cl);
+	if (cl > 0 && abs[cl - 1] != '/') abs[cl++] = '/';
+	memcpy(abs + cl, rel, rl);
+	abs[cl + rl] = '\0';
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   FILE & DIRECTORY UTILITIES
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── pwd — print working directory ── */
+static int pwd_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+	char cwd[256];
+	if (getcwd(cwd, sizeof(cwd)) < 0) {
+		printf("pwd: cannot get current directory\n");
+		return 1;
+	}
+	printf("%s\n", cwd);
+	return 0;
+}
+
+/* ── ls — list directory contents ── */
+static int ls_main(int argc, const char **argv)
+{
+	const char *target = ".";
+	if (argc > 1) target = argv[1];
 	
-	for (int i = 1; i < argc; i++) {
-		u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)argv[i], 0, 0, 0);
-		if (fd == (u64)-1) {
-			printf("cat: %s: No such file or directory\n", argv[i]);
-			continue;
+	char path[256];
+	bb_resolve(target, path, sizeof(path));
+
+	struct dirent entries[64];
+	int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path,
+	                                   (u64)(usize)entries, 64, 0);
+	if (count < 0) {
+		printf("ls: %s: No such file or directory\n", target);
+		return 1;
+	}
+
+	for (int i = 0; i < count; i++) {
+		/* Type indicator */
+		char type = '-';
+		if (entries[i].is_dir) type = 'd';
+		else if (entries[i].type == 2) type = 'c'; /* device */
+
+		/* Permissions string (simplified) */
+		char perms[10];
+		perms[0] = type;
+		perms[1] = entries[i].is_exec ? 'r' : '-';
+		perms[2] = entries[i].is_exec ? 'w' : '-';
+		perms[3] = entries[i].is_exec ? 'x' : '-';
+		perms[4] = '-';
+		perms[5] = '-';
+		perms[6] = '-';
+		perms[7] = '-';
+		perms[8] = '-';
+		perms[9] = '\0';
+
+		/* Try stat for full permissions */
+		char full_path[320];
+		usize pl = strlen(path);
+		memcpy(full_path, path, pl);
+		if (pl > 0 && full_path[pl - 1] != '/') full_path[pl++] = '/';
+		usize nl = strlen(entries[i].name);
+		memcpy(full_path + pl, entries[i].name, nl + 1);
+
+		struct b1nix_stat st;
+		if (syscall_dispatch(SYS_STAT, (u64)(usize)full_path,
+		                     (u64)(usize)&st, 0, 0) == 0) {
+			u16 m = (u16)st.st_mode;
+			perms[1] = (m & 0400) ? 'r' : '-';
+			perms[2] = (m & 0200) ? 'w' : '-';
+			perms[3] = (m & 0100) ? 'x' : '-';
+			perms[4] = (m & 0040) ? 'r' : '-';
+			perms[5] = (m & 0020) ? 'w' : '-';
+			perms[6] = (m & 0010) ? 'x' : '-';
+			perms[7] = (m & 0004) ? 'r' : '-';
+			perms[8] = (m & 0002) ? 'w' : '-';
+			perms[9] = (m & 0001) ? 'x' : '-';
 		}
-		
-		char buf[256];
-		while (1) {
-			u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, sizeof(buf) - 1, 0);
-			if (n == 0 || n == (u64)-1) break;
-			buf[n] = '\0';
-			printf("%s", buf);
-		}
-		syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+
+		printf("%s %6d %s", perms, (int)entries[i].size, entries[i].name);
+		if (entries[i].is_dir) printf("/");
+		printf("\n");
 	}
 	return 0;
 }
 
-/* ── Utility: echo — print text ── */
+/* ── cp — copy file ── */
+static int cp_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("cp: missing operand\nUsage: cp <src> <dst>\n");
+		return 1;
+	}
+
+	char src[256], dst[256];
+	bb_resolve(argv[1], src, sizeof(src));
+	bb_resolve(argv[2], dst, sizeof(dst));
+
+	u64 sfd = bb_open(src);
+	if (sfd == (u64)-1) {
+		printf("cp: %s: No such file\n", argv[1]);
+		return 1;
+	}
+
+	/* Read entire source */
+	char buf[4096];
+	usize total = 0;
+	while (1) {
+		u64 n = syscall_dispatch(SYS_READ, sfd,
+		                         (u64)(usize)(buf + total),
+		                         sizeof(buf) - total - 1, 0);
+		if (n == 0 || n == (u64)-1) break;
+		total += (usize)n;
+		if (total >= sizeof(buf) - 1) break;
+	}
+	syscall_dispatch(SYS_CLOSE, sfd, 0, 0, 0);
+	buf[total] = '\0';
+
+	if (bb_write_file(dst, buf, total) < 0) {
+		printf("cp: cannot create %s\n", argv[2]);
+		return 1;
+	}
+	return 0;
+}
+
+/* ── mv — move/rename file ── */
+static int mv_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("mv: missing operand\nUsage: mv <src> <dst>\n");
+		return 1;
+	}
+
+	char src[256], dst[256];
+	bb_resolve(argv[1], src, sizeof(src));
+	bb_resolve(argv[2], dst, sizeof(dst));
+
+	if (syscall_dispatch(SYS_RENAME, (u64)(usize)src,
+	                     (u64)(usize)dst, 0, 0) != 0) {
+		printf("mv: cannot move %s to %s\n", argv[1], argv[2]);
+		return 1;
+	}
+	return 0;
+}
+
+/* ── rm — remove file ── */
+static int rm_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("rm: missing operand\n");
+		return 1;
+	}
+
+	for (int i = 1; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0) != 0) {
+			printf("rm: cannot remove %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── mkdir — create directory ── */
+static int mkdir_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("mkdir: missing operand\n");
+		return 1;
+	}
+
+	for (int i = 1; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0) != 0) {
+			printf("mkdir: cannot create directory %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── rmdir — remove empty directory ── */
+static int rmdir_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("rmdir: missing operand\n");
+		return 1;
+	}
+
+	for (int i = 1; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		if (syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0) != 0) {
+			printf("rmdir: failed to remove %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── chmod — change file mode ── */
+static int chmod_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("chmod: missing operand\nUsage: chmod <mode> <file>\n");
+		return 1;
+	}
+
+	/* Parse octal mode */
+	const char *mode_str = argv[1];
+	u16 mode = 0;
+	for (int i = 0; mode_str[i]; i++) {
+		if (mode_str[i] >= '0' && mode_str[i] <= '7') {
+			mode = (u16)((mode << 3) | (mode_str[i] - '0'));
+		}
+	}
+
+	for (int i = 2; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		if (syscall_dispatch(SYS_CHMOD, (u64)(usize)path,
+		                     (u64)mode, 0, 0) != 0) {
+			printf("chmod: cannot access %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── chown — change file owner ── */
+static int chown_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("chown: missing operand\nUsage: chown <uid> <gid> <file>\n");
+		return 1;
+	}
+
+	u16 uid = (u16)atoi(argv[1]);
+	u16 gid = (u16)atoi(argv[2]);
+
+	for (int i = 3; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		if (syscall_dispatch(SYS_CHOWN, (u64)(usize)path,
+		                     (u64)uid, (u64)gid, 0) != 0) {
+			printf("chown: cannot access %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── ln — create hard link (copy for now) ── */
+static int ln_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("ln: missing operand\nUsage: ln <target> <linkname>\n");
+		return 1;
+	}
+
+	char src[256], dst[256];
+	bb_resolve(argv[1], src, sizeof(src));
+	bb_resolve(argv[2], dst, sizeof(dst));
+
+	/* Copy as a simplified "link" — VFS hardlink not yet implemented */
+	char buf[4096];
+	usize n = bb_read_file(argv[1], buf, sizeof(buf));
+	if (n == 0 && argv[1][0] != '\0') {
+		printf("ln: %s: No such file\n", argv[1]);
+		return 1;
+	}
+	if (bb_write_file(dst, buf, n) < 0) {
+		printf("ln: cannot create link %s\n", argv[2]);
+		return 1;
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   SYSTEM UTILITIES
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── ps — process status ── */
+static int ps_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+	syscall_dispatch(SYS_PS, 0, 0, 0, 0);
+	return 0;
+}
+
+/* ── kill — send signal to process ── */
+static int kill_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("kill: missing operand\nUsage: kill <pid> [sig]\n");
+		return 1;
+	}
+
+	int pid = atoi(argv[1]);
+	int sig = 15; /* SIGTERM default */
+	if (argc > 2) sig = atoi(argv[2]);
+
+	if (syscall_dispatch(SYS_KILL, (u64)pid, (u64)sig, 0, 0) != 0) {
+		printf("kill: failed to send signal %d to %d\n", sig, pid);
+		return 1;
+	}
+	return 0;
+}
+
+/* ── date — print system date/time ── */
+static int date_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+	long seconds = time();
+
+	/* Simple conversion: seconds since boot */
+	long days = seconds / 86400;
+	long hours = (seconds % 86400) / 3600;
+	long mins = (seconds % 3600) / 60;
+	long secs = seconds % 60;
+
+	printf("Uptime: %ld day%s %02ld:%02ld:%02ld\n",
+	       days, days == 1 ? "" : "s", hours, mins, secs);
+	return 0;
+}
+
+/* ── uname — print system information ── */
+static int uname_main(int argc, const char **argv)
+{
+	struct b1nix_utsname uts;
+	if (uname(&uts) < 0) {
+		printf("uname: error\n");
+		return 1;
+	}
+
+	int all = (argc < 2);
+	int show_s = 0, show_n = 0, show_r = 0, show_v = 0, show_m = 0;
+
+	if (!all) {
+		for (int i = 1; i < argc; i++) {
+			if (strcmp(argv[i], "-s") == 0) show_s = 1;
+			else if (strcmp(argv[i], "-n") == 0) show_n = 1;
+			else if (strcmp(argv[i], "-r") == 0) show_r = 1;
+			else if (strcmp(argv[i], "-v") == 0) show_v = 1;
+			else if (strcmp(argv[i], "-m") == 0) show_m = 1;
+			else if (strcmp(argv[i], "-a") == 0)
+				show_s = show_n = show_r = show_v = show_m = 1;
+		}
+	}
+
+	if (all || show_s) printf("%s ", uts.sysname);
+	if (all || show_n) printf("%s ", uts.nodename);
+	if (all || show_r) printf("%s ", uts.release);
+	if (all || show_v) printf("%s ", uts.version);
+	if (all || show_m) printf("%s", uts.machine);
+	printf("\n");
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   TEXT UTILITIES
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── cat — concatenate files ── */
+static int cat_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		char c;
+		while (read(0, &c, 1) > 0) putchar(c);
+		return 0;
+	}
+
+	for (int i = 1; i < argc; i++) {
+		char buf[256];
+		usize n = bb_read_file(argv[i], buf, sizeof(buf));
+		if (n == 0 && argv[i][0] != '\0') {
+			printf("cat: %s: No such file or directory\n", argv[i]);
+			continue;
+		}
+		printf("%s", buf);
+	}
+	return 0;
+}
+
+/* ── head — output first N lines ── */
+static int head_main(int argc, const char **argv)
+{
+	int nlines = 10;
+	const char *file = 0;
+	int file_idx = 1;
+
+	if (argc > 1 && argv[1][0] == '-') {
+		nlines = atoi(argv[1] + 1);
+		file_idx = 2;
+	}
+	if (argc > file_idx) file = argv[file_idx];
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) {
+			printf("head: %s: No such file\n", file);
+			return 1;
+		}
+	} else {
+		/* Read from stdin */
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	int lines = 0;
+	for (usize i = 0; i < total && lines < nlines; i++) {
+		putchar(buf[i]);
+		if (buf[i] == '\n') lines++;
+	}
+	return 0;
+}
+
+/* ── tail — output last N lines ── */
+static int tail_main(int argc, const char **argv)
+{
+	int nlines = 10;
+	const char *file = 0;
+	int file_idx = 1;
+
+	if (argc > 1 && argv[1][0] == '-') {
+		nlines = atoi(argv[1] + 1);
+		file_idx = 2;
+	}
+	if (argc > file_idx) file = argv[file_idx];
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) {
+			printf("tail: %s: No such file\n", file);
+			return 1;
+		}
+	} else {
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	/* Count total lines and find start of last N */
+	int line_starts[512];
+	int lc = 0;
+	line_starts[lc++] = 0;
+	for (usize i = 0; i < total; i++) {
+		if (buf[i] == '\n' && i + 1 < total) {
+			if (lc < 512) line_starts[lc++] = (int)(i + 1);
+		}
+	}
+
+	int start_idx = (lc > nlines) ? line_starts[lc - nlines - 1] : 0;
+	for (usize i = (usize)start_idx; i < total; i++) {
+		putchar(buf[i]);
+	}
+	return 0;
+}
+
+/* ── grep — search for pattern in files ── */
+static int grep_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("grep: missing pattern\nUsage: grep <pattern> [file]\n");
+		return 1;
+	}
+
+	const char *pattern = argv[1];
+	const char *file = (argc > 2) ? argv[2] : 0;
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) {
+			printf("grep: %s: No such file\n", file);
+			return 1;
+		}
+	} else {
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	usize plen = strlen(pattern);
+	usize line_start = 0;
+
+	for (usize i = 0; i <= total; i++) {
+		if (buf[i] == '\n' || buf[i] == '\0') {
+			/* Check if pattern is in this line */
+			for (usize j = line_start; j + plen <= i; j++) {
+				int match = 1;
+				for (usize k = 0; k < plen; k++) {
+					if (buf[j + k] != pattern[k]) { match = 0; break; }
+				}
+				if (match) {
+					/* Print the line */
+					for (usize p = line_start; p < i; p++) putchar(buf[p]);
+					putchar('\n');
+					break;
+				}
+			}
+			line_start = i + 1;
+			if (buf[i] == '\0') break;
+		}
+	}
+	return 0;
+}
+
+/* ── find — walk directory tree ── */
+static void find_recurse(const char *base, const char *name_pat, int *found)
+{
+	struct dirent entries[32];
+	char path[256];
+	usize bl = strlen(base);
+
+	int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)base,
+	                                   (u64)(usize)entries, 32, 0);
+	if (count < 0) return;
+
+	for (int i = 0; i < count; i++) {
+		if (strcmp(entries[i].name, ".") == 0 ||
+		    strcmp(entries[i].name, "..") == 0) continue;
+
+		/* Build full path */
+		memcpy(path, base, bl);
+		if (bl > 0 && path[bl - 1] != '/') path[bl++] = '/';
+		usize nl = strlen(entries[i].name);
+		memcpy(path + bl, entries[i].name, nl + 1);
+
+		/* Check name match */
+		if (!name_pat || strcmp(entries[i].name, name_pat) == 0) {
+			printf("%s\n", path);
+			(*found)++;
+		}
+
+		/* Recurse into directories */
+		if (entries[i].is_dir) {
+			find_recurse(path, name_pat, found);
+		}
+	}
+}
+
+static int find_main(int argc, const char **argv)
+{
+	const char *start = ".";
+	const char *name = 0;
+
+	for (int i = 1; i < argc; i++) {
+		if (strcmp(argv[i], "-name") == 0 && i + 1 < argc) {
+			name = argv[++i];
+		} else if (argv[i][0] != '-') {
+			start = argv[i];
+		}
+	}
+
+	char base[256];
+	bb_resolve(start, base, sizeof(base));
+
+	int found = 0;
+	find_recurse(base, name, &found);
+	return 0;
+}
+
+/* ── wc — word/line/char count ── */
+static int wc_main(int argc, const char **argv)
+{
+	const char *file = (argc > 1) ? argv[1] : 0;
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) {
+			printf("wc: %s: No such file\n", file);
+			return 1;
+		}
+	} else {
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	int lines = 0, words = 0;
+	int in_word = 0;
+
+	for (usize i = 0; i < total; i++) {
+		if (buf[i] == '\n') lines++;
+		if (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\t') {
+			in_word = 0;
+		} else if (!in_word) {
+			in_word = 1;
+			words++;
+		}
+	}
+
+	printf("%d %d %d %s\n", lines, words, (int)total,
+	       file ? file : "");
+	return 0;
+}
+
+/* ── sort — sort lines alphabetically ── */
+static void sort_swap(char **a, char **b)
+{
+	char *t = *a; *a = *b; *b = t;
+}
+
+static int sort_main(int argc, const char **argv)
+{
+	const char *file = (argc > 1) ? argv[1] : 0;
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) return 0;
+	} else {
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	/* Collect line pointers */
+	char *lines[256];
+	int lc = 0;
+	lines[lc++] = buf;
+	for (usize i = 0; i < total && lc < 256; i++) {
+		if (buf[i] == '\n') {
+			buf[i] = '\0';
+			if (i + 1 < total) lines[lc++] = &buf[i + 1];
+		}
+	}
+
+	/* Bubble sort (simple, good for small data) */
+	for (int i = 0; i < lc - 1; i++) {
+		for (int j = 0; j < lc - 1 - i; j++) {
+			if (strcmp(lines[j], lines[j + 1]) > 0) {
+				sort_swap(&lines[j], &lines[j + 1]);
+			}
+		}
+	}
+
+	for (int i = 0; i < lc; i++) {
+		printf("%s\n", lines[i]);
+	}
+	return 0;
+}
+
+/* ── uniq — report or omit repeated lines ── */
+static int uniq_main(int argc, const char **argv)
+{
+	const char *file = (argc > 1) ? argv[1] : 0;
+
+	char buf[4096];
+	usize total;
+
+	if (file) {
+		total = bb_read_file(file, buf, sizeof(buf));
+		if (total == 0) return 0;
+	} else {
+		total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+		}
+		buf[total] = '\0';
+	}
+
+	/* Collect line pointers */
+	char *lines[256];
+	int lc = 0;
+	lines[lc++] = buf;
+	for (usize i = 0; i < total && lc < 256; i++) {
+		if (buf[i] == '\n') {
+			buf[i] = '\0';
+			if (i + 1 < total) lines[lc++] = &buf[i + 1];
+		}
+	}
+
+	if (lc == 0) return 0;
+	printf("%s\n", lines[0]);
+	for (int i = 1; i < lc; i++) {
+		if (strcmp(lines[i], lines[i - 1]) != 0) {
+			printf("%s\n", lines[i]);
+		}
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   FILESYSTEM UTILITIES
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── mount — mount filesystem ── */
+static int mount_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		/* Show current mounts */
+		printf("mount: showing active mounts not implemented\n");
+		return 0;
+	}
+
+	const char *source = argv[1];
+	const char *target = (argc > 2) ? argv[2] : "/mnt";
+	const char *fstype = (argc > 3) ? argv[3] : "ext2";
+
+	char tgt[256];
+	bb_resolve(target, tgt, sizeof(tgt));
+
+	if (syscall_dispatch(SYS_MOUNT, (u64)(usize)source,
+	                     (u64)(usize)tgt, (u64)(usize)fstype, 0) != 0) {
+		printf("mount: cannot mount %s on %s (type %s)\n",
+		       source, target, fstype);
+		return 1;
+	}
+	return 0;
+}
+
+/* ── df — disk free ── */
+static int df_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+
+	/* Use memory info as approximation */
+	syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
+	return 0;
+}
+
+/* ── sync — flush filesystem caches ── */
+static int sync_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+	sync();
+	printf("sync: filesystems synchronized\n");
+	return 0;
+}
+
+/* ── hexdump — hex dump of file ── */
+static int hexdump_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("hexdump: missing file\nUsage: hexdump <file>\n");
+		return 1;
+	}
+
+	char buf[512];
+	usize total = bb_read_file(argv[1], buf, sizeof(buf));
+	if (total == 0) {
+		printf("hexdump: %s: No such file or empty\n", argv[1]);
+		return 1;
+	}
+
+	for (usize offset = 0; offset < total; offset += 16) {
+		/* Offset */
+		printf("%04x  ", (int)offset);
+
+		/* Hex bytes */
+		for (usize j = 0; j < 16; j++) {
+			if (offset + j < total) {
+				printf("%02x ", (u8)buf[offset + j]);
+			} else {
+				printf("   ");
+			}
+			if (j == 7) putchar(' ');
+		}
+
+		/* ASCII representation */
+		printf(" |");
+		for (usize j = 0; j < 16 && offset + j < total; j++) {
+			char c = buf[offset + j];
+			putchar((c >= 32 && c < 127) ? c : '.');
+		}
+		printf("|\n");
+	}
+	return 0;
+}
+
+/* ── echo — print text ── */
 static int echo_main(int argc, const char **argv)
 {
 	for (int i = 1; i < argc; i++) {
@@ -46,33 +872,29 @@ static int echo_main(int argc, const char **argv)
 	return 0;
 }
 
-/* ── Utility: true — return success ── */
+/* ── true — return success ── */
 static int true_main(int argc, const char **argv)
 {
-	(void)argc;
-	(void)argv;
+	(void)argc; (void)argv;
 	return 0;
 }
 
-/* ── Utility: false — return failure ── */
+/* ── false — return failure ── */
 static int false_main(int argc, const char **argv)
 {
-	(void)argc;
-	(void)argv;
+	(void)argc; (void)argv;
 	return 1;
 }
 
-/* ── Utility: yes — print y forever ── */
+/* ── yes — print string forever ── */
 static int yes_main(int argc, const char **argv)
 {
 	const char *str = (argc > 1) ? argv[1] : "y";
-	while (1) {
-		printf("%s\n", str);
-	}
+	while (1) printf("%s\n", str);
 	return 0;
 }
 
-/* ── Utility: sleep — delay for seconds ── */
+/* ── sleep — delay for seconds ── */
 static int sleep_main(int argc, const char **argv)
 {
 	if (argc < 2) {
@@ -84,13 +906,12 @@ static int sleep_main(int argc, const char **argv)
 	return 0;
 }
 
-/* ── Utility: whoami — print effective user name ── */
+/* ── whoami — print effective user name ── */
 static int whoami_main(int argc, const char **argv)
 {
-	(void)argc;
-	(void)argv;
+	(void)argc; (void)argv;
 	u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0);
-	
+
 	const char *names[] = {"root", "daemon", "bin", "user"};
 	if (uid < 4) {
 		printf("%s\n", names[uid]);
@@ -100,38 +921,361 @@ static int whoami_main(int argc, const char **argv)
 	return 0;
 }
 
-/* ── Utility: id — print user/group identity ── */
+/* ── id — print user/group identity ── */
 static int id_main(int argc, const char **argv)
 {
-	(void)argc;
-	(void)argv;
+	(void)argc; (void)argv;
 	u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0);
 	u64 euid = syscall_dispatch(SYS_GETEUID, 0, 0, 0, 0);
 	u64 gid = syscall_dispatch(SYS_GETGID, 0, 0, 0, 0);
 	u64 egid = syscall_dispatch(SYS_GETEGID, 0, 0, 0, 0);
-	
-	printf("uid=%d euid=%d gid=%d egid=%d\n", (int)uid, (int)euid, (int)gid, (int)egid);
+
+	printf("uid=%d euid=%d gid=%d egid=%d\n",
+	       (int)uid, (int)euid, (int)gid, (int)egid);
 	return 0;
 }
 
-/* ── Utility: clear — clear terminal ── */
+/* ── clear — clear terminal ── */
 static int clear_main(int argc, const char **argv)
 {
-	(void)argc;
-	(void)argv;
+	(void)argc; (void)argv;
 	syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
 	return 0;
 }
 
-/* ── BusyBox-style dispatcher ── */
+/* ═══════════════════════════════════════════════════════════════════
+   NETWORK UTILITIES (M23)
+   ═══════════════════════════════════════════════════════════════════ */
+
+/* ── Helper: check if network is available ── */
+static int net_is_available(void)
+{
+	/* Network is available if virtio-net was initialized at boot.
+	   Individual operations will fail gracefully if not. */
+#ifdef __aarch64__
+	return 0;
+#else
+	return 1;
+#endif
+}
+
+/* ── ifconfig — network interface configuration ── */
+static int ifconfig_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+
+	if (!net_is_available()) {
+		printf("ifconfig: no network device found\n");
+		return 1;
+	}
+
+	/* Show network info via syscall */
+	syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
+	return 0;
+}
+
+/* ── ping — send ICMP echo requests ── */
+static int ping_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("ping: missing host\nUsage: ping <ip-address>\n");
+		return 1;
+	}
+
+	if (!net_is_available()) {
+		printf("ping: network unavailable\n");
+		return 1;
+	}
+
+	/* Use SYS_NET_PING */
+	syscall_dispatch(SYS_NET_PING, (u64)(usize)argv[1], 0, 0, 0);
+	return 0;
+}
+
+/* ── nc (netcat) — TCP/UDP network tool ── */
+static int nc_main(int argc, const char **argv)
+{
+	if (argc < 3) {
+		printf("nc: usage: nc <host> <port> [-u]\n");
+		return 1;
+	}
+
+	const char *host = argv[1];
+	const char *port_str = argv[2];
+	int use_udp = 0;
+
+	if (argc > 3 && strcmp(argv[3], "-u") == 0) use_udp = 1;
+
+	if (!net_is_available()) {
+		printf("nc: network unavailable\n");
+		return 1;
+	}
+
+	u16 port = (u16)atoi(port_str);
+
+	/* Parse IP address */
+	struct b1nix_sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = B1NIX_AF_INET;
+	addr.sin_port = (u16)((port >> 8) | (port << 8)); /* host to network */
+
+	/* Parse dotted decimal IP */
+	u32 ip = 0;
+	int shift = 0;
+	const char *p = host;
+	while (*p) {
+		if (*p == '.') {
+			shift++;
+			p++;
+			continue;
+		}
+		u32 octet = 0;
+		while (*p >= '0' && *p <= '9') {
+			octet = octet * 10 + (u32)(*p - '0');
+			p++;
+		}
+		ip |= (octet << (shift * 8));
+		if (*p == '.') { shift++; p++; }
+	}
+	addr.sin_addr = ip;
+
+	int sock_type = use_udp ? B1NIX_SOCK_DGRAM : B1NIX_SOCK_STREAM;
+	int fd = socket(B1NIX_AF_INET, sock_type, 0);
+	if (fd < 0) {
+		printf("nc: socket failed\n");
+		return 1;
+	}
+
+	if (connect(fd, &addr, sizeof(addr)) < 0) {
+		printf("nc: connect failed\n");
+		close(fd);
+		return 1;
+	}
+
+	printf("nc: connected to %s:%d (%s)\n", host, port,
+	       use_udp ? "udp" : "tcp");
+
+	if (use_udp) {
+		/* UDP: read stdin, send, recv response */
+		char buf[1024];
+		usize total = 0;
+		while (total < sizeof(buf) - 1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			buf[total++] = c;
+			if (c == '\n') break;
+		}
+		if (total > 0) {
+			send(fd, buf, total, 0);
+			/* Try to receive response */
+			char rbuf[512];
+			long n = recv(fd, rbuf, sizeof(rbuf) - 1, 0);
+			if (n > 0) {
+				rbuf[n] = '\0';
+				printf("%s", rbuf);
+			}
+		}
+	} else {
+		/* TCP: interactive send/receive until EOF */
+		while (1) {
+			char c;
+			if (read(0, &c, 1) <= 0) break;
+			send(fd, &c, 1, 0);
+
+			/* Check for response */
+			char rbuf[256];
+			long n = recv(fd, rbuf, sizeof(rbuf) - 1, 0);
+			if (n > 0) {
+				rbuf[n] = '\0';
+				printf("%s", rbuf);
+			}
+		}
+	}
+
+	close(fd);
+	return 0;
+}
+
+/* ── wget — simple HTTP client ── */
+static int wget_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("wget: missing URL\nUsage: wget <http://host/path>\n");
+		return 1;
+	}
+
+	if (!net_is_available()) {
+		printf("wget: network unavailable\n");
+		return 1;
+	}
+
+	const char *url = argv[1];
+
+	/* Parse URL: http://host[:port]/path */
+	const char *host_start = url;
+	if (strncmp(url, "http://", 7) == 0) {
+		host_start = url + 7;
+	}
+
+	/* Extract host */
+	char host[128];
+	int hi = 0;
+	u16 port = 80;
+	const char *path_start = "/";
+
+	while (*host_start && *host_start != ':' && *host_start != '/' && hi < 127) {
+		host[hi++] = *host_start++;
+	}
+	host[hi] = '\0';
+
+	if (*host_start == ':') {
+		host_start++;
+		port = (u16)atoi(host_start);
+		while (*host_start && *host_start != '/') host_start++;
+	}
+	if (*host_start == '/') path_start = host_start;
+	if (path_start[0] == '\0') path_start = "/";
+
+	/* Resolve hostname via DNS */
+	printf("wget: resolving %s...\n", host);
+	syscall_dispatch(SYS_NET_DNS, (u64)(usize)host, 0, 0, 0);
+
+	/* DNS resolution is async via console. For now use QEMU user-mode
+	   networking default gateway (10.0.2.2) as HTTP proxy */
+	u32 server_ip_raw = (10) | (0 << 8) | (2 << 16) | (2 << 24);
+
+	/* Build HTTP request */
+	char request[1024];
+	int req_len = snprintf(request, sizeof(request),
+		"GET %s HTTP/1.0\r\n"
+		"Host: %s\r\n"
+		"User-Agent: b1nix-wget/0.1\r\n"
+		"Accept: */*\r\n"
+		"Connection: close\r\n"
+		"\r\n",
+		path_start, host);
+
+	/* Parse IP for socket */
+	struct b1nix_sockaddr_in addr;
+	memset(&addr, 0, sizeof(addr));
+	addr.sin_family = B1NIX_AF_INET;
+	addr.sin_port = (u16)((port >> 8) | (port << 8)); /* host to network */
+	addr.sin_addr = server_ip_raw;
+
+	int fd = socket(B1NIX_AF_INET, B1NIX_SOCK_STREAM, 0);
+	if (fd < 0) {
+		printf("wget: socket failed\n");
+		return 1;
+	}
+
+	printf("wget: connecting to %s:%d...\n", host, port);
+	if (connect(fd, &addr, sizeof(addr)) < 0) {
+		printf("wget: connect failed\n");
+		close(fd);
+		return 1;
+	}
+
+	printf("wget: sending request...\n");
+	send(fd, request, req_len, 0);
+
+	/* Receive response */
+	printf("wget: receiving response...\n");
+	char buf[512];
+	int total = 0;
+	int header_done = 0;
+
+	while (1) {
+		long n = recv(fd, buf, sizeof(buf) - 1, 0);
+		if (n <= 0) break;
+		buf[n] = '\0';
+
+		if (!header_done) {
+			/* Find end of headers */
+			char *body = strstr(buf, "\r\n\r\n");
+			if (body) {
+				header_done = 1;
+				body += 4;
+				printf("%s", body);
+				total += (int)strlen(body);
+			}
+		} else {
+			printf("%s", buf);
+			total += (int)n;
+		}
+	}
+
+	printf("\nwget: received %d bytes\n", total);
+	close(fd);
+	return 0;
+}
+
+/* ── dmesg — print kernel log buffer ── */
+static int dmesg_main(int argc, const char **argv)
+{
+	(void)argc; (void)argv;
+
+	char buf[2048];
+	long n = (long)syscall_dispatch(SYS_DMESG, (u64)(usize)buf, sizeof(buf), 0, 0);
+	if (n < 0) {
+		printf("dmesg: error reading kernel log\n");
+		return 1;
+	}
+	if (n > 0) {
+		printf("%s", buf);
+		if (buf[n - 1] != '\n') putchar('\n');
+	}
+	return 0;
+}
+
+/* ═══════════════════════════════════════════════════════════════════
+   BUSYBOX DISPATCHER
+   ═══════════════════════════════════════════════════════════════════ */
+
 struct bb_app {
 	const char *name;
 	int (*main)(int argc, const char **argv);
 };
 
 static struct bb_app bb_apps[] = {
+	/* File/directory */
+	{"pwd",     pwd_main},
+	{"ls",      ls_main},
+	{"cp",      cp_main},
+	{"mv",      mv_main},
+	{"rm",      rm_main},
+	{"mkdir",   mkdir_main},
+	{"rmdir",   rmdir_main},
+	{"chmod",   chmod_main},
+	{"chown",   chown_main},
+	{"ln",      ln_main},
+	/* System */
+	{"ps",      ps_main},
+	{"kill",    kill_main},
+	{"date",    date_main},
+	{"uname",   uname_main},
+	/* Text */
 	{"cat",     cat_main},
 	{"echo",    echo_main},
+	{"head",    head_main},
+	{"tail",    tail_main},
+	{"grep",    grep_main},
+	{"find",    find_main},
+	{"wc",      wc_main},
+	{"sort",    sort_main},
+	{"uniq",    uniq_main},
+	/* Filesystem */
+	{"mount",   mount_main},
+	{"df",      df_main},
+	{"sync",    sync_main},
+	{"hexdump", hexdump_main},
+	/* Network (M23) */
+	{"ifconfig", ifconfig_main},
+	{"ping",     ping_main},
+	{"nc",       nc_main},
+	{"wget",     wget_main},
+	/* Diagnostics (M24) */
+	{"dmesg",    dmesg_main},
+	/* Misc */
 	{"true",    true_main},
 	{"false",   false_main},
 	{"yes",     yes_main},
@@ -155,7 +1299,7 @@ int busybox_main(int argc, const char **argv)
 	}
 
 	const char *cmd = argv[1];
-	
+
 	/* Check symlink-style invocation (argv[0] == command name) */
 	for (struct bb_app *app = bb_apps; app->name; app++) {
 		if (strcmp(app->name, cmd) == 0) {

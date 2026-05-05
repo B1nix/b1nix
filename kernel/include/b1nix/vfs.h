@@ -104,6 +104,7 @@ int vfs_bind(int fd, const void *addr, usize addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
+void vfs_socket_push_udp(u16 local_port, const void *data, usize len);
 
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);

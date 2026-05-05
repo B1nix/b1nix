@@ -69,6 +69,14 @@ struct b1nix_sockaddr_in {
 	u8  sin_zero[8];
 };
 
+struct b1nix_utsname {
+	char sysname[32];
+	char nodename[32];
+	char release[32];
+	char version[32];
+	char machine[32];
+};
+
 struct b1nix_selfhost_status {
 	u32 abi_version;
 	u32 target_ready;

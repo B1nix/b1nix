@@ -42,5 +42,9 @@ int ioctl(int fd, unsigned long request, void *arg);
 int tcgetattr(int fd, struct b1nix_termios *termios);
 int tcsetattr(int fd, int optional_actions, const struct b1nix_termios *termios);
 int selfhost_status(struct b1nix_selfhost_status *status);
+int getcwd(char *buf, size_t size);
+int uname(struct b1nix_utsname *buf);
+long time(void);
+int dmesg(char *buf, size_t size);
 
 #endif

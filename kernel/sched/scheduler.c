@@ -406,6 +406,11 @@ void scheduler_on_timer_tick(void)
 	}
 }
 
+u64 scheduler_get_uptime_ticks(void)
+{
+	return scheduler_ticks;
+}
+
 void scheduler_exit_current(int exit_code)
 {
 	interrupts_disable();
