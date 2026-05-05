@@ -217,9 +217,23 @@ int tui_get_key(void)
 {
 	int c = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
 	
-	if (c == 0x1B) { /* ESC — check for escape sequences */
-		/* Try to read more bytes with a short timeout */
-		/* For now just return ESC */
+	if (c == 0x1B) {
+		int seq1 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+		if (seq1 == '[') {
+			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+			if (seq2 == 'A') return KEY_UP;
+			if (seq2 == 'B') return KEY_DOWN;
+			if (seq2 == 'C') return KEY_RIGHT;
+			if (seq2 == 'D') return KEY_LEFT;
+			if (seq2 == 'H') return KEY_HOME;
+			if (seq2 == 'F') return KEY_END;
+			if (seq2 == 'M') {
+				int f = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+				if (f >= 1 && f <= 10) return KEY_F1 + (f - 1);
+				if (f == 11) return KEY_F11;
+				if (f == 12) return KEY_F12;
+			}
+		}
 		return KEY_ESC;
 	}
 	

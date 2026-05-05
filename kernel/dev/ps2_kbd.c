@@ -50,6 +50,14 @@ static void kbd_push_escape(char final)
 	kbd_push(final);
 }
 
+static void kbd_push_fkey(int f)
+{
+	kbd_push(27);
+	kbd_push('[');
+	kbd_push('M');
+	kbd_push((char)f);
+}
+
 void ps2_kbd_interrupt_handler(void)
 {
 	u8 scancode = inb(0x60);
@@ -66,6 +74,9 @@ void ps2_kbd_interrupt_handler(void)
 		} else if (key == 0x1D) {
 			ctrl_pressed = 0;
 		}
+		if (extended_scancode && (key == 0x5B || key == 0x5C)) {
+			ctrl_pressed = 0;
+		}
 		extended_scancode = 0;
 	} else {
 		if (extended_scancode) {
@@ -76,6 +87,11 @@ void ps2_kbd_interrupt_handler(void)
 			case 0x4B: kbd_push_escape('D'); break; /* left */
 			case 0x47: kbd_push_escape('H'); break; /* home */
 			case 0x4F: kbd_push_escape('F'); break; /* end */
+			case 0x1D: /* Right Ctrl */
+			case 0x5B: /* Left GUI (Mac Cmd) */
+			case 0x5C: /* Right GUI (Mac Cmd) */
+				ctrl_pressed = 1;
+				break;
 			default: break;
 			}
 			extended_scancode = 0;
@@ -87,6 +103,13 @@ void ps2_kbd_interrupt_handler(void)
 			shift_pressed = 1;
 		} else if (scancode == 0x1D) {
 			ctrl_pressed = 1;
+		} else if (scancode >= 0x3B && scancode <= 0x44) {
+			// F1 to F10
+			kbd_push_fkey((int)(scancode - 0x3B + 1));
+		} else if (scancode == 0x57) {
+			kbd_push_fkey(11);
+		} else if (scancode == 0x58) {
+			kbd_push_fkey(12);
 		} else if (scancode < 128) {
 			char c = shift_pressed ? scancode_map_shift[scancode] : scancode_map[scancode];
 			if (c != 0) {

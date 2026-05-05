@@ -5,22 +5,36 @@ void *memcpy(void *dest, const void *src, size_t count)
 {
 	unsigned char *d = dest;
 	const unsigned char *s = src;
-
-	for (size_t i = 0; i < count; i++) {
-		d[i] = s[i];
+	
+	while (count >= 8) {
+		*(size_t *)d = *(const size_t *)s;
+		d += 8;
+		s += 8;
+		count -= 8;
 	}
-
+	while (count > 0) {
+		*d++ = *s++;
+		count--;
+	}
 	return dest;
 }
 
 void *memset(void *dest, int value, size_t count)
 {
 	unsigned char *d = dest;
+	unsigned char v = (unsigned char)value;
+	size_t v64 = ((size_t)v << 56) | ((size_t)v << 48) | ((size_t)v << 40) | ((size_t)v << 32) | 
+	             ((size_t)v << 24) | ((size_t)v << 16) | ((size_t)v << 8) | (size_t)v;
 
-	for (size_t i = 0; i < count; i++) {
-		d[i] = (unsigned char)value;
+	while (count >= 8) {
+		*(size_t *)d = v64;
+		d += 8;
+		count -= 8;
 	}
-
+	while (count > 0) {
+		*d++ = v;
+		count--;
+	}
 	return dest;
 }
 
@@ -30,12 +44,28 @@ void *memmove(void *dest, const void *src, size_t count)
 	const unsigned char *s = src;
 
 	if (d < s) {
-		for (size_t i = 0; i < count; i++) {
-			d[i] = s[i];
+		while (count >= 8) {
+			*(size_t *)d = *(const size_t *)s;
+			d += 8;
+			s += 8;
+			count -= 8;
+		}
+		while (count > 0) {
+			*d++ = *s++;
+			count--;
 		}
 	} else if (d > s) {
-		for (size_t i = count; i > 0; i--) {
-			d[i - 1] = s[i - 1];
+		d += count;
+		s += count;
+		while (count >= 8) {
+			d -= 8;
+			s -= 8;
+			*(size_t *)d = *(const size_t *)s;
+			count -= 8;
+		}
+		while (count > 0) {
+			*--d = *--s;
+			count--;
 		}
 	}
 

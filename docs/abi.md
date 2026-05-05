@@ -86,7 +86,9 @@ clang --target=x86_64-unknown-elf \
   -T userspace/linker.ld -static -nostdlib
 ```
 
-## In-Guest Compilation (Future)
+## In-Guest Compilation Status
 
-M26 will port TCC (TinyCC) to run inside B1NIX, enabling
-native compilation without an external cross-compiler.
+M25 tracks the early TinyCC/TCC path. The source and build target are present,
+but compiling and running programs fully inside B1NIX is still planned work.
+M26 remains the full toolchain and self-hosting milestone for Binutils, GCC,
+larger programs, and rebuilding the kernel from inside B1NIX.

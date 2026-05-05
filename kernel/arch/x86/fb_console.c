@@ -2,6 +2,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/types.h>
+#include <string.h>
 #include "font8x8.h"
 
 static struct boot_framebuffer fb;
@@ -108,27 +109,129 @@ static void fb_console_scroll(void)
     u8 *dst = (u8 *)fb_ptr;
     u8 *src = (u8 *)fb_ptr + (line_height * bytes_per_line);
     
-    // Copy forward since dst < src
-    for (u32 y = 0; y < scroll_height; y++) {
-        for (u32 x = 0; x < bytes_per_line; x++) {
-            dst[y * bytes_per_line + x] = src[y * bytes_per_line + x];
-        }
-    }
+    memmove(dst, src, scroll_height * bytes_per_line);
 
     // Clear bottom line
-    for (u32 y = scroll_height; y < fb.height; y++) {
-        for (u32 x = 0; x < fb.width; x++) {
-            u8 *pixel = (u8 *)fb_ptr + (y * fb.pitch) + (x * (fb.bpp / 8));
-            *(u32 *)pixel = bg_color;
-        }
+    u64 bg64 = ((u64)bg_color << 32) | bg_color;
+    u64 *dst64 = (u64 *)(dst + scroll_height * bytes_per_line);
+    u32 words = (line_height * bytes_per_line) / 8;
+    for (u32 i = 0; i < words; i++) {
+        dst64[i] = bg64;
     }
 
     cursor_y -= line_height;
 }
 
+static int cursor_visible = 0;
+
+static void fb_console_erase_cursor(void)
+{
+    if (!fb_ptr || !cursor_visible) return;
+    
+    u32 y_base = cursor_y + 7 * FONT_SCALE;
+    for (u32 dy = 0; dy < FONT_SCALE; dy++) {
+        for (u32 dx = 0; dx < 8 * FONT_SCALE; dx++) {
+            u32 px = cursor_x + dx;
+            u32 py = y_base + dy;
+            if (px < fb.width && py < fb.height) {
+                u8 *pixel = (u8 *)fb_ptr + (py * fb.pitch) + (px * (fb.bpp / 8));
+                *(u32 *)pixel = bg_color;
+            }
+        }
+    }
+    cursor_visible = 0;
+}
+
+static int ansi_state = 0;
+static int ansi_params[8];
+static int ansi_param_idx = 0;
+static int ansi_cursor_hidden = 0;
+
+
+
+void fb_console_blink_cursor(void)
+{
+    if (!fb_ptr || ansi_cursor_hidden) return;
+
+    cursor_visible = !cursor_visible;
+    u32 color = cursor_visible ? fg_color : bg_color;
+
+    u32 y_base = cursor_y + 7 * FONT_SCALE;
+    for (u32 dy = 0; dy < FONT_SCALE; dy++) {
+        for (u32 dx = 0; dx < 8 * FONT_SCALE; dx++) {
+            u32 px = cursor_x + dx;
+            u32 py = y_base + dy;
+            if (px < fb.width && py < fb.height) {
+                u8 *pixel = (u8 *)fb_ptr + (py * fb.pitch) + (px * (fb.bpp / 8));
+                *(u32 *)pixel = color;
+            }
+        }
+    }
+}
+
 void fb_console_putchar(char c)
 {
     if (!fb_ptr) return;
+
+    if (ansi_state == 1) {
+        if (c == '[') {
+            ansi_state = 2;
+            ansi_param_idx = 0;
+            for (int i = 0; i < 8; i++) ansi_params[i] = 0;
+        } else {
+            ansi_state = 0;
+        }
+        return;
+    }
+    if (ansi_state == 2) {
+        if (c >= '0' && c <= '9') {
+            ansi_params[ansi_param_idx] = ansi_params[ansi_param_idx] * 10 + (c - '0');
+        } else if (c == ';') {
+            if (ansi_param_idx < 7) ansi_param_idx++;
+        } else if (c == '?') {
+            /* ignore for now */
+        } else {
+            if (c == 'J') {
+                if (ansi_params[0] == 2) fb_console_clear();
+            } else if (c == 'H') {
+                int row = ansi_params[0] > 0 ? ansi_params[0] - 1 : 0;
+                int col = ansi_params[1] > 0 ? ansi_params[1] - 1 : 0;
+                cursor_y = row * 8 * FONT_SCALE;
+                cursor_x = col * 8 * FONT_SCALE;
+            } else if (c == 'm') {
+                for (int i = 0; i <= ansi_param_idx; i++) {
+                    int code = ansi_params[i];
+                    if (code == 0) {
+                        fg_color = 0xFFFFFFFF; bg_color = 0xFF000000;
+                    } else if (code >= 30 && code <= 37) {
+                        u32 colors[8] = { 0xFF000000, 0xFFAA0000, 0xFF00AA00, 0xFFAAAA00, 0xFF0000AA, 0xFFAA00AA, 0xFF00AAAA, 0xFFAAAAAA };
+                        fg_color = colors[code - 30];
+                    } else if (code >= 40 && code <= 47) {
+                        u32 colors[8] = { 0xFF000000, 0xFFAA0000, 0xFF00AA00, 0xFFAAAA00, 0xFF0000AA, 0xFFAA00AA, 0xFF00AAAA, 0xFFAAAAAA };
+                        bg_color = colors[code - 40];
+                    } else if (code == 90) {
+                        fg_color = 0xFF555555; /* bright black/grey */
+                    }
+                }
+            } else if (c == 'l') {
+                if (ansi_params[0] == 25) {
+                    fb_console_erase_cursor();
+                    ansi_cursor_hidden = 1;
+                }
+            } else if (c == 'h') {
+                if (ansi_params[0] == 25) ansi_cursor_hidden = 0;
+            }
+            ansi_state = 0;
+        }
+        return;
+    }
+
+    if (c == 27) {
+        ansi_state = 1;
+        return;
+    }
+
+    fb_console_erase_cursor();
 
     if (c == '\n') {
         cursor_x = 0;

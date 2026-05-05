@@ -92,6 +92,7 @@ int vfs_fstat(int fd, struct b1nix_stat *st);
 int vfs_fsync(int fd);
 int vfs_mount(const char *source, const char *target, const char *fstype, u64 flags);
 int vfs_umount(const char *target);
+isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);

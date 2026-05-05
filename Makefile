@@ -91,6 +91,9 @@ KERNEL_SOURCES += \
 	kernel/net/tcp.c \
 	kernel/net/dhcp.c \
 	kernel/net/dns.c
+else ifeq ($(ARCH),aarch64)
+KERNEL_SOURCES += \
+	kernel/net/stub.c
 endif
 
 

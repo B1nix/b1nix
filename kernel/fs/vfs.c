@@ -1070,6 +1070,24 @@ int vfs_umount(const char *target)
 	return -1;
 }
 
+isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries)
+{
+	if (!out && max_entries > 0) return -1;
+
+	usize count = 0;
+	for (usize i = 0; i < MAX_MOUNTS; i++) {
+		if (!mounts[i].used) continue;
+		if (count < max_entries) {
+			copy_path(out[count].source, sizeof(out[count].source), mounts[i].source);
+			copy_path(out[count].target, sizeof(out[count].target), mounts[i].target);
+			copy_path(out[count].fstype, sizeof(out[count].fstype), mounts[i].fstype);
+			out[count].flags = mounts[i].flags;
+		}
+		count++;
+	}
+	return (isize)count;
+}
+
 int vfs_sync(void)
 {
 	blk_cache_flush(0);

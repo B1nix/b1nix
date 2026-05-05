@@ -22,6 +22,7 @@ enum {
 	SYS_UNAME    = 76,
 	SYS_TIME     = 77,
 	SYS_DMESG    = 78,
+	SYS_MOUNTS   = 79,
 };
 
 /* Raw syscall — uses int $0x80 convention for kernel threads */

@@ -300,12 +300,6 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 
 	task_init_cred(task);
 
-	console_write("sched: created task ");
-	console_write(name);
-	console_write(" id 0x");
-	console_write_hex64(task->id);
-	console_write("\n");
-
 	return (int)task->id;
 }
 
@@ -418,10 +412,6 @@ void scheduler_exit_current(int exit_code)
 	if (current_task == 0) {
 		panic("scheduler_exit_current without current task");
 	}
-
-	console_write("sched: task exited ");
-	console_write(current_task->name);
-	console_write("\n");
 
 	/* Free credentials */
 	if (current_task->cred) {

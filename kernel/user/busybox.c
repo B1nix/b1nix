@@ -781,8 +781,22 @@ static int uniq_main(int argc, const char **argv)
 static int mount_main(int argc, const char **argv)
 {
 	if (argc < 2) {
-		/* Show current mounts */
-		printf("mount: showing active mounts not implemented\n");
+		struct b1nix_mount_entry entries[8];
+		long count = (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)entries,
+		                                    8, 0, 0);
+		if (count < 0) {
+			printf("mount: cannot read mount table\n");
+			return 1;
+		}
+		for (long i = 0; i < count && i < 8; i++) {
+			printf("%s on %s type %s", entries[i].source, entries[i].target,
+			       entries[i].fstype);
+			if (entries[i].flags) printf(" flags=%lu", (unsigned long)entries[i].flags);
+			printf("\n");
+		}
+		if (count > 8) {
+			printf("mount: %ld more mount(s) not shown\n", count - 8);
+		}
 		return 0;
 	}
 

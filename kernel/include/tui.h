@@ -83,6 +83,8 @@
 #define KEY_F8     0xE017
 #define KEY_F9     0xE018
 #define KEY_F10    0xE019
+#define KEY_F11    0xE01C
+#define KEY_F12    0xE01D
 #define KEY_TAB    0xE01A
 #define KEY_ESC    0xE01B
 #define KEY_ENTER  0x0A
@@ -119,8 +121,8 @@
 /* ── TUI Helper Macros ── */
 
 /* Screen geometry — default 80x25 */
-#define TUI_COLS 80
-#define TUI_ROWS 25
+#define TUI_COLS 64
+#define TUI_ROWS 48
 
 /* ── TUI Common Functions ── */
 

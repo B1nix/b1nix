@@ -536,6 +536,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return (u64)vfs_mount((const char *)(usize)arg0, (const char *)(usize)arg1, (const char *)(usize)arg2, arg3);
 	case SYS_UMOUNT:
 		return (u64)vfs_umount((const char *)(usize)arg0);
+	case SYS_MOUNTS:
+		return (u64)vfs_mounts((struct b1nix_mount_entry *)(usize)arg0, (usize)arg1);
 	case SYS_SYNC:
 		return (u64)vfs_sync();
 	case SYS_GETCWD: {

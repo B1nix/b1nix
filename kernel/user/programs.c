@@ -10,26 +10,74 @@ static void uwrite(const char *text)
 	syscall_dispatch(SYS_WRITE, (u64)(usize)text, strlen(text), 0, 0);
 }
 
+#define SH_HISTORY_MAX 16
+static char sh_history[SH_HISTORY_MAX][256];
+static int sh_hist_count = 0;
+
 static void readline(char *buffer, usize max_len)
 {
+	struct b1nix_termios old_t, new_t;
+	syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS, (u64)(usize)&old_t, 0);
+	new_t = old_t;
+	new_t.c_lflag &= ~(B1NIX_ICANON | B1NIX_ECHO);
+	syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&new_t, 0);
+
 	usize len = 0;
+	int hist_idx = sh_hist_count;
+
 	while (1) {
 		char c = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
-		if (c == '\n') {
-			// Trim trailing spaces
-			while (len > 0 && buffer[len - 1] == ' ') {
-				len--;
+		if (c == 27) {
+			char b1 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+			if (b1 == '[') {
+				char b2 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+				if (b2 == 'A') { // Up
+					if (hist_idx > 0) {
+						hist_idx--;
+						for (usize i = 0; i < len; i++) uwrite("\b \b");
+						len = strlen(sh_history[hist_idx]);
+						if (len >= max_len) len = max_len - 1;
+						memcpy(buffer, sh_history[hist_idx], len);
+						buffer[len] = '\0';
+						uwrite(buffer);
+					}
+				} else if (b2 == 'B') { // Down
+					if (hist_idx < sh_hist_count) {
+						for (usize i = 0; i < len; i++) uwrite("\b \b");
+						hist_idx++;
+						if (hist_idx < sh_hist_count) {
+							len = strlen(sh_history[hist_idx]);
+							if (len >= max_len) len = max_len - 1;
+							memcpy(buffer, sh_history[hist_idx], len);
+							buffer[len] = '\0';
+							uwrite(buffer);
+						} else {
+							len = 0;
+							buffer[0] = '\0';
+						}
+					}
+				}
 			}
+			continue;
+		}
+
+		if (c == '\n' || c == '\r') {
 			buffer[len] = '\0';
+			uwrite("\n");
 			break;
-		} else if (c == '\b') {
+		} else if (c == '\b' || c == 127) {
 			if (len > 0) {
 				len--;
+				uwrite("\b \b");
 			}
 		} else if (c >= ' ' && c <= '~' && len < max_len - 1) {
 			buffer[len++] = c;
+			char tmp[2] = {c, 0};
+			uwrite(tmp);
 		}
 	}
+
+	syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&old_t, 0);
 }
 
 static void resolve_path(const char *cwd, const char *rel, char *abs)
@@ -261,7 +309,12 @@ static int lookup_path(const char *cwd, const char *name, char *out)
 			return 0;
 		}
 	}
-	resolve_path(cwd, name, out);
+	usize j = 0;
+	while (name[j] && j < 127) {
+		out[j] = name[j];
+		j++;
+	}
+	out[j] = '\0';
 	return 0;
 }
 
@@ -272,6 +325,15 @@ static u64 spawn_path(const char *cwd, char **args, int num_args)
 	u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)path, num_args, (u64)(usize)args, 0);
 	if (pid == (u64)-1 && strcmp(path, args[0]) != 0) {
 		pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], num_args, (u64)(usize)args, 0);
+	}
+	if (pid == (u64)-1 && args[0][0] != '/' && args[0][0] != '.') {
+		char bin_path[128];
+		usize len = strlen(args[0]);
+		if (len < 120) {
+			memcpy(bin_path, "/bin/", 5);
+			memcpy(bin_path + 5, args[0], len + 1);
+			pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args, (u64)(usize)args, 0);
+		}
 	}
 	return pid;
 }
@@ -313,12 +375,24 @@ static int sh_main(int argc, const char **argv)
 		while (*cmd == ' ') cmd++;
 		if (cmd[0] == '\0') continue;
 
+		usize raw_len = strlen(raw_line);
+		if (raw_len > 0) {
+			if (sh_hist_count < SH_HISTORY_MAX) {
+				memcpy(sh_history[sh_hist_count++], raw_line, raw_len + 1);
+			} else {
+				for (int i = 1; i < SH_HISTORY_MAX; i++) {
+					memcpy(sh_history[i - 1], sh_history[i], 256);
+				}
+				memcpy(sh_history[SH_HISTORY_MAX - 1], raw_line, raw_len + 1);
+			}
+		}
+
 		int is_bg = 0;
-		usize len = strlen(cmd);
-		if (len > 0 && cmd[len - 1] == '&') {
+		usize cmd_len = strlen(cmd);
+		if (cmd_len > 0 && cmd[cmd_len - 1] == '&') {
 			is_bg = 1;
-			cmd[len - 1] = '\0';
-			len--;
+			cmd[cmd_len - 1] = '\0';
+			cmd_len--;
 		}
 		
 		char *cmd1 = cmd;
@@ -364,16 +438,22 @@ static int sh_main(int argc, const char **argv)
 			uwrite("  cd <dir>   - Change directory\n");
 			uwrite("  cat <file> - Print file content\n");
 			uwrite("  echo <txt> - Print text\n");
+			uwrite("  pwd        - Print working directory\n");
+			uwrite("  cp/mv/rm   - File operations\n");
+			uwrite("  mkdir/rmdir- Directory operations\n");
+			uwrite("  chmod/chown- Permission operations\n");
 			uwrite("  clear      - Clear screen\n");
+			uwrite("  ps/jobs    - List tasks/jobs\n");
+			uwrite("  kill <pid> - Kill task\n");
+			uwrite("  mem/df     - System info\n");
+			uwrite("  ifconfig   - Network info\n");
 			uwrite("  ping <ip>  - Send ICMP echo\n");
 			uwrite("  resolve    - Resolve DNS\n");
-			uwrite("  ps         - List tasks\n");
-			uwrite("  mem        - Show memory\n");
 			uwrite("  reboot     - Reboot system\n");
 			uwrite("  export     - Set env var\n");
-			uwrite("  jobs       - List background jobs\n");
-			uwrite("  ip         - Show network info\n");
 			uwrite("  selfhost   - Show M17 toolchain status\n");
+			uwrite("  mc         - Mini Commander TUI\n");
+			uwrite("  ne         - Nano-like editor\n");
 		} else if (strcmp(args[0], "ip") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
 		} else if (strcmp(args[0], "selfhost") == 0 && !pipe_pos) {

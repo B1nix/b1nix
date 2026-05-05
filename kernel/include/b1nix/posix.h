@@ -90,4 +90,11 @@ struct b1nix_selfhost_status {
 	char make[32];
 };
 
+struct b1nix_mount_entry {
+	char source[64];
+	char target[64];
+	char fstype[16];
+	u64 flags;
+};
+
 #endif

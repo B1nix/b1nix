@@ -213,10 +213,15 @@ void x86_timer_init(void)
 
 extern void ps2_kbd_interrupt_handler(void);
 
+extern void fb_console_blink_cursor(void);
+
 void x86_irq_handler(struct interrupt_frame *frame)
 {
 	if (frame->vector == 32) {
 		timer_ticks++;
+		if (timer_ticks % 50 == 0) {
+			fb_console_blink_cursor();
+		}
 		outb(PIC1_COMMAND, PIC_EOI);
 		scheduler_on_timer_tick();
 		return;
