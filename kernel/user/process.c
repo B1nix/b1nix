@@ -60,18 +60,19 @@ void userspace_init(void)
 
 int user_spawn(const char *path, int argc, const char **argv)
 {
-	const struct initramfs_file *file = initramfs_find(path);
-
-	if (file == 0 || (file->flags & INITRAMFS_EXECUTABLE) == 0) {
-		console_write("user: executable not found ");
-		console_write(path);
-		console_write("\n");
-		return -1;
-	}
-
+	/* First try to find as a registered builtin program */
 	const struct user_program *program = user_find_program(path);
 
 	if (program == 0) {
+		/* Fall back to initramfs */
+		const struct initramfs_file *file = initramfs_find(path);
+		if (file == 0 || (file->flags & INITRAMFS_EXECUTABLE) == 0) {
+			console_write("user: executable not found ");
+			console_write(path);
+			console_write("\n");
+			return -1;
+		}
+
 		console_write("user: no loader for ");
 		console_write(path);
 		console_write("\n");

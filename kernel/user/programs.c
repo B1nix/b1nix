@@ -381,8 +381,32 @@ static int init_main(int argc, const char **argv)
 	return 0;
 }
 
+extern int busybox_main(int argc, const char **argv);
+extern int mc_main(int argc, const char **argv);
+extern int editor_main(int argc, const char **argv);
+extern int nmake_main(int argc, const char **argv);
+
 void user_register_builtin_programs(void)
 {
 	user_register_program("/bin/init", init_main);
 	user_register_program("/bin/sh", sh_main);
+
+	/* BusyBox utilities */
+	user_register_program("/bin/cat", busybox_main);
+	user_register_program("/bin/echo", busybox_main);
+	user_register_program("/bin/true", busybox_main);
+	user_register_program("/bin/false", busybox_main);
+	user_register_program("/bin/yes", busybox_main);
+	user_register_program("/bin/sleep", busybox_main);
+	user_register_program("/bin/whoami", busybox_main);
+	user_register_program("/bin/id", busybox_main);
+	user_register_program("/bin/clear", busybox_main);
+
+	/* Also register the busybox dispatcher itself */
+	user_register_program("/bin/busybox", busybox_main);
+
+	/* M16 — TUI Applications */
+	user_register_program("/bin/mc", mc_main);       /* Mini Commander file manager */
+	user_register_program("/bin/ne", editor_main);   /* Nano-like editor */
+	user_register_program("/bin/nmake", nmake_main); /* Minimal make utility */
 }

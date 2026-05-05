@@ -41,6 +41,9 @@ KERNEL_SOURCES := \
 	kernel/main.c \
 	kernel/lib/string.c \
 	kernel/lib/panic.c \
+	kernel/lib/stdio.c \
+	kernel/lib/stdlib.c \
+	kernel/lib/unistd.c \
 	kernel/mm/kheap.c \
 	kernel/mm/pmm.c \
 	kernel/mm/swap.c \
@@ -55,8 +58,16 @@ KERNEL_SOURCES := \
 	kernel/fs/ext4.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
+	kernel/ipc/mqueue.c \
+	kernel/ipc/shm.c \
+	kernel/sched/uidgid.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
+	kernel/user/busybox.c \
+	kernel/user/tui_common.c \
+	kernel/user/mc.c \
+	kernel/user/editor.c \
+	kernel/user/nmake.c \
 	$(ARCH_SOURCES)
 
 ifeq ($(ARCH),x86)
@@ -115,6 +126,16 @@ run-x86: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	@mkdir -p $(BUILD_DIR)/fat_dir
 	@echo "Hello from FAT32" > $(BUILD_DIR)/fat_dir/test.txt
+	@if [ ! -f $(BUILD_DIR)/ext3.img ]; then \
+		echo "Creating ext3.img..."; \
+		dd if=/dev/zero of=$(BUILD_DIR)/ext3.img bs=1048576 count=8 2>/dev/null; \
+		/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext3 -q -F $(BUILD_DIR)/ext3.img; \
+	fi
+	@if [ ! -f $(BUILD_DIR)/ext4.img ]; then \
+		echo "Creating ext4.img..."; \
+		dd if=/dev/zero of=$(BUILD_DIR)/ext4.img bs=1048576 count=8 2>/dev/null; \
+		/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4 -q -F $(BUILD_DIR)/ext4.img; \
+	fi
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
 		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \

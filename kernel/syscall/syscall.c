@@ -8,6 +8,10 @@
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/io.h>
+#include <b1nix/mqueue.h>
+#include <b1nix/shm.h>
+#include <b1nix/uidgid.h>
+#include <b1nix/dirent.h>
 #include <string.h>
 
 static u64 sys_write(const char *text, usize size)
@@ -61,6 +65,44 @@ static u64 sys_read_kbd(void)
 		}
 	}
 	return (u64)c;
+}
+
+static u64 sys_readdir(const char *dir_path, struct dirent *buf, usize max_entries)
+{
+	const char *names[128];
+	usize count = vfs_list(dir_path, names, 128);
+	if (count > max_entries) count = max_entries;
+
+	for (usize i = 0; i < count; i++) {
+		usize len = strlen(names[i]);
+		if (len > 63) len = 63;
+		memcpy(buf[i].name, names[i], len);
+		buf[i].name[len] = '\0';
+
+		/* Try to get more info by resolving the path */
+		char full_path[256];
+		usize dirlen = strlen(dir_path);
+		memcpy(full_path, dir_path, dirlen);
+		if (dirlen > 0 && full_path[dirlen - 1] != '/') {
+			full_path[dirlen++] = '/';
+		}
+		memcpy(full_path + dirlen, names[i], len + 1);
+
+		struct vfs_node *node = vfs_find_node(full_path);
+		if (node) {
+			buf[i].type   = (u32)node->type;
+			buf[i].is_dir = (node->type == VFS_DIRECTORY) ? 1 : 0;
+			buf[i].is_exec = (node->mode & 0111) ? 1 : 0;
+			buf[i].size   = node->size;
+		} else {
+			buf[i].type   = 0;
+			buf[i].is_dir = 0;
+			buf[i].is_exec = 0;
+			buf[i].size   = 0;
+		}
+	}
+
+	return count;
 }
 
 static u64 sys_clear(void)
@@ -233,6 +275,93 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_SLEEP:
 		scheduler_sleep_ticks(arg0);
 		return 0;
+	case SYS_KILL:
+		return (u64)scheduler_kill((usize)arg0, (int)arg1);
+	case SYS_SIGNAL: {
+		/* arg0 = sig, arg1 = handler, arg2 = flags
+		 * Returns old handler, or SIG_ERR on error */
+		int sig = (int)arg0;
+		if (sig < 1 || sig >= NSIG) return (u64)SIG_ERR;
+		if (sig == SIGKILL || sig == SIGSTOP) return (u64)SIG_ERR;
+		struct sigaction act, old;
+		memset(&act, 0, sizeof(act));
+		memset(&old, 0, sizeof(old));
+		act.sa_handler = (sighandler_t)arg1;
+		act.sa_flags = arg2;
+		if (scheduler_sigaction(sig, &act, &old) < 0) return (u64)SIG_ERR;
+		return (u64)old.sa_handler;
+	}
+	case SYS_GETPID:
+		return scheduler_get_pid();
+	case SYS_MQ_OPEN: {
+		/* arg0 = name (char*), arg1 = flags (unused for now) */
+		const char *name = (const char *)(usize)arg0;
+		struct mqueue *mq = mqueue_create(name);
+		return (mq) ? (u64)(usize)mq : (u64)-1;
+	}
+	case SYS_MQ_SEND: {
+		/* arg0 = mqueue ptr, arg1 = data ptr, arg2 = data len */
+		struct mqueue *mq = (struct mqueue *)(usize)arg0;
+		const void *data = (const void *)(usize)arg1;
+		u32 len = (u32)arg2;
+		return (u64)mqueue_send(mq, data, len);
+	}
+	case SYS_MQ_RECEIVE: {
+		/* arg0 = mqueue ptr, arg1 = buffer ptr, arg2 = len ptr */
+		struct mqueue *mq = (struct mqueue *)(usize)arg0;
+		void *buffer = (void *)(usize)arg1;
+		u32 *len = (u32 *)(usize)arg2;
+		return (u64)mqueue_receive(mq, buffer, len);
+	}
+	case SYS_MQ_CLOSE: {
+		struct mqueue *mq = (struct mqueue *)(usize)arg0;
+		mqueue_close(mq);
+		return 0;
+	}
+	case SYS_MQ_UNLINK: {
+		const char *name = (const char *)(usize)arg0;
+		return (u64)mqueue_unlink(name);
+	}
+	case SYS_SHMGET:
+		return (u64)shmget((u32)arg0, (usize)arg1, (int)arg2);
+	case SYS_SHMAT:
+		return (u64)(usize)shmat((int)arg0, (const void *)(usize)arg1, (int)arg2);
+	case SYS_SHMDT:
+		return (u64)shmdt((const void *)(usize)arg0);
+	case SYS_SHMCTL:
+		return (u64)shmctl((int)arg0, (int)arg1, (struct shmid_ds *)(usize)arg2);
+	case SYS_CHMOD:
+		return (u64)vfs_chmod((const char *)(usize)arg0, (u16)arg1);
+	case SYS_CHOWN:
+		return (u64)vfs_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
+	case SYS_GETUID: {
+		struct cred *c = scheduler_get_current_cred();
+		return c ? c->uid : 0;
+	}
+	case SYS_GETEUID: {
+		struct cred *c = scheduler_get_current_cred();
+		return c ? c->euid : 0;
+	}
+	case SYS_GETGID: {
+		struct cred *c = scheduler_get_current_cred();
+		return c ? c->gid : 0;
+	}
+	case SYS_GETEGID: {
+		struct cred *c = scheduler_get_current_cred();
+		return c ? c->egid : 0;
+	}
+	case SYS_SETUID: {
+		struct cred *c = scheduler_get_current_cred();
+		if (!c) return -1;
+		return (u64)cred_set_uid(c, (u16)arg0);
+	}
+	case SYS_SETGID: {
+		struct cred *c = scheduler_get_current_cred();
+		if (!c) return -1;
+		return (u64)cred_set_gid(c, (u16)arg0);
+	}
+	case SYS_READDIR:
+		return sys_readdir((const char *)(usize)arg0, (struct dirent *)(usize)arg1, (usize)arg2);
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

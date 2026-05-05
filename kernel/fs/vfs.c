@@ -5,6 +5,8 @@
 #include <b1nix/vfs.h>
 #include <b1nix/blk.h>
 #include <b1nix/fat32.h>
+#include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 
 #define MAX_VFS_NODES 256
 #define MAX_VFS_HANDLES 64
@@ -22,6 +24,86 @@ static struct vfs_node *root_node = 0;
 
 void virtio_blk_init(void);
 
+/* ── Permission Helpers ── */
+
+extern struct cred *scheduler_get_current_cred(void);
+
+int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred, int write_access)
+{
+	if (!node || !cred) return 0;
+
+	/* Root can do anything */
+	if (cred->euid == ROOT_UID) return 1;
+
+	/* Check DAC_OVERRIDE capability */
+	if (cred_has_cap(cred, CAP_DAC_OVERRIDE)) return 1;
+	if (!write_access && cred_has_cap(cred, CAP_DAC_READ_SEARCH)) return 1;
+
+	/* Check ACLs first if present */
+	if (node->acl_count > 0) {
+		u16 matched_perms = 0;
+		int mask_found = 0;
+		u16 mask_perms = 0;
+		
+		for (int i = 0; i < node->acl_count; i++) {
+			if (node->acls[i].tag == ACL_MASK) {
+				mask_found = 1;
+				mask_perms = node->acls[i].perms;
+			}
+		}
+
+		for (int i = 0; i < node->acl_count; i++) {
+			switch (node->acls[i].tag) {
+			case ACL_USER_OBJ:
+				if (cred->euid == node->uid) {
+					matched_perms = node->acls[i].perms;
+					goto acl_check;
+				}
+				break;
+			case ACL_USER:
+				if (cred->euid == node->acls[i].qualifier) {
+					matched_perms = node->acls[i].perms;
+					goto acl_check;
+				}
+				break;
+			case ACL_GROUP_OBJ:
+				if (cred->egid == node->gid) {
+					matched_perms = node->acls[i].perms;
+					goto acl_check;
+				}
+				break;
+			case ACL_GROUP:
+				if (cred->egid == node->acls[i].qualifier) {
+					matched_perms = node->acls[i].perms;
+					goto acl_check;
+				}
+				for (int g = 0; g < cred->ngroups; g++) {
+					if (cred->groups[g] == node->acls[i].qualifier) {
+						matched_perms = node->acls[i].perms;
+						goto acl_check;
+					}
+				}
+				break;
+			}
+		}
+
+	acl_check:
+		if (mask_found) matched_perms &= mask_perms;
+		if (write_access) return (matched_perms & 0200) != 0;
+		return (matched_perms & 0400) != 0;
+	}
+
+	/* Standard Unix permissions */
+	return cred_can_access(cred, node->uid, node->gid, node->mode, write_access);
+}
+
+static const struct cred *get_current_cred(void)
+{
+	return scheduler_get_current_cred();
+}
+
+/* ── Node allocation with default permissions ── */
+
 static struct vfs_node *alloc_node(void)
 {
 	if (node_count >= MAX_VFS_NODES) {
@@ -29,6 +111,15 @@ static struct vfs_node *alloc_node(void)
 	}
 	struct vfs_node *node = &nodes[node_count++];
 	memset(node, 0, sizeof(*node));
+	const struct cred *cred = get_current_cred();
+	if (cred) {
+		node->uid = cred->euid;
+		node->gid = cred->egid;
+	} else {
+		node->uid = ROOT_UID;
+		node->gid = ROOT_GID;
+	}
+	node->mode = VFS_DEFAULT_PERMS;
 	return node;
 }
 
@@ -193,6 +284,16 @@ int vfs_open(const char *path)
 {
 	struct vfs_node *node = vfs_find_node(path);
 	if (node == 0) return -1;
+
+	/* Permission check: read access for opening */
+	const struct cred *cred = get_current_cred();
+	if (cred && !vfs_get_node_perm(node, cred, 0)) {
+		console_write("vfs: permission denied opening ");
+		console_write(path);
+		console_write("\n");
+		return -1;
+	}
+
 	return alloc_handle(node);
 }
 
@@ -202,6 +303,12 @@ isize vfs_read(int handle, char *buffer, usize size)
 
 	struct vfs_handle *h = &handles[handle];
 	struct vfs_node *node = h->node;
+
+	/* Permission check: read access */
+	const struct cred *cred = get_current_cred();
+	if (cred && !vfs_get_node_perm(node, cred, 0)) {
+		return -1;
+	}
 
 	if (node->read_cb) {
 		isize bytes = node->read_cb(node, h->offset, buffer, size);
@@ -229,6 +336,12 @@ isize vfs_write(int handle, const char *buffer, usize size)
 
 	struct vfs_node *node = handles[handle].node;
 	struct vfs_handle *h = &handles[handle];
+
+	/* Permission check: write access */
+	const struct cred *cred = get_current_cred();
+	if (cred && !vfs_get_node_perm(node, cred, 1)) {
+		return -1;
+	}
 
 	if (node->write_cb) {
 		isize bytes = node->write_cb(node, h->offset, buffer, size);
@@ -288,6 +401,15 @@ int vfs_create(const char *path, const char *data)
 			}
 			return -1;
 		}
+
+		/* Check write permission on parent directory */
+		const struct cred *cred = get_current_cred();
+		if (cred && parent && !vfs_get_node_perm(parent, cred, 1)) {
+			console_write("vfs: permission denied creating ");
+			console_write(path);
+			console_write("\n");
+			return -1;
+		}
 	}
 
 	usize size = strlen(data);
@@ -306,6 +428,37 @@ struct vfs_node *vfs_find_node_by_fd(int fd)
 int vfs_mkdir(const char *path)
 {
 	if (vfs_find_node(path) != 0) return -1;
+
+	/* Permission check on parent */
+	usize len = strlen(path);
+	isize last_slash = -1;
+	for (isize i = len - 1; i >= 0; i--) {
+		if (path[i] == '/') {
+			last_slash = i;
+			break;
+		}
+	}
+
+	if (last_slash >= 0) {
+		char parent_path[256];
+		if (last_slash == 0) {
+			parent_path[0] = '/';
+			parent_path[1] = '\0';
+		} else {
+			usize cp_len = last_slash < 255 ? last_slash : 255;
+			memcpy(parent_path, path, cp_len);
+			parent_path[cp_len] = '\0';
+		}
+		struct vfs_node *parent = vfs_find_node(parent_path);
+		const struct cred *cred = get_current_cred();
+		if (cred && parent && !vfs_get_node_perm(parent, cred, 1)) {
+			console_write("vfs: permission denied mkdir ");
+			console_write(path);
+			console_write("\n");
+			return -1;
+		}
+	}
+
 	return add_node(path, VFS_DIRECTORY, 0, 0, 0) == 0 ? -1 : 0;
 }
 
@@ -313,6 +466,12 @@ usize vfs_list(const char *dir_path, const char **names, usize max_names)
 {
 	struct vfs_node *dir = vfs_find_node(dir_path);
 	if (!dir || dir->type != VFS_DIRECTORY) return 0;
+
+	/* List requires read access on directory */
+	const struct cred *cred = get_current_cred();
+	if (cred && !vfs_get_node_perm(dir, cred, 0)) {
+		return 0;
+	}
 
 	if (dir->list_cb) {
 		return dir->list_cb(dir, names, max_names);
@@ -325,5 +484,67 @@ usize vfs_list(const char *dir_path, const char **names, usize max_names)
 		child = child->next_sibling;
 	}
 
+	return count;
+}
+
+/* ── Permission Management Functions ── */
+
+int vfs_chmod(const char *path, u16 mode)
+{
+	struct vfs_node *node = vfs_find_node(path);
+	if (!node) return -1;
+
+	const struct cred *cred = get_current_cred();
+	if (!cred) return -1;
+
+	/* Only owner or root can chmod */
+	if (cred->euid != ROOT_UID && cred->euid != node->uid) {
+		if (!cred_has_cap(cred, CAP_FOWNER)) return -1;
+	}
+
+	node->mode = (node->mode & ~0777) | (mode & 0777);
+	return 0;
+}
+
+int vfs_chown(const char *path, u16 uid, u16 gid)
+{
+	struct vfs_node *node = vfs_find_node(path);
+	if (!node) return -1;
+
+	const struct cred *cred = get_current_cred();
+	if (!cred) return -1;
+
+	/* Only root can change owner */
+	if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_CHOWN)) return -1;
+
+	if (uid != (u16)-1) node->uid = uid;
+	if (gid != (u16)-1) node->gid = gid;
+	return 0;
+}
+
+int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl)
+{
+	if (!node || !acl) return -1;
+
+	const struct cred *cred = get_current_cred();
+	if (!cred) return -1;
+
+	/* Only owner or root can set ACLs */
+	if (cred->euid != ROOT_UID && cred->euid != node->uid) {
+		if (!cred_has_cap(cred, CAP_FOWNER)) return -1;
+	}
+
+	if (node->acl_count >= ACL_MAX_ENTRIES) return -1;
+	node->acls[node->acl_count++] = *acl;
+	return 0;
+}
+
+int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl, int max_entries)
+{
+	if (!node || !out_acl) return -1;
+	int count = node->acl_count < max_entries ? node->acl_count : max_entries;
+	for (int i = 0; i < count; i++) {
+		out_acl[i] = node->acls[i];
+	}
 	return count;
 }

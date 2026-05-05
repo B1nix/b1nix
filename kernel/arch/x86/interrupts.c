@@ -247,7 +247,6 @@ void x86_exception_handler(struct interrupt_frame *frame)
 	}
 
 	const char *name = "unknown exception";
-
 	if (frame->vector < 32) {
 		name = exception_names[frame->vector];
 	}
@@ -269,6 +268,32 @@ void x86_exception_handler(struct interrupt_frame *frame)
 	console_write("\nrflags: 0x");
 	console_write_hex64(frame->rflags);
 	console_write("\n");
+
+	/* If exception happened in userspace (CS == 0x1B), send signal instead of panic */
+	if (frame->cs == 0x1B || frame->cs == 0x23) {
+		int sig = 0;
+		switch (frame->vector) {
+		case 0:  sig = SIGFPE;  break;  /* #DE divide error */
+		case 4:  sig = SIGILL;  break;  /* #OF overflow */
+		case 5:  sig = SIGSEGV; break;  /* #BR bound range */
+		case 6:  sig = SIGILL;  break;  /* #UD invalid opcode */
+		case 8:  sig = SIGSEGV; break;  /* #DF double fault */
+		case 11: sig = SIGSEGV; break;  /* #NP segment not present */
+		case 12: sig = SIGSEGV; break;  /* #SS stack segment */
+		case 13: sig = SIGSEGV; break;  /* #GP general protection */
+		case 14: sig = SIGSEGV; break;  /* #PF page fault */
+		default: sig = SIGTERM; break;
+		}
+		console_write("sending signal ");
+		console_write_dec(sig);
+		console_write(" to pid ");
+		console_write_hex64(scheduler_get_pid());
+		console_write("\n");
+		scheduler_kill(scheduler_get_pid(), sig);
+		/* Process will be killed on next scheduler check */
+		scheduler_yield();
+		return;
+	}
 
 	panic("unhandled CPU exception");
 }

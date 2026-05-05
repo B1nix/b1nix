@@ -130,19 +130,19 @@
 
 ## M15: IPC, Security & Standard OS Features
 
-- [ ] Process Signals (SIGINT, SIGKILL, SIGSEGV, etc.).
-- [ ] Inter-process communication (UNIX domain sockets, message queues).
-- [ ] POSIX shared memory (`shmget`, `shmat`).
-- [ ] User and Group ID management (UID/GID) and ring transitions.
-- [ ] File permissions, capabilities, and ACLs.
-- [ ] Standard C library (libc) port (e.g., newlib or musl).
-- [ ] Port of standard utilities (GNU coreutils / BusyBox).
+- [x] Process Signals (SIGINT, SIGKILL, SIGSEGV, etc.).
+- [x] Inter-process communication (UNIX domain sockets, message queues).
+- [x] POSIX shared memory (`shmget`, `shmat`).
+- [x] User and Group ID management (UID/GID) and ring transitions.
+- [x] File permissions, capabilities, and ACLs.
+- [x] Standard C library (libc) port (e.g., newlib or musl).
+- [x] Port of standard utilities (GNU coreutils / BusyBox).
 
 ## M16: User Space Applications & TUI
 
-- [ ] Mini File Manager (TUI-based, Midnight Commander style).
-- [ ] File tracking and build automation utility (`make` clone).
-- [ ] Text editor (e.g., `vi` or `nano` clone).
+- [x] Mini File Manager (TUI-based, Midnight Commander style).
+- [x] File tracking and build automation utility (`make` clone).
+- [x] Text editor (e.g., `vi` or `nano` clone).
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 

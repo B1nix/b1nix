@@ -3,6 +3,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 
 #define MAX_TASKS 16
 #define KERNEL_STACK_SIZE (16 * 1024)
@@ -55,6 +56,14 @@ struct task {
 	int priority;
 	int exit_code;
 	usize parent_id;
+
+	/* Signal handling */
+	u64 pending_signals;       /* bitmask of pending signals */
+	u64 blocked_signals;       /* bitmask of blocked signals */
+	struct sigaction sigactions[NSIG];  /* signal actions */
+
+	/* Credentials */
+	struct cred *cred;
 };
 
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
@@ -168,6 +177,24 @@ void scheduler_init(void)
 	console_write("sched: initialized\n");
 }
 
+static void task_init_cred(struct task *task)
+{
+	if (task->id == 1) {
+		/* Boot task gets root credentials */
+		task->cred = cred_create_default();
+	} else {
+		/* Inherit credentials from parent */
+		struct task *parent = 0;
+		for (usize i = 0; i < MAX_TASKS; i++) {
+			if (tasks[i].id == task->parent_id) {
+				parent = &tasks[i];
+				break;
+			}
+		}
+		task->cred = cred_dup(parent ? parent->cred : 0);
+	}
+}
+
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 {
 	struct task *task = find_unused_task();
@@ -215,6 +242,11 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	task->priority = 1;
 	task->parent_id = current_task ? current_task->id : 0;
 	task->exit_code = 0;
+	task->pending_signals = 0;
+	task->blocked_signals = 0;
+	memset(task->sigactions, 0, sizeof(task->sigactions));
+
+	task_init_cred(task);
 
 	console_write("sched: created task ");
 	console_write(name);
@@ -229,6 +261,11 @@ void scheduler_yield(void)
 {
 	interrupts_disable();
 	wake_sleepers();
+
+	/* Deliver pending signals for current task */
+	if (current_task) {
+		scheduler_deliver_pending_signals();
+	}
 
 	struct task *old_task = current_task;
 	struct task *new_task = pick_next_task();
@@ -319,6 +356,12 @@ void scheduler_exit_current(int exit_code)
 	console_write("sched: task exited ");
 	console_write(current_task->name);
 	console_write("\n");
+
+	/* Free credentials */
+	if (current_task->cred) {
+		cred_free(current_task->cred);
+		current_task->cred = 0;
+	}
 
 	current_task->exit_code = exit_code;
 	current_task->state = TASK_DEAD;
@@ -425,4 +468,156 @@ int scheduler_get_stdout(void)
 	}
 	interrupts_enable();
 	return fd;
+}
+
+/* ── Signal Delivery ── */
+
+int scheduler_kill(usize task_id, int sig)
+{
+	if (sig < 1 || sig >= NSIG) return -1;
+
+	interrupts_disable();
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].id == task_id && tasks[i].state != TASK_UNUSED) {
+			/* SIGKILL and SIGSTOP cannot be blocked/ignored */
+			tasks[i].pending_signals |= (1ULL << sig);
+
+			/* Wake blocked task so it can handle signal */
+			if (tasks[i].state == TASK_BLOCKED) {
+				tasks[i].state = TASK_READY;
+			}
+			interrupts_enable();
+			return 0;
+		}
+	}
+	interrupts_enable();
+	return -1;
+}
+
+int scheduler_sigaction(int sig, const struct sigaction *act, struct sigaction *old)
+{
+	if (sig < 1 || sig >= NSIG) return -1;
+	/* SIGKILL and SIGSTOP cannot be caught/ignored */
+	if (sig == SIGKILL || sig == SIGSTOP) return -1;
+	if (!current_task) return -1;
+
+	interrupts_disable();
+	if (old) {
+		*old = current_task->sigactions[sig];
+	}
+	if (act) {
+		current_task->sigactions[sig] = *act;
+		/* Remove SA_NODEFER: block the signal by default */
+		if (!(act->sa_flags & SA_NODEFER)) {
+			current_task->blocked_signals &= ~(1ULL << sig);
+		}
+	}
+	interrupts_enable();
+	return 0;
+}
+
+sighandler_t scheduler_get_sighandler(int sig)
+{
+	if (!current_task || sig < 1 || sig >= NSIG) return SIG_DFL;
+	return current_task->sigactions[sig].sa_handler;
+}
+
+usize scheduler_get_pid(void)
+{
+	if (!current_task) return 0;
+	return current_task->id;
+}
+
+struct cred *scheduler_get_current_cred(void)
+{
+	if (!current_task) return 0;
+	return current_task->cred;
+}
+
+/* Called before returning to userspace — delivers pending signals */
+void scheduler_deliver_pending_signals(void)
+{
+	if (!current_task) return;
+
+	u64 pending = current_task->pending_signals;
+	u64 blocked = current_task->blocked_signals;
+	u64 deliverable = pending & ~blocked;
+
+	if (deliverable == 0) return;
+
+	/* Find highest-priority signal (lowest number = highest priority) */
+	for (int sig = 1; sig < NSIG; sig++) {
+		if (!(deliverable & (1ULL << sig))) continue;
+
+		sighandler_t handler = current_task->sigactions[sig].sa_handler;
+
+		if (sig == SIGKILL) {
+			/* SIGKILL — terminate immediately */
+			interrupts_disable();
+			current_task->exit_code = 128 + SIGKILL;
+			current_task->state = TASK_DEAD;
+			scheduler_yield();
+			/* unreachable */
+		}
+
+		if (handler == SIG_IGN) {
+			/* Ignored — just clear */
+			current_task->pending_signals &= ~(1ULL << sig);
+			continue;
+		}
+
+		if (handler == SIG_DFL) {
+			/* Default actions */
+			switch (sig) {
+			case SIGINT:
+			case SIGTERM:
+			case SIGQUIT:
+			case SIGPIPE:
+			case SIGSEGV:
+			case SIGBUS:
+			case SIGFPE:
+			case SIGILL:
+			case SIGABRT:
+			case SIGSYS:
+			case SIGTRAP:
+			case SIGXCPU:
+			case SIGXFSZ:
+			case SIGVTALRM:
+			case SIGPROF:
+				/* Terminate */
+				interrupts_disable();
+				current_task->exit_code = 128 + sig;
+				current_task->state = TASK_DEAD;
+				scheduler_yield();
+				/* unreachable */
+			case SIGCONT:
+				current_task->pending_signals &= ~(1ULL << sig);
+				current_task->state = TASK_READY;
+				continue;
+			case SIGSTOP:
+			case SIGTSTP:
+			case SIGTTIN:
+			case SIGTTOU:
+				current_task->state = TASK_BLOCKED;
+				scheduler_yield();
+				continue;
+			case SIGCHLD:
+			case SIGURG:
+			case SIGWINCH:
+			default:
+				/* Ignore by default */
+				current_task->pending_signals &= ~(1ULL << sig);
+				continue;
+			}
+		}
+
+		/* Custom handler — for now, just clear pending and log */
+		/* In a full implementation we'd set up a signal frame on user stack */
+		current_task->pending_signals &= ~(1ULL << sig);
+
+		/* If SA_RESETHAND, reset to SIG_DFL after delivery */
+		if (current_task->sigactions[sig].sa_flags & SA_RESETHAND) {
+			current_task->sigactions[sig].sa_handler = SIG_DFL;
+		}
+	}
 }

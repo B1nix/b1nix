@@ -17,6 +17,9 @@
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
 #include <b1nix/filelock.h>
+#include <b1nix/mqueue.h>
+#include <b1nix/shm.h>
+#include <b1nix/uidgid.h>
 
 extern void ps2_kbd_init(void);
 extern void compositor_init(void);
@@ -83,6 +86,7 @@ void kernel_main(u64 arg0, u64 arg1)
 #endif
 
 	scheduler_init();
+	uidgid_init();
 	arch_init();
 	blk_cache_init();
 
@@ -96,6 +100,8 @@ void kernel_main(u64 arg0, u64 arg1)
 	ahci_init();
 	nvme_init();
 	filelock_init();
+	mqueue_init();
+	shm_init();
 	swap_init();
 	net_init();
 	ps2_kbd_init();
