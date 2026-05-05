@@ -103,3 +103,44 @@ char *strdup(const char *s)
 	if (p) memcpy(p, s, len);
 	return p;
 }
+
+char *strcat(char *dest, const char *src)
+{
+	char *d = dest;
+	while (*d) d++;
+	while ((*d++ = *src++));
+	return dest;
+}
+
+char *strrchr(const char *s, int c)
+{
+	const char *last = NULL;
+	while (*s) {
+		if (*s == (char)c) last = s;
+		s++;
+	}
+	if (c == '\0') return (char *)s;
+	return (char *)last;
+}
+
+char *strerror(int errnum)
+{
+	(void)errnum;
+	return "Error";
+}
+
+char *strpbrk(const char *s, const char *accept)
+{
+	while (*s) {
+		const char *a = accept;
+		while (*a) {
+			if (*a == *s) return (char *)s;
+			a++;
+		}
+		s++;
+	}
+	return NULL;
+}
+
+
+

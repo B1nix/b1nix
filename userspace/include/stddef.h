@@ -4,6 +4,7 @@
 #define NULL ((void *)0)
 
 typedef unsigned long size_t;
+typedef long ssize_t;
 typedef long ptrdiff_t;
 
 #endif

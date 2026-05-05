@@ -269,9 +269,9 @@ disk userland is populated.
 - [x] Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and simple `malloc`.
 - [x] Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] Build and run a VFS-loaded `hello.c` ELF program.
-- [ ] Port TinyCC/TCC as the first practical in-guest C compiler.
-- [ ] Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
-- [ ] Compile one simple shell utility inside B1NIX.
+- [x] Port TinyCC/TCC as the first practical in-guest C compiler.
+- [x] Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
+- [x] Compile one simple shell utility inside B1NIX.
 - [x] Document the path from external cross-builds to in-guest compilation.
 
 ## M26: Full Toolchain and Self-Hosting

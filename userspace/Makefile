@@ -21,7 +21,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/unistd.o
 
 BINARIES := \
-	$(BUILD)/bin/hello
+	$(BUILD)/bin/hello \
+	$(BUILD)/bin/tcc
 
 .PHONY: all clean install
 
@@ -48,11 +49,21 @@ $(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o --whole-archive $(LIB) --no-whole-archive
 
-# ── Install to initramfs ──
+$(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
+	@mkdir -p $(dir $@)
+	cd tcc && clang -DC2STR conftest.c -o c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
+	../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\""
+
+# ── Install to rootfs ──
 install: all
 	@echo "Installing userspace binaries..."
-	@mkdir -p ../build/x86/initramfs/bin
-	cp $(BINARIES) ../build/x86/initramfs/bin/
+	@mkdir -p ../build/x86/rootfs/bin
+	@mkdir -p ../build/x86/rootfs/include
+	@mkdir -p ../build/x86/rootfs/lib
+	cp $(BINARIES) ../build/x86/rootfs/bin/
+	cp -r include/* ../build/x86/rootfs/include/
+	cp $(LIB) ../build/x86/rootfs/lib/
+	cp $(CRT0) ../build/x86/rootfs/lib/
 
 clean:
 	rm -rf $(BUILD)

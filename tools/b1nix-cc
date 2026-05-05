@@ -37,5 +37,5 @@ for src in $SOURCES; do
 	OBJS="$OBJS $obj"
 done
 
-$LD -m elf_x86_64 -T "$LINKER" -o "$OUTPUT" $CRT0 $OBJS --whole-archive "$LIB" --no-whole-archive
+"$LD" -m elf_x86_64 -T "$LINKER" -o "$OUTPUT" "$CRT0" $OBJS --whole-archive "$LIB" --no-whole-archive
 echo "b1nix-cc: $OUTPUT ready" >&2

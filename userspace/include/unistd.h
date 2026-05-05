@@ -3,16 +3,20 @@
 
 #include <stddef.h>
 
+extern char **environ;
+
 int   write(int fd, const void *buf, size_t n);
 int   read(int fd, void *buf, size_t n);
 int   close(int fd);
 void  _exit(int status) __attribute__((noreturn));
 int   sleep(unsigned int seconds);
-int   open(const char *path, int flags);
+int   open(const char *path, int flags, ...);
+int   unlink(const char *pathname);
+long  lseek(int fd, long offset, int whence);
+int   execvp(const char *file, char *const argv[]);
 int   mkdir(const char *path, unsigned int mode);
 int   chdir(const char *path);
 int   getcwd(char *buf, size_t size);
-long  time(void);
 
 /* stat structure for userspace */
 struct stat {

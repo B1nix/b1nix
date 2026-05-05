@@ -15,5 +15,9 @@ char *strncpy(char *dest, const char *src, size_t n);
 char *strchr(const char *s, int c);
 char *strstr(const char *haystack, const char *needle);
 char *strdup(const char *s);
+char *strcat(char *dest, const char *src);
+char *strrchr(const char *s, int c);
+char *strpbrk(const char *s, const char *accept);
+char *strerror(int errnum);
 
 #endif

@@ -128,50 +128,15 @@ userspace:
 	@$(MAKE) -C userspace
 
 userspace-install: userspace
-	@mkdir -p $(BUILD_DIR)/iso/boot
-	cp userspace/build/bin/hello $(BUILD_DIR)/iso/boot/hello
+	@$(MAKE) -C userspace install
 
 iso-full: userspace-install iso
 
-run-x86: iso
-	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	@mkdir -p $(BUILD_DIR)/fat_dir
-	@echo "Hello from FAT32" > $(BUILD_DIR)/fat_dir/test.txt
-	@if [ ! -f $(BUILD_DIR)/ext3.img ]; then \
-		echo "Creating ext3.img..."; \
-		dd if=/dev/zero of=$(BUILD_DIR)/ext3.img bs=1048576 count=8 2>/dev/null; \
-		/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext3 -q -F $(BUILD_DIR)/ext3.img; \
-	fi
-	@if [ ! -f $(BUILD_DIR)/ext4.img ]; then \
-		echo "Creating ext4.img..."; \
-		dd if=/dev/zero of=$(BUILD_DIR)/ext4.img bs=1048576 count=8 2>/dev/null; \
-		/opt/homebrew/opt/e2fsprogs/sbin/mkfs.ext4 -q -F $(BUILD_DIR)/ext4.img; \
-	fi
-	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
-	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
-		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/ext3.img,format=raw,if=virtio \
-		-drive file=$(BUILD_DIR)/ext4.img,format=raw,if=virtio \
-		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
-
-run-ext2: iso
-	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	@echo "Generating ext2 image..."
-	@mkdir -p $(BUILD_DIR)/ext2_root
-	@echo "Hello from Ext2!" > $(BUILD_DIR)/ext2_root/hello_ext2.txt
-	@echo "Another file" > $(BUILD_DIR)/ext2_root/test.txt
-	@dd if=/dev/zero of=$(BUILD_DIR)/disk.ext2 bs=1048576 count=8 2>/dev/null
-	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext2 -q -d $(BUILD_DIR)/ext2_root $(BUILD_DIR)/disk.ext2
-	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
-	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
-		-drive file=$(BUILD_DIR)/disk.ext2,format=raw,if=virtio \
-		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
-
-run-root: iso root-image
+run-x86: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
-		-drive file=$(BUILD_DIR)/root.ext2,format=raw,if=virtio \
+		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 run-aarch64: ARCH=aarch64
@@ -179,22 +144,12 @@ run-aarch64: $(KERNEL_ELF)
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
 	qemu-system-aarch64 -machine virt -cpu cortex-a57 -nographic -kernel $(KERNEL_ELF)
 
-smoke-m18: iso
-	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	@mkdir -p $(BUILD_DIR)/fat_dir
-	@echo "Hello from FAT32" > $(BUILD_DIR)/fat_dir/test.txt
-	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
-	@echo "Booting M18 smoke test. Expected log includes: user: enter /bin/init and Hello from VFS-loaded ELF"
-	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -display none -no-reboot -boot d \
-		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
-		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
-
 root-image:
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
-	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext2 bs=1048576 count=16 2>/dev/null
-	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext2 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext2
-	@echo "created $(BUILD_DIR)/root.ext2"
+	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=16 2>/dev/null
+	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@echo "created $(BUILD_DIR)/root.ext4"
 
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)
@@ -204,8 +159,9 @@ check-tools:
 
 clean:
 	rm -rf build
+	@$(MAKE) -C userspace clean
 
-# ── M24 Smoke Tests ──
+# ── Smoke Tests ──
 smoke: iso
 	@echo "Running smoke tests..."
 	sh tests/smoke.sh $(ARCH)
@@ -216,4 +172,4 @@ smoke-x86: smoke
 smoke-aarch64: ARCH=aarch64
 smoke-aarch64: smoke
 
-.PHONY: all clean run-x86 run-aarch64 run-ext2 run-root root-image iso userspace userspace-install iso-full smoke-m18 smoke smoke-x86 smoke-aarch64 check-tools
+.PHONY: all clean run-x86 run-aarch64 root-image iso userspace userspace-install iso-full smoke smoke-x86 smoke-aarch64 check-tools
