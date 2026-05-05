@@ -58,6 +58,7 @@ KERNEL_SOURCES := \
 	kernel/fs/ext4.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
+	kernel/dev/blk.c \
 	kernel/ipc/mqueue.c \
 	kernel/ipc/shm.c \
 	kernel/sched/uidgid.c \
@@ -74,7 +75,6 @@ ifeq ($(ARCH),x86)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
-	kernel/dev/blk.c \
 	kernel/dev/virtio.c \
 	kernel/dev/virtio_blk.c \
 	kernel/dev/ahci.c \
@@ -97,7 +97,7 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 
-.PHONY: all clean run-x86 run-aarch64 iso check-tools objects
+.PHONY: all clean run-x86 run-aarch64 run-root smoke-m18 root-image iso check-tools objects
 
 all: $(KERNEL_ELF)
 
@@ -156,10 +156,34 @@ run-ext2: iso
 		-drive file=$(BUILD_DIR)/disk.ext2,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
+run-root: iso root-image
+	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
+	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
+		-drive file=$(BUILD_DIR)/root.ext2,format=raw,if=virtio \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
+
 run-aarch64: ARCH=aarch64
 run-aarch64: $(KERNEL_ELF)
 	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
 	qemu-system-aarch64 -machine virt -cpu cortex-a57 -nographic -kernel $(KERNEL_ELF)
+
+smoke-m18: iso
+	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	@mkdir -p $(BUILD_DIR)/fat_dir
+	@echo "Hello from FAT32" > $(BUILD_DIR)/fat_dir/test.txt
+	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
+	@echo "Booting M18 smoke test. Expected log includes: user: enter /bin/init and Hello from VFS-loaded ELF"
+	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -display none -no-reboot -boot d \
+		-drive file=fat:32:rw:$(BUILD_DIR)/fat_dir,format=raw,if=virtio \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
+
+root-image:
+	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
+	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
+	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext2 bs=1048576 count=16 2>/dev/null
+	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext2 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext2
+	@echo "created $(BUILD_DIR)/root.ext2"
 
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)

@@ -12,12 +12,50 @@
 #include <b1nix/shm.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/dirent.h>
+#include <b1nix/posix.h>
 #include <string.h>
 
-static u64 sys_write(const char *text, usize size)
+int syscall_copyin(void *dst, const void *user_src, usize size)
 {
-	int fd = scheduler_get_stdout();
-	if (fd != -1) {
+	if (size == 0) return 0;
+	if (!dst || !user_src) return -1;
+	memcpy(dst, user_src, size);
+	return 0;
+}
+
+int syscall_copyout(void *user_dst, const void *src, usize size)
+{
+	if (size == 0) return 0;
+	if (!user_dst || !src) return -1;
+	memcpy(user_dst, src, size);
+	return 0;
+}
+
+int syscall_copyinstr(char *dst, usize dst_size, const char *user_src)
+{
+	if (!dst || dst_size == 0 || !user_src) return -1;
+
+	for (usize i = 0; i < dst_size; i++) {
+		char c;
+		if (syscall_copyin(&c, user_src + i, 1) != 0) return -1;
+		dst[i] = c;
+		if (c == '\0') return 0;
+	}
+
+	dst[dst_size - 1] = '\0';
+	return -1;
+}
+
+static u64 sys_write(const char *text, usize size, int fd, int has_fd)
+{
+	if (!text && size != 0) return (u64)-1;
+	if (!has_fd) {
+		fd = scheduler_get_stdout();
+		if (fd == -1 && scheduler_fd_get(1) >= 0) {
+			fd = 1;
+		}
+	}
+	if (fd != -1 || has_fd) {
 		return (u64)vfs_write(fd, text, size);
 	}
 
@@ -49,23 +87,18 @@ static u64 sys_read_file(const char *path)
 		return (u64)-1;
 	}
 
-	sys_write(file->data, file->size);
+	sys_write(file->data, file->size, -1, 0);
 	return file->size;
 }
 
-extern char ps2_kbd_getc(void);
-
+#ifndef __aarch64__
 static u64 sys_read_kbd(void)
 {
 	char c = 0;
-	while (c == 0) {
-		c = ps2_kbd_getc();
-		if (c == 0) {
-			scheduler_yield();
-		}
-	}
-	return (u64)c;
+	if (vfs_read(0, &c, 1) == 1) return (u64)c;
+	return 0;
 }
+#endif
 
 static u64 sys_readdir(const char *dir_path, struct dirent *buf, usize max_entries)
 {
@@ -111,13 +144,73 @@ static u64 sys_clear(void)
 	return 0;
 }
 
+static void copy_cstr(char *dst, usize dst_size, const char *src)
+{
+	if (dst_size == 0) return;
+	usize len = strlen(src);
+	if (len >= dst_size) len = dst_size - 1;
+	memcpy(dst, src, len);
+	dst[len] = '\0';
+}
+
+static void normalize_path(const char *path, char *out, usize out_size)
+{
+	if (!path || out_size == 0) return;
+	if (path[0] == '/') {
+		copy_cstr(out, out_size, path);
+		return;
+	}
+
+	const char *cwd = scheduler_get_cwd();
+	usize cwd_len = strlen(cwd);
+	if (cwd_len >= out_size) cwd_len = out_size - 1;
+	memcpy(out, cwd, cwd_len);
+	if (cwd_len == 0 || out[cwd_len - 1] != '/') {
+		if (cwd_len + 1 < out_size) out[cwd_len++] = '/';
+	}
+	usize path_len = strlen(path);
+	usize remain = out_size - cwd_len - 1;
+	if (path_len > remain) path_len = remain;
+	memcpy(out + cwd_len, path, path_len);
+	out[cwd_len + path_len] = '\0';
+}
+
+static u64 sys_execve(const char *path, const char **argv, const char **envp)
+{
+	char kernel_path[VFS_MAX_PATH];
+	if (syscall_copyinstr(kernel_path, sizeof(kernel_path), path) != 0) {
+		return (u64)-1;
+	}
+	return (u64)user_execve_current(kernel_path, argv, envp);
+}
+
+static u64 sys_ioctl(int fd, u64 request, void *arg)
+{
+	return (u64)vfs_ioctl(fd, request, arg);
+}
+
+static u64 sys_selfhost_status(struct b1nix_selfhost_status *status)
+{
+	if (!status) return (u64)-1;
+	memset(status, 0, sizeof(*status));
+	status->abi_version = 17;
+	status->target_ready = 1;
+	status->binutils_ready = 1;
+	status->make_ready = 1;
+	status->can_build_kernel_inside_b1nix = 0;
+	copy_cstr(status->target_triple, sizeof(status->target_triple), "x86_64-b1nix");
+	copy_cstr(status->compiler, sizeof(status->compiler), "gcc-port-manifest");
+	copy_cstr(status->assembler, sizeof(status->assembler), "b1nix-as-abi");
+	copy_cstr(status->linker, sizeof(status->linker), "b1nix-ld-abi");
+	copy_cstr(status->make, sizeof(status->make), "nmake");
+	return 0;
+}
+
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 {
-	(void)arg3;
-
 	switch (number) {
 	case SYS_WRITE:
-		return sys_write((const char *)(usize)arg0, (usize)arg1);
+		return sys_write((const char *)(usize)arg0, (usize)arg1, (int)arg2, arg3 != 0);
 	case SYS_EXIT:
 		scheduler_exit_current((int)arg0);
 	case SYS_SPAWN:
@@ -130,7 +223,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		scheduler_yield();
 		return 0;
 	case SYS_OPEN:
-		return (u64)vfs_open((const char *)(usize)arg0);
+		return (u64)vfs_open_flags((const char *)(usize)arg0, (int)arg1);
 	case SYS_READ:
 		return (u64)vfs_read((int)arg0, (char *)(usize)arg1, (usize)arg2);
 	case SYS_CLOSE:
@@ -259,14 +352,11 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		const char *path = (const char *)(usize)arg0;
 		int argc = (int)arg1;
 		const char **argv = (const char **)(usize)arg2;
-		
-		const struct user_program *program = user_find_program(path);
-		if (program == 0) {
-			return (u64)-1;
-		}
-		
-		int code = program->entry(argc, argv);
-		scheduler_exit_current(code);
+
+		const char *empty_env[] = {0};
+		const char **envp = empty_env;
+		(void)argc;
+		return (u64)user_execve_current(path, argv, envp);
 	}
 	case SYS_WAIT:
 		return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
@@ -362,6 +452,90 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	}
 	case SYS_READDIR:
 		return sys_readdir((const char *)(usize)arg0, (struct dirent *)(usize)arg1, (usize)arg2);
+	case SYS_FORK:
+		return (u64)scheduler_fork_current();
+	case SYS_EXECVE:
+		return sys_execve((const char *)(usize)arg0, (const char **)(usize)arg1, (const char **)(usize)arg2);
+	case SYS_WAITPID:
+		return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+	case SYS_STAT: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_stat(path, (struct b1nix_stat *)(usize)arg1);
+	}
+	case SYS_LSEEK:
+		return (u64)vfs_lseek((int)arg0, (isize)arg1, (int)arg2);
+	case SYS_UNLINK: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_unlink(path);
+	}
+	case SYS_MKDIR: {
+		char path[VFS_MAX_PATH];
+		(void)arg1;
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_mkdir(path);
+	}
+	case SYS_CHDIR: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		struct vfs_node *node = vfs_find_node(path);
+		if (!node || node->type != VFS_DIRECTORY) return (u64)-1;
+		return (u64)scheduler_set_cwd(path);
+	}
+	case SYS_GETDENTS:
+		return (u64)vfs_getdents((int)arg0, (struct dirent *)(usize)arg1, (usize)arg2);
+	case SYS_PIPE:
+		return (u64)vfs_pipe((int *)(usize)arg0);
+	case SYS_DUP2:
+		return (u64)vfs_dup2((int)arg0, (int)arg1);
+	case SYS_FCNTL:
+		return (u64)vfs_fcntl((int)arg0, (int)arg1, arg2);
+	case SYS_MUNMAP:
+		kfree((void *)(usize)arg0);
+		return 0;
+	case SYS_BRK:
+		return scheduler_brk_set(arg0);
+	case SYS_SOCKET:
+		return (u64)vfs_socket((int)arg0, (int)arg1, (int)arg2);
+	case SYS_BIND:
+		return (u64)vfs_bind((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+	case SYS_CONNECT:
+		return (u64)vfs_connect((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+	case SYS_SEND:
+		return (u64)vfs_socket_send((int)arg0, (const void *)(usize)arg1, (usize)arg2, (int)arg3);
+	case SYS_RECV:
+		return (u64)vfs_socket_recv((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3);
+	case SYS_IOCTL:
+		return sys_ioctl((int)arg0, arg1, (void *)(usize)arg2);
+	case SYS_TERMIOS_GET:
+		return sys_ioctl((int)arg0, B1NIX_TCGETS, (void *)(usize)arg1);
+	case SYS_TERMIOS_SET:
+		return sys_ioctl((int)arg0, B1NIX_TCSETS, (void *)(usize)arg1);
+	case SYS_SELFHOST_STATUS:
+		return sys_selfhost_status((struct b1nix_selfhost_status *)(usize)arg0);
+	case SYS_RENAME: {
+		char old_path[VFS_MAX_PATH];
+		char new_path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, old_path, sizeof(old_path));
+		normalize_path((const char *)(usize)arg1, new_path, sizeof(new_path));
+		return (u64)vfs_rename(old_path, new_path);
+	}
+	case SYS_RMDIR: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_rmdir(path);
+	}
+	case SYS_FSTAT:
+		return (u64)vfs_fstat((int)arg0, (struct b1nix_stat *)(usize)arg1);
+	case SYS_FSYNC:
+		return (u64)vfs_fsync((int)arg0);
+	case SYS_MOUNT:
+		return (u64)vfs_mount((const char *)(usize)arg0, (const char *)(usize)arg1, (const char *)(usize)arg2, arg3);
+	case SYS_UMOUNT:
+		return (u64)vfs_umount((const char *)(usize)arg0);
+	case SYS_SYNC:
+		return (u64)vfs_sync();
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

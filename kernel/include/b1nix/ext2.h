@@ -110,5 +110,6 @@ struct ext2_dir_entry {
 } __attribute__((packed));
 
 void ext2_init(void);
+int ext2_mount_root(const char *device_name, const char *mount_point);
 
 #endif

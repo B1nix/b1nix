@@ -1,4 +1,5 @@
 #include <string.h>
+#include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 
@@ -15,7 +16,6 @@ static void readline(char *buffer, usize max_len)
 	while (1) {
 		char c = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
 		if (c == '\n') {
-			uwrite("\n");
 			// Trim trailing spaces
 			while (len > 0 && buffer[len - 1] == ' ') {
 				len--;
@@ -25,12 +25,9 @@ static void readline(char *buffer, usize max_len)
 		} else if (c == '\b') {
 			if (len > 0) {
 				len--;
-				uwrite("\b \b");
 			}
 		} else if (c >= ' ' && c <= '~' && len < max_len - 1) {
 			buffer[len++] = c;
-			char str[2] = {c, '\0'};
-			uwrite(str);
 		}
 	}
 }
@@ -134,6 +131,163 @@ static int parse_cmd(char *cmd, char **args, int max_args) {
 	return argc;
 }
 
+struct shell_redir {
+	const char *stdin_path;
+	const char *stdout_path;
+	const char *stderr_path;
+	int stdout_append;
+	int stderr_to_stdout;
+};
+
+static int parse_redirs(char **args, int argc, struct shell_redir *redir)
+{
+	int out_argc = 0;
+	memset(redir, 0, sizeof(*redir));
+
+	for (int i = 0; i < argc; i++) {
+		if (strcmp(args[i], "<") == 0 && i + 1 < argc) {
+			redir->stdin_path = args[++i];
+			continue;
+		}
+		if (strcmp(args[i], ">") == 0 && i + 1 < argc) {
+			redir->stdout_path = args[++i];
+			redir->stdout_append = 0;
+			continue;
+		}
+		if (strcmp(args[i], ">>") == 0 && i + 1 < argc) {
+			redir->stdout_path = args[++i];
+			redir->stdout_append = 1;
+			continue;
+		}
+		if (strcmp(args[i], "2>") == 0 && i + 1 < argc) {
+			redir->stderr_path = args[++i];
+			continue;
+		}
+		if (strcmp(args[i], "2>&1") == 0) {
+			redir->stderr_to_stdout = 1;
+			continue;
+		}
+		args[out_argc++] = args[i];
+	}
+	args[out_argc] = 0;
+	return out_argc;
+}
+
+static u64 open_output(const char *cwd, const char *path, int append)
+{
+	char abs[128];
+	resolve_path(cwd, path, abs);
+	u64 fd = syscall_dispatch(SYS_CREATE, (u64)(usize)abs, (u64)(usize)"", 0, 0);
+	if (fd == 0) {
+		fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
+	} else {
+		fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
+	}
+	if (fd != (u64)-1 && append) {
+		syscall_dispatch(SYS_LSEEK, fd, (u64)0, B1NIX_SEEK_END, 0);
+	}
+	return fd;
+}
+
+static int apply_redirs(const char *cwd, const struct shell_redir *redir, int *opened, int max_opened)
+{
+	int opened_count = 0;
+	if (redir->stdin_path) {
+		char abs[128];
+		resolve_path(cwd, redir->stdin_path, abs);
+		u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
+		if (fd == (u64)-1) return -1;
+		syscall_dispatch(SYS_DUP2, fd, 0, 0, 0);
+		if (opened_count < max_opened) opened[opened_count++] = (int)fd;
+	}
+	if (redir->stdout_path) {
+		u64 fd = open_output(cwd, redir->stdout_path, redir->stdout_append);
+		if (fd == (u64)-1) return -1;
+		syscall_dispatch(SYS_DUP2, fd, 1, 0, 0);
+		if (opened_count < max_opened) opened[opened_count++] = (int)fd;
+	}
+	if (redir->stderr_to_stdout) {
+		syscall_dispatch(SYS_DUP2, 1, 2, 0, 0);
+	} else if (redir->stderr_path) {
+		u64 fd = open_output(cwd, redir->stderr_path, 0);
+		if (fd == (u64)-1) return -1;
+		syscall_dispatch(SYS_DUP2, fd, 2, 0, 0);
+		if (opened_count < max_opened) opened[opened_count++] = (int)fd;
+	}
+	return opened_count;
+}
+
+static void save_stdio(int saved[3])
+{
+	saved[0] = 61;
+	saved[1] = 62;
+	saved[2] = 63;
+	syscall_dispatch(SYS_DUP2, 0, saved[0], 0, 0);
+	syscall_dispatch(SYS_DUP2, 1, saved[1], 0, 0);
+	syscall_dispatch(SYS_DUP2, 2, saved[2], 0, 0);
+}
+
+static void restore_stdio(const int saved[3])
+{
+	syscall_dispatch(SYS_DUP2, saved[0], 0, 0, 0);
+	syscall_dispatch(SYS_DUP2, saved[1], 1, 0, 0);
+	syscall_dispatch(SYS_DUP2, saved[2], 2, 0, 0);
+	syscall_dispatch(SYS_CLOSE, saved[0], 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, saved[1], 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, saved[2], 0, 0, 0);
+}
+
+static int lookup_path(const char *cwd, const char *name, char *out)
+{
+	if (name[0] == '/' || name[0] == '.') {
+		resolve_path(cwd, name, out);
+		return 0;
+	}
+
+	const char *path = get_env("PATH");
+	if (!path || path[0] == '\0') path = "/bin";
+	usize i = 0;
+	while (path[i]) {
+		char dir[128];
+		usize d = 0;
+		while (path[i] && path[i] != ':' && d < sizeof(dir) - 1) {
+			dir[d++] = path[i++];
+		}
+		dir[d] = '\0';
+		if (path[i] == ':') i++;
+		resolve_path(dir, name, out);
+		struct b1nix_stat st;
+		if (syscall_dispatch(SYS_STAT, (u64)(usize)out, (u64)(usize)&st, 0, 0) == 0) {
+			return 0;
+		}
+	}
+	resolve_path(cwd, name, out);
+	return 0;
+}
+
+static u64 spawn_path(const char *cwd, char **args, int num_args)
+{
+	char path[128];
+	lookup_path(cwd, args[0], path);
+	u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)path, num_args, (u64)(usize)args, 0);
+	if (pid == (u64)-1 && strcmp(path, args[0]) != 0) {
+		pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], num_args, (u64)(usize)args, 0);
+	}
+	return pid;
+}
+
+static int run_external_command(const char *cwd, char **args, int num_args, int wait_for)
+{
+	u64 pid = spawn_path(cwd, args, num_args);
+	if (pid == (u64)-1) return -1;
+	if (wait_for) {
+		int status;
+		syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
+		return status;
+	}
+	return 0;
+}
+
 static int sh_main(int argc, const char **argv)
 {
 	(void)argc;
@@ -167,63 +321,43 @@ static int sh_main(int argc, const char **argv)
 			len--;
 		}
 		
-		char *pipe_pos = 0;
-		for (usize i = 0; i < len; i++) {
-			if (cmd[i] == '|') {
-				pipe_pos = &cmd[i];
-				break;
-			}
-		}
-		
-		char *redir_pos = 0;
-		if (!pipe_pos) {
-			for (usize i = 0; i < len; i++) {
-				if (cmd[i] == '>') {
-					redir_pos = &cmd[i];
-					break;
-				}
-			}
-		}
-
 		char *cmd1 = cmd;
 		char *cmd2 = 0;
-		char *redir_file = 0;
-
+		char *pipe_pos = strchr(cmd, '|');
 		if (pipe_pos) {
 			*pipe_pos = '\0';
 			cmd2 = pipe_pos + 1;
 			while (*cmd2 == ' ') cmd2++;
-		} else if (redir_pos) {
-			*redir_pos = '\0';
-			redir_file = redir_pos + 1;
-			while (*redir_file == ' ') redir_file++;
 		}
 
-		// First command logic
 		char *args[16];
 		int num_args = parse_cmd(cmd1, args, 16);
 		if (num_args == 0) continue;
+		struct shell_redir redir1;
+		num_args = parse_redirs(args, num_args, &redir1);
+		if (num_args == 0) continue;
 
-		u64 redir_fd = (u64)-1;
-		if (redir_file) {
-			resolve_path(cwd, redir_file, abs_path);
-			redir_fd = syscall_dispatch(SYS_CREATE, (u64)(usize)abs_path, (u64)(usize)"", 0, 0);
-			if (redir_fd == (u64)-1) {
-			    // Try opening if create fails or already exists
-			    redir_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs_path, 0, 0, 0);
-			}
-			if (redir_fd != (u64)-1) {
-				syscall_dispatch(SYS_SET_STDOUT, redir_fd, 0, 0, 0);
-			}
-		} else if (pipe_pos) {
-			syscall_dispatch(SYS_CREATE, (u64)(usize)"/tmp/pipe", (u64)(usize)"", 0, 0);
-			redir_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/pipe", 0, 0, 0);
-			if (redir_fd != (u64)-1) {
-				syscall_dispatch(SYS_SET_STDOUT, redir_fd, 0, 0, 0);
-			}
+		int pipefd[2] = {-1, -1};
+		if (pipe_pos && syscall_dispatch(SYS_PIPE, (u64)(usize)pipefd, 0, 0, 0) != 0) {
+			uwrite("sh: pipe failed\n");
+			continue;
 		}
 
-		if (strcmp(args[0], "help") == 0) {
+		int saved_stdio[3];
+		save_stdio(saved_stdio);
+		int opened[4];
+		u64 first_pid = (u64)-1;
+		int opened_count = apply_redirs(cwd, &redir1, opened, 4);
+		if (opened_count < 0) {
+			uwrite("sh: redirection failed\n");
+			restore_stdio(saved_stdio);
+			continue;
+		}
+		if (pipe_pos) {
+			syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0);
+		}
+
+		if (strcmp(args[0], "help") == 0 && !pipe_pos) {
 			uwrite("Built-in commands:\n");
 			uwrite("  help       - Show this message\n");
 			uwrite("  ls [dir]   - List files\n");
@@ -239,28 +373,45 @@ static int sh_main(int argc, const char **argv)
 			uwrite("  export     - Set env var\n");
 			uwrite("  jobs       - List background jobs\n");
 			uwrite("  ip         - Show network info\n");
-		} else if (strcmp(args[0], "ip") == 0) {
+			uwrite("  selfhost   - Show M17 toolchain status\n");
+		} else if (strcmp(args[0], "ip") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
-		} else if (strcmp(args[0], "ls") == 0) {
+		} else if (strcmp(args[0], "selfhost") == 0 && !pipe_pos) {
+			struct b1nix_selfhost_status status;
+			if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0) == 0) {
+				uwrite("target: ");
+				uwrite(status.target_triple);
+				uwrite("\ncompiler: ");
+				uwrite(status.compiler);
+				uwrite("\nassembler: ");
+				uwrite(status.assembler);
+				uwrite("\nlinker: ");
+				uwrite(status.linker);
+				uwrite("\nmake: ");
+				uwrite(status.make);
+				uwrite("\nkernel self-build: ");
+				uwrite(status.can_build_kernel_inside_b1nix ? "ready\n" : "toolchain manifest ready, full GCC port pending\n");
+			}
+		} else if (strcmp(args[0], "ls") == 0 && !pipe_pos) {
 			const char *target = cwd;
 			if (num_args > 1) target = args[1];
 			resolve_path(cwd, target, abs_path);
 			syscall_dispatch(SYS_LIST, (u64)(usize)abs_path, 0, 0, 0);
-		} else if (strcmp(args[0], "clear") == 0) {
+		} else if (strcmp(args[0], "clear") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
-		} else if (strcmp(args[0], "ping") == 0 && num_args > 1) {
+		} else if (strcmp(args[0], "ping") == 0 && num_args > 1 && !pipe_pos) {
 			syscall_dispatch(SYS_NET_PING, (u64)(usize)args[1], 0, 0, 0);
-		} else if (strcmp(args[0], "resolve") == 0 && num_args > 1) {
+		} else if (strcmp(args[0], "resolve") == 0 && num_args > 1 && !pipe_pos) {
 			syscall_dispatch(SYS_NET_DNS, (u64)(usize)args[1], 0, 0, 0);
-		} else if (strcmp(args[0], "ps") == 0) {
+		} else if (strcmp(args[0], "ps") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_PS, 0, 0, 0, 0);
-		} else if (strcmp(args[0], "mem") == 0) {
+		} else if (strcmp(args[0], "mem") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
-		} else if (strcmp(args[0], "reboot") == 0) {
+		} else if (strcmp(args[0], "reboot") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0);
-		} else if (strcmp(args[0], "jobs") == 0) {
+		} else if (strcmp(args[0], "jobs") == 0 && !pipe_pos) {
 			uwrite("Background jobs tracking not fully implemented, use 'ps'.\n");
-		} else if (strcmp(args[0], "export") == 0 && num_args > 1) {
+		} else if (strcmp(args[0], "export") == 0 && num_args > 1 && !pipe_pos) {
 			char *eq = 0;
 			for (int i = 0; args[1][i]; i++) {
 				if (args[1][i] == '=') { eq = &args[1][i]; break; }
@@ -269,17 +420,23 @@ static int sh_main(int argc, const char **argv)
 				*eq = '\0';
 				set_env(args[1], eq + 1);
 			}
-		} else if (strcmp(args[0], "echo") == 0) {
+		} else if (strcmp(args[0], "echo") == 0 && !pipe_pos) {
 			for (int i = 1; i < num_args; i++) {
 				uwrite(args[i]);
 				if (i < num_args - 1) uwrite(" ");
 			}
 			uwrite("\n");
-		} else if (strcmp(args[0], "cd") == 0 && num_args > 1) {
+		} else if (strcmp(args[0], "cd") == 0 && num_args > 1 && !pipe_pos) {
 			resolve_path(cwd, args[1], abs_path);
-			usize len = strlen(abs_path);
-			memcpy(cwd, abs_path, len + 1);
-		} else if (strcmp(args[0], "cat") == 0 && num_args > 1) {
+			if (syscall_dispatch(SYS_CHDIR, (u64)(usize)abs_path, 0, 0, 0) == 0) {
+				usize len = strlen(abs_path);
+				memcpy(cwd, abs_path, len + 1);
+			} else {
+				uwrite("cd: not a directory: ");
+				uwrite(abs_path);
+				uwrite("\n");
+			}
+		} else if (strcmp(args[0], "cat") == 0 && num_args > 1 && !pipe_pos) {
 			resolve_path(cwd, args[1], abs_path);
 			char buffer[256];
 			u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs_path, 0, 0, 0);
@@ -297,69 +454,53 @@ static int sh_main(int argc, const char **argv)
 				syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
 			}
 		} else {
-			resolve_path(cwd, args[0], abs_path);
-			u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)abs_path, num_args, (u64)(usize)args, 0);
-			if (pid == (u64)-1) {
-				pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], num_args, (u64)(usize)args, 0);
-				if (pid == (u64)-1) {
-					char bin_path[128];
-					resolve_path("/bin", args[0], bin_path);
-					pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args, (u64)(usize)args, 0);
+			if (pipe_pos) {
+				first_pid = spawn_path(cwd, args, num_args);
+				if (first_pid == (u64)-1) {
+					uwrite("sh: command not found: ");
+					uwrite(args[0]);
+					uwrite("\n");
 				}
-			}
-			
-			if (pid == (u64)-1) {
+			} else if (run_external_command(cwd, args, num_args, !is_bg) < 0) {
 				uwrite("sh: command not found: ");
 				uwrite(args[0]);
 				uwrite("\n");
-			} else if (!is_bg && !pipe_pos) {
-				int status;
-				syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
 			}
 		}
 
-		if (redir_fd != (u64)-1) {
-			syscall_dispatch(SYS_SET_STDOUT, (u64)-1, 0, 0, 0);
-			syscall_dispatch(SYS_CLOSE, redir_fd, 0, 0, 0);
+		for (int i = 0; i < opened_count; i++) {
+			syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0);
 		}
 
-		// Handle pipe second command
 		if (pipe_pos && cmd2) {
+			syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0);
+			restore_stdio(saved_stdio);
+			save_stdio(saved_stdio);
+			syscall_dispatch(SYS_DUP2, (u64)pipefd[0], 0, 0, 0);
+
 			char *args2[16];
 			int num_args2 = parse_cmd(cmd2, args2, 16);
+			struct shell_redir redir2;
+			num_args2 = parse_redirs(args2, num_args2, &redir2);
+			opened_count = apply_redirs(cwd, &redir2, opened, 4);
 			if (num_args2 > 0) {
-				if (strcmp(args2[0], "cat") == 0 || strcmp(args2[0], "grep") == 0) {
-					// Append /tmp/pipe as argument since we don't have stdin
-					args2[num_args2++] = "/tmp/pipe";
-				}
-				
-				if (strcmp(args2[0], "cat") == 0) {
-					char buffer[256];
-					u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/pipe", 0, 0, 0);
-					if (fd != (u64)-1) {
-						while (1) {
-							u64 count = syscall_dispatch(SYS_READ, fd, (u64)(usize)buffer, sizeof(buffer) - 1, 0);
-							if (count == 0 || count == (u64)-1) break;
-							buffer[count] = '\0';
-							uwrite(buffer);
-						}
-						syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
-					}
-				} else {
-					// External piped command
-					u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args2[0], num_args2, (u64)(usize)args2, 0);
-					if (pid == (u64)-1) {
-						char bin_path[128];
-						resolve_path("/bin", args2[0], bin_path);
-						pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args2, (u64)(usize)args2, 0);
-					}
-					if (!is_bg) {
-						int status;
-						syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
-					}
+				if (opened_count < 0 || run_external_command(cwd, args2, num_args2, !is_bg) < 0) {
+					uwrite("sh: command not found: ");
+					uwrite(args2[0]);
+					uwrite("\n");
 				}
 			}
+			for (int i = 0; i < opened_count; i++) {
+				syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0);
+			}
+			syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0);
+			if (!is_bg && first_pid != (u64)-1) {
+				int status;
+				syscall_dispatch(SYS_WAIT, first_pid, (u64)(usize)&status, 0, 0);
+			}
 		}
+
+		restore_stdio(saved_stdio);
 	}
 
 	return 0;
@@ -386,6 +527,32 @@ extern int mc_main(int argc, const char **argv);
 extern int editor_main(int argc, const char **argv);
 extern int nmake_main(int argc, const char **argv);
 
+static int selfhost_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	struct b1nix_selfhost_status status;
+	if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0) != 0) {
+		uwrite("selfhost: status unavailable\n");
+		return 1;
+	}
+
+	uwrite("B1NIX M17 self-hosting status\n");
+	uwrite("target: ");
+	uwrite(status.target_triple);
+	uwrite("\ncompiler: ");
+	uwrite(status.compiler);
+	uwrite("\nassembler: ");
+	uwrite(status.assembler);
+	uwrite("\nlinker: ");
+	uwrite(status.linker);
+	uwrite("\nmake: ");
+	uwrite(status.make);
+	uwrite("\nfull in-guest kernel build: ");
+	uwrite(status.can_build_kernel_inside_b1nix ? "ready\n" : "pending real GCC/binutils port\n");
+	return status.can_build_kernel_inside_b1nix ? 0 : 2;
+}
+
 void user_register_builtin_programs(void)
 {
 	user_register_program("/bin/init", init_main);
@@ -409,4 +576,5 @@ void user_register_builtin_programs(void)
 	user_register_program("/bin/mc", mc_main);       /* Mini Commander file manager */
 	user_register_program("/bin/ne", editor_main);   /* Nano-like editor */
 	user_register_program("/bin/nmake", nmake_main); /* Minimal make utility */
+	user_register_program("/bin/selfhost", selfhost_main); /* M17 toolchain status */
 }

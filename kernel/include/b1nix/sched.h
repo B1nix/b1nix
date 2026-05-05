@@ -36,6 +36,7 @@
 #define SIGPWR      30
 
 #define NSIG        31
+#define SCHED_MAX_FDS 64
 
 /* Signal actions */
 #define SIG_DFL     ((void (*)(int))0)
@@ -66,6 +67,7 @@ typedef void (*kernel_thread_entry)(void *arg);
 
 void scheduler_init(void);
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg);
+int scheduler_fork_current(void);
 void scheduler_yield(void);
 void scheduler_block_current(void);
 void scheduler_wake_task(usize task_id);
@@ -73,10 +75,19 @@ void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
 int scheduler_wait(usize pid, int *status);
+int scheduler_waitpid(usize pid, int *status, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
 void scheduler_set_stdout(int fd);
 int scheduler_get_stdout(void);
+void scheduler_fd_table_init_current(void);
+int scheduler_fd_alloc(int handle);
+int scheduler_fd_get(int fd);
+int scheduler_fd_set(int fd, int handle);
+int scheduler_fd_close(int fd);
+int scheduler_fd_flags_get(int fd);
+int scheduler_fd_flags_set(int fd, int flags);
+void scheduler_fd_close_on_exec(void);
 
 /* ── Signal API ── */
 int  scheduler_kill(usize task_id, int sig);
@@ -85,5 +96,9 @@ void scheduler_deliver_pending_signals(void);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
 struct cred *scheduler_get_current_cred(void);
+const char *scheduler_get_cwd(void);
+int scheduler_set_cwd(const char *path);
+u64 scheduler_brk_get(void);
+u64 scheduler_brk_set(u64 new_brk);
 
 #endif

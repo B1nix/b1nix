@@ -146,12 +146,147 @@
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
-- [ ] POSIX Process Management: `fork()`, standard `execve()`, `waitpid()`.
-- [ ] POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
-- [ ] POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
-- [ ] POSIX Memory: Proper user-space `mmap()`, `munmap()`, `brk()`.
-- [ ] POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()`.
-- [ ] POSIX Terminal: `ioctl()` and `termios` support for proper TTY.
+- [x] POSIX Process Management: `fork()`, standard `execve()`, `waitpid()` initial ABI.
+- [x] POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
+- [x] POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
+- [x] POSIX Memory: Proper user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
+- [x] POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
+- [x] POSIX Terminal: `ioctl()` and `termios` support for proper TTY.
 - [ ] Cross-compile and port GCC (C/C++ compiler) specifically for `x86_64-b1nix`.
 - [ ] Port GNU Binutils (`as`, `ld`) and GNU Make.
 - [ ] Achieve self-hosting: compile the B1NIX kernel *inside* B1NIX using ported GCC.
+
+## M18: Real Userspace and ELF Loader
+
+- [x] Load ELF64 executables from VFS instead of relying only on built-in programs.
+- [x] Build a real user address space per process with user/kernel separation.
+- [x] Add syscall `copyin`/`copyout` helpers for safe user pointers.
+- [x] Create a proper user stack with `argc`, `argv`, `envp`, and auxiliary vector basics.
+- [x] Implement `execve()` as image replacement, not only built-in dispatch.
+- [x] Add process exit status propagation and zombie reaping semantics.
+- [x] Add QEMU tests that boot, launch `/bin/init`, and execute a VFS-loaded program.
+
+M18 establishes the loader and process-image ABI while B1NIX still uses kernel
+threads as the execution substrate. ELF64 files are read through VFS, PT_LOAD
+segments are copied into per-process image state, initial stack metadata is
+constructed with `argc`, `argv`, `envp`, and basic auxv entries, and `/bin/init`
+now boots from a VFS-loaded ELF image that launches a second VFS-loaded ELF
+smoke program before starting the shell. Full hardware-enforced ring3 entry and
+copy-on-write address spaces remain follow-up work for M19/M24.
+
+## M19: Process Model and FD Tables
+
+- [x] Implement real `fork()` with copied or copy-on-write address spaces.
+- [x] Add per-process file descriptor tables instead of a single global FD table.
+- [x] Inherit and close FDs according to POSIX rules, including close-on-exec.
+- [x] Make `stdin`, `stdout`, and `stderr` real descriptors `0`, `1`, and `2`.
+- [x] Store per-process cwd, environment, umask, process group, and session metadata.
+- [x] Implement `waitpid()` options and zombie lifecycle correctly.
+- [x] Add basic process groups and terminal foreground job ownership.
+
+M19 moves descriptor ownership out of the global VFS handle namespace and into
+per-task fd tables. VFS handles are now open-file descriptions with refcounts,
+while process-visible descriptors are inherited on spawn/fork, closed on task
+exit, and honor `FD_CLOEXEC`. Descriptor `0`, `1`, and `2` are initialized as
+real task-local TTY descriptors. `waitpid()` now supports non-blocking
+`WNOHANG`, and zombies remain reapable until the parent waits. Process metadata
+now carries cwd, environment storage, umask, process group, and session ids.
+Because B1NIX still runs user images on cooperative kernel threads, fork copies
+the process metadata/FD view rather than hardware page tables; full MMU COW is
+tracked with the later memory-management hardening work.
+
+## M20: Terminal, TTY, and Interactive Shell
+
+- [x] Add a real TTY device with line discipline.
+- [x] Support canonical and raw terminal modes through `termios`.
+- [x] Handle Ctrl-C, Ctrl-D, Ctrl-Z, backspace, arrows, and EOF behavior.
+- [x] Route keyboard input through `/dev/tty` and FD `0`.
+- [x] Replace temporary-file shell pipes with real `pipe()` and `dup2()` wiring.
+- [x] Add shell redirection `<`, `>`, `>>`, `2>`, and descriptor duplication.
+- [x] Implement `PATH` command lookup against the VFS.
+- [x] Improve shell errors and exit statuses.
+
+M20 adds `/dev/tty` as a VFS device, initializes descriptors `0`, `1`, and `2`
+to the terminal, and routes keyboard input through the TTY line discipline.
+Canonical mode, echo, signal-control characters, EOF, and raw-mode toggling are
+represented through the initial `termios` ABI. The shell now resolves commands
+through `PATH`, uses real `pipe()`/`dup2()` descriptors for pipelines, runs the
+producer and consumer as separate tasks, closes pipe ends correctly in the
+shell, and supports basic input/output/error redirection using the M19
+per-process fd tables.
+
+## M21: Persistent Root Filesystem
+
+- [x] Boot with a persistent root filesystem from a disk image.
+- [x] Add mountpoints and a real `mount`/`umount` VFS model.
+- [x] Stabilize writable ext2 as the first reliable root filesystem target.
+- [x] Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`).
+- [x] Flush block cache on shutdown and reboot.
+- [x] Add `/etc`, `/bin`, `/dev`, `/home`, `/tmp`, and `/var` layout.
+- [x] Add an image creation/install script for local development.
+
+M21 is complete for the current boot model. The VFS tracks mounted sources in a
+mount table and exposes `mount()`, `umount()`, and `sync()` syscalls. The root
+tree is initialized with the standard terminal OS layout, and `make root-image`
+creates a seeded ext2 disk. When that disk is attached as `virtio-blk0`, ext2 is
+mounted at `/` and overlays the initramfs fallback files, so persistent files can
+live at the root while built-in `/bin/init` remains available until the full
+disk userland is populated.
+
+## M22: Core Terminal Utilities
+
+- [ ] Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
+- [ ] Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
+- [ ] Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
+- [ ] Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
+- [ ] Keep BusyBox-style multi-call dispatch for small binaries.
+- [ ] Add utility smoke tests that run from the shell and from init scripts.
+
+## M23: Networking for Terminal Use
+
+- [ ] Turn the socket ABI into real UDP sockets.
+- [ ] Add minimal TCP client support.
+- [ ] Add DNS resolver integration through libc-style calls.
+- [ ] Add `ifconfig` or `ip` for interface status and static configuration.
+- [ ] Add `ping`, `nc`, and a tiny `wget`/HTTP client.
+- [ ] Handle missing network devices gracefully in all network paths.
+
+## M24: Reliability and Diagnostics
+
+- [ ] Add syscall argument validation and consistent error codes.
+- [ ] Add kernel backtraces or symbolized panic locations.
+- [ ] Replace avoidable panics with recoverable errors.
+- [ ] Add regression tests for VFS, scheduler, pipes, terminal, and sockets.
+- [ ] Add QEMU smoke tests for x86_64 and AArch64 in CI.
+- [ ] Track implemented, initial, stub, and planned features explicitly in docs.
+- [ ] Add kernel log levels and a ring buffer readable from userspace.
+
+## M25: Minimal Native C Toolchain
+
+- [ ] Define the B1NIX userspace ELF ABI and calling convention.
+- [ ] Add `crt0.o` startup code for B1NIX userspace programs.
+- [ ] Add a userspace linker script for B1NIX ELF binaries.
+- [ ] Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and simple `malloc`.
+- [ ] Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
+- [ ] Build and run a VFS-loaded `hello.c` ELF program.
+- [ ] Port TinyCC/TCC as the first practical in-guest C compiler.
+- [ ] Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
+- [ ] Compile one simple shell utility inside B1NIX.
+- [ ] Document the path from external cross-builds to in-guest compilation.
+
+## M26: Full Toolchain and Self-Hosting
+
+- [ ] Define the `x86_64-b1nix` target ABI document.
+- [ ] Port Binutils (`as`, `ld`, `objcopy`, `ar`) for `x86_64-b1nix`.
+- [ ] Port GCC after the minimal C toolchain and filesystem are stable.
+- [ ] Build larger user programs with the external cross toolchain.
+- [ ] Build the B1NIX kernel inside B1NIX.
+
+## M27: Terminal OS Polish
+
+- [ ] Add boot menu options and kernel command line parsing.
+- [ ] Add init scripts and a simple service supervisor.
+- [ ] Add users, passwords or login shell basics.
+- [ ] Add stable shutdown, reboot, and emergency shell paths.
+- [ ] Document everyday usage from boot to editing/building files.
+- [ ] Keep the system usable without graphics as a first-class target.

@@ -11,6 +11,7 @@
 static struct virtio_device net_dev;
 static struct virtqueue net_rx_vq;
 static struct virtqueue net_tx_vq;
+static int net_ready;
 
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
@@ -52,6 +53,7 @@ static void virtio_net_probe(void)
 {
 	if (!virtio_init_device(&net_dev, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)) {
 		console_write("virtio-net: no device found\n");
+		net_ready = 0;
 		return;
 	}
 
@@ -78,6 +80,7 @@ static void virtio_net_probe(void)
 		fill_rx_buffer(i);
 	}
 	virtq_kick(&net_dev, &net_rx_vq);
+	net_ready = 1;
 
 	console_write("virtio-net: initialized with MAC ");
 	for (int i = 0; i < 6; i++) {
@@ -99,8 +102,12 @@ static void net_task(void *arg)
 
 void net_init(void)
 {
+	net_ready = 0;
 	virtio_net_probe();
 	arp_init();
+	if (!net_ready) {
+		return;
+	}
 	dhcp_init();
 	
 	// Wait until DHCP gets an IP or a timeout
@@ -115,6 +122,10 @@ void net_init(void)
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
 {
+	if (!net_ready || net_tx_vq.queue_size == 0 || !net_tx_vq.desc || !net_tx_vq.avail || !net_tx_vq.used) {
+		return;
+	}
+
 	// Allocate TX buffer (simplistic bump allocation for now, no free)
 	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
 	u8 *buffer = kzalloc(packet_size);
@@ -153,6 +164,10 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 
 void net_poll(void)
 {
+	if (!net_ready || net_rx_vq.queue_size == 0 || !net_rx_vq.used) {
+		return;
+	}
+
 	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx) {
 		u16 used_idx = net_rx_vq.last_used_idx % net_rx_vq.queue_size;
 		u32 id = net_rx_vq.used->ring[used_idx].id;

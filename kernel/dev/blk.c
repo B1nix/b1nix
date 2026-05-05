@@ -145,7 +145,13 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *b
 
 void blk_cache_flush(struct block_device *dev)
 {
-	if (!dev || !dev->write_blocks) return;
+	if (!dev) {
+		for (usize i = 0; i < blk_device_count; i++) {
+			blk_cache_flush(blk_devices[i]);
+		}
+		return;
+	}
+	if (!dev->write_blocks) return;
 	for (int i = 0; i < CACHE_ENTRIES; i++) {
 		if (bcache[i].valid && bcache[i].dev == dev && bcache[i].dirty) {
 			dev->write_blocks(dev, bcache[i].lba, 1, bcache[i].data);

@@ -48,8 +48,41 @@ enum syscall_number {
 	SYS_SETUID = 42,
 	SYS_SETGID = 43,
 	SYS_READDIR = 44,
+	SYS_FORK = 45,
+	SYS_EXECVE = 46,
+	SYS_WAITPID = 47,
+	SYS_STAT = 48,
+	SYS_LSEEK = 49,
+	SYS_UNLINK = 50,
+	SYS_MKDIR = 51,
+	SYS_CHDIR = 52,
+	SYS_GETDENTS = 53,
+	SYS_PIPE = 54,
+	SYS_DUP2 = 55,
+	SYS_FCNTL = 56,
+	SYS_MUNMAP = 57,
+	SYS_BRK = 58,
+	SYS_SOCKET = 59,
+	SYS_BIND = 60,
+	SYS_CONNECT = 61,
+	SYS_SEND = 62,
+	SYS_RECV = 63,
+	SYS_IOCTL = 64,
+	SYS_TERMIOS_GET = 65,
+	SYS_TERMIOS_SET = 66,
+	SYS_SELFHOST_STATUS = 67,
+	SYS_RENAME = 68,
+	SYS_RMDIR = 69,
+	SYS_FSTAT = 70,
+	SYS_FSYNC = 71,
+	SYS_MOUNT = 72,
+	SYS_UMOUNT = 73,
+	SYS_SYNC = 74,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
+int syscall_copyin(void *dst, const void *user_src, usize size);
+int syscall_copyout(void *user_dst, const void *src, usize size);
+int syscall_copyinstr(char *dst, usize dst_size, const char *user_src);
 
 #endif

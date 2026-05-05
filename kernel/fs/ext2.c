@@ -461,21 +461,21 @@ static void ext2_populate_vfs(u32 inode_num, const char *base_path)
 	kfree(dir_buf);
 }
 
-void ext2_init(void)
+int ext2_mount_root(const char *device_name, const char *mount_point)
 {
-	ext2_dev = blk_get("virtio-blk0");
-	if (!ext2_dev) return;
+	ext2_dev = blk_get(device_name);
+	if (!ext2_dev) return -1;
 	
 	u8 *sb_buffer = kmalloc(1024);
 	if (blk_read_cached(ext2_dev, 2, 2, sb_buffer) < 0) {
 		kfree(sb_buffer);
-		return;
+		return -1;
 	}
 	
 	memcpy(&ext2_sb, sb_buffer, sizeof(struct ext2_superblock));
 	kfree(sb_buffer);
 	
-	if (ext2_sb.s_magic != EXT2_SUPER_MAGIC) return;
+	if (ext2_sb.s_magic != EXT2_SUPER_MAGIC) return -1;
 	
 	ext2_block_size = 1024 << ext2_sb.s_log_block_size;
 	ext2_inodes_per_group = ext2_sb.s_inodes_per_group;
@@ -488,9 +488,23 @@ void ext2_init(void)
 	
 	console_write("ext2: mounted, block_size=");
 	console_write_dec(ext2_block_size);
+	console_write(" at ");
+	console_write(mount_point);
 	console_write("\n");
-	
-	struct vfs_node *ext2_root = vfs_add_node("/ext2", VFS_DIRECTORY, (void *)(usize)2, 0, 0);
+
+	vfs_mount(device_name, mount_point, "ext2", 0);
+	struct vfs_node *ext2_root = vfs_add_node(mount_point, VFS_DIRECTORY, (void *)(usize)2, 0, 0);
 	if (ext2_root) ext2_root->create_cb = ext2_vfs_create;
-	ext2_populate_vfs(2, "/ext2");
+	ext2_populate_vfs(2, mount_point);
+	return 0;
+}
+
+void ext2_init(void)
+{
+	if (ext2_mount_root("virtio-blk0", "/") == 0) {
+		return;
+	}
+	if (ext2_mount_root("virtio-blk1", "/ext2") == 0) {
+		return;
+	}
 }

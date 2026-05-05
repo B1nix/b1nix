@@ -2,11 +2,14 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
+#include <b1nix/posix.h>
 #include <b1nix/sched.h>
 #include <b1nix/uidgid.h>
 
 #define MAX_TASKS 16
 #define KERNEL_STACK_SIZE (16 * 1024)
+#define TASK_ENV_MAX 16
+#define TASK_ENV_VALUE_MAX 64
 
 enum task_state {
 	TASK_UNUSED = 0,
@@ -53,9 +56,17 @@ struct task {
 	void *stack;
 	u64 wake_tick;
 	int stdout_fd;
+	int fd_table[SCHED_MAX_FDS];
+	int fd_flags[SCHED_MAX_FDS];
 	int priority;
 	int exit_code;
 	usize parent_id;
+	char cwd[64];
+	u64 user_brk;
+	u16 umask;
+	usize process_group_id;
+	usize session_id;
+	char env[TASK_ENV_MAX][TASK_ENV_VALUE_MAX];
 
 	/* Signal handling */
 	u64 pending_signals;       /* bitmask of pending signals */
@@ -67,6 +78,8 @@ struct task {
 };
 
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
+extern void vfs_handle_retain(int handle);
+extern void vfs_handle_release(int handle);
 
 static struct task tasks[MAX_TASKS];
 static struct task *current_task;
@@ -169,8 +182,18 @@ void scheduler_init(void)
 	boot->name = "boot";
 	boot->state = TASK_RUNNING;
 	boot->stdout_fd = -1;
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		boot->fd_table[i] = -1;
+		boot->fd_flags[i] = 0;
+	}
 	boot->priority = 1;
 	boot->parent_id = 0;
+	boot->cwd[0] = '/';
+	boot->cwd[1] = '\0';
+	boot->user_brk = 0;
+	boot->umask = 022;
+	boot->process_group_id = boot->id;
+	boot->session_id = boot->id;
 	current_task = boot;
 	scheduler_started = 1;
 
@@ -239,8 +262,37 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	task->context.r15 = 0;
 #endif
 	task->stdout_fd = current_task ? current_task->stdout_fd : -1;
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		if (current_task) {
+			task->fd_table[i] = current_task->fd_table[i];
+			task->fd_flags[i] = current_task->fd_flags[i];
+			if (task->fd_table[i] >= 0) {
+				vfs_handle_retain(task->fd_table[i]);
+			}
+		} else {
+			task->fd_table[i] = -1;
+			task->fd_flags[i] = 0;
+		}
+	}
 	task->priority = 1;
 	task->parent_id = current_task ? current_task->id : 0;
+	if (current_task) {
+		memcpy(task->cwd, current_task->cwd, sizeof(task->cwd));
+		task->cwd[sizeof(task->cwd) - 1] = '\0';
+		task->user_brk = current_task->user_brk;
+		task->umask = current_task->umask;
+		task->process_group_id = current_task->process_group_id;
+		task->session_id = current_task->session_id;
+		memcpy(task->env, current_task->env, sizeof(task->env));
+	} else {
+		task->cwd[0] = '/';
+		task->cwd[1] = '\0';
+		task->user_brk = 0;
+		task->umask = 022;
+		task->process_group_id = task->id;
+		task->session_id = task->id;
+		memset(task->env, 0, sizeof(task->env));
+	}
 	task->exit_code = 0;
 	task->pending_signals = 0;
 	task->blocked_signals = 0;
@@ -254,7 +306,16 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 	console_write_hex64(task->id);
 	console_write("\n");
 
-	return 0;
+	return (int)task->id;
+}
+
+int scheduler_fork_current(void)
+{
+	if (!current_task || current_task->entry == 0) {
+		return -1;
+	}
+
+	return kthread_create(current_task->name, current_task->entry, current_task->arg);
 }
 
 void scheduler_yield(void)
@@ -363,6 +424,14 @@ void scheduler_exit_current(int exit_code)
 		current_task->cred = 0;
 	}
 
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		if (current_task->fd_table[i] >= 0) {
+			vfs_handle_release(current_task->fd_table[i]);
+			current_task->fd_table[i] = -1;
+			current_task->fd_flags[i] = 0;
+		}
+	}
+
 	current_task->exit_code = exit_code;
 	current_task->state = TASK_DEAD;
 	
@@ -378,6 +447,11 @@ void scheduler_exit_current(int exit_code)
 }
 
 int scheduler_wait(usize pid, int *status)
+{
+	return scheduler_waitpid(pid, status, 0);
+}
+
+int scheduler_waitpid(usize pid, int *status, int options)
 {
 	if (current_task == 0) return -1;
 	
@@ -403,6 +477,11 @@ int scheduler_wait(usize pid, int *status)
 		if (!has_children) {
 			interrupts_enable();
 			return -1;
+		}
+
+		if (options & B1NIX_WNOHANG) {
+			interrupts_enable();
+			return 0;
 		}
 		
 		current_task->state = TASK_BLOCKED;
@@ -470,6 +549,76 @@ int scheduler_get_stdout(void)
 	return fd;
 }
 
+void scheduler_fd_table_init_current(void)
+{
+	if (!current_task) return;
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		current_task->fd_table[i] = -1;
+		current_task->fd_flags[i] = 0;
+	}
+}
+
+int scheduler_fd_alloc(int handle)
+{
+	if (!current_task || handle < 0) return -1;
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		if (current_task->fd_table[i] < 0) {
+			current_task->fd_table[i] = handle;
+			current_task->fd_flags[i] = 0;
+			return (int)i;
+		}
+	}
+	return -1;
+}
+
+int scheduler_fd_get(int fd)
+{
+	if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS) return -1;
+	return current_task->fd_table[fd];
+}
+
+int scheduler_fd_set(int fd, int handle)
+{
+	if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS) return -1;
+	current_task->fd_table[fd] = handle;
+	current_task->fd_flags[fd] = 0;
+	return fd;
+}
+
+int scheduler_fd_close(int fd)
+{
+	if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS) return -1;
+	current_task->fd_table[fd] = -1;
+	current_task->fd_flags[fd] = 0;
+	return 0;
+}
+
+int scheduler_fd_flags_get(int fd)
+{
+	if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS) return -1;
+	if (current_task->fd_table[fd] < 0) return -1;
+	return current_task->fd_flags[fd];
+}
+
+int scheduler_fd_flags_set(int fd, int flags)
+{
+	if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS) return -1;
+	if (current_task->fd_table[fd] < 0) return -1;
+	current_task->fd_flags[fd] = flags;
+	return 0;
+}
+
+void scheduler_fd_close_on_exec(void)
+{
+	if (!current_task) return;
+	for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+		if ((current_task->fd_flags[i] & B1NIX_FD_CLOEXEC) != 0) {
+			current_task->fd_table[i] = -1;
+			current_task->fd_flags[i] = 0;
+		}
+	}
+}
+
 /* ── Signal Delivery ── */
 
 int scheduler_kill(usize task_id, int sig)
@@ -532,6 +681,39 @@ struct cred *scheduler_get_current_cred(void)
 {
 	if (!current_task) return 0;
 	return current_task->cred;
+}
+
+const char *scheduler_get_cwd(void)
+{
+	if (!current_task) return "/";
+	return current_task->cwd;
+}
+
+int scheduler_set_cwd(const char *path)
+{
+	if (!current_task || !path || path[0] == '\0') return -1;
+	usize len = strlen(path);
+	if (len >= sizeof(current_task->cwd)) return -1;
+	memcpy(current_task->cwd, path, len + 1);
+	return 0;
+}
+
+u64 scheduler_brk_get(void)
+{
+	if (!current_task) return 0;
+	return current_task->user_brk;
+}
+
+u64 scheduler_brk_set(u64 new_brk)
+{
+	if (!current_task) return 0;
+	if (current_task->user_brk == 0) {
+		current_task->user_brk = (u64)(usize)kmalloc(PAGE_SIZE);
+	}
+	if (new_brk != 0) {
+		current_task->user_brk = new_brk;
+	}
+	return current_task->user_brk;
 }
 
 /* Called before returning to userspace — delivers pending signals */

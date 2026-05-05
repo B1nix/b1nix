@@ -3,6 +3,8 @@
 
 #include <b1nix/types.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/dirent.h>
+#include <b1nix/posix.h>
 
 #define VFS_MAX_PATH 64
 
@@ -73,6 +75,7 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type, void *d
 
 /* Permission-aware operations */
 int vfs_open(const char *path);
+int vfs_open_flags(const char *path, int flags);
 isize vfs_read(int handle, char *buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
 void vfs_close(int handle);
@@ -80,6 +83,27 @@ int vfs_create(const char *path, const char *data);
 int vfs_mkdir(const char *path);
 usize vfs_list(const char *dir_path, const char **names, usize max_names);
 struct vfs_node *vfs_find_node_by_fd(int fd);
+int vfs_stat(const char *path, struct b1nix_stat *st);
+isize vfs_lseek(int handle, isize offset, int whence);
+int vfs_unlink(const char *path);
+int vfs_rename(const char *old_path, const char *new_path);
+int vfs_rmdir(const char *path);
+int vfs_fstat(int fd, struct b1nix_stat *st);
+int vfs_fsync(int fd);
+int vfs_mount(const char *source, const char *target, const char *fstype, u64 flags);
+int vfs_umount(const char *target);
+int vfs_sync(void);
+isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
+int vfs_pipe(int pipefd[2]);
+int vfs_dup2(int oldfd, int newfd);
+int vfs_fcntl(int fd, int cmd, u64 arg);
+int vfs_ioctl(int fd, u64 request, void *arg);
+void vfs_close_on_exec(void);
+int vfs_socket(int domain, int type, int protocol);
+int vfs_bind(int fd, const void *addr, usize addrlen);
+int vfs_connect(int fd, const void *addr, usize addrlen);
+isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
+isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
 
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);
@@ -89,4 +113,3 @@ int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl);
 int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl, int max_entries);
 
 #endif
-
