@@ -7,9 +7,10 @@
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
 #define HUGE_PAGE_FLAG (1ULL << 7)
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
-#define DIRECT_MAP_SIZE (128ULL * 1024ULL * 1024ULL)
+#define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
 
 static u64 *kernel_pml4;
+static int direct_map_ready;
 
 static u64 read_cr3(void)
 {
@@ -46,13 +47,25 @@ static usize pt_index(u64 virtual_address)
 
 static u64 *table_from_entry(u64 entry)
 {
-	return (u64 *)(usize)(entry & PAGE_ENTRY_ADDRESS_MASK);
+	u64 phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+	if (direct_map_ready && phys < DIRECT_MAP_SIZE) {
+		return (u64 *)(usize)(phys + DIRECT_MAP_BASE);
+	}
+	return (u64 *)(usize)phys;
 }
 
 static u64 *alloc_page_table(void)
 {
 	u64 frame = pmm_alloc_frame();
+
+	if (frame >= 0x100000000ULL) {
+		panic("vmm: page table allocated above 4GB during early boot");
+	}
+
 	u64 *table = (u64 *)(usize)frame;
+	if (direct_map_ready && frame < DIRECT_MAP_SIZE) {
+		table = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+	}
 
 	memset(table, 0, PAGE_SIZE);
 	return table;
@@ -62,7 +75,12 @@ static u64 *ensure_child_table(u64 *parent, usize index)
 {
 	if ((parent[index] & VMM_PRESENT) == 0) {
 		u64 *child = alloc_page_table();
-		parent[index] = ((u64)(usize)child) | VMM_PRESENT | VMM_WRITABLE;
+		u64 phys_child = (u64)(usize)child;
+		if (phys_child >= DIRECT_MAP_BASE) {
+			phys_child -= DIRECT_MAP_BASE;
+		}
+
+		parent[index] = phys_child | VMM_PRESENT | VMM_WRITABLE;
 		return child;
 	}
 
@@ -71,14 +89,23 @@ static u64 *ensure_child_table(u64 *parent, usize index)
 
 void vmm_init(void)
 {
-	kernel_pml4 = (u64 *)(usize)(read_cr3() & PAGE_ENTRY_ADDRESS_MASK);
+	/* Get physical address of PML4 */
+	u64 phys_pml4 = read_cr3() & PAGE_ENTRY_ADDRESS_MASK;
+	kernel_pml4 = (u64 *)(usize)phys_pml4;
+	direct_map_ready = 0;
 
-	console_write("vmm: pml4 0x");
-	console_write_hex64((u64)(usize)kernel_pml4);
-	console_write("\n");
+	console_write("vmm: mapping direct map with huge pages...\n");
 
-	for (u64 physical = 0; physical < DIRECT_MAP_SIZE; physical += PAGE_SIZE) {
-		vmm_map_page(DIRECT_MAP_BASE + physical, physical, VMM_WRITABLE);
+	/* Map the direct map using 2MB huge pages for efficiency */
+	for (u64 physical = 0; physical < DIRECT_MAP_SIZE; physical += 0x200000ULL) {
+		u64 virtual = DIRECT_MAP_BASE + physical;
+		
+		u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual));
+		u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual));
+		
+		/* Set 2MB huge page entry */
+		pd[pd_index(virtual)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7); /* Bit 7 is PS (Page Size) */
+		invalidate_page(virtual);
 	}
 
 	console_write("vmm: direct map 0x");
@@ -86,6 +113,10 @@ void vmm_init(void)
 	console_write("-0x");
 	console_write_hex64(DIRECT_MAP_BASE + DIRECT_MAP_SIZE);
 	console_write("\n");
+
+	/* Now that direct map is ready, we can use virtual addresses for the PML4 */
+	direct_map_ready = 1;
+	kernel_pml4 = (u64 *)(usize)(phys_pml4 + DIRECT_MAP_BASE);
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags)

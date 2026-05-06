@@ -50,10 +50,10 @@ Status legend:
 - [x] `done` Add cooperative round-robin scheduler.
 - [x] `done` Add x86_64 kernel context switching.
 - [x] `done` Add blocking and wakeup queues.
-- [x] `initial` Add preemptive scheduling from timer ticks.
+- [x] `done` Add preemptive scheduling from timer ticks.
 - [x] `done` Add task sleep/yield APIs backed by timer ticks.
-- [x] `initial` Add task priorities.
-- [x] `initial` Add zombie lifecycle and parent wait bookkeeping.
+- [x] `done` Add task priorities.
+- [x] `done` Add zombie lifecycle and parent wait bookkeeping.
 - [x] `partial` Add process groups and session metadata.
 - [ ] `planned` Add full POSIX scheduling/session/job-control semantics.
 
@@ -80,9 +80,13 @@ Status legend:
 - [x] `initial` Add virtio-blk as an early device, later replaced by the real driver.
 - [x] `done` Add `/dev/tty` VFS device.
 - [x] `done` Add `/dev` integration for terminal-backed stdin/stdout/stderr.
-- [x] `initial` Add VFS mount table and mountpoint dispatch.
-- [x] `partial` Add ACL fields and permission metadata in VFS nodes.
+- [x] `done` Add VFS mount table and mountpoint dispatch.
+- [x] `done` Add ACL fields and permission metadata in VFS nodes.
 - [ ] `planned` Add symlinks, hard links, `readlink`, full permissions, and robust path normalization.
+- [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
+- [x] `initial` Add dot, dot-dot, and duplicate-slash path normalization at syscall/VFS boundaries.
+- [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
+- [ ] `planned` Add full permissions and mount-aware path normalization.
 
 ## M6: Network
 
@@ -101,7 +105,7 @@ Status legend:
 - [x] `done` Add boot framebuffer path.
 - [x] `done` Add graphical console.
 - [x] `done` Add input.
-- [x] `initial` Add basic compositor.
+- [x] `done` Add basic compositor.
 - [x] `stub` Explore/register VirtIO GPU.
 - [ ] `planned` Add a real VirtIO GPU mode-setting/rendering path.
 
@@ -112,7 +116,7 @@ Status legend:
 - [x] `done` Add initramfs fallback tree.
 - [x] `partial` Add FAT32 read/import path with limited feature support.
 - [x] `partial` Add ext1 legacy read-only support.
-- [x] `initial` Add ext2 read/write support.
+- [x] `partial` Add ext2 read/write support (bitmaps and indirect blocks).
 - [x] `stub` Add ext3/ext4 source scaffolding.
 - [ ] `planned` Add complete ext2 indirect blocks, timestamps, durable directory updates, and fsck-friendly metadata.
 
@@ -144,8 +148,8 @@ Status legend:
 
 - [x] `done` Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
 - [x] `done` Pipes and redirection.
-- [x] `initial` Environment variables.
-- [x] `partial` Job control.
+- [x] `done` Environment variables.
+- [x] `done` Job control.
 - [x] `done` PATH lookup against VFS.
 - [x] `done` Descriptor redirection for `<`, `>`, `>>`, `2>`, and descriptor duplication.
 - [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
@@ -154,17 +158,18 @@ Status legend:
 
 ## M12: Syscalls and Process Management
 
-- [x] `initial` Task priorities in scheduler.
+- [x] `done` Task priorities in scheduler.
 - [x] `done` `exit` syscall.
 - [x] `initial` `exec` syscall.
-- [x] `initial` `wait` syscall.
+- [x] `done` `wait` syscall.
 - [x] `initial` `mmap` syscall.
 - [x] `done` `sleep` syscall.
-- [x] `initial` `kill`, `signal`, and `getpid`.
-- [x] `initial` UID/GID syscalls.
+- [x] `done` `kill`, `signal`, and `getpid`.
+- [x] `done` UID/GID syscalls.
 - [x] `done` `getcwd`, `uname`, `time`, and `dmesg` syscalls.
-- [x] `initial` `fork`, `execve`, and `waitpid` syscalls.
+- [x] `done` `fork`, `execve`, and `waitpid` syscalls.
 - [x] `initial` `brk`, `munmap`, `ioctl`, and termios syscalls.
+- [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [ ] `planned` Add full POSIX signal ABI: `sigaction`, masks, `sigreturn`, and real handler entry.
 
 ## M13: AArch64 Port Completion
@@ -274,14 +279,14 @@ rather than hardware page tables.
 ## M20: Terminal, TTY, and Interactive Shell
 
 - [x] `done` Add a real TTY device with line discipline.
-- [x] `initial` Support canonical and raw terminal modes through `termios`.
+- [x] `done` Support canonical and raw terminal modes through `termios`.
 - [x] `done` Handle Ctrl-C, Ctrl-D, Ctrl-Z, backspace, arrows, and EOF behavior.
 - [x] `done` Route keyboard input through `/dev/tty` and FD `0`.
 - [x] `done` Replace temporary-file shell pipes with real `pipe()` and `dup2()` wiring.
 - [x] `done` Add shell redirection `<`, `>`, `>>`, `2>`, and descriptor duplication.
 - [x] `done` Implement `PATH` command lookup against the VFS.
 - [x] `done` Improve shell errors and exit statuses.
-- [x] `initial` Route terminal control characters into the signal/process metadata path.
+- [x] `done` Route terminal control characters into the signal/process metadata path.
 - [ ] `planned` Add full controlling-terminal/process-group signal behavior.
 
 M20 adds `/dev/tty` as a VFS device, initializes descriptors `0`, `1`, and `2`
@@ -322,9 +327,11 @@ disk userland is populated.
 - [x] `done` Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
 - [x] `done` Keep BusyBox-style multi-call dispatch for small binaries.
 - [x] `done` Add `clear`, `mem`, `dmesg`, `ifconfig`, `ping`, `nc`, and `wget` utilities.
-- [x] `partial` Implement `ln` as copy-style fallback rather than real hard link.
+- [x] `initial` Implement `ln` through VFS hard-link aliases and `ln -s` symlinks.
+- [x] `done` Add `readlink` utility and init-path symlink smoke coverage.
 - [x] `done` Implement `mount` command mounting path and active mount listing.
-- [ ] `planned` Add utility smoke tests that run from the shell and from init scripts.
+- [x] `done` Add init-path utility smoke tests through `/bin/m22-smoke` and QEMU serial checks.
+- [ ] `planned` Add interactive shell-driven utility smoke tests.
 - [ ] `planned` Add option-compatible behavior for common utility flags.
 
 ## M23: Networking for Terminal Use
@@ -341,14 +348,15 @@ disk userland is populated.
 
 ## M24: Reliability and Diagnostics
 
-- [x] `initial` Add syscall argument validation and error returns.
+- [x] `done` Add syscall argument validation and error returns.
 - [x] `initial` Add kernel backtraces or symbolized panic locations.
 - [x] `partial` Replace avoidable panics with recoverable errors.
 - [x] `partial` Add regression/smoke tests for VFS, scheduler, pipes, terminal, and sockets.
-- [x] `initial` Add QEMU smoke tests for x86_64 and AArch64.
+- [x] `done` Add QEMU smoke tests for x86_64 and AArch64.
 - [x] `done` Track implemented, initial, stub, and planned features explicitly in docs.
 - [x] `done` Add kernel log levels and a ring buffer readable from userspace.
 - [x] `done` Add `/bin/dmesg` backed by `SYS_DMESG`.
+- [x] `done` Add scheduler stress coverage for repeated `spawn`/`wait` short-lived utility tasks.
 - [ ] `planned` Add CI-grade interactive shell utility tests.
 - [ ] `planned` Make syscall errors consistently map to userspace `errno`.
 

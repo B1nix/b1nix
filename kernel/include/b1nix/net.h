@@ -13,6 +13,8 @@ struct ipv4_addr {
 
 void net_init(void);
 void net_poll(void);
+int net_is_ready(void);
+void net_dump_info(void);
 
 // Virtio Network Data Plane
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size);

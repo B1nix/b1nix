@@ -80,14 +80,18 @@ void console_clear(void)
 
 void console_putc(char ch)
 {
+	extern volatile u32 *fb_ptr;
+	if (bootinfo_get()->has_framebuffer && fb_ptr) {
+		fb_console_putchar(ch);
+		serial_putc(ch);
+		return;
+	}
+
 	volatile u16 *vga = VGA_MEMORY;
 
 	if (ch == '\n') {
 		serial_putc(ch);
 		console_newline();
-		if (bootinfo_get()->has_framebuffer) {
-			fb_console_putchar(ch);
-		}
 		return;
 	}
 
@@ -95,9 +99,6 @@ void console_putc(char ch)
 		if (cursor_col > 0) {
 			cursor_col--;
 			vga[cursor_row * VGA_WIDTH + cursor_col] = vga_entry(' ');
-		}
-		if (bootinfo_get()->has_framebuffer) {
-			fb_console_putchar(ch);
 		}
 		return;
 	}
@@ -108,10 +109,6 @@ void console_putc(char ch)
 
 	if (cursor_col >= VGA_WIDTH) {
 		console_newline();
-	}
-
-	if (bootinfo_get()->has_framebuffer) {
-		fb_console_putchar(ch);
 	}
 }
 

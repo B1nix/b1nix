@@ -25,6 +25,7 @@ enum vfs_node_type {
 	VFS_FILE = 1,
 	VFS_DEVICE = 2,
 	VFS_DIRECTORY = 3,
+	VFS_SYMLINK = 4,
 };
 
 struct acl_entry {
@@ -84,8 +85,12 @@ int vfs_mkdir(const char *path);
 usize vfs_list(const char *dir_path, const char **names, usize max_names);
 struct vfs_node *vfs_find_node_by_fd(int fd);
 int vfs_stat(const char *path, struct b1nix_stat *st);
+int vfs_lstat(const char *path, struct b1nix_stat *st);
 isize vfs_lseek(int handle, isize offset, int whence);
 int vfs_unlink(const char *path);
+int vfs_link(const char *target, const char *link_path);
+int vfs_symlink(const char *target, const char *link_path);
+isize vfs_readlink(const char *path, char *buffer, usize size);
 int vfs_rename(const char *old_path, const char *new_path);
 int vfs_rmdir(const char *path);
 int vfs_fstat(int fd, struct b1nix_stat *st);

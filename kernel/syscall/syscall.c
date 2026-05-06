@@ -157,32 +157,72 @@ static void copy_cstr(char *dst, usize dst_size, const char *src)
 
 static void normalize_path(const char *path, char *out, usize out_size)
 {
-	if (!path || out_size == 0) return;
-	if (path[0] == '/') {
-		copy_cstr(out, out_size, path);
-		return;
+	char raw[256];
+	char combined[256];
+	usize len = 0;
+
+	if (!out || out_size == 0) return;
+	out[0] = '\0';
+	if (!path || syscall_copyinstr(raw, sizeof(raw), path) != 0) return;
+
+	if (raw[0] == '/') {
+		copy_cstr(combined, sizeof(combined), raw);
+	} else {
+		const char *cwd = scheduler_get_cwd();
+		copy_cstr(combined, sizeof(combined), cwd && cwd[0] ? cwd : "/");
+		len = strlen(combined);
+		if (len == 0) {
+			combined[len++] = '/';
+			combined[len] = '\0';
+		}
+		if (combined[len - 1] != '/' && len < sizeof(combined) - 1) {
+			combined[len++] = '/';
+			combined[len] = '\0';
+		}
+		for (usize i = 0; raw[i] && len < sizeof(combined) - 1; i++) {
+			combined[len++] = raw[i];
+		}
+		combined[len] = '\0';
 	}
 
-	const char *cwd = scheduler_get_cwd();
-	usize cwd_len = strlen(cwd);
-	if (cwd_len >= out_size) cwd_len = out_size - 1;
-	memcpy(out, cwd, cwd_len);
-	if (cwd_len == 0 || out[cwd_len - 1] != '/') {
-		if (cwd_len + 1 < out_size) out[cwd_len++] = '/';
+	out[0] = '/';
+	out[1] = '\0';
+	len = 1;
+	for (usize i = 0; combined[i];) {
+		while (combined[i] == '/') i++;
+		if (!combined[i]) break;
+
+		char part[64];
+		usize part_len = 0;
+		while (combined[i] && combined[i] != '/' && part_len < sizeof(part) - 1) {
+			part[part_len++] = combined[i++];
+		}
+		part[part_len] = '\0';
+		while (combined[i] && combined[i] != '/') i++;
+
+		if (part[0] == '\0' || strcmp(part, ".") == 0) continue;
+		if (strcmp(part, "..") == 0) {
+			if (len > 1) {
+				if (out[len - 1] == '/') len--;
+				while (len > 1 && out[len - 1] != '/') len--;
+				out[len] = '\0';
+			}
+			continue;
+		}
+
+		if (len > 1 && len < out_size - 1) out[len++] = '/';
+		for (usize j = 0; part[j] && len < out_size - 1; j++) {
+			out[len++] = part[j];
+		}
+		out[len] = '\0';
 	}
-	usize path_len = strlen(path);
-	usize remain = out_size - cwd_len - 1;
-	if (path_len > remain) path_len = remain;
-	memcpy(out + cwd_len, path, path_len);
-	out[cwd_len + path_len] = '\0';
 }
 
 static u64 sys_execve(const char *path, const char **argv, const char **envp)
 {
 	char kernel_path[VFS_MAX_PATH];
-	if (syscall_copyinstr(kernel_path, sizeof(kernel_path), path) != 0) {
-		return (u64)-1;
-	}
+	normalize_path(path, kernel_path, sizeof(kernel_path));
+	if (kernel_path[0] == '\0') return (u64)-1;
 	return (u64)user_execve_current(kernel_path, argv, envp);
 }
 
@@ -215,24 +255,40 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return sys_write((const char *)(usize)arg0, (usize)arg1, (int)arg2, arg3 != 0);
 	case SYS_EXIT:
 		scheduler_exit_current((int)arg0);
-	case SYS_SPAWN:
-		return (u64)user_spawn((const char *)(usize)arg0, (int)arg1, (const char **)(usize)arg2);
-	case SYS_LIST:
-		return sys_list((const char *)(usize)arg0);
-	case SYS_READ_FILE:
-		return sys_read_file((const char *)(usize)arg0);
+	case SYS_SPAWN: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		if (path[0] == '\0') return (u64)-1;
+		return (u64)user_spawn(path, (int)arg1, (const char **)(usize)arg2);
+	}
+	case SYS_LIST: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return sys_list(path);
+	}
+	case SYS_READ_FILE: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return sys_read_file(path);
+	}
 	case SYS_YIELD:
 		scheduler_yield();
 		return 0;
-	case SYS_OPEN:
-		return (u64)vfs_open_flags((const char *)(usize)arg0, (int)arg1);
+	case SYS_OPEN: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_open_flags(path, (int)arg1);
+	}
 	case SYS_READ:
 		return (u64)vfs_read((int)arg0, (char *)(usize)arg1, (usize)arg2);
 	case SYS_CLOSE:
 		vfs_close((int)arg0);
 		return 0;
-	case SYS_CREATE:
-		return (u64)vfs_create((const char *)(usize)arg0, (const char *)(usize)arg1);
+	case SYS_CREATE: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_create(path, (const char *)(usize)arg1);
+	}
 #ifndef __aarch64__
 	case SYS_NET_PING: {
 		struct ipv4_addr dest;
@@ -301,11 +357,11 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_MEM:
 		console_write("Total usable memory: ");
-		console_write_dec(pmm_total_usable_memory() / 1024);
-		console_write(" KB\n");
+		console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));
+		console_write(" MB\n");
 		console_write("Free memory approx:  ");
-		console_write_dec(pmm_free_memory_estimate() / 1024);
-		console_write(" KB\n");
+		console_write_dec(pmm_free_memory_estimate() / (1024ULL * 1024ULL));
+		console_write(" MB\n");
 		return 0;
 	case SYS_REBOOT:
 #ifdef __aarch64__
@@ -321,30 +377,9 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		scheduler_set_stdout((int)arg0);
 		return 0;
 #ifndef __aarch64__
-	case SYS_NET_INFO: {
-		struct mac_addr mac = net_get_mac();
-		struct ipv4_addr ip = net_get_ip();
-		struct ipv4_addr gw = net_get_gateway();
-
-		console_write("MAC Address: ");
-		for (int i = 0; i < 6; i++) {
-			if (mac.bytes[i] < 0x10) console_write("0");
-			console_write_hex32(mac.bytes[i]);
-			if (i < 5) console_write(":");
-		}
-		console_write("\nIP Address:  ");
-		for (int i = 0; i < 4; i++) {
-			console_write_dec(ip.bytes[i]);
-			if (i < 3) console_write(".");
-		}
-		console_write("\nGateway:     ");
-		for (int i = 0; i < 4; i++) {
-			console_write_dec(gw.bytes[i]);
-			if (i < 3) console_write(".");
-		}
-		console_write("\n");
+	case SYS_NET_INFO:
+		net_dump_info();
 		return 0;
-	}
 #else
 	case SYS_NET_INFO:
 		console_write("Network not available on AArch64 yet.\n");
@@ -422,10 +457,16 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return (u64)shmdt((const void *)(usize)arg0);
 	case SYS_SHMCTL:
 		return (u64)shmctl((int)arg0, (int)arg1, (struct shmid_ds *)(usize)arg2);
-	case SYS_CHMOD:
-		return (u64)vfs_chmod((const char *)(usize)arg0, (u16)arg1);
-	case SYS_CHOWN:
-		return (u64)vfs_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
+	case SYS_CHMOD: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_chmod(path, (u16)arg1);
+	}
+	case SYS_CHOWN: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_chown(path, (u16)arg1, (u16)arg2);
+	}
 	case SYS_GETUID: {
 		struct cred *c = scheduler_get_current_cred();
 		return c ? c->uid : 0;
@@ -464,6 +505,11 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		char path[VFS_MAX_PATH];
 		normalize_path((const char *)(usize)arg0, path, sizeof(path));
 		return (u64)vfs_stat(path, (struct b1nix_stat *)(usize)arg1);
+	}
+	case SYS_LSTAT: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_lstat(path, (struct b1nix_stat *)(usize)arg1);
 	}
 	case SYS_LSEEK:
 		return (u64)vfs_lseek((int)arg0, (isize)arg1, (int)arg2);
@@ -583,6 +629,39 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		if (!arg0 || arg1 == 0) return (u64)-EINVAL;
 		return (u64)klog_read((char *)(usize)arg0, (usize)arg1);
 	}
+	case SYS_LINK: {
+		char target[VFS_MAX_PATH];
+		char link_path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, target, sizeof(target));
+		normalize_path((const char *)(usize)arg1, link_path, sizeof(link_path));
+		return (u64)vfs_link(target, link_path);
+	}
+	case SYS_SYMLINK: {
+		char target[VFS_MAX_PATH];
+		char link_path[VFS_MAX_PATH];
+		if (syscall_copyinstr(target, sizeof(target), (const char *)(usize)arg0) != 0) return (u64)-1;
+		normalize_path((const char *)(usize)arg1, link_path, sizeof(link_path));
+		return (u64)vfs_symlink(target, link_path);
+	}
+	case SYS_READLINK: {
+		char path[VFS_MAX_PATH];
+		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		return (u64)vfs_readlink(path, (char *)(usize)arg1, (usize)arg2);
+	}
+	case SYS_SETPRIORITY: {
+		usize pid = arg0 == 0 ? scheduler_get_pid() : (usize)arg0;
+		return (u64)scheduler_set_priority(pid, (int)arg1);
+	}
+	case SYS_GETPRIORITY: {
+		usize pid = arg0 == 0 ? scheduler_get_pid() : (usize)arg0;
+		return (u64)scheduler_get_priority(pid);
+	}
+	case SYS_SETSID:
+		return (u64)scheduler_setsid();
+	case SYS_GETPGRP:
+		return (u64)scheduler_getpgrp();
+	case SYS_SETPGRP:
+		return (u64)scheduler_setpgrp((usize)arg0, (usize)arg1);
 	default:
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);

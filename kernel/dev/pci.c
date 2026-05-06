@@ -99,3 +99,43 @@ int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info)
 	}
 	return 0;
 }
+
+int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info *info)
+{
+	u8 seen = 0;
+
+	for (u16 bus = 0; bus < 256; bus++) {
+		for (u8 slot = 0; slot < 32; slot++) {
+			u16 vendor = pci_config_read16((u8)bus, slot, 0, 0);
+			if (vendor == 0xFFFF) continue;
+
+			u8 header_type = pci_config_read8((u8)bus, slot, 0, 0x0E);
+			u8 max_func = (header_type & 0x80) ? 8 : 1;
+
+			for (u8 func = 0; func < max_func; func++) {
+				vendor = pci_config_read16((u8)bus, slot, func, 0);
+				if (vendor == 0xFFFF) continue;
+
+				u8 cls = pci_config_read8((u8)bus, slot, func, 0x0B);
+				u8 sub = pci_config_read8((u8)bus, slot, func, 0x0A);
+				if (cls != class_code || sub != subclass) continue;
+
+				if (seen++ != index) continue;
+
+				if (info) {
+					info->bus = (u8)bus;
+					info->slot = slot;
+					info->func = func;
+					info->vendor_id = vendor;
+					info->device_id = pci_config_read16((u8)bus, slot, func, 2);
+					info->class_code = cls;
+					info->subclass = sub;
+					info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
+				}
+				return 1;
+			}
+		}
+	}
+
+	return 0;
+}

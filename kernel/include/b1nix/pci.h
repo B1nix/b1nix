@@ -22,5 +22,6 @@ void pci_config_write32(u8 bus, u8 slot, u8 func, u8 offset, u32 value);
 void pci_config_write16(u8 bus, u8 slot, u8 func, u8 offset, u16 value);
 void pci_config_write8(u8 bus, u8 slot, u8 func, u8 offset, u8 value);
 int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info);
+int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info *info);
 
 #endif

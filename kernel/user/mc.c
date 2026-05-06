@@ -316,6 +316,10 @@ int mc_main(int argc, const char **argv)
 			break;
 			
 		case KEY_F10:
+		case KEY_ESC:
+		case KEY_CTRL_Q:
+		case 'q':
+		case 'Q':
 			running = 0;
 			break;
 			

@@ -17,7 +17,6 @@ static void compositor_thread(void *arg)
 
     volatile u32 *fb = (volatile u32 *)(usize)(0xffffa00000000000ULL);
     u32 width = info->framebuffer.width;
-    u32 height = info->framebuffer.height;
     u32 pitch = info->framebuffer.pitch;
     u8 bpp = info->framebuffer.bpp;
     
@@ -41,5 +40,6 @@ static void compositor_thread(void *arg)
 
 void compositor_init(void)
 {
-    kthread_create("compositor", compositor_thread, 0);
+    (void)compositor_thread;
+    console_write("compositor: boot thread disabled\n");
 }

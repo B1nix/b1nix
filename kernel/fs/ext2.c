@@ -1,6 +1,7 @@
 #include <b1nix/ext2.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
 #include <string.h>
@@ -193,7 +194,22 @@ static u32 ext2_get_inode_block(struct ext2_inode *inode, u32 block_idx)
 	if (block_idx < EXT2_NDIR_BLOCKS) {
 		return inode->i_block[block_idx];
 	}
-	// Currently only direct blocks are supported for simplicity
+	
+	if (block_idx < EXT2_NDIR_BLOCKS + (ext2_block_size / 4)) {
+		u32 ind_block = inode->i_block[EXT2_IND_BLOCK];
+		if (ind_block == 0) return 0;
+		
+		u32 *ind_buffer = kmalloc(ext2_block_size);
+		if (ext2_read_block(ind_block, ind_buffer) < 0) {
+			kfree(ind_buffer);
+			return 0;
+		}
+		u32 phys = ind_buffer[block_idx - EXT2_NDIR_BLOCKS];
+		kfree(ind_buffer);
+		return phys;
+	}
+
+	// Double/Triple indirect not yet supported
 	return 0;
 }
 
@@ -201,7 +217,7 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
 {
 	u32 inode_num = (u32)(usize)node->data;
 	struct ext2_inode inode;
-	if (ext2_read_inode(inode_num, &inode) < 0) return -1;
+	if (ext2_read_inode(inode_num, &inode) < 0) return -EIO;
 	
 	if (offset >= inode.i_size) return 0;
 	
@@ -241,7 +257,7 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
 {
 	u32 inode_num = (u32)(usize)node->data;
 	struct ext2_inode inode;
-	if (ext2_read_inode(inode_num, &inode) < 0) return -1;
+	if (ext2_read_inode(inode_num, &inode) < 0) return -EIO;
 	
 	u64 new_size = offset + size;
 	if (new_size > inode.i_size) {
@@ -254,8 +270,25 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
 				if (!pblk) return -1;
 				inode.i_block[b] = pblk;
 				inode.i_blocks += (ext2_block_size / 512);
+			} else if (b < EXT2_NDIR_BLOCKS + (ext2_block_size / 4)) {
+				u32 ind_block = inode.i_block[EXT2_IND_BLOCK];
+				if (ind_block == 0) {
+					ind_block = ext2_alloc_block();
+					if (!ind_block) return -1;
+					inode.i_block[EXT2_IND_BLOCK] = ind_block;
+					inode.i_blocks += (ext2_block_size / 512);
+				}
+				
+				u32 *ind_buffer = kmalloc(ext2_block_size);
+				ext2_read_block(ind_block, ind_buffer);
+				u32 pblk = ext2_alloc_block();
+				if (!pblk) { kfree(ind_buffer); return -1; }
+				ind_buffer[b - EXT2_NDIR_BLOCKS] = pblk;
+				ext2_write_block(ind_block, ind_buffer);
+				kfree(ind_buffer);
+				inode.i_blocks += (ext2_block_size / 512);
 			} else {
-				return -1; // Indirect writes not supported
+				return -1; // Double/Triple indirect writes not supported
 			}
 		}
 		inode.i_size = (u32)new_size;
@@ -381,7 +414,7 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name, const char *f
 	u32 dir_inode_num = (u32)(usize)dir->data;
 	
 	u32 new_inode_num = ext2_alloc_inode();
-	if (!new_inode_num) return -1;
+	if (!new_inode_num) return -ENOSPC;
 	
 	struct ext2_inode new_inode;
 	memset(&new_inode, 0, sizeof(new_inode));

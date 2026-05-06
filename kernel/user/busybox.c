@@ -2,9 +2,13 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <b1nix/blk.h>
+#include <b1nix/btrfs.h>
+#include <b1nix/pci.h>
 #include <b1nix/syscall.h>
 #include <b1nix/posix.h>
 #include <b1nix/dirent.h>
+#include <b1nix/net.h>
 
 /* ── Helper: open file, return fd or -1 ── */
 static u64 bb_open(const char *path)
@@ -305,29 +309,62 @@ static int chown_main(int argc, const char **argv)
 	return 0;
 }
 
-/* ── ln — create hard link (copy for now) ── */
+/* ── ln — create hard or symbolic links ── */
 static int ln_main(int argc, const char **argv)
 {
-	if (argc < 3) {
-		printf("ln: missing operand\nUsage: ln <target> <linkname>\n");
+	int symbolic = 0;
+	int argi = 1;
+
+	if (argc > 1 && strcmp(argv[1], "-s") == 0) {
+		symbolic = 1;
+		argi = 2;
+	}
+
+	if (argc - argi < 2) {
+		printf("ln: missing operand\nUsage: ln [-s] <target> <linkname>\n");
 		return 1;
 	}
 
-	char src[256], dst[256];
-	bb_resolve(argv[1], src, sizeof(src));
-	bb_resolve(argv[2], dst, sizeof(dst));
+	char dst[256];
+	bb_resolve(argv[argi + 1], dst, sizeof(dst));
 
-	/* Copy as a simplified "link" — VFS hardlink not yet implemented */
-	char buf[4096];
-	usize n = bb_read_file(argv[1], buf, sizeof(buf));
-	if (n == 0 && argv[1][0] != '\0') {
-		printf("ln: %s: No such file\n", argv[1]);
+	if (symbolic) {
+		if (syscall_dispatch(SYS_SYMLINK, (u64)(usize)argv[argi],
+		                     (u64)(usize)dst, 0, 0) != 0) {
+			printf("ln: cannot create symbolic link %s\n", argv[argi + 1]);
+			return 1;
+		}
+		return 0;
+	}
+
+	char src[256];
+	bb_resolve(argv[argi], src, sizeof(src));
+	if (syscall_dispatch(SYS_LINK, (u64)(usize)src, (u64)(usize)dst, 0, 0) != 0) {
+		printf("ln: cannot create link %s\n", argv[argi + 1]);
 		return 1;
 	}
-	if (bb_write_file(dst, buf, n) < 0) {
-		printf("ln: cannot create link %s\n", argv[2]);
+	return 0;
+}
+
+/* ── readlink — print symlink target ── */
+static int readlink_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("readlink: missing operand\nUsage: readlink <path>\n");
 		return 1;
 	}
+
+	char path[256];
+	char target[256];
+	bb_resolve(argv[1], path, sizeof(path));
+	long n = (long)syscall_dispatch(SYS_READLINK, (u64)(usize)path,
+	                                (u64)(usize)target, sizeof(target) - 1, 0);
+	if (n < 0) {
+		printf("readlink: %s: Invalid argument\n", argv[1]);
+		return 1;
+	}
+	target[n] = '\0';
+	printf("%s\n", target);
 	return 0;
 }
 
@@ -764,10 +801,10 @@ static int uniq_main(int argc, const char **argv)
 	}
 
 	if (lc == 0) return 0;
-	printf("%s\n", lines[0]);
+	puts(lines[0]);
 	for (int i = 1; i < lc; i++) {
 		if (strcmp(lines[i], lines[i - 1]) != 0) {
-			printf("%s\n", lines[i]);
+			puts(lines[i]);
 		}
 	}
 	return 0;
@@ -807,8 +844,14 @@ static int mount_main(int argc, const char **argv)
 	char tgt[256];
 	bb_resolve(target, tgt, sizeof(tgt));
 
-	if (syscall_dispatch(SYS_MOUNT, (u64)(usize)source,
-	                     (u64)(usize)tgt, (u64)(usize)fstype, 0) != 0) {
+	int rc;
+	if (strcmp(fstype, "btrfs") == 0) {
+		rc = btrfs_mount_root(source, tgt);
+	} else {
+		rc = (int)syscall_dispatch(SYS_MOUNT, (u64)(usize)source,
+		                           (u64)(usize)tgt, (u64)(usize)fstype, 0);
+	}
+	if (rc != 0) {
 		printf("mount: cannot mount %s on %s (type %s)\n",
 		       source, target, fstype);
 		return 1;
@@ -823,6 +866,128 @@ static int df_main(int argc, const char **argv)
 
 	/* Use memory info as approximation */
 	syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
+	return 0;
+}
+
+static void print_size(u64 bytes)
+{
+	if (bytes >= 1024ULL * 1024ULL * 1024ULL) {
+		printf("%dG", (int)(bytes / (1024ULL * 1024ULL * 1024ULL)));
+	} else if (bytes >= 1024ULL * 1024ULL) {
+		printf("%dM", (int)(bytes / (1024ULL * 1024ULL)));
+	} else if (bytes >= 1024ULL) {
+		printf("%dK", (int)(bytes / 1024ULL));
+	} else {
+		printf("%dB", (int)bytes);
+	}
+}
+
+static const char *mountpoint_for_source(const char *source,
+                                         struct b1nix_mount_entry *entries,
+                                         long count)
+{
+	for (long i = 0; i < count; i++) {
+		if (strcmp(entries[i].source, source) == 0) {
+			return entries[i].target;
+		}
+	}
+	return "";
+}
+
+#ifndef __aarch64__
+static const char *storage_subclass_name(u8 subclass)
+{
+	switch (subclass) {
+	case 0x01: return "IDE";
+	case 0x04: return "RAID";
+	case 0x06: return "SATA/AHCI";
+	case 0x07: return "SAS";
+	case 0x08: return "NVMe";
+	case 0x80: return "storage";
+	default: return "storage";
+	}
+}
+
+static const char *storage_vendor_name(u16 vendor)
+{
+	switch (vendor) {
+	case 0x1002: return "AMD";
+	case 0x1022: return "AMD";
+	case 0x106b: return "Apple";
+	case 0x10ec: return "Realtek";
+	case 0x1179: return "Toshiba";
+	case 0x144d: return "Samsung";
+	case 0x15b7: return "SanDisk";
+	case 0x1c5c: return "SK hynix";
+	case 0x1d0f: return "Amazon";
+	case 0x8086: return "Intel";
+	default: return "unknown";
+	}
+}
+
+static int print_storage_class(u8 subclass)
+{
+	int printed = 0;
+	for (u8 idx = 0; idx < 8; idx++) {
+		struct pci_device_info pci;
+		if (!pci_find_class(0x01, subclass, idx, &pci)) break;
+		printf("pci        -     -      -   %s %s vendor 0x%04x device 0x%04x prog_if 0x%02x\n",
+		       storage_vendor_name(pci.vendor_id),
+		       storage_subclass_name(pci.subclass),
+		       pci.vendor_id, pci.device_id, pci.prog_if);
+		printed++;
+	}
+	return printed;
+}
+
+static int print_storage_controllers(void)
+{
+	int printed = 0;
+	printed += print_storage_class(0x08); /* NVMe */
+	printed += print_storage_class(0x06); /* SATA/AHCI */
+	printed += print_storage_class(0x04); /* RAID/RST/VMD-style */
+	printed += print_storage_class(0x01); /* IDE */
+	printed += print_storage_class(0x07); /* SAS */
+	printed += print_storage_class(0x80); /* Other */
+	return printed;
+}
+#endif
+
+static int lsblk_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	struct b1nix_mount_entry mounts[16];
+	long mount_count = (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 16, 0, 0);
+	if (mount_count < 0) mount_count = 0;
+
+	printf("NAME       SIZE  BLKSZ  RO  MOUNTPOINT\n");
+	usize count = blk_count();
+	if (count == 0) {
+		printf("(no block devices)\n");
+#ifndef __aarch64__
+		if (print_storage_controllers() > 0) {
+			printf("note: storage controller found, but no block driver registered a disk\n");
+		}
+#endif
+		return 0;
+	}
+
+	for (usize i = 0; i < count; i++) {
+		struct block_device *dev = blk_at(i);
+		if (!dev) continue;
+		u64 bytes = dev->block_count * (u64)dev->block_size;
+		printf("%-10s ", dev->name);
+		print_size(bytes);
+		printf("  %5d  %s   %s\n",
+		       (int)dev->block_size,
+		       dev->write_blocks ? "rw" : "ro",
+		       mountpoint_for_source(dev->name, mounts, mount_count));
+	}
+#ifndef __aarch64__
+	print_storage_controllers();
+#endif
 	return 0;
 }
 
@@ -969,7 +1134,7 @@ static int net_is_available(void)
 #ifdef __aarch64__
 	return 0;
 #else
-	return 1;
+	return net_is_ready();
 #endif
 }
 
@@ -978,14 +1143,8 @@ static int ifconfig_main(int argc, const char **argv)
 {
 	(void)argc; (void)argv;
 
-	if (!net_is_available()) {
-		printf("ifconfig: no network device found\n");
-		return 1;
-	}
-
-	/* Show network info via syscall */
 	syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
-	return 0;
+	return net_is_available() ? 0 : 1;
 }
 
 /* ── ping — send ICMP echo requests ── */
@@ -1262,6 +1421,7 @@ static struct bb_app bb_apps[] = {
 	{"chmod",   chmod_main},
 	{"chown",   chown_main},
 	{"ln",      ln_main},
+	{"readlink", readlink_main},
 	/* System */
 	{"ps",      ps_main},
 	{"kill",    kill_main},
@@ -1280,6 +1440,7 @@ static struct bb_app bb_apps[] = {
 	/* Filesystem */
 	{"mount",   mount_main},
 	{"df",      df_main},
+	{"lsblk",   lsblk_main},
 	{"sync",    sync_main},
 	{"hexdump", hexdump_main},
 	/* Network (M23) */
@@ -1302,6 +1463,20 @@ static struct bb_app bb_apps[] = {
 
 int busybox_main(int argc, const char **argv)
 {
+	const char *invoked = argv && argc > 0 ? argv[0] : "";
+	const char *base = strrchr(invoked, '/');
+	if (base) invoked = base + 1;
+
+	if (invoked && invoked[0] != '\0' && strcmp(invoked, "busybox") != 0) {
+		for (struct bb_app *app = bb_apps; app->name; app++) {
+			if (strcmp(app->name, invoked) == 0) {
+				return app->main(argc, argv);
+			}
+		}
+		printf("busybox: %s: applet not found\n", invoked);
+		return 1;
+	}
+
 	if (argc < 2) {
 		printf("BusyBox v1.0 (b1nix) multi-call binary\n");
 		printf("Usage: busybox [command] [arguments...]\n");
@@ -1313,14 +1488,11 @@ int busybox_main(int argc, const char **argv)
 	}
 
 	const char *cmd = argv[1];
-
-	/* Check symlink-style invocation (argv[0] == command name) */
 	for (struct bb_app *app = bb_apps; app->name; app++) {
 		if (strcmp(app->name, cmd) == 0) {
 			return app->main(argc - 1, argv + 1);
 		}
 	}
-
 	printf("busybox: %s: applet not found\n", cmd);
 	return 1;
 }

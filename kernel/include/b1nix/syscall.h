@@ -83,6 +83,15 @@ enum syscall_number {
 	SYS_TIME = 77,
 	SYS_DMESG = 78,
 	SYS_MOUNTS = 79,
+	SYS_LINK = 80,
+	SYS_SYMLINK = 81,
+	SYS_READLINK = 82,
+	SYS_LSTAT = 83,
+	SYS_SETPRIORITY = 84,
+	SYS_GETPRIORITY = 85,
+	SYS_SETSID = 86,
+	SYS_GETPGRP = 87,
+	SYS_SETPGRP = 88,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);

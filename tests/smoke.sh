@@ -7,7 +7,7 @@ set -e
 
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=15  # seconds to let each test run
+TIMEOUT=60  # seconds to let each test run
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -37,18 +37,42 @@ skip() {
 run_qemu() {
 	local log="$1"
 	shift
+	local pid
 
 	if [ "$ARCH" = "x86" ]; then
-		timeout "$TIMEOUT" qemu-system-x86_64 \
-			-cdrom "$PROJECT_DIR/build/x86/tinyunix.iso" \
-			-serial stdio -display none -monitor none -no-reboot \
-			>"$log" 2>&1 || true
+		if command -v timeout >/dev/null 2>&1; then
+			timeout "$TIMEOUT" qemu-system-x86_64 \
+				-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
+				-serial stdio -display none -monitor none -no-reboot \
+				>"$log" 2>&1 || true
+		else
+			qemu-system-x86_64 \
+				-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
+				-serial stdio -display none -monitor none -no-reboot \
+				>"$log" 2>&1 &
+			pid=$!
+			sleep "$TIMEOUT"
+			kill "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
 	elif [ "$ARCH" = "aarch64" ]; then
-		timeout "$TIMEOUT" qemu-system-aarch64 \
-			-M virt -cpu cortex-a57 -m 128 \
-			-kernel "$PROJECT_DIR/build/aarch64/kernel.elf" \
-			-serial stdio -display none -monitor none -no-reboot \
-			>"$log" 2>&1 || true
+		if command -v timeout >/dev/null 2>&1; then
+			timeout "$TIMEOUT" qemu-system-aarch64 \
+				-M virt -cpu cortex-a57 -m 128 \
+				-kernel "$PROJECT_DIR/build/aarch64/kernel.elf" \
+				-serial stdio -display none -monitor none -no-reboot \
+				>"$log" 2>&1 || true
+		else
+			qemu-system-aarch64 \
+				-M virt -cpu cortex-a57 -m 128 \
+				-kernel "$PROJECT_DIR/build/aarch64/kernel.elf" \
+				-serial stdio -display none -monitor none -no-reboot \
+				>"$log" 2>&1 &
+			pid=$!
+			sleep "$TIMEOUT"
+			kill "$pid" 2>/dev/null || true
+			wait "$pid" 2>/dev/null || true
+		fi
 	else
 		echo "Unknown ARCH: $ARCH"
 		exit 1
@@ -83,14 +107,13 @@ pass "kernel builds without errors"
 # ── Test 1: Kernel boots ──
 echo ""
 echo "[TEST] Boot and basic output..."
-LOG="/tmp/b1nix-smoke-boot.log"
+LOG="b1nix-smoke-boot.log"
 run_qemu "$LOG"
 check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
 check_output "$LOG" "kheap:" "kernel heap initializes"
 
 # ── Test 2: No panic ──
-check_output() { true; }  # dummy to avoid duplicate func
 if grep -q "KERNEL PANIC" "$LOG" 2>/dev/null; then
 	fail "kernel boots without panic" "PANIC detected in log"
 else
@@ -131,6 +154,26 @@ if grep -q "shell\|b1nix shell\|Welcome" "$LOG" 2>/dev/null; then
 else
 	skip "shell appears" "shell banner not found"
 fi
+
+# ── M22 utility init-path smoke ──
+echo ""
+echo "[TEST] M22 utilities..."
+check_output "$LOG" "M22-SMOKE: start" "M22 utility smoke starts from init"
+check_output "$LOG" "M22-SMOKE: ok pwd" "pwd utility runs"
+check_output "$LOG" "M22-SMOKE: ok cp" "cp utility runs"
+check_output "$LOG" "M22-SMOKE: ok parent-perms" "missing parent creation is rejected"
+check_output "$LOG" "M22-SMOKE: ok ln-s" "ln -s utility runs"
+check_output "$LOG" "M22-SMOKE: ok readlink" "readlink utility runs"
+check_output "$LOG" "M22-SMOKE: ok lstat" "lstat reports symlink type"
+check_output "$LOG" "M22-SMOKE: ok cat-link" "symlink path resolves"
+check_output "$LOG" "M22-SMOKE: ok path-norm" "dot-dot path normalization works"
+check_output "$LOG" "M22-SMOKE: ok grep" "grep utility runs"
+check_output "$LOG" "M22-SMOKE: ok date" "date utility runs"
+check_output "$LOG" "M22-SMOKE: ok uname" "uname utility runs"
+check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
+
+check_output "$LOG" "M24-STRESS: start" "M24 stress starts"
+check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
 
 # ── Network tests (x86 only) ──
 if [ "$ARCH" = "x86" ]; then

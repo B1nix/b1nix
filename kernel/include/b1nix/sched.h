@@ -95,10 +95,17 @@ int  scheduler_sigaction(int sig, const struct sigaction *act, struct sigaction 
 void scheduler_deliver_pending_signals(void);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
+void scheduler_set_user_image(void *image);
 struct cred *scheduler_get_current_cred(void);
 const char *scheduler_get_cwd(void);
 int scheduler_set_cwd(const char *path);
 u64 scheduler_get_uptime_ticks(void);
+u64 scheduler_brk_get(void);
 usize scheduler_brk_set(u64 new_brk);
+int scheduler_set_priority(usize pid, int priority);
+int scheduler_get_priority(usize pid);
+usize scheduler_setsid(void);
+usize scheduler_getpgrp(void);
+int scheduler_setpgrp(usize pid, usize pgrp);
 
 #endif

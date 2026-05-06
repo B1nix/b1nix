@@ -98,7 +98,14 @@ static u64 find_bitmap_address(const struct boot_info *boot_info, usize bitmap_b
 			bitmap_end = start;
 		}
 
+		if (bitmap_end + bitmap_bytes > 0x100000000ULL) {
+			continue;
+		}
+
 		if (region_contains(start, end - start, bitmap_end, align_up_u64(bitmap_bytes, PAGE_SIZE))) {
+			console_write("pmm: found bitmap location at 0x");
+			console_write_hex64(bitmap_end);
+			console_write("\n");
 			return bitmap_end;
 		}
 	}

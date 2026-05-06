@@ -33,12 +33,18 @@ pml4:
 	.skip 4096
 pdpt:
 	.skip 4096
-pd:
+pd0:
+	.skip 4096
+pd1:
+	.skip 4096
+pd2:
+	.skip 4096
+pd3:
 	.skip 4096
 
 .align 16
 stack_bottom:
-	.skip 16384
+	.skip 65536
 stack_top:
 
 .section .text
@@ -61,26 +67,40 @@ _start:
 setup_page_tables:
 	movl $pml4, %edi
 	xorl %eax, %eax
-	movl $3072, %ecx
+	/* Clear 6 pages (pml4, pdpt, pd0, pd1, pd2, pd3) = 6 * 4096 = 24576 bytes */
+	/* 24576 / 4 = 6144 */
+	movl $6144, %ecx
 	rep stosl
 
 	movl $pdpt, %eax
 	orl $0x003, %eax
 	movl %eax, pml4
 
-	movl $pd, %eax
+	movl $pd0, %eax
 	orl $0x003, %eax
 	movl %eax, pdpt
+	movl $pd1, %eax
+	orl $0x003, %eax
+	movl %eax, pdpt+8
+	movl $pd2, %eax
+	orl $0x003, %eax
+	movl %eax, pdpt+16
+	movl $pd3, %eax
+	orl $0x003, %eax
+	movl %eax, pdpt+24
 
 	movl $0, %ecx
 .map_pd:
 	movl %ecx, %eax
 	shll $21, %eax
 	orl $0x083, %eax
-	movl %eax, pd(,%ecx,8)
-	movl $0, pd+4(,%ecx,8)
+	
+	/* Map 2048 entries (4 * 512) across 4 page directories */
+	movl %eax, pd0(,%ecx,8)
+	movl $0, pd0+4(,%ecx,8)
+	
 	incl %ecx
-	cmpl $512, %ecx
+	cmpl $2048, %ecx
 	jne .map_pd
 
 	ret

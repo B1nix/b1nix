@@ -51,6 +51,11 @@ int stat(const char *path, struct b1nix_stat *st)
 	return (int)syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)st, 0, 0);
 }
 
+int lstat(const char *path, struct b1nix_stat *st)
+{
+	return (int)syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)st, 0, 0);
+}
+
 int fstat(int fd, struct b1nix_stat *st)
 {
 	return (int)syscall_dispatch(SYS_FSTAT, (u64)fd, (u64)(usize)st, 0, 0);

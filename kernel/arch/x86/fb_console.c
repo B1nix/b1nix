@@ -10,7 +10,7 @@ static u32 cursor_x;
 static u32 cursor_y;
 static u32 fg_color = 0x00FFFFFF;
 static u32 bg_color = 0x00000000;
-static volatile u32 *fb_ptr;
+volatile u32 *fb_ptr = 0;
 
 void fb_console_init(void)
 {
@@ -20,6 +20,9 @@ void fb_console_init(void)
 	}
 
 	fb = info->framebuffer;
+	if (fb.bpp != 32 && fb.bpp != 24) {
+		return; /* Unsupported color depth */
+	}
 	
 	console_write("fb: addr 0x");
 	console_write_hex64(fb.address);
@@ -69,7 +72,7 @@ void fb_console_clear(void)
 	}
 }
 
-static const u32 FONT_SCALE = 2;
+static const u32 FONT_SCALE = 1;
 
 static void fb_draw_char(char c, u32 x, u32 y)
 {

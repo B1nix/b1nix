@@ -1,7 +1,12 @@
 #include <string.h>
+#include <stdio.h>
+#include <b1nix/blk.h>
+#include <b1nix/mm.h>
+#include <b1nix/net.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
+#include <b1nix/video.h>
 
 void user_register_program(const char *path, user_program_entry entry);
 
@@ -10,9 +15,116 @@ static void uwrite(const char *text)
 	syscall_dispatch(SYS_WRITE, (u64)(usize)text, strlen(text), 0, 0);
 }
 
+static void uwrite_dec_value(u64 value)
+{
+	char buf[24];
+	snprintf(buf, sizeof(buf), "%d", (int)value);
+	uwrite(buf);
+}
+
+static void uwrite_ipv4(struct ipv4_addr ip)
+{
+	char buf[24];
+	snprintf(buf, sizeof(buf), "%d.%d.%d.%d",
+	         ip.bytes[0], ip.bytes[1], ip.bytes[2], ip.bytes[3]);
+	uwrite(buf);
+}
+
+static void b1fetch_cpu_name(char *out, usize out_size)
+{
+	if (!out || out_size == 0) return;
+	out[0] = '\0';
+#ifdef __aarch64__
+	(void)out_size;
+	strcpy(out, "AArch64 CPU");
+#else
+	u32 max_leaf = 0;
+	u32 unused = 0;
+	__asm__ volatile("cpuid"
+	                 : "=a"(max_leaf), "=b"(unused), "=c"(unused), "=d"(unused)
+	                 : "a"(0x80000000U));
+	if (max_leaf >= 0x80000004U && out_size >= 49) {
+		u32 *dst = (u32 *)out;
+		for (u32 leaf = 0; leaf < 3; leaf++) {
+			u32 a, b, c, d;
+			__asm__ volatile("cpuid"
+			                 : "=a"(a), "=b"(b), "=c"(c), "=d"(d)
+			                 : "a"(0x80000002U + leaf));
+			dst[leaf * 4 + 0] = a;
+			dst[leaf * 4 + 1] = b;
+			dst[leaf * 4 + 2] = c;
+			dst[leaf * 4 + 3] = d;
+		}
+		out[48] = '\0';
+		while (out[0] == ' ') memmove(out, out + 1, strlen(out));
+		return;
+	}
+	strcpy(out, "x86_64 CPU");
+#endif
+}
+
 #define SH_HISTORY_MAX 16
 static char sh_history[SH_HISTORY_MAX][256];
 static int sh_hist_count = 0;
+
+/* ── Job Control ── */
+#define SH_JOBS_MAX 16
+struct sh_job {
+	u64 pid;
+	char name[64];
+	int done;
+};
+static struct sh_job sh_jobs[SH_JOBS_MAX];
+static int sh_job_count = 0;
+
+static int sh_job_add(u64 pid, const char *name)
+{
+	for (int i = 0; i < SH_JOBS_MAX; i++) {
+		if (!sh_jobs[i].pid || sh_jobs[i].done) {
+			sh_jobs[i].pid  = pid;
+			sh_jobs[i].done = 0;
+			usize nl = strlen(name);
+			if (nl >= 64) nl = 63;
+			memcpy(sh_jobs[i].name, name, nl + 1);
+			if (i >= sh_job_count) sh_job_count = i + 1;
+			return i + 1; /* job number (1-based) */
+		}
+	}
+	return -1;
+}
+
+static void sh_jobs_print(void)
+{
+	int any = 0;
+	for (int i = 0; i < sh_job_count; i++) {
+		if (!sh_jobs[i].pid || sh_jobs[i].done) continue;
+		/* poll: non-blocking waitpid */
+		int st = 0;
+		u64 r = syscall_dispatch(SYS_WAITPID, sh_jobs[i].pid,
+		                         (u64)(usize)&st, 1 /*WNOHANG*/, 0);
+		if (r == sh_jobs[i].pid) sh_jobs[i].done = 1;
+		if (sh_jobs[i].done) continue;
+		char num[4] = {'[', '0' + (i + 1), ']', ' '};
+		syscall_dispatch(SYS_WRITE, (u64)(usize)num, 4, 0, 0);
+		uwrite(sh_jobs[i].name);
+		uwrite("\n");
+		any = 1;
+	}
+	if (!any) uwrite("no background jobs\n");
+}
+
+static int sh_fg(int job_num)
+{
+	int idx = job_num - 1;
+	if (idx < 0 || idx >= sh_job_count || !sh_jobs[idx].pid || sh_jobs[idx].done) {
+		uwrite("fg: no such job\n");
+		return -1;
+	}
+	int st = 0;
+	syscall_dispatch(SYS_WAIT, sh_jobs[idx].pid, (u64)(usize)&st, 0, 0);
+	sh_jobs[idx].done = 1;
+	return st;
+}
 
 static void readline(char *buffer, usize max_len)
 {
@@ -82,22 +194,64 @@ static void readline(char *buffer, usize max_len)
 
 static void resolve_path(const char *cwd, const char *rel, char *abs)
 {
+	char combined[256];
+	usize len = 0;
+
 	if (rel[0] == '/') {
-		// Already absolute
-		usize i = 0;
-		while (rel[i]) { abs[i] = rel[i]; i++; }
-		abs[i] = '\0';
-		return;
+		while (rel[len] && len < sizeof(combined) - 1) {
+			combined[len] = rel[len];
+			len++;
+		}
+		combined[len] = '\0';
+	} else {
+		usize cwd_len = strlen(cwd);
+		while (len < cwd_len && len < sizeof(combined) - 1) {
+			combined[len] = cwd[len];
+			len++;
+		}
+		if (len == 0) {
+			combined[len++] = '/';
+		}
+		if (combined[len - 1] != '/' && len < sizeof(combined) - 1) {
+			combined[len++] = '/';
+		}
+		for (usize i = 0; rel[i] && len < sizeof(combined) - 1; i++) {
+			combined[len++] = rel[i];
+		}
+		combined[len] = '\0';
 	}
 
-	usize cwd_len = strlen(cwd);
-	memcpy(abs, cwd, cwd_len);
-	if (abs[cwd_len - 1] != '/') {
-		abs[cwd_len++] = '/';
+	abs[0] = '/';
+	abs[1] = '\0';
+	len = 1;
+	for (usize i = 0; combined[i];) {
+		while (combined[i] == '/') i++;
+		if (!combined[i]) break;
+
+		char part[64];
+		usize part_len = 0;
+		while (combined[i] && combined[i] != '/' && part_len < sizeof(part) - 1) {
+			part[part_len++] = combined[i++];
+		}
+		part[part_len] = '\0';
+		while (combined[i] && combined[i] != '/') i++;
+
+		if (part[0] == '\0' || strcmp(part, ".") == 0) continue;
+		if (strcmp(part, "..") == 0) {
+			if (len > 1) {
+				if (abs[len - 1] == '/') len--;
+				while (len > 1 && abs[len - 1] != '/') len--;
+				abs[len] = '\0';
+			}
+			continue;
+		}
+
+		if (len > 1) abs[len++] = '/';
+		for (usize j = 0; part[j] && len < 127; j++) {
+			abs[len++] = part[j];
+		}
+		abs[len] = '\0';
 	}
-	
-	usize rel_len = strlen(rel);
-	memcpy(abs + cwd_len, rel, rel_len + 1);
 }
 
 
@@ -347,6 +501,8 @@ static int run_external_command(const char *cwd, char **args, int num_args, int 
 		syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
 		return status;
 	}
+	/* Background job — register in jobs list */
+	sh_job_add(pid, args[0]);
 	return 0;
 }
 
@@ -443,14 +599,18 @@ static int sh_main(int argc, const char **argv)
 			uwrite("  mkdir/rmdir- Directory operations\n");
 			uwrite("  chmod/chown- Permission operations\n");
 			uwrite("  clear      - Clear screen\n");
-			uwrite("  ps/jobs    - List tasks/jobs\n");
-			uwrite("  kill <pid> - Kill task\n");
-			uwrite("  mem/df     - System info\n");
+			uwrite("  ps         - List all tasks\n");
+			uwrite("  jobs       - List background jobs\n");
+			uwrite("  fg [n]     - Bring job n to foreground\n");
+			uwrite("  kill [-s] <pid> - Send signal to task\n");
+			uwrite("  mem/df/lsblk - System and block info\n");
+			uwrite("  gpuinfo    - Video device info\n");
+			uwrite("  b1fetch    - Tiny system summary\n");
 			uwrite("  ifconfig   - Network info\n");
 			uwrite("  ping <ip>  - Send ICMP echo\n");
 			uwrite("  resolve    - Resolve DNS\n");
 			uwrite("  reboot     - Reboot system\n");
-			uwrite("  export     - Set env var\n");
+			uwrite("  export     - Set env var (NAME=val)\n");
 			uwrite("  selfhost   - Show M17 toolchain status\n");
 			uwrite("  mc         - Mini Commander TUI\n");
 			uwrite("  ne         - Nano-like editor\n");
@@ -487,10 +647,32 @@ static int sh_main(int argc, const char **argv)
 			syscall_dispatch(SYS_PS, 0, 0, 0, 0);
 		} else if (strcmp(args[0], "mem") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
+		} else if (strcmp(args[0], "gpuinfo") == 0 && !pipe_pos) {
+			video_dump_info();
 		} else if (strcmp(args[0], "reboot") == 0 && !pipe_pos) {
 			syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0);
+		} else if (strcmp(args[0], "kill") == 0 && !pipe_pos) {
+			int sig = 15; /* SIGTERM */
+			int pid_idx = 1;
+			if (num_args > 2 && args[1][0] == '-') {
+				sig = (int)(args[1][1] - '0'); // Simple 1-digit sig for now
+				if (args[1][1] >= '1' && args[1][1] <= '9' && args[1][2] >= '0' && args[1][2] <= '9') {
+					sig = (args[1][1] - '0') * 10 + (args[1][2] - '0');
+				}
+				pid_idx = 2;
+			}
+			if (num_args > pid_idx) {
+				u64 pid = (u64)(args[pid_idx][0] - '0');
+				for (int i = 1; args[pid_idx][i]; i++) pid = pid * 10 + (args[pid_idx][i] - '0');
+				syscall_dispatch(SYS_KILL, pid, (u64)sig, 0, 0);
+			} else {
+				uwrite("usage: kill [-sig] <pid>\n");
+			}
 		} else if (strcmp(args[0], "jobs") == 0 && !pipe_pos) {
-			uwrite("Background jobs tracking not fully implemented, use 'ps'.\n");
+			sh_jobs_print();
+		} else if (strcmp(args[0], "fg") == 0 && !pipe_pos) {
+			int jn = (num_args > 1) ? (int)(args[1][0] - '0') : sh_job_count;
+			sh_fg(jn);
 		} else if (strcmp(args[0], "export") == 0 && num_args > 1 && !pipe_pos) {
 			char *eq = 0;
 			for (int i = 0; args[1][i]; i++) {
@@ -592,6 +774,19 @@ static int init_main(int argc, const char **argv)
 	(void)argv;
 
 	syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
+	u64 smoke_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/m22-smoke", 0, 0, 0);
+	if (smoke_pid != (u64)-1) {
+		int smoke_status = 0;
+		syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0);
+	}
+
+	u64 stress_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/m24-stress", 0, 0, 0);
+	if (stress_pid != (u64)-1) {
+		int stress_status = 0;
+		syscall_dispatch(SYS_WAIT, stress_pid, (u64)(usize)&stress_status, 0, 0);
+	}
+
+	syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
 	syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/sh", 0, 0, 0);
 	
 	while (1) {
@@ -606,6 +801,160 @@ extern int busybox_main(int argc, const char **argv);
 extern int mc_main(int argc, const char **argv);
 extern int editor_main(int argc, const char **argv);
 extern int nmake_main(int argc, const char **argv);
+
+static int m22_run(const char *label, const char *path, int argc, const char **argv)
+{
+	(void)path;
+	int status = busybox_main(argc, argv);
+	if (status != 0) {
+		uwrite("M22-SMOKE: fail ");
+		uwrite(label);
+		uwrite("\n");
+		return 1;
+	}
+
+	uwrite("M22-SMOKE: ok ");
+	uwrite(label);
+	uwrite("\n");
+	return 0;
+}
+
+static int m22_check_symlink_stat(void)
+{
+	struct b1nix_stat st;
+	struct b1nix_stat lst;
+
+	if (syscall_dispatch(SYS_STAT, (u64)(usize)"/tmp/m22dir/m22.link",
+	                     (u64)(usize)&st, 0, 0) != 0 ||
+	    syscall_dispatch(SYS_LSTAT, (u64)(usize)"/tmp/m22dir/m22.link",
+	                     (u64)(usize)&lst, 0, 0) != 0 ||
+	    (st.st_mode & B1NIX_S_IFLNK) == B1NIX_S_IFLNK ||
+	    (lst.st_mode & B1NIX_S_IFLNK) != B1NIX_S_IFLNK) {
+		uwrite("M22-SMOKE: fail lstat\n");
+		return 1;
+	}
+
+	uwrite("M22-SMOKE: ok lstat\n");
+	return 0;
+}
+
+static int m22_check_parent_enforcement(void)
+{
+	u64 create_rc = syscall_dispatch(SYS_CREATE, (u64)(usize)"/tmp/m22-missing/file",
+	                                 (u64)(usize)"bad", 0, 0);
+	u64 mkdir_rc = syscall_dispatch(SYS_MKDIR, (u64)(usize)"/tmp/m22-missing/dir",
+	                                0, 0, 0);
+	if ((isize)create_rc >= 0 || (isize)mkdir_rc >= 0) {
+		uwrite("M22-SMOKE: fail parent-perms\n");
+		return 1;
+	}
+
+	uwrite("M22-SMOKE: ok parent-perms\n");
+	return 0;
+}
+
+static int m22_smoke_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	uwrite("M22-SMOKE: start\n");
+	syscall_dispatch(SYS_CREATE, (u64)(usize)"/tmp/m22.txt",
+	                 (u64)(usize)"beta\nalpha\nalpha\n", 0, 0);
+
+	int failures = 0;
+
+	const char *pwd_argv[] = {"pwd", 0};
+	failures += m22_run("pwd", "/bin/pwd", 1, pwd_argv);
+
+	const char *mkdir_argv[] = {"mkdir", "/tmp/m22dir", 0};
+	failures += m22_run("mkdir", "/bin/mkdir", 2, mkdir_argv);
+	failures += m22_check_parent_enforcement();
+
+	const char *ls_argv[] = {"ls", "/tmp", 0};
+	failures += m22_run("ls", "/bin/ls", 2, ls_argv);
+
+	const char *cp_argv[] = {"cp", "/tmp/m22.txt", "/tmp/m22dir/copy.txt", 0};
+	failures += m22_run("cp", "/bin/cp", 3, cp_argv);
+
+	const char *ln_argv[] = {"ln", "-s", "/tmp/m22.txt", "/tmp/m22dir/m22.link", 0};
+	failures += m22_run("ln-s", "/bin/ln", 4, ln_argv);
+
+	const char *readlink_argv[] = {"readlink", "/tmp/m22dir/m22.link", 0};
+	failures += m22_run("readlink", "/bin/readlink", 2, readlink_argv);
+	failures += m22_check_symlink_stat();
+
+	const char *cat_argv[] = {"cat", "/tmp/m22.txt", 0};
+	failures += m22_run("cat", "/bin/cat", 2, cat_argv);
+
+	const char *cat_link_argv[] = {"cat", "/tmp/m22dir/m22.link", 0};
+	failures += m22_run("cat-link", "/bin/cat", 2, cat_link_argv);
+
+	const char *cat_norm_argv[] = {"cat", "/tmp//m22dir/../m22dir/./m22.link", 0};
+	failures += m22_run("path-norm", "/bin/cat", 2, cat_norm_argv);
+
+	const char *head_argv[] = {"head", "/tmp/m22.txt", 0};
+	failures += m22_run("head", "/bin/head", 2, head_argv);
+
+	const char *tail_argv[] = {"tail", "/tmp/m22.txt", 0};
+	failures += m22_run("tail", "/bin/tail", 2, tail_argv);
+
+	const char *grep_argv[] = {"grep", "alpha", "/tmp/m22.txt", 0};
+	failures += m22_run("grep", "/bin/grep", 3, grep_argv);
+
+	const char *wc_argv[] = {"wc", "/tmp/m22.txt", 0};
+	failures += m22_run("wc", "/bin/wc", 2, wc_argv);
+
+	const char *date_argv[] = {"date", 0};
+	failures += m22_run("date", "/bin/date", 1, date_argv);
+
+	const char *uname_argv[] = {"uname", "-a", 0};
+	failures += m22_run("uname", "/bin/uname", 2, uname_argv);
+
+	const char *id_argv[] = {"id", 0};
+	failures += m22_run("id", "/bin/id", 1, id_argv);
+
+	const char *whoami_argv[] = {"whoami", 0};
+	failures += m22_run("whoami", "/bin/whoami", 1, whoami_argv);
+
+	const char *ps_argv[] = {"ps", 0};
+	failures += m22_run("ps", "/bin/ps", 1, ps_argv);
+
+	uwrite(failures ? "M22-SMOKE: fail\n" : "M22-SMOKE: done\n");
+	return failures ? 1 : 0;
+}
+
+static int m24_stress_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	uwrite("M24-STRESS: start\n");
+	int failures = 0;
+	const char *args[] = {"true", 0};
+
+	/* Sequential spawn-wait across more iterations than MAX_TASKS to verify
+	 * that waited children release their task slots and image state. */
+	for (int i = 0; i < 24; i++) {
+		u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/true", 1, (u64)(usize)args, 0);
+		if (pid == (u64)-1) {
+			failures++;
+			continue;
+		}
+		int status = 0;
+		syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
+		syscall_dispatch(SYS_YIELD, 0, 0, 0, 0);
+		if (status != 0) failures++;
+	}
+
+	if (failures) {
+		uwrite("M24-STRESS: fail\n");
+		return 1;
+	}
+
+	uwrite("M24-STRESS: done\n");
+	return 0;
+}
 
 static int selfhost_main(int argc, const char **argv)
 {
@@ -633,10 +982,112 @@ static int selfhost_main(int argc, const char **argv)
 	return status.can_build_kernel_inside_b1nix ? 0 : 2;
 }
 
+static int gpuinfo_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	video_dump_info();
+	return 0;
+}
+
+static int b1fetch_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+
+	struct b1nix_utsname uts;
+	memset(&uts, 0, sizeof(uts));
+	syscall_dispatch(SYS_UNAME, (u64)(usize)&uts, 0, 0, 0);
+
+	char cwd[128];
+	if ((isize)syscall_dispatch(SYS_GETCWD, (u64)(usize)cwd, sizeof(cwd), 0, 0) < 0) {
+		strcpy(cwd, "/");
+	}
+
+	u64 uptime = syscall_dispatch(SYS_TIME, 0, 0, 0, 0);
+	u64 minutes = uptime / 60;
+	u64 seconds = uptime % 60;
+
+	uwrite("      _     user@b1nix\n");
+	uwrite("  ___| |_   os: ");
+	uwrite(uts.sysname);
+	uwrite(" ");
+	uwrite(uts.release);
+	uwrite("\n");
+	uwrite(" / _ \\ __|  kernel: ");
+	uwrite(uts.version);
+	uwrite("\n");
+	uwrite("|  __/ |_   cpu: ");
+	char cpu[64];
+	b1fetch_cpu_name(cpu, sizeof(cpu));
+	uwrite(cpu);
+	uwrite("\n");
+	uwrite(" \\___|\\__|  arch: ");
+	uwrite(uts.machine);
+	uwrite("\n");
+	uwrite("           shell: /bin/sh\n");
+	uwrite("           cwd: ");
+	uwrite(cwd);
+	uwrite("\n");
+	uwrite("           uptime: ");
+	char num[24];
+	snprintf(num, sizeof(num), "%d:%02d", (int)minutes, (int)seconds);
+	uwrite(num);
+	uwrite("\n");
+
+	u64 total_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+	u64 free_mb = pmm_free_memory_estimate() / (1024ULL * 1024ULL);
+	u64 used_mb = total_mb > free_mb ? total_mb - free_mb : 0;
+	snprintf(num, sizeof(num), "%d/%d MB", (int)used_mb, (int)total_mb);
+	uwrite("           memory: ");
+	uwrite(num);
+	uwrite("\n");
+
+	uwrite("           video: ");
+	uwrite_dec_value(video_adapter_count());
+	uwrite(" adapter");
+	if (video_adapter_count() != 1) uwrite("s");
+	uwrite("\n");
+
+	uwrite("           net: ");
+	if (net_is_ready()) {
+		uwrite("up ");
+		uwrite_ipv4(net_get_ip());
+	} else {
+		uwrite("down");
+	}
+	uwrite("\n");
+
+	uwrite("           block: ");
+	uwrite_dec_value(blk_count());
+	uwrite(" device");
+	if (blk_count() != 1) uwrite("s");
+	uwrite("\n");
+
+	struct b1nix_mount_entry mounts[8];
+	long mount_count = (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 8, 0, 0);
+	if (mount_count < 0) mount_count = 0;
+	uwrite("           mounts: ");
+	uwrite_dec_value((u64)mount_count);
+	uwrite("\n");
+	for (long i = 0; i < mount_count && i < 3; i++) {
+		uwrite("             ");
+		uwrite(mounts[i].target);
+		uwrite(" <- ");
+		uwrite(mounts[i].source);
+		uwrite(" (");
+		uwrite(mounts[i].fstype);
+		uwrite(")\n");
+	}
+	return 0;
+}
+
 void user_register_builtin_programs(void)
 {
 	user_register_program("/bin/init", init_main);
 	user_register_program("/bin/sh", sh_main);
+	user_register_program("/bin/m22-smoke", m22_smoke_main);
+	user_register_program("/bin/m24-stress", m24_stress_main);
 
 	/* M22 — Core Terminal Utilities (BusyBox multi-call) */
 
@@ -651,6 +1102,7 @@ void user_register_builtin_programs(void)
 	user_register_program("/bin/chmod", busybox_main);
 	user_register_program("/bin/chown", busybox_main);
 	user_register_program("/bin/ln", busybox_main);
+	user_register_program("/bin/readlink", busybox_main);
 
 	/* System utilities */
 	user_register_program("/bin/ps", busybox_main);
@@ -672,6 +1124,7 @@ void user_register_builtin_programs(void)
 	/* Filesystem utilities */
 	user_register_program("/bin/mount", busybox_main);
 	user_register_program("/bin/df", busybox_main);
+	user_register_program("/bin/lsblk", busybox_main);
 	user_register_program("/bin/sync", busybox_main);
 	user_register_program("/bin/hexdump", busybox_main);
 
@@ -683,6 +1136,9 @@ void user_register_builtin_programs(void)
 
 	/* M24 — Diagnostics */
 	user_register_program("/bin/dmesg", busybox_main);
+	user_register_program("/bin/gpuinfo", gpuinfo_main);
+	user_register_program("/bin/b1fetch", b1fetch_main);
+	user_register_program("/bin/neofetch", b1fetch_main);
 
 	/* Misc */
 	user_register_program("/bin/true", busybox_main);

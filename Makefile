@@ -56,9 +56,11 @@ KERNEL_SOURCES := \
 	kernel/fs/ext1.c \
 	kernel/fs/ext3.c \
 	kernel/fs/ext4.c \
+	kernel/fs/btrfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
 	kernel/dev/blk.c \
+	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
 	kernel/ipc/shm.c \
 	kernel/sched/uidgid.c \

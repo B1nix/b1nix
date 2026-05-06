@@ -40,6 +40,7 @@ u64 pmm_free_memory_estimate(void);
 usize pmm_free_frame_count(void);
 
 void kheap_init(void);
+void kheap_use_direct_map(void);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);

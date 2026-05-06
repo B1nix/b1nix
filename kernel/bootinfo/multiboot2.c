@@ -109,10 +109,6 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		cursor = align_up(cursor + tag->size, 8);
 	}
-
-	console_write("bootinfo: memory regions: ");
-	console_write_hex64(current_boot_info.memory_region_count);
-	console_write("\n");
 }
 
 const struct boot_info *bootinfo_get(void)

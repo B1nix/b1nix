@@ -15,6 +15,7 @@ int fork(void);
 int execve(const char *path, char *const argv[], char *const envp[]);
 int waitpid(int pid, int *status, int options);
 int stat(const char *path, struct b1nix_stat *st);
+int lstat(const char *path, struct b1nix_stat *st);
 int fstat(int fd, struct b1nix_stat *st);
 long lseek(int fd, long offset, int whence);
 int unlink(const char *path);

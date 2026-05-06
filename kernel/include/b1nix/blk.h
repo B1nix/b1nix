@@ -14,6 +14,8 @@ struct block_device {
 
 void blk_register(struct block_device *dev);
 struct block_device *blk_get(const char *name);
+usize blk_count(void);
+struct block_device *blk_at(usize index);
 
 // Block Cache API
 void blk_cache_init(void);

@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <tui.h>
 
@@ -21,6 +22,7 @@ struct editor {
 };
 
 static struct editor ed;
+static char save_buffer[MAX_LINES * (MAX_LINE_LEN + 1)];
 
 /* ── File I/O ── */
 
@@ -78,31 +80,29 @@ static int editor_load(const char *path)
 static int editor_save(void)
 {
 	if (ed.filename[0] == '\0') return -1;
-	
-	/* Build content */
-	char content[MAX_LINES * (MAX_LINE_LEN + 1)];
+
 	int pos = 0;
 	
-	for (int i = 0; i < ed.line_count && pos < (int)sizeof(content) - MAX_LINE_LEN - 2; i++) {
+	for (int i = 0; i < ed.line_count && pos < (int)sizeof(save_buffer) - MAX_LINE_LEN - 2; i++) {
 		int len = strlen(ed.lines[i]);
 		if (len > 0) {
-			memcpy(content + pos, ed.lines[i], len);
+			memcpy(save_buffer + pos, ed.lines[i], len);
 			pos += len;
 		}
-		content[pos++] = '\n';
+		save_buffer[pos++] = '\n';
 	}
-	content[pos] = '\0';
-	
-	/* Write via syscall */
-	u64 fd = syscall_dispatch(SYS_CREATE, (u64)(usize)ed.filename, (u64)(usize)content, 0, 0);
+	save_buffer[pos] = '\0';
+
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)ed.filename,
+	                          B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0);
 	if (fd == (u64)-1) {
-		/* Try opening and truncating? For now just return error */
 		return -1;
 	}
-	
-	/* If create returned a fd, close it */
-	if (fd != (u64)-1 && fd <= 256) {
-		syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+
+	u64 written = syscall_dispatch(SYS_WRITE, (u64)(usize)save_buffer, (u64)pos, fd, 1);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	if (written == (u64)-1 || (usize)written != (usize)pos) {
+		return -1;
 	}
 	
 	ed.dirty = 0;
@@ -189,7 +189,7 @@ static void editor_refresh_screen(void)
 	tui_status_bar(TUI_ROWS - 2, status, 7, 4);  /* White on blue */
 	
 	/* Draw function keys */
-	tui_write_at(TUI_ROWS - 1, 1, "^X Exit  ^S Save  ^G Help", TUI_COLS - 2, 0, 7);
+	tui_write_at(TUI_ROWS - 1, 1, "^X/^Q Exit  ^S/^Y Save  ^G Help", TUI_COLS - 2, 0, 7);
 	
 	/* Position cursor */
 	tui_cursor_goto(1 + ed.cursor_row - ed.top_line, 6 + ed.cursor_col - ed.left_col);
@@ -291,7 +291,9 @@ int editor_main(int argc, const char **argv)
 		int key = tui_get_key();
 		
 		switch (key) {
+		case KEY_CTRL_Q:
 		case KEY_CTRL_X:  /* Ctrl+X — Exit */
+		case KEY_ESC:
 			if (ed.dirty) {
 				tui_write_at(TUI_ROWS - 1, 1, "Save modified buffer? (y/n): ", TUI_COLS - 2, 0, 7);
 				int c = tui_get_key();
@@ -302,7 +304,8 @@ int editor_main(int argc, const char **argv)
 			running = 0;
 			break;
 			
-		case KEY_CTRL_S:  /* Ctrl+S — Save */
+		case KEY_CTRL_S:
+		case KEY_CTRL_Y:  /* Ctrl+Y — Save, friendlier on keyboards where Ctrl+S is awkward */
 			if (editor_save() == 0) {
 				tui_write_at(TUI_ROWS - 1, 1, "Saved successfully.", TUI_COLS - 2, 2, 0);
 				tui_get_key(); /* Wait for keypress */
@@ -316,14 +319,15 @@ int editor_main(int argc, const char **argv)
 			tui_clear_screen();
 			tui_write_at(1, 1, "ne Editor Help", TUI_COLS - 2, 7, 0);
 			tui_write_at(3, 1, "Ctrl+X  - Exit editor", TUI_COLS - 2, 7, 0);
-			tui_write_at(4, 1, "Ctrl+S  - Save file", TUI_COLS - 2, 7, 0);
-			tui_write_at(5, 1, "Ctrl+G  - This help", TUI_COLS - 2, 7, 0);
-			tui_write_at(6, 1, "Arrows  - Navigate", TUI_COLS - 2, 7, 0);
-			tui_write_at(7, 1, "Backspace - Delete char", TUI_COLS - 2, 7, 0);
-			tui_write_at(8, 1, "Enter   - New line", TUI_COLS - 2, 7, 0);
-			tui_write_at(9, 1, "Home    - Line start", TUI_COLS - 2, 7, 0);
-			tui_write_at(10, 1, "End     - Line end", TUI_COLS - 2, 7, 0);
-			tui_write_at(12, 1, "Type text to insert characters.", TUI_COLS - 2, 7, 0);
+			tui_write_at(4, 1, "Ctrl+Q/Esc - Exit editor", TUI_COLS - 2, 7, 0);
+			tui_write_at(5, 1, "Ctrl+S/Ctrl+Y - Save file", TUI_COLS - 2, 7, 0);
+			tui_write_at(6, 1, "Ctrl+G  - This help", TUI_COLS - 2, 7, 0);
+			tui_write_at(7, 1, "Arrows  - Navigate", TUI_COLS - 2, 7, 0);
+			tui_write_at(8, 1, "Backspace - Delete char", TUI_COLS - 2, 7, 0);
+			tui_write_at(9, 1, "Enter   - New line", TUI_COLS - 2, 7, 0);
+			tui_write_at(10, 1, "Home    - Line start", TUI_COLS - 2, 7, 0);
+			tui_write_at(11, 1, "End     - Line end", TUI_COLS - 2, 7, 0);
+			tui_write_at(13, 1, "Type text to insert characters.", TUI_COLS - 2, 7, 0);
 			tui_write_at(TUI_ROWS - 1, 1, "Press any key to continue", TUI_COLS - 2, 0, 7);
 			tui_get_key();
 			break;

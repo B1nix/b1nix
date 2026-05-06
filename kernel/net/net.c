@@ -1,5 +1,6 @@
 #include <b1nix/console.h>
 #include <b1nix/net.h>
+#include <b1nix/pci.h>
 #include <b1nix/virtio.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -17,11 +18,134 @@ static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
 static struct ipv4_addr gateway_ip = { { 0, 0, 0, 0 } };
 
+#define NET_MAX_ADAPTERS 8
+
+struct net_adapter {
+	struct pci_device_info pci;
+	u32 bars[6];
+};
+
+static struct net_adapter net_adapters[NET_MAX_ADAPTERS];
+static usize net_adapter_count;
+
 struct mac_addr net_get_mac(void) { return local_mac; }
 struct ipv4_addr net_get_ip(void) { return local_ip; }
 struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
 void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
 void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
+int net_is_ready(void) { return net_ready; }
+
+static const char *net_vendor_name(u16 vendor)
+{
+	switch (vendor) {
+	case 0x10ec: return "Realtek";
+	case 0x14e4: return "Broadcom";
+	case 0x168c: return "Qualcomm/Atheros";
+	case 0x1969: return "Atheros";
+	case 0x1af4: return "VirtIO";
+	case 0x8086: return "Intel";
+	default: return "unknown";
+	}
+}
+
+static const char *net_kind_name(u8 subclass)
+{
+	switch (subclass) {
+	case 0x00: return "Ethernet";
+	case 0x80: return "network";
+	default: return "network";
+	}
+}
+
+static void print_hex8(u8 value)
+{
+	const char *digits = "0123456789abcdef";
+	console_putc(digits[(value >> 4) & 0xf]);
+	console_putc(digits[value & 0xf]);
+}
+
+static void print_ipv4(struct ipv4_addr addr)
+{
+	for (int i = 0; i < 4; i++) {
+		console_write_dec(addr.bytes[i]);
+		if (i < 3) console_putc('.');
+	}
+}
+
+static void print_mac(struct mac_addr mac)
+{
+	for (int i = 0; i < 6; i++) {
+		print_hex8(mac.bytes[i]);
+		if (i < 5) console_putc(':');
+	}
+}
+
+static void net_record_pci_class(u8 subclass)
+{
+	for (u8 idx = 0; net_adapter_count < NET_MAX_ADAPTERS; idx++) {
+		struct pci_device_info pci;
+		if (!pci_find_class(0x02, subclass, idx, &pci)) {
+			break;
+		}
+
+		struct net_adapter *adapter = &net_adapters[net_adapter_count++];
+		adapter->pci = pci;
+		for (u8 bar = 0; bar < 6; bar++) {
+			adapter->bars[bar] = pci_config_read32(pci.bus, pci.slot, pci.func, (u8)(0x10 + bar * 4));
+		}
+	}
+}
+
+static void net_scan_pci_adapters(void)
+{
+	net_adapter_count = 0;
+	net_record_pci_class(0x00);
+	net_record_pci_class(0x80);
+}
+
+void net_dump_info(void)
+{
+	console_write("Network\n");
+	console_write(" driver: ");
+	console_write(net_ready ? "virtio-net" : "none");
+	console_write("\n link:   ");
+	console_write(net_ready ? "up" : "down");
+	console_write("\n mac:    ");
+	print_mac(local_mac);
+	console_write("\n ip:     ");
+	print_ipv4(local_ip);
+	console_write("\n gateway:");
+	console_putc(' ');
+	print_ipv4(gateway_ip);
+	console_write("\n");
+
+	if (net_adapter_count == 0) {
+		console_write(" pci:    no network adapters found\n");
+		return;
+	}
+
+	for (usize i = 0; i < net_adapter_count; i++) {
+		const struct net_adapter *adapter = &net_adapters[i];
+		const struct pci_device_info *pci = &adapter->pci;
+		console_write(" pci:    ");
+		console_write_dec(pci->bus);
+		console_putc(':');
+		console_write_dec(pci->slot);
+		console_putc('.');
+		console_write_dec(pci->func);
+		console_putc(' ');
+		console_write(net_vendor_name(pci->vendor_id));
+		console_putc(' ');
+		console_write(net_kind_name(pci->subclass));
+		console_write(" vendor 0x");
+		console_write_hex32(pci->vendor_id);
+		console_write(" device 0x");
+		console_write_hex32(pci->device_id);
+		console_write(" prog_if 0x");
+		console_write_hex32(pci->prog_if);
+		console_write("\n");
+	}
+}
 
 #define RX_BUFFER_SIZE 2048
 #define NUM_RX_BUFFERS 16
@@ -83,11 +207,7 @@ static void virtio_net_probe(void)
 	net_ready = 1;
 
 	console_write("virtio-net: initialized with MAC ");
-	for (int i = 0; i < 6; i++) {
-		if (local_mac.bytes[i] < 0x10) console_write("0");
-		console_write_hex32(local_mac.bytes[i]);
-		if (i < 5) console_write(":");
-	}
+	print_mac(local_mac);
 	console_write("\n");
 }
 
@@ -103,7 +223,15 @@ static void net_task(void *arg)
 void net_init(void)
 {
 	net_ready = 0;
+	memset(&local_mac, 0, sizeof(local_mac));
+	local_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	gateway_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	net_scan_pci_adapters();
 	virtio_net_probe();
+	console_write("net: pci adapters 0x");
+	console_write_hex64(net_adapter_count);
+	console_write(", driver ");
+	console_write(net_ready ? "virtio-net\n" : "none\n");
 	arp_init();
 	if (!net_ready) {
 		return;

@@ -3,11 +3,6 @@
 
 #define COM1 0x3f8
 
-static int serial_ready(void)
-{
-	return (inb(COM1 + 5) & 0x20) != 0;
-}
-
 void serial_init(void)
 {
 	outb(COM1 + 1, 0x00);
@@ -21,9 +16,7 @@ void serial_init(void)
 
 void serial_putc(char ch)
 {
-	while (!serial_ready()) {
-	}
-
+	while ((inb(COM1 + 5) & 0x20) == 0);
 	outb(COM1, (u8)ch);
 }
 

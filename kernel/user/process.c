@@ -7,7 +7,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 
-#define MAX_PROGRAMS 48
+#define MAX_PROGRAMS 64
 #define ELF_MAGIC0 0x7f
 #define ELF_MAGIC1 'E'
 #define ELF_MAGIC2 'L'
@@ -57,8 +57,8 @@ static usize program_count;
 static struct user_address_space user_address_space_create(void) {
   struct user_address_space address_space;
 
-  address_space.pml4_frame = pmm_alloc_frame();
-  address_space.stack_base = pmm_alloc_frame();
+  address_space.pml4_frame = 0;
+  address_space.stack_base = 0;
   address_space.stack_size = USER_STACK_SIZE;
   address_space.stack_top = USER_STACK_TOP;
   address_space.stack_image_size = USER_STACK_SIZE;
@@ -252,6 +252,38 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   return image->segment_count > 0 ? 0 : -1;
 }
 
+void user_image_free(struct user_loaded_image *image) {
+  if (!image) return;
+
+  if (image->path) kfree((void *)image->path);
+
+  if (image->argv) {
+    for (int i = 0; i < image->argc; i++) {
+      if (image->argv[i]) kfree((void *)image->argv[i]);
+    }
+    kfree((void *)image->argv);
+  }
+
+  if (image->envp) {
+    for (int i = 0; image->envp[i]; i++) {
+      kfree((void *)image->envp[i]);
+    }
+    kfree((void *)image->envp);
+  }
+
+  for (usize i = 0; i < image->segment_count; i++) {
+    if (image->segments[i].data) {
+      kfree(image->segments[i].data);
+    }
+  }
+
+  if (image->address_space.stack_image) {
+    kfree(image->address_space.stack_image);
+  }
+
+  kfree(image);
+}
+
 static struct user_loaded_image *user_load_image(const char *path, int argc,
                                                  const char **argv,
                                                  const char **envp) {
@@ -331,6 +363,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 static void user_process_thread(void *arg) {
   struct process_start *start = arg;
   struct user_loaded_image *image = start->image;
+  
+  scheduler_set_user_image(image);
+  kfree(start);
 
   int code = 0;
   if (image->kind == USER_IMAGE_ELF64) {
@@ -363,9 +398,19 @@ int user_spawn(const char *path, int argc, const char **argv) {
   }
 
   struct process_start *start = kzalloc(sizeof(*start));
+  if (!start) {
+    user_image_free(image);
+    return -1;
+  }
   start->image = image;
 
-  return kthread_create(path, user_process_thread, start);
+  int tid = kthread_create(path, user_process_thread, start);
+  if (tid < 0) {
+    kfree(start);
+    user_image_free(image);
+    return -1;
+  }
+  return tid;
 }
 
 int user_execve_current(const char *path, const char **argv,

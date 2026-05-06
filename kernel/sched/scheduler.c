@@ -5,6 +5,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/sched.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/user.h>
 
 #define MAX_TASKS 16
 #define KERNEL_STACK_SIZE (16 * 1024)
@@ -75,6 +76,9 @@ struct task {
 
 	/* Credentials */
 	struct cred *cred;
+
+	/* Userspace Image */
+	void *user_image;
 };
 
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
@@ -460,6 +464,11 @@ int scheduler_waitpid(usize pid, int *status, int options)
 					if (tasks[i].state == TASK_DEAD) {
 						int code = tasks[i].exit_code;
 						int child_id = tasks[i].id;
+						if (tasks[i].user_image) {
+							user_image_free(tasks[i].user_image);
+							tasks[i].user_image = 0;
+						}
+						kfree(tasks[i].stack);
 						tasks[i].state = TASK_UNUSED;
 						interrupts_enable();
 						if (status) *status = code;
@@ -678,6 +687,13 @@ struct cred *scheduler_get_current_cred(void)
 	return current_task->cred;
 }
 
+void scheduler_set_user_image(void *image)
+{
+	if (current_task) {
+		current_task->user_image = image;
+	}
+}
+
 const char *scheduler_get_cwd(void)
 {
 	if (!current_task) return "/";
@@ -710,6 +726,77 @@ u64 scheduler_brk_set(u64 new_brk)
 	}
 	return current_task->user_brk;
 }
+
+/* ── Priority ── */
+
+int scheduler_set_priority(usize pid, int priority)
+{
+	if (priority < -20 || priority > 19) return -1;
+	interrupts_disable();
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
+			tasks[i].priority = 10 - priority; /* nice → internal (higher = better) */
+			interrupts_enable();
+			return 0;
+		}
+	}
+	interrupts_enable();
+	return -1;
+}
+
+int scheduler_get_priority(usize pid)
+{
+	interrupts_disable();
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
+			int p = 10 - tasks[i].priority; /* internal → nice */
+			interrupts_enable();
+			return p;
+		}
+	}
+	interrupts_enable();
+	return -1;
+}
+
+/* ── Session / Process Group ── */
+
+usize scheduler_setsid(void)
+{
+	if (!current_task) return (usize)-1;
+	interrupts_disable();
+	/* A process cannot be a process group leader to call setsid */
+	if (current_task->process_group_id == current_task->id) {
+		interrupts_enable();
+		return (usize)-1;
+	}
+	current_task->session_id = current_task->id;
+	current_task->process_group_id = current_task->id;
+	interrupts_enable();
+	return current_task->session_id;
+}
+
+usize scheduler_getpgrp(void)
+{
+	if (!current_task) return 0;
+	return current_task->process_group_id;
+}
+
+int scheduler_setpgrp(usize pid, usize pgrp)
+{
+	if (pid == 0) pid = current_task ? current_task->id : 0;
+	if (pgrp == 0) pgrp = pid;
+	interrupts_disable();
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
+			tasks[i].process_group_id = pgrp;
+			interrupts_enable();
+			return 0;
+		}
+	}
+	interrupts_enable();
+	return -1;
+}
+
 
 /* Called before returning to userspace — delivers pending signals */
 void scheduler_deliver_pending_signals(void)

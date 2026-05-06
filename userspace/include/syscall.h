@@ -23,6 +23,11 @@ enum {
 	SYS_TIME     = 77,
 	SYS_DMESG    = 78,
 	SYS_MOUNTS   = 79,
+	SYS_SETPRIORITY = 84,
+	SYS_GETPRIORITY = 85,
+	SYS_SETSID   = 86,
+	SYS_GETPGRP  = 87,
+	SYS_SETPGRP  = 88,
 };
 
 /* Raw syscall — uses int $0x80 convention for kernel threads */
