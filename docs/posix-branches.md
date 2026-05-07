@@ -10,6 +10,11 @@ The goal is not to chase every POSIX corner case at once. The goal is to make
 each branch predictable enough that real programs can trust the filesystem,
 path handling, shell execution, and common utilities.
 
+The stable requirements contract is
+[`docs/posix-requirements.md`](posix-requirements.md). When reviewing new code,
+map changes to that checklist first instead of adding surprise close criteria
+branch by branch.
+
 ## Status Legend
 
 - `done`: usable, covered by a build/smoke path, and no known semantic blocker
@@ -28,8 +33,9 @@ path handling, shell execution, and common utilities.
 - `partial` `open`, `read`, `write`, `close`, `lseek`, `stat`, `lstat`,
   `fstat`, `getdents`, `unlink`, `mkdir`, `rmdir`, `rename`, `fsync`, and
   `sync` are wired. `O_EXCL`, `O_DIRECTORY`, `O_APPEND`, read/write access-mode
-  checks, directory removal checks, and same-tree rename behavior have initial
-  coverage, but full rename semantics and durable metadata still need work.
+  checks, directory removal checks, same-tree rename behavior, and explicit
+  block-cache flush paths have initial coverage, but full rename semantics and
+  durable metadata still need work.
 - `partial` Path resolution handles cwd, dot, dot-dot, duplicate slashes, and
   common syscall entry paths; symlink-loop detection and no-follow behavior
   exist, but mount-edge behavior and broader failure tests are not closed.
@@ -41,16 +47,19 @@ path handling, shell execution, and common utilities.
   but enforcement is not consistent enough to call closed.
 - `initial` Persistent ext2 read/write support exists, but durability and
   fsck-friendly metadata are not proven across reboot stress.
+- `initial` Block-device partition discovery and write-back cache plumbing
+  exist, but real hardware persistence and recovery tests are not broad enough
+  to call storage POSIX-safe.
 - `stub` Btrfs is metadata/probe-only and should not be treated as a POSIX
   filesystem yet.
 
 ### Current Estimate
 
-`VFS/path/files` is roughly 65-72% of the way to a practical POSIX branch
+`VFS/path/files` is roughly 66-73% of the way to a practical POSIX branch
 close. The recent open-flag, descriptor-mode, directory, rename, symlink-loop,
-`getdents`, and cache-flush work moves it forward, but the branch is not
-closed: cross-mount semantics, permission enforcement, persistent filesystem
-durability, and broader failure tests still have visible gaps.
+`getdents`, partition-discovery, and cache-flush work moves it forward, but the
+branch is not closed: cross-mount semantics, permission enforcement, persistent
+filesystem durability, and broader failure tests still have visible gaps.
 
 Verification note: `make smoke-x86` currently reaches and passes the M22, M24,
 and POSIX shell-driven smoke markers. This is still smoke coverage, not a full
@@ -176,6 +185,10 @@ or initramfs shortcuts.
 
    - Flush inode size, block bitmap, inode bitmap, and directory entry updates
      on `fsync` and `sync`.
+   - `initial` Keep dirty block-cache entries write-back based and flush them
+     through eviction, `fsync`, and `sync`.
+   - `initial` Detect MBR/GPT partitions in the block layer so mounted storage
+     and `lsblk` can reason about whole disks and partition devices separately.
    - Add focused ext2 tests for create, truncate, append, rename, unlink, and
      reboot persistence.
    - Treat Btrfs as detect/list/mount metadata-only until it has real tree
@@ -231,8 +244,10 @@ the persistent ext2 root image.
   `sort`, `uniq`, `mount`, `df`, `lsblk`, `sync`, `hexdump`, `clear`, `dmesg`,
   `ifconfig`, `ping`, `nc`, `wget`, `touch`, `printf`, `basename`, `dirname`,
   `test`, and `[`.
-- `partial` Utility flags are intentionally narrow; core flags for `ls`, `cp`,
-  `rm`, `mkdir`, and `grep` need compatibility tests before this is closed.
+- `partial` Utility flags are intentionally narrow. Current smoke covers the
+  restored dispatch set plus `ls -la`, `cp -r`, `rm -rf`, `mkdir -p`,
+  `grep -q`, `grep -n`, `head -n NUM`, and `tail -n NUM`, but broader
+  compatibility tests are still needed before this is closed.
 - `initial` Shell-driven smoke coverage exists through `/bin/shell-smoke` and
   `/etc/posix-smoke.sh`, but it covers a narrow supported subset.
 - `partial` Background jobs and job-control metadata exist, but full POSIX
@@ -240,11 +255,12 @@ the persistent ext2 root image.
 
 ### Current Estimate
 
-`Shell/coreutils` is roughly 60-68% of the way to a practical POSIX branch
+`Shell/coreutils` is roughly 62-70% of the way to a practical POSIX branch
 close. Script execution, conditionals, `$?`, real pipe descriptors, redirection,
-and extra utilities now exist, but single-quote argv parsing, backslash escaping,
-pipeline EOF/blocking behavior, utility flags, unsupported-flag exits, and
-job-control semantics are not finished enough to mark the branch closed.
+restored BusyBox utility dispatch, `head -n NUM`, `tail -n NUM`, and extra
+utilities now exist, but single-quote argv parsing, backslash escaping, pipeline
+EOF/blocking behavior, unsupported-flag exits, and job-control semantics are not
+finished enough to mark the branch closed.
 
 Verification note: `make smoke-x86` currently reaches and passes the
 shell/coreutils smoke path. Treat the percentage as feature-completeness, not
@@ -360,6 +376,10 @@ pipes, exit statuses, and common file/text utilities.
      `ls -l -a`, `cp -r`, `rm -r -f`, `mkdir -p`, `grep -q -n`, `head -n`,
      `tail -n`, `wc -l -c`, `sort`, `uniq`, `test`/`[`, `basename`,
      `dirname`, `touch`, `printf`, `true`, `false`.
+   - `done` Keep the M22 dispatch table backed by real implementations for
+     `rmdir`, `chmod`, `chown`, `ln`, `readlink`, `touch`, `basename`,
+     `dirname`, `ps`, `kill`, `date`, `uname`, `cat`, `head`, `tail`, and
+     `find`.
    - `partial` Return nonzero on unsupported flags instead of silently ignoring them.
    - `initial` Prefer exact simple behavior over broad incomplete behavior.
 

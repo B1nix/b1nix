@@ -10,12 +10,14 @@ Status legend:
 
 Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 `Shell/coreutils` branches live in [`docs/posix-branches.md`](posix-branches.md).
+The stable no-surprises checklist for closing POSIX-facing work lives in
+[`docs/posix-requirements.md`](posix-requirements.md).
 
 ## Current POSIX Estimate
 
 - Overall practical POSIX compatibility: roughly 40-48%.
-- `VFS/path/files`: roughly 65-72%.
-- `Shell/coreutils`: roughly 60-68%.
+- `VFS/path/files`: roughly 66-73%.
+- `Shell/coreutils`: roughly 62-70%.
 
 These percentages mean "can run small real workflows", not "passes a POSIX
 conformance suite". The biggest blockers remain durable filesystem semantics,
@@ -99,6 +101,7 @@ and broader utility flag compatibility.
 - [x] `initial` Add symlinks, hard links, and `readlink`.
 - [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
 - [x] `partial` Add dot, dot-dot, duplicate-slash, symlink-loop, and common error path normalization at syscall/VFS boundaries.
+- [x] `partial` Add POSIX-style open-file-description mode checks for read-only, write-only, append, exclusive create, and directory-only opens.
 - [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
 - [ ] `planned` Add full permissions and mount-aware path normalization.
 
@@ -141,6 +144,7 @@ and broader utility flag compatibility.
 - [x] `done` Connect PS/2 keyboard input to shell and TTY paths.
 - [x] `initial` Add PCI device enumeration.
 - [x] `initial` Add block-device abstraction and cache.
+- [x] `initial` Add MBR/GPT partition discovery in the block-device layer.
 - [x] `partial` Add AHCI driver support.
 - [x] `partial` Add NVMe driver support.
 - [x] `stub` Add VirtIO GPU driver registration.
@@ -205,6 +209,7 @@ and broader utility flag compatibility.
 - [x] `initial` Journaling abstraction for VFS.
 - [x] `initial` Advanced file locking (`flock`/`fcntl`).
 - [x] `done` `sync()` and `fsync()` flush block cache paths.
+- [x] `initial` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
 - [x] `initial` Persistent ext2 root-image creation and boot overlay.
 - [ ] `planned` Add complete AHCI/NVMe production paths, robust journal replay, and full file-lock blocking semantics.
 
@@ -314,7 +319,8 @@ tables.
 - [x] `initial` Boot with a persistent root filesystem from a disk image.
 - [x] `initial` Add mountpoints and a real `mount`/`umount` VFS model.
 - [x] `initial` Stabilize writable ext2 as the first reliable root filesystem target.
-- [x] `initial` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`).
+- [x] `initial` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_EXCL`).
+- [x] `partial` Add safer VFS unlink/rmdir split, directory rename self-move prevention, and same-tree destination replacement.
 - [x] `initial` Flush block cache on shutdown and reboot.
 - [x] `done` Add `/etc`, `/bin`, `/dev`, `/home`, `/tmp`, and `/var` layout.
 - [x] `initial` Add an image creation/install script for local development.
@@ -348,12 +354,15 @@ unclean shutdown.
 - [x] `done` Implement `mount` command mounting path and active mount listing.
 - [x] `done` Add init-path utility smoke tests through `/bin/m22-smoke` and QEMU serial checks.
 - [x] `initial` Add interactive shell-driven utility smoke tests that execute through `/bin/sh`.
-- [x] `partial` Add option-compatible behavior for common utility flags (`ls -la`, `cp -r`, `rm -rf`, `mkdir -p`, `grep -q`).
+- [x] `partial` Add option-compatible behavior for common utility flags (`ls -la`, `cp -r`, `rm -rf`, `mkdir -p`, `grep -q`, `grep -n`, `head -n NUM`, `tail -n NUM`).
+- [x] `done` Restore all utility dispatch targets used by M22 smoke after the BusyBox table cleanup.
 
 M22 is useful but not fully closed. The init-path smoke proves many utilities
 work, and `/bin/shell-smoke` now exercises a small script through `/bin/sh`.
-POSIX-style closure still needs broader shell-script coverage, unsupported-flag
-behavior, consistent nonzero exits, and more exact text/file utility semantics.
+Current verification: `make smoke-x86` passes M22 utility smoke, M24 stress, and
+the POSIX shell-driven smoke path. POSIX-style closure still needs broader
+shell-script coverage, unsupported-flag behavior, consistent nonzero exits, and
+more exact text/file utility semantics.
 
 ## M23: Networking for Terminal Use
 
