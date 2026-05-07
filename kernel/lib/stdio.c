@@ -204,6 +204,6 @@ int printf(const char *fmt, ...)
 	va_start(args, fmt);
 	int len = vsnprintf_impl(buf, sizeof(buf), fmt, args);
 	va_end(args);
-	syscall_dispatch(SYS_WRITE, (u64)(usize)buf, len, 1, 1);
+	syscall_dispatch(SYS_WRITE, (u64)(usize)buf, len, 1, 0);
 	return len;
 }

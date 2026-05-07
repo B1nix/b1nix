@@ -27,8 +27,9 @@ path handling, shell execution, and common utilities.
 - `done` `stdin`, `stdout`, and `stderr` are real task-local descriptors.
 - `partial` `open`, `read`, `write`, `close`, `lseek`, `stat`, `lstat`,
   `fstat`, `getdents`, `unlink`, `mkdir`, `rmdir`, `rename`, `fsync`, and
-  `sync` are wired. Errno and flag semantics are improving, but read/write mode
-  enforcement, full rename semantics, and durable metadata still need work.
+  `sync` are wired. `O_EXCL`, `O_DIRECTORY`, `O_APPEND`, read/write access-mode
+  checks, directory removal checks, and same-tree rename behavior have initial
+  coverage, but full rename semantics and durable metadata still need work.
 - `partial` Path resolution handles cwd, dot, dot-dot, duplicate slashes, and
   common syscall entry paths; symlink-loop detection and no-follow behavior
   exist, but mount-edge behavior and broader failure tests are not closed.
@@ -45,11 +46,15 @@ path handling, shell execution, and common utilities.
 
 ### Current Estimate
 
-`VFS/path/files` is roughly 55-65% of the way to a practical POSIX branch
-close. The new path, errno, `getdents`, and utility work moves it forward, but
-the branch is not closed: open access modes, directory edge cases, mount
-semantics, permissions, and persistent filesystem durability still have visible
-gaps.
+`VFS/path/files` is roughly 65-72% of the way to a practical POSIX branch
+close. The recent open-flag, descriptor-mode, directory, rename, symlink-loop,
+`getdents`, and cache-flush work moves it forward, but the branch is not
+closed: cross-mount semantics, permission enforcement, persistent filesystem
+durability, and broader failure tests still have visible gaps.
+
+Verification note: `make smoke-x86` currently reaches and passes the M22, M24,
+and POSIX shell-driven smoke markers. This is still smoke coverage, not a full
+POSIX conformance result.
 
 ### Target
 
@@ -144,11 +149,14 @@ or initramfs shortcuts.
 
    Work:
 
-   - Complete `O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, and add
-     `O_EXCL` if missing.
-   - Store readable/writable mode on open-file descriptions.
-   - Reject reads from write-only handles and writes to read-only handles.
-   - Make append writes ignore the current offset and always write at EOF.
+   - `done` Complete initial `O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`,
+     and `O_EXCL` handling.
+   - `done` Store readable/writable mode on open-file descriptions.
+   - `done` Reject reads from write-only handles and writes to read-only
+     handles.
+   - `done` Make append writes ignore the current offset and always write at EOF.
+   - `partial` Add broader syscall/libc tests for access modes and error
+     reporting.
 
    Acceptance:
 
@@ -232,10 +240,15 @@ the persistent ext2 root image.
 
 ### Current Estimate
 
-`Shell/coreutils` is roughly 55-65% of the way to a practical POSIX branch
-close. Script execution and extra utilities now exist, but quoting edge cases,
-pipeline EOF behavior, conditionals, utility flags, unsupported-flag exits, and
+`Shell/coreutils` is roughly 60-68% of the way to a practical POSIX branch
+close. Script execution, conditionals, `$?`, real pipe descriptors, redirection,
+and extra utilities now exist, but single-quote argv parsing, backslash escaping,
+pipeline EOF/blocking behavior, utility flags, unsupported-flag exits, and
 job-control semantics are not finished enough to mark the branch closed.
+
+Verification note: `make smoke-x86` currently reaches and passes the
+shell/coreutils smoke path. Treat the percentage as feature-completeness, not
+full POSIX conformance.
 
 ### Target
 
@@ -256,7 +269,8 @@ pipes, exit statuses, and common file/text utilities.
    Work:
 
    - `partial` Add a token structure for words, operators, quotes, and redirects.
-   - `partial` Preserve quoted spaces for single and double quotes.
+   - `initial` Preserve quoted spaces for double quotes.
+   - `partial` Preserve quoted spaces for single quotes.
    - `partial` Implement backslash escaping for the common interactive cases.
    - `initial` Keep execution as a second phase: argv, redirections, pipeline, status.
 
@@ -277,8 +291,8 @@ pipes, exit statuses, and common file/text utilities.
 
    Work:
 
-   - `initial` Track the last foreground command status as `$?`.
-   - `initial` Implement `cmd1 && cmd2` and `cmd1 || cmd2`.
+   - `done` Track the last foreground command status as `$?`.
+   - `done` Implement `cmd1 && cmd2` and `cmd1 || cmd2`.
    - `initial` Make pipelines return a documented status, preferably the rightmost
      command status for now.
    - `partial` Ensure failed `exec` returns `127` and redirection failure returns nonzero.
@@ -366,8 +380,8 @@ pipes, exit statuses, and common file/text utilities.
 
    Work:
 
-   - `initial` Add a `/bin/shell-smoke` or `/etc/smoke.sh` path.
-   - `initial` Run a small utility workflow through the shell, not direct C calls only.
+   - `done` Add a `/bin/shell-smoke` and `/etc/posix-smoke.sh` path.
+   - `done` Run a small utility workflow through the shell, not direct C calls only.
    - `partial` Cover quoting, redirection, append, pipes, conditionals, variables,
      recursive remove, and symlinks.
 
@@ -409,7 +423,7 @@ If you want the lowest-risk implementation order, start here:
 
 1. `done` Add `touch`, `basename`, `dirname`, `test`/`[`, and `printf`.
 2. `initial` Add `mkdir -p` and `rm -rf`.
-3. `initial` Add shell quoting for single quotes, double quotes, and backslash escapes.
+3. `partial` Add shell quoting for single quotes, double quotes, and backslash escapes.
 4. `done` Add `$?`, `&&`, and `||`.
 5. `initial` Add VFS symlink loop detection and errno cleanup.
 6. `initial` Add shell-driven smoke tests.

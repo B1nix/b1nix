@@ -20,10 +20,10 @@ static u64 bb_open(const char *path)
 static usize bb_read_file(const char *path, char *buf, usize max)
 {
 	u64 fd = bb_open(path);
-	if (fd == (u64)-1) return 0;
+	if ((isize)fd < 0) return 0;
 	u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0);
 	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
-	if (n == (u64)-1) return 0;
+	if ((isize)n < 0) return 0;
 	buf[n] = '\0';
 	return (usize)n;
 }
@@ -34,7 +34,7 @@ static int bb_write_file(const char *path, const char *data, usize len)
 	/* Try create, then open */
 	syscall_dispatch(SYS_CREATE, (u64)(usize)path, (u64)(usize)"", 0, 0);
 	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0);
-	if (fd == (u64)-1) return -1;
+	if ((isize)fd < 0) return -1;
 	syscall_dispatch(SYS_WRITE, (u64)(usize)data, (u64)len, (u64)fd, 1);
 	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
 	return 0;
@@ -127,14 +127,14 @@ static int ls_main(int argc, const char **argv)
 /* ── cp — copy file ── */
 static int bb_copy_file(const char *src, const char *dst) {
 	u64 fds = bb_open(src);
-	if (fds == (u64)-1) return -1;
+	if ((isize)fds < 0) return -1;
 	syscall_dispatch(SYS_CREATE, (u64)(usize)dst, (u64)(usize)"", 0, 0);
 	u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0);
-	if (fdd == (u64)-1) { syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0); return -1; }
+	if ((isize)fdd < 0) { syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0); return -1; }
 	char buf[4096];
 	while (1) {
 		u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0);
-		if (n == 0 || n == (u64)-1) break;
+		if (n == 0 || (isize)n < 0) break;
 		syscall_dispatch(SYS_WRITE, (u64)(usize)buf, n, fdd, 1);
 	}
 	syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0);
@@ -304,6 +304,7 @@ static int mkdir_main(int argc, const char **argv)
 		return 1;
 	}
 
+	int failures = 0;
 	for (int i = start_idx; i < argc; i++) {
 		char path[256];
 		bb_resolve(argv[i], path, sizeof(path));
@@ -312,10 +313,11 @@ static int mkdir_main(int argc, const char **argv)
 		} else {
 			if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0) != 0) {
 				printf("mkdir: cannot create directory %s\n", argv[i]);
+				failures++;
 			}
 		}
 	}
-	return 0;
+	return failures ? 1 : 0;
 }
 
 /* ── rmdir — remove empty directory ── */
@@ -462,7 +464,7 @@ static int touch_main(int argc, const char **argv)
 		
 		/* Open and close to update timestamp (if kernel supports it) */
 		u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, (u64)B1NIX_O_WRONLY, 0, 0);
-		if (fd != (u64)-1) {
+		if ((isize)fd >= 0) {
 			syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
 		} else {
 			printf("touch: cannot touch %s\n", argv[i]);

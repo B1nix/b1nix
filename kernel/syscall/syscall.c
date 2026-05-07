@@ -50,7 +50,7 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src)
 
 static u64 sys_write(const char *text, usize size, int fd, int has_fd)
 {
-	if (!text && size != 0) return (u64)-1;
+	if (!text && size != 0) return (u64)-EFAULT;
 	if (!has_fd) {
 		fd = scheduler_get_stdout();
 		if (fd == -1 && scheduler_fd_get(1) >= 0) {
@@ -86,7 +86,7 @@ static u64 sys_read_file(const char *path)
 	const struct initramfs_file *file = initramfs_find(path);
 
 	if (file == 0) {
-		return (u64)-1;
+		return (u64)-ENOENT;
 	}
 
 	sys_write(file->data, file->size, -1, 0);
@@ -105,7 +105,8 @@ static u64 sys_read_kbd(void)
 static u64 sys_readdir(const char *dir_path, struct dirent *buf, usize max_entries)
 {
 	const char *names[128];
-	usize count = vfs_list(dir_path, names, 128);
+	isize count = vfs_list(dir_path, names, 128);
+	if (count < 0) return (u64)count;
 	if (count > max_entries) count = max_entries;
 
 	for (usize i = 0; i < count; i++) {
@@ -124,7 +125,7 @@ static u64 sys_readdir(const char *dir_path, struct dirent *buf, usize max_entri
 		memcpy(full_path + dirlen, names[i], len + 1);
 
 		struct vfs_node *node = vfs_find_node(full_path);
-		if (node) {
+		if (!IS_ERR(node)) {
 			buf[i].type   = (u32)node->type;
 			buf[i].is_dir = (node->type == VFS_DIRECTORY) ? 1 : 0;
 			buf[i].is_exec = (node->mode & 0111) ? 1 : 0;
@@ -159,7 +160,7 @@ static u64 sys_execve(const char *path, const char **argv, const char **envp)
 {
 	char kernel_path[VFS_MAX_PATH];
 	vfs_resolve_path(path, kernel_path);
-	if (kernel_path[0] == '\0') return (u64)-1;
+	if (kernel_path[0] == '\0') return (u64)-ENOENT;
 	return (u64)user_execve_current(kernel_path, argv, envp);
 }
 
@@ -170,7 +171,7 @@ static u64 sys_ioctl(int fd, u64 request, void *arg)
 
 static u64 sys_selfhost_status(struct b1nix_selfhost_status *status)
 {
-	if (!status) return (u64)-1;
+	if (!status) return (u64)-EFAULT;
 	memset(status, 0, sizeof(*status));
 	status->abi_version = 17;
 	status->target_ready = 1;
@@ -195,7 +196,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_SPAWN: {
 		char path[VFS_MAX_PATH];
 		vfs_resolve_path((const char *)(usize)arg0, path);
-		if (path[0] == '\0') return (u64)-1;
+		if (path[0] == '\0') return (u64)-ENOENT;
 		return (u64)user_spawn(path, (int)arg1, (const char **)(usize)arg2);
 	}
 	case SYS_LIST: {
@@ -285,7 +286,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_NET_PING:
 	case SYS_NET_DNS:
 	case SYS_READ_KBD:
-		return (u64)-1;
+		return (u64)-ENOSYS;
 #endif
 	case SYS_CLEAR:
 		return sys_clear();
@@ -335,7 +336,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_WAIT:
 		return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
 	case SYS_MMAP:
-		return (u64)(usize)kmalloc((usize)arg0);
+		void *ptr = kmalloc((usize)arg0);
+		return ptr ? (u64)(usize)ptr : (u64)-ENOMEM;
 	case SYS_SLEEP:
 		scheduler_sleep_ticks(arg0);
 		return 0;
@@ -361,7 +363,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		/* arg0 = name (char*), arg1 = flags (unused for now) */
 		const char *name = (const char *)(usize)arg0;
 		struct mqueue *mq = mqueue_create(name);
-		return (mq) ? (u64)(usize)mq : (u64)-1;
+		return (mq) ? (u64)(usize)mq : (u64)-ENOMEM;
 	}
 	case SYS_MQ_SEND: {
 		/* arg0 = mqueue ptr, arg1 = data ptr, arg2 = data len */
@@ -422,12 +424,12 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	}
 	case SYS_SETUID: {
 		struct cred *c = scheduler_get_current_cred();
-		if (!c) return -1;
+		if (!c) return -EACCES;
 		return (u64)cred_set_uid(c, (u16)arg0);
 	}
 	case SYS_SETGID: {
 		struct cred *c = scheduler_get_current_cred();
-		if (!c) return -1;
+		if (!c) return -EACCES;
 		return (u64)cred_set_gid(c, (u16)arg0);
 	}
 	case SYS_READDIR:
@@ -465,7 +467,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		char path[VFS_MAX_PATH];
 		vfs_resolve_path((const char *)(usize)arg0, path);
 		struct vfs_node *node = vfs_find_node(path);
-		if (!node || node->type != VFS_DIRECTORY) return (u64)-1;
+		if (IS_ERR(node)) return (u64)PTR_ERR(node);
+		if (node->type != VFS_DIRECTORY) return (u64)-ENOTDIR;
 		return (u64)scheduler_set_cwd(path);
 	}
 	case SYS_GETDENTS:
@@ -526,7 +529,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_GETCWD: {
 		/* arg0 = buffer, arg1 = buffer size */
 		const char *cwd = scheduler_get_cwd();
-		if (!cwd || !arg0) return (u64)-1;
+		if (!cwd || !arg0) return (u64)-EFAULT;
 		usize len = strlen(cwd);
 		if (len >= arg1) len = arg1 - 1;
 		memcpy((char *)(usize)arg0, cwd, len);
@@ -576,14 +579,15 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_SYMLINK: {
 		char target[VFS_MAX_PATH];
 		char link_path[VFS_MAX_PATH];
-		if (syscall_copyinstr(target, sizeof(target), (const char *)(usize)arg0) != 0) return (u64)-1;
+		if (syscall_copyinstr(target, sizeof(target), (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
 		vfs_resolve_path((const char *)(usize)arg1, link_path);
 		return (u64)vfs_symlink(target, link_path);
 	}
 	case SYS_READLINK: {
 		char path[VFS_MAX_PATH];
 		vfs_resolve_path((const char *)(usize)arg0, path);
-		return (u64)vfs_readlink(path, (char *)(usize)arg1, (usize)arg2);
+		isize res = vfs_readlink(path, (char *)(usize)arg1, (usize)arg2);
+		return (u64)res;
 	}
 	case SYS_SETPRIORITY: {
 		usize pid = arg0 == 0 ? scheduler_get_pid() : (usize)arg0;
@@ -603,6 +607,6 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		console_write("syscall: unknown 0x");
 		console_write_hex64(number);
 		console_write("\n");
-		return (u64)-1;
+		return (u64)-ENOSYS;
 	}
 }

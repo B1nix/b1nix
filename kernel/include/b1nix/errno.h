@@ -67,8 +67,8 @@
 #define EINPROGRESS     115 /* Operation now in progress */
 
 /* Helper: convert negative error to -errno */
-#define ERR_PTR(err) ((void *)(usize)(-(isize)(err)))
-#define PTR_ERR(ptr) ((int)(-(isize)(ptr)))
+#define ERR_PTR(err) ((void *)(isize)(err))
+#define PTR_ERR(ptr) ((int)(isize)(ptr))
 #define IS_ERR(ptr)  (((usize)(ptr) >= (usize)-4095))
 
 #endif

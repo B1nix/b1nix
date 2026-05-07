@@ -4,182 +4,232 @@
 #include <b1nix/mm.h>
 #include <string.h>
 
-#define MAX_JOURNAL_HANDLES 4
+/* JBD format magic values, compatible with ext3/ext4. */
+#define JBD_MAGIC 0xC03B3998
+#define JBD_DESCRIPTOR_BLOCK 1
+#define JBD_COMMIT_BLOCK 2
+#define JBD_SUPERBLOCK_V1 3
+#define JBD_SUPERBLOCK_V2 4
+#define JBD_REVOKE_BLOCK 5
 
-static struct {
-    struct block_device *dev;
-    u64 journal_start_lba;
-    u32 journal_blocks;
-    u32 next_transaction_id;
-    int initialized;
-} journal_state;
+struct jbd_header {
+  u32 h_magic;
+  u32 h_blocktype;
+  u32 h_sequence;
+};
 
-static struct journal_handle journal_handles[MAX_JOURNAL_HANDLES];
-static int journal_handle_count = 0;
+struct jbd_block_tag {
+  u32 t_blocknr;
+  u32 t_flags;
+};
+#define JBD_TAG_LAST_TAG 8
 
-void journal_init(struct block_device *dev, u64 start_lba, u32 total_blocks)
-{
-    memset(&journal_state, 0, sizeof(journal_state));
-    journal_state.dev = dev;
-    journal_state.journal_start_lba = start_lba;
-    journal_state.journal_blocks = total_blocks < MAX_JOURNAL_BLOCKS ? total_blocks : MAX_JOURNAL_BLOCKS;
-    journal_state.next_transaction_id = 1;
-    journal_state.initialized = 1;
-    
-    console_write("journal: initialized on ");
-    console_write(dev->name);
-    console_write(" blocks=");
-    console_write_dec(journal_state.journal_blocks);
-    console_write("\n");
-}
+struct jbd_superblock {
+  struct jbd_header s_header;
+  u32 s_blocksize;
+  u32 s_maxlen;
+  u32 s_first;
+  u32 s_sequence;
+  u32 s_start;
+  u32 s_errno;
+};
 
-static int journal_read_block(u64 lba, void *buffer)
-{
-    return blk_read_cached(journal_state.dev, lba, 1, buffer);
-}
+#define MAX_JOURNALS 4
+#define MAX_JOURNAL_HANDLES 16
 
-static int journal_write_block(u64 lba, const void *buffer)
-{
-    return blk_write_cached(journal_state.dev, lba, 1, buffer);
-}
+static struct journal_dev jdevs[MAX_JOURNALS];
+static struct journal_handle handles[MAX_JOURNAL_HANDLES];
 
-struct journal_handle *journal_start_transaction(void)
-{
-    if (!journal_state.initialized) return 0;
-    
-    struct journal_handle *h = 0;
-    for (int i = 0; i < MAX_JOURNAL_HANDLES; i++) {
-        if (!journal_handles[i].transaction_active) {
-            h = &journal_handles[i];
+struct journal_dev *journal_mount(void *fs_priv, u32 block_size,
+                                  struct journal_ops *ops) {
+  struct journal_dev *jdev = 0;
+  for (int i = 0; i < MAX_JOURNALS; i++) {
+    if (!jdevs[i].used) {
+      jdev = &jdevs[i];
             break;
         }
     }
-    if (!h) return 0;
+  if (!jdev)
+    return 0;
     
-    h->dev = journal_state.dev;
-    h->journal_start_lba = journal_state.journal_start_lba;
-    h->journal_blocks = journal_state.journal_blocks;
-    h->transaction_id = journal_state.next_transaction_id++;
-    h->transaction_active = 1;
-    h->modified_count = 0;
-    h->max_modified = (journal_state.journal_blocks - 2) / 2; // Reserve for descriptor + commit
-    h->modified_blocks = kzalloc(h->max_modified * sizeof(u32));
-    if (!h->modified_blocks) return 0;
+  jdev->used = 1;
+  jdev->fs_priv = fs_priv;
+  jdev->block_size = block_size;
+  jdev->ops = *ops;
     
-    console_write("journal: transaction ");
-    console_write_dec(h->transaction_id);
-    console_write(" started\n");
-    
-    return h;
-}
-
-int journal_log_block(struct journal_handle *handle, u64 block_lba, const void *data)
-{
-    if (!handle || !handle->transaction_active) return -1;
-    if (handle->modified_count >= handle->max_modified) return -1;
-    
-    handle->modified_blocks[handle->modified_count] = (u32)block_lba;
-    handle->modified_count++;
-    
+  u8 *sb_buf = kmalloc(block_size);
+  if (jdev->ops.read_journal_block(jdev, 0, sb_buf) < 0) {
+    kfree(sb_buf);
+    jdev->used = 0;
     return 0;
 }
 
-int journal_commit_transaction(struct journal_handle *handle)
-{
-    if (!handle || !handle->transaction_active) return -1;
-    if (handle->modified_count == 0) {
-        handle->transaction_active = 0;
+  struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
+  if (sb->s_header.h_magic != JBD_MAGIC) {
+    kfree(sb_buf);
+    jdev->used = 0;
         return 0;
     }
     
-    // Build descriptor block
-    u8 *descriptor_buf = kzalloc(JOURNAL_BLOCK_SIZE);
-    if (!descriptor_buf) return -1;
+  jdev->maxlen = sb->s_maxlen;
+  jdev->nblocks = sb->s_maxlen;
+  jdev->first = sb->s_first;
+  jdev->next_seq = sb->s_sequence;
     
-    struct journal_descriptor *desc = (struct journal_descriptor *)descriptor_buf;
-    desc->magic = JOURNAL_DESCRIPTOR_BLOCK;
-    desc->block_count = handle->modified_count;
-    for (u32 i = 0; i < handle->modified_count && i < (JOURNAL_BLOCK_SIZE - 8) / 4; i++) {
-        desc->blocks[i] = handle->modified_blocks[i];
+  kfree(sb_buf);
+  return jdev;
     }
     
-    u64 desc_lba = handle->journal_start_lba;
-    journal_write_block(desc_lba, descriptor_buf);
+int journal_recover(struct journal_dev *jdev) {
+  if (!jdev || !jdev->used)
+    return -1;
     
-    // Commit
-    u8 *commit_buf = kzalloc(JOURNAL_BLOCK_SIZE);
-    struct journal_commit *commit = (struct journal_commit *)commit_buf;
-    commit->magic = JOURNAL_COMMIT_BLOCK;
-    commit->transaction_id = handle->transaction_id;
+  console_write("jbd: starting recovery from seq=");
+  console_write_dec(jdev->next_seq);
+  console_write("\n");
     
-    // For simplicity, commit block goes right after descriptor
-    u64 commit_lba = handle->journal_start_lba + 1;
-    journal_write_block(commit_lba, commit_buf);
+  if (jdev->next_seq <= 1)
+    return 0;
     
-    console_write("journal: transaction ");
-    console_write_dec(handle->transaction_id);
-    console_write(" committed (");
-    console_write_dec(handle->modified_count);
-    console_write(" blocks)\n");
+  u32 current = jdev->first;
+  int replayed = 0;
     
-    kfree(descriptor_buf);
-    kfree(commit_buf);
-    
-    handle->transaction_active = 0;
-    if (handle->modified_blocks) {
-        kfree(handle->modified_blocks);
-        handle->modified_blocks = 0;
+  for (u32 seq = 1; seq < jdev->next_seq; seq++) {
+    u8 *hdr_buf = kmalloc(jdev->block_size);
+    if (jdev->ops.read_journal_block(jdev, current, hdr_buf) < 0) {
+      kfree(hdr_buf);
+      break;
     }
     
+    struct jbd_header *hdr = (struct jbd_header *)hdr_buf;
+    if (hdr->h_magic != JBD_MAGIC) {
+      kfree(hdr_buf);
+      break;
+    }
+
+    if (hdr->h_blocktype == JBD_DESCRIPTOR_BLOCK) {
+      struct jbd_block_tag *tag =
+          (struct jbd_block_tag *)(hdr_buf + sizeof(struct jbd_header));
+      u32 data_block = current + 1;
+      int done = 0;
+
+      while (!done) {
+        u32 blocknr = tag->t_blocknr;
+        if (tag->t_flags & JBD_TAG_LAST_TAG)
+          done = 1;
+
+        u8 *data_buf = kmalloc(jdev->block_size);
+        if (jdev->ops.read_journal_block(jdev, data_block, data_buf) == 0) {
+          jdev->ops.write_fs_block(jdev, blocknr, data_buf);
+          replayed++;
+        }
+        kfree(data_buf);
+        data_block++;
+        tag++;
+      }
+      current = data_block;
+    } else if (hdr->h_blocktype == JBD_COMMIT_BLOCK ||
+               hdr->h_blocktype == JBD_REVOKE_BLOCK) {
+      current++;
+    } else {
+      kfree(hdr_buf);
+      break;
+    }
+    kfree(hdr_buf);
+    }
+    
+  console_write("jbd: replayed ");
+  console_write_dec(replayed);
+  console_write(" blocks\n");
     return 0;
 }
 
-void journal_replay(void)
-{
-    if (!journal_state.initialized || !journal_state.dev) return;
+struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
+  for (int i = 0; i < MAX_JOURNAL_HANDLES; i++) {
+    if (!handles[i].active) {
+      handles[i].active = 1;
+      handles[i].jdev = jdev;
+      handles[i].transaction_id = jdev->next_seq;
+      handles[i].modified_count = 0;
+      return &handles[i];
+    }
+  }
+  return 0;
+}
     
-    // Check if there's a pending (committed but not checkpointed) transaction
-    u8 *block_buf = kmalloc(JOURNAL_BLOCK_SIZE);
-    if (!block_buf) return;
+int journal_log_block(struct journal_handle *handle, u32 fs_block,
+                      const void *data) {
+  if (!handle || !handle->active)
+    return -1;
+  if (handle->modified_count >= MAX_JBD_BLOCKS_PER_TX)
+    return -1;
     
-    // Read first journal block (should be descriptor if there's a pending transaction)
-    if (journal_read_block(journal_state.journal_start_lba, block_buf) < 0) {
-        kfree(block_buf);
-        return;
+  handle->fs_blocks[handle->modified_count] = fs_block;
+  handle->data_blocks[handle->modified_count] = data;
+  handle->modified_count++;
+  return 0;
     }
     
-    struct journal_descriptor *desc = (struct journal_descriptor *)block_buf;
-    if (desc->magic != JOURNAL_DESCRIPTOR_BLOCK) {
-        // No pending transaction
-        kfree(block_buf);
-        return;
+int journal_commit_transaction(struct journal_handle *handle) {
+  if (!handle || !handle->active)
+    return -1;
+  if (handle->modified_count == 0) {
+    handle->active = 0;
+    return 0;
     }
     
-    // Check for commit block
-    u8 *commit_buf = kmalloc(JOURNAL_BLOCK_SIZE);
-    journal_read_block(journal_state.journal_start_lba + 1, commit_buf);
-    struct journal_commit *commit = (struct journal_commit *)commit_buf;
-    
-    if (commit->magic != JOURNAL_COMMIT_BLOCK) {
-        // Transaction wasn't committed, discard
-        console_write("journal: found incomplete transaction, discarding\n");
-        kfree(block_buf);
+  struct journal_dev *jdev = handle->jdev;
+  u32 count = handle->modified_count;
+  u32 log_start =
+      jdev->first + (jdev->next_seq % (jdev->nblocks - jdev->first));
+
+  /* 1. Write the descriptor block. */
+  u8 *desc_buf = kzalloc(jdev->block_size);
+  struct jbd_header *hdr = (struct jbd_header *)desc_buf;
+  hdr->h_magic = JBD_MAGIC;
+  hdr->h_blocktype = JBD_DESCRIPTOR_BLOCK;
+  hdr->h_sequence = jdev->next_seq;
+
+  struct jbd_block_tag *tags =
+      (struct jbd_block_tag *)(desc_buf + sizeof(struct jbd_header));
+  for (u32 i = 0; i < count; i++) {
+    tags[i].t_blocknr = handle->fs_blocks[i];
+    tags[i].t_flags = (i == count - 1) ? JBD_TAG_LAST_TAG : 0;
+  }
+  jdev->ops.write_journal_block(jdev, log_start, desc_buf);
+  kfree(desc_buf);
+
+  /* 2. Write data blocks into the journal. */
+  for (u32 i = 0; i < count; i++) {
+    jdev->ops.write_journal_block(jdev, log_start + 1 + i,
+                                  handle->data_blocks[i]);
+  }
+
+  /* 3. Write the commit block. */
+  u8 *commit_buf = kzalloc(jdev->block_size);
+  struct jbd_header *chdr = (struct jbd_header *)commit_buf;
+  chdr->h_magic = JBD_MAGIC;
+  chdr->h_blocktype = JBD_COMMIT_BLOCK;
+  chdr->h_sequence = jdev->next_seq;
+  jdev->ops.write_journal_block(jdev, log_start + 1 + count, commit_buf);
         kfree(commit_buf);
-        return;
-    }
     
-    console_write("journal: replaying transaction ");
-    console_write_dec(commit->transaction_id);
-    console_write("\n");
+  /* 4. Update the superblock sequence. */
+  jdev->next_seq++;
+  u8 *sb_buf = kmalloc(jdev->block_size);
+  if (jdev->ops.read_journal_block(jdev, 0, sb_buf) == 0) {
+    struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
+    sb->s_sequence = jdev->next_seq;
+    jdev->ops.write_journal_block(jdev, 0, sb_buf);
+  }
+  kfree(sb_buf);
     
-    // For now, we just acknowledge the replay
-    console_write("journal: replay complete\n");
-    
-    kfree(commit_buf);
-    kfree(block_buf);
+  /* 5. Write data blocks into the filesystem. */
+  for (u32 i = 0; i < count; i++) {
+    jdev->ops.write_fs_block(jdev, handle->fs_blocks[i],
+                             handle->data_blocks[i]);
 }
 
-int journal_is_present(void)
-{
-    return journal_state.initialized ? 1 : 0;
+  handle->active = 0;
+  return 0;
 }

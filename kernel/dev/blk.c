@@ -35,32 +35,30 @@ struct blk_cache_entry {
 static struct blk_cache_entry bcache[CACHE_ENTRIES];
 static u32 bcache_tick = 0;
 
-static u32 le32(const u8 *p)
-{
+static u32 le32(const u8 *p) {
 	return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
-static u64 le64(const u8 *p)
-{
-	return (u64)le32(p) | ((u64)le32(p + 4) << 32);
-}
+static u64 le64(const u8 *p) { return (u64)le32(p) | ((u64)le32(p + 4) << 32); }
 
-static int partition_read(struct block_device *dev, u64 lba, u32 count, void *buffer)
-{
+static int partition_read(struct block_device *dev, u64 lba, u32 count,
+                          void *buffer) {
 	struct partition_device *part = (struct partition_device *)dev->priv;
-	if (!part || lba + count > dev->block_count) return -1;
+  if (!part || lba + count > dev->block_count)
+    return -1;
 	return blk_read_cached(part->parent, part->start_lba + lba, count, buffer);
 }
 
-static int partition_write(struct block_device *dev, u64 lba, u32 count, const void *buffer)
-{
+static int partition_write(struct block_device *dev, u64 lba, u32 count,
+                           const void *buffer) {
 	struct partition_device *part = (struct partition_device *)dev->priv;
-	if (!part || lba + count > dev->block_count) return -1;
+  if (!part || lba + count > dev->block_count)
+    return -1;
 	return blk_write_cached(part->parent, part->start_lba + lba, count, buffer);
 }
 
-static void blk_register_internal(struct block_device *dev, int scan_partitions)
-{
+static void blk_register_internal(struct block_device *dev,
+                                  int scan_partitions) {
 	if (blk_device_count < MAX_BLK_DEVICES) {
 		blk_devices[blk_device_count++] = dev;
 	}
@@ -69,10 +67,11 @@ static void blk_register_internal(struct block_device *dev, int scan_partitions)
 	}
 }
 
-static void make_partition_name(const char *parent, usize number, char *out, usize out_size)
-{
+static void make_partition_name(const char *parent, usize number, char *out,
+                                usize out_size) {
 	usize len = strlen(parent);
-	if (len > out_size - 4) len = out_size - 4;
+  if (len > out_size - 4)
+    len = out_size - 4;
 	memcpy(out, parent, len);
 	out[len++] = 'p';
 	if (number >= 10) {
@@ -82,10 +81,12 @@ static void make_partition_name(const char *parent, usize number, char *out, usi
 	out[len] = '\0';
 }
 
-static void register_partition(struct block_device *parent, usize number, u64 start_lba, u64 block_count)
-{
-	if (!parent || start_lba == 0 || block_count == 0) return;
-	if (partition_count >= MAX_BLK_PARTITIONS) return;
+static void register_partition(struct block_device *parent, usize number,
+                               u64 start_lba, u64 block_count) {
+  if (!parent || start_lba == 0 || block_count == 0)
+    return;
+  if (partition_count >= MAX_BLK_PARTITIONS)
+    return;
 
 	struct partition_device *part = &partitions[partition_count++];
 	memset(part, 0, sizeof(*part));
@@ -95,7 +96,8 @@ static void register_partition(struct block_device *parent, usize number, u64 st
 	char name[24];
 	make_partition_name(parent->name, number, name, sizeof(name));
 	char *persistent_name = kmalloc(strlen(name) + 1);
-	if (!persistent_name) return;
+  if (!persistent_name)
+    return;
 	memcpy(persistent_name, name, strlen(name) + 1);
 
 	part->blk.name = persistent_name;
@@ -115,23 +117,27 @@ static void register_partition(struct block_device *parent, usize number, u64 st
 	console_write("\n");
 }
 
-static int scan_gpt(struct block_device *dev, const u8 *mbr)
-{
+static int scan_gpt(struct block_device *dev, const u8 *mbr) {
 	int has_protective = 0;
 	for (int i = 0; i < 4; i++) {
 		const u8 *entry = mbr + 446 + i * 16;
-		if (entry[4] == 0xee) has_protective = 1;
+    if (entry[4] == 0xee)
+      has_protective = 1;
 	}
 
 	u8 header[CACHE_BLOCK_SIZE];
-	if (blk_read_cached(dev, 1, 1, header) < 0) return 0;
-	if (memcmp(header, "EFI PART", 8) != 0) return 0;
+  if (blk_read_cached(dev, 1, 1, header) < 0)
+    return 0;
+  if (memcmp(header, "EFI PART", 8) != 0)
+    return 0;
 
 	u64 entries_lba = le64(header + 72);
 	u32 entry_count = le32(header + 80);
 	u32 entry_size = le32(header + 84);
-	if (entry_count == 0 || entry_size < 128 || entry_size > 512) return 0;
-	if (entry_count > 128) entry_count = 128;
+  if (entry_count == 0 || entry_size < 128 || entry_size > 512)
+    return 0;
+  if (entry_count > 128)
+    entry_count = 128;
 
 	u8 sector[CACHE_BLOCK_SIZE];
 	usize found = 0;
@@ -139,8 +145,10 @@ static int scan_gpt(struct block_device *dev, const u8 *mbr)
 		u64 byte_offset = (u64)i * entry_size;
 		u64 lba = entries_lba + byte_offset / dev->block_size;
 		u32 off = (u32)(byte_offset % dev->block_size);
-		if (off + entry_size > dev->block_size) continue;
-		if (blk_read_cached(dev, lba, 1, sector) < 0) break;
+    if (off + entry_size > dev->block_size)
+      continue;
+    if (blk_read_cached(dev, lba, 1, sector) < 0)
+      break;
 		const u8 *entry = sector + off;
 
 		int empty = 1;
@@ -150,55 +158,56 @@ static int scan_gpt(struct block_device *dev, const u8 *mbr)
 				break;
 			}
 		}
-		if (empty) continue;
+    if (empty)
+      continue;
 
 		u64 first_lba = le64(entry + 32);
 		u64 last_lba = le64(entry + 40);
-		if (last_lba < first_lba) continue;
+    if (last_lba < first_lba)
+      continue;
 		register_partition(dev, i + 1, first_lba, last_lba - first_lba + 1);
 		found++;
 	}
-
-	(void)has_protective;
 	return found > 0;
 }
 
-static int scan_mbr(struct block_device *dev, const u8 *mbr)
-{
+static int scan_mbr(struct block_device *dev, const u8 *mbr) {
 	usize found = 0;
 	for (int i = 0; i < 4; i++) {
 		const u8 *entry = mbr + 446 + i * 16;
 		u8 type = entry[4];
-		if (type == 0 || type == 0xee) continue;
+    if (type == 0 || type == 0xee)
+      continue;
 		u32 start = le32(entry + 8);
 		u32 count = le32(entry + 12);
-		if (start == 0 || count == 0) continue;
+    if (start == 0 || count == 0)
+      continue;
 		register_partition(dev, i + 1, start, count);
 		found++;
 	}
 	return found > 0;
 }
 
-static void blk_scan_partitions(struct block_device *dev)
-{
-	if (!dev || !dev->read_blocks || dev->block_size != CACHE_BLOCK_SIZE) return;
-	if (dev->block_count != 0 && dev->block_count < 2) return;
+static void blk_scan_partitions(struct block_device *dev) {
+  if (!dev || !dev->read_blocks || dev->block_size != CACHE_BLOCK_SIZE)
+    return;
+  if (dev->block_count != 0 && dev->block_count < 2)
+    return;
 
 	u8 mbr[CACHE_BLOCK_SIZE];
-	if (blk_read_cached(dev, 0, 1, mbr) < 0) return;
-	if (mbr[510] != 0x55 || mbr[511] != 0xaa) return;
+  if (blk_read_cached(dev, 0, 1, mbr) < 0)
+    return;
+  if (mbr[510] != 0x55 || mbr[511] != 0xaa)
+    return;
 
-	if (scan_gpt(dev, mbr)) return;
+  if (scan_gpt(dev, mbr))
+    return;
 	scan_mbr(dev, mbr);
 }
 
-void blk_register(struct block_device *dev)
-{
-	blk_register_internal(dev, 1);
-}
+void blk_register(struct block_device *dev) { blk_register_internal(dev, 1); }
 
-struct block_device *blk_get(const char *name)
-{
+struct block_device *blk_get(const char *name) {
 	for (usize i = 0; i < blk_device_count; i++) {
 		if (strcmp(blk_devices[i]->name, name) == 0) {
 			return blk_devices[i];
@@ -207,24 +216,17 @@ struct block_device *blk_get(const char *name)
 	return 0;
 }
 
-usize blk_count(void)
-{
-	return blk_device_count;
-}
+usize blk_count(void) { return blk_device_count; }
 
-struct block_device *blk_at(usize index)
-{
-	if (index >= blk_device_count) return 0;
+struct block_device *blk_at(usize index) {
+  if (index >= blk_device_count)
+    return 0;
 	return blk_devices[index];
 }
 
-void blk_cache_init(void)
-{
-	memset(bcache, 0, sizeof(bcache));
-}
+void blk_cache_init(void) { memset(bcache, 0, sizeof(bcache)); }
 
-static struct blk_cache_entry *bcache_find(struct block_device *dev, u64 lba)
-{
+static struct blk_cache_entry *bcache_find(struct block_device *dev, u64 lba) {
 	for (int i = 0; i < CACHE_ENTRIES; i++) {
 		if (bcache[i].valid && bcache[i].dev == dev && bcache[i].lba == lba) {
 			bcache[i].last_used = ++bcache_tick;
@@ -234,8 +236,7 @@ static struct blk_cache_entry *bcache_find(struct block_device *dev, u64 lba)
 	return 0;
 }
 
-static struct blk_cache_entry *bcache_evict(void)
-{
+static struct blk_cache_entry *bcache_evict(void) {
 	int oldest_idx = 0;
 	u32 oldest_tick = 0xFFFFFFFF;
 	
@@ -261,9 +262,10 @@ static struct blk_cache_entry *bcache_evict(void)
 	return entry;
 }
 
-int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer)
-{
-	if (!dev || !dev->read_blocks) return -1;
+int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
+                    void *buffer) {
+  if (!dev || !dev->read_blocks)
+    return -1;
 	if (dev->block_size != CACHE_BLOCK_SIZE) {
 		return dev->read_blocks(dev, lba, count, buffer);
 	}
@@ -291,9 +293,10 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer)
 	return 0;
 }
 
-int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *buffer)
-{
-	if (!dev || !dev->write_blocks) return -1;
+int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
+                     const void *buffer) {
+  if (!dev || !dev->write_blocks)
+    return -1;
 	if (dev->block_size != CACHE_BLOCK_SIZE) {
 		return dev->write_blocks(dev, lba, count, buffer);
 	}
@@ -314,23 +317,23 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *b
 		memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
 		entry->dirty = true;
 		
-		// Write-through for safety right now
-		if (dev->write_blocks(dev, current_lba, 1, entry->data) == 0) {
-			entry->dirty = false;
-		}
+    /*
+     * Write-back cache is enabled: writes stay dirty until eviction or an
+     * explicit blk_cache_flush().
+     */
 	}
 	return 0;
 }
 
-void blk_cache_flush(struct block_device *dev)
-{
+void blk_cache_flush(struct block_device *dev) {
 	if (!dev) {
 		for (usize i = 0; i < blk_device_count; i++) {
 			blk_cache_flush(blk_devices[i]);
 		}
 		return;
 	}
-	if (!dev->write_blocks) return;
+  if (!dev->write_blocks)
+    return;
 	for (int i = 0; i < CACHE_ENTRIES; i++) {
 		if (bcache[i].valid && bcache[i].dev == dev && bcache[i].dirty) {
 			dev->write_blocks(dev, bcache[i].lba, 1, bcache[i].data);

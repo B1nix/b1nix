@@ -339,33 +339,34 @@ static void expand_env(const char *in, char *out) {
 }
 
 static int parse_cmd(char *cmd, char **args, int max_args) {
-	int argc = 0;
+	int count = 0;
 	char *p = cmd;
-	while (*p && argc < max_args) {
+	int in_quote = 0;
+	
+	while (*p && count < max_args) {
 		while (*p == ' ') p++;
 		if (!*p) break;
 		
-		args[argc++] = p;
-		int in_quote = 0;
+		args[count++] = p;
 		char *dst = p;
 		while (*p) {
-			if (*p == '\\' && !in_quote) {
+			if (*p == '\\' && *(p + 1) == '"') {
 				p++;
-				if (*p) *dst++ = *p++;
-			} else if ((*p == '"' || *p == '\'') && (!in_quote || in_quote == *p)) {
-				if (in_quote) in_quote = 0;
-				else in_quote = *p;
-				p++;
-			} else if (*p == ' ' && !in_quote) {
-				p++;
-				break;
-			} else {
 				*dst++ = *p++;
+				continue;
 			}
+			if (*p == '"') {
+				in_quote = !in_quote;
+				p++;
+				continue;
+			}
+			if (!in_quote && *p == ' ') break;
+			*dst++ = *p++;
 		}
+		if (*p) p++;
 		*dst = '\0';
 	}
-	return argc;
+	return count;
 }
 
 struct shell_redir {
@@ -722,10 +723,17 @@ static void sh_execute_line(char *line, char *cwd) {
 		char *end = p;
 		int op = 0; // 0: none, 1: &&, 2: ||, 3: ;
 		
+		int in_quote = 0;
 		while (*end) {
-			if (end[0] == '&' && end[1] == '&') { op = 1; end[0] = '\0'; break; }
-			if (end[0] == '|' && end[1] == '|') { op = 2; end[0] = '\0'; break; }
-			if (end[0] == ';') { op = 3; end[0] = '\0'; break; }
+			if ((*end == '"' || *end == '\'') && (in_quote == 0 || in_quote == *end)) {
+				if (in_quote) in_quote = 0;
+				else in_quote = *end;
+			}
+			if (!in_quote) {
+				if (end[0] == '&' && end[1] == '&') { op = 1; end[0] = '\0'; break; }
+				if (end[0] == '|' && end[1] == '|') { op = 2; end[0] = '\0'; break; }
+				if (end[0] == ';') { op = 3; end[0] = '\0'; break; }
+			}
 			end++;
 		}
 		

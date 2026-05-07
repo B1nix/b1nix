@@ -11,6 +11,17 @@ Status legend:
 Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 `Shell/coreutils` branches live in [`docs/posix-branches.md`](posix-branches.md).
 
+## Current POSIX Estimate
+
+- Overall practical POSIX compatibility: roughly 40-48%.
+- `VFS/path/files`: roughly 65-72%.
+- `Shell/coreutils`: roughly 60-68%.
+
+These percentages mean "can run small real workflows", not "passes a POSIX
+conformance suite". The biggest blockers remain durable filesystem semantics,
+permission enforcement, full shell parsing, robust pipeline/job-control behavior,
+and broader utility flag compatibility.
+
 ## M0: Boot and Diagnostics
 
 - [x] `done` Build freestanding kernel ELF.
@@ -87,7 +98,7 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 - [x] `done` Add ACL fields and permission metadata in VFS nodes.
 - [x] `initial` Add symlinks, hard links, and `readlink`.
 - [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
-- [x] `initial` Add dot, dot-dot, and duplicate-slash path normalization at syscall/VFS boundaries.
+- [x] `partial` Add dot, dot-dot, duplicate-slash, symlink-loop, and common error path normalization at syscall/VFS boundaries.
 - [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
 - [ ] `planned` Add full permissions and mount-aware path normalization.
 
@@ -119,9 +130,9 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 - [x] `done` Add initramfs fallback tree.
 - [x] `partial` Add FAT32 read/import path with limited feature support.
 - [x] `partial` Add ext1 legacy read-only support.
-- [x] `partial` Add ext2 read/write support (bitmaps and indirect blocks).
+- [x] `partial` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
 - [x] `stub` Add ext3/ext4 source scaffolding.
-- [ ] `planned` Add complete ext2 indirect blocks, timestamps, durable directory updates, and fsck-friendly metadata.
+- [ ] `planned` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 
 ## M9: Hardware Drivers
 
@@ -310,6 +321,7 @@ tables.
 - [x] `initial` Add `make root-image` and `make run-root` workflows.
 - [x] `initial` Overlay attached ext2 root over initramfs fallback files.
 - [x] `done` Add mount listing for active VFS mount table entries.
+- [x] `stub` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
 - [ ] `planned` Add complete mount option handling.
 
 M21 has an initial persistent-root path for the current boot model, but it is
