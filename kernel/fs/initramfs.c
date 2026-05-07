@@ -2,6 +2,8 @@
 #include <b1nix/console.h>
 #include <b1nix/initramfs.h>
 
+#include "../../build/x86/initramfs_native_smoke.inc"
+
 static const unsigned char vfs_init_elf[] = {
 	0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00,
 	0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00, 0x40, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -31,19 +33,37 @@ static const unsigned char vfs_hello_elf[] = {
 	0x00
 };
 
+static const char initramfs_fstab[] =
+	"# <source>    <target> <fstype>    <options>  <dump> <pass>\n"
+	"initramfs     /        initramfs   defaults   0      0\n"
+	"virtio-blk0   /mnt     fat32       noauto     0      0\n"
+	"sata0         /mnt     ext2        noauto     0      0\n"
+	"nvme0         /mnt     ext2        noauto     0      0\n"
+	"nvme0         /btrfs   btrfs       noauto     0      0\n";
+
+static const char posix_smoke_script[] =
+	"#!/bin/sh\n"
+	"echo \"POSIX-SMOKE: start\"\n"
+	"basename /tmp/a/b\n"
+	"dirname /tmp/a/b\n"
+	"touch /tmp/posix_test\n"
+	"[ -f /tmp/posix_test ] && echo \"ok touch\" || echo \"fail touch\"\n"
+	"printf \"hello world\\n\"\n"
+	"true && echo \"ok and\"\n"
+	"false || echo \"ok or\"\n"
+	"mkdir -p /tmp/a/b/c\n"
+	"[ -d /tmp/a/b/c ] && echo \"ok mkdir-p\" || echo \"fail mkdir-p\"\n"
+	"rm -rf /tmp/a\n"
+	"echo \"POSIX-SMOKE: done\"\n";
+
 static const struct initramfs_file files[] = {
 	{ "/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf), INITRAMFS_EXECUTABLE },
 	{ "/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE },
 	{ "/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf), INITRAMFS_EXECUTABLE },
+	{ "/bin/native-smoke", (const char *)vfs_native_smoke_elf, sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE },
 	{ "/etc/motd", "welcome to b1nix m4\n", 23, 0 },
-	{ "/etc/fstab",
-	  "# <source>    <target> <fstype>    <options>  <dump> <pass>\n"
-	  "initramfs     /        initramfs   defaults   0      0\n"
-	  "virtio-blk0   /mnt     fat32       noauto     0      0\n"
-	  "sata0         /mnt     ext2        noauto     0      0\n"
-	  "nvme0        /mnt     ext2        noauto     0      0\n"
-	  "nvme0        /btrfs   btrfs       noauto     0      0\n",
-	  333, 0 },
+	{ "/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0 },
+	{ "/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1, 0 },
 	{ "/README", "initramfs is alive\n", 20, 0 },
 };
 
@@ -61,16 +81,12 @@ const struct initramfs_file *initramfs_find(const char *path)
 			return &files[i];
 		}
 	}
-
 	return 0;
 }
 
 const struct initramfs_file *initramfs_get(usize index)
 {
-	if (index >= initramfs_count()) {
-		return 0;
-	}
-
+	if (index >= initramfs_count()) return 0;
 	return &files[index];
 }
 

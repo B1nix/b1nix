@@ -797,6 +797,19 @@ static int init_main(int argc, const char **argv)
 	(void)argv;
 
 	syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
+	u64 native_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/native-smoke", 0, 0, 0);
+	if (native_pid != (u64)-1) {
+		int native_status = 0;
+		syscall_dispatch(SYS_WAIT, native_pid, (u64)(usize)&native_status, 0, 0);
+		if (native_status == 0) {
+			uwrite("NATIVE-SMOKE: done\n");
+		} else {
+			uwrite("NATIVE-SMOKE: fail\n");
+		}
+	} else {
+		uwrite("NATIVE-SMOKE: spawn-fail\n");
+	}
+
 	u64 smoke_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/m22-smoke", 0, 0, 0);
 	if (smoke_pid != (u64)-1) {
 		int smoke_status = 0;
@@ -807,6 +820,12 @@ static int init_main(int argc, const char **argv)
 	if (stress_pid != (u64)-1) {
 		int stress_status = 0;
 		syscall_dispatch(SYS_WAIT, stress_pid, (u64)(usize)&stress_status, 0, 0);
+	}
+	
+	u64 shell_smoke_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/shell-smoke", 0, 0, 0);
+	if (shell_smoke_pid != (u64)-1) {
+		int status = 0;
+		syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0);
 	}
 
 	syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
@@ -1105,12 +1124,22 @@ static int b1fetch_main(int argc, const char **argv)
 	return 0;
 }
 
+int shell_smoke_main(int argc, const char **argv)
+{
+	(void)argc;
+	(void)argv;
+	char cwd[128] = "/";
+	sh_run_script("/etc/posix-smoke.sh", cwd);
+	return 0;
+}
+
 void user_register_builtin_programs(void)
 {
 	user_register_program("/bin/init", init_main);
 	user_register_program("/bin/sh", sh_main);
 	user_register_program("/bin/m22-smoke", m22_smoke_main);
 	user_register_program("/bin/m24-stress", m24_stress_main);
+	user_register_program("/bin/shell-smoke", shell_smoke_main);
 
 	/* M22 — Core Terminal Utilities (BusyBox multi-call) */
 
@@ -1126,6 +1155,9 @@ void user_register_builtin_programs(void)
 	user_register_program("/bin/chown", busybox_main);
 	user_register_program("/bin/ln", busybox_main);
 	user_register_program("/bin/readlink", busybox_main);
+	user_register_program("/bin/touch", busybox_main);
+	user_register_program("/bin/basename", busybox_main);
+	user_register_program("/bin/dirname", busybox_main);
 
 	/* System utilities */
 	user_register_program("/bin/ps", busybox_main);
@@ -1136,6 +1168,7 @@ void user_register_builtin_programs(void)
 	/* Text utilities */
 	user_register_program("/bin/cat", busybox_main);
 	user_register_program("/bin/echo", busybox_main);
+	user_register_program("/bin/printf", busybox_main);
 	user_register_program("/bin/head", busybox_main);
 	user_register_program("/bin/tail", busybox_main);
 	user_register_program("/bin/grep", busybox_main);
@@ -1166,6 +1199,8 @@ void user_register_builtin_programs(void)
 	/* Misc */
 	user_register_program("/bin/true", busybox_main);
 	user_register_program("/bin/false", busybox_main);
+	user_register_program("/bin/test", busybox_main);
+	user_register_program("/bin/[", busybox_main);
 	user_register_program("/bin/yes", busybox_main);
 	user_register_program("/bin/sleep", busybox_main);
 	user_register_program("/bin/whoami", busybox_main);

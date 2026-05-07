@@ -22,6 +22,7 @@ LIBC_OBJS := \
 
 BINARIES := \
 	$(BUILD)/bin/hello \
+	$(BUILD)/bin/native_smoke \
 	$(BUILD)/bin/tcc
 
 .PHONY: all clean install
@@ -48,6 +49,11 @@ $(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o --whole-archive $(LIB) --no-whole-archive
+
+$(BUILD)/bin/native_smoke: bin/native_smoke.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(BUILD)/bin/native_smoke.o
 
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)

@@ -335,7 +335,7 @@ static struct vfs_node *vfs_find_node_internal(const char *path, int follow_fina
 {
 	if (!root_node) return 0;
 	if (!path) return 0;
-	if (depth > 8) return 0;
+	if (depth > 16) return ERR_PTR(-ELOOP);
 	if (path[0] == '\0' || (path[0] == '/' && path[1] == '\0')) {
 		return root_node;
 	}
@@ -724,6 +724,7 @@ int vfs_open(const char *path)
 int vfs_open_flags(const char *path, int flags)
 {
 	struct vfs_node *node = vfs_find_node(path);
+	if (IS_ERR(node)) return (int)PTR_ERR(node);
 	if (node == 0 && (flags & B1NIX_O_CREAT)) {
 		int err = vfs_create(path, "");
 		if (err != 0) return err;
@@ -764,6 +765,7 @@ isize vfs_read(int handle, char *buffer, usize size)
 {
 	struct vfs_handle *h = get_handle(handle);
 	if (!h) return -EBADF;
+
 	if (h->kind == VFS_HANDLE_PIPE_READ) {
 		struct vfs_pipe *pipe = h->pipe;
 		if (!pipe || !pipe->used) return -EIO;
@@ -813,6 +815,7 @@ isize vfs_write(int handle, const char *buffer, usize size)
 {
 	struct vfs_handle *h = get_handle(handle);
 	if (!h) return -EBADF;
+
 	if (h->kind == VFS_HANDLE_PIPE_WRITE) {
 		struct vfs_pipe *pipe = h->pipe;
 		if (!pipe || !pipe->used) return -EIO;
@@ -1335,11 +1338,38 @@ isize vfs_getdents(int handle, struct dirent *buf, usize max_entries)
 	struct vfs_node *dir = h->node;
 	if (!dir || dir->type != VFS_DIRECTORY || !buf) return -EINVAL;
 
-	usize skipped = 0;
 	usize count = 0;
+
+	/* 0: . */
+	if (h->offset == 0 && count < max_entries) {
+		copy_path(buf[count].name, 64, ".");
+		buf[count].type = (u32)VFS_DIRECTORY;
+		buf[count].is_dir = 1;
+		buf[count].is_exec = 1;
+		buf[count].size = 0;
+		count++;
+		h->offset++;
+	}
+
+	/* 1: .. */
+	if (h->offset == 1 && count < max_entries) {
+		copy_path(buf[count].name, 64, "..");
+		struct vfs_node *parent = dir->parent ? dir->parent : dir;
+		buf[count].type = (u32)VFS_DIRECTORY;
+		buf[count].is_dir = 1;
+		buf[count].is_exec = 1;
+		buf[count].size = parent->size;
+		count++;
+		h->offset++;
+	}
+
+	if (count >= max_entries) return (isize)count;
+
+	usize skipped = 0;
+	usize child_count = 0;
 	struct vfs_node *child = dir->first_child;
 	while (child && count < max_entries) {
-		if (skipped++ < h->offset) {
+		if (skipped++ < h->offset - 2) {
 			child = child->next_sibling;
 			continue;
 		}
@@ -1353,9 +1383,10 @@ isize vfs_getdents(int handle, struct dirent *buf, usize max_entries)
 		buf[count].is_exec = (child->mode & 0111) ? 1 : 0;
 		buf[count].size = child->size;
 		count++;
+		child_count++;
 		child = child->next_sibling;
 	}
-	h->offset += count;
+	h->offset += child_count;
 	return (isize)count;
 }
 

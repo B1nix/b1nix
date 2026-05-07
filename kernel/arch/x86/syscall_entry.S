@@ -3,13 +3,25 @@
 
 .extern syscall_dispatch
 
+.section .bss
+.align 16
+.global x86_syscall_stack_bottom
+x86_syscall_stack_bottom:
+    .skip 65536
+.global x86_syscall_stack_top
+x86_syscall_stack_top:
+
+.align 8
+x86_syscall_saved_user_rsp:
+    .quad 0
+
+.section .text
+.code64
+
 /* SYSCALL entry point */
 .global x86_syscall_entry
 .type x86_syscall_entry, @function
 x86_syscall_entry:
-    /* Swap GS to kernel if needed (B1NIX doesn't use GS for TLS yet) */
-    /* For now, just save registers */
-    
     /* SYSCALL convention:
        %rdi = syscall number
        %rsi, %rdx, %r10, %r8, %r9 = args
@@ -17,13 +29,10 @@ x86_syscall_entry:
        %r11 = return RFLAGS (saved by CPU)
        Return value in %rax
     */
-    
-    /* B1NIX syscall_dispatch convention:
-       syscall_dispatch(num, a0, a1, a2, a3)
-       Wait, syscall_dispatch in syscall.c takes 5 args.
-    */
-    
-    /* We need to save all caller-saved registers */
+
+    movq %rsp, x86_syscall_saved_user_rsp(%rip)
+    leaq x86_syscall_stack_top(%rip), %rsp
+
     pushq %rcx
     pushq %r11
     pushq %rbp
@@ -32,13 +41,11 @@ x86_syscall_entry:
     pushq %r13
     pushq %r14
     pushq %r15
-    
-    /* Align stack and call C dispatcher */
-    /* %rdi is already syscall num */
-    /* %rsi is arg0 */
-    /* %rdx is arg1 */
-    /* %r10 -> %rcx (arg2) */
-    /* %r8  is arg3 */
+    /*
+     * B1NIX syscall_dispatch(num, a0, a1, a2, a3):
+     * %rdi already holds num, %rsi/%rdx are a0/a1, %r10 becomes a2,
+     * and %r8 is already the fifth SysV argument.
+     */
     movq %r10, %rcx
     
     call syscall_dispatch
@@ -52,5 +59,7 @@ x86_syscall_entry:
     popq %rbp
     popq %r11
     popq %rcx
+
+    movq x86_syscall_saved_user_rsp(%rip), %rsp
     
     sysretq

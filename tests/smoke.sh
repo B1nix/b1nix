@@ -140,6 +140,8 @@ fi
 # ── M22 utility init-path smoke ──
 echo ""
 echo "[TEST] M22 utilities..."
+check_output "$LOG" "NATIVE-SMOKE: ok" "native ELF enters ring3 and performs syscall"
+check_output "$LOG" "NATIVE-SMOKE: done" "native ELF exits cleanly"
 check_output "$LOG" "M22-SMOKE: start" "M22 utility smoke starts from init"
 check_output "$LOG" "M22-SMOKE: ok pwd" "pwd utility runs"
 check_output "$LOG" "M22-SMOKE: ok cp" "cp utility runs"
@@ -154,8 +156,9 @@ check_output "$LOG" "M22-SMOKE: ok date" "date utility runs"
 check_output "$LOG" "M22-SMOKE: ok uname" "uname utility runs"
 check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
 
-check_output "$LOG" "M24-STRESS: start" "M24 stress starts"
 check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
+
+check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
 
 # ── Network tests (x86 only) ──
 if [ "$ARCH" = "x86" ]; then

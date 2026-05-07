@@ -1,11 +1,55 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/types.h>
+
+#define X86_TSS_SELECTOR 0x28
+
+struct x86_tss {
+	u32 reserved0;
+	u64 rsp0;
+	u64 rsp1;
+	u64 rsp2;
+	u64 reserved1;
+	u64 ist1;
+	u64 ist2;
+	u64 ist3;
+	u64 ist4;
+	u64 ist5;
+	u64 ist6;
+	u64 ist7;
+	u64 reserved2;
+	u16 reserved3;
+	u16 iomap_base;
+} __attribute__((packed));
+
+static struct x86_tss x86_tss __attribute__((aligned(16)));
 
 void x86_idt_init(void);
 void x86_pic_init(void);
 void x86_timer_init(void);
 
 extern void x86_syscall_entry(void);
+extern u64 gdt64_tss[2];
+extern char x86_syscall_stack_top[];
+
+static void x86_tss_init(void)
+{
+	u64 base = (u64)&x86_tss;
+	u32 limit = sizeof(x86_tss) - 1;
+
+	x86_tss.rsp0 = (u64)x86_syscall_stack_top;
+	x86_tss.iomap_base = sizeof(x86_tss);
+
+	gdt64_tss[0] =
+		((u64)(limit & 0xffff)) |
+		((base & 0xffffff) << 16) |
+		((u64)0x89 << 40) |
+		((u64)((limit >> 16) & 0xf) << 48) |
+		((u64)((base >> 24) & 0xff) << 56);
+	gdt64_tss[1] = base >> 32;
+
+	__asm__ volatile("ltr %0" : : "r"((u16)X86_TSS_SELECTOR) : "memory");
+}
 
 void x86_syscall_init(void)
 {
@@ -26,6 +70,7 @@ void x86_syscall_init(void)
 
 void arch_init(void)
 {
+	x86_tss_init();
 	x86_idt_init();
 	x86_pic_init();
 	x86_timer_init();

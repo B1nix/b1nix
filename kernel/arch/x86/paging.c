@@ -54,6 +54,13 @@ static u64 *table_from_entry(u64 entry)
 	return (u64 *)(usize)phys;
 }
 
+static u64 table_to_phys(u64 *table)
+{
+	u64 phys = (u64)(usize)table;
+	if (phys >= DIRECT_MAP_BASE) phys -= DIRECT_MAP_BASE;
+	return phys;
+}
+
 static u64 *alloc_page_table(void)
 {
 	u64 frame = pmm_alloc_frame();
@@ -75,16 +82,27 @@ static u64 *ensure_child_table(u64 *parent, usize index)
 {
 	if ((parent[index] & VMM_PRESENT) == 0) {
 		u64 *child = alloc_page_table();
-		u64 phys_child = (u64)(usize)child;
-		if (phys_child >= DIRECT_MAP_BASE) {
-			phys_child -= DIRECT_MAP_BASE;
-		}
-
-		parent[index] = phys_child | VMM_PRESENT | VMM_WRITABLE;
+		parent[index] = table_to_phys(child) | VMM_PRESENT | VMM_WRITABLE;
 		return child;
 	}
 
 	return table_from_entry(parent[index]);
+}
+
+static u64 *split_huge_page(u64 *pd, usize index)
+{
+	u64 entry = pd[index];
+	u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
+	u64 flags = entry & ~PAGE_ENTRY_ADDRESS_MASK;
+	flags &= ~HUGE_PAGE_FLAG;
+
+	u64 *pt = alloc_page_table();
+	for (usize i = 0; i < 512; i++) {
+		pt[i] = (base + i * PAGE_SIZE) | flags;
+	}
+
+	pd[index] = table_to_phys(pt) | flags;
+	return pt;
 }
 
 void vmm_init(void)
@@ -131,12 +149,18 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags)
 
 	u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual_address));
 	u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
-
-	if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
-		panic("vmm_map_page cannot split huge pages yet");
+	if ((flags & VMM_USER) != 0) {
+		kernel_pml4[pml4_index(virtual_address)] |= VMM_USER;
+		pdpt[pdpt_index(virtual_address)] |= VMM_USER;
 	}
 
-	u64 *pt = ensure_child_table(pd, pd_index(virtual_address));
+	u64 *pt;
+	if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
+		pt = split_huge_page(pd, pd_index(virtual_address));
+	} else {
+		pt = ensure_child_table(pd, pd_index(virtual_address));
+	}
+	if ((flags & VMM_USER) != 0) pd[pd_index(virtual_address)] |= VMM_USER;
 	pt[pt_index(virtual_address)] = (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
 	invalidate_page(virtual_address);
 }

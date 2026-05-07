@@ -71,7 +71,7 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 - [x] `initial` Add syscall `copyin`/`copyout`/`copyinstr` helpers.
 - [x] `partial` Add built-in program fallback when ELF loading fails.
 - [x] `done` Add hardware-enforced ring3 userspace entry/return for normal programs.
-- [x] `done` Add arbitrary native ELF execution with real user registers and shared page tables.
+- [x] `initial` Add native ELF execution with real user registers and shared page tables.
 
 ## M5: VFS and Devices
 
@@ -85,7 +85,7 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 - [x] `done` Add `/dev` integration for terminal-backed stdin/stdout/stderr.
 - [x] `done` Add VFS mount table and mountpoint dispatch.
 - [x] `done` Add ACL fields and permission metadata in VFS nodes.
-- [ ] `planned` Add symlinks, hard links, `readlink`, full permissions, and robust path normalization.
+- [x] `initial` Add symlinks, hard links, and `readlink`.
 - [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
 - [x] `initial` Add dot, dot-dot, and duplicate-slash path normalization at syscall/VFS boundaries.
 - [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
@@ -150,12 +150,12 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 ## M11: Shell and Utilities
 
 - [x] `done` Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
-- [x] `done` Pipes and redirection.
+- [x] `partial` Pipes and redirection.
 - [x] `done` Environment variables.
-- [x] `done` Job control.
+- [x] `partial` Job control.
 - [x] `done` PATH lookup against VFS.
 - [x] `done` Descriptor redirection for `<`, `>`, `>>`, `2>`, and descriptor duplication.
-- [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
+- [x] `initial` Pipeline execution through real `pipe()` and `dup2()`.
 - [x] `done` Add `selfhost` status command.
 - [ ] `planned` Add full background-job tracking and POSIX terminal job control.
 
@@ -221,12 +221,12 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
-- [x] `done` POSIX Process Management: `fork()`, standard `execve()`, `waitpid()` initial ABI.
-- [x] `done` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
-- [x] `done` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
-- [x] `done` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
-- [x] `done` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
-- [x] `done` POSIX Terminal: `ioctl()` and `termios` support for TTY.
+- [x] `initial` POSIX Process Management: `fork()`, `execve()`, and `waitpid()` initial ABI.
+- [x] `initial` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
+- [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
+- [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
+- [x] `initial` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
+- [x] `initial` POSIX Terminal: `ioctl()` and `termios` support for TTY.
 - [x] `done` Add syscall ABI constants and userspace syscall header mirrors.
 - [x] `done` Add `docs/abi.md` for the userspace ELF ABI and calling convention.
 - [x] `initial` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
@@ -238,7 +238,7 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 
 - [x] `initial` Load ELF64 executables from VFS instead of relying only on built-in programs.
 - [x] `partial` Build a user address-space record per process.
-- [x] `done` Add syscall `copyin`/`copyout` helpers for safe user pointers.
+- [x] `initial` Add syscall `copyin`/`copyout` helpers for user pointers.
 - [x] `initial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics.
 - [x] `initial` Implement `execve()` as image replacement, not only built-in dispatch.
 - [x] `initial` Add process exit status propagation and zombie reaping semantics.
@@ -250,9 +250,10 @@ M18 establishes the loader and process-image ABI while B1NIX still uses kernel
 threads as the execution substrate. ELF64 files are read through VFS, PT_LOAD
 segments are copied into per-process image state, initial stack metadata is
 constructed with `argc`, `argv`, `envp`, and basic auxv entries, and `/bin/init`
-can boot from a VFS-loaded ELF image before starting the shell. Full
-hardware-enforced ring3 entry and copy-on-write address spaces remain follow-up
-work.
+can boot from a VFS-loaded ELF image before starting the shell. Hardware
+ring3 entry and native ELF syscall/exit smoke now work on x86_64. Copy-on-write
+address spaces, strict user-pointer validation, and full ELF dynamic behavior
+remain follow-up work.
 
 ## M19: Process Model and FD Tables
 
@@ -299,40 +300,48 @@ tables.
 
 ## M21: Persistent Root Filesystem
 
-- [x] `done` Boot with a persistent root filesystem from a disk image.
-- [x] `done` Add mountpoints and a real `mount`/`umount` VFS model.
-- [x] `done` Stabilize writable ext2 as the first reliable root filesystem target.
-- [x] `done` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`).
-- [x] `done` Flush block cache on shutdown and reboot.
+- [x] `initial` Boot with a persistent root filesystem from a disk image.
+- [x] `initial` Add mountpoints and a real `mount`/`umount` VFS model.
+- [x] `initial` Stabilize writable ext2 as the first reliable root filesystem target.
+- [x] `initial` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`).
+- [x] `initial` Flush block cache on shutdown and reboot.
 - [x] `done` Add `/etc`, `/bin`, `/dev`, `/home`, `/tmp`, and `/var` layout.
-- [x] `done` Add an image creation/install script for local development.
-- [x] `done` Add `make root-image` and `make run-root` workflows.
+- [x] `initial` Add an image creation/install script for local development.
+- [x] `initial` Add `make root-image` and `make run-root` workflows.
 - [x] `initial` Overlay attached ext2 root over initramfs fallback files.
 - [x] `done` Add mount listing for active VFS mount table entries.
 - [ ] `planned` Add complete mount option handling.
 
-M21 is complete for the current boot model. The VFS tracks mounted sources in a
+M21 has an initial persistent-root path for the current boot model, but it is
+not fully closed. The VFS tracks mounted sources in a
 mount table and exposes `mount()`, `umount()`, and `sync()` syscalls. The root
 tree is initialized with the standard terminal OS layout, and `make root-image`
 creates a seeded ext2 disk. When that disk is attached as `virtio-blk0`, ext2 is
 mounted at `/` and overlays the initramfs fallback files, so persistent files can
-live at the root while built-in `/bin/init` remains available until the full
-disk userland is populated.
+live at the root while built-in `/bin/init` remains available until the full disk
+userland is populated. Remaining work: real hardware block-device coverage,
+mount option semantics, stronger ext2 durability tests, and clean recovery after
+unclean shutdown.
 
 ## M22: Core Terminal Utilities
 
-- [x] `done` Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
-- [x] `done` Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
-- [x] `done` Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
-- [x] `done` Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
+- [x] `initial` Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
+- [x] `initial` Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
+- [x] `initial` Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
+- [x] `initial` Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
 - [x] `done` Keep BusyBox-style multi-call dispatch for small binaries.
-- [x] `done` Add `clear`, `mem`, `dmesg`, `ifconfig`, `ping`, `nc`, and `wget` utilities.
+- [x] `initial` Add `clear`, `mem`, `dmesg`, `ifconfig`, `ping`, `nc`, and `wget` utilities.
 - [x] `done` Implement `ln` through VFS hard-link aliases and `ln -s` symlinks.
 - [x] `done` Add `readlink` utility and init-path symlink smoke coverage.
 - [x] `done` Implement `mount` command mounting path and active mount listing.
 - [x] `done` Add init-path utility smoke tests through `/bin/m22-smoke` and QEMU serial checks.
-- [x] `done` Add interactive shell-driven utility smoke tests.
-- [x] `done` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q).
+- [x] `initial` Add interactive shell-driven utility smoke tests that execute through `/bin/sh`.
+- [x] `partial` Add option-compatible behavior for common utility flags (`ls -la`, `cp -r`, `rm -rf`, `mkdir -p`, `grep -q`).
+
+M22 is useful but not fully closed. The init-path smoke proves many utilities
+work, and `/bin/shell-smoke` now exercises a small script through `/bin/sh`.
+POSIX-style closure still needs broader shell-script coverage, unsupported-flag
+behavior, consistent nonzero exits, and more exact text/file utility semantics.
 
 ## M23: Networking for Terminal Use
 
@@ -357,6 +366,7 @@ disk userland is populated.
 - [x] `done` Add kernel log levels and a ring buffer readable from userspace.
 - [x] `done` Add `/bin/dmesg` backed by `SYS_DMESG`.
 - [x] `done` Add scheduler stress coverage for repeated `spawn`/`wait` short-lived utility tasks.
+- [x] `initial` Add shell-driven utility smoke coverage.
 - [ ] `planned` Add CI-grade interactive shell utility tests.
 - [ ] `planned` Make syscall errors consistently map to userspace `errno`.
 
@@ -367,12 +377,13 @@ disk userland is populated.
 - [x] `done` Add a userspace linker script for B1NIX ELF binaries.
 - [x] `done` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`.
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
-- [x] `done` Build and run a VFS-loaded `hello.c` ELF program.
-- [x] `done` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
-- [x] `done` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
-- [x] `done` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
-- [x] `initial` Compile one simple shell utility inside B1NIX.
-- [x] `done` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
+- [x] `done` Build and run a VFS-loaded native smoke ELF program.
+- [x] `initial` Build and run a VFS-loaded `hello.c` ELF program.
+- [x] `initial` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
+- [x] `initial` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
+- [ ] `planned` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
+- [ ] `planned` Compile one simple shell utility inside B1NIX.
+- [ ] `planned` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
 
 ## M26: Full Toolchain and Self-Hosting
 

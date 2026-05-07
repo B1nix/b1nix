@@ -267,10 +267,23 @@ static int mkdir_p(const char *path) {
 	while (*p) {
 		if (*p == '/') {
 			*p = '\0';
-			syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+			if (tmp[0] != '\0') {
+				struct b1nix_stat st;
+				if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0, 0) == 0) {
+					if (!((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR)) return -1;
+				} else {
+					syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+				}
+			}
 			*p = '/';
+			while (*(p + 1) == '/') p++; /* Skip duplicate slashes */
 		}
 		p++;
+	}
+	struct b1nix_stat st;
+	if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0, 0) == 0) {
+		if (!((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR)) return -1;
+		return 0;
 	}
 	return (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
 }
@@ -429,6 +442,74 @@ static int readlink_main(int argc, const char **argv)
 	}
 	target[n] = '\0';
 	printf("%s\n", target);
+	return 0;
+}
+
+/* ── touch — update file timestamps or create empty file ── */
+static int touch_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("touch: missing operand\n");
+		return 1;
+	}
+
+	for (int i = 1; i < argc; i++) {
+		char path[256];
+		bb_resolve(argv[i], path, sizeof(path));
+		
+		/* Try to create file if it doesn't exist. In B1NIX, SYS_CREATE is often used. */
+		syscall_dispatch(SYS_CREATE, (u64)(usize)path, (u64)(usize)"", 0, 0);
+		
+		/* Open and close to update timestamp (if kernel supports it) */
+		u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, (u64)B1NIX_O_WRONLY, 0, 0);
+		if (fd != (u64)-1) {
+			syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+		} else {
+			printf("touch: cannot touch %s\n", argv[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── basename — strip directory and suffix from filenames ── */
+static int basename_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("basename: missing operand\n");
+		return 1;
+	}
+
+	const char *path = argv[1];
+	const char *base = strrchr(path, '/');
+	if (base) {
+		printf("%s\n", base + 1);
+	} else {
+		printf("%s\n", path);
+	}
+	return 0;
+}
+
+/* ── dirname — strip last component from file name ── */
+static int dirname_main(int argc, const char **argv)
+{
+	if (argc < 2) {
+		printf("dirname: missing operand\n");
+		return 1;
+	}
+
+	char path[256];
+	strncpy(path, argv[1], sizeof(path));
+	path[sizeof(path) - 1] = '\0';
+
+	char *last = strrchr(path, '/');
+	if (!last) {
+		printf(".\n");
+	} else if (last == path) {
+		printf("/\n");
+	} else {
+		*last = '\0';
+		printf("%s\n", path);
+	}
 	return 0;
 }
 
@@ -877,6 +958,92 @@ static int uniq_main(int argc, const char **argv)
 			puts(lines[i]);
 		}
 	}
+	return 0;
+}
+
+/* ── printf — formatted output ── */
+static int printf_main(int argc, const char **argv)
+{
+	if (argc < 2) return 0;
+
+	const char *fmt = argv[1];
+	int argi = 2;
+
+	for (int i = 0; fmt[i]; i++) {
+		if (fmt[i] == '%') {
+			i++;
+			if (fmt[i] == 's' && argi < argc) {
+				printf("%s", argv[argi++]);
+			} else if (fmt[i] == 'd' && argi < argc) {
+				printf("%d", atoi(argv[argi++]));
+			} else if (fmt[i] == '%') {
+				putchar('%');
+			}
+		} else if (fmt[i] == '\\') {
+			i++;
+			if (fmt[i] == 'n') putchar('\n');
+			else if (fmt[i] == 't') putchar('\t');
+			else putchar(fmt[i]);
+		} else {
+			putchar(fmt[i]);
+		}
+	}
+	return 0;
+}
+
+/* ── test/[ — evaluate expression ── */
+static int test_main(int argc, const char **argv)
+{
+	int arg_idx = 1;
+	if (argc > 0 && strcmp(argv[0], "[") == 0) {
+		if (argc < 2 || strcmp(argv[argc - 1], "]") != 0) return 1;
+		argc--;
+	}
+
+	if (arg_idx >= argc) return 1;
+
+	/* -f <file> */
+	if (strcmp(argv[arg_idx], "-f") == 0 && arg_idx + 1 < argc) {
+		char path[256];
+		bb_resolve(argv[arg_idx + 1], path, sizeof(path));
+		struct b1nix_stat st;
+		if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) == 0) {
+			return (st.st_mode & B1NIX_S_IFDIR) ? 1 : 0;
+		}
+		return 1;
+	}
+
+	/* -d <dir> */
+	if (strcmp(argv[arg_idx], "-d") == 0 && arg_idx + 1 < argc) {
+		char path[256];
+		bb_resolve(argv[arg_idx + 1], path, sizeof(path));
+		struct b1nix_stat st;
+		if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) == 0) {
+			return (st.st_mode & B1NIX_S_IFDIR) ? 0 : 1;
+		}
+		return 1;
+	}
+
+	/* string == string */
+	if (argc - arg_idx >= 3) {
+		if (strcmp(argv[arg_idx + 1], "=") == 0 || strcmp(argv[arg_idx + 1], "==") == 0) {
+			return strcmp(argv[arg_idx], argv[arg_idx + 2]) == 0 ? 0 : 1;
+		}
+		if (strcmp(argv[arg_idx + 1], "!=") == 0) {
+			return strcmp(argv[arg_idx], argv[arg_idx + 2]) != 0 ? 0 : 1;
+		}
+	}
+
+	/* -n string (non-empty) */
+	if (strcmp(argv[arg_idx], "-n") == 0 && arg_idx + 1 < argc) {
+		return (argv[arg_idx + 1][0] != '\0') ? 0 : 1;
+	}
+
+	/* -z string (empty) */
+	if (strcmp(argv[arg_idx], "-z") == 0 && arg_idx + 1 < argc) {
+		return (argv[arg_idx + 1][0] == '\0') ? 0 : 1;
+	}
+
 	return 0;
 }
 
@@ -1492,6 +1659,9 @@ static struct bb_app bb_apps[] = {
 	{"chown",   chown_main},
 	{"ln",      ln_main},
 	{"readlink", readlink_main},
+	{"touch",    touch_main},
+	{"basename", basename_main},
+	{"dirname",  dirname_main},
 	/* System */
 	{"ps",      ps_main},
 	{"kill",    kill_main},
@@ -1500,6 +1670,7 @@ static struct bb_app bb_apps[] = {
 	/* Text */
 	{"cat",     cat_main},
 	{"echo",    echo_main},
+	{"printf",  printf_main},
 	{"head",    head_main},
 	{"tail",    tail_main},
 	{"grep",    grep_main},
@@ -1523,6 +1694,8 @@ static struct bb_app bb_apps[] = {
 	/* Misc */
 	{"true",    true_main},
 	{"false",   false_main},
+	{"test",    test_main},
+	{"[",       test_main},
 	{"yes",     yes_main},
 	{"sleep",   sleep_main},
 	{"whoami",  whoami_main},

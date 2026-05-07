@@ -2,6 +2,7 @@ ARCH ?= x86
 BUILD_DIR := build/$(ARCH)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 RUN_ISO := /private/tmp/b1nix-run.iso
+INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
@@ -107,6 +108,13 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC)
+
+$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S userspace/linker.ld
+	@$(MAKE) -C userspace build/bin/native_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_native_smoke_elf userspace/build/bin/native_smoke > $@
+
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
@@ -134,6 +142,8 @@ run-x86: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
+run-root: run-x86
+
 root-image:
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
@@ -159,4 +169,4 @@ smoke: iso
 smoke-x86: ARCH=x86
 smoke-x86: smoke
 
-.PHONY: all clean run-x86 root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools
+.PHONY: all clean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools

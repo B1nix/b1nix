@@ -43,20 +43,6 @@ _start:
 	/* envp = argv + (argc + 1) * 8  (skip argc+1 pointers past argv terminator) */
 	leaq 8(%rsp, %rdi, 8), %rdx
 
-	/* Call _init if weak symbol exists */
-	.weak _init
-	cmpq $0, _init
-	je 1f
-	/* Save registers before calling _init */
-	pushq %rdi
-	pushq %rsi
-	pushq %rdx
-	call _init
-	popq %rdx
-	popq %rsi
-	popq %rdi
-1:
-
 	/* Call main(argc, argv, envp) */
 	call main
 

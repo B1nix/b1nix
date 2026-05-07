@@ -397,12 +397,15 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   for (u64 v = stack_aligned; v < image->address_space.stack_top; v += PAGE_SIZE) {
     u64 frame = pmm_alloc_frame();
     vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
-    /* Copy initial stack image */
-    u64 offset = v - stack_aligned;
-    memcpy((void *)(usize)v, (char *)image->address_space.stack_image + offset, PAGE_SIZE);
+    u64 image_base = image->address_space.stack_top - image->address_space.stack_image_size;
+    u64 offset = v - image_base;
+    if (offset < image->address_space.stack_image_size) {
+      u64 chunk = image->address_space.stack_image_size - offset;
+      if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
+      memcpy((void *)(usize)v, (char *)image->address_space.stack_image + offset, chunk);
+    }
   }
 
-  /* Jump to userspace! */
   x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc, (u64)image->argv);
   
   return 0; // Should not reach here

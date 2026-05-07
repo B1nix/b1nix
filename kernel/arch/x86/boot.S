@@ -124,14 +124,20 @@ enable_long_mode:
 	ret
 
 .align 16
+.global gdt64
 gdt64:
 	.quad 0
 	.quad 0x00af9a000000ffff /* 0x08: Kernel Code */
 	.quad 0x00af92000000ffff /* 0x10: Kernel Data */
 	.quad 0x00aff2000000ffff /* 0x18: User Data (Ring 3) */
 	.quad 0x00affa000000ffff /* 0x20: User Code (Ring 3) */
+.global gdt64_tss
+gdt64_tss:
+	.quad 0 /* 0x28: TSS low descriptor, filled by arch.c */
+	.quad 0 /* 0x30: TSS high descriptor, filled by arch.c */
+gdt64_end:
 gdt64_pointer:
-	.word gdt64_pointer - gdt64 - 1
+	.word gdt64_end - gdt64 - 1
 	.quad gdt64
 
 .code64
