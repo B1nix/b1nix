@@ -64,6 +64,10 @@ install: all
 	cp -r include/* ../build/x86/rootfs/include/
 	cp $(LIB) ../build/x86/rootfs/lib/
 	cp $(CRT0) ../build/x86/rootfs/lib/
+	@mkdir -p ../build/x86/rootfs/home
+	cp hello_native.c ../build/x86/rootfs/home/
+	@mkdir -p ../build/x86/rootfs/lib/tcc/include
+	cp tcc/include/*.h ../build/x86/rootfs/lib/tcc/include/
 
 clean:
 	rm -rf $(BUILD)

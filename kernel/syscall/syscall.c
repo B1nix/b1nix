@@ -155,73 +155,10 @@ static void copy_cstr(char *dst, usize dst_size, const char *src)
 	dst[len] = '\0';
 }
 
-static void normalize_path(const char *path, char *out, usize out_size)
-{
-	char raw[256];
-	char combined[256];
-	usize len = 0;
-
-	if (!out || out_size == 0) return;
-	out[0] = '\0';
-	if (!path || syscall_copyinstr(raw, sizeof(raw), path) != 0) return;
-
-	if (raw[0] == '/') {
-		copy_cstr(combined, sizeof(combined), raw);
-	} else {
-		const char *cwd = scheduler_get_cwd();
-		copy_cstr(combined, sizeof(combined), cwd && cwd[0] ? cwd : "/");
-		len = strlen(combined);
-		if (len == 0) {
-			combined[len++] = '/';
-			combined[len] = '\0';
-		}
-		if (combined[len - 1] != '/' && len < sizeof(combined) - 1) {
-			combined[len++] = '/';
-			combined[len] = '\0';
-		}
-		for (usize i = 0; raw[i] && len < sizeof(combined) - 1; i++) {
-			combined[len++] = raw[i];
-		}
-		combined[len] = '\0';
-	}
-
-	out[0] = '/';
-	out[1] = '\0';
-	len = 1;
-	for (usize i = 0; combined[i];) {
-		while (combined[i] == '/') i++;
-		if (!combined[i]) break;
-
-		char part[64];
-		usize part_len = 0;
-		while (combined[i] && combined[i] != '/' && part_len < sizeof(part) - 1) {
-			part[part_len++] = combined[i++];
-		}
-		part[part_len] = '\0';
-		while (combined[i] && combined[i] != '/') i++;
-
-		if (part[0] == '\0' || strcmp(part, ".") == 0) continue;
-		if (strcmp(part, "..") == 0) {
-			if (len > 1) {
-				if (out[len - 1] == '/') len--;
-				while (len > 1 && out[len - 1] != '/') len--;
-				out[len] = '\0';
-			}
-			continue;
-		}
-
-		if (len > 1 && len < out_size - 1) out[len++] = '/';
-		for (usize j = 0; part[j] && len < out_size - 1; j++) {
-			out[len++] = part[j];
-		}
-		out[len] = '\0';
-	}
-}
-
 static u64 sys_execve(const char *path, const char **argv, const char **envp)
 {
 	char kernel_path[VFS_MAX_PATH];
-	normalize_path(path, kernel_path, sizeof(kernel_path));
+	vfs_resolve_path(path, kernel_path);
 	if (kernel_path[0] == '\0') return (u64)-1;
 	return (u64)user_execve_current(kernel_path, argv, envp);
 }
@@ -257,18 +194,18 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		scheduler_exit_current((int)arg0);
 	case SYS_SPAWN: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		if (path[0] == '\0') return (u64)-1;
 		return (u64)user_spawn(path, (int)arg1, (const char **)(usize)arg2);
 	}
 	case SYS_LIST: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return sys_list(path);
 	}
 	case SYS_READ_FILE: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return sys_read_file(path);
 	}
 	case SYS_YIELD:
@@ -276,7 +213,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_OPEN: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_open_flags(path, (int)arg1);
 	}
 	case SYS_READ:
@@ -286,7 +223,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return 0;
 	case SYS_CREATE: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_create(path, (const char *)(usize)arg1);
 	}
 #ifndef __aarch64__
@@ -459,12 +396,12 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return (u64)shmctl((int)arg0, (int)arg1, (struct shmid_ds *)(usize)arg2);
 	case SYS_CHMOD: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_chmod(path, (u16)arg1);
 	}
 	case SYS_CHOWN: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_chown(path, (u16)arg1, (u16)arg2);
 	}
 	case SYS_GETUID: {
@@ -503,30 +440,30 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 		return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
 	case SYS_STAT: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_stat(path, (struct b1nix_stat *)(usize)arg1);
 	}
 	case SYS_LSTAT: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_lstat(path, (struct b1nix_stat *)(usize)arg1);
 	}
 	case SYS_LSEEK:
 		return (u64)vfs_lseek((int)arg0, (isize)arg1, (int)arg2);
 	case SYS_UNLINK: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_unlink(path);
 	}
 	case SYS_MKDIR: {
 		char path[VFS_MAX_PATH];
 		(void)arg1;
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_mkdir(path);
 	}
 	case SYS_CHDIR: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		struct vfs_node *node = vfs_find_node(path);
 		if (!node || node->type != VFS_DIRECTORY) return (u64)-1;
 		return (u64)scheduler_set_cwd(path);
@@ -565,13 +502,13 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_RENAME: {
 		char old_path[VFS_MAX_PATH];
 		char new_path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, old_path, sizeof(old_path));
-		normalize_path((const char *)(usize)arg1, new_path, sizeof(new_path));
+		vfs_resolve_path((const char *)(usize)arg0, old_path);
+		vfs_resolve_path((const char *)(usize)arg1, new_path);
 		return (u64)vfs_rename(old_path, new_path);
 	}
 	case SYS_RMDIR: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_rmdir(path);
 	}
 	case SYS_FSTAT:
@@ -632,20 +569,20 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3)
 	case SYS_LINK: {
 		char target[VFS_MAX_PATH];
 		char link_path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, target, sizeof(target));
-		normalize_path((const char *)(usize)arg1, link_path, sizeof(link_path));
+		vfs_resolve_path((const char *)(usize)arg0, target);
+		vfs_resolve_path((const char *)(usize)arg1, link_path);
 		return (u64)vfs_link(target, link_path);
 	}
 	case SYS_SYMLINK: {
 		char target[VFS_MAX_PATH];
 		char link_path[VFS_MAX_PATH];
 		if (syscall_copyinstr(target, sizeof(target), (const char *)(usize)arg0) != 0) return (u64)-1;
-		normalize_path((const char *)(usize)arg1, link_path, sizeof(link_path));
+		vfs_resolve_path((const char *)(usize)arg1, link_path);
 		return (u64)vfs_symlink(target, link_path);
 	}
 	case SYS_READLINK: {
 		char path[VFS_MAX_PATH];
-		normalize_path((const char *)(usize)arg0, path, sizeof(path));
+		vfs_resolve_path((const char *)(usize)arg0, path);
 		return (u64)vfs_readlink(path, (char *)(usize)arg1, (usize)arg2);
 	}
 	case SYS_SETPRIORITY: {

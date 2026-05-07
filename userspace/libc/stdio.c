@@ -5,9 +5,9 @@
 #include <fcntl.h>
 #include <unistd.h>
 
-static FILE _stdin =  { 0, 0, 0 };
-static FILE _stdout = { 1, 0, 0 };
-static FILE _stderr = { 2, 0, 0 };
+static FILE _stdin =  { 0, 0, 0, 0, 0 };
+static FILE _stdout = { 1, 0, 0, 0, 0 };
+static FILE _stderr = { 2, 0, 0, 0, 0 };
 
 FILE *stdin = &_stdin;
 FILE *stdout = &_stdout;
@@ -43,65 +43,9 @@ int snprintf(char *str, size_t size, const char *fmt, ...)
 {
 	va_list args;
 	va_start(args, fmt);
-
-	int pos = 0;
-	for (int i = 0; fmt[i] && pos < (int)size - 1; i++) {
-		if (fmt[i] != '%') {
-			str[pos++] = fmt[i];
-			continue;
-		}
-		i++;
-		switch (fmt[i]) {
-		case 'd': {
-			int v = va_arg(args, int);
-			if (v < 0) { str[pos++] = '-'; v = -v; }
-			print_dec((unsigned long)v, str, &pos);
-			break;
-		}
-		case 'u': {
-			unsigned int v = va_arg(args, unsigned int);
-			print_dec(v, str, &pos);
-			break;
-		}
-		case 'x': case 'X': {
-			unsigned int v = va_arg(args, unsigned int);
-			print_hex(v, str, &pos);
-			break;
-		}
-		case 's': {
-			const char *s = va_arg(args, const char *);
-			if (!s) s = "(null)";
-			while (*s && pos < (int)size - 1) str[pos++] = *s++;
-			break;
-		}
-		case 'c': {
-			str[pos++] = (char)va_arg(args, int);
-			break;
-		}
-		case 'l': {
-			i++;
-			switch (fmt[i]) {
-			case 'd': {
-				long v = va_arg(args, long);
-				if (v < 0) { str[pos++] = '-'; v = -v; }
-				print_dec((unsigned long)v, str, &pos);
-				break;
-			}
-			case 'u': print_dec(va_arg(args, unsigned long), str, &pos); break;
-			case 'x': case 'X': print_hex(va_arg(args, unsigned long), str, &pos); break;
-			default: str[pos++] = '%'; str[pos++] = 'l'; str[pos++] = fmt[i]; break;
-			}
-			break;
-		}
-		default:
-			str[pos++] = '%';
-			str[pos++] = fmt[i];
-			break;
-		}
-	}
-	str[pos] = '\0';
+	int n = vsnprintf(str, size, fmt, args);
 	va_end(args);
-	return pos;
+	return n;
 }
 
 int printf(const char *fmt, ...)
@@ -109,7 +53,7 @@ int printf(const char *fmt, ...)
 	char buf[512];
 	va_list args;
 	va_start(args, fmt);
-	int n = snprintf(buf, sizeof(buf), fmt, args);
+	int n = vsnprintf(buf, sizeof(buf), fmt, args);
 	va_end(args);
 
 	syscall(SYS_WRITE, (long)buf, (long)n, 1, 0);
@@ -141,6 +85,8 @@ FILE *fopen(const char *pathname, const char *mode)
     f->fd = fd;
     f->eof = 0;
     f->error = 0;
+    f->unget_buf = 0;
+    f->has_unget = 0;
     return f;
 }
 
@@ -197,16 +143,31 @@ int fputs(const char *s, FILE *stream)
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream)
 {
     if (!stream || size == 0 || nmemb == 0) return 0;
-    int n = read(stream->fd, ptr, size * nmemb);
-    if (n < 0) {
-        stream->error = 1;
-        return 0;
+    
+    size_t total_requested = size * nmemb;
+    size_t done = 0;
+    unsigned char *p = (unsigned char *)ptr;
+
+    if (stream->has_unget) {
+        *p++ = (unsigned char)stream->unget_buf;
+        stream->has_unget = 0;
+        done++;
     }
-    if (n == 0) {
-        stream->eof = 1;
-        return 0;
+
+    if (done < total_requested) {
+        int n = read(stream->fd, p, total_requested - done);
+        if (n < 0) {
+            stream->error = 1;
+            return done / size;
+        }
+        if (n == 0) {
+            stream->eof = 1;
+            return done / size;
+        }
+        done += n;
     }
-    return n / size;
+    
+    return done / size;
 }
 
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream)
@@ -236,11 +197,9 @@ int fputc(int c, FILE *stream)
 
 int ungetc(int c, FILE *stream)
 {
-    // Extremely basic stub for ungetc. Real one needs a buffer.
-    // For now we just seek back by 1 if possible.
     if (c == EOF || !stream) return EOF;
-    long pos = syscall(SYS_LSEEK, stream->fd, -1, SEEK_CUR, 0);
-    if (pos < 0) return EOF;
+    stream->unget_buf = c;
+    stream->has_unget = 1;
     stream->eof = 0;
     return c;
 }
@@ -311,38 +270,54 @@ int vfprintf(FILE *stream, const char *fmt, va_list ap)
     return n;
 }
 
+static void _vsnprintf_putc(char *str, size_t size, int *pos, char c) {
+    if (*pos < (int)size - 1) {
+        str[(*pos)++] = c;
+    }
+}
+
+static void _vsnprintf_puts(char *str, size_t size, int *pos, const char *s) {
+    while (*s) _vsnprintf_putc(str, size, pos, *s++);
+}
+
+static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base, int signed_val) {
+    char buf[32];
+    int p = 0;
+    unsigned long uv = (unsigned long)v;
+    if (signed_val && v < 0) {
+        _vsnprintf_putc(str, size, pos, '-');
+        uv = (unsigned long)-v;
+    }
+    const char *digits = "0123456789abcdef";
+    do { buf[p++] = digits[uv % base]; uv /= base; } while (uv > 0);
+    while (p > 0) _vsnprintf_putc(str, size, pos, buf[--p]);
+}
+
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap)
 {
-    // Minimal vsnprintf wrapping existing snprintf logic
-    // B1NIX minimal libc snprintf already has va_list logic in it, let's reuse it.
-    // Wait, snprintf in B1NIX libc uses va_start directly.
-    // So we just copy the snprintf logic here.
-    
     int pos = 0;
+    if (size == 0) return 0;
+
     for (int i = 0; fmt[i] && pos < (int)size - 1; i++) {
         if (fmt[i] != '%') {
             str[pos++] = fmt[i];
             continue;
         }
         i++;
-        // ... (we'll implement basic %s %d logic) ...
-        // For simplicity, just handling %s and %d in this stub.
-        if (fmt[i] == 's') {
-            const char *s = va_arg(ap, const char *);
-            if (!s) s = "(null)";
-            while (*s && pos < (int)size - 1) str[pos++] = *s++;
-        } else if (fmt[i] == 'd') {
-            int v = va_arg(ap, int);
-            char num[32];
-            int np = 0;
-            if (v < 0) { str[pos++] = '-'; v = -v; }
-            do { num[np++] = '0' + (v % 10); v /= 10; } while (v > 0);
-            while (np > 0 && pos < (int)size - 1) str[pos++] = num[--np];
-        } else if (fmt[i] == 'c') {
-            str[pos++] = (char)va_arg(ap, int);
-        } else {
-            str[pos++] = '%';
-            str[pos++] = fmt[i];
+        if (fmt[i] == '0') i++; // Ignore padding for now
+        
+        int is_long = 0;
+        if (fmt[i] == 'l') { is_long = 1; i++; }
+
+        switch (fmt[i]) {
+        case 's': _vsnprintf_puts(str, size, &pos, va_arg(ap, const char *)); break;
+        case 'd': _vsnprintf_putd(str, size, &pos, is_long ? va_arg(ap, long) : va_arg(ap, int), 10, 1); break;
+        case 'u': _vsnprintf_putd(str, size, &pos, is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 10, 0); break;
+        case 'x': case 'X': _vsnprintf_putd(str, size, &pos, is_long ? va_arg(ap, unsigned long) : va_arg(ap, unsigned int), 16, 0); break;
+        case 'p': _vsnprintf_puts(str, size, &pos, "0x"); _vsnprintf_putd(str, size, &pos, (unsigned long)va_arg(ap, void *), 16, 0); break;
+        case 'c': _vsnprintf_putc(str, size, &pos, (char)va_arg(ap, int)); break;
+        case '%': _vsnprintf_putc(str, size, &pos, '%'); break;
+        default: _vsnprintf_putc(str, size, &pos, '%'); _vsnprintf_putc(str, size, &pos, fmt[i]); break;
         }
     }
     str[pos] = '\0';

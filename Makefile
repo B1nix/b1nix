@@ -24,17 +24,10 @@ TARGET := x86_64-elf
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
-ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S
+ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S
 ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c
-else ifeq ($(ARCH),aarch64)
-TARGET := aarch64-elf
-ARCH_CFLAGS := --target=$(TARGET)
-ARCH_LDFLAGS := -m aarch64elf
-LINKER_SCRIPT := kernel/arch/aarch64/linker.ld
-ASM_SOURCES := kernel/arch/aarch64/boot.S kernel/arch/aarch64/context_switch.S kernel/arch/aarch64/isr.S
-ARCH_SOURCES := kernel/arch/aarch64/arch.c kernel/arch/aarch64/console.c kernel/arch/aarch64/interrupts.c kernel/arch/aarch64/paging.c kernel/arch/aarch64/serial.c kernel/arch/aarch64/bootinfo.c
 else
-$(error Unsupported ARCH=$(ARCH). Try ARCH=x86 or ARCH=aarch64)
+$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86)
 endif
 
 KERNEL_SOURCES := \
@@ -93,9 +86,6 @@ KERNEL_SOURCES += \
 	kernel/net/tcp.c \
 	kernel/net/dhcp.c \
 	kernel/net/dns.c
-else ifeq ($(ARCH),aarch64)
-KERNEL_SOURCES += \
-	kernel/net/stub.c
 endif
 
 
@@ -103,7 +93,7 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 
-.PHONY: all clean run-x86 run-aarch64 run-root smoke-m18 root-image iso check-tools objects
+.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects
 
 all: $(KERNEL_ELF)
 
@@ -144,11 +134,6 @@ run-x86: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-run-aarch64: ARCH=aarch64
-run-aarch64: $(KERNEL_ELF)
-	@command -v qemu-system-aarch64 >/dev/null || (echo "missing qemu-system-aarch64"; exit 1)
-	qemu-system-aarch64 -machine virt -cpu cortex-a57 -nographic -kernel $(KERNEL_ELF)
-
 root-image:
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
@@ -174,7 +159,4 @@ smoke: iso
 smoke-x86: ARCH=x86
 smoke-x86: smoke
 
-smoke-aarch64: ARCH=aarch64
-smoke-aarch64: smoke
-
-.PHONY: all clean run-x86 run-aarch64 root-image iso userspace userspace-install iso-full smoke smoke-x86 smoke-aarch64 check-tools
+.PHONY: all clean run-x86 root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools

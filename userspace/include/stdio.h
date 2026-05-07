@@ -10,6 +10,8 @@ typedef struct {
     int fd;
     int eof;
     int error;
+    int unget_buf;
+    int has_unget;
 } FILE;
 
 extern FILE *stdin;

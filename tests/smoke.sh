@@ -1,7 +1,7 @@
 #!/bin/sh
 # B1NIX Smoke Test Suite (M24)
 # Runs kernel in QEMU and checks for expected output patterns.
-# Usage: ./tests/smoke.sh [x86|aarch64]
+# Usage: ./tests/smoke.sh [x86]
 
 set -e
 
@@ -55,26 +55,8 @@ run_qemu() {
 			kill "$pid" 2>/dev/null || true
 			wait "$pid" 2>/dev/null || true
 		fi
-	elif [ "$ARCH" = "aarch64" ]; then
-		if command -v timeout >/dev/null 2>&1; then
-			timeout "$TIMEOUT" qemu-system-aarch64 \
-				-M virt -cpu cortex-a57 -m 128 \
-				-kernel "$PROJECT_DIR/build/aarch64/kernel.elf" \
-				-serial stdio -display none -monitor none -no-reboot \
-				>"$log" 2>&1 || true
-		else
-			qemu-system-aarch64 \
-				-M virt -cpu cortex-a57 -m 128 \
-				-kernel "$PROJECT_DIR/build/aarch64/kernel.elf" \
-				-serial stdio -display none -monitor none -no-reboot \
-				>"$log" 2>&1 &
-			pid=$!
-			sleep "$TIMEOUT"
-			kill "$pid" 2>/dev/null || true
-			wait "$pid" 2>/dev/null || true
-		fi
 	else
-		echo "Unknown ARCH: $ARCH"
+		echo "Unknown ARCH: $ARCH (AArch64 is archived)"
 		exit 1
 	fi
 }

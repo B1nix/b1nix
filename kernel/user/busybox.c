@@ -83,8 +83,20 @@ static int pwd_main(int argc, const char **argv)
 /* ── ls — list directory contents ── */
 static int ls_main(int argc, const char **argv)
 {
+	int long_fmt = 0;
+	int all_files = 0;
 	const char *target = ".";
-	if (argc > 1) target = argv[1];
+	
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			for (int j = 1; argv[i][j]; j++) {
+				if (argv[i][j] == 'l') long_fmt = 1;
+				if (argv[i][j] == 'a') all_files = 1;
+			}
+		} else {
+			target = argv[i];
+		}
+	}
 	
 	char path[256];
 	bb_resolve(target, path, sizeof(path));
@@ -98,90 +110,76 @@ static int ls_main(int argc, const char **argv)
 	}
 
 	for (int i = 0; i < count; i++) {
-		/* Type indicator */
-		char type = '-';
-		if (entries[i].is_dir) type = 'd';
-		else if (entries[i].type == 2) type = 'c'; /* device */
-
-		/* Permissions string (simplified) */
-		char perms[10];
-		perms[0] = type;
-		perms[1] = entries[i].is_exec ? 'r' : '-';
-		perms[2] = entries[i].is_exec ? 'w' : '-';
-		perms[3] = entries[i].is_exec ? 'x' : '-';
-		perms[4] = '-';
-		perms[5] = '-';
-		perms[6] = '-';
-		perms[7] = '-';
-		perms[8] = '-';
-		perms[9] = '\0';
-
-		/* Try stat for full permissions */
-		char full_path[320];
-		usize pl = strlen(path);
-		memcpy(full_path, path, pl);
-		if (pl > 0 && full_path[pl - 1] != '/') full_path[pl++] = '/';
-		usize nl = strlen(entries[i].name);
-		memcpy(full_path + pl, entries[i].name, nl + 1);
-
-		struct b1nix_stat st;
-		if (syscall_dispatch(SYS_STAT, (u64)(usize)full_path,
-		                     (u64)(usize)&st, 0, 0) == 0) {
-			u16 m = (u16)st.st_mode;
-			perms[1] = (m & 0400) ? 'r' : '-';
-			perms[2] = (m & 0200) ? 'w' : '-';
-			perms[3] = (m & 0100) ? 'x' : '-';
-			perms[4] = (m & 0040) ? 'r' : '-';
-			perms[5] = (m & 0020) ? 'w' : '-';
-			perms[6] = (m & 0010) ? 'x' : '-';
-			perms[7] = (m & 0004) ? 'r' : '-';
-			perms[8] = (m & 0002) ? 'w' : '-';
-			perms[9] = (m & 0001) ? 'x' : '-';
+		if (!all_files && entries[i].name[0] == '.') continue;
+		if (long_fmt) {
+			char type = '-';
+			if (entries[i].is_dir) type = 'd';
+			else if (entries[i].type == 2) type = 'c';
+			printf("%c  %8d  %s\n", type, (int)entries[i].size, entries[i].name);
+		} else {
+			printf("%s  ", entries[i].name);
 		}
-
-		printf("%s %6d %s", perms, (int)entries[i].size, entries[i].name);
-		if (entries[i].is_dir) printf("/");
-		printf("\n");
 	}
+	if (!long_fmt) printf("\n");
 	return 0;
 }
 
 /* ── cp — copy file ── */
+static int bb_copy_file(const char *src, const char *dst) {
+	u64 fds = bb_open(src);
+	if (fds == (u64)-1) return -1;
+	syscall_dispatch(SYS_CREATE, (u64)(usize)dst, (u64)(usize)"", 0, 0);
+	u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0);
+	if (fdd == (u64)-1) { syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0); return -1; }
+	char buf[4096];
+	while (1) {
+		u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0);
+		if (n == 0 || n == (u64)-1) break;
+		syscall_dispatch(SYS_WRITE, (u64)(usize)buf, n, fdd, 1);
+	}
+	syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, fdd, 0, 0, 0);
+	return 0;
+}
+
+static void cp_recursive(const char *src, const char *dst) {
+	struct b1nix_stat st;
+	if (syscall_dispatch(SYS_LSTAT, (u64)(usize)src, (u64)(usize)&st, 0, 0) != 0) return;
+	if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
+		syscall_dispatch(SYS_MKDIR, (u64)(usize)dst, 0755, 0, 0);
+		struct dirent entries[32];
+		int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)src, (u64)(usize)entries, 32, 0);
+		for (int i = 0; i < count; i++) {
+			if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0) continue;
+			char ssub[256], dsub[256];
+			snprintf(ssub, sizeof(ssub), "%s/%s", src, entries[i].name);
+			snprintf(dsub, sizeof(dsub), "%s/%s", dst, entries[i].name);
+			cp_recursive(ssub, dsub);
+		}
+	} else {
+		bb_copy_file(src, dst);
+	}
+}
+
 static int cp_main(int argc, const char **argv)
 {
-	if (argc < 3) {
-		printf("cp: missing operand\nUsage: cp <src> <dst>\n");
+	int recursive = 0;
+	int start_idx = 1;
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			if (strchr(argv[i], 'r') || strchr(argv[i], 'R')) recursive = 1;
+			start_idx = i + 1;
+		} else break;
+	}
+	if (argc - start_idx < 2) {
+		printf("cp: missing operand\n");
 		return 1;
 	}
-
-	char src[256], dst[256];
-	bb_resolve(argv[1], src, sizeof(src));
-	bb_resolve(argv[2], dst, sizeof(dst));
-
-	u64 sfd = bb_open(src);
-	if (sfd == (u64)-1) {
-		printf("cp: %s: No such file\n", argv[1]);
-		return 1;
-	}
-
-	/* Read entire source */
-	char buf[4096];
-	usize total = 0;
-	while (1) {
-		u64 n = syscall_dispatch(SYS_READ, sfd,
-		                         (u64)(usize)(buf + total),
-		                         sizeof(buf) - total - 1, 0);
-		if (n == 0 || n == (u64)-1) break;
-		total += (usize)n;
-		if (total >= sizeof(buf) - 1) break;
-	}
-	syscall_dispatch(SYS_CLOSE, sfd, 0, 0, 0);
-	buf[total] = '\0';
-
-	if (bb_write_file(dst, buf, total) < 0) {
-		printf("cp: cannot create %s\n", argv[2]);
-		return 1;
-	}
+	char s[256], d[256];
+	bb_resolve(argv[start_idx], s, sizeof(s));
+	bb_resolve(argv[start_idx + 1], d, sizeof(d));
+	if (recursive) cp_recursive(s, d);
+	else bb_copy_file(s, d);
 	return 0;
 }
 
@@ -206,36 +204,102 @@ static int mv_main(int argc, const char **argv)
 }
 
 /* ── rm — remove file ── */
+static void rm_recursive(const char *path) {
+	struct b1nix_stat st;
+	if (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) != 0) return;
+	
+	if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
+		struct dirent entries[32];
+		int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 32, 0);
+		for (int i = 0; i < count; i++) {
+			if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0) continue;
+			char sub[256];
+			snprintf(sub, sizeof(sub), "%s/%s", path, entries[i].name);
+			rm_recursive(sub);
+		}
+		syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0);
+	} else {
+		syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0);
+	}
+}
+
 static int rm_main(int argc, const char **argv)
 {
-	if (argc < 2) {
+	int recursive = 0;
+	int force = 0;
+	int start_idx = 1;
+
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			for (int j = 1; argv[i][j]; j++) {
+				if (argv[i][j] == 'r' || argv[i][j] == 'R') recursive = 1;
+				if (argv[i][j] == 'f') force = 1;
+			}
+			start_idx = i + 1;
+		} else break;
+	}
+
+	if (start_idx >= argc) {
 		printf("rm: missing operand\n");
 		return 1;
 	}
 
-	for (int i = 1; i < argc; i++) {
+	for (int i = start_idx; i < argc; i++) {
 		char path[256];
 		bb_resolve(argv[i], path, sizeof(path));
-		if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0) != 0) {
-			printf("rm: cannot remove %s\n", argv[i]);
+		if (recursive) {
+			rm_recursive(path);
+		} else {
+			if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0) != 0 && !force) {
+				printf("rm: cannot remove %s\n", argv[i]);
+			}
 		}
 	}
 	return 0;
 }
 
 /* ── mkdir — create directory ── */
+static int mkdir_p(const char *path) {
+	char tmp[256];
+	strncpy(tmp, path, 256);
+	char *p = tmp;
+	if (*p == '/') p++;
+	while (*p) {
+		if (*p == '/') {
+			*p = '\0';
+			syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+			*p = '/';
+		}
+		p++;
+	}
+	return (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+}
+
 static int mkdir_main(int argc, const char **argv)
 {
-	if (argc < 2) {
+	int parents = 0;
+	int start_idx = 1;
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			if (strchr(argv[i], 'p')) parents = 1;
+			start_idx = i + 1;
+		} else break;
+	}
+
+	if (start_idx >= argc) {
 		printf("mkdir: missing operand\n");
 		return 1;
 	}
 
-	for (int i = 1; i < argc; i++) {
+	for (int i = start_idx; i < argc; i++) {
 		char path[256];
 		bb_resolve(argv[i], path, sizeof(path));
-		if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0) != 0) {
-			printf("mkdir: cannot create directory %s\n", argv[i]);
+		if (parents) {
+			mkdir_p(path);
+		} else {
+			if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0) != 0) {
+				printf("mkdir: cannot create directory %s\n", argv[i]);
+			}
 		}
 	}
 	return 0;
@@ -567,25 +631,29 @@ static int tail_main(int argc, const char **argv)
 /* ── grep — search for pattern in files ── */
 static int grep_main(int argc, const char **argv)
 {
-	if (argc < 2) {
-		printf("grep: missing pattern\nUsage: grep <pattern> [file]\n");
+	int quiet = 0;
+	int start_idx = 1;
+	for (int i = 1; i < argc; i++) {
+		if (argv[i][0] == '-') {
+			if (strchr(argv[i], 'q')) quiet = 1;
+			start_idx = i + 1;
+		} else break;
+	}
+
+	if (argc - start_idx < 1) {
+		printf("grep: missing pattern\n");
 		return 1;
 	}
 
-	const char *pattern = argv[1];
-	const char *file = (argc > 2) ? argv[2] : 0;
+	const char *pattern = argv[start_idx];
+	const char *file = (argc - start_idx > 1) ? argv[start_idx + 1] : 0;
 
 	char buf[4096];
-	usize total;
-
+	usize total = 0;
 	if (file) {
 		total = bb_read_file(file, buf, sizeof(buf));
-		if (total == 0) {
-			printf("grep: %s: No such file\n", file);
-			return 1;
-		}
+		if (total == 0) return 1;
 	} else {
-		total = 0;
 		while (total < sizeof(buf) - 1) {
 			char c;
 			if (read(0, &c, 1) <= 0) break;
@@ -593,22 +661,24 @@ static int grep_main(int argc, const char **argv)
 		}
 		buf[total] = '\0';
 	}
-
+	
 	usize plen = strlen(pattern);
 	usize line_start = 0;
+	int found = 0;
 
 	for (usize i = 0; i <= total; i++) {
 		if (buf[i] == '\n' || buf[i] == '\0') {
-			/* Check if pattern is in this line */
 			for (usize j = line_start; j + plen <= i; j++) {
 				int match = 1;
 				for (usize k = 0; k < plen; k++) {
 					if (buf[j + k] != pattern[k]) { match = 0; break; }
 				}
 				if (match) {
-					/* Print the line */
-					for (usize p = line_start; p < i; p++) putchar(buf[p]);
-					putchar('\n');
+					found = 1;
+					if (!quiet) {
+						for (usize p = line_start; p < i; p++) putchar(buf[p]);
+						putchar('\n');
+					}
 					break;
 				}
 			}
@@ -616,7 +686,7 @@ static int grep_main(int argc, const char **argv)
 			if (buf[i] == '\0') break;
 		}
 	}
-	return 0;
+	return found ? 0 : 1;
 }
 
 /* ── find — walk directory tree ── */

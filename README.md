@@ -4,14 +4,14 @@ A small Unix-like monolithic kernel experiment in C.
 
 The current target is a portable kernel core with architecture-specific boot
 and CPU code isolated under `kernel/arch`. The first boot path is x86_64 via a
-Multiboot2-compatible loader, with AArch64 reserved in the tree for the next
-port.
+Multiboot2-compatible loader. The old AArch64 experiment is archived under
+`archive/kernel/arch/aarch64` and is not part of the active build.
 
 ## Goals
 
 - Monolithic kernel in C11 with small assembly entry points.
 - Portable core for memory, scheduling, files, networking, and syscalls.
-- x86_64 first, AArch64 next.
+- x86_64 first.
 - QEMU-first development, real hardware later.
 - VirtIO-first drivers for disk, network, and eventually GPU.
 
@@ -52,23 +52,19 @@ For a headless smoke test, this is the QEMU shape used during development:
 qemu-system-x86_64 -cdrom build/x86/tinyunix.iso -serial stdio -display none -monitor none -no-reboot
 ```
 
-The minimal AArch64 QEMU `virt` boot path can be built and run with:
-
-```sh
-make ARCH=aarch64
-make run-aarch64
-```
-
 ## Layout
 
 ```text
 kernel/
   arch/
     x86/
-    aarch64/
   include/
   lib/
   main.c
+archive/
+  kernel/
+    arch/
+      aarch64/
 docs/
   roadmap.md
 ```

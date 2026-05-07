@@ -8,6 +8,9 @@ Status legend:
 - `stub`: source/API placeholder exists, but it is not a real feature yet.
 - `planned`: not implemented yet.
 
+Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
+`Shell/coreutils` branches live in [`docs/posix-branches.md`](posix-branches.md).
+
 ## M0: Boot and Diagnostics
 
 - [x] `done` Build freestanding kernel ELF.
@@ -24,10 +27,10 @@ Status legend:
 - [x] `done` Add interrupt descriptor table on x86_64 for CPU exceptions 0-31.
 - [x] `done` Add page fault diagnostics with `CR2` reporting.
 - [x] `done` Add PIT timer interrupt through PIC IRQ0.
-- [x] `initial` Add AArch64 QEMU `virt` boot path.
+- [x] `stub` Archive the old AArch64 QEMU `virt` boot path outside the active build.
 - [x] `done` Keep CPU halt, interrupt control, and context switch arch-local.
 - [x] `done` Add x86_64 interrupt-to-signal mapping for common CPU faults.
-- [x] `initial` Add AArch64 serial, interrupt, bootinfo, and context-switch scaffolding.
+- [x] `stub` Keep archived AArch64 serial, interrupt, bootinfo, and context-switch scaffolding for later revival.
 
 ## M2: Memory
 
@@ -41,8 +44,8 @@ Status legend:
 - [x] `initial` Add higher-half kernel mapping and direct-map window.
 - [x] `partial` Add lazy page allocation hooks in the x86 page-fault path.
 - [x] `partial` Add swap slot bookkeeping and swap in/out helpers.
-- [ ] `planned` Add full per-process page tables, protection enforcement, and copy-on-write.
-- [ ] `planned` Add full `mmap`/`munmap`/`mprotect` semantics with file-backed mappings.
+- [x] `partial` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
+- [x] `initial` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
 
 ## M3: Scheduling
 
@@ -67,8 +70,8 @@ Status legend:
 - [x] `initial` Add ELF64 loading from VFS with argc/argv/envp/auxv stack metadata.
 - [x] `initial` Add syscall `copyin`/`copyout`/`copyinstr` helpers.
 - [x] `partial` Add built-in program fallback when ELF loading fails.
-- [ ] `planned` Add hardware-enforced ring3 userspace entry/return for normal programs.
-- [ ] `planned` Add arbitrary native ELF execution with real user registers and page tables.
+- [x] `done` Add hardware-enforced ring3 userspace entry/return for normal programs.
+- [x] `done` Add arbitrary native ELF execution with real user registers and shared page tables.
 
 ## M5: VFS and Devices
 
@@ -172,15 +175,12 @@ Status legend:
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [ ] `planned` Add full POSIX signal ABI: `sigaction`, masks, `sigreturn`, and real handler entry.
 
-## M13: AArch64 Port Completion
+## M13: Archived AArch64 Port
 
-- [x] `done` Hook up AArch64 to the build (`KERNEL_SOURCES`).
-- [x] `initial` C kernel entry and memory map parsing for AArch64.
-- [x] `initial` Implement AArch64 architecture layer.
-- [x] `done` Ensure common code compiles for both platforms.
-- [x] `initial` Add AArch64 boot, serial console, interrupt, paging, and context-switch files.
-- [x] `done` Add AArch64 network/socket stubs so common VFS socket code links cleanly.
-- [ ] `planned` Bring AArch64 to feature parity with x86_64 boot, scheduler, MMU, devices, and userspace.
+- [x] `done` Move the old AArch64 port out of the active build.
+- [x] `done` Archive AArch64 boot, serial console, interrupt, paging, bootinfo, and context-switch files under `archive/kernel/arch/aarch64`.
+- [x] `done` Remove `ARCH=aarch64`, `run-aarch64`, and `smoke-aarch64` from the active Makefile/test workflow.
+- [ ] `planned` Restore AArch64 only after the x86_64 userspace, VFS, and shell paths are stable.
 
 ## M14: Advanced Storage, Swap & File Systems
 
@@ -221,12 +221,12 @@ Status legend:
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
-- [x] `initial` POSIX Process Management: `fork()`, standard `execve()`, `waitpid()` initial ABI.
-- [x] `initial` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
-- [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
-- [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
-- [x] `initial` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
-- [x] `initial` POSIX Terminal: `ioctl()` and `termios` support for TTY.
+- [x] `done` POSIX Process Management: `fork()`, standard `execve()`, `waitpid()` initial ABI.
+- [x] `done` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
+- [x] `done` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
+- [x] `done` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
+- [x] `done` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
+- [x] `done` POSIX Terminal: `ioctl()` and `termios` support for TTY.
 - [x] `done` Add syscall ABI constants and userspace syscall header mirrors.
 - [x] `done` Add `docs/abi.md` for the userspace ELF ABI and calling convention.
 - [x] `initial` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
@@ -244,7 +244,7 @@ Status legend:
 - [x] `initial` Add process exit status propagation and zombie reaping semantics.
 - [x] `done` Add QEMU tests that boot, launch `/bin/init`, and execute a VFS-loaded program.
 - [x] `done` Add external clang-backed `b1nix-cc` wrapper for early ELF builds.
-- [ ] `planned` Add hardware-enforced ring3 entry and return.
+- [x] `done` Add hardware-enforced ring3 entry and return.
 
 M18 establishes the loader and process-image ABI while B1NIX still uses kernel
 threads as the execution substrate. ELF64 files are read through VFS, PT_LOAD
@@ -300,8 +300,8 @@ tables.
 ## M21: Persistent Root Filesystem
 
 - [x] `done` Boot with a persistent root filesystem from a disk image.
-- [x] `initial` Add mountpoints and a real `mount`/`umount` VFS model.
-- [x] `initial` Stabilize writable ext2 as the first reliable root filesystem target.
+- [x] `done` Add mountpoints and a real `mount`/`umount` VFS model.
+- [x] `done` Stabilize writable ext2 as the first reliable root filesystem target.
 - [x] `done` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`).
 - [x] `done` Flush block cache on shutdown and reboot.
 - [x] `done` Add `/etc`, `/bin`, `/dev`, `/home`, `/tmp`, and `/var` layout.
@@ -327,12 +327,12 @@ disk userland is populated.
 - [x] `done` Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
 - [x] `done` Keep BusyBox-style multi-call dispatch for small binaries.
 - [x] `done` Add `clear`, `mem`, `dmesg`, `ifconfig`, `ping`, `nc`, and `wget` utilities.
-- [x] `initial` Implement `ln` through VFS hard-link aliases and `ln -s` symlinks.
+- [x] `done` Implement `ln` through VFS hard-link aliases and `ln -s` symlinks.
 - [x] `done` Add `readlink` utility and init-path symlink smoke coverage.
 - [x] `done` Implement `mount` command mounting path and active mount listing.
 - [x] `done` Add init-path utility smoke tests through `/bin/m22-smoke` and QEMU serial checks.
-- [ ] `planned` Add interactive shell-driven utility smoke tests.
-- [ ] `planned` Add option-compatible behavior for common utility flags.
+- [x] `done` Add interactive shell-driven utility smoke tests.
+- [x] `done` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q).
 
 ## M23: Networking for Terminal Use
 
@@ -342,7 +342,7 @@ disk userland is populated.
 - [x] `done` Add `ifconfig`-style interface status.
 - [x] `partial` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
 - [x] `done` Handle missing network devices gracefully in user-facing network paths.
-- [x] `done` Keep AArch64 network syscalls/socket paths as explicit unavailable stubs.
+- [x] `done` Keep non-x86 network portability concerns out of the active terminal networking target.
 - [ ] `planned` Add TCP server support: `listen`, `accept`, close states, retransmission, and timeout handling.
 - [ ] `planned` Add socket options and `select`/`poll` readiness.
 
@@ -352,7 +352,7 @@ disk userland is populated.
 - [x] `initial` Add kernel backtraces or symbolized panic locations.
 - [x] `partial` Replace avoidable panics with recoverable errors.
 - [x] `partial` Add regression/smoke tests for VFS, scheduler, pipes, terminal, and sockets.
-- [x] `done` Add QEMU smoke tests for x86_64 and AArch64.
+- [x] `done` Add QEMU smoke tests for the active x86_64 target.
 - [x] `done` Track implemented, initial, stub, and planned features explicitly in docs.
 - [x] `done` Add kernel log levels and a ring buffer readable from userspace.
 - [x] `done` Add `/bin/dmesg` backed by `SYS_DMESG`.
@@ -365,14 +365,14 @@ disk userland is populated.
 - [x] `done` Define the B1NIX userspace ELF ABI and calling convention.
 - [x] `done` Add `crt0.o` startup code for B1NIX userspace programs.
 - [x] `done` Add a userspace linker script for B1NIX ELF binaries.
-- [x] `initial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and simple `malloc`.
+- [x] `done` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`.
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] `done` Build and run a VFS-loaded `hello.c` ELF program.
-- [x] `partial` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
-- [x] `partial` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
-- [ ] `planned` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
-- [ ] `planned` Compile one simple shell utility inside B1NIX.
-- [ ] `planned` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
+- [x] `done` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
+- [x] `done` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
+- [x] `done` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
+- [x] `initial` Compile one simple shell utility inside B1NIX.
+- [x] `done` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
 
 ## M26: Full Toolchain and Self-Hosting
 

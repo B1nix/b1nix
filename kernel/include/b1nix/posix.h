@@ -30,6 +30,7 @@
 #define B1NIX_O_WRONLY    0x0001
 #define B1NIX_O_RDWR      0x0002
 #define B1NIX_O_CREAT     0x0040
+#define B1NIX_O_EXCL      0x0080
 #define B1NIX_O_TRUNC     0x0200
 #define B1NIX_O_APPEND    0x0400
 #define B1NIX_O_DIRECTORY 0x10000

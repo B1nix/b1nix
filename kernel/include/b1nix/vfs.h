@@ -6,7 +6,7 @@
 #include <b1nix/dirent.h>
 #include <b1nix/posix.h>
 
-#define VFS_MAX_PATH 64
+#define VFS_MAX_PATH 256
 
 /* Standard permission bits */
 #define VFS_IRUSR  0400    /* Owner read */
@@ -71,6 +71,7 @@ struct vfs_node {
 };
 
 void vfs_init(void);
+void vfs_resolve_path(const char *path, char *out);
 struct vfs_node *vfs_find_node(const char *path);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type, void *data, usize size, u32 flags);
 

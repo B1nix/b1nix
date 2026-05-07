@@ -274,6 +274,63 @@ static void compose_symlink_path(const char *parent_path, const char *target,
 	}
 }
 
+void vfs_resolve_path(const char *path, char *out)
+{
+	if (!path || !out) return;
+	char combined[VFS_MAX_PATH];
+	usize len = 0;
+
+	if (path[0] == '/') {
+		strncpy(combined, path, VFS_MAX_PATH);
+	} else {
+		const char *cwd = scheduler_get_cwd();
+		strncpy(combined, cwd, VFS_MAX_PATH);
+		len = strlen(combined);
+		if (len > 0 && combined[len - 1] != '/' && len < VFS_MAX_PATH - 1) {
+			combined[len++] = '/';
+			combined[len] = '\0';
+		}
+		usize plen = strlen(path);
+		if (len + plen >= VFS_MAX_PATH) plen = VFS_MAX_PATH - len - 1;
+		memcpy(combined + len, path, plen);
+		combined[len + plen] = '\0';
+	}
+
+	/* Normalization: handle . and .. and // */
+	char *parts[64];
+	int part_count = 0;
+	char tmp[VFS_MAX_PATH];
+	strncpy(tmp, combined, VFS_MAX_PATH);
+
+	char *curr = tmp;
+	while (*curr && part_count < 64) {
+		while (*curr == '/') curr++;
+		if (!*curr) break;
+		char *start = curr;
+		while (*curr && *curr != '/') curr++;
+		if (*curr) { *curr = '\0'; curr++; }
+		
+		if (strcmp(start, ".") == 0) continue;
+		if (strcmp(start, "..") == 0) {
+			if (part_count > 0) part_count--;
+			continue;
+		}
+		parts[part_count++] = start;
+	}
+
+	out[0] = '/';
+	out[1] = '\0';
+	usize pos = 1;
+	for (int i = 0; i < part_count; i++) {
+		usize plen = strlen(parts[i]);
+		if (pos + plen + 1 >= VFS_MAX_PATH) break;
+		memcpy(out + pos, parts[i], plen);
+		pos += plen;
+		if (i < part_count - 1) out[pos++] = '/';
+		out[pos] = '\0';
+	}
+}
+
 static struct vfs_node *vfs_find_node_internal(const char *path, int follow_final, int depth)
 {
 	if (!root_node) return 0;
@@ -320,12 +377,16 @@ static struct vfs_node *vfs_find_node_internal(const char *path, int follow_fina
 
 struct vfs_node *vfs_find_node(const char *path)
 {
-	return vfs_find_node_internal(path, 1, 0);
+	char resolved[VFS_MAX_PATH];
+	vfs_resolve_path(path, resolved);
+	return vfs_find_node_internal(resolved, 1, 0);
 }
 
 static struct vfs_node *vfs_find_node_no_follow(const char *path)
 {
-	return vfs_find_node_internal(path, 0, 0);
+	char resolved[VFS_MAX_PATH];
+	vfs_resolve_path(path, resolved);
+	return vfs_find_node_internal(resolved, 0, 0);
 }
 
 static struct vfs_node *add_node(const char *path, enum vfs_node_type type, void *data, usize size, u32 flags)
@@ -664,13 +725,16 @@ int vfs_open_flags(const char *path, int flags)
 {
 	struct vfs_node *node = vfs_find_node(path);
 	if (node == 0 && (flags & B1NIX_O_CREAT)) {
-		if (vfs_create(path, "") != 0) return -1;
+		int err = vfs_create(path, "");
+		if (err != 0) return err;
 		node = vfs_find_node(path);
+	} else if (node && (flags & B1NIX_O_CREAT) && (flags & B1NIX_O_EXCL)) {
+		return -EEXIST;
 	}
-	if (node == 0) return -1;
-	if ((flags & B1NIX_O_DIRECTORY) && node->type != VFS_DIRECTORY) return -1;
+	if (node == 0) return -ENOENT;
+	if ((flags & B1NIX_O_DIRECTORY) && node->type != VFS_DIRECTORY) return -ENOTDIR;
 
-	/* Permission check: read access for opening */
+	/* Permission check */
 	const struct cred *cred = get_current_cred();
 	int write_access = (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR | B1NIX_O_TRUNC)) != 0;
 	if (cred && !vfs_get_node_perm(node, cred, write_access)) {
@@ -683,7 +747,7 @@ int vfs_open_flags(const char *path, int flags)
 	}
 
 	int handle = alloc_handle(node);
-	if (handle < 0) return -1;
+	if (handle < 0) return -ENFILE;
 	handles[handle].flags = flags;
 	if (flags & B1NIX_O_APPEND) {
 		handles[handle].offset = node->size;
@@ -691,7 +755,7 @@ int vfs_open_flags(const char *path, int flags)
 	int fd = scheduler_fd_alloc(handle);
 	if (fd < 0) {
 		release_handle(handle);
-		return -1;
+		return -EMFILE;
 	}
 	return fd;
 }
@@ -1020,7 +1084,7 @@ static struct vfs_node *vfs_parent_dir_for_path(const char *path, char *name)
 	return parent;
 }
 
-int vfs_unlink(const char *path)
+static int vfs_remove_node(const char *path, int is_rmdir)
 {
 	char parent_path[256];
 	char name[64];
@@ -1036,7 +1100,13 @@ int vfs_unlink(const char *path)
 	struct vfs_node *child = parent->first_child;
 	while (child) {
 		if (strcmp(child->name, name) == 0) {
-			if (child->type == VFS_DIRECTORY && child->first_child) return -ENOTEMPTY;
+			if (is_rmdir) {
+				if (child->type != VFS_DIRECTORY) return -ENOTDIR;
+				if (child->first_child) return -ENOTEMPTY;
+			} else {
+				if (child->type == VFS_DIRECTORY) return -EISDIR;
+			}
+
 			if (prev) prev->next_sibling = child->next_sibling;
 			else parent->first_child = child->next_sibling;
 			child->parent = 0;
@@ -1050,21 +1120,27 @@ int vfs_unlink(const char *path)
 	return -ENOENT;
 }
 
+int vfs_unlink(const char *path)
+{
+	return vfs_remove_node(path, 0);
+}
+
 int vfs_link(const char *target, const char *link_path)
 {
 	struct vfs_node *target_node = vfs_find_node(target);
-	if (!target_node || target_node->type == VFS_DIRECTORY) return -1;
-	if (vfs_find_node_no_follow(link_path) != 0) return -1;
+	if (!target_node) return -ENOENT;
+	if (target_node->type == VFS_DIRECTORY) return -EPERM;
+	if (vfs_find_node_no_follow(link_path) != 0) return -EEXIST;
 
 	char parent_path[256];
 	char name[64];
-	if (split_parent_path(link_path, parent_path, name) < 0) return -1;
+	if (split_parent_path(link_path, parent_path, name) < 0) return -EINVAL;
 
 	struct vfs_node *parent = vfs_find_node(parent_path);
-	if (!parent || parent->type != VFS_DIRECTORY) return -1;
+	if (!parent || parent->type != VFS_DIRECTORY) return -ENOENT;
 
 	const struct cred *cred = get_current_cred();
-	if (cred && !vfs_get_node_perm(parent, cred, 1)) return -1;
+	if (cred && !vfs_get_node_perm(parent, cred, 1)) return -EACCES;
 
 	struct vfs_node *node = alloc_node();
 	if (!node) return -1;
@@ -1132,18 +1208,20 @@ int vfs_rename(const char *old_path, const char *new_path)
 	char old_name[64];
 	char new_parent_path[256];
 	char new_name[64];
-	if (split_parent_path(old_path, old_parent_path, old_name) < 0) return -1;
-	if (split_parent_path(new_path, new_parent_path, new_name) < 0) return -1;
+	if (split_parent_path(old_path, old_parent_path, old_name) < 0) return -EINVAL;
+	if (split_parent_path(new_path, new_parent_path, new_name) < 0) return -EINVAL;
 
 	struct vfs_node *old_parent = vfs_find_node(old_parent_path);
 	struct vfs_node *new_parent = vfs_find_node(new_parent_path);
-	if (!old_parent || !new_parent || new_parent->type != VFS_DIRECTORY) return -1;
-	if (vfs_find_node(new_path)) return -1;
+	if (!old_parent || !new_parent || new_parent->type != VFS_DIRECTORY) return -ENOENT;
+	if (vfs_find_node(new_path)) return -EEXIST; /* TODO: overwrite files */
 
 	struct vfs_node *node = find_child(old_parent, old_name);
-	if (!node) return -1;
+	if (!node) return -ENOENT;
 	const struct cred *cred = get_current_cred();
-	if (cred && (!vfs_get_node_perm(old_parent, cred, 1) || !vfs_get_node_perm(new_parent, cred, 1))) return -1;
+	if (cred && (!vfs_get_node_perm(old_parent, cred, 1) || !vfs_get_node_perm(new_parent, cred, 1))) {
+		return -EACCES;
+	}
 
 	struct vfs_node *prev = 0;
 	struct vfs_node *child = old_parent->first_child;
@@ -1166,9 +1244,7 @@ int vfs_rename(const char *old_path, const char *new_path)
 
 int vfs_rmdir(const char *path)
 {
-	struct vfs_node *node = vfs_find_node(path);
-	if (!node || node->type != VFS_DIRECTORY || node->first_child) return -1;
-	return vfs_unlink(path);
+	return vfs_remove_node(path, 1);
 }
 
 int vfs_fstat(int fd, struct b1nix_stat *st)

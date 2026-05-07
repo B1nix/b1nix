@@ -12,7 +12,7 @@ void exit(int status)
    In a real system, this would use sbrk/mmap.
    For M25, we use a static pool. */
 
-#define HEAP_SIZE (64 * 1024)
+#define HEAP_SIZE (16 * 1024 * 1024)
 static char heap[HEAP_SIZE];
 static size_t heap_used;
 

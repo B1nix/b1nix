@@ -126,8 +126,10 @@ enable_long_mode:
 .align 16
 gdt64:
 	.quad 0
-	.quad 0x00af9a000000ffff
-	.quad 0x00af92000000ffff
+	.quad 0x00af9a000000ffff /* 0x08: Kernel Code */
+	.quad 0x00af92000000ffff /* 0x10: Kernel Data */
+	.quad 0x00aff2000000ffff /* 0x18: User Data (Ring 3) */
+	.quad 0x00affa000000ffff /* 0x20: User Code (Ring 3) */
 gdt64_pointer:
 	.word gdt64_pointer - gdt64 - 1
 	.quad gdt64

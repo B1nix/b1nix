@@ -683,7 +683,8 @@ static void ext4_populate_vfs(u32 ino, const char *base_path)
 
 void ext4_init(void)
 {
-    ext4_dev = blk_get("virtio-blk2");
+    ext4_dev = blk_get("virtio-blk1");
+    if (!ext4_dev) ext4_dev = blk_get("virtio-blk2");
     if (!ext4_dev) ext4_dev = blk_get("sata1");
     if (!ext4_dev) return;
 

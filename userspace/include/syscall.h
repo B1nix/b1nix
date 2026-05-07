@@ -30,12 +30,12 @@ enum {
 	SYS_SETPGRP  = 88,
 };
 
-/* Raw syscall — uses int $0x80 convention for kernel threads */
+/* Raw syscall for the x86_64 B1NIX syscall ABI. */
 static inline long syscall(long num, long a0, long a1, long a2, long a3)
 {
 	long ret;
-	register long r10 __asm__("r10") = a3;
-	register long r8  __asm__("r8")  = a2;
+	register long r10 __asm__("r10") = a2;
+	register long r8  __asm__("r8")  = a3;
 	register long rdx __asm__("rdx") = a1;
 	register long rsi __asm__("rsi") = a0;
 	register long rdi __asm__("rdi") = num;

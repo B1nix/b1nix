@@ -6,6 +6,9 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/errno.h>
+
+extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
 
 #define MAX_PROGRAMS 64
 #define ELF_MAGIC0 0x7f
@@ -322,18 +325,19 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   return image;
 }
 
-static int user_run_elf_image(struct user_loaded_image *image) {
+static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *code)
+{
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
     const char *payload = segment->data;
-    if (segment->filesz < 10 || memcmp(payload, "B1NXEXEC", 9) != 0)
-      continue;
+    if (segment->filesz < 10 || memcmp(payload, "B1NXEXEC", 9) != 0) continue;
 
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
       const char *message = op + strlen(op) + 1;
       syscall_dispatch(SYS_WRITE, (u64)(usize)message, strlen(message), 0, 0);
-      return 0;
+      *code = 0;
+      return 1;
     }
     if (strcmp(op, "init") == 0) {
       const char *child = op + strlen(op) + 1;
@@ -353,11 +357,55 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       }
     }
   }
+  return 0;
+}
 
-  console_write("user: unsupported ELF image ");
-  console_write(image->path);
-  console_write("\n");
-  return 126;
+static int user_run_elf_image(struct user_loaded_image *image) {
+  int compat_code = 0;
+  if (user_try_run_b1nxexec_image(image, &compat_code)) return compat_code;
+
+  /* Map segments into the address space */
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *segment = &image->segments[i];
+    u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
+    u64 vaddr_end = (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    
+    for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
+      u64 frame = pmm_alloc_frame();
+      if (!frame) return -ENOMEM;
+      
+      u64 flags = VMM_USER | VMM_WRITABLE; // Simplify for now
+      vmm_map_page(v, frame, flags);
+      
+      /* Copy data if within filesz */
+      u64 page_offset = 0;
+      if (v < segment->vaddr) page_offset = segment->vaddr - v;
+      
+      if (v + page_offset < segment->vaddr + segment->filesz) {
+        u64 chunk_offset = (v + page_offset) - segment->vaddr;
+        u64 chunk_size = segment->filesz - chunk_offset;
+        if (chunk_size > PAGE_SIZE - page_offset) chunk_size = PAGE_SIZE - page_offset;
+        
+        memcpy((void *)(usize)(v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
+      }
+    }
+  }
+
+  /* Map stack */
+  u64 stack_start = image->address_space.stack_top - image->address_space.stack_size;
+  u64 stack_aligned = stack_start & ~(PAGE_SIZE - 1);
+  for (u64 v = stack_aligned; v < image->address_space.stack_top; v += PAGE_SIZE) {
+    u64 frame = pmm_alloc_frame();
+    vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
+    /* Copy initial stack image */
+    u64 offset = v - stack_aligned;
+    memcpy((void *)(usize)v, (char *)image->address_space.stack_image + offset, PAGE_SIZE);
+  }
+
+  /* Jump to userspace! */
+  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc, (u64)image->argv);
+  
+  return 0; // Should not reach here
 }
 
 static void user_process_thread(void *arg) {
