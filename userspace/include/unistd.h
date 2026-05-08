@@ -30,7 +30,26 @@ struct stat {
 	unsigned long st_size;
 	unsigned long st_blksize;
 	unsigned long st_blocks;
+	unsigned int  st_atime;
+	unsigned int  st_mtime;
+	unsigned int  st_ctime;
 };
 int stat(const char *path, struct stat *st);
+
+struct statfs {
+	unsigned long f_type;
+	unsigned long f_bsize;
+	unsigned long f_blocks;
+	unsigned long f_bfree;
+	unsigned long f_bavail;
+	unsigned long f_files;
+	unsigned long f_ffree;
+	unsigned long f_fsid;
+	unsigned long f_namelen;
+	unsigned long f_frsize;
+	unsigned long f_flags;
+	unsigned long f_spare[4];
+};
+int statfs(const char *path, struct statfs *buf);
 
 #endif

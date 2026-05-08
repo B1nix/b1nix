@@ -172,8 +172,12 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 static int user_image_read_vfs_file(const char *path, char **out_data,
                                     usize *out_size) {
   struct vfs_node *node = vfs_find_node(path);
-  if (!node || node->type != VFS_FILE || node->size == 0)
+  if (!node || IS_ERR(node)) {
     return -1;
+  }
+  if (node->type != VFS_FILE || node->size == 0) {
+    return -1;
+  }
 
   /* Enforce executable permission (at least one 'x' bit) */
   if ((node->mode & 0111) == 0) {
@@ -181,8 +185,9 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
   }
 
   int fd = vfs_open(path);
-  if (fd < 0)
+  if (fd < 0) {
     return -1;
+  }
 
   char *data = kmalloc(node->size);
   if (!data) {
@@ -192,8 +197,9 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
 
   isize got = vfs_read(fd, data, node->size);
   vfs_close(fd);
-  if (got < 0 || (usize)got != node->size)
+  if (got < 0 || (usize)got != node->size) {
     return -1;
+  }
 
   *out_data = data;
   *out_size = node->size;
@@ -308,21 +314,23 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->argc = 1;
   }
 
+  const struct user_program *program = user_find_program(path);
+  if (program) {
+    image->kind = USER_IMAGE_BUILTIN;
+    image->path = kernel_strdup(path);
+    image->entry = (u64)(usize)program->entry;
+    image->address_space = user_address_space_create();
+    user_build_initial_stack(image);
+    return image;
+  }
+
   if (user_load_elf64(image, path) == 0) {
     if (user_build_initial_stack(image) != 0)
       return 0;
     return image;
   }
 
-  const struct user_program *program = user_find_program(path);
-  if (!program)
-    return 0;
-  image->kind = USER_IMAGE_BUILTIN;
-  image->path = kernel_strdup(path);
-  image->entry = (u64)(usize)program->entry;
-  image->address_space = user_address_space_create();
-  user_build_initial_stack(image);
-  return image;
+  return 0;
 }
 
 static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *code)

@@ -48,6 +48,8 @@ struct vfs_node {
 	char name[64];
 	enum vfs_node_type type;
 	u32 flags;
+	int refcount;
+	int deleted;
 	usize size;
 	void *data;
 
@@ -63,6 +65,11 @@ struct vfs_node {
 	struct vfs_node *parent;
 	struct vfs_node *first_child;
 	struct vfs_node *next_sibling;
+
+	/* Timestamps */
+	u32 atime;
+	u32 mtime;
+	u32 ctime;
 
 	isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size);
 	usize (*list_cb)(struct vfs_node *node, const char **names, usize max_names);
@@ -91,6 +98,7 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names);
 struct vfs_node *vfs_find_node_by_fd(int fd);
 int vfs_stat(const char *path, struct b1nix_stat *st);
 int vfs_lstat(const char *path, struct b1nix_stat *st);
+int vfs_statfs(const char *path, struct b1nix_statfs *st);
 isize vfs_lseek(int handle, isize offset, int whence);
 int vfs_unlink(const char *path);
 int vfs_link(const char *target, const char *link_path);
@@ -120,7 +128,11 @@ void vfs_socket_push_udp(u16 local_port, const void *data, usize len);
 
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);
+int vfs_fchmod(int fd, u16 mode);
 int vfs_chown(const char *path, u16 uid, u16 gid);
+int vfs_fchown(int fd, u16 uid, u16 gid);
+int vfs_fstatfs(int fd, struct b1nix_statfs *st);
+int vfs_syncfs(int fd);
 int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
                       int write_access);
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl);

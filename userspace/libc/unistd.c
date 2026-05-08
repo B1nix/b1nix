@@ -117,6 +117,11 @@ int stat(const char *path, struct stat *st)
 	return (int)syscall(SYS_STAT, (long)path, (long)st, 0, 0);
 }
 
+int statfs(const char *path, struct statfs *buf)
+{
+	return (int)syscall(SYS_STATFS, (long)path, (long)buf, 0, 0);
+}
+
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset)
 {
 	(void)addr; (void)prot; (void)flags; (void)fd; (void)offset;

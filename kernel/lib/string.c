@@ -146,6 +146,18 @@ char *strcat(char *dest, const char *src)
 	return dest;
 }
 
+char *strncat(char *dest, const char *src, size_t n)
+{
+	char *d = dest;
+	while (*d) d++;
+	size_t i;
+	for (i = 0; i < n && src[i] != '\0'; i++) {
+		d[i] = src[i];
+	}
+	d[i] = '\0';
+	return dest;
+}
+
 char *strchr(const char *s, int c)
 {
 	while (*s != '\0') {

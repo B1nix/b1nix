@@ -35,6 +35,7 @@ struct cred {
     u16  sgid;      /* Saved set-group-ID */
     u16  groups[MAX_GROUPS]; /* Supplementary groups */
     int  ngroups;
+    u16  umask;
 };
 
 /* ── Ring / Privilege level ── */

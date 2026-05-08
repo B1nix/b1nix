@@ -130,6 +130,7 @@ struct cred *cred_create_default(void)
     c->egid = ROOT_GID;
     c->sgid = ROOT_GID;
     c->ngroups = 0;
+    c->umask = 0022;
 
     return c;
 }

@@ -20,6 +20,9 @@
 #define B1NIX_F_SETFL 4
 #define B1NIX_F_GETFD 1
 #define B1NIX_F_SETFD 2
+#define B1NIX_F_GETLK 5
+#define B1NIX_F_SETLK 6
+#define B1NIX_F_SETLKW 7
 #define B1NIX_FD_CLOEXEC 1
 
 #define B1NIX_AF_INET 2
@@ -33,6 +36,7 @@
 #define B1NIX_O_EXCL      0x0080
 #define B1NIX_O_TRUNC     0x0200
 #define B1NIX_O_APPEND    0x0400
+#define B1NIX_O_CLOEXEC   0x0800
 #define B1NIX_O_DIRECTORY 0x10000
 
 #define B1NIX_TCGETS 0x5401
@@ -54,6 +58,9 @@ struct b1nix_stat {
 	u64 st_size;
 	u64 st_blksize;
 	u64 st_blocks;
+	u32 st_atime;
+	u32 st_mtime;
+	u32 st_ctime;
 };
 
 struct b1nix_termios {
@@ -97,6 +104,21 @@ struct b1nix_mount_entry {
 	char target[64];
 	char fstype[16];
 	u64 flags;
+};
+
+struct b1nix_statfs {
+	u64 f_type;
+	u64 f_bsize;
+	u64 f_blocks;
+	u64 f_bfree;
+	u64 f_bavail;
+	u64 f_files;
+	u64 f_ffree;
+	u64 f_fsid;
+	u64 f_namelen;
+	u64 f_frsize;
+	u64 f_flags;
+	u64 f_spare[4];
 };
 
 #endif
