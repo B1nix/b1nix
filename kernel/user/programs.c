@@ -11,7 +11,7 @@
 void user_register_program(const char *path, user_program_entry entry);
 
 static void uwrite(const char *text) {
-  syscall_dispatch(SYS_WRITE, (u64)(usize)text, strlen(text), 1, 0);
+  syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0);
 }
 
 /* ... (uwrite_dec_value, uwrite_ipv4, b1fetch_cpu_name remain unchanged) ... */
@@ -107,7 +107,7 @@ static void sh_jobs_print(void) {
     if (sh_jobs[i].done)
       continue;
     char num[4] = {'[', '0' + (i + 1), ']', ' '};
-    syscall_dispatch(SYS_WRITE, (u64)(usize)num, 4, 0, 0);
+    syscall_dispatch(SYS_WRITE, 0, (u64)(usize)num, 4, 0);
     uwrite(sh_jobs[i].name);
     uwrite("\n");
     any = 1;

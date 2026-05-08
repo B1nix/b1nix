@@ -129,7 +129,7 @@ static int bb_copy_file(const char *src, const char *dst) {
     u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0);
     if (n == 0 || (isize)n < 0)
       break;
-    syscall_dispatch(SYS_WRITE, (u64)(usize)buf, n, fdd, 1);
+    syscall_dispatch(SYS_WRITE, (u64)fdd, (u64)(usize)buf, (u64)n, 0);
   }
   syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0);
   syscall_dispatch(SYS_CLOSE, fdd, 0, 0, 0);

@@ -44,42 +44,61 @@ struct acl_entry {
 #define ACL_MASK        0x10
 #define ACL_OTHER       0x20
 
-struct vfs_node {
-	char name[64];
+struct vfs_node;
+
+struct vfs_inode {
 	enum vfs_node_type type;
 	u32 flags;
-	int refcount;
-	int deleted;
+	int refcount;   /* Internal references (e.g. open handles) */
+	int nlink;      /* Number of hard links (names pointing to this inode) */
 	usize size;
+	usize capacity;
 	void *data;
 
 	/* Ownership and permissions */
 	u16 uid;
 	u16 gid;
-	u16 mode;        /* Permission bits: rwxrwxrwx + type bits */
+	u16 mode;
 
 	/* ACL support */
 	struct acl_entry acls[ACL_MAX_ENTRIES];
 	int acl_count;
-
-	struct vfs_node *parent;
-	struct vfs_node *first_child;
-	struct vfs_node *next_sibling;
 
 	/* Timestamps */
 	u32 atime;
 	u32 mtime;
 	u32 ctime;
 
+	struct block_device *blk_dev;
+
+	/* Callbacks (Inode Operations) */
 	isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size);
 	usize (*list_cb)(struct vfs_node *node, const char **names, usize max_names);
-  isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer,
-                    usize size);
-  int (*create_cb)(struct vfs_node *dir, const char *name,
-                   const char *full_path);
-  int (*mkdir_cb)(struct vfs_node *dir, const char *name);
+	isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer, usize size);
+	int (*create_cb)(struct vfs_node *dir, const char *name, const char *full_path, u32 mode);
+	int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
+	int (*unlink_cb)(struct vfs_node *dir, const char *name);
+	int (*rmdir_cb)(struct vfs_node *dir, const char *name);
+	int (*rename_cb)(struct vfs_node *old_dir, const char *old_name, struct vfs_node *new_dir, const char *new_name);
+	int (*link_cb)(struct vfs_node *target, struct vfs_node *dir, const char *name);
+	int (*symlink_cb)(struct vfs_node *dir, const char *name, const char *target);
+	void (*release_cb)(struct vfs_node *node);
+	int (*setattr_cb)(struct vfs_node *node);
+	int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
 };
 
+struct vfs_node {
+	char name[64];
+	struct vfs_inode *inode;
+	int refcount;   /* References to this NAME (e.g. current directory) */
+	int deleted;
+
+	struct vfs_node *parent;
+	struct vfs_node *first_child;
+	struct vfs_node *next_sibling;
+};
+
+u32 vfs_get_unix_time(void);
 void vfs_init(void);
 void vfs_resolve_path(const char *path, char *out);
 struct vfs_node *vfs_find_node(const char *path);
@@ -134,7 +153,7 @@ int vfs_fchown(int fd, u16 uid, u16 gid);
 int vfs_fstatfs(int fd, struct b1nix_statfs *st);
 int vfs_syncfs(int fd);
 int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
-                      int write_access);
+                      u32 mask);
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl);
 int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
                 int max_entries);

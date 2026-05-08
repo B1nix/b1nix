@@ -16,7 +16,7 @@ struct kheap_block {
 
 #define KHEAP_MAGIC 0xB1A110C
 #define KHEAP_HEADER_SIZE 32
-#define KHEAP_REUSE_MIN_SIZE (4 * PAGE_SIZE)
+#define KHEAP_REUSE_MIN_SIZE 0
 
 static struct kheap_state heap;
 static struct kheap_block *free_list;

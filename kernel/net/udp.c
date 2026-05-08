@@ -53,4 +53,5 @@ void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payl
 	memcpy(buffer + sizeof(struct udp_header), payload, size);
 
 	ipv4_send(dst, 17 /* UDP */, buffer, total_size);
+	kfree(buffer);
 }

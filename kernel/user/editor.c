@@ -99,7 +99,7 @@ static int editor_save(void)
 		return -1;
 	}
 
-	u64 written = syscall_dispatch(SYS_WRITE, (u64)(usize)save_buffer, (u64)pos, fd, 1);
+	u64 written = syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)save_buffer, (u64)pos, 0);
 	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
 	if (written == (u64)-1 || (usize)written != (usize)pos) {
 		return -1;

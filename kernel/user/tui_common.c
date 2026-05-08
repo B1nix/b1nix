@@ -8,12 +8,12 @@
 
 static void t_write(const char *s)
 {
-	syscall_dispatch(SYS_WRITE, (u64)(usize)s, strlen(s), 0, 0);
+	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)strlen(s), 0);
 }
 
 static void t_write_n(const char *s, int n)
 {
-	syscall_dispatch(SYS_WRITE, (u64)(usize)s, n, 0, 0);
+	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)n, 0);
 }
 
 void tui_write(const char *s)

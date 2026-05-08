@@ -15,9 +15,9 @@ The stable no-surprises checklist for closing POSIX-facing work lives in
 
 ## Current POSIX Estimate
 
-- Overall practical POSIX compatibility: roughly 40-48%.
-- `VFS/path/files`: roughly 66-73%.
-- `Shell/coreutils`: roughly 62-70%.
+- Overall practical POSIX compatibility: roughly 55-63%.
+- `VFS/path/files`: roughly 75-82%.
+- `Shell/coreutils`: roughly 73-80%.
 
 These percentages mean "can run small real workflows", not "passes a POSIX
 conformance suite". The biggest blockers remain durable filesystem semantics,
@@ -70,7 +70,7 @@ and broader utility flag compatibility.
 - [x] `done` Add task sleep/yield APIs backed by timer ticks.
 - [x] `done` Add task priorities.
 - [x] `done` Add zombie lifecycle and parent wait bookkeeping.
-- [x] `partial` Add process groups and session metadata.
+- [x] `partial` Add process groups and session metadata (`setsid`, `getpgrp`, `setpgrp` with POSIX group-leader check fully implemented; foreground job ownership partial).
 - [ ] `planned` Add full POSIX scheduling/session/job-control semantics.
 
 ## M4: Userspace
@@ -80,7 +80,7 @@ and broader utility flag compatibility.
 - [x] `done` Add initramfs.
 - [x] `done` Run `/bin/init`.
 - [x] `done` Add basic shell.
-- [x] `initial` Add ELF64 loading from VFS with argc/argv/envp/auxv stack metadata.
+- [x] `partial` Add ELF64 loading from VFS with per-process page mapping via VMM, argc/argv/envp/auxv stack metadata, and hardware ring3 entry.
 - [x] `initial` Add syscall `copyin`/`copyout`/`copyinstr` helpers.
 - [x] `partial` Add built-in program fallback when ELF loading fails.
 - [x] `done` Add hardware-enforced ring3 userspace entry/return for normal programs.
@@ -100,7 +100,7 @@ and broader utility flag compatibility.
 - [x] `done` Add ACL fields and permission metadata in VFS nodes.
 - [x] `initial` Add symlinks, hard links, and `readlink`.
 - [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
-- [x] `partial` Add dot, dot-dot, duplicate-slash, symlink-loop, and common error path normalization at syscall/VFS boundaries.
+- [x] `partial` Add dot, dot-dot, duplicate-slash, symlink-loop (iterative resolver, 16-hop limit, ELOOP), mount-crossing via `..`, and POSIX errno normalization at syscall/VFS boundaries.
 - [x] `partial` Add POSIX-style open-file-description mode checks for read-only, write-only, append, exclusive create, and directory-only opens.
 - [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
 - [ ] `planned` Add full permissions and mount-aware path normalization.
@@ -132,9 +132,10 @@ and broader utility flag compatibility.
 - [x] `initial` Add FAT32 or ext2 filesystem driver.
 - [x] `done` Add initramfs fallback tree.
 - [x] `partial` Add FAT32 read/import path with limited feature support.
-- [x] `partial` Add ext1 legacy read-only support.
+- [x] `partial` Add ext1 read/write support (inode alloc, block alloc, single/double indirect, symlinks, VFS population; missing timestamps and fsck-friendly metadata).
 - [x] `partial` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
-- [x] `stub` Add ext3/ext4 source scaffolding.
+- [x] `partial` Add ext3 read/write driver with JBD journaling (inode/block alloc, dir entries, journal mount/recover; no unlink/rename/fsck metadata).
+- [x] `partial` Add ext4 read/write driver with extent tree, 64-bit BGD, flex_bg, and JBD journaling (no unlink/rename/htree/fsck metadata).
 - [ ] `planned` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 
 ## M9: Hardware Drivers
@@ -165,7 +166,7 @@ and broader utility flag compatibility.
 ## M11: Shell and Utilities
 
 - [x] `done` Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
-- [x] `partial` Pipes and redirection.
+- [x] `partial` Pipes and redirection (real `pipe()`/`dup2()`, `<`, `>`, `>>`, `2>`, `2>&1`; EOF/blocking behavior not fully hardened).
 - [x] `done` Environment variables.
 - [x] `partial` Job control.
 - [x] `done` PATH lookup against VFS.
@@ -188,7 +189,8 @@ and broader utility flag compatibility.
 - [x] `done` `fork`, `execve`, and `waitpid` syscalls.
 - [x] `initial` `brk`, `munmap`, `ioctl`, and termios syscalls.
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
-- [ ] `planned` Add full POSIX signal ABI: `sigaction`, masks, `sigreturn`, and real handler entry.
+- [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
+- [x] `partial` Add POSIX signal ABI: `sigaction` table and pending-signal bitmask in kernel; kernel-side default actions and `SIG_IGN` work; userspace handler invocation and `sigreturn` frame are not implemented.
 
 ## M13: Archived AArch64 Port
 
@@ -203,7 +205,7 @@ and broader utility flag compatibility.
 - [x] `partial` SATA/AHCI driver support.
 - [x] `partial` NVMe driver support.
 - [x] `initial` Ext2 filesystem driver with read/write support.
-- [x] `partial` Ext1 legacy read-only support.
+- [x] `partial` Ext1 full read/write driver (inode/block alloc, indirect blocks, symlinks; missing timestamps and fsck metadata).
 - [x] `partial` Page swapping support.
 - [x] `partial` Demand paging optimization and OOM fallback hooks.
 - [x] `initial` Journaling abstraction for VFS.
@@ -215,9 +217,9 @@ and broader utility flag compatibility.
 
 ## M15: IPC, Security & Standard OS Features
 
-- [x] `initial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.).
+- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): kernel-side bitmask delivery and default actions work; no userspace handler entry frame.
 - [x] `partial` Inter-process communication through message queues and socket-like descriptors.
-- [x] `initial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`).
+- [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) with physical page allocation and VMM mapping per process.
 - [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`).
 - [x] `partial` File permissions, capabilities, and ACL metadata.
 - [x] `initial` Standard C library profile for B1NIX userspace.
@@ -238,7 +240,7 @@ and broader utility flag compatibility.
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
 - [x] `initial` POSIX Process Management: `fork()`, `execve()`, and `waitpid()` initial ABI.
-- [x] `initial` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `chdir()`, `getdents()`.
+- [x] `partial` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `rmdir()`, `rename()`, `symlink()`, `readlink()`, `chdir()`, `getdents()`, `statfs()`, `fsync()`, `sync()`, `fcntl()`, `chmod()`, `chown()`, `umask()`.
 - [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
 - [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
 - [x] `initial` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
@@ -252,11 +254,11 @@ and broader utility flag compatibility.
 
 ## M18: Real Userspace and ELF Loader
 
-- [x] `initial` Load ELF64 executables from VFS instead of relying only on built-in programs.
+- [x] `partial` Load ELF64 executables from VFS with per-process page mapping via VMM (PT_LOAD segments mapped page-by-page into user address space).
 - [x] `partial` Build a user address-space record per process.
 - [x] `initial` Add syscall `copyin`/`copyout` helpers for user pointers.
-- [x] `initial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics.
-- [x] `initial` Implement `execve()` as image replacement, not only built-in dispatch.
+- [x] `partial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics (AT_NULL, AT_ENTRY, AT_PHDR present).
+- [x] `partial` Implement `execve()` as image replacement with `vfs_close_on_exec()` and full ELF segment loading.
 - [x] `initial` Add process exit status propagation and zombie reaping semantics.
 - [x] `done` Add QEMU tests that boot, launch `/bin/init`, and execute a VFS-loaded program.
 - [x] `done` Add external clang-backed `b1nix-cc` wrapper for early ELF builds.

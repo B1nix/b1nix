@@ -3,11 +3,11 @@
 .type _start, @function
 
 _start:
-	movq $1, %rdi
-	leaq message(%rip), %rsi
-	movq $message_len, %rdx
-	movq $1, %r10
-	movq $1, %r8
+	movq $1, %rdi    /* SYS_WRITE */
+	movq $1, %rsi    /* fd = 1 (stdout) */
+	leaq message(%rip), %rdx /* buf */
+	movq $message_len, %r10  /* count */
+	xorq %r8, %r8
 	syscall
 
 	movq $2, %rdi

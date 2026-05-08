@@ -50,6 +50,7 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 		rhdr->checksum = bswap16(csum);
 
 		ipv4_send(src, 1 /* ICMP */, reply, size);
+		kfree(reply);
 	} else if (hdr->type == ICMP_TYPE_ECHO_REPLY) {
 		console_write("ping: reply from ");
 		console_write_dec(src.bytes[0]);

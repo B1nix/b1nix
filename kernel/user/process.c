@@ -18,6 +18,7 @@ extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
 #define ELF_CLASS_64 2
 #define ELF_DATA_LE 1
 #define ELF_TYPE_EXEC 2
+#define ELF_TYPE_DYN 3
 #define ELF_MACHINE_X86_64 0x3e
 #define ELF_MACHINE_AARCH64 0xb7
 #define PT_LOAD 1
@@ -175,12 +176,12 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
   if (!node || IS_ERR(node)) {
     return -1;
   }
-  if (node->type != VFS_FILE || node->size == 0) {
+  if (node->inode->type != VFS_FILE || node->inode->size == 0) {
     return -1;
   }
 
   /* Enforce executable permission (at least one 'x' bit) */
-  if ((node->mode & 0111) == 0) {
+  if ((node->inode->mode & 0111) == 0) {
     return -1;
   }
 
@@ -189,20 +190,20 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
     return -1;
   }
 
-  char *data = kmalloc(node->size);
+  char *data = kmalloc(node->inode->size);
   if (!data) {
     vfs_close(fd);
     return -1;
   }
 
-  isize got = vfs_read(fd, data, node->size);
+  isize got = vfs_read(fd, data, node->inode->size);
   vfs_close(fd);
-  if (got < 0 || (usize)got != node->size) {
+  if (got < 0 || (usize)got != node->inode->size) {
     return -1;
   }
 
   *out_data = data;
-  *out_size = node->size;
+  *out_size = node->inode->size;
   return 0;
 }
 
@@ -221,7 +222,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   }
   if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE)
     return -1;
-  if (ehdr->e_type != ELF_TYPE_EXEC)
+  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN)
     return -1;
   if (ehdr->e_machine != ELF_MACHINE_X86_64 &&
       ehdr->e_machine != ELF_MACHINE_AARCH64)
@@ -343,7 +344,7 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
       const char *message = op + strlen(op) + 1;
-      syscall_dispatch(SYS_WRITE, (u64)(usize)message, strlen(message), 0, 0);
+      syscall_dispatch(SYS_WRITE, 0, (u64)(usize)message, (u64)strlen(message), 0);
       *code = 0;
       return 1;
     }
@@ -378,12 +379,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
     u64 vaddr_end = (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     
+    u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
       u64 frame = pmm_alloc_frame();
       if (!frame) return -ENOMEM;
       
       u64 flags = VMM_USER | VMM_WRITABLE; // Simplify for now
       vmm_map_page(v, frame, flags);
+      
+      /* Clear page to avoid leaking kernel data and to handle .bss */
+      u64 direct_v = direct_base + frame;
+      memset((void *)(usize)direct_v, 0, PAGE_SIZE);
       
       /* Copy data if within filesz */
       u64 page_offset = 0;
@@ -394,7 +400,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         u64 chunk_size = segment->filesz - chunk_offset;
         if (chunk_size > PAGE_SIZE - page_offset) chunk_size = PAGE_SIZE - page_offset;
         
-        memcpy((void *)(usize)(v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
+        memcpy((void *)(usize)(direct_v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
       }
     }
   }
@@ -402,19 +408,25 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   /* Map stack */
   u64 stack_start = image->address_space.stack_top - image->address_space.stack_size;
   u64 stack_aligned = stack_start & ~(PAGE_SIZE - 1);
+  u64 direct_base = vmm_direct_map_base();
   for (u64 v = stack_aligned; v < image->address_space.stack_top; v += PAGE_SIZE) {
     u64 frame = pmm_alloc_frame();
     vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
+    
+    /* Clear stack page */
+    u64 direct_v = direct_base + frame;
+    memset((void *)(usize)direct_v, 0, PAGE_SIZE);
+
     u64 image_base = image->address_space.stack_top - image->address_space.stack_image_size;
     u64 offset = v - image_base;
     if (offset < image->address_space.stack_image_size) {
       u64 chunk = image->address_space.stack_image_size - offset;
       if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
-      memcpy((void *)(usize)v, (char *)image->address_space.stack_image + offset, chunk);
+      memcpy((void *)(usize)direct_v, (char *)image->address_space.stack_image + offset, chunk);
     }
   }
 
-  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc, (u64)image->argv);
+  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc, image->address_space.stack_base + sizeof(u64));
   
   return 0; // Should not reach here
 }

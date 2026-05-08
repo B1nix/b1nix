@@ -442,7 +442,7 @@ static u64 ext4_get_inode_size(struct ext2_inode *inode) {
 
 static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
                            usize size) {
-    u32 ino = (u32)(usize)node->data;
+    u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext4_read_inode(ino, &inode) < 0)
     return -1;
@@ -478,7 +478,7 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 
 static isize ext4_vfs_write(struct vfs_node *node, u64 offset,
                             const char *buffer, usize size) {
-    u32 ino = (u32)(usize)node->data;
+    u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext4_read_inode(ino, &inode) < 0)
     return -1;
@@ -498,7 +498,7 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset,
         }
         inode.i_size = (u32)new_size;
         ext4_write_inode(ino, &inode);
-        node->size = inode.i_size;
+        node->inode->size = (usize)ext4_get_inode_size(&inode);
     }
 
     usize done = 0;
@@ -589,8 +589,9 @@ static int ext4_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name,
 }
 
 static int ext4_vfs_create(struct vfs_node *dir, const char *name,
-                           const char *full_path) {
-    u32 dir_ino = (u32)(usize)dir->data;
+                           const char *full_path, u32 mode) {
+    (void)mode;
+    u32 dir_ino = (u32)(usize)dir->inode->data;
     u32 new_ino = ext4_alloc_inode();
   if (!new_ino)
     return -1;
@@ -607,8 +608,8 @@ static int ext4_vfs_create(struct vfs_node *dir, const char *name,
   struct vfs_node *n =
       vfs_add_node(full_path, VFS_FILE, (void *)(usize)new_ino, 0, 0);
   if (n) {
-    n->read_cb = ext4_vfs_read;
-    n->write_cb = ext4_vfs_write;
+    n->inode->read_cb = ext4_vfs_read;
+    n->inode->write_cb = ext4_vfs_write;
   }
     return 0;
 }
@@ -655,15 +656,15 @@ static void ext4_populate_vfs(u32 ino, const char *base_path) {
           struct vfs_node *dn =
               vfs_add_node(full, VFS_DIRECTORY, (void *)(usize)e->inode, 0, 0);
           if (dn)
-            dn->create_cb = ext4_vfs_create;
+            dn->inode->create_cb = ext4_vfs_create;
                     ext4_populate_vfs(e->inode, full);
                 } else {
           struct vfs_node *n =
               vfs_add_node(full, VFS_FILE, (void *)(usize)e->inode,
                                                       (usize)ext4_get_inode_size(&ci), 0);
           if (n) {
-            n->read_cb = ext4_vfs_read;
-            n->write_cb = ext4_vfs_write;
+            n->inode->read_cb = ext4_vfs_read;
+            n->inode->write_cb = ext4_vfs_write;
           }
                 }
             }
@@ -744,6 +745,6 @@ void ext4_init(void) {
   struct vfs_node *root =
       vfs_add_node("/ext4", VFS_DIRECTORY, (void *)(usize)2, 0, 0);
   if (root)
-    root->create_cb = ext4_vfs_create;
+    root->inode->create_cb = ext4_vfs_create;
     ext4_populate_vfs(2, "/ext4");
 }

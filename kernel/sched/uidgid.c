@@ -94,7 +94,7 @@ int group_add(u16 gid, const char *name)
 
 int group_add_member(u16 gid, u16 uid)
 {
-    struct group *g = group_find_by_gid(gid);
+    struct group *g = (struct group *)group_find_by_gid(gid);
     if (!g) return -1;
     if (g->member_count >= MAX_USERS) return -1;
 
@@ -201,54 +201,47 @@ int cred_set_egid(struct cred *cred, u16 egid)
 
 /* ── Permission checks ── */
 
-int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, int write_access)
+int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask)
 {
     if (!cred) return 0;
 
     /* Root can access everything */
     if (cred->euid == ROOT_UID) return 1;
 
+    u16 perms = 0;
     /* Check owner permissions */
     if (cred->euid == file_uid) {
-        if (write_access) {
-            return (file_mode & 0200) != 0; /* Owner write */
-        } else {
-            return (file_mode & 0400) != 0; /* Owner read */
-        }
+        perms = (file_mode >> 6) & 7;
     }
-
     /* Check group permissions */
-    if (cred->egid == file_gid) {
-        if (write_access) {
-            return (file_mode & 0020) != 0; /* Group write */
-        } else {
-            return (file_mode & 0040) != 0; /* Group read */
-        }
+    else if (cred->egid == file_gid) {
+        perms = (file_mode >> 3) & 7;
     }
-
     /* Check supplementary groups */
-    for (int i = 0; i < cred->ngroups; i++) {
-        if (cred->groups[i] == file_gid) {
-            if (write_access) {
-                return (file_mode & 0020) != 0;
-            } else {
-                return (file_mode & 0040) != 0;
+    else {
+        int in_group = 0;
+        for (int i = 0; i < cred->ngroups; i++) {
+            if (cred->groups[i] == file_gid) {
+                in_group = 1;
+                break;
             }
         }
+        if (in_group) {
+            perms = (file_mode >> 3) & 7;
+        } else {
+            /* Check others permissions */
+            perms = file_mode & 7;
+        }
     }
 
-    /* Check others permissions */
-    if (write_access) {
-        return (file_mode & 0002) != 0; /* Others write */
-    } else {
-        return (file_mode & 0004) != 0; /* Others read */
-    }
+    return (perms & access_mask) == access_mask;
 }
 
 /* ── Capabilities ── */
 
 int cred_has_cap(const struct cred *cred, int cap)
 {
+    (void)cap;
     if (!cred) return 0;
     /* Root (euid == 0) implicitly has all capabilities */
     if (cred->euid == ROOT_UID) return 1;

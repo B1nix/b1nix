@@ -119,7 +119,7 @@ int  cred_set_gid(struct cred *cred, u16 gid);
 int  cred_set_egid(struct cred *cred, u16 egid);
 
 /* Permission checks */
-int  cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, int write_access);
+int  cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask);
 int  cred_has_cap(const struct cred *cred, int cap);
 int  cred_has_cap_effective(const struct cred *cred, int cap);
 

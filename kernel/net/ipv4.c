@@ -94,6 +94,7 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 	if (dst.bytes[0] == 255 && dst.bytes[1] == 255 && dst.bytes[2] == 255 && dst.bytes[3] == 255) {
 		for (int i = 0; i < 6; i++) dst_mac.bytes[i] = 0xFF;
 		net_send_ethernet(dst_mac, 0x0800, buffer, total_size);
+		kfree(buffer);
 		return;
 	}
 
@@ -113,4 +114,5 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 		// In a real OS, queue the packet and wait for ARP reply.
 		// For our simple OS, we just drop the first packet and ARP will reply soon.
 	}
+	kfree(buffer);
 }

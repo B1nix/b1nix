@@ -28,7 +28,7 @@ struct vring_desc {
 
 struct vring_avail {
 	u16 flags;
-	u16 idx;
+	volatile u16 idx;
 	u16 ring[];
 } __attribute__((packed));
 
@@ -39,7 +39,7 @@ struct vring_used_elem {
 
 struct vring_used {
 	u16 flags;
-	u16 idx;
+	volatile u16 idx;
 	struct vring_used_elem ring[];
 } __attribute__((packed));
 
