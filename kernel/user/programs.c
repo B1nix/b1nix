@@ -1,5 +1,3 @@
-#include <string.h>
-#include <stdio.h>
 #include <b1nix/blk.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
@@ -7,6 +5,8 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/video.h>
+#include <stdio.h>
+#include <string.h>
 
 void user_register_program(const char *path, user_program_entry entry);
 

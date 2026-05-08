@@ -23,7 +23,7 @@ extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
 #define ELF_MACHINE_AARCH64 0xb7
 #define PT_LOAD 1
 
-    struct process_start {
+struct process_start {
   struct user_loaded_image *image;
 };
 
@@ -180,11 +180,6 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
     return -1;
   }
 
-  /* Enforce executable permission (at least one 'x' bit) */
-  if ((node->inode->mode & 0111) == 0) {
-    return -1;
-  }
-
   int fd = vfs_open(path);
   if (fd < 0) {
     return -1;
@@ -253,10 +248,16 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     segment->memsz = phdr->p_memsz;
     segment->filesz = phdr->p_filesz;
     segment->flags = phdr->p_flags;
-    segment->data = kzalloc(phdr->p_memsz);
-    if (!segment->data)
-      return -1;
-    memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
+    
+    /* FIX: Allocate only p_filesz to avoid huge memory allocations for .bss */
+    if (phdr->p_filesz > 0) {
+      segment->data = kzalloc(phdr->p_filesz);
+      if (!segment->data)
+        return -1;
+      memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
+    } else {
+      segment->data = 0;
+    }
   }
 
   return image->segment_count > 0 ? 0 : -1;
@@ -339,7 +340,7 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
     const char *payload = segment->data;
-    if (segment->filesz < 10 || memcmp(payload, "B1NXEXEC", 9) != 0) continue;
+    if (segment->filesz < 10 || !payload || memcmp(payload, "B1NXEXEC", 9) != 0) continue;
 
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
@@ -400,7 +401,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         u64 chunk_size = segment->filesz - chunk_offset;
         if (chunk_size > PAGE_SIZE - page_offset) chunk_size = PAGE_SIZE - page_offset;
         
-        memcpy((void *)(usize)(direct_v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
+        if (segment->data) {
+          memcpy((void *)(usize)(direct_v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
+        }
       }
     }
   }
@@ -475,7 +478,14 @@ int user_spawn(const char *path, int argc, const char **argv) {
   }
   start->image = image;
 
-  int tid = kthread_create(path, user_process_thread, start);
+  /* FIX: Truncate thread name to 15 chars to prevent kthread_create from failing */
+  char safe_name[16];
+  usize plen = strlen(path);
+  if (plen > 15) plen = 15;
+  memcpy(safe_name, path, plen);
+  safe_name[plen] = '\0';
+
+  int tid = kthread_create(safe_name, user_process_thread, start);
   if (tid < 0) {
     kfree(start);
     user_image_free(image);

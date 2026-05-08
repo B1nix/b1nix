@@ -23,6 +23,16 @@
 static volatile int vfs_lock_val = 0;
 static volatile usize vfs_lock_owner = 0;
 static volatile int vfs_lock_count = 0;
+static volatile int handle_lock = 0;
+static u32 next_fs_id = 1;
+
+static void vfs_acquire_handle_lock(void) {
+  while (__atomic_test_and_set(&handle_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+}
+
+static void vfs_release_handle_lock(void) {
+  __atomic_clear(&handle_lock, __ATOMIC_RELEASE);
+}
 
 static void vfs_acquire_lock(void) {
   usize tid = scheduler_get_pid();
@@ -42,6 +52,16 @@ static void vfs_release_lock(void) {
     vfs_lock_owner = 0;
     __atomic_clear(&vfs_lock_val, __ATOMIC_RELEASE);
   }
+}
+
+static void vfs_inode_lock(struct vfs_inode *inode) {
+  while (__atomic_test_and_set(&inode->lock, __ATOMIC_ACQUIRE)) {
+    scheduler_yield();
+  }
+}
+
+static void vfs_inode_unlock(struct vfs_inode *inode) {
+  __atomic_clear(&inode->lock, __ATOMIC_RELEASE);
 }
 
 static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
@@ -700,11 +720,7 @@ static void tty_init_node(void) {
 /* Forward declarations for internal VFS metadata operations (thread-unsafe variants) */
 static int vfs_create_internal(const char *path, const char *data);
 static int vfs_mkdir_internal(const char *path);
-static int vfs_unlink_internal(const char *path);
-static int vfs_rmdir_internal(const char *path);
 static int vfs_rename_internal(const char *old_path, const char *new_path);
-static int vfs_symlink_internal(const char *target, const char *link_path);
-static int vfs_link_internal(const char *target, const char *link_path);
 
 static void vfs_init_stdio(void) {
   scheduler_fd_table_init_current();
@@ -784,6 +800,8 @@ int vfs_open_flags(const char *path, int flags) {
   }
 
   if ((flags & B1NIX_O_DIRECTORY) && node->inode->type != VFS_DIRECTORY) { res = -ENOTDIR; goto out; }
+  /* POSIX: writing to a directory descriptor is not permitted */
+  if (node->inode->type == VFS_DIRECTORY && (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) { res = -EISDIR; goto out; }
 
   const struct cred *cred = get_current_cred();
   u32 access_mask = 0;
@@ -792,21 +810,31 @@ int vfs_open_flags(const char *path, int flags) {
   if (cred && !vfs_get_node_perm(node, cred, access_mask)) { res = -EACCES; goto out; }
 
   if ((flags & B1NIX_O_TRUNC) && node->inode->type == VFS_FILE) {
+    /* O_TRUNC requires write permission regardless of open mode */
+    const struct cred *tc = get_current_cred();
+    if (tc && !vfs_get_node_perm(node, tc, 2)) { res = -EACCES; goto out; }
     node->inode->size = 0; if (node->inode->data) ((char*)node->inode->data)[0] = '\0';
   }
 
+  vfs_acquire_handle_lock();
   int h_idx = -1;
   for (int i = 0; i < MAX_VFS_HANDLES; i++) { if (!handles[i].used) { h_idx = i; break; } }
-  if (h_idx < 0) { res = -ENFILE; goto out; }
+  if (h_idx < 0) { vfs_release_handle_lock(); res = -ENFILE; goto out; }
 
   struct vfs_handle *h = &handles[h_idx];
   memset(h, 0, sizeof(*h));
   h->used = 1; h->refcount = 1; h->kind = VFS_HANDLE_NODE; h->node = node;
   h->flags = flags; h->offset = (flags & B1NIX_O_APPEND) ? node->inode->size : 0;
   vfs_node_get(node);
+  vfs_release_handle_lock();
 
   int fd = scheduler_fd_alloc(h_idx);
-  if (fd < 0) { release_handle(h_idx); res = -EMFILE; goto out; }
+  if (fd < 0) { 
+    vfs_acquire_handle_lock();
+    release_handle(h_idx); 
+    vfs_release_handle_lock();
+    res = -EMFILE; goto out; 
+  }
   if (flags & B1NIX_O_CLOEXEC) scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   res = fd;
 
@@ -816,12 +844,12 @@ out:
 }
 
 isize vfs_read(int fd, char *buf, usize size) {
-  vfs_acquire_lock();
   isize res = 0;
+  vfs_acquire_handle_lock();
   int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) { vfs_release_lock(); return -EBADF; }
+  if (h_idx < 0) { vfs_release_handle_lock(); return -EBADF; }
   struct vfs_handle *h = &handles[h_idx];
-  if (!h->used || (h->flags & 3) == B1NIX_O_WRONLY) { vfs_release_lock(); return -EBADF; }
+  if (!h->used || (h->flags & 3) == B1NIX_O_WRONLY) { vfs_release_handle_lock(); return -EBADF; }
 
   /* Increment refcounts to protect handle and node during unlocked I/O */
   h->refcount++;
@@ -830,8 +858,7 @@ isize vfs_read(int fd, char *buf, usize size) {
   enum vfs_handle_kind kind = h->kind;
   struct vfs_pipe *pipe = h->pipe;
   usize offset = h->offset;
-
-  vfs_release_lock();
+  vfs_release_handle_lock();
 
   if (kind == VFS_HANDLE_PIPE_READ) {
     if (!pipe || !pipe->used) { res = -EIO; goto out; }
@@ -869,29 +896,35 @@ isize vfs_read(int fd, char *buf, usize size) {
   
   if (node->inode->type == VFS_DEVICE || node->inode->type == VFS_DIRECTORY) { res = 0; goto out; }
 
+  vfs_inode_lock(node->inode);
   usize rem = node->inode->size > offset ? node->inode->size - offset : 0;
   usize to_r = size < rem ? size : rem;
   if (to_r > 0) {
     memcpy(buf, (const char*)node->inode->data + offset, to_r);
-    __atomic_add_fetch(&h->offset, to_r, __ATOMIC_RELAXED);
   }
+  vfs_inode_unlock(node->inode);
+
+  if (to_r > 0) __atomic_add_fetch(&h->offset, to_r, __ATOMIC_RELAXED);
   res = (isize)to_r;
 
 out:
   vfs_acquire_lock();
   if (node) vfs_node_put(node);
-  release_handle(h_idx);
   vfs_release_lock();
+
+  vfs_acquire_handle_lock();
+  release_handle(h_idx);
+  vfs_release_handle_lock();
   return res;
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
-  vfs_acquire_lock();
   isize res = 0;
+  vfs_acquire_handle_lock();
   int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) { vfs_release_lock(); return -EBADF; }
+  if (h_idx < 0) { vfs_release_handle_lock(); return -EBADF; }
   struct vfs_handle *h = &handles[h_idx];
-  if (!h->used || (h->flags & 3) == B1NIX_O_RDONLY) { vfs_release_lock(); return -EBADF; }
+  if (!h->used || (h->flags & 3) == B1NIX_O_RDONLY) { vfs_release_handle_lock(); return -EBADF; }
   
   if (h->kind == VFS_HANDLE_NODE && h->node && (h->flags & B1NIX_O_APPEND)) h->offset = h->node->inode->size;
 
@@ -902,14 +935,12 @@ isize vfs_write(int fd, const char *buf, usize size) {
   enum vfs_handle_kind kind = h->kind;
   struct vfs_pipe *pipe = h->pipe;
   usize offset = h->offset;
+  vfs_release_handle_lock();
 
   if (kind == VFS_HANDLE_PIPE_WRITE) {
-    vfs_release_lock();
     if (!pipe || !pipe->used) { res = -EIO; goto out; }
     
-    /* Acquire pipe-specific lock */
     while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-
     usize written = 0;
     while (written < size && pipe->size < PIPE_BUFFER_SIZE) {
       pipe->buffer[pipe->write_pos] = buf[written++];
@@ -917,45 +948,37 @@ isize vfs_write(int fd, const char *buf, usize size) {
       pipe->size++;
     }
     res = (isize)written;
-
-    /* Release pipe-specific lock */
     __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
     goto out;
   }
 
   if (kind == VFS_HANDLE_SOCKET) {
-    vfs_release_lock();
     res = vfs_socket_send(fd, buf, size, 0);
     goto out;
   }
 
-  if (kind != VFS_HANDLE_NODE || !node) { vfs_release_lock(); return -EBADF; }
+  if (kind != VFS_HANDLE_NODE || !node) { res = -EBADF; goto out; }
 
   if (node->inode->write_cb) {
-    vfs_release_lock();
     res = node->inode->write_cb(node, offset, buf, size);
     if (res > 0) __atomic_add_fetch(&h->offset, (usize)res, __ATOMIC_RELAXED);
     goto out;
   }
 
-  /* Memory-backed file path: Keep lock for safety during memcpy and potential growth. 
-   * TODO: Implement per-node mutexes to allow releasing the global lock during kmalloc() 
-   * to avoid potential deadlocks/blocking under memory pressure. */
-  node->inode->mtime = node->inode->ctime = vfs_get_unix_time();
-
   if (node->inode->type == VFS_DEVICE && strcmp(node->name, "console") == 0) {
     for (usize i = 0; i < size; i++) console_putc(buf[i]);
     res = (isize)size;
-    goto out_locked;
+    goto out;
   }
 
   if (node->inode->type == VFS_FILE) {
+    vfs_inode_lock(node->inode);
     usize need = offset + size;
     if (need > node->inode->capacity) {
       usize new_cap = node->inode->capacity == 0 ? 64 : node->inode->capacity;
       while (new_cap < need) new_cap *= 2;
       char *new_d = kmalloc(new_cap);
-      if (!new_d) { res = -ENOMEM; goto out_locked; }
+      if (!new_d) { vfs_inode_unlock(node->inode); res = -ENOMEM; goto out; }
       if (node->inode->data) memcpy(new_d, node->inode->data, node->inode->size);
       if (new_cap > node->inode->size) memset(new_d + node->inode->size, 0, new_cap - node->inode->size);
       if (node->inode->data && (node->inode->flags & VFS_NODE_OWNS_DATA)) kfree(node->inode->data);
@@ -965,27 +988,32 @@ isize vfs_write(int fd, const char *buf, usize size) {
     }
     memcpy((char*)node->inode->data + offset, buf, size);
     if (need > node->inode->size) node->inode->size = need;
+    vfs_inode_unlock(node->inode);
+
     __atomic_add_fetch(&h->offset, size, __ATOMIC_RELAXED);
     res = (isize)size;
-    goto out_locked;
+    goto out;
   }
   res = -EINVAL;
 
-out_locked:
-  vfs_release_lock();
-
 out:
+  /* 1. Работаем с узлом (влияет на глобальное дерево VFS) */
   vfs_acquire_lock();
   if (node) vfs_node_put(node);
-  release_handle(h_idx);
   vfs_release_lock();
+
+  /* 2. Работаем с таблицей дескрипторов */
+  vfs_acquire_handle_lock();
+  release_handle(h_idx);
+  vfs_release_handle_lock();
+
   return res;
 }
 
 void vfs_close(int fd) {
-  vfs_acquire_lock();
+  vfs_acquire_handle_lock();
   int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) { vfs_release_lock(); return; }
+  if (h_idx < 0) { vfs_release_handle_lock(); return; }
   struct vfs_handle *h = &handles[h_idx];
   if (h->kind == VFS_HANDLE_SOCKET && h->socket.type == B1NIX_SOCK_STREAM && h->socket.tcp_conn) {
     tcp_close((struct tcp_conn *)h->socket.tcp_conn);
@@ -993,7 +1021,7 @@ void vfs_close(int fd) {
   }
   scheduler_fd_close(fd);
   release_handle(h_idx);
-  vfs_release_lock();
+  vfs_release_handle_lock();
 }
 
 static int vfs_create_internal(const char *path, const char *data) {
@@ -1119,17 +1147,18 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
   if (cred && !vfs_get_node_perm(dir, cred, 4))
     return 0;
 
-  if (dir->inode->list_cb)
-    return dir->inode->list_cb(dir, names, max_names);
+  /* Вызов list_cb удален, так как драйверы теперь используют readdir_cb и getdents */
 
   usize count = 0;
   struct vfs_node *child = dir->first_child;
   while (child && count < max_names) {
-    names[count++] = child->name;
+    if (!child->deleted) {
+      names[count++] = child->name;
+    }
     child = child->next_sibling;
   }
 
-  return count;
+  return (isize)count;
 }
 
 static u32 vfs_node_type_mode(const struct vfs_node *node) {
@@ -1442,6 +1471,9 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   struct vfs_node *tmp = new_parent;
   while (tmp) { if (tmp == node) return -EINVAL; tmp = tmp->parent; }
 
+  /* EXDEV check — must be before any tree mutation to avoid orphaned node */
+  if (old_parent->inode->fs_id != new_parent->inode->fs_id) return -EXDEV;
+
   const struct cred *cred = get_current_cred();
   if (cred && (!vfs_get_node_perm(old_parent, cred, 2) || !vfs_get_node_perm(new_parent, cred, 2))) return -EACCES;
 
@@ -1461,7 +1493,6 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     }
     prev = c; c = c->next_sibling;
   }
-  if (old_parent->inode->blk_dev != new_parent->inode->blk_dev) return -EXDEV;
 
   if (old_parent->inode->rename_cb) {
     int err = old_parent->inode->rename_cb(old_parent, old_n, new_parent, new_n);
@@ -1495,10 +1526,18 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
 }
 
 int vfs_fsync(int fd) {
-  struct vfs_node *node = vfs_find_node_by_fd(fd);
-  if (IS_ERR(node)) return (int)PTR_ERR(node);
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = &handles[h_idx];
+  if (!h->used || h->kind != VFS_HANDLE_NODE) return -EBADF;
+  struct vfs_node *node = h->node;
+
+  if (node->inode->fsync_cb) {
+    int err = node->inode->fsync_cb(node);
+    if (err < 0) return err;
+  }
+
   if (node->inode->blk_dev) blk_cache_flush(node->inode->blk_dev);
-  else blk_cache_flush(0);
   return 0;
 }
 
@@ -1535,6 +1574,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
       copy_path(mounts[i].fstype, sizeof(mounts[i].fstype), fstype);
       mounts[i].flags = flags;
       mounts[i].root_node = target_node;
+      target_node->inode->fs_id = next_fs_id++;
       return 0;
     }
   }
@@ -1574,72 +1614,79 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
   return (isize)count;
 }
 
+isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
+  isize res = 0;
+  vfs_acquire_handle_lock();
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) { vfs_release_handle_lock(); return -EBADF; }
+  struct vfs_handle *h = &handles[h_idx];
+  if (!h->used || h->kind != VFS_HANDLE_NODE) { vfs_release_handle_lock(); return -EBADF; }
+  struct vfs_node *dir = h->node;
+  if (!dir || dir->inode->type != VFS_DIRECTORY || !buf) { vfs_release_handle_lock(); return -EINVAL; }
+
+  h->refcount++;
+  vfs_node_get(dir);
+  usize offset = h->offset;
+  vfs_release_handle_lock();
+
+  if (dir->inode->readdir_cb) {
+    res = dir->inode->readdir_cb(dir, offset, buf, max_entries);
+    if (res > 0) {
+      vfs_acquire_handle_lock();
+      h->offset += (usize)res;
+      vfs_release_handle_lock();
+    }
+    goto out;
+  }
+
+  /* Fallback to in-memory Ramfs-style readdir */
+  usize count = 0;
+  if (offset == 0 && count < max_entries) {
+    copy_path(buf[count].name, 64, ".");
+    buf[count].type = (u32)VFS_DIRECTORY;
+    buf[count].is_dir = 1; buf[count].is_exec = 1; buf[count].size = 0;
+    count++; offset++;
+  }
+  if (offset == 1 && count < max_entries) {
+    copy_path(buf[count].name, 64, "..");
+    buf[count].type = (u32)VFS_DIRECTORY;
+    buf[count].is_dir = 1; buf[count].is_exec = 1; buf[count].size = 0;
+    count++; offset++;
+  }
+
+  vfs_acquire_lock();
+  struct vfs_node *child = dir->first_child;
+  usize skipped = 0;
+  while (child && count < max_entries) {
+    if (child->deleted) { child = child->next_sibling; continue; }
+    if (skipped < offset - 2) { skipped++; child = child->next_sibling; continue; }
+    copy_path(buf[count].name, 64, child->name);
+    buf[count].type = (u32)child->inode->type;
+    buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+    buf[count].is_exec = 0; buf[count].size = child->inode->size;
+    count++; offset++;
+    child = child->next_sibling;
+  }
+  vfs_release_lock();
+
+  vfs_acquire_handle_lock();
+  h->offset = offset;
+  vfs_release_handle_lock();
+  res = (isize)count;
+
+out:
+  vfs_acquire_lock();
+  vfs_node_put(dir);
+  vfs_release_lock();
+  vfs_acquire_handle_lock();
+  release_handle(h_idx);
+  vfs_release_handle_lock();
+  return res;
+}
+
 int vfs_sync(void) {
   blk_cache_flush(0);
   return 0;
-}
-
-isize vfs_getdents(int handle, struct dirent *buf, usize max_entries) {
-  struct vfs_handle *h = get_handle(handle);
-  if (!h || h->kind != VFS_HANDLE_NODE)
-    return -EBADF;
-  struct vfs_node *dir = h->node;
-  if (!dir || dir->inode->type != VFS_DIRECTORY || !buf)
-    return -EINVAL;
-
-  usize count = 0;
-
-  if (h->offset == 0 && count < max_entries) {
-    copy_path(buf[count].name, 64, ".");
-    buf[count].type = (u32)VFS_DIRECTORY;
-    buf[count].is_dir = 1;
-    buf[count].is_exec = 1;
-    buf[count].size = 0;
-    count++;
-    h->offset++;
-  }
-
-  if (h->offset == 1 && count < max_entries) {
-    copy_path(buf[count].name, 64, "..");
-    struct vfs_node *parent = dir->parent ? dir->parent : dir;
-    buf[count].type = (u32)VFS_DIRECTORY;
-    buf[count].is_dir = 1;
-    buf[count].is_exec = 1;
-    buf[count].size = parent->inode->size;
-    count++;
-    h->offset++;
-  }
-
-  if (count >= max_entries)
-    return (isize)count;
-
-  usize skipped = 0;
-  struct vfs_node *child = dir->first_child;
-  while (child && count < max_entries) {
-    if (child->deleted) {
-      child = child->next_sibling;
-      continue;
-    }
-    if (skipped < h->offset - 2) {
-      skipped++;
-      child = child->next_sibling;
-      continue;
-    }
-
-    usize len = strlen(child->name);
-    if (len > 63)
-      len = 63;
-    memcpy(buf[count].name, child->name, len);
-    buf[count].name[len] = '\0';
-    buf[count].type = (u32)child->inode->type;
-    buf[count].is_dir = child->inode->type == VFS_DIRECTORY;
-    buf[count].is_exec = (child->inode->mode & 0111) ? 1 : 0;
-    buf[count].size = child->inode->size;
-    count++;
-    h->offset++;
-    child = child->next_sibling;
-  }
-  return (isize)count;
 }
 
 int vfs_pipe(int pipefd[2]) {

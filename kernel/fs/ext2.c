@@ -825,6 +825,51 @@ static int ext2_vfs_rename(struct vfs_node *old_dir, const char *old_name,
   return 0;
 }
 
+static isize ext2_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent *buf, usize max_entries) {
+    u32 inode_num = (u32)(usize)dir->inode->data;
+    struct ext2_inode inode;
+    if (ext2_read_inode(dir->inode->blk_dev, inode_num, &inode) < 0) return -EIO;
+
+    u8 *dir_buf = kmalloc(ext2_block_size);
+    usize count = 0;
+    usize entry_idx = 0;
+    u32 blocks = (inode.i_size + ext2_block_size - 1) / ext2_block_size;
+
+    for (u32 b = 0; b < blocks && count < max_entries; b++) {
+        u32 phys = ext2_get_inode_block(dir->inode->blk_dev, &inode, b);
+        if (!phys) continue;
+        ext2_read_block(dir->inode->blk_dev, phys, dir_buf);
+        usize off = 0;
+        while (off < ext2_block_size && count < max_entries) {
+            struct ext2_dir_entry *e = (struct ext2_dir_entry *)(dir_buf + off);
+            if (e->rec_len == 0) break;
+            if (e->inode != 0) {
+                if (entry_idx >= offset) {
+                    usize name_len = e->name_len > 63 ? 63 : e->name_len;
+                    memcpy(buf[count].name, e->name, name_len);
+                    buf[count].name[name_len] = '\0';
+                    buf[count].type = (u32)VFS_FILE; // Default
+                    if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
+                    buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
+                    buf[count].size = 0; // We don't easily know child size here
+                    count++;
+                }
+                entry_idx++;
+            }
+            off += e->rec_len;
+        }
+    }
+    kfree(dir_buf);
+    return (isize)count;
+}
+
+static int ext2_vfs_fsync(struct vfs_node *node) {
+    (void)node;
+    /* ext2 has no journal, so flushing the block cache is sufficient if metadata was written. 
+     * Since ext2_write_inode/superblock call blk_write, we just ensure it's on disk. */
+    return 0;
+}
+
 static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     u32 dir_inode_num = (u32)(usize)dir->inode->data;
     u32 new_inode_num = ext2_alloc_inode(dir->inode->blk_dev);
@@ -904,6 +949,7 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
               dir_node->inode->mtime = child_inode.i_mtime;
               dir_node->inode->ctime = child_inode.i_ctime;
               dir_node->inode->nlink = child_inode.i_links_count;
+              dir_node->inode->fs_id = dir_node->parent->inode->fs_id;
               dir_node->inode->create_cb = ext2_vfs_create;
               dir_node->inode->mkdir_cb = ext2_vfs_mkdir;
               dir_node->inode->unlink_cb = ext2_vfs_unlink;
@@ -914,6 +960,8 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
               dir_node->inode->release_cb = ext2_vfs_release;
               dir_node->inode->setattr_cb = ext2_vfs_setattr;
               dir_node->inode->statfs_cb = ext2_vfs_statfs;
+              dir_node->inode->readdir_cb = ext2_vfs_readdir;
+              dir_node->inode->fsync_cb = ext2_vfs_fsync;
             }
 						ext2_populate_vfs(dev, entry->inode, full_path);
 					} else {
@@ -930,9 +978,11 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
               node->inode->atime = child_inode.i_atime;
               node->inode->mtime = child_inode.i_mtime;
               node->inode->ctime = child_inode.i_ctime;
-              node->inode->nlink = child_inode.i_links_count;
-              node->inode->release_cb = ext2_vfs_release;
+               node->inode->nlink = child_inode.i_links_count;
+               node->inode->fs_id = node->parent->inode->fs_id;
+               node->inode->release_cb = ext2_vfs_release;
               node->inode->setattr_cb = ext2_vfs_setattr;
+              node->inode->fsync_cb = ext2_vfs_fsync;
 						}
 					}
 				}
@@ -991,6 +1041,8 @@ int ext2_mount_root(const char *device_name, const char *mount_point) {
     ext2_root->inode->release_cb = ext2_vfs_release;
     ext2_root->inode->setattr_cb = ext2_vfs_setattr;
     ext2_root->inode->statfs_cb = ext2_vfs_statfs;
+    ext2_root->inode->readdir_cb = ext2_vfs_readdir;
+    ext2_root->inode->fsync_cb = ext2_vfs_fsync;
   }
 	ext2_populate_vfs(ext2_dev, 2, mount_point);
 	return 0;
