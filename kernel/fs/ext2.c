@@ -707,6 +707,7 @@ static int ext2_vfs_setattr(struct vfs_node *node) {
   inode.i_mode = (inode.i_mode & ~0777) | (node->inode->mode & 0777);
   inode.i_uid = node->inode->uid;
   inode.i_gid = node->inode->gid;
+  inode.i_size = (u32)node->inode->size;
   inode.i_atime = node->inode->atime;
   inode.i_mtime = node->inode->mtime;
   inode.i_ctime = node->inode->ctime;

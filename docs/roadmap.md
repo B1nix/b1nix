@@ -15,9 +15,9 @@ The stable no-surprises checklist for closing POSIX-facing work lives in
 
 ## Current POSIX Estimate
 
-- Overall practical POSIX compatibility: roughly 55-63%.
-- `VFS/path/files`: roughly 75-82%.
-- `Shell/coreutils`: roughly 73-80%.
+- Overall practical POSIX compatibility: roughly 60-68%.
+- `VFS/path/files`: roughly 85-92%.
+- `Shell/coreutils`: roughly 75-82%.
 
 These percentages mean "can run small real workflows", not "passes a POSIX
 conformance suite". The biggest blockers remain durable filesystem semantics,
@@ -100,10 +100,10 @@ and broader utility flag compatibility.
 - [x] `done` Add ACL fields and permission metadata in VFS nodes.
 - [x] `initial` Add symlinks, hard links, and `readlink`.
 - [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
-- [x] `partial` Add dot, dot-dot, duplicate-slash, symlink-loop (iterative resolver, 16-hop limit, ELOOP), mount-crossing via `..`, and POSIX errno normalization at syscall/VFS boundaries.
-- [x] `partial` Add POSIX-style open-file-description mode checks for read-only, write-only, append, exclusive create, and directory-only opens.
-- [x] `initial` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
-- [ ] `planned` Add full permissions and mount-aware path normalization.
+- [x] `done` Add dot, dot-dot, duplicate-slash, symlink-loop (iterative resolver, 16-hop limit, ELOOP), mount-crossing via `..`, and POSIX errno normalization at syscall/VFS boundaries.
+- [x] `done` Add POSIX-style open-file description mode checks for read-only, write-only, append, exclusive create, and directory-only opens.
+- [x] `done` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
+- [x] `initial` Add full permissions and mount-aware path normalization.
 
 ## M6: Network
 
@@ -133,9 +133,9 @@ and broader utility flag compatibility.
 - [x] `done` Add initramfs fallback tree.
 - [x] `partial` Add FAT32 read/import path with limited feature support.
 - [x] `partial` Add ext1 read/write support (inode alloc, block alloc, single/double indirect, symlinks, VFS population; missing timestamps and fsck-friendly metadata).
-- [x] `partial` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
-- [x] `partial` Add ext3 read/write driver with JBD journaling (inode/block alloc, dir entries, journal mount/recover; no unlink/rename/fsck metadata).
-- [x] `partial` Add ext4 read/write driver with extent tree, 64-bit BGD, flex_bg, and JBD journaling (no unlink/rename/htree/fsck metadata).
+- [x] `initial` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
+- [x] `initial` Add ext3 read/write driver with JBD journaling (inode/block alloc, dir entries, journal mount/recover, rename, unlink, rmdir).
+- [x] `initial` Add ext4 read/write driver with extent tree, 64-bit BGD, flex_bg, JBD journaling, rename, unlink, rmdir.
 - [ ] `planned` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 
 ## M9: Hardware Drivers
@@ -318,11 +318,11 @@ tables.
 
 ## M21: Persistent Root Filesystem
 
-- [x] `initial` Boot with a persistent root filesystem from a disk image.
-- [x] `initial` Add mountpoints and a real `mount`/`umount` VFS model.
-- [x] `initial` Stabilize writable ext2 as the first reliable root filesystem target.
-- [x] `initial` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_EXCL`).
-- [x] `partial` Add safer VFS unlink/rmdir split, directory rename self-move prevention, and same-tree destination replacement.
+- [x] `done` Boot with a persistent root filesystem from a disk image.
+- [x] `done` Add mountpoints and a real `mount`/`umount` VFS model.
+- [x] `done` Stabilize writable ext2 as the first reliable root filesystem target.
+- [x] `done` Add `rename()`, `rmdir()`, `fstat()`, `fsync()`, and open flags (`O_CREAT`, `O_TRUNC`, `O_APPEND`, `O_DIRECTORY`, `O_EXCL`).
+- [x] `done` Add safer VFS unlink/rmdir split, directory rename self-move prevention, and same-tree destination replacement.
 - [x] `initial` Flush block cache on shutdown and reboot.
 - [x] `done` Add `/etc`, `/bin`, `/dev`, `/home`, `/tmp`, and `/var` layout.
 - [x] `initial` Add an image creation/install script for local development.
