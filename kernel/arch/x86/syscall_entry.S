@@ -18,34 +18,37 @@ x86_syscall_saved_user_rsp:
 .section .text
 .code64
 
+.extern current_task
+
 /* SYSCALL entry point */
 .global x86_syscall_entry
 .type x86_syscall_entry, @function
 x86_syscall_entry:
-    /* SYSCALL convention:
-       %rdi = syscall number
-       %rsi, %rdx, %r10, %r8, %r9 = args
-       %rcx = return RIP (saved by CPU)
-       %r11 = return RFLAGS (saved by CPU)
-       Return value in %rax
-    */
+    /* Save RAX temporarily in our scratch area */
+    movq %rax, x86_syscall_saved_user_rsp(%rip)
+    
+    /* Get current_task pointer */
+    movq current_task(%rip), %rax
+    
+    /* Save user RSP to task->saved_user_rsp (offset 112) */
+    movq %rsp, 112(%rax)
+    
+    /* Load kernel RSP from task->kernel_stack_ptr (offset 104) */
+    movq 104(%rax), %rsp
+    
+    /* Restore RAX from scratch */
+    movq x86_syscall_saved_user_rsp(%rip), %rax
 
-    movq %rsp, x86_syscall_saved_user_rsp(%rip)
-    leaq x86_syscall_stack_top(%rip), %rsp
-
-    pushq %rcx
-    pushq %r11
+    pushq %rcx  /* Return RIP */
+    pushq %r11  /* Return RFLAGS */
     pushq %rbp
     pushq %rbx
     pushq %r12
     pushq %r13
     pushq %r14
     pushq %r15
-    /*
-     * B1NIX syscall_dispatch(num, a0, a1, a2, a3):
-     * %rdi already holds num, %rsi/%rdx are a0/a1, %r10 becomes a2,
-     * and %r8 is already the fifth SysV argument.
-     */
+
+    /* Setup arguments for syscall_dispatch */
     movq %r10, %rcx
     
     call syscall_dispatch
@@ -60,6 +63,10 @@ x86_syscall_entry:
     popq %r11
     popq %rcx
 
-    movq x86_syscall_saved_user_rsp(%rip), %rsp
+    /* Restore user RSP from current_task->saved_user_rsp */
+    movq %rax, x86_syscall_saved_user_rsp(%rip) /* Save return value temporarily */
+    movq current_task(%rip), %rax
+    movq 112(%rax), %rsp
+    movq x86_syscall_saved_user_rsp(%rip), %rax /* Restore return value */
     
     sysretq

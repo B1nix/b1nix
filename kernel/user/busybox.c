@@ -11,7 +11,14 @@
 #include <unistd.h>
 
 static u64 bb_open(const char *path) {
-  return syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+  return fd;
+}
+
+static int reboot_main(int argc, const char **argv) {
+  (void)argc; (void)argv;
+  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0);
+  return 0;
 }
 
 static usize bb_read_file(const char *path, char *buf, usize max) {
@@ -1709,6 +1716,7 @@ static struct bb_app bb_apps[] = {
     {"whoami", whoami_main},
     {"id", id_main},
     {"clear", clear_main},
+    {"reboot", reboot_main},
     {0, 0},
 };
 

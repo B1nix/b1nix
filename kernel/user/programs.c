@@ -449,12 +449,8 @@ static u64 open_output(const char *cwd, const char *path, int append) {
   char abs[128];
   resolve_path(cwd, path, abs);
   u64 fd = syscall_dispatch(SYS_CREATE, (u64)(usize)abs, (u64)(usize) "", 0, 0);
-  if (fd == 0) {
-    fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
-  } else {
-    fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
-  }
-  if (fd != (u64)-1 && append) {
+  fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, (u64)B1NIX_O_WRONLY, 0, 0);
+  if ((isize)fd >= 0 && append) {
     syscall_dispatch(SYS_LSEEK, fd, (u64)0, B1NIX_SEEK_END, 0);
   }
   return fd;
@@ -467,7 +463,7 @@ static int apply_redirs(const char *cwd, const struct shell_redir *redir,
     char abs[128];
     resolve_path(cwd, redir->stdin_path, abs);
     u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
-    if (fd == (u64)-1)
+    if ((isize)fd < 0)
       return -1;
     syscall_dispatch(SYS_DUP2, fd, 0, 0, 0);
     if (opened_count < max_opened)
@@ -475,7 +471,7 @@ static int apply_redirs(const char *cwd, const struct shell_redir *redir,
   }
   if (redir->stdout_path) {
     u64 fd = open_output(cwd, redir->stdout_path, redir->stdout_append);
-    if (fd == (u64)-1)
+    if ((isize)fd < 0)
       return -1;
     syscall_dispatch(SYS_DUP2, fd, 1, 0, 0);
     if (opened_count < max_opened)
@@ -485,7 +481,7 @@ static int apply_redirs(const char *cwd, const struct shell_redir *redir,
     syscall_dispatch(SYS_DUP2, 1, 2, 0, 0);
   } else if (redir->stderr_path) {
     u64 fd = open_output(cwd, redir->stderr_path, 0);
-    if (fd == (u64)-1)
+    if ((isize)fd < 0)
       return -1;
     syscall_dispatch(SYS_DUP2, fd, 2, 0, 0);
     if (opened_count < max_opened)
@@ -653,14 +649,14 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
     resolve_path(cwd, args[1], abs_path);
     char buffer[256];
     u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs_path, 0, 0, 0);
-    if (fd == (u64)-1) {
-      uwrite("sh: cat: file not found\n");
+    if ((isize)fd < 0) {
+      uwrite("sh: cat: open failed\n");
       return 1;
     } else {
       while (1) {
-        u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buffer,
-                                 sizeof(buffer) - 1, 0);
-        if (n == 0 || n == (u64)-1)
+        isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)buffer,
+                                          sizeof(buffer) - 1, 0);
+        if (n <= 0)
           break;
         buffer[n] = '\0';
         uwrite(buffer);
@@ -806,6 +802,7 @@ static void sh_execute_line(char *line, char *cwd) {
     *comment = '\0';
 
   char *p = line;
+  int skip = 0;
   while (*p) {
     while (*p == ' ' || *p == ';')
       p++;
@@ -844,14 +841,26 @@ static void sh_execute_line(char *line, char *cwd) {
       end++;
     }
 
-    sh_last_status = sh_execute_pipeline(p, cwd);
+    if (!skip) {
+      sh_last_status = sh_execute_pipeline(p, cwd);
+    }
 
     if (op == 0)
       break;
-    if (op == 1 && sh_last_status != 0)
-      break;
-    if (op == 2 && sh_last_status == 0)
-      break;
+
+    if (op == 1) { /* && */
+      if (sh_last_status != 0)
+        skip = 1;
+      else
+        skip = 0;
+    } else if (op == 2) { /* || */
+      if (sh_last_status == 0)
+        skip = 1;
+      else
+        skip = 0;
+    } else { /* ; */
+      skip = 0;
+    }
 
     p = end + (op == 3 ? 1 : 2);
   }
@@ -859,7 +868,7 @@ static void sh_execute_line(char *line, char *cwd) {
 
 static void sh_run_script(const char *path, char *cwd) {
   u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
-  if (fd == (u64)-1) {
+  if ((isize)fd < 0) {
     uwrite("sh: cannot open script\n");
     return;
   }
@@ -867,8 +876,8 @@ static void sh_run_script(const char *path, char *cwd) {
   int i = 0;
   while (1) {
     char c;
-    u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)&c, 1, 0);
-    if (n == 0 || n == (u64)-1)
+    isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)&c, 1, 0);
+    if (n <= 0)
       break;
     if (c == '\n') {
       line[i] = '\0';

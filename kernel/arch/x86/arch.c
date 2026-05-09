@@ -81,6 +81,10 @@ void arch_init(void)
 
 void arch_halt(void)
 {
+	/* QEMU isa-debug-exit: exit with status (val << 1) | 1. 
+	   We use value 0 to exit with status 1 (0*2+1). */
+	__asm__ volatile("outb %0, %1" : : "a"((u8)0), "Nd"((u16)0xf4));
+
 	for (;;) {
 		__asm__ volatile("hlt");
 	}

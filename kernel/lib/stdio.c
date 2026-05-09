@@ -6,13 +6,13 @@
 int putchar(int c)
 {
 	char ch = (char)c;
-	syscall_dispatch(SYS_WRITE, (u64)(usize)&ch, 1, 1, 1);
+	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)&ch, 1, 0);
 	return c;
 }
 
 int puts(const char *s)
 {
-	syscall_dispatch(SYS_WRITE, (u64)(usize)s, strlen(s), 1, 1);
+	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)s, strlen(s), 0);
 	putchar('\n');
 	return 0;
 }
@@ -204,6 +204,6 @@ int printf(const char *fmt, ...)
 	va_start(args, fmt);
 	int len = vsnprintf_impl(buf, sizeof(buf), fmt, args);
 	va_end(args);
-	syscall_dispatch(SYS_WRITE, (u64)(usize)buf, len, 1, 0);
+	syscall_dispatch(SYS_WRITE, 1, (u64)(usize)buf, len, 0);
 	return len;
 }

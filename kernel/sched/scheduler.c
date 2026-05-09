@@ -55,6 +55,8 @@ struct task {
 	kernel_thread_entry entry;
 	void *arg;
 	void *stack;
+	u64 kernel_stack_ptr;
+	u64 saved_user_rsp;
 	u64 wake_tick;
 	int stdout_fd;
 	int fd_table[SCHED_MAX_FDS];
@@ -84,9 +86,10 @@ struct task {
 extern void arch_context_switch(struct cpu_context *old_context, struct cpu_context *new_context);
 extern void vfs_handle_retain(int handle);
 extern void vfs_handle_release(int handle);
+extern char x86_syscall_stack_top[];
 
 static struct task tasks[MAX_TASKS];
-static struct task *current_task;
+struct task *current_task;
 static usize next_task_id = 1;
 static volatile u64 scheduler_ticks;
 static int scheduler_started;
@@ -198,6 +201,7 @@ void scheduler_init(void)
 	boot->umask = 022;
 	boot->process_group_id = boot->id;
 	boot->session_id = boot->id;
+	boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
 	current_task = boot;
 	scheduler_started = 1;
 
@@ -232,6 +236,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 
 	void *stack = kmalloc(KERNEL_STACK_SIZE);
 	u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
+	task->kernel_stack_ptr = stack_top;
 	u64 initial_rsp = stack_top - 16;
 	*(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
 

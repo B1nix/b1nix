@@ -57,6 +57,40 @@ static struct dcache_entry *dcache[DCACHE_SIZE] = {0};
 static struct dcache_entry *dcache_lru_head = 0;
 static struct dcache_entry *dcache_lru_tail = 0;
 static int dcache_count = 0;
+static volatile int dcache_lock = 0;
+
+static void dcache_acquire(void) {
+  while (__atomic_test_and_set(&dcache_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+}
+
+static void dcache_release(void) {
+  __atomic_clear(&dcache_lock, __ATOMIC_RELEASE);
+}
+
+/* Slab-like pool for dcache entries to avoid fragmentation and kmalloc overhead */
+static struct dcache_entry dcache_pool[MAX_DCACHE_ENTRIES];
+static struct dcache_entry *dcache_free_list = 0;
+
+static void dcache_init_pool(void) {
+  for (int i = 0; i < MAX_DCACHE_ENTRIES - 1; i++) {
+    dcache_pool[i].next = &dcache_pool[i + 1];
+  }
+  dcache_pool[MAX_DCACHE_ENTRIES - 1].next = 0;
+  dcache_free_list = &dcache_pool[0];
+}
+
+static struct dcache_entry *dcache_alloc(void) {
+  if (!dcache_free_list) return 0;
+  struct dcache_entry *e = dcache_free_list;
+  dcache_free_list = e->next;
+  memset(e, 0, sizeof(struct dcache_entry));
+  return e;
+}
+
+static void dcache_free(struct dcache_entry *e) {
+  e->next = dcache_free_list;
+  dcache_free_list = e;
+}
 
 static u32 dcache_hash(struct vfs_node *parent, const char *name) {
   u32 h = 5381;
@@ -66,6 +100,7 @@ static u32 dcache_hash(struct vfs_node *parent, const char *name) {
 }
 
 static struct vfs_node *dcache_lookup(struct vfs_node *parent, const char *name) {
+  dcache_acquire();
   u32 h = dcache_hash(parent, name);
   struct dcache_entry *e = dcache[h];
   while (e) {
@@ -81,25 +116,46 @@ static struct vfs_node *dcache_lookup(struct vfs_node *parent, const char *name)
         dcache_lru_head = e;
         if (!dcache_lru_tail) dcache_lru_tail = e;
       }
-      return e->node;
+      struct vfs_node *res = e->node;
+      dcache_release();
+      return res;
     }
     e = e->next;
   }
+  dcache_release();
   return 0;
 }
 
 static void dcache_insert(struct vfs_node *parent, const char *name, struct vfs_node *node) {
+  dcache_acquire();
   if (dcache_count >= MAX_DCACHE_ENTRIES) {
     /* Evict LRU tail */
     struct dcache_entry *victim = dcache_lru_tail;
     if (victim) {
-      dcache_invalidate(victim->parent, victim->name);
+      /* Invalidate will handle locking if we call it carefully, 
+         but here we are already holding the lock. 
+         Let's manually remove the tail to avoid deadlock. */
+      
+      /* Remove from hash table */
+      u32 vh = dcache_hash(victim->parent, victim->name);
+      struct dcache_entry **prev_ptr = &dcache[vh];
+      while (*prev_ptr && *prev_ptr != victim) prev_ptr = &(*prev_ptr)->next;
+      if (*prev_ptr) *prev_ptr = victim->next;
+
+      /* Remove from LRU */
+      if (victim == dcache_lru_head) dcache_lru_head = victim->lru_next;
+      if (victim == dcache_lru_tail) dcache_lru_tail = victim->lru_prev;
+      if (victim->lru_prev) victim->lru_prev->lru_next = victim->lru_next;
+      if (victim->lru_next) victim->lru_next->lru_prev = victim->lru_prev;
+
+      dcache_free(victim);
+      dcache_count--;
     }
   }
 
   u32 h = dcache_hash(parent, name);
-  struct dcache_entry *e = kmalloc(sizeof(struct dcache_entry));
-  if (!e) return;
+  struct dcache_entry *e = dcache_alloc();
+  if (!e) { dcache_release(); return; }
   e->parent = parent;
   copy_path(e->name, 64, name);
   e->node = node;
@@ -116,9 +172,11 @@ static void dcache_insert(struct vfs_node *parent, const char *name, struct vfs_
   if (!dcache_lru_tail) dcache_lru_tail = e;
   
   dcache_count++;
+  dcache_release();
 }
 
 static void dcache_invalidate(struct vfs_node *parent, const char *name) {
+  dcache_acquire();
   u32 h = dcache_hash(parent, name);
   struct dcache_entry **prev_ptr = &dcache[h];
   struct dcache_entry *curr = *prev_ptr;
@@ -133,13 +191,15 @@ static void dcache_invalidate(struct vfs_node *parent, const char *name) {
       if (curr->lru_prev) curr->lru_prev->lru_next = curr->lru_next;
       if (curr->lru_next) curr->lru_next->lru_prev = curr->lru_prev;
       
-      kfree(curr);
+      dcache_free(curr);
       dcache_count--;
+      dcache_release();
       return;
     }
     prev_ptr = &curr->next;
     curr = *prev_ptr;
   }
+  dcache_release();
 }
 
 static void vfs_acquire_handle_lock(void) {
@@ -378,6 +438,7 @@ void vfs_node_put(struct vfs_node *node) {
 }
 
 static void split_path(const char *path, char *first_part, const char **rest) {
+  if (!path) { if (first_part) first_part[0] = '\0'; if (rest) *rest = 0; return; }
   while (*path == '/') path++;
   if (*path == '\0') { first_part[0] = '\0'; *rest = 0; return; }
   usize i = 0;
@@ -866,6 +927,7 @@ static void vfs_init_stdio(void) {
 }
 
 void vfs_init(void) {
+  dcache_init_pool();
   node_count = 0;
   memset(handles, 0, sizeof(handles));
   memset(pipes, 0, sizeof(pipes));
@@ -975,6 +1037,11 @@ int vfs_open_flags(const char *path, int flags) {
   res = fd;
 
 out:
+  if (res < 0) {
+    console_write("vfs: open failed with ");
+    console_write_dec(-res);
+    console_write("\n");
+  }
   vfs_release_lock();
   return res;
 }
@@ -1149,6 +1216,9 @@ isize vfs_write(int fd, const char *buf, usize size) {
     if (need > node->inode->size) node->inode->size = need;
     
     vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
+    /* Notify FS driver about size/data change to mark blocks dirty */
+    if (node->inode->setattr_cb) node->inode->setattr_cb(node);
+    
     vfs_inode_unlock(node->inode);
 
     __atomic_add_fetch(&h->offset, size, __ATOMIC_RELAXED);
@@ -1564,6 +1634,11 @@ out:
 }
 
 int vfs_symlink(const char *target, const char *link_path) {
+  console_write("vfs: symlink target=");
+  console_write(target);
+  console_write(" link=");
+  console_write(link_path);
+  console_write("\n");
   vfs_acquire_lock();
   int res = 0;
   if (!target || target[0] == '\0') { res = -EINVAL; goto out; }
@@ -1667,9 +1742,20 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   vfs_inode_lock(p1->inode);
   if (p1 != p2) vfs_inode_lock(p2->inode);
 
-  /* Атомарная замена in-memory */
+  /* POSIX type-consistency checks */
   struct vfs_node *existing = find_child(new_parent, new_n);
   if (existing) {
+    if (node->inode->type == VFS_DIRECTORY && existing->inode->type != VFS_DIRECTORY) {
+      if (p1 != p2) vfs_inode_unlock(p2->inode);
+      vfs_inode_unlock(p1->inode);
+      return -ENOTDIR;
+    }
+    if (node->inode->type != VFS_DIRECTORY && existing->inode->type == VFS_DIRECTORY) {
+      if (p1 != p2) vfs_inode_unlock(p2->inode);
+      vfs_inode_unlock(p1->inode);
+      return -EISDIR;
+    }
+
     if (existing->inode->type == VFS_DIRECTORY && existing->first_child) {
         if (p1 != p2) vfs_inode_unlock(p2->inode);
         vfs_inode_unlock(p1->inode);

@@ -53,8 +53,13 @@ static const char posix_smoke_script[] =
 	"false || echo \"ok or\"\n"
 	"mkdir -p /tmp/a/b/c\n"
 	"[ -d /tmp/a/b/c ] && echo \"ok mkdir-p\" || echo \"fail mkdir-p\"\n"
-	"rm -rf /tmp/a\n"
-	"echo \"POSIX-SMOKE: done\"\n";
+	"ln -s /tmp/loop /tmp/loop\n"
+	"cat /tmp/loop && echo \"fail eloop\" || echo \"ok eloop\"\n"
+	"rm /tmp/posix_test\n"
+	"[ ! -f /tmp/posix_test ] && echo \"ok rm\" || echo \"fail rm\"\n"
+	"echo \"POSIX-SMOKE: done\"\n"
+	"sync\n"
+	"reboot\n";
 
 static const struct initramfs_file files[] = {
 	{ "/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf), INITRAMFS_EXECUTABLE },

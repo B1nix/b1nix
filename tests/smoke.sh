@@ -40,21 +40,32 @@ run_qemu() {
 	local pid
 
 	if [ "$ARCH" = "x86" ]; then
-		if command -v timeout >/dev/null 2>&1; then
-			timeout "$TIMEOUT" qemu-system-x86_64 \
-				-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
-				-serial stdio -display none -monitor none -no-reboot \
-				>"$log" 2>&1 || true
-		else
-			qemu-system-x86_64 \
-				-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
-				-serial stdio -display none -monitor none -no-reboot \
-				>"$log" 2>&1 &
-			pid=$!
-			sleep "$TIMEOUT"
-			kill "$pid" 2>/dev/null || true
-			wait "$pid" 2>/dev/null || true
-		fi
+		qemu-system-x86_64 \
+			-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
+			-serial stdio -display none -monitor none -no-reboot \
+			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+			>"$log" 2>&1 &
+		pid=$!
+		
+		# Poll for completion marker or QEMU exit
+		local count=0
+		local max_wait=$((TIMEOUT * 10)) # 0.1s steps
+		while [ $count -lt $max_wait ]; do
+			if grep -q "POSIX-SMOKE: done" "$log" 2>/dev/null; then
+				# Found marker, wait a bit for final flush
+				sleep 0.5
+				break
+			fi
+			if ! kill -0 "$pid" 2>/dev/null; then
+				# QEMU exited (likely via isa-debug-exit)
+				break
+			fi
+			sleep 0.1
+			count=$((count + 1))
+		done
+		
+		kill "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
 	else
 		echo "Unknown ARCH: $ARCH (AArch64 is archived)"
 		exit 1
@@ -157,7 +168,7 @@ check_output "$LOG" "M22-SMOKE: ok uname" "uname utility runs"
 check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
 
 check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
-
+check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
 
 # ── Network tests (x86 only) ──

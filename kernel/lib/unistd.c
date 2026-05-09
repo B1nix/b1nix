@@ -3,7 +3,7 @@
 
 int write(int fd, const void *buf, size_t count)
 {
-	return (int)syscall_dispatch(SYS_WRITE, (u64)(usize)buf, (u64)count, (u64)fd, 1);
+	return (int)syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)buf, (u64)count, 0);
 }
 
 int read(int fd, void *buf, size_t count)
