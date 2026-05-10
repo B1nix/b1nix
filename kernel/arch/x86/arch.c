@@ -27,6 +27,7 @@ static struct x86_tss x86_tss __attribute__((aligned(16)));
 void x86_idt_init(void);
 void x86_pic_init(void);
 void x86_timer_init(void);
+void rtc_init(void);
 
 extern void x86_syscall_entry(void);
 extern u64 gdt64_tss[2];
@@ -70,6 +71,7 @@ void arch_init(void) {
   x86_idt_init();
   x86_pic_init();
   x86_timer_init();
+  rtc_init();
   x86_syscall_init();
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");

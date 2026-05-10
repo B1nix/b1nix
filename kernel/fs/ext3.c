@@ -338,7 +338,8 @@ static int ext3_set_block(struct ext2_inode *inode, u32 block_idx, u32 phys) {
 }
 
 static isize ext3_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
-                           usize size) {
+                           usize size, int flags) {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext3_read_inode(ino, &inode) < 0)
@@ -371,7 +372,8 @@ static isize ext3_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 }
 
 static isize ext3_vfs_write(struct vfs_node *node, u64 offset,
-                            const char *buffer, usize size) {
+                            const char *buffer, usize size, int flags) {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext3_read_inode(ino, &inode) < 0)
@@ -418,7 +420,7 @@ static isize ext3_vfs_write(struct vfs_node *node, u64 offset,
     return done;
 }
 
-static int ext3_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name) {
+static int ext3_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name, u8 type) {
     struct ext2_inode dir;
   if (ext3_read_inode(dir_ino, &dir) < 0)
     return -1;
@@ -447,7 +449,7 @@ static int ext3_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name) {
                 ne->inode = child_ino;
                 ne->rec_len = e->rec_len - actual;
                 ne->name_len = name_len;
-                ne->file_type = EXT2_FT_REG_FILE;
+                ne->file_type = type;
                 memcpy(ne->name, name, name_len);
         ext3_journal_write(phys, buf);
                 kfree(buf);
@@ -469,7 +471,7 @@ static int ext3_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name) {
         e->inode = child_ino;
         e->rec_len = ext3_block_size;
         e->name_len = name_len;
-        e->file_type = EXT2_FT_REG_FILE;
+        e->file_type = type;
         memcpy(e->name, name, name_len);
     ext3_journal_write(phys, buf);
         kfree(buf);
@@ -493,7 +495,7 @@ static int ext3_vfs_create(struct vfs_node *dir, const char *name,
     inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
     ext3_write_inode(new_ino, &inode);
 
-    if (ext3_add_dir_entry(dir_ino, new_ino, name) < 0) return -EIO;
+    if (ext3_add_dir_entry(dir_ino, new_ino, name, EXT2_FT_REG_FILE) < 0) return -EIO;
 
     struct vfs_node *n = vfs_add_node(full_path, VFS_FILE, (void *)(usize)new_ino, 0, 0);
     if (n) {
@@ -516,10 +518,10 @@ static int ext3_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
     ext3_write_inode(new_ino, &inode);
 
-    if (ext3_add_dir_entry(dir_ino, new_ino, name) < 0) return -EIO;
+    if (ext3_add_dir_entry(dir_ino, new_ino, name, EXT2_FT_DIR) < 0) return -EIO;
     /* Add . and .. */
-    ext3_add_dir_entry(new_ino, new_ino, ".");
-    ext3_add_dir_entry(new_ino, dir_ino, "..");
+    ext3_add_dir_entry(new_ino, new_ino, ".", EXT2_FT_DIR);
+    ext3_add_dir_entry(new_ino, dir_ino, "..", EXT2_FT_DIR);
 
     struct ext2_inode di;
     if (ext3_read_inode(dir_ino, &di) == 0) {
@@ -593,6 +595,44 @@ static isize ext3_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
     }
     kfree(dir_buf);
     return (isize)count;
+}
+
+static int ext3_vfs_symlink(struct vfs_node *dir, const char *name, const char *target) {
+    u32 new_ino = ext3_alloc_inode();
+    if (!new_ino) return -ENOSPC;
+
+    struct ext2_inode inode;
+    memset(&inode, 0, sizeof(inode));
+    inode.i_mode = EXT2_S_IFLNK | 0777;
+    inode.i_links_count = 1;
+    inode.i_size = strlen(target);
+    inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+
+    if (inode.i_size < 60) {
+        memcpy(inode.i_block, target, inode.i_size);
+    } else {
+        u32 block = ext3_alloc_block();
+        if (!block) {
+            ext3_free_inode(new_ino);
+            return -ENOSPC;
+        }
+        inode.i_block[0] = block;
+        ext3_journal_write(block, target);
+    }
+    
+    ext3_write_inode(new_ino, &inode);
+    return ext3_add_dir_entry((u32)(usize)dir->inode->data, new_ino, name, EXT2_FT_SYMLINK);
+}
+
+static int ext3_vfs_link(struct vfs_node *target_node, struct vfs_node *dir, const char *name) {
+    u32 ino = (u32)(usize)target_node->inode->data;
+    struct ext2_inode inode;
+    if (ext3_read_inode(ino, &inode) < 0) return -EIO;
+
+    inode.i_links_count++;
+    ext3_write_inode(ino, &inode);
+
+    return ext3_add_dir_entry((u32)(usize)dir->inode->data, ino, name, EXT2_FT_REG_FILE);
 }
 
 static int ext3_vfs_fsync(struct vfs_node *node) {
@@ -717,7 +757,7 @@ static int ext3_vfs_rename(struct vfs_node *old_dir, const char *old_name,
     kfree(buf);
     if (!ino) return -ENOENT;
 
-    if (ext3_add_dir_entry((u32)(usize)new_dir->inode->data, ino, new_name) < 0) return -EIO;
+    if (ext3_add_dir_entry((u32)(usize)new_dir->inode->data, ino, new_name, type) < 0) return -EIO;
     ext3_vfs_unlink(old_dir, old_name);
     return 0;
 }
@@ -771,6 +811,8 @@ static void ext3_populate_vfs(u32 ino, const char *base_path) {
             dn->inode->statfs_cb = ext3_vfs_statfs;
             dn->inode->readdir_cb = ext3_vfs_readdir;
             dn->inode->fsync_cb = ext3_vfs_fsync;
+            dn->inode->symlink_cb = ext3_vfs_symlink;
+            dn->inode->link_cb = ext3_vfs_link;
           }
                     ext3_populate_vfs(e->inode, full);
                 } else {
@@ -848,6 +890,8 @@ void ext3_init(void) {
     root->inode->statfs_cb = ext3_vfs_statfs;
     root->inode->readdir_cb = ext3_vfs_readdir;
     root->inode->fsync_cb = ext3_vfs_fsync;
+    root->inode->symlink_cb = ext3_vfs_symlink;
+    root->inode->link_cb = ext3_vfs_link;
   }
     ext3_populate_vfs(2, "/ext3");
 }

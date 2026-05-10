@@ -1,4 +1,5 @@
 #include <b1nix/blk.h>
+#include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/posix.h>
@@ -936,18 +937,19 @@ static int init_main(int argc, const char **argv) {
   (void)argv;
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
-  u64 native_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0);
-  if (native_pid != (u64)-1) {
+
+  u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0);
+  
+  if ((isize)n_pid < 0) {
+    uwrite("NATIVE-SMOKE: spawn-fail\n");
+  } else {
     int native_status = 0;
-    syscall_dispatch(SYS_WAIT, native_pid, (u64)(usize)&native_status, 0, 0);
+    syscall_dispatch(SYS_WAIT, n_pid, (u64)(usize)&native_status, 0, 0);
     if (native_status == 0) {
       uwrite("NATIVE-SMOKE: done\n");
     } else {
       uwrite("NATIVE-SMOKE: fail\n");
     }
-  } else {
-    uwrite("NATIVE-SMOKE: spawn-fail\n");
   }
 
   u64 smoke_pid =

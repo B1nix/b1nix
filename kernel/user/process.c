@@ -83,7 +83,7 @@ static char *kernel_strdup(const char *src) {
 }
 
 static int copy_string_vector(const char **src, int max_count,
-                              const char ***out, int *out_count) {
+                               const char ***out, int *out_count) {
   const char **copy = kzalloc(sizeof(char *) * (max_count + 1));
   int count = 0;
   char tmp[256];
@@ -92,13 +92,27 @@ static int copy_string_vector(const char **src, int max_count,
     return -1;
   if (src) {
     for (; count < max_count; count++) {
-      const char *user_string = 0;
-      if (syscall_copyin(&user_string, src + count, sizeof(user_string)) != 0)
-        return -1;
-      if (!user_string)
+      const char *ptr = 0;
+      /* Check if src is in kernel space (high addresses) */
+      if ((u64)src >= 0xffff800000000000) {
+        ptr = src[count];
+      } else {
+        if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0)
+          return -1;
+      }
+
+      if (!ptr)
         break;
-      if (syscall_copyinstr(tmp, sizeof(tmp), user_string) != 0)
-        return -1;
+
+      /* Check if ptr is in kernel space */
+      if ((u64)ptr >= 0xffff800000000000) {
+        strncpy(tmp, ptr, sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
+      } else {
+        if (syscall_copyinstr(tmp, sizeof(tmp), ptr) != 0)
+          return -1;
+      }
+
       copy[count] = kernel_strdup(tmp);
       if (!copy[count])
         return -1;
@@ -500,6 +514,19 @@ void userspace_init(void) {
 }
 
 int user_spawn(const char *path, int argc, const char **argv) {
+  struct vfs_node *node = vfs_find_node(path);
+  if (IS_ERR(node)) {
+    return (int)PTR_ERR(node);
+  }
+
+  /* POSIX: Check execute permission */
+  const struct cred *cred = scheduler_get_current_cred();
+  if (!cred || vfs_get_node_perm(node, cred, 1) != 1) {
+    vfs_node_put(node);
+    return -EACCES;
+  }
+  vfs_node_put(node);
+
   const char *empty_env[] = {"PATH=/bin", 0};
   struct user_loaded_image *image =
       user_load_image(path, argc, argv, empty_env);
@@ -532,6 +559,18 @@ int user_spawn(const char *path, int argc, const char **argv) {
 
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
+  struct vfs_node *node = vfs_find_node(path);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+
+  /* POSIX: Check execute permission */
+  const struct cred *cred = scheduler_get_current_cred();
+  if (vfs_get_node_perm(node, cred, 1) != 1) {
+    vfs_node_put(node);
+    return -EACCES;
+  }
+  vfs_node_put(node);
+
   struct user_loaded_image *image = user_load_image(path, 0, argv, envp);
   if (!image)
     return -1;
@@ -557,6 +596,11 @@ void user_register_program(const char *path, user_program_entry entry) {
   programs[program_count].path = path;
   programs[program_count].entry = entry;
   program_count++;
+
+  /* Ensure the program exists in the VFS so vfs_find_node/vfs_get_node_perm works */
+  if (vfs_create(path, "") == 0) {
+    vfs_chmod(path, 0755);
+  }
 }
 
 const struct user_program *user_find_program(const char *path) {

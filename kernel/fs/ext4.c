@@ -317,9 +317,10 @@ static void ext4_free_inode(u32 inode_num) {
 
 static u32 ext4_extent_lookup(struct ext2_inode *inode, u32 logical_block) {
     struct ext4_extent_header *eh = (struct ext4_extent_header *)inode->i_block;
-  if (eh->eh_magic != EXT4_EXTENT_MAGIC)
+  if (eh->eh_magic != EXT4_EXTENT_MAGIC) {
     return 0;
-    u32 depth = eh->eh_depth;
+  }
+  u32 depth = eh->eh_depth;
     u8 *block_buf = kmalloc(ext4_block_size);
 
     if (depth == 0) {
@@ -476,17 +477,18 @@ static u64 ext4_get_inode_size(struct ext2_inode *inode) {
 }
 
 static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
-                           usize size) {
+                           usize size, int flags) {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext4_read_inode(ino, &inode) < 0)
     return -1;
 
-    u64 inode_sz = ext4_get_inode_size(&inode);
+  u64 inode_sz = ext4_get_inode_size(&inode);
   if (offset >= inode_sz)
     return 0;
 
-    usize remaining = (usize)(inode_sz - offset);
+  usize remaining = (usize)(inode_sz - offset);
     usize to_read = size < remaining ? size : remaining;
     usize done = 0;
     u8 *block_buf = kmalloc(ext4_block_size);
@@ -512,13 +514,14 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 }
 
 static isize ext4_vfs_write(struct vfs_node *node, u64 offset,
-                            const char *buffer, usize size) {
+                            const char *buffer, usize size, int flags) {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext2_inode inode;
   if (ext4_read_inode(ino, &inode) < 0)
     return -1;
 
-    u64 new_size = offset + size;
+  u64 new_size = offset + size;
     u32 old_blks = (inode.i_size + ext4_block_size - 1) / ext4_block_size;
     u32 new_blks = (new_size + ext4_block_size - 1) / ext4_block_size;
 
@@ -565,10 +568,11 @@ static int ext4_add_dir_entry(u32 dir_ino, u32 child_ino, const char *name,
   if (ext4_read_inode(dir_ino, &dir) < 0)
     return -1;
 
-    usize name_len = strlen(name);
-  if (name_len > 255)
+  usize name_len = strlen(name);
+  if (name_len > 255) {
     name_len = 255;
-    u32 needed = 8 + ((name_len + 3) & ~3);
+  }
+  u32 needed = 8 + ((name_len + 3) & ~3);
     u8 *buf = kmalloc(ext4_block_size);
     u32 blocks = (dir.i_size + ext4_block_size - 1) / ext4_block_size;
 
@@ -659,6 +663,45 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
     }
     kfree(dir_buf);
     return (isize)count;
+}
+
+static int ext4_vfs_symlink(struct vfs_node *dir, const char *name, const char *target) {
+    u32 new_ino = ext4_alloc_inode();
+    if (!new_ino) return -ENOSPC;
+
+    struct ext2_inode inode;
+    memset(&inode, 0, sizeof(inode));
+    inode.i_mode = EXT2_S_IFLNK | 0777;
+    inode.i_links_count = 1;
+    inode.i_size = strlen(target);
+    inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+
+    if (inode.i_size < 60) {
+        memcpy(inode.i_block, target, inode.i_size);
+    } else {
+        u32 block = ext4_alloc_block();
+        if (!block) {
+            ext4_free_inode(new_ino);
+            return -ENOSPC;
+        }
+        inode.i_block[0] = block;
+        ext4_journal_write(block, target);
+    }
+    
+    ext4_write_inode(new_ino, &inode);
+    return ext4_add_dir_entry((u32)(usize)dir->inode->data, new_ino, name, EXT2_FT_SYMLINK);
+}
+
+static int ext4_vfs_link(struct vfs_node *target_node, struct vfs_node *dir, const char *name) {
+    u32 ino = (u32)(usize)target_node->inode->data;
+    struct ext2_inode inode;
+    if (ext4_read_inode(ino, &inode) < 0) return -EIO;
+
+    inode.i_links_count++;
+    ext4_write_inode(ino, &inode);
+
+    u8 type = (target_node->inode->type == VFS_DIRECTORY) ? EXT2_FT_DIR : EXT2_FT_REG_FILE;
+    return ext4_add_dir_entry((u32)(usize)dir->inode->data, ino, name, type);
 }
 
 static int ext4_vfs_fsync(struct vfs_node *node) {
@@ -867,11 +910,11 @@ static void ext4_populate_vfs(u32 ino, const char *base_path) {
   if (ext4_read_inode(ino, &inode) < 0)
     return;
 
-    u64 inode_sz = ext4_get_inode_size(&inode);
+  u64 inode_sz = ext4_get_inode_size(&inode);
   if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
     return;
 
-    u8 *buf = kmalloc((usize)inode_sz);
+  u8 *buf = kmalloc((usize)inode_sz);
     for (u32 i = 0; i < (inode_sz + ext4_block_size - 1) / ext4_block_size; i++) {
         u32 phys = ext4_get_block(&inode, i);
     if (phys)
@@ -916,6 +959,8 @@ static void ext4_populate_vfs(u32 ino, const char *base_path) {
             dn->inode->statfs_cb = ext4_vfs_statfs;
             dn->inode->readdir_cb = ext4_vfs_readdir;
             dn->inode->fsync_cb = ext4_vfs_fsync;
+            dn->inode->symlink_cb = ext4_vfs_symlink;
+            dn->inode->link_cb = ext4_vfs_link;
           }
                     ext4_populate_vfs(e->inode, full);
                 } else {
@@ -948,7 +993,7 @@ void ext4_init(void) {
   if (!ext4_dev)
     return;
 
-    u8 *sb_buf = kmalloc(1024);
+  u8 *sb_buf = kmalloc(1024);
   if (blk_read_cached(ext4_dev, 2, 2, sb_buf) < 0) {
     kfree(sb_buf);
     return;
@@ -1020,6 +1065,8 @@ void ext4_init(void) {
     root->inode->statfs_cb = ext4_vfs_statfs;
     root->inode->readdir_cb = ext4_vfs_readdir;
     root->inode->fsync_cb = ext4_vfs_fsync;
+    root->inode->symlink_cb = ext4_vfs_symlink;
+    root->inode->link_cb = ext4_vfs_link;
   }
     ext4_populate_vfs(2, "/ext4");
 }

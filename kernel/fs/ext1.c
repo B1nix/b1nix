@@ -280,8 +280,9 @@ static u32 ext1_set_block(struct ext1_inode *inode, u32 block_idx, u32 phys)
 
 /* ── Read callback ── */
 
-static isize ext1_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usize size)
+static isize ext1_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usize size, int flags)
 {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext1_inode inode;
     if (ext1_read_inode(ino, &inode) < 0) return -1;
@@ -321,8 +322,9 @@ static isize ext1_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
 
 /* ── Write callback ── */
 
-static isize ext1_vfs_write(struct vfs_node *node, u64 offset, const char *buffer, usize size)
+static isize ext1_vfs_write(struct vfs_node *node, u64 offset, const char *buffer, usize size, int flags)
 {
+    (void)flags;
     u32 ino = (u32)(usize)node->inode->data;
     struct ext1_inode inode;
     if (ext1_read_inode(ino, &inode) < 0) return -1;

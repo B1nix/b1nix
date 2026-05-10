@@ -51,7 +51,6 @@ struct vfs_inode {
 	enum vfs_node_type type;
 	u32 flags;
 	volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
-	usize waiter_tid;     /* Task ID waiting for this inode lock (0 if none) */
 	int refcount;   /* Internal references (e.g. open handles) */
 	int nlink;      /* Number of hard links (names pointing to this inode) */
 	usize size;
@@ -76,9 +75,9 @@ struct vfs_inode {
 	u32 fs_id;      /* Unique ID for this filesystem instance */
 
 	/* Callbacks (Inode Operations) */
-	isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size);
+	isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size, int flags);
 	isize (*readdir_cb)(struct vfs_node *node, usize offset, struct dirent *buf, usize max_entries);
-	isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer, usize size);
+	isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer, usize size, int flags);
 	int (*create_cb)(struct vfs_node *dir, const char *name, const char *full_path, u32 mode);
 	int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
 	int (*unlink_cb)(struct vfs_node *dir, const char *name);

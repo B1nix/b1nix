@@ -235,6 +235,44 @@ static u32 ext2_alloc_inode(struct block_device *dev) {
 	return 0;
 }
 
+static int ext2_load_acls(struct block_device *dev, struct ext2_inode *ei, struct vfs_inode *vi) {
+    if (ei->i_file_acl == 0) return 0;
+    u8 *buf = kmalloc(ext2_block_size);
+    if (ext2_read_block(dev, ei->i_file_acl, buf) < 0) { kfree(buf); return -1; }
+    
+    /* Simple flat storage: first 4 bytes is count, then entries */
+    int count = *(int *)buf;
+    if (count > ACL_MAX_ENTRIES) count = ACL_MAX_ENTRIES;
+    vi->acl_count = count;
+    memcpy(vi->acls, buf + 4, count * sizeof(struct acl_entry));
+    kfree(buf);
+    return 0;
+}
+
+static int ext2_save_acls(struct block_device *dev, u32 inode_num, struct ext2_inode *ei, struct vfs_inode *vi) {
+    if (vi->acl_count == 0) {
+        if (ei->i_file_acl != 0) {
+            /* We should free the block, but ext2_free_block is not implemented in this driver yet? 
+             * Wait, I saw ext2_free_block earlier. */
+            ext2_free_block(dev, ei->i_file_acl);
+            ei->i_file_acl = 0;
+        }
+        return 0;
+    }
+    
+    if (ei->i_file_acl == 0) {
+        ei->i_file_acl = ext2_alloc_block(dev);
+        if (ei->i_file_acl == 0) return -ENOSPC;
+    }
+    
+    u8 *buf = kzalloc(ext2_block_size);
+    *(int *)buf = vi->acl_count;
+    memcpy(buf + 4, vi->acls, vi->acl_count * sizeof(struct acl_entry));
+    ext2_write_block(dev, ei->i_file_acl, buf);
+    kfree(buf);
+    return 0;
+}
+
 /* Read path with single and double-indirect block support. */
 static u32 ext2_get_inode_block(struct block_device *dev, struct ext2_inode *inode, u32 block_idx) {
   u32 ptrs_per_block = ext2_block_size / 4;
@@ -382,7 +420,8 @@ static u32 ext2_allocate_block_for_inode(struct block_device *dev, u32 inode_num
 }
 
 static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
-                           usize size) {
+                           usize size, int flags) {
+  (void)flags;
 	u32 inode_num = (u32)(usize)node->inode->data;
 	struct ext2_inode inode;
   if (ext2_read_inode(node->inode->blk_dev, inode_num, &inode) < 0)
@@ -427,7 +466,8 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 
 /* Sparse-file write path with file-size growth. */
 static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
-                            const char *buffer, usize size) {
+                            const char *buffer, usize size, int flags) {
+  (void)flags;
 	u32 inode_num = (u32)(usize)node->inode->data;
 	struct ext2_inode inode;
   if (ext2_read_inode(node->inode->blk_dev, inode_num, &inode) < 0)
@@ -713,6 +753,8 @@ static int ext2_vfs_setattr(struct vfs_node *node) {
   inode.i_ctime = node->inode->ctime;
   inode.i_links_count = node->inode->nlink;
   
+  ext2_save_acls(node->inode->blk_dev, inode_num, &inode, node->inode);
+  
   return ext2_write_inode(node->inode->blk_dev, inode_num, &inode);
 }
 
@@ -865,11 +907,16 @@ static isize ext2_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
 }
 
 static int ext2_vfs_fsync(struct vfs_node *node) {
-    (void)node;
-    /* ext2 has no journal, so flushing the block cache is sufficient if metadata was written. 
-     * Since ext2_write_inode/superblock call blk_write, we just ensure it's on disk. */
+    if (!node || !node->inode || !node->inode->blk_dev) return -EINVAL;
+    
+    /* Ensure inode metadata is written to block cache */
+    ext2_vfs_setattr(node);
+    
+    /* Flush block cache to physical disk */
+    blk_cache_flush(node->inode->blk_dev);
     return 0;
 }
+
 
 static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     u32 dir_inode_num = (u32)(usize)dir->inode->data;
@@ -963,6 +1010,7 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
               dir_node->inode->statfs_cb = ext2_vfs_statfs;
               dir_node->inode->readdir_cb = ext2_vfs_readdir;
               dir_node->inode->fsync_cb = ext2_vfs_fsync;
+              ext2_load_acls(dev, &child_inode, dir_node->inode);
             }
 						ext2_populate_vfs(dev, entry->inode, full_path);
 					} else {
@@ -984,6 +1032,7 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
                node->inode->release_cb = ext2_vfs_release;
               node->inode->setattr_cb = ext2_vfs_setattr;
               node->inode->fsync_cb = ext2_vfs_fsync;
+              ext2_load_acls(dev, &child_inode, node->inode);
 						}
 					}
 				}
@@ -1036,6 +1085,11 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   root->inode->statfs_cb = ext2_vfs_statfs;
   root->inode->readdir_cb = ext2_vfs_readdir;
   root->inode->fsync_cb = ext2_vfs_fsync;
+  
+  struct ext2_inode ri;
+  if (ext2_read_inode(ext2_dev, 2, &ri) == 0) {
+      ext2_load_acls(ext2_dev, &ri, root->inode);
+  }
   
   return root;
 }
@@ -1095,6 +1149,11 @@ int ext2_mount_root(const char *device_name, const char *mount_point) {
     ext2_root->inode->statfs_cb = ext2_vfs_statfs;
     ext2_root->inode->readdir_cb = ext2_vfs_readdir;
     ext2_root->inode->fsync_cb = ext2_vfs_fsync;
+    
+    struct ext2_inode ri;
+    if (ext2_read_inode(ext2_dev, 2, &ri) == 0) {
+        ext2_load_acls(ext2_dev, &ri, ext2_root->inode);
+    }
   }
 	ext2_populate_vfs(ext2_dev, 2, mount_point);
 	return 0;

@@ -58,6 +58,7 @@ struct task {
 	u64 kernel_stack_ptr;
 	u64 saved_user_rsp;
 	u64 wake_tick;
+	void *wait_chan;
 	int stdout_fd;
 	int fd_table[SCHED_MAX_FDS];
 	int fd_flags[SCHED_MAX_FDS];
@@ -93,6 +94,7 @@ struct task *current_task;
 static usize next_task_id = 1;
 static volatile u64 scheduler_ticks;
 static int scheduler_started;
+static void task_init_cred(struct task *task);
 
 static void interrupts_disable(void)
 {
@@ -202,6 +204,7 @@ void scheduler_init(void)
 	boot->process_group_id = boot->id;
 	boot->session_id = boot->id;
 	boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
+	task_init_cred(boot);
 	current_task = boot;
 	scheduler_started = 1;
 
@@ -374,7 +377,36 @@ void scheduler_wake_task(usize task_id)
 	for (usize i = 0; i < MAX_TASKS; i++) {
 		if (tasks[i].id == task_id && tasks[i].state == TASK_BLOCKED) {
 			tasks[i].state = TASK_READY;
+			tasks[i].wait_chan = 0;
 			break;
+		}
+	}
+
+	interrupts_enable();
+}
+
+void scheduler_block_on(void *chan)
+{
+	interrupts_disable();
+
+	if (current_task == 0 || current_task->state != TASK_RUNNING) {
+		panic("scheduler_block_on without running task");
+	}
+
+	current_task->wait_chan = chan;
+	current_task->state = TASK_BLOCKED;
+	scheduler_yield();
+	interrupts_enable();
+}
+
+void scheduler_wake_all(void *chan)
+{
+	interrupts_disable();
+
+	for (usize i = 0; i < MAX_TASKS; i++) {
+		if (tasks[i].state == TASK_BLOCKED && tasks[i].wait_chan == chan) {
+			tasks[i].state = TASK_READY;
+			tasks[i].wait_chan = 0;
 		}
 	}
 

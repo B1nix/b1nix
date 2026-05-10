@@ -249,18 +249,13 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       break;
     }
-    inode->waiter_tid = scheduler_get_pid();
-    scheduler_block_current();
+    scheduler_block_on((void *)&inode->rw_lock);
   }
 }
 
 static void vfs_inode_unlock_read(struct vfs_inode *inode) {
   if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_RELEASE) == 0) {
-    if (inode->waiter_tid) {
-      usize tid = inode->waiter_tid;
-      inode->waiter_tid = 0;
-      scheduler_wake_task(tid);
-    }
+    scheduler_wake_all((void *)&inode->rw_lock);
   }
 }
 
@@ -271,18 +266,13 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       break;
     }
-    inode->waiter_tid = scheduler_get_pid();
-    scheduler_block_current();
+    scheduler_block_on((void *)&inode->rw_lock);
   }
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
-  if (inode->waiter_tid) {
-    usize tid = inode->waiter_tid;
-    inode->waiter_tid = 0;
-    scheduler_wake_task(tid);
-  }
+  scheduler_wake_all((void *)&inode->rw_lock);
 }
 
 /* Compatibility wrappers */
@@ -299,7 +289,11 @@ static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
 
-u32 vfs_get_unix_time(void) { return (u32)scheduler_get_uptime_ticks(); }
+extern u32 rtc_boot_time_seconds;
+u32 vfs_get_unix_time(void) {
+  /* 100Hz scheduler ticks converted to seconds + RTC boot offset */
+  return rtc_boot_time_seconds + ((u32)scheduler_get_uptime_ticks() / 100);
+}
 
 static u16 scheduler_get_current_umask(void) {
   const struct cred *cred = get_current_cred();
@@ -603,6 +597,17 @@ void vfs_resolve_path(const char *path, char *out) {
     if (i < part_count - 1)
       strcat(out, "/");
   }
+
+  /* POSIX: preserve trailing slash for directory resolution */
+  usize path_len = strlen(path);
+  if (path_len > 0 && path[path_len - 1] == '/' && part_count > 0) {
+    usize out_len = strlen(out);
+    if (out_len > 0 && out[out_len - 1] != '/' && out_len < VFS_MAX_PATH - 1) {
+      out[out_len] = '/';
+      out[out_len + 1] = '\0';
+    }
+  }
+
   console_write("VFS: resolve '");
   console_write(path);
   console_write("' -> '");
@@ -659,6 +664,15 @@ vfs_find_node_internal(const char *path, int follow_final, int depth_unused) {
       console_write(current->name);
       console_write("'\n");
       if (part[0] == '\0') {
+        int orig_len = strlen(path);
+        if (orig_len > 0 && path[orig_len - 1] == '/') {
+          if (current->inode->type != VFS_DIRECTORY) {
+            vfs_inode_unlock_read(current->inode);
+            vfs_node_put(current);
+            kfree(curr_path);
+            return ERR_PTR(-ENOTDIR);
+          }
+        }
         kfree(curr_path);
         vfs_inode_unlock_read(current->inode);
         return current; /* Ref from get or root */
@@ -1018,7 +1032,7 @@ static char tty_getc_blocking(void) {
 }
 
 static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
-                      usize size) {
+                      usize size, int flags) {
   (void)node;
   (void)offset;
   if (!buffer || size == 0)
@@ -1035,7 +1049,16 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
     tty_line_len = 0;
 
     while (tty_line_len < sizeof(tty_line) - 1) {
-      char c = tty_getc_blocking();
+      char c = 0;
+      if (flags & B1NIX_O_NONBLOCK) {
+        c = ps2_kbd_getc();
+        if (c == 0) {
+          if (tty_line_len > 0) break;
+          return -EAGAIN;
+        }
+      } else {
+        c = tty_getc_blocking();
+      }
       if (c == 0)
         return 0;
       if (c == 27) {
@@ -1083,7 +1106,8 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
 }
 
 static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
-                       usize size) {
+                       usize size, int flags) {
+  (void)flags;
   (void)node;
   (void)offset;
   if (!buffer)
@@ -1163,6 +1187,17 @@ void vfs_init(void) {
 
 #ifndef __aarch64__
   virtio_blk_init();
+#endif
+
+  for (usize i = 0; i < blk_count(); i++) {
+    struct block_device *dev = blk_at(i);
+    char dev_path[64];
+    strcpy(dev_path, "/dev/");
+    strcat(dev_path, dev->name);
+    add_node(dev_path, VFS_DEVICE, 0, 0, 0);
+  }
+
+#ifndef __aarch64__
   struct block_device *blk = blk_get("virtio-blk0");
   if (blk)
     fat32_mount(blk, "/mnt");
@@ -1302,7 +1337,7 @@ static isize node_read(struct vfs_handle *h, char *buf, usize size) {
   vfs_update_times(node->inode, VFS_ATIME);
   isize res = 0;
   if (node->inode->read_cb) {
-    res = node->inode->read_cb(node, offset, buf, size);
+    res = node->inode->read_cb(node, offset, buf, size, h->flags);
     if (res > 0)
       h->offset += (usize)res;
   } else if (node->inode->type == VFS_FILE) {
@@ -1329,7 +1364,7 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
   vfs_inode_lock(node->inode);
   isize res = 0;
   if (node->inode->write_cb) {
-    res = node->inode->write_cb(node, offset, buf, size);
+    res = node->inode->write_cb(node, offset, buf, size, h->flags);
     if (res > 0) {
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
       h->offset += (usize)res;
@@ -2607,6 +2642,26 @@ int vfs_fchown(int fd, u16 uid, u16 gid) {
   return 0;
 }
 
+static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
+  if (!node)
+    return 0;
+  struct vfs_node *curr = node;
+  while (curr) {
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+      if (mounts[i].used && curr == mounts[i].root_node) {
+        return &mounts[i];
+      }
+    }
+    curr = curr->parent;
+  }
+  for (int i = 0; i < MAX_MOUNTS; i++) {
+    if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
+      return &mounts[i];
+    }
+  }
+  return 0;
+}
+
 int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)
@@ -2617,9 +2672,7 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   if (handle->node->inode->statfs_cb)
     return handle->node->inode->statfs_cb(handle->node, st);
 
-  /* Stub for now, fill with basic info */
   memset(st, 0, sizeof(*st));
-  st->f_type = 0x1337;
   st->f_bsize = 4096;
   st->f_blocks = 1024 * 1024;
   st->f_bfree = 512 * 1024;
@@ -2627,6 +2680,23 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   st->f_files = 10000;
   st->f_ffree = 9000;
   st->f_namelen = 255;
+
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(handle->node);
+  if (mnt) {
+    if (strcmp(mnt->fstype, "initramfs") == 0)
+      st->f_type = 0x01021994;
+    else if (strcmp(mnt->fstype, "ext2") == 0)
+      st->f_type = 0xEF53;
+    else if (strcmp(mnt->fstype, "ext3") == 0)
+      st->f_type = 0xEF53;
+    else if (strcmp(mnt->fstype, "ext4") == 0)
+      st->f_type = 0xEF53;
+    else if (strcmp(mnt->fstype, "fat32") == 0)
+      st->f_type = 0x4D44;
+  } else {
+    st->f_type = 0x1337;
+  }
+
   return 0;
 }
 

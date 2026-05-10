@@ -44,18 +44,21 @@ run_qemu() {
 			-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+			-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
 			>"$log" 2>&1 &
 		pid=$!
 		
-		# Watchdog to kill QEMU if it hangs
-		( sleep $TIMEOUT ; kill -9 $pid 2>/dev/null ) &
-		local watchdog_pid=$!
+		# Instant monitoring using tail -f
+		# We wait for the final success marker or a panic
+		(
+			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'POSIX-SMOKE: done|KERNEL PANIC'" >/dev/null 2>&1
+			kill "$pid" 2>/dev/null || true
+		) &
+		local watcher_pid=$!
 
-		# Wait for QEMU to exit (via isa-debug-exit or crash)
 		wait "$pid" 2>/dev/null || true
-		
-		# Kill watchdog if it's still running
-		kill "$watchdog_pid" 2>/dev/null || true
+		kill "$watcher_pid" 2>/dev/null || true
+		kill -9 "$pid" 2>/dev/null || true
 	else
 		echo "Unknown ARCH: $ARCH"
 		exit 1
@@ -81,7 +84,7 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" >/dev/null 2>&1 || {
+make ARCH="$ARCH" iso >/dev/null 2>&1 || {
 	echo "  ${RED}BUILD FAILED${NC}"
 	exit 1
 }
@@ -165,7 +168,7 @@ check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete
 if [ "$ARCH" = "x86" ]; then
 	echo ""
 	echo "[TEST] Network..."
-	if grep -q "virtio-net" "$LOG" 2>/dev/null; then
+	if grep -q "virtio-net" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then
 		pass "virtio-net detected"
 		if grep -q "DHCP\|dhcp" "$LOG" 2>/dev/null; then
 			pass "DHCP negotiation"
