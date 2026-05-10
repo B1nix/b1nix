@@ -398,8 +398,7 @@ static isize sys_mkdir(const char *user_path, u32 mode) {
   vfs_resolve_path(kpath, resolved);
   kfree(kpath);
 
-  (void)mode;
-  return vfs_mkdir(resolved);
+  return vfs_mkdir(resolved, mode);
 }
 
 static isize sys_unlink(const char *user_path) {
@@ -768,7 +767,7 @@ static isize sys_open(const char *user_path, int flags) {
   return vfs_open_flags(resolved, flags);
 }
 
-static isize sys_create(const char *user_path, const char *user_data) {
+static isize sys_create(const char *user_path, u32 mode) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
     return -ENOMEM;
@@ -782,20 +781,7 @@ static isize sys_create(const char *user_path, const char *user_data) {
   vfs_resolve_path(kpath, resolved);
   kfree(kpath);
 
-  char *kdata = 0;
-  if (user_data) {
-    kdata = kmalloc(4096);
-    if (!kdata)
-      return -ENOMEM;
-    if (syscall_copyinstr(kdata, 4096, user_data) < 0) {
-      kfree(kdata);
-      return -EFAULT;
-    }
-  }
-  int res = vfs_create(resolved, kdata);
-  if (kdata)
-    kfree(kdata);
-  return res;
+  return vfs_create(resolved, mode);
 }
 
 static isize sys_getdents(int fd, struct dirent *user_buf, usize max_entries) {
@@ -1099,8 +1085,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_FSYNC:
     return (u64)vfs_fsync((int)arg0);
   case SYS_CREATE:
-    return (u64)sys_create((const char *)(usize)arg0,
-                           (const char *)(usize)arg1);
+    return (u64)sys_create((const char *)(usize)arg0, (u32)arg1);
   case SYS_UNLINK:
     return (u64)sys_unlink((const char *)(usize)arg0);
   case SYS_MKDIR:

@@ -20,6 +20,17 @@ void serial_putc(char ch)
 	outb(COM1, (u8)ch);
 }
 
+int serial_has_data(void)
+{
+	return inb(COM1 + 5) & 1;
+}
+
+char serial_getc(void)
+{
+	if (!serial_has_data()) return 0;
+	return (char)inb(COM1);
+}
+
 void serial_write(const char *text)
 {
 	for (usize i = 0; text[i] != '\0'; i++) {

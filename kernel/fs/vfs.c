@@ -21,13 +21,13 @@
 #define VFS_ATIME 0x01
 #define VFS_MTIME 0x02
 #define VFS_CTIME 0x04
+#define VFS_MAX_SYMLINK_DEPTH 8
 
 static volatile int node_pool_lock = 0;
 static volatile int inode_pool_lock = 0;
 static volatile int vfs_handle_lock = 0;
 static u32 next_fs_id = 1;
 
-/* Прототипы функций dcache для предотвращения ошибок компиляции */
 static u32 dcache_hash(struct vfs_node *parent, const char *name);
 static struct vfs_node *dcache_lookup(struct vfs_node *parent,
                                       const char *name);
@@ -35,9 +35,16 @@ static void dcache_insert(struct vfs_node *parent, const char *name,
                           struct vfs_node *node);
 static void dcache_invalidate(struct vfs_node *parent, const char *name);
 
-/* Прототипы существующих вспомогательных функций */
+void serial_init(void);
+void serial_putc(char ch);
+char serial_getc(void);
+int serial_has_data(void);
+void serial_write(const char *text);
 static void copy_path(char *dst, usize dst_size, const char *src);
 static int split_parent_path(const char *path, char *parent_path, char *name);
+static int vfs_create_at_internal(const char *resolved_path, u32 mode);
+static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode);
+static int vfs_unlink_at_internal(const char *resolved_path);
 
 static struct vfs_fs *filesystems = NULL;
 
@@ -608,8 +615,17 @@ void vfs_resolve_path(const char *path, char *out) {
       *curr = '\0';
       curr++;
     }
+    /* Ignore current directory */
     if (strcmp(start, ".") == 0)
       continue;
+
+    /* Handle parent directory */
+    if (strcmp(start, "..") == 0) {
+      if (part_count > 0)
+        part_count--;
+      continue;
+    }
+
     parts[part_count++] = start;
   }
   out[0] = '/';
@@ -640,10 +656,12 @@ void vfs_resolve_path(const char *path, char *out) {
 /* POSIX: Iterative path resolution with symlink loop detection to prevent stack
  * overflow */
 static struct vfs_node *
-vfs_find_node_internal(const char *path, int follow_final, int depth_unused) {
-  (void)depth_unused;
+vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
   if (!root_node || !path)
     return ERR_PTR(-ENOENT);
+
+  if (symlink_depth > VFS_MAX_SYMLINK_DEPTH)
+    return ERR_PTR(-ELOOP);
 
   char *curr_path = kmalloc(VFS_MAX_PATH);
   if (!curr_path)
@@ -651,167 +669,184 @@ vfs_find_node_internal(const char *path, int follow_final, int depth_unused) {
   strncpy(curr_path, path, VFS_MAX_PATH - 1);
   curr_path[VFS_MAX_PATH - 1] = '\0';
 
-  vfs_node_get(root_node);
-  struct vfs_node *current = root_node;
-  vfs_inode_lock_read(current->inode);
-  int symlink_count = 0;
-
-  char parent_path[VFS_MAX_PATH];
+  char *parent_path = kmalloc(VFS_MAX_PATH);
+  if (!parent_path) {
+    kfree(curr_path);
+    return ERR_PTR(-ENOMEM);
+  }
   parent_path[0] = '/';
   parent_path[1] = '\0';
 
-  while (symlink_count < 16) {
-    char part[64];
-    const char *rest = curr_path;
+  vfs_node_get(root_node);
+  struct vfs_node *current = root_node;
+  vfs_inode_lock_read(current->inode);
 
-    if (curr_path[0] == '/') {
+  char part[64];
+  const char *rest = curr_path;
+
+restart_traversal:
+  while (1) {
+    while (*rest == '/')
+      rest++;
+
+    split_path(rest, part, &rest);
+
+    if (part[0] == '\0') {
+      int orig_len = strlen(path);
+      if (orig_len > 0 && path[orig_len - 1] == '/') {
+        if (current->inode->type != VFS_DIRECTORY) {
+          vfs_inode_unlock_read(current->inode);
+          vfs_node_put(current);
+          kfree(curr_path);
+          kfree(parent_path);
+          return ERR_PTR(-ENOTDIR);
+        }
+      }
+      kfree(curr_path);
+      kfree(parent_path);
+      vfs_inode_unlock_read(current->inode);
+      return current;
+    }
+
+    if (strcmp(part, ".") == 0)
+      continue;
+
+    if (strcmp(part, "..") == 0) {
+      struct vfs_node *parent = current->parent;
+      if (parent) {
+        vfs_node_get(parent);
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        current = parent;
+        vfs_inode_lock_read(current->inode);
+        pop_path_part(parent_path);
+      }
+      continue;
+    }
+
+    struct vfs_node *child = find_child(current, part);
+    if (!child) {
+      vfs_inode_unlock_read(current->inode);
+      vfs_node_put(current);
+      kfree(curr_path);
+      kfree(parent_path);
+      return ERR_PTR(-ENOENT);
+    }
+
+    vfs_node_get(child);
+    /* DOWNWARD MOUNT CROSSING */
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+      if (mounts[i].used && child == mounts[i].mount_point) {
+        struct vfs_node *root = vfs_node_get(mounts[i].root_node);
+        vfs_node_put(child);
+        child = root;
+        break;
+      }
+    }
+
+    vfs_inode_lock_read(child->inode);
+    vfs_inode_unlock_read(current->inode);
+    vfs_node_put(current);
+    current = child;
+
+    int is_final = (!rest || rest[0] == '\0');
+    if (current->inode->type == VFS_SYMLINK && (follow_final || !is_final)) {
+      if (++symlink_depth > VFS_MAX_SYMLINK_DEPTH) {
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR(-ELOOP);
+      }
+
+      char *target_path = kmalloc(VFS_MAX_PATH);
+      if (!target_path) {
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR(-ENOMEM);
+      }
+
+      /* Read symlink target */
+      isize target_len = 0;
+      if (current->inode->read_cb) {
+        target_len = current->inode->read_cb(current, 0, target_path,
+                                             VFS_MAX_PATH - 1, 0);
+      } else if (current->inode->data) {
+        target_len = (isize)current->inode->size;
+        if (target_len > VFS_MAX_PATH - 1)
+          target_len = VFS_MAX_PATH - 1;
+        memcpy(target_path, current->inode->data, (usize)target_len);
+      } else {
+        kfree(target_path);
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR(-EINVAL);
+      }
+
+      if (target_len < 0) {
+        kfree(target_path);
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR((int)target_len);
+      }
+      target_path[target_len] = '\0';
+
+      /* Path Injection: [target] + [rest] */
+      char *new_path = kmalloc(VFS_MAX_PATH);
+      if (!new_path) {
+        kfree(target_path);
+        vfs_inode_unlock_read(current->inode);
+        vfs_node_put(current);
+        kfree(curr_path);
+        kfree(parent_path);
+        return ERR_PTR(-ENOMEM);
+      }
+
+      if (target_path[0] == '/') {
+        strncpy(new_path, target_path, VFS_MAX_PATH - 1);
+      } else {
+        strncpy(new_path, parent_path, VFS_MAX_PATH - 1);
+        append_path_part(new_path, VFS_MAX_PATH, target_path);
+      }
+
+      if (!is_final) {
+        append_path_part(new_path, VFS_MAX_PATH, rest);
+      }
+      new_path[VFS_MAX_PATH - 1] = '\0';
+
+      kfree(target_path);
+      kfree(curr_path);
+      curr_path = new_path;
+      rest = curr_path;
+
+      /* Restart traversal from root because new_path is absolute */
       vfs_inode_unlock_read(current->inode);
       vfs_node_put(current);
       vfs_node_get(root_node);
       current = root_node;
-      /* We will lock it at the start of the while(1) loop or keep it from
-       * previous if not restart */
       vfs_inode_lock_read(current->inode);
       parent_path[0] = '/';
       parent_path[1] = '\0';
-      while (*rest == '/')
-        rest++;
+
+      goto restart_traversal;
     }
 
-    while (1) {
-      split_path(rest, part, &rest);
-      console_write("VFS: traverse '");
-      console_write(part);
-      console_write("' at '");
-      console_write(current->name);
-      console_write("'\n");
-      if (part[0] == '\0') {
-        int orig_len = strlen(path);
-        if (orig_len > 0 && path[orig_len - 1] == '/') {
-          if (current->inode->type != VFS_DIRECTORY) {
-            vfs_inode_unlock_read(current->inode);
-            vfs_node_put(current);
-            kfree(curr_path);
-            return ERR_PTR(-ENOTDIR);
-          }
-        }
-        kfree(curr_path);
-        vfs_inode_unlock_read(current->inode);
-        return current; /* Ref from get or root */
-      }
-
-      if (current->inode->type != VFS_DIRECTORY) {
-        vfs_inode_unlock_read(current->inode);
-        vfs_node_put(current);
-        kfree(curr_path);
-        return ERR_PTR(-ENOTDIR);
-      }
-
-      if (strcmp(part, ".") == 0)
-        continue;
-
-      const struct cred *cred = get_current_cred();
-      if (cred && !vfs_get_node_perm(current, cred, 1)) {
-        vfs_inode_unlock_read(current->inode);
-        vfs_node_put(current);
-        kfree(curr_path);
-        return ERR_PTR(-EACCES);
-      }
-
-      if (strcmp(part, "..") == 0) {
-        struct vfs_node *next = 0;
-        if (current == root_node) {
-          pop_path_part(parent_path);
-          continue;
-        }
-        /* MOUNT CROSSING */
-        for (int i = 0; i < MAX_MOUNTS; i++) {
-          if (mounts[i].used && current == mounts[i].root_node) {
-            struct vfs_node *mnt_point = mounts[i].mount_point;
-            if (mnt_point && mnt_point->parent)
-              next = vfs_node_get(mnt_point->parent);
-            pop_path_part(parent_path);
-            goto move_next;
-          }
-        }
-        if (current->parent)
-          next = vfs_node_get(current->parent);
-        pop_path_part(parent_path);
-
-      move_next:
-        if (!next)
-          next = vfs_node_get(root_node);
-        vfs_inode_lock_read(next->inode);
-        vfs_inode_unlock_read(current->inode);
-        vfs_node_put(current);
-        current = next;
-        continue;
-      }
-
-      struct vfs_node *child = find_child(current, part);
-      if (!child) {
-        vfs_inode_unlock_read(current->inode);
-        vfs_node_put(current);
-        kfree(curr_path);
-        return ERR_PTR(-ENOENT);
-      }
-
-      vfs_node_get(child);
-      /* DOWNWARD MOUNT CROSSING */
-      for (int i = 0; i < MAX_MOUNTS; i++) {
-        if (mounts[i].used && child == mounts[i].mount_point) {
-          struct vfs_node *root = vfs_node_get(mounts[i].root_node);
-          vfs_node_put(child);
-          child = root;
-          break;
-        }
-      }
-
-      /* Hand-over-hand lock */
-      vfs_inode_lock_read(child->inode);
-      vfs_inode_unlock_read(current->inode);
-      vfs_node_put(current);
-      current = child;
-
-      int is_final = (!rest || rest[0] == '\0');
-      if (current->inode->type == VFS_SYMLINK && (follow_final || !is_final)) {
-        symlink_count++;
-        char *next_path = kmalloc(VFS_MAX_PATH);
-        if (!next_path) {
-          vfs_inode_unlock_read(current->inode);
-          vfs_node_put(current);
-          kfree(curr_path);
-          return ERR_PTR(-ENOMEM);
-        }
-
-        const char *target = (const char *)current->inode->data;
-        if (target[0] == '/') {
-          /* Absolute: restart from root */
-          compose_symlink_path("", target, rest, next_path, VFS_MAX_PATH);
-          kfree(curr_path);
-          curr_path = next_path;
-          /* restart_lookup will handle root switch */
-        } else {
-          /* Relative: resolve target relative to parent_path */
-          compose_symlink_path(parent_path, target, rest, next_path,
-                               VFS_MAX_PATH);
-          kfree(curr_path);
-          curr_path = next_path;
-          /* We need to restart from root because next_path is now absolute (via
-           * parent_path) */
-        }
-        goto restart_lookup;
-      }
-      if (!is_final)
-        append_path_part(parent_path, sizeof(parent_path), part);
-    }
-  restart_lookup:;
+    if (!is_final)
+      append_path_part(parent_path, VFS_MAX_PATH, part);
   }
 
+  /* Unreachable */
   vfs_inode_unlock_read(current->inode);
   vfs_node_put(current);
   kfree(curr_path);
-  return ERR_PTR(-ELOOP);
+  kfree(parent_path);
+  return ERR_PTR(-EIO);
 }
 
 struct vfs_node *vfs_find_node(const char *path) {
@@ -1047,6 +1082,8 @@ static char tty_getc_blocking(void) {
   while (c == 0) {
     c = ps2_kbd_getc();
     if (c == 0)
+      c = serial_getc();
+    if (c == 0)
       scheduler_yield();
   }
   return c;
@@ -1074,6 +1111,8 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
       char c = 0;
       if (flags & B1NIX_O_NONBLOCK) {
         c = ps2_kbd_getc();
+        if (c == 0)
+          c = serial_getc();
         if (c == 0) {
           if (tty_line_len > 0)
             break;
@@ -1158,8 +1197,6 @@ static void tty_init_node(void) {
 
 /* Forward declarations for internal VFS metadata operations (thread-unsafe
  * variants) */
-static int vfs_create_internal(const char *path, const char *data);
-static int vfs_mkdir_internal(const char *path);
 static int vfs_rename_internal(const char *old_path, const char *new_path);
 
 static void vfs_init_stdio(void) {
@@ -1197,7 +1234,7 @@ void vfs_init(void) {
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
-  vfs_create("/tmp/hello", "tmpfs says hello\n");
+  vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
   vfs_init_stdio();
@@ -1228,17 +1265,21 @@ int vfs_open(const char *path) { return vfs_open_flags(path, B1NIX_O_RDONLY); }
 
 int vfs_open_flags(const char *path, int flags) {
   int res = 0;
-  char resolved[VFS_MAX_PATH];
+  char *resolved = kmalloc(VFS_MAX_PATH);
+  if (!resolved)
+    return -ENOMEM;
   vfs_resolve_path(path, resolved);
-  struct vfs_node *node = vfs_find_node(resolved);
+
+  struct vfs_node *node = vfs_find_node_internal(resolved, 1, 0);
   if (IS_ERR(node)) {
     if (PTR_ERR(node) == -ENOENT && (flags & B1NIX_O_CREAT)) {
-      int err = vfs_create_internal(resolved, "");
+      /* Use internal version to avoid redundant resolution/logging */
+      int err = vfs_create_at_internal(resolved, 0666);
       if (err != 0) {
         res = err;
         goto out;
       }
-      node = vfs_find_node(resolved);
+      node = vfs_find_node_internal(resolved, 1, 0);
       if (IS_ERR(node)) {
         res = (int)PTR_ERR(node);
         goto out;
@@ -1246,26 +1287,20 @@ int vfs_open_flags(const char *path, int flags) {
     } else {
       res = (int)PTR_ERR(node);
       klog_warn("vfs: open failed");
-      console_write("VFS: open failed for '");
-      console_write(resolved);
-      console_write("'\n");
-      goto out;
-    }
-  } else {
-    if ((flags & B1NIX_O_CREAT) && (flags & B1NIX_O_EXCL)) {
-      res = -EEXIST;
       goto out;
     }
   }
 
   if ((flags & B1NIX_O_DIRECTORY) && node->inode->type != VFS_DIRECTORY) {
     res = -ENOTDIR;
+    vfs_node_put(node);
     goto out;
   }
   /* POSIX: writing to a directory descriptor is not permitted */
   if (node->inode->type == VFS_DIRECTORY &&
       (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))) {
     res = -EISDIR;
+    vfs_node_put(node);
     goto out;
   }
 
@@ -1277,6 +1312,7 @@ int vfs_open_flags(const char *path, int flags) {
     access_mask |= 4;
   if (cred && !vfs_get_node_perm(node, cred, access_mask)) {
     res = -EACCES;
+    vfs_node_put(node);
     goto out;
   }
 
@@ -1285,6 +1321,7 @@ int vfs_open_flags(const char *path, int flags) {
     const struct cred *tc = get_current_cred();
     if (tc && !vfs_get_node_perm(node, tc, 2)) {
       res = -EACCES;
+      vfs_node_put(node);
       goto out;
     }
     vfs_inode_lock(node->inode);
@@ -1335,6 +1372,8 @@ int vfs_open_flags(const char *path, int flags) {
   res = fd;
 
 out:
+  if (resolved)
+    kfree(resolved);
   if (res < 0) {
     if (node && !IS_ERR(node))
       vfs_node_put(node);
@@ -1491,15 +1530,23 @@ void vfs_close(int fd) {
   vfs_release_handle_lock();
 }
 
-static int vfs_create_internal(const char *path, const char *data) {
+static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   int res = 0;
-  char r_path[VFS_MAX_PATH];
-  vfs_resolve_path(path, r_path);
-  char p_path[VFS_MAX_PATH], name[64];
-  split_parent_path(r_path, p_path, name);
-  struct vfs_node *parent = vfs_find_node(p_path);
-  if (IS_ERR(parent))
+  char *p_path = kmalloc(VFS_MAX_PATH);
+  char name[64];
+  if (!p_path)
+    return -ENOMEM;
+  if (split_parent_path(resolved_path, p_path, name) < 0) {
+    kfree(p_path);
+    return -EINVAL;
+  }
+
+  struct vfs_node *parent = vfs_find_node_internal(p_path, 1, 0);
+  if (IS_ERR(parent)) {
+    kfree(p_path);
     return (int)PTR_ERR(parent);
+  }
+  kfree(p_path);
 
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
@@ -1531,27 +1578,18 @@ static int vfs_create_internal(const char *path, const char *data) {
   node->parent = parent;
 
   u16 umask = scheduler_get_current_umask();
-  node->inode->mode = 0666 & ~umask;
+  node->inode->mode = mode & ~umask;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
 
-  node->inode->size = data ? strlen(data) : 0;
-  if (node->inode->size > 0) {
-    node->inode->data = kmalloc(node->inode->size + 1);
-    if (!node->inode->data) {
-      res = -ENOMEM;
-      goto out_node_put;
-    }
-    memcpy(node->inode->data, data, node->inode->size + 1);
-    node->inode->flags |= VFS_NODE_OWNS_DATA;
-  }
   node->next_sibling = parent->first_child;
   parent->first_child = node;
 
   if (parent->inode->create_cb) {
-    int err = parent->inode->create_cb(parent, name, r_path, node->inode->mode);
+    int err = parent->inode->create_cb(parent, name, resolved_path,
+                                       node->inode->mode);
     if (err < 0) {
       parent->first_child = node->next_sibling;
       res = err;
@@ -1578,8 +1616,13 @@ out_unlock:
   return res;
 }
 
-int vfs_create(const char *path, const char *data) {
-  int res = vfs_create_internal(path, data);
+int vfs_create(const char *path, u32 mode) {
+  char *resolved = kmalloc(VFS_MAX_PATH);
+  if (!resolved)
+    return -ENOMEM;
+  vfs_resolve_path(path, resolved);
+  int res = vfs_create_at_internal(resolved, mode);
+  kfree(resolved);
   return res;
 }
 
@@ -1590,15 +1633,23 @@ struct vfs_node *vfs_find_node_by_fd(int fd) {
   return h->node;
 }
 
-static int vfs_mkdir_internal(const char *path) {
+static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   int res = 0;
-  char r_path[VFS_MAX_PATH];
-  vfs_resolve_path(path, r_path);
-  char p_path[VFS_MAX_PATH], name[64];
-  split_parent_path(r_path, p_path, name);
-  struct vfs_node *parent = vfs_find_node(p_path);
-  if (IS_ERR(parent))
+  char *p_path = kmalloc(VFS_MAX_PATH);
+  char name[64];
+  if (!p_path)
+    return -ENOMEM;
+  if (split_parent_path(resolved_path, p_path, name) < 0) {
+    kfree(p_path);
+    return -EINVAL;
+  }
+
+  struct vfs_node *parent = vfs_find_node_internal(p_path, 1, 0);
+  if (IS_ERR(parent)) {
+    kfree(p_path);
     return (int)PTR_ERR(parent);
+  }
+  kfree(p_path);
 
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
@@ -1630,7 +1681,7 @@ static int vfs_mkdir_internal(const char *path) {
   node->parent = parent;
 
   u16 umask = scheduler_get_current_umask();
-  node->inode->mode = 0777 & ~umask;
+  node->inode->mode = mode & ~umask;
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
   node->inode->atime = node->inode->mtime = node->inode->ctime =
@@ -1667,7 +1718,15 @@ out_unlock:
   return res;
 }
 
-int vfs_mkdir(const char *path) { return vfs_mkdir_internal(path); }
+int vfs_mkdir(const char *path, u32 mode) {
+  char *resolved = kmalloc(VFS_MAX_PATH);
+  if (!resolved)
+    return -ENOMEM;
+  vfs_resolve_path(path, resolved);
+  int res = vfs_mkdir_at_internal(resolved, mode);
+  kfree(resolved);
+  return res;
+}
 
 isize vfs_list(const char *dir_path, const char **names, usize max_names) {
   struct vfs_node *dir = vfs_find_node(dir_path);
@@ -1913,8 +1972,72 @@ out_unlock:
   return res;
 }
 
+static int vfs_unlink_at_internal(const char *resolved_path) {
+  int res = 0;
+  char *p_path = kmalloc(VFS_MAX_PATH);
+  char name[64];
+  if (!p_path)
+    return -ENOMEM;
+  if (split_parent_path(resolved_path, p_path, name) < 0) {
+    kfree(p_path);
+    return -EINVAL;
+  }
+
+  struct vfs_node *parent = vfs_find_node_internal(p_path, 1, 0);
+  if (IS_ERR(parent)) {
+    kfree(p_path);
+    return (int)PTR_ERR(parent);
+  }
+  kfree(p_path);
+
+  vfs_inode_lock(parent->inode);
+  struct vfs_node *node = find_child(parent, name);
+  if (!node) {
+    res = -ENOENT;
+    goto out_unlock;
+  }
+  if (node->inode->type == VFS_DIRECTORY) {
+    res = -EISDIR;
+    goto out_unlock;
+  }
+
+  if (parent->inode->unlink_cb) {
+    int err = parent->inode->unlink_cb(parent, name);
+    if (err < 0) {
+      res = err;
+      goto out_unlock;
+    }
+  }
+
+  /* Remove from parent's children list */
+  struct vfs_node **prev = &parent->first_child;
+  while (*prev) {
+    if (*prev == node) {
+      *prev = node->next_sibling;
+      break;
+    }
+    prev = &(*prev)->next_sibling;
+  }
+
+  node->deleted = 1;
+  node->inode->nlink--;
+  dcache_invalidate(parent, name);
+
+  vfs_node_put(node);
+
+out_unlock:
+  vfs_inode_unlock(parent->inode);
+  vfs_node_put(parent);
+  return res;
+}
+
 int vfs_unlink(const char *path) {
-  int res = vfs_remove_node(path, 0);
+  char *resolved = kmalloc(VFS_MAX_PATH);
+  if (!resolved)
+    return -ENOMEM;
+  vfs_resolve_path(path, resolved);
+  int res = vfs_unlink_at_internal(resolved);
+  kfree(resolved);
   return res;
 }
 

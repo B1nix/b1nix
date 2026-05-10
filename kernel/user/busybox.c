@@ -21,16 +21,16 @@ static int reboot_main(int argc, const char **argv) {
   return 0;
 }
 
-static usize bb_read_file(const char *path, char *buf, usize max) {
+static isize bb_read_file(const char *path, char *buf, usize max) {
   u64 fd = bb_open(path);
   if ((isize)fd < 0)
-    return 0;
+    return -1;
   u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0, 0, 0);
   syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
   if ((isize)n < 0)
-    return 0;
+    return -1;
   buf[n] = '\0';
-  return (usize)n;
+  return (isize)n;
 }
 
 static void bb_resolve(const char *rel, char *abs, usize abs_size) {
@@ -581,14 +581,21 @@ static int cat_main(int argc, const char **argv) {
 
   int failures = 0;
   for (int i = 1; i < argc; i++) {
-    char buf[4096];
-    usize n = bb_read_file(argv[i], buf, sizeof(buf));
-    if (n == 0 && argv[i][0] != '\0') {
+    u64 fd = bb_open(argv[i]);
+    if ((isize)fd < 0) {
       printf("cat: %s: No such file or directory\n", argv[i]);
       failures++;
       continue;
     }
-    printf("%s", buf);
+
+    char buf[4096];
+    while (1) {
+      isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, sizeof(buf), 0, 0, 0);
+      if (n <= 0)
+        break;
+      write(1, buf, (usize)n);
+    }
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
   }
   return failures ? 1 : 0;
 }
@@ -609,15 +616,15 @@ static int head_main(int argc, const char **argv) {
     file = argv[file_idx];
 
   char buf[4096];
-  usize total = 0;
+  isize total = 0;
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
-    if (total == 0) {
+    if (total < 0) {
       printf("head: %s: No such file\n", file);
       return 1;
     }
   } else {
-    while (total < sizeof(buf) - 1) {
+    while ((usize)total < sizeof(buf) - 1) {
       char c;
       if (read(0, &c, 1) <= 0)
         break;
@@ -627,7 +634,7 @@ static int head_main(int argc, const char **argv) {
   }
 
   int lines = 0;
-  for (usize i = 0; i < total && lines < nlines; i++) {
+  for (usize i = 0; i < (usize)total && lines < nlines; i++) {
     putchar(buf[i]);
     if (buf[i] == '\n')
       lines++;
@@ -651,15 +658,15 @@ static int tail_main(int argc, const char **argv) {
     file = argv[file_idx];
 
   char buf[4096];
-  usize total = 0;
+  isize total = 0;
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
-    if (total == 0) {
+    if (total < 0) {
       printf("tail: %s: No such file\n", file);
       return 1;
     }
   } else {
-    while (total < sizeof(buf) - 1) {
+    while ((usize)total < sizeof(buf) - 1) {
       char c;
       if (read(0, &c, 1) <= 0)
         break;
@@ -671,13 +678,13 @@ static int tail_main(int argc, const char **argv) {
   int line_starts[512];
   int lc = 0;
   line_starts[lc++] = 0;
-  for (usize i = 0; i < total; i++) {
-    if (buf[i] == '\n' && i + 1 < total && lc < 512)
+  for (usize i = 0; i < (usize)total; i++) {
+    if (buf[i] == '\n' && i + 1 < (usize)total && lc < 512)
       line_starts[lc++] = (int)(i + 1);
   }
 
   int start_idx = (lc > nlines) ? line_starts[lc - nlines - 1] : 0;
-  for (usize i = (usize)start_idx; i < total; i++)
+  for (usize i = (usize)start_idx; i < (usize)total; i++)
     putchar(buf[i]);
   return 0;
 }
@@ -759,10 +766,10 @@ static int grep_main(int argc, const char **argv) {
   const char *file = (argc - start_idx > 1) ? argv[start_idx + 1] : 0;
 
   char buf[4096];
-  usize total = 0;
+  isize total = 0;
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
-    if (total == 0)
+    if (total < 0)
       return 1;
   } else { /* read stdin... */
   }
@@ -771,7 +778,7 @@ static int grep_main(int argc, const char **argv) {
   usize line_start = 0;
   int found = 0;
   int line_num = 1;
-  for (usize i = 0; i <= total; i++) {
+  for (usize i = 0; i <= (usize)total; i++) {
     if (buf[i] == '\n' || buf[i] == '\0') {
       for (usize j = line_start; j + plen <= i; j++) {
         if (memcmp(buf + j, pattern, plen) == 0) {
@@ -813,14 +820,14 @@ static int wc_main(int argc, const char **argv) {
 
   const char *file = (argc > start_idx) ? argv[start_idx] : 0;
   char buf[4096];
-  usize total = file ? bb_read_file(file, buf, sizeof(buf)) : 0;
-  if (file && total == 0)
+  isize total = file ? bb_read_file(file, buf, sizeof(buf)) : 0;
+  if (file && total < 0)
     return 1;
 
   int lines = 0;
   int words = 0;
   int in_word = 0;
-  for (usize i = 0; i < total; i++) {
+  for (usize i = 0; i < (usize)total; i++) {
     if (buf[i] == '\n')
       lines++;
     if (buf[i] == ' ' || buf[i] == '\n' || buf[i] == '\t')

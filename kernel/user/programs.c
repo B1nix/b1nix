@@ -1036,7 +1036,15 @@ static int m22_smoke_main(int argc, const char **argv) {
   (void)argv;
 
   uwrite("M22-SMOKE: start\n");
-  syscall_dispatch(SYS_CREATE, (u64)(usize) "/tmp/m22.txt", (u64)(usize) "beta\nalpha\nalpha\n", 0, 0, 0, 0);
+  u64 m22_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/m22.txt",
+                                B1NIX_O_CREAT | B1NIX_O_WRONLY | B1NIX_O_TRUNC,
+                                0666, 0, 0, 0);
+  if ((isize)m22_fd >= 0) {
+    const char *m22_data = "beta\nalpha\nalpha\n";
+    syscall_dispatch(SYS_WRITE, m22_fd, (u64)(usize)m22_data, strlen(m22_data),
+                     0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, m22_fd, 0, 0, 0, 0, 0);
+  }
 
   int failures = 0;
 

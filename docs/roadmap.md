@@ -53,10 +53,10 @@ and broader utility flag compatibility.
 - [x] `done` Add initial frame-backed bump kernel heap.
 - [x] `done` Add page fault diagnostics.
 - [x] `done` Replace bump frame allocator with reusable bitmap/free-list allocator.
-- [x] `initial` Add unmap/remap helpers.
-- [x] `initial` Add higher-half kernel mapping and direct-map window.
-- [x] `partial` Add lazy page allocation hooks in the x86 page-fault path.
-- [x] `partial` Add swap slot bookkeeping and swap in/out helpers.
+- [x] `done` Add unmap/remap helpers.
+- [x] `done` Add higher-half kernel mapping and direct-map window.
+- [x] `done` Add lazy page allocation hooks in the x86 page-fault path.
+- [x] `done` Add swap slot bookkeeping and swap in/out helpers.
 - [x] `partial` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
 - [x] `initial` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
 
@@ -345,18 +345,18 @@ unclean shutdown.
 
 ## M22: Core Terminal Utilities
 
-- [x] `initial` Add `pwd`, `ls`, `cp`, `mv`, `rm`, `mkdir`, `rmdir`, `chmod`, `chown`, and `ln`.
-- [x] `initial` Add `ps`, `kill`, `sleep`, `date`, `uname`, `id`, and `whoami`.
-- [x] `initial` Add text tools: `cat`, `head`, `tail`, `grep`, `find`, `wc`, `sort`, and `uniq`.
-- [x] `initial` Add filesystem tools: `mount`, `df`, `sync`, and `hexdump`.
+- [x] `done` Add pwd, ls, cp, mv, rm, mkdir, rmdir, chmod, chown, and ln.
+- [x] `done` Add ps, kill, sleep, date, uname, id, and whoami.
+- [x] `done` Add text tools: cat, head, tail, grep, find, wc, sort, and uniq.
+- [x] `done` Add filesystem tools: mount, df, sync, and hexdump.
 - [x] `done` Keep BusyBox-style multi-call dispatch for small binaries.
-- [x] `initial` Add `clear`, `mem`, `dmesg`, `ifconfig`, `ping`, `nc`, and `wget` utilities.
-- [x] `done` Implement `ln` through VFS hard-link aliases and `ln -s` symlinks.
-- [x] `done` Add `readlink` utility and init-path symlink smoke coverage.
-- [x] `done` Implement `mount` command mounting path and active mount listing.
-- [x] `done` Add init-path utility smoke tests through `/bin/m22-smoke` and QEMU serial checks.
-- [x] `initial` Add interactive shell-driven utility smoke tests that execute through `/bin/sh`.
-- [x] `partial` Add option-compatible behavior for common utility flags (`ls -la`, `cp -r`, `rm -rf`, `mkdir -p`, `grep -q`, `grep -n`, `head -n NUM`, `tail -n NUM`).
+- [x] `done` Add clear, mem, dmesg, ifconfig, ping, nc, and wget utilities.
+- [x] `done` Implement ln through VFS hard-link aliases and ln -s symlinks.
+- [x] `done` Add readlink utility and init-path symlink smoke coverage.
+- [x] `done` Implement mount command mounting path and active mount listing.
+- [x] `done` Add init-path utility smoke tests through /bin/m22-smoke and QEMU serial checks.
+- [x] `done` Add interactive shell-driven utility smoke tests that execute through /bin/sh.
+- [x] `initial` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q, grep -n, head -n NUM, tail -n NUM).
 - [x] `done` Restore all utility dispatch targets used by M22 smoke after the BusyBox table cleanup.
 
 M22 is useful but not fully closed. The init-path smoke proves many utilities

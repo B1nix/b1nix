@@ -635,8 +635,8 @@ void user_register_program(const char *path, user_program_entry entry) {
 
   /* Ensure the program exists in the VFS so vfs_find_node/vfs_get_node_perm
    * works */
-  if (vfs_create(path, "") == 0) {
-    vfs_chmod(path, 0755);
+  if (vfs_create(path, 0755) == 0) {
+    /* File created with 0755 mode */
   }
 }
 

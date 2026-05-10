@@ -396,8 +396,8 @@ static struct vfs_fs fat32_vfs = {
 };
 
 int fat32_mount(struct block_device *dev, const char *mount_point) {
-    (void)dev;
-    return vfs_mount(0, mount_point, "fat32", 0);
+    if (!dev) return -ENODEV;
+    return vfs_mount(dev->name, mount_point, "fat32", 0);
 }
 
 void fat32_init(void) {
