@@ -11,6 +11,18 @@
 #define VMM_USER (1ULL << 2)
 #define VMM_NO_EXECUTE (1ULL << 63)
 
+/* mmap protections */
+#define PROT_NONE  0x0
+#define PROT_READ  0x1
+#define PROT_WRITE 0x2
+#define PROT_EXEC  0x4
+
+/* mmap flags */
+#define MAP_SHARED    0x01
+#define MAP_PRIVATE   0x02
+#define MAP_ANONYMOUS 0x20
+#define MAP_FAILED    ((void *)-1)
+
 // Page fault error code bits
 #define PF_PRESENT  (1ULL << 0)
 #define PF_WRITE    (1ULL << 1)
@@ -50,6 +62,11 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags);
 u64 vmm_direct_map_base(void);
+
+// M2 Aliases / Helpers
+void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags);
+void paging_unmap_page(u64 virtual_address);
+void paging_mprotect_page(u64 virtual_address, u64 flags);
 
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);

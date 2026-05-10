@@ -104,6 +104,7 @@ int scheduler_set_cwd(const char *path);
 u64 scheduler_get_uptime_ticks(void);
 u64 scheduler_brk_get(void);
 usize scheduler_brk_set(u64 new_brk);
+u64 scheduler_mmap_bump_alloc(usize length);
 int scheduler_set_priority(usize pid, int priority);
 int scheduler_get_priority(usize pid);
 usize scheduler_setsid(void);

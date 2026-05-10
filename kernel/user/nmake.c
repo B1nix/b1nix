@@ -29,9 +29,9 @@ static int rule_count = 0;
 
 static int file_exists(const char *path)
 {
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
 	if (fd != (u64)-1) {
-		syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+		syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 		return 1;
 	}
 	return 0;
@@ -136,7 +136,7 @@ static void run_command(const char *cmd)
 	if (argc == 0) return;
 	
 	/* Try to find program */
-	u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], argc, (u64)(usize)args, 0);
+	u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], argc, (u64)(usize)args, 0, 0, 0);
 	if (pid == (u64)-1) {
 		char bin_path[128];
 		bin_path[0] = '/';
@@ -145,12 +145,12 @@ static void run_command(const char *cmd)
 		bin_path[3] = 'n';
 		bin_path[4] = '/';
 		strcpy(bin_path + 5, args[0]);
-		pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, argc, (u64)(usize)args, 0);
+		pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, argc, (u64)(usize)args, 0, 0, 0);
 	}
 	
 	if (pid != (u64)-1) {
 		int status;
-		syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
+		syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
 	} else {
 		printf("nmake: %s: command not found\n", args[0]);
 	}
@@ -229,11 +229,11 @@ static int build_target(const char *target)
 static int load_default_makefile(void)
 {
 	/* Try to read Makefile, makefile, or default content */
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"Makefile", 0, 0, 0);
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"Makefile", 0, 0, 0, 0, 0);
 	char path[64] = "Makefile";
 	
 	if (fd == (u64)-1) {
-		fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"makefile", 0, 0, 0);
+		fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"makefile", 0, 0, 0, 0, 0);
 		strcpy(path, "makefile");
 	}
 	
@@ -247,7 +247,7 @@ static int load_default_makefile(void)
 	char buf[256];
 	
 	while (1) {
-		u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0);
+		u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0, 0, 0);
 		if (n == 0 || n == (u64)-1) break;
 		buf[n] = '\0';
 		int copy_len = strlen(buf);
@@ -257,7 +257,7 @@ static int load_default_makefile(void)
 		}
 	}
 	
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 	content[pos] = '\0';
 	
 	return parse_makefile(content);
@@ -274,7 +274,7 @@ int nmake_main(int argc, const char **argv)
 		if (strcmp(argv[i], "-f") == 0 && i + 1 < argc) {
 			i++;
 			/* Manual makefile path — read it */
-			u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)argv[i], 0, 0, 0);
+			u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)argv[i], 0, 0, 0, 0, 0);
 			if (fd == (u64)-1) {
 				printf("nmake: %s: No such file\n", argv[i]);
 				return 1;
@@ -283,7 +283,7 @@ int nmake_main(int argc, const char **argv)
 			int pos = 0;
 			char buf[256];
 			while (1) {
-				u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0);
+				u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0, 0, 0);
 				if (n == 0 || n == (u64)-1) break;
 				buf[n] = '\0';
 				int copy_len = strlen(buf);
@@ -292,7 +292,7 @@ int nmake_main(int argc, const char **argv)
 					pos += copy_len;
 				}
 			}
-			syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+			syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 			content[pos] = '\0';
 			parse_makefile(content);
 		} else if (argv[i][0] != '-') {

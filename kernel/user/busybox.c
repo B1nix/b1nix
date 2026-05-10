@@ -11,13 +11,13 @@
 #include <unistd.h>
 
 static u64 bb_open(const char *path) {
-  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
   return fd;
 }
 
 static int reboot_main(int argc, const char **argv) {
   (void)argc; (void)argv;
-  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0);
+  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -25,8 +25,8 @@ static usize bb_read_file(const char *path, char *buf, usize max) {
   u64 fd = bb_open(path);
   if ((isize)fd < 0)
     return 0;
-  u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0);
-  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+  u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
   if ((isize)n < 0)
     return 0;
   buf[n] = '\0';
@@ -98,8 +98,7 @@ static int ls_main(int argc, const char **argv) {
   char path[256];
   bb_resolve(target, path, sizeof(path));
   struct dirent entries[64];
-  int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path,
-                                    (u64)(usize)entries, 64, 0);
+  int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 64, 0, 0, 0);
   if (count < 0) {
     printf("ls: %s: No such file or directory\n", target);
     return 1;
@@ -124,34 +123,32 @@ static int bb_copy_file(const char *src, const char *dst) {
   u64 fds = bb_open(src);
   if ((isize)fds < 0)
     return -1;
-  syscall_dispatch(SYS_CREATE, (u64)(usize)dst, (u64)(usize) "", 0, 0);
-  u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst,
-                             (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0);
+  syscall_dispatch(SYS_CREATE, (u64)(usize)dst, (u64)(usize) "", 0, 0, 0, 0);
+  u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0, 0, 0);
   if ((isize)fdd < 0) {
-    syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0, 0, 0);
     return -1;
   }
   char buf[4096];
   while (1) {
-    u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0);
+    u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0, 0, 0);
     if (n == 0 || (isize)n < 0)
       break;
-    syscall_dispatch(SYS_WRITE, (u64)fdd, (u64)(usize)buf, (u64)n, 0);
+    syscall_dispatch(SYS_WRITE, (u64)fdd, (u64)(usize)buf, (u64)n, 0, 0, 0);
   }
-  syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0);
-  syscall_dispatch(SYS_CLOSE, fdd, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, fdd, 0, 0, 0, 0, 0);
   return 0;
 }
 
 static void cp_recursive(const char *src, const char *dst) {
   struct b1nix_stat st;
-  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)src, (u64)(usize)&st, 0, 0) != 0)
+  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)src, (u64)(usize)&st, 0, 0, 0, 0) != 0)
     return;
   if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
-    syscall_dispatch(SYS_MKDIR, (u64)(usize)dst, 0755, 0, 0);
+    syscall_dispatch(SYS_MKDIR, (u64)(usize)dst, 0755, 0, 0, 0, 0);
     struct dirent entries[32];
-    int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)src,
-                                      (u64)(usize)entries, 32, 0);
+    int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)src, (u64)(usize)entries, 32, 0, 0, 0);
     for (int i = 0; i < count; i++) {
       if (strcmp(entries[i].name, ".") == 0 ||
           strcmp(entries[i].name, "..") == 0)
@@ -203,7 +200,7 @@ static int mv_main(int argc, const char **argv) {
   char src[256], dst[256];
   bb_resolve(argv[1], src, sizeof(src));
   bb_resolve(argv[2], dst, sizeof(dst));
-  if (syscall_dispatch(SYS_RENAME, (u64)(usize)src, (u64)(usize)dst, 0, 0) !=
+  if (syscall_dispatch(SYS_RENAME, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0) !=
       0) {
     printf("mv: cannot move %s to %s\n", argv[1], argv[2]);
     return 1;
@@ -214,12 +211,11 @@ static int mv_main(int argc, const char **argv) {
 /* ── rm — remove file ── */
 static void rm_recursive(const char *path) {
   struct b1nix_stat st;
-  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) != 0)
+  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) != 0)
     return;
   if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
     struct dirent entries[32];
-    int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path,
-                                      (u64)(usize)entries, 32, 0);
+    int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 32, 0, 0, 0);
     for (int i = 0; i < count; i++) {
       if (strcmp(entries[i].name, ".") == 0 ||
           strcmp(entries[i].name, "..") == 0)
@@ -228,9 +224,9 @@ static void rm_recursive(const char *path) {
       snprintf(sub, sizeof(sub), "%s/%s", path, entries[i].name);
       rm_recursive(sub);
     }
-    syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0);
+    syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0);
   } else
-    syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0);
+    syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0);
 }
 
 static int rm_main(int argc, const char **argv) {
@@ -262,7 +258,7 @@ static int rm_main(int argc, const char **argv) {
     bb_resolve(argv[i], path, sizeof(path));
     if (recursive)
       rm_recursive(path);
-    else if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0) != 0 &&
+    else if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0) != 0 &&
              !force) {
       printf("rm: cannot remove %s\n", argv[i]);
     }
@@ -282,15 +278,14 @@ static int mkdir_p(const char *path) {
       *p = '\0';
       if (tmp[0] != '\0') {
         struct b1nix_stat st;
-        if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0,
-                             0) != 0)
-          syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+        if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0, 0, 0, 0) != 0)
+          syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
       }
       *p = '/';
     }
     p++;
   }
-  return (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0);
+  return (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
 }
 
 static int mkdir_main(int argc, const char **argv) {
@@ -317,7 +312,7 @@ static int mkdir_main(int argc, const char **argv) {
     bb_resolve(argv[i], path, sizeof(path));
     if (parents)
       mkdir_p(path);
-    else if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0) != 0) {
+    else if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0, 0, 0) != 0) {
       printf("mkdir: cannot create %s\n", argv[i]);
     }
   }
@@ -334,7 +329,7 @@ static int rmdir_main(int argc, const char **argv) {
   for (int i = 1; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0) != 0) {
+    if (syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0) != 0) {
       printf("rmdir: failed to remove %s\n", argv[i]);
       failures++;
     }
@@ -362,7 +357,7 @@ static int chmod_main(int argc, const char **argv) {
   for (int i = 2; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_CHMOD, (u64)(usize)path, (u64)mode, 0, 0) != 0) {
+    if (syscall_dispatch(SYS_CHMOD, (u64)(usize)path, (u64)mode, 0, 0, 0, 0) != 0) {
       printf("chmod: cannot access %s\n", argv[i]);
       failures++;
     }
@@ -382,7 +377,7 @@ static int chown_main(int argc, const char **argv) {
   for (int i = 3; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_CHOWN, (u64)(usize)path, (u64)uid, (u64)gid, 0) !=
+    if (syscall_dispatch(SYS_CHOWN, (u64)(usize)path, (u64)uid, (u64)gid, 0, 0, 0) !=
         0) {
       printf("chown: cannot access %s\n", argv[i]);
       failures++;
@@ -408,8 +403,7 @@ static int ln_main(int argc, const char **argv) {
   char dst[256];
   bb_resolve(argv[argi + 1], dst, sizeof(dst));
   if (symbolic) {
-    if (syscall_dispatch(SYS_SYMLINK, (u64)(usize)argv[argi],
-                         (u64)(usize)dst, 0, 0) != 0) {
+    if (syscall_dispatch(SYS_SYMLINK, (u64)(usize)argv[argi], (u64)(usize)dst, 0, 0, 0, 0) != 0) {
       printf("ln: cannot create symbolic link %s\n", argv[argi + 1]);
       return 1;
     }
@@ -418,7 +412,7 @@ static int ln_main(int argc, const char **argv) {
 
   char src[256];
   bb_resolve(argv[argi], src, sizeof(src));
-  if (syscall_dispatch(SYS_LINK, (u64)(usize)src, (u64)(usize)dst, 0, 0) != 0) {
+  if (syscall_dispatch(SYS_LINK, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0) != 0) {
     printf("ln: cannot create link %s\n", argv[argi + 1]);
     return 1;
   }
@@ -434,8 +428,7 @@ static int readlink_main(int argc, const char **argv) {
   char path[256];
   char target[256];
   bb_resolve(argv[1], path, sizeof(path));
-  long n = (long)syscall_dispatch(SYS_READLINK, (u64)(usize)path,
-                                  (u64)(usize)target, sizeof(target) - 1, 0);
+  long n = (long)syscall_dispatch(SYS_READLINK, (u64)(usize)path, (u64)(usize)target, sizeof(target) - 1, 0, 0, 0);
   if (n < 0) {
     printf("readlink: %s: Invalid argument\n", argv[1]);
     return 1;
@@ -455,11 +448,10 @@ static int touch_main(int argc, const char **argv) {
   for (int i = 1; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    syscall_dispatch(SYS_CREATE, (u64)(usize)path, (u64)(usize) "", 0, 0);
-    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path,
-                              (u64)B1NIX_O_WRONLY, 0, 0);
+    syscall_dispatch(SYS_CREATE, (u64)(usize)path, (u64)(usize) "", 0, 0, 0, 0);
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, (u64)B1NIX_O_WRONLY, 0, 0, 0, 0);
     if ((isize)fd >= 0) {
-      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
     } else {
       printf("touch: cannot touch %s\n", argv[i]);
       failures++;
@@ -503,7 +495,7 @@ static int dirname_main(int argc, const char **argv) {
 static int ps_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
-  syscall_dispatch(SYS_PS, 0, 0, 0, 0);
+  syscall_dispatch(SYS_PS, 0, 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -515,7 +507,7 @@ static int kill_main(int argc, const char **argv) {
 
   int pid = atoi(argv[1]);
   int sig = argc > 2 ? atoi(argv[2]) : 15;
-  if (syscall_dispatch(SYS_KILL, (u64)pid, (u64)sig, 0, 0) != 0) {
+  if (syscall_dispatch(SYS_KILL, (u64)pid, (u64)sig, 0, 0, 0, 0) != 0) {
     printf("kill: failed to send signal %d to %d\n", sig, pid);
     return 1;
   }
@@ -694,8 +686,7 @@ static void find_recurse(const char *base, const char *name_pat, int *found) {
   struct dirent entries[32];
   char path[256];
   usize bl = strlen(base);
-  int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)base,
-                                    (u64)(usize)entries, 32, 0);
+  int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)base, (u64)(usize)entries, 32, 0, 0, 0);
   if (count < 0)
     return;
 
@@ -997,7 +988,7 @@ static int test_main(int argc, const char **argv) {
     char path[256];
     bb_resolve(argv[arg_idx + 1], path, sizeof(path));
     struct b1nix_stat st;
-    if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) ==
+    if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) ==
         0) {
       return (st.st_mode & B1NIX_S_IFDIR) ? 1 : 0;
     }
@@ -1009,7 +1000,7 @@ static int test_main(int argc, const char **argv) {
     char path[256];
     bb_resolve(argv[arg_idx + 1], path, sizeof(path));
     struct b1nix_stat st;
-    if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0) ==
+    if (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) ==
         0) {
       return (st.st_mode & B1NIX_S_IFDIR) ? 0 : 1;
     }
@@ -1049,7 +1040,7 @@ static int mount_main(int argc, const char **argv) {
   if (argc < 2) {
     struct b1nix_mount_entry entries[8];
     long count =
-        (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)entries, 8, 0, 0);
+        (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)entries, 8, 0, 0, 0, 0);
     if (count < 0) {
       printf("mount: cannot read mount table\n");
       return 1;
@@ -1078,8 +1069,7 @@ static int mount_main(int argc, const char **argv) {
   if (strcmp(fstype, "btrfs") == 0) {
     rc = btrfs_mount_root(source, tgt);
   } else {
-    rc = (int)syscall_dispatch(SYS_MOUNT, (u64)(usize)source, (u64)(usize)tgt,
-                               (u64)(usize)fstype, 0);
+    rc = (int)syscall_dispatch(SYS_MOUNT, (u64)(usize)source, (u64)(usize)tgt, (u64)(usize)fstype, 0, 0, 0);
   }
   if (rc != 0) {
     printf("mount: cannot mount %s on %s (type %s)\n", source, target, fstype);
@@ -1094,7 +1084,7 @@ static int df_main(int argc, const char **argv) {
   (void)argv;
 
   /* Use memory info as approximation */
-  syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
+  syscall_dispatch(SYS_MEM, 0, 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -1202,7 +1192,7 @@ static int lsblk_main(int argc, const char **argv) {
 
   struct b1nix_mount_entry mounts[16];
   long mount_count =
-      (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 16, 0, 0);
+      (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 16, 0, 0, 0, 0);
   if (mount_count < 0)
     mount_count = 0;
 
@@ -1333,7 +1323,7 @@ static int sleep_main(int argc, const char **argv) {
 static int whoami_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
-  u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0);
+  u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0, 0, 0);
 
   const char *names[] = {"root", "daemon", "bin", "user"};
   if (uid < 4) {
@@ -1348,10 +1338,10 @@ static int whoami_main(int argc, const char **argv) {
 static int id_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
-  u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0);
-  u64 euid = syscall_dispatch(SYS_GETEUID, 0, 0, 0, 0);
-  u64 gid = syscall_dispatch(SYS_GETGID, 0, 0, 0, 0);
-  u64 egid = syscall_dispatch(SYS_GETEGID, 0, 0, 0, 0);
+  u64 uid = syscall_dispatch(SYS_GETUID, 0, 0, 0, 0, 0, 0);
+  u64 euid = syscall_dispatch(SYS_GETEUID, 0, 0, 0, 0, 0, 0);
+  u64 gid = syscall_dispatch(SYS_GETGID, 0, 0, 0, 0, 0, 0);
+  u64 egid = syscall_dispatch(SYS_GETEGID, 0, 0, 0, 0, 0, 0);
 
   printf("uid=%d euid=%d gid=%d egid=%d\n", (int)uid, (int)euid, (int)gid,
          (int)egid);
@@ -1362,7 +1352,7 @@ static int id_main(int argc, const char **argv) {
 static int clear_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
-  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -1386,7 +1376,7 @@ static int ifconfig_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
 
-  syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
+  syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0, 0, 0);
   return net_is_available() ? 0 : 1;
 }
 
@@ -1403,7 +1393,7 @@ static int ping_main(int argc, const char **argv) {
   }
 
   /* Use SYS_NET_PING */
-  syscall_dispatch(SYS_NET_PING, (u64)(usize)argv[1], 0, 0, 0);
+  syscall_dispatch(SYS_NET_PING, (u64)(usize)argv[1], 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -1560,7 +1550,7 @@ static int wget_main(int argc, const char **argv) {
 
   /* Resolve hostname via DNS */
   printf("wget: resolving %s...\n", host);
-  syscall_dispatch(SYS_NET_DNS, (u64)(usize)host, 0, 0, 0);
+  syscall_dispatch(SYS_NET_DNS, (u64)(usize)host, 0, 0, 0, 0, 0);
 
   /* DNS resolution is async via console. For now use QEMU user-mode
      networking default gateway (10.0.2.2) as HTTP proxy */
@@ -1639,7 +1629,7 @@ static int dmesg_main(int argc, const char **argv) {
 
   char buf[2048];
   long n =
-      (long)syscall_dispatch(SYS_DMESG, (u64)(usize)buf, sizeof(buf), 0, 0);
+      (long)syscall_dispatch(SYS_DMESG, (u64)(usize)buf, sizeof(buf), 0, 0, 0, 0);
   if (n < 0) {
     printf("dmesg: error reading kernel log\n");
     return 1;

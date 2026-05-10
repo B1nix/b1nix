@@ -8,12 +8,12 @@
 
 static void t_write(const char *s)
 {
-	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)strlen(s), 0);
+	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)strlen(s), 0, 0, 0);
 }
 
 static void t_write_n(const char *s, int n)
 {
-	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)n, 0);
+	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)n, 0, 0, 0);
 }
 
 void tui_write(const char *s)
@@ -215,12 +215,12 @@ void tui_title_bar(int row, const char *title, int fg, int bg)
 /* Read a single key, return extended key code */
 int tui_get_key(void)
 {
-	int c = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+	int c = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
 	
 	if (c == 0x1B) {
-		int seq1 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+		int seq1 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
 		if (seq1 == '[') {
-			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
 			if (seq2 == 'A') return KEY_UP;
 			if (seq2 == 'B') return KEY_DOWN;
 			if (seq2 == 'C') return KEY_RIGHT;
@@ -228,7 +228,7 @@ int tui_get_key(void)
 			if (seq2 == 'H') return KEY_HOME;
 			if (seq2 == 'F') return KEY_END;
 			if (seq2 == 'M') {
-				int f = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+				int f = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
 				if (f >= 1 && f <= 10) return KEY_F1 + (f - 1);
 				if (f == 11) return KEY_F11;
 				if (f == 12) return KEY_F12;

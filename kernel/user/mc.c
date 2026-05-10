@@ -59,8 +59,7 @@ static int read_directory(struct panel *p)
 	
 	/* Use SYS_READDIR to get directory listing */
 	struct dirent entries[MAX_FILES];
-	usize count = syscall_dispatch(SYS_READDIR, (u64)(usize)p->current_dir, 
-								   (u64)(usize)entries, MAX_FILES, 0);
+	usize count = syscall_dispatch(SYS_READDIR, (u64)(usize)p->current_dir, (u64)(usize)entries, MAX_FILES, 0, 0, 0);
 	
 	if (count == 0 || count == (u64)-1) {
 		/* Fallback: at least show "." */

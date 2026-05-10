@@ -17,6 +17,10 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 
+static inline int is_canonical(u64 addr) {
+  return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+}
+
 int syscall_copyin(void *dst, const void *user_src, usize size) {
   if (size == 0)
     return 0;
@@ -402,7 +406,40 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   }
 }
 
-u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
+static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd, isize offset) {
+  (void)addr; (void)prot; (void)fd; (void)offset;
+  if (!(flags & MAP_ANONYMOUS)) return (u64)-EINVAL;
+  if (length == 0) return (u64)-EINVAL;
+  
+  return scheduler_mmap_bump_alloc(length);
+}
+
+static isize sys_munmap(void *addr, usize length) {
+  u64 start = (u64)(usize)addr;
+  if (!is_canonical(start)) return -EINVAL;
+  
+  u64 end = start + length;
+  for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
+    paging_unmap_page(vaddr);
+  }
+  return 0;
+}
+
+static isize sys_mprotect(void *addr, usize length, int prot) {
+  u64 start = (u64)(usize)addr;
+  if (!is_canonical(start)) return -EINVAL;
+  
+  u64 end = start + length;
+  u64 flags = VMM_USER;
+  if (prot & PROT_WRITE) flags |= VMM_WRITABLE;
+  
+  for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
+    paging_mprotect_page(vaddr, flags);
+  }
+  return 0;
+}
+
+u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
   switch (number) {
   case SYS_WRITE:
     return (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
@@ -591,13 +628,13 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
   }
   case SYS_BRK:
     return (u64)scheduler_brk_set(arg0);
-  case SYS_MMAP: {
-    void *ptr = kmalloc((usize)arg0);
-    return ptr ? (u64)(usize)ptr : (u64)-ENOMEM;
-  }
+  case SYS_MMAP:
+    return sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
+                    (int)arg4, (isize)arg5);
   case SYS_MUNMAP:
-    kfree((void *)(usize)arg0);
-    return 0;
+    return (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
+  case SYS_MPROTECT:
+    return (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));

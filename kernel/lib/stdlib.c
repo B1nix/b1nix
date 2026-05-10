@@ -7,14 +7,14 @@ void abort(void)
 {
 	/* Print message then exit */
 	const char *msg = "abort() called\n";
-	syscall_dispatch(SYS_WRITE, (u64)(usize)msg, strlen(msg), 0, 0);
-	syscall_dispatch(SYS_EXIT, 1, 0, 0, 0);
+	syscall_dispatch(SYS_WRITE, (u64)(usize)msg, strlen(msg), 0, 0, 0, 0);
+	syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
 	while (1);
 }
 
 void exit(int status)
 {
-	syscall_dispatch(SYS_EXIT, (u64)status, 0, 0, 0);
+	syscall_dispatch(SYS_EXIT, (u64)status, 0, 0, 0, 0, 0);
 	while (1);
 }
 

@@ -375,7 +375,7 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
       const char *message = op + strlen(op) + 1;
-      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message), 0);
+      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message), 0, 0, 0);
       *code = 0;
       return 1;
     }
@@ -498,7 +498,7 @@ static void user_process_thread(void *arg) {
     user_program_entry entry = (user_program_entry)(usize)image->entry;
     code = entry(image->argc, image->argv);
   }
-  syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0);
+  syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0, 0, 0);
 
   while (1) {
     scheduler_yield();

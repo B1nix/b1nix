@@ -12,6 +12,10 @@
 static u64 *kernel_pml4;
 static int direct_map_ready;
 
+static inline int is_canonical(u64 addr) {
+	return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+}
+
 static u64 read_cr3(void)
 {
 	u64 value;
@@ -160,7 +164,11 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags)
 	} else {
 		pt = ensure_child_table(pd, pd_index(virtual_address));
 	}
-	if ((flags & VMM_USER) != 0) pd[pd_index(virtual_address)] |= VMM_USER;
+	if ((flags & VMM_USER) != 0) {
+		kernel_pml4[pml4_index(virtual_address)] |= VMM_USER;
+		pdpt[pdpt_index(virtual_address)] |= VMM_USER;
+		pd[pd_index(virtual_address)] |= VMM_USER;
+	}
 	pt[pt_index(virtual_address)] = (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
 	invalidate_page(virtual_address);
 }
@@ -193,7 +201,46 @@ void vmm_unmap_page(u64 virtual_address)
 	}
 
 	u64 *pt = table_from_entry(pde);
+	u64 pte = pt[pt_index(virtual_address)];
+	if (pte & VMM_PRESENT) {
+		u64 frame = pte & PAGE_ENTRY_ADDRESS_MASK;
+		if (frame) pmm_free_frame(frame);
+	}
 	pt[pt_index(virtual_address)] = 0;
+	invalidate_page(virtual_address);
+}
+
+void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
+	vmm_map_page(virtual_address, physical_address, flags);
+}
+
+void paging_unmap_page(u64 virtual_address) {
+	vmm_unmap_page(virtual_address);
+}
+
+void paging_mprotect_page(u64 virtual_address, u64 flags) {
+	if ((virtual_address & (PAGE_SIZE - 1)) != 0) {
+		panic("paging_mprotect_page requires page-aligned address");
+	}
+
+	u64 pml4e = kernel_pml4[pml4_index(virtual_address)];
+	if ((pml4e & VMM_PRESENT) == 0) return;
+
+	u64 *pdpt = table_from_entry(pml4e);
+	u64 pdpte = pdpt[pdpt_index(virtual_address)];
+	if ((pdpte & VMM_PRESENT) == 0) return;
+
+	u64 *pd = table_from_entry(pdpte);
+	u64 pde = pd[pd_index(virtual_address)];
+	if ((pde & VMM_PRESENT) == 0) return;
+
+	if ((pde & HUGE_PAGE_FLAG) != 0) return;
+
+	u64 *pt = table_from_entry(pde);
+	u64 pte = pt[pt_index(virtual_address)];
+	if (!(pte & VMM_PRESENT)) return;
+
+	pt[pt_index(virtual_address)] = (pte & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
 	invalidate_page(virtual_address);
 }
 
@@ -227,6 +274,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code)
 {
 	u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
 	
+	if (!is_canonical(fault_addr)) {
+		panic("Non-canonical address fault!");
+	}
+	
+	// Lazy Allocation for User Heap/Mmap region
+	if (!(error_code & PF_PRESENT) && fault_addr >= 0x40000000 && fault_addr < 0x00007FFFFFFFFFFF) {
+		u64 frame = pmm_alloc_frame();
+		if (!frame) {
+			panic("OOM during lazy page allocation!");
+		}
+		
+		// IMPORTANT: Zero the frame before giving it to user space!
+		void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
+		memset(new_frame_virt, 0, PAGE_SIZE);
+		
+		// Map it: Present, Read/Write, User accessible
+		vmm_map_page(page_aligned, frame, VMM_PRESENT | VMM_WRITABLE | VMM_USER); 
+		return 0; // Successfully resolved!
+	}
+
 	// Get the page table entry
 	u64 pml4e = kernel_pml4[pml4_index(page_aligned)];
 	if ((pml4e & VMM_PRESENT) == 0) return -1;
@@ -251,6 +318,10 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code)
 			return -1;
 		}
 		
+		// Zero the frame
+		void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
+		memset(new_frame_virt, 0, PAGE_SIZE);
+
 		// Build proper flags from saved flags
 		u64 flags = VMM_PRESENT | VMM_WRITABLE;
 		if (pte & VMM_USER) flags |= VMM_USER;

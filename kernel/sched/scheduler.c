@@ -71,6 +71,7 @@ struct task {
 	usize process_group_id;
 	usize session_id;
 	char env[TASK_ENV_MAX][TASK_ENV_VALUE_MAX];
+	u64 mmap_bump;
 
 	/* Signal handling */
 	u64 pending_signals;       /* bitmask of pending signals */
@@ -204,6 +205,7 @@ void scheduler_init(void)
 	boot->process_group_id = boot->id;
 	boot->session_id = boot->id;
 	boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
+	boot->mmap_bump = 0x700000000000ULL;
 	task_init_cred(boot);
 	current_task = boot;
 	scheduler_started = 1;
@@ -296,6 +298,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 		task->process_group_id = current_task->process_group_id;
 		task->session_id = current_task->session_id;
 		memcpy(task->env, current_task->env, sizeof(task->env));
+		task->mmap_bump = current_task->mmap_bump;
 	} else {
 		task->cwd[0] = '/';
 		task->cwd[1] = '\0';
@@ -304,6 +307,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg)
 		task->process_group_id = task->id;
 		task->session_id = task->id;
 		memset(task->env, 0, sizeof(task->env));
+		task->mmap_bump = 0x700000000000ULL;
 	}
 	task->exit_code = 0;
 	task->pending_signals = 0;
@@ -762,6 +766,21 @@ u64 scheduler_brk_set(u64 new_brk)
 		current_task->user_brk = new_brk;
 	}
 	return current_task->user_brk;
+}
+
+u64 scheduler_mmap_bump_alloc(usize length) {
+	if (!current_task) return (u64)-1;
+	
+	// Align length to page size
+	length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+	
+	u64 result = current_task->mmap_bump;
+	if (result + length >= 0x00007FFFFFFFF000ULL) {
+		return (u64)-1; // ENOMEM
+	}
+	
+	current_task->mmap_bump += length;
+	return result;
 }
 
 /* ── Priority ── */

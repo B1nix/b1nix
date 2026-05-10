@@ -53,12 +53,12 @@ and broader utility flag compatibility.
 - [x] `done` Add initial frame-backed bump kernel heap.
 - [x] `done` Add page fault diagnostics.
 - [x] `done` Replace bump frame allocator with reusable bitmap/free-list allocator.
-- [x] `done` Add unmap/remap helpers.
-- [x] `done` Add higher-half kernel mapping and direct-map window.
-- [x] `done` Add lazy page allocation hooks in the x86 page-fault path.
-- [x] `done` Add swap slot bookkeeping and swap in/out helpers.
-- [x] `done` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
-- [x] `done` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
+- [x] `initial` Add unmap/remap helpers.
+- [x] `initial` Add higher-half kernel mapping and direct-map window.
+- [x] `partial` Add lazy page allocation hooks in the x86 page-fault path.
+- [x] `partial` Add swap slot bookkeeping and swap in/out helpers.
+- [x] `partial` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
+- [x] `initial` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
 
 ## M3: Scheduling
 

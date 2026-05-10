@@ -112,9 +112,10 @@ enum {
 	SYS_SELFHOST_STATUS = 93,
 	SYS_LINK     = 94,
 	SYS_POLL     = 95,
+	SYS_MPROTECT = 96,
 };
 
-u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);
+u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5);
 int syscall_copyin(void *dst, const void *user_src, usize size);
 int syscall_copyout(void *user_dst, const void *src, usize size);
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src);

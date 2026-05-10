@@ -48,10 +48,26 @@ x86_syscall_entry:
     pushq %r14
     pushq %r15
 
-    /* Setup arguments for syscall_dispatch */
-    movq %r10, %rcx
+    /* Setup arguments for syscall_dispatch(number, arg0, arg1, arg2, arg3, arg4, arg5) */
+    /* Registers at entry: RAX=num, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4, R9=a5 */
+    
+    /* We need to push arg5 (R9) onto the stack as the 7th argument for C */
+    /* Fixed: Add dummy push to maintain 16-byte stack alignment for System V ABI */
+    pushq $0
+    pushq %r9
+    
+    /* Move others into correct positions for System V ABI */
+    movq %r8, %r9   /* arg4 -> R9 (6th arg) */
+    movq %r10, %r8  /* arg3 -> R8 (5th arg) */
+    movq %rdx, %rcx /* arg2 -> RCX (4th arg) */
+    movq %rsi, %rdx /* arg1 -> RDX (3rd arg) */
+    movq %rdi, %rsi /* arg0 -> RSI (2nd arg) */
+    movq %rax, %rdi /* number -> RDI (1st arg) */
     
     call syscall_dispatch
+    
+    /* Clean up the 7th argument and padding from stack */
+    addq $16, %rsp
     
     /* Restore registers */
     popq %r15

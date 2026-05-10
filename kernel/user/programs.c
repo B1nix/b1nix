@@ -12,7 +12,7 @@
 void user_register_program(const char *path, user_program_entry entry);
 
 static void uwrite(const char *text) {
-  syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0);
+  syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0, 0, 0);
 }
 
 /* ... (uwrite_dec_value, uwrite_ipv4, b1fetch_cpu_name remain unchanged) ... */
@@ -101,14 +101,13 @@ static void sh_jobs_print(void) {
     if (!sh_jobs[i].pid || sh_jobs[i].done)
       continue;
     int st = 0;
-    u64 r = syscall_dispatch(SYS_WAITPID, sh_jobs[i].pid, (u64)(usize)&st,
-                             1 /*WNOHANG*/, 0);
+    u64 r = syscall_dispatch(SYS_WAITPID, sh_jobs[i].pid, (u64)(usize)&st, 1 /*WNOHANG*/, 0, 0, 0);
     if (r == sh_jobs[i].pid)
       sh_jobs[i].done = 1;
     if (sh_jobs[i].done)
       continue;
     char num[4] = {'[', '0' + (i + 1), ']', ' '};
-    syscall_dispatch(SYS_WRITE, 0, (u64)(usize)num, 4, 0);
+    syscall_dispatch(SYS_WRITE, 0, (u64)(usize)num, 4, 0, 0, 0);
     uwrite(sh_jobs[i].name);
     uwrite("\n");
     any = 1;
@@ -125,29 +124,29 @@ static int sh_fg(int job_num) {
     return -1;
   }
   int st = 0;
-  syscall_dispatch(SYS_WAIT, sh_jobs[idx].pid, (u64)(usize)&st, 0, 0);
+  syscall_dispatch(SYS_WAIT, sh_jobs[idx].pid, (u64)(usize)&st, 0, 0, 0, 0);
   sh_jobs[idx].done = 1;
   return st;
 }
 
 static int readline(char *buffer, usize max_len) {
   struct b1nix_termios old_t, new_t;
-  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS, (u64)(usize)&old_t, 0);
+  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS, (u64)(usize)&old_t, 0, 0, 0);
   new_t = old_t;
   new_t.c_lflag &= ~(B1NIX_ICANON | B1NIX_ECHO);
-  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&new_t, 0);
+  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&new_t, 0, 0, 0);
 
   usize len = 0;
   int hist_idx = sh_hist_count;
 
   while (1) {
-    char c = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+    char c = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
     if (c == 4)
       return -1; /* Ctrl-D */
     if (c == 27) {
-      char b1 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+      char b1 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
       if (b1 == '[') {
-        char b2 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0);
+        char b2 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
         if (b2 == 'A') { // Up
           if (hist_idx > 0) {
             hist_idx--;
@@ -198,7 +197,7 @@ static int readline(char *buffer, usize max_len) {
     }
   }
 
-  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&old_t, 0);
+  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&old_t, 0, 0, 0);
   return 0;
 }
 
@@ -449,10 +448,10 @@ static int parse_redirs(char **args, int argc, struct shell_redir *redir) {
 static u64 open_output(const char *cwd, const char *path, int append) {
   char abs[128];
   resolve_path(cwd, path, abs);
-  u64 fd = syscall_dispatch(SYS_CREATE, (u64)(usize)abs, (u64)(usize) "", 0, 0);
-  fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, (u64)B1NIX_O_WRONLY, 0, 0);
+  u64 fd = syscall_dispatch(SYS_CREATE, (u64)(usize)abs, (u64)(usize) "", 0, 0, 0, 0);
+  fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, (u64)B1NIX_O_WRONLY, 0, 0, 0, 0);
   if ((isize)fd >= 0 && append) {
-    syscall_dispatch(SYS_LSEEK, fd, (u64)0, B1NIX_SEEK_END, 0);
+    syscall_dispatch(SYS_LSEEK, fd, (u64)0, B1NIX_SEEK_END, 0, 0, 0);
   }
   return fd;
 }
@@ -463,10 +462,10 @@ static int apply_redirs(const char *cwd, const struct shell_redir *redir,
   if (redir->stdin_path) {
     char abs[128];
     resolve_path(cwd, redir->stdin_path, abs);
-    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0);
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs, 0, 0, 0, 0, 0);
     if ((isize)fd < 0)
       return -1;
-    syscall_dispatch(SYS_DUP2, fd, 0, 0, 0);
+    syscall_dispatch(SYS_DUP2, fd, 0, 0, 0, 0, 0);
     if (opened_count < max_opened)
       opened[opened_count++] = (int)fd;
   }
@@ -474,17 +473,17 @@ static int apply_redirs(const char *cwd, const struct shell_redir *redir,
     u64 fd = open_output(cwd, redir->stdout_path, redir->stdout_append);
     if ((isize)fd < 0)
       return -1;
-    syscall_dispatch(SYS_DUP2, fd, 1, 0, 0);
+    syscall_dispatch(SYS_DUP2, fd, 1, 0, 0, 0, 0);
     if (opened_count < max_opened)
       opened[opened_count++] = (int)fd;
   }
   if (redir->stderr_to_stdout) {
-    syscall_dispatch(SYS_DUP2, 1, 2, 0, 0);
+    syscall_dispatch(SYS_DUP2, 1, 2, 0, 0, 0, 0);
   } else if (redir->stderr_path) {
     u64 fd = open_output(cwd, redir->stderr_path, 0);
     if ((isize)fd < 0)
       return -1;
-    syscall_dispatch(SYS_DUP2, fd, 2, 0, 0);
+    syscall_dispatch(SYS_DUP2, fd, 2, 0, 0, 0, 0);
     if (opened_count < max_opened)
       opened[opened_count++] = (int)fd;
   }
@@ -495,18 +494,18 @@ static void save_stdio(int saved[3]) {
   saved[0] = 61;
   saved[1] = 62;
   saved[2] = 63;
-  syscall_dispatch(SYS_DUP2, 0, saved[0], 0, 0);
-  syscall_dispatch(SYS_DUP2, 1, saved[1], 0, 0);
-  syscall_dispatch(SYS_DUP2, 2, saved[2], 0, 0);
+  syscall_dispatch(SYS_DUP2, 0, saved[0], 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, 1, saved[1], 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, 2, saved[2], 0, 0, 0, 0);
 }
 
 static void restore_stdio(const int saved[3]) {
-  syscall_dispatch(SYS_DUP2, saved[0], 0, 0, 0);
-  syscall_dispatch(SYS_DUP2, saved[1], 1, 0, 0);
-  syscall_dispatch(SYS_DUP2, saved[2], 2, 0, 0);
-  syscall_dispatch(SYS_CLOSE, saved[0], 0, 0, 0);
-  syscall_dispatch(SYS_CLOSE, saved[1], 0, 0, 0);
-  syscall_dispatch(SYS_CLOSE, saved[2], 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, saved[0], 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, saved[1], 1, 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, saved[2], 2, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, saved[0], 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, saved[1], 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, saved[2], 0, 0, 0, 0, 0);
 }
 
 static int lookup_path(const char *cwd, const char *name, char *out) {
@@ -530,7 +529,7 @@ static int lookup_path(const char *cwd, const char *name, char *out) {
       i++;
     resolve_path(dir, name, out);
     struct b1nix_stat st;
-    if (syscall_dispatch(SYS_STAT, (u64)(usize)out, (u64)(usize)&st, 0, 0) ==
+    if (syscall_dispatch(SYS_STAT, (u64)(usize)out, (u64)(usize)&st, 0, 0, 0, 0) ==
         0) {
       return 0;
     }
@@ -547,11 +546,9 @@ static int lookup_path(const char *cwd, const char *name, char *out) {
 static u64 spawn_path(const char *cwd, char **args, int num_args) {
   char path[128];
   lookup_path(cwd, args[0], path);
-  u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)path, num_args,
-                             (u64)(usize)args, 0);
+  u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)path, num_args, (u64)(usize)args, 0, 0, 0);
   if (pid == (u64)-1 && strcmp(path, args[0]) != 0) {
-    pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], num_args,
-                           (u64)(usize)args, 0);
+    pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)args[0], num_args, (u64)(usize)args, 0, 0, 0);
   }
   if (pid == (u64)-1 && args[0][0] != '/' && args[0][0] != '.') {
     char bin_path[128];
@@ -559,8 +556,7 @@ static u64 spawn_path(const char *cwd, char **args, int num_args) {
     if (len < 120) {
       memcpy(bin_path, "/bin/", 5);
       memcpy(bin_path + 5, args[0], len + 1);
-      pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args,
-                             (u64)(usize)args, 0);
+      pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bin_path, num_args, (u64)(usize)args, 0, 0, 0);
     }
   }
   return pid;
@@ -576,7 +572,7 @@ static int run_external_command(const char *cwd, char **args, int num_args,
   }
   if (wait_for) {
     int status;
-    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
+    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
     return status;
   }
   /* Background job — register in jobs list */
@@ -591,7 +587,7 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
   /* Built-ins */
   if (strcmp(args[0], "exit") == 0) {
     int code = (num_args > 1) ? (int)(args[1][0] - '0') : sh_last_status;
-    syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0);
+    syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "help") == 0) {
@@ -604,7 +600,7 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
     char abs_path[128];
     const char *target = (num_args > 1) ? args[1] : "/";
     resolve_path(cwd, target, abs_path);
-    if (syscall_dispatch(SYS_CHDIR, (u64)(usize)abs_path, 0, 0, 0) == 0) {
+    if (syscall_dispatch(SYS_CHDIR, (u64)(usize)abs_path, 0, 0, 0, 0, 0) == 0) {
       strncpy(cwd, abs_path, 128);
       return 0;
     } else {
@@ -642,44 +638,43 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
     char abs_path[128];
     const char *target = (num_args > 1 && args[1][0] != '-') ? args[1] : cwd;
     resolve_path(cwd, target, abs_path);
-    syscall_dispatch(SYS_LIST, (u64)(usize)abs_path, 0, 0, 0);
+    syscall_dispatch(SYS_LIST, (u64)(usize)abs_path, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "cat") == 0 && num_args > 1 && args[1][0] != '-') {
     char abs_path[128];
     resolve_path(cwd, args[1], abs_path);
     char buffer[256];
-    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs_path, 0, 0, 0);
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)abs_path, 0, 0, 0, 0, 0);
     if ((isize)fd < 0) {
       uwrite("sh: cat: open failed\n");
       return 1;
     } else {
       while (1) {
-        isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)buffer,
-                                          sizeof(buffer) - 1, 0);
+        isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)buffer, sizeof(buffer) - 1, 0, 0, 0);
         if (n <= 0)
           break;
         buffer[n] = '\0';
         uwrite(buffer);
       }
-      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
       return 0;
     }
   }
   if (strcmp(args[0], "clear") == 0) {
-    syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "ps") == 0) {
-    syscall_dispatch(SYS_PS, 0, 0, 0, 0);
+    syscall_dispatch(SYS_PS, 0, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "mem") == 0) {
-    syscall_dispatch(SYS_MEM, 0, 0, 0, 0);
+    syscall_dispatch(SYS_MEM, 0, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "reboot") == 0) {
-    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0);
+    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "jobs") == 0) {
@@ -699,17 +694,17 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
     }
     if (num_args > pid_idx) {
       u64 pid = (u64)atoi(args[pid_idx]);
-      syscall_dispatch(SYS_KILL, pid, (u64)sig, 0, 0);
+      syscall_dispatch(SYS_KILL, pid, (u64)sig, 0, 0, 0, 0);
     }
     return 0;
   }
   if (strcmp(args[0], "ip") == 0) {
-    syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0);
+    syscall_dispatch(SYS_NET_INFO, 0, 0, 0, 0, 0, 0);
     return 0;
   }
   if (strcmp(args[0], "selfhost") == 0) {
     struct b1nix_selfhost_status status;
-    if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0) ==
+    if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0, 0, 0) ==
         0) {
       uwrite("target: ");
       uwrite(status.target_triple);
@@ -765,7 +760,7 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
     int status = sh_execute_cmd(cwd, args, num_args, is_bg);
 
     for (int i = 0; i < opened_count; i++)
-      syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0, 0, 0);
     restore_stdio(saved);
     return status;
   }
@@ -775,22 +770,22 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
   char *cmd2 = pipe_pos + 1;
 
   int pipefd[2];
-  if (syscall_dispatch(SYS_PIPE, (u64)(usize)pipefd, 0, 0, 0) != 0)
+  if (syscall_dispatch(SYS_PIPE, (u64)(usize)pipefd, 0, 0, 0, 0, 0) != 0)
     return 1;
 
   int saved[3];
   save_stdio(saved);
 
   /* First stage of pipe */
-  syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0);
-  syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0, 0, 0);
   sh_execute_pipeline(cmd1, cwd);
 
   /* Second stage */
   restore_stdio(saved);
   save_stdio(saved);
-  syscall_dispatch(SYS_DUP2, (u64)pipefd[0], 0, 0, 0);
-  syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, (u64)pipefd[0], 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0, 0, 0);
   int status = sh_execute_pipeline(cmd2, cwd);
 
   restore_stdio(saved);
@@ -868,7 +863,7 @@ static void sh_execute_line(char *line, char *cwd) {
 }
 
 static void sh_run_script(const char *path, char *cwd) {
-  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
   if ((isize)fd < 0) {
     uwrite("sh: cannot open script\n");
     return;
@@ -877,7 +872,7 @@ static void sh_run_script(const char *path, char *cwd) {
   int i = 0;
   while (1) {
     char c;
-    isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)&c, 1, 0);
+    isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)&c, 1, 0, 0, 0);
     if (n <= 0)
       break;
     if (c == '\n') {
@@ -892,7 +887,7 @@ static void sh_run_script(const char *path, char *cwd) {
     line[i] = '\0';
     sh_execute_line(line, cwd);
   }
-  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 }
 
 static int sh_main(int argc, const char **argv) {
@@ -936,15 +931,15 @@ static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
 
-  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
+  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
-  u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0);
+  u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
     uwrite("NATIVE-SMOKE: spawn-fail\n");
   } else {
     int native_status = 0;
-    syscall_dispatch(SYS_WAIT, n_pid, (u64)(usize)&native_status, 0, 0);
+    syscall_dispatch(SYS_WAIT, n_pid, (u64)(usize)&native_status, 0, 0, 0, 0);
     if (native_status == 0) {
       uwrite("NATIVE-SMOKE: done\n");
     } else {
@@ -953,32 +948,32 @@ static int init_main(int argc, const char **argv) {
   }
 
   u64 smoke_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m22-smoke", 0, 0, 0);
+      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m22-smoke", 0, 0, 0, 0, 0);
   if (smoke_pid != (u64)-1) {
     int smoke_status = 0;
-    syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0);
+    syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0, 0, 0);
   }
 
   u64 stress_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m24-stress", 0, 0, 0);
+      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m24-stress", 0, 0, 0, 0, 0);
   if (stress_pid != (u64)-1) {
     int stress_status = 0;
-    syscall_dispatch(SYS_WAIT, stress_pid, (u64)(usize)&stress_status, 0, 0);
+    syscall_dispatch(SYS_WAIT, stress_pid, (u64)(usize)&stress_status, 0, 0, 0, 0);
   }
 
   u64 shell_smoke_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/shell-smoke", 0, 0, 0);
+      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/shell-smoke", 0, 0, 0, 0, 0);
   if (shell_smoke_pid != (u64)-1) {
     int status = 0;
-    syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0);
+    syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
   }
 
-  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0);
-  syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0);
+  syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
 
   while (1) {
     int status;
-    syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0);
+    syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0, 0, 0);
   }
 
   return 0;
@@ -1010,10 +1005,8 @@ static int m22_check_symlink_stat(void) {
   struct b1nix_stat st;
   struct b1nix_stat lst;
 
-  if (syscall_dispatch(SYS_STAT, (u64)(usize) "/tmp/m22dir/m22.link",
-                       (u64)(usize)&st, 0, 0) != 0 ||
-      syscall_dispatch(SYS_LSTAT, (u64)(usize) "/tmp/m22dir/m22.link",
-                       (u64)(usize)&lst, 0, 0) != 0 ||
+  if (syscall_dispatch(SYS_STAT, (u64)(usize) "/tmp/m22dir/m22.link", (u64)(usize)&st, 0, 0, 0, 0) != 0 ||
+      syscall_dispatch(SYS_LSTAT, (u64)(usize) "/tmp/m22dir/m22.link", (u64)(usize)&lst, 0, 0, 0, 0) != 0 ||
       (st.st_mode & B1NIX_S_IFLNK) == B1NIX_S_IFLNK ||
       (lst.st_mode & B1NIX_S_IFLNK) != B1NIX_S_IFLNK) {
     uwrite("M22-SMOKE: fail lstat\n");
@@ -1026,10 +1019,9 @@ static int m22_check_symlink_stat(void) {
 
 static int m22_check_parent_enforcement(void) {
   u64 create_rc =
-      syscall_dispatch(SYS_CREATE, (u64)(usize) "/tmp/m22-missing/file",
-                       (u64)(usize) "bad", 0, 0);
+      syscall_dispatch(SYS_CREATE, (u64)(usize) "/tmp/m22-missing/file", (u64)(usize) "bad", 0, 0, 0, 0);
   u64 mkdir_rc =
-      syscall_dispatch(SYS_MKDIR, (u64)(usize) "/tmp/m22-missing/dir", 0, 0, 0);
+      syscall_dispatch(SYS_MKDIR, (u64)(usize) "/tmp/m22-missing/dir", 0, 0, 0, 0, 0);
   if ((isize)create_rc >= 0 || (isize)mkdir_rc >= 0) {
     uwrite("M22-SMOKE: fail parent-perms\n");
     return 1;
@@ -1044,8 +1036,7 @@ static int m22_smoke_main(int argc, const char **argv) {
   (void)argv;
 
   uwrite("M22-SMOKE: start\n");
-  syscall_dispatch(SYS_CREATE, (u64)(usize) "/tmp/m22.txt",
-                   (u64)(usize) "beta\nalpha\nalpha\n", 0, 0);
+  syscall_dispatch(SYS_CREATE, (u64)(usize) "/tmp/m22.txt", (u64)(usize) "beta\nalpha\nalpha\n", 0, 0, 0, 0);
 
   int failures = 0;
 
@@ -1121,15 +1112,14 @@ static int m24_stress_main(int argc, const char **argv) {
   /* Sequential spawn-wait across more iterations than MAX_TASKS to verify
    * that waited children release their task slots and image state. */
   for (int i = 0; i < 24; i++) {
-    u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/true", 1,
-                               (u64)(usize)args, 0);
+    u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/true", 1, (u64)(usize)args, 0, 0, 0);
     if (pid == (u64)-1) {
       failures++;
       continue;
     }
     int status = 0;
-    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0);
-    syscall_dispatch(SYS_YIELD, 0, 0, 0, 0);
+    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+    syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
     if (status != 0)
       failures++;
   }
@@ -1147,7 +1137,7 @@ static int selfhost_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
   struct b1nix_selfhost_status status;
-  if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0) !=
+  if (syscall_dispatch(SYS_SELFHOST_STATUS, (u64)(usize)&status, 0, 0, 0, 0, 0) !=
       0) {
     uwrite("selfhost: status unavailable\n");
     return 1;
@@ -1184,15 +1174,15 @@ static int b1fetch_main(int argc, const char **argv) {
 
   struct b1nix_utsname uts;
   memset(&uts, 0, sizeof(uts));
-  syscall_dispatch(SYS_UNAME, (u64)(usize)&uts, 0, 0, 0);
+  syscall_dispatch(SYS_UNAME, (u64)(usize)&uts, 0, 0, 0, 0, 0);
 
   char cwd[128];
-  if ((isize)syscall_dispatch(SYS_GETCWD, (u64)(usize)cwd, sizeof(cwd), 0, 0) <
+  if ((isize)syscall_dispatch(SYS_GETCWD, (u64)(usize)cwd, sizeof(cwd), 0, 0, 0, 0) <
       0) {
     strcpy(cwd, "/");
   }
 
-  u64 uptime = syscall_dispatch(SYS_TIME, 0, 0, 0, 0);
+  u64 uptime = syscall_dispatch(SYS_TIME, 0, 0, 0, 0, 0, 0);
   u64 minutes = uptime / 60;
   u64 seconds = uptime % 60;
 
@@ -1256,7 +1246,7 @@ static int b1fetch_main(int argc, const char **argv) {
 
   struct b1nix_mount_entry mounts[8];
   long mount_count =
-      (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 8, 0, 0);
+      (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 8, 0, 0, 0, 0);
   if (mount_count < 0)
     mount_count = 0;
   uwrite("           mounts: ");

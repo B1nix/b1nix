@@ -37,7 +37,7 @@ static int editor_load(const char *path)
 	ed.left_col = 0;
 	ed.dirty = 0;
 	
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0);
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
 	if (fd == (u64)-1) return 0; /* New file */
 	
 	char buf[512];
@@ -46,7 +46,7 @@ static int editor_load(const char *path)
 	
 	/* Read file content */
 	while (1) {
-		u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0);
+		u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0, 0, 0);
 		if (n == 0 || n == (u64)-1) break;
 		buf[n] = '\0';
 		
@@ -67,7 +67,7 @@ static int editor_load(const char *path)
 		/* Continue the current line across buffer reads */
 	}
 	
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 	
 	if (line > 0 || total > 0) {
 		ed.lines[line][total] = '\0';
@@ -93,14 +93,13 @@ static int editor_save(void)
 	}
 	save_buffer[pos] = '\0';
 
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)ed.filename,
-	                          B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0);
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)ed.filename, B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0, 0, 0);
 	if (fd == (u64)-1) {
 		return -1;
 	}
 
-	u64 written = syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)save_buffer, (u64)pos, 0);
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0);
+	u64 written = syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)save_buffer, (u64)pos, 0, 0, 0);
+	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 	if (written == (u64)-1 || (usize)written != (usize)pos) {
 		return -1;
 	}
