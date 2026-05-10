@@ -9,13 +9,10 @@ _start:
 	movq $message_len, %rdx  /* byte count */
 	syscall
 
-	movq $2, %rax            /* SYS_EXIT (B1NIX uses 2, Linux uses 60) */
+	movq $60, %rax            /* SYS_EXIT (60) */
 	xorq %rdi, %rdi          /* status = 0 */
 	syscall
 
-1:
-	pause
-	jmp 1b
 
 .section .rodata
 message:

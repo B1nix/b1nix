@@ -16,6 +16,8 @@ struct pmm_state {
   u64 free_frames;
   usize bitmap_bytes;
   u8 *bitmap;
+  usize last_found_index;
+  u16 *frame_refcounts;
 };
 
 static struct pmm_state pmm;
@@ -67,9 +69,8 @@ static int region_contains(u64 base, u64 length, u64 address, u64 size) {
   return address >= base && address + size <= base + length;
 }
 
-static u64 find_bitmap_address(const struct boot_info *boot_info,
-                               usize bitmap_bytes) {
-  u64 bitmap_end = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
+static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
+  u64 search_addr = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
 
   for (usize i = 0; i < boot_info->memory_region_count; i++) {
     const struct boot_memory_region *region = &boot_info->memory_regions[i];
@@ -81,24 +82,21 @@ static u64 find_bitmap_address(const struct boot_info *boot_info,
     u64 start = align_up_u64(region->base, PAGE_SIZE);
     u64 end = align_down_u64(region->base + region->length, PAGE_SIZE);
 
-    if (bitmap_end < start) {
-      bitmap_end = start;
+    if (search_addr < start) {
+      search_addr = start;
     }
 
-    if (bitmap_end + bitmap_bytes > 0x100000000ULL) {
+    if (search_addr + size > 0x100000000ULL) {
       continue;
     }
 
-    if (region_contains(start, end - start, bitmap_end,
-                        align_up_u64(bitmap_bytes, PAGE_SIZE))) {
-      console_write("pmm: found bitmap location at 0x");
-      console_write_hex64(bitmap_end);
-      console_write("\n");
-      return bitmap_end;
+    if (region_contains(start, end - start, search_addr,
+                        align_up_u64(size, PAGE_SIZE))) {
+      return search_addr;
     }
   }
 
-  panic("no space for physical memory bitmap");
+  panic("no space for early physical memory allocation");
 }
 
 void pmm_init(const struct boot_info *boot_info) {
@@ -123,8 +121,14 @@ void pmm_init(const struct boot_info *boot_info) {
 
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
   pmm.bitmap_bytes = align_up_u64((frame_count + 7) / 8, PAGE_SIZE);
-  pmm.bitmap = (u8 *)(usize)find_bitmap_address(boot_info, pmm.bitmap_bytes);
+  usize refcounts_bytes = align_up_u64(frame_count * sizeof(u16), PAGE_SIZE);
+
+  u64 early_mem = find_early_mem(boot_info, pmm.bitmap_bytes + refcounts_bytes);
+  pmm.bitmap = (u8 *)(usize)early_mem;
+  pmm.frame_refcounts = (u16 *)(usize)(early_mem + pmm.bitmap_bytes);
+
   memset(pmm.bitmap, 0xff, pmm.bitmap_bytes);
+  memset(pmm.frame_refcounts, 0, refcounts_bytes);
 
   console_write("pmm: kernel 0x");
   console_write_hex64(pmm.kernel_start);
@@ -173,43 +177,29 @@ void pmm_init(const struct boot_info *boot_info) {
     mark_frame_used(frame);
   }
 
+  for (u64 frame = (u64)(usize)pmm.frame_refcounts;
+       frame < (u64)(usize)pmm.frame_refcounts + refcounts_bytes; frame += PAGE_SIZE) {
+    mark_frame_used(frame);
+  }
+
   console_write("pmm: bitmap 0x");
   console_write_hex64((u64)(usize)pmm.bitmap);
   console_write("-0x");
   console_write_hex64((u64)(usize)pmm.bitmap + pmm.bitmap_bytes);
   console_write("\n");
 
+  pmm.last_found_index = 0;
+
   console_write("pmm: total usable bytes 0x");
   console_write_hex64(pmm.total_usable);
   console_write("\n");
 }
 
-u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
-
-u64 pmm_alloc_frames(usize count) {
-  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
-
-  for (usize i = 0; i <= frame_count - count; i++) {
-    int free = 1;
-    for (usize j = 0; j < count; j++) {
-      if (bitmap_get(i + j)) {
-        free = 0;
-        i += j; // Skip past the used frame
-        break;
-      }
-    }
-    if (free) {
-      u64 frame = frame_from_index(i);
-      for (usize j = 0; j < count; j++) {
-        mark_frame_used(frame_from_index(i + j));
-      }
-      memset((void *)(usize)frame, 0, count * PAGE_SIZE);
-      return frame;
-    }
+void pmm_ref_frame(u64 frame) {
+  usize idx = frame / PAGE_SIZE;
+  if (pmm.frame_refcounts) {
+    pmm.frame_refcounts[idx]++;
   }
-
-  klog_warn("pmm: out of contiguous physical memory");
-  return 0;
 }
 
 void pmm_free_frame(u64 frame) {
@@ -218,7 +208,62 @@ void pmm_free_frame(u64 frame) {
     return;
   }
 
-  mark_frame_free(frame);
+  usize idx = frame / PAGE_SIZE;
+  if (pmm.frame_refcounts) {
+    if (pmm.frame_refcounts[idx] > 0) {
+      pmm.frame_refcounts[idx]--;
+    }
+    if (pmm.frame_refcounts[idx] == 0) {
+      mark_frame_free(frame);
+    }
+  } else {
+    mark_frame_free(frame);
+  }
+}
+
+void pmm_unref_frame(u64 frame) {
+  pmm_free_frame(frame);
+}
+
+u16 pmm_get_refcount(u64 frame) {
+  usize idx = frame / PAGE_SIZE;
+  if (pmm.frame_refcounts) {
+    return pmm.frame_refcounts[idx];
+  }
+  return 0;
+}
+
+u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
+
+u64 pmm_alloc_frames(usize count) {
+  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+
+  for (usize i = 0; i < frame_count; i++) {
+    usize idx = (pmm.last_found_index + i) % (frame_count - count + 1);
+    int free = 1;
+    for (usize j = 0; j < count; j++) {
+      if (bitmap_get(idx + j)) {
+        free = 0;
+        break;
+      }
+    }
+    if (free) {
+      u64 frame = frame_from_index(idx);
+      for (usize j = 0; j < count; j++) {
+        u64 f = frame_from_index(idx + j);
+        mark_frame_used(f);
+        if (pmm.frame_refcounts) {
+          pmm.frame_refcounts[idx + j] = 1; // Critical: Set initial refcount to 1
+        }
+      }
+      pmm.last_found_index = (idx + count) % frame_count;
+      memset((void *)(usize)frame, 0, count * PAGE_SIZE);
+      return frame;
+    }
+  }
+
+  klog_warn("pmm: out of contiguous physical memory");
+  return 0;
 }
 
 u64 pmm_total_usable_memory(void) { return pmm.total_usable; }

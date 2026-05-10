@@ -12,41 +12,44 @@
 #define VMM_NO_EXECUTE (1ULL << 63)
 
 /* mmap protections */
-#define PROT_NONE  0x0
-#define PROT_READ  0x1
+#define PROT_NONE 0x0
+#define PROT_READ 0x1
 #define PROT_WRITE 0x2
-#define PROT_EXEC  0x4
+#define PROT_EXEC 0x4
 
 /* mmap flags */
-#define MAP_SHARED    0x01
-#define MAP_PRIVATE   0x02
+#define MAP_SHARED 0x01
+#define MAP_PRIVATE 0x02
 #define MAP_ANONYMOUS 0x20
-#define MAP_FAILED    ((void *)-1)
+#define MAP_FAILED ((void *)-1)
 
 // Page fault error code bits
-#define PF_PRESENT  (1ULL << 0)
-#define PF_WRITE    (1ULL << 1)
-#define PF_USER     (1ULL << 2)
+#define PF_PRESENT (1ULL << 0)
+#define PF_WRITE (1ULL << 1)
+#define PF_USER (1ULL << 2)
 #define PF_RESERVED (1ULL << 3)
-#define PF_INSTR    (1ULL << 4)
+#define PF_INSTR (1ULL << 4)
 
 // Swap / Demand Paging
-#define VMM_SWAPPED (1ULL << 9)  // Custom flag: page is swapped out
-#define VMM_LAZY    (1ULL << 10) // Custom flag: lazy allocation
+#define VMM_SWAPPED (1ULL << 9) // Custom flag: page is swapped out
+#define VMM_LAZY (1ULL << 10)   // Custom flag: lazy allocation
 #define SWAP_BLOCK_SIZE PAGE_SIZE
 
 struct block_device;
 
 struct swap_slot {
-    u32 block_lba;   // LBA on swap device
-    u32 inode_num;   // For file-backed swap
-    int present;
+  u32 block_lba; // LBA on swap device
+  u32 inode_num; // For file-backed swap
+  int present;
 };
 
 void pmm_init(const struct boot_info *boot_info);
 u64 pmm_alloc_frame(void);
 u64 pmm_alloc_frames(usize count);
+void pmm_ref_frame(u64 frame);
+void pmm_unref_frame(u64 frame);
 void pmm_free_frame(u64 frame);
+u16 pmm_get_refcount(u64 frame);
 u64 pmm_total_usable_memory(void);
 u64 pmm_free_memory_estimate(void);
 usize pmm_free_frame_count(void);

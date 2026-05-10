@@ -1,14 +1,15 @@
-#include <string.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
-#include <b1nix/errno.h>
+#include <string.h>
 
 extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+extern struct task *current_task;
 
 #define MAX_PROGRAMS 64
 #define ELF_MAGIC0 0x7f
@@ -83,10 +84,10 @@ static char *kernel_strdup(const char *src) {
 }
 
 static int copy_string_vector(const char **src, int max_count,
-                               const char ***out, int *out_count) {
+                              const char ***out, int *out_count) {
   const char **copy = kzalloc(sizeof(char *) * (max_count + 1));
   int count = 0;
-  char tmp[256];
+  char tmp[1024];
 
   if (!copy)
     return -1;
@@ -217,7 +218,8 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
       kfree(data);
       return -1;
     }
-    if (got == 0) break; /* EOF */
+    if (got == 0)
+      break; /* EOF */
     total_read += (usize)got;
   }
   vfs_close(fd);
@@ -278,7 +280,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     segment->memsz = phdr->p_memsz;
     segment->filesz = phdr->p_filesz;
     segment->flags = phdr->p_flags;
-    
+
     /* FIX: Allocate only p_filesz to avoid huge memory allocations for .bss */
     if (phdr->p_filesz > 0) {
       segment->data = kzalloc(phdr->p_filesz);
@@ -294,13 +296,16 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 }
 
 void user_image_free(struct user_loaded_image *image) {
-  if (!image) return;
+  if (!image)
+    return;
 
-  if (image->path) kfree((void *)image->path);
+  if (image->path)
+    kfree((void *)image->path);
 
   if (image->argv) {
     for (int i = 0; i < image->argc; i++) {
-      if (image->argv[i]) kfree((void *)image->argv[i]);
+      if (image->argv[i])
+        kfree((void *)image->argv[i]);
     }
     kfree((void *)image->argv);
   }
@@ -365,17 +370,19 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   return 0;
 }
 
-static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *code)
-{
+static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
+                                       int *code) {
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
     const char *payload = segment->data;
-    if (segment->filesz < 10 || !payload || memcmp(payload, "B1NXEXEC", 9) != 0) continue;
+    if (segment->filesz < 10 || !payload || memcmp(payload, "B1NXEXEC", 9) != 0)
+      continue;
 
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
       const char *message = op + strlen(op) + 1;
-      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message), 0, 0, 0);
+      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message),
+                       0, 0, 0);
       *code = 0;
       return 1;
     }
@@ -401,69 +408,95 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {
-  console_write("user_run_elf: entry="); console_write_hex64(image->entry); console_write("\n");
+  console_write("user_run_elf: entry=");
+  console_write_hex64(image->entry);
+  console_write("\n");
   int compat_code = 0;
-  if (user_try_run_b1nxexec_image(image, &compat_code)) return compat_code;
+  if (user_try_run_b1nxexec_image(image, &compat_code))
+    return compat_code;
 
   /* Map segments into the address space */
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
-    u64 vaddr_end = (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-    
+    u64 vaddr_end =
+        (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
       u64 frame = pmm_alloc_frame();
-      if (!frame) return -ENOMEM;
-      
+      if (!frame)
+        return -ENOMEM;
+
       u64 flags = VMM_USER | VMM_WRITABLE; // Simplify for now
       vmm_map_page(v, frame, flags);
-      
+
       /* Clear page to avoid leaking kernel data and to handle .bss */
       u64 direct_v = direct_base + frame;
       memset((void *)(usize)direct_v, 0, PAGE_SIZE);
-      
+
       /* Copy data if within filesz */
       u64 page_offset = 0;
-      if (v < segment->vaddr) page_offset = segment->vaddr - v;
-      
+      if (v < segment->vaddr)
+        page_offset = segment->vaddr - v;
+
       if (v + page_offset < segment->vaddr + segment->filesz) {
         u64 chunk_offset = (v + page_offset) - segment->vaddr;
         u64 chunk_size = segment->filesz - chunk_offset;
-        if (chunk_size > PAGE_SIZE - page_offset) chunk_size = PAGE_SIZE - page_offset;
-        
+        if (chunk_size > PAGE_SIZE - page_offset)
+          chunk_size = PAGE_SIZE - page_offset;
+
         if (segment->data) {
-          memcpy((void *)(usize)(direct_v + page_offset), (char *)segment->data + chunk_offset, chunk_size);
+          memcpy((void *)(usize)(direct_v + page_offset),
+                 (char *)segment->data + chunk_offset, chunk_size);
         }
       }
     }
   }
 
+  /* Initialize heap bounds based on the end of the highest segment */
+  u64 max_vaddr = 0;
+  for (usize i = 0; i < image->segment_count; i++) {
+    u64 end = image->segments[i].vaddr + image->segments[i].memsz;
+    if (end > max_vaddr)
+      max_vaddr = end;
+  }
+  if (current_task) {
+    current_task->heap_start = (max_vaddr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    current_task->user_brk = current_task->heap_start;
+  }
+
   /* Map stack */
-  u64 stack_start = image->address_space.stack_top - image->address_space.stack_image_size;
+  u64 stack_start =
+      image->address_space.stack_top - image->address_space.stack_image_size;
   u64 stack_aligned = stack_start & ~(PAGE_SIZE - 1);
   u64 direct_base = vmm_direct_map_base();
-  for (u64 v = stack_aligned; v < image->address_space.stack_top; v += PAGE_SIZE) {
+  for (u64 v = stack_aligned; v < image->address_space.stack_top;
+       v += PAGE_SIZE) {
     u64 frame = pmm_alloc_frame();
     vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
-    
+
     /* Clear stack page */
     u64 direct_v = direct_base + frame;
     memset((void *)(usize)direct_v, 0, PAGE_SIZE);
 
-    u64 image_base = image->address_space.stack_top - image->address_space.stack_image_size;
+    u64 image_base =
+        image->address_space.stack_top - image->address_space.stack_image_size;
     u64 offset = v - image_base;
     if (offset < image->address_space.stack_image_size) {
       u64 chunk = image->address_space.stack_image_size - offset;
-      if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
-      memcpy((void *)(usize)direct_v, (char *)image->address_space.stack_image + offset, chunk);
+      if (chunk > PAGE_SIZE)
+        chunk = PAGE_SIZE;
+      memcpy((void *)(usize)direct_v,
+             (char *)image->address_space.stack_image + offset, chunk);
     }
   }
 
   /* Loader check: Verify entry point content */
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
-    if (image->entry >= segment->vaddr && image->entry < segment->vaddr + segment->memsz) {
+    if (image->entry >= segment->vaddr &&
+        image->entry < segment->vaddr + segment->memsz) {
       u64 offset = image->entry - segment->vaddr;
       if (offset < segment->filesz && segment->data) {
         u8 *ptr = (u8 *)segment->data + offset;
@@ -479,15 +512,16 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     }
   }
 
-  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc, image->address_space.stack_base + sizeof(u64));
-  
+  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc,
+                image->address_space.stack_base + sizeof(u64));
+
   return 0; // Should not reach here
 }
 
 static void user_process_thread(void *arg) {
   struct process_start *start = arg;
   struct user_loaded_image *image = start->image;
-  
+
   scheduler_set_user_image(image);
   kfree(start);
 
@@ -541,10 +575,12 @@ int user_spawn(const char *path, int argc, const char **argv) {
   }
   start->image = image;
 
-  /* FIX: Truncate thread name to 15 chars to prevent kthread_create from failing */
+  /* FIX: Truncate thread name to 15 chars to prevent kthread_create from
+   * failing */
   char safe_name[16];
   usize plen = strlen(path);
-  if (plen > 15) plen = 15;
+  if (plen > 15)
+    plen = 15;
   memcpy(safe_name, path, plen);
   safe_name[plen] = '\0';
 
@@ -597,7 +633,8 @@ void user_register_program(const char *path, user_program_entry entry) {
   programs[program_count].entry = entry;
   program_count++;
 
-  /* Ensure the program exists in the VFS so vfs_find_node/vfs_get_node_perm works */
+  /* Ensure the program exists in the VFS so vfs_find_node/vfs_get_node_perm
+   * works */
   if (vfs_create(path, "") == 0) {
     vfs_chmod(path, 0755);
   }

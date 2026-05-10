@@ -1,113 +1,120 @@
 #ifndef B1NIX_VFS_H
 #define B1NIX_VFS_H
 
-#include <b1nix/types.h>
-#include <b1nix/uidgid.h>
 #include <b1nix/dirent.h>
 #include <b1nix/posix.h>
+#include <b1nix/types.h>
+#include <b1nix/uidgid.h>
 
 #define VFS_MAX_PATH 256
 #define MS_RDONLY 1
 
 /* Standard permission bits */
-#define VFS_IRUSR  0400    /* Owner read */
-#define VFS_IWUSR  0200    /* Owner write */
-#define VFS_IXUSR  0100    /* Owner execute */
-#define VFS_IRGRP  0040    /* Group read */
-#define VFS_IWGRP  0020    /* Group write */
-#define VFS_IXGRP  0010    /* Group execute */
-#define VFS_IROTH  0004    /* Others read */
-#define VFS_IWOTH  0002    /* Others write */
-#define VFS_IXOTH  0001    /* Others execute */
+#define VFS_IRUSR 0400 /* Owner read */
+#define VFS_IWUSR 0200 /* Owner write */
+#define VFS_IXUSR 0100 /* Owner execute */
+#define VFS_IRGRP 0040 /* Group read */
+#define VFS_IWGRP 0020 /* Group write */
+#define VFS_IXGRP 0010 /* Group execute */
+#define VFS_IROTH 0004 /* Others read */
+#define VFS_IWOTH 0002 /* Others write */
+#define VFS_IXOTH 0001 /* Others execute */
 
 #define VFS_DEFAULT_PERMS (VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IROTH)
 
 enum vfs_node_type {
-	VFS_FILE = 1,
-	VFS_DEVICE = 2,
-	VFS_DIRECTORY = 3,
-	VFS_SYMLINK = 4,
+  VFS_FILE = 1,
+  VFS_DEVICE = 2,
+  VFS_DIRECTORY = 3,
+  VFS_SYMLINK = 4,
 };
 
 struct acl_entry {
-	u16 tag;      /* ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK, ACL_OTHER */
-	u16 qualifier; /* UID or GID (for ACL_USER, ACL_GROUP) */
-	u16 perms;    /* Permission bitmask */
+  u16 tag;       /* ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK,
+                    ACL_OTHER */
+  u16 qualifier; /* UID or GID (for ACL_USER, ACL_GROUP) */
+  u16 perms;     /* Permission bitmask */
 };
 
 #define ACL_MAX_ENTRIES 8
 
 /* ACL tag types */
-#define ACL_USER_OBJ    0x01
-#define ACL_USER        0x02
-#define ACL_GROUP_OBJ   0x04
-#define ACL_GROUP       0x08
-#define ACL_MASK        0x10
-#define ACL_OTHER       0x20
+#define ACL_USER_OBJ 0x01
+#define ACL_USER 0x02
+#define ACL_GROUP_OBJ 0x04
+#define ACL_GROUP 0x08
+#define ACL_MASK 0x10
+#define ACL_OTHER 0x20
 
 struct vfs_node;
 
 struct vfs_inode {
-	u64 ino;
-	enum vfs_node_type type;
-	u32 flags;
-	volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
-	int refcount;   /* Internal references (e.g. open handles) */
-	int nlink;      /* Number of hard links (names pointing to this inode) */
-	usize size;
-	usize capacity;
-	void *data;
+  u64 ino;
+  enum vfs_node_type type;
+  u32 flags;
+  volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
+  int refcount;         /* Internal references (e.g. open handles) */
+  int nlink; /* Number of hard links (names pointing to this inode) */
+  usize size;
+  usize capacity;
+  void *data;
 
-	/* Ownership and permissions */
-	u16 uid;
-	u16 gid;
-	u16 mode;
+  /* Ownership and permissions */
+  u16 uid;
+  u16 gid;
+  u16 mode;
 
-	/* ACL support */
-	struct acl_entry acls[ACL_MAX_ENTRIES];
-	int acl_count;
+  /* ACL support */
+  struct acl_entry acls[ACL_MAX_ENTRIES];
+  int acl_count;
 
-	/* Timestamps */
-	u32 atime;
-	u32 mtime;
-	u32 ctime;
+  /* Timestamps */
+  u32 atime;
+  u32 mtime;
+  u32 ctime;
 
-	struct block_device *blk_dev;
-	u32 fs_id;      /* Unique ID for this filesystem instance */
+  struct block_device *blk_dev;
+  u32 fs_id; /* Unique ID for this filesystem instance */
 
-	/* Callbacks (Inode Operations) */
-	isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size, int flags);
-	isize (*readdir_cb)(struct vfs_node *node, usize offset, struct dirent *buf, usize max_entries);
-	isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer, usize size, int flags);
-	int (*create_cb)(struct vfs_node *dir, const char *name, const char *full_path, u32 mode);
-	int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
-	int (*unlink_cb)(struct vfs_node *dir, const char *name);
-	int (*rmdir_cb)(struct vfs_node *dir, const char *name);
-	int (*rename_cb)(struct vfs_node *old_dir, const char *old_name, struct vfs_node *new_dir, const char *new_name);
-	int (*link_cb)(struct vfs_node *target, struct vfs_node *dir, const char *name);
-	int (*symlink_cb)(struct vfs_node *dir, const char *name, const char *target);
-	void (*release_cb)(struct vfs_node *node);
-	int (*setattr_cb)(struct vfs_node *node);
-	int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
-	int (*fsync_cb)(struct vfs_node *node);
-	int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
+  /* Callbacks (Inode Operations) */
+  isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size,
+                   int flags);
+  isize (*readdir_cb)(struct vfs_node *node, usize offset, struct dirent *buf,
+                      usize max_entries);
+  isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer,
+                    usize size, int flags);
+  int (*create_cb)(struct vfs_node *dir, const char *name,
+                   const char *full_path, u32 mode);
+  int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
+  int (*unlink_cb)(struct vfs_node *dir, const char *name);
+  int (*rmdir_cb)(struct vfs_node *dir, const char *name);
+  int (*rename_cb)(struct vfs_node *old_dir, const char *old_name,
+                   struct vfs_node *new_dir, const char *new_name);
+  int (*link_cb)(struct vfs_node *target, struct vfs_node *dir,
+                 const char *name);
+  int (*symlink_cb)(struct vfs_node *dir, const char *name, const char *target);
+  void (*release_cb)(struct vfs_node *node);
+  int (*setattr_cb)(struct vfs_node *node);
+  int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
+  int (*fsync_cb)(struct vfs_node *node);
+  int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
 };
 
 struct vfs_node {
-	char name[64];
-	struct vfs_inode *inode;
-	int refcount;   /* References to this NAME (e.g. current directory) */
-	int deleted;
+  char name[64];
+  struct vfs_inode *inode;
+  int refcount; /* References to this NAME (e.g. current directory) */
+  int deleted;
 
-	struct vfs_node *parent;
-	struct vfs_node *first_child;
-	struct vfs_node *next_sibling;
+  struct vfs_node *parent;
+  struct vfs_node *first_child;
+  struct vfs_node *next_sibling;
 };
 
 struct vfs_fs {
-	const char *name;
-	struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
-	struct vfs_fs *next;
+  const char *name;
+  struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
+  struct vfs_fs *next;
 };
 
 u32 vfs_get_unix_time(void);
@@ -176,24 +183,24 @@ int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
                 int max_entries);
 
 enum vfs_handle_kind {
-	VFS_HANDLE_NONE = 0,
-	VFS_HANDLE_NODE,
-	VFS_HANDLE_PIPE_READ,
-	VFS_HANDLE_PIPE_WRITE,
-	VFS_HANDLE_SOCKET
+  VFS_HANDLE_NONE = 0,
+  VFS_HANDLE_NODE,
+  VFS_HANDLE_PIPE_READ,
+  VFS_HANDLE_PIPE_WRITE,
+  VFS_HANDLE_SOCKET
 };
 
 struct vfs_handle;
 
 struct vfs_file_ops {
-	isize (*read)(struct vfs_handle *h, char *buf, usize len);
-	isize (*write)(struct vfs_handle *h, const char *buf, usize len);
-	int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
-	isize (*lseek)(struct vfs_handle *h, isize offset, int whence);
-	int (*close)(struct vfs_handle *h);
-	void (*release)(struct vfs_handle *h);
-	int (*getdents)(struct vfs_handle *h, struct dirent *buf, usize max_entries);
-	int (*ioctl)(struct vfs_handle *h, u64 request, void *arg);
+  isize (*read)(struct vfs_handle *h, char *buf, usize len);
+  isize (*write)(struct vfs_handle *h, const char *buf, usize len);
+  int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
+  isize (*lseek)(struct vfs_handle *h, isize offset, int whence);
+  int (*close)(struct vfs_handle *h);
+  void (*release)(struct vfs_handle *h);
+  int (*getdents)(struct vfs_handle *h, struct dirent *buf, usize max_entries);
+  int (*ioctl)(struct vfs_handle *h, u64 request, void *arg);
 };
 
 #define MAX_VFS_NODES 4096
@@ -228,21 +235,20 @@ struct vfs_socket_state {
 };
 
 struct vfs_handle {
-	int used;
-	int refcount;
-	enum vfs_handle_kind kind;
-	struct vfs_node *node;
-	usize offset;
-	void *private_data; /* Used for pipe, socket, etc. */
-	const struct vfs_file_ops *ops;
-	int flags;
+  int used;
+  int refcount;
+  enum vfs_handle_kind kind;
+  struct vfs_node *node;
+  usize offset;
+  void *private_data; /* Used for pipe, socket, etc. */
+  const struct vfs_file_ops *ops;
+  int flags;
 };
 
 /* Internal handle management for subsystems */
 int alloc_raw_handle(enum vfs_handle_kind kind);
 struct vfs_handle *get_handle_by_idx(int idx);
 void release_handle(int idx);
-
 
 extern const struct vfs_file_ops node_file_ops;
 extern const struct vfs_file_ops pipe_read_ops;
@@ -253,7 +259,8 @@ struct vfs_pipe;
 struct vfs_socket_state;
 
 /* Internal handle initialization helpers (called from subsystems) */
-void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_write);
+void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe,
+                          int is_write);
 void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state);
 
 /* SLAB-style allocator for VFS structures (Phase 4) */

@@ -1,8 +1,8 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
-#include <b1nix/fat32.h>
 #include <b1nix/ext2.h>
+#include <b1nix/fat32.h>
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/klog.h>
@@ -1075,7 +1075,8 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
       if (flags & B1NIX_O_NONBLOCK) {
         c = ps2_kbd_getc();
         if (c == 0) {
-          if (tty_line_len > 0) break;
+          if (tty_line_len > 0)
+            break;
           return -EAGAIN;
         }
       } else {
@@ -2450,7 +2451,6 @@ out:
   return res;
 }
 
-
 int vfs_sync(void) {
   /* Flush in-memory filesystem structures to block cache first */
   ext2_sync_all_fs();
@@ -2655,7 +2655,6 @@ int vfs_fchown(int fd, u16 uid, u16 gid) {
     return handle->node->inode->setattr_cb(handle->node);
   return 0;
 }
-
 
 int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   struct vfs_handle *handle = get_handle(fd);

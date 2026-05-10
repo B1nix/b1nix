@@ -5,8 +5,8 @@
 
 typedef int (*user_program_entry)(int argc, const char **argv);
 
-#define USER_MAX_ARGS 16
-#define USER_MAX_ENVS 16
+#define USER_MAX_ARGS 32
+#define USER_MAX_ENVS 32
 #define USER_MAX_IMAGE_SEGMENTS 8
 #define USER_STACK_SIZE PAGE_SIZE
 #define USER_STACK_TOP 0x0000800000000000ULL

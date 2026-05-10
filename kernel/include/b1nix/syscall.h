@@ -6,7 +6,7 @@
 enum {
 	/* --- Core Control & I/O --- */
 	SYS_WRITE    = 1,
-	SYS_EXIT     = 2,
+	SYS_MEM      = 2,
 	SYS_SPAWN    = 3,
 	SYS_LIST     = 4,
 	SYS_READ_FILE = 5,
@@ -70,7 +70,7 @@ enum {
 	SYS_BRK      = 57,
 	SYS_MMAP     = 58,
 	SYS_MUNMAP   = 59,
-	SYS_MEM      = 60,
+	SYS_EXIT     = 60,
 
 	/* --- IPC (MQ & SHM) --- */
 	SYS_MQ_OPEN    = 61,

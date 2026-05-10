@@ -61,6 +61,9 @@ void kernel_main(u64 arg0, u64 arg1)
 	console_write_hex64(frame);
 	console_write("\n");
 
+	vmm_init();
+	console_write("Step 3.5: VMM initialized\n");
+
 	kheap_init();
 	console_write("Step 4: KHeap initialized\n");
 
@@ -69,8 +72,6 @@ void kernel_main(u64 arg0, u64 arg1)
 	console_write_hex64((u64)(usize)heap_probe);
 	console_write("\n");
 
-	vmm_init();
-	console_write("Step 6: VMM initialized\n");
 
 	kheap_use_direct_map();
 	console_write("Step 7: KHeap switched to direct map\n");

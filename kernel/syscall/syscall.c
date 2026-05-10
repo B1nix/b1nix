@@ -17,8 +17,78 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 
+extern struct task *current_task;
+
+#define MAX_EXEC_ARGS 32
+#define MAX_EXEC_ARG_LEN 1024
+static int copy_from_user(void *dst, const void *src, usize size);
+static int copy_to_user(void *dst, const void *src, usize size);
+static isize strncpy_from_user(char *dst, const char *src, usize size);
 static inline int is_canonical(u64 addr) {
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+}
+
+static char **copy_user_array(const char **u_array) {
+  if (!u_array)
+    return NULL;
+
+  if (!is_canonical((u64)u_array) || (u64)u_array >= 0x0000800000000000ULL)
+    return ERR_PTR(-EFAULT);
+
+  char **k_array = kmalloc(sizeof(char *) * (MAX_EXEC_ARGS + 1));
+  if (!k_array)
+    return ERR_PTR(-ENOMEM);
+  memset(k_array, 0, sizeof(char *) * (MAX_EXEC_ARGS + 1));
+
+  for (int i = 0; i < MAX_EXEC_ARGS; i++) {
+    if ((u64)&u_array[i] >= 0x0000800000000000ULL)
+      goto fault;
+    const char *u_str;
+    if (copy_from_user(&u_str, &u_array[i], sizeof(char *)) < 0)
+      goto fault;
+
+    if (u_str == NULL) {
+      k_array[i] = NULL;
+      break;
+    }
+
+    if (!is_canonical((u64)u_str) || (u64)u_str >= 0x0000800000000000ULL)
+      goto fault;
+
+    char *k_str = kmalloc(MAX_EXEC_ARG_LEN);
+    if (!k_str) {
+      for (int j = 0; j < i; j++)
+        kfree(k_array[j]);
+      kfree(k_array);
+      return ERR_PTR(-ENOMEM);
+    }
+
+    if (strncpy_from_user(k_str, u_str, MAX_EXEC_ARG_LEN) < 0) {
+      kfree(k_str);
+      goto fault;
+    }
+    k_str[MAX_EXEC_ARG_LEN - 1] = '\0';
+    k_array[i] = k_str;
+  }
+
+  return k_array;
+
+fault:
+  for (int j = 0; j < MAX_EXEC_ARGS; j++) {
+    if (k_array[j])
+      kfree(k_array[j]);
+  }
+  kfree(k_array);
+  return ERR_PTR(-EFAULT);
+}
+
+static void free_kernel_array(char **k_array) {
+  if (!k_array || IS_ERR(k_array))
+    return;
+  for (int i = 0; k_array[i]; i++) {
+    kfree(k_array[i]);
+  }
+  kfree(k_array);
 }
 
 int syscall_copyin(void *dst, const void *user_src, usize size) {
@@ -56,34 +126,87 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
   return -1;
 }
 
-static isize sys_read(int fd, void *buf, usize count) {
-  char kbuf[4096];
-  if (count > 4096)
-    count = 4096;
-  isize res = vfs_read(fd, kbuf, count);
-  if (res > 0) {
-    if (syscall_copyout(buf, kbuf, (usize)res) < 0)
-      return -EFAULT;
+static int copy_from_user(void *dst, const void *src, usize size) {
+  return syscall_copyin(dst, src, size);
+}
+
+static int copy_to_user(void *dst, const void *src, usize size) {
+  return syscall_copyout(dst, src, size);
+}
+
+static isize strncpy_from_user(char *dst, const char *src, usize size) {
+  if (syscall_copyinstr(dst, size, src) == 0) {
+    return (isize)strlen(dst);
   }
-  return res;
+  return -EFAULT;
+}
+
+static isize sys_read(int fd, void *buf, usize count) {
+  isize total_read = 0;
+  char kbuf[4096];
+
+  while (count > 0) {
+    usize chunk = count > 4096 ? 4096 : count;
+    isize res = vfs_read(fd, kbuf, chunk);
+    if (res < 0)
+      return total_read > 0 ? total_read : res;
+    if (res == 0)
+      break;
+
+    if (copy_to_user((char *)buf + total_read, kbuf, (usize)res) < 0)
+      return -EFAULT;
+
+    total_read += res;
+    count -= (usize)res;
+    if (res < (isize)chunk)
+      break;
+  }
+  return total_read;
 }
 
 static isize sys_write(int fd, const void *buf, usize count) {
+  isize total_written = 0;
   char kbuf[4096];
-  if (count > 4096)
-    count = 4096;
-  if (syscall_copyin(kbuf, buf, count) < 0) {
-    return -EFAULT;
+
+  while (count > 0) {
+    usize chunk = count > 4096 ? 4096 : count;
+    if (copy_from_user(kbuf, (const char *)buf + total_written, chunk) < 0)
+      return -EFAULT;
+
+    isize res = vfs_write(fd, kbuf, chunk);
+    if (res < 0)
+      return total_written > 0 ? total_written : res;
+    if (res == 0)
+      break;
+
+    total_written += res;
+    count -= (usize)res;
+    if (res < (isize)chunk)
+      break;
   }
-  isize res = vfs_write(fd, kbuf, count);
-  return res;
+  return total_written;
 }
 
-static u64 sys_list(const char *dir_path) {
-  const char *paths[64];
-  usize count = vfs_list(dir_path, paths, 64);
+static isize sys_list(const char *user_path) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
 
-  for (usize i = 0; i < count; i++) {
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  const char *paths[64];
+  isize count = vfs_list(resolved, paths, 64);
+  if (count < 0)
+    return count;
+
+  for (usize i = 0; i < (usize)count; i++) {
     console_write(paths[i]);
     console_write("\n");
   }
@@ -91,15 +214,26 @@ static u64 sys_list(const char *dir_path) {
   return count;
 }
 
-static u64 sys_read_file(const char *user_path) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
-  
-  const struct initramfs_file *file = initramfs_find(kpath);
-  if (file == 0) return (u64)-ENOENT;
+static isize sys_read_file(const char *user_path) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  const struct initramfs_file *file = initramfs_find(resolved);
+  if (file == 0)
+    return -ENOENT;
 
   console_write(file->data);
-  return file->size;
+  return (isize)file->size;
 }
 
 #ifndef __aarch64__
@@ -111,30 +245,45 @@ static u64 sys_read_kbd(void) {
 }
 #endif
 
-static u64 sys_readdir(const char *user_dir_path, struct dirent *user_buf,
-                       usize max_entries) {
-  char kdir_path[VFS_MAX_PATH];
-  if (syscall_copyinstr(kdir_path, VFS_MAX_PATH, user_dir_path) < 0) return -EFAULT;
+static isize sys_readdir(const char *user_dir_path, struct dirent *user_buf,
+                         usize max_entries) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_dir_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
 
   const char *names[128];
-  isize count = vfs_list(kdir_path, names, 128);
-  if (count < 0) return (u64)count;
-  
+  isize count = vfs_list(resolved, names, 128);
+  if (count < 0)
+    return count;
+
   usize out_count = (usize)count;
-  if (out_count > max_entries) out_count = max_entries;
-  if (out_count > 32) out_count = 32; // Limit to avoid stack overflow
+  if (out_count > max_entries)
+    out_count = max_entries;
+  if (out_count > 32)
+    out_count = 32; // Limit to avoid stack overflow
 
   struct dirent kbuf[32];
   for (usize i = 0; i < out_count; i++) {
     usize len = strlen(names[i]);
-    if (len > 63) len = 63;
+    if (len > 63)
+      len = 63;
     memcpy(kbuf[i].name, names[i], len);
     kbuf[i].name[len] = '\0';
 
     char full_path[256];
-    usize dirlen = strlen(kdir_path);
-    memcpy(full_path, kdir_path, dirlen);
-    if (dirlen > 0 && full_path[dirlen - 1] != '/') full_path[dirlen++] = '/';
+    usize dirlen = strlen(resolved);
+    memcpy(full_path, resolved, dirlen);
+    if (dirlen > 0 && full_path[dirlen - 1] != '/')
+      full_path[dirlen++] = '/';
     memcpy(full_path + dirlen, names[i], len + 1);
 
     struct vfs_node *node = vfs_find_node(full_path);
@@ -150,8 +299,9 @@ static u64 sys_readdir(const char *user_dir_path, struct dirent *user_buf,
     }
   }
 
-  if (syscall_copyout(user_buf, kbuf, out_count * sizeof(struct dirent)) < 0) return -EFAULT;
-  return out_count;
+  if (copy_to_user(user_buf, kbuf, out_count * sizeof(struct dirent)) < 0)
+    return -EFAULT;
+  return (isize)out_count;
 }
 
 static u64 sys_clear(void) {
@@ -169,33 +319,46 @@ static void copy_cstr(char *dst, usize dst_size, const char *src) {
   dst[len] = '\0';
 }
 
-static u64 sys_execve(const char *user_path, const char **user_argv, const char **user_envp) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return (u64)-EFAULT;
+static u64 sys_execve(const char *user_path, const char **user_argv,
+                      const char **user_envp) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return (u64)-ENOMEM;
 
-  /* For now, we only support a small number of arguments in kernel-space buffer */
-  char *kargv[32];
-  memset(kargv, 0, sizeof(kargv));
-  if (user_argv) {
-    for (int i = 0; i < 31; i++) {
-      const char *user_arg;
-      if (syscall_copyin(&user_arg, &user_argv[i], sizeof(char*)) < 0) break;
-      if (!user_arg) break;
-      char *karg = kmalloc(256);
-      if (syscall_copyinstr(karg, 256, user_arg) < 0) { kfree(karg); break; }
-      kargv[i] = karg;
-    }
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return (u64)-EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char **kargv = copy_user_array(user_argv);
+  if (IS_ERR(kargv)) {
+    kfree(kpath);
+    return (u64)PTR_ERR(kargv);
+  }
+
+  char **kenvp = copy_user_array(user_envp);
+  if (IS_ERR(kenvp)) {
+    kfree(kpath);
+    free_kernel_array(kargv);
+    return (u64)PTR_ERR(kenvp);
   }
 
   char kernel_path[VFS_MAX_PATH];
   vfs_resolve_path(kpath, kernel_path);
+  kfree(kpath);
+
   if (kernel_path[0] == '\0') {
-    for (int i = 0; kargv[i]; i++) kfree(kargv[i]);
+    free_kernel_array(kargv);
+    free_kernel_array(kenvp);
     return (u64)-ENOENT;
   }
 
-  u64 res = (u64)user_execve_current(kernel_path, (const char**)kargv, user_envp);
-  for (int i = 0; kargv[i]; i++) kfree(kargv[i]);
+  u64 res = (u64)user_execve_current(kernel_path, (const char **)kargv,
+                                     (const char **)kenvp);
+
+  free_kernel_array(kargv);
+  free_kernel_array(kenvp);
   return res;
 }
 
@@ -221,77 +384,186 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   return 0;
 }
 
-static isize sys_mkdir(const char *pathname, u32 mode) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_mkdir(const char *user_path, u32 mode) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
   (void)mode;
-  return vfs_mkdir(kpath);
+  return vfs_mkdir(resolved);
 }
 
-static isize sys_unlink(const char *pathname) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_unlink(const char *user_path) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
-  return vfs_unlink(kpath);
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_unlink(resolved);
 }
 
-static isize sys_rmdir(const char *pathname) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_rmdir(const char *user_path) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
-  return vfs_rmdir(kpath);
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_rmdir(resolved);
 }
 
-static isize sys_rename(const char *oldpath, const char *newpath) {
-  char kold[VFS_MAX_PATH];
-  char knew[VFS_MAX_PATH];
-  if (syscall_copyinstr(kold, VFS_MAX_PATH, oldpath) < 0)
+static isize sys_rename(const char *user_old, const char *user_new) {
+  char *kold = kmalloc(VFS_MAX_PATH);
+  if (!kold)
+    return -ENOMEM;
+  if (strncpy_from_user(kold, user_old, VFS_MAX_PATH) < 0) {
+    kfree(kold);
     return -EFAULT;
-  if (syscall_copyinstr(knew, VFS_MAX_PATH, newpath) < 0)
+  }
+  kold[VFS_MAX_PATH - 1] = '\0';
+
+  char *knew = kmalloc(VFS_MAX_PATH);
+  if (!knew) {
+    kfree(kold);
+    return -ENOMEM;
+  }
+  if (strncpy_from_user(knew, user_new, VFS_MAX_PATH) < 0) {
+    kfree(kold);
+    kfree(knew);
     return -EFAULT;
-  return vfs_rename(kold, knew);
+  }
+  knew[VFS_MAX_PATH - 1] = '\0';
+
+  char res_old[VFS_MAX_PATH];
+  char res_new[VFS_MAX_PATH];
+  vfs_resolve_path(kold, res_old);
+  vfs_resolve_path(knew, res_new);
+  kfree(kold);
+  kfree(knew);
+
+  return vfs_rename(res_old, res_new);
 }
 
-static isize sys_symlink(const char *target, const char *linkpath) {
-  char ktarget[VFS_MAX_PATH];
-  char klink[VFS_MAX_PATH];
-  if (syscall_copyinstr(ktarget, VFS_MAX_PATH, target) < 0)
+static isize sys_symlink(const char *user_target, const char *user_link) {
+  char *ktarget = kmalloc(VFS_MAX_PATH);
+  if (!ktarget)
+    return -ENOMEM;
+  if (strncpy_from_user(ktarget, user_target, VFS_MAX_PATH) < 0) {
+    kfree(ktarget);
     return -EFAULT;
-  if (syscall_copyinstr(klink, VFS_MAX_PATH, linkpath) < 0)
+  }
+  ktarget[VFS_MAX_PATH - 1] = '\0';
+
+  char *klink = kmalloc(VFS_MAX_PATH);
+  if (!klink) {
+    kfree(ktarget);
+    return -ENOMEM;
+  }
+  if (strncpy_from_user(klink, user_link, VFS_MAX_PATH) < 0) {
+    kfree(ktarget);
+    kfree(klink);
     return -EFAULT;
-  return vfs_symlink(ktarget, klink);
+  }
+  klink[VFS_MAX_PATH - 1] = '\0';
+
+  char res_link[VFS_MAX_PATH];
+  vfs_resolve_path(klink, res_link);
+  kfree(klink);
+
+  isize res = vfs_symlink(ktarget, res_link);
+  kfree(ktarget);
+  return res;
 }
 
-static isize sys_readlink(const char *pathname, char *buf, usize bufsiz) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_readlink(const char *user_path, char *user_buf, usize bufsiz) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  if (bufsiz > 4096)
+    bufsiz = 4096;
   char *kbuf = kmalloc(bufsiz);
   if (!kbuf)
     return -ENOMEM;
-  isize result = vfs_readlink(kpath, kbuf, bufsiz);
+
+  isize result = vfs_readlink(resolved, kbuf, bufsiz);
   if (result > 0) {
-    syscall_copyout(buf, kbuf, (usize)result);
+    if (copy_to_user(user_buf, kbuf, (usize)result) < 0) {
+      kfree(kbuf);
+      return -EFAULT;
+    }
   }
   kfree(kbuf);
   return result;
 }
 
-static isize sys_chmod(const char *pathname, u16 mode) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_chmod(const char *user_path, u16 mode) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
-  return vfs_chmod(kpath, mode);
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_chmod(resolved, mode);
 }
 
 static isize sys_fchmod(int fd, u16 mode) { return vfs_fchmod(fd, mode); }
 
-static isize sys_chown(const char *pathname, u16 uid, u16 gid) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, pathname) < 0)
+static isize sys_chown(const char *user_path, u16 uid, u16 gid) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
-  return vfs_chown(kpath, uid, gid);
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_chown(resolved, uid, gid);
 }
 
 static isize sys_fchown(int fd, u16 uid, u16 gid) {
@@ -302,14 +574,25 @@ static isize sys_fcntl(int fd, int cmd, u64 arg) {
   return vfs_fcntl(fd, cmd, arg);
 }
 
-static isize sys_statfs(const char *path, struct b1nix_statfs *buf) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, path) < 0)
+static isize sys_statfs(const char *user_path, struct b1nix_statfs *user_buf) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
     return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
   struct b1nix_statfs kbuf;
-  int res = vfs_statfs(kpath, &kbuf);
+  int res = vfs_statfs(resolved, &kbuf);
   if (res == 0) {
-    syscall_copyout(buf, &kbuf, sizeof(struct b1nix_statfs));
+    if (copy_to_user(user_buf, &kbuf, sizeof(struct b1nix_statfs)) < 0)
+      return -EFAULT;
   }
   return res;
 }
@@ -326,35 +609,203 @@ static isize sys_fstatfs(int fd, struct b1nix_statfs *buf) {
 static isize sys_sync(void) { return vfs_sync(); }
 
 static isize sys_lstat(const char *user_path, struct b1nix_stat *user_st) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
   struct b1nix_stat kst;
-  int res = vfs_lstat(kpath, &kst);
+  int res = vfs_lstat(resolved, &kst);
   if (res == 0) {
-    if (syscall_copyout(user_st, &kst, sizeof(struct b1nix_stat)) < 0) return -EFAULT;
+    if (copy_to_user(user_st, &kst, sizeof(struct b1nix_stat)) < 0)
+      return -EFAULT;
   }
   return res;
 }
 
+static isize sys_chdir(const char *user_path) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  struct vfs_node *node = vfs_find_node(resolved);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+  if (node->inode->type != VFS_DIRECTORY)
+    return -ENOTDIR;
+
+  return (isize)scheduler_set_cwd(resolved);
+}
+
+static isize sys_mount(const char *user_src, const char *user_target,
+                       const char *user_type, u64 flags) {
+  char *ksrc = kmalloc(VFS_MAX_PATH);
+  if (!ksrc)
+    return -ENOMEM;
+  if (strncpy_from_user(ksrc, user_src, VFS_MAX_PATH) < 0) {
+    kfree(ksrc);
+    return -EFAULT;
+  }
+
+  char *ktarget = kmalloc(VFS_MAX_PATH);
+  if (!ktarget) {
+    kfree(ksrc);
+    return -ENOMEM;
+  }
+  if (strncpy_from_user(ktarget, user_target, VFS_MAX_PATH) < 0) {
+    kfree(ksrc);
+    kfree(ktarget);
+    return -EFAULT;
+  }
+
+  char *ktype = kmalloc(64);
+  if (!ktype) {
+    kfree(ksrc);
+    kfree(ktarget);
+    return -ENOMEM;
+  }
+  if (strncpy_from_user(ktype, user_type, 64) < 0) {
+    kfree(ksrc);
+    kfree(ktarget);
+    kfree(ktype);
+    return -EFAULT;
+  }
+
+  int res = vfs_mount(ksrc, ktarget, ktype, flags);
+  kfree(ksrc);
+  kfree(ktarget);
+  kfree(ktype);
+  return (isize)res;
+}
+
+static isize sys_umount(const char *user_target) {
+  char *ktarget = kmalloc(VFS_MAX_PATH);
+  if (!ktarget)
+    return -ENOMEM;
+  if (strncpy_from_user(ktarget, user_target, VFS_MAX_PATH) < 0) {
+    kfree(ktarget);
+    return -EFAULT;
+  }
+  ktarget[VFS_MAX_PATH - 1] = '\0';
+
+  int res = vfs_umount(ktarget);
+  kfree(ktarget);
+  return (isize)res;
+}
+
+static isize sys_stat(const char *user_path, struct b1nix_stat *user_st) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  struct b1nix_stat kst;
+  int res = vfs_stat(resolved, &kst);
+  if (res == 0) {
+    if (copy_to_user(user_st, &kst, sizeof(struct b1nix_stat)) < 0)
+      return -EFAULT;
+  }
+  return res;
+}
+
+static isize sys_spawn(const char *user_path, int argc,
+                       const char **user_argv) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return user_spawn(resolved, argc, user_argv);
+}
+
+static isize sys_open(const char *user_path, int flags) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_open_flags(resolved, flags);
+}
+
 static isize sys_create(const char *user_path, const char *user_data) {
-  char kpath[VFS_MAX_PATH];
-  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
   char *kdata = 0;
   if (user_data) {
     kdata = kmalloc(4096);
-    if (syscall_copyinstr(kdata, 4096, user_data) < 0) { kfree(kdata); return -EFAULT; }
+    if (!kdata)
+      return -ENOMEM;
+    if (syscall_copyinstr(kdata, 4096, user_data) < 0) {
+      kfree(kdata);
+      return -EFAULT;
+    }
   }
-  int res = vfs_create(kpath, kdata);
-  if (kdata) kfree(kdata);
+  int res = vfs_create(resolved, kdata);
+  if (kdata)
+    kfree(kdata);
   return res;
 }
 
 static isize sys_getdents(int fd, struct dirent *user_buf, usize max_entries) {
-  if (max_entries > 32) max_entries = 32;
+  if (max_entries > 32)
+    max_entries = 32;
   struct dirent kbuf[32];
   isize res = vfs_getdents(fd, kbuf, max_entries);
   if (res > 0) {
-    if (syscall_copyout(user_buf, kbuf, (usize)res * sizeof(struct dirent)) < 0) return -EFAULT;
+    if (copy_to_user(user_buf, kbuf, (usize)res * sizeof(struct dirent)) < 0)
+      return -EFAULT;
   }
   return res;
 }
@@ -363,7 +814,8 @@ static isize sys_syncfs(int fd) { return vfs_syncfs(fd); }
 
 static isize sys_umask(u16 mask) {
   struct cred *cred = scheduler_get_current_cred();
-  if (!cred) return -EPERM;
+  if (!cred)
+    return -EPERM;
   u16 old_mask = cred->umask;
   cred->umask = mask & 0777;
   return old_mask;
@@ -371,8 +823,10 @@ static isize sys_umask(u16 mask) {
 
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   struct b1nix_pollfd fds[16];
-  if (nfds > 16) nfds = 16;
-  if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0) return -EFAULT;
+  if (nfds > 16)
+    nfds = 16;
+  if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0)
+    return -EFAULT;
 
   u64 start_ticks = scheduler_get_uptime_ticks();
   u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
@@ -386,7 +840,8 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       }
       int h_idx = scheduler_fd_get(fds[i].fd);
       vfs_poll(h_idx, &fds[i]);
-      if (fds[i].revents != 0) ready++;
+      if (fds[i].revents != 0)
+        ready++;
     }
 
     if (ready > 0 || timeout == 0) {
@@ -401,45 +856,191 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
         return 0;
       }
     }
-    
+
     scheduler_yield();
   }
 }
 
-static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd, isize offset) {
-  (void)addr; (void)prot; (void)fd; (void)offset;
-  if (!(flags & MAP_ANONYMOUS)) return (u64)-EINVAL;
-  if (length == 0) return (u64)-EINVAL;
-  
-  return scheduler_mmap_bump_alloc(length);
+static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
+                    isize offset) {
+  (void)fd;
+  (void)offset;
+  if (!(flags & MAP_ANONYMOUS))
+    return (u64)-EINVAL;
+  if (length == 0)
+    return (u64)-EINVAL;
+
+  struct task *t = current_task;
+  if (!t)
+    return (u64)-ESRCH;
+
+  // Align length to page size
+  length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  u64 vaddr;
+  if (addr == 0) {
+    vaddr = vm_find_free_area(t, length);
+  } else {
+    vaddr = (u64)(usize)addr;
+    if ((vaddr & (PAGE_SIZE - 1)) != 0) {
+      vaddr = vm_find_free_area(t, length);
+    }
+    // In a real OS we would check if the requested addr is free,
+    // but for this task we use it as a hint if aligned, otherwise find free.
+  }
+
+  if (vaddr == (u64)-1)
+    return (u64)-ENOMEM;
+
+  // Allocate and map physical frames
+  u64 vmm_flags = VMM_USER;
+  if (prot & PROT_WRITE)
+    vmm_flags |= VMM_WRITABLE;
+
+  u64 direct_base = vmm_direct_map_base();
+  for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+    u64 frame = pmm_alloc_frame();
+    if (!frame) {
+      // Cleanup already mapped pages
+      for (u64 u = vaddr; u < v; u += PAGE_SIZE) {
+        vmm_unmap_page(u);
+      }
+      return (u64)-ENOMEM;
+    }
+
+    // Zero the frame
+    memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
+
+    vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
+  }
+
+  // Create and link a new VMA
+  struct vm_area *vma = kmalloc(sizeof(struct vm_area));
+  if (!vma) {
+    // Cleanup if VMA tracking fails
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      vmm_unmap_page(v);
+    }
+    return (u64)-ENOMEM;
+  }
+  vma->start = vaddr;
+  vma->end = vaddr + length;
+  vma->prot = (u32)prot;
+  vma->flags = (u32)flags;
+  vma->next = 0;
+
+  // Insert into sorted list
+  struct vm_area **prev = &t->vma_list;
+  struct vm_area *curr = t->vma_list;
+  while (curr && curr->start < vaddr) {
+    prev = &curr->next;
+    curr = curr->next;
+  }
+  vma->next = curr;
+  *prev = vma;
+
+  return vaddr;
 }
 
 static isize sys_munmap(void *addr, usize length) {
   u64 start = (u64)(usize)addr;
-  if (!is_canonical(start)) return -EINVAL;
-  
+  if ((start & (PAGE_SIZE - 1)) != 0)
+    return -EINVAL;
+  if (length == 0)
+    return -EINVAL;
+  if (start >= 0x00007FFFFFFFFFFFULL)
+    return -EINVAL;
+
+  struct task *t = current_task;
+  if (!t)
+    return -ESRCH;
+
   u64 end = start + length;
-  for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
-    paging_unmap_page(vaddr);
+
+  // Unmap pages and free frames (vmm_unmap_page handles pmm_free_frame)
+  for (u64 v = start; v < end; v += PAGE_SIZE) {
+    vmm_unmap_page(v);
   }
+
+  // Find VMAs covering the range and remove them
+  struct vm_area **prev = &t->vma_list;
+  struct vm_area *vma = t->vma_list;
+  while (vma) {
+    if (vma->start >= start && vma->end <= end) {
+      // Remove from list
+      *prev = vma->next;
+      struct vm_area *to_free = vma;
+      vma = vma->next;
+      kfree(to_free);
+      continue;
+    }
+    prev = &vma->next;
+    vma = vma->next;
+  }
+
   return 0;
 }
 
 static isize sys_mprotect(void *addr, usize length, int prot) {
   u64 start = (u64)(usize)addr;
-  if (!is_canonical(start)) return -EINVAL;
-  
+  if (!is_canonical(start))
+    return -EINVAL;
+
   u64 end = start + length;
   u64 flags = VMM_USER;
-  if (prot & PROT_WRITE) flags |= VMM_WRITABLE;
-  
+  if (prot & PROT_WRITE)
+    flags |= VMM_WRITABLE;
+
   for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
     paging_mprotect_page(vaddr, flags);
   }
   return 0;
 }
 
-u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5) {
+static u64 sys_brk(u64 addr) {
+  struct task *t = current_task;
+  if (!t)
+    return 0;
+
+  if (addr == 0) {
+    return t->user_brk;
+  }
+
+  if (addr < t->heap_start) {
+    return t->user_brk;
+  }
+
+  if (addr > t->user_brk) {
+    u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u64 new_brk_page_end = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    for (u64 v = old_brk_page_end; v < new_brk_page_end; v += PAGE_SIZE) {
+      u64 frame = pmm_alloc_frame();
+      if (!frame) {
+        return t->user_brk; // ENOMEM
+      }
+
+      // Zero frame
+      u64 direct_base = vmm_direct_map_base();
+      memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
+
+      vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE | VMM_PRESENT);
+    }
+  } else if (addr < t->user_brk) {
+    u64 old_brk_page_end = (t->user_brk + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    u64 new_brk_page_end = (addr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    for (u64 v = new_brk_page_end; v < old_brk_page_end; v += PAGE_SIZE) {
+      vmm_unmap_page(v);
+    }
+  }
+
+  t->user_brk = addr;
+  return t->user_brk;
+}
+
+u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5) {
   switch (number) {
   case SYS_WRITE:
     return (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
@@ -447,31 +1048,21 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
     scheduler_exit_current((int)arg0);
     return 0;
   case SYS_SPAWN: {
-    char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    vfs_resolve_path(kpath, path);
-    return path[0] ? (u64)user_spawn(path, (int)arg1, (const char **)(usize)arg2) : (u64)-ENOENT;
+    return (u64)sys_spawn((const char *)(usize)arg0, (int)arg1,
+                          (const char **)(usize)arg2);
   }
+
   case SYS_LIST: {
-    char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    vfs_resolve_path(kpath, path);
-    return sys_list(path);
+    return (u64)sys_list((const char *)(usize)arg0);
   }
   case SYS_READ_FILE: {
-    char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    vfs_resolve_path(kpath, path);
-    return sys_read_file(path);
+    return (u64)sys_read_file((const char *)(usize)arg0);
   }
   case SYS_YIELD:
     scheduler_yield();
     return 0;
   case SYS_OPEN: {
-    char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    vfs_resolve_path(kpath, path);
-    return (u64)vfs_open_flags(path, (int)arg1);
+    return (u64)sys_open((const char *)(usize)arg0, (int)arg1);
   }
   case SYS_READ:
     return (u64)sys_read((int)arg0, (void *)(usize)arg1, (usize)arg2);
@@ -481,25 +1072,22 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
   case SYS_LSEEK:
     return (u64)vfs_lseek((int)arg0, (isize)arg1, (int)arg2);
   case SYS_STAT: {
-    char kpath[VFS_MAX_PATH];
-    if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    struct b1nix_stat kst;
-    int res = vfs_stat(kpath, &kst);
-    if (res == 0) {
-      if (syscall_copyout((void*)(usize)arg1, &kst, sizeof(struct b1nix_stat)) < 0) return (u64)-EFAULT;
-    }
-    return (u64)res;
+    return (u64)sys_stat((const char *)(usize)arg0,
+                         (struct b1nix_stat *)(usize)arg1);
   }
   case SYS_FSTAT: {
     struct b1nix_stat kst;
     int res = vfs_fstat((int)arg0, &kst);
     if (res == 0) {
-      if (syscall_copyout((void*)(usize)arg1, &kst, sizeof(struct b1nix_stat)) < 0) return (u64)-EFAULT;
+      if (copy_to_user((void *)(usize)arg1, &kst, sizeof(struct b1nix_stat)) <
+          0)
+        return (u64)-EFAULT;
     }
     return (u64)res;
   }
   case SYS_LSTAT:
-    return (u64)sys_lstat((const char *)(usize)arg0, (struct b1nix_stat *)(usize)arg1);
+    return (u64)sys_lstat((const char *)(usize)arg0,
+                          (struct b1nix_stat *)(usize)arg1);
   case SYS_IOCTL:
     return (u64)vfs_ioctl((int)arg0, arg1, (void *)(usize)arg2);
   case SYS_FCNTL:
@@ -511,7 +1099,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
   case SYS_FSYNC:
     return (u64)vfs_fsync((int)arg0);
   case SYS_CREATE:
-    return (u64)sys_create((const char *)(usize)arg0, (const char *)(usize)arg1);
+    return (u64)sys_create((const char *)(usize)arg0,
+                           (const char *)(usize)arg1);
   case SYS_UNLINK:
     return (u64)sys_unlink((const char *)(usize)arg0);
   case SYS_MKDIR:
@@ -552,13 +1141,14 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
   case SYS_FCHOWN:
     return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);
+
   case SYS_FORK:
     return (u64)scheduler_fork_current();
   case SYS_EXEC: {
-    const char *empty_env[] = {0};
     return (u64)sys_execve((const char *)(usize)arg0,
-                           (const char **)(usize)arg1, empty_env);
+                           (const char **)(usize)arg1, NULL);
   }
+
   case SYS_EXECVE:
     return (u64)sys_execve((const char *)(usize)arg0,
                            (const char **)(usize)arg1,
@@ -627,7 +1217,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
     return (u64)scheduler_get_priority(pid);
   }
   case SYS_BRK:
-    return (u64)scheduler_brk_set(arg0);
+    return sys_brk(arg0);
   case SYS_MMAP:
     return sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
                     (int)arg4, (isize)arg5);
@@ -752,16 +1342,9 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
     ((char *)(usize)arg0)[len] = '\0';
     return (u64)len;
   }
-  case SYS_CHDIR: {
-    char path[VFS_MAX_PATH];
-    vfs_resolve_path((const char *)(usize)arg0, path);
-    struct vfs_node *node = vfs_find_node(path);
-    if (IS_ERR(node))
-      return (u64)PTR_ERR(node);
-    if (node->inode->type != VFS_DIRECTORY)
-      return (u64)-ENOTDIR;
-    return (u64)scheduler_set_cwd(path);
-  }
+  case SYS_CHDIR:
+    return (u64)sys_chdir((const char *)(usize)arg0);
+
   case SYS_REBOOT:
     console_write("reboot requested\n");
     arch_halt();
@@ -770,10 +1353,11 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg
       return (u64)-EINVAL;
     return (u64)klog_read((char *)(usize)arg0, (usize)arg1);
   case SYS_MOUNT:
-    return (u64)vfs_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
+    return (u64)sys_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
                           (const char *)(usize)arg2, arg3);
   case SYS_UMOUNT:
-    return (u64)vfs_umount((const char *)(usize)arg0);
+    return (u64)sys_umount((const char *)(usize)arg0);
+
   case SYS_MOUNTS:
     return (u64)vfs_mounts((struct b1nix_mount_entry *)(usize)arg0,
                            (usize)arg1);
