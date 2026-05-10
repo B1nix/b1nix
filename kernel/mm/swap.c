@@ -1,6 +1,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/sched.h>
 #include <string.h>
 
 /*
@@ -19,6 +20,7 @@ static u64 swap_sector_count = 0;
 
 // Swap slot table: maps virtual page -> swap location
 static struct {
+    u64 pml4_phys;         // Address space ID
     u64 virtual_addr;      // Page-aligned virtual address
     u32 slot_index;        // Index into swap area
     int used;
@@ -70,13 +72,15 @@ static void swap_free_slot(u32 slot_index)
     if (slot_index < MAX_SWAP_SLOTS) {
         swap_table[slot_index].used = 0;
         swap_table[slot_index].virtual_addr = 0;
+        swap_table[slot_index].pml4_phys = 0;
     }
 }
 
-static int swap_find_slot(u64 virtual_addr)
+static int swap_find_slot(u64 pml4_phys, u64 virtual_addr)
 {
     for (usize i = 0; i < MAX_SWAP_SLOTS; i++) {
-        if (swap_table[i].used && swap_table[i].virtual_addr == virtual_addr) {
+        if (swap_table[i].used && swap_table[i].pml4_phys == pml4_phys && 
+            swap_table[i].virtual_addr == virtual_addr) {
             return (int)i;
         }
     }
@@ -85,6 +89,8 @@ static int swap_find_slot(u64 virtual_addr)
 
 int swap_out(u64 virtual_addr, u64 physical_frame)
 {
+    u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
+
     if (!swap_dev || !swap_dev->write_blocks) {
         console_write("swap_out: no swap device\n");
         return -1;
@@ -106,6 +112,7 @@ int swap_out(u64 virtual_addr, u64 physical_frame)
     }
 
     swap_table[slot].virtual_addr = virtual_addr;
+    swap_table[slot].pml4_phys = pml4_phys;
 
     // Flush to ensure data is on disk
     blk_cache_flush(swap_dev);
@@ -115,11 +122,13 @@ int swap_out(u64 virtual_addr, u64 physical_frame)
 
 int swap_in(u64 virtual_addr, u64 *out_physical_frame)
 {
+    u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
+
     if (!swap_dev || !swap_dev->read_blocks) {
         return -1;
     }
 
-    int slot = swap_find_slot(virtual_addr);
+    int slot = swap_find_slot(pml4_phys, virtual_addr);
     if (slot < 0) {
         return -1; // Not swapped
     }

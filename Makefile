@@ -41,6 +41,7 @@ KERNEL_SOURCES := \
 	kernel/mm/kheap.c \
 	kernel/mm/pmm.c \
 	kernel/mm/swap.c \
+	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \
 	kernel/syscall/syscall.c \
 	kernel/fs/initramfs.c \

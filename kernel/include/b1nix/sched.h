@@ -97,6 +97,8 @@ struct vm_area {
   u64 end;
   u32 prot;
   u32 flags;
+  struct vfs_node *node;
+  isize offset;
   struct vm_area *next;
 };
 
@@ -147,8 +149,11 @@ struct task {
 
   /* Userspace Image */
   void *user_image;
+  u64 pml4_phys;
   struct vm_area *vma_list;
 };
+
+extern struct task *current_task;
 
 /* ── Scheduler ── */
 
@@ -198,5 +203,7 @@ usize scheduler_setsid(void);
 usize scheduler_getpgrp(void);
 int scheduler_setpgrp(usize pid, usize pgrp);
 u64 vm_find_free_area(struct task *t, usize length);
+struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
+void vma_delete_range(struct task *t, u64 start, u64 end);
 
 #endif

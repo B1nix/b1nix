@@ -57,8 +57,8 @@ and broader utility flag compatibility.
 - [x] `done` Add higher-half kernel mapping and direct-map window.
 - [x] `done` Add lazy page allocation hooks in the x86 page-fault path.
 - [x] `done` Add swap slot bookkeeping and swap in/out helpers.
-- [x] `partial` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
-- [x] `initial` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
+- [x] `done` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
+- [x] `done` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
 
 ## M3: Scheduling
 
@@ -256,7 +256,7 @@ and broader utility flag compatibility.
 
 - [x] `partial` Load ELF64 executables from VFS with per-process page mapping via VMM (PT_LOAD segments mapped page-by-page into user address space).
 - [x] `partial` Build a user address-space record per process.
-- [x] `initial` Add syscall `copyin`/`copyout` helpers for user pointers.
+- [x] `done` Add syscall `copyin`/`copyout` helpers for user pointers.
 - [x] `partial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics (AT_NULL, AT_ENTRY, AT_PHDR present).
 - [x] `partial` Implement `execve()` as image replacement with `vfs_close_on_exec()` and full ELF segment loading.
 - [x] `initial` Add process exit status propagation and zombie reaping semantics.
@@ -283,7 +283,7 @@ remain follow-up work.
 - [x] `initial` Implement `waitpid()` options and zombie lifecycle.
 - [x] `partial` Add basic process groups and terminal foreground job ownership.
 - [x] `done` Add refcounted VFS handles/open-file descriptions.
-- [ ] `planned` Add MMU-backed fork with copied or copy-on-write address spaces.
+- [x] `done` Add MMU-backed fork with copied or copy-on-write address spaces.
 - [ ] `planned` Add exact POSIX child/parent register-return semantics.
 
 M19 moves descriptor ownership out of the global VFS handle namespace and into

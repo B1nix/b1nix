@@ -5,6 +5,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
+#include <b1nix/vfs.h>
 #include <string.h>
 
 #define MAX_TASKS 16
@@ -127,6 +128,7 @@ void scheduler_init(void) {
   boot->session_id = boot->id;
   boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
   boot->mmap_bump = 0x700000000000ULL;
+  boot->pml4_phys = 0; // Kernel PML4
   boot->vma_list = 0;
   task_init_cred(boot);
   current_task = boot;
@@ -166,7 +168,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
 
   task->id = next_task_id++;
-  task->name = name;
+  task->name = strdup(name);
   task->state = TASK_READY;
   task->entry = entry;
   task->arg = arg;
@@ -230,6 +232,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->session_id = task->id;
     memset(task->env, 0, sizeof(task->env));
     task->mmap_bump = 0x700000000000ULL;
+    task->pml4_phys = 0;
     task->vma_list = 0;
   }
   task->exit_code = 0;
@@ -242,13 +245,89 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   return (int)task->id;
 }
 
+extern void x86_fork_child_trampoline(void);
+
 int scheduler_fork_current(void) {
-  if (!current_task || current_task->entry == 0) {
+  interrupts_disable();
+  struct task *parent = current_task;
+  if (!parent) {
+    interrupts_enable();
     return -1;
   }
 
-  return kthread_create(current_task->name, current_task->entry,
-                        current_task->arg);
+  struct task *child = find_unused_task();
+  if (!child) {
+    interrupts_enable();
+    return -1;
+  }
+
+  // 1. Copy the task structure
+  memcpy(child, parent, sizeof(struct task));
+  child->id = next_task_id++;
+  child->parent_id = parent->id;
+  child->state = TASK_READY;
+  
+  // 2. Allocate and copy kernel stack
+  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
+  if (!child_stack) {
+    child->state = TASK_UNUSED;
+    interrupts_enable();
+    return -1;
+  }
+  
+  // Copy parent's kernel stack
+  void *parent_stack = parent->stack;
+  memcpy(child_stack, parent_stack, KERNEL_STACK_SIZE);
+  
+  child->stack = child_stack;
+  
+  // Calculate child's stack pointer and frame pointer offsets
+  u64 stack_offset = (u64)(usize)child_stack - (u64)(usize)parent_stack;
+  
+  u64 current_rsp, current_rbp;
+  __asm__ volatile("movq %%rsp, %0" : "=r"(current_rsp));
+  __asm__ volatile("movq %%rbp, %0" : "=r"(current_rbp));
+
+  child->context.rsp = current_rsp + stack_offset;
+  child->context.rbp = current_rbp + stack_offset;
+  
+  // Set up child context to return to trampoline
+  // We'll manually push the return address onto the child's stack
+  child->context.rsp -= 8;
+  *(u64 *)(usize)child->context.rsp = (u64)x86_fork_child_trampoline;
+  
+  // 3. Clone address space
+  child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
+  
+  // 4. Clone VMAs
+  child->vma_list = 0;
+  struct vm_area *src_vma = parent->vma_list;
+  struct vm_area **dst_prev = &child->vma_list;
+  while (src_vma) {
+    struct vm_area *new_vma = kmalloc(sizeof(struct vm_area));
+    if (new_vma) {
+      memcpy(new_vma, src_vma, sizeof(struct vm_area));
+      new_vma->next = 0;
+      if (new_vma->node) {
+        vfs_node_get(new_vma->node);
+      }
+      *dst_prev = new_vma;
+      dst_prev = &new_vma->next;
+    }
+    src_vma = src_vma->next;
+  }
+  
+  // 5. Clone credentials and file descriptors
+  task_init_cred(child);
+  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
+    if (child->fd_table[i] >= 0) {
+      vfs_handle_retain(child->fd_table[i]);
+    }
+  }
+
+  int child_id = (int)child->id;
+  interrupts_enable();
+  return child_id;
 }
 
 void scheduler_yield(void) {
@@ -279,6 +358,7 @@ void scheduler_yield(void) {
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
+  paging_switch_address_space(new_task->pml4_phys);
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
 }
@@ -657,6 +737,10 @@ struct cred *scheduler_get_current_cred(void) {
 void scheduler_set_user_image(void *image) {
   if (current_task) {
     current_task->user_image = image;
+    if (current_task->pml4_phys == 0) {
+      current_task->pml4_phys = paging_create_address_space();
+      paging_switch_address_space(current_task->pml4_phys);
+    }
   }
 }
 
@@ -706,9 +790,6 @@ u64 vm_find_free_area(struct task *t, usize length) {
   u64 current_addr = start;
   struct vm_area *vma = t->vma_list;
 
-  // Sort VMAs by start address if they aren't already
-  // (Assuming they are kept sorted for now)
-
   while (vma) {
     if (vma->start >= current_addr + length) {
       return current_addr;
@@ -722,6 +803,47 @@ u64 vm_find_free_area(struct task *t, usize length) {
   }
 
   return (u64)-1;
+}
+
+struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
+  (void)t;
+  struct vm_area *new_vma = kzalloc(sizeof(struct vm_area));
+  if (!new_vma)
+    return 0;
+
+  memcpy(new_vma, vma, sizeof(struct vm_area));
+  new_vma->start = addr;
+  vma->end = addr;
+
+  new_vma->next = vma->next;
+  vma->next = new_vma;
+
+  return new_vma;
+}
+
+void vma_delete_range(struct task *task, u64 start, u64 end) {
+  struct vm_area **curr = &task->vma_list;
+  while (*curr) {
+    struct vm_area *vma = *curr;
+    if (vma->start >= end || vma->end <= start) {
+      curr = &vma->next;
+      continue;
+    }
+
+    if (vma->start < start) {
+      vma_split(task, vma, start);
+      curr = &vma->next;
+      continue;
+    }
+
+    if (vma->end > end) {
+      vma_split(task, vma, end);
+    }
+
+    /* Now vma is entirely within [start, end] */
+    *curr = vma->next;
+    kfree(vma);
+  }
 }
 
 /* ── Priority ── */

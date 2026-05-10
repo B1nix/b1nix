@@ -66,6 +66,8 @@ x86_syscall_entry:
     
     call syscall_dispatch
     
+.global x86_syscall_return
+x86_syscall_return:
     /* Clean up the 7th argument and padding from stack */
     addq $16, %rsp
     
@@ -86,3 +88,9 @@ x86_syscall_entry:
     movq x86_syscall_saved_user_rsp(%rip), %rax /* Restore return value */
     
     sysretq
+
+.global x86_fork_child_trampoline
+x86_fork_child_trampoline:
+    /* In the child, fork() returns 0 */
+    xorq %rax, %rax
+    jmp x86_syscall_return

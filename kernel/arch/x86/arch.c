@@ -50,8 +50,9 @@ static void x86_tss_init(void) {
 
 void x86_syscall_init(void) {
   u32 lo, hi;
+  /* Fix: Enable syscall/sysret by setting SCE bit in EFER MSR */
   __asm__ volatile("rdmsr" : "=a"(lo), "=d"(hi) : "c"(0xC0000080));
-  lo |= 1;
+  lo |= 1; // Установка бита SCE (System Call Enable)
   __asm__ volatile("wrmsr" : : "a"(lo), "d"(hi), "c"(0xC0000080));
 
   /* STAR: SYSCALL enters 0x08/0x10, SYSRET returns to 0x20/0x18. */
@@ -78,8 +79,7 @@ void arch_init(void) {
 }
 
 void arch_halt(void) {
-  /* QEMU isa-debug-exit: exit with status (val << 1) | 1.
-     We use value 0 to exit with status 1 (0*2+1). */
+  /* QEMU isa-debug-exit: exit with status (val << 1) | 1. */
   __asm__ volatile("outb %0, %1" : : "a"((u8)0), "Nd"((u16)0xf4));
 
   for (;;) {

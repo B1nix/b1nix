@@ -9,6 +9,8 @@
 #define VMM_PRESENT (1ULL << 0)
 #define VMM_WRITABLE (1ULL << 1)
 #define VMM_USER (1ULL << 2)
+#define VMM_ACCESSED (1ULL << 5)
+#define VMM_DIRTY (1ULL << 6)
 #define VMM_NO_EXECUTE (1ULL << 63)
 
 /* mmap protections */
@@ -70,6 +72,9 @@ u64 vmm_direct_map_base(void);
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void paging_unmap_page(u64 virtual_address);
 void paging_mprotect_page(u64 virtual_address, u64 flags);
+u64 paging_create_address_space(void);
+u64 paging_clone_address_space(u64 src_pml4_phys);
+void paging_switch_address_space(u64 pml4_phys);
 
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);

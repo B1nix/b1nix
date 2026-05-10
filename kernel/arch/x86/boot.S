@@ -75,6 +75,7 @@ setup_page_tables:
 	movl $pdpt, %eax
 	orl $0x003, %eax
 	movl %eax, pml4
+	movl %eax, pml4+(256*8) /* Map higher half to same physical pages */
 
 	movl $pd0, %eax
 	orl $0x003, %eax
@@ -115,7 +116,7 @@ enable_long_mode:
 
 	movl $0xc0000080, %ecx
 	rdmsr
-	orl $(1 << 8), %eax
+	orl $(1 << 8) | 1, %eax /* Set LME (bit 8) and SCE (bit 0) */
 	wrmsr
 
 	movl %cr0, %eax

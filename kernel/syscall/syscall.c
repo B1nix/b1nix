@@ -91,11 +91,18 @@ static void free_kernel_array(char **k_array) {
   kfree(k_array);
 }
 
+static int is_user_range_valid(const void *src, usize size, int write);
+
 int syscall_copyin(void *dst, const void *user_src, usize size) {
   if (size == 0)
     return 0;
   if (!dst || !user_src)
-    return -1;
+    return -EFAULT;
+
+  if (!is_user_range_valid(user_src, size, 0)) {
+    return -EFAULT;
+  }
+
   memcpy(dst, user_src, size);
   return 0;
 }
@@ -104,26 +111,80 @@ int syscall_copyout(void *user_dst, const void *src, usize size) {
   if (size == 0)
     return 0;
   if (!user_dst || !src)
-    return -1;
+    return -EFAULT;
+
+  if (!is_user_range_valid(user_dst, size, 1)) {
+    return -EFAULT;
+  }
+
   memcpy(user_dst, src, size);
   return 0;
 }
 
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
   if (!dst || dst_size == 0 || !user_src)
-    return -1;
+    return -EFAULT;
+
+  // Validate the first byte to check if user_src is at least accessible
+  if (!is_user_range_valid(user_src, 1, 0)) {
+    return -EFAULT;
+  }
 
   for (usize i = 0; i < dst_size; i++) {
     char c;
-    if (syscall_copyin(&c, user_src + i, 1) != 0)
-      return -1;
+    // We check byte by byte for strings because we don't know the length upfront.
+    // However, is_user_range_valid is expensive. A better way would be to check 
+    // the VMA once for the start address and then check if we cross VMA boundaries.
+    // For simplicity, we check each page boundary or each byte.
+    // Here we check each byte for safety.
+    if (!is_user_range_valid(user_src + i, 1, 0)) {
+      return -EFAULT;
+    }
+
+    c = user_src[i];
     dst[i] = c;
     if (c == '\0')
       return 0;
   }
 
   dst[dst_size - 1] = '\0';
-  return -1;
+  return -ENAMETOOLONG;
+}
+
+static int is_user_range_valid(const void *src, usize size, int write) {
+  u64 start = (u64)(usize)src;
+  u64 end = start + size;
+
+  struct task *t = current_task;
+  /* Allow kernel pointers during early boot or for builtin programs */
+  if (!t || !t->user_image) return 1;
+  if (t->user_image) {
+    struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+    if (img->kind == USER_IMAGE_BUILTIN) return 1;
+  }
+
+  if (end < start) return 0; // Overflow
+  if (end >= 0x0000800000000000ULL) return 0; // Not in userspace
+
+  // Verify that the entire range is covered by VMAs with correct permissions
+  for (u64 v = start; v < end; ) {
+    struct vm_area *vma = t->vma_list;
+    int found = 0;
+    while (vma) {
+      if (v >= vma->start && v < vma->end) {
+        if (write && !(vma->prot & PROT_WRITE)) return 0;
+        if (!write && !(vma->prot & PROT_READ)) return 0;
+        
+        v = vma->end; // Move to end of this VMA
+        found = 1;
+        break;
+      }
+      vma = vma->next;
+    }
+    if (!found) return 0;
+  }
+
+  return 1;
 }
 
 static int copy_from_user(void *dst, const void *src, usize size) {
@@ -849,16 +910,24 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
 static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
                     isize offset) {
-  (void)fd;
-  (void)offset;
-  if (!(flags & MAP_ANONYMOUS))
-    return (u64)-EINVAL;
   if (length == 0)
     return (u64)-EINVAL;
 
   struct task *t = current_task;
   if (!t)
     return (u64)-ESRCH;
+
+  struct vfs_node *node = 0;
+  if (!(flags & MAP_ANONYMOUS)) {
+    if (fd < 0)
+      return (u64)-EBADF;
+    node = vfs_find_node_by_fd(fd);
+    if (IS_ERR(node))
+      return (u64)PTR_ERR(node);
+    // Offset must be page-aligned
+    if ((offset & (PAGE_SIZE - 1)) != 0)
+      return (u64)-EINVAL;
+  }
 
   // Align length to page size
   length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
@@ -883,21 +952,33 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   if (prot & PROT_WRITE)
     vmm_flags |= VMM_WRITABLE;
 
-  u64 direct_base = vmm_direct_map_base();
-  for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
-    u64 frame = pmm_alloc_frame();
-    if (!frame) {
-      // Cleanup already mapped pages
-      for (u64 u = vaddr; u < v; u += PAGE_SIZE) {
-        vmm_unmap_page(u);
+  if (flags & MAP_ANONYMOUS) {
+    u64 direct_base = vmm_direct_map_base();
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      u64 frame = pmm_alloc_frame();
+      if (!frame) {
+        // Cleanup already mapped pages
+        for (u64 u = vaddr; u < v; u += PAGE_SIZE) {
+          vmm_unmap_page(u);
+        }
+        if (node) vfs_node_put(node);
+        return (u64)-ENOMEM;
       }
-      return (u64)-ENOMEM;
+
+      // Zero the frame
+      memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
+
+      vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
     }
-
-    // Zero the frame
-    memset((void *)(usize)(frame + direct_base), 0, PAGE_SIZE);
-
-    vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
+  } else {
+    // For file-backed, we use lazy allocation. 
+    // Connect to VFS by setting VMM_LAZY flag. 
+    // The page fault handler will read the file contents on demand.
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      vmm_set_lazy(v);
+      // Ensure the PTE also has the correct user/writable bits saved
+      paging_mprotect_page(v, vmm_flags);
+    }
   }
 
   // Create and link a new VMA
@@ -913,6 +994,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   vma->end = vaddr + length;
   vma->prot = (u32)prot;
   vma->flags = (u32)flags;
+  vma->node = node ? vfs_node_get(node) : 0;
+  vma->offset = offset;
   vma->next = 0;
 
   // Insert into sorted list
@@ -943,26 +1026,13 @@ static isize sys_munmap(void *addr, usize length) {
 
   u64 end = start + length;
 
-  // Unmap pages and free frames (vmm_unmap_page handles pmm_free_frame)
+  // 1. Unmap pages from hardware page tables and free physical frames
   for (u64 v = start; v < end; v += PAGE_SIZE) {
     vmm_unmap_page(v);
   }
 
-  // Find VMAs covering the range and remove them
-  struct vm_area **prev = &t->vma_list;
-  struct vm_area *vma = t->vma_list;
-  while (vma) {
-    if (vma->start >= start && vma->end <= end) {
-      // Remove from list
-      *prev = vma->next;
-      struct vm_area *to_free = vma;
-      vma = vma->next;
-      kfree(to_free);
-      continue;
-    }
-    prev = &vma->next;
-    vma = vma->next;
-  }
+  // 2. Update VMA list using the new robust helper
+  vma_delete_range(t, start, end);
 
   return 0;
 }
@@ -972,14 +1042,40 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   if (!is_canonical(start))
     return -EINVAL;
 
-  u64 end = start + length;
+  u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
   u64 flags = VMM_USER;
   if (prot & PROT_WRITE)
     flags |= VMM_WRITABLE;
 
+  // 1. Update hardware page tables
   for (u64 vaddr = start; vaddr < end; vaddr += PAGE_SIZE) {
     paging_mprotect_page(vaddr, flags);
   }
+
+  // 2. Update VMAs (handle splitting if necessary)
+  struct task *t = current_task;
+  struct vm_area *vma = t->vma_list;
+  while (vma) {
+    if (vma->start >= end || vma->end <= start) {
+      vma = vma->next;
+      continue;
+    }
+
+    // Partial overlap? Split!
+    if (vma->start < start) {
+      vma_split(t, vma, start);
+      vma = vma->next; // Skip the part before 'start'
+      continue;
+    }
+    if (vma->end > end) {
+      vma_split(t, vma, end);
+      // The current VMA is now exactly within [start, end]
+    }
+
+    vma->prot = (u32)prot;
+    vma = vma->next;
+  }
+
   return 0;
 }
 
@@ -1022,6 +1118,17 @@ static u64 sys_brk(u64 addr) {
   }
 
   t->user_brk = addr;
+
+  // Update heap VMA
+  struct vm_area *vma = t->vma_list;
+  while (vma) {
+    if (vma->start == t->heap_start) {
+      vma->end = t->user_brk;
+      break;
+    }
+    vma = vma->next;
+  }
+
   return t->user_brk;
 }
 

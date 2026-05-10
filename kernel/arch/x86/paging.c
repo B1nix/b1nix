@@ -1,5 +1,7 @@
 #include <b1nix/console.h>
+#include <b1nix/sched.h>
 #include <b1nix/mm.h>
+#include <b1nix/vfs.h>
 #include <b1nix/panic.h>
 #include <string.h>
 
@@ -9,8 +11,18 @@
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
 #define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
 
-static u64 *kernel_pml4;
+static u64 *kernel_pml4_virt;
+static u64 kernel_pml4_phys;
 static int direct_map_ready;
+
+extern struct task *current_task;
+
+static u64 *get_current_pml4(void) {
+  if (current_task && current_task->pml4_phys) {
+    return (u64 *)(usize)(current_task->pml4_phys + DIRECT_MAP_BASE);
+  }
+  return kernel_pml4_virt;
+}
 
 static inline int is_canonical(u64 addr) {
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
@@ -21,6 +33,15 @@ static u64 read_cr3(void) {
 
   __asm__ volatile("movq %%cr3, %0" : "=r"(value));
   return value;
+}
+
+static void write_cr3(u64 value) {
+  __asm__ volatile("movq %0, %%cr3" : : "r"(value) : "memory");
+}
+
+void paging_switch_address_space(u64 pml4_phys) {
+  u64 target_phys = pml4_phys ? pml4_phys : kernel_pml4_phys;
+  __asm__ volatile("mov %0, %%cr3" : : "r"(target_phys) : "memory");
 }
 
 static void invalidate_page(u64 virtual_address) {
@@ -99,25 +120,40 @@ static u64 *split_huge_page(u64 *pd, usize index) {
   return pt;
 }
 
+void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {
+  u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
+  u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+  
+  u64 *pt;
+  if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
+    pt = split_huge_page(pd, pd_index(virtual_address));
+  } else {
+    pt = ensure_child_table(pd, pd_index(virtual_address));
+  }
+  
+  pt[pt_index(virtual_address)] =
+      (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
+  invalidate_page(virtual_address);
+}
+
 void vmm_init(void) {
-  /* Get physical address of PML4 */
-  u64 phys_pml4 = read_cr3() & PAGE_ENTRY_ADDRESS_MASK;
-  kernel_pml4 = (u64 *)(usize)phys_pml4;
-  direct_map_ready = 0;
+  u64 phys_pml4 = pmm_alloc_frame();
+  u64 *pml4 = (u64 *)(usize)phys_pml4;
+  memset(pml4, 0, PAGE_SIZE);
 
-  console_write("vmm: mapping direct map with huge pages...\n");
-
-  /* Map the direct map using 2MB huge pages for efficiency */
+  /* Map higher half (direct map) AND identity map using huge pages (2MB) */
   for (u64 physical = 0; physical < DIRECT_MAP_SIZE; physical += 0x200000ULL) {
-    u64 virtual = DIRECT_MAP_BASE + physical;
+    u64 virtual_high = DIRECT_MAP_BASE + physical;
 
-    u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual));
-    u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual));
+    /* Higher-half mapping */
+    u64 *pdpt_h = ensure_child_table(pml4, pml4_index(virtual_high));
+    u64 *pd_h = ensure_child_table(pdpt_h, pdpt_index(virtual_high));
+    pd_h[pd_index(virtual_high)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
 
-    /* Set 2MB huge page entry */
-    pd[pd_index(virtual)] = physical | VMM_PRESENT | VMM_WRITABLE |
-                            (1ULL << 7); /* Bit 7 is PS (Page Size) */
-    invalidate_page(virtual);
+    /* Identity mapping (for transition and kernel-space execution) */
+    u64 *pdpt_i = ensure_child_table(pml4, pml4_index(physical));
+    u64 *pd_i = ensure_child_table(pdpt_i, pdpt_index(physical));
+    pd_i[pd_index(physical)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
   }
 
   console_write("vmm: direct map 0x");
@@ -126,9 +162,13 @@ void vmm_init(void) {
   console_write_hex64(DIRECT_MAP_BASE + DIRECT_MAP_SIZE);
   console_write("\n");
 
+  /* Switch to new page table */
+  paging_switch_address_space(phys_pml4);
+
   /* Now that direct map is ready, we can use virtual addresses for the PML4 */
   direct_map_ready = 1;
-  kernel_pml4 = (u64 *)(usize)(phys_pml4 + DIRECT_MAP_BASE);
+  kernel_pml4_virt = (u64 *)(usize)(phys_pml4 + DIRECT_MAP_BASE);
+  kernel_pml4_phys = phys_pml4;
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -137,14 +177,15 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     panic("vmm_map_page requires page-aligned addresses");
   }
 
-  if (kernel_pml4 == 0) {
+  if (kernel_pml4_virt == 0) {
     panic("vmm_map_page called before vmm_init");
   }
 
-  u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual_address));
+  u64 *pml4 = get_current_pml4();
+  u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
   if ((flags & VMM_USER) != 0) {
-    kernel_pml4[pml4_index(virtual_address)] |= VMM_USER;
+    pml4[pml4_index(virtual_address)] |= VMM_USER;
     pdpt[pdpt_index(virtual_address)] |= VMM_USER;
   }
 
@@ -155,13 +196,18 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
   if ((flags & VMM_USER) != 0) {
-    kernel_pml4[pml4_index(virtual_address)] |= VMM_USER;
+    pml4[pml4_index(virtual_address)] |= VMM_USER;
     pdpt[pdpt_index(virtual_address)] |= VMM_USER;
     pd[pd_index(virtual_address)] |= VMM_USER;
   }
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
+
+  if ((flags & VMM_USER) && (flags & VMM_PRESENT)) {
+    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    eviction_register_page(current_task, virtual_address, physical_address);
+  }
 }
 
 void vmm_unmap_page(u64 virtual_address) {
@@ -169,7 +215,8 @@ void vmm_unmap_page(u64 virtual_address) {
     panic("vmm_unmap_page requires page-aligned address");
   }
 
-  u64 pml4e = kernel_pml4[pml4_index(virtual_address)];
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(virtual_address)];
   if ((pml4e & VMM_PRESENT) == 0) {
     return;
   }
@@ -196,8 +243,11 @@ void vmm_unmap_page(u64 virtual_address) {
   u64 pte = pt[pt_index(virtual_address)];
   if (pte & VMM_PRESENT) {
     u64 frame = pte & PAGE_ENTRY_ADDRESS_MASK;
-    if (frame)
+    if (frame) {
       pmm_free_frame(frame);
+      extern void eviction_unregister_page(u64 frame);
+      eviction_unregister_page(frame);
+    }
   }
   pt[pt_index(virtual_address)] = 0;
   invalidate_page(virtual_address);
@@ -214,7 +264,8 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
     panic("paging_mprotect_page requires page-aligned address");
   }
 
-  u64 pml4e = kernel_pml4[pml4_index(virtual_address)];
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(virtual_address)];
   if ((pml4e & VMM_PRESENT) == 0)
     return;
 
@@ -233,11 +284,15 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(virtual_address)];
-  if (!(pte & VMM_PRESENT))
-    return;
 
-  pt[pt_index(virtual_address)] =
-      (pte & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
+  if (pte & VMM_PRESENT) {
+    pt[pt_index(virtual_address)] =
+        (pte & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
+  } else if (pte & (VMM_LAZY | VMM_SWAPPED)) {
+    // For non-present pages, update the saved flags
+    pt[pt_index(virtual_address)] = (pte & PAGE_ENTRY_ADDRESS_MASK) | flags;
+  }
+  
   invalidate_page(virtual_address);
 }
 
@@ -253,7 +308,8 @@ void vmm_set_lazy(u64 virtual_address) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0)
     return;
 
-  u64 *pdpt = ensure_child_table(kernel_pml4, pml4_index(virtual_address));
+  u64 *pml4 = get_current_pml4();
+  u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
   u64 *pt = ensure_child_table(pd, pd_index(virtual_address));
 
@@ -288,7 +344,8 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   }
 
   // Get the page table entry
-  u64 pml4e = kernel_pml4[pml4_index(page_aligned)];
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(page_aligned)];
   if ((pml4e & VMM_PRESENT) == 0)
     return -1;
 
@@ -318,6 +375,23 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
     memset(new_frame_virt, 0, PAGE_SIZE);
 
+    // If file-backed, load from VFS
+    struct vm_area *vma = current_task->vma_list;
+    while (vma) {
+      if (page_aligned >= vma->start && page_aligned < vma->end) {
+        if (vma->node && vma->node->inode && vma->node->inode->read_cb) {
+          u64 file_offset = vma->offset + (page_aligned - vma->start);
+          isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
+          if (res < 0) {
+            pmm_free_frame(frame);
+            return -1;
+          }
+        }
+        break;
+      }
+      vma = vma->next;
+    }
+
     // Build proper flags from saved flags
     u64 flags = VMM_PRESENT | VMM_WRITABLE;
     if (pte & VMM_USER)
@@ -325,6 +399,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     pt[pt_index(page_aligned)] = frame | flags;
     invalidate_page(page_aligned);
+
+    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    eviction_register_page(current_task, page_aligned, frame);
     return 0;
   }
 
@@ -347,6 +424,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     pt[pt_index(page_aligned)] = new_frame | flags;
     invalidate_page(page_aligned);
+
+    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    eviction_register_page(current_task, page_aligned, new_frame);
     return 0;
   }
 
@@ -376,5 +456,128 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   }
 
   return -1; // Unhandled
+}
+
+u64 paging_create_address_space(void) {
+  u64 *pml4 = alloc_page_table();
+  u64 pml4_phys = table_to_phys(pml4);
+
+  // Clone kernel-half entries (256-511)
+  for (usize i = 256; i < 512; i++) {
+    pml4[i] = kernel_pml4_virt[i];
+  }
+
+  // Also clone index 0 because the kernel is currently linked at 1MB.
+  // This is required for kernel execution during syscalls/interrupts.
+  // User processes are still isolated from the kernel by the absence of
+  // the VMM_USER bit in kernel-owned page table entries.
+  pml4[0] = kernel_pml4_virt[0];
+
+  return pml4_phys;
+}
+
+static void clone_table(u64 *src_table, u64 *dst_table, int level) {
+  for (usize i = 0; i < 512; i++) {
+    if (!(src_table[i] & VMM_PRESENT)) {
+      dst_table[i] = src_table[i]; // Copy lazy/swapped entries as is
+      continue;
+    }
+
+    if (level < 3) {
+      // PML4, PDPT, or PD -> recurse
+      u64 *src_child = table_from_entry(src_table[i]);
+      u64 *dst_child = alloc_page_table();
+      dst_table[i] = table_to_phys(dst_child) | (src_table[i] & ~PAGE_ENTRY_ADDRESS_MASK);
+      clone_table(src_child, dst_child, level + 1);
+    } else {
+      // PT -> copy frame and handle CoW
+      u64 entry = src_table[i];
+      u64 frame = entry & PAGE_ENTRY_ADDRESS_MASK;
+      
+      if (entry & VMM_WRITABLE) {
+        // Mark both as Read-Only for CoW
+        entry &= ~VMM_WRITABLE;
+        src_table[i] = entry;
+      }
+      
+      dst_table[i] = entry;
+      if (frame) {
+        pmm_ref_frame(frame);
+      }
+    }
+  }
+}
+
+u64 paging_clone_address_space(u64 src_pml4_phys) {
+  u64 real_src_phys = src_pml4_phys ? src_pml4_phys : kernel_pml4_phys;
+  u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
+  u64 *dst_pml4 = alloc_page_table();
+  u64 dst_pml4_phys = table_to_phys(dst_pml4);
+
+  // Clone user-half entries (0-255)
+  for (usize i = 0; i < 256; i++) {
+    if (src_pml4[i] & VMM_PRESENT) {
+      u64 *src_pdpt = table_from_entry(src_pml4[i]);
+      u64 *dst_pdpt = alloc_page_table();
+      dst_pml4[i] = table_to_phys(dst_pdpt) | (src_pml4[i] & ~PAGE_ENTRY_ADDRESS_MASK);
+      clone_table(src_pdpt, dst_pdpt, 1);
+    }
+  }
+
+  // Copy kernel-half entries (256-511)
+  for (usize i = 256; i < 512; i++) {
+    dst_pml4[i] = kernel_pml4_virt[i];
+  }
+
+  return dst_pml4_phys;
+}
+
+void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT)) return;
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT)) return;
+
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+
+  if (pte & VMM_PRESENT) {
+    u64 flags = pte & ~PAGE_ENTRY_ADDRESS_MASK;
+    flags &= ~VMM_PRESENT;
+    flags |= VMM_SWAPPED;
+    pt[pt_index(vaddr)] = flags;
+    invalidate_page(vaddr);
+  }
+}
+
+int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return 0;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT)) return 0;
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT)) return 0;
+
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+
+  if (pte & VMM_ACCESSED) {
+    pt[pt_index(vaddr)] = pte & ~VMM_ACCESSED;
+    invalidate_page(vaddr);
+    return 1;
+  }
+  return 0;
 }
 

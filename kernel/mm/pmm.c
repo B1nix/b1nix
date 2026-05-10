@@ -262,6 +262,12 @@ u64 pmm_alloc_frames(usize count) {
     }
   }
 
+  // If we reach here, we are OOM. Try to evict a page and try again.
+  extern int swap_evict_page(void);
+  if (swap_evict_page() == 0) {
+    return pmm_alloc_frames(count);
+  }
+
   klog_warn("pmm: out of contiguous physical memory");
   return 0;
 }

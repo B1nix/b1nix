@@ -357,7 +357,8 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->path = kernel_strdup(path);
     image->entry = (u64)(usize)program->entry;
     image->address_space = user_address_space_create();
-    user_build_initial_stack(image);
+    if (user_build_initial_stack(image) != 0)
+      return 0;
     return image;
   }
 
@@ -452,6 +453,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         }
       }
     }
+
+    // Create a VMA for this segment
+    struct vm_area *vma = kzalloc(sizeof(struct vm_area));
+    if (vma) {
+      vma->start = vaddr_start;
+      vma->end = vaddr_end;
+      vma->prot = PROT_READ | PROT_WRITE | PROT_EXEC; // Simplify for now
+      vma->flags = MAP_PRIVATE;
+      vma->next = current_task->vma_list;
+      current_task->vma_list = vma;
+    }
   }
 
   /* Initialize heap bounds based on the end of the highest segment */
@@ -464,6 +476,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   if (current_task) {
     current_task->heap_start = (max_vaddr + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
     current_task->user_brk = current_task->heap_start;
+
+    // Create an initial heap VMA
+    struct vm_area *vma = kzalloc(sizeof(struct vm_area));
+    if (vma) {
+      vma->start = current_task->heap_start;
+      vma->end = current_task->heap_start;
+      vma->prot = PROT_READ | PROT_WRITE;
+      vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+      vma->next = current_task->vma_list;
+      current_task->vma_list = vma;
+    }
   }
 
   /* Map stack */
@@ -490,6 +513,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       memcpy((void *)(usize)direct_v,
              (char *)image->address_space.stack_image + offset, chunk);
     }
+  }
+
+  // Create VMA for stack
+  struct vm_area *stack_vma = kzalloc(sizeof(struct vm_area));
+  if (stack_vma) {
+    stack_vma->start = stack_aligned;
+    stack_vma->end = image->address_space.stack_top;
+    stack_vma->prot = PROT_READ | PROT_WRITE;
+    stack_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+    stack_vma->next = current_task->vma_list;
+    current_task->vma_list = stack_vma;
   }
 
   /* Loader check: Verify entry point content */
@@ -549,11 +583,10 @@ void userspace_init(void) {
 
 int user_spawn(const char *path, int argc, const char **argv) {
   struct vfs_node *node = vfs_find_node(path);
-  if (IS_ERR(node)) {
-    return (int)PTR_ERR(node);
+  if (!node || IS_ERR(node)) {
+    return -1;
   }
 
-  /* POSIX: Check execute permission */
   const struct cred *cred = scheduler_get_current_cred();
   if (!cred || vfs_get_node_perm(node, cred, 1) != 1) {
     vfs_node_put(node);
