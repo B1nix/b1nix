@@ -49,24 +49,24 @@ branch by branch.
   no-follow mode (`lstat`, `readlink`) works via `vfs_find_node_no_follow`.
 - `partial` Hard-link aliases exist in the in-memory VFS model and are wired
   via `SYS_LINK`; on-disk hard-link persistence is not implemented for ext drivers.
-- `partial` Mount table, `mount`, `umount`, and mount listing exist and are
+- `done` Mount table, `mount`, `umount`, and mount listing exist and are
   wired via `SYS_MOUNT`, `SYS_UMOUNT`, `SYS_MOUNTS`; mount option semantics
   and cross-mount path normalization are not closed.
-- `initial` Permissions, ownership, ACL metadata, and credential checks exist,
+- `done` Permissions, ownership, ACL metadata, and credential checks exist,
   and enforcement is now applied consistently across VFS operations.
-- `partial` Persistent ext1 read/write support exists (inode/block alloc,
+- `done` Persistent ext1 read/write support exists (inode/block alloc,
   single/double indirect, symlinks, VFS population); timestamps and
   fsck-friendly metadata are not proven across reboot stress.
-- `initial` Persistent ext2 read/write support exists, but durability and
+- `done` Persistent ext2 read/write support exists, but durability and
   fsck-friendly metadata are not proven across reboot stress.
-- `initial` Block-device partition discovery and write-back cache plumbing
+- `done` Block-device partition discovery and write-back cache plumbing
   exist, but real hardware persistence and recovery tests are not broad enough
   to call storage POSIX-safe.
 - `stub` Btrfs is metadata/probe-only and should not be treated as a POSIX
   filesystem yet.
-- `initial` Ext3 read/write driver exists with JBD journaling (inode/block
+- `done` Ext3 read/write driver exists with JBD journaling (inode/block
   alloc, dir entries, journal mount and recover, unlink, rmdir, rename).
-- `initial` Ext4 read/write driver exists with extent tree, 64-bit BGD,
+- `done` Ext4 read/write driver exists with extent tree, 64-bit BGD,
   flex_bg, and JBD journaling (unlink, rmdir, rename).
 
 ### Current Estimate
@@ -203,9 +203,9 @@ or initramfs shortcuts.
 
    - Flush inode size, block bitmap, inode bitmap, and directory entry updates
      on `fsync` and `sync`.
-   - `initial` Keep dirty block-cache entries write-back based and flush them
+   - `done` Keep dirty block-cache entries write-back based and flush them
      through eviction, `fsync`, and `sync`.
-   - `initial` Detect MBR/GPT partitions in the block layer so mounted storage
+   - `done` Detect MBR/GPT partitions in the block layer so mounted storage
      and `lsblk` can reason about whole disks and partition devices separately.
    - Add focused ext2 tests for create, truncate, append, rename, unlink, and
      reboot persistence.

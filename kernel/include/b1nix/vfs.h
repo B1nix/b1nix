@@ -7,6 +7,7 @@
 #include <b1nix/posix.h>
 
 #define VFS_MAX_PATH 256
+#define MS_RDONLY 1
 
 /* Standard permission bits */
 #define VFS_IRUSR  0400    /* Owner read */

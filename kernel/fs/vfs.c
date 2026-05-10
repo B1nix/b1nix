@@ -41,6 +41,37 @@ static int split_parent_path(const char *path, char *parent_path, char *name);
 
 static struct vfs_fs *filesystems = NULL;
 
+struct vfs_mount_entry {
+  int used;
+  char source[VFS_MAX_PATH];
+  char target[VFS_MAX_PATH];
+  char fstype[16];
+  u64 flags;
+  struct vfs_node *root_node;
+  struct vfs_node *mount_point;
+};
+static struct vfs_mount_entry mounts[MAX_MOUNTS];
+
+static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
+  if (!node)
+    return 0;
+  struct vfs_node *curr = node;
+  while (curr) {
+    for (int i = 0; i < MAX_MOUNTS; i++) {
+      if (mounts[i].used && curr == mounts[i].root_node) {
+        return &mounts[i];
+      }
+    }
+    curr = curr->parent;
+  }
+  for (int i = 0; i < MAX_MOUNTS; i++) {
+    if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
+      return &mounts[i];
+    }
+  }
+  return 0;
+}
+
 void vfs_register_fs(struct vfs_fs *fs) {
   fs->next = filesystems;
   filesystems = fs;
@@ -315,16 +346,6 @@ static void vfs_update_times(struct vfs_inode *inode, u32 mask) {
 
 static u64 next_ino = 1;
 
-struct vfs_mount_entry {
-  int used;
-  char source[VFS_MAX_PATH];
-  char target[VFS_MAX_PATH];
-  char fstype[16];
-  u64 flags;
-  struct vfs_node *root_node;
-  struct vfs_node *mount_point;
-};
-static struct vfs_mount_entry mounts[MAX_MOUNTS];
 static usize node_count = 0;
 static struct vfs_node *root_node = 0;
 static struct b1nix_termios tty_termios;
@@ -1173,12 +1194,6 @@ void vfs_init(void) {
   add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
 
-  for (usize i = 0; i < initramfs_count(); i++) {
-    const struct initramfs_file *file = initramfs_get(i);
-    vfs_add_node(file->path, VFS_FILE, (void *)file->data, file->size,
-                 file->flags);
-  }
-
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
   vfs_create("/tmp/hello", "tmpfs says hello\n");
@@ -1439,6 +1454,11 @@ isize vfs_write(int fd, const char *buf, usize size) {
   struct vfs_handle *h = get_handle(fd);
   if (!h || !h->ops || !h->ops->write)
     return -EBADF;
+
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+
   return h->ops->write(h, buf, size);
 }
 
@@ -1738,15 +1758,7 @@ int vfs_statfs(const char *path, struct b1nix_statfs *st) {
   if (node->inode->statfs_cb) {
     res = node->inode->statfs_cb(node, st);
   } else {
-    memset(st, 0, sizeof(*st));
-    st->f_type = 0x1337;
-    st->f_bsize = 4096;
-    st->f_blocks = 1024 * 1024;
-    st->f_bfree = 512 * 1024;
-    st->f_bavail = 512 * 1024;
-    st->f_files = 10000;
-    st->f_ffree = 9000;
-    st->f_namelen = 255;
+    res = -ENOSYS;
   }
   vfs_node_put(node);
   return res;
@@ -2266,12 +2278,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 
   struct vfs_node *target_node = vfs_find_node(target);
   if (IS_ERR(target_node)) {
-    // Some early boot logic might rely on this, but standard POSIX mount fails
-    // if target doesn't exist. We'll keep it for now but maybe log it.
-    int err = vfs_mkdir(target);
-    if (err != 0)
-      return err;
-    target_node = vfs_find_node(target);
+    return (int)PTR_ERR(target_node);
   }
   if (IS_ERR(target_node))
     return (int)PTR_ERR(target_node);
@@ -2649,25 +2656,6 @@ int vfs_fchown(int fd, u16 uid, u16 gid) {
   return 0;
 }
 
-static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
-  if (!node)
-    return 0;
-  struct vfs_node *curr = node;
-  while (curr) {
-    for (int i = 0; i < MAX_MOUNTS; i++) {
-      if (mounts[i].used && curr == mounts[i].root_node) {
-        return &mounts[i];
-      }
-    }
-    curr = curr->parent;
-  }
-  for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
-      return &mounts[i];
-    }
-  }
-  return 0;
-}
 
 int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   struct vfs_handle *handle = get_handle(fd);
@@ -2679,32 +2667,7 @@ int vfs_fstatfs(int fd, struct b1nix_statfs *st) {
   if (handle->node->inode->statfs_cb)
     return handle->node->inode->statfs_cb(handle->node, st);
 
-  memset(st, 0, sizeof(*st));
-  st->f_bsize = 4096;
-  st->f_blocks = 1024 * 1024;
-  st->f_bfree = 512 * 1024;
-  st->f_bavail = 512 * 1024;
-  st->f_files = 10000;
-  st->f_ffree = 9000;
-  st->f_namelen = 255;
-
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(handle->node);
-  if (mnt) {
-    if (strcmp(mnt->fstype, "initramfs") == 0)
-      st->f_type = 0x01021994;
-    else if (strcmp(mnt->fstype, "ext2") == 0)
-      st->f_type = 0xEF53;
-    else if (strcmp(mnt->fstype, "ext3") == 0)
-      st->f_type = 0xEF53;
-    else if (strcmp(mnt->fstype, "ext4") == 0)
-      st->f_type = 0xEF53;
-    else if (strcmp(mnt->fstype, "fat32") == 0)
-      st->f_type = 0x4D44;
-  } else {
-    st->f_type = 0x1337;
-  }
-
-  return 0;
+  return -ENOSYS;
 }
 
 int vfs_syncfs(int fd) {

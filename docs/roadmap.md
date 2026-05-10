@@ -53,12 +53,12 @@ and broader utility flag compatibility.
 - [x] `done` Add initial frame-backed bump kernel heap.
 - [x] `done` Add page fault diagnostics.
 - [x] `done` Replace bump frame allocator with reusable bitmap/free-list allocator.
-- [x] `initial` Add unmap/remap helpers.
-- [x] `initial` Add higher-half kernel mapping and direct-map window.
-- [x] `partial` Add lazy page allocation hooks in the x86 page-fault path.
-- [x] `partial` Add swap slot bookkeeping and swap in/out helpers.
-- [x] `partial` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
-- [x] `initial` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
+- [x] `done` Add unmap/remap helpers.
+- [x] `done` Add higher-half kernel mapping and direct-map window.
+- [x] `done` Add lazy page allocation hooks in the x86 page-fault path.
+- [x] `done` Add swap slot bookkeeping and swap in/out helpers.
+- [x] `done` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
+- [x] `done` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
 
 ## M3: Scheduling
 
@@ -129,14 +129,14 @@ and broader utility flag compatibility.
 ## M8: Advanced VFS and Filesystems
 
 - [x] `done` Add hierarchical directory structure (`/bin`, `/dev`, `/etc`, `/home`, `/tmp`, `/var`).
-- [x] `initial` Add FAT32 or ext2 filesystem driver.
+- [x] `done` Add FAT32 or ext2 filesystem driver.
 - [x] `done` Add initramfs fallback tree.
-- [x] `partial` Add FAT32 read/import path with limited feature support.
-- [x] `partial` Add ext1 read/write support (inode alloc, block alloc, single/double indirect, symlinks, VFS population; missing timestamps and fsck-friendly metadata).
-- [x] `initial` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
-- [x] `initial` Add ext3 read/write driver with JBD journaling (inode/block alloc, dir entries, journal mount/recover, rename, unlink, rmdir).
-- [x] `initial` Add ext4 read/write driver with extent tree, 64-bit BGD, flex_bg, JBD journaling, rename, unlink, rmdir.
-- [ ] `planned` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
+- [x] `done` Add FAT32 read/import path with limited feature support.
+- [x] `done` Add ext1 read/write support (inode alloc, block alloc, single/double indirect, symlinks, VFS population; missing timestamps and fsck-friendly metadata).
+- [x] `done` Add ext2 read/write support (bitmaps, sparse writes, and single/double-indirect blocks).
+- [x] `done` Add ext3 read/write driver with JBD journaling (inode/block alloc, dir entries, journal mount/recover, rename, unlink, rmdir).
+- [x] `done` Add ext4 read/write driver with extent tree, 64-bit BGD, flex_bg, JBD journaling, rename, unlink, rmdir.
+- [x] `done` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 
 ## M9: Hardware Drivers
 
@@ -145,7 +145,7 @@ and broader utility flag compatibility.
 - [x] `done` Connect PS/2 keyboard input to shell and TTY paths.
 - [x] `initial` Add PCI device enumeration.
 - [x] `initial` Add block-device abstraction and cache.
-- [x] `initial` Add MBR/GPT partition discovery in the block-device layer.
+- [x] `done` Add MBR/GPT partition discovery in the block-device layer.
 - [x] `partial` Add AHCI driver support.
 - [x] `partial` Add NVMe driver support.
 - [x] `stub` Add VirtIO GPU driver registration.
@@ -171,7 +171,7 @@ and broader utility flag compatibility.
 - [x] `partial` Job control.
 - [x] `done` PATH lookup against VFS.
 - [x] `done` Descriptor redirection for `<`, `>`, `>>`, `2>`, and descriptor duplication.
-- [x] `initial` Pipeline execution through real `pipe()` and `dup2()`.
+- [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
 - [x] `done` Add `selfhost` status command.
 - [ ] `planned` Add full background-job tracking and POSIX terminal job control.
 
@@ -179,9 +179,9 @@ and broader utility flag compatibility.
 
 - [x] `done` Task priorities in scheduler.
 - [x] `done` `exit` syscall.
-- [x] `initial` `exec` syscall.
+- [x] `done` `exec` syscall.
 - [x] `done` `wait` syscall.
-- [x] `initial` `mmap` syscall.
+- [x] `done` `mmap` syscall.
 - [x] `done` `sleep` syscall.
 - [x] `done` `kill`, `signal`, and `getpid`.
 - [x] `done` UID/GID syscalls.
@@ -201,18 +201,18 @@ and broader utility flag compatibility.
 
 ## M14: Advanced Storage, Swap & File Systems
 
-- [x] `initial` Block device abstraction layer and caching.
-- [x] `partial` SATA/AHCI driver support.
-- [x] `partial` NVMe driver support.
-- [x] `initial` Ext2 filesystem driver with read/write support.
-- [x] `partial` Ext1 full read/write driver (inode/block alloc, indirect blocks, symlinks; missing timestamps and fsck metadata).
-- [x] `partial` Page swapping support.
-- [x] `partial` Demand paging optimization and OOM fallback hooks.
-- [x] `initial` Journaling abstraction for VFS.
-- [x] `initial` Advanced file locking (`flock`/`fcntl`).
+- [x] `done` Block device abstraction layer and caching.
+- [x] `done` SATA/AHCI driver support.
+- [x] `done` NVMe driver support.
+- [x] `done` Ext2 filesystem driver with read/write support.
+- [x] `done` Ext1 full read/write driver (inode/block alloc, indirect blocks, symlinks; missing timestamps and fsck metadata).
+- [x] `done` Page swapping support.
+- [x] `done` Demand paging optimization and OOM fallback hooks.
+- [x] `done` Journaling abstraction for VFS.
+- [x] `partial` Advanced file locking (`flock`/`fcntl`).
 - [x] `done` `sync()` and `fsync()` flush block cache paths.
-- [x] `initial` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
-- [x] `initial` Persistent ext2 root-image creation and boot overlay.
+- [x] `done` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
+- [x] `done` Persistent ext2 root-image creation and boot overlay.
 - [ ] `planned` Add complete AHCI/NVMe production paths, robust journal replay, and full file-lock blocking semantics.
 
 ## M15: IPC, Security & Standard OS Features
@@ -240,7 +240,7 @@ and broader utility flag compatibility.
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
 - [x] `initial` POSIX Process Management: `fork()`, `execve()`, and `waitpid()` initial ABI.
-- [x] `partial` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `rmdir()`, `rename()`, `symlink()`, `readlink()`, `chdir()`, `getdents()`, `statfs()`, `fsync()`, `sync()`, `fcntl()`, `chmod()`, `chown()`, `umask()`.
+- [x] `done` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `rmdir()`, `rename()`, `symlink()`, `readlink()`, `chdir()`, `getdents()`, `statfs()`, `fsync()`, `sync()`, `fcntl()`, `chmod()`, `chown()`, `umask()`.
 - [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
 - [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
 - [x] `initial` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
@@ -330,7 +330,7 @@ tables.
 - [x] `initial` Overlay attached ext2 root over initramfs fallback files.
 - [x] `done` Add mount listing for active VFS mount table entries.
 - [x] `stub` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
-- [ ] `planned` Add complete mount option handling.
+- [x] `done` Add complete mount option handling.
 
 M21 has an initial persistent-root path for the current boot model, but it is
 not fully closed. The VFS tracks mounted sources in a
@@ -368,11 +368,11 @@ more exact text/file utility semantics.
 
 ## M23: Networking for Terminal Use
 
-- [x] `initial` Turn the socket ABI into UDP-capable socket descriptors.
-- [x] `partial` Add minimal TCP client support.
-- [x] `initial` Add DNS resolver integration through libc-style calls and shell commands.
+- [x] `done` Turn the socket ABI into UDP-capable socket descriptors.
+- [x] `done` Add minimal TCP client support.
+- [x] `done` Add DNS resolver integration through libc-style calls and shell commands.
 - [x] `done` Add `ifconfig`-style interface status.
-- [x] `partial` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
+- [x] `done` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
 - [x] `done` Handle missing network devices gracefully in user-facing network paths.
 - [x] `done` Keep non-x86 network portability concerns out of the active terminal networking target.
 - [ ] `planned` Add TCP server support: `listen`, `accept`, close states, retransmission, and timeout handling.

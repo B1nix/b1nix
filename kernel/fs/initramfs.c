@@ -1,5 +1,8 @@
 #include <b1nix/console.h>
 #include <b1nix/initramfs.h>
+#include <b1nix/vfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/errno.h>
 #include <string.h>
 
 #include "../../build/x86/initramfs_native_smoke.inc"
@@ -81,7 +84,51 @@ static const struct initramfs_file files[] = {
     {"/README", "initramfs is alive\n", 20, 0},
 };
 
+static int initramfs_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
+    (void)node;
+    memset(st, 0, sizeof(*st));
+    st->f_type = 0x858458f6;
+    st->f_bsize = 4096;
+    
+    usize total_size = 0;
+    for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
+        total_size += files[i].size;
+    }
+    
+    st->f_blocks = (total_size + 4095) / 4096;
+    if (st->f_blocks == 0) st->f_blocks = 1;
+    st->f_bfree = 0;
+    st->f_bavail = 0;
+    st->f_files = (sizeof(files) / sizeof(files[0]));
+    st->f_ffree = 0;
+    st->f_namelen = 64;
+    return 0;
+}
+
+static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags, void *data) {
+    (void)source; (void)flags; (void)data;
+    struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
+    if (!root) return ERR_PTR(-ENOMEM);
+    
+    root->inode->statfs_cb = initramfs_vfs_statfs;
+    
+    for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
+        struct vfs_node *node = vfs_add_node(files[i].path, VFS_FILE, (void *)files[i].data, files[i].size, files[i].flags);
+        if (node) {
+            node->inode->statfs_cb = initramfs_vfs_statfs;
+        }
+    }
+    
+    return root;
+}
+
+static struct vfs_fs initramfs_fs = {
+    .name = "initramfs",
+    .mount = initramfs_mount_cb,
+};
+
 void initramfs_init(void) {
+  vfs_register_fs(&initramfs_fs);
   console_write("initramfs: files 0x");
   console_write_hex64(initramfs_count());
   console_write("\n");

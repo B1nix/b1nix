@@ -621,6 +621,64 @@ static int ext2_add_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, u32 inode_n
 	return -1;
 }
 
+static u32 ext2_find_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const char *name, u8 *out_type) {
+  struct ext2_inode dir_inode;
+  if (ext2_read_inode(fs, dir_inode_num, &dir_inode) < 0) return 0;
+  
+  u8 *dir_buf = kmalloc(fs->block_size);
+  if (!dir_buf) return 0;
+  u32 blocks = (dir_inode.i_size + fs->block_size - 1) / fs->block_size;
+  for (u32 b = 0; b < blocks; b++) {
+    u32 phys_block = ext2_get_inode_block(fs, &dir_inode, b);
+    if (!phys_block) continue;
+    ext2_read_block(fs, phys_block, dir_buf);
+    usize offset = 0;
+    while (offset < fs->block_size) {
+      struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
+      if (entry->rec_len == 0) break;
+      if (entry->inode != 0 && strlen(name) == entry->name_len &&
+          memcmp(entry->name, name, entry->name_len) == 0) {
+        u32 ino = entry->inode;
+        if (out_type) *out_type = entry->file_type;
+        kfree(dir_buf);
+        return ino;
+      }
+      offset += entry->rec_len;
+    }
+  }
+  kfree(dir_buf);
+  return 0;
+}
+
+static int ext2_is_dir_empty(struct ext2_fs *fs, u32 inode_num) {
+    struct ext2_inode inode;
+    if (ext2_read_inode(fs, inode_num, &inode) < 0) return -EIO;
+    
+    u8 *buf = kmalloc(fs->block_size);
+    if (!buf) return -ENOMEM;
+    u32 blocks = (inode.i_size + fs->block_size - 1) / fs->block_size;
+    for (u32 b = 0; b < blocks; b++) {
+        u32 phys = ext2_get_inode_block(fs, &inode, b);
+        if (!phys) continue;
+        ext2_read_block(fs, phys, buf);
+        usize offset = 0;
+        while (offset < fs->block_size) {
+            struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(buf + offset);
+            if (entry->rec_len == 0) break;
+            if (entry->inode != 0) {
+                if (entry->name_len > 2 || (entry->name_len == 1 && entry->name[0] != '.') ||
+                    (entry->name_len == 2 && (entry->name[0] != '.' || entry->name[1] != '.'))) {
+                    kfree(buf);
+                    return 0; // Not empty
+                }
+            }
+            offset += entry->rec_len;
+        }
+    }
+    kfree(buf);
+    return 1; // Empty
+}
+
 static int ext2_remove_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const char *name) {
   struct ext2_inode dir_inode;
   if (ext2_read_inode(fs, dir_inode_num, &dir_inode) < 0) return -1;
@@ -704,28 +762,7 @@ static int ext2_vfs_unlink(struct vfs_node *dir, const char *name) {
   struct ext2_inode dir_inode;
   if (ext2_read_inode(fs, dir_inode_num, &dir_inode) < 0) return -EIO;
 
-  /* Find target inode number */
-  u32 inode_num = 0;
-  u8 *dir_buf = kmalloc(fs->block_size);
-  u32 blocks = (dir_inode.i_size + fs->block_size - 1) / fs->block_size;
-  for (u32 b = 0; b < blocks; b++) {
-    u32 phys_block = ext2_get_inode_block(fs, &dir_inode, b);
-    if (!phys_block) continue;
-    ext2_read_block(fs, phys_block, dir_buf);
-    usize offset = 0;
-    while (offset < fs->block_size) {
-      struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
-      if (entry->rec_len == 0) break;
-      if (entry->inode != 0 && strlen(name) == entry->name_len &&
-          memcmp(entry->name, name, entry->name_len) == 0) {
-        inode_num = entry->inode;
-        break;
-      }
-      offset += entry->rec_len;
-    }
-    if (inode_num) break;
-  }
-  kfree(dir_buf);
+  u32 inode_num = ext2_find_dir_entry(fs, dir_inode_num, name, NULL);
   if (!inode_num) return -ENOENT;
 
   /* Remove directory entry */
@@ -885,13 +922,19 @@ static int ext2_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
 }
 
 static int ext2_vfs_rmdir(struct vfs_node *dir, const char *name) {
-  /* For simplicity, we use unlink for rmdir but also decrement parent link count */
-  /* Real ext2 rmdir would check if directory is empty */
   struct ext2_fs *fs = get_fs(dir);
+  u32 dir_inode_num = get_ino(dir);
+  
+  u8 type = 0;
+  u32 target_inode_num = ext2_find_dir_entry(fs, dir_inode_num, name, &type);
+  if (!target_inode_num) return -ENOENT;
+  if (type != EXT2_FT_DIR) return -ENOTDIR;
+
+  if (!ext2_is_dir_empty(fs, target_inode_num)) return -ENOTEMPTY;
+
   int err = ext2_vfs_unlink(dir, name);
   if (err == 0) {
     struct ext2_inode dir_inode;
-    u32 dir_inode_num = get_ino(dir);
     if (ext2_read_inode(fs, dir_inode_num, &dir_inode) == 0) {
       if (dir_inode.i_links_count > 2) {
         dir_inode.i_links_count--;
@@ -904,39 +947,27 @@ static int ext2_vfs_rmdir(struct vfs_node *dir, const char *name) {
 
 static int ext2_vfs_rename(struct vfs_node *old_dir, const char *old_name,
                             struct vfs_node *new_dir, const char *new_name) {
-  /* Simplified rename: add new entry, then remove old entry */
-  /* This doesn't handle the case where target inode needs to be unlinked if it exists */
   u32 old_dir_inode_num = get_ino(old_dir);
+  u32 new_dir_inode_num = get_ino(new_dir);
   struct ext2_fs *fs = get_fs(old_dir);
-  struct ext2_inode old_dir_inode;
-  ext2_read_inode(fs, old_dir_inode_num, &old_dir_inode);
   
-  u32 inode_num = 0;
   u8 type = 0;
-  u8 *dir_buf = kmalloc(fs->block_size);
-  u32 blocks = (old_dir_inode.i_size + fs->block_size - 1) / fs->block_size;
-  for (u32 b = 0; b < blocks; b++) {
-    u32 phys_block = ext2_get_inode_block(fs, &old_dir_inode, b);
-    if (!phys_block) continue;
-    ext2_read_block(fs, phys_block, dir_buf);
-    usize offset = 0;
-    while (offset < fs->block_size) {
-      struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
-      if (entry->rec_len == 0) break;
-      if (entry->inode != 0 && strlen(old_name) == entry->name_len &&
-          memcmp(entry->name, old_name, entry->name_len) == 0) {
-        inode_num = entry->inode;
-        type = entry->file_type;
-        break;
-      }
-      offset += entry->rec_len;
-    }
-    if (inode_num) break;
-  }
-  kfree(dir_buf);
+  u32 inode_num = ext2_find_dir_entry(fs, old_dir_inode_num, old_name, &type);
   if (!inode_num) return -ENOENT;
+
+  /* Check if target exists */
+  u8 target_type = 0;
+  u32 target_ino = ext2_find_dir_entry(fs, new_dir_inode_num, new_name, &target_type);
+  if (target_ino) {
+      if (target_type == EXT2_FT_DIR) {
+          if (!ext2_is_dir_empty(fs, target_ino)) return -ENOTEMPTY;
+          ext2_vfs_rmdir(new_dir, new_name);
+      } else {
+          ext2_vfs_unlink(new_dir, new_name);
+      }
+  }
  
-  if (ext2_add_dir_entry(fs, get_ino(new_dir), inode_num, new_name, type) < 0)
+  if (ext2_add_dir_entry(fs, new_dir_inode_num, inode_num, new_name, type) < 0)
     return -EIO;
   
   ext2_remove_dir_entry(fs, old_dir_inode_num, old_name);
