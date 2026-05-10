@@ -47,9 +47,11 @@ struct acl_entry {
 struct vfs_node;
 
 struct vfs_inode {
+	u64 ino;
 	enum vfs_node_type type;
 	u32 flags;
-	volatile int lock; /* Per-inode spinlock for data I/O */
+	volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
+	usize waiter_tid;     /* Task ID waiting for this inode lock (0 if none) */
 	int refcount;   /* Internal references (e.g. open handles) */
 	int nlink;      /* Number of hard links (names pointing to this inode) */
 	usize size;
@@ -88,6 +90,7 @@ struct vfs_inode {
 	int (*setattr_cb)(struct vfs_node *node);
 	int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
 	int (*fsync_cb)(struct vfs_node *node);
+	int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
 };
 
 struct vfs_node {
@@ -101,18 +104,28 @@ struct vfs_node {
 	struct vfs_node *next_sibling;
 };
 
+struct vfs_fs {
+	const char *name;
+	struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
+	struct vfs_fs *next;
+};
+
 u32 vfs_get_unix_time(void);
 void vfs_init(void);
 void vfs_resolve_path(const char *path, char *out);
 struct vfs_node *vfs_find_node(const char *path);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
+struct vfs_node *vfs_node_get(struct vfs_node *node);
+void vfs_node_put(struct vfs_node *node);
+struct vfs_node *vfs_create_node(enum vfs_node_type type);
 
 /* Permission-aware operations */
 int vfs_open(const char *path);
 int vfs_open_flags(const char *path, int flags);
 isize vfs_read(int handle, char *buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
+int vfs_poll(int handle_idx, struct b1nix_pollfd *pfd);
 void vfs_close(int handle);
 int vfs_create(const char *path, const char *data);
 int vfs_mkdir(const char *path);
@@ -133,6 +146,7 @@ int vfs_fsync(int fd);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
+void vfs_register_fs(struct vfs_fs *fs);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
@@ -160,5 +174,94 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl);
 int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
                 int max_entries);
+
+enum vfs_handle_kind {
+	VFS_HANDLE_NONE = 0,
+	VFS_HANDLE_NODE,
+	VFS_HANDLE_PIPE_READ,
+	VFS_HANDLE_PIPE_WRITE,
+	VFS_HANDLE_SOCKET
+};
+
+struct vfs_handle;
+
+struct vfs_file_ops {
+	isize (*read)(struct vfs_handle *h, char *buf, usize len);
+	isize (*write)(struct vfs_handle *h, const char *buf, usize len);
+	int (*poll)(struct vfs_handle *h, struct b1nix_pollfd *pfd);
+	isize (*lseek)(struct vfs_handle *h, isize offset, int whence);
+	int (*close)(struct vfs_handle *h);
+	void (*release)(struct vfs_handle *h);
+	int (*getdents)(struct vfs_handle *h, struct dirent *buf, usize max_entries);
+	int (*ioctl)(struct vfs_handle *h, u64 request, void *arg);
+};
+
+#define MAX_VFS_NODES 4096
+#define MAX_VFS_HANDLES 512
+#define MAX_VFS_PIPES 64
+#define MAX_MOUNTS 16
+#define PIPE_BUFFER_SIZE 512
+#define TTY_INPUT_SIZE 256
+
+struct vfs_pipe {
+  int used;
+  char buffer[PIPE_BUFFER_SIZE];
+  usize size;
+  usize read_pos;
+  usize write_pos;
+  int readers;
+  int writers;
+  volatile int lock;
+};
+
+struct vfs_socket_state {
+  int domain;
+  int type;
+  int protocol;
+  struct b1nix_sockaddr_in local;
+  struct b1nix_sockaddr_in peer;
+  int bound;
+  int connected;
+  void *tcp_conn;
+  char recv_buf[2048];
+  usize recv_len;
+};
+
+struct vfs_handle {
+	int used;
+	int refcount;
+	enum vfs_handle_kind kind;
+	struct vfs_node *node;
+	usize offset;
+	void *private_data; /* Used for pipe, socket, etc. */
+	const struct vfs_file_ops *ops;
+	int flags;
+};
+
+/* Internal handle management for subsystems */
+int alloc_raw_handle(enum vfs_handle_kind kind);
+struct vfs_handle *get_handle_by_idx(int idx);
+void release_handle(int idx);
+
+
+extern const struct vfs_file_ops node_file_ops;
+extern const struct vfs_file_ops pipe_read_ops;
+extern const struct vfs_file_ops pipe_write_ops;
+extern const struct vfs_file_ops socket_file_ops;
+
+struct vfs_pipe;
+struct vfs_socket_state;
+
+/* Internal handle initialization helpers (called from subsystems) */
+void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_write);
+void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state);
+
+/* SLAB-style allocator for VFS structures (Phase 4) */
+struct vfs_node *vfs_alloc_node(void);
+void vfs_free_node(struct vfs_node *node);
+struct vfs_inode *vfs_alloc_inode(void);
+void vfs_free_inode(struct vfs_inode *inode);
+struct vfs_handle *vfs_alloc_handle(void);
+void vfs_free_handle(struct vfs_handle *handle);
 
 #endif

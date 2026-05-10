@@ -113,7 +113,8 @@ void kernel_main(u64 arg0, u64 arg1)
 	console_write("Step 11: Drivers initialized\n");
 
 	userspace_init();
-	user_spawn("/bin/init", 0, 0);
+	int init_pid = user_spawn("/bin/init", 0, 0);
+	console_write("init spawn result: "); console_write_dec(init_pid); console_write("\n");
 
 	while (scheduler_task_count() > 1) {
 		scheduler_yield();

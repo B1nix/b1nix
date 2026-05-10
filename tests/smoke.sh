@@ -47,27 +47,17 @@ run_qemu() {
 			>"$log" 2>&1 &
 		pid=$!
 		
-		# Poll for completion marker or QEMU exit
-		local count=0
-		local max_wait=$((TIMEOUT * 10)) # 0.1s steps
-		while [ $count -lt $max_wait ]; do
-			if grep -q "POSIX-SMOKE: done" "$log" 2>/dev/null; then
-				# Found marker, wait a bit for final flush
-				sleep 0.5
-				break
-			fi
-			if ! kill -0 "$pid" 2>/dev/null; then
-				# QEMU exited (likely via isa-debug-exit)
-				break
-			fi
-			sleep 0.1
-			count=$((count + 1))
-		done
-		
-		kill "$pid" 2>/dev/null || true
+		# Watchdog to kill QEMU if it hangs
+		( sleep $TIMEOUT ; kill -9 $pid 2>/dev/null ) &
+		local watchdog_pid=$!
+
+		# Wait for QEMU to exit (via isa-debug-exit or crash)
 		wait "$pid" 2>/dev/null || true
+		
+		# Kill watchdog if it's still running
+		kill "$watchdog_pid" 2>/dev/null || true
 	else
-		echo "Unknown ARCH: $ARCH (AArch64 is archived)"
+		echo "Unknown ARCH: $ARCH"
 		exit 1
 	fi
 }

@@ -45,6 +45,8 @@ KERNEL_SOURCES := \
 	kernel/syscall/syscall.c \
 	kernel/fs/initramfs.c \
 	kernel/fs/vfs.c \
+	kernel/fs/vfs_slab.c \
+	kernel/fs/pipe.c \
 	kernel/fs/fat32.c \
 	kernel/fs/ext2.c \
 	kernel/fs/ext1.c \
@@ -79,6 +81,7 @@ KERNEL_SOURCES += \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
 	kernel/net/net.c \
+	kernel/net/socket.c \
 	kernel/net/ethernet.c \
 	kernel/net/arp.c \
 	kernel/net/ipv4.c \

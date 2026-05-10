@@ -87,12 +87,12 @@ static u64 sys_list(const char *dir_path) {
   return count;
 }
 
-static u64 sys_read_file(const char *path) {
-  const struct initramfs_file *file = initramfs_find(path);
-
-  if (file == 0) {
-    return (u64)-ENOENT;
-  }
+static u64 sys_read_file(const char *user_path) {
+  char kpath[VFS_MAX_PATH];
+  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
+  
+  const struct initramfs_file *file = initramfs_find(kpath);
+  if (file == 0) return (u64)-ENOENT;
 
   console_write(file->data);
   return file->size;
@@ -107,46 +107,46 @@ static u64 sys_read_kbd(void) {
 }
 #endif
 
-static u64 sys_readdir(const char *dir_path, struct dirent *buf,
+static u64 sys_readdir(const char *user_dir_path, struct dirent *user_buf,
                        usize max_entries) {
-  const char *names[128];
-  isize count = vfs_list(dir_path, names, 128);
-  if (count < 0)
-    return (u64)count;
-  usize out_count = (usize)count;
-  if (out_count > max_entries)
-    out_count = max_entries;
+  char kdir_path[VFS_MAX_PATH];
+  if (syscall_copyinstr(kdir_path, VFS_MAX_PATH, user_dir_path) < 0) return -EFAULT;
 
+  const char *names[128];
+  isize count = vfs_list(kdir_path, names, 128);
+  if (count < 0) return (u64)count;
+  
+  usize out_count = (usize)count;
+  if (out_count > max_entries) out_count = max_entries;
+  if (out_count > 32) out_count = 32; // Limit to avoid stack overflow
+
+  struct dirent kbuf[32];
   for (usize i = 0; i < out_count; i++) {
     usize len = strlen(names[i]);
-    if (len > 63)
-      len = 63;
-    memcpy(buf[i].name, names[i], len);
-    buf[i].name[len] = '\0';
+    if (len > 63) len = 63;
+    memcpy(kbuf[i].name, names[i], len);
+    kbuf[i].name[len] = '\0';
 
-    /* Try to get more info by resolving the path */
     char full_path[256];
-    usize dirlen = strlen(dir_path);
-    memcpy(full_path, dir_path, dirlen);
-    if (dirlen > 0 && full_path[dirlen - 1] != '/') {
-      full_path[dirlen++] = '/';
-    }
+    usize dirlen = strlen(kdir_path);
+    memcpy(full_path, kdir_path, dirlen);
+    if (dirlen > 0 && full_path[dirlen - 1] != '/') full_path[dirlen++] = '/';
     memcpy(full_path + dirlen, names[i], len + 1);
 
     struct vfs_node *node = vfs_find_node(full_path);
     if (!IS_ERR(node)) {
-      buf[i].type = (u32)node->inode->type;
-      buf[i].is_dir = (node->inode->type == VFS_DIRECTORY) ? 1 : 0;
-      buf[i].is_exec = (node->inode->mode & 0111) ? 1 : 0;
-      buf[i].size = node->inode->size;
+      kbuf[i].type = (u32)node->inode->type;
+      kbuf[i].is_dir = (node->inode->type == VFS_DIRECTORY) ? 1 : 0;
+      kbuf[i].is_exec = (node->inode->mode & 0111) ? 1 : 0;
+      kbuf[i].size = node->inode->size;
+      vfs_node_put(node);
     } else {
-      buf[i].type = 0;
-      buf[i].is_dir = 0;
-      buf[i].is_exec = 0;
-      buf[i].size = 0;
+      memset(&kbuf[i], 0, sizeof(struct dirent));
+      memcpy(kbuf[i].name, names[i], len);
     }
   }
 
+  if (syscall_copyout(user_buf, kbuf, out_count * sizeof(struct dirent)) < 0) return -EFAULT;
   return out_count;
 }
 
@@ -165,12 +165,34 @@ static void copy_cstr(char *dst, usize dst_size, const char *src) {
   dst[len] = '\0';
 }
 
-static u64 sys_execve(const char *path, const char **argv, const char **envp) {
+static u64 sys_execve(const char *user_path, const char **user_argv, const char **user_envp) {
+  char kpath[VFS_MAX_PATH];
+  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return (u64)-EFAULT;
+
+  /* For now, we only support a small number of arguments in kernel-space buffer */
+  char *kargv[32];
+  memset(kargv, 0, sizeof(kargv));
+  if (user_argv) {
+    for (int i = 0; i < 31; i++) {
+      const char *user_arg;
+      if (syscall_copyin(&user_arg, &user_argv[i], sizeof(char*)) < 0) break;
+      if (!user_arg) break;
+      char *karg = kmalloc(256);
+      if (syscall_copyinstr(karg, 256, user_arg) < 0) { kfree(karg); break; }
+      kargv[i] = karg;
+    }
+  }
+
   char kernel_path[VFS_MAX_PATH];
-  vfs_resolve_path(path, kernel_path);
-  if (kernel_path[0] == '\0')
+  vfs_resolve_path(kpath, kernel_path);
+  if (kernel_path[0] == '\0') {
+    for (int i = 0; kargv[i]; i++) kfree(kargv[i]);
     return (u64)-ENOENT;
-  return (u64)user_execve_current(kernel_path, argv, envp);
+  }
+
+  u64 res = (u64)user_execve_current(kernel_path, (const char**)kargv, user_envp);
+  for (int i = 0; kargv[i]; i++) kfree(kargv[i]);
+  return res;
 }
 
 static u64 sys_ioctl(int fd, u64 request, void *arg) {
@@ -299,6 +321,40 @@ static isize sys_fstatfs(int fd, struct b1nix_statfs *buf) {
 
 static isize sys_sync(void) { return vfs_sync(); }
 
+static isize sys_lstat(const char *user_path, struct b1nix_stat *user_st) {
+  char kpath[VFS_MAX_PATH];
+  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
+  struct b1nix_stat kst;
+  int res = vfs_lstat(kpath, &kst);
+  if (res == 0) {
+    if (syscall_copyout(user_st, &kst, sizeof(struct b1nix_stat)) < 0) return -EFAULT;
+  }
+  return res;
+}
+
+static isize sys_create(const char *user_path, const char *user_data) {
+  char kpath[VFS_MAX_PATH];
+  if (syscall_copyinstr(kpath, VFS_MAX_PATH, user_path) < 0) return -EFAULT;
+  char *kdata = 0;
+  if (user_data) {
+    kdata = kmalloc(4096);
+    if (syscall_copyinstr(kdata, 4096, user_data) < 0) { kfree(kdata); return -EFAULT; }
+  }
+  int res = vfs_create(kpath, kdata);
+  if (kdata) kfree(kdata);
+  return res;
+}
+
+static isize sys_getdents(int fd, struct dirent *user_buf, usize max_entries) {
+  if (max_entries > 32) max_entries = 32;
+  struct dirent kbuf[32];
+  isize res = vfs_getdents(fd, kbuf, max_entries);
+  if (res > 0) {
+    if (syscall_copyout(user_buf, kbuf, (usize)res * sizeof(struct dirent)) < 0) return -EFAULT;
+  }
+  return res;
+}
+
 static isize sys_syncfs(int fd) { return vfs_syncfs(fd); }
 
 static isize sys_umask(u16 mask) {
@@ -307,6 +363,43 @@ static isize sys_umask(u16 mask) {
   u16 old_mask = cred->umask;
   cred->umask = mask & 0777;
   return old_mask;
+}
+
+static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
+  struct b1nix_pollfd fds[16];
+  if (nfds > 16) nfds = 16;
+  if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0) return -EFAULT;
+
+  u64 start_ticks = scheduler_get_uptime_ticks();
+  u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
+
+  while (1) {
+    int ready = 0;
+    for (usize i = 0; i < nfds; i++) {
+      if (fds[i].fd < 0) {
+        fds[i].revents = 0;
+        continue;
+      }
+      int h_idx = scheduler_fd_get(fds[i].fd);
+      vfs_poll(h_idx, &fds[i]);
+      if (fds[i].revents != 0) ready++;
+    }
+
+    if (ready > 0 || timeout == 0) {
+      syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+      return (u64)ready;
+    }
+
+    if (timeout != (u64)-1) {
+      u64 now = scheduler_get_uptime_ticks();
+      if (now - start_ticks >= timeout_ticks) {
+        syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
+        return 0;
+      }
+    }
+    
+    scheduler_yield();
+  }
 }
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
@@ -320,9 +413,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
     char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
     if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
     vfs_resolve_path(kpath, path);
-    return path[0] ? (u64)user_spawn(path, (int)arg1,
-                                     (const char **)(usize)arg2)
-                   : (u64)-ENOENT;
+    return path[0] ? (u64)user_spawn(path, (int)arg1, (const char **)(usize)arg2) : (u64)-ENOENT;
   }
   case SYS_LIST: {
     char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
@@ -353,18 +444,25 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
   case SYS_LSEEK:
     return (u64)vfs_lseek((int)arg0, (isize)arg1, (int)arg2);
   case SYS_STAT: {
-    char kpath[VFS_MAX_PATH], path[VFS_MAX_PATH];
+    char kpath[VFS_MAX_PATH];
     if (syscall_copyinstr(kpath, VFS_MAX_PATH, (const char *)(usize)arg0) != 0) return (u64)-EFAULT;
-    vfs_resolve_path(kpath, path);
-    return (u64)vfs_stat(path, (struct b1nix_stat *)(usize)arg1);
+    struct b1nix_stat kst;
+    int res = vfs_stat(kpath, &kst);
+    if (res == 0) {
+      if (syscall_copyout((void*)(usize)arg1, &kst, sizeof(struct b1nix_stat)) < 0) return (u64)-EFAULT;
+    }
+    return (u64)res;
   }
-  case SYS_FSTAT:
-    return (u64)vfs_fstat((int)arg0, (struct b1nix_stat *)(usize)arg1);
-  case SYS_LSTAT: {
-    char path[VFS_MAX_PATH];
-    vfs_resolve_path((const char *)(usize)arg0, path);
-    return (u64)vfs_lstat(path, (struct b1nix_stat *)(usize)arg1);
+  case SYS_FSTAT: {
+    struct b1nix_stat kst;
+    int res = vfs_fstat((int)arg0, &kst);
+    if (res == 0) {
+      if (syscall_copyout((void*)(usize)arg1, &kst, sizeof(struct b1nix_stat)) < 0) return (u64)-EFAULT;
+    }
+    return (u64)res;
   }
+  case SYS_LSTAT:
+    return (u64)sys_lstat((const char *)(usize)arg0, (struct b1nix_stat *)(usize)arg1);
   case SYS_IOCTL:
     return (u64)vfs_ioctl((int)arg0, arg1, (void *)(usize)arg2);
   case SYS_FCNTL:
@@ -375,11 +473,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
     return (u64)vfs_pipe((int *)(usize)arg0);
   case SYS_FSYNC:
     return (u64)vfs_fsync((int)arg0);
-  case SYS_CREATE: {
-    char path[VFS_MAX_PATH];
-    vfs_resolve_path((const char *)(usize)arg0, path);
-    return (u64)vfs_create(path, (const char *)(usize)arg1);
-  }
+  case SYS_CREATE:
+    return (u64)sys_create((const char *)(usize)arg0, (const char *)(usize)arg1);
   case SYS_UNLINK:
     return (u64)sys_unlink((const char *)(usize)arg0);
   case SYS_MKDIR:
@@ -396,7 +491,7 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
     return (u64)sys_readlink((const char *)(usize)arg0, (char *)(usize)arg1,
                              (usize)arg2);
   case SYS_GETDENTS:
-    return (u64)vfs_getdents((int)arg0, (struct dirent *)(usize)arg1,
+    return (u64)sys_getdents((int)arg0, (struct dirent *)(usize)arg1,
                              (usize)arg2);
   case SYS_READDIR:
     return (u64)sys_readdir((const char *)(usize)arg0,
@@ -666,6 +761,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3) {
     vfs_resolve_path((const char *)(usize)arg1, link_path);
     return (u64)vfs_link(target, link_path);
   }
+  case SYS_POLL:
+    return sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

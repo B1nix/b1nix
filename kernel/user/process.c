@@ -191,14 +191,30 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
     return -1;
   }
 
-  isize got = vfs_read(fd, data, node->inode->size);
+  usize total_read = 0;
+  while (total_read < node->inode->size) {
+    isize got = vfs_read(fd, data + total_read, node->inode->size - total_read);
+    if (got < 0) {
+      if (got == -EAGAIN || got == -EWOULDBLOCK) {
+        scheduler_yield();
+        continue;
+      }
+      vfs_close(fd);
+      kfree(data);
+      return -1;
+    }
+    if (got == 0) break; /* EOF */
+    total_read += (usize)got;
+  }
   vfs_close(fd);
-  if (got < 0 || (usize)got != node->inode->size) {
+
+  if (total_read != node->inode->size) {
+    kfree(data);
     return -1;
   }
 
   *out_data = data;
-  *out_size = node->inode->size;
+  *out_size = total_read;
   return 0;
 }
 
@@ -345,7 +361,7 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
     const char *op = payload + 9;
     if (strcmp(op, "echo") == 0) {
       const char *message = op + strlen(op) + 1;
-      syscall_dispatch(SYS_WRITE, 0, (u64)(usize)message, (u64)strlen(message), 0);
+      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message), 0);
       *code = 0;
       return 1;
     }
@@ -371,6 +387,7 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image, int *cod
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {
+  console_write("user_run_elf: entry="); console_write_hex64(image->entry); console_write("\n");
   int compat_code = 0;
   if (user_try_run_b1nxexec_image(image, &compat_code)) return compat_code;
 
@@ -409,7 +426,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   }
 
   /* Map stack */
-  u64 stack_start = image->address_space.stack_top - image->address_space.stack_size;
+  u64 stack_start = image->address_space.stack_top - image->address_space.stack_image_size;
   u64 stack_aligned = stack_start & ~(PAGE_SIZE - 1);
   u64 direct_base = vmm_direct_map_base();
   for (u64 v = stack_aligned; v < image->address_space.stack_top; v += PAGE_SIZE) {
@@ -426,6 +443,25 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       u64 chunk = image->address_space.stack_image_size - offset;
       if (chunk > PAGE_SIZE) chunk = PAGE_SIZE;
       memcpy((void *)(usize)direct_v, (char *)image->address_space.stack_image + offset, chunk);
+    }
+  }
+
+  /* Loader check: Verify entry point content */
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *segment = &image->segments[i];
+    if (image->entry >= segment->vaddr && image->entry < segment->vaddr + segment->memsz) {
+      u64 offset = image->entry - segment->vaddr;
+      if (offset < segment->filesz && segment->data) {
+        u8 *ptr = (u8 *)segment->data + offset;
+        console_write("Loader check: First 4 bytes at entry (0x");
+        console_write_hex64(image->entry);
+        console_write("): ");
+        for (int j = 0; j < 4; j++) {
+          console_write_hex64(ptr[j]);
+          console_write(" ");
+        }
+        console_write("\n");
+      }
     }
   }
 

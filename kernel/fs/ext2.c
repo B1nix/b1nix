@@ -995,7 +995,58 @@ static void ext2_populate_vfs(struct block_device *dev, u32 inode_num, const cha
 	kfree(dir_buf);
 }
 
+static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *data) {
+  (void)flags; (void)data;
+  // This is a bit of a hack to adapt the old ext2_mount_root to the new API.
+  // The old one took a mount_point, but the new vfs_mount handles the target.
+  // We'll just assume it's being mounted at some target and return the root node.
+  
+  ext2_dev = blk_get(source);
+  if (!ext2_dev) return ERR_PTR(-ENODEV);
+  
+  u8 *sb_buffer = kmalloc(1024);
+  if (blk_read_cached(ext2_dev, 2, 2, sb_buffer) < 0) {
+    kfree(sb_buffer);
+    return ERR_PTR(-EIO);
+  }
+  
+  memcpy(&ext2_sb, sb_buffer, sizeof(struct ext2_superblock));
+  kfree(sb_buffer);
+  
+  if (ext2_sb.s_magic != EXT2_SUPER_MAGIC) return ERR_PTR(-EINVAL);
+  
+  ext2_block_size = 1024 << ext2_sb.s_log_block_size;
+  ext2_inodes_per_group = ext2_sb.s_inodes_per_group;
+  ext2_inode_size = (ext2_sb.s_rev_level == 0) ? 128 : ext2_sb.s_inode_size;
+  
+  struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
+  if (!root) return ERR_PTR(-ENOMEM);
+  
+  root->inode->data = (void *)(usize)2;
+  root->inode->blk_dev = ext2_dev;
+  root->inode->create_cb = ext2_vfs_create;
+  root->inode->mkdir_cb = ext2_vfs_mkdir;
+  root->inode->unlink_cb = ext2_vfs_unlink;
+  root->inode->rmdir_cb = ext2_vfs_rmdir;
+  root->inode->rename_cb = ext2_vfs_rename;
+  root->inode->symlink_cb = ext2_vfs_symlink;
+  root->inode->link_cb = ext2_vfs_link;
+  root->inode->release_cb = ext2_vfs_release;
+  root->inode->setattr_cb = ext2_vfs_setattr;
+  root->inode->statfs_cb = ext2_vfs_statfs;
+  root->inode->readdir_cb = ext2_vfs_readdir;
+  root->inode->fsync_cb = ext2_vfs_fsync;
+  
+  return root;
+}
+
+static struct vfs_fs ext2_fs = {
+  .name = "ext2",
+  .mount = ext2_vfs_mount_cb,
+};
+
 int ext2_mount_root(const char *device_name, const char *mount_point) {
+
 	ext2_dev = blk_get(device_name);
   if (!ext2_dev)
     return -1;
@@ -1050,8 +1101,8 @@ int ext2_mount_root(const char *device_name, const char *mount_point) {
 }
 
 void ext2_init(void) {
-  if (ext2_mount_root("virtio-blk0", "/") == 0)
-		return;
-  if (ext2_mount_root("virtio-blk1", "/ext2") == 0)
-		return;
-	}
+  vfs_register_fs(&ext2_fs);
+  if (vfs_mount("virtio-blk0", "/", "ext2", 0) == 0) return;
+  if (vfs_mount("virtio-blk1", "/ext2", "ext2", 0) == 0) return;
+}
+

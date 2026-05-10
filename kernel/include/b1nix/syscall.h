@@ -111,6 +111,7 @@ enum {
 	SYS_TERMIOS_SET = 92,
 	SYS_SELFHOST_STATUS = 93,
 	SYS_LINK     = 94,
+	SYS_POLL     = 95,
 };
 
 u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3);

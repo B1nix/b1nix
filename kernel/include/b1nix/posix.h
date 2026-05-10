@@ -122,4 +122,16 @@ struct b1nix_statfs {
 	u64 f_spare[4];
 };
 
+#define B1NIX_POLLIN   0x001
+#define B1NIX_POLLOUT  0x004
+#define B1NIX_POLLERR  0x008
+#define B1NIX_POLLHUP  0x010
+#define B1NIX_POLLNVAL 0x020
+
+struct b1nix_pollfd {
+	int fd;
+	short events;
+	short revents;
+};
+
 #endif
