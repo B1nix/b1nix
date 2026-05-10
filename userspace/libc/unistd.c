@@ -82,6 +82,16 @@ int getcwd(char *buf, size_t size)
 	return syscall(SYS_GETCWD, (long)buf, size, 0, 0);
 }
 
+int fsync(int fd)
+{
+	return syscall(SYS_FSYNC, (long)fd, 0, 0, 0);
+}
+
+void sync(void)
+{
+	syscall(SYS_SYNC, 0, 0, 0, 0);
+}
+
 time_t time(time_t *tloc)
 {
 	time_t t = syscall(SYS_TIME, 0, 0, 0, 0);

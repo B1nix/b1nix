@@ -109,7 +109,23 @@ struct ext2_dir_entry {
 	char name[];
 } __attribute__((packed));
 
+struct ext2_fs {
+    struct block_device *bdev;
+    struct ext2_superblock sb;
+    u32 block_size;
+    u32 inodes_per_group;
+    u32 inode_size;
+    int bitmaps_dirty;
+    struct ext2_fs *next;
+};
+
+struct ext2_inode_info {
+    struct ext2_fs *fs;
+    u32 inode_num;
+};
+
 void ext2_init(void);
 int ext2_mount_root(const char *device_name, const char *mount_point);
+void ext2_sync_all_fs(void);
 
 #endif

@@ -2,6 +2,7 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/fat32.h>
+#include <b1nix/ext2.h>
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/klog.h>
@@ -2285,7 +2286,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return -ENODEV;
   }
 
-  struct vfs_node *root_node = fs->mount(source, flags, 0);
+  struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
   if (IS_ERR(root_node)) {
     vfs_node_put(target_node);
     return (int)PTR_ERR(root_node);
@@ -2442,8 +2443,14 @@ out:
   return res;
 }
 
+
 int vfs_sync(void) {
-  blk_cache_flush(0);
+  /* Flush in-memory filesystem structures to block cache first */
+  ext2_sync_all_fs();
+  fat32_sync_all_fs();
+
+  /* Then flush the entire block cache to physical hardware */
+  blk_sync_all();
   return 0;
 }
 

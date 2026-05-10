@@ -2,6 +2,8 @@
 #define B1NIX_EXT4_H
 
 #include <b1nix/types.h>
+#include <b1nix/ext2.h>
+#include <b1nix/journal.h>
 
 /*
  * Ext4 features added on top of Ext2/3:
@@ -137,6 +139,26 @@ struct ext4_bgd_64 {
 #define EXT4_FEATURE_RO_COMPAT_EXTRA_ISIZE 0x0040
 #define EXT4_FEATURE_RO_COMPAT_METADATA_CSUM 0x0400
 #define EXT4_FEATURE_RO_COMPAT_DIR_NLINK   0x0020
+
+struct ext4_fs {
+    struct block_device *bdev;
+    struct ext2_superblock sb;
+    u32 block_size;
+    u32 inodes_per_group;
+    u32 inode_size;
+    u32 desc_size;
+    u32 flex_size;
+    u32 features_incompat;
+    u32 features_ro_compat;
+    u32 journal_inum;
+    struct ext2_inode journal_inode_cache;
+    struct journal_dev *jdev;
+};
+
+struct ext4_inode_info {
+    struct ext4_fs *fs;
+    u32 inode_num;
+};
 
 void ext4_init(void);
 

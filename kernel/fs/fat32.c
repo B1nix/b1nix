@@ -2,6 +2,8 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
+#include <b1nix/blk.h>
+#include <b1nix/errno.h>
 #include <string.h>
 
 struct fat32_bpb {
@@ -51,68 +53,225 @@ struct fat32_dir_entry {
 	u32 size;
 } __attribute__((packed));
 
+#define FAT_ATTR_READ_ONLY 0x01
+#define FAT_ATTR_HIDDEN    0x02
+#define FAT_ATTR_SYSTEM    0x04
+#define FAT_ATTR_VOLUME_ID 0x08
 #define FAT_ATTR_DIRECTORY 0x10
-#define FAT_ATTR_LFN 0x0F
+#define FAT_ATTR_ARCHIVE   0x20
+#define FAT_ATTR_LFN       0x0F
 
-static struct block_device *fat_dev;
-static struct fat32_bpb bpb;
-static u32 data_start_sector;
-static u32 fat_start_sector;
+static struct fat32_fs *fat32_instances = NULL;
 
-static u32 cluster_to_sector(u32 cluster)
-{
-	return data_start_sector + (cluster - 2) * bpb.sectors_per_cluster;
+static u32 cluster_to_sector(struct fat32_fs *fs, u32 cluster) {
+	return fs->data_start_sector + (cluster - 2) * fs->sectors_per_cluster;
 }
 
-static u32 get_next_cluster(u32 cluster)
-{
-	u32 fat_sector = fat_start_sector + (cluster * 4) / bpb.bytes_per_sector;
-	u32 fat_offset = (cluster * 4) % bpb.bytes_per_sector;
-	u8 sector_buf[512]; // Assuming 512 byte sectors
+static u32 get_next_cluster(struct fat32_fs *fs, u32 cluster) {
+	u32 fat_sector = fs->fat_start_sector + (cluster * 4) / fs->bytes_per_sector;
+	u32 fat_offset = (cluster * 4) % fs->bytes_per_sector;
+	u8 sector_buf[512]; 
 	
-	fat_dev->read_blocks(fat_dev, fat_sector, 1, sector_buf);
+	if (blk_read_cached(fs->bdev, fat_sector, 1, sector_buf) < 0)
+        return 0x0FFFFFF7; // Bad cluster
+
 	u32 next = *(u32 *)(sector_buf + fat_offset);
 	return next & 0x0FFFFFFF;
 }
 
-static void trim_spaces(char *str)
-{
-	isize i = strlen(str) - 1;
+static void trim_spaces(char *str) {
+	isize i = (isize)strlen(str) - 1;
 	while (i >= 0 && str[i] == ' ') {
 		str[i] = '\0';
 		i--;
 	}
 }
 
-static void parse_dir(u32 cluster, const char *parent_path)
-{
-	u8 *cluster_buf = kmalloc(bpb.bytes_per_sector * bpb.sectors_per_cluster);
+static void fat_name_to_normal(const char *fat_name, char *normal) {
+    memcpy(normal, fat_name, 8);
+    normal[8] = '\0';
+    trim_spaces(normal);
+    if (fat_name[8] != ' ') {
+        usize len = strlen(normal);
+        normal[len] = '.';
+        memcpy(normal + len + 1, fat_name + 8, 3);
+        normal[len + 4] = '\0';
+        trim_spaces(normal);
+    }
+}
+
+static isize fat32_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usize size, int flags) {
+    (void)flags;
+    struct fat32_inode_info *info = (struct fat32_inode_info *)node->inode->data;
+    struct fat32_fs *fs = info->fs;
+
+    if (offset >= info->size) return 0;
+    if (offset + size > info->size) size = info->size - (usize)offset;
+
+    u32 cluster = info->first_cluster;
+    u32 cluster_size = fs->bytes_per_sector * fs->sectors_per_cluster;
+    
+    // Skip clusters to reach offset
+    u64 current_offset = 0;
+    while (current_offset + cluster_size <= offset) {
+        cluster = get_next_cluster(fs, cluster);
+        if (cluster >= 0x0FFFFFF8) return 0;
+        current_offset += cluster_size;
+    }
+
+    usize bytes_read = 0;
+    u8 *cluster_buf = kmalloc(cluster_size);
+
+    while (bytes_read < size) {
+        u32 sector = cluster_to_sector(fs, cluster);
+        blk_read_cached(fs->bdev, sector, fs->sectors_per_cluster, cluster_buf);
+
+        u32 offset_in_cluster = (u32)(offset + bytes_read - current_offset);
+        u32 to_copy = cluster_size - offset_in_cluster;
+        if (to_copy > size - bytes_read) to_copy = (u32)(size - bytes_read);
+
+        memcpy(buffer + bytes_read, cluster_buf + offset_in_cluster, to_copy);
+        bytes_read += to_copy;
+
+        if (bytes_read < size) {
+            cluster = get_next_cluster(fs, cluster);
+            if (cluster >= 0x0FFFFFF8) break;
+            current_offset += cluster_size;
+        }
+    }
+
+    kfree(cluster_buf);
+    return (isize)bytes_read;
+}
+
+static isize fat32_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent *buf, usize max_entries) {
+    struct fat32_inode_info *info = (struct fat32_inode_info *)dir->inode->data;
+    struct fat32_fs *fs = info->fs;
+
+    u32 cluster = info->first_cluster;
+    u32 cluster_size = fs->bytes_per_sector * fs->sectors_per_cluster;
+    u8 *cluster_buf = kmalloc(cluster_size);
+    
+    usize count = 0;
+    usize entry_idx = 0;
+
+    while (cluster < 0x0FFFFFF8 && count < max_entries) {
+        u32 sector = cluster_to_sector(fs, cluster);
+        blk_read_cached(fs->bdev, sector, fs->sectors_per_cluster, cluster_buf);
+
+        struct fat32_dir_entry *entries = (struct fat32_dir_entry *)cluster_buf;
+        u32 entries_per_cluster = cluster_size / sizeof(struct fat32_dir_entry);
+
+        for (u32 i = 0; i < entries_per_cluster && count < max_entries; i++) {
+            if (entries[i].name[0] == 0x00) {
+                cluster = 0x0FFFFFF8; // End of directory
+                break;
+            }
+            if (entries[i].name[0] == (char)0xE5) continue; // Deleted
+            if (entries[i].attr == FAT_ATTR_LFN) continue; // Skip LFN artifacts
+            if (entries[i].attr & FAT_ATTR_VOLUME_ID) continue; // Skip volume label
+
+            if (entry_idx >= offset) {
+                char name[13];
+                fat_name_to_normal(entries[i].name, name);
+                
+                memcpy(buf[count].name, name, strlen(name) + 1);
+                buf[count].type = (entries[i].attr & FAT_ATTR_DIRECTORY) ? VFS_DIRECTORY : VFS_FILE;
+                buf[count].is_dir = (entries[i].attr & FAT_ATTR_DIRECTORY);
+                buf[count].size = entries[i].size;
+                count++;
+            }
+            entry_idx++;
+        }
+
+        if (cluster < 0x0FFFFFF8)
+            cluster = get_next_cluster(fs, cluster);
+    }
+
+    kfree(cluster_buf);
+    return (isize)count;
+}
+
+static int fat32_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
+    struct fat32_inode_info *info = (struct fat32_inode_info *)node->inode->data;
+    struct fat32_fs *fs = info->fs;
+
+    memset(st, 0, sizeof(*st));
+    st->f_type = 0x4D44; // FAT
+    st->f_bsize = fs->bytes_per_sector * fs->sectors_per_cluster;
+    st->f_blocks = fs->total_clusters;
+    
+    // Calculate free space if not cached
+    if (fs->free_clusters == 0xFFFFFFFF) {
+        u32 free = 0;
+        u8 *fat_buf = kmalloc(fs->bytes_per_sector);
+        for (u32 s = 0; s < fs->sectors_per_fat; s++) {
+            blk_read_cached(fs->bdev, fs->fat_start_sector + s, 1, fat_buf);
+            u32 *fat = (u32 *)fat_buf;
+            for (u32 i = 0; i < fs->bytes_per_sector / 4; i++) {
+                if ((fat[i] & 0x0FFFFFFF) == 0) free++;
+            }
+        }
+        kfree(fat_buf);
+        fs->free_clusters = free;
+    }
+    
+    st->f_bfree = fs->free_clusters;
+    st->f_bavail = fs->free_clusters;
+    st->f_files = 0; // Not strictly applicable to FAT
+    st->f_ffree = 0;
+    st->f_namelen = 12; // 8.3 format for now
+    
+    return 0;
+}
+
+static int fat32_vfs_fsync(struct vfs_node *node) {
+    struct fat32_inode_info *info = (struct fat32_inode_info *)node->inode->data;
+    struct fat32_fs *fs = info->fs;
+
+    // If it's the root directory or has no valid entry location, just flush device
+    if (info->entry_sector == 0) {
+        blk_cache_flush(fs->bdev);
+        return 0;
+    }
+
+    u8 sector_buf[512];
+    if (blk_read_cached(fs->bdev, info->entry_sector, 1, sector_buf) < 0) return -EIO;
+
+    struct fat32_dir_entry *entry = (struct fat32_dir_entry *)(sector_buf + info->entry_offset);
+    
+    // Update size and cluster if they changed in memory
+    // (In a full implementation, we'd have a dirty flag on the inode info)
+    entry->size = (u32)info->size;
+    entry->cluster_low = (u16)(info->first_cluster & 0xFFFF);
+    entry->cluster_high = (u16)((info->first_cluster >> 16) & 0xFFFF);
+    
+    if (blk_write_cached(fs->bdev, info->entry_sector, 1, sector_buf) < 0) return -EIO;
+
+    blk_cache_flush(fs->bdev);
+    return 0;
+}
+
+static void fat32_populate_vfs(struct fat32_fs *fs, u32 cluster, const char *parent_path) {
+    u32 cluster_size = fs->bytes_per_sector * fs->sectors_per_cluster;
+	u8 *cluster_buf = kmalloc(cluster_size);
 	if (!cluster_buf) return;
 
 	while (cluster < 0x0FFFFFF8) {
-		u32 sector = cluster_to_sector(cluster);
-		fat_dev->read_blocks(fat_dev, sector, bpb.sectors_per_cluster, cluster_buf);
+		u32 base_sector = cluster_to_sector(fs, cluster);
+		blk_read_cached(fs->bdev, base_sector, fs->sectors_per_cluster, cluster_buf);
 
 		struct fat32_dir_entry *entries = (struct fat32_dir_entry *)cluster_buf;
-		u32 entries_per_cluster = (bpb.bytes_per_sector * bpb.sectors_per_cluster) / sizeof(struct fat32_dir_entry);
+		u32 entries_per_cluster = cluster_size / sizeof(struct fat32_dir_entry);
 
 		for (u32 i = 0; i < entries_per_cluster; i++) {
-			if (entries[i].name[0] == 0x00) break; // End of directory
-			if (entries[i].name[0] == (char)0xE5) continue; // Deleted
-			if (entries[i].attr == FAT_ATTR_LFN) continue; // Skip LFN for now
+			if (entries[i].name[0] == 0x00) break; 
+			if (entries[i].name[0] == (char)0xE5) continue; 
+			if (entries[i].attr == FAT_ATTR_LFN) continue; 
+            if (entries[i].attr & FAT_ATTR_VOLUME_ID) continue;
 			
 			char name[13];
-			memcpy(name, entries[i].name, 8);
-			name[8] = '\0';
-			trim_spaces(name);
-
-			if (entries[i].name[8] != ' ') {
-				usize len = strlen(name);
-				name[len] = '.';
-				memcpy(name + len + 1, entries[i].name + 8, 3);
-				name[len + 4] = '\0';
-				trim_spaces(name);
-			}
+            fat_name_to_normal(entries[i].name, name);
 
 			if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 
@@ -124,57 +283,123 @@ static void parse_dir(u32 cluster, const char *parent_path)
 			memcpy(full_path + plen, name, nlen + 1);
 
 			u32 entry_cluster = ((u32)entries[i].cluster_high << 16) | entries[i].cluster_low;
+            
+            u32 entry_offset_in_cluster = i * sizeof(struct fat32_dir_entry);
+            u32 entry_phys_sector = base_sector + (entry_offset_in_cluster / fs->bytes_per_sector);
+            u32 entry_phys_offset = entry_offset_in_cluster % fs->bytes_per_sector;
 
 			if (entries[i].attr & FAT_ATTR_DIRECTORY) {
-				vfs_mkdir(full_path);
-				parse_dir(entry_cluster, full_path);
+				struct vfs_node *node = vfs_add_node(full_path, VFS_DIRECTORY, 0, 0, 0);
+                if (node) {
+                    struct fat32_inode_info *info = kmalloc(sizeof(struct fat32_inode_info));
+                    info->fs = fs;
+                    info->first_cluster = entry_cluster;
+                    info->size = 0;
+                    info->entry_sector = entry_phys_sector;
+                    info->entry_offset = entry_phys_offset;
+                    node->inode->data = info;
+                    node->inode->readdir_cb = fat32_vfs_readdir;
+                    node->inode->statfs_cb = fat32_vfs_statfs;
+                    node->inode->fsync_cb = fat32_vfs_fsync;
+                }
+				fat32_populate_vfs(fs, entry_cluster, full_path);
 			} else {
-				// We allocate and read the entire file into memory for simplicity
-				u8 *file_data = kmalloc(entries[i].size + 1);
-				if (file_data) {
-					u32 fc = entry_cluster;
-					usize offset = 0;
-					while (fc < 0x0FFFFFF8 && offset < entries[i].size) {
-						fat_dev->read_blocks(fat_dev, cluster_to_sector(fc), bpb.sectors_per_cluster, file_data + offset);
-						offset += bpb.bytes_per_sector * bpb.sectors_per_cluster;
-						fc = get_next_cluster(fc);
-					}
-					file_data[entries[i].size] = '\0';
-					vfs_create(full_path, (char*)file_data);
-				}
+                struct vfs_node *node = vfs_add_node(full_path, VFS_FILE, 0, entries[i].size, 0);
+                if (node) {
+                    struct fat32_inode_info *info = kmalloc(sizeof(struct fat32_inode_info));
+                    info->fs = fs;
+                    info->first_cluster = entry_cluster;
+                    info->size = entries[i].size;
+                    info->entry_sector = entry_phys_sector;
+                    info->entry_offset = entry_phys_offset;
+                    node->inode->data = info;
+                    node->inode->read_cb = fat32_vfs_read;
+                    node->inode->statfs_cb = fat32_vfs_statfs;
+                    node->inode->fsync_cb = fat32_vfs_fsync;
+                }
 			}
 		}
-		cluster = get_next_cluster(cluster);
+		cluster = get_next_cluster(fs, cluster);
 	}
+    kfree(cluster_buf);
 }
 
-int fat32_mount(struct block_device *dev, const char *mount_point)
-{
-	fat_dev = dev;
+static struct vfs_node *fat32_vfs_mount_cb(const char *source, u64 flags, void *data) {
+    (void)flags;
+    struct block_device *dev = blk_get(source);
+    if (!dev) return ERR_PTR(-ENODEV);
 
-	u8 boot_sector[512];
-	if (dev->read_blocks(dev, 0, 1, boot_sector) < 0) {
-		console_write("fat32: failed to read boot sector\n");
-		return -1;
-	}
+    u8 boot_sector[512];
+    if (blk_read_cached(dev, 0, 1, boot_sector) < 0) return ERR_PTR(-EIO);
 
-	memcpy(&bpb, boot_sector, sizeof(bpb));
+    struct fat32_bpb *bpb = (struct fat32_bpb *)boot_sector;
+    if (bpb->bytes_per_sector != 512) return ERR_PTR(-EINVAL);
 
-	if (bpb.bytes_per_sector != 512) {
-		console_write("fat32: unsupported sector size\n");
-		return -1;
-	}
+    struct fat32_fs *fs = kmalloc(sizeof(struct fat32_fs));
+    memset(fs, 0, sizeof(struct fat32_fs));
+    fs->bdev = dev;
+    fs->bytes_per_sector = bpb->bytes_per_sector;
+    fs->sectors_per_cluster = bpb->sectors_per_cluster;
+    fs->fat_start_sector = bpb->reserved_sectors;
+    fs->sectors_per_fat = bpb->sectors_per_fat_32;
+    fs->data_start_sector = fs->fat_start_sector + (bpb->fat_count * bpb->sectors_per_fat_32);
+    fs->root_cluster = bpb->root_cluster;
+    fs->total_clusters = bpb->total_sectors_32 / bpb->sectors_per_cluster;
+    fs->free_clusters = 0xFFFFFFFF; // Mark as unknown
+    fs->fsinfo_sector = bpb->fs_info;
+    
+    // Add to instances linked list
+    fs->next = fat32_instances;
+    fat32_instances = fs;
 
-	fat_start_sector = bpb.reserved_sectors;
-	data_start_sector = fat_start_sector + (bpb.fat_count * bpb.sectors_per_fat_32);
+    struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
+    struct fat32_inode_info *info = kmalloc(sizeof(struct fat32_inode_info));
+    info->fs = fs;
+    info->first_cluster = fs->root_cluster;
+    info->size = 0;
+    info->entry_sector = 0; // Root has no parent entry
+    info->entry_offset = 0;
+    root->inode->data = info;
+    root->inode->readdir_cb = fat32_vfs_readdir;
+    root->inode->statfs_cb = fat32_vfs_statfs;
+    root->inode->fsync_cb = fat32_vfs_fsync;
 
-	console_write("fat32: mounting to ");
-	console_write(mount_point);
-	console_write("\n");
+    if (data) {
+        fat32_populate_vfs(fs, fs->root_cluster, (const char *)data);
+    }
 
-	vfs_mkdir(mount_point);
-	parse_dir(bpb.root_cluster, mount_point);
+    return root;
+}
 
-	console_write("fat32: mount complete\n");
-	return 0;
+void fat32_sync_all_fs(void) {
+    struct fat32_fs *fs = fat32_instances;
+    while (fs) {
+        if (fs->fsinfo_dirty && fs->fsinfo_sector != 0) {
+            u8 buf[512];
+            if (blk_read_cached(fs->bdev, fs->fsinfo_sector, 1, buf) >= 0) {
+                // Update free clusters in FSInfo (offset 488)
+                *(u32 *)(buf + 488) = fs->free_clusters;
+                blk_write_cached(fs->bdev, fs->fsinfo_sector, 1, buf);
+            }
+            fs->fsinfo_dirty = 0;
+        }
+        // fat_dirty is handled by blk_cache_flush because FAT sectors are written via blk_write_cached
+        blk_cache_flush(fs->bdev);
+        fs->fat_dirty = 0;
+        fs = fs->next;
+    }
+}
+
+static struct vfs_fs fat32_vfs = {
+    .name = "fat32",
+    .mount = fat32_vfs_mount_cb,
+};
+
+int fat32_mount(struct block_device *dev, const char *mount_point) {
+    (void)dev;
+    return vfs_mount(0, mount_point, "fat32", 0);
+}
+
+void fat32_init(void) {
+    vfs_register_fs(&fat32_vfs);
 }

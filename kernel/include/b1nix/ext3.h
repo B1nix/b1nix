@@ -2,6 +2,8 @@
 #define B1NIX_EXT3_H
 
 #include <b1nix/types.h>
+#include <b1nix/ext2.h>
+#include <b1nix/journal.h>
 
 /* 
  * Ext3 = Ext2 + journaling.
@@ -67,6 +69,22 @@ struct ext3_journal_block_tag {
 #define EXT3_JOURNAL_TAG_SAME_UUID  (1 << 0)
 #define EXT3_JOURNAL_TAG_LAST_TAG   (1 << 1)
 #define EXT3_JOURNAL_TAG_ESC        (1 << 2)
+
+struct ext3_fs {
+    struct block_device *bdev;
+    struct ext2_superblock sb;
+    u32 block_size;
+    u32 inodes_per_group;
+    u32 inode_size;
+    u32 journal_inum;
+    struct ext2_inode journal_inode_cache;
+    struct journal_dev *jdev;
+};
+
+struct ext3_inode_info {
+    struct ext3_fs *fs;
+    u32 inode_num;
+};
 
 void ext3_init(void);
 

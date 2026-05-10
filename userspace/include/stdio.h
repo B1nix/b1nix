@@ -19,6 +19,7 @@ extern FILE *stdout;
 extern FILE *stderr;
 
 int printf(const char *fmt, ...);
+void perror(const char *s);
 int sprintf(char *str, const char *fmt, ...);
 int putchar(int c);
 int puts(const char *s);

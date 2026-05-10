@@ -83,6 +83,18 @@ struct ext1_bgd {
 #define EXT1_S_IFCHR  0x2000
 #define EXT1_S_IFIFO  0x1000
 
+struct ext1_fs {
+    struct block_device *bdev;
+    struct ext1_superblock sb;
+    u32 block_size;
+    u32 inodes_per_group;
+};
+
+struct ext1_inode_info {
+    struct ext1_fs *fs;
+    u32 inode_num;
+};
+
 void ext1_init(void);
 
 #endif

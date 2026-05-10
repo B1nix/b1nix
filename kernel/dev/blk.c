@@ -25,16 +25,7 @@ static void blk_scan_partitions(struct block_device *dev);
 
 /* ── Block Cache Structures ── */
 
-struct blk_cache_entry {
-  struct block_device *dev;
-  u64 lba;
-  u8 data[CACHE_BLOCK_SIZE];
-  u32 last_used;
-  bool dirty;
-  bool valid;
-};
-
-static struct blk_cache_entry bcache[CACHE_ENTRIES];
+static struct block_buffer block_cache[CACHE_ENTRIES];
 static u32 bcache_tick = 0;
 
 static u32 le32(const u8 *p) {
@@ -234,45 +225,45 @@ struct block_device *blk_at(usize index) {
 
 /* ── Write-Back Cache Implementation ── */
 
-void blk_cache_init(void) { memset(bcache, 0, sizeof(bcache)); }
+void blk_cache_init(void) { memset(block_cache, 0, sizeof(block_cache)); }
 
-static struct blk_cache_entry *bcache_find(struct block_device *dev, u64 lba) {
+static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    if (bcache[i].valid && bcache[i].dev == dev && bcache[i].lba == lba) {
-      bcache[i].last_used = ++bcache_tick;
-      return &bcache[i];
+    if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && block_cache[i].block_no == lba) {
+      block_cache[i].last_used = ++bcache_tick;
+      return &block_cache[i];
     }
   }
   return 0;
 }
 
-static struct blk_cache_entry *bcache_evict(void) {
+static struct block_buffer *bcache_evict(void) {
   int oldest_idx = 0;
   u32 oldest_tick = 0xFFFFFFFF;
 
   /* 1. Try to find an invalid (empty) entry first */
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    if (!bcache[i].valid) {
-      return &bcache[i];
+    if (!(block_cache[i].flags & BLK_CACHE_VALID)) {
+      return &block_cache[i];
     }
   }
 
   /* 2. Otherwise, find the LRU (Least Recently Used) entry */
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    if (bcache[i].last_used < oldest_tick) {
-      oldest_tick = bcache[i].last_used;
+    if (block_cache[i].last_used < oldest_tick) {
+      oldest_tick = block_cache[i].last_used;
       oldest_idx = i;
     }
   }
 
-  struct blk_cache_entry *entry = &bcache[oldest_idx];
+  struct block_buffer *entry = &block_cache[oldest_idx];
 
   /* 3. Write-Back: If the evicted block is dirty, write it to physical disk */
-  if (entry->dirty && entry->dev && entry->dev->write_blocks) {
-    entry->dev->write_blocks(entry->dev, entry->lba, 1, entry->data);
-    entry->dirty = false;
+  if ((entry->flags & BLK_CACHE_DIRTY) && entry->bdev && entry->bdev->write_blocks) {
+    entry->bdev->write_blocks(entry->bdev, entry->block_no, 1, entry->data);
+    entry->flags &= ~BLK_CACHE_DIRTY;
   }
-  entry->valid = false;
+  entry->flags &= ~BLK_CACHE_VALID;
   return entry;
 }
 
@@ -287,19 +278,19 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   u8 *buf8 = (u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    struct blk_cache_entry *entry = bcache_find(dev, current_lba);
+    struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (entry) {
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
     } else {
       entry = bcache_evict();
-      entry->dev = dev;
-      entry->lba = current_lba;
+      entry->bdev = dev;
+      entry->block_no = current_lba;
       if (dev->read_blocks(dev, current_lba, 1, entry->data) < 0) {
         return -1;
       }
-      entry->valid = true;
-      entry->dirty = false;
+      entry->flags |= BLK_CACHE_VALID;
+      entry->flags &= ~BLK_CACHE_DIRTY;
       entry->last_used = ++bcache_tick;
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
     }
@@ -318,40 +309,55 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   const u8 *buf8 = (const u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    struct blk_cache_entry *entry = bcache_find(dev, current_lba);
+    struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (!entry) {
       entry = bcache_evict();
-      entry->dev = dev;
-      entry->lba = current_lba;
-      entry->valid = true;
+      entry->bdev = dev;
+      entry->block_no = current_lba;
+      entry->flags |= BLK_CACHE_VALID;
       entry->last_used = ++bcache_tick;
     }
 
     memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
 
     /* Write-Back: Mark as dirty, DO NOT write to disk immediately */
-    entry->dirty = true;
+    entry->flags |= BLK_CACHE_DIRTY;
   }
   return 0;
 }
 
 /* POSIX: Fsync/Sync support - Flush all dirty blocks to physical storage */
+/* POSIX: Fsync/Sync support - Flush all dirty blocks to physical storage */
+void blk_flush_buffer(struct block_buffer *buf) {
+  if (!buf || !(buf->flags & BLK_CACHE_DIRTY))
+    return;
+
+  if (buf->bdev && buf->bdev->write_blocks) {
+    buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data);
+    buf->flags &= ~BLK_CACHE_DIRTY;
+  }
+}
+
+void blk_sync_all(void) {
+  for (int i = 0; i < CACHE_ENTRIES; i++) {
+    if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
+      blk_flush_buffer(&block_cache[i]);
+    }
+  }
+}
+
 void blk_cache_flush(struct block_device *dev) {
   if (!dev) {
-    /* Flush all devices if dev is NULL */
-    for (usize i = 0; i < blk_device_count; i++) {
-      blk_cache_flush(blk_devices[i]);
-    }
+    blk_sync_all();
     return;
   }
   if (!dev->write_blocks)
     return;
 
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    if (bcache[i].valid && bcache[i].dev == dev && bcache[i].dirty) {
-      dev->write_blocks(dev, bcache[i].lba, 1, bcache[i].data);
-      bcache[i].dirty = false;
+    if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
+      blk_flush_buffer(&block_cache[i]);
     }
   }
 }

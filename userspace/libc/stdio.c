@@ -26,6 +26,15 @@ int puts(const char *s)
 	return 0;
 }
 
+void perror(const char *s)
+{
+	if (s && *s) {
+		printf("%s: error\n", s);
+	} else {
+		printf("error\n");
+	}
+}
+
 static void print_dec(unsigned long v, char *buf, int *pos)
 {
 	if (v >= 10) print_dec(v / 10, buf, pos);

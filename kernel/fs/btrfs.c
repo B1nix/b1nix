@@ -1,83 +1,79 @@
-#include <b1nix/blk.h>
 #include <b1nix/btrfs.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
+#include <b1nix/errno.h>
 #include <string.h>
 
-#define BTRFS_SUPER_OFFSET 65536ULL
-#define BTRFS_SUPER_SIZE 4096
-#define BTRFS_MAGIC_OFFSET 0x40
-#define BTRFS_LABEL_OFFSET 0x12b
-#define BTRFS_LABEL_SIZE 256
+u64 btrfs_logical_to_physical(struct btrfs_fs_info *fs, u64 logical) {
+    u8 *ptr = fs->sb.sys_chunk_array;
+    u8 *end = ptr + fs->sb.sys_chunk_array_size;
 
-static const char btrfs_magic[8] = {'_', 'B', 'H', 'R', 'f', 'S', '_', 'M'};
-
-static int btrfs_read_super(struct block_device *dev, u8 *buffer)
-{
-	if (!dev || dev->block_size == 0) return -1;
-	u64 lba = BTRFS_SUPER_OFFSET / dev->block_size;
-	u32 count = BTRFS_SUPER_SIZE / dev->block_size;
-	if (count == 0) count = 1;
-	return blk_read_cached(dev, lba, count, buffer);
+    while (ptr < end) {
+        struct btrfs_disk_key *key = (struct btrfs_disk_key *)ptr;
+        ptr += sizeof(struct btrfs_disk_key);
+        
+        struct btrfs_chunk *chunk = (struct btrfs_chunk *)ptr;
+        
+        if (logical >= key->offset && logical < key->offset + chunk->length) {
+            return chunk->stripes[0].physical + (logical - key->offset);
+        }
+        
+        // Skip chunk and its stripes
+        ptr += sizeof(struct btrfs_chunk) + chunk->num_stripes * sizeof(struct btrfs_stripe);
+    }
+    
+    return 0;
 }
 
-static int btrfs_probe(struct block_device *dev, char *label, usize label_size)
-{
-	u8 *super = kmalloc(BTRFS_SUPER_SIZE);
-	if (!super) return -1;
+static struct vfs_node *btrfs_vfs_mount_cb(const char *source, u64 flags, void *data) {
+    (void)flags; (void)data;
+    struct block_device *dev = blk_get(source);
+    if (!dev) return ERR_PTR(-ENODEV);
 
-	int ok = btrfs_read_super(dev, super) == 0 &&
-	         memcmp(super + BTRFS_MAGIC_OFFSET, btrfs_magic, sizeof(btrfs_magic)) == 0;
-	if (ok && label && label_size > 0) {
-		usize len = 0;
-		while (len < BTRFS_LABEL_SIZE && len < label_size - 1 &&
-		       super[BTRFS_LABEL_OFFSET + len] != 0) {
-			label[len] = (char)super[BTRFS_LABEL_OFFSET + len];
-			len++;
-		}
-		label[len] = '\0';
-	}
+    u8 *sb_buf = kmalloc(4096);
+    if (blk_read_cached(dev, BTRFS_SUPER_INFO_OFFSET / 512, 8, sb_buf) < 0) {
+        kfree(sb_buf);
+        return ERR_PTR(-EIO);
+    }
 
-	kfree(super);
-	return ok ? 0 : -1;
+    struct btrfs_super_block *sb = (struct btrfs_super_block *)sb_buf;
+    if (memcmp(sb->magic, BTRFS_MAGIC, 8) != 0) {
+        kfree(sb_buf);
+        return ERR_PTR(-EINVAL);
+    }
+
+    struct btrfs_fs_info *fs = kmalloc(sizeof(struct btrfs_fs_info));
+    fs->bdev = dev;
+    memcpy(&fs->sb, sb, sizeof(struct btrfs_super_block));
+    kfree(sb_buf);
+
+    console_write("btrfs: mounted, fsid=");
+    for (int i = 0; i < 16; i++) {
+        console_write_hex32(fs->sb.fsid[i]);
+    }
+    console_write("\n");
+
+    struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
+    if (!root) {
+        kfree(fs);
+        return ERR_PTR(-ENOMEM);
+    }
+    root->inode->data = fs;
+    root->inode->blk_dev = dev;
+
+    return root;
 }
 
-int btrfs_mount_root(const char *device_name, const char *mount_point)
-{
-	struct block_device *dev = blk_get(device_name);
-	if (!dev) return -1;
+static struct vfs_fs btrfs_vfs = {
+    .name = "btrfs",
+    .mount = btrfs_vfs_mount_cb,
+};
 
-	char label[64];
-	label[0] = '\0';
-	if (btrfs_probe(dev, label, sizeof(label)) != 0) {
-		return -1;
-	}
-
-	vfs_mount(device_name, mount_point, "btrfs", 0);
-	vfs_add_node(mount_point, VFS_DIRECTORY, 0, 0, 0);
-
-	console_write("btrfs: mounted ");
-	console_write(device_name);
-	console_write(" at ");
-	console_write(mount_point);
-	if (label[0]) {
-		console_write(" label ");
-		console_write(label);
-	}
-	console_write(" (metadata-only)\n");
-	return 0;
+int btrfs_mount_root(const char *device_name, const char *mount_point) {
+    return vfs_mount(device_name, mount_point, "btrfs", 0);
 }
 
-void btrfs_init(void)
-{
-	for (usize i = 0; i < blk_count(); i++) {
-		struct block_device *dev = blk_at(i);
-		if (!dev) continue;
-		if (btrfs_probe(dev, 0, 0) == 0) {
-			console_write("btrfs: found filesystem on ");
-			console_write(dev->name);
-			console_write("\n");
-		}
-	}
+void btrfs_init(void) {
+    vfs_register_fs(&btrfs_vfs);
 }

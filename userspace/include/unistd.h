@@ -17,6 +17,8 @@ int   execvp(const char *file, char *const argv[]);
 int   mkdir(const char *path, unsigned int mode);
 int   chdir(const char *path);
 int   getcwd(char *buf, size_t size);
+int   fsync(int fd);
+void  sync(void);
 
 /* stat structure for userspace */
 struct stat {

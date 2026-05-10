@@ -12,6 +12,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/ext2.h>
 #include <b1nix/ext1.h>
+#include <b1nix/fat32.h>
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
@@ -96,6 +97,7 @@ void kernel_main(u64 arg0, u64 arg1)
 	ext2_init();
 	ext1_init();
 	ext3_init();
+	fat32_init();
 	ext4_init();
 	ahci_init();
 	nvme_init();

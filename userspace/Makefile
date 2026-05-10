@@ -23,7 +23,8 @@ LIBC_OBJS := \
 BINARIES := \
 	$(BUILD)/bin/hello \
 	$(BUILD)/bin/native_smoke \
-	$(BUILD)/bin/tcc
+	$(BUILD)/bin/tcc \
+	$(BUILD)/bin/test_sync
 
 .PHONY: all clean install
 
