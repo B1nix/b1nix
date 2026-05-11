@@ -93,17 +93,17 @@ and broader utility flag compatibility.
 - [x] `done` Add devfs.
 - [x] `done` Add tmpfs.
 - [x] `done` Add tarfs/initramfs.
-- [x] `initial` Add virtio-blk as an early device, later replaced by the real driver.
+- [x] `done` Add virtio-blk as an early device, later replaced by the real driver.
 - [x] `done` Add `/dev/tty` VFS device.
 - [x] `done` Add `/dev` integration for terminal-backed stdin/stdout/stderr.
 - [x] `done` Add VFS mount table and mountpoint dispatch.
 - [x] `done` Add ACL fields and permission metadata in VFS nodes.
-- [x] `initial` Add symlinks, hard links, and `readlink`.
-- [x] `initial` Add `lstat()` and symlink-aware `stat` mode reporting.
+- [x] `done` Add symlinks, hard links, and `readlink`.
+- [x] `done` Add `lstat()` and symlink-aware `stat` mode reporting.
 - [x] `done` Add dot, dot-dot, duplicate-slash, symlink-loop (iterative resolver, 16-hop limit, ELOOP), mount-crossing via `..`, and POSIX errno normalization at syscall/VFS boundaries.
 - [x] `done` Add POSIX-style open-file description mode checks for read-only, write-only, append, exclusive create, and directory-only opens.
 - [x] `done` Enforce existing parent directories for create/mkdir and normalize chmod/chown paths.
-- [x] `initial` Add full permissions and mount-aware path normalization.
+- [x] `done` Add full permissions and mount-aware path normalization.
 
 ## M6: Network
 
@@ -112,10 +112,10 @@ and broader utility flag compatibility.
 - [x] `done` Add ARP.
 - [x] `done` Add IPv4.
 - [x] `done` Add ICMP echo.
-- [x] `initial` Add UDP.
-- [x] `initial` Add DHCP client.
-- [x] `initial` Add DNS client.
-- [ ] `planned` Add full socket-driven TCP/UDP server behavior.
+- [x] `done` Add UDP.
+- [x] `done` Add DHCP client.
+- [x] `done` Add DNS client.
+- [x] `done` Add full socket-driven TCP/UDP server behavior.
 
 ## M7: Graphics
 
@@ -161,7 +161,7 @@ and broader utility flag compatibility.
 - [x] `initial` DNS client.
 - [x] `initial` Add socket ABI integration for UDP/TCP-style descriptors.
 - [x] `partial` Add minimal TCP client path for terminal tools.
-- [ ] `planned` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.
+- [x] `done` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.
 
 ## M11: Shell and Utilities
 
@@ -190,7 +190,7 @@ and broader utility flag compatibility.
 - [x] `done` `brk`, `munmap`, `ioctl`, and termios syscalls.
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
-- [x] `partial` Add POSIX signal ABI: `sigaction` table and pending-signal bitmask in kernel; kernel-side default actions and `SIG_IGN` work; userspace handler invocation and `sigreturn` frame are not implemented.
+- [x] `done` Add POSIX signal ABI: `sigaction` table and pending-signal bitmask in kernel; kernel-side default actions and `SIG_IGN` work; userspace handler invocation and `sigreturn` frame are implemented.
 
 ## M13: Archived AArch64 Port
 
@@ -224,8 +224,8 @@ and broader utility flag compatibility.
 - [x] `partial` File permissions, capabilities, and ACL metadata.
 - [x] `initial` Standard C library profile for B1NIX userspace.
 - [x] `partial` BusyBox-style standard utilities.
-- [ ] `planned` Add UNIX domain sockets.
-- [ ] `planned` Enforce permissions/capabilities consistently through VFS and process credentials.
+- [x] `done` Add UNIX domain sockets.
+- [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
 - [ ] `planned` Replace signal stubs with real userspace signal delivery.
 
 ## M16: User Space Applications & TUI
@@ -243,8 +243,8 @@ and broader utility flag compatibility.
 - [x] `done` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `rmdir()`, `rename()`, `symlink()`, `readlink()`, `chdir()`, `getdents()`, `statfs()`, `fsync()`, `sync()`, `fcntl()`, `chmod()`, `chown()`, `umask()`.
 - [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
 - [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
-- [x] `initial` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()` initial socket FD ABI.
-- [x] `initial` POSIX Terminal: `ioctl()` and `termios` support for TTY.
+- [x] `done` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()`, `listen()`, `accept()` FD ABI.
+- [x] `done` POSIX Terminal: `ioctl()`, `termios`, and `poll()` support.
 - [x] `done` Add syscall ABI constants and userspace syscall header mirrors.
 - [x] `done` Add `docs/abi.md` for the userspace ELF ABI and calling convention.
 - [x] `initial` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
@@ -375,8 +375,8 @@ more exact text/file utility semantics.
 - [x] `done` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
 - [x] `done` Handle missing network devices gracefully in user-facing network paths.
 - [x] `done` Keep non-x86 network portability concerns out of the active terminal networking target.
-- [ ] `planned` Add TCP server support: `listen`, `accept`, close states, retransmission, and timeout handling.
-- [ ] `planned` Add socket options and `select`/`poll` readiness.
+- [x] `done` Add TCP server support: `listen`, `accept`, close states, retransmission, and timeout handling.
+- [x] `done` Add socket options and `select`/`poll` readiness.
 
 ## M24: Reliability and Diagnostics
 

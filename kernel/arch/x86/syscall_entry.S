@@ -1,7 +1,7 @@
 .section .text
 .code64
 
-.extern syscall_dispatch
+.extern syscall_dispatch_impl
 
 .section .bss
 .align 16
@@ -36,56 +36,102 @@ x86_syscall_entry:
     /* Load kernel RSP from task->kernel_stack_ptr (offset 104) */
     movq 104(%rax), %rsp
     
-    /* Restore RAX from scratch */
-    movq x86_syscall_saved_user_rsp(%rip), %rax
-
-    pushq %rcx  /* Return RIP */
-    pushq %r11  /* Return RFLAGS */
-    pushq %rbp
-    pushq %rbx
-    pushq %r12
-    pushq %r13
-    pushq %r14
+    /* Build a full struct interrupt_frame on the kernel stack */
+    /* Order (highest address to lowest): SS, RSP, RFLAGS, CS, RIP, Error, Vector, R15...RAX */
+    pushq $0x23        /* SS */
+    pushq 112(%rax)    /* RSP */
+    pushq %r11         /* RFLAGS (stored by SYSCALL in R11) */
+    pushq $0x1B        /* CS */
+    pushq %rcx         /* RIP (stored by SYSCALL in RCX) */
+    pushq $0           /* error_code */
+    pushq $0x80        /* vector */
+    
     pushq %r15
-
-    /* Setup arguments for syscall_dispatch(number, arg0, arg1, arg2, arg3, arg4, arg5) */
-    /* Registers at entry: RAX=num, RDI=a0, RSI=a1, RDX=a2, R10=a3, R8=a4, R9=a5 */
-    
-    /* We need to push arg5 (R9) onto the stack as the 7th argument for C */
-    /* Fixed: Add dummy push to maintain 16-byte stack alignment for System V ABI */
-    pushq $0
+    pushq %r14
+    pushq %r13
+    pushq %r12
+    pushq %r11
+    pushq %r10
     pushq %r9
+    pushq %r8
+    pushq %rsi
+    pushq %rdi
+    pushq %rbp
+    pushq %rdx
+    pushq %rcx
+    pushq %rbx
     
-    /* Move others into correct positions for System V ABI */
-    movq %r8, %r9   /* arg4 -> R9 (6th arg) */
-    movq %r10, %r8  /* arg3 -> R8 (5th arg) */
-    movq %rdx, %rcx /* arg2 -> RCX (4th arg) */
-    movq %rsi, %rdx /* arg1 -> RDX (3rd arg) */
-    movq %rdi, %rsi /* arg0 -> RSI (2nd arg) */
-    movq %rax, %rdi /* number -> RDI (1st arg) */
+    /* Restore and push RAX */
+    movq x86_syscall_saved_user_rsp(%rip), %rax
+    pushq %rax
+
+    /* RSP now points to the start of the interrupt_frame.
+     * We pass this pointer as the 8th argument to syscall_dispatch.
+     * Arguments: number(RDI), arg0(RSI), arg1(RDX), arg2(RCX), arg3(R8), arg4(R9), [arg5, frame]
+     */
     
-    call syscall_dispatch
+    /* Setup stack arguments (arg5 and frame) */
+    movq %rsp, %rbp    /* Save frame pointer in RBP temporarily */
+    
+    /* Arguments for System V ABI:
+     * RDI: number
+     * RSI: arg0
+     * RDX: arg1
+     * RCX: arg2
+     * R8:  arg3
+     * R9:  arg4
+     * [stack]: arg5
+     * [stack+8]: frame
+     */
+     
+    /* Push arguments in reverse order (System V ABI stack arguments) */
+    pushq %rbp         /* 8th arg: frame pointer */
+    
+    /* Save arg5 (original R9) before we overwrite it */
+    movq %r9, x86_syscall_saved_user_rsp(%rip)
+    pushq x86_syscall_saved_user_rsp(%rip) /* 7th arg: arg5 */
+    
+    /* Move others into correct positions */
+    movq %r8, %r9      /* arg4 -> R9 */
+    movq %r10, %r8     /* arg3 -> R8 */
+    movq %rdx, %rcx    /* arg2 -> RCX */
+    movq %rsi, %rdx    /* arg1 -> RDX */
+    movq %rdi, %rsi    /* arg0 -> RSI */
+    movq %rax, %rdi    /* number -> RDI */
+    
+    call syscall_dispatch_impl
     
 .global x86_syscall_return
 x86_syscall_return:
-    /* Clean up the 7th argument and padding from stack */
+    /* Clean up the 2 stack arguments */
     addq $16, %rsp
     
-    /* Restore registers */
-    popq %r15
-    popq %r14
-    popq %r13
-    popq %r12
+    /* Restore GPRs from the interrupt_frame */
+    popq %rax
     popq %rbx
-    popq %rbp
-    popq %r11
     popq %rcx
-
-    /* Restore user RSP from current_task->saved_user_rsp */
-    movq %rax, x86_syscall_saved_user_rsp(%rip) /* Save return value temporarily */
-    movq current_task(%rip), %rax
-    movq 112(%rax), %rsp
-    movq x86_syscall_saved_user_rsp(%rip), %rax /* Restore return value */
+    popq %rdx
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %r8
+    popq %r9
+    popq %r10
+    popq %r11
+    popq %r12
+    popq %r13
+    popq %r14
+    popq %r15
+    
+    /* Clean up vector and error code */
+    addq $16, %rsp
+    
+    /* Restore RIP, CS, RFLAGS, RSP, SS (pushed manually) */
+    popq %rcx   /* RIP */
+    addq $8, %rsp /* Skip CS */
+    popq %r11   /* RFLAGS */
+    popq %rsp   /* RSP */
+    /* Skip SS */
     
     sysretq
 

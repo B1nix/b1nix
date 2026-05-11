@@ -22,11 +22,19 @@
 
 #define VFS_DEFAULT_PERMS (VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IROTH)
 
+#define R_OK 4
+#define W_OK 2
+#define X_OK 1
+
+struct vfs_node;
+int vfs_check_access(struct vfs_node *node, int requested_access);
+
 enum vfs_node_type {
   VFS_FILE = 1,
   VFS_DEVICE = 2,
   VFS_DIRECTORY = 3,
   VFS_SYMLINK = 4,
+  VFS_SOCKET = 5,
 };
 
 struct acl_entry {
@@ -164,10 +172,14 @@ int vfs_ioctl(int fd, u64 request, void *arg);
 void vfs_close_on_exec(void);
 int vfs_socket(int domain, int type, int protocol);
 int vfs_bind(int fd, const void *addr, usize addrlen);
+int vfs_listen(int fd, int backlog);
+int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
 void vfs_socket_push_udp(u16 local_port, const void *data, usize len);
+
+extern void *vfs_poll_chan;
 
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);
@@ -225,11 +237,15 @@ struct vfs_socket_state {
   int domain;
   int type;
   int protocol;
-  struct b1nix_sockaddr_in local;
-  struct b1nix_sockaddr_in peer;
+  union {
+    struct b1nix_sockaddr_in in;
+    struct b1nix_sockaddr_un un;
+  } local, peer;
   int bound;
   int connected;
+  int listening;
   void *tcp_conn;
+  void *unix_data;
   char recv_buf[2048];
   usize recv_len;
 };

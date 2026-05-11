@@ -901,6 +901,8 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
   u64 start_ticks = scheduler_get_uptime_ticks();
   u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
+  
+  extern void *vfs_poll_chan;
 
   while (1) {
     int ready = 0;
@@ -928,8 +930,32 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       }
     }
 
-    scheduler_yield();
+    scheduler_block_on(vfs_poll_chan);
   }
+}
+
+static u64 sys_listen(int fd, int backlog) {
+  return (u64)vfs_listen(fd, backlog);
+}
+
+static u64 sys_accept(int fd, void *addr, usize *addrlen) {
+  /*addrlen is both in and out */
+  usize k_addrlen = 0;
+  if (addrlen) {
+    if (syscall_copyin(&k_addrlen, addrlen, sizeof(usize)) != 0) return (u64)-EFAULT;
+  }
+  
+  char k_addr[128]; /* enough for sockaddr_un */
+  int res = vfs_accept(fd, k_addr, &k_addrlen);
+  if (res >= 0) {
+    if (addr && k_addrlen > 0) {
+      if (syscall_copyout(addr, k_addr, k_addrlen) != 0) return (u64)-EFAULT;
+    }
+    if (addrlen) {
+      if (syscall_copyout(addrlen, &k_addrlen, sizeof(usize)) != 0) return (u64)-EFAULT;
+    }
+  }
+  return (u64)res;
 }
 
 static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
@@ -1103,10 +1129,7 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   return 0;
 }
 
-static u64 sys_sigreturn(void) {
-  klog_warn("sys_sigreturn called: stub\n");
-  scheduler_exit_current(-1);
-}
+/* sigreturn is now in kernel/arch/x86/signal.c */
 
 static u64 sys_brk(u64 addr) {
   struct task *t = current_task;
@@ -1161,14 +1184,16 @@ static u64 sys_brk(u64 addr) {
   return t->user_brk;
 }
 
-u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
-                     u64 arg4, u64 arg5) {
+u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+  u64 ret = 0;
   switch (number) {
   case SYS_WRITE:
     return (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
   case SYS_EXIT:
     scheduler_exit_current((int)arg0);
-    return 0;
+    ret = 0;
+    break;
   case SYS_SPAWN: {
     return (u64)sys_spawn((const char *)(usize)arg0, (int)arg1,
                           (const char **)(usize)arg2);
@@ -1396,6 +1421,10 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_RECV:
     return (u64)vfs_socket_recv((int)arg0, (void *)(usize)arg1, (usize)arg2,
                                 (int)arg3);
+  case SYS_LISTEN:
+    return sys_listen((int)arg0, (int)arg1);
+  case SYS_ACCEPT:
+    return sys_accept((int)arg0, (void *)(usize)arg1, (usize *)(usize)arg2);
 #ifndef __aarch64__
   case SYS_NET_INFO:
     net_dump_info();
@@ -1506,11 +1535,20 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_POLL:
     return sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
   case SYS_SIGRETURN:
-    return sys_sigreturn();
+    ret = sys_sigreturn(frame);
+    break;
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);
     console_write("\n");
-    return (u64)-ENOSYS;
+    ret = (u64)-ENOSYS;
+    break;
   }
+
+  /* Check for pending signals before returning to userspace */
+  if (frame) {
+    arch_check_and_deliver_signals(frame);
+  }
+
+  return ret;
 }

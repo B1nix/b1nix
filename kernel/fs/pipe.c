@@ -11,14 +11,18 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) return -EIO;
   
-  while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-  if (pipe->size == 0) {
-    if (pipe->writers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return 0; }
-    if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
-    __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
-    scheduler_yield();
-    return pipe_read(h, buf, size);
+  while (1) {
+    while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+    if (pipe->size == 0) {
+      if (pipe->writers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return 0; }
+      if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      scheduler_block_on(pipe);
+      continue;
+    }
+    break;
   }
+  
   usize to_r = size < pipe->size ? size : pipe->size;
   for (usize i = 0; i < to_r; i++) {
     buf[i] = pipe->buffer[pipe->read_pos];
@@ -26,6 +30,11 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   }
   pipe->size -= to_r;
   __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  
+  /* Wake up writers */
+  scheduler_wake_all(pipe);
+  scheduler_wake_all(vfs_poll_chan);
+  
   return (isize)to_r;
 }
 
@@ -33,15 +42,20 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) return -EIO;
 
-  while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-  if (pipe->readers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EPIPE; }
-  usize free_space = PIPE_BUFFER_SIZE - pipe->size;
-  if (free_space == 0) {
-    if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
-    __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
-    scheduler_yield();
-    return pipe_write(h, buf, size);
+  while (1) {
+    while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+    if (pipe->readers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EPIPE; }
+    usize free_space = PIPE_BUFFER_SIZE - pipe->size;
+    if (free_space == 0) {
+      if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      scheduler_block_on(pipe);
+      continue;
+    }
+    break;
   }
+  
+  usize free_space = PIPE_BUFFER_SIZE - pipe->size;
   usize to_w = size < free_space ? size : free_space;
   for (usize i = 0; i < to_w; i++) {
     pipe->buffer[pipe->write_pos] = buf[i];
@@ -49,6 +63,11 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
   }
   pipe->size += to_w;
   __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+  
+  /* Wake up readers */
+  scheduler_wake_all(pipe);
+  scheduler_wake_all(vfs_poll_chan);
+  
   return (isize)to_w;
 }
 
@@ -56,8 +75,13 @@ static int pipe_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) { pfd->revents = B1NIX_POLLHUP; return 0; }
   pfd->revents = 0;
-  if (h->kind == VFS_HANDLE_PIPE_READ && pipe->size > 0) pfd->revents |= B1NIX_POLLIN;
-  if (h->kind == VFS_HANDLE_PIPE_WRITE && pipe->size < PIPE_BUFFER_SIZE) pfd->revents |= B1NIX_POLLOUT;
+  if (h->kind == VFS_HANDLE_PIPE_READ) {
+    if (pipe->size > 0) pfd->revents |= B1NIX_POLLIN;
+    if (pipe->writers == 0) pfd->revents |= B1NIX_POLLHUP;
+  } else if (h->kind == VFS_HANDLE_PIPE_WRITE) {
+    if (pipe->size < PIPE_BUFFER_SIZE) pfd->revents |= B1NIX_POLLOUT;
+    if (pipe->readers == 0) pfd->revents |= B1NIX_POLLERR;
+  }
   return 0;
 }
 
@@ -66,6 +90,11 @@ static void pipe_release(struct vfs_handle *h) {
   if (!pipe) return;
   if (h->kind == VFS_HANDLE_PIPE_READ) pipe->readers--;
   else pipe->writers--;
+  
+  /* Wake up anyone waiting on the pipe */
+  scheduler_wake_all(pipe);
+  scheduler_wake_all(vfs_poll_chan);
+  
   if (pipe->readers <= 0 && pipe->writers <= 0) pipe->used = 0;
 }
 

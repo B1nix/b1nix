@@ -1,3 +1,4 @@
+#include <b1nix/arch_x86.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/mm.h>
@@ -31,29 +32,6 @@ struct idt_entry {
 struct idt_pointer {
   u16 limit;
   u64 base;
-} __attribute__((packed));
-
-struct interrupt_frame {
-  u64 rax;
-  u64 rbx;
-  u64 rcx;
-  u64 rdx;
-  u64 rbp;
-  u64 rdi;
-  u64 rsi;
-  u64 r8;
-  u64 r9;
-  u64 r10;
-  u64 r11;
-  u64 r12;
-  u64 r13;
-  u64 r14;
-  u64 r15;
-  u64 vector;
-  u64 error_code;
-  u64 rip;
-  u64 cs;
-  u64 rflags;
 } __attribute__((packed));
 
 static struct idt_entry idt[IDT_ENTRY_COUNT];
@@ -231,6 +209,10 @@ void x86_irq_handler(struct interrupt_frame *frame) {
   console_write_hex64(frame->vector);
   console_write("\n");
   outb(PIC1_COMMAND, PIC_EOI);
+  
+  if (frame->cs == 0x1B || frame->cs == 0x23) {
+    arch_check_and_deliver_signals(frame);
+  }
 }
 
 void x86_exception_handler(struct interrupt_frame *frame) {
@@ -240,6 +222,9 @@ void x86_exception_handler(struct interrupt_frame *frame) {
     u64 error_code = frame->error_code;
 
     if (vmm_handle_page_fault(fault_addr, error_code) == 0) {
+      if (frame->cs == 0x1B || frame->cs == 0x23) {
+        arch_check_and_deliver_signals(frame);
+      }
       return; // Successfully handled
     }
   }

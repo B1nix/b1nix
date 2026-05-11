@@ -23,6 +23,9 @@
 #define VFS_CTIME 0x04
 #define VFS_MAX_SYMLINK_DEPTH 8
 
+static char poll_chan_obj;
+void *vfs_poll_chan = &poll_chan_obj;
+
 static volatile int node_pool_lock = 0;
 static volatile int inode_pool_lock = 0;
 static volatile int vfs_handle_lock = 0;
@@ -370,6 +373,18 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 /* ── Permission Helpers ── */
 
 extern struct cred *scheduler_get_current_cred(void);
+
+int vfs_check_access(struct vfs_node *node, int requested_access) {
+  if (!node)
+    return -ENOENT;
+  const struct cred *cred = get_current_cred();
+  if (!cred)
+    return -EACCES;
+  if (vfs_get_node_perm(node, cred, (u32)requested_access)) {
+    return 0;
+  }
+  return -EACCES;
+}
 
 int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
                       u32 mask) {
@@ -721,6 +736,15 @@ restart_traversal:
         pop_path_part(parent_path);
       }
       continue;
+    }
+
+    /* POSIX: Check directory traversal permission (execute bit) */
+    if (vfs_check_access(current, X_OK) != 0) {
+      vfs_inode_unlock_read(current->inode);
+      vfs_node_put(current);
+      kfree(curr_path);
+      kfree(parent_path);
+      return ERR_PTR(-EACCES);
     }
 
     struct vfs_node *child = find_child(current, part);
@@ -1298,23 +1322,22 @@ int vfs_open_flags(const char *path, int flags) {
     goto out;
   }
 
-  const struct cred *cred = get_current_cred();
-  u32 access_mask = 0;
+  int access_mask = 0;
   if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
-    access_mask |= 2;
+    access_mask |= W_OK;
   if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
-    access_mask |= 4;
-  if (cred && !vfs_get_node_perm(node, cred, access_mask)) {
-    res = -EACCES;
+    access_mask |= R_OK;
+
+  res = vfs_check_access(node, access_mask);
+  if (res != 0) {
     vfs_node_put(node);
     goto out;
   }
 
   if ((flags & B1NIX_O_TRUNC) && node->inode->type == VFS_FILE) {
     /* O_TRUNC requires write permission regardless of open mode */
-    const struct cred *tc = get_current_cred();
-    if (tc && !vfs_get_node_perm(node, tc, 2)) {
-      res = -EACCES;
+    res = vfs_check_access(node, W_OK);
+    if (res != 0) {
       vfs_node_put(node);
       goto out;
     }
@@ -1731,8 +1754,8 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
     return -ENOTDIR;
   }
 
-  const struct cred *cred = get_current_cred();
-  if (cred && !vfs_get_node_perm(dir, cred, 4)) {
+  int res = vfs_check_access(dir, R_OK);
+  if (res != 0) {
     vfs_node_put(dir);
     return 0;
   }
@@ -2072,10 +2095,9 @@ int vfs_link(const char *target, const char *link_path) {
   }
 
   vfs_inode_lock(parent->inode);
-  const struct cred *cred = get_current_cred();
-  if (cred && !vfs_get_node_perm(parent, cred, 2)) {
+  res = vfs_check_access(parent, W_OK);
+  if (res != 0) {
     vfs_inode_unlock(parent->inode);
-    res = -EACCES;
     goto out;
   }
 
@@ -2273,10 +2295,10 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     goto out_put_parents;
   }
 
-  const struct cred *cred = get_current_cred();
-  if (cred && (!vfs_get_node_perm(old_parent, cred, 2) ||
-               !vfs_get_node_perm(new_parent, cred, 2))) {
-    res = -EACCES;
+  res = vfs_check_access(old_parent, W_OK);
+  if (res == 0)
+    res = vfs_check_access(new_parent, W_OK);
+  if (res != 0) {
     goto out_put_parents;
   }
 

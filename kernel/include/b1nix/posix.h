@@ -25,7 +25,10 @@
 #define B1NIX_F_SETLKW 7
 #define B1NIX_FD_CLOEXEC 1
 
+#define B1NIX_AF_UNIX 1
+#define B1NIX_AF_LOCAL B1NIX_AF_UNIX
 #define B1NIX_AF_INET 2
+
 #define B1NIX_SOCK_STREAM 1
 #define B1NIX_SOCK_DGRAM 2
 
@@ -79,6 +82,11 @@ struct b1nix_sockaddr_in {
 	u16 sin_port;
 	u32 sin_addr;
 	u8  sin_zero[8];
+};
+
+struct b1nix_sockaddr_un {
+	u16 sun_family;
+	char sun_path[108];
 };
 
 struct b1nix_utsname {

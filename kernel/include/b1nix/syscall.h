@@ -92,31 +92,37 @@ enum {
 	SYS_NET_INFO = 75,
 	SYS_NET_PING = 76,
 	SYS_NET_DNS  = 77,
+	SYS_LISTEN   = 78,
+	SYS_ACCEPT   = 79,
 
 	/* --- System Info & Misc --- */
-	SYS_TIME     = 78,
-	SYS_UNAME    = 79,
-	SYS_GETCWD   = 80,
-	SYS_CHDIR    = 81,
-	SYS_REBOOT   = 82,
-	SYS_DMESG    = 83,
-	SYS_MOUNT    = 84,
-	SYS_UMOUNT   = 85,
-	SYS_MOUNTS   = 86,
-	SYS_PS       = 87,
-	SYS_CLEAR    = 88,
-	SYS_SET_STDOUT = 89,
-	SYS_READ_KBD = 90,
-	SYS_TERMIOS_GET = 91,
-	SYS_TERMIOS_SET = 92,
-	SYS_SELFHOST_STATUS = 93,
-	SYS_LINK     = 94,
-	SYS_POLL     = 95,
-	SYS_MPROTECT = 96,
-	SYS_SIGRETURN = 97,
+	SYS_TIME     = 80,
+	SYS_UNAME    = 81,
+	SYS_GETCWD   = 82,
+	SYS_CHDIR    = 83,
+	SYS_REBOOT   = 84,
+	SYS_DMESG    = 85,
+	SYS_MOUNT    = 86,
+	SYS_UMOUNT   = 87,
+	SYS_MOUNTS   = 88,
+	SYS_PS       = 89,
+	SYS_CLEAR    = 90,
+	SYS_SET_STDOUT = 91,
+	SYS_READ_KBD = 92,
+	SYS_TERMIOS_GET = 93,
+	SYS_TERMIOS_SET = 94,
+	SYS_SELFHOST_STATUS = 95,
+	SYS_LINK     = 96,
+	SYS_POLL     = 97,
+	SYS_MPROTECT = 98,
+	SYS_SIGRETURN = 99,
 };
 
-u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5);
+#include <b1nix/arch_x86.h>
+u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, struct interrupt_frame *frame);
+
+#define SYSCALL_DISPATCH_X(x, n, a0, a1, a2, a3, a4, a5, f, FUNC, ...) FUNC
+#define syscall_dispatch(...) SYSCALL_DISPATCH_X(, ##__VA_ARGS__, syscall_dispatch_impl(__VA_ARGS__), syscall_dispatch_impl(__VA_ARGS__, 0))
 int syscall_copyin(void *dst, const void *user_src, usize size);
 int syscall_copyout(void *user_dst, const void *src, usize size);
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src);

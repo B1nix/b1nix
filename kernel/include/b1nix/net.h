@@ -61,5 +61,20 @@ struct ipv4_addr net_get_ip(void);
 struct ipv4_addr net_get_gateway(void);
 void net_set_ip(struct ipv4_addr ip);
 void net_set_gateway(struct ipv4_addr gw);
+ 
+struct vfs_socket_state;
+struct b1nix_sockaddr_un;
+struct b1nix_pollfd;
+
+// UNIX Domain Sockets (Internal)
+int unix_init_state(struct vfs_socket_state *s);
+void unix_free_state(struct vfs_socket_state *s);
+int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
+int unix_listen(struct vfs_socket_state *s, int backlog);
+int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
+int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s);
+isize unix_send(struct vfs_socket_state *s, const void *buf, usize len);
+isize unix_recv(struct vfs_socket_state *s, void *buf, usize len);
+int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd);
 
 #endif
