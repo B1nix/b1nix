@@ -55,6 +55,8 @@ int user_spawn(const char *path, int argc, const char **argv);
 int user_execve_current(const char *path, const char **argv, const char **envp);
 void user_register_builtin_programs(void);
 const struct user_program *user_find_program(const char *path);
+struct task;
+void user_address_space_cleanup(struct task *t);
 void user_image_free(struct user_loaded_image *image);
 
 #endif

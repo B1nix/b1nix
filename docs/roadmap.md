@@ -75,16 +75,16 @@ and broader utility flag compatibility.
 
 ## M4: Userspace
 
-- [x] `initial` Add user address-space objects.
-- [x] `initial` Add syscall dispatcher ABI.
+- [x] `done` Add user address-space objects.
+- [x] `done` Add syscall dispatcher ABI.
 - [x] `done` Add initramfs.
 - [x] `done` Run `/bin/init`.
 - [x] `done` Add basic shell.
-- [x] `partial` Add ELF64 loading from VFS with per-process page mapping via VMM, argc/argv/envp/auxv stack metadata, and hardware ring3 entry.
-- [x] `initial` Add syscall `copyin`/`copyout`/`copyinstr` helpers.
-- [x] `partial` Add built-in program fallback when ELF loading fails.
+- [x] `done` Add ELF64 loading from VFS with per-process page mapping via VMM, argc/argv/envp/auxv stack metadata, and hardware ring3 entry.
+- [x] `done` Add syscall `copyin`/`copyout`/`copyinstr` helpers.
+- [x] `done` Add built-in program fallback when ELF loading fails.
 - [x] `done` Add hardware-enforced ring3 userspace entry/return for normal programs.
-- [x] `initial` Add native ELF execution with real user registers and shared page tables.
+- [x] `done` Add native ELF execution with real user registers and shared page tables.
 
 ## M5: VFS and Devices
 
@@ -256,7 +256,7 @@ and broader utility flag compatibility.
 
 - [x] `partial` Load ELF64 executables from VFS with per-process page mapping via VMM (PT_LOAD segments mapped page-by-page into user address space).
 - [x] `partial` Build a user address-space record per process.
-- [x] `done` Add syscall `copyin`/`copyout` helpers for user pointers.
+- [x] `done` Add syscall `copyin`/`copyout`/`copyinstr` helpers for user pointers.
 - [x] `partial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics (AT_NULL, AT_ENTRY, AT_PHDR present).
 - [x] `partial` Implement `execve()` as image replacement with `vfs_close_on_exec()` and full ELF segment loading.
 - [x] `initial` Add process exit status propagation and zombie reaping semantics.

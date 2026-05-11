@@ -19,8 +19,8 @@
 
 extern struct task *current_task;
 
-#define MAX_EXEC_ARGS 32
-#define MAX_EXEC_ARG_LEN 1024
+#define MAX_EXEC_ARGS 256
+#define MAX_EXEC_ARG_LEN 4096
 static int copy_from_user(void *dst, const void *src, usize size);
 static int copy_to_user(void *dst, const void *src, usize size);
 static isize strncpy_from_user(char *dst, const char *src, usize size);
@@ -125,29 +125,53 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
   if (!dst || dst_size == 0 || !user_src)
     return -EFAULT;
 
-  // Validate the first byte to check if user_src is at least accessible
-  if (!is_user_range_valid(user_src, 1, 0)) {
-    return -EFAULT;
-  }
+  usize copied = 0;
+  u64 curr = (u64)(usize)user_src;
 
-  for (usize i = 0; i < dst_size; i++) {
-    char c;
-    // We check byte by byte for strings because we don't know the length upfront.
-    // However, is_user_range_valid is expensive. A better way would be to check 
-    // the VMA once for the start address and then check if we cross VMA boundaries.
-    // For simplicity, we check each page boundary or each byte.
-    // Here we check each byte for safety.
-    if (!is_user_range_valid(user_src + i, 1, 0)) {
-      return -EFAULT;
+  while (copied < dst_size) {
+    // Verify that the address is in userspace
+    if (curr >= 0x0000800000000000ULL) return -EFAULT;
+
+    // Find the VMA covering the current address
+    struct vm_area *vma = current_task->vma_list;
+    int found = 0;
+    while (vma) {
+      if (curr >= vma->start && curr < vma->end) {
+        if (!(vma->prot & PROT_READ)) return -EFAULT;
+        found = 1;
+        break;
+      }
+      vma = vma->next;
     }
 
-    c = user_src[i];
-    dst[i] = c;
-    if (c == '\0')
-      return 0;
+    /* Fallback for builtin programs or early boot where VMA list might be empty */
+    if (!found) {
+      struct task *t = current_task;
+      if (!t || !t->user_image) found = 1;
+      else {
+        struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+        if (img->kind == USER_IMAGE_BUILTIN) found = 1;
+      }
+    }
+
+    if (!found) return -EFAULT;
+
+    // Determine chunk size: up to VMA end or buffer end
+    u64 remaining_in_vma = (vma && found && vma->end > curr) ? (vma->end - curr) : (PAGE_SIZE - (curr & (PAGE_SIZE - 1)));
+    u64 remaining_in_dst = dst_size - copied;
+    u64 chunk_size = remaining_in_vma < remaining_in_dst ? remaining_in_vma : remaining_in_dst;
+
+    // Copy characters
+    for (u64 i = 0; i < chunk_size; i++) {
+      char c = ((const char *)(usize)curr)[i];
+      dst[copied++] = c;
+      if (c == '\0') return 0;
+    }
+
+    curr += chunk_size;
   }
 
-  dst[dst_size - 1] = '\0';
+  if (dst_size > 0) dst[dst_size - 1] = '\0';
   return -ENAMETOOLONG;
 }
 
@@ -1079,6 +1103,11 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   return 0;
 }
 
+static u64 sys_sigreturn(void) {
+  klog_warn("sys_sigreturn called: stub\n");
+  scheduler_exit_current(-1);
+}
+
 static u64 sys_brk(u64 addr) {
   struct task *t = current_task;
   if (!t)
@@ -1476,6 +1505,8 @@ u64 syscall_dispatch(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
   case SYS_POLL:
     return sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
+  case SYS_SIGRETURN:
+    return sys_sigreturn();
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

@@ -66,7 +66,7 @@ static const char posix_smoke_script[] =
     "rm /tmp/posix_test\n"
     "[ ! -f /tmp/posix_test ] && echo \"ok rm\" || echo \"fail rm\"\n"
     "echo \"POSIX-SMOKE: done\"\n"
-    "sync\n";
+    "reboot\n";
 
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),

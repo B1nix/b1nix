@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
@@ -161,11 +162,22 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   }
 
   sp &= ~(usize)0xf;
+
+  /* FIX: Ensure the final stack pointer will be 16-byte aligned.
+   * We push: argc(1), argv(argc), NULL(1), envp(envc), NULL(1), auxv(5).
+   * Total slots = 1 + image->argc + 1 + envc + 1 + 5 = image->argc + envc + 9.
+   * If total_slots is odd, we need 8 bytes of padding to keep 16-byte alignment.
+   */
+  usize total_slots = 9 + (usize)image->argc + (usize)envc;
+  if (total_slots % 2 != 0) {
+    user_stack_push_u64(stack, &sp, 0);
+  }
+
   user_stack_push_u64(stack, &sp, 0); /* AT_NULL */
   user_stack_push_u64(stack, &sp, 9); /* AT_ENTRY */
   user_stack_push_u64(stack, &sp, image->entry);
   user_stack_push_u64(stack, &sp,
-                      3); /* AT_PHDR, populated virtually for debuggers */
+                      3); /* AT_PHDR */
   user_stack_push_u64(stack, &sp, 0);
 
   user_stack_push_u64(stack, &sp, 0);
@@ -239,23 +251,34 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   usize file_size = 0;
   if (user_image_read_vfs_file(path, &file_data, &file_size) != 0)
     return -1;
-  if (file_size < sizeof(struct elf64_ehdr))
+  if (file_size < sizeof(struct elf64_ehdr)) {
+    kfree(file_data);
     return -1;
+  }
 
   struct elf64_ehdr *ehdr = (struct elf64_ehdr *)file_data;
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
       ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
+    kfree(file_data);
     return -1;
   }
-  if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE)
+  if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE) {
+    kfree(file_data);
     return -1;
-  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN)
+  }
+  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN) {
+    kfree(file_data);
     return -1;
+  }
   if (ehdr->e_machine != ELF_MACHINE_X86_64 &&
-      ehdr->e_machine != ELF_MACHINE_AARCH64)
+      ehdr->e_machine != ELF_MACHINE_AARCH64) {
+    kfree(file_data);
     return -1;
-  if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size)
+  }
+  if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
+    kfree(file_data);
     return -1;
+  }
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
@@ -268,11 +291,15 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
                               ((u64)i * ehdr->e_phentsize));
     if (phdr->p_type != PT_LOAD)
       continue;
-    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS)
+    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS) {
+      kfree(file_data);
       return -1;
+    }
     if (phdr->p_offset + phdr->p_filesz > file_size ||
-        phdr->p_filesz > phdr->p_memsz)
+        phdr->p_filesz > phdr->p_memsz) {
+      kfree(file_data);
       return -1;
+    }
 
     struct user_image_segment *segment =
         &image->segments[image->segment_count++];
@@ -284,14 +311,17 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     /* FIX: Allocate only p_filesz to avoid huge memory allocations for .bss */
     if (phdr->p_filesz > 0) {
       segment->data = kzalloc(phdr->p_filesz);
-      if (!segment->data)
+      if (!segment->data) {
+        kfree(file_data);
         return -1;
+      }
       memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
     } else {
       segment->data = 0;
     }
   }
 
+  kfree(file_data);
   return image->segment_count > 0 ? 0 : -1;
 }
 
@@ -351,18 +381,18 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->argc = 1;
   }
 
+  if (user_load_elf64(image, path) == 0) {
+    if (user_build_initial_stack(image) != 0)
+      return 0;
+    return image;
+  }
+
   const struct user_program *program = user_find_program(path);
   if (program) {
     image->kind = USER_IMAGE_BUILTIN;
     image->path = kernel_strdup(path);
     image->entry = (u64)(usize)program->entry;
     image->address_space = user_address_space_create();
-    if (user_build_initial_stack(image) != 0)
-      return 0;
-    return image;
-  }
-
-  if (user_load_elf64(image, path) == 0) {
     if (user_build_initial_stack(image) != 0)
       return 0;
     return image;
@@ -408,7 +438,35 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
   return 0;
 }
 
+void user_address_space_cleanup(struct task *t) {
+  if (!t) return;
+  interrupts_disable();
+  struct vm_area *vma = t->vma_list;
+  t->vma_list = NULL;
+  interrupts_enable();
+
+  while (vma) {
+    struct vm_area *next = vma->next;
+
+    /* FIX: Unmap actual physical hardware frames to prevent memory leaks */
+    for (u64 v = vma->start; v < vma->end; v += PAGE_SIZE) {
+      vmm_unmap_page(v);
+    }
+
+    if (vma->node) {
+      vfs_node_put(vma->node);
+    }
+    kfree(vma);
+    vma = next;
+  }
+}
+
 static int user_run_elf_image(struct user_loaded_image *image) {
+  /* FIX: Clear old VMAs if this is an execve image replacement */
+  if (current_task) {
+    user_address_space_cleanup(current_task);
+  }
+
   console_write("user_run_elf: entry=");
   console_write_hex64(image->entry);
   console_write("\n");

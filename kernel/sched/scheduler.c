@@ -27,21 +27,7 @@ static volatile u64 scheduler_ticks;
 static int scheduler_started;
 static void task_init_cred(struct task *task);
 
-static void interrupts_disable(void) {
-#ifdef __aarch64__
-  __asm__ volatile("msr daifset, #2" : : : "memory");
-#else
-  __asm__ volatile("cli" : : : "memory");
-#endif
-}
-
-static void interrupts_enable(void) {
-#ifdef __aarch64__
-  __asm__ volatile("msr daifclr, #2" : : : "memory");
-#else
-  __asm__ volatile("sti" : : : "memory");
-#endif
-}
+#include <b1nix/arch.h>
 
 static u64 align_down_u64(u64 value, u64 alignment) {
   return value & ~(alignment - 1);
@@ -508,6 +494,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               user_image_free(tasks[i].user_image);
               tasks[i].user_image = 0;
             }
+            user_address_space_cleanup(&tasks[i]);
             kfree(tasks[i].stack);
             tasks[i].state = TASK_UNUSED;
             interrupts_enable();
