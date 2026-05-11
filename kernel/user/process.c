@@ -646,6 +646,14 @@ int user_execve_current(const char *path, const char **argv,
 
   vfs_close_on_exec();
 
+  // POSIX: Reset caught signals to default action across execve.
+  // Ignored signals (SIG_IGN) remain ignored.
+  for (int sig = 1; sig < NSIG; sig++) {
+    if (current_task->sigactions[sig].sa_handler != SIG_IGN) {
+      current_task->sigactions[sig].sa_handler = SIG_DFL;
+    }
+  }
+
   int code = 0;
   if (image->kind == USER_IMAGE_ELF64) {
     code = user_run_elf_image(image);

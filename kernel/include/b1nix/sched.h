@@ -1,5 +1,7 @@
 #ifndef B1NIX_SCHED_H
 #define B1NIX_SCHED_H
+#define B1NIX_WNOHANG 1
+#define B1NIX_WUNTRACED 2
 
 #include <b1nix/types.h>
 
@@ -185,6 +187,7 @@ void scheduler_fd_close_on_exec(void);
 
 /* ── Signal API ── */
 int scheduler_kill(usize task_id, int sig);
+int scheduler_kill_process_group(usize pgrp, int sig);
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old);
 void scheduler_deliver_pending_signals(void);

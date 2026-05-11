@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
@@ -267,6 +268,11 @@ int scheduler_fork_current(void) {
   child->parent_id = parent->id;
   child->state = TASK_READY;
   
+  // Clear inherited pending signals and sleep/block states
+  child->pending_signals = 0;
+  child->wake_tick = 0;
+  child->wait_chan = 0;
+  
   // 2. Allocate and copy kernel stack
   void *child_stack = kmalloc(KERNEL_STACK_SIZE);
   if (!child_stack) {
@@ -508,6 +514,13 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             if (status)
               *status = code;
             return child_id;
+          } else if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_BLOCKED) {
+            // Task is stopped (e.g. by SIGSTOP, SIGTSTP, etc.)
+            int child_id = tasks[i].id;
+            if (status)
+              *status = 0x7F; // Stopped
+            interrupts_enable();
+            return child_id;
           }
         }
       }
@@ -689,6 +702,27 @@ int scheduler_kill(usize task_id, int sig) {
   }
   interrupts_enable();
   return -1;
+}
+
+int scheduler_kill_process_group(usize pgrp, int sig) {
+  if (sig < 1 || sig >= NSIG || pgrp == 0)
+    return -1;
+
+  int sent = 0;
+  interrupts_disable();
+  for (usize i = 0; i < MAX_TASKS; i++) {
+    if (tasks[i].state != TASK_UNUSED && tasks[i].process_group_id == pgrp) {
+      tasks[i].pending_signals |= (1ULL << sig);
+
+      /* Wake blocked task so it can handle signal */
+      if (tasks[i].state == TASK_BLOCKED) {
+        tasks[i].state = TASK_READY;
+      }
+      sent++;
+    }
+  }
+  interrupts_enable();
+  return sent > 0 ? 0 : -1;
 }
 
 int scheduler_sigaction(int sig, const struct sigaction *act,
@@ -907,6 +941,10 @@ int scheduler_setpgrp(usize pid, usize pgrp) {
   interrupts_disable();
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
+      if (tasks[i].session_id != current_task->session_id) {
+        interrupts_enable();
+        return -EPERM;
+      }
       tasks[i].process_group_id = pgrp;
       interrupts_enable();
       return 0;

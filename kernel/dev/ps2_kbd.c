@@ -1,5 +1,6 @@
 #include <b1nix/console.h>
 #include <b1nix/io.h>
+#include <b1nix/sched.h>
 #include <b1nix/types.h>
 
 #define KBD_BUFFER_SIZE 256
@@ -117,6 +118,20 @@ void ps2_kbd_interrupt_handler(void)
 					c = (char)(c - 'a' + 1);
 				} else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
 					c = (char)(c - 'A' + 1);
+				}
+				if ((console.termios.c_lflag & B1NIX_ISIG) && c == 3) {
+					if (console.fg_pgrp > 0) {
+						scheduler_kill_process_group(console.fg_pgrp, SIGINT);
+					}
+					console_write("^C\n");
+					return;
+				}
+				if ((console.termios.c_lflag & B1NIX_ISIG) && c == 26) {
+					if (console.fg_pgrp > 0) {
+						scheduler_kill_process_group(console.fg_pgrp, SIGTSTP);
+					}
+					console_write("^Z\n");
+					return;
 				}
 				kbd_push(c);
 			}

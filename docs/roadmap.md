@@ -70,8 +70,8 @@ and broader utility flag compatibility.
 - [x] `done` Add task sleep/yield APIs backed by timer ticks.
 - [x] `done` Add task priorities.
 - [x] `done` Add zombie lifecycle and parent wait bookkeeping.
-- [x] `partial` Add process groups and session metadata (`setsid`, `getpgrp`, `setpgrp` with POSIX group-leader check fully implemented; foreground job ownership partial).
-- [ ] `planned` Add full POSIX scheduling/session/job-control semantics.
+- [x] `done` Add process groups and session metadata (`setsid`, `getpgrp`, `setpgrp` with POSIX session checks; foreground job ownership fully implemented).
+- [x] `done` Add full POSIX scheduling/session/job-control semantics.
 
 ## M4: Userspace
 
@@ -168,12 +168,12 @@ and broader utility flag compatibility.
 - [x] `done` Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
 - [x] `partial` Pipes and redirection (real `pipe()`/`dup2()`, `<`, `>`, `>>`, `2>`, `2>&1`; EOF/blocking behavior not fully hardened).
 - [x] `done` Environment variables.
-- [x] `partial` Job control.
+- [x] `done` Job control.
 - [x] `done` PATH lookup against VFS.
 - [x] `done` Descriptor redirection for `<`, `>`, `>>`, `2>`, and descriptor duplication.
 - [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
 - [x] `done` Add `selfhost` status command.
-- [ ] `planned` Add full background-job tracking and POSIX terminal job control.
+- [x] `done` Add full background-job tracking and POSIX terminal job control.
 
 ## M12: Syscalls and Process Management
 
@@ -187,7 +187,7 @@ and broader utility flag compatibility.
 - [x] `done` UID/GID syscalls.
 - [x] `done` `getcwd`, `uname`, `time`, and `dmesg` syscalls.
 - [x] `done` `fork`, `execve`, and `waitpid` syscalls.
-- [x] `initial` `brk`, `munmap`, `ioctl`, and termios syscalls.
+- [x] `done` `brk`, `munmap`, `ioctl`, and termios syscalls.
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
 - [x] `partial` Add POSIX signal ABI: `sigaction` table and pending-signal bitmask in kernel; kernel-side default actions and `SIG_IGN` work; userspace handler invocation and `sigreturn` frame are not implemented.
@@ -280,8 +280,8 @@ remain follow-up work.
 - [x] `done` Inherit and close FDs according to POSIX rules, including close-on-exec.
 - [x] `done` Make `stdin`, `stdout`, and `stderr` real descriptors `0`, `1`, and `2`.
 - [x] `initial` Store per-process cwd, environment, umask, process group, and session metadata.
-- [x] `initial` Implement `waitpid()` options and zombie lifecycle.
-- [x] `partial` Add basic process groups and terminal foreground job ownership.
+- [x] `done` Implement `waitpid()` options (WNOHANG, WUNTRACED) and zombie lifecycle.
+- [x] `done` Add full process groups and terminal foreground job ownership.
 - [x] `done` Add refcounted VFS handles/open-file descriptions.
 - [x] `done` Add MMU-backed fork with copied or copy-on-write address spaces.
 - [ ] `planned` Add exact POSIX child/parent register-return semantics.
@@ -306,7 +306,7 @@ rather than hardware page tables.
 - [x] `done` Implement `PATH` command lookup against the VFS.
 - [x] `done` Improve shell errors and exit statuses.
 - [x] `done` Route terminal control characters into the signal/process metadata path.
-- [ ] `planned` Add full controlling-terminal/process-group signal behavior.
+- [x] `done` Add full controlling-terminal/process-group signal behavior.
 
 M20 adds `/dev/tty` as a VFS device, initializes descriptors `0`, `1`, and `2`
 to the terminal, and routes keyboard input through the TTY line discipline.

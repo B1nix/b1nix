@@ -12,6 +12,8 @@ static usize cursor_row;
 static usize cursor_col;
 static u8 current_color = 0x0f;
 
+struct console_state console;
+
 extern void fb_console_init(void);
 extern void fb_console_write(const char *str);
 extern void fb_console_putchar(char c);
@@ -53,6 +55,7 @@ void console_init(void)
 	volatile u16 *vga = VGA_MEMORY;
 	cursor_row = 0;
 	cursor_col = 0;
+	console.fg_pgrp = 1;
 
 	for (usize row = 0; row < VGA_HEIGHT; row++) {
 		for (usize col = 0; col < VGA_WIDTH; col++) {

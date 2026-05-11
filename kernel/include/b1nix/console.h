@@ -1,7 +1,15 @@
 #ifndef B1NIX_CONSOLE_H
 #define B1NIX_CONSOLE_H
 
+#include <b1nix/posix.h>
 #include <b1nix/types.h>
+
+struct console_state {
+  usize fg_pgrp;
+  struct b1nix_termios termios;
+};
+
+extern struct console_state console;
 
 void console_init(void);
 void console_clear(void);

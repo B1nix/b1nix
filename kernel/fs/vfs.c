@@ -355,7 +355,6 @@ static u64 next_ino = 1;
 
 static usize node_count = 0;
 static struct vfs_node *root_node = 0;
-static struct b1nix_termios tty_termios;
 static char tty_line[TTY_INPUT_SIZE];
 static usize tty_line_pos;
 static usize tty_line_len;
@@ -1094,10 +1093,16 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
                       usize size, int flags) {
   (void)node;
   (void)offset;
-  if (!buffer || size == 0)
-    return 0;
+  /* Job control check for background reads: */
+  if (current_task && console.fg_pgrp > 0) {
+    if (current_task->process_group_id != console.fg_pgrp) {
+      // Process is in the background trying to read from TTY
+      scheduler_kill_process_group(current_task->process_group_id, SIGTTIN);
+      return -EINTR; // Abort read, let scheduler block the task
+    }
+  }
 
-  if ((tty_termios.c_lflag & B1NIX_ICANON) == 0) {
+  if ((console.termios.c_lflag & B1NIX_ICANON) == 0) {
     for (usize i = 0; i < size; i++)
       buffer[i] = tty_getc_blocking();
     return (isize)size;
@@ -1131,30 +1136,18 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
         }
         continue;
       }
-      if ((tty_termios.c_lflag & B1NIX_ISIG) && c == 3) {
-        console_write("^C\n");
-        tty_line_len = 0;
-        tty_line[tty_line_len++] = '\n';
-        break;
-      }
-      if ((tty_termios.c_lflag & B1NIX_ISIG) && c == 26) {
-        console_write("^Z\n");
-        tty_line_len = 0;
-        tty_line[tty_line_len++] = '\n';
-        break;
-      }
       if (c == 4)
         break;
       if (c == '\b' || c == 127) {
         if (tty_line_len > 0) {
           tty_line_len--;
-          if (tty_termios.c_lflag & B1NIX_ECHO)
+          if (console.termios.c_lflag & B1NIX_ECHO)
             console_write("\b \b");
         }
         continue;
       }
       tty_line[tty_line_len++] = c;
-      if (tty_termios.c_lflag & B1NIX_ECHO)
+      if (console.termios.c_lflag & B1NIX_ECHO)
         console_putc(c);
       if (c == '\n')
         break;
@@ -1175,7 +1168,7 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
   if (!buffer)
     return -1;
   for (usize i = 0; i < size; i++) {
-    if ((tty_termios.c_oflag & B1NIX_OPOST) && buffer[i] == '\n')
+    if ((console.termios.c_oflag & B1NIX_OPOST) && buffer[i] == '\n')
       console_putc('\r');
     console_putc(buffer[i]);
   }
@@ -1183,9 +1176,10 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
 }
 
 static void tty_init_node(void) {
-  memset(&tty_termios, 0, sizeof(tty_termios));
-  tty_termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
-  tty_termios.c_oflag = B1NIX_OPOST;
+  memset(&console.termios, 0, sizeof(console.termios));
+  console.termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
+  console.termios.c_oflag = B1NIX_OPOST;
+  console.fg_pgrp = 1; /* Boot group */
   struct vfs_node *tty = add_node("/dev/tty", VFS_DEVICE, 0, 0, 0);
   if (tty) {
     tty->inode->read_cb = tty_read;
@@ -2636,11 +2630,27 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return -ENOTTY;
 
   if (request == B1NIX_TCGETS) {
-    *(struct b1nix_termios *)arg = tty_termios;
+    *(struct b1nix_termios *)arg = console.termios;
     return 0;
   }
   if (request == B1NIX_TCSETS) {
-    tty_termios = *(const struct b1nix_termios *)arg;
+    console.termios = *(const struct b1nix_termios *)arg;
+    return 0;
+  }
+  if (request == B1NIX_TIOCGPGRP) {
+    usize *pgrp_ptr = (usize *)arg;
+    if (!pgrp_ptr)
+      return -EFAULT;
+    *pgrp_ptr = console.fg_pgrp;
+    return 0;
+  }
+  if (request == B1NIX_TIOCSPGRP) {
+    usize *pgrp_ptr = (usize *)arg;
+    if (!pgrp_ptr)
+      return -EFAULT;
+    // POSIX: process group must be in the same session
+    // (B1NIX doesn't track terminal sessions yet, so we assume valid)
+    console.fg_pgrp = *pgrp_ptr;
     return 0;
   }
   return -1;
