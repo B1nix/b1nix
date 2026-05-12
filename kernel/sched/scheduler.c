@@ -9,7 +9,7 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 
-#define MAX_TASKS 16
+#define MAX_TASKS 64
 #define KERNEL_STACK_SIZE (16 * 1024)
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
@@ -34,12 +34,15 @@ static u64 align_down_u64(u64 value, u64 alignment) {
 }
 
 static struct task *find_unused_task(void) {
+  interrupts_disable();
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state == TASK_UNUSED) {
+      interrupts_enable();
       return &tasks[i];
     }
   }
 
+  interrupts_enable();
   return 0;
 }
 
@@ -114,7 +117,6 @@ void scheduler_init(void) {
   boot->process_group_id = boot->id;
   boot->session_id = boot->id;
   boot->kernel_stack_ptr = (u64)(usize)x86_syscall_stack_top;
-  boot->mmap_bump = 0x700000000000ULL;
   boot->pml4_phys = 0; // Kernel PML4
   boot->vma_list = 0;
   task_init_cred(boot);
@@ -154,11 +156,13 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   u64 initial_rsp = stack_top - 16;
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
 
+  interrupts_disable();
   task->id = next_task_id++;
   task->name = strdup(name);
   task->state = TASK_READY;
   task->entry = entry;
   task->arg = arg;
+  interrupts_enable();
   task->stack = stack;
   task->wake_tick = 0;
 #ifdef __aarch64__
@@ -209,7 +213,6 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->process_group_id = current_task->process_group_id;
     task->session_id = current_task->session_id;
     memcpy(task->env, current_task->env, sizeof(task->env));
-    task->mmap_bump = current_task->mmap_bump;
   } else {
     task->cwd[0] = '/';
     task->cwd[1] = '\0';
@@ -218,7 +221,6 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->process_group_id = task->id;
     task->session_id = task->id;
     memset(task->env, 0, sizeof(task->env));
-    task->mmap_bump = 0x700000000000ULL;
     task->pml4_phys = 0;
     task->vma_list = 0;
   }
@@ -498,8 +500,15 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             kfree(tasks[i].stack);
             tasks[i].state = TASK_UNUSED;
             interrupts_enable();
-            if (status)
-              *status = code;
+            if (status) {
+              if (code >= 128 && code < 128 + NSIG) {
+                /* Task was killed by a signal */
+                *status = (code - 128) & 0x7F;
+              } else {
+                /* Normal exit */
+                *status = (code & 0xFF) << 8;
+              }
+            }
             return child_id;
           } else if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_BLOCKED) {
             // Task is stopped (e.g. by SIGSTOP, SIGTSTP, etc.)
@@ -785,22 +794,6 @@ u64 scheduler_brk_get(void) {
   if (!current_task)
     return 0;
   return current_task->user_brk;
-}
-
-u64 scheduler_mmap_bump_alloc(usize length) {
-  if (!current_task)
-    return (u64)-1;
-
-  // Align length to page size
-  length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-  u64 result = current_task->mmap_bump;
-  if (result + length >= 0x00007FFFFFFFF000ULL) {
-    return (u64)-1; // ENOMEM
-  }
-
-  current_task->mmap_bump += length;
-  return result;
 }
 
 u64 vm_find_free_area(struct task *t, usize length) {

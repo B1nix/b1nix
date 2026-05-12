@@ -331,7 +331,12 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       fault_addr < 0x00007FFFFFFFFFFF) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      panic("OOM during lazy page allocation!");
+      extern void eviction_evict_page(void);
+      eviction_evict_page();
+      frame = pmm_alloc_frame();
+      if (!frame) {
+        panic("OOM during lazy page allocation!");
+      }
     }
 
     // IMPORTANT: Zero the frame before giving it to user space!
@@ -366,9 +371,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   if (!(pte & VMM_PRESENT) && (pte & VMM_LAZY)) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      // Try to swap something out to free memory
-      console_write("pf: OOM during lazy allocation, trying swap\n");
-      return -1;
+      extern void eviction_evict_page(void);
+      eviction_evict_page();
+      frame = pmm_alloc_frame();
+      if (!frame) {
+        // Try to swap something out to free memory
+        console_write("pf: OOM during lazy allocation, swap failed\n");
+        return -1;
+      }
     }
 
     // Zero the frame

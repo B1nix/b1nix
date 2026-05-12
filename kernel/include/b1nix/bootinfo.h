@@ -33,9 +33,12 @@ struct boot_info {
 	usize memory_region_count;
 	struct boot_framebuffer framebuffer;
 	int has_framebuffer;
+	char command_line[128];
 };
 
 void bootinfo_init_from_multiboot2(u32 magic, u32 info_address);
 const struct boot_info *bootinfo_get(void);
+const char *bootinfo_cmdline(void);
+int bootinfo_has_flag(const char *flag);
 
 #endif

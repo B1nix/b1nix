@@ -82,6 +82,11 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     /* Simple poll for TCP */
     if (s->connected) {
       pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
+    } else if (s->listening) {
+      u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+      if (tcp_pending_connections(port)) {
+        pfd->revents |= B1NIX_POLLIN;
+      }
     }
   }
   return 0;
@@ -176,6 +181,14 @@ int vfs_listen(int fd, int backlog) {
   if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (s->domain == B1NIX_AF_UNIX) return unix_listen(s, backlog);
+  
+  if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
+    u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+    int res = tcp_listen(port, backlog);
+    if (res == 0) s->listening = 1;
+    return res;
+  }
+  
   return -ENOPROTOOPT;
 }
 
@@ -196,6 +209,32 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   if (s->domain == B1NIX_AF_UNIX) {
     unix_init_state(new_s);
     res = unix_accept(s, new_s);
+    if (res == 0 && addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_un)) {
+      memcpy(addr, &new_s->peer.un, sizeof(struct b1nix_sockaddr_un));
+      *addrlen = sizeof(struct b1nix_sockaddr_un);
+    }
+  } else if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
+    u16 local_port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+    struct ipv4_addr client_ip;
+    u16 client_port;
+    struct tcp_conn *conn = 0;
+    while (1) {
+      conn = tcp_accept(local_port, &client_ip, &client_port);
+      if (conn) break;
+      scheduler_block_on(vfs_poll_chan);
+    }
+    new_s->tcp_conn = conn;
+    new_s->connected = 1;
+    new_s->peer.in.sin_family = B1NIX_AF_INET;
+    new_s->peer.in.sin_port = (client_port << 8) | (client_port >> 8);
+    new_s->peer.in.sin_addr = (u32)client_ip.bytes[0] | ((u32)client_ip.bytes[1] << 8) |
+                              ((u32)client_ip.bytes[2] << 16) | ((u32)client_ip.bytes[3] << 24);
+    
+    if (addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_in)) {
+      memcpy(addr, &new_s->peer.in, sizeof(struct b1nix_sockaddr_in));
+      *addrlen = sizeof(struct b1nix_sockaddr_in);
+    }
+    res = 0;
   } else {
     kfree(new_s);
     release_handle(new_h_idx);
@@ -212,11 +251,6 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   struct vfs_handle *new_vh = get_handle_by_idx(new_h_idx);
   vfs_socket_init_handle(new_vh, new_s);
   
-  if (addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_un)) {
-    memcpy(addr, &new_s->peer.un, sizeof(struct b1nix_sockaddr_un));
-    *addrlen = sizeof(struct b1nix_sockaddr_un);
-  }
-
   return scheduler_fd_alloc(new_h_idx);
 }
 

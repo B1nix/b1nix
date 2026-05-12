@@ -8,6 +8,7 @@ CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
 QEMU_X86_64 := qemu-system-x86_64
+KERNEL_CMDLINE ?=
 
 COMMON_CFLAGS := \
 	-std=c11 \
@@ -128,7 +129,7 @@ iso: $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
-	cp boot/grub/grub.cfg $(BUILD_DIR)/iso/boot/grub/grub.cfg
+	@printf 'set timeout=0\nset default=0\n\nmenuentry "b1nix" {\n    multiboot2 /boot/kernel.elf $(KERNEL_CMDLINE)\n    boot\n}\n' > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 
 # ── M25 Userspace ──
@@ -167,7 +168,7 @@ clean:
 	@$(MAKE) -C userspace clean
 
 # ── Smoke Tests ──
-smoke: iso
+smoke:
 	@echo "Running smoke tests..."
 	sh tests/smoke.sh $(ARCH)
 

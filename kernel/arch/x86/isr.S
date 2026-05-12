@@ -54,19 +54,31 @@ ISR_NOERR 29
 ISR_ERR 30
 ISR_NOERR 31
 
-.global isr32
-.type isr32, @function
-isr32:
+.macro IRQ vector
+.global isr\vector
+.type isr\vector, @function
+isr\vector:
 	pushq $0
-	pushq $32
+	pushq $\vector
 	jmp irq_common
+.endm
 
-.global isr33
-.type isr33, @function
-isr33:
-	pushq $0
-	pushq $33
-	jmp irq_common
+IRQ 32
+IRQ 33
+IRQ 34
+IRQ 35
+IRQ 36
+IRQ 37
+IRQ 38
+IRQ 39
+IRQ 40
+IRQ 41
+IRQ 42
+IRQ 43
+IRQ 44
+IRQ 45
+IRQ 46
+IRQ 47
 
 .global isr_common
 .type isr_common, @function

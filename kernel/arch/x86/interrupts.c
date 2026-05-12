@@ -4,6 +4,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/net.h>
 #include <b1nix/types.h>
 
 #define IDT_ENTRY_COUNT 256
@@ -70,6 +71,20 @@ extern void isr30(void);
 extern void isr31(void);
 extern void isr32(void);
 extern void isr33(void);
+extern void isr34(void);
+extern void isr35(void);
+extern void isr36(void);
+extern void isr37(void);
+extern void isr38(void);
+extern void isr39(void);
+extern void isr40(void);
+extern void isr41(void);
+extern void isr42(void);
+extern void isr43(void);
+extern void isr44(void);
+extern void isr45(void);
+extern void isr46(void);
+extern void isr47(void);
 
 static volatile u64 timer_ticks;
 
@@ -140,6 +155,20 @@ void x86_idt_init(void) {
   }
   idt_set_gate(32, isr32);
   idt_set_gate(33, isr33);
+  idt_set_gate(34, isr34);
+  idt_set_gate(35, isr35);
+  idt_set_gate(36, isr36);
+  idt_set_gate(37, isr37);
+  idt_set_gate(38, isr38);
+  idt_set_gate(39, isr39);
+  idt_set_gate(40, isr40);
+  idt_set_gate(41, isr41);
+  idt_set_gate(42, isr42);
+  idt_set_gate(43, isr43);
+  idt_set_gate(44, isr44);
+  idt_set_gate(45, isr45);
+  idt_set_gate(46, isr46);
+  idt_set_gate(47, isr47);
 
   struct idt_pointer pointer = {
       .limit = sizeof(idt) - 1,
@@ -174,6 +203,19 @@ void x86_pic_init(void) {
   outb(PIC2_DATA, 0xff);
 }
 
+void x86_pic_unmask(u8 irq) {
+  u16 port;
+  u8 value;
+  if (irq < 8) {
+    port = PIC1_DATA;
+  } else {
+    port = PIC2_DATA;
+    irq -= 8;
+  }
+  value = inb(port) & ~(1 << irq);
+  outb(port, value);
+}
+
 void x86_timer_init(void) {
   u16 divisor = (u16)(PIT_FREQUENCY / TIMER_HZ);
 
@@ -203,6 +245,16 @@ void x86_irq_handler(struct interrupt_frame *frame) {
     ps2_kbd_interrupt_handler();
     outb(PIC1_COMMAND, PIC_EOI);
     return;
+  }
+
+  if (frame->vector >= 32 && frame->vector <= 47) {
+    int irq = frame->vector - 32;
+    if (irq == net_get_irq()) {
+      net_interrupt_handler();
+      if (irq >= 8) outb(PIC2_COMMAND, PIC_EOI);
+      outb(PIC1_COMMAND, PIC_EOI);
+      return;
+    }
   }
 
   console_write("\nIRQ: unexpected vector 0x");

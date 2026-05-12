@@ -1,8 +1,8 @@
 #include <b1nix/console.h>
-#include <b1nix/initramfs.h>
-#include <b1nix/vfs.h>
-#include <b1nix/mm.h>
 #include <b1nix/errno.h>
+#include <b1nix/initramfs.h>
+#include <b1nix/mm.h>
+#include <b1nix/vfs.h>
 #include <string.h>
 
 #include "../../build/x86/initramfs_native_smoke.inc"
@@ -65,8 +65,7 @@ static const char posix_smoke_script[] =
     "cat /tmp/loop && echo \"fail eloop\" || echo \"ok eloop\"\n"
     "rm /tmp/posix_test\n"
     "[ ! -f /tmp/posix_test ] && echo \"ok rm\" || echo \"fail rm\"\n"
-    "echo \"POSIX-SMOKE: done\"\n"
-    "reboot\n";
+    "echo \"POSIX-SMOKE: done\"\n";
 
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
@@ -83,42 +82,50 @@ static const struct initramfs_file files[] = {
     {"/README", "initramfs is alive\n", 20, 0},
 };
 
-static int initramfs_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
-    (void)node;
-    memset(st, 0, sizeof(*st));
-    st->f_type = 0x858458f6;
-    st->f_bsize = 4096;
-    
-    usize total_size = 0;
-    for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
-        total_size += files[i].size;
-    }
-    
-    st->f_blocks = (total_size + 4095) / 4096;
-    if (st->f_blocks == 0) st->f_blocks = 1;
-    st->f_bfree = 0;
-    st->f_bavail = 0;
-    st->f_files = (sizeof(files) / sizeof(files[0]));
-    st->f_ffree = 0;
-    st->f_namelen = 64;
-    return 0;
+static int initramfs_vfs_statfs(struct vfs_node *node,
+                                struct b1nix_statfs *st) {
+  (void)node;
+  memset(st, 0, sizeof(*st));
+  st->f_type = 0x858458f6;
+  st->f_bsize = 4096;
+
+  usize total_size = 0;
+  for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
+    total_size += files[i].size;
+  }
+
+  st->f_blocks = (total_size + 4095) / 4096;
+  if (st->f_blocks == 0)
+    st->f_blocks = 1;
+  st->f_bfree = 0;
+  st->f_bavail = 0;
+  st->f_files = (sizeof(files) / sizeof(files[0]));
+  st->f_ffree = 0;
+  st->f_namelen = 64;
+  return 0;
 }
 
-static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags, void *data) {
-    (void)source; (void)flags; (void)data;
-    struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
-    if (!root) return ERR_PTR(-ENOMEM);
-    
-    root->inode->statfs_cb = initramfs_vfs_statfs;
-    
-    for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
-        struct vfs_node *node = vfs_add_node(files[i].path, VFS_FILE, (void *)files[i].data, files[i].size, files[i].flags);
-        if (node) {
-            node->inode->statfs_cb = initramfs_vfs_statfs;
-        }
+static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags,
+                                           void *data) {
+  (void)source;
+  (void)flags;
+  (void)data;
+  struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
+  if (!root)
+    return ERR_PTR(-ENOMEM);
+
+  root->inode->statfs_cb = initramfs_vfs_statfs;
+
+  for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
+    struct vfs_node *node =
+        vfs_add_node(files[i].path, VFS_FILE, (void *)files[i].data,
+                     files[i].size, files[i].flags);
+    if (node) {
+      node->inode->statfs_cb = initramfs_vfs_statfs;
     }
-    
-    return root;
+  }
+
+  return root;
 }
 
 static struct vfs_fs initramfs_fs = {

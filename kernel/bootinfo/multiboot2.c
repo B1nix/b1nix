@@ -1,9 +1,11 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/panic.h>
+#include <string.h>
 
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 #define MULTIBOOT2_TAG_TYPE_END 0
+#define MULTIBOOT2_TAG_TYPE_CMDLINE 1
 #define MULTIBOOT2_TAG_TYPE_MMAP 6
 #define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER 8
 
@@ -62,6 +64,20 @@ static void add_memory_region(u64 base, u64 length, u32 type)
 	current_boot_info.memory_regions[index].type = type;
 }
 
+static void copy_cmdline(const struct multiboot2_tag *tag)
+{
+	const char *src = (const char *)tag + sizeof(*tag);
+	usize max = tag->size > sizeof(*tag) ? tag->size - sizeof(*tag) : 0;
+	usize i = 0;
+
+	while (i + 1 < sizeof(current_boot_info.command_line) && i < max &&
+	       src[i] != '\0') {
+		current_boot_info.command_line[i] = src[i];
+		i++;
+	}
+	current_boot_info.command_line[i] = '\0';
+}
+
 static void parse_mmap_tag(const struct multiboot2_mmap_tag *tag)
 {
 	usize entries_start = (usize)tag + sizeof(*tag);
@@ -84,6 +100,8 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 	usize end = (usize)info + info->total_size;
 
 	current_boot_info.memory_region_count = 0;
+	current_boot_info.has_framebuffer = 0;
+	current_boot_info.command_line[0] = '\0';
 
 	while (cursor < end) {
 		const struct multiboot2_tag *tag = (const struct multiboot2_tag *)cursor;
@@ -94,6 +112,10 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_MMAP) {
 			parse_mmap_tag((const struct multiboot2_mmap_tag *)tag);
+		}
+
+		if (tag->type == MULTIBOOT2_TAG_TYPE_CMDLINE) {
+			copy_cmdline(tag);
 		}
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER) {
@@ -114,4 +136,41 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 const struct boot_info *bootinfo_get(void)
 {
 	return &current_boot_info;
+}
+
+const char *bootinfo_cmdline(void)
+{
+	return current_boot_info.command_line;
+}
+
+int bootinfo_has_flag(const char *flag)
+{
+	const char *cmd = current_boot_info.command_line;
+	usize flag_len = 0;
+
+	if (!flag || !flag[0]) {
+		return 0;
+	}
+	while (flag[flag_len]) {
+		flag_len++;
+	}
+
+	for (usize i = 0; cmd[i];) {
+		while (cmd[i] == ' ') {
+			i++;
+		}
+		if (!cmd[i]) {
+			break;
+		}
+
+		usize start = i;
+		while (cmd[i] && cmd[i] != ' ') {
+			i++;
+		}
+		if (i - start == flag_len && memcmp(cmd + start, flag, flag_len) == 0) {
+			return 1;
+		}
+	}
+
+	return 0;
 }

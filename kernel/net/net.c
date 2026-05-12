@@ -4,6 +4,7 @@
 #include <b1nix/virtio.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/arch_x86.h>
 #include <string.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
@@ -37,6 +38,14 @@ struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
 void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
 void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
 int net_is_ready(void) { return net_ready; }
+int net_get_irq(void) { return net_ready ? net_dev.irq : -1; }
+
+void net_interrupt_handler(void) {
+	if (!net_ready) return;
+	if (virtio_read_isr(&net_dev) & 1) {
+		net_poll();
+	}
+}
 
 static const char *net_vendor_name(u16 vendor)
 {
@@ -212,6 +221,10 @@ static void virtio_net_probe(void)
 	console_write("virtio-net: initialized with MAC ");
 	print_mac(local_mac);
 	console_write("\n");
+
+	if (net_dev.irq != 0xFF) {
+		x86_pic_unmask(net_dev.irq);
+	}
 }
 
 static void net_task(void *arg)
@@ -304,6 +317,8 @@ void net_poll(void)
 	if (!net_ready || net_rx_vq.queue_size == 0 || !net_rx_vq.used) {
 		return;
 	}
+
+	tcp_timer_tick();
 
 	if (__atomic_test_and_set(&net_rx_lock, __ATOMIC_ACQUIRE)) return; // Don't block if someone else is already polling
 

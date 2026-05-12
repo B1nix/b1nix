@@ -51,7 +51,8 @@ run_qemu() {
 		# Instant monitoring using tail -f
 		# We wait for the final success marker or a panic
 		(
-			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'POSIX-SMOKE: done|KERNEL PANIC'" >/dev/null 2>&1
+			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'B1NIX-TEST: done|KERNEL PANIC'" >/dev/null 2>&1
+			sleep 2
 			kill "$pid" 2>/dev/null || true
 		) &
 		local watcher_pid=$!
@@ -84,7 +85,7 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" iso >/dev/null 2>&1 || {
+make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1 || {
 	echo "  ${RED}BUILD FAILED${NC}"
 	exit 1
 }
@@ -163,6 +164,7 @@ check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
 check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
+check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 
 # ── Network tests (x86 only) ──
 if [ "$ARCH" = "x86" ]; then

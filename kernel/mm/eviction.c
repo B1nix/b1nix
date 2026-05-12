@@ -88,3 +88,11 @@ u64 swap_evict_page(void) {
 
     return 0;
 }
+
+void eviction_evict_page(void) {
+    u64 frame = swap_evict_page();
+    if (frame) {
+        pmm_free_frame(frame);
+    }
+}
+

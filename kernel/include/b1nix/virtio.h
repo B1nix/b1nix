@@ -78,5 +78,6 @@ u32 virtio_get_host_features(struct virtio_device *dev);
 void virtio_set_guest_features(struct virtio_device *dev, u32 features);
 int virtq_init(struct virtio_device *dev, u16 queue_idx, struct virtqueue *vq);
 void virtq_kick(struct virtio_device *dev, struct virtqueue *vq);
+u8 virtio_read_isr(struct virtio_device *dev);
 
 #endif

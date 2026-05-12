@@ -139,7 +139,6 @@ struct task {
   usize session_id;
   char env[16][64]; // Replaced TASK_ENV_MAX/TASK_ENV_VALUE_MAX with literals
                     // for header simplicity
-  u64 mmap_bump;
 
   /* Signal handling */
   u64 pending_signals;             /* bitmask of pending signals */

@@ -12,6 +12,7 @@ struct pci_device_info {
 	u8 class_code;
 	u8 subclass;
 	u8 prog_if;
+	u8 irq_line;
 };
 
 void pci_init(void);

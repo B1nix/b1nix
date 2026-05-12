@@ -55,19 +55,19 @@ static char **copy_user_array(const char **u_array) {
     if (!is_canonical((u64)u_str) || (u64)u_str >= 0x0000800000000000ULL)
       goto fault;
 
-    char *k_str = kmalloc(MAX_EXEC_ARG_LEN);
+    char tmp[MAX_EXEC_ARG_LEN];
+    int len = syscall_copyinstr(tmp, MAX_EXEC_ARG_LEN, u_str);
+    if (len < 0)
+      goto fault;
+
+    char *k_str = kmalloc(len + 1);
     if (!k_str) {
       for (int j = 0; j < i; j++)
         kfree(k_array[j]);
       kfree(k_array);
       return ERR_PTR(-ENOMEM);
     }
-
-    if (strncpy_from_user(k_str, u_str, MAX_EXEC_ARG_LEN) < 0) {
-      kfree(k_str);
-      goto fault;
-    }
-    k_str[MAX_EXEC_ARG_LEN - 1] = '\0';
+    memcpy(k_str, tmp, len + 1);
     k_array[i] = k_str;
   }
 
@@ -989,9 +989,21 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
     vaddr = (u64)(usize)addr;
     if ((vaddr & (PAGE_SIZE - 1)) != 0) {
       vaddr = vm_find_free_area(t, length);
+    } else {
+      /* Verify hint doesn't overlap existing VMAs */
+      struct vm_area *curr_vma = t->vma_list;
+      int overlap = 0;
+      while (curr_vma) {
+        if (!(curr_vma->start >= vaddr + length || curr_vma->end <= vaddr)) {
+          overlap = 1;
+          break;
+        }
+        curr_vma = curr_vma->next;
+      }
+      if (overlap) {
+        vaddr = vm_find_free_area(t, length);
+      }
     }
-    // In a real OS we would check if the requested addr is free,
-    // but for this task we use it as a hint if aligned, otherwise find free.
   }
 
   if (vaddr == (u64)-1)

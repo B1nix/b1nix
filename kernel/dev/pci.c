@@ -91,6 +91,7 @@ int pci_find_device(u16 vendor_id, u16 device_id, struct pci_device_info *info)
 						info->class_code = pci_config_read8((u8)bus, slot, func, 0x0B);
 						info->subclass = pci_config_read8((u8)bus, slot, func, 0x0A);
 						info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
+						info->irq_line = pci_config_read8((u8)bus, slot, func, 0x3C);
 					}
 					return 1;
 				}
@@ -131,6 +132,7 @@ int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info 
 					info->class_code = cls;
 					info->subclass = sub;
 					info->prog_if = pci_config_read8((u8)bus, slot, func, 0x09);
+					info->irq_line = pci_config_read8((u8)bus, slot, func, 0x3C);
 				}
 				return 1;
 			}

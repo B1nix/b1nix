@@ -15,6 +15,8 @@ void net_init(void);
 void net_poll(void);
 int net_is_ready(void);
 void net_dump_info(void);
+void net_interrupt_handler(void);
+int net_get_irq(void);
 
 // Virtio Network Data Plane
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size);
@@ -53,7 +55,11 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len);
 int tcp_close(struct tcp_conn *conn);
+int tcp_listen(u16 local_port, int backlog);
+struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *client_port);
+int tcp_pending_connections(u16 local_port);
 int tcp_network_ready(void);
+void tcp_timer_tick(void);
 
 // Network state
 struct mac_addr net_get_mac(void);

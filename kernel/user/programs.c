@@ -1,4 +1,5 @@
 #include <b1nix/blk.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
@@ -966,6 +967,11 @@ static int init_main(int argc, const char **argv) {
   if (shell_smoke_pid != (u64)-1) {
     int status = 0;
     syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  }
+
+  if (bootinfo_has_flag("b1nix.test=1")) {
+    uwrite("B1NIX-TEST: done\n");
+    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
   }
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);

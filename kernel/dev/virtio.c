@@ -102,3 +102,8 @@ void virtq_kick(struct virtio_device *dev, struct virtqueue *vq)
 {
 	outw((u16)(dev->port_base + VIRTIO_PCI_QUEUE_NOTIFY), vq->queue_idx);
 }
+
+u8 virtio_read_isr(struct virtio_device *dev)
+{
+	return inb((u16)(dev->port_base + VIRTIO_PCI_ISR));
+}

@@ -105,7 +105,9 @@ int swap_out(u64 virtual_addr, u64 physical_frame)
     u64 lba = swap_start_lba + (u64)slot * SECTORS_PER_PAGE;
     
     // Write the page from physical memory to swap
-    int ret = blk_write_cached(swap_dev, lba, SECTORS_PER_PAGE, (const void *)(usize)physical_frame);
+    extern u64 vmm_direct_map_base(void);
+    u64 direct_base = vmm_direct_map_base();
+    int ret = blk_write_cached(swap_dev, lba, SECTORS_PER_PAGE, (const void *)(usize)(physical_frame + direct_base));
     if (ret < 0) {
         swap_free_slot(slot);
         return -1;
@@ -142,7 +144,9 @@ int swap_in(u64 virtual_addr, u64 *out_physical_frame)
     }
 
     // Read the page from swap
-    int ret = blk_read_cached(swap_dev, lba, SECTORS_PER_PAGE, (void *)(usize)frame);
+    extern u64 vmm_direct_map_base(void);
+    u64 direct_base = vmm_direct_map_base();
+    int ret = blk_read_cached(swap_dev, lba, SECTORS_PER_PAGE, (void *)(usize)(frame + direct_base));
     if (ret < 0) {
         pmm_free_frame(frame);
         return -1;

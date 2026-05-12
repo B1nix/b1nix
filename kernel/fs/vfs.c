@@ -1,3 +1,4 @@
+#include <b1nix/arch.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -21,7 +22,7 @@
 #define VFS_ATIME 0x01
 #define VFS_MTIME 0x02
 #define VFS_CTIME 0x04
-#define VFS_MAX_SYMLINK_DEPTH 8
+#define VFS_MAX_SYMLINK_DEPTH 16
 
 static char poll_chan_obj;
 void *vfs_poll_chan = &poll_chan_obj;
@@ -29,6 +30,7 @@ void *vfs_poll_chan = &poll_chan_obj;
 static volatile int node_pool_lock = 0;
 static volatile int inode_pool_lock = 0;
 static volatile int vfs_handle_lock = 0;
+static volatile int vfs_mount_lock = 0;
 static u32 next_fs_id = 1;
 
 static u32 dcache_hash(struct vfs_node *parent, const char *name);
@@ -65,20 +67,29 @@ static struct vfs_mount_entry mounts[MAX_MOUNTS];
 static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   if (!node)
     return 0;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
   struct vfs_node *curr = node;
   while (curr) {
     for (int i = 0; i < MAX_MOUNTS; i++) {
       if (mounts[i].used && curr == mounts[i].root_node) {
-        return &mounts[i];
+        struct vfs_mount_entry *res = &mounts[i];
+        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+        return res;
       }
     }
     curr = curr->parent;
   }
   for (int i = 0; i < MAX_MOUNTS; i++) {
     if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
-      return &mounts[i];
+      struct vfs_mount_entry *res = &mounts[i];
+      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+      return res;
     }
   }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return 0;
 }
 
@@ -726,6 +737,21 @@ restart_traversal:
       continue;
 
     if (strcmp(part, "..") == 0) {
+      while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+        scheduler_yield();
+      for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (mounts[i].used && current == mounts[i].root_node) {
+          struct vfs_node *mp = vfs_node_get(mounts[i].mount_point);
+          __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+          vfs_inode_unlock_read(current->inode);
+          vfs_node_put(current);
+          current = mp;
+          vfs_inode_lock_read(current->inode);
+          continue;
+        }
+      }
+      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
       struct vfs_node *parent = current->parent;
       if (parent) {
         vfs_node_get(parent);
@@ -1567,6 +1593,11 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
 
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
   if (find_child(parent, name)) {
     res = -EEXIST;
     goto out_unlock;
@@ -1670,6 +1701,11 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
 
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
   if (find_child(parent, name)) {
     res = -EEXIST;
     goto out_unlock;
@@ -1921,6 +1957,11 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
     return (int)PTR_ERR(parent);
 
   vfs_inode_lock(parent->inode);
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
   const struct cred *cred = get_current_cred();
   if (cred && !vfs_get_node_perm(parent, cred, 2)) {
     res = -EACCES;
@@ -2008,6 +2049,11 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
   kfree(p_path);
 
   vfs_inode_lock(parent->inode);
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
   struct vfs_node *node = find_child(parent, name);
   if (!node) {
     res = -ENOENT;
@@ -2313,6 +2359,17 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   if (p1 != p2)
     vfs_inode_lock(p2->inode);
 
+  struct vfs_mount_entry *mnt_old = vfs_get_mount_for_node(old_parent);
+  if (mnt_old && (mnt_old->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
+  struct vfs_mount_entry *mnt_new = vfs_get_mount_for_node(new_parent);
+  if (mnt_new && (mnt_new->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
+
   /* POSIX type-consistency checks */
   struct vfs_node *existing = find_child(new_parent, new_n);
   if (existing) {
@@ -2453,6 +2510,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return -ENOMEM;
   }
 
+  interrupts_disable();
   mounts[midx].used = 1;
   copy_path(mounts[midx].source, sizeof(mounts[midx].source),
             source ? source : "");
@@ -2463,6 +2521,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].root_node = root_node;
 
   root_node->inode->fs_id = next_fs_id++;
+  interrupts_enable();
 
   return 0;
 }
@@ -2470,14 +2529,34 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 int vfs_umount(const char *target) {
   if (!target)
     return -EINVAL;
+
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
   for (usize i = 0; i < MAX_MOUNTS; i++) {
     if (mounts[i].used && strcmp(mounts[i].target, target) == 0) {
-      if (strcmp(target, "/") == 0)
+      if (strcmp(target, "/") == 0) {
+        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
         return -EBUSY;
+      }
+
+      /* Basic busy check: if root_node has other refs than our mount entry */
+      if (mounts[i].root_node->refcount > 1) {
+        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+        return -EBUSY;
+      }
+
       mounts[i].used = 0;
+      struct vfs_node *root = mounts[i].root_node;
+      struct vfs_node *mp = mounts[i].mount_point;
+      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+      vfs_node_put(root);
+      vfs_node_put(mp);
       return 0;
     }
   }
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return -EINVAL;
 }
 
