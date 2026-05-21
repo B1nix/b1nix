@@ -104,9 +104,8 @@ descriptors normally.
 
 `waitpid()` supports `B1NIX_WNOHANG`, and exited children stay as zombies until
 their parent reaps them. Process metadata now tracks cwd, environment storage,
-umask, process group, and session ids. Address-space copy-on-write is still a
-future MMU milestone; the current cooperative fork model copies process
-metadata and fd state.
+umask, process group, and session ids. Forked tasks get separate page tables,
+copy-on-write private mappings, and copied process metadata plus fd state.
 
 ## M21 Root Filesystem
 

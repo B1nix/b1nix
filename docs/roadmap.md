@@ -57,8 +57,8 @@ and broader utility flag compatibility.
 - [x] `done` Add higher-half kernel mapping and direct-map window.
 - [x] `done` Add lazy page allocation hooks in the x86 page-fault path.
 - [x] `done` Add swap slot bookkeeping and swap in/out helpers.
-- [x] `done` Add full per-process page tables, protection enforcement, and copy-on-write hooks.
-- [x] `done` Add full `mmap`/`munmap`/`mprotect` semantics with early kmalloc backing.
+- [x] `done` Add per-process page tables, protection enforcement, and copy-on-write fork isolation.
+- [x] `done` Add `mmap`/`munmap`/`mprotect` support with MAP_FIXED, page-alignment validation, and smoke coverage.
 
 ## M3: Scheduling
 
@@ -71,7 +71,7 @@ and broader utility flag compatibility.
 - [x] `done` Add task priorities.
 - [x] `done` Add zombie lifecycle and parent wait bookkeeping.
 - [x] `done` Add process groups and session metadata (`setsid`, `getpgrp`, `setpgrp` with POSIX session checks; foreground job ownership fully implemented).
-- [x] `done` Add full POSIX scheduling/session/job-control semantics.
+- [x] `done` Add scheduling/session/job-control semantics for the core process-group and foreground-terminal paths.
 
 ## M4: Userspace
 
@@ -269,9 +269,9 @@ threads as the execution substrate. ELF64 files are read through VFS, PT_LOAD
 segments are copied into per-process image state, initial stack metadata is
 constructed with `argc`, `argv`, `envp`, and basic auxv entries, and `/bin/init`
 can boot from a VFS-loaded ELF image before starting the shell. Hardware
-ring3 entry and native ELF syscall/exit smoke now work on x86_64. Copy-on-write
-address spaces, strict user-pointer validation, and full ELF dynamic behavior
-remain follow-up work.
+ring3 entry, native ELF syscall/exit smoke, copy-on-write fork isolation, and
+strict user-pointer validation now work on x86_64. Full ELF dynamic behavior
+remains follow-up work.
 
 ## M19: Process Model and FD Tables
 
@@ -281,9 +281,9 @@ remain follow-up work.
 - [x] `done` Make `stdin`, `stdout`, and `stderr` real descriptors `0`, `1`, and `2`.
 - [x] `initial` Store per-process cwd, environment, umask, process group, and session metadata.
 - [x] `done` Implement `waitpid()` options (WNOHANG, WUNTRACED) and zombie lifecycle.
-- [x] `done` Add full process groups and terminal foreground job ownership.
+- [x] `done` Add process groups and terminal foreground job ownership for the core controlling-terminal paths.
 - [x] `done` Add refcounted VFS handles/open-file descriptions.
-- [x] `done` Add MMU-backed fork with copied or copy-on-write address spaces.
+- [x] `done` Add MMU-aware fork with copied metadata/FD state and COW-backed address-space isolation.
 - [ ] `planned` Add exact POSIX child/parent register-return semantics.
 
 M19 moves descriptor ownership out of the global VFS handle namespace and into
@@ -291,9 +291,9 @@ per-task fd tables. VFS handles are now open-file descriptions with refcounts,
 while process-visible descriptors are inherited on spawn/fork, closed on task
 exit, and honor `FD_CLOEXEC`. Descriptor `0`, `1`, and `2` are initialized as
 real task-local TTY descriptors. `waitpid()` supports non-blocking `WNOHANG`,
-and zombies remain reapable until the parent waits. Because B1NIX still runs
-user images on cooperative kernel threads, fork copies process metadata/FD view
-rather than hardware page tables.
+and zombies remain reapable until the parent waits. Fork now clones task
+metadata and fd state while giving the child a separate page table with
+copy-on-write private mappings.
 
 ## M20: Terminal, TTY, and Interactive Shell
 
