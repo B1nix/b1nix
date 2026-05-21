@@ -16,6 +16,10 @@
 
 typedef void (*sighandler_t)(int);
 
+#define SIG_DFL ((void (*)(int))0)
+#define SIG_IGN ((void (*)(int))1)
+#define SIG_ERR ((void (*)(int))-1)
+
 typedef struct {
     int si_signo;
     int si_code;
@@ -24,15 +28,19 @@ typedef struct {
 typedef unsigned long sigset_t;
 
 struct sigaction {
-    void (*sa_sigaction)(int, siginfo_t *, void *);
+    union {
+        sighandler_t sa_handler;
+        void (*sa_sigaction)(int, siginfo_t *, void *);
+    };
+    unsigned long sa_flags;
+    void (*sa_restorer)(void);
     sigset_t sa_mask;
-    int sa_flags;
 };
 
 sighandler_t signal(int signum, sighandler_t handler);
-void sigemptyset(sigset_t *set);
-void sigaddset(sigset_t *set, int signum);
-void sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
-void sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+int sigemptyset(sigset_t *set);
+int sigaddset(sigset_t *set, int signum);
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 
 #endif

@@ -5,7 +5,7 @@
 enum {
   /* --- Core Control & I/O --- */
   SYS_WRITE = 1,
-  SYS_EXIT = 2,
+  SYS_MEM = 2,
   SYS_SPAWN = 3,
   SYS_LIST = 4,
   SYS_READ_FILE = 5,
@@ -69,7 +69,7 @@ enum {
   SYS_BRK = 57,
   SYS_MMAP = 58,
   SYS_MUNMAP = 59,
-  SYS_MEM = 60,
+  SYS_EXIT = 60,
 
   /* --- IPC (MQ & SHM) --- */
   SYS_MQ_OPEN = 61,
@@ -110,22 +110,29 @@ enum {
   SYS_TERMIOS_SET = 92,
   SYS_SELFHOST_STATUS = 93,
   SYS_LINK = 94,
+  SYS_MPROTECT = 98,
+  SYS_SIGRETURN = 99,
 };
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */
-static inline long syscall(long num, long a0, long a1, long a2, long a3) {
+static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
   long ret;
-  register long r10 __asm__("r10") = a2;
-  register long r8 __asm__("r8") = a3;
-  register long rdx __asm__("rdx") = a1;
-  register long rsi __asm__("rsi") = a0;
-  register long rdi __asm__("rdi") = num;
+  register long rdi __asm__("rdi") = a0;
+  register long rsi __asm__("rsi") = a1;
+  register long rdx __asm__("rdx") = a2;
+  register long r10 __asm__("r10") = a3;
+  register long r8 __asm__("r8") = a4;
+  register long r9 __asm__("r9") = a5;
+  register long rax __asm__("rax") = num;
 
   __asm__ volatile("syscall"
                    : "=a"(ret)
-                   : "r"(rdi), "r"(rsi), "r"(rdx), "r"(r8), "r"(r10)
+                   : "r"(rax), "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
                    : "rcx", "r11", "memory");
   return ret;
 }
+
+#define syscall(num, ...) _syscall_route(num, ##__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0)
+#define _syscall_route(num, a0, a1, a2, a3, a4, a5, ...) _syscall_raw(num, (long)(a0), (long)(a1), (long)(a2), (long)(a3), (long)(a4), (long)(a5))
 
 #endif

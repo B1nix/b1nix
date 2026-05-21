@@ -158,18 +158,46 @@ long double ldexpl(long double x, int exp) { (void)x; (void)exp; return 0.0; }
 float strtof(const char *nptr, char **endptr) { if (endptr) *endptr = (char *)nptr; return 0.0f; }
 long double strtold(const char *nptr, char **endptr) { if (endptr) *endptr = (char *)nptr; return 0.0; }
 
-typedef void (*sighandler_t)(int);
+#include <signal.h>
+
 sighandler_t signal(int signum, sighandler_t handler)
 {
-	(void)signum; (void)handler;
-	return handler;
+	struct sigaction act, old;
+	act.sa_handler = handler;
+	act.sa_flags = 0;
+	act.sa_restorer = NULL;
+	act.sa_mask = 0;
+	if (sigaction(signum, &act, &old) < 0) {
+		return SIG_ERR;
+	}
+	return old.sa_handler;
 }
 
-#include <signal.h>
-void sigemptyset(sigset_t *set) { if (set) *set = 0; }
-void sigaddset(sigset_t *set, int signum) { if (set) *set |= (1UL << (signum % 64)); }
-void sigprocmask(int how, const sigset_t *set, sigset_t *oldset) { (void)how; (void)set; (void)oldset; }
-void sigaction(int signum, const struct sigaction *act, struct sigaction *oldact) { (void)signum; (void)act; (void)oldact; }
+int sigemptyset(sigset_t *set) { if (set) { *set = 0; return 0; } return -1; }
+int sigaddset(sigset_t *set, int signum) { if (set) { *set |= (1UL << (signum % 64)); return 0; } return -1; }
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) { (void)how; (void)set; (void)oldset; return 0; }
+
+__asm__(
+	".global __sig_restorer\n"
+	"__sig_restorer:\n"
+	"movq $99, %rax\n" /* SYS_SIGRETURN */
+	"syscall\n"
+);
+
+extern void __sig_restorer(void);
+
+int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
+{
+	struct sigaction kernel_act;
+	if (act) {
+		kernel_act = *act;
+		if (!kernel_act.sa_restorer) {
+			kernel_act.sa_restorer = __sig_restorer;
+		}
+		act = &kernel_act;
+	}
+	return (int)syscall(SYS_SIGNAL, signum, (long)act, (long)oldact, 0);
+}
 
 int errno = 0;
 
