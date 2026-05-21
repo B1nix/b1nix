@@ -61,7 +61,11 @@ void kheap_init(void) {
   console_write("\n");
 }
 
-void kheap_use_direct_map(void) { use_direct_map = 1; }
+void kheap_use_direct_map(void) {
+  use_direct_map = 1;
+  heap.current += 0xffff800000000000ULL;
+  heap.end += 0xffff800000000000ULL;
+}
 
 void *kmalloc(usize size) {
   if (size == 0) {

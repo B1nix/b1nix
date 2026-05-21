@@ -123,14 +123,14 @@ static u64 *split_huge_page(u64 *pd, usize index) {
 void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
-  
+
   u64 *pt;
   if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
     pt = split_huge_page(pd, pd_index(virtual_address));
   } else {
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
-  
+
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
@@ -243,9 +243,11 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
   if (pte & VMM_PRESENT) {
     u64 frame = pte & PAGE_ENTRY_ADDRESS_MASK;
     if (frame) {
-      pmm_free_frame(frame);
-      extern void eviction_unregister_page(u64 frame);
-      eviction_unregister_page(frame);
+      if (pte & VMM_USER) {
+        pmm_free_frame(frame);
+        extern void eviction_unregister_page(u64 frame);
+        eviction_unregister_page(frame);
+      }
     }
   }
   pt[pt_index(virtual_address)] = 0;
@@ -301,7 +303,7 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
     // For non-present pages, update the saved flags
     pt[pt_index(virtual_address)] = (pte & PAGE_ENTRY_ADDRESS_MASK) | flags;
   }
-  
+
   invalidate_page(virtual_address);
 }
 
@@ -462,7 +464,6 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     u64 new_flags = (pte & ~PAGE_ENTRY_ADDRESS_MASK);
     new_flags &= ~VMM_COW;
     new_flags |= VMM_PRESENT | VMM_WRITABLE;
-
     pt[pt_index(page_aligned)] = new_frame | new_flags;
 
     if (pmm_get_refcount(old_frame) > 1) {
@@ -484,11 +485,33 @@ u64 paging_create_address_space(void) {
     pml4[i] = kernel_pml4_virt[i];
   }
 
-  // Also clone index 0 because the kernel is currently linked at 1MB.
-  // This is required for kernel execution during syscalls/interrupts.
-  // User processes are still isolated from the kernel by the absence of
-  // the VMM_USER bit in kernel-owned page table entries.
-  pml4[0] = kernel_pml4_virt[0];
+  // Instead of sharing PML4 entry 0 directly, we allocate a private PDPT for PML4 entry 0
+  // and clone the kernel's identity mapping (0-4 GB) into it.
+  u64 *kernel_pml4 = kernel_pml4_virt;
+  if (kernel_pml4[0] & VMM_PRESENT) {
+    u64 *kernel_pdpt = table_from_entry(kernel_pml4[0]);
+    u64 *dst_pdpt = alloc_page_table();
+    pml4[0] = table_to_phys(dst_pdpt) | (kernel_pml4[0] & ~PAGE_ENTRY_ADDRESS_MASK);
+
+    // Clone the first 4 entries of the kernel's PDPT (which cover 0-4 GB)
+    for (usize j = 0; j < 4; j++) {
+      if (kernel_pdpt[j] & VMM_PRESENT) {
+        if (kernel_pdpt[j] & HUGE_PAGE_FLAG) {
+          dst_pdpt[j] = kernel_pdpt[j];
+        } else {
+          // Allocate a private PD for this gigabyte
+          u64 *kernel_pd = table_from_entry(kernel_pdpt[j]);
+          u64 *dst_pd = alloc_page_table();
+          dst_pdpt[j] = table_to_phys(dst_pd) | (kernel_pdpt[j] & ~PAGE_ENTRY_ADDRESS_MASK);
+
+          // Copy all 512 entries of this PD (these are the 2MB huge pages)
+          for (usize k = 0; k < 512; k++) {
+            dst_pd[k] = kernel_pd[k];
+          }
+        }
+      }
+    }
+  }
 
   return pml4_phys;
 }
@@ -500,27 +523,38 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
       continue;
     }
 
+    u64 entry = src_table[i];
+
+    // If it's a huge page (PS bit set), it's a leaf entry (1GB at level 1, or 2MB at level 2)
+    if (entry & HUGE_PAGE_FLAG) {
+      dst_table[i] = entry;
+      continue;
+    }
+
     if (level < 3) {
       // PML4, PDPT, or PD -> recurse
-      u64 *src_child = table_from_entry(src_table[i]);
+      u64 *src_child = table_from_entry(entry);
       u64 *dst_child = alloc_page_table();
-      dst_table[i] = table_to_phys(dst_child) | (src_table[i] & ~PAGE_ENTRY_ADDRESS_MASK);
+      dst_table[i] = table_to_phys(dst_child) | (entry & ~PAGE_ENTRY_ADDRESS_MASK);
       clone_table(src_child, dst_child, level + 1);
     } else {
       // PT -> copy frame and handle CoW
-      u64 entry = src_table[i];
       u64 frame = entry & PAGE_ENTRY_ADDRESS_MASK;
-      
-      if (entry & VMM_WRITABLE) {
-        // Mark both as Read-Only for CoW
-        entry &= ~VMM_WRITABLE;
-        entry |= VMM_COW;
-        src_table[i] = entry;
-      }
-      
-      dst_table[i] = entry;
-      if (frame) {
-        pmm_ref_frame(frame);
+
+      if (entry & VMM_USER) {
+        if (entry & VMM_WRITABLE) {
+          // Mark both as Read-Only for CoW
+          entry &= ~VMM_WRITABLE;
+          entry |= VMM_COW;
+          src_table[i] = entry;
+        }
+
+        dst_table[i] = entry;
+        if (frame) {
+          pmm_ref_frame(frame);
+        }
+      } else {
+        dst_table[i] = entry;
       }
     }
   }
@@ -545,6 +579,10 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
   // Copy kernel-half entries (256-511)
   for (usize i = 256; i < 512; i++) {
     dst_pml4[i] = kernel_pml4_virt[i];
+  }
+
+  if (real_src_phys == read_cr3()) {
+    write_cr3(real_src_phys);
   }
 
   return dst_pml4_phys;
@@ -598,4 +636,3 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   }
   return 0;
 }
-
