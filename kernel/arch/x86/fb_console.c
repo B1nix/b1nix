@@ -1,5 +1,6 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/fb_console.h>
 #include <b1nix/mm.h>
 #include <b1nix/types.h>
 #include <string.h>
@@ -10,7 +11,16 @@ static u32 cursor_x;
 static u32 cursor_y;
 static u32 fg_color = 0x00FFFFFF;
 static u32 bg_color = 0x00000000;
-volatile u32 *fb_ptr = 0;
+volatile u8 *fb_ptr = 0;
+
+static inline void put_pixel(u32 x, u32 y, u32 color)
+{
+	if (!fb_ptr || x >= fb.width || y >= fb.height) {
+		return;
+	}
+	volatile u8 *pixel = fb_ptr + ((u64)y * fb.pitch) + ((u64)x * (fb.bpp / 8));
+	*(volatile u32 *)pixel = color;
+}
 
 void fb_console_init(void)
 {
@@ -36,14 +46,12 @@ void fb_console_init(void)
 	console_write_hex64(fb.bpp);
 	console_write("\n");
 
-	u64 aligned_address = fb.address & ~(PAGE_SIZE - 1);
-    u64 fb_size = fb.height * fb.pitch;
-    u64 total_map_size = ((fb.address - aligned_address) + fb_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-
-    for (u64 offset = 0; offset < total_map_size; offset += PAGE_SIZE) {
-        vmm_map_page(0xffffa00000000000ULL + offset, aligned_address + offset, VMM_WRITABLE);
-    }
-    fb_ptr = (volatile u32 *)(usize)(0xffffa00000000000ULL + (fb.address - aligned_address));
+	u64 fb_size = (u64)fb.height * fb.pitch;
+	fb_ptr = (volatile u8 *)vmm_map_mmio(fb.address, (usize)fb_size, VMM_WRITABLE | VMM_PCD);
+	if (!fb_ptr) {
+		console_write("fb: mmio map failed\n");
+		return;
+	}
 
 	cursor_x = 0;
 	cursor_y = 0;
@@ -51,8 +59,7 @@ void fb_console_init(void)
 	// Clear screen
 	for (u32 y = 0; y < fb.height; y++) {
 		for (u32 x = 0; x < fb.width; x++) {
-            u8 *pixel = (u8 *)fb_ptr + (y * fb.pitch) + (x * (fb.bpp / 8));
-            *(u32 *)pixel = bg_color;
+			put_pixel(x, y, bg_color);
 		}
 	}
 }
@@ -66,8 +73,7 @@ void fb_console_clear(void)
 
 	for (u32 y = 0; y < fb.height; y++) {
 		for (u32 x = 0; x < fb.width; x++) {
-            u8 *pixel = (u8 *)fb_ptr + (y * fb.pitch) + (x * (fb.bpp / 8));
-            *(u32 *)pixel = bg_color;
+			put_pixel(x, y, bg_color);
 		}
 	}
 }
@@ -91,10 +97,7 @@ static void fb_draw_char(char c, u32 x, u32 y)
                     u32 px = x + cx * FONT_SCALE + dx;
                     u32 py = y + cy * FONT_SCALE + dy;
 
-                    if (px < fb.width && py < fb.height) {
-                        u8 *pixel = (u8 *)fb_ptr + (py * fb.pitch) + (px * (fb.bpp / 8));
-                        *(u32 *)pixel = color;
-                    }
+                    put_pixel(px, py, color);
                 }
             }
         }
@@ -137,8 +140,7 @@ static void fb_console_erase_cursor(void)
             u32 px = cursor_x + dx;
             u32 py = y_base + dy;
             if (px < fb.width && py < fb.height) {
-                u8 *pixel = (u8 *)fb_ptr + (py * fb.pitch) + (px * (fb.bpp / 8));
-                *(u32 *)pixel = bg_color;
+                put_pixel(px, py, bg_color);
             }
         }
     }
@@ -165,8 +167,7 @@ void fb_console_blink_cursor(void)
             u32 px = cursor_x + dx;
             u32 py = y_base + dy;
             if (px < fb.width && py < fb.height) {
-                u8 *pixel = (u8 *)fb_ptr + (py * fb.pitch) + (px * (fb.bpp / 8));
-                *(u32 *)pixel = color;
+                put_pixel(px, py, color);
             }
         }
     }
@@ -265,3 +266,14 @@ void fb_console_write(const char *str)
         fb_console_putchar(*str++);
     }
 }
+
+int fb_console_ready(void)
+{
+	return fb_ptr != 0;
+}
+
+u32 fb_console_width(void) { return fb.width; }
+u32 fb_console_height(void) { return fb.height; }
+u32 fb_console_pitch(void) { return fb.pitch; }
+u8 fb_console_bpp(void) { return fb.bpp; }
+volatile void *fb_console_frontbuffer(void) { return (volatile void *)fb_ptr; }

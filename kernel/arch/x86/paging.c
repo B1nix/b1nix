@@ -10,10 +10,13 @@
 #define HUGE_PAGE_FLAG (1ULL << 7)
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
 #define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
+#define MMIO_MAP_BASE 0xffffa00000000000ULL
+#define MMIO_MAP_SIZE (512ULL * 1024ULL * 1024ULL)
 
 static u64 *kernel_pml4_virt;
 static u64 kernel_pml4_phys;
 static int direct_map_ready;
+static u64 mmio_next = MMIO_MAP_BASE;
 
 extern struct task *current_task;
 
@@ -208,6 +211,30 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
     eviction_register_page(current_task, virtual_address, physical_address);
   }
+}
+
+void *vmm_map_mmio(u64 physical_address, usize size, u64 flags) {
+  if (size == 0) {
+    return 0;
+  }
+
+  u64 phys_base = physical_address & ~(PAGE_SIZE - 1);
+  u64 phys_offset = physical_address - phys_base;
+  u64 total_size = (u64)size + phys_offset;
+  u64 map_size = (total_size + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  u64 virt_base = (mmio_next + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (virt_base < MMIO_MAP_BASE ||
+      virt_base + map_size > MMIO_MAP_BASE + MMIO_MAP_SIZE) {
+    panic("vmm_map_mmio exhausted mmio virtual range");
+  }
+
+  for (u64 off = 0; off < map_size; off += PAGE_SIZE) {
+    vmm_map_page(virt_base + off, phys_base + off, flags | VMM_PRESENT);
+  }
+
+  mmio_next = virt_base + map_size;
+  return (void *)(usize)(virt_base + phys_offset);
 }
 
 static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {

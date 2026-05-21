@@ -11,6 +11,8 @@
 #define VMM_USER (1ULL << 2)
 #define VMM_ACCESSED (1ULL << 5)
 #define VMM_DIRTY (1ULL << 6)
+#define VMM_PWT (1ULL << 3)
+#define VMM_PCD (1ULL << 4)
 #define VMM_NO_EXECUTE (1ULL << 63)
 
 /* mmap protections */
@@ -66,6 +68,7 @@ void kfree(void *ptr);
 
 void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
+void *vmm_map_mmio(u64 physical_address, usize size, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags);

@@ -120,13 +120,16 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_FRAMEBUFFER) {
 			const struct multiboot2_framebuffer_tag *fb = (const struct multiboot2_framebuffer_tag *)tag;
-			current_boot_info.framebuffer.address = fb->addr;
-			current_boot_info.framebuffer.pitch = fb->pitch;
-			current_boot_info.framebuffer.width = fb->width;
-			current_boot_info.framebuffer.height = fb->height;
-			current_boot_info.framebuffer.bpp = fb->bpp;
-			current_boot_info.framebuffer.type = fb->framebuffer_type;
-			current_boot_info.has_framebuffer = 1;
+			if (fb->width > 0 && fb->height > 0 && fb->pitch > 0 &&
+			    (fb->bpp == 24 || fb->bpp == 32)) {
+				current_boot_info.framebuffer.address = fb->addr;
+				current_boot_info.framebuffer.pitch = fb->pitch;
+				current_boot_info.framebuffer.width = fb->width;
+				current_boot_info.framebuffer.height = fb->height;
+				current_boot_info.framebuffer.bpp = fb->bpp;
+				current_boot_info.framebuffer.type = fb->framebuffer_type;
+				current_boot_info.has_framebuffer = 1;
+			}
 		}
 
 		cursor = align_up(cursor + tag->size, 8);

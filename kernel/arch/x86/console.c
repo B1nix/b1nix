@@ -1,6 +1,7 @@
 #include <string.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/fb_console.h>
 #include <b1nix/io.h>
 #include <b1nix/serial.h>
 
@@ -13,10 +14,6 @@ static usize cursor_col;
 static u8 current_color = 0x0f;
 
 struct console_state console;
-
-extern void fb_console_init(void);
-extern void fb_console_write(const char *str);
-extern void fb_console_putchar(char c);
 
 static u16 vga_entry(char ch)
 {
@@ -83,8 +80,7 @@ void console_clear(void)
 
 void console_putc(char ch)
 {
-	extern volatile u32 *fb_ptr;
-	if (bootinfo_get()->has_framebuffer && fb_ptr) {
+	if (bootinfo_get()->has_framebuffer && fb_console_ready()) {
 		fb_console_putchar(ch);
 		serial_putc(ch);
 		return;

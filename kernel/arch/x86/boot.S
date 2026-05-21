@@ -16,7 +16,7 @@ framebuffer_tag_start:
 	.short 0
 	.long 20
 	.long 1024
-	.long 720
+	.long 768
 	.long 32
 framebuffer_tag_end:
 
