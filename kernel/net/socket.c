@@ -30,13 +30,21 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   dst_ip.bytes[3] = (s->peer.in.sin_addr >> 24) & 0xFF;
 
   if (s->type == B1NIX_SOCK_DGRAM) {
+    if (!s->connected && s->peer.in.sin_port == 0)
+      return -ENOTCONN;
     udp_send(dst_ip, (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8), (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8), buf, len);
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
+    if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+      s->connected = 1;
+    }
+    if (!s->connected) {
+      return -EAGAIN;
+    }
     return tcp_send((struct tcp_conn *)s->tcp_conn, buf, len);
   }
-  return -1;
+  return -ENOTCONN;
 }
 
 isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
@@ -48,16 +56,26 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
   }
 
   if (s->type == B1NIX_SOCK_DGRAM) {
-    if (s->recv_len == 0) return -EAGAIN;
+    while (s->recv_len == 0) {
+      if (h->flags & B1NIX_O_NONBLOCK)
+        return -EAGAIN;
+      scheduler_block_on(s);
+    }
     usize to_copy = len < s->recv_len ? len : s->recv_len;
     memcpy(buf, s->recv_buf, to_copy);
     s->recv_len = 0;
     return (isize)to_copy;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
+    if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+      s->connected = 1;
+    }
+    if (!s->connected) {
+      return -EAGAIN;
+    }
     return tcp_recv((struct tcp_conn *)s->tcp_conn, buf, len);
   }
-  return -1;
+  return -ENOTCONN;
 }
 
 static isize socket_read(struct vfs_handle *h, char *buf, usize size) {
@@ -79,6 +97,10 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     if (s->recv_len > 0) pfd->revents |= B1NIX_POLLIN;
     pfd->revents |= B1NIX_POLLOUT;
   } else if (s->type == B1NIX_SOCK_STREAM) {
+    if (!s->connected && s->tcp_conn &&
+        tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+      s->connected = 1;
+    }
     /* Simple poll for TCP */
     if (s->connected) {
       pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
@@ -119,8 +141,8 @@ void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
 }
 
 int vfs_socket(int domain, int type, int protocol) {
-  if (domain != B1NIX_AF_INET && domain != B1NIX_AF_UNIX) return -1;
-  if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM) return -1;
+  if (domain != B1NIX_AF_INET && domain != B1NIX_AF_UNIX) return -EAFNOSUPPORT;
+  if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM) return -ESOCKTNOSUPPORT;
   
   int handle_idx = alloc_raw_handle(VFS_HANDLE_SOCKET);
   if (handle_idx < 0) return handle_idx;
@@ -144,41 +166,53 @@ int vfs_socket(int domain, int type, int protocol) {
     if (domain == B1NIX_AF_UNIX) unix_free_state(socket);
     kfree(socket); 
     release_handle(handle_idx); 
-    return -1; 
+    return -EMFILE; 
   }
   return fd;
 }
 
 int vfs_bind(int fd, const void *addr, usize addrlen) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   
   if (s->domain == B1NIX_AF_UNIX) {
-    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -1;
+    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
     return unix_bind(s, (const struct b1nix_sockaddr_un *)addr);
   }
 
-  if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -1;
+  if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;
   s->local.in = *(const struct b1nix_sockaddr_in *)addr;
   s->bound = 1;
   if (s->type == B1NIX_SOCK_DGRAM) {
     u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+      if (udp_bindings[i].used && udp_bindings[i].port == port) {
+        return -EADDRINUSE;
+      }
+    }
+    for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
       if (!udp_bindings[i].used) {
         udp_bindings[i].used = 1;
         udp_bindings[i].port = port;
-        udp_bindings[i].h_idx = scheduler_fd_get(fd);
-        break;
+        udp_bindings[i].h_idx = h_idx;
+        return 0;
       }
     }
+    return -ENOBUFS;
   }
   return 0;
 }
 
 int vfs_listen(int fd, int backlog) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (s->domain == B1NIX_AF_UNIX) return unix_listen(s, backlog);
   
@@ -193,8 +227,11 @@ int vfs_listen(int fd, int backlog) {
 }
 
 int vfs_accept(int fd, void *addr, usize *addrlen) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s->listening) return -EINVAL;
 
@@ -221,6 +258,11 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
     while (1) {
       conn = tcp_accept(local_port, &client_ip, &client_port);
       if (conn) break;
+      if (h->flags & B1NIX_O_NONBLOCK) {
+        kfree(new_s);
+        release_handle(new_h_idx);
+        return -EAGAIN;
+      }
       scheduler_block_on(vfs_poll_chan);
     }
     new_s->tcp_conn = conn;
@@ -255,39 +297,68 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
 }
 
 int vfs_connect(int fd, const void *addr, usize addrlen) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (s->connected) return -EISCONN;
+  if (s->tcp_conn && !s->connected) {
+    if (tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+      s->connected = 1;
+      return 0;
+    }
+    return -EALREADY;
+  }
   
   if (s->domain == B1NIX_AF_UNIX) {
-    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -1;
+    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
     return unix_connect(s, (const struct b1nix_sockaddr_un *)addr);
   }
 
-  if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -1;
+  if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;
   s->peer.in = *(const struct b1nix_sockaddr_in *)addr;
-  s->connected = 1;
+  s->connected = 0;
   if (s->type == B1NIX_SOCK_STREAM) {
     struct ipv4_addr dst_ip;
     dst_ip.bytes[0] = s->peer.in.sin_addr & 0xFF;
     dst_ip.bytes[1] = (s->peer.in.sin_addr >> 8) & 0xFF;
     dst_ip.bytes[2] = (s->peer.in.sin_addr >> 16) & 0xFF;
     dst_ip.bytes[3] = (s->peer.in.sin_addr >> 24) & 0xFF;
+    if (h->flags & B1NIX_O_NONBLOCK) {
+      s->tcp_conn = tcp_connect_async(
+          dst_ip, (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8));
+      if (!s->tcp_conn) {
+        return -ECONNREFUSED;
+      }
+      return -EINPROGRESS;
+    }
     s->tcp_conn = tcp_connect(dst_ip, (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8));
-    if (!s->tcp_conn) return -1;
+    if (!s->tcp_conn) {
+      s->connected = 0;
+      return -ECONNREFUSED;
+    }
+    s->connected = 1;
   }
   return 0;
 }
 
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_send_h(h, buf, len, flags);
 }
 
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
-  struct vfs_handle *h = get_handle_by_idx(scheduler_fd_get(fd));
-  if (!h || h->kind != VFS_HANDLE_SOCKET) return -1;
+  int h_idx = scheduler_fd_get(fd);
+  if (h_idx < 0) return -EBADF;
+  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_recv_h(h, buf, len, flags);
 }
 

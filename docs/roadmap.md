@@ -157,7 +157,7 @@ and broader utility flag compatibility.
 - [x] `initial` UDP protocol.
 - [x] `initial` DHCP client.
 - [x] `initial` DNS client.
-- [x] `initial` Add socket ABI integration for UDP/TCP-style descriptors.
+- [x] `done` Add socket ABI integration for UDP/TCP-style descriptors, including POSIX-style error returns and non-blocking connect (`EINPROGRESS`/`EALREADY`) behavior.
 - [x] `partial` Add minimal TCP client path for terminal tools.
 - [x] `done` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.
 
@@ -352,14 +352,15 @@ unclean shutdown.
 
 M22 is useful but not fully closed. The init-path smoke proves many utilities
 work, and `/bin/shell-smoke` now exercises a small script through `/bin/sh`.
-Current verification: `make smoke-x86` passes M22 utility smoke, M24 stress, and
-the POSIX shell-driven smoke path. POSIX-style closure still needs broader
+Current verification: `make smoke-x86` passes M22 utility smoke, M24 stress, the
+POSIX shell-driven smoke path, and an init-path `ping -c 2 10.0.2.2` gateway
+check. POSIX-style closure still needs broader
 shell-script coverage, unsupported-flag behavior, consistent nonzero exits, and
 more exact text/file utility semantics.
 
 ## M23: Networking for Terminal Use
 
-- [x] `initial` Turn the socket ABI into UDP-capable socket descriptors.
+- [x] `done` Turn the socket ABI into UDP-capable socket descriptors.
 - [x] `partial` Add minimal TCP client support.
 - [x] `initial` Add DNS resolver integration through libc-style calls and shell commands.
 - [x] `done` Add `ifconfig`-style interface status.

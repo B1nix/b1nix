@@ -1234,6 +1234,45 @@ static u64 sys_brk(u64 addr) {
   return t->user_brk;
 }
 
+static int parse_ipv4_literal(const char *s, struct ipv4_addr *out) {
+  if (!s || !out)
+    return -EINVAL;
+
+  struct ipv4_addr ip = {{0, 0, 0, 0}};
+  int octet = 0;
+  int value = 0;
+  int has_digit = 0;
+
+  for (const char *p = s;; p++) {
+    char c = *p;
+    if (c >= '0' && c <= '9') {
+      has_digit = 1;
+      value = value * 10 + (c - '0');
+      if (value > 255)
+        return -EINVAL;
+      continue;
+    }
+
+    if (c == '.' || c == '\0') {
+      if (!has_digit || octet >= 4)
+        return -EINVAL;
+      ip.bytes[octet++] = (u8)value;
+      value = 0;
+      has_digit = 0;
+      if (c == '\0')
+        break;
+      continue;
+    }
+
+    return -EINVAL;
+  }
+
+  if (octet != 4)
+    return -EINVAL;
+  *out = ip;
+  return 0;
+}
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   u64 ret = 0;
@@ -1480,23 +1519,42 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     net_dump_info();
     return 0;
   case SYS_NET_PING: {
+    char ip_text[32];
     struct ipv4_addr dest;
-    if (syscall_copyin(&dest, (void *)(usize)arg0, sizeof(dest)) != 0)
+    if (syscall_copyinstr(ip_text, sizeof(ip_text), (const char *)(usize)arg0) != 0)
       return (u64)-EFAULT;
-    for (int i = 0; i < 4; i++) {
+    if (parse_ipv4_literal(ip_text, &dest) != 0) {
+      return (u64)-EINVAL;
+    }
+
+    u32 before = icmp_echo_reply_count();
+
+    for (int attempt = 0; attempt < 4; attempt++) {
+      u16 seq = (u16)((scheduler_get_uptime_ticks() + attempt) & 0xffff);
       u8 echo[8] = {8, 0, 0, 0, 0, 0, 0, 0};
+      echo[6] = (u8)(seq >> 8);
+      echo[7] = (u8)(seq & 0xff);
       u16 csum = 0;
       for (int j = 0; j < 8; j += 2)
         csum = (u16)(csum + (u16)((echo[j] << 8) | echo[j + 1]));
       csum = (u16)~csum;
       echo[2] = (u8)(csum >> 8);
       echo[3] = (u8)(csum & 0xff);
+
       ipv4_send(dest, 1, echo, sizeof(echo));
       console_write("ping: sent request seq=");
-      console_write_dec(i + 1);
+      console_write_dec(seq);
       console_write("\n");
-      scheduler_sleep_ticks(100);
+
+      for (int wait = 0; wait < 25; wait++) {
+        net_poll();
+        if (icmp_echo_reply_count() > before) {
+          return 0;
+        }
+        scheduler_sleep_ticks(2);
+      }
     }
+    console_write("ping: timeout waiting reply\n");
     return 0;
   }
   case SYS_NET_DNS:

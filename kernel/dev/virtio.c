@@ -12,6 +12,14 @@ int virtio_init_device(struct virtio_device *dev, u16 vendor, u16 device)
 		return 0; // Not found
 	}
 
+	/* Ensure the PCI function is actually allowed to issue bus cycles.
+	   Legacy virtio-net relies on IO BAR access and DMA/bus mastering. */
+	u16 cmd = pci_config_read16(pci_info.bus, pci_info.slot, pci_info.func, 0x04);
+	cmd |= 0x0001; /* I/O space */
+	cmd |= 0x0002; /* memory space (harmless for IO transport) */
+	cmd |= 0x0004; /* bus master */
+	pci_config_write16(pci_info.bus, pci_info.slot, pci_info.func, 0x04, cmd);
+
 	// Read BAR0 to get I/O port base (legacy virtio)
 	u32 bar0 = pci_config_read32(pci_info.bus, pci_info.slot, pci_info.func, 0x10);
 	if ((bar0 & 1) == 0) {

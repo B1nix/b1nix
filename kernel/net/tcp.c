@@ -49,10 +49,11 @@ struct tcp_pseudo {
   u16 tcp_length;
 } __attribute__((packed));
 
-#define MAX_TCP_CONNS 4
+#define MAX_TCP_CONNS 16
 #define TCP_RECV_BUF_SIZE 4096
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
+#define TCP_TIME_WAIT_TICKS 200
 
 struct tcp_retransmit_pkt {
   u8 *data;
@@ -78,12 +79,29 @@ struct tcp_conn {
   u32 recv_len;
   u32 recv_read;
   int handed_to_user;
+  u64 time_wait_since;
   struct tcp_retransmit_pkt *retransmit_queue;
 };
 
 static struct tcp_conn tcp_conns[MAX_TCP_CONNS];
 static u16 next_local_port = 1025;
 static u32 tcp_iss_counter = 0;
+
+static void tcp_clear_retransmit_queue(struct tcp_conn *conn) {
+  struct tcp_retransmit_pkt *q = conn->retransmit_queue;
+  while (q) {
+    struct tcp_retransmit_pkt *next = q->next;
+    kfree(q->data);
+    kfree(q);
+    q = next;
+  }
+  conn->retransmit_queue = 0;
+}
+
+static void tcp_enter_time_wait(struct tcp_conn *conn) {
+  conn->state = TCP_TIME_WAIT;
+  conn->time_wait_since = scheduler_get_uptime_ticks();
+}
 
 static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 static u32 bswap32(u32 v) {
@@ -164,9 +182,7 @@ static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
   *prev = rp;
 }
 
-/* ── Create new TCP connection (active open) ── */
-struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
-  /* Find free slot */
+static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port) {
   struct tcp_conn *conn = 0;
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (!tcp_conns[i].used) {
@@ -186,13 +202,11 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
   conn->remote_port = dst_port;
   conn->local_port = tcp_alloc_port();
 
-  /* Generate initial sequence number */
   tcp_iss_counter += 1000;
   conn->iss = tcp_iss_counter;
   conn->snd_una = conn->iss;
   conn->snd_nxt = conn->iss;
 
-  /* Send SYN */
   u8 packet[sizeof(struct tcp_header)];
   memset(packet, 0, sizeof(packet));
   struct tcp_header *tcp = (struct tcp_header *)packet;
@@ -206,9 +220,16 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
   tcp->checksum = tcp_checksum(net_get_ip(), dst_ip, packet, sizeof(packet));
 
   conn->state = TCP_SYN_SENT;
-
   ipv4_send(dst_ip, IP_PROTO_TCP, packet, sizeof(packet));
   tcp_queue_retransmit(conn, packet, sizeof(packet), conn->iss);
+  return conn;
+}
+
+/* ── Create new TCP connection (active open) ── */
+struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
+  struct tcp_conn *conn = tcp_connect_start(dst_ip, dst_port);
+  if (!conn)
+    return 0;
 
   /* Wait for SYN-ACK (poll a few times) */
   for (int tries = 0; tries < 200 && conn->state == TCP_SYN_SENT; tries++) {
@@ -223,6 +244,16 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
 
   console_write("tcp: connected\n");
   return conn;
+}
+
+struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port) {
+  return tcp_connect_start(dst_ip, dst_port);
+}
+
+int tcp_is_established(struct tcp_conn *conn) {
+  if (!conn || !conn->used)
+    return 0;
+  return conn->state == TCP_ESTABLISHED;
 }
 
 /* ── TCP Listen ── */
@@ -340,6 +371,10 @@ int tcp_close(struct tcp_conn *conn) {
   if (!conn || !conn->used)
     return -1;
 
+  if (conn->state == TCP_CLOSE_WAIT) {
+    conn->state = TCP_LAST_ACK;
+  }
+
   /* Send FIN */
   u8 packet[sizeof(struct tcp_header)];
   memset(packet, 0, sizeof(packet));
@@ -362,11 +397,17 @@ int tcp_close(struct tcp_conn *conn) {
   tcp_queue_retransmit(conn, packet, sizeof(packet), seq_start);
 
   /* Wait for FIN-ACK (poll a bit) */
-  for (int tries = 0; tries < 50 && conn->state != TCP_CLOSED; tries++) {
+  for (int tries = 0; tries < 50 && conn->state != TCP_CLOSED &&
+                          conn->state != TCP_TIME_WAIT; tries++) {
     net_poll();
   }
 
-  conn->used = 0;
+  if (conn->state == TCP_CLOSED) {
+    tcp_clear_retransmit_queue(conn);
+    conn->used = 0;
+  } else if (conn->state != TCP_TIME_WAIT) {
+    tcp_enter_time_wait(conn);
+  }
   return 0;
 }
 
@@ -574,9 +615,9 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
       if (conn->state == TCP_ESTABLISHED) {
         conn->state = TCP_CLOSE_WAIT;
       } else if (conn->state == TCP_FIN_WAIT1) {
-        conn->state = TCP_CLOSED;
+        tcp_enter_time_wait(conn);
       } else if (conn->state == TCP_FIN_WAIT2) {
-        conn->state = TCP_CLOSED;
+        tcp_enter_time_wait(conn);
       }
     }
 
@@ -595,6 +636,12 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
   case TCP_LAST_ACK:
     if (flags & TCP_ACK) {
       conn->state = TCP_CLOSED;
+    }
+    break;
+
+  case TCP_TIME_WAIT:
+    if (flags & TCP_FIN) {
+      tcp_enter_time_wait(conn);
     }
     break;
 
@@ -617,21 +664,21 @@ void tcp_timer_tick(void) {
     if (!conn->used)
       continue;
 
+    if (conn->state == TCP_TIME_WAIT) {
+      if (now - conn->time_wait_since >= TCP_TIME_WAIT_TICKS) {
+        tcp_clear_retransmit_queue(conn);
+        conn->used = 0;
+      }
+      continue;
+    }
+
     struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
     while (rp) {
       if (now - rp->timestamp >= 50) { // 500ms
         if (rp->retries >= 5) {
           conn->state = TCP_CLOSED;
           conn->used = 0;
-          /* Clear queue */
-          struct tcp_retransmit_pkt *q = conn->retransmit_queue;
-          while (q) {
-            struct tcp_retransmit_pkt *next = q->next;
-            kfree(q->data);
-            kfree(q);
-            q = next;
-          }
-          conn->retransmit_queue = 0;
+          tcp_clear_retransmit_queue(conn);
           break;
         }
         ipv4_send(conn->remote_ip, IP_PROTO_TCP, rp->data, rp->len);

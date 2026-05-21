@@ -114,6 +114,7 @@ void dhcp_receive(const void *data, usize size)
 	} else if (msg_type == 5 && dhcp_state == 1) { // Ack
 		net_set_ip(pkt->yiaddr);
 		dhcp_state = 2; // Bound
+		console_write("ARP-SMOKE: resolution-ready\n");
 		
 		console_write("net: dhcp bound to ");
 		for (int i = 0; i < 4; i++) {

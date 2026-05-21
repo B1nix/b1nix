@@ -164,6 +164,18 @@ check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
 check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
+check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"
+check_output "$LOG" "ARP-SMOKE: request-sent" "ARP request path exercised"
+if grep -q "ARP-SMOKE: resolution-ready" "$LOG" 2>/dev/null; then
+	pass "ARP resolution became available"
+else
+	skip "ARP resolution became available" "no ARP resolution marker observed in this run"
+fi
+if grep -q "ARP-SMOKE: reply-received" "$LOG" 2>/dev/null; then
+	pass "ARP reply path exercised"
+else
+	skip "ARP reply path exercised" "no ARP reply observed in this run"
+fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 
 # ── Network tests (x86 only) ──

@@ -929,6 +929,11 @@ static int sh_main(int argc, const char **argv) {
   return 0;
 }
 
+extern int busybox_main(int argc, const char **argv);
+extern int mc_main(int argc, const char **argv);
+extern int editor_main(int argc, const char **argv);
+extern int nmake_main(int argc, const char **argv);
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -970,6 +975,14 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
   }
 
+  const char *net_ping_argv[] = {"ping", "-c", "2", "10.0.2.2", 0};
+  int net_ping_status = busybox_main(4, net_ping_argv);
+  if (net_ping_status == 0) {
+    uwrite("NET-SMOKE: ok ping-gateway\n");
+  } else {
+    uwrite("NET-SMOKE: fail ping-gateway\n");
+  }
+
   if (bootinfo_has_flag("b1nix.test=1")) {
     uwrite("B1NIX-TEST: done\n");
     syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
@@ -985,11 +998,6 @@ static int init_main(int argc, const char **argv) {
 
   return 0;
 }
-
-extern int busybox_main(int argc, const char **argv);
-extern int mc_main(int argc, const char **argv);
-extern int editor_main(int argc, const char **argv);
-extern int nmake_main(int argc, const char **argv);
 
 static int m22_run(const char *label, const char *path, int argc,
                    const char **argv) {

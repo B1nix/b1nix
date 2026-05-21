@@ -1,5 +1,6 @@
 #include <b1nix/net.h>
 #include <b1nix/mm.h>
+#include <b1nix/sched.h>
 #include <string.h>
 
 #define IP_PROTO_ICMP 1
@@ -108,11 +109,14 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 		route_ip = net_get_gateway();
 	}
 
-	if (arp_resolve(route_ip, &dst_mac)) {
-		net_send_ethernet(dst_mac, 0x0800, buffer, total_size);
-	} else {
-		// In a real OS, queue the packet and wait for ARP reply.
-		// For our simple OS, we just drop the first packet and ARP will reply soon.
+	for (int tries = 0; tries < 25; tries++) {
+		if (arp_resolve(route_ip, &dst_mac)) {
+			net_send_ethernet(dst_mac, 0x0800, buffer, total_size);
+			kfree(buffer);
+			return;
+		}
+		net_poll();
+		scheduler_sleep_ticks(1);
 	}
 	kfree(buffer);
 }

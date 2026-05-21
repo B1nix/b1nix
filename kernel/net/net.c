@@ -17,6 +17,8 @@ static volatile int net_ready;
 
 static volatile int net_tx_lock = 0;
 static volatile int net_rx_lock = 0;
+static void **tx_buffers;
+static u8 *tx_inflight;
 
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
@@ -196,8 +198,20 @@ static void virtio_net_probe(void)
 	virtio_set_guest_features(&net_dev, 0);
 	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
 
-	if (!virtq_init(&net_dev, 0, &net_rx_vq)) return;
-	if (!virtq_init(&net_dev, 1, &net_tx_vq)) return;
+	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
+		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
+		return;
+	}
+	if (!virtq_init(&net_dev, 1, &net_tx_vq)) {
+		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
+		return;
+	}
+	tx_buffers = kzalloc(sizeof(void *) * net_tx_vq.queue_size);
+	tx_inflight = kzalloc(sizeof(u8) * net_tx_vq.queue_size);
+	if (!tx_buffers || !tx_inflight) {
+		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
+		return;
+	}
 
 	// Read MAC from device config space (ports + 20 for legacy virtio pci)
 	for (int i = 0; i < 6; i++) {
@@ -230,8 +244,16 @@ static void virtio_net_probe(void)
 static void net_task(void *arg)
 {
 	(void)arg;
+	u64 last_dhcp_retry = 0;
 	while (1) {
 		net_poll();
+		if (local_ip.bytes[0] == 0) {
+			u64 now = scheduler_get_uptime_ticks();
+			if (now - last_dhcp_retry >= 300) {
+				dhcp_init();
+				last_dhcp_retry = now;
+			}
+		}
 		scheduler_yield();
 	}
 }
@@ -253,13 +275,6 @@ void net_init(void)
 		return;
 	}
 	dhcp_init();
-	
-	// Wait until DHCP gets an IP or a timeout
-	for (int i = 0; i < 50; i++) {
-		net_poll();
-		if (local_ip.bytes[0] != 0) break;
-		for (volatile int j = 0; j < 1000000; j++); // Simple delay
-	}
 
 	kthread_create("net_task", net_task, 0);
 }
@@ -270,7 +285,7 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 		return;
 	}
 
-	// Allocate TX buffer (simplistic bump allocation for now, no free)
+	// Allocate TX buffer. It is reclaimed on TX completion in net_poll().
 	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
 	u8 *buffer = kzalloc(packet_size);
 	if (!buffer) return;
@@ -286,28 +301,37 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 	eth_hdr[13] = ethertype & 0xFF;
 	memcpy(eth_hdr + 14, payload, size);
 
-	while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+	for (int tries = 0; tries < 2; tries++) {
+		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
 
-	u16 d0 = net_tx_vq.avail->idx % net_tx_vq.queue_size;
-	net_tx_vq.desc[d0].addr = (u64)(usize)buffer;
-	net_tx_vq.desc[d0].len = packet_size;
-	net_tx_vq.desc[d0].flags = 0;
-	net_tx_vq.desc[d0].next = 0;
+		u16 d0 = 0xFFFF;
+		for (u16 i = 0; i < net_tx_vq.queue_size; i++) {
+			if (!tx_inflight[i]) {
+				d0 = i;
+				break;
+			}
+		}
+		if (d0 == 0xFFFF) {
+			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+			net_poll();
+			continue;
+		}
 
-	net_tx_vq.avail->ring[d0] = d0;
-	__asm__ volatile("" ::: "memory");
-	net_tx_vq.avail->idx++;
-	__asm__ volatile("" ::: "memory");
+		tx_buffers[d0] = buffer;
+		tx_inflight[d0] = 1;
+		net_tx_vq.desc[d0].addr = (u64)(usize)buffer;
+		net_tx_vq.desc[d0].len = packet_size;
+		net_tx_vq.desc[d0].flags = 0;
+		net_tx_vq.desc[d0].next = 0;
 
-	virtq_kick(&net_dev, &net_tx_vq);
-
-	// Poll until sent
-	while (net_tx_vq.used->idx == net_tx_vq.last_used_idx) {
-		__asm__ volatile("pause" ::: "memory");
+		net_tx_vq.avail->ring[d0] = d0;
+		__asm__ volatile("" ::: "memory");
+		net_tx_vq.avail->idx++;
+		__asm__ volatile("" ::: "memory");
+		virtq_kick(&net_dev, &net_tx_vq);
+		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+		return;
 	}
-	net_tx_vq.last_used_idx++;
-
-	__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
 
 	kfree(buffer);
 }
@@ -319,6 +343,19 @@ void net_poll(void)
 	}
 
 	tcp_timer_tick();
+
+	while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+	while (net_tx_vq.used && net_tx_vq.used->idx != net_tx_vq.last_used_idx) {
+		u16 used_idx = net_tx_vq.last_used_idx % net_tx_vq.queue_size;
+		u32 id = net_tx_vq.used->ring[used_idx].id;
+		if (id < net_tx_vq.queue_size && tx_inflight[id]) {
+			tx_inflight[id] = 0;
+			kfree(tx_buffers[id]);
+			tx_buffers[id] = 0;
+		}
+		net_tx_vq.last_used_idx++;
+	}
+	__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
 
 	if (__atomic_test_and_set(&net_rx_lock, __ATOMIC_ACQUIRE)) return; // Don't block if someone else is already polling
 

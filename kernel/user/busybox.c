@@ -1399,9 +1399,38 @@ static int ping_main(int argc, const char **argv) {
     return 1;
   }
 
-  /* Use SYS_NET_PING */
-  syscall_dispatch(SYS_NET_PING, (u64)(usize)argv[1], 0, 0, 0, 0, 0);
-  return 0;
+  int count = 1;
+  const char *host = 0;
+  int i = 1;
+  while (i < argc) {
+    if (strcmp(argv[i], "-c") == 0) {
+      if (i + 1 >= argc) {
+        printf("ping: missing count after -c\n");
+        return 1;
+      }
+      count = atoi(argv[i + 1]);
+      if (count <= 0)
+        count = 1;
+      i += 2;
+      continue;
+    }
+    host = argv[i];
+    i++;
+  }
+
+  if (!host) {
+    printf("ping: missing host\nUsage: ping [-c count] <ip-address>\n");
+    return 1;
+  }
+
+  int failures = 0;
+  for (int seq = 0; seq < count; seq++) {
+    isize rc = (isize)syscall_dispatch(SYS_NET_PING, (u64)(usize)host, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+      failures++;
+    }
+  }
+  return failures ? 1 : 0;
 }
 
 /* ── nc (netcat) — TCP/UDP network tool ── */

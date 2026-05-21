@@ -19,6 +19,11 @@ int chdir(const char *path);
 int getcwd(char *buf, size_t size);
 int fsync(int fd);
 void sync(void);
+int socket(int domain, int type, int protocol);
+int bind(int fd, const void *addr, size_t addrlen);
+int connect(int fd, const void *addr, size_t addrlen);
+long send(int fd, const void *buf, size_t len, int flags);
+long recv(int fd, void *buf, size_t len, int flags);
 
 /* stat structure for userspace */
 struct stat {

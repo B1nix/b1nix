@@ -179,3 +179,23 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
 int munmap(void *addr, size_t length) {
   return (int)syscall(SYS_MUNMAP, addr, length);
 }
+
+int socket(int domain, int type, int protocol) {
+  return (int)syscall(SYS_SOCKET, domain, type, protocol);
+}
+
+int bind(int fd, const void *addr, size_t addrlen) {
+  return (int)syscall(SYS_BIND, fd, addr, addrlen);
+}
+
+int connect(int fd, const void *addr, size_t addrlen) {
+  return (int)syscall(SYS_CONNECT, fd, addr, addrlen);
+}
+
+long send(int fd, const void *buf, size_t len, int flags) {
+  return (long)syscall(SYS_SEND, fd, buf, len, flags);
+}
+
+long recv(int fd, void *buf, size_t len, int flags) {
+  return (long)syscall(SYS_RECV, fd, buf, len, flags);
+}

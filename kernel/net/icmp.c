@@ -15,6 +15,7 @@ struct icmp_header {
 } __attribute__((packed));
 
 static u16 bswap16(u16 value) { return (u16)((value << 8) | (value >> 8)); }
+static volatile u32 g_icmp_echo_replies = 0;
 
 static u16 icmp_checksum(const u8 *data, usize size) {
   u32 sum = 0;
@@ -52,6 +53,7 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 		ipv4_send(src, 1 /* ICMP */, reply, size);
 		kfree(reply);
 	} else if (hdr->type == ICMP_TYPE_ECHO_REPLY) {
+		__atomic_add_fetch(&g_icmp_echo_replies, 1, __ATOMIC_RELAXED);
 		console_write("ping: reply from ");
 		console_write_dec(src.bytes[0]);
 		console_write(".");
@@ -66,4 +68,8 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 		console_write_dec(hdr->seq); // Wait, seq might be swapped? Standard ping uses network byte order or host. Let's assume it's just what we sent.
 		console_write("\n");
 	}
+}
+
+u32 icmp_echo_reply_count(void) {
+	return __atomic_load_n(&g_icmp_echo_replies, __ATOMIC_RELAXED);
 }

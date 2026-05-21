@@ -35,6 +35,7 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 
 // ICMP
 void icmp_receive(struct ipv4_addr src, const void *data, usize size);
+u32 icmp_echo_reply_count(void);
 
 // UDP
 void udp_receive(struct ipv4_addr src, const void *data, usize size);
@@ -52,6 +53,8 @@ void dns_receive(const void *data, usize size);
 void tcp_receive(struct ipv4_addr src, const void *data, usize size);
 struct tcp_conn;
 struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
+struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
+int tcp_is_established(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len);
 int tcp_close(struct tcp_conn *conn);
