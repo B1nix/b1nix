@@ -28,11 +28,22 @@ static inline int is_canonical(u64 addr) {
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
 }
 
+static int syscall_allows_kernel_pointers(void) {
+  struct task *t = current_task;
+  if (!t || !t->user_image)
+    return 1;
+
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  return img->kind == USER_IMAGE_BUILTIN;
+}
+
 static char **copy_user_array(const char **u_array) {
   if (!u_array)
     return NULL;
 
-  if (!is_canonical((u64)u_array) || (u64)u_array >= 0x0000800000000000ULL)
+  int allow_kernel_ptrs = syscall_allows_kernel_pointers();
+  if (!is_canonical((u64)u_array) ||
+      (!allow_kernel_ptrs && (u64)u_array >= 0x0000800000000000ULL))
     return ERR_PTR(-EFAULT);
 
   char **k_array = kmalloc(sizeof(char *) * (MAX_EXEC_ARGS + 1));
@@ -41,7 +52,7 @@ static char **copy_user_array(const char **u_array) {
   memset(k_array, 0, sizeof(char *) * (MAX_EXEC_ARGS + 1));
 
   for (int i = 0; i < MAX_EXEC_ARGS; i++) {
-    if ((u64)&u_array[i] >= 0x0000800000000000ULL)
+    if (!allow_kernel_ptrs && (u64)&u_array[i] >= 0x0000800000000000ULL)
       goto fault;
     const char *u_str;
     if (copy_from_user(&u_str, &u_array[i], sizeof(char *)) < 0)
@@ -52,7 +63,8 @@ static char **copy_user_array(const char **u_array) {
       break;
     }
 
-    if (!is_canonical((u64)u_str) || (u64)u_str >= 0x0000800000000000ULL)
+    if (!is_canonical((u64)u_str) ||
+        (!allow_kernel_ptrs && (u64)u_str >= 0x0000800000000000ULL))
       goto fault;
 
     char tmp[MAX_EXEC_ARG_LEN];
@@ -125,11 +137,22 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
   if (!dst || dst_size == 0 || !user_src)
     return -EFAULT;
 
+  if (syscall_allows_kernel_pointers()) {
+    usize copied = 0;
+    while (copied < dst_size) {
+      char c = user_src[copied];
+      dst[copied++] = c;
+      if (c == '\0') return 0;
+    }
+    if (dst_size > 0) dst[dst_size - 1] = '\0';
+    return -ENAMETOOLONG;
+  }
+
   usize copied = 0;
   u64 curr = (u64)(usize)user_src;
 
   while (copied < dst_size) {
-    // Verify that the address is in userspace
+    // ELF64 user processes may only copy strings from userspace VMAs.
     if (curr >= 0x0000800000000000ULL) return -EFAULT;
 
     // Find the VMA covering the current address
@@ -142,16 +165,6 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
         break;
       }
       vma = vma->next;
-    }
-
-    /* Fallback for builtin programs or early boot where VMA list might be empty */
-    if (!found) {
-      struct task *t = current_task;
-      if (!t || !t->user_image) found = 1;
-      else {
-        struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-        if (img->kind == USER_IMAGE_BUILTIN) found = 1;
-      }
     }
 
     if (!found) return -EFAULT;

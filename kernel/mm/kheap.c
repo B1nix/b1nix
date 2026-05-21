@@ -15,6 +15,7 @@ struct kheap_block {
 };
 
 #define KHEAP_MAGIC 0xB1A110C
+#define KHEAP_FREED_MAGIC 0xDEAD110C
 #define KHEAP_HEADER_SIZE 32
 #define KHEAP_REUSE_MIN_SIZE 0
 
@@ -120,6 +121,7 @@ void kfree(void *ptr) {
     return;
   if (block->size < KHEAP_REUSE_MIN_SIZE)
     return;
+  block->magic = KHEAP_FREED_MAGIC;
   block->next = free_list;
   free_list = block;
 }
