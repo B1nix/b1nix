@@ -1,5 +1,6 @@
 #include <b1nix/filelock.h>
 #include <b1nix/mm.h>
+#include <b1nix/errno.h>
 #include <b1nix/vfs.h>
 #include <string.h>
 
@@ -48,11 +49,11 @@ static int lock_conflicts(struct file_lock *existing, int lock_type) {
 
 int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   if (!filelock_initialized || fd < 0)
-    return -1;
+    return -EINVAL;
 
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (!node)
-    return -1;
+    return -EBADF;
 
   if (fl->l_type == F_UNLCK) {
     // Find and remove matching lock
@@ -82,16 +83,16 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   if (conflict_pid) {
     if (cmd == F_SETLK) {
       // Non-blocking, return error
-      return -1; // EAGAIN would be proper
+      return -EAGAIN;
     }
     // F_SETLKW would block - not implemented yet
-    return -1;
+    return -EAGAIN;
   }
 
   // Create new lock
   struct file_lock *lock = alloc_lock();
   if (!lock)
-    return -1;
+    return -ENOMEM;
 
   lock->pid = fl->l_pid;
   lock->lock_type = fl->l_type;
@@ -103,7 +104,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
 
 int filelock_unlock(int fd) {
   if (!filelock_initialized || fd < 0)
-    return -1;
+    return -EINVAL;
 
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
     if (file_locks[i].active) {
@@ -135,7 +136,7 @@ int filelock_check_lock(int fd, int lock_type, u64 start, u64 len,
 
 int filelock_flock(int fd, int operation) {
   if (!filelock_initialized || fd < 0)
-    return -1;
+    return -EINVAL;
 
   struct flock fl;
   memset(&fl, 0, sizeof(fl));
@@ -158,7 +159,7 @@ int filelock_flock(int fd, int operation) {
     fl.l_len = 0;
     break;
   default:
-    return -1;
+    return -EINVAL;
   }
 
   int cmd = (operation & LOCK_NB) ? F_SETLK : F_SETLKW;
