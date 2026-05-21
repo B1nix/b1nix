@@ -367,6 +367,12 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (!image)
     return 0;
 
+  console_write("user_load_image: allocated image=");
+  console_write_hex64((u64)(usize)image);
+  console_write(" path=");
+  console_write(path ? path : "null");
+  console_write("\n");
+
   if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc) != 0)
     return 0;
   if (argc > 0 && image->argc > argc)
@@ -384,6 +390,9 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (user_load_elf64(image, path) == 0) {
     if (user_build_initial_stack(image) != 0)
       return 0;
+    console_write("user_load_image: loaded ELF64 entry=");
+    console_write_hex64(image->entry);
+    console_write("\n");
     return image;
   }
 
@@ -395,9 +404,17 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->address_space = user_address_space_create();
     if (user_build_initial_stack(image) != 0)
       return 0;
+    console_write("user_load_image: loaded BUILTIN kind=");
+    console_write_hex64(image->kind);
+    console_write(" entry=");
+    console_write_hex64(image->entry);
+    console_write(" path=");
+    console_write(image->path);
+    console_write("\n");
     return image;
   }
 
+  console_write("user_load_image: failed to load\n");
   return 0;
 }
 
@@ -612,7 +629,21 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
 static void user_process_thread(void *arg) {
   struct process_start *start = arg;
-  struct user_loaded_image *image = start->image;
+  struct user_loaded_image *image = start ? start->image : 0;
+
+  console_write("user_process_thread: start=");
+  console_write_hex64((u64)(usize)start);
+  console_write(" image=");
+  console_write_hex64((u64)(usize)image);
+  console_write("\n");
+
+  console_write("user_process_thread: name=");
+  console_write((image && image->path) ? image->path : "null");
+  console_write(" kind=");
+  console_write_hex64(image ? image->kind : 999);
+  console_write(" entry=");
+  console_write_hex64(image ? image->entry : 999);
+  console_write("\n");
 
   scheduler_set_user_image(image);
   kfree(start);
