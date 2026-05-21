@@ -996,25 +996,41 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   length = (length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
 
   u64 vaddr;
-  if (addr == 0) {
-    vaddr = vm_find_free_area(t, length);
-  } else {
+  if (flags & MAP_FIXED) {
+    if (!addr)
+      return (u64)-EINVAL;
     vaddr = (u64)(usize)addr;
-    if ((vaddr & (PAGE_SIZE - 1)) != 0) {
+    if ((vaddr & (PAGE_SIZE - 1)) != 0)
+      return (u64)-EINVAL;
+    if (vaddr >= 0x00007FFFFFFFFFFFULL || vaddr + length > 0x00007FFFFFFFFFFFULL)
+      return (u64)-EINVAL;
+
+    // Unmap existing mapping range
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      vmm_unmap_page(v);
+    }
+    vma_delete_range(t, vaddr, vaddr + length);
+  } else {
+    if (addr == 0) {
       vaddr = vm_find_free_area(t, length);
     } else {
-      /* Verify hint doesn't overlap existing VMAs */
-      struct vm_area *curr_vma = t->vma_list;
-      int overlap = 0;
-      while (curr_vma) {
-        if (!(curr_vma->start >= vaddr + length || curr_vma->end <= vaddr)) {
-          overlap = 1;
-          break;
-        }
-        curr_vma = curr_vma->next;
-      }
-      if (overlap) {
+      vaddr = (u64)(usize)addr;
+      if ((vaddr & (PAGE_SIZE - 1)) != 0) {
         vaddr = vm_find_free_area(t, length);
+      } else {
+        /* Verify hint doesn't overlap existing VMAs */
+        struct vm_area *curr_vma = t->vma_list;
+        int overlap = 0;
+        while (curr_vma) {
+          if (!(curr_vma->start >= vaddr + length || curr_vma->end <= vaddr)) {
+            overlap = 1;
+            break;
+          }
+          curr_vma = curr_vma->next;
+        }
+        if (overlap) {
+          vaddr = vm_find_free_area(t, length);
+        }
       }
     }
   }
