@@ -172,6 +172,11 @@ struct rx_buffer {
 static struct rx_buffer *rx_buffers;
 static u16 rx_buffer_count;
 
+static int is_power_of_two_u16(u16 v)
+{
+	return v && ((v & (u16)(v - 1)) == 0);
+}
+
 static void fill_rx_buffer(u16 idx)
 {
 	u16 d0 = idx;
@@ -204,6 +209,13 @@ static void virtio_net_probe(void)
 		return;
 	}
 	if (!virtq_init(&net_dev, 1, &net_tx_vq)) {
+		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
+		return;
+	}
+	if (net_rx_vq.queue_size == 0 || net_tx_vq.queue_size == 0 ||
+	    !is_power_of_two_u16(net_rx_vq.queue_size) ||
+	    !is_power_of_two_u16(net_tx_vq.queue_size)) {
+		console_write("virtio-net: invalid virtqueue size (must be power-of-two)\n");
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
 		return;
 	}
