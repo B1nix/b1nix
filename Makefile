@@ -80,6 +80,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
 	kernel/dev/ps2_kbd.c \
+	kernel/dev/ps2_mouse.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
 	kernel/net/net.c \
@@ -100,7 +101,7 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 
-.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects
+.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke
 
 all: $(KERNEL_ELF)
 
@@ -174,5 +175,8 @@ smoke:
 
 smoke-x86: ARCH=x86
 smoke-x86: smoke
+
+graphics-smoke:
+	sh tests/graphics-smoke.sh
 
 .PHONY: all clean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools

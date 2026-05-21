@@ -121,8 +121,9 @@ and broader utility flag compatibility.
 - [x] `done` Add graphical console.
 - [x] `done` Add input.
 - [x] `done` Add basic compositor.
-- [x] `stub` Explore/register VirtIO GPU.
-- [ ] `planned` Add a real VirtIO GPU mode-setting/rendering path.
+- [x] `done` Add real VirtIO GPU mode-setting/rendering path (legacy + modern PCI transport, dirty-rect transfer/flush, cursor queue path with fallback).
+- [x] `done` Add compositor optimizations: double-buffering, dirty-rect coalescing, adaptive full-redraw threshold, and event-driven wakeups.
+- [x] `done` Remove framebuffer MMIO readback from console scrolling via RAM shadow buffer.
 
 ## M8: Advanced VFS and Filesystems
 
@@ -146,7 +147,7 @@ and broader utility flag compatibility.
 - [x] `done` Add MBR/GPT partition discovery in the block-device layer.
 - [x] `partial` Add AHCI driver support.
 - [x] `partial` Add NVMe driver support.
-- [x] `stub` Add VirtIO GPU driver registration.
+- [x] `done` Add VirtIO GPU driver (legacy + modern transport, controlq/cursorq setup, scanout and present path).
 
 ## M10: Full Network Stack
 

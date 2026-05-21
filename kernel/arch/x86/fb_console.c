@@ -12,14 +12,38 @@ static u32 cursor_y;
 static u32 fg_color = 0x00FFFFFF;
 static u32 bg_color = 0x00000000;
 volatile u8 *fb_ptr = 0;
+static u8 *fb_shadow = 0;
+static usize fb_shadow_size = 0;
+static usize fb_shadow_frames = 0;
 
 static inline void put_pixel(u32 x, u32 y, u32 color)
 {
 	if (!fb_ptr || x >= fb.width || y >= fb.height) {
 		return;
 	}
-	volatile u8 *pixel = fb_ptr + ((u64)y * fb.pitch) + ((u64)x * (fb.bpp / 8));
+	u64 off = ((u64)y * fb.pitch) + ((u64)x * (fb.bpp / 8));
+	volatile u8 *pixel = fb_ptr + off;
 	*(volatile u32 *)pixel = color;
+	if (fb_shadow && off + sizeof(u32) <= fb_shadow_size) {
+		*(u32 *)(void *)(fb_shadow + off) = color;
+	}
+}
+
+static void fb_flush_rect(u32 x, u32 y, u32 w, u32 h)
+{
+	if (!fb_ptr || !fb_shadow || w == 0 || h == 0) return;
+	if (x >= fb.width || y >= fb.height) return;
+	if (x + w > fb.width) w = fb.width - x;
+	if (y + h > fb.height) h = fb.height - y;
+
+	u32 bytes_per_px = fb.bpp / 8;
+	for (u32 py = y; py < y + h; py++) {
+		u64 row_off = (u64)py * fb.pitch;
+		u64 start = row_off + (u64)x * bytes_per_px;
+		usize len = (usize)w * bytes_per_px;
+		if (start + len > fb_shadow_size) break;
+		memcpy((void *)(fb_ptr + start), fb_shadow + start, len);
+	}
 }
 
 void fb_console_init(void)
@@ -51,6 +75,19 @@ void fb_console_init(void)
 	if (!fb_ptr) {
 		console_write("fb: mmio map failed\n");
 		return;
+	}
+	fb_shadow_size = (usize)fb_size;
+	fb_shadow_frames = (fb_shadow_size + PAGE_SIZE - 1) / PAGE_SIZE;
+	u64 fb_shadow_phys = pmm_alloc_frames(fb_shadow_frames);
+	if (fb_shadow_phys) {
+		fb_shadow = (u8 *)(usize)(fb_shadow_phys + vmm_direct_map_base());
+	}
+	if (!fb_shadow) {
+		console_write("fb: shadow alloc failed (using direct mmio)\n");
+		fb_shadow_size = 0;
+		fb_shadow_frames = 0;
+	} else {
+		memset(fb_shadow, 0, fb_shadow_frames * PAGE_SIZE);
 	}
 
 	cursor_x = 0;
@@ -84,20 +121,24 @@ static void fb_draw_char(char c, u32 x, u32 y)
 {
     if (c < 0 || c > 127) c = '?';
     const u8 *glyph = font8x8_basic[(int)c];
+    u32 bytes_per_px = fb.bpp / 8;
 
     for (u32 cy = 0; cy < 8; cy++) {
-        for (u32 cx = 0; cx < 8; cx++) {
-            // MSB is on the left (x=0), LSB is on the right (x=7)
-            u8 bit = (glyph[cy] >> (7 - cx)) & 1;
-            u32 color = bit ? fg_color : bg_color;
-
-            // Draw a 2x2 block for each font pixel (scaling by FONT_SCALE)
-            for (u32 dy = 0; dy < FONT_SCALE; dy++) {
+        for (u32 dy = 0; dy < FONT_SCALE; dy++) {
+            u32 py = y + cy * FONT_SCALE + dy;
+            if (py >= fb.height) continue;
+            for (u32 cx = 0; cx < 8; cx++) {
+                u8 bit = (glyph[cy] >> (7 - cx)) & 1;
+                u32 color = bit ? fg_color : bg_color;
+                u32 px_base = x + cx * FONT_SCALE;
                 for (u32 dx = 0; dx < FONT_SCALE; dx++) {
-                    u32 px = x + cx * FONT_SCALE + dx;
-                    u32 py = y + cy * FONT_SCALE + dy;
-
-                    put_pixel(px, py, color);
+                    u32 px = px_base + dx;
+                    if (px >= fb.width) continue;
+                    u64 off = (u64)py * fb.pitch + (u64)px * bytes_per_px;
+                    *(volatile u32 *)(void *)(fb_ptr + off) = color;
+                    if (fb_shadow && off + sizeof(u32) <= fb_shadow_size) {
+                        *(u32 *)(void *)(fb_shadow + off) = color;
+                    }
                 }
             }
         }
@@ -112,17 +153,21 @@ static void fb_console_scroll(void)
     u32 bytes_per_line = fb.pitch;
     u32 scroll_height = fb.height - line_height;
 
-    u8 *dst = (u8 *)fb_ptr;
-    u8 *src = (u8 *)fb_ptr + (line_height * bytes_per_line);
-    
-    memmove(dst, src, scroll_height * bytes_per_line);
+    if (fb_shadow) {
+        u8 *dst = fb_shadow;
+        u8 *src = fb_shadow + (line_height * bytes_per_line);
+        memmove(dst, src, scroll_height * bytes_per_line);
 
-    // Clear bottom line
-    u64 bg64 = ((u64)bg_color << 32) | bg_color;
-    u64 *dst64 = (u64 *)(dst + scroll_height * bytes_per_line);
-    u32 words = (line_height * bytes_per_line) / 8;
-    for (u32 i = 0; i < words; i++) {
-        dst64[i] = bg64;
+        u8 *tail = dst + scroll_height * bytes_per_line;
+        u64 bg64 = ((u64)bg_color << 32) | bg_color;
+        u64 *tail64 = (u64 *)(void *)tail;
+        u32 words = (line_height * bytes_per_line) / 8;
+        for (u32 i = 0; i < words; i++) tail64[i] = bg64;
+        fb_flush_rect(0, 0, fb.width, fb.height);
+    } else {
+        /* Safety fallback: avoid MMIO readback scrolling when no RAM shadow exists. */
+        fb_console_clear();
+        return;
     }
 
     cursor_y -= line_height;
@@ -189,9 +234,11 @@ void fb_console_putchar(char c)
     }
     if (ansi_state == 2) {
         if (c >= '0' && c <= '9') {
-            ansi_params[ansi_param_idx] = ansi_params[ansi_param_idx] * 10 + (c - '0');
+            int v = ansi_params[ansi_param_idx] * 10 + (c - '0');
+            ansi_params[ansi_param_idx] = (v > 9999) ? 9999 : v;
         } else if (c == ';') {
             if (ansi_param_idx < 7) ansi_param_idx++;
+            else ansi_state = 0;
         } else if (c == '?') {
             /* ignore for now */
         } else {

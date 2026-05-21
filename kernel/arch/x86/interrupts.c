@@ -199,7 +199,7 @@ void x86_pic_init(void) {
   outb(PIC2_DATA, 0x01);
   io_wait();
 
-  outb(PIC1_DATA, 0xfc); // Unmask IRQ0 and IRQ1
+  outb(PIC1_DATA, 0xf8); // Unmask IRQ0, IRQ1 and IRQ2(cascade to PIC2)
   outb(PIC2_DATA, 0xff);
 }
 
@@ -227,6 +227,7 @@ void x86_timer_init(void) {
 }
 
 extern void ps2_kbd_interrupt_handler(void);
+extern void ps2_mouse_interrupt_handler(void);
 
 extern void fb_console_blink_cursor(void);
 
@@ -243,6 +244,13 @@ void x86_irq_handler(struct interrupt_frame *frame) {
 
   if (frame->vector == 33) {
     ps2_kbd_interrupt_handler();
+    outb(PIC1_COMMAND, PIC_EOI);
+    return;
+  }
+
+  if (frame->vector == 44) {
+    ps2_mouse_interrupt_handler();
+    outb(PIC2_COMMAND, PIC_EOI);
     outb(PIC1_COMMAND, PIC_EOI);
     return;
   }

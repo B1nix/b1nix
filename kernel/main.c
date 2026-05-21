@@ -25,6 +25,7 @@
 #include <b1nix/video.h>
 
 extern void ps2_kbd_init(void);
+extern void ps2_mouse_init(void);
 extern void compositor_init(void);
 extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
@@ -109,6 +110,7 @@ void kernel_main(u64 arg0, u64 arg1)
 	swap_init();
 	net_init();
 	ps2_kbd_init();
+	ps2_mouse_init();
 	video_init();
 	compositor_init();
 	virtio_gpu_init();
