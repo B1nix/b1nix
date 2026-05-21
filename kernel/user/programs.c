@@ -2,6 +2,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
+#include <b1nix/errno.h>
 #include <b1nix/net.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
@@ -1111,8 +1112,137 @@ static int m22_smoke_main(int argc, const char **argv) {
   const char *ps_argv[] = {"ps", 0};
   failures += m22_run("ps", "/bin/ps", 1, ps_argv);
 
+  // Run the new compliance checks for M0-M5 gaps
+  int m22_check_posix_compliance(void);
+  failures += m22_check_posix_compliance();
+
   uwrite(failures ? "M22-SMOKE: fail\n" : "M22-SMOKE: done\n");
   return failures ? 1 : 0;
+}
+
+int m22_check_posix_compliance(void) {
+  uwrite("POSIX compliance check: start\n");
+
+  // 1. Check MAP_FIXED
+  void *ptr = (void *)syscall_dispatch(SYS_MMAP, 0, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+  if (ptr == MAP_FAILED) {
+    uwrite("MAP_FIXED test: initial mmap failed\n");
+    return 1;
+  }
+  void *fixed_ptr = (void *)((u64)ptr + 4096);
+  void *res = (void *)syscall_dispatch(SYS_MMAP, (u64)fixed_ptr, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED, -1, 0);
+  if (res != fixed_ptr) {
+    uwrite("MAP_FIXED test: failed to map at target address\n");
+    return 1;
+  }
+  // Try to overwrite existing mapping
+  void *res2 = (void *)syscall_dispatch(SYS_MMAP, (u64)ptr, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE|MAP_FIXED, -1, 0);
+  if (res2 != ptr) {
+    uwrite("MAP_FIXED test: failed to overwrite existing page\n");
+    return 1;
+  }
+  syscall_dispatch(SYS_MUNMAP, (u64)ptr, 4096, 0, 0, 0, 0);
+  syscall_dispatch(SYS_MUNMAP, (u64)fixed_ptr, 4096, 0, 0, 0, 0);
+  uwrite("POSIX compliance check: MAP_FIXED passed\n");
+
+  // 2. Check mprotect alignment and basic permission update path
+  void *prot_ptr = (void *)syscall_dispatch(SYS_MMAP, 0, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+  if (prot_ptr == MAP_FAILED) {
+    uwrite("mprotect test: mmap failed\n");
+    return 1;
+  }
+  isize unaligned_rc = (isize)syscall_dispatch(SYS_MPROTECT, (u64)prot_ptr + 1, 4096, PROT_READ, 0, 0, 0);
+  isize aligned_rc = (isize)syscall_dispatch(SYS_MPROTECT, (u64)prot_ptr, 4096, PROT_READ, 0, 0, 0);
+  syscall_dispatch(SYS_MUNMAP, (u64)prot_ptr, 4096, 0, 0, 0, 0);
+  if (unaligned_rc != -EINVAL || aligned_rc != 0) {
+    uwrite("POSIX compliance check: mprotect failed\n");
+    return 1;
+  }
+  uwrite("POSIX compliance check: mprotect passed\n");
+
+  // 3. Check forked address spaces and copy-on-write isolation
+  volatile char *cow = (volatile char *)syscall_dispatch(SYS_MMAP, 0, 4096, PROT_READ|PROT_WRITE, MAP_ANONYMOUS|MAP_PRIVATE, -1, 0);
+  if ((void *)cow == MAP_FAILED) {
+    uwrite("COW test: mmap failed\n");
+    return 1;
+  }
+  cow[0] = 'P';
+  u64 cow_pid = syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if (cow_pid == 0) {
+    if (cow[0] != 'P')
+      syscall_dispatch(SYS_EXIT, 3, 0, 0, 0, 0, 0);
+    cow[0] = 'C';
+    syscall_dispatch(SYS_EXIT, cow[0] == 'C' ? 0 : 4, 0, 0, 0, 0, 0);
+  } else if ((isize)cow_pid > 0) {
+    int cow_status = 0;
+    syscall_dispatch(SYS_WAIT, cow_pid, (u64)(usize)&cow_status, 0, 0, 0, 0);
+    if (cow_status != 0) {
+      syscall_dispatch(SYS_MUNMAP, (u64)cow, 4096, 0, 0, 0, 0);
+      uwrite("POSIX compliance check: fork-cow child failed\n");
+      return 1;
+    }
+    if (cow[0] != 'P') {
+      syscall_dispatch(SYS_MUNMAP, (u64)cow, 4096, 0, 0, 0, 0);
+      uwrite("POSIX compliance check: fork-cow isolation failed\n");
+      return 1;
+    }
+  } else {
+    syscall_dispatch(SYS_MUNMAP, (u64)cow, 4096, 0, 0, 0, 0);
+    uwrite("POSIX compliance check: fork-cow fork failed\n");
+    return 1;
+  }
+  syscall_dispatch(SYS_MUNMAP, (u64)cow, 4096, 0, 0, 0, 0);
+  uwrite("POSIX compliance check: fork-cow passed\n");
+
+  // 4. Check foreground process-group success path for the controlling TTY
+  usize old_pgrp = 0;
+  usize my_pgrp = (usize)syscall_dispatch(SYS_GETPGRP, 0, 0, 0, 0, 0, 0);
+  if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCGPGRP, (u64)(usize)&old_pgrp, 0, 0, 0) < 0 ||
+      (isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCSPGRP, (u64)(usize)&my_pgrp, 0, 0, 0) < 0) {
+    uwrite("POSIX compliance check: TIOCSPGRP success path failed\n");
+    return 1;
+  }
+  usize readback_pgrp = 0;
+  if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCGPGRP, (u64)(usize)&readback_pgrp, 0, 0, 0) < 0 ||
+      readback_pgrp != my_pgrp) {
+    uwrite("POSIX compliance check: TIOCGPGRP readback failed\n");
+    return 1;
+  }
+  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCSPGRP, (u64)(usize)&old_pgrp, 0, 0, 0);
+  uwrite("POSIX compliance check: foreground pgrp passed\n");
+
+  // 5. Check TIOCSPGRP session restrictions
+  u64 pid = syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if (pid == 0) {
+    // Child process: setsid and TIOCSPGRP
+    u64 sid = syscall_dispatch(SYS_SETSID, 0, 0, 0, 0, 0, 0);
+    if ((isize)sid < 0) {
+      syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
+    }
+    // Now try to set fg pgrp to child pgid (which is its pid)
+    usize my_pgid = (usize)sid;
+    isize rc = (isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCSPGRP, (u64)(usize)&my_pgid, 0, 0, 0);
+    if (rc == -EPERM) {
+      // Correct! Session check prevented it
+      syscall_dispatch(SYS_EXIT, 0, 0, 0, 0, 0, 0);
+    } else {
+      // Failed or allowed
+      syscall_dispatch(SYS_EXIT, 2, 0, 0, 0, 0, 0);
+    }
+  } else if ((isize)pid > 0) {
+    int status = 0;
+    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+    if (status != 0) {
+      uwrite("POSIX compliance check: TIOCSPGRP session check failed\n");
+      return 1;
+    }
+  } else {
+    uwrite("POSIX compliance check: fork failed\n");
+    return 1;
+  }
+  uwrite("POSIX compliance check: TIOCSPGRP session check passed\n");
+
+  return 0;
 }
 
 static int m24_stress_main(int argc, const char **argv) {
