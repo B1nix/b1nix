@@ -10,6 +10,14 @@ struct udp_header {
 	u16 checksum;
 } __attribute__((packed));
 
+struct udp_pseudo_header {
+	u8 src[4];
+	u8 dst[4];
+	u8 zero;
+	u8 protocol;
+	u16 udp_length;
+} __attribute__((packed));
+
 struct udp_handler_entry {
 	u16 port;
 	udp_port_handler_t handler;
@@ -21,6 +29,33 @@ static struct udp_handler_entry udp_handlers[MAX_UDP_HANDLERS];
 static u16 bswap16(u16 value)
 {
 	return (u16)((value << 8) | (value >> 8));
+}
+
+static u16 udp_checksum(struct ipv4_addr src, struct ipv4_addr dst, const u8 *udp_pkt, usize udp_len)
+{
+	struct udp_pseudo_header pseudo;
+	memcpy(pseudo.src, src.bytes, 4);
+	memcpy(pseudo.dst, dst.bytes, 4);
+	pseudo.zero = 0;
+	pseudo.protocol = 17;
+	pseudo.udp_length = bswap16((u16)udp_len);
+
+	u32 sum = 0;
+	const u8 *ph = (const u8 *)&pseudo;
+	for (usize i = 0; i < sizeof(pseudo); i += 2) {
+		sum += (u16)(((u16)ph[i] << 8) | ph[i + 1]);
+	}
+	for (usize i = 0; i + 1 < udp_len; i += 2) {
+		sum += (u16)(((u16)udp_pkt[i] << 8) | udp_pkt[i + 1]);
+	}
+	if (udp_len & 1) {
+		sum += (u16)((u16)udp_pkt[udp_len - 1] << 8);
+	}
+	while (sum >> 16) {
+		sum = (sum & 0xFFFFu) + (sum >> 16);
+	}
+	u16 out = (u16)~sum;
+	return out ? out : 0xFFFFu;
 }
 
 int udp_register_handler(u16 port, udp_port_handler_t handler)
@@ -68,20 +103,26 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 	}
 }
 
-void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size)
+void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size)
 {
 	usize total_size = sizeof(struct udp_header) + size;
 	u8 *buffer = kzalloc(total_size);
 	if (!buffer) return;
 
 	struct udp_header *hdr = (struct udp_header *)buffer;
-	hdr->src_port = bswap16(src_port);
-	hdr->dst_port = bswap16(dst_port);
+	hdr->src_port = src_port_net;
+	hdr->dst_port = dst_port_net;
 	hdr->length = bswap16(total_size);
-	hdr->checksum = 0; // Optional for UDP over IPv4, so we leave it 0
+	hdr->checksum = 0;
 
 	memcpy(buffer + sizeof(struct udp_header), payload, size);
+	hdr->checksum = udp_checksum(net_get_ip(), dst, buffer, total_size);
 
 	ipv4_send(dst, 17 /* UDP */, buffer, total_size);
 	kfree(buffer);
+}
+
+void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size)
+{
+	udp_send_net(dst, bswap16(src_port), bswap16(dst_port), payload, size);
 }

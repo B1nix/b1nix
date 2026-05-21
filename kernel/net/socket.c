@@ -36,8 +36,7 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   if (s->type == B1NIX_SOCK_DGRAM) {
     if (!s->connected && s->peer.in.sin_port == 0)
       return -ENOTCONN;
-    udp_send(dst_ip, ntoh16(s->local.in.sin_port), ntoh16(s->peer.in.sin_port),
-             buf, len);
+    udp_send_net(dst_ip, s->local.in.sin_port, s->peer.in.sin_port, buf, len);
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {

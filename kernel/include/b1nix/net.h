@@ -41,6 +41,7 @@ u32 icmp_echo_reply_count(void);
 // UDP
 typedef void (*udp_port_handler_t)(const void *data, usize size);
 void udp_receive(struct ipv4_addr src, const void *data, usize size);
+void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size);
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size);
 int udp_register_handler(u16 port, udp_port_handler_t handler);
 
