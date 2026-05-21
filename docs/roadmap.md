@@ -40,10 +40,8 @@ and broader utility flag compatibility.
 - [x] `done` Add interrupt descriptor table on x86_64 for CPU exceptions 0-31.
 - [x] `done` Add page fault diagnostics with `CR2` reporting.
 - [x] `done` Add PIT timer interrupt through PIC IRQ0.
-- [x] `stub` Archive the old AArch64 QEMU `virt` boot path outside the active build.
 - [x] `done` Keep CPU halt, interrupt control, and context switch arch-local.
 - [x] `done` Add x86_64 interrupt-to-signal mapping for common CPU faults.
-- [x] `stub` Keep archived AArch64 serial, interrupt, bootinfo, and context-switch scaffolding for later revival.
 
 ## M2: Memory
 
@@ -112,10 +110,10 @@ and broader utility flag compatibility.
 - [x] `done` Add ARP.
 - [x] `done` Add IPv4.
 - [x] `done` Add ICMP echo.
-- [x] `done` Add UDP.
-- [x] `done` Add DHCP client.
-- [x] `done` Add DNS client.
-- [x] `done` Add full socket-driven TCP/UDP server behavior.
+- [x] `initial` Add UDP.
+- [x] `initial` Add DHCP client.
+- [x] `initial` Add DNS client.
+- [x] `partial` Add socket-driven TCP/UDP server behavior.
 
 ## M7: Graphics
 
@@ -190,20 +188,13 @@ and broader utility flag compatibility.
 - [x] `done` `brk`, `munmap`, `ioctl`, and termios syscalls.
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
-- [x] `done` Add POSIX signal ABI: `sigaction` table and pending-signal bitmask in kernel; kernel-side default actions and `SIG_IGN` work; userspace handler invocation and `sigreturn` frame are implemented.
-
-## M13: Archived AArch64 Port
-
-- [x] `done` Move the old AArch64 port out of the active build.
-- [x] `done` Archive AArch64 boot, serial console, interrupt, paging, bootinfo, and context-switch files under `archive/kernel/arch/aarch64`.
-- [x] `done` Remove `ARCH=aarch64`, `run-aarch64`, and `smoke-aarch64` from the active Makefile/test workflow.
-- [ ] `planned` Restore AArch64 only after the x86_64 userspace, VFS, and shell paths are stable.
+- [x] `partial` Add POSIX signal ABI: kernel-side `sigaction` table and pending-signal bitmask exist; default actions and `SIG_IGN` work; userspace API/semantics remain incomplete and need libc/ABI hardening.
 
 ## M14: Advanced Storage, Swap & File Systems
 
 - [x] `done` Block device abstraction layer and caching.
-- [x] `done` SATA/AHCI driver support.
-- [x] `done` NVMe driver support.
+- [x] `partial` SATA/AHCI driver support.
+- [x] `partial` NVMe driver support.
 - [x] `done` Ext2 filesystem driver with read/write support.
 - [x] `done` Ext1 full read/write driver (inode/block alloc, indirect blocks, symlinks; missing timestamps and fsck metadata).
 - [x] `done` Page swapping support.
@@ -217,7 +208,7 @@ and broader utility flag compatibility.
 
 ## M15: IPC, Security & Standard OS Features
 
-- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): kernel-side bitmask delivery and default actions work; no userspace handler entry frame.
+- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): kernel-side bitmask delivery and default actions work; userspace signal API behavior remains partially stubbed.
 - [x] `partial` Inter-process communication through message queues and socket-like descriptors.
 - [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) with physical page allocation and VMM mapping per process.
 - [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`).
@@ -226,7 +217,7 @@ and broader utility flag compatibility.
 - [x] `partial` BusyBox-style standard utilities.
 - [x] `done` Add UNIX domain sockets.
 - [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
-- [ ] `planned` Replace signal stubs with real userspace signal delivery.
+- [ ] `planned` Complete userspace signal semantics (`sigaction`, masks, handler ABI, `sigreturn`) and remove libc stubs.
 
 ## M16: User Space Applications & TUI
 
@@ -306,7 +297,7 @@ copy-on-write private mappings.
 - [x] `done` Implement `PATH` command lookup against the VFS.
 - [x] `done` Improve shell errors and exit statuses.
 - [x] `done` Route terminal control characters into the signal/process metadata path.
-- [x] `done` Add full controlling-terminal/process-group signal behavior.
+- [x] `partial` Add controlling-terminal/process-group signal behavior for interactive shell paths.
 
 M20 adds `/dev/tty` as a VFS device, initializes descriptors `0`, `1`, and `2`
 to the terminal, and routes keyboard input through the TTY line discipline.
@@ -330,7 +321,7 @@ tables.
 - [x] `initial` Overlay attached ext2 root over initramfs fallback files.
 - [x] `done` Add mount listing for active VFS mount table entries.
 - [x] `stub` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
-- [x] `done` Add complete mount option handling.
+- [x] `partial` Add mount option handling baseline.
 
 M21 has an initial persistent-root path for the current boot model, but it is
 not fully closed. The VFS tracks mounted sources in a
@@ -368,9 +359,9 @@ more exact text/file utility semantics.
 
 ## M23: Networking for Terminal Use
 
-- [x] `done` Turn the socket ABI into UDP-capable socket descriptors.
-- [x] `done` Add minimal TCP client support.
-- [x] `done` Add DNS resolver integration through libc-style calls and shell commands.
+- [x] `initial` Turn the socket ABI into UDP-capable socket descriptors.
+- [x] `partial` Add minimal TCP client support.
+- [x] `initial` Add DNS resolver integration through libc-style calls and shell commands.
 - [x] `done` Add `ifconfig`-style interface status.
 - [x] `done` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
 - [x] `done` Handle missing network devices gracefully in user-facing network paths.
@@ -398,12 +389,13 @@ more exact text/file utility semantics.
 - [x] `done` Define the B1NIX userspace ELF ABI and calling convention.
 - [x] `done` Add `crt0.o` startup code for B1NIX userspace programs.
 - [x] `done` Add a userspace linker script for B1NIX ELF binaries.
-- [x] `done` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`.
+- [x] `initial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; several POSIX-facing APIs are still stubs/incomplete.
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] `done` Build and run a VFS-loaded native smoke ELF program.
 - [x] `initial` Build and run a VFS-loaded `hello.c` ELF program.
 - [x] `initial` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
 - [x] `initial` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
+- [ ] `planned` Align libc POSIX-facing APIs and signatures (`signal.h`, `sigaction`, `sigprocmask`, `dlopen*`, `strtod` family) and remove stubs.
 - [ ] `planned` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
 - [ ] `planned` Compile one simple shell utility inside B1NIX.
 - [ ] `planned` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
