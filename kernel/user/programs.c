@@ -945,6 +945,49 @@ static u16 udp_smoke_bswap16(u16 value) {
   return (u16)((value << 8) | (value >> 8));
 }
 
+static void udp_queue_smoke_check(void) {
+  int fd = vfs_socket(B1NIX_AF_INET, B1NIX_SOCK_DGRAM, 0);
+  if (fd < 0) {
+    uwrite("UDP-SMOKE: fail queue-open\n");
+    return;
+  }
+
+  struct b1nix_sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = B1NIX_AF_INET;
+  addr.sin_port = udp_smoke_bswap16(55001);
+  addr.sin_addr = 0;
+  if (vfs_bind(fd, &addr, sizeof(addr)) < 0) {
+    uwrite("UDP-SMOKE: fail queue-bind\n");
+    vfs_close(fd);
+    return;
+  }
+
+  const char pkt1[] = "first";
+  const char pkt2[] = "second";
+  if (!vfs_socket_push_udp(addr.sin_port, pkt1, sizeof(pkt1) - 1) ||
+      !vfs_socket_push_udp(addr.sin_port, pkt2, sizeof(pkt2) - 1)) {
+    uwrite("UDP-SMOKE: fail queue-push\n");
+    vfs_close(fd);
+    return;
+  }
+
+  char out1[16];
+  char out2[16];
+  memset(out1, 0, sizeof(out1));
+  memset(out2, 0, sizeof(out2));
+  isize r1 = vfs_socket_recv(fd, out1, sizeof(out1), 0);
+  isize r2 = vfs_socket_recv(fd, out2, sizeof(out2), 0);
+  vfs_close(fd);
+
+  if (r1 == 5 && r2 == 6 && memcmp(out1, "first", 5) == 0 &&
+      memcmp(out2, "second", 6) == 0) {
+    uwrite("UDP-SMOKE: queue-2pkt-ok\n");
+    return;
+  }
+  uwrite("UDP-SMOKE: fail queue-order\n");
+}
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -1002,6 +1045,7 @@ static int init_main(int argc, const char **argv) {
   struct ipv4_addr fake_src = {{10, 0, 2, 2}};
   udp_receive(fake_src, &udp_probe, sizeof(udp_probe));
   uwrite("UDP-SMOKE: probe-sent\n");
+  udp_queue_smoke_check();
 
   if (bootinfo_has_flag("b1nix.test=1")) {
     uwrite("B1NIX-TEST: done\n");

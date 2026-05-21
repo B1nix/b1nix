@@ -167,6 +167,7 @@ check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete
 check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"
 check_output "$LOG" "UDP-SMOKE: probe-sent" "UDP probe command runs"
 check_output "$LOG" "UDP-SMOKE: icmp-port-unreachable" "UDP unbound port triggers ICMP unreachable"
+check_output "$LOG" "UDP-SMOKE: queue-2pkt-ok" "UDP socket queue preserves two packets"
 check_output "$LOG" "ARP-SMOKE: request-sent" "ARP request path exercised"
 if grep -q "ARP-SMOKE: resolution-ready" "$LOG" 2>/dev/null; then
 	pass "ARP resolution became available"

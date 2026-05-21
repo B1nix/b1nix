@@ -248,6 +248,11 @@ struct vfs_socket_state {
   void *unix_data;
   char recv_buf[2048];
   usize recv_len;
+  char udp_q_buf[8][2048];
+  usize udp_q_len[8];
+  u8 udp_q_head;
+  u8 udp_q_tail;
+  u8 udp_q_count;
 };
 
 struct vfs_handle {

@@ -61,14 +61,19 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
   }
 
   if (s->type == B1NIX_SOCK_DGRAM) {
-    while (s->recv_len == 0) {
+    while (s->udp_q_count == 0) {
       if (h->flags & B1NIX_O_NONBLOCK)
         return -EAGAIN;
       scheduler_block_on(s);
     }
-    usize to_copy = len < s->recv_len ? len : s->recv_len;
-    memcpy(buf, s->recv_buf, to_copy);
-    s->recv_len = 0;
+
+    u8 slot = s->udp_q_head;
+    usize pkt_len = s->udp_q_len[slot];
+    usize to_copy = len < pkt_len ? len : pkt_len;
+    memcpy(buf, s->udp_q_buf[slot], to_copy);
+    s->udp_q_head = (u8)((s->udp_q_head + 1) % 8);
+    s->udp_q_count--;
+    s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
     return (isize)to_copy;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
@@ -99,7 +104,7 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   
   pfd->revents = 0;
   if (s->type == B1NIX_SOCK_DGRAM) {
-    if (s->recv_len > 0) pfd->revents |= B1NIX_POLLIN;
+    if (s->udp_q_count > 0) pfd->revents |= B1NIX_POLLIN;
     pfd->revents |= B1NIX_POLLOUT;
   } else if (s->type == B1NIX_SOCK_STREAM) {
     if (!s->connected && s->tcp_conn &&
@@ -376,9 +381,16 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
         continue;
       }
       struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-      usize copy = (len > sizeof(s->recv_buf)) ? sizeof(s->recv_buf) : len;
-      memcpy(s->recv_buf, data, copy);
-      s->recv_len = copy;
+      if (s->udp_q_count >= 8) {
+        return 0;
+      }
+      u8 slot = s->udp_q_tail;
+      usize copy = (len > sizeof(s->udp_q_buf[slot])) ? sizeof(s->udp_q_buf[slot]) : len;
+      memcpy(s->udp_q_buf[slot], data, copy);
+      s->udp_q_len[slot] = copy;
+      s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+      s->udp_q_count++;
+      s->recv_len = s->udp_q_len[s->udp_q_head];
       
       /* Wake up polling tasks */
       scheduler_wake_all(s);
