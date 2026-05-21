@@ -5,6 +5,7 @@
 
 #define ICMP_TYPE_ECHO_REPLY 0
 #define ICMP_TYPE_ECHO_REQUEST 8
+#define ICMP_TYPE_DEST_UNREACH 3
 
 struct icmp_header {
   u8 type;
@@ -72,4 +73,23 @@ void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
 
 u32 icmp_echo_reply_count(void) {
 	return __atomic_load_n(&g_icmp_echo_replies, __ATOMIC_RELAXED);
+}
+
+void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code) {
+  u8 payload[8];
+  memset(payload, 0, sizeof(payload));
+  payload[0] = ICMP_TYPE_DEST_UNREACH;
+  payload[1] = code;
+  payload[2] = 0;
+  payload[3] = 0;
+  payload[4] = 0;
+  payload[5] = 0;
+  payload[6] = 0;
+  payload[7] = 0;
+
+  u16 csum = icmp_checksum(payload, sizeof(payload));
+  payload[2] = (u8)(csum >> 8);
+  payload[3] = (u8)(csum & 0xff);
+  ipv4_send(dst, 1 /* ICMP */, payload, sizeof(payload));
+  console_write("UDP-SMOKE: icmp-port-unreachable\n");
 }

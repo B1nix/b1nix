@@ -105,15 +105,15 @@ and broader utility flag compatibility.
 
 ## M6: Network
 
-- [x] `initial` Add virtio-net probe/demo device, later replaced by the real driver.
+- [x] `done` Add virtio-net probe/demo device, later replaced by the real driver.
 - [x] `done` Add Ethernet frame parsing.
 - [x] `done` Add ARP.
 - [x] `done` Add IPv4.
 - [x] `done` Add ICMP echo.
-- [x] `initial` Add UDP.
-- [x] `initial` Add DHCP client.
-- [x] `initial` Add DNS client.
-- [x] `partial` Add socket-driven TCP/UDP server behavior.
+- [x] `done` Add UDP.
+- [x] `done` Add DHCP client.
+- [x] `done` Add DNS client.
+- [x] `done` Add socket-driven TCP/UDP server behavior.
 
 ## M7: Graphics
 
@@ -152,11 +152,11 @@ and broader utility flag compatibility.
 
 - [x] `done` Ethernet frame parsing and sending.
 - [x] `done` ARP resolution.
-- [x] `initial` IPv4 routing.
+- [x] `done` IPv4 routing.
 - [x] `done` ICMP ping responses.
-- [x] `initial` UDP protocol.
-- [x] `initial` DHCP client.
-- [x] `initial` DNS client.
+- [x] `done` UDP protocol.
+- [x] `done` DHCP client.
+- [x] `done` DNS client.
 - [x] `done` Add socket ABI integration for UDP/TCP-style descriptors, including POSIX-style error returns and non-blocking connect (`EINPROGRESS`/`EALREADY`) behavior.
 - [x] `partial` Add minimal TCP client path for terminal tools.
 - [x] `done` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.

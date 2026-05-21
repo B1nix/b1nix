@@ -16,8 +16,15 @@ static u16 bswap16(u16 value)
 	return (u16)((value << 8) | (value >> 8));
 }
 
+static int dns_udp_registered = 0;
+void dns_receive(const void *data, usize size);
+
 void dns_resolve(const char *domain)
 {
+	if (!dns_udp_registered) {
+		udp_register_handler(12345, dns_receive);
+		dns_udp_registered = 1;
+	}
 	u8 buffer[512];
 	memset(buffer, 0, sizeof(buffer));
 

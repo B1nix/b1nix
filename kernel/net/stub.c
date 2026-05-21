@@ -43,10 +43,30 @@ void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payl
 	(void)size;
 }
 
+int udp_register_handler(u16 port, udp_port_handler_t handler)
+{
+	(void)port;
+	(void)handler;
+	return -1;
+}
+
 struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port)
 {
 	(void)dst_ip;
 	(void)dst_port;
+	return 0;
+}
+
+struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port)
+{
+	(void)dst_ip;
+	(void)dst_port;
+	return 0;
+}
+
+int tcp_is_established(struct tcp_conn *conn)
+{
+	(void)conn;
 	return 0;
 }
 
@@ -70,4 +90,15 @@ int tcp_close(struct tcp_conn *conn)
 {
 	(void)conn;
 	return 0;
+}
+
+void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code)
+{
+	(void)dst;
+	(void)code;
+}
+
+void dhcp_tick(u64 now_ticks)
+{
+	(void)now_ticks;
 }

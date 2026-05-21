@@ -934,6 +934,17 @@ extern int mc_main(int argc, const char **argv);
 extern int editor_main(int argc, const char **argv);
 extern int nmake_main(int argc, const char **argv);
 
+struct udp_smoke_header {
+  u16 src_port;
+  u16 dst_port;
+  u16 length;
+  u16 checksum;
+} __attribute__((packed));
+
+static u16 udp_smoke_bswap16(u16 value) {
+  return (u16)((value << 8) | (value >> 8));
+}
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -982,6 +993,15 @@ static int init_main(int argc, const char **argv) {
   } else {
     uwrite("NET-SMOKE: fail ping-gateway\n");
   }
+
+  struct udp_smoke_header udp_probe;
+  udp_probe.src_port = udp_smoke_bswap16(43210);
+  udp_probe.dst_port = udp_smoke_bswap16(54321);
+  udp_probe.length = udp_smoke_bswap16(sizeof(udp_probe));
+  udp_probe.checksum = 0;
+  struct ipv4_addr fake_src = {{10, 0, 2, 2}};
+  udp_receive(fake_src, &udp_probe, sizeof(udp_probe));
+  uwrite("UDP-SMOKE: probe-sent\n");
 
   if (bootinfo_has_flag("b1nix.test=1")) {
     uwrite("B1NIX-TEST: done\n");

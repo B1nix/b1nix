@@ -10,9 +10,36 @@ struct udp_header {
 	u16 checksum;
 } __attribute__((packed));
 
+struct udp_handler_entry {
+	u16 port;
+	udp_port_handler_t handler;
+};
+
+#define MAX_UDP_HANDLERS 8
+static struct udp_handler_entry udp_handlers[MAX_UDP_HANDLERS];
+
 static u16 bswap16(u16 value)
 {
 	return (u16)((value << 8) | (value >> 8));
+}
+
+int udp_register_handler(u16 port, udp_port_handler_t handler)
+{
+	if (!handler) return -1;
+	for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
+		if (udp_handlers[i].handler && udp_handlers[i].port == port) {
+			udp_handlers[i].handler = handler;
+			return 0;
+		}
+	}
+	for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
+		if (!udp_handlers[i].handler) {
+			udp_handlers[i].port = port;
+			udp_handlers[i].handler = handler;
+			return 0;
+		}
+	}
+	return -1;
 }
 
 void udp_receive(struct ipv4_addr src, const void *data, usize size)
@@ -27,14 +54,17 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size)
 	usize payload_size = length - sizeof(struct udp_header);
 
 	u16 dport = bswap16(hdr->dst_port);
+	u16 dport_net = hdr->dst_port;
 
-	if (dport == 68) {
-		dhcp_receive(payload, payload_size);
-	} else if (dport == 53) {
-		dns_receive(payload, payload_size);
-	} else {
-		/* Deliver to userspace socket */
-		vfs_socket_push_udp(dport, payload, payload_size);
+	if (!vfs_socket_push_udp(dport_net, payload, payload_size)) {
+		for (int i = 0; i < MAX_UDP_HANDLERS; i++) {
+			if (udp_handlers[i].handler && udp_handlers[i].port == dport) {
+				udp_handlers[i].handler(payload, payload_size);
+				return;
+			}
+		}
+		/* Port unreachable */
+		icmp_send_dest_unreachable(src, 3);
 	}
 }
 

@@ -35,15 +35,19 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 
 // ICMP
 void icmp_receive(struct ipv4_addr src, const void *data, usize size);
+void icmp_send_dest_unreachable(struct ipv4_addr dst, u8 code);
 u32 icmp_echo_reply_count(void);
 
 // UDP
+typedef void (*udp_port_handler_t)(const void *data, usize size);
 void udp_receive(struct ipv4_addr src, const void *data, usize size);
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size);
+int udp_register_handler(u16 port, udp_port_handler_t handler);
 
 // DHCP
 void dhcp_init(void);
 void dhcp_receive(const void *data, usize size);
+void dhcp_tick(u64 now_ticks);
 
 // DNS
 void dns_resolve(const char *domain);

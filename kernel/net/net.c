@@ -17,6 +17,7 @@ static volatile int net_ready;
 
 static volatile int net_tx_lock = 0;
 static volatile int net_rx_lock = 0;
+static volatile int net_irq_pending = 0;
 static void **tx_buffers;
 static u8 *tx_inflight;
 
@@ -45,7 +46,7 @@ int net_get_irq(void) { return net_ready ? net_dev.irq : -1; }
 void net_interrupt_handler(void) {
 	if (!net_ready) return;
 	if (virtio_read_isr(&net_dev) & 1) {
-		net_poll();
+		net_irq_pending = 1;
 	}
 }
 
@@ -162,7 +163,6 @@ void net_dump_info(void)
 }
 
 #define RX_BUFFER_SIZE 2048
-#define NUM_RX_BUFFERS 16
 
 struct rx_buffer {
 	struct virtio_net_hdr hdr;
@@ -170,6 +170,7 @@ struct rx_buffer {
 } __attribute__((packed));
 
 static struct rx_buffer *rx_buffers;
+static u16 rx_buffer_count;
 
 static void fill_rx_buffer(u16 idx)
 {
@@ -225,8 +226,9 @@ static void virtio_net_probe(void)
 	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
 
 	// Populate RX queue
-	rx_buffers = kzalloc(sizeof(struct rx_buffer) * NUM_RX_BUFFERS);
-	for (u16 i = 0; i < NUM_RX_BUFFERS; i++) {
+	rx_buffer_count = net_rx_vq.queue_size;
+	rx_buffers = kzalloc(sizeof(struct rx_buffer) * rx_buffer_count);
+	for (u16 i = 0; i < rx_buffer_count; i++) {
 		fill_rx_buffer(i);
 	}
 	virtq_kick(&net_dev, &net_rx_vq);
@@ -246,7 +248,11 @@ static void net_task(void *arg)
 	(void)arg;
 	u64 last_dhcp_retry = 0;
 	while (1) {
+		if (net_irq_pending) {
+			net_irq_pending = 0;
+		}
 		net_poll();
+		dhcp_tick(scheduler_get_uptime_ticks());
 		if (local_ip.bytes[0] == 0) {
 			u64 now = scheduler_get_uptime_ticks();
 			if (now - last_dhcp_retry >= 300) {
@@ -324,7 +330,8 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 		net_tx_vq.desc[d0].flags = 0;
 		net_tx_vq.desc[d0].next = 0;
 
-		net_tx_vq.avail->ring[d0] = d0;
+		u16 avail_idx = net_tx_vq.avail->idx % net_tx_vq.queue_size;
+		net_tx_vq.avail->ring[avail_idx] = d0;
 		__asm__ volatile("" ::: "memory");
 		net_tx_vq.avail->idx++;
 		__asm__ volatile("" ::: "memory");
@@ -344,7 +351,9 @@ void net_poll(void)
 
 	tcp_timer_tick();
 
-	while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+	if (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) {
+		return;
+	}
 	while (net_tx_vq.used && net_tx_vq.used->idx != net_tx_vq.last_used_idx) {
 		u16 used_idx = net_tx_vq.last_used_idx % net_tx_vq.queue_size;
 		u32 id = net_tx_vq.used->ring[used_idx].id;
@@ -364,7 +373,7 @@ void net_poll(void)
 		u32 id = net_rx_vq.used->ring[used_idx].id;
 		u32 len = net_rx_vq.used->ring[used_idx].len;
 
-		if (id < NUM_RX_BUFFERS) {
+		if (id < rx_buffer_count) {
 			struct rx_buffer *buf = &rx_buffers[id];
 			if (len > sizeof(struct virtio_net_hdr)) {
 				usize payload_len = len - sizeof(struct virtio_net_hdr);

@@ -14,6 +14,10 @@ struct udp_binding {
 #define MAX_UDP_BINDINGS 64
 struct udp_binding udp_bindings[MAX_UDP_BINDINGS];
 
+static u16 ntoh16(u16 value) {
+  return (u16)((value << 8) | (value >> 8));
+}
+
 /* Bridge functions to avoid including private net headers in vfs.h */
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
   (void)flags;
@@ -32,7 +36,8 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   if (s->type == B1NIX_SOCK_DGRAM) {
     if (!s->connected && s->peer.in.sin_port == 0)
       return -ENOTCONN;
-    udp_send(dst_ip, (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8), (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8), buf, len);
+    udp_send(dst_ip, ntoh16(s->local.in.sin_port), ntoh16(s->peer.in.sin_port),
+             buf, len);
     return (isize)len;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
@@ -105,7 +110,7 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     if (s->connected) {
       pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
     } else if (s->listening) {
-      u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+      u16 port = ntoh16(s->local.in.sin_port);
       if (tcp_pending_connections(port)) {
         pfd->revents |= B1NIX_POLLIN;
       }
@@ -188,7 +193,7 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   s->local.in = *(const struct b1nix_sockaddr_in *)addr;
   s->bound = 1;
   if (s->type == B1NIX_SOCK_DGRAM) {
-    u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+    u16 port = s->local.in.sin_port;
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
       if (udp_bindings[i].used && udp_bindings[i].port == port) {
         return -EADDRINUSE;
@@ -217,7 +222,7 @@ int vfs_listen(int fd, int backlog) {
   if (s->domain == B1NIX_AF_UNIX) return unix_listen(s, backlog);
   
   if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
-    u16 port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+    u16 port = ntoh16(s->local.in.sin_port);
     int res = tcp_listen(port, backlog);
     if (res == 0) s->listening = 1;
     return res;
@@ -251,7 +256,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
       *addrlen = sizeof(struct b1nix_sockaddr_un);
     }
   } else if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
-    u16 local_port = (s->local.in.sin_port << 8) | (s->local.in.sin_port >> 8);
+    u16 local_port = ntoh16(s->local.in.sin_port);
     struct ipv4_addr client_ip;
     u16 client_port;
     struct tcp_conn *conn = 0;
@@ -327,14 +332,13 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
     dst_ip.bytes[2] = (s->peer.in.sin_addr >> 16) & 0xFF;
     dst_ip.bytes[3] = (s->peer.in.sin_addr >> 24) & 0xFF;
     if (h->flags & B1NIX_O_NONBLOCK) {
-      s->tcp_conn = tcp_connect_async(
-          dst_ip, (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8));
+      s->tcp_conn = tcp_connect_async(dst_ip, ntoh16(s->peer.in.sin_port));
       if (!s->tcp_conn) {
         return -ECONNREFUSED;
       }
       return -EINPROGRESS;
     }
-    s->tcp_conn = tcp_connect(dst_ip, (s->peer.in.sin_port << 8) | (s->peer.in.sin_port >> 8));
+    s->tcp_conn = tcp_connect(dst_ip, ntoh16(s->peer.in.sin_port));
     if (!s->tcp_conn) {
       s->connected = 0;
       return -ECONNREFUSED;
@@ -362,9 +366,9 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
   return vfs_socket_recv_h(h, buf, len, flags);
 }
 
-void vfs_socket_push_udp(u16 local_port, const void *data, usize len) {
+int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
   for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-    if (udp_bindings[i].used && udp_bindings[i].port == local_port) {
+    if (udp_bindings[i].used && udp_bindings[i].port == local_port_net) {
       int h_idx = udp_bindings[i].h_idx;
       struct vfs_handle *h = get_handle_by_idx(h_idx);
       if (!h || !h->used || h->kind != VFS_HANDLE_SOCKET) {
@@ -380,7 +384,8 @@ void vfs_socket_push_udp(u16 local_port, const void *data, usize len) {
       scheduler_wake_all(s);
       scheduler_wake_all(vfs_poll_chan);
       
-      return;
+      return 1;
     }
   }
+  return 0;
 }
