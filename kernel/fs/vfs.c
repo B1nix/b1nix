@@ -1217,6 +1217,17 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
   (void)offset;
   if (!buffer)
     return -1;
+
+  /* Job control check for background writes: */
+  if (current_task && console.fg_pgrp > 0) {
+    if (current_task->process_group_id != console.fg_pgrp) {
+      if (console.termios.c_lflag & B1NIX_TOSTOP) {
+        scheduler_kill_process_group(current_task->process_group_id, SIGTTOU);
+        return -EINTR;
+      }
+    }
+  }
+
   for (usize i = 0; i < size; i++) {
     if ((console.termios.c_oflag & B1NIX_OPOST) && buffer[i] == '\n')
       console_putc('\r');
@@ -1230,6 +1241,7 @@ static void tty_init_node(void) {
   console.termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
   console.termios.c_oflag = B1NIX_OPOST;
   console.fg_pgrp = 1; /* Boot group */
+  console.session_id = 1; /* Boot session */
   struct vfs_node *tty = add_node("/dev/tty", VFS_DEVICE, 0, 0, 0);
   if (tty) {
     tty->inode->read_cb = tty_read;
@@ -2749,8 +2761,15 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     usize *pgrp_ptr = (usize *)arg;
     if (!pgrp_ptr)
       return -EFAULT;
-    // POSIX: process group must be in the same session
-    // (B1NIX doesn't track terminal sessions yet, so we assume valid)
+    // POSIX: process group must be in the same session, and calling process must be in the terminal's session
+    if (current_task) {
+      if (current_task->session_id != console.session_id) {
+        return -EPERM;
+      }
+      if (!scheduler_is_pgrp_in_session(*pgrp_ptr, current_task->session_id)) {
+        return -EPERM;
+      }
+    }
     console.fg_pgrp = *pgrp_ptr;
     return 0;
   }

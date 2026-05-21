@@ -52,6 +52,7 @@
 #define B1NIX_ICANON 0x00000002
 #define B1NIX_ISIG 0x00000001
 #define B1NIX_OPOST 0x00000001
+#define B1NIX_TOSTOP 0x00000100
 
 struct b1nix_stat {
   u64 st_dev;

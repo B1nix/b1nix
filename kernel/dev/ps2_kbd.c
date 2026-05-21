@@ -118,6 +118,8 @@ void ps2_kbd_interrupt_handler(void)
 					c = (char)(c - 'a' + 1);
 				} else if (ctrl_pressed && c >= 'A' && c <= 'Z') {
 					c = (char)(c - 'A' + 1);
+				} else if (ctrl_pressed && c == '\\') {
+					c = 28;
 				}
 				if ((console.termios.c_lflag & B1NIX_ISIG) && c == 3) {
 					if (console.fg_pgrp > 0) {
@@ -131,6 +133,13 @@ void ps2_kbd_interrupt_handler(void)
 						scheduler_kill_process_group(console.fg_pgrp, SIGTSTP);
 					}
 					console_write("^Z\n");
+					return;
+				}
+				if ((console.termios.c_lflag & B1NIX_ISIG) && c == 28) {
+					if (console.fg_pgrp > 0) {
+						scheduler_kill_process_group(console.fg_pgrp, SIGQUIT);
+					}
+					console_write("^\\\n");
 					return;
 				}
 				kbd_push(c);

@@ -6,6 +6,7 @@
 
 struct console_state {
   usize fg_pgrp;
+  usize session_id;
   struct b1nix_termios termios;
 };
 

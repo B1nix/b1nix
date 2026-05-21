@@ -7,6 +7,7 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/arch_x86.h>
 #include <string.h>
 
 #define MAX_TASKS 64
@@ -34,15 +35,13 @@ static u64 align_down_u64(u64 value, u64 alignment) {
 }
 
 static struct task *find_unused_task(void) {
-  interrupts_disable();
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state == TASK_UNUSED) {
-      interrupts_enable();
+      memset(&tasks[i], 0, sizeof(struct task));
+      tasks[i].state = TASK_BLOCKED;
       return &tasks[i];
     }
   }
-
-  interrupts_enable();
   return 0;
 }
 
@@ -144,7 +143,9 @@ static void task_init_cred(struct task *task) {
 }
 
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
+  interrupts_disable();
   struct task *task = find_unused_task();
+  interrupts_enable();
 
   if (task == 0) {
     return -1;
@@ -255,12 +256,12 @@ int scheduler_fork_current(void) {
   child->id = next_task_id++;
   child->parent_id = parent->id;
   child->state = TASK_READY;
-  
+
   // Clear inherited pending signals and sleep/block states
   child->pending_signals = 0;
   child->wake_tick = 0;
   child->wait_chan = 0;
-  
+
   // 2. Allocate and copy kernel stack
   void *child_stack = kmalloc(KERNEL_STACK_SIZE);
   if (!child_stack) {
@@ -268,31 +269,55 @@ int scheduler_fork_current(void) {
     interrupts_enable();
     return -1;
   }
-  
+
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
   memcpy(child_stack, parent_stack, KERNEL_STACK_SIZE);
-  
+
   child->stack = child_stack;
-  
+
   // Calculate child's stack pointer and frame pointer offsets
   u64 stack_offset = (u64)(usize)child_stack - (u64)(usize)parent_stack;
-  
+
+  // Relocate the kernel stack pointer in child task structure to prevent sharing stack
+  child->kernel_stack_ptr = parent->kernel_stack_ptr + stack_offset;
+
   u64 current_rsp, current_rbp;
   __asm__ volatile("movq %%rsp, %0" : "=r"(current_rsp));
   __asm__ volatile("movq %%rbp, %0" : "=r"(current_rbp));
 
-  child->context.rsp = current_rsp + stack_offset;
-  child->context.rbp = current_rbp + stack_offset;
-  
-  // Set up child context to return to trampoline
-  // We'll manually push the return address onto the child's stack
-  child->context.rsp -= 8;
-  *(u64 *)(usize)child->context.rsp = (u64)x86_fork_child_trampoline;
-  
+  // Save callee-saved registers of parent to restore in child context
+  __asm__ volatile("movq %%rbx, %0" : "=r"(child->context.rbx));
+  __asm__ volatile("movq %%r12, %0" : "=r"(child->context.r12));
+  __asm__ volatile("movq %%r13, %0" : "=r"(child->context.r13));
+  __asm__ volatile("movq %%r14, %0" : "=r"(child->context.r14));
+  __asm__ volatile("movq %%r15, %0" : "=r"(child->context.r15));
+
+  extern void x86_fork_child_trampoline(void);
+  extern void x86_fork_kernel_trampoline(void);
+
+  int is_user = (parent->user_image != NULL && ((struct user_loaded_image *)parent->user_image)->kind == USER_IMAGE_ELF64);
+
+  if (is_user) {
+    struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
+    child_iframe->rax = 0;
+
+    child->context.rsp = (u64)child_iframe - 16;
+    child->context.rbp = current_rbp + stack_offset;
+
+    child->context.rsp -= 8;
+    *(u64 *)(usize)child->context.rsp = (u64)x86_fork_child_trampoline;
+  } else {
+    child->context.rsp = current_rsp + stack_offset;
+    child->context.rbp = current_rbp + stack_offset;
+
+    child->context.rsp -= 8;
+    *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
+  }
+
   // 3. Clone address space
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
-  
+
   // 4. Clone VMAs
   child->vma_list = 0;
   struct vm_area *src_vma = parent->vma_list;
@@ -310,7 +335,7 @@ int scheduler_fork_current(void) {
     }
     src_vma = src_vma->next;
   }
-  
+
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
   for (usize i = 0; i < SCHED_MAX_FDS; i++) {
@@ -932,6 +957,21 @@ int scheduler_setpgrp(usize pid, usize pgrp) {
   }
   interrupts_enable();
   return -1;
+}
+
+int scheduler_is_pgrp_in_session(usize pgrp, usize session_id) {
+  int found = 0;
+  interrupts_disable();
+  for (usize i = 0; i < MAX_TASKS; i++) {
+    if (tasks[i].state != TASK_UNUSED && tasks[i].process_group_id == pgrp) {
+      if (tasks[i].session_id == session_id) {
+        found = 1;
+        break;
+      }
+    }
+  }
+  interrupts_enable();
+  return found;
 }
 
 /* Called before returning to userspace — delivers pending signals */

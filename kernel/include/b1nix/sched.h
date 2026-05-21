@@ -204,6 +204,7 @@ int scheduler_get_priority(usize pid);
 usize scheduler_setsid(void);
 usize scheduler_getpgrp(void);
 int scheduler_setpgrp(usize pid, usize pgrp);
+int scheduler_is_pgrp_in_session(usize pgrp, usize session_id);
 u64 vm_find_free_area(struct task *t, usize length);
 struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr);
 void vma_delete_range(struct task *t, u64 start, u64 end);
