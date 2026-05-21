@@ -33,6 +33,13 @@ extern void x86_syscall_entry(void);
 extern u64 gdt64_tss[2];
 extern char x86_syscall_stack_top[];
 
+static void x86_enable_write_protect(void) {
+  u64 cr0;
+  __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
+  cr0 |= (1ULL << 16);
+  __asm__ volatile("movq %0, %%cr0" : : "r"(cr0) : "memory");
+}
+
 static void x86_tss_init(void) {
   u64 base = (u64)&x86_tss;
   u32 limit = sizeof(x86_tss) - 1;
@@ -74,6 +81,7 @@ void arch_init(void) {
   x86_timer_init();
   rtc_init();
   x86_syscall_init();
+  x86_enable_write_protect();
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");
 }

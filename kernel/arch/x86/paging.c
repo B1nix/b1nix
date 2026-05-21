@@ -210,12 +210,11 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
   }
 }
 
-void vmm_unmap_page(u64 virtual_address) {
+static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0) {
     panic("vmm_unmap_page requires page-aligned address");
   }
 
-  u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];
   if ((pml4e & VMM_PRESENT) == 0) {
     return;
@@ -251,6 +250,16 @@ void vmm_unmap_page(u64 virtual_address) {
   }
   pt[pt_index(virtual_address)] = 0;
   invalidate_page(virtual_address);
+}
+
+void vmm_unmap_page(u64 virtual_address) {
+  unmap_page_from_pml4(get_current_pml4(), virtual_address);
+}
+
+void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
+  u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
+                         : kernel_pml4_virt;
+  unmap_page_from_pml4(pml4, virtual_address);
 }
 
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -440,28 +449,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     return 0;
   }
 
-  // Case 3: Copy-on-Write (write to a read-only shared page)
-  if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && !(pte & VMM_WRITABLE)) {
+  // Case 3: Copy-on-Write (write to a cloned private page)
+  if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && (pte & VMM_COW)) {
     u64 old_frame = pte & PAGE_ENTRY_ADDRESS_MASK;
+    u64 new_frame = pmm_alloc_frame();
+    if (!new_frame)
+      return -1;
 
-    if (pmm_get_refcount(old_frame) == 1) {
-      // Sole owner, just make it writable
-      paging_mprotect_page(page_aligned,
-                           (pte & ~PAGE_ENTRY_ADDRESS_MASK) | VMM_WRITABLE);
-    } else {
-      u64 new_frame = pmm_alloc_frame();
-      if (!new_frame)
-        return -1;
+    memcpy((void *)(usize)(new_frame + DIRECT_MAP_BASE),
+           (void *)(usize)(old_frame + DIRECT_MAP_BASE), PAGE_SIZE);
 
-      // Copy old page contents
-      memcpy((void *)(usize)(new_frame + DIRECT_MAP_BASE),
-             (void *)(usize)(old_frame + DIRECT_MAP_BASE), PAGE_SIZE);
+    u64 new_flags = (pte & ~PAGE_ENTRY_ADDRESS_MASK);
+    new_flags &= ~VMM_COW;
+    new_flags |= VMM_PRESENT | VMM_WRITABLE;
 
-      pt[pt_index(page_aligned)] =
-          new_frame | VMM_PRESENT | VMM_WRITABLE | VMM_USER;
+    pt[pt_index(page_aligned)] = new_frame | new_flags;
+
+    if (pmm_get_refcount(old_frame) > 1) {
       pmm_unref_frame(old_frame);
-      invalidate_page(page_aligned);
     }
+    invalidate_page(page_aligned);
     return 0;
   }
 
@@ -507,6 +514,7 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
       if (entry & VMM_WRITABLE) {
         // Mark both as Read-Only for CoW
         entry &= ~VMM_WRITABLE;
+        entry |= VMM_COW;
         src_table[i] = entry;
       }
       

@@ -35,6 +35,7 @@
 // Swap / Demand Paging
 #define VMM_SWAPPED (1ULL << 9) // Custom flag: page is swapped out
 #define VMM_LAZY (1ULL << 10)   // Custom flag: lazy allocation
+#define VMM_COW (1ULL << 11)    // Custom flag: copy-on-write mapping
 #define SWAP_BLOCK_SIZE PAGE_SIZE
 
 struct block_device;
@@ -65,6 +66,7 @@ void kfree(void *ptr);
 void vmm_init(void);
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags);
 void vmm_unmap_page(u64 virtual_address);
+void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags);
 u64 vmm_direct_map_base(void);
 

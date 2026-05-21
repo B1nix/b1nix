@@ -1116,8 +1116,17 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   u64 start = (u64)(usize)addr;
   if (!is_canonical(start))
     return -EINVAL;
+  if ((start & (PAGE_SIZE - 1)) != 0)
+    return -EINVAL;
+  if (length == 0)
+    return 0;
+  if ((prot & ~(PROT_READ | PROT_WRITE | PROT_EXEC)) != 0)
+    return -EINVAL;
 
   u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (end < start || end > 0x0000800000000000ULL)
+    return -EINVAL;
+
   u64 flags = VMM_USER;
   if (prot & PROT_WRITE)
     flags |= VMM_WRITABLE;

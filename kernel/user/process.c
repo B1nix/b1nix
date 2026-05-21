@@ -450,7 +450,7 @@ void user_address_space_cleanup(struct task *t) {
 
     /* FIX: Unmap actual physical hardware frames to prevent memory leaks */
     for (u64 v = vma->start; v < vma->end; v += PAGE_SIZE) {
-      vmm_unmap_page(v);
+      paging_unmap_page_from_space(t->pml4_phys, v);
     }
 
     if (vma->node) {
