@@ -147,8 +147,8 @@ and broader utility flag compatibility.
 - [x] `initial` Add PCI device enumeration.
 - [x] `initial` Add block-device abstraction and cache.
 - [x] `done` Add MBR/GPT partition discovery in the block-device layer.
-- [x] `partial` Add AHCI driver support.
-- [x] `partial` Add NVMe driver support.
+- [x] `done` Add AHCI driver support.
+- [x] `done` Add NVMe driver support.
 - [x] `done` Add VirtIO GPU driver (legacy + modern transport, controlq/cursorq setup, scanout and present path).
 
 ## M10: Full Network Stack
@@ -196,8 +196,8 @@ and broader utility flag compatibility.
 ## M14: Advanced Storage, Swap & File Systems
 
 - [x] `done` Block device abstraction layer and caching.
-- [x] `partial` SATA/AHCI driver support.
-- [x] `partial` NVMe driver support.
+- [x] `done` SATA/AHCI driver support.
+- [x] `done` NVMe driver support.
 - [x] `done` Ext2 filesystem driver with read/write support.
 - [x] `done` Ext1 full read/write driver (inode/block alloc, indirect blocks, symlinks; missing timestamps and fsck metadata).
 - [x] `done` Page swapping support.
