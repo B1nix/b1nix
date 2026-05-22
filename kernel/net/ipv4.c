@@ -40,6 +40,12 @@ static u16 ipv4_checksum(const u8 *data, usize size)
 	return (u16)~sum;
 }
 
+static int ipv4_is_broadcast(struct ipv4_addr ip)
+{
+	return ip.bytes[0] == 255 && ip.bytes[1] == 255 &&
+	       ip.bytes[2] == 255 && ip.bytes[3] == 255;
+}
+
 void ipv4_receive(const void *data, usize size)
 {
 	if (size < sizeof(struct ipv4_header)) return;
@@ -50,7 +56,16 @@ void ipv4_receive(const void *data, usize size)
 	if (ihl < sizeof(struct ipv4_header) || ihl > size) return;
 
 	u16 total_len = bswap16(hdr->total_len);
-	if (total_len > size) return;
+	if (total_len > size || total_len < ihl) return;
+	if (ipv4_checksum((const u8 *)data, ihl) != 0) return;
+
+	u16 frag = bswap16(hdr->frag_offset);
+	if ((frag & 0x3fff) != 0) return;
+
+	struct ipv4_addr local = net_get_ip();
+	if (!ipv4_is_broadcast(hdr->dst) && memcmp(hdr->dst.bytes, local.bytes, 4) != 0) {
+		return;
+	}
 
 	const void *payload = (const u8 *)data + ihl;
 	usize payload_size = total_len - ihl;
@@ -92,7 +107,7 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 	struct mac_addr dst_mac;
 	
 	// Determine if broadcast or not
-	if (dst.bytes[0] == 255 && dst.bytes[1] == 255 && dst.bytes[2] == 255 && dst.bytes[3] == 255) {
+	if (ipv4_is_broadcast(dst)) {
 		for (int i = 0; i < 6; i++) dst_mac.bytes[i] = 0xFF;
 		net_send_ethernet(dst_mac, 0x0800, buffer, total_size);
 		kfree(buffer);
@@ -107,6 +122,11 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 		route_ip = dst;
 	} else {
 		route_ip = net_get_gateway();
+		if (route_ip.bytes[0] == 0 && route_ip.bytes[1] == 0 &&
+		    route_ip.bytes[2] == 0 && route_ip.bytes[3] == 0) {
+			kfree(buffer);
+			return;
+		}
 	}
 
 	for (int tries = 0; tries < 25; tries++) {

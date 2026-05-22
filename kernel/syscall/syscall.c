@@ -946,7 +946,12 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
         continue;
       }
       int h_idx = scheduler_fd_get(fds[i].fd);
-      vfs_poll(h_idx, &fds[i]);
+      if (h_idx < 0) {
+        fds[i].revents = B1NIX_POLLNVAL;
+        ready++;
+        continue;
+      }
+      vfs_poll(fds[i].fd, &fds[i]);
       if (fds[i].revents != 0)
         ready++;
     }
@@ -966,6 +971,64 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
     scheduler_block_on(vfs_poll_chan);
   }
+}
+
+static u64 sys_bind(int fd, const void *user_addr, usize addrlen) {
+  u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+  if (!user_addr || addrlen == 0 || addrlen > sizeof(kaddr))
+    return (u64)-EINVAL;
+  if (syscall_copyin(kaddr, user_addr, addrlen) < 0)
+    return (u64)-EFAULT;
+  return (u64)vfs_bind(fd, kaddr, addrlen);
+}
+
+static u64 sys_connect(int fd, const void *user_addr, usize addrlen) {
+  u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+  if (!user_addr || addrlen == 0 || addrlen > sizeof(kaddr))
+    return (u64)-EINVAL;
+  if (syscall_copyin(kaddr, user_addr, addrlen) < 0)
+    return (u64)-EFAULT;
+  return (u64)vfs_connect(fd, kaddr, addrlen);
+}
+
+static u64 sys_send(int fd, const void *user_buf, usize len, int flags) {
+  enum { SOCKET_IO_MAX = 64 * 1024 };
+  if (len == 0)
+    return 0;
+  if (len > SOCKET_IO_MAX)
+    return (u64)-EINVAL;
+  if (!user_buf)
+    return (u64)-EFAULT;
+  void *kbuf = kmalloc(len);
+  if (!kbuf)
+    return (u64)-ENOMEM;
+  if (syscall_copyin(kbuf, user_buf, len) < 0) {
+    kfree(kbuf);
+    return (u64)-EFAULT;
+  }
+  isize rc = vfs_socket_send(fd, kbuf, len, flags);
+  kfree(kbuf);
+  return (u64)rc;
+}
+
+static u64 sys_recv(int fd, void *user_buf, usize len, int flags) {
+  enum { SOCKET_IO_MAX = 64 * 1024 };
+  if (len == 0)
+    return 0;
+  if (len > SOCKET_IO_MAX)
+    return (u64)-EINVAL;
+  if (!user_buf)
+    return (u64)-EFAULT;
+  void *kbuf = kmalloc(len);
+  if (!kbuf)
+    return (u64)-ENOMEM;
+  isize rc = vfs_socket_recv(fd, kbuf, len, flags);
+  if (rc > 0 && syscall_copyout(user_buf, kbuf, (usize)rc) < 0) {
+    kfree(kbuf);
+    return (u64)-EFAULT;
+  }
+  kfree(kbuf);
+  return (u64)rc;
 }
 
 static u64 sys_listen(int fd, int backlog) {
@@ -1522,15 +1585,14 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_SOCKET:
     return (u64)vfs_socket((int)arg0, (int)arg1, (int)arg2);
   case SYS_BIND:
-    return (u64)vfs_bind((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+    return sys_bind((int)arg0, (const void *)(usize)arg1, (usize)arg2);
   case SYS_CONNECT:
-    return (u64)vfs_connect((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+    return sys_connect((int)arg0, (const void *)(usize)arg1, (usize)arg2);
   case SYS_SEND:
-    return (u64)vfs_socket_send((int)arg0, (const void *)(usize)arg1,
-                                (usize)arg2, (int)arg3);
+    return sys_send((int)arg0, (const void *)(usize)arg1, (usize)arg2,
+                    (int)arg3);
   case SYS_RECV:
-    return (u64)vfs_socket_recv((int)arg0, (void *)(usize)arg1, (usize)arg2,
-                                (int)arg3);
+    return sys_recv((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3);
   case SYS_LISTEN:
     return sys_listen((int)arg0, (int)arg1);
   case SYS_ACCEPT:

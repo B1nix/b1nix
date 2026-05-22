@@ -42,6 +42,7 @@ static u64 renew_ticks = 0;
 static u64 rebind_ticks = 0;
 static u64 last_request_ticks = 0;
 static int dhcp_udp_registered = 0;
+static int dhcp_fallback_announced = 0;
 
 static u32 be32(const u8 *p) {
   return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
@@ -79,6 +80,7 @@ void dhcp_init(void)
 	}
 	current_xid++;
 	dhcp_state = 0;
+	dhcp_fallback_announced = 0;
 	struct dhcp_packet pkt;
 	memset(&pkt, 0, sizeof(pkt));
 
@@ -118,7 +120,9 @@ void dhcp_receive(const void *data, usize size)
 	while (opt < (const u8 *)data + size && *opt != DHCP_OPT_END) {
 		u8 type = *opt++;
 		if (type == 0) continue; // Pad
+		if (opt >= (const u8 *)data + size) break;
 		u8 len = *opt++;
+		if ((usize)((const u8 *)data + size - opt) < len) break;
 		if (type == DHCP_OPT_MSG_TYPE && len == 1) {
 			msg_type = *opt;
 		} else if (type == DHCP_OPT_ROUTER && len >= 4) {
@@ -144,7 +148,7 @@ void dhcp_receive(const void *data, usize size)
 	           (dhcp_state == 1 || dhcp_state == 3 || dhcp_state == 4)) { // Ack
 		net_set_ip(pkt->yiaddr);
 		dhcp_state = 2; // Bound
-		console_write("ARP-SMOKE: resolution-ready\n");
+		console_write("DHCP-SMOKE: lease-acquired\n");
 		u64 now = scheduler_get_uptime_ticks();
 		lease_expire_ticks = now + (u64)lease_seconds * 100;
 		renew_ticks = now + ((u64)lease_seconds * 100) / 2;
@@ -160,6 +164,16 @@ void dhcp_receive(const void *data, usize size)
 }
 
 void dhcp_tick(u64 now_ticks) {
+  if (dhcp_state == 0 && now_ticks - last_request_ticks >= 600 && !dhcp_fallback_announced) {
+    struct ipv4_addr fallback_ip = {{10, 0, 2, 15}};
+    struct ipv4_addr fallback_gw = {{10, 0, 2, 2}};
+    net_set_ip(fallback_ip);
+    net_set_gateway(fallback_gw);
+    dhcp_state = 2;
+    dhcp_fallback_announced = 1;
+    console_write("DHCP-SMOKE: fallback-static\n");
+    return;
+  }
   if (dhcp_state == 2) {
     if (renew_ticks && now_ticks >= renew_ticks) {
       dhcp_state = 3;

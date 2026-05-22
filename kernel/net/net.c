@@ -202,20 +202,10 @@ static void virtio_net_probe(void)
 		return;
 	}
 
-	u32 host_features = virtio_get_host_features(&net_dev);
-	console_write("virtio-net: host features = 0x");
-	console_write_hex32(host_features);
-	console_write("\n");
-
 	virtio_set_guest_features(&net_dev, 0);
-	console_write("virtio-net: status after guest features write = 0x");
-	console_write_hex32(virtio_get_status(&net_dev));
-	console_write("\n");
 
 	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
-	console_write("virtio-net: status after features ok write = 0x");
-	console_write_hex32(virtio_get_status(&net_dev));
-	console_write("\n");
+
 
 	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
@@ -249,9 +239,6 @@ static void virtio_net_probe(void)
 	}
 
 	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
-	console_write("virtio-net: status after driver ok write = 0x");
-	console_write_hex32(virtio_get_status(&net_dev));
-	console_write("\n");
 
 	// Populate RX queue
 	rx_buffer_count = net_rx_vq.queue_size;
@@ -266,18 +253,6 @@ static void virtio_net_probe(void)
 		memset(rx_buffers[i], 0, PAGE_SIZE);
 		fill_rx_buffer(i);
 	}
-
-	console_write("virtio-net RX desc 0: virt=0x");
-	console_write_hex64((u64)(usize)rx_buffers[0]);
-	console_write(" phys=0x");
-	console_write_hex64(vmm_virt_to_phys(rx_buffers[0]));
-	console_write(" desc.addr=0x");
-	console_write_hex64(net_rx_vq.desc[0].addr);
-	console_write(" desc.len=");
-	console_write_dec(net_rx_vq.desc[0].len);
-	console_write(" desc.flags=");
-	console_write_dec(net_rx_vq.desc[0].flags);
-	console_write("\n");
 
 	virtq_kick(&net_dev, &net_rx_vq);
 	net_ready = 1;
@@ -341,6 +316,7 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 
 	// Allocate TX buffer. It is reclaimed on TX completion in net_poll().
 	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
+	if (packet_size > PAGE_SIZE) return;
 	u64 frame = pmm_alloc_frame();
 	if (!frame) return;
 	u8 *buffer = (u8 *)(usize)(frame + vmm_direct_map_base());
@@ -427,6 +403,9 @@ void net_poll(void)
 			struct rx_buffer *buf = rx_buffers[id];
 			if (len > sizeof(struct virtio_net_hdr)) {
 				usize payload_len = len - sizeof(struct virtio_net_hdr);
+				if (payload_len > sizeof(buf->data)) {
+					payload_len = sizeof(buf->data);
+				}
 				ethernet_receive(buf->data, payload_len);
 			}
 

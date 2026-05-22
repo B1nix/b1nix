@@ -4,10 +4,7 @@
 #define ETHERTYPE_IPV4 0x0800
 #define ETHERTYPE_ARP  0x0806
 
-static u16 bswap16(u16 value)
-{
-	return (u16)((value << 8) | (value >> 8));
-}
+
 
 void ethernet_receive(const void *data, usize size)
 {

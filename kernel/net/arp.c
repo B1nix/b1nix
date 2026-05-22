@@ -37,7 +37,7 @@ static void arp_smoke_mark_resolution(void)
 {
 	if (!arp_smoke_resolution_logged) {
 		arp_smoke_resolution_logged = 1;
-		console_write("ARP-SMOKE: resolution-ready\n");
+		console_write("\nARP-SMOKE: resolution-ready\n");
 	}
 }
 
@@ -91,7 +91,7 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
 
 	struct mac_addr bcast = { { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } };
 	net_send_ethernet(bcast, 0x0806, &req, sizeof(req));
-	console_write("ARP-SMOKE: request-sent\n");
+	console_write("\nARP-SMOKE: request-sent\n");
 	
 	// We don't block here. Returning 0 means not found yet. The upper layer should retry later.
 	return 0;
@@ -107,7 +107,7 @@ void arp_receive(const void *data, usize size)
 	arp_cache_put(pkt->sender_ip, pkt->sender_mac);
 	arp_smoke_mark_resolution();
 	if (bswap16(pkt->op) == ARP_OP_REPLY) {
-		console_write("ARP-SMOKE: reply-received\n");
+		console_write("\nARP-SMOKE: reply-received\n");
 	}
 
 	if (bswap16(pkt->op) == ARP_OP_REQUEST) {

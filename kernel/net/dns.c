@@ -21,6 +21,7 @@ void dns_receive(const void *data, usize size);
 
 void dns_resolve(const char *domain)
 {
+	if (!domain || !*domain) return;
 	if (!dns_udp_registered) {
 		udp_register_handler(12345, dns_receive);
 		dns_udp_registered = 1;
@@ -42,6 +43,8 @@ void dns_resolve(const char *domain)
 		while (*dot && *dot != '.') dot++;
 		
 		usize len = dot - start;
+		if (len == 0 || len > 63) return;
+		if (offset + 1 + len + 5 > sizeof(buffer) - sizeof(struct dns_header)) return;
 		qname[offset++] = (u8)len;
 		memcpy(qname + offset, start, len);
 		offset += len;

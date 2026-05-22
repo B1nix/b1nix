@@ -181,6 +181,7 @@ check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"
 check_output "$LOG" "UDP-SMOKE: probe-sent" "UDP probe command runs"
 check_output "$LOG" "UDP-SMOKE: icmp-port-unreachable" "UDP unbound port triggers ICMP unreachable"
 check_output "$LOG" "UDP-SMOKE: queue-2pkt-ok" "UDP socket queue preserves two packets"
+check_output "$LOG" "POLL-SMOKE: ready-udp" "socket poll readiness path exercised"
 check_output "$LOG" "ARP-SMOKE: request-sent" "ARP request path exercised"
     if grep -q "ARP-SMOKE: resolution-ready" "$LOG" 2>/dev/null; then
         pass "ARP resolution became available"
@@ -192,6 +193,13 @@ check_output "$LOG" "ARP-SMOKE: request-sent" "ARP request path exercised"
     else
         fail "ARP reply path exercised" "no ARP reply observed in this run"
     fi
+if grep -q "TCP-SMOKE: path-exercised" "$LOG" 2>/dev/null; then
+	pass "TCP connect/listen/accept/send/recv path exercised"
+elif grep -q "TCP-SMOKE: unsupported" "$LOG" 2>/dev/null; then
+	pass "TCP baseline limitation explicitly reported"
+else
+	fail "TCP path marker emitted" "missing TCP smoke marker"
+fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
@@ -200,15 +208,15 @@ check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 if [ "$ARCH" = "x86" ]; then
 	echo ""
 	echo "[TEST] Network..."
-	if grep -q "virtio-net" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then
-		pass "virtio-net detected"
-		if grep -q "DHCP\|dhcp" "$LOG" 2>/dev/null; then
-			pass "DHCP negotiation"
+	if grep -q "virtio-net: initialized with MAC" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then
+		pass "virtio-net initialized"
+		if grep -q "DHCP-SMOKE: lease-acquired\|DHCP-SMOKE: fallback-static" "$LOG" 2>/dev/null; then
+			pass "DHCP lease or deterministic fallback"
 		else
-			skip "DHCP negotiation" "DHCP message not found"
+			fail "DHCP lease or deterministic fallback" "missing DHCP-SMOKE marker"
 		fi
 	else
-		skip "virtio-net detected" "virtio-net message not found"
+		fail "virtio-net initialized" "virtio-net message not found"
 	fi
 fi
 

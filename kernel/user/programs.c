@@ -964,8 +964,25 @@ struct udp_smoke_header {
   u16 checksum;
 } __attribute__((packed));
 
+struct tcp_smoke_header {
+  u16 src_port;
+  u16 dst_port;
+  u32 seq_num;
+  u32 ack_num;
+  u8 data_offset;
+  u8 flags;
+  u16 window;
+  u16 checksum;
+  u16 urgent;
+} __attribute__((packed));
+
 static u16 udp_smoke_bswap16(u16 value) {
   return (u16)((value << 8) | (value >> 8));
+}
+
+static u32 tcp_smoke_bswap32(u32 value) {
+  return ((value & 0x000000ffU) << 24) | ((value & 0x0000ff00U) << 8) |
+         ((value & 0x00ff0000U) >> 8) | ((value & 0xff000000U) >> 24);
 }
 
 static void udp_queue_smoke_check(void) {
@@ -1009,6 +1026,132 @@ static void udp_queue_smoke_check(void) {
     return;
   }
   uwrite("UDP-SMOKE: fail queue-order\n");
+}
+
+static void poll_smoke_check(void) {
+  int fd = vfs_socket(B1NIX_AF_INET, B1NIX_SOCK_DGRAM, 0);
+  if (fd < 0) {
+    uwrite("POLL-SMOKE: fail open\n");
+    return;
+  }
+
+  struct b1nix_sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = B1NIX_AF_INET;
+  addr.sin_port = udp_smoke_bswap16(55002);
+  addr.sin_addr = 0;
+  if (vfs_bind(fd, &addr, sizeof(addr)) < 0) {
+    uwrite("POLL-SMOKE: fail bind\n");
+    vfs_close(fd);
+    return;
+  }
+
+  struct b1nix_pollfd pfd;
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = fd;
+  pfd.events = (short)(B1NIX_POLLIN | B1NIX_POLLOUT);
+  if (vfs_poll(fd, &pfd) < 0 || (pfd.revents & B1NIX_POLLOUT) == 0) {
+    uwrite("POLL-SMOKE: fail writable\n");
+    vfs_close(fd);
+    return;
+  }
+
+  const char pkt[] = "poll";
+  if (!vfs_socket_push_udp(addr.sin_port, pkt, sizeof(pkt) - 1)) {
+    uwrite("POLL-SMOKE: fail inject\n");
+    vfs_close(fd);
+    return;
+  }
+
+  memset(&pfd, 0, sizeof(pfd));
+  pfd.fd = fd;
+  pfd.events = B1NIX_POLLIN;
+  if (vfs_poll(fd, &pfd) < 0 || (pfd.revents & B1NIX_POLLIN) == 0) {
+    uwrite("POLL-SMOKE: fail readable\n");
+    vfs_close(fd);
+    return;
+  }
+  vfs_close(fd);
+  uwrite("POLL-SMOKE: ready-udp\n");
+}
+
+static void tcp_smoke_check(void) {
+  const u16 listen_port = 56001;
+  const u16 remote_port = 40000;
+  struct ipv4_addr remote_ip = {{10, 0, 2, 2}};
+  const u32 remote_seq = 1000;
+  const u32 local_iss = 1000;
+
+  int fd = vfs_socket(B1NIX_AF_INET, B1NIX_SOCK_STREAM, 0);
+  if (fd < 0) {
+    uwrite("TCP-SMOKE: fail socket\n");
+    return;
+  }
+
+  struct b1nix_sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = B1NIX_AF_INET;
+  addr.sin_port = udp_smoke_bswap16(listen_port);
+  addr.sin_addr = 0;
+  if (vfs_bind(fd, &addr, sizeof(addr)) < 0 || vfs_listen(fd, 1) < 0) {
+    uwrite("TCP-SMOKE: fail listen\n");
+    vfs_close(fd);
+    return;
+  }
+
+  struct tcp_smoke_header syn;
+  memset(&syn, 0, sizeof(syn));
+  syn.src_port = udp_smoke_bswap16(remote_port);
+  syn.dst_port = udp_smoke_bswap16(listen_port);
+  syn.seq_num = tcp_smoke_bswap32(remote_seq);
+  syn.data_offset = (5 << 4);
+  syn.flags = 0x02; /* SYN */
+  syn.window = udp_smoke_bswap16(4096);
+  tcp_receive(remote_ip, &syn, sizeof(syn));
+
+  struct tcp_smoke_header ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.src_port = udp_smoke_bswap16(remote_port);
+  ack.dst_port = udp_smoke_bswap16(listen_port);
+  ack.seq_num = tcp_smoke_bswap32(remote_seq + 1);
+  ack.ack_num = tcp_smoke_bswap32(local_iss + 1);
+  ack.data_offset = (5 << 4);
+  ack.flags = 0x10; /* ACK */
+  ack.window = udp_smoke_bswap16(4096);
+  tcp_receive(remote_ip, &ack, sizeof(ack));
+
+  int client_fd = vfs_accept(fd, 0, 0);
+  if (client_fd < 0) {
+    uwrite("TCP-SMOKE: fail accept\n");
+    vfs_close(fd);
+    return;
+  }
+
+  const char payload[] = "tcp-smoke";
+  u8 pkt[sizeof(struct tcp_smoke_header) + sizeof(payload) - 1];
+  memset(pkt, 0, sizeof(pkt));
+  struct tcp_smoke_header *psh = (struct tcp_smoke_header *)pkt;
+  psh->src_port = udp_smoke_bswap16(remote_port);
+  psh->dst_port = udp_smoke_bswap16(listen_port);
+  psh->seq_num = tcp_smoke_bswap32(remote_seq + 1);
+  psh->ack_num = tcp_smoke_bswap32(local_iss + 1);
+  psh->data_offset = (5 << 4);
+  psh->flags = 0x18; /* PSH|ACK */
+  psh->window = udp_smoke_bswap16(4096);
+  memcpy(pkt + sizeof(struct tcp_smoke_header), payload, sizeof(payload) - 1);
+  tcp_receive(remote_ip, pkt, sizeof(pkt));
+
+  char out[16];
+  memset(out, 0, sizeof(out));
+  isize got = vfs_socket_recv(client_fd, out, sizeof(out), 0);
+  vfs_close(client_fd);
+  vfs_close(fd);
+  if (got == (isize)(sizeof(payload) - 1) &&
+      memcmp(out, payload, sizeof(payload) - 1) == 0) {
+    uwrite("TCP-SMOKE: path-exercised\n");
+    return;
+  }
+  uwrite("TCP-SMOKE: fail recv\n");
 }
 
 static int lock_smoke_main(int argc, const char **argv) {
@@ -1280,6 +1423,8 @@ static int init_main(int argc, const char **argv) {
   udp_receive(fake_src, &udp_probe, sizeof(udp_probe));
   uwrite("UDP-SMOKE: probe-sent\n");
   udp_queue_smoke_check();
+  poll_smoke_check();
+  tcp_smoke_check();
 
   if (bootinfo_has_flag("b1nix.test=1")) {
     uwrite("B1NIX-TEST: done\n");
