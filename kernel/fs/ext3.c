@@ -42,6 +42,14 @@ static int ext3_jbd_fs_write(struct journal_dev *jdev, u32 phys, const void *buf
 }
 
 static struct journal_ops ext3_jbd_ops = {ext3_jbd_read, ext3_jbd_write, ext3_jbd_fs_write};
+static int ext3_journal_write(struct ext3_fs *fs, u32 block, const void *buffer);
+
+static int ext3_journal_write_tx(struct ext3_fs *fs, struct journal_handle *h,
+                                 u32 block, const void *buffer) {
+  if (h)
+    return journal_log_block(h, block, buffer);
+  return ext3_journal_write(fs, block, buffer);
+}
 
 static int ext3_journal_write(struct ext3_fs *fs, u32 block, const void *buffer) {
   if (fs->jdev) {
@@ -99,6 +107,24 @@ static int ext3_write_inode(struct ext3_fs *fs, u32 inode_num, const struct ext2
   ext3_read_block(fs, block_idx, buf);
   memcpy(buf + (inode_offset % fs->block_size), inode, sizeof(struct ext2_inode));
   int ret = ext3_journal_write(fs, block_idx, buf);
+  kfree(buf);
+  return ret;
+}
+
+static int ext3_write_inode_tx(struct ext3_fs *fs, struct journal_handle *h,
+                               u32 inode_num,
+                               const struct ext2_inode *inode) {
+  if (inode_num == 0)
+    return -1;
+  u32 group = (inode_num - 1) / fs->inodes_per_group;
+  struct ext2_block_group_desc bgd;
+  ext3_read_bgd(fs, group, &bgd);
+  u32 inode_offset = ((inode_num - 1) % fs->inodes_per_group) * fs->inode_size;
+  u32 block_idx = bgd.bg_inode_table + (inode_offset / fs->block_size);
+  u8 *buf = kmalloc(fs->block_size);
+  ext3_read_block(fs, block_idx, buf);
+  memcpy(buf + (inode_offset % fs->block_size), inode, sizeof(struct ext2_inode));
+  int ret = ext3_journal_write_tx(fs, h, block_idx, buf);
   kfree(buf);
   return ret;
 }
@@ -392,36 +418,66 @@ static int ext3_vfs_unlink(struct vfs_node *dir, const char *name) {
   struct ext3_inode_info *dir_info = (struct ext3_inode_info *)dir->inode->data;
   struct ext3_fs *fs = dir_info->fs; struct ext2_inode di;
   if (ext3_read_inode(fs, dir_info->inode_num, &di) < 0) return -EIO;
-  u32 ino = 0; u8 *buf = kmalloc(fs->block_size);
+  u32 ino = 0; u32 target_phys = 0; usize target_off = 0; usize prev_off = (usize)-1;
+  u8 *buf = kmalloc(fs->block_size);
   u32 blocks = (di.i_size + fs->block_size - 1) / fs->block_size;
   for (u32 b = 0; b < blocks; b++) {
     u32 phys = ext3_get_block(fs, &di, b); if (!phys) continue;
-    ext3_read_block(fs, phys, buf); usize off = 0;
+    ext3_read_block(fs, phys, buf); usize off = 0; usize local_prev = (usize)-1;
     while (off < fs->block_size) {
       struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
       if (e->rec_len == 0) break;
-      if (e->inode != 0 && strlen(name) == e->name_len && memcmp(e->name, name, e->name_len) == 0) { ino = e->inode; break; }
+      if (e->inode != 0 && strlen(name) == e->name_len && memcmp(e->name, name, e->name_len) == 0) {
+        ino = e->inode; target_phys = phys; target_off = off; prev_off = local_prev; break;
+      }
+      local_prev = off;
       off += e->rec_len;
     }
     if (ino) break;
   }
   kfree(buf); if (!ino) return -ENOENT;
+
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
   buf = kmalloc(fs->block_size);
-  for (u32 b = 0; b < blocks; b++) {
-    u32 phys = ext3_get_block(fs, &di, b); if (!phys) continue;
-    ext3_read_block(fs, phys, buf); usize off = 0; struct ext2_dir_entry *prev = 0;
-    while (off < fs->block_size) {
-      struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-      if (e->rec_len == 0) break;
-      if (e->inode == ino && strlen(name) == e->name_len && memcmp(e->name, name, e->name_len) == 0) {
-        if (prev) prev->rec_len += e->rec_len; else e->inode = 0;
-        ext3_journal_write(fs, phys, buf); break;
-      }
-      off += e->rec_len; prev = e;
+  ext3_read_block(fs, target_phys, buf);
+
+  struct ext2_inode ci;
+  if (ext3_read_inode(fs, ino, &ci) == 0) {
+    if (ci.i_links_count > 0)
+      ci.i_links_count--;
+    ci.i_ctime = vfs_get_unix_time();
+    if (ext3_write_inode_tx(fs, h, ino, &ci) < 0) {
+      if (h)
+        journal_abort_transaction(h);
+      kfree(buf);
+      return -EIO;
     }
   }
+
+  struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(buf + target_off);
+  if (prev_off != (usize)-1) {
+    struct ext2_dir_entry *prev = (struct ext2_dir_entry *)(buf + prev_off);
+    prev->rec_len += entry->rec_len;
+  } else {
+    entry->inode = 0;
+  }
+  if (ext3_journal_write_tx(fs, h, target_phys, buf) < 0) {
+    if (h)
+      journal_abort_transaction(h);
+    kfree(buf);
+    return -EIO;
+  }
+
+  di.i_mtime = di.i_ctime = vfs_get_unix_time();
+  if (ext3_write_inode_tx(fs, h, dir_info->inode_num, &di) < 0) {
+    if (h)
+      journal_abort_transaction(h);
+    kfree(buf);
+    return -EIO;
+  }
+  if (h)
+    journal_commit_transaction(h);
   kfree(buf);
-  struct ext2_inode ci; if (ext3_read_inode(fs, ino, &ci) == 0) { if (ci.i_links_count > 0) { ci.i_links_count--; ext3_write_inode(fs, ino, &ci); } }
   return 0;
 }
 
@@ -430,7 +486,12 @@ static int ext3_vfs_rmdir(struct vfs_node *dir, const char *name) {
   if (err == 0) {
     struct ext3_inode_info *dir_info = (struct ext3_inode_info *)dir->inode->data;
     struct ext3_fs *fs = dir_info->fs; struct ext2_inode di;
-    if (ext3_read_inode(fs, dir_info->inode_num, &di) == 0) { if (di.i_links_count > 2) { di.i_links_count--; ext3_write_inode(fs, dir_info->inode_num, &di); } }
+    if (ext3_read_inode(fs, dir_info->inode_num, &di) == 0) {
+      if (di.i_links_count > 2)
+        di.i_links_count--;
+      di.i_mtime = di.i_ctime = vfs_get_unix_time();
+      ext3_write_inode(fs, dir_info->inode_num, &di);
+    }
   }
   return err;
 }
@@ -455,7 +516,13 @@ static int ext3_vfs_rename(struct vfs_node *old_dir, const char *old_name, struc
   kfree(buf); if (!ino) return -ENOENT;
   struct ext3_inode_info *new_dir_info = (struct ext3_inode_info *)new_dir->inode->data;
   if (ext3_add_dir_entry(fs, new_dir_info->inode_num, ino, new_name, type) < 0) return -EIO;
-  ext3_vfs_unlink(old_dir, old_name); return 0;
+  if (ext3_vfs_unlink(old_dir, old_name) < 0) return -EIO;
+  struct ext2_inode moved;
+  if (ext3_read_inode(fs, ino, &moved) == 0) {
+    moved.i_ctime = vfs_get_unix_time();
+    ext3_write_inode(fs, ino, &moved);
+  }
+  return 0;
 }
 
 static int ext3_vfs_symlink(struct vfs_node *dir, const char *name, const char *target) {
@@ -560,7 +627,11 @@ static struct vfs_node *ext3_vfs_mount_cb(const char *source, u64 flags, void *d
       if (fs->jdev) {
         fs->jdev->fs_priv = fs;
         if (fs->sb.s_feature_incompat & EXT3_FEATURE_INCOMPAT_RECOVER) {
-          console_write("ext3: journal needs recovery\n"); journal_recover(fs->jdev);
+          console_write("ext3: journal needs recovery\n");
+          if (journal_recover(fs->jdev) == 0) {
+            fs->sb.s_feature_incompat &= ~EXT3_FEATURE_INCOMPAT_RECOVER;
+            ext3_write_superblock(fs);
+          }
         }
       }
     }

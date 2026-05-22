@@ -31,10 +31,10 @@ struct journal_dev {
 struct journal_handle {
   int active;
   struct journal_dev *jdev;
-    u32 transaction_id;
-    u32 modified_count;
+  u32 transaction_id;
+  u32 modified_count;
   u32 fs_blocks[MAX_JBD_BLOCKS_PER_TX];
-  const void *data_blocks[MAX_JBD_BLOCKS_PER_TX];
+  void *data_blocks[MAX_JBD_BLOCKS_PER_TX];
 };
 
 /* Journal mount and recovery API. */
@@ -47,5 +47,6 @@ struct journal_handle *journal_start_transaction(struct journal_dev *jdev);
 int journal_log_block(struct journal_handle *handle, u32 fs_block,
                       const void *data);
 int journal_commit_transaction(struct journal_handle *handle);
+void journal_abort_transaction(struct journal_handle *handle);
 
 #endif

@@ -93,6 +93,8 @@ int journal_recover(struct journal_dev *jdev) {
     
   u32 current = jdev->first;
   int replayed = 0;
+  int scanned_txs = 0;
+  int committed_txs = 0;
     
   for (u32 seq = 1; seq < jdev->next_seq; seq++) {
     u8 *hdr_buf = kmalloc(jdev->block_size);
@@ -111,23 +113,60 @@ int journal_recover(struct journal_dev *jdev) {
       struct jbd_block_tag *tag =
           (struct jbd_block_tag *)(hdr_buf + sizeof(struct jbd_header));
       u32 data_block = current + 1;
+      u32 tx_data_start = data_block;
+      u32 tx_seq = hdr->h_sequence;
       int done = 0;
 
       while (!done) {
-        u32 blocknr = tag->t_blocknr;
+        (void)tag->t_blocknr;
         if (tag->t_flags & JBD_TAG_LAST_TAG)
           done = 1;
-
-        u8 *data_buf = kmalloc(jdev->block_size);
-        if (jdev->ops.read_journal_block(jdev, data_block, data_buf) == 0) {
-          jdev->ops.write_fs_block(jdev, blocknr, data_buf);
-          replayed++;
-        }
-        kfree(data_buf);
         data_block++;
         tag++;
       }
-      current = data_block;
+
+      /* Descriptor + N data blocks must be followed by a matching commit
+       * block before we are allowed to replay the transaction. */
+      u8 *commit_buf = kmalloc(jdev->block_size);
+      int has_commit = 0;
+      if (jdev->ops.read_journal_block(jdev, data_block, commit_buf) == 0) {
+        struct jbd_header *chdr = (struct jbd_header *)commit_buf;
+        if (chdr->h_magic == JBD_MAGIC &&
+            chdr->h_blocktype == JBD_COMMIT_BLOCK &&
+            chdr->h_sequence == tx_seq) {
+          has_commit = 1;
+        }
+      }
+      kfree(commit_buf);
+
+      scanned_txs++;
+      if (has_commit) {
+        committed_txs++;
+        struct jbd_block_tag *rtag =
+            (struct jbd_block_tag *)(hdr_buf + sizeof(struct jbd_header));
+        u32 rdata = tx_data_start;
+        int rdone = 0;
+        while (!rdone) {
+          u32 blocknr = rtag->t_blocknr;
+          if (rtag->t_flags & JBD_TAG_LAST_TAG)
+            rdone = 1;
+
+          u8 *data_buf = kmalloc(jdev->block_size);
+          if (jdev->ops.read_journal_block(jdev, rdata, data_buf) == 0) {
+            jdev->ops.write_fs_block(jdev, blocknr, data_buf);
+            replayed++;
+          }
+          kfree(data_buf);
+          rdata++;
+          rtag++;
+        }
+      } else {
+        console_write("jbd: skip uncommitted tx seq=");
+        console_write_dec(tx_seq);
+        console_write("\n");
+      }
+
+      current = data_block + 1;
     } else if (hdr->h_blocktype == JBD_COMMIT_BLOCK ||
                hdr->h_blocktype == JBD_REVOKE_BLOCK) {
       current++;
@@ -140,7 +179,11 @@ int journal_recover(struct journal_dev *jdev) {
     
   console_write("jbd: replayed ");
   console_write_dec(replayed);
-  console_write(" blocks\n");
+  console_write(" blocks from ");
+  console_write_dec(committed_txs);
+  console_write("/");
+  console_write_dec(scanned_txs);
+  console_write(" committed txs\n");
     return 0;
 }
 
@@ -151,6 +194,8 @@ struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
       handles[i].jdev = jdev;
       handles[i].transaction_id = jdev->next_seq;
       handles[i].modified_count = 0;
+      for (u32 j = 0; j < MAX_JBD_BLOCKS_PER_TX; j++)
+        handles[i].data_blocks[j] = 0;
       return &handles[i];
     }
   }
@@ -163,12 +208,17 @@ int journal_log_block(struct journal_handle *handle, u32 fs_block,
     return -1;
   if (handle->modified_count >= MAX_JBD_BLOCKS_PER_TX)
     return -1;
-    
+
+  void *copy = kmalloc(handle->jdev->block_size);
+  if (!copy)
+    return -1;
+  memcpy(copy, data, handle->jdev->block_size);
+
   handle->fs_blocks[handle->modified_count] = fs_block;
-  handle->data_blocks[handle->modified_count] = data;
+  handle->data_blocks[handle->modified_count] = copy;
   handle->modified_count++;
   return 0;
-    }
+}
     
 int journal_commit_transaction(struct journal_handle *handle) {
   if (!handle || !handle->active)
@@ -176,7 +226,7 @@ int journal_commit_transaction(struct journal_handle *handle) {
   if (handle->modified_count == 0) {
     handle->active = 0;
     return 0;
-    }
+  }
     
   struct journal_dev *jdev = handle->jdev;
   u32 count = handle->modified_count;
@@ -228,8 +278,23 @@ int journal_commit_transaction(struct journal_handle *handle) {
   for (u32 i = 0; i < count; i++) {
     jdev->ops.write_fs_block(jdev, handle->fs_blocks[i],
                              handle->data_blocks[i]);
+    kfree(handle->data_blocks[i]);
+    handle->data_blocks[i] = 0;
 }
 
   handle->active = 0;
   return 0;
+}
+
+void journal_abort_transaction(struct journal_handle *handle) {
+  if (!handle || !handle->active)
+    return;
+  for (u32 i = 0; i < handle->modified_count; i++) {
+    if (handle->data_blocks[i]) {
+      kfree(handle->data_blocks[i]);
+      handle->data_blocks[i] = 0;
+    }
+  }
+  handle->modified_count = 0;
+  handle->active = 0;
 }
