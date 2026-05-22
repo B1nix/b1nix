@@ -2,7 +2,8 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-LOG="$PROJECT_DIR/b1nix-graphics-smoke.log"
+mkdir -p "$PROJECT_DIR/logs"
+LOG="$PROJECT_DIR/logs/b1nix-graphics-smoke.log"
 TIMEOUT=40
 
 cd "$PROJECT_DIR"

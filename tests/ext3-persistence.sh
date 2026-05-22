@@ -15,7 +15,7 @@ ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ITERATIONS="${1:-10}"
 DISK_IMAGE="${DISK_IMAGE:-$ROOT_DIR/disk.img}"
 BOOT_ISO="${BOOT_ISO:-$ROOT_DIR/build/x86/os.iso}"
-LOG_DIR="$ROOT_DIR/.tmp/ext3-persist"
+LOG_DIR="$ROOT_DIR/logs/ext3-persist"
 mkdir -p "$LOG_DIR"
 
 if ! command -v qemu-system-x86_64 >/dev/null 2>&1; then
