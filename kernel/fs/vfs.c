@@ -671,11 +671,13 @@ void vfs_resolve_path(const char *path, char *out) {
     }
   }
 
+  /*
   console_write("VFS: resolve '");
   console_write(path);
   console_write("' -> '");
   console_write(out);
   console_write("'\n");
+  */
 }
 
 /* POSIX: Iterative path resolution with symlink loop detection to prevent stack

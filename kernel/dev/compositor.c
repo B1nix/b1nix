@@ -338,6 +338,11 @@ static void compositor_thread(void *arg)
         return;
     }
 
+    if (!bootinfo_has_flag("b1nix.ui=1") && !bootinfo_has_flag("ui=1") && !bootinfo_has_flag("gfx_demo")) {
+        console_write("compositor: UI or demo flags not set, compositor thread exiting\n");
+        return;
+    }
+
     console_write("compositor: started loop with backbuffer\n");
     compositor_started = 1;
     while (1) {
@@ -364,7 +369,9 @@ void compositor_init(void)
     }
 
     backbuffer_size = (usize)fb_console_width() * (usize)fb_console_height() * sizeof(u32);
-    backbuffer = (u32 *)kmalloc(backbuffer_size);
+    usize backbuffer_frames = (backbuffer_size + PAGE_SIZE - 1) / PAGE_SIZE;
+    u64 backbuffer_phys = pmm_alloc_frames(backbuffer_frames);
+    backbuffer = backbuffer_phys ? (u32 *)(usize)(backbuffer_phys + vmm_direct_map_base()) : 0;
     if (!backbuffer) {
         console_write("compositor: backbuffer alloc failed\n");
         return;

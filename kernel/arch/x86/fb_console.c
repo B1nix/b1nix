@@ -80,14 +80,14 @@ void fb_console_init(void)
 	fb_shadow_frames = (fb_shadow_size + PAGE_SIZE - 1) / PAGE_SIZE;
 	u64 fb_shadow_phys = pmm_alloc_frames(fb_shadow_frames);
 	if (fb_shadow_phys) {
-		fb_shadow = (u8 *)(usize)(fb_shadow_phys + vmm_direct_map_base());
+		fb_shadow = (u8 *)vmm_map_mmio(fb_shadow_phys, fb_shadow_size, VMM_WRITABLE);
 	}
 	if (!fb_shadow) {
 		console_write("fb: shadow alloc failed (using direct mmio)\n");
 		fb_shadow_size = 0;
 		fb_shadow_frames = 0;
 	} else {
-		memset(fb_shadow, 0, fb_shadow_frames * PAGE_SIZE);
+		memset(fb_shadow, 0, fb_shadow_size);
 	}
 
 	cursor_x = 0;

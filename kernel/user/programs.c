@@ -3,6 +3,7 @@
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/errno.h>
+#include <b1nix/filelock.h>
 #include <b1nix/net.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
@@ -131,20 +132,42 @@ static int sh_fg(int job_num) {
   return st;
 }
 
+static void ensure_shell_tty_stdio(void) {
+  u64 tty = syscall_dispatch(SYS_OPEN, (u64)(usize)"/dev/tty", (u64)B1NIX_O_RDWR,
+                             0, 0, 0, 0);
+  if ((isize)tty < 0)
+    return;
+  syscall_dispatch(SYS_DUP2, tty, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, tty, 1, 0, 0, 0, 0);
+  syscall_dispatch(SYS_DUP2, tty, 2, 0, 0, 0, 0);
+  if (tty > 2)
+    syscall_dispatch(SYS_CLOSE, tty, 0, 0, 0, 0, 0);
+}
+
 static int readline(char *buffer, usize max_len) {
+  ensure_shell_tty_stdio();
+
   struct b1nix_termios old_t, new_t;
-  syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS, (u64)(usize)&old_t, 0, 0, 0);
+  if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS,
+                              (u64)(usize)&old_t, 0, 0, 0) < 0) {
+    memset(&old_t, 0, sizeof(old_t));
+    old_t.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
+    old_t.c_oflag = B1NIX_OPOST;
+  }
   new_t = old_t;
   new_t.c_lflag &= ~(B1NIX_ICANON | B1NIX_ECHO);
   syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&new_t, 0, 0, 0);
 
   usize len = 0;
   int hist_idx = sh_hist_count;
+  int ret = 0;
 
   while (1) {
     char c = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-    if (c == 4)
-      return -1; /* Ctrl-D */
+    if (c == 4) {
+      ret = -1; /* Ctrl-D */
+      break;
+    }
     if (c == 27) {
       char b1 = (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
       if (b1 == '[') {
@@ -200,7 +223,7 @@ static int readline(char *buffer, usize max_len) {
   }
 
   syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS, (u64)(usize)&old_t, 0, 0, 0);
-  return 0;
+  return ret;
 }
 
 static void resolve_path(const char *cwd, const char *rel, char *abs) {
@@ -988,6 +1011,77 @@ static void udp_queue_smoke_check(void) {
   uwrite("UDP-SMOKE: fail queue-order\n");
 }
 
+static int lock_smoke_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+
+  uwrite("LOCK-SMOKE: start\n");
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/lock-smoke.dat",
+                            B1NIX_O_CREAT | B1NIX_O_RDWR | B1NIX_O_TRUNC, 0666, 0, 0, 0);
+  if ((isize)fd < 0) {
+    uwrite("LOCK-SMOKE: fail open\n");
+    return 1;
+  }
+
+  struct flock parent_lock;
+  memset(&parent_lock, 0, sizeof(parent_lock));
+  parent_lock.l_type = F_WRLCK;
+  parent_lock.l_whence = 0;
+  parent_lock.l_start = 0;
+  parent_lock.l_len = 0;
+  if ((isize)syscall_dispatch(SYS_FCNTL, fd, B1NIX_F_SETLK, (u64)(usize)&parent_lock, 0, 0, 0) < 0) {
+    uwrite("LOCK-SMOKE: fail parent-setlk\n");
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    return 1;
+  }
+
+  u64 pid = syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if ((isize)pid < 0) {
+    uwrite("LOCK-SMOKE: fail fork\n");
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    return 1;
+  }
+  if (pid == 0) {
+    struct flock child_lock;
+    memset(&child_lock, 0, sizeof(child_lock));
+    child_lock.l_type = F_WRLCK;
+    child_lock.l_whence = 0;
+    child_lock.l_start = 0;
+    child_lock.l_len = 0;
+
+    isize nb = (isize)syscall_dispatch(SYS_FCNTL, fd, B1NIX_F_SETLK, (u64)(usize)&child_lock, 0, 0, 0);
+    if (nb != -EAGAIN) {
+      uwrite("LOCK-SMOKE: fail nonblock-conflict\n");
+      syscall_dispatch(SYS_EXIT, 2, 0, 0, 0, 0, 0);
+    }
+    uwrite("LOCK-SMOKE: ok nonblock-conflict\n");
+
+    isize blk = (isize)syscall_dispatch(SYS_FCNTL, fd, B1NIX_F_SETLKW, (u64)(usize)&child_lock, 0, 0, 0);
+    if (blk < 0) {
+      uwrite("LOCK-SMOKE: fail setlkw\n");
+      syscall_dispatch(SYS_EXIT, 3, 0, 0, 0, 0, 0);
+    }
+    uwrite("LOCK-SMOKE: ok wake-on-close\n");
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    syscall_dispatch(SYS_EXIT, 0, 0, 0, 0, 0, 0);
+  }
+
+  for (int i = 0; i < 8; i++) {
+    syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+  }
+  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+
+  int st = 0;
+  syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&st, 0, 0, 0, 0);
+  if (st != 0) {
+    uwrite("LOCK-SMOKE: fail child-status\n");
+    return 1;
+  }
+
+  uwrite("LOCK-SMOKE: done\n");
+  return 0;
+}
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -1029,6 +1123,13 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
   }
 
+  u64 lock_smoke_pid =
+      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/lock-smoke", 0, 0, 0, 0, 0);
+  if (lock_smoke_pid != (u64)-1) {
+    int status = 0;
+    syscall_dispatch(SYS_WAIT, lock_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  }
+
   const char *net_ping_argv[] = {"ping", "-c", "2", "10.0.2.2", 0};
   int net_ping_status = busybox_main(4, net_ping_argv);
   if (net_ping_status == 0) {
@@ -1053,7 +1154,16 @@ static int init_main(int argc, const char **argv) {
   }
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
-  syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
+  if (bootinfo_has_flag("b1nix.ui=1") || bootinfo_has_flag("ui=1")) {
+    uwrite("UI: launching /bin/mc\n");
+    u64 ui_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/mc", 0, 0, 0, 0, 0);
+    if ((isize)ui_pid < 0) {
+      uwrite("UI: fallback to /bin/sh\n");
+      syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/sh", 0, 0, 0, 0, 0);
+    }
+  } else {
+    syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
+  }
 
   while (1) {
     int status;
@@ -1334,9 +1444,16 @@ static int m24_stress_main(int argc, const char **argv) {
       continue;
     }
     int status = 0;
-    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
-    syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    if (status != 0)
+    int reaped = 0;
+    for (int spins = 0; spins < 200; spins++) {
+      u64 wr = syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&status, 1 /*WNOHANG*/, 0, 0, 0);
+      if (wr == pid) {
+        reaped = 1;
+        break;
+      }
+      syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+    }
+    if (!reaped || status != 0)
       failures++;
   }
 
@@ -1494,6 +1611,7 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/m22-smoke", m22_smoke_main);
   user_register_program("/bin/m24-stress", m24_stress_main);
   user_register_program("/bin/shell-smoke", shell_smoke_main);
+  user_register_program("/bin/lock-smoke", lock_smoke_main);
 
   /* M22 — Core Terminal Utilities (BusyBox multi-call) */
 

@@ -86,16 +86,45 @@ struct tcp_conn {
 static struct tcp_conn tcp_conns[MAX_TCP_CONNS];
 static u16 next_local_port = 1025;
 static u32 tcp_iss_counter = 0;
+static volatile int tcp_queue_lock;
+
+static u64 irq_save(void) {
+  u64 flags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+  return flags;
+}
+
+static void irq_restore(u64 flags) {
+  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
+}
+
+static void tcp_lock(void) {
+  while (__atomic_test_and_set(&tcp_queue_lock, __ATOMIC_ACQUIRE)) {
+  }
+}
+
+static void tcp_unlock(void) {
+  __atomic_clear(&tcp_queue_lock, __ATOMIC_RELEASE);
+}
+
+static void tcp_free_retransmit_list(struct tcp_retransmit_pkt *head) {
+  while (head) {
+    struct tcp_retransmit_pkt *next = head->next;
+    kfree(head->data);
+    kfree(head);
+    head = next;
+  }
+}
 
 static void tcp_clear_retransmit_queue(struct tcp_conn *conn) {
-  struct tcp_retransmit_pkt *q = conn->retransmit_queue;
-  while (q) {
-    struct tcp_retransmit_pkt *next = q->next;
-    kfree(q->data);
-    kfree(q);
-    q = next;
-  }
+  struct tcp_retransmit_pkt *detached = 0;
+  u64 irq = irq_save();
+  tcp_lock();
+  detached = conn->retransmit_queue;
   conn->retransmit_queue = 0;
+  tcp_unlock();
+  irq_restore(irq);
+  tcp_free_retransmit_list(detached);
 }
 
 static void tcp_enter_time_wait(struct tcp_conn *conn) {
@@ -176,10 +205,14 @@ static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
   rp->retries = 0;
   rp->next = 0;
 
+  u64 irq = irq_save();
+  tcp_lock();
   struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
   while (*prev)
     prev = &(*prev)->next;
   *prev = rp;
+  tcp_unlock();
+  irq_restore(irq);
 }
 
 static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port) {
@@ -556,15 +589,19 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
     if (flags & TCP_ACK) {
       if (ack > conn->snd_una || ack == conn->snd_una) {
         conn->snd_una = ack;
-        /* Clear acknowledged packets from retransmit queue */
-        struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
-        while (rp && (isize)(ack - rp->seq) > 0) {
-          struct tcp_retransmit_pkt *next = rp->next;
-          kfree(rp->data);
-          kfree(rp);
-          rp = next;
+        struct tcp_retransmit_pkt *detached = 0;
+        u64 irq = irq_save();
+        tcp_lock();
+        while (conn->retransmit_queue &&
+               (isize)(ack - conn->retransmit_queue->seq) > 0) {
+          struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
+          conn->retransmit_queue = rp->next;
+          rp->next = detached;
+          detached = rp;
         }
-        conn->retransmit_queue = rp;
+        tcp_unlock();
+        irq_restore(irq);
+        tcp_free_retransmit_list(detached);
       }
     }
 
@@ -672,13 +709,19 @@ void tcp_timer_tick(void) {
       continue;
     }
 
+    u64 irq = irq_save();
+    tcp_lock();
     struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
     while (rp) {
       if (now - rp->timestamp >= 50) { // 500ms
         if (rp->retries >= 5) {
           conn->state = TCP_CLOSED;
           conn->used = 0;
+          tcp_unlock();
+          irq_restore(irq);
           tcp_clear_retransmit_queue(conn);
+          irq = irq_save();
+          tcp_lock();
           break;
         }
         ipv4_send(conn->remote_ip, IP_PROTO_TCP, rp->data, rp->len);
@@ -687,5 +730,7 @@ void tcp_timer_tick(void) {
       }
       rp = rp->next;
     }
+    tcp_unlock();
+    irq_restore(irq);
   }
 }

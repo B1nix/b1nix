@@ -335,10 +335,17 @@ static isize sys_read_file(const char *user_path) {
 }
 
 #ifndef __aarch64__
+extern char ps2_kbd_getc(void);
 static u64 sys_read_kbd(void) {
   char c = 0;
   if (vfs_read(0, &c, 1) == 1)
     return (u64)c;
+  /* Fallback path: if stdin got redirected/closed, still allow interactive
+   * keyboard input through the PS/2 ring buffer. */
+  c = ps2_kbd_getc();
+  if (c)
+    return (u64)c;
+  scheduler_yield();
   return 0;
 }
 #endif

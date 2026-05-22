@@ -85,12 +85,14 @@ void ps2_mouse_init(void)
     mouse_state.y = (int)(bi->framebuffer.height / 2);
     mouse_state.buttons = 0;
 
-    ps2_write_cmd(0xA8);
-    ps2_write_cmd(0x20);
-    u8 status = ps2_read_data();
-    status |= 0x02;
-    ps2_write_cmd(0x60);
-    ps2_write_data(status);
+    // Drain any pending data in the PS/2 controller output buffer
+    while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUT_FULL) {
+        (void)inb(PS2_DATA_PORT);
+    }
+
+    ps2_write_cmd(0xA8); // Enable auxiliary device (mouse)
+    ps2_write_cmd(0x60); // Write Command Byte
+    ps2_write_data(0x47); // 0x47: enable keyboard, mouse, translation, and system flag
 
     ps2_mouse_write(0xF6);
     (void)ps2_read_data();
@@ -107,14 +109,14 @@ void ps2_mouse_init(void)
     console_write("ps2_mouse: initialized on irq12\n");
 }
 
-void ps2_mouse_interrupt_handler(void)
+extern void ps2_kbd_handle_byte(u8 scancode);
+
+void ps2_mouse_handle_byte(u8 data)
 {
     if (!mouse_ready) {
-        (void)inb(PS2_DATA_PORT);
         return;
     }
 
-    u8 data = inb(PS2_DATA_PORT);
     if (packet_index == 0 && (data & 0x08) == 0) {
         return;
     }
@@ -143,6 +145,22 @@ void ps2_mouse_interrupt_handler(void)
 
     if (mouse_state.x != old_x || mouse_state.y != old_y || mouse_state.buttons != old_buttons) {
         mouse_event_pending = 1;
+    }
+}
+
+void ps2_mouse_interrupt_handler(void)
+{
+    while (1) {
+        u8 status = inb(PS2_STATUS_PORT);
+        if (!(status & PS2_STATUS_OUT_FULL)) {
+            break;
+        }
+        u8 data = inb(PS2_DATA_PORT);
+        if (status & 0x20) {
+            ps2_mouse_handle_byte(data);
+        } else {
+            ps2_kbd_handle_byte(data);
+        }
     }
 }
 

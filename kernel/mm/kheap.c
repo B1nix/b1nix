@@ -4,6 +4,7 @@
 #include <string.h>
 
 struct kheap_state {
+  u64 base;
   u64 current;
   u64 end;
 };
@@ -21,10 +22,13 @@ struct kheap_block {
 
 static struct kheap_state heap;
 static struct kheap_block *free_list;
-static int use_direct_map;
 
 static u64 align_up_u64(u64 value, u64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
+}
+
+static int is_canonical_addr(u64 addr) {
+  return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
 }
 
 static void heap_grow(usize minimum_bytes) {
@@ -40,6 +44,7 @@ static void heap_grow(usize minimum_bytes) {
     vmm_map_page(vaddr, frame, VMM_PRESENT | VMM_WRITABLE);
 
     if (heap.current == 0) {
+      heap.base = vaddr;
       heap.current = vaddr;
     }
 
@@ -48,10 +53,10 @@ static void heap_grow(usize minimum_bytes) {
 }
 
 void kheap_init(void) {
+  heap.base = 0;
   heap.current = 0;
   heap.end = 0;
   free_list = 0;
-  use_direct_map = 0;
   heap_grow(PAGE_SIZE);
 
   console_write("kheap: start 0x");
@@ -62,9 +67,9 @@ void kheap_init(void) {
 }
 
 void kheap_use_direct_map(void) {
-  use_direct_map = 1;
-  heap.current += 0xffff800000000000ULL;
-  heap.end += 0xffff800000000000ULL;
+  /* Keep kheap in the already-mapped identity range. The direct-map
+   * transition caused unstable early-boot faults under current paging. */
+  return;
 }
 
 void *kmalloc(usize size) {
@@ -119,6 +124,13 @@ void *kzalloc(usize size) {
 void kfree(void *ptr) {
   if (!ptr)
     return;
+  u64 p = (u64)(usize)ptr;
+  if (!is_canonical_addr(p))
+    return;
+  if (heap.base != 0) {
+    if (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end)
+      return;
+  }
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
   if (block->magic != KHEAP_MAGIC)

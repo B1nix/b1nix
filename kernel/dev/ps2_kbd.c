@@ -59,9 +59,10 @@ static void kbd_push_fkey(int f)
 	kbd_push((char)f);
 }
 
-void ps2_kbd_interrupt_handler(void)
+extern void ps2_mouse_handle_byte(u8 data);
+
+void ps2_kbd_handle_byte(u8 scancode)
 {
-	u8 scancode = inb(0x60);
 	if (scancode == 0xE0) {
 		extended_scancode = 1;
 		return;
@@ -144,6 +145,22 @@ void ps2_kbd_interrupt_handler(void)
 				}
 				kbd_push(c);
 			}
+		}
+	}
+}
+
+void ps2_kbd_interrupt_handler(void)
+{
+	while (1) {
+		u8 status = inb(0x64);
+		if (!(status & 0x01)) {
+			break;
+		}
+		u8 data = inb(0x60);
+		if (status & 0x20) {
+			ps2_mouse_handle_byte(data);
+		} else {
+			ps2_kbd_handle_byte(data);
 		}
 	}
 }
