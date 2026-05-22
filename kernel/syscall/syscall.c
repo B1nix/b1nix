@@ -15,6 +15,7 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/filelock.h>
 #include <string.h>
 
 extern struct task *current_task;
@@ -675,6 +676,19 @@ static isize sys_fchown(int fd, u16 uid, u16 gid) {
 }
 
 static isize sys_fcntl(int fd, int cmd, u64 arg) {
+  if (cmd == B1NIX_F_GETLK || cmd == B1NIX_F_SETLK || cmd == B1NIX_F_SETLKW) {
+    struct flock kfl;
+    if (copy_from_user(&kfl, (void *)(usize)arg, sizeof(struct flock)) < 0) {
+      return -EFAULT;
+    }
+    isize res = vfs_fcntl(fd, cmd, (u64)(usize)&kfl);
+    if (res == 0 && cmd == B1NIX_F_GETLK) {
+      if (copy_to_user((void *)(usize)arg, &kfl, sizeof(struct flock)) < 0) {
+        return -EFAULT;
+      }
+    }
+    return res;
+  }
   return vfs_fcntl(fd, cmd, arg);
 }
 

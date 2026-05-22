@@ -162,6 +162,8 @@ check_output "$LOG" "M22-SMOKE: ok uname" "uname utility runs"
 check_output "$LOG" "M22-SMOKE: done" "M22 utility smoke completes"
 
 check_output "$LOG" "M24-STRESS: done" "M24 stress completes successfully"
+check_output "$LOG" "LOCK-SMOKE: done" "LOCK-SMOKE completes successfully"
+check_output "$LOG" "EXT-STRESS: done" "EXT-STRESS completes successfully"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
 check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"

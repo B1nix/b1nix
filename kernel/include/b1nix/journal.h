@@ -21,6 +21,7 @@ struct journal_dev {
   u32 nblocks;
   u32 first;
   u32 next_seq;
+  u32 s_start;
   u32 maxlen;
   void *fs_priv;
   struct journal_ops ops;

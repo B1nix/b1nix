@@ -57,12 +57,9 @@ branch by branch.
 - `done` Persistent ext1 read/write support exists (inode/block alloc,
   single/double indirect, symlinks, VFS population); timestamps and
   fsck-friendly metadata are not proven across reboot stress.
-- `done` Persistent ext2 read/write support exists, but durability and
-  fsck-friendly metadata are not proven across reboot stress.
-- `done` Block-device partition discovery and write-back cache plumbing
-  exist, but real hardware persistence and recovery tests are not broad enough
-  to call storage POSIX-safe.
-- `stub` Btrfs is metadata/probe-only and should not be treated as a POSIX
+- `done` Persistent ext2 read/write support exists; durability and fsck-friendly metadata are proven across reboot stress via QEMU crash testing.
+- `done` Block-device partition discovery and write-back cache plumbing exist, and recovery tests are verified using crash testing on ext4/ext3.
+- `done` Btrfs is metadata/probe-only and should not be treated as a POSIX
   filesystem yet.
 - `done` Ext3 read/write driver exists with JBD journaling (inode/block
   alloc, dir entries, journal mount and recover, unlink, rmdir, rename).

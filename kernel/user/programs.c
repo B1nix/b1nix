@@ -1082,6 +1082,132 @@ static int lock_smoke_main(int argc, const char **argv) {
   return 0;
 }
 
+static int run_ext_stress(const char *mount_path) {
+  struct b1nix_mount_entry mounts[16];
+  long count = (long)syscall_dispatch(SYS_MOUNTS, (u64)(usize)mounts, 16, 0, 0, 0, 0);
+  int is_mounted = 0;
+  if (count > 0) {
+    for (long i = 0; i < count && i < 16; i++) {
+      if (strcmp(mounts[i].target, mount_path) == 0) {
+        is_mounted = 1;
+        break;
+      }
+    }
+  }
+  if (!is_mounted) {
+    return 0;
+  }
+
+  char path_buf[256];
+  snprintf(path_buf, sizeof(path_buf), "%s/.stress_test", mount_path);
+  isize fd = (isize)syscall_dispatch(SYS_OPEN, (u64)(usize)path_buf,
+                                   B1NIX_O_CREAT | B1NIX_O_RDWR, 0666, 0, 0, 0);
+  if (fd < 0) {
+    return 0; 
+  }
+  syscall_dispatch(SYS_CLOSE, (u64)fd, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_UNLINK, (u64)(usize)path_buf, 0, 0, 0, 0, 0);
+
+  uwrite("EXT-STRESS: running on ");
+  uwrite(mount_path);
+  uwrite("\n");
+
+  char dir_path[256];
+  char file_path[256];
+  char renamed_path[256];
+  char sym_path[256];
+  char link_path[256];
+
+  for (int i = 0; i < 50; i++) {
+    snprintf(dir_path, sizeof(dir_path), "%s/dir_%d", mount_path, i);
+    isize rc = (isize)syscall_dispatch(SYS_MKDIR, (u64)(usize)dir_path, 0755, 0, 0, 0, 0);
+    if (rc < 0 && rc != -EEXIST) {
+      uwrite("EXT-STRESS: mkdir failed\n");
+      return 1;
+    }
+
+    snprintf(file_path, sizeof(file_path), "%s/dir_%d/file_%d", mount_path, i, i);
+    fd = (isize)syscall_dispatch(SYS_OPEN, (u64)(usize)file_path,
+                                 B1NIX_O_CREAT | B1NIX_O_RDWR | B1NIX_O_TRUNC, 0666, 0, 0, 0);
+    if (fd < 0) {
+      uwrite("EXT-STRESS: open failed\n");
+      return 1;
+    }
+
+    char write_buf[128];
+    snprintf(write_buf, sizeof(write_buf), "Stress data for iteration %d. Repeating some blocks of text to ensure we use some file blocks.\n", i);
+    isize bytes_written = (isize)syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)write_buf, strlen(write_buf), 0, 0, 0);
+    if (bytes_written < 0) {
+      uwrite("EXT-STRESS: write failed\n");
+      syscall_dispatch(SYS_CLOSE, (u64)fd, 0, 0, 0, 0, 0);
+      return 1;
+    }
+
+    syscall_dispatch(SYS_FSYNC, (u64)fd, 0, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, (u64)fd, 0, 0, 0, 0, 0);
+
+    snprintf(sym_path, sizeof(sym_path), "%s/dir_%d/sym_%d", mount_path, i, i);
+    rc = (isize)syscall_dispatch(SYS_SYMLINK, (u64)(usize)file_path, (u64)(usize)sym_path, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: symlink failed\n");
+      return 1;
+    }
+
+    snprintf(link_path, sizeof(link_path), "%s/dir_%d/link_%d", mount_path, i, i);
+    rc = (isize)syscall_dispatch(SYS_LINK, (u64)(usize)file_path, (u64)(usize)link_path, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: link failed\n");
+      return 1;
+    }
+
+    snprintf(renamed_path, sizeof(renamed_path), "%s/dir_%d/renamed_%d", mount_path, i, i);
+    rc = (isize)syscall_dispatch(SYS_RENAME, (u64)(usize)file_path, (u64)(usize)renamed_path, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: rename failed\n");
+      return 1;
+    }
+
+    rc = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)sym_path, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: unlink sym failed\n");
+      return 1;
+    }
+
+    rc = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)link_path, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: unlink link failed\n");
+      return 1;
+    }
+
+    rc = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)renamed_path, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: unlink renamed failed\n");
+      return 1;
+    }
+
+    rc = (isize)syscall_dispatch(SYS_RMDIR, (u64)(usize)dir_path, 0, 0, 0, 0, 0);
+    if (rc < 0) {
+      uwrite("EXT-STRESS: rmdir failed\n");
+      return 1;
+    }
+  }
+
+  uwrite("EXT-STRESS: done on ");
+  uwrite(mount_path);
+  uwrite("\n");
+  return 0;
+}
+
+static int ext_stress_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  uwrite("EXT-STRESS: start\n");
+  run_ext_stress("/ext4");
+  run_ext_stress("/ext3");
+  uwrite("EXT-STRESS: done\n");
+  return 0;
+}
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -1128,6 +1254,13 @@ static int init_main(int argc, const char **argv) {
   if (lock_smoke_pid != (u64)-1) {
     int status = 0;
     syscall_dispatch(SYS_WAIT, lock_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  }
+
+  u64 ext_stress_pid =
+      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/ext-stress", 0, 0, 0, 0, 0);
+  if (ext_stress_pid != (u64)-1) {
+    int status = 0;
+    syscall_dispatch(SYS_WAIT, ext_stress_pid, (u64)(usize)&status, 0, 0, 0, 0);
   }
 
   const char *net_ping_argv[] = {"ping", "-c", "2", "10.0.2.2", 0};
@@ -1612,6 +1745,7 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/m24-stress", m24_stress_main);
   user_register_program("/bin/shell-smoke", shell_smoke_main);
   user_register_program("/bin/lock-smoke", lock_smoke_main);
+  user_register_program("/bin/ext-stress", ext_stress_main);
 
   /* M22 — Core Terminal Utilities (BusyBox multi-call) */
 

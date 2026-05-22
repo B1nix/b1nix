@@ -9,6 +9,7 @@
 #define F_UNLCK 2 // Unlock
 
 // Lock commands
+#define F_GETLK  5  // Get lock
 #define F_SETLK  6  // Set lock (non-blocking)
 #define F_SETLKW 7  // Set lock (blocking)
 
@@ -27,9 +28,12 @@ struct flock {
 #define LOCK_NB 4  // Non-blocking
 #define LOCK_UN 8  // Unlock
 
+struct vfs_inode;
+
 // File lock structure
 struct file_lock {
     struct file_lock *next;
+    struct vfs_inode *inode; // Inode this lock applies to
     int pid;              // Process ID owning this lock
     int lock_type;        // F_RDLCK or F_WRLCK
     u64 start;            // Start offset
@@ -42,5 +46,6 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl);
 int filelock_unlock(int fd);
 int filelock_check_lock(int fd, int lock_type, u64 start, u64 len, int *conflict_pid);
 int filelock_flock(int fd, int operation);
+void filelock_release_all_by_pid_inode(int pid, struct vfs_inode *inode);
 
 #endif

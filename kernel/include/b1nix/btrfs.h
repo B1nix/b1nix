@@ -52,6 +52,17 @@ struct btrfs_super_block {
     u32 leafsize;
     u32 stripesize;
     u32 sys_chunk_array_size;
+    u64 chunk_root_generation;
+    u64 compat_flags;
+    u64 compat_ro_flags;
+    u64 incompat_flags;
+    u16 csum_type;
+    u8 root_level;
+    u8 chunk_root_level;
+    u8 log_root_level;
+    u8 dev_item[98];
+    char label[256];
+    u8 unused[256];
     u8 sys_chunk_array[2048];
 } __attribute__((packed));
 

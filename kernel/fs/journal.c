@@ -46,65 +46,83 @@ struct journal_dev *journal_mount(void *fs_priv, u32 block_size,
   for (int i = 0; i < MAX_JOURNALS; i++) {
     if (!jdevs[i].used) {
       jdev = &jdevs[i];
-            break;
-        }
+      break;
     }
+  }
   if (!jdev)
     return 0;
-    
+
   jdev->used = 1;
   jdev->fs_priv = fs_priv;
   jdev->block_size = block_size;
   jdev->ops = *ops;
-    
+
   u8 *sb_buf = kmalloc(block_size);
   if (jdev->ops.read_journal_block(jdev, 0, sb_buf) < 0) {
     kfree(sb_buf);
     jdev->used = 0;
     return 0;
-}
+  }
 
   struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
   if (sb->s_header.h_magic != JBD_MAGIC) {
     kfree(sb_buf);
     jdev->used = 0;
-        return 0;
-    }
-    
+    return 0;
+  }
+
   jdev->maxlen = sb->s_maxlen;
   jdev->nblocks = sb->s_maxlen;
   jdev->first = sb->s_first;
   jdev->next_seq = sb->s_sequence;
-    
+  jdev->s_start = sb->s_start;
+  if (jdev->s_start < sb->s_first || jdev->s_start >= sb->s_maxlen) {
+    jdev->s_start = sb->s_first;
+  }
+
   kfree(sb_buf);
   return jdev;
-    }
-    
+}
+
+static u32 journal_next_block(struct journal_dev *jdev, u32 *pos) {
+  u32 cur = *pos;
+  (*pos)++;
+  if (*pos >= jdev->maxlen) {
+    *pos = jdev->first;
+  }
+  return cur;
+}
+
 int journal_recover(struct journal_dev *jdev) {
   if (!jdev || !jdev->used)
     return -1;
-    
+
   console_write("jbd: starting recovery from seq=");
   console_write_dec(jdev->next_seq);
+  console_write(", start_block=");
+  console_write_dec(jdev->s_start);
   console_write("\n");
-    
-  if (jdev->next_seq <= 1)
-    return 0;
-    
-  u32 current = jdev->first;
+
+  u32 current = jdev->s_start;
   int replayed = 0;
   int scanned_txs = 0;
   int committed_txs = 0;
-    
-  for (u32 seq = 1; seq < jdev->next_seq; seq++) {
+  u32 seq = jdev->next_seq;
+
+  while (1) {
     u8 *hdr_buf = kmalloc(jdev->block_size);
     if (jdev->ops.read_journal_block(jdev, current, hdr_buf) < 0) {
       kfree(hdr_buf);
       break;
     }
-    
+
     struct jbd_header *hdr = (struct jbd_header *)hdr_buf;
     if (hdr->h_magic != JBD_MAGIC) {
+      kfree(hdr_buf);
+      break;
+    }
+
+    if (hdr->h_sequence != seq) {
       kfree(hdr_buf);
       break;
     }
@@ -112,28 +130,30 @@ int journal_recover(struct journal_dev *jdev) {
     if (hdr->h_blocktype == JBD_DESCRIPTOR_BLOCK) {
       struct jbd_block_tag *tag =
           (struct jbd_block_tag *)(hdr_buf + sizeof(struct jbd_header));
-      u32 data_block = current + 1;
-      u32 tx_data_start = data_block;
-      u32 tx_seq = hdr->h_sequence;
+      u32 pos = current;
+      journal_next_block(jdev, &pos); // skip descriptor block
+      u32 tx_data_start = pos;
       int done = 0;
+      int count = 0;
 
       while (!done) {
-        (void)tag->t_blocknr;
         if (tag->t_flags & JBD_TAG_LAST_TAG)
           done = 1;
-        data_block++;
+        journal_next_block(jdev, &pos); // skip data block
+        count++;
         tag++;
       }
 
-      /* Descriptor + N data blocks must be followed by a matching commit
-       * block before we are allowed to replay the transaction. */
+      u32 commit_pos = journal_next_block(jdev, &pos); // commit block pos
+
+      /* Read commit block and verify */
       u8 *commit_buf = kmalloc(jdev->block_size);
       int has_commit = 0;
-      if (jdev->ops.read_journal_block(jdev, data_block, commit_buf) == 0) {
+      if (jdev->ops.read_journal_block(jdev, commit_pos, commit_buf) == 0) {
         struct jbd_header *chdr = (struct jbd_header *)commit_buf;
         if (chdr->h_magic == JBD_MAGIC &&
             chdr->h_blocktype == JBD_COMMIT_BLOCK &&
-            chdr->h_sequence == tx_seq) {
+            chdr->h_sequence == seq) {
           has_commit = 1;
         }
       }
@@ -142,9 +162,10 @@ int journal_recover(struct journal_dev *jdev) {
       scanned_txs++;
       if (has_commit) {
         committed_txs++;
+
         struct jbd_block_tag *rtag =
             (struct jbd_block_tag *)(hdr_buf + sizeof(struct jbd_header));
-        u32 rdata = tx_data_start;
+        u32 rdata_pos = tx_data_start;
         int rdone = 0;
         while (!rdone) {
           u32 blocknr = rtag->t_blocknr;
@@ -152,31 +173,45 @@ int journal_recover(struct journal_dev *jdev) {
             rdone = 1;
 
           u8 *data_buf = kmalloc(jdev->block_size);
-          if (jdev->ops.read_journal_block(jdev, rdata, data_buf) == 0) {
+          if (jdev->ops.read_journal_block(jdev, rdata_pos, data_buf) == 0) {
             jdev->ops.write_fs_block(jdev, blocknr, data_buf);
             replayed++;
           }
           kfree(data_buf);
-          rdata++;
+          journal_next_block(jdev, &rdata_pos);
           rtag++;
         }
+
+        current = pos;
+        seq++;
       } else {
         console_write("jbd: skip uncommitted tx seq=");
-        console_write_dec(tx_seq);
+        console_write_dec(seq);
         console_write("\n");
+        kfree(hdr_buf);
+        break;
       }
-
-      current = data_block + 1;
-    } else if (hdr->h_blocktype == JBD_COMMIT_BLOCK ||
-               hdr->h_blocktype == JBD_REVOKE_BLOCK) {
-      current++;
     } else {
       kfree(hdr_buf);
       break;
     }
     kfree(hdr_buf);
+  }
+
+  if (committed_txs > 0) {
+    jdev->next_seq = seq;
+    jdev->s_start = current;
+
+    u8 *sb_buf = kmalloc(jdev->block_size);
+    if (jdev->ops.read_journal_block(jdev, 0, sb_buf) == 0) {
+      struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
+      sb->s_sequence = jdev->next_seq;
+      sb->s_start = jdev->s_start;
+      jdev->ops.write_journal_block(jdev, 0, sb_buf);
     }
-    
+    kfree(sb_buf);
+  }
+
   console_write("jbd: replayed ");
   console_write_dec(replayed);
   console_write(" blocks from ");
@@ -184,7 +219,8 @@ int journal_recover(struct journal_dev *jdev) {
   console_write("/");
   console_write_dec(scanned_txs);
   console_write(" committed txs\n");
-    return 0;
+
+  return 0;
 }
 
 struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
@@ -201,7 +237,7 @@ struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
   }
   return 0;
 }
-    
+
 int journal_log_block(struct journal_handle *handle, u32 fs_block,
                       const void *data) {
   if (!handle || !handle->active)
@@ -219,7 +255,7 @@ int journal_log_block(struct journal_handle *handle, u32 fs_block,
   handle->modified_count++;
   return 0;
 }
-    
+
 int journal_commit_transaction(struct journal_handle *handle) {
   if (!handle || !handle->active)
     return -1;
@@ -227,11 +263,10 @@ int journal_commit_transaction(struct journal_handle *handle) {
     handle->active = 0;
     return 0;
   }
-    
+
   struct journal_dev *jdev = handle->jdev;
   u32 count = handle->modified_count;
-  u32 log_start =
-      jdev->first + (jdev->next_seq % (jdev->nblocks - jdev->first));
+  u32 pos = jdev->s_start;
 
   /* 1. Write the descriptor block. */
   u8 *desc_buf = kzalloc(jdev->block_size);
@@ -246,13 +281,14 @@ int journal_commit_transaction(struct journal_handle *handle) {
     tags[i].t_blocknr = handle->fs_blocks[i];
     tags[i].t_flags = (i == count - 1) ? JBD_TAG_LAST_TAG : 0;
   }
-  jdev->ops.write_journal_block(jdev, log_start, desc_buf);
+  u32 desc_pos = journal_next_block(jdev, &pos);
+  jdev->ops.write_journal_block(jdev, desc_pos, desc_buf);
   kfree(desc_buf);
 
   /* 2. Write data blocks into the journal. */
   for (u32 i = 0; i < count; i++) {
-    jdev->ops.write_journal_block(jdev, log_start + 1 + i,
-                                  handle->data_blocks[i]);
+    u32 data_pos = journal_next_block(jdev, &pos);
+    jdev->ops.write_journal_block(jdev, data_pos, handle->data_blocks[i]);
   }
 
   /* 3. Write the commit block. */
@@ -261,26 +297,32 @@ int journal_commit_transaction(struct journal_handle *handle) {
   chdr->h_magic = JBD_MAGIC;
   chdr->h_blocktype = JBD_COMMIT_BLOCK;
   chdr->h_sequence = jdev->next_seq;
-  jdev->ops.write_journal_block(jdev, log_start + 1 + count, commit_buf);
-        kfree(commit_buf);
-    
-  /* 4. Update the superblock sequence. */
-  jdev->next_seq++;
-  u8 *sb_buf = kmalloc(jdev->block_size);
-  if (jdev->ops.read_journal_block(jdev, 0, sb_buf) == 0) {
-    struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
-    sb->s_sequence = jdev->next_seq;
-    jdev->ops.write_journal_block(jdev, 0, sb_buf);
-  }
-  kfree(sb_buf);
-    
-  /* 5. Write data blocks into the filesystem. */
+  u32 commit_pos = journal_next_block(jdev, &pos);
+  jdev->ops.write_journal_block(jdev, commit_pos, commit_buf);
+  kfree(commit_buf);
+
+  u32 next_tx_start = pos;
+
+  /* 4. Write data blocks into the filesystem (immediate checkpoint). */
   for (u32 i = 0; i < count; i++) {
     jdev->ops.write_fs_block(jdev, handle->fs_blocks[i],
                              handle->data_blocks[i]);
     kfree(handle->data_blocks[i]);
     handle->data_blocks[i] = 0;
-}
+  }
+
+  /* 5. Update the superblock. */
+  jdev->next_seq++;
+  jdev->s_start = next_tx_start;
+
+  u8 *sb_buf = kmalloc(jdev->block_size);
+  if (jdev->ops.read_journal_block(jdev, 0, sb_buf) == 0) {
+    struct jbd_superblock *sb = (struct jbd_superblock *)sb_buf;
+    sb->s_sequence = jdev->next_seq;
+    sb->s_start = jdev->s_start;
+    jdev->ops.write_journal_block(jdev, 0, sb_buf);
+  }
+  kfree(sb_buf);
 
   handle->active = 0;
   return 0;

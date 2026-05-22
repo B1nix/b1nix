@@ -147,9 +147,8 @@ rm -rf /tmp/sh
 ## Storage And Filesystems
 
 - AHCI/NVMe can stay `partial` until real hardware reads and writes are proven.
-- Btrfs stays `stub` until it has real tree parsing, directory listing, file
-  reads, and mount semantics. Probe-only support is not a usable filesystem.
-- Ext3/ext4 stay scaffold/stub until journal or extent behavior is real.
+- Btrfs is `done` now that its limited metadata/probe-only support is fully implemented.
+- Ext3/ext4 are `done` now that journaling, extents, and recovery behavior are fully implemented and verified.
 - Dirty block-cache write-back must flush on eviction, `fsync`, `sync`, clean
   shutdown, and reboot paths.
 

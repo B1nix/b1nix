@@ -1289,6 +1289,8 @@ void vfs_init(void) {
   add_node("/var", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/ext4", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/ext3", VFS_DIRECTORY, 0, 0, 0);
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
@@ -1577,6 +1579,11 @@ void vfs_close(int fd) {
   }
   struct vfs_handle *h = &handles[h_idx];
   vfs_release_handle_lock();
+
+  if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
+    int my_pid = current_task ? (int)current_task->id : 0;
+    filelock_release_all_by_pid_inode(my_pid, h->node->inode);
+  }
 
   if (h->ops && h->ops->close)
     h->ops->close(h);

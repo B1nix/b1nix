@@ -203,11 +203,11 @@ and broader utility flag compatibility.
 - [x] `done` Page swapping support.
 - [x] `done` Demand paging optimization and OOM fallback hooks.
 - [x] `done` Journaling abstraction for VFS.
-- [x] `partial` Advanced file locking (`flock`/`fcntl`).
+- [x] `done` Advanced file locking (`flock`/`fcntl`).
 - [x] `done` `sync()` and `fsync()` flush block cache paths.
 - [x] `done` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
 - [x] `done` Persistent ext2 root-image creation and boot overlay.
-- [ ] `planned` Add complete AHCI/NVMe production paths, robust journal replay, and full file-lock blocking semantics.
+- [ ] `planned` Add complete AHCI/NVMe production paths (robust journal replay and full file-lock blocking semantics are implemented).
 
 ## M15: IPC, Security & Standard OS Features
 
@@ -323,7 +323,7 @@ tables.
 - [x] `initial` Add `make root-image` and `make run-root` workflows.
 - [x] `initial` Overlay attached ext2 root over initramfs fallback files.
 - [x] `done` Add mount listing for active VFS mount table entries.
-- [x] `stub` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
+- [x] `done` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
 - [x] `partial` Add mount option handling baseline.
 
 M21 has an initial persistent-root path for the current boot model, but it is

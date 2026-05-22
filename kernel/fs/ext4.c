@@ -98,7 +98,7 @@ static void ext4_read_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd
     kfree(buf);
 }
 
-static void ext4_write_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd) {
+static void ext4_write_bgd_tx(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd, struct journal_handle *h) {
     u32 bg_block = ext4_get_desc_block(fs, group);
     u32 desc_per_block = fs->block_size / fs->desc_size;
     u32 bg_offset = (group % desc_per_block) * fs->desc_size;
@@ -110,7 +110,11 @@ static void ext4_write_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bg
         bg32.bg_inode_table = bgd->bg_inode_table_lo; bg32.bg_free_blocks_count = bgd->bg_free_blocks_count_lo;
         bg32.bg_free_inodes_count = bgd->bg_free_inodes_count_lo; memcpy(buf + bg_offset, &bg32, sizeof(bg32));
     }
-    ext4_journal_write(fs, bg_block, buf); kfree(buf);
+    ext4_journal_write_tx(fs, h, bg_block, buf); kfree(buf);
+}
+
+static void ext4_write_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd) {
+    ext4_write_bgd_tx(fs, group, bgd, 0);
 }
 
 static void ext4_write_superblock(struct ext4_fs *fs) {
@@ -145,18 +149,6 @@ static int ext4_read_inode(struct ext4_fs *fs, u32 inode_num, struct ext2_inode 
   return 0;
 }
 
-static int ext4_write_inode(struct ext4_fs *fs, u32 inode_num, const struct ext2_inode *inode) {
-  if (inode_num == 0) return -1;
-  u32 group = (inode_num - 1) / fs->inodes_per_group; struct ext4_bgd_64 bgd; ext4_read_bgd(fs, group, &bgd);
-  u32 itable = ext4_bgd_inode_table(fs, &bgd);
-  u32 inode_offset = ((inode_num - 1) % fs->inodes_per_group) * fs->inode_size;
-  u32 block_idx = itable + (inode_offset / fs->block_size);
-  u8 *buf = kmalloc(fs->block_size); ext4_read_block(fs, block_idx, buf);
-  memcpy(buf + (inode_offset % fs->block_size), inode, sizeof(struct ext2_inode));
-  int ret = ext4_journal_write(fs, block_idx, buf); kfree(buf);
-  return ret;
-}
-
 static int ext4_write_inode_tx(struct ext4_fs *fs, struct journal_handle *h,
                                u32 inode_num, const struct ext2_inode *inode) {
   if (inode_num == 0)
@@ -175,18 +167,22 @@ static int ext4_write_inode_tx(struct ext4_fs *fs, struct journal_handle *h,
   return ret;
 }
 
-static u32 ext4_alloc_block(struct ext4_fs *fs) {
+static int ext4_write_inode(struct ext4_fs *fs, u32 inode_num, const struct ext2_inode *inode) {
+  return ext4_write_inode_tx(fs, 0, inode_num, inode);
+}
+
+static u32 ext4_alloc_block_tx(struct ext4_fs *fs, struct journal_handle *h) {
   u32 groups = (fs->sb.s_blocks_count + fs->sb.s_blocks_per_group - 1) / fs->sb.s_blocks_per_group;
   for (u32 g = 0; g < groups; g++) {
     struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd); if (bgd.bg_free_blocks_count_lo == 0) continue;
     u8 *bitmap = kmalloc(fs->block_size); ext4_read_block(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
     for (u32 i = 0; i < fs->sb.s_blocks_per_group; i++) {
       if (!(bitmap[i / 8] & (1 << (i % 8)))) {
-        bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
-        kfree(bitmap); bgd.bg_free_blocks_count_lo--; ext4_write_bgd(fs, g, &bgd);
+        bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
+        kfree(bitmap); bgd.bg_free_blocks_count_lo--; ext4_write_bgd_tx(fs, g, &bgd, h);
         fs->sb.s_free_blocks_count--; ext4_write_superblock(fs);
         u32 block_num = g * fs->sb.s_blocks_per_group + i + (fs->sb.s_log_block_size == 0 ? 1 : 0);
-        u8 *zero = kzalloc(fs->block_size); ext4_journal_write(fs, block_num, zero);
+        u8 *zero = kzalloc(fs->block_size); ext4_journal_write_tx(fs, h, block_num, zero);
         kfree(zero); return block_num;
       }
     }
@@ -195,18 +191,22 @@ static u32 ext4_alloc_block(struct ext4_fs *fs) {
   return 0;
 }
 
-static u32 ext4_alloc_inode(struct ext4_fs *fs) {
+static u32 ext4_alloc_block(struct ext4_fs *fs) {
+  return ext4_alloc_block_tx(fs, 0);
+}
+
+static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
   u32 groups = (fs->sb.s_inodes_count + fs->inodes_per_group - 1) / fs->inodes_per_group;
   for (u32 g = 0; g < groups; g++) {
     struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd); if (bgd.bg_free_inodes_count_lo == 0) continue;
     u8 *bitmap = kmalloc(fs->block_size); ext4_read_block(fs, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
     for (u32 i = 0; i < fs->inodes_per_group; i++) {
       if (!(bitmap[i / 8] & (1 << (i % 8)))) {
-        bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write(fs, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
-        kfree(bitmap); bgd.bg_free_inodes_count_lo--; ext4_write_bgd(fs, g, &bgd);
+        bitmap[i / 8] |= (1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
+        kfree(bitmap); bgd.bg_free_inodes_count_lo--; ext4_write_bgd_tx(fs, g, &bgd, h);
         fs->sb.s_free_inodes_count--; ext4_write_superblock(fs);
         u32 inode_num = g * fs->inodes_per_group + i + 1;
-        struct ext2_inode ni; memset(&ni, 0, sizeof(ni)); ext4_write_inode(fs, inode_num, &ni);
+        struct ext2_inode ni; memset(&ni, 0, sizeof(ni)); ext4_write_inode_tx(fs, h, inode_num, &ni);
         return inode_num;
       }
     }
@@ -215,26 +215,38 @@ static u32 ext4_alloc_inode(struct ext4_fs *fs) {
   return 0;
 }
 
-static void ext4_free_block(struct ext4_fs *fs, u32 block_num) {
+static u32 ext4_alloc_inode(struct ext4_fs *fs) {
+  return ext4_alloc_inode_tx(fs, 0);
+}
+
+static void ext4_free_block_tx(struct ext4_fs *fs, u32 block_num, struct journal_handle *h) {
   if (block_num == 0) return;
   u32 g = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) / fs->sb.s_blocks_per_group;
   u32 i = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) % fs->sb.s_blocks_per_group;
   struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd);
   u8 *bitmap = kmalloc(fs->block_size); ext4_read_block(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
-  bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write(fs, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
-  kfree(bitmap); bgd.bg_free_blocks_count_lo++; ext4_write_bgd(fs, g, &bgd);
+  bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
+  kfree(bitmap); bgd.bg_free_blocks_count_lo++; ext4_write_bgd_tx(fs, g, &bgd, h);
   fs->sb.s_free_blocks_count++; ext4_write_superblock(fs);
 }
 
-static void ext4_free_inode(struct ext4_fs *fs, u32 inode_num) {
+static void ext4_free_block(struct ext4_fs *fs, u32 block_num) {
+  ext4_free_block_tx(fs, block_num, 0);
+}
+
+static void ext4_free_inode_tx(struct ext4_fs *fs, u32 inode_num, struct journal_handle *h) {
   if (inode_num == 0) return;
   u32 g = (inode_num - 1) / fs->inodes_per_group;
   u32 i = (inode_num - 1) % fs->inodes_per_group;
   struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd);
   u8 *bitmap = kmalloc(fs->block_size); ext4_read_block(fs, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
-  bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write(fs, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
-  kfree(bitmap); bgd.bg_free_inodes_count_lo++; ext4_write_bgd(fs, g, &bgd);
+  bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
+  kfree(bitmap); bgd.bg_free_inodes_count_lo++; ext4_write_bgd_tx(fs, g, &bgd, h);
   fs->sb.s_free_inodes_count++; ext4_write_superblock(fs);
+}
+
+static void ext4_free_inode(struct ext4_fs *fs, u32 inode_num) {
+  ext4_free_inode_tx(fs, inode_num, 0);
 }
 
 static u32 ext4_extent_lookup(struct ext4_fs *fs, struct ext2_inode *inode, u32 logical_block) {
@@ -328,7 +340,16 @@ static isize ext4_vfs_read(struct vfs_node *node, u64 offset, char *buffer, usiz
         else memset(buffer + done, 0, chunk);
         done += chunk;
     }
-    kfree(block_buf); return done;
+    kfree(block_buf);
+    if (done > 0) {
+        node->inode->atime = vfs_get_unix_time();
+        struct ext2_inode inode_to_update;
+        if (ext4_read_inode(fs, info->inode_num, &inode_to_update) == 0) {
+            inode_to_update.i_atime = node->inode->atime;
+            ext4_write_inode(fs, info->inode_num, &inode_to_update);
+        }
+    }
+    return (isize)done;
 }
 
 static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffer, usize size, int flags) {
@@ -354,10 +375,28 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
         memcpy(block_buf + b_off, buffer + done, chunk); ext4_journal_write(fs, phys, block_buf);
         done += chunk;
     }
-    kfree(block_buf); return done;
+    kfree(block_buf);
+    if (done > 0) {
+        node->inode->mtime = vfs_get_unix_time();
+        node->inode->ctime = vfs_get_unix_time();
+        if (offset + done > ext4_get_inode_size(fs, &inode)) {
+            node->inode->size = (usize)(offset + done);
+        }
+        struct ext2_inode inode_to_update;
+        if (ext4_read_inode(fs, info->inode_num, &inode_to_update) == 0) {
+            inode_to_update.i_mtime = node->inode->mtime;
+            inode_to_update.i_ctime = node->inode->ctime;
+            inode_to_update.i_size = (u32)node->inode->size;
+            if (fs->features_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) {
+                inode_to_update.i_dir_acl = (u32)(node->inode->size >> 32);
+            }
+            ext4_write_inode(fs, info->inode_num, &inode_to_update);
+        }
+    }
+    return (isize)done;
 }
 
-static int ext4_add_dir_entry(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type) {
+static int ext4_add_dir_entry_tx(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type, struct journal_handle *h) {
     struct ext2_inode dir; if (ext4_read_inode(fs, dir_ino, &dir) < 0) return -1;
     usize name_len = strlen(name); if (name_len > 255) name_len = 255;
     u32 needed = 8 + ((name_len + 3) & ~3);
@@ -373,24 +412,28 @@ static int ext4_add_dir_entry(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, co
                 e->rec_len = actual;
                 struct ext2_dir_entry *ne = (struct ext2_dir_entry *)(buf + off + actual);
                 ne->inode = child_ino; ne->rec_len = e->rec_len - actual; ne->name_len = name_len; ne->file_type = type;
-                memcpy(ne->name, name, name_len); ext4_journal_write(fs, phys, buf);
+                memcpy(ne->name, name, name_len); ext4_journal_write_tx(fs, h, phys, buf);
                 kfree(buf); return 0;
             }
             off += e->rec_len;
         }
     }
-    u32 phys = ext4_alloc_block(fs);
+    u32 phys = ext4_alloc_block_tx(fs, h);
     if (phys) {
         ext4_set_block(&dir, blocks, phys);
         dir.i_blocks += fs->block_size / 512; dir.i_size += fs->block_size;
-        ext4_write_inode(fs, dir_ino, &dir);
+        ext4_write_inode_tx(fs, h, dir_ino, &dir);
         memset(buf, 0, fs->block_size);
         struct ext2_dir_entry *e = (struct ext2_dir_entry *)buf;
         e->inode = child_ino; e->rec_len = fs->block_size; e->name_len = name_len; e->file_type = type;
-        memcpy(e->name, name, name_len); ext4_journal_write(fs, phys, buf);
+        memcpy(e->name, name, name_len); ext4_journal_write_tx(fs, h, phys, buf);
         kfree(buf); return 0;
     }
     kfree(buf); return -1;
+}
+
+static int ext4_add_dir_entry(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type) {
+    return ext4_add_dir_entry_tx(fs, dir_ino, child_ino, name, type, 0);
 }
 
 static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32 mode);
@@ -423,132 +466,301 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
     kfree(dir_buf); return (isize)count;
 }
 
+static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *full_path, u32 mode) {
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  u32 new_ino = ext4_alloc_inode_tx(fs, h);
+  if (!new_ino) {
+    if (h) journal_abort_transaction(h);
+    return -ENOSPC;
+  }
+  struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
+  inode.i_mode = EXT2_S_IFREG | (mode & 0777); inode.i_links_count = 1;
+  inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+  struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
+  eh->eh_magic = EXT4_EXTENT_MAGIC; eh->eh_entries = 0; eh->eh_max = 4; eh->eh_depth = 0; eh->eh_generation = 0;
+  inode.i_flags |= EXT4_EXTENTS_FL;
+
+  if (ext4_write_inode_tx(fs, h, new_ino, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, new_ino, name, EXT2_FT_REG_FILE, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (h) journal_commit_transaction(h);
+  struct vfs_node *n = vfs_add_node(full_path, VFS_FILE, 0, 0, 0);
+  if (n) ext4_setup_node(n, fs, new_ino, inode.i_mode);
+  return 0;
+}
+
 static int ext4_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
-    struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
-    struct ext4_fs *fs = dir_info->fs; u32 new_ino = ext4_alloc_inode(fs); if (!new_ino) return -ENOSPC;
-    struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
-    inode.i_mode = EXT2_S_IFDIR | (mode & 0777); inode.i_links_count = 2;
-    inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
-    ext4_write_inode(fs, new_ino, &inode);
-    if (ext4_add_dir_entry(fs, dir_info->inode_num, new_ino, name, EXT2_FT_DIR) < 0) return -EIO;
-    ext4_add_dir_entry(fs, new_ino, new_ino, ".", EXT2_FT_DIR);
-    ext4_add_dir_entry(fs, new_ino, dir_info->inode_num, "..", EXT2_FT_DIR);
-    struct ext2_inode di; if (ext4_read_inode(fs, dir_info->inode_num, &di) == 0) { di.i_links_count++; ext4_write_inode(fs, dir_info->inode_num, &di); }
-    return 0;
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  u32 new_ino = ext4_alloc_inode_tx(fs, h);
+  if (!new_ino) {
+    if (h) journal_abort_transaction(h);
+    return -ENOSPC;
+  }
+  struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
+  inode.i_mode = EXT2_S_IFDIR | (mode & 0777); inode.i_links_count = 2;
+  inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+  if (ext4_write_inode_tx(fs, h, new_ino, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, new_ino, name, EXT2_FT_DIR, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_add_dir_entry_tx(fs, new_ino, new_ino, ".", EXT2_FT_DIR, h) < 0 ||
+      ext4_add_dir_entry_tx(fs, new_ino, dir_info->inode_num, "..", EXT2_FT_DIR, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  struct ext2_inode di;
+  if (ext4_read_inode(fs, dir_info->inode_num, &di) == 0) {
+    di.i_links_count++;
+    ext4_write_inode_tx(fs, h, dir_info->inode_num, &di);
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
+}
+
+static int ext4_vfs_unlink_tx(struct vfs_node *dir, const char *name, struct journal_handle *h) {
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs; struct ext2_inode di;
+  if (ext4_read_inode(fs, dir_info->inode_num, &di) < 0) return -EIO;
+  u32 ino = 0; u32 target_phys = 0; usize target_off = 0; usize prev_off = (usize)-1;
+  u8 *buf = kmalloc(fs->block_size);
+  u32 blocks = (di.i_size + fs->block_size - 1) / fs->block_size;
+  for (u32 b = 0; b < blocks; b++) {
+    u32 phys = ext4_get_block(fs, &di, b); if (!phys) continue;
+    ext4_read_block(fs, phys, buf); usize off = 0; usize local_prev = (usize)-1;
+    while (off < fs->block_size) {
+      struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
+      if (e->rec_len == 0) break;
+      if (e->inode != 0 && strlen(name) == e->name_len && memcmp(e->name, name, e->name_len) == 0) {
+        ino = e->inode; target_phys = phys; target_off = off; prev_off = local_prev; break;
+      }
+      local_prev = off;
+      off += e->rec_len;
+    }
+    if (ino) break;
+  }
+  kfree(buf); if (!ino) return -ENOENT;
+
+  buf = kmalloc(fs->block_size);
+  ext4_read_block(fs, target_phys, buf);
+
+  struct ext2_inode ci;
+  if (ext4_read_inode(fs, ino, &ci) == 0) {
+    if (ci.i_links_count > 0)
+      ci.i_links_count--;
+    ci.i_ctime = vfs_get_unix_time();
+    if (ext4_write_inode_tx(fs, h, ino, &ci) < 0) {
+      kfree(buf);
+      return -EIO;
+    }
+  }
+
+  struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(buf + target_off);
+  if (prev_off != (usize)-1) {
+    struct ext2_dir_entry *prev = (struct ext2_dir_entry *)(buf + prev_off);
+    prev->rec_len += entry->rec_len;
+  } else {
+    entry->inode = 0;
+  }
+  if (ext4_journal_write_tx(fs, h, target_phys, buf) < 0) {
+    kfree(buf);
+    return -EIO;
+  }
+
+  di.i_mtime = di.i_ctime = vfs_get_unix_time();
+  if (ext4_write_inode_tx(fs, h, dir_info->inode_num, &di) < 0) {
+    kfree(buf);
+    return -EIO;
+  }
+  kfree(buf);
+  return 0;
 }
 
 static int ext4_vfs_unlink(struct vfs_node *dir, const char *name) {
-    struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
-    struct ext4_fs *fs = dir_info->fs; struct ext2_inode di;
-    if (ext4_read_inode(fs, dir_info->inode_num, &di) < 0) return -EIO;
-
-    u32 ino = 0, target_phys = 0; usize target_off = 0, prev_off = (usize)-1;
-    u8 *buf = kmalloc(fs->block_size);
-    u32 blocks = (di.i_size + fs->block_size - 1) / fs->block_size;
-    for (u32 b = 0; b < blocks; b++) {
-        u32 phys = ext4_get_block(fs, &di, b); if (!phys) continue;
-        ext4_read_block(fs, phys, buf); usize off = 0, local_prev = (usize)-1;
-        while (off < fs->block_size) {
-            struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-            if (e->rec_len == 0) break;
-            if (e->inode != 0 && strlen(name) == e->name_len &&
-                memcmp(e->name, name, e->name_len) == 0) {
-                ino = e->inode; target_phys = phys; target_off = off; prev_off = local_prev; break;
-            }
-            local_prev = off;
-            off += e->rec_len;
-        }
-        if (ino) break;
-    }
-    kfree(buf);
-    if (!ino) return -ENOENT;
-
-    struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
-    buf = kmalloc(fs->block_size);
-    ext4_read_block(fs, target_phys, buf);
-
-    struct ext2_inode ci;
-    if (ext4_read_inode(fs, ino, &ci) == 0) {
-        if (ci.i_links_count > 0) ci.i_links_count--;
-        ci.i_ctime = vfs_get_unix_time();
-        if (ext4_write_inode_tx(fs, h, ino, &ci) < 0) {
-            if (h) journal_abort_transaction(h);
-            kfree(buf);
-            return -EIO;
-        }
-    }
-
-    struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(buf + target_off);
-    if (prev_off != (usize)-1) {
-        struct ext2_dir_entry *prev = (struct ext2_dir_entry *)(buf + prev_off);
-        prev->rec_len += entry->rec_len;
-    } else {
-        entry->inode = 0;
-    }
-    if (ext4_journal_write_tx(fs, h, target_phys, buf) < 0) {
-        if (h) journal_abort_transaction(h);
-        kfree(buf);
-        return -EIO;
-    }
-
-    di.i_mtime = di.i_ctime = vfs_get_unix_time();
-    if (ext4_write_inode_tx(fs, h, dir_info->inode_num, &di) < 0) {
-        if (h) journal_abort_transaction(h);
-        kfree(buf);
-        return -EIO;
-    }
-    if (h) journal_commit_transaction(h);
-    kfree(buf);
-    return 0;
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  int err = ext4_vfs_unlink_tx(dir, name, h);
+  if (err < 0) {
+    if (h) journal_abort_transaction(h);
+    return err;
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
 }
 
 static int ext4_vfs_rmdir(struct vfs_node *dir, const char *name) {
-    int err = ext4_vfs_unlink(dir, name);
-    if (err == 0) {
-        struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
-        struct ext4_fs *fs = dir_info->fs; struct ext2_inode di;
-        if (ext4_read_inode(fs, dir_info->inode_num, &di) == 0) {
-            if (di.i_links_count > 2) di.i_links_count--;
-            di.i_mtime = di.i_ctime = vfs_get_unix_time();
-            ext4_write_inode(fs, dir_info->inode_num, &di);
-        }
-    }
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  int err = ext4_vfs_unlink_tx(dir, name, h);
+  if (err < 0) {
+    if (h) journal_abort_transaction(h);
     return err;
+  }
+  struct ext2_inode di;
+  if (ext4_read_inode(fs, dir_info->inode_num, &di) == 0) {
+    if (di.i_links_count > 2)
+      di.i_links_count--;
+    di.i_mtime = di.i_ctime = vfs_get_unix_time();
+    ext4_write_inode_tx(fs, h, dir_info->inode_num, &di);
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
 }
 
 static int ext4_vfs_rename(struct vfs_node *old_dir, const char *old_name,
                            struct vfs_node *new_dir, const char *new_name) {
-    struct ext4_inode_info *old_dir_info = (struct ext4_inode_info *)old_dir->inode->data;
-    struct ext4_fs *fs = old_dir_info->fs; struct ext2_inode old_di;
-    ext4_read_inode(fs, old_dir_info->inode_num, &old_di);
-    u32 ino = 0; u8 type = 0; u8 *buf = kmalloc(fs->block_size);
-    u32 blocks = (old_di.i_size + fs->block_size - 1) / fs->block_size;
-    for (u32 b = 0; b < blocks; b++) {
-        u32 phys = ext4_get_block(fs, &old_di, b); if (!phys) continue;
-        ext4_read_block(fs, phys, buf); usize off = 0;
-        while (off < fs->block_size) {
-            struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-            if (e->rec_len == 0) break;
-            if (e->inode != 0 && strlen(old_name) == e->name_len &&
-                memcmp(e->name, old_name, e->name_len) == 0) {
-                ino = e->inode; type = e->file_type; break;
-            }
-            off += e->rec_len;
-        }
-        if (ino) break;
+  struct ext4_inode_info *old_dir_info = (struct ext4_inode_info *)old_dir->inode->data;
+  struct ext4_fs *fs = old_dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  struct ext2_inode old_di;
+  if (ext4_read_inode(fs, old_dir_info->inode_num, &old_di) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  u32 ino = 0; u8 type = 0; u8 *buf = kmalloc(fs->block_size);
+  u32 blocks = (old_di.i_size + fs->block_size - 1) / fs->block_size;
+  for (u32 b = 0; b < blocks; b++) {
+    u32 phys = ext4_get_block(fs, &old_di, b); if (!phys) continue;
+    ext4_read_block(fs, phys, buf); usize off = 0;
+    while (off < fs->block_size) {
+      struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
+      if (e->rec_len == 0) break;
+      if (e->inode != 0 && strlen(old_name) == e->name_len && memcmp(e->name, old_name, e->name_len) == 0) {
+        ino = e->inode; type = e->file_type; break;
+      }
+      off += e->rec_len;
     }
-    kfree(buf);
-    if (!ino) return -ENOENT;
+    if (ino) break;
+  }
+  kfree(buf);
+  if (!ino) {
+    if (h) journal_abort_transaction(h);
+    return -ENOENT;
+  }
+  struct ext4_inode_info *new_dir_info = (struct ext4_inode_info *)new_dir->inode->data;
+  if (ext4_add_dir_entry_tx(fs, new_dir_info->inode_num, ino, new_name, type, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_vfs_unlink_tx(old_dir, old_name, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  struct ext2_inode moved;
+  if (ext4_read_inode(fs, ino, &moved) == 0) {
+    moved.i_ctime = vfs_get_unix_time();
+    ext4_write_inode_tx(fs, h, ino, &moved);
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
+}
 
-    struct ext4_inode_info *new_dir_info = (struct ext4_inode_info *)new_dir->inode->data;
-    if (ext4_add_dir_entry(fs, new_dir_info->inode_num, ino, new_name, type) < 0) return -EIO;
-    if (ext4_vfs_unlink(old_dir, old_name) < 0) return -EIO;
-    struct ext2_inode moved;
-    if (ext4_read_inode(fs, ino, &moved) == 0) {
-        moved.i_ctime = vfs_get_unix_time();
-        ext4_write_inode(fs, ino, &moved);
+static int ext4_vfs_symlink(struct vfs_node *dir, const char *name, const char *target) {
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  u32 new_ino = ext4_alloc_inode_tx(fs, h);
+  if (!new_ino) {
+    if (h) journal_abort_transaction(h);
+    return -ENOSPC;
+  }
+  struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
+  inode.i_mode = EXT2_S_IFLNK | 0777; inode.i_links_count = 1;
+  inode.i_size = strlen(target); inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+  if (inode.i_size < 60) memcpy(inode.i_block, target, inode.i_size);
+  else {
+    u32 block = ext4_alloc_block_tx(fs, h);
+    if (!block) {
+      ext4_free_inode_tx(fs, new_ino, h);
+      if (h) journal_abort_transaction(h);
+      return -ENOSPC;
     }
-    return 0;
+    inode.i_block[0] = block;
+    u8 *tmp_buf = kmalloc(fs->block_size);
+    memset(tmp_buf, 0, fs->block_size);
+    memcpy(tmp_buf, target, inode.i_size < fs->block_size ? inode.i_size : fs->block_size);
+    ext4_journal_write_tx(fs, h, block, tmp_buf);
+    kfree(tmp_buf);
+  }
+  if (ext4_write_inode_tx(fs, h, new_ino, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, new_ino, name, EXT2_FT_SYMLINK, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
+}
+
+static int ext4_vfs_link(struct vfs_node *target_node, struct vfs_node *dir, const char *name) {
+  struct ext4_inode_info *target_info = (struct ext4_inode_info *)target_node->inode->data;
+  struct ext4_fs *fs = target_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  struct ext2_inode inode;
+  if (ext4_read_inode(fs, target_info->inode_num, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  inode.i_links_count++;
+  if (ext4_write_inode_tx(fs, h, target_info->inode_num, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, target_info->inode_num, name, EXT2_FT_REG_FILE, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (h) journal_commit_transaction(h);
+  return 0;
+}
+
+static int ext4_vfs_setattr(struct vfs_node *node) {
+  struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+  struct ext4_fs *fs = info->fs; struct ext2_inode inode;
+  if (ext4_read_inode(fs, info->inode_num, &inode) < 0) return -EIO;
+  node->inode->ctime = vfs_get_unix_time();
+  inode.i_mode = (inode.i_mode & ~0777) | (node->inode->mode & 0777);
+  inode.i_uid = node->inode->uid; inode.i_gid = node->inode->gid;
+  inode.i_size = (u32)node->inode->size;
+  inode.i_atime = node->inode->atime; inode.i_mtime = node->inode->mtime; inode.i_ctime = node->inode->ctime;
+  if (fs->features_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) {
+    inode.i_dir_acl = (u32)(node->inode->size >> 32);
+  }
+  return ext4_write_inode(fs, info->inode_num, &inode);
+}
+
+static int ext4_vfs_statfs(struct vfs_node *node, struct b1nix_statfs *st) {
+  struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+  struct ext4_fs *fs = info->fs; memset(st, 0, sizeof(*st));
+  st->f_type = EXT2_SUPER_MAGIC; st->f_bsize = fs->block_size;
+  st->f_blocks = fs->sb.s_blocks_count; st->f_bfree = fs->sb.s_free_blocks_count;
+  st->f_bavail = fs->sb.s_free_blocks_count; st->f_files = fs->sb.s_inodes_count;
+  st->f_ffree = fs->sb.s_free_inodes_count; st->f_namelen = 255;
+  return 0;
+}
+
+static int ext4_vfs_fsync(struct vfs_node *node) {
+  if (node && node->inode && node->inode->blk_dev) {
+    blk_cache_flush(node->inode->blk_dev);
+  }
+  return 0;
 }
 
 static void ext4_vfs_release(struct vfs_node *node) {
@@ -568,11 +780,14 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
   ni->fs = fs; ni->inode_num = ino;
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext4_vfs_read; n->inode->write_cb = ext4_vfs_write;
-  n->inode->unlink_cb = ext4_vfs_unlink;
-  n->inode->release_cb = ext4_vfs_release;
+  n->inode->setattr_cb = ext4_vfs_setattr; n->inode->statfs_cb = ext4_vfs_statfs;
+  n->inode->unlink_cb = ext4_vfs_unlink; n->inode->release_cb = ext4_vfs_release;
+  n->inode->fsync_cb = ext4_vfs_fsync;
   if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR) {
-    n->inode->readdir_cb = ext4_vfs_readdir; n->inode->mkdir_cb = ext4_vfs_mkdir;
-    n->inode->rmdir_cb = ext4_vfs_rmdir; n->inode->rename_cb = ext4_vfs_rename;
+    n->inode->create_cb = ext4_vfs_create; n->inode->mkdir_cb = ext4_vfs_mkdir;
+    n->inode->readdir_cb = ext4_vfs_readdir; n->inode->rmdir_cb = ext4_vfs_rmdir;
+    n->inode->rename_cb = ext4_vfs_rename; n->inode->symlink_cb = ext4_vfs_symlink;
+    n->inode->link_cb = ext4_vfs_link;
   }
 }
 
@@ -627,9 +842,8 @@ static struct vfs_node *ext4_vfs_mount_cb(const char *source, u64 flags, void *d
         memcpy(&fs->journal_inum, sb_buf + EXT3_SB_JOURNAL_INUM_OFF, 4);
         if (fs->journal_inum != 0) {
             ext4_read_inode(fs, fs->journal_inum, &fs->journal_inode_cache);
-            fs->jdev = journal_mount(&fs->journal_inode_cache, fs->block_size, &ext4_jbd_ops);
+            fs->jdev = journal_mount(fs, fs->block_size, &ext4_jbd_ops);
             if (fs->jdev) {
-                fs->jdev->fs_priv = fs;
                 if (fs->sb.s_feature_incompat & EXT3_FEATURE_INCOMPAT_RECOVER) {
                     console_write("ext4: journal needs recovery\n");
                     if (journal_recover(fs->jdev) == 0) {

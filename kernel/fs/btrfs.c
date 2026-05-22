@@ -49,10 +49,19 @@ static struct vfs_node *btrfs_vfs_mount_cb(const char *source, u64 flags, void *
     kfree(sb_buf);
 
     console_write("btrfs: mounted, fsid=");
+    const char *digits = "0123456789abcdef";
     for (int i = 0; i < 16; i++) {
-        console_write_hex32(fs->sb.fsid[i]);
+        if (i == 4 || i == 6 || i == 8 || i == 10) {
+            console_putc('-');
+        }
+        console_putc(digits[(fs->sb.fsid[i] >> 4) & 0xf]);
+        console_putc(digits[fs->sb.fsid[i] & 0xf]);
     }
-    console_write("\n");
+    console_write(", label=\"");
+    for (int i = 0; i < 256 && fs->sb.label[i] != '\0'; i++) {
+        console_putc(fs->sb.label[i]);
+    }
+    console_write("\"\n");
 
     struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
     if (!root) {

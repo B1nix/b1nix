@@ -471,6 +471,14 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 	}
 	
 	kfree(block_buf);
+	if (bytes_read > 0) {
+		node->inode->atime = vfs_get_unix_time();
+		struct ext2_inode inode_to_update;
+		if (ext2_read_inode(fs, inode_num, &inode_to_update) == 0) {
+			inode_to_update.i_atime = node->inode->atime;
+			ext2_write_inode(fs, inode_num, &inode_to_update);
+		}
+	}
 	return bytes_read;
 }
 
@@ -517,11 +525,19 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
 	
 	kfree(block_buf);
 
-  /* Update the file size when appending past EOF. */
-  if (offset + bytes_written > inode.i_size) {
-    inode.i_size = (u32)(offset + bytes_written);
-    ext2_write_inode(fs, inode_num, &inode);
-    node->inode->size = inode.i_size;
+  if (bytes_written > 0) {
+    node->inode->mtime = vfs_get_unix_time();
+    node->inode->ctime = vfs_get_unix_time();
+    if (offset + bytes_written > inode.i_size) {
+      node->inode->size = (usize)(offset + bytes_written);
+    }
+    struct ext2_inode inode_to_update;
+    if (ext2_read_inode(fs, inode_num, &inode_to_update) == 0) {
+      inode_to_update.i_mtime = node->inode->mtime;
+      inode_to_update.i_ctime = node->inode->ctime;
+      inode_to_update.i_size = (u32)node->inode->size;
+      ext2_write_inode(fs, inode_num, &inode_to_update);
+    }
   }
 
 	return bytes_written;
@@ -802,6 +818,7 @@ static int ext2_vfs_setattr(struct vfs_node *node) {
   struct ext2_inode inode;
   if (ext2_read_inode(fs, inode_num, &inode) < 0) return -EIO;
   
+  node->inode->ctime = vfs_get_unix_time();
   inode.i_mode = (inode.i_mode & ~0777) | (node->inode->mode & 0777);
   inode.i_uid = node->inode->uid;
   inode.i_gid = node->inode->gid;
