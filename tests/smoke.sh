@@ -45,6 +45,11 @@ run_qemu() {
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 			-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+			-device ich9-ahci,id=ahci \
+			-drive file="$PROJECT_DIR/sata.img",if=none,id=satadrive,format=raw \
+			-device ide-hd,drive=satadrive,bus=ahci.0 \
+			-drive file="$PROJECT_DIR/nvme.img",if=none,id=nvmedrive,format=raw \
+			-device nvme,serial=deadbeef,drive=nvmedrive \
 			>"$log" 2>&1 &
 		pid=$!
 		
@@ -90,6 +95,10 @@ make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1 || {
 	exit 1
 }
 pass "kernel builds without errors"
+
+# Create dummy images for SATA and NVMe tests
+dd if=/dev/zero of="$PROJECT_DIR/sata.img" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$PROJECT_DIR/nvme.img" bs=1M count=4 2>/dev/null
 
 # ── Test 1: Kernel boots ──
 echo ""
@@ -183,6 +192,8 @@ else
 	skip "ARP reply path exercised" "no ARP reply observed in this run"
 fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
+check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
+check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 
 # ── Network tests (x86 only) ──
 if [ "$ARCH" = "x86" ]; then
@@ -207,6 +218,9 @@ echo "  Passed:  $PASSED"
 echo "  Failed:  $FAILED"
 echo "  Skipped: $SKIPPED"
 echo ""
+
+# Clean up SATA and NVMe dummy images
+rm -f "$PROJECT_DIR/sata.img" "$PROJECT_DIR/nvme.img"
 
 if [ "$FAILED" -gt 0 ]; then
 	exit 1

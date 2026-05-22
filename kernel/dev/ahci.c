@@ -32,9 +32,7 @@ static struct ahci_port_state ports[AHCI_MAX_PORTS];
 
 static u64 ahci_pci_bar5 = 0;
 
-static u64 align_up_u64(u64 value, u64 alignment) {
-  return (value + alignment - 1) & ~(alignment - 1);
-}
+
 
 static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
                           void *buffer) {
@@ -63,10 +61,11 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   // Setup PRD
   struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
   memset(prdt, 0, sizeof(struct ahci_prdt_entry));
-  prdt->dba = (u32)((u64)(usize)buffer & 0xFFFFFFFF);
-  prdt->dbau = (u32)(((u64)(usize)buffer >> 32) & 0xFFFFFFFF);
+  u64 phys_buf = vmm_virt_to_phys(buffer);
+  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
+  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
   prdt->dbc = (count * 512 - 1) |
-              (1 << 31); // byte count, I=1 (interrupt on completion)
+              (1ULL << 31); // byte count, I=1 (interrupt on completion)
 
   // Setup FIS
   memset(cmd_table->cfis, 0, 64);
@@ -144,9 +143,10 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
 
   struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
   memset(prdt, 0, sizeof(struct ahci_prdt_entry));
-  prdt->dba = (u32)((u64)(usize)buffer & 0xFFFFFFFF);
-  prdt->dbau = (u32)(((u64)(usize)buffer >> 32) & 0xFFFFFFFF);
-  prdt->dbc = (count * 512 - 1) | (1 << 31);
+  u64 phys_buf = vmm_virt_to_phys((void *)buffer);
+  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
+  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
+  prdt->dbc = (count * 512 - 1) | (1ULL << 31);
 
   memset(cmd_table->cfis, 0, 64);
   struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
@@ -243,19 +243,19 @@ static void ahci_port_init(struct ahci_port_state *port,
 
   // Allocate command list (1K aligned)
   port->phys_cmd_list = pmm_alloc_frames(1);
-  port->cmd_list = (struct ahci_cmd_header *)(usize)port->phys_cmd_list;
-  memset((void *)(usize)port->phys_cmd_list, 0, PAGE_SIZE);
+  port->cmd_list = (struct ahci_cmd_header *)(usize)(port->phys_cmd_list + vmm_direct_map_base());
+  memset(port->cmd_list, 0, PAGE_SIZE);
 
   // Allocate FIS receive area (256 bytes, must be 256-byte aligned, but page is
   // fine)
   port->phys_fis = pmm_alloc_frames(1);
-  port->fis_base = (u8 *)(usize)port->phys_fis;
-  memset((void *)(usize)port->phys_fis, 0, PAGE_SIZE);
+  port->fis_base = (u8 *)(usize)(port->phys_fis + vmm_direct_map_base());
+  memset(port->fis_base, 0, PAGE_SIZE);
 
   // Allocate command table (must be 128-byte aligned)
   port->phys_cmd_table = pmm_alloc_frames(2); // 2 pages for read + write tables
-  port->cmd_table = (struct ahci_cmd_table *)(usize)port->phys_cmd_table;
-  memset((void *)(usize)port->phys_cmd_table, 0, 2 * PAGE_SIZE);
+  port->cmd_table = (struct ahci_cmd_table *)(usize)(port->phys_cmd_table + vmm_direct_map_base());
+  memset(port->cmd_table, 0, 2 * PAGE_SIZE);
 
   // Point to command list (phys addr needs to be in specific format)
   p->clb = (u32)(port->phys_cmd_list & 0xFFFFFFFF);
@@ -286,59 +286,76 @@ static void ahci_port_init(struct ahci_port_state *port,
   console_write(" ready\n");
 }
 
+static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
+  if (!port->present)
+    return -1;
+
+  volatile struct ahci_port *p = &port->abar->ports[port->port_num];
+  struct ahci_cmd_header *cmd_hdr = &port->cmd_list[0];
+  struct ahci_cmd_table *cmd_table = port->cmd_table;
+
+  int timeout = 1000000;
+  while ((p->cmd & AHCI_PxCMD_CR) && timeout > 0) {
+    __asm__ volatile("pause");
+    timeout--;
+  }
+  if (timeout == 0)
+    return -1;
+
+  memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
+  cmd_hdr->write = 0;
+  cmd_hdr->prdtl = 1;
+
+  struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
+  memset(prdt, 0, sizeof(struct ahci_prdt_entry));
+  u64 phys_buf = vmm_virt_to_phys(identify_buf);
+  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
+  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
+  prdt->dbc = (512 - 1) | (1ULL << 31);
+
+  memset(cmd_table->cfis, 0, 64);
+  struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
+  fis->fis_type = FIS_TYPE_REG_H2D;
+  fis->c = 1;
+  fis->command = ATA_CMD_IDENTIFY;
+  fis->device = 0;
+
+  p->serr = p->serr;
+  p->ci = 1;
+
+  timeout = 10000000;
+  while ((p->ci & 1) && timeout > 0) {
+    scheduler_yield();
+    timeout--;
+  }
+  if (timeout == 0) {
+    return -1;
+  }
+
+  u32 tfd = p->tfd;
+  if (tfd & 0x01) {
+    return -1;
+  }
+  return 0;
+}
+
 void ahci_init(void) {
   struct pci_device_info pci;
-  if (!pci_find_device(0x8086, 0xFFFF, &pci)) {
-    // Try finding by class code instead
-    int found = 0;
-    for (u16 bus = 0; bus < 256 && !found; bus++) {
-      for (u8 slot = 0; slot < 32 && !found; slot++) {
-        u16 vendor = pci_config_read16((u8)bus, slot, 0, 0);
-        if (vendor == 0xFFFF)
-          continue;
-
-        u8 class = pci_config_read8((u8)bus, slot, 0, 0x0B);
-        u8 subclass = pci_config_read8((u8)bus, slot, 0, 0x0A);
-        u8 prog_if = pci_config_read8((u8)bus, slot, 0, 0x09);
-
-        if (class == AHCI_PCI_CLASS && subclass == AHCI_PCI_SUBCLASS) {
-          pci.bus = (u8)bus;
-          pci.slot = slot;
-          pci.func = 0;
-          pci.vendor_id = vendor;
-          pci.device_id = pci_config_read16((u8)bus, slot, 0, 2);
-          pci.class_code = class;
-          pci.subclass = subclass;
-          pci.prog_if = prog_if;
-          found = 1;
-        }
+  int found = pci_find_class(AHCI_PCI_CLASS, AHCI_PCI_SUBCLASS, 0, &pci);
+  if (!found) {
+    // Check for generic mass storage class
+    for (int i = 0; i < 8; i++) {
+      if (pci_find_class(0x01, i, 0, &pci)) {
+        found = 1;
+        break;
       }
     }
-    if (!found) {
-      // Check for Mass Storage Controller (class 0x01) with any subclass
-      for (u16 bus = 0; bus < 256 && !found; bus++) {
-        for (u8 slot = 0; slot < 32 && !found; slot++) {
-          u8 class = pci_config_read8((u8)bus, slot, 0, 0x0B);
-          if (class == 0x01) {
-            pci.bus = (u8)bus;
-            pci.slot = slot;
-            pci.func = 0;
-            pci.vendor_id = pci_config_read16((u8)bus, slot, 0, 0);
-            if (pci.vendor_id == 0xFFFF)
-              continue;
-            pci.device_id = pci_config_read16((u8)bus, slot, 0, 2);
-            pci.class_code = class;
-            pci.subclass = pci_config_read8((u8)bus, slot, 0, 0x0A);
-            pci.prog_if = pci_config_read8((u8)bus, slot, 0, 0x09);
-            found = 1;
-          }
-        }
-      }
-    }
-    if (!found) {
-      console_write("ahci: no SATA controller found\n");
-      return;
-    }
+  }
+
+  if (!found) {
+    console_write("ahci: no SATA controller found\n");
+    return;
   }
 
   console_write("ahci: found controller v=0x");
@@ -433,7 +450,27 @@ void ahci_init(void) {
 
         dev->name = persistent_name;
         dev->block_size = 512;
-        dev->block_count = 0; // Could read identify data for size
+        dev->block_count = 0;
+
+        u16 *identify_buf = kzalloc(512);
+        if (identify_buf) {
+          if (ahci_port_identify(&ports[i], identify_buf) == 0) {
+            u64 sectors = 0;
+            // Check if LBA48 is supported: word 83 bit 10 is 1
+            if (identify_buf[83] & (1 << 10)) {
+              sectors = ((u64)identify_buf[100]) |
+                        ((u64)identify_buf[101] << 16) |
+                        ((u64)identify_buf[102] << 32) |
+                        ((u64)identify_buf[103] << 48);
+            } else {
+              sectors = ((u64)identify_buf[60]) |
+                        ((u64)identify_buf[61] << 16);
+            }
+            dev->block_count = sectors;
+          }
+          kfree(identify_buf);
+        }
+
         dev->read_blocks = ahci_blk_read;
         dev->write_blocks = ahci_blk_write;
         dev->priv = &ports[i];

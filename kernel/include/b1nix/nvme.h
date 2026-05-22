@@ -148,7 +148,7 @@ struct nvme_identify_ctrl {
     u16  mntmt;
     u16  mxtmt;
     u32  sanicap;
-    u8   rsv1[180];
+    u8   rsv1[168];
     u8   sqes;
     u8   cqes;
     u16  maxcmd;
@@ -160,10 +160,12 @@ struct nvme_identify_ctrl {
     u16  awun;
     u16  awupf;
     u8   nvscc;
-    u8   rsv2[151];
+    u8   rsv2;
     u16  acwu;
-    u8   rsv3[246];
+    u8   rsv3[170];
+    u8   vs[1344];
     struct nvme_power_state_desc psd[32];
+    u8   vs2[1024];
 } __attribute__((packed));
 
 struct nvme_identify_ns {
@@ -179,7 +181,7 @@ struct nvme_identify_ns {
     u8   nmic;
     u8   rescap;
     u8   fpi;
-    u8   rsv0;
+    u8   dlfeat;
     u16  nawun;
     u16  nawupf;
     u16  nacwu;
@@ -193,15 +195,19 @@ struct nvme_identify_ns {
     u16  npdg;
     u16  npda;
     u16  nows;
-    u8   rsv1[14];
+    u8   rsvd74[18];
     u32  anagrpid;
-    u8   rsv2[4];
+    u8   rsvd96[3];
+    u8   nsattr;
+    u16  nvmsetid;
+    u16  endgid;
+    u8   nguid[16];
+    u8   eui64[8];
     struct {
         u16  ms;
-        u16  ds;
+        u8   ds;
         u8   rp;
-    } __attribute__((packed)) lbaf[16];
-    u8   rsv3[192];
+    } __attribute__((packed)) lbaf[64];
     u8   vs[3712];
 } __attribute__((packed));
 

@@ -5,7 +5,7 @@
 #include <b1nix/pci.h>
 #include <string.h>
 
-#define NVME_MAX_QUEUE_SIZE 256
+#define NVME_MAX_QUEUE_SIZE 64
 #define NVME_PAGE_SIZE 4096
 
 // NVMe device state
@@ -43,10 +43,7 @@ struct nvme_device {
 
 static struct nvme_device nvme;
 
-static u64 align_up_u64(u64 val, u64 alignment)
-{
-    return (val + alignment - 1) & ~(alignment - 1);
-}
+
 
 static int nvme_wait_ready(volatile struct nvme_registers *regs, int ready)
 {
@@ -80,15 +77,16 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         
         // Check if there's a completion
         struct nvme_cqe *cqe = &dev->admin_cq[cq_head];
-        if (cqe->cdw0 || cqe->status != 0xFFFF) {
+        if (cqe->status != 0xFFFF) {
             u16 status = cqe->status;
+            cqe->status = 0xFFFF; // Reset status on consume
             
             // Update head
             cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
             dev->admin_cq_head = cq_head;
             *cq_hdb = cq_head;
             
-            if (status & 0x1) { // Phase tag mismatch or error
+            if ((status & 0xFFFE) != 0) { // Check bits 15:1 for error (bit 0 is Phase Tag)
                 console_write("nvme: admin cmd error status=0x");
                 console_write_hex32(status);
                 console_write("\n");
@@ -104,14 +102,14 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     return -1;
 }
 
-static int nvme_identify(struct nvme_device *dev, u8 cns, u32 nsid)
+static int nvme_identify(struct nvme_device *dev, u8 cns, u32 nsid, u64 phys_buf)
 {
     struct nvme_sqe sqe;
     memset(&sqe, 0, sizeof(sqe));
     
     sqe.cdw0 = NVME_CMD_ADMIN_IDENTIFY | (0 << 16); // opcode | fuse
     sqe.nsid = nsid;
-    sqe.prp1 = dev->phys_identify_buf;
+    sqe.prp1 = phys_buf;
     sqe.cdw10 = cns; // CNS
     
     return nvme_admin_submit(dev, &sqe);
@@ -125,9 +123,10 @@ static int nvme_create_io_cq(struct nvme_device *dev)
     sqe.cdw0 = NVME_CMD_ADMIN_CREATE_CQ | (0 << 16);
     sqe.prp1 = dev->phys_io_cq;
     
-    // QID | QSIZE | PC | IEN | IV
-    sqe.cdw10 = (1 << 16) | (NVME_MAX_QUEUE_SIZE - 1) | (1 << 0); // QID=1, QSIZE, PC=1
-    sqe.cdw11 = 0; // IRQ vector
+    // CDW10: QSIZE (bits 31:16) | QID (bits 15:0)
+    sqe.cdw10 = ((NVME_MAX_QUEUE_SIZE - 1) << 16) | 1;
+    // CDW11: IEN (bit 1) | PC (bit 0)
+    sqe.cdw11 = (1 << 0); // PC = 1
     
     return nvme_admin_submit(dev, &sqe);
 }
@@ -140,8 +139,10 @@ static int nvme_create_io_sq(struct nvme_device *dev)
     sqe.cdw0 = NVME_CMD_ADMIN_CREATE_SQ | (0 << 16);
     sqe.prp1 = dev->phys_io_sq;
     
-    sqe.cdw10 = (1 << 16) | (NVME_MAX_QUEUE_SIZE - 1) | (1 << 0); // QID=1, QSIZE, PC=1
-    sqe.cdw11 = (1 << 0); // CQID=1
+    // CDW10: QSIZE (bits 31:16) | QID (bits 15:0)
+    sqe.cdw10 = ((NVME_MAX_QUEUE_SIZE - 1) << 16) | 1;
+    // CDW11: CQID (bits 31:16) | PC (bit 0)
+    sqe.cdw11 = (1 << 16) | (1 << 0); // CQID = 1, PC = 1
     
     return nvme_admin_submit(dev, &sqe);
 }
@@ -164,14 +165,18 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         u16 cq_head = dev->io_cq_head;
         
         struct nvme_cqe *cqe = &dev->io_cq[cq_head];
-        if (cqe->cdw0 || cqe->status != 0xFFFF) {
+        if (cqe->status != 0xFFFF) {
             u16 status = cqe->status;
+            cqe->status = 0xFFFF; // Reset status on consume
             
             cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
             dev->io_cq_head = cq_head;
             *cq_hdb = cq_head;
             
-            if (status & 0x1) {
+            if ((status & 0xFFFE) != 0) {
+                console_write("nvme: io cmd error status=0x");
+                console_write_hex32(status);
+                console_write("\n");
                 return -1;
             }
             return 0;
@@ -183,42 +188,63 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     return -1;
 }
 
+static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *buffer, int is_write)
+{
+    struct nvme_sqe sqe;
+    memset(&sqe, 0, sizeof(sqe));
+    
+    sqe.cdw0 = (is_write ? NVME_CMD_IO_WRITE : NVME_CMD_IO_READ) | (0 << 16);
+    sqe.nsid = 1;
+    
+    u64 phys_addr = vmm_virt_to_phys(buffer);
+    sqe.prp1 = phys_addr;
+    
+    u64 offset = phys_addr & (NVME_PAGE_SIZE - 1);
+    u64 bytes_to_transfer = (u64)count * 512;
+    u64 prp_list_phys = 0;
+    
+    if (offset + bytes_to_transfer <= NVME_PAGE_SIZE) {
+        sqe.prp2 = 0;
+    } else {
+        u64 rem_bytes = bytes_to_transfer - (NVME_PAGE_SIZE - offset);
+        if (rem_bytes <= NVME_PAGE_SIZE) {
+            sqe.prp2 = vmm_virt_to_phys((void *)((usize)buffer + (NVME_PAGE_SIZE - offset)));
+        } else {
+            int num_pages = (offset + bytes_to_transfer + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE;
+            prp_list_phys = pmm_alloc_frames(1);
+            u64 *prp_list = (u64 *)(usize)(prp_list_phys + vmm_direct_map_base());
+            memset(prp_list, 0, NVME_PAGE_SIZE);
+            for (int i = 1; i < num_pages; i++) {
+                u64 page_virt_addr = (usize)buffer + (NVME_PAGE_SIZE - offset) + (i - 1) * NVME_PAGE_SIZE;
+                prp_list[i - 1] = vmm_virt_to_phys((void *)page_virt_addr);
+            }
+            sqe.prp2 = prp_list_phys;
+        }
+    }
+    
+    sqe.cdw10 = (u32)(lba & 0xFFFFFFFF);
+    sqe.cdw11 = (u32)((lba >> 32) & 0xFFFFFFFF);
+    sqe.cdw12 = count - 1;
+    
+    int ret = nvme_io_submit(nd, &sqe);
+    if (prp_list_phys) {
+        pmm_free_frame(prp_list_phys);
+    }
+    return ret == 0 ? (int)count : -1;
+}
+
 static int nvme_blk_read(struct block_device *dev, u64 lba, u32 count, void *buffer)
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
     if (!nd) return -1;
-    
-    struct nvme_sqe sqe;
-    memset(&sqe, 0, sizeof(sqe));
-    
-    sqe.cdw0 = NVME_CMD_IO_READ | (0 << 16);
-    sqe.nsid = 1;
-    sqe.prp1 = (u64)(usize)buffer;
-    sqe.cdw10 = (u32)(lba & 0xFFFFFFFF);
-    sqe.cdw11 = (u32)((lba >> 32) & 0xFFFFFFFF);
-    sqe.cdw12 = count - 1; // Number of logical blocks - 1
-    sqe.cdw14 = 0;
-    sqe.cdw15 = 0;
-    
-    return nvme_io_submit(nd, &sqe) == 0 ? (int)count : -1;
+    return nvme_io_transfer(nd, lba, count, buffer, 0);
 }
 
 static int nvme_blk_write(struct block_device *dev, u64 lba, u32 count, const void *buffer)
 {
     struct nvme_device *nd = (struct nvme_device *)dev->priv;
     if (!nd) return -1;
-    
-    struct nvme_sqe sqe;
-    memset(&sqe, 0, sizeof(sqe));
-    
-    sqe.cdw0 = NVME_CMD_IO_WRITE | (0 << 16);
-    sqe.nsid = 1;
-    sqe.prp1 = (u64)(usize)buffer;
-    sqe.cdw10 = (u32)(lba & 0xFFFFFFFF);
-    sqe.cdw11 = (u32)((lba >> 32) & 0xFFFFFFFF);
-    sqe.cdw12 = count - 1;
-    
-    return nvme_io_submit(nd, &sqe) == 0 ? (int)count : -1;
+    return nvme_io_transfer(nd, lba, count, (void *)buffer, 1);
 }
 
 void nvme_init(void)
@@ -286,7 +312,6 @@ void nvme_init(void)
     // Read capabilities
     u64 cap = regs->cap;
     u32 to = (u32)((cap >> NVME_CAP_TO_SHIFT) & 0xFF);
-    u16 mps_min = (u16)((cap >> NVME_CAP_MPSMIN_SHIFT) & 0xF);
     
     console_write("nvme: cap=0x");
     console_write_hex64(cap);
@@ -307,30 +332,35 @@ void nvme_init(void)
     
     // Allocate admin submission queue (phys contiguous)
     nvme.phys_admin_sq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
-    nvme.admin_sq = (struct nvme_sqe *)(usize)nvme.phys_admin_sq;
+    nvme.admin_sq = (struct nvme_sqe *)(usize)(nvme.phys_admin_sq + vmm_direct_map_base());
     memset(nvme.admin_sq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe));
     
     // Allocate admin completion queue
     nvme.phys_admin_cq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
-    nvme.admin_cq = (struct nvme_cqe *)(usize)nvme.phys_admin_cq;
+    nvme.admin_cq = (struct nvme_cqe *)(usize)(nvme.phys_admin_cq + vmm_direct_map_base());
     memset(nvme.admin_cq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe));
     
     // Allocate I/O submission queue
     nvme.phys_io_sq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
-    nvme.io_sq = (struct nvme_sqe *)(usize)nvme.phys_io_sq;
+    nvme.io_sq = (struct nvme_sqe *)(usize)(nvme.phys_io_sq + vmm_direct_map_base());
     memset(nvme.io_sq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_sqe));
     
     // Allocate I/O completion queue
     nvme.phys_io_cq = pmm_alloc_frames((NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe) + NVME_PAGE_SIZE - 1) / NVME_PAGE_SIZE);
-    nvme.io_cq = (struct nvme_cqe *)(usize)nvme.phys_io_cq;
+    nvme.io_cq = (struct nvme_cqe *)(usize)(nvme.phys_io_cq + vmm_direct_map_base());
     memset(nvme.io_cq, 0, NVME_MAX_QUEUE_SIZE * sizeof(struct nvme_cqe));
     
     // Allocate identify buffer (phys contiguous, page aligned)
     // Need 2 pages: one for controller, one for namespace
     nvme.phys_identify_buf = pmm_alloc_frames(2);
-    nvme.identify_ctrl = (struct nvme_identify_ctrl *)(usize)nvme.phys_identify_buf;
-    nvme.identify_ns = (struct nvme_identify_ns *)(usize)(nvme.phys_identify_buf + NVME_PAGE_SIZE);
-    memset((void *)(usize)nvme.phys_identify_buf, 0, 2 * NVME_PAGE_SIZE);
+    nvme.identify_ctrl = (struct nvme_identify_ctrl *)(usize)(nvme.phys_identify_buf + vmm_direct_map_base());
+    nvme.identify_ns = (struct nvme_identify_ns *)(usize)(nvme.phys_identify_buf + NVME_PAGE_SIZE + vmm_direct_map_base());
+    memset((void *)(usize)(nvme.phys_identify_buf + vmm_direct_map_base()), 0, 2 * NVME_PAGE_SIZE);
+    
+    for (int i = 0; i < NVME_MAX_QUEUE_SIZE; i++) {
+        nvme.admin_cq[i].status = 0xFFFF;
+        nvme.io_cq[i].status = 0xFFFF;
+    }
     
     // Configure admin queue attributes
     u32 aqa = (NVME_MAX_QUEUE_SIZE - 1) | ((NVME_MAX_QUEUE_SIZE - 1) << 16);
@@ -339,7 +369,7 @@ void nvme_init(void)
     regs->acq = nvme.phys_admin_cq;
     
     // Configure and enable controller
-    cc = NVME_CC_EN | NVME_CC_CSS_NVM | (0 << NVME_CC_MPS_SHIFT) | (NVME_CC_IOSQES << 20) | (NVME_CC_IOCQES << 16);
+    cc = NVME_CC_EN | NVME_CC_CSS_NVM | (0 << NVME_CC_MPS_SHIFT) | (NVME_CC_IOSQES << 16) | (NVME_CC_IOCQES << 20);
     regs->cc = cc;
     
     if (nvme_wait_ready(regs, 1) < 0) {
@@ -350,7 +380,7 @@ void nvme_init(void)
     console_write("nvme: controller enabled\n");
     
     // Identify controller
-    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_CTRL, 0) < 0) {
+    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_CTRL, 0, nvme.phys_identify_buf) < 0) {
         console_write("nvme: identify controller failed\n");
         return;
     }
@@ -372,7 +402,7 @@ void nvme_init(void)
     }
     
     // Identify namespace 1
-    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_NS, 1) < 0) {
+    if (nvme_identify(&nvme, NVME_IDENTIFY_CNS_NS, 1, nvme.phys_identify_buf + NVME_PAGE_SIZE) < 0) {
         console_write("nvme: identify namespace 1 failed\n");
         return;
     }

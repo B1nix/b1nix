@@ -341,6 +341,38 @@ void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags) {
 
 u64 vmm_direct_map_base(void) { return DIRECT_MAP_BASE; }
 
+u64 vmm_virt_to_phys(void *ptr) {
+  u64 virtual_address = (u64)(usize)ptr;
+  if (virtual_address >= DIRECT_MAP_BASE && virtual_address < DIRECT_MAP_BASE + DIRECT_MAP_SIZE) {
+    return virtual_address - DIRECT_MAP_BASE;
+  }
+  u64 *pml4 = get_current_pml4();
+  if (!pml4) return 0;
+
+  u64 pml4e = pml4[pml4_index(virtual_address)];
+  if ((pml4e & VMM_PRESENT) == 0) return 0;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(virtual_address)];
+  if ((pdpte & VMM_PRESENT) == 0) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) {
+    return (pdpte & PAGE_ENTRY_ADDRESS_MASK) + (virtual_address & 0x3FFFFFFF);
+  }
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(virtual_address)];
+  if ((pde & VMM_PRESENT) == 0) return 0;
+  if (pde & HUGE_PAGE_FLAG) {
+    return (pde & PAGE_ENTRY_ADDRESS_MASK) + (virtual_address & 0x1FFFFF);
+  }
+
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(virtual_address)];
+  if ((pte & VMM_PRESENT) == 0) return 0;
+
+  return (pte & PAGE_ENTRY_ADDRESS_MASK) + (virtual_address & 0xFFF);
+}
+
 // Mark a page as lazy (will allocate on first access)
 void vmm_set_lazy(u64 virtual_address) {
   if ((virtual_address & (PAGE_SIZE - 1)) != 0)
