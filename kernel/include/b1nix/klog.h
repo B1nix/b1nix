@@ -10,6 +10,8 @@
 #define KLOG_ERROR 3
 #define KLOG_PANIC 4
 
+#define KLOG_BUF_SIZE 4096
+
 /* Core logging functions */
 void klog_debug(const char *msg);
 void klog_info(const char *msg);

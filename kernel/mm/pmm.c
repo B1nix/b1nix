@@ -257,7 +257,11 @@ u64 pmm_alloc_frames(usize count) {
         }
       }
       pmm.last_found_index = (idx + count) % frame_count;
-      memset((void *)(usize)frame, 0, count * PAGE_SIZE);
+      void *ptr = (void *)(usize)frame;
+      if (direct_map_ready) {
+        ptr = (void *)(usize)(frame + vmm_direct_map_base());
+      }
+      memset(ptr, 0, count * PAGE_SIZE);
       return frame;
     }
   }

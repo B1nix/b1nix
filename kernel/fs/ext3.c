@@ -708,6 +708,24 @@ static void ext3_vfs_release(struct vfs_node *node) {
     if (inode.i_links_count == 0) {
       u32 blocks = (inode.i_size + fs->block_size - 1) / fs->block_size;
       for (u32 b = 0; b < blocks; b++) { u32 phys = ext3_get_block(fs, &inode, b); if (phys) ext3_free_block(fs, phys); }
+      if (inode.i_block[EXT2_IND_BLOCK]) {
+        ext3_free_block(fs, inode.i_block[EXT2_IND_BLOCK]);
+      }
+      if (inode.i_block[EXT2_DIND_BLOCK]) {
+        u32 ptrs = fs->block_size / 4;
+        u32 *dind_buf = kmalloc(fs->block_size);
+        if (dind_buf) {
+          if (ext3_read_block(fs, inode.i_block[EXT2_DIND_BLOCK], dind_buf) == 0) {
+            for (u32 i = 0; i < ptrs; i++) {
+              if (dind_buf[i]) {
+                ext3_free_block(fs, dind_buf[i]);
+              }
+            }
+          }
+          kfree(dind_buf);
+        }
+        ext3_free_block(fs, inode.i_block[EXT2_DIND_BLOCK]);
+      }
       ext3_free_inode(fs, info->inode_num);
     }
   }

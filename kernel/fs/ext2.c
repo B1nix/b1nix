@@ -251,8 +251,7 @@ static int ext2_save_acls(struct ext2_fs *fs, u32 inode_num, struct ext2_inode *
     (void)inode_num;
     if (vi->acl_count == 0) {
         if (ei->i_file_acl != 0) {
-            /* We should free the block, but ext2_free_block is not implemented in this driver yet? 
-             * Wait, I saw ext2_free_block earlier. */
+            /* Free the ACL block */
             ext2_free_block(fs, ei->i_file_acl);
             ei->i_file_acl = 0;
         }
@@ -806,6 +805,27 @@ static void ext2_vfs_release(struct vfs_node *node) {
       for (u32 b = 0; b < total_blocks; b++) {
         u32 phys = ext2_get_inode_block(fs, &inode, b);
         if (phys) ext2_free_block(fs, phys);
+      }
+      if (inode.i_block[EXT2_IND_BLOCK]) {
+        ext2_free_block(fs, inode.i_block[EXT2_IND_BLOCK]);
+      }
+      if (inode.i_block[EXT2_DIND_BLOCK]) {
+        u32 ptrs = fs->block_size / 4;
+        u32 *dind_buf = kmalloc(fs->block_size);
+        if (dind_buf) {
+          if (ext2_read_block(fs, inode.i_block[EXT2_DIND_BLOCK], dind_buf) == 0) {
+            for (u32 i = 0; i < ptrs; i++) {
+              if (dind_buf[i]) {
+                ext2_free_block(fs, dind_buf[i]);
+              }
+            }
+          }
+          kfree(dind_buf);
+        }
+        ext2_free_block(fs, inode.i_block[EXT2_DIND_BLOCK]);
+      }
+      if (inode.i_file_acl) {
+        ext2_free_block(fs, inode.i_file_acl);
       }
       ext2_free_inode(fs, inode_num);
     }

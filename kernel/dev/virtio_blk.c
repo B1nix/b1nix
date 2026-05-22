@@ -49,18 +49,18 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   u16 d1 = 1;
   u16 d2 = 2;
 
-  inst->vq.desc[d0].addr = (u64)(usize)req;
+  inst->vq.desc[d0].addr = vmm_virt_to_phys(req);
   inst->vq.desc[d0].len = sizeof(struct virtio_blk_req);
   inst->vq.desc[d0].flags = VRING_DESC_F_NEXT;
   inst->vq.desc[d0].next = d1;
 
-  inst->vq.desc[d1].addr = (u64)(usize)buffer;
+  inst->vq.desc[d1].addr = vmm_virt_to_phys(buffer);
   inst->vq.desc[d1].len = count * 512;
   inst->vq.desc[d1].flags =
       VRING_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0);
   inst->vq.desc[d1].next = d2;
 
-  inst->vq.desc[d2].addr = (u64)(usize)&virtio_blk_status;
+  inst->vq.desc[d2].addr = vmm_virt_to_phys((void *)&virtio_blk_status);
   inst->vq.desc[d2].len = 1;
   inst->vq.desc[d2].flags = VRING_DESC_F_WRITE;
   inst->vq.desc[d2].next = 0;

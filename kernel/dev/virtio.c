@@ -94,12 +94,13 @@ int virtq_init(struct virtio_device *dev, u16 queue_idx, struct virtqueue *vq)
 		return 0;
 	}
 
-	memset((void*)paddr, 0, total_size);
+	u64 vaddr = paddr + vmm_direct_map_base();
+	memset((void*)(usize)vaddr, 0, total_size);
 
 	vq->pfn = (u32)(paddr / 4096);
-	vq->desc = (struct vring_desc *)paddr;
-	vq->avail = (struct vring_avail *)(paddr + desc_size);
-	vq->used = (struct vring_used *)(paddr + offset);
+	vq->desc = (struct vring_desc *)(usize)vaddr;
+	vq->avail = (struct vring_avail *)(usize)(vaddr + desc_size);
+	vq->used = (struct vring_used *)(usize)(vaddr + offset);
 
 	outl((u16)(dev->port_base + VIRTIO_PCI_QUEUE_PFN), vq->pfn);
 

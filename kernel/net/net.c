@@ -45,7 +45,8 @@ int net_get_irq(void) { return net_ready ? net_dev.irq : -1; }
 
 void net_interrupt_handler(void) {
 	if (!net_ready) return;
-	if (virtio_read_isr(&net_dev) & 1) {
+	u8 isr = virtio_read_isr(&net_dev);
+	if (isr & 1) {
 		net_irq_pending = 1;
 	}
 }
@@ -169,7 +170,7 @@ struct rx_buffer {
 	u8 data[RX_BUFFER_SIZE];
 } __attribute__((packed));
 
-static struct rx_buffer *rx_buffers;
+static struct rx_buffer **rx_buffers;
 static u16 rx_buffer_count;
 
 static int is_power_of_two_u16(u16 v)
@@ -180,7 +181,7 @@ static int is_power_of_two_u16(u16 v)
 static void fill_rx_buffer(u16 idx)
 {
 	u16 d0 = idx;
-	net_rx_vq.desc[d0].addr = (u64)(usize)&rx_buffers[idx];
+	net_rx_vq.desc[d0].addr = vmm_virt_to_phys(rx_buffers[idx]);
 	net_rx_vq.desc[d0].len = sizeof(struct rx_buffer);
 	net_rx_vq.desc[d0].flags = VRING_DESC_F_WRITE;
 	net_rx_vq.desc[d0].next = 0;
@@ -201,8 +202,20 @@ static void virtio_net_probe(void)
 		return;
 	}
 
+	u32 host_features = virtio_get_host_features(&net_dev);
+	console_write("virtio-net: host features = 0x");
+	console_write_hex32(host_features);
+	console_write("\n");
+
 	virtio_set_guest_features(&net_dev, 0);
+	console_write("virtio-net: status after guest features write = 0x");
+	console_write_hex32(virtio_get_status(&net_dev));
+	console_write("\n");
+
 	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
+	console_write("virtio-net: status after features ok write = 0x");
+	console_write_hex32(virtio_get_status(&net_dev));
+	console_write("\n");
 
 	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
@@ -236,13 +249,36 @@ static void virtio_net_probe(void)
 	}
 
 	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
+	console_write("virtio-net: status after driver ok write = 0x");
+	console_write_hex32(virtio_get_status(&net_dev));
+	console_write("\n");
 
 	// Populate RX queue
 	rx_buffer_count = net_rx_vq.queue_size;
-	rx_buffers = kzalloc(sizeof(struct rx_buffer) * rx_buffer_count);
+	rx_buffers = kzalloc(sizeof(struct rx_buffer *) * rx_buffer_count);
 	for (u16 i = 0; i < rx_buffer_count; i++) {
+		u64 frame = pmm_alloc_frame();
+		if (!frame) {
+			console_write("virtio-net: failed to allocate RX buffer frame\n");
+			return;
+		}
+		rx_buffers[i] = (struct rx_buffer *)(usize)(frame + vmm_direct_map_base());
+		memset(rx_buffers[i], 0, PAGE_SIZE);
 		fill_rx_buffer(i);
 	}
+
+	console_write("virtio-net RX desc 0: virt=0x");
+	console_write_hex64((u64)(usize)rx_buffers[0]);
+	console_write(" phys=0x");
+	console_write_hex64(vmm_virt_to_phys(rx_buffers[0]));
+	console_write(" desc.addr=0x");
+	console_write_hex64(net_rx_vq.desc[0].addr);
+	console_write(" desc.len=");
+	console_write_dec(net_rx_vq.desc[0].len);
+	console_write(" desc.flags=");
+	console_write_dec(net_rx_vq.desc[0].flags);
+	console_write("\n");
+
 	virtq_kick(&net_dev, &net_rx_vq);
 	net_ready = 1;
 
@@ -305,8 +341,10 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 
 	// Allocate TX buffer. It is reclaimed on TX completion in net_poll().
 	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
-	u8 *buffer = kzalloc(packet_size);
-	if (!buffer) return;
+	u64 frame = pmm_alloc_frame();
+	if (!frame) return;
+	u8 *buffer = (u8 *)(usize)(frame + vmm_direct_map_base());
+	memset(buffer, 0, PAGE_SIZE);
 
 	struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
 	hdr->flags = 0;
@@ -337,7 +375,7 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 
 		tx_buffers[d0] = buffer;
 		tx_inflight[d0] = 1;
-		net_tx_vq.desc[d0].addr = (u64)(usize)buffer;
+		net_tx_vq.desc[d0].addr = vmm_virt_to_phys(buffer);
 		net_tx_vq.desc[d0].len = packet_size;
 		net_tx_vq.desc[d0].flags = 0;
 		net_tx_vq.desc[d0].next = 0;
@@ -352,7 +390,7 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 		return;
 	}
 
-	kfree(buffer);
+	pmm_free_frame(vmm_virt_to_phys(buffer));
 }
 
 void net_poll(void)
@@ -371,7 +409,7 @@ void net_poll(void)
 		u32 id = net_tx_vq.used->ring[used_idx].id;
 		if (id < net_tx_vq.queue_size && tx_inflight[id]) {
 			tx_inflight[id] = 0;
-			kfree(tx_buffers[id]);
+			pmm_free_frame(vmm_virt_to_phys(tx_buffers[id]));
 			tx_buffers[id] = 0;
 		}
 		net_tx_vq.last_used_idx++;
@@ -386,7 +424,7 @@ void net_poll(void)
 		u32 len = net_rx_vq.used->ring[used_idx].len;
 
 		if (id < rx_buffer_count) {
-			struct rx_buffer *buf = &rx_buffers[id];
+			struct rx_buffer *buf = rx_buffers[id];
 			if (len > sizeof(struct virtio_net_hdr)) {
 				usize payload_len = len - sizeof(struct virtio_net_hdr);
 				ethernet_receive(buf->data, payload_len);

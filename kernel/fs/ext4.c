@@ -770,6 +770,11 @@ static void ext4_vfs_release(struct vfs_node *node) {
     if (inode.i_links_count == 0) {
       u32 blocks = (inode.i_size + fs->block_size - 1) / fs->block_size;
       for (u32 b = 0; b < blocks; b++) { u32 phys = ext4_get_block(fs, &inode, b); if (phys) ext4_free_block(fs, phys); }
+      if (!(inode.i_flags & EXT4_EXTENTS_FL)) {
+        if (inode.i_block[EXT2_IND_BLOCK]) {
+          ext4_free_block(fs, inode.i_block[EXT2_IND_BLOCK]);
+        }
+      }
       ext4_free_inode(fs, info->inode_num);
     }
   }

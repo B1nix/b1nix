@@ -503,6 +503,9 @@ void vfs_node_put(struct vfs_node *node) {
     return;
   if (__atomic_sub_fetch(&node->refcount, 1, __ATOMIC_RELAXED) == 0 &&
       node->deleted) {
+    if (node->inode && node->inode->release_cb) {
+      node->inode->release_cb(node);
+    }
     vfs_inode_put(node->inode);
     vfs_free_node(node);
     __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
@@ -2704,9 +2707,9 @@ int vfs_dup2(int oldfd, int newfd) {
   int old_handle = scheduler_fd_get(oldfd);
   if (old_handle < 0 || (usize)old_handle >= MAX_VFS_HANDLES ||
       !handles[old_handle].used)
-    return -1;
+    return -EBADF;
   if (newfd < 0 || (usize)newfd >= SCHED_MAX_FDS)
-    return -1;
+    return -EBADF;
   if (oldfd == newfd)
     return newfd;
 

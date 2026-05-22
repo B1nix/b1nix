@@ -45,6 +45,7 @@ run_qemu() {
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 			-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+			-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/logs/net.pcap" \
 			-device ich9-ahci,id=ahci \
 			-drive file="$PROJECT_DIR/sata.img",if=none,id=satadrive,format=raw \
 			-device ide-hd,drive=satadrive,bus=ahci.0 \
@@ -181,16 +182,16 @@ check_output "$LOG" "UDP-SMOKE: probe-sent" "UDP probe command runs"
 check_output "$LOG" "UDP-SMOKE: icmp-port-unreachable" "UDP unbound port triggers ICMP unreachable"
 check_output "$LOG" "UDP-SMOKE: queue-2pkt-ok" "UDP socket queue preserves two packets"
 check_output "$LOG" "ARP-SMOKE: request-sent" "ARP request path exercised"
-if grep -q "ARP-SMOKE: resolution-ready" "$LOG" 2>/dev/null; then
-	pass "ARP resolution became available"
-else
-	skip "ARP resolution became available" "no ARP resolution marker observed in this run"
-fi
-if grep -q "ARP-SMOKE: reply-received" "$LOG" 2>/dev/null; then
-	pass "ARP reply path exercised"
-else
-	skip "ARP reply path exercised" "no ARP reply observed in this run"
-fi
+    if grep -q "ARP-SMOKE: resolution-ready" "$LOG" 2>/dev/null; then
+        pass "ARP resolution became available"
+    else
+        fail "ARP resolution became available" "no ARP resolution marker observed in this run"
+    fi
+    if grep -q "ARP-SMOKE: reply-received" "$LOG" 2>/dev/null; then
+        pass "ARP reply path exercised"
+    else
+        fail "ARP reply path exercised" "no ARP reply observed in this run"
+    fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"

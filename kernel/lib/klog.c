@@ -56,58 +56,50 @@ static const char *klog_lookup_symbol(u64 address)
 	return best_name;
 }
 
+static void klog_ring_put(char ch)
+{
+    usize next = (klog_write_pos + 1) % KLOG_BUF_SIZE;
+    if (next == klog_read_pos) {
+        klog_read_pos = (klog_read_pos + 1) % KLOG_BUF_SIZE;
+        klog_overflow = 1;
+    }
+    klog_buf[klog_write_pos] = ch;
+    klog_write_pos = next;
+}
+
 /* ── Core log function ── */
 static void klog_write(int level, const char *message)
 {
-	const char *prefix = klog_level_names[level];
-	usize prefix_len = strlen(prefix);
-	usize msg_len = strlen(message);
+    const char *prefix = klog_level_names[level];
+    usize prefix_len = strlen(prefix);
+    usize msg_len = strlen(message);
 
-	/* Write to console and serial */
-	if (level >= KLOG_WARN) {
-		console_write("[");
-		console_write(prefix);
-		console_write("] ");
-		console_write(message);
-		console_write("\n");
+    /* Write to console and serial */
+    if (level >= KLOG_WARN) {
+        console_write("[");
+        console_write(prefix);
+        console_write("] ");
+        console_write(message);
+        console_write("\n");
 
-		serial_write("[");
-		serial_write(prefix);
-		serial_write("] ");
-		serial_write(message);
-		serial_write("\n");
-	}
+        serial_write("[");
+        serial_write(prefix);
+        serial_write("] ");
+        serial_write(message);
+        serial_write("\n");
+    }
 
-	/* Write to ring buffer */
-	for (usize i = 0; i < prefix_len && klog_write_pos < KLOG_BUF_SIZE; i++) {
-		klog_buf[(klog_write_pos++) % KLOG_BUF_SIZE] = prefix[i];
-	}
-	if (klog_write_pos < KLOG_BUF_SIZE)
-		klog_buf[(klog_write_pos++) % KLOG_BUF_SIZE] = ':';
-	if (klog_write_pos < KLOG_BUF_SIZE)
-		klog_buf[(klog_write_pos++) % KLOG_BUF_SIZE] = ' ';
-	if (klog_write_pos >= KLOG_BUF_SIZE) klog_overflow = 1;
-
-	for (usize i = 0; i < msg_len; i++) {
-		if (klog_write_pos < KLOG_BUF_SIZE)
-			klog_buf[(klog_write_pos++) % KLOG_BUF_SIZE] = message[i];
-		else
-			klog_overflow = 1;
-	}
-
-	if (klog_write_pos < KLOG_BUF_SIZE)
-		klog_buf[(klog_write_pos++) % KLOG_BUF_SIZE] = '\n';
-	else
-		klog_overflow = 1;
-
-	/* Adjust read position if we overflowed */
-	if (klog_overflow) {
-		klog_read_pos = klog_write_pos - KLOG_BUF_SIZE;
-		if (klog_read_pos >= KLOG_BUF_SIZE)
-			klog_read_pos = 0;
-	}
+    /* Write to circular ring buffer */
+    for (usize i = 0; i < prefix_len; i++) {
+        klog_ring_put(prefix[i]);
+    }
+    klog_ring_put(':');
+    klog_ring_put(' ');
+    for (usize i = 0; i < msg_len; i++) {
+        klog_ring_put(message[i]);
+    }
+    klog_ring_put('\n');
 }
-
 void klog_debug(const char *msg) { klog_write(KLOG_DEBUG, msg); }
 void klog_info(const char *msg)  { klog_write(KLOG_INFO, msg); }
 void klog_warn(const char *msg)  { klog_write(KLOG_WARN, msg); }

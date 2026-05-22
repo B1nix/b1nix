@@ -1576,11 +1576,17 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
       }
     }
     console_write("ping: timeout waiting reply\n");
-    return 0;
+    return (u64)-ETIMEDOUT;
   }
   case SYS_NET_DNS:
-    dns_resolve((const char *)(usize)arg0);
-    return 0;
+    {
+        char host[256];
+        isize ret = syscall_copyinstr(host, sizeof(host), (const char *)(usize)arg0);
+        if (ret < 0)
+            return (u64)ret;
+        dns_resolve(host);
+        return 0;
+    }
   case SYS_READ_KBD:
     return sys_read_kbd();
 #else
@@ -1617,8 +1623,13 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     usize len = strlen(cwd);
     if (len >= arg1)
       len = arg1 - 1;
-    syscall_copyout((void *)(usize)arg0, cwd, len);
-    ((char *)(usize)arg0)[len] = '\0';
+    char tmp[VFS_MAX_PATH];
+    if (len >= sizeof(tmp))
+      len = sizeof(tmp) - 1;
+    memcpy(tmp, cwd, len);
+    tmp[len] = '\0';
+    if (syscall_copyout((void *)(usize)arg0, tmp, len + 1) != 0)
+      return (u64)-EFAULT;
     return (u64)len;
   }
   case SYS_CHDIR:
@@ -1630,7 +1641,15 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_DMESG:
     if (!arg0 || arg1 == 0)
       return (u64)-EINVAL;
-    return (u64)klog_read((char *)(usize)arg0, (usize)arg1);
+    if (arg1 > KLOG_BUF_SIZE)
+      arg1 = KLOG_BUF_SIZE;
+    if (!is_user_range_valid((const void *)arg0, arg1, 1))
+      return (u64)-EFAULT;
+    char tmp[KLOG_BUF_SIZE];
+    usize copied = klog_read(tmp, (usize)arg1);
+    if (syscall_copyout((void *)(usize)arg0, tmp, copied) != 0)
+      return (u64)-EFAULT;
+    return (u64)copied;
   case SYS_MOUNT:
     return (u64)sys_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
                           (const char *)(usize)arg2, arg3);

@@ -44,7 +44,11 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
 
   while (1) {
     while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-    if (pipe->readers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EPIPE; }
+    if (pipe->readers == 0) {
+      __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
+      scheduler_kill(scheduler_get_pid(), SIGPIPE);
+      return -EPIPE;
+    }
     usize free_space = PIPE_BUFFER_SIZE - pipe->size;
     if (free_space == 0) {
       if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }

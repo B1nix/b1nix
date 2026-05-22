@@ -74,6 +74,7 @@ void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address);
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags);
 u64 vmm_direct_map_base(void);
 u64 vmm_virt_to_phys(void *ptr);
+extern int direct_map_ready;
 
 // M2 Aliases / Helpers
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags);

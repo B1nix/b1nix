@@ -116,7 +116,7 @@ void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, cons
 	hdr->checksum = 0;
 
 	memcpy(buffer + sizeof(struct udp_header), payload, size);
-	hdr->checksum = udp_checksum(net_get_ip(), dst, buffer, total_size);
+	hdr->checksum = bswap16(udp_checksum(net_get_ip(), dst, buffer, total_size));
 
 	ipv4_send(dst, 17 /* UDP */, buffer, total_size);
 	kfree(buffer);

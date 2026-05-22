@@ -15,7 +15,7 @@
 
 static u64 *kernel_pml4_virt;
 static u64 kernel_pml4_phys;
-static int direct_map_ready;
+int direct_map_ready;
 static u64 mmio_next = MMIO_MAP_BASE;
 
 extern struct task *current_task;
