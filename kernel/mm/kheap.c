@@ -43,19 +43,14 @@ static void heap_grow(usize minimum_bytes) {
     u64 vaddr = heap.end;
     vmm_map_page(vaddr, frame, VMM_PRESENT | VMM_WRITABLE);
 
-    if (heap.current == 0) {
-      heap.base = vaddr;
-      heap.current = vaddr;
-    }
-
     heap.end += PAGE_SIZE;
   }
 }
 
 void kheap_init(void) {
-  heap.base = 0;
-  heap.current = 0;
-  heap.end = 0;
+  heap.base = KHEAP_START;
+  heap.current = KHEAP_START;
+  heap.end = KHEAP_START;
   free_list = 0;
   heap_grow(PAGE_SIZE);
 
@@ -67,8 +62,8 @@ void kheap_init(void) {
 }
 
 void kheap_use_direct_map(void) {
-  /* Keep kheap in the already-mapped identity range. The direct-map
-   * transition caused unstable early-boot faults under current paging. */
+  /* kheap has been transitioned to KHEAP_START in the higher half.
+   * Direct-map is ready, and page tables for the heap are shared globally. */
   return;
 }
 

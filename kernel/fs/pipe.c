@@ -92,14 +92,19 @@ static int pipe_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
 static void pipe_release(struct vfs_handle *h) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe) return;
-  if (h->kind == VFS_HANDLE_PIPE_READ) pipe->readers--;
-  else pipe->writers--;
+  while (__atomic_test_and_set(&pipe->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+  if (h->kind == VFS_HANDLE_PIPE_READ) {
+    if (pipe->readers > 0) pipe->readers--;
+  } else {
+    if (pipe->writers > 0) pipe->writers--;
+  }
+  int free_pipe = (pipe->readers <= 0 && pipe->writers <= 0);
+  if (free_pipe) pipe->used = 0;
+  __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
   
   /* Wake up anyone waiting on the pipe */
   scheduler_wake_all(pipe);
   scheduler_wake_all(vfs_poll_chan);
-  
-  if (pipe->readers <= 0 && pipe->writers <= 0) pipe->used = 0;
 }
 
 const struct vfs_file_ops pipe_read_ops = { .read = pipe_read, .poll = pipe_poll, .release = pipe_release };

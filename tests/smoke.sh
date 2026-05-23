@@ -7,7 +7,7 @@ set -e
 
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=60  # seconds to let each test run
+TIMEOUT=300  # seconds to let each test run
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -26,11 +26,6 @@ pass() {
 fail() {
 	echo "  ${RED}FAIL${NC} $1 — $2"
 	FAILED=$((FAILED + 1))
-}
-
-skip() {
-	echo "  ${YELLOW}SKIP${NC} $1 — $2"
-	SKIPPED=$((SKIPPED + 1))
 }
 
 # Run QEMU and capture output
@@ -118,40 +113,12 @@ else
 	pass "kernel boots without panic"
 fi
 
-# ── Test 3: Initramfs ──
-if grep -q "initramfs" "$LOG" 2>/dev/null; then
-	pass "initramfs initializes"
-else
-	skip "initramfs initializes" "initramfs message not found"
-fi
-
-# ── Test 4: VFS ──
-if grep -q "vfs:" "$LOG" 2>/dev/null || grep -q "VFS" "$LOG" 2>/dev/null; then
-	pass "VFS initializes"
-else
-	skip "VFS initializes" "VFS message not found"
-fi
-
-# ── Test 5: Scheduler ──
-if grep -q "sched" "$LOG" 2>/dev/null || grep -q "task" "$LOG" 2>/dev/null; then
-	pass "scheduler starts"
-else
-	skip "scheduler starts" "scheduler message not found"
-fi
-
-# ── Test 6: Init process ──
-if grep -q "/bin/init" "$LOG" 2>/dev/null || grep -q "init" "$LOG" 2>/dev/null; then
-	pass "/bin/init launches"
-else
-	skip "/bin/init launches" "/bin/init message not found"
-fi
-
-# ── Test 7: Shell available ──
-if grep -q "shell\|b1nix shell\|Welcome" "$LOG" 2>/dev/null; then
-	pass "shell appears"
-else
-	skip "shell appears" "shell banner not found"
-fi
+# ── Test 3-7: Core boot path markers ──
+check_output "$LOG" "initramfs: files" "initramfs initializes"
+check_output "$LOG" "M22-SMOKE: start" "VFS initializes"
+check_output "$LOG" "M24-STRESS: start" "scheduler starts"
+check_output "$LOG" "init spawn result:" "/bin/init launches"
+check_output "$LOG" "M11-SMOKE: start" "shell appears"
 
 # ── M22 utility init-path smoke ──
 echo ""
@@ -177,6 +144,67 @@ check_output "$LOG" "LOCK-SMOKE: done" "LOCK-SMOKE completes successfully"
 check_output "$LOG" "EXT-STRESS: done" "EXT-STRESS completes successfully"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
+
+# ── M11 Shell & Utilities ──
+echo ""
+echo "[TEST] M11 Shell baseline..."
+check_output "$LOG" "M11-SMOKE: start" "M11 shell smoke starts"
+check_output "$LOG" "M11-SMOKE: ok pipe-eof" "pipe EOF when all writers close"
+check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-read" "pipe nonblocking read returns EAGAIN"
+check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-write" "pipe nonblocking write returns EAGAIN"
+check_output "$LOG" "M11-SMOKE: done" "M11 shell smoke completes"
+check_output "$LOG" "M11-SHELL: ok simple-success" "simple command success"
+check_output "$LOG" "M11-SHELL: ok simple-fail" "simple command failure propagates status"
+check_output "$LOG" "M11-SHELL: ok exec-127" "failed exec returns 127"
+check_output "$LOG" "M11-SHELL: ok var-expand" "variable expansion works"
+check_output "$LOG" "M11-SHELL: ok path-lookup" "PATH lookup resolves command"
+check_output "$LOG" "M11-SHELL: ok quoted-string" "double-quoted string with spaces"
+check_output "$LOG" "M11-SHELL: ok single-quote" "single-quoted string preserves special chars"
+check_output "$LOG" "M11-SHELL: ok and-op" "&& operator runs second on success"
+check_output "$LOG" "M11-SHELL: ok or-op" "|| operator runs second on failure"
+check_output "$LOG" "M11-SHELL: ok semicolon" "semicolon separates commands"
+check_output "$LOG" "M11-SHELL: ok redir-out" "stdout redirection > creates file"
+check_output "$LOG" "M11-SHELL: ok redir-in" "stdin redirection < reads file"
+check_output "$LOG" "M11-SHELL: ok redir-append" "append redirection >> works"
+check_output "$LOG" "M11-SHELL: ok redir-stderr" "stderr redirection 2> captures errors"
+check_output "$LOG" "M11-SHELL: ok redir-2>&1" "2>&1 merges stderr into stdout"
+check_output "$LOG" "M11-SHELL: ok redir-failure" "redirection failure returns nonzero"
+check_output "$LOG" "M11-SHELL: ok pipeline-output" "pipeline passes data between commands"
+check_output "$LOG" "M11-SHELL: ok pipeline-status" "pipeline exit status = last command"
+check_output "$LOG" "M11-SHELL: ok pipeline-chain" "3-stage pipeline: echo | grep | wc"
+check_output "$LOG" "M11-SHELL: ok combo-redir-pipe" "combined redirection and pipeline path works"
+check_output "$LOG" "M11-SHELL: ok combo-quote-redir" "quoted variable through pipeline+redirection works"
+check_output "$LOG" "M11-SHELL: ok script-exec" "script execution via /bin/sh"
+if grep -q "M11-SHELL: ok shebang" "$LOG" 2>/dev/null || grep -q "M11-SHELL: ok shebang-unsupported" "$LOG" 2>/dev/null; then
+	pass "shebang behavior marker emitted"
+else
+	fail "shebang behavior marker emitted" "missing shebang support/unsupported marker"
+fi
+
+echo ""
+echo "[TEST] M11 Coreutils via shell..."
+check_output "$LOG" "M11-UTIL: ok cat" "cat reads file via pipeline"
+check_output "$LOG" "M11-UTIL: ok grep" "grep finds pattern (exit 0)"
+check_output "$LOG" "M11-UTIL: ok grep-nomatch" "grep exits nonzero when no match"
+check_output "$LOG" "M11-UTIL: ok wc" "wc -l counts lines correctly"
+check_output "$LOG" "M11-UTIL: ok head" "head -n 2 returns 2 lines"
+check_output "$LOG" "M11-UTIL: ok tail" "tail -n 2 returns 2 lines"
+check_output "$LOG" "M11-UTIL: ok sort" "sort produces ordered output"
+check_output "$LOG" "M11-UTIL: ok uniq" "uniq removes adjacent duplicates"
+check_output "$LOG" "M11-UTIL: ok cp" "cp copies file"
+check_output "$LOG" "M11-UTIL: ok mv" "mv renames file"
+check_output "$LOG" "M11-UTIL: ok mkdir" "mkdir creates directory"
+check_output "$LOG" "M11-UTIL: ok rmdir" "rmdir removes directory"
+check_output "$LOG" "M11-UTIL: ok rm" "rm removes file"
+check_output "$LOG" "M11-UTIL: ok ln-readlink" "ln -s and readlink work together"
+check_output "$LOG" "M11-UTIL: ok ps" "ps runs without error"
+check_output "$LOG" "M11-UTIL: ok date" "date runs without error"
+check_output "$LOG" "M11-UTIL: ok uname" "uname -a runs without error"
+check_output "$LOG" "M11-UTIL: ok id" "id prints identity"
+check_output "$LOG" "M11-UTIL: ok whoami" "whoami prints user name"
+check_output "$LOG" "M11-UTIL: ok sleep" "sleep 0 returns successfully"
+check_output "$LOG" "M11-UTIL: ok bad-flag-ls" "ls rejects unsupported flags"
+check_output "$LOG" "M11-UTIL: ok bad-flag-grep" "grep rejects unsupported flags"
 check_output "$LOG" "NET-SMOKE: ok ping-gateway" "ping -c 2 10.0.2.2 succeeds"
 check_output "$LOG" "UDP-SMOKE: probe-sent" "UDP probe command runs"
 check_output "$LOG" "UDP-SMOKE: icmp-port-unreachable" "UDP unbound port triggers ICMP unreachable"

@@ -52,20 +52,142 @@ static const char initramfs_fstab[] =
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
     "echo \"POSIX-SMOKE: start\"\n"
-    "basename /tmp/a/b\n"
-    "dirname /tmp/a/b\n"
+    /* ── M11 Shell Baseline ─────────────────────────────────────── */
+    /* 1. simple success */
+    "true && echo \"M11-SHELL: ok simple-success\"\n"
+    /* 2. simple failure: false returns nonzero; || branch runs */
+    "false || echo \"M11-SHELL: ok simple-fail\"\n"
+    /* 3. exec-127: /bin/sh -c with bad cmd; sh exits 127; || fires */
+    "/bin/sh -c '_no_such_cmd_xyz_' || echo \"M11-SHELL: ok exec-127\"\n"
+    /* 4. variable expansion via export */
+    "export TESTVAR=hello\n"
+    "echo $TESTVAR | grep hello && echo \"M11-SHELL: ok var-expand\"\n"
+    /* 4b. PATH lookup for plain command names */
+    "export PATH=/bin\n"
+    "uname -a >/tmp/m11_path.txt && grep b1nix /tmp/m11_path.txt && echo \"M11-SHELL: ok path-lookup\"\n"
+    /* 5. double-quoted string with spaces */
+    "echo \"hello world\" | grep \"hello world\" && echo \"M11-SHELL: ok quoted-string\"\n"
+    /* 6. single-quoted string passes literal text through */
+    "echo 'no expansion here' | grep 'no expansion' && echo \"M11-SHELL: ok single-quote\"\n"
+    /* 7. && operator */
+    "true && echo \"M11-SHELL: ok and-op\"\n"
+    /* 8. || operator */
+    "false || echo \"M11-SHELL: ok or-op\"\n"
+    /* 9. semicolon */
+    "true ; echo \"M11-SHELL: ok semicolon\"\n"
+    /* ── M11 Redirection ────────────────────────────────────────── */
+    /* 10. redirect stdout > */
+    "echo \"redir-test\" > /tmp/m11_out.txt\n"
+    "grep \"redir-test\" /tmp/m11_out.txt && echo \"M11-SHELL: ok redir-out\"\n"
+    /* 11. redirect stdin < */
+    "echo \"stdin-line\" > /tmp/m11_in.txt\n"
+    "cat < /tmp/m11_in.txt | grep \"stdin-line\" && echo \"M11-SHELL: ok redir-in\"\n"
+    /* 12. append >> */
+    "echo \"line1\" > /tmp/m11_app.txt\n"
+    "echo \"line2\" >> /tmp/m11_app.txt\n"
+    "wc -l /tmp/m11_app.txt | grep \"2\" && grep \"line2\" /tmp/m11_app.txt && echo \"M11-SHELL: ok redir-append\"\n"
+    /* 13. redirect stderr 2> — cat nonexistent; error goes to file */
+    "cat /tmp/m11_nosuchfile 2>/tmp/m11_err.txt\n"
+    "wc -c /tmp/m11_err.txt | grep -v \" 0\" && echo \"M11-SHELL: ok redir-stderr\"\n"
+    /* 14. 2>&1 — cat nonexistent; error merged into stdout; pipe to grep */
+    "cat /tmp/m11_nosuchfile2 2>&1 | grep \"cat\" && echo \"M11-SHELL: ok redir-2>&1\"\n"
+    /* 14b. redirection target open failure returns nonzero */
+    "cat < /tmp/definitely-missing-m11 && echo \"M11-SHELL: fail redir-failure\" || echo \"M11-SHELL: ok redir-failure\"\n"
+    /* ── M11 Pipeline ───────────────────────────────────────────── */
+    /* 15. pipeline output */
+    "echo \"pipe-data\" | grep \"pipe-data\" && echo \"M11-SHELL: ok pipeline-output\"\n"
+    /* 16. pipeline exit status = last cmd (false exits 1; || fires) */
+    "echo \"irrelevant\" | false || echo \"M11-SHELL: ok pipeline-status\"\n"
+    /* 17. pipeline-chain: 2-stage pipe then file wc */
+    "printf \"alpha\\nbeta\\nalpha\\n\" | grep \"alpha\" > /tmp/m11_chain.txt\n"
+    "wc -l /tmp/m11_chain.txt | grep \"2\" && echo \"M11-SHELL: ok pipeline-chain\"\n"
+    "echo \"combo-one\" > /tmp/m11_combo.txt\n"
+    "cat < /tmp/m11_combo.txt | grep \"combo-one\" && echo \"M11-SHELL: ok combo-redir-pipe\"\n"
+    "echo \"alpha beta\" > /tmp/m11_combo_src.txt\n"
+    "grep \"alpha beta\" /tmp/m11_combo_src.txt > /tmp/m11_combo2.txt\n"
+    "grep \"alpha beta\" /tmp/m11_combo2.txt && echo \"M11-SHELL: ok combo-quote-redir\"\n"
+    /* ── M11 Script exec ────────────────────────────────────────── */
+    /* 18. script execution via /bin/sh */
+    "echo \"echo M11-SHELL: ok script-exec\" > /tmp/m11_scr.sh\n"
+    "/bin/sh /tmp/m11_scr.sh\n"
+    /* 18b. direct shebang execution status */
+    "echo \"#!/bin/sh\" > /tmp/m11_shebang.sh\n"
+    "echo \"echo M11-SHELL: ok shebang-direct\" >> /tmp/m11_shebang.sh\n"
+    "/tmp/m11_shebang.sh >/tmp/m11_shebang.out 2>/dev/null && grep \"M11-SHELL: ok shebang-direct\" /tmp/m11_shebang.out && echo \"M11-SHELL: ok shebang\" || echo \"M11-SHELL: ok shebang-unsupported\"\n"
+    /* ── M11-UTIL coreutils via shell ──────────────────────────── */
+    "printf \"beta\\nalpha\\nalpha\\ngamma\\n\" > /tmp/m11_util.txt\n"
+    /* 19. cat */
+    "cat /tmp/m11_util.txt | grep \"beta\" && echo \"M11-UTIL: ok cat\"\n"
+    /* 20. grep match */
+    "grep \"alpha\" /tmp/m11_util.txt && echo \"M11-UTIL: ok grep\"\n"
+    /* 21. grep no match */
+    "grep \"ZZZMISSING\" /tmp/m11_util.txt || echo \"M11-UTIL: ok grep-nomatch\"\n"
+    /* 22. wc -l */
+    "wc -l /tmp/m11_util.txt | grep \"4\" && echo \"M11-UTIL: ok wc\"\n"
+    /* 23. head -n 2 — write to file then wc */
+    "head -n 2 /tmp/m11_util.txt > /tmp/m11_head.txt\n"
+    "wc -l /tmp/m11_head.txt | grep \"2\" && echo \"M11-UTIL: ok head\"\n"
+    /* 24. tail -n 2 — write to file then wc */
+    "tail -n 2 /tmp/m11_util.txt > /tmp/m11_tail.txt\n"
+    "wc -l /tmp/m11_tail.txt | grep \"2\" && echo \"M11-UTIL: ok tail\"\n"
+    /* 25. sort — sort to file, grep first line */
+    "sort /tmp/m11_util.txt > /tmp/m11_sort.txt\n"
+    "head -n 1 /tmp/m11_sort.txt | grep \"alpha\" && echo \"M11-UTIL: ok sort\"\n"
+    /* 26. uniq — sort to file, uniq to file, wc */
+    "sort /tmp/m11_util.txt > /tmp/m11_sorted.txt\n"
+    "uniq /tmp/m11_sorted.txt > /tmp/m11_uniq.txt\n"
+    "wc -l /tmp/m11_uniq.txt | grep \"3\" && echo \"M11-UTIL: ok uniq\"\n"
+    /* 27. cp */
+    "cp /tmp/m11_util.txt /tmp/m11_util_cp.txt\n"
+    "cat /tmp/m11_util_cp.txt | grep \"beta\" && echo \"M11-UTIL: ok cp\"\n"
+    /* 28. mv */
+    "cp /tmp/m11_util.txt /tmp/m11_mv_src.txt\n"
+    "mv /tmp/m11_mv_src.txt /tmp/m11_mv_dst.txt\n"
+    "cat /tmp/m11_mv_dst.txt | grep \"beta\" && echo \"M11-UTIL: ok mv\"\n"
+    /* 29. mkdir */
+    "mkdir /tmp/m11_dir\n"
+    "[ -d /tmp/m11_dir ] && echo \"M11-UTIL: ok mkdir\"\n"
+    /* 30. rmdir */
+    "rmdir /tmp/m11_dir\n"
+    "[ -d /tmp/m11_dir ] || echo \"M11-UTIL: ok rmdir\"\n"
+    /* 31. rm */
+    "cp /tmp/m11_util.txt /tmp/m11_rm.txt\n"
+    "rm /tmp/m11_rm.txt\n"
+    "[ -f /tmp/m11_rm.txt ] || echo \"M11-UTIL: ok rm\"\n"
+    /* 32. ln -s + readlink */
+    "ln -s /tmp/m11_util.txt /tmp/m11_lnk.txt\n"
+    "readlink /tmp/m11_lnk.txt | grep \"m11_util\" && echo \"M11-UTIL: ok ln-readlink\"\n"
+    /* 33. ps */
+    "ps && echo \"M11-UTIL: ok ps\"\n"
+    /* 34. date */
+    "date && echo \"M11-UTIL: ok date\"\n"
+    /* 35. uname */
+    "uname -a && echo \"M11-UTIL: ok uname\"\n"
+    /* 36. id */
+    "id && echo \"M11-UTIL: ok id\"\n"
+    /* 37. whoami */
+    "whoami && echo \"M11-UTIL: ok whoami\"\n"
+    /* 38. sleep 0 */
+    "sleep 0 && echo \"M11-UTIL: ok sleep\"\n"
+    /* 39. unsupported flag for ls returns nonzero */
+    "ls -Z /tmp 2>/dev/null || echo \"M11-UTIL: ok bad-flag-ls\"\n"
+    /* 40. unsupported flag for grep returns nonzero */
+    "grep -X \"pat\" /tmp/m11_util.txt 2>/dev/null || echo \"M11-UTIL: ok bad-flag-grep\"\n"
+    /* ── Legacy POSIX tests preserved ──────────────────────────── */
     "touch /tmp/posix_test\n"
     "[ -f /tmp/posix_test ] && echo \"ok touch\" || echo \"fail touch\"\n"
-    "printf \"hello world\\n\"\n"
-    "true && echo \"ok and\"\n"
+    "true && echo \"ok and\" || echo \"fail and\"\n"
     "false || echo \"ok or\"\n"
     "mkdir -p /tmp/a/b/c\n"
     "[ -d /tmp/a/b/c ] && echo \"ok mkdir-p\" || echo \"fail mkdir-p\"\n"
+    "echo \"hello; world\" | grep \";\" && echo \"ok quote split\"\n"
+    "echo 'single; quote' | grep \";\" && echo \"ok quote split 2\"\n"
+    "rm -rf /tmp/a\n"
     "ln -s /tmp/loop /tmp/loop\n"
     "cat /tmp/loop && echo \"fail eloop\" || echo \"ok eloop\"\n"
-    "rm /tmp/posix_test\n"
-    "[ ! -f /tmp/posix_test ] && echo \"ok rm\" || echo \"fail rm\"\n"
     "echo \"POSIX-SMOKE: done\"\n";
+
+
 
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),

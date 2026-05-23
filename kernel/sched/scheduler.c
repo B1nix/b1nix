@@ -144,7 +144,12 @@ static void task_init_cred(struct task *task) {
 
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   interrupts_disable();
+  struct task *parent_task = current_task;
   struct task *task = find_unused_task();
+  if (task) {
+    task->id = next_task_id++;
+    task->state = TASK_BLOCKED; /* Reserve the slot until fully initialized. */
+  }
   interrupts_enable();
 
   if (task == 0) {
@@ -152,18 +157,28 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   }
 
   void *stack = kmalloc(KERNEL_STACK_SIZE);
+  if (!stack) {
+    interrupts_disable();
+    task->state = TASK_UNUSED;
+    interrupts_enable();
+    return -1;
+  }
+
   u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
   task->kernel_stack_ptr = stack_top;
   u64 initial_rsp = stack_top - 16;
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
 
-  interrupts_disable();
-  task->id = next_task_id++;
   task->name = strdup(name);
-  task->state = TASK_READY;
+  if (!task->name) {
+    interrupts_disable();
+    task->state = TASK_UNUSED;
+    interrupts_enable();
+    kfree(stack);
+    return -1;
+  }
   task->entry = entry;
   task->arg = arg;
-  interrupts_enable();
   task->stack = stack;
   task->wake_tick = 0;
 #ifdef __aarch64__
@@ -190,11 +205,11 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->context.r14 = 0;
   task->context.r15 = 0;
 #endif
-  task->stdout_fd = current_task ? current_task->stdout_fd : -1;
+  task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
   for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if (current_task) {
-      task->fd_table[i] = current_task->fd_table[i];
-      task->fd_flags[i] = current_task->fd_flags[i];
+    if (parent_task) {
+      task->fd_table[i] = parent_task->fd_table[i];
+      task->fd_flags[i] = parent_task->fd_flags[i];
       if (task->fd_table[i] >= 0) {
         vfs_handle_retain(task->fd_table[i]);
       }
@@ -204,16 +219,16 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     }
   }
   task->priority = 1;
-  task->parent_id = current_task ? current_task->id : 0;
-  if (current_task) {
-    memcpy(task->cwd, current_task->cwd, sizeof(task->cwd));
+  task->parent_id = parent_task ? parent_task->id : 0;
+  if (parent_task) {
+    memcpy(task->cwd, parent_task->cwd, sizeof(task->cwd));
     task->cwd[sizeof(task->cwd) - 1] = '\0';
-    task->user_brk = current_task->user_brk;
-    task->heap_start = current_task->heap_start;
-    task->umask = current_task->umask;
-    task->process_group_id = current_task->process_group_id;
-    task->session_id = current_task->session_id;
-    memcpy(task->env, current_task->env, sizeof(task->env));
+    task->user_brk = parent_task->user_brk;
+    task->heap_start = parent_task->heap_start;
+    task->umask = parent_task->umask;
+    task->process_group_id = parent_task->process_group_id;
+    task->session_id = parent_task->session_id;
+    memcpy(task->env, parent_task->env, sizeof(task->env));
   } else {
     task->cwd[0] = '/';
     task->cwd[1] = '\0';
@@ -231,6 +246,10 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
   task_init_cred(task);
+
+  interrupts_disable();
+  task->state = TASK_READY;
+  interrupts_enable();
 
   return (int)task->id;
 }
@@ -522,6 +541,10 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tasks[i].user_image = 0;
             }
             user_address_space_cleanup(&tasks[i]);
+            if (tasks[i].name && strcmp(tasks[i].name, "boot") != 0) {
+              kfree((void *)tasks[i].name);
+              tasks[i].name = 0;
+            }
             kfree(tasks[i].stack);
             tasks[i].state = TASK_UNUSED;
             interrupts_enable();

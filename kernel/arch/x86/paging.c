@@ -159,6 +159,10 @@ void vmm_init(void) {
     pd_i[pd_index(physical)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
   }
 
+  /* Pre-allocate page tables for the kernel heap in the higher half */
+  u64 *pdpt_kheap = ensure_child_table(pml4, pml4_index(KHEAP_START));
+  ensure_child_table(pdpt_kheap, pdpt_index(KHEAP_START));
+
   console_write("vmm: direct map 0x");
   console_write_hex64(DIRECT_MAP_BASE);
   console_write("-0x");

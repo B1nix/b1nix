@@ -247,8 +247,8 @@ the persistent ext2 root image.
 
 - `done` Shell command loop exists.
 - `done` `PATH` lookup exists.
-- `partial` Pipes use real `pipe()` and `dup2()`, but EOF/blocking semantics
-  still need hardening for POSIX-style pipelines.
+- `done` Pipes use real `pipe()` and `dup2()` with deterministic smoke markers
+  for EOF, nonblocking `-EAGAIN`, and broken-pipe `-EPIPE` behavior.
 - `done` Redirection supports `<`, `>`, `>>`, `2>`, `2>&1`, and descriptor
   duplication.
 - `done` Basic environment variables exist (`export`, `unset`, `$VAR`, `$?`).
@@ -264,19 +264,24 @@ the persistent ext2 root image.
   restored dispatch set plus `ls -la`, `cp -r`, `rm -rf`, `mkdir -p`,
   `grep -q`, `grep -n`, `head -n NUM`, and `tail -n NUM`. Unknown flags
   return nonzero exit code. Broader compatibility tests still needed.
-- `partial` Shell-driven smoke coverage exists through `/bin/shell-smoke` and
-  `/etc/posix-smoke.sh`, but it covers a narrow supported subset.
+- `done` Shell-driven smoke coverage exists through `/bin/shell-smoke` and
+  `/etc/posix-smoke.sh` with deterministic M11 markers for command status,
+  PATH lookup, quoting, redirection, pipeline status, script execution, and
+  shebang support/unsupported behavior.
 - `partial` Background jobs and job-control metadata exist (`jobs`, `fg`, `&`);
   `bg` and full POSIX terminal job control are not complete.
 
 ### Current Estimate
 
-`Shell/coreutils` is roughly 73-80% of the way to a practical POSIX branch
-close. Single-quote, double-quote, and backslash parsing are done; `&&`, `||`,
-and `;` operators work; `mkdir -p`, `rm -rf`, and all major utility flags are
-implemented; scripts run from VFS with shebang skip. Remaining gaps: pipeline
-EOF/blocking hardening, `bg` built-in, full job-control signal semantics, and
-broad unsupported-flag compatibility tests.
+`Shell/coreutils` is closed for the current x86_64 QEMU/dev baseline. Single-
+quote, double-quote, and backslash parsing are done; `&&`, `||`, and `;`
+operators work; deterministic smoke now checks failed exec as `127`,
+redirection failure as nonzero, and pipeline status as rightmost-stage status.
+Remaining gaps beyond M11 are broader POSIX shell compatibility (`bg`,
+subshells, command substitution, full signal/job-control semantics, and broad
+unsupported-flag parity with GNU/BSD userlands).
+TCP e2e completeness is tracked under network scope; M11 accepts either
+`TCP-SMOKE: path-exercised` or an explicit `TCP-SMOKE: unsupported` marker.
 
 Verification note: `make smoke-x86` currently reaches and passes the
 shell/coreutils smoke path. Treat the percentage as feature-completeness, not

@@ -123,8 +123,10 @@ static int bb_copy_file(const char *src, const char *dst) {
   u64 fds = bb_open(src);
   if ((isize)fds < 0)
     return -1;
-  syscall_dispatch(SYS_CREATE, (u64)(usize)dst, (u64)(usize) "", 0, 0, 0, 0);
-  u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst, (u64)B1NIX_O_WRONLY | B1NIX_O_TRUNC, 0, 0, 0, 0);
+  u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst,
+                             (u64)(B1NIX_O_WRONLY | B1NIX_O_CREAT |
+                                   B1NIX_O_TRUNC),
+                             0, 0, 0, 0);
   if ((isize)fdd < 0) {
     syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0, 0, 0);
     return -1;
@@ -683,7 +685,7 @@ static int tail_main(int argc, const char **argv) {
       line_starts[lc++] = (int)(i + 1);
   }
 
-  int start_idx = (lc > nlines) ? line_starts[lc - nlines - 1] : 0;
+  int start_idx = (lc > nlines) ? line_starts[lc - nlines] : 0;
   for (usize i = (usize)start_idx; i < (usize)total; i++)
     putchar(buf[i]);
   return 0;
@@ -740,6 +742,7 @@ static int find_main(int argc, const char **argv) {
 static int grep_main(int argc, const char **argv) {
   int quiet = 0;
   int show_line = 0;
+  int invert = 0;
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
@@ -748,6 +751,8 @@ static int grep_main(int argc, const char **argv) {
           quiet = 1;
         else if (argv[i][j] == 'n')
           show_line = 1;
+        else if (argv[i][j] == 'v')
+          invert = 1;
         else {
           printf("grep: invalid option\n");
           return 1;
@@ -771,35 +776,46 @@ static int grep_main(int argc, const char **argv) {
     total = bb_read_file(file, buf, sizeof(buf));
     if (total < 0)
       return 1;
-  } else { /* read stdin... */
+  } else {
+    while (total < (isize)sizeof(buf) - 1) {
+      char c;
+      if (read(0, &c, 1) <= 0)
+        break;
+      buf[total++] = c;
+    }
+    buf[total] = '\0';
   }
 
   usize plen = strlen(pattern);
   usize line_start = 0;
-  int found = 0;
+  int any_found = 0;
   int line_num = 1;
   for (usize i = 0; i <= (usize)total; i++) {
     if (buf[i] == '\n' || buf[i] == '\0') {
+      int line_found = 0;
       for (usize j = line_start; j + plen <= i; j++) {
         if (memcmp(buf + j, pattern, plen) == 0) {
-          found = 1;
-          if (!quiet) {
-            if (show_line)
-              printf("%d:", line_num);
-            for (usize p = line_start; p < i; p++)
-              putchar(buf[p]);
-            putchar('\n');
-          }
+          line_found = 1;
           break;
         }
       }
+      int selected = invert ? !line_found : line_found;
+      if (selected && !quiet) {
+        if (show_line)
+          printf("%d:", line_num);
+        for (usize p = line_start; p < i; p++)
+          putchar(buf[p]);
+        putchar('\n');
+      }
+      if (selected)
+        any_found = 1;
       line_start = i + 1;
       line_num++;
       if (buf[i] == '\0')
         break;
     }
   }
-  return found ? 0 : 1;
+  return any_found ? 0 : 1;
 }
 
 /* ── wc — word/line/char count ── */
@@ -820,9 +836,20 @@ static int wc_main(int argc, const char **argv) {
 
   const char *file = (argc > start_idx) ? argv[start_idx] : 0;
   char buf[4096];
-  isize total = file ? bb_read_file(file, buf, sizeof(buf)) : 0;
-  if (file && total < 0)
-    return 1;
+  isize total = 0;
+  if (file) {
+    total = bb_read_file(file, buf, sizeof(buf));
+    if (total < 0)
+      return 1;
+  } else {
+    while (total < (isize)sizeof(buf) - 1) {
+      char c;
+      if (read(0, &c, 1) <= 0)
+        break;
+      buf[total++] = c;
+    }
+    buf[total] = '\0';
+  }
 
   int lines = 0;
   int words = 0;
@@ -990,6 +1017,14 @@ static int test_main(int argc, const char **argv) {
   if (arg_idx >= argc)
     return 1;
 
+  /* -e <file> — exists */
+  if (strcmp(argv[arg_idx], "-e") == 0 && arg_idx + 1 < argc) {
+    char path[256];
+    bb_resolve(argv[arg_idx + 1], path, sizeof(path));
+    struct b1nix_stat st;
+    return (syscall_dispatch(SYS_STAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) == 0) ? 0 : 1;
+  }
+
   /* -f <file> */
   if (strcmp(argv[arg_idx], "-f") == 0 && arg_idx + 1 < argc) {
     char path[256];
@@ -1014,6 +1049,19 @@ static int test_main(int argc, const char **argv) {
     return 1;
   }
 
+  /* Integer comparisons: num op num */
+  if (argc - arg_idx >= 3) {
+    const char *op = argv[arg_idx + 1];
+    int a = atoi(argv[arg_idx]);
+    int b = atoi(argv[arg_idx + 2]);
+    if (strcmp(op, "-eq") == 0) return (a == b) ? 0 : 1;
+    if (strcmp(op, "-ne") == 0) return (a != b) ? 0 : 1;
+    if (strcmp(op, "-lt") == 0) return (a <  b) ? 0 : 1;
+    if (strcmp(op, "-le") == 0) return (a <= b) ? 0 : 1;
+    if (strcmp(op, "-gt") == 0) return (a >  b) ? 0 : 1;
+    if (strcmp(op, "-ge") == 0) return (a >= b) ? 0 : 1;
+  }
+
   /* string == string */
   if (argc - arg_idx >= 3) {
     if (strcmp(argv[arg_idx + 1], "=") == 0 ||
@@ -1035,8 +1083,14 @@ static int test_main(int argc, const char **argv) {
     return (argv[arg_idx + 1][0] == '\0') ? 0 : 1;
   }
 
+  /* single string: true if non-empty */
+  if (argc - arg_idx == 1) {
+    return (argv[arg_idx][0] != '\0') ? 0 : 1;
+  }
+
   return 0;
 }
+
 
 /* ═══════════════════════════════════════════════════════════════════
    FILESYSTEM UTILITIES

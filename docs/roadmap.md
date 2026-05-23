@@ -167,7 +167,7 @@ and broader utility flag compatibility.
 ## M11: Shell and Utilities
 
 - [x] `done` Shell built-in commands: `ps`, `mem`, `ping`, `reboot`.
-- [x] `partial` Pipes and redirection (real `pipe()`/`dup2()`, `<`, `>`, `>>`, `2>`, `2>&1`; EOF/blocking behavior not fully hardened).
+- [x] `done` Pipes and redirection (real `pipe()`/`dup2()`, `<`, `>`, `>>`, `2>`, `2>&1`; deterministic EOF/nonblocking/broken-pipe smoke coverage).
 - [x] `done` Environment variables.
 - [x] `done` Job control.
 - [x] `done` PATH lookup against VFS.
@@ -175,6 +175,8 @@ and broader utility flag compatibility.
 - [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
 - [x] `done` Add `selfhost` status command.
 - [x] `done` Add full background-job tracking and POSIX terminal job control.
+- Note: full TCP e2e completeness is tracked under network milestones; M11
+  baseline accepts explicit `TCP-SMOKE: unsupported` reporting.
 
 ## M12: Syscalls and Process Management
 

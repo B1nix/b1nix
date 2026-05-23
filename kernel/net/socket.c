@@ -125,6 +125,19 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
 
 static int socket_close(struct vfs_handle *h) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!s)
+    return 0;
+  if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_DGRAM &&
+      s->bound) {
+    for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+      if (udp_bindings[i].used &&
+          get_handle_by_idx(udp_bindings[i].h_idx) == h) {
+        udp_bindings[i].used = 0;
+        udp_bindings[i].port = 0;
+        udp_bindings[i].h_idx = -1;
+      }
+    }
+  }
   if (s->domain == B1NIX_AF_UNIX) {
     unix_free_state(s);
   } else if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
@@ -132,6 +145,7 @@ static int socket_close(struct vfs_handle *h) {
     s->tcp_conn = 0;
   }
   kfree(s);
+  h->private_data = 0;
   return 0;
 }
 
