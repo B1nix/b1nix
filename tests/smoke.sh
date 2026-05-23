@@ -44,6 +44,8 @@ run_qemu() {
 			-device ich9-ahci,id=ahci \
 			-drive file="$PROJECT_DIR/sata.img",if=none,id=satadrive,format=raw \
 			-device ide-hd,drive=satadrive,bus=ahci.0 \
+			-drive file="$PROJECT_DIR/swap.img",if=none,id=swapdrive,format=raw \
+			-device ide-hd,drive=swapdrive,bus=ahci.1 \
 			-drive file="$PROJECT_DIR/nvme.img",if=none,id=nvmedrive,format=raw \
 			-device nvme,serial=deadbeef,drive=nvmedrive \
 			>"$log" 2>&1 &
@@ -92,9 +94,29 @@ make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1 || {
 }
 pass "kernel builds without errors"
 
-# Create dummy images for SATA and NVMe tests
+# Create dummy images for SATA, NVMe and Swap tests
 dd if=/dev/zero of="$PROJECT_DIR/sata.img" bs=1M count=4 2>/dev/null
 dd if=/dev/zero of="$PROJECT_DIR/nvme.img" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$PROJECT_DIR/swap.img" bs=1M count=2 2>/dev/null
+
+MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
+if [ ! -x "$MKE2FS" ]; then
+    MKE2FS=$(which mke2fs || echo "")
+fi
+if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
+    echo "Error: mke2fs utility not found. Please install e2fsprogs."
+    exit 1
+fi
+
+"$MKE2FS" -t ext3 -q "$PROJECT_DIR/sata.img" || {
+    echo "Error: Failed to format sata.img as ext3."
+    exit 1
+}
+"$MKE2FS" -t ext4 -q "$PROJECT_DIR/nvme.img" || {
+    echo "Error: Failed to format nvme.img as ext4."
+    exit 1
+}
+
 
 # ── Test 1: Kernel boots ──
 echo ""
@@ -202,6 +224,22 @@ fi
 check_output "$LOG" "M13-SMOKE: ok parent-intact" "failed child exec path does not corrupt parent runtime"
 check_output "$LOG" "M13-SMOKE: ok errno-negative" "negative syscall result path is exposed to userspace"
 check_output "$LOG" "M13-SMOKE: done" "M13 smoke completes successfully"
+
+# ── M14 Advanced Storage, Swap & File Systems ──
+echo ""
+echo "[TEST] M14 Storage, Swap & File Systems..."
+check_output "$LOG" "M14-SMOKE: ok swap-smoke" "swap page swap-out and swap-in verified"
+check_output "$LOG" "M14-SMOKE: ok mount-ext3" "mount sata0 as ext3 successful"
+check_output "$LOG" "M14-SMOKE: ok mount-ext4" "mount nvme0 as ext4 successful"
+check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
+check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"
+check_output "$LOG" "M14-SMOKE: ok persistence" "persistence through sync, umount, and remount verified"
+check_output "$LOG" "M14-SMOKE: ok invalid-device" "mounting invalid device fails gracefully"
+check_output "$LOG" "M14-SMOKE: ok invalid-fs" "mounting invalid filesystem type fails gracefully"
+check_output "$LOG" "M14-SMOKE: ok stress-loop" "repeated create/write/read/delete loop completes successfully"
+check_output "$LOG" "M14-SMOKE: ok large-file" "large file bounds allocation and verification successful"
+check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization works on mounts"
+check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
 
 # ── M22 utility init-path smoke ──
 echo ""
@@ -339,8 +377,8 @@ echo "  Failed:  $FAILED"
 echo "  Skipped: $SKIPPED"
 echo ""
 
-# Clean up SATA and NVMe dummy images
-rm -f "$PROJECT_DIR/sata.img" "$PROJECT_DIR/nvme.img"
+# Clean up SATA, NVMe and Swap dummy images
+rm -f "$PROJECT_DIR/sata.img" "$PROJECT_DIR/nvme.img" "$PROJECT_DIR/swap.img"
 
 if [ "$FAILED" -gt 0 ]; then
 	exit 1

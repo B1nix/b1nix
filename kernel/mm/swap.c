@@ -32,9 +32,14 @@ void vmm_set_swap_device(struct block_device *dev)
 {
     swap_dev = dev;
     if (dev) {
-        // Reserve last 1/4 of the device for swap
-        swap_start_lba = (dev->block_count * 3) / 4;
-        swap_sector_count = dev->block_count - swap_start_lba;
+        if (strcmp(dev->name, "sata1") == 0 || strcmp(dev->name, "nvme1") == 0) {
+            swap_start_lba = 0;
+            swap_sector_count = dev->block_count;
+        } else {
+            // Reserve last 1/4 of the device for swap
+            swap_start_lba = (dev->block_count * 3) / 4;
+            swap_sector_count = dev->block_count - swap_start_lba;
+        }
         console_write("swap: device=");
         console_write(dev->name);
         console_write(" start_lba=");
@@ -51,6 +56,57 @@ int swap_init(void)
     console_write("swap: initialized, max_slots=");
     console_write_dec(MAX_SWAP_SLOTS);
     console_write("\n");
+
+    struct block_device *dev = blk_get("sata1");
+    if (!dev) {
+        dev = blk_get("nvme1");
+    }
+    if (dev) {
+        vmm_set_swap_device(dev);
+    }
+
+    if (swap_dev) {
+        console_write("swap: running internal smoke test...\n");
+        u64 test_frame = pmm_alloc_frame();
+        if (test_frame) {
+            extern u64 vmm_direct_map_base(void);
+            u64 direct_base = vmm_direct_map_base();
+            char *ptr = (char *)(usize)(test_frame + direct_base);
+            strcpy(ptr, "B1NIX Swap Smoke Test Pattern");
+
+            u64 fake_vaddr = 0xDEADBEEF000ULL;
+            int slot = swap_out(fake_vaddr, test_frame);
+            if (slot >= 0) {
+                console_write("swap: page swap-out ok, slot=");
+                console_write_dec(slot);
+                console_write("\n");
+
+                memset(ptr, 0, PAGE_SIZE);
+
+                u64 out_frame = 0;
+                if (swap_in(fake_vaddr, &out_frame) == 0 && out_frame != 0) {
+                    char *out_ptr = (char *)(usize)(out_frame + direct_base);
+                    if (strcmp(out_ptr, "B1NIX Swap Smoke Test Pattern") == 0) {
+                        console_write("swap: page swap-in ok, verified data\n");
+                        console_write("M14-SMOKE: ok swap-smoke\n");
+                    } else {
+                        console_write("swap: swap-in data mismatch!\n");
+                    }
+                    pmm_free_frame(out_frame);
+                } else {
+                    console_write("swap: swap-in failed!\n");
+                }
+            } else {
+                console_write("swap: swap-out failed!\n");
+            }
+            pmm_free_frame(test_frame);
+        } else {
+            console_write("swap: failed to allocate test frame\n");
+        }
+    } else {
+        console_write("M14-SMOKE: swap not active (no device)\n");
+    }
+
     return 0;
 }
 
@@ -79,7 +135,7 @@ static void swap_free_slot(u32 slot_index)
 static int swap_find_slot(u64 pml4_phys, u64 virtual_addr)
 {
     for (usize i = 0; i < MAX_SWAP_SLOTS; i++) {
-        if (swap_table[i].used && swap_table[i].pml4_phys == pml4_phys && 
+        if (swap_table[i].used && swap_table[i].pml4_phys == pml4_phys &&
             swap_table[i].virtual_addr == virtual_addr) {
             return (int)i;
         }
@@ -102,8 +158,15 @@ int swap_out(u64 virtual_addr, u64 physical_frame)
         return -1;
     }
 
-    u64 lba = swap_start_lba + (u64)slot * SECTORS_PER_PAGE;
-    
+    u64 slot_sector = (u64)slot * SECTORS_PER_PAGE;
+    if (slot_sector > swap_sector_count || SECTORS_PER_PAGE > swap_sector_count - slot_sector) {
+        console_write("swap_out: slot exceeds swap device bounds\n");
+        swap_free_slot(slot);
+        return -1;
+    }
+
+    u64 lba = swap_start_lba + slot_sector;
+
     // Write the page from physical memory to swap
     extern u64 vmm_direct_map_base(void);
     u64 direct_base = vmm_direct_map_base();
@@ -136,7 +199,7 @@ int swap_in(u64 virtual_addr, u64 *out_physical_frame)
     }
 
     u64 lba = swap_start_lba + (u64)slot * SECTORS_PER_PAGE;
-    
+
     // Allocate a new physical frame
     u64 frame = pmm_alloc_frame();
     if (!frame) {

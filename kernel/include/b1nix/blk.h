@@ -35,5 +35,6 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count, const void *b
 void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
+void blk_cache_invalidate(struct block_device *dev);
 
 #endif

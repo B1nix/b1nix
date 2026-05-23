@@ -360,9 +360,10 @@ static int ext3_add_dir_entry_tx(struct ext3_fs *fs, u32 dir_ino, u32 child_ino,
       if (e->rec_len == 0) break;
       u32 actual = 8 + ((e->name_len + 3) & ~3);
       if (e->rec_len >= actual + needed) {
+        u32 old_rec_len = e->rec_len;
         e->rec_len = actual;
         struct ext2_dir_entry *ne = (struct ext2_dir_entry *)(buf + off + actual);
-        ne->inode = child_ino; ne->rec_len = e->rec_len - actual; ne->name_len = name_len; ne->file_type = type;
+        ne->inode = child_ino; ne->rec_len = old_rec_len - actual; ne->name_len = name_len; ne->file_type = type;
         memcpy(ne->name, name, name_len); ext3_journal_write_tx(fs, h, phys, buf);
         kfree(buf); return 0;
       }
@@ -411,7 +412,7 @@ static int ext3_vfs_create(struct vfs_node *dir, const char *name, const char *f
     return -EIO;
   }
   if (h) journal_commit_transaction(h);
-  struct vfs_node *n = vfs_add_node(full_path, VFS_FILE, 0, 0, 0);
+  struct vfs_node *n = find_child(dir, name);
   if (n) ext3_setup_node(n, fs, new_ino, inode.i_mode);
   return 0;
 }
@@ -806,6 +807,7 @@ static struct vfs_node *ext3_vfs_mount_cb(const char *source, u64 flags, void *d
   kfree(sb_buf);
   struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
   ext3_setup_node(root, fs, 2, EXT2_S_IFDIR);
+  vfs_set_currently_mounting_root(root);
   if (data) ext3_populate_vfs(fs, 2, (const char *)data);
   return root;
 }

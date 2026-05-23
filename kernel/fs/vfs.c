@@ -536,7 +536,7 @@ static void split_path(const char *path, char *first_part, const char **rest) {
   *rest = path + i;
 }
 
-static struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
+struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
   if (!parent || !parent->inode || parent->inode->type != VFS_DIRECTORY)
     return 0;
 
@@ -943,6 +943,14 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       return current;
 
     struct vfs_node *child = find_child(current, part);
+    if (child) {
+      for (int i = 0; i < MAX_MOUNTS; i++) {
+        if (mounts[i].used && child == mounts[i].mount_point) {
+          child = mounts[i].root_node;
+          break;
+        }
+      }
+    }
     int is_leaf =
         (!rest || rest[0] == '\0' || (rest[0] == '/' && rest[1] == '\0'));
 
@@ -988,7 +996,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->inode->flags = flags;
         child->inode->mtime = child->inode->ctime = vfs_get_unix_time();
       } else {
-        return ERR_PTR(-EEXIST);
+        return child;
       }
       return child;
     } else {
@@ -1388,7 +1396,7 @@ int vfs_open_flags(const char *path, int flags) {
     }
     vfs_inode_lock(node->inode);
     node->inode->size = 0;
-    if (node->inode->data)
+    if (node->inode->data && !node->inode->write_cb && !node->inode->read_cb)
       ((char *)node->inode->data)[0] = '\0';
     if (node->inode->setattr_cb)
       node->inode->setattr_cb(node);
@@ -2492,6 +2500,14 @@ int vfs_fsync(int fd) {
   return 0;
 }
 
+static struct vfs_mount_entry *currently_mounting = NULL;
+
+void vfs_set_currently_mounting_root(struct vfs_node *root) {
+  if (currently_mounting) {
+    currently_mounting->root_node = root;
+  }
+}
+
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags) {
   if (!target || target[0] == '\0' || !fstype)
@@ -2514,12 +2530,6 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return -ENODEV;
   }
 
-  struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
-  if (IS_ERR(root_node)) {
-    vfs_node_put(target_node);
-    return (int)PTR_ERR(root_node);
-  }
-
   int midx = -1;
   for (usize i = 0; i < MAX_MOUNTS; i++) {
     if (!mounts[i].used) {
@@ -2530,18 +2540,30 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
 
   if (midx == -1) {
     vfs_node_put(target_node);
-    vfs_node_put(root_node);
     return -ENOMEM;
   }
 
-  interrupts_disable();
+  // Pre-register slot so mount crossing works during populate_vfs
   mounts[midx].used = 1;
+  mounts[midx].mount_point = target_node;
+  mounts[midx].root_node = NULL;
+
+  currently_mounting = &mounts[midx];
+  struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
+  currently_mounting = NULL;
+
+  if (IS_ERR(root_node)) {
+    mounts[midx].used = 0;
+    vfs_node_put(target_node);
+    return (int)PTR_ERR(root_node);
+  }
+
+  interrupts_disable();
   copy_path(mounts[midx].source, sizeof(mounts[midx].source),
             source ? source : "");
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
   mounts[midx].flags = flags;
-  mounts[midx].mount_point = target_node;
   mounts[midx].root_node = root_node;
 
   root_node->inode->fs_id = next_fs_id++;
@@ -2574,6 +2596,11 @@ int vfs_umount(const char *target) {
       struct vfs_node *root = mounts[i].root_node;
       struct vfs_node *mp = mounts[i].mount_point;
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
+
+      if (root && root->inode && root->inode->blk_dev) {
+        blk_cache_flush(root->inode->blk_dev);
+        blk_cache_invalidate(root->inode->blk_dev);
+      }
 
       vfs_node_put(root);
       vfs_node_put(mp);

@@ -39,7 +39,7 @@ static u64 le64(const u8 *p) { return (u64)le32(p) | ((u64)le32(p + 4) << 32); }
 static int partition_read(struct block_device *dev, u64 lba, u32 count,
                           void *buffer) {
   struct partition_device *part = (struct partition_device *)dev->priv;
-  if (!part || lba + count > dev->block_count)
+  if (!part || count > dev->block_count || lba > dev->block_count - count)
     return -1;
   return blk_read_cached(part->parent, part->start_lba + lba, count, buffer);
 }
@@ -47,7 +47,7 @@ static int partition_read(struct block_device *dev, u64 lba, u32 count,
 static int partition_write(struct block_device *dev, u64 lba, u32 count,
                            const void *buffer) {
   struct partition_device *part = (struct partition_device *)dev->priv;
-  if (!part || lba + count > dev->block_count)
+  if (!part || count > dev->block_count || lba > dev->block_count - count)
     return -1;
   return blk_write_cached(part->parent, part->start_lba + lba, count, buffer);
 }
@@ -269,8 +269,19 @@ static struct block_buffer *bcache_evict(void) {
 
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
                     void *buffer) {
-  if (!dev || !dev->read_blocks)
+  if (!dev || !dev->read_blocks) {
+    console_write("blk_read_cached: dev or read_blocks is NULL\n");
     return -1;
+  }
+  if (dev->block_count > 0 && (count > dev->block_count || lba > dev->block_count - count)) {
+    console_write("blk_read_cached: bounds check failed for ");
+    console_write(dev->name);
+    console_write(" lba="); console_write_dec(lba);
+    console_write(" count="); console_write_dec(count);
+    console_write(" block_count="); console_write_dec(dev->block_count);
+    console_write("\n");
+    return -1;
+  }
   if (dev->block_size != CACHE_BLOCK_SIZE) {
     return dev->read_blocks(dev, lba, count, buffer);
   }
@@ -287,6 +298,10 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       entry->bdev = dev;
       entry->block_no = current_lba;
       if (dev->read_blocks(dev, current_lba, 1, entry->data) < 0) {
+        console_write("blk_read_cached: read_blocks failed for ");
+        console_write(dev->name);
+        console_write(" lba="); console_write_dec(current_lba);
+        console_write("\n");
         return -1;
       }
       entry->flags |= BLK_CACHE_VALID;
@@ -302,6 +317,9 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
                      const void *buffer) {
   if (!dev || !dev->write_blocks)
     return -1;
+  if (dev->block_count > 0 && (count > dev->block_count || lba > dev->block_count - count)) {
+    return -1;
+  }
   if (dev->block_size != CACHE_BLOCK_SIZE) {
     return dev->write_blocks(dev, lba, count, buffer);
   }
@@ -327,7 +345,6 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   return 0;
 }
 
-/* POSIX: Fsync/Sync support - Flush all dirty blocks to physical storage */
 /* POSIX: Fsync/Sync support - Flush all dirty blocks to physical storage */
 void blk_flush_buffer(struct block_buffer *buf) {
   if (!buf || !(buf->flags & BLK_CACHE_DIRTY))
@@ -358,6 +375,20 @@ void blk_cache_flush(struct block_device *dev) {
   for (int i = 0; i < CACHE_ENTRIES; i++) {
     if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       blk_flush_buffer(&block_cache[i]);
+    }
+  }
+}
+
+void blk_cache_invalidate(struct block_device *dev) {
+  if (!dev) return;
+  for (int i = 0; i < CACHE_ENTRIES; i++) {
+    if (block_cache[i].bdev == dev) {
+      if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
+        blk_flush_buffer(&block_cache[i]);
+      }
+      block_cache[i].flags = 0;
+      block_cache[i].bdev = 0;
+      block_cache[i].block_no = 0;
     }
   }
 }

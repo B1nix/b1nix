@@ -754,8 +754,7 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name,
 		return -1;
 	}
 	
-  struct vfs_node *node =
-      vfs_add_node(full_path, VFS_FILE, 0, 0, 0);
+  struct vfs_node *node = find_child(dir, name);
 	if (node) {
 		node->inode->blk_dev = dir->inode->blk_dev;
 		node->inode->read_cb = ext2_vfs_read;
@@ -1238,6 +1237,7 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
       ext2_load_acls(fs, &ri, root->inode);
   }
   
+  vfs_set_currently_mounting_root(root);
   if (data) {
     ext2_populate_vfs(fs, 2, (const char *)data);
   }

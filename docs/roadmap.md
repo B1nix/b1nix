@@ -228,7 +228,10 @@ gaps are explicitly deferred to M15.
 - [x] `done` `sync()` and `fsync()` flush block cache paths.
 - [x] `done` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
 - [x] `done` Persistent ext2 root-image creation and boot overlay.
-- [ ] `planned` Add complete AHCI/NVMe production paths (robust journal replay and full file-lock blocking semantics are implemented).
+- [x] `done` Add complete AHCI/NVMe baseline storage paths (QEMU/dev storage baseline with robust journal replay and full file-lock blocking semantics are implemented).
+
+M14 closes the QEMU/dev advanced storage, swap, and filesystem baseline. The system implements a write-back block cache with bounds checking, smoke-tests swap on dedicated block devices, covers ext2/ext3/ext4 mount and persistence paths, and flushes caches on unmount.
+*Deferred to future:* Unsupported journaling features (JBD revoke block tracking, metadata-only ordering), full ext4 extent index tree splitting (currently single leaf extent block is used), and userspace partition/formatting tools.
 
 ## M15: IPC, Security & Standard OS Features
 

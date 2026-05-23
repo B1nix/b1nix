@@ -25,6 +25,7 @@ BINARIES := \
 	$(BUILD)/bin/native_smoke \
 	$(BUILD)/bin/m12_smoke \
 	$(BUILD)/bin/m13_smoke \
+	$(BUILD)/bin/m14_smoke \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync
 

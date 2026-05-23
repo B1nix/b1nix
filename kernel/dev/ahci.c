@@ -43,9 +43,9 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   struct ahci_cmd_header *cmd_hdr = &port->cmd_list[0];
   struct ahci_cmd_table *cmd_table = port->cmd_table;
 
-  // Wait for command list to be not running
+  // Wait for device to not be busy
   int timeout = 1000000;
-  while ((p->cmd & AHCI_PxCMD_CR) && timeout > 0) {
+  while ((p->tfd & 0x88) && timeout > 0) {
     __asm__ volatile("pause");
     timeout--;
   }
@@ -53,7 +53,11 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
     return -1;
 
   // Setup command header
+  u32 ctba = cmd_hdr->ctba;
+  u32 ctbau = cmd_hdr->ctbau;
   memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->ctba = ctba;
+  cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 0; // Read
   cmd_hdr->prdtl = 1; // One PRD entry
@@ -129,14 +133,18 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
                                 4096); // Separate table for slot 1
 
   int timeout = 1000000;
-  while ((p->cmd & AHCI_PxCMD_CR) && timeout > 0) {
+  while ((p->tfd & 0x88) && timeout > 0) {
     __asm__ volatile("pause");
     timeout--;
   }
   if (timeout == 0)
     return -1;
 
+  u32 ctba = cmd_hdr->ctba;
+  u32 ctbau = cmd_hdr->ctbau;
   memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->ctba = ctba;
+  cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 1; // Write
   cmd_hdr->prdtl = 1;
@@ -241,6 +249,18 @@ static void ahci_port_init(struct ahci_port_state *port,
   console_write_dec(num);
   console_write(" device detected\n");
 
+  // Make sure engine is stopped before writing configuration registers
+  p->cmd &= ~AHCI_PxCMD_ST;
+  p->cmd &= ~AHCI_PxCMD_FRE;
+  int init_timeout = 1000000;
+  while (init_timeout > 0) {
+    if (!(p->cmd & AHCI_PxCMD_CR) && !(p->cmd & AHCI_PxCMD_FR)) {
+      break;
+    }
+    __asm__ volatile("pause");
+    init_timeout--;
+  }
+
   // Allocate command list (1K aligned)
   port->phys_cmd_list = pmm_alloc_frames(1);
   port->cmd_list = (struct ahci_cmd_header *)(usize)(port->phys_cmd_list + vmm_direct_map_base());
@@ -295,14 +315,18 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   struct ahci_cmd_table *cmd_table = port->cmd_table;
 
   int timeout = 1000000;
-  while ((p->cmd & AHCI_PxCMD_CR) && timeout > 0) {
+  while ((p->tfd & 0x88) && timeout > 0) {
     __asm__ volatile("pause");
     timeout--;
   }
   if (timeout == 0)
     return -1;
 
+  u32 ctba = cmd_hdr->ctba;
+  u32 ctbau = cmd_hdr->ctbau;
   memset(cmd_hdr, 0, sizeof(struct ahci_cmd_header));
+  cmd_hdr->ctba = ctba;
+  cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 0;
   cmd_hdr->prdtl = 1;

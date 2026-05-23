@@ -128,6 +128,7 @@ struct vfs_fs {
 u32 vfs_get_unix_time(void);
 void vfs_init(void);
 void vfs_resolve_path(const char *path, char *out);
+struct vfs_node *find_child(struct vfs_node *parent, const char *name);
 struct vfs_node *vfs_find_node(const char *path);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
                               void *data, usize size, u32 flags);
@@ -162,6 +163,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
 void vfs_register_fs(struct vfs_fs *fs);
+void vfs_set_currently_mounting_root(struct vfs_node *root);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
