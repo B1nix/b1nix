@@ -90,34 +90,48 @@ static int copy_string_vector(const char **src, int max_count,
   int count = 0;
   char tmp[1024];
 
-  if (!copy)
+  if (!copy) {
+    console_write("copy_string_vector: kzalloc failed\n");
     return -1;
+  }
   if (src) {
     for (; count < max_count; count++) {
       const char *ptr = 0;
-      /* Check if src is in kernel space (high addresses) */
-      if ((u64)src >= 0xffff800000000000) {
+      /* Check if src is in kernel space */
+      if ((u64)src >= 0xffff800000000000 || (u64)src < 0x400000) {
         ptr = src[count];
       } else {
-        if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0)
+        if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0) {
+          console_write("copy_string_vector: syscall_copyin src failed at ");
+          console_write_dec(count);
+          console_write("\n");
           return -1;
+        }
       }
 
       if (!ptr)
         break;
 
       /* Check if ptr is in kernel space */
-      if ((u64)ptr >= 0xffff800000000000) {
+      if ((u64)ptr >= 0xffff800000000000 || (u64)ptr < 0x400000) {
         strncpy(tmp, ptr, sizeof(tmp));
         tmp[sizeof(tmp) - 1] = '\0';
       } else {
-        if (syscall_copyinstr(tmp, sizeof(tmp), ptr) != 0)
+        if (syscall_copyinstr(tmp, sizeof(tmp), ptr) != 0) {
+          console_write("copy_string_vector: syscall_copyinstr ptr failed at ");
+          console_write_dec(count);
+          console_write("\n");
           return -1;
+        }
       }
 
       copy[count] = kernel_strdup(tmp);
-      if (!copy[count])
+      if (!copy[count]) {
+        console_write("copy_string_vector: kernel_strdup failed at ");
+        console_write_dec(count);
+        console_write("\n");
         return -1;
+      }
     }
   }
   copy[count] = 0;
@@ -329,6 +343,11 @@ void user_image_free(struct user_loaded_image *image) {
   if (!image)
     return;
 
+  if (image->refcount > 1) {
+    image->refcount--;
+    return;
+  }
+
   if (image->path)
     kfree((void *)image->path);
 
@@ -366,19 +385,18 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   struct user_loaded_image *image = kzalloc(sizeof(*image));
   if (!image)
     return 0;
+  image->refcount = 1;
 
-  console_write("user_load_image: allocated image=");
-  console_write_hex64((u64)(usize)image);
-  console_write(" path=");
-  console_write(path ? path : "null");
-  console_write("\n");
-
-  if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc) != 0)
+  if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc) != 0) {
+    console_write("user_load_image: copy_string_vector argv failed\n");
     return 0;
+  }
   if (argc > 0 && image->argc > argc)
     image->argc = argc;
-  if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0) != 0)
+  if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0) != 0) {
+    console_write("user_load_image: copy_string_vector envp failed\n");
     return 0;
+  }
 
   if (image->argc == 0) {
     const char **default_argv = image->argv;
@@ -388,11 +406,10 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   }
 
   if (user_load_elf64(image, path) == 0) {
-    if (user_build_initial_stack(image) != 0)
+    if (user_build_initial_stack(image) != 0) {
+      console_write("user_load_image: user_build_initial_stack ELF64 failed\n");
       return 0;
-    console_write("user_load_image: loaded ELF64 entry=");
-    console_write_hex64(image->entry);
-    console_write("\n");
+    }
     return image;
   }
 
@@ -402,15 +419,10 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->path = kernel_strdup(path);
     image->entry = (u64)(usize)program->entry;
     image->address_space = user_address_space_create();
-    if (user_build_initial_stack(image) != 0)
+    if (user_build_initial_stack(image) != 0) {
+      console_write("user_load_image: user_build_initial_stack BUILTIN failed\n");
       return 0;
-    console_write("user_load_image: loaded BUILTIN kind=");
-    console_write_hex64(image->kind);
-    console_write(" entry=");
-    console_write_hex64(image->entry);
-    console_write(" path=");
-    console_write(image->path);
-    console_write("\n");
+    }
     return image;
   }
 
@@ -484,9 +496,6 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     user_address_space_cleanup(current_task);
   }
 
-  console_write("user_run_elf: entry=");
-  console_write_hex64(image->entry);
-  console_write("\n");
   int compat_code = 0;
   if (user_try_run_b1nxexec_image(image, &compat_code))
     return compat_code;
@@ -631,20 +640,6 @@ static void user_process_thread(void *arg) {
   struct process_start *start = arg;
   struct user_loaded_image *image = start ? start->image : 0;
 
-  console_write("user_process_thread: start=");
-  console_write_hex64((u64)(usize)start);
-  console_write(" image=");
-  console_write_hex64((u64)(usize)image);
-  console_write("\n");
-
-  console_write("user_process_thread: name=");
-  console_write((image && image->path) ? image->path : "null");
-  console_write(" kind=");
-  console_write_hex64(image ? image->kind : 999);
-  console_write(" entry=");
-  console_write_hex64(image ? image->entry : 999);
-  console_write("\n");
-
   scheduler_set_user_image(image);
   kfree(start);
 
@@ -742,6 +737,11 @@ int user_execve_current(const char *path, const char **argv,
       current_task->sigactions[sig].sa_handler = SIG_DFL;
     }
   }
+
+  if (current_task->user_image) {
+    user_image_free(current_task->user_image);
+  }
+  current_task->user_image = image;
 
   int code = 0;
   if (image->kind == USER_IMAGE_ELF64) {

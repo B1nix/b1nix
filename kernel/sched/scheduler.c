@@ -276,6 +276,10 @@ int scheduler_fork_current(void) {
   child->parent_id = parent->id;
   child->state = TASK_READY;
 
+  if (child->user_image) {
+    ((struct user_loaded_image *)child->user_image)->refcount++;
+  }
+
   // Clear inherited pending signals and sleep/block states
   child->pending_signals = 0;
   child->wake_tick = 0;
@@ -397,6 +401,7 @@ void scheduler_yield(void) {
   current_task = new_task;
 
   paging_switch_address_space(new_task->pml4_phys);
+  arch_set_kernel_stack(new_task->kernel_stack_ptr);
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
 }
@@ -557,14 +562,14 @@ int scheduler_waitpid(usize pid, int *status, int options) {
                 *status = (code & 0xFF) << 8;
               }
             }
-            return child_id;
+             return child_id;
           } else if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_BLOCKED) {
             // Task is stopped (e.g. by SIGSTOP, SIGTSTP, etc.)
             int child_id = tasks[i].id;
             if (status)
               *status = 0x7F; // Stopped
             interrupts_enable();
-            return child_id;
+             return child_id;
           }
         }
       }
@@ -1018,10 +1023,13 @@ void scheduler_deliver_pending_signals(void) {
 
     if (sig == SIGKILL) {
       /* SIGKILL — terminate immediately */
-      interrupts_disable();
       current_task->exit_code = 128 + SIGKILL;
       current_task->state = TASK_DEAD;
-      scheduler_yield();
+      for (usize i = 0; i < MAX_TASKS; i++) {
+        if (tasks[i].id == current_task->parent_id && tasks[i].state == TASK_BLOCKED)
+          tasks[i].state = TASK_READY;
+      }
+      return;
       /* unreachable */
     }
 
@@ -1050,10 +1058,13 @@ void scheduler_deliver_pending_signals(void) {
       case SIGVTALRM:
       case SIGPROF:
         /* Terminate */
-        interrupts_disable();
         current_task->exit_code = 128 + sig;
         current_task->state = TASK_DEAD;
-        scheduler_yield();
+        for (usize i = 0; i < MAX_TASKS; i++) {
+          if (tasks[i].id == current_task->parent_id && tasks[i].state == TASK_BLOCKED)
+            tasks[i].state = TASK_READY;
+        }
+        return;
         /* unreachable */
       case SIGCONT:
         current_task->pending_signals &= ~(1ULL << sig);

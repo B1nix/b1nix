@@ -152,6 +152,7 @@ struct task {
   void *user_image;
   u64 pml4_phys;
   struct vm_area *vma_list;
+  int in_kernel_syscall;
 };
 
 extern struct task *current_task;

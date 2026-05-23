@@ -1461,6 +1461,14 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  u64 m12_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m12-smoke", 0, 0, 0, 0, 0);
+  if ((isize)m12_pid < 0) {
+    uwrite("M12-SMOKE: spawn-fail\n");
+  } else {
+    int m12_status = 0;
+    syscall_dispatch(SYS_WAIT, m12_pid, (u64)(usize)&m12_status, 0, 0, 0, 0);
+  }
+
   u64 smoke_pid =
       syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m22-smoke", 0, 0, 0, 0, 0);
   if (smoke_pid != (u64)-1) {

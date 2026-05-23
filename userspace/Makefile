@@ -7,7 +7,7 @@ CC       := clang
 TARGET   := x86_64-unknown-elf
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float
 LDFLAGS  := -m elf_x86_64
 BUILD    := build
 LIB      := $(BUILD)/libb1nix.a
@@ -23,6 +23,7 @@ LIBC_OBJS := \
 BINARIES := \
 	$(BUILD)/bin/hello \
 	$(BUILD)/bin/native_smoke \
+	$(BUILD)/bin/m12_smoke \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync
 

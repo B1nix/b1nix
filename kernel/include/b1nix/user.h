@@ -48,6 +48,7 @@ struct user_loaded_image {
 	int argc;
 	const char **argv;
 	const char **envp;
+	int refcount;
 };
 
 void userspace_init(void);

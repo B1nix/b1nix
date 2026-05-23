@@ -106,6 +106,9 @@ x86_syscall_return:
     /* Clean up the 2 stack arguments */
     addq $16, %rsp
 
+    /* Store the return value into the saved RAX slot in the interrupt frame */
+    movq %rax, (%rsp)
+
     /* Restore GPRs from the interrupt_frame */
     popq %rax
     popq %rbx

@@ -55,6 +55,10 @@ static void x86_tss_init(void) {
   __asm__ volatile("ltr %0" : : "r"((u16)X86_TSS_SELECTOR) : "memory");
 }
 
+void arch_set_kernel_stack(u64 stack_top) {
+  x86_tss.rsp0 = stack_top;
+}
+
 void x86_syscall_init(void) {
   u32 lo, hi;
   /* Fix: Enable syscall/sysret by setting SCE bit in EFER MSR */

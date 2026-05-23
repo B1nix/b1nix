@@ -1,8 +1,11 @@
 #ifndef B1NIX_ARCH_H
 #define B1NIX_ARCH_H
 
+#include <b1nix/types.h>
+
 void arch_init(void);
 void arch_halt(void) __attribute__((noreturn));
+void arch_set_kernel_stack(u64 stack_top);
 
 static inline void interrupts_disable(void) {
 #ifdef __aarch64__

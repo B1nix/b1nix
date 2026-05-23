@@ -14,12 +14,12 @@ FILE *stdout = &_stdout;
 FILE *stderr = &_stderr;
 int putchar(int c) {
   char ch = (char)c;
-  syscall(SYS_WRITE, (long)&ch, 1, 1, 0);
+  write(stdout->fd, &ch, 1);
   return c;
 }
 
 int puts(const char *s) {
-  syscall(SYS_WRITE, (long)s, (long)strlen(s), 1, 0);
+  write(stdout->fd, s, strlen(s));
   putchar('\n');
   return 0;
 }
@@ -60,7 +60,7 @@ int printf(const char *fmt, ...) {
   int n = vsnprintf(buf, sizeof(buf), fmt, args);
   va_end(args);
 
-  syscall(SYS_WRITE, (long)buf, (long)n, 1, 0);
+  write(stdout->fd, buf, n);
   return n;
 }
 

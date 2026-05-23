@@ -33,6 +33,8 @@ static int syscall_allows_kernel_pointers(void) {
   struct task *t = current_task;
   if (!t || !t->user_image)
     return 1;
+  if (t->in_kernel_syscall)
+    return 1;
 
   struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
   return img->kind == USER_IMAGE_BUILTIN;
@@ -202,7 +204,7 @@ static int is_user_range_valid(const void *src, usize size, int write) {
   }
 
   if (end < start) return 0; // Overflow
-  if (end >= 0x0000800000000000ULL) return 0; // Not in userspace
+  if (end > 0x0000800000000000ULL) return 0; // Not in userspace
 
   // Verify that the entire range is covered by VMAs with correct permissions
   for (u64 v = start; v < end; ) {
@@ -212,7 +214,7 @@ static int is_user_range_valid(const void *src, usize size, int write) {
       if (v >= vma->start && v < vma->end) {
         if (write && !(vma->prot & PROT_WRITE)) return 0;
         if (!write && !(vma->prot & PROT_READ)) return 0;
-        
+
         v = vma->end; // Move to end of this VMA
         found = 1;
         break;
@@ -935,7 +937,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
   u64 start_ticks = scheduler_get_uptime_ticks();
   u64 timeout_ticks = timeout == (u64)-1 ? (u64)-1 : timeout / 10;
-  
+
   extern void *vfs_poll_chan;
 
   while (1) {
@@ -1041,7 +1043,7 @@ static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   if (addrlen) {
     if (syscall_copyin(&k_addrlen, addrlen, sizeof(usize)) != 0) return (u64)-EFAULT;
   }
-  
+
   char k_addr[128]; /* enough for sockaddr_un */
   int res = vfs_accept(fd, k_addr, &k_addrlen);
   if (res >= 0) {
@@ -1146,8 +1148,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
     }
   } else {
-    // For file-backed, we use lazy allocation. 
-    // Connect to VFS by setting VMM_LAZY flag. 
+    // For file-backed, we use lazy allocation.
+    // Connect to VFS by setting VMM_LAZY flag.
     // The page fault handler will read the file contents on demand.
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       vmm_set_lazy(v);
