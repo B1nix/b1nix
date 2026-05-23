@@ -195,6 +195,16 @@ and broader utility flag compatibility.
 - [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
 - [x] `partial` Add POSIX signal ABI: kernel-side `sigaction` table and pending-signal bitmask exist; default actions and `SIG_IGN` work; userspace API/semantics remain incomplete and need libc/ABI hardening.
 
+## M13: Userspace ABI, libc, and POSIX Runtime Hardening
+
+- [x] `done` Add dedicated `/bin/m13-smoke` runtime hardening program and deterministic `M13-SMOKE:*` boot-log markers.
+- [x] `done` Verify userspace process ABI baseline: `argc`, `argv[0]`, initial stack alignment sanity, and multi-argument native-ELF `execve` argv/envp semantics.
+- [x] `done` Verify libc/syscall wrapper baseline in smoke paths: `read`, `write`, `open`, `close`, `lseek`, `fork`, `execve`, `waitpid`, `getpid`, `getuid`, `getgid`, `brk`, `mmap`, `munmap`.
+- [x] `done` Verify stdio/basic libc baseline used by userland programs: `printf`, `snprintf`, `puts`, and file stdio lifecycle (`fopen`/`fwrite`/`fread`/`fclose`).
+- [x] `done` Verify exec/fd runtime behavior through real exec boundaries: deterministic failed-`execve` status, parent integrity, fd inheritance, `dup2`, and close-on-exec behavior.
+- [x] `done` Verify shell/userland ABI integration baseline: `/bin/sh -c` argv and status semantics.
+- [ ] `planned` Complete full POSIX userspace signal semantics and libc `errno` behavior parity (tracked under M15 signal/libc completion work).
+
 ## M14: Advanced Storage, Swap & File Systems
 
 - [x] `done` Block device abstraction layer and caching.

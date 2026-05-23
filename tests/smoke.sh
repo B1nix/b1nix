@@ -142,6 +142,67 @@ check_output "$LOG" "M12-SMOKE: ok setsid-pgrp" "process group / session sanity 
 check_output "$LOG" "M12-SMOKE: ok uid-gid" "uid/gid getter/setter sanity works"
 check_output "$LOG" "M12-SMOKE: done" "M12 smoke completes successfully"
 
+# ── M13 Userspace ABI / libc / POSIX runtime hardening ──
+echo ""
+echo "[TEST] M13 Userspace ABI / libc / POSIX runtime..."
+check_output "$LOG" "M13-SMOKE: start" "M13 smoke starts"
+check_output "$LOG" "M13-SMOKE: ok argc-argv0" "argc/argv[0] baseline is stable"
+check_output "$LOG" "M13-SMOKE: ok stack-align" "initial userspace stack alignment is sane"
+check_output "$LOG" "M13-SMOKE: ok libc-rw-open-close-lseek" "libc wrappers for read/write/open/close/lseek work"
+check_output "$LOG" "M13-SMOKE: ok getpid-uid-gid" "getpid/getuid/getgid path works"
+check_output "$LOG" "M13-SMOKE: ok brk-mmap-munmap" "brk/mmap/munmap baseline works"
+check_output "$LOG" "M13-SMOKE: ok puts" "puts works"
+check_output "$LOG" "M13-SMOKE: ok printf" "printf works"
+check_output "$LOG" "M13-SMOKE: ok snprintf" "snprintf works"
+check_output "$LOG" "M13-SMOKE: ok stdio-file" "fopen/fread/fwrite/fclose path works"
+if grep -q "M13-SMOKE: ok execve-argv-env" "$LOG" 2>/dev/null; then
+	pass "execve preserves argv/envp semantics"
+elif grep -q "M13-SMOKE: unsupported execve-argv-env-native-elf" "$LOG" 2>/dev/null; then
+	fail "execve preserves argv/envp semantics" "native ELF argv/envp is explicitly unsupported"
+else
+	fail "execve argv/envp marker emitted" "missing execve argv/envp support/unsupported marker"
+fi
+check_output "$LOG" "M13-SMOKE: ok execve-fail-deterministic" "failed execve returns deterministic child status"
+if grep -q "M13-SMOKE: ok builtin-exec" "$LOG" 2>/dev/null; then
+	pass "builtin exec path works through execve"
+elif grep -q "M13-SMOKE: unsupported builtin-exec" "$LOG" 2>/dev/null; then
+	fail "builtin exec path works through execve" "builtin exec is explicitly unsupported"
+else
+	fail "builtin exec marker emitted" "missing builtin exec support/unsupported marker"
+fi
+if grep -q "M13-SMOKE: ok sh-c-argv" "$LOG" 2>/dev/null; then
+	pass "/bin/sh -c preserves command argv semantics"
+elif grep -q "M13-SMOKE: unsupported sh-c-argv" "$LOG" 2>/dev/null; then
+	fail "/bin/sh -c preserves command argv semantics" "sh -c argv is explicitly unsupported"
+else
+	fail "sh -c argv marker emitted" "missing sh -c argv support/unsupported marker"
+fi
+if grep -q "M13-SMOKE: ok sh-c-status" "$LOG" 2>/dev/null; then
+	pass "/bin/sh -c execution returns stable status"
+elif grep -q "M13-SMOKE: unsupported sh-c-status" "$LOG" 2>/dev/null; then
+	fail "/bin/sh -c execution returns stable status" "sh -c status is explicitly unsupported"
+else
+	fail "sh -c status marker emitted" "missing sh -c status support/unsupported marker"
+fi
+if grep -q "M13-SMOKE: ok fd-inherit-exec" "$LOG" 2>/dev/null; then
+	pass "fd inheritance survives exec boundary"
+elif grep -q "M13-SMOKE: unsupported fd-inherit-exec" "$LOG" 2>/dev/null; then
+	fail "fd inheritance survives exec boundary" "fd inheritance exec-boundary is explicitly unsupported"
+else
+	fail "fd inheritance exec marker emitted" "missing fd inheritance support/unsupported marker"
+fi
+check_output "$LOG" "M13-SMOKE: ok dup2" "dup2 behavior remains correct"
+if grep -q "M13-SMOKE: ok cloexec-exec" "$LOG" 2>/dev/null; then
+	pass "close-on-exec is enforced across exec boundary"
+elif grep -q "M13-SMOKE: unsupported cloexec-exec" "$LOG" 2>/dev/null; then
+	fail "close-on-exec is enforced across exec boundary" "close-on-exec exec-boundary is explicitly unsupported"
+else
+	fail "close-on-exec exec marker emitted" "missing close-on-exec support/unsupported marker"
+fi
+check_output "$LOG" "M13-SMOKE: ok parent-intact" "failed child exec path does not corrupt parent runtime"
+check_output "$LOG" "M13-SMOKE: ok errno-negative" "negative syscall result path is exposed to userspace"
+check_output "$LOG" "M13-SMOKE: done" "M13 smoke completes successfully"
+
 # ── M22 utility init-path smoke ──
 echo ""
 echo "[TEST] M22 utilities..."

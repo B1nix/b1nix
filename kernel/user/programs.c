@@ -367,7 +367,9 @@ static void expand_env(const char *in, char *out) {
       }
       char key[32];
       int k = 0;
-      while (in[i] && in[i] != ' ' && in[i] != '$' && in[i] != '/' && k < 31) {
+      while (in[i] && in[i] != ' ' && in[i] != '$' && in[i] != '/' &&
+             in[i] != '"' && in[i] != '\'' && in[i] != ';' && in[i] != ')' &&
+             in[i] != '(' && in[i] != '\t' && k < 31) {
         key[k++] = in[i++];
       }
       key[k] = '\0';
@@ -985,6 +987,15 @@ static int sh_main(int argc, const char **argv) {
   char cwd[128] = "/";
   /* sh -c 'cmd' — execute command string directly */
   if (argc >= 3 && strcmp(argv[1], "-c") == 0) {
+    if (argc >= 4) {
+      set_env("0", argv[3]);
+    }
+    for (int i = 4; i < argc && (i - 3) <= 9; i++) {
+      char key[2];
+      key[0] = (char)('0' + (i - 3));
+      key[1] = '\0';
+      set_env(key, argv[i]);
+    }
     char line[512];
     char expanded[512];
     usize len = strlen(argv[2]);
@@ -1467,6 +1478,14 @@ static int init_main(int argc, const char **argv) {
   } else {
     int m12_status = 0;
     syscall_dispatch(SYS_WAIT, m12_pid, (u64)(usize)&m12_status, 0, 0, 0, 0);
+  }
+
+  u64 m13_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m13-smoke", 0, 0, 0, 0, 0);
+  if ((isize)m13_pid < 0) {
+    uwrite("M13-SMOKE: spawn-fail\n");
+  } else {
+    int m13_status = 0;
+    syscall_dispatch(SYS_WAIT, m13_pid, (u64)(usize)&m13_status, 0, 0, 0, 0);
   }
 
   u64 smoke_pid =

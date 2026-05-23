@@ -7,6 +7,7 @@
 
 #include "../../build/x86/initramfs_native_smoke.inc"
 #include "../../build/x86/initramfs_m12_smoke.inc"
+#include "../../build/x86/initramfs_m13_smoke.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -200,6 +201,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
      sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m13-smoke", (const char *)vfs_m13_smoke_elf,
+     sizeof(vfs_m13_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m13-helper", (const char *)vfs_m13_smoke_elf,
+     sizeof(vfs_m13_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,

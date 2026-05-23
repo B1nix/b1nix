@@ -71,10 +71,10 @@ static char **copy_user_array(const char **u_array) {
       goto fault;
 
     char tmp[MAX_EXEC_ARG_LEN];
-    int len = syscall_copyinstr(tmp, MAX_EXEC_ARG_LEN, u_str);
-    if (len < 0)
+    if (syscall_copyinstr(tmp, MAX_EXEC_ARG_LEN, u_str) < 0)
       goto fault;
 
+    usize len = strlen(tmp);
     char *k_str = kmalloc(len + 1);
     if (!k_str) {
       for (int j = 0; j < i; j++)

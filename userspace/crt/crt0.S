@@ -31,9 +31,6 @@ _start:
 	 *   [argc]          — argument count
 	 */
 
-	/* Align stack to 16 bytes */
-	andq $-16, %rsp
-
 	/* Pop argc into %rdi (first argument to main) */
 	popq %rdi
 
@@ -42,6 +39,9 @@ _start:
 
 	/* envp = argv + (argc + 1) * 8  (skip argc+1 pointers past argv terminator) */
 	leaq 8(%rsp, %rdi, 8), %rdx
+
+	/* Align for C call ABI while preserving decoded argc/argv/envp. */
+	andq $-16, %rsp
 
 	/* Call main(argc, argv, envp) */
 	call main
