@@ -205,6 +205,15 @@ and broader utility flag compatibility.
 - [x] `done` Verify shell/userland ABI integration baseline: `/bin/sh -c` argv and status semantics.
 - [ ] `planned` Complete full POSIX userspace signal semantics and libc `errno` behavior parity (tracked under M15 signal/libc completion work).
 
+M13 closes the userspace process/system call ABI validation and POSIX runtime
+hardening baseline. Native ELF execve processes preserve correct argv/envp mappings
+including argc/argv[0] verification, and userspace stacks are properly 16-byte
+aligned at ring3 entry. A complete baseline of libc wrappers, stdio functions
+(fopen/fread/fwrite/fclose/printf/snprintf/puts), fd inheritance, close-on-exec
+enforcement, dup2, parent safety, and /bin/sh -c status propagation are covered
+by deterministic QEMU/dev smoke. Further POSIX signal handling and errno parity
+gaps are explicitly deferred to M15.
+
 ## M14: Advanced Storage, Swap & File Systems
 
 - [x] `done` Block device abstraction layer and caching.

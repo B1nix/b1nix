@@ -179,10 +179,10 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 
   /* FIX: Ensure the final stack pointer will be 16-byte aligned.
    * We push: argc(1), argv(argc), NULL(1), envp(envc), NULL(1), auxv(5).
-   * Total slots = 1 + image->argc + 1 + envc + 1 + 5 = image->argc + envc + 9.
+   * Total slots = 1 + image->argc + 1 + envc + 1 + 5 = image->argc + envc + 8.
    * If total_slots is odd, we need 8 bytes of padding to keep 16-byte alignment.
    */
-  usize total_slots = 9 + (usize)image->argc + (usize)envc;
+  usize total_slots = 8 + (usize)image->argc + (usize)envc;
   if (total_slots % 2 != 0) {
     user_stack_push_u64(stack, &sp, 0);
   }
@@ -610,25 +610,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     current_task->vma_list = stack_vma;
   }
 
-  /* Loader check: Verify entry point content */
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *segment = &image->segments[i];
-    if (image->entry >= segment->vaddr &&
-        image->entry < segment->vaddr + segment->memsz) {
-      u64 offset = image->entry - segment->vaddr;
-      if (offset < segment->filesz && segment->data) {
-        u8 *ptr = (u8 *)segment->data + offset;
-        console_write("Loader check: First 4 bytes at entry (0x");
-        console_write_hex64(image->entry);
-        console_write("): ");
-        for (int j = 0; j < 4; j++) {
-          console_write_hex64(ptr[j]);
-          console_write(" ");
-        }
-        console_write("\n");
-      }
-    }
-  }
+
 
   x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc,
                 image->address_space.stack_base + sizeof(u64));

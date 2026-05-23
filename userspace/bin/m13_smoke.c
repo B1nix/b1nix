@@ -4,6 +4,7 @@
 #include <string.h>
 #include <sys/mman.h>
 #include <unistd.h>
+#include <errno.h>
 
 #include "syscall.h"
 #include "types.h"
@@ -64,8 +65,11 @@ int main(int argc, char **argv, char **envp) {
           }
         }
       }
-      int argv_ok = (argc == 4 && strcmp(argv[2], "alpha") == 0 &&
-                     strcmp(argv[3], "beta") == 0);
+      int argv_ok = (argc == 4 && argv &&
+                     argv[0] && strcmp(argv[0], "m13-smoke") == 0 &&
+                     argv[1] && strcmp(argv[1], "check-exec-argv-env") == 0 &&
+                     argv[2] && strcmp(argv[2], "alpha") == 0 &&
+                     argv[3] && strcmp(argv[3], "beta") == 0);
       if (!(env_ok && argv_ok)) {
         char d[160];
         snprintf(d, sizeof(d),
@@ -125,9 +129,7 @@ int main(int argc, char **argv, char **envp) {
     marker("M13-SMOKE: fail argc-argv0\n");
   }
 
-  unsigned long rsp = 0;
-  __asm__ volatile("movq %%rsp, %0" : "=r"(rsp));
-  if (((rsp & 0xF) == 8) || ((rsp & 0xF) == 0)) {
+  if (((unsigned long)argv & 0xF) == 8) {
     marker("M13-SMOKE: ok stack-align\n");
   } else {
     marker("M13-SMOKE: fail stack-align\n");
@@ -226,7 +228,7 @@ int main(int argc, char **argv, char **envp) {
     char *bad_argv[] = {"/bin/does-not-exist", NULL};
     char *bad_env[] = {NULL};
     long rc = syscall(SYS_EXECVE, "/bin/does-not-exist", bad_argv, bad_env);
-    if (rc < 0) {
+    if (rc == -ENOENT) {
       syscall(SYS_EXIT, 0);
     }
     syscall(SYS_EXIT, 112);
