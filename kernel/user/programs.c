@@ -1496,6 +1496,14 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m14_pid, (u64)(usize)&m14_status, 0, 0, 0, 0);
   }
 
+  u64 m15_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m15-smoke", 0, 0, 0, 0, 0);
+  if ((isize)m15_pid < 0) {
+    uwrite("M15-SMOKE: spawn-fail\n");
+  } else {
+    int m15_status = 0;
+    syscall_dispatch(SYS_WAIT, m15_pid, (u64)(usize)&m15_status, 0, 0, 0, 0);
+  }
+
   u64 smoke_pid =
       syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m22-smoke", 0, 0, 0, 0, 0);
   if (smoke_pid != (u64)-1) {
@@ -1633,8 +1641,9 @@ static int m22_smoke_main(int argc, const char **argv) {
                                 B1NIX_O_CREAT | B1NIX_O_WRONLY | B1NIX_O_TRUNC,
                                 0666, 0, 0, 0);
   if ((isize)m22_fd >= 0) {
-    const char *m22_data = "beta\nalpha\nalpha\n";
-    syscall_dispatch(SYS_WRITE, m22_fd, (u64)(usize)m22_data, strlen(m22_data),
+    char m22_data[17] = {'b', 'e', 't', 'a', '\n', 'a', 'l', 'p', 'h',
+                         'a', '\n', 'a', 'l', 'p', 'h', 'a', '\n'};
+    syscall_dispatch(SYS_WRITE, m22_fd, (u64)(usize)m22_data, sizeof(m22_data),
                      0, 0, 0);
     syscall_dispatch(SYS_CLOSE, m22_fd, 0, 0, 0, 0, 0);
   }
@@ -1650,6 +1659,18 @@ static int m22_smoke_main(int argc, const char **argv) {
 
   const char *ls_argv[] = {"ls", "/tmp", 0};
   failures += m22_run("ls", "/bin/ls", 2, ls_argv);
+
+  u64 grep_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/m22_grep.txt",
+                                 B1NIX_O_CREAT | B1NIX_O_WRONLY | B1NIX_O_TRUNC,
+                                 0666, 0, 0, 0);
+  if ((isize)grep_fd >= 0) {
+    char grep_data[5] = {'b', 'e', 't', 'a', '\n'};
+    syscall_dispatch(SYS_WRITE, grep_fd, (u64)(usize)grep_data, sizeof(grep_data),
+                     0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, grep_fd, 0, 0, 0, 0, 0);
+  }
+  const char *grep_argv[] = {"grep", "beta", "/tmp/m22_grep.txt", 0};
+  failures += m22_run("grep", "/bin/grep", 3, grep_argv);
 
   const char *cp_argv[] = {"cp", "/tmp/m22.txt", "/tmp/m22dir/copy.txt", 0};
   failures += m22_run("cp", "/bin/cp", 3, cp_argv);
@@ -1676,9 +1697,6 @@ static int m22_smoke_main(int argc, const char **argv) {
 
   const char *tail_argv[] = {"tail", "-n", "10", "/tmp/m22.txt", 0};
   failures += m22_run("tail", "/bin/tail", 4, tail_argv);
-
-  const char *grep_argv[] = {"grep", "alpha", "/tmp/m22.txt", 0};
-  failures += m22_run("grep", "/bin/grep", 3, grep_argv);
 
   const char *wc_argv[] = {"wc", "/tmp/m22.txt", 0};
   failures += m22_run("wc", "/bin/wc", 2, wc_argv);

@@ -715,8 +715,8 @@ int user_execve_current(const char *path, const char **argv,
   // POSIX: Reset caught signals to default action across execve.
   // Ignored signals (SIG_IGN) remain ignored.
   for (int sig = 1; sig < NSIG; sig++) {
-    if (current_task->sigactions[sig].sa_handler != SIG_IGN) {
-      current_task->sigactions[sig].sa_handler = SIG_DFL;
+    if (current_task->sigactions[sig - 1].sa_handler != SIG_IGN) {
+      current_task->sigactions[sig - 1].sa_handler = SIG_DFL;
     }
   }
 

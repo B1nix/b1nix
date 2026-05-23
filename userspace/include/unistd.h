@@ -59,4 +59,7 @@ struct statfs {
 };
 int statfs(const char *path, struct statfs *buf);
 
+int setuid(unsigned short uid);
+int setgid(unsigned short gid);
+
 #endif

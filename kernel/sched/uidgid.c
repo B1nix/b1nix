@@ -153,13 +153,18 @@ int cred_set_uid(struct cred *cred, u16 uid)
 {
     if (!cred) return -1;
     /* Only root can change real UID, or if we have CAP_SETUID */
-    if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_SETUID)) {
+    int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
+    if (!is_privileged) {
         /* Non-root can only set uid to one of: euid, suid, or uid */
         if (uid != cred->euid && uid != cred->suid && uid != cred->uid) {
             return -1;
         }
     }
     cred->uid = uid;
+    if (is_privileged) {
+        cred->euid = uid;
+        cred->suid = uid;
+    }
     return 0;
 }
 
@@ -178,12 +183,17 @@ int cred_set_euid(struct cred *cred, u16 euid)
 int cred_set_gid(struct cred *cred, u16 gid)
 {
     if (!cred) return -1;
-    if (cred->egid != ROOT_GID && !cred_has_cap(cred, CAP_SETGID)) {
+    int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
+    if (!is_privileged) {
         if (gid != cred->egid && gid != cred->sgid && gid != cred->gid) {
             return -1;
         }
     }
     cred->gid = gid;
+    if (is_privileged) {
+        cred->egid = gid;
+        cred->sgid = gid;
+    }
     return 0;
 }
 

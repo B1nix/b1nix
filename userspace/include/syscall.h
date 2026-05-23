@@ -115,6 +115,7 @@ enum {
   SYS_POLL     = 97,
   SYS_MPROTECT = 98,
   SYS_SIGRETURN = 99,
+  SYS_CLOCK_GETTIME = 100,
 };
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */

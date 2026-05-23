@@ -29,4 +29,15 @@ time_t time(time_t *tloc);
 int gettimeofday(struct timeval *tv, struct timezone *tz);
 struct tm *localtime(const time_t *timep);
 
+#define CLOCK_REALTIME 0
+#define CLOCK_MONOTONIC 1
+
+struct timespec {
+    time_t tv_sec;
+    long tv_nsec;
+};
+
+int clock_gettime(int clk_id, struct timespec *tp);
+int nanosleep(const struct timespec *req, struct timespec *rem);
+
 #endif

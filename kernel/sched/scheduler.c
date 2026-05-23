@@ -739,7 +739,7 @@ int scheduler_kill(usize task_id, int sig) {
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].id == task_id && tasks[i].state != TASK_UNUSED) {
       /* SIGKILL and SIGSTOP cannot be blocked/ignored */
-      tasks[i].pending_signals |= (1ULL << sig);
+      tasks[i].pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
       if (tasks[i].state == TASK_BLOCKED) {
@@ -761,7 +761,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
   interrupts_disable();
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state != TASK_UNUSED && tasks[i].process_group_id == pgrp) {
-      tasks[i].pending_signals |= (1ULL << sig);
+      tasks[i].pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
       if (tasks[i].state == TASK_BLOCKED) {
@@ -786,13 +786,13 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
 
   interrupts_disable();
   if (old) {
-    *old = current_task->sigactions[sig];
+    *old = current_task->sigactions[sig - 1];
   }
   if (act) {
-    current_task->sigactions[sig] = *act;
+    current_task->sigactions[sig - 1] = *act;
     /* Remove SA_NODEFER: block the signal by default */
     if (!(act->sa_flags & SA_NODEFER)) {
-      current_task->blocked_signals &= ~(1ULL << sig);
+      current_task->blocked_signals &= ~(1ULL << (sig - 1));
     }
   }
   interrupts_enable();
@@ -802,7 +802,7 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
 sighandler_t scheduler_get_sighandler(int sig) {
   if (!current_task || sig < 1 || sig >= NSIG)
     return SIG_DFL;
-  return current_task->sigactions[sig].sa_handler;
+  return current_task->sigactions[sig - 1].sa_handler;
 }
 
 usize scheduler_get_pid(void) {
@@ -1016,10 +1016,10 @@ void scheduler_deliver_pending_signals(void) {
 
   /* Find highest-priority signal (lowest number = highest priority) */
   for (int sig = 1; sig < NSIG; sig++) {
-    if (!(deliverable & (1ULL << sig)))
+    if (!(deliverable & (1ULL << (sig - 1))))
       continue;
 
-    sighandler_t handler = current_task->sigactions[sig].sa_handler;
+    sighandler_t handler = current_task->sigactions[sig - 1].sa_handler;
 
     if (sig == SIGKILL) {
       /* SIGKILL — terminate immediately */
@@ -1035,7 +1035,7 @@ void scheduler_deliver_pending_signals(void) {
 
     if (handler == SIG_IGN) {
       /* Ignored — just clear */
-      current_task->pending_signals &= ~(1ULL << sig);
+      current_task->pending_signals &= ~(1ULL << (sig - 1));
       continue;
     }
 
@@ -1067,7 +1067,7 @@ void scheduler_deliver_pending_signals(void) {
         return;
         /* unreachable */
       case SIGCONT:
-        current_task->pending_signals &= ~(1ULL << sig);
+        current_task->pending_signals &= ~(1ULL << (sig - 1));
         current_task->state = TASK_READY;
         continue;
       case SIGSTOP:
@@ -1082,18 +1082,13 @@ void scheduler_deliver_pending_signals(void) {
       case SIGWINCH:
       default:
         /* Ignore by default */
-        current_task->pending_signals &= ~(1ULL << sig);
+        current_task->pending_signals &= ~(1ULL << (sig - 1));
         continue;
       }
     }
 
-    /* Custom handler — for now, just clear pending and log */
-    /* In a full implementation we'd set up a signal frame on user stack */
-    current_task->pending_signals &= ~(1ULL << sig);
-
-    /* If SA_RESETHAND, reset to SIG_DFL after delivery */
-    if (current_task->sigactions[sig].sa_flags & SA_RESETHAND) {
-      current_task->sigactions[sig].sa_handler = SIG_DFL;
-    }
+    /* Custom handlers need an architecture frame; leave them pending for the
+     * syscall/interrupt return path instead of consuming the signal here. */
+    return;
   }
 }

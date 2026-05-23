@@ -235,16 +235,25 @@ M14 closes the QEMU/dev advanced storage, swap, and filesystem baseline. The sys
 
 ## M15: IPC, Security & Standard OS Features
 
-- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): kernel-side bitmask delivery and default actions work; userspace signal API behavior remains partially stubbed.
-- [x] `partial` Inter-process communication through message queues and socket-like descriptors.
-- [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) with physical page allocation and VMM mapping per process.
-- [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`).
-- [x] `partial` File permissions, capabilities, and ACL metadata.
+- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): QEMU/dev baseline covers default actions, `SIG_IGN`, and a userspace handler baseline; full POSIX semantics remain incomplete.
+- [x] `done` Inter-process communication message queue baseline (`mq_open/send/receive/close/unlink`) with smoke verification.
+- [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) baseline with smoke verification; production-grade multi-process semantics remain follow-up.
+- [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`) baseline.
+- [x] `partial` File permissions/capabilities metadata plus smoke-verified non-root access denial baseline.
 - [x] `initial` Standard C library profile for B1NIX userspace.
 - [x] `partial` BusyBox-style standard utilities.
 - [x] `done` Add UNIX domain sockets.
 - [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
-- [ ] `planned` Complete userspace signal semantics (`sigaction`, masks, handler ABI, `sigreturn`) and remove libc stubs.
+- [ ] `planned` Complete full userspace signal semantics (`sigaction` masks, nested delivery, robust `sigreturn` ABI behavior) and remove libc stubs.
+
+M15 is closed for the QEMU/dev smoke baseline through `make smoke-x86` coverage
+of signal baseline/ignore and explicit handler-delivery smoke (`kill` + yield
+loop + userspace state mutation), message queues, shared memory baseline,
+cooperative semaphore baseline, clock/timer behavior, permission enforcement,
+and audit markers. Deferred production/POSIX parity gaps: full signal masks and
+mask-restoration edge cases, nested signal behavior, production-grade
+`sigreturn` correctness hardening, full permission/capability model, and
+production-grade IPC semantics.
 
 ## M16: User Space Applications & TUI
 

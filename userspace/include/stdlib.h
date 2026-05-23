@@ -17,4 +17,10 @@ void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, co
 char *getenv(const char *name);
 char *realpath(const char *path, char *resolved_path);
 
+/* Cooperative spin-based semaphores (no kernel futex; shared-memory safe) */
+int sem_init(int *sem, int pshared, unsigned int value);
+int sem_wait(int *sem);
+int sem_post(int *sem);
+int sem_destroy(int *sem);
+
 #endif

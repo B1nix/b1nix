@@ -1382,6 +1382,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
   case SYS_YIELD:
     scheduler_yield();
+    if (frame) {
+      frame->rax = 0;
+      arch_check_and_deliver_signals(frame);
+    }
     return 0;
   case SYS_OPEN: {
     return (u64)sys_open((const char *)(usize)arg0, (int)arg1);
@@ -1455,10 +1459,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_UMASK:
     return (u64)sys_umask((u16)arg0);
   case SYS_CHMOD:
+    klog_info("audit: chmod called");
     return (u64)sys_chmod((const char *)(usize)arg0, (u16)arg1);
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
   case SYS_CHOWN:
+    klog_info("audit: chown called");
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
   case SYS_FCHOWN:
     return (u64)sys_fchown((int)arg0, (u16)arg1, (u16)arg2);
@@ -1497,18 +1503,26 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return c ? c->egid : 0;
   }
   case SYS_SETUID: {
+    klog_info("audit: setuid called");
     struct cred *c = scheduler_get_current_cred();
     return c ? (u64)cred_set_uid(c, (u16)arg0) : (u64)-EACCES;
   }
   case SYS_SETGID: {
+    klog_info("audit: setgid called");
     struct cred *c = scheduler_get_current_cred();
     return c ? (u64)cred_set_gid(c, (u16)arg0) : (u64)-EACCES;
   }
   case SYS_SLEEP:
     scheduler_sleep_ticks(arg0);
     return 0;
-  case SYS_KILL:
-    return (u64)scheduler_kill((usize)arg0, (int)arg1);
+  case SYS_KILL: {
+    u64 kill_ret = (u64)scheduler_kill((usize)arg0, (int)arg1);
+    if (frame) {
+      frame->rax = kill_ret;
+      arch_check_and_deliver_signals(frame);
+    }
+    return kill_ret;
+  }
   case SYS_SIGNAL: {
     int sig = (int)arg0;
     struct sigaction act;
@@ -1749,6 +1763,18 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_SIGRETURN:
     ret = sys_sigreturn(frame);
     break;
+  case SYS_CLOCK_GETTIME: {
+    int clk_id = (int)arg0;
+    (void)clk_id;
+    struct timespec ktp;
+    u64 ticks = scheduler_get_uptime_ticks();
+    ktp.tv_sec = (long)(ticks / 100);
+    ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+    if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0) {
+      return (u64)-EFAULT;
+    }
+    return 0;
+  }
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

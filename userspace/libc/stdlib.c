@@ -201,10 +201,32 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 
 int errno = 0;
 
-int sem_init(int *sem, int pshared, unsigned int value) { (void)sem; (void)pshared; (void)value; return 0; }
-int sem_wait(int *sem) { (void)sem; return 0; }
-int sem_post(int *sem) { (void)sem; return 0; }
-int sem_destroy(int *sem) { (void)sem; return 0; }
+int sem_init(int *sem, int pshared, unsigned int value) {
+  (void)pshared;
+  if (!sem) return -1;
+  *sem = (int)value;
+  return 0;
+}
+
+int sem_wait(int *sem) {
+  if (!sem) return -1;
+  while (*sem <= 0) {
+    syscall(SYS_YIELD);
+  }
+  (*sem)--;
+  return 0;
+}
+
+int sem_post(int *sem) {
+  if (!sem) return -1;
+  (*sem)++;
+  return 0;
+}
+
+int sem_destroy(int *sem) {
+  (void)sem;
+  return 0;
+}
 
 
 

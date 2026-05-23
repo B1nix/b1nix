@@ -145,4 +145,9 @@ struct b1nix_pollfd {
   short revents;
 };
 
+struct timespec {
+  long tv_sec;
+  long tv_nsec;
+};
+
 #endif

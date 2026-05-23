@@ -116,6 +116,7 @@ enum {
 	SYS_POLL     = 97,
 	SYS_MPROTECT = 98,
 	SYS_SIGRETURN = 99,
+	SYS_CLOCK_GETTIME = 100,
 };
 
 #include <b1nix/arch_x86.h>

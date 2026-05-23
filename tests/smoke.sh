@@ -8,6 +8,9 @@ set -e
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TIMEOUT=300  # seconds to let each test run
+SATA_IMG="$PROJECT_DIR/sata-smoke-$$.img"
+NVME_IMG="$PROJECT_DIR/nvme-smoke-$$.img"
+SWAP_IMG="$PROJECT_DIR/swap-smoke-$$.img"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -39,16 +42,16 @@ run_qemu() {
 			-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-			-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
-			-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/logs/net.pcap" \
-			-device ich9-ahci,id=ahci \
-			-drive file="$PROJECT_DIR/sata.img",if=none,id=satadrive,format=raw \
-			-device ide-hd,drive=satadrive,bus=ahci.0 \
-			-drive file="$PROJECT_DIR/swap.img",if=none,id=swapdrive,format=raw \
-			-device ide-hd,drive=swapdrive,bus=ahci.1 \
-			-drive file="$PROJECT_DIR/nvme.img",if=none,id=nvmedrive,format=raw \
-			-device nvme,serial=deadbeef,drive=nvmedrive \
-			>"$log" 2>&1 &
+				-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/logs/net.pcap" \
+				-device ich9-ahci,id=ahci \
+				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
+				-device ide-hd,drive=satadrive,bus=ahci.0 \
+				-drive file="$SWAP_IMG",if=none,id=swapdrive,format=raw \
+				-device ide-hd,drive=swapdrive,bus=ahci.1 \
+				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw \
+				-device nvme,serial=deadbeef,drive=nvmedrive \
+				>"$log" 2>&1 &
 		pid=$!
 		
 		# Instant monitoring using tail -f
@@ -95,9 +98,9 @@ make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1 || {
 pass "kernel builds without errors"
 
 # Create dummy images for SATA, NVMe and Swap tests
-dd if=/dev/zero of="$PROJECT_DIR/sata.img" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$PROJECT_DIR/nvme.img" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$PROJECT_DIR/swap.img" bs=1M count=2 2>/dev/null
+dd if=/dev/zero of="$SATA_IMG" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$NVME_IMG" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
 
 MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
 if [ ! -x "$MKE2FS" ]; then
@@ -108,11 +111,11 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     exit 1
 fi
 
-"$MKE2FS" -t ext3 -q "$PROJECT_DIR/sata.img" || {
+"$MKE2FS" -t ext3 -q "$SATA_IMG" || {
     echo "Error: Failed to format sata.img as ext3."
     exit 1
 }
-"$MKE2FS" -t ext4 -q "$PROJECT_DIR/nvme.img" || {
+"$MKE2FS" -t ext4 -q "$NVME_IMG" || {
     echo "Error: Failed to format nvme.img as ext4."
     exit 1
 }
@@ -240,6 +243,22 @@ check_output "$LOG" "M14-SMOKE: ok stress-loop" "repeated create/write/read/dele
 check_output "$LOG" "M14-SMOKE: ok large-file" "large file bounds allocation and verification successful"
 check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization works on mounts"
 check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
+
+# ── M15 IPC, Security & Standard OS Features ──
+echo ""
+echo "[TEST] M15 IPC, security, and OS baseline..."
+check_output "$LOG" "M15-SMOKE: start" "M15 smoke starts"
+check_output "$LOG" "M15-SMOKE: ok signal-baseline" "signal baseline syscall path works"
+check_output "$LOG" "M15-SMOKE: ok signal-ignore" "ignored signal does not terminate process"
+check_output "$LOG" "M15-SMOKE: ok signal-handler" "userspace signal handler is delivered"
+check_output "$LOG" "M15-SMOKE: ok ipc-mq" "message queue roundtrip works"
+check_output "$LOG" "M15-SMOKE: ok shm" "shared memory create/map/read/write lifecycle works"
+check_output "$LOG" "M15-SMOKE: ok semaphore" "cooperative semaphore baseline works"
+check_output "$LOG" "M15-SMOKE: ok clock-timer" "clock_gettime and nanosleep work"
+check_output "$LOG" "M15-SMOKE: ok permissions-chmod" "chmod changes mode bits"
+check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enforced for non-root uid"
+check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
+check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 
 # ── M22 utility init-path smoke ──
 echo ""
@@ -375,6 +394,8 @@ echo "=== Results ==="
 echo "  Passed:  $PASSED"
 echo "  Failed:  $FAILED"
 echo "  Skipped: $SKIPPED"
+
+rm -f "$SATA_IMG" "$NVME_IMG" "$SWAP_IMG"
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images

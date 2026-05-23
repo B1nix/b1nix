@@ -199,3 +199,29 @@ long send(int fd, const void *buf, size_t len, int flags) {
 long recv(int fd, void *buf, size_t len, int flags) {
   return (long)syscall(SYS_RECV, fd, buf, len, flags);
 }
+
+int setuid(unsigned short uid) {
+  return (int)syscall(SYS_SETUID, uid);
+}
+
+int setgid(unsigned short gid) {
+  return (int)syscall(SYS_SETGID, gid);
+}
+
+int clock_gettime(int clk_id, struct timespec *tp) {
+  return (int)syscall(SYS_CLOCK_GETTIME, clk_id, tp);
+}
+
+int nanosleep(const struct timespec *req, struct timespec *rem) {
+  if (!req) return -1;
+  unsigned long ticks = req->tv_sec * 100 + req->tv_nsec / 10000000;
+  if (ticks == 0 && req->tv_nsec > 0) {
+    ticks = 1;
+  }
+  long rc = syscall(SYS_SLEEP, ticks);
+  if (rem) {
+    rem->tv_sec = 0;
+    rem->tv_nsec = 0;
+  }
+  return (int)rc;
+}
