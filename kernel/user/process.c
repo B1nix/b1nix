@@ -59,6 +59,7 @@ struct elf64_phdr {
 
 static struct user_program programs[MAX_PROGRAMS];
 static usize program_count;
+static const u64 USER_STACK_MAX_SIZE = 8ULL * 1024ULL * 1024ULL;
 
 static struct user_address_space user_address_space_create(void) {
   struct user_address_space address_space;
@@ -85,7 +86,8 @@ static char *kernel_strdup(const char *src) {
 }
 
 static int copy_string_vector(const char **src, int max_count,
-                              const char ***out, int *out_count) {
+                              const char ***out, int *out_count,
+                              int source_is_user) {
   const char **copy = kzalloc(sizeof(char *) * (max_count + 1));
   int count = 0;
   char tmp[1024];
@@ -97,32 +99,30 @@ static int copy_string_vector(const char **src, int max_count,
   if (src) {
     for (; count < max_count; count++) {
       const char *ptr = 0;
-      /* Check if src is in kernel space */
-      if ((u64)src >= 0xffff800000000000 || (u64)src < 0x2000000) {
-        ptr = src[count];
-      } else {
+      if (source_is_user) {
         if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0) {
           console_write("copy_string_vector: syscall_copyin src failed at ");
           console_write_dec(count);
           console_write("\n");
           return -1;
         }
+      } else {
+        ptr = src[count];
       }
 
       if (!ptr)
         break;
 
-      /* Check if ptr is in kernel space */
-      if ((u64)ptr >= 0xffff800000000000 || (u64)ptr < 0x2000000) {
-        strncpy(tmp, ptr, sizeof(tmp));
-        tmp[sizeof(tmp) - 1] = '\0';
-      } else {
+      if (source_is_user) {
         if (syscall_copyinstr(tmp, sizeof(tmp), ptr) != 0) {
           console_write("copy_string_vector: syscall_copyinstr ptr failed at ");
           console_write_dec(count);
           console_write("\n");
           return -1;
         }
+      } else {
+        strncpy(tmp, ptr, sizeof(tmp));
+        tmp[sizeof(tmp) - 1] = '\0';
       }
 
       copy[count] = kernel_strdup(tmp);
@@ -381,19 +381,23 @@ void user_image_free(struct user_loaded_image *image) {
 
 static struct user_loaded_image *user_load_image(const char *path, int argc,
                                                  const char **argv,
-                                                 const char **envp) {
+                                                 const char **envp,
+                                                 int argv_is_user,
+                                                 int envp_is_user) {
   struct user_loaded_image *image = kzalloc(sizeof(*image));
   if (!image)
     return 0;
   image->refcount = 1;
 
-  if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc) != 0) {
+  if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc,
+                         argv_is_user) != 0) {
     console_write("user_load_image: copy_string_vector argv failed\n");
     return 0;
   }
   if (argc > 0 && image->argc > argc)
     image->argc = argc;
-  if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0) != 0) {
+  if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0,
+                         envp_is_user) != 0) {
     console_write("user_load_image: copy_string_vector envp failed\n");
     return 0;
   }
@@ -602,7 +606,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   // Create VMA for stack
   struct vm_area *stack_vma = kzalloc(sizeof(struct vm_area));
   if (stack_vma) {
-    stack_vma->start = stack_aligned;
+    /* Reserve a stack growth window; faults map pages lazily on demand. */
+    stack_vma->start = image->address_space.stack_top - USER_STACK_MAX_SIZE;
     stack_vma->end = image->address_space.stack_top;
     stack_vma->prot = PROT_READ | PROT_WRITE;
     stack_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
@@ -662,7 +667,7 @@ int user_spawn(const char *path, int argc, const char **argv) {
 
   const char *empty_env[] = {"PATH=/bin", 0};
   struct user_loaded_image *image =
-      user_load_image(path, argc, argv, empty_env);
+      user_load_image(path, argc, argv, empty_env, 0, 0);
   if (!image) {
     return -1;
   }
@@ -706,7 +711,7 @@ int user_execve_current(const char *path, const char **argv,
   }
   vfs_node_put(node);
 
-  struct user_loaded_image *image = user_load_image(path, 0, argv, envp);
+  struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
   if (!image)
     return -1;
 

@@ -88,7 +88,11 @@ clang --target=x86_64-unknown-elf \
 
 ## In-Guest Compilation Status
 
-M25 tracks the early TinyCC/TCC path. The source and build target are present,
-but compiling and running programs fully inside B1NIX is still planned work.
+M25 closes the early TinyCC/TCC path for the QEMU/dev baseline. `/bin/tcc`,
+userspace headers, `crt0.o`, and `libb1nix.a` are packaged into initramfs, and
+the smoke suite compiles and runs native programs inside B1NIX. Current coverage
+includes hello output, argc/argv propagation, stderr redirection, file output,
+and non-zero exit status propagation.
+
 M26 remains the full toolchain and self-hosting milestone for Binutils, GCC,
-larger programs, and rebuilding the kernel from inside B1NIX.
+larger programs, native `make`, and rebuilding the kernel from inside B1NIX.

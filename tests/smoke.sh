@@ -265,16 +265,13 @@ echo ""
 echo "[TEST] M25 Native C Toolchain..."
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
 check_output "$LOG" "M25-SMOKE: ok tcc-launch" "tcc launches"
-if grep -q "M25-SMOKE: ok compile-hello" "$LOG"; then
-	pass "tcc compiles hello.c"
-	check_output "$LOG" "M25-SMOKE: ok run-hello" "compiled hello program runs"
-	check_output "$LOG" "M25-HELLO: hello from native tcc" "hello program outputs correct greeting"
-	check_output "$LOG" "M25-SMOKE: ok compile-utility" "tcc compiles and runs mini-echo utility"
-else
-	check_output "$LOG" "M25-SMOKE: unsupported compile-hello" "tcc compile path is explicitly deferred"
-	check_output "$LOG" "M25-SMOKE: unsupported run-hello" "compiled hello run path is explicitly deferred"
-	check_output "$LOG" "M25-SMOKE: unsupported compile-utility" "native utility compile path is explicitly deferred"
-fi
+check_output "$LOG" "M25-SMOKE: ok compile-hello" "tcc compiles hello.c"
+check_output "$LOG" "M25-SMOKE: ok run-hello" "compiled hello program runs"
+check_output "$LOG" "M25-HELLO: hello from native tcc" "hello program outputs correct greeting"
+check_output "$LOG" "M25-SMOKE: ok compile-utility" "tcc compiles and runs mini-echo utility"
+check_output "$LOG" "M25-SMOKE: ok argv-check" "compiled program receives argc/argv"
+check_output "$LOG" "M25-SMOKE: ok stderr-check" "compiled program stderr path works"
+check_output "$LOG" "M25-SMOKE: ok exit-check" "compiled program non-zero exit status propagates"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
 # ── M16 User Space Applications & TUI ──

@@ -441,13 +441,21 @@ implemented.
 - [x] `initial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; several POSIX-facing APIs are still stubs/incomplete.
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] `done` Build and run a VFS-loaded native smoke ELF program.
-- [x] `initial` Build and run a VFS-loaded `hello.c` ELF program.
-- [x] `initial` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
-- [x] `initial` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
+- [x] `done` Build and run a VFS-loaded `hello.c` ELF program.
+- [x] `done` Import TinyCC/TCC source and wire an early `/bin/tcc` build target.
+- [x] `done` Prepare installed userspace headers, `libb1nix.a`, and `crt0.o` in the rootfs image.
+- [x] `done` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
+- [x] `done` Compile and run a simple utility inside B1NIX, including argv/output verification.
+- [x] `done` Smoke-test native TCC stderr handling and non-zero exit status propagation.
+- [x] `done` Document the current external cross-build to in-guest compilation boundary in `docs/abi.md`.
 - [ ] `planned` Align libc POSIX-facing APIs and signatures (`signal.h`, `sigaction`, `sigprocmask`, `dlopen*`, `strtod` family) and remove stubs.
-- [ ] `planned` Compile and run `hello.c` inside B1NIX using `/bin/tcc`.
-- [ ] `planned` Compile one simple shell utility inside B1NIX.
-- [ ] `planned` Document the exact path from external cross-builds to in-guest compilation after it works end-to-end.
+
+M25 is closed for the QEMU/dev baseline. `/bin/tcc` is packaged into initramfs
+with headers, `crt0.o`, and `libb1nix.a`; smoke compiles and runs native
+programs in-guest for hello output, argv propagation, stderr redirection, file
+output, and non-zero exit status. Larger programs, full libc/POSIX parity, GNU
+Binutils/GCC, native `make`, and rebuilding the kernel inside B1NIX remain M26
+work.
 
 ## M26: Full Toolchain and Self-Hosting
 
