@@ -138,6 +138,7 @@ and broader utility flag compatibility.
 - [x] `done` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 - [x] `done` Harden JBD recovery semantics: replay only committed descriptor transactions and clear `RECOVER` incompat bit after successful replay.
 - [x] `done` Add ext3 metadata ordering hardening for `unlink`/`rmdir`/`rename` path with journal transaction grouping and inode timestamp updates.
+- [ ] `planned` Formalize VFS node refcounting rules: enforce that all functions returning a VFS node MUST increment its refcount, and callers are strictly responsible for decref to prevent memory leaks during lookup paths.
 
 ## M9: Hardware Drivers
 
@@ -163,6 +164,7 @@ and broader utility flag compatibility.
 - [x] `done` Add socket ABI integration for UDP/TCP-style descriptors, including POSIX-style error returns and non-blocking connect (`EINPROGRESS`/`EALREADY`) behavior.
 - [x] `partial` Add minimal TCP client path for terminal tools.
 - [x] `done` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.
+- [ ] `planned` Harden network buffer ownership: explicitly decouple packet allocation from hardware interrupt handlers to prevent nested memory allocations in atomic contexts.
 
 ## M11: Shell and Utilities
 
@@ -175,8 +177,6 @@ and broader utility flag compatibility.
 - [x] `done` Pipeline execution through real `pipe()` and `dup2()`.
 - [x] `done` Add `selfhost` status command.
 - [x] `done` Add full background-job tracking and POSIX terminal job control.
-- Note: full TCP e2e completeness is tracked under network milestones; M11
-  baseline accepts explicit `TCP-SMOKE: unsupported` reporting.
 
 ## M12: Syscalls and Process Management
 
@@ -203,16 +203,9 @@ and broader utility flag compatibility.
 - [x] `done` Verify stdio/basic libc baseline used by userland programs: `printf`, `snprintf`, `puts`, and file stdio lifecycle (`fopen`/`fwrite`/`fread`/`fclose`).
 - [x] `done` Verify exec/fd runtime behavior through real exec boundaries: deterministic failed-`execve` status, parent integrity, fd inheritance, `dup2`, and close-on-exec behavior.
 - [x] `done` Verify shell/userland ABI integration baseline: `/bin/sh -c` argv and status semantics.
-- [ ] `planned` Complete full POSIX userspace signal semantics and libc `errno` behavior parity (tracked under M15 signal/libc completion work).
-
-M13 closes the userspace process/system call ABI validation and POSIX runtime
-hardening baseline. Native ELF execve processes preserve correct argv/envp mappings
-including argc/argv[0] verification, and userspace stacks are properly 16-byte
-aligned at ring3 entry. A complete baseline of libc wrappers, stdio functions
-(fopen/fread/fwrite/fclose/printf/snprintf/puts), fd inheritance, close-on-exec
-enforcement, dup2, parent safety, and /bin/sh -c status propagation are covered
-by deterministic QEMU/dev smoke. Further POSIX signal handling and errno parity
-gaps are explicitly deferred to M15.
+- [ ] `planned` Complete full POSIX userspace signal semantics and libc `errno` behavior parity.
+- [ ] `planned` Enforce strict 16-byte stack alignment validation at Ring 3 entry using explicit architectural assertions; reject non-compliant frames immediately.
+- [ ] `planned` Audit all libc syscall wrappers to ensure unknown or negative kernel return values are never leaked, mapping them strictly to standard POSIX `errno` values.
 
 ## M14: Advanced Storage, Swap & File Systems
 
@@ -228,10 +221,8 @@ gaps are explicitly deferred to M15.
 - [x] `done` `sync()` and `fsync()` flush block cache paths.
 - [x] `done` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
 - [x] `done` Persistent ext2 root-image creation and boot overlay.
-- [x] `done` Add complete AHCI/NVMe baseline storage paths (QEMU/dev storage baseline with robust journal replay and full file-lock blocking semantics are implemented).
-
-M14 closes the QEMU/dev advanced storage, swap, and filesystem baseline. The system implements a write-back block cache with bounds checking, smoke-tests swap on dedicated block devices, covers ext2/ext3/ext4 mount and persistence paths, and flushes caches on unmount.
-*Deferred to future:* Unsupported journaling features (JBD revoke block tracking, metadata-only ordering), full ext4 extent index tree splitting (currently single leaf extent block is used), and userspace partition/formatting tools.
+- [x] `done` Add complete AHCI/NVMe baseline storage paths.
+- [ ] `planned` Enforce strict block cache locking topology: ensure VFS-level locks are never acquired while holding a block cache spinlock to prevent layer-inversion deadlocks.
 
 ## M15: IPC, Security & Standard OS Features
 
@@ -245,15 +236,7 @@ M14 closes the QEMU/dev advanced storage, swap, and filesystem baseline. The sys
 - [x] `done` Add UNIX domain sockets.
 - [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
 - [ ] `planned` Complete full userspace signal semantics (`sigaction` masks, nested delivery, robust `sigreturn` ABI behavior) and remove libc stubs.
-
-M15 is closed for the QEMU/dev smoke baseline through `make smoke-x86` coverage
-of signal baseline/ignore and explicit handler-delivery smoke (`kill` + yield
-loop + userspace state mutation), message queues, shared memory baseline,
-cooperative semaphore baseline, clock/timer behavior, permission enforcement,
-and audit markers. Deferred production/POSIX parity gaps: full signal masks and
-mask-restoration edge cases, nested signal behavior, production-grade
-`sigreturn` correctness hardening, full permission/capability model, and
-production-grade IPC semantics.
+- [ ] `planned` Harden IPC interfaces (`mq_*`, `shm*`): enforce strict user-space pointer verification using `copyin`/`copyout` wrappers; direct raw pointer dereferencing inside the kernel is strictly prohibited.
 
 ## M16: User Space Applications & TUI
 
@@ -266,14 +249,6 @@ production-grade IPC semantics.
 - [x] `partial` File manager copy/move clipboard actions reserved for future work.
 - [x] `partial` Richer GUI/compositor-backed app surfaces and a longer-lived event loop remain deferred.
 - [ ] `planned` Add richer editor persistence/workflow tests and more interactive TUI coverage.
-
-M16 closes the QEMU/dev baseline for user-space applications with the existing
-TUI file explorer and text editor. The boot smoke now exercises the real
-interactive programs in deterministic smoke modes, covers shared key decoding,
-and verifies terminal raw-mode restore, so the source of truth stays
-`make smoke-x86`. Richer editor persistence, a production styling/layout system,
-clipboard copy/move workflows, and compositor-backed GUI apps remain planned
-follow-up work.
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
@@ -289,6 +264,8 @@ follow-up work.
 - [ ] `planned` Cross-compile and port GCC specifically for `x86_64-b1nix`.
 - [ ] `planned` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`) and GNU Make.
 - [ ] `planned` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC.
+- [ ] `planned` Restructure syscall layers to strictly decouple generic VFS traversal from file-system specific logic, enforcing explicit `refcount` tracking on every descriptor lifecycle step.
+- [ ] `planned` Formalize expected `errno` matrices for failed file operations, explicitly validating edge cases like `ELOOP`, `ENAMETOOLONG`, and `EACCES` propagation.
 
 ## M18: Real Userspace and ELF Loader
 
@@ -301,15 +278,8 @@ follow-up work.
 - [x] `done` Add QEMU tests that boot, launch `/bin/init`, and execute a VFS-loaded program.
 - [x] `done` Add external clang-backed `b1nix-cc` wrapper for early ELF builds.
 - [x] `done` Add hardware-enforced ring3 entry and return.
-
-M18 establishes the loader and process-image ABI while B1NIX still uses kernel
-threads as the execution substrate. ELF64 files are read through VFS, PT_LOAD
-segments are copied into per-process image state, initial stack metadata is
-constructed with `argc`, `argv`, `envp`, and basic auxv entries, and `/bin/init`
-can boot from a VFS-loaded ELF image before starting the shell. Hardware
-ring3 entry, native ELF syscall/exit smoke, copy-on-write fork isolation, and
-strict user-pointer validation now work on x86_64. Full ELF dynamic behavior
-remains follow-up work.
+- [ ] `planned` Implement strict boundary verification for ELF `PT_LOAD` segments to guarantee that malformed binaries can never corrupt kernel memory limits.
+- [ ] `planned` Enforce that all string operations during environment and stack construction utilize bounded `copyinstr` tracking with exact destination limit assertions.
 
 ## M19: Process Model and FD Tables
 
@@ -323,15 +293,7 @@ remains follow-up work.
 - [x] `done` Add refcounted VFS handles/open-file descriptions.
 - [x] `done` Add MMU-aware fork with copied metadata/FD state and COW-backed address-space isolation.
 - [ ] `planned` Add exact POSIX child/parent register-return semantics.
-
-M19 moves descriptor ownership out of the global VFS handle namespace and into
-per-task fd tables. VFS handles are now open-file descriptions with refcounts,
-while process-visible descriptors are inherited on spawn/fork, closed on task
-exit, and honor `FD_CLOEXEC`. Descriptor `0`, `1`, and `2` are initialized as
-real task-local TTY descriptors. `waitpid()` supports non-blocking `WNOHANG`,
-and zombies remain reapable until the parent waits. Fork now clones task
-metadata and fd state while giving the child a separate page table with
-copy-on-write private mappings.
+- [ ] `planned` Formalize FD table locking semantics during multi-threaded `fork`/`exec` operations and enforce strict `O_CLOEXEC` validation to prevent descriptor leaks across boundaries.
 
 ## M20: Terminal, TTY, and Interactive Shell
 
@@ -345,14 +307,6 @@ copy-on-write private mappings.
 - [x] `done` Improve shell errors and exit statuses.
 - [x] `done` Route terminal control characters into the signal/process metadata path.
 - [x] `partial` Add controlling-terminal/process-group signal behavior for interactive shell paths.
-
-M20 adds `/dev/tty` as a VFS device, initializes descriptors `0`, `1`, and `2`
-to the terminal, and routes keyboard input through the TTY line discipline.
-Canonical mode, echo, signal-control characters, EOF, and raw-mode toggling are
-represented through the initial `termios` ABI. The shell now resolves commands
-through `PATH`, uses real `pipe()`/`dup2()` descriptors for pipelines, and
-supports basic input/output/error redirection using the M19 per-process fd
-tables.
 
 ## M21: Persistent Root Filesystem
 
@@ -370,17 +324,6 @@ tables.
 - [x] `done` Add Btrfs probing/listing metadata without treating Btrfs as a usable POSIX filesystem.
 - [x] `partial` Add mount option handling baseline.
 
-M21 has an initial persistent-root path for the current boot model, but it is
-not fully closed. The VFS tracks mounted sources in a
-mount table and exposes `mount()`, `umount()`, and `sync()` syscalls. The root
-tree is initialized with the standard terminal OS layout, and `make root-image`
-creates a seeded ext2 disk. When that disk is attached as `virtio-blk0`, ext2 is
-mounted at `/` and overlays the initramfs fallback files, so persistent files can
-live at the root while built-in `/bin/init` remains available until the full disk
-userland is populated. Remaining work: real hardware block-device coverage,
-mount option semantics, stronger ext2 durability tests, and clean recovery after
-unclean shutdown.
-
 ## M22: Core Terminal Utilities
 
 - [x] `done` Add pwd, ls, cp, mv, rm, mkdir, rmdir, chmod, chown, and ln.
@@ -396,15 +339,6 @@ unclean shutdown.
 - [x] `done` Add interactive shell-driven utility smoke tests that execute through /bin/sh.
 - [x] `done` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q, grep -n, head -n NUM, tail -n NUM).
 - [x] `done` Restore all utility dispatch targets used by M22 smoke after the BusyBox table cleanup.
-
-M22 is closed for the QEMU/dev baseline. The init-path smoke proves many utilities
-work, and `/bin/shell-smoke` now exercises the polished options, text pipeline,
-file workflow, and failure status propagation through `/bin/sh`.
-Current verification: `make smoke-x86` passes M22 utility smoke, M24 stress, the
-POSIX shell-driven smoke path, and an init-path `ping -c 2 10.0.2.2` gateway
-check. QEMU/dev baseline coverage is in place for the covered utilities and
-libc paths, while full and exact POSIX utility parity is deferred if not
-implemented.
 
 ## M23: Networking for Terminal Use
 
@@ -432,6 +366,8 @@ implemented.
 - [x] `done` Add shell-driven utility smoke coverage.
 - [x] `done` Add CI-grade interactive shell utility tests.
 - [x] `done` Make syscall errors consistently map to userspace `errno` for the covered libc wrappers and smoke paths.
+- [ ] `planned` Systematically eliminate non-critical kernel panics (`KASSERT`) from VFS lookup and network packet ingestion paths, replacing them with structured error propagation chains.
+- [ ] `planned` Integrate automated static analysis checks into the top-level Makefile, ensuring code compiles without warnings under elevated syntax checking flags.
 
 ## M25: Minimal Native C Toolchain
 
@@ -449,13 +385,7 @@ implemented.
 - [x] `done` Smoke-test native TCC stderr handling and non-zero exit status propagation.
 - [x] `done` Document the current external cross-build to in-guest compilation boundary in `docs/abi.md`.
 - [ ] `planned` Align libc POSIX-facing APIs and signatures (`signal.h`, `sigaction`, `sigprocmask`, `dlopen*`, `strtod` family) and remove stubs.
-
-M25 is closed for the QEMU/dev baseline. `/bin/tcc` is packaged into initramfs
-with headers, `crt0.o`, and `libb1nix.a`; smoke compiles and runs native
-programs in-guest for hello output, argv propagation, stderr redirection, file
-output, and non-zero exit status. Larger programs, full libc/POSIX parity, GNU
-Binutils/GCC, native `make`, and rebuilding the kernel inside B1NIX remain M26
-work.
+- [ ] `planned` Harden the internal kernel `malloc`/`free` heap implementations with strict boundary canary validations to detect and block buffer overruns immediately at runtime.
 
 ## M26: Full Toolchain and Self-Hosting
 
