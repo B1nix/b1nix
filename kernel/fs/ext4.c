@@ -493,7 +493,10 @@ static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *f
   }
   if (h) journal_commit_transaction(h);
   struct vfs_node *n = find_child(dir, name);
-  if (n) ext4_setup_node(n, fs, new_ino, inode.i_mode);
+  if (n) {
+    ext4_setup_node(n, fs, new_ino, inode.i_mode);
+    vfs_node_put(n);
+  }
   return 0;
 }
 

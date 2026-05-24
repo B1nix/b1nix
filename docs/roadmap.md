@@ -138,7 +138,7 @@ and broader utility flag compatibility.
 - [x] `done` Add ext2 timestamps, durable directory updates, reboot persistence tests, and fsck-friendly metadata.
 - [x] `done` Harden JBD recovery semantics: replay only committed descriptor transactions and clear `RECOVER` incompat bit after successful replay.
 - [x] `done` Add ext3 metadata ordering hardening for `unlink`/`rmdir`/`rename` path with journal transaction grouping and inode timestamp updates.
-- [ ] `planned` Formalize VFS node refcounting rules: enforce that all functions returning a VFS node MUST increment its refcount, and callers are strictly responsible for decref to prevent memory leaks during lookup paths.
+- [x] `done` Formalize VFS node refcounting rules: enforce that all functions returning a VFS node MUST increment its refcount, and callers are strictly responsible for decref to prevent memory leaks during lookup paths.
 
 ## M9: Hardware Drivers
 

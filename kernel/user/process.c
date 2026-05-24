@@ -218,23 +218,27 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
     return -1;
   }
   if (node->inode->type != VFS_FILE || node->inode->size == 0) {
+    vfs_node_put(node);
     return -1;
   }
+
+  usize file_size = node->inode->size;
+  vfs_node_put(node);
 
   int fd = vfs_open(path);
   if (fd < 0) {
     return -1;
   }
 
-  char *data = kmalloc(node->inode->size);
+  char *data = kmalloc(file_size);
   if (!data) {
     vfs_close(fd);
     return -1;
   }
 
   usize total_read = 0;
-  while (total_read < node->inode->size) {
-    isize got = vfs_read(fd, data + total_read, node->inode->size - total_read);
+  while (total_read < file_size) {
+    isize got = vfs_read(fd, data + total_read, file_size - total_read);
     if (got < 0) {
       if (got == -EAGAIN || got == -EWOULDBLOCK) {
         scheduler_yield();
@@ -250,7 +254,7 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
   }
   vfs_close(fd);
 
-  if (total_read != node->inode->size) {
+  if (total_read != file_size) {
     kfree(data);
     return -1;
   }

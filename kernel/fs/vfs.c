@@ -465,7 +465,13 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
 
 /* ── Node/Inode allocation ── */
 
-static struct vfs_inode *alloc_inode(void) { return vfs_alloc_inode(); }
+static struct vfs_inode *alloc_inode(void) {
+  struct vfs_inode *inode = vfs_alloc_inode();
+  if (inode) {
+    inode->refcount = 0;
+  }
+  return inode;
+}
 
 struct vfs_inode *vfs_inode_get(struct vfs_inode *inode) {
   if (inode)
@@ -487,8 +493,10 @@ void vfs_inode_put(struct vfs_inode *inode) {
 
 static struct vfs_node *alloc_node(void) {
   struct vfs_node *n = vfs_alloc_node();
-  if (n)
+  if (n) {
+    n->refcount = 0;
     __atomic_add_fetch(&node_count, 1, __ATOMIC_RELAXED);
+  }
   return n;
 }
 
@@ -955,13 +963,12 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       return current;
 
     struct vfs_node *child = find_child(current, part);
-    /* find_child() returns with refcount incremented, but we need to drop it
-     * because the caller (vfs_add_node) takes ownership via tree insertion */
+    int child_was_found = (child != NULL);
     if (child) {
       for (int i = 0; i < MAX_MOUNTS; i++) {
         if (mounts[i].used && child == mounts[i].mount_point) {
           vfs_node_put(child); /* Drop ref from find_child */
-          child = mounts[i].root_node;
+          child = vfs_node_get(mounts[i].root_node);
           break;
         }
       }
@@ -975,8 +982,11 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         if (!child)
           return ERR_PTR(-ENOMEM);
         child->inode = alloc_inode();
-        if (!child->inode)
+        if (!child->inode) {
+          vfs_free_node(child);
+          __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
           return ERR_PTR(-ENOMEM);
+        }
 
         copy_path(child->name, 64, part);
         child->inode->type = type;
@@ -1011,7 +1021,13 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->inode->flags = flags;
         child->inode->mtime = child->inode->ctime = vfs_get_unix_time();
       } else {
+        if (child_was_found) {
+          vfs_node_put(child);
+        }
         return child;
+      }
+      if (child_was_found) {
+        vfs_node_put(child);
       }
       return child;
     } else {
@@ -1020,8 +1036,11 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         if (!child)
           return ERR_PTR(-ENOMEM);
         child->inode = alloc_inode();
-        if (!child->inode)
+        if (!child->inode) {
+          vfs_free_node(child);
+          __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
           return ERR_PTR(-ENOMEM);
+        }
 
         copy_path(child->name, 64, part);
         child->inode->type = VFS_DIRECTORY;
@@ -1041,6 +1060,9 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         current->first_child = child;
       }
       current = child;
+      if (child_was_found) {
+        vfs_node_put(child);
+      }
     }
   }
 }
@@ -1672,7 +1694,7 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   if (!node->inode) {
     memset(node, 0, sizeof(*node));
     res = -ENOMEM;
-    goto out_unlock;
+    goto out_node_put;
   }
 
   node->inode->blk_dev = parent->inode->blk_dev;
@@ -1782,7 +1804,7 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   if (!node->inode) {
     memset(node, 0, sizeof(*node));
     res = -ENOMEM;
-    goto out_unlock;
+    goto out_node_put;
   }
 
   node->inode->blk_dev = parent->inode->blk_dev;
@@ -2105,13 +2127,14 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
   }
   kfree(p_path);
 
+  struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
   struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
   if (mnt && (mnt->flags & MS_RDONLY)) {
     res = -EROFS;
     goto out_unlock;
   }
-  struct vfs_node *node = find_child(parent, name);
+  node = find_child(parent, name);
   if (!node) {
     res = -ENOENT;
     goto out_unlock;
@@ -2144,9 +2167,9 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
   node->inode->nlink--;
   dcache_invalidate(parent, name);
 
-  vfs_node_put(node);
-
 out_unlock:
+  if (node)
+    vfs_node_put(node);
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
   return res;
@@ -2379,7 +2402,10 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     return (int)PTR_ERR(new_parent);
   }
 
-  struct vfs_node *node = find_child(old_parent, old_n);
+  struct vfs_node *node = 0;
+  struct vfs_node *existing = 0;
+
+  node = find_child(old_parent, old_n);
   if (!node) {
     res = -ENOENT;
     goto out_put_parents;
@@ -2431,7 +2457,7 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   }
 
   /* POSIX type-consistency checks */
-  struct vfs_node *existing = find_child(new_parent, new_n);
+  existing = find_child(new_parent, new_n);
   if (existing) {
     if (node->inode->type == VFS_DIRECTORY &&
         existing->inode->type != VFS_DIRECTORY) {
@@ -2487,6 +2513,10 @@ out_unlock:
     vfs_inode_unlock(p2->inode);
   vfs_inode_unlock(p1->inode);
 out_put_parents:
+  if (existing)
+    vfs_node_put(existing);
+  if (node)
+    vfs_node_put(node);
   vfs_node_put(new_parent);
   vfs_node_put(old_parent);
   return res;

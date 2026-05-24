@@ -765,6 +765,7 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name,
     info->fs = fs;
     info->inode_num = new_inode_num;
     node->inode->data = info;
+    vfs_node_put(node);
 	}
 	
 	return 0;

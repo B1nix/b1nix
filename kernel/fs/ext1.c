@@ -373,7 +373,10 @@ static int ext1_vfs_create(struct vfs_node *dir, const char *name, const char *f
     ext1_write_inode(fs, new_ino, &inode);
     if (ext1_add_dir_entry(fs, dir_info->inode_num, new_ino, name) < 0) return -1;
     struct vfs_node *n = find_child(dir, name);
-    if (n) ext1_setup_node(n, fs, new_ino, inode.i_mode);
+    if (n) {
+        ext1_setup_node(n, fs, new_ino, inode.i_mode);
+        vfs_node_put(n);
+    }
     return 0;
 }
 

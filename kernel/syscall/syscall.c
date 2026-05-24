@@ -768,10 +768,14 @@ static isize sys_chdir(const char *user_path) {
   struct vfs_node *node = vfs_find_node(resolved);
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
-  if (node->inode->type != VFS_DIRECTORY)
+  if (node->inode->type != VFS_DIRECTORY) {
+    vfs_node_put(node);
     return -ENOTDIR;
+  }
 
-  return (isize)scheduler_set_cwd(resolved);
+  isize res = (isize)scheduler_set_cwd(resolved);
+  vfs_node_put(node);
+  return res;
 }
 
 static isize sys_mount(const char *user_src, const char *user_target,
