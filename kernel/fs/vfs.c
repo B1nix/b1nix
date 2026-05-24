@@ -541,14 +541,18 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
     return 0;
 
   struct vfs_node *cached = dcache_lookup(parent, name);
-  if (cached && !cached->deleted)
-    return cached;
+  if (cached && !cached->deleted) {
+    /* REFCOUNT RULE: All functions returning a VFS node MUST increment refcount.
+     * Caller is responsible for calling vfs_node_put() when done. */
+    return vfs_node_get(cached);
+  }
 
   struct vfs_node *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
       dcache_insert(parent, name, child);
-      return child;
+      /* REFCOUNT RULE: Return with refcount incremented for caller ownership */
+      return vfs_node_get(child);
     }
     child = child->next_sibling;
   }
@@ -795,7 +799,7 @@ restart_traversal:
       return ERR_PTR(-ENOENT);
     }
 
-    vfs_node_get(child);
+    /* find_child() already returns with refcount incremented */
     /* DOWNWARD MOUNT CROSSING */
     for (int i = 0; i < MAX_MOUNTS; i++) {
       if (mounts[i].used && child == mounts[i].mount_point) {
@@ -951,9 +955,12 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
       return current;
 
     struct vfs_node *child = find_child(current, part);
+    /* find_child() returns with refcount incremented, but we need to drop it
+     * because the caller (vfs_add_node) takes ownership via tree insertion */
     if (child) {
       for (int i = 0; i < MAX_MOUNTS; i++) {
         if (mounts[i].used && child == mounts[i].mount_point) {
+          vfs_node_put(child); /* Drop ref from find_child */
           child = mounts[i].root_node;
           break;
         }
@@ -1644,7 +1651,9 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
     res = -EROFS;
     goto out_unlock;
   }
-  if (find_child(parent, name)) {
+  struct vfs_node *existing_child = find_child(parent, name);
+  if (existing_child) {
+    vfs_node_put(existing_child); /* Drop ref from find_child */
     res = -EEXIST;
     goto out_unlock;
   }
@@ -1752,7 +1761,9 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
     res = -EROFS;
     goto out_unlock;
   }
-  if (find_child(parent, name)) {
+  struct vfs_node *existing_child = find_child(parent, name);
+  if (existing_child) {
+    vfs_node_put(existing_child); /* Drop ref from find_child */
     res = -EEXIST;
     goto out_unlock;
   }
@@ -2105,6 +2116,7 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
     res = -ENOENT;
     goto out_unlock;
   }
+  /* find_child() returns with refcount incremented, caller owns it */
   if (node->inode->type == VFS_DIRECTORY) {
     res = -EISDIR;
     goto out_unlock;
@@ -2245,7 +2257,9 @@ int vfs_symlink(const char *target, const char *link_path) {
 
   struct vfs_node *node = 0;
   vfs_inode_lock(parent->inode);
-  if (find_child(parent, name)) {
+  struct vfs_node *existing_child = find_child(parent, name);
+  if (existing_child) {
+    vfs_node_put(existing_child); /* Drop ref from find_child */
     res = -EEXIST;
     goto out_unlock;
   }
