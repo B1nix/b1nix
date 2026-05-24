@@ -46,16 +46,22 @@ static int ext3_journal_write(struct ext3_fs *fs, u32 block, const void *buffer)
 
 static int ext3_journal_write_tx(struct ext3_fs *fs, struct journal_handle *h,
                                  u32 block, const void *buffer) {
-  if (h)
-    return journal_log_block(h, block, buffer);
-  return ext3_journal_write(fs, block, buffer);
+  if (h) {
+    journal_log_block(h, block, buffer);
+  }
+  // Always update the block cache so subsequent reads see the changes
+  return ext3_write_block(fs, block, buffer);
 }
 
 static int ext3_journal_write(struct ext3_fs *fs, u32 block, const void *buffer) {
   if (fs->jdev) {
     struct journal_handle *h = journal_start_transaction(fs->jdev);
-    if (h) { journal_log_block(h, block, buffer); journal_commit_transaction(h); return 0; }
+    if (h) { 
+      journal_log_block(h, block, buffer); 
+      journal_commit_transaction(h); 
+    }
   }
+  // Always update the block cache so subsequent reads see the changes
   return ext3_write_block(fs, block, buffer);
 }
 
@@ -318,7 +324,9 @@ static isize ext3_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
       inode.i_blocks += fs->block_size / 512;
     }
     inode.i_size = (u32)new_size; ext3_write_inode(fs, info->inode_num, &inode);
-    node->inode->size = inode.i_size;
+    if (inode.i_size > node->inode->size) {
+      node->inode->size = inode.i_size;
+    }
   }
   usize done = 0; u8 *block_buf = kmalloc(fs->block_size);
   while (done < size) {
@@ -334,15 +342,15 @@ static isize ext3_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
     node->inode->mtime = vfs_get_unix_time();
     node->inode->ctime = vfs_get_unix_time();
     if (offset + done > inode.i_size) {
+      inode.i_size = (u32)(offset + done);
+    }
+    if (offset + done > node->inode->size) {
       node->inode->size = (usize)(offset + done);
     }
-    struct ext2_inode inode_to_update;
-    if (ext3_read_inode(fs, info->inode_num, &inode_to_update) == 0) {
-      inode_to_update.i_mtime = node->inode->mtime;
-      inode_to_update.i_ctime = node->inode->ctime;
-      inode_to_update.i_size = (u32)node->inode->size;
-      ext3_write_inode(fs, info->inode_num, &inode_to_update);
-    }
+    // Reuse our existing up-to-date inode rather than fetching a stale one from disk
+    inode.i_mtime = node->inode->mtime;
+    inode.i_ctime = node->inode->ctime;
+    ext3_write_inode(fs, info->inode_num, &inode);
   }
   return done;
 }

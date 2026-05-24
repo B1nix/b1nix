@@ -10,6 +10,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/blk.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/ext2.h>
 #include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
@@ -96,6 +97,7 @@ void kernel_main(u64 arg0, u64 arg1)
 
 #ifndef __aarch64__
 	vfs_init();
+	page_cache_init();
 	ext2_init();
 	ext1_init();
 	ext3_init();

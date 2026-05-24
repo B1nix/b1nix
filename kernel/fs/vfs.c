@@ -9,7 +9,9 @@
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/sched.h>
+#include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
 #include <stdio.h>
@@ -1505,7 +1507,66 @@ static isize node_read(struct vfs_handle *h, char *buf, usize size) {
   vfs_inode_lock(node->inode);
   vfs_update_times(node->inode, VFS_ATIME);
   isize res = 0;
-  if (node->inode->read_cb) {
+  if (node->inode->type == VFS_FILE && node->inode->read_cb) {
+    usize remaining = size;
+    usize total_read = 0;
+    u64 curr_offset = offset;
+
+    while (remaining > 0) {
+      if (curr_offset >= node->inode->size) break;
+
+      u64 page_aligned = curr_offset & ~(PAGE_SIZE - 1);
+      usize page_offset = curr_offset & (PAGE_SIZE - 1);
+      usize chunk = PAGE_SIZE - page_offset;
+      if (chunk > remaining) chunk = remaining;
+      if (curr_offset + chunk > node->inode->size) {
+        chunk = node->inode->size - curr_offset;
+      }
+
+      struct page_cache_entry *page = page_cache_get_page(node->inode, page_aligned);
+      if (!page) {
+        u64 frame = pmm_alloc_frame();
+        if (!frame) {
+          if (total_read == 0) res = -ENOMEM;
+          break;
+        }
+
+        void *virt_addr = (void *)(usize)(frame + vmm_direct_map_base());
+        memset(virt_addr, 0, PAGE_SIZE);
+        isize read_res = node->inode->read_cb(node, page_aligned, virt_addr, PAGE_SIZE, 0);
+
+        if (read_res < 0) {
+          pmm_free_frame(frame);
+          if (total_read == 0) res = read_res;
+          break;
+        }
+
+        if (page_cache_add_page(node->inode, page_aligned, frame) < 0) {
+          pmm_free_frame(frame);
+          page = page_cache_get_page(node->inode, page_aligned);
+          if (!page) {
+            if (total_read == 0) res = -ENOMEM;
+            break;
+          }
+        } else {
+          page = page_cache_get_page(node->inode, page_aligned);
+        }
+      }
+
+      void *virt_addr = (void *)(usize)(page->frame + vmm_direct_map_base());
+      memcpy(buf + total_read, (char *)virt_addr + page_offset, chunk);
+      page_cache_put_page(page);
+
+      total_read += chunk;
+      curr_offset += chunk;
+      remaining -= chunk;
+    }
+
+    if (total_read > 0) {
+      res = total_read;
+      h->offset += total_read;
+    }
+  } else if (node->inode->read_cb) {
     res = node->inode->read_cb(node, offset, buf, size, h->flags);
     if (res > 0)
       h->offset += (usize)res;
@@ -1532,7 +1593,65 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
   u64 offset = h->offset;
   vfs_inode_lock(node->inode);
   isize res = 0;
-  if (node->inode->write_cb) {
+  if (node->inode->type == VFS_FILE && node->inode->write_cb) {
+    usize remaining = size;
+    usize total_written = 0;
+    u64 curr_offset = offset;
+
+    while (remaining > 0) {
+      u64 page_aligned = curr_offset & ~(PAGE_SIZE - 1);
+      usize page_offset = curr_offset & (PAGE_SIZE - 1);
+      usize chunk = PAGE_SIZE - page_offset;
+      if (chunk > remaining) chunk = remaining;
+
+      struct page_cache_entry *page = page_cache_get_page(node->inode, page_aligned);
+      if (!page) {
+        u64 frame = pmm_alloc_frame();
+        if (!frame) {
+          if (total_written == 0) res = -ENOMEM;
+          break;
+        }
+
+        void *virt_addr = (void *)(usize)(frame + vmm_direct_map_base());
+        memset(virt_addr, 0, PAGE_SIZE);
+        
+        if ((chunk < PAGE_SIZE) && (page_aligned < node->inode->size)) {
+          if (node->inode->read_cb) {
+             node->inode->read_cb(node, page_aligned, virt_addr, PAGE_SIZE, 0);
+          }
+        }
+
+        if (page_cache_add_page(node->inode, page_aligned, frame) < 0) {
+          pmm_free_frame(frame);
+          page = page_cache_get_page(node->inode, page_aligned);
+          if (!page) {
+            if (total_written == 0) res = -ENOMEM;
+            break;
+          }
+        } else {
+          page = page_cache_get_page(node->inode, page_aligned);
+        }
+      }
+
+      void *virt_addr = (void *)(usize)(page->frame + vmm_direct_map_base());
+      memcpy((char *)virt_addr + page_offset, buf + total_written, chunk);
+      page_cache_mark_dirty(page);
+      page_cache_put_page(page);
+
+      total_written += chunk;
+      curr_offset += chunk;
+      remaining -= chunk;
+    }
+
+    if (total_written > 0) {
+      res = total_written;
+      h->offset += total_written;
+      if (h->offset > node->inode->size) {
+        node->inode->size = h->offset;
+      }
+      vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
+    }
+  } else if (node->inode->write_cb) {
     res = node->inode->write_cb(node, offset, buf, size, h->flags);
     if (res > 0) {
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
@@ -2546,6 +2665,8 @@ int vfs_fsync(int fd) {
   if (!h->used || h->kind != VFS_HANDLE_NODE)
     return -EBADF;
   struct vfs_node *node = h->node;
+
+  page_cache_flush_inode(node->inode);
 
   if (node->inode->fsync_cb) {
     int err = node->inode->fsync_cb(node);

@@ -13,7 +13,7 @@ INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
-GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
+GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
 
@@ -48,6 +48,7 @@ KERNEL_SOURCES := \
 	kernel/lib/unistd.c \
 	kernel/mm/kheap.c \
 	kernel/mm/pmm.c \
+	kernel/mm/page_cache.c \
 	kernel/mm/swap.c \
 	kernel/mm/eviction.c \
 	kernel/sched/scheduler.c \

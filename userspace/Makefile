@@ -6,7 +6,7 @@
 CC       := clang
 TARGET   := x86_64-unknown-elf
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
-AR       := $(shell command -v llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)
+AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || echo llvm-ar)
 CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix
 LDFLAGS  := -m elf_x86_64
 BUILD    := build

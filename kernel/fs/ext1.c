@@ -268,7 +268,9 @@ static isize ext1_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
         }
         inode.i_size = (u32)new_size;
         ext1_write_inode(fs, info->inode_num, &inode);
-        node->inode->size = inode.i_size;
+        if (inode.i_size > node->inode->size) {
+            node->inode->size = inode.i_size;
+        }
     }
     usize done = 0;
     u8 *block_buf = kmalloc(fs->block_size);

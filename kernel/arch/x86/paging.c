@@ -2,6 +2,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
 #include <string.h>
 
@@ -462,16 +463,45 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
     memset(new_frame_virt, 0, PAGE_SIZE);
 
-    // If file-backed, load from VFS
+    // If file-backed, load from page cache or VFS
     struct vm_area *vma = current_task->vma_list;
     while (vma) {
       if (page_aligned >= vma->start && page_aligned < vma->end) {
-        if (vma->node && vma->node->inode && vma->node->inode->read_cb) {
+        if (vma->node && vma->node->inode) {
           u64 file_offset = vma->offset + (page_aligned - vma->start);
-          isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
-          if (res < 0) {
-            pmm_free_frame(frame);
-            return -1;
+          u64 file_page = file_offset & ~(PAGE_SIZE - 1);
+          
+          if (vma->node->inode->type == VFS_FILE) {
+            struct page_cache_entry *page = page_cache_get_page(vma->node->inode, file_page);
+            if (page) {
+              // Use existing page cache frame (sharing!)
+              pmm_free_frame(frame); // Free the freshly allocated frame
+              frame = page->frame;
+              pmm_ref_frame(frame);  // VMA references it
+              page_cache_put_page(page);
+            } else {
+              // Miss in page cache, read into the fresh frame and add to cache
+              if (vma->node->inode->read_cb) {
+                isize res = vma->node->inode->read_cb(vma->node, file_page, (char *)new_frame_virt, PAGE_SIZE, 0);
+                if (res >= 0) {
+                  if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
+                    pmm_ref_frame(frame); // Cache has a reference, VMA has a reference
+                  }
+                } else {
+                  pmm_free_frame(frame);
+                  return -1;
+                }
+              }
+            }
+          } else {
+            // Not a file (e.g. device node mapped lazily), just call read_cb
+            if (vma->node->inode->read_cb) {
+              isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
+              if (res < 0) {
+                pmm_free_frame(frame);
+                return -1;
+              }
+            }
           }
         }
         break;

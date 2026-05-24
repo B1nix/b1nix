@@ -5,6 +5,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
 #include <string.h>
+#include <b1nix/klog.h>
 
 static struct ext2_fs *ext2_fs_list = NULL;
 
@@ -528,15 +529,15 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
     node->inode->mtime = vfs_get_unix_time();
     node->inode->ctime = vfs_get_unix_time();
     if (offset + bytes_written > inode.i_size) {
+      inode.i_size = (u32)(offset + bytes_written);
+    }
+    if (offset + bytes_written > node->inode->size) {
       node->inode->size = (usize)(offset + bytes_written);
     }
-    struct ext2_inode inode_to_update;
-    if (ext2_read_inode(fs, inode_num, &inode_to_update) == 0) {
-      inode_to_update.i_mtime = node->inode->mtime;
-      inode_to_update.i_ctime = node->inode->ctime;
-      inode_to_update.i_size = (u32)node->inode->size;
-      ext2_write_inode(fs, inode_num, &inode_to_update);
-    }
+    // Reuse our existing up-to-date inode rather than fetching a stale one from disk
+    inode.i_mtime = node->inode->mtime;
+    inode.i_ctime = node->inode->ctime;
+    ext2_write_inode(fs, inode_num, &inode);
   }
 
 	return bytes_written;
