@@ -906,6 +906,10 @@ LIBTCCAPI TCCState *tcc_new(void)
     /* might be used in error() before preprocess_start() */
     s->include_stack_ptr = s->include_stack;
 
+#ifdef b1nix
+    s->static_link = 1;
+#endif
+
     tcc_set_lib_path(s, CONFIG_TCCDIR);
 #ifdef CONFIG_TCC_SWITCHES /* predefined options */
     tcc_set_options(s, CONFIG_TCC_SWITCHES);

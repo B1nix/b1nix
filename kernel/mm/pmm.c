@@ -281,3 +281,12 @@ u64 pmm_total_usable_memory(void) { return pmm.total_usable; }
 u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 
 usize pmm_free_frame_count(void) { return (usize)pmm.free_frames; }
+
+void pmm_switch_to_direct_map(void) {
+  if (pmm.bitmap) {
+    pmm.bitmap = (u8 *)((u64)(usize)pmm.bitmap + DIRECT_MAP_BASE);
+  }
+  if (pmm.frame_refcounts) {
+    pmm.frame_refcounts = (u16 *)((u64)(usize)pmm.frame_refcounts + DIRECT_MAP_BASE);
+  }
+}

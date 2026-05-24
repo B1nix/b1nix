@@ -16,14 +16,15 @@ TARGET="x86_64-unknown-elf"
 
 [ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make -C "$USR" -s; }
 
-# Parse: find sources and -o output
+# Parse: find sources, output, and keep other flags
 OUTPUT="a.out"
 SOURCES=""
+FLAGS=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-o) shift; OUTPUT="$1" ;;
-		-c|-I*|-D*|-O*|-W*|-std=*) ;;  # skip
-		-*) ;;
+		-c) ;;  # skip -c
+		-*) FLAGS="$FLAGS $1" ;;
 		*) SOURCES="$SOURCES $1" ;;
 	esac
 	shift
@@ -33,7 +34,7 @@ OBJS=""
 for src in $SOURCES; do
 	obj="${src%.c}.o"
 	clang --target="$TARGET" -ffreestanding -fno-builtin -fno-stack-protector \
-		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" -Wall -O2 -c "$src" -o "$obj"
+		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" -Wall -O2 -msoft-float -mno-implicit-float -Db1nix $FLAGS -c "$src" -o "$obj"
 	OBJS="$OBJS $obj"
 done
 

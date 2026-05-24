@@ -275,6 +275,7 @@ static void _vsnprintf_putc(char *str, size_t size, int *pos, char c) {
 }
 
 static void _vsnprintf_puts(char *str, size_t size, int *pos, const char *s) {
+  if (!s) s = "(null)";
   while (*s)
     _vsnprintf_putc(str, size, pos, *s++);
 }

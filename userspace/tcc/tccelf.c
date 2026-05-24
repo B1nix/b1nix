@@ -1743,6 +1743,11 @@ static void tcc_tcov_add_file(TCCState *s1, const char *filename)
 /* add libc crt1/crti objects */
 ST_FUNC void tccelf_add_crtbegin(TCCState *s1)
 {
+#ifdef b1nix
+    if (s1->output_type != TCC_OUTPUT_DLL)
+        tcc_add_crt(s1, "crt0.o");
+    return;
+#endif
 #if TARGETOS_OpenBSD
     if (s1->output_type != TCC_OUTPUT_DLL)
         tcc_add_crt(s1, "crt0.o");
@@ -1778,6 +1783,9 @@ ST_FUNC void tccelf_add_crtbegin(TCCState *s1)
 
 ST_FUNC void tccelf_add_crtend(TCCState *s1)
 {
+#ifdef b1nix
+    return;
+#endif
 #if TARGETOS_OpenBSD
     if (s1->output_type == TCC_OUTPUT_DLL)
         tcc_add_crt(s1, "crtendS.o");
@@ -1836,7 +1844,11 @@ ST_FUNC void tcc_add_runtime(TCCState *s1)
 #endif
         if (lpthread)
             tcc_add_library(s1, "pthread");
+#ifdef b1nix
+        tcc_add_library(s1, "b1nix");
+#else
         tcc_add_library(s1, "c");
+#endif
 #ifdef TCC_LIBGCC
         if (!s1->static_link) {
             if (TCC_LIBGCC[0] == '/')

@@ -5,6 +5,7 @@
 #include <b1nix/types.h>
 
 #define PAGE_SIZE 4096ULL
+#define DIRECT_MAP_BASE 0xffff800000000000ULL
 #define KHEAP_START 0xffffc00000000000ULL
 
 #define VMM_PRESENT (1ULL << 0)

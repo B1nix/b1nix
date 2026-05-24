@@ -98,7 +98,7 @@ static int copy_string_vector(const char **src, int max_count,
     for (; count < max_count; count++) {
       const char *ptr = 0;
       /* Check if src is in kernel space */
-      if ((u64)src >= 0xffff800000000000 || (u64)src < 0x400000) {
+      if ((u64)src >= 0xffff800000000000 || (u64)src < 0x2000000) {
         ptr = src[count];
       } else {
         if (syscall_copyin(&ptr, src + count, sizeof(ptr)) != 0) {
@@ -113,7 +113,7 @@ static int copy_string_vector(const char **src, int max_count,
         break;
 
       /* Check if ptr is in kernel space */
-      if ((u64)ptr >= 0xffff800000000000 || (u64)ptr < 0x400000) {
+      if ((u64)ptr >= 0xffff800000000000 || (u64)ptr < 0x2000000) {
         strncpy(tmp, ptr, sizeof(tmp));
         tmp[sizeof(tmp) - 1] = '\0';
       } else {

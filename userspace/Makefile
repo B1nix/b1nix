@@ -7,7 +7,7 @@ CC       := clang
 TARGET   := x86_64-unknown-elf
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix
 LDFLAGS  := -m elf_x86_64
 BUILD    := build
 LIB      := $(BUILD)/libb1nix.a
@@ -28,7 +28,8 @@ BINARIES := \
 	$(BUILD)/bin/m14_smoke \
 	$(BUILD)/bin/m15_smoke \
 	$(BUILD)/bin/tcc \
-	$(BUILD)/bin/test_sync
+	$(BUILD)/bin/test_sync \
+	$(BUILD)/bin/m25_smoke
 
 .PHONY: all clean install
 
@@ -63,7 +64,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)
 	cd tcc && clang -DC2STR conftest.c -o c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
-	../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\""
+	../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 
 # ── Install to rootfs ──
 install: all

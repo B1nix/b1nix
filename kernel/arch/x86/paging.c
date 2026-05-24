@@ -8,7 +8,6 @@
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
 #define HUGE_PAGE_FLAG (1ULL << 7)
-#define DIRECT_MAP_BASE 0xffff800000000000ULL
 #define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
 #define MMIO_MAP_BASE 0xffffa00000000000ULL
 #define MMIO_MAP_SIZE (512ULL * 1024ULL * 1024ULL)
@@ -176,6 +175,9 @@ void vmm_init(void) {
   direct_map_ready = 1;
   kernel_pml4_virt = (u64 *)(usize)(phys_pml4 + DIRECT_MAP_BASE);
   kernel_pml4_phys = phys_pml4;
+
+  extern void pmm_switch_to_direct_map(void);
+  pmm_switch_to_direct_map();
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -394,6 +396,7 @@ void vmm_set_lazy(u64 virtual_address) {
 
 // Handle page faults for demand paging and swap
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
+
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
 
   if (!is_canonical(fault_addr)) {

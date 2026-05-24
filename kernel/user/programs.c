@@ -1587,6 +1587,14 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m15_pid, (u64)(usize)&m15_status, 0, 0, 0, 0);
   }
 
+  u64 m25_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m25-smoke", 0, 0, 0, 0, 0);
+  if ((isize)m25_pid < 0) {
+    uwrite("M25-SMOKE: spawn-fail\n");
+  } else {
+    int m25_status = 0;
+    syscall_dispatch(SYS_WAIT, m25_pid, (u64)(usize)&m25_status, 0, 0, 0, 0);
+  }
+
   uwrite("M16-SMOKE: start\n");
   struct b1nix_termios m16_termios_before;
   memset(&m16_termios_before, 0, sizeof(m16_termios_before));

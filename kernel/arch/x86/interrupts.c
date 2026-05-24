@@ -355,6 +355,7 @@ void x86_exception_handler(struct interrupt_frame *frame) {
     console_write("\n");
     scheduler_kill(scheduler_get_pid(), sig);
     /* Process will be killed on next scheduler check */
+    arch_check_and_deliver_signals(frame);
     scheduler_yield();
     return;
   }

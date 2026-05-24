@@ -7,6 +7,8 @@ INITRAMFS_M12_SMOKE_INC := $(BUILD_DIR)/initramfs_m12_smoke.inc
 INITRAMFS_M13_SMOKE_INC := $(BUILD_DIR)/initramfs_m13_smoke.inc
 INITRAMFS_M14_SMOKE_INC := $(BUILD_DIR)/initramfs_m14_smoke.inc
 INITRAMFS_M15_SMOKE_INC := $(BUILD_DIR)/initramfs_m15_smoke.inc
+INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
+INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
@@ -119,7 +121,7 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
 
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/native_smoke
@@ -145,6 +147,15 @@ $(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/m15_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m15_smoke_elf userspace/build/bin/m15_smoke > $@
+
+$(INITRAMFS_TCC_FILES_INC): userspace
+	@mkdir -p $(dir $@)
+	sh tools/gen_tcc_initramfs.sh $@
+
+$(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c userspace/linker.ld
+	@$(MAKE) -C userspace build/bin/m25_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m25_smoke_elf userspace/build/bin/m25_smoke > $@
 
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)

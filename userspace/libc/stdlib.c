@@ -140,17 +140,41 @@ double strtod(const char *nptr, char **endptr)
 	return 0.0;
 }
 
-int setjmp(long env[8])
-{
-	(void)env;
-	return 0;
-}
+__asm__(
+".global setjmp\n"
+"setjmp:\n"
+"    movq %rbx, 0(%rdi)\n"
+"    movq %rsp, 8(%rdi)\n"
+"    movq %rbp, 16(%rdi)\n"
+"    movq %r12, 24(%rdi)\n"
+"    movq %r13, 32(%rdi)\n"
+"    movq %r14, 40(%rdi)\n"
+"    movq %r15, 48(%rdi)\n"
+"    movq (%rsp), %rax\n"
+"    movq %rax, 56(%rdi)\n"
+"    xorq %rax, %rax\n"
+"    ret\n"
+);
 
-void longjmp(long env[8], int val)
-{
-	(void)env; (void)val;
-	exit(1);
-}
+__asm__(
+".global longjmp\n"
+"longjmp:\n"
+"    movq 0(%rdi), %rbx\n"
+"    movq 16(%rdi), %rbp\n"
+"    movq 24(%rdi), %r12\n"
+"    movq 32(%rdi), %r13\n"
+"    movq 40(%rdi), %r14\n"
+"    movq 48(%rdi), %r15\n"
+"    movq 56(%rdi), %rdx\n"
+"    movq 8(%rdi), %rsp\n"
+"    movq %rsi, %rax\n"
+"    testq %rax, %rax\n"
+"    jnz 1f\n"
+"    movq $1, %rax\n"
+"1:\n"
+"    movq %rdx, (%rsp)\n"
+"    ret\n"
+);
 
 void *dlopen(const char *filename, int flag) { (void)filename; (void)flag; return NULL; }
 char *dlerror(void) { return "Dynamic loading not supported"; }
