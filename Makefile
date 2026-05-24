@@ -1,7 +1,7 @@
 ARCH ?= x86
 BUILD_DIR := build/$(ARCH)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
-RUN_ISO := /private/tmp/b1nix-run.iso
+RUN_ISO := /tmp/b1nix-run.iso
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_M12_SMOKE_INC := $(BUILD_DIR)/initramfs_m12_smoke.inc
 INITRAMFS_M13_SMOKE_INC := $(BUILD_DIR)/initramfs_m13_smoke.inc
@@ -12,6 +12,7 @@ INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
+MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
@@ -190,7 +191,7 @@ root-image:
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=16 2>/dev/null
-	@/opt/homebrew/opt/e2fsprogs/sbin/mke2fs -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@$(MKE2FS) -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
 	@echo "created $(BUILD_DIR)/root.ext4"
 
 check-tools:

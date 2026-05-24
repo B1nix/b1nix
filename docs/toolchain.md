@@ -130,3 +130,15 @@ make ARCH=x86 run-root
 When the image is attached as `virtio-blk0`, ext2 mounts at `/` and overlays the
 initramfs fallback files. The fallback keeps the built-in `/bin/init` available
 until a complete disk userland is installed.
+
+## Smoke Tests & Test Artifacts
+
+To prevent cluttering the repository root and build directories, all artifacts, logs, temporary files, and disk images generated during smoke tests MUST be placed in the dedicated `smoke_run/` directory at the project root.
+
+The `smoke_run/` directory is git-ignored and contains:
+- `sata-smoke-*.img`, `nvme-smoke-*.img`, `swap-smoke-*.img`, `disk.img` (temporary drive images used in testing)
+- `b1nix-smoke-boot.log`, `b1nix-graphics-smoke.log` (execution logs capturing serial output)
+- `net.pcap` (network packets dump generated during network smoke testing)
+- `ext3-persist/` (directory containing crash/recovery iterations logs)
+
+Any newly added test script or testing procedure must write all of its temporary files, output files, or logs strictly into the `smoke_run/` folder.

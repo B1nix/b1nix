@@ -8,9 +8,10 @@ set -e
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TIMEOUT=300  # seconds to let each test run
-SATA_IMG="$PROJECT_DIR/sata-smoke-$$.img"
-NVME_IMG="$PROJECT_DIR/nvme-smoke-$$.img"
-SWAP_IMG="$PROJECT_DIR/swap-smoke-$$.img"
+mkdir -p "$PROJECT_DIR/smoke_run"
+SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
+NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
+SWAP_IMG="$PROJECT_DIR/smoke_run/swap-smoke-$$.img"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -43,7 +44,7 @@ run_qemu() {
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
-				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/logs/net.pcap" \
+				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/smoke_run/net.pcap" \
 				-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
@@ -104,7 +105,7 @@ dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
 
 MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
 if [ ! -x "$MKE2FS" ]; then
-    MKE2FS=$(which mke2fs || echo "")
+    MKE2FS=$(command -v mke2fs 2>/dev/null || echo "/sbin/mke2fs")
 fi
 if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
@@ -124,8 +125,8 @@ fi
 # ── Test 1: Kernel boots ──
 echo ""
 echo "[TEST] Boot and basic output..."
-mkdir -p "$PROJECT_DIR/logs"
-LOG="$PROJECT_DIR/logs/b1nix-smoke-boot.log"
+mkdir -p "$PROJECT_DIR/smoke_run"
+LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot.log"
 run_qemu "$LOG"
 check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
@@ -439,7 +440,7 @@ rm -f "$SATA_IMG" "$NVME_IMG" "$SWAP_IMG"
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images
-rm -f "$PROJECT_DIR/sata.img" "$PROJECT_DIR/nvme.img" "$PROJECT_DIR/swap.img"
+rm -f "$PROJECT_DIR/smoke_run/sata.img" "$PROJECT_DIR/smoke_run/nvme.img" "$PROJECT_DIR/smoke_run/swap.img"
 
 if [ "$FAILED" -gt 0 ]; then
 	exit 1
