@@ -1,6 +1,8 @@
 #ifndef TUI_H
 #define TUI_H
 
+#include <b1nix/types.h>
+
 /* ── ANSI Escape Sequences ── */
 
 /* Cursor movement */
@@ -148,6 +150,11 @@ void tui_title_bar(int row, const char *title, int fg, int bg);
 
 /* Input */
 int tui_get_key(void);
+int tui_decode_key_sequence(const char *seq, usize len);
+
+/* Terminal mode */
+int tui_terminal_begin(void);
+void tui_terminal_end(void);
 
 /* Color aliases */
 #define TUI_FG_INDEX(fg) fg

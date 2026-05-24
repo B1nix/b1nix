@@ -260,6 +260,17 @@ check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enf
 check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 
+# ── M16 User Space Applications & TUI ──
+echo ""
+echo "[TEST] M16 user space applications and TUI..."
+check_output "$LOG" "M16-SMOKE: start" "M16 smoke starts"
+check_output "$LOG" "M16-SMOKE: ok tui-key-decode" "shared TUI key decoding works"
+check_output "$LOG" "M16-SMOKE: ok file-explorer-hotkeys" "file explorer hotkeys work"
+check_output "$LOG" "M16-SMOKE: ok editor-hotkeys" "text editor hotkeys work"
+check_output "$LOG" "M16-SMOKE: ok terminal-restore" "terminal raw mode is restored"
+check_output "$LOG" "M16-SMOKE: ok app-lifecycle" "app lifecycle completes"
+check_output "$LOG" "M16-SMOKE: done" "M16 smoke completes"
+
 # ── M22 utility init-path smoke ──
 echo ""
 echo "[TEST] M22 utilities..."

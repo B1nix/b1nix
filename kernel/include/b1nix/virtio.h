@@ -45,6 +45,7 @@ struct vring_used {
 
 #define VRING_DESC_F_NEXT  1
 #define VRING_DESC_F_WRITE 2
+#define VRING_AVAIL_F_NO_INTERRUPT 1
 
 struct virtqueue {
 	u16 queue_idx;

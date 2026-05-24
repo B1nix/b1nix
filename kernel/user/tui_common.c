@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <tui.h>
 
@@ -14,6 +15,32 @@ static void t_write(const char *s)
 static void t_write_n(const char *s, int n)
 {
 	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)n, 0, 0, 0);
+}
+
+static int tui_stdio_ready = 0;
+static int tui_raw_depth = 0;
+static int tui_raw_active = 0;
+static struct b1nix_termios tui_saved_termios;
+
+static void tui_ensure_stdio(void)
+{
+	if (tui_stdio_ready) {
+		return;
+	}
+
+	u64 tty = syscall_dispatch(SYS_OPEN, (u64)(usize)"/dev/tty",
+	                          (u64)B1NIX_O_RDWR, 0, 0, 0, 0);
+	if ((isize)tty < 0) {
+		return;
+	}
+
+	syscall_dispatch(SYS_DUP2, tty, 0, 0, 0, 0, 0);
+	syscall_dispatch(SYS_DUP2, tty, 1, 0, 0, 0, 0);
+	syscall_dispatch(SYS_DUP2, tty, 2, 0, 0, 0, 0);
+	if (tty > 2) {
+		syscall_dispatch(SYS_CLOSE, tty, 0, 0, 0, 0, 0);
+	}
+	tui_stdio_ready = 1;
 }
 
 void tui_write(const char *s)
@@ -210,36 +237,231 @@ void tui_title_bar(int row, const char *title, int fg, int bg)
 	tui_write_at(row, 1, buf, TUI_COLS - 2, fg, bg);
 }
 
+int tui_terminal_begin(void)
+{
+	tui_ensure_stdio();
+
+	if (tui_raw_depth++ > 0) {
+		return 0;
+	}
+
+	if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS,
+	                            (u64)(usize)&tui_saved_termios, 0, 0, 0) < 0) {
+		tui_raw_depth = 0;
+		return -1;
+	}
+
+	struct b1nix_termios raw = tui_saved_termios;
+	raw.c_lflag &= ~(B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG);
+	if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS,
+	                            (u64)(usize)&raw, 0, 0, 0) < 0) {
+		tui_raw_depth = 0;
+		return -1;
+	}
+
+	tui_raw_active = 1;
+	return 0;
+}
+
+void tui_terminal_end(void)
+{
+	if (tui_raw_depth <= 0) {
+		return;
+	}
+
+	tui_raw_depth--;
+	if (tui_raw_depth > 0 || !tui_raw_active) {
+		return;
+	}
+
+	syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS,
+	                 (u64)(usize)&tui_saved_termios, 0, 0, 0);
+	tui_raw_active = 0;
+}
+
+int tui_decode_key_sequence(const char *seq, usize len)
+{
+	if (!seq || len == 0) {
+		return KEY_ESC;
+	}
+
+	unsigned char c = (unsigned char)seq[0];
+	if (c == 0x1B) {
+		if (len == 1) {
+			return KEY_ESC;
+		}
+
+		if (seq[1] == '[') {
+			if (len >= 3) {
+				switch ((unsigned char)seq[2]) {
+				case 'A': return KEY_UP;
+				case 'B': return KEY_DOWN;
+				case 'C': return KEY_RIGHT;
+				case 'D': return KEY_LEFT;
+				case 'H': return KEY_HOME;
+				case 'F': return KEY_END;
+				case 'M':
+					if (len >= 4) {
+						switch ((unsigned char)seq[3]) {
+						case 1: return KEY_F1;
+						case 2: return KEY_F2;
+						case 3: return KEY_F3;
+						case 4: return KEY_F4;
+						case 5: return KEY_F5;
+						case 6: return KEY_F6;
+						case 7: return KEY_F7;
+						case 8: return KEY_F8;
+						case 9: return KEY_F9;
+						case 10: return KEY_F10;
+						case 11: return KEY_F11;
+						case 12: return KEY_F12;
+						default: break;
+						}
+					}
+					break;
+				case 'O':
+					if (len >= 4) {
+						switch ((unsigned char)seq[3]) {
+						case 'P': return KEY_F1;
+						case 'Q': return KEY_F2;
+						case 'R': return KEY_F3;
+						case 'S': return KEY_F4;
+						case 'A': return KEY_UP;
+						case 'B': return KEY_DOWN;
+						case 'C': return KEY_RIGHT;
+						case 'D': return KEY_LEFT;
+						case 'H': return KEY_HOME;
+						case 'F': return KEY_END;
+						default: break;
+						}
+					}
+					break;
+				default:
+					break;
+				}
+
+				if (seq[2] >= '0' && seq[2] <= '9') {
+					int value = 0;
+					usize i = 2;
+					while (i < len && seq[i] != '~') {
+						if (seq[i] < '0' || seq[i] > '9') {
+							return KEY_ESC;
+						}
+						value = (value * 10) + (seq[i] - '0');
+						i++;
+					}
+					switch (value) {
+					case 1: return KEY_HOME;
+					case 2: return KEY_INS;
+					case 3: return KEY_DEL;
+					case 4: return KEY_END;
+					case 5: return KEY_PGUP;
+					case 6: return KEY_PGDN;
+					case 7: return KEY_HOME;
+					case 8: return KEY_END;
+					case 11: return KEY_F1;
+					case 12: return KEY_F2;
+					case 13: return KEY_F3;
+					case 14: return KEY_F4;
+					case 15: return KEY_F5;
+					case 17: return KEY_F6;
+					case 18: return KEY_F7;
+					case 19: return KEY_F8;
+					case 20: return KEY_F9;
+					case 21: return KEY_F10;
+					case 23: return KEY_F11;
+					case 24: return KEY_F12;
+					default:
+						return KEY_ESC;
+					}
+				}
+			}
+		} else if (seq[1] == 'O') {
+			if (len >= 3) {
+				switch ((unsigned char)seq[2]) {
+				case 'P': return KEY_F1;
+				case 'Q': return KEY_F2;
+				case 'R': return KEY_F3;
+				case 'S': return KEY_F4;
+				case 'A': return KEY_UP;
+				case 'B': return KEY_DOWN;
+				case 'C': return KEY_RIGHT;
+				case 'D': return KEY_LEFT;
+				case 'H': return KEY_HOME;
+				case 'F': return KEY_END;
+				default:
+					return KEY_ESC;
+				}
+			}
+		}
+
+		return KEY_ESC;
+	}
+
+	if (c == '\t') return KEY_TAB;
+	if (c == '\n' || c == '\r') return KEY_ENTER;
+	if (c == 0x7F || c == '\b') return KEY_BACKSP;
+
+	return (int)c;
+}
+
 /* ── Input reading ── */
 
 /* Read a single key, return extended key code */
 int tui_get_key(void)
 {
 	int c = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-	
+
 	if (c == 0x1B) {
+		char seq[6];
+		int len = 0;
+		seq[len++] = (char)c;
+
 		int seq1 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+		if (seq1 == 0) {
+			return KEY_ESC;
+		}
+		seq[len++] = (char)seq1;
+
 		if (seq1 == '[') {
 			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-			if (seq2 == 'A') return KEY_UP;
-			if (seq2 == 'B') return KEY_DOWN;
-			if (seq2 == 'C') return KEY_RIGHT;
-			if (seq2 == 'D') return KEY_LEFT;
-			if (seq2 == 'H') return KEY_HOME;
-			if (seq2 == 'F') return KEY_END;
-			if (seq2 == 'M') {
-				int f = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-				if (f >= 1 && f <= 10) return KEY_F1 + (f - 1);
-				if (f == 11) return KEY_F11;
-				if (f == 12) return KEY_F12;
+			if (seq2 == 0) {
+				return KEY_ESC;
 			}
+			seq[len++] = (char)seq2;
+
+			if (seq2 == 'M') {
+				int seq3 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+				if (seq3 == 0) {
+					return KEY_ESC;
+				}
+				seq[len++] = (char)seq3;
+			} else if (seq2 >= '0' && seq2 <= '9') {
+				int seq3 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+				if (seq3 == 0) {
+					return KEY_ESC;
+				}
+				seq[len++] = (char)seq3;
+
+				if ((seq2 == '1' || seq2 == '2') && seq3 >= '0' && seq3 <= '9') {
+					int seq4 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+					if (seq4 == 0) {
+						return KEY_ESC;
+					}
+					seq[len++] = (char)seq4;
+				}
+			}
+		} else if (seq1 == 'O') {
+			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+			if (seq2 == 0) {
+				return KEY_ESC;
+			}
+			seq[len++] = (char)seq2;
 		}
-		return KEY_ESC;
+
+		return tui_decode_key_sequence(seq, (usize)len);
 	}
-	
-	if (c == '\t') return KEY_TAB;
-	if (c == '\n') return KEY_ENTER;
-	if (c == 0x7F || c == '\b') return KEY_BACKSP;
-	
-	return c;
+
+	char ch = (char)c;
+	return tui_decode_key_sequence(&ch, 1);
 }

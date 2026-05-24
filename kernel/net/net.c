@@ -5,6 +5,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch_x86.h>
+#include <b1nix/bootinfo.h>
 #include <string.h>
 
 #define VIRTIO_VENDOR_ID 0x1AF4
@@ -215,6 +216,7 @@ static void virtio_net_probe(void)
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
 		return;
 	}
+	net_tx_vq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
 	if (net_rx_vq.queue_size == 0 || net_tx_vq.queue_size == 0 ||
 	    !is_power_of_two_u16(net_rx_vq.queue_size) ||
 	    !is_power_of_two_u16(net_tx_vq.queue_size)) {
@@ -303,7 +305,9 @@ void net_init(void)
 	if (!net_ready) {
 		return;
 	}
-	dhcp_init();
+	if (bootinfo_has_flag("b1nix.test=1") || bootinfo_has_flag("b1nix.net=dhcp")) {
+		dhcp_init();
+	}
 
 	kthread_create("net_task", net_task, 0);
 }

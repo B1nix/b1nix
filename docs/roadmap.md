@@ -261,8 +261,19 @@ production-grade IPC semantics.
 - [x] `done` File tracking and build automation utility (`make` clone).
 - [x] `done` Text editor (`vi`/`nano`-style clone).
 - [x] `done` Shared TUI input/rendering helpers.
+- [x] `done` Deterministic smoke coverage for the file explorer and editor through the normal boot path.
+- [x] `done` Real hotkey dispatch coverage, including shared key decoding and terminal raw-mode restore.
 - [x] `partial` File manager copy/move clipboard actions reserved for future work.
-- [ ] `planned` Add richer editor persistence/workflow tests and TUI app smoke tests.
+- [x] `partial` Richer GUI/compositor-backed app surfaces and a longer-lived event loop remain deferred.
+- [ ] `planned` Add richer editor persistence/workflow tests and more interactive TUI coverage.
+
+M16 closes the QEMU/dev baseline for user-space applications with the existing
+TUI file explorer and text editor. The boot smoke now exercises the real
+interactive programs in deterministic smoke modes, covers shared key decoding,
+and verifies terminal raw-mode restore, so the source of truth stays
+`make smoke-x86`. Richer editor persistence, a production styling/layout system,
+clipboard copy/move workflows, and compositor-backed GUI apps remain planned
+follow-up work.
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 

@@ -1,6 +1,7 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <b1nix/errno.h>
 #include <b1nix/syscall.h>
 #include <b1nix/dirent.h>
 #include <tui.h>
@@ -34,6 +35,7 @@ static struct panel panels[2];
 static int active_panel = 0;  /* 0 or 1 */
 static char clipboard_path[256]; /* For copy/move */
 static int clipboard_has_path = 0; /* Track if clipboard has content */
+static int mc_smoke_mode = 0;
 
 /* ── Helper functions ── */
 
@@ -182,6 +184,291 @@ static void draw_panel(int panel_idx, int left_col)
 	}
 }
 
+static void mc_render_screen(void)
+{
+	/* Draw title bar */
+	tui_title_bar(0, " Mini Commander (b1nix) ", 0, 7);
+
+	/* Draw function key bar */
+	tui_write_at(TUI_ROWS - 1, 1, "F1-Help F2-Menu F3-8 Deferred F10-Quit",
+					TUI_COLS - 2, 0, 7);
+
+	/* Draw panels */
+	draw_panel(0, 1);
+	draw_panel(1, 1 + PANEL_WIDTH + 1);
+
+	/* Draw info between panels */
+	int mid_col = 1 + PANEL_WIDTH + 1;
+	tui_write_at(TUI_ROWS / 2 - 2, mid_col + 1, "Info", TUI_COLS - mid_col - 3, 7, 0);
+
+	char info[64];
+	struct panel *ap = &panels[active_panel];
+	if (ap->selected < ap->file_count) {
+		struct file_entry *fe = &ap->files[ap->selected];
+		snprintf(info, sizeof(info), "File: %s", fe->name);
+		tui_write_at(TUI_ROWS / 2, mid_col + 1, info, TUI_COLS - mid_col - 3, 7, 0);
+		if (fe->size > 0) {
+			snprintf(info, sizeof(info), "Size: %d bytes", (int)fe->size);
+			tui_write_at(TUI_ROWS / 2 + 1, mid_col + 1, info, TUI_COLS - mid_col - 3, 7, 0);
+		}
+	}
+}
+
+static int mc_handle_key(int key)
+{
+	switch (key) {
+	case KEY_TAB:
+		active_panel = 1 - active_panel;
+		return 1;
+
+	case KEY_UP:
+		if (panels[active_panel].selected > 0) {
+			panels[active_panel].selected--;
+			if (panels[active_panel].selected < panels[active_panel].top_line) {
+				panels[active_panel].top_line = panels[active_panel].selected;
+			}
+		}
+		return 1;
+
+	case KEY_DOWN:
+		if (panels[active_panel].selected < panels[active_panel].file_count - 1) {
+			panels[active_panel].selected++;
+			int max_visible = TUI_ROWS - 6;
+			if (panels[active_panel].selected >= panels[active_panel].top_line + max_visible) {
+				panels[active_panel].top_line = panels[active_panel].selected - max_visible + 1;
+			}
+		}
+		return 1;
+
+	case KEY_HOME:
+		panels[active_panel].selected = 0;
+		panels[active_panel].top_line = 0;
+		return 1;
+
+	case KEY_END:
+		panels[active_panel].selected = panels[active_panel].file_count - 1;
+		panels[active_panel].top_line = panels[active_panel].selected - (TUI_ROWS - 6) + 1;
+		if (panels[active_panel].top_line < 0) panels[active_panel].top_line = 0;
+		return 1;
+
+	case KEY_PGUP:
+		panels[active_panel].selected = 0;
+		panels[active_panel].top_line = 0;
+		return 1;
+
+	case KEY_PGDN:
+		panels[active_panel].selected = panels[active_panel].file_count - 1;
+		panels[active_panel].top_line = panels[active_panel].selected - (TUI_ROWS - 6) + 1;
+		if (panels[active_panel].top_line < 0) panels[active_panel].top_line = 0;
+		return 1;
+
+	case KEY_ENTER: {
+		struct panel *p = &panels[active_panel];
+		if (p->selected < p->file_count && p->files[p->selected].is_dir) {
+			const char *name = p->files[p->selected].name;
+			if (strcmp(name, ".") == 0) {
+				/* Same dir */
+			} else if (strcmp(name, "..") == 0) {
+				/* Go up */
+				char *slash = strrchr(p->current_dir, '/');
+				if (slash && slash != p->current_dir) {
+					*slash = '\0';
+				} else if (slash == p->current_dir) {
+					p->current_dir[1] = '\0';
+				}
+			} else {
+				/* Go into directory */
+				char new_path[256];
+				resolve_path(p->current_dir, name, new_path);
+				strcpy(p->current_dir, new_path);
+			}
+			read_directory(p);
+		}
+		return 1;
+	}
+
+	case KEY_F1:
+		tui_clear_screen();
+		tui_write_at(1, 1, "Mini Commander Help", TUI_COLS - 2, 7, 0);
+		tui_write_at(3, 1, "F1  - This help screen", TUI_COLS - 2, 7, 0);
+		tui_write_at(4, 1, "F2  - Menu (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(5, 1, "F3  - View file content (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(6, 1, "F4  - Edit file (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(7, 1, "F5  - Copy file/dir (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(8, 1, "F6  - Move file/dir (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(9, 1, "F7  - Create directory (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(10, 1, "F8  - Delete file/dir (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(11, 1, "F10 - Quit", TUI_COLS - 2, 7, 0);
+		tui_write_at(13, 1, "TAB - Switch panel", TUI_COLS - 2, 7, 0);
+		tui_write_at(14, 1, "Arrows - Navigate", TUI_COLS - 2, 7, 0);
+		tui_write_at(15, 1, "ENTER - Open directory", TUI_COLS - 2, 7, 0);
+		tui_write_at(TUI_ROWS - 1, 1, "Press any key to continue", TUI_COLS - 2, 0, 7);
+		if (!mc_smoke_mode) {
+			tui_get_key();
+		}
+		return 1;
+
+	case KEY_F2:
+		tui_write_at(TUI_ROWS - 2, 1, "F2 menu is deferred for M16", TUI_COLS - 2, 0, 7);
+		return 1;
+
+	case KEY_F3:
+	case KEY_F4:
+	case KEY_F5:
+	case KEY_F6:
+	case KEY_F7:
+	case KEY_F8:
+		tui_write_at(TUI_ROWS - 2, 1, "File operations are deferred for M16", TUI_COLS - 2, 0, 7);
+		return 1;
+
+	case KEY_F10:
+	case KEY_ESC:
+	case KEY_CTRL_Q:
+	case 'q':
+	case 'Q':
+		return 0;
+
+	default:
+		return 1;
+	}
+}
+
+static int mc_smoke_run(void)
+{
+	const char *smoke_dir = "/tmp/m16-mc-smoke";
+	const char *smoke_subdir = "/tmp/m16-mc-smoke/subdir";
+	u64 mkdir_rc = syscall_dispatch(SYS_MKDIR, (u64)(usize)smoke_dir, 0755, 0, 0, 0, 0);
+	if ((isize)mkdir_rc < 0 && (isize)mkdir_rc != -EEXIST) {
+		return 1;
+	}
+	mkdir_rc = syscall_dispatch(SYS_MKDIR, (u64)(usize)smoke_subdir, 0755, 0, 0, 0, 0);
+	if ((isize)mkdir_rc < 0 && (isize)mkdir_rc != -EEXIST) {
+		return 1;
+	}
+
+	mc_smoke_mode = 1;
+	if (tui_terminal_begin() != 0) {
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	active_panel = 0;
+	strcpy(panels[0].current_dir, smoke_dir);
+	strcpy(panels[1].current_dir, "/");
+	read_directory(&panels[0]);
+	read_directory(&panels[1]);
+
+	if (panels[0].file_count < 1 || panels[1].file_count < 1) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	tui_clear_screen();
+	tui_cursor_hide();
+	mc_render_screen();
+
+	int initial_active = active_panel;
+	int initial_selected = panels[active_panel].selected;
+	if (mc_handle_key(KEY_F1) != 1) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+	mc_render_screen();
+
+	int subdir_idx = -1;
+	for (int i = 0; i < panels[0].file_count; i++) {
+		if (strcmp(panels[0].files[i].name, "subdir") == 0) {
+			subdir_idx = i;
+			break;
+		}
+	}
+	if (subdir_idx < 0) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	active_panel = 0;
+	panels[0].selected = subdir_idx;
+	panels[0].top_line = 0;
+	if (mc_handle_key(KEY_ENTER) != 1 ||
+	    strcmp(panels[0].current_dir, smoke_subdir) != 0) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	mc_handle_key(KEY_END);
+	if (panels[active_panel].file_count > 0 &&
+	    panels[active_panel].selected != panels[active_panel].file_count - 1) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+	mc_handle_key(KEY_UP);
+	if (panels[active_panel].file_count > 1 &&
+	    panels[active_panel].selected != panels[active_panel].file_count - 2) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+	mc_handle_key(KEY_HOME);
+	if (panels[active_panel].selected != 0) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+	mc_handle_key(KEY_TAB);
+	if (active_panel == initial_active) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+	mc_handle_key(KEY_TAB);
+	if (active_panel != initial_active) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	if (mc_handle_key(KEY_F10) != 0) {
+		tui_clear_screen();
+		tui_cursor_show();
+		tui_terminal_end();
+		mc_smoke_mode = 0;
+		return 1;
+	}
+
+	(void)initial_selected;
+	mc_render_screen();
+	tui_clear_screen();
+	tui_cursor_show();
+	tui_terminal_end();
+	mc_smoke_mode = 0;
+	printf("M16-SMOKE: ok file-explorer-hotkeys\n");
+	return 0;
+}
+
 /* ── Main ── */
 
 int mc_main(int argc, const char **argv)
@@ -190,145 +477,38 @@ int mc_main(int argc, const char **argv)
 	(void)argv;
 	(void)clipboard_path;     /* Reserved for future F5/F6 operations */
 	(void)clipboard_has_path; /* Reserved for future F5/F6 operations */
+
+	if (argc >= 2 && argv && argv[1] && strcmp(argv[1], "--smoke") == 0) {
+		return mc_smoke_run();
+	}
 	
 	/* Initialize panels */
+	active_panel = 0;
 	strcpy(panels[0].current_dir, "/");
 	strcpy(panels[1].current_dir, "/");
 	
 	read_directory(&panels[0]);
 	read_directory(&panels[1]);
 	
+	if (tui_terminal_begin() != 0) {
+		return 1;
+	}
+
 	tui_clear_screen();
 	tui_cursor_hide();
 	
 	int running = 1;
 	
 	while (running) {
-		/* Draw title bar */
-		tui_title_bar(0, " Mini Commander (b1nix) ", 0, 7);
-		
-		/* Draw function key bar */
-		tui_write_at(TUI_ROWS - 1, 1, "F1-Help F2-Menu F3-View F4-Edit F5-Copy F6-Move F7-Mkdir F8-Delete F10-Quit", 
-					TUI_COLS - 2, 0, 7);
-		
-		/* Draw panels */
-		draw_panel(0, 1);
-		draw_panel(1, 1 + PANEL_WIDTH + 1);
-		
-		/* Draw info between panels */
-		int mid_col = 1 + PANEL_WIDTH + 1;
-		tui_write_at(TUI_ROWS / 2 - 2, mid_col + 1, "Info", TUI_COLS - mid_col - 3, 7, 0);
-		
-		char info[64];
-		struct panel *ap = &panels[active_panel];
-		if (ap->selected < ap->file_count) {
-			struct file_entry *fe = &ap->files[ap->selected];
-			snprintf(info, sizeof(info), "File: %s", fe->name);
-			tui_write_at(TUI_ROWS / 2, mid_col + 1, info, TUI_COLS - mid_col - 3, 7, 0);
-			if (fe->size > 0) {
-				snprintf(info, sizeof(info), "Size: %d bytes", (int)fe->size);
-				tui_write_at(TUI_ROWS / 2 + 1, mid_col + 1, info, TUI_COLS - mid_col - 3, 7, 0);
-			}
-		}
-		
-		/* Read key */
-		int key = tui_get_key();
-		
-		switch (key) {
-		case KEY_TAB:
-			/* Switch panel */
-			active_panel = 1 - active_panel;
-			break;
-			
-		case KEY_UP:
-			if (panels[active_panel].selected > 0) {
-				panels[active_panel].selected--;
-				if (panels[active_panel].selected < panels[active_panel].top_line) {
-					panels[active_panel].top_line = panels[active_panel].selected;
-				}
-			}
-			break;
-			
-		case KEY_DOWN:
-			if (panels[active_panel].selected < panels[active_panel].file_count - 1) {
-				panels[active_panel].selected++;
-				int max_visible = TUI_ROWS - 6;
-				if (panels[active_panel].selected >= panels[active_panel].top_line + max_visible) {
-					panels[active_panel].top_line = panels[active_panel].selected - max_visible + 1;
-				}
-			}
-			break;
-			
-		case KEY_HOME:
-			panels[active_panel].selected = 0;
-			panels[active_panel].top_line = 0;
-			break;
-			
-		case KEY_END:
-			panels[active_panel].selected = panels[active_panel].file_count - 1;
-			panels[active_panel].top_line = panels[active_panel].selected - (TUI_ROWS - 6) + 1;
-			if (panels[active_panel].top_line < 0) panels[active_panel].top_line = 0;
-			break;
-			
-		case KEY_ENTER: {
-			struct panel *p = &panels[active_panel];
-			if (p->selected < p->file_count && p->files[p->selected].is_dir) {
-				const char *name = p->files[p->selected].name;
-				if (strcmp(name, ".") == 0) {
-					/* Same dir */
-				} else if (strcmp(name, "..") == 0) {
-					/* Go up */
-					char *slash = strrchr(p->current_dir, '/');
-					if (slash && slash != p->current_dir) {
-						*slash = '\0';
-					} else if (slash == p->current_dir) {
-						p->current_dir[1] = '\0';
-					}
-				} else {
-					/* Go into directory */
-					char new_path[256];
-					resolve_path(p->current_dir, name, new_path);
-					strcpy(p->current_dir, new_path);
-				}
-				read_directory(p);
-			}
-			break;
-		}
-			
-		case KEY_F1:
-			tui_clear_screen();
-			tui_write_at(1, 1, "Mini Commander Help", TUI_COLS - 2, 7, 0);
-			tui_write_at(3, 1, "F1  - This help screen", TUI_COLS - 2, 7, 0);
-			tui_write_at(4, 1, "F2  - Menu (not yet implemented)", TUI_COLS - 2, 7, 0);
-			tui_write_at(5, 1, "F3  - View file content (cat)", TUI_COLS - 2, 7, 0);
-			tui_write_at(6, 1, "F4  - Edit file with nano-like editor", TUI_COLS - 2, 7, 0);
-			tui_write_at(7, 1, "F5  - Copy file/dir", TUI_COLS - 2, 7, 0);
-			tui_write_at(8, 1, "F6  - Move file/dir", TUI_COLS - 2, 7, 0);
-			tui_write_at(9, 1, "F7  - Create directory", TUI_COLS - 2, 7, 0);
-			tui_write_at(10, 1, "F8  - Delete file/dir", TUI_COLS - 2, 7, 0);
-			tui_write_at(11, 1, "F10 - Quit", TUI_COLS - 2, 7, 0);
-			tui_write_at(13, 1, "TAB - Switch panel", TUI_COLS - 2, 7, 0);
-			tui_write_at(14, 1, "Arrows - Navigate", TUI_COLS - 2, 7, 0);
-			tui_write_at(15, 1, "ENTER - Open directory", TUI_COLS - 2, 7, 0);
-			tui_write_at(TUI_ROWS - 1, 1, "Press any key to continue", TUI_COLS - 2, 0, 7);
-			tui_get_key();
-			break;
-			
-		case KEY_F10:
-		case KEY_ESC:
-		case KEY_CTRL_Q:
-		case 'q':
-		case 'Q':
+		mc_render_screen();
+		if (!mc_handle_key(tui_get_key())) {
 			running = 0;
-			break;
-			
-		default:
-			break;
 		}
 	}
 	
 	tui_clear_screen();
 	tui_cursor_show();
+	tui_terminal_end();
 	printf("Mini Commander exited.\n");
 	return 0;
 }

@@ -231,6 +231,7 @@ extern void ps2_mouse_interrupt_handler(void);
 
 extern void fb_console_blink_cursor(void);
 
+
 void x86_irq_handler(struct interrupt_frame *frame) {
   if (frame->vector == 32) {
     timer_ticks++;
@@ -254,7 +255,6 @@ void x86_irq_handler(struct interrupt_frame *frame) {
     outb(PIC1_COMMAND, PIC_EOI);
     return;
   }
-
   if (frame->vector >= 32 && frame->vector <= 47) {
     int irq = frame->vector - 32;
     if (irq == net_get_irq()) {

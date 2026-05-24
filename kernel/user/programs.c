@@ -11,8 +11,14 @@
 #include <b1nix/video.h>
 #include <stdio.h>
 #include <string.h>
+#include <tui.h>
 
 void user_register_program(const char *path, user_program_entry entry);
+static int m22_smoke_main(int argc, const char **argv);
+static int m24_stress_main(int argc, const char **argv);
+static int lock_smoke_main(int argc, const char **argv);
+static int ext_stress_main(int argc, const char **argv);
+int shell_smoke_main(int argc, const char **argv);
 
 static void uwrite(const char *text) {
   syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0, 0, 0);
@@ -65,6 +71,82 @@ static void b1fetch_cpu_name(char *out, usize out_size) {
   }
   strcpy(out, "x86_64 CPU");
 #endif
+}
+
+static int m16_check_tui_key_decode(void)
+{
+	struct {
+		const char *seq;
+		usize len;
+		int key;
+	} cases[] = {
+		{"a", 1, 'a'},
+		{"\t", 1, KEY_TAB},
+		{"\n", 1, KEY_ENTER},
+		{"\r", 1, KEY_ENTER},
+		{"\b", 1, KEY_BACKSP},
+		{"\x7f", 1, KEY_BACKSP},
+		{"\x11", 1, KEY_CTRL_Q},
+		{"\x13", 1, KEY_CTRL_S},
+		{"\x18", 1, KEY_CTRL_X},
+		{"\x07", 1, KEY_CTRL_G},
+		{"\033", 1, KEY_ESC},
+		{"\033[A", 3, KEY_UP},
+		{"\033[B", 3, KEY_DOWN},
+		{"\033[C", 3, KEY_RIGHT},
+		{"\033[D", 3, KEY_LEFT},
+		{"\033[H", 3, KEY_HOME},
+		{"\033[F", 3, KEY_END},
+		{"\033[1~", 4, KEY_HOME},
+		{"\033[2~", 4, KEY_INS},
+		{"\033[3~", 4, KEY_DEL},
+		{"\033[4~", 4, KEY_END},
+		{"\033[5~", 4, KEY_PGUP},
+		{"\033[6~", 4, KEY_PGDN},
+		{"\033[7~", 4, KEY_HOME},
+		{"\033[8~", 4, KEY_END},
+		{"\033[11~", 5, KEY_F1},
+		{"\033[12~", 5, KEY_F2},
+		{"\033[13~", 5, KEY_F3},
+		{"\033[14~", 5, KEY_F4},
+		{"\033[15~", 5, KEY_F5},
+		{"\033[17~", 5, KEY_F6},
+		{"\033[18~", 5, KEY_F7},
+		{"\033[19~", 5, KEY_F8},
+		{"\033[20~", 5, KEY_F9},
+		{"\033[21~", 5, KEY_F10},
+		{"\033[23~", 5, KEY_F11},
+		{"\033[24~", 5, KEY_F12},
+		{"\033[M\1", 4, KEY_F1},
+		{"\033[M\n", 4, KEY_F10},
+		{"\033[M\v", 4, KEY_F11},
+		{"\033[M\f", 4, KEY_F12},
+		{"\033OP", 3, KEY_F1},
+		{"\033OQ", 3, KEY_F2},
+		{"\033OR", 3, KEY_F3},
+		{"\033OS", 3, KEY_F4},
+	};
+
+	for (usize i = 0; i < sizeof(cases) / sizeof(cases[0]); i++) {
+		int got = tui_decode_key_sequence(cases[i].seq, cases[i].len);
+		if (got != cases[i].key) {
+			return -1;
+		}
+	}
+
+	uwrite("M16-SMOKE: ok tui-key-decode\n");
+	return 0;
+}
+
+static int m16_termios_unchanged(const struct b1nix_termios *before)
+{
+	struct b1nix_termios after;
+	memset(&after, 0, sizeof(after));
+	if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS,
+	                            (u64)(usize)&after, 0, 0, 0) < 0) {
+		return -1;
+	}
+	return memcmp(before, &after, sizeof(after)) == 0 ? 0 : -1;
 }
 
 #define SH_HISTORY_MAX 16
@@ -1458,6 +1540,7 @@ static int init_main(int argc, const char **argv) {
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
+  if (bootinfo_has_flag("b1nix.test=1")) {
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
@@ -1504,40 +1587,79 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m15_pid, (u64)(usize)&m15_status, 0, 0, 0, 0);
   }
 
-  u64 smoke_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m22-smoke", 0, 0, 0, 0, 0);
-  if (smoke_pid != (u64)-1) {
-    int smoke_status = 0;
-    syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0, 0, 0);
+  uwrite("M16-SMOKE: start\n");
+  struct b1nix_termios m16_termios_before;
+  memset(&m16_termios_before, 0, sizeof(m16_termios_before));
+  int m16_have_termios =
+      (isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS,
+                              (u64)(usize)&m16_termios_before, 0, 0, 0) >= 0;
+  int m16_ok = m16_have_termios ? 1 : 0;
+
+  if (m16_check_tui_key_decode() != 0) {
+    uwrite("M16-SMOKE: fail tui-key-decode\n");
+    m16_ok = 0;
   }
 
-  u64 stress_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m24-stress", 0, 0, 0, 0, 0);
-  if (stress_pid != (u64)-1) {
-    int stress_status = 0;
-    syscall_dispatch(SYS_WAIT, stress_pid, (u64)(usize)&stress_status, 0, 0, 0, 0);
+  const char *mc_smoke_argv[] = {"mc", "--smoke", 0};
+  const char *ne_smoke_argv[] = {"ne", "--smoke", "/tmp/m16-editor-smoke.txt", 0};
+
+  u64 mc_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/mc", 2,
+                                 (u64)(usize)mc_smoke_argv, 0, 0, 0);
+  if ((isize)mc_pid < 0) {
+    uwrite("M16-SMOKE: fail file-explorer-hotkeys\n");
+    m16_ok = 0;
+  } else {
+    int mc_status = 0;
+    syscall_dispatch(SYS_WAIT, mc_pid, (u64)(usize)&mc_status, 0, 0, 0, 0);
+    if (mc_status == 0) {
+      uwrite("M16-SMOKE: ok file-explorer-hotkeys\n");
+    } else {
+      uwrite("M16-SMOKE: fail file-explorer-hotkeys\n");
+      m16_ok = 0;
+    }
+    if (m16_have_termios && m16_termios_unchanged(&m16_termios_before) != 0) {
+      m16_ok = 0;
+    }
   }
 
-  u64 shell_smoke_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/shell-smoke", 0, 0, 0, 0, 0);
-  if (shell_smoke_pid != (u64)-1) {
-    int status = 0;
-    syscall_dispatch(SYS_WAIT, shell_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  u64 ne_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/ne", 3,
+                                 (u64)(usize)ne_smoke_argv, 0, 0, 0);
+  if ((isize)ne_pid < 0) {
+    uwrite("M16-SMOKE: fail editor-hotkeys\n");
+    m16_ok = 0;
+  } else {
+    int ne_status = 0;
+    syscall_dispatch(SYS_WAIT, ne_pid, (u64)(usize)&ne_status, 0, 0, 0, 0);
+    if (ne_status == 0) {
+      uwrite("M16-SMOKE: ok editor-hotkeys\n");
+    } else {
+      uwrite("M16-SMOKE: fail editor-hotkeys\n");
+      m16_ok = 0;
+    }
+    if (m16_have_termios && m16_termios_unchanged(&m16_termios_before) != 0) {
+      m16_ok = 0;
+    }
   }
 
-  u64 lock_smoke_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/lock-smoke", 0, 0, 0, 0, 0);
-  if (lock_smoke_pid != (u64)-1) {
-    int status = 0;
-    syscall_dispatch(SYS_WAIT, lock_smoke_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  if (m16_have_termios && m16_termios_unchanged(&m16_termios_before) != 0) {
+    m16_ok = 0;
   }
 
-  u64 ext_stress_pid =
-      syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/ext-stress", 0, 0, 0, 0, 0);
-  if (ext_stress_pid != (u64)-1) {
-    int status = 0;
-    syscall_dispatch(SYS_WAIT, ext_stress_pid, (u64)(usize)&status, 0, 0, 0, 0);
+  if (m16_ok) {
+    uwrite("M16-SMOKE: ok terminal-restore\n");
+    uwrite("M16-SMOKE: ok app-lifecycle\n");
+    uwrite("M16-SMOKE: done\n");
+  } else {
+    uwrite("M16-SMOKE: fail terminal-restore\n");
+    uwrite("M16-SMOKE: fail app-lifecycle\n");
+    uwrite("M16-SMOKE: fail done\n");
   }
+
+  (void)m22_smoke_main(0, 0);
+  (void)m24_stress_main(0, 0);
+  (void)shell_smoke_main(0, 0);
+  (void)lock_smoke_main(0, 0);
+  (void)ext_stress_main(0, 0);
 
   const char *net_ping_argv[] = {"ping", "-c", "2", "10.0.2.2", 0};
   int net_ping_status = busybox_main(4, net_ping_argv);
@@ -1560,9 +1682,8 @@ static int init_main(int argc, const char **argv) {
   poll_smoke_check();
   tcp_smoke_check();
 
-  if (bootinfo_has_flag("b1nix.test=1")) {
-    uwrite("B1NIX-TEST: done\n");
-    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
+  uwrite("B1NIX-TEST: done\n");
+  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
   }
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);

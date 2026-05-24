@@ -230,6 +230,7 @@ static int virtio_gpu_setup_modern_queue(struct virtqueue *vq, u16 queue_idx)
     memset(base, 0, frames * PAGE_SIZE);
     vq->desc = (struct vring_desc *)base;
     vq->avail = (struct vring_avail *)(base + desc_size);
+    vq->avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
     vq->used = (struct vring_used *)(base + offset_used);
 
     u64 desc_phys = paddr;
@@ -588,6 +589,8 @@ void virtio_gpu_init(void)
             console_write("virtio-gpu: queue init failed\n");
             return;
         }
+        controlq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+        cursorq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
         virtio_set_status(&gpu_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER |
                                     VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
     }

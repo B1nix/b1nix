@@ -182,6 +182,7 @@ void virtio_blk_init(void) {
       dev_idx++;
       continue;
     }
+    inst->vq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
 
     virtio_set_status(&inst->dev,
                       virtio_get_status(&inst->dev) | VIRTIO_STATUS_DRIVER_OK);
