@@ -139,6 +139,11 @@ and broader utility flag compatibility.
 - [x] `done` Harden JBD recovery semantics: replay only committed descriptor transactions and clear `RECOVER` incompat bit after successful replay.
 - [x] `done` Add ext3 metadata ordering hardening for `unlink`/`rmdir`/`rename` path with journal transaction grouping and inode timestamp updates.
 - [x] `done` Formalize VFS node refcounting rules: enforce that all functions returning a VFS node MUST increment its refcount, and callers are strictly responsible for decref to prevent memory leaks during lookup paths.
+- [ ] `planned` Implement a Unified Page Cache bridging VM pages and VFS file operations (enabling shared coherent memory-mapped files via `MAP_SHARED`).
+- [ ] `planned` Add a dedicated `icache` (inode cache) to cache file system specific inodes and optimize `dcache` size/lookup performance.
+- [ ] `planned` Transition VFS synchronization from global spinlocks to fine-grained per-directory lock hierarchies to prepare for SMP scaling.
+- [ ] `planned` Replace the global fixed-size descriptor table (`MAX_VFS_HANDLES`) with per-process dynamic descriptor tables to improve resource limits.
+- [ ] `planned` Support asynchronous I/O interfaces (AIO / completion queues) at the VFS layer for non-blocking file read/write operations.
 
 ## M9: Hardware Drivers
 
