@@ -1,6 +1,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include "syscall.h"
+#include <errno.h>
 
 void exit(int status)
 {
@@ -21,7 +22,10 @@ void *malloc(size_t size)
 	if (size == 0) return 0;
 	/* Align to 8 bytes */
 	size = (size + 7) & ~(size_t)7;
-	if (heap_used + size > HEAP_SIZE) return 0;
+	if (heap_used + size > HEAP_SIZE) {
+		errno = ENOMEM;
+		return 0;
+	}
 	void *p = heap + heap_used;
 	heap_used += size;
 	return p;
@@ -196,7 +200,12 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		}
 		act = &kernel_act;
 	}
-	return (int)syscall(SYS_SIGNAL, signum, (long)act, (long)oldact, 0);
+	int rc = (int)syscall(SYS_SIGNAL, signum, (long)act, (long)oldact, 0);
+	if (rc < 0) {
+		errno = -rc;
+		return -1;
+	}
+	return rc;
 }
 
 int errno = 0;

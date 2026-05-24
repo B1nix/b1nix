@@ -217,7 +217,7 @@ int ungetc(int c, FILE *stream) {
 int fseek(FILE *stream, long offset, int whence) {
   if (!stream)
     return -1;
-  long pos = syscall(SYS_LSEEK, stream->fd, offset, whence, 0);
+  long pos = lseek(stream->fd, offset, whence);
   if (pos < 0)
     return -1;
   stream->eof = 0;
@@ -227,7 +227,7 @@ int fseek(FILE *stream, long offset, int whence) {
 long ftell(FILE *stream) {
   if (!stream)
     return -1;
-  return syscall(SYS_LSEEK, stream->fd, 0, SEEK_CUR, 0);
+  return lseek(stream->fd, 0, SEEK_CUR);
 }
 
 int fflush(FILE *stream) {
@@ -243,7 +243,7 @@ int ferror(FILE *stream) { return stream ? stream->error : 1; }
 int fileno(FILE *stream) { return stream ? stream->fd : -1; }
 
 int remove(const char *pathname) {
-  return syscall(SYS_UNLINK, (long)pathname, 0, 0, 0);
+  return unlink(pathname);
 }
 
 int fprintf(FILE *stream, const char *fmt, ...) {

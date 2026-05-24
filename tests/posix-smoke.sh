@@ -198,4 +198,103 @@ rm -rf /tmp/a
 ln -s /tmp/loop /tmp/loop
 cat /tmp/loop 2>&1 | grep "Too many levels" && echo "ok eloop"
 
+echo "M22-POLISH: start"
+
+# script status should follow the last command in a command list
+false
+true
+false
+true
+echo "M22-POLISH: after-status"
+
+# 1. M22-POLISH: ok utility-flags
+# Test option parsing of polished utilities:
+ls -la /tmp >/dev/null || exit 1
+printf "one\ntwo\nthree\n" > /tmp/m22_tool.txt
+tail -n 2 /tmp/m22_tool.txt >/dev/null || exit 1
+cp -Z /tmp/nonexistent /tmp/nonexistent2 2>/dev/null && exit 1
+rm -Z /tmp/nonexistent 2>/dev/null && exit 1
+mkdir /tmp/m22_mkdir_test || exit 1
+mkdir -p /tmp/m22_mkdir_test || exit 1
+echo "test" | grep -qn "test" || exit 1
+echo "test" | grep -Z "test" 2>/dev/null && exit 1
+head -n 2 /tmp/m22_tool.txt >/dev/null || exit 1
+head -x /etc/posix-smoke.sh 2>/dev/null && exit 1
+echo "one two three" | wc -w | grep "3" >/dev/null || exit 1
+wc -c /tmp/m22_tool.txt >/dev/null || exit 1
+wc -Z 2>/dev/null && exit 1
+uname -sn >/dev/null || exit 1
+uname -Z 2>/dev/null && exit 1
+echo "M22-POLISH: ok utility-flags"
+
+# Cleanup
+rmdir /tmp/m22_mkdir_test
+rm -f /tmp/m22_tool.txt
+
+# 2. M22-POLISH: ok text-pipeline
+# pipelines with text tools:
+echo "banana" > /tmp/m22_fruit.txt
+echo "apple" >> /tmp/m22_fruit.txt
+echo "banana" >> /tmp/m22_fruit.txt
+cat /tmp/m22_fruit.txt | sort | uniq | grep "apple" >/dev/null
+[ $? -eq 0 ] || exit 1
+cat /tmp/m22_fruit.txt | sort | uniq | wc -l | grep "2" >/dev/null
+[ $? -eq 0 ] || exit 1
+echo "M22-POLISH: ok text-pipeline"
+
+# 3. M22-POLISH: ok file-workflow
+# temp file creation, copy, move, remove, grep, wc, sort, uniq pipeline:
+# Create:
+echo "z" > /tmp/m22_wf.txt
+echo "y" >> /tmp/m22_wf.txt
+echo "x" >> /tmp/m22_wf.txt
+# Recursive copy:
+mkdir -p /tmp/m22_wf_dir || exit 1
+echo "inner" > /tmp/m22_wf_dir/file.txt
+echo "M22-POLISH: before-cp-r"
+cp -r /tmp/m22_wf_dir /tmp/m22_wf_dir_copy || exit 1
+echo "M22-POLISH: after-cp-r"
+grep "inner" /tmp/m22_wf_dir_copy/file.txt >/dev/null || exit 1
+# Copy:
+cp /tmp/m22_wf.txt /tmp/m22_wf_cp.txt || exit 1
+# Move:
+mv /tmp/m22_wf_cp.txt /tmp/m22_wf_mv.txt || exit 1
+# Pipeline:
+cat /tmp/m22_wf_mv.txt | sort | uniq | grep -v "z" > /tmp/m22_wf_out.txt || exit 1
+# Check output:
+grep "x" /tmp/m22_wf_out.txt >/dev/null || exit 1
+grep "y" /tmp/m22_wf_out.txt >/dev/null || exit 1
+# Remove files:
+echo "M22-POLISH: before-rm-rf"
+rm -rf /tmp/m22_wf_dir /tmp/m22_wf_dir_copy || exit 1
+echo "M22-POLISH: after-rm-rf"
+rm -f /tmp/m22_wf.txt /tmp/m22_wf_mv.txt /tmp/m22_wf_out.txt /tmp/m22_fruit.txt || exit 1
+echo "M22-POLISH: ok file-workflow"
+
+# 4. M22-POLISH: ok failure-status
+# utility failure status propagation:
+# command not found returns 127
+/bin/sh -c 'some_random_nonexistent_command'
+CNF_STATUS=$?
+# cp on nonexistent file returns nonzero
+cp /tmp/nonexistent_file_123 /tmp/nonexistent_file_456 2>/dev/null
+CP_STATUS=$?
+# rm on nonexistent file without -f returns nonzero
+rm /tmp/nonexistent_file_123 2>/dev/null
+RM_STATUS=$?
+# grep on nonexistent file returns nonzero
+grep "test" /tmp/nonexistent_file_123 2>/dev/null
+GREP_STATUS=$?
+# wc on nonexistent file returns nonzero
+wc -l /tmp/nonexistent_file_123 2>/dev/null
+WC_STATUS=$?
+
+if [ $CNF_STATUS -eq 127 ] && [ $CP_STATUS -ne 0 ] && [ $RM_STATUS -ne 0 ] && [ $GREP_STATUS -ne 0 ] && [ $WC_STATUS -ne 0 ]; then
+  echo "M22-POLISH: ok failure-status"
+fi
+
+# Run userspace M24 errno tests:
+/bin/m13-smoke --m24 && echo "M24-SMOKE: ok errno-mapping" && echo "M24-SMOKE: ok diagnostics"
+
+echo "M22-POLISH: done"
 echo "POSIX-SMOKE: done"

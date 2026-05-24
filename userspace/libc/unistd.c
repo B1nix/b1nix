@@ -6,16 +6,25 @@
 #include <sys/time.h>
 #include <time.h>
 #include <unistd.h>
+#include <errno.h>
+
+static inline int _check_err(long rc) {
+  if (rc < 0) {
+    errno = (int)-rc;
+    return -1;
+  }
+  return (int)rc;
+}
 
 int write(int fd, const void *buf, size_t n) {
-  return (int)syscall(SYS_WRITE, fd, buf, n);
+  return _check_err(syscall(SYS_WRITE, fd, buf, n));
 }
 
 int read(int fd, void *buf, size_t n) {
-  return (int)syscall(SYS_READ, fd, buf, n);
+  return _check_err(syscall(SYS_READ, fd, buf, n));
 }
 
-int close(int fd) { return (int)syscall(SYS_CLOSE, fd); }
+int close(int fd) { return _check_err(syscall(SYS_CLOSE, fd)); }
 
 void _exit(int status) {
   syscall(SYS_EXIT, status);
@@ -35,23 +44,28 @@ int open(const char *path, int flags, ...) {
     mode = va_arg(ap, unsigned int);
     va_end(ap);
   }
-  return (int)syscall(SYS_OPEN, path, flags, mode);
+  return _check_err(syscall(SYS_OPEN, path, flags, mode));
 }
 
 int unlink(const char *pathname) {
-  return (int)syscall(SYS_UNLINK, pathname);
+  return _check_err(syscall(SYS_UNLINK, pathname));
 }
 
 int mprotect(void *addr, size_t len, int prot) {
-  return (int)syscall(SYS_MPROTECT, addr, len, prot);
+  return _check_err(syscall(SYS_MPROTECT, addr, len, prot));
 }
 
 long lseek(int fd, long offset, int whence) {
-  return (long)syscall(SYS_LSEEK, fd, offset, whence);
+  long rc = syscall(SYS_LSEEK, fd, offset, whence);
+  if (rc < 0) {
+    errno = (int)-rc;
+    return -1;
+  }
+  return rc;
 }
 
 int execve(const char *pathname, char *const argv[], char *const envp[]) {
-  return (int)syscall(SYS_EXECVE, pathname, argv, envp);
+  return _check_err(syscall(SYS_EXECVE, pathname, argv, envp));
 }
 
 extern char **environ;
@@ -90,18 +104,18 @@ int execvp(const char *file, char *const argv[]) {
 }
 
 int mkdir(const char *path, unsigned int mode) {
-  return (int)syscall(SYS_MKDIR, path, mode);
+  return _check_err(syscall(SYS_MKDIR, path, mode));
 }
 
 int chdir(const char *path) {
-  return (int)syscall(SYS_CHDIR, path);
+  return _check_err(syscall(SYS_CHDIR, path));
 }
 
 int getcwd(char *buf, size_t size) {
-  return (int)syscall(SYS_GETCWD, buf, size);
+  return _check_err(syscall(SYS_GETCWD, buf, size));
 }
 
-int fsync(int fd) { return (int)syscall(SYS_FSYNC, fd); }
+int fsync(int fd) { return _check_err(syscall(SYS_FSYNC, fd)); }
 
 void sync(void) { syscall(SYS_SYNC); }
 
@@ -164,52 +178,67 @@ struct tm *localtime(const time_t *timep) {
 }
 
 int stat(const char *path, struct stat *st) {
-  return (int)syscall(SYS_STAT, path, st);
+  return _check_err(syscall(SYS_STAT, path, st));
 }
 
 int statfs(const char *path, struct statfs *buf) {
-  return (int)syscall(SYS_STATFS, path, buf);
+  return _check_err(syscall(SYS_STATFS, path, buf));
 }
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd,
            long offset) {
-  return (void *)syscall(SYS_MMAP, addr, length, prot, flags, fd, offset);
+  long rc = syscall(SYS_MMAP, addr, length, prot, flags, fd, offset);
+  if (rc < 0) {
+    errno = (int)-rc;
+    return (void *)-1;
+  }
+  return (void *)rc;
 }
 
 int munmap(void *addr, size_t length) {
-  return (int)syscall(SYS_MUNMAP, addr, length);
+  return _check_err(syscall(SYS_MUNMAP, addr, length));
 }
 
 int socket(int domain, int type, int protocol) {
-  return (int)syscall(SYS_SOCKET, domain, type, protocol);
+  return _check_err(syscall(SYS_SOCKET, domain, type, protocol));
 }
 
 int bind(int fd, const void *addr, size_t addrlen) {
-  return (int)syscall(SYS_BIND, fd, addr, addrlen);
+  return _check_err(syscall(SYS_BIND, fd, addr, addrlen));
 }
 
 int connect(int fd, const void *addr, size_t addrlen) {
-  return (int)syscall(SYS_CONNECT, fd, addr, addrlen);
+  return _check_err(syscall(SYS_CONNECT, fd, addr, addrlen));
 }
 
 long send(int fd, const void *buf, size_t len, int flags) {
-  return (long)syscall(SYS_SEND, fd, buf, len, flags);
+  long rc = syscall(SYS_SEND, fd, buf, len, flags);
+  if (rc < 0) {
+    errno = (int)-rc;
+    return -1;
+  }
+  return rc;
 }
 
 long recv(int fd, void *buf, size_t len, int flags) {
-  return (long)syscall(SYS_RECV, fd, buf, len, flags);
+  long rc = syscall(SYS_RECV, fd, buf, len, flags);
+  if (rc < 0) {
+    errno = (int)-rc;
+    return -1;
+  }
+  return rc;
 }
 
 int setuid(unsigned short uid) {
-  return (int)syscall(SYS_SETUID, uid);
+  return _check_err(syscall(SYS_SETUID, uid));
 }
 
 int setgid(unsigned short gid) {
-  return (int)syscall(SYS_SETGID, gid);
+  return _check_err(syscall(SYS_SETGID, gid));
 }
 
 int clock_gettime(int clk_id, struct timespec *tp) {
-  return (int)syscall(SYS_CLOCK_GETTIME, clk_id, tp);
+  return _check_err(syscall(SYS_CLOCK_GETTIME, clk_id, tp));
 }
 
 int nanosleep(const struct timespec *req, struct timespec *rem) {

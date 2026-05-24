@@ -1393,6 +1393,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_READ:
     return (u64)sys_read((int)arg0, (void *)(usize)arg1, (usize)arg2);
   case SYS_CLOSE:
+    if (scheduler_fd_get((int)arg0) < 0)
+      return (u64)-EBADF;
     vfs_close((int)arg0);
     return 0;
   case SYS_LSEEK:

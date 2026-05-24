@@ -778,6 +778,14 @@ restart_traversal:
       return ERR_PTR(-EACCES);
     }
 
+    if (current->inode->type != VFS_DIRECTORY) {
+      vfs_inode_unlock_read(current->inode);
+      vfs_node_put(current);
+      kfree(curr_path);
+      kfree(parent_path);
+      return ERR_PTR(-ENOTDIR);
+    }
+
     struct vfs_node *child = find_child(current, part);
     if (!child) {
       vfs_inode_unlock_read(current->inode);
@@ -1358,6 +1366,12 @@ int vfs_open_flags(const char *path, int flags) {
     } else {
       res = (int)PTR_ERR(node);
       klog_warn("vfs: open failed");
+      goto out;
+    }
+  } else {
+    if ((flags & B1NIX_O_CREAT) && (flags & B1NIX_O_EXCL)) {
+      res = -EEXIST;
+      vfs_node_put(node);
       goto out;
     }
   }

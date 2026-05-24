@@ -5,10 +5,54 @@
 #include <b1nix/pci.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
+#include <b1nix/errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+
+static const char *bb_strerror(int err) {
+  if (err < 0) err = -err;
+  switch (err) {
+    case 0: return "Success";
+    case EPERM: return "Operation not permitted";
+    case ENOENT: return "No such file or directory";
+    case ESRCH: return "No such process";
+    case EINTR: return "Interrupted system call";
+    case EIO: return "I/O error";
+    case ENXIO: return "No such device or address";
+    case E2BIG: return "Argument list too long";
+    case ENOEXEC: return "Exec format error";
+    case EBADF: return "Bad file number";
+    case ECHILD: return "No child processes";
+    case EAGAIN: return "Try again";
+    case ENOMEM: return "Out of memory";
+    case EACCES: return "Permission denied";
+    case EFAULT: return "Bad address";
+    case ENOTBLK: return "Block device required";
+    case EBUSY: return "Device or resource busy";
+    case EEXIST: return "File exists";
+    case EXDEV: return "Cross-device link";
+    case ENODEV: return "No such device";
+    case ENOTDIR: return "Not a directory";
+    case EISDIR: return "Is a directory";
+    case EINVAL: return "Invalid argument";
+    case ENFILE: return "File table overflow";
+    case EMFILE: return "Too many open files";
+    case ENOTTY: return "Not a typewriter";
+    case ETXTBSY: return "Text file busy";
+    case EFBIG: return "File too large";
+    case ENOSPC: return "No space left on device";
+    case ESPIPE: return "Illegal seek";
+    case EROFS: return "Read-only file system";
+    case EMLINK: return "Too many links";
+    case EPIPE: return "Broken pipe";
+    case EDOM: return "Math argument out of domain";
+    case ERANGE: return "Math result not representable";
+    case ELOOP: return "Too many levels of symbolic links";
+    default: return "Unknown error";
+  }
+}
 
 static u64 bb_open(const char *path) {
   u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
@@ -24,11 +68,11 @@ static int reboot_main(int argc, const char **argv) {
 static isize bb_read_file(const char *path, char *buf, usize max) {
   u64 fd = bb_open(path);
   if ((isize)fd < 0)
-    return -1;
+    return (isize)fd;
   u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, max - 1, 0, 0, 0);
   syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
   if ((isize)n < 0)
-    return -1;
+    return (isize)n;
   buf[n] = '\0';
   return (isize)n;
 }
@@ -50,20 +94,31 @@ static void bb_resolve(const char *rel, char *abs, usize abs_size) {
   }
   usize cl = strlen(cwd);
   usize rl = strlen(rel);
-  usize total = cl + rl + 2;
-  if (total > abs_size)
-    total = abs_size;
+  if (cl >= abs_size) {
+    cl = abs_size - 1;
+  }
   memcpy(abs, cwd, cl);
-  if (cl > 0 && abs[cl - 1] != '/')
+  abs[cl] = '\0';
+
+  if (cl > 0 && abs[cl - 1] != '/' && cl < abs_size - 1) {
     abs[cl++] = '/';
+    abs[cl] = '\0';
+  }
+
+  usize space = abs_size - 1 - cl;
+  if (rl > space) {
+    rl = space;
+  }
   memcpy(abs + cl, rel, rl);
   abs[cl + rl] = '\0';
 }
 
 /* ── pwd — print working directory ── */
 static int pwd_main(int argc, const char **argv) {
-  (void)argc;
-  (void)argv;
+  if (argc > 1 && argv[1][0] == '-') {
+    printf("pwd: invalid option\n");
+    return 1;
+  }
   char cwd[256];
   if (getcwd(cwd, sizeof(cwd)) < 0) {
     printf("pwd: cannot get current directory\n");
@@ -88,19 +143,37 @@ static int ls_main(int argc, const char **argv) {
           all_files = 1;
         else {
           printf("ls: invalid option -- '%c'\n", argv[i][j]);
-          return 1; /* Return 1 on unknown flag */
+          return 1;
         }
       }
-    } else
+    } else {
       target = argv[i];
+    }
   }
 
   char path[256];
   bb_resolve(target, path, sizeof(path));
+  struct b1nix_stat st;
+  int rc = (int)syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0);
+  if (rc != 0) {
+    printf("ls: %s: %s\n", target, bb_strerror(rc));
+    return 1;
+  }
+
+  if (!(st.st_mode & B1NIX_S_IFDIR)) {
+    if (long_fmt) {
+      char type = (st.st_mode & B1NIX_S_IFLNK) ? 'l' : '-';
+      printf("%c  %8d  %s\n", type, (int)st.st_size, target);
+    } else {
+      printf("%s\n", target);
+    }
+    return 0;
+  }
+
   struct dirent entries[64];
   int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 64, 0, 0, 0);
   if (count < 0) {
-    printf("ls: %s: No such file or directory\n", target);
+    printf("ls: %s: %s\n", target, bb_strerror(count));
     return 1;
   }
 
@@ -110,8 +183,9 @@ static int ls_main(int argc, const char **argv) {
     if (long_fmt) {
       char type = entries[i].is_dir ? 'd' : (entries[i].type == 2 ? 'c' : '-');
       printf("%c  %8d  %s\n", type, (int)entries[i].size, entries[i].name);
-    } else
+    } else {
       printf("%s  ", entries[i].name);
+    }
   }
   if (!long_fmt)
     printf("\n");
@@ -121,20 +195,27 @@ static int ls_main(int argc, const char **argv) {
 /* ── cp — copy file ── */
 static int bb_copy_file(const char *src, const char *dst) {
   u64 fds = bb_open(src);
-  if ((isize)fds < 0)
+  if ((isize)fds < 0) {
+    printf("cp: cannot open '%s' for reading: %s\n", src, bb_strerror((int)fds));
     return -1;
+  }
   u64 fdd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst,
                              (u64)(B1NIX_O_WRONLY | B1NIX_O_CREAT |
                                    B1NIX_O_TRUNC),
-                             0, 0, 0, 0);
+                             0666, 0, 0, 0);
   if ((isize)fdd < 0) {
+    printf("cp: cannot open '%s' for writing: %s\n", dst, bb_strerror((int)fdd));
     syscall_dispatch(SYS_CLOSE, fds, 0, 0, 0, 0, 0);
     return -1;
   }
   char buf[4096];
   while (1) {
     u64 n = syscall_dispatch(SYS_READ, fds, (u64)(usize)buf, sizeof(buf), 0, 0, 0);
-    if (n == 0 || (isize)n < 0)
+    if ((isize)n < 0) {
+      printf("cp: error reading '%s': %s\n", src, bb_strerror((int)n));
+      break;
+    }
+    if (n == 0)
       break;
     syscall_dispatch(SYS_WRITE, (u64)fdd, (u64)(usize)buf, (u64)n, 0, 0, 0);
   }
@@ -169,15 +250,25 @@ static int cp_main(int argc, const char **argv) {
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
-      if (strchr(argv[i], 'r') || strchr(argv[i], 'R'))
-        recursive = 1;
-      else {
-        printf("cp: invalid option\n");
-        return 1;
+      if (argv[i][1] == '\0') {
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        start_idx = i + 1;
+        break;
+      }
+      for (int j = 1; argv[i][j]; j++) {
+        if (argv[i][j] == 'r' || argv[i][j] == 'R') {
+          recursive = 1;
+        } else {
+          printf("cp: invalid option -- '%c'\n", argv[i][j]);
+          return 1;
+        }
       }
       start_idx = i + 1;
-    } else
+    } else {
       break;
+    }
   }
   if (argc - start_idx < 2) {
     printf("cp: missing operand\n");
@@ -186,11 +277,27 @@ static int cp_main(int argc, const char **argv) {
   char s[256], d[256];
   bb_resolve(argv[start_idx], s, sizeof(s));
   bb_resolve(argv[start_idx + 1], d, sizeof(d));
-  if (recursive)
+
+  struct b1nix_stat st;
+  int dst_is_dir = (syscall_dispatch(SYS_STAT, (u64)(usize)d, (u64)(usize)&st, 0, 0, 0, 0) == 0 &&
+                    (st.st_mode & B1NIX_S_IFDIR));
+  if (dst_is_dir) {
+    const char *base = strrchr(argv[start_idx], '/');
+    if (!base) base = argv[start_idx];
+    else base++;
+    char new_d[512];
+    snprintf(new_d, sizeof(new_d), "%s/%s", d, base);
+    strcpy(d, new_d);
+  }
+
+  int rc;
+  if (recursive) {
     cp_recursive(s, d);
-  else
-    bb_copy_file(s, d);
-  return 0;
+    rc = 0;
+  } else {
+    rc = bb_copy_file(s, d);
+  }
+  return rc == 0 ? 0 : 1;
 }
 
 /* ── mv — move/rename file ── */
@@ -202,19 +309,27 @@ static int mv_main(int argc, const char **argv) {
   char src[256], dst[256];
   bb_resolve(argv[1], src, sizeof(src));
   bb_resolve(argv[2], dst, sizeof(dst));
-  if (syscall_dispatch(SYS_RENAME, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0) !=
-      0) {
-    printf("mv: cannot move %s to %s\n", argv[1], argv[2]);
+  int rc = (int)syscall_dispatch(SYS_RENAME, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0);
+  if (rc != 0) {
+    printf("mv: cannot move %s to %s: %s\n", argv[1], argv[2], bb_strerror(rc));
     return 1;
   }
   return 0;
 }
 
 /* ── rm — remove file ── */
+static int rm_failures = 0;
+static int rm_force = 0;
+
 static void rm_recursive(const char *path) {
   struct b1nix_stat st;
-  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) != 0)
+  if (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) != 0) {
+    if (!rm_force) {
+      printf("rm: %s: No such file or directory\n", path);
+      rm_failures++;
+    }
     return;
+  }
   if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
     struct dirent entries[32];
     int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 32, 0, 0, 0);
@@ -226,9 +341,18 @@ static void rm_recursive(const char *path) {
       snprintf(sub, sizeof(sub), "%s/%s", path, entries[i].name);
       rm_recursive(sub);
     }
-    syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0);
-  } else
-    syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0);
+    int rc = (int)syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0);
+    if (rc != 0 && !rm_force) {
+      printf("rm: cannot remove directory %s: %s\n", path, bb_strerror(rc));
+      rm_failures++;
+    }
+  } else {
+    int rc = (int)syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0);
+    if (rc != 0 && !rm_force) {
+      printf("rm: cannot remove %s: %s\n", path, bb_strerror(rc));
+      rm_failures++;
+    }
+  }
 }
 
 static int rm_main(int argc, const char **argv) {
@@ -237,57 +361,99 @@ static int rm_main(int argc, const char **argv) {
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        start_idx = i + 1;
+        break;
+      }
       for (int j = 1; argv[i][j]; j++) {
         if (argv[i][j] == 'r' || argv[i][j] == 'R')
           recursive = 1;
         else if (argv[i][j] == 'f')
           force = 1;
         else {
-          printf("rm: invalid option\n");
+          printf("rm: invalid option -- '%c'\n", argv[i][j]);
           return 1;
         }
       }
       start_idx = i + 1;
-    } else
+    } else {
       break;
+    }
   }
   if (start_idx >= argc) {
+    if (force) return 0;
     printf("rm: missing operand\n");
     return 1;
   }
+
+  rm_failures = 0;
+  rm_force = force;
+
   for (int i = start_idx; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (recursive)
+    struct b1nix_stat st;
+    int exists = (syscall_dispatch(SYS_LSTAT, (u64)(usize)path, (u64)(usize)&st, 0, 0, 0, 0) == 0);
+    if (!exists) {
+      if (!force) {
+        printf("rm: %s: No such file or directory\n", argv[i]);
+        rm_failures++;
+      }
+      continue;
+    }
+    if (recursive) {
       rm_recursive(path);
-    else if (syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0) != 0 &&
-             !force) {
-      printf("rm: cannot remove %s\n", argv[i]);
+    } else {
+      if (st.st_mode & B1NIX_S_IFDIR) {
+        printf("rm: %s: is a directory\n", argv[i]);
+        rm_failures++;
+      } else {
+        int rc = (int)syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0);
+        if (rc != 0 && !force) {
+          printf("rm: cannot remove %s: %s\n", argv[i], bb_strerror(rc));
+          rm_failures++;
+        }
+      }
     }
   }
-  return 0;
+  return rm_failures ? 1 : 0;
 }
 
 /* ── mkdir — create directory ── */
 static int mkdir_p(const char *path) {
   char tmp[256];
-  strncpy(tmp, path, 256);
-  char *p = tmp;
-  if (*p == '/')
-    p++;
-  while (*p) {
-    if (*p == '/') {
-      *p = '\0';
-      if (tmp[0] != '\0') {
-        struct b1nix_stat st;
-        if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0, 0, 0, 0) != 0)
-          syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
-      }
-      *p = '/';
-    }
-    p++;
+  if (strlen(path) >= sizeof(tmp)) {
+    return -ENAMETOOLONG;
   }
-  return (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
+  strcpy(tmp, path);
+  char *p = tmp;
+  if (*p == '/') p++;
+  while (1) {
+    char *slash = strchr(p, '/');
+    if (slash) {
+      *slash = '\0';
+    }
+    if (tmp[0] != '\0') {
+      struct b1nix_stat st;
+      if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp, (u64)(usize)&st, 0, 0, 0, 0) == 0) {
+        if (!(st.st_mode & B1NIX_S_IFDIR)) {
+          return -ENOTDIR;
+        }
+      } else {
+        int rc = (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
+        if (rc != 0) {
+          return rc;
+        }
+      }
+    }
+    if (!slash) break;
+    *slash = '/';
+    p = slash + 1;
+  }
+  return 0;
 }
 
 static int mkdir_main(int argc, const char **argv) {
@@ -295,30 +461,50 @@ static int mkdir_main(int argc, const char **argv) {
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
-      if (strchr(argv[i], 'p'))
-        parents = 1;
-      else {
-        printf("mkdir: invalid option\n");
-        return 1;
+      if (argv[i][1] == '\0') {
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        start_idx = i + 1;
+        break;
+      }
+      for (int j = 1; argv[i][j]; j++) {
+        if (argv[i][j] == 'p') {
+          parents = 1;
+        } else {
+          printf("mkdir: invalid option -- '%c'\n", argv[i][j]);
+          return 1;
+        }
       }
       start_idx = i + 1;
-    } else
+    } else {
       break;
+    }
   }
   if (start_idx >= argc) {
     printf("mkdir: missing operand\n");
     return 1;
   }
+
+  int failures = 0;
   for (int i = start_idx; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (parents)
-      mkdir_p(path);
-    else if (syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0, 0, 0) != 0) {
-      printf("mkdir: cannot create %s\n", argv[i]);
+    if (parents) {
+      int rc = mkdir_p(path);
+      if (rc != 0) {
+        printf("mkdir: cannot create directory '%s': %s\n", argv[i], bb_strerror(rc));
+        failures++;
+      }
+    } else {
+      int rc = (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)path, 0755, 0, 0, 0, 0);
+      if (rc != 0) {
+        printf("mkdir: cannot create directory '%s': %s\n", argv[i], bb_strerror(rc));
+        failures++;
+      }
     }
   }
-  return 0;
+  return failures ? 1 : 0;
 }
 
 static int rmdir_main(int argc, const char **argv) {
@@ -331,8 +517,9 @@ static int rmdir_main(int argc, const char **argv) {
   for (int i = 1; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0) != 0) {
-      printf("rmdir: failed to remove %s\n", argv[i]);
+    int rc = (int)syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0);
+    if (rc != 0) {
+      printf("rmdir: failed to remove %s: %s\n", argv[i], bb_strerror(rc));
       failures++;
     }
   }
@@ -359,8 +546,9 @@ static int chmod_main(int argc, const char **argv) {
   for (int i = 2; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_CHMOD, (u64)(usize)path, (u64)mode, 0, 0, 0, 0) != 0) {
-      printf("chmod: cannot access %s\n", argv[i]);
+    int rc = (int)syscall_dispatch(SYS_CHMOD, (u64)(usize)path, (u64)mode, 0, 0, 0, 0);
+    if (rc != 0) {
+      printf("chmod: cannot access %s: %s\n", argv[i], bb_strerror(rc));
       failures++;
     }
   }
@@ -379,9 +567,9 @@ static int chown_main(int argc, const char **argv) {
   for (int i = 3; i < argc; i++) {
     char path[256];
     bb_resolve(argv[i], path, sizeof(path));
-    if (syscall_dispatch(SYS_CHOWN, (u64)(usize)path, (u64)uid, (u64)gid, 0, 0, 0) !=
-        0) {
-      printf("chown: cannot access %s\n", argv[i]);
+    int rc = (int)syscall_dispatch(SYS_CHOWN, (u64)(usize)path, (u64)uid, (u64)gid, 0, 0, 0);
+    if (rc != 0) {
+      printf("chown: cannot access %s: %s\n", argv[i], bb_strerror(rc));
       failures++;
     }
   }
@@ -405,8 +593,9 @@ static int ln_main(int argc, const char **argv) {
   char dst[256];
   bb_resolve(argv[argi + 1], dst, sizeof(dst));
   if (symbolic) {
-    if (syscall_dispatch(SYS_SYMLINK, (u64)(usize)argv[argi], (u64)(usize)dst, 0, 0, 0, 0) != 0) {
-      printf("ln: cannot create symbolic link %s\n", argv[argi + 1]);
+    int rc = (int)syscall_dispatch(SYS_SYMLINK, (u64)(usize)argv[argi], (u64)(usize)dst, 0, 0, 0, 0);
+    if (rc != 0) {
+      printf("ln: cannot create symbolic link %s: %s\n", argv[argi + 1], bb_strerror(rc));
       return 1;
     }
     return 0;
@@ -414,8 +603,9 @@ static int ln_main(int argc, const char **argv) {
 
   char src[256];
   bb_resolve(argv[argi], src, sizeof(src));
-  if (syscall_dispatch(SYS_LINK, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0) != 0) {
-    printf("ln: cannot create link %s\n", argv[argi + 1]);
+  int rc = (int)syscall_dispatch(SYS_LINK, (u64)(usize)src, (u64)(usize)dst, 0, 0, 0, 0);
+  if (rc != 0) {
+    printf("ln: cannot create link %s: %s\n", argv[argi + 1], bb_strerror(rc));
     return 1;
   }
   return 0;
@@ -426,13 +616,17 @@ static int readlink_main(int argc, const char **argv) {
     printf("readlink: missing operand\nUsage: readlink <path>\n");
     return 1;
   }
+  if (argv[1][0] == '-' && argv[1][1] != '\0') {
+    printf("readlink: invalid option -- '%s'\n", argv[1]);
+    return 1;
+  }
 
   char path[256];
   char target[256];
   bb_resolve(argv[1], path, sizeof(path));
   long n = (long)syscall_dispatch(SYS_READLINK, (u64)(usize)path, (u64)(usize)target, sizeof(target) - 1, 0, 0, 0);
   if (n < 0) {
-    printf("readlink: %s: Invalid argument\n", argv[1]);
+    printf("readlink: %s: %s\n", argv[1], bb_strerror((int)n));
     return 1;
   }
   target[n] = '\0';
@@ -536,39 +730,67 @@ static int uname_main(int argc, const char **argv) {
     return 1;
   }
 
-  int all = (argc < 2);
   int show_s = 0, show_n = 0, show_r = 0, show_v = 0, show_m = 0;
-  if (!all) {
-    for (int i = 1; i < argc; i++) {
-      if (strcmp(argv[i], "-s") == 0)
-        show_s = 1;
-      else if (strcmp(argv[i], "-n") == 0)
-        show_n = 1;
-      else if (strcmp(argv[i], "-r") == 0)
-        show_r = 1;
-      else if (strcmp(argv[i], "-v") == 0)
-        show_v = 1;
-      else if (strcmp(argv[i], "-m") == 0)
-        show_m = 1;
-      else if (strcmp(argv[i], "-a") == 0)
-        show_s = show_n = show_r = show_v = show_m = 1;
-      else {
-        printf("uname: invalid option\n");
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        printf("uname: extra operand '%s'\n", argv[i]);
         return 1;
       }
+      if (strcmp(argv[i], "--") == 0) {
+        if (i + 1 < argc) {
+          printf("uname: extra operand '%s'\n", argv[i + 1]);
+          return 1;
+        }
+        break;
+      }
+      for (int j = 1; argv[i][j]; j++) {
+        if (argv[i][j] == 's') show_s = 1;
+        else if (argv[i][j] == 'n') show_n = 1;
+        else if (argv[i][j] == 'r') show_r = 1;
+        else if (argv[i][j] == 'v') show_v = 1;
+        else if (argv[i][j] == 'm') show_m = 1;
+        else if (argv[i][j] == 'a') {
+          show_s = show_n = show_r = show_v = show_m = 1;
+        } else {
+          printf("uname: invalid option -- '%c'\n", argv[i][j]);
+          return 1;
+        }
+      }
+    } else {
+      printf("uname: extra operand '%s'\n", argv[i]);
+      return 1;
     }
   }
 
-  if (all || show_s)
-    printf("%s ", uts.sysname);
-  if (all || show_n)
-    printf("%s ", uts.nodename);
-  if (all || show_r)
-    printf("%s ", uts.release);
-  if (all || show_v)
-    printf("%s ", uts.version);
-  if (all || show_m)
+  if (argc < 2) {
+    show_s = 1;
+  }
+
+  int need_space = 0;
+  if (show_s) {
+    printf("%s", uts.sysname);
+    need_space = 1;
+  }
+  if (show_n) {
+    if (need_space) printf(" ");
+    printf("%s", uts.nodename);
+    need_space = 1;
+  }
+  if (show_r) {
+    if (need_space) printf(" ");
+    printf("%s", uts.release);
+    need_space = 1;
+  }
+  if (show_v) {
+    if (need_space) printf(" ");
+    printf("%s", uts.version);
+    need_space = 1;
+  }
+  if (show_m) {
+    if (need_space) printf(" ");
     printf("%s", uts.machine);
+  }
   printf("\n");
   return 0;
 }
@@ -581,11 +803,18 @@ static int cat_main(int argc, const char **argv) {
     return 0;
   }
 
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-' && argv[i][1] != '\0') {
+      printf("cat: invalid option -- '%s'\n", argv[i]);
+      return 1;
+    }
+  }
+
   int failures = 0;
   for (int i = 1; i < argc; i++) {
     u64 fd = bb_open(argv[i]);
     if ((isize)fd < 0) {
-      printf("cat: %s: No such file or directory\n", argv[i]);
+      printf("cat: %s: %s\n", argv[i], bb_strerror((int)fd));
       failures++;
       continue;
     }
@@ -607,22 +836,54 @@ static int head_main(int argc, const char **argv) {
   const char *file = 0;
   int file_idx = 1;
 
-  if (argc > 2 && strcmp(argv[1], "-n") == 0) {
-    nlines = atoi(argv[2]);
-    file_idx = 3;
-  } else if (argc > 1 && argv[1][0] == '-') {
-    nlines = atoi(argv[1] + 1);
-    file_idx = 2;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        file = argv[i];
+        file_idx = i + 1;
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        file_idx = i + 1;
+        break;
+      }
+      if (strcmp(argv[i], "-n") == 0) {
+        if (i + 1 >= argc) {
+          printf("head: option requires an argument -- 'n'\n");
+          return 1;
+        }
+        nlines = atoi(argv[++i]);
+      } else {
+        int is_num = 1;
+        for (int j = 1; argv[i][j]; j++) {
+          if (argv[i][j] < '0' || argv[i][j] > '9') {
+            is_num = 0;
+            break;
+          }
+        }
+        if (is_num) {
+          nlines = atoi(argv[i] + 1);
+        } else {
+          printf("head: invalid option -- '%s'\n", argv[i]);
+          return 1;
+        }
+      }
+      file_idx = i + 1;
+    } else {
+      break;
+    }
   }
-  if (argc > file_idx)
+
+  if (argc > file_idx) {
     file = argv[file_idx];
+  }
 
   char buf[4096];
   isize total = 0;
-  if (file) {
+  if (file && strcmp(file, "-") != 0) {
     total = bb_read_file(file, buf, sizeof(buf));
     if (total < 0) {
-      printf("head: %s: No such file\n", file);
+      printf("head: cannot open '%s' for reading: %s\n", file, bb_strerror((int)total));
       return 1;
     }
   } else {
@@ -649,22 +910,54 @@ static int tail_main(int argc, const char **argv) {
   const char *file = 0;
   int file_idx = 1;
 
-  if (argc > 2 && strcmp(argv[1], "-n") == 0) {
-    nlines = atoi(argv[2]);
-    file_idx = 3;
-  } else if (argc > 1 && argv[1][0] == '-') {
-    nlines = atoi(argv[1] + 1);
-    file_idx = 2;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        file = argv[i];
+        file_idx = i + 1;
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        file_idx = i + 1;
+        break;
+      }
+      if (strcmp(argv[i], "-n") == 0) {
+        if (i + 1 >= argc) {
+          printf("tail: option requires an argument -- 'n'\n");
+          return 1;
+        }
+        nlines = atoi(argv[++i]);
+      } else {
+        int is_num = 1;
+        for (int j = 1; argv[i][j]; j++) {
+          if (argv[i][j] < '0' || argv[i][j] > '9') {
+            is_num = 0;
+            break;
+          }
+        }
+        if (is_num) {
+          nlines = atoi(argv[i] + 1);
+        } else {
+          printf("tail: invalid option -- '%s'\n", argv[i]);
+          return 1;
+        }
+      }
+      file_idx = i + 1;
+    } else {
+      break;
+    }
   }
-  if (argc > file_idx)
+
+  if (argc > file_idx) {
     file = argv[file_idx];
+  }
 
   char buf[4096];
   isize total = 0;
-  if (file) {
+  if (file && strcmp(file, "-") != 0) {
     total = bb_read_file(file, buf, sizeof(buf));
     if (total < 0) {
-      printf("tail: %s: No such file\n", file);
+      printf("tail: cannot open '%s' for reading: %s\n", file, bb_strerror((int)total));
       return 1;
     }
   } else {
@@ -726,6 +1019,9 @@ static int find_main(int argc, const char **argv) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-name") == 0 && i + 1 < argc) {
       name = argv[++i];
+    } else if (argv[i][0] == '-') {
+      printf("find: invalid option -- '%s'\n", argv[i]);
+      return 1;
     } else if (argv[i][0] != '-') {
       start = argv[i];
     }
@@ -746,6 +1042,13 @@ static int grep_main(int argc, const char **argv) {
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
+      if (argv[i][1] == '\0') {
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        start_idx = i + 1;
+        break;
+      }
       for (int j = 1; argv[i][j]; j++) {
         if (argv[i][j] == 'q')
           quiet = 1;
@@ -754,13 +1057,14 @@ static int grep_main(int argc, const char **argv) {
         else if (argv[i][j] == 'v')
           invert = 1;
         else {
-          printf("grep: invalid option\n");
+          printf("grep: invalid option -- '%c'\n", argv[i][j]);
           return 1;
         }
       }
       start_idx = i + 1;
-    } else
+    } else {
       break;
+    }
   }
 
   if (argc - start_idx < 1) {
@@ -774,8 +1078,12 @@ static int grep_main(int argc, const char **argv) {
   isize total = 0;
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
-    if (total < 0)
+    if (total < 0) {
+      if (!quiet) {
+        printf("grep: %s: %s\n", file, bb_strerror((int)total));
+      }
       return 1;
+    }
   } else {
     while (total < (isize)sizeof(buf) - 1) {
       char c;
@@ -820,27 +1128,52 @@ static int grep_main(int argc, const char **argv) {
 
 /* ── wc — word/line/char count ── */
 static int wc_main(int argc, const char **argv) {
-  int lines_only = 0;
-  int chars_only = 0;
+  int show_lines = 0;
+  int show_words = 0;
+  int show_chars = 0;
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
-      if (strchr(argv[i], 'l'))
-        lines_only = 1;
-      if (strchr(argv[i], 'c'))
-        chars_only = 1;
+      if (argv[i][1] == '\0') {
+        break;
+      }
+      if (strcmp(argv[i], "--") == 0) {
+        start_idx = i + 1;
+        break;
+      }
+      for (int j = 1; argv[i][j]; j++) {
+        if (argv[i][j] == 'l')
+          show_lines = 1;
+        else if (argv[i][j] == 'w')
+          show_words = 1;
+        else if (argv[i][j] == 'c')
+          show_chars = 1;
+        else {
+          printf("wc: invalid option -- '%c'\n", argv[i][j]);
+          return 1;
+        }
+      }
       start_idx = i + 1;
-    } else
+    } else {
       break;
+    }
+  }
+
+  if (!show_lines && !show_words && !show_chars) {
+    show_lines = 1;
+    show_words = 1;
+    show_chars = 1;
   }
 
   const char *file = (argc > start_idx) ? argv[start_idx] : 0;
   char buf[4096];
   isize total = 0;
-  if (file) {
+  if (file && strcmp(file, "-") != 0) {
     total = bb_read_file(file, buf, sizeof(buf));
-    if (total < 0)
+    if (total < 0) {
+      printf("wc: %s: %s\n", file, bb_strerror((int)total));
       return 1;
+    }
   } else {
     while (total < (isize)sizeof(buf) - 1) {
       char c;
@@ -865,12 +1198,20 @@ static int wc_main(int argc, const char **argv) {
     }
   }
 
-  if (lines_only)
-    printf("%d\n", lines);
-  else if (chars_only)
-    printf("%d\n", (int)total);
-  else
-    printf("%d %d %d %s\n", lines, words, (int)total, file ? file : "");
+  if (show_lines) {
+    printf("%d ", lines);
+  }
+  if (show_words) {
+    printf("%d ", words);
+  }
+  if (show_chars) {
+    printf("%d ", (int)total);
+  }
+  if (file) {
+    printf("%s\n", file);
+  } else {
+    printf("\n");
+  }
   return 0;
 }
 static void sort_swap(char **a, char **b) {
@@ -880,18 +1221,29 @@ static void sort_swap(char **a, char **b) {
 }
 
 static int sort_main(int argc, const char **argv) {
-  const char *file = (argc > 1) ? argv[1] : 0;
+  const char *file = 0;
+  if (argc > 1) {
+    if (argv[1][0] == '-') {
+      printf("sort: invalid option -- '%s'\n", argv[1]);
+      return 1;
+    }
+    file = argv[1];
+  }
 
   char buf[4096];
-  usize total;
+  isize total;
 
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
+    if (total < 0) {
+      printf("sort: %s: %s\n", file, bb_strerror((int)total));
+      return 1;
+    }
     if (total == 0)
       return 0;
   } else {
     total = 0;
-    while (total < sizeof(buf) - 1) {
+    while ((usize)total < sizeof(buf) - 1) {
       char c;
       if (read(0, &c, 1) <= 0)
         break;
@@ -904,10 +1256,10 @@ static int sort_main(int argc, const char **argv) {
   char *lines[256];
   int lc = 0;
   lines[lc++] = buf;
-  for (usize i = 0; i < total && lc < 256; i++) {
+  for (usize i = 0; i < (usize)total && lc < 256; i++) {
     if (buf[i] == '\n') {
       buf[i] = '\0';
-      if (i + 1 < total)
+      if (i + 1 < (usize)total)
         lines[lc++] = &buf[i + 1];
     }
   }
@@ -929,18 +1281,29 @@ static int sort_main(int argc, const char **argv) {
 
 /* ── uniq — report or omit repeated lines ── */
 static int uniq_main(int argc, const char **argv) {
-  const char *file = (argc > 1) ? argv[1] : 0;
+  const char *file = 0;
+  if (argc > 1) {
+    if (argv[1][0] == '-') {
+      printf("uniq: invalid option -- '%s'\n", argv[1]);
+      return 1;
+    }
+    file = argv[1];
+  }
 
   char buf[4096];
-  usize total;
+  isize total;
 
   if (file) {
     total = bb_read_file(file, buf, sizeof(buf));
+    if (total < 0) {
+      printf("uniq: %s: %s\n", file, bb_strerror((int)total));
+      return 1;
+    }
     if (total == 0)
       return 0;
   } else {
     total = 0;
-    while (total < sizeof(buf) - 1) {
+    while ((usize)total < sizeof(buf) - 1) {
       char c;
       if (read(0, &c, 1) <= 0)
         break;
@@ -953,10 +1316,10 @@ static int uniq_main(int argc, const char **argv) {
   char *lines[256];
   int lc = 0;
   lines[lc++] = buf;
-  for (usize i = 0; i < total && lc < 256; i++) {
+  for (usize i = 0; i < (usize)total && lc < 256; i++) {
     if (buf[i] == '\n') {
       buf[i] = '\0';
-      if (i + 1 < total)
+      if (i + 1 < (usize)total)
         lines[lc++] = &buf[i + 1];
     }
   }
@@ -1304,19 +1667,23 @@ static int hexdump_main(int argc, const char **argv) {
   }
 
   char buf[512];
-  usize total = bb_read_file(argv[1], buf, sizeof(buf));
+  isize total = bb_read_file(argv[1], buf, sizeof(buf));
+  if (total < 0) {
+    printf("hexdump: %s: %s\n", argv[1], bb_strerror((int)total));
+    return 1;
+  }
   if (total == 0) {
     printf("hexdump: %s: No such file or empty\n", argv[1]);
     return 1;
   }
 
-  for (usize offset = 0; offset < total; offset += 16) {
+  for (usize offset = 0; offset < (usize)total; offset += 16) {
     /* Offset */
     printf("%04x  ", (int)offset);
 
     /* Hex bytes */
     for (usize j = 0; j < 16; j++) {
-      if (offset + j < total) {
+      if (offset + j < (usize)total) {
         printf("%02x ", (u8)buf[offset + j]);
       } else {
         printf("   ");
@@ -1327,7 +1694,7 @@ static int hexdump_main(int argc, const char **argv) {
 
     /* ASCII representation */
     printf(" |");
-    for (usize j = 0; j < 16 && offset + j < total; j++) {
+    for (usize j = 0; j < 16 && offset + j < (usize)total; j++) {
       char c = buf[offset + j];
       putchar((c >= 32 && c < 127) ? c : '.');
     }

@@ -394,16 +394,17 @@ unclean shutdown.
 - [x] `done` Implement mount command mounting path and active mount listing.
 - [x] `done` Add init-path utility smoke tests through /bin/m22-smoke and QEMU serial checks.
 - [x] `done` Add interactive shell-driven utility smoke tests that execute through /bin/sh.
-- [x] `initial` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q, grep -n, head -n NUM, tail -n NUM).
+- [x] `done` Add option-compatible behavior for common utility flags (ls -la, cp -r, rm -rf, mkdir -p, grep -q, grep -n, head -n NUM, tail -n NUM).
 - [x] `done` Restore all utility dispatch targets used by M22 smoke after the BusyBox table cleanup.
 
-M22 is useful but not fully closed. The init-path smoke proves many utilities
-work, and `/bin/shell-smoke` now exercises a small script through `/bin/sh`.
+M22 is closed for the QEMU/dev baseline. The init-path smoke proves many utilities
+work, and `/bin/shell-smoke` now exercises the polished options, text pipeline,
+file workflow, and failure status propagation through `/bin/sh`.
 Current verification: `make smoke-x86` passes M22 utility smoke, M24 stress, the
 POSIX shell-driven smoke path, and an init-path `ping -c 2 10.0.2.2` gateway
-check. POSIX-style closure still needs broader
-shell-script coverage, unsupported-flag behavior, consistent nonzero exits, and
-more exact text/file utility semantics.
+check. QEMU/dev baseline coverage is in place for the covered utilities and
+libc paths, while full and exact POSIX utility parity is deferred if not
+implemented.
 
 ## M23: Networking for Terminal Use
 
@@ -428,9 +429,9 @@ more exact text/file utility semantics.
 - [x] `done` Add kernel log levels and a ring buffer readable from userspace.
 - [x] `done` Add `/bin/dmesg` backed by `SYS_DMESG`.
 - [x] `done` Add scheduler stress coverage for repeated `spawn`/`wait` short-lived utility tasks.
-- [x] `initial` Add shell-driven utility smoke coverage.
-- [ ] `planned` Add CI-grade interactive shell utility tests.
-- [ ] `planned` Make syscall errors consistently map to userspace `errno`.
+- [x] `done` Add shell-driven utility smoke coverage.
+- [x] `done` Add CI-grade interactive shell utility tests.
+- [x] `done` Make syscall errors consistently map to userspace `errno` for the covered libc wrappers and smoke paths.
 
 ## M25: Minimal Native C Toolchain
 

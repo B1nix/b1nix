@@ -54,7 +54,125 @@ static int read_all_file(const char *path, char *buf, int buf_sz) {
   return n;
 }
 
+static int test_m24_errno(void) {
+  marker("M24-SMOKE: start\n");
+
+  // 1. ENOENT: open non-existent file
+  errno = 0;
+  int fd = open("/tmp/nonexistent_file_xyz_123", O_RDONLY);
+  if (fd >= 0 || errno != ENOENT) {
+    marker("M24-SMOKE: fail ENOENT\n");
+    return 1;
+  }
+  marker("M24-SMOKE: ok ENOENT\n");
+
+  // 2. EEXIST: create file with O_EXCL
+  unlink("/tmp/exists_test");
+  fd = open("/tmp/exists_test", O_CREAT | O_RDWR, 0666);
+  if (fd >= 0) {
+    close(fd);
+    errno = 0;
+    int fd2 = open("/tmp/exists_test", O_CREAT | O_EXCL | O_RDWR, 0666);
+    if (fd2 >= 0 || errno != EEXIST) {
+      marker("M24-SMOKE: fail EEXIST\n");
+      return 2;
+    }
+    marker("M24-SMOKE: ok EEXIST\n");
+  } else {
+    marker("M24-SMOKE: fail EEXIST setup\n");
+    return 2;
+  }
+
+  // 3. EINVAL: lseek with invalid whence
+  errno = 0;
+  long rc = lseek(0, 0, 999);
+  if (rc >= 0 || errno != EINVAL) {
+    marker("M24-SMOKE: fail EINVAL\n");
+    return 3;
+  }
+  marker("M24-SMOKE: ok EINVAL\n");
+
+  // 4. EBADF: close invalid file descriptor
+  errno = 0;
+  rc = close(999);
+  if (rc >= 0 || errno != EBADF) {
+    marker("M24-SMOKE: fail EBADF\n");
+    return 4;
+  }
+  marker("M24-SMOKE: ok EBADF\n");
+
+  // 5. ENOTDIR: treat file as directory
+  errno = 0;
+  fd = open("/tmp/exists_test/child", O_RDONLY);
+  if (fd >= 0 || errno != ENOTDIR) {
+    char d[96];
+    snprintf(d, sizeof(d), "M24-SMOKE: fail ENOTDIR errno=%d\n", errno);
+    marker(d);
+    return 5;
+  }
+  marker("M24-SMOKE: ok ENOTDIR\n");
+
+  // 6. EISDIR: open directory for writing
+  errno = 0;
+  fd = open("/tmp", O_WRONLY);
+  if (fd >= 0 || errno != EISDIR) {
+    marker("M24-SMOKE: fail EISDIR\n");
+    return 6;
+  }
+  marker("M24-SMOKE: ok EISDIR\n");
+
+  // 7. EACCES: permissions check for non-root
+  unlink("/tmp/eacces_test");
+  int fd_acc = open("/tmp/eacces_test", O_CREAT | O_RDWR | O_TRUNC, 0666);
+  if (fd_acc >= 0) {
+    close(fd_acc);
+    if ((int)syscall(SYS_CHMOD, "/tmp/eacces_test", 0400) != 0) {
+      marker("M24-SMOKE: fail EACCES chmod\n");
+      return 7;
+    }
+    int acc_pid = (int)syscall(SYS_FORK);
+    if (acc_pid == 0) {
+      int su = setuid(1000);
+      int uid_after = (int)syscall(SYS_GETUID);
+      errno = 0;
+      int fd_child = open("/tmp/eacces_test", O_RDONLY);
+      if (su == 0 && uid_after == 1000 && fd_child < 0 && errno == EACCES) {
+        syscall(SYS_EXIT, 0);
+      }
+      if (fd_child >= 0 || errno != EACCES) {
+        char d[96];
+        snprintf(d, sizeof(d), "M24-SMOKE: fail EACCES su=%d uid=%d errno=%d fd=%d\n",
+                 su, uid_after, errno, fd_child);
+        marker(d);
+      }
+      syscall(SYS_EXIT, 1);
+    } else if (acc_pid > 0) {
+      int st = 0;
+      syscall(SYS_WAITPID, acc_pid, &st, 0);
+      if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+        marker("M24-SMOKE: fail EACCES\n");
+        return 7;
+      }
+    } else {
+      marker("M24-SMOKE: fail EACCES fork\n");
+      return 7;
+    }
+  } else {
+    marker("M24-SMOKE: fail EACCES setup\n");
+    return 7;
+  }
+
+  marker("M24-SMOKE: ok EACCES\n");
+  marker("M24-SMOKE: ok errno-mapping\n");
+  marker("M24-SMOKE: ok diagnostics\n");
+
+  return 0;
+}
+
 int main(int argc, char **argv, char **envp) {
+  if (argc >= 2 && argv && argv[1] && strcmp(argv[1], "--m24") == 0) {
+    return test_m24_errno();
+  }
   if (argc >= 2 && argv && argv[1] && strcmp(argv[1], "check-exec-argv-env") == 0) {
       int env_ok = 0;
       if (envp) {
