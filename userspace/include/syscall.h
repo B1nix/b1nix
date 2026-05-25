@@ -116,6 +116,9 @@ enum {
   SYS_MPROTECT = 98,
   SYS_SIGRETURN = 99,
   SYS_CLOCK_GETTIME = 100,
+  SYS_IO_SETUP = 101,
+  SYS_IO_SUBMIT = 102,
+  SYS_IO_GETEVENTS = 103,
 };
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */

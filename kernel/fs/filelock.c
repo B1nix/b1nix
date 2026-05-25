@@ -103,10 +103,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   if (!filelock_initialized || fd < 0)
     return -EINVAL;
 
-  int handle_idx = scheduler_fd_get(fd);
-  if (handle_idx < 0)
-    return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(handle_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h)
     return -EBADF;
 

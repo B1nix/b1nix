@@ -229,6 +229,32 @@ check_output "$LOG" "M13-SMOKE: ok parent-intact" "failed child exec path does n
 check_output "$LOG" "M13-SMOKE: ok errno-negative" "negative syscall result path is exposed to userspace"
 check_output "$LOG" "M13-SMOKE: done" "M13 smoke completes successfully"
 
+# ── M17 errno matrix smoke ──
+echo ""
+echo "[TEST] M17 errno matrix..."
+check_output "$LOG" "M17-SMOKE: start" "M17 smoke starts"
+check_output "$LOG" "M17-SMOKE: ok eloop" "M17 ELOOP symlink-depth behavior is correct"
+check_output "$LOG" "M17-SMOKE: ok enametoolong" "M17 ENAMETOOLONG path-component limit is correct"
+check_output "$LOG" "M17-SMOKE: ok enotdir" "M17 ENOTDIR file-as-directory behavior is correct"
+check_output "$LOG" "M17-SMOKE: ok eisdir" "M17 EISDIR write-to-directory behavior is correct"
+if grep -q "M17-SMOKE: ok erofs" "$LOG" 2>/dev/null; then
+	pass "M17 EROFS readonly mount behavior is correct"
+elif grep -q "M17-SMOKE: ok erofs-skip" "$LOG" 2>/dev/null; then
+	pass "M17 EROFS test skipped (no readonly mount candidate)"
+else
+	fail "M17 EROFS marker emitted" "missing erofs/erofs-skip marker"
+fi
+check_output "$LOG" "M17-SMOKE: ok errno-isolation" "M17 errno isolation across successful syscall is correct"
+check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
+
+# ── M8 AIO / completion queues ──
+echo ""
+echo "[TEST] M8 AIO completion queues..."
+check_output "$LOG" "M8-AIO-SMOKE: start" "M8 AIO smoke starts"
+check_output "$LOG" "M8-AIO-SMOKE: ok write" "M8 AIO async write completes"
+check_output "$LOG" "M8-AIO-SMOKE: ok read" "M8 AIO async read completes"
+check_output "$LOG" "M8-AIO-SMOKE: done" "M8 AIO smoke completes"
+
 # ── M14 Advanced Storage, Swap & File Systems ──
 echo ""
 echo "[TEST] M14 Storage, Swap & File Systems..."

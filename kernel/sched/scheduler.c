@@ -8,6 +8,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/arch_x86.h>
+#include <b1nix/aio.h>
 #include <string.h>
 
 #define MAX_TASKS 64
@@ -17,8 +18,6 @@
 
 extern void arch_context_switch(struct cpu_context *old_context,
                                 struct cpu_context *new_context);
-extern void vfs_handle_retain(int handle);
-extern void vfs_handle_release(int handle);
 extern char x86_syscall_stack_top[];
 
 static struct task tasks[MAX_TASKS];
@@ -102,10 +101,9 @@ void scheduler_init(void) {
   boot->name = "boot";
   boot->state = TASK_RUNNING;
   boot->stdout_fd = -1;
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    boot->fd_table[i] = -1;
-    boot->fd_flags[i] = 0;
-  }
+  boot->fd_capacity = SCHED_MAX_FDS;
+  boot->fd_table = kzalloc(boot->fd_capacity * sizeof(struct vfs_handle *));
+  boot->fd_flags = kzalloc(boot->fd_capacity * sizeof(int));
   boot->priority = 1;
   boot->parent_id = 0;
   boot->cwd[0] = '/';
@@ -206,17 +204,21 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->context.r15 = 0;
 #endif
   task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if (parent_task) {
+  if (parent_task) {
+    task->fd_capacity = parent_task->fd_capacity;
+    task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
+    task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
+    for (usize i = 0; i < task->fd_capacity; i++) {
       task->fd_table[i] = parent_task->fd_table[i];
       task->fd_flags[i] = parent_task->fd_flags[i];
-      if (task->fd_table[i] >= 0) {
+      if (task->fd_table[i]) {
         vfs_handle_retain(task->fd_table[i]);
       }
-    } else {
-      task->fd_table[i] = -1;
-      task->fd_flags[i] = 0;
     }
+  } else {
+    task->fd_capacity = SCHED_MAX_FDS;
+    task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
+    task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
   }
   task->priority = 1;
   task->parent_id = parent_task ? parent_task->id : 0;
@@ -274,7 +276,13 @@ int scheduler_fork_current(void) {
   memcpy(child, parent, sizeof(struct task));
   child->id = next_task_id++;
   child->parent_id = parent->id;
-  child->state = TASK_READY;
+  child->state = TASK_BLOCKED;
+  child->name = parent->name ? strdup(parent->name) : 0;
+  if (parent->name && !child->name) {
+    child->state = TASK_UNUSED;
+    interrupts_enable();
+    return -1;
+  }
 
   if (child->user_image) {
     ((struct user_loaded_image *)child->user_image)->refcount++;
@@ -288,6 +296,14 @@ int scheduler_fork_current(void) {
   // 2. Allocate and copy kernel stack
   void *child_stack = kmalloc(KERNEL_STACK_SIZE);
   if (!child_stack) {
+    if (child->user_image) {
+      user_image_free(child->user_image);
+      child->user_image = 0;
+    }
+    if (child->name) {
+      kfree((void *)child->name);
+      child->name = 0;
+    }
     child->state = TASK_UNUSED;
     interrupts_enable();
     return -1;
@@ -361,13 +377,42 @@ int scheduler_fork_current(void) {
 
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if (child->fd_table[i] >= 0) {
+  child->fd_capacity = parent->fd_capacity;
+  child->fd_table = kzalloc(child->fd_capacity * sizeof(struct vfs_handle *));
+  child->fd_flags = kzalloc(child->fd_capacity * sizeof(int));
+  if (!child->fd_table || !child->fd_flags) {
+    if (child->fd_table)
+      kfree(child->fd_table);
+    if (child->fd_flags)
+      kfree(child->fd_flags);
+    if (child->cred) {
+      cred_free(child->cred);
+      child->cred = 0;
+    }
+    if (child->user_image) {
+      user_image_free(child->user_image);
+      child->user_image = 0;
+    }
+    if (child->name) {
+      kfree((void *)child->name);
+      child->name = 0;
+    }
+    kfree(child_stack);
+    child->stack = 0;
+    child->state = TASK_UNUSED;
+    interrupts_enable();
+    return -1;
+  }
+  for (usize i = 0; i < child->fd_capacity; i++) {
+    child->fd_table[i] = parent->fd_table[i];
+    child->fd_flags[i] = parent->fd_flags[i];
+    if (child->fd_table[i]) {
       vfs_handle_retain(child->fd_table[i]);
     }
   }
 
   int child_id = (int)child->id;
+  child->state = TASK_READY;
   interrupts_enable();
   return child_id;
 }
@@ -499,13 +544,20 @@ void scheduler_exit_current(int exit_code) {
     current_task->cred = 0;
   }
 
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if (current_task->fd_table[i] >= 0) {
-      vfs_handle_release(current_task->fd_table[i]);
-      current_task->fd_table[i] = -1;
-      current_task->fd_flags[i] = 0;
+  if (current_task->fd_table) {
+    for (usize i = 0; i < current_task->fd_capacity; i++) {
+      if (current_task->fd_table[i]) {
+        vfs_handle_release(current_task->fd_table[i]);
+      }
     }
+    kfree(current_task->fd_table);
+    kfree(current_task->fd_flags);
+    current_task->fd_table = 0;
+    current_task->fd_flags = 0;
+    current_task->fd_capacity = 0;
   }
+
+  aio_task_cleanup(current_task);
 
   current_task->exit_code = exit_code;
   current_task->state = TASK_DEAD;
@@ -660,70 +712,133 @@ int scheduler_get_stdout(void) {
 void scheduler_fd_table_init_current(void) {
   if (!current_task)
     return;
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    current_task->fd_table[i] = -1;
-    current_task->fd_flags[i] = 0;
+  if (current_task->fd_table) {
+    kfree(current_task->fd_table);
+    kfree(current_task->fd_flags);
   }
+  current_task->fd_capacity = SCHED_MAX_FDS;
+  current_task->fd_table = kzalloc(current_task->fd_capacity * sizeof(struct vfs_handle *));
+  current_task->fd_flags = kzalloc(current_task->fd_capacity * sizeof(int));
 }
 
-int scheduler_fd_alloc(int handle) {
-  if (!current_task || handle < 0)
+int scheduler_fd_alloc(struct vfs_handle *handle) {
+  if (!current_task || !handle)
     return -1;
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if (current_task->fd_table[i] < 0) {
+  for (usize i = 0; i < current_task->fd_capacity; i++) {
+    if (current_task->fd_table[i] == 0) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
       return (int)i;
     }
   }
-  return -1;
+
+  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT)
+    return -1;
+
+  usize new_capacity = current_task->fd_capacity * 2;
+  if (new_capacity > SCHED_MAX_FD_LIMIT)
+    new_capacity = SCHED_MAX_FD_LIMIT;
+
+  struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
+  if (!new_table) return -1;
+  int *new_flags = kzalloc(new_capacity * sizeof(int));
+  if (!new_flags) {
+    kfree(new_table);
+    return -1;
+  }
+
+  memcpy(new_table, current_task->fd_table, current_task->fd_capacity * sizeof(struct vfs_handle *));
+  memcpy(new_flags, current_task->fd_flags, current_task->fd_capacity * sizeof(int));
+
+  kfree(current_task->fd_table);
+  kfree(current_task->fd_flags);
+
+  current_task->fd_table = new_table;
+  current_task->fd_flags = new_flags;
+
+  int allocated_fd = (int)current_task->fd_capacity;
+  current_task->fd_capacity = new_capacity;
+  current_task->fd_table[allocated_fd] = handle;
+  current_task->fd_flags[allocated_fd] = 0;
+  return allocated_fd;
 }
 
-int scheduler_fd_get(int fd) {
-  if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS)
-    return -1;
+struct vfs_handle *scheduler_fd_get(int fd) {
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
+    return 0;
   return current_task->fd_table[fd];
 }
 
-int scheduler_fd_set(int fd, int handle) {
-  if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS)
+int scheduler_fd_set(int fd, struct vfs_handle *handle) {
+  if (!current_task || fd < 0)
     return -1;
+
+  if ((usize)fd >= current_task->fd_capacity) {
+    if ((usize)fd >= SCHED_MAX_FD_LIMIT)
+      return -1;
+    usize new_capacity = current_task->fd_capacity;
+    while (new_capacity <= (usize)fd) {
+      new_capacity *= 2;
+    }
+    if (new_capacity > SCHED_MAX_FD_LIMIT)
+      new_capacity = SCHED_MAX_FD_LIMIT;
+
+    struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
+    if (!new_table) return -1;
+    int *new_flags = kzalloc(new_capacity * sizeof(int));
+    if (!new_flags) {
+      kfree(new_table);
+      return -1;
+    }
+
+    memcpy(new_table, current_task->fd_table, current_task->fd_capacity * sizeof(struct vfs_handle *));
+    memcpy(new_flags, current_task->fd_flags, current_task->fd_capacity * sizeof(int));
+
+    kfree(current_task->fd_table);
+    kfree(current_task->fd_flags);
+
+    current_task->fd_table = new_table;
+    current_task->fd_flags = new_flags;
+    current_task->fd_capacity = new_capacity;
+  }
+
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
   return fd;
 }
 
 int scheduler_fd_close(int fd) {
-  if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS)
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  current_task->fd_table[fd] = -1;
+  current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
   return 0;
 }
 
 int scheduler_fd_flags_get(int fd) {
-  if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS)
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  if (current_task->fd_table[fd] < 0)
+  if (!current_task->fd_table[fd])
     return -1;
   return current_task->fd_flags[fd];
 }
 
 int scheduler_fd_flags_set(int fd, int flags) {
-  if (!current_task || fd < 0 || (usize)fd >= SCHED_MAX_FDS)
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  if (current_task->fd_table[fd] < 0)
+  if (!current_task->fd_table[fd])
     return -1;
   current_task->fd_flags[fd] = flags;
   return 0;
 }
 
 void scheduler_fd_close_on_exec(void) {
-  if (!current_task)
+  if (!current_task || !current_task->fd_table)
     return;
-  for (usize i = 0; i < SCHED_MAX_FDS; i++) {
-    if ((current_task->fd_flags[i] & B1NIX_FD_CLOEXEC) != 0) {
-      current_task->fd_table[i] = -1;
+  for (usize i = 0; i < current_task->fd_capacity; i++) {
+    if (current_task->fd_table[i] && (current_task->fd_flags[i] & B1NIX_FD_CLOEXEC) != 0) {
+      vfs_handle_release(current_task->fd_table[i]);
+      current_task->fd_table[i] = 0;
       current_task->fd_flags[i] = 0;
     }
   }

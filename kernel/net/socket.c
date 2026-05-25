@@ -9,7 +9,7 @@
 struct udp_binding {
   int used;
   u16 port;
-  int h_idx;
+  struct vfs_handle *handle;
 };
 #define MAX_UDP_BINDINGS 64
 struct udp_binding udp_bindings[MAX_UDP_BINDINGS];
@@ -130,11 +130,10 @@ static int socket_close(struct vfs_handle *h) {
   if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_DGRAM &&
       s->bound) {
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-      if (udp_bindings[i].used &&
-          get_handle_by_idx(udp_bindings[i].h_idx) == h) {
+      if (udp_bindings[i].used && udp_bindings[i].handle == h) {
         udp_bindings[i].used = 0;
         udp_bindings[i].port = 0;
-        udp_bindings[i].h_idx = -1;
+        udp_bindings[i].handle = 0;
       }
     }
   }
@@ -167,37 +166,32 @@ int vfs_socket(int domain, int type, int protocol) {
   if (domain != B1NIX_AF_INET && domain != B1NIX_AF_UNIX) return -EAFNOSUPPORT;
   if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM) return -ESOCKTNOSUPPORT;
   
-  int handle_idx = alloc_raw_handle(VFS_HANDLE_SOCKET);
-  if (handle_idx < 0) return handle_idx;
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_SOCKET);
+  if (!h) return -ENFILE;
   
   struct vfs_socket_state *socket = kzalloc(sizeof(*socket));
-  if (!socket) { release_handle(handle_idx); return -ENOMEM; }
+  if (!socket) { vfs_handle_release(h); return -ENOMEM; }
   socket->domain = domain;
   socket->type = type;
   socket->protocol = protocol;
   
   if (domain == B1NIX_AF_UNIX) {
     int res = unix_init_state(socket);
-    if (res < 0) { kfree(socket); release_handle(handle_idx); return res; }
+    if (res < 0) { kfree(socket); vfs_handle_release(h); return res; }
   }
   
-  struct vfs_handle *h = get_handle_by_idx(handle_idx);
   vfs_socket_init_handle(h, socket);
   
-  int fd = scheduler_fd_alloc(handle_idx);
+  int fd = scheduler_fd_alloc(h);
   if (fd < 0) { 
-    if (domain == B1NIX_AF_UNIX) unix_free_state(socket);
-    kfree(socket); 
-    release_handle(handle_idx); 
+    vfs_handle_release(h); 
     return -EMFILE; 
   }
   return fd;
 }
 
 int vfs_bind(int fd, const void *addr, usize addrlen) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -221,7 +215,7 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
       if (!udp_bindings[i].used) {
         udp_bindings[i].used = 1;
         udp_bindings[i].port = port;
-        udp_bindings[i].h_idx = h_idx;
+        udp_bindings[i].handle = h;
         return 0;
       }
     }
@@ -231,9 +225,7 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
 }
 
 int vfs_listen(int fd, int backlog) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -250,18 +242,16 @@ int vfs_listen(int fd, int backlog) {
 }
 
 int vfs_accept(int fd, void *addr, usize *addrlen) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s->listening) return -EINVAL;
 
-  int new_h_idx = alloc_raw_handle(VFS_HANDLE_SOCKET);
-  if (new_h_idx < 0) return new_h_idx;
+  struct vfs_handle *new_vh = alloc_raw_handle(VFS_HANDLE_SOCKET);
+  if (!new_vh) return -ENFILE;
   struct vfs_socket_state *new_s = kzalloc(sizeof(*new_s));
-  if (!new_s) { release_handle(new_h_idx); return -ENOMEM; }
+  if (!new_s) { vfs_handle_release(new_vh); return -ENOMEM; }
   new_s->domain = s->domain;
   new_s->type = s->type;
   
@@ -283,7 +273,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
       if (conn) break;
       if (h->flags & B1NIX_O_NONBLOCK) {
         kfree(new_s);
-        release_handle(new_h_idx);
+        vfs_handle_release(new_vh);
         return -EAGAIN;
       }
       scheduler_block_on(vfs_poll_chan);
@@ -302,27 +292,29 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
     res = 0;
   } else {
     kfree(new_s);
-    release_handle(new_h_idx);
+    vfs_handle_release(new_vh);
     return -ENOPROTOOPT;
   }
   
   if (res < 0) { 
     if (s->domain == B1NIX_AF_UNIX) unix_free_state(new_s);
     kfree(new_s); 
-    release_handle(new_h_idx); 
+    vfs_handle_release(new_vh); 
     return res; 
   }
 
-  struct vfs_handle *new_vh = get_handle_by_idx(new_h_idx);
   vfs_socket_init_handle(new_vh, new_s);
   
-  return scheduler_fd_alloc(new_h_idx);
+  int new_fd = scheduler_fd_alloc(new_vh);
+  if (new_fd < 0) {
+    vfs_handle_release(new_vh);
+    return -EMFILE;
+  }
+  return new_fd;
 }
 
 int vfs_connect(int fd, const void *addr, usize addrlen) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -367,18 +359,14 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
 }
 
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_send_h(h, buf, len, flags);
 }
 
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) return -EBADF;
-  struct vfs_handle *h = get_handle_by_idx(h_idx);
+  struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_recv_h(h, buf, len, flags);
@@ -387,8 +375,7 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
   for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
     if (udp_bindings[i].used && udp_bindings[i].port == local_port_net) {
-      int h_idx = udp_bindings[i].h_idx;
-      struct vfs_handle *h = get_handle_by_idx(h_idx);
+      struct vfs_handle *h = udp_bindings[i].handle;
       if (!h || !h->used || h->kind != VFS_HANDLE_SOCKET) {
         udp_bindings[i].used = 0;
         continue;

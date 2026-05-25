@@ -16,6 +16,7 @@
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/filelock.h>
+#include <b1nix/aio.h>
 #include <string.h>
 
 extern struct task *current_task;
@@ -236,10 +237,11 @@ static int copy_to_user(void *dst, const void *src, usize size) {
 }
 
 static isize strncpy_from_user(char *dst, const char *src, usize size) {
-  if (syscall_copyinstr(dst, size, src) == 0) {
+  int rc = syscall_copyinstr(dst, size, src);
+  if (rc == 0) {
     return (isize)strlen(dst);
   }
-  return -EFAULT;
+  return (isize)rc;
 }
 
 static isize sys_read(int fd, void *buf, usize count) {
@@ -879,9 +881,10 @@ static isize sys_open(const char *user_path, int flags) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
     return -ENOMEM;
-  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+  isize path_len = strncpy_from_user(kpath, user_path, VFS_MAX_PATH);
+  if (path_len < 0) {
     kfree(kpath);
-    return -EFAULT;
+    return path_len;
   }
   kpath[VFS_MAX_PATH - 1] = '\0';
 
@@ -951,8 +954,8 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
         fds[i].revents = 0;
         continue;
       }
-      int h_idx = scheduler_fd_get(fds[i].fd);
-      if (h_idx < 0) {
+      struct vfs_handle *h = scheduler_fd_get(fds[i].fd);
+      if (!h) {
         fds[i].revents = B1NIX_POLLNVAL;
         ready++;
         continue;
@@ -1397,7 +1400,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_READ:
     return (u64)sys_read((int)arg0, (void *)(usize)arg1, (usize)arg2);
   case SYS_CLOSE:
-    if (scheduler_fd_get((int)arg0) < 0)
+    if (scheduler_fd_get((int)arg0) == 0)
       return (u64)-EBADF;
     vfs_close((int)arg0);
     return 0;
@@ -1781,6 +1784,14 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     }
     return 0;
   }
+  case SYS_IO_SETUP:
+    return sys_io_setup((u32)arg0, (u64 *)(usize)arg1);
+  case SYS_IO_SUBMIT:
+    return sys_io_submit(arg0, (u32)arg1,
+                         (const struct b1nix_aio_sqe *)(usize)arg2);
+  case SYS_IO_GETEVENTS:
+    return sys_io_getevents(arg0, (u32)arg1, (u32)arg2,
+                            (struct b1nix_aio_cqe *)(usize)arg3, (u32)arg4);
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

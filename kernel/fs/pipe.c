@@ -124,28 +124,26 @@ int vfs_pipe(int pipefd[2]) {
   }
   if (!pipe) return -ENFILE;
 
-  int rfd_h = alloc_raw_handle(VFS_HANDLE_PIPE_READ);
-  if (rfd_h < 0) return -EMFILE;
-  int wfd_h = alloc_raw_handle(VFS_HANDLE_PIPE_WRITE);
-  if (wfd_h < 0) { release_handle(rfd_h); return -EMFILE; }
+  struct vfs_handle *rh = alloc_raw_handle(VFS_HANDLE_PIPE_READ);
+  if (!rh) return -EMFILE;
+  struct vfs_handle *wh = alloc_raw_handle(VFS_HANDLE_PIPE_WRITE);
+  if (!wh) { vfs_handle_release(rh); return -EMFILE; }
 
   memset(pipe, 0, sizeof(*pipe));
   pipe->used = 1;
   pipe->readers = 1;
   pipe->writers = 1;
 
-  struct vfs_handle *rh = get_handle_by_idx(rfd_h);
-  struct vfs_handle *wh = get_handle_by_idx(wfd_h);
   vfs_pipe_init_handle(rh, pipe, 0);
   vfs_pipe_init_handle(wh, pipe, 1);
 
-  pipefd[0] = scheduler_fd_alloc(rfd_h);
-  pipefd[1] = scheduler_fd_alloc(wfd_h);
+  pipefd[0] = scheduler_fd_alloc(rh);
+  pipefd[1] = scheduler_fd_alloc(wh);
   if (pipefd[0] < 0 || pipefd[1] < 0) {
     if (pipefd[0] >= 0) scheduler_fd_close(pipefd[0]);
     if (pipefd[1] >= 0) scheduler_fd_close(pipefd[1]);
-    release_handle(rfd_h);
-    release_handle(wfd_h);
+    vfs_handle_release(rh);
+    vfs_handle_release(wh);
     return -EMFILE;
   }
   return 0;

@@ -5,6 +5,7 @@
 
 #include <b1nix/types.h>
 
+struct vfs_handle;
 struct task;
 struct cred;
 
@@ -77,6 +78,7 @@ struct cpu_context {
 
 #define NSIG 31
 #define SCHED_MAX_FDS 64
+#define SCHED_MAX_FD_LIMIT 1024
 
 /* Signal actions */
 #define SIG_DFL ((void (*)(int))0)
@@ -126,8 +128,9 @@ struct task {
   u64 wake_tick;
   void *wait_chan;
   int stdout_fd;
-  int fd_table[SCHED_MAX_FDS];
-  int fd_flags[SCHED_MAX_FDS];
+  struct vfs_handle **fd_table;
+  int *fd_flags;
+  usize fd_capacity;
   int priority;
   int exit_code;
   usize parent_id;
@@ -147,7 +150,6 @@ struct task {
 
   /* Credentials */
   struct cred *cred;
-
   /* Userspace Image */
   void *user_image;
   u64 pml4_phys;
@@ -177,9 +179,9 @@ void scheduler_dump_tasks(void);
 void scheduler_set_stdout(int fd);
 int scheduler_get_stdout(void);
 void scheduler_fd_table_init_current(void);
-int scheduler_fd_alloc(int handle);
-int scheduler_fd_get(int fd);
-int scheduler_fd_set(int fd, int handle);
+int scheduler_fd_alloc(struct vfs_handle *handle);
+struct vfs_handle *scheduler_fd_get(int fd);
+int scheduler_fd_set(int fd, struct vfs_handle *handle);
 int scheduler_fd_close(int fd);
 int scheduler_fd_flags_get(int fd);
 int scheduler_fd_flags_set(int fd, int flags);

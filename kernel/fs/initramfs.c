@@ -8,6 +8,8 @@
 #include "../../build/x86/initramfs_native_smoke.inc"
 #include "../../build/x86/initramfs_m12_smoke.inc"
 #include "../../build/x86/initramfs_m13_smoke.inc"
+#include "../../build/x86/initramfs_m8_aio_test.inc"
+#include "../../build/x86/initramfs_m17_smoke.inc"
 #include "../../build/x86/initramfs_m14_smoke.inc"
 #include "../../build/x86/initramfs_m15_smoke.inc"
 #include "../../build/x86/initramfs_tcc_files.inc"
@@ -282,6 +284,8 @@ static const char posix_smoke_script[] =
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
     "/bin/m13-smoke --m24 && echo \"M24-SMOKE: ok errno-mapping\" && echo \"M24-SMOKE: ok diagnostics\"\n"
+    "/bin/m17-smoke\n"
+    "/bin/m8-aio-test\n"
     "echo \"M22-POLISH: done\"\n"
     "echo \"POSIX-SMOKE: done\"\n";
 
@@ -299,6 +303,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m13-smoke", (const char *)vfs_m13_smoke_elf,
      sizeof(vfs_m13_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m17-smoke", (const char *)vfs_m17_smoke_elf,
+     sizeof(vfs_m17_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m8-aio-test", (const char *)vfs_m8_aio_test_elf,
+     sizeof(vfs_m8_aio_test_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m13-helper", (const char *)vfs_m13_smoke_elf,
      sizeof(vfs_m13_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m14-smoke", (const char *)vfs_m14_smoke_elf,

@@ -296,6 +296,216 @@ static void dcache_invalidate(struct vfs_node *parent, const char *name) {
   dcache_release();
 }
 
+#define ICACHE_SIZE 128
+#define MAX_ICACHE_ENTRIES 256
+
+struct icache_entry {
+  u32 fs_id;
+  u64 ino;
+  struct vfs_inode *inode;
+  struct icache_entry *next;
+  struct icache_entry *lru_next;
+  struct icache_entry *lru_prev;
+};
+
+static struct icache_entry icache_pool[MAX_ICACHE_ENTRIES];
+static struct icache_entry *icache_free_list = 0;
+static struct icache_entry *icache_buckets[ICACHE_SIZE] = {0};
+static struct icache_entry *icache_lru_head = 0;
+static struct icache_entry *icache_lru_tail = 0;
+static int icache_count = 0;
+static volatile int icache_lock = 0;
+
+static void icache_acquire(void) {
+  while (__atomic_test_and_set(&icache_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+}
+
+static void icache_release(void) {
+  __atomic_clear(&icache_lock, __ATOMIC_RELEASE);
+}
+
+static u32 icache_hash(u32 fs_id, u64 ino) {
+  return (u32)((fs_id * 2654435761ULL + ino) % ICACHE_SIZE);
+}
+
+void icache_init(void) {
+  for (int i = 0; i < MAX_ICACHE_ENTRIES - 1; i++)
+    icache_pool[i].next = &icache_pool[i + 1];
+  icache_pool[MAX_ICACHE_ENTRIES - 1].next = 0;
+  icache_free_list = &icache_pool[0];
+  memset(icache_buckets, 0, sizeof(icache_buckets));
+  icache_lru_head = 0;
+  icache_lru_tail = 0;
+  icache_count = 0;
+}
+
+static struct icache_entry *icache_alloc(void) {
+  if (!icache_free_list)
+    return 0;
+  struct icache_entry *e = icache_free_list;
+  icache_free_list = e->next;
+  memset(e, 0, sizeof(struct icache_entry));
+  return e;
+}
+
+static void icache_free(struct icache_entry *e) {
+  e->next = icache_free_list;
+  icache_free_list = e;
+}
+
+struct vfs_inode *icache_get(u32 fs_id, u64 ino) {
+  if (!fs_id || !ino)
+    return 0;
+  icache_acquire();
+  u32 h = icache_hash(fs_id, ino);
+  struct icache_entry *e = icache_buckets[h];
+  while (e) {
+    if (e->fs_id == fs_id && e->ino == ino) {
+      if (e != icache_lru_head) {
+        if (e == icache_lru_tail)
+          icache_lru_tail = e->lru_prev;
+        if (e->lru_prev)
+          e->lru_prev->lru_next = e->lru_next;
+        if (e->lru_next)
+          e->lru_next->lru_prev = e->lru_prev;
+        e->lru_next = icache_lru_head;
+        e->lru_prev = 0;
+        if (icache_lru_head)
+          icache_lru_head->lru_prev = e;
+        icache_lru_head = e;
+        if (!icache_lru_tail)
+          icache_lru_tail = e;
+      }
+      struct vfs_inode *res = e->inode;
+      icache_release();
+      return res;
+    }
+    e = e->next;
+  }
+  icache_release();
+  return 0;
+}
+
+void icache_insert(u32 fs_id, u64 ino, struct vfs_inode *inode) {
+  if (!fs_id || !ino || !inode)
+    return;
+  icache_acquire();
+  u32 h = icache_hash(fs_id, ino);
+  struct icache_entry *existing = icache_buckets[h];
+  while (existing) {
+    if (existing->fs_id == fs_id && existing->ino == ino) {
+      existing->inode = inode;
+      icache_release();
+      return;
+    }
+    existing = existing->next;
+  }
+
+  if (icache_count >= MAX_ICACHE_ENTRIES) {
+    struct icache_entry *victim = icache_lru_tail;
+    if (victim) {
+      u32 vh = icache_hash(victim->fs_id, victim->ino);
+      struct icache_entry **prev_ptr = &icache_buckets[vh];
+      while (*prev_ptr && *prev_ptr != victim)
+        prev_ptr = &(*prev_ptr)->next;
+      if (*prev_ptr)
+        *prev_ptr = victim->next;
+
+      if (victim == icache_lru_head)
+        icache_lru_head = victim->lru_next;
+      if (victim == icache_lru_tail)
+        icache_lru_tail = victim->lru_prev;
+      if (victim->lru_prev)
+        victim->lru_prev->lru_next = victim->lru_next;
+      if (victim->lru_next)
+        victim->lru_next->lru_prev = victim->lru_prev;
+      icache_free(victim);
+      icache_count--;
+    }
+  }
+
+  struct icache_entry *e = icache_alloc();
+  if (!e) {
+    icache_release();
+    return;
+  }
+  e->fs_id = fs_id;
+  e->ino = ino;
+  e->inode = inode;
+  e->next = icache_buckets[h];
+  icache_buckets[h] = e;
+  e->lru_next = icache_lru_head;
+  e->lru_prev = 0;
+  if (icache_lru_head)
+    icache_lru_head->lru_prev = e;
+  icache_lru_head = e;
+  if (!icache_lru_tail)
+    icache_lru_tail = e;
+  icache_count++;
+  icache_release();
+}
+
+void icache_invalidate(u32 fs_id, u64 ino) {
+  if (!fs_id || !ino)
+    return;
+  icache_acquire();
+  u32 h = icache_hash(fs_id, ino);
+  struct icache_entry **prev_ptr = &icache_buckets[h];
+  struct icache_entry *curr = *prev_ptr;
+  while (curr) {
+    if (curr->fs_id == fs_id && curr->ino == ino) {
+      *prev_ptr = curr->next;
+      if (curr == icache_lru_head)
+        icache_lru_head = curr->lru_next;
+      if (curr == icache_lru_tail)
+        icache_lru_tail = curr->lru_prev;
+      if (curr->lru_prev)
+        curr->lru_prev->lru_next = curr->lru_next;
+      if (curr->lru_next)
+        curr->lru_next->lru_prev = curr->lru_prev;
+      icache_free(curr);
+      icache_count--;
+      icache_release();
+      return;
+    }
+    prev_ptr = &curr->next;
+    curr = *prev_ptr;
+  }
+  icache_release();
+}
+
+void icache_invalidate_fs(u32 fs_id) {
+  if (!fs_id)
+    return;
+  icache_acquire();
+  for (u32 h = 0; h < ICACHE_SIZE; h++) {
+    struct icache_entry **prev_ptr = &icache_buckets[h];
+    struct icache_entry *curr = *prev_ptr;
+    while (curr) {
+      if (curr->fs_id == fs_id) {
+        struct icache_entry *victim = curr;
+        *prev_ptr = curr->next;
+        curr = *prev_ptr;
+        if (victim == icache_lru_head)
+          icache_lru_head = victim->lru_next;
+        if (victim == icache_lru_tail)
+          icache_lru_tail = victim->lru_prev;
+        if (victim->lru_prev)
+          victim->lru_prev->lru_next = victim->lru_next;
+        if (victim->lru_next)
+          victim->lru_next->lru_prev = victim->lru_prev;
+        icache_free(victim);
+        icache_count--;
+      } else {
+        prev_ptr = &curr->next;
+        curr = *prev_ptr;
+      }
+    }
+  }
+  icache_release();
+}
+
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
   while (1) {
     int val = inode->rw_lock;
@@ -821,6 +1031,13 @@ restart_traversal:
     }
 
     vfs_inode_lock_read(child->inode);
+    if (child->inode && child->inode->ino && child->inode->fs_id) {
+      struct vfs_inode *cached =
+          icache_get(child->inode->fs_id, child->inode->ino);
+      if (!cached) {
+        icache_insert(child->inode->fs_id, child->inode->ino, child->inode);
+      }
+    }
     vfs_inode_unlock_read(current->inode);
     vfs_node_put(current);
     current = child;
@@ -1091,50 +1308,24 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
   return add_node(path, type, data, size, flags);
 }
 
-static struct vfs_handle handles[MAX_VFS_HANDLES];
-
-struct vfs_handle *get_handle_by_idx(int idx) {
-  if (idx < 0 || idx >= MAX_VFS_HANDLES)
+struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
+  struct vfs_handle *h = vfs_alloc_handle();
+  if (!h)
     return 0;
-  return &handles[idx];
+  h->used = 1;
+  h->refcount = 1;
+  h->kind = kind;
+  return h;
 }
 
-void vfs_acquire_handle_lock(void) {
-  while (__atomic_test_and_set(&vfs_handle_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
-}
-
-void vfs_release_handle_lock(void) {
-  __atomic_clear(&vfs_handle_lock, __ATOMIC_RELEASE);
-}
-
-int alloc_raw_handle(enum vfs_handle_kind kind) {
-  vfs_acquire_handle_lock();
-  for (usize i = 0; i < MAX_VFS_HANDLES; i++) {
-    if (!handles[i].used) {
-      memset(&handles[i], 0, sizeof(handles[i]));
-      handles[i].used = 1;
-      handles[i].refcount = 1;
-      handles[i].kind = kind;
-      vfs_release_handle_lock();
-      return (int)i;
-    }
-  }
-  vfs_release_handle_lock();
-  return -ENFILE;
-}
-
-void vfs_handle_retain(int handle) {
-  if (handle < 0 || (usize)handle >= MAX_VFS_HANDLES || !handles[handle].used)
+void vfs_handle_retain(struct vfs_handle *h) {
+  if (!h)
     return;
-  handles[handle].refcount++;
+  h->refcount++;
 }
 
 static struct vfs_handle *get_handle(int fd) {
-  int handle = scheduler_fd_get(fd);
-  if (handle < 0 || (usize)handle >= MAX_VFS_HANDLES || !handles[handle].used)
-    return 0;
-  return &handles[handle];
+  return scheduler_fd_get(fd);
 }
 
 static void copy_path(char *dst, usize dst_size, const char *src) {
@@ -1149,31 +1340,22 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
   dst[len] = '\0';
 }
 
-void release_handle(int handle) {
-  if (handle < 0 || (usize)handle >= MAX_VFS_HANDLES || !handles[handle].used)
+void vfs_handle_release(struct vfs_handle *h) {
+  if (!h)
     return;
-  if (handles[handle].refcount > 1) {
-    handles[handle].refcount--;
+  if (h->refcount > 1) {
+    h->refcount--;
     return;
   }
 
-  if (handles[handle].ops && handles[handle].ops->release) {
-    handles[handle].ops->release(&handles[handle]);
-  } else if (handles[handle].kind == VFS_HANDLE_NODE && handles[handle].node) {
-    vfs_node_put(handles[handle].node);
+  if (h->ops && h->ops->release) {
+    h->ops->release(h);
+  } else if (h->kind == VFS_HANDLE_NODE && h->node) {
+    vfs_node_put(h->node);
   }
 
-  handles[handle].used = 0;
-  handles[handle].refcount = 0;
-  handles[handle].kind = VFS_HANDLE_NONE;
-  handles[handle].node = 0;
-  handles[handle].offset = 0;
-  handles[handle].private_data = 0;
-  handles[handle].ops = 0;
-  handles[handle].flags = 0;
+  vfs_free_handle(h);
 }
-
-void vfs_handle_release(int handle) { release_handle(handle); }
 
 static char tty_getc_blocking(void) {
 #ifdef __aarch64__
@@ -1319,8 +1501,8 @@ static void vfs_init_stdio(void) {
 
 void vfs_init(void) {
   dcache_init_pool();
+  icache_init();
   node_count = 0;
-  memset(handles, 0, sizeof(handles));
   memset(mounts, 0, sizeof(mounts));
 
   root_node = alloc_node();
@@ -1375,6 +1557,10 @@ int vfs_open(const char *path) { return vfs_open_flags(path, B1NIX_O_RDONLY); }
 
 int vfs_open_flags(const char *path, int flags) {
   int res = 0;
+  if (!path)
+    return -EINVAL;
+  if (strlen(path) >= VFS_MAX_PATH)
+    return -ENAMETOOLONG;
   char *resolved = kmalloc(VFS_MAX_PATH);
   if (!resolved)
     return -ENOMEM;
@@ -1404,6 +1590,13 @@ int vfs_open_flags(const char *path, int flags) {
       res = -EEXIST;
       vfs_node_put(node);
       goto out;
+    }
+  }
+
+  if (node->inode && node->inode->ino && node->inode->fs_id) {
+    struct vfs_inode *cached = icache_get(node->inode->fs_id, node->inode->ino);
+    if (!cached) {
+      icache_insert(node->inode->fs_id, node->inode->ino, node->inode);
     }
   }
 
@@ -1448,37 +1641,20 @@ int vfs_open_flags(const char *path, int flags) {
     vfs_inode_unlock(node->inode);
   }
 
-  vfs_acquire_handle_lock();
-  int h_idx = -1;
-  for (int i = 0; i < MAX_VFS_HANDLES; i++) {
-    if (!handles[i].used) {
-      h_idx = i;
-      break;
-    }
-  }
-  if (h_idx < 0) {
-    vfs_release_handle_lock();
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
+  if (!h) {
     res = -ENFILE;
     goto out;
   }
-
-  struct vfs_handle *h = &handles[h_idx];
-  memset(h, 0, sizeof(*h));
-  h->used = 1;
-  h->refcount = 1;
-  h->kind = VFS_HANDLE_NODE;
   h->node = node; /* Already has ref from find_node */
   extern const struct vfs_file_ops node_file_ops;
   h->ops = &node_file_ops;
   h->flags = flags;
   h->offset = (flags & B1NIX_O_APPEND) ? node->inode->size : 0;
-  vfs_release_handle_lock();
 
-  int fd = scheduler_fd_alloc(h_idx);
+  int fd = scheduler_fd_alloc(h);
   if (fd < 0) {
-    vfs_acquire_handle_lock();
-    release_handle(h_idx);
-    vfs_release_handle_lock();
+    vfs_handle_release(h);
     res = -EMFILE;
     goto out;
   }
@@ -1744,14 +1920,9 @@ int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
 }
 
 void vfs_close(int fd) {
-  vfs_acquire_handle_lock();
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) {
-    vfs_release_handle_lock();
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h)
     return;
-  }
-  struct vfs_handle *h = &handles[h_idx];
-  vfs_release_handle_lock();
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     int my_pid = current_task ? (int)current_task->id : 0;
@@ -1761,10 +1932,8 @@ void vfs_close(int fd) {
   if (h->ops && h->ops->close)
     h->ops->close(h);
 
-  vfs_acquire_handle_lock();
   scheduler_fd_close(fd);
-  release_handle(h_idx);
-  vfs_release_handle_lock();
+  vfs_handle_release(h);
 }
 
 static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
@@ -2026,6 +2195,12 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
     return -EINVAL;
 
   struct vfs_inode *inode = node->inode;
+  if (inode && inode->ino && inode->fs_id) {
+    struct vfs_inode *cached = icache_get(inode->fs_id, inode->ino);
+    if (!cached) {
+      icache_insert(inode->fs_id, inode->ino, inode);
+    }
+  }
   vfs_inode_lock_read(inode);
   memset(st, 0, sizeof(*st));
   st->st_ino = inode->ino;
@@ -2208,6 +2383,8 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
 
       child->deleted = 1;
       child->inode->nlink--;
+      if (child->inode)
+        icache_invalidate(child->inode->fs_id, child->inode->ino);
       if (prev)
         prev->next_sibling = child->next_sibling;
       else
@@ -2284,6 +2461,8 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
 
   node->deleted = 1;
   node->inode->nlink--;
+  if (node->inode)
+    icache_invalidate(node->inode->fs_id, node->inode->ino);
   dcache_invalidate(parent, name);
 
 out_unlock:
@@ -2624,6 +2803,8 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   node->parent = new_parent;
   node->next_sibling = new_parent->first_child;
   new_parent->first_child = node;
+  if (node->inode)
+    icache_invalidate(node->inode->fs_id, node->inode->ino);
   dcache_invalidate(old_parent, old_n);
   dcache_invalidate(new_parent, new_n);
 
@@ -2654,15 +2835,18 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
+  if (node->inode && node->inode->ino && node->inode->fs_id) {
+    struct vfs_inode *cached = icache_get(node->inode->fs_id, node->inode->ino);
+    if (!cached) {
+      icache_insert(node->inode->fs_id, node->inode->ino, node->inode);
+    }
+  }
   return vfs_stat_node(node, st);
 }
 
 int vfs_fsync(int fd) {
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0)
-    return -EBADF;
-  struct vfs_handle *h = &handles[h_idx];
-  if (!h->used || h->kind != VFS_HANDLE_NODE)
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_NODE)
     return -EBADF;
   struct vfs_node *node = h->node;
 
@@ -2774,6 +2958,7 @@ int vfs_umount(const char *target) {
       mounts[i].used = 0;
       struct vfs_node *root = mounts[i].root_node;
       struct vfs_node *mp = mounts[i].mount_point;
+      u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
       if (root && root->inode && root->inode->blk_dev) {
@@ -2783,6 +2968,7 @@ int vfs_umount(const char *target) {
 
       vfs_node_put(root);
       vfs_node_put(mp);
+      icache_invalidate_fs(fs_id);
       return 0;
     }
   }
@@ -2811,34 +2997,23 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries) {
 
 isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   isize res = 0;
-  vfs_acquire_handle_lock();
-  int h_idx = scheduler_fd_get(fd);
-  if (h_idx < 0) {
-    vfs_release_handle_lock();
-    return -EBADF;
-  }
-  struct vfs_handle *h = &handles[h_idx];
-  if (!h->used || h->kind != VFS_HANDLE_NODE) {
-    vfs_release_handle_lock();
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || h->kind != VFS_HANDLE_NODE) {
     return -EBADF;
   }
   struct vfs_node *dir = h->node;
   if (!dir || dir->inode->type != VFS_DIRECTORY || !buf) {
-    vfs_release_handle_lock();
     return -EINVAL;
   }
 
-  h->refcount++;
+  vfs_handle_retain(h);
   vfs_node_get(dir);
   usize offset = h->offset;
-  vfs_release_handle_lock();
 
   if (dir->inode->readdir_cb) {
     res = dir->inode->readdir_cb(dir, offset, buf, max_entries);
     if (res > 0) {
-      vfs_acquire_handle_lock();
       h->offset += (usize)res;
-      vfs_release_handle_lock();
     }
     goto out;
   }
@@ -2886,16 +3061,12 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     child = child->next_sibling;
   }
 
-  vfs_acquire_handle_lock();
   h->offset = offset;
-  vfs_release_handle_lock();
   res = (isize)count;
 
 out:
   vfs_node_put(dir);
-  vfs_acquire_handle_lock();
-  release_handle(h_idx);
-  vfs_release_handle_lock();
+  vfs_handle_release(h);
   return res;
 }
 
@@ -2910,18 +3081,18 @@ int vfs_sync(void) {
 }
 
 int vfs_dup2(int oldfd, int newfd) {
-  int old_handle = scheduler_fd_get(oldfd);
-  if (old_handle < 0 || (usize)old_handle >= MAX_VFS_HANDLES ||
-      !handles[old_handle].used)
+  struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
+  if (!old_handle)
     return -EBADF;
-  if (newfd < 0 || (usize)newfd >= SCHED_MAX_FDS)
+  if (newfd < 0 || (usize)newfd >= SCHED_MAX_FD_LIMIT)
     return -EBADF;
   if (oldfd == newfd)
     return newfd;
 
-  if (scheduler_fd_get(newfd) >= 0)
+  if (scheduler_fd_get(newfd) != 0)
     vfs_close(newfd);
-  scheduler_fd_set(newfd, old_handle);
+  if (scheduler_fd_set(newfd, old_handle) < 0)
+    return -EMFILE;
   vfs_handle_retain(old_handle);
   return newfd;
 }
@@ -2995,10 +3166,12 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
 }
 
 void vfs_close_on_exec(void) {
-  for (int fd = 0; fd < SCHED_MAX_FDS; fd++) {
-    int flags = scheduler_fd_flags_get(fd);
+  if (!current_task)
+    return;
+  for (usize i = 0; i < current_task->fd_capacity; i++) {
+    int flags = scheduler_fd_flags_get((int)i);
     if (flags >= 0 && (flags & B1NIX_FD_CLOEXEC) != 0) {
-      vfs_close(fd);
+      vfs_close((int)i);
     }
   }
 }

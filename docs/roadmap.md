@@ -140,10 +140,10 @@ and broader utility flag compatibility.
 - [x] `done` Add ext3 metadata ordering hardening for `unlink`/`rmdir`/`rename` path with journal transaction grouping and inode timestamp updates.
 - [x] `done` Formalize VFS node refcounting rules: enforce that all functions returning a VFS node MUST increment its refcount, and callers are strictly responsible for decref to prevent memory leaks during lookup paths.
 - [x] `done` Implement a Unified Page Cache bridging VM pages and VFS file operations (enabling shared coherent memory-mapped files via `MAP_SHARED`).
-- [ ] `planned` Add a dedicated `icache` (inode cache) to cache file system specific inodes and optimize `dcache` size/lookup performance.
-- [ ] `planned` Transition VFS synchronization from global spinlocks to fine-grained per-directory lock hierarchies to prepare for SMP scaling.
-- [ ] `planned` Replace the global fixed-size descriptor table (`MAX_VFS_HANDLES`) with per-process dynamic descriptor tables to improve resource limits.
-- [ ] `planned` Support asynchronous I/O interfaces (AIO / completion queues) at the VFS layer for non-blocking file read/write operations.
+- [x] `done` Add a dedicated `icache` (inode cache) to cache file system specific inodes and optimize `dcache` size/lookup performance.
+- [x] `done` Transition VFS synchronization from global spinlocks to fine-grained per-directory lock hierarchies to prepare for SMP scaling (parent directory inode write-lock held across create/unlink/mkdir/rmdir/rename; per-inode rw_lock with reader/writer semantics for file data).
+- [x] `done` Replace the global fixed-size descriptor table (`MAX_VFS_HANDLES`) with per-process dynamic descriptor tables to improve resource limits (slab-allocated refcounted `vfs_handle *`, per-process growth to 1024 FDs).
+- [x] `done` Support asynchronous I/O interfaces (AIO / completion queues) at the VFS layer for non-blocking file read/write operations via io_setup/io_submit/io_getevents, per-task completion queues, a lazy kernel worker, VFS handle retention, and bounce-buffered read/write smoke coverage.
 
 ## M9: Hardware Drivers
 
@@ -270,7 +270,7 @@ and broader utility flag compatibility.
 - [ ] `planned` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`) and GNU Make.
 - [ ] `planned` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC.
 - [ ] `planned` Restructure syscall layers to strictly decouple generic VFS traversal from file-system specific logic, enforcing explicit `refcount` tracking on every descriptor lifecycle step.
-- [ ] `planned` Formalize expected `errno` matrices for failed file operations, explicitly validating edge cases like `ELOOP`, `ENAMETOOLONG`, and `EACCES` propagation.
+- [x] `done` Formalize expected `errno` matrices for failed file operations, explicitly validating ELOOP (symlink depth), ENAMETOOLONG (path component limit), ENOTDIR (file-as-dir), EISDIR (write to dir), EROFS, and errno isolation across syscalls via /bin/m17-smoke smoke coverage.
 
 ## M18: Real Userspace and ELF Loader
 
@@ -379,7 +379,7 @@ and broader utility flag compatibility.
 - [x] `done` Define the B1NIX userspace ELF ABI and calling convention.
 - [x] `done` Add `crt0.o` startup code for B1NIX userspace programs.
 - [x] `done` Add a userspace linker script for B1NIX ELF binaries.
-- [x] `initial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; several POSIX-facing APIs are still stubs/incomplete.
+- [x] `partial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; `qsort` (O(N log N) quicksort), `strtol`, and `strtod` are now complete; several POSIX-facing APIs are still stubs/incomplete.
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] `done` Build and run a VFS-loaded native smoke ELF program.
 - [x] `done` Build and run a VFS-loaded `hello.c` ELF program.

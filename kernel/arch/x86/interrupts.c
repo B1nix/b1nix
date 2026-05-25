@@ -303,8 +303,11 @@ void x86_exception_handler(struct interrupt_frame *frame) {
   console_write("\nrip:    0x");
   console_write_hex64(frame->rip);
   if (frame->vector == 14) {
+    u64 cr2_val = read_cr2();
     console_write("\ncr2:    0x");
-    console_write_hex64(read_cr2());
+    console_write_hex64(cr2_val);
+    console_write("\n");
+    paging_dump_entries(cr2_val);
   }
   console_write("\ncs:     0x");
   console_write_hex64(frame->cs);

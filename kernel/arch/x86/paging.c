@@ -732,3 +732,25 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   }
   return 0;
 }
+
+void paging_dump_entries(u64 virtual_address) {
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(virtual_address)];
+  console_write("PML4E for "); console_write_hex64(virtual_address); console_write(": 0x"); console_write_hex64(pml4e); console_write("\n");
+  if (!(pml4e & VMM_PRESENT)) return;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(virtual_address)];
+  console_write("  PDPTE: 0x"); console_write_hex64(pdpte); console_write("\n");
+  if (!(pdpte & VMM_PRESENT)) return;
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(virtual_address)];
+  console_write("  PDE:   0x"); console_write_hex64(pde); console_write("\n");
+  if (!(pde & VMM_PRESENT)) return;
+
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(virtual_address)];
+  console_write("  PTE:   0x"); console_write_hex64(pte); console_write("\n");
+}
+

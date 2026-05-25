@@ -79,30 +79,62 @@ void *realloc(void *ptr, size_t size)
 {
 	if (size == 0) { free(ptr); return NULL; }
 	if (!ptr) return malloc(size);
-	// Basic realloc: allocate new, copy old (assume conservative size), free old
-	// Since we don't know the old size and have a bump allocator, we will copy size bytes...
-	// Wait, we can't safely copy size bytes if it's larger than old size.
-	// Let's copy 1024 bytes or size, whichever is smaller.
-	// Actually, a simple workaround is just to copy "size" bytes because bump allocator
-	// memory is contiguous and readable, but it might read garbage.
 	void *new_ptr = malloc(size);
 	if (new_ptr) {
-		memcpy(new_ptr, ptr, size); // Might copy some garbage, but safe in our heap
-		free(ptr);
+		size_t safe_copy = size;
+		if ((char *)ptr + safe_copy > heap + HEAP_SIZE) {
+			safe_copy = (heap + HEAP_SIZE) - (char *)ptr;
+		}
+		memcpy(new_ptr, ptr, safe_copy);
 	}
 	return new_ptr;
 }
 
 long strtol(const char *nptr, char **endptr, int base)
 {
-	(void)base; // Ignoring base for now, assume 10
-	long val = atoi(nptr);
-	if (endptr) {
-		while (*nptr == ' ' || *nptr == '-' || *nptr == '+') nptr++;
-		while (*nptr >= '0' && *nptr <= '9') nptr++;
-		*endptr = (char *)nptr;
+	const char *s = nptr;
+	long acc = 0;
+	int sign = 1;
+	while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r') s++;
+	if (*s == '-') { sign = -1; s++; }
+	else if (*s == '+') s++;
+
+	if (base == 0) {
+		if (*s == '0') {
+			if (s[1] == 'x' || s[1] == 'X') {
+				base = 16;
+				s += 2;
+			} else {
+				base = 8;
+				s++;
+			}
+		} else {
+			base = 10;
+		}
+	} else if (base == 16) {
+		if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
+	} else if (base == 8) {
+		if (s[0] == '0') s++;
 	}
-	return val;
+
+	if (base == 0) base = 10;
+
+	int any = 0;
+	while (*s) {
+		int v;
+		if (*s >= '0' && *s <= '9') v = *s - '0';
+		else if (*s >= 'a' && *s <= 'z') v = *s - 'a' + 10;
+		else if (*s >= 'A' && *s <= 'Z') v = *s - 'A' + 10;
+		else break;
+
+		if (v >= base) break;
+		acc = acc * base + v;
+		any = 1;
+		s++;
+	}
+
+	if (endptr) *endptr = (char *)(any ? s : nptr);
+	return acc * sign;
 }
 
 unsigned long strtoul(const char *nptr, char **endptr, int base)
@@ -115,28 +147,57 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base)
 	return (unsigned long long)strtol(nptr, endptr, base);
 }
 
+static void swap(char *a, char *b, size_t size) {
+    char tmp;
+    for (size_t i = 0; i < size; i++) {
+        tmp = a[i];
+        a[i] = b[i];
+        b[i] = tmp;
+    }
+}
+
+static void quicksort(char *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
+    if (nmemb < 2) return;
+    
+    char *pivot = base + (nmemb / 2) * size;
+    swap(pivot, base + (nmemb - 1) * size, size);
+    
+    size_t i = 0;
+    for (size_t j = 0; j < nmemb - 1; j++) {
+        if (compar(base + j * size, base + (nmemb - 1) * size) < 0) {
+            if (i != j) swap(base + i * size, base + j * size, size);
+            i++;
+        }
+    }
+    swap(base + i * size, base + (nmemb - 1) * size, size);
+    
+    if (i > 0) quicksort(base, i, size, compar);
+    if (i + 1 < nmemb) quicksort(base + (i + 1) * size, nmemb - i - 1, size, compar);
+}
+
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *))
 {
-	// Minimal bubble sort for TCC stub
-	if (nmemb < 2) return;
-	char *arr = (char *)base;
-	char *tmp = malloc(size);
-	if (!tmp) return;
-	for (size_t i = 0; i < nmemb - 1; i++) {
-		for (size_t j = 0; j < nmemb - i - 1; j++) {
-			if (compar(arr + j * size, arr + (j + 1) * size) > 0) {
-				memcpy(tmp, arr + j * size, size);
-				memcpy(arr + j * size, arr + (j + 1) * size, size);
-				memcpy(arr + (j + 1) * size, tmp, size);
-			}
-		}
-	}
-	free(tmp);
+    if (nmemb < 2 || size == 0) return;
+    quicksort((char *)base, nmemb, size, compar);
 }
 
 double strtod(const char *nptr, char **endptr)
 {
-	if (endptr) *endptr = (char *)nptr;
+	const char *s = nptr;
+	while (*s == ' ' || *s == '\t') s++;
+	if (*s == '-' || *s == '+') s++;
+	int any = 0;
+	while (*s >= '0' && *s <= '9') { s++; any = 1; }
+	if (*s == '.') {
+		s++;
+		while (*s >= '0' && *s <= '9') { s++; any = 1; }
+	}
+	if (any && (*s == 'e' || *s == 'E' || *s == 'p' || *s == 'P')) {
+		s++;
+		if (*s == '-' || *s == '+') s++;
+		while (*s >= '0' && *s <= '9') s++;
+	}
+	if (endptr) *endptr = (char *)(any ? s : nptr);
 	return 0.0;
 }
 
@@ -260,10 +321,3 @@ int sem_destroy(int *sem) {
   (void)sem;
   return 0;
 }
-
-
-
-
-
-
-

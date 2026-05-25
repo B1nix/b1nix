@@ -108,6 +108,13 @@ struct vfs_inode {
   int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
 };
 
+/* Inode cache API */
+void icache_init(void);
+struct vfs_inode *icache_get(u32 fs_id, u64 ino);
+void icache_insert(u32 fs_id, u64 ino, struct vfs_inode *inode);
+void icache_invalidate(u32 fs_id, u64 ino);
+void icache_invalidate_fs(u32 fs_id);
+
 struct vfs_node {
   char name[64];
   struct vfs_inode *inode;
@@ -218,7 +225,6 @@ struct vfs_file_ops {
 };
 
 #define MAX_VFS_NODES 4096
-#define MAX_VFS_HANDLES 512
 #define MAX_VFS_PIPES 64
 #define MAX_MOUNTS 16
 #define PIPE_BUFFER_SIZE 512
@@ -269,9 +275,9 @@ struct vfs_handle {
 };
 
 /* Internal handle management for subsystems */
-int alloc_raw_handle(enum vfs_handle_kind kind);
-struct vfs_handle *get_handle_by_idx(int idx);
-void release_handle(int idx);
+struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind);
+void vfs_handle_retain(struct vfs_handle *h);
+void vfs_handle_release(struct vfs_handle *h);
 
 extern const struct vfs_file_ops node_file_ops;
 extern const struct vfs_file_ops pipe_read_ops;
@@ -280,11 +286,14 @@ extern const struct vfs_file_ops socket_file_ops;
 
 struct vfs_pipe;
 struct vfs_socket_state;
+struct task;
+struct b1nix_aio_sqe;
 
 /* Internal handle initialization helpers (called from subsystems) */
 void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe,
                           int is_write);
 void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state);
+int vfs_submit_aio(struct task *owner, const struct b1nix_aio_sqe *sqe);
 
 /* SLAB-style allocator for VFS structures (Phase 4) */
 struct vfs_node *vfs_alloc_node(void);

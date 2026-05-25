@@ -67,10 +67,16 @@ void kheap_use_direct_map(void) {
   return;
 }
 
+void kheap_validate(const char *func) {
+  (void)func;
+}
+
 void *kmalloc(usize size) {
   if (size == 0) {
     return 0;
   }
+
+  kheap_validate("kmalloc_start");
 
   size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
@@ -103,6 +109,7 @@ void *kmalloc(usize size) {
   block->size = size;
   block->next = 0;
   block->magic = KHEAP_MAGIC;
+  
   return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
 }
 
@@ -126,6 +133,9 @@ void kfree(void *ptr) {
     if (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end)
       return;
   }
+  
+  kheap_validate("kfree_start");
+
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
   if (block->magic != KHEAP_MAGIC)
@@ -135,4 +145,7 @@ void kfree(void *ptr) {
   block->magic = KHEAP_FREED_MAGIC;
   block->next = free_list;
   free_list = block;
+  
+  kheap_validate("kfree_end");
 }
+
