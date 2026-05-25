@@ -1,6 +1,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/sched.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -27,6 +28,23 @@ static void blk_scan_partitions(struct block_device *dev);
 
 static struct block_buffer block_cache[CACHE_ENTRIES];
 static u32 bcache_tick = 0;
+static volatile int bcache_lock = 0;
+static volatile int bcache_lock_held = 0;
+
+static void bcache_acquire(void) {
+  while (__atomic_test_and_set(&bcache_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  __atomic_store_n(&bcache_lock_held, 1, __ATOMIC_RELEASE);
+}
+
+static void bcache_release(void) {
+  __atomic_store_n(&bcache_lock_held, 0, __ATOMIC_RELEASE);
+  __atomic_clear(&bcache_lock, __ATOMIC_RELEASE);
+}
+
+int blk_cache_lock_is_held(void) {
+  return __atomic_load_n(&bcache_lock_held, __ATOMIC_ACQUIRE);
+}
 
 static u32 le32(const u8 *p) {
   return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
@@ -289,14 +307,17 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   u8 *buf8 = (u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
+    bcache_acquire();
     struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (entry) {
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
+      bcache_release();
     } else {
       entry = bcache_evict();
       entry->bdev = dev;
       entry->block_no = current_lba;
+      bcache_release();
       if (dev->read_blocks(dev, current_lba, 1, entry->data) < 0) {
         console_write("blk_read_cached: read_blocks failed for ");
         console_write(dev->name);
@@ -304,10 +325,12 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         console_write("\n");
         return -1;
       }
+      bcache_acquire();
       entry->flags |= BLK_CACHE_VALID;
       entry->flags &= ~BLK_CACHE_DIRTY;
       entry->last_used = ++bcache_tick;
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
+      bcache_release();
     }
   }
   return 0;
@@ -327,6 +350,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   const u8 *buf8 = (const u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
+    bcache_acquire();
     struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (!entry) {
@@ -341,6 +365,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
 
     /* Write-Back: Mark as dirty, DO NOT write to disk immediately */
     entry->flags |= BLK_CACHE_DIRTY;
+    bcache_release();
   }
   return 0;
 }
@@ -358,9 +383,14 @@ void blk_flush_buffer(struct block_buffer *buf) {
 
 void blk_sync_all(void) {
   for (int i = 0; i < CACHE_ENTRIES; i++) {
+    bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
-      blk_flush_buffer(&block_cache[i]);
+      struct block_buffer *buf = &block_cache[i];
+      bcache_release();
+      blk_flush_buffer(buf);
+      continue;
     }
+    bcache_release();
   }
 }
 
@@ -373,22 +403,32 @@ void blk_cache_flush(struct block_device *dev) {
     return;
 
   for (int i = 0; i < CACHE_ENTRIES; i++) {
+    bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
-      blk_flush_buffer(&block_cache[i]);
+      struct block_buffer *buf = &block_cache[i];
+      bcache_release();
+      blk_flush_buffer(buf);
+      continue;
     }
+    bcache_release();
   }
 }
 
 void blk_cache_invalidate(struct block_device *dev) {
   if (!dev) return;
   for (int i = 0; i < CACHE_ENTRIES; i++) {
+    bcache_acquire();
     if (block_cache[i].bdev == dev) {
       if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
-        blk_flush_buffer(&block_cache[i]);
+        struct block_buffer *buf = &block_cache[i];
+        bcache_release();
+        blk_flush_buffer(buf);
+        bcache_acquire();
       }
       block_cache[i].flags = 0;
       block_cache[i].bdev = 0;
       block_cache[i].block_no = 0;
     }
+    bcache_release();
   }
 }

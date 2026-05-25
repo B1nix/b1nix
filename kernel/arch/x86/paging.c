@@ -638,7 +638,7 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
       u64 frame = entry & PAGE_ENTRY_ADDRESS_MASK;
 
       if (entry & VMM_USER) {
-        if (entry & VMM_WRITABLE) {
+        if ((entry & VMM_WRITABLE) && !(entry & VMM_SHARED)) {
           // Mark both as Read-Only for CoW
           entry &= ~VMM_WRITABLE;
           entry |= VMM_COW;

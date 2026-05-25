@@ -8,9 +8,16 @@
 #include <unistd.h>
 #include <errno.h>
 
+static int normalize_errno(long rc) {
+  int e = (int)(-rc);
+  if (e >= EPERM && e <= ERANGE)
+    return e;
+  return EIO;
+}
+
 static inline int _check_err(long rc) {
   if (rc < 0) {
-    errno = (int)-rc;
+    errno = normalize_errno(rc);
     return -1;
   }
   return (int)rc;
@@ -58,7 +65,7 @@ int mprotect(void *addr, size_t len, int prot) {
 long lseek(int fd, long offset, int whence) {
   long rc = syscall(SYS_LSEEK, fd, offset, whence);
   if (rc < 0) {
-    errno = (int)-rc;
+    errno = normalize_errno(rc);
     return -1;
   }
   return rc;
@@ -189,7 +196,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd,
            long offset) {
   long rc = syscall(SYS_MMAP, addr, length, prot, flags, fd, offset);
   if (rc < 0) {
-    errno = (int)-rc;
+    errno = normalize_errno(rc);
     return (void *)-1;
   }
   return (void *)rc;
@@ -214,7 +221,7 @@ int connect(int fd, const void *addr, size_t addrlen) {
 long send(int fd, const void *buf, size_t len, int flags) {
   long rc = syscall(SYS_SEND, fd, buf, len, flags);
   if (rc < 0) {
-    errno = (int)-rc;
+    errno = normalize_errno(rc);
     return -1;
   }
   return rc;
@@ -223,7 +230,7 @@ long send(int fd, const void *buf, size_t len, int flags) {
 long recv(int fd, void *buf, size_t len, int flags) {
   long rc = syscall(SYS_RECV, fd, buf, len, flags);
   if (rc < 0) {
-    errno = (int)-rc;
+    errno = normalize_errno(rc);
     return -1;
   }
   return rc;
@@ -248,9 +255,13 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
     ticks = 1;
   }
   long rc = syscall(SYS_SLEEP, ticks);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
   if (rem) {
     rem->tv_sec = 0;
     rem->tv_nsec = 0;
   }
-  return (int)rc;
+  return 0;
 }

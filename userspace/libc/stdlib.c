@@ -3,6 +3,13 @@
 #include "syscall.h"
 #include <errno.h>
 
+static int normalize_errno(long rc) {
+	int e = (int)(-rc);
+	if (e >= EPERM && e <= ERANGE)
+		return e;
+	return EIO;
+}
+
 void exit(int status)
 {
 	syscall(SYS_EXIT, status, 0, 0, 0);
@@ -271,7 +278,7 @@ int sigaddset(sigset_t *set, int signum) {
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
   if (rc < 0) {
-    errno = -rc;
+    errno = normalize_errno(rc);
     return -1;
   }
   return 0;
@@ -299,7 +306,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	}
 	int rc = (int)syscall(SYS_SIGNAL, signum, (long)act, (long)oldact, 0);
 	if (rc < 0) {
-		errno = -rc;
+		errno = normalize_errno(rc);
 		return -1;
 	}
 	return rc;

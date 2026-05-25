@@ -67,6 +67,9 @@
 #define EALREADY        114 /* Operation already in progress */
 #define EINPROGRESS     115 /* Operation now in progress */
 
+/* Internal kernel errors */
+#define ERESTARTSYS     512 /* Restart system call */
+
 /* Helper: convert negative error to -errno */
 #define ERR_PTR(err) ((void *)(isize)(err))
 #define PTR_ERR(ptr) ((int)(isize)(ptr))

@@ -141,13 +141,18 @@ static int copy_string_vector(const char **src, int max_count,
   return 0;
 }
 
-static void user_stack_push_u64(char *stack, usize *sp, u64 value) {
+static int user_stack_push_u64(char *stack, usize *sp, u64 value) {
+  if (*sp < sizeof(u64))
+    return -1;
   *sp -= sizeof(u64);
   memcpy(stack + *sp, &value, sizeof(value));
+  return 0;
 }
 
 static u64 user_stack_push_string(char *stack, usize *sp, const char *text) {
   usize len = strlen(text) + 1;
+  if (*sp < len)
+    return 0; // Return 0 to indicate error (0 is never a valid user pointer for strings)
   *sp -= len;
   memcpy(stack + *sp, text, len);
   return USER_STACK_TOP - USER_STACK_SIZE + *sp;
@@ -164,6 +169,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 
   for (int i = image->argc - 1; i >= 0; i--) {
     argv_ptrs[i] = user_stack_push_string(stack, &sp, image->argv[i]);
+    if (argv_ptrs[i] == 0) return -1;
   }
 
   int envc = 0;
@@ -173,6 +179,7 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   }
   for (int i = envc - 1; i >= 0; i--) {
     envp_ptrs[i] = user_stack_push_string(stack, &sp, image->envp[i]);
+    if (envp_ptrs[i] == 0) return -1;
   }
 
   sp &= ~(usize)0xf;
@@ -184,30 +191,28 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    */
   usize total_slots = 8 + (usize)image->argc + (usize)envc;
   if (total_slots % 2 != 0) {
-    user_stack_push_u64(stack, &sp, 0);
+    if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
   }
 
-  user_stack_push_u64(stack, &sp, 0); /* AT_NULL */
-  user_stack_push_u64(stack, &sp, 9); /* AT_ENTRY */
-  user_stack_push_u64(stack, &sp, image->entry);
-  user_stack_push_u64(stack, &sp,
-                      3); /* AT_PHDR */
-  user_stack_push_u64(stack, &sp, 0);
+  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1; /* AT_NULL */
+  if (user_stack_push_u64(stack, &sp, 9) < 0) return -1; /* AT_ENTRY */
+  if (user_stack_push_u64(stack, &sp, image->entry) < 0) return -1;
+  if (user_stack_push_u64(stack, &sp, 3) < 0) return -1; /* AT_PHDR */
+  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
 
-  user_stack_push_u64(stack, &sp, 0);
+  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
-    user_stack_push_u64(stack, &sp, envp_ptrs[i]);
+    if (user_stack_push_u64(stack, &sp, envp_ptrs[i]) < 0) return -1;
   }
 
-  user_stack_push_u64(stack, &sp, 0);
+  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
   for (int i = image->argc - 1; i >= 0; i--) {
-    user_stack_push_u64(stack, &sp, argv_ptrs[i]);
+    if (user_stack_push_u64(stack, &sp, argv_ptrs[i]) < 0) return -1;
   }
-  user_stack_push_u64(stack, &sp, (u64)image->argc);
+  if (user_stack_push_u64(stack, &sp, (u64)image->argc) < 0) return -1;
 
   image->address_space.stack_base = USER_STACK_TOP - USER_STACK_SIZE + sp;
-  image->address_space.stack_size =
-      USER_STACK_TOP - image->address_space.stack_base;
+  image->address_space.stack_size = USER_STACK_TOP - image->address_space.stack_base;
   return 0;
 }
 
@@ -313,8 +318,14 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       kfree(file_data);
       return -1;
     }
-    if (phdr->p_offset + phdr->p_filesz > file_size ||
+    if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
+        phdr->p_offset + phdr->p_filesz > file_size ||
         phdr->p_filesz > phdr->p_memsz) {
+      kfree(file_data);
+      return -1;
+    }
+    if (phdr->p_vaddr + phdr->p_memsz < phdr->p_vaddr ||
+        phdr->p_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL) {
       kfree(file_data);
       return -1;
     }
@@ -396,6 +407,7 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (copy_string_vector(argv, USER_MAX_ARGS, &image->argv, &image->argc,
                          argv_is_user) != 0) {
     console_write("user_load_image: copy_string_vector argv failed\n");
+    user_image_free(image);
     return 0;
   }
   if (argc > 0 && image->argc > argc)
@@ -403,6 +415,7 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (copy_string_vector(envp, USER_MAX_ENVS, &image->envp, 0,
                          envp_is_user) != 0) {
     console_write("user_load_image: copy_string_vector envp failed\n");
+    user_image_free(image);
     return 0;
   }
 
@@ -416,6 +429,7 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (user_load_elf64(image, path) == 0) {
     if (user_build_initial_stack(image) != 0) {
       console_write("user_load_image: user_build_initial_stack ELF64 failed\n");
+      user_image_free(image);
       return 0;
     }
     return image;
@@ -429,12 +443,14 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     image->address_space = user_address_space_create();
     if (user_build_initial_stack(image) != 0) {
       console_write("user_load_image: user_build_initial_stack BUILTIN failed\n");
+      user_image_free(image);
       return 0;
     }
     return image;
   }
 
   console_write("user_load_image: failed to load\n");
+  user_image_free(image);
   return 0;
 }
 
@@ -621,7 +637,18 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
 
 
-  x86_user_jump(image->entry, image->address_space.stack_base, (u64)image->argc,
+  if ((image->address_space.stack_base & 0xFULL) != 0) {
+    console_write("user: reject unaligned ring3 stack\n");
+    return -1;
+  }
+  if (image->entry >= 0x0000800000000000ULL ||
+      image->address_space.stack_base >= 0x0000800000000000ULL) {
+    console_write("user: reject non-canonical ring3 frame\n");
+    return -1;
+  }
+
+  x86_user_jump(image->entry, image->address_space.stack_base,
+                (u64)image->argc,
                 image->address_space.stack_base + sizeof(u64));
 
   return 0; // Should not reach here
@@ -713,6 +740,11 @@ int user_execve_current(const char *path, const char **argv,
     vfs_node_put(node);
     return -EACCES;
   }
+
+  u16 file_mode = node->inode->mode;
+  u16 file_uid = node->inode->uid;
+  u16 file_gid = node->inode->gid;
+
   vfs_node_put(node);
 
   struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
@@ -720,6 +752,16 @@ int user_execve_current(const char *path, const char **argv,
     return -1;
 
   vfs_close_on_exec();
+
+  /* POSIX: Apply SUID/SGID bits */
+  if (file_mode & 04000) { /* S_ISUID */
+    current_task->cred->euid = file_uid;
+    current_task->cred->suid = file_uid;
+  }
+  if (file_mode & 02000) { /* S_ISGID */
+    current_task->cred->egid = file_gid;
+    current_task->cred->sgid = file_gid;
+  }
 
   // POSIX: Reset caught signals to default action across execve.
   // Ignored signals (SIG_IGN) remain ignored.

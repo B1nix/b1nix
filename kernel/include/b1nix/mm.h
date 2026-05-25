@@ -13,6 +13,7 @@
 #define VMM_USER (1ULL << 2)
 #define VMM_ACCESSED (1ULL << 5)
 #define VMM_DIRTY (1ULL << 6)
+#define VMM_SHARED (1ULL << 8)
 #define VMM_PWT (1ULL << 3)
 #define VMM_PCD (1ULL << 4)
 #define VMM_NO_EXECUTE (1ULL << 63)

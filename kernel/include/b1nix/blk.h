@@ -36,5 +36,6 @@ void blk_cache_flush(struct block_device *dev);
 void blk_flush_buffer(struct block_buffer *buf);
 void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
+int blk_cache_lock_is_held(void);
 
 #endif

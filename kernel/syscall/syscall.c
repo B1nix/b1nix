@@ -476,6 +476,20 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
   return (u64)vfs_ioctl(fd, request, arg);
 }
 
+static int user_frame_is_valid(const struct interrupt_frame *frame) {
+  if (!frame)
+    return 1;
+  if (frame->cs != 0x1B || frame->ss != 0x23)
+    return 0;
+  if (frame->rip >= 0x0000800000000000ULL ||
+      frame->rsp >= 0x0000800000000000ULL)
+    return 0;
+  /* SysV ABI: stack pointer is 16-byte aligned at Ring 3 transfer points. */
+  if ((frame->rsp & 0xFULL) != 0)
+    return 0;
+  return 1;
+}
+
 static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   if (!status)
     return (u64)-EFAULT;
@@ -1612,12 +1626,29 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     struct mqueue *mq = mqueue_create(name);
     return mq ? (u64)(usize)mq : (u64)-ENOMEM;
   }
-  case SYS_MQ_SEND:
-    return (u64)mqueue_send((struct mqueue *)(usize)arg0,
-                            (const void *)(usize)arg1, (u32)arg2);
-  case SYS_MQ_RECEIVE:
-    return (u64)mqueue_receive((struct mqueue *)(usize)arg0,
-                               (void *)(usize)arg1, (u32 *)(usize)arg2);
+  case SYS_MQ_SEND: {
+    u32 len = (u32)arg2;
+    if (len > 256) /* MQ_MAX_MSG_SIZE */
+      return (u64)-EINVAL;
+    char kbuf[256];
+    if (len > 0) {
+      if (syscall_copyin(kbuf, (const void *)(usize)arg1, len) != 0)
+        return (u64)-EFAULT;
+    }
+    return (u64)mqueue_send((struct mqueue *)(usize)arg0, kbuf, len);
+  }
+  case SYS_MQ_RECEIVE: {
+    char kbuf[256];
+    u32 klen = 0;
+    int ret = mqueue_receive((struct mqueue *)(usize)arg0, kbuf, &klen);
+    if (ret == 0) {
+      if (arg2 && syscall_copyout((void *)(usize)arg2, &klen, sizeof(u32)) != 0)
+        return (u64)-EFAULT;
+      if (arg1 && klen > 0 && syscall_copyout((void *)(usize)arg1, kbuf, klen) != 0)
+        return (u64)-EFAULT;
+    }
+    return (u64)ret;
+  }
   case SYS_MQ_CLOSE:
     mqueue_close((struct mqueue *)(usize)arg0);
     return 0;
@@ -1633,8 +1664,21 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)(usize)shmat((int)arg0, (const void *)(usize)arg1, (int)arg2);
   case SYS_SHMDT:
     return (u64)shmdt((const void *)(usize)arg0);
-  case SYS_SHMCTL:
-    return (u64)shmctl((int)arg0, (int)arg1, (struct shmid_ds *)(usize)arg2);
+  case SYS_SHMCTL: {
+    int shmid = (int)arg0;
+    int cmd = (int)arg1;
+    struct shmid_ds kds;
+    if (cmd == 2 /* IPC_SET */ && arg2) {
+      if (syscall_copyin(&kds, (const void *)(usize)arg2, sizeof(kds)) != 0)
+        return (u64)-EFAULT;
+    }
+    int ret = shmctl(shmid, cmd, arg2 ? &kds : 0);
+    if (ret == 0 && cmd == 1 /* IPC_STAT */ && arg2) {
+      if (syscall_copyout((void *)(usize)arg2, &kds, sizeof(kds)) != 0)
+        return (u64)-EFAULT;
+    }
+    return (u64)ret;
+  }
   case SYS_SOCKET:
     return (u64)vfs_socket((int)arg0, (int)arg1, (int)arg2);
   case SYS_BIND:
@@ -1831,6 +1875,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   /* Check for pending signals before returning to userspace */
   if (frame) {
     arch_check_and_deliver_signals(frame);
+    if (!user_frame_is_valid(frame)) {
+      scheduler_exit_current(-SIGSEGV);
+      return (u64)-EFAULT;
+    }
   }
 
   return ret;

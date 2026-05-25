@@ -157,6 +157,41 @@ int main(void) {
     marker("M17-SMOKE: ok errno-isolation");
   }
 
+  /* Test 7: dup2 smoke */
+  {
+    errno = 0;
+    long fd = sys_call(SYS_OPEN, (long)"/tmp/m17_dup2_test",
+                       O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (fd < 0) {
+      fail_marker("dup2-setup", errno, 0);
+      return 1;
+    }
+    long str_len = 13;
+    sys_call(SYS_WRITE, fd, (long)"hello b1nix\n", str_len);
+    sys_call(SYS_LSEEK, fd, 0, SEEK_SET);
+
+    /* dup2 to fd 100 */
+    long dup_fd = 100;
+    long rc = sys_call(SYS_DUP2, fd, dup_fd, 0);
+    if (rc != dup_fd) {
+      fail_marker("dup2", errno, 0);
+      return 1;
+    }
+
+    char buf[16];
+    memset(buf, 0, sizeof(buf));
+    long n = sys_call(SYS_READ, dup_fd, (long)buf, sizeof(buf));
+    if (n != str_len || strcmp(buf, "hello b1nix\n") != 0) {
+      fail_marker("dup2-read", 0, 0);
+      return 1;
+    }
+
+    sys_call(SYS_CLOSE, fd, 0, 0);
+    sys_call(SYS_CLOSE, dup_fd, 0, 0);
+    sys_call(SYS_UNLINK, (long)"/tmp/m17_dup2_test", 0, 0);
+    marker("M17-SMOKE: ok dup2");
+  }
+
   marker("M17-SMOKE: done");
   return 0;
 }

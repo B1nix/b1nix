@@ -174,17 +174,44 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     int slot = find_proc_attach_slot(pa);
     if (slot < 0) return (void *)-1; /* Too many attachments */
 
-    /* Find a free virtual address for mapping
-     * Use a dedicated region: 0x70000000 + shmid * 0x100000
-     * This is a simple approach for a kernel-only mapping */
-    u64 vaddr = 0x70000000ULL + (shmid * 0x100000ULL);
+    /* Find a free virtual address for mapping */
+    u64 vaddr = vm_find_free_area(current_task, seg->page_count * PAGE_SIZE);
+    if (vaddr == (u64)-1) return (void *)-1;
 
-    /* Map all pages into kernel virtual space */
+    /* Map all pages into user virtual space */
     int npages = seg->page_count;
     for (int p = 0; p < npages; p++) {
         u64 page_vaddr = vaddr + p * PAGE_SIZE;
-        vmm_map_page(page_vaddr, seg->physical_pages[p], VMM_WRITABLE | VMM_USER);
+        /* Map with VMM_SHARED to bypass CoW on fork */
+        vmm_map_page(page_vaddr, seg->physical_pages[p], VMM_WRITABLE | VMM_USER | VMM_SHARED | VMM_PRESENT);
+        /* Explicitly increment physical frame refcount for this new mapping */
+        pmm_ref_frame(seg->physical_pages[p]);
     }
+
+    /* Create VMA for this region */
+    struct vm_area *vma = kmalloc(sizeof(struct vm_area));
+    if (!vma) {
+        for (int p = 0; p < npages; p++) {
+            vmm_unmap_page(vaddr + p * PAGE_SIZE);
+        }
+        return (void *)-1;
+    }
+    vma->start = vaddr;
+    vma->end = vaddr + npages * PAGE_SIZE;
+    vma->prot = PROT_READ | PROT_WRITE;
+    vma->flags = MAP_SHARED;
+    vma->node = 0;
+    vma->offset = 0;
+    
+    /* Insert VMA into current_task */
+    struct vm_area **prev = &current_task->vma_list;
+    struct vm_area *curr = current_task->vma_list;
+    while (curr && curr->start < vaddr) {
+        prev = &curr->next;
+        curr = curr->next;
+    }
+    vma->next = curr;
+    *prev = vma;
 
     /* Record attachment */
     pa->attaches[slot].used = 1;
@@ -219,11 +246,16 @@ int shmdt(const void *shmaddr)
             int shmid = pa->attaches[i].shmid;
             struct shm_segment *seg = &shm_segments[shmid];
             
-            /* Unmap pages */
-            for (int p = 0; p < seg->page_count; p++) {
-                u64 page_vaddr = (u64)(usize)shmaddr + p * PAGE_SIZE;
-                vmm_unmap_page(page_vaddr);
+            u64 vaddr = pa->attaches[i].virtual_addr;
+            u64 size = seg->page_count * PAGE_SIZE;
+
+            /* Unmap pages and drop physical refcounts */
+            for (u64 v = vaddr; v < vaddr + size; v += PAGE_SIZE) {
+                vmm_unmap_page(v);
             }
+
+            /* Delete VMA */
+            vma_delete_range(current_task, vaddr, vaddr + size);
 
             /* Clear attach record */
             pa->attaches[i].used = 0;

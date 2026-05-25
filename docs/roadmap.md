@@ -209,8 +209,9 @@ and broader utility flag compatibility.
 - [x] `done` Verify exec/fd runtime behavior through real exec boundaries: deterministic failed-`execve` status, parent integrity, fd inheritance, `dup2`, and close-on-exec behavior.
 - [x] `done` Verify shell/userland ABI integration baseline: `/bin/sh -c` argv and status semantics.
 - [x] `done` Complete full POSIX userspace signal baseline: `sigaction` handler delivery, mask/unmask via `sigprocmask`, robust `sigreturn` path, and red-zone-safe signal frame layout.
-- [ ] `planned` Enforce strict 16-byte stack alignment validation at Ring 3 entry using explicit architectural assertions; reject non-compliant frames immediately.
-- [ ] `planned` Audit all libc syscall wrappers to ensure unknown or negative kernel return values are never leaked, mapping them strictly to standard POSIX `errno` values.
+- [x] `done` Enforce strict 16-byte stack alignment validation at Ring 3 entry using explicit architectural assertions; reject non-compliant frames immediately.
+- [x] `done` Audit libc syscall wrappers so unknown or negative kernel return values are never leaked directly, mapping them to strict POSIX `errno` values.
+- [x] `done` Implement POSIX-compliant TTY Background Input/Output enforcement via `SIGTTIN` and `SIGTTOU` tracking.
 
 ## M14: Advanced Storage, Swap & File Systems
 
@@ -227,21 +228,21 @@ and broader utility flag compatibility.
 - [x] `done` Add write-back dirty block-cache behavior with explicit flush on eviction, `sync()`, and `fsync()`.
 - [x] `done` Persistent ext2 root-image creation and boot overlay.
 - [x] `done` Add complete AHCI/NVMe baseline storage paths.
-- [ ] `planned` Enforce strict block cache locking topology: ensure VFS-level locks are never acquired while holding a block cache spinlock to prevent layer-inversion deadlocks.
+- [x] `done` Enforce strict block cache locking topology: block cache metadata is spinlock-protected and VFS inode lock acquisition now asserts/panics if attempted while the block cache lock is held, preventing layer-inversion deadlocks.
 
 ## M15: IPC, Security & Standard OS Features
 
 - [x] `done` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): default actions, `SIG_IGN`, userspace handlers, mask semantics, and `sigreturn` context restoration are implemented and smoke-verified.
 - [x] `done` Inter-process communication message queue baseline (`mq_open/send/receive/close/unlink`) with smoke verification.
-- [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) baseline with smoke verification; production-grade multi-process semantics remain follow-up.
-- [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`) baseline.
-- [x] `partial` File permissions/capabilities metadata plus smoke-verified non-root access denial baseline.
-- [x] `initial` Standard C library profile for B1NIX userspace.
-- [x] `partial` BusyBox-style standard utilities.
+- [x] `done` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) baseline with smoke verification.
+- [x] `done` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`, `su`) baseline.
+- [x] `done` File permissions/capabilities metadata plus smoke-verified non-root access denial baseline.
+- [x] `done` Standard C library profile for B1NIX userspace.
+- [x] `done` BusyBox-style standard utilities (`su`, `ls -l`, `chown`, `chmod`).
 - [x] `done` Add UNIX domain sockets.
 - [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
 - [x] `done` Complete userspace signal semantics baseline (`sigaction` masks, nested-delivery-safe frame setup, robust `sigreturn` ABI behavior) and remove libc stubs for `sigprocmask`.
-- [ ] `planned` Harden IPC interfaces (`mq_*`, `shm*`): enforce strict user-space pointer verification using `copyin`/`copyout` wrappers; direct raw pointer dereferencing inside the kernel is strictly prohibited.
+- [x] `done` Harden IPC interfaces (`mq_*`, `shm*`): enforce strict user-space pointer verification using `copyin`/`copyout` wrappers; direct raw pointer dereferencing inside the kernel is strictly prohibited.
 
 ## M16: User Space Applications & TUI
 
@@ -257,15 +258,15 @@ and broader utility flag compatibility.
 
 ## M17: POSIX Syscall Compliance & Self-Hosting
 
-- [x] `initial` POSIX Process Management: `fork()`, `execve()`, and `waitpid()` initial ABI.
+- [x] `done` POSIX Process Management: `fork()`, `execve()`, and `waitpid()` initial ABI.
 - [x] `done` POSIX File I/O: `stat()`, `lseek()`, `unlink()`, `mkdir()`, `rmdir()`, `rename()`, `symlink()`, `readlink()`, `chdir()`, `getdents()`, `statfs()`, `fsync()`, `sync()`, `fcntl()`, `chmod()`, `chown()`, `umask()`.
-- [x] `initial` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
-- [x] `initial` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
+- [x] `done` POSIX Pipes & FDs: `pipe()`, `dup2()`, `fcntl()`.
+- [x] `done` POSIX Memory: user-space `mmap()`, `munmap()`, `brk()` initial heap ABI.
 - [x] `done` POSIX Sockets: `socket()`, `bind()`, `connect()`, `send()`, `recv()`, `listen()`, `accept()` FD ABI.
 - [x] `done` POSIX Terminal: `ioctl()`, `termios`, and `poll()` support.
 - [x] `done` Add syscall ABI constants and userspace syscall header mirrors.
 - [x] `done` Add `docs/abi.md` for the userspace ELF ABI and calling convention.
-- [x] `initial` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
+- [x] `done` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
 - [ ] `planned` Cross-compile and port GCC specifically for `x86_64-b1nix`.
 - [ ] `planned` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`) and GNU Make.
 - [ ] `planned` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC.
@@ -274,17 +275,17 @@ and broader utility flag compatibility.
 
 ## M18: Real Userspace and ELF Loader
 
-- [x] `partial` Load ELF64 executables from VFS with per-process page mapping via VMM (PT_LOAD segments mapped page-by-page into user address space).
-- [x] `partial` Build a user address-space record per process.
+- [x] `done` Load ELF64 executables from VFS with per-process page mapping via VMM (PT_LOAD segments mapped page-by-page into user address space).
+- [x] `done` Build a user address-space record per process.
 - [x] `done` Add syscall `copyin`/`copyout`/`copyinstr` helpers for user pointers.
-- [x] `partial` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics (AT_NULL, AT_ENTRY, AT_PHDR present).
-- [x] `partial` Implement `execve()` as image replacement with `vfs_close_on_exec()` and full ELF segment loading.
-- [x] `initial` Add process exit status propagation and zombie reaping semantics.
+- [x] `done` Create a user stack with `argc`, `argv`, `envp`, and auxiliary vector basics (AT_NULL, AT_ENTRY, AT_PHDR present).
+- [x] `done` Implement `execve()` as image replacement with `vfs_close_on_exec()` and full ELF segment loading.
+- [x] `done` Add process exit status propagation and zombie reaping semantics.
 - [x] `done` Add QEMU tests that boot, launch `/bin/init`, and execute a VFS-loaded program.
 - [x] `done` Add external clang-backed `b1nix-cc` wrapper for early ELF builds.
 - [x] `done` Add hardware-enforced ring3 entry and return.
-- [ ] `planned` Implement strict boundary verification for ELF `PT_LOAD` segments to guarantee that malformed binaries can never corrupt kernel memory limits.
-- [ ] `planned` Enforce that all string operations during environment and stack construction utilize bounded `copyinstr` tracking with exact destination limit assertions.
+- [x] `done` Implement strict boundary verification for ELF `PT_LOAD` segments to guarantee that malformed binaries can never corrupt kernel memory limits.
+- [x] `done` Enforce that all string operations during environment and stack construction utilize bounded `copyinstr` tracking with exact destination limit assertions.
 
 ## M19: Process Model and FD Tables
 

@@ -10,6 +10,7 @@ INITRAMFS_M8_AIO_TEST_INC := $(BUILD_DIR)/initramfs_m8_aio_test.inc
 INITRAMFS_M17_SMOKE_INC := $(BUILD_DIR)/initramfs_m17_smoke.inc
 INITRAMFS_M14_SMOKE_INC := $(BUILD_DIR)/initramfs_m14_smoke.inc
 INITRAMFS_M15_SMOKE_INC := $(BUILD_DIR)/initramfs_m15_smoke.inc
+INITRAMFS_M15_SHM_FORK_INC := $(BUILD_DIR)/initramfs_m15_shm_fork.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
 INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 
@@ -127,7 +128,7 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_M15_SHM_FORK_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
 
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/native_smoke
@@ -168,6 +169,11 @@ $(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/m15_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m15_smoke_elf userspace/build/bin/m15_smoke > $@
+
+$(INITRAMFS_M15_SHM_FORK_INC): userspace/bin/m15_shm_fork.c userspace/linker.ld
+	@$(MAKE) -C userspace build/bin/m15_shm_fork
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m15_shm_fork_elf userspace/build/bin/m15_shm_fork > $@
 
 $(INITRAMFS_TCC_FILES_INC): userspace
 	@mkdir -p $(dir $@)

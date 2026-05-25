@@ -13,6 +13,7 @@
 #include "../../build/x86/initramfs_m17_smoke.inc"
 #include "../../build/x86/initramfs_m14_smoke.inc"
 #include "../../build/x86/initramfs_m15_smoke.inc"
+#include "../../build/x86/initramfs_m15_shm_fork.inc"
 #include "../../build/x86/initramfs_tcc_files.inc"
 #include "../../build/x86/initramfs_m25_smoke.inc"
 
@@ -288,6 +289,8 @@ static const char posix_smoke_script[] =
     "/bin/m13-job-control\n"
     "/bin/m17-smoke\n"
     "/bin/m8-aio-test\n"
+    "/bin/m15-smoke\n"
+    "/bin/m15-shm-fork\n"
     "echo \"M22-POLISH: done\"\n"
     "echo \"POSIX-SMOKE: done\"\n";
 
@@ -317,6 +320,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m14_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m15-smoke", (const char *)vfs_m15_smoke_elf,
      sizeof(vfs_m15_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m15-shm-fork", (const char *)vfs_m15_shm_fork_elf,
+     sizeof(vfs_m15_shm_fork_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,

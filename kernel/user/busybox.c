@@ -129,6 +129,18 @@ static int pwd_main(int argc, const char **argv) {
 }
 
 /* ── ls — list directory contents ── */
+static void strmode(u32 mode, char *buf) {
+  const char chars[] = "rwxrwxrwx";
+  buf[0] = (mode & B1NIX_S_IFDIR) ? 'd' : ((mode & B1NIX_S_IFLNK) ? 'l' : '-');
+  for (int i = 0; i < 9; i++) {
+    buf[1 + i] = (mode & (1 << (8 - i))) ? chars[i] : '-';
+  }
+  if (mode & 04000) buf[3] = (mode & (1 << 6)) ? 's' : 'S';
+  if (mode & 02000) buf[6] = (mode & (1 << 3)) ? 's' : 'S';
+  if (mode & 01000) buf[9] = (mode & (1 << 0)) ? 't' : 'T';
+  buf[10] = '\0';
+}
+
 static int ls_main(int argc, const char **argv) {
   int long_fmt = 0;
   int all_files = 0;
@@ -162,8 +174,9 @@ static int ls_main(int argc, const char **argv) {
 
   if (!(st.st_mode & B1NIX_S_IFDIR)) {
     if (long_fmt) {
-      char type = (st.st_mode & B1NIX_S_IFLNK) ? 'l' : '-';
-      printf("%c  %8d  %s\n", type, (int)st.st_size, target);
+      char mode_buf[12];
+      strmode(st.st_mode, mode_buf);
+      printf("%s %4d %4d %8d  %s\n", mode_buf, (int)st.st_uid, (int)st.st_gid, (int)st.st_size, target);
     } else {
       printf("%s\n", target);
     }
@@ -181,8 +194,16 @@ static int ls_main(int argc, const char **argv) {
     if (!all_files && entries[i].name[0] == '.')
       continue;
     if (long_fmt) {
-      char type = entries[i].is_dir ? 'd' : (entries[i].type == 2 ? 'c' : '-');
-      printf("%c  %8d  %s\n", type, (int)entries[i].size, entries[i].name);
+      char sub[512];
+      snprintf(sub, sizeof(sub), "%s/%s", path, entries[i].name);
+      struct b1nix_stat est;
+      if (syscall_dispatch(SYS_LSTAT, (u64)(usize)sub, (u64)(usize)&est, 0, 0, 0, 0) == 0) {
+        char mode_buf[12];
+        strmode(est.st_mode, mode_buf);
+        printf("%s %4d %4d %8d  %s\n", mode_buf, (int)est.st_uid, (int)est.st_gid, (int)est.st_size, entries[i].name);
+      } else {
+        printf("?--------- %4d %4d %8d  %s\n", 0, 0, (int)entries[i].size, entries[i].name);
+      }
     } else {
       printf("%s  ", entries[i].name);
     }
@@ -1776,6 +1797,32 @@ static int id_main(int argc, const char **argv) {
   return 0;
 }
 
+/* ── su — switch user ── */
+static int su_main(int argc, const char **argv) {
+  int target_uid = 0;
+  if (argc > 1) {
+    target_uid = atoi(argv[1]);
+  }
+
+  if (syscall_dispatch(SYS_SETGID, (u64)target_uid, 0, 0, 0, 0, 0) != 0 ||
+      syscall_dispatch(SYS_SETUID, (u64)target_uid, 0, 0, 0, 0, 0) != 0) {
+    printf("su: permission denied\n");
+    return 1;
+  }
+
+  const char *shell_argv[] = {"/bin/sh", 0};
+  int pid = (int)syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if (pid == 0) {
+    syscall_dispatch(SYS_EXECVE, (u64)(usize)"/bin/sh", (u64)(usize)shell_argv, 0, 0, 0, 0);
+    syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
+  } else if (pid > 0) {
+    int status;
+    syscall_dispatch(SYS_WAITPID, (u64)pid, (u64)(usize)&status, 0, 0, 0, 0);
+    return (status >> 8) & 0xff;
+  }
+  return 1;
+}
+
 /* ── clear — clear terminal ── */
 static int clear_main(int argc, const char **argv) {
   (void)argc;
@@ -2162,6 +2209,7 @@ static struct bb_app bb_apps[] = {
     {"sleep", sleep_main},
     {"whoami", whoami_main},
     {"id", id_main},
+    {"su", su_main},
     {"clear", clear_main},
     {"reboot", reboot_main},
     {0, 0},

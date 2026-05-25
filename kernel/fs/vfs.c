@@ -10,6 +10,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -507,6 +508,9 @@ void icache_invalidate_fs(u32 fs_id) {
 }
 
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
+  if (blk_cache_lock_is_held()) {
+    panic("vfs: inode read-lock under block-cache lock");
+  }
   while (1) {
     int val = inode->rw_lock;
     if (val >= 0 &&
@@ -525,6 +529,9 @@ static void vfs_inode_unlock_read(struct vfs_inode *inode) {
 }
 
 static void vfs_inode_lock_write(struct vfs_inode *inode) {
+  if (blk_cache_lock_is_held()) {
+    panic("vfs: inode write-lock under block-cache lock");
+  }
   while (1) {
     int val = 0;
     if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
@@ -1381,9 +1388,17 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
   /* Job control check for background reads: */
   if (current_task && console.fg_pgrp > 0) {
     if (current_task->process_group_id != console.fg_pgrp) {
-      // Process is in the background trying to read from TTY
-      scheduler_kill_process_group(current_task->process_group_id, SIGTTIN);
-      return -EINTR; // Abort read, let scheduler block the task
+      if ((current_task->blocked_signals & (1ULL << (SIGTTIN - 1))) ||
+          current_task->sigactions[SIGTTIN - 1].sa_handler == SIG_IGN) {
+        return -EIO;
+      } else {
+        if (current_task->parent_id == 0 || current_task->parent_id == 1) {
+          return -EIO;
+        }
+        // Process is in the background trying to read from TTY
+        scheduler_kill_process_group(current_task->process_group_id, SIGTTIN);
+        return -ERESTARTSYS; // Abort read, let scheduler block the task, retry on SIGCONT
+      }
     }
   }
 
@@ -1457,8 +1472,16 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
   if (current_task && console.fg_pgrp > 0) {
     if (current_task->process_group_id != console.fg_pgrp) {
       if (console.termios.c_lflag & B1NIX_TOSTOP) {
-        scheduler_kill_process_group(current_task->process_group_id, SIGTTOU);
-        return -EINTR;
+        if ((current_task->blocked_signals & (1ULL << (SIGTTOU - 1))) ||
+            current_task->sigactions[SIGTTOU - 1].sa_handler == SIG_IGN) {
+          /* POSIX: if blocked/ignored, let the write execute */
+        } else {
+          if (current_task->parent_id == 0 || current_task->parent_id == 1) {
+            return -EIO; /* Orphaned process group, fail immediately */
+          }
+          scheduler_kill_process_group(current_task->process_group_id, SIGTTOU);
+          return -ERESTARTSYS;
+        }
       }
     }
   }
