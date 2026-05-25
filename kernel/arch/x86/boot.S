@@ -29,6 +29,7 @@ multiboot_header_end:
 
 .section .bss
 .align 4096
+.global pml4
 pml4:
 	.skip 4096
 pdpt:

@@ -31,5 +31,6 @@ struct interrupt_frame {
 void arch_check_and_deliver_signals(struct interrupt_frame *frame);
 u64 sys_sigreturn(struct interrupt_frame *frame);
 void x86_pic_unmask(u8 irq);
+void arch_backtrace(u64 rbp, u64 rip);
 
 #endif

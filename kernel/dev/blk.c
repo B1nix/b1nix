@@ -2,6 +2,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <stdbool.h>
 #include <string.h>
 
@@ -28,22 +29,18 @@ static void blk_scan_partitions(struct block_device *dev);
 
 static struct block_buffer block_cache[CACHE_ENTRIES];
 static u32 bcache_tick = 0;
-static volatile int bcache_lock = 0;
-static volatile int bcache_lock_held = 0;
+static spinlock_t bcache_lock = SPINLOCK_INIT;
 
 static void bcache_acquire(void) {
-  while (__atomic_test_and_set(&bcache_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
-  __atomic_store_n(&bcache_lock_held, 1, __ATOMIC_RELEASE);
+  spin_lock(&bcache_lock);
 }
 
 static void bcache_release(void) {
-  __atomic_store_n(&bcache_lock_held, 0, __ATOMIC_RELEASE);
-  __atomic_clear(&bcache_lock, __ATOMIC_RELEASE);
+  spin_unlock(&bcache_lock);
 }
 
 int blk_cache_lock_is_held(void) {
-  return __atomic_load_n(&bcache_lock_held, __ATOMIC_ACQUIRE);
+  return spin_is_locked(&bcache_lock);
 }
 
 static u32 le32(const u8 *p) {

@@ -739,12 +739,11 @@ void vfs_node_put(struct vfs_node *node) {
   }
 }
 
-static void split_path(const char *path, char *first_part, const char **rest) {
-  if (!path) {
-    if (first_part)
-      first_part[0] = '\0';
-    if (rest)
-      *rest = 0;
+static void split_path(const char *path, char *first_part, usize first_size,
+                        const char **rest) {
+  if (!path || !first_part || !first_size) {
+    if (first_part && first_size) first_part[0] = '\0';
+    if (rest) *rest = 0;
     return;
   }
   while (*path == '/')
@@ -755,7 +754,7 @@ static void split_path(const char *path, char *first_part, const char **rest) {
     return;
   }
   usize i = 0;
-  while (path[i] != '\0' && path[i] != '/') {
+  while (path[i] != '\0' && path[i] != '/' && i + 1 < first_size) {
     first_part[i] = path[i];
     i++;
   }
@@ -950,7 +949,7 @@ restart_traversal:
     while (*rest == '/')
       rest++;
 
-    split_path(rest, part, &rest);
+    split_path(rest, part, sizeof(part), &rest);
 
     if (part[0] == '\0') {
       int orig_len = strlen(path);
@@ -1184,7 +1183,7 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
   struct vfs_node *current = root_node;
 
   while (1) {
-    split_path(rest, part, &rest);
+    split_path(rest, part, sizeof(part), &rest);
     if (part[0] == '\0')
       return current;
 
@@ -1546,7 +1545,7 @@ void vfs_init(void) {
   add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
   add_node("/ext4", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/ext3", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
@@ -2979,10 +2978,24 @@ int vfs_umount(const char *target) {
         return -EBUSY;
       }
 
-      mounts[i].used = 0;
       struct vfs_node *root = mounts[i].root_node;
       struct vfs_node *mp = mounts[i].mount_point;
       u32 fs_id = (root && root->inode) ? root->inode->fs_id : 0;
+
+      /* Call filesystem umount callback if available (e.g. JBD RECOVER flag) */
+      if (mounts[i].fstype[0]) {
+        struct vfs_fs *fs = filesystems;
+        while (fs) {
+          if (strcmp(fs->name, mounts[i].fstype) == 0) {
+            if (fs->umount && root)
+              fs->umount(root);
+            break;
+          }
+          fs = fs->next;
+        }
+      }
+
+      mounts[i].used = 0;
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
       if (root && root->inode && root->inode->blk_dev) {

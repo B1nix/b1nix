@@ -129,6 +129,7 @@ struct vfs_node {
 struct vfs_fs {
   const char *name;
   struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
+  int (*umount)(struct vfs_node *root_node);
   struct vfs_fs *next;
 };
 

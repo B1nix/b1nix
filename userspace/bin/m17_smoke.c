@@ -27,7 +27,7 @@ static void fail_marker(const char *name, int got, int expected) {
 static long sys_call(long num, long a0, long a1, long a2) {
   long rc = syscall(num, a0, a1, a2);
   if (rc < 0) {
-    errno = (int)(-rc);
+    errno = normalize_errno(rc);
     return -1;
   }
   return rc;

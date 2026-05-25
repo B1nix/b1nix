@@ -23,7 +23,9 @@
 #include <b1nix/mqueue.h>
 #include <b1nix/shm.h>
 #include <b1nix/uidgid.h>
+#include <b1nix/lapic.h>
 #include <b1nix/video.h>
+#include <string.h>
 
 extern void ps2_kbd_init(void);
 extern void ps2_mouse_init(void);
@@ -90,6 +92,8 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	uidgid_init();
 	arch_init();
+	percpu_init();
+	lapic_init();
 	blk_cache_init();
 
 	initramfs_init();
@@ -118,6 +122,22 @@ void kernel_main(u64 arg0, u64 arg1)
 	virtio_gpu_init();
 #endif
 	console_write("Step 11: Drivers initialized\n");
+
+	/* Bring up Application Processors */
+	smp_boot_aps();
+
+#ifndef __aarch64__
+	/* Try to mount persistent root device.
+	 * If virtio-blk0 has an ext4 filesystem (created via `make root-image`),
+	 * it becomes available at /persist.  In test mode (b1nix.test=1) the smoke
+	 * test controls its own drives, so the mount may fail — that's fine.    */
+	{
+		int rc = vfs_mount("virtio-blk0", "/persist", "ext4", 0);
+		if (rc == 0) {
+			console_write("persistent root: virtio-blk0 mounted at /persist\n");
+		}
+	}
+#endif
 
 	userspace_init();
 	int init_pid = user_spawn("/bin/init", 0, 0);

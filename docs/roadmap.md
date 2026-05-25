@@ -15,14 +15,14 @@ The stable no-surprises checklist for closing POSIX-facing work lives in
 
 ## Current POSIX Estimate
 
-- Overall practical POSIX compatibility: roughly 60-68%.
-- `VFS/path/files`: roughly 85-92%.
-- `Shell/coreutils`: roughly 75-82%.
+- Overall practical POSIX compatibility: roughly 70-78%.
+- `VFS/path/files`: roughly 90-95%.
+- `Shell/coreutils`: roughly 80-85%.
 
 These percentages mean "can run small real workflows", not "passes a POSIX
-conformance suite". The biggest blockers remain durable filesystem semantics,
-permission enforcement, full shell parsing, robust pipeline/job-control behavior,
-and broader utility flag compatibility.
+conformance suite". The biggest remaining blockers are full shell parsing,
+broader utility flag coverage, permission edge cases, and kernel backtrace
+diagnostics.
 
 ## M0: Boot and Diagnostics
 
@@ -150,8 +150,8 @@ and broader utility flag compatibility.
 - [x] `done` Add virtio-blk real block read/write implementation.
 - [x] `done` Add virtio-net real PCI/VirtIO initialization path.
 - [x] `done` Connect PS/2 keyboard input to shell and TTY paths.
-- [x] `initial` Add PCI device enumeration.
-- [x] `initial` Add block-device abstraction and cache.
+- [x] `done` Add PCI device enumeration with full bus/slot/function scanning.
+- [x] `done` Add block-device abstraction and cache (256-entry LRU, write-back, dirty flush on eviction).
 - [x] `done` Add MBR/GPT partition discovery in the block-device layer.
 - [x] `done` Add AHCI driver support.
 - [x] `done` Add NVMe driver support.
@@ -312,7 +312,7 @@ and broader utility flag compatibility.
 - [x] `done` Implement `PATH` command lookup against the VFS.
 - [x] `done` Improve shell errors and exit statuses.
 - [x] `done` Route terminal control characters into the signal/process metadata path.
-- [x] `partial` Add controlling-terminal/process-group signal behavior for interactive shell paths.
+- [x] `done` Add controlling-terminal/process-group signal behavior (SIGTTIN/SIGTTOU enforcement with mask/handler awareness, ERESTARTSYS restart semantics).
 
 ## M21: Persistent Root Filesystem
 
@@ -361,7 +361,7 @@ and broader utility flag compatibility.
 ## M24: Reliability and Diagnostics
 
 - [x] `done` Add syscall argument validation and error returns.
-- [x] `initial` Add kernel backtraces or symbolized panic locations.
+- [x] `stub` Add kernel backtraces or symbolized panic locations (panic message only; no stack unwinder yet).
 - [x] `partial` Replace avoidable panics with recoverable errors.
 - [x] `partial` Add regression/smoke tests for VFS, scheduler, pipes, terminal, and sockets.
 - [x] `done` Add QEMU smoke tests for the active x86_64 target.

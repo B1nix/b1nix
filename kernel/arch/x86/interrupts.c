@@ -1,4 +1,5 @@
 #include <b1nix/arch_x86.h>
+#include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/mm.h>
@@ -315,6 +316,8 @@ void x86_exception_handler(struct interrupt_frame *frame) {
   console_write_hex64(frame->rflags);
   console_write("\n");
 
+  arch_backtrace(frame->rbp, frame->rip);
+
   /* If exception happened in userspace (CS == 0x1B), send signal instead of
    * panic */
   if (frame->cs == 0x1B || frame->cs == 0x23) {
@@ -363,5 +366,83 @@ void x86_exception_handler(struct interrupt_frame *frame) {
     return;
   }
 
-  panic("unhandled CPU exception");
+  console_write("[PANIC] unhandled CPU exception\n");
+  arch_halt();
+}
+
+/* ── Stack Backtrace ──────────────────────────────────────────── */
+#define MAX_BACKTRACE_FRAMES 32
+
+static int addr_is_kernel_text(u64 addr) {
+  /* Kernel .text is identity-mapped in the 0x100000-0x200000 range
+     (the linker starts at 1M, and the kernel is a few hundred KB).
+     Also accept higher-half direct-map addresses. */
+  return (addr >= 0x100000ULL && addr <= 0x200000ULL) ||
+         (addr >= 0xffff800000000000ULL && addr <= 0xffff800100000000ULL);
+}
+
+void arch_backtrace(u64 rbp, u64 rip) {
+  int frames = 0;
+  console_write("\n--- Kernel Backtrace ---\n");
+
+  if (rip) {
+    console_write("  [0] 0x");
+    console_write_hex64(rip);
+    frames++;
+  }
+
+  /* Phase 1: Try RBP-based unwinding */
+  for (int i = 0; i < MAX_BACKTRACE_FRAMES && rbp; i++) {
+    if (rbp == (u64)-1)
+      break;
+    if (rbp < 0x1000ULL || rbp > 0xffff800100000000ULL)
+      break;
+
+    u64 next_rbp = 0;
+    u64 ret_addr = 0;
+
+    if (rbp + 16 > 0xffff800100000000ULL)
+      break;
+
+    next_rbp = *(volatile u64 *)rbp;
+    ret_addr = *(volatile u64 *)(rbp + 8);
+
+    if (ret_addr == 0 || !addr_is_kernel_text(ret_addr))
+      break;
+
+    console_write("\n  [");
+    console_write_dec(frames);
+    console_write("] 0x");
+    console_write_hex64(ret_addr);
+    frames++;
+
+    rbp = next_rbp;
+  }
+
+  /* Phase 2: If RBP unwinding gave nothing, try scanning the stack for
+     return addresses using the current frame pointer (if in exception handler) */
+  if (frames <= 1) {
+    u64 scan_rbp = 0;
+    __asm__ volatile("movq %%rbp, %0" : "=r"(scan_rbp));
+
+    for (int i = 0; i < MAX_BACKTRACE_FRAMES && scan_rbp; i++) {
+      if (scan_rbp < 0x1000ULL || scan_rbp > 0xffff800100000000ULL)
+        break;
+
+      u64 ret = *(volatile u64 *)(scan_rbp + 8);
+      if (ret && addr_is_kernel_text(ret)) {
+        console_write("\n  [");
+        console_write_dec(frames);
+        console_write("] 0x");
+        console_write_hex64(ret);
+        frames++;
+      }
+      scan_rbp = *(volatile u64 *)scan_rbp;
+    }
+  }
+
+  if (frames == 0)
+    console_write("  (no frames)");
+
+  console_write("\n--- End Backtrace ---\n");
 }

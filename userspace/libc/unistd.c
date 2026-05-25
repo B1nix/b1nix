@@ -8,9 +8,9 @@
 #include <unistd.h>
 #include <errno.h>
 
-static int normalize_errno(long rc) {
+int normalize_errno(long rc) {
   int e = (int)(-rc);
-  if (e >= EPERM && e <= ERANGE)
+  if (e >= EPERM && e <= EINPROGRESS)
     return e;
   return EIO;
 }

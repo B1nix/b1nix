@@ -3,12 +3,7 @@
 #include "syscall.h"
 #include <errno.h>
 
-static int normalize_errno(long rc) {
-	int e = (int)(-rc);
-	if (e >= EPERM && e <= ERANGE)
-		return e;
-	return EIO;
-}
+extern int normalize_errno(long rc);
 
 void exit(int status)
 {

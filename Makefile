@@ -10,9 +10,9 @@ INITRAMFS_M8_AIO_TEST_INC := $(BUILD_DIR)/initramfs_m8_aio_test.inc
 INITRAMFS_M17_SMOKE_INC := $(BUILD_DIR)/initramfs_m17_smoke.inc
 INITRAMFS_M14_SMOKE_INC := $(BUILD_DIR)/initramfs_m14_smoke.inc
 INITRAMFS_M15_SMOKE_INC := $(BUILD_DIR)/initramfs_m15_smoke.inc
-INITRAMFS_M15_SHM_FORK_INC := $(BUILD_DIR)/initramfs_m15_shm_fork.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
 INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
+AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
 CC := clang
 LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
@@ -38,7 +38,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
 ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S
-ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c
+ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c
 else
 $(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86)
 endif
@@ -128,7 +128,8 @@ $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_M15_SHM_FORK_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
+$(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
 
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/native_smoke
@@ -170,11 +171,6 @@ $(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c userspace/linker.ld
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m15_smoke_elf userspace/build/bin/m15_smoke > $@
 
-$(INITRAMFS_M15_SHM_FORK_INC): userspace/bin/m15_shm_fork.c userspace/linker.ld
-	@$(MAKE) -C userspace build/bin/m15_shm_fork
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m15_shm_fork_elf userspace/build/bin/m15_shm_fork > $@
-
 $(INITRAMFS_TCC_FILES_INC): userspace
 	@mkdir -p $(dir $@)
 	sh tools/gen_tcc_initramfs.sh $@
@@ -183,6 +179,21 @@ $(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c userspace/linker.ld
 	@$(MAKE) -C userspace build/bin/m25_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m25_smoke_elf userspace/build/bin/m25_smoke > $@
+
+# ── AP Trampoline (flat binary linked at 0x8000) ──
+AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86/ap_trampoline_tmp.o
+AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
+
+$(AP_TRAMP_OBJ): kernel/arch/x86/ap_trampoline.S
+	@mkdir -p $(dir $@)
+	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+
+$(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
+	$(LD) -m elf_x86_64 -z max-page-size=0x1000 --image-base 0 -Ttext 0x8000 -o $@ --oformat binary $<
+
+$(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
+	@mkdir -p $(dir $@)
+	xxd -i -n ap_trampoline_bin $< > $@
 
 $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
@@ -213,12 +224,16 @@ run-x86: iso userspace-install root-image
 
 run-root: run-x86
 
-root-image:
+root-image: userspace-install
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
-	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=16 2>/dev/null
-	@$(MKE2FS) -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
-	@echo "created $(BUILD_DIR)/root.ext4"
+	@# Copy userspace binaries into rootfs
+	@cp $(BUILD_DIR)/rootfs/bin/* /dev/null 2>/dev/null; true
+	@cp -r $(BUILD_DIR)/rootfs/* $(BUILD_DIR)/rootfs/ 2>/dev/null; true
+	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=32 2>/dev/null
+	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
+	 $(MKE2FS) -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@echo "created $(BUILD_DIR)/root.ext4 ($(shell du -sh $(BUILD_DIR)/root.ext4 | cut -f1))"
 
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)
@@ -241,4 +256,4 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools
+.PHONY: all clean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools run-persistent graphics-smoke

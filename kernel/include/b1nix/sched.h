@@ -161,8 +161,13 @@ struct task {
   int last_stop_signal;
   int stop_report_pending;
   int continued_report_pending;
+
+  /* SMP runqueue linkage (must be last field for ABI compat) */
+  struct task *next_run;
 };
 
+/* SMP-safe current_task accessor.
+ * For now, uses a single global pointer (SMP migration in progress). */
 extern struct task *current_task;
 
 /* ── Scheduler ── */

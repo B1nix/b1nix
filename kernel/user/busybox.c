@@ -1311,7 +1311,7 @@ static int uniq_main(int argc, const char **argv) {
     file = argv[1];
   }
 
-  char buf[4096];
+  char buf[8192];
   isize total;
 
   if (file) {
@@ -1325,19 +1325,23 @@ static int uniq_main(int argc, const char **argv) {
   } else {
     total = 0;
     while ((usize)total < sizeof(buf) - 1) {
-      char c;
-      if (read(0, &c, 1) <= 0)
+      int n = read(0, buf + total, sizeof(buf) - 1 - (usize)total);
+      if (n <= 0)
         break;
-      buf[total++] = c;
+      total += n;
     }
     buf[total] = '\0';
   }
 
+  /* Strip trailing newline so the last line isn't empty */
+  if ((usize)total > 0 && buf[(usize)total - 1] == '\n')
+    total--, buf[(usize)total] = '\0';
+
   /* Collect line pointers */
-  char *lines[256];
+  char *lines[512];
   int lc = 0;
   lines[lc++] = buf;
-  for (usize i = 0; i < (usize)total && lc < 256; i++) {
+  for (usize i = 0; i < (usize)total && lc < 512; i++) {
     if (buf[i] == '\n') {
       buf[i] = '\0';
       if (i + 1 < (usize)total)

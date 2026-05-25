@@ -805,13 +805,17 @@ static struct vfs_node *ext3_vfs_mount_cb(const char *source, u64 flags, void *d
       ext3_read_inode(fs, fs->journal_inum, &fs->journal_inode_cache);
       fs->jdev = journal_mount(fs, fs->block_size, &ext3_jbd_ops);
       if (fs->jdev) {
+        /* Run recovery if the filesystem wasn't cleanly unmounted */
         if (fs->sb.s_feature_incompat & EXT3_FEATURE_INCOMPAT_RECOVER) {
           console_write("ext3: journal needs recovery\n");
           if (journal_recover(fs->jdev) == 0) {
-            fs->sb.s_feature_incompat &= ~EXT3_FEATURE_INCOMPAT_RECOVER;
-            ext3_write_superblock(fs);
+            console_write("ext3: journal recovery complete\n");
           }
         }
+        /* Mark filesystem as needing recovery (will be cleared on clean umount).
+         * Must happen AFTER recovery so the next mount re-replays if we crash. */
+        fs->sb.s_feature_incompat |= EXT3_FEATURE_INCOMPAT_RECOVER;
+        ext3_write_superblock(fs);
       }
     }
   }
@@ -823,7 +827,21 @@ static struct vfs_node *ext3_vfs_mount_cb(const char *source, u64 flags, void *d
   return root;
 }
 
-static struct vfs_fs ext3_vfs = { .name = "ext3", .mount = ext3_vfs_mount_cb };
+static int ext3_vfs_umount_cb(struct vfs_node *root_node) {
+  struct ext3_inode_info *ni = (struct ext3_inode_info *)root_node->inode->data;
+  struct ext3_fs *fs = ni->fs;
+  if (fs->sb.s_feature_compat & EXT3_FEATURE_COMPAT_HAS_JOURNAL) {
+    if (fs->jdev) {
+      /* Clear RECOVER flag: filesystem was cleanly unmounted */
+      fs->sb.s_feature_incompat &= ~EXT3_FEATURE_INCOMPAT_RECOVER;
+      ext3_write_superblock(fs);
+      console_write("ext3: clean umount, RECOVER flag cleared\n");
+    }
+  }
+  return 0;
+}
+
+static struct vfs_fs ext3_vfs = { .name = "ext3", .mount = ext3_vfs_mount_cb, .umount = ext3_vfs_umount_cb };
 
 void ext3_init(void) {
   vfs_register_fs(&ext3_vfs);

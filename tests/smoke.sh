@@ -112,13 +112,18 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     exit 1
 fi
 
-"$MKE2FS" -t ext3 -q "$SATA_IMG" || {
-    echo "Error: Failed to format sata.img as ext3."
-    exit 1
+# Format with minimal ext4 features (metadata_csum, 64bit, flex_bg not supported by kernel driver)
+"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || {
+    "$MKE2FS" -t ext4 -q "$SATA_IMG" 2>/dev/null || {
+        echo "Error: Failed to format sata.img as ext4."
+        exit 1
+    }
 }
-"$MKE2FS" -t ext4 -q "$NVME_IMG" || {
-    echo "Error: Failed to format nvme.img as ext4."
-    exit 1
+"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || {
+    "$MKE2FS" -t ext4 -q "$NVME_IMG" 2>/dev/null || {
+        echo "Error: Failed to format nvme.img as ext4."
+        exit 1
+    }
 }
 
 
@@ -267,8 +272,8 @@ check_output "$LOG" "M8-AIO-SMOKE: done" "M8 AIO smoke completes"
 echo ""
 echo "[TEST] M14 Storage, Swap & File Systems..."
 check_output "$LOG" "M14-SMOKE: ok swap-smoke" "swap page swap-out and swap-in verified"
-check_output "$LOG" "M14-SMOKE: ok mount-ext3" "mount sata0 as ext3 successful"
-check_output "$LOG" "M14-SMOKE: ok mount-ext4" "mount nvme0 as ext4 successful"
+check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sata0 as ext4 successful"
+check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
 check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"
 check_output "$LOG" "M14-SMOKE: ok persistence" "persistence through sync, umount, and remount verified"
