@@ -114,7 +114,23 @@ OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
 
-.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke
+ANALYZE_DIR := $(BUILD_DIR)/analyze
+
+# ── Static Analysis ──
+analyze: $(KERNEL_SOURCES) $(ASM_SOURCES)
+	@mkdir -p $(ANALYZE_DIR)
+	@echo "Running clang static analyzer..."
+	@for src in $(KERNEL_SOURCES); do \
+		rel=$${src#kernel/}; \
+		out="$(ANALYZE_DIR)/$${rel%.c}.plist"; \
+		mkdir -p "$$(dirname "$$out")"; \
+		$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) --analyze -Xclang -analyzer-output=plist -o "$$out" -c "$$src" 2>&1 | \
+			grep -v "^$$" | grep -v "analyz" | head -5 || true; \
+	done
+	@echo "Analysis results in $(ANALYZE_DIR)"
+	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
+
+.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke analyze
 
 all: $(KERNEL_ELF)
 

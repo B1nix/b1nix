@@ -1797,6 +1797,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_REBOOT:
     console_write("reboot requested\n");
     arch_halt();
+    break;
   case SYS_DMESG:
     if (!arg0 || arg1 == 0)
       return (u64)-EINVAL;

@@ -19,8 +19,11 @@ static volatile int net_ready;
 static volatile int net_tx_lock = 0;
 static volatile int net_rx_lock = 0;
 static volatile int net_irq_pending = 0;
-static void **tx_buffers;
+static void **tx_buffers;       /* Pre-allocated TX buffer pool */
 static u8 *tx_inflight;
+static u16 *tx_pool_free;       /* Stack of free buffer indices */
+static u16 tx_pool_count;       /* Number of buffers free in pool */
+static u16 *tx_pool_map;        /* Virtqueue desc idx → pool idx */
 
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
@@ -226,9 +229,20 @@ static void virtio_net_probe(void)
 	}
 	tx_buffers = kzalloc(sizeof(void *) * net_tx_vq.queue_size);
 	tx_inflight = kzalloc(sizeof(u8) * net_tx_vq.queue_size);
-	if (!tx_buffers || !tx_inflight) {
+	tx_pool_free = kzalloc(sizeof(u16) * net_tx_vq.queue_size);
+	tx_pool_map = kzalloc(sizeof(u16) * net_tx_vq.queue_size);
+	if (!tx_buffers || !tx_inflight || !tx_pool_free || !tx_pool_map) {
 		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
 		return;
+	}
+	/* Pre-allocate TX buffer pool */
+	tx_pool_count = net_tx_vq.queue_size;
+	for (u16 i = 0; i < net_tx_vq.queue_size; i++) {
+		u64 frame = pmm_alloc_frame();
+		if (!frame) { tx_pool_count = i; break; }
+		tx_buffers[i] = (void *)(usize)(frame + vmm_direct_map_base());
+		memset(tx_buffers[i], 0, PAGE_SIZE);
+		tx_pool_free[i] = i;
 	}
 
 	// Read MAC from device config space (ports + 20 for legacy virtio pci)
@@ -318,12 +332,25 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 		return;
 	}
 
-	// Allocate TX buffer. It is reclaimed on TX completion in net_poll().
+	// Grab a pre-allocated TX buffer from the pool (no IRQ-time allocation).
 	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
 	if (packet_size > PAGE_SIZE) return;
-	u64 frame = pmm_alloc_frame();
-	if (!frame) return;
-	u8 *buffer = (u8 *)(usize)(frame + vmm_direct_map_base());
+
+	u8 *buffer = 0;
+	u16 pool_idx;
+	for (int tries = 0; tries < 2; tries++) {
+		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
+		if (tx_pool_count > 0) {
+			tx_pool_count--;
+			pool_idx = tx_pool_free[tx_pool_count];
+			buffer = tx_buffers[pool_idx];
+			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+			break;
+		}
+		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
+		net_poll();
+	}
+	if (!buffer) return;
 	memset(buffer, 0, PAGE_SIZE);
 
 	struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
@@ -353,7 +380,7 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 			continue;
 		}
 
-		tx_buffers[d0] = buffer;
+		tx_pool_map[d0] = pool_idx;
 		tx_inflight[d0] = 1;
 		net_tx_vq.desc[d0].addr = vmm_virt_to_phys(buffer);
 		net_tx_vq.desc[d0].len = packet_size;
@@ -370,7 +397,9 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 		return;
 	}
 
-	pmm_free_frame(vmm_virt_to_phys(buffer));
+	/* Return buffer to pool on send failure */
+	tx_pool_free[tx_pool_count] = pool_idx;
+	tx_pool_count++;
 }
 
 void net_poll(void)
@@ -389,8 +418,11 @@ void net_poll(void)
 		u32 id = net_tx_vq.used->ring[used_idx].id;
 		if (id < net_tx_vq.queue_size && tx_inflight[id]) {
 			tx_inflight[id] = 0;
-			pmm_free_frame(vmm_virt_to_phys(tx_buffers[id]));
-			tx_buffers[id] = 0;
+			u16 pool_ret = tx_pool_map[id];
+			if (pool_ret < net_tx_vq.queue_size) {
+				tx_pool_free[tx_pool_count] = pool_ret;
+				tx_pool_count++;
+			}
 		}
 		net_tx_vq.last_used_idx++;
 	}

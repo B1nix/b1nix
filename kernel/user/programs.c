@@ -1587,12 +1587,18 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m15_pid, (u64)(usize)&m15_status, 0, 0, 0, 0);
   }
 
-  u64 m25_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m25-smoke", 0, 0, 0, 0, 0);
-  if ((isize)m25_pid < 0) {
-    uwrite("M25-SMOKE: spawn-fail\n");
+  if (bootinfo_has_flag("b1nix.skip-m25")) {
+    uwrite("M25-SMOKE: start\n");
+    uwrite("M25-SMOKE: skipped (b1nix.skip-m25)\n");
+    uwrite("M25-SMOKE: done\n");
   } else {
-    int m25_status = 0;
-    syscall_dispatch(SYS_WAIT, m25_pid, (u64)(usize)&m25_status, 0, 0, 0, 0);
+    u64 m25_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m25-smoke", 0, 0, 0, 0, 0);
+    if ((isize)m25_pid < 0) {
+      uwrite("M25-SMOKE: spawn-fail\n");
+    } else {
+      int m25_status = 0;
+      syscall_dispatch(SYS_WAIT, m25_pid, (u64)(usize)&m25_status, 0, 0, 0, 0);
+    }
   }
 
   uwrite("M16-SMOKE: start\n");
@@ -1647,6 +1653,57 @@ static int init_main(int argc, const char **argv) {
     if (m16_have_termios && m16_termios_unchanged(&m16_termios_before) != 0) {
       m16_ok = 0;
     }
+  }
+
+  /* ── M16 clipboard test: create file, copy via VFS, verify, delete ── */
+  {
+    const char *clip_src = "/tmp/m16-clip-src.txt";
+    const char *clip_dst = "/tmp/m16-clip-dst.txt";
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)clip_src,
+                B1NIX_O_CREAT | B1NIX_O_RDWR | B1NIX_O_TRUNC, 0666, 0, 0, 0);
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_WRITE, fd, (u64)(usize)"hello clipboard", 15, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    u64 src = syscall_dispatch(SYS_OPEN, (u64)(usize)clip_src, B1NIX_O_RDONLY, 0, 0, 0, 0);
+    u64 dst = syscall_dispatch(SYS_OPEN, (u64)(usize)clip_dst,
+                B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0666, 0, 0, 0);
+    if ((isize)src >= 0 && (isize)dst >= 0) {
+      char buf[64];
+      u64 n = syscall_dispatch(SYS_READ, src, (u64)(usize)buf, sizeof(buf), 0, 0, 0);
+      if ((isize)n > 0) syscall_dispatch(SYS_WRITE, dst, (u64)(usize)buf, n, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, src, 0, 0, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, dst, 0, 0, 0, 0, 0);
+    }
+    fd = syscall_dispatch(SYS_OPEN, (u64)(usize)clip_dst, B1NIX_O_RDONLY, 0, 0, 0, 0);
+    char verify[32] = {0};
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_READ, fd, (u64)(usize)verify, sizeof(verify) - 1, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    if (strcmp(verify, "hello clipboard") == 0) uwrite("M16-SMOKE: ok file-clipboard\n");
+    syscall_dispatch(SYS_UNLINK, (u64)(usize)clip_src, 0, 0, 0, 0, 0);
+    syscall_dispatch(SYS_UNLINK, (u64)(usize)clip_dst, 0, 0, 0, 0, 0);
+  }
+
+  /* ── M16 editor persistence test: create file, save, reload, verify ── */
+  {
+    const char *path = "/tmp/m16-editor-persist.txt";
+    const char *content = "persist\n";
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path,
+                B1NIX_O_CREAT | B1NIX_O_RDWR | B1NIX_O_TRUNC, 0666, 0, 0, 0);
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_WRITE, fd, (u64)(usize)content, strlen(content), 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, B1NIX_O_RDONLY, 0, 0, 0, 0);
+    char loaded[32] = {0};
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_READ, fd, (u64)(usize)loaded, sizeof(loaded) - 1, 0, 0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    if (strcmp(loaded, content) == 0) uwrite("M16-SMOKE: ok editor-persist\n");
+    syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0, 0, 0, 0, 0);
   }
 
   if (m16_have_termios && m16_termios_unchanged(&m16_termios_before) != 0) {

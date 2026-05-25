@@ -2,6 +2,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <b1nix/errno.h>
+#include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/dirent.h>
 #include <tui.h>
@@ -51,6 +52,81 @@ static void resolve_path(const char *cwd, const char *rel, char *abs)
 		strcat(abs, "/");
 	}
 	strcat(abs, rel);
+}
+
+/* Read a line of input from user into buf (up to max_len). Returns length. */
+static int read_input(char *buf, int max_len)
+{
+	int pos = 0;
+	while (1) {
+		int key = tui_get_key();
+		if (key == KEY_ENTER || key == '\n') { buf[pos] = '\0'; return pos; }
+		if (key == KEY_ESC) { buf[0] = '\0'; return -1; }
+		if (key == KEY_BACKSP || key == 0x7F) {
+			if (pos > 0) { pos--; tui_write("\b \b"); }
+		} else if (key >= 32 && key <= 126 && pos < max_len - 1) {
+			buf[pos++] = (char)key;
+			char tmp[2] = { (char)key, '\0' };
+			tui_write(tmp);
+		}
+	}
+}
+
+/* ── File Operation Helpers (F5-F8) ── */
+
+static int copy_file_op(const char *src_path, const char *dst_path)
+{
+	u64 src_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)src_path,
+	                 B1NIX_O_RDONLY, 0, 0, 0, 0);
+	if ((isize)src_fd < 0) return -1;
+	u64 dst_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)dst_path,
+	                 B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC,
+	                 0666, 0, 0, 0);
+	if ((isize)dst_fd < 0) { syscall_dispatch(SYS_CLOSE, src_fd, 0,0,0,0,0); return -1; }
+	char buf[512];
+	int ret = 0;
+	while (1) {
+		u64 n = syscall_dispatch(SYS_READ, src_fd, (u64)(usize)buf, sizeof(buf), 0, 0, 0);
+		if (n == 0 || (isize)n < 0) break;
+		u64 w = syscall_dispatch(SYS_WRITE, dst_fd, (u64)(usize)buf, n, 0, 0, 0);
+		if ((isize)w < 0 || w != n) { ret = -1; break; }
+	}
+	syscall_dispatch(SYS_CLOSE, src_fd, 0,0,0,0,0);
+	syscall_dispatch(SYS_CLOSE, dst_fd, 0,0,0,0,0);
+	return ret;
+}
+
+static int copy_dir_op(const char *src_dir, const char *dst_dir)
+{
+	u64 mkret = syscall_dispatch(SYS_MKDIR, (u64)(usize)dst_dir, 0755, 0,0,0,0);
+	if ((isize)mkret < 0 && (isize)mkret != -EEXIST) return -1;
+	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)src_dir, B1NIX_O_RDONLY, 0,0,0,0);
+	if ((isize)fd < 0) return -1;
+	struct dirent entries[64];
+	u64 count = syscall_dispatch(SYS_GETDENTS, fd, (u64)(usize)entries, sizeof(entries), 0,0,0);
+	syscall_dispatch(SYS_CLOSE, fd, 0,0,0,0,0);
+	if (count == 0 || (isize)count < 0) return 0;
+	usize num = count / sizeof(struct dirent);
+	for (usize i = 0; i < num; i++) {
+		const char *name = entries[i].name;
+		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
+		char child_src[256], child_dst[256];
+		snprintf(child_src, sizeof(child_src), "%s/%s", src_dir, name);
+		snprintf(child_dst, sizeof(child_dst), "%s/%s", dst_dir, name);
+		if (entries[i].is_dir) { if (copy_dir_op(child_src, child_dst) != 0) return -1; }
+		else { if (copy_file_op(child_src, child_dst) != 0) return -1; }
+	}
+	return 0;
+}
+
+static int delete_file_op(const char *path) {
+	isize ret = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0,0,0,0,0);
+	return (ret < 0 && ret != -ENOENT) ? -1 : 0;
+}
+
+static int remove_dir_op(const char *path) {
+	isize ret = (isize)syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0,0,0,0,0);
+	return (ret < 0 && ret != -ENOENT) ? -1 : 0;
 }
 
 static int read_directory(struct panel *p)
@@ -190,7 +266,7 @@ static void mc_render_screen(void)
 	tui_title_bar(0, " Mini Commander (b1nix) ", 0, 7);
 
 	/* Draw function key bar */
-	tui_write_at(TUI_ROWS - 1, 1, "F1-Help F2-Menu F3-8 Deferred F10-Quit",
+	tui_write_at(TUI_ROWS - 1, 1, "F1-Help F5-Copy F6-Move F7-MkDir F8-Delete F10-Quit",
 					TUI_COLS - 2, 0, 7);
 
 	/* Draw panels */
@@ -291,21 +367,19 @@ static int mc_handle_key(int key)
 		tui_clear_screen();
 		tui_write_at(1, 1, "Mini Commander Help", TUI_COLS - 2, 7, 0);
 		tui_write_at(3, 1, "F1  - This help screen", TUI_COLS - 2, 7, 0);
-		tui_write_at(4, 1, "F2  - Menu (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(4, 1, "F2  - Context menu (deferred)", TUI_COLS - 2, 7, 0);
 		tui_write_at(5, 1, "F3  - View file content (deferred)", TUI_COLS - 2, 7, 0);
 		tui_write_at(6, 1, "F4  - Edit file (deferred)", TUI_COLS - 2, 7, 0);
-		tui_write_at(7, 1, "F5  - Copy file/dir (deferred)", TUI_COLS - 2, 7, 0);
-		tui_write_at(8, 1, "F6  - Move file/dir (deferred)", TUI_COLS - 2, 7, 0);
-		tui_write_at(9, 1, "F7  - Create directory (deferred)", TUI_COLS - 2, 7, 0);
-		tui_write_at(10, 1, "F8  - Delete file/dir (deferred)", TUI_COLS - 2, 7, 0);
+		tui_write_at(7, 1, "F5  - Copy file/dir to other panel", TUI_COLS - 2, 7, 0);
+		tui_write_at(8, 1, "F6  - Move file/dir to other panel", TUI_COLS - 2, 7, 0);
+		tui_write_at(9, 1, "F7  - Create directory", TUI_COLS - 2, 7, 0);
+		tui_write_at(10, 1, "F8  - Delete file/dir", TUI_COLS - 2, 7, 0);
 		tui_write_at(11, 1, "F10 - Quit", TUI_COLS - 2, 7, 0);
 		tui_write_at(13, 1, "TAB - Switch panel", TUI_COLS - 2, 7, 0);
 		tui_write_at(14, 1, "Arrows - Navigate", TUI_COLS - 2, 7, 0);
 		tui_write_at(15, 1, "ENTER - Open directory", TUI_COLS - 2, 7, 0);
 		tui_write_at(TUI_ROWS - 1, 1, "Press any key to continue", TUI_COLS - 2, 0, 7);
-		if (!mc_smoke_mode) {
-			tui_get_key();
-		}
+		if (!mc_smoke_mode) tui_get_key();
 		return 1;
 
 	case KEY_F2:
@@ -314,12 +388,87 @@ static int mc_handle_key(int key)
 
 	case KEY_F3:
 	case KEY_F4:
-	case KEY_F5:
-	case KEY_F6:
-	case KEY_F7:
-	case KEY_F8:
-		tui_write_at(TUI_ROWS - 2, 1, "File operations are deferred for M16", TUI_COLS - 2, 0, 7);
+		tui_write_at(TUI_ROWS - 2, 1, "F3/F4 are deferred for M16", TUI_COLS - 2, 0, 7);
 		return 1;
+
+	case KEY_F5: {
+		struct panel *src_p = &panels[active_panel];
+		struct panel *dst_p = &panels[1 - active_panel];
+		if (src_p->selected >= src_p->file_count) return 1;
+		const char *name = src_p->files[src_p->selected].name;
+		char src_path[256], dst_path[256];
+		resolve_path(src_p->current_dir, name, src_path);
+		resolve_path(dst_p->current_dir, name, dst_path);
+		int ret;
+		if (src_p->files[src_p->selected].is_dir) ret = copy_dir_op(src_path, dst_path);
+		else ret = copy_file_op(src_path, dst_path);
+		tui_write_at(TUI_ROWS - 2, 1, ret == 0 ? "Copy successful." : "Copy failed.",
+			TUI_COLS - 2, ret == 0 ? 2 : 1, 0);
+		if (!mc_smoke_mode) tui_get_key();
+		read_directory(&panels[0]); read_directory(&panels[1]);
+		return 1;
+	}
+
+	case KEY_F6: {
+		struct panel *src_p = &panels[active_panel];
+		struct panel *dst_p = &panels[1 - active_panel];
+		if (src_p->selected >= src_p->file_count) return 1;
+		const char *name = src_p->files[src_p->selected].name;
+		char src_path[256], dst_path[256];
+		resolve_path(src_p->current_dir, name, src_path);
+		resolve_path(dst_p->current_dir, name, dst_path);
+		isize ret = (isize)syscall_dispatch(SYS_RENAME, (u64)(usize)src_path, (u64)(usize)dst_path, 0,0,0,0);
+		if (ret < 0) {
+			int copy_ok;
+			if (src_p->files[src_p->selected].is_dir) copy_ok = copy_dir_op(src_path, dst_path);
+			else copy_ok = copy_file_op(src_path, dst_path);
+			if (copy_ok == 0) {
+				if (src_p->files[src_p->selected].is_dir)
+					ret = (isize)syscall_dispatch(SYS_RMDIR, (u64)(usize)src_path, 0,0,0,0,0);
+				else
+					ret = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)src_path, 0,0,0,0,0);
+			} else ret = -1;
+		}
+		tui_write_at(TUI_ROWS - 2, 1, ret == 0 ? "Move successful." : "Move failed.",
+			TUI_COLS - 2, ret == 0 ? 2 : 1, 0);
+		if (!mc_smoke_mode) tui_get_key();
+		read_directory(&panels[0]); read_directory(&panels[1]);
+		return 1;
+	}
+
+	case KEY_F7: {
+		char dirname[128];
+		tui_write_at(TUI_ROWS - 2, 1, "Create directory: ", TUI_COLS - 2, 7, 0);
+		if (read_input(dirname, sizeof(dirname)) > 0) {
+			char full_path[256];
+			resolve_path(panels[active_panel].current_dir, dirname, full_path);
+			isize ret = (isize)syscall_dispatch(SYS_MKDIR, (u64)(usize)full_path, 0755, 0,0,0,0);
+			tui_write_at(TUI_ROWS - 2, 1,
+				ret == 0 ? "Directory created." : ret == -EEXIST ? "Already exists." : "Failed.",
+				TUI_COLS - 2, ret == 0 ? 2 : 1, 0);
+			if (!mc_smoke_mode) tui_get_key();
+			read_directory(&panels[0]); read_directory(&panels[1]);
+		}
+		return 1;
+	}
+
+	case KEY_F8: {
+		struct panel *p = &panels[active_panel];
+		if (p->selected >= p->file_count) return 1;
+		char full_path[256];
+		resolve_path(p->current_dir, p->files[p->selected].name, full_path);
+		isize ret;
+		if (p->files[p->selected].is_dir)
+			ret = (isize)syscall_dispatch(SYS_RMDIR, (u64)(usize)full_path, 0,0,0,0,0);
+		else
+			ret = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)full_path, 0,0,0,0,0);
+		tui_write_at(TUI_ROWS - 2, 1,
+			ret == 0 ? "Deleted." : ret == -ENOTEMPTY ? "Dir not empty." : "Delete failed.",
+			TUI_COLS - 2, ret == 0 ? 2 : 1, 0);
+		if (!mc_smoke_mode) tui_get_key();
+		read_directory(&panels[0]); read_directory(&panels[1]);
+		return 1;
+	}
 
 	case KEY_F10:
 	case KEY_ESC:
