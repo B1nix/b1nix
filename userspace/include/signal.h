@@ -12,7 +12,11 @@
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
 #define SIG_UNBLOCK 2
+#define SIG_BLOCK   0
+#define SIG_SETMASK 1
 #define SA_SIGINFO 4
+#define SA_RESTORER 0x04000000
+#define SA_NODEFER  0x40000000
 
 typedef void (*sighandler_t)(int);
 

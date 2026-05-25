@@ -1319,7 +1319,7 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
 }
 
 void vfs_handle_retain(struct vfs_handle *h) {
-  if (!h)
+  if (!h || h->used != 1 || h->refcount <= 0)
     return;
   h->refcount++;
 }
@@ -1341,13 +1341,14 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 }
 
 void vfs_handle_release(struct vfs_handle *h) {
-  if (!h)
+  if (!h || h->used != 1 || h->refcount <= 0)
     return;
   if (h->refcount > 1) {
     h->refcount--;
     return;
   }
 
+  h->used = 0;
   if (h->ops && h->ops->release) {
     h->ops->release(h);
   } else if (h->kind == VFS_HANDLE_NODE && h->node) {

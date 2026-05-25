@@ -263,8 +263,19 @@ sighandler_t signal(int signum, sighandler_t handler)
 }
 
 int sigemptyset(sigset_t *set) { if (set) { *set = 0; return 0; } return -1; }
-int sigaddset(sigset_t *set, int signum) { if (set) { *set |= (1UL << (signum % 64)); return 0; } return -1; }
-int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) { (void)how; (void)set; (void)oldset; return 0; }
+int sigaddset(sigset_t *set, int signum) {
+  if (!set || signum <= 0 || signum >= 64) return -1;
+  *set |= (1UL << (signum - 1));
+  return 0;
+}
+int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
+  int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
+  if (rc < 0) {
+    errno = -rc;
+    return -1;
+  }
+  return 0;
+}
 
 __asm__(
 	".global __sig_restorer\n"
@@ -283,6 +294,7 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 		if (!kernel_act.sa_restorer) {
 			kernel_act.sa_restorer = __sig_restorer;
 		}
+		kernel_act.sa_flags |= SA_RESTORER;
 		act = &kernel_act;
 	}
 	int rc = (int)syscall(SYS_SIGNAL, signum, (long)act, (long)oldact, 0);

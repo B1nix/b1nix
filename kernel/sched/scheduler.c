@@ -245,6 +245,9 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->exit_code = 0;
   task->pending_signals = 0;
   task->blocked_signals = 0;
+  task->last_stop_signal = 0;
+  task->stop_report_pending = 0;
+  task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
   task_init_cred(task);
@@ -290,6 +293,10 @@ int scheduler_fork_current(void) {
 
   // Clear inherited pending signals and sleep/block states
   child->pending_signals = 0;
+  child->blocked_signals = 0;
+  child->last_stop_signal = 0;
+  child->stop_report_pending = 0;
+  child->continued_report_pending = 0;
   child->wake_tick = 0;
   child->wait_chan = 0;
 
@@ -615,13 +622,26 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               }
             }
              return child_id;
-          } else if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_BLOCKED) {
-            // Task is stopped (e.g. by SIGSTOP, SIGTSTP, etc.)
+          } else if ((options & (B1NIX_WUNTRACED | B1NIX_WCONTINUED)) &&
+                     (tasks[i].state == TASK_STOPPED ||
+                      tasks[i].continued_report_pending)) {
             int child_id = tasks[i].id;
-            if (status)
-              *status = 0x7F; // Stopped
-            interrupts_enable();
-             return child_id;
+            if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_STOPPED &&
+                tasks[i].stop_report_pending) {
+              if (status)
+                *status = ((tasks[i].last_stop_signal & 0xFF) << 8) | 0x7F;
+              tasks[i].stop_report_pending = 0;
+              interrupts_enable();
+              return child_id;
+            }
+            if ((options & B1NIX_WCONTINUED) &&
+                tasks[i].continued_report_pending) {
+              if (status)
+                *status = 0xFFFF;
+              tasks[i].continued_report_pending = 0;
+              interrupts_enable();
+              return child_id;
+            }
           }
         }
       }
@@ -675,6 +695,9 @@ void scheduler_dump_tasks(void) {
         break;
       case TASK_SLEEPING:
         state_str = "SLEEPING";
+        break;
+      case TASK_STOPPED:
+        state_str = "STOPPED";
         break;
       case TASK_DEAD:
         state_str = "DEAD";
@@ -857,7 +880,10 @@ int scheduler_kill(usize task_id, int sig) {
       tasks[i].pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
-      if (tasks[i].state == TASK_BLOCKED) {
+      if (sig == SIGCONT && tasks[i].state == TASK_STOPPED) {
+        tasks[i].continued_report_pending = 1;
+      }
+      if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
         tasks[i].state = TASK_READY;
       }
       interrupts_enable();
@@ -879,7 +905,10 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       tasks[i].pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
-      if (tasks[i].state == TASK_BLOCKED) {
+      if (sig == SIGCONT && tasks[i].state == TASK_STOPPED) {
+        tasks[i].continued_report_pending = 1;
+      }
+      if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
         tasks[i].state = TASK_READY;
       }
       sent++;
@@ -905,11 +934,39 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
   }
   if (act) {
     current_task->sigactions[sig - 1] = *act;
-    /* Remove SA_NODEFER: block the signal by default */
-    if (!(act->sa_flags & SA_NODEFER)) {
-      current_task->blocked_signals &= ~(1ULL << (sig - 1));
+  }
+  interrupts_enable();
+  return 0;
+}
+
+int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset) {
+  if (!current_task)
+    return -1;
+
+  interrupts_disable();
+  u64 old = current_task->blocked_signals;
+  if (oldset) {
+    *oldset = old;
+  }
+
+  if (set) {
+    u64 mask = *set;
+    /* SIGKILL/SIGSTOP cannot be blocked. */
+    mask &= ~(1ULL << (SIGKILL - 1));
+    mask &= ~(1ULL << (SIGSTOP - 1));
+
+    if (how == 0) { /* SIG_BLOCK */
+      current_task->blocked_signals |= mask;
+    } else if (how == 2) { /* SIG_UNBLOCK */
+      current_task->blocked_signals &= ~mask;
+    } else if (how == 1) { /* SIG_SETMASK */
+      current_task->blocked_signals = mask;
+    } else {
+      interrupts_enable();
+      return -1;
     }
   }
+
   interrupts_enable();
   return 0;
 }
@@ -1183,13 +1240,19 @@ void scheduler_deliver_pending_signals(void) {
         /* unreachable */
       case SIGCONT:
         current_task->pending_signals &= ~(1ULL << (sig - 1));
-        current_task->state = TASK_READY;
+        if (current_task->state == TASK_STOPPED) {
+          current_task->state = TASK_READY;
+          current_task->continued_report_pending = 1;
+        }
         continue;
       case SIGSTOP:
       case SIGTSTP:
       case SIGTTIN:
       case SIGTTOU:
-        current_task->state = TASK_BLOCKED;
+        current_task->state = TASK_STOPPED;
+        current_task->last_stop_signal = sig;
+        current_task->stop_report_pending = 1;
+        current_task->pending_signals &= ~(1ULL << (sig - 1));
         scheduler_yield();
         continue;
       case SIGCHLD:

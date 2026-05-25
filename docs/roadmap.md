@@ -198,7 +198,7 @@ and broader utility flag compatibility.
 - [x] `done` `brk`, `munmap`, `ioctl`, and termios syscalls.
 - [x] `done` `setsid`, `getpgrp`, `setpgrp`, `setpriority`, `getpriority` syscalls.
 - [x] `done` `statfs`, `fstatfs`, `fchmod`, `fchown`, `umask`, `syncfs`, and `link` syscalls.
-- [x] `partial` Add POSIX signal ABI: kernel-side `sigaction` table and pending-signal bitmask exist; default actions and `SIG_IGN` work; userspace API/semantics remain incomplete and need libc/ABI hardening.
+- [x] `done` Add POSIX signal ABI: kernel-side `sigaction` table with pending/block masks, userspace restorer trampoline, validated `sigreturn` frame restore, and `sigprocmask` semantics with smoke coverage.
 
 ## M13: Userspace ABI, libc, and POSIX Runtime Hardening
 
@@ -208,7 +208,7 @@ and broader utility flag compatibility.
 - [x] `done` Verify stdio/basic libc baseline used by userland programs: `printf`, `snprintf`, `puts`, and file stdio lifecycle (`fopen`/`fwrite`/`fread`/`fclose`).
 - [x] `done` Verify exec/fd runtime behavior through real exec boundaries: deterministic failed-`execve` status, parent integrity, fd inheritance, `dup2`, and close-on-exec behavior.
 - [x] `done` Verify shell/userland ABI integration baseline: `/bin/sh -c` argv and status semantics.
-- [ ] `planned` Complete full POSIX userspace signal semantics and libc `errno` behavior parity.
+- [x] `done` Complete full POSIX userspace signal baseline: `sigaction` handler delivery, mask/unmask via `sigprocmask`, robust `sigreturn` path, and red-zone-safe signal frame layout.
 - [ ] `planned` Enforce strict 16-byte stack alignment validation at Ring 3 entry using explicit architectural assertions; reject non-compliant frames immediately.
 - [ ] `planned` Audit all libc syscall wrappers to ensure unknown or negative kernel return values are never leaked, mapping them strictly to standard POSIX `errno` values.
 
@@ -231,7 +231,7 @@ and broader utility flag compatibility.
 
 ## M15: IPC, Security & Standard OS Features
 
-- [x] `partial` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): QEMU/dev baseline covers default actions, `SIG_IGN`, and a userspace handler baseline; full POSIX semantics remain incomplete.
+- [x] `done` Process signals (`SIGINT`, `SIGKILL`, `SIGSEGV`, etc.): default actions, `SIG_IGN`, userspace handlers, mask semantics, and `sigreturn` context restoration are implemented and smoke-verified.
 - [x] `done` Inter-process communication message queue baseline (`mq_open/send/receive/close/unlink`) with smoke verification.
 - [x] `partial` POSIX-style shared memory (`shmget`, `shmat`, `shmdt`, `shmctl`) baseline with smoke verification; production-grade multi-process semantics remain follow-up.
 - [x] `initial` User and group ID management (`uid`, `euid`, `gid`, `egid`, `setuid`, `setgid`) baseline.
@@ -240,7 +240,7 @@ and broader utility flag compatibility.
 - [x] `partial` BusyBox-style standard utilities.
 - [x] `done` Add UNIX domain sockets.
 - [x] `done` Enforce permissions/capabilities consistently through VFS and process credentials.
-- [ ] `planned` Complete full userspace signal semantics (`sigaction` masks, nested delivery, robust `sigreturn` ABI behavior) and remove libc stubs.
+- [x] `done` Complete userspace signal semantics baseline (`sigaction` masks, nested-delivery-safe frame setup, robust `sigreturn` ABI behavior) and remove libc stubs for `sigprocmask`.
 - [ ] `planned` Harden IPC interfaces (`mq_*`, `shm*`): enforce strict user-space pointer verification using `copyin`/`copyout` wrappers; direct raw pointer dereferencing inside the kernel is strictly prohibited.
 
 ## M16: User Space Applications & TUI

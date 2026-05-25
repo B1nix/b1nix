@@ -2,6 +2,7 @@
 #define B1NIX_SCHED_H
 #define B1NIX_WNOHANG 1
 #define B1NIX_WUNTRACED 2
+#define B1NIX_WCONTINUED 8
 
 #include <b1nix/types.h>
 
@@ -15,6 +16,7 @@ enum task_state {
   TASK_READY,
   TASK_BLOCKED,
   TASK_SLEEPING,
+  TASK_STOPPED,
   TASK_DEAD,
 };
 
@@ -89,6 +91,7 @@ struct cpu_context {
 #define SA_NOCLDSTOP 1
 #define SA_NOCLDWAIT 2
 #define SA_SIGINFO 4
+#define SA_RESTORER 0x04000000
 #define SA_ONSTACK 0x08000000
 #define SA_RESTART 0x10000000
 #define SA_NODEFER 0x40000000
@@ -155,6 +158,9 @@ struct task {
   u64 pml4_phys;
   struct vm_area *vma_list;
   int in_kernel_syscall;
+  int last_stop_signal;
+  int stop_report_pending;
+  int continued_report_pending;
 };
 
 extern struct task *current_task;
@@ -192,6 +198,7 @@ int scheduler_kill(usize task_id, int sig);
 int scheduler_kill_process_group(usize pgrp, int sig);
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old);
+int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset);
 void scheduler_deliver_pending_signals(void);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);

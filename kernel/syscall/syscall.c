@@ -1371,7 +1371,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   u64 ret = 0;
   switch (number) {
   case SYS_WRITE:
-    return (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+    ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
+    break;
   case SYS_EXIT:
     scheduler_exit_current((int)arg0);
     ret = 0;
@@ -1398,7 +1399,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)sys_open((const char *)(usize)arg0, (int)arg1);
   }
   case SYS_READ:
-    return (u64)sys_read((int)arg0, (void *)(usize)arg1, (usize)arg2);
+    ret = (u64)sys_read((int)arg0, (void *)(usize)arg1, (usize)arg2);
+    break;
   case SYS_CLOSE:
     if (scheduler_fd_get((int)arg0) == 0)
       return (u64)-EBADF;
@@ -1525,7 +1527,13 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     scheduler_sleep_ticks(arg0);
     return 0;
   case SYS_KILL: {
-    u64 kill_ret = (u64)scheduler_kill((usize)arg0, (int)arg1);
+    isize target = (isize)arg0;
+    u64 kill_ret = (u64)-EINVAL;
+    if (target < 0) {
+      kill_ret = (u64)scheduler_kill_process_group((usize)(-target), (int)arg1);
+    } else {
+      kill_ret = (u64)scheduler_kill((usize)target, (int)arg1);
+    }
     if (frame) {
       frame->rax = kill_ret;
       arch_check_and_deliver_signals(frame);
@@ -1543,6 +1551,26 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     if (scheduler_sigaction(sig, arg1 ? &act : 0, &old) < 0)
       return (u64)-EINVAL;
     if (arg2 && syscall_copyout((void *)(usize)arg2, &old, sizeof(old)) != 0)
+      return (u64)-EFAULT;
+    return 0;
+  }
+  case SYS_SIGPROCMASK: {
+    int how = (int)arg0;
+    u64 set_val = 0;
+    u64 old_val = 0;
+    u64 *set_ptr = 0;
+
+    if (arg1) {
+      if (syscall_copyin(&set_val, (void *)(usize)arg1, sizeof(set_val)) != 0)
+        return (u64)-EFAULT;
+      set_ptr = &set_val;
+    }
+
+    if (scheduler_sigprocmask(how, set_ptr, arg2 ? &old_val : 0) < 0)
+      return (u64)-EINVAL;
+
+    if (arg2 &&
+        syscall_copyout((void *)(usize)arg2, &old_val, sizeof(old_val)) != 0)
       return (u64)-EFAULT;
     return 0;
   }

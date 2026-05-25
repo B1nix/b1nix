@@ -7,6 +7,7 @@
 #include <string.h>
 
 #define AIO_MAX_ENTRIES 128
+#define AIO_MAX_IO_SIZE (1024 * 1024)
 
 struct aio_request {
   struct aio_request *next;
@@ -32,7 +33,6 @@ static struct aio_request *aio_pending_head = 0;
 static struct aio_request *aio_pending_tail = 0;
 static volatile int aio_pending_lock = 0;
 static char aio_worker_chan;
-static volatile int aio_exec_lock = 0;
 static int aio_worker_created = 0;
 static int aio_worker_started = 0;
 static struct aio_context *aio_ctx_list = 0;
@@ -97,15 +97,6 @@ static void aio_pending_acquire(void) {
 
 static void aio_pending_release(void) {
   __atomic_clear(&aio_pending_lock, __ATOMIC_RELEASE);
-}
-
-static void aio_exec_acquire(void) {
-  while (__atomic_test_and_set(&aio_exec_lock, __ATOMIC_ACQUIRE))
-    scheduler_yield();
-}
-
-static void aio_exec_release(void) {
-  __atomic_clear(&aio_exec_lock, __ATOMIC_RELEASE);
 }
 
 static u32 aio_cq_count_locked(const struct aio_context *ctx) {
@@ -189,23 +180,19 @@ static void aio_worker_thread(void *arg) {
       if (!req->handle->ops->read || !req->kbuf) {
         res = -EINVAL;
       } else {
-        aio_exec_acquire();
-        usize saved = req->handle->offset;
-        req->handle->offset = (usize)req->sqe.offset;
-        res = req->handle->ops->read(req->handle, req->kbuf, req->sqe.len);
-        req->handle->offset = saved;
-        aio_exec_release();
+        /* Use a local handle copy so AIO offset never races on shared fd state. */
+        struct vfs_handle local = *req->handle;
+        local.offset = (usize)req->sqe.offset;
+        res = local.ops->read(&local, req->kbuf, req->sqe.len);
       }
     } else if (req->sqe.opcode == B1NIX_AIO_OP_WRITE) {
       if (!req->handle->ops->write || !req->kbuf) {
         res = -EINVAL;
       } else {
-        aio_exec_acquire();
-        usize saved = req->handle->offset;
-        req->handle->offset = (usize)req->sqe.offset;
-        res = req->handle->ops->write(req->handle, req->kbuf, req->sqe.len);
-        req->handle->offset = saved;
-        aio_exec_release();
+        /* Use a local handle copy so AIO offset never races on shared fd state. */
+        struct vfs_handle local = *req->handle;
+        local.offset = (usize)req->sqe.offset;
+        res = local.ops->write(&local, req->kbuf, req->sqe.len);
       }
     }
     req->result = res;
@@ -255,6 +242,8 @@ int vfs_submit_aio(struct task *owner, const struct b1nix_aio_sqe *sqe) {
     return -EINVAL;
   if (sqe->len == 0)
     return 0;
+  if (sqe->len > AIO_MAX_IO_SIZE)
+    return -E2BIG;
 
   struct vfs_handle *h = 0;
   if (sqe->fd >= 0 && owner->fd_table && (usize)sqe->fd < owner->fd_capacity) {

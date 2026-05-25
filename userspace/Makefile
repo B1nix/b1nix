@@ -25,6 +25,7 @@ BINARIES := \
 	$(BUILD)/bin/native_smoke \
 	$(BUILD)/bin/m12_smoke \
 	$(BUILD)/bin/m13_smoke \
+	$(BUILD)/bin/m13_job_control \
 	$(BUILD)/bin/m14_smoke \
 	$(BUILD)/bin/m15_smoke \
 	$(BUILD)/bin/m8_aio_test \

@@ -1,5 +1,6 @@
 #include <b1nix/arch_x86.h>
 #include <b1nix/sched.h>
+#include <b1nix/signal.h>
 #include <b1nix/syscall.h>
 #include <b1nix/arch.h>
 #include <b1nix/klog.h>
@@ -9,51 +10,51 @@
 
 extern struct task *current_task;
 
+static int is_valid_user_code_ptr(u64 ptr) {
+  if (ptr == 0)
+    return 0;
+  return ptr < 0x0000800000000000ULL;
+}
+
 static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
-    struct task *t = current_task;
-    struct sigaction *sa = &t->sigactions[sig - 1]; // sig 1 is index 0
+  struct task *t = current_task;
+  struct sigaction *sa = &t->sigactions[sig - 1];
 
-    u64 sp = frame->rsp;
+  /* Preserve x86_64 SysV red zone (128 bytes below RSP). */
+  u64 user_rsp = frame->rsp - 128;
+  u64 frame_base = (user_rsp - sizeof(struct b1nix_sigframe)) & ~0xFULL;
+  u64 restorer_slot = frame_base - sizeof(u64);
 
-    /* Ensure 16-byte alignment before pushing anything */
-    sp &= ~0xf;
+  if (!is_valid_user_code_ptr((u64)(usize)sa->sa_handler) ||
+      !is_valid_user_code_ptr((u64)(usize)sa->sa_restorer)) {
+    scheduler_exit_current(-SIGSEGV);
+    return;
+  }
 
-    /* Space for saved context (struct interrupt_frame) */
-    sp -= sizeof(struct interrupt_frame);
+  struct b1nix_sigframe sf;
+  memset(&sf, 0, sizeof(sf));
+  sf.magic = B1NIX_SIGFRAME_MAGIC;
+  sf.old_blocked_signals = t->blocked_signals;
+  sf.saved_frame = *frame;
 
-    /* Copy current kernel state (interrupt_frame) to user stack */
-    if (syscall_copyout((void*)sp, frame, sizeof(struct interrupt_frame)) < 0) {
-        console_write("signal: failed to push context to user stack\n");
-        scheduler_exit_current(-SIGSEGV);
-        return;
-    }
+  if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
+      syscall_copyout((void *)(usize)restorer_slot, &sa->sa_restorer,
+                      sizeof(sa->sa_restorer)) < 0) {
+    console_write("signal: failed to build user frame\n");
+    scheduler_exit_current(-SIGSEGV);
+    return;
+  }
 
-    /* Push saved blocked_signals mask */
-    sp -= 8;
-    if (syscall_copyout((void*)sp, &t->blocked_signals, 8) < 0) {
-        console_write("signal: failed to push blocked_signals to user stack\n");
-        scheduler_exit_current(-SIGSEGV);
-        return;
-    }
+  /* Block mask for handler execution. */
+  t->blocked_signals |= sa->sa_mask;
+  if (!(sa->sa_flags & SA_NODEFER))
+    t->blocked_signals |= (1ULL << (sig - 1));
 
-    /* Push restorer address (trampoline) */
-    sp -= 8;
-    if (syscall_copyout((void*)sp, &sa->sa_restorer, 8) < 0) {
-        console_write("signal: failed to push restorer to user stack\n");
-        scheduler_exit_current(-SIGSEGV);
-        return;
-    }
-
-    /* Update frame for return to handler */
-    frame->rsp = sp;
-    frame->rip = (u64)sa->sa_handler;
-    frame->rdi = (u64)sig;
-
-    /* If this was called from a syscall, we must also update task->saved_user_rsp
-     * because x86_syscall_return restores RSP from there. */
-    if (t->saved_user_rsp != 0) {
-        t->saved_user_rsp = sp;
-    }
+  frame->rip = (u64)(usize)sa->sa_handler;
+  frame->rsp = restorer_slot;
+  frame->rdi = (u64)sig;
+  if (t->saved_user_rsp != 0)
+    t->saved_user_rsp = frame->rsp;
 }
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
@@ -78,17 +79,27 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                 /* Clear pending bit */
                 current_task->pending_signals &= ~(1ULL << (i - 1));
 
-                /* If not SA_NODEFER, block this signal during its handler */
-                if (!(sa->sa_flags & SA_NODEFER)) {
-                    current_task->blocked_signals |= (1ULL << (i - 1));
-                }
-
                 interrupts_enable();
                 return; /* Deliver one signal at a time */
             } else if (sa->sa_handler == SIG_DFL) {
                 /* Default actions: most kill the process */
                 if (i == SIGCHLD || i == SIGURG || i == SIGWINCH) {
                     current_task->pending_signals &= ~(1ULL << (i - 1));
+                } else if (i == SIGCONT) {
+                    current_task->pending_signals &= ~(1ULL << (i - 1));
+                    if (current_task->state == TASK_STOPPED) {
+                        current_task->state = TASK_READY;
+                        current_task->continued_report_pending = 1;
+                    }
+                } else if (i == SIGSTOP || i == SIGTSTP ||
+                           i == SIGTTIN || i == SIGTTOU) {
+                    current_task->state = TASK_STOPPED;
+                    current_task->last_stop_signal = i;
+                    current_task->stop_report_pending = 1;
+                    current_task->pending_signals &= ~(1ULL << (i - 1));
+                    interrupts_enable();
+                    scheduler_yield();
+                    return;
                 } else {
                     console_write("signal: process killed by signal\n");
                     scheduler_exit_current(-i);
@@ -101,38 +112,35 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
 }
 
 u64 sys_sigreturn(struct interrupt_frame *frame) {
-    struct task *t = current_task;
-    u64 sp = frame->rsp;
+  struct task *t = current_task;
+  u64 sp = frame->rsp;
+  u64 sf_addr = sp;
+  struct b1nix_sigframe sf;
 
-    /* Frame was pushed to user stack:
-     * [restorer]        <--- SP
-     * [blocked_signals] <--- SP + 8
-     * [interrupt_frame] <--- SP + 16
-     *
-     * The handler returns with `ret`, which pops [restorer]. The restorer then
-     * enters the kernel through `syscall`, so the saved user RSP points at
-     * [blocked_signals], not at [restorer].
-     */
+  if (syscall_copyin(&sf, (void *)(usize)sf_addr, sizeof(sf)) < 0) {
+    scheduler_exit_current(-SIGSEGV);
+  }
 
-    u64 blocked_signals_ptr = sp;
-    u64 context_ptr = sp + 8;
+  if (sf.magic != B1NIX_SIGFRAME_MAGIC) {
+    return (u64)-EINVAL;
+  }
 
-    u64 old_blocked;
-    if (syscall_copyin(&old_blocked, (void*)blocked_signals_ptr, 8) < 0) {
-        scheduler_exit_current(-SIGSEGV);
-    }
-    t->blocked_signals = old_blocked;
+  /* Privilege checks: user cannot forge kernel return state. */
+  if (sf.saved_frame.cs != 0x1B || sf.saved_frame.ss != 0x23) {
+    return (u64)-EINVAL;
+  }
+  if (sf.saved_frame.rip >= 0x0000800000000000ULL ||
+      sf.saved_frame.rsp >= 0x0000800000000000ULL) {
+    return (u64)-EINVAL;
+  }
 
-    struct interrupt_frame kframe;
-    if (syscall_copyin(&kframe, (void*)context_ptr, sizeof(kframe)) < 0) {
-        scheduler_exit_current(-SIGSEGV);
-    }
+  /* Preserve IF and keep user-modifiable status bits conservative. */
+  sf.saved_frame.rflags &= 0x00000000003f7fd7ULL;
+  sf.saved_frame.rflags |= 0x200ULL;
 
-    /* Restore register state into current kernel frame */
-    memcpy(frame, &kframe, sizeof(struct interrupt_frame));
+  t->blocked_signals = sf.old_blocked_signals;
+  memcpy(frame, &sf.saved_frame, sizeof(*frame));
+  t->saved_user_rsp = frame->rsp;
 
-    /* Update saved_user_rsp since it might have changed */
-    t->saved_user_rsp = frame->rsp;
-
-    return frame->rax;
+  return frame->rax;
 }

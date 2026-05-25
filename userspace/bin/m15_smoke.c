@@ -62,6 +62,39 @@ int main(int argc, char **argv) {
     marker("M15-SMOKE: fail signal-handler\n");
   }
 
+  /* 2.1) sigprocmask: blocked signal must remain pending until unblocked. */
+  sigset_t set = 0;
+  sigemptyset(&set);
+  sigaddset(&set, B1NIX_SIGUSR1);
+  int mask_ok = 1;
+  int before_hits = g_sigusr1_hits;
+  if (sigprocmask(SIG_BLOCK, &set, NULL) != 0) {
+    mask_ok = 0;
+  }
+  if ((int)syscall(SYS_KILL, self_pid, B1NIX_SIGUSR1) != 0) {
+    mask_ok = 0;
+  }
+  for (int i = 0; i < 8; i++) {
+    syscall(SYS_YIELD);
+  }
+  if (g_sigusr1_hits != before_hits) {
+    mask_ok = 0;
+  }
+  if (sigprocmask(SIG_UNBLOCK, &set, NULL) != 0) {
+    mask_ok = 0;
+  }
+  for (int i = 0; i < 16 && g_sigusr1_hits == before_hits; i++) {
+    syscall(SYS_YIELD);
+  }
+  if (g_sigusr1_hits == before_hits) {
+    mask_ok = 0;
+  }
+  if (mask_ok) {
+    marker("M15-SMOKE: ok signal-mask\n");
+  } else {
+    marker("M15-SMOKE: fail signal-mask\n");
+  }
+
   /* 3) SIG_IGN behavior. */
   memset(&act, 0, sizeof(act));
   act.sa_handler = SIG_IGN;
