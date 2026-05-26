@@ -2,52 +2,58 @@
 import os
 import sys
 
-PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-gcc_dir = os.path.join(PROJECT_DIR, "build/toolchain_build/gcc-13.2.0")
+if len(sys.argv) > 1:
+    gcc_dir = sys.argv[1]
+else:
+    PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    gcc_dir = os.path.join(PROJECT_DIR, "build/toolchain_build/gcc-13.2.0")
 
 if not os.path.exists(gcc_dir):
     print(f"Error: {gcc_dir} does not exist", file=sys.stderr)
     sys.exit(1)
 
+def clean(text):
+    return text.replace('\r\n', '\n')
+
 # 1. Modify gcc/config.gcc
 config_gcc_path = os.path.join(gcc_dir, "gcc/config.gcc")
-with open(config_gcc_path, "r") as f:
-    content = f.read()
+with open(config_gcc_path, "r", encoding="utf-8", errors="ignore") as f:
+    content = clean(f.read())
 
 # Add target config
 if "*-*-b1nix*" not in content:
-    target_case = """    *-*-vxworks7*)
+    target_case = clean("""    *-*-vxworks7*)
       # VxWorks 7 always has init/fini_array support and it is simpler to
       # just leverage this, sticking to what the system toolchain does:
       gcc_cv_initfini_array=yes
       ;;
   esac
-  ;;"""
-    replacement = target_case + """\n*-*-b1nix*)
+  ;;""")
+    replacement = target_case + clean("""\n*-*-b1nix*)
   gas=yes
   gnu_ld=yes
   default_use_cxa_atexit=no
   use_gcc_stdint=wrap
-  ;;"""
+  ;;""")
     content = content.replace(target_case, replacement)
 
-    x86_case = """x86_64-*-elf*)
+    x86_case = clean("""x86_64-*-elf*)
 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h"
-	;;"""
-    x86_replacement = x86_case + """\nx86_64-*-b1nix*)
+	;;""")
+    x86_replacement = x86_case + clean("""\nx86_64-*-b1nix*)
 	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h i386/x86-64.h b1nix.h"
 	tmake_file="${tmake_file} i386/t-i386elf t-fdpbit"
-	;;"""
+	;;""")
     content = content.replace(x86_case, x86_replacement)
 
-    with open(config_gcc_path, "w") as f:
+    with open(config_gcc_path, "w", encoding="utf-8") as f:
         f.write(content)
 
 # 2. Create gcc/config/b1nix.h
 b1nix_h_path = os.path.join(gcc_dir, "gcc/config/b1nix.h")
 os.makedirs(os.path.dirname(b1nix_h_path), exist_ok=True)
-with open(b1nix_h_path, "w") as f:
-    f.write("""#ifndef GCC_B1NIX_H
+with open(b1nix_h_path, "w", encoding="utf-8") as f:
+    f.write(clean("""#ifndef GCC_B1NIX_H
 #define GCC_B1NIX_H
 
 #undef TARGET_OS_CPP_BUILTINS
@@ -63,34 +69,34 @@ with open(b1nix_h_path, "w") as f:
 #define STANDARD_STARTFILE_PREFIX "/lib/"
 
 #endif
-""")
+"""))
 
 # 3. Modify libgcc/config.host
 config_host_path = os.path.join(gcc_dir, "libgcc/config.host")
-with open(config_host_path, "r") as f:
-    content = f.read()
+with open(config_host_path, "r", encoding="utf-8", errors="ignore") as f:
+    content = clean(f.read())
 
 if "x86_64-*-b1nix*" not in content:
-    host_case = """case ${host} in
-aarch64*-*-elf | aarch64*-*-rtems*)"""
-    replacement = """case ${host} in
+    host_case = clean("""case ${host} in
+aarch64*-*-elf | aarch64*-*-rtems*)""")
+    replacement = clean("""case ${host} in
 x86_64-*-b1nix*)
 	extra_parts="$extra_parts crtbegin.o crtend.o"
 	tmake_file="$tmake_file i386/t-crtstuff t-fdpbit"
 	;;
-aarch64*-*-elf | aarch64*-*-rtems*)"""
+aarch64*-*-elf | aarch64*-*-rtems*)""")
     content = content.replace(host_case, replacement)
-    with open(config_host_path, "w") as f:
+    with open(config_host_path, "w", encoding="utf-8") as f:
         f.write(content)
 
 # 4. Modify gcc/system.h
 system_h_path = os.path.join(gcc_dir, "gcc/system.h")
-with open(system_h_path, "r") as f:
-    content = f.read()
+with open(system_h_path, "r", encoding="utf-8", errors="ignore") as f:
+    content = clean(f.read())
 
 # We need to move the C++ includes above safe-ctype.h inclusion
 if '#include "safe-ctype.h"' in content:
-    cpp_block = """#ifdef __cplusplus
+    cpp_block = clean("""#ifdef __cplusplus
 #if defined (INCLUDE_ALGORITHM) || !defined (HAVE_SWAP_IN_UTILITY)
 # include <algorithm>
 #endif
@@ -117,17 +123,17 @@ if '#include "safe-ctype.h"' in content:
 # include <new>
 # include <utility>
 # include <type_traits>
-#endif"""
+#endif""")
     
     content = content.replace(cpp_block, "")
     
-    string_block = """#ifdef __cplusplus
+    string_block = clean("""#ifdef __cplusplus
 #ifdef INCLUDE_STRING
 # include <string>
 #endif
-#endif"""
+#endif""")
     
-    new_string_block = """#ifdef __cplusplus
+    new_string_block = clean("""#ifdef __cplusplus
 #ifdef INCLUDE_STRING
 # include <string>
 #endif
@@ -152,15 +158,60 @@ if '#include "safe-ctype.h"' in content:
 #ifdef INCLUDE_FUNCTIONAL
 # include <functional>
 #endif
+#ifdef INCLUDE_MEMORY
+# include <memory>
+#endif
+#ifdef INCLUDE_MUTEX
+# include <mutex>
+#endif
+#ifdef INCLUDE_SSTREAM
+# include <sstream>
+#endif
 # include <cstring>
 # include <initializer_list>
 # include <new>
 # include <utility>
 # include <type_traits>
-#endif"""
+#endif""")
+
+    # Strip the later inclusions that happen after safe-ctype.h
+    memory_block = clean("""#ifdef INCLUDE_MEMORY
+# include <memory>
+#endif""")
+    content = content.replace(memory_block, "")
+
+    mutex_block = clean("""#ifdef INCLUDE_MUTEX
+# include <mutex>
+#endif""")
+    content = content.replace(mutex_block, "")
+
+    sstream_block = clean("""#ifdef INCLUDE_SSTREAM
+# include <sstream>
+#endif""")
+    content = content.replace(sstream_block, "")
 
     content = content.replace(string_block, new_string_block)
-    with open(system_h_path, "w") as f:
+
+    with open(system_h_path, "w", encoding="utf-8") as f:
         f.write(content)
+
+# 5. Patch libstdc++-v3/crossconfig.m4 and libstdc++-v3/configure for b1nix
+crossconfig_path = os.path.join(gcc_dir, "libstdc++-v3/crossconfig.m4")
+if os.path.exists(crossconfig_path):
+    with open(crossconfig_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = clean(f.read())
+    if "*-b1nix*" not in content:
+        content = content.replace("*-cygwin* | *-solaris*)", "*-cygwin* | *-solaris* | *-b1nix*)")
+        with open(crossconfig_path, "w", encoding="utf-8") as f:
+            f.write(content)
+
+libstdcxx_configure_path = os.path.join(gcc_dir, "libstdc++-v3/configure")
+if os.path.exists(libstdcxx_configure_path):
+    with open(libstdcxx_configure_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = clean(f.read())
+    if "*-b1nix*" not in content:
+        content = content.replace("*-cygwin* | *-solaris*)", "*-cygwin* | *-solaris* | *-b1nix*)")
+        with open(libstdcxx_configure_path, "w", encoding="utf-8") as f:
+            f.write(content)
 
 print("GCC patched successfully via python script!")
