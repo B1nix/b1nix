@@ -2,6 +2,9 @@
 #define B1NIX_U_SIGNAL_H
 
 #define SIGINT  2
+#ifdef __cplusplus
+extern "C" {
+#endif
 #define SIGILL  4
 #define SIGABRT 6
 #define SIGBUS  7
@@ -19,6 +22,15 @@
 #define SA_NODEFER  0x40000000
 
 typedef void (*sighandler_t)(int);
+typedef int sig_atomic_t;
+
+int kill(int pid, int sig);
+
+#include <syscall.h>
+static inline int raise(int sig) {
+    int pid = (int)_syscall_raw(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+    return kill(pid, sig);
+}
 
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)
@@ -49,5 +61,9 @@ int sigdelset(sigset_t *set, int signum);
 int sigismember(const sigset_t *set, int signum);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+int kill(int pid, int sig);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

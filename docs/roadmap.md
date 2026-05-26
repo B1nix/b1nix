@@ -267,8 +267,8 @@ diagnostics.
 - [x] `done` Add syscall ABI constants and userspace syscall header mirrors.
 - [x] `done` Add `docs/abi.md` for the userspace ELF ABI and calling convention.
 - [x] `done` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
-- [ ] `planned` Cross-compile and port GCC specifically for `x86_64-b1nix`.
-- [ ] `planned` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`) and GNU Make.
+- [x] `done` Cross-compile and port GCC specifically for `x86_64-b1nix`.
+- [x] `done` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`).
 - [ ] `planned` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC.
 - [x] `done` Restructure syscall layers with formalized refcount tracking: documented REFCOUNT RULES, atomic refcount on all VFS nodes/inodes, vfs_handle_retain/close lifecycle, and per-inode read-write locks.
 - [x] `done` Formalize expected `errno` matrices for failed file operations, explicitly validating ELOOP (symlink depth), ENAMETOOLONG (path component limit), ENOTDIR (file-as-dir), EISDIR (write to dir), EROFS, and errno isolation across syscalls via /bin/m17-smoke smoke coverage.
@@ -405,9 +405,9 @@ diagnostics.
 ## M26: Full Toolchain and Self-Hosting
 
 - [x] `done` Define the `x86_64-b1nix` target ABI document in `docs/abi.md`.
-- [ ] `planned` Port Binutils (`as`, `ld`, `objcopy`, `ar`) for `x86_64-b1nix`.
-- [ ] `planned` Port GCC after the minimal C toolchain and filesystem are stable.
-- [ ] `planned` Build larger user programs with the external cross toolchain.
+- [x] `done` Port Binutils (`as`, `ld`, `objcopy`, `ar`) for `x86_64-b1nix`.
+- [x] `done` Port GCC after the minimal C toolchain and filesystem are stable.
+- [x] `done` Build larger user programs with the external cross toolchain.
 - [ ] `planned` Build the B1NIX kernel inside B1NIX.
 - [ ] `planned` Add native `make`/assembler/linker workflow usable from the B1NIX shell.
 
