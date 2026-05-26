@@ -8,14 +8,18 @@ This directory contains SMP support code that is NOT part of the default build.
   sched_rq_enqueue_current, sched_steal_task)
 - `runqueue.h` — Header with struct runqueue and function declarations
 
-## Why Archived
+## Why Archived (Historical)
 
 Adding runqueue.c to the kernel build increases .text by ~220 bytes, which
-causes the TCC compilation test (M25) to hang. Root cause: TCC (Tiny C Compiler)
-is sensitive to the kernel ELF .text layout — even benign code of the same size
-in a separate .o file triggers the hang.
+used to cause the TCC compilation test (M25) to hang. Root cause: TCC (Tiny C Compiler)
+was sensitive to the kernel ELF .text layout — even benign code of the same size
+in a separate .o file triggered the hang.
 
-## How to Re-enable
+**This is now fixed.** The kernel linker script (`kernel/arch/x86/linker.ld`) pads
+`.text` to a 256 KB boundary (`ALIGN(256K)`), so adding runqueue.c no longer
+triggers the TCC hang.
+
+## How to Re-enable (Current)
 
 1. Copy `runqueue.h` → `kernel/include/b1nix/runqueue.h`
 2. Copy `runqueue.c` → `kernel/sched/runqueue.c`

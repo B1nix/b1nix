@@ -5,6 +5,7 @@
 #include <b1nix/io.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/runqueue.h>
 #include <string.h>
 
 /* External functions */
@@ -248,14 +249,12 @@ void ap_main(u32 cpu_id) {
         struct task *t = NULL;
 
         /* Try our per-CPU runqueue first */
-        if (pcpu && pcpu->runqueue.head) {
-            t = pcpu->runqueue.head;
-            pcpu->runqueue.head = t->next_run;
-            t->next_run = NULL;
-            if (!pcpu->runqueue.head) pcpu->runqueue.tail = NULL;
-        }
+        if (pcpu)
+            t = rq_dequeue(&pcpu->runqueue);
 
-        /* stub: work stealing */
+        /* If nothing, try to steal from other CPUs */
+        if (!t)
+            t = sched_steal_task();
 
         /* If we found a task, run it */
         if (t && t->state == TASK_READY) {

@@ -389,12 +389,26 @@ static isize sys_readdir(const char *user_dir_path, struct dirent *user_buf,
     memcpy(kbuf[i].name, names[i], len);
     kbuf[i].name[len] = '\0';
 
-    char full_path[256];
+    char full_path[VFS_MAX_PATH];
     usize dirlen = strlen(resolved);
+    if (dirlen >= VFS_MAX_PATH) {
+      dirlen = VFS_MAX_PATH - 1;
+    }
     memcpy(full_path, resolved, dirlen);
-    if (dirlen > 0 && full_path[dirlen - 1] != '/')
+    full_path[dirlen] = '\0';
+
+    if (dirlen > 0 && full_path[dirlen - 1] != '/' && dirlen < VFS_MAX_PATH - 1) {
       full_path[dirlen++] = '/';
-    memcpy(full_path + dirlen, names[i], len + 1);
+      full_path[dirlen] = '\0';
+    }
+
+    usize namelen = strlen(names[i]);
+    usize remaining = VFS_MAX_PATH - dirlen - 1;
+    if (namelen > remaining) {
+      namelen = remaining;
+    }
+    memcpy(full_path + dirlen, names[i], namelen);
+    full_path[dirlen + namelen] = '\0';
 
     struct vfs_node *node = vfs_find_node(full_path);
     if (!IS_ERR(node)) {
@@ -406,6 +420,7 @@ static isize sys_readdir(const char *user_dir_path, struct dirent *user_buf,
     } else {
       memset(&kbuf[i], 0, sizeof(struct dirent));
       memcpy(kbuf[i].name, names[i], len);
+      kbuf[i].name[len] = '\0';
     }
   }
 
@@ -1871,6 +1886,30 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     console_write("\n");
     ret = (u64)-ENOSYS;
     break;
+  }
+
+  if (frame && ret == (u64)-ERESTARTSYS) {
+    u64 pending = current_task->pending_signals & ~current_task->blocked_signals;
+    int restart = 1;
+    for (int i = 1; i < NSIG; i++) {
+      if (pending & (1ULL << (i - 1))) {
+        struct sigaction *sa = &current_task->sigactions[i - 1];
+        if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
+          if (!(sa->sa_flags & SA_RESTART)) {
+            restart = 0;
+          }
+          break;
+        }
+      }
+    }
+    if (restart) {
+      frame->rip -= 2;
+      frame->rax = number;
+      ret = number;
+    } else {
+      ret = (u64)-EINTR;
+      frame->rax = (u64)-EINTR;
+    }
   }
 
   /* Check for pending signals before returning to userspace */

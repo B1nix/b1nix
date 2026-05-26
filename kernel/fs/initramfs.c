@@ -284,10 +284,6 @@ static const char posix_smoke_script[] =
     "if [ $CNF_STATUS -eq 127 ] && [ $CP_STATUS -ne 0 ] && [ $RM_STATUS -ne 0 ] && [ $GREP_STATUS -ne 0 ] && [ $WC_STATUS -ne 0 ]; then\n"
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
-    "/bin/m13-smoke --m24 && echo \"M24-SMOKE: ok errno-mapping\" && echo \"M24-SMOKE: ok diagnostics\"\n"
-    "/bin/m13-job-control\n"
-    "/bin/m17-smoke\n"
-    "/bin/m8-aio-test\n"
     "echo \"M22-POLISH: done\"\n"
     "echo \"POSIX-SMOKE: done\"\n";
 

@@ -75,6 +75,7 @@ KERNEL_SOURCES := \
 	kernel/ipc/mqueue.c \
 	kernel/ipc/shm.c \
 	kernel/sched/uidgid.c \
+	kernel/sched/runqueue.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/busybox.c \

@@ -1,8 +1,10 @@
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
+#include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
@@ -53,11 +55,20 @@ static struct task *pick_next_task(void) {
     return 0;
   }
 
+  /* Try per-CPU runqueue first */
+  struct percpu *pcpu = get_percpu();
+  if (pcpu) {
+      struct task *t = rq_dequeue(&pcpu->runqueue);
+      if (t && t->state == TASK_READY)
+          return t;
+      if (t) rq_enqueue(&pcpu->runqueue, t); /* put back if not ready */
+  }
+
+  /* Fallback: global O(n) scan */
   usize start = task_index(current_task);
   int max_priority = -1;
   struct task *best_task = 0;
 
-  // Find the highest priority among ready tasks
   for (usize offset = 1; offset <= MAX_TASKS; offset++) {
     usize index = (start + offset) % MAX_TASKS;
 
@@ -78,6 +89,7 @@ static void wake_sleepers(void) {
         tasks[i].wake_tick <= scheduler_ticks) {
       tasks[i].state = TASK_READY;
       tasks[i].wake_tick = 0;
+      sched_rq_enqueue_current(&tasks[i]);
     }
   }
 }
@@ -254,6 +266,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
 
   interrupts_disable();
   task->state = TASK_READY;
+  sched_rq_enqueue_current(task);
   interrupts_enable();
 
   return (int)task->id;
@@ -420,6 +433,7 @@ int scheduler_fork_current(void) {
 
   int child_id = (int)child->id;
   child->state = TASK_READY;
+  sched_rq_enqueue_current(child);
   interrupts_enable();
   return child_id;
 }
@@ -477,6 +491,7 @@ void scheduler_wake_task(usize task_id) {
     if (tasks[i].id == task_id && tasks[i].state == TASK_BLOCKED) {
       tasks[i].state = TASK_READY;
       tasks[i].wait_chan = 0;
+      sched_rq_enqueue_current(&tasks[i]);
       break;
     }
   }
@@ -504,6 +519,7 @@ void scheduler_wake_all(void *chan) {
     if (tasks[i].state == TASK_BLOCKED && tasks[i].wait_chan == chan) {
       tasks[i].state = TASK_READY;
       tasks[i].wait_chan = 0;
+      sched_rq_enqueue_current(&tasks[i]);
     }
   }
 
@@ -885,6 +901,7 @@ int scheduler_kill(usize task_id, int sig) {
       }
       if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
         tasks[i].state = TASK_READY;
+        sched_rq_enqueue_current(&tasks[i]);
       }
       interrupts_enable();
       return 0;
@@ -910,6 +927,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       }
       if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
         tasks[i].state = TASK_READY;
+        sched_rq_enqueue_current(&tasks[i]);
       }
       sent++;
     }
@@ -1253,7 +1271,6 @@ void scheduler_deliver_pending_signals(void) {
         current_task->last_stop_signal = sig;
         current_task->stop_report_pending = 1;
         current_task->pending_signals &= ~(1ULL << (sig - 1));
-        scheduler_yield();
         continue;
       case SIGCHLD:
       case SIGURG:

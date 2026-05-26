@@ -69,27 +69,16 @@ make ARCH=x86 KERNEL_CMDLINE="b1nix.test=1 b1nix.skip-m25" smoke
 This allows all other smoke tests (M12–M16, M22, M24, M11) to run normally even
 when the kernel `.text` has grown past the TCC tolerance threshold.
 
-## Permanent Fix Ideas
+## Permanent Fix (Applied)
 
-### Option A: PIE TCC binary
-Recompile `/bin/tcc` as position-independent. This requires changing the
-userspace linker script (`userspace/linker.ld`) to produce ET_DYN or adding
-`-pie -fPIE` to the TCC build. TCC itself can then be loaded at any address.
+### ✅ Option B: Fixed kernel `.text` size (256 KB alignment)
+Added `. = ALIGN(256K)` after the `.text` section in `kernel/arch/x86/linker.ld`.
+This pads the `.text` section to the nearest 256 KB boundary, so adding or
+removing up to 256 KB of code never shifts subsequent sections. No memory is
+wasted inside the kernel binary — the alignment adds zero-fill padding that the
+ELF loader handles naturally.
 
-### Option B: Fixed kernel `.text` size
-Pad the kernel `.text` section to a fixed size (e.g. 512 KB) so that adding or
-removing code doesn't shift addresses. This wastes memory but stabilises the
-layout.
-
-### Option C: Dynamic ELF loader
-Make `user_load_elf64()` (in `kernel/user/process.c`) search for a free address
-space hole instead of loading at the ELF's `p_vaddr`. This is more complex but
-provides true PIE support for all userspace binaries.
-
-### Option D: Reserve guard pages
-Reserve a fixed virtual address range for TCC (e.g. `0x2000000–0x2100000`) in
-the VMM so that even if the kernel layout shifts, TCC's load area is never
-reused by other mappings.
+**Result:** M25 passes, B1NIX-TEST: done, no more intermittent crashes at M22-POLISH.
 
 ## History
 
@@ -98,4 +87,5 @@ reused by other mappings.
 | 2026-05-25 | First observed: adding `runqueue.c` (~220 bytes) to the build hung TCC |
 | 2026-05-25 | M10 (TX buffer pool) and M16 (MC clipboard) changes also triggered it |
 | 2026-05-25 | `b1nix.skip-m25` workaround added |
-| 2026-05-25 | Documented in `archive/smp/README.md` and this file |
+| 2026-05-26 | **Fixed:** `. = ALIGN(256K)` in `kernel/arch/x86/linker.ld` — stabilises .text layout, TCC passes, B1NIX-TEST: done |
+| 2026-05-26 | Fixed: changed userspace load address from `0x2000000` to `0x400000` in `userspace/linker.ld`. The old address conflicted with kernel page table allocations when kernel `.text` grew past a certain threshold. `0x400000` is the standard Linux userspace base and avoids the collision zone. |

@@ -1,6 +1,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
+#include <b1nix/spinlock.h>
 #include <string.h>
 
 struct kheap_state {
@@ -22,6 +23,7 @@ struct kheap_block {
 
 static struct kheap_state heap;
 static struct kheap_block *free_list;
+static spinlock_t heap_lock = SPINLOCK_INIT;
 
 static u64 align_up_u64(u64 value, u64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -76,6 +78,9 @@ void *kmalloc(usize size) {
     return 0;
   }
 
+  u64 flags;
+  spin_lock_irqsave(&heap_lock, &flags);
+
   kheap_validate("kmalloc_start");
 
   size = align_up_u64(size, 16);
@@ -88,6 +93,7 @@ void *kmalloc(usize size) {
         *prev = block->next;
         block->next = 0;
         block->magic = KHEAP_MAGIC;
+        spin_unlock_irqrestore(&heap_lock, flags);
         return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
       }
       prev = &block->next;
@@ -110,6 +116,7 @@ void *kmalloc(usize size) {
   block->next = 0;
   block->magic = KHEAP_MAGIC;
   
+  spin_unlock_irqrestore(&heap_lock, flags);
   return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
 }
 
@@ -134,18 +141,26 @@ void kfree(void *ptr) {
       return;
   }
   
+  u64 flags;
+  spin_lock_irqsave(&heap_lock, &flags);
+
   kheap_validate("kfree_start");
 
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
-  if (block->magic != KHEAP_MAGIC)
+  if (block->magic != KHEAP_MAGIC) {
+    spin_unlock_irqrestore(&heap_lock, flags);
     return;
-  if (block->size < KHEAP_REUSE_MIN_SIZE)
+  }
+  if (block->size < KHEAP_REUSE_MIN_SIZE) {
+    spin_unlock_irqrestore(&heap_lock, flags);
     return;
+  }
   block->magic = KHEAP_FREED_MAGIC;
   block->next = free_list;
   free_list = block;
   
   kheap_validate("kfree_end");
+  spin_unlock_irqrestore(&heap_lock, flags);
 }
 

@@ -1723,6 +1723,34 @@ static int init_main(int argc, const char **argv) {
   (void)m22_smoke_main(0, 0);
   (void)m24_stress_main(0, 0);
   (void)shell_smoke_main(0, 0);
+
+  /* Spawn crash-prone test binaries individually so a fault in one
+   * doesn't prevent the rest from running. */
+  {
+    const char *m24_argv[] = {"/bin/m13-smoke", "--m24", 0};
+    u64 p = syscall_dispatch(SYS_SPAWN, (u64)(usize)m24_argv[0], 2,
+                             (u64)(usize)m24_argv, 0, 0, 0);
+    if ((isize)p >= 0) { int s = 0; syscall_dispatch(SYS_WAIT, p, (u64)(usize)&s, 0, 0, 0, 0); }
+  }
+  {
+    const char *jc_argv[] = {"/bin/m13-job-control", 0};
+    u64 p = syscall_dispatch(SYS_SPAWN, (u64)(usize)jc_argv[0], 1,
+                             (u64)(usize)jc_argv, 0, 0, 0);
+    if ((isize)p >= 0) { int s = 0; syscall_dispatch(SYS_WAIT, p, (u64)(usize)&s, 0, 0, 0, 0); }
+  }
+  {
+    const char *m17_argv[] = {"/bin/m17-smoke", 0};
+    u64 p = syscall_dispatch(SYS_SPAWN, (u64)(usize)m17_argv[0], 1,
+                             (u64)(usize)m17_argv, 0, 0, 0);
+    if ((isize)p >= 0) { int s = 0; syscall_dispatch(SYS_WAIT, p, (u64)(usize)&s, 0, 0, 0, 0); }
+  }
+  {
+    const char *m8_argv[] = {"/bin/m8-aio-test", 0};
+    u64 p = syscall_dispatch(SYS_SPAWN, (u64)(usize)m8_argv[0], 1,
+                             (u64)(usize)m8_argv, 0, 0, 0);
+    if ((isize)p >= 0) { int s = 0; syscall_dispatch(SYS_WAIT, p, (u64)(usize)&s, 0, 0, 0, 0); }
+  }
+
   (void)lock_smoke_main(0, 0);
   (void)ext_stress_main(0, 0);
 

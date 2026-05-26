@@ -12,6 +12,7 @@ SECTIONS
 	.text ALIGN(4K) : {
 		*(.text .text.*)
 	}
+	. = ALIGN(256K);  /* Pad .text to 256K boundary — stabilises layout for TCC */
 
 	.rodata ALIGN(4K) : {
 		*(.rodata .rodata.*)

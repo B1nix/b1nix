@@ -1,6 +1,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
+#include <b1nix/spinlock.h>
 #include <string.h>
 
 #define BITS_PER_BYTE 8
@@ -21,6 +22,7 @@ struct pmm_state {
 };
 
 static struct pmm_state pmm;
+static spinlock_t pmm_lock = SPINLOCK_INIT;
 
 static u64 align_up_u64(u64 value, u64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -196,10 +198,13 @@ void pmm_init(const struct boot_info *boot_info) {
 }
 
 void pmm_ref_frame(u64 frame) {
+  u64 flags;
+  spin_lock_irqsave(&pmm_lock, &flags);
   usize idx = frame / PAGE_SIZE;
   if (pmm.frame_refcounts) {
     pmm.frame_refcounts[idx]++;
   }
+  spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_free_frame(u64 frame) {
@@ -208,6 +213,8 @@ void pmm_free_frame(u64 frame) {
     return;
   }
 
+  u64 flags;
+  spin_lock_irqsave(&pmm_lock, &flags);
   usize idx = frame / PAGE_SIZE;
   if (pmm.frame_refcounts) {
     if (pmm.frame_refcounts[idx] > 0) {
@@ -219,6 +226,7 @@ void pmm_free_frame(u64 frame) {
   } else {
     mark_frame_free(frame);
   }
+  spin_unlock_irqrestore(&pmm_lock, flags);
 }
 
 void pmm_unref_frame(u64 frame) {
@@ -226,16 +234,22 @@ void pmm_unref_frame(u64 frame) {
 }
 
 u16 pmm_get_refcount(u64 frame) {
+  u64 flags;
+  spin_lock_irqsave(&pmm_lock, &flags);
   usize idx = frame / PAGE_SIZE;
+  u16 val = 0;
   if (pmm.frame_refcounts) {
-    return pmm.frame_refcounts[idx];
+    val = pmm.frame_refcounts[idx];
   }
-  return 0;
+  spin_unlock_irqrestore(&pmm_lock, flags);
+  return val;
 }
 
 u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
 
 u64 pmm_alloc_frames(usize count) {
+  u64 flags;
+  spin_lock_irqsave(&pmm_lock, &flags);
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
 
   for (usize i = 0; i < frame_count; i++) {
@@ -262,9 +276,12 @@ u64 pmm_alloc_frames(usize count) {
         ptr = (void *)(usize)(frame + vmm_direct_map_base());
       }
       memset(ptr, 0, count * PAGE_SIZE);
+      spin_unlock_irqrestore(&pmm_lock, flags);
       return frame;
     }
   }
+
+  spin_unlock_irqrestore(&pmm_lock, flags);
 
   // If we reach here, we are OOM. Try to evict a page and try again.
   extern int swap_evict_page(void);

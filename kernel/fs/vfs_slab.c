@@ -1,41 +1,52 @@
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <stdlib.h>
 #include <string.h>
 
-/* Simple object pool for VFS structures to avoid fragmentation */
+/* Object pool for VFS structures — non-intrusive free list.
+ * Uses a separate pointer array so use-after-free of a pooled object
+ * cannot corrupt the pool itself (unlike an intrusive linked-list pool
+ * that writes into the freed object's memory). */
+#define POOL_FREE_MAX 64
+
 struct vfs_pool {
-    void *free_list;
+    void *free_list[POOL_FREE_MAX];
+    int free_count;
     usize obj_size;
-    volatile int lock;
+    spinlock_t lock;
 };
 
-static struct vfs_pool node_pool = { .obj_size = sizeof(struct vfs_node) };
-static struct vfs_pool inode_pool = { .obj_size = sizeof(struct vfs_inode) };
-static struct vfs_pool handle_pool = { .obj_size = sizeof(struct vfs_handle) };
+static struct vfs_pool node_pool = { .obj_size = sizeof(struct vfs_node), .lock = SPINLOCK_INIT };
+static struct vfs_pool inode_pool = { .obj_size = sizeof(struct vfs_inode), .lock = SPINLOCK_INIT };
+static struct vfs_pool handle_pool = { .obj_size = sizeof(struct vfs_handle), .lock = SPINLOCK_INIT };
 
 static void *pool_alloc(struct vfs_pool *pool) {
-    while (__atomic_test_and_set(&pool->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-    if (pool->free_list) {
-        void *obj = pool->free_list;
-        pool->free_list = *(void **)obj;
-        __atomic_clear(&pool->lock, __ATOMIC_RELEASE);
+    u64 flags;
+    spin_lock_irqsave(&pool->lock, &flags);
+    if (pool->free_count > 0) {
+        void *obj = pool->free_list[--pool->free_count];
+        pool->free_list[pool->free_count] = NULL;
+        spin_unlock_irqrestore(&pool->lock, flags);
         memset(obj, 0, pool->obj_size);
         return obj;
     }
-    __atomic_clear(&pool->lock, __ATOMIC_RELEASE);
-    
-    /* Fallback to heap if pool is empty */
+    spin_unlock_irqrestore(&pool->lock, flags);
     return kzalloc(pool->obj_size);
 }
 
 static void pool_free(struct vfs_pool *pool, void *obj) {
     if (!obj) return;
-    while (__atomic_test_and_set(&pool->lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-    *(void **)obj = pool->free_list;
-    pool->free_list = obj;
-    __atomic_clear(&pool->lock, __ATOMIC_RELEASE);
+    u64 flags;
+    spin_lock_irqsave(&pool->lock, &flags);
+    if (pool->free_count < POOL_FREE_MAX) {
+        pool->free_list[pool->free_count++] = obj;
+        spin_unlock_irqrestore(&pool->lock, flags);
+    } else {
+        spin_unlock_irqrestore(&pool->lock, flags);
+        kfree(obj);
+    }
 }
 
 struct vfs_node *vfs_alloc_node(void) {

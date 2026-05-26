@@ -251,7 +251,9 @@ static void cp_recursive(const char *src, const char *dst) {
     return;
   if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
     syscall_dispatch(SYS_MKDIR, (u64)(usize)dst, 0755, 0, 0, 0, 0);
-    struct dirent entries[32];
+    struct dirent *entries = malloc(32 * sizeof(struct dirent));
+    if (!entries)
+      return;
     int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)src, (u64)(usize)entries, 32, 0, 0, 0);
     for (int i = 0; i < count; i++) {
       if (strcmp(entries[i].name, ".") == 0 ||
@@ -262,6 +264,7 @@ static void cp_recursive(const char *src, const char *dst) {
       snprintf(dsub, sizeof(dsub), "%s/%s", dst, entries[i].name);
       cp_recursive(ssub, dsub);
     }
+    free(entries);
   } else
     bb_copy_file(src, dst);
 }
@@ -352,7 +355,9 @@ static void rm_recursive(const char *path) {
     return;
   }
   if ((st.st_mode & B1NIX_S_IFDIR) == B1NIX_S_IFDIR) {
-    struct dirent entries[32];
+    struct dirent *entries = malloc(32 * sizeof(struct dirent));
+    if (!entries)
+      return;
     int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)path, (u64)(usize)entries, 32, 0, 0, 0);
     for (int i = 0; i < count; i++) {
       if (strcmp(entries[i].name, ".") == 0 ||
@@ -362,6 +367,7 @@ static void rm_recursive(const char *path) {
       snprintf(sub, sizeof(sub), "%s/%s", path, entries[i].name);
       rm_recursive(sub);
     }
+    free(entries);
     int rc = (int)syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0, 0, 0, 0, 0);
     if (rc != 0 && !rm_force) {
       printf("rm: cannot remove directory %s: %s\n", path, bb_strerror(rc));
@@ -1006,12 +1012,16 @@ static int tail_main(int argc, const char **argv) {
 }
 
 static void find_recurse(const char *base, const char *name_pat, int *found) {
-  struct dirent entries[32];
+  struct dirent *entries = malloc(32 * sizeof(struct dirent));
+  if (!entries)
+    return;
   char path[256];
   usize bl = strlen(base);
   int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)base, (u64)(usize)entries, 32, 0, 0, 0);
-  if (count < 0)
+  if (count < 0) {
+    free(entries);
     return;
+  }
 
   for (int i = 0; i < count; i++) {
     if (strcmp(entries[i].name, ".") == 0 ||
@@ -1031,6 +1041,7 @@ static void find_recurse(const char *base, const char *name_pat, int *found) {
     if (entries[i].is_dir)
       find_recurse(path, name_pat, found);
   }
+  free(entries);
 }
 
 static int find_main(int argc, const char **argv) {

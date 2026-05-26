@@ -7,7 +7,7 @@ set -e
 
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=300  # seconds to let each test run
+TIMEOUT=60  # seconds to let each test run
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"

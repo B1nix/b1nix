@@ -31,12 +31,14 @@ static struct block_buffer block_cache[CACHE_ENTRIES];
 static u32 bcache_tick = 0;
 static spinlock_t bcache_lock = SPINLOCK_INIT;
 
-static void bcache_acquire(void) {
-  spin_lock(&bcache_lock);
+static u64 bcache_acquire(void) {
+  u64 flags;
+  spin_lock_irqsave(&bcache_lock, &flags);
+  return flags;
 }
 
-static void bcache_release(void) {
-  spin_unlock(&bcache_lock);
+static void bcache_release(u64 flags) {
+  spin_unlock_irqrestore(&bcache_lock, flags);
 }
 
 int blk_cache_lock_is_held(void) {
@@ -304,17 +306,17 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   u8 *buf8 = (u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    bcache_acquire();
+    u64 flags = bcache_acquire();
     struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (entry) {
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
-      bcache_release();
+      bcache_release(flags);
     } else {
       entry = bcache_evict();
       entry->bdev = dev;
       entry->block_no = current_lba;
-      bcache_release();
+      bcache_release(flags);
       if (dev->read_blocks(dev, current_lba, 1, entry->data) < 0) {
         console_write("blk_read_cached: read_blocks failed for ");
         console_write(dev->name);
@@ -322,12 +324,12 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         console_write("\n");
         return -1;
       }
-      bcache_acquire();
+      flags = bcache_acquire();
       entry->flags |= BLK_CACHE_VALID;
       entry->flags &= ~BLK_CACHE_DIRTY;
       entry->last_used = ++bcache_tick;
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
-      bcache_release();
+      bcache_release(flags);
     }
   }
   return 0;
@@ -347,7 +349,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   const u8 *buf8 = (const u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    bcache_acquire();
+    u64 flags = bcache_acquire();
     struct block_buffer *entry = bcache_find(dev, current_lba);
 
     if (!entry) {
@@ -362,7 +364,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
 
     /* Write-Back: Mark as dirty, DO NOT write to disk immediately */
     entry->flags |= BLK_CACHE_DIRTY;
-    bcache_release();
+    bcache_release(flags);
   }
   return 0;
 }
@@ -380,14 +382,14 @@ void blk_flush_buffer(struct block_buffer *buf) {
 
 void blk_sync_all(void) {
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    bcache_acquire();
+    u64 flags = bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       struct block_buffer *buf = &block_cache[i];
-      bcache_release();
+      bcache_release(flags);
       blk_flush_buffer(buf);
       continue;
     }
-    bcache_release();
+    bcache_release(flags);
   }
 }
 
@@ -400,32 +402,32 @@ void blk_cache_flush(struct block_device *dev) {
     return;
 
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    bcache_acquire();
+    u64 flags = bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       struct block_buffer *buf = &block_cache[i];
-      bcache_release();
+      bcache_release(flags);
       blk_flush_buffer(buf);
       continue;
     }
-    bcache_release();
+    bcache_release(flags);
   }
 }
 
 void blk_cache_invalidate(struct block_device *dev) {
   if (!dev) return;
   for (int i = 0; i < CACHE_ENTRIES; i++) {
-    bcache_acquire();
+    u64 flags = bcache_acquire();
     if (block_cache[i].bdev == dev) {
       if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
         struct block_buffer *buf = &block_cache[i];
-        bcache_release();
+        bcache_release(flags);
         blk_flush_buffer(buf);
-        bcache_acquire();
+        flags = bcache_acquire();
       }
       block_cache[i].flags = 0;
       block_cache[i].bdev = 0;
       block_cache[i].block_no = 0;
     }
-    bcache_release();
+    bcache_release(flags);
   }
 }

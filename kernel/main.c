@@ -26,6 +26,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/video.h>
 #include <string.h>
+#include <stdio.h>
 
 extern void ps2_kbd_init(void);
 extern void ps2_mouse_init(void);
@@ -141,7 +142,9 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	userspace_init();
 	int init_pid = user_spawn("/bin/init", 0, 0);
-	console_write("init spawn result: "); console_write_dec(init_pid); console_write("\n");
+	char init_spawn_buf[64];
+	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
+	console_write(init_spawn_buf);
 
 	while (scheduler_task_count() > 1) {
 		scheduler_yield();

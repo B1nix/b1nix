@@ -2404,6 +2404,7 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
         }
       }
 
+      vfs_node_get(child);
       child->deleted = 1;
       child->inode->nlink--;
       if (child->inode)
