@@ -53,8 +53,9 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   frame->rip = (u64)(usize)sa->sa_handler;
   frame->rsp = restorer_slot;
   frame->rdi = (u64)sig;
-  if (t->saved_user_rsp != 0)
-    t->saved_user_rsp = frame->rsp;
+  /* Note: do NOT update saved_user_rsp here — it already holds the original
+   * user RSP and will be refreshed by the SYSCALL entry on the next entry.
+   * Updating it with restorer_slot (the modified RSP) would be wrong. */
 }
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {

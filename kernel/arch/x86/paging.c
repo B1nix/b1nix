@@ -99,13 +99,46 @@ static u64 *alloc_page_table(void) {
 }
 
 static u64 *ensure_child_table(u64 *parent, usize index) {
+  if (!parent || (direct_map_ready && (u64)parent < DIRECT_MAP_BASE) || !is_canonical((u64)parent)) {
+    console_write("ensure_child_table: INVALID parent: 0x");
+    console_write_hex64((u64)parent);
+    console_write(" index: ");
+    console_write_hex64(index);
+    console_write(" caller: 0x");
+    console_write_hex64((u64)__builtin_return_address(0));
+    console_write("\n");
+    if (current_task) {
+      console_write("current_task: ");
+      console_write(current_task->name);
+      console_write(" (id: ");
+      console_write_dec(current_task->id);
+      console_write(")\n");
+    } else {
+      console_write("current_task is NULL\n");
+    }
+    panic("ensure_child_table: invalid parent pointer");
+  }
+  u64 *result;
   if ((parent[index] & VMM_PRESENT) == 0) {
     u64 *child = alloc_page_table();
     parent[index] = table_to_phys(child) | VMM_PRESENT | VMM_WRITABLE;
-    return child;
+    result = child;
+  } else {
+    result = table_from_entry(parent[index]);
   }
 
-  return table_from_entry(parent[index]);
+  if (direct_map_ready && ((u64)result < DIRECT_MAP_BASE || !is_canonical((u64)result))) {
+    console_write("ensure_child_table: returning INVALID pointer: 0x");
+    console_write_hex64((u64)result);
+    console_write(" parent: 0x");
+    console_write_hex64((u64)parent);
+    console_write(" index: ");
+    console_write_hex64(index);
+    console_write(" entry: 0x");
+    console_write_hex64(parent[index]);
+    console_write("\n");
+  }
+  return result;
 }
 
 static u64 *split_huge_page(u64 *pd, usize index) {
@@ -179,6 +212,16 @@ void vmm_init(void) {
 
   extern void pmm_switch_to_direct_map(void);
   pmm_switch_to_direct_map();
+
+  console_write("paging offsets: fd_table=");
+  console_write_dec((usize)&((struct task *)0)->fd_table);
+  console_write(" fd_lock=");
+  console_write_dec((usize)&((struct task *)0)->fd_lock);
+  console_write(" pml4_phys=");
+  console_write_dec((usize)&((struct task *)0)->pml4_phys);
+  console_write(" vma_list=");
+  console_write_dec((usize)&((struct task *)0)->vma_list);
+  console_write("\n");
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -575,6 +618,11 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 u64 paging_create_address_space(void) {
   u64 *pml4 = alloc_page_table();
   u64 pml4_phys = table_to_phys(pml4);
+  console_write("paging_create_address_space: pml4=0x");
+  console_write_hex64((u64)pml4);
+  console_write(" phys=0x");
+  console_write_hex64(pml4_phys);
+  console_write("\n");
 
   // Clone kernel-half entries (256-511)
   for (usize i = 256; i < 512; i++) {
@@ -661,6 +709,11 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
   u64 *dst_pml4 = alloc_page_table();
   u64 dst_pml4_phys = table_to_phys(dst_pml4);
+  console_write("paging_clone_address_space: src_phys=0x");
+  console_write_hex64(src_pml4_phys);
+  console_write(" dst_phys=0x");
+  console_write_hex64(dst_pml4_phys);
+  console_write("\n");
 
   // Clone user-half entries (0-255)
   for (usize i = 0; i < 256; i++) {

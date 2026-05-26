@@ -2,12 +2,14 @@
 #define B1NIX_LAPIC_H
 
 #include <b1nix/types.h>
+#include <b1nix/spinlock.h>
 
 /* Forward declaration (defined in sched.h) */
 struct task;
 
 /* Per-CPU runqueue — linked list of READY tasks (SMP) */
 struct runqueue {
+    spinlock_t  lock; /* protects head/tail under SMP */
     struct task *head;
     struct task *tail;
 };
@@ -148,5 +150,9 @@ void percpu_init(void);
 
 /* AP entry point (called from trampoline) */
 void ap_main(u32 cpu_id);
+
+/* SMP percpu accessors for task stealing */
+struct percpu *get_percpu_n(int idx);   /* returns NULL if idx out of range or CPU offline */
+int            get_online_cpu_count(void);
 
 #endif /* B1NIX_LAPIC_H */

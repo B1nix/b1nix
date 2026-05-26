@@ -140,6 +140,7 @@ static struct percpu boot_cpu_data = {
     .current_task = 0,
     .scheduler_ticks = 0,
     .scheduler_started = 0,
+    /* .runqueue.lock = 0 — zero-initialized by static storage */
 };
 
 void arch_set_gs_base(u64 base) {
@@ -401,4 +402,33 @@ ap_done:
     console_write_dec(ap_count + 1);
     console_write("\n");
     return ap_count + 1;
+}
+
+/* ── SMP percpu accessors (used by task stealing) ── */
+
+/* Returns percpu for index idx (0 = BSP, 1..N = APs).
+ * Returns NULL if idx is out of range or the CPU is not online. */
+struct percpu *get_percpu_n(int idx)
+{
+    if (idx < 0 || idx >= MAX_CPUS)
+        return (struct percpu *)0;
+    if (idx == 0) {
+        return boot_cpu_data.cpu_online ? &boot_cpu_data : (struct percpu *)0;
+    }
+    struct percpu *p = ap_cpu_data[idx];
+    if (!p || !p->cpu_online)
+        return (struct percpu *)0;
+    return p;
+}
+
+/* Returns total number of online CPUs (BSP + APs). */
+int get_online_cpu_count(void)
+{
+    int count = boot_cpu_data.cpu_online ? 1 : 0;
+    for (int i = 1; i < MAX_CPUS; i++) {
+        struct percpu *p = ap_cpu_data[i];
+        if (p && p->cpu_online)
+            count++;
+    }
+    return count;
 }

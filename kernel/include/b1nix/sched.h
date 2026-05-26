@@ -5,6 +5,7 @@
 #define B1NIX_WCONTINUED 8
 
 #include <b1nix/types.h>
+#include <b1nix/spinlock.h>
 
 struct vfs_handle;
 struct task;
@@ -134,6 +135,7 @@ struct task {
   struct vfs_handle **fd_table;
   int *fd_flags;
   usize fd_capacity;
+  spinlock_t fd_lock; /* protects fd_table/fd_flags/fd_capacity */
   int priority;
   int exit_code;
   usize parent_id;

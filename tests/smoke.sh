@@ -313,6 +313,8 @@ check_output "$LOG" "M25-SMOKE: ok compile-utility" "tcc compiles and runs mini-
 check_output "$LOG" "M25-SMOKE: ok argv-check" "compiled program receives argc/argv"
 check_output "$LOG" "M25-SMOKE: ok stderr-check" "compiled program stderr path works"
 check_output "$LOG" "M25-SMOKE: ok exit-check" "compiled program non-zero exit status propagates"
+check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double parsing works"
+check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
 # ── M16 User Space Applications & TUI ──

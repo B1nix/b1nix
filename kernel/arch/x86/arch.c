@@ -78,6 +78,21 @@ void x86_syscall_init(void) {
   __asm__ volatile("wrmsr" : : "a"(0x200), "d"(0), "c"(0xC0000084));
 }
 
+static void x86_enable_sse(void) {
+  u64 cr0;
+  __asm__ volatile("movq %%cr0, %0" : "=r"(cr0));
+  cr0 &= ~(1ULL << 2); // Clear EM (Coprocessor Emulation)
+  cr0 |= (1ULL << 1);  // Set MP (Monitor Coprocessor)
+  cr0 |= (1ULL << 5);  // Set NE (Numeric Error)
+  __asm__ volatile("movq %0, %%cr0" : : "r"(cr0) : "memory");
+
+  u64 cr4;
+  __asm__ volatile("movq %%cr4, %0" : "=r"(cr4));
+  cr4 |= (1ULL << 9);  // Set OSFXSR (FXSAVE/FXRSTOR Support)
+  cr4 |= (1ULL << 10); // Set OSXMMEXCPT (SIMD Exception Support)
+  __asm__ volatile("movq %0, %%cr4" : : "r"(cr4) : "memory");
+}
+
 void arch_init(void) {
   x86_tss_init();
   x86_idt_init();
@@ -86,6 +101,7 @@ void arch_init(void) {
   rtc_init();
   x86_syscall_init();
   x86_enable_write_protect();
+  x86_enable_sse();
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");
 }

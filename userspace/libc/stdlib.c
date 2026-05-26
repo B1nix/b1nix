@@ -2,6 +2,7 @@
 #include <string.h>
 #include "syscall.h"
 #include <errno.h>
+#include <math.h>
 
 extern int normalize_errno(long rc);
 
@@ -183,24 +184,223 @@ void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, co
     quicksort((char *)base, nmemb, size, compar);
 }
 
+static double pow10_helper(int n)
+{
+	double res = 1.0;
+	double base = 10.0;
+	while (n > 0) {
+		if (n & 1) res *= base;
+		base *= base;
+		n >>= 1;
+	}
+	return res;
+}
+
 double strtod(const char *nptr, char **endptr)
 {
 	const char *s = nptr;
-	while (*s == ' ' || *s == '\t') s++;
-	if (*s == '-' || *s == '+') s++;
+	while (*s == ' ' || *s == '\t' || *s == '\n' || *s == '\r' || *s == '\v' || *s == '\f') {
+		s++;
+	}
+
+	int sign = 1;
+	if (*s == '-') {
+		sign = -1;
+		s++;
+	} else if (*s == '+') {
+		s++;
+	}
+
+	/* Case-insensitive check for inf/infinity/nan */
+	int is_inf = 0;
+	int is_nan = 0;
+	if ((*s == 'i' || *s == 'I') &&
+	    (s[1] == 'n' || s[1] == 'N') &&
+	    (s[2] == 'f' || s[2] == 'F')) {
+		s += 3;
+		is_inf = 1;
+		if ((*s == 'i' || *s == 'I') &&
+		    (s[1] == 'n' || s[1] == 'N') &&
+		    (s[2] == 'i' || s[2] == 'I') &&
+		    (s[3] == 't' || s[3] == 'T') &&
+		    (s[4] == 'y' || s[4] == 'Y')) {
+			s += 5;
+		}
+	} else if ((*s == 'n' || *s == 'N') &&
+	           (s[1] == 'a' || s[1] == 'A') &&
+	           (s[2] == 'n' || s[2] == 'N')) {
+		s += 3;
+		is_nan = 1;
+		if (*s == '(') {
+			const char *p = s + 1;
+			while (*p && *p != ')') p++;
+			if (*p == ')') {
+				s = p + 1;
+			}
+		}
+	}
+
+	if (is_inf) {
+		if (endptr) *endptr = (char *)s;
+		return sign * (1.0 / 0.0);
+	}
+	if (is_nan) {
+		if (endptr) *endptr = (char *)s;
+		return 0.0 / 0.0;
+	}
+
+	/* Check for hexadecimal float */
+	int is_hex = 0;
+	if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		const char *hex_check = s + 2;
+		int has_hex_digit = 0;
+		while ((*hex_check >= '0' && *hex_check <= '9') ||
+		       (*hex_check >= 'a' && *hex_check <= 'f') ||
+		       (*hex_check >= 'A' && *hex_check <= 'F')) {
+			has_hex_digit = 1;
+			hex_check++;
+		}
+		if (*hex_check == '.') {
+			hex_check++;
+			while ((*hex_check >= '0' && *hex_check <= '9') ||
+			       (*hex_check >= 'a' && *hex_check <= 'f') ||
+			       (*hex_check >= 'A' && *hex_check <= 'F')) {
+				has_hex_digit = 1;
+				hex_check++;
+			}
+		}
+		if (has_hex_digit) {
+			is_hex = 1;
+			s += 2;
+		}
+	}
+
+	double val = 0.0;
 	int any = 0;
-	while (*s >= '0' && *s <= '9') { s++; any = 1; }
-	if (*s == '.') {
-		s++;
-		while (*s >= '0' && *s <= '9') { s++; any = 1; }
+
+	if (is_hex) {
+		/* Parse hexadecimal float */
+		while (1) {
+			int digit;
+			if (*s >= '0' && *s <= '9') digit = *s - '0';
+			else if (*s >= 'a' && *s <= 'f') digit = *s - 'a' + 10;
+			else if (*s >= 'A' && *s <= 'F') digit = *s - 'A' + 10;
+			else break;
+			val = val * 16.0 + digit;
+			any = 1;
+			s++;
+		}
+		if (*s == '.') {
+			s++;
+			double frac_mult = 1.0 / 16.0;
+			while (1) {
+				int digit;
+				if (*s >= '0' && *s <= '9') digit = *s - '0';
+				else if (*s >= 'a' && *s <= 'f') digit = *s - 'a' + 10;
+				else if (*s >= 'A' && *s <= 'F') digit = *s - 'A' + 10;
+				else break;
+				val += digit * frac_mult;
+				frac_mult /= 16.0;
+				any = 1;
+				s++;
+			}
+		}
+		int bin_exp = 0;
+		if (*s == 'p' || *s == 'P') {
+			const char *exp_start = s;
+			s++;
+			int exp_sign = 1;
+			if (*s == '-') {
+				exp_sign = -1;
+				s++;
+			} else if (*s == '+') {
+				s++;
+			}
+			int has_exp_digits = 0;
+			int exp_val = 0;
+			while (*s >= '0' && *s <= '9') {
+				if (exp_val < 100000) {
+					exp_val = exp_val * 10 + (*s - '0');
+				}
+				has_exp_digits = 1;
+				s++;
+			}
+			if (has_exp_digits) {
+				bin_exp = exp_sign * exp_val;
+			} else {
+				s = exp_start;
+			}
+		}
+		if (any) {
+			val = ldexp(val, bin_exp);
+		}
+	} else {
+		/* Parse decimal float */
+		int decimals = 0;
+		int has_dot = 0;
+		int sig_digits = 0;
+		int exponent_adjustment = 0;
+
+		while (1) {
+			if (*s >= '0' && *s <= '9') {
+				any = 1;
+				if (sig_digits < 17) {
+					val = val * 10.0 + (*s - '0');
+					if (val > 0.0) sig_digits++;
+					if (has_dot) decimals++;
+				} else {
+					if (!has_dot) exponent_adjustment++;
+				}
+				s++;
+			} else if (*s == '.' && !has_dot) {
+				has_dot = 1;
+				s++;
+			} else {
+				break;
+			}
+		}
+
+		int dec_exp = 0;
+		if (any && (*s == 'e' || *s == 'E')) {
+			const char *exp_start = s;
+			s++;
+			int exp_sign = 1;
+			if (*s == '-') {
+				exp_sign = -1;
+				s++;
+			} else if (*s == '+') {
+				s++;
+			}
+			int has_exp_digits = 0;
+			int exp_val = 0;
+			while (*s >= '0' && *s <= '9') {
+				if (exp_val < 100000) {
+					exp_val = exp_val * 10 + (*s - '0');
+				}
+				has_exp_digits = 1;
+				s++;
+			}
+			if (has_exp_digits) {
+				dec_exp = exp_sign * exp_val;
+			} else {
+				s = exp_start;
+			}
+		}
+
+		if (any) {
+			int total_exp = dec_exp + exponent_adjustment - decimals;
+			if (total_exp > 0) {
+				val *= pow10_helper(total_exp);
+			} else if (total_exp < 0) {
+				val /= pow10_helper(-total_exp);
+			}
+		}
 	}
-	if (any && (*s == 'e' || *s == 'E' || *s == 'p' || *s == 'P')) {
-		s++;
-		if (*s == '-' || *s == '+') s++;
-		while (*s >= '0' && *s <= '9') s++;
+
+	if (endptr) {
+		*endptr = (char *)(any ? s : nptr);
 	}
-	if (endptr) *endptr = (char *)(any ? s : nptr);
-	return 0.0;
+	return any ? (val * sign) : 0.0;
 }
 
 __asm__(
@@ -239,15 +439,122 @@ __asm__(
 "    ret\n"
 );
 
-void *dlopen(const char *filename, int flag) { (void)filename; (void)flag; return NULL; }
-char *dlerror(void) { return "Dynamic loading not supported"; }
-void *dlsym(void *handle, const char *symbol) { (void)handle; (void)symbol; return NULL; }
-int dlclose(void *handle) { (void)handle; return -1; }
+/* -----------------------------------------------------------------------
+ * dlfcn stubs — B1NIX supports static linking only; dynamic loading is
+ * not available.  These stubs follow the POSIX error-reporting contract:
+ *   • dlopen()  always fails → returns NULL, sets dlerror buffer.
+ *   • dlerror() returns the last error string and clears the buffer.
+ *   • dlsym()   always fails → returns NULL, sets dlerror buffer.
+ *   • dlclose() always fails → returns -1, sets dlerror buffer.
+ * A program that checks dlerror() after each call will behave correctly.
+ * ----------------------------------------------------------------------- */
+static const char *_dl_errmsg;
 
-double ldexp(double x, int exp) { (void)x; (void)exp; return 0.0; }
-long double ldexpl(long double x, int exp) { (void)x; (void)exp; return 0.0; }
-float strtof(const char *nptr, char **endptr) { if (endptr) *endptr = (char *)nptr; return 0.0f; }
-long double strtold(const char *nptr, char **endptr) { if (endptr) *endptr = (char *)nptr; return 0.0; }
+void *dlopen(const char *filename, int flag)
+{
+    (void)flag;
+    if (filename == NULL) {
+        /* RTLD_DEFAULT / self-handle: return a non-NULL sentinel so that
+         * dlsym(RTLD_DEFAULT, ...) callers get a consistent NULL back from
+         * dlsym rather than a misleading dlerror from dlopen itself. */
+        return (void *)(unsigned long)1;
+    }
+    _dl_errmsg = "dlopen: dynamic loading not supported on b1nix";
+    return NULL;
+}
+
+char *dlerror(void)
+{
+    /* POSIX: each successful call to dlerror() resets the error indicator. */
+    const char *msg = _dl_errmsg;
+    _dl_errmsg = NULL;
+    return (char *)msg;
+}
+
+void *dlsym(void *handle, const char *symbol)
+{
+    (void)handle;
+    (void)symbol;
+    _dl_errmsg = "dlsym: dynamic symbol lookup not supported on b1nix";
+    return NULL;
+}
+
+int dlclose(void *handle)
+{
+    (void)handle;
+    _dl_errmsg = "dlclose: dynamic loading not supported on b1nix";
+    return -1;
+}
+
+double ldexp(double x, int exp)
+{
+	if (x == 0.0 || exp == 0) return x;
+	while (exp > 100) {
+		x *= 1.2676506002282294e+30; /* 2^100 */
+		exp -= 100;
+	}
+	while (exp < -100) {
+		x *= 7.888609052210118e-31; /* 2^-100 */
+		exp += 100;
+	}
+	if (exp > 0) {
+		double base = 2.0;
+		while (exp > 0) {
+			if (exp & 1) x *= base;
+			base *= base;
+			exp >>= 1;
+		}
+	} else if (exp < 0) {
+		exp = -exp;
+		double base = 0.5;
+		while (exp > 0) {
+			if (exp & 1) x *= base;
+			base *= base;
+			exp >>= 1;
+		}
+	}
+	return x;
+}
+
+long double ldexpl(long double x, int exp)
+{
+	if (x == 0.0 || exp == 0) return x;
+	while (exp > 100) {
+		x *= 1.2676506002282294e+30L; /* 2^100 */
+		exp -= 100;
+	}
+	while (exp < -100) {
+		x *= 7.888609052210118e-31L; /* 2^-100 */
+		exp += 100;
+	}
+	if (exp > 0) {
+		long double base = 2.0L;
+		while (exp > 0) {
+			if (exp & 1) x *= base;
+			base *= base;
+			exp >>= 1;
+		}
+	} else if (exp < 0) {
+		exp = -exp;
+		long double base = 0.5L;
+		while (exp > 0) {
+			if (exp & 1) x *= base;
+			base *= base;
+			exp >>= 1;
+		}
+	}
+	return x;
+}
+
+float strtof(const char *nptr, char **endptr)
+{
+	return (float)strtod(nptr, endptr);
+}
+
+long double strtold(const char *nptr, char **endptr)
+{
+	return (long double)strtod(nptr, endptr);
+}
 
 #include <signal.h>
 
@@ -264,11 +571,44 @@ sighandler_t signal(int signum, sighandler_t handler)
 	return old.sa_handler;
 }
 
-int sigemptyset(sigset_t *set) { if (set) { *set = 0; return 0; } return -1; }
+int sigemptyset(sigset_t *set) {
+  if (!set) {
+    errno = EINVAL;
+    return -1;
+  }
+  *set = 0;
+  return 0;
+}
+int sigfillset(sigset_t *set) {
+  if (!set) {
+    errno = EINVAL;
+    return -1;
+  }
+  *set = ~0UL;
+  return 0;
+}
 int sigaddset(sigset_t *set, int signum) {
-  if (!set || signum <= 0 || signum >= 64) return -1;
+  if (!set || signum <= 0 || signum >= 64) {
+    errno = EINVAL;
+    return -1;
+  }
   *set |= (1UL << (signum - 1));
   return 0;
+}
+int sigdelset(sigset_t *set, int signum) {
+  if (!set || signum <= 0 || signum >= 64) {
+    errno = EINVAL;
+    return -1;
+  }
+  *set &= ~(1UL << (signum - 1));
+  return 0;
+}
+int sigismember(const sigset_t *set, int signum) {
+  if (!set || signum <= 0 || signum >= 64) {
+    errno = EINVAL;
+    return -1;
+  }
+  return (*set & (1UL << (signum - 1))) ? 1 : 0;
 }
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);

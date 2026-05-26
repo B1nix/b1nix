@@ -374,8 +374,14 @@ diagnostics.
 - [x] `done` Make syscall errors consistently map to userspace `errno` for the covered libc wrappers and smoke paths.
 - [x] `done` Eliminate non-critical kernel panics from VFS lookup and network packet ingestion paths: zero panics in net/ layer, only 2 lock-ordering safety assertions remain in VFS.
 - [x] `done` Integrate automated static analysis checks into the top-level Makefile: `make analyze` target runs clang `--analyze` on all kernel sources with plist output.
-- [x] `done` Boot Application Processors (APs) via INIT-SIPI-SIPI, configure Local APIC timer/MMIO, and initialize spinlocks for multithreaded kernel synchronization.
+## M24b: Symmetric Multiprocessing (SMP) & Multithreading
+
+- [x] `done` Boot Application Processors (APs) via INIT-SIPI-SIPI sequence.
+- [x] `done` Configure Local APIC timer, MMIO maps, and per-CPU data areas (via GS segment).
+- [x] `done` Implement spinlock primitives for kernel-wide synchronization and thread safety.
+- [x] `done` Activate per-CPU scheduler runqueues and idle task loops on all online processors.
 - [ ] `planned` Implement cross-CPU task stealing (load balancing) in `sched_steal_task()` to enable task migration across cores.
+- [ ] `planned` Formalize file descriptor table locking to ensure thread-safe FD allocation under multi-threaded execution.
 
 ## M25: Minimal Native C Toolchain
 
@@ -392,7 +398,8 @@ diagnostics.
 - [x] `done` Compile and run a simple utility inside B1NIX, including argv/output verification.
 - [x] `done` Smoke-test native TCC stderr handling and non-zero exit status propagation.
 - [x] `done` Document the current external cross-build to in-guest compilation boundary in `docs/abi.md`.
-- [ ] `planned` Align libc POSIX-facing APIs and signatures (`signal.h`, `sigaction`, `sigprocmask`, `dlopen*`, `strtod` family) and remove stubs.
+- [x] `done` Align libc POSIX-facing APIs and signatures: implemented the `strtod` family (`strtod`, `strtof`, `strtold`) and `ldexp`/`ldexpl` scaling routines, resolving the floating-point parsing stubs for the native compiler toolchain.
+- [x] `done` Align remaining libc POSIX-facing APIs: signal set helpers (`sigfillset`, `sigdelset`, `sigismember`) implemented with EINVAL validation; `dlopen`/`dlsym`/`dlclose`/`dlerror` stubs hardened to follow POSIX error-reporting contract (error buffer, consume-and-clear semantics, RTLD_DEFAULT sentinel handle); `dlfcn.h` expanded with full RTLD_* constants including `RTLD_LOCAL`, `RTLD_NOLOAD`, `RTLD_NEXT`.
 - [x] `done` Harden the internal kernel `malloc`/`free` heap implementations: magic number validation (KHEAP_MAGIC/KHEAP_FREED_MAGIC) and header canary (KHEAP_CANARY) validated on alloc and free; `kheap_validate()` walks all blocks checking canary integrity.
 
 ## M26: Full Toolchain and Self-Hosting

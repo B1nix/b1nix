@@ -116,6 +116,7 @@ void scheduler_init(void) {
   boot->fd_capacity = SCHED_MAX_FDS;
   boot->fd_table = kzalloc(boot->fd_capacity * sizeof(struct vfs_handle *));
   boot->fd_flags = kzalloc(boot->fd_capacity * sizeof(int));
+  boot->fd_lock = 0;
   boot->priority = 1;
   boot->parent_id = 0;
   boot->cwd[0] = '/';
@@ -133,6 +134,15 @@ void scheduler_init(void) {
   scheduler_started = 1;
 
   console_write("sched: initialized\n");
+  console_write("scheduler offsets: fd_table=");
+  console_write_dec((usize)&((struct task *)0)->fd_table);
+  console_write(" fd_lock=");
+  console_write_dec((usize)&((struct task *)0)->fd_lock);
+  console_write(" pml4_phys=");
+  console_write_dec((usize)&((struct task *)0)->pml4_phys);
+  console_write(" vma_list=");
+  console_write_dec((usize)&((struct task *)0)->vma_list);
+  console_write("\n");
 }
 
 static void task_init_cred(struct task *task) {
@@ -220,6 +230,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->fd_capacity = parent_task->fd_capacity;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
+    task->fd_lock = 0;
     for (usize i = 0; i < task->fd_capacity; i++) {
       task->fd_table[i] = parent_task->fd_table[i];
       task->fd_flags[i] = parent_task->fd_flags[i];
@@ -231,6 +242,7 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->fd_capacity = SCHED_MAX_FDS;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
+    task->fd_lock = 0;
   }
   task->priority = 1;
   task->parent_id = parent_task ? parent_task->id : 0;
@@ -243,6 +255,8 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
     task->process_group_id = parent_task->process_group_id;
     task->session_id = parent_task->session_id;
     memcpy(task->env, parent_task->env, sizeof(task->env));
+    task->pml4_phys = 0;
+    task->vma_list = 0;
   } else {
     task->cwd[0] = '/';
     task->cwd[1] = '\0';
@@ -423,6 +437,7 @@ int scheduler_fork_current(void) {
     interrupts_enable();
     return -1;
   }
+  child->fd_lock = 0;
   for (usize i = 0; i < child->fd_capacity; i++) {
     child->fd_table[i] = parent->fd_table[i];
     child->fd_flags[i] = parent->fd_flags[i];
@@ -758,31 +773,42 @@ void scheduler_fd_table_init_current(void) {
   current_task->fd_capacity = SCHED_MAX_FDS;
   current_task->fd_table = kzalloc(current_task->fd_capacity * sizeof(struct vfs_handle *));
   current_task->fd_flags = kzalloc(current_task->fd_capacity * sizeof(int));
+  current_task->fd_lock = 0; /* reset lock for new table */
 }
 
 int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
+
+  spin_lock(&current_task->fd_lock);
+
   for (usize i = 0; i < current_task->fd_capacity; i++) {
     if (current_task->fd_table[i] == 0) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
+      spin_unlock(&current_task->fd_lock);
       return (int)i;
     }
   }
 
-  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT)
+  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT) {
+    spin_unlock(&current_task->fd_lock);
     return -1;
+  }
 
   usize new_capacity = current_task->fd_capacity * 2;
   if (new_capacity > SCHED_MAX_FD_LIMIT)
     new_capacity = SCHED_MAX_FD_LIMIT;
 
   struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
-  if (!new_table) return -1;
+  if (!new_table) {
+    spin_unlock(&current_task->fd_lock);
+    return -1;
+  }
   int *new_flags = kzalloc(new_capacity * sizeof(int));
   if (!new_flags) {
     kfree(new_table);
+    spin_unlock(&current_task->fd_lock);
     return -1;
   }
 
@@ -799,22 +825,31 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   current_task->fd_capacity = new_capacity;
   current_task->fd_table[allocated_fd] = handle;
   current_task->fd_flags[allocated_fd] = 0;
+
+  spin_unlock(&current_task->fd_lock);
   return allocated_fd;
 }
 
 struct vfs_handle *scheduler_fd_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return 0;
-  return current_task->fd_table[fd];
+  spin_lock(&current_task->fd_lock);
+  struct vfs_handle *h = current_task->fd_table[fd];
+  spin_unlock(&current_task->fd_lock);
+  return h;
 }
 
 int scheduler_fd_set(int fd, struct vfs_handle *handle) {
   if (!current_task || fd < 0)
     return -1;
 
+  spin_lock(&current_task->fd_lock);
+
   if ((usize)fd >= current_task->fd_capacity) {
-    if ((usize)fd >= SCHED_MAX_FD_LIMIT)
+    if ((usize)fd >= SCHED_MAX_FD_LIMIT) {
+      spin_unlock(&current_task->fd_lock);
       return -1;
+    }
     usize new_capacity = current_task->fd_capacity;
     while (new_capacity <= (usize)fd) {
       new_capacity *= 2;
@@ -823,10 +858,14 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
       new_capacity = SCHED_MAX_FD_LIMIT;
 
     struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
-    if (!new_table) return -1;
+    if (!new_table) {
+      spin_unlock(&current_task->fd_lock);
+      return -1;
+    }
     int *new_flags = kzalloc(new_capacity * sizeof(int));
     if (!new_flags) {
       kfree(new_table);
+      spin_unlock(&current_task->fd_lock);
       return -1;
     }
 
@@ -843,31 +882,39 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
+  spin_unlock(&current_task->fd_lock);
   return fd;
 }
 
 int scheduler_fd_close(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
+  spin_lock(&current_task->fd_lock);
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
+  spin_unlock(&current_task->fd_lock);
   return 0;
 }
 
 int scheduler_fd_flags_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  if (!current_task->fd_table[fd])
-    return -1;
-  return current_task->fd_flags[fd];
+  spin_lock(&current_task->fd_lock);
+  int f = current_task->fd_table[fd] ? current_task->fd_flags[fd] : -1;
+  spin_unlock(&current_task->fd_lock);
+  return f;
 }
 
-int scheduler_fd_flags_set(int fd, int flags) {
+int scheduler_fd_flags_set(int fd, int flags_val) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  if (!current_task->fd_table[fd])
+  spin_lock(&current_task->fd_lock);
+  if (!current_task->fd_table[fd]) {
+    spin_unlock(&current_task->fd_lock);
     return -1;
-  current_task->fd_flags[fd] = flags;
+  }
+  current_task->fd_flags[fd] = flags_val;
+  spin_unlock(&current_task->fd_lock);
   return 0;
 }
 
@@ -1010,10 +1057,17 @@ struct cred *scheduler_get_current_cred(void) {
 void scheduler_set_user_image(void *image) {
   if (current_task) {
     current_task->user_image = image;
+    console_write("scheduler_set_user_image: task=");
+    console_write(current_task->name);
+    console_write(" pml4_phys before=0x");
+    console_write_hex64(current_task->pml4_phys);
     if (current_task->pml4_phys == 0) {
       current_task->pml4_phys = paging_create_address_space();
       paging_switch_address_space(current_task->pml4_phys);
     }
+    console_write(" after=0x");
+    console_write_hex64(current_task->pml4_phys);
+    console_write("\n");
   }
 }
 

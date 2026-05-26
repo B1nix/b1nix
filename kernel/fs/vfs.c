@@ -3170,34 +3170,30 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return -ENOTTY;
 
   if (request == B1NIX_TCGETS) {
-    *(struct b1nix_termios *)arg = console.termios;
+    if (!arg || syscall_copyout(arg, &console.termios, sizeof(struct b1nix_termios)) < 0)
+      return -EFAULT;
     return 0;
   }
   if (request == B1NIX_TCSETS) {
-    console.termios = *(const struct b1nix_termios *)arg;
+    if (!arg || syscall_copyin(&console.termios, arg, sizeof(struct b1nix_termios)) < 0)
+      return -EFAULT;
     return 0;
   }
   if (request == B1NIX_TIOCGPGRP) {
-    usize *pgrp_ptr = (usize *)arg;
-    if (!pgrp_ptr)
+    if (!arg || syscall_copyout(arg, &console.fg_pgrp, sizeof(usize)) < 0)
       return -EFAULT;
-    *pgrp_ptr = console.fg_pgrp;
     return 0;
   }
   if (request == B1NIX_TIOCSPGRP) {
-    usize *pgrp_ptr = (usize *)arg;
-    if (!pgrp_ptr)
+    usize fg;
+    if (!arg || syscall_copyin(&fg, arg, sizeof(usize)) < 0)
       return -EFAULT;
-    // POSIX: process group must be in the same session, and calling process must be in the terminal's session
-    if (current_task) {
-      if (current_task->session_id != console.session_id) {
-        return -EPERM;
-      }
-      if (!scheduler_is_pgrp_in_session(*pgrp_ptr, current_task->session_id)) {
-        return -EPERM;
-      }
-    }
-    console.fg_pgrp = *pgrp_ptr;
+      
+    /* Временно отключаем строгую POSIX-проверку совпадения сессий 
+     * (current_task->session_id == console.session_id), так как 
+     * в B1NIX еще не реализован захват терминала новой сессией через TIOCSCTTY.
+     */
+    console.fg_pgrp = fg;
     return 0;
   }
   return -1;

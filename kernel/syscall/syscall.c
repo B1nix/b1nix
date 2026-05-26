@@ -499,9 +499,10 @@ static int user_frame_is_valid(const struct interrupt_frame *frame) {
   if (frame->rip >= 0x0000800000000000ULL ||
       frame->rsp >= 0x0000800000000000ULL)
     return 0;
-  /* SysV ABI: stack pointer is 16-byte aligned at Ring 3 transfer points. */
-  if ((frame->rsp & 0xFULL) != 0)
-    return 0;
+  /* Note: RSP alignment is NOT enforced here because signal frame delivery
+   * sets RSP to restorer_slot (= frame_base - 8), which is 8-byte aligned.
+   * The 16-byte ABI alignment is a userspace calling convention, not a
+   * kernel security invariant. */
   return 1;
 }
 

@@ -287,6 +287,61 @@ int main(void) {
   }
   marker("M25-SMOKE: ok exit-check\n");
 
+  // 9. Floating point parsing and scaling tests
+  int float_fd = open("/tmp/float-check.c", O_CREAT | O_WRONLY | O_TRUNC, 0666);
+  if (float_fd < 0) {
+    marker("M25-SMOKE: fail write-float-check\n");
+    return 1;
+  }
+  const char *float_src =
+      "#include <stdio.h>\n"
+      "#include <stdlib.h>\n"
+      "#include <math.h>\n"
+      "#include <signal.h>\n"
+      "#include <errno.h>\n"
+      "int main(void) {\n"
+      "  char *end;\n"
+      "  double val;\n"
+      "  val = strtod(\"  -123.456\", &end);\n"
+      "  if (val != -123.456 || *end != '\\0') return 1;\n"
+      "  val = strtod(\"1.5e3\", &end);\n"
+      "  if (val != 1500.0 || *end != '\\0') return 2;\n"
+      "  val = strtod(\"0x1.8p2\", &end);\n"
+      "  if (val != 6.0 || *end != '\\0') return 3;\n"
+      "  val = ldexp(1.25, 4);\n"
+      "  if (val != 20.0) return 4;\n"
+      "  sigset_t set;\n"
+      "  if (sigemptyset(&set) != 0 || set != 0) return 5;\n"
+      "  if (sigaddset(&set, SIGINT) != 0 || set != (1UL << (SIGINT - 1))) return 6;\n"
+      "  if (sigismember(&set, SIGINT) != 1) return 7;\n"
+      "  if (sigismember(&set, SIGSEGV) != 0) return 8;\n"
+      "  if (sigfillset(&set) != 0 || set != ~0UL) return 9;\n"
+      "  if (sigdelset(&set, SIGINT) != 0 || sigismember(&set, SIGINT) != 0) return 10;\n"
+      "  if (sigismember(&set, SIGSEGV) != 1) return 11;\n"
+      "  errno = 0;\n"
+      "  if (sigaddset(&set, -1) != -1 || errno != EINVAL) return 12;\n"
+      "  errno = 0;\n"
+      "  if (sigaddset(&set, 64) != -1 || errno != EINVAL) return 13;\n"
+      "  errno = 0;\n"
+      "  if (sigismember(&set, 0) != -1 || errno != EINVAL) return 14;\n"
+      "  printf(\"M25-FLOAT: all float tests passed\\n\");\n"
+      "  return 0;\n"
+      "}\n";
+  write(float_fd, float_src, strlen(float_src));
+  close(float_fd);
+
+  char *tcc_float_argv[] = {"tcc", "/tmp/float-check.c", "-o", "/tmp/float-check", NULL};
+  if (run_cmd("/bin/tcc", tcc_float_argv) != 0) {
+    marker("M25-SMOKE: fail compile-float-check\n");
+    return 1;
+  }
+  char *float_argv[] = {"float-check", NULL};
+  if (run_cmd("/tmp/float-check", float_argv) != 0) {
+    marker("M25-SMOKE: fail run-float-check\n");
+    return 1;
+  }
+  marker("M25-SMOKE: ok float-check\n");
+
   marker("M25-SMOKE: done\n");
   return 0;
 }
