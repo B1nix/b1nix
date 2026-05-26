@@ -19,6 +19,15 @@
 #define SA_NODEFER  0x40000000
 
 typedef void (*sighandler_t)(int);
+typedef int sig_atomic_t;
+
+int kill(int pid, int sig);
+
+#include <syscall.h>
+static inline int raise(int sig) {
+    int pid = (int)_syscall_raw(SYS_GETPID, 0, 0, 0, 0, 0, 0);
+    return kill(pid, sig);
+}
 
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)

@@ -53,8 +53,65 @@ static inline void clearerr(FILE *stream) {
     }
 }
 
-#define putc(c, stream) fputc(c, stream)
-#define getc(stream) fgetc(stream)
+#define SEEK_SET 0
+#define SEEK_CUR 1
+#define SEEK_END 2
+
+typedef long fpos_t;
+
+static inline int getc(FILE *stream) {
+    return fgetc(stream);
+}
+
+static inline int putc(int c, FILE *stream) {
+    return fputc(c, stream);
+}
+
+static inline int fgetpos(FILE *stream, fpos_t *pos) {
+    long p = ftell(stream);
+    if (p < 0) return -1;
+    *pos = p;
+    return 0;
+}
+
+static inline int fsetpos(FILE *stream, const fpos_t *pos) {
+    return fseek(stream, *pos, SEEK_SET);
+}
+
+#include <syscall.h>
+#include <errno.h>
+int normalize_errno(long rc);
+
+static inline int rename(const char *oldpath, const char *newpath) {
+    int rc = (int)syscall(SYS_RENAME, oldpath, newpath);
+    if (rc < 0) {
+        errno = normalize_errno(rc);
+        return -1;
+    }
+    return 0;
+}
+
+static inline int scanf(const char *format, ...) {
+    (void)format;
+    return 0;
+}
+
+static inline void setbuf(FILE *stream, char *buf) {
+    (void)stream;
+    (void)buf;
+}
+
+static inline int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
+    (void)stream;
+    (void)buf;
+    (void)mode;
+    (void)size;
+    return 0;
+}
+
+static inline int vprintf(const char *format, va_list ap) {
+    return vfprintf(stdout, format, ap);
+}
 
 static inline char *fgets(char *s, int size, FILE *stream) {
     int i = 0;
@@ -92,10 +149,6 @@ static inline int sscanf(const char *str, const char *format, ...) {
     va_end(ap);
     return 1;
 }
-
-#define SEEK_SET 0
-#define SEEK_CUR 1
-#define SEEK_END 2
 
 #define BUFSIZ 1024
 

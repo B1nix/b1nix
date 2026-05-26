@@ -78,7 +78,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
 fi
 
 # 5. Build cross-gcc
-if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
+if [ ! -f "$PREFIX/bin/${TARGET}-g++" ]; then
     echo "Building Cross-GCC (bootstrap)..."
     mkdir -p build-gcc
     cd build-gcc
@@ -87,7 +87,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --prefix="$PREFIX" \
         --with-sysroot="$PROJECT_DIR/build/x86/rootfs" \
         --disable-nls \
-        --enable-languages=c \
+        --enable-languages=c,c++ \
         --without-headers \
         --disable-shared \
         --disable-multilib \
@@ -96,15 +96,14 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --disable-libmudflap \
         --disable-libssp \
         --disable-libquadmath \
-        --disable-libstdcxx \
         --with-newlib \
         --with-system-zlib \
         --with-gmp=/opt/homebrew \
         --with-mpfr=/opt/homebrew \
         --with-mpc=/opt/homebrew \
         MAKEINFO=true
-    make -j2 all-gcc all-target-libgcc MAKEINFO=true
-    make install-gcc install-target-libgcc MAKEINFO=true
+    make -j2 all-gcc all-target-libgcc all-target-libstdc++-v3 MAKEINFO=true
+    make install-gcc install-target-libgcc install-target-libstdc++-v3 MAKEINFO=true
     cd ..
 fi
 

@@ -68,4 +68,37 @@ static inline char *ctime(const time_t *timep) {
     return "Tue May 26 15:00:00 2026\n";
 }
 
+static inline double difftime(time_t time1, time_t time0) {
+    return (double)(time1 - time0);
+}
+
+static inline time_t mktime(struct tm *tm) {
+    int y = tm->tm_year + 1900;
+    int m = tm->tm_mon + 1;
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    int d = tm->tm_mday;
+    long days = (365L * y) + (y / 4) - (y / 100) + (y / 400) + ((153 * m + 2) / 5) + d - 719468;
+    return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
+}
+
+static inline char *asctime(const struct tm *tm) {
+    static char buf[26];
+    static const char wday_name[7][4] = {
+        "Sun", "Mon", "Tue", "Wed", "Thu", "Fri", "Sat"
+    };
+    static const char mon_name[12][4] = {
+        "Jan", "Feb", "Mar", "Apr", "May", "Jun",
+        "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"
+    };
+    snprintf(buf, sizeof(buf), "%.3s %.3s%3d %.2d:%.2d:%.2d %d\n",
+             wday_name[tm->tm_wday >= 0 && tm->tm_wday < 7 ? tm->tm_wday : 0],
+             mon_name[tm->tm_mon >= 0 && tm->tm_mon < 12 ? tm->tm_mon : 0],
+             tm->tm_mday, tm->tm_hour, tm->tm_min, tm->tm_sec,
+             1900 + tm->tm_year);
+    return buf;
+}
+
 #endif

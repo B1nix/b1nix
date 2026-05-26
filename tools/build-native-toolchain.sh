@@ -12,14 +12,15 @@ SYSROOT="$PROJECT_DIR/build/x86/rootfs"
 
 export PATH="$CROSS_PREFIX/bin:$PATH"
 
-# Export build environment for all subconfigures and makefiles
-export CC="x86_64-b1nix-gcc"
-export AR="x86_64-b1nix-ar"
-export RANLIB="x86_64-b1nix-ranlib"
-export CFLAGS="-isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
-export CPPFLAGS="-isystem $SYSROOT/include"
-export LDFLAGS="-Wl,-Ttext-segment=0x2000000"
-export LIBS="-lb1nix -lgcc"
+# Define host build variables
+CC_VAL="x86_64-b1nix-gcc"
+CXX_VAL="x86_64-b1nix-gcc"
+AR_VAL="x86_64-b1nix-ar"
+RANLIB_VAL="x86_64-b1nix-ranlib"
+CFLAGS_VAL="-isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
+CPPFLAGS_VAL="-isystem $SYSROOT/include"
+LDFLAGS_VAL="-Wl,-Ttext-segment=0x2000000"
+LIBS_VAL="-lb1nix -lgcc"
 
 BINUTILS_VER="2.41"
 GCC_VER="13.2.0"
@@ -43,6 +44,14 @@ if [ ! -f "$NATIVE_DEST/bin/ld" ]; then
     mkdir -p build-native-binutils
     cd build-native-binutils
     ../binutils-${BINUTILS_VER}/configure \
+        CC="$CC_VAL" \
+        CXX="$CXX_VAL" \
+        AR="$AR_VAL" \
+        RANLIB="$RANLIB_VAL" \
+        CFLAGS="$CFLAGS_VAL" \
+        CPPFLAGS="$CPPFLAGS_VAL" \
+        LDFLAGS="$LDFLAGS_VAL" \
+        LIBS="$LIBS_VAL" \
         --host="$TARGET" \
         --target="$TARGET" \
         --prefix="" \
@@ -63,6 +72,14 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     mkdir -p build-native-gcc
     cd build-native-gcc
     ../gcc-${GCC_VER}/configure \
+        CC="$CC_VAL" \
+        CXX="$CXX_VAL" \
+        AR="$AR_VAL" \
+        RANLIB="$RANLIB_VAL" \
+        CFLAGS="$CFLAGS_VAL" \
+        CPPFLAGS="$CPPFLAGS_VAL" \
+        LDFLAGS="$LDFLAGS_VAL" \
+        LIBS="$LIBS_VAL" \
         --host="$TARGET" \
         --target="$TARGET" \
         --prefix="" \

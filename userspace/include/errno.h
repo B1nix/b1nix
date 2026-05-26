@@ -72,4 +72,10 @@ int normalize_errno(long rc);
 #define EALREADY        114     /* Operation already in progress */
 #define EINPROGRESS     115     /* Operation now in progress */
 
+#define EDEADLK         35      /* Resource deadlock would occur */
+#define ENOLCK          37      /* No record locks available */
+#define ENOMSG          42      /* No message of desired type */
+#define EILSEQ          84      /* Illegal byte sequence */
+#define EOVERFLOW       75      /* Value too large for defined data type */
+
 #endif

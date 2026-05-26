@@ -6,6 +6,16 @@
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 
+typedef struct {
+    int quot;
+    int rem;
+} div_t;
+
+typedef struct {
+    long quot;
+    long rem;
+} ldiv_t;
+
 void  exit(int status) __attribute__((noreturn));
 void *malloc(size_t size);
 void  free(void *ptr);
@@ -51,6 +61,29 @@ static inline void abort(void) {
 static inline long labs(long x) {
     return x < 0 ? -x : x;
 }
+
+static inline int abs(int x) {
+    return x < 0 ? -x : x;
+}
+
+static inline div_t div(int numer, int denom) {
+    div_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
+static inline ldiv_t ldiv(long numer, long denom) {
+    ldiv_t r;
+    r.quot = numer / denom;
+    r.rem = numer % denom;
+    return r;
+}
+
+int atexit(void (*function)(void));
+int rand(void);
+void srand(unsigned int seed);
+int system(const char *command);
 
 static inline void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
     size_t l = 0, r = nmemb;

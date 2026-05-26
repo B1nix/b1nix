@@ -22,6 +22,56 @@ char *strrchr(const char *s, int c);
 char *strpbrk(const char *s, const char *accept);
 char *strerror(int errnum);
 
+static inline void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (n--) {
+        if (*p == (unsigned char)c) return (void *)p;
+        p++;
+    }
+    return NULL;
+}
+
+static inline char *strtok(char *str, const char *delim) {
+    static char *last;
+    if (str) last = str;
+    if (!last || *last == '\0') return NULL;
+    while (*last) {
+        const char *d = delim;
+        while (*d) {
+            if (*last == *d) break;
+            d++;
+        }
+        if (!*d) break;
+        last++;
+    }
+    if (*last == '\0') return NULL;
+    char *start = last;
+    while (*last) {
+        const char *d = delim;
+        while (*d) {
+            if (*last == *d) {
+                *last = '\0';
+                last++;
+                return start;
+            }
+            d++;
+        }
+        last++;
+    }
+    return start;
+}
+
+static inline size_t strxfrm(char *dest, const char *src, size_t n) {
+    size_t len = strlen(src);
+    if (n > len) {
+        strcpy(dest, src);
+    } else if (n > 0) {
+        strncpy(dest, src, n - 1);
+        dest[n - 1] = '\0';
+    }
+    return len;
+}
+
 static inline size_t strcspn(const char *s, const char *reject) {
     const char *p = s;
     while (*p) {

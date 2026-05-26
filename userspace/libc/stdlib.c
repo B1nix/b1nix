@@ -6,8 +6,20 @@
 
 extern int normalize_errno(long rc);
 
+static void (*atexit_funcs[32])(void);
+static int atexit_count = 0;
+
+int atexit(void (*function)(void)) {
+	if (atexit_count >= 32) return -1;
+	atexit_funcs[atexit_count++] = function;
+	return 0;
+}
+
 void exit(int status)
 {
+	while (atexit_count > 0) {
+		atexit_funcs[--atexit_count]();
+	}
 	syscall(SYS_EXIT, status, 0, 0, 0);
 	while (1);
 }
@@ -674,4 +686,34 @@ int sem_post(int *sem) {
 int sem_destroy(int *sem) {
   (void)sem;
   return 0;
+}
+
+static unsigned long next_rand = 1;
+
+int rand(void) {
+	next_rand = next_rand * 1103515245 + 12345;
+	return (unsigned int)(next_rand / 65536) % 32768;
+}
+
+void srand(unsigned int seed) {
+	next_rand = seed;
+}
+
+int fork(void);
+int execv(const char *pathname, char *const argv[]);
+typedef int pid_t;
+pid_t waitpid(pid_t pid, int *status, int options);
+
+int system(const char *command) {
+	if (!command) return 1;
+	pid_t pid = fork();
+	if (pid < 0) return -1;
+	if (pid == 0) {
+		char *args[] = { "/bin/sh", "-c", (char *)command, NULL };
+		execv("/bin/sh", args);
+		exit(127);
+	}
+	int status;
+	if (waitpid(pid, &status, 0) < 0) return -1;
+	return status;
 }
