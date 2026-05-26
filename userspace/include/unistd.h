@@ -2,6 +2,7 @@
 #define B1NIX_U_UNISTD_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #define _PC_PATH_MAX 4
 static inline long pathconf(const char *path, int name) {
@@ -9,6 +10,10 @@ static inline long pathconf(const char *path, int name) {
     if (name == _PC_PATH_MAX) return 4096;
     return -1;
 }
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 extern char **environ;
 
@@ -114,5 +119,9 @@ static inline int getpid(void) {
 static inline int isatty(int fd) {
     return fd >= 0 && fd <= 2;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

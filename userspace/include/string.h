@@ -1,6 +1,10 @@
 #ifndef B1NIX_U_STRING_H
 #define B1NIX_U_STRING_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 void *memcpy(void *dest, const void *src, size_t count);
@@ -98,5 +102,9 @@ static inline size_t strspn(const char *s, const char *accept) {
     }
     return p - s;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

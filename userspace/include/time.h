@@ -1,6 +1,14 @@
 #ifndef B1NIX_U_TIME_H
 #define B1NIX_U_TIME_H
 
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int snprintf(char *s, size_t n, const char *format, ...);
+
 typedef long time_t;
 
 struct timeval {
@@ -100,5 +108,9 @@ static inline char *asctime(const struct tm *tm) {
              1900 + tm->tm_year);
     return buf;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

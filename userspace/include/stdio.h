@@ -1,7 +1,12 @@
 #ifndef B1NIX_U_STDIO_H
 #define B1NIX_U_STDIO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
+#include <sys/types.h>
 #include <stdarg.h>
 
 #define EOF (-1)
@@ -109,9 +114,7 @@ static inline int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
     return 0;
 }
 
-static inline int vprintf(const char *format, va_list ap) {
-    return vfprintf(stdout, format, ap);
-}
+int vprintf(const char *format, va_list ap);
 
 static inline char *fgets(char *s, int size, FILE *stream) {
     int i = 0;
@@ -151,6 +154,9 @@ static inline int sscanf(const char *str, const char *format, ...) {
 }
 
 #define BUFSIZ 1024
+#define _IOFBF 0
+#define _IOLBF 1
+#define _IONBF 2
 
 static inline FILE *tmpfile(void) {
     return NULL;
@@ -189,5 +195,9 @@ static inline int fscanf(FILE *stream, const char *format, ...) {
 static inline int getchar(void) {
     return fgetc(stdin);
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

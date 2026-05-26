@@ -1,12 +1,26 @@
 #ifndef B1NIX_U_MATH_H
 #define B1NIX_U_MATH_H
 
+#define FP_NAN          0
+#define FP_INFINITE     1
+#define FP_ZERO         2
+#define FP_SUBNORMAL    3
+#define FP_NORMAL       4
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 double strtod(const char *nptr, char **endptr);
 double ldexp(double x, int exp);
 double frexp(double x, int *exp);
 long double ldexpl(long double x, int exp);
 float strtof(const char *nptr, char **endptr);
 long double strtold(const char *nptr, char **endptr);
+
+#ifdef __cplusplus
+}
+#endif
 
 static inline double acos(double x) { return __builtin_acos(x); }
 static inline double asin(double x) { return __builtin_asin(x); }

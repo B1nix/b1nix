@@ -2,6 +2,9 @@
 #define B1NIX_U_SIGNAL_H
 
 #define SIGINT  2
+#ifdef __cplusplus
+extern "C" {
+#endif
 #define SIGILL  4
 #define SIGABRT 6
 #define SIGBUS  7
@@ -59,5 +62,8 @@ int sigismember(const sigset_t *set, int signum);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int kill(int pid, int sig);
+#ifdef __cplusplus
+}
+#endif
 
 #endif

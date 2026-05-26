@@ -1,6 +1,10 @@
 #ifndef B1NIX_U_STDLIB_H
 #define B1NIX_U_STDLIB_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 #include <stddef.h>
 
 #define EXIT_SUCCESS 0
@@ -125,5 +129,9 @@ static inline char *mktemp(char *tmpl) {
     }
     return tmpl;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
