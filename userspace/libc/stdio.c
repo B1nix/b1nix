@@ -268,6 +268,10 @@ int vfprintf(FILE *stream, const char *fmt, va_list ap) {
   return n;
 }
 
+int vprintf(const char *fmt, va_list ap) {
+  return vfprintf(stdout, fmt, ap);
+}
+
 static void _vsnprintf_putc(char *str, size_t size, int *pos, char c) {
   if (*pos < (int)size - 1) {
     str[(*pos)++] = c;

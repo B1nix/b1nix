@@ -230,7 +230,15 @@ userspace:
 userspace-install: userspace
 	@$(MAKE) -C userspace install
 
-iso-full: userspace-install iso
+install-native-toolchain:
+	@if [ -d /root/b1nix-toolchain/native_root ]; then \
+		echo "Installing native toolchain to rootfs..."; \
+		mkdir -p build/x86/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
+		cp -r /root/b1nix-toolchain/native_root/* build/x86/rootfs/; \
+		cp /root/b1nix-toolchain/cross/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a build/x86/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+	fi
+
+iso-full: userspace-install install-native-toolchain iso
 
 run-x86: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
@@ -241,7 +249,7 @@ run-x86: iso userspace-install root-image
 
 run-root: run-x86
 
-root-image: userspace-install
+root-image: userspace-install install-native-toolchain
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
 	@# Copy userspace binaries into rootfs

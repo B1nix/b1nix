@@ -40,6 +40,9 @@ _start:
 	/* envp = argv + (argc + 1) * 8  (skip argc+1 pointers past argv terminator) */
 	leaq 8(%rsp, %rdi, 8), %rdx
 
+	/* Store envp in global environ variable */
+	movq %rdx, environ(%rip)
+
 	/* Align for C call ABI while preserving decoded argc/argv/envp. */
 	andq $-16, %rsp
 

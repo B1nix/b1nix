@@ -1,11 +1,19 @@
 #ifndef B1NIX_U_ERRNO_H
 #define B1NIX_U_ERRNO_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 extern int errno;
 
 /* Normalize kernel error codes to valid POSIX errno values.
    Returns EIO for out-of-range codes. */
 int normalize_errno(long rc);
+
+#ifdef __cplusplus
+}
+#endif
 
 #define EPERM            1      /* Operation not permitted */
 #define ENOENT           2      /* No such file or directory */
@@ -54,6 +62,7 @@ int normalize_errno(long rc);
 #define EPROTONOSUPPORT 93      /* Protocol not supported */
 #define ESOCKTNOSUPPORT 94      /* Socket type not supported */
 #define EOPNOTSUPP      95      /* Operation not supported */
+#define ENOTSUP         EOPNOTSUPP
 #define EPFNOSUPPORT    96      /* Protocol family not supported */
 #define EAFNOSUPPORT    97      /* Address family not supported */
 #define EADDRINUSE      98      /* Address already in use */
@@ -71,5 +80,11 @@ int normalize_errno(long rc);
 #define EHOSTUNREACH    113     /* No route to host */
 #define EALREADY        114     /* Operation already in progress */
 #define EINPROGRESS     115     /* Operation now in progress */
+
+#define EDEADLK         35      /* Resource deadlock would occur */
+#define ENOLCK          37      /* No record locks available */
+#define ENOMSG          42      /* No message of desired type */
+#define EILSEQ          84      /* Illegal byte sequence */
+#define EOVERFLOW       75      /* Value too large for defined data type */
 
 #endif
