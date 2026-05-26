@@ -79,8 +79,114 @@ char **environ = empty_env;
 
 char *getenv(const char *name)
 {
-	(void)name;
+	if (!name || !environ) return NULL;
+	size_t len = strlen(name);
+	for (char **env = environ; *env; env++) {
+		if (strncmp(*env, name, len) == 0 && (*env)[len] == '=') {
+			return *env + len + 1;
+		}
+	}
 	return NULL;
+}
+
+int putenv(char *string)
+{
+	if (!string) {
+		errno = EINVAL;
+		return -1;
+	}
+	char *equals = strchr(string, '=');
+	if (!equals || equals == string) {
+		errno = EINVAL;
+		return -1;
+	}
+	
+	size_t name_len = equals - string;
+	
+	/* Count existing environment variables */
+	size_t count = 0;
+	int found_idx = -1;
+	if (environ) {
+		while (environ[count]) {
+			if (strncmp(environ[count], string, name_len) == 0 && environ[count][name_len] == '=') {
+				found_idx = (int)count;
+			}
+			count++;
+		}
+	}
+	
+	if (found_idx != -1) {
+		/* Overwrite existing entry */
+		environ[found_idx] = string;
+	} else {
+		/* Allocate a new environ array */
+		char **new_environ = malloc((count + 2) * sizeof(char *));
+		if (!new_environ) {
+			errno = ENOMEM;
+			return -1;
+		}
+		if (environ && environ != empty_env) {
+			memcpy(new_environ, environ, count * sizeof(char *));
+		}
+		new_environ[count] = string;
+		new_environ[count + 1] = NULL;
+		environ = new_environ;
+	}
+	return 0;
+}
+
+int setenv(const char *name, const char *value, int overwrite)
+{
+	if (!name || name[0] == '\0' || strchr(name, '=')) {
+		errno = EINVAL;
+		return -1;
+	}
+	
+	char *existing = getenv(name);
+	if (existing && !overwrite) {
+		return 0;
+	}
+	
+	size_t name_len = strlen(name);
+	size_t val_len = value ? strlen(value) : 0;
+	
+	/* Allocate string "name=value" */
+	char *buf = malloc(name_len + val_len + 2);
+	if (!buf) {
+		errno = ENOMEM;
+		return -1;
+	}
+	memcpy(buf, name, name_len);
+	buf[name_len] = '=';
+	if (value) {
+		memcpy(buf + name_len + 1, value, val_len);
+	}
+	buf[name_len + 1 + val_len] = '\0';
+	
+	return putenv(buf);
+}
+
+int unsetenv(const char *name)
+{
+	if (!name || name[0] == '\0' || strchr(name, '=')) {
+		errno = EINVAL;
+		return -1;
+	}
+	
+	if (!environ || environ == empty_env) return 0;
+	
+	size_t len = strlen(name);
+	size_t i = 0, j = 0;
+	while (environ[i]) {
+		if (strncmp(environ[i], name, len) == 0 && environ[i][len] == '=') {
+			/* Skip copying this element */
+			i++;
+		} else {
+			environ[j++] = environ[i++];
+		}
+	}
+	environ[j] = NULL;
+	return 0;
 }
 
 char *realpath(const char *path, char *resolved_path)
