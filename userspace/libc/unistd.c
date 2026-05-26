@@ -5,6 +5,7 @@
 #include <stdlib.h>
 #include <sys/time.h>
 #include <time.h>
+#include <sys/types.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -56,6 +57,10 @@ int open(const char *path, int flags, ...) {
 
 int unlink(const char *pathname) {
   return _check_err(syscall(SYS_UNLINK, pathname));
+}
+
+int rmdir(const char *pathname) {
+  return _check_err(syscall(SYS_RMDIR, pathname));
 }
 
 int mprotect(void *addr, size_t len, int prot) {
@@ -264,4 +269,45 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
     rem->tv_nsec = 0;
   }
   return 0;
+}
+
+int fchmod(int fd, mode_t mode) {
+  (void)fd;
+  (void)mode;
+  return 0;
+}
+
+int utime(const char *filename, const void *times) {
+  (void)filename;
+  (void)times;
+  return 0;
+}
+
+int fork(void) {
+  return _check_err(syscall(SYS_FORK));
+}
+
+int pipe(int pipefd[2]) {
+  return _check_err(syscall(SYS_PIPE, pipefd));
+}
+
+int dup2(int oldfd, int newfd) {
+  return _check_err(syscall(SYS_DUP2, oldfd, newfd));
+}
+
+int execv(const char *pathname, char *const argv[]) {
+  extern char **environ;
+  return _check_err(syscall(SYS_EXECVE, pathname, argv, environ));
+}
+
+int kill(int pid, int sig) {
+  return _check_err(syscall(SYS_KILL, pid, sig));
+}
+
+pid_t wait(int *wstatus) {
+  return _check_err(syscall(SYS_WAIT, wstatus));
+}
+
+pid_t waitpid(pid_t pid, int *wstatus, int options) {
+  return _check_err(syscall(SYS_WAITPID, pid, wstatus, options));
 }

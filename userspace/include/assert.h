@@ -4,13 +4,8 @@
 #ifdef NDEBUG
 #define assert(ignore) ((void)0)
 #else
-#define assert(expr) \
-    do { \
-        if (!(expr)) { \
-            /* Add minimal assert logging if needed */ \
-            while (1); \
-        } \
-    } while (0)
+void _exit(int status) __attribute__((noreturn));
+#define assert(expr) ((expr) ? (void)0 : _exit(139))
 #endif
 
 #endif

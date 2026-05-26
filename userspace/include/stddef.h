@@ -7,4 +7,7 @@ typedef unsigned long size_t;
 typedef long ssize_t;
 typedef long ptrdiff_t;
 
+#define offsetof(type, member) ((size_t)&((type *)0)->member)
+
+
 #endif

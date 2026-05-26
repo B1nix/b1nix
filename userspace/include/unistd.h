@@ -3,6 +3,13 @@
 
 #include <stddef.h>
 
+#define _PC_PATH_MAX 4
+static inline long pathconf(const char *path, int name) {
+    (void)path;
+    if (name == _PC_PATH_MAX) return 4096;
+    return -1;
+}
+
 extern char **environ;
 
 int write(int fd, const void *buf, size_t n);
@@ -12,8 +19,13 @@ void _exit(int status) __attribute__((noreturn));
 int sleep(unsigned int seconds);
 int open(const char *path, int flags, ...);
 int unlink(const char *pathname);
+int rmdir(const char *pathname);
 long lseek(int fd, long offset, int whence);
 int execvp(const char *file, char *const argv[]);
+int execv(const char *pathname, char *const argv[]);
+int fork(void);
+int pipe(int pipefd[2]);
+int dup2(int oldfd, int newfd);
 int mkdir(const char *path, unsigned int mode);
 int chdir(const char *path);
 int getcwd(char *buf, size_t size);
@@ -61,5 +73,46 @@ int statfs(const char *path, struct statfs *buf);
 
 int setuid(unsigned short uid);
 int setgid(unsigned short gid);
+
+#include <syscall.h>
+
+static inline unsigned int umask(unsigned int mask) {
+    return syscall(SYS_UMASK, mask);
+}
+
+static inline int chmod(const char *path, unsigned int mode) {
+    return syscall(SYS_CHMOD, path, mode);
+}
+
+static inline int dup(int oldfd) {
+    static int next_fd = 100;
+    return syscall(SYS_DUP2, oldfd, next_fd++);
+}
+
+static inline int access(const char *path, int mode) {
+    (void)mode;
+    int fd = open(path, 0); // O_RDONLY
+    if (fd >= 0) {
+        close(fd);
+        return 0;
+    }
+    return -1;
+}
+
+static inline int lstat(const char *path, struct stat *st) {
+    return syscall(SYS_LSTAT, path, st);
+}
+
+static inline int fstat(int fd, struct stat *st) {
+    return syscall(SYS_FSTAT, fd, st);
+}
+
+static inline int getpid(void) {
+    return syscall(SYS_GETPID);
+}
+
+static inline int isatty(int fd) {
+    return fd >= 0 && fd <= 2;
+}
 
 #endif

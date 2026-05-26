@@ -20,6 +20,9 @@
 #define F_SETLK 6
 #define F_SETLKW 7
 
+#define FD_CLOEXEC 1
+
+
 struct flock {
 	short l_type;
 	short l_whence;
@@ -28,6 +31,22 @@ struct flock {
 	int   l_pid;
 };
 
-int fcntl(int fd, int cmd, ...);
+#include <syscall.h>
+#include <stdarg.h>
+
+static inline int fcntl(int fd, int cmd, ...) {
+    long arg = 0;
+    va_list ap;
+    va_start(ap, cmd);
+    arg = va_arg(ap, long);
+    va_end(ap);
+    long rc = syscall(SYS_FCNTL, fd, cmd, arg);
+    if (rc < 0) {
+        extern int errno;
+        errno = (int)(-rc);
+        return -1;
+    }
+    return (int)rc;
+}
 
 #endif
