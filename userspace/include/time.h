@@ -35,7 +35,10 @@ struct tm {
 
 time_t time(time_t *tloc);
 int gettimeofday(struct timeval *tv, struct timezone *tz);
+
+#ifndef __cplusplus
 struct tm *localtime(const time_t *timep);
+#endif
 
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
@@ -67,14 +70,16 @@ static inline size_t strftime(char *s, size_t max, const char *format, const str
     return n;
 }
 
+#ifndef __cplusplus
 static inline struct tm *gmtime(const time_t *timep) {
     return localtime(timep);
 }
 
 static inline char *ctime(const time_t *timep) {
     (void)timep;
-    return "Tue May 26 15:00:00 2026\n";
+    return (char *)"Tue May 26 15:00:00 2026\n";
 }
+#endif
 
 static inline double difftime(time_t time1, time_t time0) {
     return (double)(time1 - time0);
@@ -110,6 +115,41 @@ static inline char *asctime(const struct tm *tm) {
 }
 
 #ifdef __cplusplus
+}
+#endif
+
+#ifdef __cplusplus
+extern "C" {
+struct tm *b1nix_real_localtime(const time_t *timep) __asm__("localtime");
+}
+
+static inline struct tm *b1nix_real_gmtime(const time_t *timep) {
+    return b1nix_real_localtime(timep);
+}
+
+static inline char *b1nix_real_ctime(const time_t *timep) {
+    (void)timep;
+    return (char *)"Tue May 26 15:00:00 2026\n";
+}
+
+struct B1nixTimePtr {
+    time_t val;
+    const time_t *ptr;
+    B1nixTimePtr(const time_t *p) : ptr(p) {}
+    B1nixTimePtr(const unsigned int *p) : val(*p), ptr(&val) {}
+    B1nixTimePtr(decltype(nullptr)) : ptr(nullptr) {}
+};
+
+inline struct tm *localtime(B1nixTimePtr tp) {
+    return b1nix_real_localtime(tp.ptr);
+}
+
+inline struct tm *gmtime(B1nixTimePtr tp) {
+    return b1nix_real_gmtime(tp.ptr);
+}
+
+inline char *ctime(B1nixTimePtr tp) {
+    return b1nix_real_ctime(tp.ptr);
 }
 #endif
 

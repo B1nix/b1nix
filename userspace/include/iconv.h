@@ -3,6 +3,10 @@
 
 #include <stddef.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /* iconv stub for B1NIX — character encoding conversion is not supported.
  * These declarations satisfy headers that include iconv.h but B1NIX
  * does not have a working iconv implementation. */
@@ -30,5 +34,9 @@ static inline int iconv_close(iconv_t cd) {
     (void)cd;
     return -1;
 }
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

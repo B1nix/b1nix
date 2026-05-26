@@ -194,5 +194,105 @@ char *strpbrk(const char *s, const char *accept)
 	return NULL;
 }
 
+static inline char to_lower(char c) {
+	if (c >= 'A' && c <= 'Z') return c - 'A' + 'a';
+	return c;
+}
+
+int strcasecmp(const char *a, const char *b) {
+	while (*a && to_lower(*a) == to_lower(*b)) {
+		a++;
+		b++;
+	}
+	return (int)(unsigned char)to_lower(*a) - (int)(unsigned char)to_lower(*b);
+}
+
+int strncasecmp(const char *a, const char *b, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		char la = to_lower(a[i]);
+		char lb = to_lower(b[i]);
+		if (la != lb) return (int)(unsigned char)la - (int)(unsigned char)lb;
+		if (la == '\0') return 0;
+	}
+	return 0;
+}
+
+void *memchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s;
+    while (n--) {
+        if (*p == (unsigned char)c) return (void *)p;
+        p++;
+    }
+    return NULL;
+}
+
+char *strtok(char *str, const char *delim) {
+    static char *last;
+    if (str) last = str;
+    if (!last || *last == '\0') return NULL;
+    while (*last) {
+        const char *d = delim;
+        while (*d) {
+            if (*last == *d) break;
+            d++;
+        }
+        if (!*d) break;
+        last++;
+    }
+    if (*last == '\0') return NULL;
+    char *start = last;
+    while (*last) {
+        const char *d = delim;
+        while (*d) {
+            if (*last == *d) {
+                *last = '\0';
+                last++;
+                return start;
+            }
+            d++;
+        }
+        last++;
+    }
+    return start;
+}
+
+size_t strxfrm(char *dest, const char *src, size_t n) {
+    size_t len = strlen(src);
+    if (n > len) {
+        strcpy(dest, src);
+    } else if (n > 0) {
+        strncpy(dest, src, n - 1);
+        dest[n - 1] = '\0';
+    }
+    return len;
+}
+
+size_t strcspn(const char *s, const char *reject) {
+    const char *p = s;
+    while (*p) {
+        const char *r = reject;
+        while (*r) {
+            if (*p == *r) return p - s;
+            r++;
+        }
+        p++;
+    }
+    return p - s;
+}
+
+size_t strspn(const char *s, const char *accept) {
+    const char *p = s;
+    while (*p) {
+        const char *a = accept;
+        while (*a) {
+            if (*p == *a) break;
+            a++;
+        }
+        if (!*a) return p - s;
+        p++;
+    }
+    return p - s;
+}
+
 
 

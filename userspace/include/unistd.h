@@ -33,14 +33,11 @@ int pipe(int pipefd[2]);
 int dup2(int oldfd, int newfd);
 int mkdir(const char *path, unsigned int mode);
 int chdir(const char *path);
-int getcwd(char *buf, size_t size);
+char *getcwd(char *buf, size_t size);
 int fsync(int fd);
 void sync(void);
-int socket(int domain, int type, int protocol);
-int bind(int fd, const void *addr, size_t addrlen);
-int connect(int fd, const void *addr, size_t addrlen);
-long send(int fd, const void *buf, size_t len, int flags);
-long recv(int fd, void *buf, size_t len, int flags);
+unsigned int alarm(unsigned int seconds);
+
 
 /* stat structure for userspace */
 struct stat {
@@ -51,7 +48,7 @@ struct stat {
   unsigned int st_uid;
   unsigned int st_gid;
   unsigned long st_rdev;
-  unsigned long st_size;
+  off_t st_size;
   unsigned long st_blksize;
   unsigned long st_blocks;
   unsigned int st_atime;
@@ -93,6 +90,11 @@ static inline int dup(int oldfd) {
     static int next_fd = 100;
     return syscall(SYS_DUP2, oldfd, next_fd++);
 }
+
+#define F_OK 0
+#define X_OK 1
+#define W_OK 2
+#define R_OK 4
 
 static inline int access(const char *path, int mode) {
     (void)mode;

@@ -44,6 +44,7 @@ if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
 fi
 
 export PATH="$CROSS_PREFIX/bin:$PATH"
+export ac_cv_c_bigendian=no
 
 CC_VAL="${TARGET}-gcc"
 CXX_VAL="${TARGET}-g++"
@@ -115,7 +116,7 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     rm -rf "$WORK_DIR/build-native-gcc"
     mkdir -p "$WORK_DIR/build-native-gcc"
     cd "$WORK_DIR/build-native-gcc"
-    export CXXFLAGS="-O2"
+    export CXXFLAGS="-O2 -DCODY_NETWORKING=0"
     export CXXFLAGS_FOR_BUILD="-O2"
     export CFLAGS_FOR_BUILD="-O2"
     "$SRC_DIR/gcc-${GCC_VER}/configure" \

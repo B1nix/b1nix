@@ -1,5 +1,6 @@
 #ifndef B1NIX_U_STDIO_H
 #define B1NIX_U_STDIO_H
+#define _STDIO_H 1
 
 #ifdef __cplusplus
 extern "C" {

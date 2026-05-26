@@ -6,6 +6,7 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/socket.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -123,8 +124,22 @@ int chdir(const char *path) {
   return _check_err(syscall(SYS_CHDIR, path));
 }
 
-int getcwd(char *buf, size_t size) {
-  return _check_err(syscall(SYS_GETCWD, buf, size));
+char *getcwd(char *buf, size_t size) {
+  if (!buf) {
+    size_t alloc_size = size == 0 ? 1024 : size;
+    buf = (char *)malloc(alloc_size);
+    if (!buf) {
+      errno = normalize_errno(-ENOMEM);
+      return NULL;
+    }
+    size = alloc_size;
+  }
+  long rc = syscall(SYS_GETCWD, buf, size);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return NULL;
+  }
+  return buf;
 }
 
 int fsync(int fd) { return _check_err(syscall(SYS_FSYNC, fd)); }
@@ -215,30 +230,38 @@ int socket(int domain, int type, int protocol) {
   return _check_err(syscall(SYS_SOCKET, domain, type, protocol));
 }
 
-int bind(int fd, const void *addr, size_t addrlen) {
+int bind(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return _check_err(syscall(SYS_BIND, fd, addr, addrlen));
 }
 
-int connect(int fd, const void *addr, size_t addrlen) {
+int connect(int fd, const struct sockaddr *addr, socklen_t addrlen) {
   return _check_err(syscall(SYS_CONNECT, fd, addr, addrlen));
 }
 
-long send(int fd, const void *buf, size_t len, int flags) {
+ssize_t send(int fd, const void *buf, size_t len, int flags) {
   long rc = syscall(SYS_SEND, fd, buf, len, flags);
   if (rc < 0) {
     errno = normalize_errno(rc);
     return -1;
   }
-  return rc;
+  return (ssize_t)rc;
 }
 
-long recv(int fd, void *buf, size_t len, int flags) {
+ssize_t recv(int fd, void *buf, size_t len, int flags) {
   long rc = syscall(SYS_RECV, fd, buf, len, flags);
   if (rc < 0) {
     errno = normalize_errno(rc);
     return -1;
   }
-  return rc;
+  return (ssize_t)rc;
+}
+
+int listen(int fd, int backlog) {
+  return _check_err(syscall(SYS_LISTEN, fd, backlog));
+}
+
+int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
+  return _check_err(syscall(SYS_ACCEPT, fd, addr, addrlen));
 }
 
 int setuid(unsigned short uid) {
@@ -268,6 +291,11 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
     rem->tv_sec = 0;
     rem->tv_nsec = 0;
   }
+  return 0;
+}
+
+unsigned int alarm(unsigned int seconds) {
+  (void)seconds;
   return 0;
 }
 
