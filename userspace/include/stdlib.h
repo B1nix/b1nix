@@ -32,7 +32,11 @@ unsigned long long strtoull(const char *nptr, char **endptr, int base);
 double strtod(const char *nptr, char **endptr);
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
 char *getenv(const char *name);
+int   putenv(char *string);
+int   setenv(const char *name, const char *value, int overwrite);
+int   unsetenv(const char *name);
 char *realpath(const char *path, char *resolved_path);
+extern char **environ;
 
 /* Cooperative spin-based semaphores (no kernel futex; shared-memory safe) */
 int sem_init(int *sem, int pshared, unsigned int value);

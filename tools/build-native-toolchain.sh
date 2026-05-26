@@ -113,38 +113,42 @@ fi
 # ── 3. Build native GCC ───────────────────────────────────────────────────────
 if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     echo "Building Native GCC (host=$TARGET)..."
-    rm -rf "$WORK_DIR/build-native-gcc"
-    mkdir -p "$WORK_DIR/build-native-gcc"
-    cd "$WORK_DIR/build-native-gcc"
     export CXXFLAGS="-O2 -DCODY_NETWORKING=0"
     export CXXFLAGS_FOR_BUILD="-O2"
     export CFLAGS_FOR_BUILD="-O2"
-    "$SRC_DIR/gcc-${GCC_VER}/configure" \
-        CC="$CC_VAL" \
-        CXX="$CXX_VAL" \
-        AR="$AR_VAL" \
-        RANLIB="$RANLIB_VAL" \
-        CFLAGS="$CFLAGS_VAL" \
-        CPPFLAGS="$CPPFLAGS_VAL" \
-        LDFLAGS="$LDFLAGS_VAL" \
-        LIBS="$LIBS_VAL" \
-        --host="$TARGET" \
-        --target="$TARGET" \
-        --prefix="" \
-        --with-sysroot="/" \
-        --disable-nls \
-        --enable-languages=c \
-        --without-headers \
-        --disable-shared \
-        --disable-multilib \
-        --disable-threads \
-        --disable-libgomp \
-        --disable-libmudflap \
-        --disable-libssp \
-        --disable-libquadmath \
-        --disable-libstdcxx \
-        --with-newlib \
-        MAKEINFO=true
+    if [ ! -f "$WORK_DIR/build-native-gcc/Makefile" ]; then
+        rm -rf "$WORK_DIR/build-native-gcc"
+        mkdir -p "$WORK_DIR/build-native-gcc"
+        cd "$WORK_DIR/build-native-gcc"
+        "$SRC_DIR/gcc-${GCC_VER}/configure" \
+            CC="$CC_VAL" \
+            CXX="$CXX_VAL" \
+            AR="$AR_VAL" \
+            RANLIB="$RANLIB_VAL" \
+            CFLAGS="$CFLAGS_VAL" \
+            CPPFLAGS="$CPPFLAGS_VAL" \
+            LDFLAGS="$LDFLAGS_VAL" \
+            LIBS="$LIBS_VAL" \
+            --host="$TARGET" \
+            --target="$TARGET" \
+            --prefix="" \
+            --with-sysroot="/" \
+            --disable-nls \
+            --enable-languages=c \
+            --without-headers \
+            --disable-shared \
+            --disable-multilib \
+            --disable-threads \
+            --disable-libgomp \
+            --disable-libmudflap \
+            --disable-libssp \
+            --disable-libquadmath \
+            --disable-libstdcxx \
+            --with-newlib \
+            MAKEINFO=true
+    else
+        cd "$WORK_DIR/build-native-gcc"
+    fi
     make -j"$NPROC" all-gcc MAKEINFO=true
     make install-gcc DESTDIR="$NATIVE_DEST" MAKEINFO=true
     unset CXXFLAGS CXXFLAGS_FOR_BUILD CFLAGS_FOR_BUILD
