@@ -374,6 +374,8 @@ diagnostics.
 - [x] `done` Make syscall errors consistently map to userspace `errno` for the covered libc wrappers and smoke paths.
 - [x] `done` Eliminate non-critical kernel panics from VFS lookup and network packet ingestion paths: zero panics in net/ layer, only 2 lock-ordering safety assertions remain in VFS.
 - [x] `done` Integrate automated static analysis checks into the top-level Makefile: `make analyze` target runs clang `--analyze` on all kernel sources with plist output.
+- [x] `done` Boot Application Processors (APs) via INIT-SIPI-SIPI, configure Local APIC timer/MMIO, and initialize spinlocks for multithreaded kernel synchronization.
+- [ ] `planned` Implement cross-CPU task stealing (load balancing) in `sched_steal_task()` to enable task migration across cores.
 
 ## M25: Minimal Native C Toolchain
 
