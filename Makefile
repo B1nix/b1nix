@@ -148,51 +148,63 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
 
-$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S userspace/linker.ld
+# Anything in userspace libc/includes/crt that affects every embedded ELF.
+# Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
+# otherwise initramfs ships with stale userspace and the kernel sees old libc.
+USERSPACE_DEPS := \
+	$(wildcard userspace/libc/*.c) \
+	$(wildcard userspace/include/*.h) \
+	$(wildcard userspace/include/sys/*.h) \
+	$(wildcard userspace/crt/*.S) \
+	userspace/Makefile \
+	userspace/linker.ld
+
+$(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/bin/native_smoke > $@
 
-$(INITRAMFS_M12_SMOKE_INC): userspace/bin/m12_smoke.c userspace/linker.ld
+$(INITRAMFS_M12_SMOKE_INC): userspace/bin/m12_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m12_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m12_smoke_elf userspace/build/bin/m12_smoke > $@
 
-$(INITRAMFS_M13_SMOKE_INC): userspace/bin/m13_smoke.c userspace/linker.ld
+$(INITRAMFS_M13_SMOKE_INC): userspace/bin/m13_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m13_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m13_smoke_elf userspace/build/bin/m13_smoke > $@
 
-$(INITRAMFS_M13_JOB_CONTROL_INC): userspace/bin/m13_job_control.c userspace/linker.ld
+$(INITRAMFS_M13_JOB_CONTROL_INC): userspace/bin/m13_job_control.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m13_job_control
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m13_job_control_elf userspace/build/bin/m13_job_control > $@
 
-$(INITRAMFS_M8_AIO_TEST_INC): userspace/bin/m8_aio_test.c userspace/linker.ld
+$(INITRAMFS_M8_AIO_TEST_INC): userspace/bin/m8_aio_test.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m8_aio_test
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m8_aio_test_elf userspace/build/bin/m8_aio_test > $@
 
-$(INITRAMFS_M17_SMOKE_INC): userspace/bin/m17_smoke.c userspace/linker.ld
+$(INITRAMFS_M17_SMOKE_INC): userspace/bin/m17_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m17_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m17_smoke_elf userspace/build/bin/m17_smoke > $@
 
-$(INITRAMFS_M14_SMOKE_INC): userspace/bin/m14_smoke.c userspace/linker.ld
+$(INITRAMFS_M14_SMOKE_INC): userspace/bin/m14_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m14_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m14_smoke_elf userspace/build/bin/m14_smoke > $@
 
-$(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c userspace/linker.ld
+$(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m15_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m15_smoke_elf userspace/build/bin/m15_smoke > $@
 
-$(INITRAMFS_TCC_FILES_INC): userspace
+$(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/include/*.h)
+	@$(MAKE) -C userspace build/bin/tcc
 	@mkdir -p $(dir $@)
 	sh tools/gen_tcc_initramfs.sh $@
 
-$(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c userspace/linker.ld
+$(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m25_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m25_smoke_elf userspace/build/bin/m25_smoke > $@

@@ -89,6 +89,19 @@ void *kmalloc(usize size) {
     struct kheap_block **prev = &free_list;
     block = free_list;
     while (block) {
+      u64 bp = (u64)(usize)block;
+      /* Detect free-list corruption (UAF / buffer overflow into a freed
+       * neighbour). On corruption, sever the list here so we fall through to
+       * bump allocation instead of crashing in a #GP/#PF. */
+      if (!is_canonical_addr(bp) ||
+          (bp & 0xF) != 0 ||
+          bp < heap.base + KHEAP_HEADER_SIZE ||
+          bp + KHEAP_HEADER_SIZE > heap.end ||
+          block->magic != KHEAP_FREED_MAGIC) {
+        *prev = 0;
+        block = 0;
+        break;
+      }
       if (block->size >= size) {
         *prev = block->next;
         block->next = 0;

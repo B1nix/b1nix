@@ -7,7 +7,7 @@ CC       := clang
 TARGET   := x86_64-unknown-elf
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MMD -MP
 LDFLAGS  := -m elf_x86_64
 BUILD    := build
 LIB      := $(BUILD)/libb1nix.a
@@ -33,6 +33,9 @@ BINARIES := \
 	$(BUILD)/bin/test_sync \
 	$(BUILD)/bin/m25_smoke
 
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
+DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
+
 .PHONY: all clean install
 
 all: $(LIB) $(BINARIES)
@@ -53,7 +56,7 @@ $(LIB): $(LIBC_OBJS)
 	$(AR) rcs $@ $(LIBC_OBJS)
 
 # ── User programs ──
-$(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0)
+$(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o --whole-archive $(LIB) --no-whole-archive
@@ -90,3 +93,5 @@ install: all
 
 clean:
 	rm -rf $(BUILD)
+
+-include $(DEPS)
