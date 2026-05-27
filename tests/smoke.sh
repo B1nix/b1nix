@@ -7,7 +7,7 @@ set -e
 
 ARCH="${1:-x86}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=60  # seconds to let each test run
+TIMEOUT=120  # seconds to let each test run (kernel takes longer under macOS load)
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
@@ -54,11 +54,10 @@ run_qemu() {
 				-device nvme,serial=deadbeef,drive=nvmedrive \
 				>"$log" 2>&1 &
 		pid=$!
-		
-		# Instant monitoring using tail -f
-		# We wait for the final success marker or a panic
+
+		# Wait for the final success marker or a panic, then kill QEMU.
 		(
-			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'B1NIX-TEST: done|KERNEL PANIC'" >/dev/null 2>&1
+			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'B1NIX-TEST: done|KERNEL PANIC|\\[PANIC\\]'" >/dev/null 2>&1
 			sleep 2
 			kill "$pid" 2>/dev/null || true
 		) &

@@ -562,9 +562,14 @@ void scheduler_on_timer_tick(void) {
   scheduler_ticks++;
   wake_sleepers();
 
-  if (current_task->state == TASK_RUNNING) {
-    scheduler_yield();
-  }
+  /* Cooperative scheduling: do NOT yield from the timer interrupt.
+   * Several VFS walkers (find_child, vfs_get_mount_for_node, add_node)
+   * traverse vfs_node parent/sibling chains without holding the parent's
+   * inode lock. Preemptive yields here interleave those walks with concurrent
+   * unlink/rmdir paths and let the walker dereference a freed sibling.
+   * Tasks still yield voluntarily on syscall blocks (scheduler_block_on,
+   * sleep, I/O), which is enough for smoke-test progress without exposing
+   * the unsynchronized chain walks. Re-enable once VFS locking is audited. */
 }
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
