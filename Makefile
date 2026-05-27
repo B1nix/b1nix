@@ -21,6 +21,23 @@ GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
 
+# Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
+# source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
+ROOT_IMAGE_SIZE ?= 512
+
+# Locate the native toolchain that tools/build-native-toolchain.sh produced.
+# The script writes to build/toolchain_build/native_root by default, or to
+# ~/b1nix-toolchain/native_root when the project path contains spaces (WSL).
+# /root/b1nix-toolchain is the legacy Docker-builder location kept as fallback.
+NATIVE_TOOLCHAIN_ROOT := $(shell \
+	for p in build/toolchain_build/native_root $$HOME/b1nix-toolchain/native_root /root/b1nix-toolchain/native_root; do \
+		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
+	done)
+CROSS_TOOLCHAIN_ROOT := $(shell \
+	for p in build/toolchain_build/cross $$HOME/b1nix-toolchain/cross /root/b1nix-toolchain/cross; do \
+		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
+	done)
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-ffreestanding \
@@ -243,14 +260,42 @@ userspace-install: userspace
 	@$(MAKE) -C userspace install
 
 install-native-toolchain:
-	@if [ -d /root/b1nix-toolchain/native_root ]; then \
-		echo "Installing native toolchain to rootfs..."; \
-		mkdir -p build/x86/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
-		cp -r /root/b1nix-toolchain/native_root/* build/x86/rootfs/; \
-		cp /root/b1nix-toolchain/cross/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a build/x86/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
+		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
+		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
+		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
+		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" ]; then \
+			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+		fi; \
+	else \
+		echo "Note: native toolchain not built (looked in build/toolchain_build/native_root and ~/b1nix-toolchain/native_root)."; \
+		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
 	fi
 
-iso-full: userspace-install install-native-toolchain iso
+# Stage kernel + userspace + build harness source into the rootfs so the
+# in-guest toolchain can rebuild b1nix from inside b1nix (M26 self-host).
+# Excludes generated artifacts (build/, *.o, *.a, *.elf, .git).
+install-kernel-source:
+	@echo "Staging b1nix source tree into $(BUILD_DIR)/rootfs/usr/src/b1nix..."
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix
+	@for d in kernel userspace tools tests docs; do \
+		if [ -d "$$d" ]; then \
+			rsync -a --delete \
+				--exclude='build/' \
+				--exclude='*.o' \
+				--exclude='*.a' \
+				--exclude='*.elf' \
+				--exclude='*.bin' \
+				--exclude='*.iso' \
+				--exclude='.git/' \
+				"$$d" $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
+		fi; \
+	done
+	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
+	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
+	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
+
+iso-full: userspace-install install-native-toolchain install-kernel-source iso
 
 run-x86: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
@@ -261,16 +306,13 @@ run-x86: iso userspace-install root-image
 
 run-root: run-x86
 
-root-image: userspace-install install-native-toolchain
+root-image: userspace-install install-native-toolchain install-kernel-source
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
-	@# Copy userspace binaries into rootfs
-	@cp $(BUILD_DIR)/rootfs/bin/* /dev/null 2>/dev/null; true
-	@cp -r $(BUILD_DIR)/rootfs/* $(BUILD_DIR)/rootfs/ 2>/dev/null; true
-	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=32 2>/dev/null
+	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
 	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
 	 $(MKE2FS) -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
-	@echo "created $(BUILD_DIR)/root.ext4 ($(shell du -sh $(BUILD_DIR)/root.ext4 | cut -f1))"
+	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
 
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)
@@ -279,8 +321,15 @@ check-tools:
 	@command -v $(QEMU_X86_64) >/dev/null || echo "optional: missing qemu-system-x86_64 for running"
 
 clean:
-	rm -rf build
+	@# Preserve build/toolchain_build — cross + native GCC/Binutils take an hour
+	@# to rebuild. Use `make distclean` to wipe everything including the toolchain.
+	@if [ -d build ]; then \
+		find build -mindepth 1 -maxdepth 1 ! -name toolchain_build -exec rm -rf {} +; \
+	fi
 	@$(MAKE) -C userspace clean
+
+distclean: clean
+	rm -rf build
 
 # ── Smoke Tests ──
 smoke:
@@ -293,4 +342,4 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools run-persistent graphics-smoke
+.PHONY: all clean distclean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools run-persistent graphics-smoke install-native-toolchain install-kernel-source
