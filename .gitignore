@@ -3,3 +3,5 @@ build/
 logs/
 .tmp/
 smoke_run/
+.claude/
+CLAUDE.md

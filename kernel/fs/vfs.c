@@ -74,26 +74,32 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
+  /* Walk up the parent chain with interrupts disabled — preemption mid-walk
+   * lets another task rmdir+free an ancestor and we'd dereference garbage on
+   * `curr = curr->parent`. The lock above only protects the mounts array. */
+  u64 flags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
   struct vfs_node *curr = node;
+  struct vfs_mount_entry *res = 0;
   while (curr) {
     for (int i = 0; i < MAX_MOUNTS; i++) {
       if (mounts[i].used && curr == mounts[i].root_node) {
-        struct vfs_mount_entry *res = &mounts[i];
-        __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-        return res;
+        res = &mounts[i];
+        goto out;
       }
     }
     curr = curr->parent;
   }
   for (int i = 0; i < MAX_MOUNTS; i++) {
     if (mounts[i].used && strcmp(mounts[i].target, "/") == 0) {
-      struct vfs_mount_entry *res = &mounts[i];
-      __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-      return res;
+      res = &mounts[i];
+      goto out;
     }
   }
+out:
+  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
-  return 0;
+  return res;
 }
 
 void vfs_register_fs(struct vfs_fs *fs) {
@@ -266,6 +272,21 @@ static void dcache_insert(struct vfs_node *parent, const char *name,
   dcache_release();
 }
 
+static void dcache_unlink_locked(struct dcache_entry **prev_ptr,
+                                 struct dcache_entry *curr) {
+  *prev_ptr = curr->next;
+  if (curr == dcache_lru_head)
+    dcache_lru_head = curr->lru_next;
+  if (curr == dcache_lru_tail)
+    dcache_lru_tail = curr->lru_prev;
+  if (curr->lru_prev)
+    curr->lru_prev->lru_next = curr->lru_next;
+  if (curr->lru_next)
+    curr->lru_next->lru_prev = curr->lru_prev;
+  dcache_free(curr);
+  dcache_count--;
+}
+
 static void dcache_invalidate(struct vfs_node *parent, const char *name) {
   dcache_acquire();
   u32 h = dcache_hash(parent, name);
@@ -273,26 +294,37 @@ static void dcache_invalidate(struct vfs_node *parent, const char *name) {
   struct dcache_entry *curr = *prev_ptr;
   while (curr) {
     if (curr->parent == parent && strcmp(curr->name, name) == 0) {
-      /* Remove from hash table */
-      *prev_ptr = curr->next;
-
-      /* Remove from LRU list */
-      if (curr == dcache_lru_head)
-        dcache_lru_head = curr->lru_next;
-      if (curr == dcache_lru_tail)
-        dcache_lru_tail = curr->lru_prev;
-      if (curr->lru_prev)
-        curr->lru_prev->lru_next = curr->lru_next;
-      if (curr->lru_next)
-        curr->lru_next->lru_prev = curr->lru_prev;
-
-      dcache_free(curr);
-      dcache_count--;
+      dcache_unlink_locked(prev_ptr, curr);
       dcache_release();
       return;
     }
     prev_ptr = &curr->next;
     curr = *prev_ptr;
+  }
+  dcache_release();
+}
+
+/* Purge every dcache entry that references `node` either as parent or as the
+ * cached child. Called before vfs_free_node so a recycled vfs_node address
+ * cannot resurrect a stale lookup against the previous tenant. Without this,
+ * dcache_lookup(reused_node, name) can return a dangling child pointer from
+ * the previous owner's subtree and crash find_child's sibling walk. */
+static void dcache_invalidate_node(struct vfs_node *node) {
+  if (!node)
+    return;
+  dcache_acquire();
+  for (u32 h = 0; h < DCACHE_SIZE; h++) {
+    struct dcache_entry **prev_ptr = &dcache[h];
+    struct dcache_entry *curr = *prev_ptr;
+    while (curr) {
+      if (curr->parent == node || curr->node == node) {
+        dcache_unlink_locked(prev_ptr, curr);
+        curr = *prev_ptr;
+      } else {
+        prev_ptr = &curr->next;
+        curr = *prev_ptr;
+      }
+    }
   }
   dcache_release();
 }
@@ -734,6 +766,10 @@ void vfs_node_put(struct vfs_node *node) {
       node->inode->release_cb(node);
     }
     vfs_inode_put(node->inode);
+    /* Purge any dcache entry that references this node before its memory is
+     * returned to the slab pool — otherwise dcache_lookup can resurrect a
+     * dangling pointer once the address is recycled. */
+    dcache_invalidate_node(node);
     vfs_free_node(node);
     __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
   }
@@ -766,23 +802,33 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
   if (!parent || !parent->inode || parent->inode->type != VFS_DIRECTORY)
     return 0;
 
-  struct vfs_node *cached = dcache_lookup(parent, name);
-  if (cached && !cached->deleted) {
-    /* REFCOUNT RULE: All functions returning a VFS node MUST increment refcount.
-     * Caller is responsible for calling vfs_node_put() when done. */
-    return vfs_node_get(cached);
-  }
-
+  /* The children list walk must not be preempted: this kernel runs a timer
+   * tick that calls scheduler_yield() (see scheduler_on_timer_tick), and
+   * find_child is called from many sites that do not hold parent's inode
+   * read lock. A mid-walk preemption would let another task unlink+free a
+   * sibling, leaving us with a dangling next_sibling. Disabling interrupts
+   * for the duration of the walk is cheap (lists are short) and lets us read
+   * a consistent snapshot. vfs_node_get below is atomic and safe to run with
+   * interrupts disabled.
+   *
+   * Note: dcache is intentionally bypassed here because dcache_acquire yields
+   * on contention, which reintroduces the same race window. dcache_insert
+   * after-the-fact is the right place to repopulate when we add a similarly
+   * safe lookup path. */
+  struct vfs_node *result = 0;
+  u64 flags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
   struct vfs_node *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
-      dcache_insert(parent, name, child);
-      /* REFCOUNT RULE: Return with refcount incremented for caller ownership */
-      return vfs_node_get(child);
+      result = child;
+      vfs_node_get(result); /* REFCOUNT RULE: caller owns the returned ref */
+      break;
     }
     child = child->next_sibling;
   }
-  return 0;
+  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+  return result;
 }
 
 static void append_path_part(char *dst, usize dst_size, const char *part) {
@@ -1220,8 +1266,14 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->inode->flags = flags;
         child->inode->fs_id = current->inode->fs_id;
         child->parent = current;
+        /* Inserting into current->first_child must exclude concurrent readers
+         * (vfs_list/find_child) — without the write lock a timer-tick preempt
+         * mid-iteration sees a half-linked sibling chain and crashes on a
+         * dangling next_sibling. */
+        vfs_inode_lock_write(current->inode);
         child->next_sibling = current->first_child;
         current->first_child = child;
+        vfs_inode_unlock_write(current->inode);
 
         const struct cred *cred = get_current_cred();
         child->inode->uid = cred ? cred->euid : ROOT_UID;
@@ -1281,8 +1333,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
             vfs_get_unix_time();
 
         child->parent = current;
+        vfs_inode_lock_write(current->inode);
         child->next_sibling = current->first_child;
         current->first_child = child;
+        vfs_inode_unlock_write(current->inode);
       }
       current = child;
       if (child_was_found) {
