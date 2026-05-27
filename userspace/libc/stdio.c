@@ -260,9 +260,12 @@ int vprintf(const char *fmt, va_list ap) {
 }
 
 static void _vsnprintf_putc(char *str, size_t size, int *pos, char c) {
-  if (*pos < (int)size - 1) {
-    str[(*pos)++] = c;
-  }
+  /* C99: count every character (so the return value is the would-be length),
+   * but only write into the buffer when there is room (reserving the final
+   * byte for the terminating NUL). str may be NULL when size == 0. */
+  if (str && (size_t)(*pos + 1) < size)
+    str[*pos] = c;
+  (*pos)++;
 }
 
 static void _vsnprintf_puts(char *str, size_t size, int *pos, const char *s) {
@@ -291,12 +294,13 @@ static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base,
 
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   int pos = 0;
-  if (size == 0)
-    return 0;
-
-  for (int i = 0; fmt[i] && pos < (int)size - 1; i++) {
+  /* Format the whole string regardless of buffer size so the return value is
+   * the C99 "would-be" length; _vsnprintf_putc only writes what fits. Callers
+   * such as GCC's build_attr_access_from_parms rely on snprintf(NULL, 0, ...)
+   * returning the full length to size their buffers. */
+  for (int i = 0; fmt[i]; i++) {
     if (fmt[i] != '%') {
-      str[pos++] = fmt[i];
+      _vsnprintf_putc(str, size, &pos, fmt[i]);
       continue;
     }
     i++;
@@ -380,7 +384,9 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       break;
     }
   }
-  str[pos] = '\0';
+  /* NUL-terminate within the buffer (truncating if the output didn't fit). */
+  if (str && size > 0)
+    str[(size_t)pos < size ? pos : (int)size - 1] = '\0';
   return pos;
 }
 

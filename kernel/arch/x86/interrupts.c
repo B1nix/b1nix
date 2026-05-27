@@ -354,16 +354,40 @@ void x86_exception_handler(struct interrupt_frame *frame) {
       sig = SIGTERM;
       break;
     }
-    console_write("sending signal ");
+    /* A signal generated synchronously by a CPU fault must be acted upon
+     * before we resume userspace. If the faulting process installed a handler
+     * for it and hasn't blocked it, deliver to that handler (e.g. a debugger or
+     * an ICE reporter). Otherwise — SIG_DFL, SIG_IGN, or currently blocked —
+     * returning to the faulting instruction would just re-fault forever, so we
+     * force the default terminate action (matching Linux force_sig()). This
+     * also covers the case where the signal is re-raised inside its own handler
+     * (where it is blocked): the second fault terminates instead of looping. */
+    usize pid = scheduler_get_pid();
+    struct sigaction *sa = &current_task->sigactions[sig - 1];
+    int is_blocked = (current_task->blocked_signals >> (sig - 1)) & 1ULL;
+    int has_handler =
+        (sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
+
+    if (has_handler && !is_blocked) {
+      console_write("delivering signal ");
+      console_write_dec(sig);
+      console_write(" to handler in pid ");
+      console_write_hex64(pid);
+      console_write("\n");
+      scheduler_kill(pid, sig);
+      arch_check_and_deliver_signals(frame);
+      scheduler_yield();
+      return;
+    }
+
+    console_write("fatal signal ");
     console_write_dec(sig);
-    console_write(" to pid ");
-    console_write_hex64(scheduler_get_pid());
-    console_write("\n");
-    scheduler_kill(scheduler_get_pid(), sig);
-    /* Process will be killed on next scheduler check */
-    arch_check_and_deliver_signals(frame);
-    scheduler_yield();
-    return;
+    console_write(" in pid ");
+    console_write_hex64(pid);
+    console_write(" (no handler): terminating\n");
+    scheduler_exit_current(128 + sig);
+    /* scheduler_exit_current never returns */
+    arch_halt();
   }
 
   console_write("[PANIC] unhandled CPU exception\n");

@@ -13,6 +13,19 @@
  *   5. Call exit() with main's return value
  */
 
+/* Weak references to libgcc's DWARF frame-registration entry points. They are
+ * defined only when a program links libgcc (e.g. the GCC-built native
+ * toolchain: cc1/gcc/as/ld). For clang-linked b1nix programs they resolve to 0
+ * and the registration below is skipped. */
+.weak __register_frame_info
+.weak __EH_FRAME_BEGIN__
+
+.section .bss
+.align 16
+.local __b1nix_eh_object
+__b1nix_eh_object:
+	.skip 48                        /* sizeof(struct object) in libgcc */
+
 .section .text
 .globl _start
 .type _start, @function
@@ -46,14 +59,34 @@ _start:
 	/* Align for C call ABI while preserving decoded argc/argv/envp. */
 	andq $-16, %rsp
 
-	/* Run ELF .init_array constructors before main(). C++ static
-	 * constructors and __attribute__((constructor)) functions live here;
-	 * skipping them leaves global state uninitialized (this is why the
-	 * natively-built GCC's cc1 crashed in code generation). argc/argv/envp
-	 * are stashed in callee-saved registers, which constructors preserve. */
+	/* Stash argc/argv/envp in callee-saved registers across the init calls
+	 * below (constructors preserve these per the SysV ABI). */
 	movq %rdi, %rbx                 /* argc */
 	movq %rsi, %r12                 /* argv */
 	movq %rdx, %r13                 /* envp */
+
+	/* Register the program's .eh_frame with libgcc so its DWARF unwinder can
+	 * find FDEs. This is normally done by frame_dummy() called from _init,
+	 * but the x86_64-b1nix target has no crti.o/crtn.o (so no callable _init)
+	 * and crt0 runs only .init_array — leaving frame_dummy's call orphaned.
+	 * Without this, any unwind in the GCC-built cc1 (a C++ throw, or the
+	 * ICE crash-handler's backtrace) hits gcc_assert(code==_URC_NO_REASON)
+	 * in uw_init_context_1 and executes ud2 (SIGILL). Replicate frame_dummy:
+	 *   if (&__register_frame_info)
+	 *     __register_frame_info(__EH_FRAME_BEGIN__, &__b1nix_eh_object);
+	 * The weak NULL check makes this a no-op for clang-linked programs. */
+	leaq __register_frame_info(%rip), %rax
+	testq %rax, %rax
+	jz 3f
+	leaq __EH_FRAME_BEGIN__(%rip), %rdi
+	leaq __b1nix_eh_object(%rip), %rsi
+	call __register_frame_info
+3:
+
+	/* Run ELF .init_array constructors before main(). C++ static
+	 * constructors and __attribute__((constructor)) functions live here;
+	 * skipping them leaves global state uninitialized (this is why the
+	 * natively-built GCC's cc1 crashed in code generation). */
 	leaq __init_array_start(%rip), %r14
 	leaq __init_array_end(%rip), %r15
 1:
