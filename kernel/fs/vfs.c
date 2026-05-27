@@ -1600,6 +1600,9 @@ void vfs_init(void) {
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
   add_node("/ext4", VFS_DIRECTORY, 0, 0, 0);
   add_node("/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/persist", VFS_DIRECTORY, 0, 0, 0); /* M26: mountpoint for the
+                                                   persistent root image (native
+                                                   toolchain + kernel source) */
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
