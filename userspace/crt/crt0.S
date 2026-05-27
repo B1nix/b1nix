@@ -46,6 +46,27 @@ _start:
 	/* Align for C call ABI while preserving decoded argc/argv/envp. */
 	andq $-16, %rsp
 
+	/* Run ELF .init_array constructors before main(). C++ static
+	 * constructors and __attribute__((constructor)) functions live here;
+	 * skipping them leaves global state uninitialized (this is why the
+	 * natively-built GCC's cc1 crashed in code generation). argc/argv/envp
+	 * are stashed in callee-saved registers, which constructors preserve. */
+	movq %rdi, %rbx                 /* argc */
+	movq %rsi, %r12                 /* argv */
+	movq %rdx, %r13                 /* envp */
+	leaq __init_array_start(%rip), %r14
+	leaq __init_array_end(%rip), %r15
+1:
+	cmpq %r15, %r14
+	jae 2f
+	call *(%r14)
+	addq $8, %r14
+	jmp 1b
+2:
+	movq %rbx, %rdi
+	movq %r12, %rsi
+	movq %r13, %rdx
+
 	/* Call main(argc, argv, envp) */
 	call main
 
