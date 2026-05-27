@@ -831,10 +831,39 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
             memcpy(full + len, name, e->name_len + 1);
             struct ext2_inode ci;
             if (ext4_read_inode(fs, e->inode, &ci) == 0) {
-                struct vfs_node *n = vfs_add_node(full, ((ci.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
-                if (n) {
-                    ext4_setup_node(n, fs, e->inode, ci.i_mode);
-                    if ((ci.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext4_populate_vfs(fs, e->inode, full);
+                u32 fmt = ci.i_mode & EXT2_S_IFMT;
+                if (fmt == EXT2_S_IFLNK) {
+                    /* Symlink: read its target and create a VFS_SYMLINK node so
+                     * path resolution and readlink work. Do NOT call
+                     * ext4_setup_node here — it overwrites inode->data (where the
+                     * link target lives) with its ext4 inode_info. */
+                    u32 tlen = ci.i_size;
+                    if (tlen > 4095) tlen = 4095;
+                    char *tgt = kmalloc(tlen + 1);
+                    int ok = 0;
+                    if (ci.i_size < 60) {
+                        memcpy(tgt, (const char *)ci.i_block, tlen); ok = 1; /* fast symlink */
+                    } else {
+                        u32 phys = ext4_get_block(fs, &ci, 0);
+                        if (phys) {
+                            u8 *blk = kmalloc(fs->block_size);
+                            ext4_read_block(fs, phys, blk);
+                            memcpy(tgt, blk, tlen < fs->block_size ? tlen : fs->block_size);
+                            kfree(blk); ok = 1;
+                        }
+                    }
+                    if (ok) {
+                        tgt[tlen] = '\0';
+                        vfs_add_node(full, VFS_SYMLINK, tgt, tlen, VFS_NODE_OWNS_DATA);
+                    } else {
+                        kfree(tgt);
+                    }
+                } else {
+                    struct vfs_node *n = vfs_add_node(full, (fmt == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
+                    if (n) {
+                        ext4_setup_node(n, fs, e->inode, ci.i_mode);
+                        if (fmt == EXT2_S_IFDIR) ext4_populate_vfs(fs, e->inode, full);
+                    }
                 }
             }
         }

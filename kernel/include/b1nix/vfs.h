@@ -37,6 +37,9 @@ enum vfs_node_type {
   VFS_SOCKET = 5,
 };
 
+/* inode->flags: the VFS owns inode->data and must kfree() it on release. */
+#define VFS_NODE_OWNS_DATA 0x80000000u
+
 struct acl_entry {
   u16 tag;       /* ACL_USER_OBJ, ACL_USER, ACL_GROUP_OBJ, ACL_GROUP, ACL_MASK,
                     ACL_OTHER */

@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define VFS_NODE_OWNS_DATA 0x80000000u
+/* VFS_NODE_OWNS_DATA now lives in <b1nix/vfs.h> so other filesystems can use it. */
 #define MAX_FILE_SIZE (1024 * 1024 * 1024) /* 1 GB limit for now */
 
 /* VFS time update masks */
