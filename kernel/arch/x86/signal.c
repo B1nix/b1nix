@@ -103,8 +103,14 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     return;
                 } else {
                     console_write("signal: process killed by signal\n");
-                    scheduler_exit_current(-i);
+                    /* Encode "killed by signal i" as 128+i so waitpid reports
+                     * WIFSIGNALED with WTERMSIG == i (see scheduler_waitpid). */
+                    scheduler_exit_current(128 + i);
                 }
+            } else {
+                /* SIG_IGN: discard the signal so its pending bit doesn't
+                 * linger and get re-examined on every delivery check. */
+                current_task->pending_signals &= ~(1ULL << (i - 1));
             }
         }
     }
