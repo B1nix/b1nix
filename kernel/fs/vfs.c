@@ -178,7 +178,9 @@ static u32 dcache_hash(struct vfs_node *parent, const char *name) {
   return h % DCACHE_SIZE;
 }
 
-static struct vfs_node *dcache_lookup(struct vfs_node *parent,
+/* Dentry-cache lookup/insert: a complete LRU path-resolution cache, not yet
+ * wired into the lookup path. Kept (marked unused) for future use. */
+__attribute__((unused)) static struct vfs_node *dcache_lookup(struct vfs_node *parent,
                                       const char *name) {
   dcache_acquire();
   u32 h = dcache_hash(parent, name);
@@ -211,7 +213,7 @@ static struct vfs_node *dcache_lookup(struct vfs_node *parent,
   return 0;
 }
 
-static void dcache_insert(struct vfs_node *parent, const char *name,
+__attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const char *name,
                           struct vfs_node *node) {
   dcache_acquire();
   if (dcache_count >= MAX_DCACHE_ENTRIES) {
@@ -587,8 +589,6 @@ static void vfs_inode_unlock(struct vfs_inode *inode) {
   vfs_inode_unlock_write(inode);
 }
 
-static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
-
 static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
@@ -615,8 +615,6 @@ static void vfs_update_times(struct vfs_inode *inode, u32 mask) {
   if (mask & VFS_CTIME)
     inode->ctime = now;
 }
-
-static u64 next_ino = 1;
 
 static usize node_count = 0;
 static struct vfs_node *root_node = 0;
@@ -864,7 +862,7 @@ static void pop_path_part(char *path) {
   path[len] = '\0';
 }
 
-static void compose_symlink_path(const char *parent_path, const char *target,
+__attribute__((unused)) static void compose_symlink_path(const char *parent_path, const char *target,
                                  const char *rest, char *out, usize out_size) {
   out[0] = '\0';
   if (!target || target[0] == '\0')

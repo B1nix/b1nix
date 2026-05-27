@@ -119,7 +119,7 @@ static const u32 FONT_SCALE = 1;
 
 static void fb_draw_char(char c, u32 x, u32 y)
 {
-    if (c < 0 || c > 127) c = '?';
+    if ((unsigned char)c > 127) c = '?';
     const u8 *glyph = font8x8_basic[(int)c];
     u32 bytes_per_px = fb.bpp / 8;
 

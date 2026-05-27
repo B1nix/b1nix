@@ -85,7 +85,13 @@ void *kmalloc(usize size) {
 
   size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
-  if (size >= KHEAP_REUSE_MIN_SIZE) {
+  /* Free-list reuse is gated by a tunable minimum. At KHEAP_REUSE_MIN_SIZE == 0
+   * (reuse everything) the guard is unconditional; the #if keeps it meaningful
+   * for a non-zero threshold without a tautological always-true comparison. */
+#if KHEAP_REUSE_MIN_SIZE > 0
+  if (size >= KHEAP_REUSE_MIN_SIZE)
+#endif
+  {
     struct kheap_block **prev = &free_list;
     block = free_list;
     while (block) {
@@ -165,10 +171,12 @@ void kfree(void *ptr) {
     spin_unlock_irqrestore(&heap_lock, flags);
     return;
   }
+#if KHEAP_REUSE_MIN_SIZE > 0
   if (block->size < KHEAP_REUSE_MIN_SIZE) {
     spin_unlock_irqrestore(&heap_lock, flags);
     return;
   }
+#endif
   block->magic = KHEAP_FREED_MAGIC;
   block->next = free_list;
   free_list = block;

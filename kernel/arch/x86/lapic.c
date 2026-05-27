@@ -274,7 +274,9 @@ void ap_main(u32 cpu_id) {
     }
 }
 
-static u32 apic_timer_calibrate(void) {
+/* LAPIC timer frequency calibration — kept (marked unused) for when the LAPIC
+ * timer replaces the PIT as the scheduler tick source. */
+__attribute__((unused)) static u32 apic_timer_calibrate(void) {
     u32 max_count = 0xFFFFFFFF;
     lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
     lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_ONESHOT);

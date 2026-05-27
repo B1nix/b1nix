@@ -737,6 +737,7 @@ static int ext2_remove_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const ch
 
 static int ext2_vfs_create(struct vfs_node *dir, const char *name,
                            const char *full_path, u32 mode) {
+	(void)full_path; /* part of the vfs create-op signature; this impl uses name+dir */
 	u32 dir_inode_num = get_ino(dir);
   struct ext2_fs *fs = get_fs(dir);
 	

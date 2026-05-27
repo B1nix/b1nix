@@ -150,7 +150,8 @@ static int m16_termios_unchanged(const struct b1nix_termios *before)
 }
 
 #define SH_HISTORY_MAX 16
-static char sh_history[SH_HISTORY_MAX][256];
+#define SH_LINE_MAX 512
+static char sh_history[SH_HISTORY_MAX][SH_LINE_MAX];
 static int sh_hist_count = 0;
 
 /* ── Job Control ── */
@@ -893,8 +894,11 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
 
   char *pipe_pos = strchr(p, '|');
   if (!pipe_pos) {
-    char *args[16];
-    int num_args = parse_cmd(p, args, 16);
+    /* Cap matches USER_MAX_ARGS (the SYS_SPAWN argv copy limit). 16 was too few
+     * for real toolchain command lines (e.g. a kernel-flag gcc invocation has
+     * ~20 tokens), which silently dropped trailing args like `-o file`. */
+    char *args[32];
+    int num_args = parse_cmd(p, args, 32);
     struct shell_redir redir;
     num_args = parse_redirs(args, num_args, &redir);
     if (num_args < 0) {
@@ -1038,8 +1042,8 @@ static void sh_run_script(const char *path, char *cwd) {
     uwrite("sh: cannot open script\n");
     return;
   }
-  char line[256];
-  char expanded[512];
+  char line[SH_LINE_MAX];
+  char expanded[SH_LINE_MAX * 2];
   int i = 0;
   while (1) {
     char c;
@@ -1053,7 +1057,7 @@ static void sh_run_script(const char *path, char *cwd) {
         sh_execute_line(expanded, cwd);
       }
       i = 0;
-    } else if (i < 255)
+    } else if (i < SH_LINE_MAX - 1)
       line[i++] = c;
   }
   if (i > 0) {
@@ -1078,8 +1082,8 @@ static int sh_main(int argc, const char **argv) {
       key[1] = '\0';
       set_env(key, argv[i]);
     }
-    char line[512];
-    char expanded[512];
+    char line[SH_LINE_MAX];
+    char expanded[SH_LINE_MAX * 2];
     usize len = strlen(argv[2]);
     if (len >= sizeof(line))
       len = sizeof(line) - 1;
@@ -1095,8 +1099,11 @@ static int sh_main(int argc, const char **argv) {
   }
 
   uwrite("Welcome to b1nix shell!\nType 'help' for a list of commands.\n\n");
-  char raw_line[256];
-  char line[512];
+  /* SH_LINE_MAX-char input handles long toolchain command lines (a kernel-flag
+   * gcc invocation is ~260 chars); `line` is 2x for env-expansion headroom
+   * (expand_env has no output bound). 256 truncated such lines mid-argument. */
+  char raw_line[SH_LINE_MAX];
+  char line[SH_LINE_MAX * 2];
   set_env("PATH", "/bin");
 
   while (1) {
