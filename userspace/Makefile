@@ -18,7 +18,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/string.o \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
-	$(BUILD)/libc/unistd.o
+	$(BUILD)/libc/unistd.o \
+	$(BUILD)/libc/ctype.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \

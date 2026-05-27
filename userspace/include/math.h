@@ -43,4 +43,16 @@ static inline double sqrt(double x) { return __builtin_sqrt(x); }
 static inline double tan(double x) { return __builtin_tan(x); }
 static inline double tanh(double x) { return __builtin_tanh(x); }
 
+/* Float / long-double variants for the functions GCC lowers to a single
+ * hardware instruction (fabs/sqrt). libstdc++'s math stubs treat these as
+ * "present" (HAVE_FABSF/HAVE_SQRTF/HAVE_FABSL/HAVE_SQRTL) and therefore do NOT
+ * emit stub definitions, yet reference them from hypotf()/hypotl(). They must
+ * be declared here or the libstdc++ build fails with "fabsf/sqrtf not declared".
+ * Transcendental f/l variants are intentionally omitted: libstdc++ stubs DO
+ * define those, so declaring them here would be a duplicate definition. */
+static inline float fabsf(float x) { return __builtin_fabsf(x); }
+static inline float sqrtf(float x) { return __builtin_sqrtf(x); }
+static inline long double fabsl(long double x) { return __builtin_fabsl(x); }
+static inline long double sqrtl(long double x) { return __builtin_sqrtl(x); }
+
 #endif
