@@ -3,6 +3,7 @@
 #include "syscall.h"
 #include <errno.h>
 #include <math.h>
+#include <sys/mman.h>
 
 extern int normalize_errno(long rc);
 
@@ -24,37 +25,146 @@ void exit(int status)
 	while (1);
 }
 
-/* Simple bump-allocator for userspace malloc.
-   In a real system, this would use sbrk/mmap.
-   For M25, we use a static pool. */
+/* ── Dynamic memory allocator ───────────────────────────────────────────────
+ * Explicit free list with boundary tags, backed by anonymous mmap. This
+ * replaces an earlier 16 MB static bump pool whose free() was a no-op: large
+ * programs such as the native GCC's cc1 exhausted the pool, malloc() returned
+ * NULL, and cc1 crashed dereferencing it. Payloads are 16-byte aligned
+ * (x86-64 MALLOC_ABI_ALIGNMENT). Coalescing is bounded per mmap region by
+ * allocated prologue/epilogue sentinels so it never crosses a region edge. */
 
-#define HEAP_SIZE (16 * 1024 * 1024)
-static char heap[HEAP_SIZE];
-static size_t heap_used;
+#define MA_WSIZE   ((size_t)8)                  /* header / footer size */
+#define MA_DSIZE   ((size_t)16)                 /* alignment, hdr+ftr */
+#define MA_CHUNK   ((size_t)(4 * 1024 * 1024))  /* heap growth granularity */
+#define MA_MINBLK  ((size_t)32)                 /* hdr+ftr + 16B free links */
+
+#define MA_PACK(sz, a)  ((size_t)(sz) | (size_t)(a))
+#define MA_GET(p)       (*(volatile size_t *)(p))
+#define MA_PUT(p, v)    (*(volatile size_t *)(p) = (size_t)(v))
+#define MA_SIZE(p)      (MA_GET(p) & ~(size_t)0xF)
+#define MA_ALLOC(p)     (MA_GET(p) & (size_t)0x1)
+#define MA_HDR(bp)      ((char *)(bp) - MA_WSIZE)
+#define MA_FTR(bp)      ((char *)(bp) + MA_SIZE(MA_HDR(bp)) - MA_DSIZE)
+#define MA_NEXT(bp)     ((char *)(bp) + MA_SIZE((char *)(bp) - MA_WSIZE))
+#define MA_PREV(bp)     ((char *)(bp) - MA_SIZE((char *)(bp) - MA_DSIZE))
+#define MA_FLINK(bp)    (*(char **)(bp))                       /* free-list next */
+#define MA_BLINK(bp)    (*(char **)((char *)(bp) + MA_WSIZE))  /* free-list prev */
+
+static char *ma_free_list = 0;
+
+static void ma_fl_insert(char *bp) {
+	MA_FLINK(bp) = ma_free_list;
+	MA_BLINK(bp) = 0;
+	if (ma_free_list) MA_BLINK(ma_free_list) = bp;
+	ma_free_list = bp;
+}
+
+static void ma_fl_remove(char *bp) {
+	char *prev = MA_BLINK(bp), *next = MA_FLINK(bp);
+	if (prev) MA_FLINK(prev) = next; else ma_free_list = next;
+	if (next) MA_BLINK(next) = prev;
+}
+
+static char *ma_coalesce(char *bp) {
+	size_t prev_alloc = MA_ALLOC((char *)bp - MA_DSIZE); /* previous footer */
+	size_t next_alloc = MA_ALLOC(MA_HDR(MA_NEXT(bp)));   /* next header */
+	size_t size = MA_SIZE(MA_HDR(bp));
+	if (prev_alloc && next_alloc) {
+		/* isolated block */
+	} else if (prev_alloc && !next_alloc) {
+		char *nx = MA_NEXT(bp);
+		ma_fl_remove(nx);
+		size += MA_SIZE(MA_HDR(nx));
+		MA_PUT(MA_HDR(bp), MA_PACK(size, 0));
+		MA_PUT(MA_FTR(bp), MA_PACK(size, 0));
+	} else if (!prev_alloc && next_alloc) {
+		char *pv = MA_PREV(bp);
+		ma_fl_remove(pv);
+		size += MA_SIZE(MA_HDR(pv));
+		MA_PUT(MA_FTR(bp), MA_PACK(size, 0));
+		MA_PUT(MA_HDR(pv), MA_PACK(size, 0));
+		bp = pv;
+	} else {
+		char *pv = MA_PREV(bp), *nx = MA_NEXT(bp);
+		ma_fl_remove(pv); ma_fl_remove(nx);
+		size += MA_SIZE(MA_HDR(pv)) + MA_SIZE(MA_HDR(nx));
+		MA_PUT(MA_HDR(pv), MA_PACK(size, 0));
+		MA_PUT(MA_FTR(nx), MA_PACK(size, 0));
+		bp = pv;
+	}
+	ma_fl_insert(bp);
+	return bp;
+}
+
+static char *ma_extend(size_t need) {
+	size_t overhead = MA_WSIZE + MA_DSIZE + MA_WSIZE; /* pad + prologue + epilogue */
+	size_t region = overhead + need;
+	if (region < MA_CHUNK) region = MA_CHUNK;
+	region = (region + (MA_DSIZE - 1)) & ~(MA_DSIZE - 1);
+	char *r = (char *)mmap(0, region, PROT_READ | PROT_WRITE,
+	                       MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+	if (r == (char *)MAP_FAILED || r == 0) return 0;
+	MA_PUT(r + MA_WSIZE, MA_PACK(MA_DSIZE, 1)); /* prologue header */
+	MA_PUT(r + MA_DSIZE, MA_PACK(MA_DSIZE, 1)); /* prologue footer */
+	char *bp = r + MA_WSIZE + MA_DSIZE + MA_WSIZE; /* payload of first block (16-aligned) */
+	size_t fsize = region - overhead;
+	MA_PUT(MA_HDR(bp), MA_PACK(fsize, 0));
+	MA_PUT(MA_FTR(bp), MA_PACK(fsize, 0));
+	MA_PUT(MA_HDR(MA_NEXT(bp)), MA_PACK(0, 1)); /* epilogue header */
+	ma_fl_insert(bp);
+	return bp;
+}
+
+static char *ma_find_fit(size_t asize) {
+	for (char *bp = ma_free_list; bp; bp = MA_FLINK(bp))
+		if (MA_SIZE(MA_HDR(bp)) >= asize) return bp;
+	return 0;
+}
+
+static void ma_place(char *bp, size_t asize) {
+	size_t csize = MA_SIZE(MA_HDR(bp));
+	ma_fl_remove(bp);
+	if (csize - asize >= MA_MINBLK) {
+		MA_PUT(MA_HDR(bp), MA_PACK(asize, 1));
+		MA_PUT(MA_FTR(bp), MA_PACK(asize, 1));
+		char *nb = MA_NEXT(bp);
+		MA_PUT(MA_HDR(nb), MA_PACK(csize - asize, 0));
+		MA_PUT(MA_FTR(nb), MA_PACK(csize - asize, 0));
+		ma_fl_insert(nb);
+	} else {
+		MA_PUT(MA_HDR(bp), MA_PACK(csize, 1));
+		MA_PUT(MA_FTR(bp), MA_PACK(csize, 1));
+	}
+}
 
 void *malloc(size_t size)
 {
 	if (size == 0) return 0;
-	/* Align to 8 bytes */
-	size = (size + 7) & ~(size_t)7;
-	if (heap_used + size > HEAP_SIZE) {
-		errno = ENOMEM;
-		return 0;
+	size_t payload = (size + (MA_DSIZE - 1)) & ~(MA_DSIZE - 1);
+	size_t asize = payload + MA_DSIZE;
+	if (asize < MA_MINBLK) asize = MA_MINBLK;
+	char *bp = ma_find_fit(asize);
+	if (!bp) {
+		bp = ma_extend(asize);
+		if (!bp) { errno = ENOMEM; return 0; }
 	}
-	void *p = heap + heap_used;
-	heap_used += size;
-	return p;
+	ma_place(bp, asize);
+	return bp;
 }
 
 void free(void *ptr)
 {
-	/* No-op bump allocator — memory is never freed */
-	(void)ptr;
+	if (!ptr) return;
+	size_t size = MA_SIZE(MA_HDR(ptr));
+	MA_PUT(MA_HDR(ptr), MA_PACK(size, 0));
+	MA_PUT(MA_FTR(ptr), MA_PACK(size, 0));
+	ma_coalesce((char *)ptr);
 }
 
 void *calloc(size_t nmemb, size_t size)
 {
 	size_t total = nmemb * size;
+	if (size != 0 && total / size != nmemb) { errno = ENOMEM; return 0; } /* overflow */
 	void *p = malloc(total);
 	if (p) memset(p, 0, total);
 	return p;
@@ -200,14 +310,12 @@ void *realloc(void *ptr, size_t size)
 {
 	if (size == 0) { free(ptr); return NULL; }
 	if (!ptr) return malloc(size);
+	size_t old_payload = MA_SIZE(MA_HDR(ptr)) - MA_DSIZE; /* usable bytes in old block */
 	void *new_ptr = malloc(size);
-	if (new_ptr) {
-		size_t safe_copy = size;
-		if ((char *)ptr + safe_copy > heap + HEAP_SIZE) {
-			safe_copy = (heap + HEAP_SIZE) - (char *)ptr;
-		}
-		memcpy(new_ptr, ptr, safe_copy);
-	}
+	if (!new_ptr) return NULL;
+	size_t copy = size < old_payload ? size : old_payload;
+	memcpy(new_ptr, ptr, copy);
+	free(ptr);
 	return new_ptr;
 }
 
