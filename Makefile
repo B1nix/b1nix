@@ -277,18 +277,23 @@ install-native-toolchain:
 # Excludes generated artifacts (build/, *.o, *.a, *.elf, .git).
 install-kernel-source:
 	@echo "Staging b1nix source tree into $(BUILD_DIR)/rootfs/usr/src/b1nix..."
+	@# Clean restage (replaces rsync --delete) so stale files never linger.
+	@# tar is used instead of rsync because rsync is not guaranteed present in
+	@# every build environment (e.g. minimal WSL/Arch); tar is universal and its
+	@# --exclude handling matches what we need to drop generated artifacts.
+	@rm -rf $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@for d in kernel userspace tools tests docs; do \
 		if [ -d "$$d" ]; then \
-			rsync -a --delete \
-				--exclude='build/' \
+			tar -c \
+				--exclude='build' \
 				--exclude='*.o' \
 				--exclude='*.a' \
 				--exclude='*.elf' \
 				--exclude='*.bin' \
 				--exclude='*.iso' \
-				--exclude='.git/' \
-				"$$d" $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
+				--exclude='.git' \
+				-f - "$$d" | tar -x -C $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
 		fi; \
 	done
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
