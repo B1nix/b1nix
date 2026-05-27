@@ -2005,6 +2005,10 @@ void vfs_close(int fd) {
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     int my_pid = current_task ? (int)current_task->id : 0;
     filelock_release_all_by_pid_inode(my_pid, h->node->inode);
+
+    if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
+      page_cache_flush_inode(h->node->inode);
+    }
   }
 
   if (h->ops && h->ops->close)

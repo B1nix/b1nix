@@ -23,4 +23,16 @@ static inline void interrupts_enable(void) {
 #endif
 }
 
+static inline int interrupts_enabled(void) {
+#ifdef __aarch64__
+  u64 daif;
+  __asm__ volatile("mrs %0, daif" : "=r"(daif));
+  return (daif & (1ULL << 7)) == 0;
+#else
+  u64 rflags;
+  __asm__ volatile("pushfq; popq %0" : "=r"(rflags));
+  return (rflags & 0x200) != 0;
+#endif
+}
+
 #endif

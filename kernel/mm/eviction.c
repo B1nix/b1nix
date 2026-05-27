@@ -96,3 +96,14 @@ void eviction_evict_page(void) {
     }
 }
 
+void eviction_unregister_all_pages(struct task *task) {
+    if (!task) return;
+    for (usize i = 0; i < MAX_USER_PAGES; i++) {
+        if (page_ring[i].used && page_ring[i].task == task) {
+            page_ring[i].used = 0;
+            page_count--;
+        }
+    }
+}
+
+

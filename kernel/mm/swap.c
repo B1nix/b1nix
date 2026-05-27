@@ -143,12 +143,16 @@ static int swap_find_slot(u64 pml4_phys, u64 virtual_addr)
     return -1;
 }
 
+int swap_active(void)
+{
+    return swap_dev && swap_dev->write_blocks;
+}
+
 int swap_out(u64 virtual_addr, u64 physical_frame)
 {
     u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
 
-    if (!swap_dev || !swap_dev->write_blocks) {
-        console_write("swap_out: no swap device\n");
+    if (!swap_active()) {
         return -1;
     }
 
@@ -219,3 +223,13 @@ int swap_in(u64 virtual_addr, u64 *out_physical_frame)
     swap_free_slot((u32)slot);
     return 0;
 }
+
+void swap_free_all_slots(u64 pml4_phys)
+{
+    for (usize i = 0; i < MAX_SWAP_SLOTS; i++) {
+        if (swap_table[i].used && swap_table[i].pml4_phys == pml4_phys) {
+            swap_free_slot((u32)i);
+        }
+    }
+}
+

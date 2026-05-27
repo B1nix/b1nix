@@ -2,6 +2,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/arch.h>
 #include <string.h>
 
 #define BITS_PER_BYTE 8
@@ -283,10 +284,21 @@ u64 pmm_alloc_frames(usize count) {
 
   spin_unlock_irqrestore(&pmm_lock, flags);
 
-  // If we reach here, we are OOM. Try to evict a page and try again.
-  extern int swap_evict_page(void);
-  if (swap_evict_page() == 0) {
+  // If we reach here, we are OOM. Try to evict some page cache pages first!
+  extern int page_cache_evict(void);
+  if (page_cache_evict() > 0) {
     return pmm_alloc_frames(count);
+  }
+
+  // If still OOM, try to evict a process page and try again.
+  extern int swap_active(void);
+  if (swap_active() && interrupts_enabled()) {
+    extern u64 swap_evict_page(void);
+    u64 evicted_frame = swap_evict_page();
+    if (evicted_frame != 0) {
+      pmm_free_frame(evicted_frame);
+      return pmm_alloc_frames(count);
+    }
   }
 
   klog_warn("pmm: out of contiguous physical memory");

@@ -299,16 +299,24 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
 extern void x86_fork_child_trampoline(void);
 
 int scheduler_fork_current(void) {
-  interrupts_disable();
   struct task *parent = current_task;
   if (!parent) {
-    interrupts_enable();
     return -1;
   }
 
+  extern void paging_swap_in_all_swapped(u64 pml4_phys);
+  paging_swap_in_all_swapped(parent->pml4_phys);
+
+  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
+  if (!child_stack) {
+    return -1;
+  }
+
+  interrupts_disable();
   struct task *child = find_unused_task();
   if (!child) {
     interrupts_enable();
+    kfree(child_stack);
     return -1;
   }
 
@@ -321,6 +329,7 @@ int scheduler_fork_current(void) {
   if (parent->name && !child->name) {
     child->state = TASK_UNUSED;
     interrupts_enable();
+    kfree(child_stack);
     return -1;
   }
 
@@ -336,22 +345,6 @@ int scheduler_fork_current(void) {
   child->continued_report_pending = 0;
   child->wake_tick = 0;
   child->wait_chan = 0;
-
-  // 2. Allocate and copy kernel stack
-  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
-  if (!child_stack) {
-    if (child->user_image) {
-      user_image_free(child->user_image);
-      child->user_image = 0;
-    }
-    if (child->name) {
-      kfree((void *)child->name);
-      child->name = 0;
-    }
-    child->state = TASK_UNUSED;
-    interrupts_enable();
-    return -1;
-  }
 
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
@@ -419,7 +412,7 @@ int scheduler_fork_current(void) {
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }
 
-  // 3. Clone address space
+  // 3. Clone address space with interrupts disabled
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
 
   // 4. Clone VMAs
@@ -450,6 +443,12 @@ int scheduler_fork_current(void) {
       kfree(child->fd_table);
     if (child->fd_flags)
       kfree(child->fd_flags);
+    
+    extern void user_address_space_cleanup(struct task *t);
+    user_address_space_cleanup(child);
+    paging_free_address_space(child->pml4_phys);
+    child->pml4_phys = 0;
+
     if (child->cred) {
       cred_free(child->cred);
       child->cred = 0;
@@ -481,8 +480,13 @@ int scheduler_fork_current(void) {
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
+  console_write("scheduler_fork_current: done, child=");
+  console_write_dec(child_id);
+  console_write("\n");
   return child_id;
 }
+
+
 
 void scheduler_yield(void) {
   interrupts_disable();
@@ -626,11 +630,20 @@ void scheduler_on_timer_tick(void) {
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
 void scheduler_exit_current(int exit_code) {
-  interrupts_disable();
-
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
   }
+
+  /* Close all open file descriptors with interrupts enabled, so writebacks can sleep/block */
+  if (current_task->fd_table) {
+    for (usize i = 0; i < current_task->fd_capacity; i++) {
+      if (current_task->fd_table[i]) {
+        vfs_close((int)i);
+      }
+    }
+  }
+
+  interrupts_disable();
 
   /* Free credentials */
   if (current_task->cred) {
@@ -639,11 +652,6 @@ void scheduler_exit_current(int exit_code) {
   }
 
   if (current_task->fd_table) {
-    for (usize i = 0; i < current_task->fd_capacity; i++) {
-      if (current_task->fd_table[i]) {
-        vfs_handle_release(current_task->fd_table[i]);
-      }
-    }
     kfree(current_task->fd_table);
     kfree(current_task->fd_flags);
     current_task->fd_table = 0;
@@ -692,6 +700,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tasks[i].user_image = 0;
             }
             user_address_space_cleanup(&tasks[i]);
+            paging_free_address_space(tasks[i].pml4_phys);
+            tasks[i].pml4_phys = 0;
             if (tasks[i].name && strcmp(tasks[i].name, "boot") != 0) {
               kfree((void *)tasks[i].name);
               tasks[i].name = 0;
