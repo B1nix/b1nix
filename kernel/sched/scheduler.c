@@ -394,6 +394,27 @@ int scheduler_fork_current(void) {
     child->context.rsp = current_rsp + stack_offset;
     child->context.rbp = current_rbp + stack_offset;
 
+    /* Relocate the entire saved frame-pointer chain into the child's copied
+     * stack. The kernel-fork trampoline resumes the child via leave/ret, which
+     * unwinds by following the rbp chain. memcpy duplicates the stack bytes but
+     * each saved rbp still points into the PARENT's stack; without fixing them
+     * the child would `leave` onto the parent's stack and clobber it (and read
+     * stale slots as return addresses). Walk the chain and rebase every saved
+     * rbp by stack_offset so the child unwinds entirely on its own stack. */
+    u64 clo = (u64)(usize)child_stack;
+    u64 chi = clo + KERNEL_STACK_SIZE;
+    u64 fp = child->context.rbp;
+    for (int i = 0; i < 64 && fp >= clo && fp + 16 <= chi; i++) {
+      u64 saved = *(u64 *)(usize)fp;
+      if (saved == 0)
+        break;
+      u64 reloc = saved + stack_offset;
+      if (reloc < clo || reloc + 16 > chi)
+        break;
+      *(u64 *)(usize)fp = reloc;
+      fp = reloc;
+    }
+
     child->context.rsp -= 8;
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }

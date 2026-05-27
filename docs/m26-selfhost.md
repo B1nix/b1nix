@@ -18,14 +18,14 @@ ported GCC, inside b1nix.
   `gcc -c` produces a real `.o`.
 - **The b1nix kernel now builds with GCC** on the host:
   `make ARCH=x86 TOOLCHAIN=gcc all` produces `kernel.elf` with zero errors.
-- The **GCC-built kernel boots** and passes the M12/M13/M14/M15/M25(TCC)/M16/M22
-  smoke modules, then hits one **GCC-codegen `#GP`** (see §6).
+- The **GCC-built kernel boots and now passes the FULL test suite** to
+  `B1NIX-TEST: done` with **zero exceptions/panics** — the post-fork `#GP` is
+  fixed at its root cause (kernel-fork rbp-chain relocation, see §6).
 - The **clang build is unchanged and still passes the full smoke suite, 214/0**,
   so all the kernel-side fixes below are regression-free.
 
 What is NOT done yet:
-- Fix the GCC-codegen `#GP` so the GCC-built kernel is fully clean (§6).
-- Build the kernel **in-guest** (need a build driver + the `#GP` fixed) (§7).
+- Build the kernel **in-guest** (need a build driver + crt objects) (§7).
 - Full in-guest **link** of a user program (`gcc hello.c -o hello`): needs
   `crtbegin.o`/`crtend.o` and a prefix fix (§7).
 
@@ -117,6 +117,24 @@ In dependency order — each was a real gap the GCC port exposed:
    `gcc -c` produces a real `.o`.
 9. **`Makefile`** — `install-kernel-source` uses `tar` instead of `rsync`.
 10. **`Makefile`** — opt-in `TOOLCHAIN=gcc` kernel build mode (see §5).
+11. **`kernel/sched/scheduler.c`** — kernel-mode fork: relocate the *entire*
+    saved-rbp chain in the child's copied stack (not just the first frame) so the
+    child unwinds on its own stack. Fixes the post-fork `#GP` (see §6). Was a real
+    latent bug, exposed by GCC; clang happened to survive it.
+12. **`kernel/arch/x86/interrupts.c`** — `arch_backtrace` now validates frame
+    pointers for canonical-ness + mapped range (`fp_is_safe`), so a corrupt frame
+    can't double-fault and mask the original exception.
+13. **`Makefile`** — `install-native-toolchain` now also stages the cross-built
+    `crtbegin.o`/`crtend.o` (+ `libgcov.a`/variants) into
+    `rootfs/lib/gcc/x86_64-b1nix/13.2.0/`. This is what makes an in-guest
+    gcc-driven *link* succeed (§7.2).
+14. **`kernel/user/programs.c`** — raised the shell argv cap (`args[16]`→32) and
+    line buffers (256→`SH_LINE_MAX`=512 in `readline`/`sh_run_script`/`sh -c`) so
+    long toolchain command lines aren't truncated (§7.3). Host-clean; not yet
+    re-verified in-guest.
+15. **`Makefile`** — `install-kernel-source` now stages the generated
+    `build/x86/*.inc` files into the in-guest source tree so `kernel/fs/initramfs.c`
+    can compile during an in-guest kernel build (§7.4).
 
 Dead-ends ruled out along the way (do not re-investigate): the cc1 crash was
 NOT malloc, NOT FPU/SSE, NOT qsort/memcpy/memmove, NOT the ELF loader (it
@@ -149,66 +167,108 @@ build.
 
 ---
 
-## 6. THE remaining blocker: GCC-codegen `#GP` after fork
+## 6. RESOLVED: `#GP` after a kernel-mode fork
 
-The GCC-built kernel boots and runs M12/M13/M14/M15/M25(TCC)/M16/M22, then:
+**Fixed.** The GCC-built kernel now boots and runs the full test suite
+(M12/M13/M14/M15/M25(TCC)/M16/M22/M24/NET) to `B1NIX-TEST: done` with **zero
+exceptions/panics**, and the clang build is still **214/0**.
 
+### Symptom (before the fix)
 ```
 POSIX compliance check: foreground pgrp passed
 paging_clone_address_space: ...                 <- a fork
 EXCEPTION: general protection fault
 rip: 0xff894c00001073e8                          <- NON-CANONICAL instruction pointer
 ```
+The faulting fork is the one in `m22_check_posix_compliance` (TIOCSPGRP session
+test, `kernel/user/programs.c:2033`). `addr2line 0x1073e8` on the GCC kernel
+maps inside `scheduler_fork_current`; the `0xff894c00` upper half is stale stack
+garbage (not real code — confirmed by searching `.text`).
 
-The low 32 bits (`0x001073e8`) are a valid kernel `.text` address (~1.07 MB);
-the **upper 32 bits are corrupted** (`0xff894c00`). The CPU jumped/returned to a
-non-canonical address → `#GP`. It happens immediately after a `fork`
-(`paging_clone_address_space`), so a return address / function pointer in the
-fork-return path has its top half clobbered (pointer truncation).
+### Root cause (NOT a codegen/truncation bug)
+This fork is **kernel-mode**: `/bin/init` runs as a builtin (`init_main`), which
+calls `m22_smoke_main` → `m22_check_posix_compliance` directly, so the fork takes
+the `is_user == false` branch in `scheduler_fork_current` and resumes the child
+via `x86_fork_kernel_trampoline` (`leave; ret` = `mov %rbp,%rsp; pop %rbp; ret`).
 
-This is a **GCC-vs-clang code-generation difference**, NOT the FPU/struct
-changes: the **clang** kernel with all the same fixes passes the full smoke
-suite 214/0, including this exact test.
+That trampoline unwinds by **following the saved-rbp chain**. `scheduler_fork_current`
+`memcpy`s the parent's kernel stack into the child and relocated only the *first*
+frame pointer (`child->context.rbp = current_rbp + stack_offset`). Every *saved*
+rbp deeper in the copied stack still pointed into the **parent's** stack. After
+the first `leave`, the child ran on the parent's stack, read a stale slot as a
+return address, and `#GP`'d (and corrupted the parent's blocked frames). This
+path is exercised exactly **once** in the whole suite; clang's frame layout
+happened to survive it, GCC's did not — it was never a GCC codegen difference.
 
-The `[PANIC] unhandled CPU exception` that follows (rip `0x147d01`) is a
-*secondary* fault: `arch_backtrace` itself `#GP`s while unwinding the bad frame
-(`kernel/arch/x86/interrupts.c`) — its frame-pointer validation only checks an
-upper bound, not canonical-ness/lower-bound. Hardening it would surface the real
-first fault instead of masking it.
+### The fix (`kernel/sched/scheduler.c`, kernel-fork branch)
+After setting `child->context.rbp`, walk the copied stack's rbp chain and rebase
+every saved rbp by `stack_offset`, so the child unwinds entirely on its own
+stack. Bounded to 64 frames and to the child stack range. The user-fork branch
+(iframe + `x86_fork_child_trampoline` + `sysretq`) was already correct and is
+untouched.
 
-Where to look next:
-- The fork path: `kernel/sched/scheduler.c` `scheduler_fork_current` and the
-  fork **assembly trampolines** (`kernel/arch/x86/*.S`) that return the child to
-  user/kernel. An asm trampoline written against clang's codegen/ABI
-  assumptions may mishandle a 64-bit value under GCC (e.g. a `movl` where a
-  `movq` is needed, or a clobbered callee-saved reg).
-- `addr2line` the intended `0x1073e8` in a GCC `kernel.elf` to identify the
-  function the child was returning into.
-- Compare GCC vs clang disassembly of `scheduler_fork_current` and the trampoline.
+### Secondary fault hardening (`kernel/arch/x86/interrupts.c`)
+`arch_backtrace` only bounded rbp from above, so a non-canonical rbp (in the
+`[2^47, 0xffff800000000000)` hole) passed the check and the dereference `#GP`'d
+inside the exception handler, masking the real first fault. Added `fp_is_safe()`
+(canonical + mapped-range + `fp+16` bound) and gated both unwind phases on it.
 
 ---
 
 ## 7. Remaining work toward full in-guest self-host
 
-1. **Fix the GCC-codegen `#GP`** (§6) — gate for a clean GCC kernel.
-2. **In-guest full link** (`gcc hello.c -o hello`): native build only did
-   `all-gcc`, so `crtbegin.o`/`crtend.o` were never built and are absent from
-   the rootfs → any gcc-driven *link* fails. Fix: add `all-target-libgcc` +
-   `install-target-libgcc` to `tools/build-native-toolchain.sh`. Also the gcc
-   driver's compiled-in prefix is `/` but the toolchain is mounted at `/persist`
-   → pass `-B/persist/... --sysroot=/persist`, or add `/lib /libexec /include
-   /bin` symlinks → `/persist/...`, or rebuild native gcc with `--prefix=/persist`.
+1. **Fix the GCC-codegen `#GP`** — **DONE** (§6).
+2. **In-guest full link** (`gcc hello.c -o hello`) — **DONE & verified**.
+   In-guest `/persist/bin/gcc /tmp/h.c -o /tmp/h` returns 0 and the binary runs
+   (e.g. `return 42` → wait status 10752 = 42<<8). The fix was *only* staging the
+   crt objects: `crtbegin.o`/`crtend.o` now copied into
+   `rootfs/lib/gcc/x86_64-b1nix/13.2.0/` by the Makefile `install-native-toolchain`
+   target (alongside the already-copied `libgcc.a`). **Correction to the earlier
+   plan:** do NOT add `all-target-libgcc` to `tools/build-native-toolchain.sh` —
+   that's the *native* (host=b1nix) build and can't run a b1nix `gcc` on the host.
+   The crt objects come from the **cross** build (`cross/lib/gcc/.../crt*.o`),
+   which already builds them. **No `-B`/`--sysroot`/symlink/prefix hack is
+   needed**: the gcc driver relocates its prefix *and* target sysroot from
+   `argv[0] = /persist/bin/gcc`, so it finds `cc1` at `/persist/libexec/...`,
+   `crtbegin/crtend/libgcc` at `/persist/lib/gcc/...`, and `crt0.o` at the
+   relocated sysroot `/persist/lib/crt0.o`. (One harmless warning remains:
+   `crtend.o: missing .note.GNU-stack section implies executable stack` — it's
+   the cross-built crtend.o; cosmetic, link still RC=0.)
    NOTE: a freshly in-guest-linked program lands at **0x400000** (binutils
    default script) — do NOT pass `userspace/linker.ld` (it forces 0x2000000).
-   `as`+`ld` by hand already work today (Path A): `as x.s -o x.o &&
-   ld /persist/lib/crt0.o x.o -L/persist/lib -lc -o x`.
-3. **In-guest build driver**: `nmake` (`kernel/user/nmake.c`) is too limited for
-   the real Makefile (no variables/automatic vars, only searches `/bin` not
-   `/persist/bin`, no mtime check). Either extend it or port GNU make, or drive
-   the kernel build with a flat script.
-4. Then build the kernel in-guest from `/persist/usr/src/b1nix` with
-   `TOOLCHAIN=gcc`, and flip `can_build_kernel_inside_b1nix` to 1 in
-   `kernel/syscall/syscall.c` (only when it actually works — no fake passes).
+3. **In-guest compilation of kernel sources — VERIFIED.** With the kernel flags
+   (`-std=c11 -ffreestanding ... -mcmodel=kernel -mno-sse ... -I.../kernel/include`)
+   the in-guest gcc compiles real kernel TUs to `.o`: `kernel/lib/string.c` → RC 0
+   (5080-byte `.o`), and the larger `kernel/sched/scheduler.c` → RC 0 too. So
+   `-mcmodel=kernel`, the kernel headers, and a big TU all work in-guest.
+   Two **shell limits** were blocking long toolchain command lines and are now
+   fixed (`kernel/user/programs.c`):
+   - argv cap was `char *args[16]` → raised to 32 (matches `USER_MAX_ARGS`). 16
+     silently dropped trailing args (a kernel-flag gcc line has ~20 tokens), e.g.
+     `-o file` became just `-o` → "missing filename after -o".
+   - input/script line buffer was 256 → `SH_LINE_MAX` (512) for `readline`,
+     `sh_run_script`, and `sh -c`. 256 truncated a ~260-char gcc line mid-arg
+     (e.g. `-o /tmp/sched.o` → `-o /tmp/sch`). (Mindful of the 16 KB kthread stack
+     + 6.6 KB `syscall_dispatch_impl` frame; 512 is a safe bump.)
+   - **Still UNVERIFIED in-guest** (compiles clean on host; needs a guest run).
+4. **In-guest build driver + full build (REMAINING).** `nmake`
+   (`kernel/user/nmake.c`) is too limited for the real Makefile (no
+   variables/automatic vars, only searches `/bin` not `/persist/bin`, no mtime
+   check). Simplest path: a **flat shell script** generated from the Makefile's
+   `KERNEL_SOURCES`/`ASM_SOURCES`/`ARCH_SOURCES` + the gcc flags, run from the
+   interactive shell. Prereqs now in place:
+   - The generated `.inc` files (`build/x86/*.inc`) are now staged into
+     `/persist/usr/src/b1nix/build/x86/` by `install-kernel-source` (kernel/fs/
+     initramfs.c `#include`s them via `../../build/x86/*.inc`; can't be
+     regenerated in-guest without `xxd`).
+   - The AP trampoline needs a flat-binary link + an `xxd -i`-style `.inc`; since
+     that `.inc` is now staged, the driver can skip regenerating it and just
+     compile/link the kernel objects.
+   - Expect this SLOW in QEMU: ~70 TUs each forking the 38 MB cc1 on an emulated
+     single CPU — many minutes, well past the 120 s smoke timeout. Run it from the
+     interactive shell, not the smoke runner.
+   Then flip `can_build_kernel_inside_b1nix` to 1 in `kernel/syscall/syscall.c`
+   (ONLY when an in-guest `kernel.elf` actually builds — no fake passes).
 5. Add an `M26-SMOKE` test module + boot-log markers for the self-host path.
 
 ### Latent bugs noticed (not blockers, worth tracking)

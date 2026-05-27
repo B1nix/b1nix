@@ -119,12 +119,14 @@ static int copy_dir_op(const char *src_dir, const char *dst_dir)
 	return 0;
 }
 
-static int delete_file_op(const char *path) {
+/* File-manager delete/rmdir ops — scaffolding for a delete key binding not yet
+ * wired into the panel input handler. Kept (marked unused) for future use. */
+__attribute__((unused)) static int delete_file_op(const char *path) {
 	isize ret = (isize)syscall_dispatch(SYS_UNLINK, (u64)(usize)path, 0,0,0,0,0);
 	return (ret < 0 && ret != -ENOENT) ? -1 : 0;
 }
 
-static int remove_dir_op(const char *path) {
+__attribute__((unused)) static int remove_dir_op(const char *path) {
 	isize ret = (isize)syscall_dispatch(SYS_RMDIR, (u64)(usize)path, 0,0,0,0,0);
 	return (ret < 0 && ret != -ENOENT) ? -1 : 0;
 }

@@ -381,6 +381,23 @@ static int addr_is_kernel_text(u64 addr) {
          (addr >= 0xffff800000000000ULL && addr <= 0xffff800100000000ULL);
 }
 
+/* A frame pointer is safe to dereference only if it is canonical and lands in a
+   region we actually map. A corrupt frame (e.g. after a bad fork return) can
+   carry a NON-canonical rbp; dereferencing it would itself #GP inside the
+   exception handler and mask the original fault. */
+static int fp_is_safe(u64 fp) {
+  if (fp < 0x1000ULL || fp == (u64)-1)
+    return 0;
+  /* Reject the non-canonical hole [2^47, 0xffff800000000000). */
+  if (fp >= 0x0000800000000000ULL && fp < 0xffff800000000000ULL)
+    return 0;
+  if (fp < 0x0000800000000000ULL)
+    /* Low identity-mapped region: kernel image + heap/stacks live below 4 GiB. */
+    return fp + 16 <= 0x0000000100000000ULL;
+  /* Higher-half direct map. */
+  return fp + 16 <= 0xffff800100000000ULL;
+}
+
 void arch_backtrace(u64 rbp, u64 rip) {
   int frames = 0;
   console_write("\n--- Kernel Backtrace ---\n");
@@ -393,16 +410,11 @@ void arch_backtrace(u64 rbp, u64 rip) {
 
   /* Phase 1: Try RBP-based unwinding */
   for (int i = 0; i < MAX_BACKTRACE_FRAMES && rbp; i++) {
-    if (rbp == (u64)-1)
-      break;
-    if (rbp < 0x1000ULL || rbp > 0xffff800100000000ULL)
+    if (!fp_is_safe(rbp))
       break;
 
     u64 next_rbp = 0;
     u64 ret_addr = 0;
-
-    if (rbp + 16 > 0xffff800100000000ULL)
-      break;
 
     next_rbp = *(volatile u64 *)rbp;
     ret_addr = *(volatile u64 *)(rbp + 8);
@@ -426,7 +438,7 @@ void arch_backtrace(u64 rbp, u64 rip) {
     __asm__ volatile("movq %%rbp, %0" : "=r"(scan_rbp));
 
     for (int i = 0; i < MAX_BACKTRACE_FRAMES && scan_rbp; i++) {
-      if (scan_rbp < 0x1000ULL || scan_rbp > 0xffff800100000000ULL)
+      if (!fp_is_safe(scan_rbp))
         break;
 
       u64 ret = *(volatile u64 *)(scan_rbp + 8);

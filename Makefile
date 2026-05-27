@@ -285,9 +285,12 @@ install-native-toolchain:
 		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
 		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
 		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
-		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" ]; then \
-			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
-		fi; \
+		gccdir="$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0"; \
+		for f in libgcc.a libgcov.a crtbegin.o crtend.o crtbeginT.o crtbeginS.o crtendS.o; do \
+			if [ -f "$$gccdir/$$f" ]; then \
+				cp "$$gccdir/$$f" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+			fi; \
+		done; \
 	else \
 		echo "Note: native toolchain not built (looked in build/toolchain_build/native_root and ~/b1nix-toolchain/native_root)."; \
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
@@ -319,6 +322,11 @@ install-kernel-source:
 	done
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
+	@# Stage the generated initramfs/AP-trampoline .inc files: kernel/fs/initramfs.c
+	@# #includes them via ../../build/x86/*.inc, and an in-guest kernel build cannot
+	@# regenerate them (no xxd/grub in-guest). Without these, initramfs.c won't compile.
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86
+	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso

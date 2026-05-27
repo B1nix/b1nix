@@ -119,10 +119,6 @@ static void ext4_write_bgd_tx(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 
     ext4_journal_write_tx(fs, h, bg_block, buf); kfree(buf);
 }
 
-static void ext4_write_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd) {
-    ext4_write_bgd_tx(fs, group, bgd, 0);
-}
-
 static void ext4_write_superblock(struct ext4_fs *fs) {
     u8 *sb_buf = kmalloc(1024);
     if (blk_read_cached(fs->bdev, 2, 2, sb_buf) >= 0) { memcpy(sb_buf, &fs->sb, sizeof(struct ext2_superblock)); blk_write_cached(fs->bdev, 2, 2, sb_buf); }
@@ -219,10 +215,6 @@ static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
     kfree(bitmap);
   }
   return 0;
-}
-
-static u32 ext4_alloc_inode(struct ext4_fs *fs) {
-  return ext4_alloc_inode_tx(fs, 0);
 }
 
 static void ext4_free_block_tx(struct ext4_fs *fs, u32 block_num, struct journal_handle *h) {
@@ -446,10 +438,6 @@ static int ext4_add_dir_entry_tx(struct ext4_fs *fs, u32 dir_ino, u32 child_ino,
     kfree(buf); return -1;
 }
 
-static int ext4_add_dir_entry(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type) {
-    return ext4_add_dir_entry_tx(fs, dir_ino, child_ino, name, type, 0);
-}
-
 static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32 mode);
 
 static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent *buf, usize max_entries) {
@@ -481,6 +469,7 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
 }
 
 static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *full_path, u32 mode) {
+  (void)full_path; /* part of the vfs create-op signature; this impl uses name+dir */
   struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
   struct ext4_fs *fs = dir_info->fs;
   struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
