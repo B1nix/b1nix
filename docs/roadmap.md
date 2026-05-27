@@ -408,8 +408,11 @@ diagnostics.
 - [x] `done` Port Binutils (`as`, `ld`, `objcopy`, `ar`) for `x86_64-b1nix`.
 - [x] `done` Port GCC after the minimal C toolchain and filesystem are stable.
 - [x] `done` Build larger user programs with the external cross toolchain.
-- [ ] `planned` Build the B1NIX kernel inside B1NIX.
-- [ ] `planned` Add native `make`/assembler/linker workflow usable from the B1NIX shell.
+- [x] `done` Build a target `libstdc++` for `x86_64-b1nix` (prerequisite for the native GCC port).
+- [x] `done` Run the native GCC inside B1NIX to compile C to an object file (`cc1` + `as`: `gcc -c` works in-guest). See [`docs/m26-selfhost.md`](m26-selfhost.md).
+- [x] `done` Build the B1NIX kernel with the ported GCC on the host (`make TOOLCHAIN=gcc`); the GCC-built kernel boots and passes M12/M13/M14/M15/M25/M16/M22.
+- [x] `partial` Build the B1NIX kernel inside B1NIX. Host GCC build works; in-guest build is still blocked by a GCC-codegen `#GP` in the fork path and the lack of an in-guest build driver — full handoff in [`docs/m26-selfhost.md`](m26-selfhost.md).
+- [x] `partial` Add native `make`/assembler/linker workflow usable from the B1NIX shell. In-guest `as`+`ld` work by hand; `gcc`-driven linking needs `crtbegin`/`crtend` + a sysroot/prefix fix, and `nmake` is too limited to drive the real build.
 
 ## M27: Terminal OS Polish
 
