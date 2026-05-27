@@ -11,6 +11,8 @@ static struct page_cache_entry *lru_head;
 static struct page_cache_entry *lru_tail;
 static volatile int pc_lock = 0;
 
+static struct page_cache_entry *to_free_list = 0;
+
 static void lock_pc(void) {
   while (__sync_lock_test_and_set(&pc_lock, 1)) {
     while (pc_lock) { __asm__ volatile("pause"); }
@@ -19,6 +21,19 @@ static void lock_pc(void) {
 
 static void unlock_pc(void) {
   __sync_lock_release(&pc_lock);
+}
+
+static void page_cache_process_deferred_free(void) {
+  lock_pc();
+  struct page_cache_entry *curr = to_free_list;
+  to_free_list = 0;
+  unlock_pc();
+  
+  while (curr) {
+    struct page_cache_entry *next = curr->hash_next;
+    kfree(curr);
+    curr = next;
+  }
 }
 
 static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
@@ -52,6 +67,9 @@ void page_cache_init(void) {
 }
 
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset) {
+  if (to_free_list) {
+    page_cache_process_deferred_free();
+  }
   u32 h = pc_hash(inode, offset);
   
   lock_pc();
@@ -72,6 +90,9 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
 }
 
 int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
+  if (to_free_list) {
+    page_cache_process_deferred_free();
+  }
   u32 h = pc_hash(inode, offset);
   
   struct page_cache_entry *new_entry = kmalloc(sizeof(struct page_cache_entry));
@@ -162,7 +183,7 @@ void page_cache_put_page(struct page_cache_entry *page) {
   unlock_pc();
 }
 
-void page_cache_evict(void) {
+int page_cache_evict(void) {
   lock_pc();
   
   struct page_cache_entry *curr = lru_head;
@@ -173,7 +194,8 @@ void page_cache_evict(void) {
     
     if (curr->refcount == 0) {
       if (curr->flags & PAGE_CACHE_DIRTY) {
-        writeback_page_locked(curr);
+        curr = next;
+        continue;
       }
       
       // Remove from hash table
@@ -193,7 +215,8 @@ void page_cache_evict(void) {
       
       // Free frame and entry
       pmm_free_frame(curr->frame);
-      kfree(curr);
+      curr->hash_next = to_free_list;
+      to_free_list = curr;
       evicted++;
     }
     
@@ -201,4 +224,5 @@ void page_cache_evict(void) {
   }
   
   unlock_pc();
+  return evicted;
 }

@@ -39,6 +39,6 @@ int page_cache_flush_inode(struct vfs_inode *inode);
 void page_cache_put_page(struct page_cache_entry *page);
 
 // Evicts some unused pages (writes back dirty pages).
-void page_cache_evict(void);
+int page_cache_evict(void);
 
 #endif

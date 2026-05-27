@@ -494,10 +494,17 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
 
 void user_address_space_cleanup(struct task *t) {
   if (!t) return;
+
+  extern void swap_free_all_slots(u64 pml4_phys);
+  extern void eviction_unregister_all_pages(struct task *task);
+  swap_free_all_slots(t->pml4_phys);
+  eviction_unregister_all_pages(t);
+
   interrupts_disable();
   struct vm_area *vma = t->vma_list;
   t->vma_list = NULL;
   interrupts_enable();
+
 
   while (vma) {
     struct vm_area *next = vma->next;
@@ -606,6 +613,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   for (u64 v = stack_aligned; v < image->address_space.stack_top;
        v += PAGE_SIZE) {
     u64 frame = pmm_alloc_frame();
+    if (!frame) {
+      return -ENOMEM;
+    }
     vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
 
     /* Clear stack page */

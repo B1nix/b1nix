@@ -86,6 +86,7 @@ void paging_unmap_page(u64 virtual_address);
 void paging_mprotect_page(u64 virtual_address, u64 flags);
 u64 paging_create_address_space(void);
 u64 paging_clone_address_space(u64 src_pml4_phys);
+void paging_free_address_space(u64 pml4_phys);
 void paging_switch_address_space(u64 pml4_phys);
 
 // Demand Paging / Swap
@@ -95,6 +96,7 @@ void vmm_set_swap_device(struct block_device *dev);
 
 // Swap
 int swap_init(void);
+int swap_active(void);
 int swap_out(u64 virtual_addr, u64 physical_frame);
 int swap_in(u64 virtual_addr, u64 *out_physical_frame);
 
