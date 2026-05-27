@@ -14,8 +14,10 @@ INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
 INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
-CC := clang
-LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
+# Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
+# builds the kernel with the ported cross x86_64-b1nix-gcc/ld (toward M26
+# self-host). CC/LD are assigned below, after CROSS_TOOLCHAIN_ROOT is known.
+TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
@@ -38,6 +40,19 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 
+# Select the kernel compiler/linker per TOOLCHAIN. The gcc path uses the ported
+# binutils GNU ld and omits clang-only flags; the AP-trampoline flat-binary link
+# drops lld-only --image-base (GNU ld rejects it; it is unneeded for binary out).
+ifeq ($(TOOLCHAIN),gcc)
+CC := $(CROSS_TOOLCHAIN_ROOT)/bin/x86_64-b1nix-gcc
+LD := $(CROSS_TOOLCHAIN_ROOT)/bin/x86_64-b1nix-ld
+AP_IMAGE_BASE :=
+else
+CC := clang
+LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
+AP_IMAGE_BASE := --image-base 0
+endif
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-ffreestanding \
@@ -51,7 +66,13 @@ COMMON_CFLAGS := \
 
 ifeq ($(ARCH),x86)
 TARGET := x86_64-elf
+# clang needs --target to cross-compile; the b1nix-gcc cross compiler already
+# targets x86_64 natively, so it must NOT receive --target (it is clang-only).
+ifeq ($(TOOLCHAIN),gcc)
+ARCH_CFLAGS := -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+else
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+endif
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
 ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
@@ -235,7 +256,7 @@ $(AP_TRAMP_OBJ): kernel/arch/x86/ap_trampoline.S
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
-	$(LD) -m elf_x86_64 -z max-page-size=0x1000 --image-base 0 -Ttext 0x8000 -o $@ --oformat binary $<
+	$(LD) -m elf_x86_64 -z max-page-size=0x1000 $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
 
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
