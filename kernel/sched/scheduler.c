@@ -22,6 +22,16 @@ extern void arch_context_switch(struct cpu_context *old_context,
                                 struct cpu_context *new_context);
 extern char x86_syscall_stack_top[];
 
+/* x86 FPU/SSE save/restore (kernel/arch/x86/fpu.S). The kernel is -mno-sse, so
+ * the fxsave/fxrstor instructions live in assembly. */
+extern void arch_fpu_save(void *area);
+extern void arch_fpu_restore(void *area);
+extern void arch_fpu_capture_clean(void *area);
+
+/* Canonical clean FXSAVE image, loaded into tasks that have never run. */
+static __attribute__((aligned(16))) u8 g_clean_fpu[512];
+static int g_clean_fpu_ready = 0;
+
 static struct task tasks[MAX_TASKS];
 struct task *current_task;
 static usize next_task_id = 1;
@@ -483,6 +493,26 @@ void scheduler_yield(void) {
 
   paging_switch_address_space(new_task->pml4_phys);
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
+
+  /* Preserve userspace FPU/SSE/MXCSR/x87 across the switch. Save the outgoing
+   * task's live state, then load the incoming task's (or a clean image if it
+   * has never run). Without this, userspace XMM registers are clobbered by
+   * other tasks and FP-heavy programs (e.g. cc1) corrupt silently. */
+  arch_fpu_save(old_task->fpu_state);
+  old_task->fpu_initialized = 1;
+  if (!g_clean_fpu_ready) {
+    /* old_task's state is already saved above; capture_clean reinits the live
+     * FPU, which is fine since new_task's state is loaded immediately after. */
+    arch_fpu_capture_clean(g_clean_fpu);
+    g_clean_fpu_ready = 1;
+  }
+  if (new_task->fpu_initialized) {
+    arch_fpu_restore(new_task->fpu_state);
+  } else {
+    arch_fpu_restore(g_clean_fpu);
+    new_task->fpu_initialized = 1;
+  }
+
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
 }

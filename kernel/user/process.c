@@ -10,6 +10,7 @@
 #include <string.h>
 
 extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 extern struct task *current_task;
 
 #define MAX_PROGRAMS 64
@@ -646,6 +647,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     console_write("user: reject non-canonical ring3 frame\n");
     return -1;
   }
+
+  /* A freshly started program expects a clean FPU/MXCSR (SysV ABI). Reset the
+   * live FPU here since exec replaces the image without a context switch. */
+  arch_fpu_init_current();
 
   x86_user_jump(image->entry, image->address_space.stack_base,
                 (u64)image->argc,
