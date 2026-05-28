@@ -256,15 +256,27 @@ inside the exception handler, masking the real first fault. Added `fp_is_safe()`
    blocked by a kernel OOM at vfs.c.** With the `vsnprintf` fix (item 5) the
    build compiles past `pipe.c` (39) to `kernel/fs/vfs.c` (40) under KVM with 0
    ICEs, then PANICs: `pmm: out of contiguous physical memory` →
-   `[PANIC] kheap: OOM during heap growth`. `kheap` grows one frame at a time
-   (`heap_grow` → `pmm_alloc_frame`), so this is *true* physical exhaustion, not
-   fragmentation; and `vfs.c`'s cc1 alone (≈69 KB `.o`, default `-O0`) should not
-   need ~3 GB, so **frames are leaking across the ~40 cc1 spawns** (suspect: the
-   COW refcount path — `pmm_free_frame` is refcount-aware, so a frame stuck at
-   refcount > 1 never returns to the allocator). Three remaining MM blockers (all
-   kernel-side, distinct from the two fixes above):
-   - **Per-spawn frame leak** — the actual OOM cause; needs the teardown/COW
-     refcount path audited so every frame returns to the pmm.
+   `[PANIC] kheap: OOM during heap growth`. **Root: the kernel KHEAP itself grows
+   to ~3 GB (~70 MB/file).** Instrumented (then reverted) ~13 in-guest runs to
+   localize it: `kheap_size_bytes()` climbs in lockstep with `pmm.free_frames`
+   dropping (file 12: kheap≈688 MB / free≈2400 MB → file 39: kheap≈2998 MB /
+   free≈38 MB), and it is mostly *live* (`kheapLive ≈ kheap`), not fragmentation.
+   **Ruled out (with in-kernel counters):** page cache (pinned ≈42 MB, evicts to 0
+   at OOM); per-process residency (an OOM-time dump showed all live tasks hold
+   only ~10 MB total — so no live process owns the 3 GB); leaked pml4s (clones 79
+   + creates 44 = 123 ≈ frees 118 + 5 live, balanced); the 39 MB `file_data`
+   buffer (kfree'd on all paths); ELF `segment->data` (an `imgLive` counter
+   showed images ARE freed, ≈4 live); ext4 block buffers (kmalloc/kfree balanced);
+   `unmap` (`unmShared` = correct COW release, `unmNoUser` = 0). **Strongest
+   unresolved signal:** a "live ≥1 MB blocks" counter showed **~130 live ≥1 MB
+   kheap blocks ≈ 2700 MB (~20 MB avg, ~3.7 leaked/file)** → the leak is *big,
+   non-image* kheap blocks. A bump-region walker couldn't enumerate them (its
+   stride derails ~7 MB in). NEXT STEP: fix the kheap walker (or tag every
+   `kmalloc >= 1 MB` with `__builtin_return_address(0)` and dump the leaking call
+   site at OOM) to pin the exact ~20 MB allocation. Tried-and-failed fixes (all
+   reverted): `free_table`→`eviction_unregister_page`; `vmm_map_page`
+   free-on-overwrite (never fired); `scheduler_set_user_image` free-old-image
+   (no effect). This is kernel-MM (Blair's area).
    - **Direct map caps at 4 GB** (`DIRECT_MAP_SIZE`, paging.c:12). Retrying with
      `-m 6144` does NOT help — it PANICs with a kernel page fault at
      `cr2=0xffff800100000000` (the direct-map address for physical 4 GB) because
