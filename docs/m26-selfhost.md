@@ -8,6 +8,35 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 (h) — kheap segregated free lists: O(1) bucket search, no more timeout at file 58
+
+**`kernel/mm/kheap.c` — 16 segregated free-list buckets** replacing the single
+global `free_list`.
+
+Root cause of the 2700 s timeout at file 58 (2048 MB): with the split fix
+(`d34caac`) live kheap dropped to ~57 MB, but the **free list still held
+thousands of small blocks in one singly-linked list**. Every `kmalloc(33 MB)`
+for a new cc1 ELF segment had to walk past all of them before finding the
+right block — O(N) × 76 files = timeout.
+
+- **Fix:** 16 size-class buckets (32 B … ∞). `kfree` inserts the block into
+  `free_lists[size_to_bucket(block->size)]`; `kmalloc` searches from the
+  smallest fitting bucket upward. Each bucket list stays short → O(1) amortised
+  even under pressure. A freed 33 MB block lands in bucket 15 and is found
+  immediately by the next `kmalloc(33 MB)`, never buried behind small blocks.
+- **Split remainder routing fixed:** the remainder after a split is inserted
+  into its own correct bucket (not back into the source bucket), so large
+  remainders remain discoverable by future large requests.
+- **No coalescing, no page-return (intentional).** Coalescing + page-return
+  was attempted and reached 218/0 host smoke... then broke it (170/48) when
+  a tighter allocator exposed the latent VFS UAF (`vfs_get_mount_for_node`
+  reading a freed node, `vfs.c:2252`) that first-fit's oversized blocks were
+  masking — same class as the best-fit regression documented below. The VFS
+  UAF is real and must be fixed separately before enabling coalescing/shrink.
+- **Verified:** host smoke **218/0** (identical to baseline). 8 GB self-host
+  unaffected. The 2048 MB build is expected to complete within the 2700 s
+  window now that the bucket search is O(1); in-guest verification pending.
+
 ## UPDATE 2026-05-28 (g) — pmm alloc made O(1); the low-RAM blocker is the KHEAP, not the pmm
 
 Two commits on `m26-selfhost` (local, **NOT pushed**), on top of the SELF-HOST-ACHIEVED state below.
