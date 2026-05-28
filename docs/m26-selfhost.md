@@ -8,6 +8,101 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 (j) — 2048 MB #GP ROOT-CAUSED: ext4_vfs_mkdir never attached inode_info (NOT a heap UAF)
+
+The `#GP` that kills the **2048 MB + populated /persist** run (reported as crashes
+in `find_child` and `ext4_vfs_create`) is **NOT** the long-suspected "latent heap
+UAF/overlap". It is a **deterministic NULL-deref logic bug** in the ext4 driver.
+
+### Reproduction (important — why host smoke hides it)
+The bug only fires when `/ext4` is an **ext4-backed mount**, which requires a
+**virtio-blk** device. The recipe that reproduces:
+```
+qemu-system-x86_64 -cdrom build/x86/b1nix.iso -m 2048 \
+  -drive file=<populated root.ext4>,if=none,id=vblk0,format=raw \
+  -device virtio-blk-pci,drive=vblk0   (mounts at /persist; /ext4 also ext4-backed) \
+  -device ich9-ahci,... -device nvme,...   (SATA/NVMe ext4 images)
+```
+The **host `tests/smoke.sh` passes 218/0 at the QEMU default 128 MB** because it
+attaches **no virtio-blk** device, so `/ext4` is not ext4-mounted and
+`run_ext_stress("/ext4")` (EXT-STRESS, `kernel/user/programs.c`) **early-returns
+"not mounted"** — the buggy path never runs. RAM size is a red herring; the real
+variable is "is `/ext4` ext4-backed and does EXT-STRESS run on it".
+
+### Root cause (`kernel/fs/ext4.c`)
+`ext4_vfs_mkdir` created the directory on disk, committed the journal, and
+**returned without attaching the `ext4_inode_info` to the new VFS node**. Contrast
+`ext4_vfs_create`, which after commit does
+`find_child(dir,name)` → `ext4_setup_node(n,...)` → `vfs_node_put(n)`.
+`vfs_mkdir_at_internal` (`kernel/fs/vfs.c`) only **copies the parent's callbacks**
+onto the new dir node (`create_cb=ext4_vfs_create`, …) but cannot set the
+ext4-specific `inode->data` (the per-inode `{fs, inode_num}`), which stays **NULL**.
+
+So `mkdir /ext4/dir_i` then `create /ext4/dir_i/file_i` runs
+`ext4_vfs_create(dir=dir_i)` → `dir_info = dir->inode->data` = **NULL** →
+`fs = dir_info->fs` reads `*(NULL)` = garbage from identity-mapped low memory →
+`fs->jdev` faults → `#GP` (non-canonical) or, depending on layout, the garbage
+is reused elsewhere and faults later (hence the *varying* crash sites that looked
+like heap corruption).
+
+### Proof
+A diagnostic inode magic canary (set on `vfs_alloc_inode`, cleared on
+`vfs_free_inode`) + a guard in `ext4_vfs_create` printed, at EXT-STRESS iteration 0:
+```
+[EXT4-DIAG] create corrupt kind=4 inode=0xffffc0000099d570 magic=0x1a0de10c data=0x0 dir='dir_0' new='file_0'
+```
+`magic` is the **live** value → the directory inode is NOT freed (not a UAF). `data`
+is **NULL** → `inode_info` was never attached. Deterministic on the first ext4
+mkdir+create.
+
+### Fix (landed, minimal — `kernel/fs/ext4.c`)
+After `journal_commit_transaction` in `ext4_vfs_mkdir`, mirror `ext4_vfs_create`:
+```c
+struct vfs_node *n = find_child(dir, name);
+if (n) { ext4_setup_node(n, fs, new_ino, inode.i_mode); vfs_node_put(n); }
+```
+(The new dir node is already linked into `dir->first_child` before `mkdir_cb` is
+called, so `find_child` finds it.)
+
+### Open issue — M22 `ls /tmp` hang under the 2048 MB + /persist repro
+With the mkdir fix applied (and independently with two *other* kernel edits — a
+kheap write-after-free probe, and a page-cache invalidation experiment), the
+2048 MB + /persist run **hangs at M22 `ls -la /tmp`** (`kernel/fs/initramfs.c`
+shell, ~line 945 "M22-POLISH: after-status", last scheduled task `/bin/ls`). QEMU
+sits at **0 % CPU, state Ss** → guest **blocked/deadlocked**, not a busy loop.
+- The original committed kernel does **not** hang here (it reaches EXT-STRESS and
+  crashes per above).
+- The mkdir fix is **not executed before this point** (it's ext4; `/tmp` is tmpfs),
+  so it cannot be the direct cause. Two suspects, not yet disambiguated:
+  1. **layout-sensitivity** (cf. the documented TCC `.text` sensitivity) — any code
+     change shifts the kernel layout and trips a fragile address-dependent path;
+  2. **host contention** — multiple overlapping QEMU instances were running during
+     testing (now all killed); virtio/SATA I/O completion can stall a guest under
+     host load → deadlock waiting on I/O.
+- **Next step:** one clean, isolated run (no other QEMU running) of the mkdir-fixed
+  kernel to determine whether the M22 hang is real or was a test-harness artifact.
+
+### Other real bugs found while investigating (NOT yet landed — separate fixes)
+1. **Page cache holds dangling `vfs_inode*`** (`kernel/mm/page_cache.c`): entries
+   key on a raw inode pointer with **no inode reference**, and `vfs_inode_put` frees
+   inodes **without purging the cache**. A recycled inode at the same address
+   aliases stale frames. A fix (`page_cache_invalidate_inode` called from
+   `vfs_inode_put`) works but **walks the whole LRU per inode free → O(N·M)** and
+   regresses to a near-hang under the large /persist cache. Needs a cheaper design
+   (per-inode page list, or guard to file inodes that actually use the cache).
+2. **`vfs_link` hard-link inode refcount imbalance** (`kernel/fs/vfs.c` ~2633):
+   shares `target_node->inode` across two nodes but never `vfs_inode_get()`s it.
+   Risky to "just add" because the refcount model is inconsistent
+   (`vfs_create_node` sets `inode->refcount=1`; the lazy `add_node` path uses 0).
+   EXT-STRESS hammers `SYS_LINK`, so this needs a deliberate refcount-model pass.
+3. **`ext4_inode_info` leak** (`kernel/fs/ext4.c`): `ext4_setup_node` `kmalloc`s the
+   `{fs,inode_num}` struct but never sets `VFS_NODE_OWNS_DATA`, and
+   `ext4_vfs_release` does not free it → leaked on every ext4 inode destruction;
+   `ext4_setup_node` called twice on a node also leaks the first allocation.
+4. **kheap split orphan** (`kernel/mm/kheap.c`): in the segregated-list split, when
+   the source block is the bucket **head** and the remainder maps to the **same
+   bucket**, the remainder is orphaned (leaked). Harmless (no overlap), small leak.
+
 ## UPDATE 2026-05-28 (i) — VFS sibling-list UAF fixed in vfs_list + vfs_getdents
 
 **`kernel/fs/vfs.c`** — two sibling-list walkers were missing interrupt-disable

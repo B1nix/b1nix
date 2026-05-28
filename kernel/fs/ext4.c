@@ -533,6 +533,15 @@ static int ext4_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     ext4_write_inode_tx(fs, h, dir_info->inode_num, &di);
   }
   if (h) journal_commit_transaction(h);
+  /* Attach the ext4 inode_info to the freshly-created VFS directory node, the
+   * same way ext4_vfs_create does for files. Without this the node's
+   * inode->data stays NULL and any later op on the directory (e.g. creating a
+   * file inside it) dereferences NULL. */
+  struct vfs_node *n = find_child(dir, name);
+  if (n) {
+    ext4_setup_node(n, fs, new_ino, inode.i_mode);
+    vfs_node_put(n);
+  }
   return 0;
 }
 
