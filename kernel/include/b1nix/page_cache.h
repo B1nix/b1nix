@@ -35,10 +35,13 @@ void page_cache_mark_dirty(struct page_cache_entry *page);
 // Write back all dirty pages for the given inode.
 int page_cache_flush_inode(struct vfs_inode *inode);
 
+// Drop cached pages for an inode that is being destroyed.
+void page_cache_invalidate_inode(struct vfs_inode *inode);
+
 // Decrease refcount. If 0, page is eligible for eviction (stays in cache).
 void page_cache_put_page(struct page_cache_entry *page);
 
-// Evicts some unused pages (writes back dirty pages).
-int page_cache_evict(void);
+// Evicts up to target_pages unused clean pages.
+usize page_cache_evict(usize target_pages);
 
 #endif

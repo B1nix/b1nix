@@ -8,6 +8,60 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 (k) — Page-cache reclaim now targets need; 2048 MB blocker is kheap high-water/page-return
+
+The old low-RAM reclaim path was misleading: `pmm_alloc_frames()` hit OOM,
+called `page_cache_evict()`, and the page cache always evicted **at most 16**
+clean pages. At 2048 MB this produced thousands of tiny reclaim rounds:
+`pc_evict evicted=16 free_frames=16`, immediately consumed by the current `cc1`
+allocation. That looked like a deadlock but was really reclaim thrash.
+
+### Landed changes
+- `page_cache_evict()` now takes a `target_pages` argument instead of using the
+  hard-coded 16-page batch.
+- `pmm_alloc_frames()` computes the reclaim target from the current allocation
+  request plus a dynamic low-watermark derived from total RAM. On the 2048 MB
+  repro this gives `target=1023`, so reclaim amortizes work instead of freeing
+  one tiny batch at a time.
+- `page_cache_invalidate_inode()` is now called when an unlinked VFS inode is
+  destroyed, preventing page-cache entries from retaining a dangling
+  `vfs_inode *`.
+- M26 diagnostics were added around PMM reclaim, page-cache eviction/invalidate,
+  and large kheap growth. The `kheap_dump_large_allocs()` OOM diagnostic now
+  avoids taking `heap_lock` recursively when OOM is reached from `heap_grow()`;
+  before this, the diagnostic path could silently spin instead of printing the
+  real OOM.
+
+### 2048 MB result
+Latest targeted run:
+`smoke_run/selfhost-2gb-targeted-reclaim-oomdiag.log`.
+
+The run reaches the same pressure point, `KBUILD 27 kernel_dev_virtio_gpu`, but
+the evidence is different:
+```
+[M26DIAG] pc_evict call=6 target=1023 evicted=1023 dirty_skipped=0 free_frames=1023
+...
+[M26DIAG] pc_evict call=22 target=1023 evicted=420 dirty_skipped=0 free_frames=420
+[M26DIAG] pc_evict call=23 target=1023 evicted=0 dirty_skipped=0 free_frames=0
+[OOMDIAG] Large allocation dump skipped: heap_lock held
+[M26DIAG] pmm_reclaim_failed ...
+```
+
+So the page cache is no longer the immediate batching bug: it frees large
+batches until it is exhausted. `dirty_skipped=0`, so dirty writeback is not the
+blocker, and swap is not active in this QEMU recipe (`M14-SMOKE: swap not active
+(no device)`). The remaining 2048 MB failure is genuine physical-memory
+exhaustion driven by **kheap high-water growth**: `heap_grow()` keeps mapping new
+pages for repeated large GCC/cc1/as allocations, while `kfree()` only returns
+blocks to heap free lists and never returns whole pages to the PMM.
+
+### Next step
+The next fix should be in kheap, not page-cache batch size: coalesce adjacent
+free blocks and return whole free pages/spans to the PMM, or introduce a
+separate reclaimable heap arena for transient ELF/user-image buffers. Keep the
+current diagnostics until that work is verified; they distinguish page-cache
+exhaustion from kheap high-water growth cleanly.
+
 ## UPDATE 2026-05-28 (j) — 2048 MB #GP ROOT-CAUSED: ext4_vfs_mkdir never attached inode_info (NOT a heap UAF)
 
 The `#GP` that kills the **2048 MB + populated /persist** run (reported as crashes
