@@ -585,6 +585,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       vma->next = current_task->vma_list;
       current_task->vma_list = vma;
     }
+
+    /* The segment is now resident in the user address space. Its staging
+     * buffer is never read again: fork clones the address space via COW page
+     * tables (it does not re-instantiate from segment->data), and execve
+     * builds a fresh image. Holding it would pin tens of MB per process for
+     * the image's whole lifetime (cc1's text segment alone is ~16MB), which
+     * is the dominant kheap leak that OOMs the in-guest self-host build. */
+    if (segment->data) {
+      kfree(segment->data);
+      segment->data = 0;
+    }
   }
 
   /* Initialize heap bounds based on the end of the highest segment */
