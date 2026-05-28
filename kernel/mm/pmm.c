@@ -18,8 +18,18 @@ struct pmm_state {
   u64 free_frames;
   usize bitmap_bytes;
   u8 *bitmap;
-  usize last_found_index;
   u16 *frame_refcounts;
+  /* O(1) single-frame allocator. free_list_head is an intrusive LIFO stack of
+   * free frames: each free frame's first 8 bytes (via the direct map) hold the
+   * next frame's physical address; 0 terminates (frame 0 is always reserved, so
+   * it is a safe sentinel). free_list_bitmap tracks which frames are currently
+   * linked so a push is idempotent: a frame taken by a contiguous bitmap scan
+   * stays linked (stale) until popped, and re-freeing it must not link it twice
+   * (which would create a cycle). The used-bitmap stays the source of truth for
+   * "free vs used"; a popped frame whose used-bit is set is stale and skipped. */
+  u64 free_list_head;
+  u8 *free_list_bitmap;
+  int free_list_ready;
 };
 
 static struct pmm_state pmm;
@@ -50,12 +60,56 @@ static void bitmap_clear(usize index) {
   pmm.bitmap[index / BITS_PER_BYTE] &= (u8) ~(1u << (index % BITS_PER_BYTE));
 }
 
+static int onlist_get(usize index) {
+  return (pmm.free_list_bitmap[index / BITS_PER_BYTE] &
+          (1u << (index % BITS_PER_BYTE))) != 0;
+}
+
+static void onlist_set(usize index) {
+  pmm.free_list_bitmap[index / BITS_PER_BYTE] |= (u8)(1u << (index % BITS_PER_BYTE));
+}
+
+static void onlist_clear(usize index) {
+  pmm.free_list_bitmap[index / BITS_PER_BYTE] &=
+      (u8) ~(1u << (index % BITS_PER_BYTE));
+}
+
+/* Link a frame onto the free stack. Idempotent: a frame already on the list is
+ * left untouched, so it can never be linked twice. Requires the direct map. */
+static void freelist_push(u64 frame) {
+  usize index = frame_index(frame);
+  if (onlist_get(index)) {
+    return;
+  }
+  *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pmm.free_list_head;
+  pmm.free_list_head = frame;
+  onlist_set(index);
+}
+
+/* Pop the next genuinely-free frame, discarding stale entries (frames that were
+ * linked but later taken by a contiguous bitmap scan). Returns 0 if empty. */
+static u64 freelist_pop(void) {
+  while (pmm.free_list_head != 0) {
+    u64 frame = pmm.free_list_head;
+    usize index = frame_index(frame);
+    pmm.free_list_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    onlist_clear(index);
+    if (!bitmap_get(index)) {
+      return frame;
+    }
+  }
+  return 0;
+}
+
 static void mark_frame_free(u64 frame) {
   usize index = frame_index(frame);
 
   if (bitmap_get(index)) {
     bitmap_clear(index);
     pmm.free_frames++;
+  }
+  if (pmm.free_list_ready) {
+    freelist_push(frame);
   }
 }
 
@@ -133,11 +187,18 @@ void pmm_init(const struct boot_info *boot_info) {
   pmm.bitmap_bytes = align_up_u64((frame_count + 7) / 8, PAGE_SIZE);
   usize refcounts_bytes = align_up_u64(frame_count * sizeof(u16), PAGE_SIZE);
 
-  u64 early_mem = find_early_mem(boot_info, pmm.bitmap_bytes + refcounts_bytes);
+  pmm.free_list_head = 0;
+  pmm.free_list_ready = 0;
+
+  u64 early_mem = find_early_mem(
+      boot_info, pmm.bitmap_bytes * 2 + refcounts_bytes);
   pmm.bitmap = (u8 *)(usize)early_mem;
-  pmm.frame_refcounts = (u16 *)(usize)(early_mem + pmm.bitmap_bytes);
+  pmm.free_list_bitmap = (u8 *)(usize)(early_mem + pmm.bitmap_bytes);
+  pmm.frame_refcounts =
+      (u16 *)(usize)(early_mem + pmm.bitmap_bytes * 2);
 
   memset(pmm.bitmap, 0xff, pmm.bitmap_bytes);
+  memset(pmm.free_list_bitmap, 0, pmm.bitmap_bytes);
   memset(pmm.frame_refcounts, 0, refcounts_bytes);
 
   console_write("pmm: kernel 0x");
@@ -192,6 +253,12 @@ void pmm_init(const struct boot_info *boot_info) {
     mark_frame_used(frame);
   }
 
+  for (u64 frame = (u64)(usize)pmm.free_list_bitmap;
+       frame < (u64)(usize)pmm.free_list_bitmap + pmm.bitmap_bytes;
+       frame += PAGE_SIZE) {
+    mark_frame_used(frame);
+  }
+
   for (u64 frame = (u64)(usize)pmm.frame_refcounts;
        frame < (u64)(usize)pmm.frame_refcounts + refcounts_bytes; frame += PAGE_SIZE) {
     mark_frame_used(frame);
@@ -202,8 +269,6 @@ void pmm_init(const struct boot_info *boot_info) {
   console_write("-0x");
   console_write_hex64((u64)(usize)pmm.bitmap + pmm.bitmap_bytes);
   console_write("\n");
-
-  pmm.last_found_index = 0;
 
   console_write("pmm: total usable bytes 0x");
   console_write_hex64(pmm.total_usable);
@@ -260,6 +325,61 @@ u16 pmm_get_refcount(u64 frame) {
 
 u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
 
+static void claim_frame(usize index) {
+  mark_frame_used(frame_from_index(index));
+  if (pmm.frame_refcounts) {
+    pmm.frame_refcounts[index] = 1;
+  }
+}
+
+static void zero_frames(u64 frame, usize count) {
+  void *ptr = (void *)(usize)frame;
+  if (direct_map_ready) {
+    ptr = (void *)(usize)(frame + DIRECT_MAP_BASE);
+  }
+  memset(ptr, 0, count * PAGE_SIZE);
+}
+
+/* Find the first run of `count` free frames, skipping whole all-used 64-bit
+ * bitmap words. Returns the run's base frame (claimed + zeroed), or 0. Used for
+ * contiguous (count>1) requests and as the count==1 fallback before the free
+ * list is built. Caller holds pmm_lock. */
+static u64 bitmap_scan_alloc(usize count) {
+  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+  if (count == 0 || count > frame_count) {
+    return 0;
+  }
+
+  const u64 *words = (const u64 *)pmm.bitmap;
+  usize run = 0;
+  usize run_start = 0;
+
+  for (usize idx = 0; idx < frame_count;) {
+    if ((idx % 64) == 0 && idx + 64 <= frame_count && words[idx / 64] == ~0ULL) {
+      run = 0;
+      idx += 64;
+      continue;
+    }
+    if (!bitmap_get(idx)) {
+      if (run == 0) {
+        run_start = idx;
+      }
+      if (++run >= count) {
+        for (usize j = 0; j < count; j++) {
+          claim_frame(run_start + j);
+        }
+        u64 frame = frame_from_index(run_start);
+        zero_frames(frame, count);
+        return frame;
+      }
+    } else {
+      run = 0;
+    }
+    idx++;
+  }
+  return 0;
+}
+
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
 
@@ -270,32 +390,29 @@ u64 pmm_alloc_frames(usize count) {
    * satisfies the request, makes progress by freeing >=1 frame, or gives up. */
   for (;;) {
     spin_lock_irqsave(&pmm_lock, &flags);
-    usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
 
-    for (usize i = 0; i < frame_count; i++) {
-      usize idx = (pmm.last_found_index + i) % (frame_count - count + 1);
-      int free = 1;
-      for (usize j = 0; j < count; j++) {
-        if (bitmap_get(idx + j)) {
-          free = 0;
-          break;
+    /* Single-frame fast path: pop the free-list stack in O(1). */
+    if (count == 1 && pmm.free_list_ready) {
+      u64 frame = freelist_pop();
+      if (frame != 0) {
+        claim_frame(frame_index(frame));
+        zero_frames(frame, 1);
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return frame;
+      }
+      /* List empty. If the bitmap still shows free frames, the list missed
+       * some (it must not): fall back to the authoritative scan. Skip the scan
+       * when nothing is free so the OOM path stays O(1) instead of O(N). */
+      if (pmm.free_frames > 0) {
+        frame = bitmap_scan_alloc(1);
+        if (frame != 0) {
+          spin_unlock_irqrestore(&pmm_lock, flags);
+          return frame;
         }
       }
-      if (free) {
-        u64 frame = frame_from_index(idx);
-        for (usize j = 0; j < count; j++) {
-          u64 f = frame_from_index(idx + j);
-          mark_frame_used(f);
-          if (pmm.frame_refcounts) {
-            pmm.frame_refcounts[idx + j] = 1; // Critical: Set initial refcount to 1
-          }
-        }
-        pmm.last_found_index = (idx + count) % frame_count;
-        void *ptr = (void *)(usize)frame;
-        if (direct_map_ready) {
-          ptr = (void *)(usize)(frame + vmm_direct_map_base());
-        }
-        memset(ptr, 0, count * PAGE_SIZE);
+    } else {
+      u64 frame = bitmap_scan_alloc(count);
+      if (frame != 0) {
         spin_unlock_irqrestore(&pmm_lock, flags);
         return frame;
       }
@@ -338,7 +455,25 @@ void pmm_switch_to_direct_map(void) {
   if (pmm.bitmap) {
     pmm.bitmap = (u8 *)((u64)(usize)pmm.bitmap + DIRECT_MAP_BASE);
   }
+  if (pmm.free_list_bitmap) {
+    pmm.free_list_bitmap =
+        (u8 *)((u64)(usize)pmm.free_list_bitmap + DIRECT_MAP_BASE);
+  }
   if (pmm.frame_refcounts) {
     pmm.frame_refcounts = (u16 *)((u64)(usize)pmm.frame_refcounts + DIRECT_MAP_BASE);
   }
+
+  /* The direct map now exists, so free frames can hold the intrusive list link.
+   * Seed the stack with every currently-free frame (one-time O(frame_count)
+   * walk); from here on alloc/free maintain it incrementally. */
+  u64 flags;
+  spin_lock_irqsave(&pmm_lock, &flags);
+  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+  for (usize idx = 0; idx < frame_count; idx++) {
+    if (!bitmap_get(idx)) {
+      freelist_push(frame_from_index(idx));
+    }
+  }
+  pmm.free_list_ready = 1;
+  spin_unlock_irqrestore(&pmm_lock, flags);
 }
