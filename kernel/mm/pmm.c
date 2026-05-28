@@ -1,6 +1,8 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
+#include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/arch.h>
 #include <string.h>
@@ -34,6 +36,38 @@ struct pmm_state {
 
 static struct pmm_state pmm;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
+
+static void m26_diag_task(void) {
+  if (current_task && current_task->name) {
+    console_write(" task=");
+    console_write(current_task->name);
+    console_write(" pid=");
+    console_write_dec(current_task->id);
+  }
+}
+
+static int is_power_of_two_u64(u64 value) {
+  return value && ((value & (value - 1)) == 0);
+}
+
+static usize pmm_reclaim_target_frames(usize count, u64 free_snapshot) {
+  usize needed = count;
+  if (free_snapshot < count)
+    needed = count - (usize)free_snapshot;
+
+  usize total_frames = (usize)(pmm.total_usable / PAGE_SIZE);
+  usize low_watermark = total_frames / 512;
+  if (low_watermark < count)
+    low_watermark = count;
+
+  if (free_snapshot < low_watermark) {
+    usize watermark_needed = low_watermark - (usize)free_snapshot;
+    if (watermark_needed > needed)
+      needed = watermark_needed;
+  }
+
+  return needed ? needed : 1;
+}
 
 static u64 align_up_u64(u64 value, u64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
@@ -382,6 +416,7 @@ static u64 bitmap_scan_alloc(usize count) {
 
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
+  static u64 reclaim_attempts;
 
   /* Retry via an explicit loop, never by recursion. Under memory pressure the
    * recovery path can run many eviction rounds; a tail-recursive retry would
@@ -389,6 +424,7 @@ u64 pmm_alloc_frames(usize count) {
    * cause of the in-guest-build wedge at low RAM). Each iteration either
    * satisfies the request, makes progress by freeing >=1 frame, or gives up. */
   for (;;) {
+    u64 free_snapshot = 0;
     spin_lock_irqsave(&pmm_lock, &flags);
 
     /* Single-frame fast path: pop the free-list stack in O(1). */
@@ -418,11 +454,24 @@ u64 pmm_alloc_frames(usize count) {
       }
     }
 
+    free_snapshot = pmm.free_frames;
     spin_unlock_irqrestore(&pmm_lock, flags);
 
     // OOM. Reclaim and retry. Try evicting clean page-cache pages first.
-    extern int page_cache_evict(void);
-    if (page_cache_evict() > 0) {
+    reclaim_attempts++;
+    if (reclaim_attempts <= 16 || is_power_of_two_u64(reclaim_attempts)) {
+      console_write("[M26DIAG] pmm_reclaim attempt=");
+      console_write_dec(reclaim_attempts);
+      console_write(" count=");
+      console_write_dec(count);
+      console_write(" free_frames=");
+      console_write_dec(free_snapshot);
+      m26_diag_task();
+      console_write("\n");
+    }
+    usize reclaim_target = pmm_reclaim_target_frames(count, free_snapshot);
+    usize pc_evicted = page_cache_evict(reclaim_target);
+    if (pc_evicted > 0) {
       continue;
     }
 
@@ -432,6 +481,10 @@ u64 pmm_alloc_frames(usize count) {
       extern u64 swap_evict_page(void);
       u64 evicted_frame = swap_evict_page();
       if (evicted_frame != 0) {
+        console_write("[M26DIAG] swap_evict frame=0x");
+        console_write_hex64(evicted_frame);
+        m26_diag_task();
+        console_write("\n");
         pmm_free_frame(evicted_frame);
         continue;
       }
@@ -440,6 +493,10 @@ u64 pmm_alloc_frames(usize count) {
     // Nothing left to reclaim — genuinely out of memory.
     extern void kheap_dump_large_allocs(void);
     kheap_dump_large_allocs();
+    console_write("[M26DIAG] pmm_reclaim_failed count=");
+    console_write_dec(count);
+    m26_diag_task();
+    console_write("\n");
     klog_warn("pmm: out of contiguous physical memory");
     return 0;
   }

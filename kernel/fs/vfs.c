@@ -733,6 +733,7 @@ void vfs_inode_put(struct vfs_inode *inode) {
     return;
   if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
       inode->nlink == 0) {
+    page_cache_invalidate_inode(inode);
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }

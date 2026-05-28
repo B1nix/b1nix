@@ -1,6 +1,7 @@
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
+#include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <string.h>
 
@@ -50,6 +51,19 @@ static struct kheap_state heap;
 static struct kheap_block *free_lists[NBUCKETS];
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
+static int is_power_of_two_u64(u64 value) {
+  return value && ((value & (value - 1)) == 0);
+}
+
+static void m26_diag_task(void) {
+  if (current_task && current_task->name) {
+    console_write(" task=");
+    console_write(current_task->name);
+    console_write(" pid=");
+    console_write_dec(current_task->id);
+  }
+}
+
 /* Return the bucket index for a block with the given payload size. */
 static int size_to_bucket(usize size) {
   for (int i = 0; i < NBUCKETS - 1; i++) {
@@ -92,6 +106,11 @@ static void track_free(u64 addr) {
 
 void kheap_dump_large_allocs(void) {
   u64 flags;
+  if (spin_is_locked(&heap_lock)) {
+    console_write("[OOMDIAG] Large allocation dump skipped: heap_lock held\n");
+    return;
+  }
+
   spin_lock_irqsave(&heap_lock, &flags);
   console_write("[OOMDIAG] Large allocations (>= 1MB):\n");
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
@@ -117,7 +136,24 @@ static int is_canonical_addr(u64 addr) {
 }
 
 static void heap_grow(usize minimum_bytes) {
+  static u64 grow_calls;
   usize pages = (minimum_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+  grow_calls++;
+
+  if (minimum_bytes >= 1024 * 1024 || is_power_of_two_u64(grow_calls)) {
+    console_write("[M26DIAG] kheap_grow call=");
+    console_write_dec(grow_calls);
+    console_write(" bytes=");
+    console_write_dec(minimum_bytes);
+    console_write(" pages=");
+    console_write_dec(pages);
+    console_write(" heap_end=0x");
+    console_write_hex64(heap.end);
+    console_write(" free_frames=");
+    console_write_dec(pmm_free_frame_count());
+    m26_diag_task();
+    console_write("\n");
+  }
 
   for (usize i = 0; i < pages; i++) {
     u64 frame = pmm_alloc_frame();
