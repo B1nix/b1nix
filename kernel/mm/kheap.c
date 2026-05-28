@@ -160,7 +160,20 @@ static void *kmalloc_internal(usize size, u64 caller) {
         break;
       }
       if (block->size >= size) {
-        *prev = block->next;
+        /* Split off the remainder as its own free block when it is large enough
+         * to hold a header plus a minimal allocation; this stops internal
+         * fragmentation (a small alloc otherwise wastes the whole big block). */
+        if (block->size >= size + KHEAP_HEADER_SIZE + 16) {
+          struct kheap_block *rem =
+              (struct kheap_block *)((u8 *)block + KHEAP_HEADER_SIZE + size);
+          rem->size = block->size - size - KHEAP_HEADER_SIZE;
+          rem->next = block->next;
+          rem->magic = KHEAP_FREED_MAGIC;
+          *prev = rem;
+          block->size = size;
+        } else {
+          *prev = block->next;
+        }
         block->next = 0;
         block->magic = KHEAP_MAGIC;
         void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
@@ -187,7 +200,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
   block->size = size;
   block->next = 0;
   block->magic = KHEAP_MAGIC;
-  
+
   void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
   track_alloc((u64)(usize)ptr, size, caller);
   spin_unlock_irqrestore(&heap_lock, flags);
