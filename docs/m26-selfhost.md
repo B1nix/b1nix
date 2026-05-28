@@ -8,6 +8,50 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 — SELF-HOST BUILD ACHIEVED (on native Fedora 43)
+
+The in-guest native GCC + binutils now build the **entire b1nix kernel**: all 76
+translation units compile and `ld` links a real `kernel.elf`.
+
+- **Verified, no fake pass.** `smoke_run/_fullbuild_8gb4.log`: 76 `gcc` driver
+  spawns, 76 `cc1` spawns, 1 `ld`, 76 distinct `KBUILD` steps, **zero**
+  compile/ICE/ld errors, and `ls -l /tmp/kernel.elf` = **1,577,080 bytes**
+  (smaller than the host's 2.1 MB only because `tools/inguest/build-kernel.sh`
+  omits `-g`). `sys_selfhost_status.can_build_kernel_inside_b1nix` is now `1`.
+- **What unblocked it (three MM fixes, on top of e54a7a8's segment-buffer free):**
+  1. `DIRECT_MAP_SIZE` 4 GB → 8 GB (moved to `kernel/include/b1nix/mm.h`,
+     shared with the pmm). Lifts the old 4 GB usable-RAM cap.
+  2. `kernel/mm/pmm.c` `pmm_init` clamps both region loops to `DIRECT_MAP_SIZE`,
+     so the pmm never hands out a frame the direct map can't reach. (Without it,
+     `-m 8192` exposes RAM to ~9 GB and a frame at phys 8 GB faulted when
+     `memset` touched `frame + DIRECT_MAP_BASE` = `0xffff800200000000`.)
+  3. `kernel/arch/x86/paging.c` `alloc_page_table` guard now tracks
+     `DIRECT_MAP_SIZE` (was a stale hardcoded 4 GB that panicked once >4 GB
+     frames existed).
+- **Boot of the self-built kernel:** it boots and runs ~101 suite `ok` markers
+  (M11/M12/M14/M17/M22) then hits **one** page-fault panic (garbage `rip` =
+  corrupted control-flow target) in the M11 coreutils path. This is the known
+  **GCC-build codegen-sensitivity class** — a clang build from identical source
+  is 218/0 — and is tracked as a kernel-robustness issue, *separate* from the
+  self-host *build* capability.
+- **Reproduce:** `make root-image` (once) → `make ARCH=x86 iso` →
+  `python3 smoke_run/inguest_drive.py --cmds <(echo 'sh /persist/usr/src/b1nix/tools/inguest/build-kernel.sh') --log L --done KBUILD-DONE --ready "Welcome to b1nix shell" --timeout 2700 --ram 8192`.
+  Extract the artifact with `debugfs -R "dump /kernel-selfhost.elf out.elf" build/x86/root.ext4`.
+- **Environment:** development moved off Windows/WSL to native Fedora 43; the
+  cross+native toolchains were rebuilt from scratch there (`build/toolchain_build/`,
+  not `~/b1nix-toolchain`). The serial-driver harness was recreated as
+  `smoke_run/inguest_drive.py`. Host smoke remains **218/0** with all the above
+  MM changes.
+- **Still open:** the GCC-codegen crash above; the pmm OOM evict-retry livelock
+  (seen at 2048 MB, latent at 8 GB); the smoke suite can't run the full in-guest
+  build within its 120 s/TCG cap, so its honest marker stays `toolchain-ready`.
+
+The pre-2026-05-28 sections below are the original WSL-era handoff, kept for the
+debugging trail; their environment specifics (`/root/b1nix-toolchain`, `wsl`,
+Git-Bash) are obsolete.
+
+---
+
 ## 1. TL;DR — where we are
 
 - The cross **and** native GCC 13.2.0 + Binutils 2.41 toolchains build, including

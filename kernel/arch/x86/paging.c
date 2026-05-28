@@ -9,7 +9,8 @@
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
 #define HUGE_PAGE_FLAG (1ULL << 7)
-#define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
+/* DIRECT_MAP_SIZE is shared with the pmm via <b1nix/mm.h> (the pmm clamps
+ * usable RAM to it so no frame is ever allocated outside the direct map). */
 #define MMIO_MAP_BASE 0xffffa00000000000ULL
 #define MMIO_MAP_SIZE (512ULL * 1024ULL * 1024ULL)
 
@@ -88,8 +89,13 @@ static u64 *alloc_page_table(void) {
     panic("vmm: OOM during page table allocation");
   }
 
-  if (frame >= 0x100000000ULL) {
-    panic("vmm: page table allocated above 4GB during early boot");
+  /* Page tables are dereferenced via the direct map once it is ready
+   * (frame + DIRECT_MAP_BASE), so any frame below DIRECT_MAP_SIZE is
+   * reachable. Before the direct map exists, only the low 4GB identity
+   * window set up by the bootstrap (boot.S) is addressable. */
+  u64 reachable_limit = direct_map_ready ? DIRECT_MAP_SIZE : 0x100000000ULL;
+  if (frame >= reachable_limit) {
+    panic("vmm: page table frame beyond reachable map");
   }
 
   u64 *table = (u64 *)(usize)frame;

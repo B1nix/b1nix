@@ -269,7 +269,7 @@ diagnostics.
 - [x] `done` Add `SYS_SELFHOST_STATUS` and `/bin/selfhost` status reporting.
 - [x] `done` Cross-compile and port GCC specifically for `x86_64-b1nix`.
 - [x] `done` Port GNU Binutils (`as`, `ld`, `objcopy`, `ar`).
-- [ ] `planned` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC.
+- [x] `done` Achieve self-hosting: compile the B1NIX kernel inside B1NIX using ported GCC (all 76 TUs compiled + linked in-guest into a real `kernel.elf`, verified 2026-05-28). The self-built GCC kernel boots and runs most of the suite; a residual codegen-class crash remains (tracked separately).
 - [x] `done` Restructure syscall layers with formalized refcount tracking: documented REFCOUNT RULES, atomic refcount on all VFS nodes/inodes, vfs_handle_retain/close lifecycle, and per-inode read-write locks.
 - [x] `done` Formalize expected `errno` matrices for failed file operations, explicitly validating ELOOP (symlink depth), ENAMETOOLONG (path component limit), ENOTDIR (file-as-dir), EISDIR (write to dir), EROFS, and errno isolation across syscalls via /bin/m17-smoke smoke coverage.
 
@@ -411,7 +411,7 @@ diagnostics.
 - [x] `done` Build a target `libstdc++` for `x86_64-b1nix` (prerequisite for the native GCC port).
 - [x] `done` Run the native GCC inside B1NIX to compile C to an object file (`cc1` + `as`: `gcc -c` works in-guest). See [`docs/m26-selfhost.md`](m26-selfhost.md).
 - [x] `done` Build the B1NIX kernel with the ported GCC on the host (`make TOOLCHAIN=gcc`); the GCC-built kernel boots and passes M12/M13/M14/M15/M25/M16/M22.
-- [x] `partial` Build the B1NIX kernel inside B1NIX. Host GCC build works; in-guest build is still blocked by a GCC-codegen `#GP` in the fork path and the lack of an in-guest build driver — full handoff in [`docs/m26-selfhost.md`](m26-selfhost.md).
+- [x] `done` Build the B1NIX kernel inside B1NIX. The in-guest native GCC+ld compile all 76 kernel translation units and link a real `kernel.elf` (verified 2026-05-28: 76 cc1 + 1 ld spawns, 0 errors, 1,577,080-byte ELF; `smoke_run/_fullbuild_8gb4.log`). Required lifting the 4GB direct-map cap to 8GB and clamping the pmm to it so frames stay reachable (`DIRECT_MAP_SIZE`, `kernel/mm/pmm.c`, `kernel/arch/x86/paging.c`). The self-built (GCC) kernel boots and runs ~101 suite markers but still hits one codegen-class panic in the M11 coreutils path — a separate kernel-robustness issue (clang-built kernel from identical source is 218/0), not a build-capability gap. Full handoff in [`docs/m26-selfhost.md`](m26-selfhost.md).
 - [x] `partial` Add native `make`/assembler/linker workflow usable from the B1NIX shell. In-guest `as`+`ld` work by hand; `gcc`-driven linking needs `crtbegin`/`crtend` + a sysroot/prefix fix, and `nmake` is too limited to drive the real build.
 
 ## M27: Terminal OS Polish
