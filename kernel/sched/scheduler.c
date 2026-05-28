@@ -378,6 +378,12 @@ int scheduler_fork_current(void) {
     struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
     child_iframe->rax = 0;
 
+    console_write("FORK-USER-DEBUG: child_iframe->rip = 0x");
+    console_write_hex64(child_iframe->rip);
+    console_write(" child_iframe->rsp = 0x");
+    console_write_hex64(child_iframe->rsp);
+    console_write("\n");
+
     child->context.rsp = (u64)child_iframe - 16;
     child->context.rbp = current_rbp + stack_offset;
 

@@ -131,5 +131,6 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u6
 int syscall_copyin(void *dst, const void *user_src, usize size);
 int syscall_copyout(void *user_dst, const void *src, usize size);
 int syscall_copyinstr(char *dst, usize dst_size, const char *user_src);
+void free_kernel_array(char **k_array);
 
 #endif

@@ -54,6 +54,94 @@ static int run_cmd_stderr_to_file(const char *path, char *const argv[],
   return -1;
 }
 
+static void dump_elf(const char *path) {
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    marker("DUMP-ELF: fail open\n");
+    return;
+  }
+
+  struct {
+    unsigned char e_ident[16];
+    unsigned short e_type;
+    unsigned short e_machine;
+    unsigned int e_version;
+    unsigned long long e_entry;
+    unsigned long long e_phoff;
+    unsigned long long e_shoff;
+    unsigned int e_flags;
+    unsigned short e_ehsize;
+    unsigned short e_phentsize;
+    unsigned short e_phnum;
+    unsigned short e_shentsize;
+    unsigned short e_shnum;
+    unsigned short e_shstrndx;
+  } ehdr;
+
+  if (read(fd, &ehdr, sizeof(ehdr)) != sizeof(ehdr)) {
+    marker("DUMP-ELF: fail read ehdr\n");
+    close(fd);
+    return;
+  }
+
+  char buf[256];
+  snprintf(buf, sizeof(buf), "DUMP-ELF: entry=0x%llx phoff=0x%llx phnum=%u\n",
+           ehdr.e_entry, ehdr.e_phoff, (unsigned int)ehdr.e_phnum);
+  marker(buf);
+
+  // Read program headers to find offset of entry point
+  unsigned long long entry_offset = 0;
+  int found = 0;
+
+  for (int i = 0; i < ehdr.e_phnum; i++) {
+    struct {
+      unsigned int p_type;
+      unsigned int p_flags;
+      unsigned long long p_offset;
+      unsigned long long p_vaddr;
+      unsigned long long p_paddr;
+      unsigned long long p_filesz;
+      unsigned long long p_memsz;
+      unsigned long long p_align;
+    } phdr;
+
+    lseek(fd, ehdr.e_phoff + i * ehdr.e_phentsize, SEEK_SET);
+    if (read(fd, &phdr, sizeof(phdr)) == sizeof(phdr)) {
+      snprintf(buf, sizeof(buf), "DUMP-ELF: phdr[%d] type=%u vaddr=0x%llx offset=0x%llx filesz=0x%llx memsz=0x%llx\n",
+               i, phdr.p_type, phdr.p_vaddr, phdr.p_offset, phdr.p_filesz, phdr.p_memsz);
+      marker(buf);
+
+      if (phdr.p_type == 1 /* PT_LOAD */ &&
+          ehdr.e_entry >= phdr.p_vaddr &&
+          ehdr.e_entry < phdr.p_vaddr + phdr.p_filesz) {
+        entry_offset = phdr.p_offset + (ehdr.e_entry - phdr.p_vaddr);
+        found = 1;
+      }
+    }
+  }
+
+  if (found) {
+    snprintf(buf, sizeof(buf), "DUMP-ELF: entry file offset = 0x%llx\n", entry_offset);
+    marker(buf);
+
+    unsigned char code[64];
+    lseek(fd, entry_offset, SEEK_SET);
+    int n = read(fd, code, sizeof(code));
+    if (n > 0) {
+      marker("DUMP-ELF: code bytes:");
+      for (int i = 0; i < n; i++) {
+        snprintf(buf, sizeof(buf), " %02x", code[i]);
+        marker(buf);
+      }
+      marker("\n");
+    }
+  } else {
+    marker("DUMP-ELF: entry point not found in loadable segments\n");
+  }
+
+  close(fd);
+}
+
 int main(void) {
   marker("M25-SMOKE: start\n");
 
@@ -91,6 +179,8 @@ int main(void) {
     return 1;
   }
   marker("M25-SMOKE: ok compile-hello\n");
+
+  dump_elf("/tmp/hello");
 
   // 4. Run /tmp/hello
   char *hello_argv[] = {"hello", NULL};

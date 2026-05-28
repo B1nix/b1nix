@@ -85,8 +85,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   inst->vq.last_used_idx++;
 
   int ret = (virtio_blk_status == 0) ? (int)count : -1;
-  // Memory leaks here in a real OS since bump allocator cannot free, but fine
-  // for now
+  kfree(req);
   return ret;
 }
 

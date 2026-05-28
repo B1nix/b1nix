@@ -931,3 +931,9 @@ int system(const char *command) {
 	if (waitpid(pid, &status, 0) < 0) return -1;
 	return status;
 }
+
+__attribute__((weak)) void __register_frame_info(const void *begin, void *ob) {
+	(void)begin;
+	(void)ob;
+}
+

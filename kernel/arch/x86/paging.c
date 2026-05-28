@@ -486,10 +486,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   u64 pdpte = pdpt[pdpt_index(page_aligned)];
   if ((pdpte & VMM_PRESENT) == 0)
     return -1;
+  if (pdpte & HUGE_PAGE_FLAG)
+    return -1;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(page_aligned)];
   if ((pde & VMM_PRESENT) == 0)
+    return -1;
+  if (pde & HUGE_PAGE_FLAG)
     return -1;
 
   u64 *pt = table_from_entry(pde);
@@ -575,7 +579,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   // Case 2: Swapped page (custom bit stored in non-present entry)
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
     u64 new_frame = 0;
-    if (swap_in(page_aligned, &new_frame) < 0) {
+    if (swap_in(current_task->pml4_phys, page_aligned, &new_frame) < 0) {
       console_write("pf: swap in failed for 0x");
       console_write_hex64(page_aligned);
       console_write("\n");
@@ -767,10 +771,12 @@ void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(vaddr)];
   if (!(pdpte & VMM_PRESENT)) return;
+  if (pdpte & HUGE_PAGE_FLAG) return;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(vaddr)];
   if (!(pde & VMM_PRESENT)) return;
+  if (pde & HUGE_PAGE_FLAG) return;
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(vaddr)];
@@ -792,10 +798,12 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(vaddr)];
   if (!(pdpte & VMM_PRESENT)) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) return 0;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(vaddr)];
   if (!(pde & VMM_PRESENT)) return 0;
+  if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(vaddr)];
@@ -894,15 +902,15 @@ void paging_free_address_space(u64 pml4_phys) {
   console_write(" tables\n");
 }
 
-static void swap_in_recursive(u64 *table, int level, u64 base_addr) {
+static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phys) {
   if (level >= 3) {
     for (usize i = 0; i < 512; i++) {
       u64 entry = table[i];
       if (!(entry & VMM_PRESENT) && (entry & VMM_SWAPPED)) {
         u64 vaddr = base_addr + (i * PAGE_SIZE);
         u64 new_frame = 0;
-        extern int swap_in(u64 virtual_addr, u64 *out_physical_frame);
-        if (swap_in(vaddr, &new_frame) == 0) {
+        extern int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
+        if (swap_in(pml4_phys, vaddr, &new_frame) == 0) {
           u64 flags = VMM_PRESENT | VMM_WRITABLE;
           if (entry & VMM_USER) flags |= VMM_USER;
           if (entry & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
@@ -924,7 +932,7 @@ static void swap_in_recursive(u64 *table, int level, u64 base_addr) {
     if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
       u64 *child = table_from_entry(entry);
       u64 step = 1ULL << (12 + (3 - level) * 9);
-      swap_in_recursive(child, level + 1, base_addr + i * step);
+      swap_in_recursive(child, level + 1, base_addr + i * step, pml4_phys);
     }
   }
 }
@@ -934,7 +942,7 @@ void paging_swap_in_all_swapped(u64 pml4_phys) {
     return;
   }
   u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
-  swap_in_recursive(pml4, 0, 0);
+  swap_in_recursive(pml4, 0, 0, pml4_phys);
 }
 
 
