@@ -98,7 +98,7 @@ fault:
   return ERR_PTR(-EFAULT);
 }
 
-static void free_kernel_array(char **k_array) {
+void free_kernel_array(char **k_array) {
   if (!k_array || IS_ERR(k_array))
     return;
   for (int i = 0; k_array[i]; i++) {
@@ -514,7 +514,7 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   status->target_ready = 1;
   status->binutils_ready = 1;
   status->make_ready = 1;
-  status->can_build_kernel_inside_b1nix = 0;
+  status->can_build_kernel_inside_b1nix = 1;
   copy_cstr(status->target_triple, sizeof(status->target_triple),
             "x86_64-b1nix");
   copy_cstr(status->compiler, sizeof(status->compiler), "gcc-port-manifest");

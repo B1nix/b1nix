@@ -74,7 +74,7 @@ u64 swap_evict_page(void) {
         }
 
         // Evict!
-        if (swap_out(v, f) >= 0) {
+        if (swap_out(t->pml4_phys, v, f) >= 0) {
             extern void paging_mark_swapped(u64 pml4_phys, u64 vaddr);
             paging_mark_swapped(t->pml4_phys, v);
             

@@ -80,7 +80,7 @@ _start:
 	jz 3f
 	leaq __EH_FRAME_BEGIN__(%rip), %rdi
 	leaq __b1nix_eh_object(%rip), %rsi
-	call __register_frame_info
+	call *%rax
 3:
 
 	/* Run ELF .init_array constructors before main(). C++ static

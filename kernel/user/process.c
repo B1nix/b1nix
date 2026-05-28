@@ -307,6 +307,11 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
   image->entry = ehdr->e_entry;
+  console_write("ELF load: ");
+  console_write(path);
+  console_write(" entry=0x");
+  console_write_hex64(ehdr->e_entry);
+  console_write("\n");
   image->address_space = user_address_space_create();
 
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
@@ -765,6 +770,9 @@ int user_execve_current(const char *path, const char **argv,
   struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
   if (!image)
     return -1;
+
+  free_kernel_array((char **)argv);
+  free_kernel_array((char **)envp);
 
   vfs_close_on_exec();
 

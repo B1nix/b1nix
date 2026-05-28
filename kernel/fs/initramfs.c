@@ -15,6 +15,7 @@
 #include "../../build/x86/initramfs_m15_smoke.inc"
 #include "../../build/x86/initramfs_tcc_files.inc"
 #include "../../build/x86/initramfs_m25_smoke.inc"
+#include "../../build/x86/initramfs_m26_smoke.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -320,6 +321,8 @@ static const struct initramfs_file files[] = {
     {"/README", "initramfs is alive\n", 20, 0},
     {"/bin/m25-smoke", (const char *)vfs_m25_smoke_elf,
      sizeof(vfs_m25_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m26-smoke", (const char *)vfs_m26_smoke_elf,
+     sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
     TCC_INITRAMFS_FILES
 };
 

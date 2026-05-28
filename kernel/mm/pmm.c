@@ -301,6 +301,8 @@ u64 pmm_alloc_frames(usize count) {
     }
   }
 
+  extern void kheap_dump_large_allocs(void);
+  kheap_dump_large_allocs();
   klog_warn("pmm: out of contiguous physical memory");
   return 0;
 }

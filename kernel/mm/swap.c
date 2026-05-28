@@ -75,7 +75,7 @@ int swap_init(void)
             strcpy(ptr, "B1NIX Swap Smoke Test Pattern");
 
             u64 fake_vaddr = 0xDEADBEEF000ULL;
-            int slot = swap_out(fake_vaddr, test_frame);
+            int slot = swap_out(0, fake_vaddr, test_frame);
             if (slot >= 0) {
                 console_write("swap: page swap-out ok, slot=");
                 console_write_dec(slot);
@@ -84,7 +84,7 @@ int swap_init(void)
                 memset(ptr, 0, PAGE_SIZE);
 
                 u64 out_frame = 0;
-                if (swap_in(fake_vaddr, &out_frame) == 0 && out_frame != 0) {
+                if (swap_in(0, fake_vaddr, &out_frame) == 0 && out_frame != 0) {
                     char *out_ptr = (char *)(usize)(out_frame + direct_base);
                     if (strcmp(out_ptr, "B1NIX Swap Smoke Test Pattern") == 0) {
                         console_write("swap: page swap-in ok, verified data\n");
@@ -148,10 +148,8 @@ int swap_active(void)
     return swap_dev && swap_dev->write_blocks;
 }
 
-int swap_out(u64 virtual_addr, u64 physical_frame)
+int swap_out(u64 pml4_phys, u64 virtual_addr, u64 physical_frame)
 {
-    u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
-
     if (!swap_active()) {
         return -1;
     }
@@ -189,10 +187,8 @@ int swap_out(u64 virtual_addr, u64 physical_frame)
     return (int)slot;
 }
 
-int swap_in(u64 virtual_addr, u64 *out_physical_frame)
+int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame)
 {
-    u64 pml4_phys = current_task ? current_task->pml4_phys : 0;
-
     if (!swap_dev || !swap_dev->read_blocks) {
         return -1;
     }

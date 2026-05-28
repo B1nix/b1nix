@@ -97,7 +97,7 @@ void vmm_set_swap_device(struct block_device *dev);
 // Swap
 int swap_init(void);
 int swap_active(void);
-int swap_out(u64 virtual_addr, u64 physical_frame);
-int swap_in(u64 virtual_addr, u64 *out_physical_frame);
+int swap_out(u64 pml4_phys, u64 virtual_addr, u64 physical_frame);
+int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
 
 #endif

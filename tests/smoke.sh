@@ -316,6 +316,15 @@ check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double p
 check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
+# ── M26 Native Toolchain & Self-Host ──
+echo ""
+echo "[TEST] M26 Native C Toolchain & Self-Host..."
+check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
+check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
+check_output "$LOG" "M26-SMOKE: ok can-build-kernel" "selfhost kernel build capability is enabled"
+check_output "$LOG" "M26-SMOKE: done" "M26 smoke completes"
+
+
 # ── M16 User Space Applications & TUI ──
 echo ""
 echo "[TEST] M16 user space applications and TUI..."

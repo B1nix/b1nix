@@ -25,6 +25,56 @@ static struct kheap_state heap;
 static struct kheap_block *free_list;
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
+struct tracked_alloc {
+  u64 addr;
+  usize size;
+  u64 caller;
+};
+
+#define MAX_TRACKED_BLOCKS 1024
+static struct tracked_alloc tracked_blocks[MAX_TRACKED_BLOCKS];
+
+static void track_alloc(u64 addr, usize size, u64 caller) {
+  if (size < 1024 * 1024) return;
+  for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
+    if (tracked_blocks[i].addr == 0) {
+      tracked_blocks[i].addr = addr;
+      tracked_blocks[i].size = size;
+      tracked_blocks[i].caller = caller;
+      break;
+    }
+  }
+}
+
+static void track_free(u64 addr) {
+  for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
+    if (tracked_blocks[i].addr == addr) {
+      tracked_blocks[i].addr = 0;
+      tracked_blocks[i].size = 0;
+      tracked_blocks[i].caller = 0;
+      break;
+    }
+  }
+}
+
+void kheap_dump_large_allocs(void) {
+  u64 flags;
+  spin_lock_irqsave(&heap_lock, &flags);
+  console_write("[OOMDIAG] Large allocations (>= 1MB):\n");
+  for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
+    if (tracked_blocks[i].addr != 0) {
+      console_write("  Address: 0x");
+      console_write_hex64(tracked_blocks[i].addr);
+      console_write(" Size: ");
+      console_write_dec(tracked_blocks[i].size);
+      console_write(" Caller: 0x");
+      console_write_hex64(tracked_blocks[i].caller);
+      console_write("\n");
+    }
+  }
+  spin_unlock_irqrestore(&heap_lock, flags);
+}
+
 static u64 align_up_u64(u64 value, u64 alignment) {
   return (value + alignment - 1) & ~(alignment - 1);
 }
@@ -73,7 +123,8 @@ void kheap_validate(const char *func) {
   (void)func;
 }
 
-void *kmalloc(usize size) {
+
+static void *kmalloc_internal(usize size, u64 caller) {
   if (size == 0) {
     return 0;
   }
@@ -112,8 +163,10 @@ void *kmalloc(usize size) {
         *prev = block->next;
         block->next = 0;
         block->magic = KHEAP_MAGIC;
+        void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+        track_alloc((u64)(usize)ptr, size, caller);
         spin_unlock_irqrestore(&heap_lock, flags);
-        return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+        return ptr;
       }
       prev = &block->next;
       block = block->next;
@@ -135,18 +188,28 @@ void *kmalloc(usize size) {
   block->next = 0;
   block->magic = KHEAP_MAGIC;
   
+  void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+  track_alloc((u64)(usize)ptr, size, caller);
   spin_unlock_irqrestore(&heap_lock, flags);
-  return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+  return ptr;
 }
 
-void *kzalloc(usize size) {
-  void *ptr = kmalloc(size);
+void *kmalloc(usize size) {
+  return kmalloc_internal(size, (u64)__builtin_return_address(0));
+}
+
+static void *kzalloc_internal(usize size, u64 caller) {
+  void *ptr = kmalloc_internal(size, caller);
 
   if (ptr != 0) {
     memset(ptr, 0, size);
   }
 
   return ptr;
+}
+
+void *kzalloc(usize size) {
+  return kzalloc_internal(size, (u64)__builtin_return_address(0));
 }
 
 void kfree(void *ptr) {
@@ -177,6 +240,7 @@ void kfree(void *ptr) {
     return;
   }
 #endif
+  track_free((u64)(usize)ptr);
   block->magic = KHEAP_FREED_MAGIC;
   block->next = free_list;
   free_list = block;
