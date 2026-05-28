@@ -262,61 +262,70 @@ u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
 
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
-  spin_lock_irqsave(&pmm_lock, &flags);
-  usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
 
-  for (usize i = 0; i < frame_count; i++) {
-    usize idx = (pmm.last_found_index + i) % (frame_count - count + 1);
-    int free = 1;
-    for (usize j = 0; j < count; j++) {
-      if (bitmap_get(idx + j)) {
-        free = 0;
-        break;
-      }
-    }
-    if (free) {
-      u64 frame = frame_from_index(idx);
+  /* Retry via an explicit loop, never by recursion. Under memory pressure the
+   * recovery path can run many eviction rounds; a tail-recursive retry would
+   * add a stack frame per round and overflow the 16KB kernel stack (a likely
+   * cause of the in-guest-build wedge at low RAM). Each iteration either
+   * satisfies the request, makes progress by freeing >=1 frame, or gives up. */
+  for (;;) {
+    spin_lock_irqsave(&pmm_lock, &flags);
+    usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
+
+    for (usize i = 0; i < frame_count; i++) {
+      usize idx = (pmm.last_found_index + i) % (frame_count - count + 1);
+      int free = 1;
       for (usize j = 0; j < count; j++) {
-        u64 f = frame_from_index(idx + j);
-        mark_frame_used(f);
-        if (pmm.frame_refcounts) {
-          pmm.frame_refcounts[idx + j] = 1; // Critical: Set initial refcount to 1
+        if (bitmap_get(idx + j)) {
+          free = 0;
+          break;
         }
       }
-      pmm.last_found_index = (idx + count) % frame_count;
-      void *ptr = (void *)(usize)frame;
-      if (direct_map_ready) {
-        ptr = (void *)(usize)(frame + vmm_direct_map_base());
+      if (free) {
+        u64 frame = frame_from_index(idx);
+        for (usize j = 0; j < count; j++) {
+          u64 f = frame_from_index(idx + j);
+          mark_frame_used(f);
+          if (pmm.frame_refcounts) {
+            pmm.frame_refcounts[idx + j] = 1; // Critical: Set initial refcount to 1
+          }
+        }
+        pmm.last_found_index = (idx + count) % frame_count;
+        void *ptr = (void *)(usize)frame;
+        if (direct_map_ready) {
+          ptr = (void *)(usize)(frame + vmm_direct_map_base());
+        }
+        memset(ptr, 0, count * PAGE_SIZE);
+        spin_unlock_irqrestore(&pmm_lock, flags);
+        return frame;
       }
-      memset(ptr, 0, count * PAGE_SIZE);
-      spin_unlock_irqrestore(&pmm_lock, flags);
-      return frame;
     }
-  }
 
-  spin_unlock_irqrestore(&pmm_lock, flags);
+    spin_unlock_irqrestore(&pmm_lock, flags);
 
-  // If we reach here, we are OOM. Try to evict some page cache pages first!
-  extern int page_cache_evict(void);
-  if (page_cache_evict() > 0) {
-    return pmm_alloc_frames(count);
-  }
-
-  // If still OOM, try to evict a process page and try again.
-  extern int swap_active(void);
-  if (swap_active() && interrupts_enabled()) {
-    extern u64 swap_evict_page(void);
-    u64 evicted_frame = swap_evict_page();
-    if (evicted_frame != 0) {
-      pmm_free_frame(evicted_frame);
-      return pmm_alloc_frames(count);
+    // OOM. Reclaim and retry. Try evicting clean page-cache pages first.
+    extern int page_cache_evict(void);
+    if (page_cache_evict() > 0) {
+      continue;
     }
-  }
 
-  extern void kheap_dump_large_allocs(void);
-  kheap_dump_large_allocs();
-  klog_warn("pmm: out of contiguous physical memory");
-  return 0;
+    // Then try evicting a process page to swap.
+    extern int swap_active(void);
+    if (swap_active() && interrupts_enabled()) {
+      extern u64 swap_evict_page(void);
+      u64 evicted_frame = swap_evict_page();
+      if (evicted_frame != 0) {
+        pmm_free_frame(evicted_frame);
+        continue;
+      }
+    }
+
+    // Nothing left to reclaim — genuinely out of memory.
+    extern void kheap_dump_large_allocs(void);
+    kheap_dump_large_allocs();
+    klog_warn("pmm: out of contiguous physical memory");
+    return 0;
+  }
 }
 
 u64 pmm_total_usable_memory(void) { return pmm.total_usable; }
