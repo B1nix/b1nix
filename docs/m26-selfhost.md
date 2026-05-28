@@ -8,6 +8,79 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 (g) — pmm alloc made O(1); the low-RAM blocker is the KHEAP, not the pmm
+
+Two commits on `m26-selfhost` (local, **NOT pushed**), on top of the SELF-HOST-ACHIEVED state below.
+
+**`90b0b94` — pmm single-frame allocation is now O(1)** (`kernel/mm/pmm.c`).
+The old `pmm_alloc_frames` did an `O(total_frames)` bitmap scan **per allocation**
+(~500k frames at 2 GB, ~2.3M at 8 GB), run once per single-frame alloc and ~8200×
+per cc1 instantiate — the source of the documented "grinds to a near-halt at
+file 53" at 2048 MB.
+
+- Added an intrusive **LIFO free-list**: the next-pointer is stored in each free
+  frame's first 8 bytes via the direct map; `0` terminates (frame 0 is always
+  reserved → safe sentinel). The `count==1` path pops in O(1).
+- A per-frame **on-list bitmap** (`free_list_bitmap`, allocated next to the
+  used-bitmap + refcounts in `find_early_mem`, sized = `bitmap_bytes`) makes
+  `freelist_push` **idempotent**: a frame grabbed by a contiguous bitmap scan
+  while still linked stays linked (stale) and is discarded on pop, and re-freeing
+  it does not link it twice (which would form a cycle).
+- The **used-bitmap stays the source of truth.** `count>1` and the `count==1`
+  fallback use a **word-skip scan** (skip all-used 64-bit words); a `count==1`
+  empty list with `free_frames>0` falls back to the scan. The list is seeded once
+  at the direct-map switch (`pmm_switch_to_direct_map`). Removed `last_found_index`.
+- **Verified:** host smoke 218/0; 8 GB in-guest self-host still builds an
+  **identical 1,577,080-byte `kernel.elf`**, ~42 s, no grind. At 2048 MB the full
+  76-step sequence now runs in ~112 s with no pmm grind.
+
+**`d34caac` — kheap splits free blocks on reuse** (`kernel/mm/kheap.c`).
+With the pmm grind gone, the 2048 MB build still OOMed (`[OOMDIAG] pmm count=1
+free_frames=0` = **genuine** exhaustion) at ~file 27, cc1 `.o`s missing → ld
+fails → no `/tmp/kernel.elf`. (NB: `tools/inguest/build-kernel.sh` prints
+`KBUILD-DONE` unconditionally, so it is **not** proof — always check
+`ls -l /tmp/kernel.elf` + zero compile errors.)
+
+Root cause, pinned with temporary live-bytes + per-caller kheap instrumentation
+(since reverted): at OOM `highwater≈2.0 GB, live_bytes≈1.99 GB` — i.e. genuinely
+allocated, mostly **wasted**. The kheap free-list reuse was **first-fit with no
+splitting**, so a small alloc consumed a whole large freed block (e.g. a freed
+33 MB ELF staging buffer) and wasted the remainder. Top wasters:
+`page_cache_add_page` (`page_cache.c:98`) **974 MB / 10 953 blocks ≈ 88 KB each
+for a ~64-byte struct**, `node_write` (`vfs.c:1925`) 528 MB, `pool_alloc`
+(`vfs_slab.c:36`) 227 MB, plus `kernel_strdup`/`copy_string_vector` getting
+MB-sized blocks for tiny strings.
+
+- **Fix:** split the remainder into its own free block when
+  `block->size >= size + KHEAP_HEADER_SIZE + 16`.
+- **Result:** in-guest live kheap drops **1.99 GB → ~57 MB**; the 2048 MB build
+  advances **file 27 → 58**. Host smoke 218/0; 8 GB unaffected (identical
+  `kernel.elf`, ~42 s).
+- **WARNING — do not retry best-fit naively.** A best-fit restructure (scan the
+  whole list, split via a saved `best_prev` after the loop) BROKE smoke
+  (49–145/x): tighter blocks expose a latent heap **UAF/overlap** that first-fit's
+  oversized blocks were masking — it surfaced as a `#GP`/`#PF` in
+  `user_image_free` reading a corrupted `image->segments[]`. The safe shape is
+  **first-fit + split** (return-in-loop, minimal delta from the known-good loop),
+  which is what shipped. The latent corruption bug is real but separate.
+
+**Still open — low-RAM (≤2048 MB) self-host needs a kheap redesign (Blair's MM).**
+Split alone is insufficient because the kheap:
+1. **never returns freed frames to the pmm** — `heap.end`/high-water only grows
+   (`heap_grow` maps pages; `kfree` only re-lists), so it still climbs to ~2 GB
+   under pressure even with live ≈ 57 MB;
+2. **first-fit can nibble** a large freed block with small allocs (`kfree`
+   prepends to head; small allocs hit it first and split it), so the next ~33 MB
+   cc1 segment can't reuse it → `heap_grow`;
+3. the **long fragmented free list** makes first-fit's head-scan slow under
+   pressure — the 2048 MB run **timed out at 2700 s at file 58** (was 112 s pre-split).
+
+Real fix: **coalescing + segregated free lists** (O(1), no nibble) + **return
+whole freed pages to the pmm**. The 8 GB path sidesteps all of this (no pressure →
+short list, no high-water blowup), so it is unaffected.
+
+---
+
 ## UPDATE 2026-05-28 — SELF-HOST BUILD ACHIEVED (on native Fedora 43)
 
 The in-guest native GCC + binutils now build the **entire b1nix kernel**: all 76
