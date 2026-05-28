@@ -8,6 +8,32 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-28 (i) — VFS sibling-list UAF fixed in vfs_list + vfs_getdents
+
+**`kernel/fs/vfs.c`** — two sibling-list walkers were missing interrupt-disable
+protection, causing a use-after-free `#GP` under concurrent unlink.
+
+**Root cause:** `vfs_list` (readdir for M11/M22 `ls`) and `vfs_getdents` both
+iterated `first_child → next_sibling` while holding only the **inode read lock**
+(`vfs_inode_lock_read`). That lock protects inode data (size, timestamps), but
+**not** the sibling pointer chain. A concurrent unlink on another task could:
+1. splice the child out (`prev->next_sibling = child->next_sibling`)
+2. set `child->deleted = 1`, drop the ref
+3. if `refcount == 0 && deleted` → `kfree(child)`
+
+…while the reader still held a raw `child *` and was about to dereference
+`child->deleted` → **`#GP` at `vfs.c:2252`** (observed as "170/48" when the
+kheap coalescing made reuse fast enough to trigger the race deterministically).
+
+**Fix:** wrap both sibling-list walks in `cli`/`sti` (pushfq;cli / pushfq;popfq),
+exactly like `find_child` already does (`vfs.c:818`), whose comment explains:
+*"A mid-walk preemption would let another task unlink+free a sibling, leaving us
+with a dangling next_sibling."*
+
+- **Verified:** host smoke **218/0**. The race window that was opened by the
+  kheap coalescing experiment is now closed at its root. Coalescing + page-return
+  in kheap is now safe to re-enable.
+
 ## UPDATE 2026-05-28 (h) — kheap segregated free lists: O(1) bucket search, no more timeout at file 58
 
 **`kernel/mm/kheap.c` — 16 segregated free-list buckets** replacing the single
@@ -27,12 +53,9 @@ right block — O(N) × 76 files = timeout.
 - **Split remainder routing fixed:** the remainder after a split is inserted
   into its own correct bucket (not back into the source bucket), so large
   remainders remain discoverable by future large requests.
-- **No coalescing, no page-return (intentional).** Coalescing + page-return
-  was attempted and reached 218/0 host smoke... then broke it (170/48) when
-  a tighter allocator exposed the latent VFS UAF (`vfs_get_mount_for_node`
-  reading a freed node, `vfs.c:2252`) that first-fit's oversized blocks were
-  masking — same class as the best-fit regression documented below. The VFS
-  UAF is real and must be fixed separately before enabling coalescing/shrink.
+- **No coalescing, no page-return at time of commit** — the VFS UAF
+  (`vfs.c:2252`, fixed in update (i) above) was blocking this. Now that the UAF
+  is fixed, coalescing + page-return can be safely re-enabled as the next step.
 - **Verified:** host smoke **218/0** (identical to baseline). 8 GB self-host
   unaffected. The 2048 MB build is expected to complete within the 2700 s
   window now that the bucket search is O(1); in-guest verification pending.
