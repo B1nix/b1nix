@@ -6,6 +6,10 @@
 
 #define PAGE_SIZE 4096ULL
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
+/* Physical memory below DIRECT_MAP_SIZE is identity-accessible via the direct
+ * map (phys + DIRECT_MAP_BASE). The pmm must never hand out a frame at or above
+ * this limit, and vmm_init maps exactly this range — keep the two in lockstep. */
+#define DIRECT_MAP_SIZE (8ULL * 1024ULL * 1024ULL * 1024ULL)
 #define KHEAP_START 0xffffc00000000000ULL
 
 #define VMM_PRESENT (1ULL << 0)

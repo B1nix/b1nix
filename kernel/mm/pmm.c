@@ -117,6 +117,13 @@ void pmm_init(const struct boot_info *boot_info) {
 
     u64 end = align_down_u64(region->base + region->length, PAGE_SIZE);
 
+    /* Only memory reachable through the direct map is usable: the kernel
+     * dereferences any frame as (frame + DIRECT_MAP_BASE), and that mapping
+     * exists only for [0, DIRECT_MAP_SIZE). RAM above the limit is dropped. */
+    if (end > DIRECT_MAP_SIZE) {
+      end = DIRECT_MAP_SIZE;
+    }
+
     if (end > pmm.max_address) {
       pmm.max_address = end;
     }
@@ -148,6 +155,11 @@ void pmm_init(const struct boot_info *boot_info) {
 
     u64 start = align_up_u64(region->base, PAGE_SIZE);
     u64 end = align_down_u64(region->base + region->length, PAGE_SIZE);
+
+    /* Drop RAM above the direct-map limit (see the max_address loop above). */
+    if (end > DIRECT_MAP_SIZE) {
+      end = DIRECT_MAP_SIZE;
+    }
 
     if (end <= start) {
       continue;

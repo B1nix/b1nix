@@ -20,7 +20,7 @@ AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 # self-host). CC/LD are assigned below, after CROSS_TOOLCHAIN_ROOT is known.
 TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
-GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
+GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
 
