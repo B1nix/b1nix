@@ -21,9 +21,42 @@ struct kheap_block {
 #define KHEAP_HEADER_SIZE 32
 #define KHEAP_REUSE_MIN_SIZE 0
 
+/* -----------------------------------------------------------------------
+ * Segregated free lists
+ *
+ * Instead of a single free_list (O(N) first-fit scan over ALL free blocks),
+ * we keep NBUCKETS separate singly-linked lists partitioned by payload size.
+ * kfree() places a block into the right bucket; kmalloc() first searches the
+ * smallest bucket that can satisfy the request, then falls through to larger
+ * buckets.  Each bucket's list is short → search stays O(1) amortised even
+ * under pressure with thousands of free blocks.
+ *
+ * The internal block structure, split-on-reuse logic, magic canaries, and
+ * bump allocator are unchanged from the known-good first-fit baseline.
+ * No coalescing, no page return — both are intentionally excluded to avoid
+ * exposing the latent VFS UAF bug documented in docs/m26-selfhost.md.
+ *
+ * Bucket i holds blocks with payload in (bucket_min[i-1], bucket_min[i]].
+ * Bucket NBUCKETS-1 is the catch-all for the largest blocks.
+ * -----------------------------------------------------------------------*/
+#define NBUCKETS 16
+/* Upper bound (inclusive) of each bucket's size class. */
+static const usize bucket_max[NBUCKETS] = {
+  32, 64, 128, 256, 512, 1024, 2048, 4096,
+  8192, 16384, 32768, 65536, 131072, 262144, 1048576, (usize)-1
+};
+
 static struct kheap_state heap;
-static struct kheap_block *free_list;
+static struct kheap_block *free_lists[NBUCKETS];
 static spinlock_t heap_lock = SPINLOCK_INIT;
+
+/* Return the bucket index for a block with the given payload size. */
+static int size_to_bucket(usize size) {
+  for (int i = 0; i < NBUCKETS - 1; i++) {
+    if (size <= bucket_max[i]) return i;
+  }
+  return NBUCKETS - 1;
+}
 
 struct tracked_alloc {
   u64 addr;
@@ -103,7 +136,7 @@ void kheap_init(void) {
   heap.base = KHEAP_START;
   heap.current = KHEAP_START;
   heap.end = KHEAP_START;
-  free_list = 0;
+  for (int i = 0; i < NBUCKETS; i++) free_lists[i] = 0;
   heap_grow(PAGE_SIZE);
 
   console_write("kheap: start 0x");
@@ -136,56 +169,71 @@ static void *kmalloc_internal(usize size, u64 caller) {
 
   size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
-  /* Free-list reuse is gated by a tunable minimum. At KHEAP_REUSE_MIN_SIZE == 0
-   * (reuse everything) the guard is unconditional; the #if keeps it meaningful
-   * for a non-zero threshold without a tautological always-true comparison. */
+
+  /* Search segregated buckets from the smallest that could fit `size`
+   * upward.  Each bucket list is short, so the scan stays fast even
+   * under pressure.  The logic inside each bucket is identical to the
+   * original first-fit + split: we walk the list, validate entries, and
+   * split large blocks to avoid internal fragmentation. */
 #if KHEAP_REUSE_MIN_SIZE > 0
   if (size >= KHEAP_REUSE_MIN_SIZE)
 #endif
   {
-    struct kheap_block **prev = &free_list;
-    block = free_list;
-    while (block) {
-      u64 bp = (u64)(usize)block;
-      /* Detect free-list corruption (UAF / buffer overflow into a freed
-       * neighbour). On corruption, sever the list here so we fall through to
-       * bump allocation instead of crashing in a #GP/#PF. */
-      if (!is_canonical_addr(bp) ||
-          (bp & 0xF) != 0 ||
-          bp < heap.base + KHEAP_HEADER_SIZE ||
-          bp + KHEAP_HEADER_SIZE > heap.end ||
-          block->magic != KHEAP_FREED_MAGIC) {
-        *prev = 0;
-        block = 0;
-        break;
-      }
-      if (block->size >= size) {
-        /* Split off the remainder as its own free block when it is large enough
-         * to hold a header plus a minimal allocation; this stops internal
-         * fragmentation (a small alloc otherwise wastes the whole big block). */
-        if (block->size >= size + KHEAP_HEADER_SIZE + 16) {
-          struct kheap_block *rem =
-              (struct kheap_block *)((u8 *)block + KHEAP_HEADER_SIZE + size);
-          rem->size = block->size - size - KHEAP_HEADER_SIZE;
-          rem->next = block->next;
-          rem->magic = KHEAP_FREED_MAGIC;
-          *prev = rem;
-          block->size = size;
-        } else {
-          *prev = block->next;
+    int start_bucket = size_to_bucket(size);
+    for (int bi = start_bucket; bi < NBUCKETS && !block; bi++) {
+      struct kheap_block **prev = &free_lists[bi];
+      struct kheap_block *b = free_lists[bi];
+      while (b) {
+        u64 bp = (u64)(usize)b;
+        /* Detect free-list corruption: sever the list on a bad entry. */
+        if (!is_canonical_addr(bp) ||
+            (bp & 0xF) != 0 ||
+            bp < heap.base + KHEAP_HEADER_SIZE ||
+            bp + KHEAP_HEADER_SIZE > heap.end ||
+            b->magic != KHEAP_FREED_MAGIC) {
+          *prev = 0;
+          b = 0;
+          break;
         }
-        block->next = 0;
-        block->magic = KHEAP_MAGIC;
-        void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
-        track_alloc((u64)(usize)ptr, size, caller);
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return ptr;
+        if (b->size >= size) {
+          /* Split off the remainder as its own free block when it is large
+           * enough to hold a header plus a minimal allocation; this stops
+           * internal fragmentation (a small alloc otherwise wastes the
+           * whole big block).  The remainder is inserted into its own
+           * bucket, not back into bi — ensures large remainders are
+           * findable by later large requests without a full-list walk. */
+          if (b->size >= size + KHEAP_HEADER_SIZE + 16) {
+            struct kheap_block *rem =
+                (struct kheap_block *)((u8 *)b + KHEAP_HEADER_SIZE + size);
+            rem->size = b->size - size - KHEAP_HEADER_SIZE;
+            rem->magic = KHEAP_FREED_MAGIC;
+            /* Link remainder into the correct bucket for its size. */
+            int rem_bkt = size_to_bucket(rem->size);
+            rem->next = free_lists[rem_bkt];
+            free_lists[rem_bkt] = rem;
+            b->size = size;
+          }
+          /* Unlink b from bucket bi. */
+          *prev = b->next;
+          b->next = 0;
+          b->magic = KHEAP_MAGIC;
+          block = b;
+          break;
+        }
+        prev = &b->next;
+        b = b->next;
       }
-      prev = &block->next;
-      block = block->next;
     }
   }
 
+  if (block) {
+    void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+    track_alloc((u64)(usize)ptr, block->size, caller);
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return ptr;
+  }
+
+  /* No suitable free block found — bump allocate. */
   u64 aligned_current = align_up_u64(heap.current, 16);
   u64 next = aligned_current + KHEAP_HEADER_SIZE + size;
 
@@ -235,7 +283,7 @@ void kfree(void *ptr) {
     if (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end)
       return;
   }
-  
+
   u64 flags;
   spin_lock_irqsave(&heap_lock, &flags);
 
@@ -255,10 +303,13 @@ void kfree(void *ptr) {
 #endif
   track_free((u64)(usize)ptr);
   block->magic = KHEAP_FREED_MAGIC;
-  block->next = free_list;
-  free_list = block;
-  
+  /* Insert into the appropriate size-class bucket instead of a global list.
+   * This prevents large freed blocks from being buried behind many small
+   * blocks, eliminating the O(N) scan that caused the 2048 MB timeout. */
+  int bkt = size_to_bucket(block->size);
+  block->next = free_lists[bkt];
+  free_lists[bkt] = block;
+
   kheap_validate("kfree_end");
   spin_unlock_irqrestore(&heap_lock, flags);
 }
-
