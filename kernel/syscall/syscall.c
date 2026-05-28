@@ -514,7 +514,8 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   status->target_ready = 1;
   status->binutils_ready = 1;
   status->make_ready = 1;
-  status->can_build_kernel_inside_b1nix = 1;
+  /* Only set to 1 once an in-guest kernel.elf actually builds (no fake pass). */
+  status->can_build_kernel_inside_b1nix = 0;
   copy_cstr(status->target_triple, sizeof(status->target_triple),
             "x86_64-b1nix");
   copy_cstr(status->compiler, sizeof(status->compiler), "gcc-port-manifest");
