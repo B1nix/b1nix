@@ -1858,6 +1858,94 @@ static int clear_main(int argc, const char **argv) {
   return 0;
 }
 
+/* ── login — look up a user in /etc/passwd, drop privileges, run their shell ──
+ * Password authentication is not implemented yet (passwd field is "x"). */
+static int login_lookup(const char *name, int *uid, int *gid, char *home,
+                        usize home_sz, char *shell, usize shell_sz) {
+  char buf[1024];
+  isize n = bb_read_file("/etc/passwd", buf, sizeof(buf));
+  if (n <= 0)
+    return 0;
+
+  char *line = buf;
+  while (line && *line) {
+    char *nl = strchr(line, '\n');
+    if (nl)
+      *nl = '\0';
+    if (line[0] && line[0] != '#') {
+      char *f[7];
+      int nf = 0;
+      char *p = line;
+      f[nf++] = p;
+      while (*p && nf < 7) {
+        if (*p == ':') {
+          *p = '\0';
+          f[nf++] = p + 1;
+        }
+        p++;
+      }
+      if (nf == 7 && strcmp(f[0], name) == 0) {
+        *uid = atoi(f[2]);
+        *gid = atoi(f[3]);
+        strncpy(home, f[5], home_sz - 1);
+        home[home_sz - 1] = '\0';
+        strncpy(shell, f[6], shell_sz - 1);
+        shell[shell_sz - 1] = '\0';
+        return 1;
+      }
+    }
+    line = nl ? nl + 1 : 0;
+  }
+  return 0;
+}
+
+static int login_main(int argc, const char **argv) {
+  char namebuf[64];
+  const char *name;
+
+  if (argc > 1) {
+    name = argv[1];
+  } else {
+    printf("login: ");
+    isize r = (isize)syscall_dispatch(SYS_READ, 0, (u64)(usize)namebuf,
+                                      sizeof(namebuf) - 1, 0, 0, 0);
+    if (r <= 0)
+      return 1;
+    while (r > 0 && (namebuf[r - 1] == '\n' || namebuf[r - 1] == '\r'))
+      r--;
+    namebuf[r] = '\0';
+    name = namebuf;
+  }
+
+  int uid = 0, gid = 0;
+  char home[128], shell[128];
+  if (!login_lookup(name, &uid, &gid, home, sizeof(home), shell,
+                    sizeof(shell))) {
+    printf("login: unknown user '%s'\n", name);
+    return 1;
+  }
+
+  if (syscall_dispatch(SYS_SETGID, (u64)gid, 0, 0, 0, 0, 0) != 0 ||
+      syscall_dispatch(SYS_SETUID, (u64)uid, 0, 0, 0, 0, 0) != 0) {
+    printf("login: cannot set credentials for '%s'\n", name);
+    return 1;
+  }
+  syscall_dispatch(SYS_CHDIR, (u64)(usize)home, 0, 0, 0, 0, 0);
+
+  const char *shell_argv[] = {shell, 0};
+  int pid = (int)syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if (pid == 0) {
+    syscall_dispatch(SYS_EXECVE, (u64)(usize)shell, (u64)(usize)shell_argv, 0, 0,
+                     0, 0);
+    syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
+  } else if (pid > 0) {
+    int status;
+    syscall_dispatch(SYS_WAITPID, (u64)pid, (u64)(usize)&status, 0, 0, 0, 0);
+    return (status >> 8) & 0xff;
+  }
+  return 1;
+}
+
 /* ═══════════════════════════════════════════════════════════════════
    NETWORK UTILITIES (M23)
    ═══════════════════════════════════════════════════════════════════ */
@@ -2237,6 +2325,7 @@ static struct bb_app bb_apps[] = {
     {"whoami", whoami_main},
     {"id", id_main},
     {"su", su_main},
+    {"login", login_main},
     {"clear", clear_main},
     {"reboot", reboot_main},
     {"poweroff", poweroff_main},

@@ -110,7 +110,42 @@ production init uses); smoke checks `M27-INIT: ok rc-script`. Host smoke
 **225/0**. The supervisor's respawn loop lives on the production path and isn't
 auto-exercised by the harness (which boots `b1nix.test=1` → reboots).
 
+## Users / passwords / login basics — DONE (2026-05-29)
+
+**`/etc/passwd`** ships in the initramfs with `root:x:0:0:...:/bin/sh` and
+`user:x:1000:1000:...:/home/user:/bin/sh` (password field `x` — no shadow db /
+password check yet). **libc `getpwnam`/`getpwuid`** (`userspace/libc/pwd.c`)
+now parse it line-by-line (returned `struct passwd` + strings in static
+storage, standard contract), falling back to a hardcoded `root` entry when the
+file is absent (keeps GNU Make's `~` expansion working).
+
+**`/bin/login`** (`login_main` in `kernel/user/busybox.c`) reads `/etc/passwd`
+kernel-side, prompts for a username (or takes it as `argv[1]`), drops
+privileges (`setgid`/`setuid`), `chdir`s to the home dir, and `fork`+`execve`s
+the user's login shell — modelled on the existing `su`. `init` launches it when
+`b1nix.login` is on the kernel command line.
+
+**Verification:** `userspace/bin/m27_smoke.c` (`M27-USER:` markers) checks
+`getpwnam("root")`/`getpwnam("user")`/`getpwuid(1000)`, NULL for an unknown
+user, and a `setgid`/`setuid` privilege drop to uid 1000 in a forked child
+(the exact sequence `login` performs). Host smoke **231/0**. The interactive
+`login` prompt itself is on the production path and isn't auto-tested, but its
+building blocks (passwd parse + privilege drop) are.
+
+## Fixed: ramfs `getdents` returned every-other entry + duplicates
+
+Adding the new `/bin` programs pushed `/bin` past one 32-entry `getdents`
+batch and exposed a real `readdir` bug in `kernel/fs/vfs.c`: the fallback
+ramfs readdir's skip used the running `offset`, which it also incremented while
+emitting, so after the initial skip it alternated skip/emit — returning every
+*other* entry and re-emitting already-seen ones on the next batch. It only ever
+"worked" for callers whose target landed on an even index. Rewrote the walk to
+use a separate absolute cursor (`idx`) vs the emitted `count`, so the resume
+position is exact and multi-batch directory reads are correct. (Surfaced as a
+spurious `M26-SMOKE: fail readdir` once `/bin` crossed 32 entries.) Also dropped
+three pre-existing unused static locks in vfs.c to keep the build warning-free.
+
 ## Remaining M27 items (planned)
 
-users/passwords/login · usage docs · no-graphics first-class · first-boot
-persistent-root setup · POSIX compatibility matrix.
+usage docs · no-graphics first-class · first-boot persistent-root setup ·
+POSIX compatibility matrix.

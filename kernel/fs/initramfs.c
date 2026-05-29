@@ -17,6 +17,7 @@
 #include "../../build/x86/initramfs_m25_smoke.inc"
 #include "../../build/x86/initramfs_m26_smoke.inc"
 #include "../../build/x86/initramfs_m24b_smoke.inc"
+#include "../../build/x86/initramfs_m27_smoke.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -59,6 +60,12 @@ static const char initramfs_fstab[] =
     "sata0         /mnt     ext2        noauto     0      0\n"
     "nvme0         /mnt     ext2        noauto     0      0\n"
     "nvme0         /btrfs   btrfs       noauto     0      0\n";
+
+/* User database. name:passwd:uid:gid:gecos:home:shell (passwd "x" = no shadow
+ * db; b1nix login does not check passwords yet). */
+static const char initramfs_passwd[] =
+    "root:x:0:0:root:/root:/bin/sh\n"
+    "user:x:1000:1000:b1nix user:/home/user:/bin/sh\n";
 
 /* Boot rc script: init runs this once at startup, before the login shell. */
 static const char initramfs_rc[] =
@@ -325,7 +332,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m15_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m24b-smoke", (const char *)vfs_m24b_smoke_elf,
      sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m27-smoke", (const char *)vfs_m27_smoke_elf,
+     sizeof(vfs_m27_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
+    {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,
