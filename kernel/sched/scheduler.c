@@ -215,11 +215,9 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
                                int stealable) {
   interrupts_disable();
   struct task *parent_task = current_task;
+  /* find_unused_task atomically claims the slot, marks it BLOCKED (reserved
+   * until fully initialized), and assigns its id. */
   struct task *task = find_unused_task();
-  if (task) {
-    task->id = next_task_id++;
-    task->state = TASK_BLOCKED; /* Reserve the slot until fully initialized. */
-  }
   interrupts_enable();
 
   if (task == 0) {
@@ -228,9 +226,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
 
   void *stack = kmalloc(KERNEL_STACK_SIZE);
   if (!stack) {
-    interrupts_disable();
-    task->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(task);
     return -1;
   }
 
@@ -242,9 +238,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
 
   task->name = strdup(name);
   if (!task->name) {
-    interrupts_disable();
-    task->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(task);
     kfree(stack);
     return -1;
   }
@@ -374,8 +368,8 @@ void sched_ap_reap_worker(struct task *t) {
     kfree((void *)t->name);
     t->name = 0;
   }
-  __asm__ volatile("" ::: "memory");
-  t->state = TASK_UNUSED;
+  /* Publish the kfrees and release the slot atomically vs find_unused_task. */
+  free_task_slot(t);
 }
 
 extern void x86_fork_child_trampoline(void);
@@ -396,21 +390,23 @@ int scheduler_fork_current(void) {
 
   interrupts_disable();
   struct task *child = find_unused_task();
+  interrupts_enable();
   if (!child) {
-    interrupts_enable();
     kfree(child_stack);
     return -1;
   }
+  /* find_unused_task assigned the id under g_tasks_lock; preserve it across the
+   * struct copy below (memcpy from the parent would otherwise clobber it). */
+  usize claimed_id = child->id;
 
   // 1. Copy the task structure
   memcpy(child, parent, sizeof(struct task));
-  child->id = next_task_id++;
+  child->id = claimed_id;
   child->parent_id = parent->id;
   child->state = TASK_BLOCKED;
   child->name = parent->name ? strdup(parent->name) : 0;
   if (parent->name && !child->name) {
-    child->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(child);
     kfree(child_stack);
     return -1;
   }
@@ -551,8 +547,8 @@ int scheduler_fork_current(void) {
     }
     kfree(child_stack);
     child->stack = 0;
-    child->state = TASK_UNUSED;
     interrupts_enable();
+    free_task_slot(child);
     return -1;
   }
   child->fd_lock = 0;
@@ -802,8 +798,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tasks[i].name = 0;
             }
             kfree(tasks[i].stack);
-            tasks[i].state = TASK_UNUSED;
             interrupts_enable();
+            free_task_slot(&tasks[i]);
             if (status) {
               if (code >= 128 && code < 128 + NSIG) {
                 /* Task was killed by a signal */
