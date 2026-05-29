@@ -8,7 +8,6 @@
 #include <b1nix/errno.h>
 #include <string.h>
 
-extern struct task *current_task;
 
 static int is_valid_user_code_ptr(u64 ptr) {
   if (ptr == 0)

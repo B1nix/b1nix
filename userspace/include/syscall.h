@@ -120,6 +120,7 @@ enum {
   SYS_IO_SUBMIT = 102,
   SYS_IO_GETEVENTS = 103,
   SYS_SIGPROCMASK = 104,
+  SYS_GETCPU   = 105,
 };
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */

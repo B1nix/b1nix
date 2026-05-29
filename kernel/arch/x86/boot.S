@@ -135,9 +135,13 @@ gdt64:
 	.quad 0x00affa000000ffff /* 0x20: User Code (Ring 3) */
 .global gdt64_tss
 gdt64_tss:
-	.quad 0 /* 0x28: TSS low descriptor, filled by arch.c */
-	.quad 0 /* 0x30: TSS high descriptor, filled by arch.c */
+	/* One 16-byte (2-quad) TSS descriptor per CPU, MAX_CPUS=16 slots. The BSP
+	 * uses selector 0x28; CPU k uses 0x28 + k*16. All filled in at runtime by
+	 * arch.c (x86_tss_init_cpu). Reserving them up front keeps every CPU's TSS
+	 * descriptor in the one shared GDT so APs can run ring 3. */
+	.fill 32, 8, 0
 gdt64_end:
+.global gdt64_pointer
 gdt64_pointer:
 	.word gdt64_end - gdt64 - 1
 	.quad gdt64
