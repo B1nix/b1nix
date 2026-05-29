@@ -521,73 +521,29 @@ static void *kmalloc_internal(usize size, u64 caller) {
 
   size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
-
-  /* Search segregated buckets from the smallest that could fit `size`
-   * upward.  Each bucket list is short, so the scan stays fast even
-   * under pressure.  The logic inside each bucket is identical to the
-   * original first-fit + split: we walk the list, validate entries, and
-   * split large blocks to avoid internal fragmentation. */
-#if KHEAP_REUSE_MIN_SIZE > 0
-  if (size >= KHEAP_REUSE_MIN_SIZE)
-#endif
-  {
-    int start_bucket = size_to_bucket(size);
-    for (int bi = start_bucket; bi < NBUCKETS && !block; bi++) {
-      struct kheap_block **prev = &free_lists[bi];
-      struct kheap_block *b = free_lists[bi];
-      while (b) {
-        u64 bp = (u64)(usize)b;
-        /* Detect free-list corruption: sever the list on a bad entry. */
-        if (!is_canonical_addr(bp) ||
-            (bp & 0xF) != 0 ||
-            bp < heap.base + KHEAP_HEADER_SIZE ||
-            bp + KHEAP_HEADER_SIZE > heap.end ||
-            b->magic != KHEAP_FREED_MAGIC) {
-          *prev = 0;
-          b = 0;
-          break;
-        }
-        if (b->size >= size) {
-          /* Unlink b before splitting: the remainder may land in the same
-           * bucket bi, and inserting it while b is still linked would corrupt
-           * the list (a later `*prev = b->next` could drop the remainder). */
-          *prev = b->next;
-          b->next = 0;
-
-          /* Split off the remainder as its own free block when it is large
-           * enough to hold a header plus a minimal allocation; this stops
-           * internal fragmentation (a small alloc otherwise wastes the
-           * whole big block).  The remainder is inserted into its own
-           * bucket, not back into bi — ensures large remainders are
-           * findable by later large requests without a full-list walk. */
-          if (b->size >= size + KHEAP_HEADER_SIZE + 16) {
-            struct kheap_block *rem =
-                (struct kheap_block *)((u8 *)b + KHEAP_HEADER_SIZE + size);
-            rem->size = b->size - size - KHEAP_HEADER_SIZE;
-            rem->prev_size = size;
-            rem->magic = KHEAP_FREED_MAGIC;
-            /* The block physically after rem (b's old successor) now has rem as
-             * its predecessor; keep its boundary tag in sync, or record rem as
-             * the new topmost block when b was the tail. */
-            struct kheap_block *after_rem =
-                (struct kheap_block *)((u8 *)rem + KHEAP_HEADER_SIZE + rem->size);
-            if ((u64)(usize)after_rem < heap.current) {
-              after_rem->prev_size = rem->size;
-            } else {
-              heap.last_block = rem;
-            }
-            /* Link remainder into the correct bucket for its size. */
-            int rem_bkt = size_to_bucket(rem->size);
-            rem->next = free_lists[rem_bkt];
-            free_lists[rem_bkt] = rem;
-            b->size = size;
-          }
-          b->magic = KHEAP_MAGIC;
-          block = b;
-          break;
-        }
-        prev = &b->next;
-        b = b->next;
+  if (size >= KHEAP_REUSE_MIN_SIZE) {
+    struct kheap_block **prev = &free_list;
+    block = free_list;
+    while (block) {
+      u64 bp = (u64)(usize)block;
+      /* Detect free-list corruption (UAF / buffer overflow into a freed
+       * neighbour). On corruption, sever the list here so we fall through to
+       * bump allocation instead of crashing in a #GP/#PF. */
+      if (!is_canonical_addr(bp) ||
+          (bp & 0xF) != 0 ||
+          bp < heap.base + KHEAP_HEADER_SIZE ||
+          bp + KHEAP_HEADER_SIZE > heap.end ||
+          block->magic != KHEAP_FREED_MAGIC) {
+        *prev = 0;
+        block = 0;
+        break;
+      }
+      if (block->size >= size) {
+        *prev = block->next;
+        block->next = 0;
+        block->magic = KHEAP_MAGIC;
+        spin_unlock_irqrestore(&heap_lock, flags);
+        return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
       }
     }
   }
