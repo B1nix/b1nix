@@ -1,0 +1,134 @@
+# In-guest kernel build, driven by GNU Make running INSIDE b1nix.
+#
+# Closes roadmap 416: a real Makefile (variables, pattern rules, automatic
+# variables, prerequisite/mtime tracking) replaces the flat, hand-unrolled
+# tools/inguest/build-kernel.sh. The ported GNU Make (tools/build-make.sh)
+# drives this exactly like make on any Unix.
+#
+# Invoke in-guest (rootfs mounted at /persist, source staged at
+# /persist/usr/src/b1nix, native toolchain at /persist/bin):
+#
+#   make -f /persist/usr/src/b1nix/tools/inguest/Makefile
+#
+# Output: $(KERNEL) (= /tmp/kernel.elf). Emits KBUILD-START / KBUILD-LINK /
+# KBUILD-DONE markers compatible with tools/inguest/run-build.py.
+#
+# Paths are overridable so the same Makefile works under other layouts:
+#   make -f Makefile SRC=. OBJDIR=./obj CC=gcc LD=ld KERNEL=./kernel.elf
+
+SRC     ?= /persist/usr/src/b1nix
+OBJDIR  ?= /tmp/kbuild
+CC      ?= /persist/bin/gcc
+LD      ?= /persist/bin/ld
+KERNEL  ?= /tmp/kernel.elf
+
+CFLAGS  := -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic \
+           -mno-red-zone -I$(SRC)/kernel/include -mcmodel=kernel \
+           -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 \
+           -T $(SRC)/kernel/arch/x86/linker.ld
+
+# Kernel translation units (relative to $(SRC)); .S files are assembled by the
+# gcc driver just like .c. Mirrors the x86 KERNEL_SOURCES of the host Makefile.
+SRCS := \
+  kernel/arch/x86/arch.c \
+  kernel/arch/x86/boot.S \
+  kernel/arch/x86/console.c \
+  kernel/arch/x86/context_switch.S \
+  kernel/arch/x86/fb_console.c \
+  kernel/arch/x86/fpu.S \
+  kernel/arch/x86/interrupts.c \
+  kernel/arch/x86/io.c \
+  kernel/arch/x86/isr.S \
+  kernel/arch/x86/lapic.c \
+  kernel/arch/x86/paging.c \
+  kernel/arch/x86/rtc.c \
+  kernel/arch/x86/serial.c \
+  kernel/arch/x86/signal.c \
+  kernel/arch/x86/syscall_entry.S \
+  kernel/arch/x86/user_jump.S \
+  kernel/bootinfo/multiboot2.c \
+  kernel/dev/ahci.c \
+  kernel/dev/blk.c \
+  kernel/dev/compositor.c \
+  kernel/dev/nvme.c \
+  kernel/dev/pci.c \
+  kernel/dev/ps2_kbd.c \
+  kernel/dev/ps2_mouse.c \
+  kernel/dev/video.c \
+  kernel/dev/virtio_blk.c \
+  kernel/dev/virtio_gpu.c \
+  kernel/dev/virtio.c \
+  kernel/fs/aio.c \
+  kernel/fs/btrfs.c \
+  kernel/fs/ext1.c \
+  kernel/fs/ext2.c \
+  kernel/fs/ext3.c \
+  kernel/fs/ext4.c \
+  kernel/fs/fat32.c \
+  kernel/fs/filelock.c \
+  kernel/fs/initramfs.c \
+  kernel/fs/journal.c \
+  kernel/fs/pipe.c \
+  kernel/fs/vfs.c \
+  kernel/fs/vfs_slab.c \
+  kernel/ipc/mqueue.c \
+  kernel/ipc/shm.c \
+  kernel/lib/klog.c \
+  kernel/lib/stdio.c \
+  kernel/lib/stdlib.c \
+  kernel/lib/string.c \
+  kernel/lib/unistd.c \
+  kernel/main.c \
+  kernel/mm/eviction.c \
+  kernel/mm/kheap.c \
+  kernel/mm/page_cache.c \
+  kernel/mm/pmm.c \
+  kernel/mm/swap.c \
+  kernel/net/arp.c \
+  kernel/net/dhcp.c \
+  kernel/net/dns.c \
+  kernel/net/ethernet.c \
+  kernel/net/icmp.c \
+  kernel/net/ipv4.c \
+  kernel/net/net.c \
+  kernel/net/socket.c \
+  kernel/net/tcp.c \
+  kernel/net/udp.c \
+  kernel/net/unix.c \
+  kernel/sched/runqueue.c \
+  kernel/sched/scheduler.c \
+  kernel/sched/uidgid.c \
+  kernel/syscall/syscall.c \
+  kernel/user/busybox.c \
+  kernel/user/editor.c \
+  kernel/user/mc.c \
+  kernel/user/process.c \
+  kernel/user/programs.c \
+  kernel/user/tui_common.c
+
+# Objects mirror the source tree under $(OBJDIR) (parallel directories), so the
+# two pattern rules below map each .o back to its .c/.S source unambiguously.
+OBJS := $(patsubst %,$(OBJDIR)/%.o,$(basename $(SRCS)))
+
+.PHONY: all clean
+all: $(KERNEL)
+
+$(OBJDIR)/%.o: $(SRC)/%.c
+	@mkdir -p $(dir $@)
+	@echo "KBUILD cc $*"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(OBJDIR)/%.o: $(SRC)/%.S
+	@mkdir -p $(dir $@)
+	@echo "KBUILD as $*"
+	$(CC) $(CFLAGS) -c $< -o $@
+
+$(KERNEL): $(OBJS)
+	@echo KBUILD-LINK
+	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	@echo KBUILD-LINK-DONE
+	@echo KBUILD-DONE
+
+clean:
+	rm -rf $(OBJDIR) $(KERNEL)

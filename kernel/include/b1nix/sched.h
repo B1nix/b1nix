@@ -164,6 +164,14 @@ struct task {
   int stop_report_pending;
   int continued_report_pending;
 
+  /* x86 FPU/SSE state. 512-byte FXSAVE area, 16-byte aligned for
+   * fxsave/fxrstor. Saved/restored across context switches so userspace
+   * XMM/MXCSR/x87 state survives scheduling (e.g. the native GCC's cc1).
+   * fpu_initialized is 0 until the task has run once; the first switch-in
+   * loads a clean FPU image instead of the uninitialized buffer. */
+  __attribute__((aligned(16))) u8 fpu_state[512];
+  int fpu_initialized;
+
   /* SMP runqueue linkage (must be last field for ABI compat) */
   struct task *next_run;
 };

@@ -14,13 +14,29 @@
 #include <string.h>
 
 #define MAX_TASKS 64
-#define KERNEL_STACK_SIZE (16 * 1024)
+/* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
+ * silently corrupts the adjacent heap block (e.g. a vfs_node) instead of
+ * faulting. b1nix runs the busybox coreutils builtins in kernel mode on this
+ * stack, and some have large on-stack buffers (uniq_main alone is ~12 KB:
+ * buf[8192] + lines[512]); together with the ~6.6 KB syscall dispatch frame
+ * and the VFS/ext4 call chain they exceed 16 KB. Keep this at >= 32 KB. */
+#define KERNEL_STACK_SIZE (32 * 1024)
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
 
 extern void arch_context_switch(struct cpu_context *old_context,
                                 struct cpu_context *new_context);
 extern char x86_syscall_stack_top[];
+
+/* x86 FPU/SSE save/restore (kernel/arch/x86/fpu.S). The kernel is -mno-sse, so
+ * the fxsave/fxrstor instructions live in assembly. */
+extern void arch_fpu_save(void *area);
+extern void arch_fpu_restore(void *area);
+extern void arch_fpu_capture_clean(void *area);
+
+/* Canonical clean FXSAVE image, loaded into tasks that have never run. */
+static __attribute__((aligned(16))) u8 g_clean_fpu[512];
+static int g_clean_fpu_ready = 0;
 
 static struct task tasks[MAX_TASKS];
 struct task *current_task;
@@ -289,16 +305,24 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
 extern void x86_fork_child_trampoline(void);
 
 int scheduler_fork_current(void) {
-  interrupts_disable();
   struct task *parent = current_task;
   if (!parent) {
-    interrupts_enable();
     return -1;
   }
 
+  extern void paging_swap_in_all_swapped(u64 pml4_phys);
+  paging_swap_in_all_swapped(parent->pml4_phys);
+
+  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
+  if (!child_stack) {
+    return -1;
+  }
+
+  interrupts_disable();
   struct task *child = find_unused_task();
   if (!child) {
     interrupts_enable();
+    kfree(child_stack);
     return -1;
   }
 
@@ -311,6 +335,7 @@ int scheduler_fork_current(void) {
   if (parent->name && !child->name) {
     child->state = TASK_UNUSED;
     interrupts_enable();
+    kfree(child_stack);
     return -1;
   }
 
@@ -326,22 +351,6 @@ int scheduler_fork_current(void) {
   child->continued_report_pending = 0;
   child->wake_tick = 0;
   child->wait_chan = 0;
-
-  // 2. Allocate and copy kernel stack
-  void *child_stack = kmalloc(KERNEL_STACK_SIZE);
-  if (!child_stack) {
-    if (child->user_image) {
-      user_image_free(child->user_image);
-      child->user_image = 0;
-    }
-    if (child->name) {
-      kfree((void *)child->name);
-      child->name = 0;
-    }
-    child->state = TASK_UNUSED;
-    interrupts_enable();
-    return -1;
-  }
 
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
@@ -375,6 +384,12 @@ int scheduler_fork_current(void) {
     struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
     child_iframe->rax = 0;
 
+    console_write("FORK-USER-DEBUG: child_iframe->rip = 0x");
+    console_write_hex64(child_iframe->rip);
+    console_write(" child_iframe->rsp = 0x");
+    console_write_hex64(child_iframe->rsp);
+    console_write("\n");
+
     child->context.rsp = (u64)child_iframe - 16;
     child->context.rbp = current_rbp + stack_offset;
 
@@ -384,11 +399,32 @@ int scheduler_fork_current(void) {
     child->context.rsp = current_rsp + stack_offset;
     child->context.rbp = current_rbp + stack_offset;
 
+    /* Relocate the entire saved frame-pointer chain into the child's copied
+     * stack. The kernel-fork trampoline resumes the child via leave/ret, which
+     * unwinds by following the rbp chain. memcpy duplicates the stack bytes but
+     * each saved rbp still points into the PARENT's stack; without fixing them
+     * the child would `leave` onto the parent's stack and clobber it (and read
+     * stale slots as return addresses). Walk the chain and rebase every saved
+     * rbp by stack_offset so the child unwinds entirely on its own stack. */
+    u64 clo = (u64)(usize)child_stack;
+    u64 chi = clo + KERNEL_STACK_SIZE;
+    u64 fp = child->context.rbp;
+    for (int i = 0; i < 64 && fp >= clo && fp + 16 <= chi; i++) {
+      u64 saved = *(u64 *)(usize)fp;
+      if (saved == 0)
+        break;
+      u64 reloc = saved + stack_offset;
+      if (reloc < clo || reloc + 16 > chi)
+        break;
+      *(u64 *)(usize)fp = reloc;
+      fp = reloc;
+    }
+
     child->context.rsp -= 8;
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }
 
-  // 3. Clone address space
+  // 3. Clone address space with interrupts disabled
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
 
   // 4. Clone VMAs
@@ -419,6 +455,12 @@ int scheduler_fork_current(void) {
       kfree(child->fd_table);
     if (child->fd_flags)
       kfree(child->fd_flags);
+    
+    extern void user_address_space_cleanup(struct task *t);
+    user_address_space_cleanup(child);
+    paging_free_address_space(child->pml4_phys);
+    child->pml4_phys = 0;
+
     if (child->cred) {
       cred_free(child->cred);
       child->cred = 0;
@@ -450,8 +492,13 @@ int scheduler_fork_current(void) {
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
+  console_write("scheduler_fork_current: done, child=");
+  console_write_dec(child_id);
+  console_write("\n");
   return child_id;
 }
+
+
 
 void scheduler_yield(void) {
   interrupts_disable();
@@ -483,6 +530,26 @@ void scheduler_yield(void) {
 
   paging_switch_address_space(new_task->pml4_phys);
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
+
+  /* Preserve userspace FPU/SSE/MXCSR/x87 across the switch. Save the outgoing
+   * task's live state, then load the incoming task's (or a clean image if it
+   * has never run). Without this, userspace XMM registers are clobbered by
+   * other tasks and FP-heavy programs (e.g. cc1) corrupt silently. */
+  arch_fpu_save(old_task->fpu_state);
+  old_task->fpu_initialized = 1;
+  if (!g_clean_fpu_ready) {
+    /* old_task's state is already saved above; capture_clean reinits the live
+     * FPU, which is fine since new_task's state is loaded immediately after. */
+    arch_fpu_capture_clean(g_clean_fpu);
+    g_clean_fpu_ready = 1;
+  }
+  if (new_task->fpu_initialized) {
+    arch_fpu_restore(new_task->fpu_state);
+  } else {
+    arch_fpu_restore(g_clean_fpu);
+    new_task->fpu_initialized = 1;
+  }
+
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
 }
@@ -575,11 +642,20 @@ void scheduler_on_timer_tick(void) {
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
 void scheduler_exit_current(int exit_code) {
-  interrupts_disable();
-
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
   }
+
+  /* Close all open file descriptors with interrupts enabled, so writebacks can sleep/block */
+  if (current_task->fd_table) {
+    for (usize i = 0; i < current_task->fd_capacity; i++) {
+      if (current_task->fd_table[i]) {
+        vfs_close((int)i);
+      }
+    }
+  }
+
+  interrupts_disable();
 
   /* Free credentials */
   if (current_task->cred) {
@@ -588,11 +664,6 @@ void scheduler_exit_current(int exit_code) {
   }
 
   if (current_task->fd_table) {
-    for (usize i = 0; i < current_task->fd_capacity; i++) {
-      if (current_task->fd_table[i]) {
-        vfs_handle_release(current_task->fd_table[i]);
-      }
-    }
     kfree(current_task->fd_table);
     kfree(current_task->fd_flags);
     current_task->fd_table = 0;
@@ -623,7 +694,14 @@ int scheduler_wait(usize pid, int *status) {
 
 int scheduler_waitpid(usize pid, int *status, int options) {
   if (current_task == 0)
-    return -1;
+    return -ECHILD;
+
+  /* pid 0 ("any child in my process group") and pid -1 ("any child", which
+   * arrives as (usize)-1 from a userspace waitpid(-1, ...)) both mean "reap any
+   * child" in b1nix's flat process model. GNU Make's reap_children() relies on
+   * waitpid(-1, &status, WNOHANG); without the -1 case it matched no task and
+   * the syscall's -1 return was mapped to EPERM by the libc. */
+  int wait_any = (pid == 0 || pid == (usize)-1);
 
   while (1) {
     interrupts_disable();
@@ -631,7 +709,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     for (usize i = 0; i < MAX_TASKS; i++) {
       if (tasks[i].state != TASK_UNUSED &&
           tasks[i].parent_id == current_task->id) {
-        if (pid == 0 || tasks[i].id == pid) {
+        if (wait_any || tasks[i].id == pid) {
           has_children = 1;
           if (tasks[i].state == TASK_DEAD) {
             int code = tasks[i].exit_code;
@@ -641,6 +719,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tasks[i].user_image = 0;
             }
             user_address_space_cleanup(&tasks[i]);
+            paging_free_address_space(tasks[i].pml4_phys);
+            tasks[i].pml4_phys = 0;
             if (tasks[i].name && strcmp(tasks[i].name, "boot") != 0) {
               kfree((void *)tasks[i].name);
               tasks[i].name = 0;
@@ -685,7 +765,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 
     if (!has_children) {
       interrupts_enable();
-      return -1;
+      return -ECHILD;
     }
 
     if (options & B1NIX_WNOHANG) {

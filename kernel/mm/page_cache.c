@@ -2,6 +2,8 @@
 #include <b1nix/vfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/errno.h>
+#include <b1nix/console.h>
+#include <b1nix/sched.h>
 #include <string.h>
 
 #define PC_HASH_SIZE 1024
@@ -11,6 +13,21 @@ static struct page_cache_entry *lru_head;
 static struct page_cache_entry *lru_tail;
 static volatile int pc_lock = 0;
 
+static struct page_cache_entry *to_free_list = 0;
+
+static int is_power_of_two_u64(u64 value) {
+  return value && ((value & (value - 1)) == 0);
+}
+
+static void m26_diag_task(void) {
+  if (current_task && current_task->name) {
+    console_write(" task=");
+    console_write(current_task->name);
+    console_write(" pid=");
+    console_write_dec(current_task->id);
+  }
+}
+
 static void lock_pc(void) {
   while (__sync_lock_test_and_set(&pc_lock, 1)) {
     while (pc_lock) { __asm__ volatile("pause"); }
@@ -19,6 +36,19 @@ static void lock_pc(void) {
 
 static void unlock_pc(void) {
   __sync_lock_release(&pc_lock);
+}
+
+static void page_cache_process_deferred_free(void) {
+  lock_pc();
+  struct page_cache_entry *curr = to_free_list;
+  to_free_list = 0;
+  unlock_pc();
+  
+  while (curr) {
+    struct page_cache_entry *next = curr->hash_next;
+    kfree(curr);
+    curr = next;
+  }
 }
 
 static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
@@ -52,6 +82,9 @@ void page_cache_init(void) {
 }
 
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset) {
+  if (to_free_list) {
+    page_cache_process_deferred_free();
+  }
   u32 h = pc_hash(inode, offset);
   
   lock_pc();
@@ -72,6 +105,9 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
 }
 
 int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
+  if (to_free_list) {
+    page_cache_process_deferred_free();
+  }
   u32 h = pc_hash(inode, offset);
   
   struct page_cache_entry *new_entry = kmalloc(sizeof(struct page_cache_entry));
@@ -154,6 +190,49 @@ int page_cache_flush_inode(struct vfs_inode *inode) {
   return 0;
 }
 
+void page_cache_invalidate_inode(struct vfs_inode *inode) {
+  if (!inode)
+    return;
+
+  int invalidated = 0;
+  lock_pc();
+  struct page_cache_entry *curr = lru_head;
+  while (curr) {
+    struct page_cache_entry *next = curr->lru_next;
+    if (curr->inode == inode && curr->refcount == 0) {
+      u32 h = pc_hash(curr->inode, curr->offset);
+      struct page_cache_entry **prev = &hash_table[h];
+      struct page_cache_entry *hcurr = *prev;
+      while (hcurr) {
+        if (hcurr == curr) {
+          *prev = hcurr->hash_next;
+          break;
+        }
+        prev = &hcurr->hash_next;
+        hcurr = hcurr->hash_next;
+      }
+
+      lru_remove(curr);
+      pmm_free_frame(curr->frame);
+      curr->inode = 0;
+      curr->hash_next = to_free_list;
+      to_free_list = curr;
+      invalidated++;
+    }
+    curr = next;
+  }
+  unlock_pc();
+
+  if (invalidated > 0) {
+    console_write("[M26DIAG] pc_invalidate inode=0x");
+    console_write_hex64((u64)(usize)inode);
+    console_write(" pages=");
+    console_write_dec(invalidated);
+    m26_diag_task();
+    console_write("\n");
+  }
+}
+
 void page_cache_put_page(struct page_cache_entry *page) {
   lock_pc();
   if (page->refcount > 0) {
@@ -162,18 +241,25 @@ void page_cache_put_page(struct page_cache_entry *page) {
   unlock_pc();
 }
 
-void page_cache_evict(void) {
+usize page_cache_evict(usize target_pages) {
+  static u64 evict_calls;
+  if (target_pages == 0)
+    target_pages = 1;
+  evict_calls++;
   lock_pc();
   
   struct page_cache_entry *curr = lru_head;
-  int evicted = 0;
+  usize evicted = 0;
+  usize dirty_skipped = 0;
   
-  while (curr && evicted < 16) { // Try to evict up to 16 pages
+  while (curr && evicted < target_pages) {
     struct page_cache_entry *next = curr->lru_next;
     
     if (curr->refcount == 0) {
       if (curr->flags & PAGE_CACHE_DIRTY) {
-        writeback_page_locked(curr);
+        dirty_skipped++;
+        curr = next;
+        continue;
       }
       
       // Remove from hash table
@@ -193,7 +279,8 @@ void page_cache_evict(void) {
       
       // Free frame and entry
       pmm_free_frame(curr->frame);
-      kfree(curr);
+      curr->hash_next = to_free_list;
+      to_free_list = curr;
       evicted++;
     }
     
@@ -201,4 +288,20 @@ void page_cache_evict(void) {
   }
   
   unlock_pc();
+  if (evict_calls <= 16 || is_power_of_two_u64(evict_calls) ||
+      dirty_skipped > 0 || evicted < target_pages) {
+    console_write("[M26DIAG] pc_evict call=");
+    console_write_dec(evict_calls);
+    console_write(" target=");
+    console_write_dec(target_pages);
+    console_write(" evicted=");
+    console_write_dec(evicted);
+    console_write(" dirty_skipped=");
+    console_write_dec(dirty_skipped);
+    console_write(" free_frames=");
+    console_write_dec(pmm_free_frame_count());
+    m26_diag_task();
+    console_write("\n");
+  }
+  return evicted;
 }

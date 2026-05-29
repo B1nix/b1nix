@@ -10,6 +10,7 @@
 #include <string.h>
 
 extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 extern struct task *current_task;
 
 #define MAX_PROGRAMS 64
@@ -306,6 +307,11 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
   image->entry = ehdr->e_entry;
+  console_write("ELF load: ");
+  console_write(path);
+  console_write(" entry=0x");
+  console_write_hex64(ehdr->e_entry);
+  console_write("\n");
   image->address_space = user_address_space_create();
 
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
@@ -493,10 +499,17 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
 
 void user_address_space_cleanup(struct task *t) {
   if (!t) return;
+
+  extern void swap_free_all_slots(u64 pml4_phys);
+  extern void eviction_unregister_all_pages(struct task *task);
+  swap_free_all_slots(t->pml4_phys);
+  eviction_unregister_all_pages(t);
+
   interrupts_disable();
   struct vm_area *vma = t->vma_list;
   t->vma_list = NULL;
   interrupts_enable();
+
 
   while (vma) {
     struct vm_area *next = vma->next;
@@ -572,6 +585,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       vma->next = current_task->vma_list;
       current_task->vma_list = vma;
     }
+
+    /* The segment is now resident in the user address space. Its staging
+     * buffer is never read again: fork clones the address space via COW page
+     * tables (it does not re-instantiate from segment->data), and execve
+     * builds a fresh image. Holding it would pin tens of MB per process for
+     * the image's whole lifetime (cc1's text segment alone is ~16MB), which
+     * is the dominant kheap leak that OOMs the in-guest self-host build. */
+    if (segment->data) {
+      kfree(segment->data);
+      segment->data = 0;
+    }
   }
 
   /* Initialize heap bounds based on the end of the highest segment */
@@ -605,6 +629,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   for (u64 v = stack_aligned; v < image->address_space.stack_top;
        v += PAGE_SIZE) {
     u64 frame = pmm_alloc_frame();
+    if (!frame) {
+      return -ENOMEM;
+    }
     vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
 
     /* Clear stack page */
@@ -646,6 +673,10 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     console_write("user: reject non-canonical ring3 frame\n");
     return -1;
   }
+
+  /* A freshly started program expects a clean FPU/MXCSR (SysV ABI). Reset the
+   * live FPU here since exec replaces the image without a context switch. */
+  arch_fpu_init_current();
 
   x86_user_jump(image->entry, image->address_space.stack_base,
                 (u64)image->argc,
@@ -750,6 +781,9 @@ int user_execve_current(const char *path, const char **argv,
   struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
   if (!image)
     return -1;
+
+  free_kernel_array((char **)argv);
+  free_kernel_array((char **)envp);
 
   vfs_close_on_exec();
 

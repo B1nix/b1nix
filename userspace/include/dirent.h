@@ -6,23 +6,13 @@ struct dirent {
     char d_name[256];
 };
 
-typedef struct {
-    int fd;
-} DIR;
+/* Opaque directory stream; backed by an open fd plus a batched SYS_GETDENTS
+ * cursor (see libc/dirent.c). */
+typedef struct __dirstream DIR;
 
-static inline DIR *opendir(const char *name) {
-    (void)name;
-    return (DIR *)0;
-}
-
-static inline struct dirent *readdir(DIR *dirp) {
-    (void)dirp;
-    return (struct dirent *)0;
-}
-
-static inline int closedir(DIR *dirp) {
-    (void)dirp;
-    return 0;
-}
+DIR *opendir(const char *name);
+struct dirent *readdir(DIR *dirp);
+int closedir(DIR *dirp);
+int dirfd(DIR *dirp);
 
 #endif

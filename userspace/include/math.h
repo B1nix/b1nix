@@ -43,4 +43,16 @@ static inline double sqrt(double x) { return __builtin_sqrt(x); }
 static inline double tan(double x) { return __builtin_tan(x); }
 static inline double tanh(double x) { return __builtin_tanh(x); }
 
+/* Float variants for the functions GCC lowers to a single hardware
+ * instruction (fabs/sqrt). libstdc++'s crossconfig.m4 b1nix stanza hardcodes
+ * HAVE_FABSF/HAVE_SQRTF, so <cmath> does `using ::fabsf/::sqrtf` and the float
+ * math stubs are skipped — these MUST be declared here or the libstdc++ build
+ * fails with "fabsf/sqrtf not declared".
+ * The long-double variants (fabsl/sqrtl) are intentionally NOT declared:
+ * HAVE_FABSL/HAVE_SQRTL are left undefined (the long-double decl checks never
+ * run for this target), so libstdc++ emits its own fabsl/sqrtl stub definitions
+ * in math_stubs_long_double.cc. Declaring them here would collide with those. */
+static inline float fabsf(float x) { return __builtin_fabsf(x); }
+static inline float sqrtf(float x) { return __builtin_sqrtf(x); }
+
 #endif

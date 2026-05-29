@@ -160,6 +160,19 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
     cd ..
 fi
 
+# ── 6. Build target C++ standard library ──────────────────────────────────────
+# The native GCC port (tools/build-native-toolchain.sh) cross-compiles GCC's own
+# C++ sources (libcpp, gcc/*.cc) for x86_64-b1nix. Those include <new>, <vector>,
+# etc. and link against libstdc++. Without a target libstdc++ the native build
+# fails at libcpp with: "fatal error: new: No such file or directory".
+if [ ! -f "$PREFIX/x86_64-b1nix/lib/libstdc++.a" ]; then
+    echo "Building target libstdc++-v3 for ${TARGET}..."
+    cd build-gcc
+    make -j"$NPROC" all-target-libstdc++-v3 MAKEINFO=true
+    make install-target-libstdc++-v3 MAKEINFO=true
+    cd ..
+fi
+
 echo ""
 echo "Toolchain build completed successfully!"
 echo "Cross compiler: $PREFIX/bin/${TARGET}-gcc"

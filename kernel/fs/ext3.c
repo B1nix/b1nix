@@ -82,9 +82,6 @@ static void ext3_write_bgd_tx(struct ext3_fs *fs, u32 group, struct ext2_block_g
   kfree(buf);
 }
 
-static void ext3_write_bgd(struct ext3_fs *fs, u32 group, struct ext2_block_group_desc *bgd) {
-  ext3_write_bgd_tx(fs, group, bgd, 0);
-}
 
 static void ext3_write_superblock(struct ext3_fs *fs) {
     u8 *sb_buf = kmalloc(1024);
@@ -194,9 +191,6 @@ static u32 ext3_alloc_inode_tx(struct ext3_fs *fs, struct journal_handle *h) {
   return 0;
 }
 
-static u32 ext3_alloc_inode(struct ext3_fs *fs) {
-  return ext3_alloc_inode_tx(fs, 0);
-}
 
 static void ext3_free_block_tx(struct ext3_fs *fs, u32 block_num, struct journal_handle *h) {
   if (block_num == 0) return;
@@ -392,14 +386,11 @@ static int ext3_add_dir_entry_tx(struct ext3_fs *fs, u32 dir_ino, u32 child_ino,
   kfree(buf); return -1;
 }
 
-static int ext3_add_dir_entry(struct ext3_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type) {
-  return ext3_add_dir_entry_tx(fs, dir_ino, child_ino, name, type, 0);
-}
-
 static void ext3_populate_vfs(struct ext3_fs *fs, u32 ino, const char *base_path);
 static void ext3_setup_node(struct vfs_node *n, struct ext3_fs *fs, u32 ino, u32 mode);
 
 static int ext3_vfs_create(struct vfs_node *dir, const char *name, const char *full_path, u32 mode) {
+  (void)full_path; /* part of the vfs create-op signature; this impl uses name+dir */
   struct ext3_inode_info *dir_info = (struct ext3_inode_info *)dir->inode->data;
   struct ext3_fs *fs = dir_info->fs;
   struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;

@@ -122,6 +122,8 @@ static inline int isatty(int fd) {
     return fd >= 0 && fd <= 2;
 }
 
+char *getlogin(void);
+
 #ifdef __cplusplus
 }
 #endif

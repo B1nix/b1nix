@@ -18,7 +18,10 @@ LIBC_OBJS := \
 	$(BUILD)/libc/string.o \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
-	$(BUILD)/libc/unistd.o
+	$(BUILD)/libc/unistd.o \
+	$(BUILD)/libc/ctype.o \
+	$(BUILD)/libc/dirent.o \
+	$(BUILD)/libc/pwd.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \
@@ -31,7 +34,11 @@ BINARIES := \
 	$(BUILD)/bin/m8_aio_test \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync \
-	$(BUILD)/bin/m25_smoke
+	$(BUILD)/bin/m25_smoke \
+	$(BUILD)/bin/m26_smoke
+
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
+DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)

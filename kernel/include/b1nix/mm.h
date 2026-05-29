@@ -6,6 +6,10 @@
 
 #define PAGE_SIZE 4096ULL
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
+/* Physical memory below DIRECT_MAP_SIZE is identity-accessible via the direct
+ * map (phys + DIRECT_MAP_BASE). The pmm must never hand out a frame at or above
+ * this limit, and vmm_init maps exactly this range — keep the two in lockstep. */
+#define DIRECT_MAP_SIZE (8ULL * 1024ULL * 1024ULL * 1024ULL)
 #define KHEAP_START 0xffffc00000000000ULL
 
 #define VMM_PRESENT (1ULL << 0)
@@ -86,6 +90,7 @@ void paging_unmap_page(u64 virtual_address);
 void paging_mprotect_page(u64 virtual_address, u64 flags);
 u64 paging_create_address_space(void);
 u64 paging_clone_address_space(u64 src_pml4_phys);
+void paging_free_address_space(u64 pml4_phys);
 void paging_switch_address_space(u64 pml4_phys);
 
 // Demand Paging / Swap
@@ -95,7 +100,8 @@ void vmm_set_swap_device(struct block_device *dev);
 
 // Swap
 int swap_init(void);
-int swap_out(u64 virtual_addr, u64 physical_frame);
-int swap_in(u64 virtual_addr, u64 *out_physical_frame);
+int swap_active(void);
+int swap_out(u64 pml4_phys, u64 virtual_addr, u64 physical_frame);
+int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
 
 #endif

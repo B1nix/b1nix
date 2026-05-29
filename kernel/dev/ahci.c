@@ -32,6 +32,22 @@ static struct ahci_port_state ports[AHCI_MAX_PORTS];
 
 static u64 ahci_pci_bar5 = 0;
 
+static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
+                               const char *what, int port_num) {
+  u64 spins = 0;
+  while (p->ci & slot_mask) {
+    if (spins == 10000000ULL) {
+      console_write("ahci: port ");
+      console_write_dec(port_num);
+      console_write(" ");
+      console_write(what);
+      console_write(" still pending after timeout; waiting to preserve DMA buffer lifetime\n");
+    }
+    scheduler_yield();
+    spins++;
+  }
+}
+
 
 
 static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
@@ -93,19 +109,9 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   // Issue command
   p->ci = 1;
 
-  // Wait for completion
-  timeout = 10000000;
-  while ((p->ci & 1) && timeout > 0) {
-    scheduler_yield();
-    timeout--;
-  }
-
-  if (timeout == 0) {
-    console_write("ahci: port ");
-    console_write_dec(port->port_num);
-    console_write(" read timeout\n");
-    return -1;
-  }
+  // Wait for completion. Once issued, never return while DMA may still target
+  // the caller's buffer.
+  ahci_wait_ci_clear(p, 1, "read", port->port_num);
 
   // Check for errors
   u32 tfd = p->tfd;
@@ -174,18 +180,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   p->serr = p->serr;
   p->ci = (1 << 1); // Issue slot 1
 
-  timeout = 10000000;
-  while ((p->ci & (1 << 1)) && timeout > 0) {
-    __asm__ volatile("pause");
-    timeout--;
-  }
-
-  if (timeout == 0) {
-    console_write("ahci: port ");
-    console_write_dec(port->port_num);
-    console_write(" write timeout\n");
-    return -1;
-  }
+  ahci_wait_ci_clear(p, (1 << 1), "write", port->port_num);
 
   // Flush cache
   memset(cmd_table->cfis, 0, 64);
@@ -200,11 +195,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   memset(prdt, 0, sizeof(struct ahci_prdt_entry));
 
   p->ci = (1 << 1);
-  timeout = 10000000;
-  while ((p->ci & (1 << 1)) && timeout > 0) {
-    __asm__ volatile("pause");
-    timeout--;
-  }
+  ahci_wait_ci_clear(p, (1 << 1), "flush", port->port_num);
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
@@ -348,14 +339,7 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   p->serr = p->serr;
   p->ci = 1;
 
-  timeout = 10000000;
-  while ((p->ci & 1) && timeout > 0) {
-    scheduler_yield();
-    timeout--;
-  }
-  if (timeout == 0) {
-    return -1;
-  }
+  ahci_wait_ci_clear(p, 1, "identify", port->port_num);
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {

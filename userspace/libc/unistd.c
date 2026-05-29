@@ -333,9 +333,18 @@ int kill(int pid, int sig) {
 }
 
 pid_t wait(int *wstatus) {
-  return _check_err(syscall(SYS_WAIT, wstatus));
+  /* POSIX wait(status) == waitpid(-1, status, 0): reap any child. Route via
+   * SYS_WAITPID (kernel SYS_WAIT uses a different in-kernel (pid,status) ABI). */
+  return _check_err(syscall(SYS_WAITPID, (long)-1, wstatus, 0));
 }
 
 pid_t waitpid(pid_t pid, int *wstatus, int options) {
   return _check_err(syscall(SYS_WAITPID, pid, wstatus, options));
+}
+
+/* b1nix runs as root and has no login/passwd database; report "root" so tilde
+ * (~) expansion in GNU Make's glob resolves to root's home. */
+char *getlogin(void) {
+  static char name[] = "root";
+  return name;
 }

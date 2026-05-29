@@ -32,19 +32,6 @@ void perror(const char *s) {
   }
 }
 
-static void print_dec(unsigned long v, char *buf, int *pos) {
-  if (v >= 10)
-    print_dec(v / 10, buf, pos);
-  buf[(*pos)++] = '0' + (v % 10);
-}
-
-static void print_hex(unsigned long v, char *buf, int *pos) {
-  const char *hex = "0123456789abcdef";
-  if (v >= 16)
-    print_hex(v / 16, buf, pos);
-  buf[(*pos)++] = hex[v % 16];
-}
-
 int snprintf(char *str, size_t size, const char *fmt, ...) {
   va_list args;
   va_start(args, fmt);
@@ -273,9 +260,12 @@ int vprintf(const char *fmt, va_list ap) {
 }
 
 static void _vsnprintf_putc(char *str, size_t size, int *pos, char c) {
-  if (*pos < (int)size - 1) {
-    str[(*pos)++] = c;
-  }
+  /* C99: count every character (so the return value is the would-be length),
+   * but only write into the buffer when there is room (reserving the final
+   * byte for the terminating NUL). str may be NULL when size == 0. */
+  if (str && (size_t)(*pos + 1) < size)
+    str[*pos] = c;
+  (*pos)++;
 }
 
 static void _vsnprintf_puts(char *str, size_t size, int *pos, const char *s) {
@@ -304,22 +294,49 @@ static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base,
 
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   int pos = 0;
-  if (size == 0)
-    return 0;
-
-  for (int i = 0; fmt[i] && pos < (int)size - 1; i++) {
+  /* Format the whole string regardless of buffer size so the return value is
+   * the C99 "would-be" length; _vsnprintf_putc only writes what fits. Callers
+   * such as GCC's build_attr_access_from_parms rely on snprintf(NULL, 0, ...)
+   * returning the full length to size their buffers. */
+  for (int i = 0; fmt[i]; i++) {
     if (fmt[i] != '%') {
-      str[pos++] = fmt[i];
+      _vsnprintf_putc(str, size, &pos, fmt[i]);
       continue;
     }
     i++;
-    if (fmt[i] == '0')
-      i++; // Ignore padding for now
 
+    /* Flags. */
+    while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' ||
+           fmt[i] == '0')
+      i++;
+    /* Field width (parsed but not applied — values are still correct, which is
+     * all the assembler output from cc1 needs). */
+    while (fmt[i] >= '0' && fmt[i] <= '9')
+      i++;
+    /* Precision. */
+    if (fmt[i] == '.') {
+      i++;
+      while (fmt[i] >= '0' && fmt[i] <= '9')
+        i++;
+    }
+
+    /* Length modifiers. On x86_64 long, long long, size_t, intmax_t and
+     * ptrdiff_t are all 64-bit, so they collapse to a single "is 64-bit" flag.
+     * Handling "ll" (and z/j/t) is what GCC's HOST_WIDE_INT_PRINT ("%lld")
+     * needs — without it the native cc1 emitted literal "%ld" into its asm. */
     int is_long = 0;
-    if (fmt[i] == 'l') {
+    while (fmt[i] == 'l') {
       is_long = 1;
       i++;
+    }
+    if (fmt[i] == 'z' || fmt[i] == 'j' || fmt[i] == 't' || fmt[i] == 'L') {
+      is_long = 1;
+      i++;
+    }
+    if (fmt[i] == 'h') { /* h / hh: still passed as int via default promotion */
+      i++;
+      if (fmt[i] == 'h')
+        i++;
     }
 
     switch (fmt[i]) {
@@ -327,26 +344,33 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       _vsnprintf_puts(str, size, &pos, va_arg(ap, const char *));
       break;
     case 'd':
+    case 'i':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? va_arg(ap, long) : va_arg(ap, int), 10, 1);
+                      is_long ? va_arg(ap, long) : (long)va_arg(ap, int), 10, 1);
       break;
     case 'u':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? va_arg(ap, unsigned long)
-                              : va_arg(ap, unsigned int),
+                      is_long ? (long)va_arg(ap, unsigned long)
+                              : (long)va_arg(ap, unsigned int),
                       10, 0);
       break;
     case 'x':
     case 'X':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? va_arg(ap, unsigned long)
-                              : va_arg(ap, unsigned int),
+                      is_long ? (long)va_arg(ap, unsigned long)
+                              : (long)va_arg(ap, unsigned int),
                       16, 0);
+      break;
+    case 'o':
+      _vsnprintf_putd(str, size, &pos,
+                      is_long ? (long)va_arg(ap, unsigned long)
+                              : (long)va_arg(ap, unsigned int),
+                      8, 0);
       break;
     case 'p':
       _vsnprintf_puts(str, size, &pos, "0x");
-      _vsnprintf_putd(str, size, &pos, (unsigned long)va_arg(ap, void *), 16,
-                      0);
+      _vsnprintf_putd(str, size, &pos, (long)(unsigned long)va_arg(ap, void *),
+                      16, 0);
       break;
     case 'c':
       _vsnprintf_putc(str, size, &pos, (char)va_arg(ap, int));
@@ -360,7 +384,9 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       break;
     }
   }
-  str[pos] = '\0';
+  /* NUL-terminate within the buffer (truncating if the output didn't fit). */
+  if (str && size > 0)
+    str[(size_t)pos < size ? pos : (int)size - 1] = '\0';
   return pos;
 }
 

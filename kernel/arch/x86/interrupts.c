@@ -354,16 +354,40 @@ void x86_exception_handler(struct interrupt_frame *frame) {
       sig = SIGTERM;
       break;
     }
-    console_write("sending signal ");
+    /* A signal generated synchronously by a CPU fault must be acted upon
+     * before we resume userspace. If the faulting process installed a handler
+     * for it and hasn't blocked it, deliver to that handler (e.g. a debugger or
+     * an ICE reporter). Otherwise — SIG_DFL, SIG_IGN, or currently blocked —
+     * returning to the faulting instruction would just re-fault forever, so we
+     * force the default terminate action (matching Linux force_sig()). This
+     * also covers the case where the signal is re-raised inside its own handler
+     * (where it is blocked): the second fault terminates instead of looping. */
+    usize pid = scheduler_get_pid();
+    struct sigaction *sa = &current_task->sigactions[sig - 1];
+    int is_blocked = (current_task->blocked_signals >> (sig - 1)) & 1ULL;
+    int has_handler =
+        (sa->sa_handler != SIG_DFL && sa->sa_handler != SIG_IGN);
+
+    if (has_handler && !is_blocked) {
+      console_write("delivering signal ");
+      console_write_dec(sig);
+      console_write(" to handler in pid ");
+      console_write_hex64(pid);
+      console_write("\n");
+      scheduler_kill(pid, sig);
+      arch_check_and_deliver_signals(frame);
+      scheduler_yield();
+      return;
+    }
+
+    console_write("fatal signal ");
     console_write_dec(sig);
-    console_write(" to pid ");
-    console_write_hex64(scheduler_get_pid());
-    console_write("\n");
-    scheduler_kill(scheduler_get_pid(), sig);
-    /* Process will be killed on next scheduler check */
-    arch_check_and_deliver_signals(frame);
-    scheduler_yield();
-    return;
+    console_write(" in pid ");
+    console_write_hex64(pid);
+    console_write(" (no handler): terminating\n");
+    scheduler_exit_current(128 + sig);
+    /* scheduler_exit_current never returns */
+    arch_halt();
   }
 
   console_write("[PANIC] unhandled CPU exception\n");
@@ -381,6 +405,23 @@ static int addr_is_kernel_text(u64 addr) {
          (addr >= 0xffff800000000000ULL && addr <= 0xffff800100000000ULL);
 }
 
+/* A frame pointer is safe to dereference only if it is canonical and lands in a
+   region we actually map. A corrupt frame (e.g. after a bad fork return) can
+   carry a NON-canonical rbp; dereferencing it would itself #GP inside the
+   exception handler and mask the original fault. */
+static int fp_is_safe(u64 fp) {
+  if (fp < 0x1000ULL || fp == (u64)-1)
+    return 0;
+  /* Reject the non-canonical hole [2^47, 0xffff800000000000). */
+  if (fp >= 0x0000800000000000ULL && fp < 0xffff800000000000ULL)
+    return 0;
+  if (fp < 0x0000800000000000ULL)
+    /* Low identity-mapped region: kernel image + heap/stacks live below 4 GiB. */
+    return fp + 16 <= 0x0000000100000000ULL;
+  /* Higher-half direct map. */
+  return fp + 16 <= 0xffff800100000000ULL;
+}
+
 void arch_backtrace(u64 rbp, u64 rip) {
   int frames = 0;
   console_write("\n--- Kernel Backtrace ---\n");
@@ -393,16 +434,11 @@ void arch_backtrace(u64 rbp, u64 rip) {
 
   /* Phase 1: Try RBP-based unwinding */
   for (int i = 0; i < MAX_BACKTRACE_FRAMES && rbp; i++) {
-    if (rbp == (u64)-1)
-      break;
-    if (rbp < 0x1000ULL || rbp > 0xffff800100000000ULL)
+    if (!fp_is_safe(rbp))
       break;
 
     u64 next_rbp = 0;
     u64 ret_addr = 0;
-
-    if (rbp + 16 > 0xffff800100000000ULL)
-      break;
 
     next_rbp = *(volatile u64 *)rbp;
     ret_addr = *(volatile u64 *)(rbp + 8);
@@ -426,7 +462,7 @@ void arch_backtrace(u64 rbp, u64 rip) {
     __asm__ volatile("movq %%rbp, %0" : "=r"(scan_rbp));
 
     for (int i = 0; i < MAX_BACKTRACE_FRAMES && scan_rbp; i++) {
-      if (scan_rbp < 0x1000ULL || scan_rbp > 0xffff800100000000ULL)
+      if (!fp_is_safe(scan_rbp))
         break;
 
       u64 ret = *(volatile u64 *)(scan_rbp + 8);

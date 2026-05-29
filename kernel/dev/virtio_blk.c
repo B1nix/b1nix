@@ -19,6 +19,7 @@ struct virtio_blk_instance {
   struct virtio_device dev;
   struct virtqueue vq;
   struct block_device blk;
+  volatile int busy;
 };
 
 static struct virtio_blk_instance instances[MAX_VIRTIO_BLK];
@@ -30,26 +31,39 @@ struct virtio_blk_req {
   u64 sector;
 } __attribute__((packed));
 
-static volatile u8 virtio_blk_status;
+struct virtio_blk_dma_req {
+  struct virtio_blk_req req;
+  volatile u8 status;
+} __attribute__((packed));
+
+static void virtio_blk_lock(struct virtio_blk_instance *inst) {
+  while (__sync_lock_test_and_set(&inst->busy, 1)) {
+    scheduler_yield();
+  }
+}
+
+static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
+  __sync_lock_release(&inst->busy);
+}
 
 static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
                              u32 count, void *buffer, u32 type) {
-  struct virtio_blk_req *req = kzalloc(sizeof(struct virtio_blk_req));
-  if (!req)
+  struct virtio_blk_dma_req *dma = kzalloc(sizeof(struct virtio_blk_dma_req));
+  if (!dma)
     return -1;
 
-  req->type = type;
-  req->reserved = 0;
-  req->sector = lba;
-
-  virtio_blk_status = 0xFF;
+  virtio_blk_lock(inst);
+  dma->req.type = type;
+  dma->req.reserved = 0;
+  dma->req.sector = lba;
+  dma->status = 0xFF;
 
   // Set up descriptors
   u16 d0 = 0;
   u16 d1 = 1;
   u16 d2 = 2;
 
-  inst->vq.desc[d0].addr = vmm_virt_to_phys(req);
+  inst->vq.desc[d0].addr = vmm_virt_to_phys(&dma->req);
   inst->vq.desc[d0].len = sizeof(struct virtio_blk_req);
   inst->vq.desc[d0].flags = VRING_DESC_F_NEXT;
   inst->vq.desc[d0].next = d1;
@@ -60,7 +74,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
       VRING_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0);
   inst->vq.desc[d1].next = d2;
 
-  inst->vq.desc[d2].addr = vmm_virt_to_phys((void *)&virtio_blk_status);
+  inst->vq.desc[d2].addr = vmm_virt_to_phys((void *)&dma->status);
   inst->vq.desc[d2].len = 1;
   inst->vq.desc[d2].flags = VRING_DESC_F_WRITE;
   inst->vq.desc[d2].next = 0;
@@ -68,13 +82,9 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   u16 avail_idx = inst->vq.avail->idx % inst->vq.queue_size;
   inst->vq.avail->ring[avail_idx] = d0;
 
-  // Full memory barrier is usually needed here, but since it's a simple hobby
-  // OS on single core, we just enforce compiler barrier
-  __asm__ volatile("" ::: "memory");
-
+  __sync_synchronize();
   inst->vq.avail->idx++;
-
-  __asm__ volatile("" ::: "memory");
+  __sync_synchronize();
 
   virtq_kick(&inst->dev, &inst->vq);
 
@@ -82,11 +92,12 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
     scheduler_yield();
   }
 
+  __sync_synchronize();
   inst->vq.last_used_idx++;
 
-  int ret = (virtio_blk_status == 0) ? (int)count : -1;
-  // Memory leaks here in a real OS since bump allocator cannot free, but fine
-  // for now
+  int ret = (dma->status == 0) ? (int)count : -1;
+  virtio_blk_unlock(inst);
+  kfree(dma);
   return ret;
 }
 

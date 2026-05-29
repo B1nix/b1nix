@@ -9,7 +9,8 @@
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
 #define HUGE_PAGE_FLAG (1ULL << 7)
-#define DIRECT_MAP_SIZE (4ULL * 1024ULL * 1024ULL * 1024ULL)
+/* DIRECT_MAP_SIZE is shared with the pmm via <b1nix/mm.h> (the pmm clamps
+ * usable RAM to it so no frame is ever allocated outside the direct map). */
 #define MMIO_MAP_BASE 0xffffa00000000000ULL
 #define MMIO_MAP_SIZE (512ULL * 1024ULL * 1024ULL)
 
@@ -84,9 +85,17 @@ static u64 table_to_phys(u64 *table) {
 
 static u64 *alloc_page_table(void) {
   u64 frame = pmm_alloc_frame();
+  if (frame == 0) {
+    panic("vmm: OOM during page table allocation");
+  }
 
-  if (frame >= 0x100000000ULL) {
-    panic("vmm: page table allocated above 4GB during early boot");
+  /* Page tables are dereferenced via the direct map once it is ready
+   * (frame + DIRECT_MAP_BASE), so any frame below DIRECT_MAP_SIZE is
+   * reachable. Before the direct map exists, only the low 4GB identity
+   * window set up by the bootstrap (boot.S) is addressable. */
+  u64 reachable_limit = direct_map_ready ? DIRECT_MAP_SIZE : 0x100000000ULL;
+  if (frame >= reachable_limit) {
+    panic("vmm: page table frame beyond reachable map");
   }
 
   u64 *table = (u64 *)(usize)frame;
@@ -466,6 +475,10 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     // Map it: Present, Read/Write, User accessible
     vmm_map_page(page_aligned, frame, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+
+    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    eviction_register_page(current_task, page_aligned, frame);
+
     return 0; // Successfully resolved!
   }
 
@@ -479,10 +492,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   u64 pdpte = pdpt[pdpt_index(page_aligned)];
   if ((pdpte & VMM_PRESENT) == 0)
     return -1;
+  if (pdpte & HUGE_PAGE_FLAG)
+    return -1;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(page_aligned)];
   if ((pde & VMM_PRESENT) == 0)
+    return -1;
+  if (pde & HUGE_PAGE_FLAG)
     return -1;
 
   u64 *pt = table_from_entry(pde);
@@ -568,7 +585,7 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   // Case 2: Swapped page (custom bit stored in non-present entry)
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
     u64 new_frame = 0;
-    if (swap_in(page_aligned, &new_frame) < 0) {
+    if (swap_in(current_task->pml4_phys, page_aligned, &new_frame) < 0) {
       console_write("pf: swap in failed for 0x");
       console_write_hex64(page_aligned);
       console_write("\n");
@@ -593,6 +610,16 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   // Case 3: Copy-on-Write (write to a cloned private page)
   if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && (pte & VMM_COW)) {
     u64 old_frame = pte & PAGE_ENTRY_ADDRESS_MASK;
+
+    if (pmm_get_refcount(old_frame) == 1) {
+      u64 new_flags = (pte & ~PAGE_ENTRY_ADDRESS_MASK);
+      new_flags &= ~VMM_COW;
+      new_flags |= VMM_PRESENT | VMM_WRITABLE;
+      pt[pt_index(page_aligned)] = old_frame | new_flags;
+      invalidate_page(page_aligned);
+      return 0;
+    }
+
     u64 new_frame = pmm_alloc_frame();
     if (!new_frame)
       return -1;
@@ -605,10 +632,13 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     new_flags |= VMM_PRESENT | VMM_WRITABLE;
     pt[pt_index(page_aligned)] = new_frame | new_flags;
 
-    if (pmm_get_refcount(old_frame) > 1) {
-      pmm_unref_frame(old_frame);
-    }
+    pmm_unref_frame(old_frame);
     invalidate_page(page_aligned);
+
+    extern void eviction_unregister_page(u64 frame);
+    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    eviction_unregister_page(old_frame);
+    eviction_register_page(current_task, page_aligned, new_frame);
     return 0;
   }
 
@@ -734,8 +764,10 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
     write_cr3(real_src_phys);
   }
 
+  console_write("paging_clone_address_space: done\n");
   return dst_pml4_phys;
 }
+
 
 void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
   u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
@@ -745,10 +777,12 @@ void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(vaddr)];
   if (!(pdpte & VMM_PRESENT)) return;
+  if (pdpte & HUGE_PAGE_FLAG) return;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(vaddr)];
   if (!(pde & VMM_PRESENT)) return;
+  if (pde & HUGE_PAGE_FLAG) return;
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(vaddr)];
@@ -770,10 +804,12 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   u64 *pdpt = table_from_entry(pml4e);
   u64 pdpte = pdpt[pdpt_index(vaddr)];
   if (!(pdpte & VMM_PRESENT)) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) return 0;
 
   u64 *pd = table_from_entry(pdpte);
   u64 pde = pd[pd_index(vaddr)];
   if (!(pde & VMM_PRESENT)) return 0;
+  if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
   u64 pte = pt[pt_index(vaddr)];
@@ -806,4 +842,113 @@ void paging_dump_entries(u64 virtual_address) {
   u64 pte = pt[pt_index(virtual_address)];
   console_write("  PTE:   0x"); console_write_hex64(pte); console_write("\n");
 }
+
+static u64 freed_tables_count = 0;
+
+static void free_table(u64 *table, int level) {
+  if (level >= 3) {
+    /* PT level: free the leaf user data frames. VMA-backed pages were already
+     * unmapped (PTE cleared) by user_address_space_cleanup, so they are skipped
+     * here; what remains present is memory NOT covered by a VMA — chiefly the
+     * brk heap (cc1 grows it by tens of MB per compile). Without freeing it here
+     * those frames leak permanently across process teardown (OOM after many
+     * spawns). pmm_free_frame is refcount-aware, so shared/COW frames are safe. */
+    for (usize i = 0; i < 512; i++) {
+      u64 entry = table[i];
+      if ((entry & VMM_PRESENT) && (entry & VMM_USER)) {
+        u64 frame = entry & PAGE_ENTRY_ADDRESS_MASK;
+        if (frame) {
+          pmm_free_frame(frame);
+          freed_tables_count++;
+        }
+      }
+    }
+    return;
+  }
+  for (usize i = 0; i < 512; i++) {
+    u64 entry = table[i];
+    if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
+      u64 *child = table_from_entry(entry);
+      u64 child_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+      free_table(child, level + 1);
+      pmm_free_frame(child_phys);
+      freed_tables_count++;
+    }
+  }
+}
+
+void paging_free_address_space(u64 pml4_phys) {
+  if (pml4_phys == 0 || pml4_phys == kernel_pml4_phys) {
+    return;
+  }
+
+  freed_tables_count = 0;
+  u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+
+  // Free user-half entries (0-255)
+  for (usize i = 0; i < 256; i++) {
+    u64 entry = pml4[i];
+    if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
+      u64 *pdpt = table_from_entry(entry);
+      u64 pdpt_phys = entry & PAGE_ENTRY_ADDRESS_MASK;
+      free_table(pdpt, 1);
+      pmm_free_frame(pdpt_phys);
+      freed_tables_count++;
+    }
+  }
+
+  // Free the PML4 itself
+  pmm_free_frame(pml4_phys);
+  freed_tables_count++;
+
+  console_write("paging_free_address_space: pml4=0x");
+  console_write_hex64(pml4_phys);
+  console_write(" freed ");
+  console_write_dec(freed_tables_count);
+  console_write(" tables\n");
+}
+
+static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phys) {
+  if (level >= 3) {
+    for (usize i = 0; i < 512; i++) {
+      u64 entry = table[i];
+      if (!(entry & VMM_PRESENT) && (entry & VMM_SWAPPED)) {
+        u64 vaddr = base_addr + (i * PAGE_SIZE);
+        u64 new_frame = 0;
+        extern int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
+        if (swap_in(pml4_phys, vaddr, &new_frame) == 0) {
+          u64 flags = VMM_PRESENT | VMM_WRITABLE;
+          if (entry & VMM_USER) flags |= VMM_USER;
+          if (entry & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
+          table[i] = new_frame | flags;
+          invalidate_page(vaddr);
+          
+          extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+          eviction_register_page(current_task, vaddr, new_frame);
+        }
+      }
+    }
+    return;
+  }
+
+  for (usize i = 0; i < 512; i++) {
+    if (level == 0 && i >= 256) break; // Only check user space (0-255)
+
+    u64 entry = table[i];
+    if ((entry & VMM_PRESENT) && !(entry & HUGE_PAGE_FLAG)) {
+      u64 *child = table_from_entry(entry);
+      u64 step = 1ULL << (12 + (3 - level) * 9);
+      swap_in_recursive(child, level + 1, base_addr + i * step, pml4_phys);
+    }
+  }
+}
+
+void paging_swap_in_all_swapped(u64 pml4_phys) {
+  if (pml4_phys == 0 || pml4_phys == kernel_pml4_phys) {
+    return;
+  }
+  u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
+  swap_in_recursive(pml4, 0, 0, pml4_phys);
+}
+
 

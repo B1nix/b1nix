@@ -316,6 +316,19 @@ check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double p
 check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
+# ── M26 Native Toolchain & Self-Host ──
+echo ""
+echo "[TEST] M26 Native C Toolchain & Self-Host..."
+check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
+check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
+check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (gcc/binutils/make) is ported"
+check_output "$LOG" "M26-SMOKE: ok readdir" "libc opendir/readdir over SYS_GETDENTS works"
+# NOTE: in-guest full kernel self-build is not yet verified, so the marker is
+# "pending can-build-kernel" (not "ok"). Flip the kernel flag + this check to
+# "ok can-build-kernel" only once an in-guest kernel.elf actually builds.
+check_output "$LOG" "M26-SMOKE: done" "M26 smoke completes"
+
+
 # ── M16 User Space Applications & TUI ──
 echo ""
 echo "[TEST] M16 user space applications and TUI..."
