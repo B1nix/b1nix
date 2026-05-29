@@ -429,7 +429,7 @@ diagnostics.
 
 ## M27: Terminal OS Polish
 
-- [ ] `planned` Add boot menu options and kernel command line parsing.
+- [x] `done` Add boot menu options and kernel command line parsing. `bootinfo_get_kv()` key=value parser + `init=`/`b1nix.single`/`b1nix.nographics` dispatch in `init_main` + a 3-entry GRUB boot menu. Host smoke 223/0 (`M27-CMDLINE: ok kv-parse`). See [`docs/m27-polish.md`](m27-polish.md).
 - [ ] `planned` Add init scripts and a simple service supervisor.
 - [ ] `planned` Add users, passwords or login shell basics.
 - [ ] `planned` Add stable shutdown, reboot, and emergency shell paths.
