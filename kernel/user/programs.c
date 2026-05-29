@@ -1583,6 +1583,17 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M27: user/passwd/login basics (getpwnam/getpwuid over /etc/passwd +
+   * privilege drop). */
+  {
+    u64 u_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m27-smoke", 0, 0,
+                                 0, 0, 0);
+    if ((isize)u_pid >= 0) {
+      int u_status = 0;
+      syscall_dispatch(SYS_WAIT, u_pid, (u64)(usize)&u_status, 0, 0, 0, 0);
+    }
+  }
+
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
@@ -1894,6 +1905,8 @@ static int init_main(int argc, const char **argv) {
   int nographics = bootinfo_has_flag("b1nix.nographics") ||
                    bootinfo_has_flag("nographics");
   int want_ui = bootinfo_has_flag("b1nix.ui=1") || bootinfo_has_flag("ui=1");
+  int want_login = bootinfo_has_flag("b1nix.login") ||
+                   bootinfo_has_flag("login");
 
   if (bootinfo_get_kv("init", init_override, sizeof(init_override)) &&
       init_override[0]) {
@@ -1904,6 +1917,9 @@ static int init_main(int argc, const char **argv) {
   } else if (single) {
     uwrite("init: single-user mode, launching emergency shell /bin/sh\n");
     init_prog = "/bin/sh";
+  } else if (want_login) {
+    uwrite("init: launching login prompt /bin/login\n");
+    init_prog = "/bin/login";
   } else if (want_ui && !nographics) {
     uwrite("init: launching graphical UI /bin/mc\n");
     init_prog = "/bin/mc";
@@ -2530,6 +2546,7 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/whoami", busybox_main);
   user_register_program("/bin/id", busybox_main);
   user_register_program("/bin/clear", busybox_main);
+  user_register_program("/bin/login", busybox_main);
   user_register_program("/bin/reboot", busybox_main);
   user_register_program("/bin/poweroff", busybox_main);
   user_register_program("/bin/halt", busybox_main);
