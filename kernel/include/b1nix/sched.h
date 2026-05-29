@@ -172,6 +172,13 @@ struct task {
   __attribute__((aligned(16))) u8 fpu_state[512];
   int fpu_initialized;
 
+  /* SMP work-stealing: when set, this task is a self-contained CPU-bound
+   * kernel worker that an idle Application Processor may steal and run on its
+   * own idle context (see ap_main / ap_worker_trampoline). Ordinary userspace
+   * tasks leave this 0 so APs never migrate them — the kernel's syscall/VFS
+   * paths are not yet SMP-safe for parallel kernel-mode execution. */
+  int stealable;
+
   /* SMP runqueue linkage (must be last field for ABI compat) */
   struct task *next_run;
 };
@@ -184,6 +191,16 @@ extern struct task *current_task;
 
 void scheduler_init(void);
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg);
+/* Create a stealable CPU-bound kernel worker (see struct task::stealable).
+ * Returns the task id, or -1 on failure. The worker is enqueued READY on the
+ * creating CPU's runqueue; an idle AP may steal and run it. */
+int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
+                                  void *arg);
+/* Reap a finished stealable worker (called by an AP after the worker parks). */
+void sched_ap_reap_worker(struct task *t);
+/* SMP work-stealing self-test (M24b). No-op unless >1 CPU is online and
+ * test mode is active. */
+void smp_selftest_run(void);
 int scheduler_fork_current(void);
 void scheduler_yield(void);
 void scheduler_block_current(void);

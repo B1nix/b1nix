@@ -40,6 +40,7 @@ run_qemu() {
 
 	if [ "$ARCH" = "x86" ]; then
 		qemu-system-x86_64 \
+			${EXTRA_QEMU_ARGS:-} \
 			-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
@@ -484,6 +485,21 @@ if [ "$ARCH" = "x86" ]; then
 		fail "virtio-net initialized" "virtio-net message not found"
 	fi
 fi
+
+# ── M24b SMP work-stealing (multi-core) ──
+echo ""
+echo "[TEST] M24b SMP work-stealing (-smp 4)..."
+# Re-create the disk images so the SMP boot starts from a clean state.
+"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || true
+"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || true
+dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
+SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp.log"
+EXTRA_QEMU_ARGS="-smp 4"
+run_qemu "$SMP_LOG"
+EXTRA_QEMU_ARGS=""
+check_output "$SMP_LOG" "smp: AP 1 ready" "Application Processor boots (INIT-SIPI)"
+check_output "$SMP_LOG" "M24B-SMP: ok work-stealing" "cross-CPU work-stealing runs stolen tasks on APs"
+check_output "$SMP_LOG" "B1NIX-TEST: done" "full suite completes under SMP"
 
 # ── Summary ──
 echo ""

@@ -57,8 +57,11 @@ void lapic_timer_start(u32 init_count) {
 }
 
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
-    /* Write destination APIC ID to ICR high */
-    lapic_write(LAPIC_ICR_HIGH, (u64)apic_id << 32);
+    /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
+     * [31:24]. The old `(u64)apic_id << 32` is the x2APIC (MSR) layout; written
+     * through the u32 lapic_write it truncated to 0, so every IPI targeted APIC
+     * 0 (the BSP) — an INIT to self triple-faults the boot CPU. */
+    lapic_write(LAPIC_ICR_HIGH, apic_id << 24);
     /* Write command to ICR low */
     lapic_write(LAPIC_ICR_LOW, icr_low);
     /* Wait for delivery to complete */
@@ -159,6 +162,7 @@ u64 arch_get_gs_base(void) {
 void percpu_init(void) {
     /* Set BSP per-CPU data */
     boot_cpu_data.apic_id = 0;
+    boot_cpu_data.cpu_online = 1;  /* BSP is online; lets APs see it as a steal victim */
     arch_set_gs_base((u64)&boot_cpu_data);
 
     /* If APIC is available, get real APIC ID */
@@ -192,15 +196,15 @@ static struct percpu *ap_cpu_data[MAX_CPUS];
 extern u8 ap_trampoline_bin[];
 extern u32 ap_trampoline_bin_len;
 
-/* Define the data layout offsets within the trampoline page (from nm output) */
+/* Data layout offsets within the trampoline page. These MUST match the data
+ * block at the end of kernel/arch/x86/ap_trampoline.S (verify with `nm` after
+ * changing the trampoline). */
 #define TRAMP_PML4_OFF    0xB8   /* pml4_phys */
 #define TRAMP_STACK_OFF   0xC0   /* stack_ptr */
 #define TRAMP_PCPU_OFF    0xC8   /* percpu_ptr */
 #define TRAMP_CPU_OFF     0xD0   /* cpu_id */
-#define TRAMP_GDT_PTR_OFF 0xD8   /* gdt_ptr (2 limit + 4 base = 6 bytes) */
 #define TRAMP_READY_OFF   0xE2   /* ready_flag (4 bytes) */
 #define TRAMP_APMAIN_OFF  0xE6   /* ap_main_ptr (8 bytes) */
-#define TRAMP_GDT_OFF     0xF0   /* gdt entries */
 
 static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
                                   u64 percpu_ptr, u32 cpu_id)
@@ -223,54 +227,91 @@ static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
     *(volatile u64 *)(tv + TRAMP_APMAIN_OFF) = (u64)(usize)ap_main;
 }
 
-/* Timer calibration: how many APIC timer ticks per scheduler tick (10ms) */
+/* ── AP-worker trampoline ──
+ * Entered (via arch_context_switch from ap_main) on an idle AP after it steals
+ * a stealable CPU-bound kernel worker. Runs the worker's entry with interrupts
+ * disabled (ap_main disabled them), then parks back to the AP idle context.
+ *
+ * This deliberately does NOT touch the global current_task or go through the
+ * cooperative scheduler_yield/exit path — those are BSP-owned and not SMP-safe.
+ * The AP tracks the worker solely via its per-CPU struct. */
+void ap_worker_trampoline(void) {
+    struct percpu *pcpu = get_percpu();
+    struct task *t = pcpu ? pcpu->current_task : (struct task *)0;
+
+    if (t && t->entry)
+        t->entry(t->arg);
+    if (t)
+        t->state = TASK_DEAD;  /* tells ap_main the worker has finished */
+
+    /* Switch back to the AP idle loop. Saves our now-defunct context into
+     * t->context (never reused) and restores the AP idle context captured in
+     * ap_main. Does not return. */
+    arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx);
+
+    for (;;) __asm__ volatile("hlt");  /* unreachable */
+}
+
 /* ── AP entry point ──
  * Called by the trampoline after it enters 64-bit long mode.
  * cpu_id is a CPU index (0=BSP, 1+ = AP).
  * This function runs on the AP with its own stack and per-CPU data. */
 void ap_main(u32 cpu_id) {
+    (void)cpu_id;
     struct percpu *pcpu = get_percpu();
 
-    console_write("AP: cpu ");
-    console_write_dec(cpu_id);
-    console_write(" online (apic_id=");
-    console_write_dec(pcpu ? pcpu->apic_id : 0);
-    console_write(")\n");
-
+    /* Mark online FIRST, before anything that could stall, so the BSP's
+     * get_online_cpu_count() observes this AP promptly. We deliberately do NOT
+     * call console_write from an AP: the framebuffer console's cursor globals
+     * and the shared VGA/serial port are unsynchronised, so AP output would
+     * race the BSP's (which runs the whole test suite in parallel). */
     if (pcpu) {
         pcpu->cpu_online = 1;
         pcpu->scheduler_started = 1;
     }
 
-    /* Enable interrupts — AP will receive timer ticks via APIC */
-    interrupts_enable();
+    /* The AP idle context. ap_main never returns, so this local persists for
+     * the AP's lifetime; a stolen worker switches back into it when it parks. */
+    struct cpu_context idle_ctx;
 
-    /* Idle loop: halt until interrupt, then try to find work */
+    /* Work-stealing idle loop. Workers run with interrupts disabled so the AP
+     * never takes a timer tick mid-worker (the cooperative scheduler's shared
+     * bookkeeping — tasks[], scheduler_ticks, wake_sleepers — is BSP-owned and
+     * not SMP-safe). We busy-poll rather than `hlt` because an AP is not
+     * guaranteed a periodic timer interrupt and stolen work is pushed without
+     * an IPI. */
     for (;;) {
-        struct task *t = NULL;
+        interrupts_disable();
 
-        /* Try our per-CPU runqueue first */
-        if (pcpu)
-            t = rq_dequeue(&pcpu->runqueue);
-
-        /* If nothing, try to steal from other CPUs */
+        struct task *t = pcpu ? rq_dequeue(&pcpu->runqueue) : (struct task *)0;
+        if (t && !(t->state == TASK_READY && t->stealable)) {
+            /* Not a runnable worker — should not appear on an AP queue, but be
+             * safe and put it back rather than mis-running it. */
+            rq_enqueue(&pcpu->runqueue, t);
+            t = NULL;
+        }
         if (!t)
-            t = sched_steal_task();
+            t = sched_steal_task();  /* only returns READY stealable workers */
 
-        /* If we found a task, run it */
-        if (t && t->state == TASK_READY) {
+        if (t) {
             t->state = TASK_RUNNING;
             pcpu->current_task = t;
-            current_task = t;
-            paging_switch_address_space(t->pml4_phys);
-            arch_set_kernel_stack(t->kernel_stack_ptr);
-            arch_context_switch(&t->context, &t->context); /* dummy — real switch */
-            /* Back to idle */
+            pcpu->sched_return_ctx = &idle_ctx;
+            /* Kernel worker: stays on the kernel address space (pml4_phys==0)
+             * and runs on its own kmalloc'd kernel stack — no address-space
+             * switch and no TSS rsp0 update (no user mode is entered). */
+            arch_context_switch(&idle_ctx, &t->context);
+            /* Worker has parked back here and is now TASK_DEAD. Its stack is no
+             * longer in use, so it is safe to reap. */
             pcpu->current_task = NULL;
-            current_task = NULL;
+            sched_ap_reap_worker(t);
+            interrupts_enable();
+            continue;
         }
 
-        __asm__ volatile("sti; hlt");
+        interrupts_enable();
+        for (volatile int i = 0; i < 100000; i++)
+            __asm__ volatile("pause");
     }
 }
 
@@ -298,27 +339,60 @@ __attribute__((unused)) static u32 apic_timer_calibrate(void) {
 int smp_boot_aps(void) {
     int ap_count = 0;
 
-    /* Get PML4 physical address */
-    u64 pml4_phys = (u64)(usize)pml4;
+    /* Use the ACTIVE kernel PML4 (from CR3), not the boot-time `pml4` symbol.
+     * The boot `pml4` only maps low identity + the kernel image; paging_init
+     * switched to a fresh runtime PML4 that additionally maps the kheap and the
+     * full direct map. AP kernel stacks are kmalloc'd from the kheap (high
+     * addresses), so an AP running on the boot `pml4` faults on its first stack
+     * push (the call into ap_main) — before reaching any C code. */
+    u64 cr3_val;
+    __asm__ volatile("movq %%cr3, %0" : "=r"(cr3_val));
+    u64 pml4_phys = cr3_val & ~0xFFFULL;  /* mask CR3 flag bits, keep frame addr */
     console_write("smp: kernel PML4 at 0x");
     console_write_hex64(pml4_phys);
     console_write("\n");
 
-    /* Determine number of CPUs from CPUID */
+    /* Determine number of CPUs from CPUID.
+     *
+     * Leaf 0x0B (extended topology) returns, per subleaf, the level type in
+     * ECX[15:8] (0 = invalid/last) and the number of logical processors at
+     * that level in EBX[15:0]. The TOTAL logical-processor count is the EBX of
+     * the highest valid level, so we iterate subleaves and take the max EBX —
+     * NOT subleaf 0 (that is the SMT level, e.g. 1 thread/core). The old code
+     * read subleaf 0 and gated on ECX[7:0] (the echoed subleaf number, always
+     * 0 for subleaf 0), so it never detected APs. */
     u32 max_leaf;
     __asm__ volatile("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
     u32 cpu_count = 1;
     if (max_leaf >= 0x0B) {
-        u32 eax, ebx, ecx, edx;
-        __asm__ volatile("cpuid" : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx) : "a"(0x0B), "c"(0));
-        if (ecx & 0xFF) {
-            cpu_count = ebx & 0xFFFF;
-            console_write("smp: CPUID reports ");
-            console_write_dec(cpu_count);
-            console_write(" logical processors\n");
+        for (u32 sub = 0; sub < 8; sub++) {
+            u32 eax, ebx, ecx, edx;
+            __asm__ volatile("cpuid"
+                             : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                             : "a"(0x0B), "c"(sub));
+            u32 level_type = (ecx >> 8) & 0xFF;
+            if (level_type == 0)
+                break;  /* no more valid topology levels */
+            u32 logical = ebx & 0xFFFF;
+            if (logical > cpu_count)
+                cpu_count = logical;
+        }
+    }
+    /* Fallback for CPUs/QEMU configs without a useful leaf 0x0B: the legacy
+     * logical-processor count in CPUID.1 EBX[23:16] (valid when HTT is set). */
+    if (cpu_count <= 1) {
+        u32 a, b, c, d;
+        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1));
+        if (d & (1u << 28)) {
+            u32 lpc = (b >> 16) & 0xFF;
+            if (lpc > cpu_count)
+                cpu_count = lpc;
         }
     }
     if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
+    console_write("smp: CPUID reports ");
+    console_write_dec(cpu_count);
+    console_write(" logical processors\n");
 
     /* If only 1 CPU, nothing to do */
     if (cpu_count <= 1) {
@@ -360,9 +434,12 @@ int smp_boot_aps(void) {
         for (volatile int i = 0; i < 5000000; i++) __asm__ volatile("pause");
         lapic_send_ipi(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_DEASSERT | LAPIC_ICR_TRIGGER_LEVEL);
 
-        /* Step 2: Send SIPI (vector = 0x80 = 0x8000 >> 12) */
+        /* Step 2: Send SIPI. The start-up vector is the trampoline page number:
+         * the AP begins executing at (vector << 12). The trampoline lives at
+         * physical 0x8000, so the vector is 0x08 (0x8000 >> 12), NOT 0x80 —
+         * vector 0x80 would start the AP at 0x80000, where there is no code. */
         console_write("smp: sending SIPI...\n");
-        lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x80);
+        lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x08);
 
         /* Wait for ready flag */
         u64 tv = 0xFFFF800000000000ULL + 0x8000;
@@ -379,7 +456,7 @@ int smp_boot_aps(void) {
 
         /* If first SIPI didn't work, try a second */
         console_write("smp: retrying SIPI...\n");
-        lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x80);
+        lapic_send_ipi(apic_id, LAPIC_ICR_STARTUP | 0x08);
         for (volatile int wait = 0; wait < 50000000; wait++) {
             if (*(volatile u32 *)(tv + TRAMP_READY_OFF)) {
                 console_write("smp: AP ");

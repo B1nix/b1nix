@@ -45,21 +45,48 @@ static volatile u64 scheduler_ticks;
 static int scheduler_started;
 static void task_init_cred(struct task *task);
 
+/* SMP: protects the tasks[] slot lifecycle (UNUSED <-> claimed) so allocation
+ * and freeing are atomic across CPUs. interrupts_disable() only fences the
+ * local CPU, so it is NOT sufficient once APs touch the table (e.g. an AP
+ * reaping a stolen worker while the BSP allocates). This is a leaf lock — never
+ * acquire another lock while holding it, and never hold it across a context
+ * switch. State transitions of an already-owned task (RUNNING/READY/...) stay
+ * word-atomic and are not covered here; only slot ownership is. */
+static spinlock_t g_tasks_lock = SPINLOCK_INIT;
+
 #include <b1nix/arch.h>
 
 static u64 align_down_u64(u64 value, u64 alignment) {
   return value & ~(alignment - 1);
 }
 
+/* Atomically claim a free tasks[] slot, zero it, mark it BLOCKED (reserved),
+ * and assign its id — all under g_tasks_lock so two CPUs can never claim the
+ * same slot. */
 static struct task *find_unused_task(void) {
+  u64 flags;
+  spin_lock_irqsave(&g_tasks_lock, &flags);
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state == TASK_UNUSED) {
       memset(&tasks[i], 0, sizeof(struct task));
       tasks[i].state = TASK_BLOCKED;
+      tasks[i].id = next_task_id++;
+      spin_unlock_irqrestore(&g_tasks_lock, flags);
       return &tasks[i];
     }
   }
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
   return 0;
+}
+
+/* Release a tasks[] slot back to UNUSED under g_tasks_lock (pairs with
+ * find_unused_task). The store also publishes any prior writes (e.g. the
+ * kfree of the task's resources) before the slot becomes claimable again. */
+static void free_task_slot(struct task *t) {
+  u64 flags;
+  spin_lock_irqsave(&g_tasks_lock, &flags);
+  t->state = TASK_UNUSED;
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
 static usize task_index(const struct task *task) {
@@ -178,7 +205,14 @@ static void task_init_cred(struct task *task) {
   }
 }
 
-int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
+/* Stealable CPU-bound kernel workers (SMP work-stealing, M24b) park back to
+ * the stealing AP's idle context via this trampoline instead of the normal
+ * kernel_thread_trampoline; defined in kernel/arch/x86/lapic.c. */
+extern void ap_worker_trampoline(void);
+
+static int kthread_create_impl(const char *name, kernel_thread_entry entry,
+                               void *arg, void (*trampoline)(void),
+                               int stealable) {
   interrupts_disable();
   struct task *parent_task = current_task;
   struct task *task = find_unused_task();
@@ -203,7 +237,8 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
   task->kernel_stack_ptr = stack_top;
   u64 initial_rsp = stack_top - 16;
-  *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
+  *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
+  task->stealable = stealable;
 
   task->name = strdup(name);
   if (!task->name) {
@@ -242,7 +277,16 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->context.r15 = 0;
 #endif
   task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
-  if (parent_task) {
+  if (stealable) {
+    /* Stealable CPU-bound workers are self-contained: no fd table, no cred,
+     * no address space. This keeps the AP run/reap path free of VFS/cred
+     * teardown (the worker never makes syscalls). */
+    task->stdout_fd = -1;
+    task->fd_capacity = 0;
+    task->fd_table = 0;
+    task->fd_flags = 0;
+    task->fd_lock = 0;
+  } else if (parent_task) {
     task->fd_capacity = parent_task->fd_capacity;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
@@ -292,7 +336,8 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
-  task_init_cred(task);
+  if (!stealable)
+    task_init_cred(task);
 
   interrupts_disable();
   task->state = TASK_READY;
@@ -300,6 +345,37 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   interrupts_enable();
 
   return (int)task->id;
+}
+
+int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0);
+}
+
+int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
+                                  void *arg) {
+  return kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1);
+}
+
+/* Reap a finished stealable worker. Called by an AP from ap_main AFTER the
+ * worker has switched back to the AP idle context (so its kernel stack is no
+ * longer in use). Stealable workers carry no fd table or cred, so teardown is
+ * just freeing the stack + name and releasing the task slot. kfree is
+ * heap_lock-protected; the state store is a word-sized x86 write, which the
+ * BSP's scheduler_task_count() reads tolerantly (DEAD and UNUSED both count as
+ * inactive). */
+void sched_ap_reap_worker(struct task *t) {
+  if (!t)
+    return;
+  if (t->stack) {
+    kfree(t->stack);
+    t->stack = 0;
+  }
+  if (t->name) {
+    kfree((void *)t->name);
+    t->name = 0;
+  }
+  __asm__ volatile("" ::: "memory");
+  t->state = TASK_UNUSED;
 }
 
 extern void x86_fork_child_trampoline(void);
