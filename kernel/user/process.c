@@ -749,7 +749,11 @@ int user_spawn(const char *path, int argc, const char **argv) {
   memcpy(safe_name, path, plen);
   safe_name[plen] = '\0';
 
-  int tid = kthread_create(safe_name, user_process_thread, start);
+  /* Real userspace ELF processes may run on Application Processors: they enter
+   * ring 3 and so release the Big Kernel Lock. Builtins run in kernel mode and
+   * stay on the BSP (ap_runnable=0). */
+  int ap_runnable = (image->kind == USER_IMAGE_ELF64);
+  int tid = kthread_create_user(safe_name, user_process_thread, start, ap_runnable);
   if (tid < 0) {
     kfree(start);
     user_image_free(image);

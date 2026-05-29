@@ -1401,9 +1401,30 @@ static int parse_ipv4_literal(const char *s, struct ipv4_addr *out) {
   return 0;
 }
 
+/* Bitmask of CPU ids that have executed a syscall from a real (ELF) userspace
+ * task. A syscall instruction runs in ring 3 and traps to ring 0 on the SAME
+ * core, so a set bit N means userspace genuinely ran on cpu N — the M24b BKL
+ * proof that ordinary processes execute on Application Processors. */
+static volatile u32 g_user_cpu_mask = 0;
+
+u32 sched_user_cpu_mask(void) { return g_user_cpu_mask; }
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   u64 ret = 0;
+
+  /* Record which CPU this userspace syscall came in on (ELF tasks only — kernel
+   * builtins make in-kernel syscalls that do not prove ring-3 execution). */
+  {
+    struct task *t = current_task;
+    if (t && t->user_image &&
+        ((struct user_loaded_image *)t->user_image)->kind == USER_IMAGE_ELF64) {
+      struct percpu *p = get_percpu();
+      if (p)
+        g_user_cpu_mask |= (1u << (p->cpu_id & 31));
+    }
+  }
+
   switch (number) {
   case SYS_WRITE:
     ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
@@ -1536,6 +1557,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
   case SYS_GETPID:
     return (u64)scheduler_get_pid();
+  case SYS_GETCPU: {
+    struct percpu *p = get_percpu();
+    return (u64)(p ? p->cpu_id : 0);
+  }
   case SYS_GETUID: {
     struct cred *c = scheduler_get_current_cred();
     return c ? c->uid : 0;

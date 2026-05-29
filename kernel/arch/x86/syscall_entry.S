@@ -2,6 +2,8 @@
 .code64
 
 .extern syscall_dispatch_impl
+.extern bkl_lock
+.extern bkl_unlock
 
 .section .bss
 .align 16
@@ -66,39 +68,30 @@ x86_syscall_entry:
     movq x86_syscall_saved_user_rsp(%rip), %rax
     pushq %rax
 
-    /* RSP now points to the start of the interrupt_frame.
-     * We pass this pointer as the 8th argument to syscall_dispatch.
-     * Arguments: number(RDI), arg0(RSI), arg1(RDX), arg2(RCX), arg3(R8), arg4(R9), [arg5, frame]
-     */
+    /* RSP now points to the start of the interrupt_frame (16-byte aligned).
+     *
+     * Acquire the Big Kernel Lock now that we are executing kernel code on
+     * behalf of this userspace task. bkl_lock clobbers the caller-saved
+     * registers that still hold the syscall arguments, so we reload every
+     * argument from the saved register frame afterwards (offsets from the frame
+     * start, which we keep in RBP). */
+    call bkl_lock
+    movq %rsp, %rbp    /* RBP = interrupt_frame pointer (also the 8th argument) */
 
-    /* Setup stack arguments (arg5 and frame) */
-    movq %rsp, %rbp    /* Save frame pointer in RBP temporarily */
+    /* Syscall convention -> System V ABI argument registers. Frame layout (from
+     * the pushes above): rax@0 rbx@8 rcx@16 rdx@24 rbp@32 rdi@40 rsi@48 r8@56
+     * r9@64 r10@72 r11@80 ...  Syscall args are number=rax, arg0=rdi, arg1=rsi,
+     * arg2=rdx, arg3=r10, arg4=r8, arg5=r9. */
+    movq 0(%rbp),  %rdi    /* number */
+    movq 40(%rbp), %rsi    /* arg0 (saved rdi) */
+    movq 48(%rbp), %rdx    /* arg1 (saved rsi) */
+    movq 24(%rbp), %rcx    /* arg2 (saved rdx) */
+    movq 72(%rbp), %r8     /* arg3 (saved r10) */
+    movq 56(%rbp), %r9     /* arg4 (saved r8) */
 
-    /* Arguments for System V ABI:
-     * RDI: number
-     * RSI: arg0
-     * RDX: arg1
-     * RCX: arg2
-     * R8:  arg3
-     * R9:  arg4
-     * [stack]: arg5
-     * [stack+8]: frame
-     */
-
-    /* Push arguments in reverse order (System V ABI stack arguments) */
-    pushq %rbp         /* 8th arg: frame pointer */
-
-    /* Save arg5 (original R9) before we overwrite it */
-    movq %r9, x86_syscall_saved_user_rsp(%rip)
-    pushq x86_syscall_saved_user_rsp(%rip) /* 7th arg: arg5 */
-
-    /* Move others into correct positions */
-    movq %r8, %r9      /* arg4 -> R9 */
-    movq %r10, %r8     /* arg3 -> R8 */
-    movq %rdx, %rcx    /* arg2 -> RCX */
-    movq %rsi, %rdx    /* arg1 -> RDX */
-    movq %rdi, %rsi    /* arg0 -> RSI */
-    movq %rax, %rdi    /* number -> RDI */
+    /* System V stack arguments (pushed in reverse order). */
+    pushq %rbp            /* 8th arg: frame pointer */
+    pushq 64(%rbp)        /* 7th arg: arg5 (saved r9) */
 
     call syscall_dispatch_impl
 
@@ -109,6 +102,13 @@ x86_syscall_return:
 
     /* Store the return value into the saved RAX slot in the interrupt frame */
     movq %rax, (%rsp)
+
+    /* Release the Big Kernel Lock before returning to ring 3 — userspace runs
+     * lock-free so other cores can execute their own userspace in parallel. The
+     * return value is parked in the frame slot above, so bkl_unlock clobbering
+     * RAX is harmless (it is reloaded by the popq below). RSP points at the
+     * 16-byte-aligned frame start here, satisfying the call ABI. */
+    call bkl_unlock
 
     /* Restore GPRs from the interrupt_frame */
     popq %rax

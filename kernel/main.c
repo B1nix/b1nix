@@ -24,6 +24,7 @@
 #include <b1nix/shm.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/lapic.h>
+#include <b1nix/bkl.h>
 #include <b1nix/video.h>
 #include <string.h>
 #include <stdio.h>
@@ -134,6 +135,12 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
 	smp_selftest_run();
 
+	/* The work-stealing self-test is done; let APs leave the work-stealing-only
+	 * loop and run the full cooperative scheduler (ordinary userspace processes)
+	 * under the Big Kernel Lock. From here, userspace runs on Application
+	 * Processors too. */
+	g_ap_userspace_enabled = 1;
+
 #ifndef __aarch64__
 	/* Try to mount persistent root device.
 	 * If virtio-blk0 has an ext4 filesystem (created via `make root-image`),
@@ -153,8 +160,17 @@ void kernel_main(u64 arg0, u64 arg1)
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
 	console_write(init_spawn_buf);
 
+	/* BSP idle loop. We hold the BKL (depth 1) here; scheduler_yield runs any
+	 * runnable task and returns at depth 1. When nothing is runnable it returns
+	 * 0 — drop the BKL so other cores can execute kernel code, pause, then
+	 * re-take it. Without this the BSP would spin holding the BKL and starve the
+	 * APs running userspace. */
 	while (scheduler_task_count() > 1) {
-		scheduler_yield();
+		if (!scheduler_yield()) {
+			bkl_unlock();
+			__asm__ volatile("pause");
+			bkl_lock();
+		}
 	}
 
 	console_write("\nM6 network layer demo complete\n");

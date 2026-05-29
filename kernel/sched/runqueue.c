@@ -31,10 +31,22 @@ struct task *rq_dequeue(struct runqueue *rq) {
     return t;
 }
 
-/* Enqueue onto current CPU's runqueue */
+/* Make a READY task runnable.
+ *
+ * Stealable CPU-bound workers go on THIS CPU's per-CPU runqueue so an idle AP
+ * can steal them via sched_steal_task (the M24b work-stealing path). Ordinary
+ * tasks (userspace processes, kernel threads) go on the shared global runqueue
+ * so any CPU can schedule them under the Big Kernel Lock — this is what lets
+ * userspace run on Application Processors. */
+extern struct runqueue *sched_global_rq(void);
+
 void sched_rq_enqueue_current(struct task *t) {
-    struct percpu *pcpu = get_percpu();
-    if (pcpu) rq_enqueue(&pcpu->runqueue, t);
+    if (t->stealable) {
+        struct percpu *pcpu = get_percpu();
+        if (pcpu) rq_enqueue(&pcpu->runqueue, t);
+    } else {
+        rq_enqueue(sched_global_rq(), t);
+    }
 }
 
 /* ── Work stealing ──
