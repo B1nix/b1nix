@@ -481,8 +481,9 @@ diagnostics.
 - [ ] `planned` Support subshell execution via `( list )`.
 - [ ] `planned` Complete POSIX terminal job control (implementing `bg`, robust job resumption, and state queries).
 - [ ] `planned` Add support for complex script structures (functions, `case` statements, arrays).
-- [ ] `planned` Implement pathname expansion (globbing): `*`, `?`, and `[…]` bracket expressions against the VFS.
-- [ ] `planned` Implement here-documents (`<<`, `<<-`) and arithmetic expansion (`$((…))`).
+- [x] `done` Implement pathname expansion (globbing): `*`, `?`, and `[…]`/`[!…]` bracket expressions against the VFS. Quote-aware (`parse_cmd` flags only unquoted metachars), sorted matches, dotfiles hidden unless the pattern starts with `.`, literal fallback when nothing matches. `kernel/user/programs.c` (`glob_match`/`glob_expand`); smoke-verified (`M33-SHELL: ok glob-star`/`glob-class`/`glob-nomatch`).
+- [x] `done` Implement arithmetic expansion (`$((…))`): recursive-descent integer evaluator (`+ - * / %`, parentheses, unary `+/-`, decimal literals, bare/`$`-prefixed variables) wired into `expand_env`. Smoke-verified (`M33-SHELL: ok arith`).
+- [x] `done` Implement here-documents (`<<`, `<<-`): source-agnostic body collection (script fd + interactive tty), `<<-` leading-tab stripping, quoted-delimiter expansion suppression, and body variable expansion; spooled to a temp file and consumed via the normal `<` redirection path. `kernel/user/programs.c` (`sh_resolve_heredoc`); smoke-verified (`M33-SHELL: ok heredoc`).
 - [ ] `planned` Broaden coreutils utility flag coverage toward POSIX (the named blocker in the POSIX estimate above).
 
 ## M34: Virtual Filesystems (/proc and /sys)

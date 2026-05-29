@@ -11,7 +11,9 @@
 #include <b1nix/video.h>
 #include <b1nix/sched.h>
 #include <b1nix/lapic.h>
+#include <b1nix/dirent.h>
 #include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 #include <tui.h>
 
@@ -423,18 +425,103 @@ static const char *get_env(const char *key) {
 
 static int sh_last_status = 0;
 
-static int atoi(const char *s) {
-  int res = 0;
-  int sign = 1;
-  if (*s == '-') {
-    sign = -1;
-    s++;
+/* Integer evaluator for $((...)) arithmetic expansion. Supports + - * / %,
+ * parentheses, unary +/-, decimal literals, and bare/`$`-prefixed variable
+ * names (resolved via the shell environment). Division/modulo by zero yield 0.
+ * Single-threaded shell, so a file-local cursor is safe across the recursion. */
+static const char *ar_cur;
+
+static long ar_expr(void);
+
+static void ar_skip(void) {
+  while (*ar_cur == ' ' || *ar_cur == '\t')
+    ar_cur++;
+}
+
+static long ar_factor(void) {
+  ar_skip();
+  if (*ar_cur == '+') {
+    ar_cur++;
+    return ar_factor();
   }
-  while (*s >= '0' && *s <= '9') {
-    res = res * 10 + (*s - '0');
-    s++;
+  if (*ar_cur == '-') {
+    ar_cur++;
+    return -ar_factor();
   }
-  return res * sign;
+  if (*ar_cur == '(') {
+    ar_cur++;
+    long v = ar_expr();
+    ar_skip();
+    if (*ar_cur == ')')
+      ar_cur++;
+    return v;
+  }
+  if (*ar_cur == '$')
+    ar_cur++;
+  if ((*ar_cur >= 'a' && *ar_cur <= 'z') || (*ar_cur >= 'A' && *ar_cur <= 'Z') ||
+      *ar_cur == '_') {
+    char name[32];
+    int k = 0;
+    while (((*ar_cur >= 'a' && *ar_cur <= 'z') ||
+            (*ar_cur >= 'A' && *ar_cur <= 'Z') ||
+            (*ar_cur >= '0' && *ar_cur <= '9') || *ar_cur == '_') &&
+           k < 31)
+      name[k++] = *ar_cur++;
+    name[k] = '\0';
+    return atoi(get_env(name));
+  }
+  long v = 0;
+  while (*ar_cur >= '0' && *ar_cur <= '9') {
+    v = v * 10 + (*ar_cur - '0');
+    ar_cur++;
+  }
+  return v;
+}
+
+static long ar_term(void) {
+  long v = ar_factor();
+  for (;;) {
+    ar_skip();
+    char op = *ar_cur;
+    if (op == '*') {
+      ar_cur++;
+      v = v * ar_factor();
+    } else if (op == '/') {
+      ar_cur++;
+      long d = ar_factor();
+      v = d ? v / d : 0;
+    } else if (op == '%') {
+      ar_cur++;
+      long d = ar_factor();
+      v = d ? v % d : 0;
+    } else {
+      break;
+    }
+  }
+  return v;
+}
+
+static long ar_expr(void) {
+  long v = ar_term();
+  for (;;) {
+    ar_skip();
+    char op = *ar_cur;
+    if (op == '+') {
+      ar_cur++;
+      v = v + ar_term();
+    } else if (op == '-') {
+      ar_cur++;
+      v = v - ar_term();
+    } else {
+      break;
+    }
+  }
+  return v;
+}
+
+static long eval_arith(const char *expr) {
+  ar_cur = expr;
+  return ar_expr();
 }
 
 static void expand_env(const char *in, char *out) {
@@ -442,6 +529,31 @@ static void expand_env(const char *in, char *out) {
   while (in[i]) {
     if (in[i] == '$') {
       i++;
+      if (in[i] == '(' && in[i + 1] == '(') {
+        /* arithmetic expansion: $(( expr )) */
+        i += 2;
+        char inner[128];
+        int n = 0, depth = 0;
+        while (in[i]) {
+          if (in[i] == ')' && in[i + 1] == ')' && depth == 0) {
+            i += 2;
+            break;
+          }
+          if (in[i] == '(')
+            depth++;
+          else if (in[i] == ')')
+            depth--;
+          if (n < (int)sizeof(inner) - 1)
+            inner[n++] = in[i];
+          i++;
+        }
+        inner[n] = '\0';
+        char buf[24];
+        snprintf(buf, sizeof(buf), "%ld", eval_arith(inner));
+        for (int k = 0; buf[k]; k++)
+          out[j++] = buf[k];
+        continue;
+      }
       if (in[i] == '?') {
         char buf[12];
         snprintf(buf, sizeof(buf), "%d", sh_last_status);
@@ -469,8 +581,10 @@ static void expand_env(const char *in, char *out) {
   out[j] = '\0';
 }
 
-/* POSIX-style shell parsing with quotes and escaping */
-static int parse_cmd(char *cmd, char **args, int max_args) {
+/* POSIX-style shell parsing with quotes and escaping. When glob_flags is
+ * non-NULL it receives, per token, 1 if the token held an unquoted glob
+ * metacharacter (* ? [) and is therefore eligible for pathname expansion. */
+static int parse_cmd(char *cmd, char **args, int *glob_flags, int max_args) {
   int count = 0;
   char *p = cmd;
   int in_dquote = 0;
@@ -483,6 +597,7 @@ static int parse_cmd(char *cmd, char **args, int max_args) {
       break;
 
     args[count++] = p;
+    int tok_glob = 0;
     char *dst = p;
     while (*p) {
       /* Backslash escape: only outside single quotes */
@@ -511,13 +626,171 @@ static int parse_cmd(char *cmd, char **args, int max_args) {
       if (!in_squote && !in_dquote && (*p == ' ' || *p == '\t'))
         break;
 
+      if (!in_squote && !in_dquote &&
+          (*p == '*' || *p == '?' || *p == '['))
+        tok_glob = 1;
+
       *dst++ = *p++;
     }
     if (*p)
       p++;
     *dst = '\0';
+    if (glob_flags)
+      glob_flags[count - 1] = tok_glob;
   }
   return count;
+}
+
+/* fnmatch-style matcher for shell globbing: *, ?, and [set]/[!set]. */
+static int glob_match(const char *pat, const char *str) {
+  while (*pat) {
+    if (*pat == '*') {
+      pat++;
+      if (!*pat)
+        return 1;
+      while (*str) {
+        if (glob_match(pat, str))
+          return 1;
+        str++;
+      }
+      return glob_match(pat, str);
+    } else if (*pat == '?') {
+      if (!*str)
+        return 0;
+      pat++;
+      str++;
+    } else if (*pat == '[') {
+      const char *p = pat + 1;
+      int neg = 0;
+      if (*p == '!' || *p == '^') {
+        neg = 1;
+        p++;
+      }
+      int matched = 0;
+      char c = *str;
+      if (!c)
+        return 0;
+      while (*p && *p != ']') {
+        if (p[1] == '-' && p[2] && p[2] != ']') {
+          if (c >= p[0] && c <= p[2])
+            matched = 1;
+          p += 3;
+        } else {
+          if (c == *p)
+            matched = 1;
+          p++;
+        }
+      }
+      if (*p == ']')
+        p++;
+      if (matched == neg)
+        return 0;
+      pat = p;
+      str++;
+    } else {
+      if (*pat != *str)
+        return 0;
+      pat++;
+      str++;
+    }
+  }
+  return *str == '\0';
+}
+
+/* Expand glob tokens (flagged by parse_cmd) against the filesystem. Non-glob
+ * tokens are passed through verbatim. A glob with no match stays literal (bash
+ * default without nullglob). Matches are sorted and never include "." / ".." or
+ * dotfiles unless the pattern itself starts with '.'. Result strings are
+ * written into pool; returns the expanded argument count. */
+static int glob_expand(const char *cwd, char **args, const int *gflags,
+                       int argc, char **out, int max_out, char *pool,
+                       int pool_sz) {
+  int oc = 0;
+  int pu = 0;
+
+  for (int i = 0; i < argc; i++) {
+    if (!gflags[i]) {
+      if (oc < max_out)
+        out[oc++] = args[i];
+      continue;
+    }
+
+    const char *tok = args[i];
+    const char *slash = 0;
+    for (const char *s = tok; *s; s++)
+      if (*s == '/')
+        slash = s;
+
+    char dirpart[200];
+    char pat[120];
+    if (slash) {
+      int dl = (int)(slash - tok);
+      if (dl > (int)sizeof(dirpart) - 1)
+        dl = (int)sizeof(dirpart) - 1;
+      memcpy(dirpart, tok, dl);
+      dirpart[dl] = '\0';
+      strncpy(pat, slash + 1, sizeof(pat) - 1);
+      pat[sizeof(pat) - 1] = '\0';
+    } else {
+      dirpart[0] = '\0';
+      strncpy(pat, tok, sizeof(pat) - 1);
+      pat[sizeof(pat) - 1] = '\0';
+    }
+
+    char dirpath[256];
+    if (tok[0] == '/')
+      snprintf(dirpath, sizeof(dirpath), "%s", dirpart[0] ? dirpart : "/");
+    else if (dirpart[0])
+      snprintf(dirpath, sizeof(dirpath), "%s/%s", cwd, dirpart);
+    else
+      snprintf(dirpath, sizeof(dirpath), "%s", cwd);
+
+    int before = oc;
+    int matchstart = oc;
+    struct dirent *ents = malloc(64 * sizeof(struct dirent));
+    if (ents) {
+      int n = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)dirpath,
+                                    (u64)(usize)ents, 64, 0, 0, 0);
+      for (int e = 0; e < n && oc < max_out; e++) {
+        const char *nm = ents[e].name;
+        if (strcmp(nm, ".") == 0 || strcmp(nm, "..") == 0)
+          continue;
+        if (nm[0] == '.' && pat[0] != '.')
+          continue;
+        if (!glob_match(pat, nm))
+          continue;
+        char res[256];
+        int rl;
+        if (slash && dirpart[0])
+          rl = snprintf(res, sizeof(res), "%s/%s", dirpart, nm);
+        else if (slash)
+          rl = snprintf(res, sizeof(res), "/%s", nm);
+        else
+          rl = snprintf(res, sizeof(res), "%s", nm);
+        if (rl < 0 || pu + rl + 1 > pool_sz)
+          break;
+        memcpy(pool + pu, res, rl + 1);
+        out[oc++] = pool + pu;
+        pu += rl + 1;
+      }
+      free(ents);
+    }
+
+    /* Sort the matches added for this token. */
+    for (int a = matchstart + 1; a < oc; a++) {
+      char *key = out[a];
+      int b = a - 1;
+      while (b >= matchstart && strcmp(out[b], key) > 0) {
+        out[b + 1] = out[b];
+        b--;
+      }
+      out[b + 1] = key;
+    }
+
+    if (oc == before && oc < max_out)
+      out[oc++] = args[i]; /* no match: literal */
+  }
+  return oc;
 }
 
 struct shell_redir {
@@ -900,11 +1173,28 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
      * for real toolchain command lines (e.g. a kernel-flag gcc invocation has
      * ~20 tokens), which silently dropped trailing args like `-o file`. */
     char *args[32];
-    int num_args = parse_cmd(p, args, 32);
+    int gflags[32];
+    int num_args = parse_cmd(p, args, gflags, 32);
+
+    /* Pathname expansion: expand glob-flagged tokens against the filesystem.
+     * Output is capped at USER_MAX_ARGS to stay within the SYS_SPAWN argv
+     * copy limit; on alloc failure we fall back to the unexpanded args. */
+    char *gargs[USER_MAX_ARGS];
+    char *gpool = malloc(SH_LINE_MAX * 4);
+    char **eargs = args;
+    int eargc = num_args;
+    if (gpool) {
+      eargc = glob_expand(cwd, args, gflags, num_args, gargs, USER_MAX_ARGS,
+                          gpool, SH_LINE_MAX * 4);
+      eargs = gargs;
+    }
+
     struct shell_redir redir;
-    num_args = parse_redirs(args, num_args, &redir);
-    if (num_args < 0) {
+    eargc = parse_redirs(eargs, eargc, &redir);
+    if (eargc < 0) {
       uwrite("sh: syntax error: redirection\n");
+      if (gpool)
+        free(gpool);
       return 2;
     }
 
@@ -915,14 +1205,18 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
     if (opened_count < 0) {
       uwrite("sh: redirection failed\n");
       restore_stdio(saved);
+      if (gpool)
+        free(gpool);
       return 1;
     }
 
-    int status = sh_execute_cmd(cwd, args, num_args, is_bg);
+    int status = sh_execute_cmd(cwd, eargs, eargc, is_bg);
 
     for (int i = 0; i < opened_count; i++)
       syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0, 0, 0);
     restore_stdio(saved);
+    if (gpool)
+      free(gpool);
     return status;
   }
 
@@ -1038,6 +1332,136 @@ static void sh_execute_line(char *line, char *cwd) {
   }
 }
 
+/* Source-agnostic "read next raw line" callback used by here-document
+ * collection: returns the line length (without newline), or -1 at EOF. */
+typedef int (*sh_readline_fn)(char *buf, int max, void *ctx);
+
+struct hdoc_fd_ctx {
+  u64 fd;
+};
+
+static int hdoc_read_fd(char *buf, int max, void *ctx) {
+  struct hdoc_fd_ctx *c = (struct hdoc_fd_ctx *)ctx;
+  int i = 0;
+  for (;;) {
+    char ch;
+    isize n = (isize)syscall_dispatch(SYS_READ, c->fd, (u64)(usize)&ch, 1, 0, 0,
+                                      0);
+    if (n <= 0) {
+      if (i == 0)
+        return -1;
+      break;
+    }
+    if (ch == '\n')
+      break;
+    if (i < max - 1)
+      buf[i++] = ch;
+  }
+  buf[i] = '\0';
+  return i;
+}
+
+static int hdoc_read_tty(char *buf, int max, void *ctx) {
+  (void)ctx;
+  return readline(buf, (usize)max);
+}
+
+/* Resolve a single here-document on `line` in place. Reads body lines via
+ * next(ctx) until a line equal to the delimiter, spools the (optionally
+ * variable-expanded) body into a temp file, and rewrites `cmd <<[-]DELIM` to
+ * `cmd < /tmp/.b1hdocN` so the normal `<` redirection path consumes it.
+ * `<<-` strips leading tabs from body lines and the closing delimiter; a quoted
+ * delimiter (`<<'EOF'`) suppresses variable expansion. Returns 1 if a heredoc
+ * was processed, else 0. */
+static int sh_resolve_heredoc(char *line, int linecap, sh_readline_fn next,
+                              void *ctx) {
+  int q = 0;
+  int pos = -1;
+  for (int i = 0; line[i]; i++) {
+    char c = line[i];
+    if ((c == '"' || c == '\'') && (q == 0 || q == c))
+      q = q ? 0 : c;
+    else if (!q && c == '<' && line[i + 1] == '<') {
+      pos = i;
+      break;
+    }
+  }
+  if (pos < 0)
+    return 0;
+
+  int j = pos + 2;
+  int strip_tabs = 0;
+  if (line[j] == '-') {
+    strip_tabs = 1;
+    j++;
+  }
+  while (line[j] == ' ' || line[j] == '\t')
+    j++;
+  int expand = 1;
+  char qc = 0;
+  if (line[j] == '"' || line[j] == '\'') {
+    qc = line[j];
+    expand = 0;
+    j++;
+  }
+  char delim[64];
+  int dl = 0;
+  while (line[j] && line[j] != ' ' && line[j] != '\t' && line[j] != qc &&
+         line[j] != '"' && line[j] != '\'' && dl < 63)
+    delim[dl++] = line[j++];
+  delim[dl] = '\0';
+  if (qc && line[j] == qc)
+    j++;
+  if (dl == 0)
+    return 0;
+
+  static int hseq = 0;
+  char tmpname[32];
+  snprintf(tmpname, sizeof(tmpname), "/tmp/.b1hdoc%d", hseq++);
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)tmpname,
+                            B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0,
+                            0, 0);
+
+  char body[SH_LINE_MAX];
+  char ebody[SH_LINE_MAX * 2];
+  for (;;) {
+    if (next(body, sizeof(body), ctx) < 0)
+      break; /* EOF before delimiter */
+    char *bl = body;
+    if (strip_tabs)
+      while (*bl == '\t')
+        bl++;
+    if (strcmp(bl, delim) == 0)
+      break;
+    const char *wline = bl;
+    if (expand) {
+      expand_env(bl, ebody);
+      wline = ebody;
+    }
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_WRITE, fd, (u64)(usize)wline, strlen(wline), 0, 0, 0);
+      syscall_dispatch(SYS_WRITE, fd, (u64)(usize) "\n", 1, 0, 0, 0);
+    }
+  }
+  if ((isize)fd >= 0)
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+
+  char rebuilt[SH_LINE_MAX];
+  int w = 0;
+  for (int i = 0; i < pos && w < linecap - 1; i++)
+    rebuilt[w++] = line[i];
+  const char *inj = "< ";
+  for (int i = 0; inj[i] && w < linecap - 1; i++)
+    rebuilt[w++] = inj[i];
+  for (int i = 0; tmpname[i] && w < linecap - 1; i++)
+    rebuilt[w++] = tmpname[i];
+  for (int i = j; line[i] && w < linecap - 1; i++)
+    rebuilt[w++] = line[i];
+  rebuilt[w] = '\0';
+  memcpy(line, rebuilt, (usize)w + 1);
+  return 1;
+}
+
 static void sh_run_script(const char *path, char *cwd) {
   u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
   if ((isize)fd < 0) {
@@ -1055,6 +1479,8 @@ static void sh_run_script(const char *path, char *cwd) {
     if (c == '\n') {
       line[i] = '\0';
       if (line[0] && strncmp(line, "#!", 2) != 0) {
+        struct hdoc_fd_ctx hc = {fd};
+        sh_resolve_heredoc(line, SH_LINE_MAX, hdoc_read_fd, &hc);
         expand_env(line, expanded);
         sh_execute_line(expanded, cwd);
       }
@@ -1116,6 +1542,7 @@ static int sh_main(int argc, const char **argv) {
       break;
     }
 
+    sh_resolve_heredoc(raw_line, sizeof(raw_line), hdoc_read_tty, 0);
     expand_env(raw_line, line);
     sh_execute_line(line, cwd);
 
@@ -2458,10 +2885,143 @@ static void m11_pipe_nonblock_smoke(void) {
   syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0, 0, 0);
 }
 
+struct hdoc_str_ctx {
+  const char **lines;
+  int idx;
+};
+
+static int hdoc_read_str(char *buf, int max, void *ctx) {
+  struct hdoc_str_ctx *c = (struct hdoc_str_ctx *)ctx;
+  if (!c->lines[c->idx])
+    return -1;
+  strncpy(buf, c->lines[c->idx++], (usize)max - 1);
+  buf[max - 1] = '\0';
+  return (int)strlen(buf);
+}
+
+static void m33_touch(const char *path) {
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path,
+                            B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0,
+                            0, 0, 0);
+  if ((isize)fd >= 0)
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+}
+
+/* Deterministic M33 shell smoke: pathname globbing + arithmetic expansion.
+ * Exercises the real glob_expand / expand_env code paths and asserts results. */
+static void m33_shell_smoke(void) {
+  uwrite("M33-SHELL: start\n");
+
+  /* --- globbing fixture --- */
+  syscall_dispatch(SYS_MKDIR, (u64)(usize) "/tmp/m33", 0755, 0, 0, 0, 0);
+  m33_touch("/tmp/m33/a.txt");
+  m33_touch("/tmp/m33/b.txt");
+  m33_touch("/tmp/m33/c.log");
+
+  char pool[SH_LINE_MAX * 2];
+  char *out[USER_MAX_ARGS];
+
+  /* "*.txt" -> a.txt b.txt (sorted) */
+  {
+    char tok[] = "*.txt";
+    char *in[1] = {tok};
+    int gf[1] = {1};
+    int n = glob_expand("/tmp/m33", in, gf, 1, out, USER_MAX_ARGS, pool,
+                        sizeof(pool));
+    if (n == 2 && strcmp(out[0], "a.txt") == 0 && strcmp(out[1], "b.txt") == 0)
+      uwrite("M33-SHELL: ok glob-star\n");
+    else
+      uwrite("M33-SHELL: fail glob-star\n");
+  }
+
+  /* "?.log" -> c.log ; "[ab].txt" -> a.txt b.txt */
+  {
+    char tq[] = "?.log";
+    char *in[1] = {tq};
+    int gf[1] = {1};
+    int n1 = glob_expand("/tmp/m33", in, gf, 1, out, USER_MAX_ARGS, pool,
+                         sizeof(pool));
+    int ok_q = (n1 == 1 && strcmp(out[0], "c.log") == 0);
+
+    char tc[] = "[ab].txt";
+    char *in2[1] = {tc};
+    int n2 = glob_expand("/tmp/m33", in2, gf, 1, out, USER_MAX_ARGS, pool,
+                         sizeof(pool));
+    int ok_c =
+        (n2 == 2 && strcmp(out[0], "a.txt") == 0 && strcmp(out[1], "b.txt") == 0);
+
+    if (ok_q && ok_c)
+      uwrite("M33-SHELL: ok glob-class\n");
+    else
+      uwrite("M33-SHELL: fail glob-class\n");
+  }
+
+  /* no match -> literal token preserved */
+  {
+    char tm[] = "*.md";
+    char *in[1] = {tm};
+    int gf[1] = {1};
+    int n = glob_expand("/tmp/m33", in, gf, 1, out, USER_MAX_ARGS, pool,
+                        sizeof(pool));
+    if (n == 1 && strcmp(out[0], "*.md") == 0)
+      uwrite("M33-SHELL: ok glob-nomatch\n");
+    else
+      uwrite("M33-SHELL: fail glob-nomatch\n");
+  }
+
+  /* --- arithmetic expansion --- */
+  {
+    char e1[32], e2[32], e3[32], e4[32];
+    expand_env("$((2+3*4))", e1);
+    expand_env("$(( (2+3)*4 ))", e2);
+    expand_env("$((10%3))", e3);
+    set_env("N", "5");
+    expand_env("$((N*2))", e4);
+    if (strcmp(e1, "14") == 0 && strcmp(e2, "20") == 0 &&
+        strcmp(e3, "1") == 0 && strcmp(e4, "10") == 0)
+      uwrite("M33-SHELL: ok arith\n");
+    else
+      uwrite("M33-SHELL: fail arith\n");
+  }
+
+  /* --- here-document: collection, delimiter, and body var-expansion --- */
+  {
+    set_env("N", "5");
+    char hline[64];
+    strcpy(hline, "cat <<EOF");
+    const char *blines[] = {"hi $N", "world", "EOF", 0};
+    struct hdoc_str_ctx hc = {blines, 0};
+    int got = sh_resolve_heredoc(hline, sizeof(hline), hdoc_read_str, &hc);
+    int ok = 0;
+    char *lt = strchr(hline, '<');
+    if (got == 1 && lt) {
+      const char *path = lt + 1;
+      while (*path == ' ')
+        path++;
+      u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
+      if ((isize)fd >= 0) {
+        char rb[64];
+        isize n = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)rb,
+                                          sizeof(rb) - 1, 0, 0, 0);
+        if (n > 0) {
+          rb[n] = '\0';
+          if (strcmp(rb, "hi 5\nworld\n") == 0)
+            ok = 1;
+        }
+        syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+      }
+    }
+    uwrite(ok ? "M33-SHELL: ok heredoc\n" : "M33-SHELL: fail heredoc\n");
+  }
+
+  uwrite("M33-SHELL: done\n");
+}
+
 int shell_smoke_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
   uwrite("M11-SMOKE: start\n");
+  m33_shell_smoke();
   /* Inline pipe-EOF deterministic check */
   m11_pipe_eof_smoke();
   m11_pipe_nonblock_smoke();
