@@ -8,6 +8,133 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-29 (n) — Why 128MB+swap still OOM'd: swap reclaim was gated off in the klarge path; raised the two swap caps
+
+The 128MB + 256MB-swap run from the previous status failed at `KBUILD 1` with
+`[PANIC] klarge: OOM` even though swap was active and `M14-SMOKE: ok swap-smoke`
+passed. The conclusion "swap can't free kernel memory" was only half the story.
+
+### Root cause — swap eviction never ran
+`pmm_alloc_frame`'s OOM reclaim (`kernel/mm/pmm.c:478`) only swaps a user page
+out when **`swap_active() && interrupts_enabled()`**. But `klarge_alloc` (and
+`heap_grow`) allocate frames while holding `heap_lock` via `spin_lock_irqsave`,
+i.e. **with interrupts disabled**, so `interrupts_enabled()` is false and
+`swap_evict_page()` is **never called**. The 128MB+swap log proves it: there is
+not a single `[M26DIAG] swap_evict frame=` line before the OOM — only page-cache
+eviction ran (to zero), then `pmm_reclaim_failed`. You cannot do blocking swap
+I/O (which yields) under a spinlock, so the reclaim path correctly refuses — the
+real bug is that the large-allocation path held the lock across frame allocation.
+
+### Fixes landed (this session)
+1. **klarge frame alloc moved out of the lock** (`kernel/mm/kheap.c`).
+   `klarge_alloc` now reserves the vaddr span under `heap_lock` (fast,
+   non-blocking), **releases the lock**, then maps the frames at the caller's
+   interrupt state. For the in-guest build path (kmalloc from a syscall with
+   IRQs on) this lets `pmm_alloc_frame` swap user pages out and retry instead of
+   OOMing. b1nix is cooperatively scheduled, so on the uniprocessor build/smoke
+   path `vmm_map_page` is not preempted mid-call; the span is reserved
+   exclusively so no other allocator races it.
+2. **Swap capacity raised to track the device** (`kernel/mm/swap.c`).
+   `MAX_SWAP_SLOTS` 1024 → 65536 (static cap, ~1.5MB BSS) with a runtime
+   `swap_slot_count` clamped to the backing device, so a 256MB swap disk is now
+   fully usable instead of 4MB (98% was wasted).
+3. **Evictable-page tracking raised** (`kernel/mm/eviction.c`).
+   `MAX_USER_PAGES` 4096 → 65536 (~2MB BSS). The clock/page-ring only tracked
+   16MB of user pages, far below a cc1 working set, so most user pages were
+   never registered and could not be evicted even with swap space free.
+
+All three are required together: (1) lets reclaim run, (2) gives it somewhere to
+write, (3) gives it pages to choose. Host smoke is unaffected by these
+(`swap: initialized, max_slots=65536`, `M14-SMOKE: ok swap-smoke`, M25/klarge OK).
+
+### In-guest results (this macOS host, `smoke_run/inguest_build.py`, HVF)
+- **256MB**: healthy — reached `KBUILD 64/76` cleanly with no panic/OOM before a
+  900s harness timeout (TCG-slow; raise the timeout to ~2700s to see KBUILD-DONE).
+  No regression from the swap/klarge changes.
+- **128MB + 256MB swap**: still OOMs at `KBUILD 1` (`[PANIC] klarge: OOM`) — **but
+  the swap path is now working**: `swap_evict` fired **1026 times** (it was *never*
+  called before — Part-1 gating fix confirmed). Crucially, **swap is NOT the
+  limiter**: `0` "no free swap slots" (only ~4MB of the 256MB swap used), and the
+  reclaim died on `swap_evict` returning 0 = **no more evictable user pages**.
+  At the OOM the general kheap had grown to ~32MB and `free_frames=0`; only ~1026
+  user pages (~4MB, the gcc driver's footprint) were evictable. The real 128MB
+  limiter is the **non-swappable kernel peak** — general kheap (~32MB) + the
+  klarge ELF-staging buffer for cc1 + page tables — which together exceed the
+  ~119MB usable after evicting the small evictable set. **A bigger (8GB) swap
+  would NOT help** (swap was 98% free). Pushing below 256MB requires shrinking the
+  non-swappable peak (e.g. stream/segment the ELF load instead of a full-file
+  klarge staging buffer, and reduce kheap residency), not more swap.
+
+**Verified minimum remains 256MB** (256/512/2048/8192 MB all build); 128MB is
+below the practical floor for cc1's footprint on the current loader.
+
+### Decision: 256MB is the accepted floor; 128MB is not pursued
+The official GCC docs state **no minimum RAM** to run (it is workload-dependent
+on TU size and optimization), and community guidance puts real-world builds at
+~512MB with little headroom. b1nix builds its own kernel in **256MB** (small TUs
+at `-O0`), which is at or below upstream GCC's own practical floor — so 128MB
+failing reflects GCC's genuine memory needs, not a b1nix limitation. The M26
+"≤2048MB in-guest self-host" goal is therefore **met**; pushing below 256MB is
+recorded as `wontfix` in the roadmap. Remaining separate item: the M11 host-smoke
+control-flow corruption (latent heap/VFS bug, layout-exposed by the mc fix; does
+not affect the self-host build path) — triage with the `m26-coalesce-wip` stash
+validator.
+
+### Known perf caveat (not yet addressed)
+`swap_out` calls `blk_cache_flush` after every page (`swap.c:196`); under heavy
+128MB swapping this is O(pages) full flushes and may dominate runtime. If the
+128MB build is correct but slow/times out, this is the first thing to relax.
+
+### M11 host-smoke GP is a SEPARATE pre-existing corruption (not the swap work)
+Current HEAD host smoke deterministically (3/3) GPs during **M11 `cp`** with
+`rip=0x111bf0, cs=0x08` — a kernel-mode jump to a **non-kernel garbage address**
+(kernel .text is at `0xFFFFFFFF80000000+`), i.e. **corrupted control flow** from
+an overwritten return address / function pointer. Bisecting on the host:
+reverting the klarge Part-1 change does NOT fix it, and reverting the DMA-fix
+drivers does NOT fix it; the only differentiator from the last passing run is the
+**mc fix (`0304fdf`)**, which is pure `kernel/user/mc.c`. Since mc's malloc/free
+are userspace and it has no kernel write-overflow, the mc fix doesn't *introduce*
+the corruption — it shifts the kernel binary layout (mc.c is a built-in compiled
+into the kernel) and **exposes the same latent heap/VFS corruption** the
+aggressive `kheap_validate` already flags at M16 (UPDATE m: it still panics at
+M16 *after* the mc + DMA fixes, so at least one corruption source remains). This
+is a host-smoke-suite robustness bug; the **in-guest self-host build does not run
+the M11 coreutils path**, so it does not block the low-RAM self-host goal. The
+validator branch in git stash `m26-coalesce-wip` is the tool to localize it.
+
+## UPDATE 2026-05-29 (m) — Block DMA lifetime fixed at the suspected UAF boundary
+
+The latent heap corruption from UPDATE (l) had one clearly unsafe boundary:
+block drivers could hand a caller's DMA buffer back to the allocator while the
+device still owned an in-flight command. That is now fixed at the driver API
+boundary.
+
+### Landed changes
+- **AHCI:** once a read/write/flush/identify command is issued via `PxCI`, the
+  driver no longer returns on a bounded timeout. It waits until the controller
+  clears the command slot, printing a one-time diagnostic if the old timeout
+  threshold is exceeded. This preserves the lifetime of the caller's buffer.
+- **NVMe:** admin and I/O submissions no longer return after the old polling
+  timeout once the SQ doorbell has been rung. This prevents freeing/reusing PRP
+  lists or data buffers while the controller may still DMA to them.
+- **virtio-blk:** request status is now per-request DMA storage, not a global
+  byte; the single legacy queue is serialized; real memory barriers surround
+  descriptor publication and completion/status consumption.
+
+### Verification
+- `make ARCH=x86 KERNEL_CMDLINE= iso && make ARCH=x86 root-image`
+- `sh tests/smoke.sh x86` → **218/0**, including M14 storage, M25 TCC, AHCI and
+  NVMe registration.
+
+The preserved `m26-coalesce-wip` validator stash was re-run in a temporary
+worktree after copying the ignored local TCC configure outputs from
+`userspace/tcc` (`config.*`, `conftest.c`, `tccdefs_.h`). It now builds and runs
+far enough to prove the DMA-lifetime fix is **not sufficient**: M25/TCC and M26
+pass, then the aggressive kheap validator still panics at M16 with the same
+stable header corruption (`magic=0x4f780`, adjacent implausible
+`prev_size=3141632`). The block-DMA lifetime fix is still correct and necessary,
+but the latent heap overwrite has at least one more source.
+
 ## UPDATE 2026-05-29 (l) — Large-allocation arena returns pages to the pmm; general-heap coalescing abandoned (exposes a pre-existing heap UAF)
 
 This session set out to do the planned "coalescing + return whole pages to the

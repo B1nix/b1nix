@@ -247,6 +247,7 @@ static void *klarge_alloc(usize size, u64 caller) {
   usize total = KLARGE_HEADER_SIZE + size;
   usize npages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
 
+  /* Phase 1 — reserve a vaddr span under the lock (fast, non-blocking). */
   u64 flags;
   spin_lock_irqsave(&heap_lock, &flags);
 
@@ -272,7 +273,21 @@ static void *klarge_alloc(usize size, u64 caller) {
     }
     klarge_bump = base + npages * PAGE_SIZE;
   }
+  void *ptr = (void *)(usize)(base + KLARGE_HEADER_SIZE);
+  track_alloc((u64)(usize)ptr, size, caller);
+  spin_unlock_irqrestore(&heap_lock, flags);
 
+  /* Phase 2 — map fresh frames with the lock released, i.e. at the CALLER's
+   * interrupt state. This is deliberate and load-bearing: `pmm_alloc_frame`'s
+   * OOM path can only swap user pages out to relieve pressure when interrupts
+   * are enabled (swap I/O yields), so doing this under heap_lock (IRQs off)
+   * gates swap reclaim off entirely — which is exactly why a 128MB + swap
+   * in-guest build OOM'd at `KBUILD 1` without ever calling swap_evict_page.
+   * The span is already reserved exclusively here, so no other allocator can
+   * touch it. b1nix is cooperatively scheduled (no preemption mid-map), so on
+   * the uniprocessor build/smoke path vmm_map_page is atomic w.r.t. other
+   * tasks; on true SMP this shares the single-writer assumption already made
+   * by general-heap growth. */
   for (usize i = 0; i < npages; i++) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
@@ -286,10 +301,6 @@ static void *klarge_alloc(usize size, u64 caller) {
   h->size = size;
   h->npages = npages;
   h->pad = 0;
-
-  void *ptr = (void *)(usize)(base + KLARGE_HEADER_SIZE);
-  track_alloc((u64)(usize)ptr, size, caller);
-  spin_unlock_irqrestore(&heap_lock, flags);
   return ptr;
 }
 

@@ -3,6 +3,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
+#include <b1nix/sched.h>
 #include <string.h>
 
 #define NVME_MAX_QUEUE_SIZE 64
@@ -43,6 +44,13 @@ struct nvme_device {
 
 static struct nvme_device nvme;
 
+static void nvme_wait_note(const char *queue_name)
+{
+    console_write("nvme: ");
+    console_write(queue_name);
+    console_write(" command still pending after timeout; waiting to preserve DMA buffer lifetime\n");
+}
+
 
 
 static int nvme_wait_ready(volatile struct nvme_registers *regs, int ready)
@@ -69,9 +77,10 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     volatile u32 *sq_tdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000);
     *sq_tdb = tail;
     
-    // Wait for completion
-    int timeout = 10000000;
-    while (timeout > 0) {
+    // Wait for completion. Once the command is submitted, do not return while
+    // the controller may still DMA into command buffers owned by the caller.
+    u64 spins = 0;
+    for (;;) {
         volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 4); // CQ0 head doorbell
         u16 cq_head = dev->admin_cq_head;
         
@@ -94,12 +103,12 @@ static int nvme_admin_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             }
             return 0;
         }
-        __asm__ volatile("pause");
-        timeout--;
+        if (spins == 10000000ULL) {
+            nvme_wait_note("admin");
+        }
+        scheduler_yield();
+        spins++;
     }
-    
-    console_write("nvme: admin cmd timeout\n");
-    return -1;
 }
 
 static int nvme_identify(struct nvme_device *dev, u8 cns, u32 nsid, u64 phys_buf)
@@ -158,9 +167,10 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     volatile u32 *sq_tdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 8); // SQ1
     *sq_tdb = tail;
     
-    // Wait for completion on CQ1
-    int timeout = 10000000;
-    while (timeout > 0) {
+    // Wait for completion on CQ1. Returning on timeout would let the caller
+    // free or reuse PRP-list/data buffers while the device still owns them.
+    u64 spins = 0;
+    for (;;) {
         volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 12); // CQ1
         u16 cq_head = dev->io_cq_head;
         
@@ -181,11 +191,12 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             }
             return 0;
         }
-        __asm__ volatile("pause");
-        timeout--;
+        if (spins == 10000000ULL) {
+            nvme_wait_note("io");
+        }
+        scheduler_yield();
+        spins++;
     }
-    
-    return -1;
 }
 
 static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *buffer, int is_write)

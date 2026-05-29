@@ -102,20 +102,35 @@ static int copy_dir_op(const char *src_dir, const char *dst_dir)
 	if ((isize)mkret < 0 && (isize)mkret != -EEXIST) return -1;
 	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)src_dir, B1NIX_O_RDONLY, 0,0,0,0);
 	if ((isize)fd < 0) return -1;
-	struct dirent entries[64];
-	u64 count = syscall_dispatch(SYS_GETDENTS, fd, (u64)(usize)entries, sizeof(entries), 0,0,0);
+	struct dirent *entries = malloc(64 * sizeof(struct dirent));
+	if (!entries) {
+		syscall_dispatch(SYS_CLOSE, fd, 0,0,0,0,0);
+		return -1;
+	}
+	u64 count = syscall_dispatch(SYS_GETDENTS, fd, (u64)(usize)entries, 64, 0,0,0);
 	syscall_dispatch(SYS_CLOSE, fd, 0,0,0,0,0);
-	if (count == 0 || (isize)count < 0) return 0;
-	usize num = count / sizeof(struct dirent);
+	if (count == 0 || (isize)count < 0) {
+		free(entries);
+		return 0;
+	}
+	usize num = count;
 	for (usize i = 0; i < num; i++) {
 		const char *name = entries[i].name;
 		if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0) continue;
 		char child_src[256], child_dst[256];
 		snprintf(child_src, sizeof(child_src), "%s/%s", src_dir, name);
 		snprintf(child_dst, sizeof(child_dst), "%s/%s", dst_dir, name);
-		if (entries[i].is_dir) { if (copy_dir_op(child_src, child_dst) != 0) return -1; }
-		else { if (copy_file_op(child_src, child_dst) != 0) return -1; }
+		if (entries[i].is_dir) {
+			if (copy_dir_op(child_src, child_dst) != 0) {
+				free(entries);
+				return -1;
+			}
+		} else if (copy_file_op(child_src, child_dst) != 0) {
+			free(entries);
+			return -1;
+		}
 	}
+	free(entries);
 	return 0;
 }
 
@@ -137,8 +152,16 @@ static int read_directory(struct panel *p)
 	p->selected = 0;
 	p->top_line = 0;
 	
-	/* Use SYS_READDIR to get directory listing */
-	struct dirent entries[MAX_FILES];
+	/* Keep the directory buffer off the 16 KiB kernel stack. */
+	struct dirent *entries = malloc(MAX_FILES * sizeof(struct dirent));
+	if (!entries) {
+		strcpy(p->files[0].name, ".");
+		p->files[0].is_dir = 1;
+		p->files[0].is_exec = 0;
+		p->files[0].size = 0;
+		p->file_count = 1;
+		return 0;
+	}
 	usize count = syscall_dispatch(SYS_READDIR, (u64)(usize)p->current_dir, (u64)(usize)entries, MAX_FILES, 0, 0, 0);
 	
 	if (count == 0 || count == (u64)-1) {
@@ -148,6 +171,7 @@ static int read_directory(struct panel *p)
 		p->files[0].is_exec = 0;
 		p->files[0].size = 0;
 		p->file_count = 1;
+		free(entries);
 		return 0;
 	}
 	
@@ -179,6 +203,7 @@ static int read_directory(struct panel *p)
 		p->file_count++;
 	}
 	
+	free(entries);
 	return 0;
 }
 

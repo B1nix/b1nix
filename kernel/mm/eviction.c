@@ -2,7 +2,13 @@
 #include <b1nix/sched.h>
 #include <b1nix/console.h>
 
-#define MAX_USER_PAGES 4096
+/* Evictable user pages tracked for swap reclaim. At ~32 bytes/entry this is
+ * ~2MB of BSS and covers ~256MB of user memory. The old 4096 (= 16MB) was far
+ * smaller than a cc1/self-host working set, so most user pages were never
+ * registered and thus could not be swapped out under low-RAM pressure — which,
+ * together with the 4MB swap cap and the IRQ-disabled klarge alloc path, is why
+ * a 128MB in-guest build OOM'd instead of swapping. */
+#define MAX_USER_PAGES 65536
 
 struct mapped_page {
     struct task *task;
