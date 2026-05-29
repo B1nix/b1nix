@@ -80,6 +80,18 @@ IRQ 45
 IRQ 46
 IRQ 47
 
+/* LAPIC timer (per-CPU scheduler tick) — vector 0x40 = 64.
+ * Drives scheduler_on_timer_tick on the BSP; on APs it's a per-CPU EOI today
+ * (cooperative scheduler — no preemption from ISR) and the mechanism through
+ * which we'll later enable preemption once VFS chain walks are rwlock-safe. */
+IRQ 64
+
+/* LAPIC spurious vector — must match LAPIC_SPURIOUS_VECTOR (0xFF). The CPU
+ * delivers this when a pending interrupt is cancelled mid-flight; per Intel
+ * SDM the handler must NOT issue an EOI. Without an IDT gate the CPU would
+ * triple-fault, so route it to a no-op stub. */
+IRQ 255
+
 .global isr_common
 .type isr_common, @function
 isr_common:

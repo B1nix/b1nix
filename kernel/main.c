@@ -109,6 +109,17 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* Switch IRQ routing from the 8259 PIC to the IOAPIC discovered via
 	 * ACPI. No-op (PIC stays in charge) when no IOAPIC was reported. */
 	ioapic_init();
+
+	/* M28-A: switch the BSP scheduler tick from PIT IRQ0 (vector 32) to the
+	 * per-CPU LAPIC timer (vector 64) at 100 Hz. APs arm the same timer when
+	 * they enter the cooperative phase in ap_main, so every core now ticks
+	 * itself instead of relying on the BSP-only PIT route. */
+	if (lapic_timer_start_periodic_ms(10)) {
+		console_write("timer: LAPIC periodic timer armed at 100 Hz; masking PIT IRQ0\n");
+		ioapic_mask_irq(0);
+	} else {
+		console_write("timer: LAPIC calibration unavailable, keeping PIT IRQ0 active\n");
+	}
 	blk_cache_init();
 
 	initramfs_init();

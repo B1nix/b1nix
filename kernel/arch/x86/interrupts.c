@@ -89,6 +89,8 @@ extern void isr44(void);
 extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
+extern void isr64(void);   /* LAPIC timer — per-CPU scheduler tick */
+extern void isr255(void);  /* LAPIC spurious — no-EOI no-op */
 
 static volatile u64 timer_ticks;
 
@@ -173,6 +175,12 @@ void x86_idt_init(void) {
   idt_set_gate(45, isr45);
   idt_set_gate(46, isr46);
   idt_set_gate(47, isr47);
+
+  /* LAPIC timer (per-CPU) and LAPIC spurious gates. Installed unconditionally:
+   * the BSP arms the LAPIC timer from lapic_timer_start_periodic_ms after
+   * calibration, and APs arm it as they enter the cooperative phase. */
+  idt_set_gate(64, isr64);
+  idt_set_gate(255, isr255);
 
   struct idt_pointer pointer = {
       .limit = sizeof(idt) - 1,
@@ -268,7 +276,36 @@ static inline void irq_eoi(u64 vector) {
 }
 
 static void x86_irq_handler_inner(struct interrupt_frame *frame) {
+  /* LAPIC spurious interrupt (vector 0xFF). Per Intel SDM 10.9, the handler
+   * must NOT issue an EOI. Just return. */
+  if (frame->vector == 255) {
+    return;
+  }
+
+  /* LAPIC timer (vector 0x40 = 64) — per-CPU scheduler tick. Drives the global
+   * scheduler bookkeeping (scheduler_ticks++, wake_sleepers) on the BSP only so
+   * wall-clock ticks aren't multiplied by g_max_cpus. APs receive the tick as a
+   * per-CPU preemption opportunity (cooperative for now — preemption from ISR is
+   * still gated on the VFS chain-walk rwlock audit, M28 item 3). */
+  if (frame->vector == 64) {
+    struct percpu *pcpu = get_percpu();
+    int is_bsp = pcpu ? (pcpu->cpu_id == 0) : 1;
+    if (is_bsp) {
+      timer_ticks++;
+      if (timer_ticks % 50 == 0) {
+        fb_console_blink_cursor();
+      }
+      scheduler_on_timer_tick();
+    }
+    lapic_eoi();
+    return;
+  }
+
   if (frame->vector == 32) {
+    /* Legacy PIT IRQ0 fallback. With M28-A the LAPIC timer drives the scheduler
+     * tick on all cores and PIT IRQ0 is masked at the IOAPIC; this branch is
+     * kept so an unsuspected stray (e.g. calibration failed → IOAPIC mask
+     * skipped) still progresses the BSP tick instead of console-spamming. */
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();
