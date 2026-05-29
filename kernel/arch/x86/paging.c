@@ -19,7 +19,6 @@ static u64 kernel_pml4_phys;
 int direct_map_ready;
 static u64 mmio_next = MMIO_MAP_BASE;
 
-extern struct task *current_task;
 
 static u64 *get_current_pml4(void) {
   if (current_task && current_task->pml4_phys) {

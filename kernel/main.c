@@ -57,7 +57,12 @@ void kernel_main(u64 arg0, u64 arg1)
 #endif
 
 	console_write("Step 1: Bootinfo parsed\n");
-	
+
+	/* Initialize the BSP per-CPU area (sets the GS base) FIRST: current_task is
+	 * now a per-CPU accessor (get_percpu()->cur_task), and pmm/kheap diagnostics
+	 * read current_task, so GS must be valid before any of that runs. */
+	percpu_init();
+
 	pmm_init(bootinfo_get());
 	console_write("Step 2: PMM initialized\n");
 
@@ -93,7 +98,6 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	uidgid_init();
 	arch_init();
-	percpu_init();
 	lapic_init();
 	blk_cache_init();
 

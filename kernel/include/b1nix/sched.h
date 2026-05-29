@@ -6,6 +6,7 @@
 
 #include <b1nix/types.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/lapic.h>   /* struct percpu + get_percpu() for the current_task macro */
 
 struct vfs_handle;
 struct task;
@@ -183,9 +184,12 @@ struct task {
   struct task *next_run;
 };
 
-/* SMP-safe current_task accessor.
- * For now, uses a single global pointer (SMP migration in progress). */
-extern struct task *current_task;
+/* Per-CPU current task. `current_task` is the task running on THIS CPU; each
+ * core has its own slot in struct percpu (cur_task), so APs and the BSP never
+ * share one "current". Expands to an lvalue, so existing reads/writes
+ * (current_task = t, current_task->field, current_task == 0) all work
+ * unchanged. Requires GS to be initialized (percpu_init) before first use. */
+#define current_task (get_percpu()->cur_task)
 
 /* ── Scheduler ── */
 

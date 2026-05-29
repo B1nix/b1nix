@@ -140,7 +140,7 @@ void lapic_init(void) {
 static struct percpu boot_cpu_data = {
     .cpu_id = 0,
     .apic_id = 0,
-    .current_task = 0,
+    .cur_task = 0,
     .scheduler_ticks = 0,
     .scheduler_started = 0,
     /* .runqueue.lock = 0 — zero-initialized by static storage */
@@ -237,7 +237,7 @@ static void smp_setup_trampoline(u64 pml4_phys, u64 stack_virt,
  * The AP tracks the worker solely via its per-CPU struct. */
 void ap_worker_trampoline(void) {
     struct percpu *pcpu = get_percpu();
-    struct task *t = pcpu ? pcpu->current_task : (struct task *)0;
+    struct task *t = pcpu ? pcpu->cur_task : (struct task *)0;
 
     if (t && t->entry)
         t->entry(t->arg);
@@ -295,7 +295,7 @@ void ap_main(u32 cpu_id) {
 
         if (t) {
             t->state = TASK_RUNNING;
-            pcpu->current_task = t;
+            pcpu->cur_task = t;
             pcpu->sched_return_ctx = &idle_ctx;
             /* Kernel worker: stays on the kernel address space (pml4_phys==0)
              * and runs on its own kmalloc'd kernel stack — no address-space
@@ -303,7 +303,7 @@ void ap_main(u32 cpu_id) {
             arch_context_switch(&idle_ctx, &t->context);
             /* Worker has parked back here and is now TASK_DEAD. Its stack is no
              * longer in use, so it is safe to reap. */
-            pcpu->current_task = NULL;
+            pcpu->cur_task = NULL;
             sched_ap_reap_worker(t);
             interrupts_enable();
             continue;

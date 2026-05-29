@@ -18,8 +18,6 @@ x86_syscall_saved_user_rsp:
 .section .text
 .code64
 
-.extern current_task
-
 /* SYSCALL entry point */
 .global x86_syscall_entry
 .type x86_syscall_entry, @function
@@ -27,8 +25,11 @@ x86_syscall_entry:
     /* Save RAX temporarily in our scratch area */
     movq %rax, x86_syscall_saved_user_rsp(%rip)
 
-    /* Get current_task pointer */
-    movq current_task(%rip), %rax
+    /* Get the per-CPU current task: GS base points at this CPU's struct percpu,
+     * whose cur_task member is at offset 0x10 (see struct percpu in lapic.h;
+     * a _Static_assert in scheduler.c pins the offset). The kernel never uses
+     * SWAPGS, so GS already holds the kernel per-CPU base in the syscall path. */
+    movq %gs:0x10, %rax
 
     /* Save user RSP to task->saved_user_rsp (offset 112) */
     movq %rsp, 112(%rax)

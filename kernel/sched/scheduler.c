@@ -13,6 +13,11 @@
 #include <b1nix/aio.h>
 #include <string.h>
 
+/* syscall_entry.S reads the per-CPU current task as %gs:0x10 — keep that in
+ * sync with struct percpu's cur_task member. */
+_Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
+               "cur_task must be at offset 0x10 (see syscall_entry.S)");
+
 #define MAX_TASKS 64
 /* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
  * silently corrupts the adjacent heap block (e.g. a vfs_node) instead of
@@ -39,7 +44,7 @@ static __attribute__((aligned(16))) u8 g_clean_fpu[512];
 static int g_clean_fpu_ready = 0;
 
 static struct task tasks[MAX_TASKS];
-struct task *current_task;
+/* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
 static usize next_task_id = 1;
 static volatile u64 scheduler_ticks;
 static int scheduler_started;
