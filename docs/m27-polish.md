@@ -90,8 +90,27 @@ overflowed `MAX_PROGRAMS` (was 64) in `kernel/user/process.c`.
 `vfs_create` once full, which dropped `/bin` VFS entries and broke
 `M26-SMOKE: ok readdir`. Bumped `MAX_PROGRAMS` to 96.
 
+## Init scripts + service supervisor — DONE (2026-05-29)
+
+**Boot rc script:** `/etc/rc` is shipped in the initramfs
+(`kernel/fs/initramfs.c`, `initramfs_rc[]`). At startup `init_main` runs it once
+via `/bin/sh /etc/rc` (after clearing the screen, before the login shell),
+reusing the shell's existing script-execution path. It is a real, editable shell
+script — the default prints a banner and `cat`s `/etc/motd`.
+
+**Service supervisor:** the init reap loop now respawns the login shell whenever
+it exits, so the console is never lost. This also fixes a latent busy-spin:
+`scheduler_waitpid(0)` returns `-ECHILD` immediately once init has no children,
+so the old `while(1) wait()` loop would spin at 100% CPU the moment the shell
+exited. The supervisor keeps exactly one live shell (blocking wait), and halts
+(`B1NIX_REBOOT_HALT`) rather than spin if no shell can be spawned at all.
+
+**Verification:** a test-mode self-test runs `/bin/sh /etc/rc` (the same path
+production init uses); smoke checks `M27-INIT: ok rc-script`. Host smoke
+**225/0**. The supervisor's respawn loop lives on the production path and isn't
+auto-exercised by the harness (which boots `b1nix.test=1` → reboots).
+
 ## Remaining M27 items (planned)
 
-init scripts + service supervisor · users/passwords/login · usage docs ·
-no-graphics first-class · first-boot persistent-root setup · POSIX
-compatibility matrix.
+users/passwords/login · usage docs · no-graphics first-class · first-boot
+persistent-root setup · POSIX compatibility matrix.

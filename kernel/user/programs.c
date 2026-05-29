@@ -1571,6 +1571,18 @@ static int init_main(int argc, const char **argv) {
     uwrite(ok ? "M27-CMDLINE: ok kv-parse\n" : "M27-CMDLINE: fail kv-parse\n");
   }
 
+  /* M27: verify the boot rc script runs end-to-end via /bin/sh (same path the
+   * production init uses at startup). The script emits its own markers. */
+  {
+    const char *rc_argv[] = {"/bin/sh", "/etc/rc", 0};
+    u64 rc_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)rc_argv[0], 2,
+                                  (u64)(usize)rc_argv, 0, 0, 0);
+    if ((isize)rc_pid >= 0) {
+      int rc_status = 0;
+      syscall_dispatch(SYS_WAIT, rc_pid, (u64)(usize)&rc_status, 0, 0, 0, 0);
+    }
+  }
+
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
@@ -1857,6 +1869,22 @@ static int init_main(int argc, const char **argv) {
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
+  /* M27: run the boot rc script once at startup (service/init setup) if
+   * present, before the login shell. /etc/rc is shipped in the initramfs. */
+  {
+    u64 rc_fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/etc/rc", 0, 0, 0, 0, 0);
+    if ((isize)rc_fd >= 0) {
+      syscall_dispatch(SYS_CLOSE, rc_fd, 0, 0, 0, 0, 0);
+      const char *rc_argv[] = {"/bin/sh", "/etc/rc", 0};
+      u64 rc_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)rc_argv[0], 2,
+                                    (u64)(usize)rc_argv, 0, 0, 0);
+      if ((isize)rc_pid >= 0) {
+        int rc_status = 0;
+        syscall_dispatch(SYS_WAIT, rc_pid, (u64)(usize)&rc_status, 0, 0, 0, 0);
+      }
+    }
+  }
+
   /* M27: pick the init/shell program from the kernel command line.
    * Precedence: explicit init=<path>  >  single-user emergency shell  >
    * graphical UI (unless nographics)  >  plain text shell. */
@@ -1888,12 +1916,25 @@ static int init_main(int argc, const char **argv) {
     uwrite("init: failed to spawn ");
     uwrite(init_prog);
     uwrite(", falling back to emergency shell /bin/sh\n");
-    syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
+    init_prog = "/bin/sh";
+    init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
   }
 
+  /* M27: minimal service supervisor. Reap children, and respawn the login
+   * shell whenever it exits so the console is never lost. A blocking wait()
+   * with at least one live child avoids busy-spinning; if no shell can be
+   * started at all we halt rather than spin. */
   while (1) {
-    int status;
-    syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0, 0, 0);
+    int status = 0;
+    isize reaped =
+        (isize)syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0, 0, 0);
+    if (reaped == (isize)init_pid || reaped < 0) {
+      init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)init_prog, 0, 0, 0, 0, 0);
+      if ((isize)init_pid < 0) {
+        uwrite("init: cannot respawn shell, halting\n");
+        syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_HALT, 0, 0, 0, 0, 0);
+      }
+    }
   }
 
   return 0;

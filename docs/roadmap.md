@@ -430,7 +430,7 @@ diagnostics.
 ## M27: Terminal OS Polish
 
 - [x] `done` Add boot menu options and kernel command line parsing. `bootinfo_get_kv()` key=value parser + `init=`/`b1nix.single`/`b1nix.nographics` dispatch in `init_main` + a 3-entry GRUB boot menu. Host smoke 223/0 (`M27-CMDLINE: ok kv-parse`). See [`docs/m27-polish.md`](m27-polish.md).
-- [ ] `planned` Add init scripts and a simple service supervisor.
+- [x] `done` Add init scripts and a simple service supervisor. `/etc/rc` ships in the initramfs and `init_main` runs it via `/bin/sh /etc/rc` at startup; the reap loop now respawns the login shell when it exits (fixing a latent `-ECHILD` busy-spin) and halts rather than spin if no shell can start. Host smoke 225/0 (`M27-INIT: ok rc-script`). See [`docs/m27-polish.md`](m27-polish.md).
 - [ ] `planned` Add users, passwords or login shell basics.
 - [x] `done` Add stable shutdown, reboot, and emergency shell paths. `SYS_REBOOT` (was a no-op `arch_halt` stub) now takes RESTART (8042 pulse + triple-fault fallback) / POWEROFF (QEMU/Bochs ACPI ports) / HALT commands, exposed as `reboot`/`poweroff`/`halt`/`shutdown`. Emergency single-user `/bin/sh` via `b1nix.single` + spawn-failure fallback. Host smoke 224/0 (`reboot: restarting`, real reset under QEMU `-no-reboot`). See [`docs/m27-polish.md`](m27-polish.md).
 - [ ] `planned` Document everyday usage from boot to editing/building files.
