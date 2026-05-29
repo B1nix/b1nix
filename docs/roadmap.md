@@ -15,14 +15,19 @@ The stable no-surprises checklist for closing POSIX-facing work lives in
 
 ## Current POSIX Estimate
 
-- Overall practical POSIX compatibility: roughly 70-78%.
+- Overall practical POSIX compatibility: roughly 75-82%.
 - `VFS/path/files`: roughly 90-95%.
-- `Shell/coreutils`: roughly 80-85%.
+- `Shell/coreutils`: roughly 90-94% (M33 closed the shell-grammar gap:
+  globbing, `$((…))`, here-docs, `$(…)`/backticks, subshells, functions,
+  `case`, arrays, full job control, `for`/`while`/`until` loops, `${x:-y}`-style
+  parameter expansion, and bare `VAR=value` assignment).
 
 These percentages mean "can run small real workflows", not "passes a POSIX
-conformance suite". The biggest remaining blockers are full shell parsing,
-broader utility flag coverage, permission edge cases, and kernel backtrace
-diagnostics.
+conformance suite". The biggest remaining shell gaps are substring/pattern
+parameter expansion (`${x:off:len}`, `${x%pat}`), env-prefix command form
+(`VAR=x cmd`), and concurrent (rather than sequential) pipeline execution —
+the last deliberately deferred (see M33); broader remaining blockers are
+permission edge cases and kernel backtrace diagnostics.
 
 ## M0: Boot and Diagnostics
 
@@ -477,14 +482,18 @@ diagnostics.
 
 ## M33: POSIX Shell Compliance & Job Control Polish
 
-- [ ] `planned` Implement command substitution (e.g., `$(cmd)` or `` `cmd` ``) in the shell.
-- [ ] `planned` Support subshell execution via `( list )`.
-- [ ] `planned` Complete POSIX terminal job control (implementing `bg`, robust job resumption, and state queries).
-- [ ] `planned` Add support for complex script structures (functions, `case` statements, arrays).
+- [x] `done` Implement command substitution (`$(cmd)` and `` `cmd` ``): runs the inner command with stdout captured to a temp file (no pipe deadlock), trims trailing newlines / collapses embedded newlines, supports nesting; resolved in all readers before expansion. `kernel/user/programs.c` (`sh_expand_cmdsubst`/`sh_capture_command`); smoke-verified (`M33-SHELL: ok cmdsubst`).
+- [x] `done` Support subshell execution via `( list )`: paren-aware operator/pipe splitting, inner list runs with its own cwd copy + env snapshot so `cd`/variable side effects do not leak; trailing redirections applied around the group. `kernel/user/programs.c` (`sh_run_subshell`); smoke-verified (`M33-SHELL: ok subshell`).
+- [x] `done` Complete POSIX terminal job control: growable job table with Running/Stopped state; a foreground job that receives `SIGTSTP` is recorded as Stopped (`run_external_command` waits with `WUNTRACED`); `bg` resumes it in the background and `fg` resumes + waits (re-stopping is tracked) via `SIGCONT`; `jobs` reports state. `kernel/user/programs.c` (`sh_bg`/`sh_fg`/`sh_jobs_print`); smoke-verified end-to-end (`M33-SHELL: ok jobs` — real SIGTSTP stop + bg/SIGCONT resume of a child).
+- [x] `done` Add support for complex script structures (functions, `case` statements, arrays). Multi-line constructs collected by a shared block reader (`sh_handle_compound`/`sh_collect_braces`): `name() { … }` functions stored in a growable table and run with `$1..$9`/`$#` set; `case WORD in pat) … ;; esac` matched via `glob_match`; `arr=(…)` arrays with `${arr[i]}`, `${arr[@]}`, `${#arr[@]}` in `expand_env`. Shell env + function + array tables are now heap-backed and grow on demand (no fixed caps). Smoke-verified (`M33-SHELL: ok function`/`case`/`array`).
 - [x] `done` Implement pathname expansion (globbing): `*`, `?`, and `[…]`/`[!…]` bracket expressions against the VFS. Quote-aware (`parse_cmd` flags only unquoted metachars), sorted matches, dotfiles hidden unless the pattern starts with `.`, literal fallback when nothing matches. `kernel/user/programs.c` (`glob_match`/`glob_expand`); smoke-verified (`M33-SHELL: ok glob-star`/`glob-class`/`glob-nomatch`).
 - [x] `done` Implement arithmetic expansion (`$((…))`): recursive-descent integer evaluator (`+ - * / %`, parentheses, unary `+/-`, decimal literals, bare/`$`-prefixed variables) wired into `expand_env`. Smoke-verified (`M33-SHELL: ok arith`).
 - [x] `done` Implement here-documents (`<<`, `<<-`): source-agnostic body collection (script fd + interactive tty), `<<-` leading-tab stripping, quoted-delimiter expansion suppression, and body variable expansion; spooled to a temp file and consumed via the normal `<` redirection path. `kernel/user/programs.c` (`sh_resolve_heredoc`); smoke-verified (`M33-SHELL: ok heredoc`).
-- [ ] `planned` Broaden coreutils utility flag coverage toward POSIX (the named blocker in the POSIX estimate above).
+- [x] `done` Broaden coreutils utility flag coverage toward POSIX. On top of the M22 set (`ls -la`, `cp -r`, `rm -rf`, `mkdir -p`, `grep -q/-n/-v`, `wc -lwc`, `head/tail -n`), added `grep -i` (case-insensitive) and `grep -c` (match count). `kernel/user/busybox.c`; smoke-verified (`M33-SHELL: ok grep-flags`). Further flags can be added incrementally against this pattern.
+- [x] `done` Add `for`/`while`/`until` loops. Collected by the shared block reader (`sh_collect_block` to the `done` keyword) and run by `sh_run_for`/`sh_run_while`; `for` splits a cmdsubst+var-expanded word list, `while`/`until` re-evaluate the condition each iteration (with a large runaway guard so a never-false loop can't wedge the in-kernel shell). `kernel/user/programs.c`; smoke-verified (`M33-SHELL: ok for-loop`/`while-loop`).
+- [x] `done` Add `${x:-w}`/`${x-w}`, `${x:=w}`/`${x=w}`, `${x:+w}`/`${x+w}` parameter expansion and `${#x}` length (word recursively expanded) in `expand_env`, plus bare `VAR=value` scalar assignment (`sh_try_scalar_assign`). Smoke-verified (`M33-SHELL: ok param-expand`, used by the loop tests).
+- [x] `done` Add `trap 'cmds' SIG …`: handlers stored in a growable table (`sh_trap_set`/`sh_run_trap`); `trap` with no args lists them, `trap - SIG` clears. The `EXIT` handler fires from the `exit` builtin. `kernel/user/programs.c`; smoke-verified (`M33-SHELL: ok trap`). NOTE: asynchronous signal-delivered traps (INT/TERM mid-command) are not yet wired — only `EXIT` and explicit firing are active.
+- [ ] `wontfix` Concurrent pipeline execution — **deliberately deferred**. `a | b` currently runs stages sequentially (stage 1 writes the pipe fully, then stage 2 reads), which is correct for typical bounded data and is smoke-verified (M11 pipe tests). True concurrency would require spawning earlier stages as background tasks, but the in-kernel shell runs built-ins synchronously in kernel context, so rewriting the proven pipeline path carries high regression risk for low marginal value. Revisit only if a real workload overflows the pipe buffer mid-pipeline.
 
 ## M34: Virtual Filesystems (/proc and /sys)
 
