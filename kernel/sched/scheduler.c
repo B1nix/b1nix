@@ -14,7 +14,13 @@
 #include <string.h>
 
 #define MAX_TASKS 64
-#define KERNEL_STACK_SIZE (16 * 1024)
+/* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
+ * silently corrupts the adjacent heap block (e.g. a vfs_node) instead of
+ * faulting. b1nix runs the busybox coreutils builtins in kernel mode on this
+ * stack, and some have large on-stack buffers (uniq_main alone is ~12 KB:
+ * buf[8192] + lines[512]); together with the ~6.6 KB syscall dispatch frame
+ * and the VFS/ext4 call chain they exceed 16 KB. Keep this at >= 32 KB. */
+#define KERNEL_STACK_SIZE (32 * 1024)
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
 
