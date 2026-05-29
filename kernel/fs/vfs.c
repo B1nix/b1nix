@@ -18,7 +18,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define VFS_NODE_OWNS_DATA 0x80000000u
+/* VFS_NODE_OWNS_DATA now lives in <b1nix/vfs.h> so other filesystems can use it. */
 #define MAX_FILE_SIZE (1024 * 1024 * 1024) /* 1 GB limit for now */
 
 /* VFS time update masks */
@@ -178,7 +178,9 @@ static u32 dcache_hash(struct vfs_node *parent, const char *name) {
   return h % DCACHE_SIZE;
 }
 
-static struct vfs_node *dcache_lookup(struct vfs_node *parent,
+/* Dentry-cache lookup/insert: a complete LRU path-resolution cache, not yet
+ * wired into the lookup path. Kept (marked unused) for future use. */
+__attribute__((unused)) static struct vfs_node *dcache_lookup(struct vfs_node *parent,
                                       const char *name) {
   dcache_acquire();
   u32 h = dcache_hash(parent, name);
@@ -211,7 +213,7 @@ static struct vfs_node *dcache_lookup(struct vfs_node *parent,
   return 0;
 }
 
-static void dcache_insert(struct vfs_node *parent, const char *name,
+__attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const char *name,
                           struct vfs_node *node) {
   dcache_acquire();
   if (dcache_count >= MAX_DCACHE_ENTRIES) {
@@ -587,8 +589,6 @@ static void vfs_inode_unlock(struct vfs_inode *inode) {
   vfs_inode_unlock_write(inode);
 }
 
-static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
-
 static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
@@ -615,8 +615,6 @@ static void vfs_update_times(struct vfs_inode *inode, u32 mask) {
   if (mask & VFS_CTIME)
     inode->ctime = now;
 }
-
-static u64 next_ino = 1;
 
 static usize node_count = 0;
 static struct vfs_node *root_node = 0;
@@ -735,6 +733,7 @@ void vfs_inode_put(struct vfs_inode *inode) {
     return;
   if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
       inode->nlink == 0) {
+    page_cache_invalidate_inode(inode);
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }
@@ -864,7 +863,7 @@ static void pop_path_part(char *path) {
   path[len] = '\0';
 }
 
-static void compose_symlink_path(const char *parent_path, const char *target,
+__attribute__((unused)) static void compose_symlink_path(const char *parent_path, const char *target,
                                  const char *rest, char *out, usize out_size) {
   out[0] = '\0';
   if (!target || target[0] == '\0')
@@ -1600,6 +1599,9 @@ void vfs_init(void) {
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
   add_node("/ext4", VFS_DIRECTORY, 0, 0, 0);
   add_node("/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/persist", VFS_DIRECTORY, 0, 0, 0); /* M26: mountpoint for the
+                                                   persistent root image (native
+                                                   toolchain + kernel source) */
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
@@ -2004,6 +2006,10 @@ void vfs_close(int fd) {
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
     int my_pid = current_task ? (int)current_task->id : 0;
     filelock_release_all_by_pid_inode(my_pid, h->node->inode);
+
+    if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
+      page_cache_flush_inode(h->node->inode);
+    }
   }
 
   if (h->ops && h->ops->close)
@@ -2242,6 +2248,18 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
 
   vfs_inode_lock_read(dir->inode);
   usize count = 0;
+  /* The sibling list (first_child / next_sibling) is NOT protected by the
+   * inode rwlock — that lock guards inode data (size, timestamps, etc.).
+   * A concurrent unlink on another CPU or after a timer-tick preemption can
+   * splice a child out of the list, set child->deleted = 1, drop its ref,
+   * and free it while we are still walking — producing a #GP on
+   * child->deleted (same race that find_child closes with cli/sti).
+   * Disable interrupts for the duration of the walk: it is cheap (the list
+   * is at most a directory's entry count, typically < 256 entries) and
+   * prevents scheduler_yield() from giving another task the window to
+   * unlink+free a sibling we are about to dereference. */
+  u64 irq_flags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
   struct vfs_node *child = dir->first_child;
   while (child && count < max_names) {
     if (!child->deleted) {
@@ -2249,6 +2267,7 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
     }
     child = child->next_sibling;
   }
+  __asm__ volatile("pushq %0; popfq" : : "r"(irq_flags) : "memory");
   vfs_inode_unlock_read(dir->inode);
   vfs_node_put(dir);
   return (isize)count;
@@ -3131,6 +3150,11 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     offset++;
   }
 
+  /* Same race as vfs_list: sibling list is NOT protected by any inode lock.
+   * A concurrent unlink can free a child while we walk — use cli/sti like
+   * find_child does to take a consistent snapshot. */
+  u64 irq_flags;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
   struct vfs_node *child = dir->first_child;
   usize skipped = 0;
   while (child && count < max_entries) {
@@ -3152,6 +3176,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     offset++;
     child = child->next_sibling;
   }
+  __asm__ volatile("pushq %0; popfq" : : "r"(irq_flags) : "memory");
 
   h->offset = offset;
   res = (isize)count;

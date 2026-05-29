@@ -161,6 +161,7 @@ int shmget(u32 key, usize size, int shmflg)
 void *shmat(int shmid, const void *shmaddr, int shmflg)
 {
     (void)shmaddr; /* We ignore requested addr for simplicity */
+    (void)shmflg;  /* SHM_RDONLY/SHM_RND not yet honored */
 
     if (shmid < 0 || shmid >= SHMMNI) return (void *)-1;
     if (!shm_segments[shmid].used) return (void *)-1;

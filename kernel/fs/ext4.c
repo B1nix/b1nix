@@ -119,10 +119,6 @@ static void ext4_write_bgd_tx(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 
     ext4_journal_write_tx(fs, h, bg_block, buf); kfree(buf);
 }
 
-static void ext4_write_bgd(struct ext4_fs *fs, u32 group, struct ext4_bgd_64 *bgd) {
-    ext4_write_bgd_tx(fs, group, bgd, 0);
-}
-
 static void ext4_write_superblock(struct ext4_fs *fs) {
     u8 *sb_buf = kmalloc(1024);
     if (blk_read_cached(fs->bdev, 2, 2, sb_buf) >= 0) { memcpy(sb_buf, &fs->sb, sizeof(struct ext2_superblock)); blk_write_cached(fs->bdev, 2, 2, sb_buf); }
@@ -219,10 +215,6 @@ static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
     kfree(bitmap);
   }
   return 0;
-}
-
-static u32 ext4_alloc_inode(struct ext4_fs *fs) {
-  return ext4_alloc_inode_tx(fs, 0);
 }
 
 static void ext4_free_block_tx(struct ext4_fs *fs, u32 block_num, struct journal_handle *h) {
@@ -446,10 +438,6 @@ static int ext4_add_dir_entry_tx(struct ext4_fs *fs, u32 dir_ino, u32 child_ino,
     kfree(buf); return -1;
 }
 
-static int ext4_add_dir_entry(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type) {
-    return ext4_add_dir_entry_tx(fs, dir_ino, child_ino, name, type, 0);
-}
-
 static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32 mode);
 
 static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent *buf, usize max_entries) {
@@ -481,6 +469,7 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
 }
 
 static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *full_path, u32 mode) {
+  (void)full_path; /* part of the vfs create-op signature; this impl uses name+dir */
   struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
   struct ext4_fs *fs = dir_info->fs;
   struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
@@ -544,6 +533,15 @@ static int ext4_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     ext4_write_inode_tx(fs, h, dir_info->inode_num, &di);
   }
   if (h) journal_commit_transaction(h);
+  /* Attach the ext4 inode_info to the freshly-created VFS directory node, the
+   * same way ext4_vfs_create does for files. Without this the node's
+   * inode->data stays NULL and any later op on the directory (e.g. creating a
+   * file inside it) dereferences NULL. */
+  struct vfs_node *n = find_child(dir, name);
+  if (n) {
+    ext4_setup_node(n, fs, new_ino, inode.i_mode);
+    vfs_node_put(n);
+  }
   return 0;
 }
 
@@ -831,10 +829,39 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
             memcpy(full + len, name, e->name_len + 1);
             struct ext2_inode ci;
             if (ext4_read_inode(fs, e->inode, &ci) == 0) {
-                struct vfs_node *n = vfs_add_node(full, ((ci.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
-                if (n) {
-                    ext4_setup_node(n, fs, e->inode, ci.i_mode);
-                    if ((ci.i_mode & EXT2_S_IFMT) == EXT2_S_IFDIR) ext4_populate_vfs(fs, e->inode, full);
+                u32 fmt = ci.i_mode & EXT2_S_IFMT;
+                if (fmt == EXT2_S_IFLNK) {
+                    /* Symlink: read its target and create a VFS_SYMLINK node so
+                     * path resolution and readlink work. Do NOT call
+                     * ext4_setup_node here — it overwrites inode->data (where the
+                     * link target lives) with its ext4 inode_info. */
+                    u32 tlen = ci.i_size;
+                    if (tlen > 4095) tlen = 4095;
+                    char *tgt = kmalloc(tlen + 1);
+                    int ok = 0;
+                    if (ci.i_size < 60) {
+                        memcpy(tgt, (const char *)ci.i_block, tlen); ok = 1; /* fast symlink */
+                    } else {
+                        u32 phys = ext4_get_block(fs, &ci, 0);
+                        if (phys) {
+                            u8 *blk = kmalloc(fs->block_size);
+                            ext4_read_block(fs, phys, blk);
+                            memcpy(tgt, blk, tlen < fs->block_size ? tlen : fs->block_size);
+                            kfree(blk); ok = 1;
+                        }
+                    }
+                    if (ok) {
+                        tgt[tlen] = '\0';
+                        vfs_add_node(full, VFS_SYMLINK, tgt, tlen, VFS_NODE_OWNS_DATA);
+                    } else {
+                        kfree(tgt);
+                    }
+                } else {
+                    struct vfs_node *n = vfs_add_node(full, (fmt == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
+                    if (n) {
+                        ext4_setup_node(n, fs, e->inode, ci.i_mode);
+                        if (fmt == EXT2_S_IFDIR) ext4_populate_vfs(fs, e->inode, full);
+                    }
                 }
             }
         }

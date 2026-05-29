@@ -137,7 +137,12 @@ struct B1nixTimePtr {
     const time_t *ptr;
     B1nixTimePtr(const time_t *p) : ptr(p) {}
     B1nixTimePtr(const unsigned int *p) : val(*p), ptr(&val) {}
-    B1nixTimePtr(decltype(nullptr)) : ptr(nullptr) {}
+#if __cplusplus >= 201103L
+    /* nullptr/decltype are C++11; guard so libstdc++'s -std=gnu++98 TUs that
+     * include <ctime> can still parse this header. C++98 callers never pass a
+     * null literal here. */
+    B1nixTimePtr(decltype(nullptr)) : ptr(0) {}
+#endif
 };
 
 inline struct tm *localtime(B1nixTimePtr tp) {

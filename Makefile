@@ -12,12 +12,15 @@ INITRAMFS_M14_SMOKE_INC := $(BUILD_DIR)/initramfs_m14_smoke.inc
 INITRAMFS_M15_SMOKE_INC := $(BUILD_DIR)/initramfs_m15_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
 INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
+INITRAMFS_M26_SMOKE_INC := $(BUILD_DIR)/initramfs_m26_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
-CC := clang
-LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
+# Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
+# builds the kernel with the ported cross x86_64-b1nix-gcc/ld (toward M26
+# self-host). CC/LD are assigned below, after CROSS_TOOLCHAIN_ROOT is known.
+TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
-GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
+GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
 
@@ -40,6 +43,7 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 
 COMMON_CFLAGS := \
 	-std=c11 \
+	-g \
 	-ffreestanding \
 	-fno-builtin \
 	-fno-stack-protector \
@@ -49,12 +53,19 @@ COMMON_CFLAGS := \
 	-Wextra \
 	-I kernel/include
 
+
 ifeq ($(ARCH),x86)
 TARGET := x86_64-elf
+# clang needs --target to cross-compile; the b1nix-gcc cross compiler already
+# targets x86_64 natively, so it must NOT receive --target (it is clang-only).
+ifeq ($(TOOLCHAIN),gcc)
+ARCH_CFLAGS := -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+else
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+endif
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
-ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S
+ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
 ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c
 else
 $(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86)
@@ -99,7 +110,6 @@ KERNEL_SOURCES := \
 	kernel/user/tui_common.c \
 	kernel/user/mc.c \
 	kernel/user/editor.c \
-	kernel/user/nmake.c \
 	$(ARCH_SOURCES)
 
 ifeq ($(ARCH),x86)
@@ -226,6 +236,12 @@ $(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m25_smoke_elf userspace/build/bin/m25_smoke > $@
 
+$(INITRAMFS_M26_SMOKE_INC): userspace/bin/m26_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m26_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m26_smoke_elf userspace/build/bin/m26_smoke > $@
+
+
 # ── AP Trampoline (flat binary linked at 0x8000) ──
 AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86/ap_trampoline_tmp.o
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
@@ -235,7 +251,7 @@ $(AP_TRAMP_OBJ): kernel/arch/x86/ap_trampoline.S
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
-	$(LD) -m elf_x86_64 -z max-page-size=0x1000 --image-base 0 -Ttext 0x8000 -o $@ --oformat binary $<
+	$(LD) -m elf_x86_64 -z max-page-size=0x1000 $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
 
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
