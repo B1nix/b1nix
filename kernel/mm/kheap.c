@@ -234,8 +234,93 @@ void kheap_use_direct_map(void) {
   return;
 }
 
+/* Strict heap validator (recovered from the m26-coalesce-wip experiment).
+ * When enabled it walks the entire general-heap bump region on EVERY
+ * kmalloc/kfree and panics on the first corrupt block header. This is the tool
+ * that originally surfaced the M16/M25 "heap corruption" — now believed to have
+ * been the 16KB kernel-stack overflow (the per-task stack is a kheap block, so
+ * a frame overrun smashes the adjacent header). Re-run it on the 32KB stack to
+ * confirm the heap stays clean end-to-end. O(N) per op — debug only.
+ * Verified 2026-05-29 on the 32KB stack: host smoke reaches B1NIX-TEST: done,
+ * 178 ok markers, zero validator trips — the old M16/M25 corruption was the
+ * 16KB kernel-stack overflow, not a heap/DMA UAF. Set to 1 to re-run. */
+#define KHEAP_VALIDATE 0
+
+#if KHEAP_VALIDATE
+static void kheap_dump(void) {
+  if (heap.base == 0) return;
+  console_write("=== KHEAP DUMP ===\n");
+  console_write("heap.base: 0x"); console_write_hex64(heap.base);
+  console_write(" heap.current: 0x"); console_write_hex64(heap.current);
+  console_write(" heap.end: 0x"); console_write_hex64(heap.end);
+  console_write("\n");
+  u64 addr = heap.base;
+  int idx = 0;
+  while (addr < heap.current) {
+    struct kheap_block *block = (struct kheap_block *)(usize)addr;
+    console_write("  ["); console_write_dec(idx++); console_write("] addr=0x");
+    console_write_hex64(addr);
+    console_write(" size="); console_write_dec(block->size);
+    console_write(" magic=0x"); console_write_hex64(block->magic);
+    console_write("\n");
+    if (block->size == 0 || block->size > 100u * 1024u * 1024u) {
+      console_write("  (aborting dump: insane size)\n");
+      break;
+    }
+    addr += KHEAP_HEADER_SIZE + block->size;
+  }
+  console_write("==================\n");
+}
+#endif /* KHEAP_VALIDATE */
+
 void kheap_validate(const char *func) {
+#if KHEAP_VALIDATE
+  if (heap.base == 0) return;
+  u64 addr = heap.base;
+  while (addr < heap.current) {
+    struct kheap_block *block = (struct kheap_block *)(usize)addr;
+    if (block->magic != KHEAP_MAGIC && block->magic != KHEAP_FREED_MAGIC) {
+      console_write("kheap_validate (from ");
+      console_write(func);
+      console_write("): block at 0x");
+      console_write_hex64(addr);
+      console_write(" invalid magic 0x");
+      console_write_hex64(block->magic);
+      console_write("\n  raw: ");
+      u64 *raw = (u64 *)(usize)addr;
+      console_write_hex64(raw[0]); console_write(" ");
+      console_write_hex64(raw[1]); console_write(" ");
+      console_write_hex64(raw[2]); console_write("\n");
+      kheap_dump();
+      panic("kheap magic corrupt");
+    }
+    if (block->size == 0 || block->size > heap.current - addr - KHEAP_HEADER_SIZE) {
+      console_write("kheap_validate (from ");
+      console_write(func);
+      console_write("): block at 0x");
+      console_write_hex64(addr);
+      console_write(" insane size ");
+      console_write_dec(block->size);
+      console_write("\n");
+      kheap_dump();
+      panic("kheap size corrupt");
+    }
+    addr += KHEAP_HEADER_SIZE + block->size;
+  }
+  if (addr != heap.current) {
+    console_write("kheap_validate (from ");
+    console_write(func);
+    console_write("): walk overran to 0x");
+    console_write_hex64(addr);
+    console_write(" != heap.current 0x");
+    console_write_hex64(heap.current);
+    console_write("\n");
+    kheap_dump();
+    panic("kheap walk mismatch");
+  }
+#else
   (void)func;
+#endif
 }
 
 
