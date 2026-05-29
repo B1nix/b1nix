@@ -8,6 +8,44 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-29 (p) — SELF-HOST COMPLETE: the in-guest-built kernel boots AND passes the full smoke suite (218/0) at 256 MB
+
+End-to-end self-hosting is now proven on the Fedora/KVM rig, including the part
+that was previously open ("built ≠ boot-verified") and the part that was
+mis-attributed to GCC codegen (the M11 panic in the self-built kernel — see below).
+
+**The full loop, all verified this session:**
+1. `make clean` (preserves `build/toolchain_build`) → rebuild userspace + kernel →
+   host smoke **218/0**.
+2. `make root-image` stages the **current** source (which now carries the
+   `KERNEL_STACK_SIZE` 16 KB→32 KB fix from UPDATE (o) — confirmed with
+   `debugfs -R "cat /usr/src/b1nix/kernel/sched/scheduler.c"`).
+3. `python3 tools/inguest/run-build.py 256` → the in-guest **native GCC + ld**
+   compile all 76 kernel TUs and link `/tmp/kernel.elf` = **1,582,336 B**, 185 s,
+   0 faults, `HARNESS_DONE_B1NIX`.
+4. Extract that artifact (`debugfs -R "dump /kernel-selfhost-256mb.elf …"`),
+   wrap it in a **test-mode** GRUB ISO (`multiboot2 /boot/kernel.elf b1nix.test=1`),
+   and run the full suite against it (no-rebuild copy of `tests/smoke.sh`:
+   `sed 's|make … iso|true|'`, saved as `smoke_run/_smoke_selfbuilt.sh`):
+   **the self-built kernel scores 218/0/0** — `B1NIX-TEST: done`, every M11
+   coreutils marker and all M26 markers (`ok can-build-kernel`) green, 0 GP/panic.
+
+So **b1nix's own GCC builds a kernel that both boots and passes b1nix's entire
+test suite.**
+
+**This also resolves the "self-built GCC kernel panics in the M11 coreutils path"
+note (previously called a "codegen-class" issue):** it was NOT GCC codegen — it was
+the same **16 KB kernel-stack overflow** documented in UPDATE (o). The busybox
+builtins run in kernel mode on the per-task kernel stack (a kheap block), and
+`uniq_main`'s ~12 KB frame + the syscall/VFS chain overran 16 KB, corrupting the
+adjacent kheap block. GCC's frame layout happened to tip over the 16 KB edge where
+an older clang build didn't — hence the "only the GCC kernel crashes" red herring.
+With the 32 KB stack the self-built **GCC** kernel is now 218/0, same as clang.
+
+**Caveat (honest):** this passes only because `root.ext4` was rebuilt from the
+stack-fixed source. The 256 MB artifact built from the *pre-fix* (16 KB) source
+boots to a shell but fails the suite at M11 — the bug, not a self-host gap.
+
 ## UPDATE 2026-05-29 (o) — Smoke regression ROOT-CAUSED: a 16 KB kernel-stack overflow, NOT a heap/VFS/DMA corruption (corrects UPDATE l/m/n)
 
 On Fedora 43 / clang 21 the HEAD smoke suite was **159/59** with a *deterministic*
