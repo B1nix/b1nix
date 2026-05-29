@@ -60,6 +60,14 @@ static const char initramfs_fstab[] =
     "nvme0         /mnt     ext2        noauto     0      0\n"
     "nvme0         /btrfs   btrfs       noauto     0      0\n";
 
+/* Boot rc script: init runs this once at startup, before the login shell. */
+static const char initramfs_rc[] =
+    "#!/bin/sh\n"
+    "# b1nix boot rc script - runs once at startup, before the login shell.\n"
+    "echo \"M27-INIT: rc-script start\"\n"
+    "[ -f /etc/motd ] && cat /etc/motd\n"
+    "echo \"M27-INIT: ok rc-script\"\n";
+
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
     "echo \"POSIX-SMOKE: start\"\n"
@@ -318,6 +326,7 @@ static const struct initramfs_file files[] = {
     {"/bin/m24b-smoke", (const char *)vfs_m24b_smoke_elf,
      sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
+    {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,
      0},

@@ -468,6 +468,7 @@ else
 fi
 # ── M27 Terminal OS Polish: kernel command line parsing ──
 check_output "$LOG" "M27-CMDLINE: ok kv-parse" "kernel command line key=value parser works"
+check_output "$LOG" "M27-INIT: ok rc-script" "boot rc script runs via /bin/sh"
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
