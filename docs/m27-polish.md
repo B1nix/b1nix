@@ -61,9 +61,37 @@ is. Future M27 items that live on the production path (init scripts/supervisor,
 login, shutdown/reboot/emergency) will need a dedicated cmdline+marker or manual
 in-guest verification.
 
+## Shutdown / reboot / emergency shell — DONE (2026-05-29)
+
+`SYS_REBOOT` was a no-op stub (`console_write` + `arch_halt`). It now takes a
+command in `arg0` (constants in both `syscall.h`):
+
+| cmd | value | action |
+|-----|-------|--------|
+| `B1NIX_REBOOT_RESTART`  | 0 | drain the 8042 input buffer, pulse the reset line (`outb 0x64, 0xFE`); fall back to a triple fault via a null IDT, then `arch_halt` |
+| `B1NIX_REBOOT_POWEROFF` | 1 | QEMU/Bochs ACPI shutdown ports (`0x604`, `0xB004`, `0x4004`); fall back to `arch_halt` |
+| `B1NIX_REBOOT_HALT`     | 2 | `arch_halt` |
+
+Shell commands (`kernel/user/busybox.c`, registered as `/bin/*` in
+`programs.c`): `reboot` → RESTART, `poweroff`/`shutdown` → POWEROFF,
+`halt` → HALT.
+
+**Emergency shell:** `init_main` already drops to a single-user `/bin/sh` on
+`b1nix.single`, and falls back to an emergency `/bin/sh` if the chosen init
+fails to spawn (see the cmdline section above).
+
+**Verification:** the test harness runs with QEMU `-no-reboot`, so the
+end-of-test `SYS_REBOOT(RESTART)` performs a real machine reset and QEMU exits
+cleanly. Smoke checks `reboot: restarting`; host smoke **224/0**.
+
+**Gotcha fixed along the way:** registering the 4 new `/bin` reboot commands
+overflowed `MAX_PROGRAMS` (was 64) in `kernel/user/process.c`.
+`user_register_program` silently skips both the registry slot *and* the
+`vfs_create` once full, which dropped `/bin` VFS entries and broke
+`M26-SMOKE: ok readdir`. Bumped `MAX_PROGRAMS` to 96.
+
 ## Remaining M27 items (planned)
 
-init scripts + service supervisor · users/passwords/login · stable
-shutdown/reboot/emergency shell (note: `SYS_REBOOT` is currently a no-op stub
-that just `arch_halt()`s) · usage docs · no-graphics first-class · first-boot
-persistent-root setup · POSIX compatibility matrix.
+init scripts + service supervisor · users/passwords/login · usage docs ·
+no-graphics first-class · first-boot persistent-root setup · POSIX
+compatibility matrix.

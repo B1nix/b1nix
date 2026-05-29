@@ -432,7 +432,7 @@ diagnostics.
 - [x] `done` Add boot menu options and kernel command line parsing. `bootinfo_get_kv()` key=value parser + `init=`/`b1nix.single`/`b1nix.nographics` dispatch in `init_main` + a 3-entry GRUB boot menu. Host smoke 223/0 (`M27-CMDLINE: ok kv-parse`). See [`docs/m27-polish.md`](m27-polish.md).
 - [ ] `planned` Add init scripts and a simple service supervisor.
 - [ ] `planned` Add users, passwords or login shell basics.
-- [ ] `planned` Add stable shutdown, reboot, and emergency shell paths.
+- [x] `done` Add stable shutdown, reboot, and emergency shell paths. `SYS_REBOOT` (was a no-op `arch_halt` stub) now takes RESTART (8042 pulse + triple-fault fallback) / POWEROFF (QEMU/Bochs ACPI ports) / HALT commands, exposed as `reboot`/`poweroff`/`halt`/`shutdown`. Emergency single-user `/bin/sh` via `b1nix.single` + spawn-failure fallback. Host smoke 224/0 (`reboot: restarting`, real reset under QEMU `-no-reboot`). See [`docs/m27-polish.md`](m27-polish.md).
 - [ ] `planned` Document everyday usage from boot to editing/building files.
 - [ ] `planned` Keep the system usable without graphics as a first-class target.
 - [ ] `planned` Add first-boot setup for persistent root images.

@@ -61,7 +61,19 @@ static u64 bb_open(const char *path) {
 
 static int reboot_main(int argc, const char **argv) {
   (void)argc; (void)argv;
-  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_RESTART, 0, 0, 0, 0, 0);
+  return 0;
+}
+
+static int poweroff_main(int argc, const char **argv) {
+  (void)argc; (void)argv;
+  syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_POWEROFF, 0, 0, 0, 0, 0);
+  return 0;
+}
+
+static int halt_main(int argc, const char **argv) {
+  (void)argc; (void)argv;
+  syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_HALT, 0, 0, 0, 0, 0);
   return 0;
 }
 
@@ -2227,6 +2239,9 @@ static struct bb_app bb_apps[] = {
     {"su", su_main},
     {"clear", clear_main},
     {"reboot", reboot_main},
+    {"poweroff", poweroff_main},
+    {"halt", halt_main},
+    {"shutdown", poweroff_main},
     {0, 0},
 };
 

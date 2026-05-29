@@ -1845,8 +1845,33 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)sys_chdir((const char *)(usize)arg0);
 
   case SYS_REBOOT:
-    console_write("reboot requested\n");
-    arch_halt();
+    if ((int)arg0 == B1NIX_REBOOT_POWEROFF) {
+      console_write("reboot: powering off\n");
+      /* QEMU/Bochs ACPI shutdown ports - no full ACPI parsing needed. */
+      outw(0x604, 0x2000);  /* QEMU >= 2.0 */
+      outw(0xB004, 0x2000); /* Bochs / older QEMU */
+      outw(0x4004, 0x3400); /* QEMU microvm/newer */
+      console_write("reboot: poweroff unsupported, halting\n");
+      arch_halt();
+    } else if ((int)arg0 == B1NIX_REBOOT_HALT) {
+      console_write("reboot: system halted\n");
+      arch_halt();
+    } else {
+      console_write("reboot: restarting\n");
+      interrupts_disable();
+      /* Pulse the 8042 keyboard-controller reset line once its input
+       * buffer is drained. */
+      while (inb(0x64) & 0x02)
+        ;
+      outb(0x64, 0xFE);
+      /* Fallback: provoke a triple fault via a null IDT. */
+      struct {
+        u16 limit;
+        u64 base;
+      } __attribute__((packed)) null_idt = {0, 0};
+      __asm__ volatile("lidt %0; int3" : : "m"(null_idt));
+      arch_halt();
+    }
     break;
   case SYS_DMESG:
     if (!arg0 || arg1 == 0)
