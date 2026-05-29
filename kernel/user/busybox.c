@@ -1083,6 +1083,8 @@ static int grep_main(int argc, const char **argv) {
   int quiet = 0;
   int show_line = 0;
   int invert = 0;
+  int ignore_case = 0;
+  int count_only = 0;
   int start_idx = 1;
   for (int i = 1; i < argc; i++) {
     if (argv[i][0] == '-') {
@@ -1100,6 +1102,10 @@ static int grep_main(int argc, const char **argv) {
           show_line = 1;
         else if (argv[i][j] == 'v')
           invert = 1;
+        else if (argv[i][j] == 'i')
+          ignore_case = 1;
+        else if (argv[i][j] == 'c')
+          count_only = 1;
         else {
           printf("grep: invalid option -- '%c'\n", argv[i][j]);
           return 1;
@@ -1141,32 +1147,51 @@ static int grep_main(int argc, const char **argv) {
   usize plen = strlen(pattern);
   usize line_start = 0;
   int any_found = 0;
+  int match_count = 0;
   int line_num = 1;
   for (usize i = 0; i <= (usize)total; i++) {
     if (buf[i] == '\n' || buf[i] == '\0') {
       int line_found = 0;
       for (usize j = line_start; j + plen <= i; j++) {
-        if (memcmp(buf + j, pattern, plen) == 0) {
+        int eq = 1;
+        for (usize k = 0; k < plen; k++) {
+          char a = buf[j + k], b = pattern[k];
+          if (ignore_case) {
+            if (a >= 'A' && a <= 'Z')
+              a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z')
+              b = (char)(b + 32);
+          }
+          if (a != b) {
+            eq = 0;
+            break;
+          }
+        }
+        if (eq) {
           line_found = 1;
           break;
         }
       }
       int selected = invert ? !line_found : line_found;
-      if (selected && !quiet) {
-        if (show_line)
-          printf("%d:", line_num);
-        for (usize p = line_start; p < i; p++)
-          putchar(buf[p]);
-        putchar('\n');
-      }
-      if (selected)
+      if (selected) {
         any_found = 1;
+        match_count++;
+        if (!quiet && !count_only) {
+          if (show_line)
+            printf("%d:", line_num);
+          for (usize p = line_start; p < i; p++)
+            putchar(buf[p]);
+          putchar('\n');
+        }
+      }
       line_start = i + 1;
       line_num++;
       if (buf[i] == '\0')
         break;
     }
   }
+  if (count_only && !quiet)
+    printf("%d\n", match_count);
   return any_found ? 0 : 1;
 }
 

@@ -159,30 +159,53 @@ static char sh_history[SH_HISTORY_MAX][SH_LINE_MAX];
 static int sh_hist_count = 0;
 
 /* ── Job Control ── */
-#define SH_JOBS_MAX 16
+/* Growable job table (no fixed SH_JOBS_MAX cap). A job is Running unless it has
+ * been stopped (SIGTSTP); `done` marks a reaped slot available for reuse. */
 struct sh_job {
   u64 pid;
-  char name[64];
+  char *name;
   int done;
+  int stopped;
 };
-static struct sh_job sh_jobs[SH_JOBS_MAX];
+static struct sh_job *sh_jobs = 0;
 static int sh_job_count = 0;
+static int sh_job_cap = 0;
 
-static int sh_job_add(u64 pid, const char *name) {
-  for (int i = 0; i < SH_JOBS_MAX; i++) {
+/* WIFSTOPPED equivalent: the kernel encodes a stopped child as low byte 0x7F. */
+static int sh_status_stopped(int st) { return (st & 0xFF) == 0x7F; }
+
+static int sh_job_add_ex(u64 pid, const char *name, int stopped) {
+  for (int i = 0; i < sh_job_count; i++) {
     if (!sh_jobs[i].pid || sh_jobs[i].done) {
+      free(sh_jobs[i].name);
       sh_jobs[i].pid = pid;
+      sh_jobs[i].name = strdup(name);
       sh_jobs[i].done = 0;
-      usize nl = strlen(name);
-      if (nl >= 64)
-        nl = 63;
-      memcpy(sh_jobs[i].name, name, nl + 1);
-      if (i >= sh_job_count)
-        sh_job_count = i + 1;
+      sh_jobs[i].stopped = stopped;
       return i + 1;
     }
   }
-  return -1;
+  if (sh_job_count == sh_job_cap) {
+    int ncap = sh_job_cap ? sh_job_cap * 2 : 8;
+    struct sh_job *nj = malloc((usize)ncap * sizeof(*nj));
+    if (!nj)
+      return -1;
+    for (int i = 0; i < sh_job_count; i++)
+      nj[i] = sh_jobs[i];
+    free(sh_jobs);
+    sh_jobs = nj;
+    sh_job_cap = ncap;
+  }
+  int idx = sh_job_count++;
+  sh_jobs[idx].pid = pid;
+  sh_jobs[idx].name = strdup(name);
+  sh_jobs[idx].done = 0;
+  sh_jobs[idx].stopped = stopped;
+  return idx + 1;
+}
+
+static int sh_job_add(u64 pid, const char *name) {
+  return sh_job_add_ex(pid, name, 0);
 }
 
 static void sh_jobs_print(void) {
@@ -190,14 +213,18 @@ static void sh_jobs_print(void) {
   for (int i = 0; i < sh_job_count; i++) {
     if (!sh_jobs[i].pid || sh_jobs[i].done)
       continue;
-    int st = 0;
-    u64 r = syscall_dispatch(SYS_WAITPID, sh_jobs[i].pid, (u64)(usize)&st, 1 /*WNOHANG*/, 0, 0, 0);
-    if (r == sh_jobs[i].pid)
-      sh_jobs[i].done = 1;
+    if (!sh_jobs[i].stopped) {
+      int st = 0;
+      u64 r = syscall_dispatch(SYS_WAITPID, sh_jobs[i].pid, (u64)(usize)&st,
+                               1 /*WNOHANG*/, 0, 0, 0);
+      if (r == sh_jobs[i].pid && !sh_status_stopped(st))
+        sh_jobs[i].done = 1;
+    }
     if (sh_jobs[i].done)
       continue;
-    char num[4] = {'[', '0' + (i + 1), ']', ' '};
-    syscall_dispatch(SYS_WRITE, 0, (u64)(usize)num, 4, 0, 0, 0);
+    char num[5] = {'[', (char)('0' + (i + 1)), ']', ' ', 0};
+    uwrite(num);
+    uwrite(sh_jobs[i].stopped ? "Stopped  " : "Running  ");
     uwrite(sh_jobs[i].name);
     uwrite("\n");
     any = 1;
@@ -206,6 +233,8 @@ static void sh_jobs_print(void) {
     uwrite("no background jobs\n");
 }
 
+/* Bring job to the foreground: resume it if stopped, then wait. If it stops
+ * again it stays a (stopped) job; otherwise it is reaped. */
 static int sh_fg(int job_num) {
   int idx = job_num - 1;
   if (idx < 0 || idx >= sh_job_count || !sh_jobs[idx].pid ||
@@ -213,10 +242,37 @@ static int sh_fg(int job_num) {
     uwrite("fg: no such job\n");
     return -1;
   }
+  uwrite(sh_jobs[idx].name);
+  uwrite("\n");
+  if (sh_jobs[idx].stopped) {
+    syscall_dispatch(SYS_KILL, sh_jobs[idx].pid, SIGCONT, 0, 0, 0, 0);
+    sh_jobs[idx].stopped = 0;
+  }
   int st = 0;
-  syscall_dispatch(SYS_WAIT, sh_jobs[idx].pid, (u64)(usize)&st, 0, 0, 0, 0);
-  sh_jobs[idx].done = 1;
+  syscall_dispatch(SYS_WAITPID, sh_jobs[idx].pid, (u64)(usize)&st,
+                   B1NIX_WUNTRACED, 0, 0, 0);
+  if (sh_status_stopped(st))
+    sh_jobs[idx].stopped = 1;
+  else
+    sh_jobs[idx].done = 1;
   return st;
+}
+
+/* Resume a stopped job in the background (`bg`). */
+static int sh_bg(int job_num) {
+  int idx = job_num - 1;
+  if (idx < 0 || idx >= sh_job_count || !sh_jobs[idx].pid ||
+      sh_jobs[idx].done) {
+    uwrite("bg: no such job\n");
+    return -1;
+  }
+  syscall_dispatch(SYS_KILL, sh_jobs[idx].pid, SIGCONT, 0, 0, 0, 0);
+  sh_jobs[idx].stopped = 0;
+  char num[5] = {'[', (char)('0' + (idx + 1)), ']', ' ', 0};
+  uwrite(num);
+  uwrite(sh_jobs[idx].name);
+  uwrite(" &\n");
+  return 0;
 }
 
 static void ensure_shell_tty_stdio(void) {
@@ -381,49 +437,333 @@ static void resolve_path(const char *cwd, const char *rel, char *abs) {
   }
 }
 
-#define MAX_ENV_VARS 16
-static char env_keys[MAX_ENV_VARS][32];
-static char env_vals[MAX_ENV_VARS][64];
-static int env_count = 0;
+/* Dynamic shell environment: the table grows on demand and keys/values are
+ * strdup'd at full length, so capacity tracks what the running scripts use
+ * instead of a hardcoded ceiling. */
+struct sh_envvar {
+  char *key;
+  char *val;
+};
+static struct sh_envvar *sh_env = 0;
+static int sh_env_count = 0;
+static int sh_env_cap = 0;
+
+static void sh_env_grow(void) {
+  int ncap = sh_env_cap ? sh_env_cap * 2 : 8;
+  struct sh_envvar *ne = malloc((usize)ncap * sizeof(*ne));
+  if (!ne)
+    return;
+  for (int i = 0; i < sh_env_count; i++)
+    ne[i] = sh_env[i];
+  free(sh_env);
+  sh_env = ne;
+  sh_env_cap = ncap;
+}
 
 static void set_env(const char *key, const char *val) {
-  for (int i = 0; i < env_count; i++) {
-    if (strcmp(env_keys[i], key) == 0) {
-      usize len = strlen(val);
-      if (len > 63)
-        len = 63;
-      memcpy(env_vals[i], val, len);
-      env_vals[i][len] = '\0';
+  for (int i = 0; i < sh_env_count; i++) {
+    if (strcmp(sh_env[i].key, key) == 0) {
+      char *nv = strdup(val);
+      if (nv) {
+        free(sh_env[i].val);
+        sh_env[i].val = nv;
+      }
       return;
     }
   }
-  if (env_count < MAX_ENV_VARS) {
-    usize klen = strlen(key);
-    if (klen > 31)
-      klen = 31;
-    memcpy(env_keys[env_count], key, klen);
-    env_keys[env_count][klen] = '\0';
-
-    usize vlen = strlen(val);
-    if (vlen > 63)
-      vlen = 63;
-    memcpy(env_vals[env_count], val, vlen);
-    env_vals[env_count][vlen] = '\0';
-
-    env_count++;
+  if (sh_env_count == sh_env_cap)
+    sh_env_grow();
+  if (sh_env_count == sh_env_cap)
+    return;
+  char *k = strdup(key);
+  char *v = strdup(val);
+  if (!k || !v) {
+    free(k);
+    free(v);
+    return;
   }
+  sh_env[sh_env_count].key = k;
+  sh_env[sh_env_count].val = v;
+  sh_env_count++;
 }
 
 static const char *get_env(const char *key) {
-  for (int i = 0; i < env_count; i++) {
-    if (strcmp(env_keys[i], key) == 0) {
-      return env_vals[i];
-    }
-  }
+  for (int i = 0; i < sh_env_count; i++)
+    if (strcmp(sh_env[i].key, key) == 0)
+      return sh_env[i].val;
   return "";
 }
 
+/* Whole-environment snapshot/restore used to isolate subshell side effects. */
+struct sh_env_snap {
+  struct sh_envvar *vars;
+  int count;
+};
+
+static void sh_env_snapshot(struct sh_env_snap *s) {
+  s->count = sh_env_count;
+  s->vars = malloc((usize)(sh_env_count > 0 ? sh_env_count : 1) *
+                   sizeof(struct sh_envvar));
+  if (!s->vars) {
+    s->count = 0;
+    return;
+  }
+  for (int i = 0; i < sh_env_count; i++) {
+    s->vars[i].key = strdup(sh_env[i].key);
+    s->vars[i].val = strdup(sh_env[i].val);
+  }
+}
+
+static void sh_env_restore(struct sh_env_snap *s) {
+  for (int i = 0; i < sh_env_count; i++) {
+    free(sh_env[i].key);
+    free(sh_env[i].val);
+  }
+  sh_env_count = 0;
+  for (int i = 0; i < s->count; i++) {
+    if (s->vars[i].key && s->vars[i].val)
+      set_env(s->vars[i].key, s->vars[i].val);
+    free(s->vars[i].key);
+    free(s->vars[i].val);
+  }
+  free(s->vars);
+  s->vars = 0;
+  s->count = 0;
+}
+
 static int sh_last_status = 0;
+
+static void sh_execute_line(char *line, char *cwd);
+static void sh_expand_cmdsubst(char *line, int linecap, char *cwd);
+static void expand_env(const char *in, char *out);
+static void sh_run_fragment(const char *frag, char *cwd);
+
+/* ---- shell functions: name() { list; } ---- */
+/* Dynamic function table: grows on demand, bodies strdup'd at full length. */
+struct sh_func {
+  char *name;
+  char *body;
+};
+static struct sh_func *sh_funcs = 0;
+static int sh_func_count = 0;
+static int sh_func_cap = 0;
+
+static int sh_func_find(const char *name) {
+  for (int i = 0; i < sh_func_count; i++)
+    if (strcmp(sh_funcs[i].name, name) == 0)
+      return i;
+  return -1;
+}
+
+static void sh_func_define(const char *name, const char *body) {
+  int idx = sh_func_find(name);
+  if (idx >= 0) {
+    char *nb = strdup(body);
+    if (nb) {
+      free(sh_funcs[idx].body);
+      sh_funcs[idx].body = nb;
+    }
+    return;
+  }
+  if (sh_func_count == sh_func_cap) {
+    int ncap = sh_func_cap ? sh_func_cap * 2 : 8;
+    struct sh_func *nf = malloc((usize)ncap * sizeof(*nf));
+    if (!nf)
+      return;
+    for (int i = 0; i < sh_func_count; i++)
+      nf[i] = sh_funcs[i];
+    free(sh_funcs);
+    sh_funcs = nf;
+    sh_func_cap = ncap;
+  }
+  char *n = strdup(name);
+  char *b = strdup(body);
+  if (!n || !b) {
+    free(n);
+    free(b);
+    return;
+  }
+  sh_funcs[sh_func_count].name = n;
+  sh_funcs[sh_func_count].body = b;
+  sh_func_count++;
+}
+
+/* Invoke a function: set $1..$9 and $# to the call args (saving/restoring the
+ * caller's positionals), then expand and run the stored body. The $1..$9 bound
+ * is the POSIX single-digit positional model, not an arbitrary cap. */
+static int sh_func_run(const char *name, char **args, int num_args, char *cwd) {
+  int idx = sh_func_find(name);
+  if (idx < 0)
+    return 127;
+
+  char saved[10][64];
+  char saved_hash[12];
+  char key[2] = {0, 0};
+  for (int i = 1; i <= 9; i++) {
+    key[0] = (char)('0' + i);
+    strncpy(saved[i], get_env(key), 63);
+    saved[i][63] = '\0';
+  }
+  strncpy(saved_hash, get_env("#"), sizeof(saved_hash) - 1);
+  saved_hash[sizeof(saved_hash) - 1] = '\0';
+
+  for (int i = 1; i <= 9; i++) {
+    key[0] = (char)('0' + i);
+    set_env(key, (i < num_args) ? args[i] : "");
+  }
+  char nbuf[12];
+  snprintf(nbuf, sizeof(nbuf), "%d", num_args - 1);
+  set_env("#", nbuf);
+
+  usize blen = strlen(sh_funcs[idx].body);
+  usize cap = blen * 4 + 256;
+  char *body = malloc(cap);
+  char *expanded = malloc(blen * 8 + 256);
+  if (body && expanded) {
+    memcpy(body, sh_funcs[idx].body, blen + 1);
+    sh_expand_cmdsubst(body, (int)cap, cwd);
+    expand_env(body, expanded);
+    sh_execute_line(expanded, cwd);
+  }
+  free(body);
+  free(expanded);
+  int status = sh_last_status;
+
+  for (int i = 1; i <= 9; i++) {
+    key[0] = (char)('0' + i);
+    set_env(key, saved[i]);
+  }
+  set_env("#", saved_hash);
+  return status;
+}
+
+/* ---- shell arrays: arr=(a b c), ${arr[i]}, ${arr[@]}, ${#arr[@]} ---- */
+/* Each array and its element list grow on demand (no fixed element cap). */
+struct sh_array {
+  char *name;
+  char **elems;
+  int count;
+  int cap;
+};
+static struct sh_array *sh_arrays = 0;
+static int sh_array_count = 0;
+static int sh_array_cap = 0;
+
+static int sh_array_find(const char *name) {
+  for (int i = 0; i < sh_array_count; i++)
+    if (strcmp(sh_arrays[i].name, name) == 0)
+      return i;
+  return -1;
+}
+
+/* Reset (or create) an array to empty, freeing any existing elements. */
+static int sh_array_reset(const char *name) {
+  int idx = sh_array_find(name);
+  if (idx >= 0) {
+    for (int i = 0; i < sh_arrays[idx].count; i++)
+      free(sh_arrays[idx].elems[i]);
+    sh_arrays[idx].count = 0;
+    return idx;
+  }
+  if (sh_array_count == sh_array_cap) {
+    int ncap = sh_array_cap ? sh_array_cap * 2 : 8;
+    struct sh_array *na = malloc((usize)ncap * sizeof(*na));
+    if (!na)
+      return -1;
+    for (int i = 0; i < sh_array_count; i++)
+      na[i] = sh_arrays[i];
+    free(sh_arrays);
+    sh_arrays = na;
+    sh_array_cap = ncap;
+  }
+  char *nm = strdup(name);
+  if (!nm)
+    return -1;
+  idx = sh_array_count++;
+  sh_arrays[idx].name = nm;
+  sh_arrays[idx].elems = 0;
+  sh_arrays[idx].count = 0;
+  sh_arrays[idx].cap = 0;
+  return idx;
+}
+
+static void sh_array_append(int idx, const char *elem) {
+  if (idx < 0)
+    return;
+  struct sh_array *a = &sh_arrays[idx];
+  if (a->count == a->cap) {
+    int ncap = a->cap ? a->cap * 2 : 8;
+    char **ne = malloc((usize)ncap * sizeof(char *));
+    if (!ne)
+      return;
+    for (int i = 0; i < a->count; i++)
+      ne[i] = a->elems[i];
+    free(a->elems);
+    a->elems = ne;
+    a->cap = ncap;
+  }
+  char *e = strdup(elem);
+  if (!e)
+    return;
+  a->elems[a->count++] = e;
+}
+
+/* ---- trap handlers: trap 'cmds' SIG ... ---- */
+struct sh_trap {
+  char *sig;
+  char *cmd;
+};
+static struct sh_trap *sh_traps = 0;
+static int sh_trap_count = 0;
+static int sh_trap_cap = 0;
+
+static void sh_trap_set(const char *sig, const char *cmd) {
+  for (int i = 0; i < sh_trap_count; i++) {
+    if (strcmp(sh_traps[i].sig, sig) == 0) {
+      char *nc = strdup(cmd);
+      if (nc) {
+        free(sh_traps[i].cmd);
+        sh_traps[i].cmd = nc;
+      }
+      return;
+    }
+  }
+  if (sh_trap_count == sh_trap_cap) {
+    int ncap = sh_trap_cap ? sh_trap_cap * 2 : 8;
+    struct sh_trap *nt = malloc((usize)ncap * sizeof(*nt));
+    if (!nt)
+      return;
+    for (int i = 0; i < sh_trap_count; i++)
+      nt[i] = sh_traps[i];
+    free(sh_traps);
+    sh_traps = nt;
+    sh_trap_cap = ncap;
+  }
+  char *s = strdup(sig);
+  char *c = strdup(cmd);
+  if (!s || !c) {
+    free(s);
+    free(c);
+    return;
+  }
+  sh_traps[sh_trap_count].sig = s;
+  sh_traps[sh_trap_count].cmd = c;
+  sh_trap_count++;
+}
+
+static const char *sh_trap_get(const char *sig) {
+  for (int i = 0; i < sh_trap_count; i++)
+    if (strcmp(sh_traps[i].sig, sig) == 0)
+      return sh_traps[i].cmd;
+  return 0;
+}
+
+/* Run the handler registered for `sig` (e.g. "EXIT"), if any. */
+static void sh_run_trap(const char *sig, char *cwd) {
+  const char *c = sh_trap_get(sig);
+  if (c && c[0])
+    sh_run_fragment(c, cwd);
+}
 
 /* Integer evaluator for $((...)) arithmetic expansion. Supports + - * / %,
  * parentheses, unary +/-, decimal literals, and bare/`$`-prefixed variable
@@ -560,6 +900,120 @@ static void expand_env(const char *in, char *out) {
         for (int k = 0; buf[k]; k++)
           out[j++] = buf[k];
         i++;
+        continue;
+      }
+      if (in[i] == '{') {
+        /* ${VAR} ${#VAR} ${arr[i]} ${arr[@]} ${#arr[@]}
+         * ${x:-w} ${x-w} ${x:=w} ${x=w} ${x:+w} ${x+w} */
+        i++;
+        int lenmode = 0;
+        if (in[i] == '#') {
+          lenmode = 1;
+          i++;
+        }
+        char nm[64];
+        int k = 0;
+        while (in[i] && in[i] != '}' && in[i] != '[' && in[i] != ':' &&
+               in[i] != '-' && in[i] != '+' && in[i] != '=' && k < 63)
+          nm[k++] = in[i++];
+        nm[k] = '\0';
+
+        int allidx = 0, hasidx = 0, idxval = 0;
+        if (in[i] == '[') {
+          i++;
+          if (in[i] == '@' || in[i] == '*') {
+            allidx = 1;
+            i++;
+          } else {
+            char ib[12];
+            int m = 0;
+            while (in[i] >= '0' && in[i] <= '9' && m < 11)
+              ib[m++] = in[i++];
+            ib[m] = '\0';
+            idxval = atoi(ib);
+            hasidx = 1;
+          }
+          if (in[i] == ']')
+            i++;
+        }
+
+        /* modifier operator: :-, -, :=, =, :+, + (empty == unset here) */
+        int op = 0; /* 1=use-default 2=assign-default 3=use-alternate */
+        if (in[i] == ':')
+          i++;
+        if (in[i] == '-') {
+          op = 1;
+          i++;
+        } else if (in[i] == '=') {
+          op = 2;
+          i++;
+        } else if (in[i] == '+') {
+          op = 3;
+          i++;
+        }
+        char word[256];
+        word[0] = '\0';
+        if (op) {
+          int wl = 0;
+          while (in[i] && in[i] != '}' && wl < 255)
+            word[wl++] = in[i++];
+          word[wl] = '\0';
+        }
+        if (in[i] == '}')
+          i++;
+
+        int ai = sh_array_find(nm);
+        if (allidx || hasidx) {
+          if (lenmode) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", ai >= 0 ? sh_arrays[ai].count : 0);
+            for (int m = 0; buf[m]; m++)
+              out[j++] = buf[m];
+          } else if (allidx && ai >= 0) {
+            for (int e = 0; e < sh_arrays[ai].count; e++) {
+              const char *el = sh_arrays[ai].elems[e];
+              while (*el)
+                out[j++] = *el++;
+              if (e + 1 < sh_arrays[ai].count)
+                out[j++] = ' ';
+            }
+          } else if (hasidx && ai >= 0 && idxval >= 0 &&
+                     idxval < sh_arrays[ai].count) {
+            const char *el = sh_arrays[ai].elems[idxval];
+            while (*el)
+              out[j++] = *el++;
+          }
+        } else {
+          const char *val = (ai >= 0 && sh_arrays[ai].count > 0)
+                                ? sh_arrays[ai].elems[0]
+                                : get_env(nm);
+          int empty = (val[0] == '\0');
+          if (lenmode) {
+            char buf[16];
+            snprintf(buf, sizeof(buf), "%d", (int)strlen(val));
+            for (int m = 0; buf[m]; m++)
+              out[j++] = buf[m];
+          } else if (op) {
+            char wexp[512];
+            expand_env(word, wexp);
+            if (op == 3) {
+              if (!empty)
+                for (const char *w = wexp; *w; w++)
+                  out[j++] = *w;
+            } else if (empty) {
+              for (const char *w = wexp; *w; w++)
+                out[j++] = *w;
+              if (op == 2)
+                set_env(nm, wexp);
+            } else {
+              while (*val)
+                out[j++] = *val++;
+            }
+          } else {
+            while (*val)
+              out[j++] = *val++;
+          }
+        }
         continue;
       }
       char key[32];
@@ -996,8 +1450,19 @@ static int run_external_command(const char *cwd, char **args, int num_args,
     return 127;
   }
   if (wait_for) {
-    int status;
-    syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+    int status = 0;
+    syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&status, B1NIX_WUNTRACED, 0,
+                     0, 0);
+    /* If the foreground job stopped (Ctrl-Z), record it so fg/bg can resume. */
+    if (sh_status_stopped(status)) {
+      int jn = sh_job_add_ex(pid, args[0], 1);
+      char num[5] = {'[', (char)('0' + jn), ']', ' ', 0};
+      uwrite("\n");
+      uwrite(num);
+      uwrite("Stopped  ");
+      uwrite(args[0]);
+      uwrite("\n");
+    }
     return status;
   }
   /* Background job — register in jobs list */
@@ -1009,10 +1474,27 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
   if (num_args == 0)
     return 0;
 
+  /* User-defined functions take precedence over external commands. */
+  if (sh_func_find(args[0]) >= 0)
+    return sh_func_run(args[0], args, num_args, cwd);
+
   /* Built-ins */
   if (strcmp(args[0], "exit") == 0) {
     int code = (num_args > 1) ? atoi(args[1]) : sh_last_status;
+    sh_run_trap("EXIT", cwd);
     syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0, 0, 0);
+    return 0;
+  }
+  if (strcmp(args[0], "trap") == 0) {
+    if (num_args == 1) {
+      for (int i = 0; i < sh_trap_count; i++)
+        if (sh_traps[i].cmd[0])
+          printf("trap -- '%s' %s\n", sh_traps[i].cmd, sh_traps[i].sig);
+      return 0;
+    }
+    const char *cmd = args[1];
+    for (int s = 2; s < num_args; s++)
+      sh_trap_set(args[s], strcmp(cmd, "-") == 0 ? "" : cmd);
     return 0;
   }
   if (strcmp(args[0], "help") == 0) {
@@ -1112,6 +1594,10 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
     int jn = (num_args > 1) ? (int)(args[1][0] - '0') : sh_job_count;
     return sh_fg(jn);
   }
+  if (strcmp(args[0], "bg") == 0) {
+    int jn = (num_args > 1) ? (int)(args[1][0] - '0') : sh_job_count;
+    return sh_bg(jn);
+  }
   if (strcmp(args[0], "kill") == 0) {
     int sig = 15;
     int pid_idx = 1;
@@ -1149,6 +1635,186 @@ static int sh_execute_cmd(char *cwd, char **args, int num_args, int is_bg) {
   return run_external_command(cwd, args, num_args, !is_bg);
 }
 
+static void sh_execute_line(char *line, char *cwd);
+
+/* Find a top-level pipe `|` (paren depth 0, outside quotes, not `||`). */
+static char *find_top_pipe(char *p) {
+  int sq = 0, dq = 0, paren = 0;
+  for (char *s = p; *s; s++) {
+    char c = *s;
+    if (c == '\'' && !dq)
+      sq = !sq;
+    else if (c == '"' && !sq)
+      dq = !dq;
+    else if (!sq && !dq) {
+      if (c == '(')
+        paren++;
+      else if (c == ')') {
+        if (paren > 0)
+          paren--;
+      } else if (c == '|' && paren == 0) {
+        if (s[1] == '|') {
+          s++;
+          continue;
+        }
+        return s;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Run `seg` (which begins with '(') as a subshell: the inner list executes
+ * with its own cwd copy and an env snapshot, so `cd`/variable side effects do
+ * not leak to the parent. Redirections following the closing ')' are applied
+ * around the whole group. b1nix's shell is in-kernel and does not fork itself,
+ * so isolation is emulated via save/restore rather than a real child. */
+static int sh_run_subshell(char *seg, char *cwd, int is_bg) {
+  (void)is_bg;
+  int depth = 0, sq = 0, dq = 0, close = -1;
+  for (int i = 0; seg[i]; i++) {
+    char c = seg[i];
+    if (c == '\'' && !dq)
+      sq = !sq;
+    else if (c == '"' && !sq)
+      dq = !dq;
+    else if (!sq && !dq) {
+      if (c == '(')
+        depth++;
+      else if (c == ')') {
+        depth--;
+        if (depth == 0) {
+          close = i;
+          break;
+        }
+      }
+    }
+  }
+  if (close < 0) {
+    uwrite("sh: syntax error: unmatched (\n");
+    return 2;
+  }
+
+  char inner[SH_LINE_MAX];
+  int il = close - 1;
+  if (il < 0)
+    il = 0;
+  if (il > (int)sizeof(inner) - 1)
+    il = (int)sizeof(inner) - 1;
+  memcpy(inner, seg + 1, (usize)il);
+  inner[il] = '\0';
+
+  char trailing[128];
+  strncpy(trailing, seg + close + 1, sizeof(trailing) - 1);
+  trailing[sizeof(trailing) - 1] = '\0';
+
+  /* env + cwd snapshot for isolation */
+  struct sh_env_snap snap;
+  sh_env_snapshot(&snap);
+  char parent_cwd[128];
+  strncpy(parent_cwd, cwd, sizeof(parent_cwd) - 1);
+  parent_cwd[sizeof(parent_cwd) - 1] = '\0';
+
+  /* trailing redirections (applied around the group) */
+  char *targs[16];
+  int tn = parse_cmd(trailing, targs, 0, 16);
+  struct shell_redir redir;
+  int rc = parse_redirs(targs, tn, &redir);
+  int saved_io[3];
+  int have_io = 0;
+  int opened[4];
+  int opened_count = 0;
+  if (rc >= 0 && (redir.stdin_path || redir.stdout_path || redir.stderr_path ||
+                  redir.stderr_to_stdout)) {
+    save_stdio(saved_io);
+    have_io = 1;
+    opened_count = apply_redirs(cwd, &redir, opened, 4);
+  }
+
+  char subcwd[128];
+  strncpy(subcwd, cwd, sizeof(subcwd) - 1);
+  subcwd[sizeof(subcwd) - 1] = '\0';
+  sh_execute_line(inner, subcwd);
+  int status = sh_last_status;
+
+  if (have_io) {
+    for (int i = 0; i < opened_count; i++)
+      syscall_dispatch(SYS_CLOSE, opened[i], 0, 0, 0, 0, 0);
+    restore_stdio(saved_io);
+  }
+
+  /* restore parent env and process cwd (subshell side effects discarded) */
+  sh_env_restore(&snap);
+  syscall_dispatch(SYS_CHDIR, (u64)(usize)parent_cwd, 0, 0, 0, 0, 0);
+  return status;
+}
+
+/* Detect and perform a `name=(elem ...)` array assignment. The segment has
+ * already been variable-expanded, so the elements are literal. Returns 1 if it
+ * was an array assignment (and stored it), 0 otherwise. */
+static int sh_try_array_assign(char *p) {
+  int k = 0;
+  while ((p[k] >= 'a' && p[k] <= 'z') || (p[k] >= 'A' && p[k] <= 'Z') ||
+         (p[k] >= '0' && p[k] <= '9') || p[k] == '_')
+    k++;
+  if (k == 0 || p[k] != '=' || p[k + 1] != '(')
+    return 0;
+  char name[64];
+  int nl = k > 63 ? 63 : k;
+  memcpy(name, p, (usize)nl);
+  name[nl] = '\0';
+  char *q = p + k + 2;
+  char *end = q;
+  while (*end && *end != ')')
+    end++;
+  int idx = sh_array_reset(name);
+  while (q < end) {
+    while (q < end && (*q == ' ' || *q == '\t'))
+      q++;
+    if (q >= end)
+      break;
+    char elem[256];
+    int el = 0;
+    while (q < end && *q != ' ' && *q != '\t' && el < 255)
+      elem[el++] = *q++;
+    elem[el] = '\0';
+    sh_array_append(idx, elem);
+  }
+  return 1;
+}
+
+/* Detect and perform a bare `name=value` scalar assignment. The segment is
+ * already variable-expanded. Only a pure single-word assignment (no trailing
+ * command, no spaces in the value) is handled here; env-prefix command form
+ * (`VAR=x cmd`) and quoted values with spaces fall through. Returns 1 if it was
+ * handled. */
+static int sh_try_scalar_assign(char *p) {
+  int k = 0;
+  while ((p[k] >= 'a' && p[k] <= 'z') || (p[k] >= 'A' && p[k] <= 'Z') ||
+         (p[k] >= '0' && p[k] <= '9') || p[k] == '_')
+    k++;
+  if (k == 0 || p[k] != '=')
+    return 0;
+  if (p[k + 1] == '(' || p[k + 1] == '=') /* array assign / comparison */
+    return 0;
+  const char *val = p + k + 1;
+  int vl = 0;
+  while (val[vl] && val[vl] != ' ' && val[vl] != '\t')
+    vl++;
+  if (val[vl] != '\0') /* trailing content -> not a pure assignment */
+    return 0;
+  char name[64];
+  int nl = k > 63 ? 63 : k;
+  memcpy(name, p, (usize)nl);
+  name[nl] = '\0';
+  char value[256];
+  int vc = vl > 255 ? 255 : vl;
+  memcpy(value, val, (usize)vc);
+  value[vc] = '\0';
+  set_env(name, value);
+  return 1;
+}
+
 static int sh_execute_pipeline(char *cmd, char *cwd) {
   int is_bg = 0;
   char *p = cmd;
@@ -1167,8 +1833,17 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
     p[len - 1] = '\0';
   }
 
-  char *pipe_pos = strchr(p, '|');
+  char *pipe_pos = find_top_pipe(p);
   if (!pipe_pos) {
+    if (*p == '(')
+      return sh_run_subshell(p, cwd, is_bg);
+    if (sh_try_array_assign(p))
+      return 0;
+    if (sh_try_scalar_assign(p))
+      return 0;
+    /* Cap matches USER_MAX_ARGS (the SYS_SPAWN argv copy limit). 16 was too few
+     * for real toolchain command lines (e.g. a kernel-flag gcc invocation has
+     * ~20 tokens), which silently dropped trailing args like `-o file`. */
     /* Cap matches USER_MAX_ARGS (the SYS_SPAWN argv copy limit). 16 was too few
      * for real toolchain command lines (e.g. a kernel-flag gcc invocation has
      * ~20 tokens), which silently dropped trailing args like `-o file`. */
@@ -1279,6 +1954,7 @@ static void sh_execute_line(char *line, char *cwd) {
     int op = 0; // 0: none, 1: &&, 2: ||, 3: ;
 
     int in_quote = 0;
+    int paren = 0;
     while (*end) {
       if ((*end == '"' || *end == '\'') &&
           (in_quote == 0 || in_quote == *end)) {
@@ -1288,20 +1964,28 @@ static void sh_execute_line(char *line, char *cwd) {
           in_quote = *end;
       }
       if (!in_quote) {
-        if (end[0] == '&' && end[1] == '&') {
-          op = 1;
-          end[0] = '\0';
-          break;
-        }
-        if (end[0] == '|' && end[1] == '|') {
-          op = 2;
-          end[0] = '\0';
-          break;
-        }
-        if (end[0] == ';') {
-          op = 3;
-          end[0] = '\0';
-          break;
+        /* Don't split on operators nested inside a ( … ) subshell group. */
+        if (end[0] == '(')
+          paren++;
+        else if (end[0] == ')') {
+          if (paren > 0)
+            paren--;
+        } else if (paren == 0) {
+          if (end[0] == '&' && end[1] == '&') {
+            op = 1;
+            end[0] = '\0';
+            break;
+          }
+          if (end[0] == '|' && end[1] == '|') {
+            op = 2;
+            end[0] = '\0';
+            break;
+          }
+          if (end[0] == ';') {
+            op = 3;
+            end[0] = '\0';
+            break;
+          }
         }
       }
       end++;
@@ -1462,6 +2146,567 @@ static int sh_resolve_heredoc(char *line, int linecap, sh_readline_fn next,
   return 1;
 }
 
+/* Run `inner` as a command with stdout captured into out[]. Trailing newlines
+ * are stripped and embedded newlines collapse to spaces (POSIX-ish command
+ * substitution word formation). Uses a temp file (not a pipe) so a large
+ * producer can never deadlock against an unread pipe. */
+static int sh_capture_command(const char *inner, char *out, int outcap,
+                              char *cwd) {
+  static int cseq = 0;
+  char tmpname[32];
+  snprintf(tmpname, sizeof(tmpname), "/tmp/.b1csub%d", cseq++);
+
+  int saved[3];
+  save_stdio(saved);
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)tmpname,
+                            B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0,
+                            0, 0);
+  if ((isize)fd >= 0) {
+    syscall_dispatch(SYS_DUP2, fd, 1, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+  }
+
+  char inbuf[SH_LINE_MAX];
+  char expanded[SH_LINE_MAX * 2];
+  strncpy(inbuf, inner, sizeof(inbuf) - 1);
+  inbuf[sizeof(inbuf) - 1] = '\0';
+  expand_env(inbuf, expanded);
+  sh_execute_line(expanded, cwd);
+
+  restore_stdio(saved);
+
+  int n = 0;
+  u64 rfd = syscall_dispatch(SYS_OPEN, (u64)(usize)tmpname, 0, 0, 0, 0, 0);
+  if ((isize)rfd >= 0) {
+    isize r = (isize)syscall_dispatch(SYS_READ, rfd, (u64)(usize)out,
+                                      (u64)(outcap - 1), 0, 0, 0);
+    n = (r > 0) ? (int)r : 0;
+    syscall_dispatch(SYS_CLOSE, rfd, 0, 0, 0, 0, 0);
+  }
+  out[n] = '\0';
+  while (n > 0 && (out[n - 1] == '\n' || out[n - 1] == '\r'))
+    out[--n] = '\0';
+  for (int i = 0; i < n; i++)
+    if (out[i] == '\n' || out[i] == '\r')
+      out[i] = ' ';
+  return n;
+}
+
+/* Resolve command substitutions `$(...)` and backticks in `line` in place.
+ * `$((` is left for arithmetic expansion. Nested `$(...)` is handled by
+ * recursing on the inner text. Single quotes suppress substitution. */
+static void sh_expand_cmdsubst(char *line, int linecap, char *cwd) {
+  for (int guard = 0; guard < 32; guard++) {
+    int sq = 0, dq = 0;
+    int start = -1, inner_start = -1, inner_end = -1, after = -1;
+    for (int i = 0; line[i]; i++) {
+      char c = line[i];
+      if (c == '\'' && !dq) {
+        sq = !sq;
+        continue;
+      }
+      if (c == '"' && !sq) {
+        dq = !dq;
+        continue;
+      }
+      if (sq)
+        continue;
+      if (c == '`') {
+        int j = i + 1;
+        while (line[j] && line[j] != '`')
+          j++;
+        if (line[j] != '`')
+          return; /* unterminated */
+        start = i;
+        inner_start = i + 1;
+        inner_end = j;
+        after = j + 1;
+        break;
+      }
+      if (c == '$' && line[i + 1] == '(' && line[i + 2] != '(') {
+        int depth = 1, j = i + 2, isq = 0, idq = 0;
+        while (line[j] && depth > 0) {
+          char d = line[j];
+          if (d == '\'' && !idq)
+            isq = !isq;
+          else if (d == '"' && !isq)
+            idq = !idq;
+          else if (!isq && !idq) {
+            if (d == '(')
+              depth++;
+            else if (d == ')') {
+              depth--;
+              if (depth == 0)
+                break;
+            }
+          }
+          j++;
+        }
+        if (depth != 0)
+          return; /* unterminated */
+        start = i;
+        inner_start = i + 2;
+        inner_end = j;
+        after = j + 1;
+        break;
+      }
+    }
+    if (start < 0)
+      return;
+
+    char inner[SH_LINE_MAX];
+    int il = inner_end - inner_start;
+    if (il > (int)sizeof(inner) - 1)
+      il = (int)sizeof(inner) - 1;
+    memcpy(inner, line + inner_start, (usize)il);
+    inner[il] = '\0';
+    sh_expand_cmdsubst(inner, sizeof(inner), cwd); /* nested */
+
+    char out[SH_LINE_MAX];
+    sh_capture_command(inner, out, sizeof(out), cwd);
+
+    char rebuilt[SH_LINE_MAX * 2];
+    int w = 0;
+    for (int i = 0; i < start && w < (int)sizeof(rebuilt) - 1; i++)
+      rebuilt[w++] = line[i];
+    for (int i = 0; out[i] && w < (int)sizeof(rebuilt) - 1; i++)
+      rebuilt[w++] = out[i];
+    for (int i = after; line[i] && w < (int)sizeof(rebuilt) - 1; i++)
+      rebuilt[w++] = line[i];
+    rebuilt[w] = '\0';
+    int copy = (w > linecap - 1) ? linecap - 1 : w;
+    memcpy(line, rebuilt, (usize)copy);
+    line[copy] = '\0';
+  }
+}
+
+/* Tiny growable byte buffer for assembling multi-line compound statements
+ * (function bodies, case blocks) without a fixed-size ceiling. */
+struct sh_buf {
+  char *p;
+  int len;
+  int cap;
+};
+
+static void sh_buf_putc(struct sh_buf *b, char c) {
+  if (b->len + 1 >= b->cap) {
+    int ncap = b->cap ? b->cap * 2 : 256;
+    char *np = malloc((usize)ncap);
+    if (!np)
+      return;
+    if (b->p) {
+      memcpy(np, b->p, (usize)b->len);
+      free(b->p);
+    }
+    b->p = np;
+    b->cap = ncap;
+  }
+  b->p[b->len++] = c;
+}
+
+static void sh_buf_puts(struct sh_buf *b, const char *s) {
+  while (*s)
+    sh_buf_putc(b, *s++);
+}
+
+/* Collect a brace-delimited body starting at `frag` (the text after the
+ * function's `)`), pulling more lines via next(ctx) until the matching `}`.
+ * Lines are joined with "; ". Returns a malloc'd body string (caller frees). */
+static char *sh_collect_braces(const char *frag, sh_readline_fn next,
+                               void *ctx) {
+  struct sh_buf b = {0, 0, 0};
+  int depth = 0, started = 0;
+  const char *cur = frag;
+  char linebuf[SH_LINE_MAX];
+  for (;;) {
+    for (; *cur; cur++) {
+      char c = *cur;
+      if (c == '{') {
+        if (!started) {
+          started = 1;
+          depth = 1;
+        } else {
+          depth++;
+          sh_buf_putc(&b, c);
+        }
+      } else if (c == '}') {
+        if (started) {
+          depth--;
+          if (depth == 0) {
+            sh_buf_putc(&b, '\0');
+            return b.p;
+          }
+          sh_buf_putc(&b, c);
+        } else {
+          sh_buf_putc(&b, c);
+        }
+      } else if (started) {
+        sh_buf_putc(&b, c);
+      }
+    }
+    if (started)
+      sh_buf_puts(&b, "; ");
+    if (next(linebuf, sizeof(linebuf), ctx) < 0) {
+      sh_buf_putc(&b, '\0');
+      return b.p;
+    }
+    cur = linebuf;
+  }
+}
+
+/* Execute a fully-collected `case WORD in pat) list ;; ... esac` block. */
+static void sh_run_case(char *block, char *cwd) {
+  char *p = block;
+  while (*p == ' ' || *p == '\t')
+    p++;
+  if (strncmp(p, "case", 4) != 0)
+    return;
+  p += 4;
+  while (*p == ' ' || *p == '\t')
+    p++;
+
+  char word[128];
+  int wl = 0;
+  while (*p && *p != ' ' && *p != '\t' && *p != '\n' && wl < 127)
+    word[wl++] = *p++;
+  word[wl] = '\0';
+  char wexp[256];
+  expand_env(word, wexp);
+
+  /* advance past the 'in' keyword */
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n')
+      p++;
+    if (p[0] == 'i' && p[1] == 'n' &&
+        (p[2] == ' ' || p[2] == '\t' || p[2] == '\n' || p[2] == '\0')) {
+      p += 2;
+      break;
+    }
+    /* not 'in' yet — skip a token to avoid an infinite loop */
+    while (*p && *p != ' ' && *p != '\t' && *p != '\n')
+      p++;
+  }
+
+  int matched = 0;
+  while (*p) {
+    while (*p == ' ' || *p == '\t' || *p == '\n' || *p == ';')
+      p++;
+    if (strncmp(p, "esac", 4) == 0 || !*p)
+      break;
+
+    char pats[256];
+    int pl = 0;
+    while (*p && *p != ')' && pl < 255)
+      pats[pl++] = *p++;
+    pats[pl] = '\0';
+    if (*p == ')')
+      p++;
+
+    /* body up to ';;' */
+    const char *bstart = p;
+    while (*p && !(p[0] == ';' && p[1] == ';'))
+      p++;
+    int blen = (int)(p - bstart);
+    if (p[0] == ';' && p[1] == ';')
+      p += 2;
+
+    if (!matched) {
+      const char *tok = pats;
+      while (*tok) {
+        while (*tok == ' ' || *tok == '\t' || *tok == '\n')
+          tok++;
+        char one[128];
+        int ol = 0;
+        while (*tok && *tok != '|' && ol < 127) {
+          if (*tok != ' ' && *tok != '\t' && *tok != '\n')
+            one[ol++] = *tok;
+          tok++;
+        }
+        one[ol] = '\0';
+        if (*tok == '|')
+          tok++;
+        if (ol == 0)
+          continue;
+        char pe[256];
+        expand_env(one, pe);
+        if (glob_match(pe, wexp)) {
+          matched = 1;
+          char *body = malloc((usize)blen * 4 + 256);
+          char *bexp = malloc((usize)blen * 8 + 256);
+          if (body && bexp) {
+            memcpy(body, bstart, (usize)blen);
+            body[blen] = '\0';
+            for (int i = 0; i < blen; i++)
+              if (body[i] == '\n')
+                body[i] = ';';
+            sh_expand_cmdsubst(body, blen * 4 + 256, cwd);
+            expand_env(body, bexp);
+            sh_execute_line(bexp, cwd);
+          }
+          free(body);
+          free(bexp);
+          break;
+        }
+      }
+    }
+  }
+}
+
+/* Find `w` as a whole word in `s` (bounded by start/end/space/tab/newline/;). */
+static const char *sh_find_word(const char *s, const char *w) {
+  usize wl = strlen(w);
+  for (usize i = 0; s[i]; i++) {
+    if (strncmp(s + i, w, wl) == 0) {
+      char before = (i > 0) ? s[i - 1] : ' ';
+      char after = s[i + wl];
+      int bok = (before == ' ' || before == '\t' || before == '\n' ||
+                 before == ';');
+      int aok = (after == '\0' || after == ' ' || after == '\t' ||
+                 after == '\n' || after == ';');
+      if (bok && aok)
+        return s + i;
+    }
+  }
+  return 0;
+}
+
+/* Collect a compound statement that ends at the keyword `term` (e.g. "done",
+ * "esac"), pulling more lines via next(ctx). Returns a malloc'd block. */
+static char *sh_collect_block(const char *first, const char *term,
+                              sh_readline_fn next, void *ctx) {
+  struct sh_buf b = {0, 0, 0};
+  sh_buf_puts(&b, first);
+  int complete = (sh_find_word(first, term) != 0);
+  char nl[SH_LINE_MAX];
+  while (!complete) {
+    if (next(nl, sizeof(nl), ctx) < 0)
+      break;
+    sh_buf_putc(&b, '\n');
+    sh_buf_puts(&b, nl);
+    if (sh_find_word(nl, term))
+      break;
+  }
+  sh_buf_putc(&b, '\0');
+  return b.p;
+}
+
+static char *sh_substr(const char *a, const char *b) {
+  int n = (int)(b - a);
+  if (n < 0)
+    n = 0;
+  char *s = malloc((usize)n + 1);
+  if (s) {
+    memcpy(s, a, (usize)n);
+    s[n] = '\0';
+  }
+  return s;
+}
+
+/* cmdsubst + variable-expand a fragment, then execute it as a command line. */
+static void sh_run_fragment(const char *frag, char *cwd) {
+  usize n = strlen(frag);
+  char *buf = malloc(n * 4 + 256);
+  char *exp = malloc(n * 8 + 256);
+  if (buf && exp) {
+    memcpy(buf, frag, n + 1);
+    sh_expand_cmdsubst(buf, (int)(n * 4 + 256), cwd);
+    expand_env(buf, exp);
+    sh_execute_line(exp, cwd);
+  }
+  free(buf);
+  free(exp);
+}
+
+/* cmdsubst + variable-expand a fragment into a fresh malloc'd string. */
+static char *sh_expand_fragment(const char *frag, char *cwd) {
+  usize n = strlen(frag);
+  char *buf = malloc(n * 4 + 256);
+  char *exp = malloc(n * 8 + 256);
+  char *result = 0;
+  if (buf && exp) {
+    memcpy(buf, frag, n + 1);
+    sh_expand_cmdsubst(buf, (int)(n * 4 + 256), cwd);
+    expand_env(buf, exp);
+    result = strdup(exp);
+  }
+  free(buf);
+  free(exp);
+  return result;
+}
+
+/* for VAR in LIST; do BODY; done — LIST is cmdsubst+var-expanded then split. */
+static void sh_run_for(char *block, char *cwd) {
+  char *p = block;
+  while (*p == ' ' || *p == '\t')
+    p++;
+  p += 3; /* "for" */
+  while (*p == ' ' || *p == '\t')
+    p++;
+  char var[64];
+  int vl = 0;
+  while (((*p >= 'a' && *p <= 'z') || (*p >= 'A' && *p <= 'Z') ||
+          (*p >= '0' && *p <= '9') || *p == '_') &&
+         vl < 63)
+    var[vl++] = *p++;
+  var[vl] = '\0';
+  const char *inp = sh_find_word(p, "in");
+  const char *dop = sh_find_word(p, "do");
+  const char *donep = sh_find_word(block, "done");
+  if (vl == 0 || !inp || !dop || !donep)
+    return;
+  char *listraw = sh_substr(inp + 2, dop);
+  char *list = sh_expand_fragment(listraw ? listraw : "", cwd);
+  free(listraw);
+  char *body = sh_substr(dop + 2, donep);
+  if (list && body) {
+    char *q = list;
+    while (*q) {
+      while (*q == ' ' || *q == '\t' || *q == '\n' || *q == ';')
+        q++;
+      if (!*q)
+        break;
+      char word[256];
+      int wl = 0;
+      while (*q && *q != ' ' && *q != '\t' && *q != '\n' && *q != ';' &&
+             wl < 255)
+        word[wl++] = *q++;
+      word[wl] = '\0';
+      set_env(var, word);
+      sh_run_fragment(body, cwd);
+    }
+  }
+  free(list);
+  free(body);
+}
+
+/* while/until COND; do BODY; done. A large runaway guard prevents a buggy or
+ * never-false condition from wedging the in-kernel shell (not a feature cap). */
+static void sh_run_while(char *block, char *cwd, int is_until) {
+  char *p = block;
+  while (*p == ' ' || *p == '\t')
+    p++;
+  p += 5; /* "while" / "until" */
+  const char *dop = sh_find_word(p, "do");
+  const char *donep = sh_find_word(block, "done");
+  if (!dop || !donep)
+    return;
+  char *cond = sh_substr(p, dop);
+  char *body = sh_substr(dop + 2, donep);
+  if (cond && body) {
+    int guard = 0;
+    for (;;) {
+      if (++guard > 1000000)
+        break;
+      sh_run_fragment(cond, cwd);
+      int st = sh_last_status;
+      if (is_until ? (st == 0) : (st != 0))
+        break;
+      sh_run_fragment(body, cwd);
+    }
+  }
+  free(cond);
+  free(body);
+}
+
+/* If `line` opens a multi-line compound statement (function definition, case,
+ * or a for/while/until loop), collect the rest via next(ctx) and handle it.
+ * Returns 1 if consumed (caller skips normal expansion/execution), 0 otherwise. */
+static int sh_handle_compound(char *line, sh_readline_fn next, void *ctx,
+                              char *cwd) {
+  const char *s = line;
+  while (*s == ' ' || *s == '\t')
+    s++;
+
+  /* case ... esac */
+  if (strncmp(s, "case ", 5) == 0 || strncmp(s, "case\t", 5) == 0) {
+    struct sh_buf b = {0, 0, 0};
+    sh_buf_puts(&b, s);
+    /* If 'esac' is already on this line the case is single-line. */
+    int complete = 0;
+    for (const char *t = s; *t; t++)
+      if (t[0] == 'e' && t[1] == 's' && t[2] == 'a' && t[3] == 'c') {
+        complete = 1;
+        break;
+      }
+    char nl[SH_LINE_MAX];
+    while (!complete) {
+      if (next(nl, sizeof(nl), ctx) < 0)
+        break;
+      sh_buf_putc(&b, '\n');
+      sh_buf_puts(&b, nl);
+      const char *t = nl;
+      while (*t == ' ' || *t == '\t')
+        t++;
+      if (strncmp(t, "esac", 4) == 0)
+        break;
+    }
+    sh_buf_putc(&b, '\0');
+    if (b.p) {
+      sh_run_case(b.p, cwd);
+      free(b.p);
+    }
+    return 1;
+  }
+
+  /* for / while / until loops (terminated by `done`) */
+  if (strncmp(s, "for ", 4) == 0 || strncmp(s, "for\t", 4) == 0) {
+    char *blk = sh_collect_block(s, "done", next, ctx);
+    if (blk) {
+      sh_run_for(blk, cwd);
+      free(blk);
+    }
+    return 1;
+  }
+  if (strncmp(s, "while ", 6) == 0 || strncmp(s, "while\t", 6) == 0) {
+    char *blk = sh_collect_block(s, "done", next, ctx);
+    if (blk) {
+      sh_run_while(blk, cwd, 0);
+      free(blk);
+    }
+    return 1;
+  }
+  if (strncmp(s, "until ", 6) == 0 || strncmp(s, "until\t", 6) == 0) {
+    char *blk = sh_collect_block(s, "done", next, ctx);
+    if (blk) {
+      sh_run_while(blk, cwd, 1);
+      free(blk);
+    }
+    return 1;
+  }
+
+  /* function: ident ( ) { ... } */
+  const char *id = s;
+  int idlen = 0;
+  while ((id[idlen] >= 'a' && id[idlen] <= 'z') ||
+         (id[idlen] >= 'A' && id[idlen] <= 'Z') ||
+         (id[idlen] >= '0' && id[idlen] <= '9') || id[idlen] == '_')
+    idlen++;
+  if (idlen > 0) {
+    const char *p = id + idlen;
+    while (*p == ' ' || *p == '\t')
+      p++;
+    if (*p == '(') {
+      p++;
+      while (*p == ' ' || *p == '\t')
+        p++;
+      if (*p == ')') {
+        char name[64];
+        int n2 = idlen > 63 ? 63 : idlen;
+        memcpy(name, id, (usize)n2);
+        name[n2] = '\0';
+        p++;
+        char *body = sh_collect_braces(p, next, ctx);
+        if (body) {
+          sh_func_define(name, body);
+          free(body);
+        }
+        return 1;
+      }
+    }
+  }
+  return 0;
+}
+
 static void sh_run_script(const char *path, char *cwd) {
   u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
   if ((isize)fd < 0) {
@@ -1480,9 +2725,12 @@ static void sh_run_script(const char *path, char *cwd) {
       line[i] = '\0';
       if (line[0] && strncmp(line, "#!", 2) != 0) {
         struct hdoc_fd_ctx hc = {fd};
-        sh_resolve_heredoc(line, SH_LINE_MAX, hdoc_read_fd, &hc);
-        expand_env(line, expanded);
-        sh_execute_line(expanded, cwd);
+        if (!sh_handle_compound(line, hdoc_read_fd, &hc, cwd)) {
+          sh_expand_cmdsubst(line, SH_LINE_MAX, cwd);
+          sh_resolve_heredoc(line, SH_LINE_MAX, hdoc_read_fd, &hc);
+          expand_env(line, expanded);
+          sh_execute_line(expanded, cwd);
+        }
       }
       i = 0;
     } else if (i < SH_LINE_MAX - 1)
@@ -1490,8 +2738,12 @@ static void sh_run_script(const char *path, char *cwd) {
   }
   if (i > 0) {
     line[i] = '\0';
-    expand_env(line, expanded);
-    sh_execute_line(expanded, cwd);
+    struct hdoc_fd_ctx hc = {fd};
+    if (!sh_handle_compound(line, hdoc_read_fd, &hc, cwd)) {
+      sh_expand_cmdsubst(line, SH_LINE_MAX, cwd);
+      expand_env(line, expanded);
+      sh_execute_line(expanded, cwd);
+    }
   }
   syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
 }
@@ -1517,6 +2769,7 @@ static int sh_main(int argc, const char **argv) {
       len = sizeof(line) - 1;
     memcpy(line, argv[2], len);
     line[len] = '\0';
+    sh_expand_cmdsubst(line, sizeof(line), cwd);
     expand_env(line, expanded);
     sh_execute_line(expanded, cwd);
     return sh_last_status;
@@ -1542,9 +2795,12 @@ static int sh_main(int argc, const char **argv) {
       break;
     }
 
-    sh_resolve_heredoc(raw_line, sizeof(raw_line), hdoc_read_tty, 0);
-    expand_env(raw_line, line);
-    sh_execute_line(line, cwd);
+    if (!sh_handle_compound(raw_line, hdoc_read_tty, 0, cwd)) {
+      sh_expand_cmdsubst(raw_line, sizeof(raw_line), cwd);
+      sh_resolve_heredoc(raw_line, sizeof(raw_line), hdoc_read_tty, 0);
+      expand_env(raw_line, line);
+      sh_execute_line(line, cwd);
+    }
 
     /* Simple history add */
     if (raw_line[0]) {
@@ -3012,6 +4268,249 @@ static void m33_shell_smoke(void) {
       }
     }
     uwrite(ok ? "M33-SHELL: ok heredoc\n" : "M33-SHELL: fail heredoc\n");
+  }
+
+  /* --- command substitution: $(...) and backticks, incl. embedding --- */
+  {
+    char a[64];
+    strcpy(a, "X$(echo mid)Y");
+    sh_expand_cmdsubst(a, sizeof(a), "/tmp/m33");
+    char b[64];
+    strcpy(b, "`echo bt`");
+    sh_expand_cmdsubst(b, sizeof(b), "/tmp/m33");
+    char c[64];
+    strcpy(c, "$(echo $(echo deep))");
+    sh_expand_cmdsubst(c, sizeof(c), "/tmp/m33");
+    if (strcmp(a, "XmidY") == 0 && strcmp(b, "bt") == 0 &&
+        strcmp(c, "deep") == 0)
+      uwrite("M33-SHELL: ok cmdsubst\n");
+    else
+      uwrite("M33-SHELL: fail cmdsubst\n");
+  }
+
+  /* --- subshell: env side effects do not leak to the parent --- */
+  {
+    set_env("SSV", "outer");
+    char s[64];
+    strcpy(s, "(export SSV=inner)");
+    char scwd[128] = "/tmp/m33";
+    sh_execute_line(s, scwd);
+    if (strcmp(get_env("SSV"), "outer") == 0)
+      uwrite("M33-SHELL: ok subshell\n");
+    else
+      uwrite("M33-SHELL: fail subshell\n");
+  }
+
+  /* --- functions: direct define + multi-line def via the block reader --- */
+  {
+    sh_func_define("m33fn", "echo hi-$1");
+    char out1[64];
+    sh_capture_command("m33fn bob", out1, sizeof(out1), "/tmp/m33");
+    int ok1 = (strcmp(out1, "hi-bob") == 0);
+
+    char fl[32];
+    strcpy(fl, "m33fn2() {");
+    const char *body_lines[] = {"echo body-$1", "}", 0};
+    struct hdoc_str_ctx hc = {body_lines, 0};
+    sh_handle_compound(fl, hdoc_read_str, &hc, "/tmp/m33");
+    char out2[64];
+    sh_capture_command("m33fn2 Z", out2, sizeof(out2), "/tmp/m33");
+    int ok2 = (strcmp(out2, "body-Z") == 0);
+
+    uwrite((ok1 && ok2) ? "M33-SHELL: ok function\n"
+                        : "M33-SHELL: fail function\n");
+  }
+
+  /* --- case: glob pattern matching selects the right branch --- */
+  {
+    char cl[32];
+    strcpy(cl, "case foo in");
+    const char *clines[] = {"bar) echo no > /tmp/m33/case.out ;;",
+                            "f*) echo yes > /tmp/m33/case.out ;;",
+                            "*) echo def > /tmp/m33/case.out ;;", "esac", 0};
+    struct hdoc_str_ctx hc = {clines, 0};
+    sh_handle_compound(cl, hdoc_read_str, &hc, "/tmp/m33");
+    char rb[32];
+    int n = 0;
+    u64 fd =
+        syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/case.out", 0, 0, 0, 0,
+                         0);
+    if ((isize)fd >= 0) {
+      isize r = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)rb,
+                                        sizeof(rb) - 1, 0, 0, 0);
+      n = (r > 0) ? (int)r : 0;
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    rb[n] = '\0';
+    uwrite(strcmp(rb, "yes\n") == 0 ? "M33-SHELL: ok case\n"
+                                    : "M33-SHELL: fail case\n");
+  }
+
+  /* --- arrays: assignment, index, [@], and length --- */
+  {
+    char a1[64];
+    strcpy(a1, "arr=(alpha beta gamma)");
+    char acwd[8] = "/";
+    sh_execute_line(a1, acwd);
+    char e1[64], e2[64], e3[64];
+    expand_env("${arr[1]}", e1);
+    expand_env("${arr[@]}", e2);
+    expand_env("${#arr[@]}", e3);
+    if (strcmp(e1, "beta") == 0 && strcmp(e2, "alpha beta gamma") == 0 &&
+        strcmp(e3, "3") == 0)
+      uwrite("M33-SHELL: ok array\n");
+    else
+      uwrite("M33-SHELL: fail array\n");
+  }
+
+  /* --- job control: stop a child (SIGTSTP), then resume via bg (SIGCONT) ---
+   * Stop detection is bounded (WNOHANG poll) so the test can never hang; the
+   * reaping waits are safe because SIGCONT/SIGKILL guarantee the child runs. */
+  {
+    const char *sargv[] = {"/bin/sleep", "2", 0};
+    u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sleep", 2,
+                               (u64)(usize)sargv, 0, 0, 0);
+    int ok = 0;
+    if ((isize)pid >= 0) {
+      syscall_dispatch(SYS_KILL, pid, SIGTSTP, 0, 0, 0, 0);
+      int st = 0, got_stop = 0;
+      for (int t = 0; t < 200; t++) {
+        u64 r = syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&st,
+                                 B1NIX_WUNTRACED | 1 /*WNOHANG*/, 0, 0, 0);
+        if (r == pid && sh_status_stopped(st)) {
+          got_stop = 1;
+          break;
+        }
+        if (r == pid)
+          break; /* exited before we stopped it */
+        syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+      }
+      if (got_stop) {
+        int jn = sh_job_add_ex(pid, "sleep", 1);
+        sh_bg(jn); /* real bg path: SIGCONT + mark running */
+        syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&st, 0, 0, 0, 0);
+        ok = !sh_status_stopped(st);
+      } else {
+        syscall_dispatch(SYS_KILL, pid, SIGKILL, 0, 0, 0, 0);
+        syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&st, 0, 0, 0, 0);
+      }
+    }
+    uwrite(ok ? "M33-SHELL: ok jobs\n" : "M33-SHELL: fail jobs\n");
+  }
+
+  /* --- coreutils flag broadening: grep -i (ignore case) + -c (count) --- */
+  {
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/grp.txt",
+                              B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0,
+                              0, 0, 0);
+    if ((isize)fd >= 0) {
+      const char *content = "Foo\nfoo\nbar\nFOObar\n";
+      syscall_dispatch(SYS_WRITE, fd, (u64)(usize)content, strlen(content), 0,
+                       0, 0);
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    char out[32];
+    sh_capture_command("grep -ic foo /tmp/m33/grp.txt", out, sizeof(out),
+                       "/tmp/m33");
+    uwrite(strcmp(out, "3") == 0 ? "M33-SHELL: ok grep-flags\n"
+                                 : "M33-SHELL: fail grep-flags\n");
+  }
+
+  /* --- parameter expansion: ${x:-w} ${x:+w} ${x:=w} ${#x} --- */
+  {
+    set_env("PE", "");
+    set_env("PE2", "val");
+    char e1[64], e2[64], e3[64], e4[64], e5[64], e6[64];
+    expand_env("${PE:-fallback}", e1);
+    expand_env("${PE:+set}", e2);
+    expand_env("${PE2:-other}", e3);
+    expand_env("${PE2:+yes}", e4);
+    expand_env("${PE3:=assigned}", e5);
+    expand_env("${#PE2}", e6);
+    int ok = strcmp(e1, "fallback") == 0 && strcmp(e2, "") == 0 &&
+             strcmp(e3, "val") == 0 && strcmp(e4, "yes") == 0 &&
+             strcmp(e5, "assigned") == 0 &&
+             strcmp(get_env("PE3"), "assigned") == 0 && strcmp(e6, "3") == 0;
+    uwrite(ok ? "M33-SHELL: ok param-expand\n"
+              : "M33-SHELL: fail param-expand\n");
+  }
+
+  /* --- for loop: iterate a word list, body appends each item --- */
+  {
+    const char *none[] = {0};
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/for.out",
+                              B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0,
+                              0, 0, 0);
+    if ((isize)fd >= 0)
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    char fl[96];
+    strcpy(fl, "for x in a b c; do echo $x >> /tmp/m33/for.out; done");
+    struct hdoc_str_ctx hc = {none, 0};
+    sh_handle_compound(fl, hdoc_read_str, &hc, "/tmp/m33");
+    char rb[32];
+    int n = 0;
+    fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/for.out", 0, 0, 0, 0,
+                          0);
+    if ((isize)fd >= 0) {
+      isize r = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)rb,
+                                        sizeof(rb) - 1, 0, 0, 0);
+      n = (r > 0) ? (int)r : 0;
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    rb[n] = '\0';
+    uwrite(strcmp(rb, "a\nb\nc\n") == 0 ? "M33-SHELL: ok for-loop\n"
+                                       : "M33-SHELL: fail for-loop\n");
+  }
+
+  /* --- while loop: countdown via [ -gt ] + scalar assign + arithmetic --- */
+  {
+    const char *none[] = {0};
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/while.out",
+                              B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0,
+                              0, 0, 0);
+    if ((isize)fd >= 0)
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    set_env("N", "3");
+    char wl[128];
+    strcpy(wl, "while [ $N -gt 0 ]; do echo $N >> /tmp/m33/while.out; "
+               "N=$((N - 1)); done");
+    struct hdoc_str_ctx hc = {none, 0};
+    sh_handle_compound(wl, hdoc_read_str, &hc, "/tmp/m33");
+    char rb[32];
+    int n = 0;
+    fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/while.out", 0, 0, 0,
+                          0, 0);
+    if ((isize)fd >= 0) {
+      isize r = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)rb,
+                                        sizeof(rb) - 1, 0, 0, 0);
+      n = (r > 0) ? (int)r : 0;
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    rb[n] = '\0';
+    uwrite(strcmp(rb, "3\n2\n1\n") == 0 ? "M33-SHELL: ok while-loop\n"
+                                        : "M33-SHELL: fail while-loop\n");
+  }
+
+  /* --- trap: register a handler and fire it (as `exit` would) --- */
+  {
+    char tcwd[16] = "/tmp/m33";
+    char tl[96];
+    strcpy(tl, "trap 'echo trapped > /tmp/m33/trap.out' EXIT");
+    sh_execute_line(tl, tcwd);
+    sh_run_trap("EXIT", tcwd);
+    char rb[32];
+    int n = 0;
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/tmp/m33/trap.out", 0, 0,
+                              0, 0, 0);
+    if ((isize)fd >= 0) {
+      isize r = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)rb,
+                                        sizeof(rb) - 1, 0, 0, 0);
+      n = (r > 0) ? (int)r : 0;
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+    }
+    rb[n] = '\0';
+    uwrite(strcmp(rb, "trapped\n") == 0 ? "M33-SHELL: ok trap\n"
+                                        : "M33-SHELL: fail trap\n");
   }
 
   uwrite("M33-SHELL: done\n");
