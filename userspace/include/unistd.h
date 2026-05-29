@@ -118,6 +118,11 @@ static inline int getpid(void) {
     return syscall(SYS_GETPID);
 }
 
+/* Index of the CPU currently executing this thread (0 = BSP, 1+ = AP). */
+static inline int getcpu(void) {
+    return syscall(SYS_GETCPU);
+}
+
 static inline int isatty(int fd) {
     return fd >= 0 && fd <= 2;
 }

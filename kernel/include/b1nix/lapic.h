@@ -120,7 +120,12 @@ struct percpu {
      * sched.h into this header). */
     void *sched_return_ctx;
 
-    u8 __pad[3832];  /* pad to 4KB total */
+    /* Per-CPU idle task (struct task *). Set on APs so the cooperative scheduler
+     * can park back to it when no other task is runnable; NULL on the BSP (whose
+     * boot task serves that role). void* to avoid pulling sched.h here. */
+    void *idle_task;
+
+    u8 __pad[3824];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* GS segment base management */
@@ -159,6 +164,16 @@ void percpu_init(void);
 
 /* AP entry point (called from trampoline) */
 void ap_main(u32 cpu_id);
+
+/* Set by the BSP (main.c) once the SMP self-test finishes, telling APs to leave
+ * the work-stealing-only loop and run the full cooperative scheduler (ordinary
+ * userspace tasks) under the Big Kernel Lock. */
+extern volatile int g_ap_userspace_enabled;
+
+/* Per-CPU arch init for an Application Processor (kernel/arch/x86/arch.c):
+ * loads the kernel GDT/IDT, this CPU's TSS, and the SYSCALL/SSE MSRs so the AP
+ * can execute ring 3. */
+void x86_ap_arch_init(int cpu);
 
 /* SMP percpu accessors for task stealing */
 struct percpu *get_percpu_n(int idx);   /* returns NULL if idx out of range or CPU offline */

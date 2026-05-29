@@ -1,3 +1,4 @@
+#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
@@ -46,6 +47,39 @@ static int g_clean_fpu_ready = 0;
 static struct task tasks[MAX_TASKS];
 /* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
 static usize next_task_id = 1;
+
+/* SMP: the global runqueue holds READY *non-stealable* tasks — ordinary
+ * userspace processes and kernel threads. Any CPU (BSP or AP) dequeues from it
+ * in pick_next_task and runs the task under the Big Kernel Lock, so userspace
+ * runs on more than one core while kernel-mode execution stays serialised.
+ * (Stealable CPU-bound workers stay on per-CPU runqueues for the work-stealing
+ * path in ap_main — see sched_rq_enqueue_current / sched_steal_task.) Its own
+ * spinlock makes enqueue/dequeue safe even outside the BKL. */
+static struct runqueue g_global_rq;
+
+struct runqueue *sched_global_rq(void) { return &g_global_rq; }
+
+/* ── Per-CPU idle tasks for APs ──
+ * Each AP runs a dedicated idle task as current_task while waiting for work.
+ * These live OUTSIDE the global tasks[] table so the O(n) scan never migrates
+ * one onto another core; the cooperative scheduler reaches an AP's idle task
+ * only through the per-CPU fallback in pick_next_task. */
+static struct task g_ap_idle_tasks[MAX_CPUS];
+
+struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return 0;
+  struct task *t = &g_ap_idle_tasks[cpu];
+  memset(t, 0, sizeof(*t));
+  t->name = "ap-idle";
+  t->state = TASK_RUNNING;
+  t->priority = 0;
+  t->pml4_phys = 0; /* kernel address space */
+  t->kernel_stack_ptr = kstack_top;
+  t->cwd[0] = '/';
+  t->cwd[1] = '\0';
+  return t;
+}
 static volatile u64 scheduler_ticks;
 static int scheduler_started;
 static void task_init_cred(struct task *task);
@@ -103,16 +137,29 @@ static struct task *pick_next_task(void) {
     return 0;
   }
 
-  /* Try per-CPU runqueue first */
   struct percpu *pcpu = get_percpu();
-  if (pcpu) {
-      struct task *t = rq_dequeue(&pcpu->runqueue);
-      if (t && t->state == TASK_READY)
-          return t;
-      if (t) rq_enqueue(&pcpu->runqueue, t); /* put back if not ready */
+  int on_ap = (pcpu && pcpu->cpu_id != 0);
+
+  /* On the BSP, drain the global runqueue first (fast path for freshly woken /
+   * created tasks). APs skip the rq dequeue and rely on the scan below with the
+   * ap_runnable filter — an AP must run ONLY userspace ELF processes (kernel
+   * threads would hold the BKL across their ring-0 yields and monopolise it). A
+   * userspace task left in the rq is still found by the AP scan; the BSP later
+   * dequeues the now-RUNNING stale entry and discards it. */
+  if (!on_ap) {
+    for (;;) {
+      struct task *t = rq_dequeue(&g_global_rq);
+      if (!t)
+        break;
+      if (t->state == TASK_READY && !t->stealable)
+        return t;
+    }
   }
 
-  /* Fallback: global O(n) scan */
+  /* O(n) scan over the task table. A task that yields is marked READY without
+   * being re-enqueued (scheduler_yield), so this scan — not the rq — re-picks
+   * voluntarily-yielding tasks. Stealable workers are always skipped; on an AP
+   * only ap_runnable userspace processes are eligible. */
   usize start = task_index(current_task);
   int max_priority = -1;
   struct task *best_task = 0;
@@ -120,15 +167,30 @@ static struct task *pick_next_task(void) {
   for (usize offset = 1; offset <= MAX_TASKS; offset++) {
     usize index = (start + offset) % MAX_TASKS;
 
-    if (tasks[index].state == TASK_READY) {
-      if (tasks[index].priority > max_priority) {
-        max_priority = tasks[index].priority;
-        best_task = &tasks[index];
-      }
+    if (tasks[index].state != TASK_READY)
+      continue;
+    if (tasks[index].stealable)
+      continue;
+    if (on_ap && !tasks[index].ap_runnable)
+      continue; /* APs run only userspace ELF processes */
+
+    if (tasks[index].priority > max_priority) {
+      max_priority = tasks[index].priority;
+      best_task = &tasks[index];
     }
   }
 
-  return best_task;
+  if (best_task)
+    return best_task;
+
+  /* AP fallback: nothing else runnable, so park back to this CPU's idle task,
+   * which lets the AP cooperative loop regain control and drop the BKL. NULL on
+   * the BSP (its boot task handles idling), and skipped when the idle task is
+   * already current (so scheduler_yield returns 0 and the loop parks). */
+  if (pcpu && pcpu->idle_task && current_task != (struct task *)pcpu->idle_task)
+    return (struct task *)pcpu->idle_task;
+
+  return 0;
 }
 
 static void wake_sleepers(void) {
@@ -181,6 +243,14 @@ void scheduler_init(void) {
   current_task = boot;
   scheduler_started = 1;
 
+  /* The boot task now holds the Big Kernel Lock at depth 1. From here on the
+   * BSP runs all kernel code holding the BKL; it is handed off (still depth 1)
+   * across every context switch and only released when a task enters userspace
+   * or the idle loop parks. Uncontended on a single CPU, so this is a no-op for
+   * the non-SMP path — it just establishes the depth==1-at-context-switch
+   * invariant before the first scheduler_yield. */
+  bkl_lock();
+
   console_write("sched: initialized\n");
   console_write("scheduler offsets: fd_table=");
   console_write_dec((usize)&((struct task *)0)->fd_table);
@@ -217,7 +287,7 @@ extern void ap_worker_trampoline(void);
 
 static int kthread_create_impl(const char *name, kernel_thread_entry entry,
                                void *arg, void (*trampoline)(void),
-                               int stealable) {
+                               int stealable, int ap_runnable) {
   interrupts_disable();
   struct task *parent_task = current_task;
   /* find_unused_task atomically claims the slot, marks it BLOCKED (reserved
@@ -240,6 +310,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   u64 initial_rsp = stack_top - 16;
   *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
   task->stealable = stealable;
+  task->ap_runnable = ap_runnable;
 
   task->name = strdup(name);
   if (!task->name) {
@@ -347,12 +418,18 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
 }
 
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
-  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0);
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0, 0);
+}
+
+int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
+                        int ap_runnable) {
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0,
+                             ap_runnable);
 }
 
 int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
                                   void *arg) {
-  return kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1);
+  return kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0);
 }
 
 /* Reap a finished stealable worker. Called by an AP from ap_main AFTER the
@@ -577,7 +654,7 @@ int scheduler_fork_current(void) {
 
 
 
-void scheduler_yield(void) {
+int scheduler_yield(void) {
   interrupts_disable();
   wake_sleepers();
 
@@ -595,7 +672,7 @@ void scheduler_yield(void) {
     }
 
     interrupts_enable();
-    return;
+    return 0; /* nothing runnable — caller's idle loop may drop the BKL */
   }
 
   if (old_task->state == TASK_RUNNING) {
@@ -629,6 +706,7 @@ void scheduler_yield(void) {
 
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
+  return 1; /* we switched out and have since been resumed (BKL held, depth 1) */
 }
 
 void scheduler_block_current(void) {

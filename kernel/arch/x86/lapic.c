@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/lapic.h>
+#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/io.h>
@@ -7,6 +8,11 @@
 #include <b1nix/sched.h>
 #include <b1nix/runqueue.h>
 #include <string.h>
+
+/* Cleared at boot; the BSP sets it after the SMP self-test so APs leave the
+ * work-stealing-only loop and run the full cooperative scheduler (userspace)
+ * under the Big Kernel Lock. */
+volatile int g_ap_userspace_enabled = 0;
 
 /* External functions */
 extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new);
@@ -257,36 +263,38 @@ void ap_worker_trampoline(void) {
  * cpu_id is a CPU index (0=BSP, 1+ = AP).
  * This function runs on the AP with its own stack and per-CPU data. */
 void ap_main(u32 cpu_id) {
-    (void)cpu_id;
     struct percpu *pcpu = get_percpu();
 
     /* Mark online FIRST, before anything that could stall, so the BSP's
      * get_online_cpu_count() observes this AP promptly. We deliberately do NOT
-     * call console_write from an AP: the framebuffer console's cursor globals
-     * and the shared VGA/serial port are unsynchronised, so AP output would
-     * race the BSP's (which runs the whole test suite in parallel). */
+     * call console_write from an AP during the work-stealing phase: the
+     * framebuffer console's cursor globals and the shared serial port are
+     * unsynchronised there. (Once the BKL is held — the userspace phase below —
+     * console writes are serialised and safe.) */
     if (pcpu) {
         pcpu->cpu_online = 1;
         pcpu->scheduler_started = 1;
     }
 
+    /* Per-CPU arch init so this AP can run ring 3: kernel GDT/IDT, this CPU's
+     * TSS, and the SYSCALL/SSE MSRs. Harmless for the work-stealing path (which
+     * stays in ring 0), required before the cooperative phase touches userspace. */
+    x86_ap_arch_init((int)cpu_id);
+
     /* The AP idle context. ap_main never returns, so this local persists for
      * the AP's lifetime; a stolen worker switches back into it when it parks. */
     struct cpu_context idle_ctx;
 
-    /* Work-stealing idle loop. Workers run with interrupts disabled so the AP
-     * never takes a timer tick mid-worker (the cooperative scheduler's shared
-     * bookkeeping — tasks[], scheduler_ticks, wake_sleepers — is BSP-owned and
-     * not SMP-safe). We busy-poll rather than `hlt` because an AP is not
-     * guaranteed a periodic timer interrupt and stolen work is pushed without
-     * an IPI. */
-    for (;;) {
+    /* ── Phase 1: work-stealing only ──
+     * Until the BSP finishes the SMP self-test (g_ap_userspace_enabled), run
+     * only stealable CPU-bound kernel workers, with interrupts disabled and
+     * WITHOUT the BKL (workers are self-contained and SMP-safe via their own
+     * test lock). This preserves the M24b work-stealing path exactly. */
+    while (!g_ap_userspace_enabled) {
         interrupts_disable();
 
         struct task *t = pcpu ? rq_dequeue(&pcpu->runqueue) : (struct task *)0;
         if (t && !(t->state == TASK_READY && t->stealable)) {
-            /* Not a runnable worker — should not appear on an AP queue, but be
-             * safe and put it back rather than mis-running it. */
             rq_enqueue(&pcpu->runqueue, t);
             t = NULL;
         }
@@ -297,12 +305,7 @@ void ap_main(u32 cpu_id) {
             t->state = TASK_RUNNING;
             pcpu->cur_task = t;
             pcpu->sched_return_ctx = &idle_ctx;
-            /* Kernel worker: stays on the kernel address space (pml4_phys==0)
-             * and runs on its own kmalloc'd kernel stack — no address-space
-             * switch and no TSS rsp0 update (no user mode is entered). */
             arch_context_switch(&idle_ctx, &t->context);
-            /* Worker has parked back here and is now TASK_DEAD. Its stack is no
-             * longer in use, so it is safe to reap. */
             pcpu->cur_task = NULL;
             sched_ap_reap_worker(t);
             interrupts_enable();
@@ -312,6 +315,29 @@ void ap_main(u32 cpu_id) {
         interrupts_enable();
         for (volatile int i = 0; i < 100000; i++)
             __asm__ volatile("pause");
+    }
+
+    /* ── Phase 2: full cooperative scheduler ──
+     * Run ordinary userspace processes (and kernel threads) from the global
+     * runqueue under the Big Kernel Lock. The AP runs its dedicated idle task as
+     * current_task; scheduler_yield switches into a runnable task (releasing the
+     * BKL when that task enters ring 3, so userspace runs in parallel with other
+     * cores) and parks back to the idle task when nothing is left to run. */
+    struct task *idle = scheduler_setup_ap_idle((int)cpu_id, pcpu->kernel_stack_virt);
+    pcpu->idle_task = idle;
+    pcpu->cur_task = idle;       /* current_task = this AP's idle task */
+    pcpu->sched_return_ctx = 0;
+
+    bkl_lock();                  /* AP now holds the BKL at depth 1 */
+    for (;;) {
+        if (!scheduler_yield()) {
+            /* Nothing runnable: drop the BKL so other cores proceed, pause, and
+             * re-take it before scheduling again. */
+            bkl_unlock();
+            for (volatile int i = 0; i < 2000; i++)
+                __asm__ volatile("pause");
+            bkl_lock();
+        }
     }
 }
 
