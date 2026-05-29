@@ -100,8 +100,10 @@ struct percpu {
     u32 apic_id;
     u32 cpu_online;
 
-    /* 0x10: Current task */
-    struct task *current_task;
+    /* 0x10: Current task. Named cur_task (not current_task) so it does not
+     * collide with the `current_task` macro (#define current_task
+     * get_percpu()->cur_task in sched.h). syscall_entry.S reads it as %gs:0x10. */
+    struct task *cur_task;
 
     /* 0x18: Scheduler state */
     struct runqueue runqueue;
@@ -111,7 +113,19 @@ struct percpu {
     /* 0x40: Kernel stack for this CPU (idle task stack) */
     u64 kernel_stack_phys;
     u64 kernel_stack_virt;
-    u8 __pad[3840];  /* pad to 4KB total */
+
+    /* SMP work-stealing: when an AP switches into a stolen worker, it stores a
+     * pointer to its own idle struct cpu_context here so the worker can switch
+     * back to the AP idle loop when done (kept as void* to avoid pulling
+     * sched.h into this header). */
+    void *sched_return_ctx;
+
+    /* Per-CPU idle task (struct task *). Set on APs so the cooperative scheduler
+     * can park back to it when no other task is runnable; NULL on the BSP (whose
+     * boot task serves that role). void* to avoid pulling sched.h here. */
+    void *idle_task;
+
+    u8 __pad[3824];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* GS segment base management */
@@ -129,8 +143,8 @@ static inline struct percpu *get_percpu(void) {
 #define percpu_ptr(member)          ({ struct percpu *_p = get_percpu(); _p ? &_p->member : (typeof(&_p->member))0; })
 
 /* Current task accessor (SMP-safe via per-CPU) */
-#define smp_current_task()          percpu_read(current_task)
-#define smp_set_current_task(t)     percpu_write(current_task, (t))
+#define smp_current_task()          percpu_read(cur_task)
+#define smp_set_current_task(t)     percpu_write(cur_task, (t))
 
 /* APIC / SMP API */
 void lapic_init(void);
@@ -150,6 +164,16 @@ void percpu_init(void);
 
 /* AP entry point (called from trampoline) */
 void ap_main(u32 cpu_id);
+
+/* Set by the BSP (main.c) once the SMP self-test finishes, telling APs to leave
+ * the work-stealing-only loop and run the full cooperative scheduler (ordinary
+ * userspace tasks) under the Big Kernel Lock. */
+extern volatile int g_ap_userspace_enabled;
+
+/* Per-CPU arch init for an Application Processor (kernel/arch/x86/arch.c):
+ * loads the kernel GDT/IDT, this CPU's TSS, and the SYSCALL/SSE MSRs so the AP
+ * can execute ring 3. */
+void x86_ap_arch_init(int cpu);
 
 /* SMP percpu accessors for task stealing */
 struct percpu *get_percpu_n(int idx);   /* returns NULL if idx out of range or CPU offline */

@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/lapic.h>
 #include <b1nix/types.h>
 
 #define X86_TSS_SELECTOR 0x28
@@ -22,15 +23,21 @@ struct x86_tss {
   u16 iomap_base;
 } __attribute__((packed));
 
-static struct x86_tss x86_tss __attribute__((aligned(16)));
+/* One TSS per CPU. TSS.rsp0 is the ring-0 stack a CPU switches to on a ring-3
+ * interrupt/exception; it is repointed at the running task's kernel stack on
+ * every context switch (arch_set_kernel_stack), so each CPU needs its own TSS
+ * to run userspace independently. */
+static struct x86_tss x86_tss_arr[MAX_CPUS] __attribute__((aligned(16)));
 
 void x86_idt_init(void);
+void x86_idt_load(void); /* interrupts.c — load the shared IDT on this CPU */
 void x86_pic_init(void);
 void x86_timer_init(void);
 void rtc_init(void);
 
 extern void x86_syscall_entry(void);
-extern u64 gdt64_tss[2];
+extern u64 gdt64_tss[];      /* MAX_CPUS TSS descriptors (2 quads each) */
+extern u8 gdt64_pointer[];   /* 10-byte GDT descriptor (limit:2 + base:8) */
 extern char x86_syscall_stack_top[];
 
 static void x86_enable_write_protect(void) {
@@ -40,23 +47,35 @@ static void x86_enable_write_protect(void) {
   __asm__ volatile("movq %0, %%cr0" : : "r"(cr0) : "memory");
 }
 
-static void x86_tss_init(void) {
-  u64 base = (u64)&x86_tss;
-  u32 limit = sizeof(x86_tss) - 1;
+/* Build CPU `cpu`'s TSS descriptor in the shared GDT and load it (ltr). The
+ * descriptor pair lives at gdt64_tss[cpu*2 .. cpu*2+1] (selector
+ * X86_TSS_SELECTOR + cpu*16). */
+static void x86_tss_init_cpu(int cpu) {
+  struct x86_tss *t = &x86_tss_arr[cpu];
+  u64 base = (u64)t;
+  u32 limit = sizeof(*t) - 1;
 
-  x86_tss.rsp0 = (u64)x86_syscall_stack_top;
-  x86_tss.iomap_base = sizeof(x86_tss);
+  if (cpu == 0)
+    t->rsp0 = (u64)x86_syscall_stack_top; /* boot value; updated per switch */
+  t->iomap_base = sizeof(*t);
 
-  gdt64_tss[0] = ((u64)(limit & 0xffff)) | ((base & 0xffffff) << 16) |
-                 ((u64)0x89 << 40) | ((u64)((limit >> 16) & 0xf) << 48) |
-                 ((u64)((base >> 24) & 0xff) << 56);
-  gdt64_tss[1] = base >> 32;
+  gdt64_tss[cpu * 2 + 0] =
+      ((u64)(limit & 0xffff)) | ((base & 0xffffff) << 16) | ((u64)0x89 << 40) |
+      ((u64)((limit >> 16) & 0xf) << 48) | ((u64)((base >> 24) & 0xff) << 56);
+  gdt64_tss[cpu * 2 + 1] = base >> 32;
 
-  __asm__ volatile("ltr %0" : : "r"((u16)X86_TSS_SELECTOR) : "memory");
+  __asm__ volatile("ltr %0"
+                   :
+                   : "r"((u16)(X86_TSS_SELECTOR + cpu * 16))
+                   : "memory");
 }
 
+static void x86_tss_init(void) { x86_tss_init_cpu(0); }
+
 void arch_set_kernel_stack(u64 stack_top) {
-  x86_tss.rsp0 = stack_top;
+  struct percpu *p = get_percpu();
+  int cpu = p ? (int)p->cpu_id : 0;
+  x86_tss_arr[cpu].rsp0 = stack_top;
 }
 
 void x86_syscall_init(void) {
@@ -104,6 +123,38 @@ void arch_init(void) {
   x86_enable_sse();
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");
+}
+
+/* Per-CPU arch init for an Application Processor, run once from ap_main before
+ * the AP may execute ring 3. The AP arrives on the trampoline's minimal GDT
+ * (no user segments, no TSS) with no IDT and with the SYSCALL/SSE MSRs unset,
+ * so it must replicate the BSP's arch_init for itself. */
+void x86_ap_arch_init(int cpu) {
+  /* Switch to the kernel GDT (it has the user code/data segments and every
+   * CPU's TSS descriptor). Reload the data segments and CS, but NEVER %gs:
+   * reloading a GS selector in long mode resets the GS base, which holds this
+   * CPU's per-CPU pointer (the trampoline set it via wrmsr; b1nix uses no
+   * SWAPGS). CS is reloaded with a far return to the kernel code selector. */
+  __asm__ volatile("lgdt (%0)" : : "r"(gdt64_pointer) : "memory");
+  __asm__ volatile("movw $0x10, %%ax\n\t"
+                   "movw %%ax, %%ds\n\t"
+                   "movw %%ax, %%es\n\t"
+                   "movw %%ax, %%ss\n\t"
+                   "movw %%ax, %%fs\n\t"
+                   "pushq $0x08\n\t"          /* CS */
+                   "leaq 1f(%%rip), %%rax\n\t"
+                   "pushq %%rax\n\t"          /* RIP */
+                   "lretq\n\t"
+                   "1:\n\t"
+                   :
+                   :
+                   : "rax", "memory");
+
+  x86_idt_load();         /* shared kernel IDT — page faults/exceptions on the AP */
+  x86_tss_init_cpu(cpu);  /* this CPU's TSS + ltr (ring-3 interrupts need rsp0) */
+  x86_syscall_init();     /* per-CPU SYSCALL MSRs: EFER.SCE, STAR, LSTAR, FMASK */
+  x86_enable_sse();       /* per-CPU CR0/CR4 for fxsave/fxrstor in ctx switch */
+  x86_enable_write_protect();
 }
 
 void arch_halt(void) {

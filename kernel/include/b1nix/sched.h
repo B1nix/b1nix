@@ -6,6 +6,7 @@
 
 #include <b1nix/types.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/lapic.h>   /* struct percpu + get_percpu() for the current_task macro */
 
 struct vfs_handle;
 struct task;
@@ -172,20 +173,66 @@ struct task {
   __attribute__((aligned(16))) u8 fpu_state[512];
   int fpu_initialized;
 
+  /* SMP work-stealing: when set, this task is a self-contained CPU-bound
+   * kernel worker that an idle Application Processor may steal and run on its
+   * own idle context (see ap_main / ap_worker_trampoline). Ordinary userspace
+   * tasks leave this 0 so APs never migrate them — the kernel's syscall/VFS
+   * paths are not yet SMP-safe for parallel kernel-mode execution. */
+  int stealable;
+
+  /* SMP: set when an Application Processor may run this task. Only real
+   * userspace ELF processes qualify — they enter ring 3 and so release the Big
+   * Kernel Lock, letting cores run in parallel. Kernel threads (daemons like
+   * net_task, builtins, the boot/idle task) stay on the BSP: they execute
+   * entirely in ring 0 and would hold the BKL across their cooperative yields,
+   * monopolising it. Set at creation (kthread_create_user) and inherited by
+   * fork. */
+  int ap_runnable;
+
   /* SMP runqueue linkage (must be last field for ABI compat) */
   struct task *next_run;
 };
 
-/* SMP-safe current_task accessor.
- * For now, uses a single global pointer (SMP migration in progress). */
-extern struct task *current_task;
+/* Per-CPU current task. `current_task` is the task running on THIS CPU; each
+ * core has its own slot in struct percpu (cur_task), so APs and the BSP never
+ * share one "current". Expands to an lvalue, so existing reads/writes
+ * (current_task = t, current_task->field, current_task == 0) all work
+ * unchanged. Requires GS to be initialized (percpu_init) before first use. */
+#define current_task (get_percpu()->cur_task)
 
 /* ── Scheduler ── */
 
 void scheduler_init(void);
 int kthread_create(const char *name, kernel_thread_entry entry, void *arg);
+/* Like kthread_create, but marks the task ap_runnable so Application Processors
+ * may run it (used for userspace processes, which enter ring 3 and release the
+ * BKL). See struct task::ap_runnable. */
+int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
+                        int ap_runnable);
+/* Create a stealable CPU-bound kernel worker (see struct task::stealable).
+ * Returns the task id, or -1 on failure. The worker is enqueued READY on the
+ * creating CPU's runqueue; an idle AP may steal and run it. */
+int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
+                                  void *arg);
+/* Reap a finished stealable worker (called by an AP after the worker parks). */
+void sched_ap_reap_worker(struct task *t);
+/* SMP work-stealing self-test (M24b). No-op unless >1 CPU is online and
+ * test mode is active. */
+void smp_selftest_run(void);
 int scheduler_fork_current(void);
-void scheduler_yield(void);
+/* Cooperatively switch to another runnable task. Returns 1 if it context
+ * switched (and has since been resumed), 0 if nothing was runnable. An idle
+ * loop uses the 0 return to drop the Big Kernel Lock before parking. */
+int scheduler_yield(void);
+/* The shared runqueue of READY non-stealable tasks (scheduler.c). */
+struct runqueue *sched_global_rq(void);
+/* Initialise (and return) the dedicated idle task for AP `cpu` running on the
+ * given kernel stack top. The AP runs it as current_task and the cooperative
+ * scheduler parks back to it when no other task is runnable. */
+struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top);
+/* Bitmask of CPU ids that have run a syscall from an ELF userspace task — the
+ * M24b proof that userspace executes on APs (defined in syscall.c). */
+u32 sched_user_cpu_mask(void);
 void scheduler_block_current(void);
 void scheduler_block_on(void *chan);
 void scheduler_wake_task(usize task_id);

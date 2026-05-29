@@ -35,7 +35,8 @@ BINARIES := \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync \
 	$(BUILD)/bin/m25_smoke \
-	$(BUILD)/bin/m26_smoke
+	$(BUILD)/bin/m26_smoke \
+	$(BUILD)/bin/m24b_smoke
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)

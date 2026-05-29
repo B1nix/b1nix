@@ -299,7 +299,13 @@ static void net_task(void *arg)
 				last_dhcp_retry = now;
 			}
 		}
-		scheduler_yield();
+		/* Sleep a tick between polls rather than busy-yielding. As a perpetually
+		 * runnable kernel daemon, busy-yielding would keep net_task READY and —
+		 * under the Big Kernel Lock — let it monopolise the lock across its
+		 * cooperative yields (it never enters ring 3 to release it), starving
+		 * userspace on the other cores. Sleeping makes it BLOCKED between ~100Hz
+		 * polls, which the DHCP/ARP/ICMP/UDP smoke paths tolerate. */
+		scheduler_sleep_ticks(1);
 	}
 }
 

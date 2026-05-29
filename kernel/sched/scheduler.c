@@ -1,3 +1,4 @@
+#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
@@ -12,6 +13,11 @@
 #include <b1nix/arch_x86.h>
 #include <b1nix/aio.h>
 #include <string.h>
+
+/* syscall_entry.S reads the per-CPU current task as %gs:0x10 — keep that in
+ * sync with struct percpu's cur_task member. */
+_Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
+               "cur_task must be at offset 0x10 (see syscall_entry.S)");
 
 #define MAX_TASKS 64
 /* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
@@ -39,11 +45,53 @@ static __attribute__((aligned(16))) u8 g_clean_fpu[512];
 static int g_clean_fpu_ready = 0;
 
 static struct task tasks[MAX_TASKS];
-struct task *current_task;
+/* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
 static usize next_task_id = 1;
+
+/* SMP: the global runqueue holds READY *non-stealable* tasks — ordinary
+ * userspace processes and kernel threads. Any CPU (BSP or AP) dequeues from it
+ * in pick_next_task and runs the task under the Big Kernel Lock, so userspace
+ * runs on more than one core while kernel-mode execution stays serialised.
+ * (Stealable CPU-bound workers stay on per-CPU runqueues for the work-stealing
+ * path in ap_main — see sched_rq_enqueue_current / sched_steal_task.) Its own
+ * spinlock makes enqueue/dequeue safe even outside the BKL. */
+static struct runqueue g_global_rq;
+
+struct runqueue *sched_global_rq(void) { return &g_global_rq; }
+
+/* ── Per-CPU idle tasks for APs ──
+ * Each AP runs a dedicated idle task as current_task while waiting for work.
+ * These live OUTSIDE the global tasks[] table so the O(n) scan never migrates
+ * one onto another core; the cooperative scheduler reaches an AP's idle task
+ * only through the per-CPU fallback in pick_next_task. */
+static struct task g_ap_idle_tasks[MAX_CPUS];
+
+struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
+  if (cpu < 0 || cpu >= MAX_CPUS)
+    return 0;
+  struct task *t = &g_ap_idle_tasks[cpu];
+  memset(t, 0, sizeof(*t));
+  t->name = "ap-idle";
+  t->state = TASK_RUNNING;
+  t->priority = 0;
+  t->pml4_phys = 0; /* kernel address space */
+  t->kernel_stack_ptr = kstack_top;
+  t->cwd[0] = '/';
+  t->cwd[1] = '\0';
+  return t;
+}
 static volatile u64 scheduler_ticks;
 static int scheduler_started;
 static void task_init_cred(struct task *task);
+
+/* SMP: protects the tasks[] slot lifecycle (UNUSED <-> claimed) so allocation
+ * and freeing are atomic across CPUs. interrupts_disable() only fences the
+ * local CPU, so it is NOT sufficient once APs touch the table (e.g. an AP
+ * reaping a stolen worker while the BSP allocates). This is a leaf lock — never
+ * acquire another lock while holding it, and never hold it across a context
+ * switch. State transitions of an already-owned task (RUNNING/READY/...) stay
+ * word-atomic and are not covered here; only slot ownership is. */
+static spinlock_t g_tasks_lock = SPINLOCK_INIT;
 
 #include <b1nix/arch.h>
 
@@ -51,15 +99,33 @@ static u64 align_down_u64(u64 value, u64 alignment) {
   return value & ~(alignment - 1);
 }
 
+/* Atomically claim a free tasks[] slot, zero it, mark it BLOCKED (reserved),
+ * and assign its id — all under g_tasks_lock so two CPUs can never claim the
+ * same slot. */
 static struct task *find_unused_task(void) {
+  u64 flags;
+  spin_lock_irqsave(&g_tasks_lock, &flags);
   for (usize i = 0; i < MAX_TASKS; i++) {
     if (tasks[i].state == TASK_UNUSED) {
       memset(&tasks[i], 0, sizeof(struct task));
       tasks[i].state = TASK_BLOCKED;
+      tasks[i].id = next_task_id++;
+      spin_unlock_irqrestore(&g_tasks_lock, flags);
       return &tasks[i];
     }
   }
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
   return 0;
+}
+
+/* Release a tasks[] slot back to UNUSED under g_tasks_lock (pairs with
+ * find_unused_task). The store also publishes any prior writes (e.g. the
+ * kfree of the task's resources) before the slot becomes claimable again. */
+static void free_task_slot(struct task *t) {
+  u64 flags;
+  spin_lock_irqsave(&g_tasks_lock, &flags);
+  t->state = TASK_UNUSED;
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
 static usize task_index(const struct task *task) {
@@ -71,16 +137,29 @@ static struct task *pick_next_task(void) {
     return 0;
   }
 
-  /* Try per-CPU runqueue first */
   struct percpu *pcpu = get_percpu();
-  if (pcpu) {
-      struct task *t = rq_dequeue(&pcpu->runqueue);
-      if (t && t->state == TASK_READY)
-          return t;
-      if (t) rq_enqueue(&pcpu->runqueue, t); /* put back if not ready */
+  int on_ap = (pcpu && pcpu->cpu_id != 0);
+
+  /* On the BSP, drain the global runqueue first (fast path for freshly woken /
+   * created tasks). APs skip the rq dequeue and rely on the scan below with the
+   * ap_runnable filter — an AP must run ONLY userspace ELF processes (kernel
+   * threads would hold the BKL across their ring-0 yields and monopolise it). A
+   * userspace task left in the rq is still found by the AP scan; the BSP later
+   * dequeues the now-RUNNING stale entry and discards it. */
+  if (!on_ap) {
+    for (;;) {
+      struct task *t = rq_dequeue(&g_global_rq);
+      if (!t)
+        break;
+      if (t->state == TASK_READY && !t->stealable)
+        return t;
+    }
   }
 
-  /* Fallback: global O(n) scan */
+  /* O(n) scan over the task table. A task that yields is marked READY without
+   * being re-enqueued (scheduler_yield), so this scan — not the rq — re-picks
+   * voluntarily-yielding tasks. Stealable workers are always skipped; on an AP
+   * only ap_runnable userspace processes are eligible. */
   usize start = task_index(current_task);
   int max_priority = -1;
   struct task *best_task = 0;
@@ -88,15 +167,30 @@ static struct task *pick_next_task(void) {
   for (usize offset = 1; offset <= MAX_TASKS; offset++) {
     usize index = (start + offset) % MAX_TASKS;
 
-    if (tasks[index].state == TASK_READY) {
-      if (tasks[index].priority > max_priority) {
-        max_priority = tasks[index].priority;
-        best_task = &tasks[index];
-      }
+    if (tasks[index].state != TASK_READY)
+      continue;
+    if (tasks[index].stealable)
+      continue;
+    if (on_ap && !tasks[index].ap_runnable)
+      continue; /* APs run only userspace ELF processes */
+
+    if (tasks[index].priority > max_priority) {
+      max_priority = tasks[index].priority;
+      best_task = &tasks[index];
     }
   }
 
-  return best_task;
+  if (best_task)
+    return best_task;
+
+  /* AP fallback: nothing else runnable, so park back to this CPU's idle task,
+   * which lets the AP cooperative loop regain control and drop the BKL. NULL on
+   * the BSP (its boot task handles idling), and skipped when the idle task is
+   * already current (so scheduler_yield returns 0 and the loop parks). */
+  if (pcpu && pcpu->idle_task && current_task != (struct task *)pcpu->idle_task)
+    return (struct task *)pcpu->idle_task;
+
+  return 0;
 }
 
 static void wake_sleepers(void) {
@@ -149,6 +243,14 @@ void scheduler_init(void) {
   current_task = boot;
   scheduler_started = 1;
 
+  /* The boot task now holds the Big Kernel Lock at depth 1. From here on the
+   * BSP runs all kernel code holding the BKL; it is handed off (still depth 1)
+   * across every context switch and only released when a task enters userspace
+   * or the idle loop parks. Uncontended on a single CPU, so this is a no-op for
+   * the non-SMP path — it just establishes the depth==1-at-context-switch
+   * invariant before the first scheduler_yield. */
+  bkl_lock();
+
   console_write("sched: initialized\n");
   console_write("scheduler offsets: fd_table=");
   console_write_dec((usize)&((struct task *)0)->fd_table);
@@ -178,14 +280,19 @@ static void task_init_cred(struct task *task) {
   }
 }
 
-int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
+/* Stealable CPU-bound kernel workers (SMP work-stealing, M24b) park back to
+ * the stealing AP's idle context via this trampoline instead of the normal
+ * kernel_thread_trampoline; defined in kernel/arch/x86/lapic.c. */
+extern void ap_worker_trampoline(void);
+
+static int kthread_create_impl(const char *name, kernel_thread_entry entry,
+                               void *arg, void (*trampoline)(void),
+                               int stealable, int ap_runnable) {
   interrupts_disable();
   struct task *parent_task = current_task;
+  /* find_unused_task atomically claims the slot, marks it BLOCKED (reserved
+   * until fully initialized), and assigns its id. */
   struct task *task = find_unused_task();
-  if (task) {
-    task->id = next_task_id++;
-    task->state = TASK_BLOCKED; /* Reserve the slot until fully initialized. */
-  }
   interrupts_enable();
 
   if (task == 0) {
@@ -194,22 +301,20 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
 
   void *stack = kmalloc(KERNEL_STACK_SIZE);
   if (!stack) {
-    interrupts_disable();
-    task->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(task);
     return -1;
   }
 
   u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
   task->kernel_stack_ptr = stack_top;
   u64 initial_rsp = stack_top - 16;
-  *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
+  *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
+  task->stealable = stealable;
+  task->ap_runnable = ap_runnable;
 
   task->name = strdup(name);
   if (!task->name) {
-    interrupts_disable();
-    task->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(task);
     kfree(stack);
     return -1;
   }
@@ -242,7 +347,16 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->context.r15 = 0;
 #endif
   task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
-  if (parent_task) {
+  if (stealable) {
+    /* Stealable CPU-bound workers are self-contained: no fd table, no cred,
+     * no address space. This keeps the AP run/reap path free of VFS/cred
+     * teardown (the worker never makes syscalls). */
+    task->stdout_fd = -1;
+    task->fd_capacity = 0;
+    task->fd_table = 0;
+    task->fd_flags = 0;
+    task->fd_lock = 0;
+  } else if (parent_task) {
     task->fd_capacity = parent_task->fd_capacity;
     task->fd_table = kzalloc(task->fd_capacity * sizeof(struct vfs_handle *));
     task->fd_flags = kzalloc(task->fd_capacity * sizeof(int));
@@ -292,7 +406,8 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
-  task_init_cred(task);
+  if (!stealable)
+    task_init_cred(task);
 
   interrupts_disable();
   task->state = TASK_READY;
@@ -300,6 +415,43 @@ int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
   interrupts_enable();
 
   return (int)task->id;
+}
+
+int kthread_create(const char *name, kernel_thread_entry entry, void *arg) {
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0, 0);
+}
+
+int kthread_create_user(const char *name, kernel_thread_entry entry, void *arg,
+                        int ap_runnable) {
+  return kthread_create_impl(name, entry, arg, kernel_thread_trampoline, 0,
+                             ap_runnable);
+}
+
+int sched_create_stealable_worker(const char *name, kernel_thread_entry entry,
+                                  void *arg) {
+  return kthread_create_impl(name, entry, arg, ap_worker_trampoline, 1, 0);
+}
+
+/* Reap a finished stealable worker. Called by an AP from ap_main AFTER the
+ * worker has switched back to the AP idle context (so its kernel stack is no
+ * longer in use). Stealable workers carry no fd table or cred, so teardown is
+ * just freeing the stack + name and releasing the task slot. kfree is
+ * heap_lock-protected; the state store is a word-sized x86 write, which the
+ * BSP's scheduler_task_count() reads tolerantly (DEAD and UNUSED both count as
+ * inactive). */
+void sched_ap_reap_worker(struct task *t) {
+  if (!t)
+    return;
+  if (t->stack) {
+    kfree(t->stack);
+    t->stack = 0;
+  }
+  if (t->name) {
+    kfree((void *)t->name);
+    t->name = 0;
+  }
+  /* Publish the kfrees and release the slot atomically vs find_unused_task. */
+  free_task_slot(t);
 }
 
 extern void x86_fork_child_trampoline(void);
@@ -320,21 +472,23 @@ int scheduler_fork_current(void) {
 
   interrupts_disable();
   struct task *child = find_unused_task();
+  interrupts_enable();
   if (!child) {
-    interrupts_enable();
     kfree(child_stack);
     return -1;
   }
+  /* find_unused_task assigned the id under g_tasks_lock; preserve it across the
+   * struct copy below (memcpy from the parent would otherwise clobber it). */
+  usize claimed_id = child->id;
 
   // 1. Copy the task structure
   memcpy(child, parent, sizeof(struct task));
-  child->id = next_task_id++;
+  child->id = claimed_id;
   child->parent_id = parent->id;
   child->state = TASK_BLOCKED;
   child->name = parent->name ? strdup(parent->name) : 0;
   if (parent->name && !child->name) {
-    child->state = TASK_UNUSED;
-    interrupts_enable();
+    free_task_slot(child);
     kfree(child_stack);
     return -1;
   }
@@ -475,8 +629,8 @@ int scheduler_fork_current(void) {
     }
     kfree(child_stack);
     child->stack = 0;
-    child->state = TASK_UNUSED;
     interrupts_enable();
+    free_task_slot(child);
     return -1;
   }
   child->fd_lock = 0;
@@ -500,7 +654,7 @@ int scheduler_fork_current(void) {
 
 
 
-void scheduler_yield(void) {
+int scheduler_yield(void) {
   interrupts_disable();
   wake_sleepers();
 
@@ -518,7 +672,7 @@ void scheduler_yield(void) {
     }
 
     interrupts_enable();
-    return;
+    return 0; /* nothing runnable — caller's idle loop may drop the BKL */
   }
 
   if (old_task->state == TASK_RUNNING) {
@@ -552,6 +706,7 @@ void scheduler_yield(void) {
 
   arch_context_switch(&old_task->context, &new_task->context);
   interrupts_enable();
+  return 1; /* we switched out and have since been resumed (BKL held, depth 1) */
 }
 
 void scheduler_block_current(void) {
@@ -726,8 +881,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               tasks[i].name = 0;
             }
             kfree(tasks[i].stack);
-            tasks[i].state = TASK_UNUSED;
             interrupts_enable();
+            free_task_slot(&tasks[i]);
             if (status) {
               if (code >= 128 && code < 128 + NSIG) {
                 /* Task was killed by a signal */

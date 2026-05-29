@@ -1,5 +1,6 @@
 #include <b1nix/arch_x86.h>
 #include <b1nix/arch.h>
+#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/mm.h>
@@ -179,6 +180,16 @@ void x86_idt_init(void) {
   __asm__ volatile("lidt %0" : : "m"(pointer));
 }
 
+/* Load the (already-populated) shared IDT on the calling CPU. Used by APs from
+ * x86_ap_arch_init so exceptions/page faults are handled on every core. */
+void x86_idt_load(void) {
+  struct idt_pointer pointer = {
+      .limit = sizeof(idt) - 1,
+      .base = (u64)&idt,
+  };
+  __asm__ volatile("lidt %0" : : "m"(pointer));
+}
+
 void x86_pic_init(void) {
   outb(PIC1_COMMAND, 0x11);
   io_wait();
@@ -233,7 +244,7 @@ extern void ps2_mouse_interrupt_handler(void);
 extern void fb_console_blink_cursor(void);
 
 
-void x86_irq_handler(struct interrupt_frame *frame) {
+static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 32) {
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
@@ -276,7 +287,19 @@ void x86_irq_handler(struct interrupt_frame *frame) {
   }
 }
 
-void x86_exception_handler(struct interrupt_frame *frame) {
+/* Interrupt entry from a userspace core acquires the Big Kernel Lock; a nested
+ * interrupt on a core already holding it (e.g. a timer tick mid-syscall) just
+ * recurses the depth. The matching release happens on the normal return; paths
+ * that never return (a fatal signal terminating the task via
+ * scheduler_exit_current) hand the depth-1 lock off across the context switch,
+ * so skipping bkl_unlock there is correct. */
+void x86_irq_handler(struct interrupt_frame *frame) {
+  bkl_lock();
+  x86_irq_handler_inner(frame);
+  bkl_unlock();
+}
+
+static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   // Page fault handling for Demand Paging
   if (frame->vector == 14) {
     u64 fault_addr = read_cr2();
@@ -392,6 +415,16 @@ void x86_exception_handler(struct interrupt_frame *frame) {
 
   console_write("[PANIC] unhandled CPU exception\n");
   arch_halt();
+}
+
+/* Exception entry takes the Big Kernel Lock (recursively if the faulting CPU
+ * already held it, e.g. a demand-paging fault while copying a user buffer
+ * mid-syscall). Released on normal return; a fault that terminates the task
+ * (scheduler_exit_current) hands the lock off across the context switch. */
+void x86_exception_handler(struct interrupt_frame *frame) {
+  bkl_lock();
+  x86_exception_handler_inner(frame);
+  bkl_unlock();
 }
 
 /* ── Stack Backtrace ──────────────────────────────────────────── */

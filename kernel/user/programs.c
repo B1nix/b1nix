@@ -9,6 +9,8 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/video.h>
+#include <b1nix/sched.h>
+#include <b1nix/lapic.h>
 #include <stdio.h>
 #include <string.h>
 #include <tui.h>
@@ -1788,6 +1790,44 @@ static int init_main(int argc, const char **argv) {
   udp_queue_smoke_check();
   poll_smoke_check();
   tcp_smoke_check();
+
+  /* M24b BKL proof: run several CPU-bound userspace processes at once so the
+   * cooperative scheduler distributes them across the BSP and Application
+   * Processors under the Big Kernel Lock. sched_user_cpu_mask() reports which
+   * cores actually executed ring-3 syscalls — a set bit > 0 means an ordinary
+   * userspace process genuinely ran on an AP. */
+  {
+    uwrite("M24B-BKL: start\n");
+    int bkl_cpus = get_online_cpu_count();
+    uwrite("M24B-BKL: cpus=");
+    uwrite_dec_value((u64)bkl_cpus);
+    uwrite("\n");
+
+#define M24B_BKL_INSTANCES 6
+    u64 bkl_pids[M24B_BKL_INSTANCES];
+    int bkl_spawned = 0;
+    for (int i = 0; i < M24B_BKL_INSTANCES; i++) {
+      u64 p = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m24b-smoke", 0, 0,
+                               0, 0, 0);
+      if ((isize)p >= 0)
+        bkl_pids[bkl_spawned++] = p;
+    }
+    for (int i = 0; i < bkl_spawned; i++) {
+      int s = 0;
+      syscall_dispatch(SYS_WAIT, bkl_pids[i], (u64)(usize)&s, 0, 0, 0, 0);
+    }
+
+    u32 bkl_mask = sched_user_cpu_mask();
+    uwrite("M24B-BKL: user-cpu-mask=");
+    uwrite_dec_value((u64)bkl_mask);
+    uwrite("\n");
+    if (bkl_cpus <= 1)
+      uwrite("M24B-BKL: skip single-cpu\n");
+    else if (bkl_mask & ~1u)
+      uwrite("M24B-BKL: ok userspace-on-ap\n");
+    else
+      uwrite("M24B-BKL: fail userspace-on-ap\n");
+  }
 
   uwrite("B1NIX-TEST: done\n");
   syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
