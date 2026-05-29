@@ -391,6 +391,16 @@ check_output "$LOG" "M11-SMOKE: ok pipe-eof" "pipe EOF when all writers close"
 check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-read" "pipe nonblocking read returns EAGAIN"
 check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-write" "pipe nonblocking write returns EAGAIN"
 check_output "$LOG" "M11-SMOKE: done" "M11 shell smoke completes"
+
+# ── M33 Shell compliance: globbing + arithmetic expansion ──
+check_output "$LOG" "M33-SHELL: start" "M33 shell smoke starts"
+check_output "$LOG" "M33-SHELL: ok glob-star" "pathname glob '*.txt' expands and sorts"
+check_output "$LOG" "M33-SHELL: ok glob-class" "glob '?' and '[ab]' bracket expressions match"
+check_output "$LOG" "M33-SHELL: ok glob-nomatch" "non-matching glob stays literal"
+check_output "$LOG" "M33-SHELL: ok arith" "arithmetic expansion \$((...)) evaluates"
+check_output "$LOG" "M33-SHELL: ok heredoc" "here-document collection + body expansion"
+check_output "$LOG" "M33-SHELL: done" "M33 shell smoke completes"
+
 check_output "$LOG" "M11-SHELL: ok simple-success" "simple command success"
 check_output "$LOG" "M11-SHELL: ok simple-fail" "simple command failure propagates status"
 check_output "$LOG" "M11-SHELL: ok exec-127" "failed exec returns 127"
