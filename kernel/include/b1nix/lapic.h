@@ -91,7 +91,18 @@ struct runqueue {
 /* NMI IPI vector */
 #define SMP_NMI_IPI_VECTOR       0x30
 
-#define MAX_CPUS 16
+/* Compile-time ceiling for per-CPU data (TSS array, AP pointer table, idle
+ * task slot table). Runtime CPU count is g_max_cpus (set from ACPI by
+ * smp_boot_aps) — most loops should bound by that. MAX_CPUS was 16 prior
+ * to the C3 audit pass; raised to 64 so multi-socket x86_64 boxes aren't
+ * cut off at the desktop-tier limit. Static cost: x86_tss_arr ~7 KiB,
+ * ap_cpu_data 512 B; idle tasks are heap-allocated lazily per AP. */
+#define MAX_CPUS 64
+
+/* Runtime CPU count: 1 until smp_boot_aps observes ACPI / CPUID and
+ * publishes the discovered total. Code that walks CPUs should prefer this
+ * to the MAX_CPUS ceiling. */
+extern int g_max_cpus;
 
 /* Per-CPU data */
 struct percpu {
@@ -155,6 +166,10 @@ void lapic_write(u32 reg, u32 val);
 u32 lapic_id(void);
 void lapic_send_ipi(u32 apic_id, u32 icr_low);
 void lapic_send_ipi_allbutself(u32 icr_low);
+
+/* LAPIC-timer frequency (ticks per millisecond at divide=16), calibrated
+ * against the PIT at lapic_init. 0 until calibration runs. */
+u32 lapic_ticks_per_ms(void);
 
 /* AP bringup */
 int smp_boot_aps(void);

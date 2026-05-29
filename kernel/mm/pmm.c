@@ -37,6 +37,11 @@ struct pmm_state {
 static struct pmm_state pmm;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
+/* Runtime size of the kernel's direct map (see mm.h). Starts at the
+ * compile-time ceiling so any pre-pmm_init reference is a safe over-estimate;
+ * pmm_init shrinks it to the actual top-of-RAM clamped into [MIN, MAX]. */
+u64 g_direct_map_size = DIRECT_MAP_MAX;
+
 static void m26_diag_task(void) {
   if (current_task && current_task->name) {
     console_write(" task=");
@@ -190,12 +195,40 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
   panic("no space for early physical memory allocation");
 }
 
+/* Size the direct map to actual hardware: walk usable regions, take the top
+ * end, align UP to a 2 MiB boundary (vmm_init maps in 2 MiB hugepages), then
+ * clamp into [DIRECT_MAP_MIN, DIRECT_MAP_MAX]. Must run before any code
+ * (including the rest of pmm_init) reads DIRECT_MAP_SIZE. */
+static void size_direct_map(const struct boot_info *boot_info) {
+  u64 top = 0;
+  for (usize i = 0; i < boot_info->memory_region_count; i++) {
+    const struct boot_memory_region *r = &boot_info->memory_regions[i];
+    if (r->type != BOOT_MEMORY_AVAILABLE) continue;
+    u64 end = r->base + r->length;
+    if (end > top) top = end;
+  }
+  /* 2 MiB hugepage alignment so the vmm_init loop covers the whole region. */
+  u64 huge = 0x200000ULL;
+  top = (top + huge - 1ULL) & ~(huge - 1ULL);
+  if (top < DIRECT_MAP_MIN) top = DIRECT_MAP_MIN;
+  if (top > DIRECT_MAP_MAX) top = DIRECT_MAP_MAX;
+  g_direct_map_size = top;
+  console_write("pmm: direct map sized to 0x");
+  console_write_hex64(g_direct_map_size);
+  console_write(" (");
+  console_write_dec(g_direct_map_size / (1024ULL * 1024ULL));
+  console_write(" MiB)\n");
+}
+
 void pmm_init(const struct boot_info *boot_info) {
   pmm.kernel_start = (u64)(usize)__kernel_start;
   pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
   pmm.max_address = 0;
   pmm.total_usable = 0;
   pmm.free_frames = 0;
+
+  /* Compute the runtime direct-map size before the loops below consult it. */
+  size_direct_map(boot_info);
 
   for (usize i = 0; i < boot_info->memory_region_count; i++) {
     const struct boot_memory_region *region = &boot_info->memory_regions[i];

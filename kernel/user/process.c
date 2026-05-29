@@ -12,7 +12,11 @@
 extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
-#define MAX_PROGRAMS 96
+/* Built-in program registry (C2 audit): grows on demand from the kheap
+ * starting at PROGRAMS_INITIAL slots and doubling each time. There is no
+ * hard ceiling — the only limit is kheap exhaustion, signalled by
+ * user_register_program emitting the existing warning. */
+#define PROGRAMS_INITIAL 16
 #define ELF_MAGIC0 0x7f
 #define ELF_MAGIC1 'E'
 #define ELF_MAGIC2 'L'
@@ -57,8 +61,9 @@ struct elf64_phdr {
   u64 p_align;
 } __attribute__((packed));
 
-static struct user_program programs[MAX_PROGRAMS];
-static usize program_count;
+static struct user_program *programs = 0;
+static usize program_count = 0;
+static usize programs_capacity = 0;
 static const u64 USER_STACK_MAX_SIZE = 8ULL * 1024ULL * 1024ULL;
 
 static struct user_address_space user_address_space_create(void) {
@@ -824,9 +829,24 @@ int user_execve_current(const char *path, const char **argv,
 }
 
 void user_register_program(const char *path, user_program_entry entry) {
-  if (program_count >= MAX_PROGRAMS) {
-    klog_warn("too many builtin user programs, skipping registration");
-    return;
+  /* Grow the registry on demand: start at PROGRAMS_INITIAL, double each
+   * time we fill up. Existing entries stay in place (memcpy to the new
+   * buffer), so any pointer returned by a prior user_find_program() is
+   * invalidated — callers never cache such pointers across registration,
+   * so this is safe. */
+  if (program_count >= programs_capacity) {
+    usize new_cap = programs_capacity ? programs_capacity * 2 : PROGRAMS_INITIAL;
+    struct user_program *grown = kzalloc(new_cap * sizeof(struct user_program));
+    if (!grown) {
+      klog_warn("too many builtin user programs, skipping registration");
+      return;
+    }
+    if (programs && program_count) {
+      memcpy(grown, programs, program_count * sizeof(struct user_program));
+    }
+    if (programs) kfree(programs);
+    programs = grown;
+    programs_capacity = new_cap;
   }
 
   programs[program_count].path = path;

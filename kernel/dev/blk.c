@@ -8,7 +8,12 @@
 
 #define MAX_BLK_DEVICES 32
 #define MAX_BLK_PARTITIONS 32
-#define CACHE_ENTRIES 256
+/* Block-cache sizing (B2 audit): pool capacity is now scaled to actual RAM
+ * at blk_cache_init() time so small machines don't waste ~140 KB on a 256-
+ * entry pool and big machines aren't starved. ~1 entry per 512 KiB of usable
+ * RAM, clamped to [MIN, MAX]. */
+#define CACHE_ENTRIES_MIN 64
+#define CACHE_ENTRIES_MAX 8192
 #define CACHE_BLOCK_SIZE 512
 
 static struct block_device *blk_devices[MAX_BLK_DEVICES];
@@ -27,7 +32,8 @@ static void blk_scan_partitions(struct block_device *dev);
 
 /* ── Block Cache Structures ── */
 
-static struct block_buffer block_cache[CACHE_ENTRIES];
+static struct block_buffer *block_cache = 0;
+static usize block_cache_n = 0;
 static u32 bcache_tick = 0;
 static spinlock_t bcache_lock = SPINLOCK_INIT;
 
@@ -242,10 +248,29 @@ struct block_device *blk_at(usize index) {
 
 /* ── Write-Back Cache Implementation ── */
 
-void blk_cache_init(void) { memset(block_cache, 0, sizeof(block_cache)); }
+void blk_cache_init(void) {
+  /* Scale pool to RAM: ~1 entry per 512 KiB of usable memory, clamped. */
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  usize want = (usize)(ram_mb * 2);  /* 1 entry per 512 KiB = 2 per MiB */
+  if (want < CACHE_ENTRIES_MIN) want = CACHE_ENTRIES_MIN;
+  if (want > CACHE_ENTRIES_MAX) want = CACHE_ENTRIES_MAX;
+  block_cache_n = want;
+  block_cache = kzalloc(block_cache_n * sizeof(struct block_buffer));
+  if (!block_cache) {
+    /* Fall back to floor — kzalloc still failed? then we have bigger problems
+     * but try a smaller pool before giving up entirely. */
+    block_cache_n = CACHE_ENTRIES_MIN;
+    block_cache = kzalloc(block_cache_n * sizeof(struct block_buffer));
+  }
+  console_write("blk-cache: ");
+  console_write_dec(block_cache_n);
+  console_write(" entries (");
+  console_write_dec((block_cache_n * sizeof(struct block_buffer)) / 1024);
+  console_write(" KiB)\n");
+}
 
 static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && block_cache[i].block_no == lba) {
       block_cache[i].last_used = ++bcache_tick;
       return &block_cache[i];
@@ -259,14 +284,14 @@ static struct block_buffer *bcache_evict(void) {
   u32 oldest_tick = 0xFFFFFFFF;
 
   /* 1. Try to find an invalid (empty) entry first */
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     if (!(block_cache[i].flags & BLK_CACHE_VALID)) {
       return &block_cache[i];
     }
   }
 
   /* 2. Otherwise, find the LRU (Least Recently Used) entry */
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     if (block_cache[i].last_used < oldest_tick) {
       oldest_tick = block_cache[i].last_used;
       oldest_idx = i;
@@ -381,7 +406,7 @@ void blk_flush_buffer(struct block_buffer *buf) {
 }
 
 void blk_sync_all(void) {
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       struct block_buffer *buf = &block_cache[i];
@@ -401,7 +426,7 @@ void blk_cache_flush(struct block_device *dev) {
   if (!dev->write_blocks)
     return;
 
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
     if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
       struct block_buffer *buf = &block_cache[i];
@@ -415,7 +440,7 @@ void blk_cache_flush(struct block_device *dev) {
 
 void blk_cache_invalidate(struct block_device *dev) {
   if (!dev) return;
-  for (int i = 0; i < CACHE_ENTRIES; i++) {
+  for (usize i = 0; i < block_cache_n; i++) {
     u64 flags = bcache_acquire();
     if (block_cache[i].bdev == dev) {
       if ((block_cache[i].flags & BLK_CACHE_VALID) && (block_cache[i].flags & BLK_CACHE_DIRTY)) {
