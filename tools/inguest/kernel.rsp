@@ -70,7 +70,6 @@
 /tmp/kbuild/kernel_user_busybox.o
 /tmp/kbuild/kernel_user_editor.o
 /tmp/kbuild/kernel_user_mc.o
-/tmp/kbuild/kernel_user_nmake.o
 /tmp/kbuild/kernel_user_process.o
 /tmp/kbuild/kernel_user_programs.o
 /tmp/kbuild/kernel_user_tui_common.o

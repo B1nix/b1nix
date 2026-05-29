@@ -322,6 +322,7 @@ echo "[TEST] M26 Native C Toolchain & Self-Host..."
 check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
 check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
 check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (gcc/binutils/make) is ported"
+check_output "$LOG" "M26-SMOKE: ok readdir" "libc opendir/readdir over SYS_GETDENTS works"
 # NOTE: in-guest full kernel self-build is not yet verified, so the marker is
 # "pending can-build-kernel" (not "ok"). Flip the kernel flag + this check to
 # "ok can-build-kernel" only once an in-guest kernel.elf actually builds.
