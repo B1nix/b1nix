@@ -124,6 +124,11 @@ enum {
 	SYS_GETCPU   = 105,
 };
 
+/* SYS_REBOOT commands (arg0). */
+#define B1NIX_REBOOT_RESTART  0
+#define B1NIX_REBOOT_POWEROFF 1
+#define B1NIX_REBOOT_HALT     2
+
 #include <b1nix/arch_x86.h>
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, struct interrupt_frame *frame);
 

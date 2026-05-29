@@ -92,7 +92,7 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1 || {
+make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123" iso >/dev/null 2>&1 || {
 	echo "  ${RED}BUILD FAILED${NC}"
 	exit 1
 }
@@ -466,7 +466,18 @@ elif grep -q "TCP-SMOKE: unsupported" "$LOG" 2>/dev/null; then
 else
 	fail "TCP path marker emitted" "missing TCP smoke marker"
 fi
+# ── M27 Terminal OS Polish: kernel command line parsing ──
+check_output "$LOG" "M27-CMDLINE: ok kv-parse" "kernel command line key=value parser works"
+check_output "$LOG" "M27-INIT: ok rc-script" "boot rc script runs via /bin/sh"
+check_output "$LOG" "M27-INIT: first-boot /persist initialised" "first-boot persistent-root setup runs"
+check_output "$LOG" "M27-USER: ok getpwnam-root" "getpwnam parses root from /etc/passwd"
+check_output "$LOG" "M27-USER: ok getpwnam-user" "getpwnam parses a non-root user from /etc/passwd"
+check_output "$LOG" "M27-USER: ok getpwuid" "getpwuid resolves uid to name"
+check_output "$LOG" "M27-USER: ok unknown-user" "getpwnam returns NULL for unknown user"
+check_output "$LOG" "M27-USER: ok setuid-drop" "setgid/setuid privilege drop works (login machinery)"
+check_output "$LOG" "M27-USER: done" "M27 user/passwd smoke completes"
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
+check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 

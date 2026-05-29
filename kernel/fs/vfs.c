@@ -30,9 +30,6 @@
 static char poll_chan_obj;
 void *vfs_poll_chan = &poll_chan_obj;
 
-static volatile int node_pool_lock = 0;
-static volatile int inode_pool_lock = 0;
-static volatile int vfs_handle_lock = 0;
 static volatile int vfs_mount_lock = 0;
 static u32 next_fs_id = 1;
 
@@ -3129,26 +3126,38 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     goto out;
   }
 
-  /* Fallback to in-memory Ramfs-style readdir */
+  /* Fallback to in-memory Ramfs-style readdir.
+   *
+   * h->offset is the ABSOLUTE index of the next directory entry to return:
+   * index 0 = ".", 1 = "..", and 2+ = the (n-2)th non-deleted child. We walk
+   * from the start each call (O(n) per batch) emitting entries whose absolute
+   * index is >= start, until the buffer fills. Crucially the cursor `idx` is
+   * a SEPARATE counter from the emitted `count`, so emitting never perturbs
+   * the resume position — an earlier version reused the running offset as the
+   * skip target, which made it emit every other entry and duplicate across
+   * batches once a directory exceeded one getdents batch. */
+  usize start = offset;
+  usize idx = 0;
   usize count = 0;
-  if (offset == 0 && count < max_entries) {
+
+  if (idx >= start && count < max_entries) {
     copy_path(buf[count].name, 64, ".");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
     buf[count].size = 0;
     count++;
-    offset++;
   }
-  if (offset == 1 && count < max_entries) {
+  idx++;
+  if (idx >= start && count < max_entries) {
     copy_path(buf[count].name, 64, "..");
     buf[count].type = (u32)VFS_DIRECTORY;
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
     buf[count].size = 0;
     count++;
-    offset++;
   }
+  idx++;
 
   /* Same race as vfs_list: sibling list is NOT protected by any inode lock.
    * A concurrent unlink can free a child while we walk — use cli/sti like
@@ -3156,29 +3165,25 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   u64 irq_flags;
   __asm__ volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
   struct vfs_node *child = dir->first_child;
-  usize skipped = 0;
   while (child && count < max_entries) {
     if (child->deleted) {
       child = child->next_sibling;
       continue;
     }
-    if (skipped < offset - 2) {
-      skipped++;
-      child = child->next_sibling;
-      continue;
+    if (idx >= start) {
+      copy_path(buf[count].name, 64, child->name);
+      buf[count].type = (u32)child->inode->type;
+      buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+      buf[count].is_exec = 0;
+      buf[count].size = child->inode->size;
+      count++;
     }
-    copy_path(buf[count].name, 64, child->name);
-    buf[count].type = (u32)child->inode->type;
-    buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
-    buf[count].is_exec = 0;
-    buf[count].size = child->inode->size;
-    count++;
-    offset++;
+    idx++;
     child = child->next_sibling;
   }
   __asm__ volatile("pushq %0; popfq" : : "r"(irq_flags) : "memory");
 
-  h->offset = offset;
+  h->offset = start + count;
   res = (isize)count;
 
 out:

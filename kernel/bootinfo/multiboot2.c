@@ -177,3 +177,47 @@ int bootinfo_has_flag(const char *flag)
 
 	return 0;
 }
+
+int bootinfo_get_kv(const char *key, char *out, usize out_size)
+{
+	const char *cmd = current_boot_info.command_line;
+	usize key_len = 0;
+
+	if (!key || !key[0]) {
+		return 0;
+	}
+	while (key[key_len]) {
+		key_len++;
+	}
+
+	for (usize i = 0; cmd[i];) {
+		while (cmd[i] == ' ') {
+			i++;
+		}
+		if (!cmd[i]) {
+			break;
+		}
+
+		usize start = i;
+		while (cmd[i] && cmd[i] != ' ') {
+			i++;
+		}
+
+		usize tok_len = i - start;
+		if (tok_len > key_len && cmd[start + key_len] == '=' &&
+		    memcmp(cmd + start, key, key_len) == 0) {
+			const char *val = cmd + start + key_len + 1;
+			usize val_len = tok_len - key_len - 1;
+
+			if (out && out_size > 0) {
+				usize n = val_len < out_size - 1 ? val_len
+							         : out_size - 1;
+				memcpy(out, val, n);
+				out[n] = '\0';
+			}
+			return 1;
+		}
+	}
+
+	return 0;
+}
