@@ -8,6 +8,57 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-29 (o) — Smoke regression ROOT-CAUSED: a 16 KB kernel-stack overflow, NOT a heap/VFS/DMA corruption (corrects UPDATE l/m/n)
+
+On Fedora 43 / clang 21 the HEAD smoke suite was **159/59** with a *deterministic*
+`[PANIC] general protection fault` in `find_child` (`kernel/fs/vfs.c`) while walking
+`/tmp` during the M11 coreutils block (right after `uniq`/`cp`). The crashing `child`
+was a non-canonical pointer; the offending `/tmp` sibling node's memory had been
+overwritten with exec `argv`/`envp` debris (`"PATH=/bin"`, pointer arrays) plus stale
+`KHEAP_FREED_MAGIC`/`KHEAP_MAGIC` block headers — which looked exactly like the
+"latent heap/VFS UAF" and "DMA-into-freed-buffer" corruption hypothesised in
+**UPDATE (l)/(m)/(n)**. **That diagnosis was wrong.**
+
+### Real cause — kernel-stack overflow
+b1nix runs the busybox coreutils **builtins in kernel mode on the task's kernel
+stack**, and that stack is a `kmalloc(KERNEL_STACK_SIZE)` block living in the shared
+kheap. So when a builtin overflows the 16 KB stack it does **not** fault — it
+silently writes past the stack base into the *adjacent lower kheap block*, which here
+was a live `vfs_node`. The clobbered `next_sibling` then pointed into recycled heap
+holding `argv`/`envp` strings → `find_child` dereferenced garbage → `#GP`. This is why
+every allocator/VFS theory came up empty.
+
+`uniq_main` alone has a **~12 KB frame** (`char buf[8192]` + `char *lines[512]`);
+combined with the ~6.6 KB syscall-dispatch frame and the VFS/ext4 read chain beneath
+it, the worst-case path exceeds 16 KB. `objdump -d` confirms the outlier frames
+(`uniq_main` 0x3060 = 12384 B; `ls_main`/`pwd_main`/`syscall_dispatch_impl` ~0x1a10 =
+~6.6 KB).
+
+### How it was localised (all ruled OUT by instrumentation, then confirmed)
+- Kernel @ commit `83f7cb3` = clean **218/0**; HEAD = 159/59 → a *real regression* (a
+  later commit added the final straw to the common path), **not** environmental/clang21.
+- Temporary detectors (since reverted) were **all silent**, which pointed *away* from
+  every allocator/VFS theory: freeing a node still linked in its parent chain
+  (`vfs_node_put`); any live node still referencing a node being freed (`vfs_free_node`
+  registry scan); `kmalloc` returning a block overlapping a live `vfs_node`; `pmm`
+  double-allocating a frame (claim with refcount≠0); and `pmm` freeing a kheap-owned
+  frame. Silence everywhere ⇒ a raw memory write from outside the alloc/VFS layers.
+- Disabling the klarge arena (`KLARGE_THRESHOLD` huge) did **not** help → klarge
+  (972c62b) is innocent.
+- Bumping `KERNEL_STACK_SIZE` → smoke goes **218/0**, confirming the overflow.
+
+### Fix
+`KERNEL_STACK_SIZE` 16 KB → **32 KB** (`kernel/sched/scheduler.c`). Both 32 KB and
+64 KB were verified at 218/0; 32 KB chosen to keep per-task stack cost low for the
+low-RAM (256 MB) self-host target (≤ MAX_TASKS·32 KB = 2 MB worst case). The fork
+stack-copy + rbp-rebase logic scales off the same `#define`, so no other change is
+needed. A comment at the `#define` records *why* it must stay ≥ 32 KB.
+
+**Lesson for next time** a "deterministic heap/VFS corruption with `argv`/pointer
+debris in a struct" appears: **suspect a kernel-stack overflow first** — kernel stacks
+are kheap blocks here, so an overflow masquerades as heap corruption. Check
+`objdump -d build/x86/kernel.elf` for large `sub $0xNNNN,%rsp` frames.
+
 ## UPDATE 2026-05-29 (n) — Why 128MB+swap still OOM'd: swap reclaim was gated off in the klarge path; raised the two swap caps
 
 The 128MB + 256MB-swap run from the previous status failed at `KBUILD 1` with
