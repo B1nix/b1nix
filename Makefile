@@ -42,19 +42,6 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 
-# Select the kernel compiler/linker per TOOLCHAIN. The gcc path uses the ported
-# binutils GNU ld and omits clang-only flags; the AP-trampoline flat-binary link
-# drops lld-only --image-base (GNU ld rejects it; it is unneeded for binary out).
-ifeq ($(TOOLCHAIN),gcc)
-CC := $(CROSS_TOOLCHAIN_ROOT)/bin/x86_64-b1nix-gcc
-LD := $(CROSS_TOOLCHAIN_ROOT)/bin/x86_64-b1nix-ld
-AP_IMAGE_BASE :=
-else
-CC := clang
-LD := $(shell command -v ld.lld 2>/dev/null || printf '%s' /opt/homebrew/opt/lld/bin/ld.lld)
-AP_IMAGE_BASE := --image-base 0
-endif
-
 COMMON_CFLAGS := \
 	-std=c11 \
 	-g \
@@ -189,7 +176,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -301,12 +288,9 @@ install-native-toolchain:
 		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
 		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
 		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
-		gccdir="$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0"; \
-		for f in libgcc.a libgcov.a crtbegin.o crtend.o crtbeginT.o crtbeginS.o crtendS.o; do \
-			if [ -f "$$gccdir/$$f" ]; then \
-				cp "$$gccdir/$$f" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
-			fi; \
-		done; \
+		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" ]; then \
+			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+		fi; \
 	else \
 		echo "Note: native toolchain not built (looked in build/toolchain_build/native_root and ~/b1nix-toolchain/native_root)."; \
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
@@ -317,32 +301,22 @@ install-native-toolchain:
 # Excludes generated artifacts (build/, *.o, *.a, *.elf, .git).
 install-kernel-source:
 	@echo "Staging b1nix source tree into $(BUILD_DIR)/rootfs/usr/src/b1nix..."
-	@# Clean restage (replaces rsync --delete) so stale files never linger.
-	@# tar is used instead of rsync because rsync is not guaranteed present in
-	@# every build environment (e.g. minimal WSL/Arch); tar is universal and its
-	@# --exclude handling matches what we need to drop generated artifacts.
-	@rm -rf $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@for d in kernel userspace tools tests docs; do \
 		if [ -d "$$d" ]; then \
-			tar -c \
-				--exclude='build' \
+			rsync -a --delete \
+				--exclude='build/' \
 				--exclude='*.o' \
 				--exclude='*.a' \
 				--exclude='*.elf' \
 				--exclude='*.bin' \
 				--exclude='*.iso' \
-				--exclude='.git' \
-				-f - "$$d" | tar -x -C $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
+				--exclude='.git/' \
+				"$$d" $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
 		fi; \
 	done
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
-	@# Stage the generated initramfs/AP-trampoline .inc files: kernel/fs/initramfs.c
-	@# #includes them via ../../build/x86/*.inc, and an in-guest kernel build cannot
-	@# regenerate them (no xxd/grub in-guest). Without these, initramfs.c won't compile.
-	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86
-	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso
