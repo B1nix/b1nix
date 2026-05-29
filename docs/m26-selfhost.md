@@ -8,6 +8,74 @@ ported GCC, inside b1nix.
 
 ---
 
+## UPDATE 2026-05-29 (l) — Large-allocation arena returns pages to the pmm; general-heap coalescing abandoned (exposes a pre-existing heap UAF)
+
+This session set out to do the planned "coalescing + return whole pages to the
+pmm" kheap redesign. The result is different and, I think, better-scoped:
+
+**1. General-heap coalescing was implemented, then abandoned — it is unsafe.**
+A boundary-tag (`prev_size` in the header) + bidirectional coalescing + tail
+page-return version was written and instrumented with an aggressive per-op
+`kheap_validate` (full heap walk on every `kmalloc`/`kfree`). It crashes
+deterministically during **M25 (TCC)** / `/bin/mc` with `kheap magic corrupt`.
+
+Bisecting with compile-time toggles proved the crash is **NOT in the new code**:
+with **both** coalescing and page-return disabled (so the allocator behaves
+byte-for-byte like the committed baseline) the aggressive validator **still**
+panics deep in M25. The committed baseline reaches `B1NIX-TEST: done` only
+because its `kheap_validate` is a **no-op** — it silently tolerates the
+corruption. So there is a **pre-existing latent heap corruption** that the
+baseline ignores and that tighter coalescing reuse would turn fatal — exactly
+the "latent UAF/overlap masked by oversized blocks" warned about in UPDATE (g).
+
+Evidence (validator + a re-read probe): a live allocated block's **header** is
+overwritten (`magic`/`size`/`next` clobbered, `prev_size` often intact) with
+data that looks like a consumer struct (kheap pointers + small integers) or
+stale PTE bytes. Re-reading the bytes 16× shows them **stable** (one-shot write,
+not continuous DMA). The corrupt kheap page's frame is consistently **adjacent
+to the current address space's freshly-allocated PML4 frames** — i.e. a recycled
+page-table frame, OR a freed DMA buffer reused by the heap. A driver audit found
+the most likely trigger: AHCI/NVMe completion waits with **bounded timeouts that
+return while the command is still queued** (`ahci.c:97-108`, `nvme.c:162-188`)
+and `virtio_blk.c:81-83` without read barriers — all wait via `scheduler_yield()`
+(interrupts on), so a DMA can complete into a buffer after it has been freed and
+reused. This is a real, separate bug (tracked in the roadmap) and is the
+prerequisite for ever enabling general-heap coalescing.
+
+**2. Page-return shipped as a separate large-allocation arena (`klarge_*`).**
+Instead of restructuring the fragile general heap, the docs' alternative —
+"a separate reclaimable arena for transient ELF/user-image buffers" — was
+implemented in `kernel/mm/kheap.c`:
+- `kmalloc`/`kzalloc` of **≥ 256KB** (`KLARGE_THRESHOLD`) are routed to the
+  arena: `npages = ceil((32 + size)/PAGE)` fresh pmm frames are mapped at a
+  page-aligned vaddr in the **upper part of the kheap's `PML4[384]` slot**
+  (`KLARGE_START = KHEAP_START + 64GB`, below `+512GB`), which shares the same
+  globally-mapped kernel page tables — no extra early-paging setup.
+- `kfree` dispatches by address range: arena pointers are **unmapped and their
+  frames returned to the pmm**, and the vaddr span is recorded for reuse
+  (first-fit, split on reuse, fixed 1024-entry pool; on overflow the span is
+  dropped — vaddr leaks but the physical frames were already freed).
+- The general bump heap (segregated buckets, no coalescing, no boundary tags)
+  is **unchanged from the committed baseline**, so its behaviour and the host
+  smoke result are unchanged, and the latent UAF stays as silent as before.
+
+**Verified (host, macOS qemu, uniprocessor):** `B1NIX-TEST: done`, 178 `ok`
+markers across all modules, **0 panics**, M25/TCC and M16/mc pass. With a
+temporary `[KLARGE]` trace, the ~516KB and ~419KB TCC buffers route to the arena
+and `pmm_free_frame_count()` **recovers on every large free** (no monotonic
+high-water growth), which is the whole point for the low-RAM build.
+
+**Not verified:** the end-to-end 2048MB in-guest build completing — that needs
+the Fedora/KVM rig + populated root image + ~2700s, not available on this macOS
+host. The mechanism (big transient cc1/as/ld buffers return their pages to the
+pmm on free) is the documented blocker from UPDATE (k), so the arena is expected
+to bound the high-water there, but this must be run on the rig to confirm.
+
+**Repro harness:** `smoke_run/qrun.sh [maxsec]` (macOS lacks coreutils
+`timeout`, so it can't use `tests/smoke.sh` directly). The abandoned coalescing +
+aggressive-validator branch is preserved in **git stash `m26-coalesce-wip`** —
+re-apply it to reproduce/triage the pre-existing UAF.
+
 ## UPDATE 2026-05-28 (k) — Page-cache reclaim now targets need; 2048 MB blocker is kheap high-water/page-return
 
 The old low-RAM reclaim path was misleading: `pmm_alloc_frames()` hit OOM,
