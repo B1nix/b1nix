@@ -23,6 +23,52 @@ struct kheap_block {
 #define KHEAP_REUSE_MIN_SIZE 0
 
 /* -----------------------------------------------------------------------
+ * Large-allocation arena (returns whole pages to the pmm on free)
+ *
+ * The general bump heap above never hands freed pages back to the pmm — its
+ * mapped high-water only grows. During the in-guest self-host build this lets
+ * the kheap climb to ~2 GB even though live use is ~57 MB, because cc1/as/ld
+ * allocate big transient ELF-staging buffers (tens of MB) that are freed but
+ * whose pages stay mapped. Those large, short-lived allocations are exactly
+ * the ones that blow the high-water, so we route every allocation >=
+ * KLARGE_THRESHOLD to a separate page-granular arena that maps frames on
+ * alloc and unmaps + frees them to the pmm on free. The general heap below is
+ * left byte-for-byte identical to the known-good baseline (no coalescing, no
+ * boundary tags), so its behaviour — and the host smoke result — is unchanged.
+ *
+ * The arena lives in the upper part of the kheap's PML4[384] slot (which spans
+ * 512 GB), well above where the general bump heap ever reaches, so it shares
+ * the same globally-mapped kernel page tables and needs no extra early paging
+ * setup: a PD/PT installed for an arena page lands in the shared PDPT and is
+ * visible in every address space, exactly like a general-heap growth.
+ * -----------------------------------------------------------------------*/
+#define KLARGE_START     (KHEAP_START + 0x1000000000ULL) /* +64 GB, same PML4[384] */
+#define KLARGE_END       (KHEAP_START + 0x8000000000ULL) /* +512 GB (PML4[384] top) */
+#define KLARGE_THRESHOLD (256u * 1024u)
+#define KLARGE_MAGIC     0xB1A11A6EULL
+#define KLARGE_HEADER_SIZE 32
+
+struct klarge_header {
+  u64 magic;
+  usize size;   /* requested payload bytes */
+  usize npages; /* total mapped pages (header + payload, rounded up) */
+  u64 pad;
+};
+
+/* Free vaddr spans available for reuse; physical frames are always returned to
+ * the pmm on free, so an entry here is purely an address-space range. A fixed
+ * pool avoids allocating during free; on overflow we simply drop the span
+ * (its vaddr leaks, but the physical frames were already freed — safe). */
+struct klarge_span {
+  u64 vaddr;
+  usize npages;
+};
+#define KLARGE_MAX_SPANS 1024
+static struct klarge_span klarge_free_spans[KLARGE_MAX_SPANS];
+static int klarge_free_count;
+static u64 klarge_bump = KLARGE_START;
+
+/* -----------------------------------------------------------------------
  * Segregated free lists
  *
  * Instead of a single free_list (O(N) first-fit scan over ALL free blocks),
@@ -193,9 +239,104 @@ void kheap_validate(const char *func) {
 }
 
 
+/* Allocate from the large arena: map npages fresh frames and return a 16-byte
+ * aligned payload pointer. Reuses a freed vaddr span when one is big enough
+ * (split on reuse), else bumps. Holds heap_lock (same lock as the general
+ * heap; large allocations are infrequent so contention is a non-issue). */
+static void *klarge_alloc(usize size, u64 caller) {
+  usize total = KLARGE_HEADER_SIZE + size;
+  usize npages = (total + PAGE_SIZE - 1) / PAGE_SIZE;
+
+  u64 flags;
+  spin_lock_irqsave(&heap_lock, &flags);
+
+  u64 base = 0;
+  for (int i = 0; i < klarge_free_count; i++) {
+    if (klarge_free_spans[i].npages >= npages) {
+      base = klarge_free_spans[i].vaddr;
+      usize extra = klarge_free_spans[i].npages - npages;
+      if (extra > 0) {
+        /* Keep the remainder span (its vaddr is unmapped, no physical cost). */
+        klarge_free_spans[i].vaddr = base + npages * PAGE_SIZE;
+        klarge_free_spans[i].npages = extra;
+      } else {
+        klarge_free_spans[i] = klarge_free_spans[--klarge_free_count];
+      }
+      break;
+    }
+  }
+  if (!base) {
+    base = klarge_bump;
+    if (base + npages * PAGE_SIZE > KLARGE_END) {
+      panic("klarge: arena address space exhausted");
+    }
+    klarge_bump = base + npages * PAGE_SIZE;
+  }
+
+  for (usize i = 0; i < npages; i++) {
+    u64 frame = pmm_alloc_frame();
+    if (!frame) {
+      panic("klarge: OOM mapping large allocation");
+    }
+    vmm_map_page(base + i * PAGE_SIZE, frame, VMM_PRESENT | VMM_WRITABLE);
+  }
+
+  struct klarge_header *h = (struct klarge_header *)(usize)base;
+  h->magic = KLARGE_MAGIC;
+  h->size = size;
+  h->npages = npages;
+  h->pad = 0;
+
+  void *ptr = (void *)(usize)(base + KLARGE_HEADER_SIZE);
+  track_alloc((u64)(usize)ptr, size, caller);
+  spin_unlock_irqrestore(&heap_lock, flags);
+  return ptr;
+}
+
+/* Free a large-arena allocation: unmap every page and return its frame to the
+ * pmm (this is the whole point — the pages go back, unlike the general heap),
+ * then record the vaddr span for later reuse. */
+static void klarge_free(void *ptr) {
+  u64 p = (u64)(usize)ptr;
+  struct klarge_header *h =
+      (struct klarge_header *)(usize)(p - KLARGE_HEADER_SIZE);
+
+  u64 flags;
+  spin_lock_irqsave(&heap_lock, &flags);
+
+  if (h->magic != KLARGE_MAGIC) {
+    spin_unlock_irqrestore(&heap_lock, flags);
+    return;
+  }
+  u64 base = (u64)(usize)h;
+  usize npages = h->npages;
+  h->magic = 0;
+  track_free(p);
+
+  for (usize i = 0; i < npages; i++) {
+    u64 vaddr = base + i * PAGE_SIZE;
+    u64 frame = vmm_virt_to_phys((void *)(usize)vaddr);
+    vmm_unmap_page(vaddr);
+    if (frame) {
+      pmm_free_frame(frame);
+    }
+  }
+
+  if (klarge_free_count < KLARGE_MAX_SPANS) {
+    klarge_free_spans[klarge_free_count].vaddr = base;
+    klarge_free_spans[klarge_free_count].npages = npages;
+    klarge_free_count++;
+  }
+  spin_unlock_irqrestore(&heap_lock, flags);
+}
+
 static void *kmalloc_internal(usize size, u64 caller) {
   if (size == 0) {
     return 0;
+  }
+
+  if (size >= KLARGE_THRESHOLD) {
+    return klarge_alloc(size, caller);
   }
 
   u64 flags;
@@ -315,6 +456,10 @@ void kfree(void *ptr) {
   u64 p = (u64)(usize)ptr;
   if (!is_canonical_addr(p))
     return;
+  if (p >= KLARGE_START && p < KLARGE_END) {
+    klarge_free(ptr);
+    return;
+  }
   if (heap.base != 0) {
     if (p < heap.base + KHEAP_HEADER_SIZE || p >= heap.end)
       return;
