@@ -117,6 +117,7 @@ KERNEL_SOURCES := \
 	kernel/ipc/shm.c \
 	kernel/sched/uidgid.c \
 	kernel/sched/runqueue.c \
+	kernel/sched/smp_test.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/busybox.c \

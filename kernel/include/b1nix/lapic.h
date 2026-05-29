@@ -111,7 +111,14 @@ struct percpu {
     /* 0x40: Kernel stack for this CPU (idle task stack) */
     u64 kernel_stack_phys;
     u64 kernel_stack_virt;
-    u8 __pad[3840];  /* pad to 4KB total */
+
+    /* SMP work-stealing: when an AP switches into a stolen worker, it stores a
+     * pointer to its own idle struct cpu_context here so the worker can switch
+     * back to the AP idle loop when done (kept as void* to avoid pulling
+     * sched.h into this header). */
+    void *sched_return_ctx;
+
+    u8 __pad[3832];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* GS segment base management */

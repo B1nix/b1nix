@@ -127,6 +127,9 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* Bring up Application Processors */
 	smp_boot_aps();
 
+	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
+	smp_selftest_run();
+
 #ifndef __aarch64__
 	/* Try to mount persistent root device.
 	 * If virtio-blk0 has an ext4 filesystem (created via `make root-image`),

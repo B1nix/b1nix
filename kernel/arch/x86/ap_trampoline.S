@@ -1,6 +1,7 @@
 /*
  * AP Trampoline — compiled as a flat binary linked at 0x8000.
- * The BSP copies this to physical address 0x8000 and sends SIPI.
+ * The BSP copies this to physical address 0x8000 and sends SIPI with
+ * vector 0x08 (0x8000 >> 12) so the AP begins executing here.
  */
 
 .global _start
@@ -37,7 +38,7 @@ ap_32:
     movl %cr0, %eax
     orl $0x80000000, %eax
     movl %eax, %cr0
-    ljmpl $0x08, $ap_64
+    ljmpl $0x18, $ap_64
 
 ap_64:
     .code64
@@ -71,12 +72,19 @@ pml4_phys:  .quad 0
 stack_ptr:  .quad 0
 percpu_ptr: .quad 0
 cpu_id:     .quad 0
-gdt_ptr:    .word 23  /* limit */
-            .quad gdt /* base */
+gdt_ptr:    .word gdt_end - gdt - 1  /* limit */
+            .quad gdt                /* base */
 ready_flag: .long 0
 ap_main_ptr: .quad 0
 
+/* GDT with a real 32-bit code/data pair for the protected-mode phase (ap_32)
+ * AND a 64-bit code segment for long mode (ap_64). The old GDT had only the
+ * 64-bit (L=1, D=0) code segment at 0x08; running 32-bit code through it makes
+ * the CPU decode ap_32 as 16-bit (D=0) and fault — which is why the AP
+ * trampoline never actually worked. */
 .align 8
-gdt:    .quad 0x0000000000000000
-        .quad 0x00AF9A000000FFFF
-        .quad 0x00AF92000000FFFF
+gdt:    .quad 0x0000000000000000  /* 0x00 null */
+        .quad 0x00CF9A000000FFFF  /* 0x08 32-bit code (G=1,D=1,L=0) */
+        .quad 0x00CF92000000FFFF  /* 0x10 32-bit data */
+        .quad 0x00AF9A000000FFFF  /* 0x18 64-bit code (G=1,D=0,L=1) */
+gdt_end:
