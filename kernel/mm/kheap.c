@@ -522,28 +522,33 @@ static void *kmalloc_internal(usize size, u64 caller) {
   size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
   if (size >= KHEAP_REUSE_MIN_SIZE) {
-    struct kheap_block **prev = &free_list;
-    block = free_list;
-    while (block) {
-      u64 bp = (u64)(usize)block;
-      /* Detect free-list corruption (UAF / buffer overflow into a freed
-       * neighbour). On corruption, sever the list here so we fall through to
-       * bump allocation instead of crashing in a #GP/#PF. */
-      if (!is_canonical_addr(bp) ||
-          (bp & 0xF) != 0 ||
-          bp < heap.base + KHEAP_HEADER_SIZE ||
-          bp + KHEAP_HEADER_SIZE > heap.end ||
-          block->magic != KHEAP_FREED_MAGIC) {
-        *prev = 0;
-        block = 0;
-        break;
-      }
-      if (block->size >= size) {
-        *prev = block->next;
-        block->next = 0;
-        block->magic = KHEAP_MAGIC;
-        spin_unlock_irqrestore(&heap_lock, flags);
-        return (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+    /* Search the smallest size-class bucket that can satisfy the request, then
+     * larger buckets (segregated free lists, matching the kfree() push). */
+    for (int bkt = size_to_bucket(size); bkt < NBUCKETS && !block; bkt++) {
+      struct kheap_block **prev = &free_lists[bkt];
+      struct kheap_block *cur = free_lists[bkt];
+      while (cur) {
+        u64 bp = (u64)(usize)cur;
+        /* Detect free-list corruption (UAF / buffer overflow into a freed
+         * neighbour). On corruption, sever this bucket here so we fall through
+         * to bump allocation instead of crashing in a #GP/#PF. */
+        if (!is_canonical_addr(bp) ||
+            (bp & 0xF) != 0 ||
+            bp < heap.base + KHEAP_HEADER_SIZE ||
+            bp + KHEAP_HEADER_SIZE > heap.end ||
+            cur->magic != KHEAP_FREED_MAGIC) {
+          *prev = 0;
+          break;
+        }
+        if (cur->size >= size) {
+          *prev = cur->next;
+          cur->next = 0;
+          cur->magic = KHEAP_MAGIC;
+          block = cur;
+          break;
+        }
+        prev = &cur->next;
+        cur = cur->next;
       }
     }
   }
