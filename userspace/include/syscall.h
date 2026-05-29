@@ -123,6 +123,11 @@ enum {
   SYS_GETCPU   = 105,
 };
 
+/* SYS_REBOOT commands (arg0). */
+#define B1NIX_REBOOT_RESTART  0
+#define B1NIX_REBOOT_POWEROFF 1
+#define B1NIX_REBOOT_HALT     2
+
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */
 static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
   long ret;

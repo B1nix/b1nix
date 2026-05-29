@@ -2489,6 +2489,10 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/whoami", busybox_main);
   user_register_program("/bin/id", busybox_main);
   user_register_program("/bin/clear", busybox_main);
+  user_register_program("/bin/reboot", busybox_main);
+  user_register_program("/bin/poweroff", busybox_main);
+  user_register_program("/bin/halt", busybox_main);
+  user_register_program("/bin/shutdown", busybox_main);
 
   /* Also register the busybox dispatcher itself */
   user_register_program("/bin/busybox", busybox_main);
