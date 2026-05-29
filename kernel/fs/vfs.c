@@ -11,6 +11,7 @@
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
+#include <b1nix/rwlock.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -32,6 +33,20 @@ void *vfs_poll_chan = &poll_chan_obj;
 
 static volatile int vfs_mount_lock = 0;
 static u32 next_fs_id = 1;
+
+/* M28-B: rwlock protecting the parent/sibling chain of every vfs_node — i.e.
+ * the in-RAM tree (first_child / next_sibling / parent). Readers are the
+ * lookup paths (find_child + ancestor walks in vfs_get_mount_for_node);
+ * writers are the sibling-list mutations (add_node, the create/mkdir/link
+ * sibling-prepend, and the unlink/rmdir/rename sibling-splice). Independent
+ * of the per-inode locks (which guard inode fields, not the chain).
+ *
+ * Today it runs under the Big Kernel Lock (M28 item 2), so this lock is
+ * decorative for the BSP and reader-collisions on APs never happen. Wiring
+ * it now is the small, contained diff that lets a future per-subsystem BKL
+ * teardown remove cross-CPU races from the VFS one site at a time, instead
+ * of one large flag-day patch. */
+static rwlock_t vfs_tree_lock = RWLOCK_INIT;
 
 static u32 dcache_hash(struct vfs_node *parent, const char *name);
 static struct vfs_node *dcache_lookup(struct vfs_node *parent,
@@ -71,11 +86,14 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
   while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
     scheduler_yield();
 
-  /* Walk up the parent chain with interrupts disabled — preemption mid-walk
-   * lets another task rmdir+free an ancestor and we'd dereference garbage on
-   * `curr = curr->parent`. The lock above only protects the mounts array. */
+  /* Walk up the parent chain under the VFS tree rwlock (read side) — preemption
+   * or a concurrent rmdir mid-walk lets another task free an ancestor and we'd
+   * dereference garbage on `curr = curr->parent`. The IRQ-save variant
+   * preserves the pre-rwlock cli/sti semantics so a same-CPU writer (entered
+   * from a future preemptive timer ISR) can't race us; the mount_lock above
+   * only protects the mounts array, not the parent chain. */
   u64 flags;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+  rw_read_lock_irqsave(&vfs_tree_lock, &flags);
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
   while (curr) {
@@ -94,7 +112,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
     }
   }
 out:
-  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+  rw_read_unlock_irqrestore(&vfs_tree_lock, flags);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return res;
 }
@@ -855,14 +873,13 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
   if (!parent || !parent->inode || parent->inode->type != VFS_DIRECTORY)
     return 0;
 
-  /* The children list walk must not be preempted: this kernel runs a timer
-   * tick that calls scheduler_yield() (see scheduler_on_timer_tick), and
-   * find_child is called from many sites that do not hold parent's inode
-   * read lock. A mid-walk preemption would let another task unlink+free a
-   * sibling, leaving us with a dangling next_sibling. Disabling interrupts
-   * for the duration of the walk is cheap (lists are short) and lets us read
-   * a consistent snapshot. vfs_node_get below is atomic and safe to run with
-   * interrupts disabled.
+  /* M28-B: read-side of vfs_tree_lock — the children list walk must observe a
+   * consistent snapshot of first_child / next_sibling. Without this lock, a
+   * concurrent unlink/rmdir (which splices a sibling out and frees it) could
+   * leave us dereferencing a freed node mid-walk. The IRQ-save variant keeps
+   * the pre-rwlock cli/sti semantics so a same-CPU writer entered from a
+   * (future) preemptive timer ISR can't race either; vfs_node_get is atomic
+   * and safe with IRQs disabled.
    *
    * Note: dcache is intentionally bypassed here because dcache_acquire yields
    * on contention, which reintroduces the same race window. dcache_insert
@@ -870,7 +887,7 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
    * safe lookup path. */
   struct vfs_node *result = 0;
   u64 flags;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
+  rw_read_lock_irqsave(&vfs_tree_lock, &flags);
   struct vfs_node *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
@@ -880,7 +897,7 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
     }
     child = child->next_sibling;
   }
-  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+  rw_read_unlock_irqrestore(&vfs_tree_lock, flags);
   return result;
 }
 
@@ -1322,10 +1339,16 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         /* Inserting into current->first_child must exclude concurrent readers
          * (vfs_list/find_child) — without the write lock a timer-tick preempt
          * mid-iteration sees a half-linked sibling chain and crashes on a
-         * dangling next_sibling. */
+         * dangling next_sibling. The per-inode write lock guards against other
+         * writers of this parent; the vfs_tree_lock write lock (M28-B) is
+         * what readers in find_child / vfs_get_mount_for_node observe so they
+         * see a consistent next_sibling snapshot. */
         vfs_inode_lock_write(current->inode);
+        u64 _tlflags;
+        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
         child->next_sibling = current->first_child;
         current->first_child = child;
+        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
         vfs_inode_unlock_write(current->inode);
 
         const struct cred *cred = get_current_cred();
@@ -1387,8 +1410,11 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
 
         child->parent = current;
         vfs_inode_lock_write(current->inode);
+        u64 _tlflags;
+        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
         child->next_sibling = current->first_child;
         current->first_child = child;
+        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
         vfs_inode_unlock_write(current->inode);
       }
       current = child;
@@ -2134,14 +2160,22 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
 
-  node->next_sibling = parent->first_child;
-  parent->first_child = node;
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    node->next_sibling = parent->first_child;
+    parent->first_child = node;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+  }
 
   if (parent->inode->create_cb) {
     int err = parent->inode->create_cb(parent, name, resolved_path,
                                        node->inode->mode);
     if (err < 0) {
+      u64 _tlflags;
+      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
       parent->first_child = node->next_sibling;
+      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
       res = err;
       goto out_node_put;
     }
@@ -2244,13 +2278,21 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
 
-  node->next_sibling = parent->first_child;
-  parent->first_child = node;
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    node->next_sibling = parent->first_child;
+    parent->first_child = node;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+  }
 
   if (parent->inode->mkdir_cb) {
     int err = parent->inode->mkdir_cb(parent, name, node->inode->mode);
     if (err < 0) {
+      u64 _tlflags;
+      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
       parent->first_child = node->next_sibling;
+      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
       res = err;
       goto out_node_put;
     }
@@ -2536,10 +2578,15 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
       child->inode->nlink--;
       if (child->inode)
         icache_invalidate(child->inode->fs_id, child->inode->ino);
-      if (prev)
-        prev->next_sibling = child->next_sibling;
-      else
-        parent->first_child = child->next_sibling;
+      {
+        u64 _tlflags;
+        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+        if (prev)
+          prev->next_sibling = child->next_sibling;
+        else
+          parent->first_child = child->next_sibling;
+        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      }
       vfs_node_put(child);
       dcache_invalidate(parent, name);
       res = 0;
@@ -2600,14 +2647,22 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
     }
   }
 
-  /* Remove from parent's children list */
-  struct vfs_node **prev = &parent->first_child;
-  while (*prev) {
-    if (*prev == node) {
-      *prev = node->next_sibling;
-      break;
+  /* Remove from parent's children list under the vfs_tree_lock write side
+   * (M28-B). The walk-and-splice happens entirely inside the critical section
+   * so a concurrent find_child reader cannot observe a freed-or-spliced
+   * next_sibling. */
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    struct vfs_node **prev = &parent->first_child;
+    while (*prev) {
+      if (*prev == node) {
+        *prev = node->next_sibling;
+        break;
+      }
+      prev = &(*prev)->next_sibling;
     }
-    prev = &(*prev)->next_sibling;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
   }
 
   node->deleted = 1;
@@ -2688,13 +2743,21 @@ int vfs_link(const char *target, const char *link_path) {
   new_node->inode = target_node->inode;
   new_node->inode->nlink++;
   new_node->parent = parent;
-  new_node->next_sibling = parent->first_child;
-  parent->first_child = new_node;
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    new_node->next_sibling = parent->first_child;
+    parent->first_child = new_node;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+  }
 
   if (parent->inode->link_cb) {
     res = parent->inode->link_cb(target_node, parent, name);
     if (res < 0) {
+      u64 _tlflags;
+      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
       parent->first_child = new_node->next_sibling;
+      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
       new_node->inode->nlink--;
       new_node->inode = 0;
       vfs_node_put(new_node);
@@ -2779,13 +2842,21 @@ int vfs_symlink(const char *target, const char *link_path) {
   node->inode->atime = node->inode->mtime = node->inode->ctime =
       vfs_get_unix_time();
   node->parent = parent;
-  node->next_sibling = parent->first_child;
-  parent->first_child = node;
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    node->next_sibling = parent->first_child;
+    parent->first_child = node;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+  }
 
   if (parent->inode->symlink_cb) {
     int err = parent->inode->symlink_cb(parent, name, target);
     if (err < 0) {
+      u64 _tlflags;
+      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
       parent->first_child = node->next_sibling;
+      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
       vfs_node_put(node);
       res = err;
       goto out_unlock;
@@ -2925,26 +2996,37 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     vfs_remove_node(new_res, 0);
   }
 
-  /* Перенос узла */
-  struct vfs_node *prev_c = 0, *c = old_parent->first_child;
-  while (c) {
-    if (c == node) {
-      if (prev_c)
-        prev_c->next_sibling = c->next_sibling;
-      else
-        old_parent->first_child = c->next_sibling;
-      break;
+  /* Move the node between parents under the vfs_tree_lock write side
+   * (M28-B). Unlink from old_parent then link to new_parent — both halves
+   * inside the lock so a concurrent find_child can't observe the node
+   * "missing" or doubly-linked. */
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    struct vfs_node *prev_c = 0, *c = old_parent->first_child;
+    while (c) {
+      if (c == node) {
+        if (prev_c)
+          prev_c->next_sibling = c->next_sibling;
+        else
+          old_parent->first_child = c->next_sibling;
+        break;
+      }
+      prev_c = c;
+      c = c->next_sibling;
     }
-    prev_c = c;
-    c = c->next_sibling;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
   }
 
   if (old_parent->inode->rename_cb) {
     int err =
         old_parent->inode->rename_cb(old_parent, old_n, new_parent, new_n);
     if (err < 0) {
+      u64 _tlflags;
+      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
       node->next_sibling = old_parent->first_child;
       old_parent->first_child = node;
+      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
       res = err;
       goto out_unlock;
     }
@@ -2952,8 +3034,13 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
 
   copy_path(node->name, 64, new_n);
   node->parent = new_parent;
-  node->next_sibling = new_parent->first_child;
-  new_parent->first_child = node;
+  {
+    u64 _tlflags;
+    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    node->next_sibling = new_parent->first_child;
+    new_parent->first_child = node;
+    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+  }
   if (node->inode)
     icache_invalidate(node->inode->fs_id, node->inode->ino);
   dcache_invalidate(old_parent, old_n);

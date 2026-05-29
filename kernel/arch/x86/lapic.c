@@ -70,6 +70,35 @@ void lapic_timer_start(u32 init_count) {
     lapic_write(LAPIC_TIMER_INITCNT, init_count);
 }
 
+static volatile int g_lapic_timer_periodic_active = 0;
+
+int lapic_timer_start_periodic_ms(u32 ms) {
+    /* PIT-calibrated rate (per ms at divide=16). Zero means lapic_init never
+     * managed to calibrate — without that we have no idea what one tick is, so
+     * refuse rather than program a bogus cadence. The caller (main.c) treats a
+     * 0 return as "leave PIT IRQ0 alive". */
+    u32 tpms = lapic_ticks_per_ms();
+    if (tpms == 0 || ms == 0) return 0;
+
+    /* Detect overflow before storing a wrapped value. The 32-bit LAPIC init
+     * count holds at most ~68 s at QEMU's ~62 kticks/ms — far beyond the 10 ms
+     * scheduler tick we use today, but the guard keeps a future caller from
+     * silently programming a 0-init-count (= timer disabled). */
+    u64 init64 = (u64)tpms * (u64)ms;
+    if (init64 == 0 || init64 > 0xFFFFFFFFULL) return 0;
+
+    /* Match the calibration divider so the rate computed by
+     * apic_timer_calibrate_against_pit lines up with what we program here. */
+    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_PERIODIC);
+    lapic_write(LAPIC_TIMER_INITCNT, (u32)init64);
+
+    g_lapic_timer_periodic_active = 1;
+    return 1;
+}
+
+int lapic_timer_periodic_active(void) { return g_lapic_timer_periodic_active; }
+
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
     /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
      * [31:24]. The old `(u64)apic_id << 32` is the x2APIC (MSR) layout; written
@@ -337,6 +366,14 @@ void ap_main(u32 cpu_id) {
      * current_task; scheduler_yield switches into a runnable task (releasing the
      * BKL when that task enters ring 3, so userspace runs in parallel with other
      * cores) and parks back to the idle task when nothing is left to run. */
+
+    /* M28-A: arm THIS AP's LAPIC timer at 100 Hz so the per-CPU scheduler tick
+     * fires here too. The BSP arms its own from main.c after lapic_init.
+     * Interrupts are already enabled here (Phase 1 ended with
+     * interrupts_enable()) and the depth-1 BKL acquired below recursively
+     * re-enters from the timer ISR — both already wired by M24b. */
+    lapic_timer_start_periodic_ms(10);
+
     struct task *idle = scheduler_setup_ap_idle((int)cpu_id, pcpu->kernel_stack_virt);
     pcpu->idle_task = idle;
     pcpu->cur_task = idle;       /* current_task = this AP's idle task */

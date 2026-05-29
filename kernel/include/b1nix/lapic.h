@@ -161,6 +161,14 @@ static inline struct percpu *get_percpu(void) {
 void lapic_init(void);
 void lapic_eoi(void);
 void lapic_timer_start(u32 init_count);
+/* Arm the LAPIC timer in periodic mode at LAPIC_TIMER_VECTOR with a period of
+ * `ms` milliseconds. Returns 1 on success, 0 if the timer is uncalibrated
+ * (lapic_ticks_per_ms() == 0) or the requested cadence overflows the 32-bit
+ * init count. Each CPU calls this once after its LAPIC is initialised. */
+int lapic_timer_start_periodic_ms(u32 ms);
+/* Non-zero once any CPU has armed the periodic LAPIC timer. main.c uses this
+ * to decide whether it can safely mask PIT IRQ0 (the previous tick source). */
+int lapic_timer_periodic_active(void);
 u32 lapic_read(u32 reg);
 void lapic_write(u32 reg, u32 val);
 u32 lapic_id(void);
