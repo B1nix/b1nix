@@ -1134,7 +1134,6 @@ static int sh_main(int argc, const char **argv) {
 extern int busybox_main(int argc, const char **argv);
 extern int mc_main(int argc, const char **argv);
 extern int editor_main(int argc, const char **argv);
-extern int nmake_main(int argc, const char **argv);
 
 struct udp_smoke_header {
   u16 src_port;
@@ -2411,7 +2410,6 @@ void user_register_builtin_programs(void) {
   /* M16 — TUI Applications */
   user_register_program("/bin/mc", mc_main); /* Mini Commander file manager */
   user_register_program("/bin/ne", editor_main);   /* Nano-like editor */
-  user_register_program("/bin/nmake", nmake_main); /* Minimal make utility */
   user_register_program("/bin/selfhost",
                         selfhost_main); /* M17 toolchain status */
 }

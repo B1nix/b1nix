@@ -694,7 +694,14 @@ int scheduler_wait(usize pid, int *status) {
 
 int scheduler_waitpid(usize pid, int *status, int options) {
   if (current_task == 0)
-    return -1;
+    return -ECHILD;
+
+  /* pid 0 ("any child in my process group") and pid -1 ("any child", which
+   * arrives as (usize)-1 from a userspace waitpid(-1, ...)) both mean "reap any
+   * child" in b1nix's flat process model. GNU Make's reap_children() relies on
+   * waitpid(-1, &status, WNOHANG); without the -1 case it matched no task and
+   * the syscall's -1 return was mapped to EPERM by the libc. */
+  int wait_any = (pid == 0 || pid == (usize)-1);
 
   while (1) {
     interrupts_disable();
@@ -702,7 +709,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     for (usize i = 0; i < MAX_TASKS; i++) {
       if (tasks[i].state != TASK_UNUSED &&
           tasks[i].parent_id == current_task->id) {
-        if (pid == 0 || tasks[i].id == pid) {
+        if (wait_any || tasks[i].id == pid) {
           has_children = 1;
           if (tasks[i].state == TASK_DEAD) {
             int code = tasks[i].exit_code;
@@ -758,7 +765,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 
     if (!has_children) {
       interrupts_enable();
-      return -1;
+      return -ECHILD;
     }
 
     if (options & B1NIX_WNOHANG) {

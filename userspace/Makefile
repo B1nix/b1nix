@@ -19,7 +19,9 @@ LIBC_OBJS := \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
 	$(BUILD)/libc/unistd.o \
-	$(BUILD)/libc/ctype.o
+	$(BUILD)/libc/ctype.o \
+	$(BUILD)/libc/dirent.o \
+	$(BUILD)/libc/pwd.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \

@@ -526,7 +526,7 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   copy_cstr(status->compiler, sizeof(status->compiler), "gcc-port-manifest");
   copy_cstr(status->assembler, sizeof(status->assembler), "b1nix-as-abi");
   copy_cstr(status->linker, sizeof(status->linker), "b1nix-ld-abi");
-  copy_cstr(status->make, sizeof(status->make), "nmake");
+  copy_cstr(status->make, sizeof(status->make), "gnu-make-port");
   return 0;
 }
 
@@ -1528,6 +1528,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                            (const char **)(usize)arg1,
                            (const char **)(usize)arg2);
   case SYS_WAIT:
+    /* In-kernel callers (the shell, the smoke launcher) invoke this as
+     * syscall_dispatch(SYS_WAIT, pid, &status): arg0 = pid, arg1 = status.
+     * The userspace libc does NOT use SYS_WAIT — its wait() maps to
+     * SYS_WAITPID(-1, status, 0). */
     return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
   case SYS_WAITPID:
     return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);

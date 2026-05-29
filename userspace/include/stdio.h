@@ -159,8 +159,21 @@ static inline int sscanf(const char *str, const char *format, ...) {
 #define _IOLBF 1
 #define _IONBF 2
 
+#define L_tmpnam 20
+
 static inline FILE *tmpfile(void) {
     return NULL;
+}
+
+/* Best-effort unique temp name under /tmp. b1nix has no mkstemp, so this backs
+ * the L_tmpnam fallback in programs like GNU Make's open_tmpfile(). Not a
+ * security boundary; uniqueness is a per-process counter. */
+static inline char *tmpnam(char *s) {
+    static unsigned int __tmpnam_seq = 0;
+    static char __tmpnam_buf[L_tmpnam];
+    char *out = s ? s : __tmpnam_buf;
+    snprintf(out, L_tmpnam, "/tmp/tmp%u", ++__tmpnam_seq);
+    return out;
 }
 
 static inline void rewind(FILE *stream) {

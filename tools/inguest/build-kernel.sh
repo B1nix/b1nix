@@ -146,13 +146,11 @@ echo KBUILD 71 kernel_user_editor
 /persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/editor.c -o /tmp/kbuild/kernel_user_editor.o
 echo KBUILD 72 kernel_user_mc
 /persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/mc.c -o /tmp/kbuild/kernel_user_mc.o
-echo KBUILD 73 kernel_user_nmake
-/persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/nmake.c -o /tmp/kbuild/kernel_user_nmake.o
-echo KBUILD 74 kernel_user_process
+echo KBUILD 73 kernel_user_process
 /persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/process.c -o /tmp/kbuild/kernel_user_process.o
-echo KBUILD 75 kernel_user_programs
+echo KBUILD 74 kernel_user_programs
 /persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/programs.c -o /tmp/kbuild/kernel_user_programs.o
-echo KBUILD 76 kernel_user_tui_common
+echo KBUILD 75 kernel_user_tui_common
 /persist/bin/gcc -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic -mno-red-zone -I/persist/usr/src/b1nix/kernel/include -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow -c /persist/usr/src/b1nix/kernel/user/tui_common.c -o /tmp/kbuild/kernel_user_tui_common.o
 echo KBUILD-LINK
 /persist/bin/ld -m elf_x86_64 -z max-page-size=0x1000 -T /persist/usr/src/b1nix/kernel/arch/x86/linker.ld -o /tmp/kernel.elf @/persist/usr/src/b1nix/tools/inguest/kernel.rsp

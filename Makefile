@@ -123,7 +123,6 @@ KERNEL_SOURCES := \
 	kernel/user/tui_common.c \
 	kernel/user/mc.c \
 	kernel/user/editor.c \
-	kernel/user/nmake.c \
 	$(ARCH_SOURCES)
 
 ifeq ($(ARCH),x86)
