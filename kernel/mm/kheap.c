@@ -5,22 +5,42 @@
 #include <b1nix/spinlock.h>
 #include <string.h>
 
+struct kheap_block {
+  usize size;       /* payload bytes of this block (16-aligned) */
+  usize prev_size;  /* payload bytes of the physically-preceding block, 0 if none */
+  u32 magic;
+  u32 padding;      /* keeps `next` 8-byte aligned; header stride is KHEAP_HEADER_SIZE */
+  struct kheap_block *next; /* free-list link, valid only while freed */
+};
+
 struct kheap_state {
   u64 base;
   u64 current;
   u64 end;
-};
-
-struct kheap_block {
-  usize size;
-  struct kheap_block *next;
-  u32 magic;
+  struct kheap_block *last_block; /* physically-topmost block, 0 if heap empty */
 };
 
 #define KHEAP_MAGIC 0xB1A110C
 #define KHEAP_FREED_MAGIC 0xDEAD110C
 #define KHEAP_HEADER_SIZE 32
 #define KHEAP_REUSE_MIN_SIZE 0
+
+/* A freed tail block at least this large is dropped from the general heap and
+ * its whole pages returned to the pmm (high-water shrinks). It is set above
+ * KLARGE_THRESHOLD on purpose: single general-heap allocations are always
+ * smaller than that (bigger ones go to the klarge arena, which already returns
+ * pages), so this only fires when coalescing has merged many small frees into a
+ * large contiguous tail. Keeping it large avoids thrashing unmap/remap on the
+ * normal small-allocation churn. */
+#define KHEAP_SHRINK_MIN (512u * 1024u)
+
+/* Free-block coalescing (boundary-tag bidirectional merge) and tail page-return
+ * for the general bump heap. Both maintain the per-block prev_size boundary tag
+ * and heap.last_block; those invariants are checked by kheap_validate when
+ * KHEAP_VALIDATE is enabled. Flip either to 0 to bisect against the no-coalesce
+ * baseline. */
+#define KHEAP_ENABLE_COALESCE 1
+#define KHEAP_ENABLE_PAGE_RETURN 1
 
 /* -----------------------------------------------------------------------
  * Large-allocation arena (returns whole pages to the pmm on free)
@@ -32,9 +52,10 @@ struct kheap_block {
  * whose pages stay mapped. Those large, short-lived allocations are exactly
  * the ones that blow the high-water, so we route every allocation >=
  * KLARGE_THRESHOLD to a separate page-granular arena that maps frames on
- * alloc and unmaps + frees them to the pmm on free. The general heap below is
- * left byte-for-byte identical to the known-good baseline (no coalescing, no
- * boundary tags), so its behaviour — and the host smoke result — is unchanged.
+ * alloc and unmaps + frees them to the pmm on free. The general heap below
+ * additionally coalesces adjacent free blocks (boundary-tag prev_size) and
+ * returns large freed tails to the pmm; the arena still owns every single
+ * allocation >= KLARGE_THRESHOLD.
  *
  * The arena lives in the upper part of the kheap's PML4[384] slot (which spans
  * 512 GB), well above where the general bump heap ever reaches, so it shares
@@ -78,10 +99,10 @@ static u64 klarge_bump = KLARGE_START;
  * buckets.  Each bucket's list is short → search stays O(1) amortised even
  * under pressure with thousands of free blocks.
  *
- * The internal block structure, split-on-reuse logic, magic canaries, and
- * bump allocator are unchanged from the known-good first-fit baseline.
- * No coalescing, no page return — both are intentionally excluded to avoid
- * exposing the latent VFS UAF bug documented in docs/m26-selfhost.md.
+ * On top of the segregated lists, kfree() coalesces a freed block with its
+ * physical neighbours when they are also free (boundary-tag prev_size locates
+ * the predecessor in O(1)), and returns a large freed tail's pages to the pmm.
+ * See KHEAP_ENABLE_COALESCE / KHEAP_ENABLE_PAGE_RETURN above.
  *
  * Bucket i holds blocks with payload in (bucket_min[i-1], bucket_min[i]].
  * Bucket NBUCKETS-1 is the catch-all for the largest blocks.
@@ -116,6 +137,34 @@ static int size_to_bucket(usize size) {
     if (size <= bucket_max[i]) return i;
   }
   return NBUCKETS - 1;
+}
+
+/* Remove a freed block from its size-class bucket. Coalescing merges a block
+ * with a physical neighbour that is currently sitting on a free list, so that
+ * neighbour must first be unlinked from wherever it lives. Panics if the block
+ * is not found — that would mean the free lists and the physical heap layout
+ * have diverged, i.e. corruption we want to catch immediately. */
+static void bucket_unlink(struct kheap_block *blk) {
+  int bkt = size_to_bucket(blk->size);
+  struct kheap_block **pp = &free_lists[bkt];
+  while (*pp) {
+    if (*pp == blk) {
+      *pp = blk->next;
+      blk->next = 0;
+      return;
+    }
+    pp = &(*pp)->next;
+  }
+  console_write("bucket_unlink: block 0x");
+  console_write_hex64((u64)(usize)blk);
+  console_write(" size ");
+  console_write_dec(blk->size);
+  console_write(" magic 0x");
+  console_write_hex64(blk->magic);
+  console_write(" not in bucket ");
+  console_write_dec(bkt);
+  console_write("\n");
+  panic("bucket_unlink: block not found in bucket");
 }
 
 struct tracked_alloc {
@@ -218,6 +267,7 @@ void kheap_init(void) {
   heap.base = KHEAP_START;
   heap.current = KHEAP_START;
   heap.end = KHEAP_START;
+  heap.last_block = 0;
   for (int i = 0; i < NBUCKETS; i++) free_lists[i] = 0;
   heap_grow(PAGE_SIZE);
 
@@ -253,6 +303,7 @@ static void kheap_dump(void) {
   console_write("heap.base: 0x"); console_write_hex64(heap.base);
   console_write(" heap.current: 0x"); console_write_hex64(heap.current);
   console_write(" heap.end: 0x"); console_write_hex64(heap.end);
+  console_write(" heap.last_block: 0x"); console_write_hex64((u64)(usize)heap.last_block);
   console_write("\n");
   u64 addr = heap.base;
   int idx = 0;
@@ -261,6 +312,7 @@ static void kheap_dump(void) {
     console_write("  ["); console_write_dec(idx++); console_write("] addr=0x");
     console_write_hex64(addr);
     console_write(" size="); console_write_dec(block->size);
+    console_write(" prev_size="); console_write_dec(block->prev_size);
     console_write(" magic=0x"); console_write_hex64(block->magic);
     console_write("\n");
     if (block->size == 0 || block->size > 100u * 1024u * 1024u) {
@@ -277,6 +329,7 @@ void kheap_validate(const char *func) {
 #if KHEAP_VALIDATE
   if (heap.base == 0) return;
   u64 addr = heap.base;
+  struct kheap_block *prev_block = 0;
   while (addr < heap.current) {
     struct kheap_block *block = (struct kheap_block *)(usize)addr;
     if (block->magic != KHEAP_MAGIC && block->magic != KHEAP_FREED_MAGIC) {
@@ -305,6 +358,21 @@ void kheap_validate(const char *func) {
       kheap_dump();
       panic("kheap size corrupt");
     }
+    usize expect_prev = prev_block ? prev_block->size : 0;
+    if (block->prev_size != expect_prev) {
+      console_write("kheap_validate (from ");
+      console_write(func);
+      console_write("): block at 0x");
+      console_write_hex64(addr);
+      console_write(" prev_size ");
+      console_write_dec(block->prev_size);
+      console_write(" != expected ");
+      console_write_dec(expect_prev);
+      console_write("\n");
+      kheap_dump();
+      panic("kheap prev_size corrupt");
+    }
+    prev_block = block;
     addr += KHEAP_HEADER_SIZE + block->size;
   }
   if (addr != heap.current) {
@@ -317,6 +385,17 @@ void kheap_validate(const char *func) {
     console_write("\n");
     kheap_dump();
     panic("kheap walk mismatch");
+  }
+  if (heap.last_block != prev_block) {
+    console_write("kheap_validate (from ");
+    console_write(func);
+    console_write("): last_block 0x");
+    console_write_hex64((u64)(usize)heap.last_block);
+    console_write(" != topmost 0x");
+    console_write_hex64((u64)(usize)prev_block);
+    console_write("\n");
+    kheap_dump();
+    panic("kheap last_block mismatch");
   }
 #else
   (void)func;
@@ -469,6 +548,12 @@ static void *kmalloc_internal(usize size, u64 caller) {
           break;
         }
         if (b->size >= size) {
+          /* Unlink b before splitting: the remainder may land in the same
+           * bucket bi, and inserting it while b is still linked would corrupt
+           * the list (a later `*prev = b->next` could drop the remainder). */
+          *prev = b->next;
+          b->next = 0;
+
           /* Split off the remainder as its own free block when it is large
            * enough to hold a header plus a minimal allocation; this stops
            * internal fragmentation (a small alloc otherwise wastes the
@@ -479,16 +564,24 @@ static void *kmalloc_internal(usize size, u64 caller) {
             struct kheap_block *rem =
                 (struct kheap_block *)((u8 *)b + KHEAP_HEADER_SIZE + size);
             rem->size = b->size - size - KHEAP_HEADER_SIZE;
+            rem->prev_size = size;
             rem->magic = KHEAP_FREED_MAGIC;
+            /* The block physically after rem (b's old successor) now has rem as
+             * its predecessor; keep its boundary tag in sync, or record rem as
+             * the new topmost block when b was the tail. */
+            struct kheap_block *after_rem =
+                (struct kheap_block *)((u8 *)rem + KHEAP_HEADER_SIZE + rem->size);
+            if ((u64)(usize)after_rem < heap.current) {
+              after_rem->prev_size = rem->size;
+            } else {
+              heap.last_block = rem;
+            }
             /* Link remainder into the correct bucket for its size. */
             int rem_bkt = size_to_bucket(rem->size);
             rem->next = free_lists[rem_bkt];
             free_lists[rem_bkt] = rem;
             b->size = size;
           }
-          /* Unlink b from bucket bi. */
-          *prev = b->next;
-          b->next = 0;
           b->magic = KHEAP_MAGIC;
           block = b;
           break;
@@ -502,6 +595,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
   if (block) {
     void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
     track_alloc((u64)(usize)ptr, block->size, caller);
+    kheap_validate("kmalloc_end_reuse");
     spin_unlock_irqrestore(&heap_lock, flags);
     return ptr;
   }
@@ -519,11 +613,14 @@ static void *kmalloc_internal(usize size, u64 caller) {
   heap.current = next;
   block = (struct kheap_block *)(usize)aligned_current;
   block->size = size;
+  block->prev_size = heap.last_block ? heap.last_block->size : 0;
   block->next = 0;
   block->magic = KHEAP_MAGIC;
+  heap.last_block = block;
 
   void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
   track_alloc((u64)(usize)ptr, size, caller);
+  kheap_validate("kmalloc_end_bump");
   spin_unlock_irqrestore(&heap_lock, flags);
   return ptr;
 }
@@ -580,9 +677,74 @@ void kfree(void *ptr) {
 #endif
   track_free((u64)(usize)ptr);
   block->magic = KHEAP_FREED_MAGIC;
-  /* Insert into the appropriate size-class bucket instead of a global list.
-   * This prevents large freed blocks from being buried behind many small
-   * blocks, eliminating the O(N) scan that caused the 2048 MB timeout. */
+
+  /* Coalesce with the physically-preceding block when it is also free. The
+   * boundary tag prev_size locates the predecessor in O(1); merging undoes the
+   * fragmentation that split-on-reuse otherwise leaves behind. */
+  if (KHEAP_ENABLE_COALESCE && block->prev_size > 0) {
+    struct kheap_block *prev_phys =
+        (struct kheap_block *)((u8 *)block - KHEAP_HEADER_SIZE - block->prev_size);
+    if ((u64)(usize)prev_phys >= heap.base &&
+        prev_phys->magic == KHEAP_FREED_MAGIC) {
+      bucket_unlink(prev_phys);
+      prev_phys->size += KHEAP_HEADER_SIZE + block->size;
+      struct kheap_block *after =
+          (struct kheap_block *)((u8 *)prev_phys + KHEAP_HEADER_SIZE + prev_phys->size);
+      if ((u64)(usize)after < heap.current) {
+        after->prev_size = prev_phys->size;
+      } else {
+        heap.last_block = prev_phys;
+      }
+      block = prev_phys;
+    }
+  }
+
+  /* Coalesce with the physically-succeeding block when it is also free. */
+  if (KHEAP_ENABLE_COALESCE) {
+    struct kheap_block *next_phys =
+        (struct kheap_block *)((u8 *)block + KHEAP_HEADER_SIZE + block->size);
+    if ((u64)(usize)next_phys < heap.current &&
+        next_phys->magic == KHEAP_FREED_MAGIC) {
+      bucket_unlink(next_phys);
+      block->size += KHEAP_HEADER_SIZE + next_phys->size;
+      struct kheap_block *after =
+          (struct kheap_block *)((u8 *)next_phys + KHEAP_HEADER_SIZE + next_phys->size);
+      if ((u64)(usize)after < heap.current) {
+        after->prev_size = block->size;
+      } else {
+        heap.last_block = block;
+      }
+    }
+  }
+
+  /* Tail page-return: when the merged block is the topmost block and big
+   * enough, hand its whole pages back to the pmm so the heap high-water
+   * shrinks. Only full pages strictly above the (shrunken) payload are
+   * unmapped; the header page always stays mapped. KHEAP_SHRINK_MIN sits above
+   * KLARGE_THRESHOLD, so this only triggers when coalescing has merged many
+   * small frees into a large contiguous tail. */
+  if (KHEAP_ENABLE_PAGE_RETURN && heap.last_block == block &&
+      block->size >= KHEAP_SHRINK_MIN) {
+    u64 free_start =
+        align_up_u64((u64)(usize)block + KHEAP_HEADER_SIZE + 16, PAGE_SIZE);
+    if (free_start < heap.end) {
+      for (u64 vaddr = free_start; vaddr < heap.end; vaddr += PAGE_SIZE) {
+        u64 frame = vmm_virt_to_phys((void *)(usize)vaddr);
+        vmm_unmap_page(vaddr);
+        if (frame) {
+          pmm_free_frame(frame);
+        }
+      }
+      heap.end = free_start;
+      heap.current = free_start;
+      block->size = free_start - (u64)(usize)block - KHEAP_HEADER_SIZE;
+    }
+  }
+
+  /* Insert the (possibly merged/shrunken) block into its size-class bucket
+   * instead of a global list. This keeps large freed blocks out from behind
+   * many small ones, eliminating the O(N) scan that caused the 2048 MB
+   * timeout. */
   int bkt = size_to_bucket(block->size);
   block->next = free_lists[bkt];
   free_lists[bkt] = block;
