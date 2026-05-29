@@ -1549,6 +1549,28 @@ static int init_main(int argc, const char **argv) {
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
   if (bootinfo_has_flag("b1nix.test=1")) {
+  /* M27: kernel command line key=value parser self-test. The smoke harness
+   * passes "b1nix.test=1 b1nix.kvtest=abc123" so we can verify a present key,
+   * an absent key, prefix non-matching, and value truncation. */
+  {
+    char v[16];
+    char small[4];
+    int ok = 1;
+    if (!bootinfo_get_kv("b1nix.test", v, sizeof(v)) || strcmp(v, "1") != 0)
+      ok = 0;
+    if (!bootinfo_get_kv("b1nix.kvtest", v, sizeof(v)) ||
+        strcmp(v, "abc123") != 0)
+      ok = 0;
+    if (bootinfo_get_kv("b1nix.absent", v, sizeof(v)))
+      ok = 0;
+    if (bootinfo_get_kv("b1nix.tes", v, sizeof(v)))
+      ok = 0;
+    if (!bootinfo_get_kv("b1nix.kvtest", small, sizeof(small)) ||
+        strcmp(small, "abc") != 0)
+      ok = 0;
+    uwrite(ok ? "M27-CMDLINE: ok kv-parse\n" : "M27-CMDLINE: fail kv-parse\n");
+  }
+
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
@@ -1834,14 +1856,38 @@ static int init_main(int argc, const char **argv) {
   }
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
-  if (bootinfo_has_flag("b1nix.ui=1") || bootinfo_has_flag("ui=1")) {
-    uwrite("UI: launching /bin/mc\n");
-    u64 ui_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/mc", 0, 0, 0, 0, 0);
-    if ((isize)ui_pid < 0) {
-      uwrite("UI: fallback to /bin/sh\n");
-      syscall_dispatch(SYS_SPAWN, (u64)(usize)"/bin/sh", 0, 0, 0, 0, 0);
-    }
+
+  /* M27: pick the init/shell program from the kernel command line.
+   * Precedence: explicit init=<path>  >  single-user emergency shell  >
+   * graphical UI (unless nographics)  >  plain text shell. */
+  char init_override[64];
+  const char *init_prog;
+  int single = bootinfo_has_flag("b1nix.single") || bootinfo_has_flag("single");
+  int nographics = bootinfo_has_flag("b1nix.nographics") ||
+                   bootinfo_has_flag("nographics");
+  int want_ui = bootinfo_has_flag("b1nix.ui=1") || bootinfo_has_flag("ui=1");
+
+  if (bootinfo_get_kv("init", init_override, sizeof(init_override)) &&
+      init_override[0]) {
+    init_prog = init_override;
+    uwrite("init: launching ");
+    uwrite(init_prog);
+    uwrite(" (init= override)\n");
+  } else if (single) {
+    uwrite("init: single-user mode, launching emergency shell /bin/sh\n");
+    init_prog = "/bin/sh";
+  } else if (want_ui && !nographics) {
+    uwrite("init: launching graphical UI /bin/mc\n");
+    init_prog = "/bin/mc";
   } else {
+    init_prog = "/bin/sh";
+  }
+
+  u64 init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)init_prog, 0, 0, 0, 0, 0);
+  if ((isize)init_pid < 0 && strcmp(init_prog, "/bin/sh") != 0) {
+    uwrite("init: failed to spawn ");
+    uwrite(init_prog);
+    uwrite(", falling back to emergency shell /bin/sh\n");
     syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/sh", 0, 0, 0, 0, 0);
   }
 

@@ -24,6 +24,10 @@ MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/de
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
 KERNEL_CMDLINE ?=
+# GRUB menu timeout in seconds. 0 = boot the default entry immediately (used by
+# the smoke harness so QEMU never stalls). Set e.g. GRUB_TIMEOUT=5 for an
+# interactive build where you want to see/select the boot menu.
+GRUB_TIMEOUT ?= 0
 
 # Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
 # source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
@@ -286,7 +290,7 @@ iso: $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
-	@printf 'set timeout=0\nset default=0\n\nmenuentry "b1nix" {\n    multiboot2 /boot/kernel.elf $(KERNEL_CMDLINE)\n    boot\n}\n' > $(BUILD_DIR)/iso/boot/grub/grub.cfg
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 
 # ── M25 Userspace ──

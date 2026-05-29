@@ -41,4 +41,13 @@ const struct boot_info *bootinfo_get(void);
 const char *bootinfo_cmdline(void);
 int bootinfo_has_flag(const char *flag);
 
+/*
+ * Look up a "key=value" token on the kernel command line. On a match the
+ * value is copied into out (always NUL-terminated, truncated to out_size-1)
+ * and 1 is returned; out is left untouched and 0 is returned otherwise. The
+ * key must match a whole token up to '=' (so "foo" never matches "foobar=x").
+ * out may be NULL / out_size 0 to test presence only.
+ */
+int bootinfo_get_kv(const char *key, char *out, usize out_size);
+
 #endif
