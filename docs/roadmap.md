@@ -437,3 +437,101 @@ diagnostics.
 - [x] `done` Keep the system usable without graphics as a first-class target. All kernel/userspace I/O is text/serial; the only GUI (`/bin/mc`) is opt-in via `b1nix.ui=1`, and `b1nix.nographics` forces text mode (honoured even alongside `ui=1`). See [`docs/m27-polish.md`](m27-polish.md).
 - [x] `done` Add first-boot setup for persistent root images. `/etc/rc` initialises `/persist` (creates `home`/`etc`/`tmp`, idempotent via `.b1nix-setup`) on first boot when the persistent root is mounted; inert otherwise. See [`docs/m27-polish.md`](m27-polish.md).
 - [x] `done` Add a clear POSIX compatibility matrix for application ports. Summary matrix in [`docs/m27-polish.md`](m27-polish.md), linking the authoritative [`posix-requirements.md`](posix-requirements.md) / [`posix-branches.md`](posix-branches.md).
+
+## M28: Preemptive SMP Scheduling & Fine-Grained Locking
+
+- [ ] `planned` Preemptive scheduling off the Local APIC timer ticks on all cores.
+- [ ] `planned` Audit and remove the Big Kernel Lock (BKL) for userspace execution on APs.
+- [ ] `planned` Implement fine-grained spinlocks and read-write locks for the VFS, process table, and memory manager.
+- [ ] `planned` Benchmark and optimize context-switch latency under SMP workloads.
+
+## M29: POSIX Threads & Futex Synchronization
+
+- [ ] `planned` Implement `clone()` syscall with `CLONE_VM`, `CLONE_FS`, and `CLONE_FILES` flags.
+- [ ] `planned` Implement `SYS_futex` for fast userspace locking and waiting.
+- [ ] `planned` Configure Thread Local Storage (TLS) via `%fs` / `%gs` register segment bases in userspace.
+- [ ] `planned` Build a compliant `libpthread` inside libc with mutexes, condvars, and join/detach APIs.
+- [ ] `planned` Verify thread safety in core memory and file operations from userspace.
+
+## M30: ELF Dynamic Linking & Shared Libraries
+
+- [ ] `planned` Extend the kernel ELF loader to support `PT_INTERP` segment loading.
+- [ ] `planned` Implement the dynamic linker (`/lib/ld-b1nix.so`) for symbol resolution and relocation at runtime.
+- [ ] `planned` Build a shared C library (`libc.so`) and compile system utilities dynamically.
+- [ ] `planned` Implement real `dlopen`, `dlsym`, `dlerror`, and `dlclose` dynamic loading routines.
+
+## M31: User Security, Passwords & Permissions
+
+- [ ] `planned` Add `/etc/shadow` support for storing hashed user passwords.
+- [ ] `planned` Port/implement password hashing algorithms (bcrypt or SHA-512) for login verification.
+- [ ] `planned` Enforce strict permissions check in VFS for `/etc`, `/root`, and `/home`.
+- [ ] `planned` Support sudo-like privilege escalation via `setuid` binaries.
+
+## M32: Advanced Network Stack & TCP Completeness
+
+- [ ] `planned` Implement TCP sliding window flow control.
+- [ ] `planned` Implement TCP congestion control algorithms (Reno/Cubic).
+- [ ] `planned` Handle packet loss recovery and fast retransmit.
+- [ ] `planned` Port standard network clients and servers (e.g., a minimal SSH daemon or curl).
+- [ ] `planned` Add the `select()` syscall as a companion to the existing `poll()` for fd readiness multiplexing.
+
+## M33: POSIX Shell Compliance & Job Control Polish
+
+- [ ] `planned` Implement command substitution (e.g., `$(cmd)` or `` `cmd` ``) in the shell.
+- [ ] `planned` Support subshell execution via `( list )`.
+- [ ] `planned` Complete POSIX terminal job control (implementing `bg`, robust job resumption, and state queries).
+- [ ] `planned` Add support for complex script structures (functions, `case` statements, arrays).
+- [ ] `planned` Implement pathname expansion (globbing): `*`, `?`, and `[…]` bracket expressions against the VFS.
+- [ ] `planned` Implement here-documents (`<<`, `<<-`) and arithmetic expansion (`$((…))`).
+- [ ] `planned` Broaden coreutils utility flag coverage toward POSIX (the named blocker in the POSIX estimate above).
+
+## M34: Virtual Filesystems (/proc and /sys)
+
+- [ ] `planned` Implement a `/proc` filesystem mounting path exposing per-process information (`cmdline`, `fd/`, `maps`, `status`).
+- [ ] `planned` Implement a `/sys` filesystem to expose active hardware status and kernel configuration tunables.
+- [ ] `planned` Port Linux-compatible process monitoring and control utilities (`top`, `free`, `sysctl`, standard `ps`).
+
+## M35: Core Dumps & Diagnostic Analysis
+
+- [ ] `planned` Implement ELF core dump generation (`core`) in the kernel upon fatal signals (SIGSEGV, SIGABRT, SIGILL).
+- [ ] `planned` Extend the kernel backtrace utility with full `kallsyms` symbolication.
+- [ ] `planned` Implement user-space debug symbol resolution helpers for cleaner panic analysis.
+
+## M36: Kernel Debugging & Tracing (GDB Stub & ftrace)
+
+- [ ] `planned` Implement a serial-port GDB stub in the kernel to support remote host-based kernel debugging.
+- [ ] `planned` Add a kernel tracing framework (e.g., ftrace/kprobes) to record function calls and execution times.
+
+## M37: Real Hardware Booting (Bare Metal)
+
+- [ ] `planned` Write a UEFI bootloader setup or GRUB USB configuration targeting standard x86_64 PC hardware.
+- [ ] `planned` Replace hardcoded system limits with dynamic ACPI table discovery (dynamic CPU count, interrupt routing).
+- [ ] `planned` Implement BIOS/UEFI VBE/GOP graphics mode-setting dynamically at startup.
+
+## M38: Sound / Audio Subsystem
+
+- [ ] `planned` Implement an Intel High Definition Audio (HDA) or AC97 PCI device driver.
+- [ ] `planned` Expose sound interfaces via `/dev/dsp` or a simple ALSA-like API.
+- [ ] `planned` Build a WAV file parser and player utility for user-space.
+
+## M39: Configurable Init System (SysVinit & /etc/inittab)
+
+- [ ] `planned` Implement a parser for the `/etc/inittab` configuration file to define system startups, runlevels, and respawn targets.
+- [ ] `planned` Add support for runlevels (e.g., single-user, multi-user, GUI) and transition control via `telinit` / `init Q`.
+- [ ] `planned` Implement multiple virtual terminal (TTY) lines or serial consoles handled by independent `getty` / `login` process spawners.
+- [ ] `planned` Replace the hardcoded boot program selection in the kernel-registered `/bin/init` with the configurable file-based service dispatcher.
+
+## M40: Linux ABI Compatibility Layer
+
+Run unmodified Linux x86-64 ELF binaries. This is a large, continually-catching-up
+effort (FreeBSD Linuxulator / WSL1 style) and is **gated on M29 (threads/`futex`/TLS),
+M30 (dynamic linking), and M34 (`/proc`, `/sys`)** — until those land, the layer would
+sit on a process model that cannot satisfy glibc. Source-level porting (recompiling
+against b1nix libc) is the cheaper, higher-leverage path and should be exhausted first.
+
+- [ ] `planned` Add a Linux syscall translation layer mapping Linux x86-64 syscall numbers and semantics onto b1nix kernel services (distinct from the native `b1nix/syscall.h` numbers).
+- [ ] `planned` Support `PT_INTERP` so the glibc dynamic linker (`ld-linux-x86-64.so`) can load, plus a static-binary fast path.
+- [ ] `planned` Provide Linux-compatible process/thread startup: full `auxv`, vDSO, TLS via `%fs`, and a Linux-shaped signal trampoline.
+- [ ] `planned` Implement the `/proc` and `/sys` entries glibc and common tools probe at startup (depends on M34).
+- [ ] `planned` Add a binary "personality" switch so Linux ELFs are detected and dispatched to the compat layer without affecting native b1nix binaries.
+
