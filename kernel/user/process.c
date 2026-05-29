@@ -11,7 +11,6 @@
 
 extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
-extern struct task *current_task;
 
 #define MAX_PROGRAMS 64
 #define ELF_MAGIC0 0x7f

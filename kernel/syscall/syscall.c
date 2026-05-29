@@ -19,7 +19,6 @@
 #include <b1nix/aio.h>
 #include <string.h>
 
-extern struct task *current_task;
 
 #define MAX_EXEC_ARGS 256
 #define MAX_EXEC_ARG_LEN 4096

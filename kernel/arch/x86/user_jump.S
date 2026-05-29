@@ -7,13 +7,15 @@
 x86_user_jump:
     /* %rdi = entry, %rsi = stack, %rdx = argc, %rcx = argv */
     
-    /* Set up segment registers for Ring 3 */
+    /* Set up segment registers for Ring 3. We deliberately do NOT reload %gs:
+     * in 64-bit mode loading a GS selector resets the GS base, and the kernel
+     * keeps its per-CPU base in GS (no SWAPGS) so the syscall handler can read
+     * the per-CPU current task via %gs:0x10. b1nix userspace does not use %gs. */
     mov $0x1B, %ax /* User Data selector (0x18 | 3) */
     mov %ax, %ds
     mov %ax, %es
     mov %ax, %fs
-    mov %ax, %gs
-    
+
     /* Prepare stack frame for iretq */
     /* [SS] [RSP] [RFLAGS] [CS] [RIP] */
     pushq $0x1B      /* SS */

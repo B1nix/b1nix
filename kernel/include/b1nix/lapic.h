@@ -100,8 +100,10 @@ struct percpu {
     u32 apic_id;
     u32 cpu_online;
 
-    /* 0x10: Current task */
-    struct task *current_task;
+    /* 0x10: Current task. Named cur_task (not current_task) so it does not
+     * collide with the `current_task` macro (#define current_task
+     * get_percpu()->cur_task in sched.h). syscall_entry.S reads it as %gs:0x10. */
+    struct task *cur_task;
 
     /* 0x18: Scheduler state */
     struct runqueue runqueue;
@@ -136,8 +138,8 @@ static inline struct percpu *get_percpu(void) {
 #define percpu_ptr(member)          ({ struct percpu *_p = get_percpu(); _p ? &_p->member : (typeof(&_p->member))0; })
 
 /* Current task accessor (SMP-safe via per-CPU) */
-#define smp_current_task()          percpu_read(current_task)
-#define smp_set_current_task(t)     percpu_write(current_task, (t))
+#define smp_current_task()          percpu_read(cur_task)
+#define smp_set_current_task(t)     percpu_write(cur_task, (t))
 
 /* APIC / SMP API */
 void lapic_init(void);
