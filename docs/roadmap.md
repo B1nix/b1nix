@@ -445,7 +445,7 @@ permission edge cases and kernel backtrace diagnostics.
 
 ## M28: Preemptive SMP Scheduling & Fine-Grained Locking
 
-- [ ] `planned` Preemptive scheduling off the Local APIC timer ticks on all cores.
+- [ ] `partial` Preemptive scheduling off the Local APIC timer ticks on all cores. A2 already calibrated the LAPIC timer against the PIT (62443 ticks/ms on QEMU, exported via `lapic_ticks_per_ms()`); switching the primary scheduler tick source from the BSP-only PIT to per-CPU LAPIC ticks is the remaining piece. See `docs/dehardcode-audit.md` follow-up #2.
 - [ ] `planned` Audit and remove the Big Kernel Lock (BKL) for userspace execution on APs.
 - [ ] `planned` Implement fine-grained spinlocks and read-write locks for the VFS, process table, and memory manager.
 - [ ] `planned` Benchmark and optimize context-switch latency under SMP workloads.
@@ -515,8 +515,8 @@ permission edge cases and kernel backtrace diagnostics.
 ## M37: Real Hardware Booting (Bare Metal)
 
 - [ ] `planned` Write a UEFI bootloader setup or GRUB USB configuration targeting standard x86_64 PC hardware.
-- [ ] `planned` Replace hardcoded system limits with dynamic ACPI table discovery (dynamic CPU count, interrupt routing).
-- [ ] `planned` Implement BIOS/UEFI VBE/GOP graphics mode-setting dynamically at startup.
+- [x] `done` Replace hardcoded system limits with dynamic ACPI table discovery (dynamic CPU count, interrupt routing). Delivered across A1 (ACPI MADT CPU enumeration), A1-irq (IOAPIC routing replaces 8259 PIC), A2 (LAPIC timer calibrated against PIT), B1 (direct map sized to actual RAM), B2 (caches scaled to RAM), B3 (swap + eviction tables sized to RAM/device), C1 (chunked growable task table), C2 (growable program registry), C3 (MAX_CPUS raised + runtime `g_max_cpus` from MADT). Smoke 250/0/0 after each step. See `docs/dehardcode-audit.md` for the per-item commit map and remaining follow-ups (drivers→`vmm_map_mmio()`, LAPIC tick switch, heap-backed TSS array).
+- [ ] `partial` Implement BIOS/UEFI VBE/GOP graphics mode-setting dynamically at startup. Framebuffer parameters (resolution/bpp/pitch/address) are already runtime-discovered from Multiboot2 via `bootinfo_get()->framebuffer`, so the kernel adapts to whatever GRUB set. True in-kernel mode-setting still requires either UEFI/GOP (depends on the M37 UEFI bootloader item above) or a v86 emulator for BIOS INT 10h; deferred until one of those lands.
 
 ## M38: Sound / Audio Subsystem
 

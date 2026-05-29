@@ -8,8 +8,23 @@
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
 /* Physical memory below DIRECT_MAP_SIZE is identity-accessible via the direct
  * map (phys + DIRECT_MAP_BASE). The pmm must never hand out a frame at or above
- * this limit, and vmm_init maps exactly this range — keep the two in lockstep. */
-#define DIRECT_MAP_SIZE (8ULL * 1024ULL * 1024ULL * 1024ULL)
+ * this limit, and vmm_init maps exactly this range — keep the two in lockstep.
+ *
+ * DIRECT_MAP_SIZE is now a runtime value sized to the Multiboot2 top-of-RAM
+ * at pmm_init, clamped to [DIRECT_MAP_MIN, DIRECT_MAP_MAX] and aligned to a
+ * 2 MiB boundary. The macro forwards to the global so existing call sites
+ * (`if (x < DIRECT_MAP_SIZE) ...`) keep compiling unchanged.
+ *
+ * MIN is 4 GiB: PCI MMIO BARs (AHCI ABAR ~ 0xFEBD6000, etc.) sit in the
+ * 32-bit PCI hole and several drivers access them as
+ * `phys + DIRECT_MAP_BASE` directly. Below 4 GiB those would page-fault.
+ * (The fully clean alternative — vmm_map_mmio() in every driver — is a
+ * separate cleanup; for now the floor keeps the legacy direct-map MMIO
+ * pattern working.) */
+#define DIRECT_MAP_MIN  (4ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL)
+extern u64 g_direct_map_size;
+#define DIRECT_MAP_SIZE (g_direct_map_size)
 #define KHEAP_START 0xffffc00000000000ULL
 
 #define VMM_PRESENT (1ULL << 0)

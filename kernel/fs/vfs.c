@@ -114,8 +114,13 @@ static struct vfs_fs *find_fs(const char *name) {
   return NULL;
 }
 
-#define DCACHE_SIZE 256
-#define MAX_DCACHE_ENTRIES 512
+/* Dcache sizing (B2 audit): pool + hash table are sized to RAM at
+ * dcache_init_pool() and lazy-allocated from the kernel heap, instead of
+ * burning ~50 KiB of static memory regardless of machine size. */
+#define DCACHE_SIZE_MIN          64
+#define DCACHE_SIZE_MAX          4096
+#define DCACHE_POOL_MIN          256
+#define DCACHE_POOL_MAX          8192
 
 struct dcache_entry {
   struct vfs_node *parent;
@@ -125,7 +130,8 @@ struct dcache_entry {
   struct dcache_entry *lru_next;
   struct dcache_entry *lru_prev;
 };
-static struct dcache_entry *dcache[DCACHE_SIZE] = {0};
+static struct dcache_entry **dcache = 0;
+static u32 g_dcache_size = 0;
 static struct dcache_entry *dcache_lru_head = 0;
 static struct dcache_entry *dcache_lru_tail = 0;
 static int dcache_count = 0;
@@ -141,15 +147,39 @@ static void dcache_release(void) {
 }
 
 /* Slab-like pool for dcache entries to avoid fragmentation and kmalloc overhead
- */
-static struct dcache_entry dcache_pool[MAX_DCACHE_ENTRIES];
+ * Pool + hash table are kzalloc'd at init, sized from total RAM. */
+static struct dcache_entry *dcache_pool = 0;
+static u32 g_dcache_pool_size = 0;
 static struct dcache_entry *dcache_free_list = 0;
 
 static void dcache_init_pool(void) {
-  for (int i = 0; i < MAX_DCACHE_ENTRIES - 1; i++) {
+  /* Scale to RAM: ~1 entry per 256 KiB usable RAM, clamped. */
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  u32 pool = (u32)(ram_mb * 4);
+  if (pool < DCACHE_POOL_MIN) pool = DCACHE_POOL_MIN;
+  if (pool > DCACHE_POOL_MAX) pool = DCACHE_POOL_MAX;
+  g_dcache_pool_size = pool;
+  /* Hash table half the pool size, also clamped to [MIN, MAX]. */
+  u32 table = pool / 2;
+  if (table < DCACHE_SIZE_MIN) table = DCACHE_SIZE_MIN;
+  if (table > DCACHE_SIZE_MAX) table = DCACHE_SIZE_MAX;
+  g_dcache_size = table;
+
+  dcache_pool = kzalloc(g_dcache_pool_size * sizeof(struct dcache_entry));
+  dcache = kzalloc(g_dcache_size * sizeof(struct dcache_entry *));
+  if (!dcache_pool || !dcache) {
+    /* Out of memory at dcache init — the dentry cache is non-critical (its
+     * lookup path is currently dead code), so degrade gracefully: zero out
+     * counts and leave the free list NULL. dcache_alloc returns 0 then. */
+    g_dcache_pool_size = 0;
+    g_dcache_size = 0;
+    dcache_free_list = 0;
+    return;
+  }
+  for (u32 i = 0; i < g_dcache_pool_size - 1; i++) {
     dcache_pool[i].next = &dcache_pool[i + 1];
   }
-  dcache_pool[MAX_DCACHE_ENTRIES - 1].next = 0;
+  dcache_pool[g_dcache_pool_size - 1].next = 0;
   dcache_free_list = &dcache_pool[0];
 }
 
@@ -172,7 +202,7 @@ static u32 dcache_hash(struct vfs_node *parent, const char *name) {
   h = ((h << 5) + h) + (u32)(usize)parent;
   while (*name)
     h = ((h << 5) + h) + (u32)(*name++);
-  return h % DCACHE_SIZE;
+  return h % g_dcache_size;
 }
 
 /* Dentry-cache lookup/insert: a complete LRU path-resolution cache, not yet
@@ -213,7 +243,7 @@ __attribute__((unused)) static struct vfs_node *dcache_lookup(struct vfs_node *p
 __attribute__((unused)) static void dcache_insert(struct vfs_node *parent, const char *name,
                           struct vfs_node *node) {
   dcache_acquire();
-  if (dcache_count >= MAX_DCACHE_ENTRIES) {
+  if ((u32)dcache_count >= g_dcache_pool_size) {
     /* Evict LRU tail */
     struct dcache_entry *victim = dcache_lru_tail;
     if (victim) {
@@ -312,7 +342,7 @@ static void dcache_invalidate_node(struct vfs_node *node) {
   if (!node)
     return;
   dcache_acquire();
-  for (u32 h = 0; h < DCACHE_SIZE; h++) {
+  for (u32 h = 0; h < g_dcache_size; h++) {
     struct dcache_entry **prev_ptr = &dcache[h];
     struct dcache_entry *curr = *prev_ptr;
     while (curr) {
@@ -328,8 +358,12 @@ static void dcache_invalidate_node(struct vfs_node *node) {
   dcache_release();
 }
 
-#define ICACHE_SIZE 128
-#define MAX_ICACHE_ENTRIES 256
+/* Icache sizing (B2 audit): same RAM-scaled treatment as dcache, smaller
+ * per-entry footprint so we use a tighter ratio (1 entry per 512 KiB). */
+#define ICACHE_SIZE_MIN          32
+#define ICACHE_SIZE_MAX          2048
+#define ICACHE_POOL_MIN          128
+#define ICACHE_POOL_MAX          4096
 
 struct icache_entry {
   u32 fs_id;
@@ -340,9 +374,11 @@ struct icache_entry {
   struct icache_entry *lru_prev;
 };
 
-static struct icache_entry icache_pool[MAX_ICACHE_ENTRIES];
+static struct icache_entry *icache_pool = 0;
+static u32 g_icache_pool_size = 0;
 static struct icache_entry *icache_free_list = 0;
-static struct icache_entry *icache_buckets[ICACHE_SIZE] = {0};
+static struct icache_entry **icache_buckets = 0;
+static u32 g_icache_size = 0;
 static struct icache_entry *icache_lru_head = 0;
 static struct icache_entry *icache_lru_tail = 0;
 static int icache_count = 0;
@@ -358,15 +394,36 @@ static void icache_release(void) {
 }
 
 static u32 icache_hash(u32 fs_id, u64 ino) {
-  return (u32)((fs_id * 2654435761ULL + ino) % ICACHE_SIZE);
+  return (u32)((fs_id * 2654435761ULL + ino) % g_icache_size);
 }
 
 void icache_init(void) {
-  for (int i = 0; i < MAX_ICACHE_ENTRIES - 1; i++)
+  /* Scale to RAM: ~1 entry per 512 KiB usable RAM, clamped. */
+  u64 ram_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  u32 pool = (u32)(ram_mb * 2);
+  if (pool < ICACHE_POOL_MIN) pool = ICACHE_POOL_MIN;
+  if (pool > ICACHE_POOL_MAX) pool = ICACHE_POOL_MAX;
+  g_icache_pool_size = pool;
+  u32 table = pool / 2;
+  if (table < ICACHE_SIZE_MIN) table = ICACHE_SIZE_MIN;
+  if (table > ICACHE_SIZE_MAX) table = ICACHE_SIZE_MAX;
+  g_icache_size = table;
+
+  icache_pool = kzalloc(g_icache_pool_size * sizeof(struct icache_entry));
+  icache_buckets = kzalloc(g_icache_size * sizeof(struct icache_entry *));
+  if (!icache_pool || !icache_buckets) {
+    g_icache_pool_size = 0;
+    g_icache_size = 0;
+    icache_free_list = 0;
+    icache_lru_head = 0;
+    icache_lru_tail = 0;
+    icache_count = 0;
+    return;
+  }
+  for (u32 i = 0; i < g_icache_pool_size - 1; i++)
     icache_pool[i].next = &icache_pool[i + 1];
-  icache_pool[MAX_ICACHE_ENTRIES - 1].next = 0;
+  icache_pool[g_icache_pool_size - 1].next = 0;
   icache_free_list = &icache_pool[0];
-  memset(icache_buckets, 0, sizeof(icache_buckets));
   icache_lru_head = 0;
   icache_lru_tail = 0;
   icache_count = 0;
@@ -434,7 +491,7 @@ void icache_insert(u32 fs_id, u64 ino, struct vfs_inode *inode) {
     existing = existing->next;
   }
 
-  if (icache_count >= MAX_ICACHE_ENTRIES) {
+  if ((u32)icache_count >= g_icache_pool_size) {
     struct icache_entry *victim = icache_lru_tail;
     if (victim) {
       u32 vh = icache_hash(victim->fs_id, victim->ino);
@@ -511,7 +568,7 @@ void icache_invalidate_fs(u32 fs_id) {
   if (!fs_id)
     return;
   icache_acquire();
-  for (u32 h = 0; h < ICACHE_SIZE; h++) {
+  for (u32 h = 0; h < g_icache_size; h++) {
     struct icache_entry **prev_ptr = &icache_buckets[h];
     struct icache_entry *curr = *prev_ptr;
     while (curr) {

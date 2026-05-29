@@ -19,7 +19,24 @@
 _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
                "cur_task must be at offset 0x10 (see syscall_entry.S)");
 
-#define MAX_TASKS 64
+/*
+ * Task table (C1 audit item).
+ *
+ * The table is split into fixed-size CHUNKS that are allocated from the
+ * kernel heap on demand. Existing code accessed slots as `T(i)`; the
+ * chunked storage is exposed through the `T(i)` accessor that returns a
+ * `struct task *` into the right chunk. Growth never relocates an existing
+ * slot, so pointers stored elsewhere (current_task, runqueue links, etc.)
+ * stay valid forever.
+ *
+ * MAX_TASKS is now the hard ceiling; the live table size starts at one
+ * chunk (TASK_CHUNK_SIZE slots) and grows by one chunk each time find_unused
+ * runs out of slots. g_task_hwm tracks the high-water-mark slot index used
+ * so far, so the linear scans cost O(active) instead of O(ceiling).
+ */
+#define TASK_CHUNK_SIZE   64
+#define TASK_MAX_CHUNKS   64
+#define MAX_TASKS         (TASK_CHUNK_SIZE * TASK_MAX_CHUNKS)  /* 4096 */
 /* The kernel stack is a kmalloc'd block in the shared kheap, so an overflow
  * silently corrupts the adjacent heap block (e.g. a vfs_node) instead of
  * faulting. b1nix runs the busybox coreutils builtins in kernel mode on this
@@ -44,7 +61,15 @@ extern void arch_fpu_capture_clean(void *area);
 static __attribute__((aligned(16))) u8 g_clean_fpu[512];
 static int g_clean_fpu_ready = 0;
 
-static struct task tasks[MAX_TASKS];
+/* Chunked task storage. g_task_chunks[c] points to a kmalloc'd block of
+ * TASK_CHUNK_SIZE consecutively-laid-out struct tasks (or NULL if that chunk
+ * is not yet allocated). Slot indices i map as (i >> 6) -> chunk, (i & 63) ->
+ * offset within chunk. */
+static struct task *g_task_chunks[TASK_MAX_CHUNKS];
+static usize        g_task_hwm = 0;  /* one past highest slot ever used */
+static inline struct task *T(usize i) {
+  return &g_task_chunks[i >> 6][i & 63];
+}
 /* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
 static usize next_task_id = 1;
 
@@ -63,13 +88,20 @@ struct runqueue *sched_global_rq(void) { return &g_global_rq; }
  * Each AP runs a dedicated idle task as current_task while waiting for work.
  * These live OUTSIDE the global tasks[] table so the O(n) scan never migrates
  * one onto another core; the cooperative scheduler reaches an AP's idle task
- * only through the per-CPU fallback in pick_next_task. */
-static struct task g_ap_idle_tasks[MAX_CPUS];
+ * only through the per-CPU fallback in pick_next_task.
+ *
+ * C3 audit: lazy-allocate from the kheap so MAX_CPUS=64 doesn't reserve
+ * ~256 KiB BSS for slots that may never run. Pointer table costs 512 B. */
+static struct task *g_ap_idle_tasks[MAX_CPUS];
 
 struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   if (cpu < 0 || cpu >= MAX_CPUS)
     return 0;
-  struct task *t = &g_ap_idle_tasks[cpu];
+  if (!g_ap_idle_tasks[cpu]) {
+    g_ap_idle_tasks[cpu] = kzalloc(sizeof(struct task));
+    if (!g_ap_idle_tasks[cpu]) return 0;
+  }
+  struct task *t = g_ap_idle_tasks[cpu];
   memset(t, 0, sizeof(*t));
   t->name = "ap-idle";
   t->state = TASK_RUNNING;
@@ -99,23 +131,56 @@ static u64 align_down_u64(u64 value, u64 alignment) {
   return value & ~(alignment - 1);
 }
 
-/* Atomically claim a free tasks[] slot, zero it, mark it BLOCKED (reserved),
+/* Lazily allocate task chunk `c` from the kernel heap. Called only with
+ * g_tasks_lock held. Returns 0 if kmalloc fails (then the caller must report
+ * "no free slot" — same as the old hard-cap behaviour). */
+static int ensure_task_chunk(usize c) {
+  if (c >= TASK_MAX_CHUNKS) return 0;
+  if (g_task_chunks[c]) return 1;
+  struct task *chunk = kzalloc(TASK_CHUNK_SIZE * sizeof(struct task));
+  if (!chunk) return 0;
+  /* kzalloc already zeros the chunk -> all slots are TASK_UNUSED. */
+  g_task_chunks[c] = chunk;
+  return 1;
+}
+
+/* Atomically claim a free task slot, zero it, mark it BLOCKED (reserved),
  * and assign its id — all under g_tasks_lock so two CPUs can never claim the
- * same slot. */
+ * same slot. Scans the in-use range first (cheap), then grows by one chunk
+ * (TASK_CHUNK_SIZE slots) on demand up to the MAX_TASKS ceiling. */
 static struct task *find_unused_task(void) {
   u64 flags;
   spin_lock_irqsave(&g_tasks_lock, &flags);
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state == TASK_UNUSED) {
-      memset(&tasks[i], 0, sizeof(struct task));
-      tasks[i].state = TASK_BLOCKED;
-      tasks[i].id = next_task_id++;
+
+  /* 1) Fast path: reuse a slot already in [0, g_task_hwm). */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state == TASK_UNUSED) {
+      memset(T(i), 0, sizeof(struct task));
+      T(i)->state = TASK_BLOCKED;
+      T(i)->id = next_task_id++;
       spin_unlock_irqrestore(&g_tasks_lock, flags);
-      return &tasks[i];
+      return T(i);
     }
   }
+
+  /* 2) Slow path: extend the high-water mark, allocating a new chunk if the
+   *    next slot crosses a chunk boundary. */
+  if (g_task_hwm >= MAX_TASKS) {
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    return 0;
+  }
+  if (!ensure_task_chunk(g_task_hwm >> 6)) {
+    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    return 0;
+  }
+  usize i = g_task_hwm++;
+  /* Chunk was kzalloc'd, but be explicit so a slot that gets reused after
+   * free_task_slot starts from a clean state too (same as the old path). */
+  memset(T(i), 0, sizeof(struct task));
+  T(i)->state = TASK_BLOCKED;
+  T(i)->id = next_task_id++;
   spin_unlock_irqrestore(&g_tasks_lock, flags);
-  return 0;
+  return T(i);
 }
 
 /* Release a tasks[] slot back to UNUSED under g_tasks_lock (pairs with
@@ -128,8 +193,19 @@ static void free_task_slot(struct task *t) {
   spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
+/* Find the slot index of a task by scanning the populated chunks. Only
+ * called from pick_next_task to choose a scan start point, so an O(active)
+ * walk is fine. Returns 0 (a safe default scan origin) if the pointer is not
+ * one of ours — e.g., an AP's idle task lives outside the chunked table. */
 static usize task_index(const struct task *task) {
-  return (usize)(task - tasks);
+  for (usize c = 0; c < TASK_MAX_CHUNKS; c++) {
+    const struct task *chunk = g_task_chunks[c];
+    if (!chunk) break;
+    if (task >= chunk && task < chunk + TASK_CHUNK_SIZE) {
+      return (c << 6) | (usize)(task - chunk);
+    }
+  }
+  return 0;
 }
 
 static struct task *pick_next_task(void) {
@@ -164,19 +240,19 @@ static struct task *pick_next_task(void) {
   int max_priority = -1;
   struct task *best_task = 0;
 
-  for (usize offset = 1; offset <= MAX_TASKS; offset++) {
-    usize index = (start + offset) % MAX_TASKS;
+  for (usize offset = 1; offset <= g_task_hwm; offset++) {
+    usize index = (start + offset) % g_task_hwm;
 
-    if (tasks[index].state != TASK_READY)
+    if (T(index)->state != TASK_READY)
       continue;
-    if (tasks[index].stealable)
+    if (T(index)->stealable)
       continue;
-    if (on_ap && !tasks[index].ap_runnable)
+    if (on_ap && !T(index)->ap_runnable)
       continue; /* APs run only userspace ELF processes */
 
-    if (tasks[index].priority > max_priority) {
-      max_priority = tasks[index].priority;
-      best_task = &tasks[index];
+    if (T(index)->priority > max_priority) {
+      max_priority = T(index)->priority;
+      best_task = T(index);
     }
   }
 
@@ -194,12 +270,12 @@ static struct task *pick_next_task(void) {
 }
 
 static void wake_sleepers(void) {
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state == TASK_SLEEPING &&
-        tasks[i].wake_tick <= scheduler_ticks) {
-      tasks[i].state = TASK_READY;
-      tasks[i].wake_tick = 0;
-      sched_rq_enqueue_current(&tasks[i]);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state == TASK_SLEEPING &&
+        T(i)->wake_tick <= scheduler_ticks) {
+      T(i)->state = TASK_READY;
+      T(i)->wake_tick = 0;
+      sched_rq_enqueue_current(T(i));
     }
   }
 }
@@ -216,9 +292,15 @@ static void kernel_thread_trampoline(void) {
 }
 
 void scheduler_init(void) {
-  memset(tasks, 0, sizeof(tasks));
+  /* Allocate the first task chunk so T(0) is dereferenceable for the boot
+   * task. kzalloc panics on OOM here — we cannot proceed without a task
+   * table. */
+  if (!ensure_task_chunk(0)) {
+    panic("scheduler: failed to allocate initial task chunk");
+  }
+  g_task_hwm = 1;  /* boot task occupies slot 0 */
 
-  struct task *boot = &tasks[0];
+  struct task *boot = T(0);
   boot->id = next_task_id++;
   boot->name = "boot";
   boot->state = TASK_RUNNING;
@@ -270,9 +352,9 @@ static void task_init_cred(struct task *task) {
   } else {
     /* Inherit credentials from parent */
     struct task *parent = 0;
-    for (usize i = 0; i < MAX_TASKS; i++) {
-      if (tasks[i].id == task->parent_id) {
-        parent = &tasks[i];
+    for (usize i = 0; i < g_task_hwm; i++) {
+      if (T(i)->id == task->parent_id) {
+        parent = T(i);
         break;
       }
     }
@@ -724,11 +806,11 @@ void scheduler_block_current(void) {
 void scheduler_wake_task(usize task_id) {
   interrupts_disable();
 
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].id == task_id && tasks[i].state == TASK_BLOCKED) {
-      tasks[i].state = TASK_READY;
-      tasks[i].wait_chan = 0;
-      sched_rq_enqueue_current(&tasks[i]);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == task_id && T(i)->state == TASK_BLOCKED) {
+      T(i)->state = TASK_READY;
+      T(i)->wait_chan = 0;
+      sched_rq_enqueue_current(T(i));
       break;
     }
   }
@@ -752,11 +834,11 @@ void scheduler_block_on(void *chan) {
 void scheduler_wake_all(void *chan) {
   interrupts_disable();
 
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state == TASK_BLOCKED && tasks[i].wait_chan == chan) {
-      tasks[i].state = TASK_READY;
-      tasks[i].wait_chan = 0;
-      sched_rq_enqueue_current(&tasks[i]);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state == TASK_BLOCKED && T(i)->wait_chan == chan) {
+      T(i)->state = TASK_READY;
+      T(i)->wait_chan = 0;
+      sched_rq_enqueue_current(T(i));
     }
   }
 
@@ -832,10 +914,10 @@ void scheduler_exit_current(int exit_code) {
   current_task->state = TASK_DEAD;
 
   // Wake up parent if it is blocked waiting for us
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].id == current_task->parent_id &&
-        tasks[i].state == TASK_BLOCKED) {
-      tasks[i].state = TASK_READY;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == current_task->parent_id &&
+        T(i)->state == TASK_BLOCKED) {
+      T(i)->state = TASK_READY;
     }
   }
 
@@ -861,28 +943,28 @@ int scheduler_waitpid(usize pid, int *status, int options) {
   while (1) {
     interrupts_disable();
     int has_children = 0;
-    for (usize i = 0; i < MAX_TASKS; i++) {
-      if (tasks[i].state != TASK_UNUSED &&
-          tasks[i].parent_id == current_task->id) {
-        if (wait_any || tasks[i].id == pid) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      if (T(i)->state != TASK_UNUSED &&
+          T(i)->parent_id == current_task->id) {
+        if (wait_any || T(i)->id == pid) {
           has_children = 1;
-          if (tasks[i].state == TASK_DEAD) {
-            int code = tasks[i].exit_code;
-            int child_id = tasks[i].id;
-            if (tasks[i].user_image) {
-              user_image_free(tasks[i].user_image);
-              tasks[i].user_image = 0;
+          if (T(i)->state == TASK_DEAD) {
+            int code = T(i)->exit_code;
+            int child_id = T(i)->id;
+            if (T(i)->user_image) {
+              user_image_free(T(i)->user_image);
+              T(i)->user_image = 0;
             }
-            user_address_space_cleanup(&tasks[i]);
-            paging_free_address_space(tasks[i].pml4_phys);
-            tasks[i].pml4_phys = 0;
-            if (tasks[i].name && strcmp(tasks[i].name, "boot") != 0) {
-              kfree((void *)tasks[i].name);
-              tasks[i].name = 0;
+            user_address_space_cleanup(T(i));
+            paging_free_address_space(T(i)->pml4_phys);
+            T(i)->pml4_phys = 0;
+            if (T(i)->name && strcmp(T(i)->name, "boot") != 0) {
+              kfree((void *)T(i)->name);
+              T(i)->name = 0;
             }
-            kfree(tasks[i].stack);
+            kfree(T(i)->stack);
             interrupts_enable();
-            free_task_slot(&tasks[i]);
+            free_task_slot(T(i));
             if (status) {
               if (code >= 128 && code < 128 + NSIG) {
                 /* Task was killed by a signal */
@@ -894,22 +976,22 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             }
              return child_id;
           } else if ((options & (B1NIX_WUNTRACED | B1NIX_WCONTINUED)) &&
-                     (tasks[i].state == TASK_STOPPED ||
-                      tasks[i].continued_report_pending)) {
-            int child_id = tasks[i].id;
-            if ((options & B1NIX_WUNTRACED) && tasks[i].state == TASK_STOPPED &&
-                tasks[i].stop_report_pending) {
+                     (T(i)->state == TASK_STOPPED ||
+                      T(i)->continued_report_pending)) {
+            int child_id = T(i)->id;
+            if ((options & B1NIX_WUNTRACED) && T(i)->state == TASK_STOPPED &&
+                T(i)->stop_report_pending) {
               if (status)
-                *status = ((tasks[i].last_stop_signal & 0xFF) << 8) | 0x7F;
-              tasks[i].stop_report_pending = 0;
+                *status = ((T(i)->last_stop_signal & 0xFF) << 8) | 0x7F;
+              T(i)->stop_report_pending = 0;
               interrupts_enable();
               return child_id;
             }
             if ((options & B1NIX_WCONTINUED) &&
-                tasks[i].continued_report_pending) {
+                T(i)->continued_report_pending) {
               if (status)
                 *status = 0xFFFF;
-              tasks[i].continued_report_pending = 0;
+              T(i)->continued_report_pending = 0;
               interrupts_enable();
               return child_id;
             }
@@ -937,8 +1019,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 usize scheduler_task_count(void) {
   usize count = 0;
 
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].state != TASK_DEAD) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->state != TASK_DEAD) {
       count++;
     }
   }
@@ -948,13 +1030,13 @@ usize scheduler_task_count(void) {
 
 void scheduler_dump_tasks(void) {
   console_write("ID\tSTATE\tNAME\n");
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED) {
-      console_write_hex64(tasks[i].id);
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED) {
+      console_write_hex64(T(i)->id);
       console_write("\t");
 
       const char *state_str = "UNKNOWN";
-      switch (tasks[i].state) {
+      switch (T(i)->state) {
       case TASK_RUNNING:
         state_str = "RUNNING";
         break;
@@ -979,7 +1061,7 @@ void scheduler_dump_tasks(void) {
 
       console_write(state_str);
       console_write("\t");
-      console_write(tasks[i].name);
+      console_write(T(i)->name);
       console_write("\n");
     }
   }
@@ -1177,18 +1259,18 @@ int scheduler_kill(usize task_id, int sig) {
     return -1;
 
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].id == task_id && tasks[i].state != TASK_UNUSED) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
       /* SIGKILL and SIGSTOP cannot be blocked/ignored */
-      tasks[i].pending_signals |= (1ULL << (sig - 1));
+      T(i)->pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
-      if (sig == SIGCONT && tasks[i].state == TASK_STOPPED) {
-        tasks[i].continued_report_pending = 1;
+      if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
+        T(i)->continued_report_pending = 1;
       }
-      if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
-        tasks[i].state = TASK_READY;
-        sched_rq_enqueue_current(&tasks[i]);
+      if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
+        T(i)->state = TASK_READY;
+        sched_rq_enqueue_current(T(i));
       }
       interrupts_enable();
       return 0;
@@ -1204,17 +1286,17 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
 
   int sent = 0;
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].process_group_id == pgrp) {
-      tasks[i].pending_signals |= (1ULL << (sig - 1));
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+      T(i)->pending_signals |= (1ULL << (sig - 1));
 
       /* Wake blocked task so it can handle signal */
-      if (sig == SIGCONT && tasks[i].state == TASK_STOPPED) {
-        tasks[i].continued_report_pending = 1;
+      if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
+        T(i)->continued_report_pending = 1;
       }
-      if (tasks[i].state == TASK_BLOCKED || tasks[i].state == TASK_STOPPED) {
-        tasks[i].state = TASK_READY;
-        sched_rq_enqueue_current(&tasks[i]);
+      if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
+        T(i)->state = TASK_READY;
+        sched_rq_enqueue_current(T(i));
       }
       sent++;
     }
@@ -1403,9 +1485,9 @@ int scheduler_set_priority(usize pid, int priority) {
   if (priority < -20 || priority > 19)
     return -1;
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
-      tasks[i].priority = 10 - priority; /* nice → internal (higher = better) */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
+      T(i)->priority = 10 - priority; /* nice → internal (higher = better) */
       interrupts_enable();
       return 0;
     }
@@ -1416,9 +1498,9 @@ int scheduler_set_priority(usize pid, int priority) {
 
 int scheduler_get_priority(usize pid) {
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
-      int p = 10 - tasks[i].priority; /* internal → nice */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
+      int p = 10 - T(i)->priority; /* internal → nice */
       interrupts_enable();
       return p;
     }
@@ -1456,13 +1538,13 @@ int scheduler_setpgrp(usize pid, usize pgrp) {
   if (pgrp == 0)
     pgrp = pid;
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].id == pid) {
-      if (tasks[i].session_id != current_task->session_id) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
+      if (T(i)->session_id != current_task->session_id) {
         interrupts_enable();
         return -EPERM;
       }
-      tasks[i].process_group_id = pgrp;
+      T(i)->process_group_id = pgrp;
       interrupts_enable();
       return 0;
     }
@@ -1474,9 +1556,9 @@ int scheduler_setpgrp(usize pid, usize pgrp) {
 int scheduler_is_pgrp_in_session(usize pgrp, usize session_id) {
   int found = 0;
   interrupts_disable();
-  for (usize i = 0; i < MAX_TASKS; i++) {
-    if (tasks[i].state != TASK_UNUSED && tasks[i].process_group_id == pgrp) {
-      if (tasks[i].session_id == session_id) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+      if (T(i)->session_id == session_id) {
         found = 1;
         break;
       }
@@ -1509,9 +1591,9 @@ void scheduler_deliver_pending_signals(void) {
       /* SIGKILL — terminate immediately */
       current_task->exit_code = 128 + SIGKILL;
       current_task->state = TASK_DEAD;
-      for (usize i = 0; i < MAX_TASKS; i++) {
-        if (tasks[i].id == current_task->parent_id && tasks[i].state == TASK_BLOCKED)
-          tasks[i].state = TASK_READY;
+      for (usize i = 0; i < g_task_hwm; i++) {
+        if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
+          T(i)->state = TASK_READY;
       }
       return;
       /* unreachable */
@@ -1544,9 +1626,9 @@ void scheduler_deliver_pending_signals(void) {
         /* Terminate */
         current_task->exit_code = 128 + sig;
         current_task->state = TASK_DEAD;
-        for (usize i = 0; i < MAX_TASKS; i++) {
-          if (tasks[i].id == current_task->parent_id && tasks[i].state == TASK_BLOCKED)
-            tasks[i].state = TASK_READY;
+        for (usize i = 0; i < g_task_hwm; i++) {
+          if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
+            T(i)->state = TASK_READY;
         }
         return;
         /* unreachable */

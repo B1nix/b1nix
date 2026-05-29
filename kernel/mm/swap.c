@@ -11,29 +11,28 @@
  * (since PAGE_SIZE / 512 = 8 sectors per page).
  */
 
-/* Static upper bound on swap slots (one slot = one 4KB page). At 24 bytes per
- * entry this is ~1.5MB of BSS, which buys up to 256MB of usable swap — enough
- * to relieve a cc1/self-host working set on a low-RAM (e.g. 128MB) guest. The
- * actual usable count is clamped to the backing device at init (swap_slot_count)
- * so we never hand out a slot past the device. The old fixed 1024 (= 4MB) was
- * far too small: a 256MB swap device was 98% wasted and swap could not relieve
- * the in-guest build's pressure. */
-#define MAX_SWAP_SLOTS 65536
+/* Swap slot table sizing (B3 audit): allocate on demand at
+ * vmm_set_swap_device() with the exact slot count the backing device can
+ * hold, clamped to a sane ceiling so a malicious or huge swap volume can't
+ * cost arbitrary kernel memory. ~24 bytes per entry. The previous 65536-
+ * slot static table cost ~1.5 MiB BSS on every machine regardless of
+ * whether swap was wired up. */
+#define SWAP_SLOTS_MAX   65536
 #define SECTORS_PER_PAGE (PAGE_SIZE / 512)
+
+struct swap_slot_entry {
+    u64 pml4_phys;         // Address space ID
+    u64 virtual_addr;      // Page-aligned virtual address
+    u32 slot_index;        // Index into swap area
+    int used;
+};
 
 static struct block_device *swap_dev = 0;
 static u64 swap_start_lba = 0; // First LBA of swap area
 static u64 swap_sector_count = 0;
 
-// Swap slot table: maps virtual page -> swap location
-static struct {
-    u64 pml4_phys;         // Address space ID
-    u64 virtual_addr;      // Page-aligned virtual address
-    u32 slot_index;        // Index into swap area
-    int used;
-} swap_table[MAX_SWAP_SLOTS];
-
-static usize swap_slot_count = MAX_SWAP_SLOTS; // usable slots, clamped to device
+static struct swap_slot_entry *swap_table = 0;
+static usize swap_slot_count = 0;  /* usable slots, set by vmm_set_swap_device */
 static int swap_next_slot = 0;
 
 void vmm_set_swap_device(struct block_device *dev)
@@ -48,25 +47,33 @@ void vmm_set_swap_device(struct block_device *dev)
             swap_start_lba = (dev->block_count * 3) / 4;
             swap_sector_count = dev->block_count - swap_start_lba;
         }
-        // Clamp usable slots to what the backing device can actually hold.
+        /* Allocate the slot table sized to the device, clamped to the
+         * SWAP_SLOTS_MAX ceiling so a huge volume doesn't cost arbitrary
+         * kernel memory. */
         usize dev_slots = (usize)(swap_sector_count / SECTORS_PER_PAGE);
-        swap_slot_count = dev_slots < MAX_SWAP_SLOTS ? dev_slots : MAX_SWAP_SLOTS;
+        swap_slot_count = dev_slots < SWAP_SLOTS_MAX ? dev_slots : SWAP_SLOTS_MAX;
+        swap_table = kzalloc(swap_slot_count * sizeof(struct swap_slot_entry));
+        if (!swap_table) {
+            console_write("swap: kzalloc slot table failed, disabling swap\n");
+            swap_slot_count = 0;
+        }
         console_write("swap: device=");
         console_write(dev->name);
         console_write(" start_lba=");
         console_write_dec(swap_start_lba);
         console_write(" sectors=");
         console_write_dec(swap_sector_count);
+        console_write(" slots=");
+        console_write_dec(swap_slot_count);
         console_write("\n");
     }
 }
 
 int swap_init(void)
 {
-    memset(swap_table, 0, sizeof(swap_table));
-    console_write("swap: initialized, max_slots=");
-    console_write_dec(MAX_SWAP_SLOTS);
-    console_write("\n");
+    /* Slot table is allocated on demand once a swap device is attached
+     * (see vmm_set_swap_device). No device means no swap memory cost. */
+    console_write("swap: initialized (slot table allocated when device attached)\n");
 
     struct block_device *dev = blk_get("sata1");
     if (!dev) {
@@ -136,7 +143,7 @@ static u32 swap_alloc_slot(void)
 
 static void swap_free_slot(u32 slot_index)
 {
-    if (slot_index < MAX_SWAP_SLOTS) {
+    if (slot_index < swap_slot_count) {
         swap_table[slot_index].used = 0;
         swap_table[slot_index].virtual_addr = 0;
         swap_table[slot_index].pml4_phys = 0;

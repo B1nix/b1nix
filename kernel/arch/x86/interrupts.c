@@ -3,6 +3,8 @@
 #include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
+#include <b1nix/ioapic.h>
+#include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
@@ -216,6 +218,15 @@ void x86_pic_init(void) {
 }
 
 void x86_pic_unmask(u8 irq) {
+  /* IOAPIC mode: program a redirection entry instead of poking the (now
+   * masked) 8259. Default to PCI semantics — level-triggered, active-low —
+   * which matches every dynamic IRQ a driver actually wants to register
+   * (NIC and friends). Any ACPI ISO override still takes precedence inside
+   * ioapic_route_irq. */
+  if (ioapic_active()) {
+    ioapic_route_irq(irq, (u8)(32 + irq), (u8)lapic_id(), /*level_low=*/1);
+    return;
+  }
   u16 port;
   u8 value;
   if (irq < 8) {
@@ -243,6 +254,18 @@ extern void ps2_mouse_interrupt_handler(void);
 
 extern void fb_console_blink_cursor(void);
 
+/* Centralised EOI: LAPIC EOI when running through the IOAPIC, 8259 EOI
+ * (both PICs for IRQs 8..15) when still on the legacy PIC. Vectors below 32
+ * are CPU exceptions and don't go through this path. */
+static inline void irq_eoi(u64 vector) {
+  if (ioapic_active()) {
+    lapic_eoi();
+    return;
+  }
+  int irq = (int)vector - 32;
+  if (irq >= 8) outb(PIC2_COMMAND, PIC_EOI);
+  outb(PIC1_COMMAND, PIC_EOI);
+}
 
 static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 32) {
@@ -250,29 +273,27 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();
     }
-    outb(PIC1_COMMAND, PIC_EOI);
+    irq_eoi(frame->vector);
     scheduler_on_timer_tick();
     return;
   }
 
   if (frame->vector == 33) {
     ps2_kbd_interrupt_handler();
-    outb(PIC1_COMMAND, PIC_EOI);
+    irq_eoi(frame->vector);
     return;
   }
 
   if (frame->vector == 44) {
     ps2_mouse_interrupt_handler();
-    outb(PIC2_COMMAND, PIC_EOI);
-    outb(PIC1_COMMAND, PIC_EOI);
+    irq_eoi(frame->vector);
     return;
   }
   if (frame->vector >= 32 && frame->vector <= 47) {
     int irq = frame->vector - 32;
     if (irq == net_get_irq()) {
       net_interrupt_handler();
-      if (irq >= 8) outb(PIC2_COMMAND, PIC_EOI);
-      outb(PIC1_COMMAND, PIC_EOI);
+      irq_eoi(frame->vector);
       return;
     }
   }
@@ -280,8 +301,8 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   console_write("\nIRQ: unexpected vector 0x");
   console_write_hex64(frame->vector);
   console_write("\n");
-  outb(PIC1_COMMAND, PIC_EOI);
-  
+  irq_eoi(frame->vector);
+
   if (frame->cs == 0x1B || frame->cs == 0x23) {
     arch_check_and_deliver_signals(frame);
   }

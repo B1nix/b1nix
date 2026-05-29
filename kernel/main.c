@@ -26,6 +26,8 @@
 #include <b1nix/lapic.h>
 #include <b1nix/bkl.h>
 #include <b1nix/video.h>
+#include <b1nix/acpi.h>
+#include <b1nix/ioapic.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -99,7 +101,14 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	uidgid_init();
 	arch_init();
+	/* Discover CPU + interrupt topology from ACPI (RSDP -> RSDT/XSDT -> MADT)
+	 * before LAPIC bring-up: smp_boot_aps prefers the MADT CPU list to the
+	 * CPUID guess. Silently no-ops on platforms without ACPI. */
+	acpi_init();
 	lapic_init();
+	/* Switch IRQ routing from the 8259 PIC to the IOAPIC discovered via
+	 * ACPI. No-op (PIC stays in charge) when no IOAPIC was reported. */
+	ioapic_init();
 	blk_cache_init();
 
 	initramfs_init();

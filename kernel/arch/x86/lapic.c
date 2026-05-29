@@ -7,6 +7,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/runqueue.h>
+#include <b1nix/acpi.h>
 #include <string.h>
 
 /* Cleared at boot; the BSP sets it after the SMP self-test so APs leave the
@@ -14,10 +15,17 @@
  * under the Big Kernel Lock. */
 volatile int g_ap_userspace_enabled = 0;
 
+/* Total online CPUs after smp_boot_aps. Visible everywhere via <b1nix/lapic.h>
+ * so loop bounds can shrink from MAX_CPUS (ceiling) to the actual count. */
+int g_max_cpus = 1;
+
 /* External functions */
 extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new);
 extern void paging_switch_address_space(u64 pml4_phys);
 extern void arch_set_kernel_stack(u64 stack);
+
+/* Forward decl — defined below; called from lapic_init. */
+static void apic_timer_calibrate_against_pit(void);
 
 /* Map LAPIC MMIO at a fixed virtual address in kernel space.
  * We use 0xFFFFFE0000000000 which is in the kernel's high mapping area
@@ -139,6 +147,12 @@ void lapic_init(void) {
     console_write("lapic: initialized (id=");
     console_write_dec(lapic_id());
     console_write(")\n");
+
+    /* Calibrate the LAPIC timer against the PIT so the value is available
+     * before any subsystem requests a LAPIC-driven tick. Requires interrupts
+     * disabled at the source — PIT channel 2 doesn't fire IRQ0, and the
+     * LVT_TIMER entry stays masked during calibration. */
+    apic_timer_calibrate_against_pit();
 }
 
 /* ── Per-CPU data ── */
@@ -341,23 +355,71 @@ void ap_main(u32 cpu_id) {
     }
 }
 
-/* LAPIC timer frequency calibration — kept (marked unused) for when the LAPIC
- * timer replaces the PIT as the scheduler tick source. */
-__attribute__((unused)) static u32 apic_timer_calibrate(void) {
-    u32 max_count = 0xFFFFFFFF;
+/* LAPIC-timer frequency, calibrated at lapic_init via the PIT (A2 audit item).
+ * Replaces the previous busy-loop "calibration" that was tied to the host
+ * CPU's pause-loop speed rather than wall-clock time. Stored as ticks per
+ * millisecond so callers (AP per-CPU ticks once we switch the scheduler off
+ * the PIT) can derive any cadence. 0 means uncalibrated. */
+static u32 g_lapic_ticks_per_ms = 0;
+
+u32 lapic_ticks_per_ms(void) {
+    return g_lapic_ticks_per_ms;
+}
+
+/* PIT channel 2 (the speaker timer) — runs at 1193182 Hz, doesn't raise IRQ0,
+ * and is independent of channel 0 (which the scheduler ticks at TIMER_HZ).
+ * Bit 0 of port 0x61 gates the counter; bit 5 mirrors PIT2 OUT (high when the
+ * count reaches zero in mode 0). */
+#define PIT2_CHANNEL  0x42
+#define PIT2_COMMAND  0x43
+#define PIT2_GATE     0x61
+#define PIT_HZ        1193182U
+
+extern u8 inb(u16 port);
+extern void outb(u16 port, u8 value);
+
+static void apic_timer_calibrate_against_pit(void) {
+    /* 1) Quiesce: disable speaker, disable gate. */
+    u8 gate = inb(PIT2_GATE);
+    outb(PIT2_GATE, (u8)(gate & ~0x03));
+
+    /* 2) Program PIT2 for mode 0 (interrupt on terminal count), binary,
+     *    lobyte+hibyte access, channel 2: 0b10110000 = 0xB0. */
+    outb(PIT2_COMMAND, 0xB0);
+
+    /* 3) Pick a count that produces ~10 ms: 11932 / 1193182 Hz ≈ 10 ms.
+     *    Avoid 0 (= 65536). */
+    const u32 pit_count = 11932;
+    outb(PIT2_CHANNEL, (u8)(pit_count & 0xFF));
+    outb(PIT2_CHANNEL, (u8)((pit_count >> 8) & 0xFF));
+
+    /* 4) Arm LAPIC timer: one-shot, divide by 16, masked vector, max init. */
     lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
-    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_ONESHOT);
-    lapic_write(LAPIC_TIMER_INITCNT, max_count);
-    (void)lapic_read(LAPIC_TIMER_CURCNT); /* reset counter */
-    for (volatile int i = 0; i < 10000000; i++)
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED | LAPIC_LVT_ONESHOT);
+
+    /* 5) Open the gate (bit 0) — this starts both counters in lock-step.
+     *    Setting INITCNT and the gate back-to-back keeps the window tight. */
+    outb(PIT2_GATE, (u8)((gate & ~0x02) | 0x01));
+    lapic_write(LAPIC_TIMER_INITCNT, 0xFFFFFFFFU);
+
+    /* 6) Wait for PIT2 OUT to go high (count reached zero). */
+    while ((inb(PIT2_GATE) & 0x20) == 0)
         __asm__ volatile("pause");
+
+    /* 7) Snapshot LAPIC remaining count, then mask the timer. */
     u32 end = lapic_read(LAPIC_TIMER_CURCNT);
-    u32 elapsed = max_count - end;
     lapic_write(LAPIC_LVT_TIMER, LAPIC_LVT_MASKED);
-    console_write("lapic: timer calibration ~");
-    console_write_dec(elapsed);
-    console_write(" ticks per 10ms\n");
-    return elapsed ? elapsed : 100000;
+    /* Restore PIT2 gate to whatever it was (speaker off either way). */
+    outb(PIT2_GATE, (u8)(gate & ~0x03));
+
+    /* 8) LAPIC ticks consumed during ~10 ms, scaled to per-ms.
+     *    (max - end) / 10 — divide-by-16 already applied at LVT level. */
+    u32 elapsed = 0xFFFFFFFFU - end;
+    g_lapic_ticks_per_ms = elapsed / 10U;
+
+    console_write("lapic: calibrated against PIT: ");
+    console_write_dec(g_lapic_ticks_per_ms);
+    console_write(" ticks/ms (div=16)\n");
 }
 
 /* Bring up Application Processors.
@@ -378,57 +440,89 @@ int smp_boot_aps(void) {
     console_write_hex64(pml4_phys);
     console_write("\n");
 
-    /* Determine number of CPUs from CPUID.
+    /* Build the AP bring-up list.
      *
-     * Leaf 0x0B (extended topology) returns, per subleaf, the level type in
-     * ECX[15:8] (0 = invalid/last) and the number of logical processors at
-     * that level in EBX[15:0]. The TOTAL logical-processor count is the EBX of
-     * the highest valid level, so we iterate subleaves and take the max EBX —
-     * NOT subleaf 0 (that is the SMT level, e.g. 1 thread/core). The old code
-     * read subleaf 0 and gated on ECX[7:0] (the echoed subleaf number, always
-     * 0 for subleaf 0), so it never detected APs. */
-    u32 max_leaf;
-    __asm__ volatile("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
-    u32 cpu_count = 1;
-    if (max_leaf >= 0x0B) {
-        for (u32 sub = 0; sub < 8; sub++) {
-            u32 eax, ebx, ecx, edx;
-            __asm__ volatile("cpuid"
-                             : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
-                             : "a"(0x0B), "c"(sub));
-            u32 level_type = (ecx >> 8) & 0xFF;
-            if (level_type == 0)
-                break;  /* no more valid topology levels */
-            u32 logical = ebx & 0xFFFF;
-            if (logical > cpu_count)
-                cpu_count = logical;
-        }
-    }
-    /* Fallback for CPUs/QEMU configs without a useful leaf 0x0B: the legacy
-     * logical-processor count in CPUID.1 EBX[23:16] (valid when HTT is set). */
-    if (cpu_count <= 1) {
-        u32 a, b, c, d;
-        __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1));
-        if (d & (1u << 28)) {
-            u32 lpc = (b >> 16) & 0xFF;
-            if (lpc > cpu_count)
-                cpu_count = lpc;
-        }
-    }
-    if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
-    console_write("smp: CPUID reports ");
-    console_write_dec(cpu_count);
-    console_write(" logical processors\n");
+     * Preferred source: ACPI MADT (real firmware-discovered APIC IDs, no
+     * assumption that they are 0..N-1 contiguous). Fall back to CPUID-derived
+     * count + the QEMU-style contiguous-APIC-ID assumption when ACPI is
+     * unavailable. The BSP's APIC ID is filtered out: we are it.
+     */
+    u32 bsp_apic = lapic_id();
+    u32 ap_apic_ids[MAX_CPUS];
+    u32 ap_to_bring_up = 0;
 
-    /* If only 1 CPU, nothing to do */
-    if (cpu_count <= 1) {
+    if (acpi_ready() && acpi_cpu_count() > 0) {
+        int total = acpi_cpu_count();
+        for (int i = 0; i < total && ap_to_bring_up < MAX_CPUS - 1; i++) {
+            const struct acpi_cpu_entry *c = acpi_cpu(i);
+            if (!c || !c->enabled)
+                continue;
+            if ((u32)c->apic_id == bsp_apic)
+                continue;
+            ap_apic_ids[ap_to_bring_up++] = (u32)c->apic_id;
+        }
+        console_write("smp: ACPI MADT lists ");
+        console_write_dec(total);
+        console_write(" CPUs, ");
+        console_write_dec(ap_to_bring_up);
+        console_write(" APs to bring up\n");
+    } else {
+        /* CPUID fallback (legacy path).
+         *
+         * Leaf 0x0B (extended topology) returns, per subleaf, the level type
+         * in ECX[15:8] (0 = invalid/last) and the number of logical processors
+         * at that level in EBX[15:0]. The TOTAL logical-processor count is the
+         * EBX of the highest valid level. */
+        u32 max_leaf;
+        __asm__ volatile("cpuid" : "=a"(max_leaf) : "a"(0) : "ebx", "ecx", "edx");
+        u32 cpu_count = 1;
+        if (max_leaf >= 0x0B) {
+            for (u32 sub = 0; sub < 8; sub++) {
+                u32 eax, ebx, ecx, edx;
+                __asm__ volatile("cpuid"
+                                 : "=a"(eax), "=b"(ebx), "=c"(ecx), "=d"(edx)
+                                 : "a"(0x0B), "c"(sub));
+                u32 level_type = (ecx >> 8) & 0xFF;
+                if (level_type == 0)
+                    break;
+                u32 logical = ebx & 0xFFFF;
+                if (logical > cpu_count)
+                    cpu_count = logical;
+            }
+        }
+        if (cpu_count <= 1) {
+            u32 a, b, c, d;
+            __asm__ volatile("cpuid" : "=a"(a), "=b"(b), "=c"(c), "=d"(d) : "a"(1));
+            if (d & (1u << 28)) {
+                u32 lpc = (b >> 16) & 0xFF;
+                if (lpc > cpu_count)
+                    cpu_count = lpc;
+            }
+        }
+        if (cpu_count > MAX_CPUS) cpu_count = MAX_CPUS;
+        console_write("smp: CPUID reports ");
+        console_write_dec(cpu_count);
+        console_write(" logical processors (ACPI absent)\n");
+
+        /* Assume APIC IDs are 0..cpu_count-1 (true on QEMU and most desktops). */
+        for (u32 id = 0; id < cpu_count && ap_to_bring_up < MAX_CPUS - 1; id++) {
+            if (id == bsp_apic) continue;
+            ap_apic_ids[ap_to_bring_up++] = id;
+        }
+    }
+
+    /* If only BSP, nothing to do */
+    if (ap_to_bring_up == 0) {
         console_write("smp: single CPU mode\n");
         return 1;
     }
 
-    /* Bring up APs one by one */
-    for (u32 apic_id = 1; apic_id < cpu_count; apic_id++) {
-        int cpu_id = (int)apic_id;
+    /* Bring up APs one by one. cpu_id is a contiguous index assigned in the
+     * order APs successfully come online; apic_id is the firmware-discovered
+     * physical APIC ID (the value the LAPIC ICR/MMIO actually wants). */
+    for (u32 i = 0; i < ap_to_bring_up; i++) {
+        u32 apic_id = ap_apic_ids[i];
+        int cpu_id = (int)(i + 1);
         console_write("smp: bringing up AP apic_id=");
         console_write_dec(apic_id);
         console_write(" cpu_id=");
@@ -449,7 +543,10 @@ int smp_boot_aps(void) {
         u64 stack_top = ((u64)(usize)stack + 16384) & ~0xFULL;
         pcpu->kernel_stack_virt = stack_top;
 
-        ap_cpu_data[apic_id] = pcpu;
+        /* Index the per-CPU table by the contiguous cpu_id, not the
+         * (potentially sparse) APIC ID — get_percpu_n(idx) walks idx
+         * 0..MAX_CPUS-1 as a CPU number. */
+        ap_cpu_data[cpu_id] = pcpu;
 
         /* Setup trampoline at 0x8000 */
         smp_setup_trampoline(pml4_phys, stack_top, (u64)(usize)pcpu, cpu_id);
@@ -506,6 +603,9 @@ ap_done:
     console_write("smp: total CPUs: ");
     console_write_dec(ap_count + 1);
     console_write("\n");
+    /* Publish the runtime CPU count for loop-bound consumers (work-stealing,
+     * IPI fan-outs, etc.) so they don't always walk to MAX_CPUS. */
+    g_max_cpus = ap_count + 1;
     return ap_count + 1;
 }
 
@@ -526,11 +626,14 @@ struct percpu *get_percpu_n(int idx)
     return p;
 }
 
-/* Returns total number of online CPUs (BSP + APs). */
+/* Returns total number of online CPUs (BSP + APs). Bounded by the runtime
+ * CPU count instead of MAX_CPUS so big-ceiling configs don't pay a 64-slot
+ * scan on small machines. */
 int get_online_cpu_count(void)
 {
     int count = boot_cpu_data.cpu_online ? 1 : 0;
-    for (int i = 1; i < MAX_CPUS; i++) {
+    int upper = g_max_cpus < MAX_CPUS ? g_max_cpus : MAX_CPUS;
+    for (int i = 1; i < upper; i++) {
         struct percpu *p = ap_cpu_data[i];
         if (p && p->cpu_online)
             count++;

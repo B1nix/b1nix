@@ -135,11 +135,12 @@ gdt64:
 	.quad 0x00affa000000ffff /* 0x20: User Code (Ring 3) */
 .global gdt64_tss
 gdt64_tss:
-	/* One 16-byte (2-quad) TSS descriptor per CPU, MAX_CPUS=16 slots. The BSP
+	/* One 16-byte (2-quad) TSS descriptor per CPU, MAX_CPUS=64 slots. The BSP
 	 * uses selector 0x28; CPU k uses 0x28 + k*16. All filled in at runtime by
 	 * arch.c (x86_tss_init_cpu). Reserving them up front keeps every CPU's TSS
-	 * descriptor in the one shared GDT so APs can run ring 3. */
-	.fill 32, 8, 0
+	 * descriptor in the one shared GDT so APs can run ring 3. Keep this in
+	 * sync with MAX_CPUS in kernel/include/b1nix/lapic.h — 128 quads = 64*2. */
+	.fill 128, 8, 0
 gdt64_end:
 .global gdt64_pointer
 gdt64_pointer:

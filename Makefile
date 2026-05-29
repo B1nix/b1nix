@@ -104,6 +104,8 @@ KERNEL_SOURCES := \
 	kernel/fs/btrfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
+	kernel/dev/acpi.c \
+	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
 	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
@@ -263,6 +265,12 @@ $(INITRAMFS_M27_SMOKE_INC): userspace/bin/m27_smoke.c $(USERSPACE_DEPS)
 # ── AP Trampoline (flat binary linked at 0x8000) ──
 AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86/ap_trampoline_tmp.o
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
+# ld.lld defaults its image base to 0x200000 and rejects -Ttext 0x8000 unless
+# we pin the image base to 0. GNU ld doesn't recognise --image-base; pass it
+# only when LD is lld.
+ifneq (,$(findstring lld,$(LD)))
+AP_IMAGE_BASE := --image-base=0
+endif
 
 $(AP_TRAMP_OBJ): kernel/arch/x86/ap_trampoline.S
 	@mkdir -p $(dir $@)

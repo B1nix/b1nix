@@ -64,7 +64,7 @@ void sched_rq_enqueue_current(struct task *t) {
 struct task *sched_steal_task(void) {
     struct percpu *self = get_percpu();
 
-    for (int i = 0; i < MAX_CPUS; i++) {
+    for (int i = 0; i < g_max_cpus; i++) {
         struct percpu *victim = get_percpu_n(i);
 
         /* Skip: CPU not online, is ourselves, or has empty queue */
