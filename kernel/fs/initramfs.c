@@ -67,12 +67,19 @@ static const char initramfs_passwd[] =
     "root:x:0:0:root:/root:/bin/sh\n"
     "user:x:1000:1000:b1nix user:/home/user:/bin/sh\n";
 
-/* Boot rc script: init runs this once at startup, before the login shell. */
+/* Boot rc script: init runs this once at startup, before the login shell.
+ * The /persist block is first-boot setup for the persistent root image; it is
+ * inert when /persist is not mounted (e.g. the smoke harness uses its own
+ * drives) and idempotent afterwards via the .b1nix-setup marker. */
 static const char initramfs_rc[] =
     "#!/bin/sh\n"
     "# b1nix boot rc script - runs once at startup, before the login shell.\n"
     "echo \"M27-INIT: rc-script start\"\n"
     "[ -f /etc/motd ] && cat /etc/motd\n"
+    "[ -d /persist ] && [ ! -f /persist/.b1nix-setup ] && mkdir -p /persist/home "
+    "&& mkdir -p /persist/etc && mkdir -p /persist/tmp "
+    "&& echo ready > /persist/.b1nix-setup "
+    "&& echo \"M27-INIT: first-boot /persist initialised\"\n"
     "echo \"M27-INIT: ok rc-script\"\n";
 
 static const char posix_smoke_script[] =

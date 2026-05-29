@@ -469,6 +469,7 @@ fi
 # ── M27 Terminal OS Polish: kernel command line parsing ──
 check_output "$LOG" "M27-CMDLINE: ok kv-parse" "kernel command line key=value parser works"
 check_output "$LOG" "M27-INIT: ok rc-script" "boot rc script runs via /bin/sh"
+check_output "$LOG" "M27-INIT: first-boot /persist initialised" "first-boot persistent-root setup runs"
 check_output "$LOG" "M27-USER: ok getpwnam-root" "getpwnam parses root from /etc/passwd"
 check_output "$LOG" "M27-USER: ok getpwnam-user" "getpwnam parses a non-root user from /etc/passwd"
 check_output "$LOG" "M27-USER: ok getpwuid" "getpwuid resolves uid to name"
