@@ -145,7 +145,65 @@ position is exact and multi-batch directory reads are correct. (Surfaced as a
 spurious `M26-SMOKE: fail readdir` once `/bin` crossed 32 entries.) Also dropped
 three pre-existing unused static locks in vfs.c to keep the build warning-free.
 
-## Remaining M27 items (planned)
+## No-graphics as a first-class target — DONE (2026-05-29)
 
-usage docs · no-graphics first-class · first-boot persistent-root setup ·
-POSIX compatibility matrix.
+b1nix is fully usable over a text/serial console with no framebuffer: all
+kernel and userspace I/O goes to COM1 (the smoke harness itself runs
+`-display none`), the shell, coreutils, editor (`ne`) and the toolchain are all
+text-mode, and the kernel boots without a GRUB framebuffer tag. The graphical
+file manager `/bin/mc` is the only GUI surface and is strictly opt-in
+(`b1nix.ui=1`). `b1nix.nographics` (or `nographics`) on the kernel command line
+forces text mode and is honoured by `init_main` even if `b1nix.ui=1` is also
+present, so a headless boot never tries to start the GUI. The single-user
+GRUB / `b1nix.single` path is likewise pure text.
+
+## First-boot setup for persistent root images — DONE (2026-05-29)
+
+`make root-image` builds an ext4 image that the kernel mounts at `/persist`
+(from `virtio-blk0`) when present. The boot rc script (`/etc/rc`) now performs
+**first-boot initialisation**: if `/persist` is mounted and the
+`/persist/.b1nix-setup` marker is absent, it creates `home`/`etc`/`tmp` under
+`/persist` and writes the marker, so the structure is laid down once and skipped
+on every later boot. The block is guarded by `[ -d /persist ]`, so it is inert
+when `/persist` is not mounted (the smoke harness attaches its own SATA/NVMe/swap
+drives and no `/persist`), which is why it has no dedicated smoke marker — the
+surrounding `M27-INIT: ok rc-script` still proves the script (including these
+lines) parses and runs.
+
+## Everyday usage: boot → edit → build
+
+1. **Boot.** `make iso` then run under QEMU. GRUB shows three entries (normal,
+   single-user/emergency, text-mode/no-graphics — build with `GRUB_TIMEOUT=5`
+   to see the menu). Useful kernel command line options:
+   `init=<path>` (override the first program), `b1nix.single` (emergency root
+   shell), `b1nix.nographics` (force text mode), `b1nix.login` (login prompt),
+   `b1nix.ui=1` (launch `/bin/mc`).
+2. **Log in.** With `b1nix.login`, `/bin/login` prompts for a user (`root` or
+   `user` from `/etc/passwd`), drops to their uid/gid and starts their shell.
+   Otherwise you land directly in `/bin/sh`.
+3. **Explore / edit.** Standard tools: `ls`, `cat`, `cp`, `mv`, `rm`, `mkdir`,
+   `grep`, `sort`, `ps`, pipes/redirection, plus the `ne` text editor and the
+   `mc` file manager. The shell supports scripts (`/bin/sh script.sh`).
+4. **Build.** The ported native toolchain (`gcc`, `as`, `ld`, GNU `make` — see
+   [`m26-selfhost.md`](m26-selfhost.md)) compiles and links C programs in-guest;
+   `tcc` is also available. Work on `/persist` to keep results across reboots.
+5. **Shut down.** `poweroff` / `halt` / `reboot` (or `shutdown`).
+
+## POSIX compatibility matrix
+
+See [`posix-requirements.md`](posix-requirements.md) for the authoritative
+per-requirement contract and [`posix-branches.md`](posix-branches.md) for
+status. High-level summary (from [`roadmap.md`](roadmap.md)): overall ~70-78%;
+VFS/path ~90-95%; shell/coreutils ~80-85%. Quick matrix of the areas M27
+touches:
+
+| Area | Status | Notes |
+|------|--------|-------|
+| Process/signals (fork/exec/wait, kill, sigaction) | good | M12/M13 |
+| Userspace ABI + libc (stdio, string, unistd, dirent, pwd) | good | M13/M26 |
+| VFS / readdir / getdents | good | multi-batch readdir fixed in M27 |
+| Filesystems (ext2/3/4, fat32, initramfs) | partial | no metadata_csum/64bit/flex_bg |
+| Job control / termios | partial | M13-JC |
+| Users / passwd / login | initial | `/etc/passwd` + `getpwnam`; no password check or shadow |
+| Networking (ARP/ICMP/UDP/TCP) | partial | TCP baseline only |
+| Shutdown / reboot | good | restart + ACPI poweroff (M27) |
