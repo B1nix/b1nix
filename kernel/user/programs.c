@@ -3345,6 +3345,18 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m26_pid, (u64)(usize)&m26_status, 0, 0, 0, 0);
   }
 
+  /* M29: POSIX threads / futex / TLS. */
+  {
+    u64 m29_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m29-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m29_pid < 0) {
+      uwrite("M29-PTHREAD: spawn-fail\n");
+    } else {
+      int m29_status = 0;
+      syscall_dispatch(SYS_WAIT, m29_pid, (u64)(usize)&m29_status, 0, 0, 0, 0);
+    }
+  }
+
   uwrite("M16-SMOKE: start\n");
   struct b1nix_termios m16_termios_before;
   memset(&m16_termios_before, 0, sizeof(m16_termios_before));

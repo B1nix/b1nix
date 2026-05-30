@@ -15,6 +15,7 @@ INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
 INITRAMFS_M26_SMOKE_INC := $(BUILD_DIR)/initramfs_m26_smoke.inc
 INITRAMFS_M24B_SMOKE_INC := $(BUILD_DIR)/initramfs_m24b_smoke.inc
 INITRAMFS_M27_SMOKE_INC := $(BUILD_DIR)/initramfs_m27_smoke.inc
+INITRAMFS_M29_SMOKE_INC := $(BUILD_DIR)/initramfs_m29_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -117,6 +118,7 @@ KERNEL_SOURCES := \
 	kernel/sched/lockdep.c \
 	kernel/sched/smp_test.c \
 	kernel/sched/m28_ctxbench.c \
+	kernel/sched/futex.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/busybox.c \
@@ -186,7 +188,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -263,6 +265,11 @@ $(INITRAMFS_M27_SMOKE_INC): userspace/bin/m27_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m27_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m27_smoke_elf userspace/build/bin/m27_smoke > $@
+
+$(INITRAMFS_M29_SMOKE_INC): userspace/bin/m29_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m29_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m29_smoke_elf userspace/build/bin/m29_smoke > $@
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──

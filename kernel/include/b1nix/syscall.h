@@ -122,7 +122,27 @@ enum {
 	SYS_IO_GETEVENTS = 103,
 	SYS_SIGPROCMASK = 104,
 	SYS_GETCPU   = 105,
+
+	/* --- M29: Threads, Futex, TLS --- */
+	SYS_CLONE        = 106,
+	SYS_FUTEX        = 107,
+	SYS_SET_TLS      = 108,
+	SYS_GETTID       = 109,
+	SYS_EXIT_THREAD  = 110,
 };
+
+/* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
+#define B1NIX_CLONE_VM       0x00000100
+#define B1NIX_CLONE_FS       0x00000200
+#define B1NIX_CLONE_FILES    0x00000400
+#define B1NIX_CLONE_SIGHAND  0x00000800
+#define B1NIX_CLONE_THREAD   0x00010000
+#define B1NIX_CLONE_SETTLS   0x00080000
+#define B1NIX_CLONE_CHILD_CLEARTID 0x00200000
+
+/* Linux-compatible FUTEX_* op codes (subset). */
+#define B1NIX_FUTEX_WAIT 0
+#define B1NIX_FUTEX_WAKE 1
 
 /* SYS_REBOOT commands (arg0). */
 #define B1NIX_REBOOT_RESTART  0
