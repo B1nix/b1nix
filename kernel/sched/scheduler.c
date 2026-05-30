@@ -49,7 +49,8 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
 #define TASK_ENV_VALUE_MAX 64
 
 extern void arch_context_switch(struct cpu_context *old_context,
-                                struct cpu_context *new_context);
+                                struct cpu_context *new_context,
+                                volatile int *released_publish);
 extern char x86_syscall_stack_top[];
 
 /* x86 FPU/SSE save/restore (kernel/arch/x86/fpu.S). The kernel is -mno-sse, so
@@ -863,7 +864,8 @@ int scheduler_yield(void) {
     new_task->fpu_initialized = 1;
   }
 
-  arch_context_switch(&old_task->context, &new_task->context);
+  arch_context_switch(&old_task->context, &new_task->context,
+                      &old_task->stack_released);
   interrupts_enable();
   return 1; /* we switched out and have since been resumed (BKL held, depth 1) */
 }
@@ -1042,6 +1044,12 @@ void scheduler_exit_current(int exit_code) {
   aio_task_cleanup(current_task);
 
   current_task->exit_code = exit_code;
+  /* F-tier T4 prerequisite: claim stack_released BEFORE publishing DEAD.
+   * x86 TSO orders the stores, so any CPU that observes state == DEAD also
+   * observes stack_released == 0 — its waitpid path will spin on the
+   * stack_released flag until arch_context_switch publishes 1 after the
+   * RSP swap below. See struct task::stack_released in sched.h. */
+  current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
 
   // Wake up parent if it is blocked waiting for us
@@ -1113,6 +1121,23 @@ int scheduler_waitpid(usize pid, int *status, int options) {
                                           TASK_REAPING, 0,
                                           __ATOMIC_ACQUIRE,
                                           __ATOMIC_RELAXED)) {
+            /* F-tier T4 prerequisite: the child's kernel_stack is still
+             * being used as RSP on whatever CPU ran exit_current →
+             * scheduler_yield up until arch_context_switch's RSP swap.
+             * Spin until that swap has published stack_released==1 — see
+             * struct task::stack_released in sched.h.
+             *
+             * The child set stack_released=0 BEFORE state=DEAD (x86 TSO
+             * orders the two stores), so observing state==DEAD here
+             * guarantees we will observe a 0 first and then transition to
+             * 1 once the child's CPU finishes context_switch. The CAS
+             * above used __ATOMIC_ACQUIRE, which pairs with the implicit
+             * release of the asm's `movl $1, (%rdx)` after the RSP swap. */
+            while (!__atomic_load_n(&T(i)->stack_released,
+                                    __ATOMIC_ACQUIRE)) {
+              __asm__ volatile("pause");
+            }
+
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
             if (T(i)->user_image) {
@@ -1758,6 +1783,8 @@ void scheduler_deliver_pending_signals(void) {
     if (sig == SIGKILL) {
       /* SIGKILL — terminate immediately */
       current_task->exit_code = 128 + SIGKILL;
+      /* See scheduler_exit_current — claim stack_released before DEAD. */
+      current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
       for (usize i = 0; i < g_task_hwm; i++) {
         if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
@@ -1793,6 +1820,8 @@ void scheduler_deliver_pending_signals(void) {
       case SIGPROF:
         /* Terminate */
         current_task->exit_code = 128 + sig;
+        /* See scheduler_exit_current — claim stack_released before DEAD. */
+        current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
         for (usize i = 0; i < g_task_hwm; i++) {
           if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
