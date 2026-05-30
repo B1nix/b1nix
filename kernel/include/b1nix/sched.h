@@ -225,6 +225,20 @@ struct task {
   struct task *next_run;
 };
 
+/* M29: per-task thread metadata stored in parallel side-tables indexed by
+ * the task's slot index in the chunked g_task_chunks[]. Kept out of struct
+ * task itself because adding fields to that struct broke an unrelated
+ * paging invariant on M14 (LAPIC PT became unreachable from user pml4
+ * after kheap allocation order shifted; the root cause is a pre-existing
+ * latent issue that surfaces only when struct task grows). Accessors live
+ * in kernel/sched/scheduler.c. */
+int  task_is_thread(const struct task *t);
+void task_set_is_thread(struct task *t, int v);
+u64  task_tls_base(const struct task *t);
+void task_set_tls_base(struct task *t, u64 base);
+u64  task_child_tid_clear(const struct task *t);
+void task_set_child_tid_clear(struct task *t, u64 addr);
+
 /* Per-CPU current task. `current_task` is the task running on THIS CPU; each
  * core has its own slot in struct percpu (cur_task), so APs and the BSP never
  * share one "current". Expands to an lvalue, so existing reads/writes
@@ -256,6 +270,35 @@ void smp_selftest_run(void);
  * test mode only. See kernel/sched/m28_ctxbench.c for what's measured. */
 void m28_ctxbench_run(void);
 int scheduler_fork_current(void);
+
+/* M29: SYS_CLONE entry. Creates a new task that runs `entry(arg)` in ring 3
+ * on the provided user stack. `flags` is a B1NIX_CLONE_* bitmask. Returns
+ * the new task id (TID) on success, or -errno on failure.
+ *
+ * Supported flags:
+ *   CLONE_VM       — share parent's pml4 + vma_list + user_image (no copy).
+ *   CLONE_FS       — share cwd / umask / env (no copy).
+ *   CLONE_FILES    — share fd_table / fd_flags / fd_capacity (no copy).
+ *   CLONE_SIGHAND  — copy parent's signal action table (b1nix has no per-
+ *                    process signal sharing yet; thread signals are best-
+ *                    effort).
+ *   CLONE_THREAD   — make parent_id = current's parent_id so waitpid skips
+ *                    this task (it is joined via futex on child_tid).
+ *   CLONE_SETTLS   — initialize tls_base from `tls`.
+ *   CLONE_CHILD_CLEARTID — store `ctid` and write 0 + futex_wake on exit.
+ */
+int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
+                           u64 tls, u64 ctid);
+
+/* M29: futex. op is B1NIX_FUTEX_WAIT or B1NIX_FUTEX_WAKE. Returns 0 on success,
+ * -errno otherwise. WAIT blocks if *uaddr == val; WAKE wakes up to val
+ * waiters on uaddr. */
+int scheduler_futex(u64 uaddr, int op, int val);
+void scheduler_futex_wake_addr(u64 uaddr, int val);
+
+/* M29: reap any DEAD thread tasks (created via SYS_CLONE with is_thread=1)
+ * whose kernel stack is no longer in use. Called from scheduler_yield. */
+void scheduler_reap_dead_threads(void);
 /* Cooperatively switch to another runnable task. Returns 1 if it context
  * switched (and has since been resumed), 0 if nothing was runnable. An idle
  * loop uses the 0 return to drop the Big Kernel Lock before parking. */

@@ -226,6 +226,22 @@ int munmap(void *addr, size_t length) {
   return _check_err(syscall(SYS_MUNMAP, addr, length));
 }
 
+/* M32: select() — fd-readiness multiplex. Converts tv to ms (with NULL ⇒
+ * wait forever, matching the b1nix poll convention). */
+#include <sys/select.h>
+int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
+           struct timeval *timeout) {
+  unsigned long ms;
+  if (!timeout) {
+    ms = (unsigned long)-1;
+  } else {
+    long total = timeout->tv_sec * 1000L + timeout->tv_usec / 1000L;
+    if (total < 0) total = 0;
+    ms = (unsigned long)total;
+  }
+  return _check_err(syscall(SYS_SELECT, nfds, readfds, writefds, exceptfds, ms));
+}
+
 int socket(int domain, int type, int protocol) {
   return _check_err(syscall(SYS_SOCKET, domain, type, protocol));
 }

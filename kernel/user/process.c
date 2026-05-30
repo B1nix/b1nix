@@ -27,7 +27,43 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define ELF_TYPE_DYN 3
 #define ELF_MACHINE_X86_64 0x3e
 #define ELF_MACHINE_AARCH64 0xb7
-#define PT_LOAD 1
+#define PT_LOAD    1
+#define PT_DYNAMIC 2
+#define PT_INTERP  3
+
+/* M30 — ELF64 dynamic-tag identifiers (subset honoured by the in-kernel
+ * loader). Standard `Elf64_Dyn` tag values. */
+#define DT_NULL    0
+#define DT_PLTRELSZ 2
+#define DT_RELA    7
+#define DT_RELASZ  8
+#define DT_RELAENT 9
+#define DT_JMPREL  23
+#define DT_PLTREL  20
+
+/* M30 — x86-64 ELF64 relocation types (subset). */
+#define R_X86_64_NONE     0
+#define R_X86_64_64       1
+#define R_X86_64_GLOB_DAT 6
+#define R_X86_64_JUMP_SLOT 7
+#define R_X86_64_RELATIVE 8
+
+struct elf64_rela {
+  u64 r_offset;
+  u64 r_info;
+  i64 r_addend;
+} __attribute__((packed));
+
+struct elf64_dyn {
+  i64 d_tag;
+  u64 d_val;
+} __attribute__((packed));
+
+/* M30 — base address at which PIE/ET_DYN images get loaded. Picked well
+ * above the standard 0x400000 ET_EXEC load base and below the user
+ * stack top (0x800000000000) so a PIE binary and the existing static
+ * binaries don't collide. */
+#define PIE_LOAD_BASE 0x0000500000000000ULL
 
 struct process_start {
   struct user_loaded_image *image;
@@ -310,14 +346,53 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
-  image->entry = ehdr->e_entry;
+
+  /* M30: PIE / ET_DYN support. For ET_DYN the segment vaddrs are 0-based
+   * and the loader gets to choose where to place the image. We use a
+   * fixed base (PIE_LOAD_BASE) — above the standard ET_EXEC load
+   * address (0x400000) so a PIE binary can coexist with statically-
+   * linked ones in the same userspace map. After segment loading we
+   * also walk PT_DYNAMIC and apply R_X86_64_RELATIVE relocations so
+   * absolute pointers in the binary (e.g. into .rodata or function
+   * tables) point at the relocated base. */
+  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+
+  image->entry = ehdr->e_entry + load_base;
   console_write("ELF load: ");
   console_write(path);
   console_write(" entry=0x");
-  console_write_hex64(ehdr->e_entry);
+  console_write_hex64(image->entry);
+  if (load_base) {
+    console_write(" (PIE base=0x");
+    console_write_hex64(load_base);
+    console_write(")");
+  }
   console_write("\n");
   image->address_space = user_address_space_create();
 
+  /* PT_INTERP: log which interpreter the binary asks for. With PIE +
+   * RELATIVE relocations the kernel does the relocation work itself; a
+   * proper userspace dynamic linker is still future work, so binaries
+   * that have undefined external symbols won't run. We accept the
+   * PT_INTERP segment as informational rather than rejecting outright. */
+  for (u16 j = 0; j < ehdr->e_phnum; j++) {
+    struct elf64_phdr *p =
+        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)j * ehdr->e_phentsize));
+    if (p->p_type != PT_INTERP) continue;
+    if (p->p_offset + p->p_filesz > file_size) continue;
+    char interp[64];
+    usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
+                                              : sizeof(interp) - 1;
+    memcpy(interp, file_data + p->p_offset, ilen);
+    interp[ilen] = '\0';
+    console_write("ELF load: PT_INTERP=");
+    console_write(interp);
+    console_write(" (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n");
+  }
+
+  /* First pass: PT_LOAD segments. Vaddrs are offset by `load_base` for
+   * PIE; this also offsets any later relocation targets we compute. */
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     struct elf64_phdr *phdr =
         (struct elf64_phdr *)(file_data + ehdr->e_phoff +
@@ -334,20 +409,21 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       kfree(file_data);
       return -1;
     }
-    if (phdr->p_vaddr + phdr->p_memsz < phdr->p_vaddr ||
-        phdr->p_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL) {
+    u64 reloc_vaddr = phdr->p_vaddr + load_base;
+    if (reloc_vaddr + phdr->p_memsz < reloc_vaddr ||
+        reloc_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL) {
       kfree(file_data);
       return -1;
     }
 
     struct user_image_segment *segment =
         &image->segments[image->segment_count++];
-    segment->vaddr = phdr->p_vaddr;
+    segment->vaddr = reloc_vaddr;
     segment->memsz = phdr->p_memsz;
     segment->filesz = phdr->p_filesz;
     segment->flags = phdr->p_flags;
 
-    /* FIX: Allocate only p_filesz to avoid huge memory allocations for .bss */
+    /* Allocate only p_filesz to avoid huge .bss kernel-heap allocations. */
     if (phdr->p_filesz > 0) {
       segment->data = kzalloc(phdr->p_filesz);
       if (!segment->data) {
@@ -360,8 +436,135 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     }
   }
 
+  /* Second pass: apply PIE relocations. Skipped for ET_EXEC since
+   * static binaries have no PT_DYNAMIC. Only R_X86_64_RELATIVE is
+   * handled — that covers PIE binaries with no external symbol
+   * references (the only flavour b1nix currently supports). */
+  if (load_base != 0) {
+    u64 rela_off = 0, rela_sz = 0;
+    u64 jmprel_off = 0, jmprel_sz = 0;
+    int jmprel_is_rela = 1;
+    for (u16 i = 0; i < ehdr->e_phnum; i++) {
+      struct elf64_phdr *phdr =
+          (struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                                ((u64)i * ehdr->e_phentsize));
+      if (phdr->p_type != PT_DYNAMIC) continue;
+      if (phdr->p_offset + phdr->p_filesz > file_size) continue;
+      struct elf64_dyn *dyn =
+          (struct elf64_dyn *)(file_data + phdr->p_offset);
+      usize ndyn = phdr->p_filesz / sizeof(struct elf64_dyn);
+      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
+        switch (dyn[d].d_tag) {
+          case DT_RELA:    rela_off = dyn[d].d_val; break;
+          case DT_RELASZ:  rela_sz = dyn[d].d_val; break;
+          case DT_JMPREL:  jmprel_off = dyn[d].d_val; break;
+          case DT_PLTRELSZ: jmprel_sz = dyn[d].d_val; break;
+          case DT_PLTREL:  jmprel_is_rela = (dyn[d].d_val == DT_RELA); break;
+        }
+      }
+      break;
+    }
+
+    /* Translate a PIE-relative virtual address to a kernel pointer into
+     * one of the staging buffers we just kzalloc'd. Returns 0 if the
+     * vaddr lies outside any loaded segment. */
+    #define VADDR_TO_STAGE(v, n) \
+      _vaddr_to_stage(image, (v) + load_base, (n))
+
+    /* Inline helper as a static-scope lambda-replacement. */
+    /* (declared inline above; body further down) */
+
+    /* Walk DT_RELA. */
+    if (rela_off && rela_sz) {
+      usize nrela = rela_sz / sizeof(struct elf64_rela);
+      struct elf64_rela *rela_arr = (struct elf64_rela *)0;
+      /* Find rela_arr in the file. The DT_RELA address is a PIE vaddr;
+       * convert it to a staging-buffer pointer. We use a small helper. */
+      for (usize r = 0; r < nrela; r++) {
+        /* Read the rela entry out of the staging buffer (kernel-mapped
+         * pre-relocation snapshot of the segments). */
+        u8 *rela_stage = 0;
+        for (usize s = 0; s < image->segment_count; s++) {
+          u64 sv = image->segments[s].vaddr;
+          u64 sf = image->segments[s].filesz;
+          u64 target = rela_off + load_base + r * sizeof(struct elf64_rela);
+          if (target >= sv && target + sizeof(struct elf64_rela) <= sv + sf) {
+            rela_stage = (u8 *)image->segments[s].data + (target - sv);
+            break;
+          }
+        }
+        if (!rela_stage) continue;
+        struct elf64_rela rr;
+        memcpy(&rr, rela_stage, sizeof(rr));
+        u32 type = (u32)(rr.r_info & 0xffffffff);
+        if (type != R_X86_64_RELATIVE) continue;
+        u64 target_va = rr.r_offset + load_base;
+        u64 value = (u64)((i64)load_base + rr.r_addend);
+        /* Find the segment that contains target_va and write `value`
+         * into the staging buffer at the appropriate offset. */
+        for (usize s = 0; s < image->segment_count; s++) {
+          u64 sv = image->segments[s].vaddr;
+          u64 sf = image->segments[s].filesz;
+          if (target_va >= sv && target_va + 8 <= sv + sf) {
+            memcpy((u8 *)image->segments[s].data + (target_va - sv), &value, 8);
+            break;
+          }
+        }
+      }
+    }
+
+    /* DT_JMPREL (PLT relocations) — same shape, applied separately. */
+    if (jmprel_off && jmprel_sz && jmprel_is_rela) {
+      usize nrela = jmprel_sz / sizeof(struct elf64_rela);
+      for (usize r = 0; r < nrela; r++) {
+        u8 *rela_stage = 0;
+        for (usize s = 0; s < image->segment_count; s++) {
+          u64 sv = image->segments[s].vaddr;
+          u64 sf = image->segments[s].filesz;
+          u64 target = jmprel_off + load_base + r * sizeof(struct elf64_rela);
+          if (target >= sv && target + sizeof(struct elf64_rela) <= sv + sf) {
+            rela_stage = (u8 *)image->segments[s].data + (target - sv);
+            break;
+          }
+        }
+        if (!rela_stage) continue;
+        struct elf64_rela rr;
+        memcpy(&rr, rela_stage, sizeof(rr));
+        u32 type = (u32)(rr.r_info & 0xffffffff);
+        if (type != R_X86_64_RELATIVE) continue;
+        u64 target_va = rr.r_offset + load_base;
+        u64 value = (u64)((i64)load_base + rr.r_addend);
+        for (usize s = 0; s < image->segment_count; s++) {
+          u64 sv = image->segments[s].vaddr;
+          u64 sf = image->segments[s].filesz;
+          if (target_va >= sv && target_va + 8 <= sv + sf) {
+            memcpy((u8 *)image->segments[s].data + (target_va - sv), &value, 8);
+            break;
+          }
+        }
+      }
+    }
+    #undef VADDR_TO_STAGE
+  }
+
   kfree(file_data);
   return image->segment_count > 0 ? 0 : -1;
+}
+
+/* Helper referenced by VADDR_TO_STAGE — kept out-of-line to keep the
+ * loader body readable. (Currently unused after the inlined searches
+ * above, but retained for the next iteration when relocations become
+ * symbol-aware.) */
+__attribute__((unused))
+static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n) {
+  for (usize s = 0; s < image->segment_count; s++) {
+    u64 sv = image->segments[s].vaddr;
+    u64 sf = image->segments[s].filesz;
+    if (va >= sv && va + n <= sv + sf) {
+      return (u8 *)image->segments[s].data + (va - sv);
+    }
+  }
+  return 0;
 }
 
 void user_image_free(struct user_loaded_image *image) {
@@ -541,7 +744,20 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   if (user_try_run_b1nxexec_image(image, &compat_code))
     return compat_code;
 
-  /* Map segments into the address space */
+  /* Map segments into the address space. PIE/ET_DYN binaries can have
+   * multiple PT_LOAD segments share the same 4 KB page (e.g. .data +
+   * .dynamic both starting at vaddr 0x1000 + 0x10d0). We track which
+   * vaddrs we've already mapped this image and reuse those frames so
+   * the later segment's copy doesn't overwrite the earlier one with a
+   * fresh zero page. Tracked locally rather than via vmm_virt_to_phys
+   * because the user pml4 also inherits the kernel's low-4GB identity
+   * map (PML4[0]) — `vmm_virt_to_phys((void *)0x2000000)` would return
+   * the identity-mapped phys frame and we'd corrupt physical memory. */
+  #define MAX_MAPPED_PAGES 64
+  u64 mapped_va[MAX_MAPPED_PAGES];
+  u64 mapped_frame[MAX_MAPPED_PAGES];
+  usize n_mapped = 0;
+
   for (usize i = 0; i < image->segment_count; i++) {
     struct user_image_segment *segment = &image->segments[i];
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
@@ -550,18 +766,27 @@ static int user_run_elf_image(struct user_loaded_image *image) {
 
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
-      u64 frame = pmm_alloc_frame();
-      if (!frame)
-        return -ENOMEM;
+      u64 frame = 0;
+      for (usize m = 0; m < n_mapped; m++) {
+        if (mapped_va[m] == v) { frame = mapped_frame[m]; break; }
+      }
+      if (!frame) {
+        frame = pmm_alloc_frame();
+        if (!frame)
+          return -ENOMEM;
+        u64 flags = VMM_USER | VMM_WRITABLE;
+        vmm_map_page(v, frame, flags);
+        memset((void *)(usize)(direct_base + frame), 0, PAGE_SIZE);
+        if (n_mapped < MAX_MAPPED_PAGES) {
+          mapped_va[n_mapped] = v;
+          mapped_frame[n_mapped] = frame;
+          n_mapped++;
+        }
+      }
 
-      u64 flags = VMM_USER | VMM_WRITABLE; // Simplify for now
-      vmm_map_page(v, frame, flags);
-
-      /* Clear page to avoid leaking kernel data and to handle .bss */
       u64 direct_v = direct_base + frame;
-      memset((void *)(usize)direct_v, 0, PAGE_SIZE);
 
-      /* Copy data if within filesz */
+      /* Copy this segment's slice into the page at the appropriate offset. */
       u64 page_offset = 0;
       if (v < segment->vaddr)
         page_offset = segment->vaddr - v;
