@@ -1,5 +1,6 @@
 #include <b1nix/bkl.h>
 #include <b1nix/lapic.h>
+#include <b1nix/lockdep.h>
 #include <b1nix/spinlock.h>
 
 /* Underlying test-and-set lock plus owner/depth bookkeeping. owner == -1 means
@@ -45,6 +46,9 @@ void bkl_lock(void) {
         if (spin_xchg(&g_bkl, 1) == 0) {
             g_bkl_owner = cpu;
             g_bkl_depth = 1;
+            /* Lockdep tracks only the outermost acquire — recursive
+             * re-entry by the same CPU doesn't push a second frame. */
+            LOCKDEP_ACQUIRE(LOCKDEP_LVL_BKL);
             irq_restore(fl);
             return;
         }
@@ -59,6 +63,7 @@ void bkl_unlock(void) {
                                     * this store ordered ahead of the unlock) */
         __asm__ volatile("" : : : "memory");
         g_bkl = 0;                 /* release */
+        LOCKDEP_RELEASE(LOCKDEP_LVL_BKL);
     }
     irq_restore(fl);
 }

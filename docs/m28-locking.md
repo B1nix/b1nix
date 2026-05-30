@@ -29,9 +29,9 @@ teardown happen one subsystem at a time.
         │                                   │
         │                              bcache_lock
         │                                   │
-        │                              pmm_lock
-        │                                   │
         │                              heap_lock
+        │                                   │
+        │                              pmm_lock
         │                                   │
         └────── (independent subtree) ──────┘
         page_cache_lock, dcache_lock, icache_lock,
@@ -60,8 +60,26 @@ that close into a cycle deadlock under SMP.
   `g_task_hwm`. NOT task fields after the slot is published.
 - **Order:** below BKL, above the per-CPU runqueue lock and any subsystem
   the allocated task immediately touches.
-- **Will become:** `rwlock_t` in M28 #3 — readers (PID lookup, process-list
-  walks) parallelise; allocator/exit remains a writer.
+- **Why NOT rwlock:** the walker contract (skip TASK_UNUSED + read `state`
+  word-atomically + leave allocated slots alone) is already lock-free
+  correct. Making it an rwlock would require taking the read lock in
+  every walker, which is decorative overhead with no race actually
+  closed. The real SMP gap on tasks[] is **per-task field tearing**
+  — see below.
+
+### Per-task fields beyond `state` (`struct task`)
+- **The real M28 #3 gap.** Today walkers like `scheduler_waitpid` read
+  `parent_id` / `exit_code` / `user_image` / `name` / `stack` while
+  another CPU might be mutating them; under BKL it's serialised, post-BKL
+  it tears.
+- **Fix shape:** either (a) make each multi-word field follow a
+  publication/teardown protocol with explicit memory barriers, or
+  (b) add a per-task `spinlock_t state_lock` (irq-save) and hold it for
+  any read/write that spans more than one word.
+- **Order:** above `g_tasks_lock` (you take `state_lock` of a task you
+  already own; you only take `g_tasks_lock` to claim a fresh slot or
+  release one).
+- **Not landed yet** — flagged in roadmap as the M28 #3 follow-up.
 
 ### Per-CPU runqueue lock (`kernel/sched/runqueue.c`, `rq->lock`)
 - **Type:** `spinlock_t`, **plain** (no irqsave) — every caller is already
@@ -102,22 +120,25 @@ that close into a cycle deadlock under SMP.
   bcache and release it before touching inode fields again.
 - **Does not yield.**
 
-### `pmm_lock` (`kernel/mm/pmm.c`)
-- **Type:** `spinlock_t`, irq-save.
-- **Protects:** physical-frame free list + accounting.
-- **Order:** terminal. May be taken under any other lock that does not yield.
-- **Will become:** `rwlock_t` in M28 #4 — `pmm_total_usable_memory()` /
-  `pmm_total_free_frames()` and similar getters become readers.
-
 ### `heap_lock` (`kernel/mm/kheap.c`)
 - **Type:** `spinlock_t`, irq-save.
 - **Protects:** the general-heap bump region, segregated free lists, the
   `last_block` invariant used by M26 coalescing.
-- **Order:** terminal. Calls to `kmalloc` / `kfree` under any other lock
-  are fine as long as that lock does not yield (heap_lock never yields).
+- **Order:** above `pmm_lock`. `kmalloc` holds `heap_lock` and when the
+  heap needs to grow it calls `pmm_alloc_frame` which takes `pmm_lock` —
+  so HEAP is the OUTER lock and PMM is the inner.
 - **Special:** `klarge_alloc` (M26) reserves vaddr span under `heap_lock`,
   then maps frames with the lock released so `swap_evict_page` can run
   with interrupts enabled.
+
+### `pmm_lock` (`kernel/mm/pmm.c`)
+- **Type:** `spinlock_t`, irq-save.
+- **Protects:** physical-frame free list + accounting.
+- **Order:** terminal — innermost MM lock. Acquired under `heap_lock`
+  during heap_grow; never the reverse.
+- **Will become:** atomic accounting counters in M28 #4 follow-up —
+  `pmm_total_usable_memory()` / `pmm_total_free_frames()` are simple
+  counter reads that don't need locking; the free-list head still does.
 
 ### `vfs_mount_lock` / `dcache_lock` / `icache_lock` (`kernel/fs/vfs.c`)
 - **Type:** atomic test-and-set, yields to scheduler on contention.

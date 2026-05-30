@@ -125,6 +125,21 @@ static void task_init_cred(struct task *task);
  * word-atomic and are not covered here; only slot ownership is. */
 static spinlock_t g_tasks_lock = SPINLOCK_INIT;
 
+/* Lockdep-traced acquire/release helpers — wrap spin_lock_irqsave with the
+ * DAG level for the held-lock tracker. Inlines to a single store in
+ * production builds (KERNEL_LOCKDEP undef). Defined here rather than as
+ * macros because the level must be paired with the lock pointer at one
+ * place. */
+#include <b1nix/lockdep.h>
+static inline void tasks_lock(u64 *flags) {
+  spin_lock_irqsave(&g_tasks_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_TASKS);
+}
+static inline void tasks_unlock(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_TASKS);
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
+}
+
 #include <b1nix/arch.h>
 
 static u64 align_down_u64(u64 value, u64 alignment) {
@@ -150,7 +165,7 @@ static int ensure_task_chunk(usize c) {
  * (TASK_CHUNK_SIZE slots) on demand up to the MAX_TASKS ceiling. */
 static struct task *find_unused_task(void) {
   u64 flags;
-  spin_lock_irqsave(&g_tasks_lock, &flags);
+  tasks_lock(&flags);
 
   /* 1) Fast path: reuse a slot already in [0, g_task_hwm). */
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -158,7 +173,7 @@ static struct task *find_unused_task(void) {
       memset(T(i), 0, sizeof(struct task));
       T(i)->state = TASK_BLOCKED;
       T(i)->id = next_task_id++;
-      spin_unlock_irqrestore(&g_tasks_lock, flags);
+      tasks_unlock(flags);
       return T(i);
     }
   }
@@ -166,11 +181,11 @@ static struct task *find_unused_task(void) {
   /* 2) Slow path: extend the high-water mark, allocating a new chunk if the
    *    next slot crosses a chunk boundary. */
   if (g_task_hwm >= MAX_TASKS) {
-    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    tasks_unlock(flags);
     return 0;
   }
   if (!ensure_task_chunk(g_task_hwm >> 6)) {
-    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    tasks_unlock(flags);
     return 0;
   }
   usize i = g_task_hwm++;
@@ -179,7 +194,7 @@ static struct task *find_unused_task(void) {
   memset(T(i), 0, sizeof(struct task));
   T(i)->state = TASK_BLOCKED;
   T(i)->id = next_task_id++;
-  spin_unlock_irqrestore(&g_tasks_lock, flags);
+  tasks_unlock(flags);
   return T(i);
 }
 
@@ -188,9 +203,9 @@ static struct task *find_unused_task(void) {
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
   u64 flags;
-  spin_lock_irqsave(&g_tasks_lock, &flags);
+  tasks_lock(&flags);
   t->state = TASK_UNUSED;
-  spin_unlock_irqrestore(&g_tasks_lock, flags);
+  tasks_unlock(flags);
 }
 
 /* Find the slot index of a task by scanning the populated chunks. Only

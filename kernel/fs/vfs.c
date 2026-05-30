@@ -9,6 +9,7 @@
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/lockdep.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
 #include <b1nix/rwlock.h>
@@ -47,6 +48,26 @@ static u32 next_fs_id = 1;
  * teardown remove cross-CPU races from the VFS one site at a time, instead
  * of one large flag-day patch. */
 static rwlock_t vfs_tree_lock = RWLOCK_INIT;
+
+/* Lockdep-traced acquire/release helpers: the bare rw_*_lock_irqsave calls
+ * don't know their DAG level, so wrap them here. Inlined to a single
+ * instruction sequence in production builds (KERNEL_LOCKDEP undef). */
+static inline void vfs_tree_read_acquire(u64 *flags) {
+  rw_read_lock_irqsave(&vfs_tree_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_VFS_TREE);
+}
+static inline void vfs_tree_read_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_VFS_TREE);
+  rw_read_unlock_irqrestore(&vfs_tree_lock, flags);
+}
+static inline void vfs_tree_write_acquire(u64 *flags) {
+  rw_write_lock_irqsave(&vfs_tree_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_VFS_TREE);
+}
+static inline void vfs_tree_write_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_VFS_TREE);
+  rw_write_unlock_irqrestore(&vfs_tree_lock, flags);
+}
 
 static u32 dcache_hash(struct vfs_node *parent, const char *name);
 static struct vfs_node *dcache_lookup(struct vfs_node *parent,
@@ -93,7 +114,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
    * from a future preemptive timer ISR) can't race us; the mount_lock above
    * only protects the mounts array, not the parent chain. */
   u64 flags;
-  rw_read_lock_irqsave(&vfs_tree_lock, &flags);
+  vfs_tree_read_acquire(&flags);
   struct vfs_node *curr = node;
   struct vfs_mount_entry *res = 0;
   while (curr) {
@@ -112,7 +133,7 @@ static struct vfs_mount_entry *vfs_get_mount_for_node(struct vfs_node *node) {
     }
   }
 out:
-  rw_read_unlock_irqrestore(&vfs_tree_lock, flags);
+  vfs_tree_read_release(flags);
   __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
   return res;
 }
@@ -887,7 +908,7 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
    * safe lookup path. */
   struct vfs_node *result = 0;
   u64 flags;
-  rw_read_lock_irqsave(&vfs_tree_lock, &flags);
+  vfs_tree_read_acquire(&flags);
   struct vfs_node *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
@@ -897,7 +918,7 @@ struct vfs_node *find_child(struct vfs_node *parent, const char *name) {
     }
     child = child->next_sibling;
   }
-  rw_read_unlock_irqrestore(&vfs_tree_lock, flags);
+  vfs_tree_read_release(flags);
   return result;
 }
 
@@ -1345,10 +1366,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
          * see a consistent next_sibling snapshot. */
         vfs_inode_lock_write(current->inode);
         u64 _tlflags;
-        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+        vfs_tree_write_acquire(&_tlflags);
         child->next_sibling = current->first_child;
         current->first_child = child;
-        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+        vfs_tree_write_release(_tlflags);
         vfs_inode_unlock_write(current->inode);
 
         const struct cred *cred = get_current_cred();
@@ -1411,10 +1432,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         child->parent = current;
         vfs_inode_lock_write(current->inode);
         u64 _tlflags;
-        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+        vfs_tree_write_acquire(&_tlflags);
         child->next_sibling = current->first_child;
         current->first_child = child;
-        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+        vfs_tree_write_release(_tlflags);
         vfs_inode_unlock_write(current->inode);
       }
       current = child;
@@ -2162,10 +2183,10 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
 
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     node->next_sibling = parent->first_child;
     parent->first_child = node;
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   if (parent->inode->create_cb) {
@@ -2173,9 +2194,9 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
                                        node->inode->mode);
     if (err < 0) {
       u64 _tlflags;
-      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+      vfs_tree_write_acquire(&_tlflags);
       parent->first_child = node->next_sibling;
-      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      vfs_tree_write_release(_tlflags);
       res = err;
       goto out_node_put;
     }
@@ -2280,19 +2301,19 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
 
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     node->next_sibling = parent->first_child;
     parent->first_child = node;
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   if (parent->inode->mkdir_cb) {
     int err = parent->inode->mkdir_cb(parent, name, node->inode->mode);
     if (err < 0) {
       u64 _tlflags;
-      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+      vfs_tree_write_acquire(&_tlflags);
       parent->first_child = node->next_sibling;
-      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      vfs_tree_write_release(_tlflags);
       res = err;
       goto out_node_put;
     }
@@ -2580,12 +2601,12 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
         icache_invalidate(child->inode->fs_id, child->inode->ino);
       {
         u64 _tlflags;
-        rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+        vfs_tree_write_acquire(&_tlflags);
         if (prev)
           prev->next_sibling = child->next_sibling;
         else
           parent->first_child = child->next_sibling;
-        rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+        vfs_tree_write_release(_tlflags);
       }
       vfs_node_put(child);
       dcache_invalidate(parent, name);
@@ -2653,7 +2674,7 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
    * next_sibling. */
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     struct vfs_node **prev = &parent->first_child;
     while (*prev) {
       if (*prev == node) {
@@ -2662,7 +2683,7 @@ static int vfs_unlink_at_internal(const char *resolved_path) {
       }
       prev = &(*prev)->next_sibling;
     }
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   node->deleted = 1;
@@ -2745,19 +2766,19 @@ int vfs_link(const char *target, const char *link_path) {
   new_node->parent = parent;
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     new_node->next_sibling = parent->first_child;
     parent->first_child = new_node;
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   if (parent->inode->link_cb) {
     res = parent->inode->link_cb(target_node, parent, name);
     if (res < 0) {
       u64 _tlflags;
-      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+      vfs_tree_write_acquire(&_tlflags);
       parent->first_child = new_node->next_sibling;
-      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      vfs_tree_write_release(_tlflags);
       new_node->inode->nlink--;
       new_node->inode = 0;
       vfs_node_put(new_node);
@@ -2844,19 +2865,19 @@ int vfs_symlink(const char *target, const char *link_path) {
   node->parent = parent;
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     node->next_sibling = parent->first_child;
     parent->first_child = node;
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   if (parent->inode->symlink_cb) {
     int err = parent->inode->symlink_cb(parent, name, target);
     if (err < 0) {
       u64 _tlflags;
-      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+      vfs_tree_write_acquire(&_tlflags);
       parent->first_child = node->next_sibling;
-      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      vfs_tree_write_release(_tlflags);
       vfs_node_put(node);
       res = err;
       goto out_unlock;
@@ -3002,7 +3023,7 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
    * "missing" or doubly-linked. */
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     struct vfs_node *prev_c = 0, *c = old_parent->first_child;
     while (c) {
       if (c == node) {
@@ -3015,7 +3036,7 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
       prev_c = c;
       c = c->next_sibling;
     }
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
 
   if (old_parent->inode->rename_cb) {
@@ -3023,10 +3044,10 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
         old_parent->inode->rename_cb(old_parent, old_n, new_parent, new_n);
     if (err < 0) {
       u64 _tlflags;
-      rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+      vfs_tree_write_acquire(&_tlflags);
       node->next_sibling = old_parent->first_child;
       old_parent->first_child = node;
-      rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+      vfs_tree_write_release(_tlflags);
       res = err;
       goto out_unlock;
     }
@@ -3036,10 +3057,10 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   node->parent = new_parent;
   {
     u64 _tlflags;
-    rw_write_lock_irqsave(&vfs_tree_lock, &_tlflags);
+    vfs_tree_write_acquire(&_tlflags);
     node->next_sibling = new_parent->first_child;
     new_parent->first_child = node;
-    rw_write_unlock_irqrestore(&vfs_tree_lock, _tlflags);
+    vfs_tree_write_release(_tlflags);
   }
   if (node->inode)
     icache_invalidate(node->inode->fs_id, node->inode->ino);
