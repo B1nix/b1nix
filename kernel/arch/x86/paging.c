@@ -32,6 +32,15 @@ static inline void vmm_write_release(u64 flags) {
   rw_write_unlock_irqrestore(&vmm_lock, flags);
 }
 
+static inline void vmm_read_acquire(u64 *flags) {
+  rw_read_lock_irqsave(&vmm_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_VMM);
+}
+static inline void vmm_read_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_VMM);
+  rw_read_unlock_irqrestore(&vmm_lock, flags);
+}
+
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
 #define HUGE_PAGE_FLAG (1ULL << 7)
@@ -246,16 +255,6 @@ void vmm_init(void) {
 
   extern void pmm_switch_to_direct_map(void);
   pmm_switch_to_direct_map();
-
-  console_write("paging offsets: fd_table=");
-  console_write_dec((usize)&((struct task *)0)->fd_table);
-  console_write(" fd_lock=");
-  console_write_dec((usize)&((struct task *)0)->fd_lock);
-  console_write(" pml4_phys=");
-  console_write_dec((usize)&((struct task *)0)->pml4_phys);
-  console_write(" vma_list=");
-  console_write_dec((usize)&((struct task *)0)->vma_list);
-  console_write("\n");
 }
 
 void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -690,11 +689,9 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 u64 paging_create_address_space(void) {
   u64 *pml4 = alloc_page_table();
   u64 pml4_phys = table_to_phys(pml4);
-  console_write("paging_create_address_space: pml4=0x");
-  console_write_hex64((u64)pml4);
-  console_write(" phys=0x");
-  console_write_hex64(pml4_phys);
-  console_write("\n");
+
+  u64 _vmflags;
+  vmm_read_acquire(&_vmflags);
 
   // Clone kernel-half entries (256-511)
   for (usize i = 256; i < 512; i++) {
@@ -729,6 +726,7 @@ u64 paging_create_address_space(void) {
     }
   }
 
+  vmm_read_release(_vmflags);
   return pml4_phys;
 }
 
@@ -781,11 +779,16 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 *src_pml4 = (u64 *)(usize)(real_src_phys + DIRECT_MAP_BASE);
   u64 *dst_pml4 = alloc_page_table();
   u64 dst_pml4_phys = table_to_phys(dst_pml4);
-  console_write("paging_clone_address_space: src_phys=0x");
-  console_write_hex64(src_pml4_phys);
-  console_write(" dst_phys=0x");
-  console_write_hex64(dst_pml4_phys);
-  console_write("\n");
+
+  /* M28 #7 T4: serialize page-table reads against concurrent vmm_map_page
+   * /vmm_unmap_page writes. Without BKL the syscall path lets two CPUs run
+   * mm syscalls in parallel; a fork that walks its src pml4 while another
+   * core mutates the same pml4 (mmap, page-fault CoW handler, eviction)
+   * sees torn flag/address words and produces a corrupt child mapping that
+   * faults the moment the child enters ring 3. The clone_table CoW pass
+   * also writes back to src PT entries, so we need the write side. */
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
 
   // Clone user-half entries (0-255)
   for (usize i = 0; i < 256; i++) {
@@ -806,7 +809,8 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
     write_cr3(real_src_phys);
   }
 
-  console_write("paging_clone_address_space: done\n");
+  vmm_write_release(_vmflags);
+
   return dst_pml4_phys;
 }
 
@@ -942,12 +946,6 @@ void paging_free_address_space(u64 pml4_phys) {
   // Free the PML4 itself
   pmm_free_frame(pml4_phys);
   freed_tables_count++;
-
-  console_write("paging_free_address_space: pml4=0x");
-  console_write_hex64(pml4_phys);
-  console_write(" freed ");
-  console_write_dec(freed_tables_count);
-  console_write(" tables\n");
 }
 
 static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phys) {

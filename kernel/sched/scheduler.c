@@ -20,6 +20,8 @@
  * sync with struct percpu's cur_task member. */
 _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
                "cur_task must be at offset 0x10 (see syscall_entry.S)");
+_Static_assert(__builtin_offsetof(struct percpu, syscall_scratch_rax) == 0x60,
+               "syscall_scratch_rax must be at offset 0x60 (see syscall_entry.S)");
 
 /*
  * Task table (C1 audit item).
@@ -44,8 +46,10 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
  * faulting. b1nix runs the busybox coreutils builtins in kernel mode on this
  * stack, and some have large on-stack buffers (uniq_main alone is ~12 KB:
  * buf[8192] + lines[512]); together with the ~6.6 KB syscall dispatch frame
- * and the VFS/ext4 call chain they exceed 16 KB. Keep this at >= 32 KB. */
-#define KERNEL_STACK_SIZE (32 * 1024)
+ * and the VFS/ext4 call chain they exceed 16 KB. SMP/T8 preemption adds
+ * enough nested scheduler/signal/syscall frames that 32 KB still leaves too
+ * little headroom for the M12/M14 stress paths. */
+#define KERNEL_STACK_SIZE (64 * 1024)
 #define TASK_ENV_MAX 16
 #define TASK_ENV_VALUE_MAX 64
 
@@ -116,6 +120,7 @@ struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   t->name = "ap-idle";
   t->state = TASK_RUNNING;
   t->priority = 0;
+  t->bkl_depth = 1;
   t->pml4_phys = 0; /* kernel address space */
   t->kernel_stack_ptr = kstack_top;
   t->cwd[0] = '/';
@@ -359,6 +364,24 @@ static void wake_sleepers(void) {
   if (woken > 0) ipi_reschedule_all();
 }
 
+static int scheduler_wake_blocked_parent(usize parent_id) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id != parent_id)
+      continue;
+
+    enum task_state expected = TASK_BLOCKED;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected,
+                                    TASK_READY, 0,
+                                    __ATOMIC_RELEASE,
+                                    __ATOMIC_RELAXED)) {
+      sched_rq_enqueue_current(T(i));
+      return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
 static void kernel_thread_trampoline(void) {
   interrupts_enable();
 
@@ -383,6 +406,7 @@ void scheduler_init(void) {
   boot->id = next_task_id++;
   boot->name = "boot";
   boot->state = TASK_RUNNING;
+  boot->bkl_depth = 1;
   boot->stdout_fd = -1;
   boot->fd_capacity = SCHED_MAX_FDS;
   boot->fd_table = kzalloc(boot->fd_capacity * sizeof(struct vfs_handle *));
@@ -424,15 +448,6 @@ void scheduler_init(void) {
   bkl_lock();
 
   console_write("sched: initialized\n");
-  console_write("scheduler offsets: fd_table=");
-  console_write_dec((usize)&((struct task *)0)->fd_table);
-  console_write(" fd_lock=");
-  console_write_dec((usize)&((struct task *)0)->fd_lock);
-  console_write(" pml4_phys=");
-  console_write_dec((usize)&((struct task *)0)->pml4_phys);
-  console_write(" vma_list=");
-  console_write_dec((usize)&((struct task *)0)->vma_list);
-  console_write("\n");
 }
 
 static void task_init_cred(struct task *task) {
@@ -483,6 +498,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
   task->stealable = stealable;
   task->ap_runnable = ap_runnable;
+  task->bkl_depth = 1;
 
   task->name = strdup(name);
   if (!task->name) {
@@ -644,8 +660,8 @@ int scheduler_fork_current(void) {
 
   interrupts_disable();
   struct task *child = find_unused_task();
-  interrupts_enable();
   if (!child) {
+    interrupts_enable();
     kfree(child_stack);
     return -1;
   }
@@ -662,6 +678,7 @@ int scheduler_fork_current(void) {
   if (parent->name && !child->name) {
     free_task_slot(child);
     kfree(child_stack);
+    interrupts_enable();
     return -1;
   }
 
@@ -709,12 +726,6 @@ int scheduler_fork_current(void) {
   if (is_user) {
     struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
     child_iframe->rax = 0;
-
-    console_write("FORK-USER-DEBUG: child_iframe->rip = 0x");
-    console_write_hex64(child_iframe->rip);
-    console_write(" child_iframe->rsp = 0x");
-    console_write_hex64(child_iframe->rsp);
-    console_write("\n");
 
     child->context.rsp = (u64)child_iframe - 16;
     child->context.rbp = current_rbp + stack_offset;
@@ -818,9 +829,6 @@ int scheduler_fork_current(void) {
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
-  console_write("scheduler_fork_current: done, child=");
-  console_write_dec(child_id);
-  console_write("\n");
   return child_id;
 }
 
@@ -937,6 +945,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
   child->stack = kstack;
   child->entry = clone_thread_kentry;
+  child->bkl_depth = 1;
   child->arg = cta;
   child->context.rsp = initial_rsp;
   child->context.rbp = 0;
@@ -1147,10 +1156,23 @@ int scheduler_yield(void) {
     new_task->fpu_initialized = 1;
   }
 
+  /* Save BKL depth of the outgoing task. */
+  old_task->bkl_depth = bkl_is_held_by_current_cpu() ? bkl_get_depth() : 0;
+
+  /* Release the BKL if the outgoing task holds it, so other CPUs can run. */
+  if (old_task->bkl_depth > 0) {
+    bkl_unlock_for_switch();
+  }
+
+  /* Re-acquire the BKL if the incoming task expects it. */
+  if (new_task->bkl_depth > 0) {
+    bkl_lock_for_switch(new_task->bkl_depth);
+  }
+
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
   interrupts_enable();
-  return 1; /* we switched out and have since been resumed (BKL held, depth 1) */
+  return 1; /* we switched out and have since been resumed */
 }
 
 void scheduler_block_current(void) {
@@ -1274,6 +1296,8 @@ void scheduler_on_timer_tick(void) {
   scheduler_ticks++;
   wake_sleepers();
 
+
+
   /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
    * that motivated the cooperative model — VFS chain walks (find_child /
    * vfs_get_mount_for_node / add_node) traversing parent/sibling chains
@@ -1285,10 +1309,20 @@ void scheduler_on_timer_tick(void) {
    * locked critical section running on another task.
    *
    * Only the BSP runs this branch (the AP timer's BSP-only filter in
-   * x86_irq_handler_inner). Yielding from an ISR on the BSP is the
-   * canonical preemptive-tick model; the inner handler still EOIs first. */
+   * x86_irq_handler_inner). If the tick interrupted userspace, this CPU does
+   * not yet own the BKL; take it around scheduler_yield so the global scheduler
+   * state is still serialized against AP syscall/idle handoffs. If the tick
+   * interrupted kernel code, the BKL is already owned by this CPU and recursive
+   * locking is unnecessary. */
   if (current_task->state == TASK_RUNNING) {
+    int took_bkl = 0;
+    if (!bkl_is_held_by_current_cpu()) {
+      bkl_lock();
+      took_bkl = 1;
+    }
     scheduler_yield();
+    if (took_bkl)
+      bkl_unlock();
   }
 }
 
@@ -1363,26 +1397,11 @@ void scheduler_exit_current(int exit_code) {
   current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
 
-  // Wake up parent if it is blocked waiting for us
-  int woke_parent = 0;
-  for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == current_task->parent_id) {
-      /* F6 (M28 #7): atomic CAS BLOCKED -> READY so concurrent waitpid
-       * paths on multiple CPUs can't double-promote and double-enqueue
-       * the parent. The wake here doesn't enqueue at all (pick_next_task
-       * scan handles the unenqueued READY tasks separately) so the CAS
-       * just claims the transition; whoever loses the CAS observed a
-       * parent that was already woken by someone else. */
-      enum task_state expected = TASK_BLOCKED;
-      if (__atomic_compare_exchange_n(&T(i)->state, &expected,
-                                      TASK_READY, 0,
-                                      __ATOMIC_RELEASE,
-                                      __ATOMIC_RELAXED)) {
-        woke_parent = 1;
-      }
-      break;  /* flat parent model: only one task matches parent_id */
-    }
-  }
+
+  /* F6 (M28 #7): atomic CAS BLOCKED -> READY so concurrent waitpid paths on
+   * multiple CPUs can't double-promote and double-enqueue the parent. */
+  int woke_parent = scheduler_wake_blocked_parent(current_task->parent_id);
+
 
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
    * out of sti;hlt so it picks the parent immediately instead of waiting
@@ -1418,6 +1437,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
           T(i)->parent_id == current_task->id) {
         if (wait_any || T(i)->id == pid) {
           has_children = 1;
+
           /* F1 (M28): atomic CAS DEAD -> REAPING so only one CPU drives the
            * actual free path even if two waitpids race for the same child.
            * The loser observes state == REAPING (which still counts as "this
@@ -1782,6 +1802,25 @@ int scheduler_kill(usize task_id, int sig) {
       /* SIGKILL and SIGSTOP cannot be blocked/ignored */
       T(i)->pending_signals |= (1ULL << (sig - 1));
 
+      if (T(i) != current_task &&
+          (sig == SIGSTOP || sig == SIGTSTP ||
+           sig == SIGTTIN || sig == SIGTTOU)) {
+        T(i)->pending_signals &= ~(1ULL << (sig - 1));
+        T(i)->last_stop_signal = sig;
+        T(i)->stop_report_pending = 1;
+        T(i)->state = TASK_STOPPED;
+        for (usize j = 0; j < g_task_hwm; j++) {
+          if (T(j)->id == T(i)->parent_id && T(j)->state == TASK_BLOCKED) {
+            T(j)->state = TASK_READY;
+            sched_rq_enqueue_current(T(j));
+            break;
+          }
+        }
+        interrupts_enable();
+        ipi_reschedule_all();
+        return 0;
+      }
+
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
@@ -1897,17 +1936,10 @@ struct cred *scheduler_get_current_cred(void) {
 void scheduler_set_user_image(void *image) {
   if (current_task) {
     current_task->user_image = image;
-    console_write("scheduler_set_user_image: task=");
-    console_write(current_task->name);
-    console_write(" pml4_phys before=0x");
-    console_write_hex64(current_task->pml4_phys);
     if (current_task->pml4_phys == 0) {
       current_task->pml4_phys = paging_create_address_space();
       paging_switch_address_space(current_task->pml4_phys);
     }
-    console_write(" after=0x");
-    console_write_hex64(current_task->pml4_phys);
-    console_write("\n");
   }
 }
 
@@ -2111,10 +2143,8 @@ void scheduler_deliver_pending_signals(void) {
       /* See scheduler_exit_current — claim stack_released before DEAD. */
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
-      for (usize i = 0; i < g_task_hwm; i++) {
-        if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
-          T(i)->state = TASK_READY;
-      }
+      if (scheduler_wake_blocked_parent(current_task->parent_id))
+        ipi_reschedule_all();
       return;
       /* unreachable */
     }
@@ -2148,10 +2178,8 @@ void scheduler_deliver_pending_signals(void) {
         /* See scheduler_exit_current — claim stack_released before DEAD. */
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
-        for (usize i = 0; i < g_task_hwm; i++) {
-          if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
-            T(i)->state = TASK_READY;
-        }
+        if (scheduler_wake_blocked_parent(current_task->parent_id))
+          ipi_reschedule_all();
         return;
         /* unreachable */
       case SIGCONT:

@@ -28,5 +28,9 @@
 
 void bkl_lock(void);
 void bkl_unlock(void);
+int bkl_is_held_by_current_cpu(void);
+void bkl_lock_for_switch(u32 depth);
+void bkl_unlock_for_switch(void);
+u32 bkl_get_depth(void);
 
 #endif /* B1NIX_BKL_H */
