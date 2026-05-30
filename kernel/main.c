@@ -155,6 +155,9 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
 	smp_selftest_run();
 
+	/* M28 #9: ctx-switch + light-syscall rdtsc baseline (single-CPU, test mode). */
+	m28_ctxbench_run();
+
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)
 	 * under the Big Kernel Lock. From here, userspace runs on Application

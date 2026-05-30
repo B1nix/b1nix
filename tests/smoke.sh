@@ -150,6 +150,8 @@ check_output "$LOG" "M22-SMOKE: start" "VFS initializes"
 check_output "$LOG" "M24-STRESS: start" "scheduler starts"
 check_output "$LOG" "init spawn result:" "/bin/init launches"
 check_output "$LOG" "M11-SMOKE: start" "shell appears"
+# M28 #9: ctx-switch + light-syscall rdtsc benchmark (single-CPU only)
+check_output "$LOG" "M28-BENCH: ok" "M28 ctx-switch benchmark completes"
 
 # ── M12 Syscalls & Process Management ──
 echo ""
