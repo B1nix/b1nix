@@ -180,20 +180,17 @@ void kernel_main(u64 arg0, u64 arg1)
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
 	console_write(init_spawn_buf);
 
-	/* BSP idle loop. We hold the BKL (depth 1) here; scheduler_yield runs any
-	 * runnable task and returns at depth 1. When nothing is runnable it returns
-	 * 0 — drop the BKL so other cores can execute kernel code, pause, then
-	 * re-take it. Without this the BSP would spin holding the BKL and starve the
-	 * APs running userspace. */
+	/* T2 (M28 #7): BSP idle loop is BKL-free, same shape as the AP idle
+	 * after T1. scheduler_yield's internals are SMP-safe via F1-F6. The
+	 * bkl_unlock() before sti;hlt is kept because a syscall-return path that
+	 * yielded back into this idle frame may have left the BKL held — the
+	 * owner-check (commit 9d0784f) makes the call a no-op when this CPU
+	 * never took it, safe either way. The matching bkl_lock() after sti;hlt
+	 * is gone: the outer loop no longer assumes BKL is held. */
 	while (scheduler_task_count() > 1) {
 		if (!scheduler_yield()) {
-			/* M28 #6: same `sti; hlt` idiom the APs use — sleep until the
-			 * next interrupt (LAPIC tick or reschedule IPI from another
-			 * CPU). Replaces a bare `pause`, which spun until the next
-			 * implicit poll. */
 			bkl_unlock();
 			__asm__ volatile("sti; hlt" : : : "memory");
-			bkl_lock();
 		}
 	}
 

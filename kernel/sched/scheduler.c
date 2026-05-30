@@ -141,6 +141,19 @@ static inline void tasks_unlock(u64 flags) {
   spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
+/* fd_lock helpers — wraps spin_lock/unlock on current_task->fd_lock with
+ * lockdep tracking. fd_lock is plain (no irq-save) because fd ops never
+ * fire from ISR context and the lock is process-local (only the owning
+ * task touches it). */
+static inline void fd_lock_acquire(void) {
+  spin_lock(&current_task->fd_lock);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_FD);
+}
+static inline void fd_lock_release(void) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_FD);
+  spin_unlock(&current_task->fd_lock);
+}
+
 #include <b1nix/arch.h>
 
 static u64 align_down_u64(u64 value, u64 alignment) {
@@ -243,8 +256,22 @@ static struct task *pick_next_task(void) {
       struct task *t = rq_dequeue(&g_global_rq);
       if (!t)
         break;
-      if (t->state == TASK_READY && !t->stealable)
+      if (t->stealable)
+        continue;
+      /* F5 (M28 #7): atomic claim. CAS READY -> RUNNING so a concurrent
+       * scan on another CPU can't pick the same task between our check and
+       * scheduler_yield's eventual state=RUNNING store. The same fix is
+       * applied to the scan path below. Under M24b BKL the race couldn't
+       * happen; T1+ depends on this. */
+      enum task_state expected = TASK_READY;
+      if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
+                                      0, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
         return t;
+      }
+      /* Lost the CAS (someone else already picked, or task transitioned to
+       * BLOCKED/SLEEPING). Drop on the floor — if it's still relevant the
+       * next iteration / scan will find it. */
     }
   }
 
@@ -272,8 +299,18 @@ static struct task *pick_next_task(void) {
     }
   }
 
-  if (best_task)
-    return best_task;
+  if (best_task) {
+    /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
+     * the CAS, return 0 (no work this iteration) and let the caller retry;
+     * starting a fresh scan here can spin under contention without ever
+     * settling, so the cleaner shape is "treat as no-work and try again". */
+    enum task_state expected = TASK_READY;
+    if (__atomic_compare_exchange_n(&best_task->state, &expected,
+                                    TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      return best_task;
+    }
+  }
 
   /* AP fallback: nothing else runnable, so park back to this CPU's idle task,
    * which lets the AP cooperative loop regain control and drop the BKL. NULL on
@@ -288,12 +325,20 @@ static struct task *pick_next_task(void) {
 static void wake_sleepers(void) {
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state == TASK_SLEEPING &&
-        T(i)->wake_tick <= scheduler_ticks) {
-      T(i)->state = TASK_READY;
-      T(i)->wake_tick = 0;
-      sched_rq_enqueue_current(T(i));
-      woken++;
+    /* F4 (M28 #7): atomic CAS SLEEPING -> READY so only one CPU wins when
+     * two timer ticks (or a tick + an explicit wake) race for the same
+     * sleeper. Without this, the loser also enqueues the task — same task
+     * in the runqueue twice → corruption. Under M24b BKL the race couldn't
+     * happen; T1+ depends on this fix. */
+    if (T(i)->wake_tick <= scheduler_ticks) {
+      enum task_state expected = TASK_SLEEPING;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                      0, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
+        T(i)->wake_tick = 0;
+        sched_rq_enqueue_current(T(i));
+        woken++;
+      }
     }
   }
   /* M28 #6: if we promoted at least one task, kick the other CPUs out of
@@ -860,8 +905,16 @@ void scheduler_wake_all(void *chan) {
 
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state == TASK_BLOCKED && T(i)->wait_chan == chan) {
-      T(i)->state = TASK_READY;
+    /* F4 (M28 #7): atomic CAS BLOCKED -> READY so two CPUs both trying
+     * to wake the same channel can't both enqueue. Reading wait_chan
+     * outside the CAS is fine — it's written only by scheduler_block_on
+     * under the task's own context (the task itself sets it before
+     * yielding), so the value is stable while the task is BLOCKED. */
+    if (T(i)->wait_chan != chan) continue;
+    enum task_state expected = TASK_BLOCKED;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                    0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
       T(i)->wait_chan = 0;
       sched_rq_enqueue_current(T(i));
       woken++;
@@ -944,12 +997,32 @@ void scheduler_exit_current(int exit_code) {
   current_task->state = TASK_DEAD;
 
   // Wake up parent if it is blocked waiting for us
+  int woke_parent = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == current_task->parent_id &&
-        T(i)->state == TASK_BLOCKED) {
-      T(i)->state = TASK_READY;
+    if (T(i)->id == current_task->parent_id) {
+      /* F6 (M28 #7): atomic CAS BLOCKED -> READY so concurrent waitpid
+       * paths on multiple CPUs can't double-promote and double-enqueue
+       * the parent. The wake here doesn't enqueue at all (pick_next_task
+       * scan handles the unenqueued READY tasks separately) so the CAS
+       * just claims the transition; whoever loses the CAS observed a
+       * parent that was already woken by someone else. */
+      enum task_state expected = TASK_BLOCKED;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected,
+                                      TASK_READY, 0,
+                                      __ATOMIC_RELEASE,
+                                      __ATOMIC_RELAXED)) {
+        woke_parent = 1;
+      }
+      break;  /* flat parent model: only one task matches parent_id */
     }
   }
+
+  /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
+   * out of sti;hlt so it picks the parent immediately instead of waiting
+   * for the next 10 ms LAPIC tick. Particularly important for the
+   * test-driver init kthread on the BSP, which sits in sti;hlt during
+   * userspace test runs. */
+  if (woke_parent) ipi_reschedule_all();
 
   scheduler_yield();
   panic("dead task resumed");
@@ -978,7 +1051,20 @@ int scheduler_waitpid(usize pid, int *status, int options) {
           T(i)->parent_id == current_task->id) {
         if (wait_any || T(i)->id == pid) {
           has_children = 1;
-          if (T(i)->state == TASK_DEAD) {
+          /* F1 (M28): atomic CAS DEAD -> REAPING so only one CPU drives the
+           * actual free path even if two waitpids race for the same child.
+           * The loser observes state == REAPING (which still counts as "this
+           * child exists" thanks to has_children) and falls through to the
+           * yield/return path, letting the winner publish the reaped status.
+           *
+           * Note: parent_id is read non-atomically above, but the field is
+           * only written by fork (publication before the child runs) and is
+           * never overwritten thereafter, so a torn read here is impossible. */
+          enum task_state _expected = TASK_DEAD;
+          if (__atomic_compare_exchange_n(&T(i)->state, &_expected,
+                                          TASK_REAPING, 0,
+                                          __ATOMIC_ACQUIRE,
+                                          __ATOMIC_RELAXED)) {
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
             if (T(i)->user_image) {
@@ -1050,7 +1136,8 @@ usize scheduler_task_count(void) {
   usize count = 0;
 
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state != TASK_UNUSED && T(i)->state != TASK_DEAD) {
+    enum task_state s = T(i)->state;
+    if (s != TASK_UNUSED && s != TASK_DEAD && s != TASK_REAPING) {
       count++;
     }
   }
@@ -1084,6 +1171,9 @@ void scheduler_dump_tasks(void) {
         break;
       case TASK_DEAD:
         state_str = "DEAD";
+        break;
+      case TASK_REAPING:
+        state_str = "REAPING";
         break;
       default:
         break;
@@ -1132,19 +1222,19 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
 
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
 
   for (usize i = 0; i < current_task->fd_capacity; i++) {
     if (current_task->fd_table[i] == 0) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return (int)i;
     }
   }
 
   if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
 
@@ -1154,13 +1244,13 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
 
   struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
   if (!new_table) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
   int *new_flags = kzalloc(new_capacity * sizeof(int));
   if (!new_flags) {
     kfree(new_table);
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
 
@@ -1178,16 +1268,16 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   current_task->fd_table[allocated_fd] = handle;
   current_task->fd_flags[allocated_fd] = 0;
 
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return allocated_fd;
 }
 
 struct vfs_handle *scheduler_fd_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return 0;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   struct vfs_handle *h = current_task->fd_table[fd];
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return h;
 }
 
@@ -1195,11 +1285,11 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
   if (!current_task || fd < 0)
     return -1;
 
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
 
   if ((usize)fd >= current_task->fd_capacity) {
     if ((usize)fd >= SCHED_MAX_FD_LIMIT) {
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
     usize new_capacity = current_task->fd_capacity;
@@ -1211,13 +1301,13 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
     struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
     if (!new_table) {
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
     int *new_flags = kzalloc(new_capacity * sizeof(int));
     if (!new_flags) {
       kfree(new_table);
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
 
@@ -1234,39 +1324,39 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return fd;
 }
 
 int scheduler_fd_close(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return 0;
 }
 
 int scheduler_fd_flags_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   int f = current_task->fd_table[fd] ? current_task->fd_flags[fd] : -1;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return f;
 }
 
 int scheduler_fd_flags_set(int fd, int flags_val) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   if (!current_task->fd_table[fd]) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
   current_task->fd_flags[fd] = flags_val;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return 0;
 }
 
