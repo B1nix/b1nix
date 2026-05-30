@@ -116,6 +116,7 @@ KERNEL_SOURCES := \
 	kernel/sched/bkl.c \
 	kernel/sched/lockdep.c \
 	kernel/sched/smp_test.c \
+	kernel/sched/m28_ctxbench.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/busybox.c \

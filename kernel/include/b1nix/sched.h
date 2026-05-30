@@ -251,6 +251,10 @@ void sched_ap_reap_worker(struct task *t);
 /* SMP work-stealing self-test (M24b). No-op unless >1 CPU is online and
  * test mode is active. */
 void smp_selftest_run(void);
+
+/* M28 #9 — ctx-switch + light-syscall rdtsc benchmark. Single-CPU only;
+ * test mode only. See kernel/sched/m28_ctxbench.c for what's measured. */
+void m28_ctxbench_run(void);
 int scheduler_fork_current(void);
 /* Cooperatively switch to another runnable task. Returns 1 if it context
  * switched (and has since been resumed), 0 if nothing was runnable. An idle
