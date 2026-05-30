@@ -155,6 +155,14 @@ void x86_ap_arch_init(int cpu) {
   x86_syscall_init();     /* per-CPU SYSCALL MSRs: EFER.SCE, STAR, LSTAR, FMASK */
   x86_enable_sse();       /* per-CPU CR0/CR4 for fxsave/fxrstor in ctx switch */
   x86_enable_write_protect();
+  /* Software-enable this AP's LAPIC + TPR/LVT setup. Without this the AP's
+   * LAPIC stays in its reset (software-disabled) state and every locally-
+   * delivered vector — including the LAPIC timer we arm later in ap_main
+   * (M28-A) and the TLB shootdown IPI (M28 #5) — is silently dropped.
+   * Prior to this call landing the timer "worked" because no smoke check
+   * actually depended on AP ticks doing anything visible; the shootdown
+   * IPI does, which is how the gap surfaced. */
+  lapic_init_local();
 }
 
 void arch_halt(void) {

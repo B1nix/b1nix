@@ -20,7 +20,8 @@ volatile int g_ap_userspace_enabled = 0;
 int g_max_cpus = 1;
 
 /* External functions */
-extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new);
+extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new,
+                                volatile int *released_publish);
 extern void paging_switch_address_space(u64 pml4_phys);
 extern void arch_set_kernel_stack(u64 stack);
 
@@ -70,6 +71,35 @@ void lapic_timer_start(u32 init_count) {
     lapic_write(LAPIC_TIMER_INITCNT, init_count);
 }
 
+static volatile int g_lapic_timer_periodic_active = 0;
+
+int lapic_timer_start_periodic_ms(u32 ms) {
+    /* PIT-calibrated rate (per ms at divide=16). Zero means lapic_init never
+     * managed to calibrate — without that we have no idea what one tick is, so
+     * refuse rather than program a bogus cadence. The caller (main.c) treats a
+     * 0 return as "leave PIT IRQ0 alive". */
+    u32 tpms = lapic_ticks_per_ms();
+    if (tpms == 0 || ms == 0) return 0;
+
+    /* Detect overflow before storing a wrapped value. The 32-bit LAPIC init
+     * count holds at most ~68 s at QEMU's ~62 kticks/ms — far beyond the 10 ms
+     * scheduler tick we use today, but the guard keeps a future caller from
+     * silently programming a 0-init-count (= timer disabled). */
+    u64 init64 = (u64)tpms * (u64)ms;
+    if (init64 == 0 || init64 > 0xFFFFFFFFULL) return 0;
+
+    /* Match the calibration divider so the rate computed by
+     * apic_timer_calibrate_against_pit lines up with what we program here. */
+    lapic_write(LAPIC_TIMER_DIV, LAPIC_TIMER_DIV_16);
+    lapic_write(LAPIC_LVT_TIMER, LAPIC_TIMER_VECTOR | LAPIC_LVT_PERIODIC);
+    lapic_write(LAPIC_TIMER_INITCNT, (u32)init64);
+
+    g_lapic_timer_periodic_active = 1;
+    return 1;
+}
+
+int lapic_timer_periodic_active(void) { return g_lapic_timer_periodic_active; }
+
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
     /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
      * [31:24]. The old `(u64)apic_id << 32` is the x2APIC (MSR) layout; written
@@ -88,6 +118,24 @@ void lapic_send_ipi_allbutself(u32 icr_low) {
     lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
     while (lapic_read(LAPIC_ICR_LOW) & (1 << 12))
         __asm__ volatile("pause");
+}
+
+void lapic_init_local(void) {
+    /* Software enable LAPIC via SVR — the CPU otherwise drops every locally
+     * delivered interrupt (timer, IPI). Spurious vector goes in the low byte. */
+    u32 svr = lapic_read(LAPIC_SVR);
+    svr |= LAPIC_SVR_ENABLE;
+    svr &= ~LAPIC_SVR_FOCUS_DISABLE;
+    svr = (svr & ~0xFF) | LAPIC_SPURIOUS_VECTOR;
+    lapic_write(LAPIC_SVR, svr);
+
+    /* Mask unused LVT entries (not LINT0/LINT1 — those carry PIC interrupts). */
+    lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_LVT_THERMAL, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_LVT_PERFMON, LAPIC_LVT_MASKED);
+
+    /* TPR = 0 so every vector >= 0x10 is accepted. */
+    lapic_write(LAPIC_TPR, 0);
 }
 
 void lapic_init(void) {
@@ -129,20 +177,12 @@ void lapic_init(void) {
     console_write_dec(max_lvt);
     console_write("\n");
 
-    /* Software enable LAPIC via SVR */
-    u32 svr = lapic_read(LAPIC_SVR);
-    svr |= LAPIC_SVR_ENABLE;
-    svr &= ~LAPIC_SVR_FOCUS_DISABLE; /* enable focus checking */
-    svr = (svr & ~0xFF) | LAPIC_SPURIOUS_VECTOR;
-    lapic_write(LAPIC_SVR, svr);
-
-    /* Mask unused LVT entries (not LINT0/LINT1 — they carry PIC interrupts) */
-    lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_THERMAL, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_PERFMON, LAPIC_LVT_MASKED);
-
-    /* Set task priority to accept all interrupts */
-    lapic_write(LAPIC_TPR, 0);
+    /* Per-CPU LAPIC state — factored into lapic_init_local so APs can run
+     * the same setup from x86_ap_arch_init. Before this factoring, AP LAPICs
+     * stayed software-disabled and every locally-delivered vector (timer,
+     * IPI) was silently dropped — invisible until M28 #5's TLB shootdown
+     * actually needed the IPI to arrive. */
+    lapic_init_local();
 
     console_write("lapic: initialized (id=");
     console_write_dec(lapic_id());
@@ -261,13 +301,20 @@ void ap_worker_trampoline(void) {
 
     if (t && t->entry)
         t->entry(t->arg);
-    if (t)
+    if (t) {
+        /* Claim stack_released before publishing DEAD so any reaper (today
+         * only sched_ap_reap_worker on the same CPU after switch-back, but
+         * keep the protocol symmetric) sees released==0 until the
+         * arch_context_switch below swaps RSP off this stack. */
+        t->stack_released = 0;
         t->state = TASK_DEAD;  /* tells ap_main the worker has finished */
+    }
 
     /* Switch back to the AP idle loop. Saves our now-defunct context into
      * t->context (never reused) and restores the AP idle context captured in
      * ap_main. Does not return. */
-    arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx);
+    arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx,
+                        &t->stack_released);
 
     for (;;) __asm__ volatile("hlt");  /* unreachable */
 }
@@ -319,7 +366,9 @@ void ap_main(u32 cpu_id) {
             t->state = TASK_RUNNING;
             pcpu->cur_task = t;
             pcpu->sched_return_ctx = &idle_ctx;
-            arch_context_switch(&idle_ctx, &t->context);
+            /* OLD here is the AP idle context (stack-local cpu_context, no
+             * task struct, never reaped) — pass NULL to skip the publish. */
+            arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
             pcpu->cur_task = NULL;
             sched_ap_reap_worker(t);
             interrupts_enable();
@@ -337,20 +386,32 @@ void ap_main(u32 cpu_id) {
      * current_task; scheduler_yield switches into a runnable task (releasing the
      * BKL when that task enters ring 3, so userspace runs in parallel with other
      * cores) and parks back to the idle task when nothing is left to run. */
+
+    /* M28-A: arm THIS AP's LAPIC timer at 100 Hz so the per-CPU scheduler tick
+     * fires here too. The BSP arms its own from main.c after lapic_init.
+     * Interrupts are already enabled here (Phase 1 ended with
+     * interrupts_enable()) and the depth-1 BKL acquired below recursively
+     * re-enters from the timer ISR — both already wired by M24b. */
+    lapic_timer_start_periodic_ms(10);
+
     struct task *idle = scheduler_setup_ap_idle((int)cpu_id, pcpu->kernel_stack_virt);
     pcpu->idle_task = idle;
     pcpu->cur_task = idle;       /* current_task = this AP's idle task */
     pcpu->sched_return_ctx = 0;
 
-    bkl_lock();                  /* AP now holds the BKL at depth 1 */
+    /* T1 (M28 #7): AP idle no longer takes the BKL across the OUTER loop —
+     * scheduler_yield runs without BKL on this CPU. But we DO drop the BKL
+     * before sti;hlt because a userspace task that we just yielded out of
+     * may have left this CPU holding it (the task entered the kernel via
+     * syscall_entry's bkl_lock, scheduler_exit_current called us, and
+     * scheduler_yield itself doesn't touch BKL). Holding it through hlt
+     * would deadlock every other CPU's IRQ entry (x86_irq_handler does
+     * bkl_lock too). bkl_unlock is now a no-op for non-owners (commit
+     * 9d0784f), so safe regardless of how we got here. */
     for (;;) {
         if (!scheduler_yield()) {
-            /* Nothing runnable: drop the BKL so other cores proceed, pause, and
-             * re-take it before scheduling again. */
             bkl_unlock();
-            for (volatile int i = 0; i < 2000; i++)
-                __asm__ volatile("pause");
-            bkl_lock();
+            __asm__ volatile("sti; hlt" : : : "memory");
         }
     }
 }

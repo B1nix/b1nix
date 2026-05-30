@@ -118,6 +118,16 @@ static struct kheap_state heap;
 static struct kheap_block *free_lists[NBUCKETS];
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
+#include <b1nix/lockdep.h>
+static inline void heap_acquire(u64 *flags) {
+  spin_lock_irqsave(&heap_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_HEAP);
+}
+static inline void heap_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_HEAP);
+  spin_unlock_irqrestore(&heap_lock, flags);
+}
+
 static int is_power_of_two_u64(u64 value) {
   return value && ((value & (value - 1)) == 0);
 }
@@ -206,7 +216,7 @@ void kheap_dump_large_allocs(void) {
     return;
   }
 
-  spin_lock_irqsave(&heap_lock, &flags);
+  heap_acquire(&flags);
   console_write("[OOMDIAG] Large allocations (>= 1MB):\n");
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
     if (tracked_blocks[i].addr != 0) {
@@ -219,7 +229,7 @@ void kheap_dump_large_allocs(void) {
       console_write("\n");
     }
   }
-  spin_unlock_irqrestore(&heap_lock, flags);
+  heap_release(flags);
 }
 
 static u64 align_up_u64(u64 value, u64 alignment) {
@@ -413,7 +423,7 @@ static void *klarge_alloc(usize size, u64 caller) {
 
   /* Phase 1 — reserve a vaddr span under the lock (fast, non-blocking). */
   u64 flags;
-  spin_lock_irqsave(&heap_lock, &flags);
+  heap_acquire(&flags);
 
   u64 base = 0;
   for (int i = 0; i < klarge_free_count; i++) {
@@ -439,7 +449,7 @@ static void *klarge_alloc(usize size, u64 caller) {
   }
   void *ptr = (void *)(usize)(base + KLARGE_HEADER_SIZE);
   track_alloc((u64)(usize)ptr, size, caller);
-  spin_unlock_irqrestore(&heap_lock, flags);
+  heap_release(flags);
 
   /* Phase 2 — map fresh frames with the lock released, i.e. at the CALLER's
    * interrupt state. This is deliberate and load-bearing: `pmm_alloc_frame`'s
@@ -477,10 +487,10 @@ static void klarge_free(void *ptr) {
       (struct klarge_header *)(usize)(p - KLARGE_HEADER_SIZE);
 
   u64 flags;
-  spin_lock_irqsave(&heap_lock, &flags);
+  heap_acquire(&flags);
 
   if (h->magic != KLARGE_MAGIC) {
-    spin_unlock_irqrestore(&heap_lock, flags);
+    heap_release(flags);
     return;
   }
   u64 base = (u64)(usize)h;
@@ -502,7 +512,7 @@ static void klarge_free(void *ptr) {
     klarge_free_spans[klarge_free_count].npages = npages;
     klarge_free_count++;
   }
-  spin_unlock_irqrestore(&heap_lock, flags);
+  heap_release(flags);
 }
 
 static void *kmalloc_internal(usize size, u64 caller) {
@@ -515,7 +525,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
   }
 
   u64 flags;
-  spin_lock_irqsave(&heap_lock, &flags);
+  heap_acquire(&flags);
 
   kheap_validate("kmalloc_start");
 
@@ -557,7 +567,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
     void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
     track_alloc((u64)(usize)ptr, block->size, caller);
     kheap_validate("kmalloc_end_reuse");
-    spin_unlock_irqrestore(&heap_lock, flags);
+    heap_release(flags);
     return ptr;
   }
 
@@ -582,7 +592,7 @@ static void *kmalloc_internal(usize size, u64 caller) {
   void *ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
   track_alloc((u64)(usize)ptr, size, caller);
   kheap_validate("kmalloc_end_bump");
-  spin_unlock_irqrestore(&heap_lock, flags);
+  heap_release(flags);
   return ptr;
 }
 
@@ -620,19 +630,19 @@ void kfree(void *ptr) {
   }
 
   u64 flags;
-  spin_lock_irqsave(&heap_lock, &flags);
+  heap_acquire(&flags);
 
   kheap_validate("kfree_start");
 
   struct kheap_block *block =
       (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
   if (block->magic != KHEAP_MAGIC) {
-    spin_unlock_irqrestore(&heap_lock, flags);
+    heap_release(flags);
     return;
   }
 #if KHEAP_REUSE_MIN_SIZE > 0
   if (block->size < KHEAP_REUSE_MIN_SIZE) {
-    spin_unlock_irqrestore(&heap_lock, flags);
+    heap_release(flags);
     return;
   }
 #endif
@@ -711,5 +721,5 @@ void kfree(void *ptr) {
   free_lists[bkt] = block;
 
   kheap_validate("kfree_end");
-  spin_unlock_irqrestore(&heap_lock, flags);
+  heap_release(flags);
 }
