@@ -3381,6 +3381,21 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
+   * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
+   * the base offset correctly, the pointer-table dereferences land on
+   * valid strings and we get the M30-DYN: markers. */
+  {
+    u64 m30_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m30-pie", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m30_pid < 0) {
+      uwrite("M30-DYN: spawn-fail\n");
+    } else {
+      int m30_status = 0;
+      syscall_dispatch(SYS_WAIT, m30_pid, (u64)(usize)&m30_status, 0, 0, 0, 0);
+    }
+  }
+
   uwrite("M16-SMOKE: start\n");
   struct b1nix_termios m16_termios_before;
   memset(&m16_termios_before, 0, sizeof(m16_termios_before));

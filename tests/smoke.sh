@@ -519,6 +519,10 @@ check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeou
 check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
 check_output "$LOG" "M32-NET: done" "M32 smoke completes"
+# ── M30 Dynamic Linking (PIE) ──
+check_output "$LOG" "M30-DYN: ok pie-binary" "PIE ET_DYN binary loads at PIE base"
+check_output "$LOG" "M30-DYN: ok pie-relocs" "R_X86_64_RELATIVE relocations applied"
+check_output "$LOG" "M30-DYN: done" "M30 dyn-linking smoke completes"
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"

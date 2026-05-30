@@ -22,6 +22,7 @@
 #include "../../build/x86/initramfs_m31_smoke.inc"
 #include "../../build/x86/initramfs_m31_setuid.inc"
 #include "../../build/x86/initramfs_m32_smoke.inc"
+#include "../../build/x86/initramfs_m30_pie.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -362,6 +363,14 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     {"/bin/m32-smoke", (const char *)vfs_m32_smoke_elf,
      sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
+     sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+    /* M30: the dynamic linker file is shipped as the PIE binary itself —
+     * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
+     * exists as a name on disk that PT_INTERP can reference even though
+     * b1nix doesn't hand control off to a separate userspace ld.so. */
+    {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,
+     sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
