@@ -58,6 +58,22 @@ void bkl_lock(void) {
 
 void bkl_unlock(void) {
     u64 fl = irq_save_cli();
+    int cpu = this_cpu_id();
+    /* T1 (M28 #7): no-op if this CPU isn't the owner. Two reasons:
+     *  1. Idempotency for callsites being progressively removed (T1..T5).
+     *     user_jump.S calls bkl_unlock unconditionally on a fresh task's
+     *     first entry to ring 3; once we stop holding the BKL in the AP
+     *     idle loop, that call must not corrupt another CPU's depth.
+     *  2. Latent-bug fix: the old test g_bkl_depth > 0 looked at the
+     *     OWNER's depth, so a non-owner calling unlock would decrement
+     *     someone else's counter. Under M24b BKL this couldn't happen
+     *     in practice — every release was preceded by a matching
+     *     acquire on the same CPU — but the check is the right shape
+     *     either way. */
+    if (g_bkl_owner != cpu) {
+        irq_restore(fl);
+        return;
+    }
     if (g_bkl_depth > 0 && --g_bkl_depth == 0) {
         g_bkl_owner = -1;          /* clear owner before releasing (x86 TSO keeps
                                     * this store ordered ahead of the unlock) */

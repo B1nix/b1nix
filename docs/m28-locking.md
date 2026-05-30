@@ -85,7 +85,10 @@ that close into a cycle deadlock under SMP.
 - **Type:** `spinlock_t`, **plain** (no irqsave) — every caller is already
   running with interrupts off (BKL holders + idle loops).
 - **Protects:** the per-CPU ready ring buffer (`head`, `tail`, `nr`).
-- **Order:** below `g_tasks_lock`, above nothing else (terminal).
+- **Order:** terminal leaf — innermost lock in the DAG (LOCKDEP=1000). Has
+  to be deeper than every other lock because sleeping-lock release paths
+  (`vfs_inode_unlock_*` → `scheduler_wake_all` → `rq_enqueue`, plus every
+  yield-on-contention atomic-test-and-set lock) all eventually take it.
 - **Does not yield.** Held for O(1) operations only.
 
 ### Per-task `fd_lock` (`struct task::fd_lock`)

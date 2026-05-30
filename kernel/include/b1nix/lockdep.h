@@ -30,17 +30,24 @@ typedef enum {
     LOCKDEP_LVL_BKL          = 100,  /* outermost — Big Kernel Lock */
     LOCKDEP_LVL_TASKS        = 200,  /* g_tasks_lock — process-table slots */
     LOCKDEP_LVL_FD           = 210,  /* per-task fd_lock — sibling of TASKS */
-    LOCKDEP_LVL_RUNQUEUE     = 220,  /* per-CPU runqueue lock */
     LOCKDEP_LVL_MOUNT_TBL    = 300,  /* vfs_mount_lock, dcache, icache */
     LOCKDEP_LVL_INODE        = 400,  /* vfs_inode rw_lock (sleeping) */
     LOCKDEP_LVL_VFS_TREE     = 500,  /* vfs_tree_lock (M28-B) — chain walks */
     LOCKDEP_LVL_BCACHE       = 600,  /* block-cache hash + LRU */
-    /* HEAP < PMM: kmalloc holds heap_lock, and when the heap needs to grow
-     * it calls pmm_alloc_frame which takes pmm_lock — so HEAP is the outer
-     * acquisition and PMM is the inner one. */
+    /* HEAP < VMM < PMM: kmalloc may call kheap_grow which calls vmm_map_page,
+     * which in turn allocates intermediate page tables via pmm_alloc_frame.
+     * So HEAP wraps VMM wraps PMM. */
     LOCKDEP_LVL_HEAP         = 700,  /* kheap general arena */
+    LOCKDEP_LVL_VMM          = 750,  /* page-table mutations (M28 F2) */
     LOCKDEP_LVL_PMM          = 800,  /* physical-frame allocator */
     LOCKDEP_LVL_PAGECACHE    = 900,  /* page_cache_lock */
+    /* RUNQUEUE is a TERMINAL leaf — acquired briefly by sched_rq_enqueue /
+     * rq_dequeue, but those callers can be nested inside any sleeping lock
+     * release path (vfs_inode_unlock_* -> scheduler_wake_all, plus every
+     * yield-on-contention atomic-test-and-set lock). Putting it past every
+     * outer-tier lock means "anywhere can wake/yield" — which is what we
+     * actually do. */
+    LOCKDEP_LVL_RUNQUEUE     = 1000,
 } lockdep_level_t;
 
 #ifdef KERNEL_LOCKDEP

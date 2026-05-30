@@ -389,21 +389,19 @@ void ap_main(u32 cpu_id) {
     pcpu->cur_task = idle;       /* current_task = this AP's idle task */
     pcpu->sched_return_ctx = 0;
 
-    bkl_lock();                  /* AP now holds the BKL at depth 1 */
+    /* T1 (M28 #7): AP idle no longer takes the BKL across the OUTER loop —
+     * scheduler_yield runs without BKL on this CPU. But we DO drop the BKL
+     * before sti;hlt because a userspace task that we just yielded out of
+     * may have left this CPU holding it (the task entered the kernel via
+     * syscall_entry's bkl_lock, scheduler_exit_current called us, and
+     * scheduler_yield itself doesn't touch BKL). Holding it through hlt
+     * would deadlock every other CPU's IRQ entry (x86_irq_handler does
+     * bkl_lock too). bkl_unlock is now a no-op for non-owners (commit
+     * 9d0784f), so safe regardless of how we got here. */
     for (;;) {
         if (!scheduler_yield()) {
-            /* Nothing runnable: drop the BKL so other cores proceed, sleep
-             * the CPU until the next interrupt (LAPIC timer or a reschedule
-             * IPI from wake_sleepers / scheduler_wake_all, M28 #6), then
-             * re-take the BKL and try scheduling again.
-             *
-             * `sti; hlt` is the canonical idle idiom — STI has a one-
-             * instruction grace window during which interrupts can't fire,
-             * so a pending IRQ that arrived while we held BKL won't be
-             * lost between unlock and hlt. */
             bkl_unlock();
             __asm__ volatile("sti; hlt" : : : "memory");
-            bkl_lock();
         }
     }
 }

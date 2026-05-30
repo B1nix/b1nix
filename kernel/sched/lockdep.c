@@ -47,7 +47,13 @@ void lockdep_acquire(int level, const char *name) {
         panic("lockdep: stack overflow");
     }
 
-    if (s->depth > 0 && s->levels[s->depth - 1] >= level) {
+    /* Strict-> inversion check. Same-level acquisition of two distinct lock
+     * instances (e.g. rename locking parent and grandparent inodes in pointer
+     * order) is legitimate and must be allowed; the DAG only constrains
+     * cross-level order. Recursive re-acquisition of the SAME instance is
+     * caught by each lock's own machinery (BKL bumps depth_owner, spinlocks
+     * deadlock-detect via their cmpxchg loop). */
+    if (s->depth > 0 && s->levels[s->depth - 1] > level) {
         console_write("LOCKDEP: ORDER INVERSION on cpu ");
         console_write_dec(cpu);
         console_write("\n  trying to acquire ");

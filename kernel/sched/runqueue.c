@@ -1,4 +1,5 @@
 #include <b1nix/lapic.h>
+#include <b1nix/lockdep.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
@@ -13,20 +14,24 @@
 
 void rq_enqueue(struct runqueue *rq, struct task *t) {
     spin_lock(&rq->lock);
+    LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     t->next_run = NULL;
     if (rq->tail) { rq->tail->next_run = t; rq->tail = t; }
     else          { rq->head = t; rq->tail = t; }
+    LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
     spin_unlock(&rq->lock);
 }
 
 struct task *rq_dequeue(struct runqueue *rq) {
     spin_lock(&rq->lock);
+    LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *t = rq->head;
     if (t) {
         rq->head = t->next_run;
         t->next_run = NULL;
         if (!rq->head) rq->tail = NULL;
     }
+    LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
     spin_unlock(&rq->lock);
     return t;
 }

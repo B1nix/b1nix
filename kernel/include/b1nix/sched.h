@@ -20,6 +20,18 @@ enum task_state {
   TASK_SLEEPING,
   TASK_STOPPED,
   TASK_DEAD,
+  /* Intermediate state between TASK_DEAD and TASK_UNUSED — the parent (or any
+   * waitpid caller in the flat process model) has won the atomic CAS from
+   * DEAD->REAPING and is now freeing the task's resources (user_image,
+   * page tables, name, stack). free_task_slot() flips it to UNUSED at the end.
+   *
+   * Without this distinct state, two CPUs racing waitpid against the same
+   * dead child both observe state == DEAD and proceed to free its memory
+   * twice — a kernel UAF. Under BKL this couldn't happen (only one CPU in
+   * kernel code at a time); under fine-grained locking it can, which is
+   * what M28 #7 is preparing for. Skipped by every walker that already
+   * skips DEAD (scheduler_task_count, pick_next_task, scheduler_dump_tasks). */
+  TASK_REAPING,
 };
 
 struct cpu_context {
