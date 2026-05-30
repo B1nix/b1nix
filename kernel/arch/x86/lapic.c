@@ -119,6 +119,24 @@ void lapic_send_ipi_allbutself(u32 icr_low) {
         __asm__ volatile("pause");
 }
 
+void lapic_init_local(void) {
+    /* Software enable LAPIC via SVR — the CPU otherwise drops every locally
+     * delivered interrupt (timer, IPI). Spurious vector goes in the low byte. */
+    u32 svr = lapic_read(LAPIC_SVR);
+    svr |= LAPIC_SVR_ENABLE;
+    svr &= ~LAPIC_SVR_FOCUS_DISABLE;
+    svr = (svr & ~0xFF) | LAPIC_SPURIOUS_VECTOR;
+    lapic_write(LAPIC_SVR, svr);
+
+    /* Mask unused LVT entries (not LINT0/LINT1 — those carry PIC interrupts). */
+    lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_LVT_THERMAL, LAPIC_LVT_MASKED);
+    lapic_write(LAPIC_LVT_PERFMON, LAPIC_LVT_MASKED);
+
+    /* TPR = 0 so every vector >= 0x10 is accepted. */
+    lapic_write(LAPIC_TPR, 0);
+}
+
 void lapic_init(void) {
     /* Check CPUID for APIC presence */
     u32 eax, ebx, ecx, edx;
@@ -158,20 +176,12 @@ void lapic_init(void) {
     console_write_dec(max_lvt);
     console_write("\n");
 
-    /* Software enable LAPIC via SVR */
-    u32 svr = lapic_read(LAPIC_SVR);
-    svr |= LAPIC_SVR_ENABLE;
-    svr &= ~LAPIC_SVR_FOCUS_DISABLE; /* enable focus checking */
-    svr = (svr & ~0xFF) | LAPIC_SPURIOUS_VECTOR;
-    lapic_write(LAPIC_SVR, svr);
-
-    /* Mask unused LVT entries (not LINT0/LINT1 — they carry PIC interrupts) */
-    lapic_write(LAPIC_LVT_ERROR, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_THERMAL, LAPIC_LVT_MASKED);
-    lapic_write(LAPIC_LVT_PERFMON, LAPIC_LVT_MASKED);
-
-    /* Set task priority to accept all interrupts */
-    lapic_write(LAPIC_TPR, 0);
+    /* Per-CPU LAPIC state — factored into lapic_init_local so APs can run
+     * the same setup from x86_ap_arch_init. Before this factoring, AP LAPICs
+     * stayed software-disabled and every locally-delivered vector (timer,
+     * IPI) was silently dropped — invisible until M28 #5's TLB shootdown
+     * actually needed the IPI to arrive. */
+    lapic_init_local();
 
     console_write("lapic: initialized (id=");
     console_write_dec(lapic_id());
@@ -382,11 +392,17 @@ void ap_main(u32 cpu_id) {
     bkl_lock();                  /* AP now holds the BKL at depth 1 */
     for (;;) {
         if (!scheduler_yield()) {
-            /* Nothing runnable: drop the BKL so other cores proceed, pause, and
-             * re-take it before scheduling again. */
+            /* Nothing runnable: drop the BKL so other cores proceed, sleep
+             * the CPU until the next interrupt (LAPIC timer or a reschedule
+             * IPI from wake_sleepers / scheduler_wake_all, M28 #6), then
+             * re-take the BKL and try scheduling again.
+             *
+             * `sti; hlt` is the canonical idle idiom — STI has a one-
+             * instruction grace window during which interrupts can't fire,
+             * so a pending IRQ that arrived while we held BKL won't be
+             * lost between unlock and hlt. */
             bkl_unlock();
-            for (volatile int i = 0; i < 2000; i++)
-                __asm__ volatile("pause");
+            __asm__ volatile("sti; hlt" : : : "memory");
             bkl_lock();
         }
     }

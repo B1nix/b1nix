@@ -88,6 +88,15 @@ struct runqueue {
 /* APIC timer vector for scheduling */
 #define LAPIC_TIMER_VECTOR       0x40
 
+/* TLB shootdown IPI vector (M28 #5). Targets invalidate the requested vaddr
+ * range from their local TLB then decrement the pending counter. */
+#define TLB_SHOOTDOWN_VECTOR     0x41
+
+/* Reschedule IPI (M28 #6). A no-op handler whose sole purpose is to wake a
+ * CPU out of `sti; hlt` in its idle loop so it can re-poll the global
+ * runqueue. EOI inside the handler; no other state. */
+#define RESCHEDULE_VECTOR        0x42
+
 /* NMI IPI vector */
 #define SMP_NMI_IPI_VECTOR       0x30
 
@@ -159,6 +168,14 @@ static inline struct percpu *get_percpu(void) {
 
 /* APIC / SMP API */
 void lapic_init(void);
+/* Per-CPU LAPIC software-enable + LVT masking + TPR clear. lapic_init runs
+ * this on the BSP transparently; each AP must call it from x86_ap_arch_init
+ * before any interrupt (timer tick, IPI, etc.) can be delivered to that CPU.
+ * Before this lands, an AP's LAPIC stays in its reset state (SVR.SoftEnable
+ * = 0) so every locally-delivered vector — including the LAPIC timer tick
+ * we armed in M28-A and the TLB shootdown IPI in M28 #5 — is silently
+ * dropped. */
+void lapic_init_local(void);
 void lapic_eoi(void);
 void lapic_timer_start(u32 init_count);
 /* Arm the LAPIC timer in periodic mode at LAPIC_TIMER_VECTOR with a period of

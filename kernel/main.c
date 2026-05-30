@@ -187,8 +187,12 @@ void kernel_main(u64 arg0, u64 arg1)
 	 * APs running userspace. */
 	while (scheduler_task_count() > 1) {
 		if (!scheduler_yield()) {
+			/* M28 #6: same `sti; hlt` idiom the APs use — sleep until the
+			 * next interrupt (LAPIC tick or reschedule IPI from another
+			 * CPU). Replaces a bare `pause`, which spun until the next
+			 * implicit poll. */
 			bkl_unlock();
-			__asm__ volatile("pause");
+			__asm__ volatile("sti; hlt" : : : "memory");
 			bkl_lock();
 		}
 	}
