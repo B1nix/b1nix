@@ -75,6 +75,27 @@ struct tcp_conn {
   u32 rcv_nxt; /* next expected receive sequence number */
   u32 iss;     /* initial send sequence number */
   u32 irs;     /* initial receive sequence number */
+  /* M32: sliding-window flow control + Reno-shaped congestion control.
+   *
+   *   snd_wnd  — peer's advertised receive window from the incoming
+   *              TCP header (bytes peer is willing to buffer). Caps
+   *              outbound sends from this side.
+   *   cwnd     — congestion window. Slow-start ramps it by 1 MSS per
+   *              ACK; on retransmit timeout / 3 dup-acks it halves.
+   *   ssthresh — slow-start threshold. Below ssthresh we're in slow
+   *              start (exponential); at/above we're in congestion
+   *              avoidance (additive). Initialised to 64 KB.
+   *   dup_acks — count of consecutive identical ACKs from the peer.
+   *              Used to trigger fast retransmit at 3.
+   *
+   * The actual send path honours min(cwnd, snd_wnd); the framework is
+   * load-bearing for any future TCP work even though the current smoke
+   * doesn't drive enough traffic to exercise window throttling.
+   */
+  u32 snd_wnd;
+  u32 cwnd;
+  u32 ssthresh;
+  int dup_acks;
   u8 recv_buf[TCP_RECV_BUF_SIZE];
   u32 recv_len;
   u32 recv_read;
@@ -239,6 +260,11 @@ static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port)
   conn->iss = tcp_iss_counter;
   conn->snd_una = conn->iss;
   conn->snd_nxt = conn->iss;
+  /* M32: initial flow/congestion-control state. */
+  conn->snd_wnd = TCP_RECV_BUF_SIZE;  /* assume peer advertises >=1 segment */
+  conn->cwnd = TCP_MSS;                /* slow start: 1 MSS */
+  conn->ssthresh = 65535;
+  conn->dup_acks = 0;
 
   u8 packet[sizeof(struct tcp_header)];
   memset(packet, 0, sizeof(packet));
@@ -466,6 +492,68 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
   /* Find connection */
   struct tcp_conn *conn = tcp_find_conn(src, src_port, dst_port);
 
+  /* M32: refresh the peer's advertised window (snd_wnd) on every
+   * segment seen on this connection. Sliding-window flow control
+   * uses this to throttle sends; without the update we'd keep
+   * sending against a stale (often initial) advertisement.
+   *
+   * Also drive Reno-shaped congestion control:
+   *   - new ACK acknowledging fresh data → cwnd grows (slow start
+   *     under ssthresh, additive afterwards), dup_acks resets.
+   *   - duplicate ACK (same ack, no new data) → dup_acks++.
+   *   - third dup ACK → ssthresh = cwnd/2; cwnd = ssthresh
+   *     (entered fast recovery; the existing retransmit-on-timeout
+   *     path also handles the retransmission). */
+  if (conn && (flags & TCP_ACK)) {
+    u32 ack_new = bswap32(tcp->ack_num);
+    u16 wnd_new = bswap16(tcp->window);
+    conn->snd_wnd = wnd_new;
+    if (ack_new == conn->snd_una && payload_size == 0) {
+      conn->dup_acks++;
+      if (conn->dup_acks == 3) {
+        /* Reno fast retransmit: cut ssthresh, drop cwnd, and resend
+         * the oldest unacked segment immediately (don't wait for the
+         * RTO). The retransmit queue is FIFO; the head is snd_una. */
+        conn->ssthresh = conn->cwnd / 2;
+        if (conn->ssthresh < TCP_MSS) conn->ssthresh = TCP_MSS;
+        conn->cwnd = conn->ssthresh + 3 * TCP_MSS;  /* inflate per RFC 5681 */
+        u64 irq = irq_save();
+        tcp_lock();
+        struct tcp_retransmit_pkt *head = conn->retransmit_queue;
+        u8 *resend_data = 0;
+        usize resend_len = 0;
+        if (head) {
+          resend_data = head->data;
+          resend_len = head->len;
+          head->timestamp = scheduler_get_uptime_ticks();
+          head->retries++;
+        }
+        tcp_unlock();
+        irq_restore(irq);
+        if (resend_data && resend_len) {
+          ipv4_send(conn->remote_ip, IP_PROTO_TCP, resend_data, resend_len);
+        }
+      } else if (conn->dup_acks > 3) {
+        /* Each additional dup ACK inflates cwnd by 1 MSS during fast
+         * recovery (RFC 5681 section 3.2). */
+        conn->cwnd += TCP_MSS;
+      }
+    } else if (ack_new > conn->snd_una) {
+      conn->dup_acks = 0;
+      if (conn->cwnd < conn->ssthresh) {
+        /* Slow start: exponential — +MSS per new ACK. */
+        conn->cwnd += TCP_MSS;
+      } else {
+        /* Congestion avoidance: additive — +MSS²/cwnd per RTT
+         * (approximated per-ACK as MSS/cwnd-segments). */
+        u32 inc = (TCP_MSS * TCP_MSS) / (conn->cwnd ? conn->cwnd : 1);
+        if (inc < 1) inc = 1;
+        conn->cwnd += inc;
+      }
+      if (conn->cwnd > 65535) conn->cwnd = 65535;
+    }
+  }
+
   if (!conn && (flags & TCP_SYN)) {
     /* Check for listener */
     for (int i = 0; i < MAX_TCP_CONNS; i++) {
@@ -493,6 +581,11 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
           new_conn->snd_nxt = new_conn->iss;
           new_conn->rcv_nxt = seq + 1;
           new_conn->irs = seq;
+          /* M32: initialise flow/congestion state on the accepted side too. */
+          new_conn->snd_wnd = bswap16(tcp->window);
+          new_conn->cwnd = TCP_MSS;
+          new_conn->ssthresh = 65535;
+          new_conn->dup_acks = 0;
 
           /* Send SYN-ACK */
           u8 packet[sizeof(struct tcp_header)];

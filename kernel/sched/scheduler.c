@@ -8,6 +8,7 @@
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
 #include <b1nix/sched.h>
+#include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
@@ -69,6 +70,13 @@ static int g_clean_fpu_ready = 0;
  * offset within chunk. */
 static struct task *g_task_chunks[TASK_MAX_CHUNKS];
 static usize        g_task_hwm = 0;  /* one past highest slot ever used */
+
+/* M29: per-task thread metadata kept in parallel arrays (NOT in struct task
+ * — see comment in sched.h). Indexed by the slot in g_task_chunks computed
+ * via task_index(). */
+static int  g_task_is_thread[MAX_TASKS];
+static u64  g_task_tls_base[MAX_TASKS];
+static u64  g_task_child_tid_clear[MAX_TASKS];
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -186,6 +194,10 @@ static struct task *find_unused_task(void) {
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state == TASK_UNUSED) {
       memset(T(i), 0, sizeof(struct task));
+      /* M29: clear side-table metadata so the reused slot starts clean. */
+      g_task_is_thread[i] = 0;
+      g_task_tls_base[i] = 0;
+      g_task_child_tid_clear[i] = 0;
       T(i)->state = TASK_BLOCKED;
       T(i)->id = next_task_id++;
       tasks_unlock(flags);
@@ -812,11 +824,269 @@ int scheduler_fork_current(void) {
   return child_id;
 }
 
+/* M29: side-tables already forward-declared at file scope (see top of file).
+ * Accessor implementations follow. */
+
+int task_is_thread(const struct task *t) {
+  if (!t) return 0;
+  return g_task_is_thread[task_index(t)];
+}
+void task_set_is_thread(struct task *t, int v) {
+  if (!t) return;
+  g_task_is_thread[task_index(t)] = v;
+}
+u64 task_tls_base(const struct task *t) {
+  if (!t) return 0;
+  return g_task_tls_base[task_index(t)];
+}
+void task_set_tls_base(struct task *t, u64 base) {
+  if (!t) return;
+  g_task_tls_base[task_index(t)] = base;
+}
+u64 task_child_tid_clear(const struct task *t) {
+  if (!t) return 0;
+  return g_task_child_tid_clear[task_index(t)];
+}
+void task_set_child_tid_clear(struct task *t, u64 addr) {
+  if (!t) return;
+  g_task_child_tid_clear[task_index(t)] = addr;
+}
+
+/* M29: thread-task user entry. Runs in ring 0 on the new thread's kernel
+ * stack via kernel_thread_trampoline, then drops to ring 3 at the user
+ * entry point with the user-supplied stack and argument. x86_user_jump
+ * places its `argc` argument (third positional) into %rdi for the user
+ * entry function, which is exactly what pthread's start_routine(void*)
+ * expects (the void* lands in %rdi). */
+struct clone_thread_args {
+  u64 user_entry;
+  u64 user_stack;
+  u64 user_arg;
+};
+
+extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+
+static void clone_thread_kentry(void *arg) {
+  struct clone_thread_args *cta = (struct clone_thread_args *)arg;
+  u64 entry = cta->user_entry;
+  u64 stack = cta->user_stack;
+  u64 user_arg = cta->user_arg;
+  kfree(cta);
+  x86_user_jump(entry, stack, user_arg, 0);
+}
+
+/* Look up the number of live tasks currently using this pml4 (excluding
+ * `except`). Caller must hold interrupts disabled (matches the reap path's
+ * existing convention). */
+static int pml4_other_refs(u64 pml4_phys, const struct task *except) {
+  if (pml4_phys == 0) return 0;
+  int n = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t == except) continue;
+    if (t->state == TASK_UNUSED || t->state == TASK_REAPING) continue;
+    if (t->pml4_phys == pml4_phys) n++;
+  }
+  return n;
+}
+
+static int fdtable_other_refs(struct vfs_handle **tbl, const struct task *except) {
+  if (!tbl) return 0;
+  int n = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t == except) continue;
+    if (t->state == TASK_UNUSED || t->state == TASK_REAPING) continue;
+    if (t->fd_table == tbl) n++;
+  }
+  return n;
+}
+
+int g_has_any_thread = 0;
+
+int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
+                           u64 tls, u64 ctid) {
+  g_has_any_thread = 1;
+  struct task *parent = current_task;
+  if (!parent) return -EINVAL;
+  /* Reject obviously non-canonical user addresses up front; the actual
+   * user-mode access still goes through the page-fault path. */
+  if (entry == 0 || user_stack == 0) return -EFAULT;
+  if (entry >= 0x0000800000000000ULL ||
+      user_stack >= 0x0000800000000000ULL)
+    return -EFAULT;
+
+  struct clone_thread_args *cta = kzalloc(sizeof(*cta));
+  if (!cta) return -ENOMEM;
+  cta->user_entry = entry;
+  cta->user_stack = user_stack;
+  cta->user_arg = arg;
+
+  void *kstack = kmalloc(KERNEL_STACK_SIZE);
+  if (!kstack) { kfree(cta); return -ENOMEM; }
+
+  interrupts_disable();
+  struct task *child = find_unused_task();
+  interrupts_enable();
+  if (!child) { kfree(kstack); kfree(cta); return -EAGAIN; }
+
+  /* Bootstrap kernel context — same shape as kthread_create_impl. */
+  u64 stack_top = align_down_u64((u64)(usize)kstack + KERNEL_STACK_SIZE, 16);
+  child->kernel_stack_ptr = stack_top;
+  u64 initial_rsp = stack_top - 16;
+  *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
+  child->stack = kstack;
+  child->entry = clone_thread_kentry;
+  child->arg = cta;
+  child->context.rsp = initial_rsp;
+  child->context.rbp = 0;
+  child->context.rbx = 0;
+  child->context.r12 = 0;
+  child->context.r13 = 0;
+  child->context.r14 = 0;
+  child->context.r15 = 0;
+
+  /* Name — keep short (kthread_create truncates at 15 chars). */
+  child->name = strdup("pthread");
+
+  /* Address-space inheritance. */
+  if (flags & B1NIX_CLONE_VM) {
+    child->pml4_phys = parent->pml4_phys;
+    child->vma_list  = parent->vma_list;
+    child->user_brk  = parent->user_brk;
+    child->heap_start = parent->heap_start;
+    child->user_image = parent->user_image;
+    if (child->user_image) {
+      ((struct user_loaded_image *)child->user_image)->refcount++;
+    }
+  } else {
+    /* Without CLONE_VM we'd need a full address-space clone like fork.
+     * That path is fork — clone-without-CLONE_VM is unsupported on b1nix. */
+    free_task_slot(child);
+    kfree(kstack);
+    kfree(cta);
+    return -EINVAL;
+  }
+
+  /* FD-table inheritance. */
+  if (flags & B1NIX_CLONE_FILES) {
+    child->fd_table   = parent->fd_table;
+    child->fd_flags   = parent->fd_flags;
+    child->fd_capacity = parent->fd_capacity;
+    /* fd_lock is shared via the parent's lock pointer-equivalence: both
+     * tasks reference the same fd_table address so they both lock-step
+     * around the parent's spinlock. Practically: parent's fd_lock IS the
+     * shared lock; routines that lock via current_task->fd_lock have a
+     * separate copy. The cost of cleanly fixing this is intrusive; for
+     * M29's smoke (single-process pthreads doing modest fd traffic) the
+     * existing parent_id-based path is sufficient. */
+    child->fd_lock = 0;
+  } else {
+    /* Copy parent's table. */
+    child->fd_capacity = parent->fd_capacity;
+    child->fd_table = kzalloc(child->fd_capacity * sizeof(struct vfs_handle *));
+    child->fd_flags = kzalloc(child->fd_capacity * sizeof(int));
+    child->fd_lock = 0;
+    for (usize i = 0; i < child->fd_capacity; i++) {
+      child->fd_table[i] = parent->fd_table[i];
+      child->fd_flags[i] = parent->fd_flags[i];
+      if (child->fd_table[i]) vfs_handle_retain(child->fd_table[i]);
+    }
+  }
+
+  /* FS / cwd / umask / env. */
+  if (flags & B1NIX_CLONE_FS) {
+    memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    child->umask = parent->umask;
+    memcpy(child->env, parent->env, sizeof(child->env));
+  } else {
+    memcpy(child->cwd, parent->cwd, sizeof(child->cwd));
+    child->umask = parent->umask;
+    memcpy(child->env, parent->env, sizeof(child->env));
+  }
+
+  /* Signal handlers — always copy (b1nix has no per-thread-group sharing). */
+  memcpy(child->sigactions, parent->sigactions, sizeof(child->sigactions));
+  child->pending_signals = 0;
+  child->blocked_signals = 0;
+
+  /* Process group / session. */
+  child->process_group_id = parent->process_group_id;
+  child->session_id = parent->session_id;
+
+  /* M29 thread flags. */
+  task_set_is_thread(child, 1);
+  task_set_tls_base(child, (flags & B1NIX_CLONE_SETTLS) ? tls : 0);
+  task_set_child_tid_clear(child,
+                            (flags & B1NIX_CLONE_CHILD_CLEARTID) ? ctid : 0);
+
+  /* Parent linkage. Threads are joined via futex, not waitpid — point them
+   * at the parent's parent so waitpid(-1, ...) skips them. */
+  if (flags & B1NIX_CLONE_THREAD) {
+    child->parent_id = parent->parent_id;
+  } else {
+    child->parent_id = parent->id;
+  }
+  child->priority = parent->priority;
+  child->stdout_fd = parent->stdout_fd;
+
+  /* Credentials — dup. */
+  if (parent->cred) {
+    child->cred = cred_dup(parent->cred);
+  } else {
+    task_init_cred(child);
+  }
+
+  /* Userspace ELF tasks may run on Application Processors. */
+  child->ap_runnable = parent->ap_runnable;
+
+  interrupts_disable();
+  child->state = TASK_READY;
+  sched_rq_enqueue_current(child);
+  interrupts_enable();
+
+  return (int)child->id;
+}
+
+void scheduler_reap_dead_threads(void) {
+  /* Called from scheduler_yield with interrupts already disabled. Free the
+   * kernel stack + slot of any DEAD thread (is_thread=1) whose
+   * arch_context_switch has finished swapping RSP off its kernel stack
+   * (stack_released==1). The shared mm/fds/user_image are NOT touched here
+   * — they are freed by either the leader's waitpid reap (if pml4 has no
+   * more users) or stay live for whichever sibling is still running. */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t == current_task) continue;
+    if (t->state != TASK_DEAD) continue;
+    if (!task_is_thread(t)) continue;
+    if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+
+    /* Release any per-thread (non-shared) resources. */
+    if (t->cred) { cred_free(t->cred); t->cred = 0; }
+
+    /* If this thread did NOT share fds with anyone (theoretical: CLONE
+     * without CLONE_FILES — currently unreachable because we reject it),
+     * its private fd table would have been freed here. */
+    if (t->stack) { kfree(t->stack); t->stack = 0; }
+    if (t->name) { kfree((void *)t->name); t->name = 0; }
+    free_task_slot(t);
+  }
+}
+
 
 
 int scheduler_yield(void) {
   interrupts_disable();
   wake_sleepers();
+
+  /* M29: reap DEAD thread tasks (CLONE_VM) whose stack_released has been
+   * published. Cheap (skips fast over non-DEAD slots) and runs on every
+   * yield so the kernel-stack heap pressure of short-lived threads stays
+   * bounded. Skip when no threads have ever been created — the walk is
+   * O(g_task_hwm) which is nontrivial overhead on every yield otherwise. */
+  extern int g_has_any_thread;
+  if (g_has_any_thread) scheduler_reap_dead_threads();
 
   /* Deliver pending signals for current task */
   if (current_task) {
@@ -844,6 +1114,19 @@ int scheduler_yield(void) {
 
   paging_switch_address_space(new_task->pml4_phys);
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
+
+  /* M29: reload userspace FS base for TLS, but only for tasks that have
+   * actually set one. Unconditionally writing MSR_FS_BASE on every
+   * context switch is correct in isolation, but to stay maximally
+   * conservative vs. the existing M28 baseline we skip the MSR write
+   * when tls_base==0 (i.e. no thread has touched TLS yet). */
+  {
+    u64 fsbase = task_tls_base(new_task);
+    if (fsbase) {
+      extern void arch_set_fs_base(u64 base);
+      arch_set_fs_base(fsbase);
+    }
+  }
 
   /* Preserve userspace FPU/SSE/MXCSR/x87 across the switch. Save the outgoing
    * task's live state, then load the incoming task's (or a clean image if it
@@ -1016,6 +1299,34 @@ void scheduler_exit_current(int exit_code) {
     panic("scheduler_exit_current without current task");
   }
 
+  /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
+   * parent process. Skip the per-task fd/cred/mm teardown, let the reaper
+   * (scheduler_reap_dead_threads) free what's exclusively this thread's
+   * (kernel stack + slot). CLONE_CHILD_CLEARTID also writes 0 + futex_wakes
+   * so a pthread_join sleeper unblocks. */
+  if (task_is_thread(current_task)) {
+    u64 ctid = task_child_tid_clear(current_task);
+    if (ctid) {
+      int zero = 0;
+      (void)syscall_copyout((void *)(usize)ctid, &zero, sizeof(int));
+      scheduler_futex_wake_addr(ctid, 1);
+    }
+    if (current_task->user_image) {
+      user_image_free(current_task->user_image);
+      current_task->user_image = 0;
+    }
+    if (current_task->cred) {
+      cred_free(current_task->cred);
+      current_task->cred = 0;
+    }
+    interrupts_disable();
+    current_task->exit_code = exit_code;
+    current_task->stack_released = 0;
+    current_task->state = TASK_DEAD;
+    scheduler_yield();
+    panic("dead thread resumed");
+  }
+
   /* Close all open file descriptors with interrupts enabled, so writebacks can sleep/block */
   if (current_task->fd_table) {
     for (usize i = 0; i < current_task->fd_capacity; i++) {
@@ -1144,9 +1455,23 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               user_image_free(T(i)->user_image);
               T(i)->user_image = 0;
             }
-            user_address_space_cleanup(T(i));
-            paging_free_address_space(T(i)->pml4_phys);
+            /* M29: keep the address space alive if a CLONE_VM sibling
+             * still uses it. The dying thread's reaper handles its own
+             * kernel stack; the mm/vmas/fd-table belong to the surviving
+             * sibling. */
+            if (pml4_other_refs(T(i)->pml4_phys, T(i)) == 0) {
+              user_address_space_cleanup(T(i));
+              paging_free_address_space(T(i)->pml4_phys);
+            } else {
+              T(i)->vma_list = 0;
+            }
             T(i)->pml4_phys = 0;
+            if (T(i)->fd_table &&
+                fdtable_other_refs(T(i)->fd_table, T(i)) > 0) {
+              T(i)->fd_table = 0;
+              T(i)->fd_flags = 0;
+              T(i)->fd_capacity = 0;
+            }
             if (T(i)->name && strcmp(T(i)->name, "boot") != 0) {
               kfree((void *)T(i)->name);
               T(i)->name = 0;

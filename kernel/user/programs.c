@@ -3345,6 +3345,57 @@ static int init_main(int argc, const char **argv) {
     syscall_dispatch(SYS_WAIT, m26_pid, (u64)(usize)&m26_status, 0, 0, 0, 0);
   }
 
+  /* M29: POSIX threads / futex / TLS. */
+  {
+    u64 m29_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m29-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m29_pid < 0) {
+      uwrite("M29-PTHREAD: spawn-fail\n");
+    } else {
+      int m29_status = 0;
+      syscall_dispatch(SYS_WAIT, m29_pid, (u64)(usize)&m29_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M31: user security / setuid / shadow. */
+  {
+    u64 m31_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m31-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m31_pid < 0) {
+      uwrite("M31-SEC: spawn-fail\n");
+    } else {
+      int m31_status = 0;
+      syscall_dispatch(SYS_WAIT, m31_pid, (u64)(usize)&m31_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M32: select() / network multiplexing. */
+  {
+    u64 m32_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m32-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m32_pid < 0) {
+      uwrite("M32-NET: spawn-fail\n");
+    } else {
+      int m32_status = 0;
+      syscall_dispatch(SYS_WAIT, m32_pid, (u64)(usize)&m32_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
+   * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
+   * the base offset correctly, the pointer-table dereferences land on
+   * valid strings and we get the M30-DYN: markers. */
+  {
+    u64 m30_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m30-pie", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m30_pid < 0) {
+      uwrite("M30-DYN: spawn-fail\n");
+    } else {
+      int m30_status = 0;
+      syscall_dispatch(SYS_WAIT, m30_pid, (u64)(usize)&m30_status, 0, 0, 0, 0);
+    }
+  }
+
   uwrite("M16-SMOKE: start\n");
   struct b1nix_termios m16_termios_before;
   memset(&m16_termios_before, 0, sizeof(m16_termios_before));

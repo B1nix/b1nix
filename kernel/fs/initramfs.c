@@ -18,6 +18,11 @@
 #include "../../build/x86/initramfs_m26_smoke.inc"
 #include "../../build/x86/initramfs_m24b_smoke.inc"
 #include "../../build/x86/initramfs_m27_smoke.inc"
+#include "../../build/x86/initramfs_m29_smoke.inc"
+#include "../../build/x86/initramfs_m31_smoke.inc"
+#include "../../build/x86/initramfs_m31_setuid.inc"
+#include "../../build/x86/initramfs_m32_smoke.inc"
+#include "../../build/x86/initramfs_m30_pie.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -61,11 +66,19 @@ static const char initramfs_fstab[] =
     "nvme0         /mnt     ext2        noauto     0      0\n"
     "nvme0         /btrfs   btrfs       noauto     0      0\n";
 
-/* User database. name:passwd:uid:gid:gecos:home:shell (passwd "x" = no shadow
- * db; b1nix login does not check passwords yet). */
+/* User database. name:passwd:uid:gid:gecos:home:shell. The pw_passwd
+ * field is "x", meaning the real hash lives in /etc/shadow. */
 static const char initramfs_passwd[] =
     "root:x:0:0:root:/root:/bin/sh\n"
     "user:x:1000:1000:b1nix user:/home/user:/bin/sh\n";
+
+/* M31: shadow database. Format: name:hash:lastchange:min:max:warn:inactive:expire:reserved
+ * Empty fields after the hash are POSIX-compliant placeholders. The hash
+ * is b1nix's $b1$<salt>$<base64> format (kernel/lib/crypt.c). Passwords
+ * here are 'root' and 'user' — change via /bin/passwd. */
+static const char initramfs_shadow[] =
+    "root:$b1$rootsalt$YLR0bb6kf/9n3oGVFfPVbAVfAqs.k/9jnNVshpAFNbj6hBY2OZmMg6Jav8muEuSt8vkIU8mahAr9KwerDzvv6Q:0:0:99999:7:::\n"
+    "user:$b1$usersalt$BaxHIimflG4IPjGvD7HDPKcnI1nRIILqEKYNIyHy6iDPeyxWpyqT4p5Hir8Iauy.ZiTCnjIUPj1KKlgdLNBHXQ:0:0:99999:7:::\n";
 
 /* Boot rc script: init runs this once at startup, before the login shell.
  * The /persist block is first-boot setup for the persistent root image; it is
@@ -341,8 +354,26 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m27-smoke", (const char *)vfs_m27_smoke_elf,
      sizeof(vfs_m27_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m29-smoke", (const char *)vfs_m29_smoke_elf,
+     sizeof(vfs_m29_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m31-smoke", (const char *)vfs_m31_smoke_elf,
+     sizeof(vfs_m31_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m31-setuid", (const char *)vfs_m31_setuid_elf,
+     sizeof(vfs_m31_setuid_elf),
+     INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
+    {"/bin/m32-smoke", (const char *)vfs_m32_smoke_elf,
+     sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
+     sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+    /* M30: the dynamic linker file is shipped as the PIE binary itself —
+     * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
+     * exists as a name on disk that PT_INTERP can reference even though
+     * b1nix doesn't hand control off to a separate userspace ld.so. */
+    {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,
+     sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
+    {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,

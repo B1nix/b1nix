@@ -1,5 +1,6 @@
 #include <b1nix/blk.h>
 #include <b1nix/btrfs.h>
+#include <b1nix/crypt.h>
 #include <b1nix/dirent.h>
 #include <b1nix/net.h>
 #include <b1nix/pci.h>
@@ -1924,13 +1925,88 @@ static int login_lookup(const char *name, int *uid, int *gid, char *home,
   return 0;
 }
 
+/* M31: look up a user's shadow entry. Writes the hash field to `hash`
+ * (NUL-terminated). Returns 1 on success, 0 if user missing, -1 on I/O
+ * error. */
+static int shadow_lookup(const char *name, char *hash, usize hash_sz) {
+  char buf[2048];
+  isize n = bb_read_file("/etc/shadow", buf, sizeof(buf));
+  if (n <= 0) return -1;
+
+  char *line = buf;
+  while (line && *line) {
+    char *nl = strchr(line, '\n');
+    if (nl) *nl = '\0';
+    if (line[0] && line[0] != '#') {
+      char *colon = strchr(line, ':');
+      if (colon) {
+        *colon = '\0';
+        if (strcmp(line, name) == 0) {
+          char *hash_start = colon + 1;
+          char *hash_end = strchr(hash_start, ':');
+          usize hlen = hash_end ? (usize)(hash_end - hash_start)
+                                : strlen(hash_start);
+          if (hlen + 1 > hash_sz) return -1;
+          memcpy(hash, hash_start, hlen);
+          hash[hlen] = '\0';
+          return 1;
+        }
+      }
+    }
+    line = nl ? nl + 1 : 0;
+  }
+  return 0;
+}
+
+/* Parse a "$b1$<salt>$<hash>" string and extract just the salt portion.
+ * Returns 1 on success, 0 if the format doesn't match. */
+static int crypt_extract_salt(const char *hash, char *salt, usize salt_sz) {
+  if (strncmp(hash, "$b1$", 4) != 0) return 0;
+  const char *p = hash + 4;
+  const char *end = strchr(p, '$');
+  if (!end) return 0;
+  usize n = (usize)(end - p);
+  if (n + 1 > salt_sz) return 0;
+  memcpy(salt, p, n);
+  salt[n] = '\0';
+  return 1;
+}
+
+/* Verify `password` against the b1nix-format `expected` hash from
+ * /etc/shadow. Returns 1 on match, 0 on mismatch or malformed entry. */
+static int check_password(const char *password, const char *expected) {
+  char salt[64];
+  if (!crypt_extract_salt(expected, salt, sizeof(salt))) return 0;
+  char computed[256];
+  if (b1nix_crypt(password, salt, computed, sizeof(computed)) != 0) return 0;
+  return b1nix_crypt_equal(computed, expected);
+}
+
 static int login_main(int argc, const char **argv) {
   char namebuf[64];
-  const char *name;
+  char passbuf[128];
+  const char *name = 0;
+  const char *password = 0;
 
-  if (argc > 1) {
-    name = argv[1];
-  } else {
+  /* Argument parsing:
+   *   login                           — interactive (prompt for name + pass)
+   *   login NAME                      — non-interactive name, prompt for pass
+   *   login -p PASS NAME              — non-interactive (used by M31 smoke
+   *                                     so the test runs deterministically
+   *                                     without a tty for password entry)
+   *   login NAME PASS                 — non-interactive shorthand
+   */
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-p") == 0 && i + 1 < argc) {
+      password = argv[++i];
+    } else if (!name) {
+      name = argv[i];
+    } else if (!password) {
+      password = argv[i];
+    }
+  }
+
+  if (!name) {
     printf("login: ");
     isize r = (isize)syscall_dispatch(SYS_READ, 0, (u64)(usize)namebuf,
                                       sizeof(namebuf) - 1, 0, 0, 0);
@@ -1947,6 +2023,35 @@ static int login_main(int argc, const char **argv) {
   if (!login_lookup(name, &uid, &gid, home, sizeof(home), shell,
                     sizeof(shell))) {
     printf("login: unknown user '%s'\n", name);
+    return 1;
+  }
+
+  /* M31: verify password against /etc/shadow. */
+  char expected_hash[256];
+  int sh_rc = shadow_lookup(name, expected_hash, sizeof(expected_hash));
+  if (sh_rc < 0) {
+    printf("login: cannot read /etc/shadow\n");
+    return 1;
+  }
+  if (sh_rc == 0) {
+    printf("login: no shadow entry for '%s'\n", name);
+    return 1;
+  }
+
+  if (!password) {
+    printf("Password: ");
+    isize r = (isize)syscall_dispatch(SYS_READ, 0, (u64)(usize)passbuf,
+                                      sizeof(passbuf) - 1, 0, 0, 0);
+    if (r <= 0)
+      return 1;
+    while (r > 0 && (passbuf[r - 1] == '\n' || passbuf[r - 1] == '\r'))
+      r--;
+    passbuf[r] = '\0';
+    password = passbuf;
+  }
+
+  if (!check_password(password, expected_hash)) {
+    printf("login: authentication failed for '%s'\n", name);
     return 1;
   }
 

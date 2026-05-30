@@ -21,7 +21,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/unistd.o \
 	$(BUILD)/libc/ctype.o \
 	$(BUILD)/libc/dirent.o \
-	$(BUILD)/libc/pwd.o
+	$(BUILD)/libc/pwd.o \
+	$(BUILD)/libc/pthread.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \
@@ -37,12 +38,17 @@ BINARIES := \
 	$(BUILD)/bin/m25_smoke \
 	$(BUILD)/bin/m26_smoke \
 	$(BUILD)/bin/m24b_smoke \
-	$(BUILD)/bin/m27_smoke
+	$(BUILD)/bin/m27_smoke \
+	$(BUILD)/bin/m29_smoke \
+	$(BUILD)/bin/m31_smoke \
+	$(BUILD)/bin/m31_setuid \
+	$(BUILD)/bin/m32_smoke \
+	$(BUILD)/bin/m30_pie
 
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
 .PHONY: all clean install
@@ -74,6 +80,15 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(BUILD)/bin/native_smoke.o
+
+# M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the
+# linker emits ET_DYN with R_X86_64_RELATIVE relocations. No crt0 or
+# libb1nix.a — the body is self-contained inline-asm syscalls; the
+# kernel's PIE-aware loader takes care of base relocation.
+$(BUILD)/bin/m30_pie: bin/m30_pie.c linker_pie.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_pie.o
+	$(LD) $(LDFLAGS) -pie -T linker_pie.ld -o $@ $(BUILD)/bin/m30_pie.o
 
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)

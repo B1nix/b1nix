@@ -29,6 +29,10 @@ arch_context_switch:
 
 	movq 0(%rsi), %rsp
 
+/* M29: MSR_FS_BASE write is handled in C by scheduler_yield (it has the
+ * task pointer; this asm only knows about cpu_context). See arch_set_fs_base
+ * in kernel/arch/x86/arch.c. */
+
 	/* Publish "old kernel stack is no longer in use as RSP" — only after
 	 * the swap above, so no reaper can observe released=1 while we're
 	 * still on the old stack. rdx is allowed to be NULL. */
