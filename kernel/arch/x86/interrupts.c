@@ -11,6 +11,8 @@
 #include <b1nix/net.h>
 #include <b1nix/tlb.h>
 #include <b1nix/types.h>
+#include <stdio.h>
+#include <string.h>
 
 #define IDT_ENTRY_COUNT 256
 #define KERNEL_CODE_SELECTOR 0x08
@@ -330,6 +332,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       if (timer_ticks % 50 == 0) {
         fb_console_blink_cursor();
       }
+
       scheduler_on_timer_tick();
     }
     return;

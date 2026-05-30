@@ -219,6 +219,7 @@ struct task {
    * `state = TASK_DEAD` (x86 TSO orders the stores). `arch_context_switch`
    * sets `*released_publish = 1` AFTER the RSP swap. `scheduler_waitpid`
    * spins on `stack_released == 1` after winning the CAS, before kfree. */
+  volatile u32 bkl_depth;
   volatile int stack_released;
 
   /* SMP runqueue linkage (must be last field for ABI compat) */
