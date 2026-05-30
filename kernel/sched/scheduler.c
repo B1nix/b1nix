@@ -1,6 +1,7 @@
 #include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
@@ -48,7 +49,8 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
 #define TASK_ENV_VALUE_MAX 64
 
 extern void arch_context_switch(struct cpu_context *old_context,
-                                struct cpu_context *new_context);
+                                struct cpu_context *new_context,
+                                volatile int *released_publish);
 extern char x86_syscall_stack_top[];
 
 /* x86 FPU/SSE save/restore (kernel/arch/x86/fpu.S). The kernel is -mno-sse, so
@@ -125,6 +127,34 @@ static void task_init_cred(struct task *task);
  * word-atomic and are not covered here; only slot ownership is. */
 static spinlock_t g_tasks_lock = SPINLOCK_INIT;
 
+/* Lockdep-traced acquire/release helpers — wrap spin_lock_irqsave with the
+ * DAG level for the held-lock tracker. Inlines to a single store in
+ * production builds (KERNEL_LOCKDEP undef). Defined here rather than as
+ * macros because the level must be paired with the lock pointer at one
+ * place. */
+#include <b1nix/lockdep.h>
+static inline void tasks_lock(u64 *flags) {
+  spin_lock_irqsave(&g_tasks_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_TASKS);
+}
+static inline void tasks_unlock(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_TASKS);
+  spin_unlock_irqrestore(&g_tasks_lock, flags);
+}
+
+/* fd_lock helpers — wraps spin_lock/unlock on current_task->fd_lock with
+ * lockdep tracking. fd_lock is plain (no irq-save) because fd ops never
+ * fire from ISR context and the lock is process-local (only the owning
+ * task touches it). */
+static inline void fd_lock_acquire(void) {
+  spin_lock(&current_task->fd_lock);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_FD);
+}
+static inline void fd_lock_release(void) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_FD);
+  spin_unlock(&current_task->fd_lock);
+}
+
 #include <b1nix/arch.h>
 
 static u64 align_down_u64(u64 value, u64 alignment) {
@@ -150,7 +180,7 @@ static int ensure_task_chunk(usize c) {
  * (TASK_CHUNK_SIZE slots) on demand up to the MAX_TASKS ceiling. */
 static struct task *find_unused_task(void) {
   u64 flags;
-  spin_lock_irqsave(&g_tasks_lock, &flags);
+  tasks_lock(&flags);
 
   /* 1) Fast path: reuse a slot already in [0, g_task_hwm). */
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -158,7 +188,7 @@ static struct task *find_unused_task(void) {
       memset(T(i), 0, sizeof(struct task));
       T(i)->state = TASK_BLOCKED;
       T(i)->id = next_task_id++;
-      spin_unlock_irqrestore(&g_tasks_lock, flags);
+      tasks_unlock(flags);
       return T(i);
     }
   }
@@ -166,11 +196,11 @@ static struct task *find_unused_task(void) {
   /* 2) Slow path: extend the high-water mark, allocating a new chunk if the
    *    next slot crosses a chunk boundary. */
   if (g_task_hwm >= MAX_TASKS) {
-    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    tasks_unlock(flags);
     return 0;
   }
   if (!ensure_task_chunk(g_task_hwm >> 6)) {
-    spin_unlock_irqrestore(&g_tasks_lock, flags);
+    tasks_unlock(flags);
     return 0;
   }
   usize i = g_task_hwm++;
@@ -179,7 +209,7 @@ static struct task *find_unused_task(void) {
   memset(T(i), 0, sizeof(struct task));
   T(i)->state = TASK_BLOCKED;
   T(i)->id = next_task_id++;
-  spin_unlock_irqrestore(&g_tasks_lock, flags);
+  tasks_unlock(flags);
   return T(i);
 }
 
@@ -188,9 +218,9 @@ static struct task *find_unused_task(void) {
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
   u64 flags;
-  spin_lock_irqsave(&g_tasks_lock, &flags);
+  tasks_lock(&flags);
   t->state = TASK_UNUSED;
-  spin_unlock_irqrestore(&g_tasks_lock, flags);
+  tasks_unlock(flags);
 }
 
 /* Find the slot index of a task by scanning the populated chunks. Only
@@ -227,8 +257,22 @@ static struct task *pick_next_task(void) {
       struct task *t = rq_dequeue(&g_global_rq);
       if (!t)
         break;
-      if (t->state == TASK_READY && !t->stealable)
+      if (t->stealable)
+        continue;
+      /* F5 (M28 #7): atomic claim. CAS READY -> RUNNING so a concurrent
+       * scan on another CPU can't pick the same task between our check and
+       * scheduler_yield's eventual state=RUNNING store. The same fix is
+       * applied to the scan path below. Under M24b BKL the race couldn't
+       * happen; T1+ depends on this. */
+      enum task_state expected = TASK_READY;
+      if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
+                                      0, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
         return t;
+      }
+      /* Lost the CAS (someone else already picked, or task transitioned to
+       * BLOCKED/SLEEPING). Drop on the floor — if it's still relevant the
+       * next iteration / scan will find it. */
     }
   }
 
@@ -256,8 +300,18 @@ static struct task *pick_next_task(void) {
     }
   }
 
-  if (best_task)
-    return best_task;
+  if (best_task) {
+    /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
+     * the CAS, return 0 (no work this iteration) and let the caller retry;
+     * starting a fresh scan here can spin under contention without ever
+     * settling, so the cleaner shape is "treat as no-work and try again". */
+    enum task_state expected = TASK_READY;
+    if (__atomic_compare_exchange_n(&best_task->state, &expected,
+                                    TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      return best_task;
+    }
+  }
 
   /* AP fallback: nothing else runnable, so park back to this CPU's idle task,
    * which lets the AP cooperative loop regain control and drop the BKL. NULL on
@@ -270,14 +324,27 @@ static struct task *pick_next_task(void) {
 }
 
 static void wake_sleepers(void) {
+  int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state == TASK_SLEEPING &&
-        T(i)->wake_tick <= scheduler_ticks) {
-      T(i)->state = TASK_READY;
-      T(i)->wake_tick = 0;
-      sched_rq_enqueue_current(T(i));
+    /* F4 (M28 #7): atomic CAS SLEEPING -> READY so only one CPU wins when
+     * two timer ticks (or a tick + an explicit wake) race for the same
+     * sleeper. */
+    if (T(i)->wake_tick != 0 && T(i)->wake_tick <= scheduler_ticks) {
+      enum task_state expected = TASK_SLEEPING;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                      0, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
+        T(i)->wake_tick = 0;
+        sched_rq_enqueue_current(T(i));
+        woken++;
+      }
     }
   }
+  /* M28 #6: if we promoted at least one task, kick the other CPUs out of
+   * `sti; hlt` so they re-poll the global runqueue. We are called from the
+   * timer ISR (T3) which now runs WITHOUT the BKL. The IPI is a fire-and-
+   * forget no-op handler — safe regardless. */
+  if (woken > 0) ipi_reschedule_all();
 }
 
 static void kernel_thread_trampoline(void) {
@@ -324,6 +391,17 @@ void scheduler_init(void) {
   task_init_cred(boot);
   current_task = boot;
   scheduler_started = 1;
+
+  /* T3 (M28 #7): make the boot task the BSP's idle-fallback target so that
+   * pick_next_task's fallback path has somewhere to go when no READY task
+   * is found — symmetric to scheduler_setup_ap_idle on APs. Without this,
+   * an exit_current on the BSP that races a fully-blocked task set hits
+   * "dead task has nowhere to yield" because the DEAD task can't continue
+   * and there's no idle target. */
+  {
+    struct percpu *p = get_percpu();
+    if (p) p->idle_task = boot;
+  }
 
   /* The boot task now holds the Big Kernel Lock at depth 1. From here on the
    * BSP runs all kernel code holding the BKL; it is handed off (still depth 1)
@@ -786,7 +864,8 @@ int scheduler_yield(void) {
     new_task->fpu_initialized = 1;
   }
 
-  arch_context_switch(&old_task->context, &new_task->context);
+  arch_context_switch(&old_task->context, &new_task->context,
+                      &old_task->stack_released);
   interrupts_enable();
   return 1; /* we switched out and have since been resumed (BKL held, depth 1) */
 }
@@ -794,7 +873,14 @@ int scheduler_yield(void) {
 void scheduler_block_current(void) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_block_current without running task");
+  }
+
+  /* Same yield-returned-0 recovery as the other voluntary blockers. */
+  if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_block_current without running task");
   }
 
@@ -821,7 +907,17 @@ void scheduler_wake_task(usize task_id) {
 void scheduler_block_on(void *chan) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_block_on without running task");
+  }
+
+  /* Same pre-existing-bug recovery as scheduler_sleep_ticks: if scheduler_yield
+   * previously returned 0 (no other task ready), we resumed with the old
+   * state — TASK_BLOCKED here — even though we're conceptually RUNNING again
+   * (the kernel kept us on-CPU). Allow the re-entry. */
+  if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_block_on without running task");
   }
 
@@ -834,21 +930,50 @@ void scheduler_block_on(void *chan) {
 void scheduler_wake_all(void *chan) {
   interrupts_disable();
 
+  int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state == TASK_BLOCKED && T(i)->wait_chan == chan) {
-      T(i)->state = TASK_READY;
+    /* F4 (M28 #7): atomic CAS BLOCKED -> READY so two CPUs both trying
+     * to wake the same channel can't both enqueue. Reading wait_chan
+     * outside the CAS is fine — it's written only by scheduler_block_on
+     * under the task's own context (the task itself sets it before
+     * yielding), so the value is stable while the task is BLOCKED. */
+    if (T(i)->wait_chan != chan) continue;
+    enum task_state expected = TASK_BLOCKED;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                    0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
       T(i)->wait_chan = 0;
       sched_rq_enqueue_current(T(i));
+      woken++;
     }
   }
 
   interrupts_enable();
+  /* M28 #6: same reschedule kick as wake_sleepers. Outside the IRQ-off
+   * window because lapic_send_ipi spins on ICR delivery — cheap, but no
+   * reason to do it with interrupts disabled. */
+  if (woken > 0) ipi_reschedule_all();
 }
 
 void scheduler_sleep_ticks(u64 ticks) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_sleep_ticks without running task");
+  }
+
+  /* Pre-existing bug surfaced by T3: scheduler_yield can return 0 when no
+   * other task is ready to run, leaving us with our own state still set to
+   * TASK_SLEEPING (we set it just before yielding). The next iteration of
+   * the caller's loop then re-enters sleep_ticks with state == SLEEPING.
+   * Pre-T3 the BKL-serialised timer ISR happened to keep at least one task
+   * always runnable on the BSP, so the path was masked; T3 makes it
+   * reproducible. Treat SLEEPING-at-entry as a no-op-sleep recovery: we're
+   * effectively already RUNNING (the kernel just kept us on-CPU), so reset
+   * state and proceed. */
+  if (current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_sleep_ticks without running task");
   }
 
@@ -866,14 +991,22 @@ void scheduler_on_timer_tick(void) {
   scheduler_ticks++;
   wake_sleepers();
 
-  /* Cooperative scheduling: do NOT yield from the timer interrupt.
-   * Several VFS walkers (find_child, vfs_get_mount_for_node, add_node)
-   * traverse vfs_node parent/sibling chains without holding the parent's
-   * inode lock. Preemptive yields here interleave those walks with concurrent
-   * unlink/rmdir paths and let the walker dereference a freed sibling.
-   * Tasks still yield voluntarily on syscall blocks (scheduler_block_on,
-   * sleep, I/O), which is enough for smoke-test progress without exposing
-   * the unsynchronized chain walks. Re-enable once VFS locking is audited. */
+  /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
+   * that motivated the cooperative model — VFS chain walks (find_child /
+   * vfs_get_mount_for_node / add_node) traversing parent/sibling chains
+   * without explicit locks — is closed by M28-B's vfs_tree_lock + the
+   * IRQ-save semantics of the chain-walk helpers (a walker holds the lock
+   * with IRQs disabled, so a same-CPU timer ISR cannot preempt it). Every
+   * other spinlock in the kernel is either irq-save (heap, pmm, vmm, tasks)
+   * or per-task (fd_lock), so preemption from this ISR cannot leave a
+   * locked critical section running on another task.
+   *
+   * Only the BSP runs this branch (the AP timer's BSP-only filter in
+   * x86_irq_handler_inner). Yielding from an ISR on the BSP is the
+   * canonical preemptive-tick model; the inner handler still EOIs first. */
+  if (current_task->state == TASK_RUNNING) {
+    scheduler_yield();
+  }
 }
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
@@ -911,15 +1044,41 @@ void scheduler_exit_current(int exit_code) {
   aio_task_cleanup(current_task);
 
   current_task->exit_code = exit_code;
+  /* F-tier T4 prerequisite: claim stack_released BEFORE publishing DEAD.
+   * x86 TSO orders the stores, so any CPU that observes state == DEAD also
+   * observes stack_released == 0 — its waitpid path will spin on the
+   * stack_released flag until arch_context_switch publishes 1 after the
+   * RSP swap below. See struct task::stack_released in sched.h. */
+  current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
 
   // Wake up parent if it is blocked waiting for us
+  int woke_parent = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == current_task->parent_id &&
-        T(i)->state == TASK_BLOCKED) {
-      T(i)->state = TASK_READY;
+    if (T(i)->id == current_task->parent_id) {
+      /* F6 (M28 #7): atomic CAS BLOCKED -> READY so concurrent waitpid
+       * paths on multiple CPUs can't double-promote and double-enqueue
+       * the parent. The wake here doesn't enqueue at all (pick_next_task
+       * scan handles the unenqueued READY tasks separately) so the CAS
+       * just claims the transition; whoever loses the CAS observed a
+       * parent that was already woken by someone else. */
+      enum task_state expected = TASK_BLOCKED;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected,
+                                      TASK_READY, 0,
+                                      __ATOMIC_RELEASE,
+                                      __ATOMIC_RELAXED)) {
+        woke_parent = 1;
+      }
+      break;  /* flat parent model: only one task matches parent_id */
     }
   }
+
+  /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
+   * out of sti;hlt so it picks the parent immediately instead of waiting
+   * for the next 10 ms LAPIC tick. Particularly important for the
+   * test-driver init kthread on the BSP, which sits in sti;hlt during
+   * userspace test runs. */
+  if (woke_parent) ipi_reschedule_all();
 
   scheduler_yield();
   panic("dead task resumed");
@@ -948,7 +1107,37 @@ int scheduler_waitpid(usize pid, int *status, int options) {
           T(i)->parent_id == current_task->id) {
         if (wait_any || T(i)->id == pid) {
           has_children = 1;
-          if (T(i)->state == TASK_DEAD) {
+          /* F1 (M28): atomic CAS DEAD -> REAPING so only one CPU drives the
+           * actual free path even if two waitpids race for the same child.
+           * The loser observes state == REAPING (which still counts as "this
+           * child exists" thanks to has_children) and falls through to the
+           * yield/return path, letting the winner publish the reaped status.
+           *
+           * Note: parent_id is read non-atomically above, but the field is
+           * only written by fork (publication before the child runs) and is
+           * never overwritten thereafter, so a torn read here is impossible. */
+          enum task_state _expected = TASK_DEAD;
+          if (__atomic_compare_exchange_n(&T(i)->state, &_expected,
+                                          TASK_REAPING, 0,
+                                          __ATOMIC_ACQUIRE,
+                                          __ATOMIC_RELAXED)) {
+            /* F-tier T4 prerequisite: the child's kernel_stack is still
+             * being used as RSP on whatever CPU ran exit_current →
+             * scheduler_yield up until arch_context_switch's RSP swap.
+             * Spin until that swap has published stack_released==1 — see
+             * struct task::stack_released in sched.h.
+             *
+             * The child set stack_released=0 BEFORE state=DEAD (x86 TSO
+             * orders the two stores), so observing state==DEAD here
+             * guarantees we will observe a 0 first and then transition to
+             * 1 once the child's CPU finishes context_switch. The CAS
+             * above used __ATOMIC_ACQUIRE, which pairs with the implicit
+             * release of the asm's `movl $1, (%rdx)` after the RSP swap. */
+            while (!__atomic_load_n(&T(i)->stack_released,
+                                    __ATOMIC_ACQUIRE)) {
+              __asm__ volatile("pause");
+            }
+
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
             if (T(i)->user_image) {
@@ -1020,7 +1209,8 @@ usize scheduler_task_count(void) {
   usize count = 0;
 
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state != TASK_UNUSED && T(i)->state != TASK_DEAD) {
+    enum task_state s = T(i)->state;
+    if (s != TASK_UNUSED && s != TASK_DEAD && s != TASK_REAPING) {
       count++;
     }
   }
@@ -1054,6 +1244,9 @@ void scheduler_dump_tasks(void) {
         break;
       case TASK_DEAD:
         state_str = "DEAD";
+        break;
+      case TASK_REAPING:
+        state_str = "REAPING";
         break;
       default:
         break;
@@ -1102,19 +1295,19 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
 
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
 
   for (usize i = 0; i < current_task->fd_capacity; i++) {
     if (current_task->fd_table[i] == 0) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return (int)i;
     }
   }
 
   if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
 
@@ -1124,13 +1317,13 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
 
   struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
   if (!new_table) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
   int *new_flags = kzalloc(new_capacity * sizeof(int));
   if (!new_flags) {
     kfree(new_table);
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
 
@@ -1148,16 +1341,16 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   current_task->fd_table[allocated_fd] = handle;
   current_task->fd_flags[allocated_fd] = 0;
 
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return allocated_fd;
 }
 
 struct vfs_handle *scheduler_fd_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return 0;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   struct vfs_handle *h = current_task->fd_table[fd];
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return h;
 }
 
@@ -1165,11 +1358,11 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
   if (!current_task || fd < 0)
     return -1;
 
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
 
   if ((usize)fd >= current_task->fd_capacity) {
     if ((usize)fd >= SCHED_MAX_FD_LIMIT) {
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
     usize new_capacity = current_task->fd_capacity;
@@ -1181,13 +1374,13 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
     struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
     if (!new_table) {
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
     int *new_flags = kzalloc(new_capacity * sizeof(int));
     if (!new_flags) {
       kfree(new_table);
-      spin_unlock(&current_task->fd_lock);
+      fd_lock_release();
       return -1;
     }
 
@@ -1204,39 +1397,39 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
 
   current_task->fd_table[fd] = handle;
   current_task->fd_flags[fd] = 0;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return fd;
 }
 
 int scheduler_fd_close(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   current_task->fd_table[fd] = 0;
   current_task->fd_flags[fd] = 0;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return 0;
 }
 
 int scheduler_fd_flags_get(int fd) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   int f = current_task->fd_table[fd] ? current_task->fd_flags[fd] : -1;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return f;
 }
 
 int scheduler_fd_flags_set(int fd, int flags_val) {
   if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
     return -1;
-  spin_lock(&current_task->fd_lock);
+  fd_lock_acquire();
   if (!current_task->fd_table[fd]) {
-    spin_unlock(&current_task->fd_lock);
+    fd_lock_release();
     return -1;
   }
   current_task->fd_flags[fd] = flags_val;
-  spin_unlock(&current_task->fd_lock);
+  fd_lock_release();
   return 0;
 }
 
@@ -1590,6 +1783,8 @@ void scheduler_deliver_pending_signals(void) {
     if (sig == SIGKILL) {
       /* SIGKILL — terminate immediately */
       current_task->exit_code = 128 + SIGKILL;
+      /* See scheduler_exit_current — claim stack_released before DEAD. */
+      current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
       for (usize i = 0; i < g_task_hwm; i++) {
         if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)
@@ -1625,6 +1820,8 @@ void scheduler_deliver_pending_signals(void) {
       case SIGPROF:
         /* Terminate */
         current_task->exit_code = 128 + sig;
+        /* See scheduler_exit_current — claim stack_released before DEAD. */
+        current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
         for (usize i = 0; i < g_task_hwm; i++) {
           if (T(i)->id == current_task->parent_id && T(i)->state == TASK_BLOCKED)

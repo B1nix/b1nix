@@ -1,10 +1,36 @@
 #include <b1nix/console.h>
+#include <b1nix/lockdep.h>
 #include <b1nix/sched.h>
 #include <b1nix/mm.h>
+#include <b1nix/rwlock.h>
 #include <b1nix/vfs.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
 #include <string.h>
+
+/* F2 (M28 #7 prep): rwlock serialising page-table mutations across CPUs.
+ * Today every kernel-mode entry holds the BKL so this is decorative; the
+ * lock becomes load-bearing once the BKL teardown lands, at which point
+ * two CPUs that both call vmm_map_page or vmm_unmap_page on the same
+ * address space could race ensure_child_table / pt[idx] = entry and leak
+ * an intermediate PT frame. Held as the writer for every map/unmap; the
+ * page-fault read path stays lock-free for now (still BKL-protected).
+ *
+ * DAG position: HEAP (700) -> VMM (750) -> PMM (800). kheap_grow holds
+ * heap_lock and calls vmm_map_page; the map path then allocates a PT
+ * frame via pmm_alloc_frame. Reverse order is the kernel's normal
+ * "kmalloc under vmm" pattern but never happens in practice — call sites
+ * that need both lock VMM-first. */
+static rwlock_t vmm_lock = RWLOCK_INIT;
+
+static inline void vmm_write_acquire(u64 *flags) {
+  rw_write_lock_irqsave(&vmm_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_VMM);
+}
+static inline void vmm_write_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_VMM);
+  rw_write_unlock_irqrestore(&vmm_lock, flags);
+}
 
 #define PAGE_ENTRY_ADDRESS_MASK 0x000ffffffffff000ULL
 #define PAGE_TABLE_INDEX_MASK 0x1ffULL
@@ -242,6 +268,8 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     panic("vmm_map_page called before vmm_init");
   }
 
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
   u64 *pml4 = get_current_pml4();
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
@@ -264,6 +292,7 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
+  vmm_write_release(_vmflags);
 
   if ((flags & VMM_USER) && (flags & VMM_PRESENT)) {
     extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
@@ -340,13 +369,27 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
 }
 
 void vmm_unmap_page(u64 virtual_address) {
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
   unmap_page_from_pml4(get_current_pml4(), virtual_address);
+  vmm_write_release(_vmflags);
+  /* M28 #5: every other CPU that has cached this translation needs to drop
+   * it before we return; otherwise a write through their stale TLB entry hits
+   * the (potentially freed-and-reused) physical frame. tlb_shootdown_page is
+   * a no-op when g_max_cpus <= 1 so single-CPU boots pay nothing. Issued
+   * with vmm_lock released so a target CPU that just took vmm_lock as a
+   * reader doesn't block the shootdown ACK. */
+  extern void tlb_shootdown_page(u64);
+  tlb_shootdown_page(virtual_address);
 }
 
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
   u64 *pml4 = pml4_phys ? (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE)
                          : kernel_pml4_virt;
   unmap_page_from_pml4(pml4, virtual_address);
+  vmm_write_release(_vmflags);
 }
 
 void paging_map_page(u64 virtual_address, u64 physical_address, u64 flags) {

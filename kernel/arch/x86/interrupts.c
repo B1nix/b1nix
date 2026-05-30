@@ -9,6 +9,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/net.h>
+#include <b1nix/tlb.h>
 #include <b1nix/types.h>
 
 #define IDT_ENTRY_COUNT 256
@@ -89,6 +90,10 @@ extern void isr44(void);
 extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
+extern void isr64(void);   /* LAPIC timer — per-CPU scheduler tick */
+extern void isr65(void);   /* TLB shootdown IPI */
+extern void isr66(void);   /* Reschedule IPI — wake from sti;hlt */
+extern void isr255(void);  /* LAPIC spurious — no-EOI no-op */
 
 static volatile u64 timer_ticks;
 
@@ -173,6 +178,19 @@ void x86_idt_init(void) {
   idt_set_gate(45, isr45);
   idt_set_gate(46, isr46);
   idt_set_gate(47, isr47);
+
+  /* LAPIC timer (per-CPU) and LAPIC spurious gates. Installed unconditionally:
+   * the BSP arms the LAPIC timer from lapic_timer_start_periodic_ms after
+   * calibration, and APs arm it as they enter the cooperative phase. */
+  idt_set_gate(64, isr64);
+  /* TLB shootdown IPI vector — wired on every CPU so tlb_shootdown_*
+   * can target every other core. */
+  idt_set_gate(65, isr65);
+  /* Reschedule IPI — wires the wake-from-sti;hlt path so a new task on
+   * the global runqueue doesn't wait for the next 10 ms LAPIC tick on
+   * each idle AP. Handler is a no-op (just EOI). */
+  idt_set_gate(66, isr66);
+  idt_set_gate(255, isr255);
 
   struct idt_pointer pointer = {
       .limit = sizeof(idt) - 1,
@@ -268,7 +286,60 @@ static inline void irq_eoi(u64 vector) {
 }
 
 static void x86_irq_handler_inner(struct interrupt_frame *frame) {
+  /* LAPIC spurious interrupt (vector 0xFF). Per Intel SDM 10.9, the handler
+   * must NOT issue an EOI. Just return. */
+  if (frame->vector == 255) {
+    return;
+  }
+
+  /* TLB shootdown IPI (vector 0x41 = 65). Forwarded to the shootdown machinery
+   * in kernel/arch/x86/tlb.c which invlpg's the published vaddr (or reloads
+   * CR3) and decrements the pending counter the initiator polls. EOI happens
+   * inside the handler. */
+  if (frame->vector == 65) {
+    tlb_shootdown_handler();
+    return;
+  }
+
+  /* Reschedule IPI (vector 0x42 = 66). Pure wake-up: the target was sitting in
+   * `sti; hlt` and we want it to re-poll the runqueue immediately. No state to
+   * touch — just EOI. */
+  if (frame->vector == 66) {
+    lapic_eoi();
+    return;
+  }
+
+  /* LAPIC timer (vector 0x40 = 64) — per-CPU scheduler tick. Drives the global
+   * scheduler bookkeeping (scheduler_ticks++, wake_sleepers) on the BSP only so
+   * wall-clock ticks aren't multiplied by g_max_cpus. APs receive the tick as a
+   * per-CPU preemption opportunity (cooperative for now — preemption from ISR is
+   * still gated on the VFS chain-walk rwlock audit, M28 item 3). */
+  if (frame->vector == 64) {
+    struct percpu *pcpu = get_percpu();
+    int is_bsp = pcpu ? (pcpu->cpu_id == 0) : 1;
+    /* T8 (M28 #8): EOI BEFORE scheduler_on_timer_tick. With preemptive
+     * yields enabled, scheduler_on_timer_tick may context-switch away —
+     * the task that returns here later finishes the EOI path long after
+     * we wanted the LAPIC to consider this interrupt done. Delaying EOI
+     * past the yield wedges the LAPIC: it thinks the timer is still in
+     * service and never delivers another tick. Issue EOI first so the
+     * LAPIC unblocks immediately, then run the (preemptible) tick work. */
+    lapic_eoi();
+    if (is_bsp) {
+      timer_ticks++;
+      if (timer_ticks % 50 == 0) {
+        fb_console_blink_cursor();
+      }
+      scheduler_on_timer_tick();
+    }
+    return;
+  }
+
   if (frame->vector == 32) {
+    /* Legacy PIT IRQ0 fallback. With M28-A the LAPIC timer drives the scheduler
+     * tick on all cores and PIT IRQ0 is masked at the IOAPIC; this branch is
+     * kept so an unsuspected stray (e.g. calibration failed → IOAPIC mask
+     * skipped) still progresses the BSP tick instead of console-spamming. */
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();
@@ -313,8 +384,38 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
  * recurses the depth. The matching release happens on the normal return; paths
  * that never return (a fatal signal terminating the task via
  * scheduler_exit_current) hand the depth-1 lock off across the context switch,
- * so skipping bkl_unlock there is correct. */
+ * so skipping bkl_unlock there is correct.
+ *
+ * **TLB shootdown IPI (vector 65) is the one exception** — the initiator of
+ * the shootdown holds the BKL and synchronously waits for every target to
+ * ACK; if a target tried to acquire the BKL, the initiator would never
+ * release it and the system deadlocks. The handler is trivial (invlpg +
+ * atomic decrement + EOI), touches no BKL-protected state, and runs with
+ * IRQs implicitly disabled at the LAPIC level, so skipping BKL here is safe.
+ */
 void x86_irq_handler(struct interrupt_frame *frame) {
+  if (frame->vector == 65) {
+    tlb_shootdown_handler();
+    return;
+  }
+  /* Reschedule IPI (M28 #6): same BKL bypass as TLB shootdown — the handler
+   * is a pure no-op wake-up, so taking BKL would just add unnecessary
+   * contention without adding correctness. */
+  if (frame->vector == 66) {
+    lapic_eoi();
+    return;
+  }
+  /* T3 (M28 #7): LAPIC timer (vector 64) bypasses the BKL.
+   * scheduler_on_timer_tick mutates only:
+   *  - scheduler_ticks (BSP-only writer, single-writer safe non-atomic),
+   *  - wake_sleepers (atomic CAS SLEEPING->READY via F4 + IPI),
+   *  - cursor blink + ipi_reschedule_all.
+   * All SMP-safe via the F-tier foundation, so the BKL is needless serialisation
+   * here. The inner handler does its own EOI for this vector. */
+  if (frame->vector == 64) {
+    x86_irq_handler_inner(frame);
+    return;
+  }
   bkl_lock();
   x86_irq_handler_inner(frame);
   bkl_unlock();

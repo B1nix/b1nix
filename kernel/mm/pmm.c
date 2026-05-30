@@ -37,6 +37,16 @@ struct pmm_state {
 static struct pmm_state pmm;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
+#include <b1nix/lockdep.h>
+static inline void pmm_acquire(u64 *flags) {
+  spin_lock_irqsave(&pmm_lock, flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_PMM);
+}
+static inline void pmm_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_PMM);
+  spin_unlock_irqrestore(&pmm_lock, flags);
+}
+
 /* Runtime size of the kernel's direct map (see mm.h). Starts at the
  * compile-time ceiling so any pre-pmm_init reference is a safe over-estimate;
  * pmm_init shrinks it to the actual top-of-RAM clamped into [MIN, MAX]. */
@@ -344,12 +354,12 @@ void pmm_init(const struct boot_info *boot_info) {
 
 void pmm_ref_frame(u64 frame) {
   u64 flags;
-  spin_lock_irqsave(&pmm_lock, &flags);
+  pmm_acquire(&flags);
   usize idx = frame / PAGE_SIZE;
   if (pmm.frame_refcounts) {
     pmm.frame_refcounts[idx]++;
   }
-  spin_unlock_irqrestore(&pmm_lock, flags);
+  pmm_release(flags);
 }
 
 void pmm_free_frame(u64 frame) {
@@ -359,7 +369,7 @@ void pmm_free_frame(u64 frame) {
   }
 
   u64 flags;
-  spin_lock_irqsave(&pmm_lock, &flags);
+  pmm_acquire(&flags);
   usize idx = frame / PAGE_SIZE;
   if (pmm.frame_refcounts) {
     if (pmm.frame_refcounts[idx] > 0) {
@@ -371,7 +381,7 @@ void pmm_free_frame(u64 frame) {
   } else {
     mark_frame_free(frame);
   }
-  spin_unlock_irqrestore(&pmm_lock, flags);
+  pmm_release(flags);
 }
 
 void pmm_unref_frame(u64 frame) {
@@ -380,13 +390,13 @@ void pmm_unref_frame(u64 frame) {
 
 u16 pmm_get_refcount(u64 frame) {
   u64 flags;
-  spin_lock_irqsave(&pmm_lock, &flags);
+  pmm_acquire(&flags);
   usize idx = frame / PAGE_SIZE;
   u16 val = 0;
   if (pmm.frame_refcounts) {
     val = pmm.frame_refcounts[idx];
   }
-  spin_unlock_irqrestore(&pmm_lock, flags);
+  pmm_release(flags);
   return val;
 }
 
@@ -458,7 +468,7 @@ u64 pmm_alloc_frames(usize count) {
    * satisfies the request, makes progress by freeing >=1 frame, or gives up. */
   for (;;) {
     u64 free_snapshot = 0;
-    spin_lock_irqsave(&pmm_lock, &flags);
+    pmm_acquire(&flags);
 
     /* Single-frame fast path: pop the free-list stack in O(1). */
     if (count == 1 && pmm.free_list_ready) {
@@ -466,7 +476,7 @@ u64 pmm_alloc_frames(usize count) {
       if (frame != 0) {
         claim_frame(frame_index(frame));
         zero_frames(frame, 1);
-        spin_unlock_irqrestore(&pmm_lock, flags);
+        pmm_release(flags);
         return frame;
       }
       /* List empty. If the bitmap still shows free frames, the list missed
@@ -475,20 +485,20 @@ u64 pmm_alloc_frames(usize count) {
       if (pmm.free_frames > 0) {
         frame = bitmap_scan_alloc(1);
         if (frame != 0) {
-          spin_unlock_irqrestore(&pmm_lock, flags);
+          pmm_release(flags);
           return frame;
         }
       }
     } else {
       u64 frame = bitmap_scan_alloc(count);
       if (frame != 0) {
-        spin_unlock_irqrestore(&pmm_lock, flags);
+        pmm_release(flags);
         return frame;
       }
     }
 
     free_snapshot = pmm.free_frames;
-    spin_unlock_irqrestore(&pmm_lock, flags);
+    pmm_release(flags);
 
     // OOM. Reclaim and retry. Try evicting clean page-cache pages first.
     reclaim_attempts++;
@@ -557,7 +567,7 @@ void pmm_switch_to_direct_map(void) {
    * Seed the stack with every currently-free frame (one-time O(frame_count)
    * walk); from here on alloc/free maintain it incrementally. */
   u64 flags;
-  spin_lock_irqsave(&pmm_lock, &flags);
+  pmm_acquire(&flags);
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
   for (usize idx = 0; idx < frame_count; idx++) {
     if (!bitmap_get(idx)) {
@@ -565,5 +575,5 @@ void pmm_switch_to_direct_map(void) {
     }
   }
   pmm.free_list_ready = 1;
-  spin_unlock_irqrestore(&pmm_lock, flags);
+  pmm_release(flags);
 }

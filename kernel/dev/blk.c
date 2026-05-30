@@ -37,13 +37,17 @@ static usize block_cache_n = 0;
 static u32 bcache_tick = 0;
 static spinlock_t bcache_lock = SPINLOCK_INIT;
 
+#include <b1nix/lockdep.h>
+
 static u64 bcache_acquire(void) {
   u64 flags;
   spin_lock_irqsave(&bcache_lock, &flags);
+  LOCKDEP_ACQUIRE(LOCKDEP_LVL_BCACHE);
   return flags;
 }
 
 static void bcache_release(u64 flags) {
+  LOCKDEP_RELEASE(LOCKDEP_LVL_BCACHE);
   spin_unlock_irqrestore(&bcache_lock, flags);
 }
 

@@ -20,6 +20,18 @@ enum task_state {
   TASK_SLEEPING,
   TASK_STOPPED,
   TASK_DEAD,
+  /* Intermediate state between TASK_DEAD and TASK_UNUSED — the parent (or any
+   * waitpid caller in the flat process model) has won the atomic CAS from
+   * DEAD->REAPING and is now freeing the task's resources (user_image,
+   * page tables, name, stack). free_task_slot() flips it to UNUSED at the end.
+   *
+   * Without this distinct state, two CPUs racing waitpid against the same
+   * dead child both observe state == DEAD and proceed to free its memory
+   * twice — a kernel UAF. Under BKL this couldn't happen (only one CPU in
+   * kernel code at a time); under fine-grained locking it can, which is
+   * what M28 #7 is preparing for. Skipped by every walker that already
+   * skips DEAD (scheduler_task_count, pick_next_task, scheduler_dump_tasks). */
+  TASK_REAPING,
 };
 
 struct cpu_context {
@@ -189,6 +201,26 @@ struct task {
    * fork. */
   int ap_runnable;
 
+  /* Kernel-stack lease flag for cross-CPU reap safety (M28 T4 prerequisite).
+   *
+   * A dying task on CPU A executes `scheduler_exit_current` → publishes
+   * `state = TASK_DEAD` → runs `scheduler_yield`'s body → calls
+   * `arch_context_switch` — and is STILL using its own kernel_stack as RSP
+   * the entire time, right up to the `mov 0(%rsi), %rsp` swap inside the
+   * asm. Meanwhile, under T4 (no BKL), the parent's `scheduler_waitpid`
+   * on CPU B can win the `DEAD → REAPING` CAS the instant DEAD is
+   * published and `kfree` the stack out from under CPU A. The freed page
+   * returns to kheap, gets handed to some other allocation, and CPU A's
+   * subsequent stack pushes (or, much later, the iret frame on this
+   * page after a context-switch-back) land on corrupted bytes —
+   * shape #1/#2 from docs/m28-t4-blocker.md.
+   *
+   * Protocol: the death-path clears `stack_released = 0` BEFORE writing
+   * `state = TASK_DEAD` (x86 TSO orders the stores). `arch_context_switch`
+   * sets `*released_publish = 1` AFTER the RSP swap. `scheduler_waitpid`
+   * spins on `stack_released == 1` after winning the CAS, before kfree. */
+  volatile int stack_released;
+
   /* SMP runqueue linkage (must be last field for ABI compat) */
   struct task *next_run;
 };
@@ -219,6 +251,10 @@ void sched_ap_reap_worker(struct task *t);
 /* SMP work-stealing self-test (M24b). No-op unless >1 CPU is online and
  * test mode is active. */
 void smp_selftest_run(void);
+
+/* M28 #9 — ctx-switch + light-syscall rdtsc benchmark. Single-CPU only;
+ * test mode only. See kernel/sched/m28_ctxbench.c for what's measured. */
+void m28_ctxbench_run(void);
 int scheduler_fork_current(void);
 /* Cooperatively switch to another runnable task. Returns 1 if it context
  * switched (and has since been resumed), 0 if nothing was runnable. An idle
