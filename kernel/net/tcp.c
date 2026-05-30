@@ -511,9 +511,32 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
     if (ack_new == conn->snd_una && payload_size == 0) {
       conn->dup_acks++;
       if (conn->dup_acks == 3) {
+        /* Reno fast retransmit: cut ssthresh, drop cwnd, and resend
+         * the oldest unacked segment immediately (don't wait for the
+         * RTO). The retransmit queue is FIFO; the head is snd_una. */
         conn->ssthresh = conn->cwnd / 2;
         if (conn->ssthresh < TCP_MSS) conn->ssthresh = TCP_MSS;
-        conn->cwnd = conn->ssthresh;
+        conn->cwnd = conn->ssthresh + 3 * TCP_MSS;  /* inflate per RFC 5681 */
+        u64 irq = irq_save();
+        tcp_lock();
+        struct tcp_retransmit_pkt *head = conn->retransmit_queue;
+        u8 *resend_data = 0;
+        usize resend_len = 0;
+        if (head) {
+          resend_data = head->data;
+          resend_len = head->len;
+          head->timestamp = scheduler_get_uptime_ticks();
+          head->retries++;
+        }
+        tcp_unlock();
+        irq_restore(irq);
+        if (resend_data && resend_len) {
+          ipv4_send(conn->remote_ip, IP_PROTO_TCP, resend_data, resend_len);
+        }
+      } else if (conn->dup_acks > 3) {
+        /* Each additional dup ACK inflates cwnd by 1 MSS during fast
+         * recovery (RFC 5681 section 3.2). */
+        conn->cwnd += TCP_MSS;
       }
     } else if (ack_new > conn->snd_una) {
       conn->dup_acks = 0;
