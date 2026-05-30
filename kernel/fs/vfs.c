@@ -1393,6 +1393,11 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
 
         if (flags & INITRAMFS_EXECUTABLE)
           child->inode->mode |= VFS_IXUSR | VFS_IXGRP | VFS_IXOTH;
+        /* M31: stamp setuid on initramfs files marked SETUID. The file
+         * owner is uid 0, so user_execve_current's S_ISUID branch will
+         * elevate the new task's euid to root. */
+        if (flags & INITRAMFS_SETUID)
+          child->inode->mode |= 04000;
 
         child->inode->atime = child->inode->mtime = child->inode->ctime =
             vfs_get_unix_time();
