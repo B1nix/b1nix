@@ -317,6 +317,14 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   if (frame->vector == 64) {
     struct percpu *pcpu = get_percpu();
     int is_bsp = pcpu ? (pcpu->cpu_id == 0) : 1;
+    /* T8 (M28 #8): EOI BEFORE scheduler_on_timer_tick. With preemptive
+     * yields enabled, scheduler_on_timer_tick may context-switch away —
+     * the task that returns here later finishes the EOI path long after
+     * we wanted the LAPIC to consider this interrupt done. Delaying EOI
+     * past the yield wedges the LAPIC: it thinks the timer is still in
+     * service and never delivers another tick. Issue EOI first so the
+     * LAPIC unblocks immediately, then run the (preemptible) tick work. */
+    lapic_eoi();
     if (is_bsp) {
       timer_ticks++;
       if (timer_ticks % 50 == 0) {
@@ -324,7 +332,6 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       }
       scheduler_on_timer_tick();
     }
-    lapic_eoi();
     return;
   }
 
@@ -396,6 +403,17 @@ void x86_irq_handler(struct interrupt_frame *frame) {
    * contention without adding correctness. */
   if (frame->vector == 66) {
     lapic_eoi();
+    return;
+  }
+  /* T3 (M28 #7): LAPIC timer (vector 64) bypasses the BKL.
+   * scheduler_on_timer_tick mutates only:
+   *  - scheduler_ticks (BSP-only writer, single-writer safe non-atomic),
+   *  - wake_sleepers (atomic CAS SLEEPING->READY via F4 + IPI),
+   *  - cursor blink + ipi_reschedule_all.
+   * All SMP-safe via the F-tier foundation, so the BKL is needless serialisation
+   * here. The inner handler does its own EOI for this vector. */
+  if (frame->vector == 64) {
+    x86_irq_handler_inner(frame);
     return;
   }
   bkl_lock();

@@ -327,10 +327,8 @@ static void wake_sleepers(void) {
   for (usize i = 0; i < g_task_hwm; i++) {
     /* F4 (M28 #7): atomic CAS SLEEPING -> READY so only one CPU wins when
      * two timer ticks (or a tick + an explicit wake) race for the same
-     * sleeper. Without this, the loser also enqueues the task — same task
-     * in the runqueue twice → corruption. Under M24b BKL the race couldn't
-     * happen; T1+ depends on this fix. */
-    if (T(i)->wake_tick <= scheduler_ticks) {
+     * sleeper. */
+    if (T(i)->wake_tick != 0 && T(i)->wake_tick <= scheduler_ticks) {
       enum task_state expected = TASK_SLEEPING;
       if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
                                       0, __ATOMIC_ACQUIRE,
@@ -342,10 +340,9 @@ static void wake_sleepers(void) {
     }
   }
   /* M28 #6: if we promoted at least one task, kick the other CPUs out of
-   * `sti; hlt` so they re-poll the global runqueue immediately instead of
-   * waiting for their next LAPIC tick (up to 10 ms). The IPI is cheap and
-   * the bound it removes matters most when this task's wake-up is the only
-   * event in flight. */
+   * `sti; hlt` so they re-poll the global runqueue. We are called from the
+   * timer ISR (T3) which now runs WITHOUT the BKL. The IPI is a fire-and-
+   * forget no-op handler — safe regardless. */
   if (woken > 0) ipi_reschedule_all();
 }
 
@@ -393,6 +390,17 @@ void scheduler_init(void) {
   task_init_cred(boot);
   current_task = boot;
   scheduler_started = 1;
+
+  /* T3 (M28 #7): make the boot task the BSP's idle-fallback target so that
+   * pick_next_task's fallback path has somewhere to go when no READY task
+   * is found — symmetric to scheduler_setup_ap_idle on APs. Without this,
+   * an exit_current on the BSP that races a fully-blocked task set hits
+   * "dead task has nowhere to yield" because the DEAD task can't continue
+   * and there's no idle target. */
+  {
+    struct percpu *p = get_percpu();
+    if (p) p->idle_task = boot;
+  }
 
   /* The boot task now holds the Big Kernel Lock at depth 1. From here on the
    * BSP runs all kernel code holding the BKL; it is handed off (still depth 1)
@@ -863,7 +871,14 @@ int scheduler_yield(void) {
 void scheduler_block_current(void) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_block_current without running task");
+  }
+
+  /* Same yield-returned-0 recovery as the other voluntary blockers. */
+  if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_block_current without running task");
   }
 
@@ -890,7 +905,17 @@ void scheduler_wake_task(usize task_id) {
 void scheduler_block_on(void *chan) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_block_on without running task");
+  }
+
+  /* Same pre-existing-bug recovery as scheduler_sleep_ticks: if scheduler_yield
+   * previously returned 0 (no other task ready), we resumed with the old
+   * state — TASK_BLOCKED here — even though we're conceptually RUNNING again
+   * (the kernel kept us on-CPU). Allow the re-entry. */
+  if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_block_on without running task");
   }
 
@@ -931,7 +956,22 @@ void scheduler_wake_all(void *chan) {
 void scheduler_sleep_ticks(u64 ticks) {
   interrupts_disable();
 
-  if (current_task == 0 || current_task->state != TASK_RUNNING) {
+  if (current_task == 0) {
+    panic("scheduler_sleep_ticks without running task");
+  }
+
+  /* Pre-existing bug surfaced by T3: scheduler_yield can return 0 when no
+   * other task is ready to run, leaving us with our own state still set to
+   * TASK_SLEEPING (we set it just before yielding). The next iteration of
+   * the caller's loop then re-enters sleep_ticks with state == SLEEPING.
+   * Pre-T3 the BKL-serialised timer ISR happened to keep at least one task
+   * always runnable on the BSP, so the path was masked; T3 makes it
+   * reproducible. Treat SLEEPING-at-entry as a no-op-sleep recovery: we're
+   * effectively already RUNNING (the kernel just kept us on-CPU), so reset
+   * state and proceed. */
+  if (current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
     panic("scheduler_sleep_ticks without running task");
   }
 
@@ -949,14 +989,22 @@ void scheduler_on_timer_tick(void) {
   scheduler_ticks++;
   wake_sleepers();
 
-  /* Cooperative scheduling: do NOT yield from the timer interrupt.
-   * Several VFS walkers (find_child, vfs_get_mount_for_node, add_node)
-   * traverse vfs_node parent/sibling chains without holding the parent's
-   * inode lock. Preemptive yields here interleave those walks with concurrent
-   * unlink/rmdir paths and let the walker dereference a freed sibling.
-   * Tasks still yield voluntarily on syscall blocks (scheduler_block_on,
-   * sleep, I/O), which is enough for smoke-test progress without exposing
-   * the unsynchronized chain walks. Re-enable once VFS locking is audited. */
+  /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
+   * that motivated the cooperative model — VFS chain walks (find_child /
+   * vfs_get_mount_for_node / add_node) traversing parent/sibling chains
+   * without explicit locks — is closed by M28-B's vfs_tree_lock + the
+   * IRQ-save semantics of the chain-walk helpers (a walker holds the lock
+   * with IRQs disabled, so a same-CPU timer ISR cannot preempt it). Every
+   * other spinlock in the kernel is either irq-save (heap, pmm, vmm, tasks)
+   * or per-task (fd_lock), so preemption from this ISR cannot leave a
+   * locked critical section running on another task.
+   *
+   * Only the BSP runs this branch (the AP timer's BSP-only filter in
+   * x86_irq_handler_inner). Yielding from an ISR on the BSP is the
+   * canonical preemptive-tick model; the inner handler still EOIs first. */
+  if (current_task->state == TASK_RUNNING) {
+    scheduler_yield();
+  }
 }
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
