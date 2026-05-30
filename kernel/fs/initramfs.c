@@ -18,6 +18,7 @@
 #include "../../build/x86/initramfs_m26_smoke.inc"
 #include "../../build/x86/initramfs_m24b_smoke.inc"
 #include "../../build/x86/initramfs_m27_smoke.inc"
+#include "../../build/x86/initramfs_m29_smoke.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -341,6 +342,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m27-smoke", (const char *)vfs_m27_smoke_elf,
      sizeof(vfs_m27_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m29-smoke", (const char *)vfs_m29_smoke_elf,
+     sizeof(vfs_m29_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},

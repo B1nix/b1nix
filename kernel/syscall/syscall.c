@@ -1940,6 +1940,34 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_IO_GETEVENTS:
     return sys_io_getevents(arg0, (u32)arg1, (u32)arg2,
                             (struct b1nix_aio_cqe *)(usize)arg3, (u32)arg4);
+  case SYS_CLONE:
+    /* SYS_CLONE(flags, entry, user_stack, arg, tls, ctid) — see
+     * kernel/include/b1nix/syscall.h for the B1NIX_CLONE_* flag bits.
+     * Returns the new TID on success or -errno on failure. */
+    return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5);
+  case SYS_FUTEX:
+    /* SYS_FUTEX(uaddr, op, val) — minimal WAIT/WAKE only. */
+    return (u64)scheduler_futex(arg0, (int)arg1, (int)arg2);
+  case SYS_SET_TLS: {
+    /* SYS_SET_TLS(addr) — set this task's FS base. Takes effect on the
+     * next return-to-userspace transition (the scheduler reloads MSR_FS_BASE
+     * on each context switch). For the current task we also write the
+     * MSR live, so a thread that just set its TLS can dereference it
+     * immediately. */
+    if (!current_task) return (u64)-EINVAL;
+    task_set_tls_base(current_task, arg0);
+    extern void arch_set_fs_base(u64 base);
+    arch_set_fs_base(arg0);
+    return 0;
+  }
+  case SYS_GETTID:
+    return (u64)scheduler_get_pid();
+  case SYS_EXIT_THREAD:
+    /* SYS_EXIT_THREAD(code) — thread-only exit. For an is_thread task
+     * scheduler_exit_current already handles the CLONE_CHILD_CLEARTID
+     * futex wake. For a process leader this acts the same as SYS_EXIT. */
+    scheduler_exit_current((int)arg0);
+    return 0;
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

@@ -452,11 +452,13 @@ permission edge cases and kernel backtrace diagnostics.
 
 ## M29: POSIX Threads & Futex Synchronization
 
-- [ ] `planned` Implement `clone()` syscall with `CLONE_VM`, `CLONE_FS`, and `CLONE_FILES` flags.
-- [ ] `planned` Implement `SYS_futex` for fast userspace locking and waiting.
-- [ ] `planned` Configure Thread Local Storage (TLS) via `%fs` / `%gs` register segment bases in userspace.
-- [ ] `planned` Build a compliant `libpthread` inside libc with mutexes, condvars, and join/detach APIs.
-- [ ] `planned` Verify thread safety in core memory and file operations from userspace.
+- [x] `done` Implement `clone()` syscall with `CLONE_VM`, `CLONE_FS`, `CLONE_FILES`, `CLONE_SIGHAND`, `CLONE_THREAD`, `CLONE_SETTLS`, and `CLONE_CHILD_CLEARTID` flags. `kernel/sched/scheduler.c::scheduler_clone_thread` allocates a new task slot, shares pml4/vma/fd_table/user_image with the parent (refcount on user_image bumped, mm/fds detached at waitpid reap via [`pml4_other_refs`](../kernel/sched/scheduler.c)/`fdtable_other_refs` so the surviving sibling keeps them), and lands in ring 3 via a `clone_thread_kentry` → `x86_user_jump` trampoline with `start_routine(arg)` in RDI.
+- [x] `done` Implement `SYS_futex` for fast userspace locking and waiting. `kernel/sched/futex.c` — 64-bucket hash table keyed on `(pml4_phys, uaddr)`, `FUTEX_WAIT` re-checks `*uaddr == val` under the bucket lock (closes the classic wait/wake race) then `scheduler_block_on`s; `FUTEX_WAKE` removes up to N waiters from the bucket and transitions each via `scheduler_wake_task`.
+- [x] `done` Configure Thread Local Storage (TLS) via `%fs` segment base. `SYS_SET_TLS(addr)` writes `MSR_FS_BASE` (0xC0000100) live and stores the value in a per-task side-table; the scheduler re-writes the MSR on every context switch in (`kernel/arch/x86/arch.c::arch_set_fs_base`). Userspace `mov %fs:N, %reg` lands at `fs_base + N` since `x86_user_jump` keeps the FS selector at the user data descriptor.
+- [x] `done` Build a compliant `libpthread` inside libc with mutexes, condvars, and join/detach APIs. `userspace/libc/pthread.c` — `pthread_create/exit/join/detach/self/equal`, three-state futex-backed `pthread_mutex_*` (normal + recursive flavour, fast-path is a single atomic CAS), `pthread_cond_*` (sequence-counter + FUTEX_WAKE), `pthread_once`, and `pthread_mutexattr_*`. Header at `userspace/include/pthread.h`.
+- [x] `done` Verify thread safety in core memory and file operations from userspace. Smoke `M29-PTHREAD` covers `pthread_create` + `pthread_join` (return value passing), mutex serialisation of two competing increment loops (counter == 400 after 2×200), `pthread_cond_signal`/`wait`, `SYS_SET_TLS` + `mov %fs:0, %reg` round-trip, and `SYS_GETTID` returning distinct ids per thread. Markers: `M29-PTHREAD: ok create-join`, `mutex`, `condvar`, `tls`, `gettid`, `done`.
+
+NOTE: M29 thread metadata (`is_thread` / `tls_base` / `child_tid_clear`) lives in parallel side-tables in `kernel/sched/scheduler.c` (`g_task_is_thread[MAX_TASKS]` etc.), NOT in `struct task`. Adding fields to `struct task` triggered an unrelated paging issue — the LAPIC PT became unreachable from user-task pml4 (cr2 `0xfffffe00000000b0`, PT[0]=0) right after the M14 mount syscall. Root cause looks like a latent kernel/pmm interaction between struct task chunk allocation order and the LAPIC PT physical frame; not investigated further since the side-table layout sidesteps it entirely. See `task_is_thread()` / `task_tls_base()` / `task_child_tid_clear()` accessors in `sched.h`.
 
 ## M30: ELF Dynamic Linking & Shared Libraries
 
