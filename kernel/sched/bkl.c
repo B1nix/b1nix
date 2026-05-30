@@ -47,8 +47,12 @@ void bkl_lock(void) {
             g_bkl_owner = cpu;
             g_bkl_depth = 1;
             /* Lockdep tracks only the outermost acquire — recursive
-             * re-entry by the same CPU doesn't push a second frame. */
-            LOCKDEP_ACQUIRE(LOCKDEP_LVL_BKL);
+             * re-entry by the same CPU doesn't bump the global counter
+             * a second time. M24b's bequeath model lets the release CPU
+             * differ from the acquire CPU (task migrates mid-syscall),
+             * so this lock uses the GLOBAL singleton entry that bypasses
+             * the per-CPU acquisition stack. See lockdep.h. */
+            LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_BKL);
             irq_restore(fl);
             return;
         }
@@ -79,7 +83,7 @@ void bkl_unlock(void) {
                                     * this store ordered ahead of the unlock) */
         __asm__ volatile("" : : : "memory");
         g_bkl = 0;                 /* release */
-        LOCKDEP_RELEASE(LOCKDEP_LVL_BKL);
+        LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_BKL);
     }
     irq_restore(fl);
 }

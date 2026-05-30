@@ -647,11 +647,15 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
     }
     scheduler_block_on((void *)&inode->rw_lock);
   }
-  LOCKDEP_ACQUIRE(LOCKDEP_LVL_INODE);
+  /* INODE rwlock is a sleeping lock — scheduler_block_on can wake the
+   * caller on a different CPU than it slept on, so the release-CPU and
+   * acquire-CPU may differ. Track via the global-singleton lockdep
+   * entry (M28 #2 Variant A) instead of the per-CPU acquisition stack. */
+  LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
 
 static void vfs_inode_unlock_read(struct vfs_inode *inode) {
-  LOCKDEP_RELEASE(LOCKDEP_LVL_INODE);
+  LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   if (__atomic_add_fetch(&inode->rw_lock, -1, __ATOMIC_RELEASE) == 0) {
     scheduler_wake_all((void *)&inode->rw_lock);
   }
@@ -669,11 +673,12 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
     }
     scheduler_block_on((void *)&inode->rw_lock);
   }
-  LOCKDEP_ACQUIRE(LOCKDEP_LVL_INODE);
+  /* Sleeping lock — see read-lock variant for why this uses _GLOBAL. */
+  LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);
 }
 
 static void vfs_inode_unlock_write(struct vfs_inode *inode) {
-  LOCKDEP_RELEASE(LOCKDEP_LVL_INODE);
+  LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_INODE);
   __atomic_store_n(&inode->rw_lock, 0, __ATOMIC_RELEASE);
   scheduler_wake_all((void *)&inode->rw_lock);
 }

@@ -201,6 +201,26 @@ struct task {
    * fork. */
   int ap_runnable;
 
+  /* Kernel-stack lease flag for cross-CPU reap safety (M28 T4 prerequisite).
+   *
+   * A dying task on CPU A executes `scheduler_exit_current` → publishes
+   * `state = TASK_DEAD` → runs `scheduler_yield`'s body → calls
+   * `arch_context_switch` — and is STILL using its own kernel_stack as RSP
+   * the entire time, right up to the `mov 0(%rsi), %rsp` swap inside the
+   * asm. Meanwhile, under T4 (no BKL), the parent's `scheduler_waitpid`
+   * on CPU B can win the `DEAD → REAPING` CAS the instant DEAD is
+   * published and `kfree` the stack out from under CPU A. The freed page
+   * returns to kheap, gets handed to some other allocation, and CPU A's
+   * subsequent stack pushes (or, much later, the iret frame on this
+   * page after a context-switch-back) land on corrupted bytes —
+   * shape #1/#2 from docs/m28-t4-blocker.md.
+   *
+   * Protocol: the death-path clears `stack_released = 0` BEFORE writing
+   * `state = TASK_DEAD` (x86 TSO orders the stores). `arch_context_switch`
+   * sets `*released_publish = 1` AFTER the RSP swap. `scheduler_waitpid`
+   * spins on `stack_released == 1` after winning the CAS, before kfree. */
+  volatile int stack_released;
+
   /* SMP runqueue linkage (must be last field for ABI compat) */
   struct task *next_run;
 };

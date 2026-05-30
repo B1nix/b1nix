@@ -20,7 +20,8 @@ volatile int g_ap_userspace_enabled = 0;
 int g_max_cpus = 1;
 
 /* External functions */
-extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new);
+extern void arch_context_switch(struct cpu_context *old, struct cpu_context *new,
+                                volatile int *released_publish);
 extern void paging_switch_address_space(u64 pml4_phys);
 extern void arch_set_kernel_stack(u64 stack);
 
@@ -300,13 +301,20 @@ void ap_worker_trampoline(void) {
 
     if (t && t->entry)
         t->entry(t->arg);
-    if (t)
+    if (t) {
+        /* Claim stack_released before publishing DEAD so any reaper (today
+         * only sched_ap_reap_worker on the same CPU after switch-back, but
+         * keep the protocol symmetric) sees released==0 until the
+         * arch_context_switch below swaps RSP off this stack. */
+        t->stack_released = 0;
         t->state = TASK_DEAD;  /* tells ap_main the worker has finished */
+    }
 
     /* Switch back to the AP idle loop. Saves our now-defunct context into
      * t->context (never reused) and restores the AP idle context captured in
      * ap_main. Does not return. */
-    arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx);
+    arch_context_switch(&t->context, (struct cpu_context *)pcpu->sched_return_ctx,
+                        &t->stack_released);
 
     for (;;) __asm__ volatile("hlt");  /* unreachable */
 }
@@ -358,7 +366,9 @@ void ap_main(u32 cpu_id) {
             t->state = TASK_RUNNING;
             pcpu->cur_task = t;
             pcpu->sched_return_ctx = &idle_ctx;
-            arch_context_switch(&idle_ctx, &t->context);
+            /* OLD here is the AP idle context (stack-local cpu_context, no
+             * task struct, never reaped) — pass NULL to skip the publish. */
+            arch_context_switch(&idle_ctx, &t->context, (volatile int *)0);
             pcpu->cur_task = NULL;
             sched_ap_reap_worker(t);
             interrupts_enable();

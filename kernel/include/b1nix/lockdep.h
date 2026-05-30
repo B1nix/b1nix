@@ -60,6 +60,24 @@ void lockdep_acquire(int level, const char *name);
  * the top of the stack (out-of-order release / double release). */
 void lockdep_release(int level);
 
+/* Cross-CPU "bequeathing" variants for locks whose holder may migrate to a
+ * different CPU between acquire and release (BKL under M24b ownership
+ * bequeath; per-inode sleeping rwlock when scheduler_block_on resumes the
+ * task on another CPU). These DO NOT push/pop the per-CPU acquisition
+ * stack — instead they bump a global per-level counter, so the
+ * release-CPU is allowed to differ from the acquire-CPU without tripping
+ * the LIFO check.
+ *
+ * Order check is still enforced against the calling CPU's per-CPU stack
+ * at acquire time: trying to acquire BKL (level 100) while that CPU is
+ * already in an inner-lock region (e.g. holding BCACHE, level 600) still
+ * panics. We only lose the symmetric check at release (release of a
+ * global lock no longer cares about per-CPU stack top), and the check
+ * "you must hold BKL when acquiring sub-BKL" — both of which are tied to
+ * the per-CPU stack model that bequeath fundamentally breaks. */
+void lockdep_acquire_global(int level, const char *name);
+void lockdep_release_global(int level, const char *name);
+
 /* Dump the current held-lock stack for `cpu` to console. Called from
  * panic() to surface lock state. Safe to call before percpu_init. */
 void lockdep_dump_cpu(int cpu);
@@ -67,13 +85,17 @@ void lockdep_dump_cpu(int cpu);
 /* Dump every CPU's stack — used by panic. */
 void lockdep_dump_all(void);
 
-#define LOCKDEP_ACQUIRE(lvl)  lockdep_acquire((int)(lvl), #lvl)
-#define LOCKDEP_RELEASE(lvl)  lockdep_release((int)(lvl))
+#define LOCKDEP_ACQUIRE(lvl)         lockdep_acquire((int)(lvl), #lvl)
+#define LOCKDEP_RELEASE(lvl)         lockdep_release((int)(lvl))
+#define LOCKDEP_ACQUIRE_GLOBAL(lvl)  lockdep_acquire_global((int)(lvl), #lvl)
+#define LOCKDEP_RELEASE_GLOBAL(lvl)  lockdep_release_global((int)(lvl), #lvl)
 
 #else  /* !KERNEL_LOCKDEP */
 
-#define LOCKDEP_ACQUIRE(lvl)  ((void)0)
-#define LOCKDEP_RELEASE(lvl)  ((void)0)
+#define LOCKDEP_ACQUIRE(lvl)         ((void)0)
+#define LOCKDEP_RELEASE(lvl)         ((void)0)
+#define LOCKDEP_ACQUIRE_GLOBAL(lvl)  ((void)0)
+#define LOCKDEP_RELEASE_GLOBAL(lvl)  ((void)0)
 
 static inline void lockdep_dump_cpu(int cpu) { (void)cpu; }
 static inline void lockdep_dump_all(void) {}

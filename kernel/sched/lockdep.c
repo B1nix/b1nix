@@ -27,6 +27,15 @@ struct lockdep_cpu_state {
  * cpu_id 0 by convention, and APs each get their slot in ap_main. */
 static struct lockdep_cpu_state g_lockdep[MAX_CPUS];
 
+/* "Bequeathing" lock levels (M28 #2 Variant A): BKL and the per-inode
+ * sleeping rwlock can be released by a CPU other than the one that
+ * acquired them. Their LOCKDEP_*_GLOBAL helpers bypass the per-CPU
+ * acquisition stack and do only the inversion check on acquire — that
+ * suffices to detect lock-discipline mistakes T4 might introduce
+ * without bumping a globally-contended counter (cache-line ping-pong
+ * perturbs syscall density enough to tickle the documented stack-
+ * corruption race; see docs/m28-t4-blocker.md). */
+
 static int lockdep_self_cpu(void) {
     struct percpu *p = get_percpu();
     return p ? (int)p->cpu_id : 0;
@@ -107,6 +116,48 @@ void lockdep_release(int level) {
     s->names[s->depth] = 0;
 }
 
+void lockdep_acquire_global(int level, const char *name) {
+    int cpu = lockdep_self_cpu();
+    if (cpu < 0 || cpu >= MAX_CPUS) return;
+    /* Order check: a global-level acquire while the same CPU already
+     * holds a higher per-CPU-stack level is still an inversion. The
+     * release side we cannot check (different CPU may release us).
+     *
+     * No global counter is bumped: under the M24b bequeath model the
+     * BKL is acquired on one CPU and released on another constantly,
+     * so an atomic on a shared cache line here perturbs syscall density
+     * enough to tickle the documented stack-corruption race in M14
+     * (see docs/m28-t4-blocker.md). The order check is sufficient as a
+     * detector for the lock-discipline mistakes T4 might introduce; the
+     * stack-corruption races surface as GP/PF exceptions independently. */
+    struct lockdep_cpu_state *s = &g_lockdep[cpu];
+    if (s->depth > 0 && s->levels[s->depth - 1] > level) {
+        console_write("LOCKDEP: ORDER INVERSION on cpu ");
+        console_write_dec(cpu);
+        console_write(" (global acquire)\n  trying to acquire ");
+        console_write(name ? name : "(null)");
+        console_write(" (level ");
+        console_write_dec((u32)level);
+        console_write(")\n  while holding ");
+        console_write(s->names[s->depth - 1] ?
+                      s->names[s->depth - 1] : "(null)");
+        console_write(" (level ");
+        console_write_dec((u32)s->levels[s->depth - 1]);
+        console_write(")\n");
+        lockdep_dump_cpu(cpu);
+        panic("lockdep: inversion (global)");
+    }
+}
+
+void lockdep_release_global(int level, const char *name) {
+    /* Intentionally no-op: any work here would either contend on a
+     * shared cache line (defeating the bequeath relaxation) or require
+     * per-task held-lock tracking. The matching acquire-side order check
+     * is what we care about for race detection. */
+    (void)level;
+    (void)name;
+}
+
 void lockdep_dump_cpu(int cpu) {
     if (cpu < 0 || cpu >= MAX_CPUS) return;
     struct lockdep_cpu_state *s = &g_lockdep[cpu];
@@ -115,13 +166,13 @@ void lockdep_dump_cpu(int cpu) {
     console_write(" held locks: ");
     if (s->depth == 0) {
         console_write("(none)\n");
-        return;
+    } else {
+        for (int i = 0; i < s->depth; i++) {
+            console_write(s->names[i] ? s->names[i] : "?");
+            if (i + 1 < s->depth) console_write(" -> ");
+        }
+        console_write("\n");
     }
-    for (int i = 0; i < s->depth; i++) {
-        console_write(s->names[i] ? s->names[i] : "?");
-        if (i + 1 < s->depth) console_write(" -> ");
-    }
-    console_write("\n");
 }
 
 void lockdep_dump_all(void) {
