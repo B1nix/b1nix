@@ -57,7 +57,8 @@ COMMON_CFLAGS := \
 	-mno-red-zone \
 	-Wall \
 	-Wextra \
-	-I kernel/include
+	-I kernel/include \
+	$(CFLAGS_EXTRA)
 
 
 ifeq ($(ARCH),x86)
@@ -113,6 +114,7 @@ KERNEL_SOURCES := \
 	kernel/sched/uidgid.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/bkl.c \
+	kernel/sched/lockdep.c \
 	kernel/sched/smp_test.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
@@ -183,7 +185,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
