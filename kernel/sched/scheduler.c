@@ -1,6 +1,7 @@
 #include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
@@ -285,14 +286,22 @@ static struct task *pick_next_task(void) {
 }
 
 static void wake_sleepers(void) {
+  int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state == TASK_SLEEPING &&
         T(i)->wake_tick <= scheduler_ticks) {
       T(i)->state = TASK_READY;
       T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
+      woken++;
     }
   }
+  /* M28 #6: if we promoted at least one task, kick the other CPUs out of
+   * `sti; hlt` so they re-poll the global runqueue immediately instead of
+   * waiting for their next LAPIC tick (up to 10 ms). The IPI is cheap and
+   * the bound it removes matters most when this task's wake-up is the only
+   * event in flight. */
+  if (woken > 0) ipi_reschedule_all();
 }
 
 static void kernel_thread_trampoline(void) {
@@ -849,15 +858,21 @@ void scheduler_block_on(void *chan) {
 void scheduler_wake_all(void *chan) {
   interrupts_disable();
 
+  int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state == TASK_BLOCKED && T(i)->wait_chan == chan) {
       T(i)->state = TASK_READY;
       T(i)->wait_chan = 0;
       sched_rq_enqueue_current(T(i));
+      woken++;
     }
   }
 
   interrupts_enable();
+  /* M28 #6: same reschedule kick as wake_sleepers. Outside the IRQ-off
+   * window because lapic_send_ipi spins on ICR delivery — cheap, but no
+   * reason to do it with interrupts disabled. */
+  if (woken > 0) ipi_reschedule_all();
 }
 
 void scheduler_sleep_ticks(u64 ticks) {

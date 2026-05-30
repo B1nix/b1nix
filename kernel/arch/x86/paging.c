@@ -341,6 +341,12 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
 
 void vmm_unmap_page(u64 virtual_address) {
   unmap_page_from_pml4(get_current_pml4(), virtual_address);
+  /* M28 #5: every other CPU that has cached this translation needs to drop
+   * it before we return; otherwise a write through their stale TLB entry hits
+   * the (potentially freed-and-reused) physical frame. tlb_shootdown_page is
+   * a no-op when g_max_cpus <= 1 so single-CPU boots pay nothing. */
+  extern void tlb_shootdown_page(u64);
+  tlb_shootdown_page(virtual_address);
 }
 
 void paging_unmap_page_from_space(u64 pml4_phys, u64 virtual_address) {

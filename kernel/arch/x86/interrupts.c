@@ -9,6 +9,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/net.h>
+#include <b1nix/tlb.h>
 #include <b1nix/types.h>
 
 #define IDT_ENTRY_COUNT 256
@@ -90,6 +91,8 @@ extern void isr45(void);
 extern void isr46(void);
 extern void isr47(void);
 extern void isr64(void);   /* LAPIC timer — per-CPU scheduler tick */
+extern void isr65(void);   /* TLB shootdown IPI */
+extern void isr66(void);   /* Reschedule IPI — wake from sti;hlt */
 extern void isr255(void);  /* LAPIC spurious — no-EOI no-op */
 
 static volatile u64 timer_ticks;
@@ -180,6 +183,13 @@ void x86_idt_init(void) {
    * the BSP arms the LAPIC timer from lapic_timer_start_periodic_ms after
    * calibration, and APs arm it as they enter the cooperative phase. */
   idt_set_gate(64, isr64);
+  /* TLB shootdown IPI vector — wired on every CPU so tlb_shootdown_*
+   * can target every other core. */
+  idt_set_gate(65, isr65);
+  /* Reschedule IPI — wires the wake-from-sti;hlt path so a new task on
+   * the global runqueue doesn't wait for the next 10 ms LAPIC tick on
+   * each idle AP. Handler is a no-op (just EOI). */
+  idt_set_gate(66, isr66);
   idt_set_gate(255, isr255);
 
   struct idt_pointer pointer = {
@@ -282,6 +292,23 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     return;
   }
 
+  /* TLB shootdown IPI (vector 0x41 = 65). Forwarded to the shootdown machinery
+   * in kernel/arch/x86/tlb.c which invlpg's the published vaddr (or reloads
+   * CR3) and decrements the pending counter the initiator polls. EOI happens
+   * inside the handler. */
+  if (frame->vector == 65) {
+    tlb_shootdown_handler();
+    return;
+  }
+
+  /* Reschedule IPI (vector 0x42 = 66). Pure wake-up: the target was sitting in
+   * `sti; hlt` and we want it to re-poll the runqueue immediately. No state to
+   * touch — just EOI. */
+  if (frame->vector == 66) {
+    lapic_eoi();
+    return;
+  }
+
   /* LAPIC timer (vector 0x40 = 64) — per-CPU scheduler tick. Drives the global
    * scheduler bookkeeping (scheduler_ticks++, wake_sleepers) on the BSP only so
    * wall-clock ticks aren't multiplied by g_max_cpus. APs receive the tick as a
@@ -350,8 +377,27 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
  * recurses the depth. The matching release happens on the normal return; paths
  * that never return (a fatal signal terminating the task via
  * scheduler_exit_current) hand the depth-1 lock off across the context switch,
- * so skipping bkl_unlock there is correct. */
+ * so skipping bkl_unlock there is correct.
+ *
+ * **TLB shootdown IPI (vector 65) is the one exception** — the initiator of
+ * the shootdown holds the BKL and synchronously waits for every target to
+ * ACK; if a target tried to acquire the BKL, the initiator would never
+ * release it and the system deadlocks. The handler is trivial (invlpg +
+ * atomic decrement + EOI), touches no BKL-protected state, and runs with
+ * IRQs implicitly disabled at the LAPIC level, so skipping BKL here is safe.
+ */
 void x86_irq_handler(struct interrupt_frame *frame) {
+  if (frame->vector == 65) {
+    tlb_shootdown_handler();
+    return;
+  }
+  /* Reschedule IPI (M28 #6): same BKL bypass as TLB shootdown — the handler
+   * is a pure no-op wake-up, so taking BKL would just add unnecessary
+   * contention without adding correctness. */
+  if (frame->vector == 66) {
+    lapic_eoi();
+    return;
+  }
   bkl_lock();
   x86_irq_handler_inner(frame);
   bkl_unlock();

@@ -86,6 +86,16 @@ IRQ 47
  * which we'll later enable preemption once VFS chain walks are rwlock-safe. */
 IRQ 64
 
+/* TLB shootdown IPI — vector 0x41 = 65. Targets invalidate the requested
+ * vaddr range from their local TLB and decrement the pending counter so the
+ * initiator can wait synchronously. See kernel/arch/x86/tlb.c (M28 #5). */
+IRQ 65
+
+/* Reschedule IPI — vector 0x42 = 66. No-op handler whose only effect is to
+ * pull the target out of `sti; hlt` so it re-polls the global runqueue
+ * (M28 #6). EOI inside the handler; never takes the BKL. */
+IRQ 66
+
 /* LAPIC spurious vector — must match LAPIC_SPURIOUS_VECTOR (0xFF). The CPU
  * delivers this when a pending interrupt is cancelled mid-flight; per Intel
  * SDM the handler must NOT issue an EOI. Without an IDT gate the CPU would
