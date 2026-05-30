@@ -128,6 +128,9 @@ enum {
   SYS_SET_TLS      = 108,
   SYS_GETTID       = 109,
   SYS_EXIT_THREAD  = 110,
+
+  /* --- M32: networking & multiplexing --- */
+  SYS_SELECT       = 111,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

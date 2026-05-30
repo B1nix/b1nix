@@ -3357,6 +3357,30 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M31: user security / setuid / shadow. */
+  {
+    u64 m31_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m31-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m31_pid < 0) {
+      uwrite("M31-SEC: spawn-fail\n");
+    } else {
+      int m31_status = 0;
+      syscall_dispatch(SYS_WAIT, m31_pid, (u64)(usize)&m31_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M32: select() / network multiplexing. */
+  {
+    u64 m32_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m32-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m32_pid < 0) {
+      uwrite("M32-NET: spawn-fail\n");
+    } else {
+      int m32_status = 0;
+      syscall_dispatch(SYS_WAIT, m32_pid, (u64)(usize)&m32_status, 0, 0, 0, 0);
+    }
+  }
+
   uwrite("M16-SMOKE: start\n");
   struct b1nix_termios m16_termios_before;
   memset(&m16_termios_before, 0, sizeof(m16_termios_before));

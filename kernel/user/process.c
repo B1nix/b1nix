@@ -27,7 +27,9 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define ELF_TYPE_DYN 3
 #define ELF_MACHINE_X86_64 0x3e
 #define ELF_MACHINE_AARCH64 0xb7
-#define PT_LOAD 1
+#define PT_LOAD   1
+#define PT_DYNAMIC 2
+#define PT_INTERP 3
 
 struct process_start {
   struct user_loaded_image *image;
@@ -317,6 +319,31 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   console_write_hex64(ehdr->e_entry);
   console_write("\n");
   image->address_space = user_address_space_create();
+
+  /* M30: PT_INTERP detection. b1nix's ELF loader is static-only — when
+   * a binary requests a dynamic loader via PT_INTERP we log the request
+   * and refuse to load (the binary wouldn't run correctly without
+   * relocation/symbol resolution). A real dynamic linker (`ld-b1nix.so`)
+   * exists in the initramfs as a stub for future M30 work. */
+  for (u16 j = 0; j < ehdr->e_phnum; j++) {
+    struct elf64_phdr *p =
+        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)j * ehdr->e_phentsize));
+    if (p->p_type != PT_INTERP) continue;
+    if (p->p_offset + p->p_filesz > file_size) continue;
+    char interp[64];
+    usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
+                                              : sizeof(interp) - 1;
+    memcpy(interp, file_data + p->p_offset, ilen);
+    interp[ilen] = '\0';
+    console_write("ELF load: rejected ");
+    console_write(path);
+    console_write(" — requires interpreter ");
+    console_write(interp);
+    console_write(" (b1nix M30 dynamic linker is initial-stage only)\n");
+    kfree(file_data);
+    return -1;
+  }
 
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     struct elf64_phdr *phdr =

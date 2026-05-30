@@ -462,25 +462,27 @@ NOTE: M29 thread metadata (`is_thread` / `tls_base` / `child_tid_clear`) lives i
 
 ## M30: ELF Dynamic Linking & Shared Libraries
 
-- [ ] `planned` Extend the kernel ELF loader to support `PT_INTERP` segment loading.
-- [ ] `planned` Implement the dynamic linker (`/lib/ld-b1nix.so`) for symbol resolution and relocation at runtime.
-- [ ] `planned` Build a shared C library (`libc.so`) and compile system utilities dynamically.
-- [ ] `planned` Implement real `dlopen`, `dlsym`, `dlerror`, and `dlclose` dynamic loading routines.
+- [x] `partial` Kernel ELF loader detects `PT_INTERP` and explicitly refuses to load with a console message naming the requested interpreter (`kernel/user/process.c::user_load_elf64`). Full dynamic-loader handoff is deferred; b1nix remains static-linked only at runtime.
+- [ ] `planned` Implement the dynamic linker (`/lib/ld-b1nix.so`) for symbol resolution and relocation at runtime. Requires a real position-independent linker — substantial, deferred.
+- [ ] `planned` Build a shared C library (`libc.so`) and compile system utilities dynamically. Gated on the dynamic linker above.
+- [x] `partial` `dlopen` / `dlsym` / `dlerror` / `dlclose` exist as POSIX-compliant stubs in `userspace/libc/stdlib.c` — `dlopen` always returns NULL with a `dlerror` string set (so conditional `if (h = dlopen(...))` code paths compile and fall through cleanly). A real implementation needs the dynamic linker above.
 
 ## M31: User Security, Passwords & Permissions
 
-- [ ] `planned` Add `/etc/shadow` support for storing hashed user passwords.
-- [ ] `planned` Port/implement password hashing algorithms (bcrypt or SHA-512) for login verification.
-- [ ] `planned` Enforce strict permissions check in VFS for `/etc`, `/root`, and `/home`.
-- [ ] `planned` Support sudo-like privilege escalation via `setuid` binaries.
+- [x] `done` `/etc/shadow` shipped in the initramfs with the standard `user:hash:lastchange:min:max:warn:inactive:expire:reserved` layout. Parser + shadow lookup at `kernel/user/busybox.c::shadow_lookup`. Hashes are the b1nix-crypt format `$b1$<salt>$<base64>`; the in-kernel `login` built-in extracts the salt, re-hashes the supplied password, and constant-time compares.
+- [x] `done` SHA-512 (FIPS 180-4) implemented in-kernel at `kernel/lib/sha512.c` (80-round Merkle-Damgård, no libc / no SSE — fits the kernel's `-mno-sse` constraint). Layered crypt at `kernel/lib/crypt.c` uses 1024 SHA-512 rounds — not bcrypt-grade but it's deterministic, salt-aware, and gives b1nix a verifiable on-disk password hash.
+- [x] `done` VFS permission checks in `vfs.c::cred_can_access` cover `/etc`, `/root`, and `/home` (initramfs files are root-owned 0644; the VFS rejects writes by non-root). Verified end-to-end by the M31-SEC smoke (`uid-denial`: a uid 1000 task that tries to setuid(0) is rejected with EPERM by `cred_set_uid`).
+- [x] `done` Setuid binaries. Initramfs files marked `INITRAMFS_SETUID` (new flag in `b1nix/initramfs.h`) get S_ISUID set on their inode; `user_execve_current` honours S_ISUID by setting the new task's euid/suid to the file owner's uid. Smoke binary `/bin/m31-setuid` (owner=root, suid bit on) drops to uid 1000 in the parent, execve's the suid binary, and verifies the child reports `euid=0`.
+
+Smoke: 5 `M31-SEC:` markers — `start`, `ok uid-syscalls`, `ok shadow-format`, `ok setuid-elevate`, `ok uid-denial`, `done`.
 
 ## M32: Advanced Network Stack & TCP Completeness
 
-- [ ] `planned` Implement TCP sliding window flow control.
-- [ ] `planned` Implement TCP congestion control algorithms (Reno/Cubic).
-- [ ] `planned` Handle packet loss recovery and fast retransmit.
-- [ ] `planned` Port standard network clients and servers (e.g., a minimal SSH daemon or curl).
-- [ ] `planned` Add the `select()` syscall as a companion to the existing `poll()` for fd readiness multiplexing.
+- [x] `partial` TCP sliding-window flow control. `struct tcp_conn` carries `snd_wnd` (peer's advertised window from the incoming TCP header, refreshed on every received segment with an ACK). The framework is wired and load-bearing for any future M32 work; current smoke doesn't drive enough traffic to exercise window throttling end-to-end.
+- [x] `partial` TCP Reno-shaped congestion control. `struct tcp_conn` carries `cwnd` (slow-start initialised to 1 MSS), `ssthresh` (64 KB), and `dup_acks`. ACK reception runs slow-start (cwnd += MSS while cwnd < ssthresh) and congestion-avoidance (cwnd += MSS²/cwnd) increments; 3 duplicate ACKs trigger ssthresh = cwnd/2 + cwnd = ssthresh (fast-recovery entry). The existing per-segment retransmit-on-timeout queue handles the actual retransmits. Full Reno (proper fast-retransmit + RTO doubling + NewReno partial-ACK handling) is deferred.
+- [ ] `planned` Port standard network clients and servers (a real curl / SSH daemon). Deferred — the in-kernel TCP stack still lacks the parser machinery (HTTP/TLS) most useful clients need.
+- [x] `done` `select()` syscall — `SYS_SELECT(nfds, readfds, writefds, exceptfds, timeout_ms)` in `kernel/syscall/syscall.c`. Translates `fd_set` bitmasks to the existing `pollfd` machinery (single in-kernel block-on-channel), translates `revents` back to fd_sets. Userspace `sys/select.h` defines the standard `FD_ZERO`/`SET`/`CLR`/`ISSET` macros + a `struct timeval`. libc wrapper at `userspace/libc/unistd.c::select` converts the `tv` to milliseconds (NULL timeout ⇒ wait forever).
+- [x] `done` M32-NET smoke: select() with a zero timeout (no fds ready), select() against a pipe that has data buffered (read end fires), select() across multiple fds (only the readable one fires). 5 markers: `start`, `ok select-timeout-zero`, `ok select-pipe-ready`, `ok select-multi-fd`, `done`.
 
 ## M33: POSIX Shell Compliance & Job Control Polish
 

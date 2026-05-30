@@ -1968,6 +1968,100 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
      * futex wake. For a process leader this acts the same as SYS_EXIT. */
     scheduler_exit_current((int)arg0);
     return 0;
+  case SYS_SELECT: {
+    /* SYS_SELECT(nfds, readfds, writefds, exceptfds, timeout_ms).
+     *
+     * b1nix doesn't ship a full POSIX `struct timeval` (no float in the
+     * kernel; the libc has not added it yet). The userspace wrapper
+     * converts the tv into a millisecond count, with timeout==(u64)-1
+     * meaning "wait forever" (matching the b1nix poll convention).
+     *
+     * fd_set is a fixed-size bitmask — b1nix uses 1024-bit (128 bytes)
+     * to match Linux's FD_SETSIZE=1024. We translate set bits to a
+     * pollfd array, dispatch to sys_poll, then translate revents back. */
+    int nfds = (int)arg0;
+    if (nfds < 0 || nfds > 1024) return (u64)-EINVAL;
+    /* Local copies of each fd_set (NULL-aware — userspace may pass 0). */
+    u8 r_kset[128] = {0}, w_kset[128] = {0}, e_kset[128] = {0};
+    if (arg1 && syscall_copyin(r_kset, (void *)(usize)arg1, 128) < 0)
+      return (u64)-EFAULT;
+    if (arg2 && syscall_copyin(w_kset, (void *)(usize)arg2, 128) < 0)
+      return (u64)-EFAULT;
+    if (arg3 && syscall_copyin(e_kset, (void *)(usize)arg3, 128) < 0)
+      return (u64)-EFAULT;
+
+    /* Build pollfd array — one slot per fd that appears in any set. */
+    struct b1nix_pollfd pfds[64];
+    int np = 0;
+    for (int fd = 0; fd < nfds && np < 64; fd++) {
+      int r = (r_kset[fd / 8] >> (fd & 7)) & 1;
+      int w = (w_kset[fd / 8] >> (fd & 7)) & 1;
+      int e = (e_kset[fd / 8] >> (fd & 7)) & 1;
+      if (!r && !w && !e) continue;
+      pfds[np].fd = fd;
+      pfds[np].events = 0;
+      if (r) pfds[np].events |= B1NIX_POLLIN;
+      if (w) pfds[np].events |= B1NIX_POLLOUT;
+      pfds[np].revents = 0;
+      np++;
+    }
+
+    /* Dispatch into sys_poll's machinery without going back through the
+     * syscall boundary — keeps the implementation a single function and
+     * makes the user-vs-kernel buffer ownership consistent. The inline
+     * pfds array lives on this kernel stack; sys_poll's copyin would
+     * normally bring it in from userspace, so we duplicate the spin
+     * loop here. */
+    u64 start_ticks = scheduler_get_uptime_ticks();
+    u64 timeout_ms = arg4;
+    u64 timeout_ticks =
+        (timeout_ms == (u64)-1) ? (u64)-1 : timeout_ms / 10;
+    extern void *vfs_poll_chan;
+    int ready_count = 0;
+    while (1) {
+      ready_count = 0;
+      for (int i = 0; i < np; i++) {
+        if (pfds[i].fd < 0) { pfds[i].revents = 0; continue; }
+        struct vfs_handle *h = scheduler_fd_get(pfds[i].fd);
+        if (!h) { pfds[i].revents = B1NIX_POLLNVAL; ready_count++; continue; }
+        pfds[i].revents = 0;
+        vfs_poll(pfds[i].fd, &pfds[i]);
+        if (pfds[i].revents) ready_count++;
+      }
+      if (ready_count > 0 || timeout_ms == 0) break;
+      if (timeout_ms != (u64)-1) {
+        u64 now = scheduler_get_uptime_ticks();
+        if (now - start_ticks >= timeout_ticks) break;
+      }
+      scheduler_block_on(vfs_poll_chan);
+    }
+
+    /* Translate revents back to fd_sets. */
+    u8 r_kout[128] = {0}, w_kout[128] = {0}, e_kout[128] = {0};
+    int hits = 0;
+    for (int i = 0; i < np; i++) {
+      int fd = pfds[i].fd;
+      if (pfds[i].revents & B1NIX_POLLIN) {
+        r_kout[fd / 8] |= (u8)(1 << (fd & 7));
+        hits++;
+      }
+      if (pfds[i].revents & B1NIX_POLLOUT) {
+        w_kout[fd / 8] |= (u8)(1 << (fd & 7));
+        hits++;
+      }
+      if (pfds[i].revents & (B1NIX_POLLERR | B1NIX_POLLHUP | B1NIX_POLLNVAL)) {
+        e_kout[fd / 8] |= (u8)(1 << (fd & 7));
+        hits++;
+      }
+    }
+    if (arg1 && syscall_copyout((void *)(usize)arg1, r_kout, 128) < 0)
+      return (u64)-EFAULT;
+    if (arg2 && syscall_copyout((void *)(usize)arg2, w_kout, 128) < 0)
+      return (u64)-EFAULT;
+    if (arg3 && syscall_copyout((void *)(usize)arg3, e_kout, 128) < 0)
+      return (u64)-EFAULT;
+    return (u64)hits;
+  }
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

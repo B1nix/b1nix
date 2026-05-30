@@ -39,7 +39,10 @@ BINARIES := \
 	$(BUILD)/bin/m26_smoke \
 	$(BUILD)/bin/m24b_smoke \
 	$(BUILD)/bin/m27_smoke \
-	$(BUILD)/bin/m29_smoke
+	$(BUILD)/bin/m29_smoke \
+	$(BUILD)/bin/m31_smoke \
+	$(BUILD)/bin/m31_setuid \
+	$(BUILD)/bin/m32_smoke
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)

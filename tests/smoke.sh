@@ -507,6 +507,18 @@ check_output "$LOG" "M29-PTHREAD: ok condvar" "pthread condvar signal/wait works
 check_output "$LOG" "M29-PTHREAD: ok tls" "SYS_SET_TLS + %fs:0 round-trip works"
 check_output "$LOG" "M29-PTHREAD: ok gettid" "SYS_GETTID returns distinct ids per thread"
 check_output "$LOG" "M29-PTHREAD: done" "M29 pthread smoke completes"
+# ── M31 User Security / Passwords / Setuid ──
+check_output "$LOG" "M31-SEC: start" "M31 user-security smoke starts"
+check_output "$LOG" "M31-SEC: ok shadow-format" "/etc/shadow exists and uses b1nix-crypt"
+check_output "$LOG" "M31-SEC: ok setuid-elevate" "setuid initramfs binary elevates euid to root"
+check_output "$LOG" "M31-SEC: ok uid-denial" "non-root setuid(0) is rejected by kernel"
+check_output "$LOG" "M31-SEC: done" "M31 smoke completes"
+# ── M32 Networking / Multiplexing ──
+check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
+check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeout returns 0 ready"
+check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
+check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
+check_output "$LOG" "M32-NET: done" "M32 smoke completes"
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
