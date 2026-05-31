@@ -485,7 +485,21 @@ static int mkdir_p(const char *path) {
       } else {
         int rc = (int)syscall_dispatch(SYS_MKDIR, (u64)(usize)tmp, 0755, 0, 0, 0, 0);
         if (rc != 0) {
-          return rc;
+          /* TOCTOU under make -jN: two jobs both stat -> ENOENT, both
+           * mkdir; one wins, the other gets EEXIST. The dir does exist
+           * (we just lost the race), so re-stat and succeed if it's now
+           * a directory — matches GNU mkdir(1)/coreutils' -p semantics. */
+          if (rc == -EEXIST) {
+            if (syscall_dispatch(SYS_STAT, (u64)(usize)tmp,
+                                 (u64)(usize)&st, 0, 0, 0, 0) == 0 &&
+                (st.st_mode & B1NIX_S_IFDIR)) {
+              /* directory now exists — treat as success */
+            } else {
+              return rc;
+            }
+          } else {
+            return rc;
+          }
         }
       }
     }
