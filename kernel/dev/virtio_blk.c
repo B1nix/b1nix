@@ -46,6 +46,51 @@ static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
   __sync_lock_release(&inst->busy);
 }
 
+/* Append one logical buffer region to the virtqueue descriptor chain, split at
+ * physical page boundaries.
+ *
+ * The device treats each descriptor's (addr, len) as a physically contiguous
+ * span. But the buffers we are handed — block-cache entries that live in the
+ * klarge arena, kheap structs — are only *virtually* contiguous; consecutive
+ * virtual pages map to unrelated physical frames. Describing a region that
+ * crosses a page boundary with a single (vmm_virt_to_phys(start), len) makes
+ * the device run off the end of the first frame into whatever physical frame
+ * follows it — frequently an unrelated kernel page table. (Observed: a 512-byte
+ * cache read straddling a klarge page overran the data frame into the adjacent
+ * klarge page-directory frame, zeroing a PDE; with other layouts it zeroed the
+ * LAPIC leaf PT — a #PF on the next lapic_eoi. It also silently corrupted large
+ * ELF reads, e.g. /persist/bin/make, producing a #GP in early userspace.)
+ *
+ * Splitting at page boundaries yields one descriptor per physically-contiguous
+ * chunk. *next_desc is the next free descriptor slot; *prev is the previous
+ * chain link (0xFFFF for the very first region). Returns -1 if the chain would
+ * overflow the queue. */
+static int vblk_add_region(struct virtqueue *vq, u16 *next_desc, u16 *prev,
+                           u64 vaddr, u32 len, u16 write_flag) {
+  u32 rem = len;
+  while (rem > 0) {
+    if (*next_desc >= vq->queue_size)
+      return -1;
+    u16 idx = (*next_desc)++;
+    u64 phys = vmm_virt_to_phys((void *)(usize)vaddr);
+    u32 chunk = (u32)(4096 - (vaddr & 4095));
+    if (chunk > rem)
+      chunk = rem;
+    vq->desc[idx].addr = phys;
+    vq->desc[idx].len = chunk;
+    vq->desc[idx].flags = write_flag; /* F_NEXT is added once a successor links in */
+    vq->desc[idx].next = 0;
+    if (*prev != 0xFFFF) {
+      vq->desc[*prev].flags |= VRING_DESC_F_NEXT;
+      vq->desc[*prev].next = idx;
+    }
+    *prev = idx;
+    vaddr += chunk;
+    rem -= chunk;
+  }
+  return 0;
+}
+
 static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
                              u32 count, void *buffer, u32 type) {
   struct virtio_blk_dma_req *dma = kzalloc(sizeof(struct virtio_blk_dma_req));
@@ -58,29 +103,26 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   dma->req.sector = lba;
   dma->status = 0xFF;
 
-  // Set up descriptors
-  u16 d0 = 0;
-  u16 d1 = 1;
-  u16 d2 = 2;
-
-  inst->vq.desc[d0].addr = vmm_virt_to_phys(&dma->req);
-  inst->vq.desc[d0].len = sizeof(struct virtio_blk_req);
-  inst->vq.desc[d0].flags = VRING_DESC_F_NEXT;
-  inst->vq.desc[d0].next = d1;
-
-  inst->vq.desc[d1].addr = vmm_virt_to_phys(buffer);
-  inst->vq.desc[d1].len = count * 512;
-  inst->vq.desc[d1].flags =
-      VRING_DESC_F_NEXT | (type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0);
-  inst->vq.desc[d1].next = d2;
-
-  inst->vq.desc[d2].addr = vmm_virt_to_phys((void *)&dma->status);
-  inst->vq.desc[d2].len = 1;
-  inst->vq.desc[d2].flags = VRING_DESC_F_WRITE;
-  inst->vq.desc[d2].next = 0;
+  /* Build the descriptor chain: header (device reads), data (device writes for
+   * reads / reads for writes), status (device writes). Each region is split at
+   * page boundaries so the device never crosses into an unrelated frame. The
+   * chain head is descriptor 0 (next_desc starts at 0). */
+  u16 next_desc = 0;
+  u16 prev = 0xFFFF;
+  if (vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->req,
+                      sizeof(struct virtio_blk_req), 0) < 0 ||
+      vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)buffer,
+                      count * 512,
+                      type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0) < 0 ||
+      vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->status, 1,
+                      VRING_DESC_F_WRITE) < 0) {
+    virtio_blk_unlock(inst);
+    kfree(dma);
+    return -1;
+  }
 
   u16 avail_idx = inst->vq.avail->idx % inst->vq.queue_size;
-  inst->vq.avail->ring[avail_idx] = d0;
+  inst->vq.avail->ring[avail_idx] = 0; /* chain head is descriptor 0 */
 
   __sync_synchronize();
   inst->vq.avail->idx++;

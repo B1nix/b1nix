@@ -18,9 +18,18 @@
 
 SRC     ?= /persist/usr/src/b1nix
 OBJDIR  ?= /tmp/kbuild
-CC      ?= /persist/bin/gcc
-LD      ?= /persist/bin/ld
 KERNEL  ?= /tmp/kernel.elf
+
+# CC/LD: GNU make PREDEFINES CC=cc and LD=ld with origin 'default', and `?=`
+# does NOT override a default-origin variable — so a bare `make -f Makefile`
+# would invoke the host's `cc`/`ld` (Error 127 in-guest: there is no /bin/cc).
+# Force the b1nix native toolchain unless overridden on the command line / env.
+ifeq ($(filter command line environment,$(origin CC)),)
+  CC := /persist/bin/gcc
+endif
+ifeq ($(filter command line environment,$(origin LD)),)
+  LD := /persist/bin/ld
+endif
 
 CFLAGS  := -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic \
            -mno-red-zone -I$(SRC)/kernel/include -mcmodel=kernel \
@@ -105,7 +114,17 @@ SRCS := \
   kernel/user/mc.c \
   kernel/user/process.c \
   kernel/user/programs.c \
-  kernel/user/tui_common.c
+  kernel/user/tui_common.c \
+  kernel/arch/x86/tlb.c \
+  kernel/dev/acpi.c \
+  kernel/dev/ioapic.c \
+  kernel/lib/crypt.c \
+  kernel/lib/sha512.c \
+  kernel/sched/bkl.c \
+  kernel/sched/futex.c \
+  kernel/sched/lockdep.c \
+  kernel/sched/m28_ctxbench.c \
+  kernel/sched/smp_test.c
 
 # Objects mirror the source tree under $(OBJDIR) (parallel directories), so the
 # two pattern rules below map each .o back to its .c/.S source unambiguously.
@@ -124,9 +143,18 @@ $(OBJDIR)/%.o: $(SRC)/%.S
 	@echo "KBUILD as $*"
 	$(CC) $(CFLAGS) -c $< -o $@
 
+# Link via a response file, NOT $(OBJS) on the command line. b1nix's exec()
+# truncates an over-long argv, so passing all 85 object paths (~3.5 KB) directly
+# silently drops most of them and the link fails with dozens of bogus "undefined
+# reference"s. ld reads @RSP from the file instead (no argv limit) — the same
+# trick the flat build-kernel.sh uses. RSP is a static, host-generated list
+# (kernel-make.rsp) staged alongside this Makefile; regenerate it whenever SRCS
+# changes (it must match $(OBJS) for OBJDIR=/tmp/kbuild).
+RSP ?= $(SRC)/tools/inguest/kernel-make.rsp
+
 $(KERNEL): $(OBJS)
 	@echo KBUILD-LINK
-	$(LD) $(LDFLAGS) -o $@ $(OBJS)
+	$(LD) $(LDFLAGS) -o $@ @$(RSP)
 	@echo KBUILD-LINK-DONE
 	@echo KBUILD-DONE
 

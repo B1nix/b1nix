@@ -12,6 +12,13 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+
+/* Drain cross-CPU TLB shootdowns while spin-waiting with IRQs disabled (these
+ * stack_released hand-off spins run inside scheduler_yield, IRQs off). Without
+ * it a core parked here can't ACK a shootdown IPI and the initiator times out
+ * (observed: `tlb_shootdown stalled pending=1` panic under -smp4 parallel
+ * builds). Defined in kernel/arch/x86/tlb.c; fast no-op when nothing pending. */
+extern void tlb_shootdown_poll(void);
 #include <b1nix/arch_x86.h>
 #include <b1nix/aio.h>
 #include <string.h>
@@ -285,6 +292,7 @@ static struct task *pick_next_task(void) {
        * a single store with no locks/IRQs/sleeping calls. */
       while (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("pause");
+        tlb_shootdown_poll();
       }
       /* F5 (M28 #7): atomic claim. CAS READY -> RUNNING so a concurrent
        * scan on another CPU can't pick the same task between our check and
@@ -333,6 +341,7 @@ static struct task *pick_next_task(void) {
      * kernel stack the other CPU is still saving to. */
     while (!__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
       __asm__ volatile("pause");
+      tlb_shootdown_poll();
     }
     /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
      * the CAS, return 0 (no work this iteration) and let the caller retry;
@@ -1487,6 +1496,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             while (!__atomic_load_n(&T(i)->stack_released,
                                     __ATOMIC_ACQUIRE)) {
               __asm__ volatile("pause");
+              tlb_shootdown_poll();
             }
 
             int code = T(i)->exit_code;

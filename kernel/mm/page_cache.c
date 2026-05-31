@@ -29,8 +29,11 @@ static void m26_diag_task(void) {
 }
 
 static void lock_pc(void) {
+  extern void tlb_shootdown_poll(void);
   while (__sync_lock_test_and_set(&pc_lock, 1)) {
-    while (pc_lock) { __asm__ volatile("pause"); }
+    /* Drain TLB shootdowns while spinning — a waiter that entered with IRQs
+     * disabled otherwise can't ACK the initiator's IPI (deadlock). */
+    while (pc_lock) { __asm__ volatile("pause"); tlb_shootdown_poll(); }
   }
 }
 

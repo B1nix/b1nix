@@ -21,13 +21,21 @@ import os, re, subprocess, sys, time
 RAM = sys.argv[1] if len(sys.argv) > 1 else "256"
 TIMEOUT = int(sys.argv[2]) if len(sys.argv) > 2 else 2700
 SWAP_MB = int(sys.argv[3]) if len(sys.argv) > 3 else 0
+SMP = sys.argv[4] if len(sys.argv) > 4 else "1"      # guest vCPUs (-smp N)
+JOBS = sys.argv[5] if len(sys.argv) > 5 else "1"     # parallel make (-jN)
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 OUT = os.path.join(ROOT, "smoke_run")
 os.makedirs(OUT, exist_ok=True)
-LOG = os.path.join(OUT, f"inguest-{RAM}mb.log")
+LOG = os.path.join(OUT, f"inguest-{RAM}mb-smp{SMP}-j{JOBS}.log")
 ARTIFACT = f"/persist/kernel-selfhost-{RAM}mb.elf"
 MARKER = "HARNESS_DONE_B1NIX"
-CMD = (f"sh /persist/usr/src/b1nix/tools/inguest/build-kernel.sh; "
+# Drive the in-guest build through the real parallel Makefile so -jN is
+# meaningful (the flat build-kernel.sh is serial). `time` brackets the build so
+# the in-guest wall-clock is captured independently of host-side polling jitter.
+MK = "/persist/usr/src/b1nix/tools/inguest/Makefile"
+CMD = (f"echo BUILD_BEGIN; date; "
+       f"/persist/bin/make -f {MK} CC=/persist/bin/gcc LD=/persist/bin/ld -j{JOBS}; "
+       f"date; echo BUILD_END; "
        f"cp /tmp/kernel.elf {ARTIFACT}; sync; "
        f"ls -l /tmp/kernel.elf {ARTIFACT}; sync; echo {MARKER}\n")
 
@@ -38,11 +46,18 @@ def img(name, mb):
             f.truncate(mb * 1024 * 1024)
     return path
 
+# Accelerator. Default to round-robin TCG: counter-intuitively it is FASTER than
+# MTTCG (tcg,thread=multi) for this workload — emulating x86's strong (TSO) memory
+# model on an ARM host forces expensive barriers per atomic, and b1nix's BKL-heavy
+# kernel makes 4 real threads spin-contend rather than compute. Override for a
+# correctness stress test (ACCEL=tcg,thread=multi) or on a same-arch host
+# (ACCEL=kvm / ACCEL=hvf). Measured here: round-robin ~5 TU/150s vs MTTCG ~2.
+ACCEL = os.environ.get("ACCEL", "tcg")
 qemu = [
     "qemu-system-x86_64",
-    "-machine", "accel=kvm:hvf:tcg",  # fast where available, always falls back to TCG
+    "-accel", ACCEL,
     "-cdrom", f"{ROOT}/build/x86/b1nix.iso",
-    "-m", RAM, "-boot", "d",
+    "-m", RAM, "-smp", SMP, "-boot", "d",
     "-serial", "stdio", "-display", "none", "-monitor", "none", "-no-reboot",
     "-drive", f"file={ROOT}/build/x86/root.ext4,if=none,id=vblk0,format=raw",
     "-device", "virtio-blk-pci,drive=vblk0",
@@ -63,6 +78,8 @@ sent = False
 status = "timeout"
 start = time.time()
 last = 0
+t_begin = None   # host time when in-guest `make` started (BUILD_BEGIN seen)
+t_end = None     # host time when in-guest `make` finished (BUILD_END seen)
 FAULTS = ("KERNEL PANIC", "[PANIC]", "EXCEPTION:", "out of contiguous",
           "klarge: OOM", "pmm_reclaim_failed", "no free swap slots")
 try:
@@ -73,6 +90,16 @@ try:
         if not sent and ("Welcome to b1nix shell" in text or "/> " in text):
             p.stdin.write(CMD.encode()); p.stdin.flush(); sent = True
             print(f"[{int(time.time()-start)}s] sent build command", flush=True)
+        # Host-wall-clock bracket of the build itself (the in-guest clock is
+        # unreliable on TCG). BUILD_BEGIN/BUILD_END are echoed around `make`.
+        # Match on its own line (the typed command also echoes "echo BUILD_END").
+        nl = text.replace("\r", "\n")
+        if t_begin is None and re.search(r"^\s*BUILD_BEGIN\s*$", nl, re.M):
+            t_begin = time.time()
+            print(f"[{int(t_begin-start)}s] BUILD_BEGIN", flush=True)
+        if t_begin is not None and t_end is None and re.search(r"^\s*BUILD_END\s*$", nl, re.M):
+            t_end = time.time()
+            print(f"[{int(t_end-start)}s] BUILD_END  build_wallclock={int(t_end-t_begin)}s", flush=True)
         if re.search(rf"^\s*{re.escape(MARKER)}\s*$", text.replace("\r", "\n"), re.M):
             status = "done"; break
         if any(m in text for m in FAULTS):
@@ -82,7 +109,7 @@ try:
         el = int(time.time() - start)
         if el - last >= 30:
             last = el
-            steps = re.findall(r"KBUILD [0-9]+ [^\r\n]+", text)
+            steps = re.findall(r"KBUILD (?:cc|[0-9]+|LINK)[^\r\n]+", text)
             print(f"[{el}s] {steps[-1] if steps else 'waiting for shell'} "
                   f"(log {len(text)}B)", flush=True)
 finally:
@@ -90,6 +117,11 @@ finally:
         p.terminate(); time.sleep(1)
         if p.poll() is None: p.kill()
     elapsed = int(time.time() - start)
-    done = sum(1 for _ in re.finditer(r"^KBUILD-DONE", open(LOG).read().replace("\r","\n"), re.M))
-    print(f"=== status={status} ram={RAM}MB elapsed={elapsed}s kbuild_done={done} log={LOG} ===")
+    # Read binary + latin1: the serial log contains framebuffer/console bytes
+    # that are not valid utf-8 (a plain open().read() would raise mid-run).
+    _logtxt = open(LOG, "rb").read().decode("latin1", "replace").replace("\r", "\n")
+    done = sum(1 for _ in re.finditer(r"^KBUILD-DONE", _logtxt, re.M))
+    bwc = int(t_end - t_begin) if (t_begin and t_end) else -1
+    print(f"=== status={status} ram={RAM}MB smp={SMP} jobs={JOBS} "
+          f"build_wallclock={bwc}s total_elapsed={elapsed}s kbuild_done={done} log={LOG} ===")
     sys.exit(0 if status == "done" else 1)
