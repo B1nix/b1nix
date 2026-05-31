@@ -145,7 +145,12 @@ struct percpu {
      * boot task serves that role). void* to avoid pulling sched.h here. */
     void *idle_task;
 
-    u8 __pad[3824];  /* pad to 4KB total */
+    /* 0x60: SYSCALL entry scratch. syscall_entry.S stores the incoming RAX
+     * here before it reuses RAX to load cur_task. This must be per-CPU:
+     * a single global scratch races before the BKL can be acquired. */
+    u64 syscall_scratch_rax;
+
+    u8 __pad[3816];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
 /* GS segment base management */

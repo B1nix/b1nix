@@ -87,3 +87,41 @@ void bkl_unlock(void) {
     }
     irq_restore(fl);
 }
+
+int bkl_is_held_by_current_cpu(void) {
+    return g_bkl_owner == this_cpu_id();
+}
+
+u32 bkl_get_depth(void) {
+    return g_bkl_depth;
+}
+
+void bkl_unlock_for_switch(void) {
+    u64 fl = irq_save_cli();
+    int cpu = this_cpu_id();
+    if (g_bkl_owner == cpu) {
+        g_bkl_depth = 0;
+        g_bkl_owner = -1;
+        __asm__ volatile("" : : : "memory");
+        g_bkl = 0;
+        LOCKDEP_RELEASE_GLOBAL(LOCKDEP_LVL_BKL);
+    }
+    irq_restore(fl);
+}
+
+void bkl_lock_for_switch(u32 depth) {
+    int cpu = this_cpu_id();
+    for (;;) {
+        while (g_bkl)
+            __asm__ volatile("pause");
+        u64 fl = irq_save_cli();
+        if (spin_xchg(&g_bkl, 1) == 0) {
+            g_bkl_owner = cpu;
+            g_bkl_depth = depth;
+            LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_BKL);
+            irq_restore(fl);
+            return;
+        }
+        irq_restore(fl);
+    }
+}
