@@ -18,6 +18,7 @@
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
+#include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
 #include <b1nix/filelock.h>
@@ -136,6 +137,8 @@ void kernel_main(u64 arg0, u64 arg1)
 	ahci_init();
 	nvme_init();
 	btrfs_init();
+	procfs_init();
+	sysfs_init();
 	filelock_init();
 	mqueue_init();
 	shm_init();
@@ -146,6 +149,13 @@ void kernel_main(u64 arg0, u64 arg1)
 	video_init();
 	compositor_init();
 	virtio_gpu_init();
+	/* M34: mount the synthetic /proc and /sys filesystems. /proc already
+	 * exists as a mount point (created in vfs_init); /sys is created here. */
+	if (vfs_mount("proc", "/proc", "procfs", 0) == 0)
+		console_write("procfs: mounted at /proc\n");
+	vfs_mkdir("/sys", 0555);
+	if (vfs_mount("sys", "/sys", "sysfs", 0) == 0)
+		console_write("sysfs: mounted at /sys\n");
 #endif
 	console_write("Step 11: Drivers initialized\n");
 

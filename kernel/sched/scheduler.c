@@ -1617,6 +1617,44 @@ usize scheduler_task_count(void) {
   return count;
 }
 
+/* ── M34: task-table introspection for procfs / ps / top ──
+ * Expose the chunked task array to read-only consumers (the /proc filesystem
+ * and the in-shell ps/top builtins). No struct task fields are added — callers
+ * read the already-public struct directly. */
+usize scheduler_task_slots(void) { return g_task_hwm; }
+
+struct task *scheduler_task_slot(usize index) {
+  if (index >= g_task_hwm)
+    return 0;
+  struct task *t = T(index);
+  if (t->state == TASK_UNUSED || t->state == TASK_DEAD ||
+      t->state == TASK_REAPING)
+    return 0;
+  return t;
+}
+
+struct task *scheduler_task_by_pid(usize pid) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = scheduler_task_slot(i);
+    if (t && t->id == pid)
+      return t;
+  }
+  return 0;
+}
+
+const char *scheduler_state_name(int state) {
+  switch (state) {
+  case TASK_RUNNING:  return "R";
+  case TASK_READY:    return "R";
+  case TASK_BLOCKED:  return "D";
+  case TASK_SLEEPING: return "S";
+  case TASK_STOPPED:  return "T";
+  case TASK_DEAD:     return "Z";
+  case TASK_REAPING:  return "Z";
+  default:            return "?";
+  }
+}
+
 void scheduler_dump_tasks(void) {
   console_write("ID\tSTATE\tNAME\n");
   for (usize i = 0; i < g_task_hwm; i++) {
