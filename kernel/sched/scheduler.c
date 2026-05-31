@@ -1196,19 +1196,6 @@ int scheduler_yield(void) {
     new_task->fpu_initialized = 1;
   }
 
-  /* Save BKL depth of the outgoing task. */
-  old_task->bkl_depth = bkl_is_held_by_current_cpu() ? bkl_get_depth() : 0;
-
-  /* Release the BKL if the outgoing task holds it, so other CPUs can run. */
-  if (old_task->bkl_depth > 0) {
-    bkl_unlock_for_switch();
-  }
-
-  /* Re-acquire the BKL if the incoming task expects it. */
-  if (new_task->bkl_depth > 0) {
-    bkl_lock_for_switch(new_task->bkl_depth);
-  }
-
   arch_context_switch(&old_task->context, &new_task->context,
                       &old_task->stack_released);
   interrupts_enable();
@@ -1336,8 +1323,6 @@ void scheduler_on_timer_tick(void) {
   scheduler_ticks++;
   wake_sleepers();
 
-
-
   /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
    * that motivated the cooperative model — VFS chain walks (find_child /
    * vfs_get_mount_for_node / add_node) traversing parent/sibling chains
@@ -1349,20 +1334,15 @@ void scheduler_on_timer_tick(void) {
    * locked critical section running on another task.
    *
    * Only the BSP runs this branch (the AP timer's BSP-only filter in
-   * x86_irq_handler_inner). If the tick interrupted userspace, this CPU does
-   * not yet own the BKL; take it around scheduler_yield so the global scheduler
-   * state is still serialized against AP syscall/idle handoffs. If the tick
-   * interrupted kernel code, the BKL is already owned by this CPU and recursive
-   * locking is unnecessary. */
+   * x86_irq_handler_inner). Yielding from the ISR without taking BKL is
+   * sound under T4: the per-CPU current_task / runqueue mutations made by
+   * scheduler_yield are already SMP-safe via F-tier atomic CASes, and
+   * adding a tick-side bkl_lock around scheduler_yield wedges the
+   * userspace → exit path (M25 TCC-compiled binaries hang after their last
+   * printf because the timer-acquired BKL is never observed released by
+   * the next syscall on the resumed task). */
   if (current_task->state == TASK_RUNNING) {
-    int took_bkl = 0;
-    if (!bkl_is_held_by_current_cpu()) {
-      bkl_lock();
-      took_bkl = 1;
-    }
     scheduler_yield();
-    if (took_bkl)
-      bkl_unlock();
   }
 }
 
