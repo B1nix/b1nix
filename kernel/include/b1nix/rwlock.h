@@ -36,6 +36,16 @@ static inline void rw_init(rwlock_t *lock) {
     lock->state = 0;
 }
 
+/* While spinning we MUST drain TLB shootdown IPIs ourselves: callers reach
+ * here via the _irqsave variants (vmm_lock is taken IRQs-off for the whole
+ * page-table walk), so the IPI delivery is masked and a shootdown initiator
+ * on another CPU would never see our ACK. Same fix as the regular spinlock
+ * in spinlock.h — without this, smp=4+ KVM builds panic with
+ * `tlb: shootdown stalled, pending=1; [PANIC] tlb_shootdown timeout` after
+ * a few seconds of -j8 build, because at least one CPU is always waiting
+ * on vmm_lock for a fork/exec page-table walk. */
+void tlb_shootdown_poll(void);
+
 static inline void rw_read_lock(rwlock_t *lock) {
     for (;;) {
         int s = __atomic_load_n(&lock->state, __ATOMIC_ACQUIRE);
@@ -48,6 +58,7 @@ static inline void rw_read_lock(rwlock_t *lock) {
                 return;
         }
         __asm__ volatile("pause");
+        tlb_shootdown_poll();
     }
 }
 
@@ -64,6 +75,7 @@ static inline void rw_write_lock(rwlock_t *lock) {
                                         __ATOMIC_RELAXED))
             return;
         __asm__ volatile("pause");
+        tlb_shootdown_poll();
     }
 }
 
