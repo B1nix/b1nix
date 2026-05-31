@@ -2,10 +2,21 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <stdlib.h>
 #include <string.h>
 
 struct vfs_pipe pipes[MAX_VFS_PIPES];
+/* Guards the pipes[] free-slot search in vfs_pipe(). Without it, two CPUs
+ * racing through vfs_pipe at the same instant could each pick the same
+ * `!used` slot — both then memset()+used=1 on the SAME struct, sharing one
+ * underlying buffer; when one side closed, readers would drop to 0 and the
+ * other side would get an unexpected SIGPIPE/EPIPE. This was a real hang
+ * under make -j8 (8 concurrent fork chains all calling vfs_pipe). The
+ * per-pipe lock inside struct vfs_pipe only protects in-flight read/write
+ * once the slot is owned; the search-and-claim transition is what needs
+ * mutual exclusion. */
+static spinlock_t pipe_pool_lock = SPINLOCK_INIT;
 
 static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
@@ -119,16 +130,28 @@ void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_wr
 int vfs_pipe(int pipefd[2]) {
   if (!pipefd) return -EINVAL;
   struct vfs_pipe *pipe = 0;
+  /* Atomically find a free slot and CLAIM it before releasing the pool lock,
+   * so no other CPU can pick the same slot. The full memset() happens after
+   * the unlock — once `used = 1` is published, the slot is ours to fill in. */
+  u64 flags;
+  spin_lock_irqsave(&pipe_pool_lock, &flags);
   for (usize i = 0; i < MAX_VFS_PIPES; i++) {
-    if (!pipes[i].used) { pipe = &pipes[i]; break; }
+    if (!pipes[i].used) {
+      pipe = &pipes[i];
+      pipe->used = 1;  /* claim atomically under the pool lock */
+      break;
+    }
   }
+  spin_unlock_irqrestore(&pipe_pool_lock, flags);
   if (!pipe) return -ENFILE;
 
   struct vfs_handle *rh = alloc_raw_handle(VFS_HANDLE_PIPE_READ);
-  if (!rh) return -EMFILE;
+  if (!rh) { pipe->used = 0; return -EMFILE; }
   struct vfs_handle *wh = alloc_raw_handle(VFS_HANDLE_PIPE_WRITE);
-  if (!wh) { vfs_handle_release(rh); return -EMFILE; }
+  if (!wh) { vfs_handle_release(rh); pipe->used = 0; return -EMFILE; }
 
+  /* memset() blows away `used=1` we just set; restore it. lock/refcount fields
+   * are also re-zeroed which is correct — they start fresh for this episode. */
   memset(pipe, 0, sizeof(*pipe));
   pipe->used = 1;
   pipe->readers = 1;

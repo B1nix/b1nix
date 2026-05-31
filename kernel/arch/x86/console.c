@@ -4,6 +4,7 @@
 #include <b1nix/fb_console.h>
 #include <b1nix/io.h>
 #include <b1nix/serial.h>
+#include <b1nix/spinlock.h>
 
 #define VGA_WIDTH 80
 #define VGA_HEIGHT 25
@@ -14,6 +15,14 @@ static usize cursor_col;
 static u8 current_color = 0x0f;
 
 struct console_state console;
+
+/* Serialize console_write* across CPUs so multi-character outputs aren't
+ * interleaved character-by-character on serial/VGA. Without this, every
+ * concurrent klog_warn produced unreadable output like
+ *   "[M2tem6Dpt=1I cAount=G]"
+ * under SMP. Held only across the body of a single console_write call —
+ * individual console_putc still goes through serial_putc without recursion. */
+static spinlock_t console_lock = SPINLOCK_INIT;
 
 static u16 vga_entry(char ch)
 {
@@ -113,33 +122,45 @@ void console_putc(char ch)
 
 void console_write(const char *text)
 {
+	u64 flags;
+	spin_lock_irqsave(&console_lock, &flags);
 	for (usize i = 0; text[i] != '\0'; i++) {
 		console_putc(text[i]);
 	}
+	spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_write_hex32(u32 value)
 {
 	const char *digits = "0123456789abcdef";
 
+	u64 flags;
+	spin_lock_irqsave(&console_lock, &flags);
 	for (int shift = 28; shift >= 0; shift -= 4) {
 		console_putc(digits[(value >> shift) & 0xf]);
 	}
+	spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_write_hex64(u64 value)
 {
 	const char *digits = "0123456789abcdef";
 
+	u64 flags;
+	spin_lock_irqsave(&console_lock, &flags);
 	for (int shift = 60; shift >= 0; shift -= 4) {
 		console_putc(digits[(value >> shift) & 0xf]);
 	}
+	spin_unlock_irqrestore(&console_lock, flags);
 }
 
 void console_write_dec(u64 value)
 {
+	u64 flags;
+	spin_lock_irqsave(&console_lock, &flags);
 	if (value == 0) {
 		console_putc('0');
+		spin_unlock_irqrestore(&console_lock, flags);
 		return;
 	}
 
@@ -153,4 +174,5 @@ void console_write_dec(u64 value)
 	for (int j = i - 1; j >= 0; j--) {
 		console_putc(buf[j]);
 	}
+	spin_unlock_irqrestore(&console_lock, flags);
 }
