@@ -749,6 +749,110 @@ static int ps_main(int argc, const char **argv) {
   return 0;
 }
 
+/* Point past `key` in a procfs-style "Key:  <num>" buffer and atoi the value. */
+static long bb_proc_val(const char *buf, const char *key) {
+  const char *p = strstr(buf, key);
+  if (!p)
+    return -1;
+  p += strlen(key);
+  while (*p && (*p < '0' || *p > '9'))
+    p++;
+  if (!*p)
+    return -1;
+  return (long)atoi(p);
+}
+
+/* free — memory usage from /proc/meminfo (M34). */
+static int free_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  char buf[1024];
+  if (bb_read_file("/proc/meminfo", buf, sizeof(buf)) <= 0) {
+    printf("free: cannot read /proc/meminfo\n");
+    return 1;
+  }
+  long total = bb_proc_val(buf, "MemTotal:");
+  long avail = bb_proc_val(buf, "MemFree:");
+  long used = bb_proc_val(buf, "MemUsed:");
+  if (total < 0)
+    total = 0;
+  if (avail < 0)
+    avail = 0;
+  if (used < 0)
+    used = total - avail;
+  printf("              total        used        free\n");
+  printf("Mem:    %10ld  %10ld  %10ld\n", total, used, avail);
+  return 0;
+}
+
+/* top — single-snapshot system summary + process table (M34). Non-interactive:
+ * prints uptime/loadavg/memory from /proc, then the live process list. */
+static int top_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  char buf[1024];
+  if (bb_read_file("/proc/uptime", buf, sizeof(buf)) > 0)
+    printf("uptime: %s", buf);
+  if (bb_read_file("/proc/loadavg", buf, sizeof(buf)) > 0)
+    printf("load:   %s", buf);
+  if (bb_read_file("/proc/meminfo", buf, sizeof(buf)) > 0) {
+    long total = bb_proc_val(buf, "MemTotal:");
+    long avail = bb_proc_val(buf, "MemFree:");
+    printf("mem:    %ld kB total, %ld kB free\n", total, avail);
+  }
+  printf("\n");
+  syscall_dispatch(SYS_PS, 0, 0, 0, 0, 0, 0);
+  return 0;
+}
+
+/* sysctl — read kernel tunables. `kernel.ostype` maps to /sys/kernel/ostype.
+ * With -a, dumps a fixed known set. (M34) */
+static int sysctl_one(const char *name) {
+  /* Translate dotted name to /sys/<slashes>. */
+  char path[128];
+  int n = 0;
+  const char *prefix = "/sys/";
+  while (prefix[n]) {
+    path[n] = prefix[n];
+    n++;
+  }
+  for (const char *c = name; *c && n < (int)sizeof(path) - 1; c++)
+    path[n++] = (*c == '.') ? '/' : *c;
+  path[n] = '\0';
+  char buf[256];
+  if (bb_read_file(path, buf, sizeof(buf)) <= 0) {
+    printf("sysctl: cannot read key '%s'\n", name);
+    return 1;
+  }
+  /* Strip trailing newline for the "name = value" form. */
+  int len = 0;
+  while (buf[len])
+    len++;
+  while (len > 0 && (buf[len - 1] == '\n' || buf[len - 1] == '\r'))
+    buf[--len] = '\0';
+  printf("%s = %s\n", name, buf);
+  return 0;
+}
+
+static int sysctl_main(int argc, const char **argv) {
+  static const char *known[] = {
+      "kernel.ostype", "kernel.osrelease", "kernel.hostname",
+      "kernel.version", "memory.total_kb", 0};
+  if (argc >= 2 && strcmp(argv[1], "-a") == 0) {
+    for (int i = 0; known[i]; i++)
+      sysctl_one(known[i]);
+    return 0;
+  }
+  if (argc < 2) {
+    printf("Usage: sysctl <name> | sysctl -a\n");
+    return 1;
+  }
+  int rc = 0;
+  for (int i = 1; i < argc; i++)
+    rc |= sysctl_one(argv[i]);
+  return rc;
+}
+
 static int kill_main(int argc, const char **argv) {
   if (argc < 2) {
     printf("kill: missing operand\nUsage: kill <pid> [sig]\n");
@@ -2432,6 +2536,9 @@ static struct bb_app bb_apps[] = {
     {"dirname", dirname_main},
     /* System */
     {"ps", ps_main},
+    {"top", top_main},
+    {"free", free_main},
+    {"sysctl", sysctl_main},
     {"kill", kill_main},
     {"date", date_main},
     {"uname", uname_main},

@@ -23,6 +23,7 @@
 #include "../../build/x86/initramfs_m31_setuid.inc"
 #include "../../build/x86/initramfs_m32_smoke.inc"
 #include "../../build/x86/initramfs_m30_pie.inc"
+#include "../../build/x86/initramfs_m34_smoke.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -365,6 +366,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
+     sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
     /* M30: the dynamic linker file is shipped as the PIE binary itself —
      * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
      * exists as a name on disk that PT_INTERP can reference even though

@@ -20,6 +20,7 @@ INITRAMFS_M31_SMOKE_INC := $(BUILD_DIR)/initramfs_m31_smoke.inc
 INITRAMFS_M31_SETUID_INC := $(BUILD_DIR)/initramfs_m31_setuid.inc
 INITRAMFS_M32_SMOKE_INC := $(BUILD_DIR)/initramfs_m32_smoke.inc
 INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
+INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -58,6 +59,16 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 # release against the DAG in docs/m28-locking.md. Never ship with it on.
 ifeq ($(LOCKDEP),1)
 CFLAGS_EXTRA += -DKERNEL_LOCKDEP=1
+endif
+
+# CC/LD for the clang (default) toolchain. The kernel links with LLVM's ld.lld
+# because the ELF linker script uses GNU-ld options (-z, -T) that Apple's system
+# `ld` rejects. Only override when LD is still make's built-in default ("ld");
+# an explicit `make LD=...` (e.g. the in-guest gcc/binutils build) is respected.
+ifeq ($(TOOLCHAIN),clang)
+ifeq ($(origin LD),default)
+LD := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)
+endif
 endif
 
 COMMON_CFLAGS := \
@@ -118,6 +129,8 @@ KERNEL_SOURCES := \
 	kernel/fs/ext3.c \
 	kernel/fs/ext4.c \
 	kernel/fs/btrfs.c \
+	kernel/fs/procfs.c \
+	kernel/fs/sysfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
 	kernel/dev/acpi.c \
@@ -202,7 +215,7 @@ $(BUILD_DIR)/%.o: %.c
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M30_PIE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -304,6 +317,11 @@ $(INITRAMFS_M30_PIE_INC): userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/li
 	@$(MAKE) -C userspace build/bin/m30_pie
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
+
+$(INITRAMFS_M34_SMOKE_INC): userspace/bin/m34_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m34_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m34_smoke_elf userspace/build/bin/m34_smoke > $@
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
