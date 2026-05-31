@@ -5,6 +5,76 @@ out of `syscall_entry.S`) from landing. Read it before the next attempt
 so you don't repeat the prior iterations from this branch's session
 history.
 
+## Status (stack-lease for yield, 2026-05-31): save-vs-steal race closed
+
+The prior session left T4 applied with a documented kernel-stack save-side
+race on SMP-4: another CPU's `pick_next_task` could observe `state==READY`
+on the outgoing task between `scheduler_yield`'s state store and
+`arch_context_switch`'s RSP swap, grab the task, load its half-saved RSP,
+and `ret` on the same kernel stack the original CPU was still saving to.
+Shape: "kernel CS, RIP at user-stack address" — the corrupted `ret` pops a
+stack qword that happens to hold a user-stack pointer.
+
+This session extends the existing `struct task::stack_released` lease
+mechanism — which already covered the exit-vs-reap race for
+`scheduler_waitpid` — to cover the yield-vs-steal race symmetrically:
+
+1. **`scheduler_yield`**: on the RUNNING→READY transition, set
+   `old_task->stack_released = 0` BEFORE the state store. x86 TSO
+   guarantees other CPUs observe the 0 store before the READY store, so
+   a remote `pick_next_task` that sees `state == READY` is guaranteed to
+   read `stack_released == 0`.
+2. **`pick_next_task`**: both the global-rq dequeue path and the scan
+   path spin on `__atomic_load_n(&t->stack_released, ACQUIRE) == 1`
+   before attempting the `READY → RUNNING` CAS. The spin is bounded by
+   the outgoing CPU's `arch_context_switch` save side, which is a
+   handful of moves plus a single store with no locks/IRQs/sleeping
+   calls. The `ACQUIRE` load pairs with the implicit RELEASE of the
+   asm's `movl $1, (%rdx)` that publishes the lease after the RSP swap.
+3. **Fresh tasks** (`kthread_create_impl`, `scheduler_fork_current`,
+   `scheduler_clone_thread`): publish `stack_released = 1` explicitly
+   BEFORE `state = TASK_READY`. Their kernel stack is set up
+   synchronously without going through `arch_context_switch`, so the
+   publish must happen via the create path; otherwise the first pick
+   would spin forever waiting for a release that never comes.
+
+The existing exit-path lease (cleared by `scheduler_exit_current` /
+`scheduler_deliver_pending_signals` DFL-kill / `ap_worker_trampoline`
+before `state = TASK_DEAD`) keeps the same shape and parses identically
+through the same `pick_next_task` check.
+
+Tasks that yield with `state != RUNNING` (block, sleep, stop, exit) do
+not touch `stack_released` from the yield side — their state was set
+externally before yield, and the prior `arch_context_switch` already
+left `stack_released == 1` from the last switch. Wake paths
+(BLOCKED→READY, SLEEPING→READY, STOPPED→READY) preserve that 1.
+
+### Validation
+
+Smoke test on this branch (commit on top of `m28-t4-closure` HEAD):
+
+| variant | Passed | Failed |
+|---------|--------|--------|
+| baseline `m28-t4-closure` HEAD       | 146 | 125 |
+| baseline + this stack-lease-for-yield | 146 | 125 |
+
+The save-vs-steal race fix does not change the visible smoke count in
+this environment — neither single-CPU nor SMP-4 was reproducing the
+panic shape #1 in the runs I bisected here. The fix remains a strict
+improvement: it closes the race the doc identifies as the dominant
+shape-#1 kernel-stack lifetime corruption, parallels the existing
+exit-path lease, and adds no overhead on the fast path (the spin only
+fires when a remote CPU is mid-`arch_context_switch` save-side, a
+window of a few cycles).
+
+The 146/125 baseline regression vs. the doc's earlier 270/0 claim is
+**pre-existing in `0d6e287`** (the T4 commit itself, verified by
+re-running smoke on `995a02e` which gives 270/1). The regression
+manifests as user-mode tests printing their `start` marker but no
+subsequent markers — children exit between two adjacent `marker()`
+calls with no intervening syscalls. That is orthogonal to the
+stack-lifetime race fixed here and is a separate follow-up.
+
 ## Status (CS/SS swap session, 2026-05-31): single-CPU GREEN with T4 applied
 
 The prior session's "T4 + new BKL handoff" attempt failed single-CPU at
