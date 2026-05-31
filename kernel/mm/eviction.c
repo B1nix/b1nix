@@ -46,8 +46,18 @@ static void eviction_lazy_init(void) {
     g_user_pages = want;
 }
 
+/* No swap device → no PT entry can ever become VMM_SWAPPED → the ring is
+ * dead weight. Worse, every user-page map called eviction_register_page,
+ * which did TWO linear scans over a ring sized as total_frames/2. At 8 GiB
+ * RAM that was 2M comparisons per vmm_map_page; gcc binary load (10 MB =
+ * ~2500 pages) burned ~5G comparisons just for the registration scans, so
+ * smp=1/-j1 throughput fell ~÷16 from 512 MB to 8192 MB. Short-circuit
+ * here so swap-less guests skip the bookkeeping entirely. */
+extern int swap_active(void);
+
 void eviction_register_page(struct task *task, u64 vaddr, u64 frame) {
     if (!task) return;
+    if (!swap_active()) return;   /* no swap → no need to track */
     eviction_lazy_init();
     if (!page_ring) return;  /* allocation failed — eviction stays off */
 
@@ -72,6 +82,7 @@ void eviction_register_page(struct task *task, u64 vaddr, u64 frame) {
 }
 
 void eviction_unregister_page(u64 frame) {
+    if (!page_ring) return;       /* ring never allocated (no swap) */
     for (usize i = 0; i < g_user_pages; i++) {
         if (page_ring[i].used && page_ring[i].frame == frame) {
             page_ring[i].used = 0;
@@ -131,6 +142,7 @@ void eviction_evict_page(void) {
 
 void eviction_unregister_all_pages(struct task *task) {
     if (!task) return;
+    if (!page_ring) return;       /* ring never allocated (no swap) */
     for (usize i = 0; i < g_user_pages; i++) {
         if (page_ring[i].used && page_ring[i].task == task) {
             page_ring[i].used = 0;
