@@ -276,6 +276,16 @@ static struct task *pick_next_task(void) {
         break;
       if (t->stealable)
         continue;
+      /* M28 T4: spin until the outgoing CPU's arch_context_switch publishes
+       * stack_released==1. Without this, we could load a saved RSP that is
+       * still being written to as a callee-save spill area by the other
+       * CPU's save side. See struct task::stack_released and
+       * scheduler_yield's RUNNING->READY transition. The spin is bounded by
+       * the arch_context_switch save-side, which is a handful of mov +
+       * a single store with no locks/IRQs/sleeping calls. */
+      while (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+        __asm__ volatile("pause");
+      }
       /* F5 (M28 #7): atomic claim. CAS READY -> RUNNING so a concurrent
        * scan on another CPU can't pick the same task between our check and
        * scheduler_yield's eventual state=RUNNING store. The same fix is
@@ -318,6 +328,12 @@ static struct task *pick_next_task(void) {
   }
 
   if (best_task) {
+    /* M28 T4: see global-rq comment — wait for the outgoing CPU to publish
+     * stack_released==1 before claiming, otherwise we could resume on a
+     * kernel stack the other CPU is still saving to. */
+    while (!__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+      __asm__ volatile("pause");
+    }
     /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
      * the CAS, return 0 (no work this iteration) and let the caller retry;
      * starting a fresh scan here can spin under contention without ever
@@ -598,6 +614,11 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
     task_init_cred(task);
 
   interrupts_disable();
+  /* M28 T4: fresh task has never been context-switched out, so its kernel
+   * stack is fully set up (context.rsp points at a manually-initialised
+   * frame). pick_next_task waits for stack_released==1 before claiming;
+   * publish that here so the first pick doesn't spin forever. */
+  task->stack_released = 1;
   task->state = TASK_READY;
   sched_rq_enqueue_current(task);
   interrupts_enable();
@@ -826,6 +847,11 @@ int scheduler_fork_current(void) {
   }
 
   int child_id = (int)child->id;
+  /* M28 T4: publish stack_released=1 BEFORE state=READY so a concurrent
+   * pick on an AP doesn't observe READY with stack_released=0 (which would
+   * make it spin forever — fork sets up the child stack synchronously and
+   * never calls arch_context_switch from this path). */
+  child->stack_released = 1;
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
@@ -1050,6 +1076,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->ap_runnable = parent->ap_runnable;
 
   interrupts_disable();
+  /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
+   * up synchronously without going through arch_context_switch, so publish
+   * stack_released=1 explicitly before the first pick sees it. */
+  child->stack_released = 1;
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
@@ -1115,6 +1145,16 @@ int scheduler_yield(void) {
   }
 
   if (old_task->state == TASK_RUNNING) {
+    /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
+     * the save side of arch_context_switch (the movq %rsp,0(%rdi) +
+     * movq 0(%rsi),%rsp sequence) is no longer serialised by the BKL, so a
+     * concurrent pick_next_task on another CPU could observe state==READY,
+     * win the CAS, load this task's saved RSP, and start `ret`ing on the
+     * same kernel stack while THIS CPU is mid-save. The reader checks
+     * stack_released==1 (published by arch_context_switch after the RSP
+     * swap) before claiming; x86 TSO orders the 0 store ahead of the READY
+     * store, so other CPUs observe "READY but not yet released" and skip. */
+    old_task->stack_released = 0;
     old_task->state = TASK_READY;
   }
 
