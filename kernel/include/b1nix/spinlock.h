@@ -25,6 +25,15 @@ static inline int spin_xchg(volatile int *lock, int val) {
     return old;
 }
 
+/* Drain any in-flight cross-CPU TLB shootdown while spin-waiting (defined in
+ * kernel/arch/x86/tlb.c). A CPU spinning here may have interrupts disabled (it
+ * was called under cli, or via spin_lock_irqsave) and so cannot take the
+ * shootdown IPI; the shootdown initiator also waits IRQs-off, so without this
+ * poll the two deadlock. Fast path is a single load when nothing is pending, so
+ * uniprocessor and uncontended SMP pay nothing (the loop body only runs when a
+ * lock is actually contended). Always linked (tlb.c is in every kernel). */
+void tlb_shootdown_poll(void);
+
 static inline void spin_lock(spinlock_t *lock) {
     /* Spin until we successfully exchange 1 (locked) with the old value.
      * xchg is implicitly locked on x86 when used with a memory operand. */
@@ -32,6 +41,7 @@ static inline void spin_lock(spinlock_t *lock) {
         /* Pause to hint to the CPU that we're in a spin-wait loop.
          * Improves performance and power consumption on SMP. */
         __asm__ volatile("pause");
+        tlb_shootdown_poll();
     }
 }
 
@@ -46,7 +56,9 @@ static inline int spin_is_locked(spinlock_t *lock) {
     return *lock != 0;
 }
 
-/* IRQ-safe variants (save/restore interrupt flag) */
+/* IRQ-safe variants (save/restore interrupt flag). The acquire loop is in
+ * spin_lock, which polls TLB shootdowns — so an IRQs-off waiter here still
+ * drains them and cannot deadlock the initiator. */
 static inline void spin_lock_irqsave(spinlock_t *lock, u64 *flags) {
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
     spin_lock(lock);
