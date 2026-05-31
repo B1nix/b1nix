@@ -680,8 +680,15 @@ int scheduler_fork_current(void) {
     return -1;
   }
 
-  extern void paging_swap_in_all_swapped(u64 pml4_phys);
-  paging_swap_in_all_swapped(parent->pml4_phys);
+  /* If no swap device is attached, no PT entry can ever carry VMM_SWAPPED,
+   * so walking the full user page-table tree on every fork is pure overhead.
+   * Skip when swap is inactive — recovers a measurable fraction of fork
+   * wall-clock under -j8 KVM. */
+  extern int swap_active(void);
+  if (swap_active()) {
+    extern void paging_swap_in_all_swapped(u64 pml4_phys);
+    paging_swap_in_all_swapped(parent->pml4_phys);
+  }
 
   void *child_stack = kmalloc(KERNEL_STACK_SIZE);
   if (!child_stack) {

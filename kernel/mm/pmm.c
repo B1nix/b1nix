@@ -5,6 +5,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/arch.h>
+#include <b1nix/lapic.h>   /* struct percpu + MAX_CPUS for the per-CPU PCP cache */
 #include <string.h>
 
 #define BITS_PER_BYTE 8
@@ -391,25 +392,159 @@ void pmm_ref_frame(u64 frame) {
   pmm_release(flags);
 }
 
+/* ─────────────────────────── Per-CPU PMM cache (PCP) ───────────────────────
+ *
+ * Single-frame alloc/free is the dominant path under any SMP build (fork,
+ * mmap, kheap growth — all of it). Going through the global pmm_lock for
+ * every page makes that path serialize across all CPUs: with 8 vCPUs +
+ * make -j8 the lock-acquire dominated wall-clock, and the per-RAM watermark
+ * (low_watermark = total_frames / 512) made bigger guests *slower* because
+ * a single reclaim batch held both pmm_lock and pc_lock for thousands of
+ * frames at a time.
+ *
+ * Same trick Linux uses (per-CPU pageset, "PCP") and FreeBSD uses (UMA
+ * per-CPU buckets): each CPU keeps a small private intrusive stack of
+ * recently-freed-but-not-redistributed frames. alloc pops local, free
+ * pushes local — IRQs disabled to pin to the current CPU, no global lock.
+ * When local empties we refill a batch from global; when local overflows
+ * we drain a batch back. The global lock is hit ~1/PCP_REFILL times.
+ *
+ * Bitmap invariant: a frame sitting in *any* per-CPU cache is bitmap-USED
+ * (refilling claims it via bitmap_set); pmm.free_frames counts only the
+ * *globally-free* stash. Free-frame consumers (page-cache evict, reclaim
+ * watermark) therefore see a slightly stale view that ignores cache
+ * inventory — fine in steady state; under hard pressure we drain caches
+ * before declaring OOM.
+ * ──────────────────────────────────────────────────────────────────────── */
+struct pmm_pcp {
+  u64 head;       /* intrusive stack head, same on-frame link layout as global */
+  u32 count;      /* number of frames currently parked */
+  u32 _pad;
+} __attribute__((aligned(64)));
+
+#define PMM_PCP_LIMIT  128   /* drain to global once cache exceeds */
+#define PMM_PCP_REFILL  32   /* pull this many on miss */
+#define PMM_PCP_DRAIN   64   /* push this many back on overflow */
+
+static struct pmm_pcp pmm_pcp[MAX_CPUS];
+
+static inline int pmm_pcp_ready(void) {
+  if (!pmm.free_list_ready) return 0;
+  struct percpu *p = get_percpu();
+  return p && p->cpu_id < MAX_CPUS;
+}
+
+static inline u64 irq_save_cli(void) {
+  u64 f;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
+  return f;
+}
+static inline void irq_restore(u64 f) {
+  __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
+}
+
+static void pmm_pcp_refill(struct pmm_pcp *pcp) {
+  u64 flags;
+  pmm_acquire(&flags);
+  for (int i = 0; i < PMM_PCP_REFILL && pcp->count < PMM_PCP_LIMIT; i++) {
+    u64 frame = freelist_pop();
+    if (frame == 0) break;
+    usize idx = frame_index(frame);
+    if (bitmap_get(idx)) continue; /* stale entry, skip */
+    bitmap_set(idx);
+    pmm.free_frames--;
+    *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->head;
+    pcp->head = frame;
+    pcp->count++;
+  }
+  pmm_release(flags);
+}
+
+static void pmm_pcp_drain(struct pmm_pcp *pcp) {
+  u64 flags;
+  pmm_acquire(&flags);
+  for (int i = 0; i < PMM_PCP_DRAIN && pcp->count > 0; i++) {
+    u64 frame = pcp->head;
+    pcp->head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    pcp->count--;
+    usize idx = frame_index(frame);
+    if (bitmap_get(idx)) {
+      bitmap_clear(idx);
+      pmm.free_frames++;
+    }
+    freelist_push(frame);
+  }
+  pmm_release(flags);
+}
+
+static void pmm_pcp_drain_all(void) {
+  for (int c = 0; c < MAX_CPUS; c++) {
+    struct pmm_pcp *pcp = &pmm_pcp[c];
+    if (pcp->count == 0) continue;
+    u64 flags;
+    pmm_acquire(&flags);
+    while (pcp->count > 0) {
+      u64 frame = pcp->head;
+      pcp->head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+      pcp->count--;
+      usize idx = frame_index(frame);
+      if (bitmap_get(idx)) {
+        bitmap_clear(idx);
+        pmm.free_frames++;
+      }
+      freelist_push(frame);
+    }
+    pmm_release(flags);
+  }
+}
+
 void pmm_free_frame(u64 frame) {
   if ((frame & (PAGE_SIZE - 1)) != 0 || frame >= pmm.max_address) {
     klog_warn("pmm_free_frame: invalid frame");
     return;
   }
+  usize idx = frame / PAGE_SIZE;
 
+  /* Refcount step still goes through the global lock — it's a tiny
+   * critical section and we need atomicity vs pmm_ref_frame for fork CoW. */
   u64 flags;
   pmm_acquire(&flags);
-  usize idx = frame / PAGE_SIZE;
+  int now_zero = 1;
   if (pmm.frame_refcounts) {
     if (pmm.frame_refcounts[idx] > 0) {
       pmm.frame_refcounts[idx]--;
     }
-    if (pmm.frame_refcounts[idx] == 0) {
-      mark_frame_free(frame);
-    }
-  } else {
-    mark_frame_free(frame);
+    now_zero = (pmm.frame_refcounts[idx] == 0);
   }
+  pmm_release(flags);
+
+  if (!now_zero) return;  /* still referenced elsewhere (CoW sibling) */
+
+  /* Refcount hit 0 — park the frame in our per-CPU cache rather than
+   * touching the global free list. Drain a batch back if the cache is
+   * full so memory doesn't pile up on one CPU. */
+  if (pmm_pcp_ready()) {
+    u64 ifl = irq_save_cli();
+    struct percpu *p = get_percpu();
+    struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+    if (pcp->count >= PMM_PCP_LIMIT) {
+      /* Overflowing — drain half back to global. pmm_pcp_drain takes the
+       * spinlock internally (which save/restores the flag we already
+       * cleared); the inner cli is a no-op. */
+      pmm_pcp_drain(pcp);
+    }
+    /* Frame stays bitmap-USED while it sits in the cache; the link goes
+     * in the frame's own first 8 bytes via the direct map. */
+    *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->head;
+    pcp->head = frame;
+    pcp->count++;
+    irq_restore(ifl);
+    return;
+  }
+
+  /* No per-CPU cache yet (early boot) — fall back to the global free list. */
+  pmm_acquire(&flags);
+  mark_frame_free(frame);
   pmm_release(flags);
 }
 
@@ -429,7 +564,40 @@ u16 pmm_get_refcount(u64 frame) {
   return val;
 }
 
-u64 pmm_alloc_frame(void) { return pmm_alloc_frames(1); }
+u64 pmm_alloc_frame(void) {
+  if (!pmm_pcp_ready()) return pmm_alloc_frames(1);
+
+  /* Try the per-CPU cache. IRQs off to prevent migration mid-pop; no spinlock,
+   * the cache belongs only to this CPU. */
+  u64 flags = irq_save_cli();
+  struct percpu *p = get_percpu();
+  struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+
+  if (pcp->count == 0) {
+    /* Local empty — refill under global lock. pmm_pcp_refill itself does
+     * pushfq/cli inside spin_lock_irqsave; we are already cli, so the
+     * combined push/popf restores to "still cli" — correct. */
+    pmm_pcp_refill(pcp);
+  }
+  if (pcp->count > 0) {
+    u64 frame = pcp->head;
+    pcp->head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    pcp->count--;
+    /* Set refcount=1 (transfer ownership from cache to caller). The frame is
+     * already bitmap-USED from refill time, so no bitmap touch needed. */
+    if (pmm.frame_refcounts) pmm.frame_refcounts[frame_index(frame)] = 1;
+    irq_restore(flags);
+    /* Zero outside the cli window — memset can take a while and we don't
+     * want to mask IRQs longer than necessary. */
+    memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
+    return frame;
+  }
+  irq_restore(flags);
+
+  /* Cache still empty after refill — global is truly out. Fall back to the
+   * slow path which runs reclaim/swap. */
+  return pmm_alloc_frames(1);
+}
 
 static void claim_frame(usize index) {
   mark_frame_used(frame_from_index(index));
@@ -501,6 +669,7 @@ static u64 pmm_warned_pressure = 0;    /* one-shot per pressure episode */
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
   u64 reclaim_attempts = 0;
+  int pcp_drained = 0;  /* one-shot: drain per-CPU caches at most once per call */
 
   /* Retry via an explicit loop, never by recursion. Under memory pressure the
    * recovery path can run many eviction rounds; a tail-recursive retry would
@@ -594,6 +763,16 @@ u64 pmm_alloc_frames(usize count) {
     usize reclaim_target = pmm_reclaim_target_frames(count, free_snapshot);
     usize pc_evicted = page_cache_evict(reclaim_target);
     if (pc_evicted > 0) {
+      continue;
+    }
+
+    /* Before declaring OOM, drain per-CPU caches back to the global pool —
+     * frames sitting in another CPU's pcp are bitmap-USED and invisible to
+     * bitmap_scan_alloc. One-shot per call so we don't busy-loop draining
+     * an empty cache. */
+    if (pmm_pcp_ready() && !pcp_drained) {
+      pmm_pcp_drain_all();
+      pcp_drained = 1;
       continue;
     }
 
