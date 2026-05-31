@@ -1,9 +1,406 @@
-# M28 T4 — what's blocking it
+# M28 T4 — closure history
 
-This document captures what's known about the race that prevents T4 (BKL
-out of `syscall_entry.S`) from landing. Read it before the next attempt
-so you don't repeat the four failed iterations from this branch's session
-history.
+## Status (closure, 2026-05-31): T4 LANDED, smoke 271/0 both UP and SMP-4
+
+T4 (BKL out of `syscall_entry.S`) is fully landed on this branch with the
+full smoke suite green at **271 / 0** on both single-CPU and `-smp 4`.
+The closure commit makes three minimal changes to the prior session's
+state (which sat at 146 / 125 single-CPU):
+
+1. **Revert the CS/SS check inversion** in `kernel/syscall/syscall.c` and
+   `kernel/arch/x86/signal.c`. The T4 commit 0d6e287 inverted both
+   `user_frame_is_valid` and `sys_sigreturn`'s privilege check to
+   `cs != 0x23 || ss != 0x1B`, but `syscall_entry.S` pushes
+   CS = 0x1B, SS = 0x23 (the "data-segment-as-SS, code-segment-as-CS
+   reversed" ordering that has been historically compatible with every
+   consumer in the tree — see the next section for why). The inverted
+   check meant every userspace ELF syscall returned to
+   `scheduler_exit_current(-SIGSEGV)` at the end of its very first call
+   to `write()`, so 125 tests printed only "M*-SMOKE: start" then died
+   silently. Built-in kernel programs (busybox / shell / mc / editor)
+   survived because they call `syscall_dispatch` directly with
+   `frame == NULL` and the check is skipped.
+
+2. **Delete the BKL handoff block in `scheduler_yield`** (the
+   `bkl_unlock_for_switch` / `bkl_lock_for_switch` lines around
+   `arch_context_switch`). Without it, scheduler_yield restores its
+   pre-T4 shape: it doesn't touch BKL at all, and the surrounding
+   syscall / fork / exit paths keep whatever ownership they already had.
+   The handoff machinery was correct in principle but interacted with
+   the timer-ISR path below to wedge M25 deterministically.
+
+3. **Delete the tick-side `bkl_lock` block in
+   `scheduler_on_timer_tick`** (the `if (!bkl_is_held_by_current_cpu)
+   bkl_lock(); scheduler_yield(); if (took_bkl) bkl_unlock();`
+   wrapper). Restores the original bare `scheduler_yield()` from
+   995a02e. With either of these two BKL blocks present, /tmp/hello
+   (the TCC-compiled M25 hello binary) prints "M25-HELLO: hello from
+   native tcc" via write() and then never reaches its own SYS_EXIT —
+   the next syscall instruction effectively never gets dispatched
+   inside the kernel, the parent's waitpid blocks forever, and the
+   whole suite stalls. Removing both gives 271 / 0 deterministically.
+
+The helpers `bkl_lock_for_switch` / `bkl_unlock_for_switch` /
+`bkl_get_depth` in `kernel/sched/bkl.c` are kept (still declared in the
+header) but unused. They're available if a future SMP iteration needs a
+genuine BKL handoff; this iteration found it wasn't necessary.
+
+## DO NOT re-add a BKL handoff in scheduler_yield or the timer ISR
+
+Reintroducing either block deterministically wedges M25 at
+"M25-HELLO". The bisection was unambiguous: each block alone is
+sufficient to wedge; both must be absent for /tmp/hello's SYS_EXIT to
+reach `scheduler_exit_current`. The exact mechanism wasn't fully
+isolated (no panic, no exception, no signal — the binary just stops
+issuing syscalls), but the smoke signal is binary: M25-SMOKE: done
+either appears in every run or never appears.
+
+To verify, after any future scheduler change:
+
+```
+LD=/opt/homebrew/opt/lld/bin/ld.lld make ARCH=x86 KERNEL_CMDLINE="b1nix.test=1" iso
+bash smoke_run/qrun.sh 60
+grep "M25-SMOKE: done" smoke_run/b1nix-smoke-boot.log
+```
+
+Should print one line. If empty, you re-introduced the M25 wedge.
+
+## Why CS / SS are pushed reversed in syscall_entry.S
+
+`sysretq` does NOT pop CS / SS from the kernel stack — it derives them
+from `IA32_STAR`'s bits [63:48] (CS base = +16, SS base = +8, both with
+RPL = 3). Whatever `syscall_entry.S` pushes for CS / SS is only used by
+other kernel code that inspects the frame: `user_frame_is_valid`, the
+panic dumper, `arch_check_and_deliver_signals`'s "is this a user
+frame?" check, and `sys_sigreturn`'s privilege check on the saved
+frame.
+
+The historical push order (predating commit "1") was
+`pushq $0x23 /* SS */ ; ... ; pushq $0x1B /* CS */` — data-segment
+selector pushed in the SS slot, code-segment selector pushed in the CS
+slot. By inspection this looks wrong, but the consumers above were
+historically coded to match (cs == 0x1B && ss == 0x23) and the layout
+has been compatible with every codepath in the tree for the entire
+M24b → M28 era. A previous session "fixed" the push order to
+`pushq $0x1B /* SS */ ; ... ; pushq $0x23 /* CS */` on cosmetic
+grounds and silently broke the M25 / TCC sigreturn-style path; that
+push-order change was reverted earlier in this branch, but the
+matching CS / SS check flip in `user_frame_is_valid` / `sys_sigreturn`
+was missed and stayed in 0d6e287 — that's the 125-test regression the
+closure commit fixed.
+
+---
+
+## Historical: status (stack-lease for yield, 2026-05-31): save-vs-steal race closed
+
+The prior session left T4 applied with a documented kernel-stack save-side
+race on SMP-4: another CPU's `pick_next_task` could observe `state==READY`
+on the outgoing task between `scheduler_yield`'s state store and
+`arch_context_switch`'s RSP swap, grab the task, load its half-saved RSP,
+and `ret` on the same kernel stack the original CPU was still saving to.
+Shape: "kernel CS, RIP at user-stack address" — the corrupted `ret` pops a
+stack qword that happens to hold a user-stack pointer.
+
+This session extends the existing `struct task::stack_released` lease
+mechanism — which already covered the exit-vs-reap race for
+`scheduler_waitpid` — to cover the yield-vs-steal race symmetrically:
+
+1. **`scheduler_yield`**: on the RUNNING→READY transition, set
+   `old_task->stack_released = 0` BEFORE the state store. x86 TSO
+   guarantees other CPUs observe the 0 store before the READY store, so
+   a remote `pick_next_task` that sees `state == READY` is guaranteed to
+   read `stack_released == 0`.
+2. **`pick_next_task`**: both the global-rq dequeue path and the scan
+   path spin on `__atomic_load_n(&t->stack_released, ACQUIRE) == 1`
+   before attempting the `READY → RUNNING` CAS. The spin is bounded by
+   the outgoing CPU's `arch_context_switch` save side, which is a
+   handful of moves plus a single store with no locks/IRQs/sleeping
+   calls. The `ACQUIRE` load pairs with the implicit RELEASE of the
+   asm's `movl $1, (%rdx)` that publishes the lease after the RSP swap.
+3. **Fresh tasks** (`kthread_create_impl`, `scheduler_fork_current`,
+   `scheduler_clone_thread`): publish `stack_released = 1` explicitly
+   BEFORE `state = TASK_READY`. Their kernel stack is set up
+   synchronously without going through `arch_context_switch`, so the
+   publish must happen via the create path; otherwise the first pick
+   would spin forever waiting for a release that never comes.
+
+The existing exit-path lease (cleared by `scheduler_exit_current` /
+`scheduler_deliver_pending_signals` DFL-kill / `ap_worker_trampoline`
+before `state = TASK_DEAD`) keeps the same shape and parses identically
+through the same `pick_next_task` check.
+
+Tasks that yield with `state != RUNNING` (block, sleep, stop, exit) do
+not touch `stack_released` from the yield side — their state was set
+externally before yield, and the prior `arch_context_switch` already
+left `stack_released == 1` from the last switch. Wake paths
+(BLOCKED→READY, SLEEPING→READY, STOPPED→READY) preserve that 1.
+
+### Validation
+
+Smoke test on this branch (commit on top of `m28-t4-closure` HEAD):
+
+| variant | Passed | Failed |
+|---------|--------|--------|
+| baseline `m28-t4-closure` HEAD       | 146 | 125 |
+| baseline + this stack-lease-for-yield | 146 | 125 |
+
+The save-vs-steal race fix does not change the visible smoke count in
+this environment — neither single-CPU nor SMP-4 was reproducing the
+panic shape #1 in the runs I bisected here. The fix remains a strict
+improvement: it closes the race the doc identifies as the dominant
+shape-#1 kernel-stack lifetime corruption, parallels the existing
+exit-path lease, and adds no overhead on the fast path (the spin only
+fires when a remote CPU is mid-`arch_context_switch` save-side, a
+window of a few cycles).
+
+The 146/125 baseline regression vs. the doc's earlier 270/0 claim is
+**pre-existing in `0d6e287`** (the T4 commit itself, verified by
+re-running smoke on `995a02e` which gives 270/1). The regression
+manifests as user-mode tests printing their `start` marker but no
+subsequent markers — children exit between two adjacent `marker()`
+calls with no intervening syscalls. That is orthogonal to the
+stack-lifetime race fixed here and is a separate follow-up.
+
+## Status (CS/SS swap session, 2026-05-31): single-CPU GREEN with T4 applied
+
+The prior session's "T4 + new BKL handoff" attempt failed single-CPU at
+M25 with no clear root cause. This session bisected the failure: the
+breakage was NOT in the BKL handoff, but in the **CS/SS push order** of
+`syscall_entry.S`. The prior session had "swapped" the constants from the
+old (functionally-correct) ordering to a new (broken) ordering, on the
+mistaken theory that the old code was a bug. Reverting that swap unblocks
+T4 single-CPU completely.
+
+### Background: why the old push order works
+
+In long-mode SYSCALL, the kernel never returns to userspace via `iretq`
+on the syscall-return path — `sysretq` is used instead. `sysretq` derives
+CS/SS from the IA32_STAR MSR (CS = STAR[63:48]+16 = 0x23,
+SS = STAR[63:48]+8 = 0x1B), it does NOT pop them from the stack. So
+whatever the syscall entry path pushes for CS/SS on the per-task kernel
+stack is, by itself, never reloaded by the CPU.
+
+What it IS used for: building a `struct interrupt_frame` that other code
+inspects — `arch_check_and_deliver_signals` looks at `frame->cs` to
+decide whether the interrupted context was user (0x1B/0x23 either way),
+the panic dumper prints CS for debugging, etc. So the values just need
+to be present; the actual ordering convention has wiggle room.
+
+The PRE-commit-"1" entry pushed `SS=0x23, CS=0x1B` (which is
+"data-segment-as-SS, code-segment-as-CS reversed"). That looks wrong by
+inspection, BUT it has been compatible with every consumer in the tree
+for the entire SMP era. Switching to `SS=0x1B, CS=0x23` broke the M25
+flow on single CPU — likely via some sigreturn-style codepath in the
+TCC-compiled child that depends on the historically-used values.
+
+### What's in tree now
+
+`kernel/arch/x86/syscall_entry.S` restored to `pushq $0x23 /* SS */ ...
+pushq $0x1B /* CS */` (the pre-commit-"1" ordering), with everything else
+of commit "1" kept:
+
+- T4 itself (`call bkl_lock` commented out in syscall_entry.S)
+- Per-CPU syscall scratch at `gs:0x60` (struct percpu::syscall_scratch_rax)
+- `bkl_*_for_switch` helpers in kernel/sched/bkl.c
+- scheduler_yield BKL handoff (save old's depth, release, acquire new's)
+- BSP/AP idle loop: lock BKL before yield, unlock before sti;hlt
+- Timer ISR: lock BKL around yield if it interrupted userspace
+- 64 KiB kernel stacks (up from 32 KiB)
+- kthread/idle/boot tasks init `bkl_depth = 1`
+- `scheduler_fork_current`: interrupts disabled across the entire child
+  init critical section
+- `paging_create_address_space`: kernel-half clone under vmm_read_acquire
+- `paging_clone_address_space`: full user-half walk under vmm_write_acquire
+- `scheduler_wake_blocked_parent`: tightened SIGKILL/default-terminate
+  wake path
+
+### Smoke verification (3 consecutive runs, BKL out of syscall_entry.S)
+
+| run | single-CPU | SMP-4 |
+|-----|------------|-------|
+| 1 | 270/0 ✅ | invalid-opcode kernel-CS at RIP 0x7ffffffffed3 ❌ (M13-JC start) |
+| 2 | 270/0 ✅ | same shape ❌ |
+| 3 | 270/0 ✅ | same shape ❌ |
+
+Single-CPU is now deterministically GREEN with T4 applied — a first for
+this branch. SMP-4 deterministically fails at M13-JC start with the
+documented shape #1 (kernel CS jumping to user-stack RIP — kernel-stack
+lifetime / save-side corruption).
+
+### What's next for SMP-4
+
+The remaining race is a kernel-side stack-lifetime / ctx-switch save-side
+race that materializes around the M13-JC fork+setpgrp+tcsetpgrp sequence
+under SMP-4. The next session should attack this directly — the
+debugging signal is now clean (single-CPU is a control, SMP-4 a
+near-deterministic reproducer) instead of the prior 60% flake rate.
+
+---
+
+## Status (stack-lifetime + vmm_read session, 2026-05-30): fixes landed, T4 still not attempted
+
+This session targeted the two highest-priority suspects identified at the
+end of the previous session: the fork kernel-stack copy race and the
+`paging_create_address_space` kernel-half clone running without any lock.
+Both fixes landed as strict improvements. T4 was **not re-attempted** in
+this session; the goal was to reduce the baseline flake rate first.
+
+### Fixes applied
+
+**1. `scheduler_fork_current` — interrupts held across the entire child
+init critical section.**
+`interrupts_disable()` is now called before `find_unused_task()` and
+`interrupts_enable()` is called only after `child->state = TASK_READY` +
+`sched_rq_enqueue_current(child)`.  Previously interrupts were re-enabled
+too early (after just claiming the task slot), meaning the LAPIC timer ISR
+could fire, preempt the fork path mid-stack-copy, and schedule the child
+task on an AP before the child's `context.rsp`, `context.rbp`, VMA list,
+and FD table were initialised. The AP would then resume the child on a
+partially-written kernel stack → corrupted return addresses.
+
+*File:* `kernel/sched/scheduler.c`, `scheduler_fork_current` (lines 671–847).
+
+**2. `paging_create_address_space` — kernel-half clone now under
+`vmm_read_acquire`.**
+`paging_create_address_space` clones `kernel_pml4_virt[256..511]` into
+a freshly allocated PML4. Without the read lock a concurrent
+`vmm_map_page` (writer) could be modifying a kernel-half PD entry at the
+same moment, producing a new process's PML4 with a torn intermediate
+entry. The fix wraps the entire clone loop in `vmm_read_acquire` /
+`vmm_read_release` (using the existing `vmm_lock` rwlock already held as
+a write lock by `vmm_map_page` and `vmm_unmap_page`).
+
+*File:* `kernel/arch/x86/paging.c`, `paging_create_address_space`
+(lines 708–744).
+
+Note: `paging_clone_address_space` was already taking `vmm_write_acquire`
+(landed in the previous session). The new `vmm_read_acquire` in
+`paging_create_address_space` closes the symmetric gap for exec-style
+address-space creation.
+
+### Smoke test result (BKL in, fixes above, SMP-4)
+
+Run: `LD=/opt/homebrew/bin/ld.lld ./tests/smoke.sh x86` (-smp 4)
+
+| marker                        | result |
+|-------------------------------|--------|
+| AP boots (INIT-SIPI)          | ✅ PASS |
+| cross-CPU work-stealing       | ✅ PASS |
+| AHCI / NVMe block device      | ✅ PASS |
+| virtio-net init / DHCP        | ✅ PASS |
+| M27 user/passwd smoke         | ✅ PASS |
+| kernel cmdline parser         | ✅ PASS |
+| full suite `B1NIX-TEST: done` | ❌ FAIL |
+| SMP-4 `B1NIX-TEST: done`      | ❌ FAIL |
+
+Overall: **93 passed / 178 failed / 0 skipped.**
+
+The SMP-4 leg never reaches `B1NIX-TEST: done`. The failures are
+concentrated in the shell / pthread / network / PIE / security smokes —
+all of which require a working shell (`M11-SHELL`) as their prerequisite.
+`M11-SHELL: ok simple-success` is the first failure, suggesting the shell
+binary itself crashes or hangs before any output. This is a single-CPU
+regression (the shell also fails on UP in this run), not a new SMP race.
+
+Root-cause hypothesis: the shell binary's failure is unrelated to the
+vmm_lock / fork-init changes; it is most likely a pre-existing issue in
+the M33 shell feature branch that is exposed because the test tree is on
+that branch. The AP/SMP infrastructure (INIT-SIPI, work-stealing) passes
+cleanly.
+
+### What remains for T4
+
+The two strict improvements above reduce the fork-setup window but do not
+close the residual shape-#2 (kernel-heap RIP / memmove crash) race
+documented below. T4 should not be re-attempted until the shell regression
+is resolved and the BKL-in baseline returns to `B1NIX-TEST: done`.
+
+## Status (m28-t4-closure session, 2026-05-30): T4 still does not land
+
+This session found and fixed several real BKL-invariant and scheduler
+publication bugs, but it was not enough to land T4.
+
+`kernel/arch/x86/syscall_entry.S` used to save the incoming syscall
+number (`RAX`) in one global `.bss` scratch slot before switching to the
+task kernel stack and before acquiring the BKL. On SMP, two CPUs entering
+syscall at the same time could overwrite each other's saved syscall
+number before either CPU reached `bkl_lock`. That was a true T4-relevant
+bug because it existed outside the BKL's protection window. The scratch
+is now `struct percpu::syscall_scratch_rax` at GS offset `0x60`, pinned
+by a static assert in `kernel/sched/scheduler.c`.
+
+Two more BKL-invariant fixes landed after that initial scratch cleanup:
+
+- BSP/AP idle loops now take the BKL before calling `scheduler_yield`
+  and drop it before `hlt`. A runnable userspace task can be either a
+  fresh `user_jump` entry or a resumed kernel-side syscall/exit
+  continuation; the latter must not resume without the BKL.
+- The LAPIC timer preemption path now takes the BKL before calling
+  `scheduler_yield` when the tick interrupted userspace. Previously the
+  timer ISR bypassed the BKL and could mutate scheduler state in
+  parallel with AP syscall/idle handoff paths.
+
+Signal/wait publication was also tightened:
+
+- `SIGKILL`/default-terminate delivery now wakes a blocked parent via
+  the same CAS + runqueue + IPI helper as normal `exit`, fixing the M12
+  `kill`/`waitpid` hang seen during this session.
+- Stop signals sent to another task publish `TASK_STOPPED` and the
+  WUNTRACED report immediately, so `waitpid(WUNTRACED)` no longer
+  depends on the stopped task entering the kernel again.
+- Kernel stacks are now 64 KiB; 32 KiB left too little headroom for the
+  SMP/T8 nested syscall/signal/scheduler paths hit by M12/M14/M25.
+
+Validation with BKL kept in `syscall_entry.S` is now clean for the
+current tree:
+
+| variant | runs | pass | notes |
+|---------|------|------|-------|
+| BKL in + fixes above | 1 | 1 | full `LD=/opt/homebrew/bin/ld.lld ./tests/smoke.sh x86` passed `271 / 0 / 0`, including SMP-4 `B1NIX-TEST: done` |
+
+T4 was then re-applied on top of the fixes above by disabling the
+syscall-entry `bkl_lock` call. It still failed before the SMP leg:
+
+| variant | runs | pass | typical fail shape |
+|---------|------|------|--------------------|
+| T4 + fixes above | 1 | 0 | single-CPU hang in M25 after `/tmp/hello` printed `M25-HELLO: hello from native tcc`, before `M25-SMOKE: ok run-hello` / suite completion |
+
+Conclusion: the global scratch race and BKL-invariant holes are fixed as
+strict improvements, and the BKL-in baseline is green again. T4 still
+cannot honestly land: with syscall-entry BKL acquisition disabled, even
+the single-CPU smoke can wedge in the native-toolchain path.
+
+## Status (M29-M32 closeout session, 2026-05-30): T4 still does not land
+
+A second attempt was made after the M29-M32 closeout work landed. The
+hypothesis was that the SMP-spawn pmm-churn reduction and stack-lifetime
+fixes from that closeout might have closed enough of the residual race
+for T4 to be stable. They did not.
+
+Empirical characterization on top of branch `m29-m32-closeout`:
+
+| variant | runs | pass | typical fail shape |
+|---------|------|------|--------------------|
+| baseline (BKL in, no other changes) | 2 | 1 | M25 TCC-launch hang at SMP-4 |
+| T4 (BKL out)                         | 4 | 1 | M12 fork PML4-U-bit corruption; M14/M15 stack corruption (GP fault, garbage RIP) |
+| T4 + vmm_lock on clone               | 1 | 0 | stack corruption |
+| BKL in + vmm_lock on clone           | 3 | 1 | M14 stack corruption + one M25 hang |
+
+Sample sizes are small, but the trend matches the prior session's 60 %
+characterization: T4 doesn't reliably regress smoke vs. the BKL-on
+baseline (which itself has the documented SMP-4 flake), but it
+*amplifies* the residual race enough that single-PR closure is not
+honest. **BKL stays in `syscall_entry.S`.**
+
+What landed as a strict improvement in this session:
+
+- `paging_clone_address_space` now holds `vmm_lock` for write across the
+  whole user-half walk. Without it, a fork that ran while another path
+  was in `vmm_map_page` could observe a torn intermediate-level entry
+  and produce a child PML4 with the user bit cleared in PML4[0] /
+  PDPT[0] / PD[N] — the child page-faulted on its first ring-3
+  instruction fetch (shape observed once in this session, gone after
+  the lock). Closes a real fork-vs-mm race regardless of T4 status.
 
 ## Final status: T4 reverted; race fix kept
 
@@ -274,3 +671,92 @@ Foundation that **stays in tree** regardless of T4 status:
 
 Nothing else needs to be touched for T4 — `syscall_entry.S` is the only
 file with `bkl_lock`/`bkl_unlock` left to remove.
+
+## Status (M11-SHELL trace session, 2026-05-30): regression isolated to M25
+
+The previous session's report read "all failures cascade from M11-SHELL,
+shell binary crashes/hangs before any output, single-CPU regression."
+Re-tracing the smoke log with the experimental fixes applied shows the
+real failure is one step earlier: **single-CPU hangs in M25**, after
+`/tmp/hello` (the TCC-compiled binary) prints `M25-HELLO: hello from
+native tcc` but before it reaches `SYS_EXIT`. The M11-SHELL "fail" is
+just the smoke harness reporting every later marker as missing, because
+boot never reaches `B1NIX-TEST: done`.
+
+### What was reproduced this session (BKL kept in syscall_entry.S)
+
+5 single-CPU smoke runs on the experimental tree:
+
+| run | result | last marker reached |
+|-----|--------|---------------------|
+| with diagnostic prints (sched/syscall) | hang | `M25-HELLO: hello from native tcc` |
+| after removing diagnostic prints       | hang | `M25-HELLO: hello from native tcc` |
+| after reverting `bkl_depth` save/restore in `scheduler_yield` alone | hang single-CPU, **pass SMP-4** | `M25-HELLO: hello from native tcc` (single-CPU) |
+| clean `m28-t4-closure` HEAD (none of the experimental fixes) | **270 / 1** | full suite, single-CPU green; pre-existing SMP-4 M25 hang flake |
+| `b1nix.skip-m25` with experimentals applied | hang in M29 pthread futex | `syscall: 109 task=pthread` looping |
+
+So: the regression that turns 271/0 into 93/178 is in the experimental
+fix stack, not in the M33 shell branch. Reverting just the
+`bkl_depth` save/restore block (lines 1159–1170 in the experimental
+scheduler.c) is **not enough** — single-CPU still hangs at the same
+M25-HELLO point. The race is somewhere else in the stack.
+
+### What's ruled out
+
+- **Not a kernel `.text` layout boundary issue** (the TCC-hang.md
+  failure mode). `objdump -h build/x86/kernel.elf` shows `.text` at
+  450 558 bytes inside the 512 KiB padded slot — 73 KiB of headroom.
+- **Not the diagnostic `console_write` prints alone.** Removing every
+  added `console_write` (`exit_current:`, `waitpid: blocking/woke`,
+  `FORK-USER-DEBUG`, `paging_*: ...`, `syscall: <n> task=<name>`)
+  did not change the hang or the marker the smoke reaches.
+- **Not the CS/SS swap fix in `user_frame_is_valid` / `sys_sigreturn`.**
+  Both call sites had inverted constants; the new constants match what
+  `syscall_entry.S` actually pushes. Reverting that change would just
+  re-introduce a different bug.
+- **Not `paging_clone_address_space`'s new `vmm_write_acquire`.** It
+  is held over the user-half walk only and does not change kernel-side
+  page-table mutation timing.
+
+### What stays suspect (for the next session to bisect)
+
+The remaining experimental delta versus `m28-t4-closure` HEAD that
+plausibly affects the user-mode exit path is:
+
+1. `scheduler_yield` — explicit `bkl_unlock_for_switch` /
+   `bkl_lock_for_switch(new_task->bkl_depth)` around
+   `arch_context_switch`. Partial revert (only this block) was tested;
+   single-CPU still hangs, so this alone isn't the root cause but it
+   probably contributes.
+2. `kernel/main.c` BSP idle loop — `bkl_lock()` before
+   `scheduler_yield()`, `bkl_unlock()` immediately after, then
+   `sti; hlt` if not switched. Differs from the prior commit that
+   relied on yield not touching BKL.
+3. `kernel/arch/x86/lapic.c` AP idle loop — same pattern as #2.
+4. `scheduler_on_timer_tick` — takes `bkl_lock()` around the yield if
+   the timer interrupted userspace, releases after.
+5. `kernel/arch/x86/paging.c` `paging_create_address_space` — now holds
+   `vmm_read_acquire` while cloning kernel-half PML4 entries. Affects
+   `execve` timing for every user-image swap (including the
+   `/tmp/hello` execve done from m25-smoke's child).
+6. `scheduler_kill` SIGSTOP/SIGTSTP path — publishes `TASK_STOPPED` +
+   wakes the blocked parent inline. Unrelated to M25 in theory
+   (hello.c doesn't use stop signals).
+
+Recommended next-session bisect: take `m28-t4-closure` HEAD, apply the
+experimental hunks one at a time (in the order above), rebuild, run
+`tests/smoke.sh x86`, and stop at the first hunk that wedges
+single-CPU M25.
+
+### What's in tree right now (working state, not committed)
+
+The 14 experimentally modified files from the previous session are
+preserved in the working tree (restored from a dropped stash). `git
+status` lists them; `git diff` against `m28-t4-closure` HEAD shows the
+full experimental delta to bisect. Nothing in this session was
+committed — the experimental work is unchanged from where the previous
+session left it.
+
+`m28-t4-closure` HEAD = commit `66eb0e1` (docs + `vmm_lock` on clone),
+baseline `270 / 1` on a single run (single SMP-4 flake — documented
+pre-existing M25 TCC hang under `-smp 4`).

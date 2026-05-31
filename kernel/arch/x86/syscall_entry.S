@@ -13,10 +13,6 @@ x86_syscall_stack_bottom:
 .global x86_syscall_stack_top
 x86_syscall_stack_top:
 
-.align 8
-x86_syscall_saved_user_rsp:
-    .quad 0
-
 .section .text
 .code64
 
@@ -24,8 +20,10 @@ x86_syscall_saved_user_rsp:
 .global x86_syscall_entry
 .type x86_syscall_entry, @function
 x86_syscall_entry:
-    /* Save RAX temporarily in our scratch area */
-    movq %rax, x86_syscall_saved_user_rsp(%rip)
+    /* Save RAX temporarily in per-CPU scratch. This runs before the BKL is
+     * acquired, so a global scratch slot would race between simultaneous
+     * syscalls on different CPUs. */
+    movq %rax, %gs:0x60
 
     /* Get the per-CPU current task: GS base points at this CPU's struct percpu,
      * whose cur_task member is at offset 0x10 (see struct percpu in lapic.h;
@@ -65,7 +63,7 @@ x86_syscall_entry:
     pushq %rbx
 
     /* Restore and push RAX */
-    movq x86_syscall_saved_user_rsp(%rip), %rax
+    movq %gs:0x60, %rax
     pushq %rax
 
     /* RSP now points to the start of the interrupt_frame (16-byte aligned).
@@ -74,8 +72,14 @@ x86_syscall_entry:
      * behalf of this userspace task. bkl_lock clobbers the caller-saved
      * registers that still hold the syscall arguments, so we reload every
      * argument from the saved register frame afterwards (offsets from the frame
-     * start, which we keep in RBP). */
-    call bkl_lock
+     * start, which we keep in RBP).
+     *
+     * M28 T4 (see docs/m28-t4-blocker.md): commented out — single-CPU is
+     * GREEN with this disabled; SMP-4 still hits a kernel-stack lifetime
+     * race at M13-JC start that the next session needs to attack. The
+     * pre-BKL entry scratch is per-CPU (gs:0x60) so simultaneous syscalls
+     * on different CPUs don't trample each other's saved RAX. */
+    /* call bkl_lock */
     movq %rsp, %rbp    /* RBP = interrupt_frame pointer (also the 8th argument) */
 
     /* Syscall convention -> System V ABI argument registers. Frame layout (from

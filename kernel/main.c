@@ -11,6 +11,7 @@
 #include <b1nix/vfs.h>
 #include <b1nix/blk.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/tlb.h>
 #include <b1nix/ext2.h>
 #include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
@@ -152,6 +153,13 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* Bring up Application Processors */
 	smp_boot_aps();
 
+	/* M28 T4: enable cross-CPU TLB shootdown. With BKL out of syscall_entry.S
+	 * (T4), two CPUs can simultaneously execute vmm_unmap_page on different
+	 * pml4s; without shootdown, the stale TLB entry on another CPU lets a
+	 * write hit the freed-and-reused physical frame. Safe to enable here
+	 * because all APs have come up and have functional LAPICs to ACK IPIs. */
+	tlb_shootdown_set_enabled(1);
+
 	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
 	smp_selftest_run();
 
@@ -183,16 +191,17 @@ void kernel_main(u64 arg0, u64 arg1)
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
 	console_write(init_spawn_buf);
 
-	/* T2 (M28 #7): BSP idle loop is BKL-free, same shape as the AP idle
-	 * after T1. scheduler_yield's internals are SMP-safe via F1-F6. The
-	 * bkl_unlock() before sti;hlt is kept because a syscall-return path that
-	 * yielded back into this idle frame may have left the BKL held — the
-	 * owner-check (commit 9d0784f) makes the call a no-op when this CPU
-	 * never took it, safe either way. The matching bkl_lock() after sti;hlt
-	 * is gone: the outer loop no longer assumes BKL is held. */
+	/* The idle frame may resume either from a syscall/exit path that still
+	 * holds the BKL or from a previous no-work hlt with the BKL dropped. Keep
+	 * the scheduler's original invariant: context switches happen with this
+	 * CPU holding the BKL, but idle never parks while holding it. */
 	while (scheduler_task_count() > 1) {
-		if (!scheduler_yield()) {
-			bkl_unlock();
+		if (!bkl_is_held_by_current_cpu()) {
+			bkl_lock();
+		}
+		int switched = scheduler_yield();
+		bkl_unlock();
+		if (!switched) {
 			__asm__ volatile("sti; hlt" : : : "memory");
 		}
 	}
