@@ -636,6 +636,12 @@ void icache_invalidate_fs(u32 fs_id) {
 
 static void vfs_inode_lock_read(struct vfs_inode *inode) {
   if (blk_cache_lock_is_held()) {
+    /* Walking the frame pointer chain into panic() shows just the
+     * vfs_inode_lock_read frame; print our caller's return address up-front
+     * so the offender is named even if the post-panic backtrace fails. */
+    console_write("[LOCK ORDER] vfs_inode_lock_read called by 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write(" while bcache lock held\n");
     panic("vfs: inode read-lock under block-cache lock");
   }
   while (1) {
@@ -663,6 +669,9 @@ static void vfs_inode_unlock_read(struct vfs_inode *inode) {
 
 static void vfs_inode_lock_write(struct vfs_inode *inode) {
   if (blk_cache_lock_is_held()) {
+    console_write("[LOCK ORDER] vfs_inode_lock_write called by 0x");
+    console_write_hex64((u64)(usize)__builtin_return_address(0));
+    console_write(" while bcache lock held\n");
     panic("vfs: inode write-lock under block-cache lock");
   }
   while (1) {
