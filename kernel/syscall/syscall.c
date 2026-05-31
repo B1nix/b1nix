@@ -493,7 +493,7 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
 static int user_frame_is_valid(const struct interrupt_frame *frame) {
   if (!frame)
     return 1;
-  if (frame->cs != 0x23 || frame->ss != 0x1B)
+  if (frame->cs != 0x1B || frame->ss != 0x23)
     return 0;
   if (frame->rip >= 0x0000800000000000ULL ||
       frame->rsp >= 0x0000800000000000ULL)

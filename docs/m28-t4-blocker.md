@@ -1,11 +1,97 @@
-# M28 T4 — what's blocking it
+# M28 T4 — closure history
 
-This document captures what's known about the race that prevents T4 (BKL
-out of `syscall_entry.S`) from landing. Read it before the next attempt
-so you don't repeat the prior iterations from this branch's session
-history.
+## Status (closure, 2026-05-31): T4 LANDED, smoke 271/0 both UP and SMP-4
 
-## Status (stack-lease for yield, 2026-05-31): save-vs-steal race closed
+T4 (BKL out of `syscall_entry.S`) is fully landed on this branch with the
+full smoke suite green at **271 / 0** on both single-CPU and `-smp 4`.
+The closure commit makes three minimal changes to the prior session's
+state (which sat at 146 / 125 single-CPU):
+
+1. **Revert the CS/SS check inversion** in `kernel/syscall/syscall.c` and
+   `kernel/arch/x86/signal.c`. The T4 commit 0d6e287 inverted both
+   `user_frame_is_valid` and `sys_sigreturn`'s privilege check to
+   `cs != 0x23 || ss != 0x1B`, but `syscall_entry.S` pushes
+   CS = 0x1B, SS = 0x23 (the "data-segment-as-SS, code-segment-as-CS
+   reversed" ordering that has been historically compatible with every
+   consumer in the tree — see the next section for why). The inverted
+   check meant every userspace ELF syscall returned to
+   `scheduler_exit_current(-SIGSEGV)` at the end of its very first call
+   to `write()`, so 125 tests printed only "M*-SMOKE: start" then died
+   silently. Built-in kernel programs (busybox / shell / mc / editor)
+   survived because they call `syscall_dispatch` directly with
+   `frame == NULL` and the check is skipped.
+
+2. **Delete the BKL handoff block in `scheduler_yield`** (the
+   `bkl_unlock_for_switch` / `bkl_lock_for_switch` lines around
+   `arch_context_switch`). Without it, scheduler_yield restores its
+   pre-T4 shape: it doesn't touch BKL at all, and the surrounding
+   syscall / fork / exit paths keep whatever ownership they already had.
+   The handoff machinery was correct in principle but interacted with
+   the timer-ISR path below to wedge M25 deterministically.
+
+3. **Delete the tick-side `bkl_lock` block in
+   `scheduler_on_timer_tick`** (the `if (!bkl_is_held_by_current_cpu)
+   bkl_lock(); scheduler_yield(); if (took_bkl) bkl_unlock();`
+   wrapper). Restores the original bare `scheduler_yield()` from
+   995a02e. With either of these two BKL blocks present, /tmp/hello
+   (the TCC-compiled M25 hello binary) prints "M25-HELLO: hello from
+   native tcc" via write() and then never reaches its own SYS_EXIT —
+   the next syscall instruction effectively never gets dispatched
+   inside the kernel, the parent's waitpid blocks forever, and the
+   whole suite stalls. Removing both gives 271 / 0 deterministically.
+
+The helpers `bkl_lock_for_switch` / `bkl_unlock_for_switch` /
+`bkl_get_depth` in `kernel/sched/bkl.c` are kept (still declared in the
+header) but unused. They're available if a future SMP iteration needs a
+genuine BKL handoff; this iteration found it wasn't necessary.
+
+## DO NOT re-add a BKL handoff in scheduler_yield or the timer ISR
+
+Reintroducing either block deterministically wedges M25 at
+"M25-HELLO". The bisection was unambiguous: each block alone is
+sufficient to wedge; both must be absent for /tmp/hello's SYS_EXIT to
+reach `scheduler_exit_current`. The exact mechanism wasn't fully
+isolated (no panic, no exception, no signal — the binary just stops
+issuing syscalls), but the smoke signal is binary: M25-SMOKE: done
+either appears in every run or never appears.
+
+To verify, after any future scheduler change:
+
+```
+LD=/opt/homebrew/opt/lld/bin/ld.lld make ARCH=x86 KERNEL_CMDLINE="b1nix.test=1" iso
+bash smoke_run/qrun.sh 60
+grep "M25-SMOKE: done" smoke_run/b1nix-smoke-boot.log
+```
+
+Should print one line. If empty, you re-introduced the M25 wedge.
+
+## Why CS / SS are pushed reversed in syscall_entry.S
+
+`sysretq` does NOT pop CS / SS from the kernel stack — it derives them
+from `IA32_STAR`'s bits [63:48] (CS base = +16, SS base = +8, both with
+RPL = 3). Whatever `syscall_entry.S` pushes for CS / SS is only used by
+other kernel code that inspects the frame: `user_frame_is_valid`, the
+panic dumper, `arch_check_and_deliver_signals`'s "is this a user
+frame?" check, and `sys_sigreturn`'s privilege check on the saved
+frame.
+
+The historical push order (predating commit "1") was
+`pushq $0x23 /* SS */ ; ... ; pushq $0x1B /* CS */` — data-segment
+selector pushed in the SS slot, code-segment selector pushed in the CS
+slot. By inspection this looks wrong, but the consumers above were
+historically coded to match (cs == 0x1B && ss == 0x23) and the layout
+has been compatible with every codepath in the tree for the entire
+M24b → M28 era. A previous session "fixed" the push order to
+`pushq $0x1B /* SS */ ; ... ; pushq $0x23 /* CS */` on cosmetic
+grounds and silently broke the M25 / TCC sigreturn-style path; that
+push-order change was reverted earlier in this branch, but the
+matching CS / SS check flip in `user_frame_is_valid` / `sys_sigreturn`
+was missed and stayed in 0d6e287 — that's the 125-test regression the
+closure commit fixed.
+
+---
+
+## Historical: status (stack-lease for yield, 2026-05-31): save-vs-steal race closed
 
 The prior session left T4 applied with a documented kernel-stack save-side
 race on SMP-4: another CPU's `pick_next_task` could observe `state==READY`
