@@ -162,6 +162,34 @@ static void mark_frame_free(u64 frame) {
   }
 }
 
+/* Bulk version of mark_frame_free for pmm_init's "mark whole region free"
+ * walk. The naive per-frame loop dominated boot under TCG with large RAM
+ * (~2M iterations for 8 GB ⇒ tens of seconds before the shell appeared).
+ * Pre-condition: every bitmap bit in [start_idx, end_idx) is currently SET
+ * (the bitmap was just memset(0xff)'d in pmm_init); the bulk clear is the
+ * inverse — memset(0) for the byte-aligned interior, bit-clear at the edges.
+ * Caller may not depend on free_list_ready here (it is false during init). */
+static void mark_frames_free_range(usize start_idx, usize end_idx) {
+  if (end_idx <= start_idx) return;
+  usize count = end_idx - start_idx;
+  /* Leading partial byte */
+  while (start_idx < end_idx && (start_idx & 7)) {
+    bitmap_clear(start_idx++);
+  }
+  /* Aligned middle bytes — single memset, the fast path */
+  usize byte_start = start_idx >> 3;
+  usize byte_end = end_idx >> 3;
+  if (byte_end > byte_start) {
+    memset(&pmm.bitmap[byte_start], 0, byte_end - byte_start);
+    start_idx = byte_end << 3;
+  }
+  /* Trailing partial byte */
+  while (start_idx < end_idx) {
+    bitmap_clear(start_idx++);
+  }
+  pmm.free_frames += count;
+}
+
 static void mark_frame_used(u64 frame) {
   usize index = frame_index(frame);
 
@@ -305,9 +333,10 @@ void pmm_init(const struct boot_info *boot_info) {
 
     pmm.total_usable += end - start;
 
-    for (u64 frame = start; frame < end; frame += PAGE_SIZE) {
-      mark_frame_free(frame);
-    }
+    /* Bulk-free the whole region. Replaces a per-frame loop that ran ~2M
+     * times for 8 GB — under TCG that walk added tens of seconds to the
+     * boot-to-shell time, making "more RAM → slower boot" feel pathological. */
+    mark_frames_free_range(start / PAGE_SIZE, end / PAGE_SIZE);
 
     console_write("pmm: usable 0x");
     console_write_hex64(start);
@@ -630,14 +659,23 @@ void pmm_switch_to_direct_map(void) {
 
   /* The direct map now exists, so free frames can hold the intrusive list link.
    * Seed the stack with every currently-free frame (one-time O(frame_count)
-   * walk); from here on alloc/free maintain it incrementally. */
+   * walk); from here on alloc/free maintain it incrementally. Skip whole
+   * all-used 64-bit bitmap words — for typical layouts a chunk of low memory,
+   * the kernel, and the bitmap/refcount pages are all used, so word-stride
+   * skipping cuts the seed cost a lot at large RAM under TCG. */
   u64 flags;
   pmm_acquire(&flags);
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
-  for (usize idx = 0; idx < frame_count; idx++) {
+  const u64 *words = (const u64 *)pmm.bitmap;
+  for (usize idx = 0; idx < frame_count;) {
+    if ((idx & 63) == 0 && idx + 64 <= frame_count && words[idx / 64] == ~0ULL) {
+      idx += 64;
+      continue;
+    }
     if (!bitmap_get(idx)) {
       freelist_push(frame_from_index(idx));
     }
+    idx++;
   }
   pmm.free_list_ready = 1;
   pmm_release(flags);
