@@ -528,11 +528,29 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       return;
     }
 
-    console_write("fatal signal ");
+    /* Most actionable line in a crash log — name the signal, name the task,
+     * and the userspace address that took the fault. Mirrors what Linux
+     * dmesg ("Segmentation fault in <comm>[<pid>], ip=<addr>") and FreeBSD
+     * ("pid X (comm), signal Y") emit. */
+    static const char *sig_name[] = {
+        "?",      "SIGABRT", "SIGALRM", "SIGBUS",  "SIGCHLD", "SIGCONT",
+        "SIGFPE", "SIGHUP",  "SIGILL",  "SIGINT",  "SIGKILL", "SIGPIPE",
+        "SIGQUIT","SIGSEGV", "SIGSTOP", "SIGTERM", "SIGTSTP", "SIGTTIN",
+        "SIGTTOU"
+    };
+    const char *sname = (sig > 0 && sig < (int)(sizeof(sig_name)/sizeof(*sig_name)))
+                          ? sig_name[sig] : "?";
+    console_write("[FATAL] task '");
+    console_write(current_task && current_task->name ? current_task->name : "?");
+    console_write("' (pid ");
+    console_write_dec(pid);
+    console_write("): unhandled ");
+    console_write(sname);
+    console_write(" (signal ");
     console_write_dec(sig);
-    console_write(" in pid ");
-    console_write_hex64(pid);
-    console_write(" (no handler): terminating\n");
+    console_write(") at rip=0x");
+    console_write_hex64(frame->rip);
+    console_write(" — terminating\n");
     scheduler_exit_current(128 + sig);
     /* scheduler_exit_current never returns */
     arch_halt();

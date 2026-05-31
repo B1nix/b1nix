@@ -457,9 +457,21 @@ static u64 bitmap_scan_alloc(usize count) {
   return 0;
 }
 
+/* Global pressure tracker. Per-call retry counters are blind to the real
+ * thrash pattern: each pmm_alloc_frames returns after 1 reclaim, but hundreds
+ * of distinct calls each need that reclaim — the system as a whole is in
+ * sustained pressure even though no single call loops. So count cumulative
+ * reclaim *attempts* (not "evictions per call"); reset on a sustained
+ * stretch of no-reclaim allocs (low_pressure_run). Same intuition as Linux
+ * PSI / systemd-oomd: the metric is "how often does reclaim happen",
+ * normalized over a window of allocations. */
+static u64 pmm_total_reclaims = 0;     /* cumulative reclaim iterations */
+static u64 pmm_clean_alloc_streak = 0; /* successful allocs without reclaim */
+static u64 pmm_warned_pressure = 0;    /* one-shot per pressure episode */
+
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
-  static u64 reclaim_attempts;
+  u64 reclaim_attempts = 0;
 
   /* Retry via an explicit loop, never by recursion. Under memory pressure the
    * recovery path can run many eviction rounds; a tail-recursive retry would
@@ -477,6 +489,15 @@ u64 pmm_alloc_frames(usize count) {
         claim_frame(frame_index(frame));
         zero_frames(frame, 1);
         pmm_release(flags);
+        if (reclaim_attempts == 0) {
+          /* Healthy fast-path success. After a stretch of these, the
+           * pressure episode is over — re-arm the warning. */
+          if (++pmm_clean_alloc_streak >= 128) {
+            pmm_warned_pressure = 0;
+            pmm_total_reclaims = 0;
+            pmm_clean_alloc_streak = 0;
+          }
+        }
         return frame;
       }
       /* List empty. If the bitmap still shows free frames, the list missed
@@ -486,6 +507,15 @@ u64 pmm_alloc_frames(usize count) {
         frame = bitmap_scan_alloc(1);
         if (frame != 0) {
           pmm_release(flags);
+          if (reclaim_attempts == 0) {
+          /* Healthy fast-path success. After a stretch of these, the
+           * pressure episode is over — re-arm the warning. */
+          if (++pmm_clean_alloc_streak >= 128) {
+            pmm_warned_pressure = 0;
+            pmm_total_reclaims = 0;
+            pmm_clean_alloc_streak = 0;
+          }
+        }
           return frame;
         }
       }
@@ -493,6 +523,15 @@ u64 pmm_alloc_frames(usize count) {
       u64 frame = bitmap_scan_alloc(count);
       if (frame != 0) {
         pmm_release(flags);
+        if (reclaim_attempts == 0) {
+          /* Healthy fast-path success. After a stretch of these, the
+           * pressure episode is over — re-arm the warning. */
+          if (++pmm_clean_alloc_streak >= 128) {
+            pmm_warned_pressure = 0;
+            pmm_total_reclaims = 0;
+            pmm_clean_alloc_streak = 0;
+          }
+        }
         return frame;
       }
     }
@@ -512,6 +551,17 @@ u64 pmm_alloc_frames(usize count) {
       m26_diag_task();
       console_write("\n");
     }
+    /* This call needed reclaim — break any clean-streak. */
+    pmm_clean_alloc_streak = 0;
+    pmm_total_reclaims++;
+    enum { PMM_PRESSURE_WARN = 32 };
+    if (pmm_total_reclaims == PMM_PRESSURE_WARN && !pmm_warned_pressure) {
+      pmm_warned_pressure = 1;
+      klog_warn("pmm: memory pressure — 32 cumulative reclaim cycles "
+                "(too many parallel tasks for available RAM; suggest "
+                "fewer make -j N jobs, more memory, or enable swap)");
+    }
+
     usize reclaim_target = pmm_reclaim_target_frames(count, free_snapshot);
     usize pc_evicted = page_cache_evict(reclaim_target);
     if (pc_evicted > 0) {
@@ -533,14 +583,29 @@ u64 pmm_alloc_frames(usize count) {
       }
     }
 
-    // Nothing left to reclaim — genuinely out of memory.
+    // Nothing left to reclaim — genuinely out of memory. Tell the user
+    // exactly what we tried and what would make this work, then return 0 so
+    // the caller can panic with a meaningful upstream message. This is the
+    // closest analogue to Linux's "Out of memory: Killed process X" dmesg
+    // line — observable, actionable, not a silent hang.
     extern void kheap_dump_large_allocs(void);
     kheap_dump_large_allocs();
-    console_write("[M26DIAG] pmm_reclaim_failed count=");
+    console_write("[OUT OF MEMORY] pmm: cannot satisfy ");
     console_write_dec(count);
+    console_write("-frame request after ");
+    console_write_dec(pmm_total_reclaims);
+    console_write(" reclaim cycles. Total RAM=");
+    console_write_dec(pmm.total_usable / (1024 * 1024));
+    console_write(" MB free=");
+    console_write_dec(pmm.free_frames * PAGE_SIZE / (1024 * 1024));
+    console_write(" MB. SUGGEST: increase -m or reduce make -j N.");
     m26_diag_task();
     console_write("\n");
     klog_warn("pmm: out of contiguous physical memory");
+    /* Reset pressure flags so the NEXT episode can warn again. */
+    pmm_warned_pressure = 0;
+    pmm_total_reclaims = 0;
+    pmm_clean_alloc_streak = 0;
     return 0;
   }
 }
