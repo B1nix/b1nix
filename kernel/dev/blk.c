@@ -39,20 +39,37 @@ static spinlock_t bcache_lock = SPINLOCK_INIT;
 
 #include <b1nix/lockdep.h>
 
+/* CPU that currently owns bcache_lock (-1 = unheld). The held check below must
+ * be PER-CPU: its only caller (vfs_inode_lock_*) panics if *this* execution
+ * context holds the block-cache lock while taking an inode lock (deadlock-order
+ * guard). A plain spin_is_locked() is global — under SMP it reports "held" when
+ * ANY core holds it, so a core doing an ordinary VFS lookup would falsely panic
+ * merely because another core was concurrently in the block cache. That is why
+ * -smp4 builds tripped `inode read-lock under block-cache lock` while -smp1
+ * (single core, no concurrent holder) never did. The lock is taken IRQ-safe, so
+ * the owning core can't be preempted mid-section and the field stays stable. */
+static volatile int bcache_owner_cpu = -1;
+
 static u64 bcache_acquire(void) {
   u64 flags;
   spin_lock_irqsave(&bcache_lock, &flags);
+  struct percpu *p = get_percpu();
+  bcache_owner_cpu = p ? (int)p->cpu_id : -1;
   LOCKDEP_ACQUIRE(LOCKDEP_LVL_BCACHE);
   return flags;
 }
 
 static void bcache_release(u64 flags) {
   LOCKDEP_RELEASE(LOCKDEP_LVL_BCACHE);
+  bcache_owner_cpu = -1;
   spin_unlock_irqrestore(&bcache_lock, flags);
 }
 
 int blk_cache_lock_is_held(void) {
-  return spin_is_locked(&bcache_lock);
+  struct percpu *p = get_percpu();
+  if (!p)
+    return 0; /* no per-CPU area => cannot be the holder */
+  return bcache_owner_cpu == (int)p->cpu_id;
 }
 
 static u32 le32(const u8 *p) {
@@ -284,23 +301,33 @@ static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
 }
 
 static struct block_buffer *bcache_evict(void) {
-  int oldest_idx = 0;
+  int oldest_idx = -1;
   u32 oldest_tick = 0xFFFFFFFF;
 
-  /* 1. Try to find an invalid (empty) entry first */
+  /* BUSY entries are mid-DMA on another CPU — never reuse them (that is the
+   * corruption this guards). Caller holds bcache_lock, so the flags are stable
+   * during this scan. Returns NULL if every entry is in-flight (caller retries);
+   * impossible in practice (cache has thousands of slots, only a few concurrent
+   * misses) but handled rather than assumed. */
+
+  /* 1. Try to find an invalid (empty), non-busy entry first */
   for (usize i = 0; i < block_cache_n; i++) {
-    if (!(block_cache[i].flags & BLK_CACHE_VALID)) {
+    if (!(block_cache[i].flags & (BLK_CACHE_VALID | BLK_CACHE_BUSY))) {
       return &block_cache[i];
     }
   }
 
-  /* 2. Otherwise, find the LRU (Least Recently Used) entry */
+  /* 2. Otherwise, find the LRU (Least Recently Used) non-busy entry */
   for (usize i = 0; i < block_cache_n; i++) {
+    if (block_cache[i].flags & BLK_CACHE_BUSY)
+      continue;
     if (block_cache[i].last_used < oldest_tick) {
       oldest_tick = block_cache[i].last_used;
-      oldest_idx = i;
+      oldest_idx = (int)i;
     }
   }
+  if (oldest_idx < 0)
+    return 0; /* all entries in-flight — caller yields and retries */
 
   struct block_buffer *entry = &block_cache[oldest_idx];
 
@@ -335,30 +362,49 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   u8 *buf8 = (u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    u64 flags = bcache_acquire();
-    struct block_buffer *entry = bcache_find(dev, current_lba);
+    /* Retry loop: re-runs only if every cache slot is momentarily in-flight on
+     * other CPUs (bcache_evict returned NULL) — otherwise breaks after one pass. */
+    for (;;) {
+      u64 flags = bcache_acquire();
+      struct block_buffer *entry = bcache_find(dev, current_lba);
 
-    if (entry) {
-      memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
-      bcache_release(flags);
-    } else {
+      if (entry) {
+        memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
+        bcache_release(flags);
+        break;
+      }
+
       entry = bcache_evict();
+      if (!entry) {
+        bcache_release(flags);
+        scheduler_yield(); /* all slots in-flight; let a filler finish */
+        continue;
+      }
       entry->bdev = dev;
       entry->block_no = current_lba;
+      /* Claim the slot for our lock-free DMA so no other CPU reuses it. */
+      entry->flags |= BLK_CACHE_BUSY;
       bcache_release(flags);
-      if (dev->read_blocks(dev, current_lba, 1, entry->data) < 0) {
+
+      int rc = dev->read_blocks(dev, current_lba, 1, entry->data);
+      if (rc < 0) {
+        flags = bcache_acquire();
+        entry->flags &= ~BLK_CACHE_BUSY; /* release the slot on error */
+        bcache_release(flags);
         console_write("blk_read_cached: read_blocks failed for ");
         console_write(dev->name);
         console_write(" lba="); console_write_dec(current_lba);
         console_write("\n");
         return -1;
       }
+
       flags = bcache_acquire();
       entry->flags |= BLK_CACHE_VALID;
-      entry->flags &= ~BLK_CACHE_DIRTY;
+      entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
       entry->last_used = ++bcache_tick;
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
       bcache_release(flags);
+      break;
     }
   }
   return 0;
@@ -378,22 +424,30 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
   const u8 *buf8 = (const u8 *)buffer;
   for (u32 i = 0; i < count; i++) {
     u64 current_lba = lba + i;
-    u64 flags = bcache_acquire();
-    struct block_buffer *entry = bcache_find(dev, current_lba);
+    for (;;) {
+      u64 flags = bcache_acquire();
+      struct block_buffer *entry = bcache_find(dev, current_lba);
 
-    if (!entry) {
-      entry = bcache_evict();
-      entry->bdev = dev;
-      entry->block_no = current_lba;
-      entry->flags |= BLK_CACHE_VALID;
-      entry->last_used = ++bcache_tick;
+      if (!entry) {
+        entry = bcache_evict();
+        if (!entry) { /* all slots in-flight on other CPUs — retry */
+          bcache_release(flags);
+          scheduler_yield();
+          continue;
+        }
+        entry->bdev = dev;
+        entry->block_no = current_lba;
+        entry->flags |= BLK_CACHE_VALID;
+        entry->last_used = ++bcache_tick;
+      }
+
+      /* The whole fill happens under the lock (no yielding DMA), so no BUSY
+       * claim is needed here — unlike the read path. */
+      memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
+      entry->flags |= BLK_CACHE_DIRTY; /* write-back: flush later */
+      bcache_release(flags);
+      break;
     }
-
-    memcpy(entry->data, buf8 + i * CACHE_BLOCK_SIZE, CACHE_BLOCK_SIZE);
-
-    /* Write-Back: Mark as dirty, DO NOT write to disk immediately */
-    entry->flags |= BLK_CACHE_DIRTY;
-    bcache_release(flags);
   }
   return 0;
 }

@@ -371,6 +371,12 @@ install-kernel-source:
 	done
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
+	@# The in-guest kernel build (self-host) compiles lapic.c and initramfs.c,
+	@# which #include generated artifacts from build/x86 (ap_trampoline.inc and
+	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
+	@# host output, so stage just these generated *.inc inputs the compile needs.
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86
+	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso
