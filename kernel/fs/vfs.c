@@ -1784,8 +1784,11 @@ int vfs_open_flags(const char *path, int flags) {
         goto out;
       }
     } else {
+      /* Plain ENOENT (or any other open error without O_CREAT) is a *normal*
+       * userspace event — gcc/cc1, init scripts, and shells probe many paths
+       * that may not exist. Linux doesn't log it; neither should we. The
+       * errno reaches userspace via the syscall return, that's enough. */
       res = (int)PTR_ERR(node);
-      klog_warn("vfs: open failed");
       goto out;
     }
   } else {
@@ -1868,13 +1871,8 @@ int vfs_open_flags(const char *path, int flags) {
 out:
   if (resolved)
     kfree(resolved);
-  if (res < 0) {
-    if (node && !IS_ERR(node))
-      vfs_node_put(node);
-    console_write("vfs: open failed with ");
-    console_write_dec(-res);
-    console_write("\n");
-  }
+  if (res < 0 && node && !IS_ERR(node))
+    vfs_node_put(node);
   return res;
 }
 
