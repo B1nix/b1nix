@@ -14,6 +14,11 @@ struct block_device {
 
 #define BLK_CACHE_DIRTY 0x01
 #define BLK_CACHE_VALID 0x02
+/* In-flight: a CPU has claimed this entry and is doing its (lock-free, yielding)
+ * block DMA into ->data. Eviction must skip BUSY entries, otherwise a second CPU
+ * could pick the same slot and DMA a different block into it — corrupting both
+ * (observed under -smp4 parallel builds as gcc reading garbage from a header). */
+#define BLK_CACHE_BUSY  0x04
 
 struct block_buffer {
     u64 block_no;

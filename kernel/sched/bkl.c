@@ -40,8 +40,15 @@ void bkl_lock(void) {
      * window would call bkl_lock(), see owner != cpu, find the lock already
      * held (by us), and spin forever. */
     for (;;) {
-        while (g_bkl)
+        while (g_bkl) {
             __asm__ volatile("pause");
+            /* This loop can run with interrupts disabled (callers in the
+             * context-switch / AP idle paths enter under cli). A CPU spinning
+             * here with IRQs off cannot take the TLB-shootdown IPI, which would
+             * deadlock the initiator; drain shootdowns explicitly. See
+             * tlb_shootdown_poll. */
+            tlb_shootdown_poll();
+        }
         u64 fl = irq_save_cli();
         if (spin_xchg(&g_bkl, 1) == 0) {
             g_bkl_owner = cpu;
@@ -112,8 +119,10 @@ void bkl_unlock_for_switch(void) {
 void bkl_lock_for_switch(u32 depth) {
     int cpu = this_cpu_id();
     for (;;) {
-        while (g_bkl)
+        while (g_bkl) {
             __asm__ volatile("pause");
+            tlb_shootdown_poll(); /* drain shootdowns while spinning IRQs-off */
+        }
         u64 fl = irq_save_cli();
         if (spin_xchg(&g_bkl, 1) == 0) {
             g_bkl_owner = cpu;
