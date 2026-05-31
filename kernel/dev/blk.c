@@ -358,15 +358,18 @@ static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
   return 0;
 }
 
-static struct block_buffer *bcache_evict(void) {
+/* Pick + prepare a slot to evict. Caller holds bcache_lock; on dirty entries we
+ * MUST drop the lock around write_blocks (the virtio/AHCI drivers spin on
+ * scheduler_yield(), and CLAUDE.md's "Never Sleep While Holding a Spinlock"
+ * rule means yielding under bcache_lock is a deadlock waiting to happen — and
+ * also misleads vfs_inode_lock_*'s "is bcache held by this CPU?" guard, so a
+ * task that runs during the yield trips the lock-order panic). The slot is
+ * claimed via BLK_CACHE_BUSY for the duration so a concurrent evict on
+ * another CPU skips it. flags_inout lets us release/reacquire with the
+ * caller's saved IRQ state preserved. */
+static struct block_buffer *bcache_evict(u64 *flags_inout) {
   int oldest_idx = -1;
   u32 oldest_tick = 0xFFFFFFFF;
-
-  /* BUSY entries are mid-DMA on another CPU — never reuse them (that is the
-   * corruption this guards). Caller holds bcache_lock, so the flags are stable
-   * during this scan. Returns NULL if every entry is in-flight (caller retries);
-   * impossible in practice (cache has thousands of slots, only a few concurrent
-   * misses) but handled rather than assumed. */
 
   /* 1. Try to find an invalid (empty), non-busy entry first */
   for (usize i = 0; i < block_cache_n; i++) {
@@ -389,10 +392,15 @@ static struct block_buffer *bcache_evict(void) {
 
   struct block_buffer *entry = &block_cache[oldest_idx];
 
-  /* 3. Write-Back: If the evicted block is dirty, write it to physical disk */
+  /* 3. Write-Back: flush a dirty entry to disk OUTSIDE the bcache_lock. */
   if ((entry->flags & BLK_CACHE_DIRTY) && entry->bdev && entry->bdev->write_blocks) {
-    entry->bdev->write_blocks(entry->bdev, entry->block_no, 1, entry->data);
-    entry->flags &= ~BLK_CACHE_DIRTY;
+    entry->flags |= BLK_CACHE_BUSY;          /* lock the slot across the drop */
+    struct block_device *wb_dev = entry->bdev;
+    u64 wb_lba = entry->block_no;
+    bcache_release(*flags_inout);            /* RELEASE — write_blocks may yield */
+    wb_dev->write_blocks(wb_dev, wb_lba, 1, entry->data);
+    *flags_inout = bcache_acquire();         /* REACQUIRE before returning */
+    entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
   }
   /* Unlink from its old hash chain — its (bdev, block_no) is about to be
    * replaced. Leaving it linked would leak chain length and waste lookups. */
@@ -435,7 +443,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         break;
       }
 
-      entry = bcache_evict();
+      entry = bcache_evict(&flags);
       if (!entry) {
         bcache_release(flags);
         scheduler_yield(); /* all slots in-flight; let a filler finish */
@@ -493,7 +501,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
       struct block_buffer *entry = bcache_find(dev, current_lba);
 
       if (!entry) {
-        entry = bcache_evict();
+        entry = bcache_evict(&flags);
         if (!entry) { /* all slots in-flight on other CPUs — retry */
           bcache_release(flags);
           scheduler_yield();
