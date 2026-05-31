@@ -26,6 +26,13 @@ struct block_buffer {
     u8 data[512]; // Assuming 512-byte blocks
     struct block_device *bdev;
     u32 last_used;
+    /* Singly-linked hash-chain index in the bcache, -1 = end of chain.
+     * Lets bcache_find lookup an (bdev, block_no) pair without scanning the
+     * full block_cache[] array. block_cache scales with RAM (~2 entries per
+     * MiB), so the old linear scan made gcc execve O(cache_size) per binary
+     * page read — at 4 GiB guests that was 8K comparisons per file page,
+     * dwarfing everything else. */
+    i32 hash_next;
 };
 
 void blk_register(struct block_device *dev);

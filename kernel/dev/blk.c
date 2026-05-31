@@ -37,6 +37,53 @@ static usize block_cache_n = 0;
 static u32 bcache_tick = 0;
 static spinlock_t bcache_lock = SPINLOCK_INIT;
 
+/* Hash table indexing block_cache[] by (bdev, block_no). Each bucket holds
+ * an index into block_cache[] (or -1 for empty); collisions chain through
+ * block_buffer.hash_next. Without this, bcache_find linearly scanned the
+ * entire cache on every block read — at 4 GiB guests that's 8K comparisons
+ * per cache lookup, and dominated gcc execve wall-clock (turning a 5 s
+ * binary load into a 30 s one). Hash sized so average chain length stays
+ * below ~8 even at CACHE_ENTRIES_MAX. */
+#define BCACHE_HASH_BITS 10
+#define BCACHE_HASH_SIZE (1u << BCACHE_HASH_BITS)
+#define BCACHE_HASH_MASK (BCACHE_HASH_SIZE - 1u)
+static i32 bcache_hash[BCACHE_HASH_SIZE];
+
+static inline u32 bcache_bucket(struct block_device *dev, u64 lba) {
+  /* Spread bdev pointer bits across the lba — both are dense in low bits,
+   * a plain XOR would collide for sequential reads from the same device. */
+  u64 m = (u64)(usize)dev * 0x9E3779B97F4A7C15ULL;
+  m ^= lba * 0xC6BC279692B5C323ULL;
+  return (u32)((m ^ (m >> 32)) & BCACHE_HASH_MASK);
+}
+
+/* Caller must hold bcache_lock. Unlinks block_cache[idx] from its hash chain
+ * (a no-op if not currently linked, i.e. invalid/uninitialized entry). */
+static void bcache_hash_remove(i32 idx) {
+  struct block_buffer *b = &block_cache[idx];
+  if (!b->bdev) return; /* never inserted */
+  u32 h = bcache_bucket(b->bdev, b->block_no);
+  i32 *pp = &bcache_hash[h];
+  while (*pp != -1) {
+    if (*pp == idx) {
+      *pp = b->hash_next;
+      b->hash_next = -1;
+      return;
+    }
+    pp = &block_cache[*pp].hash_next;
+  }
+  /* If we get here the chain was inconsistent — leave gracefully. */
+  b->hash_next = -1;
+}
+
+/* Caller must hold bcache_lock. Links idx at the head of its hash bucket. */
+static void bcache_hash_insert(i32 idx) {
+  struct block_buffer *b = &block_cache[idx];
+  u32 h = bcache_bucket(b->bdev, b->block_no);
+  b->hash_next = bcache_hash[h];
+  bcache_hash[h] = idx;
+}
+
 #include <b1nix/lockdep.h>
 
 /* CPU that currently owns bcache_lock (-1 = unheld). The held check below must
@@ -283,6 +330,10 @@ void blk_cache_init(void) {
     block_cache_n = CACHE_ENTRIES_MIN;
     block_cache = kzalloc(block_cache_n * sizeof(struct block_buffer));
   }
+  /* kzalloc zeroes the buffer, but hash_next must start at -1 (empty), not 0
+   * (which is a valid index). Likewise prime the hash buckets to -1. */
+  for (usize i = 0; i < block_cache_n; i++) block_cache[i].hash_next = -1;
+  for (u32 b = 0; b < BCACHE_HASH_SIZE; b++) bcache_hash[b] = -1;
   console_write("blk-cache: ");
   console_write_dec(block_cache_n);
   console_write(" entries (");
@@ -291,11 +342,18 @@ void blk_cache_init(void) {
 }
 
 static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
-  for (usize i = 0; i < block_cache_n; i++) {
-    if ((block_cache[i].flags & BLK_CACHE_VALID) && block_cache[i].bdev == dev && block_cache[i].block_no == lba) {
-      block_cache[i].last_used = ++bcache_tick;
-      return &block_cache[i];
+  /* O(chain-length) lookup via the (bdev, lba)-keyed hash table. The hash
+   * is filled on cache fill / evict so stale (invalid) entries don't linger
+   * in chains — but defensively skip any whose flags say invalid. */
+  u32 h = bcache_bucket(dev, lba);
+  i32 idx = bcache_hash[h];
+  while (idx >= 0) {
+    struct block_buffer *e = &block_cache[idx];
+    if ((e->flags & BLK_CACHE_VALID) && e->bdev == dev && e->block_no == lba) {
+      e->last_used = ++bcache_tick;
+      return e;
     }
+    idx = e->hash_next;
   }
   return 0;
 }
@@ -336,6 +394,9 @@ static struct block_buffer *bcache_evict(void) {
     entry->bdev->write_blocks(entry->bdev, entry->block_no, 1, entry->data);
     entry->flags &= ~BLK_CACHE_DIRTY;
   }
+  /* Unlink from its old hash chain — its (bdev, block_no) is about to be
+   * replaced. Leaving it linked would leak chain length and waste lookups. */
+  bcache_hash_remove((i32)oldest_idx);
   entry->flags &= ~BLK_CACHE_VALID;
   return entry;
 }
@@ -402,6 +463,9 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       entry->flags |= BLK_CACHE_VALID;
       entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
       entry->last_used = ++bcache_tick;
+      /* Link this freshly-filled slot into its (bdev, block_no) hash bucket
+       * so subsequent bcache_find lookups for the same key are O(chain). */
+      bcache_hash_insert((i32)(entry - block_cache));
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
       bcache_release(flags);
       break;
@@ -439,6 +503,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
         entry->block_no = current_lba;
         entry->flags |= BLK_CACHE_VALID;
         entry->last_used = ++bcache_tick;
+        bcache_hash_insert((i32)(entry - block_cache));
       }
 
       /* The whole fill happens under the lock (no yielding DMA), so no BUSY
@@ -507,6 +572,10 @@ void blk_cache_invalidate(struct block_device *dev) {
         blk_flush_buffer(buf);
         flags = bcache_acquire();
       }
+      /* Unhash before zeroing — otherwise the chain head ends up pointing
+       * at a slot whose (bdev, block_no) keys are 0, polluting future
+       * lookups for any read at LBA 0 on dev==0. */
+      bcache_hash_remove((i32)i);
       block_cache[i].flags = 0;
       block_cache[i].bdev = 0;
       block_cache[i].block_no = 0;
