@@ -46,9 +46,16 @@ def img(name, mb):
             f.truncate(mb * 1024 * 1024)
     return path
 
+# Accelerator. Default to round-robin TCG: counter-intuitively it is FASTER than
+# MTTCG (tcg,thread=multi) for this workload — emulating x86's strong (TSO) memory
+# model on an ARM host forces expensive barriers per atomic, and b1nix's BKL-heavy
+# kernel makes 4 real threads spin-contend rather than compute. Override for a
+# correctness stress test (ACCEL=tcg,thread=multi) or on a same-arch host
+# (ACCEL=kvm / ACCEL=hvf). Measured here: round-robin ~5 TU/150s vs MTTCG ~2.
+ACCEL = os.environ.get("ACCEL", "tcg")
 qemu = [
     "qemu-system-x86_64",
-    "-machine", "accel=kvm:hvf:tcg",  # fast where available, always falls back to TCG
+    "-accel", ACCEL,
     "-cdrom", f"{ROOT}/build/x86/b1nix.iso",
     "-m", RAM, "-smp", SMP, "-boot", "d",
     "-serial", "stdio", "-display", "none", "-monitor", "none", "-no-reboot",
@@ -85,10 +92,12 @@ try:
             print(f"[{int(time.time()-start)}s] sent build command", flush=True)
         # Host-wall-clock bracket of the build itself (the in-guest clock is
         # unreliable on TCG). BUILD_BEGIN/BUILD_END are echoed around `make`.
-        if t_begin is None and "BUILD_BEGIN" in text:
+        # Match on its own line (the typed command also echoes "echo BUILD_END").
+        nl = text.replace("\r", "\n")
+        if t_begin is None and re.search(r"^\s*BUILD_BEGIN\s*$", nl, re.M):
             t_begin = time.time()
             print(f"[{int(t_begin-start)}s] BUILD_BEGIN", flush=True)
-        if t_end is None and "BUILD_END" in text:
+        if t_begin is not None and t_end is None and re.search(r"^\s*BUILD_END\s*$", nl, re.M):
             t_end = time.time()
             print(f"[{int(t_end-start)}s] BUILD_END  build_wallclock={int(t_end-t_begin)}s", flush=True)
         if re.search(rf"^\s*{re.escape(MARKER)}\s*$", text.replace("\r", "\n"), re.M):
