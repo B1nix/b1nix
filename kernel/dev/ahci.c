@@ -26,9 +26,33 @@ struct ahci_port_state {
   u64 phys_cmd_table;
   u64 phys_fis;
   int present;
+  volatile int busy; // yield-safe per-port I/O mutex (see ahci_port_lock)
 };
 
 static struct ahci_port_state ports[AHCI_MAX_PORTS];
+
+/* Yield-safe per-port mutex. The read (slot 0) and write (slot 1) paths share
+ * the port's command list / command tables / FIS area and the port registers
+ * (ci, serr, tfd), and ahci_wait_ci_clear() calls scheduler_yield() while a
+ * command is in flight. Without serialization a second task that runs during
+ * that yield — e.g. swap_out()/swap_in() driven by another process's page
+ * fault, which reaches this same port via blk_*_cached() → ahci_blk_* — would
+ * re-enter ahci_port_write()/read() and rewrite the in-flight command table,
+ * corrupting the command QEMU is still reading (mismatched FIS sector count vs
+ * PRDT byte count → ide_dma_cb assert) and silently dropping the swap I/O. This
+ * mirrors virtio_blk's busy-flag mutex: spin with scheduler_yield() so we never
+ * hold a real spinlock across the blocking DMA wait (CLAUDE.md: never sleep/
+ * yield holding a spinlock). __sync_lock_test_and_set gives the SMP-safe
+ * atomic claim. */
+static void ahci_port_lock(struct ahci_port_state *port) {
+  while (__sync_lock_test_and_set(&port->busy, 1)) {
+    scheduler_yield();
+  }
+}
+
+static void ahci_port_unlock(struct ahci_port_state *port) {
+  __sync_lock_release(&port->busy);
+}
 
 static u64 ahci_pci_bar5 = 0;
 
@@ -55,6 +79,8 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   if (!port->present)
     return -1;
 
+  ahci_port_lock(port);
+
   volatile struct ahci_port *p = &port->abar->ports[port->port_num];
   struct ahci_cmd_header *cmd_hdr = &port->cmd_list[0];
   struct ahci_cmd_table *cmd_table = port->cmd_table;
@@ -65,8 +91,10 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
     __asm__ volatile("pause");
     timeout--;
   }
-  if (timeout == 0)
+  if (timeout == 0) {
+    ahci_port_unlock(port);
     return -1;
+  }
 
   // Setup command header
   u32 ctba = cmd_hdr->ctba;
@@ -121,9 +149,11 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
     console_write(" read error tfd=0x");
     console_write_hex32(tfd);
     console_write("\n");
+    ahci_port_unlock(port);
     return -1;
   }
 
+  ahci_port_unlock(port);
   return (int)count;
 }
 
@@ -131,6 +161,8 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
                            const void *buffer) {
   if (!port->present)
     return -1;
+
+  ahci_port_lock(port);
 
   volatile struct ahci_port *p = &port->abar->ports[port->port_num];
   struct ahci_cmd_header *cmd_hdr = &port->cmd_list[1]; // Use slot 1 for writes
@@ -143,8 +175,10 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
     __asm__ volatile("pause");
     timeout--;
   }
-  if (timeout == 0)
+  if (timeout == 0) {
+    ahci_port_unlock(port);
     return -1;
+  }
 
   u32 ctba = cmd_hdr->ctba;
   u32 ctbau = cmd_hdr->ctbau;
@@ -199,9 +233,11 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
+    ahci_port_unlock(port);
     return -1;
   }
 
+  ahci_port_unlock(port);
   return (int)count;
 }
 

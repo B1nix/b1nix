@@ -40,9 +40,28 @@ struct nvme_device {
     
     struct block_device blk_dev;
     u16 cid_counter;
+    volatile int io_busy; // yield-safe I/O-path mutex (see nvme_io_lock)
 };
 
 static struct nvme_device nvme;
+
+/* Yield-safe per-device I/O mutex. nvme_io_submit() rings the SQ doorbell then
+ * spins on the CQ calling scheduler_yield(); the submission/completion queues,
+ * io_sq_tail and io_cq_head are shared device state. Without serialization a
+ * task that runs during that yield — e.g. swap_out()/swap_in() driven by
+ * another process's page fault reaching this device via blk_*_cached() —
+ * re-enters nvme_io_transfer() and corrupts the in-flight queue entry / head
+ * tracking. Mirrors virtio_blk's and AHCI's busy-flag mutex: spin with
+ * scheduler_yield() so no real spinlock is held across the DMA wait. */
+static void nvme_io_lock(struct nvme_device *dev) {
+    while (__sync_lock_test_and_set(&dev->io_busy, 1)) {
+        scheduler_yield();
+    }
+}
+
+static void nvme_io_unlock(struct nvme_device *dev) {
+    __sync_lock_release(&dev->io_busy);
+}
 
 static void nvme_wait_note(const char *queue_name)
 {
@@ -201,6 +220,7 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 
 static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *buffer, int is_write)
 {
+    nvme_io_lock(nd);
     struct nvme_sqe sqe;
     memset(&sqe, 0, sizeof(sqe));
     
@@ -241,6 +261,7 @@ static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *bu
     if (prp_list_phys) {
         pmm_free_frame(prp_list_phys);
     }
+    nvme_io_unlock(nd);
     return ret == 0 ? (int)count : -1;
 }
 
