@@ -546,6 +546,11 @@ check_output "$LOG" "DNS-SMOKE: ok parse-a-record" "DNS A-record parser extracts
 check_output "$LOG" "DNS-SMOKE: ok parse-aaaa-record" "DNS AAAA-record parser extracts a 128-bit IPv6 address"
 check_output "$LOG" "DNS-SMOKE: ok resolv-conf" "/etc/resolv.conf nameserver parsed by the kernel resolver"
 check_output "$LOG" "M32-IP6: ok icmpv6-loopback" "ICMPv6 echo over the ::1 loopback datapath round-trips"
+# ── M32a PCRE2 userspace port ──
+check_output "$LOG" "M32-PCRE2: ok compile" "ported PCRE2 compiles a pattern"
+check_output "$LOG" "M32-PCRE2: ok match" "ported PCRE2 matches and captures a group"
+check_output "$LOG" "M32-PCRE2: ok nomatch" "ported PCRE2 correctly reports a non-match"
+check_output "$LOG" "M32-PCRE2: done" "PCRE2 smoke completes"
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

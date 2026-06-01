@@ -3556,6 +3556,19 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M32a: PCRE2 userspace port. */
+  {
+    u64 pcre2_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m32-pcre2-smoke", 0, 0, 0, 0, 0);
+    if ((isize)pcre2_pid < 0) {
+      uwrite("M32-PCRE2: spawn-fail\n");
+    } else {
+      int pcre2_status = 0;
+      syscall_dispatch(SYS_WAIT, pcre2_pid, (u64)(usize)&pcre2_status, 0, 0, 0,
+                       0);
+    }
+  }
+
   /* M34: procfs / sysfs synthetic filesystems. */
   {
     u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,

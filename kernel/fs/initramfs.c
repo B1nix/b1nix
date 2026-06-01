@@ -23,6 +23,7 @@
 #include "../../build/x86/initramfs_m31_setuid.inc"
 #include "../../build/x86/initramfs_m32_smoke.inc"
 #include "../../build/x86/initramfs_m32_nettool.inc"
+#include "../../build/x86/initramfs_m32_pcre2_smoke.inc"
 #include "../../build/x86/initramfs_curl.inc"
 #include "../../build/x86/initramfs_wget.inc"
 #include "../../build/x86/initramfs_cacert.inc"
@@ -384,6 +385,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m32-nettool", (const char *)vfs_m32_nettool_elf,
      sizeof(vfs_m32_nettool_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m32-pcre2-smoke", (const char *)vfs_m32_pcre2_smoke_elf,
+     sizeof(vfs_m32_pcre2_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/curl", (const char *)vfs_curl_elf, sizeof(vfs_curl_elf),
      INITRAMFS_EXECUTABLE},
     {"/bin/wget", (const char *)vfs_wget_elf, sizeof(vfs_wget_elf),

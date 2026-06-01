@@ -47,6 +47,7 @@ BINARIES := \
 	$(BUILD)/bin/m31_setuid \
 	$(BUILD)/bin/m32_smoke \
 	$(BUILD)/bin/m32_nettool \
+	$(BUILD)/bin/m32_pcre2_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m30_pie
@@ -104,6 +105,14 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	  $(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/m32_nettool.o; \
 	  $(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_nettool.o --whole-archive $(LIB) --no-whole-archive; \
 	fi
+
+# m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
+PCRE2_DIR := ../build/pcre2-b1nix/install
+$(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_pcre2_smoke.o \
+	  $(PCRE2_DIR)/lib/libpcre2-8.a --whole-archive $(LIB) --no-whole-archive
 
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the
 # linker emits ET_DYN with R_X86_64_RELATIVE relocations. No crt0 or
