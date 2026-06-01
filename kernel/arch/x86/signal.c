@@ -63,7 +63,10 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
     /* Block signals during delivery check to prevent reentrancy issues */
     interrupts_disable();
 
-    u64 pending = current_task->pending_signals & ~current_task->blocked_signals;
+    /* Acquire-load: another CPU's scheduler_kill sets bits with a release
+     * fetch_or. blocked_signals is task-local. */
+    u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                  __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
     if (pending == 0) {
         interrupts_enable();
         return;
@@ -77,16 +80,16 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                 arch_build_signal_frame(frame, i);
 
                 /* Clear pending bit */
-                current_task->pending_signals &= ~(1ULL << (i - 1));
+                __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
 
                 interrupts_enable();
                 return; /* Deliver one signal at a time */
             } else if (sa->sa_handler == SIG_DFL) {
                 /* Default actions: most kill the process */
                 if (i == SIGCHLD || i == SIGURG || i == SIGWINCH) {
-                    current_task->pending_signals &= ~(1ULL << (i - 1));
+                    __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
                 } else if (i == SIGCONT) {
-                    current_task->pending_signals &= ~(1ULL << (i - 1));
+                    __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
                     if (current_task->state == TASK_STOPPED) {
                         current_task->state = TASK_READY;
                         current_task->continued_report_pending = 1;
@@ -96,7 +99,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     current_task->state = TASK_STOPPED;
                     current_task->last_stop_signal = i;
                     current_task->stop_report_pending = 1;
-                    current_task->pending_signals &= ~(1ULL << (i - 1));
+                    __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
                     interrupts_enable();
                     scheduler_yield();
                     return;
@@ -109,7 +112,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
             } else {
                 /* SIG_IGN: discard the signal so its pending bit doesn't
                  * linger and get re-examined on every delivery check. */
-                current_task->pending_signals &= ~(1ULL << (i - 1));
+                __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
             }
         }
     }

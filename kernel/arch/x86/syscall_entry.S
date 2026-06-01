@@ -2,8 +2,6 @@
 .code64
 
 .extern syscall_dispatch_impl
-.extern bkl_lock
-.extern bkl_unlock
 
 .section .bss
 .align 16
@@ -67,19 +65,8 @@ x86_syscall_entry:
     pushq %rax
 
     /* RSP now points to the start of the interrupt_frame (16-byte aligned).
-     *
-     * Acquire the Big Kernel Lock now that we are executing kernel code on
-     * behalf of this userspace task. bkl_lock clobbers the caller-saved
-     * registers that still hold the syscall arguments, so we reload every
-     * argument from the saved register frame afterwards (offsets from the frame
-     * start, which we keep in RBP).
-     *
-     * M28 T4 (see docs/m28-t4-blocker.md): commented out — single-CPU is
-     * GREEN with this disabled; SMP-4 still hits a kernel-stack lifetime
-     * race at M13-JC start that the next session needs to attack. The
-     * pre-BKL entry scratch is per-CPU (gs:0x60) so simultaneous syscalls
-     * on different CPUs don't trample each other's saved RAX. */
-    /* call bkl_lock */
+     * Kernel entry runs BKL-free (M28 #7); per-subsystem locks provide all
+     * SMP serialisation. */
     movq %rsp, %rbp    /* RBP = interrupt_frame pointer (also the 8th argument) */
 
     /* Syscall convention -> System V ABI argument registers. Frame layout (from
@@ -107,12 +94,7 @@ x86_syscall_return:
     /* Store the return value into the saved RAX slot in the interrupt frame */
     movq %rax, (%rsp)
 
-    /* Release the Big Kernel Lock before returning to ring 3 — userspace runs
-     * lock-free so other cores can execute their own userspace in parallel. The
-     * return value is parked in the frame slot above, so bkl_unlock clobbering
-     * RAX is harmless (it is reloaded by the popq below). RSP points at the
-     * 16-byte-aligned frame start here, satisfying the call ABI. */
-    call bkl_unlock
+    /* BKL fully retired (M28 #7): no lock to release on the way back to ring 3. */
 
     /* Restore GPRs from the interrupt_frame */
     popq %rax

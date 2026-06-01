@@ -500,6 +500,19 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
       u64 flags = bcache_acquire();
       struct block_buffer *entry = bcache_find(dev, current_lba);
 
+      /* SMP: a found entry may be mid-eviction — bcache_evict marks the slot
+       * BLK_CACHE_BUSY and drops bcache_lock while a dirty write-back DMA
+       * reads entry->data on another CPU. Writing into it now would (a) tear
+       * the in-flight DMA and (b) be silently dropped when the evictor clears
+       * BLK_CACHE_DIRTY after the write-back. Wait for the write-back to land,
+       * then retry. (The read path is safe: it only reads entry->data, so it
+       * may share the buffer with the write-back DMA.) */
+      if (entry && (entry->flags & BLK_CACHE_BUSY)) {
+        bcache_release(flags);
+        scheduler_yield();
+        continue;
+      }
+
       if (!entry) {
         entry = bcache_evict(&flags);
         if (!entry) { /* all slots in-flight on other CPUs — retry */
