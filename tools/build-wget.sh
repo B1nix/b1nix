@@ -18,6 +18,16 @@ if [ "$B1NIX_TLS" != "none" ]; then
   echo "tools/build-wget.sh: TLS provider '$B1NIX_TLS' requested, but wget TLS wiring is not enabled yet; building HTTP-only wget." >&2
 fi
 
+# PCRE2 backs wget's --regex-type=pcre mode (--accept-regex/--reject-regex).
+# Use the same static libpcre2-8 the standalone PCRE2 smoke is built against.
+PCRE2_PREFIX="$ROOT_DIR/build/pcre2-b1nix/install"
+if [ ! -f "$PCRE2_PREFIX/lib/libpcre2-8.a" ]; then
+  if ! "$ROOT_DIR/tools/build-pcre2.sh" >/dev/null; then
+    echo "tools/build-wget.sh: PCRE2 build failed" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$ROOT_DIR/build/wget-src" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -72,6 +82,9 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
 
 (
   cd "$BUILD_DIR"
+  # PCRE2_CFLAGS/PCRE2_LIBS override pkg-config (absent in this cross env), so
+  # configure trusts our static lib and defines HAVE_LIBPCRE2 -> --regex-type
+  # pcre becomes available. Keep --disable-pcre (only PCRE2 is ported).
   "$SRC_DIR/configure" \
     --host=x86_64-b1nix \
     --disable-shared --enable-static \
@@ -79,12 +92,13 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --without-zlib \
     --disable-iri \
     --disable-pcre \
-    --disable-pcre2 \
     --disable-threads \
     --disable-nls \
     --disable-ipv6 \
     --disable-ntlm \
-    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN"
+    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+    PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
+    PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8"
 )
 
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"

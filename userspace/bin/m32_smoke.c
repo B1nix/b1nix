@@ -844,6 +844,135 @@ static int test_v4mapped_udp(void) {
   return 0;
 }
 
+/* PCRE2-backed regex filtering for wget. A recursive fetch is driven with an
+ * --accept-regex that only a real PCRE2 matcher honours ("yes-\d+": POSIX would
+ * treat \d as a literal 'd' and reject "yes-1"), and --regex-type pcre, which
+ * wget only accepts when built with HAVE_LIBPCRE2. The loopback server serves
+ * an index linking to /no-2 (must be filtered out) and /yes-1 (must be kept);
+ * we then verify on disk that /yes-1 was downloaded with the right body and
+ * /no-2 was not, proving both that PCRE2 is linked and that its matcher ran.
+ * Self-contained on 127.0.0.1 — no external network. */
+static void regex_send(int cfd, const char *ctype, const char *body) {
+  char hdr[160];
+  int hl = snprintf(hdr, sizeof(hdr),
+                    "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nConnection: close\r\n\r\n",
+                    ctype);
+  send(cfd, hdr, (size_t)hl, 0);
+  if (body && *body) send(cfd, body, strlen(body), 0);
+}
+
+/* The server bounds each accept with a 3s select() timeout so it returns
+ * cleanly even when wget rejects --regex-type pcre (built without PCRE2) and
+ * never connects, or when the filter correctly skips /no-2. */
+static int run_regex_server(unsigned short port) {
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0) return 1;
+  struct sockaddr_in addr;
+  make_loopback_addr(port, &addr);
+  if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      listen(lfd, 4) < 0) {
+    close(lfd);
+    return 2;
+  }
+  for (int i = 0; i < 6; i++) {
+    fd_set rs;
+    FD_ZERO(&rs);
+    FD_SET(lfd, &rs);
+    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
+    if (select(lfd + 1, &rs, 0, 0, &tv) <= 0) break;
+    int cfd = accept(lfd, 0, 0);
+    if (cfd < 0) break;
+    char req[512];
+    int n = (int)recv(cfd, req, sizeof(req) - 1, 0);
+    if (n <= 0) { close(cfd); continue; }
+    req[n] = '\0';
+    if (strstr(req, "GET /yes-1")) {
+      regex_send(cfd, "text/plain", "regex-ok");
+    } else if (strstr(req, "GET /no-2")) {
+      regex_send(cfd, "text/plain", "should-be-filtered");
+    } else if (strstr(req, "GET / ") || strstr(req, "GET /index")) {
+      regex_send(cfd, "text/html",
+                 "<html><body>"
+                 "<a href=\"/no-2\">n</a> <a href=\"/yes-1\">y</a>"
+                 "</body></html>");
+    } else {
+      /* An unexpected request (e.g. /robots.txt) — answer 404 so wget moves on. */
+      const char *nf = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
+      send(cfd, nf, strlen(nf), 0);
+    }
+    close(cfd);
+  }
+  close(lfd);
+  return 0;
+}
+
+static int test_wget_pcre2_regex(void) {
+  unsigned short port = 3290;
+  mkdir("/tmp/wgr", 0755);
+  unlink("/tmp/wgr/yes-1");
+  unlink("/tmp/wgr/no-2");
+  unlink("/tmp/wgr/index.html");
+
+  int spid = fork();
+  if (spid < 0) { fail("wget-pcre2-regex"); return -1; }
+  if (spid == 0) _exit(run_regex_server(port));
+
+  sleep(1);
+  int wpid = fork();
+  if (wpid < 0) { fail("wget-pcre2-regex"); return -1; }
+  if (wpid == 0) {
+    char *argv[] = {"/bin/wget", "-e", "robots=off", "-r", "-l", "1",
+                    "-nd", "-nH", "-P", "/tmp/wgr",
+                    "--regex-type", "pcre", "--accept-regex", "yes-\\d+",
+                    "-t", "1", "-o", "/tmp/wgr.log",
+                    "http://127.0.0.1:3290/", NULL};
+    char *envp[] = {NULL};
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  int wst = 0;
+  waitpid(wpid, &wst, 0);
+  int sst = 0;
+  waitpid(spid, &sst, 0);
+
+  /* The accepted child must have been downloaded with the right content. */
+  int ok_yes = 0;
+  int fd = open("/tmp/wgr/yes-1", O_RDONLY);
+  if (fd >= 0) {
+    char b[32];
+    int r = (int)read(fd, b, sizeof(b) - 1);
+    close(fd);
+    if (r == 8 && memcmp(b, "regex-ok", 8) == 0) ok_yes = 1;
+  }
+  /* The rejected child must NOT have been fetched. */
+  int no_present = 0;
+  fd = open("/tmp/wgr/no-2", O_RDONLY);
+  if (fd >= 0) { no_present = 1; close(fd); }
+
+  unlink("/tmp/wgr/yes-1");
+  unlink("/tmp/wgr/no-2");
+  unlink("/tmp/wgr/index.html");
+
+  if (!ok_yes || no_present) {
+    /* Dump the wget log to serial for diagnosis, mirroring wget-loopback. */
+    int lf = open("/tmp/wgr.log", O_RDONLY);
+    if (lf >= 0) {
+      char lb[1024];
+      int nr;
+      emit("--- wget pcre2 log start ---\n");
+      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
+      emit("--- wget pcre2 log end ---\n");
+      close(lf);
+    }
+    unlink("/tmp/wgr.log");
+    fail("wget-pcre2-regex");
+    return -1;
+  }
+  unlink("/tmp/wgr.log");
+  ok("wget-pcre2-regex");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   test_external_net();
@@ -856,6 +985,7 @@ int main(void) {
   if (test_udp6_loopback() != 0)       return 1;
   if (test_tcp6_loopback() != 0)       return 1;
   if (test_tcp_client_server() != 0)   return 1;
+  if (test_wget_pcre2_regex() != 0)    return 1;
   emit("M32-NET: done\n");
   return 0;
 }

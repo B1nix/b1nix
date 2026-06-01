@@ -559,6 +559,7 @@ check_output "$LOG" "M32-NET: ok tcp6-loopback" "TCP over IPv6 (::1) echo round-
 check_output "$LOG" "M32-NET: ok tcp-echo" "TCP loopback client/server echo works through sockets"
 check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange works over TCP"
 check_output "$LOG" "M32-NET: ok wget-loopback" "Wget HTTP client download works over TCP loopback"
+check_output "$LOG" "M32-NET: ok wget-pcre2-regex" "Wget --regex-type pcre filters a recursive fetch (PCRE2 \\d matcher: keeps yes-1, drops no-2)"
 if grep -q "M32-NET: unsupported curl-tls-suite" "$LOG" 2>/dev/null; then
 	pass "Curl TLS suite skipped (curl unavailable or built without HTTPS)"
 else
