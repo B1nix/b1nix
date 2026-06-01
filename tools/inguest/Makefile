@@ -120,11 +120,19 @@ SRCS := \
   kernel/dev/ioapic.c \
   kernel/lib/crypt.c \
   kernel/lib/sha512.c \
-  kernel/sched/bkl.c \
   kernel/sched/futex.c \
   kernel/sched/lockdep.c \
   kernel/sched/m28_ctxbench.c \
-  kernel/sched/smp_test.c
+  kernel/sched/m28_heapbench.c \
+  kernel/sched/smp_test.c \
+  kernel/arch/x86/coredump.c \
+  kernel/arch/x86/gdbstub.c \
+  kernel/fs/procfs.c \
+  kernel/fs/sysfs.c \
+  kernel/lib/ftrace.c \
+  kernel/lib/ftrace_demo.c \
+  kernel/lib/m35_diag.c \
+  kernel/lib/m36_diag.c
 
 # Objects mirror the source tree under $(OBJDIR) (parallel directories), so the
 # two pattern rules below map each .o back to its .c/.S source unambiguously.
