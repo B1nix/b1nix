@@ -1,6 +1,5 @@
 #include <b1nix/arch_x86.h>
 #include <b1nix/arch.h>
-#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
 #include <b1nix/ioapic.h>
@@ -382,19 +381,15 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   }
 }
 
-/* Interrupt entry from a userspace core acquires the Big Kernel Lock; a nested
- * interrupt on a core already holding it (e.g. a timer tick mid-syscall) just
- * recurses the depth. The matching release happens on the normal return; paths
- * that never return (a fatal signal terminating the task via
- * scheduler_exit_current) hand the depth-1 lock off across the context switch,
- * so skipping bkl_unlock there is correct.
+/* Interrupt entry runs BKL-free (M28 #7). The hot IPI/timer vectors are handled
+ * inline below; device IRQs and exceptions are each independently SMP-safe (see
+ * x86_irq_handler / x86_exception_handler).
  *
- * **TLB shootdown IPI (vector 65) is the one exception** — the initiator of
- * the shootdown holds the BKL and synchronously waits for every target to
- * ACK; if a target tried to acquire the BKL, the initiator would never
- * release it and the system deadlocks. The handler is trivial (invlpg +
- * atomic decrement + EOI), touches no BKL-protected state, and runs with
- * IRQs implicitly disabled at the LAPIC level, so skipping BKL here is safe.
+ * **TLB shootdown IPI (vector 65)** is dispatched before anything else: the
+ * initiator spins (IRQs off) waiting for every target to ACK, so the handler
+ * must run even while this CPU is deep in other kernel work. It is trivial
+ * (invlpg + atomic decrement + EOI) and runs with IRQs implicitly disabled at
+ * the LAPIC level.
  */
 void x86_irq_handler(struct interrupt_frame *frame) {
   if (frame->vector == 65) {
@@ -419,9 +414,15 @@ void x86_irq_handler(struct interrupt_frame *frame) {
     x86_irq_handler_inner(frame);
     return;
   }
-  bkl_lock();
+  /* M28 #7 (final teardown): device IRQs run WITHOUT the BKL. The hot vectors
+   * above already bypassed it; the remaining device handlers are each
+   * independently SMP-safe — the PS/2 keyboard ring is a release/acquire SPSC
+   * (kbd_push vs ps2_kbd_getc), the mouse event flag is an atomic exchange and
+   * its packet assembly is single-producer (a device IRQ is delivered to one
+   * CPU at a time and is not re-entrant), and the net handler serialises on its
+   * own net_rx_lock/net_tx_lock. A device IRQ touches no other cross-CPU state
+   * the BKL was protecting. This removes the last bkl_lock() call site. */
   x86_irq_handler_inner(frame);
-  bkl_unlock();
 }
 
 static void x86_exception_handler_inner(struct interrupt_frame *frame) {
@@ -560,14 +561,17 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   arch_halt();
 }
 
-/* Exception entry takes the Big Kernel Lock (recursively if the faulting CPU
- * already held it, e.g. a demand-paging fault while copying a user buffer
- * mid-syscall). Released on normal return; a fault that terminates the task
- * (scheduler_exit_current) hands the lock off across the context switch. */
+/* Exception entry runs WITHOUT the Big Kernel Lock (M28 #7, final teardown
+ * step). The two things an exception does are both independently SMP-safe now:
+ *  - demand paging / CoW / swap-in: vmm_handle_page_fault is self-locking under
+ *    vmm_lock (prepare-then-commit with a leaf re-validation), so concurrent
+ *    faults on different CPUs no longer race on the page tables / PMM;
+ *  - fatal faults: signal delivery (pending_signals atomics) and
+ *    scheduler_exit_current (stack_released lease) are already SMP-safe.
+ * The faulting task runs on its own CPU and kernel stack, so there is no
+ * cross-CPU state the BKL was protecting here. */
 void x86_exception_handler(struct interrupt_frame *frame) {
-  bkl_lock();
   x86_exception_handler_inner(frame);
-  bkl_unlock();
 }
 
 /* ── Stack Backtrace ──────────────────────────────────────────── */

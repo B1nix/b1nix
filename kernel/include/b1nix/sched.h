@@ -219,7 +219,6 @@ struct task {
    * `state = TASK_DEAD` (x86 TSO orders the stores). `arch_context_switch`
    * sets `*released_publish = 1` AFTER the RSP swap. `scheduler_waitpid`
    * spins on `stack_released == 1` after winning the CAS, before kfree. */
-  volatile u32 bkl_depth;
   volatile int stack_released;
 
   /* SMP runqueue linkage (must be last field for ABI compat) */
@@ -270,6 +269,10 @@ void smp_selftest_run(void);
 /* M28 #9 — ctx-switch + light-syscall rdtsc benchmark. Single-CPU only;
  * test mode only. See kernel/sched/m28_ctxbench.c for what's measured. */
 void m28_ctxbench_run(void);
+
+/* M28 #4 — SMP heap_lock contention benchmark (1 vs N cores hammering
+ * kmalloc/kfree). >1 CPU + test mode only. See kernel/sched/m28_heapbench.c. */
+void m28_heapbench_run(void);
 int scheduler_fork_current(void);
 
 /* M29: SYS_CLONE entry. Creates a new task that runs `entry(arg)` in ring 3
