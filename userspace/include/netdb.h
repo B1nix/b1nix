@@ -16,6 +16,13 @@ struct hostent {
 };
 #define h_addr h_addr_list[0]
 
+struct servent {
+  char *s_name;        /* official service name */
+  char **s_aliases;    /* alias list */
+  int s_port;          /* port number (network byte order) */
+  char *s_proto;       /* protocol to use */
+};
+
 struct addrinfo {
   int ai_flags;
   int ai_family;
@@ -59,6 +66,7 @@ struct addrinfo {
 extern int h_errno;
 
 struct hostent *gethostbyname(const char *name);
+struct servent *getservbyname(const char *name, const char *proto);
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res);
 void freeaddrinfo(struct addrinfo *res);

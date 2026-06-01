@@ -284,7 +284,8 @@ int getaddrinfo(const char *node, const char *service,
     return EAI_MEMORY;
   }
   memset(ai, 0, sizeof(*ai));
-  if (family == AF_INET6) {
+  int is_v6 = (family == AF_INET6) || (family == 0 && node && strchr(node, ':') != NULL);
+  if (is_v6) {
     unsigned char addr6[16];
     if (node && *node) {
       if (resolve_host6(node, addr6) != 0) {
@@ -385,4 +386,51 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
     serv[n] = '\0';
   }
   return 0;
+}
+
+struct servent *getservbyname(const char *name, const char *proto) {
+  static struct servent se;
+  static char *aliases[1] = {NULL};
+  static char s_name_buf[32];
+  static char s_proto_buf[16];
+
+  if (!name) return NULL;
+
+  int port = 0;
+  if (strcmp(name, "http") == 0) {
+    port = 80;
+  } else if (strcmp(name, "https") == 0) {
+    port = 443;
+  } else if (strcmp(name, "ftp") == 0) {
+    port = 21;
+  } else if (strcmp(name, "ssh") == 0) {
+    port = 22;
+  } else {
+    int p = 0;
+    const char *s = name;
+    while (*s >= '0' && *s <= '9') {
+      p = p * 10 + (*s - '0');
+      s++;
+    }
+    if (*s == '\0' && p > 0 && p <= 65535) {
+      port = p;
+    } else {
+      return NULL;
+    }
+  }
+
+  strncpy(s_name_buf, name, sizeof(s_name_buf) - 1);
+  s_name_buf[sizeof(s_name_buf) - 1] = '\0';
+  se.s_name = s_name_buf;
+  se.s_aliases = aliases;
+  se.s_port = htons((unsigned short)port);
+  if (proto) {
+    strncpy(s_proto_buf, proto, sizeof(s_proto_buf) - 1);
+    s_proto_buf[sizeof(s_proto_buf) - 1] = '\0';
+    se.s_proto = s_proto_buf;
+  } else {
+    se.s_proto = "tcp";
+  }
+
+  return &se;
 }

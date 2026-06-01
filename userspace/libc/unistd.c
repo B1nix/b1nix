@@ -338,6 +338,11 @@ int getsockopt(int sockfd, int level, int optname, void *optval,
     *optlen = sizeof(int);
     return 0;
   }
+  if (optname == SO_ERROR) {
+    *(int *)optval = 0;
+    *optlen = sizeof(int);
+    return 0;
+  }
   errno = ENOPROTOOPT;
   return -1;
 }
@@ -557,4 +562,18 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {
 
 pid_t setsid(void) {
   return _check_err(syscall(SYS_SETSID));
+}
+
+#include <syslog.h>
+void openlog(const char *ident, int option, int facility) {
+  (void)ident; (void)option; (void)facility;
+}
+void syslog(int priority, const char *format, ...) {
+  (void)priority; (void)format;
+}
+void closelog(void) {
+}
+int setlogmask(int mask) {
+  (void)mask;
+  return 0;
 }

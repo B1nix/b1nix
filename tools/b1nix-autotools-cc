@@ -15,7 +15,7 @@ TARGET="x86_64-unknown-elf"
 
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make -C "$USR" -s build/libb1nix.a build/crt/crt0.o
 
-COMMON_FLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix"
+COMMON_FLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -D__STDC_NO_ATOMICS__"
 
 compile_only=0
 preprocess_only=0
@@ -36,6 +36,10 @@ while [ $# -gt 0 ]; do
     -o)
       shift
       output="$1"
+      ;;
+    -MT|-MF|-MQ|-isystem|-I|-L|-D|-U|-x)
+      args="$args $1 $2"
+      shift
       ;;
     *.c|*.S|*.s|*.o|*.a)
       inputs="$inputs $1"

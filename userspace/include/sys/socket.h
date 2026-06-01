@@ -74,6 +74,7 @@ struct sockaddr_un {
 #define SO_KEEPALIVE    9
 #define SO_REUSEADDR    2
 #define SO_TYPE         3
+#define SO_ERROR        4
 
 #define MSG_PEEK        0x02
 

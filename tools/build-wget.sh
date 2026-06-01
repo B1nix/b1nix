@@ -28,6 +28,14 @@ if [ ! -f "$PCRE2_PREFIX/lib/libpcre2-8.a" ]; then
   fi
 fi
 
+OPENSSL_PREFIX="$ROOT_DIR/build/openssl-b1nix/install"
+if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ]; then
+  if ! "$ROOT_DIR/tools/build-openssl.sh" >/dev/null; then
+    echo "tools/build-wget.sh: OpenSSL build failed" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$ROOT_DIR/build/wget-src" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -88,17 +96,19 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
   "$SRC_DIR/configure" \
     --host=x86_64-b1nix \
     --disable-shared --enable-static \
-    --without-ssl \
+    --with-ssl=openssl \
     --without-zlib \
     --disable-iri \
     --disable-pcre \
     --disable-threads \
     --disable-nls \
-    --disable-ipv6 \
+    --enable-ipv6 \
     --disable-ntlm \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
-    PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8"
+    PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \
+    OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include" \
+    OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib -lssl -lcrypto"
 )
 
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"

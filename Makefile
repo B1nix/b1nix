@@ -384,7 +384,11 @@ $(INITRAMFS_CURL_INC): $(CURL_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_curl_elf $(CURL_ELF) > $@
 
-$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+OPENSSL_LIB := build/openssl-b1nix/install/lib/libssl.a
+$(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+	tools/build-openssl.sh >/dev/null
+
+$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)

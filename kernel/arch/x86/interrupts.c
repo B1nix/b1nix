@@ -482,6 +482,29 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
 
   arch_backtrace(frame->rbp, frame->rip);
 
+  if (frame->cs == 0x1B || frame->cs == 0x23) {
+    console_write("\nuserspace stack dump (rsp=0x");
+    console_write_hex64(frame->rsp);
+    console_write("):");
+    extern int syscall_copyin(void *dst, const void *user_src, unsigned long size);
+    for (int i = 0; i < 32; i++) {
+      u64 val = 0;
+      if (syscall_copyin(&val, (void *)(frame->rsp + i * 8), 8) == 0) {
+        console_write("\n  +0x");
+        console_write_hex64(i * 8);
+        console_write(": 0x");
+        console_write_hex64(val);
+        if (val >= 0x2000000ULL && val <= 0x3000000ULL) {
+          console_write(" (code?)");
+        }
+      } else {
+        console_write("\n  (invalid page)");
+        break;
+      }
+    }
+    console_write("\n");
+  }
+
   /* If exception happened in userspace (CS == 0x1B), send signal instead of
    * panic */
   if (frame->cs == 0x1B || frame->cs == 0x23) {
@@ -600,10 +623,10 @@ void x86_exception_handler(struct interrupt_frame *frame) {
 #define MAX_BACKTRACE_FRAMES 32
 
 static int addr_is_kernel_text(u64 addr) {
-  /* Kernel .text is identity-mapped in the 0x100000-0x200000 range
-     (the linker starts at 1M, and the kernel is a few hundred KB).
-     Also accept higher-half direct-map addresses. */
+  /* Kernel .text is identity-mapped in the 0x100000-0x200000 range.
+     Also accept userspace addresses (0x2000000-0x3000000) for backtrace mapping. */
   return (addr >= 0x100000ULL && addr <= 0x200000ULL) ||
+         (addr >= 0x2000000ULL && addr <= 0x3000000ULL) ||
          (addr >= 0xffff800000000000ULL && addr <= 0xffff800100000000ULL);
 }
 

@@ -14,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <signal.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -973,6 +974,243 @@ static int test_wget_pcre2_regex(void) {
   return 0;
 }
 
+static int run_server6_http(unsigned short port) {
+  int lfd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (lfd < 0) return 1;
+  struct sockaddr_in6 a;
+  memset(&a, 0, sizeof(a));
+  a.sin6_family = AF_INET6;
+  a.sin6_port = htons(port);
+  a.sin6_addr = in6addr_loopback;
+  if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(lfd, 1) < 0) {
+    close(lfd);
+    return 2;
+  }
+  int cfd = accept(lfd, 0, 0);
+  if (cfd < 0) {
+    close(lfd);
+    return 3;
+  }
+  char buf[256];
+  int n = recv_with_retry(cfd, buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    close(cfd);
+    close(lfd);
+    return 4;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "GET /wget-v6-test")) {
+    close(cfd);
+    close(lfd);
+    return 5;
+  }
+  const char *resp = "HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\nwget6-ok";
+  send(cfd, resp, strlen(resp), 0);
+  close(cfd);
+  close(lfd);
+  return 0;
+}
+
+static int test_wget_ipv6(void) {
+  unsigned short port = 3267;
+  int pid = fork();
+  if (pid < 0) { fail("wget-ipv6"); return -1; }
+  if (pid == 0) _exit(run_server6_http(port));
+
+  sleep(1);
+  int wpid = fork();
+  if (wpid < 0) { fail("wget-ipv6"); return -1; }
+  if (wpid == 0) {
+    char *argv[] = {"/bin/wget", "-t", "1", "-o", "/tmp/wget6.log", "-O", "/tmp/wget6.out", "http://[::1]:3267/wget-v6-test", NULL};
+    char *envp[] = {NULL};
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  int wst = 0;
+  waitpid(wpid, &wst, 0);
+  
+  int sst = 0;
+  waitpid(pid, &sst, 0);
+
+  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+    int lf = open("/tmp/wget6.log", O_RDONLY);
+    if (lf >= 0) {
+      char lb[1024];
+      int nr;
+      emit("--- wget ipv6 log start ---\n");
+      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
+      emit("--- wget ipv6 log end ---\n");
+      close(lf);
+    }
+    unlink("/tmp/wget6.log");
+    fail("wget-ipv6");
+    return -1;
+  }
+
+  int fd = open("/tmp/wget6.out", O_RDONLY);
+  if (fd < 0) {
+    fail("wget-ipv6");
+    return -1;
+  }
+  char buf[32];
+  int r = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  unlink("/tmp/wget6.out");
+  unlink("/tmp/wget6.log");
+  if (r != 8 || memcmp(buf, "wget6-ok", 8) != 0) {
+    fail("wget-ipv6");
+    return -1;
+  }
+  ok("wget-ipv6");
+  return 0;
+}
+
+static int test_wget_https(void) {
+  const int max_wait_sec = 20;
+  int tls_srv = fork();
+  if (tls_srv < 0) {
+    fail("wget-https-handshake");
+    return -1;
+  }
+  if (tls_srv == 0) {
+    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4445", NULL};
+    char *srv_envp[] = {NULL};
+    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    _exit(127);
+  }
+  sleep(1);
+  int wpid = fork();
+  if (wpid < 0) {
+    fail("wget-https-handshake");
+    return -1;
+  }
+  if (wpid == 0) {
+    char *argv[] = {
+      "/bin/wget", "--ca-certificate=/etc/tls-test/ca.pem",
+      "--random-file=/etc/tls-test/ca.pem",
+      "-t", "1", "-T", "5", "-o", "/tmp/wget.https.log", "-O", "/tmp/wget.https.out",
+      "https://127.0.0.1:4445/", NULL
+    };
+    char *envp[] = {NULL};
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  int wst = 0, sst = 0;
+  int waited = 0;
+  while (waited < max_wait_sec) {
+    int wr = waitpid(wpid, &wst, WNOHANG);
+    int sr = waitpid(tls_srv, &sst, WNOHANG);
+    if (wr == wpid && sr == tls_srv) break;
+    sleep(1);
+    waited++;
+  }
+  if (waited >= max_wait_sec) {
+    emit("--- wget https timeout ---\n");
+    kill(wpid, SIGTERM);
+    kill(tls_srv, SIGTERM);
+    waitpid(wpid, &wst, 0);
+    waitpid(tls_srv, &sst, 0);
+  } else {
+    if (waitpid(wpid, &wst, WNOHANG) == 0) waitpid(wpid, &wst, 0);
+    if (waitpid(tls_srv, &sst, WNOHANG) == 0) waitpid(tls_srv, &sst, 0);
+  }
+  
+  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+    char stbuf[128];
+    snprintf(stbuf, sizeof(stbuf),
+             "wget https status: wst=0x%x sst=0x%x waited=%d\n",
+             wst, sst, waited);
+    emit(stbuf);
+    int lf = open("/tmp/wget.https.log", O_RDONLY);
+    if (lf >= 0) {
+      char lb[1024];
+      int nr;
+      emit("--- wget https log start ---\n");
+      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
+      emit("--- wget https log end ---\n");
+      close(lf);
+    }
+    unlink("/tmp/wget.https.log");
+    fail("wget-https-handshake");
+    return -1;
+  }
+  int fd = open("/tmp/wget.https.out", O_RDONLY);
+  if (fd < 0) {
+    fail("wget-https-handshake");
+    return -1;
+  }
+  char buf[64];
+  int n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  unlink("/tmp/wget.https.out");
+  unlink("/tmp/wget.https.log");
+  if (n <= 0) {
+    fail("wget-https-handshake");
+    return -1;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "tls-loopback-ok")) {
+    fail("wget-https-handshake");
+    return -1;
+  }
+  ok("wget-https-handshake");
+
+  tls_srv = fork();
+  if (tls_srv < 0) {
+    fail("wget-https-selfsigned-reject");
+    return -1;
+  }
+  if (tls_srv == 0) {
+    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4446", NULL};
+    char *srv_envp[] = {NULL};
+    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    _exit(127);
+  }
+  sleep(1);
+  wpid = fork();
+  if (wpid < 0) {
+    fail("wget-https-selfsigned-reject");
+    return -1;
+  }
+  if (wpid == 0) {
+    char *argv[] = {
+      "/bin/wget", "--random-file=/etc/tls-test/ca.pem",
+      "-t", "1", "-T", "5", "-o", "/tmp/wget.https.bad.log", "-O", "/tmp/wget.https.bad.out",
+      "https://127.0.0.1:4446/", NULL
+    };
+    char *envp[] = {NULL};
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  waited = 0;
+  while (waited < max_wait_sec) {
+    int wr = waitpid(wpid, &wst, WNOHANG);
+    int sr = waitpid(tls_srv, &sst, WNOHANG);
+    if (wr == wpid && sr == tls_srv) break;
+    sleep(1);
+    waited++;
+  }
+  if (waited >= max_wait_sec) {
+    emit("--- wget https selfsigned timeout ---\n");
+    kill(wpid, SIGTERM);
+    kill(tls_srv, SIGTERM);
+    waitpid(wpid, &wst, 0);
+    waitpid(tls_srv, &sst, 0);
+  } else {
+    if (waitpid(wpid, &wst, WNOHANG) == 0) waitpid(wpid, &wst, 0);
+    if (waitpid(tls_srv, &sst, WNOHANG) == 0) waitpid(tls_srv, &sst, 0);
+  }
+  unlink("/tmp/wget.https.bad.out");
+  unlink("/tmp/wget.https.bad.log");
+  
+  if (!WIFEXITED(wst) || WEXITSTATUS(wst) == 0) {
+    fail("wget-https-selfsigned-reject");
+    return -1;
+  }
+  ok("wget-https-selfsigned-reject");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   test_external_net();
@@ -986,6 +1224,8 @@ int main(void) {
   if (test_tcp6_loopback() != 0)       return 1;
   if (test_tcp_client_server() != 0)   return 1;
   if (test_wget_pcre2_regex() != 0)    return 1;
+  if (test_wget_ipv6() != 0)           return 1;
+  if (test_wget_https() != 0)          return 1;
   emit("M32-NET: done\n");
   return 0;
 }
