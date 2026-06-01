@@ -46,6 +46,11 @@ static int ipv4_is_broadcast(struct ipv4_addr ip)
 	       ip.bytes[2] == 255 && ip.bytes[3] == 255;
 }
 
+static int ipv4_is_loopback(struct ipv4_addr ip)
+{
+	return ip.bytes[0] == 127;
+}
+
 void ipv4_receive(const void *data, usize size)
 {
 	if (size < sizeof(struct ipv4_header)) return;
@@ -63,7 +68,8 @@ void ipv4_receive(const void *data, usize size)
 	if ((frag & 0x3fff) != 0) return;
 
 	struct ipv4_addr local = net_get_ip();
-	if (!ipv4_is_broadcast(hdr->dst) && memcmp(hdr->dst.bytes, local.bytes, 4) != 0) {
+	if (!ipv4_is_broadcast(hdr->dst) && !ipv4_is_loopback(hdr->dst) &&
+	    memcmp(hdr->dst.bytes, local.bytes, 4) != 0) {
 		return;
 	}
 
@@ -97,12 +103,21 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 	hdr->protocol = protocol;
 	hdr->src = net_get_ip();
 	hdr->dst = dst;
+	if (ipv4_is_loopback(dst)) {
+		hdr->src = dst;
+	}
 	hdr->checksum = 0;
 
 	u16 csum = ipv4_checksum((const u8 *)hdr, sizeof(struct ipv4_header));
 	hdr->checksum = bswap16(csum);
 
 	memcpy(buffer + sizeof(struct ipv4_header), payload, size);
+
+	if (ipv4_is_loopback(dst)) {
+		ipv4_receive(buffer, total_size);
+		kfree(buffer);
+		return;
+	}
 
 	struct mac_addr dst_mac;
 	
