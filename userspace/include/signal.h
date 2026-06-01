@@ -12,6 +12,7 @@ extern "C" {
 #define SIGPIPE 13
 #define SIGSEGV 11
 #define SIGTERM 15
+#define NSIG    64
 
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
@@ -27,11 +28,7 @@ typedef int sig_atomic_t;
 
 int kill(int pid, int sig);
 
-#include <syscall.h>
-static inline int raise(int sig) {
-    int pid = (int)_syscall_raw(SYS_GETPID, 0, 0, 0, 0, 0, 0);
-    return kill(pid, sig);
-}
+int raise(int sig);
 
 #define SIG_DFL ((void (*)(int))0)
 #define SIG_IGN ((void (*)(int))1)

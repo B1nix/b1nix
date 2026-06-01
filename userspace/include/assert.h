@@ -1,11 +1,14 @@
-#ifndef B1NIX_U_ASSERT_H
-#define B1NIX_U_ASSERT_H
+#undef assert
 
 #ifdef NDEBUG
 #define assert(ignore) ((void)0)
 #else
-void _exit(int status) __attribute__((noreturn));
-#define assert(expr) ((expr) ? (void)0 : _exit(139))
+#ifdef __cplusplus
+extern "C" {
 #endif
-
+void _exit(int status) __attribute__((noreturn));
+#ifdef __cplusplus
+}
+#endif
+#define assert(expr) ((expr) ? (void)0 : _exit(139))
 #endif

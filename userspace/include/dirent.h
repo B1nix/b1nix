@@ -14,5 +14,10 @@ DIR *opendir(const char *name);
 struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
 int dirfd(DIR *dirp);
+void rewinddir(DIR *dirp);
+
+#ifndef HAVE_REWINDDIR
+#define HAVE_REWINDDIR 1
+#endif
 
 #endif

@@ -294,5 +294,49 @@ size_t strspn(const char *s, const char *accept) {
     return p - s;
 }
 
+#include <wchar.h>
+
+wchar_t *wmemcpy(wchar_t *dest, const wchar_t *src, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		dest[i] = src[i];
+	}
+	return dest;
+}
+
+wchar_t *wmemmove(wchar_t *dest, const wchar_t *src, size_t n) {
+	if (dest < src) {
+		for (size_t i = 0; i < n; i++) dest[i] = src[i];
+	} else {
+		for (size_t i = n; i > 0; i--) dest[i - 1] = src[i - 1];
+	}
+	return dest;
+}
+
+wchar_t *wmemset(wchar_t *s, wchar_t c, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		s[i] = c;
+	}
+	return s;
+}
+
+size_t wcslen(const wchar_t *s) {
+	size_t n = 0;
+	while (s[n]) n++;
+	return n;
+}
+
+wchar_t *wcscat(wchar_t *dest, const wchar_t *src) {
+	wchar_t *d = dest;
+	while (*d) d++;
+	while ((*d++ = *src++));
+	return dest;
+}
+
+wchar_t *wcscpy(wchar_t *dest, const wchar_t *src) {
+	wchar_t *d = dest;
+	while ((*d++ = *src++));
+	return dest;
+}
+
 
 

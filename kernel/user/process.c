@@ -1038,6 +1038,11 @@ int user_execve_current(const char *path, const char **argv,
     }
   }
 
+  if (current_task->name) {
+    kfree((void *)current_task->name);
+  }
+  current_task->name = strdup(path);
+
   if (current_task->user_image) {
     user_image_free(current_task->user_image);
   }

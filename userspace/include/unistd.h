@@ -4,10 +4,12 @@
 #include <stddef.h>
 #include <sys/types.h>
 
+#define _PC_NAME_MAX 3
 #define _PC_PATH_MAX 4
 static inline long pathconf(const char *path, int name) {
     (void)path;
     if (name == _PC_PATH_MAX) return 4096;
+    if (name == _PC_NAME_MAX) return 255;
     return -1;
 }
 
@@ -24,6 +26,7 @@ void _exit(int status) __attribute__((noreturn));
 int sleep(unsigned int seconds);
 int open(const char *path, int flags, ...);
 int unlink(const char *pathname);
+int link(const char *oldpath, const char *newpath);
 int rmdir(const char *pathname);
 long lseek(int fd, long offset, int whence);
 int execvp(const char *file, char *const argv[]);
@@ -75,6 +78,27 @@ int statfs(const char *path, struct statfs *buf);
 
 int setuid(unsigned short uid);
 int setgid(unsigned short gid);
+int seteuid(uid_t uid);
+int setegid(gid_t gid);
+uid_t getuid(void);
+uid_t geteuid(void);
+gid_t getgid(void);
+gid_t getegid(void);
+int setpgid(pid_t pid, pid_t pgid);
+pid_t getpgrp(void);
+pid_t tcgetpgrp(int fd);
+int tcsetpgrp(int fd, pid_t pgrp);
+pid_t setsid(void);
+int execve(const char *pathname, char *const argv[], char *const envp[]);
+int getgroups(int size, gid_t list[]);
+#include <sys/select.h>
+
+#ifndef HAVE_SETEUID
+#define HAVE_SETEUID 1
+#endif
+#ifndef HAVE_SETEGID
+#define HAVE_SETEGID 1
+#endif
 
 #include <syscall.h>
 

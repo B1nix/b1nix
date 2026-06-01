@@ -9,6 +9,8 @@ extern "C" {
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
+#define MB_CUR_MAX 1
+#define RAND_MAX 32767
 
 typedef struct {
     int quot;
@@ -48,6 +50,9 @@ int sem_destroy(int *sem);
 #define B1NIX_WCHAR_T_DEFINED
 typedef int wchar_t;
 #endif
+
+int wctomb(char *s, wchar_t wc);
+int mbtowc(wchar_t *pwc, const char *s, size_t n);
 
 static inline size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
     size_t i;
@@ -133,6 +138,8 @@ static inline char *mktemp(char *tmpl) {
     }
     return tmpl;
 }
+
+const char *getprogname(void);
 
 #ifdef __cplusplus
 }

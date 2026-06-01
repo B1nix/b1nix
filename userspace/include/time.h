@@ -38,6 +38,10 @@ struct tm {
 
 time_t time(time_t *tloc);
 int gettimeofday(struct timeval *tv, struct timezone *tz);
+void tzset(void);
+extern char *tzname[2];
+extern long timezone;
+extern int daylight;
 
 #ifndef __cplusplus
 struct tm *localtime(const time_t *timep);

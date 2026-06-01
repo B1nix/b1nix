@@ -67,6 +67,8 @@ static inline int isxdigit(int c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+int isblank(int c);
+
 static inline int tolower(int c) {
     return (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
 }

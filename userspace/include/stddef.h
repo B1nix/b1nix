@@ -18,6 +18,11 @@ typedef struct {
 } max_align_t;
 #endif
 
+#ifndef B1NIX_WCHAR_T_DEFINED
+#define B1NIX_WCHAR_T_DEFINED
+typedef int wchar_t;
+#endif
+
 #define offsetof(type, member) __builtin_offsetof(type, member)
 
 #endif

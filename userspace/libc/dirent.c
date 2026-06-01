@@ -90,3 +90,13 @@ int dirfd(DIR *dirp)
 {
     return dirp ? dirp->fd : -1;
 }
+
+void rewinddir(DIR *dirp)
+{
+    if (!dirp)
+        return;
+    lseek(dirp->fd, 0, 0);
+    dirp->count = 0;
+    dirp->index = 0;
+    dirp->eof = 0;
+}

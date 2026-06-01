@@ -953,3 +953,34 @@ __attribute__((weak)) void __register_frame_info(const void *begin, void *ob) {
 	(void)ob;
 }
 
+const char *getprogname(void) {
+	return "wget";
+}
+
+int raise(int sig) {
+	int pid = (int)syscall(SYS_GETPID);
+	return (int)syscall(SYS_KILL, pid, sig);
+}
+
+int wctomb(char *s, wchar_t wc) {
+	if (!s) return 0;
+	if (wc < 0 || wc > 255) return -1;
+	s[0] = (char)wc;
+	return 1;
+}
+
+int mbtowc(wchar_t *pwc, const char *s, size_t n) {
+	if (!s) return 0;
+	if (n == 0) return -1;
+	if (pwc) *pwc = (wchar_t)(unsigned char)s[0];
+	return s[0] == '\0' ? 0 : 1;
+}
+
+char *tzname[2] = { (char *)"UTC", (char *)"UTC" };
+long timezone = 0;
+int daylight = 0;
+
+void tzset(void) {
+	/* Dummy */
+}
+

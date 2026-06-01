@@ -378,9 +378,9 @@ static struct task *pick_next_task(void) {
 static void wake_sleepers(void) {
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
-    /* F4 (M28 #7): atomic CAS SLEEPING -> READY so only one CPU wins when
+    /* F4 (M28 #7): atomic CAS SLEEPING/BLOCKED -> READY so only one CPU wins when
      * two timer ticks (or a tick + an explicit wake) race for the same
-     * sleeper. */
+     * task. */
     if (T(i)->wake_tick != 0 && T(i)->wake_tick <= scheduler_ticks) {
       enum task_state expected = TASK_SLEEPING;
       if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
@@ -389,6 +389,16 @@ static void wake_sleepers(void) {
         T(i)->wake_tick = 0;
         sched_rq_enqueue_current(T(i));
         woken++;
+      } else {
+        expected = TASK_BLOCKED;
+        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                        0, __ATOMIC_ACQUIRE,
+                                        __ATOMIC_RELAXED)) {
+          T(i)->wake_tick = 0;
+          T(i)->wait_chan = 0;
+          sched_rq_enqueue_current(T(i));
+          woken++;
+        }
       }
     }
   }

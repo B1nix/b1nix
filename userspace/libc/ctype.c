@@ -38,3 +38,7 @@ const char _ctype_[257] = {
 
     /* 0x80-0xFF : non-ASCII, unclassified — remaining entries are zero. */
 };
+
+int isblank(int c) {
+    return (c == ' ' || c == '\t');
+}
