@@ -357,6 +357,12 @@ int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
   return 0;
 }
 
+int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
+                           const struct timespec *abstime) {
+  (void)abstime;
+  return pthread_cond_wait(c, m);
+}
+
 /* ── Once ── */
 
 int pthread_once(pthread_once_t *once, void (*init_routine)(void)) {

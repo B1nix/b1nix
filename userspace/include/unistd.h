@@ -87,6 +87,7 @@ static inline int chmod(const char *path, unsigned int mode) {
 }
 
 int fchmod(int fd, unsigned int mode);
+int ftruncate(int fd, off_t length);
 
 static inline int dup(int oldfd) {
     static int next_fd = 100;

@@ -8,10 +8,6 @@
 extern "C" {
 #endif
 
-struct in_addr {
-  unsigned int s_addr; /* network byte order */
-};
-
 /* x86_64 is little-endian, so host<->network is a byte swap. */
 static inline uint16_t htons(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
 static inline uint16_t ntohs(uint16_t x) { return htons(x); }

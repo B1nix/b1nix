@@ -9,7 +9,10 @@ extern "C" {
 
 int snprintf(char *s, size_t n, const char *format, ...);
 
+#ifndef B1NIX_TIME_T_DEFINED
+#define B1NIX_TIME_T_DEFINED
 typedef long time_t;
+#endif
 
 struct timeval {
     time_t tv_sec;

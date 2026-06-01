@@ -15,10 +15,17 @@ struct sockaddr {
   char sa_data[14];
 };
 
+#ifndef B1NIX_IN_ADDR_DEFINED
+#define B1NIX_IN_ADDR_DEFINED
+struct in_addr {
+  unsigned int s_addr; /* network byte order */
+};
+#endif
+
 struct sockaddr_in {
   sa_family_t sin_family;
   unsigned short sin_port;
-  unsigned int sin_addr;
+  struct in_addr sin_addr;
   unsigned char sin_zero[8];
 };
 
@@ -31,8 +38,19 @@ struct sockaddr_un {
 #define AF_LOCAL        AF_UNIX
 #define AF_INET         2
 
+#define PF_UNIX         AF_UNIX
+#define PF_LOCAL        AF_LOCAL
+#define PF_INET         AF_INET
+
 #define SOCK_STREAM     1
 #define SOCK_DGRAM      2
+
+#define IPPROTO_IP      0
+#define IPPROTO_TCP     6
+#define IPPROTO_UDP     17
+
+#define SOL_SOCKET      1
+#define SO_KEEPALIVE    9
 
 int socket(int domain, int type, int protocol);
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
@@ -41,6 +59,8 @@ int listen(int sockfd, int backlog);
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
 ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
+int setsockopt(int sockfd, int level, int optname, const void *optval,
+               socklen_t optlen);
 
 #ifdef __cplusplus
 }

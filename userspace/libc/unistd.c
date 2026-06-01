@@ -146,6 +146,15 @@ int fsync(int fd) { return _check_err(syscall(SYS_FSYNC, fd)); }
 
 void sync(void) { syscall(SYS_SYNC); }
 
+int fcntl(int fd, int cmd, ...) {
+  long arg = 0;
+  va_list ap;
+  va_start(ap, cmd);
+  arg = va_arg(ap, long);
+  va_end(ap);
+  return _check_err(syscall(SYS_FCNTL, fd, cmd, arg));
+}
+
 time_t time(time_t *tloc) {
   time_t t = (time_t)syscall(SYS_TIME);
   if (tloc)
@@ -281,6 +290,16 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
   return (ssize_t)rc;
 }
 
+int setsockopt(int sockfd, int level, int optname, const void *optval,
+               socklen_t optlen) {
+  (void)sockfd;
+  (void)level;
+  (void)optname;
+  (void)optval;
+  (void)optlen;
+  return 0;
+}
+
 int listen(int fd, int backlog) {
   return _check_err(syscall(SYS_LISTEN, fd, backlog));
 }
@@ -326,6 +345,11 @@ unsigned int alarm(unsigned int seconds) {
 
 int fchmod(int fd, mode_t mode) {
   return _check_err(syscall(SYS_FCHMOD, fd, mode));
+}
+
+int ftruncate(int fd, off_t length) {
+  (void)fd;
+  return length == 0 ? 0 : -1;
 }
 
 #include <utime.h>

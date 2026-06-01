@@ -14,6 +14,7 @@ extern "C" {
 #define O_TRUNC     0x0200
 #define O_APPEND    0x0400
 #define O_CLOEXEC   0x0800
+#define O_NONBLOCK  0x4000
 #define O_DIRECTORY 0x10000
 #define O_BINARY    0
 
@@ -40,23 +41,7 @@ struct flock {
 	int   l_pid;
 };
 
-#include <syscall.h>
-#include <stdarg.h>
-
-static inline int fcntl(int fd, int cmd, ...) {
-    long arg = 0;
-    va_list ap;
-    va_start(ap, cmd);
-    arg = va_arg(ap, long);
-    va_end(ap);
-    long rc = syscall(SYS_FCNTL, fd, cmd, arg);
-    if (rc < 0) {
-        extern int errno;
-        errno = (int)(-rc);
-        return -1;
-    }
-    return (int)rc;
-}
+int fcntl(int fd, int cmd, ...);
 
 #ifdef __cplusplus
 }

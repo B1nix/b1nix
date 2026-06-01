@@ -17,6 +17,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <time.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -89,6 +90,8 @@ int pthread_cond_destroy(pthread_cond_t *c);
 int pthread_cond_signal(pthread_cond_t *c);
 int pthread_cond_broadcast(pthread_cond_t *c);
 int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m);
+int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
+                           const struct timespec *abstime);
 
 /* ── Once ── */
 int pthread_once(pthread_once_t *once, void (*init_routine)(void));

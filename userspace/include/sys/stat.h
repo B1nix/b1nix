@@ -40,10 +40,4 @@
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
-static inline int fchmod(int fd, mode_t mode) {
-    (void)fd;
-    (void)mode;
-    return 0;
-}
-
 #endif

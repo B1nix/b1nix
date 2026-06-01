@@ -176,8 +176,8 @@ int getaddrinfo(const char *node, const char *service,
 
   sa->sin_family = AF_INET;
   sa->sin_port = htons(port);
-  sa->sin_addr = (unsigned int)addr[0] | ((unsigned int)addr[1] << 8) |
-                 ((unsigned int)addr[2] << 16) | ((unsigned int)addr[3] << 24);
+  sa->sin_addr.s_addr = (unsigned int)addr[0] | ((unsigned int)addr[1] << 8) |
+                        ((unsigned int)addr[2] << 16) | ((unsigned int)addr[3] << 24);
 
   ai->ai_family = AF_INET;
   ai->ai_socktype = socktype ? socktype : SOCK_STREAM;

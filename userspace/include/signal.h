@@ -9,6 +9,7 @@ extern "C" {
 #define SIGABRT 6
 #define SIGBUS  7
 #define SIGFPE  8
+#define SIGPIPE 13
 #define SIGSEGV 11
 #define SIGTERM 15
 
