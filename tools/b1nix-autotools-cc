@@ -1,0 +1,76 @@
+#!/bin/sh
+# Cross-compiler wrapper for autotools-style userspace ports.
+
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+USR="$PROJECT_DIR/userspace"
+INCLUDE="$USR/include"
+LIB="$USR/build/libb1nix.a"
+CRT0="$USR/build/crt/crt0.o"
+LINKER="$USR/linker.ld"
+LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+TARGET="x86_64-unknown-elf"
+
+[ -f "$LIB" ] && [ -f "$CRT0" ] || make -C "$USR" -s build/libb1nix.a build/crt/crt0.o
+
+COMMON_FLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix"
+
+compile_only=0
+preprocess_only=0
+output=""
+args=""
+inputs=""
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c)
+      compile_only=1
+      ;;
+    -E)
+      preprocess_only=1
+      args="$args -E"
+      ;;
+    -o)
+      shift
+      output="$1"
+      ;;
+    *.c|*.S|*.s|*.o|*.a)
+      inputs="$inputs $1"
+      ;;
+    -l*|-L*)
+      ;;
+    *)
+      args="$args $1"
+      ;;
+  esac
+  shift
+done
+
+if [ "$preprocess_only" -eq 1 ]; then
+  exec clang $COMMON_FLAGS $args $inputs ${output:+-o "$output"}
+fi
+
+if [ "$compile_only" -eq 1 ]; then
+  exec clang $COMMON_FLAGS $args -c $inputs ${output:+-o "$output"}
+fi
+
+objs=""
+tmpdir="${TMPDIR:-/tmp}/b1nix-autotools-cc.$$"
+mkdir -p "$tmpdir"
+for input in $inputs; do
+  case "$input" in
+    *.o|*.a)
+      objs="$objs $input"
+      ;;
+    *)
+      obj="$tmpdir/$(basename "$input").o"
+      clang $COMMON_FLAGS $args -c "$input" -o "$obj"
+      objs="$objs $obj"
+      ;;
+  esac
+done
+
+[ -n "$output" ] || output="a.out"
+"$LD" -m elf_x86_64 -T "$LINKER" -o "$output" "$CRT0" $objs --whole-archive "$LIB" --no-whole-archive
