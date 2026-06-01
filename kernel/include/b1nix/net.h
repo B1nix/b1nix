@@ -37,10 +37,31 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
 void ipv4_receive(const void *data, usize size);
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size);
 
-// IPv6 (loopback datapath + ICMPv6 echo; ND/routing/real-link are TODO)
+// IPv6 datapath (loopback + real-link via NDP)
 void ipv6_receive(const void *data, usize size);
 void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload, usize size);
 u32 icmpv6_echo_reply_count(void);
+
+// IPv6 interface state
+struct in6_addr_k net_get_ip6_ll(void);
+struct in6_addr_k net_get_ip6(void);
+struct in6_addr_k net_get_gateway6(void);
+struct in6_addr_k net_get_prefix6(void);
+int net_get_prefix6_valid(void);
+void net_set_ip6(struct in6_addr_k a);
+void net_set_gateway6(struct in6_addr_k a);
+void net_set_prefix6(struct in6_addr_k p);
+
+// Neighbor Discovery + SLAAC (kernel/net/ndp.c)
+void ndp_init(void);
+void ndp_tick(u64 now_ticks);
+/* Handle an incoming ICMPv6 Neighbor Discovery message (RS/RA/NS/NA),
+ * dispatched from ipv6_receive for types 133-136. */
+void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
+                 const void *data, usize size);
+/* Resolve a link-local/on-link IPv6 address to a MAC. Returns 1 with *mac on a
+ * cache hit, otherwise sends a Neighbor Solicitation and returns 0 (retry). */
+int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac);
 /* UDP over IPv6 (loopback ::1 datapath). */
 void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
                const void *payload, usize size);
@@ -48,6 +69,8 @@ void udp6_receive(struct in6_addr_k src, const void *data, usize size);
 /* Offline self-test: ping ::1 through the loopback datapath and verify an
  * ICMPv6 echo reply comes back. Emits an M32-IP6 marker. */
 void ipv6_loopback_smoke(void);
+/* Real-link self-test: SLAAC + an ICMPv6 ping of the usernet IPv6 gateway. */
+void ipv6_realink_smoke(void);
 
 // ICMP
 void icmp_receive(struct ipv4_addr src, const void *data, usize size);

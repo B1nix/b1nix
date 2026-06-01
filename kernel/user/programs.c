@@ -3798,6 +3798,7 @@ static int init_main(int argc, const char **argv) {
   tcp_window_smoke_check();
   dns_smoke_check();
   ipv6_loopback_smoke();
+  ipv6_realink_smoke();
 
   /* M24b BKL proof: run several CPU-bound userspace processes at once so the
    * cooperative scheduler distributes them across the BSP and Application

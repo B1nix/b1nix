@@ -29,6 +29,14 @@ static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
 static struct ipv4_addr gateway_ip = { { 0, 0, 0, 0 } };
 
+/* IPv6 interface state: link-local is derived from the MAC at probe time; the
+ * global address / prefix / gateway are filled in by SLAAC (see ndp.c). */
+static struct in6_addr_k local_ip6_ll;       /* fe80::/64 link-local */
+static struct in6_addr_k local_ip6;          /* global (SLAAC), 0 until set */
+static struct in6_addr_k gateway_ip6;        /* router link-local */
+static struct in6_addr_k prefix6;            /* on-link /64 prefix */
+static int prefix6_valid;
+
 #define NET_MAX_ADAPTERS 8
 
 struct net_adapter {
@@ -44,6 +52,32 @@ struct ipv4_addr net_get_ip(void) { return local_ip; }
 struct ipv4_addr net_get_gateway(void) { return gateway_ip; }
 void net_set_ip(struct ipv4_addr ip) { local_ip = ip; }
 void net_set_gateway(struct ipv4_addr gw) { gateway_ip = gw; }
+
+struct in6_addr_k net_get_ip6_ll(void) { return local_ip6_ll; }
+struct in6_addr_k net_get_ip6(void) { return local_ip6; }
+struct in6_addr_k net_get_gateway6(void) { return gateway_ip6; }
+struct in6_addr_k net_get_prefix6(void) { return prefix6; }
+int net_get_prefix6_valid(void) { return prefix6_valid; }
+void net_set_ip6(struct in6_addr_k a) { local_ip6 = a; }
+void net_set_gateway6(struct in6_addr_k a) { gateway_ip6 = a; }
+void net_set_prefix6(struct in6_addr_k p) { prefix6 = p; prefix6_valid = 1; }
+
+/* Build the EUI-64 modified interface identifier from the 48-bit MAC and
+ * compose the fe80::/64 link-local address. */
+static void net_compute_link_local(void)
+{
+	memset(&local_ip6_ll, 0, sizeof(local_ip6_ll));
+	local_ip6_ll.bytes[0] = 0xfe;
+	local_ip6_ll.bytes[1] = 0x80;
+	local_ip6_ll.bytes[8] = local_mac.bytes[0] ^ 0x02; /* flip U/L bit */
+	local_ip6_ll.bytes[9] = local_mac.bytes[1];
+	local_ip6_ll.bytes[10] = local_mac.bytes[2];
+	local_ip6_ll.bytes[11] = 0xff;
+	local_ip6_ll.bytes[12] = 0xfe;
+	local_ip6_ll.bytes[13] = local_mac.bytes[3];
+	local_ip6_ll.bytes[14] = local_mac.bytes[4];
+	local_ip6_ll.bytes[15] = local_mac.bytes[5];
+}
 int net_is_ready(void) { return net_ready; }
 int net_get_irq(void) { return net_ready ? net_dev.irq : -1; }
 
@@ -254,6 +288,8 @@ static void virtio_net_probe(void)
 		local_mac.bytes[i] = val;
 	}
 
+	net_compute_link_local();
+
 	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
 
 	// Populate RX queue
@@ -293,6 +329,7 @@ static void net_task(void *arg)
 		net_poll();
 		dhcp_tick(scheduler_get_uptime_ticks());
 		ntp_tick(scheduler_get_uptime_ticks());
+		ndp_tick(scheduler_get_uptime_ticks());
 		if (local_ip.bytes[0] == 0) {
 			u64 now = scheduler_get_uptime_ticks();
 			if (now - last_dhcp_retry >= 300) {
@@ -323,6 +360,7 @@ void net_init(void)
 	console_write(", driver ");
 	console_write(net_ready ? "virtio-net\n" : "none\n");
 	arp_init();
+	ndp_init();
 	if (!net_ready) {
 		return;
 	}

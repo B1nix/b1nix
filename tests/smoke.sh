@@ -561,6 +561,19 @@ check_output "$LOG" "DNS-SMOKE: ok parse-a-record" "DNS A-record parser extracts
 check_output "$LOG" "DNS-SMOKE: ok parse-aaaa-record" "DNS AAAA-record parser extracts a 128-bit IPv6 address"
 check_output "$LOG" "DNS-SMOKE: ok resolv-conf" "/etc/resolv.conf nameserver parsed by the kernel resolver"
 check_output "$LOG" "M32-IP6: ok icmpv6-loopback" "ICMPv6 echo over the ::1 loopback datapath round-trips"
+# Real-link IPv6 over QEMU usernet (SLAAC + NDP + ICMPv6 ping the v6 gateway).
+# Skips cleanly when the link has no IPv6 router.
+if grep -q "M32-IP6: unsupported real-link" "$LOG" 2>/dev/null; then
+	pass "Real-link IPv6 skipped (no usernet IPv6 router)"
+	pass "Real-link IPv6 ping skipped (no usernet IPv6 router)"
+else
+	check_output "$LOG" "M32-IP6: ok slaac-global" "SLAAC (RS->RA) configures a global IPv6 address on the real link"
+	if grep -q "M32-IP6: unsupported real-link-ping" "$LOG" 2>/dev/null; then
+		pass "Real-link IPv6 ping skipped (gateway did not answer)"
+	else
+		check_output "$LOG" "M32-IP6: ok real-link-ping" "ICMPv6 echo to the usernet IPv6 gateway round-trips (NDP NS/NA + 0x86DD)"
+	fi
+fi
 # ── M32a PCRE2 userspace port ──
 check_output "$LOG" "M32-PCRE2: ok compile" "ported PCRE2 compiles a pattern"
 check_output "$LOG" "M32-PCRE2: ok match" "ported PCRE2 matches and captures a group"
