@@ -255,6 +255,7 @@ struct vfs_socket_state {
   int protocol;
   union {
     struct b1nix_sockaddr_in in;
+    struct b1nix_sockaddr_in6 in6;
     struct b1nix_sockaddr_un un;
   } local, peer;
   int bound;

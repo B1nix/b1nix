@@ -34,6 +34,7 @@
 #define B1NIX_AF_UNIX 1
 #define B1NIX_AF_LOCAL B1NIX_AF_UNIX
 #define B1NIX_AF_INET 2
+#define B1NIX_AF_INET6 10
 
 #define B1NIX_SOCK_STREAM 1
 #define B1NIX_SOCK_DGRAM 2
@@ -97,6 +98,18 @@ struct b1nix_sockaddr_in {
   u16 sin_port;
   u32 sin_addr;
   u8 sin_zero[8];
+};
+
+struct b1nix_in6_addr {
+  u8 s6_addr[16];
+};
+
+struct b1nix_sockaddr_in6 {
+  u16 sin6_family;
+  u16 sin6_port;
+  u32 sin6_flowinfo;
+  struct b1nix_in6_addr sin6_addr;
+  u32 sin6_scope_id;
 };
 
 struct b1nix_sockaddr_un {

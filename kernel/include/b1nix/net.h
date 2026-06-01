@@ -41,6 +41,10 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 void ipv6_receive(const void *data, usize size);
 void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload, usize size);
 u32 icmpv6_echo_reply_count(void);
+/* UDP over IPv6 (loopback ::1 datapath). */
+void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
+               const void *payload, usize size);
+void udp6_receive(struct in6_addr_k src, const void *data, usize size);
 /* Offline self-test: ping ::1 through the loopback datapath and verify an
  * ICMPv6 echo reply comes back. Emits an M32-IP6 marker. */
 void ipv6_loopback_smoke(void);

@@ -27,6 +27,19 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
     return unix_send(s, buf, len);
   }
 
+  if (s->domain == B1NIX_AF_INET6) {
+    if (s->type == B1NIX_SOCK_DGRAM) {
+      if (!s->connected && s->peer.in6.sin6_port == 0)
+        return -ENOTCONN;
+      struct in6_addr_k dst;
+      memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+      udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf, len);
+      return (isize)len;
+    }
+    /* TCP over IPv6 is not implemented yet. */
+    return -EAFNOSUPPORT;
+  }
+
   struct ipv4_addr dst_ip;
   dst_ip.bytes[0] = s->peer.in.sin_addr & 0xFF;
   dst_ip.bytes[1] = (s->peer.in.sin_addr >> 8) & 0xFF;
@@ -139,8 +152,8 @@ static int socket_close(struct vfs_handle *h) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s)
     return 0;
-  if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_DGRAM &&
-      s->bound) {
+  if ((s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6) &&
+      s->type == B1NIX_SOCK_DGRAM && s->bound) {
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
       if (udp_bindings[i].used && udp_bindings[i].handle == h) {
         udp_bindings[i].used = 0;
@@ -175,7 +188,8 @@ void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
 }
 
 int vfs_socket(int domain, int type, int protocol) {
-  if (domain != B1NIX_AF_INET && domain != B1NIX_AF_UNIX) return -EAFNOSUPPORT;
+  if (domain != B1NIX_AF_INET && domain != B1NIX_AF_INET6 &&
+      domain != B1NIX_AF_UNIX) return -EAFNOSUPPORT;
   if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM) return -ESOCKTNOSUPPORT;
   
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_SOCKET);
@@ -211,6 +225,29 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   if (s->domain == B1NIX_AF_UNIX) {
     if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
     return unix_bind(s, (const struct b1nix_sockaddr_un *)addr);
+  }
+
+  if (s->domain == B1NIX_AF_INET6) {
+    if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in6)) return -EINVAL;
+    s->local.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
+    s->bound = 1;
+    if (s->type == B1NIX_SOCK_DGRAM) {
+      u16 port = s->local.in6.sin6_port;
+      for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+        if (udp_bindings[i].used && udp_bindings[i].port == port)
+          return -EADDRINUSE;
+      }
+      for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+        if (!udp_bindings[i].used) {
+          udp_bindings[i].used = 1;
+          udp_bindings[i].port = port;
+          udp_bindings[i].handle = h;
+          return 0;
+        }
+      }
+      return -ENOBUFS;
+    }
+    return 0;
   }
 
   if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;
@@ -342,6 +379,17 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
   if (s->domain == B1NIX_AF_UNIX) {
     if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
     return unix_connect(s, (const struct b1nix_sockaddr_un *)addr);
+  }
+
+  if (s->domain == B1NIX_AF_INET6) {
+    if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in6)) return -EINVAL;
+    s->peer.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
+    s->connected = 0;
+    /* TCP over IPv6 is not implemented yet; datagram connect just records the
+     * default peer for subsequent send()s. */
+    if (s->type == B1NIX_SOCK_STREAM)
+      return -EAFNOSUPPORT;
+    return 0;
   }
 
   if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in)) return -EINVAL;

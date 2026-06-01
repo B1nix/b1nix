@@ -126,3 +126,62 @@ void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payl
 {
 	udp_send_net(dst, bswap16(src_port), bswap16(dst_port), payload, size);
 }
+
+/* UDP-over-IPv6 checksum: ones'-complement sum over the IPv6 pseudo-header
+ * (src, dst, 32-bit UDP length, next header 17) and the UDP datagram. */
+static u16 udp6_checksum(struct in6_addr_k src, struct in6_addr_k dst,
+                         const u8 *udp_pkt, usize udp_len)
+{
+	u32 sum = 0;
+	for (int i = 0; i < 16; i += 2)
+		sum += ((u16)src.bytes[i] << 8) | src.bytes[i + 1];
+	for (int i = 0; i < 16; i += 2)
+		sum += ((u16)dst.bytes[i] << 8) | dst.bytes[i + 1];
+	sum += (u16)(udp_len >> 16);
+	sum += (u16)(udp_len & 0xffff);
+	sum += 17; /* next header = UDP */
+	for (usize i = 0; i + 1 < udp_len; i += 2)
+		sum += ((u16)udp_pkt[i] << 8) | udp_pkt[i + 1];
+	if (udp_len & 1)
+		sum += (u16)udp_pkt[udp_len - 1] << 8;
+	while (sum >> 16)
+		sum = (sum & 0xFFFFu) + (sum >> 16);
+	u16 out = (u16)~sum;
+	return out ? out : 0xFFFFu;
+}
+
+void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
+               const void *payload, usize size)
+{
+	usize total_size = sizeof(struct udp_header) + size;
+	u8 *buffer = kzalloc(total_size);
+	if (!buffer) return;
+
+	struct udp_header *hdr = (struct udp_header *)buffer;
+	hdr->src_port = src_port_net;
+	hdr->dst_port = dst_port_net;
+	hdr->length = bswap16((u16)total_size);
+	hdr->checksum = 0;
+
+	memcpy(buffer + sizeof(struct udp_header), payload, size);
+	/* On the ::1 loopback path the source address equals the destination. */
+	hdr->checksum = bswap16(udp6_checksum(dst, dst, buffer, total_size));
+
+	ipv6_send(dst, 17 /* UDP */, buffer, total_size);
+	kfree(buffer);
+}
+
+void udp6_receive(struct in6_addr_k src, const void *data, usize size)
+{
+	(void)src;
+	if (size < sizeof(struct udp_header)) return;
+	const struct udp_header *hdr = data;
+
+	u16 length = bswap16(hdr->length);
+	if (length > size || length < sizeof(struct udp_header)) return;
+
+	const void *payload = (const u8 *)data + sizeof(struct udp_header);
+	usize payload_size = length - sizeof(struct udp_header);
+
+	vfs_socket_push_udp(hdr->dst_port, payload, payload_size);
+}

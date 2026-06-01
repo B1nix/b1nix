@@ -18,6 +18,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netdb.h>
+#include <netinet/in.h>
 #include <arpa/inet.h>
 #include "syscall.h"
 
@@ -590,12 +591,55 @@ static int test_tcp_client_server(void) {
   return 0;
 }
 
+/* UDP over IPv6 on the ::1 loopback: bind a receiver to [::1]:port, send a
+ * datagram from a second AF_INET6 socket, and read it back. Exercises the
+ * kernel AF_INET6 socket path + udp6 + the IPv6 ::1 datapath end to end. */
+static int test_udp6_loopback(void) {
+  int rx = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (rx < 0) { fail("udp6-socket"); return -1; }
+  struct sockaddr_in6 la;
+  memset(&la, 0, sizeof(la));
+  la.sin6_family = AF_INET6;
+  la.sin6_port = htons(6789);
+  la.sin6_addr = in6addr_loopback;
+  if (bind(rx, (struct sockaddr *)&la, sizeof(la)) < 0) {
+    fail("udp6-bind");
+    return -1;
+  }
+
+  int tx = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (tx < 0) { fail("udp6-tx-socket"); return -1; }
+  struct sockaddr_in6 pa;
+  memset(&pa, 0, sizeof(pa));
+  pa.sin6_family = AF_INET6;
+  pa.sin6_port = htons(6789);
+  pa.sin6_addr = in6addr_loopback;
+  if (connect(tx, (struct sockaddr *)&pa, sizeof(pa)) < 0) {
+    fail("udp6-connect");
+    return -1;
+  }
+
+  if (send(tx, "v6-dgram", 8, 0) != 8) { fail("udp6-send"); return -1; }
+
+  char buf[32];
+  int n = (int)recv(rx, buf, sizeof(buf), 0);
+  close(tx);
+  close(rx);
+  if (n != 8 || memcmp(buf, "v6-dgram", 8) != 0) {
+    fail("udp6-loopback");
+    return -1;
+  }
+  ok("udp6-loopback");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   if (test_select_timeout_zero() != 0) return 1;
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;
   if (test_dns_libc() != 0)            return 1;
+  if (test_udp6_loopback() != 0)       return 1;
   if (test_tcp_client_server() != 0)   return 1;
   emit("M32-NET: done\n");
   return 0;
