@@ -120,7 +120,6 @@ KERNEL_SOURCES := \
 	kernel/ipc/shm.c \
 	kernel/sched/uidgid.c \
 	kernel/sched/runqueue.c \
-	kernel/sched/bkl.c \
 	kernel/sched/lockdep.c \
 	kernel/sched/smp_test.c \
 	kernel/sched/m28_ctxbench.c \

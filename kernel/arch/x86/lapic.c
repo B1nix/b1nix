@@ -1,6 +1,5 @@
 #include <b1nix/arch.h>
 #include <b1nix/lapic.h>
-#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/io.h>
@@ -399,16 +398,10 @@ void ap_main(u32 cpu_id) {
     pcpu->cur_task = idle;       /* current_task = this AP's idle task */
     pcpu->sched_return_ctx = 0;
 
-    /* Keep the scheduler's BKL handoff invariant on APs too: a runnable
-     * userspace task may be a first-entry user_jump OR a resumed kernel-side
-     * syscall/exit continuation. The latter must not run without the BKL.
-     * Drop the lock before parking so idle APs don't block other CPUs. */
+    /* AP idle loop. BKL fully retired (M28 #7): no lock to hold across the
+     * context switch, so just yield and park when this AP has no work. */
     for (;;) {
-        if (!bkl_is_held_by_current_cpu()) {
-            bkl_lock();
-        }
         int switched = scheduler_yield();
-        bkl_unlock();
         if (!switched) {
             __asm__ volatile("sti; hlt" : : : "memory");
         }

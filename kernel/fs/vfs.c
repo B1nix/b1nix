@@ -2388,16 +2388,16 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
   usize count = 0;
   /* The sibling list (first_child / next_sibling) is NOT protected by the
    * inode rwlock — that lock guards inode data (size, timestamps, etc.).
-   * A concurrent unlink on another CPU or after a timer-tick preemption can
-   * splice a child out of the list, set child->deleted = 1, drop its ref,
-   * and free it while we are still walking — producing a #GP on
-   * child->deleted (same race that find_child closes with cli/sti).
-   * Disable interrupts for the duration of the walk: it is cheap (the list
-   * is at most a directory's entry count, typically < 256 entries) and
-   * prevents scheduler_yield() from giving another task the window to
-   * unlink+free a sibling we are about to dereference. */
-  u64 irq_flags;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
+   * A concurrent unlink can splice a child out of the list, set
+   * child->deleted = 1, drop its ref, and free it while we walk — a #GP on
+   * child->deleted. The bare cli/sti this used before only blocked SAME-CPU
+   * preemption; under SMP another core mutates the list in parallel. Take the
+   * vfs_tree_lock read side (the rwlock unlink holds for write over its
+   * splice), exactly like find_child. It is irqsave, so the old same-CPU
+   * guarantee is preserved too. Order: inode lock then tree lock, per the
+   * M28 DAG; the walk does not yield. */
+  u64 tflags;
+  vfs_tree_read_acquire(&tflags);
   struct vfs_node *child = dir->first_child;
   while (child && count < max_names) {
     if (!child->deleted) {
@@ -2405,7 +2405,7 @@ isize vfs_list(const char *dir_path, const char **names, usize max_names) {
     }
     child = child->next_sibling;
   }
-  __asm__ volatile("pushq %0; popfq" : : "r"(irq_flags) : "memory");
+  vfs_tree_read_release(tflags);
   vfs_inode_unlock_read(dir->inode);
   vfs_node_put(dir);
   return (isize)count;
@@ -3345,11 +3345,13 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
   }
   idx++;
 
-  /* Same race as vfs_list: sibling list is NOT protected by any inode lock.
-   * A concurrent unlink can free a child while we walk — use cli/sti like
-   * find_child does to take a consistent snapshot. */
-  u64 irq_flags;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(irq_flags) : : "memory");
+  /* Same race as vfs_list: the sibling list is NOT protected by any inode
+   * lock, and a concurrent unlink on another CPU can free a child mid-walk.
+   * The bare cli/sti this used before only blocked same-CPU preemption; take
+   * the vfs_tree_lock read side (held for write by unlink's splice) like
+   * find_child. irqsave, so the same-CPU snapshot guarantee is preserved. */
+  u64 tflags;
+  vfs_tree_read_acquire(&tflags);
   struct vfs_node *child = dir->first_child;
   while (child && count < max_entries) {
     if (child->deleted) {
@@ -3367,7 +3369,7 @@ isize vfs_getdents(int fd, struct dirent *buf, usize max_entries) {
     idx++;
     child = child->next_sibling;
   }
-  __asm__ volatile("pushq %0; popfq" : : "r"(irq_flags) : "memory");
+  vfs_tree_read_release(tflags);
 
   h->offset = start + count;
   res = (isize)count;
