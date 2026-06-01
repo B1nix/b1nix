@@ -44,6 +44,7 @@ BINARIES := \
 	$(BUILD)/bin/m31_setuid \
 	$(BUILD)/bin/m32_smoke \
 	$(BUILD)/bin/m34_smoke \
+	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m30_pie
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))

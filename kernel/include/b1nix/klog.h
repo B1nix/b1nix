@@ -26,6 +26,12 @@ usize klog_size(void);
 void klog_register_symbol(u64 address, const char *name);
 void panic_backtrace(void);
 
+/* kallsyms: resolve a kernel text address to "name"+offset (M35). Returns the
+ * symbol name (or NULL) and sets *off to the byte offset into it. ksym_print
+ * emits " <name+0xoff>" to console+serial when the address resolves. */
+const char *ksym_lookup(u64 addr, u64 *off);
+void ksym_print(u64 addr);
+
 /* Enhanced panic (defined in panic.h, implemented in klog.c) */
 void panic(const char *message) __attribute__((noreturn));
 

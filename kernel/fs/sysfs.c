@@ -67,11 +67,7 @@ static struct vfs_node *sysfs_mkchild(struct vfs_node *parent,
   }
   n->parent = parent;
   n->refcount++;
-  u64 fl;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
-  n->next_sibling = parent->first_child;
-  parent->first_child = n;
-  __asm__ volatile("pushq %0; popfq" : : "r"(fl) : "memory");
+  vfs_attach_child(parent, n);
   return n;
 }
 

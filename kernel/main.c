@@ -39,6 +39,8 @@ extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
+extern void m35_diag_run(void);
+extern void m36_diag_run(void);
 
 void kernel_main(u64 arg0, u64 arg1)
 {
@@ -179,6 +181,12 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	/* M28 #9: ctx-switch + light-syscall rdtsc baseline (single-CPU, test mode). */
 	m28_ctxbench_run();
+
+	/* M35: verify kallsyms symbolication resolves kernel addresses. */
+	m35_diag_run();
+
+	/* M36: verify the GDB serial-stub protocol engine and ftrace tracer. */
+	m36_diag_run();
 
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)
