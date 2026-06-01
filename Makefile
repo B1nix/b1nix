@@ -52,6 +52,14 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 
+# Lockdep-light (M28 #2): debug-only lock-order validator. Off by default
+# (zero cost — the LOCKDEP_* macros compile to no-ops). Enable with
+# `make ... LOCKDEP=1` to panic on a lock-order inversion / out-of-order
+# release against the DAG in docs/m28-locking.md. Never ship with it on.
+ifeq ($(LOCKDEP),1)
+CFLAGS_EXTRA += -DKERNEL_LOCKDEP=1
+endif
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-g \
@@ -123,6 +131,7 @@ KERNEL_SOURCES := \
 	kernel/sched/lockdep.c \
 	kernel/sched/smp_test.c \
 	kernel/sched/m28_ctxbench.c \
+	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \

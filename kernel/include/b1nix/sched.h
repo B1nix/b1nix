@@ -269,6 +269,10 @@ void smp_selftest_run(void);
 /* M28 #9 — ctx-switch + light-syscall rdtsc benchmark. Single-CPU only;
  * test mode only. See kernel/sched/m28_ctxbench.c for what's measured. */
 void m28_ctxbench_run(void);
+
+/* M28 #4 — SMP heap_lock contention benchmark (1 vs N cores hammering
+ * kmalloc/kfree). >1 CPU + test mode only. See kernel/sched/m28_heapbench.c. */
+void m28_heapbench_run(void);
 int scheduler_fork_current(void);
 
 /* M29: SYS_CLONE entry. Creates a new task that runs `entry(arg)` in ring 3

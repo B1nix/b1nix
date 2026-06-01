@@ -27,7 +27,8 @@
 /* Lock levels — keep these in monotonic top-down order matching the DAG.
  * Add new levels in their proper slot; never reuse a number. */
 typedef enum {
-    LOCKDEP_LVL_BKL          = 100,  /* outermost — Big Kernel Lock */
+    /* (level 100 was LOCKDEP_LVL_BKL — the Big Kernel Lock, removed in M28 #7.
+     * The number is retired, not reused.) */
     LOCKDEP_LVL_TASKS        = 200,  /* g_tasks_lock — process-table slots */
     LOCKDEP_LVL_FD           = 210,  /* per-task fd_lock — sibling of TASKS */
     LOCKDEP_LVL_MOUNT_TBL    = 300,  /* vfs_mount_lock, dcache, icache */
@@ -60,21 +61,15 @@ void lockdep_acquire(int level, const char *name);
  * the top of the stack (out-of-order release / double release). */
 void lockdep_release(int level);
 
-/* Cross-CPU "bequeathing" variants for locks whose holder may migrate to a
- * different CPU between acquire and release (BKL under M24b ownership
- * bequeath; per-inode sleeping rwlock when scheduler_block_on resumes the
- * task on another CPU). These DO NOT push/pop the per-CPU acquisition
- * stack — instead they bump a global per-level counter, so the
- * release-CPU is allowed to differ from the acquire-CPU without tripping
- * the LIFO check.
- *
- * Order check is still enforced against the calling CPU's per-CPU stack
- * at acquire time: trying to acquire BKL (level 100) while that CPU is
- * already in an inner-lock region (e.g. holding BCACHE, level 600) still
- * panics. We only lose the symmetric check at release (release of a
- * global lock no longer cares about per-CPU stack top), and the check
- * "you must hold BKL when acquiring sub-BKL" — both of which are tied to
- * the per-CPU stack model that bequeath fundamentally breaks. */
+/* Cross-CPU "bequeathing" variant for a lock whose holder may migrate to a
+ * different CPU between acquire and release. Sole user since the BKL was
+ * removed: the per-inode sleeping rwlock, whose holder calls
+ * scheduler_block_on and may be resumed on another CPU. These DO NOT push/pop
+ * the per-CPU acquisition stack (the release-CPU may differ from the
+ * acquire-CPU, which would trip the LIFO check). The acquire-side order check
+ * against the calling CPU's per-CPU stack IS still enforced — acquiring the
+ * inode lock while already holding an inner-tier lock (e.g. BCACHE) still
+ * panics. Only the symmetric release-side check is given up. */
 void lockdep_acquire_global(int level, const char *name);
 void lockdep_release_global(int level, const char *name);
 

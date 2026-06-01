@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
@@ -118,6 +119,109 @@ static struct kheap_state heap;
 static struct kheap_block *free_lists[NBUCKETS];
 static spinlock_t heap_lock = SPINLOCK_INIT;
 
+/* ----------------------------------------------------------------------------
+ * Per-CPU small-allocation magazine (M28 #4)
+ *
+ * The single heap_lock serialises every kmalloc/kfree across cores; the SMP
+ * heap benchmark measured ~2.58x per-op cost at -smp 4 under allocation-heavy
+ * load. A per-CPU magazine caches fully-formed freed blocks (header intact,
+ * still carrying KHEAP_MAGIC + size + prev_size) so the common small-alloc
+ * traffic — task structs, vfs nodes, fd tables, path buffers — hits a
+ * lock-free per-CPU stack instead of the global lock.
+ *
+ * Bounded and small-classes-only ON PURPOSE: the kheap already has a known
+ * fragmentation blocker at large RAM (cached blocks sit outside the coalescing
+ * pool), so only payload classes <= MAG_MAX_CLASS are cached, each magazine is
+ * capped at MAG_DEPTH, and on overflow the block goes to the shared free list
+ * normally (so coalescing still reclaims it). Large allocations bypass the
+ * magazine entirely and are unaffected.
+ *
+ * Access discipline mirrors the PMM per-CPU cache: IRQs off across the
+ * per-CPU touch (prevents migration mid-pop/push), no lock — the magazine
+ * belongs only to this CPU. A block cached on one CPU and reused on another is
+ * fine: it is an ordinary heap block, independent of which core frees/allocs.
+ * ------------------------------------------------------------------------- */
+#define MAG_NCLASS    6         /* size classes 16,32,64,128,256,512 */
+#define MAG_MAX_CLASS 512u      /* payloads above this never enter the magazine */
+#define MAG_DEPTH     32        /* max cached blocks per class per CPU
+                                 * (worst case ~30 KiB/CPU: 512*32 + ... ) */
+
+struct kheap_magazine {
+  struct kheap_block *slot[MAG_NCLASS][MAG_DEPTH];
+  u16 count[MAG_NCLASS];
+};
+static struct kheap_magazine kheap_mag[MAX_CPUS];
+
+/* Map an exact 16-aligned payload size to a magazine class index, or -1 if the
+ * size is not one of the cached classes (sizes are aligned to 16 first). */
+static inline int mag_class(usize size) {
+  switch (size) {
+    case 16:  return 0;
+    case 32:  return 1;
+    case 64:  return 2;
+    case 128: return 3;
+    case 256: return 4;
+    case 512: return 5;
+    default:  return -1;
+  }
+}
+
+static inline int kheap_mag_ready(void) {
+  struct percpu *p = get_percpu();
+  return p && p->cpu_id < MAX_CPUS;
+}
+
+static inline u64 kheap_irq_save_cli(void) {
+  u64 f;
+  __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
+  return f;
+}
+static inline void kheap_irq_restore(u64 f) {
+  __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
+}
+
+/* Try to satisfy a small alloc from this CPU's magazine. Returns a ready-to-use
+ * payload pointer, or 0 on miss (caller falls through to the locked path).
+ * `size` must already be 16-aligned. */
+static void *kheap_mag_alloc(usize size) {
+  int cls = mag_class(size);
+  if (cls < 0 || !kheap_mag_ready())
+    return 0;
+  u64 f = kheap_irq_save_cli();
+  struct percpu *p = get_percpu();
+  struct kheap_magazine *m = &kheap_mag[p->cpu_id];
+  void *ptr = 0;
+  if (m->count[cls] > 0) {
+    struct kheap_block *block = m->slot[cls][--m->count[cls]];
+    block->magic = KHEAP_MAGIC;
+    block->next = 0;
+    ptr = (void *)((u8 *)block + KHEAP_HEADER_SIZE);
+  }
+  kheap_irq_restore(f);
+  return ptr;
+}
+
+/* Try to cache a freed small block in this CPU's magazine. Returns 1 if cached
+ * (caller is done), 0 if declined (wrong class / full / not ready) and the
+ * block must take the normal locked free path. The block keeps KHEAP_MAGIC
+ * while cached so a concurrent coalesce never merges it. */
+static int kheap_mag_free(struct kheap_block *block) {
+  int cls = mag_class(block->size);
+  if (cls < 0 || !kheap_mag_ready())
+    return 0;
+  u64 f = kheap_irq_save_cli();
+  struct percpu *p = get_percpu();
+  struct kheap_magazine *m = &kheap_mag[p->cpu_id];
+  int cached = 0;
+  if (m->count[cls] < MAG_DEPTH) {
+    block->next = 0;
+    m->slot[cls][m->count[cls]++] = block;
+    cached = 1;
+  }
+  kheap_irq_restore(f);
+  return cached;
+}
+
 #include <b1nix/lockdep.h>
 static inline void heap_acquire(u64 *flags) {
   spin_lock_irqsave(&heap_lock, flags);
@@ -198,7 +302,15 @@ static void track_alloc(u64 addr, usize size, u64 caller) {
   }
 }
 
-static void track_free(u64 addr) {
+/* Mirror track_alloc's size gate: only >=1MB blocks are ever inserted, so a
+ * free below that can never be in the table — skip the O(MAX_TRACKED_BLOCKS)
+ * scan entirely. Before this, EVERY kfree (the overwhelmingly common small
+ * free) walked all 1024 slots to the end (the matching `break` never fires for
+ * an untracked address), a fixed ~1024-iteration cost inside heap_lock on the
+ * hottest kernel path — which also lengthened the critical section and worsened
+ * cross-core heap_lock contention. */
+static void track_free(u64 addr, usize size) {
+  if (size < 1024 * 1024) return;
   for (int i = 0; i < MAX_TRACKED_BLOCKS; i++) {
     if (tracked_blocks[i].addr == addr) {
       tracked_blocks[i].addr = 0;
@@ -465,7 +577,36 @@ static void *klarge_alloc(usize size, u64 caller) {
   for (usize i = 0; i < npages; i++) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      panic("klarge: OOM mapping large allocation");
+      /* True OOM partway through mapping. Do NOT panic the kernel for one
+       * greedy allocation (e.g. 8 parallel cc1 each grabbing ~38 MB on a
+       * 512 MB guest). Roll back cleanly and return NULL; kmalloc propagates
+       * NULL so the offending userspace allocation fails while the system
+       * survives.
+       *
+       * CRITICAL: the unmap/free MUST run WITHOUT heap_lock, exactly like the
+       * Phase 2 mapping loop above. vmm_unmap_page issues a cross-CPU TLB
+       * shootdown that spins (IRQs off) until every other CPU ACKs; holding
+       * heap_lock across it deadlocks under SMP — a core spinning to acquire
+       * heap_lock with IRQs off can never service the shootdown IPI. (This is
+       * why klarge_alloc's Phase 2 deliberately maps with the lock released.)
+       * The span is reserved exclusively to us, so no lock is needed to touch
+       * its pages; only the bookkeeping at the end takes heap_lock briefly. */
+      for (usize j = 0; j < i; j++) {
+        u64 vaddr = base + j * PAGE_SIZE;
+        u64 fr = vmm_virt_to_phys((void *)(usize)vaddr);
+        vmm_unmap_page(vaddr);
+        if (fr) pmm_free_frame(fr);
+      }
+      heap_acquire(&flags);
+      track_free((u64)(usize)ptr, size);
+      if (klarge_free_count < KLARGE_MAX_SPANS) {
+        klarge_free_spans[klarge_free_count].vaddr = base;
+        klarge_free_spans[klarge_free_count].npages = npages;
+        klarge_free_count++;
+      }
+      heap_release(flags);
+      klog_warn("klarge: large allocation denied (low memory) — returning NULL");
+      return 0;
     }
     vmm_map_page(base + i * PAGE_SIZE, frame, VMM_PRESENT | VMM_WRITABLE);
   }
@@ -496,7 +637,7 @@ static void klarge_free(void *ptr) {
   u64 base = (u64)(usize)h;
   usize npages = h->npages;
   h->magic = 0;
-  track_free(p);
+  track_free(p, npages * PAGE_SIZE);
 
   for (usize i = 0; i < npages; i++) {
     u64 vaddr = base + i * PAGE_SIZE;
@@ -524,12 +665,19 @@ static void *kmalloc_internal(usize size, u64 caller) {
     return klarge_alloc(size, caller);
   }
 
+  size = align_up_u64(size, 16);
+
+  /* Fast path: per-CPU magazine for small classes, lock-free. track_alloc only
+   * acts on >=1MB blocks, so a magazine hit (<=256b) needs no accounting. */
+  void *mag = kheap_mag_alloc(size);
+  if (mag)
+    return mag;
+
   u64 flags;
   heap_acquire(&flags);
 
   kheap_validate("kmalloc_start");
 
-  size = align_up_u64(size, 16);
   struct kheap_block *block = 0;
   if (size >= KHEAP_REUSE_MIN_SIZE) {
     /* Search the smallest size-class bucket that can satisfy the request, then
@@ -629,6 +777,19 @@ void kfree(void *ptr) {
       return;
   }
 
+  /* Fast path: cache small blocks in this CPU's magazine, lock-free. Validate
+   * the magic here (same double-free guard the locked path applies) before
+   * handing the block to the per-CPU cache. A cached block keeps KHEAP_MAGIC,
+   * so it stays invisible to coalescing (which only merges KHEAP_FREED_MAGIC
+   * neighbours) and passes kheap_validate as a live block. track_free only
+   * matters for >=1MB blocks, so a small magazine free needs no accounting. */
+  {
+    struct kheap_block *mb =
+        (struct kheap_block *)((u8 *)ptr - KHEAP_HEADER_SIZE);
+    if (mb->magic == KHEAP_MAGIC && kheap_mag_free(mb))
+      return;
+  }
+
   u64 flags;
   heap_acquire(&flags);
 
@@ -646,7 +807,7 @@ void kfree(void *ptr) {
     return;
   }
 #endif
-  track_free((u64)(usize)ptr);
+  track_free((u64)(usize)ptr, block->size);
   block->magic = KHEAP_FREED_MAGIC;
 
   /* Coalesce with the physically-preceding block when it is also free. The
