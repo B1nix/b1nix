@@ -15,6 +15,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
 #include <netdb.h>
 #include <arpa/inet.h>
 #include "syscall.h"
@@ -128,10 +130,147 @@ static int test_dns_libc(void) {
   }
   struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
   int port_ok = (ntohs(sa->sin_port) == 80);
-  int addr_ok = ((unsigned char)(sa->sin_addr & 0xff) == 10);
+  int addr_ok = ((unsigned char)(sa->sin_addr.s_addr & 0xff) == 10);
   freeaddrinfo(res);
   if (!port_ok || !addr_ok) { fail("getaddrinfo"); return -1; }
   ok("getaddrinfo");
+  return 0;
+}
+
+static int make_loopback_addr(unsigned short port, struct sockaddr_in *addr) {
+  memset(addr, 0, sizeof(*addr));
+  addr->sin_family = AF_INET;
+  addr->sin_port = htons(port);
+  addr->sin_addr.s_addr = inet_addr("127.0.0.1");
+  return 0;
+}
+
+static int recv_with_retry(int fd, char *buf, int max) {
+  for (int tries = 0; tries < 100; tries++) {
+    int n = (int)recv(fd, buf, (size_t)max, 0);
+    if (n > 0) return n;
+    syscall(SYS_YIELD);
+  }
+  return 0;
+}
+
+static int connect_loopback(unsigned short port) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) return -1;
+  struct sockaddr_in addr;
+  make_loopback_addr(port, &addr);
+  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(fd);
+    return -1;
+  }
+  return fd;
+}
+
+static int run_server(unsigned short port) {
+  int lfd = socket(AF_INET, SOCK_STREAM, 0);
+  if (lfd < 0) return 2;
+
+  struct sockaddr_in addr;
+  make_loopback_addr(port, &addr);
+  if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
+      listen(lfd, 2) < 0) {
+    close(lfd);
+    return 3;
+  }
+
+  int cfd = accept(lfd, 0, 0);
+  if (cfd < 0) {
+    close(lfd);
+    return 4;
+  }
+  char buf[256];
+  int n = recv_with_retry(cfd, buf, sizeof(buf));
+  if (n <= 0 || memcmp(buf, "m32-echo", 8) != 0) {
+    close(cfd);
+    close(lfd);
+    return 5;
+  }
+  send(cfd, "m32-echo-ok", 11, 0);
+  close(cfd);
+
+  cfd = accept(lfd, 0, 0);
+  if (cfd < 0) {
+    close(lfd);
+    return 6;
+  }
+  n = recv_with_retry(cfd, buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    close(cfd);
+    close(lfd);
+    return 7;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "GET /m32 HTTP/1.0") || !strstr(buf, "Host: 127.0.0.1")) {
+    close(cfd);
+    close(lfd);
+    return 8;
+  }
+  const char *resp = "HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nm32-http";
+  send(cfd, resp, strlen(resp), 0);
+  close(cfd);
+  close(lfd);
+  return 0;
+}
+
+static int test_tcp_client_server(void) {
+  unsigned short port = 3232;
+  int pid = fork();
+  if (pid < 0) {
+    fail("tcp-fork");
+    return -1;
+  }
+  if (pid == 0) {
+    _exit(run_server(port));
+  }
+
+  sleep(1);
+  int fd = connect_loopback(port);
+  if (fd < 0) {
+    fail("tcp-connect");
+    return -1;
+  }
+  send(fd, "m32-echo", 8, 0);
+  char buf[512];
+  int n = recv_with_retry(fd, buf, sizeof(buf));
+  close(fd);
+  if (n != 11 || memcmp(buf, "m32-echo-ok", 11) != 0) {
+    fail("tcp-echo");
+    return -1;
+  }
+  ok("tcp-echo");
+
+  fd = connect_loopback(port);
+  if (fd < 0) {
+    fail("http-connect");
+    return -1;
+  }
+  const char *req = "GET /m32 HTTP/1.0\r\nHost: 127.0.0.1\r\n\r\n";
+  send(fd, req, strlen(req), 0);
+  n = recv_with_retry(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  if (n <= 0) {
+    fail("http-get");
+    return -1;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "HTTP/1.0 200 OK") || !strstr(buf, "m32-http")) {
+    fail("http-get");
+    return -1;
+  }
+  ok("http-get");
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+  if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+    fail("tcp-server");
+    return -1;
+  }
+  ok("tcp-server");
   return 0;
 }
 
@@ -141,6 +280,7 @@ int main(void) {
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;
   if (test_dns_libc() != 0)            return 1;
+  if (test_tcp_client_server() != 0)   return 1;
   emit("M32-NET: done\n");
   return 0;
 }

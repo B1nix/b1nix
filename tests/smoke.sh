@@ -525,6 +525,9 @@ check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds 
 check_output "$LOG" "M32-NET: ok inet-pton-ntop" "libc inet_pton/inet_ntop round-trip"
 check_output "$LOG" "M32-NET: ok gethostbyname-numeric" "libc gethostbyname resolves a dotted-quad"
 check_output "$LOG" "M32-NET: ok getaddrinfo" "libc getaddrinfo fills sockaddr_in"
+check_output "$LOG" "M32-NET: ok tcp-echo" "TCP loopback client/server echo works through sockets"
+check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange works over TCP"
+check_output "$LOG" "M32-NET: ok tcp-server" "TCP listener accepts and exits cleanly"
 check_output "$LOG" "M32-NET: done" "M32 smoke completes"
 # ── M32 TCP sliding-window flow control + M23 DNS resolver (kernel net smoke) ──
 check_output "$LOG" "M32-TCP: ok window-throttle" "tcp_send honours min(cwnd,snd_wnd) and blocks at a full window"
