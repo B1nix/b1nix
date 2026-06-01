@@ -15,6 +15,8 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/select.h>
+#include <netdb.h>
+#include <arpa/inet.h>
 #include "syscall.h"
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
@@ -90,11 +92,55 @@ static int test_select_multi_fd(void) {
   return 0;
 }
 
+/* DNS / resolver libc layer. Numeric forms resolve locally (no nameserver
+ * needed), so this is deterministic offline; it proves the getaddrinfo /
+ * gethostbyname / inet_pton / inet_ntop plumbing is wired correctly. */
+static int test_dns_libc(void) {
+  /* inet_pton round-trips through inet_ntop. */
+  unsigned char raw[4];
+  if (inet_pton(AF_INET, "10.0.2.2", raw) != 1 ||
+      raw[0] != 10 || raw[1] != 0 || raw[2] != 2 || raw[3] != 2) {
+    fail("inet-pton"); return -1;
+  }
+  char back[16];
+  if (!inet_ntop(AF_INET, raw, back, sizeof(back)) ||
+      strcmp(back, "10.0.2.2") != 0) {
+    fail("inet-ntop"); return -1;
+  }
+  ok("inet-pton-ntop");
+
+  /* gethostbyname on a dotted-quad: numeric fast path, no DNS query. */
+  struct hostent *he = gethostbyname("10.0.2.2");
+  if (!he || he->h_length != 4 || he->h_addrtype != AF_INET ||
+      (unsigned char)he->h_addr_list[0][0] != 10 ||
+      (unsigned char)he->h_addr_list[0][3] != 2) {
+    fail("gethostbyname-numeric"); return -1;
+  }
+  ok("gethostbyname-numeric");
+
+  /* getaddrinfo with a numeric node + service. */
+  struct addrinfo hints, *res = 0;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo("10.0.2.2", "80", &hints, &res) != 0 || !res) {
+    fail("getaddrinfo"); return -1;
+  }
+  struct sockaddr_in *sa = (struct sockaddr_in *)res->ai_addr;
+  int port_ok = (ntohs(sa->sin_port) == 80);
+  int addr_ok = ((unsigned char)(sa->sin_addr & 0xff) == 10);
+  freeaddrinfo(res);
+  if (!port_ok || !addr_ok) { fail("getaddrinfo"); return -1; }
+  ok("getaddrinfo");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   if (test_select_timeout_zero() != 0) return 1;
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;
+  if (test_dns_libc() != 0)            return 1;
   emit("M32-NET: done\n");
   return 0;
 }

@@ -200,6 +200,7 @@ extern void *vfs_poll_chan;
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);
 int vfs_fchmod(int fd, u16 mode);
+int vfs_utime(const char *path, u32 atime, u32 mtime);
 int vfs_chown(const char *path, u16 uid, u16 gid);
 int vfs_fchown(int fd, u16 uid, u16 gid);
 int vfs_fstatfs(int fd, struct b1nix_statfs *st);

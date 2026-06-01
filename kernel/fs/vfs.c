@@ -3560,6 +3560,29 @@ int vfs_chmod(const char *path, u16 mode) {
   return 0;
 }
 
+int vfs_utime(const char *path, u32 atime, u32 mtime) {
+  struct vfs_node *node = vfs_find_node(path);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+
+  const struct cred *cred = get_current_cred();
+  if (!cred)
+    return -EACCES;
+
+  /* POSIX: setting explicit times needs ownership (or CAP_FOWNER). */
+  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
+    if (!cred_has_cap(cred, CAP_FOWNER))
+      return -EPERM;
+  }
+
+  node->inode->atime = atime;
+  node->inode->mtime = mtime;
+  node->inode->ctime = vfs_get_unix_time();
+  if (node->inode->setattr_cb)
+    return node->inode->setattr_cb(node);
+  return 0;
+}
+
 int vfs_fchmod(int fd, u16 mode) {
   struct vfs_handle *handle = get_handle(fd);
   if (!handle || !handle->used)

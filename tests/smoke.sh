@@ -317,6 +317,9 @@ check_output "$LOG" "M25-SMOKE: ok stderr-check" "compiled program stderr path w
 check_output "$LOG" "M25-SMOKE: ok exit-check" "compiled program non-zero exit status propagates"
 check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double parsing works"
 check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
+check_output "$LOG" "M25-SMOKE: ok scanf" "libc scanf/sscanf format parsing works"
+check_output "$LOG" "M25-SMOKE: ok frexp" "libc frexp decomposes correctly"
+check_output "$LOG" "M25-SMOKE: ok fileops" "libc fchmod/utime/tmpfile work (verified via stat)"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
 # ── M26 Native Toolchain & Self-Host ──
@@ -518,7 +521,14 @@ check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
 check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeout returns 0 ready"
 check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
+check_output "$LOG" "M32-NET: ok inet-pton-ntop" "libc inet_pton/inet_ntop round-trip"
+check_output "$LOG" "M32-NET: ok gethostbyname-numeric" "libc gethostbyname resolves a dotted-quad"
+check_output "$LOG" "M32-NET: ok getaddrinfo" "libc getaddrinfo fills sockaddr_in"
 check_output "$LOG" "M32-NET: done" "M32 smoke completes"
+# ── M32 TCP sliding-window flow control + M23 DNS resolver (kernel net smoke) ──
+check_output "$LOG" "M32-TCP: ok window-throttle" "tcp_send honours min(cwnd,snd_wnd) and blocks at a full window"
+check_output "$LOG" "DNS-SMOKE: ok parse-a-record" "DNS A-record parser extracts the resolved address"
+check_output "$LOG" "DNS-SMOKE: ok resolv-conf" "/etc/resolv.conf nameserver parsed by the kernel resolver"
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

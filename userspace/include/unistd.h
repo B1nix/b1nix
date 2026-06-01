@@ -86,6 +86,8 @@ static inline int chmod(const char *path, unsigned int mode) {
     return syscall(SYS_CHMOD, path, mode);
 }
 
+int fchmod(int fd, unsigned int mode);
+
 static inline int dup(int oldfd) {
     static int next_fd = 100;
     return syscall(SYS_DUP2, oldfd, next_fd++);

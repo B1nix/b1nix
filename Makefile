@@ -70,6 +70,13 @@ ifeq ($(TOOLCHAIN),clang)
 ifeq ($(origin LD),default)
 LD := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)
 endif
+# Default CC is clang for the clang toolchain. macOS aliases `cc`->clang, but on
+# Linux make's built-in `cc` is gcc, which rejects clang-only flags like
+# --target=x86_64-elf. Only override make's built-in default; an explicit
+# `make CC=...` is respected.
+ifeq ($(origin CC),default)
+CC := clang
+endif
 endif
 
 COMMON_CFLAGS := \

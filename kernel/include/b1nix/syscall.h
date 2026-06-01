@@ -132,6 +132,9 @@ enum {
 
 	/* --- M32: networking & multiplexing --- */
 	SYS_SELECT       = 111,
+
+	/* --- M25 libc completeness --- */
+	SYS_UTIME        = 112,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

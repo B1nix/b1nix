@@ -772,6 +772,22 @@ long double ldexpl(long double x, int exp)
 	return x;
 }
 
+double frexp(double x, int *exp)
+{
+	/* Decompose x into a normalised fraction in [0.5, 1) and a power of two,
+	 * so that x == fraction * 2^*exp. Zero, NaN and infinity return x with an
+	 * exponent of 0 (IEEE 754 / C99). */
+	if (exp) *exp = 0;
+	if (x == 0.0 || x != x || (x - x) != 0.0)
+		return x;
+	int e = 0;
+	double ax = x < 0 ? -x : x;
+	while (ax >= 1.0) { ax *= 0.5; e++; }
+	while (ax < 0.5)  { ax *= 2.0; e--; }
+	if (exp) *exp = e;
+	return x < 0 ? -ax : ax;
+}
+
 float strtof(const char *nptr, char **endptr)
 {
 	return (float)strtod(nptr, endptr);

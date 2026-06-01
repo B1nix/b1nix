@@ -2,16 +2,13 @@
 #define B1NIX_UTIME_H
 
 #include <sys/types.h>
+#include <time.h>
 
 struct utimbuf {
     time_t actime;
     time_t modtime;
 };
 
-static inline int utime(const char *filename, const struct utimbuf *times) {
-    (void)filename;
-    (void)times;
-    return 0;
-}
+int utime(const char *filename, const struct utimbuf *times);
 
 #endif

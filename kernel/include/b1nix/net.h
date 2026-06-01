@@ -53,6 +53,19 @@ void dhcp_tick(u64 now_ticks);
 // DNS
 void dns_resolve(const char *domain);
 void dns_receive(const void *data, usize size);
+/* Synchronous resolve: send a query and poll the network until an A record
+ * arrives or a short timeout elapses. Returns 0 and fills out[4] on success,
+ * -1 on timeout/failure. */
+int dns_resolve_sync(const char *domain, u8 out[4]);
+/* Last A-record result captured by dns_receive (1 if available, fills out). */
+int dns_last_result(u8 out[4]);
+/* Configure / read the resolver's nameserver (also loaded from
+ * /etc/resolv.conf lazily on first use). */
+void dns_set_server(struct ipv4_addr server);
+struct ipv4_addr dns_get_server(void);
+/* Lazily parse /etc/resolv.conf for "nameserver <ip>"; returns 1 if a server
+ * was parsed, 0 otherwise. Idempotent. */
+int dns_load_resolv_conf(void);
 
 // TCP
 void tcp_receive(struct ipv4_addr src, const void *data, usize size);
@@ -68,6 +81,8 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *cl
 int tcp_pending_connections(u16 local_port);
 int tcp_network_ready(void);
 void tcp_timer_tick(void);
+u32 tcp_debug_peek_iss(struct ipv4_addr remote_ip, u16 remote_port,
+                       u16 local_port);
 
 // Network state
 struct mac_addr net_get_mac(void);

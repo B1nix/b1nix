@@ -97,6 +97,12 @@ static const char initramfs_rc[] =
     "&& echo \"M27-INIT: first-boot /persist initialised\"\n"
     "echo \"M27-INIT: ok rc-script\"\n";
 
+/* Resolver configuration. The kernel DNS client parses the first
+ * "nameserver" line lazily (kernel/net/dns.c); 10.0.2.3 is the QEMU
+ * user-mode-networking built-in resolver. */
+static const char initramfs_resolv_conf[] =
+    "nameserver 10.0.2.3\n";
+
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
     "echo \"POSIX-SMOKE: start\"\n"
@@ -382,6 +388,8 @@ static const struct initramfs_file files[] = {
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
+    {"/etc/resolv.conf", initramfs_resolv_conf,
+     sizeof(initramfs_resolv_conf) - 1, 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,
      0},
     {"/README", "initramfs is alive\n", 20, 0},

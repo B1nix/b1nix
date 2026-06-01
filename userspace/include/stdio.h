@@ -97,10 +97,12 @@ static inline int rename(const char *oldpath, const char *newpath) {
     return 0;
 }
 
-static inline int scanf(const char *format, ...) {
-    (void)format;
-    return 0;
-}
+int scanf(const char *format, ...);
+int fscanf(FILE *stream, const char *format, ...);
+int sscanf(const char *str, const char *format, ...);
+int vscanf(const char *format, va_list ap);
+int vfscanf(FILE *stream, const char *format, va_list ap);
+int vsscanf(const char *str, const char *format, va_list ap);
 
 static inline void setbuf(FILE *stream, char *buf) {
     (void)stream;
@@ -136,24 +138,6 @@ static inline int vsprintf(char *str, const char *format, va_list ap) {
     return vsnprintf(str, 0x7fffffff, format, ap);
 }
 
-// Simple sscanf wrapper suited for parsing integers/strings
-static inline int sscanf(const char *str, const char *format, ...) {
-    (void)format;
-    va_list ap;
-    va_start(ap, format);
-    unsigned long long *val = va_arg(ap, unsigned long long *);
-    *val = 0;
-    // Skip leading spaces
-    while (*str == ' ' || *str == '\t' || *str == '\n' || *str == '\r') str++;
-    // Basic base-10 parser
-    while (*str >= '0' && *str <= '9') {
-        *val = (*val * 10) + (*str - '0');
-        str++;
-    }
-    va_end(ap);
-    return 1;
-}
-
 #define BUFSIZ 1024
 #define _IOFBF 0
 #define _IOLBF 1
@@ -161,9 +145,7 @@ static inline int sscanf(const char *str, const char *format, ...) {
 
 #define L_tmpnam 20
 
-static inline FILE *tmpfile(void) {
-    return NULL;
-}
+FILE *tmpfile(void);
 
 /* Best-effort unique temp name under /tmp. b1nix has no mkstemp, so this backs
  * the L_tmpnam fallback in programs like GNU Make's open_tmpfile(). Not a
@@ -178,32 +160,6 @@ static inline char *tmpnam(char *s) {
 
 static inline void rewind(FILE *stream) {
     fseek(stream, 0L, SEEK_SET);
-}
-
-static inline int fscanf(FILE *stream, const char *format, ...) {
-    (void)format;
-    va_list ap;
-    va_start(ap, format);
-    char *dummy = va_arg(ap, char *);
-    int i = 0;
-    while (1) {
-        int c = fgetc(stream);
-        if (c == EOF) {
-            if (i == 0) {
-                va_end(ap);
-                return EOF;
-            }
-            break;
-        }
-        if (c == '\n' || c == ':') {
-            ungetc(c, stream);
-            break;
-        }
-        dummy[i++] = (char)c;
-    }
-    dummy[i] = '\0';
-    va_end(ap);
-    return 1;
 }
 
 static inline int getchar(void) {

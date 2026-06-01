@@ -2943,14 +2943,10 @@ static void poll_smoke_check(void) {
 }
 
 static void tcp_smoke_check(void) {
-  uwrite("TCP-SMOKE: unsupported\n");
-  return;
-
   const u16 listen_port = 56001;
   const u16 remote_port = 40000;
   struct ipv4_addr remote_ip = {{10, 0, 2, 2}};
   const u32 remote_seq = 1000;
-  const u32 local_iss = 1000;
 
   int fd = vfs_socket(B1NIX_AF_INET, B1NIX_SOCK_STREAM, 0);
   if (fd < 0) {
@@ -2978,6 +2974,11 @@ static void tcp_smoke_check(void) {
   syn.flags = 0x02; /* SYN */
   syn.window = udp_smoke_bswap16(4096);
   tcp_receive(remote_ip, &syn, sizeof(syn));
+
+  /* Learn the ISS the kernel chose for the new (SYN-RECEIVED) connection so we
+   * can complete the handshake with a valid ACK — the in-process equivalent of
+   * a peer echoing seq+1 from the SYN-ACK it would have received on the wire. */
+  u32 local_iss = tcp_debug_peek_iss(remote_ip, remote_port, listen_port);
 
   struct tcp_smoke_header ack;
   memset(&ack, 0, sizeof(ack));
@@ -3026,6 +3027,121 @@ static void tcp_smoke_check(void) {
     return;
   }
   uwrite("TCP-SMOKE: unsupported\n");
+}
+
+/* M32: prove sliding-window flow control actually throttles a sender. Drive a
+ * connection to ESTABLISHED, shrink the peer's advertised window to 10 bytes,
+ * then check that tcp_send() emits at most a window's worth and returns 0 once
+ * the window is full (bytes-in-flight == window). White-box: uses the raw tcp_*
+ * API so it can inspect the byte counts a socket fd would hide. */
+static void tcp_window_smoke_check(void) {
+  const u16 listen_port = 56002;
+  const u16 remote_port = 40002;
+  struct ipv4_addr remote_ip = {{10, 0, 2, 2}};
+  const u32 remote_seq = 5000;
+
+  if (tcp_listen(listen_port, 1) < 0) {
+    uwrite("M32-TCP: fail window-listen\n");
+    return;
+  }
+
+  struct tcp_smoke_header syn;
+  memset(&syn, 0, sizeof(syn));
+  syn.src_port = udp_smoke_bswap16(remote_port);
+  syn.dst_port = udp_smoke_bswap16(listen_port);
+  syn.seq_num = tcp_smoke_bswap32(remote_seq);
+  syn.data_offset = (5 << 4);
+  syn.flags = 0x02; /* SYN */
+  syn.window = udp_smoke_bswap16(4096);
+  tcp_receive(remote_ip, &syn, sizeof(syn));
+
+  u32 iss = tcp_debug_peek_iss(remote_ip, remote_port, listen_port);
+
+  struct tcp_smoke_header ack;
+  memset(&ack, 0, sizeof(ack));
+  ack.src_port = udp_smoke_bswap16(remote_port);
+  ack.dst_port = udp_smoke_bswap16(listen_port);
+  ack.seq_num = tcp_smoke_bswap32(remote_seq + 1);
+  ack.ack_num = tcp_smoke_bswap32(iss + 1);
+  ack.data_offset = (5 << 4);
+  ack.flags = 0x10; /* ACK */
+  ack.window = udp_smoke_bswap16(4096);
+  tcp_receive(remote_ip, &ack, sizeof(ack));
+
+  struct ipv4_addr cip;
+  u16 cport;
+  struct tcp_conn *conn = tcp_accept(listen_port, &cip, &cport);
+  if (!conn) {
+    uwrite("M32-TCP: fail window-accept\n");
+    return;
+  }
+
+  /* Shrink the peer window to 10 bytes via a (duplicate) ACK carrying a small
+   * advertised window. ack == snd_una and no payload, so it only updates
+   * snd_wnd (a single dup-ack never trips fast-retransmit). */
+  struct tcp_smoke_header winack;
+  memset(&winack, 0, sizeof(winack));
+  winack.src_port = udp_smoke_bswap16(remote_port);
+  winack.dst_port = udp_smoke_bswap16(listen_port);
+  winack.seq_num = tcp_smoke_bswap32(remote_seq + 1);
+  winack.ack_num = tcp_smoke_bswap32(iss + 1);
+  winack.data_offset = (5 << 4);
+  winack.flags = 0x10; /* ACK */
+  winack.window = udp_smoke_bswap16(10);
+  tcp_receive(remote_ip, &winack, sizeof(winack));
+
+  char buf[100];
+  memset(buf, 'A', sizeof(buf));
+  int r1 = tcp_send(conn, buf, sizeof(buf)); /* window=10 → at most 10 */
+  int r2 = tcp_send(conn, buf, sizeof(buf)); /* window now full → 0 */
+
+  if (r1 == 10 && r2 == 0) {
+    uwrite("M32-TCP: ok window-throttle\n");
+  } else {
+    uwrite("M32-TCP: fail window-throttle\n");
+  }
+}
+
+/* M23: prove the DNS A-record parser extracts the right address. Synthesises a
+ * real DNS response packet (header + question + answer with a compression
+ * pointer) and feeds it through dns_receive(), then reads back the captured
+ * result — deterministic and offline (no live nameserver needed). Also checks
+ * /etc/resolv.conf parsing set the expected nameserver. */
+static void dns_smoke_check(void) {
+  static const u8 resp[] = {
+      0x12, 0x34,             /* id 0x1234 */
+      0x81, 0x80,             /* flags: response, recursion available */
+      0x00, 0x01,             /* qdcount 1 */
+      0x00, 0x01,             /* ancount 1 */
+      0x00, 0x00, 0x00, 0x00, /* ns/ar 0 */
+      /* question: example.com A IN */
+      0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+      0x03, 'c', 'o', 'm', 0x00,
+      0x00, 0x01, 0x00, 0x01,
+      /* answer: ptr->qname, A, IN, ttl, rdlen 4, 93.184.216.34 */
+      0xC0, 0x0C,
+      0x00, 0x01, 0x00, 0x01,
+      0x00, 0x00, 0x00, 0x3C,
+      0x00, 0x04,
+      93, 184, 216, 34};
+
+  dns_receive(resp, sizeof(resp));
+  u8 ip[4];
+  if (dns_last_result(ip) && ip[0] == 93 && ip[1] == 184 && ip[2] == 216 &&
+      ip[3] == 34) {
+    uwrite("DNS-SMOKE: ok parse-a-record\n");
+  } else {
+    uwrite("DNS-SMOKE: fail parse-a-record\n");
+  }
+
+  dns_load_resolv_conf();
+  struct ipv4_addr srv = dns_get_server();
+  if (srv.bytes[0] == 10 && srv.bytes[1] == 0 && srv.bytes[2] == 2 &&
+      srv.bytes[3] == 3) {
+    uwrite("DNS-SMOKE: ok resolv-conf\n");
+  } else {
+    uwrite("DNS-SMOKE: fail resolv-conf\n");
+  }
 }
 
 static int lock_smoke_main(int argc, const char **argv) {
@@ -3607,6 +3723,8 @@ static int init_main(int argc, const char **argv) {
   udp_queue_smoke_check();
   poll_smoke_check();
   tcp_smoke_check();
+  tcp_window_smoke_check();
+  dns_smoke_check();
 
   /* M24b BKL proof: run several CPU-bound userspace processes at once so the
    * cooperative scheduler distributes them across the BSP and Application

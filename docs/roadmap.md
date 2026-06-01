@@ -172,7 +172,10 @@ permission edge cases and kernel backtrace diagnostics.
 - [x] `done` DHCP client.
 - [x] `done` DNS client.
 - [x] `done` Add socket ABI integration for UDP/TCP-style descriptors, including POSIX-style error returns and non-blocking connect (`EINPROGRESS`/`EALREADY`) behavior.
-- [x] `partial` Add minimal TCP client path for terminal tools.
+- [x] `done` Add minimal TCP client path for terminal tools. Active-open
+  handshake (`tcp_connect`), data send/recv, and close lifecycle are
+  implemented and the connect/listen/accept/send/recv path is smoke-verified
+  end-to-end (`TCP-SMOKE: path-exercised`, `kernel/user/programs.c`).
 - [x] `done` Add `listen`, `accept`, TCP lifecycle, socket options, and `select`/`poll` integration.
 - [x] `done` Harden network buffer ownership: TX buffer pool is pre-allocated at device init; `net_send_ethernet()` uses pool buffers instead of calling `pmm_alloc_frame()` in the data path; completed buffers are returned to the pool in `net_poll()`, fully decoupling packet buffer allocation from the send interrupt path.
 
@@ -304,7 +307,7 @@ permission edge cases and kernel backtrace diagnostics.
 - [x] `done` Add refcounted VFS handles/open-file descriptions.
 - [x] `done` Add MMU-aware fork with copied metadata/FD state and COW-backed address-space isolation.
 - [x] `done` Add exact POSIX child/parent register-return semantics: child RAX=0, parent returns PID, callee-saved registers preserved, assembly trampolines for both user and kernel fork paths.
-- [x] `partial` Enforce strict `O_CLOEXEC` validation to prevent descriptor leaks across exec boundaries; FD table locking formalization deferred until multi-thread support is active.
+- [x] `done` Enforce strict `O_CLOEXEC` validation to prevent descriptor leaks across exec boundaries. The deferred FD-table locking is now in place: each task carries a `spinlock_t fd_lock` held by every fd-table mutator (M24b), and multi-thread support is live (M29 `clone()`/pthreads), so the formalization that was waiting on it is complete.
 
 ## M20: Terminal, TTY, and Interactive Shell
 
@@ -354,8 +357,18 @@ permission edge cases and kernel backtrace diagnostics.
 ## M23: Networking for Terminal Use
 
 - [x] `done` Turn the socket ABI into UDP-capable socket descriptors.
-- [x] `partial` Add minimal TCP client support.
-- [x] `initial` Add DNS resolver integration through libc-style calls and shell commands.
+- [x] `done` Add minimal TCP client support (see M10 — handshake/send/recv/close, smoke-verified).
+- [x] `done` Add DNS resolver integration through libc-style calls and shell commands.
+  Kernel DNS client is now synchronous (`dns_resolve_sync`, `kernel/net/dns.c`)
+  with A-record capture, parses `/etc/resolv.conf` for the nameserver, and is
+  exposed via `SYS_NET_DNS(host, &ip4)`. libc gains `gethostbyname`,
+  `getaddrinfo`/`freeaddrinfo`/`gai_strerror`, and `inet_pton`/`inet_ntop`/
+  `inet_aton`/`inet_ntoa`/`htons` family (`userspace/libc/netdb.c`, `netdb.h`,
+  `arpa/inet.h`); `ping`/`nc`/`wget` resolve hostnames (numeric fast-path, DNS
+  fallback). Smoke-verified offline: deterministic A-record parse + resolv.conf
+  (`DNS-SMOKE: ok parse-a-record`/`resolv-conf`) and libc numeric paths
+  (`M32-NET: ok inet-pton-ntop`/`gethostbyname-numeric`/`getaddrinfo`). Live
+  name resolution depends on a reachable nameserver (QEMU user-mode resolver).
 - [x] `done` Add `ifconfig`-style interface status.
 - [x] `done` Add `ping`, `nc`, and a tiny `wget`/HTTP client.
 - [x] `done` Handle missing network devices gracefully in user-facing network paths.
@@ -390,15 +403,15 @@ permission edge cases and kernel backtrace diagnostics.
 - [x] `done` Make `tasks[]` slot allocation/free SMP-safe with a leaf `g_tasks_lock` (`kernel/sched/scheduler.c`): `find_unused_task` claims+zeroes+ids a slot atomically, every free goes through `free_task_slot`, and `next_task_id` is assigned only under the lock. Previously the table relied on `interrupts_disable()`, which only fences the local CPU.
 - [x] `done` Make `current_task` per-CPU (`#define current_task (get_percpu()->cur_task)` over the `cur_task` slot in `struct percpu`; commit `ace00c4`) — the prerequisite for running tasks on more than one core. `syscall_entry.S` reads it as `%gs:0x10`; the kernel keeps its per-CPU base in GS with no SWAPGS, so `user_jump.S` must not reload `%gs` when entering ring 3. Smoke stays 222/0 (single-CPU userspace + `-smp 4`).
 - [x] `done` Run ordinary userspace processes on Application Processors via a **Big Kernel Lock** (recursive, serialises kernel-mode execution across cores; userspace runs lock-free in parallel). APs get per-CPU TSS + their own arch init and run the cooperative scheduler off a shared global runqueue; only ELF userspace migrates to APs. Verified at `-smp 4`: userspace ran on all 4 cores (`M24B-BKL: ok userspace-on-ap`, 180 ok / 0 fail); single-CPU unchanged (178 ok / 0 fail). **Details: [docs/m24b-bkl.md](m24b-bkl.md).**
-- [ ] `planned` Preemptive scheduling — timer-tick preemption so CPU-bound tasks rotate without yielding (today scheduling is cooperative: `scheduler_on_timer_tick` deliberately does not yield). Needs the BKL/VFS paths audited for preemption safety first.
-- [ ] `planned` POSIX threads — `clone()` with a shared address space (real pthreads). Today the model is process-only (`fork` copies the address space; sharing is via SysV shm).
+- [x] `done` Preemptive scheduling — **delivered in M28**: each core ticks itself off the LAPIC timer at 100 Hz and `scheduler_on_timer_tick` now calls `scheduler_yield()` (the long-deferred "re-enable once VFS locking is audited" step), after the BKL/VFS paths were made preemption-safe. See M28-A / M28 #8.
+- [x] `done` POSIX threads — **delivered in M29**: `clone()` with `CLONE_VM`/`CLONE_FILES`/`CLONE_THREAD`/`CLONE_SETTLS`/…, `SYS_futex`, `%fs`-based TLS, and a full in-libc `libpthread` (mutex/condvar/join/detach). See M29.
 
 ## M25: Minimal Native C Toolchain
 
 - [x] `done` Define the B1NIX userspace ELF ABI and calling convention.
 - [x] `done` Add `crt0.o` startup code for B1NIX userspace programs.
 - [x] `done` Add a userspace linker script for B1NIX ELF binaries.
-- [x] `partial` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; `qsort` (O(N log N) quicksort), `strtol`, and `strtod` are now complete; several POSIX-facing APIs are still stubs/incomplete.
+- [x] `done` Build a minimal libc profile with syscall wrappers, `string`, `stdio`, `stdlib`, and improved `malloc`; `qsort` (O(N log N) quicksort), `strtol`, and `strtod` are complete. The previously-stubbed POSIX-facing APIs are now real: a full `scanf`/`fscanf`/`sscanf`/`vscanf`/`vfscanf`/`vsscanf` format engine (`%d %i %u %o %x %c %s %f %p %n %%`, width/suppress/length modifiers), `frexp`, `tmpfile`, a real `fchmod` (SYS_FCHMOD), `utime` (new `SYS_UTIME` → `vfs_utime`), and `gettimeofday` with sub-second precision via `clock_gettime`. Smoke-verified (`M25-SMOKE: ok scanf`/`frexp`/`fileops`). (`alarm` remains a no-op stub — it needs a per-process SIGALRM timer, deferred.)
 - [x] `done` Add an external `b1nix-cc` wrapper backed by clang for early userland builds.
 - [x] `done` Build and run a VFS-loaded native smoke ELF program.
 - [x] `done` Build and run a VFS-loaded `hello.c` ELF program.
@@ -481,7 +494,7 @@ Smoke: 5 `M31-SEC:` markers — `start`, `ok uid-syscalls`, `ok shadow-format`, 
 
 ## M32: Advanced Network Stack & TCP Completeness
 
-- [x] `partial` TCP sliding-window flow control. `struct tcp_conn` carries `snd_wnd` (peer's advertised window from the incoming TCP header, refreshed on every received segment with an ACK). The framework is wired and load-bearing for any future M32 work; current smoke doesn't drive enough traffic to exercise window throttling end-to-end.
+- [x] `done` TCP sliding-window flow control. `struct tcp_conn` carries `snd_wnd` (peer's advertised window, refreshed on every received ACK). `tcp_send()` now enforces it: it never puts more than `min(cwnd, snd_wnd)` bytes in flight (`snd_nxt - snd_una`), truncates a send to the usable window, and returns 0 once the window is full so the caller retries after an ACK advances `snd_una`. Smoke-verified end-to-end with a deliberately small (10-byte) advertised window (`M32-TCP: ok window-throttle`, `kernel/net/tcp.c` + `kernel/user/programs.c`).
 - [x] `done` TCP Reno congestion control. `struct tcp_conn` carries `cwnd`, `ssthresh`, `dup_acks`. ACK reception runs slow-start (cwnd += MSS while cwnd < ssthresh) and congestion-avoidance (cwnd += MSS²/cwnd) increments. **Fast retransmit**: 3 duplicate ACKs trigger ssthresh = cwnd/2, cwnd = ssthresh + 3·MSS (RFC 5681 inflation), and the head of the retransmit queue is resent immediately (no waiting for RTO). Subsequent dup ACKs in fast recovery inflate cwnd by another MSS each. Full NewReno partial-ACK handling and Cubic are deferred — Reno is the standard textbook algorithm.
 - [ ] `planned` Port standard network clients and servers (a real curl / SSH daemon). Deferred — the in-kernel TCP stack still lacks the parser machinery (HTTP/TLS) most useful clients need.
 - [x] `done` `select()` syscall — `SYS_SELECT(nfds, readfds, writefds, exceptfds, timeout_ms)` in `kernel/syscall/syscall.c`. Translates `fd_set` bitmasks to the existing `pollfd` machinery (single in-kernel block-on-channel), translates `revents` back to fd_sets. Userspace `sys/select.h` defines the standard `FD_ZERO`/`SET`/`CLR`/`ISSET` macros + a `struct timeval`. libc wrapper at `userspace/libc/unistd.c::select` converts the `tv` to milliseconds (NULL timeout ⇒ wait forever).

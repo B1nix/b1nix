@@ -22,7 +22,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/ctype.o \
 	$(BUILD)/libc/dirent.o \
 	$(BUILD)/libc/pwd.o \
-	$(BUILD)/libc/pthread.o
+	$(BUILD)/libc/pthread.o \
+	$(BUILD)/libc/netdb.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \

@@ -2291,26 +2291,45 @@ static int nc_main(int argc, const char **argv) {
   addr.sin_family = B1NIX_AF_INET;
   addr.sin_port = (u16)((port >> 8) | (port << 8)); /* host to network */
 
-  /* Parse dotted decimal IP */
+  /* Resolve the host: a dotted-quad is parsed directly, otherwise it is sent
+   * through DNS (SYS_NET_DNS with an output buffer). */
   u32 ip = 0;
-  int shift = 0;
-  const char *p = host;
-  while (*p) {
-    if (*p == '.') {
-      shift++;
-      p++;
-      continue;
+  int numeric = 1;
+  for (const char *q = host; *q; q++) {
+    if (!((*q >= '0' && *q <= '9') || *q == '.')) {
+      numeric = 0;
+      break;
     }
-    u32 octet = 0;
-    while (*p >= '0' && *p <= '9') {
-      octet = octet * 10 + (u32)(*p - '0');
-      p++;
+  }
+  if (numeric) {
+    int shift = 0;
+    const char *p = host;
+    while (*p) {
+      if (*p == '.') {
+        shift++;
+        p++;
+        continue;
+      }
+      u32 octet = 0;
+      while (*p >= '0' && *p <= '9') {
+        octet = octet * 10 + (u32)(*p - '0');
+        p++;
+      }
+      ip |= (octet << (shift * 8));
+      if (*p == '.') {
+        shift++;
+        p++;
+      }
     }
-    ip |= (octet << (shift * 8));
-    if (*p == '.') {
-      shift++;
-      p++;
+  } else {
+    u8 dip[4];
+    if ((isize)syscall_dispatch(SYS_NET_DNS, (u64)(usize)host,
+                                (u64)(usize)dip, 0, 0, 0, 0) != 0) {
+      printf("nc: cannot resolve %s\n", host);
+      return 1;
     }
+    ip = (u32)dip[0] | ((u32)dip[1] << 8) | ((u32)dip[2] << 16) |
+         ((u32)dip[3] << 24);
   }
   addr.sin_addr = ip;
 
@@ -2415,13 +2434,22 @@ static int wget_main(int argc, const char **argv) {
   if (path_start[0] == '\0')
     path_start = "/";
 
-  /* Resolve hostname via DNS */
+  /* Resolve hostname via DNS (synchronous: SYS_NET_DNS with an output buffer
+     fills in the A record). Fall back to the QEMU user-mode gateway only if
+     resolution fails so the tool still works offline. */
   printf("wget: resolving %s...\n", host);
-  syscall_dispatch(SYS_NET_DNS, (u64)(usize)host, 0, 0, 0, 0, 0);
-
-  /* DNS resolution is async via console. For now use QEMU user-mode
-     networking default gateway (10.0.2.2) as HTTP proxy */
-  u32 server_ip_raw = (10) | (0 << 8) | (2 << 16) | (2 << 24);
+  u8 dns_ip[4];
+  u32 server_ip_raw;
+  if ((isize)syscall_dispatch(SYS_NET_DNS, (u64)(usize)host,
+                              (u64)(usize)dns_ip, 0, 0, 0, 0) == 0) {
+    server_ip_raw = (u32)dns_ip[0] | ((u32)dns_ip[1] << 8) |
+                    ((u32)dns_ip[2] << 16) | ((u32)dns_ip[3] << 24);
+    printf("wget: resolved %s to %d.%d.%d.%d\n", host, dns_ip[0], dns_ip[1],
+           dns_ip[2], dns_ip[3]);
+  } else {
+    server_ip_raw = (10) | (0 << 8) | (2 << 16) | (2 << 24);
+    printf("wget: dns lookup failed, using gateway 10.0.2.2\n");
+  }
 
   /* Build HTTP request */
   char request[1024];

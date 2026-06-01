@@ -375,9 +375,24 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     return 0;
   u32 seq_start = conn->snd_nxt;
 
+  /* M32 sliding-window flow control: never put more bytes in flight than the
+   * smaller of the peer's advertised receive window (snd_wnd) and our own
+   * congestion window (cwnd). bytes-in-flight is snd_nxt - snd_una. When the
+   * window is full we send nothing and return 0 so the caller retries once an
+   * incoming ACK advances snd_una (and refreshes snd_wnd). */
+  u32 window = conn->snd_wnd < conn->cwnd ? conn->snd_wnd : conn->cwnd;
+  u32 inflight = conn->snd_nxt - conn->snd_una;
+  if (inflight >= window)
+    return 0;
+  u32 usable = window - inflight;
+
   usize to_send = len;
   if (to_send > TCP_MSS)
     to_send = TCP_MSS;
+  if (to_send > usable)
+    to_send = usable;
+  if (to_send == 0)
+    return 0;
 
   usize packet_len = sizeof(struct tcp_header) + to_send;
   u8 *packet = kzalloc(packet_len);
@@ -787,6 +802,16 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
   default:
     break;
   }
+}
+
+/* White-box test hook: return the ISS the kernel chose for the connection
+ * matching (remote_ip, remote_port, local_port), or 0 if none. Lets the TCP
+ * smoke craft a valid handshake ACK without observing the SYN-ACK on the wire
+ * (the in-process equivalent of a peer echoing seq+1). */
+u32 tcp_debug_peek_iss(struct ipv4_addr remote_ip, u16 remote_port,
+                       u16 local_port) {
+  struct tcp_conn *c = tcp_find_conn(remote_ip, remote_port, local_port);
+  return c ? c->iss : 0;
 }
 
 /* ── Check if network is available ── */

@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include <ctype.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -396,4 +397,286 @@ int sprintf(char *str, const char *fmt, ...) {
   int n = vsnprintf(str, 0x7fffffff, fmt, args);
   va_end(args);
   return n;
+}
+
+/* ── scanf family ────────────────────────────────────────────────────────────
+ * A single character-source-driven engine backs scanf/fscanf/sscanf. The source
+ * is either a FILE* (stream) or a NUL-terminated string. It supports the common
+ * conversions used by real programs: %d %i %u %o %x %X %c %s %f/%e/%g %p %n %%,
+ * with optional assignment-suppression (*), a maximum field width, and length
+ * modifiers (l/ll/h/hh/z/j/t/L). Whitespace in the format skips run of input
+ * whitespace; a literal format character must match the input. */
+
+struct _scan_src {
+  FILE *fp;        /* stream source, or NULL */
+  const char *str; /* string source, or NULL */
+  int pos;         /* index into str */
+  int pushed;      /* one-char pushback, or EOF when empty */
+  int nread;       /* total characters consumed from the source */
+};
+
+static int _sc_get(struct _scan_src *s) {
+  int c;
+  if (s->pushed != EOF) {
+    c = s->pushed;
+    s->pushed = EOF;
+  } else if (s->fp) {
+    c = fgetc(s->fp);
+  } else {
+    c = (unsigned char)s->str[s->pos];
+    if (c == 0)
+      c = EOF;
+    else
+      s->pos++;
+  }
+  if (c != EOF)
+    s->nread++;
+  return c;
+}
+
+static void _sc_unget(struct _scan_src *s, int c) {
+  if (c == EOF)
+    return;
+  s->pushed = c;
+  s->nread--;
+}
+
+static int _sc_digit(int c, int base) {
+  int v;
+  if (c >= '0' && c <= '9') v = c - '0';
+  else if (c >= 'a' && c <= 'z') v = c - 'a' + 10;
+  else if (c >= 'A' && c <= 'Z') v = c - 'A' + 10;
+  else return -1;
+  return v < base ? v : -1;
+}
+
+static int _scan_int(struct _scan_src *s, int base, int width, int is_unsigned,
+                     long long *out) {
+  int c;
+  do { c = _sc_get(s); } while (c != EOF && isspace(c));
+  int neg = 0, consumed = 0;
+  if (c == '+' || c == '-') {
+    neg = (c == '-');
+    consumed++;
+    if (width && consumed >= width) { _sc_unget(s, c); return 0; }
+    c = _sc_get(s);
+  }
+  /* Base autodetect for %i and 0x/0 prefixes. */
+  if ((base == 0 || base == 16) && c == '0') {
+    int c2 = _sc_get(s);
+    if (c2 == 'x' || c2 == 'X') {
+      base = 16;
+      consumed += 2;
+      c = _sc_get(s);
+    } else {
+      /* leading zero counts as a digit; keep it */
+      if (base == 0) base = 8;
+      _sc_unget(s, c2);
+    }
+  }
+  if (base == 0) base = 10;
+  long long acc = 0;
+  int any = 0;
+  while (c != EOF) {
+    int d = _sc_digit(c, base);
+    if (d < 0) break;
+    acc = acc * base + d;
+    any = 1;
+    consumed++;
+    if (width && consumed >= width) { c = EOF; break; }
+    c = _sc_get(s);
+  }
+  if (c != EOF) _sc_unget(s, c);
+  if (!any) return 0;
+  *out = is_unsigned ? (long long)(unsigned long long)acc : (neg ? -acc : acc);
+  return 1;
+}
+
+static int _scan_float(struct _scan_src *s, int width, double *out) {
+  char buf[64];
+  int n = 0, c;
+  do { c = _sc_get(s); } while (c != EOF && isspace(c));
+  while (c != EOF && n < (int)sizeof(buf) - 1 && (width == 0 || n < width)) {
+    if (isdigit(c) || c == '.' || c == '+' || c == '-' ||
+        c == 'e' || c == 'E') {
+      buf[n++] = (char)c;
+      c = _sc_get(s);
+    } else {
+      break;
+    }
+  }
+  if (c != EOF) _sc_unget(s, c);
+  buf[n] = '\0';
+  if (n == 0) return 0;
+  char *end = buf;
+  double v = strtod(buf, &end);
+  if (end == buf) return 0;
+  *out = v;
+  return 1;
+}
+
+static int _vscan(struct _scan_src *s, const char *fmt, va_list ap) {
+  int assigned = 0;
+  int saw_input = 0;
+  for (const char *f = fmt; *f; f++) {
+    if (isspace((unsigned char)*f)) {
+      int c;
+      do { c = _sc_get(s); } while (c != EOF && isspace(c));
+      if (c != EOF) _sc_unget(s, c); else saw_input |= 0;
+      continue;
+    }
+    if (*f != '%') {
+      int c = _sc_get(s);
+      if (c == EOF) return assigned ? assigned : EOF;
+      saw_input = 1;
+      if (c != (unsigned char)*f) { _sc_unget(s, c); return assigned; }
+      continue;
+    }
+    /* conversion specifier */
+    f++;
+    int suppress = 0;
+    if (*f == '*') { suppress = 1; f++; }
+    int width = 0;
+    while (*f >= '0' && *f <= '9') { width = width * 10 + (*f - '0'); f++; }
+    int lng = 0;
+    while (*f == 'l') { lng++; f++; }
+    if (*f == 'h') { f++; if (*f == 'h') f++; }
+    if (*f == 'z' || *f == 'j' || *f == 't' || *f == 'L') { lng = 1; f++; }
+    char conv = *f;
+    if (conv == '\0') break;
+
+    if (conv == '%') {
+      int c = _sc_get(s);
+      if (c == EOF) return assigned ? assigned : EOF;
+      if (c != '%') { _sc_unget(s, c); return assigned; }
+      continue;
+    }
+    if (conv == 'n') {
+      if (!suppress) { int *p = va_arg(ap, int *); *p = s->nread; }
+      continue;
+    }
+    if (conv == 'c') {
+      int w = width ? width : 1;
+      char *p = suppress ? 0 : va_arg(ap, char *);
+      int got = 0;
+      for (int k = 0; k < w; k++) {
+        int c = _sc_get(s);
+        if (c == EOF) break;
+        saw_input = 1;
+        if (p) p[k] = (char)c;
+        got++;
+      }
+      if (got == 0) return assigned ? assigned : EOF;
+      if (!suppress) assigned++;
+      continue;
+    }
+    if (conv == 's') {
+      int c;
+      do { c = _sc_get(s); } while (c != EOF && isspace(c));
+      if (c == EOF) return assigned ? assigned : EOF;
+      saw_input = 1;
+      char *p = suppress ? 0 : va_arg(ap, char *);
+      int n = 0;
+      while (c != EOF && !isspace(c) && (width == 0 || n < width)) {
+        if (p) p[n] = (char)c;
+        n++;
+        c = _sc_get(s);
+      }
+      if (c != EOF) _sc_unget(s, c);
+      if (p) p[n] = '\0';
+      if (!suppress) assigned++;
+      continue;
+    }
+    if (conv == 'd' || conv == 'i' || conv == 'u' || conv == 'o' ||
+        conv == 'x' || conv == 'X' || conv == 'p') {
+      int base = (conv == 'd' || conv == 'u') ? 10
+               : (conv == 'o') ? 8
+               : (conv == 'i') ? 0 : 16;
+      int is_uns = (conv == 'u' || conv == 'x' || conv == 'X' || conv == 'o' ||
+                    conv == 'p');
+      long long v = 0;
+      int before = s->nread;
+      int r = _scan_int(s, base, width, is_uns, &v);
+      if (s->nread != before) saw_input = 1;
+      if (!r) {
+        if (!saw_input) return assigned ? assigned : EOF;
+        return assigned;
+      }
+      if (!suppress) {
+        if (conv == 'p') { *va_arg(ap, void **) = (void *)(unsigned long)v; }
+        else if (lng >= 2) { *va_arg(ap, long long *) = v; }
+        else if (lng == 1) { *va_arg(ap, long *) = (long)v; }
+        else if (is_uns) { *va_arg(ap, unsigned int *) = (unsigned int)v; }
+        else { *va_arg(ap, int *) = (int)v; }
+        assigned++;
+      }
+      continue;
+    }
+    if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' ||
+        conv == 'G' || conv == 'a' || conv == 'A') {
+      double v = 0;
+      int before = s->nread;
+      int r = _scan_float(s, width, &v);
+      if (s->nread != before) saw_input = 1;
+      if (!r) {
+        if (!saw_input) return assigned ? assigned : EOF;
+        return assigned;
+      }
+      if (!suppress) {
+        if (lng) *va_arg(ap, double *) = v;
+        else *va_arg(ap, float *) = (float)v;
+        assigned++;
+      }
+      continue;
+    }
+    /* Unknown conversion: stop. */
+    return assigned;
+  }
+  return assigned;
+}
+
+int vsscanf(const char *str, const char *fmt, va_list ap) {
+  struct _scan_src s = {0, str, 0, EOF, 0};
+  return _vscan(&s, fmt, ap);
+}
+
+int vfscanf(FILE *stream, const char *fmt, va_list ap) {
+  struct _scan_src s = {stream, 0, 0, EOF, 0};
+  return _vscan(&s, fmt, ap);
+}
+
+int sscanf(const char *str, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vsscanf(str, fmt, ap);
+  va_end(ap);
+  return r;
+}
+
+int fscanf(FILE *stream, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vfscanf(stream, fmt, ap);
+  va_end(ap);
+  return r;
+}
+
+int scanf(const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vfscanf(stdin, fmt, ap);
+  va_end(ap);
+  return r;
+}
+
+int vscanf(const char *fmt, va_list ap) { return vfscanf(stdin, fmt, ap); }
+
+FILE *tmpfile(void) {
+  /* Best-effort: create a uniquely-named regular file under /tmp opened for
+   * update. b1nix has no anonymous-inode / O_TMPFILE path, so (unlike POSIX)
+   * the file is not auto-removed on close — callers that care unlink it. */
+  char name[L_tmpnam];
+  if (!tmpnam(name))
+    return NULL;
+  return fopen(name, "w+");
 }

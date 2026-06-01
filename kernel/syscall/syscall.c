@@ -693,6 +693,23 @@ static isize sys_chmod(const char *user_path, u16 mode) {
 
 static isize sys_fchmod(int fd, u16 mode) { return vfs_fchmod(fd, mode); }
 
+static isize sys_utime(const char *user_path, u32 atime, u32 mtime) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_utime(resolved, atime, mtime);
+}
+
 static isize sys_chown(const char *user_path, u16 uid, u16 gid) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
@@ -1530,6 +1547,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)sys_chmod((const char *)(usize)arg0, (u16)arg1);
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
+  case SYS_UTIME:
+    return (u64)sys_utime((const char *)(usize)arg0, (u32)arg1, (u32)arg2);
   case SYS_CHOWN:
     klog_info("audit: chown called");
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
@@ -1754,7 +1773,9 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     if (syscall_copyinstr(ip_text, sizeof(ip_text), (const char *)(usize)arg0) != 0)
       return (u64)-EFAULT;
     if (parse_ipv4_literal(ip_text, &dest) != 0) {
-      return (u64)-EINVAL;
+      /* Not a dotted-quad — try resolving it as a hostname via DNS. */
+      if (dns_resolve_sync(ip_text, dest.bytes) != 0)
+        return (u64)-EINVAL;
     }
 
     u32 before = icmp_echo_reply_count();
@@ -1793,6 +1814,16 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
         isize ret = syscall_copyinstr(host, sizeof(host), (const char *)(usize)arg0);
         if (ret < 0)
             return (u64)ret;
+        /* arg1 != 0: synchronous resolve, copy the 4-byte A record out.
+         * arg1 == 0: legacy fire-and-forget query (prints to console). */
+        if (arg1) {
+            u8 ip[4];
+            if (dns_resolve_sync(host, ip) != 0)
+                return (u64)-EHOSTUNREACH;
+            if (syscall_copyout((void *)(usize)arg1, ip, 4) != 0)
+                return (u64)-EFAULT;
+            return 0;
+        }
         dns_resolve(host);
         return 0;
     }

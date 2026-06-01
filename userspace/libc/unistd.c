@@ -156,8 +156,17 @@ time_t time(time_t *tloc) {
 int gettimeofday(struct timeval *tv, struct timezone *tz) {
   (void)tz;
   if (tv) {
-    tv->tv_sec = (time_t)syscall(SYS_TIME);
-    tv->tv_usec = 0;
+    /* Prefer the higher-resolution monotonic clock so tv_usec carries real
+     * sub-second detail (tick granularity, ~10 ms) instead of always 0. Fall
+     * back to whole-second SYS_TIME if the clock syscall is unavailable. */
+    struct timespec ts;
+    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
+      tv->tv_sec = ts.tv_sec;
+      tv->tv_usec = ts.tv_nsec / 1000;
+    } else {
+      tv->tv_sec = (time_t)syscall(SYS_TIME);
+      tv->tv_usec = 0;
+    }
   }
   return 0;
 }
@@ -316,15 +325,22 @@ unsigned int alarm(unsigned int seconds) {
 }
 
 int fchmod(int fd, mode_t mode) {
-  (void)fd;
-  (void)mode;
-  return 0;
+  return _check_err(syscall(SYS_FCHMOD, fd, mode));
 }
 
-int utime(const char *filename, const void *times) {
-  (void)filename;
-  (void)times;
-  return 0;
+#include <utime.h>
+int utime(const char *filename, const struct utimbuf *times) {
+  /* POSIX: a NULL times argument sets both atime and mtime to the current
+   * time. Pass the two timestamps as scalar args (seconds) so the kernel
+   * never has to copy a struct from user memory. */
+  long atime, mtime;
+  if (times) {
+    atime = (long)times->actime;
+    mtime = (long)times->modtime;
+  } else {
+    atime = mtime = (long)syscall(SYS_TIME);
+  }
+  return _check_err(syscall(SYS_UTIME, filename, atime, mtime));
 }
 
 int fork(void) {

@@ -3,6 +3,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <math.h>
+#include <utime.h>
 #include "syscall.h"
 
 #define WIFEXITED(status) (((status) & 0x7f) == 0)
@@ -431,6 +433,60 @@ int main(void) {
     return 1;
   }
   marker("M25-SMOKE: ok float-check\n");
+
+  /* 10. libc completeness: scanf family, frexp, fchmod, utime, tmpfile. */
+  {
+    int a = 0, b = 0, hx = 0;
+    char word[16];
+    double d = 0;
+    int n = sscanf("42 -7 hello 3.5", "%d %d %15s %lf", &a, &b, word, &d);
+    if (n != 4 || a != 42 || b != -7 || strcmp(word, "hello") != 0 ||
+        d < 3.49 || d > 3.51) {
+      marker("M25-SMOKE: fail scanf\n");
+      return 1;
+    }
+    if (sscanf("0xff", "%x", &hx) != 1 || hx != 255) {
+      marker("M25-SMOKE: fail scanf\n");
+      return 1;
+    }
+    marker("M25-SMOKE: ok scanf\n");
+
+    int e = 0;
+    double m = frexp(20.0, &e); /* 20 == 0.625 * 2^5 */
+    if (e != 5 || m < 0.6249 || m > 0.6251) {
+      marker("M25-SMOKE: fail frexp\n");
+      return 1;
+    }
+    marker("M25-SMOKE: ok frexp\n");
+
+    FILE *tf = tmpfile();
+    if (!tf) { marker("M25-SMOKE: fail tmpfile\n"); return 1; }
+    fputs("tmp", tf);
+    fclose(tf);
+
+    int lf = open("/tmp/m25-libc.dat", O_CREAT | O_RDWR | O_TRUNC, 0666);
+    if (lf < 0) { marker("M25-SMOKE: fail fileops\n"); return 1; }
+    write(lf, "hi", 2);
+    if (fchmod(lf, 0600) != 0) {
+      marker("M25-SMOKE: fail fileops\n"); close(lf); return 1;
+    }
+    close(lf);
+
+    struct utimbuf ut;
+    ut.actime = 1000000;
+    ut.modtime = 2000000;
+    if (utime("/tmp/m25-libc.dat", &ut) != 0) {
+      marker("M25-SMOKE: fail fileops\n"); return 1;
+    }
+
+    struct stat sb;
+    if (stat("/tmp/m25-libc.dat", &sb) != 0 ||
+        (sb.st_mode & 0777) != 0600 || sb.st_mtime != 2000000) {
+      marker("M25-SMOKE: fail fileops\n");
+      return 1;
+    }
+    marker("M25-SMOKE: ok fileops\n");
+  }
 
   marker("M25-SMOKE: done\n");
   return 0;
