@@ -112,7 +112,6 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-threads \
     --disable-nls \
     --enable-ipv6 \
-    --disable-ntlm \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
     PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \

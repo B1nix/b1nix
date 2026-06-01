@@ -1104,6 +1104,52 @@ static int test_wget_idn_punycode(void) {
   return 0;
 }
 
+static int test_wget_ntlm_enabled(void) {
+  int wpid = fork();
+  if (wpid < 0) { fail("wget-ntlm-enabled"); return -1; }
+  if (wpid == 0) {
+    char *argv[] = {
+      "/bin/wget", "--version",
+      NULL
+    };
+    char *envp[] = {NULL};
+    int fd = open("/tmp/wget.ntlm.help", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (fd >= 0) {
+      dup2(fd, 1);
+      dup2(fd, 2);
+      close(fd);
+    }
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  int wst = 0;
+  waitpid(wpid, &wst, 0);
+  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
+    fail("wget-ntlm-enabled");
+    return -1;
+  }
+  int fd = open("/tmp/wget.ntlm.help", O_RDONLY);
+  if (fd < 0) {
+    fail("wget-ntlm-enabled");
+    return -1;
+  }
+  char buf[8192];
+  int n = read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  unlink("/tmp/wget.ntlm.help");
+  if (n <= 0) {
+    fail("wget-ntlm-enabled");
+    return -1;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "+ntlm")) {
+    fail("wget-ntlm-enabled");
+    return -1;
+  }
+  ok("wget-ntlm-enabled");
+  return 0;
+}
+
 static int test_wget_https(void) {
   const int max_wait_sec = 20;
   int tls_srv = fork();
@@ -1264,6 +1310,7 @@ int main(void) {
   if (test_tcp_client_server() != 0)   return 1;
   if (test_wget_pcre2_regex() != 0)    return 1;
   if (test_wget_ipv6() != 0)           return 1;
+  if (test_wget_ntlm_enabled() != 0)   return 1;
   if (test_wget_idn_punycode() != 0)   return 1;
   if (test_wget_https() != 0)          return 1;
   emit("M32-NET: done\n");
