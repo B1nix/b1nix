@@ -561,6 +561,7 @@ check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange wo
 check_output "$LOG" "M32-NET: ok wget-loopback" "Wget HTTP client download works over TCP loopback"
 check_output "$LOG" "M32-NET: ok wget-pcre2-regex" "Wget --regex-type pcre filters a recursive fetch (PCRE2 \\d matcher: keeps yes-1, drops no-2)"
 check_output "$LOG" "M32-NET: ok wget-ipv6" "Wget HTTP client download works over IPv6 loopback (::1)"
+check_output "$LOG" "M32-NET: ok wget-idn-punycode" "Wget IRI/IDN path converts an internationalized hostname to punycode"
 check_output "$LOG" "M32-NET: ok wget-https-handshake" "Wget performs a real HTTPS request (TLS handshake path)"
 check_output "$LOG" "M32-NET: ok wget-https-selfsigned-reject" "Wget rejects an invalid self-signed chain without --ca-certificate"
 if grep -q "M32-NET: unsupported curl-tls-suite" "$LOG" 2>/dev/null; then

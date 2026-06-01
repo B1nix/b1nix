@@ -8,6 +8,7 @@
 #include <sys/types.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
+#include <sys/resource.h>
 #include <unistd.h>
 #include <termios.h>
 #include <errno.h>
@@ -562,6 +563,13 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {
 
 pid_t setsid(void) {
   return _check_err(syscall(SYS_SETSID));
+}
+
+int getrlimit(int resource, struct rlimit *rlim) {
+  (void)resource;
+  (void)rlim;
+  errno = ENOSYS;
+  return -1;
 }
 
 #include <syslog.h>

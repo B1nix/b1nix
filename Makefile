@@ -388,7 +388,11 @@ OPENSSL_LIB := build/openssl-b1nix/install/lib/libssl.a
 $(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-openssl.sh >/dev/null
 
-$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB)
+LIBIDN2_LIB := build/libidn2-b1nix/install/lib/libidn2.a
+$(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+	tools/build-libidn2.sh >/dev/null
+
+$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB) $(LIBIDN2_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)

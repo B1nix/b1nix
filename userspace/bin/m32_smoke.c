@@ -1065,6 +1065,45 @@ static int test_wget_ipv6(void) {
   return 0;
 }
 
+static int test_wget_idn_punycode(void) {
+  int wpid = fork();
+  if (wpid < 0) { fail("wget-idn-punycode"); return -1; }
+  if (wpid == 0) {
+    char *argv[] = {
+      "/bin/wget", "--local-encoding=UTF-8", "-t", "1", "-T", "5",
+      "-o", "/tmp/wget.idn.log", "-O", "/tmp/wget.idn.out",
+      "http://b\303\274cher.example/", NULL
+    };
+    char *envp[] = {NULL};
+    execve("/bin/wget", argv, envp);
+    _exit(127);
+  }
+  int wst = 0;
+  waitpid(wpid, &wst, 0);
+
+  int lf = open("/tmp/wget.idn.log", O_RDONLY);
+  if (lf < 0) {
+    fail("wget-idn-punycode");
+    return -1;
+  }
+  char lb[2048];
+  int nr = read(lf, lb, sizeof(lb) - 1);
+  close(lf);
+  unlink("/tmp/wget.idn.log");
+  unlink("/tmp/wget.idn.out");
+  if (nr <= 0) {
+    fail("wget-idn-punycode");
+    return -1;
+  }
+  lb[nr] = '\0';
+  if (!strstr(lb, "xn--bcher-kva.example")) {
+    fail("wget-idn-punycode");
+    return -1;
+  }
+  ok("wget-idn-punycode");
+  return 0;
+}
+
 static int test_wget_https(void) {
   const int max_wait_sec = 20;
   int tls_srv = fork();
@@ -1225,6 +1264,7 @@ int main(void) {
   if (test_tcp_client_server() != 0)   return 1;
   if (test_wget_pcre2_regex() != 0)    return 1;
   if (test_wget_ipv6() != 0)           return 1;
+  if (test_wget_idn_punycode() != 0)   return 1;
   if (test_wget_https() != 0)          return 1;
   emit("M32-NET: done\n");
   return 0;

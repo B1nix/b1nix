@@ -36,6 +36,15 @@ if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ]; then
   fi
 fi
 
+LIBIDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/install"
+LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/install"
+if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
+  if ! "$ROOT_DIR/tools/build-libidn2.sh" >/dev/null; then
+    echo "tools/build-wget.sh: libidn2 build failed" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$ROOT_DIR/build/wget-src" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -98,7 +107,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-shared --enable-static \
     --with-ssl=openssl \
     --without-zlib \
-    --disable-iri \
+    --enable-iri \
     --disable-pcre \
     --disable-threads \
     --disable-nls \
@@ -108,7 +117,9 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
     PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \
     OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include" \
-    OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib -lssl -lcrypto"
+    OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib -lssl -lcrypto" \
+    LIBIDN2_CFLAGS="-I$LIBIDN2_PREFIX/include -I$LIBUNISTRING_PREFIX/include" \
+    LIBIDN2_LIBS="-L$LIBIDN2_PREFIX/lib -lidn2 -L$LIBUNISTRING_PREFIX/lib -lunistring"
 )
 
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"
