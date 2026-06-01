@@ -18,6 +18,7 @@
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
+#include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
 #include <b1nix/filelock.h>
@@ -38,6 +39,8 @@ extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
+extern void m35_diag_run(void);
+extern void m36_diag_run(void);
 
 void kernel_main(u64 arg0, u64 arg1)
 {
@@ -136,6 +139,8 @@ void kernel_main(u64 arg0, u64 arg1)
 	ahci_init();
 	nvme_init();
 	btrfs_init();
+	procfs_init();
+	sysfs_init();
 	filelock_init();
 	mqueue_init();
 	shm_init();
@@ -146,6 +151,13 @@ void kernel_main(u64 arg0, u64 arg1)
 	video_init();
 	compositor_init();
 	virtio_gpu_init();
+	/* M34: mount the synthetic /proc and /sys filesystems. /proc already
+	 * exists as a mount point (created in vfs_init); /sys is created here. */
+	if (vfs_mount("proc", "/proc", "procfs", 0) == 0)
+		console_write("procfs: mounted at /proc\n");
+	vfs_mkdir("/sys", 0555);
+	if (vfs_mount("sys", "/sys", "sysfs", 0) == 0)
+		console_write("sysfs: mounted at /sys\n");
 #endif
 	console_write("Step 11: Drivers initialized\n");
 
@@ -169,6 +181,12 @@ void kernel_main(u64 arg0, u64 arg1)
 
 	/* M28 #9: ctx-switch + light-syscall rdtsc baseline (single-CPU, test mode). */
 	m28_ctxbench_run();
+
+	/* M35: verify kallsyms symbolication resolves kernel addresses. */
+	m35_diag_run();
+
+	/* M36: verify the GDB serial-stub protocol engine and ftrace tracer. */
+	m36_diag_run();
 
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)

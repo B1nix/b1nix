@@ -20,6 +20,8 @@ INITRAMFS_M31_SMOKE_INC := $(BUILD_DIR)/initramfs_m31_smoke.inc
 INITRAMFS_M31_SETUID_INC := $(BUILD_DIR)/initramfs_m31_setuid.inc
 INITRAMFS_M32_SMOKE_INC := $(BUILD_DIR)/initramfs_m32_smoke.inc
 INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
+INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
+INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -60,6 +62,16 @@ ifeq ($(LOCKDEP),1)
 CFLAGS_EXTRA += -DKERNEL_LOCKDEP=1
 endif
 
+# CC/LD for the clang (default) toolchain. The kernel links with LLVM's ld.lld
+# because the ELF linker script uses GNU-ld options (-z, -T) that Apple's system
+# `ld` rejects. Only override when LD is still make's built-in default ("ld");
+# an explicit `make LD=...` (e.g. the in-guest gcc/binutils build) is respected.
+ifeq ($(TOOLCHAIN),clang)
+ifeq ($(origin LD),default)
+LD := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)
+endif
+endif
+
 COMMON_CFLAGS := \
 	-std=c11 \
 	-g \
@@ -86,7 +98,7 @@ endif
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86/linker.ld
 ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
-ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c
+ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c kernel/arch/x86/coredump.c kernel/arch/x86/gdbstub.c
 else
 $(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86)
 endif
@@ -96,6 +108,10 @@ KERNEL_SOURCES := \
 	kernel/lib/string.c \
 	kernel/lib/klog.c \
 	kernel/lib/stdio.c \
+	kernel/lib/m35_diag.c \
+	kernel/lib/m36_diag.c \
+	kernel/lib/ftrace.c \
+	kernel/lib/ftrace_demo.c \
 	kernel/lib/stdlib.c \
 	kernel/lib/unistd.c \
 	kernel/lib/sha512.c \
@@ -118,6 +134,8 @@ KERNEL_SOURCES := \
 	kernel/fs/ext3.c \
 	kernel/fs/ext4.c \
 	kernel/fs/btrfs.c \
+	kernel/fs/procfs.c \
+	kernel/fs/sysfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
 	kernel/dev/acpi.c \
@@ -193,16 +211,36 @@ all: $(KERNEL_ELF)
 
 objects: $(OBJECTS)
 
-$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT)
+# Symbol-table tooling for kallsyms (M35). nm reads the linked ELF; Apple's
+# /usr/bin/nm handles our ELF output fine, llvm-nm is preferred when present.
+NM ?= $(shell command -v llvm-nm 2>/dev/null || command -v nm 2>/dev/null || echo nm)
+KALLSYMS_S := $(BUILD_DIR)/kallsyms.S
+KALLSYMS_O := $(BUILD_DIR)/kallsyms.o
+
+# Two-pass link for kallsyms:
+#   pass 1 → kernel.elf.stage1 with empty .kallsyms (final .text addresses)
+#   generate the symbol blob from stage1, assemble it
+#   pass 2 → final kernel.elf with the blob appended into .kallsyms
+# The blob lands after .text/.rodata/.data (frozen by 512K padding), so the
+# pass-1 addresses it records remain correct in the final image.
+$(KERNEL_ELF): $(OBJECTS) $(LINKER_SCRIPT) tools/gen_kallsyms.sh
 	@mkdir -p $(dir $@)
-	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS)
+	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@.stage1 $(OBJECTS)
+	NM='$(NM)' sh tools/gen_kallsyms.sh $@.stage1 > $(KALLSYMS_S)
+	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $(KALLSYMS_S) -o $(KALLSYMS_O)
+	$(LD) $(ARCH_LDFLAGS) -T $(LINKER_SCRIPT) -o $@ $(OBJECTS) $(KALLSYMS_O)
 
 $(BUILD_DIR)/%.o: %.c
 	@mkdir -p $(dir $@)
-	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
+	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) $(INSTRUMENT_FLAGS) -c $< -o $@
+
+# M36: only the ftrace demo TU is instrumented, so __cyg_profile hooks fire
+# there and nowhere else (global instrumentation would recurse / slow the
+# whole kernel).
+$(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M30_PIE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -304,6 +342,16 @@ $(INITRAMFS_M30_PIE_INC): userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/li
 	@$(MAKE) -C userspace build/bin/m30_pie
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
+
+$(INITRAMFS_M34_SMOKE_INC): userspace/bin/m34_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m34_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m34_smoke_elf userspace/build/bin/m34_smoke > $@
+
+$(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m35_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m35_smoke_elf userspace/build/bin/m35_smoke > $@
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──

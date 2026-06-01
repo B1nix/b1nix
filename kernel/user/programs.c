@@ -3381,6 +3381,44 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M34: procfs / sysfs synthetic filesystems. */
+  {
+    u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m34_pid < 0) {
+      uwrite("M34-PROC: spawn-fail\n");
+    } else {
+      int m34_status = 0;
+      syscall_dispatch(SYS_WAIT, m34_pid, (u64)(usize)&m34_status, 0, 0, 0, 0);
+    }
+
+    /* Verify the procfs/sysfs-backed monitoring tools actually run and read
+     * back kernel state (they open /proc and /sys under the hood). */
+    const char *free_argv[] = {"free", 0};
+    const char *sysctl_argv[] = {"sysctl", "kernel.osrelease", 0};
+    const char *top_argv[] = {"top", 0};
+    int rc_free = busybox_main(1, free_argv);
+    int rc_sysctl = busybox_main(2, sysctl_argv);
+    int rc_top = busybox_main(1, top_argv);
+    if (rc_free == 0 && rc_sysctl == 0 && rc_top == 0)
+      uwrite("M34-PROC: ok tools\n");
+    else
+      uwrite("M34-PROC: fail tools\n");
+  }
+
+  /* M35: ELF core dump on fatal signal. The child faults; the kernel writes
+   * /tmp/core; the parent validates the ET_CORE ELF. */
+  {
+    u64 m35_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m35-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m35_pid < 0) {
+      uwrite("M35-CORE: spawn-fail\n");
+    } else {
+      int m35_status = 0;
+      syscall_dispatch(SYS_WAIT, m35_pid, (u64)(usize)&m35_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
    * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
    * the base offset correctly, the pointer-table dereferences land on
@@ -4611,6 +4649,9 @@ void user_register_builtin_programs(void) {
 
   /* System utilities */
   user_register_program("/bin/ps", busybox_main);
+  user_register_program("/bin/top", busybox_main);
+  user_register_program("/bin/free", busybox_main);
+  user_register_program("/bin/sysctl", busybox_main);
   user_register_program("/bin/kill", busybox_main);
   user_register_program("/bin/date", busybox_main);
   user_register_program("/bin/uname", busybox_main);

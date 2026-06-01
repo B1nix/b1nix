@@ -24,6 +24,19 @@ SECTIONS
 	}
 	. = ALIGN(512K);  /* Pad .data to 512K boundary — stabilises layout */
 
+	/* M35: kallsyms symbol blob, generated post-link and appended on a second
+	 * link pass. Placed AFTER .text/.rodata/.data (whose addresses are frozen
+	 * by the 512K padding above) so adding it never shifts a function address —
+	 * the pass-1 addresses baked into the blob stay valid in the final image.
+	 * The start/end labels are defined here so the FIRST pass (no blob yet)
+	 * still links: the section is simply empty (start == end) until pass two. */
+	.kallsyms ALIGN(8) : {
+		__kallsyms_start = .;
+		KEEP(*(.kallsyms))
+		__kallsyms_end = .;
+	}
+	. = ALIGN(4K);
+
 	.bss ALIGN(4K) : {
 		*(COMMON)
 		*(.bss .bss.*)

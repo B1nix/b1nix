@@ -197,6 +197,11 @@ int snprintf(char *str, size_t size, const char *fmt, ...)
 	return len;
 }
 
+int vsnprintf(char *str, size_t size, const char *fmt, va_list args)
+{
+	return vsnprintf_impl(str, size, fmt, args);
+}
+
 int printf(const char *fmt, ...)
 {
 	char buf[512];

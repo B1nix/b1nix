@@ -327,6 +327,11 @@ int scheduler_wait(usize pid, int *status);
 int scheduler_waitpid(usize pid, int *status, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
+/* M34: read-only task-table introspection for procfs / ps / top. */
+usize scheduler_task_slots(void);
+struct task *scheduler_task_slot(usize index);
+struct task *scheduler_task_by_pid(usize pid);
+const char *scheduler_state_name(int state);
 void scheduler_set_stdout(int fd);
 int scheduler_get_stdout(void);
 void scheduler_fd_table_init_current(void);

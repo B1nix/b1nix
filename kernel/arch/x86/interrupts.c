@@ -1,8 +1,14 @@
 #include <b1nix/arch_x86.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/bootinfo.h>
+#include <b1nix/gdbstub.h>
 #include <b1nix/io.h>
 #include <b1nix/ioapic.h>
+#include <b1nix/klog.h>
+
+/* M35: ELF core dump on fatal fault (kernel/arch/x86/coredump.c). */
+void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
@@ -426,6 +432,15 @@ void x86_irq_handler(struct interrupt_frame *frame) {
 }
 
 static void x86_exception_handler_inner(struct interrupt_frame *frame) {
+  /* M36: route #BP (int3, vector 3) and #DB (single-step, vector 1) to the
+   * GDB serial stub when the kernel was booted with b1nix.gdb. Off by default
+   * so an ordinary/test boot never blocks waiting on a host debugger. */
+  if ((frame->vector == 3 || frame->vector == 1) &&
+      bootinfo_has_flag("b1nix.gdb")) {
+    gdb_stub_enter(frame);
+    return;
+  }
+
   // Page fault handling for Demand Paging
   if (frame->vector == 14) {
     u64 fault_addr = read_cr2();
@@ -552,6 +567,13 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     console_write(") at rip=0x");
     console_write_hex64(frame->rip);
     console_write(" — terminating\n");
+    /* M35: dump an ELF core for the fault-generating signals before the task
+     * is torn down (its address space is still live here). */
+    if (sig == SIGSEGV || sig == SIGABRT || sig == SIGILL || sig == SIGFPE ||
+        sig == SIGBUS) {
+      coredump_write(frame, sig);
+      console_write("coredump: wrote /tmp/core\n");
+    }
     scheduler_exit_current(128 + sig);
     /* scheduler_exit_current never returns */
     arch_halt();
@@ -609,6 +631,7 @@ void arch_backtrace(u64 rbp, u64 rip) {
   if (rip) {
     console_write("  [0] 0x");
     console_write_hex64(rip);
+    ksym_print(rip);
     frames++;
   }
 
@@ -630,6 +653,7 @@ void arch_backtrace(u64 rbp, u64 rip) {
     console_write_dec(frames);
     console_write("] 0x");
     console_write_hex64(ret_addr);
+    ksym_print(ret_addr);
     frames++;
 
     rbp = next_rbp;
@@ -651,6 +675,7 @@ void arch_backtrace(u64 rbp, u64 rip) {
         console_write_dec(frames);
         console_write("] 0x");
         console_write_hex64(ret);
+        ksym_print(ret);
         frames++;
       }
       scan_rbp = *(volatile u64 *)scan_rbp;

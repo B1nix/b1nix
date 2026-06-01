@@ -1485,6 +1485,61 @@ struct vfs_node *vfs_create_node(enum vfs_node_type type) {
   return n;
 }
 
+void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
+  if (!parent || !child)
+    return;
+  u64 flags;
+  vfs_tree_write_acquire(&flags);
+  child->next_sibling = parent->first_child;
+  parent->first_child = child;
+  vfs_tree_write_release(flags);
+}
+
+isize vfs_readdir_children(struct vfs_node *dir, usize offset,
+                           struct dirent *buf, usize max_entries) {
+  if (!dir || !buf)
+    return -EINVAL;
+
+  usize start = offset, idx = 0, count = 0;
+  if (idx >= start && count < max_entries) {
+    copy_path(buf[count].name, 64, ".");
+    buf[count].type = (u32)VFS_DIRECTORY;
+    buf[count].is_dir = 1;
+    buf[count].is_exec = 1;
+    buf[count].size = 0;
+    count++;
+  }
+  idx++;
+  if (idx >= start && count < max_entries) {
+    copy_path(buf[count].name, 64, "..");
+    buf[count].type = (u32)VFS_DIRECTORY;
+    buf[count].is_dir = 1;
+    buf[count].is_exec = 1;
+    buf[count].size = 0;
+    count++;
+  }
+  idx++;
+
+  u64 flags;
+  vfs_tree_read_acquire(&flags);
+  for (struct vfs_node *child = dir->first_child;
+       child && count < max_entries; child = child->next_sibling) {
+    if (child->deleted)
+      continue;
+    if (idx >= start) {
+      copy_path(buf[count].name, 64, child->name);
+      buf[count].type = (u32)child->inode->type;
+      buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
+      buf[count].is_exec = 0;
+      buf[count].size = child->inode->size;
+      count++;
+    }
+    idx++;
+  }
+  vfs_tree_read_release(flags);
+  return (isize)count;
+}
+
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
 
                               void *data, usize size, u32 flags) {

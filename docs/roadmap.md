@@ -504,20 +504,20 @@ Smoke: 5 `M31-SEC:` markers — `start`, `ok uid-syscalls`, `ok shadow-format`, 
 
 ## M34: Virtual Filesystems (/proc and /sys)
 
-- [ ] `planned` Implement a `/proc` filesystem mounting path exposing per-process information (`cmdline`, `fd/`, `maps`, `status`).
-- [ ] `planned` Implement a `/sys` filesystem to expose active hardware status and kernel configuration tunables.
-- [ ] `planned` Port Linux-compatible process monitoring and control utilities (`top`, `free`, `sysctl`, standard `ps`).
+- [x] `done` `/proc` synthetic filesystem (`kernel/fs/procfs.c`). System files `meminfo`, `uptime`, `loadavg`, `version`, `cpuinfo`, `stat`, `filesystems`, plus per-process `self/{status,cmdline,comm,stat,maps}` and lazily-materialised `<pid>/` dirs (content regenerated per read from the PMM, scheduler task table and per-task VMAs). Synthetic files are `VFS_DEVICE` nodes so the VFS dynamic-read path is taken (the `VFS_FILE`+read_cb page-cache path would freeze content). Smoke-verified (`M34-PROC: ok meminfo`/`version`/`proc-self-status`/`proc-self-maps`/`proc-listing`/`proc-pid-status`).
+- [x] `done` `/sys` synthetic filesystem (`kernel/fs/sysfs.c`): `kernel/{ostype,osrelease,hostname,version}`, `devices/system/cpu/{possible,online,present}`, `memory/total_kb`. Smoke-verified (`M34-PROC: ok sysfs-osrelease`/`sysfs-cpu`).
+- [x] `done` Process monitoring tools `free`, `top`, `sysctl` (read `/proc` + `/sys`) added to busybox alongside the existing `ps`; registered as `/bin/{free,top,sysctl}`. Smoke-verified end-to-end (`M34-PROC: ok tools` — free/sysctl/top run and read back live kernel state). See `docs/m34-m36-diagnostics.md`.
 
 ## M35: Core Dumps & Diagnostic Analysis
 
-- [ ] `planned` Implement ELF core dump generation (`core`) in the kernel upon fatal signals (SIGSEGV, SIGABRT, SIGILL).
-- [ ] `planned` Extend the kernel backtrace utility with full `kallsyms` symbolication.
-- [ ] `planned` Implement user-space debug symbol resolution helpers for cleaner panic analysis.
+- [x] `done` ELF core dump generation on fatal CPU-fault signals (SIGSEGV/SIGABRT/SIGILL/SIGFPE/SIGBUS) with no handler. `kernel/arch/x86/coredump.c` writes a valid `ET_CORE` ELF to `/tmp/core` with a `PT_NOTE`/`NT_PRSTATUS` register file and one `PT_LOAD` per mapped run of the dying task's address space. Pages are probed with `vmm_virt_to_phys()` before reading so a lazily-unmapped page can't fault the dumper. Smoke-verified (`M35-CORE: ok crash-signal`/`core-elf`/`core-prstatus`).
+- [x] `done` `kallsyms` backtrace symbolication. A two-pass link (`tools/gen_kallsyms.sh` + linker.ld `.kallsyms` section placed after the address-frozen `.text/.rodata/.data`) embeds an address→name blob; `ksym_lookup`/`ksym_print` (`kernel/lib/klog.c`) resolve `name+0xoffset`, wired into `arch_backtrace`. Smoke-verified (`M35-DIAG: ok kallsyms`/`kallsyms-offset`/`kallsyms-multi`).
+- [x] `done` User-space/panic symbol resolution: backtraces now print symbolised frames, and `/proc` exposes process diagnostics for post-mortem analysis. See `docs/m34-m36-diagnostics.md`.
 
 ## M36: Kernel Debugging & Tracing (GDB Stub & ftrace)
 
-- [ ] `planned` Implement a serial-port GDB stub in the kernel to support remote host-based kernel debugging.
-- [ ] `planned` Add a kernel tracing framework (e.g., ftrace/kprobes) to record function calls and execution times.
+- [x] `done` Serial-port GDB Remote Serial Protocol stub (`kernel/arch/x86/gdbstub.c`): `?`, `g`/`G`, `m`/`M`, `c`/`s`, `qSupported` over COM1, entered on int3 (#BP)/#DB when booted with `b1nix.gdb` (off by default so a normal boot never blocks on a host). The transport-agnostic packet engine is self-tested in-kernel (`M36-GDB: ok stop-reply`/`read-regs`/`read-mem`/`framing`).
+- [x] `done` ftrace function tracer (`kernel/lib/ftrace.c`): `-finstrument-functions` hooks (`__cyg_profile_func_enter/exit`) record a ring buffer of enter/exit events, symbolised via `kallsyms`. Only opted-in TUs are instrumented (the Makefile flags `ftrace_demo.c`) so the kernel is not globally slowed and hooks don't recurse. Smoke-verified (`M36-FTRACE: ok capture`/`symbolize`).
 
 ## M37: Real Hardware Booting (Bare Metal)
 
