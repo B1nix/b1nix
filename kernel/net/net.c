@@ -292,6 +292,7 @@ static void net_task(void *arg)
 		}
 		net_poll();
 		dhcp_tick(scheduler_get_uptime_ticks());
+		ntp_tick(scheduler_get_uptime_ticks());
 		if (local_ip.bytes[0] == 0) {
 			u64 now = scheduler_get_uptime_ticks();
 			if (now - last_dhcp_retry >= 300) {

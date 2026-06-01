@@ -15,6 +15,11 @@ struct sockaddr {
   char sa_data[14];
 };
 
+struct sockaddr_storage {
+  sa_family_t ss_family;
+  char __ss_padding[126];
+};
+
 #ifndef B1NIX_IN_ADDR_DEFINED
 #define B1NIX_IN_ADDR_DEFINED
 struct in_addr {
@@ -29,6 +34,18 @@ struct sockaddr_in {
   unsigned char sin_zero[8];
 };
 
+struct in6_addr {
+  unsigned char s6_addr[16];
+};
+
+struct sockaddr_in6 {
+  sa_family_t sin6_family;
+  unsigned short sin6_port;
+  unsigned int sin6_flowinfo;
+  struct in6_addr sin6_addr;
+  unsigned int sin6_scope_id;
+};
+
 struct sockaddr_un {
   sa_family_t sun_family;
   char sun_path[108];
@@ -37,10 +54,13 @@ struct sockaddr_un {
 #define AF_UNIX         1
 #define AF_LOCAL        AF_UNIX
 #define AF_INET         2
+#define AF_UNSPEC       0
+#define AF_INET6        10
 
 #define PF_UNIX         AF_UNIX
 #define PF_LOCAL        AF_LOCAL
 #define PF_INET         AF_INET
+#define PF_INET6        AF_INET6
 
 #define SOCK_STREAM     1
 #define SOCK_DGRAM      2
@@ -51,6 +71,10 @@ struct sockaddr_un {
 
 #define SOL_SOCKET      1
 #define SO_KEEPALIVE    9
+#define SO_REUSEADDR    2
+#define SO_TYPE         3
+
+#define MSG_PEEK        0x02
 
 int socket(int domain, int type, int protocol);
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
@@ -61,6 +85,15 @@ ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
 int setsockopt(int sockfd, int level, int optname, const void *optval,
                socklen_t optlen);
+int getsockopt(int sockfd, int level, int optname, void *optval,
+               socklen_t *optlen);
+int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest_addr, socklen_t addrlen);
+ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
+                 struct sockaddr *src_addr, socklen_t *addrlen);
+int shutdown(int sockfd, int how);
 
 #ifdef __cplusplus
 }

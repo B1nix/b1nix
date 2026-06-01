@@ -2,6 +2,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/sched.h>
+#include <b1nix/posix.h>
 #include <string.h>
 
 /* TCP protocol number in IPv4 */
@@ -324,6 +325,19 @@ int tcp_is_established(struct tcp_conn *conn) {
   return conn->state == TCP_ESTABLISHED;
 }
 
+int tcp_is_readable(struct tcp_conn *conn) {
+  if (!conn || !conn->used)
+    return 1;
+  if (conn->recv_len > conn->recv_read)
+    return 1;
+  if (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_CLOSED ||
+      conn->state == TCP_TIME_WAIT || conn->state == TCP_LAST_ACK ||
+      conn->state == TCP_CLOSING) {
+    return 1;
+  }
+  return 0;
+}
+
 /* ── TCP Listen ── */
 int tcp_listen(u16 local_port, int backlog) {
   (void)backlog;
@@ -423,7 +437,7 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
 }
 
 /* ── TCP receive data (non-blocking) ── */
-int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len) {
+int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
   if (!conn)
     return -1;
   if (conn->recv_read >= conn->recv_len) {
@@ -438,12 +452,14 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len) {
     avail = max_len;
 
   memcpy(buf, conn->recv_buf + conn->recv_read, avail);
-  conn->recv_read += (u32)avail;
+  if (!(flags & B1NIX_MSG_PEEK)) {
+    conn->recv_read += (u32)avail;
 
-  /* Compact buffer if all read */
-  if (conn->recv_read >= conn->recv_len) {
-    conn->recv_len = 0;
-    conn->recv_read = 0;
+    /* Compact buffer if all read */
+    if (conn->recv_read >= conn->recv_len) {
+      conn->recv_len = 0;
+      conn->recv_read = 0;
+    }
   }
 
   return (int)avail;
@@ -693,6 +709,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
         ipv4_send(src, IP_PROTO_TCP, ack_pkt, sizeof(ack_pkt));
 
         conn->state = TCP_ESTABLISHED;
+        extern void *vfs_poll_chan;
+        scheduler_wake_all(vfs_poll_chan);
       }
     } else if (flags & TCP_RST) {
       conn->state = TCP_CLOSED;
@@ -745,6 +763,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
         a->window = bswap16(TCP_RECV_BUF_SIZE - conn->recv_len);
         a->checksum = tcp_checksum(net_get_ip(), src, ack_pkt, sizeof(ack_pkt));
         ipv4_send(src, IP_PROTO_TCP, ack_pkt, sizeof(ack_pkt));
+        extern void *vfs_poll_chan;
+        scheduler_wake_all(vfs_poll_chan);
       }
     }
 
@@ -773,11 +793,15 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
       } else if (conn->state == TCP_FIN_WAIT2) {
         tcp_enter_time_wait(conn);
       }
+      extern void *vfs_poll_chan;
+      scheduler_wake_all(vfs_poll_chan);
     }
 
     /* Handle RST */
     if (flags & TCP_RST) {
       conn->state = TCP_CLOSED;
+      extern void *vfs_poll_chan;
+      scheduler_wake_all(vfs_poll_chan);
     }
     break;
 

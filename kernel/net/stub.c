@@ -87,11 +87,12 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len)
 	return -1;
 }
 
-int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len)
+int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags)
 {
 	(void)conn;
 	(void)buf;
 	(void)max_len;
+	(void)flags;
 	return -1;
 }
 

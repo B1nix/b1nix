@@ -41,6 +41,14 @@ struct addrinfo {
 #define EAI_MEMORY    -10
 #define EAI_SYSTEM    -11
 
+#define HOST_NOT_FOUND 1
+#define TRY_AGAIN      2
+#define NO_RECOVERY    3
+#define NO_DATA        4
+#define NO_ADDRESS     NO_DATA
+
+extern int h_errno;
+
 struct hostent *gethostbyname(const char *name);
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res);

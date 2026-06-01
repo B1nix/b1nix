@@ -50,6 +50,9 @@ void dhcp_init(void);
 void dhcp_receive(const void *data, usize size);
 void dhcp_tick(u64 now_ticks);
 
+// NTP (SNTP client)
+void ntp_tick(u64 now_ticks);
+
 // DNS
 void dns_resolve(const char *domain);
 void dns_receive(const void *data, usize size);
@@ -73,8 +76,9 @@ struct tcp_conn;
 struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_is_established(struct tcp_conn *conn);
+int tcp_is_readable(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
-int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len);
+int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);
 int tcp_listen(u16 local_port, int backlog);
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *client_port);

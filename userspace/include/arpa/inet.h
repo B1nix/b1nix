@@ -8,6 +8,14 @@
 extern "C" {
 #endif
 
+#ifndef INET_ADDRSTRLEN
+#define INET_ADDRSTRLEN 16
+#endif
+
+#ifndef INET6_ADDRSTRLEN
+#define INET6_ADDRSTRLEN 46
+#endif
+
 /* x86_64 is little-endian, so host<->network is a byte swap. */
 static inline uint16_t htons(uint16_t x) { return (uint16_t)((x << 8) | (x >> 8)); }
 static inline uint16_t ntohs(uint16_t x) { return htons(x); }

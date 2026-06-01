@@ -52,7 +52,6 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
 }
 
 isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
-  (void)flags;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   
   if (s->domain == B1NIX_AF_UNIX) {
@@ -70,19 +69,28 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     usize pkt_len = s->udp_q_len[slot];
     usize to_copy = len < pkt_len ? len : pkt_len;
     memcpy(buf, s->udp_q_buf[slot], to_copy);
-    s->udp_q_head = (u8)((s->udp_q_head + 1) % 8);
-    s->udp_q_count--;
-    s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
+    if (!(flags & B1NIX_MSG_PEEK)) {
+      s->udp_q_head = (u8)((s->udp_q_head + 1) % 8);
+      s->udp_q_count--;
+      s->recv_len = (s->udp_q_count > 0) ? s->udp_q_len[s->udp_q_head] : 0;
+    }
     return (isize)to_copy;
   }
   if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
-    if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
+    struct tcp_conn *conn = (struct tcp_conn *)s->tcp_conn;
+    if (!s->connected && tcp_is_established(conn)) {
       s->connected = 1;
     }
     if (!s->connected) {
       return -EAGAIN;
     }
-    return tcp_recv((struct tcp_conn *)s->tcp_conn, buf, len);
+    while (!tcp_is_readable(conn)) {
+      if (h->flags & B1NIX_O_NONBLOCK) {
+        return -EAGAIN;
+      }
+      scheduler_block_on(vfs_poll_chan);
+    }
+    return tcp_recv(conn, buf, len, flags);
   }
   return -ENOTCONN;
 }
@@ -112,7 +120,11 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
     }
     /* Simple poll for TCP */
     if (s->connected) {
-      pfd->revents |= B1NIX_POLLIN | B1NIX_POLLOUT;
+      struct tcp_conn *conn = (struct tcp_conn *)s->tcp_conn;
+      if (conn && tcp_is_readable(conn)) {
+        pfd->revents |= B1NIX_POLLIN;
+      }
+      pfd->revents |= B1NIX_POLLOUT;
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
       if (tcp_pending_connections(port)) {
