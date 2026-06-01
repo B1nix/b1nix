@@ -44,6 +44,7 @@ BINARIES := \
 	$(BUILD)/bin/m31_smoke \
 	$(BUILD)/bin/m31_setuid \
 	$(BUILD)/bin/m32_smoke \
+	$(BUILD)/bin/m32_nettool \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/m30_pie

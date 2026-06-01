@@ -22,6 +22,7 @@
 #include "../../build/x86/initramfs_m31_smoke.inc"
 #include "../../build/x86/initramfs_m31_setuid.inc"
 #include "../../build/x86/initramfs_m32_smoke.inc"
+#include "../../build/x86/initramfs_m32_nettool.inc"
 #include "../../build/x86/initramfs_m30_pie.inc"
 #include "../../build/x86/initramfs_m34_smoke.inc"
 #include "../../build/x86/initramfs_m35_smoke.inc"
@@ -377,6 +378,8 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     {"/bin/m32-smoke", (const char *)vfs_m32_smoke_elf,
      sizeof(vfs_m32_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m32-nettool", (const char *)vfs_m32_nettool_elf,
+     sizeof(vfs_m32_nettool_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,

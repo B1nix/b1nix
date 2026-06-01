@@ -19,6 +19,7 @@ INITRAMFS_M29_SMOKE_INC := $(BUILD_DIR)/initramfs_m29_smoke.inc
 INITRAMFS_M31_SMOKE_INC := $(BUILD_DIR)/initramfs_m31_smoke.inc
 INITRAMFS_M31_SETUID_INC := $(BUILD_DIR)/initramfs_m31_setuid.inc
 INITRAMFS_M32_SMOKE_INC := $(BUILD_DIR)/initramfs_m32_smoke.inc
+INITRAMFS_M32_NETTOOL_INC := $(BUILD_DIR)/initramfs_m32_nettool.inc
 INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
 INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
@@ -247,7 +248,7 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -255,6 +256,8 @@ $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M1
 USERSPACE_DEPS := \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/include/*.h) \
+	$(wildcard userspace/include/arpa/*.h) \
+	$(wildcard userspace/include/netinet/*.h) \
 	$(wildcard userspace/include/sys/*.h) \
 	$(wildcard userspace/crt/*.S) \
 	userspace/Makefile \
@@ -344,6 +347,11 @@ $(INITRAMFS_M32_SMOKE_INC): userspace/bin/m32_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m32_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_smoke_elf userspace/build/bin/m32_smoke > $@
+
+$(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/m32_nettool
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
 
 $(INITRAMFS_M30_PIE_INC): userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
 	@$(MAKE) -C userspace build/bin/m30_pie
