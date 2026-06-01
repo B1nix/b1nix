@@ -1110,8 +1110,10 @@ static u64 sys_send(int fd, const void *user_buf, usize len, int flags) {
   enum { SOCKET_IO_MAX = 64 * 1024 };
   if (len == 0)
     return 0;
+  /* A buffer larger than one transfer chunk is legal; send up to the cap and
+   * report how many bytes were taken (the caller loops for the rest). */
   if (len > SOCKET_IO_MAX)
-    return (u64)-EINVAL;
+    len = SOCKET_IO_MAX;
   if (!user_buf)
     return (u64)-EFAULT;
   void *kbuf = kmalloc(len);
@@ -1130,8 +1132,10 @@ static u64 sys_recv(int fd, void *user_buf, usize len, int flags) {
   enum { SOCKET_IO_MAX = 64 * 1024 };
   if (len == 0)
     return 0;
+  /* recv() into a large buffer is legal — it returns however many bytes are
+   * available, up to the cap; don't reject it (curl uses a >64K read buffer). */
   if (len > SOCKET_IO_MAX)
-    return (u64)-EINVAL;
+    len = SOCKET_IO_MAX;
   if (!user_buf)
     return (u64)-EFAULT;
   void *kbuf = kmalloc(len);

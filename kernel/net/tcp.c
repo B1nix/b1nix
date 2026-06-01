@@ -237,10 +237,14 @@ static void tcp_set_checksum(u8 family, struct ipv4_addr v4,
                              const struct in6_addr_k *v6, u8 *pkt, usize len) {
   struct tcp_header *t = (struct tcp_header *)pkt;
   t->checksum = 0;
+  /* The checksum field is network byte order, like every other on-wire field.
+   * Loopback RX does not verify it, but QEMU slirp/NAT and real peers drop a
+   * segment with a wrong checksum — which is why external TCP timed out while
+   * UDP (which already byte-swaps) worked. */
   if (family == B1NIX_AF_INET6)
-    t->checksum = tcp6_checksum(*v6, *v6, pkt, len);
+    t->checksum = bswap16(tcp6_checksum(*v6, *v6, pkt, len));
   else
-    t->checksum = tcp_checksum(net_get_ip(), v4, pkt, len);
+    t->checksum = bswap16(tcp_checksum(net_get_ip(), v4, pkt, len));
 }
 
 /* Checksum + transmit a segment to a connection's peer. */
@@ -361,12 +365,19 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   return conn;
 }
 
-/* Drive a freshly-started connection to ESTABLISHED by polling. */
+/* Drive a freshly-started connection to ESTABLISHED by polling. For a
+ * loopback peer the SYN/SYN-ACK/ACK all complete synchronously inside
+ * tcp_connect_start_af (so this loop exits on the first iteration); for an
+ * off-link peer we must actually wait out the round-trip, hence the per-poll
+ * sleep — without it the loop spins to exhaustion in microseconds. */
 static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
   if (!conn)
     return 0;
-  for (int tries = 0; tries < 200 && conn->state == TCP_SYN_SENT; tries++) {
+  for (int tries = 0; tries < 400 && conn->state == TCP_SYN_SENT; tries++) {
     net_poll();
+    if (conn->state != TCP_SYN_SENT)
+      break;
+    scheduler_sleep_ticks(1);
   }
   if (conn->state != TCP_ESTABLISHED) {
     console_write("tcp: connect failed\n");

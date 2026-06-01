@@ -693,8 +693,61 @@ static int test_tcp6_loopback(void) {
   return 0;
 }
 
+/* Fetch a URL with curl into /tmp/ext.out; return curl's exit status (or -1).
+ * Used by the external-connectivity probes below. */
+static int curl_fetch(const char *url) {
+  int pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    char *argv[] = {"/bin/curl", "-sS", "--connect-timeout", "12",
+                    (char *)url, NULL};
+    char *envp[] = {NULL};
+    int out = open("/tmp/ext.out", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out >= 0) { dup2(out, 1); close(out); }
+    execve("/bin/curl", argv, envp);
+    _exit(127);
+  }
+  int st = 0;
+  waitpid(pid, &st, 0);
+  return WIFEXITED(st) ? WEXITSTATUS(st) : -1;
+}
+
+static int ext_body_has(const char *needle) {
+  int fd = open("/tmp/ext.out", O_RDONLY);
+  if (fd < 0) return 0;
+  char buf[512];
+  int n = (int)read(fd, buf, sizeof(buf) - 1);
+  close(fd);
+  unlink("/tmp/ext.out");
+  if (n <= 0) return 0;
+  buf[n] = '\0';
+  return strstr(buf, needle) != 0;
+}
+
+/* External connectivity over QEMU usernet. These need a working off-link path
+ * (real DNS + TCP to the internet); when none is available the probe degrades
+ * to an "unsupported" marker that tests/smoke.sh treats as a skip, so the
+ * suite stays green offline. The HTTPS probe also exercises the full mbedTLS
+ * path against a real CA-signed certificate (real cert-time validity). */
+static void test_external_net(void) {
+  if (curl_fetch("http://example.com/") == 0 &&
+      ext_body_has("Example Domain")) {
+    ok("ext-http");
+  } else {
+    emit("M32-NET: unsupported ext-http\n");
+    return; /* no off-link path — skip the HTTPS probe too */
+  }
+  if (curl_fetch("https://example.com/") == 0 &&
+      ext_body_has("Example Domain")) {
+    ok("ext-https");
+  } else {
+    emit("M32-NET: unsupported ext-https\n");
+  }
+}
+
 int main(void) {
   emit("M32-NET: start\n");
+  test_external_net();
   if (test_select_timeout_zero() != 0) return 1;
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;

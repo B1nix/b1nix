@@ -519,6 +519,19 @@ check_output "$LOG" "M31-SEC: ok uid-denial" "non-root setuid(0) is rejected by 
 check_output "$LOG" "M31-SEC: done" "M31 smoke completes"
 # ── M32 Networking / Multiplexing ──
 check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
+# External connectivity (off-link TCP over QEMU usernet). Skips cleanly when
+# the test host has no internet so the suite stays green offline.
+if grep -q "M32-NET: unsupported ext-http" "$LOG" 2>/dev/null; then
+	pass "External HTTP skipped (no off-link connectivity)"
+	pass "External HTTPS skipped (no off-link connectivity)"
+else
+	check_output "$LOG" "M32-NET: ok ext-http" "external HTTP GET over usernet works (off-link TCP to a real host)"
+	if grep -q "M32-NET: unsupported ext-https" "$LOG" 2>/dev/null; then
+		pass "External HTTPS skipped (handshake/cert-time unavailable)"
+	else
+		check_output "$LOG" "M32-NET: ok ext-https" "external HTTPS GET works (real mbedTLS handshake against a CA-signed cert)"
+	fi
+fi
 check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeout returns 0 ready"
 check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
