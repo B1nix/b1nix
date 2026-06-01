@@ -24,6 +24,8 @@
 #include "../../build/x86/initramfs_m32_smoke.inc"
 #include "../../build/x86/initramfs_m32_nettool.inc"
 #include "../../build/x86/initramfs_curl.inc"
+#include "../../build/x86/initramfs_wget.inc"
+#include "../../build/x86/initramfs_cacert.inc"
 #include "../../build/x86/initramfs_m30_pie.inc"
 #include "../../build/x86/initramfs_m34_smoke.inc"
 #include "../../build/x86/initramfs_m35_smoke.inc"
@@ -383,6 +385,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m32_nettool_elf), INITRAMFS_EXECUTABLE},
     {"/bin/curl", (const char *)vfs_curl_elf, sizeof(vfs_curl_elf),
      INITRAMFS_EXECUTABLE},
+    {"/bin/wget", (const char *)vfs_wget_elf, sizeof(vfs_wget_elf),
+     INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
@@ -402,6 +406,8 @@ static const struct initramfs_file files[] = {
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/resolv.conf", initramfs_resolv_conf,
      sizeof(initramfs_resolv_conf) - 1, 0},
+    {"/etc/ssl/certs/ca-certificates.crt", (const char *)vfs_cacert_pem,
+     sizeof(vfs_cacert_pem), 0},
     {"/etc/posix-smoke.sh", posix_smoke_script, sizeof(posix_smoke_script) - 1,
      0},
     {"/README", "initramfs is alive\n", 20, 0},

@@ -12,6 +12,19 @@ BUILD_DIR="$ROOT_DIR/build/curl-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
 RANLIB_BIN="${RANLIB:-/opt/homebrew/opt/llvm/bin/llvm-ranlib}"
+B1NIX_TLS="${B1NIX_TLS:-none}"
+
+SSL_FLAGS="--without-ssl"
+TLS_CPPFLAGS=""
+TLS_LDFLAGS=""
+TLS_LIBS=""
+if [ "$B1NIX_TLS" = "mbedtls" ]; then
+  MBEDTLS_PREFIX="$("$ROOT_DIR/tools/build-mbedtls.sh" | tail -n 1)"
+  SSL_FLAGS="--with-mbedtls=$MBEDTLS_PREFIX"
+  TLS_CPPFLAGS="-I$MBEDTLS_PREFIX/include"
+  TLS_LDFLAGS="-L$MBEDTLS_PREFIX/lib"
+  TLS_LIBS="-lmbedx509 -lmbedcrypto"
+fi
 
 mkdir -p "$ROOT_DIR/build/curl-src" "$BUILD_DIR"
 
@@ -30,6 +43,13 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xzf "$tmp" -C "$ROOT_DIR/build/curl-src"
 fi
 
+# Time discipline/NTP can move clocks and confuse autotools dependency checks.
+# Keep generated files newer than *.am/*.ac so make does not require autoreconf.
+find "$SRC_DIR" -exec touch {} +
+find "$SRC_DIR" -name 'Makefile.in' -exec touch {} +
+[ -f "$SRC_DIR/configure" ] && touch "$SRC_DIR/configure"
+[ -f "$SRC_DIR/aclocal.m4" ] && touch "$SRC_DIR/aclocal.m4"
+
 if ! grep -q 'b1nix\*' "$SRC_DIR/config.sub"; then
   tmp_config_sub="$SRC_DIR/config.sub.tmp"
   sed 's/| fiwix\\*/| fiwix* | b1nix*/' "$SRC_DIR/config.sub" > "$tmp_config_sub"
@@ -43,7 +63,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
   "$SRC_DIR/configure" \
     --host=x86_64-b1nix \
     --disable-shared --enable-static \
-    --without-ssl --without-zlib --without-brotli --without-zstd \
+    "$SSL_FLAGS" --without-zlib --without-brotli --without-zstd \
     --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \
     --without-ngtcp2 \
     --disable-ldap --disable-ldaps --disable-ftp --disable-file \
@@ -54,7 +74,9 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-cookies --disable-alt-svc --disable-hsts \
     --disable-websockets --disable-headers-api --disable-mime \
     --disable-dateparse \
-    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN"
+    --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
+    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+    CPPFLAGS="$TLS_CPPFLAGS" LDFLAGS="$TLS_LDFLAGS" LIBS="$TLS_LIBS"
 )
 
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}" libcurl.la

@@ -22,6 +22,7 @@ preprocess_only=0
 output=""
 args=""
 inputs=""
+ldargs=""
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -40,6 +41,7 @@ while [ $# -gt 0 ]; do
       inputs="$inputs $1"
       ;;
     -l*|-L*)
+      ldargs="$ldargs $1"
       ;;
     *)
       args="$args $1"
@@ -73,4 +75,4 @@ for input in $inputs; do
 done
 
 [ -n "$output" ] || output="a.out"
-"$LD" -m elf_x86_64 -T "$LINKER" -o "$output" "$CRT0" $objs --whole-archive "$LIB" --no-whole-archive
+"$LD" -m elf_x86_64 -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs --whole-archive "$LIB" --no-whole-archive
