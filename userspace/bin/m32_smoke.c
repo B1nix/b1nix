@@ -694,13 +694,21 @@ static int test_tcp6_loopback(void) {
 }
 
 /* Fetch a URL with curl into /tmp/ext.out; return curl's exit status (or -1).
+ * `family` pins the IP version ("-4"/"-6") or is NULL to let curl choose.
  * Used by the external-connectivity probes below. */
-static int curl_fetch(const char *url) {
+static int curl_fetch(const char *url, const char *family) {
   int pid = fork();
   if (pid < 0) return -1;
   if (pid == 0) {
-    char *argv[] = {"/bin/curl", "-sS", "--connect-timeout", "12",
-                    (char *)url, NULL};
+    char *argv[8];
+    int a = 0;
+    argv[a++] = "/bin/curl";
+    argv[a++] = "-sS";
+    if (family) argv[a++] = (char *)family;
+    argv[a++] = "--connect-timeout";
+    argv[a++] = "12";
+    argv[a++] = (char *)url;
+    argv[a] = NULL;
     char *envp[] = {NULL};
     int out = open("/tmp/ext.out", O_CREAT | O_TRUNC | O_WRONLY, 0644);
     if (out >= 0) { dup2(out, 1); close(out); }
@@ -728,20 +736,40 @@ static int ext_body_has(const char *needle) {
  * (real DNS + TCP to the internet); when none is available the probe degrades
  * to an "unsupported" marker that tests/smoke.sh treats as a skip, so the
  * suite stays green offline. The HTTPS probe also exercises the full mbedTLS
- * path against a real CA-signed certificate (real cert-time validity). */
+ * path against a real CA-signed certificate (real cert-time validity). The
+ * IPv6 probes (curl -6) exercise the kernel's off-link IPv6 datapath end to
+ * end; they degrade the same way when the usernet link has no IPv6 route. */
 static void test_external_net(void) {
-  if (curl_fetch("http://example.com/") == 0 &&
+  if (curl_fetch("http://example.com/", "-4") == 0 &&
       ext_body_has("Example Domain")) {
     ok("ext-http");
   } else {
     emit("M32-NET: unsupported ext-http\n");
-    return; /* no off-link path — skip the HTTPS probe too */
+    /* No off-link path at all — skip every remaining external probe. */
+    emit("M32-NET: unsupported ext-https\n");
+    emit("M32-NET: unsupported ext-http6\n");
+    emit("M32-NET: unsupported ext-https6\n");
+    return;
   }
-  if (curl_fetch("https://example.com/") == 0 &&
+  if (curl_fetch("https://example.com/", "-4") == 0 &&
       ext_body_has("Example Domain")) {
     ok("ext-https");
   } else {
     emit("M32-NET: unsupported ext-https\n");
+  }
+  /* IPv6 reachability is independent of IPv4: a usernet link may route v4 but
+   * not v6, so each v6 probe skips on its own rather than gating the suite. */
+  if (curl_fetch("http://example.com/", "-6") == 0 &&
+      ext_body_has("Example Domain")) {
+    ok("ext-http6");
+  } else {
+    emit("M32-NET: unsupported ext-http6\n");
+  }
+  if (curl_fetch("https://example.com/", "-6") == 0 &&
+      ext_body_has("Example Domain")) {
+    ok("ext-https6");
+  } else {
+    emit("M32-NET: unsupported ext-https6\n");
   }
 }
 

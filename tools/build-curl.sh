@@ -76,7 +76,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-gopher --disable-imap --disable-mqtt --disable-pop3 \
     --disable-rtsp --disable-smb --disable-smtp --disable-telnet \
     --disable-tftp --disable-dict --disable-manual --disable-docs \
-    --disable-threaded-resolver --disable-ipv6 --disable-unix-sockets \
+    --disable-threaded-resolver --enable-ipv6 --disable-unix-sockets \
     --disable-cookies --disable-alt-svc --disable-hsts \
     --disable-websockets --disable-headers-api --disable-mime \
     --disable-dateparse \

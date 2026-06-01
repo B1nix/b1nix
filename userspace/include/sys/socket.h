@@ -57,6 +57,7 @@ struct sockaddr_un {
 #define AF_UNSPEC       0
 #define AF_INET6        10
 
+#define PF_UNSPEC       AF_UNSPEC
 #define PF_UNIX         AF_UNIX
 #define PF_LOCAL        AF_LOCAL
 #define PF_INET         AF_INET

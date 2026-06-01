@@ -532,6 +532,18 @@ else
 		check_output "$LOG" "M32-NET: ok ext-https" "external HTTPS GET works (real mbedTLS handshake against a CA-signed cert)"
 	fi
 fi
+# External IPv6 connectivity (curl -6 over the kernel off-link IPv6 datapath).
+# Skips on its own when the usernet link has no IPv6 route.
+if grep -q "M32-NET: unsupported ext-http6" "$LOG" 2>/dev/null; then
+	pass "External HTTP over IPv6 skipped (no off-link IPv6 route)"
+else
+	check_output "$LOG" "M32-NET: ok ext-http6" "external HTTP GET over IPv6 works (curl -6, off-link IPv6 datapath)"
+fi
+if grep -q "M32-NET: unsupported ext-https6" "$LOG" 2>/dev/null; then
+	pass "External HTTPS over IPv6 skipped (no off-link IPv6 route)"
+else
+	check_output "$LOG" "M32-NET: ok ext-https6" "external HTTPS GET over IPv6 works (curl -6 + mbedTLS over off-link IPv6)"
+fi
 check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeout returns 0 ready"
 check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
