@@ -110,6 +110,17 @@ static int test_dns_libc(void) {
     fail("inet-ntop"); return -1;
   }
   ok("inet-pton-ntop");
+  unsigned char raw6[16];
+  if (inet_pton(AF_INET6, "::1", raw6) != 1 ||
+      raw6[15] != 1) {
+    fail("inet6-pton"); return -1;
+  }
+  char back6[INET6_ADDRSTRLEN];
+  if (!inet_ntop(AF_INET6, raw6, back6, sizeof(back6)) ||
+      strcmp(back6, "0:0:0:0:0:0:0:1") != 0) {
+    fail("inet6-ntop"); return -1;
+  }
+  ok("inet6-pton-ntop");
 
   /* gethostbyname on a dotted-quad: numeric fast path, no DNS query. */
   struct hostent *he = gethostbyname("10.0.2.2");
@@ -134,6 +145,19 @@ static int test_dns_libc(void) {
   freeaddrinfo(res);
   if (!port_ok || !addr_ok) { fail("getaddrinfo"); return -1; }
   ok("getaddrinfo");
+
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_INET6;
+  hints.ai_socktype = SOCK_STREAM;
+  if (getaddrinfo("::1", "443", &hints, &res) != 0 || !res) {
+    fail("getaddrinfo-inet6"); return -1;
+  }
+  struct sockaddr_in6 *sa6 = (struct sockaddr_in6 *)res->ai_addr;
+  int port6_ok = (ntohs(sa6->sin6_port) == 443);
+  int addr6_ok = (sa6->sin6_addr.s6_addr[15] == 1);
+  freeaddrinfo(res);
+  if (!port6_ok || !addr6_ok) { fail("getaddrinfo-inet6"); return -1; }
+  ok("getaddrinfo-inet6");
   return 0;
 }
 
@@ -213,6 +237,28 @@ static int run_server(unsigned short port) {
   const char *resp = "HTTP/1.0 200 OK\r\nContent-Length: 9\r\n\r\nm32-http";
   send(cfd, resp, strlen(resp), 0);
   close(cfd);
+
+  cfd = accept(lfd, 0, 0);
+  if (cfd < 0) {
+    close(lfd);
+    return 9;
+  }
+  n = recv_with_retry(cfd, buf, sizeof(buf) - 1);
+  if (n <= 0) {
+    close(cfd);
+    close(lfd);
+    return 10;
+  }
+  buf[n] = '\0';
+  if (!strstr(buf, "GET /wget-test")) {
+    close(cfd);
+    close(lfd);
+    return 11;
+  }
+  const char *wget_resp = "HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nwget-ok";
+  send(cfd, wget_resp, strlen(wget_resp), 0);
+  close(cfd);
+
   close(lfd);
   return 0;
 }
@@ -263,6 +309,238 @@ static int test_tcp_client_server(void) {
     return -1;
   }
   ok("http-get");
+
+  int wget_pid = fork();
+  if (wget_pid < 0) {
+    fail("wget-fork");
+    return -1;
+  }
+  if (wget_pid == 0) {
+    char *wget_argv[] = {"/bin/wget", "-t", "1", "-o", "/tmp/wget.log", "-O", "/tmp/wget.out", "http://127.0.0.1:3232/wget-test", NULL};
+    char *wget_envp[] = {NULL};
+    execve("/bin/wget", wget_argv, wget_envp);
+    _exit(127);
+  }
+  int wget_status = 0;
+  waitpid(wget_pid, &wget_status, 0);
+
+  int log_fd = open("/tmp/wget.log", O_RDONLY);
+  if (log_fd >= 0) {
+    char log_buf[1024];
+    int nr;
+    emit("--- wget log start ---\n");
+    while ((nr = read(log_fd, log_buf, sizeof(log_buf) - 1)) > 0) {
+      log_buf[nr] = '\0';
+      emit(log_buf);
+    }
+    emit("--- wget log end ---\n");
+    close(log_fd);
+    unlink("/tmp/wget.log");
+  }
+
+  if (!WIFEXITED(wget_status) || WEXITSTATUS(wget_status) != 0) {
+    fail("wget-exec");
+    return -1;
+  }
+
+  int wget_fd = open("/tmp/wget.out", O_RDONLY);
+  if (wget_fd < 0) {
+    fail("wget-file-open");
+    return -1;
+  }
+  char wget_buf[32];
+  int wget_read = read(wget_fd, wget_buf, sizeof(wget_buf) - 1);
+  close(wget_fd);
+  unlink("/tmp/wget.out");
+  if (wget_read != 7 || memcmp(wget_buf, "wget-ok", 7) != 0) {
+    fail("wget-content");
+    return -1;
+  }
+  ok("wget-loopback");
+
+  int curl_pid = fork();
+  if (curl_pid < 0) {
+    fail("curl-fork");
+    return -1;
+  }
+  if (curl_pid == 0) {
+    char *curl_argv[] = {"/bin/curl", "--version", NULL};
+    char *curl_envp[] = {NULL};
+    int out = open("/tmp/curl.ver", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out >= 0) {
+      dup2(out, 1);
+      close(out);
+    }
+    int err = open("/tmp/curl.ver.err", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (err >= 0) {
+      dup2(err, 2);
+      close(err);
+    }
+    execve("/bin/curl", curl_argv, curl_envp);
+    _exit(127);
+  }
+  int curl_status = 0;
+  waitpid(curl_pid, &curl_status, 0);
+  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
+    emit("M32-NET: unsupported curl-tls-suite\n");
+    unlink("/tmp/curl.ver.err");
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fail("tcp-server");
+      return -1;
+    }
+    ok("tcp-server");
+    return 0;
+  }
+  unlink("/tmp/curl.ver.err");
+
+  int curl_fd = open("/tmp/curl.ver", O_RDONLY);
+  if (curl_fd < 0) {
+    emit("M32-NET: unsupported curl-tls-suite\n");
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fail("tcp-server");
+      return -1;
+    }
+    ok("tcp-server");
+    return 0;
+  }
+  char curl_buf[1024];
+  int curl_n = read(curl_fd, curl_buf, sizeof(curl_buf) - 1);
+  close(curl_fd);
+  unlink("/tmp/curl.ver");
+  if (curl_n <= 0) {
+    emit("M32-NET: unsupported curl-tls-suite\n");
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fail("tcp-server");
+      return -1;
+    }
+    ok("tcp-server");
+    return 0;
+  }
+  curl_buf[curl_n] = '\0';
+  if (!strstr(curl_buf, "https")) {
+    emit("M32-NET: unsupported curl-tls-suite\n");
+    int status = 0;
+    waitpid(pid, &status, 0);
+    if (!WIFEXITED(status) || WEXITSTATUS(status) != 0) {
+      fail("tcp-server");
+      return -1;
+    }
+    ok("tcp-server");
+    return 0;
+  }
+  ok("curl-https-enabled");
+
+  curl_pid = fork();
+  if (curl_pid < 0) {
+    fail("curl-policy-fork");
+    return -1;
+  }
+  if (curl_pid == 0) {
+    char *curl_help_argv[] = {"/bin/curl", "--help", "tls", NULL};
+    char *curl_help_envp[] = {NULL};
+    int out = open("/tmp/curl.help", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out >= 0) {
+      dup2(out, 1);
+      close(out);
+    }
+    execve("/bin/curl", curl_help_argv, curl_help_envp);
+    _exit(127);
+  }
+  waitpid(curl_pid, &curl_status, 0);
+  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
+    fail("curl-policy-help");
+    return -1;
+  }
+  curl_fd = open("/tmp/curl.help", O_RDONLY);
+  if (curl_fd < 0) {
+    fail("curl-policy-open");
+    return -1;
+  }
+  curl_n = read(curl_fd, curl_buf, sizeof(curl_buf) - 1);
+  close(curl_fd);
+  unlink("/tmp/curl.help");
+  if (curl_n <= 0) {
+    fail("curl-policy-read");
+    return -1;
+  }
+  curl_buf[curl_n] = '\0';
+  if (!strstr(curl_buf, "--cert-status") ||
+      !strstr(curl_buf, "--crlfile") ||
+      !strstr(curl_buf, "--pinnedpubkey")) {
+    fail("curl-policy-flags");
+    return -1;
+  }
+  ok("curl-policy-flags");
+
+  curl_pid = fork();
+  if (curl_pid < 0) {
+    fail("curl-https-fork");
+    return -1;
+  }
+  if (curl_pid == 0) {
+    char *curl_tls_argv[] = {
+      "/bin/curl", "--connect-timeout", "8", "-sS",
+      "https://sha256.badssl.com/", NULL
+    };
+    char *curl_tls_envp[] = {NULL};
+    int out = open("/tmp/curl.https", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (out >= 0) {
+      dup2(out, 1);
+      close(out);
+    }
+    execve("/bin/curl", curl_tls_argv, curl_tls_envp);
+    _exit(127);
+  }
+  waitpid(curl_pid, &curl_status, 0);
+  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
+    fail("curl-https-handshake");
+    return -1;
+  }
+  curl_fd = open("/tmp/curl.https", O_RDONLY);
+  if (curl_fd < 0) {
+    fail("curl-https-open");
+    return -1;
+  }
+  curl_n = read(curl_fd, curl_buf, sizeof(curl_buf) - 1);
+  close(curl_fd);
+  unlink("/tmp/curl.https");
+  if (curl_n <= 0) {
+    fail("curl-https-read");
+    return -1;
+  }
+  curl_buf[curl_n] = '\0';
+  if (!strstr(curl_buf, "badssl.com")) {
+    fail("curl-https-content");
+    return -1;
+  }
+  ok("curl-https-handshake");
+
+  curl_pid = fork();
+  if (curl_pid < 0) {
+    fail("curl-https-selfsigned-fork");
+    return -1;
+  }
+  if (curl_pid == 0) {
+    char *curl_bad_argv[] = {
+      "/bin/curl", "--connect-timeout", "8", "-sS",
+      "https://self-signed.badssl.com/", NULL
+    };
+    char *curl_bad_envp[] = {NULL};
+    execve("/bin/curl", curl_bad_argv, curl_bad_envp);
+    _exit(127);
+  }
+  waitpid(curl_pid, &curl_status, 0);
+  if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
+    fail("curl-https-selfsigned-reject");
+    return -1;
+  }
+  ok("curl-https-selfsigned-reject");
 
   int status = 0;
   waitpid(pid, &status, 0);

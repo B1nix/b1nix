@@ -523,10 +523,21 @@ check_output "$LOG" "M32-NET: ok select-timeout-zero" "select() with zero timeou
 check_output "$LOG" "M32-NET: ok select-pipe-ready" "select() reports a buffered pipe as readable"
 check_output "$LOG" "M32-NET: ok select-multi-fd" "select() across multiple fds isolates readability"
 check_output "$LOG" "M32-NET: ok inet-pton-ntop" "libc inet_pton/inet_ntop round-trip"
+check_output "$LOG" "M32-NET: ok inet6-pton-ntop" "libc inet_pton/inet_ntop AF_INET6 round-trip"
 check_output "$LOG" "M32-NET: ok gethostbyname-numeric" "libc gethostbyname resolves a dotted-quad"
 check_output "$LOG" "M32-NET: ok getaddrinfo" "libc getaddrinfo fills sockaddr_in"
+check_output "$LOG" "M32-NET: ok getaddrinfo-inet6" "libc getaddrinfo fills sockaddr_in6 for numeric ::1"
 check_output "$LOG" "M32-NET: ok tcp-echo" "TCP loopback client/server echo works through sockets"
 check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange works over TCP"
+check_output "$LOG" "M32-NET: ok wget-loopback" "Wget HTTP client download works over TCP loopback"
+if grep -q "M32-NET: unsupported curl-tls-suite" "$LOG" 2>/dev/null; then
+	pass "Curl TLS suite skipped (curl unavailable or built without HTTPS)"
+else
+	check_output "$LOG" "M32-NET: ok curl-https-enabled" "Curl reports HTTPS protocol support in --version output"
+	check_output "$LOG" "M32-NET: ok curl-policy-flags" "Curl exposes TLS policy controls (cert-status/crlfile/pinnedpubkey)"
+	check_output "$LOG" "M32-NET: ok curl-https-handshake" "Curl performs a real HTTPS request (TLS handshake path)"
+	check_output "$LOG" "M32-NET: ok curl-https-selfsigned-reject" "Curl rejects an invalid self-signed chain without -k"
+fi
 check_output "$LOG" "M32-NET: ok tcp-server" "TCP listener accepts and exits cleanly"
 check_output "$LOG" "M32-NET: done" "M32 smoke completes"
 # ── M32 TCP sliding-window flow control + M23 DNS resolver (kernel net smoke) ──
