@@ -40,6 +40,15 @@ struct addrinfo {
 #define EAI_SERVICE   -8
 #define EAI_MEMORY    -10
 #define EAI_SYSTEM    -11
+#define EAI_OVERFLOW  -12
+
+/* getnameinfo() flags */
+#define NI_NUMERICHOST 0x01
+#define NI_NUMERICSERV 0x02
+#define NI_NAMEREQD    0x04
+#define NI_DGRAM       0x10
+#define NI_MAXHOST     1025
+#define NI_MAXSERV     32
 
 #define HOST_NOT_FOUND 1
 #define TRY_AGAIN      2
@@ -54,6 +63,8 @@ int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res);
 void freeaddrinfo(struct addrinfo *res);
 const char *gai_strerror(int errcode);
+int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
+                socklen_t hostlen, char *serv, socklen_t servlen, int flags);
 
 #ifdef __cplusplus
 }

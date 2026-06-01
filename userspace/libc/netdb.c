@@ -123,15 +123,37 @@ const char *inet_ntop(int af, const void *src, char *dst, socklen_t size) {
   }
   if (af == AF_INET6) {
     const unsigned char *b = (const unsigned char *)src;
+    unsigned g[8];
+    for (int k = 0; k < 8; k++)
+      g[k] = ((unsigned)b[2 * k] << 8) | b[2 * k + 1];
+    /* RFC 5952: collapse the longest run (>= 2) of zero groups to "::". */
+    int best = -1, bestlen = 0, cur = -1, curlen = 0;
+    for (int k = 0; k < 8; k++) {
+      if (g[k] == 0) {
+        if (cur < 0) { cur = k; curlen = 1; } else { curlen++; }
+        if (curlen > bestlen) { best = cur; bestlen = curlen; }
+      } else {
+        cur = -1;
+        curlen = 0;
+      }
+    }
+    if (bestlen < 2) best = -1;
     char tmp[INET6_ADDRSTRLEN];
-    int n = snprintf(
-        tmp, sizeof(tmp), "%x:%x:%x:%x:%x:%x:%x:%x",
-        ((unsigned)b[0] << 8) | b[1], ((unsigned)b[2] << 8) | b[3],
-        ((unsigned)b[4] << 8) | b[5], ((unsigned)b[6] << 8) | b[7],
-        ((unsigned)b[8] << 8) | b[9], ((unsigned)b[10] << 8) | b[11],
-        ((unsigned)b[12] << 8) | b[13], ((unsigned)b[14] << 8) | b[15]);
-    if (n < 0 || (socklen_t)n >= size) return NULL;
-    memcpy(dst, tmp, (size_t)n + 1);
+    int pos = 0, k = 0;
+    while (k < 8) {
+      if (k == best) {
+        tmp[pos++] = ':';
+        k += bestlen;
+        if (k == 8) tmp[pos++] = ':';
+        continue;
+      }
+      if (k > 0) tmp[pos++] = ':';
+      pos += snprintf(tmp + pos, sizeof(tmp) - (size_t)pos, "%x", g[k]);
+      k++;
+    }
+    tmp[pos] = '\0';
+    if ((socklen_t)pos >= size) return NULL;
+    memcpy(dst, tmp, (size_t)pos + 1);
     return dst;
   }
   return NULL;
@@ -326,4 +348,41 @@ void freeaddrinfo(struct addrinfo *res) {
     free(res);
     res = next;
   }
+}
+
+int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
+                socklen_t hostlen, char *serv, socklen_t servlen, int flags) {
+  (void)salen;
+  (void)flags;
+  if (!sa) return EAI_FAIL;
+
+  unsigned short port = 0;
+  if (sa->sa_family == AF_INET) {
+    const struct sockaddr_in *s4 = (const struct sockaddr_in *)sa;
+    if (host && hostlen &&
+        !inet_ntop(AF_INET, &s4->sin_addr, host, hostlen))
+      return EAI_OVERFLOW;
+    port = ntohs(s4->sin_port);
+  } else if (sa->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *s6 = (const struct sockaddr_in6 *)sa;
+    if (host && hostlen &&
+        !inet_ntop(AF_INET6, &s6->sin6_addr, host, hostlen))
+      return EAI_OVERFLOW;
+    port = ntohs(s6->sin6_port);
+  } else {
+    return EAI_FAMILY;
+  }
+
+  if (serv && servlen) {
+    char rev[8];
+    int ri = 0;
+    unsigned short p = port;
+    if (p == 0) rev[ri++] = '0';
+    while (p) { rev[ri++] = (char)('0' + (p % 10)); p /= 10; }
+    if ((socklen_t)(ri + 1) > servlen) return EAI_OVERFLOW;
+    int n = 0;
+    while (ri) serv[n++] = rev[--ri];
+    serv[n] = '\0';
+  }
+  return 0;
 }

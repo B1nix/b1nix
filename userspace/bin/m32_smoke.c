@@ -118,7 +118,7 @@ static int test_dns_libc(void) {
   }
   char back6[INET6_ADDRSTRLEN];
   if (!inet_ntop(AF_INET6, raw6, back6, sizeof(back6)) ||
-      strcmp(back6, "0:0:0:0:0:0:0:1") != 0) {
+      strcmp(back6, "::1") != 0) {
     fail("inet6-ntop"); return -1;
   }
   ok("inet6-pton-ntop");
@@ -745,9 +745,82 @@ static void test_external_net(void) {
   }
 }
 
+/* getnameinfo() numeric round-trip for both families. */
+static int test_getnameinfo(void) {
+  char host[64], serv[16];
+  struct sockaddr_in6 s6;
+  memset(&s6, 0, sizeof(s6));
+  s6.sin6_family = AF_INET6;
+  s6.sin6_port = htons(8080);
+  s6.sin6_addr = in6addr_loopback;
+  if (getnameinfo((struct sockaddr *)&s6, sizeof(s6), host, sizeof(host), serv,
+                  sizeof(serv), NI_NUMERICHOST | NI_NUMERICSERV) != 0 ||
+      strcmp(host, "::1") != 0 || strcmp(serv, "8080") != 0) {
+    fail("getnameinfo6");
+    return -1;
+  }
+  struct sockaddr_in s4;
+  memset(&s4, 0, sizeof(s4));
+  s4.sin_family = AF_INET;
+  s4.sin_port = htons(80);
+  s4.sin_addr.s_addr = inet_addr("127.0.0.1");
+  if (getnameinfo((struct sockaddr *)&s4, sizeof(s4), host, sizeof(host), serv,
+                  sizeof(serv), 0) != 0 ||
+      strcmp(host, "127.0.0.1") != 0 || strcmp(serv, "80") != 0) {
+    fail("getnameinfo4");
+    return -1;
+  }
+  ok("getnameinfo");
+  return 0;
+}
+
+/* Dual-stack: an AF_INET6 socket sends to ::ffff:127.0.0.1 and the datagram is
+ * delivered to a plain AF_INET socket over the IPv4 loopback path. */
+static int test_v4mapped_udp(void) {
+  unsigned short port = 6790;
+  int rx = socket(AF_INET, SOCK_DGRAM, 0);
+  if (rx < 0) { fail("v4mapped-socket"); return -1; }
+  struct sockaddr_in la;
+  memset(&la, 0, sizeof(la));
+  la.sin_family = AF_INET;
+  la.sin_port = htons(port);
+  la.sin_addr.s_addr = inet_addr("127.0.0.1");
+  if (bind(rx, (struct sockaddr *)&la, sizeof(la)) < 0) {
+    fail("v4mapped-bind");
+    return -1;
+  }
+  int tx = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (tx < 0) { fail("v4mapped-tx"); return -1; }
+  struct sockaddr_in6 pa;
+  memset(&pa, 0, sizeof(pa));
+  pa.sin6_family = AF_INET6;
+  pa.sin6_port = htons(port);
+  pa.sin6_addr.s6_addr[10] = 0xff;
+  pa.sin6_addr.s6_addr[11] = 0xff;
+  pa.sin6_addr.s6_addr[12] = 127;
+  pa.sin6_addr.s6_addr[15] = 1;
+  if (connect(tx, (struct sockaddr *)&pa, sizeof(pa)) < 0) {
+    fail("v4mapped-connect");
+    return -1;
+  }
+  if (send(tx, "v4map", 5, 0) != 5) { fail("v4mapped-send"); return -1; }
+  char buf[16];
+  int n = (int)recv(rx, buf, sizeof(buf), 0);
+  close(tx);
+  close(rx);
+  if (n != 5 || memcmp(buf, "v4map", 5) != 0) {
+    fail("v4mapped-udp");
+    return -1;
+  }
+  ok("v4mapped-udp");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   test_external_net();
+  if (test_getnameinfo() != 0)         return 1;
+  if (test_v4mapped_udp() != 0)        return 1;
   if (test_select_timeout_zero() != 0) return 1;
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;

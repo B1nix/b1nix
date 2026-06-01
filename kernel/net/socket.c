@@ -18,6 +18,15 @@ static u16 ntoh16(u16 value) {
   return (u16)((value << 8) | (value >> 8));
 }
 
+/* IPv4-mapped IPv6 address ::ffff:a.b.c.d (dual-stack): the first 10 bytes are
+ * zero, then 0xffff, then the 4 IPv4 octets. */
+static int in6_is_v4mapped(const struct in6_addr_k *a) {
+  for (int i = 0; i < 10; i++)
+    if (a->bytes[i] != 0)
+      return 0;
+  return a->bytes[10] == 0xff && a->bytes[11] == 0xff;
+}
+
 /* Bridge functions to avoid including private net headers in vfs.h */
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
   (void)flags;
@@ -33,6 +42,14 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
         return -ENOTCONN;
       struct in6_addr_k dst;
       memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+      if (in6_is_v4mapped(&dst)) {
+        /* Dual-stack: ::ffff:a.b.c.d is delivered over the IPv4 path. */
+        struct ipv4_addr v4 = {{dst.bytes[12], dst.bytes[13], dst.bytes[14],
+                                dst.bytes[15]}};
+        udp_send_net(v4, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf,
+                     len);
+        return (isize)len;
+      }
       udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf, len);
       return (isize)len;
     }

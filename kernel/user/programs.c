@@ -2975,7 +2975,7 @@ static void poll_smoke_check(void) {
 static void tcp_smoke_check(void) {
   const u16 listen_port = 56001;
   const u16 remote_port = 40000;
-  struct ipv4_addr remote_ip = {{10, 0, 2, 2}};
+  struct ipv4_addr remote_ip = {{192, 0, 2, 1}}; /* RFC 5737 TEST-NET: routes via the gateway (ARP cached, no retransmit stall) but is unreachable, so slirp cannot quickly RST the crafted conn and race the window check */
   const u32 remote_seq = 1000;
 
   int fd = vfs_socket(B1NIX_AF_INET, B1NIX_SOCK_STREAM, 0);
@@ -3067,7 +3067,7 @@ static void tcp_smoke_check(void) {
 static void tcp_window_smoke_check(void) {
   const u16 listen_port = 56002;
   const u16 remote_port = 40002;
-  struct ipv4_addr remote_ip = {{10, 0, 2, 2}};
+  struct ipv4_addr remote_ip = {{192, 0, 2, 1}}; /* RFC 5737 TEST-NET: routes via the gateway (ARP cached, no retransmit stall) but is unreachable, so slirp cannot quickly RST the crafted conn and race the window check */
   const u32 remote_seq = 5000;
 
   if (tcp_listen(listen_port, 1) < 0) {
