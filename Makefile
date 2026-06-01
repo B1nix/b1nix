@@ -192,6 +192,7 @@ KERNEL_SOURCES += \
 	kernel/net/ethernet.c \
 	kernel/net/arp.c \
 	kernel/net/ipv4.c \
+	kernel/net/ipv6.c \
 	kernel/net/icmp.c \
 	kernel/net/udp.c \
 	kernel/net/tcp.c \

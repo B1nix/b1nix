@@ -3172,6 +3172,35 @@ static void dns_smoke_check(void) {
   } else {
     uwrite("DNS-SMOKE: fail resolv-conf\n");
   }
+
+  /* AAAA parse: a response whose answer is a 16-byte IPv6 address
+   * (2001:db8::1). Deterministic and offline, like the A-record case. */
+  static const u8 resp6[] = {
+      0x12, 0x34,             /* id 0x1234 */
+      0x81, 0x80,             /* flags: response */
+      0x00, 0x01,             /* qdcount 1 */
+      0x00, 0x01,             /* ancount 1 */
+      0x00, 0x00, 0x00, 0x00, /* ns/ar 0 */
+      /* question: example.com AAAA IN */
+      0x07, 'e', 'x', 'a', 'm', 'p', 'l', 'e',
+      0x03, 'c', 'o', 'm', 0x00,
+      0x00, 0x1C, 0x00, 0x01,
+      /* answer: ptr->qname, AAAA(28), IN, ttl, rdlen 16, 2001:db8::1 */
+      0xC0, 0x0C,
+      0x00, 0x1C, 0x00, 0x01,
+      0x00, 0x00, 0x00, 0x3C,
+      0x00, 0x10,
+      0x20, 0x01, 0x0d, 0xb8, 0x00, 0x00, 0x00, 0x00,
+      0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x01};
+
+  dns_receive(resp6, sizeof(resp6));
+  u8 ip6[16];
+  if (dns_last_result6(ip6) && ip6[0] == 0x20 && ip6[1] == 0x01 &&
+      ip6[2] == 0x0d && ip6[3] == 0xb8 && ip6[15] == 0x01) {
+    uwrite("DNS-SMOKE: ok parse-aaaa-record\n");
+  } else {
+    uwrite("DNS-SMOKE: fail parse-aaaa-record\n");
+  }
 }
 
 static int lock_smoke_main(int argc, const char **argv) {
@@ -3755,6 +3784,7 @@ static int init_main(int argc, const char **argv) {
   tcp_smoke_check();
   tcp_window_smoke_check();
   dns_smoke_check();
+  ipv6_loopback_smoke();
 
   /* M24b BKL proof: run several CPU-bound userspace processes at once so the
    * cooperative scheduler distributes them across the BSP and Application

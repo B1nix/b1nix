@@ -26,6 +26,8 @@ static struct ipv4_addr g_dns_server = { { 10, 0, 2, 3 } };
 static int g_resolv_loaded = 0;
 static volatile int g_dns_have = 0;
 static u8 g_dns_ip[4];
+static volatile int g_dns6_have = 0;
+static u8 g_dns6_ip[16];
 
 void dns_receive(const void *data, usize size);
 
@@ -203,6 +205,12 @@ void dns_receive(const void *data, usize size)
 				if (i < 3) console_write(".");
 			}
 			console_write("\n");
+		} else if (type == 28 && rdlength == 16 &&
+		           ptr + 16 <= (const u8 *)data + size) {
+			/* AAAA record: capture the 128-bit address. */
+			memcpy(g_dns6_ip, ptr, 16);
+			g_dns6_have = 1;
+			console_write("net: dns resolved AAAA\n");
 		}
 	}
 }
@@ -211,6 +219,13 @@ int dns_last_result(u8 out[4])
 {
 	if (!g_dns_have) return 0;
 	memcpy(out, g_dns_ip, 4);
+	return 1;
+}
+
+int dns_last_result6(u8 out[16])
+{
+	if (!g_dns6_have) return 0;
+	memcpy(out, g_dns6_ip, 16);
 	return 1;
 }
 

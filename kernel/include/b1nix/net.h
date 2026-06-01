@@ -11,6 +11,10 @@ struct ipv4_addr {
 	u8 bytes[4];
 };
 
+struct in6_addr_k {
+	u8 bytes[16];
+};
+
 void net_init(void);
 void net_poll(void);
 int net_is_ready(void);
@@ -32,6 +36,14 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
 // IPv4
 void ipv4_receive(const void *data, usize size);
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size);
+
+// IPv6 (loopback datapath + ICMPv6 echo; ND/routing/real-link are TODO)
+void ipv6_receive(const void *data, usize size);
+void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload, usize size);
+u32 icmpv6_echo_reply_count(void);
+/* Offline self-test: ping ::1 through the loopback datapath and verify an
+ * ICMPv6 echo reply comes back. Emits an M32-IP6 marker. */
+void ipv6_loopback_smoke(void);
 
 // ICMP
 void icmp_receive(struct ipv4_addr src, const void *data, usize size);
@@ -62,6 +74,8 @@ void dns_receive(const void *data, usize size);
 int dns_resolve_sync(const char *domain, u8 out[4]);
 /* Last A-record result captured by dns_receive (1 if available, fills out). */
 int dns_last_result(u8 out[4]);
+/* Last AAAA-record result captured by dns_receive (1 if available, fills 16). */
+int dns_last_result6(u8 out[16]);
 /* Configure / read the resolver's nameserver (also loaded from
  * /etc/resolv.conf lazily on first use). */
 void dns_set_server(struct ipv4_addr server);
