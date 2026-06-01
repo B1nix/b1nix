@@ -150,6 +150,12 @@ static const char posix_smoke_script[] =
     /* ── M11 Pipeline ───────────────────────────────────────────── */
     /* 15. pipeline output */
     "echo \"pipe-data\" | grep \"pipe-data\" && echo \"M11-SHELL: ok pipeline-output\"\n"
+    /* 15b. M33 concurrent pipeline: stream this multi-KB script (>512B, the pipe
+     * buffer) through a pipe. The producer (cat) and consumer (wc) now run
+     * concurrently, so the producer never blocks on a full pipe before the
+     * consumer starts. If the old sequential path were still in use this line
+     * would deadlock and the boot would never reach POSIX-SMOKE: done. */
+    "cat /etc/posix-smoke.sh | cat > /tmp/m33_pipe.out && echo \"M33-SHELL: ok pipe-large\"\n"
     /* 16. pipeline exit status = last cmd (false exits 1; || fires) */
     "echo \"irrelevant\" | false || echo \"M11-SHELL: ok pipeline-status\"\n"
     /* 17. pipeline-chain: 2-stage pipe then file wc */

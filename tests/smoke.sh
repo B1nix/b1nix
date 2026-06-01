@@ -399,6 +399,7 @@ check_output "$LOG" "M11-SMOKE: done" "M11 shell smoke completes"
 
 # ── M33 Shell compliance: globbing + arithmetic expansion ──
 check_output "$LOG" "M33-SHELL: start" "M33 shell smoke starts"
+check_output "$LOG" "M33-SHELL: ok pipe-large" "concurrent pipeline streams >512B without deadlock"
 check_output "$LOG" "M33-SHELL: ok glob-star" "pathname glob '*.txt' expands and sorts"
 check_output "$LOG" "M33-SHELL: ok glob-class" "glob '?' and '[ab]' bracket expressions match"
 check_output "$LOG" "M33-SHELL: ok glob-nomatch" "non-matching glob stays literal"

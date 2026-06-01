@@ -1896,31 +1896,61 @@ static int sh_execute_pipeline(char *cmd, char *cwd) {
   }
 
   *pipe_pos = '\0';
-  char *cmd1 = p;
-  char *cmd2 = pipe_pos + 1;
+  char *cmd1 = p;            /* producer: the first stage */
+  char *cmd2 = pipe_pos + 1; /* consumer: the remaining stages (may pipe again) */
 
   int pipefd[2];
   if (syscall_dispatch(SYS_PIPE, (u64)(usize)pipefd, 0, 0, 0, 0, 0) != 0)
     return 1;
 
+  /* M33: concurrent pipeline. Fork the producer so it streams into the pipe
+   * while the consumer drains it. This both matches POSIX subshell semantics
+   * (each non-final stage runs in its own process) and fixes the latent
+   * deadlock the old run-to-completion path had: a producer emitting more than
+   * PIPE_BUFFER_SIZE (512) bytes blocked on a full pipe before the consumer
+   * ever started reading. Pipeline status stays the rightmost stage's status
+   * (no pipefail). Falls back to the sequential path if fork is unavailable. */
+  u64 pid = syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
+  if ((isize)pid == 0) {
+    /* Child = producer: stdout -> pipe write end, then run the first stage. */
+    syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0, 0, 0);
+    int cst = sh_execute_pipeline(cmd1, cwd);
+    syscall_dispatch(SYS_EXIT, (u64)cst, 0, 0, 0, 0, 0);
+    return cst; /* not reached */
+  }
+
+  if ((isize)pid < 0) {
+    /* Fork unavailable: deterministic sequential fallback (bounded data only). */
+    int saved[3];
+    save_stdio(saved);
+    syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0, 0, 0);
+    sh_execute_pipeline(cmd1, cwd);
+    restore_stdio(saved);
+    save_stdio(saved);
+    syscall_dispatch(SYS_DUP2, (u64)pipefd[0], 0, 0, 0, 0, 0);
+    syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0, 0, 0);
+    int seq_status = sh_execute_pipeline(cmd2, cwd);
+    restore_stdio(saved);
+    return seq_status;
+  }
+
+  /* Parent = consumer chain: stdin <- pipe read end. Close the write end so the
+   * consumer sees EOF once the producer finishes. restore_stdio (which closes
+   * the read end) runs before waitpid so a non-reading consumer still lets the
+   * producer drain via EPIPE rather than wedging. */
   int saved[3];
   save_stdio(saved);
-
-  /* Pipeline semantics: status returned is the rightmost stage status.
-   * This is deterministic and intentionally does not implement pipefail. */
-  /* First stage of pipe */
-  syscall_dispatch(SYS_DUP2, (u64)pipefd[1], 1, 0, 0, 0, 0);
   syscall_dispatch(SYS_CLOSE, (u64)pipefd[1], 0, 0, 0, 0, 0);
-  sh_execute_pipeline(cmd1, cwd);
-
-  /* Second stage */
-  restore_stdio(saved);
-  save_stdio(saved);
   syscall_dispatch(SYS_DUP2, (u64)pipefd[0], 0, 0, 0, 0, 0);
   syscall_dispatch(SYS_CLOSE, (u64)pipefd[0], 0, 0, 0, 0, 0);
   int status = sh_execute_pipeline(cmd2, cwd);
-
   restore_stdio(saved);
+
+  int wst = 0;
+  syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&wst, 0, 0, 0, 0);
   return status;
 }
 
