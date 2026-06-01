@@ -551,7 +551,16 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       eviction_evict_page();
       frame = pmm_alloc_frame();
       if (!frame) {
-        panic("OOM during lazy page allocation!");
+        /* True OOM while growing a userspace mapping. Do NOT panic the whole
+         * kernel for one greedy process — return failure so the exception
+         * handler kills the faulting task with SIGSEGV (Linux-style OOM: the
+         * offending process dies, the system survives). Matches the VMM_LAZY
+         * path below. Kernel-internal OOM (page tables, klarge, heap growth)
+         * still panics — there is no faulting userspace task to blame. */
+        console_write("pf: OOM growing userspace mapping for pid ");
+        console_write_dec(current_task ? current_task->id : 0);
+        console_write(" — killing task\n");
+        return -1;
       }
     }
     memset((void *)((u64)frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);

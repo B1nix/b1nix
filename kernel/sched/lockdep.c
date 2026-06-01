@@ -27,14 +27,14 @@ struct lockdep_cpu_state {
  * cpu_id 0 by convention, and APs each get their slot in ap_main. */
 static struct lockdep_cpu_state g_lockdep[MAX_CPUS];
 
-/* "Bequeathing" lock levels (M28 #2 Variant A): BKL and the per-inode
- * sleeping rwlock can be released by a CPU other than the one that
- * acquired them. Their LOCKDEP_*_GLOBAL helpers bypass the per-CPU
- * acquisition stack and do only the inversion check on acquire — that
- * suffices to detect lock-discipline mistakes T4 might introduce
- * without bumping a globally-contended counter (cache-line ping-pong
- * perturbs syscall density enough to tickle the documented stack-
- * corruption race; see docs/m28-t4-blocker.md). */
+/* "Bequeathing" lock level (M28 #2 Variant A): the per-inode sleeping rwlock
+ * can be released by a CPU other than the one that acquired it (its holder
+ * blocks via scheduler_block_on and may resume on another CPU). Its
+ * LOCKDEP_*_GLOBAL helpers bypass the per-CPU acquisition stack and do only
+ * the inversion check on acquire. The BKL was the other bequeath client; it
+ * was removed in M28 #7, so the inode lock is now the only one. No global
+ * counter is bumped — a shared cache line here would perturb syscall density
+ * for no detection benefit; the acquire-side order check is what matters. */
 
 static int lockdep_self_cpu(void) {
     struct percpu *p = get_percpu();
@@ -121,15 +121,13 @@ void lockdep_acquire_global(int level, const char *name) {
     if (cpu < 0 || cpu >= MAX_CPUS) return;
     /* Order check: a global-level acquire while the same CPU already
      * holds a higher per-CPU-stack level is still an inversion. The
-     * release side we cannot check (different CPU may release us).
+     * release side we cannot check (a different CPU may release us, since
+     * the inode lock's holder can resume elsewhere after blocking).
      *
-     * No global counter is bumped: under the M24b bequeath model the
-     * BKL is acquired on one CPU and released on another constantly,
-     * so an atomic on a shared cache line here perturbs syscall density
-     * enough to tickle the documented stack-corruption race in M14
-     * (see docs/m28-t4-blocker.md). The order check is sufficient as a
-     * detector for the lock-discipline mistakes T4 might introduce; the
-     * stack-corruption races surface as GP/PF exceptions independently. */
+     * No global counter is bumped: the bequeath client (the per-inode
+     * sleeping rwlock) acquires on one CPU and may release on another, so an
+     * atomic on a shared cache line here would just add contention for no
+     * detection benefit. The acquire-side order check is the useful part. */
     struct lockdep_cpu_state *s = &g_lockdep[cpu];
     if (s->depth > 0 && s->levels[s->depth - 1] > level) {
         console_write("LOCKDEP: ORDER INVERSION on cpu ");

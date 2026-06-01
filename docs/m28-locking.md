@@ -60,19 +60,37 @@ CPUs; there is no outermost umbrella lock. The locks below are all load-bearing.
   closed. The real SMP gap on tasks[] is **per-task field tearing**
   — see below.
 
-### Per-task fields beyond `state` (`struct task`)
-- **The real M28 #3 gap.** Today walkers like `scheduler_waitpid` read
-  `parent_id` / `exit_code` / `user_image` / `name` / `stack` while
-  another CPU might be mutating them; under BKL it's serialised, post-BKL
-  it tears.
-- **Fix shape:** either (a) make each multi-word field follow a
-  publication/teardown protocol with explicit memory barriers, or
-  (b) add a per-task `spinlock_t state_lock` (irq-save) and hold it for
-  any read/write that spans more than one word.
-- **Order:** above `g_tasks_lock` (you take `state_lock` of a task you
-  already own; you only take `g_tasks_lock` to claim a fresh slot or
-  release one).
-- **Not landed yet** — flagged in roadmap as the M28 #3 follow-up.
+### Per-task fields beyond `state` (`struct task`) — M28 #3 CLOSED BY ANALYSIS
+Audited every cross-task field read/write after BKL removal. There is **no
+memory-corrupting race left**; a per-task `state_lock` would be decorative
+(forbidden), so none was added. Classification:
+
+- **The one real bug — `pending_signals` — is FIXED.** It was a multi-bit RMW
+  (`|=`/`&=~`) raced across CPUs (killer vs. the task consuming its own
+  signals): a genuine lost-update that dropped whole signals. Now atomic
+  fetch_or/fetch_and/load everywhere (see the "Pre-BKL-teardown gates" section).
+- **Reaper fields** (`exit_code`, `user_image`, `pml4_phys`, `vma_list`,
+  `fd_table`/`fd_flags`/`fd_capacity`, `name`, `stack`): read/freed by
+  `scheduler_waitpid` ONLY after winning the atomic `DEAD→REAPING` CAS *and*
+  spinning on `stack_released==1`. That makes the reaper the single exclusive
+  accessor of a fully-stopped task → safe, no lock needed.
+- **`parent_id`, `cwd[64]`, `env[][]`, `sigactions[]`**: written once at
+  fork/creation (parent is `current_task`, IRQs off during the copy) and
+  thereafter read only by the task itself. No concurrent cross-task writer.
+- **Single aligned words** (`state`, `priority`, `process_group_id`,
+  `session_id`): x86 TSO gives atomic aligned load/store — no tearing. No RMW
+  race on them (unlike `pending_signals`). The job-control trio in
+  `scheduler_kill` writes `last_stop_signal → stop_report_pending → state`
+  with `state` LAST; `scheduler_waitpid` reads `state==STOPPED` FIRST, so TSO
+  store-order guarantees the reader that sees STOPPED also sees the trio.
+- **Known benign LOGICAL race (not memory-unsafe):** `stop_report_pending` /
+  `continued_report_pending` set by a killer on one CPU while `waitpid` clears
+  them on another can lose/duplicate ONE job-control report under concurrent
+  SIGSTOP/SIGCONT + waitpid on the same child from different cores. Single-word
+  (no corruption); atomics would NOT fix it (it is a set-vs-clear ordering
+  race, not a torn read) — only a waitpid/kill-path lock or CAS protocol would,
+  which is not worth it for a cosmetic, pathological-timing reporting glitch.
+  Documented, deliberately left.
 
 ### Per-CPU runqueue lock (`kernel/sched/runqueue.c`, `rq->lock`)
 - **Type:** `spinlock_t`, **plain** (no irqsave) — every caller is already
@@ -165,7 +183,9 @@ order here first.
 
 ## Inter-subsystem rules
 
-1. **BKL is outermost.** Always.
+1. **There is no BKL.** It has been removed entirely (M28 #7). Every kernel
+   entry runs concurrently across CPUs; the locks below are the only
+   serialisation and each rule here is load-bearing, not decorative.
 2. **bcache → inode.** Enforced by panic guard. Never reverse.
 3. **inode → vfs_tree.** Writers take per-inode write first, then the tree
    lock over the splice.
@@ -181,10 +201,6 @@ order here first.
 
 ## Anti-patterns the audit should catch
 
-- Acquiring `heap_lock` (or any irqsave lock) inside an ISR handler that
-  itself ran from an IRQ entry, then yielding. The irqsave restores the
-  pre-IRQ interrupt state, but the BKL hand-off path expects depth
-  bookkeeping; yielding with the wrong depth corrupts the BKL.
 - Acquiring an inode rw_lock while holding `bcache_lock`. Panics by design.
 - Acquiring `vfs_tree_lock` (write) on an outer scope and then calling
   `vfs_inode_lock_write` (which may yield). The tree lock is IRQs-off; a
@@ -286,9 +302,11 @@ step (10/10 per entry cut, 15/15 after the full deletion).
 
 ## Known open issues (not yet fixed)
 
-- **Cooperative context-switch handoff still uses the BKL** (see above) — the
-  lock object is retained for the depth==1-at-switch invariant; not an
-  entry-serialisation concern. Retiring it is the remaining M28 follow-up.
+- **Job-control report flags** (`stop_report_pending` / `continued_report_pending`):
+  benign logical set-vs-clear race between a killer and a concurrent `waitpid`
+  on the same child from two cores — at worst one missed/duplicated
+  WUNTRACED/WCONTINUED report, no memory corruption. See the "Per-task fields"
+  section for why atomics don't fix it and a lock isn't worth it.
 - **mouse_state torn read** (`ps2_mouse.c`): cursor x/y/buttons read by the
   worker/`ps2_mouse_get_state` while the IRQ updates them — cosmetic only (a
   stale cursor pixel), no memory-safety impact. Left unlocked deliberately.
@@ -302,13 +320,21 @@ step (10/10 per entry cut, 15/15 after the full deletion).
 
 ## Roadmap
 
-- M28 #2 — Lockdep-light: per-CPU acquisition stack, debug-only, panics on
-  inversion against the DAG above.
-- M28 #3 — `g_tasks_lock` → `rwlock_t`.
-- M28 #4 — `pmm_lock` / `heap_lock` (and `vmm` page-table walks) → finer
-  granularity where it pays off. PMM as a writer-only path with readers
-  for accounting; heap as a per-arena lock; vmm as PML4-level rwlock.
-- M28 #7 — BKL teardown, in pieces: idle loop ✓, syscall entry ✓ (T4),
-  exception handler ✓, device IRQ handler ✓. Kernel entry is now BKL-free
-  (see "BKL teardown" section above). REMAINING: retire the cooperative
-  context-switch handoff so the lock object itself can be deleted.
+- M28 #2 — Lockdep-light: **DONE.** Per-CPU acquisition stack, debug-only,
+  panics on inversion / out-of-order release against the DAG above. Enable with
+  `make LOCKDEP=1` (off by default — macros are no-ops in production). Verified
+  clean over the full suite at -smp 4. The retired BKL level (100) is gone; the
+  per-inode sleeping rwlock is the sole user of the bequeath (GLOBAL) path.
+- M28 #3 — per-task field tearing: **CLOSED by analysis** (no
+  memory-corrupting race remains; see "Per-task fields beyond state").
+  `g_tasks_lock` stays a spinlock by design — making it an rwlock would be
+  decorative.
+- M28 #4 — heap/pmm granularity: **largely done.** PMM already has a per-CPU
+  cache; the heap now has a per-CPU small-allocation magazine + an O(1)
+  track_free fast path (see git log: per-CPU kmalloc magazine). Measured heap
+  cross-core contention dropped 2.58x→1.78x; the dominant per-op cost was a
+  fixed O(1024) track_free scan, now gated by size. Further sharding has
+  diminishing returns until a benchmark shows a new hot lock.
+- M28 #7 — BKL teardown: **COMPLETE.** idle loop ✓, syscall entry ✓ (T4),
+  exception handler ✓, device IRQ handler ✓, and the lock object itself
+  deleted ✓ (no global kernel lock exists anymore — see "BKL teardown").
