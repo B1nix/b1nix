@@ -23,13 +23,14 @@ INITRAMFS_M32_NETTOOL_INC := $(BUILD_DIR)/initramfs_m32_nettool.inc
 INITRAMFS_CURL_INC := $(BUILD_DIR)/initramfs_curl.inc
 INITRAMFS_WGET_INC := $(BUILD_DIR)/initramfs_wget.inc
 INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
+INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
 INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
 INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 CURL_ELF := build/curl-b1nix/src/curl
 WGET_ELF := build/wget-b1nix/src/wget
-B1NIX_TLS ?= none
+B1NIX_TLS ?= mbedtls
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
 # builds the kernel with the ported cross x86_64-b1nix-gcc/ld (toward M26
@@ -255,7 +256,7 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
@@ -355,7 +356,10 @@ $(INITRAMFS_M32_SMOKE_INC): userspace/bin/m32_smoke.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_smoke_elf userspace/build/bin/m32_smoke > $@
 
-$(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS)
+# Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
+# static mbedTLS archives that m32_nettool's tls-server links against, so curl
+# must build first to guarantee the libs exist.
+$(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
 	@$(MAKE) -C userspace build/bin/m32_nettool
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
@@ -381,6 +385,18 @@ $(CACERT_PEM): tools/fetch-cacert.sh
 $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cacert_pem $(CACERT_PEM) > $@
+
+# Self-contained TLS test PKI (CA + server cert/key) embedded under
+# /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
+TLS_TEST_DIR := build/tls-test
+$(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem: tools/gen-tls-test-certs.sh
+	sh tools/gen-tls-test-certs.sh $(TLS_TEST_DIR) >/dev/null
+
+$(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_tls_ca_pem $(TLS_TEST_DIR)/ca.pem > $@
+	xxd -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
+	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
 $(INITRAMFS_M30_PIE_INC): userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
 	@$(MAKE) -C userspace build/bin/m30_pie

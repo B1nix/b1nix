@@ -10,8 +10,8 @@ CURL_URL="https://curl.se/download/${CURL_TARBALL}"
 SRC_DIR="$ROOT_DIR/build/curl-src/curl-${CURL_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/curl-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
-AR_BIN="${AR:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
-RANLIB_BIN="${RANLIB:-/opt/homebrew/opt/llvm/bin/llvm-ranlib}"
+AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 B1NIX_TLS="${B1NIX_TLS:-none}"
 
 SSL_FLAGS="--without-ssl"
@@ -19,7 +19,13 @@ TLS_CPPFLAGS=""
 TLS_LDFLAGS=""
 TLS_LIBS=""
 if [ "$B1NIX_TLS" = "mbedtls" ]; then
-  MBEDTLS_PREFIX="$("$ROOT_DIR/tools/build-mbedtls.sh" | tail -n 1)"
+  # Capture the full output so a build failure is not masked by the pipe;
+  # the install prefix is the final stdout line (build noise goes to stderr).
+  if ! MBEDTLS_OUT="$("$ROOT_DIR/tools/build-mbedtls.sh")"; then
+    echo "tools/build-curl.sh: mbedTLS build failed" >&2
+    exit 1
+  fi
+  MBEDTLS_PREFIX="$(printf '%s\n' "$MBEDTLS_OUT" | tail -n 1)"
   SSL_FLAGS="--with-mbedtls=$MBEDTLS_PREFIX"
   TLS_CPPFLAGS="-I$MBEDTLS_PREFIX/include"
   TLS_LDFLAGS="-L$MBEDTLS_PREFIX/lib"

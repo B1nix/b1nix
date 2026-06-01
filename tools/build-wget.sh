@@ -10,8 +10,8 @@ WGET_URL="https://ftpmirror.gnu.org/wget/${WGET_TARBALL}"
 SRC_DIR="$ROOT_DIR/build/wget-src/wget-${WGET_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/wget-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
-AR_BIN="${AR:-/opt/homebrew/opt/llvm/bin/llvm-ar}"
-RANLIB_BIN="${RANLIB:-/opt/homebrew/opt/llvm/bin/llvm-ranlib}"
+AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 B1NIX_TLS="${B1NIX_TLS:-none}"
 
 if [ "$B1NIX_TLS" != "none" ]; then
@@ -76,6 +76,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --host=x86_64-b1nix \
     --disable-shared --enable-static \
     --without-ssl \
+    --without-zlib \
     --disable-iri \
     --disable-pcre \
     --disable-pcre2 \

@@ -58,6 +58,13 @@ if [ "$compile_only" -eq 1 ]; then
   exec clang $COMMON_FLAGS $args -c $inputs ${output:+-o "$output"}
 fi
 
+# Version/info probes (e.g. `CC --version`, `-dumpmachine`) carry no input
+# files. Forward them straight to clang instead of trying to link crt0.o,
+# which would fail with "undefined symbol: main" and confuse configure.
+if [ -z "$inputs" ]; then
+  exec clang $COMMON_FLAGS $args ${output:+-o "$output"}
+fi
+
 objs=""
 tmpdir="${TMPDIR:-/tmp}/b1nix-autotools-cc.$$"
 mkdir -p "$tmpdir"

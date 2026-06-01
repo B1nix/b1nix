@@ -462,22 +462,44 @@ static int test_tcp_client_server(void) {
     fail("curl-policy-open");
     return -1;
   }
-  curl_n = read(curl_fd, curl_buf, sizeof(curl_buf) - 1);
+  static char help_buf[16384];
+  int help_total = 0;
+  while (help_total < (int)sizeof(help_buf) - 1) {
+    int r = read(curl_fd, help_buf + help_total, sizeof(help_buf) - 1 - help_total);
+    if (r <= 0) break;
+    help_total += r;
+  }
   close(curl_fd);
   unlink("/tmp/curl.help");
-  if (curl_n <= 0) {
+  help_buf[help_total > 0 ? help_total : 0] = '\0';
+  if (help_total <= 0) {
     fail("curl-policy-read");
     return -1;
   }
-  curl_buf[curl_n] = '\0';
-  if (!strstr(curl_buf, "--cert-status") ||
-      !strstr(curl_buf, "--crlfile") ||
-      !strstr(curl_buf, "--pinnedpubkey")) {
+  if (!strstr(help_buf, "--cert-status") ||
+      !strstr(help_buf, "--crlfile") ||
+      !strstr(help_buf, "--pinnedpubkey")) {
     fail("curl-policy-flags");
     return -1;
   }
   ok("curl-policy-flags");
 
+  /* Real TLS handshake over loopback: an mbedTLS server (m32-nettool
+   * tls-server) presents the embedded test certificate (SAN IP:127.0.0.1) and
+   * curl validates it against the matching test CA. Exercises the full mbedTLS
+   * client+server handshake with no external network dependency. */
+  int tls_srv = fork();
+  if (tls_srv < 0) {
+    fail("curl-https-srv-fork");
+    return -1;
+  }
+  if (tls_srv == 0) {
+    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4443", NULL};
+    char *srv_envp[] = {NULL};
+    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    _exit(127);
+  }
+  sleep(1);
   curl_pid = fork();
   if (curl_pid < 0) {
     fail("curl-https-fork");
@@ -485,8 +507,8 @@ static int test_tcp_client_server(void) {
   }
   if (curl_pid == 0) {
     char *curl_tls_argv[] = {
-      "/bin/curl", "--connect-timeout", "8", "-sS",
-      "https://sha256.badssl.com/", NULL
+      "/bin/curl", "--cacert", "/etc/tls-test/ca.pem",
+      "--connect-timeout", "8", "-sS", "https://127.0.0.1:4443/", NULL
     };
     char *curl_tls_envp[] = {NULL};
     int out = open("/tmp/curl.https", O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -498,6 +520,7 @@ static int test_tcp_client_server(void) {
     _exit(127);
   }
   waitpid(curl_pid, &curl_status, 0);
+  { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
     fail("curl-https-handshake");
     return -1;
@@ -515,12 +538,26 @@ static int test_tcp_client_server(void) {
     return -1;
   }
   curl_buf[curl_n] = '\0';
-  if (!strstr(curl_buf, "badssl.com")) {
+  if (!strstr(curl_buf, "tls-loopback-ok")) {
     fail("curl-https-content");
     return -1;
   }
   ok("curl-https-handshake");
 
+  /* Negative path: the same server, but curl validates against the default
+   * system trust store (no test CA) → verification must fail (non-zero exit). */
+  tls_srv = fork();
+  if (tls_srv < 0) {
+    fail("curl-https-reject-srv-fork");
+    return -1;
+  }
+  if (tls_srv == 0) {
+    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4444", NULL};
+    char *srv_envp[] = {NULL};
+    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    _exit(127);
+  }
+  sleep(1);
   curl_pid = fork();
   if (curl_pid < 0) {
     fail("curl-https-selfsigned-fork");
@@ -529,13 +566,14 @@ static int test_tcp_client_server(void) {
   if (curl_pid == 0) {
     char *curl_bad_argv[] = {
       "/bin/curl", "--connect-timeout", "8", "-sS",
-      "https://self-signed.badssl.com/", NULL
+      "https://127.0.0.1:4444/", NULL
     };
     char *curl_bad_envp[] = {NULL};
     execve("/bin/curl", curl_bad_argv, curl_bad_envp);
     _exit(127);
   }
   waitpid(curl_pid, &curl_status, 0);
+  { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
     fail("curl-https-selfsigned-reject");
     return -1;

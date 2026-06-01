@@ -87,6 +87,24 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(BUILD)/bin/native_smoke.o
 
+# m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
+# archives are present (built by tools/build-curl.sh with B1NIX_TLS=mbedtls).
+# Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
+MBEDTLS_DIR := ../build/mbedtls-b1nix/install
+$(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
+	  echo "  CC+TLS  m32_nettool"; \
+	  $(CC) $(CFLAGS) -DB1NIX_HAVE_MBEDTLS -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m32_nettool.o; \
+	  $(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_nettool.o \
+	    $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
+	    --whole-archive $(LIB) --no-whole-archive; \
+	else \
+	  echo "  CC      m32_nettool (HTTP-only, no mbedTLS)"; \
+	  $(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/m32_nettool.o; \
+	  $(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_nettool.o --whole-archive $(LIB) --no-whole-archive; \
+	fi
+
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the
 # linker emits ET_DYN with R_X86_64_RELATIVE relocations. No crt0 or
 # libb1nix.a — the body is self-contained inline-asm syscalls; the

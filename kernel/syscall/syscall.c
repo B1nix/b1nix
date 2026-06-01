@@ -40,20 +40,51 @@ static int syscall_allows_kernel_pointers(void) {
   return img->kind == USER_IMAGE_BUILTIN;
 }
 
+#if defined(__x86_64__)
+/* RDRAND is optional on x86_64; QEMU's default CPU model does not expose it.
+ * Executing the instruction on an unsupporting CPU raises #UD, so probe
+ * CPUID.1:ECX[30] once and cache the result before ever issuing rdrand. */
+static int rdrand_supported(void) {
+  static int cached = -1;
+  if (cached >= 0)
+    return cached;
+  u32 eax = 1, ebx = 0, ecx = 0, edx = 0;
+  __asm__ volatile("cpuid"
+                   : "+a"(eax), "=b"(ebx), "+c"(ecx), "=d"(edx));
+  cached = (ecx & (1u << 30)) ? 1 : 0;
+  return cached;
+}
+#endif
+
 static u64 sys_random_u64(void) {
   u64 v = 0;
 #if defined(__x86_64__)
-  unsigned char ok = 0;
-  __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
-  if (ok) return v;
+  if (rdrand_supported()) {
+    /* rdrand can transiently fail (carry clear); retry a bounded number of
+     * times before falling through to the software mixer. */
+    for (int i = 0; i < 16; i++) {
+      unsigned char ok = 0;
+      __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
+      if (ok)
+        return v;
+    }
+  }
 #endif
   /* Fallback for platforms/VMs without RDRAND: mix time + address entropy
-   * through xorshift64*. */
-  v = scheduler_get_uptime_ticks() ^ (u64)(usize)&v ^ 0x9e3779b97f4a7c15ULL;
+   * through xorshift64*. A persistent state advances on every call so a burst
+   * of requests (e.g. mbedTLS seeding) does not return correlated values even
+   * when the uptime tick has not advanced between calls. */
+  static u64 state = 0;
+  if (state == 0)
+    state = (u64)(usize)&v ^ 0x9e3779b97f4a7c15ULL;
+  state += 0x9e3779b97f4a7c15ULL;
+  v = state ^ scheduler_get_uptime_ticks() ^ ((u64)(usize)&v << 16);
   v ^= v >> 12;
   v ^= v << 25;
   v ^= v >> 27;
-  return v * 2685821657736338717ULL;
+  v *= 2685821657736338717ULL;
+  state ^= v;
+  return v;
 }
 
 static char **copy_user_array(const char **u_array) {
