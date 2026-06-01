@@ -633,6 +633,66 @@ static int test_udp6_loopback(void) {
   return 0;
 }
 
+/* TCP over IPv6 on ::1: a forked echo server binds [::1]:port, accepts one
+ * connection and echoes; the parent connects over AF_INET6 and verifies the
+ * round-trip. Exercises the kernel AF_INET6 STREAM path end to end. */
+static int run_server6(unsigned short port) {
+  int lfd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (lfd < 0) return 1;
+  struct sockaddr_in6 a;
+  memset(&a, 0, sizeof(a));
+  a.sin6_family = AF_INET6;
+  a.sin6_port = htons(port);
+  a.sin6_addr = in6addr_loopback;
+  if (bind(lfd, (struct sockaddr *)&a, sizeof(a)) < 0 || listen(lfd, 1) < 0) {
+    close(lfd);
+    return 2;
+  }
+  int cfd = accept(lfd, 0, 0);
+  if (cfd < 0) {
+    close(lfd);
+    return 3;
+  }
+  char buf[64];
+  int n = recv_with_retry(cfd, buf, sizeof(buf));
+  if (n > 0) send(cfd, buf, (size_t)n, 0);
+  close(cfd);
+  close(lfd);
+  return 0;
+}
+
+static int test_tcp6_loopback(void) {
+  unsigned short port = 3266;
+  int pid = fork();
+  if (pid < 0) { fail("tcp6-fork"); return -1; }
+  if (pid == 0) _exit(run_server6(port));
+
+  sleep(1);
+  int fd = socket(AF_INET6, SOCK_STREAM, 0);
+  if (fd < 0) { fail("tcp6-socket"); return -1; }
+  struct sockaddr_in6 pa;
+  memset(&pa, 0, sizeof(pa));
+  pa.sin6_family = AF_INET6;
+  pa.sin6_port = htons(port);
+  pa.sin6_addr = in6addr_loopback;
+  if (connect(fd, (struct sockaddr *)&pa, sizeof(pa)) < 0) {
+    fail("tcp6-connect");
+    return -1;
+  }
+  send(fd, "v6tcp-ok", 8, 0);
+  char buf[64];
+  int n = recv_with_retry(fd, buf, sizeof(buf));
+  close(fd);
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (n != 8 || memcmp(buf, "v6tcp-ok", 8) != 0) {
+    fail("tcp6-loopback");
+    return -1;
+  }
+  ok("tcp6-loopback");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
   if (test_select_timeout_zero() != 0) return 1;
@@ -640,6 +700,7 @@ int main(void) {
   if (test_select_multi_fd() != 0)     return 1;
   if (test_dns_libc() != 0)            return 1;
   if (test_udp6_loopback() != 0)       return 1;
+  if (test_tcp6_loopback() != 0)       return 1;
   if (test_tcp_client_server() != 0)   return 1;
   emit("M32-NET: done\n");
   return 0;

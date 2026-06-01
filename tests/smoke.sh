@@ -528,6 +528,7 @@ check_output "$LOG" "M32-NET: ok gethostbyname-numeric" "libc gethostbyname reso
 check_output "$LOG" "M32-NET: ok getaddrinfo" "libc getaddrinfo fills sockaddr_in"
 check_output "$LOG" "M32-NET: ok getaddrinfo-inet6" "libc getaddrinfo fills sockaddr_in6 for numeric ::1"
 check_output "$LOG" "M32-NET: ok udp6-loopback" "UDP over IPv6 (::1) round-trips through AF_INET6 sockets"
+check_output "$LOG" "M32-NET: ok tcp6-loopback" "TCP over IPv6 (::1) echo round-trips through AF_INET6 sockets"
 check_output "$LOG" "M32-NET: ok tcp-echo" "TCP loopback client/server echo works through sockets"
 check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange works over TCP"
 check_output "$LOG" "M32-NET: ok wget-loopback" "Wget HTTP client download works over TCP loopback"

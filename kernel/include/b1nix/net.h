@@ -100,6 +100,10 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);
 int tcp_listen(u16 local_port, int backlog);
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *client_port);
+/* TCP over IPv6 (loopback ::1). */
+void tcp6_receive(struct in6_addr_k src, const void *data, usize size);
+struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port);
+struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6, u16 *client_port);
 int tcp_pending_connections(u16 local_port);
 int tcp_network_ready(void);
 void tcp_timer_tick(void);

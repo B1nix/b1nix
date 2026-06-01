@@ -36,8 +36,14 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
       udp6_send(dst, s->local.in6.sin6_port, s->peer.in6.sin6_port, buf, len);
       return (isize)len;
     }
-    /* TCP over IPv6 is not implemented yet. */
-    return -EAFNOSUPPORT;
+    if (s->type == B1NIX_SOCK_STREAM && s->tcp_conn) {
+      if (!s->connected && tcp_is_established((struct tcp_conn *)s->tcp_conn))
+        s->connected = 1;
+      if (!s->connected)
+        return -EAGAIN;
+      return tcp_send((struct tcp_conn *)s->tcp_conn, buf, len);
+    }
+    return -ENOTCONN;
   }
 
   struct ipv4_addr dst_ip;
@@ -286,7 +292,14 @@ int vfs_listen(int fd, int backlog) {
     if (res == 0) s->listening = 1;
     return res;
   }
-  
+
+  if (s->domain == B1NIX_AF_INET6 && s->type == B1NIX_SOCK_STREAM) {
+    u16 port = ntoh16(s->local.in6.sin6_port);
+    int res = tcp_listen(port, backlog);
+    if (res == 0) s->listening = 1;
+    return res;
+  }
+
   return -ENOPROTOOPT;
 }
 
@@ -339,6 +352,32 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
       *addrlen = sizeof(struct b1nix_sockaddr_in);
     }
     res = 0;
+  } else if (s->domain == B1NIX_AF_INET6 && s->type == B1NIX_SOCK_STREAM) {
+    u16 local_port = ntoh16(s->local.in6.sin6_port);
+    struct in6_addr_k client_ip6;
+    u16 client_port;
+    struct tcp_conn *conn = 0;
+    while (1) {
+      conn = tcp_accept6(local_port, &client_ip6, &client_port);
+      if (conn) break;
+      if (h->flags & B1NIX_O_NONBLOCK) {
+        kfree(new_s);
+        vfs_handle_release(new_vh);
+        return -EAGAIN;
+      }
+      scheduler_block_on(vfs_poll_chan);
+    }
+    new_s->tcp_conn = conn;
+    new_s->connected = 1;
+    new_s->peer.in6.sin6_family = B1NIX_AF_INET6;
+    new_s->peer.in6.sin6_port = (client_port << 8) | (client_port >> 8);
+    memcpy(new_s->peer.in6.sin6_addr.s6_addr, client_ip6.bytes, 16);
+
+    if (addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_in6)) {
+      memcpy(addr, &new_s->peer.in6, sizeof(struct b1nix_sockaddr_in6));
+      *addrlen = sizeof(struct b1nix_sockaddr_in6);
+    }
+    res = 0;
   } else {
     kfree(new_s);
     vfs_handle_release(new_vh);
@@ -385,10 +424,15 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
     if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in6)) return -EINVAL;
     s->peer.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
     s->connected = 0;
-    /* TCP over IPv6 is not implemented yet; datagram connect just records the
-     * default peer for subsequent send()s. */
-    if (s->type == B1NIX_SOCK_STREAM)
-      return -EAFNOSUPPORT;
+    if (s->type == B1NIX_SOCK_STREAM) {
+      struct in6_addr_k dst;
+      memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+      s->tcp_conn = tcp_connect6(dst, ntoh16(s->peer.in6.sin6_port));
+      if (!s->tcp_conn)
+        return -ECONNREFUSED;
+      s->connected = 1;
+    }
+    /* Datagram connect just records the default peer for subsequent send()s. */
     return 0;
   }
 

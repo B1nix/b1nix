@@ -68,7 +68,9 @@ struct tcp_retransmit_pkt {
 struct tcp_conn {
   int used;
   int state;
+  u8 family; /* B1NIX_AF_INET or B1NIX_AF_INET6 */
   struct ipv4_addr remote_ip;
+  struct in6_addr_k remote_ip6;
   u16 remote_port;
   u16 local_port;
   u32 snd_una; /* oldest unacked sequence number */
@@ -196,6 +198,57 @@ static u16 tcp_checksum(struct ipv4_addr src, struct ipv4_addr dst,
   return (u16)~sum;
 }
 
+/* TCP-over-IPv6 checksum: ones'-complement sum over the IPv6 pseudo-header
+ * (src, dst, 32-bit TCP length, next header 6) and the segment. */
+static u16 tcp6_checksum(struct in6_addr_k src, struct in6_addr_k dst,
+                         const void *tcp_data, usize tcp_len) {
+  u32 sum = 0;
+  for (int i = 0; i < 16; i += 2)
+    sum += ((u16)src.bytes[i] << 8) | src.bytes[i + 1];
+  for (int i = 0; i < 16; i += 2)
+    sum += ((u16)dst.bytes[i] << 8) | dst.bytes[i + 1];
+  sum += (u16)(tcp_len >> 16);
+  sum += (u16)(tcp_len & 0xffff);
+  sum += 6; /* next header = TCP */
+  const u8 *p = (const u8 *)tcp_data;
+  for (usize i = 0; i + 1 < tcp_len; i += 2)
+    sum += ((u16)p[i] << 8) | p[i + 1];
+  if ((tcp_len & 1) != 0)
+    sum += (u16)p[tcp_len - 1] << 8;
+  while ((sum >> 16) != 0)
+    sum = (sum & 0xffff) + (sum >> 16);
+  return (u16)~sum;
+}
+
+/* Raw L3 transmit of an already-formed TCP segment, choosing IPv4 or IPv6
+ * by address family. Does not touch the checksum (used for retransmits). */
+static void tcp_l3_send(u8 family, struct ipv4_addr v4,
+                        const struct in6_addr_k *v6, const void *pkt,
+                        usize len) {
+  if (family == B1NIX_AF_INET6)
+    ipv6_send(*v6, IP_PROTO_TCP, pkt, len);
+  else
+    ipv4_send(v4, IP_PROTO_TCP, pkt, len);
+}
+
+/* Fill in the TCP checksum for the given address family. For the IPv6 ::1
+ * loopback path the source address equals the destination. */
+static void tcp_set_checksum(u8 family, struct ipv4_addr v4,
+                             const struct in6_addr_k *v6, u8 *pkt, usize len) {
+  struct tcp_header *t = (struct tcp_header *)pkt;
+  t->checksum = 0;
+  if (family == B1NIX_AF_INET6)
+    t->checksum = tcp6_checksum(*v6, *v6, pkt, len);
+  else
+    t->checksum = tcp_checksum(net_get_ip(), v4, pkt, len);
+}
+
+/* Checksum + transmit a segment to a connection's peer. */
+static void tcp_conn_emit(struct tcp_conn *conn, u8 *pkt, usize len) {
+  tcp_set_checksum(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len);
+  tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, pkt, len);
+}
+
 /* ── Allocate local port ── */
 static u16 tcp_alloc_port(void) {
   u16 port = next_local_port++;
@@ -204,19 +257,30 @@ static u16 tcp_alloc_port(void) {
   return port;
 }
 
-/* ── Find connection by remote ── */
-static struct tcp_conn *tcp_find_conn(struct ipv4_addr remote_ip,
-                                      u16 remote_port, u16 local_port) {
+/* ── Find connection by remote (family-aware) ── */
+static struct tcp_conn *tcp_find_conn_af(u8 family, struct ipv4_addr v4,
+                                         const struct in6_addr_k *v6,
+                                         u16 remote_port, u16 local_port) {
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (!tcp_conns[i].used)
       continue;
-    if (tcp_conns[i].remote_port == remote_port &&
-        tcp_conns[i].local_port == local_port &&
-        memcmp(&tcp_conns[i].remote_ip, &remote_ip, 4) == 0) {
+    if (tcp_conns[i].remote_port != remote_port ||
+        tcp_conns[i].local_port != local_port ||
+        tcp_conns[i].family != family)
+      continue;
+    if (family == B1NIX_AF_INET6) {
+      if (memcmp(&tcp_conns[i].remote_ip6, v6, 16) == 0)
+        return &tcp_conns[i];
+    } else if (memcmp(&tcp_conns[i].remote_ip, &v4, 4) == 0) {
       return &tcp_conns[i];
     }
   }
   return 0;
+}
+
+static struct tcp_conn *tcp_find_conn(struct ipv4_addr remote_ip,
+                                      u16 remote_port, u16 local_port) {
+  return tcp_find_conn_af(B1NIX_AF_INET, remote_ip, 0, remote_port, local_port);
 }
 
 static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
@@ -246,7 +310,9 @@ static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
   irq_restore(irq);
 }
 
-static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port) {
+static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
+                                             struct in6_addr_k v6,
+                                             u16 dst_port) {
   struct tcp_conn *conn = 0;
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (!tcp_conns[i].used) {
@@ -262,7 +328,9 @@ static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port)
   memset(conn, 0, sizeof(*conn));
   conn->used = 1;
   conn->state = TCP_CLOSED;
-  conn->remote_ip = dst_ip;
+  conn->family = family;
+  conn->remote_ip = v4;
+  conn->remote_ip6 = v6;
   conn->remote_port = dst_port;
   conn->local_port = tcp_alloc_port();
 
@@ -286,37 +354,48 @@ static struct tcp_conn *tcp_connect_start(struct ipv4_addr dst_ip, u16 dst_port)
   tcp->data_offset = (5 << 4);
   tcp->flags = TCP_SYN;
   tcp->window = bswap16(TCP_RECV_BUF_SIZE);
-  tcp->checksum = tcp_checksum(net_get_ip(), dst_ip, packet, sizeof(packet));
 
   conn->state = TCP_SYN_SENT;
-  ipv4_send(dst_ip, IP_PROTO_TCP, packet, sizeof(packet));
+  tcp_conn_emit(conn, packet, sizeof(packet));
   tcp_queue_retransmit(conn, packet, sizeof(packet), conn->iss);
   return conn;
 }
 
-/* ── Create new TCP connection (active open) ── */
-struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
-  struct tcp_conn *conn = tcp_connect_start(dst_ip, dst_port);
+/* Drive a freshly-started connection to ESTABLISHED by polling. */
+static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
   if (!conn)
     return 0;
-
-  /* Wait for SYN-ACK (poll a few times) */
   for (int tries = 0; tries < 200 && conn->state == TCP_SYN_SENT; tries++) {
     net_poll();
   }
-
   if (conn->state != TCP_ESTABLISHED) {
     console_write("tcp: connect failed\n");
     conn->used = 0;
     return 0;
   }
-
   console_write("tcp: connected\n");
   return conn;
 }
 
+/* ── Create new TCP connection (active open) ── */
+struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port) {
+  struct in6_addr_k z;
+  memset(&z, 0, sizeof(z));
+  return tcp_connect_wait(
+      tcp_connect_start_af(B1NIX_AF_INET, dst_ip, z, dst_port));
+}
+
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port) {
-  return tcp_connect_start(dst_ip, dst_port);
+  struct in6_addr_k z;
+  memset(&z, 0, sizeof(z));
+  return tcp_connect_start_af(B1NIX_AF_INET, dst_ip, z, dst_port);
+}
+
+struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port) {
+  struct ipv4_addr z4;
+  memset(&z4, 0, sizeof(z4));
+  return tcp_connect_wait(
+      tcp_connect_start_af(B1NIX_AF_INET6, z4, dst_ip6, dst_port));
 }
 
 int tcp_is_established(struct tcp_conn *conn) {
@@ -369,10 +448,30 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
                             u16 *client_port) {
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
-        tcp_conns[i].local_port == local_port && !tcp_conns[i].handed_to_user) {
+        tcp_conns[i].local_port == local_port &&
+        tcp_conns[i].family == B1NIX_AF_INET &&
+        !tcp_conns[i].handed_to_user) {
       tcp_conns[i].handed_to_user = 1;
       if (client_ip)
         *client_ip = tcp_conns[i].remote_ip;
+      if (client_port)
+        *client_port = tcp_conns[i].remote_port;
+      return &tcp_conns[i];
+    }
+  }
+  return 0;
+}
+
+struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
+                             u16 *client_port) {
+  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+    if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
+        tcp_conns[i].local_port == local_port &&
+        tcp_conns[i].family == B1NIX_AF_INET6 &&
+        !tcp_conns[i].handed_to_user) {
+      tcp_conns[i].handed_to_user = 1;
+      if (client_ip6)
+        *client_ip6 = tcp_conns[i].remote_ip6;
       if (client_port)
         *client_port = tcp_conns[i].remote_port;
       return &tcp_conns[i];
@@ -424,12 +523,9 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
 
   memcpy(packet + sizeof(struct tcp_header), data, to_send);
 
-  tcp->checksum =
-      tcp_checksum(net_get_ip(), conn->remote_ip, packet, packet_len);
-
   conn->snd_nxt += (u32)to_send;
 
-  ipv4_send(conn->remote_ip, IP_PROTO_TCP, packet, packet_len);
+  tcp_conn_emit(conn, packet, packet_len);
   tcp_queue_retransmit(conn, packet, packet_len, seq_start);
   kfree(packet);
 
@@ -485,14 +581,12 @@ int tcp_close(struct tcp_conn *conn) {
   tcp->data_offset = (5 << 4);
   tcp->flags = TCP_FIN | TCP_ACK;
   tcp->window = bswap16(TCP_RECV_BUF_SIZE);
-  tcp->checksum =
-      tcp_checksum(net_get_ip(), conn->remote_ip, packet, sizeof(packet));
 
   u32 seq_start = conn->snd_nxt;
   conn->state = TCP_FIN_WAIT1;
   conn->snd_nxt++;
 
-  ipv4_send(conn->remote_ip, IP_PROTO_TCP, packet, sizeof(packet));
+  tcp_conn_emit(conn, packet, sizeof(packet));
   tcp_queue_retransmit(conn, packet, sizeof(packet), seq_start);
 
   /* Wait for FIN-ACK (poll a bit) */
@@ -510,8 +604,9 @@ int tcp_close(struct tcp_conn *conn) {
   return 0;
 }
 
-/* ── Receive TCP segment from IP layer ── */
-void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
+/* ── Receive TCP segment from IP layer (family-aware core) ── */
+static void tcp_input(u8 family, struct ipv4_addr v4src,
+                      struct in6_addr_k v6src, const void *data, usize size) {
   if (size < sizeof(struct tcp_header))
     return;
 
@@ -530,7 +625,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
   usize payload_size = (size > data_offset) ? size - data_offset : 0;
 
   /* Find connection */
-  struct tcp_conn *conn = tcp_find_conn(src, src_port, dst_port);
+  struct tcp_conn *conn =
+      tcp_find_conn_af(family, v4src, &v6src, src_port, dst_port);
 
   /* M32: refresh the peer's advertised window (snd_wnd) on every
    * segment seen on this connection. Sliding-window flow control
@@ -571,7 +667,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
         tcp_unlock();
         irq_restore(irq);
         if (resend_data && resend_len) {
-          ipv4_send(conn->remote_ip, IP_PROTO_TCP, resend_data, resend_len);
+          tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6,
+                      resend_data, resend_len);
         }
       } else if (conn->dup_acks > 3) {
         /* Each additional dup ACK inflates cwnd by 1 MSS during fast
@@ -611,7 +708,9 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
           memset(new_conn, 0, sizeof(*new_conn));
           new_conn->used = 1;
           new_conn->state = TCP_SYN_RECEIVED;
-          new_conn->remote_ip = src;
+          new_conn->family = family;
+          new_conn->remote_ip = v4src;
+          new_conn->remote_ip6 = v6src;
           new_conn->remote_port = src_port;
           new_conn->local_port = dst_port;
 
@@ -638,10 +737,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
           tcp_hdr->data_offset = (5 << 4);
           tcp_hdr->flags = TCP_SYN | TCP_ACK;
           tcp_hdr->window = bswap16(TCP_RECV_BUF_SIZE);
-          tcp_hdr->checksum =
-              tcp_checksum(net_get_ip(), src, packet, sizeof(packet));
 
-          ipv4_send(src, IP_PROTO_TCP, packet, sizeof(packet));
+          tcp_conn_emit(new_conn, packet, sizeof(packet));
           tcp_queue_retransmit(new_conn, packet, sizeof(packet), new_conn->iss);
         }
         return;
@@ -665,8 +762,8 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
       r->data_offset = (5 << 4);
       r->flags = TCP_RST | (flags & TCP_ACK ? TCP_ACK : 0);
       r->window = 0;
-      r->checksum = tcp_checksum(net_get_ip(), src, rst, sizeof(rst));
-      ipv4_send(src, IP_PROTO_TCP, rst, sizeof(rst));
+      tcp_set_checksum(family, v4src, &v6src, rst, sizeof(rst));
+      tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst));
     }
     return;
   }
@@ -705,8 +802,7 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
         a->window = bswap16(TCP_RECV_BUF_SIZE);
-        a->checksum = tcp_checksum(net_get_ip(), src, ack_pkt, sizeof(ack_pkt));
-        ipv4_send(src, IP_PROTO_TCP, ack_pkt, sizeof(ack_pkt));
+        tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
 
         conn->state = TCP_ESTABLISHED;
         extern void *vfs_poll_chan;
@@ -761,8 +857,7 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
         a->window = bswap16(TCP_RECV_BUF_SIZE - conn->recv_len);
-        a->checksum = tcp_checksum(net_get_ip(), src, ack_pkt, sizeof(ack_pkt));
-        ipv4_send(src, IP_PROTO_TCP, ack_pkt, sizeof(ack_pkt));
+        tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
         extern void *vfs_poll_chan;
         scheduler_wake_all(vfs_poll_chan);
       }
@@ -783,8 +878,7 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
       a->data_offset = (5 << 4);
       a->flags = TCP_ACK;
       a->window = 0;
-      a->checksum = tcp_checksum(net_get_ip(), src, ack_pkt, sizeof(ack_pkt));
-      ipv4_send(src, IP_PROTO_TCP, ack_pkt, sizeof(ack_pkt));
+      tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
 
       if (conn->state == TCP_ESTABLISHED) {
         conn->state = TCP_CLOSE_WAIT;
@@ -826,6 +920,18 @@ void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
   default:
     break;
   }
+}
+
+void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
+  struct in6_addr_k z;
+  memset(&z, 0, sizeof(z));
+  tcp_input(B1NIX_AF_INET, src, z, data, size);
+}
+
+void tcp6_receive(struct in6_addr_k src, const void *data, usize size) {
+  struct ipv4_addr z4;
+  memset(&z4, 0, sizeof(z4));
+  tcp_input(B1NIX_AF_INET6, z4, src, data, size);
 }
 
 /* White-box test hook: return the ISS the kernel chose for the connection
@@ -875,7 +981,8 @@ void tcp_timer_tick(void) {
           tcp_lock();
           break;
         }
-        ipv4_send(conn->remote_ip, IP_PROTO_TCP, rp->data, rp->len);
+        tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, rp->data,
+                    rp->len);
         rp->timestamp = now;
         rp->retries++;
       }

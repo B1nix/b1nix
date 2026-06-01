@@ -126,8 +126,9 @@ void ipv6_receive(const void *data, usize size)
 		icmpv6_receive(&hdr->src, &hdr->dst, payload, payload_len);
 	} else if (hdr->next_header == IP6_NH_UDP) {
 		udp6_receive(hdr->src, payload, payload_len);
+	} else if (hdr->next_header == IP6_NH_TCP) {
+		tcp6_receive(hdr->src, payload, payload_len);
 	}
-	/* IP6_NH_TCP over IPv6 is not wired yet. */
 }
 
 void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
