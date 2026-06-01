@@ -13,6 +13,7 @@
 #include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
 #include <b1nix/rwlock.h>
+#include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -704,10 +705,8 @@ static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
 
-extern u32 rtc_boot_time_seconds;
 u32 vfs_get_unix_time(void) {
-  /* 100Hz scheduler ticks converted to seconds + RTC boot offset */
-  return rtc_boot_time_seconds + ((u32)scheduler_get_uptime_ticks() / 100);
+  return rtc_now_unix_seconds();
 }
 
 static u16 scheduler_get_current_umask(void) {

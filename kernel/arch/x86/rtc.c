@@ -1,10 +1,12 @@
 #include <b1nix/io.h>
 #include <b1nix/rtc.h>
+#include <b1nix/sched.h>
 
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
 
 u32 rtc_boot_time_seconds = 0;
+static isize rtc_time_offset_seconds = 0;
 
 static u8 read_cmos(u8 reg) {
   outb(CMOS_ADDR, reg);
@@ -59,4 +61,16 @@ void rtc_init(void) {
   d += day - 1;
 
   rtc_boot_time_seconds = d * 86400 + hour * 3600 + minute * 60 + second;
+}
+
+u32 rtc_now_unix_seconds(void) {
+  u64 base = (u64)rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
+  isize adjusted = (isize)base + rtc_time_offset_seconds;
+  if (adjusted < 0) return 0;
+  return (u32)adjusted;
+}
+
+void rtc_set_unix_time(u32 unix_time_now) {
+  u64 base = (u64)rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
+  rtc_time_offset_seconds = (isize)unix_time_now - (isize)base;
 }

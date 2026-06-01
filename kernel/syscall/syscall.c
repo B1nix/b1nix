@@ -40,6 +40,22 @@ static int syscall_allows_kernel_pointers(void) {
   return img->kind == USER_IMAGE_BUILTIN;
 }
 
+static u64 sys_random_u64(void) {
+  u64 v = 0;
+#if defined(__x86_64__)
+  unsigned char ok = 0;
+  __asm__ volatile("rdrand %0; setc %1" : "=r"(v), "=qm"(ok));
+  if (ok) return v;
+#endif
+  /* Fallback for platforms/VMs without RDRAND: mix time + address entropy
+   * through xorshift64*. */
+  v = scheduler_get_uptime_ticks() ^ (u64)(usize)&v ^ 0x9e3779b97f4a7c15ULL;
+  v ^= v >> 12;
+  v ^= v << 25;
+  v ^= v >> 27;
+  return v * 2685821657736338717ULL;
+}
+
 static char **copy_user_array(const char **u_array) {
   if (!u_array)
     return NULL;
@@ -999,6 +1015,11 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
   extern void *vfs_poll_chan;
 
+  if (timeout != (u64)-1 && timeout != 0) {
+    u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+    current_task->wake_tick = start_ticks + ticks;
+  }
+
   while (1) {
     int ready = 0;
     for (usize i = 0; i < nfds; i++) {
@@ -1018,6 +1039,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
     }
 
     if (ready > 0 || timeout == 0) {
+      current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
       return (u64)ready;
     }
@@ -1025,6 +1047,7 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
     if (timeout != (u64)-1) {
       u64 now = scheduler_get_uptime_ticks();
       if (now - start_ticks >= timeout_ticks) {
+        current_task->wake_tick = 0;
         syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
         return 0;
       }
@@ -1549,6 +1572,28 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
   case SYS_UTIME:
     return (u64)sys_utime((const char *)(usize)arg0, (u32)arg1, (u32)arg2);
+  case SYS_GETRANDOM: {
+    void *user_buf = (void *)(usize)arg0;
+    usize len = (usize)arg1;
+    if (!user_buf) return (u64)-EFAULT;
+    if (len == 0) return 0;
+    u8 tmp[256];
+    usize done = 0;
+    while (done < len) {
+      usize chunk = len - done;
+      if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
+      for (usize i = 0; i < chunk; i += sizeof(u64)) {
+        u64 r = sys_random_u64();
+        usize left = chunk - i;
+        usize n = left < sizeof(u64) ? left : sizeof(u64);
+        memcpy(tmp + i, &r, n);
+      }
+      if (syscall_copyout((u8 *)user_buf + done, tmp, chunk) != 0)
+        return (u64)-EFAULT;
+      done += chunk;
+    }
+    return (u64)done;
+  }
   case SYS_CHOWN:
     klog_info("audit: chown called");
     return (u64)sys_chown((const char *)(usize)arg0, (u16)arg1, (u16)arg2);
@@ -1839,7 +1884,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)-ENOSYS;
 #endif
   case SYS_TIME:
-    return scheduler_get_uptime_ticks() / 100;
+    /* Wall-clock seconds since Unix epoch: RTC snapshot at boot plus uptime. */
+    return (u64)vfs_get_unix_time();
   case SYS_UNAME: {
     struct b1nix_utsname uts;
     memset(&uts, 0, sizeof(uts));
@@ -1953,11 +1999,16 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     break;
   case SYS_CLOCK_GETTIME: {
     int clk_id = (int)arg0;
-    (void)clk_id;
     struct timespec ktp;
     u64 ticks = scheduler_get_uptime_ticks();
-    ktp.tv_sec = (long)(ticks / 100);
-    ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+    if (clk_id == 1 /* CLOCK_MONOTONIC */) {
+      ktp.tv_sec = (long)(ticks / 100);
+      ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+    } else {
+      /* CLOCK_REALTIME: epoch-based wall clock from RTC boot offset. */
+      ktp.tv_sec = (long)vfs_get_unix_time();
+      ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+    }
     if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0) {
       return (u64)-EFAULT;
     }
@@ -2047,6 +2098,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     u64 timeout_ms = arg4;
     u64 timeout_ticks =
         (timeout_ms == (u64)-1) ? (u64)-1 : timeout_ms / 10;
+
+    if (timeout_ms != (u64)-1 && timeout_ms != 0) {
+      u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+      current_task->wake_tick = start_ticks + ticks;
+    }
+
     extern void *vfs_poll_chan;
     int ready_count = 0;
     while (1) {
@@ -2066,6 +2123,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
       }
       scheduler_block_on(vfs_poll_chan);
     }
+
+    current_task->wake_tick = 0;
 
     /* Translate revents back to fd_sets. */
     u8 r_kout[128] = {0}, w_kout[128] = {0}, e_kout[128] = {0};

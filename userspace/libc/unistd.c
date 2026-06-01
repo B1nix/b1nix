@@ -7,7 +7,9 @@
 #include <time.h>
 #include <sys/types.h>
 #include <sys/socket.h>
+#include <sys/ioctl.h>
 #include <unistd.h>
+#include <termios.h>
 #include <errno.h>
 
 int normalize_errno(long rc) {
@@ -29,6 +31,16 @@ int write(int fd, const void *buf, size_t n) {
   return _check_err(syscall(SYS_WRITE, fd, buf, n));
 }
 
+ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
+  (void)flags;
+  long rc = syscall(SYS_GETRANDOM, buf, buflen, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return (ssize_t)rc;
+}
+
 int read(int fd, void *buf, size_t n) {
   return _check_err(syscall(SYS_READ, fd, buf, n));
 }
@@ -42,7 +54,7 @@ void _exit(int status) {
 }
 
 int sleep(unsigned int seconds) {
-  return (int)syscall(SYS_SLEEP, seconds);
+  return (int)syscall(SYS_SLEEP, (unsigned long)seconds * 100);
 }
 
 int open(const char *path, int flags, ...) {
@@ -58,6 +70,10 @@ int open(const char *path, int flags, ...) {
 
 int unlink(const char *pathname) {
   return _check_err(syscall(SYS_UNLINK, pathname));
+}
+
+int link(const char *oldpath, const char *newpath) {
+  return _check_err(syscall(SYS_LINK, oldpath, newpath));
 }
 
 int rmdir(const char *pathname) {
@@ -153,6 +169,15 @@ int fcntl(int fd, int cmd, ...) {
   arg = va_arg(ap, long);
   va_end(ap);
   return _check_err(syscall(SYS_FCNTL, fd, cmd, arg));
+}
+
+int ioctl(int fd, unsigned long request, ...) {
+  void *arg = 0;
+  va_list ap;
+  va_start(ap, request);
+  arg = va_arg(ap, void *);
+  va_end(ap);
+  return _check_err(syscall(SYS_IOCTL, fd, request, arg));
 }
 
 time_t time(time_t *tloc) {
@@ -300,12 +325,75 @@ int setsockopt(int sockfd, int level, int optname, const void *optval,
   return 0;
 }
 
+int getsockopt(int sockfd, int level, int optname, void *optval,
+               socklen_t *optlen) {
+  (void)sockfd;
+  (void)level;
+  if (!optval || !optlen || *optlen < sizeof(int)) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (optname == SO_TYPE) {
+    *(int *)optval = SOCK_STREAM;
+    *optlen = sizeof(int);
+    return 0;
+  }
+  errno = ENOPROTOOPT;
+  return -1;
+}
+
 int listen(int fd, int backlog) {
   return _check_err(syscall(SYS_LISTEN, fd, backlog));
 }
 
+ssize_t sendto(int fd, const void *buf, size_t len, int flags,
+               const struct sockaddr *dest_addr, socklen_t addrlen) {
+  (void)dest_addr;
+  (void)addrlen;
+  return send(fd, buf, len, flags);
+}
+
+ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
+                 struct sockaddr *src_addr, socklen_t *addrlen) {
+  (void)src_addr;
+  (void)addrlen;
+  return recv(fd, buf, len, flags);
+}
+
+int shutdown(int sockfd, int how) {
+  (void)sockfd;
+  (void)how;
+  return 0;
+}
+
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
   return _check_err(syscall(SYS_ACCEPT, fd, addr, addrlen));
+}
+
+int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  (void)sockfd;
+  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    memset(sin, 0, sizeof(*sin));
+    sin->sin_family = AF_INET;
+    sin->sin_port = 0x5000; // htons(80) -> 0x0050 in big-endian, so 0x5000 in little-endian representation of short
+    sin->sin_addr.s_addr = 0x0100007f; // 127.0.0.1 in little-endian
+    *addrlen = sizeof(struct sockaddr_in);
+  }
+  return 0;
+}
+
+int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
+  (void)sockfd;
+  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
+    memset(sin, 0, sizeof(*sin));
+    sin->sin_family = AF_INET;
+    sin->sin_port = 0x5000;
+    sin->sin_addr.s_addr = 0x0100007f;
+    *addrlen = sizeof(struct sockaddr_in);
+  }
+  return 0;
 }
 
 int setuid(unsigned short uid) {
@@ -403,4 +491,70 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
 char *getlogin(void) {
   static char name[] = "root";
   return name;
+}
+
+int getgroups(int size, gid_t list[]) {
+  (void)size;
+  (void)list;
+  return 0;
+}
+
+int seteuid(uid_t uid) {
+  return _check_err(syscall(SYS_SETUID, uid));
+}
+
+int setegid(gid_t gid) {
+  return _check_err(syscall(SYS_SETGID, gid));
+}
+
+uid_t getuid(void) {
+  return (uid_t)syscall(SYS_GETUID);
+}
+
+uid_t geteuid(void) {
+  return (uid_t)syscall(SYS_GETEUID);
+}
+
+gid_t getgid(void) {
+  return (gid_t)syscall(SYS_GETGID);
+}
+
+gid_t getegid(void) {
+  return (gid_t)syscall(SYS_GETEGID);
+}
+
+int setpgid(pid_t pid, pid_t pgid) {
+  return _check_err(syscall(SYS_SETPGRP, pid, pgid));
+}
+
+#define B1NIX_TIOCGPGRP 0x540F
+#define B1NIX_TIOCSPGRP 0x5410
+
+pid_t getpgrp(void) {
+  return (pid_t)syscall(SYS_GETPGRP);
+}
+
+pid_t tcgetpgrp(int fd) {
+  pid_t pgrp = -1;
+  if (ioctl(fd, B1NIX_TIOCGPGRP, &pgrp) < 0) {
+    return -1;
+  }
+  return pgrp;
+}
+
+int tcsetpgrp(int fd, pid_t pgrp) {
+  return ioctl(fd, B1NIX_TIOCSPGRP, &pgrp);
+}
+
+int tcgetattr(int fd, struct termios *termios_p) {
+  return _check_err(syscall(SYS_TERMIOS_GET, fd, termios_p));
+}
+
+int tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {
+  (void)optional_actions;
+  return _check_err(syscall(SYS_TERMIOS_SET, fd, termios_p));
+}
+
+pid_t setsid(void) {
+  return _check_err(syscall(SYS_SETSID));
 }

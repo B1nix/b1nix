@@ -135,6 +135,7 @@ enum {
 
 	/* --- M25 libc completeness --- */
 	SYS_UTIME        = 112,
+	SYS_GETRANDOM    = 113,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
