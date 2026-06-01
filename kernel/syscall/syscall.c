@@ -2071,7 +2071,9 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
 
   if (frame && ret == (u64)-ERESTARTSYS) {
-    u64 pending = current_task->pending_signals & ~current_task->blocked_signals;
+    /* Acquire-load: a concurrent killer publishes bits with a release RMW. */
+    u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                  __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
     int restart = 1;
     for (int i = 1; i < NSIG; i++) {
       if (pending & (1ULL << (i - 1))) {

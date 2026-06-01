@@ -257,18 +257,14 @@ void vmm_init(void) {
   pmm_switch_to_direct_map();
 }
 
-void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
-  if ((virtual_address & (PAGE_SIZE - 1)) != 0 ||
-      (physical_address & (PAGE_SIZE - 1)) != 0) {
-    panic("vmm_map_page requires page-aligned addresses");
-  }
-
-  if (kernel_pml4_virt == 0) {
-    panic("vmm_map_page called before vmm_init");
-  }
-
-  u64 _vmflags;
-  vmm_write_acquire(&_vmflags);
+/* Build the page-table path for virtual_address and install the leaf PTE.
+ * Caller MUST already hold vmm_lock (write). No allocation here blocks
+ * (alloc_page_table uses the non-blocking pmm fast path), so this is safe in an
+ * IRQs-off critical section. Split out of vmm_map_page so the page-fault
+ * handler — which also holds vmm_lock at commit time — can install without
+ * re-entering the non-recursive rwlock. */
+static void vmm_map_page_locked(u64 virtual_address, u64 physical_address,
+                                u64 flags) {
   u64 *pml4 = get_current_pml4();
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
@@ -284,13 +280,26 @@ void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
     pt = ensure_child_table(pd, pd_index(virtual_address));
   }
   if ((flags & VMM_USER) != 0) {
-    pml4[pml4_index(virtual_address)] |= VMM_USER;
-    pdpt[pdpt_index(virtual_address)] |= VMM_USER;
     pd[pd_index(virtual_address)] |= VMM_USER;
   }
   pt[pt_index(virtual_address)] =
       (physical_address & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   invalidate_page(virtual_address);
+}
+
+void vmm_map_page(u64 virtual_address, u64 physical_address, u64 flags) {
+  if ((virtual_address & (PAGE_SIZE - 1)) != 0 ||
+      (physical_address & (PAGE_SIZE - 1)) != 0) {
+    panic("vmm_map_page requires page-aligned addresses");
+  }
+
+  if (kernel_pml4_virt == 0) {
+    panic("vmm_map_page called before vmm_init");
+  }
+
+  u64 _vmflags;
+  vmm_write_acquire(&_vmflags);
+  vmm_map_page_locked(virtual_address, physical_address, flags);
   vmm_write_release(_vmflags);
 
   if ((flags & VMM_USER) && (flags & VMM_PRESENT)) {
@@ -489,6 +498,38 @@ void vmm_set_lazy(u64 virtual_address) {
 }
 
 // Handle page faults for demand paging and swap
+/* Walk the CURRENT address space to the leaf PT entry for va, following only
+ * already-present, non-huge intermediate tables (no allocation — safe to call
+ * under vmm_lock with IRQs off). Returns a pointer to the live pt[idx] slot, or
+ * NULL if any level is absent/huge (i.e. there is no leaf PTE to fault on).
+ * Caller must hold vmm_lock so the tables can't be torn down mid-walk. */
+static u64 *pf_leaf_pte_ptr(u64 va) {
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(va)];
+  if ((pml4e & VMM_PRESENT) == 0) return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(va)];
+  if ((pdpte & VMM_PRESENT) == 0 || (pdpte & HUGE_PAGE_FLAG)) return 0;
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(va)];
+  if ((pde & VMM_PRESENT) == 0 || (pde & HUGE_PAGE_FLAG)) return 0;
+  u64 *pt = table_from_entry(pde);
+  return &pt[pt_index(va)];
+}
+
+/* SMP page-fault handler (M28 #7 — make the fault path self-locking so the
+ * exception handler can drop the BKL). The page-table mutators (vmm_map_page,
+ * vmm_unmap_page, paging_clone_address_space's CoW write-back) all serialise on
+ * vmm_lock; the fault handler is the one mutator that historically did not, so
+ * a CLONE_VM sibling faulting on one CPU could RMW the same leaf PTE that fork
+ * was CoW-marking on another. vmm_lock is IRQs-off and non-recursive and the
+ * file/swap paths block (blk_*_cached → scheduler_yield), so we cannot simply
+ * hold it across the handler. Instead use the classic prepare-then-commit
+ * shape: allocate the frame and do the blocking I/O OUTSIDE the lock, then take
+ * vmm_lock, RE-READ the live leaf PTE, and only install if the precondition
+ * (LAZY / SWAPPED / COW with the same old frame) still holds — otherwise
+ * another CPU already serviced this address, so we discard our spare frame and
+ * report success. */
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   u64 page_aligned = fault_addr & ~(PAGE_SIZE - 1);
@@ -497,111 +538,111 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     panic("Non-canonical address fault!");
   }
 
-  // Lazy Allocation for User Heap/Mmap region
+  extern void eviction_evict_page(void);
+  extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+  extern void eviction_unregister_page(u64 frame);
+
+  // Lazy Allocation for User Heap/Mmap region (anonymous, no leaf PTE yet).
   if (!(error_code & PF_PRESENT) && fault_addr >= 0x40000000 &&
       fault_addr < 0x00007FFFFFFFFFFF) {
+    // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      extern void eviction_evict_page(void);
       eviction_evict_page();
       frame = pmm_alloc_frame();
       if (!frame) {
-        panic("OOM during lazy page allocation!");
+        /* True OOM while growing a userspace mapping. Do NOT panic the whole
+         * kernel for one greedy process — return failure so the exception
+         * handler kills the faulting task with SIGSEGV (Linux-style OOM: the
+         * offending process dies, the system survives). Matches the VMM_LAZY
+         * path below. Kernel-internal OOM (page tables, klarge, heap growth)
+         * still panics — there is no faulting userspace task to blame. */
+        console_write("pf: OOM growing userspace mapping for pid ");
+        console_write_dec(current_task ? current_task->id : 0);
+        console_write(" — killing task\n");
+        return -1;
       }
     }
+    memset((void *)((u64)frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
 
-    // IMPORTANT: Zero the frame before giving it to user space!
-    void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
-    memset(new_frame_virt, 0, PAGE_SIZE);
-
-    // Map it: Present, Read/Write, User accessible
-    vmm_map_page(page_aligned, frame, VMM_PRESENT | VMM_WRITABLE | VMM_USER);
-
-    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    // Commit under vmm_lock. Re-check that the leaf is still absent — another
+    // CPU faulting the same anonymous address may have installed it while we
+    // were allocating; if so, discard our spare and let the retry succeed.
+    u64 cflags;
+    vmm_write_acquire(&cflags);
+    u64 *slot = pf_leaf_pte_ptr(page_aligned);
+    if (slot && (*slot & VMM_PRESENT)) {
+      vmm_write_release(cflags);
+      pmm_free_frame(frame);
+      return 0; // already serviced concurrently
+    }
+    vmm_map_page_locked(page_aligned, frame,
+                        VMM_PRESENT | VMM_WRITABLE | VMM_USER);
+    vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, frame);
-
-    return 0; // Successfully resolved!
+    return 0;
   }
 
-  // Get the page table entry
-  u64 *pml4 = get_current_pml4();
-  u64 pml4e = pml4[pml4_index(page_aligned)];
-  if ((pml4e & VMM_PRESENT) == 0)
+  /* Classify against the live leaf PTE. Read it under the lock so we get a
+   * coherent snapshot, then drop the lock for any blocking work and re-validate
+   * on commit. */
+  u64 rflags;
+  vmm_read_acquire(&rflags);
+  u64 *leaf0 = pf_leaf_pte_ptr(page_aligned);
+  if (!leaf0) {
+    vmm_read_release(rflags);
     return -1;
+  }
+  u64 pte = *leaf0;
+  vmm_read_release(rflags);
 
-  u64 *pdpt = table_from_entry(pml4e);
-  u64 pdpte = pdpt[pdpt_index(page_aligned)];
-  if ((pdpte & VMM_PRESENT) == 0)
-    return -1;
-  if (pdpte & HUGE_PAGE_FLAG)
-    return -1;
-
-  u64 *pd = table_from_entry(pdpte);
-  u64 pde = pd[pd_index(page_aligned)];
-  if ((pde & VMM_PRESENT) == 0)
-    return -1;
-  if (pde & HUGE_PAGE_FLAG)
-    return -1;
-
-  u64 *pt = table_from_entry(pde);
-  u64 pte = pt[pt_index(page_aligned)];
-
-  // Case 1: Lazy page (marked with VMM_LAZY flag, not present)
+  // Case 1: Lazy page (VMM_LAZY leaf, not present) — anonymous or file-backed.
   if (!(pte & VMM_PRESENT) && (pte & VMM_LAZY)) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
-      extern void eviction_evict_page(void);
       eviction_evict_page();
       frame = pmm_alloc_frame();
       if (!frame) {
-        // Try to swap something out to free memory
         console_write("pf: OOM during lazy allocation, swap failed\n");
         return -1;
       }
     }
-
-    // Zero the frame
-    void *new_frame_virt = (void *)((uint64_t)frame + DIRECT_MAP_BASE);
+    void *new_frame_virt = (void *)((u64)frame + DIRECT_MAP_BASE);
     memset(new_frame_virt, 0, PAGE_SIZE);
 
-    // If file-backed, load from page cache or VFS
+    // File-backed fill happens OUTSIDE vmm_lock (read_cb / blk_*_cached block).
+    int shared_cache_frame = 0;
     struct vm_area *vma = current_task->vma_list;
     while (vma) {
       if (page_aligned >= vma->start && page_aligned < vma->end) {
         if (vma->node && vma->node->inode) {
           u64 file_offset = vma->offset + (page_aligned - vma->start);
           u64 file_page = file_offset & ~(PAGE_SIZE - 1);
-          
+
           if (vma->node->inode->type == VFS_FILE) {
             struct page_cache_entry *page = page_cache_get_page(vma->node->inode, file_page);
             if (page) {
-              // Use existing page cache frame (sharing!)
-              pmm_free_frame(frame); // Free the freshly allocated frame
+              pmm_free_frame(frame); // drop the freshly allocated frame
               frame = page->frame;
               pmm_ref_frame(frame);  // VMA references it
               page_cache_put_page(page);
-            } else {
-              // Miss in page cache, read into the fresh frame and add to cache
-              if (vma->node->inode->read_cb) {
-                isize res = vma->node->inode->read_cb(vma->node, file_page, (char *)new_frame_virt, PAGE_SIZE, 0);
-                if (res >= 0) {
-                  if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
-                    pmm_ref_frame(frame); // Cache has a reference, VMA has a reference
-                  }
-                } else {
-                  pmm_free_frame(frame);
-                  return -1;
+              shared_cache_frame = 1;
+            } else if (vma->node->inode->read_cb) {
+              isize res = vma->node->inode->read_cb(vma->node, file_page, (char *)new_frame_virt, PAGE_SIZE, 0);
+              if (res >= 0) {
+                if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
+                  pmm_ref_frame(frame); // cache ref + VMA ref
                 }
-              }
-            }
-          } else {
-            // Not a file (e.g. device node mapped lazily), just call read_cb
-            if (vma->node->inode->read_cb) {
-              isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
-              if (res < 0) {
+              } else {
                 pmm_free_frame(frame);
                 return -1;
               }
+            }
+          } else if (vma->node->inode->read_cb) {
+            isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
+            if (res < 0) {
+              pmm_free_frame(frame);
+              return -1;
             }
           }
         }
@@ -610,21 +651,28 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       vma = vma->next;
     }
 
-    // Build proper flags from saved flags
+    // Commit: re-read the leaf; only install if it is still the same LAZY PTE.
+    u64 cflags;
+    vmm_write_acquire(&cflags);
+    u64 *slot = pf_leaf_pte_ptr(page_aligned);
+    if (!slot || (*slot & VMM_PRESENT) || !(*slot & VMM_LAZY)) {
+      // Another CPU serviced it (or it was torn down) — discard our frame.
+      vmm_write_release(cflags);
+      if (shared_cache_frame) pmm_unref_frame(frame); else pmm_free_frame(frame);
+      return (slot && (*slot & VMM_PRESENT)) ? 0 : -1;
+    }
     u64 flags = VMM_PRESENT | VMM_WRITABLE;
-    if (pte & VMM_USER)
-      flags |= VMM_USER;
-
-    pt[pt_index(page_aligned)] = frame | flags;
+    if (*slot & VMM_USER) flags |= VMM_USER;
+    *slot = frame | flags;
     invalidate_page(page_aligned);
-
-    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, frame);
     return 0;
   }
 
-  // Case 2: Swapped page (custom bit stored in non-present entry)
+  // Case 2: Swapped page (VMM_SWAPPED leaf, not present).
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
+    // swap_in allocates a frame and does blocking disk I/O — outside the lock.
     u64 new_frame = 0;
     if (swap_in(current_task->pml4_phys, page_aligned, &new_frame) < 0) {
       console_write("pf: swap in failed for 0x");
@@ -633,51 +681,71 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       return -1;
     }
 
-    // Build flags from saved bits
+    u64 cflags;
+    vmm_write_acquire(&cflags);
+    u64 *slot = pf_leaf_pte_ptr(page_aligned);
+    if (!slot || (*slot & VMM_PRESENT) || !(*slot & VMM_SWAPPED)) {
+      // Raced with another fault/unmap — our frame is now orphaned.
+      vmm_write_release(cflags);
+      pmm_free_frame(new_frame);
+      return (slot && (*slot & VMM_PRESENT)) ? 0 : -1;
+    }
     u64 flags = VMM_PRESENT | VMM_WRITABLE;
-    if (pte & VMM_USER)
-      flags |= VMM_USER;
-    if (pte & VMM_NO_EXECUTE)
-      flags |= VMM_NO_EXECUTE;
-
-    pt[pt_index(page_aligned)] = new_frame | flags;
+    if (*slot & VMM_USER) flags |= VMM_USER;
+    if (*slot & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;
+    *slot = new_frame | flags;
     invalidate_page(page_aligned);
-
-    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
+    vmm_write_release(cflags);
     eviction_register_page(current_task, page_aligned, new_frame);
     return 0;
   }
 
-  // Case 3: Copy-on-Write (write to a cloned private page)
+  // Case 3: Copy-on-Write (write to a cloned private page).
   if ((error_code & PF_WRITE) && (pte & VMM_PRESENT) && (pte & VMM_COW)) {
-    u64 old_frame = pte & PAGE_ENTRY_ADDRESS_MASK;
+    // Pre-allocate a copy frame outside the lock (we may not need it if we are
+    // the last sharer, but allocating speculatively keeps the commit section
+    // non-blocking). pmm_alloc_frame fast path doesn't block.
+    u64 new_frame = pmm_alloc_frame();
+    if (!new_frame) {
+      eviction_evict_page();
+      new_frame = pmm_alloc_frame();
+      if (!new_frame) return -1;
+    }
+
+    u64 cflags;
+    vmm_write_acquire(&cflags);
+    u64 *slot = pf_leaf_pte_ptr(page_aligned);
+    if (!slot || !(*slot & VMM_PRESENT) || !(*slot & VMM_COW)) {
+      // Another CPU already resolved the COW for this page.
+      vmm_write_release(cflags);
+      pmm_free_frame(new_frame);
+      return 0;
+    }
+    u64 cur = *slot;
+    u64 old_frame = cur & PAGE_ENTRY_ADDRESS_MASK;
+    u64 new_flags = (cur & ~PAGE_ENTRY_ADDRESS_MASK);
+    new_flags &= ~VMM_COW;
+    new_flags |= VMM_PRESENT | VMM_WRITABLE;
 
     if (pmm_get_refcount(old_frame) == 1) {
-      u64 new_flags = (pte & ~PAGE_ENTRY_ADDRESS_MASK);
-      new_flags &= ~VMM_COW;
-      new_flags |= VMM_PRESENT | VMM_WRITABLE;
-      pt[pt_index(page_aligned)] = old_frame | new_flags;
+      // Sole owner now — just flip to writable in place, no copy needed.
+      *slot = old_frame | new_flags;
       invalidate_page(page_aligned);
+      vmm_write_release(cflags);
+      pmm_free_frame(new_frame); // didn't need the spare
       return 0;
     }
 
-    u64 new_frame = pmm_alloc_frame();
-    if (!new_frame)
-      return -1;
-
+    // Shared: copy into the spare frame and point this mapping at it. The copy
+    // touches only the two physical frames via the direct map (not the fault
+    // va), so it is safe under the lock.
     memcpy((void *)(usize)(new_frame + DIRECT_MAP_BASE),
            (void *)(usize)(old_frame + DIRECT_MAP_BASE), PAGE_SIZE);
-
-    u64 new_flags = (pte & ~PAGE_ENTRY_ADDRESS_MASK);
-    new_flags &= ~VMM_COW;
-    new_flags |= VMM_PRESENT | VMM_WRITABLE;
-    pt[pt_index(page_aligned)] = new_frame | new_flags;
-
+    *slot = new_frame | new_flags;
     pmm_unref_frame(old_frame);
     invalidate_page(page_aligned);
+    vmm_write_release(cflags);
 
-    extern void eviction_unregister_page(u64 frame);
-    extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
     eviction_unregister_page(old_frame);
     eviction_register_page(current_task, page_aligned, new_frame);
     return 0;
@@ -730,7 +798,21 @@ u64 paging_create_address_space(void) {
   return pml4_phys;
 }
 
+/* Drain any in-flight cross-CPU TLB shootdown (defined in arch/x86/tlb.c).
+ * clone_table / free_table / swap_in_recursive walk the whole user page-table
+ * tree doing real work — not spinning — while the caller holds an IRQs-off
+ * section (paging_clone_address_space takes vmm_write_lock via its _irqsave
+ * variant; the exit reaper frees with interrupts disabled). With IRQs masked
+ * and no spin loop, such a CPU never ACKs a shootdown IPI, so an initiator on
+ * another core hits `tlb: shootdown stalled, pending=1` and panics — exactly
+ * the smp>=2 in-guest-build failure. A poll once per visited table keeps the
+ * ACK latency far under the runaway guard; it is a single atomic load on the
+ * common (nothing-pending) path, so uniprocessor and uncontended SMP pay
+ * nothing. */
+void tlb_shootdown_poll(void);
+
 static void clone_table(u64 *src_table, u64 *dst_table, int level) {
+  tlb_shootdown_poll();
   for (usize i = 0; i < 512; i++) {
     if (!(src_table[i] & VMM_PRESENT)) {
       dst_table[i] = src_table[i]; // Copy lazy/swapped entries as is
@@ -892,6 +974,7 @@ void paging_dump_entries(u64 virtual_address) {
 static u64 freed_tables_count = 0;
 
 static void free_table(u64 *table, int level) {
+  tlb_shootdown_poll(); /* see clone_table: drain shootdowns from this IRQs-off walk */
   if (level >= 3) {
     /* PT level: free the leaf user data frames. VMA-backed pages were already
      * unmapped (PTE cleared) by user_address_space_cleanup, so they are skipped
@@ -949,6 +1032,7 @@ void paging_free_address_space(u64 pml4_phys) {
 }
 
 static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phys) {
+  tlb_shootdown_poll(); /* see clone_table: drain shootdowns from this IRQs-off walk */
   if (level >= 3) {
     for (usize i = 0; i < 512; i++) {
       u64 entry = table[i];

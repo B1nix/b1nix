@@ -1,30 +1,14 @@
 .section .text
 .code64
 
-.extern bkl_unlock
-
 /* void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv); */
 .global x86_user_jump
 .type x86_user_jump, @function
 x86_user_jump:
     /* %rdi = entry, %rsi = stack, %rdx = argc, %rcx = argv */
 
-    /* First entry into ring 3 for this task. We arrive holding the Big Kernel
-     * Lock (depth 1, handed off across the context switch that scheduled this
-     * kernel thread); release it before dropping to userspace so other cores
-     * can run kernel code. Stash the args in callee-saved registers (preserved
-     * across the C call) and pad RSP to 16 bytes for the call ABI. */
-    movq %rdi, %r12
-    movq %rsi, %r13
-    movq %rdx, %r14
-    movq %rcx, %r15
-    pushq %rax
-    call bkl_unlock
-    popq %rax
-    movq %r12, %rdi
-    movq %r13, %rsi
-    movq %r14, %rdx
-    movq %r15, %rcx
+    /* First entry into ring 3 for this task. The BKL is fully retired
+     * (M28 #7) — there is no kernel lock to drop before dropping to ring 3. */
 
     /* Set up segment registers for Ring 3. We deliberately do NOT reload %gs:
      * in 64-bit mode loading a GS selector resets the GS base, and the kernel

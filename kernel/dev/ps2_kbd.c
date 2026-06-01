@@ -35,12 +35,22 @@ void ps2_kbd_init(void)
 	console_write("ps2_kbd: initialized on irq1\n");
 }
 
+/* Single-producer (IRQ handler) / single-consumer (ps2_kbd_getc, called from a
+ * syscall on possibly another CPU) ring. With the BKL gone from the device-IRQ
+ * path, producer and consumer run unserialised, so the index hand-off needs
+ * explicit ordering: the producer publishes kbd_head with RELEASE *after*
+ * writing the slot, and the consumer ACQUIRE-loads kbd_head so it never reads a
+ * slot before that write is visible; symmetrically for kbd_tail. A device IRQ
+ * is delivered to one CPU at a time and not re-entrant, so there is only ever
+ * one producer and one consumer — no CAS needed. */
 static void kbd_push(char c)
 {
-	usize next_head = (kbd_head + 1) % KBD_BUFFER_SIZE;
-	if (next_head != kbd_tail) {
-		kbd_buffer[kbd_head] = c;
-		kbd_head = next_head;
+	usize head = __atomic_load_n(&kbd_head, __ATOMIC_RELAXED); /* sole producer */
+	usize tail = __atomic_load_n(&kbd_tail, __ATOMIC_ACQUIRE);
+	usize next_head = (head + 1) % KBD_BUFFER_SIZE;
+	if (next_head != tail) {
+		kbd_buffer[head] = c;
+		__atomic_store_n(&kbd_head, next_head, __ATOMIC_RELEASE);
 	}
 }
 
@@ -167,11 +177,13 @@ void ps2_kbd_interrupt_handler(void)
 
 char ps2_kbd_getc(void)
 {
-	if (kbd_head == kbd_tail) {
+	usize tail = __atomic_load_n(&kbd_tail, __ATOMIC_RELAXED); /* sole consumer */
+	usize head = __atomic_load_n(&kbd_head, __ATOMIC_ACQUIRE);
+	if (head == tail) {
 		return 0;
 	}
 
-	char c = kbd_buffer[kbd_tail];
-	kbd_tail = (kbd_tail + 1) % KBD_BUFFER_SIZE;
+	char c = kbd_buffer[tail];
+	__atomic_store_n(&kbd_tail, (tail + 1) % KBD_BUFFER_SIZE, __ATOMIC_RELEASE);
 	return c;
 }

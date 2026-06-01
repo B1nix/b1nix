@@ -25,7 +25,6 @@
 #include <b1nix/shm.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/lapic.h>
-#include <b1nix/bkl.h>
 #include <b1nix/video.h>
 #include <b1nix/acpi.h>
 #include <b1nix/ioapic.h>
@@ -163,6 +162,11 @@ void kernel_main(u64 arg0, u64 arg1)
 	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
 	smp_selftest_run();
 
+	/* M28 #4: measure heap_lock contention across cores (decides whether a
+	 * per-CPU kmalloc magazine is worth its fragmentation cost). Same
+	 * stealable-worker window as the self-test; no-op outside test mode / single CPU. */
+	m28_heapbench_run();
+
 	/* M28 #9: ctx-switch + light-syscall rdtsc baseline (single-CPU, test mode). */
 	m28_ctxbench_run();
 
@@ -191,16 +195,11 @@ void kernel_main(u64 arg0, u64 arg1)
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
 	console_write(init_spawn_buf);
 
-	/* The idle frame may resume either from a syscall/exit path that still
-	 * holds the BKL or from a previous no-work hlt with the BKL dropped. Keep
-	 * the scheduler's original invariant: context switches happen with this
-	 * CPU holding the BKL, but idle never parks while holding it. */
+	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs
+	 * BKL-free and scheduler_yield no longer hands a lock across the context
+	 * switch, so the idle loop just yields and parks when there is no work. */
 	while (scheduler_task_count() > 1) {
-		if (!bkl_is_held_by_current_cpu()) {
-			bkl_lock();
-		}
 		int switched = scheduler_yield();
-		bkl_unlock();
 		if (!switched) {
 			__asm__ volatile("sti; hlt" : : : "memory");
 		}

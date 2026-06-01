@@ -1,4 +1,3 @@
-#include <b1nix/bkl.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/ipi.h>
@@ -127,7 +126,6 @@ struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top) {
   t->name = "ap-idle";
   t->state = TASK_RUNNING;
   t->priority = 0;
-  t->bkl_depth = 1;
   t->pml4_phys = 0; /* kernel address space */
   t->kernel_stack_ptr = kstack_top;
   t->cwd[0] = '/';
@@ -289,8 +287,17 @@ static struct task *pick_next_task(void) {
        * CPU's save side. See struct task::stack_released and
        * scheduler_yield's RUNNING->READY transition. The spin is bounded by
        * the arch_context_switch save-side, which is a handful of mov +
-       * a single store with no locks/IRQs/sleeping calls. */
-      while (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+       * a single store with no locks/IRQs/sleeping calls.
+       *
+       * Skip the wait when re-picking OUR OWN task: a waker on another CPU may
+       * have CAS'd us BLOCKED/SLEEPING->READY and enqueued us here before this
+       * CPU even reached pick_next_task (now that the block paths clear the
+       * lease before yielding). Our stack is live on THIS CPU and the lease is
+       * only published once we leave it via arch_context_switch — waiting on
+       * our own publish would self-deadlock. Resuming ourselves is a no-op
+       * switch, always safe. */
+      while (t != current_task &&
+             !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
         __asm__ volatile("pause");
         tlb_shootdown_poll();
       }
@@ -338,8 +345,11 @@ static struct task *pick_next_task(void) {
   if (best_task) {
     /* M28 T4: see global-rq comment — wait for the outgoing CPU to publish
      * stack_released==1 before claiming, otherwise we could resume on a
-     * kernel stack the other CPU is still saving to. */
-    while (!__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+     * kernel stack the other CPU is still saving to. Skip for our own task
+     * (re-picked after a cross-CPU wake) — its stack is live here and the
+     * publish only happens once we leave it; see the global-rq comment. */
+    while (best_task != current_task &&
+           !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
       __asm__ volatile("pause");
       tlb_shootdown_poll();
     }
@@ -431,7 +441,6 @@ void scheduler_init(void) {
   boot->id = next_task_id++;
   boot->name = "boot";
   boot->state = TASK_RUNNING;
-  boot->bkl_depth = 1;
   boot->stdout_fd = -1;
   boot->fd_capacity = SCHED_MAX_FDS;
   boot->fd_table = kzalloc(boot->fd_capacity * sizeof(struct vfs_handle *));
@@ -464,13 +473,8 @@ void scheduler_init(void) {
     if (p) p->idle_task = boot;
   }
 
-  /* The boot task now holds the Big Kernel Lock at depth 1. From here on the
-   * BSP runs all kernel code holding the BKL; it is handed off (still depth 1)
-   * across every context switch and only released when a task enters userspace
-   * or the idle loop parks. Uncontended on a single CPU, so this is a no-op for
-   * the non-SMP path — it just establishes the depth==1-at-context-switch
-   * invariant before the first scheduler_yield. */
-  bkl_lock();
+  /* BKL fully retired (M28 #7) — no init-time acquire needed. Kernel entry
+   * runs BKL-free and the context switch no longer hands a lock across. */
 
   console_write("sched: initialized\n");
 }
@@ -523,7 +527,6 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
   task->stealable = stealable;
   task->ap_runnable = ap_runnable;
-  task->bkl_depth = 1;
 
   task->name = strdup(name);
   if (!task->name) {
@@ -987,7 +990,6 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
   child->stack = kstack;
   child->entry = clone_thread_kentry;
-  child->bkl_depth = 1;
   child->arg = cta;
   child->context.rsp = initial_rsp;
   child->context.rbp = 0;
@@ -1232,6 +1234,14 @@ void scheduler_block_current(void) {
     panic("scheduler_block_current without running task");
   }
 
+  /* M28 T4: claim the kernel stack BEFORE publishing a non-RUNNING state, the
+   * same lease yield/exit take. A waker on another CPU can CAS us BLOCKED->READY
+   * and resume us the instant the state is visible; without clearing the lease
+   * it would observe a stale stack_released==1 and load our saved RSP while this
+   * CPU is still mid-arch_context_switch on this very stack. yield's
+   * RUNNING->READY arm only clears it when state==RUNNING, which is already
+   * false here, so we must do it ourselves. */
+  current_task->stack_released = 0;
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
   interrupts_enable();
@@ -1270,6 +1280,9 @@ void scheduler_block_on(void *chan) {
   }
 
   current_task->wait_chan = chan;
+  /* M28 T4: claim the stack lease before publishing BLOCKED — see
+   * scheduler_block_current for the full race. */
+  current_task->stack_released = 0;
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
   interrupts_enable();
@@ -1326,6 +1339,10 @@ void scheduler_sleep_ticks(u64 ticks) {
   }
 
   current_task->wake_tick = scheduler_ticks + ticks;
+  /* M28 T4: claim the stack lease before publishing SLEEPING — a timer-tick
+   * wake_sleepers on another CPU can CAS us SLEEPING->READY and resume us; see
+   * scheduler_block_current for the full race. */
+  current_task->stack_released = 0;
   current_task->state = TASK_SLEEPING;
   scheduler_yield();
   interrupts_enable();
@@ -1836,13 +1853,17 @@ int scheduler_kill(usize task_id, int sig) {
   interrupts_disable();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
-      /* SIGKILL and SIGSTOP cannot be blocked/ignored */
-      T(i)->pending_signals |= (1ULL << (sig - 1));
+      /* SIGKILL and SIGSTOP cannot be blocked/ignored. Atomic RMW: post-BKL
+       * the target task (or another killer) may concurrently set/clear its own
+       * pending bits, so a plain |= would drop a racing update. */
+      __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
+                        __ATOMIC_RELEASE);
 
       if (T(i) != current_task &&
           (sig == SIGSTOP || sig == SIGTSTP ||
            sig == SIGTTIN || sig == SIGTTOU)) {
-        T(i)->pending_signals &= ~(1ULL << (sig - 1));
+        __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
+                           __ATOMIC_RELAXED);
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
@@ -1882,7 +1903,8 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
   interrupts_disable();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
-      T(i)->pending_signals |= (1ULL << (sig - 1));
+      __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
+                        __ATOMIC_RELEASE);
 
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
@@ -2160,7 +2182,9 @@ void scheduler_deliver_pending_signals(void) {
   if (!current_task)
     return;
 
-  u64 pending = current_task->pending_signals;
+  /* Acquire-load the pending set: another CPU's scheduler_kill publishes new
+   * bits with a release fetch_or. blocked_signals is task-local. */
+  u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE);
   u64 blocked = current_task->blocked_signals;
   u64 deliverable = pending & ~blocked;
 
@@ -2187,8 +2211,9 @@ void scheduler_deliver_pending_signals(void) {
     }
 
     if (handler == SIG_IGN) {
-      /* Ignored — just clear */
-      current_task->pending_signals &= ~(1ULL << (sig - 1));
+      /* Ignored — just clear (atomic: races with a concurrent killer's set) */
+      __atomic_fetch_and(&current_task->pending_signals,
+                         ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
       continue;
     }
 
@@ -2220,7 +2245,8 @@ void scheduler_deliver_pending_signals(void) {
         return;
         /* unreachable */
       case SIGCONT:
-        current_task->pending_signals &= ~(1ULL << (sig - 1));
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
         if (current_task->state == TASK_STOPPED) {
           current_task->state = TASK_READY;
           current_task->continued_report_pending = 1;
@@ -2233,14 +2259,16 @@ void scheduler_deliver_pending_signals(void) {
         current_task->state = TASK_STOPPED;
         current_task->last_stop_signal = sig;
         current_task->stop_report_pending = 1;
-        current_task->pending_signals &= ~(1ULL << (sig - 1));
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
         continue;
       case SIGCHLD:
       case SIGURG:
       case SIGWINCH:
       default:
         /* Ignore by default */
-        current_task->pending_signals &= ~(1ULL << (sig - 1));
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
         continue;
       }
     }
