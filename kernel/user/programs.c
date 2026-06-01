@@ -3406,6 +3406,19 @@ static int init_main(int argc, const char **argv) {
       uwrite("M34-PROC: fail tools\n");
   }
 
+  /* M35: ELF core dump on fatal signal. The child faults; the kernel writes
+   * /tmp/core; the parent validates the ET_CORE ELF. */
+  {
+    u64 m35_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m35-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m35_pid < 0) {
+      uwrite("M35-CORE: spawn-fail\n");
+    } else {
+      int m35_status = 0;
+      syscall_dispatch(SYS_WAIT, m35_pid, (u64)(usize)&m35_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
    * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
    * the base offset correctly, the pointer-table dereferences land on

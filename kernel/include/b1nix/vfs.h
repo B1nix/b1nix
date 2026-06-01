@@ -146,6 +146,9 @@ struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
 struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
+void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
+isize vfs_readdir_children(struct vfs_node *dir, usize offset,
+                           struct dirent *buf, usize max_entries);
 
 /* Permission-aware operations */
 int vfs_open(const char *path);

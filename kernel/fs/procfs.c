@@ -160,13 +160,7 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   }
   n->parent = parent;
   n->refcount++;
-  /* Prepend into the parent's child list. Boot-time/listing-time only; the
-   * only concurrent reader is find_child/readdir, which snapshot under cli. */
-  u64 fl;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
-  n->next_sibling = parent->first_child;
-  parent->first_child = n;
-  __asm__ volatile("pushq %0; popfq" : : "r"(fl) : "memory");
+  vfs_attach_child(parent, n);
   return n;
 }
 
@@ -361,43 +355,7 @@ static void procfs_refresh(void) {
 static isize procfs_root_readdir(struct vfs_node *dir, usize offset,
                                  struct dirent *buf, usize max_entries) {
   procfs_refresh();
-  usize start = offset, idx = 0, count = 0;
-  if (idx >= start && count < max_entries) {
-    strcpy(buf[count].name, ".");
-    buf[count].type = (u32)VFS_DIRECTORY;
-    buf[count].is_dir = 1;
-    buf[count].is_exec = 1;
-    buf[count].size = 0;
-    count++;
-  }
-  idx++;
-  if (idx >= start && count < max_entries) {
-    strcpy(buf[count].name, "..");
-    buf[count].type = (u32)VFS_DIRECTORY;
-    buf[count].is_dir = 1;
-    buf[count].is_exec = 1;
-    buf[count].size = 0;
-    count++;
-  }
-  idx++;
-  u64 fl;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(fl) : : "memory");
-  for (struct vfs_node *c = dir->first_child; c && count < max_entries;
-       c = c->next_sibling) {
-    if (c->deleted)
-      continue;
-    if (idx >= start) {
-      strcpy(buf[count].name, c->name);
-      buf[count].type = (u32)c->inode->type;
-      buf[count].is_dir = (c->inode->type == VFS_DIRECTORY);
-      buf[count].is_exec = 0;
-      buf[count].size = c->inode->size;
-      count++;
-    }
-    idx++;
-  }
-  __asm__ volatile("pushq %0; popfq" : : "r"(fl) : "memory");
-  return (isize)count;
+  return vfs_readdir_children(dir, offset, buf, max_entries);
 }
 
 /* ──────────────────────────────────────────────────────────────────────────

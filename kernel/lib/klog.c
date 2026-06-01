@@ -56,6 +56,60 @@ static const char *klog_lookup_symbol(u64 address)
 	return best_name;
 }
 
+/* ── kallsyms: post-link symbol blob (M35) ──
+ * Walks the packed [u64 addr][asciz name] records the two-pass link emitted
+ * into the .kallsyms section (see tools/gen_kallsyms.sh, linker.ld). Returns
+ * the name of the function containing `addr` and, via *off, the byte offset
+ * into it. Names point into the loaded blob, valid for the kernel's lifetime. */
+extern const unsigned char __kallsyms_start[];
+extern const unsigned char __kallsyms_end[];
+
+const char *ksym_lookup(u64 addr, u64 *off)
+{
+	const unsigned char *p = __kallsyms_start;
+	const unsigned char *end = __kallsyms_end;
+	u64 best_addr = 0;
+	const char *best_name = 0;
+
+	while (p + 8 < end) {
+		u64 a;
+		memcpy(&a, p, 8);
+		p += 8;
+		const char *name = (const char *)p;
+		while (p < end && *p)
+			p++;
+		p++; /* skip the NUL terminator */
+		if (a <= addr && a >= best_addr) {
+			best_addr = a;
+			best_name = name;
+		}
+	}
+
+	if (best_name && off)
+		*off = addr - best_addr;
+	return best_name;
+}
+
+/* Print " <symbol+0xoff>" to console and serial if `addr` resolves. */
+void ksym_print(u64 addr)
+{
+	u64 off = 0;
+	const char *name = ksym_lookup(addr, &off);
+	if (!name)
+		return;
+	console_write(" <");
+	console_write(name);
+	serial_write(" <");
+	serial_write(name);
+	if (off) {
+		console_write("+0x");
+		console_write_hex64(off);
+		serial_write("+0x");
+	}
+	console_write(">");
+	serial_write(">");
+}
+
 static void klog_ring_put(char ch)
 {
     usize next = (klog_write_pos + 1) % KLOG_BUF_SIZE;
