@@ -22,6 +22,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/ctype.o \
 	$(BUILD)/libc/dirent.o \
 	$(BUILD)/libc/pwd.o \
+	$(BUILD)/libc/pty.o \
 	$(BUILD)/libc/pthread.o \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \

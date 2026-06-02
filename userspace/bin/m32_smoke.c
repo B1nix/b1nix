@@ -16,6 +16,9 @@
 #include <string.h>
 #include <unistd.h>
 #include <signal.h>
+#include <termios.h>
+#include <pty.h>
+#include <sys/ioctl.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -1401,8 +1404,86 @@ static int test_socket_options(void) {
   return 0;
 }
 
+/* M32b: pseudo-terminal substrate (/dev/ptmx, pts, line discipline). */
+static int test_pty(void) {
+  /* The hangup test closes the master, which delivers SIGHUP to the slave's
+   * foreground group — here, ours. Ignore it so the test process survives. */
+  signal(SIGHUP, SIG_IGN);
+
+  int m, s;
+  char name[64];
+  if (openpty(&m, &s, name, NULL, NULL) != 0) {
+    emit("M32B-PTY: FAIL openpty\n");
+    return -1;
+  }
+  char *pn = ptsname(m);
+  if (!pn || strncmp(pn, "/dev/pts/", 9) != 0 || strcmp(pn, name) != 0) {
+    emit("M32B-PTY: FAIL ptsname\n");
+    close(m); close(s); return -1;
+  }
+  emit("M32B-PTY: ok openpty\n");
+
+  /* window size round-trips through the slave. */
+  struct winsize ws;
+  memset(&ws, 0, sizeof(ws));
+  ws.ws_row = 30; ws.ws_col = 100;
+  struct winsize got;
+  memset(&got, 0, sizeof(got));
+  if (ioctl(s, TIOCSWINSZ, &ws) != 0 || ioctl(s, TIOCGWINSZ, &got) != 0 ||
+      got.ws_row != 30 || got.ws_col != 100) {
+    emit("M32B-PTY: FAIL winsize\n");
+    close(m); close(s); return -1;
+  }
+  emit("M32B-PTY: ok winsize\n");
+
+  /* Canonical mode: a line written to the master is delivered to the slave on
+   * the newline, and echoed back on the master (ONLCR -> "hi\r\n"). */
+  write(m, "hi\n", 3);
+  char lb[32];
+  int n = (int)read(s, lb, sizeof(lb));
+  if (n != 3 || memcmp(lb, "hi\n", 3) != 0) {
+    emit("M32B-PTY: FAIL canonical\n");
+    close(m); close(s); return -1;
+  }
+  emit("M32B-PTY: ok canonical\n");
+  char eb[32];
+  int en = (int)read(m, eb, sizeof(eb));
+  if (en < 2 || eb[0] != 'h' || eb[1] != 'i') {
+    emit("M32B-PTY: FAIL echo\n");
+    close(m); close(s); return -1;
+  }
+  emit("M32B-PTY: ok echo\n");
+
+  /* Raw mode: no echo, single-byte immediate delivery. */
+  struct termios raw;
+  tcgetattr(s, &raw);
+  cfmakeraw(&raw);
+  tcsetattr(s, TCSANOW, &raw);
+  write(m, "Z", 1);
+  char rb[4];
+  int rn = (int)read(s, rb, sizeof(rb));
+  if (rn != 1 || rb[0] != 'Z') {
+    emit("M32B-PTY: FAIL raw\n");
+    close(m); close(s); return -1;
+  }
+  emit("M32B-PTY: ok raw\n");
+
+  /* Hangup: closing the master makes the slave read report EOF. */
+  close(m);
+  char hb[4];
+  if (read(s, hb, sizeof(hb)) != 0) {
+    emit("M32B-PTY: FAIL hangup\n");
+    close(s); return -1;
+  }
+  emit("M32B-PTY: ok hangup\n");
+  close(s);
+  emit("M32B-PTY: done\n");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
+  if (test_pty() != 0)                 return 1;
   if (test_socket_options() != 0)      return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;

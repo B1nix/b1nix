@@ -1783,6 +1783,12 @@ void vfs_init(void) {
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
+  /* M32b pseudo-terminals: /dev/ptmx + the /dev/pts mountpoint directory. Both
+   * opens are intercepted in vfs_open_flags; the nodes exist so stat()/ls and
+   * ptsname() paths resolve. */
+  pty_init();
+  add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
+  add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
@@ -1822,6 +1828,26 @@ int vfs_open_flags(const char *path, int flags) {
   if (!resolved)
     return -ENOMEM;
   vfs_resolve_path(path, resolved);
+
+  /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
+   * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
+   * intercept the open before the path lookup. */
+  if (strcmp(resolved, "/dev/ptmx") == 0) {
+    int fd = pty_open_master(flags);
+    kfree(resolved);
+    return fd;
+  }
+  if (strncmp(resolved, "/dev/pts/", 9) == 0) {
+    const char *num = resolved + 9;
+    if (*num >= '0' && *num <= '9') {
+      int idx = 0;
+      for (const char *q = num; *q >= '0' && *q <= '9'; q++)
+        idx = idx * 10 + (*q - '0');
+      int fd = pty_open_slave(idx, flags);
+      kfree(resolved);
+      return fd;
+    }
+  }
 
   struct vfs_node *node = vfs_find_node_internal(resolved, 1, 0);
   if (IS_ERR(node)) {
@@ -3487,6 +3513,12 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
 }
 
 int vfs_ioctl(int fd, u64 request, void *arg) {
+  /* Handles with their own ioctl op (pty master/slave) take priority — they
+   * are raw handles with no backing VFS node. */
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (h && h->ops && h->ops->ioctl)
+    return h->ops->ioctl(h, request, arg);
+
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
