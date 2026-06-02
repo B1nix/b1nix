@@ -9,6 +9,7 @@
  *
  * Markers (`M32-NET: ok <name>`) are consumed by tests/smoke.sh. */
 
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,6 +21,7 @@
 #include <sys/wait.h>
 #include <netdb.h>
 #include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <arpa/inet.h>
 #include "syscall.h"
 
@@ -1296,8 +1298,112 @@ static int test_wget_https(void) {
   return 0;
 }
 
+/* M32b: socket option / address / shutdown API hardening. */
+static int test_socket_options(void) {
+  int fd = socket(AF_INET, SOCK_STREAM, 0);
+  if (fd < 0) { fail("sockopt-create"); return -1; }
+
+  int one = 1;
+  if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one)) != 0) {
+    fail("sockopt-reuseaddr"); close(fd); return -1;
+  }
+  int val = 0; socklen_t vlen = sizeof(val);
+  if (getsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &val, &vlen) != 0 || val != 1) {
+    fail("sockopt-reuseaddr"); close(fd); return -1;
+  }
+  ok("sockopt-reuseaddr");
+
+  if (setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one)) != 0) {
+    fail("sockopt-nodelay"); close(fd); return -1;
+  }
+  val = 0; vlen = sizeof(val);
+  if (getsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &val, &vlen) != 0 || val != 1) {
+    fail("sockopt-nodelay"); close(fd); return -1;
+  }
+  ok("sockopt-nodelay");
+
+  val = 0; vlen = sizeof(val);
+  if (getsockopt(fd, SOL_SOCKET, SO_TYPE, &val, &vlen) != 0 ||
+      val != SOCK_STREAM) {
+    fail("sockopt-sotype"); close(fd); return -1;
+  }
+  ok("sockopt-sotype");
+
+  /* getsockname reports the address we bound to. */
+  unsigned short port = 3399;
+  struct sockaddr_in baddr;
+  make_loopback_addr(port, &baddr);
+  if (bind(fd, (struct sockaddr *)&baddr, sizeof(baddr)) != 0) {
+    fail("getsockname-bind"); close(fd); return -1;
+  }
+  struct sockaddr_in got;
+  socklen_t glen = sizeof(got);
+  memset(&got, 0, sizeof(got));
+  if (getsockname(fd, (struct sockaddr *)&got, &glen) != 0 ||
+      got.sin_family != AF_INET || got.sin_port != htons(port)) {
+    fail("getsockname"); close(fd); return -1;
+  }
+  ok("getsockname");
+  close(fd);
+
+  /* getpeername + shutdown half-close semantics need a connected pair. The
+   * child accepts once, reads the single "hello", then exits — it does NOT wait
+   * for EOF, because shutdown() here is a local half-close (correct POSIX
+   * caller-side semantics); peer FIN-on-shutdown is delivered by close(). */
+  unsigned short sport = 3400;
+  int pid = fork();
+  if (pid < 0) { fail("sockopt-fork"); return -1; }
+  if (pid == 0) {
+    int lfd = socket(AF_INET, SOCK_STREAM, 0);
+    int reuse = 1;
+    setsockopt(lfd, SOL_SOCKET, SO_REUSEADDR, &reuse, sizeof(reuse));
+    struct sockaddr_in la;
+    make_loopback_addr(sport, &la);
+    if (bind(lfd, (struct sockaddr *)&la, sizeof(la)) < 0 ||
+        listen(lfd, 1) < 0) { _exit(3); }
+    int cfd = accept(lfd, 0, 0);
+    if (cfd < 0) { _exit(4); }
+    char b[64];
+    int r = recv_with_retry(cfd, b, sizeof(b));
+    close(cfd); close(lfd);
+    _exit(r == 5 ? 0 : 5);
+  }
+
+  sleep(1);
+  int cfd = connect_loopback(sport);
+  if (cfd < 0) { fail("getpeername-connect"); return -1; }
+  struct sockaddr_in peer;
+  socklen_t plen = sizeof(peer);
+  memset(&peer, 0, sizeof(peer));
+  if (getpeername(cfd, (struct sockaddr *)&peer, &plen) != 0 ||
+      peer.sin_family != AF_INET || peer.sin_port != htons(sport) ||
+      peer.sin_addr.s_addr != inet_addr("127.0.0.1")) {
+    fail("getpeername"); close(cfd); return -1;
+  }
+  ok("getpeername");
+
+  send(cfd, "hello", 5, 0);
+  /* SHUT_WR closes the write half: further send() must fail with EPIPE. */
+  if (shutdown(cfd, SHUT_WR) != 0) { fail("shutdown-wr"); close(cfd); return -1; }
+  if (send(cfd, "x", 1, 0) >= 0 || errno != EPIPE) {
+    fail("shutdown-wr"); close(cfd); return -1;
+  }
+  /* SHUT_RD closes the read half: recv() must report EOF (0) immediately. */
+  if (shutdown(cfd, SHUT_RD) != 0) { fail("shutdown-wr"); close(cfd); return -1; }
+  char rb[8];
+  if (recv(cfd, rb, sizeof(rb), 0) != 0) {
+    fail("shutdown-wr"); close(cfd); return -1;
+  }
+  int st = 0;
+  waitpid(pid, &st, 0);
+  close(cfd);
+  ok("shutdown-wr");
+  return 0;
+}
+
 int main(void) {
   emit("M32-NET: start\n");
+  if (test_socket_options() != 0)      return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
   if (test_v4mapped_udp() != 0)        return 1;

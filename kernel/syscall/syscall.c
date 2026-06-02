@@ -1174,6 +1174,58 @@ static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   return (u64)res;
 }
 
+static u64 sys_setsockopt(int fd, int level, int optname,
+                          const void *user_optval, usize optlen) {
+  u8 kopt[64];
+  if (!user_optval || optlen == 0 || optlen > sizeof(kopt))
+    return (u64)-EINVAL;
+  if (syscall_copyin(kopt, user_optval, optlen) < 0)
+    return (u64)-EFAULT;
+  return (u64)vfs_setsockopt(fd, level, optname, kopt, optlen);
+}
+
+static u64 sys_getsockopt(int fd, int level, int optname, void *user_optval,
+                          usize *user_optlen) {
+  usize klen = 0;
+  if (!user_optlen)
+    return (u64)-EINVAL;
+  if (syscall_copyin(&klen, user_optlen, sizeof(usize)) < 0)
+    return (u64)-EFAULT;
+  u8 kopt[64];
+  if (klen == 0 || klen > sizeof(kopt))
+    return (u64)-EINVAL;
+  int rc = vfs_getsockopt(fd, level, optname, kopt, &klen);
+  if (rc < 0)
+    return (u64)rc;
+  if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0)
+    return (u64)-EFAULT;
+  if (syscall_copyout(user_optlen, &klen, sizeof(usize)) < 0)
+    return (u64)-EFAULT;
+  return 0;
+}
+
+static u64 sys_getsockaddr(int fd, void *user_addr, usize *user_addrlen,
+                           int want_peer) {
+  usize klen = 0;
+  if (!user_addrlen)
+    return (u64)-EINVAL;
+  if (syscall_copyin(&klen, user_addrlen, sizeof(usize)) < 0)
+    return (u64)-EFAULT;
+  char kaddr[128];
+  if (klen > sizeof(kaddr))
+    klen = sizeof(kaddr);
+  int rc = want_peer ? vfs_getpeername(fd, kaddr, &klen)
+                     : vfs_getsockname(fd, kaddr, &klen);
+  if (rc < 0)
+    return (u64)rc;
+  usize out = klen < sizeof(kaddr) ? klen : sizeof(kaddr);
+  if (user_addr && out > 0 && syscall_copyout(user_addr, kaddr, out) < 0)
+    return (u64)-EFAULT;
+  if (syscall_copyout(user_addrlen, &klen, sizeof(usize)) < 0)
+    return (u64)-EFAULT;
+  return 0;
+}
+
 static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
                     isize offset) {
   if (length == 0)
@@ -1843,6 +1895,20 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return sys_listen((int)arg0, (int)arg1);
   case SYS_ACCEPT:
     return sys_accept((int)arg0, (void *)(usize)arg1, (usize *)(usize)arg2);
+  case SYS_SETSOCKOPT:
+    return sys_setsockopt((int)arg0, (int)arg1, (int)arg2,
+                          (const void *)(usize)arg3, (usize)arg4);
+  case SYS_GETSOCKOPT:
+    return sys_getsockopt((int)arg0, (int)arg1, (int)arg2,
+                          (void *)(usize)arg3, (usize *)(usize)arg4);
+  case SYS_GETSOCKNAME:
+    return sys_getsockaddr((int)arg0, (void *)(usize)arg1,
+                           (usize *)(usize)arg2, 0);
+  case SYS_GETPEERNAME:
+    return sys_getsockaddr((int)arg0, (void *)(usize)arg1,
+                           (usize *)(usize)arg2, 1);
+  case SYS_SHUTDOWN:
+    return (u64)vfs_shutdown((int)arg0, (int)arg1);
 #ifndef __aarch64__
   case SYS_NET_INFO:
     net_dump_info();

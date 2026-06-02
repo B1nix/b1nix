@@ -470,34 +470,25 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
 
 int setsockopt(int sockfd, int level, int optname, const void *optval,
                socklen_t optlen) {
-  (void)sockfd;
-  (void)level;
-  (void)optname;
-  (void)optval;
-  (void)optlen;
-  return 0;
+  return _check_err(syscall(SYS_SETSOCKOPT, sockfd, level, optname, optval,
+                            (size_t)optlen));
 }
 
 int getsockopt(int sockfd, int level, int optname, void *optval,
                socklen_t *optlen) {
-  (void)sockfd;
-  (void)level;
-  if (!optval || !optlen || *optlen < sizeof(int)) {
+  if (!optlen) {
     errno = EINVAL;
     return -1;
   }
-  if (optname == SO_TYPE) {
-    *(int *)optval = SOCK_STREAM;
-    *optlen = sizeof(int);
-    return 0;
+  /* The kernel reads/writes the length as a 64-bit usize; bridge via size_t. */
+  size_t klen = *optlen;
+  long rc = syscall(SYS_GETSOCKOPT, sockfd, level, optname, optval, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
   }
-  if (optname == SO_ERROR) {
-    *(int *)optval = 0;
-    *optlen = sizeof(int);
-    return 0;
-  }
-  errno = ENOPROTOOPT;
-  return -1;
+  *optlen = (socklen_t)klen;
+  return 0;
 }
 
 int listen(int fd, int backlog) {
@@ -519,9 +510,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 }
 
 int shutdown(int sockfd, int how) {
-  (void)sockfd;
-  (void)how;
-  return 0;
+  return _check_err(syscall(SYS_SHUTDOWN, sockfd, how));
 }
 
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -529,28 +518,32 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
 }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-  (void)sockfd;
-  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    sin->sin_port = 0x5000; // htons(80) -> 0x0050 in big-endian, so 0x5000 in little-endian representation of short
-    sin->sin_addr.s_addr = 0x0100007f; // 127.0.0.1 in little-endian
-    *addrlen = sizeof(struct sockaddr_in);
+  if (!addrlen) {
+    errno = EINVAL;
+    return -1;
   }
+  size_t klen = *addrlen;
+  long rc = syscall(SYS_GETSOCKNAME, sockfd, addr, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  *addrlen = (socklen_t)klen;
   return 0;
 }
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-  (void)sockfd;
-  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    sin->sin_port = 0x5000;
-    sin->sin_addr.s_addr = 0x0100007f;
-    *addrlen = sizeof(struct sockaddr_in);
+  if (!addrlen) {
+    errno = EINVAL;
+    return -1;
   }
+  size_t klen = *addrlen;
+  long rc = syscall(SYS_GETPEERNAME, sockfd, addr, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  *addrlen = (socklen_t)klen;
   return 0;
 }
 

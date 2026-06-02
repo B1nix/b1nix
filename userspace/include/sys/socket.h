@@ -71,12 +71,23 @@ struct sockaddr_un {
 #define IPPROTO_UDP     17
 
 #define SOL_SOCKET      1
-#define SO_KEEPALIVE    9
 #define SO_REUSEADDR    2
 #define SO_TYPE         3
 #define SO_ERROR        4
+#define SO_SNDBUF       7
+#define SO_RCVBUF       8
+#define SO_KEEPALIVE    9
+#define SO_LINGER       13
+#define SO_REUSEPORT    15
+#define SO_ACCEPTCONN   30
 
 #define MSG_PEEK        0x02
+#define MSG_DONTWAIT    0x40
+#define MSG_NOSIGNAL    0x4000
+
+#define SHUT_RD         0
+#define SHUT_WR         1
+#define SHUT_RDWR       2
 
 int socket(int domain, int type, int protocol);
 int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);

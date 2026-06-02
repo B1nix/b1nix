@@ -193,6 +193,13 @@ int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
+int vfs_setsockopt(int fd, int level, int optname, const void *optval,
+                   usize optlen);
+int vfs_getsockopt(int fd, int level, int optname, void *optval,
+                   usize *optlen);
+int vfs_getsockname(int fd, void *addr, usize *addrlen);
+int vfs_getpeername(int fd, void *addr, usize *addrlen);
+int vfs_shutdown(int fd, int how);
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len);
 
 extern void *vfs_poll_chan;
@@ -261,6 +268,16 @@ struct vfs_socket_state {
   int bound;
   int connected;
   int listening;
+  /* M32b socket options + shutdown state (SHUT_RD/WR half-close flags). */
+  int so_reuseaddr;
+  int so_keepalive;
+  int tcp_nodelay;
+  int so_error;
+  int so_rcvbuf;
+  int so_sndbuf;
+  int backlog;
+  int shut_rd;
+  int shut_wr;
   void *tcp_conn;
   void *unix_data;
   char recv_buf[2048];
