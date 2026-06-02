@@ -1558,7 +1558,11 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
 void vfs_handle_retain(struct vfs_handle *h) {
   if (!h || h->used != 1 || h->refcount <= 0)
     return;
-  h->refcount++;
+  /* SMP-safe: fork retains every shared fd's handle (scheduler.c) on the
+   * forking CPU while the original holder may run on another. A non-atomic
+   * increment would lose updates, breaking the refcount and ultimately
+   * double-freeing the underlying socket/pipe state in ->release. */
+  __atomic_add_fetch(&h->refcount, 1, __ATOMIC_RELAXED);
 }
 
 static struct vfs_handle *get_handle(int fd) {
@@ -1580,10 +1584,14 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 void vfs_handle_release(struct vfs_handle *h) {
   if (!h || h->used != 1 || h->refcount <= 0)
     return;
-  if (h->refcount > 1) {
-    h->refcount--;
+  /* SMP-safe dec-and-test: a fork'd parent and child closing a shared socket
+   * fd on different CPUs both release the same handle. A non-atomic
+   * "if (refcount > 1) refcount--" lost the update under that race, so both
+   * fell through to ->release → kfree(socket_state) twice → kheap double-free
+   * ("bucket_unlink ... magic 0x...dead110c"). The atomic sub-and-test makes
+   * exactly one releaser observe 0 and run teardown. */
+  if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) > 0)
     return;
-  }
 
   h->used = 0;
   if (h->ops && h->ops->release) {
