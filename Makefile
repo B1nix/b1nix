@@ -3,6 +3,15 @@ ARCH ?= x86_64
 export B1NIX_ARCH := $(ARCH)
 $(shell $(MAKE) -C userspace B1NIX_ARCH=$(ARCH) build/libb1nix.a build/crt/crt0.o >/dev/null)
 BUILD_DIR := build/$(ARCH)
+# Host triplet for the ported userspace toolchain + programs. Their build trees
+# live under per-triplet directories (build/toolchain_build/<triplet>,
+# build/<prog>-{src,b1nix}/<triplet>) so x86 and x86_64 never share objects.
+# Keep this mapping in sync with tools/toolchain-env.sh.
+ifeq ($(ARCH),x86)
+B1NIX_TRIPLET := i686-b1nix
+else
+B1NIX_TRIPLET := x86_64-b1nix
+endif
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 RUN_ISO := /tmp/b1nix-run.iso
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
@@ -43,10 +52,10 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
 	$(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) \
 	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
-CURL_ELF := build/curl-b1nix/src/curl
-WGET_ELF := build/wget-b1nix/src/wget
+CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
+WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
-DROPBEAR_ELF := build/dropbear-src/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
+DROPBEAR_ELF := build/dropbear-src/$(B1NIX_TRIPLET)/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
 B1NIX_TLS ?= mbedtls
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -67,15 +76,15 @@ GRUB_TIMEOUT ?= 0
 ROOT_IMAGE_SIZE ?= 512
 
 # Locate the native toolchain that tools/build-native-toolchain.sh produced.
-# The script writes to build/toolchain_build/native_root by default, or to
-# ~/b1nix-toolchain/native_root when the project path contains spaces (WSL).
+# Per-triplet: build/toolchain_build/<triplet>/native_root by default, or
+# ~/b1nix-toolchain/<triplet>/native_root when the project path has spaces (WSL).
 # /root/b1nix-toolchain is the legacy Docker-builder location kept as fallback.
 NATIVE_TOOLCHAIN_ROOT := $(shell \
-	for p in build/toolchain_build/native_root $$HOME/b1nix-toolchain/native_root /root/b1nix-toolchain/native_root; do \
+	for p in build/toolchain_build/$(B1NIX_TRIPLET)/native_root $$HOME/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root /root/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root; do \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 CROSS_TOOLCHAIN_ROOT := $(shell \
-	for p in build/toolchain_build/cross $$HOME/b1nix-toolchain/cross /root/b1nix-toolchain/cross; do \
+	for p in build/toolchain_build/$(B1NIX_TRIPLET)/cross $$HOME/b1nix-toolchain/$(B1NIX_TRIPLET)/cross /root/b1nix-toolchain/$(B1NIX_TRIPLET)/cross; do \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 
@@ -397,7 +406,7 @@ $(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CU
 	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
-PCRE2_LIB := build/pcre2-b1nix/install/lib/libpcre2-8.a
+PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
 $(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-pcre2.sh >/dev/null
 
@@ -422,11 +431,11 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
-OPENSSL_LIB := build/openssl-b1nix/install/lib/libssl.a
+OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
 $(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-openssl.sh >/dev/null
 
-LIBIDN2_LIB := build/libidn2-b1nix/install/lib/libidn2.a
+LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
 $(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-libidn2.sh >/dev/null
 
@@ -515,13 +524,13 @@ userspace-install: userspace
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
 		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
-		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
+		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0; \
 		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
-		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" ]; then \
-			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" ]; then \
+			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
 		fi; \
 	else \
-		echo "Note: native toolchain not built (looked in build/toolchain_build/native_root and ~/b1nix-toolchain/native_root)."; \
+		echo "Note: native toolchain not built (looked in build/toolchain_build/$(B1NIX_TRIPLET)/native_root and ~/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root)."; \
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
 	fi
 

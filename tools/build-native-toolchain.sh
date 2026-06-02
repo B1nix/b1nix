@@ -4,9 +4,12 @@
 # Requires: cross-toolchain already built (run build-toolchain.sh first)
 set -euo pipefail
 
-TARGET="x86_64-b1nix"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Per-architecture build identity (B1NIX_ARCH -> triplet, per-triplet paths).
+. "$PROJECT_DIR/tools/toolchain-env.sh"
+TARGET="$B1NIX_TRIPLET"
 
 BINUTILS_VER="2.41"
 GCC_VER="13.2.0"
@@ -21,14 +24,8 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
-# ── Space-free build directory ────────────────────────────────────────────────
-if echo "$PROJECT_DIR" | grep -q ' '; then
-    # Path has spaces → build on the Linux-side filesystem
-    BUILD_HOME="$HOME/b1nix-toolchain"
-    echo "Note: project path has spaces; building native toolchain in $BUILD_HOME"
-else
-    BUILD_HOME="$PROJECT_DIR/build/toolchain_build"
-fi
+# ── Per-triplet build directory (build/toolchain_build/<triplet>) ─────────────
+BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
 SRC_DIR="$BUILD_HOME/src"
 WORK_DIR="$BUILD_HOME/native_build"

@@ -5,8 +5,12 @@ import sys
 if len(sys.argv) > 1:
     gcc_dir = sys.argv[1]
 else:
+    # Fallback when invoked without an explicit path: derive the per-triplet
+    # toolchain src dir from B1NIX_ARCH (build-toolchain.sh always passes the
+    # path explicitly, so this only matters for manual runs).
     PROJECT_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    gcc_dir = os.path.join(PROJECT_DIR, "build/toolchain_build/gcc-13.2.0")
+    triplet = "i686-b1nix" if os.environ.get("B1NIX_ARCH") == "x86" else "x86_64-b1nix"
+    gcc_dir = os.path.join(PROJECT_DIR, "build/toolchain_build", triplet, "src/gcc-13.2.0")
 
 if not os.path.exists(gcc_dir):
     print(f"Error: {gcc_dir} does not exist", file=sys.stderr)
@@ -46,6 +50,16 @@ if "*-*-b1nix*" not in content:
 	;;""")
     content = content.replace(x86_case, x86_replacement)
 
+    # 32-bit i686-b1nix target (mirror of the i[34567]86-*-elf* case).
+    i386_case = clean("""i[34567]86-*-elf*)
+	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h"
+	;;""")
+    i386_replacement = i386_case + clean("""\ni[34567]86-*-b1nix*)
+	tm_file="${tm_file} i386/unix.h i386/att.h elfos.h newlib-stdint.h i386/i386elf.h b1nix.h"
+	tmake_file="${tmake_file} i386/t-i386elf t-fdpbit"
+	;;""")
+    content = content.replace(i386_case, i386_replacement)
+
     with open(config_gcc_path, "w", encoding="utf-8") as f:
         f.write(content)
 
@@ -81,6 +95,10 @@ if "x86_64-*-b1nix*" not in content:
 aarch64*-*-elf | aarch64*-*-rtems*)""")
     replacement = clean("""case ${host} in
 x86_64-*-b1nix*)
+	extra_parts="$extra_parts crtbegin.o crtend.o"
+	tmake_file="$tmake_file i386/t-crtstuff t-fdpbit"
+	;;
+i[34567]86-*-b1nix*)
 	extra_parts="$extra_parts crtbegin.o crtend.o"
 	tmake_file="$tmake_file i386/t-crtstuff t-fdpbit"
 	;;

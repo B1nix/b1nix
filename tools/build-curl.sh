@@ -7,17 +7,16 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 CURL_VERSION="${CURL_VERSION:-8.20.0}"
 CURL_TARBALL="curl-${CURL_VERSION}.tar.gz"
 CURL_URL="https://curl.se/download/${CURL_TARBALL}"
-SRC_DIR="$ROOT_DIR/build/curl-src/curl-${CURL_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/curl-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
-if [ "$B1NIX_ARCH" = "x86" ]; then
-  HOST_TRIPLET="i686-b1nix"
-else
-  HOST_TRIPLET="x86_64-b1nix"
-fi
+# Per-architecture build identity (B1NIX_ARCH -> triplet).
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+# Per-triplet source tree + build dir so x86 and x86_64 never share objects.
+SRC_PARENT="$ROOT_DIR/build/curl-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/curl-${CURL_VERSION}"
+BUILD_DIR="$ROOT_DIR/build/curl-b1nix/$HOST_TRIPLET"
 
 SSL_FLAGS="--without-ssl"
 TLS_CPPFLAGS=""
@@ -37,10 +36,10 @@ if [ "$B1NIX_TLS" = "mbedtls" ]; then
   TLS_LIBS="-lmbedx509 -lmbedcrypto"
 fi
 
-mkdir -p "$ROOT_DIR/build/curl-src" "$BUILD_DIR"
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/curl-src/${CURL_TARBALL}"
+  tmp="$SRC_PARENT/${CURL_TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$CURL_URL" -o "$tmp"
@@ -51,7 +50,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/curl-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
 fi
 
 # Time discipline/NTP can move clocks and confuse autotools dependency checks.

@@ -7,27 +7,25 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VER="${LIBIDN2_VERSION:-2.3.7}"
 TARBALL="libidn2-${VER}.tar.gz"
 URL="https://ftp.gnu.org/gnu/libidn/${TARBALL}"
-SRC_DIR="$ROOT_DIR/build/libidn2-src/libidn2-${VER}"
-BUILD_DIR="$ROOT_DIR/build/libidn2-b1nix"
-INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
-if [ "$B1NIX_ARCH" = "x86" ]; then
-  HOST_TRIPLET="i686-b1nix"
-else
-  HOST_TRIPLET="x86_64-b1nix"
-fi
-UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/install"
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/libidn2-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/libidn2-${VER}"
+BUILD_DIR="$ROOT_DIR/build/libidn2-b1nix/$HOST_TRIPLET"
+INSTALL_DIR="$BUILD_DIR/install"
+UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET/install"
 if [ ! -f "$UNISTR_PREFIX/lib/libunistring.a" ]; then
   "$ROOT_DIR/tools/build-libunistring.sh" >/dev/null
 fi
 
-mkdir -p "$ROOT_DIR/build/libidn2-src" "$BUILD_DIR"
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/libidn2-src/${TARBALL}"
+  tmp="$SRC_PARENT/${TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$URL" -o "$tmp"
@@ -38,7 +36,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/libidn2-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
 fi
 
 if ! grep -q 'b1nix\*' "$SRC_DIR/build-aux/config.sub"; then

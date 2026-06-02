@@ -7,17 +7,15 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 WGET_VERSION="${WGET_VERSION:-1.21.4}"
 WGET_TARBALL="wget-${WGET_VERSION}.tar.gz"
 WGET_URL="https://ftpmirror.gnu.org/wget/${WGET_TARBALL}"
-SRC_DIR="$ROOT_DIR/build/wget-src/wget-${WGET_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/wget-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
-if [ "$B1NIX_ARCH" = "x86" ]; then
-  HOST_TRIPLET="i686-b1nix"
-else
-  HOST_TRIPLET="x86_64-b1nix"
-fi
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/wget-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/wget-${WGET_VERSION}"
+BUILD_DIR="$ROOT_DIR/build/wget-b1nix/$HOST_TRIPLET"
 
 B1NIX_TLS="${B1NIX_TLS:-none}"
 
@@ -27,7 +25,7 @@ fi
 
 # PCRE2 backs wget's --regex-type=pcre mode (--accept-regex/--reject-regex).
 # Use the same static libpcre2-8 the standalone PCRE2 smoke is built against.
-PCRE2_PREFIX="$ROOT_DIR/build/pcre2-b1nix/install"
+PCRE2_PREFIX="$ROOT_DIR/build/pcre2-b1nix/$HOST_TRIPLET/install"
 if [ ! -f "$PCRE2_PREFIX/lib/libpcre2-8.a" ]; then
   if ! "$ROOT_DIR/tools/build-pcre2.sh" >/dev/null; then
     echo "tools/build-wget.sh: PCRE2 build failed" >&2
@@ -35,7 +33,7 @@ if [ ! -f "$PCRE2_PREFIX/lib/libpcre2-8.a" ]; then
   fi
 fi
 
-OPENSSL_PREFIX="$ROOT_DIR/build/openssl-b1nix/install"
+OPENSSL_PREFIX="$ROOT_DIR/build/openssl-b1nix/$HOST_TRIPLET/install"
 if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ]; then
   if ! "$ROOT_DIR/tools/build-openssl.sh" >/dev/null; then
     echo "tools/build-wget.sh: OpenSSL build failed" >&2
@@ -43,8 +41,8 @@ if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ]; then
   fi
 fi
 
-LIBIDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/install"
-LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/install"
+LIBIDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/$HOST_TRIPLET/install"
+LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET/install"
 if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
   if ! "$ROOT_DIR/tools/build-libidn2.sh" >/dev/null; then
     echo "tools/build-wget.sh: libidn2 build failed" >&2
@@ -52,10 +50,10 @@ if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
   fi
 fi
 
-mkdir -p "$ROOT_DIR/build/wget-src" "$BUILD_DIR"
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/wget-src/${WGET_TARBALL}"
+  tmp="$SRC_PARENT/${WGET_TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$WGET_URL" -o "$tmp"
@@ -66,7 +64,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/wget-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
 fi
 
 if ! grep -q 'b1nix\*' "$SRC_DIR/build-aux/config.sub"; then

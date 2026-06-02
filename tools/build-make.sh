@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
-# tools/build-make.sh - Cross-build GNU Make for the x86_64-b1nix target.
+# tools/build-make.sh - Cross-build GNU Make for the b1nix target selected by
+# B1NIX_ARCH (x86 -> i686-b1nix, x86_64 -> x86_64-b1nix; default x86_64).
 #
 # Produces a native `make` that runs INSIDE b1nix, alongside the ported
 # gcc/binutils (see build-native-toolchain.sh). This replaces the old in-kernel
@@ -22,12 +23,15 @@
 # of the in-guest self-host flow — the macOS host is TCG-only).
 set -euo pipefail
 
-TARGET="x86_64-b1nix"
 MAKE_VER="3.82"
 MAKE_URL="https://ftp.gnu.org/gnu/make/make-${MAKE_VER}.tar.gz"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Per-architecture build identity (B1NIX_ARCH -> triplet, per-triplet paths).
+. "$PROJECT_DIR/tools/toolchain-env.sh"
+TARGET="$B1NIX_TRIPLET"
 
 # ── Platform detection (matches build-native-toolchain.sh) ──────────────────
 OS="$(uname -s)"
@@ -39,21 +43,17 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
-# ── Space-free build directory (matches the toolchain scripts) ──────────────
-if echo "$PROJECT_DIR" | grep -q ' '; then
-    BUILD_HOME="$HOME/b1nix-toolchain"
-else
-    BUILD_HOME="$PROJECT_DIR/build/toolchain_build"
-fi
+# ── Per-triplet build directory (build/toolchain_build/<triplet>) ───────────
+BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
 SRC_DIR="$BUILD_HOME/src"
 WORK_DIR="$BUILD_HOME/native_build"
 CROSS_PREFIX="$BUILD_HOME/cross"
 NATIVE_DEST="$BUILD_HOME/native_root"
-# The cross toolchain's sysroot is a symlink to build/x86_64/rootfs (see
+# The cross toolchain's sysroot is a symlink to build/<arch>/rootfs (see
 # build-toolchain.sh); the userspace libc + headers must already be installed
 # there via `make -C userspace install`.
-SYSROOT="$PROJECT_DIR/build/x86_64/rootfs"
+SYSROOT="$B1NIX_ROOTFS"
 
 # ── Sanity checks ───────────────────────────────────────────────────────────
 if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
@@ -80,16 +80,19 @@ LIBS_VAL="-lb1nix -lgcc"
 
 mkdir -p "$SRC_DIR" "$WORK_DIR" "$NATIVE_DEST"
 
-# ── 1. Fetch + unpack GNU Make ──────────────────────────────────────────────
-if [ ! -d "$SRC_DIR/make-${MAKE_VER}" ]; then
+# ── 1. Fetch (shared cache) + unpack GNU Make (per-triplet src) ─────────────
+mkdir -p "$TOOLCHAIN_DIST_DIR"
+MAKE_TARBALL="$TOOLCHAIN_DIST_DIR/make-${MAKE_VER}.tar.gz"
+if [ ! -f "$MAKE_TARBALL" ]; then
     echo "Fetching GNU Make ${MAKE_VER}..."
-    cd "$SRC_DIR"
     if command -v curl >/dev/null 2>&1; then
-        curl -L -o "make-${MAKE_VER}.tar.gz" "$MAKE_URL"
+        curl -L -o "$MAKE_TARBALL" "$MAKE_URL"
     else
-        wget -O "make-${MAKE_VER}.tar.gz" "$MAKE_URL"
+        wget -O "$MAKE_TARBALL" "$MAKE_URL"
     fi
-    tar xf "make-${MAKE_VER}.tar.gz"
+fi
+if [ ! -d "$SRC_DIR/make-${MAKE_VER}" ]; then
+    tar xf "$MAKE_TARBALL" -C "$SRC_DIR"
 fi
 
 # ── 2. Teach Make's config.sub about the b1nix OS ──────────────────────────
@@ -102,7 +105,7 @@ fi
 MK_CFGDIR="$SRC_DIR/make-${MAKE_VER}/config"
 GOOD_CFG=""
 for c in "$SRC_DIR"/binutils-*/config.sub "$SRC_DIR"/gcc-*/config.sub; do
-    if [ -f "$c" ] && bash "$c" x86_64-b1nix >/dev/null 2>&1; then
+    if [ -f "$c" ] && bash "$c" "$TARGET" >/dev/null 2>&1; then
         GOOD_CFG="$(dirname "$c")"
         break
     fi

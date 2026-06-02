@@ -1,8 +1,9 @@
 #!/bin/bash
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
-REAL="$PROJECT_DIR/build/toolchain_build"
-LIBCODY="$REAL/gcc-13.2.0/libcody"
+. "$PROJECT_DIR/tools/toolchain-env.sh"
+REAL="$TOOLCHAIN_BUILD_HOME"
+LIBCODY="$REAL/src/gcc-13.2.0/libcody"
 
 echo "--- Patching libcody: removing u8 string prefix ---"
 # Find all .cc and .hh files and do an in-place replacement of u8"..." -> "..."
@@ -26,5 +27,5 @@ fi
 
 echo ""
 echo "--- Removing stale build-gcc ---"
-rm -rf "$REAL/build-gcc"
+rm -rf "$REAL/src/build-gcc"
 echo "Done. Run g2 again."

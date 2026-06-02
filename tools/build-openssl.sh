@@ -7,17 +7,20 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 OPENSSL_VERSION="${OPENSSL_VERSION:-1.1.1w}"
 OPENSSL_TARBALL="openssl-${OPENSSL_VERSION}.tar.gz"
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/${OPENSSL_TARBALL}"
-SRC_DIR="$ROOT_DIR/build/openssl-src/openssl-${OPENSSL_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/openssl-b1nix"
-INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+SRC_PARENT="$ROOT_DIR/build/openssl-src"
+SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/openssl-${OPENSSL_VERSION}"
+BUILD_DIR="$ROOT_DIR/build/openssl-b1nix/$B1NIX_TRIPLET"
+INSTALL_DIR="$BUILD_DIR/install"
 
-mkdir -p "$ROOT_DIR/build/openssl-src" "$BUILD_DIR"
+mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/openssl-src/${OPENSSL_TARBALL}"
+  tmp="$SRC_PARENT/${OPENSSL_TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$OPENSSL_URL" -o "$tmp"
@@ -28,7 +31,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/openssl-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$B1NIX_TRIPLET"
 fi
 
 # Time discipline/touching to avoid autotools/make rebuild dependencies
