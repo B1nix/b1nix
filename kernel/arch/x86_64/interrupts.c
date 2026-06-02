@@ -1,4 +1,4 @@
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/bootinfo.h>
@@ -7,7 +7,7 @@
 #include <b1nix/ioapic.h>
 #include <b1nix/klog.h>
 
-/* M35: ELF core dump on fatal fault (kernel/arch/x86/coredump.c). */
+/* M35: ELF core dump on fatal fault (kernel/arch/x86_64/coredump.c). */
 void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
@@ -300,7 +300,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   }
 
   /* TLB shootdown IPI (vector 0x41 = 65). Forwarded to the shootdown machinery
-   * in kernel/arch/x86/tlb.c which invlpg's the published vaddr (or reloads
+   * in kernel/arch/x86_64/tlb.c which invlpg's the published vaddr (or reloads
    * CR3) and decrements the pending counter the initiator polls. EOI happens
    * inside the handler. */
   if (frame->vector == 65) {

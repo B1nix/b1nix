@@ -80,7 +80,7 @@ void arch_set_kernel_stack(u64 stack_top) {
 
 /* M29: write IA32_FS_BASE (MSR 0xC0000100) for userspace TLS. The kernel
  * deliberately keeps %fs's selector pointing at the user-data descriptor
- * (see kernel/arch/x86/user_jump.S), so userspace `%fs:N` reads land at
+ * (see kernel/arch/x86_64/user_jump.S), so userspace `%fs:N` reads land at
  * (fs_base + N) — exactly the pthread TLS pattern. Called from the
  * scheduler on every context switch and from SYS_SET_TLS for live updates. */
 void arch_set_fs_base(u64 base) {

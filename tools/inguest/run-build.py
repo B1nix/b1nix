@@ -3,13 +3,13 @@
 
 Portable across hosts: QEMU accel falls back kvm -> hvf -> tcg, so it runs fast
 on a Linux/KVM bench, on macOS (HVF), or anywhere (TCG). Boots the interactive
-ISO with build/x86/root.ext4 as virtio-blk (mounts /persist), optionally attaches
+ISO with build/x86_64/root.ext4 as virtio-blk (mounts /persist), optionally attaches
 a swap disk as AHCI sata1, waits for the shell, runs the in-guest build, copies
 the resulting kernel.elf to /persist, and watches for a completion marker.
 
 Prereqs (build once on the bench):
   tools/build-toolchain.sh && make -C userspace && \
-  tools/build-native-toolchain.sh && make ARCH=x86 root-image && make ARCH=x86 iso
+  tools/build-native-toolchain.sh && make ARCH=x86_64 root-image && make ARCH=x86_64 iso
 
 Usage:
   python3 tools/inguest/run-build.py <ram_mb> [timeout_s] [swap_mb]
@@ -56,10 +56,10 @@ ACCEL = os.environ.get("ACCEL", "tcg")
 qemu = [
     "qemu-system-x86_64",
     "-accel", ACCEL,
-    "-cdrom", f"{ROOT}/build/x86/b1nix.iso",
+    "-cdrom", f"{ROOT}/build/x86_64/b1nix.iso",
     "-m", RAM, "-smp", SMP, "-boot", "d",
     "-serial", "stdio", "-display", "none", "-monitor", "none", "-no-reboot",
-    "-drive", f"file={ROOT}/build/x86/root.ext4,if=none,id=vblk0,format=raw",
+    "-drive", f"file={ROOT}/build/x86_64/root.ext4,if=none,id=vblk0,format=raw",
     "-device", "virtio-blk-pci,drive=vblk0",
 ]
 if SWAP_MB > 0:

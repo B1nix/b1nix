@@ -7,10 +7,10 @@ LOG="$PROJECT_DIR/smoke_run/b1nix-graphics-smoke.log"
 TIMEOUT=40
 
 cd "$PROJECT_DIR"
-make ARCH=x86 KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1
+make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1
 
 qemu-system-x86_64 \
-  -cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
+  -cdrom "$PROJECT_DIR/build/x86_64/b1nix.iso" \
   -serial stdio -display none -monitor none -no-reboot \
   -device virtio-gpu-pci \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \

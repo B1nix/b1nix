@@ -32,7 +32,7 @@ make
 This produces:
 
 ```text
-build/x86/kernel.elf
+build/x86_64/kernel.elf
 ```
 
 ## Run
@@ -40,7 +40,7 @@ build/x86/kernel.elf
 The run target expects `qemu-system-x86_64` and `grub-mkrescue` to be installed:
 
 ```sh
-make run-x86
+make run-x86_64
 ```
 
 If those tools are missing, the kernel can still be built and inspected.
@@ -49,7 +49,7 @@ See `docs/toolchain.md` for macOS setup notes.
 For a headless smoke test, this is the QEMU shape used during development:
 
 ```sh
-qemu-system-x86_64 -cdrom build/x86/tinyunix.iso -serial stdio -display none -monitor none -no-reboot
+qemu-system-x86_64 -cdrom build/x86_64/tinyunix.iso -serial stdio -display none -monitor none -no-reboot
 ```
 
 ## Layout
@@ -57,7 +57,8 @@ qemu-system-x86_64 -cdrom build/x86/tinyunix.iso -serial stdio -display none -mo
 ```text
 kernel/
   arch/
-    x86/
+    x86/       # reserved 32-bit scaffold
+    x86_64/    # active 64-bit port
   include/
   lib/
   main.c

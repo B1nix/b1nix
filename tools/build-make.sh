@@ -50,10 +50,10 @@ SRC_DIR="$BUILD_HOME/src"
 WORK_DIR="$BUILD_HOME/native_build"
 CROSS_PREFIX="$BUILD_HOME/cross"
 NATIVE_DEST="$BUILD_HOME/native_root"
-# The cross toolchain's sysroot is a symlink to build/x86/rootfs (see
+# The cross toolchain's sysroot is a symlink to build/x86_64/rootfs (see
 # build-toolchain.sh); the userspace libc + headers must already be installed
 # there via `make -C userspace install`.
-SYSROOT="$PROJECT_DIR/build/x86/rootfs"
+SYSROOT="$PROJECT_DIR/build/x86_64/rootfs"
 
 # ── Sanity checks ───────────────────────────────────────────────────────────
 if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then

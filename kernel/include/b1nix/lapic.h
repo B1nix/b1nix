@@ -215,7 +215,7 @@ void ap_main(u32 cpu_id);
  * userspace tasks) under the Big Kernel Lock. */
 extern volatile int g_ap_userspace_enabled;
 
-/* Per-CPU arch init for an Application Processor (kernel/arch/x86/arch.c):
+/* Per-CPU arch init for an Application Processor (kernel/arch/x86_64/arch.c):
  * loads the kernel GDT/IDT, this CPU's TSS, and the SYSCALL/SSE MSRs so the AP
  * can execute ring 3. */
 void x86_ap_arch_init(int cpu);

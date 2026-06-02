@@ -5,9 +5,11 @@ logs/
 smoke_run/
 .claude/
 CLAUDE.md
-/graphify-out/cache
+.graphify_detect.json
+
+# Graphify generated output.
+/graphify-out/cache/
 /graphify-out/.graphify_*
 /graphify-out/manifest.json
-/graphify-out/2026-06-02
-.graphify_detect.json
-/graphify-out/memory
+/graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
+/graphify-out/memory/

@@ -88,7 +88,7 @@ IRQ 64
 
 /* TLB shootdown IPI — vector 0x41 = 65. Targets invalidate the requested
  * vaddr range from their local TLB and decrement the pending counter so the
- * initiator can wait synchronously. See kernel/arch/x86/tlb.c (M28 #5). */
+ * initiator can wait synchronously. See kernel/arch/x86_64/tlb.c (M28 #5). */
 IRQ 65
 
 /* Reschedule IPI — vector 0x42 = 66. No-op handler whose only effect is to

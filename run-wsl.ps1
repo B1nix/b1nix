@@ -92,7 +92,7 @@ while ($running) {
     Write-Host "3) Run in QEMU via WSL (WSLg / GUI required)" -ForegroundColor Gray
     Write-Host "4) Run in QEMU in console mode (Headless / Serial)" -ForegroundColor Gray
     Write-Host "5) Run in QEMU via Windows-native QEMU" -ForegroundColor Gray
-    Write-Host "6) Run standard smoke tests (make smoke-x86)" -ForegroundColor Gray
+    Write-Host "6) Run standard smoke tests (make smoke-x86_64)" -ForegroundColor Gray
     Write-Host "7) Run graphics smoke tests (make graphics-smoke)" -ForegroundColor Gray
     Write-Host "8) Clean build files (make clean)" -ForegroundColor Gray
     Write-Host "─── Userspace ────────────────────────────────────" -ForegroundColor DarkGray
@@ -143,17 +143,17 @@ while ($running) {
         
         "3" {
             Write-Host "`nRunning b1nix in QEMU via WSL (with graphical output)..." -ForegroundColor Cyan
-            wsl -d $distro make run-x86
+            wsl -d $distro make run-x86_64
         }
         
         "4" {
             Write-Host "`nRunning b1nix in console mode (Headless, output to terminal)..." -ForegroundColor Cyan
-            if (-not (Test-Path "build/x86/b1nix.iso") -or -not (Test-Path "build/x86/root.ext4")) {
+            if (-not (Test-Path "build/x86_64/b1nix.iso") -or -not (Test-Path "build/x86_64/root.ext4")) {
                 Write-Host "Images not found. Building first..." -ForegroundColor Yellow
                 wsl -d $distro make iso userspace-install root-image
             }
             if ($LASTEXITCODE -eq 0) {
-                wsl -d $distro sh -c "cp build/x86/b1nix.iso /tmp/b1nix-run.iso && qemu-system-x86_64 -cdrom /tmp/b1nix-run.iso -serial stdio -display none -monitor none -no-reboot -boot d -drive file=build/x86/root.ext4,format=raw,if=virtio -netdev user,id=n0 -device virtio-net-pci,netdev=n0"
+                wsl -d $distro sh -c "cp build/x86_64/b1nix.iso /tmp/b1nix-run.iso && qemu-system-x86_64 -cdrom /tmp/b1nix-run.iso -serial stdio -display none -monitor none -no-reboot -boot d -drive file=build/x86_64/root.ext4,format=raw,if=virtio -netdev user,id=n0 -device virtio-net-pci,netdev=n0"
             }
         }
         
@@ -166,20 +166,20 @@ while ($running) {
                 Write-Host "  winget install QEMU.QEMU" -ForegroundColor White
                 Write-Host "Or download it from: https://www.qemu.org/download/#windows"
             } else {
-                if (-not (Test-Path "build/x86/b1nix.iso") -or -not (Test-Path "build/x86/root.ext4")) {
+                if (-not (Test-Path "build/x86_64/b1nix.iso") -or -not (Test-Path "build/x86_64/root.ext4")) {
                     Write-Host "Images not found. Building in WSL first..." -ForegroundColor Yellow
                     wsl -d $distro make iso userspace-install root-image
                 }
                 if ($LASTEXITCODE -eq 0) {
                     Write-Host "Launching QEMU..." -ForegroundColor Green
-                    qemu-system-x86_64.exe -cdrom build/x86/b1nix.iso -serial stdio -no-reboot -boot d -drive file=build/x86/root.ext4,format=raw,if=virtio -netdev user,id=n0 -device virtio-net-pci,netdev=n0
+                    qemu-system-x86_64.exe -cdrom build/x86_64/b1nix.iso -serial stdio -no-reboot -boot d -drive file=build/x86_64/root.ext4,format=raw,if=virtio -netdev user,id=n0 -device virtio-net-pci,netdev=n0
                 }
             }
         }
         
         "6" {
             Write-Host "`nRunning standard smoke tests..." -ForegroundColor Cyan
-            wsl -d $distro make smoke-x86
+            wsl -d $distro make smoke-x86_64
         }
         
         "7" {
@@ -215,7 +215,7 @@ while ($running) {
             }
             wsl -d $distro make userspace-install
             if ($LASTEXITCODE -eq 0) {
-                Write-Host "`n Userspace installed into build/x86/rootfs/" -ForegroundColor Green
+                Write-Host "`n Userspace installed into build/x86_64/rootfs/" -ForegroundColor Green
                 Write-Host "   bin/    - executables" -ForegroundColor Gray
                 Write-Host "   lib/    - libb1nix.a + crt0.o" -ForegroundColor Gray
                 Write-Host "   include/ - headers" -ForegroundColor Gray
@@ -229,7 +229,7 @@ while ($running) {
             wsl -d $distro make iso-full
             if ($LASTEXITCODE -eq 0) {
                 Write-Host "`n ISO built successfully!" -ForegroundColor Green
-                Write-Host " Image: build/x86/b1nix.iso" -ForegroundColor Green
+                Write-Host " Image: build/x86_64/b1nix.iso" -ForegroundColor Green
             } else {
                 Write-Host "`n iso-full FAILED." -ForegroundColor Red
             }

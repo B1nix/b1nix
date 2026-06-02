@@ -10,6 +10,8 @@ AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/o
 CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MMD -MP
 LDFLAGS  := -m elf_x86_64
 BUILD    := build
+B1NIX_ARCH ?= x86_64
+ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
 CRT0     := $(BUILD)/crt/crt0.o
 LINKER   := linker.ld
@@ -134,22 +136,22 @@ $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 # ── Install to rootfs ──
 install: all
 	@echo "Installing userspace binaries..."
-	@mkdir -p ../build/x86/rootfs/bin
-	@mkdir -p ../build/x86/rootfs/include
-	@mkdir -p ../build/x86/rootfs/lib
-	cp $(BINARIES) ../build/x86/rootfs/bin/
-	cp -r include/* ../build/x86/rootfs/include/
-	cp $(LIB) ../build/x86/rootfs/lib/
-	cp $(CRT0) ../build/x86/rootfs/lib/
-	ln -sf libb1nix.a ../build/x86/rootfs/lib/libc.a
-	ln -sf libb1nix.a ../build/x86/rootfs/lib/libm.a
-	@mkdir -p ../build/x86/rootfs/usr
-	ln -sfn ../include ../build/x86/rootfs/usr/include
-	ln -sfn ../lib ../build/x86/rootfs/usr/lib
-	@mkdir -p ../build/x86/rootfs/home
-	cp hello_native.c ../build/x86/rootfs/home/
-	@mkdir -p ../build/x86/rootfs/lib/tcc/include
-	cp tcc/include/*.h ../build/x86/rootfs/lib/tcc/include/
+	@mkdir -p $(ROOTFS)/bin
+	@mkdir -p $(ROOTFS)/include
+	@mkdir -p $(ROOTFS)/lib
+	cp $(BINARIES) $(ROOTFS)/bin/
+	cp -r include/* $(ROOTFS)/include/
+	cp $(LIB) $(ROOTFS)/lib/
+	cp $(CRT0) $(ROOTFS)/lib/
+	ln -sf libb1nix.a $(ROOTFS)/lib/libc.a
+	ln -sf libb1nix.a $(ROOTFS)/lib/libm.a
+	@mkdir -p $(ROOTFS)/usr
+	ln -sfn ../include $(ROOTFS)/usr/include
+	ln -sfn ../lib $(ROOTFS)/usr/lib
+	@mkdir -p $(ROOTFS)/home
+	cp hello_native.c $(ROOTFS)/home/
+	@mkdir -p $(ROOTFS)/lib/tcc/include
+	cp tcc/include/*.h $(ROOTFS)/lib/tcc/include/
 
 clean:
 	rm -rf $(BUILD)

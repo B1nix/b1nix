@@ -8,7 +8,7 @@
 set -e
 
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-OUTPUT="${1:-$PROJECT_DIR/build/x86/root.ext4}"
+OUTPUT="${1:-$PROJECT_DIR/build/x86_64/root.ext4}"
 SIZE_MB="${2:-32}"
 
 MKE2FS="$(command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || echo /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)"

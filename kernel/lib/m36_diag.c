@@ -2,7 +2,7 @@
  * (without a live host) and the ftrace function tracer. Test mode only. Emits
  * M36-GDB / M36-FTRACE markers consumed by tests/smoke.sh. */
 
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>

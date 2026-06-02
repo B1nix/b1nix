@@ -35,27 +35,27 @@ CFLAGS  := -std=c11 -ffreestanding -fno-builtin -fno-stack-protector -fno-pic \
            -mno-red-zone -I$(SRC)/kernel/include -mcmodel=kernel \
            -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000 \
-           -T $(SRC)/kernel/arch/x86/linker.ld
+           -T $(SRC)/kernel/arch/x86_64/linker.ld
 
 # Kernel translation units (relative to $(SRC)); .S files are assembled by the
-# gcc driver just like .c. Mirrors the x86 KERNEL_SOURCES of the host Makefile.
+# gcc driver just like .c. Mirrors the x86_64 KERNEL_SOURCES of the host Makefile.
 SRCS := \
-  kernel/arch/x86/arch.c \
-  kernel/arch/x86/boot.S \
-  kernel/arch/x86/console.c \
-  kernel/arch/x86/context_switch.S \
-  kernel/arch/x86/fb_console.c \
-  kernel/arch/x86/fpu.S \
-  kernel/arch/x86/interrupts.c \
-  kernel/arch/x86/io.c \
-  kernel/arch/x86/isr.S \
-  kernel/arch/x86/lapic.c \
-  kernel/arch/x86/paging.c \
-  kernel/arch/x86/rtc.c \
-  kernel/arch/x86/serial.c \
-  kernel/arch/x86/signal.c \
-  kernel/arch/x86/syscall_entry.S \
-  kernel/arch/x86/user_jump.S \
+  kernel/arch/x86_64/arch.c \
+  kernel/arch/x86_64/boot.S \
+  kernel/arch/x86_64/console.c \
+  kernel/arch/x86_64/context_switch.S \
+  kernel/arch/x86_64/fb_console.c \
+  kernel/arch/x86_64/fpu.S \
+  kernel/arch/x86_64/interrupts.c \
+  kernel/arch/x86_64/io.c \
+  kernel/arch/x86_64/isr.S \
+  kernel/arch/x86_64/lapic.c \
+  kernel/arch/x86_64/paging.c \
+  kernel/arch/x86_64/rtc.c \
+  kernel/arch/x86_64/serial.c \
+  kernel/arch/x86_64/signal.c \
+  kernel/arch/x86_64/syscall_entry.S \
+  kernel/arch/x86_64/user_jump.S \
   kernel/bootinfo/multiboot2.c \
   kernel/dev/ahci.c \
   kernel/dev/blk.c \
@@ -115,7 +115,7 @@ SRCS := \
   kernel/user/process.c \
   kernel/user/programs.c \
   kernel/user/tui_common.c \
-  kernel/arch/x86/tlb.c \
+  kernel/arch/x86_64/tlb.c \
   kernel/dev/acpi.c \
   kernel/dev/ioapic.c \
   kernel/lib/crypt.c \
@@ -125,8 +125,8 @@ SRCS := \
   kernel/sched/m28_ctxbench.c \
   kernel/sched/m28_heapbench.c \
   kernel/sched/smp_test.c \
-  kernel/arch/x86/coredump.c \
-  kernel/arch/x86/gdbstub.c \
+  kernel/arch/x86_64/coredump.c \
+  kernel/arch/x86_64/gdbstub.c \
   kernel/fs/procfs.c \
   kernel/fs/sysfs.c \
   kernel/lib/ftrace.c \

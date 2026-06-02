@@ -19,7 +19,7 @@
  * qSupported handshake. Unknown packets get the empty "" response per spec.
  */
 
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/serial.h>
 #include <string.h>

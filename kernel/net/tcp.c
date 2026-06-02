@@ -128,7 +128,7 @@ static void irq_restore(u64 flags) {
   __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
 }
 
-/* Defined in kernel/arch/x86/tlb.c. tcp_lock() is always taken with IRQs
+/* Defined in kernel/arch/x86_64/tlb.c. tcp_lock() is always taken with IRQs
  * disabled (every caller wraps it in irq_save()/irq_restore()), so a CPU
  * spinning here cannot take the cross-CPU TLB-shootdown IPI. Without draining
  * shootdowns explicitly the initiator (also waiting IRQs-off) deadlocks —

@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Fast in-guest check that the ported GNU Make actually runs inside b1nix.
 
-Boots the interactive ISO with build/x86/root.ext4 as virtio-blk (mounts
+Boots the interactive ISO with build/x86_64/root.ext4 as virtio-blk (mounts
 /persist), waits for the shell, then runs:
   - /persist/bin/make --version  (proves the b1nix make ELF loads + runs)
   - /persist/bin/make -C <maketest>  (drives a real Makefile: variables,
@@ -13,7 +13,7 @@ at /persist/usr/src/b1nix by `make root-image` (install-kernel-source).
 Watches for the expected markers, then a sentinel. Unlike the full self-host
 build (~45 min in TCG) this is a few-second smoke of the make port itself.
 
-Prereq: make ARCH=x86 root-image && make ARCH=x86 iso
+Prereq: make ARCH=x86_64 root-image && make ARCH=x86_64 iso
 Usage:  python3 tools/inguest/make-test.py [ram_mb] [timeout_s]
 """
 import os, re, subprocess, sys, time
@@ -36,10 +36,10 @@ FAULTS = ("KERNEL PANIC", "[PANIC]", "EXCEPTION:", "Segmentation fault")
 qemu = [
     "qemu-system-x86_64",
     "-machine", "accel=kvm:hvf:tcg",
-    "-cdrom", f"{ROOT}/build/x86/b1nix.iso",
+    "-cdrom", f"{ROOT}/build/x86_64/b1nix.iso",
     "-m", RAM, "-boot", "d",
     "-serial", "stdio", "-display", "none", "-monitor", "none", "-no-reboot",
-    "-drive", f"file={ROOT}/build/x86/root.ext4,if=none,id=vblk0,format=raw",
+    "-drive", f"file={ROOT}/build/x86_64/root.ext4,if=none,id=vblk0,format=raw",
     "-device", "virtio-blk-pci,drive=vblk0",
 ]
 

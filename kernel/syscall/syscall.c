@@ -1442,7 +1442,7 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
   return 0;
 }
 
-/* sigreturn is now in kernel/arch/x86/signal.c */
+/* sigreturn is now in kernel/arch/x86_64/signal.c */
 
 static u64 sys_brk(u64 addr) {
   struct task *t = current_task;

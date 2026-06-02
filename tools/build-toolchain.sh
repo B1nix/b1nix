@@ -63,8 +63,8 @@ if [ "$PREFIX" != "$CROSS_LINK" ]; then
 fi
 
 # Sysroot symlink
-mkdir -p "$PROJECT_DIR/build/x86/rootfs"
-ln -sfn "$PROJECT_DIR/build/x86/rootfs" "$SYSROOT" 2>/dev/null || true
+mkdir -p "$PROJECT_DIR/build/x86_64/rootfs"
+ln -sfn "$PROJECT_DIR/build/x86_64/rootfs" "$SYSROOT" 2>/dev/null || true
 
 cd "$WORK_DIR"
 

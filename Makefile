@@ -1,4 +1,4 @@
-ARCH ?= x86
+ARCH ?= x86_64
 BUILD_DIR := build/$(ARCH)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 RUN_ISO := /tmp/b1nix-run.iso
@@ -105,7 +105,7 @@ COMMON_CFLAGS := \
 	$(CFLAGS_EXTRA)
 
 
-ifeq ($(ARCH),x86)
+ifeq ($(ARCH),x86_64)
 TARGET := x86_64-elf
 # clang needs --target to cross-compile; the b1nix-gcc cross compiler already
 # targets x86_64 natively, so it must NOT receive --target (it is clang-only).
@@ -115,11 +115,13 @@ else
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 endif
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
-LINKER_SCRIPT := kernel/arch/x86/linker.ld
-ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
-ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c kernel/arch/x86/coredump.c kernel/arch/x86/gdbstub.c
+LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
+ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
+ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c
+else ifeq ($(ARCH),x86)
+$(error ARCH=x86 is reserved for the future 32-bit port; the current 64-bit port is ARCH=x86_64)
 else
-$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86)
+$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64)
 endif
 
 KERNEL_SOURCES := \
@@ -178,7 +180,7 @@ KERNEL_SOURCES := \
 	kernel/user/editor.c \
 	$(ARCH_SOURCES)
 
-ifeq ($(ARCH),x86)
+ifeq ($(ARCH),x86_64)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
@@ -228,7 +230,7 @@ analyze: $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all clean run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke analyze
+.PHONY: all clean run-x86_64 run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke analyze
 
 all: $(KERNEL_ELF)
 
@@ -262,7 +264,7 @@ $(BUILD_DIR)/%.o: %.c
 # whole kernel).
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
-$(BUILD_DIR)/kernel/arch/x86/lapic.o: $(AP_TRAMPOLINE_INC)
+$(BUILD_DIR)/kernel/arch/x86_64/lapic.o: $(AP_TRAMPOLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
@@ -449,7 +451,7 @@ $(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
-AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86/ap_trampoline_tmp.o
+AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86_64/ap_trampoline_tmp.o
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 # ld.lld defaults its image base to 0x200000 and rejects -Ttext 0x8000 unless
 # we pin the image base to 0. GNU ld doesn't recognise --image-base; pass it
@@ -458,7 +460,7 @@ ifneq (,$(findstring lld,$(LD)))
 AP_IMAGE_BASE := --image-base=0
 endif
 
-$(AP_TRAMP_OBJ): kernel/arch/x86/ap_trampoline.S
+$(AP_TRAMP_OBJ): kernel/arch/x86_64/ap_trampoline.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
@@ -482,10 +484,10 @@ iso: $(KERNEL_ELF)
 
 # ── M25 Userspace ──
 userspace:
-	@$(MAKE) -C userspace
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
 
 userspace-install: userspace
-	@$(MAKE) -C userspace install
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
@@ -522,23 +524,25 @@ install-kernel-source:
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
 	@# The in-guest kernel build (self-host) compiles lapic.c and initramfs.c,
-	@# which #include generated artifacts from build/x86 (ap_trampoline.inc and
+	@# which #include generated artifacts from build/x86_64 (ap_trampoline.inc and
 	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
 	@# host output, so stage just these generated *.inc inputs the compile needs.
-	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86
-	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86/ 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64
+	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso
 
-run-x86: iso userspace-install root-image
+run-x86_64: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
 	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-run-root: run-x86
+run-x86: run-x86_64
+
+run-root: run-x86_64
 
 root-image: userspace-install install-native-toolchain install-kernel-source
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
@@ -570,10 +574,12 @@ smoke:
 	@echo "Running smoke tests..."
 	sh tests/smoke.sh $(ARCH)
 
-smoke-x86: ARCH=x86
-smoke-x86: smoke
+smoke-x86_64: ARCH=x86_64
+smoke-x86_64: smoke
+
+smoke-x86: smoke-x86_64
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean distclean run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86 check-tools run-persistent graphics-smoke install-native-toolchain install-kernel-source
+.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools run-persistent graphics-smoke install-native-toolchain install-kernel-source

@@ -1,4 +1,4 @@
-/* kernel/arch/x86/fpu.S — x86_64 FPU/SSE state helpers.
+/* kernel/arch/x86_64/fpu.S — x86_64 FPU/SSE state helpers.
  *
  * The kernel itself is built with -mno-sse and never touches the FPU, but
  * userspace (e.g. the natively-ported GCC's cc1) uses SSE/x87 heavily. The

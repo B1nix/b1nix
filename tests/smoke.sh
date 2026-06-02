@@ -1,11 +1,11 @@
 #!/bin/sh
 # B1NIX Smoke Test Suite (M24)
 # Runs kernel in QEMU and checks for expected output patterns.
-# Usage: ./tests/smoke.sh [x86]
+# Usage: ./tests/smoke.sh [x86_64]
 
 set -e
 
-ARCH="${1:-x86}"
+ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TIMEOUT=120  # seconds to let each test run (kernel takes longer under macOS load)
 mkdir -p "$PROJECT_DIR/smoke_run"
@@ -38,10 +38,10 @@ run_qemu() {
 	shift
 	local pid
 
-	if [ "$ARCH" = "x86" ]; then
+	if [ "$ARCH" = "x86_64" ]; then
 		qemu-system-x86_64 \
 			${EXTRA_QEMU_ARGS:-} \
-			-cdrom "$PROJECT_DIR/build/x86/b1nix.iso" \
+			-cdrom "$PROJECT_DIR/build/x86_64/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
@@ -680,8 +680,8 @@ check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine res
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 
-# ── Network tests (x86 only) ──
-if [ "$ARCH" = "x86" ]; then
+# Network tests are only wired for the current x86_64 QEMU path.
+if [ "$ARCH" = "x86_64" ]; then
 	echo ""
 	echo "[TEST] Network..."
 	if grep -q "virtio-net: initialized with MAC" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then

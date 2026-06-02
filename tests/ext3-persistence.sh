@@ -14,7 +14,7 @@ set -euo pipefail
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 ITERATIONS="${1:-10}"
 DISK_IMAGE="${DISK_IMAGE:-$ROOT_DIR/smoke_run/disk.img}"
-BOOT_ISO="${BOOT_ISO:-$ROOT_DIR/build/x86/os.iso}"
+BOOT_ISO="${BOOT_ISO:-$ROOT_DIR/build/x86_64/os.iso}"
 LOG_DIR="$ROOT_DIR/smoke_run/ext3-persist"
 mkdir -p "$LOG_DIR"
 

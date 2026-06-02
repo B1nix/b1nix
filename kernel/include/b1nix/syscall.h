@@ -163,7 +163,7 @@ enum {
 #define B1NIX_REBOOT_POWEROFF 1
 #define B1NIX_REBOOT_HALT     2
 
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3, u64 arg4, u64 arg5, struct interrupt_frame *frame);
 
 #define SYSCALL_DISPATCH_X(x, n, a0, a1, a2, a3, a4, a5, f, FUNC, ...) FUNC

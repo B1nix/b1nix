@@ -26,7 +26,7 @@ static inline int spin_xchg(volatile int *lock, int val) {
 }
 
 /* Drain any in-flight cross-CPU TLB shootdown while spin-waiting (defined in
- * kernel/arch/x86/tlb.c). A CPU spinning here may have interrupts disabled (it
+ * kernel/arch/x86_64/tlb.c). A CPU spinning here may have interrupts disabled (it
  * was called under cli, or via spin_lock_irqsave) and so cannot take the
  * shootdown IPI; the shootdown initiator also waits IRQs-off, so without this
  * poll the two deadlock. Fast path is a single load when nothing is pending, so

@@ -16,9 +16,9 @@
  * stack_released hand-off spins run inside scheduler_yield, IRQs off). Without
  * it a core parked here can't ACK a shootdown IPI and the initiator times out
  * (observed: `tlb_shootdown stalled pending=1` panic under -smp4 parallel
- * builds). Defined in kernel/arch/x86/tlb.c; fast no-op when nothing pending. */
+ * builds). Defined in kernel/arch/x86_64/tlb.c; fast no-op when nothing pending. */
 extern void tlb_shootdown_poll(void);
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/aio.h>
 #include <string.h>
 
@@ -64,7 +64,7 @@ extern void arch_context_switch(struct cpu_context *old_context,
                                 volatile int *released_publish);
 extern char x86_syscall_stack_top[];
 
-/* x86 FPU/SSE save/restore (kernel/arch/x86/fpu.S). The kernel is -mno-sse, so
+/* x86 FPU/SSE save/restore (kernel/arch/x86_64/fpu.S). The kernel is -mno-sse, so
  * the fxsave/fxrstor instructions live in assembly. */
 extern void arch_fpu_save(void *area);
 extern void arch_fpu_restore(void *area);
@@ -571,7 +571,7 @@ static void task_init_cred(struct task *task) {
 
 /* Stealable CPU-bound kernel workers (SMP work-stealing, M24b) park back to
  * the stealing AP's idle context via this trampoline instead of the normal
- * kernel_thread_trampoline; defined in kernel/arch/x86/lapic.c. */
+ * kernel_thread_trampoline; defined in kernel/arch/x86_64/lapic.c. */
 extern void ap_worker_trampoline(void);
 
 static int kthread_create_impl(const char *name, kernel_thread_entry entry,

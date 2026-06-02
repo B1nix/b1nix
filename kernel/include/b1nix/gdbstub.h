@@ -1,10 +1,10 @@
 #ifndef B1NIX_GDBSTUB_H
 #define B1NIX_GDBSTUB_H
 
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/types.h>
 
-/* GDB Remote Serial Protocol stub (M36). See kernel/arch/x86/gdbstub.c. */
+/* GDB Remote Serial Protocol stub (M36). See kernel/arch/x86_64/gdbstub.c. */
 
 struct gdb_transport {
   int (*getc)(void *ctx);         /* blocking; byte 0..255, or -1 on EOF */

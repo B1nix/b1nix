@@ -1,4 +1,4 @@
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/sched.h>
 #include <b1nix/signal.h>
 #include <b1nix/syscall.h>

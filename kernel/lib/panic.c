@@ -1,5 +1,5 @@
 #include <b1nix/arch.h>
-#include <b1nix/arch_x86.h>
+#include <b1nix/arch_x86_64.h>
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 
