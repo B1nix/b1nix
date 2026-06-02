@@ -521,7 +521,10 @@ Smoke: 5 `M31-SEC:` markers — `start`, `ok uid-syscalls`, `ok shadow-format`, 
   - **Then wire it.** Rebuild wget with `--with-ssl=<backend>` (drop `--without-ssl`), expose any libc gaps the backend needs, and add an `M32-NET: ok wget-https-*` loopback marker. Until all of the above lands, wget stays HTTP-only by design.
 
 ## M32b: SSH Daemon Prerequisites
-- [ ] `planned` Pick the first sshd target. Prefer `dropbear` or `tinyssh` for the first daemon-sized port; defer OpenSSH until PTY, privilege separation, and broader libc/POSIX coverage are stronger.
+
+Plan, rationale, and per-item commit map: [`docs/m32b-ssh.md`](m32b-ssh.md).
+
+- [x] `done` Pick the first sshd target — **Dropbear** (2026-06-02). Chosen over tinyssh/OpenSSH because it bundles its own crypto (libtomcrypt + libtommath, so the crypto-baseline item is satisfied by vetted in-tree code seeded by our existing `getrandom(2)`), authenticates against `/etc/passwd`+`/etc/shadow`, runs its own `listen()`/`accept()` loop (tinyssh needs an external `tcpserver`), and allocates PTYs for interactive shells. OpenSSH stays deferred (needs OpenSSL + privilege separation + a much larger POSIX surface). Full rationale and build plan in [`docs/m32b-ssh.md`](m32b-ssh.md).
 - [ ] `planned` Add the crypto and RNG baseline required by SSH: secure random bytes, Curve25519/DH key exchange, Ed25519/ECDSA/RSA host/user keys, chacha20-poly1305, AES-CTR/GCM, HMAC-SHA2, SHA2 hashing, and constant-time compare helpers.
 - [ ] `planned` Add persistent SSH host-key storage under `/etc/ssh` with permission checks, first-boot key generation, and tooling to inspect/regenerate keys.
 - [ ] `planned` Finish the PTY/TTY substrate for interactive logins: `/dev/ptmx`, pty pairs, controlling terminal handoff, `termios`, window-size ioctls, and clean hangup semantics.
