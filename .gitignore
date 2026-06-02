@@ -5,3 +5,6 @@ logs/
 smoke_run/
 .claude/
 CLAUDE.md
+/graphify-out/cache
+/graphify-out/.graphify_*
+/graphify-out/manifest.json
