@@ -4,6 +4,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/arch.h>
 #include <string.h>
 
 struct kheap_block {
@@ -172,12 +173,10 @@ static inline int kheap_mag_ready(void) {
 }
 
 static inline u64 kheap_irq_save_cli(void) {
-  u64 f;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
-  return f;
+  return interrupts_save();
 }
 static inline void kheap_irq_restore(u64 f) {
-  __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
+  interrupts_restore(f);
 }
 
 /* Try to satisfy a small alloc from this CPU's magazine. Returns a ready-to-use
@@ -349,7 +348,11 @@ static u64 align_up_u64(u64 value, u64 alignment) {
 }
 
 static int is_canonical_addr(u64 addr) {
+#ifdef __x86_64__
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+#else
+  return (addr >> 32) == 0;
+#endif
 }
 
 static void heap_grow(usize minimum_bytes) {

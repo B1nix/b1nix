@@ -12,6 +12,13 @@ BUILD_DIR="$ROOT_DIR/build/wget-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  HOST_TRIPLET="i686-b1nix"
+else
+  HOST_TRIPLET="x86_64-b1nix"
+fi
+
 B1NIX_TLS="${B1NIX_TLS:-none}"
 
 if [ "$B1NIX_TLS" != "none" ]; then
@@ -103,7 +110,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
   # configure trusts our static lib and defines HAVE_LIBPCRE2 -> --regex-type
   # pcre becomes available. Keep --disable-pcre (only PCRE2 is ported).
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --disable-shared --enable-static \
     --with-ssl=openssl \
     --without-zlib \

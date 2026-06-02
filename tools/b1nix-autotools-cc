@@ -11,11 +11,27 @@ LIB="$USR/build/libb1nix.a"
 CRT0="$USR/build/crt/crt0.o"
 LINKER="$USR/linker.ld"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
-TARGET="x86_64-unknown-elf"
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+	TARGET="i686-unknown-elf"
+	LD_EMULATION="elf_i386"
+	ARCH_FLAGS="-fomit-frame-pointer"
+else
+	TARGET="x86_64-unknown-elf"
+	LD_EMULATION="elf_x86_64"
+	ARCH_FLAGS=""
+fi
 
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make -C "$USR" -s build/libb1nix.a build/crt/crt0.o
 
-COMMON_FLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -D__STDC_NO_ATOMICS__"
+CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
+if [ -n "$CLANG_RES_DIR" ]; then
+	RES_INC="-isystem $CLANG_RES_DIR/include"
+else
+	RES_INC=""
+fi
+
+COMMON_FLAGS="--target=$TARGET $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE $RES_INC -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -D__STDC_NO_ATOMICS__"
 
 compile_only=0
 preprocess_only=0
@@ -86,4 +102,4 @@ for input in $inputs; do
 done
 
 [ -n "$output" ] || output="a.out"
-"$LD" -m elf_x86_64 -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs --whole-archive "$LIB" --no-whole-archive
+"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs --whole-archive "$LIB" --no-whole-archive

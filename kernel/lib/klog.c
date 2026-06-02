@@ -202,18 +202,13 @@ usize klog_size(void)
 /* ── Enhanced panic with backtrace ── */
 void panic_backtrace(void)
 {
-	u64 *rbp = 0;
-#ifdef __aarch64__
-	__asm__ volatile("mov %0, x29" : "=r"(rbp));
-#else
-	__asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
-#endif
-
+	int depth = 0;
 	console_write("\n--- Kernel Backtrace ---\n");
 	serial_write("\n--- Kernel Backtrace ---\n");
 
-	int depth = 0;
 #ifdef __aarch64__
+	u64 *rbp = 0;
+	__asm__ volatile("mov %0, x29" : "=r"(rbp));
 	/* AArch64: walk frame pointer chain (FP = x29, LR = FP+8) */
 	while (rbp && depth < 16) {
 		u64 fp = rbp[0];
@@ -246,7 +241,9 @@ void panic_backtrace(void)
 		rbp = (u64 *)(usize)fp;
 		depth++;
 	}
-#else
+#elif defined(__x86_64__)
+	u64 *rbp = 0;
+	__asm__ volatile("movq %%rbp, %0" : "=r"(rbp));
 	/* x86_64: walk frame pointer chain */
 	while (rbp && depth < 16) {
 		u64 rip = rbp[1];
@@ -269,6 +266,33 @@ void panic_backtrace(void)
 		console_write("\n");
 
 		rbp = (u64 *)(usize)new_rbp;
+		depth++;
+	}
+#else
+	u32 *ebp = 0;
+	__asm__ volatile("movl %%ebp, %0" : "=r"(ebp));
+	/* x86 32-bit: walk frame pointer chain */
+	while (ebp && depth < 16) {
+		u32 eip = ebp[1];
+		u32 new_ebp = ebp[0];
+
+		if (eip == 0) break;
+		if (new_ebp != 0 && new_ebp <= (u32)(usize)ebp) break;
+
+		console_write("  #");
+		console_write_dec(depth);
+		console_write(" 0x");
+		console_write_hex64(eip);
+
+		const char *name = klog_lookup_symbol(eip);
+		if (name) {
+			console_write(" <");
+			console_write(name);
+			console_write(">");
+		}
+		console_write("\n");
+
+		ebp = (u32 *)(usize)new_ebp;
 		depth++;
 	}
 #endif

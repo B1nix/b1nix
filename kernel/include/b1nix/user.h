@@ -9,11 +9,18 @@ typedef int (*user_program_entry)(int argc, const char **argv);
 #define USER_MAX_ENVS 32
 #define USER_MAX_IMAGE_SEGMENTS 8
 #define USER_STACK_SIZE PAGE_SIZE
+#ifdef __x86_64__
+#define USER_SPACE_LIMIT 0x0000800000000000ULL
 #define USER_STACK_TOP 0x0000800000000000ULL
+#else
+#define USER_SPACE_LIMIT 0xC0000000ULL
+#define USER_STACK_TOP 0xC0000000ULL
+#endif
 
 enum user_image_kind {
 	USER_IMAGE_BUILTIN = 1,
 	USER_IMAGE_ELF64 = 2,
+	USER_IMAGE_ELF32 = 3,
 };
 
 struct user_image_segment {

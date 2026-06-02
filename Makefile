@@ -1,4 +1,7 @@
+.DEFAULT_GOAL := all
 ARCH ?= x86_64
+export B1NIX_ARCH := $(ARCH)
+$(shell $(MAKE) -C userspace B1NIX_ARCH=$(ARCH) build/libb1nix.a build/crt/crt0.o >/dev/null)
 BUILD_DIR := build/$(ARCH)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 RUN_ISO := /tmp/b1nix-run.iso
@@ -30,6 +33,16 @@ INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
+	$(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) \
+	$(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) \
+	$(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) \
+	$(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) \
+	$(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) \
+	$(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) \
+	$(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) \
+	$(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) \
+	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
 CURL_ELF := build/curl-b1nix/src/curl
 WGET_ELF := build/wget-b1nix/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -102,6 +115,7 @@ COMMON_CFLAGS := \
 	-Wall \
 	-Wextra \
 	-I kernel/include \
+	-I $(BUILD_DIR) \
 	$(CFLAGS_EXTRA)
 
 
@@ -119,9 +133,18 @@ LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
 ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c
 else ifeq ($(ARCH),x86)
-$(error ARCH=x86 is reserved for the future 32-bit port; the current 64-bit port is ARCH=x86_64)
+TARGET := i686-elf
+ifeq ($(TOOLCHAIN),gcc)
+ARCH_CFLAGS := -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 else
-$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64)
+ARCH_CFLAGS := --target=$(TARGET) -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+endif
+ARCH_LDFLAGS := -m elf_i386 -z max-page-size=0x1000
+LINKER_SCRIPT := kernel/arch/x86/linker.ld
+ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
+ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c kernel/arch/x86/coredump.c kernel/arch/x86/gdbstub.c
+else
+$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64 or ARCH=x86)
 endif
 
 KERNEL_SOURCES := \
@@ -180,7 +203,7 @@ KERNEL_SOURCES := \
 	kernel/user/editor.c \
 	$(ARCH_SOURCES)
 
-ifeq ($(ARCH),x86_64)
+ifneq ($(filter $(ARCH),x86_64 x86),)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
@@ -217,7 +240,7 @@ OBJECTS := \
 ANALYZE_DIR := $(BUILD_DIR)/analyze
 
 # ── Static Analysis ──
-analyze: $(KERNEL_SOURCES) $(ASM_SOURCES)
+analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@mkdir -p $(ANALYZE_DIR)
 	@echo "Running clang static analyzer..."
 	@for src in $(KERNEL_SOURCES); do \
@@ -264,7 +287,7 @@ $(BUILD_DIR)/%.o: %.c
 # whole kernel).
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
-$(BUILD_DIR)/kernel/arch/x86_64/lapic.o: $(AP_TRAMPOLINE_INC)
+$(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
@@ -451,7 +474,7 @@ $(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
-AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86_64/ap_trampoline_tmp.o
+AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/$(ARCH)/ap_trampoline_tmp.o
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 # ld.lld defaults its image base to 0x200000 and rejects -Ttext 0x8000 unless
 # we pin the image base to 0. GNU ld doesn't recognise --image-base; pass it
@@ -460,12 +483,12 @@ ifneq (,$(findstring lld,$(LD)))
 AP_IMAGE_BASE := --image-base=0
 endif
 
-$(AP_TRAMP_OBJ): kernel/arch/x86_64/ap_trampoline.S
+$(AP_TRAMP_OBJ): kernel/arch/$(ARCH)/ap_trampoline.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
-	$(LD) -m elf_x86_64 -z max-page-size=0x1000 $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
+	$(LD) $(ARCH_LDFLAGS) $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
 
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
@@ -524,11 +547,11 @@ install-kernel-source:
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
 	@# The in-guest kernel build (self-host) compiles lapic.c and initramfs.c,
-	@# which #include generated artifacts from build/x86_64 (ap_trampoline.inc and
+	@# which #include generated artifacts from build/$(ARCH) (ap_trampoline.inc and
 	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
 	@# host output, so stage just these generated *.inc inputs the compile needs.
-	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64
-	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64/ 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)
+	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso
@@ -577,7 +600,8 @@ smoke:
 smoke-x86_64: ARCH=x86_64
 smoke-x86_64: smoke
 
-smoke-x86: smoke-x86_64
+smoke-x86: ARCH=x86
+smoke-x86: smoke
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh

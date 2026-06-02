@@ -435,12 +435,10 @@ static inline int pmm_pcp_ready(void) {
 }
 
 static inline u64 irq_save_cli(void) {
-  u64 f;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
-  return f;
+  return interrupts_save();
 }
 static inline void irq_restore(u64 f) {
-  __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
+  interrupts_restore(f);
 }
 
 static void pmm_pcp_refill(struct pmm_pcp *pcp) {

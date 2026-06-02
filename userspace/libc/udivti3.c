@@ -1,3 +1,4 @@
+#if defined(__x86_64__) || defined(__aarch64__)
 #include <stdint.h>
 
 typedef unsigned __int128 u128;
@@ -29,3 +30,5 @@ u128 __umodti3(u128 n, u128 d) {
   (void)udivmod128(n, d, &r);
   return r;
 }
+#endif
+

@@ -12,7 +12,12 @@ BUILD_DIR="$ROOT_DIR/build/curl-b1nix"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-B1NIX_TLS="${B1NIX_TLS:-none}"
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  HOST_TRIPLET="i686-b1nix"
+else
+  HOST_TRIPLET="x86_64-b1nix"
+fi
 
 SSL_FLAGS="--without-ssl"
 TLS_CPPFLAGS=""
@@ -67,7 +72,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
 (
   cd "$BUILD_DIR"
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --disable-shared --enable-static \
     "$SSL_FLAGS" --without-zlib --without-brotli --without-zstd \
     --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \

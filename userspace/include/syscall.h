@@ -164,6 +164,7 @@ enum {
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */
 static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
+#ifdef __x86_64__
   long ret;
   register long rdi __asm__("rdi") = a0;
   register long rsi __asm__("rsi") = a1;
@@ -178,6 +179,22 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
                    : "r"(rax), "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
                    : "rcx", "r11", "memory");
   return ret;
+#else
+  long ret;
+  register long ebx __asm__("ebx") = a0;
+  register long ecx __asm__("ecx") = a1;
+  register long edx __asm__("edx") = a2;
+  register long esi __asm__("esi") = a3;
+  register long edi __asm__("edi") = a4;
+  register long ebp __asm__("ebp") = a5;
+  register long eax __asm__("eax") = num;
+
+  __asm__ volatile("int $0x80"
+                   : "=a"(ret)
+                   : "r"(eax), "r"(ebx), "r"(ecx), "r"(edx), "r"(esi), "r"(edi), "r"(ebp)
+                   : "memory");
+  return ret;
+#endif
 }
 
 #define syscall(num, ...) _syscall_route(num, ##__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0)

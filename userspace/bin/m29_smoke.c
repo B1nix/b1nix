@@ -136,13 +136,17 @@ static int test_condvar(void) {
 
 static int test_tls(void) {
   long val = 0xCAFE;
-  /* The SYS_SET_TLS handler writes IA32_FS_BASE for the current task. We
-   * can't easily dereference %fs:0 from C without an inline-asm helper —
-   * exercise the round-trip via a tiny inline-asm read. */
+  /* The SYS_SET_TLS handler writes the TLS segment base.
+   * On x86_64, TLS is accessed via %fs:0.
+   * On x86 32-bit, TLS is accessed via %gs:0. */
   long rc = syscall(SYS_SET_TLS, &val);
   if (rc != 0) { fail("tls-set"); return -1; }
   long readback = 0;
+#ifdef __x86_64__
   __asm__ volatile("movq %%fs:0, %0" : "=r"(readback));
+#else
+  __asm__ volatile("movl %%gs:0, %0" : "=r"(readback));
+#endif
   if (readback != 0xCAFE) { fail("tls-read"); return -1; }
   ok("tls");
   return 0;

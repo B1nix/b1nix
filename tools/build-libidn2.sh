@@ -13,7 +13,12 @@ INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  HOST_TRIPLET="i686-b1nix"
+else
+  HOST_TRIPLET="x86_64-b1nix"
+fi
 UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/install"
 if [ ! -f "$UNISTR_PREFIX/lib/libunistring.a" ]; then
   "$ROOT_DIR/tools/build-libunistring.sh" >/dev/null
@@ -55,7 +60,7 @@ mkdir -p "$BUILD_DIR"
   LDFLAGS="-L$UNISTR_PREFIX/lib" \
   LIBS="-lunistring" \
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
     --with-libunistring-prefix="$UNISTR_PREFIX" \

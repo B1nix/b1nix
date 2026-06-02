@@ -42,6 +42,7 @@
 #define UINT_MAX 4294967295U
 #endif
 
+#if defined(__x86_64__) || defined(__LP64__)
 #ifndef LONG_MIN
 #define LONG_MIN (-9223372036854775807L - 1)
 #endif
@@ -50,6 +51,17 @@
 #endif
 #ifndef ULONG_MAX
 #define ULONG_MAX 18446744073709551615UL
+#endif
+#else
+#ifndef LONG_MIN
+#define LONG_MIN (-2147483647L - 1)
+#endif
+#ifndef LONG_MAX
+#define LONG_MAX 2147483647L
+#endif
+#ifndef ULONG_MAX
+#define ULONG_MAX 4294967295UL
+#endif
 #endif
 
 #ifndef LLONG_MIN

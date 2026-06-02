@@ -26,7 +26,11 @@ static int copy_from_user(void *dst, const void *src, usize size);
 static int copy_to_user(void *dst, const void *src, usize size);
 static isize strncpy_from_user(char *dst, const char *src, usize size);
 static inline int is_canonical(u64 addr) {
+#ifdef __x86_64__
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+#else
+  return (addr >> 32) == 0;
+#endif
 }
 
 static int syscall_allows_kernel_pointers(void) {
@@ -93,7 +97,7 @@ static char **copy_user_array(const char **u_array) {
 
   int allow_kernel_ptrs = syscall_allows_kernel_pointers();
   if (!is_canonical((u64)u_array) ||
-      (!allow_kernel_ptrs && (u64)u_array >= 0x0000800000000000ULL))
+      (!allow_kernel_ptrs && (u64)u_array >= USER_SPACE_LIMIT))
     return ERR_PTR(-EFAULT);
 
   char **k_array = kmalloc(sizeof(char *) * (MAX_EXEC_ARGS + 1));
@@ -102,7 +106,7 @@ static char **copy_user_array(const char **u_array) {
   memset(k_array, 0, sizeof(char *) * (MAX_EXEC_ARGS + 1));
 
   for (int i = 0; i < MAX_EXEC_ARGS; i++) {
-    if (!allow_kernel_ptrs && (u64)&u_array[i] >= 0x0000800000000000ULL)
+    if (!allow_kernel_ptrs && (u64)&u_array[i] >= USER_SPACE_LIMIT)
       goto fault;
     const char *u_str;
     if (copy_from_user(&u_str, &u_array[i], sizeof(char *)) < 0)
@@ -114,7 +118,7 @@ static char **copy_user_array(const char **u_array) {
     }
 
     if (!is_canonical((u64)u_str) ||
-        (!allow_kernel_ptrs && (u64)u_str >= 0x0000800000000000ULL))
+        (!allow_kernel_ptrs && (u64)u_str >= USER_SPACE_LIMIT))
       goto fault;
 
     char tmp[MAX_EXEC_ARG_LEN];
@@ -203,7 +207,7 @@ int syscall_copyinstr(char *dst, usize dst_size, const char *user_src) {
 
   while (copied < dst_size) {
     // ELF64 user processes may only copy strings from userspace VMAs.
-    if (curr >= 0x0000800000000000ULL) return -EFAULT;
+    if (curr >= USER_SPACE_LIMIT) return -EFAULT;
 
     // Find the VMA covering the current address
     struct vm_area *vma = current_task->vma_list;
@@ -251,7 +255,7 @@ static int is_user_range_valid(const void *src, usize size, int write) {
   }
 
   if (end < start) return 0; // Overflow
-  if (end > 0x0000800000000000ULL) return 0; // Not in userspace
+  if (end > USER_SPACE_LIMIT) return 0; // Not in userspace
 
   // Verify that the entire range is covered by VMAs with correct permissions
   for (u64 v = start; v < end; ) {
@@ -542,8 +546,8 @@ static int user_frame_is_valid(const struct interrupt_frame *frame) {
     return 1;
   if (frame->cs != 0x1B || frame->ss != 0x23)
     return 0;
-  if (frame->rip >= 0x0000800000000000ULL ||
-      frame->rsp >= 0x0000800000000000ULL)
+  if (frame->rip >= USER_SPACE_LIMIT ||
+      frame->rsp >= USER_SPACE_LIMIT)
     return 0;
   /* Note: RSP alignment is NOT enforced here because signal frame delivery
    * sets RSP to restorer_slot (= frame_base - 8), which is 8-byte aligned.
@@ -1403,7 +1407,7 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
     return -EINVAL;
 
   u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
-  if (end < start || end > 0x0000800000000000ULL)
+  if (end < start || end > USER_SPACE_LIMIT)
     return -EINVAL;
 
   u64 flags = VMM_USER;

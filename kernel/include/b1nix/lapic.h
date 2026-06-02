@@ -119,11 +119,17 @@ struct percpu {
     u32 cpu_id;
     u32 apic_id;
     u32 cpu_online;
+#ifndef __x86_64__
+    u32 self_ptr;
+#endif
 
     /* 0x10: Current task. Named cur_task (not current_task) so it does not
      * collide with the `current_task` macro (#define current_task
      * get_percpu()->cur_task in sched.h). syscall_entry.S reads it as %gs:0x10. */
     struct task *cur_task;
+#ifndef __x86_64__
+    u32 _pad_cur_task;
+#endif
 
     /* 0x18: Scheduler state */
     struct runqueue runqueue;
@@ -153,15 +159,25 @@ struct percpu {
     u8 __pad[3816];  /* pad to 4KB total */
 } __attribute__((aligned(4096)));
 
-/* GS segment base management */
+/* Segment base management */
+#ifdef __x86_64__
 void arch_set_gs_base(u64 base);
 u64 arch_get_gs_base(void);
+#else
+void arch_set_fs_base_percpu(u32 base);
+u32 arch_get_fs_base_percpu(void);
+#endif
 
-/* Per-CPU access via GS segment.
- * Returns NULL if not yet initialized (GS base == 0). */
+/* Per-CPU access.
+ * Returns NULL if not yet initialized. */
 static inline struct percpu *get_percpu(void) {
+#ifdef __x86_64__
     u64 gs = arch_get_gs_base();
     return gs ? (struct percpu *)gs : (struct percpu *)0;
+#else
+    u32 fs = arch_get_fs_base_percpu();
+    return fs ? (struct percpu *)fs : (struct percpu *)0;
+#endif
 }
 #define percpu_write(member, val)   do { struct percpu *_p = get_percpu(); if (_p) _p->member = (val); } while(0)
 #define percpu_read(member)         ({ struct percpu *_p = get_percpu(); _p ? _p->member : 0; })

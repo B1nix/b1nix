@@ -17,6 +17,13 @@ WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  HOST_TRIPLET="i686-b1nix"
+else
+  HOST_TRIPLET="x86_64-b1nix"
+fi
+
 mkdir -p "$ROOT_DIR/build/pcre2-src" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -57,7 +64,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 (
   cd "$BUILD_DIR"
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
     --disable-jit \

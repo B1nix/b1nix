@@ -13,6 +13,7 @@
 
 /* Hand-rolled syscall (no libc): RAX=number, args in RDI/RSI/RDX, return
  * in RAX. Matches the b1nix x86_64 ABI documented in docs/abi.md. */
+#ifdef __x86_64__
 static long raw_syscall(long n, long a, long b, long c) {
   long ret;
   register long rdi __asm__("rdi") = a;
@@ -25,6 +26,20 @@ static long raw_syscall(long n, long a, long b, long c) {
                    : "rcx", "r11", "memory");
   return ret;
 }
+#else
+static long raw_syscall(long n, long a, long b, long c) {
+  long ret;
+  register long ebx __asm__("ebx") = a;
+  register long ecx __asm__("ecx") = b;
+  register long edx __asm__("edx") = c;
+  register long eax __asm__("eax") = n;
+  __asm__ volatile("int $0x80"
+                   : "=a"(ret)
+                   : "r"(eax), "r"(ebx), "r"(ecx), "r"(edx)
+                   : "memory");
+  return ret;
+}
+#endif
 
 /* Mutable globals in .data force the linker to emit R_X86_64_RELATIVE
  * relocations against the pointers below. With static `const` the

@@ -371,6 +371,11 @@ unsigned long strtoul(const char *nptr, char **endptr, int base)
 	return (unsigned long)strtol(nptr, endptr, base);
 }
 
+long long strtoll(const char *nptr, char **endptr, int base)
+{
+	return (long long)strtol(nptr, endptr, base);
+}
+
 unsigned long long strtoull(const char *nptr, char **endptr, int base)
 {
 	return (unsigned long long)strtol(nptr, endptr, base);
@@ -629,6 +634,7 @@ double strtod(const char *nptr, char **endptr)
 	return any ? (val * sign) : 0.0;
 }
 
+#ifdef __x86_64__
 __asm__(
 ".global setjmp\n"
 "setjmp:\n"
@@ -664,6 +670,42 @@ __asm__(
 "    movq %rdx, (%rsp)\n"
 "    ret\n"
 );
+#else
+__asm__(
+".global setjmp\n"
+"setjmp:\n"
+"    movl 4(%esp), %eax\n"
+"    movl %ebx, 0(%eax)\n"
+"    movl %esi, 4(%eax)\n"
+"    movl %edi, 8(%eax)\n"
+"    movl %ebp, 12(%eax)\n"
+"    leal 4(%esp), %ecx\n"
+"    movl %ecx, 16(%eax)\n"
+"    movl (%esp), %ecx\n"
+"    movl %ecx, 20(%eax)\n"
+"    xorl %eax, %eax\n"
+"    ret\n"
+);
+
+__asm__(
+".global longjmp\n"
+"longjmp:\n"
+"    movl 4(%esp), %edx\n"
+"    movl 8(%esp), %eax\n"
+"    testl %eax, %eax\n"
+"    jnz 1f\n"
+"    movl $1, %eax\n"
+"1:\n"
+"    movl 0(%edx), %ebx\n"
+"    movl 4(%edx), %esi\n"
+"    movl 8(%edx), %edi\n"
+"    movl 12(%edx), %ebp\n"
+"    movl 16(%edx), %ecx\n"
+"    movl %ecx, %esp\n"
+"    movl 20(%edx), %ecx\n"
+"    jmp *%ecx\n"
+);
+#endif
 
 /* -----------------------------------------------------------------------
  * dlfcn stubs — B1NIX supports static linking only; dynamic loading is
@@ -861,12 +903,21 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   return 0;
 }
 
+#ifdef __x86_64__
 __asm__(
 	".global __sig_restorer\n"
 	"__sig_restorer:\n"
 	"movq $99, %rax\n" /* SYS_SIGRETURN */
 	"syscall\n"
 );
+#else
+__asm__(
+	".global __sig_restorer\n"
+	"__sig_restorer:\n"
+	"movl $99, %eax\n" /* SYS_SIGRETURN */
+	"int $0x80\n"
+);
+#endif
 
 extern void __sig_restorer(void);
 

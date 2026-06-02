@@ -2,7 +2,7 @@
  * (without a live host) and the ftrace function tracer. Test mode only. Emits
  * M36-GDB / M36-FTRACE markers consumed by tests/smoke.sh. */
 
-#include <b1nix/arch_x86_64.h>
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>
@@ -72,9 +72,23 @@ static void gdb_selftest(void) {
 
   /* g → read-all-registers; rip is register index 16 (offset 256 hex chars). */
   gdb_handle_packet("g", resp, sizeof(resp), &f, &resume);
+#ifdef __x86_64__
   u64 rip = decode_le64(resp + 16 * 16);
   u64 rax = decode_le64(resp + 0);
   if (rip == f.rip && rax == f.rax)
+#else
+  u32 eip = 0;
+  for (int b = 0; b < 4; b++) {
+    int hi = hexval(resp[64 + 2 * b]), lo = hexval(resp[64 + 2 * b + 1]);
+    eip |= (u32)((hi << 4) | lo) << (8 * b);
+  }
+  u32 eax = 0;
+  for (int b = 0; b < 4; b++) {
+    int hi = hexval(resp[2 * b]), lo = hexval(resp[2 * b + 1]);
+    eax |= (u32)((hi << 4) | lo) << (8 * b);
+  }
+  if (eip == f.eip && eax == f.eax)
+#endif
     console_write("M36-GDB: ok read-regs\n");
   else
     console_write("M36-GDB: fail read-regs\n");

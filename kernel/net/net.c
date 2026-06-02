@@ -5,7 +5,7 @@
 #include <b1nix/ipi.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
-#include <b1nix/arch_x86_64.h>
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <string.h>
 

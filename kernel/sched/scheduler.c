@@ -18,16 +18,23 @@
  * (observed: `tlb_shootdown stalled pending=1` panic under -smp4 parallel
  * builds). Defined in kernel/arch/x86_64/tlb.c; fast no-op when nothing pending. */
 extern void tlb_shootdown_poll(void);
+#ifdef __x86_64__
 #include <b1nix/arch_x86_64.h>
+#else
+#include <b1nix/arch_x86.h>
+#endif
 #include <b1nix/aio.h>
 #include <string.h>
 
-/* syscall_entry.S reads the per-CPU current task as %gs:0x10 — keep that in
- * sync with struct percpu's cur_task member. */
+#ifdef __x86_64__
 _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
                "cur_task must be at offset 0x10 (see syscall_entry.S)");
 _Static_assert(__builtin_offsetof(struct percpu, syscall_scratch_rax) == 0x60,
                "syscall_scratch_rax must be at offset 0x60 (see syscall_entry.S)");
+#else
+_Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
+               "cur_task must be at offset 0x10");
+#endif
 
 /*
  * Task table (C1 audit item).
@@ -497,6 +504,10 @@ static void kernel_thread_trampoline(void) {
     panic("scheduler entered invalid task");
   }
 
+  console_write("[DEBUG] trampoline: entering task ");
+  console_write(current_task->name);
+  console_write("\n");
+
   current_task->entry(current_task->arg);
   scheduler_exit_current(0);
 }
@@ -596,8 +607,18 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
 
   u64 stack_top = align_down_u64((u64)(usize)stack + KERNEL_STACK_SIZE, 16);
   task->kernel_stack_ptr = stack_top;
+#ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
+#else
+  u64 initial_rsp = stack_top - 8;
+#endif
+#ifdef __aarch64__
+  // AArch64 uses registers for trampoline return path
+#elif defined(__x86_64__)
   *(u64 *)(usize)initial_rsp = (u64)(usize)trampoline;
+#else
+  *(u32 *)(usize)initial_rsp = (u32)(usize)trampoline;
+#endif
   task->stealable = stealable;
   task->ap_runnable = ap_runnable;
 
@@ -626,7 +647,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->context.x26 = 0;
   task->context.x27 = 0;
   task->context.x28 = 0;
-#else
+#elif defined(__x86_64__)
   task->context.rsp = initial_rsp;
   task->context.rbp = 0;
   task->context.rbx = 0;
@@ -634,6 +655,12 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->context.r13 = 0;
   task->context.r14 = 0;
   task->context.r15 = 0;
+#else
+  task->context.esp = (u32)initial_rsp;
+  task->context.ebp = 0;
+  task->context.ebx = 0;
+  task->context.esi = 0;
+  task->context.edi = 0;
 #endif
   task->stdout_fd = parent_task ? parent_task->stdout_fd : -1;
   if (stealable) {
@@ -755,6 +782,7 @@ int scheduler_fork_current(void) {
   if (!parent) {
     return -1;
   }
+  int is_user = (parent->user_image != NULL);
 
   /* If no swap device is attached, no PT entry can ever carry VMM_SWAPPED,
    * so walking the full user page-table tree on every fork is pure overhead.
@@ -820,6 +848,7 @@ int scheduler_fork_current(void) {
   // Relocate the kernel stack pointer in child task structure to prevent sharing stack
   child->kernel_stack_ptr = parent->kernel_stack_ptr + stack_offset;
 
+#ifdef __x86_64__
   u64 current_rsp, current_rbp;
   __asm__ volatile("movq %%rsp, %0" : "=r"(current_rsp));
   __asm__ volatile("movq %%rbp, %0" : "=r"(current_rbp));
@@ -833,8 +862,6 @@ int scheduler_fork_current(void) {
 
   extern void x86_fork_child_trampoline(void);
   extern void x86_fork_kernel_trampoline(void);
-
-  int is_user = (parent->user_image != NULL && ((struct user_loaded_image *)parent->user_image)->kind == USER_IMAGE_ELF64);
 
   if (is_user) {
     struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
@@ -873,6 +900,51 @@ int scheduler_fork_current(void) {
     child->context.rsp -= 8;
     *(u64 *)(usize)child->context.rsp = (u64)x86_fork_kernel_trampoline;
   }
+#else
+  u32 current_esp, current_ebp;
+  __asm__ volatile("movl %%esp, %0" : "=r"(current_esp));
+  __asm__ volatile("movl %%ebp, %0" : "=r"(current_ebp));
+
+  // Save callee-saved registers of parent to restore in child context
+  __asm__ volatile("movl %%ebx, %0" : "=r"(child->context.ebx));
+  __asm__ volatile("movl %%esi, %0" : "=r"(child->context.esi));
+  __asm__ volatile("movl %%edi, %0" : "=r"(child->context.edi));
+
+  extern void x86_fork_child_trampoline(void);
+  extern void x86_fork_kernel_trampoline(void);
+
+  if (is_user) {
+    struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
+    child_iframe->eax = 0;
+
+    child->context.esp = (u32)(usize)child_iframe - 16;
+    child->context.ebp = current_ebp + (u32)stack_offset;
+
+    child->context.esp -= 4;
+    *(u32 *)(usize)child->context.esp = (u32)(usize)x86_fork_child_trampoline;
+  } else {
+    child->context.esp = current_esp + (u32)stack_offset;
+    child->context.ebp = current_ebp + (u32)stack_offset;
+
+    /* Relocate the entire saved frame-pointer chain into the child's copied stack. */
+    u32 clo = (u32)(usize)child_stack;
+    u32 chi = clo + KERNEL_STACK_SIZE;
+    u32 fp = child->context.ebp;
+    for (int i = 0; i < 64 && fp >= clo && fp + 8 <= chi; i++) {
+      u32 saved = *(u32 *)(usize)fp;
+      if (saved == 0)
+        break;
+      u32 reloc = saved + (u32)stack_offset;
+      if (reloc < clo || reloc + 8 > chi)
+        break;
+      *(u32 *)(usize)fp = reloc;
+      fp = reloc;
+    }
+
+    child->context.esp -= 4;
+    *(u32 *)(usize)child->context.esp = (u32)(usize)x86_fork_kernel_trampoline;
+  }
+#endif
 
   // 3. Clone address space with interrupts disabled
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
@@ -990,7 +1062,7 @@ struct clone_thread_args {
   u64 user_arg;
 };
 
-extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
 
 static void clone_thread_kentry(void *arg) {
   struct clone_thread_args *cta = (struct clone_thread_args *)arg;
@@ -998,7 +1070,7 @@ static void clone_thread_kentry(void *arg) {
   u64 stack = cta->user_stack;
   u64 user_arg = cta->user_arg;
   kfree(cta);
-  x86_user_jump(entry, stack, user_arg, 0);
+  x86_user_jump((usize)entry, (usize)stack, (usize)user_arg, 0);
 }
 
 /* Look up the number of live tasks currently using this pml4 (excluding
@@ -1038,8 +1110,8 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   /* Reject obviously non-canonical user addresses up front; the actual
    * user-mode access still goes through the page-fault path. */
   if (entry == 0 || user_stack == 0) return -EFAULT;
-  if (entry >= 0x0000800000000000ULL ||
-      user_stack >= 0x0000800000000000ULL)
+  if (entry >= USER_SPACE_LIMIT ||
+      user_stack >= USER_SPACE_LIMIT)
     return -EFAULT;
 
   struct clone_thread_args *cta = kzalloc(sizeof(*cta));
@@ -1059,7 +1131,12 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   /* Bootstrap kernel context — same shape as kthread_create_impl. */
   u64 stack_top = align_down_u64((u64)(usize)kstack + KERNEL_STACK_SIZE, 16);
   child->kernel_stack_ptr = stack_top;
+#ifdef __x86_64__
   u64 initial_rsp = stack_top - 16;
+#else
+  u64 initial_rsp = stack_top - 8;
+#endif
+#ifdef __x86_64__
   *(u64 *)(usize)initial_rsp = (u64)(usize)kernel_thread_trampoline;
   child->stack = kstack;
   child->entry = clone_thread_kentry;
@@ -1071,6 +1148,17 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->context.r13 = 0;
   child->context.r14 = 0;
   child->context.r15 = 0;
+#else
+  *(u32 *)(usize)initial_rsp = (u32)(usize)kernel_thread_trampoline;
+  child->stack = kstack;
+  child->entry = clone_thread_kentry;
+  child->arg = cta;
+  child->context.esp = (u32)initial_rsp;
+  child->context.ebp = 0;
+  child->context.ebx = 0;
+  child->context.esi = 0;
+  child->context.edi = 0;
+#endif
 
   /* Name — keep short (kthread_create truncates at 15 chars). */
   child->name = strdup("pthread");
@@ -2227,8 +2315,11 @@ void scheduler_set_user_image(void *image) {
   if (current_task) {
     current_task->user_image = image;
     if (current_task->pml4_phys == 0) {
+      console_write("[DEBUG] scheduler_set_user_image: creating address space\n");
       current_task->pml4_phys = paging_create_address_space();
+      console_write("[DEBUG] scheduler_set_user_image: switching address space\n");
       paging_switch_address_space(current_task->pml4_phys);
+      console_write("[DEBUG] scheduler_set_user_image: address space switched\n");
     }
   }
 }

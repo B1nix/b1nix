@@ -38,10 +38,10 @@ run_qemu() {
 	shift
 	local pid
 
-	if [ "$ARCH" = "x86_64" ]; then
+	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		qemu-system-x86_64 \
 			${EXTRA_QEMU_ARGS:-} \
-			-cdrom "$PROJECT_DIR/build/x86_64/b1nix.iso" \
+			-cdrom "$PROJECT_DIR/build/$ARCH/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
@@ -680,8 +680,8 @@ check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine res
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 
-# Network tests are only wired for the current x86_64 QEMU path.
-if [ "$ARCH" = "x86_64" ]; then
+# Network tests are only wired for the current x86_64/x86 QEMU path.
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	echo ""
 	echo "[TEST] Network..."
 	if grep -q "virtio-net: initialized with MAC" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then

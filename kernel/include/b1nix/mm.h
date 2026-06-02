@@ -5,7 +5,19 @@
 #include <b1nix/types.h>
 
 #define PAGE_SIZE 4096ULL
+
+#ifdef __x86_64__
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
+#define DIRECT_MAP_MIN  (4ULL * 1024ULL * 1024ULL * 1024ULL)
+#define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL)
+#define KHEAP_START 0xffffc00000000000ULL
+#else
+#define DIRECT_MAP_BASE 0x80000000ULL
+#define DIRECT_MAP_MIN  (256ULL * 1024ULL * 1024ULL)
+#define DIRECT_MAP_MAX  (1024ULL * 1024ULL * 1024ULL)
+#define KHEAP_START     0xc0000000ULL
+#endif
+
 /* Physical memory below DIRECT_MAP_SIZE is identity-accessible via the direct
  * map (phys + DIRECT_MAP_BASE). The pmm must never hand out a frame at or above
  * this limit, and vmm_init maps exactly this range — keep the two in lockstep.
@@ -15,17 +27,14 @@
  * 2 MiB boundary. The macro forwards to the global so existing call sites
  * (`if (x < DIRECT_MAP_SIZE) ...`) keep compiling unchanged.
  *
- * MIN is 4 GiB: PCI MMIO BARs (AHCI ABAR ~ 0xFEBD6000, etc.) sit in the
+ * MIN is 4 GiB (64-bit) or 256 MiB (32-bit). PCI MMIO BARs (AHCI ABAR ~ 0xFEBD6000, etc.) sit in the
  * 32-bit PCI hole and several drivers access them as
  * `phys + DIRECT_MAP_BASE` directly. Below 4 GiB those would page-fault.
  * (The fully clean alternative — vmm_map_mmio() in every driver — is a
  * separate cleanup; for now the floor keeps the legacy direct-map MMIO
  * pattern working.) */
-#define DIRECT_MAP_MIN  (4ULL * 1024ULL * 1024ULL * 1024ULL)
-#define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL)
 extern u64 g_direct_map_size;
 #define DIRECT_MAP_SIZE (g_direct_map_size)
-#define KHEAP_START 0xffffc00000000000ULL
 
 #define VMM_PRESENT (1ULL << 0)
 #define VMM_WRITABLE (1ULL << 1)
@@ -35,7 +44,12 @@ extern u64 g_direct_map_size;
 #define VMM_SHARED (1ULL << 8)
 #define VMM_PWT (1ULL << 3)
 #define VMM_PCD (1ULL << 4)
+
+#ifdef __x86_64__
 #define VMM_NO_EXECUTE (1ULL << 63)
+#else
+#define VMM_NO_EXECUTE 0ULL
+#endif
 
 /* mmap protections */
 #define PROT_NONE 0x0

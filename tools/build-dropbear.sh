@@ -25,6 +25,13 @@ WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  HOST_TRIPLET="i686-b1nix"
+else
+  HOST_TRIPLET="x86_64-b1nix"
+fi
+
 mkdir -p "$SRC_PARENT"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -78,7 +85,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
 (
   cd "$SRC_DIR"
   ./configure \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --disable-zlib \
     --disable-pam \
     --disable-syslog \
