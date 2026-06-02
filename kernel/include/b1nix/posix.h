@@ -80,9 +80,9 @@ struct b1nix_stat {
   u64 st_size;
   u64 st_blksize;
   u64 st_blocks;
-  u32 st_atime;
-  u32 st_mtime;
-  u32 st_ctime;
+  u64 st_atime;
+  u64 st_mtime;
+  u64 st_ctime;
 };
 
 struct b1nix_termios {
@@ -175,8 +175,8 @@ struct b1nix_pollfd {
 };
 
 struct timespec {
-  long tv_sec;
-  long tv_nsec;
+  i64 tv_sec;
+  i64 tv_nsec;
 };
 
 #endif

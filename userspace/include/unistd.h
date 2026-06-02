@@ -44,19 +44,19 @@ unsigned int alarm(unsigned int seconds);
 
 /* stat structure for userspace */
 struct stat {
-  unsigned long st_dev;
-  unsigned long st_ino;
+  unsigned long long st_dev;
+  unsigned long long st_ino;
   unsigned int st_mode;
   unsigned int st_nlink;
   unsigned int st_uid;
   unsigned int st_gid;
-  unsigned long st_rdev;
-  off_t st_size;
-  unsigned long st_blksize;
-  unsigned long st_blocks;
-  unsigned int st_atime;
-  unsigned int st_mtime;
-  unsigned int st_ctime;
+  unsigned long long st_rdev;
+  unsigned long long st_size;
+  unsigned long long st_blksize;
+  unsigned long long st_blocks;
+  unsigned long long st_atime;
+  unsigned long long st_mtime;
+  unsigned long long st_ctime;
 };
 int stat(const char *path, struct stat *st);
 

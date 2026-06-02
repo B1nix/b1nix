@@ -705,7 +705,7 @@ static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
 
-u32 vfs_get_unix_time(void) {
+u64 vfs_get_unix_time(void) {
   return rtc_now_unix_seconds();
 }
 
@@ -717,7 +717,7 @@ static u16 scheduler_get_current_umask(void) {
 static void vfs_update_times(struct vfs_inode *inode, u32 mask) {
   if (!inode)
     return;
-  u32 now = vfs_get_unix_time();
+  u64 now = vfs_get_unix_time();
   if (mask & VFS_ATIME)
     inode->atime = now;
   if (mask & VFS_MTIME)
@@ -3559,7 +3559,7 @@ int vfs_chmod(const char *path, u16 mode) {
   return 0;
 }
 
-int vfs_utime(const char *path, u32 atime, u32 mtime) {
+int vfs_utime(const char *path, u64 atime, u64 mtime) {
   struct vfs_node *node = vfs_find_node(path);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);

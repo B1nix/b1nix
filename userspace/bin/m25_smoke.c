@@ -459,6 +459,16 @@ int main(void) {
     }
     marker("M25-SMOKE: ok frexp\n");
 
+    struct timespec rt0, mono0;
+    if (clock_gettime(CLOCK_REALTIME, &rt0) != 0 ||
+        clock_gettime(CLOCK_MONOTONIC, &mono0) != 0 ||
+        rt0.tv_nsec < 0 || rt0.tv_nsec >= 1000000000LL ||
+        mono0.tv_nsec < 0 || mono0.tv_nsec >= 1000000000LL) {
+      marker("M25-SMOKE: fail clock64\n");
+      return 1;
+    }
+    marker("M25-SMOKE: ok clock64\n");
+
     FILE *tf = tmpfile();
     if (!tf) { marker("M25-SMOKE: fail tmpfile\n"); return 1; }
     fputs("tmp", tf);
@@ -485,6 +495,20 @@ int main(void) {
       marker("M25-SMOKE: fail fileops\n");
       return 1;
     }
+
+    ut.actime = (time_t)5000000000LL;
+    ut.modtime = (time_t)5000000001LL;
+    if (utime("/tmp/m25-libc.dat", &ut) != 0) {
+      marker("M25-SMOKE: fail time64-utime\n");
+      return 1;
+    }
+    if (stat("/tmp/m25-libc.dat", &sb) != 0 ||
+        sb.st_atime != 5000000000ULL || sb.st_mtime != 5000000001ULL) {
+      marker("M25-SMOKE: fail time64-utime\n");
+      return 1;
+    }
+    marker("M25-SMOKE: ok time64-utime\n");
+
     marker("M25-SMOKE: ok fileops\n");
   }
 

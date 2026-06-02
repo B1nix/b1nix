@@ -45,6 +45,9 @@ fi
 
 make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 
+# libidn2's autotools tree is brittle after interrupted/failed builds in this
+# cross environment. Recreate the build dir to avoid incremental corruption.
+rm -rf "$BUILD_DIR"
 mkdir -p "$BUILD_DIR"
 (
   cd "$BUILD_DIR"
@@ -55,13 +58,17 @@ mkdir -p "$BUILD_DIR"
     --host=x86_64-b1nix \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
+    --with-libunistring-prefix="$UNISTR_PREFIX" \
+    --with-included-libunistring=no \
     --disable-nls \
     --disable-doc \
     --disable-rpath \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN"
 )
 
-make -C "$BUILD_DIR" -j"${JOBS:-4}" 1>&2
+# Configure is now forced to use external libunistring, but keep single-job
+# build because this cross tree is sensitive to jobserver propagation.
+make -C "$BUILD_DIR" -j1 1>&2
 make -C "$BUILD_DIR" install 1>&2
 
 echo "$INSTALL_DIR"

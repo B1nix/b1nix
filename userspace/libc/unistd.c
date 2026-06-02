@@ -189,63 +189,215 @@ time_t time(time_t *tloc) {
 }
 
 int gettimeofday(struct timeval *tv, struct timezone *tz) {
-  (void)tz;
   if (tv) {
     /* Prefer the higher-resolution monotonic clock so tv_usec carries real
      * sub-second detail (tick granularity, ~10 ms) instead of always 0. Fall
      * back to whole-second SYS_TIME if the clock syscall is unavailable. */
     struct timespec ts;
-    if (clock_gettime(CLOCK_REALTIME, &ts) == 0) {
-      tv->tv_sec = ts.tv_sec;
-      tv->tv_usec = ts.tv_nsec / 1000;
-    } else {
-      tv->tv_sec = (time_t)syscall(SYS_TIME);
-      tv->tv_usec = 0;
-    }
+    if (clock_gettime(CLOCK_REALTIME, &ts) != 0)
+      return -1;
+    tv->tv_sec = ts.tv_sec;
+    tv->tv_usec = ts.tv_nsec / 1000;
+  }
+  if (tz) {
+    tzset();
+    tz->tz_minuteswest = (int)(timezone / 60);
+    tz->tz_dsttime = daylight;
   }
   return 0;
 }
 
+extern int __b1nix_tz_dst_rule; /* from stdlib.c */
+
+static int is_leap_year(int y) {
+  return (y % 4 == 0) && ((y % 100) != 0 || (y % 400) == 0);
+}
+
+static int days_in_month(int y, int m) {
+  static const int d[] = {31,28,31,30,31,30,31,31,30,31,30,31};
+  if (m == 2) return d[m - 1] + (is_leap_year(y) ? 1 : 0);
+  return d[m - 1];
+}
+
+static int day_of_week_ymd(int y, int m, int d) {
+  if (m < 3) { m += 12; y -= 1; }
+  int k = y % 100;
+  int j = y / 100;
+  int h = (d + (13 * (m + 1)) / 5 + k + k / 4 + j / 4 + 5 * j) % 7;
+  return (h + 6) % 7; /* 0=Sun..6=Sat */
+}
+
+static int nth_weekday_of_month(int y, int m, int weekday, int nth) {
+  int d = 1;
+  int w = day_of_week_ymd(y, m, d);
+  int delta = (weekday - w + 7) % 7;
+  d += delta + (nth - 1) * 7;
+  return d;
+}
+
+static int last_weekday_of_month(int y, int m, int weekday) {
+  int d = days_in_month(y, m);
+  int w = day_of_week_ymd(y, m, d);
+  int delta = (w - weekday + 7) % 7;
+  return d - delta;
+}
+
+static long long days_from_civil(int y, unsigned m, unsigned d) {
+  y -= m <= 2;
+  const int era = (y >= 0 ? y : y - 399) / 400;
+  const unsigned yoe = (unsigned)(y - era * 400);
+  const unsigned doy = (153 * (m + (m > 2 ? -3 : 9)) + 2) / 5 + d - 1;
+  const unsigned doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+  return era * 146097 + (int)doe - 719468;
+}
+
+static time_t epoch_from_ymdhms_utc(int y, int mon, int mday, int h, int min, int sec) {
+  long long days = days_from_civil(y, (unsigned)mon, (unsigned)mday);
+  long long t = days * 86400LL + h * 3600LL + min * 60LL + sec;
+  return (time_t)t;
+}
+
+static void seconds_to_tm(time_t seconds, struct tm *t) {
+  long long s = (long long)seconds;
+  long long days = s / 86400;
+  long long rem = s % 86400;
+  if (rem < 0) {
+    rem += 86400;
+    days -= 1;
+  }
+
+  t->tm_hour = (int)(rem / 3600);
+  rem %= 3600;
+  t->tm_min = (int)(rem / 60);
+  t->tm_sec = (int)(rem % 60);
+
+  int wday = (int)((4 + days) % 7); /* 1970-01-01 = Thursday */
+  if (wday < 0) wday += 7;
+  t->tm_wday = wday;
+
+  long long z = days + 719468;
+  long long era = (z >= 0 ? z : z - 146096) / 146097;
+  unsigned doe = (unsigned)(z - era * 146097);
+  unsigned yoe = (doe - doe / 1460 + doe / 36524 - doe / 146096) / 365;
+  int y = (int)yoe + (int)(era * 400);
+  unsigned doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+  unsigned mp = (5 * doy + 2) / 153;
+  unsigned d = doy - (153 * mp + 2) / 5 + 1;
+  unsigned m = mp + (mp < 10 ? 3 : -9);
+  y += (m <= 2);
+
+  t->tm_year = y - 1900;
+  t->tm_mon = (int)m - 1;
+  t->tm_mday = (int)d;
+  t->tm_yday = (int)doy;
+}
+
+static int is_dst_active(time_t utc, int std_offset_east_sec) {
+  struct tm *gt = gmtime(&utc);
+  if (!gt) return 0;
+  int y = gt->tm_year + 1900;
+
+  if (__b1nix_tz_dst_rule == 1) {
+    int start_day = last_weekday_of_month(y, 3, 0);  /* Mar, Sun */
+    int end_day = last_weekday_of_month(y, 10, 0);   /* Oct, Sun */
+    time_t start = epoch_from_ymdhms_utc(y, 3, start_day, 1, 0, 0);
+    time_t end = epoch_from_ymdhms_utc(y, 10, end_day, 1, 0, 0);
+    return utc >= start && utc < end;
+  }
+
+  if (__b1nix_tz_dst_rule == 2) {
+    int start_day = nth_weekday_of_month(y, 3, 0, 2);  /* second Sun Mar */
+    int end_day = nth_weekday_of_month(y, 11, 0, 1);   /* first Sun Nov */
+    time_t start_local_std = epoch_from_ymdhms_utc(y, 3, start_day, 2, 0, 0);
+    time_t end_local_dst = epoch_from_ymdhms_utc(y, 11, end_day, 2, 0, 0);
+    time_t start_utc = start_local_std - (time_t)std_offset_east_sec;
+    time_t end_utc = end_local_dst - (time_t)(std_offset_east_sec + 3600);
+    return utc >= start_utc && utc < end_utc;
+  }
+
+  return 0;
+}
+
+struct tm *gmtime(const time_t *timep) {
+  static struct tm t;
+  if (!timep) return NULL;
+  seconds_to_tm(*timep, &t);
+  t.tm_isdst = 0;
+  return &t;
+}
+
 struct tm *localtime(const time_t *timep) {
   static struct tm t;
-  time_t seconds = *timep;
-  int days = seconds / 86400;
-  int rem = seconds % 86400;
-
-  t.tm_hour = rem / 3600;
-  rem %= 3600;
-  t.tm_min = rem / 60;
-  t.tm_sec = rem % 60;
-
-  t.tm_wday = (4 + days) % 7; // 1 Jan 1970 was a Thursday (4)
-
-  int year = 1970;
-  while (1) {
-    int leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-    int days_in_year = leap ? 366 : 365;
-    if (days < days_in_year) {
-      break;
-    }
-    days -= days_in_year;
-    year++;
-  }
-
-  t.tm_year = year - 1900;
-  t.tm_yday = days;
-
-  int leap = (year % 4 == 0 && (year % 100 != 0 || year % 400 == 0));
-  int days_in_month[] = {31, 28 + leap, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31};
-  int month = 0;
-  while (days >= days_in_month[month]) {
-    days -= days_in_month[month];
-    month++;
-  }
-
-  t.tm_mon = month;
-  t.tm_mday = days + 1;
-  t.tm_isdst = 0;
+  if (!timep) return NULL;
+  tzset();
+  int std_offset_east = (int)(-timezone);
+  int dst_on = daylight ? is_dst_active(*timep, std_offset_east) : 0;
+  time_t local = *timep + (time_t)std_offset_east + (dst_on ? 3600 : 0);
+  seconds_to_tm(local, &t);
+  t.tm_isdst = dst_on ? 1 : 0;
 
   return &t;
+}
+
+char *ctime(const time_t *timep) { return asctime(localtime(timep)); }
+
+size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
+  static const char *wday_short[7] = {"Sun","Mon","Tue","Wed","Thu","Fri","Sat"};
+  static const char *wday_long[7] = {"Sunday","Monday","Tuesday","Wednesday","Thursday","Friday","Saturday"};
+  static const char *mon_short[12] = {"Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"};
+  static const char *mon_long[12] = {"January","February","March","April","May","June","July","August","September","October","November","December"};
+  size_t out = 0;
+  if (!s || max == 0 || !format || !tm) return 0;
+  tzset();
+
+  for (const char *p = format; *p; p++) {
+    char buf[64];
+    const char *add = NULL;
+    buf[0] = '\0';
+    if (*p != '%') {
+      if (out + 1 >= max) return 0;
+      s[out++] = *p;
+      continue;
+    }
+    p++;
+    if (!*p) break;
+    switch (*p) {
+      case '%': add = "%"; break;
+      case 'Y': snprintf(buf, sizeof(buf), "%04d", tm->tm_year + 1900); add = buf; break;
+      case 'm': snprintf(buf, sizeof(buf), "%02d", tm->tm_mon + 1); add = buf; break;
+      case 'd': snprintf(buf, sizeof(buf), "%02d", tm->tm_mday); add = buf; break;
+      case 'H': snprintf(buf, sizeof(buf), "%02d", tm->tm_hour); add = buf; break;
+      case 'M': snprintf(buf, sizeof(buf), "%02d", tm->tm_min); add = buf; break;
+      case 'S': snprintf(buf, sizeof(buf), "%02d", tm->tm_sec); add = buf; break;
+      case 'a': add = wday_short[(tm->tm_wday >= 0 && tm->tm_wday < 7) ? tm->tm_wday : 0]; break;
+      case 'A': add = wday_long[(tm->tm_wday >= 0 && tm->tm_wday < 7) ? tm->tm_wday : 0]; break;
+      case 'b': add = mon_short[(tm->tm_mon >= 0 && tm->tm_mon < 12) ? tm->tm_mon : 0]; break;
+      case 'B': add = mon_long[(tm->tm_mon >= 0 && tm->tm_mon < 12) ? tm->tm_mon : 0]; break;
+      case 'z': {
+        int east = (int)(-timezone) + (tm->tm_isdst ? 3600 : 0);
+        int sign = east >= 0 ? '+' : '-';
+        int a = east >= 0 ? east : -east;
+        snprintf(buf, sizeof(buf), "%c%02d%02d", sign, a / 3600, (a % 3600) / 60);
+        add = buf;
+        break;
+      }
+      case 'Z': add = tzname[tm->tm_isdst ? 1 : 0]; break;
+      case 'F': snprintf(buf, sizeof(buf), "%04d-%02d-%02d", tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday); add = buf; break;
+      case 'T': snprintf(buf, sizeof(buf), "%02d:%02d:%02d", tm->tm_hour, tm->tm_min, tm->tm_sec); add = buf; break;
+      default:
+        if (out + 2 >= max) return 0;
+        s[out++] = '%';
+        s[out++] = *p;
+        continue;
+    }
+    if (!add) add = "";
+    size_t n = strlen(add);
+    if (out + n >= max) return 0;
+    memcpy(s + out, add, n);
+    out += n;
+  }
+  s[out] = '\0';
+  return out;
 }
 
 int stat(const char *path, struct stat *st) {

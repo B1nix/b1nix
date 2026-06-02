@@ -5,8 +5,8 @@
 #define CMOS_ADDR 0x70
 #define CMOS_DATA 0x71
 
-u32 rtc_boot_time_seconds = 0;
-static isize rtc_time_offset_seconds = 0;
+u64 rtc_boot_time_seconds = 0;
+static i64 rtc_time_offset_seconds = 0;
 
 static u8 read_cmos(u8 reg) {
   outb(CMOS_ADDR, reg);
@@ -52,8 +52,8 @@ void rtc_init(void) {
   // Simple Unix time calculation (seconds since 1970-01-01 00:00:00)
   // This is a simplified version, not accounting for all leap years correctly
   // but good enough for boot time offset.
-  u32 y = year - 1970;
-  u32 d = y * 365 + (y + 2) / 4; // approximate leap years since 1970
+  u64 y = year - 1970;
+  u64 d = y * 365 + (y + 2) / 4; // approximate leap years since 1970
   
   static const u16 month_days[] = {0, 31, 59, 90, 120, 151, 181, 212, 243, 273, 304, 334};
   d += month_days[month - 1];
@@ -63,14 +63,14 @@ void rtc_init(void) {
   rtc_boot_time_seconds = d * 86400 + hour * 3600 + minute * 60 + second;
 }
 
-u32 rtc_now_unix_seconds(void) {
-  u64 base = (u64)rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
-  isize adjusted = (isize)base + rtc_time_offset_seconds;
+u64 rtc_now_unix_seconds(void) {
+  u64 base = rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
+  i64 adjusted = (i64)base + rtc_time_offset_seconds;
   if (adjusted < 0) return 0;
-  return (u32)adjusted;
+  return (u64)adjusted;
 }
 
-void rtc_set_unix_time(u32 unix_time_now) {
-  u64 base = (u64)rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
-  rtc_time_offset_seconds = (isize)unix_time_now - (isize)base;
+void rtc_set_unix_time(u64 unix_time_now) {
+  u64 base = rtc_boot_time_seconds + (scheduler_get_uptime_ticks() / 100);
+  rtc_time_offset_seconds = (i64)unix_time_now - (i64)base;
 }

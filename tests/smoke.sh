@@ -56,9 +56,21 @@ run_qemu() {
 				>"$log" 2>&1 &
 		pid=$!
 
-		# Wait for the final success marker or a panic, then kill QEMU.
+		# Wait for completion marker/panic or timeout, then kill QEMU.
+		# Keep this POSIX-portable (macOS doesn't ship GNU timeout by default).
 		(
-			timeout "$TIMEOUT" bash -c "tail -n +1 -f \"$log\" 2>/dev/null | grep -m 1 -E 'B1NIX-TEST: done|KERNEL PANIC|\\[PANIC\\]'" >/dev/null 2>&1
+			start_ts=$(date +%s)
+			while :; do
+				if grep -q -E 'B1NIX-TEST: done|KERNEL PANIC|\[PANIC\]' "$log" 2>/dev/null; then
+					break
+				fi
+				now_ts=$(date +%s)
+				if [ $((now_ts - start_ts)) -ge "$TIMEOUT" ]; then
+					echo "[smoke] run_qemu timeout after ${TIMEOUT}s" >>"$log"
+					break
+				fi
+				sleep 1
+			done
 			sleep 2
 			kill "$pid" 2>/dev/null || true
 		) &
@@ -66,6 +78,7 @@ run_qemu() {
 
 		wait "$pid" 2>/dev/null || true
 		kill "$watcher_pid" 2>/dev/null || true
+		wait "$watcher_pid" 2>/dev/null || true
 		kill -9 "$pid" 2>/dev/null || true
 	else
 		echo "Unknown ARCH: $ARCH"
@@ -319,6 +332,8 @@ check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double p
 check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
 check_output "$LOG" "M25-SMOKE: ok scanf" "libc scanf/sscanf format parsing works"
 check_output "$LOG" "M25-SMOKE: ok frexp" "libc frexp decomposes correctly"
+check_output "$LOG" "M25-SMOKE: ok clock64" "libc clock_gettime returns sane 64-bit realtime/monotonic tuples"
+check_output "$LOG" "M25-SMOKE: ok time64-utime" "libc utime/stat preserves timestamps above 2^32"
 check_output "$LOG" "M25-SMOKE: ok fileops" "libc fchmod/utime/tmpfile work (verified via stat)"
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 

@@ -11,7 +11,7 @@ int snprintf(char *s, size_t n, const char *format, ...);
 
 #ifndef B1NIX_TIME_T_DEFINED
 #define B1NIX_TIME_T_DEFINED
-typedef long time_t;
+typedef long long time_t;
 #endif
 
 struct timeval {
@@ -45,6 +45,8 @@ extern int daylight;
 
 #ifndef __cplusplus
 struct tm *localtime(const time_t *timep);
+struct tm *gmtime(const time_t *timep);
+char *ctime(const time_t *timep);
 #endif
 
 #define CLOCK_REALTIME 0
@@ -52,7 +54,7 @@ struct tm *localtime(const time_t *timep);
 
 struct timespec {
     time_t tv_sec;
-    long tv_nsec;
+    long long tv_nsec;
 };
 
 int clock_gettime(int clk_id, struct timespec *tp);
@@ -67,26 +69,7 @@ static inline clock_t clock(void) {
     return (clock_t)tv.tv_sec * 1000000 + tv.tv_usec;
 }
 
-static inline size_t strftime(char *s, size_t max, const char *format, const struct tm *tm) {
-    (void)format;
-    // Simple mock formatting that fits the expected gas timestamp
-    int n = snprintf(s, max, "%04d-%02d-%02dT%02d:%02d:%02d.000+0000",
-                     tm->tm_year + 1900, tm->tm_mon + 1, tm->tm_mday,
-                     tm->tm_hour, tm->tm_min, tm->tm_sec);
-    if (n < 0 || (size_t)n >= max) return 0;
-    return n;
-}
-
-#ifndef __cplusplus
-static inline struct tm *gmtime(const time_t *timep) {
-    return localtime(timep);
-}
-
-static inline char *ctime(const time_t *timep) {
-    (void)timep;
-    return (char *)"Tue May 26 15:00:00 2026\n";
-}
-#endif
+size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
 
 static inline double difftime(time_t time1, time_t time0) {
     return (double)(time1 - time0);

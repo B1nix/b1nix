@@ -740,7 +740,7 @@ static isize sys_chmod(const char *user_path, u16 mode) {
 
 static isize sys_fchmod(int fd, u16 mode) { return vfs_fchmod(fd, mode); }
 
-static isize sys_utime(const char *user_path, u32 atime, u32 mtime) {
+static isize sys_utime(const char *user_path, u64 atime, u64 mtime) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
     return -ENOMEM;
@@ -1606,7 +1606,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
   case SYS_UTIME:
-    return (u64)sys_utime((const char *)(usize)arg0, (u32)arg1, (u32)arg2);
+    return (u64)sys_utime((const char *)(usize)arg0, (u64)arg1, (u64)arg2);
   case SYS_GETRANDOM: {
     void *user_buf = (void *)(usize)arg0;
     usize len = (usize)arg1;
@@ -2037,12 +2037,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     struct timespec ktp;
     u64 ticks = scheduler_get_uptime_ticks();
     if (clk_id == 1 /* CLOCK_MONOTONIC */) {
-      ktp.tv_sec = (long)(ticks / 100);
-      ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+      ktp.tv_sec = (i64)(ticks / 100);
+      ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
     } else {
       /* CLOCK_REALTIME: epoch-based wall clock from RTC boot offset. */
-      ktp.tv_sec = (long)vfs_get_unix_time();
-      ktp.tv_nsec = (long)((ticks % 100) * 10000000);
+      ktp.tv_sec = (i64)vfs_get_unix_time();
+      ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
     }
     if (syscall_copyout((void *)(usize)arg1, &ktp, sizeof(struct timespec)) != 0) {
       return (u64)-EFAULT;

@@ -80,9 +80,9 @@ struct vfs_inode {
   int acl_count;
 
   /* Timestamps */
-  u32 atime;
-  u32 mtime;
-  u32 ctime;
+  u64 atime;
+  u64 mtime;
+  u64 ctime;
 
   struct block_device *blk_dev;
   u32 fs_id; /* Unique ID for this filesystem instance */
@@ -136,7 +136,7 @@ struct vfs_fs {
   struct vfs_fs *next;
 };
 
-u32 vfs_get_unix_time(void);
+u64 vfs_get_unix_time(void);
 void vfs_init(void);
 void vfs_resolve_path(const char *path, char *out);
 struct vfs_node *find_child(struct vfs_node *parent, const char *name);
@@ -200,7 +200,7 @@ extern void *vfs_poll_chan;
 /* Permission management */
 int vfs_chmod(const char *path, u16 mode);
 int vfs_fchmod(int fd, u16 mode);
-int vfs_utime(const char *path, u32 atime, u32 mtime);
+int vfs_utime(const char *path, u64 atime, u64 mtime);
 int vfs_chown(const char *path, u16 uid, u16 gid);
 int vfs_fchown(int fd, u16 uid, u16 gid);
 int vfs_fstatfs(int fd, struct b1nix_statfs *st);

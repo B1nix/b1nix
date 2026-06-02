@@ -979,8 +979,94 @@ int mbtowc(wchar_t *pwc, const char *s, size_t n) {
 char *tzname[2] = { (char *)"UTC", (char *)"UTC" };
 long timezone = 0;
 int daylight = 0;
+int __b1nix_tz_dst_rule = 0; /* 0=none, 1=EU, 2=US */
 
-void tzset(void) {
-	/* Dummy */
+static int tz_parse_hhmm(const char *s, int *consumed, int *seconds_out) {
+	int h = 0, m = 0, i = 0;
+	if (s[i] < '0' || s[i] > '9') return 0;
+	while (s[i] >= '0' && s[i] <= '9') {
+		h = h * 10 + (s[i] - '0');
+		i++;
+	}
+	if (s[i] == ':') {
+		i++;
+		if (!(s[i] >= '0' && s[i] <= '9' && s[i + 1] >= '0' && s[i + 1] <= '9')) {
+			return 0;
+		}
+		m = (s[i] - '0') * 10 + (s[i + 1] - '0');
+		i += 2;
+	}
+	if (m < 0 || m > 59) return 0;
+	*seconds_out = h * 3600 + m * 60;
+	*consumed = i;
+	return 1;
 }
 
+void tzset(void) {
+	const char *tz = getenv("TZ");
+	static char stdname[16] = "UTC";
+	static char dstname[16] = "DST";
+
+	timezone = 0;
+	daylight = 0;
+	__b1nix_tz_dst_rule = 0;
+	tzname[0] = stdname;
+	tzname[1] = dstname;
+	strcpy(stdname, "UTC");
+	strcpy(dstname, "DST");
+
+	if (!tz || !*tz) return;
+
+	/* Accept TZ as:
+	 *  - "UTC", "GMT"
+	 *  - "+HH[:MM]", "-HH[:MM]"
+	 *  - "UTC+HH[:MM]", "GMT-HH[:MM]"
+	 *  - "NAME+HH[:MM]" / "NAME-HH[:MM]"
+	 *  - "NAMEHH[:MM]" (POSIX-style: west of UTC) */
+	const char *p = tz;
+	int had_name = 0;
+	int ni = 0;
+	while ((*p >= 'A' && *p <= 'Z') || (*p >= 'a' && *p <= 'z')) {
+		if (ni < (int)sizeof(stdname) - 1) stdname[ni++] = *p;
+		p++;
+		had_name = 1;
+	}
+	stdname[ni] = '\0';
+	if (!had_name) strcpy(stdname, "UTC");
+
+	if (*p == '\0') return;
+
+	int sign = 0;
+	if (*p == '+') {
+		sign = +1;
+		p++;
+	} else if (*p == '-') {
+		sign = -1;
+		p++;
+	}
+
+	int consumed = 0;
+	int off = 0;
+	if (!tz_parse_hhmm(p, &consumed, &off)) return;
+
+	/* Human-readable +/- means east/west respectively.
+	 * POSIX NAMEHH form (without +/-) means west of UTC. */
+	int offset_east_sec;
+	if (sign == 0 && had_name) offset_east_sec = -off;
+	else if (sign == 0) offset_east_sec = off;
+	else offset_east_sec = sign * off;
+
+	timezone = -offset_east_sec; /* seconds west of UTC */
+
+	p += consumed;
+	if (*p == ',') {
+		p++;
+		if ((p[0] == 'E' || p[0] == 'e') && (p[1] == 'U' || p[1] == 'u') && p[2] == '\0') {
+			daylight = 1;
+			__b1nix_tz_dst_rule = 1;
+		} else if ((p[0] == 'U' || p[0] == 'u') && (p[1] == 'S' || p[1] == 's') && p[2] == '\0') {
+			daylight = 1;
+			__b1nix_tz_dst_rule = 2;
+		}
+	}
+}
