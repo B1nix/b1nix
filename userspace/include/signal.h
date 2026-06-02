@@ -38,9 +38,14 @@ extern "C" {
 #define SIG_UNBLOCK 2
 #define SIG_BLOCK   0
 #define SIG_SETMASK 1
+#define SA_NOCLDSTOP 0x00000001
+#define SA_NOCLDWAIT 0x00000002
 #define SA_SIGINFO 4
+#define SA_ONSTACK  0x08000000
+#define SA_RESTART  0x10000000
 #define SA_RESTORER 0x04000000
 #define SA_NODEFER  0x40000000
+#define SA_RESETHAND 0x80000000
 
 typedef void (*sighandler_t)(int);
 typedef int sig_atomic_t;

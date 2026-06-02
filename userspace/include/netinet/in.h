@@ -8,6 +8,10 @@ typedef uint32_t in_addr_t;
 
 #define INADDR_ANY 0x00000000
 #define INADDR_LOOPBACK 0x7f000001
+#define INADDR_NONE 0xffffffff
+#define INADDR_BROADCAST 0xffffffff
+
+#define IPPORT_RESERVED 1024
 
 #define IN6ADDR_ANY_INIT      { { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,0 } }
 #define IN6ADDR_LOOPBACK_INIT { { 0,0,0,0,0,0,0,0,0,0,0,0,0,0,0,1 } }

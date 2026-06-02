@@ -28,8 +28,13 @@ static inline int _check_err(long rc) {
   return (int)rc;
 }
 
-int write(int fd, const void *buf, size_t n) {
-  return _check_err(syscall(SYS_WRITE, fd, buf, n));
+ssize_t write(int fd, const void *buf, size_t n) {
+  long rc = syscall(SYS_WRITE, fd, buf, n);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return (ssize_t)rc;
 }
 
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
@@ -42,8 +47,13 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
   return (ssize_t)rc;
 }
 
-int read(int fd, void *buf, size_t n) {
-  return _check_err(syscall(SYS_READ, fd, buf, n));
+ssize_t read(int fd, void *buf, size_t n) {
+  long rc = syscall(SYS_READ, fd, buf, n);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return (ssize_t)rc;
 }
 
 int close(int fd) { return _check_err(syscall(SYS_CLOSE, fd)); }
@@ -715,6 +725,106 @@ int getrlimit(int resource, struct rlimit *rlim) {
   (void)rlim;
   errno = ENOSYS;
   return -1;
+}
+
+#include <sys/uio.h>
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
+  ssize_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    ssize_t w = write(fd, iov[i].iov_base, iov[i].iov_len);
+    if (w < 0)
+      return total > 0 ? total : -1;
+    total += w;
+    if ((size_t)w < iov[i].iov_len)
+      break; /* short write: stop, report progress */
+  }
+  return total;
+}
+
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+  ssize_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    ssize_t r = read(fd, iov[i].iov_base, iov[i].iov_len);
+    if (r < 0)
+      return total > 0 ? total : -1;
+    total += r;
+    if ((size_t)r < iov[i].iov_len)
+      break; /* short read: stop */
+  }
+  return total;
+}
+
+int chown(const char *path, uid_t owner, gid_t group) {
+  return _check_err(syscall(SYS_CHOWN, path, owner, group));
+}
+
+int fchown(int fd, uid_t owner, gid_t group) {
+  return _check_err(syscall(SYS_FCHOWN, fd, owner, group));
+}
+
+int ttyname_r(int fd, char *buf, size_t buflen) {
+  if (fd < 0) return EBADF;
+  const char *nm = "/dev/tty";
+  size_t n = strlen(nm);
+  if (buflen <= n) return ERANGE;
+  memcpy(buf, nm, n + 1);
+  return 0;
+}
+
+char *ttyname(int fd) {
+  static char buf[32];
+  if (ttyname_r(fd, buf, sizeof(buf)) != 0)
+    return 0;
+  return buf;
+}
+
+int gethostname(char *name, size_t len) {
+  if (!name || len == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  const char *host = "b1nix";
+  /* Prefer /etc/hostname if present. */
+  int fd = open("/etc/hostname", 0 /* O_RDONLY */);
+  char filebuf[64];
+  if (fd >= 0) {
+    ssize_t r = read(fd, filebuf, sizeof(filebuf) - 1);
+    close(fd);
+    if (r > 0) {
+      while (r > 0 && (filebuf[r - 1] == '\n' || filebuf[r - 1] == '\r'))
+        r--;
+      filebuf[r] = '\0';
+      if (filebuf[0])
+        host = filebuf;
+    }
+  }
+  size_t hlen = strlen(host);
+  if (hlen >= len) {
+    memcpy(name, host, len - 1);
+    name[len - 1] = '\0';
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(name, host, hlen + 1);
+  return 0;
+}
+
+int sethostname(const char *name, size_t len) {
+  (void)name;
+  (void)len;
+  return 0; /* b1nix hostname is fixed/boot-configured */
+}
+
+int setrlimit(int resource, const struct rlimit *rlim) {
+  /* b1nix has no per-process resource limits; accept the request as a no-op so
+   * callers that lower RLIMIT_CORE etc. (dropbear) proceed. */
+  (void)resource;
+  (void)rlim;
+  return 0;
 }
 
 #include <syslog.h>

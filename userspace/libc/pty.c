@@ -39,10 +39,30 @@ char *ptsname(int fd) {
 void cfmakeraw(struct termios *t) {
   if (!t)
     return;
-  t->c_iflag &= ~(ICRNL);
-  t->c_oflag &= ~(OPOST | ONLCR);
-  t->c_lflag &= ~(ECHO | ICANON | ISIG);
+  t->c_iflag &= ~(IGNBRK | BRKINT | PARMRK | ISTRIP | INLCR | IGNCR | ICRNL |
+                  IXON);
+  t->c_oflag &= ~OPOST;
+  t->c_lflag &= ~(ECHO | ECHONL | ICANON | ISIG | IEXTEN);
+  t->c_cflag &= ~(CSIZE | PARENB);
+  t->c_cflag |= CS8;
 }
+
+speed_t cfgetospeed(const struct termios *t) { return t ? (t->c_cflag & CBAUD) : 0; }
+speed_t cfgetispeed(const struct termios *t) { return cfgetospeed(t); }
+
+int cfsetospeed(struct termios *t, speed_t speed) {
+  if (!t) return -1;
+  t->c_cflag = (t->c_cflag & ~CBAUD) | (speed & CBAUD);
+  return 0;
+}
+int cfsetispeed(struct termios *t, speed_t speed) { return cfsetospeed(t, speed); }
+int cfsetspeed(struct termios *t, speed_t speed) { return cfsetospeed(t, speed); }
+
+/* b1nix ptys/console have no hardware queues to flush or drain. */
+int tcflush(int fd, int queue_selector) { (void)fd; (void)queue_selector; return 0; }
+int tcdrain(int fd) { (void)fd; return 0; }
+int tcflow(int fd, int action) { (void)fd; (void)action; return 0; }
+int tcsendbreak(int fd, int duration) { (void)fd; (void)duration; return 0; }
 
 int openpty(int *amaster, int *aslave, char *name, const struct termios *termp,
             const struct winsize *winp) {

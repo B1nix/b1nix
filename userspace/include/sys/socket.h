@@ -51,6 +51,21 @@ struct sockaddr_un {
   char sun_path[108];
 };
 
+struct linger {
+  int l_onoff;
+  int l_linger;
+};
+
+struct msghdr {
+  void *msg_name;
+  socklen_t msg_namelen;
+  struct iovec *msg_iov;
+  int msg_iovlen;
+  void *msg_control;
+  socklen_t msg_controllen;
+  int msg_flags;
+};
+
 #define AF_UNIX         1
 #define AF_LOCAL        AF_UNIX
 #define AF_INET         2

@@ -24,6 +24,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/pwd.o \
 	$(BUILD)/libc/pty.o \
 	$(BUILD)/libc/crypt.o \
+	$(BUILD)/libc/grp.o \
 	$(BUILD)/libc/pthread.o \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \

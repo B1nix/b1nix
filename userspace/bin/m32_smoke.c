@@ -1554,6 +1554,39 @@ static int test_crypto(void) {
   return 0;
 }
 
+/* M32b: prove the Dropbear binary executes on b1nix by generating an Ed25519
+ * host key with dropbearkey (exercises libtomcrypt curve/ed25519 + getrandom +
+ * file I/O through a real ported daemon binary). */
+static int test_dropbear_keygen(void) {
+  unlink("/tmp/hk_ed25519");
+  int pid = fork();
+  if (pid < 0) { emit("M32B-SSH: FAIL fork\n"); return -1; }
+  if (pid == 0) {
+    char *av[] = {"/bin/dropbearkey", "-t", "ed25519", "-f",
+                  "/tmp/hk_ed25519", 0};
+    char *ev[] = {0};
+    execve("/bin/dropbearkey", av, ev);
+    _exit(127);
+  }
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg keygen status=0x%x\n", st);
+    emit(dbg);
+    emit("M32B-SSH: FAIL dropbearkey\n");
+    return -1;
+  }
+  int fd = open("/tmp/hk_ed25519", O_RDONLY);
+  if (fd < 0) { emit("M32B-SSH: FAIL keyfile\n"); return -1; }
+  char buf[64];
+  int n = (int)read(fd, buf, sizeof(buf));
+  close(fd);
+  if (n < 32) { emit("M32B-SSH: FAIL keyfile-size\n"); return -1; }
+  emit("M32B-SSH: ok dropbearkey\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   /* Self-reexec env probe (see test_session): report whether the env we were
    * exec'd with reached getenv(). */
@@ -1565,6 +1598,7 @@ int main(int argc, char **argv) {
   if (test_pty() != 0)                 return 1;
   if (test_session() != 0)             return 1;
   if (test_crypto() != 0)              return 1;
+  if (test_dropbear_keygen() != 0)     return 1;
   if (test_socket_options() != 0)      return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;

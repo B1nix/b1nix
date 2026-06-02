@@ -95,9 +95,11 @@ if [ "$PHASE" = "crypto" ]; then
   exit 0
 fi
 
+# Server-side only: the SSH daemon + key tools. The client (dbclient/scp) pulls
+# in cli-* sources b1nix does not need yet.
 make -C "$SRC_DIR" -j"${JOBS:-4}" \
   CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-  PROGRAMS="dropbear dbclient dropbearkey dropbearconvert scp" \
-  MULTI=1 SCPPROGRESS=0 dropbearmulti 1>&2
+  PROGRAMS="dropbear dropbearkey dropbearconvert" \
+  MULTI=1 dropbearmulti 1>&2
 
 echo "$SRC_DIR"

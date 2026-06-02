@@ -75,7 +75,10 @@ static void sha512_transform(struct sha512_ctx *c, const uint8_t *block) {
   c->h[4] += e; c->h[5] += f; c->h[6] += g; c->h[7] += h;
 }
 
-void sha512_init(struct sha512_ctx *c) {
+/* File-local to avoid clashing with libtomcrypt's sha512_init/process/done when
+ * a port (dropbear) links both libb1nix.a and libtomcrypt.a. Only the one-shot
+ * sha512() is exported. */
+static void sha512_init(struct sha512_ctx *c) {
   c->h[0] = 0x6a09e667f3bcc908ULL; c->h[1] = 0xbb67ae8584caa73bULL;
   c->h[2] = 0x3c6ef372fe94f82bULL; c->h[3] = 0xa54ff53a5f1d36f1ULL;
   c->h[4] = 0x510e527fade682d1ULL; c->h[5] = 0x9b05688c2b3e6c1fULL;
@@ -83,7 +86,7 @@ void sha512_init(struct sha512_ctx *c) {
   c->bitlen = 0; c->buflen = 0;
 }
 
-void sha512_update(struct sha512_ctx *c, const void *data, size_t len) {
+static void sha512_update(struct sha512_ctx *c, const void *data, size_t len) {
   const uint8_t *p = (const uint8_t *)data;
   c->bitlen += (uint64_t)len * 8;
   while (len > 0) {
@@ -95,7 +98,7 @@ void sha512_update(struct sha512_ctx *c, const void *data, size_t len) {
   }
 }
 
-void sha512_final(struct sha512_ctx *c, uint8_t out[64]) {
+static void sha512_final(struct sha512_ctx *c, uint8_t out[64]) {
   c->buf[c->buflen++] = 0x80;
   if (c->buflen > 112) {
     while (c->buflen < 128) c->buf[c->buflen++] = 0;

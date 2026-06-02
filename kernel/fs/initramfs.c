@@ -31,6 +31,7 @@
 #include "../../build/x86/initramfs_m30_pie.inc"
 #include "../../build/x86/initramfs_m34_smoke.inc"
 #include "../../build/x86/initramfs_m35_smoke.inc"
+#include "../../build/x86/initramfs_dropbear.inc"
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -391,6 +392,14 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     {"/bin/wget", (const char *)vfs_wget_elf, sizeof(vfs_wget_elf),
      INITRAMFS_EXECUTABLE},
+    /* Dropbear multi-call binary: the applet is selected by argv[0]'s
+     * basename, so the same image is registered under each name. */
+    {"/bin/dropbear", (const char *)vfs_dropbear_elf, sizeof(vfs_dropbear_elf),
+     INITRAMFS_EXECUTABLE},
+    {"/bin/dropbearkey", (const char *)vfs_dropbear_elf,
+     sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/dropbearconvert", (const char *)vfs_dropbear_elf,
+     sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
