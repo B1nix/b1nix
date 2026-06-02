@@ -64,24 +64,24 @@ Dropbear is configured for the b1nix environment via `localoptions.h`:
 
 1. **Pick sshd target** — this document. *(done)*
 2. **Crypto/RNG baseline** — dropbear's bundled libtomcrypt/libtommath build for
-   b1nix; `getrandom(2)` seeds it; primitives proven by smoke.
+   b1nix; `getrandom(2)` seeds it; primitives proven by smoke. *(done)*
 3. **Host-key storage** — persistent `/etc/ssh/`, first-boot key generation via
-   `dropbearkey`, permission checks, inspect/regenerate tooling.
+   `dropbearkey`, permission checks, inspect/regenerate tooling. *(done)*
 4. **PTY/TTY substrate** — `/dev/ptmx`, `/dev/pts/N`, `openpty`/`grantpt`/
    `unlockpt`/`ptsname`, `TIOCSCTTY`, `TIOCGWINSZ`/`TIOCSWINSZ`, per-task
-   controlling terminal, SIGHUP hangup.
+   controlling terminal, SIGHUP hangup. *(done)*
 5. **Socket API hardening** — `setsockopt`/`getsockopt` (`SO_REUSEADDR`,
    `SO_KEEPALIVE`, `TCP_NODELAY`, `SO_ERROR`, buffers), `getsockname`/
-   `getpeername`, `shutdown`, listen backlog, nonblocking edge cases.
+   `getpeername`, `shutdown`, listen backlog, nonblocking edge cases. *(done)*
 6. **Login/session plumbing** — controlling-terminal handoff on the session
-   leader; `fork`/`exec`/`setuid`/`setgid`/`setsid`/`chdir`/env for login shells.
+   leader; `fork`/`exec`/`setuid`/`setgid`/`setsid`/`chdir`/env for login shells. *(done)*
 7. **Auth storage and policy** — `/etc/shadow` password auth in sshd, optional
    `authorized_keys`, account shell/home validation, login-failure accounting,
-   root-login defaults.
+   root-login defaults. *(done)*
 8. **Service lifecycle** — init/service entry for sshd, background daemon mode,
-   log output, pid tracking, clean shutdown/restart, loopback-only early bind.
+   log output, pid tracking, clean shutdown/restart, loopback-only early bind. *(done)*
 9. **Localhost smoke** — SSH handshake, host-key persistence, password login to
-   run one command, interactive shell over pty, negative auth cases.
+   run one command, interactive shell over pty, negative auth cases. *(done)*
 
 See [`docs/roadmap.md`](roadmap.md) M32b for live status.
 
@@ -163,10 +163,13 @@ table is warranted.
 **Single-CPU: all green** — `handshake` + `negauth` + `pty` + the kernel TCP
 `window-throttle` test all pass and the suite reaches `B1NIX-TEST: done`.
 
-**SMP caveat (pre-existing).** Under `-smp 4` the full suite hangs
-intermittently (no `B1NIX-TEST: done`; the stall point varies — loopback TCP,
-the M11 pipe tests, …). This is **not** introduced by the SSH work: stashing all
-in-progress changes and running the committed branch tip under `-smp 4` hangs on
-roughly one run in three as well, so a latent race lives in the committed
-loopback-deferral / `net_task` path. The extra loopback traffic from three SSH
-logins simply raises the hit rate. Tracked separately from the SSH items.
+**SMP status.** The M32b SSH prerequisite bucket is closed. The follow-up SMP
+race work fixed the concrete corruption vectors that were blocking the smoke
+suite: socket/VFS handle teardown double-free (`bucket_unlink`), sleeping
+`net_task` wakeups, leaked exec TLS state, and stale remote TLB mappings after
+user image teardown. Post-fix restricted `-smp 4` smoke ran 5x with 4/5
+full-suite completions and 0 panics, 0 GP faults, 0 `bucket_unlink`, and 0
+wget/curl/argv-shift markers. The one non-completion passed all M32b markers,
+including `M32B-SSH: ok service-lifecycle` and `M32B-SSH: ok handshake`, then
+timed out in a later dbclient/full-suite tail after the SSH handshake. Track
+that residual timeout outside M32b.
