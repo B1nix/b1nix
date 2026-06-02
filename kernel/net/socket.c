@@ -179,7 +179,14 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
-static int socket_close(struct vfs_handle *h) {
+/* Tear down the underlying socket: send the TCP FIN, drop UDP bindings, free
+ * the shared vfs_socket_state. This MUST run only when the LAST fd referencing
+ * the handle is closed (refcount -> 0), i.e. from ->release, never from a
+ * per-fd ->close. dropbear's accept()+fork() server keeps the connection fd
+ * open in the child while the parent close()s its copy: tearing down on the
+ * parent's close would FIN the peer (client sees "Remote closed") and free the
+ * state out from under the child mid-handshake. */
+static int socket_teardown(struct vfs_handle *h) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s)
     return 0;
@@ -205,11 +212,14 @@ static int socket_close(struct vfs_handle *h) {
 }
 
 static void socket_release(struct vfs_handle *h) {
-  socket_close(h);
+  socket_teardown(h);
 }
 
+/* No per-fd ->close: a close() on one of several dup'd/forked references must
+ * not disturb the connection. Teardown happens once, in ->release, when the
+ * handle refcount reaches zero (see socket_teardown). */
 const struct vfs_file_ops socket_file_ops = {
-  .read = socket_read, .write = socket_write, .poll = socket_poll, .close = socket_close, .release = socket_release
+  .read = socket_read, .write = socket_write, .poll = socket_poll, .release = socket_release
 };
 
 void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
@@ -346,7 +356,11 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   if (!new_s) { vfs_handle_release(new_vh); return -ENOMEM; }
   new_s->domain = s->domain;
   new_s->type = s->type;
-  
+  /* The accepted socket's local address is the listener's bound address. Copy
+   * it so getsockname() on the connection returns a valid family/addr (sshd
+   * calls getsockname right after accept; a zeroed family fails getnameinfo). */
+  new_s->local = s->local;
+
   int res = 0;
   if (s->domain == B1NIX_AF_UNIX) {
     unix_init_state(new_s);
