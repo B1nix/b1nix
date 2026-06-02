@@ -735,6 +735,15 @@ void user_address_space_cleanup(struct task *t) {
     kfree(vma);
     vma = next;
   }
+
+  /* execve/exit tear down whole user images, often at the same virtual
+   * addresses that the next exec will immediately reuse. A process may have
+   * run on another CPU before this cleanup, so that CPU can retain stale TLB
+   * translations for the old image and later resume the same task after exec.
+   * Flush all CPUs after the bulk unmap; per-page remote shootdowns would be
+   * much more expensive and still need the same cross-CPU guarantee. */
+  extern void tlb_shootdown_all(void);
+  tlb_shootdown_all();
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {
