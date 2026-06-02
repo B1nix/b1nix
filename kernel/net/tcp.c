@@ -50,7 +50,13 @@ struct tcp_pseudo {
   u16 tcp_length;
 } __attribute__((packed));
 
-#define MAX_TCP_CONNS 16
+/* 32, not 16: b1nix now runs a fork-per-connection SSH daemon. A single SSH
+ * session occupies several slots at once (client conn + server listener +
+ * accepted child conn), and a SIGKILLed client/server leaves connections that
+ * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
+ * plus the white-box kernel TCP tests that run right after would otherwise
+ * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
+#define MAX_TCP_CONNS 32
 #define TCP_RECV_BUF_SIZE 4096
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
@@ -317,6 +323,18 @@ static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
 static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
                                              struct in6_addr_k v6,
                                              u16 dst_port) {
+  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
+  if (!rp)
+    return 0;
+  rp->data = kmalloc(sizeof(struct tcp_header));
+  if (!rp->data) {
+    kfree(rp);
+    return 0;
+  }
+
+  u64 irq = irq_save();
+  tcp_lock();
+
   struct tcp_conn *conn = 0;
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (!tcp_conns[i].used) {
@@ -325,6 +343,10 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
     }
   }
   if (!conn) {
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
     console_write("tcp: no free connection slots\n");
     return 0;
   }
@@ -360,8 +382,25 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   tcp->window = bswap16(TCP_RECV_BUF_SIZE);
 
   conn->state = TCP_SYN_SENT;
+
+  // Set up rp under lock
+  memcpy(rp->data, packet, sizeof(packet));
+  rp->len = sizeof(packet);
+  rp->seq = conn->iss;
+  rp->timestamp = scheduler_get_uptime_ticks();
+  rp->retries = 0;
+  rp->next = 0;
+
+  // Insert rp into queue
+  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
+  while (*prev)
+    prev = &(*prev)->next;
+  *prev = rp;
+
+  tcp_unlock();
+  irq_restore(irq);
+
   tcp_conn_emit(conn, packet, sizeof(packet));
-  tcp_queue_retransmit(conn, packet, sizeof(packet), conn->iss);
   return conn;
 }
 
@@ -373,17 +412,41 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
 static struct tcp_conn *tcp_connect_wait(struct tcp_conn *conn) {
   if (!conn)
     return 0;
-  for (int tries = 0; tries < 400 && conn->state == TCP_SYN_SENT; tries++) {
-    net_poll();
-    if (conn->state != TCP_SYN_SENT)
+  for (int tries = 0; tries < 400; tries++) {
+    u64 irq = irq_save();
+    tcp_lock();
+    int state = conn->state;
+    tcp_unlock();
+    irq_restore(irq);
+
+    if (state != TCP_SYN_SENT)
       break;
+
+    net_poll();
+
+    irq = irq_save();
+    tcp_lock();
+    state = conn->state;
+    tcp_unlock();
+    irq_restore(irq);
+
+    if (state != TCP_SYN_SENT)
+      break;
+
     scheduler_sleep_ticks(1);
   }
+
+  u64 irq = irq_save();
+  tcp_lock();
   if (conn->state != TCP_ESTABLISHED) {
     console_write("tcp: connect failed\n");
     conn->used = 0;
+    tcp_unlock();
+    irq_restore(irq);
     return 0;
   }
+  tcp_unlock();
+  irq_restore(irq);
   console_write("tcp: connected\n");
   return conn;
 }
@@ -410,53 +473,113 @@ struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port) {
 }
 
 int tcp_is_established(struct tcp_conn *conn) {
-  if (!conn || !conn->used)
+  if (!conn)
     return 0;
-  return conn->state == TCP_ESTABLISHED;
+  u64 irq = irq_save();
+  tcp_lock();
+  int res = conn->used && (conn->state == TCP_ESTABLISHED);
+  tcp_unlock();
+  irq_restore(irq);
+  return res;
 }
 
 int tcp_is_readable(struct tcp_conn *conn) {
-  if (!conn || !conn->used)
+  if (!conn)
     return 1;
-  if (conn->recv_len > conn->recv_read)
+  u64 irq = irq_save();
+  tcp_lock();
+  if (!conn->used) {
+    tcp_unlock();
+    irq_restore(irq);
     return 1;
+  }
+  if (conn->recv_len > conn->recv_read) {
+    tcp_unlock();
+    irq_restore(irq);
+    return 1;
+  }
   if (conn->state == TCP_CLOSE_WAIT || conn->state == TCP_CLOSED ||
       conn->state == TCP_TIME_WAIT || conn->state == TCP_LAST_ACK ||
       conn->state == TCP_CLOSING) {
+    tcp_unlock();
+    irq_restore(irq);
     return 1;
   }
+  tcp_unlock();
+  irq_restore(irq);
   return 0;
 }
+
+int tcp_is_close_wait(struct tcp_conn *conn) {
+  if (!conn)
+    return 0;
+  u64 irq = irq_save();
+  tcp_lock();
+  int res = conn->used && (conn->state == TCP_CLOSE_WAIT);
+  tcp_unlock();
+  irq_restore(irq);
+  return res;
+}
+
+int tcp_is_closed(struct tcp_conn *conn) {
+  if (!conn)
+    return 1;
+  u64 irq = irq_save();
+  tcp_lock();
+  if (!conn->used) {
+    tcp_unlock();
+    irq_restore(irq);
+    return 1;
+  }
+  int res = (conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT);
+  tcp_unlock();
+  irq_restore(irq);
+  return res;
+}
+
 
 /* ── TCP Listen ── */
 int tcp_listen(u16 local_port, int backlog) {
   (void)backlog;
+  u64 irq = irq_save();
+  tcp_lock();
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (!tcp_conns[i].used) {
       memset(&tcp_conns[i], 0, sizeof(struct tcp_conn));
       tcp_conns[i].used = 1;
       tcp_conns[i].state = TCP_LISTEN;
       tcp_conns[i].local_port = local_port;
+      tcp_unlock();
+      irq_restore(irq);
       return 0;
     }
   }
+  tcp_unlock();
+  irq_restore(irq);
   return -1;
 }
 
 /* ── Check for pending connections (for poll) ── */
 int tcp_pending_connections(u16 local_port) {
+  u64 irq = irq_save();
+  tcp_lock();
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port && !tcp_conns[i].handed_to_user) {
+      tcp_unlock();
+      irq_restore(irq);
       return 1;
     }
   }
+  tcp_unlock();
+  irq_restore(irq);
   return 0;
 }
-
 /* ── TCP Accept ── */
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
                             u16 *client_port) {
+  u64 irq = irq_save();
+  tcp_lock();
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port &&
@@ -467,14 +590,21 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
         *client_ip = tcp_conns[i].remote_ip;
       if (client_port)
         *client_port = tcp_conns[i].remote_port;
-      return &tcp_conns[i];
+      struct tcp_conn *res = &tcp_conns[i];
+      tcp_unlock();
+      irq_restore(irq);
+      return res;
     }
   }
+  tcp_unlock();
+  irq_restore(irq);
   return 0;
 }
 
 struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
                              u16 *client_port) {
+  u64 irq = irq_save();
+  tcp_lock();
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port &&
@@ -485,43 +615,82 @@ struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
         *client_ip6 = tcp_conns[i].remote_ip6;
       if (client_port)
         *client_port = tcp_conns[i].remote_port;
-      return &tcp_conns[i];
+      struct tcp_conn *res = &tcp_conns[i];
+      tcp_unlock();
+      irq_restore(irq);
+      return res;
     }
   }
+  tcp_unlock();
+  irq_restore(irq);
   return 0;
 }
 
 /* ── TCP send data ── */
 int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
-  if (!conn || conn->state != TCP_ESTABLISHED)
+  if (!conn)
     return -1;
   if (len == 0)
     return 0;
-  u32 seq_start = conn->snd_nxt;
 
-  /* M32 sliding-window flow control: never put more bytes in flight than the
-   * smaller of the peer's advertised receive window (snd_wnd) and our own
-   * congestion window (cwnd). bytes-in-flight is snd_nxt - snd_una. When the
-   * window is full we send nothing and return 0 so the caller retries once an
-   * incoming ACK advances snd_una (and refreshes snd_wnd). */
+  /* Pre-allocate packet and retransmit packet buffers BEFORE taking the lock
+   * to avoid heap_lock deadlock. */
+  usize to_alloc = len > TCP_MSS ? TCP_MSS : len;
+  usize packet_len = sizeof(struct tcp_header) + to_alloc;
+  u8 *packet = kzalloc(packet_len);
+  if (!packet)
+    return -1;
+
+  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
+  if (!rp) {
+    kfree(packet);
+    return -1;
+  }
+  rp->data = kmalloc(packet_len);
+  if (!rp->data) {
+    kfree(rp);
+    kfree(packet);
+    return -1;
+  }
+
+  u64 irq = irq_save();
+  tcp_lock();
+
+  if (conn->state != TCP_ESTABLISHED) {
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
+    kfree(packet);
+    return -1;
+  }
+
   u32 window = conn->snd_wnd < conn->cwnd ? conn->snd_wnd : conn->cwnd;
   u32 inflight = conn->snd_nxt - conn->snd_una;
-  if (inflight >= window)
+  if (inflight >= window) {
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
+    kfree(packet);
     return 0;
+  }
   u32 usable = window - inflight;
-
   usize to_send = len;
   if (to_send > TCP_MSS)
     to_send = TCP_MSS;
   if (to_send > usable)
     to_send = usable;
-  if (to_send == 0)
+  if (to_send == 0) {
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
+    kfree(packet);
     return 0;
+  }
 
-  usize packet_len = sizeof(struct tcp_header) + to_send;
-  u8 *packet = kzalloc(packet_len);
-  if (!packet)
-    return -1;
+  packet_len = sizeof(struct tcp_header) + to_send;
 
   struct tcp_header *tcp = (struct tcp_header *)packet;
   tcp->src_port = bswap16(conn->local_port);
@@ -534,10 +703,25 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
 
   memcpy(packet + sizeof(struct tcp_header), data, to_send);
 
+  u32 seq_start = conn->snd_nxt;
   conn->snd_nxt += (u32)to_send;
 
+  memcpy(rp->data, packet, packet_len);
+  rp->len = packet_len;
+  rp->seq = seq_start;
+  rp->timestamp = scheduler_get_uptime_ticks();
+  rp->retries = 0;
+  rp->next = 0;
+
+  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
+  while (*prev)
+    prev = &(*prev)->next;
+  *prev = rp;
+
+  tcp_unlock();
+  irq_restore(irq);
+
   tcp_conn_emit(conn, packet, packet_len);
-  tcp_queue_retransmit(conn, packet, packet_len, seq_start);
   kfree(packet);
 
   return (int)to_send;
@@ -547,12 +731,24 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
   if (!conn)
     return -1;
+
+  u64 irq = irq_save();
+  tcp_lock();
+
   if (conn->recv_read >= conn->recv_len) {
     /* Poll for new data */
+    tcp_unlock();
+    irq_restore(irq);
     net_poll();
+    irq = irq_save();
+    tcp_lock();
   }
-  if (conn->recv_read >= conn->recv_len)
+
+  if (conn->recv_read >= conn->recv_len) {
+    tcp_unlock();
+    irq_restore(irq);
     return 0;
+  }
 
   usize avail = conn->recv_len - conn->recv_read;
   if (avail > max_len)
@@ -569,6 +765,9 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
     }
   }
 
+  tcp_unlock();
+  irq_restore(irq);
+
   return (int)avail;
 }
 
@@ -576,6 +775,26 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
 int tcp_close(struct tcp_conn *conn) {
   if (!conn || !conn->used)
     return -1;
+
+  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
+  if (!rp)
+    return -1;
+  rp->data = kmalloc(sizeof(struct tcp_header));
+  if (!rp->data) {
+    kfree(rp);
+    return -1;
+  }
+
+  u64 irq = irq_save();
+  tcp_lock();
+
+  if (!conn->used) {
+    tcp_unlock();
+    irq_restore(irq);
+    kfree(rp->data);
+    kfree(rp);
+    return -1;
+  }
 
   if (conn->state == TCP_CLOSE_WAIT) {
     conn->state = TCP_LAST_ACK;
@@ -597,21 +816,55 @@ int tcp_close(struct tcp_conn *conn) {
   conn->state = TCP_FIN_WAIT1;
   conn->snd_nxt++;
 
+  // Set up rp under lock
+  memcpy(rp->data, packet, sizeof(packet));
+  rp->len = sizeof(packet);
+  rp->seq = seq_start;
+  rp->timestamp = scheduler_get_uptime_ticks();
+  rp->retries = 0;
+  rp->next = 0;
+
+  // Insert rp into queue
+  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
+  while (*prev)
+    prev = &(*prev)->next;
+  *prev = rp;
+
+  tcp_unlock();
+  irq_restore(irq);
+
+  // Emit FIN segment outside the lock (calls kzalloc, loopback enqueue)
   tcp_conn_emit(conn, packet, sizeof(packet));
-  tcp_queue_retransmit(conn, packet, sizeof(packet), seq_start);
 
   /* Wait for FIN-ACK (poll a bit) */
-  for (int tries = 0; tries < 50 && conn->state != TCP_CLOSED &&
-                          conn->state != TCP_TIME_WAIT; tries++) {
+  for (int tries = 0; tries < 50; tries++) {
+    irq = irq_save();
+    tcp_lock();
+    int state = conn->state;
+    tcp_unlock();
+    irq_restore(irq);
+
+    if (state == TCP_CLOSED || state == TCP_TIME_WAIT)
+      break;
+
     net_poll();
   }
 
+  irq = irq_save();
+  tcp_lock();
   if (conn->state == TCP_CLOSED) {
+    tcp_unlock();
+    irq_restore(irq);
     tcp_clear_retransmit_queue(conn);
+    irq = irq_save();
+    tcp_lock();
     conn->used = 0;
   } else if (conn->state != TCP_TIME_WAIT) {
     tcp_enter_time_wait(conn);
   }
+  tcp_unlock();
+  irq_restore(irq);
+
   return 0;
 }
 
@@ -634,6 +887,9 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
 
   const u8 *payload = (const u8 *)data + data_offset;
   usize payload_size = (size > data_offset) ? size - data_offset : 0;
+
+  u64 irq = irq_save();
+  tcp_lock();
 
   /* Find connection */
   struct tcp_conn *conn =
@@ -664,8 +920,6 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         conn->ssthresh = conn->cwnd / 2;
         if (conn->ssthresh < TCP_MSS) conn->ssthresh = TCP_MSS;
         conn->cwnd = conn->ssthresh + 3 * TCP_MSS;  /* inflate per RFC 5681 */
-        u64 irq = irq_save();
-        tcp_lock();
         struct tcp_retransmit_pkt *head = conn->retransmit_queue;
         u8 *resend_data = 0;
         usize resend_len = 0;
@@ -681,6 +935,8 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6,
                       resend_data, resend_len);
         }
+        irq = irq_save();
+        tcp_lock();
       } else if (conn->dup_acks > 3) {
         /* Each additional dup ACK inflates cwnd by 1 MSS during fast
          * recovery (RFC 5681 section 3.2). */
@@ -749,9 +1005,43 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           tcp_hdr->flags = TCP_SYN | TCP_ACK;
           tcp_hdr->window = bswap16(TCP_RECV_BUF_SIZE);
 
+          tcp_unlock();
+          irq_restore(irq);
+
+          struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
+          u8 *rp_data = rp ? kmalloc(sizeof(packet)) : 0;
+          if (rp && rp_data) {
+            memcpy(rp_data, packet, sizeof(packet));
+            rp->data = rp_data;
+            rp->len = sizeof(packet);
+            rp->seq = new_conn->iss;
+            rp->timestamp = scheduler_get_uptime_ticks();
+            rp->retries = 0;
+            rp->next = 0;
+          } else {
+            if (rp) {
+              kfree(rp);
+              rp = 0;
+            }
+          }
+
           tcp_conn_emit(new_conn, packet, sizeof(packet));
-          tcp_queue_retransmit(new_conn, packet, sizeof(packet), new_conn->iss);
+
+          irq = irq_save();
+          tcp_lock();
+
+          if (rp && rp_data && new_conn->used && new_conn->state == TCP_SYN_RECEIVED) {
+            struct tcp_retransmit_pkt **prev = &new_conn->retransmit_queue;
+            while (*prev)
+              prev = &(*prev)->next;
+            *prev = rp;
+          } else if (rp) {
+            if (rp_data) kfree(rp_data);
+            kfree(rp);
+          }
         }
+        tcp_unlock();
+        irq_restore(irq);
         return;
       }
     }
@@ -773,9 +1063,16 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       r->data_offset = (5 << 4);
       r->flags = TCP_RST | (flags & TCP_ACK ? TCP_ACK : 0);
       r->window = 0;
+
+      tcp_unlock();
+      irq_restore(irq);
+
       tcp_set_checksum(family, v4src, &v6src, rst, sizeof(rst));
       tcp_l3_send(family, v4src, &v6src, rst, sizeof(rst));
+      return;
     }
+    tcp_unlock();
+    irq_restore(irq);
     return;
   }
 
@@ -813,7 +1110,12 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
         a->window = bswap16(TCP_RECV_BUF_SIZE);
+
+        tcp_unlock();
+        irq_restore(irq);
         tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
+        irq = irq_save();
+        tcp_lock();
 
         conn->state = TCP_ESTABLISHED;
         extern void *vfs_poll_chan;
@@ -832,8 +1134,6 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       if (ack > conn->snd_una || ack == conn->snd_una) {
         conn->snd_una = ack;
         struct tcp_retransmit_pkt *detached = 0;
-        u64 irq = irq_save();
-        tcp_lock();
         while (conn->retransmit_queue &&
                (isize)(ack - conn->retransmit_queue->seq) > 0) {
           struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
@@ -841,9 +1141,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
           rp->next = detached;
           detached = rp;
         }
-        tcp_unlock();
-        irq_restore(irq);
-        tcp_free_retransmit_list(detached);
+        if (detached) {
+          tcp_unlock();
+          irq_restore(irq);
+          tcp_free_retransmit_list(detached);
+          irq = irq_save();
+          tcp_lock();
+        }
       }
     }
 
@@ -868,7 +1172,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
         a->window = bswap16(TCP_RECV_BUF_SIZE - conn->recv_len);
+
+        tcp_unlock();
+        irq_restore(irq);
         tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
+        irq = irq_save();
+        tcp_lock();
+
         extern void *vfs_poll_chan;
         scheduler_wake_all(vfs_poll_chan);
       }
@@ -889,7 +1199,12 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
       a->data_offset = (5 << 4);
       a->flags = TCP_ACK;
       a->window = 0;
+
+      tcp_unlock();
+      irq_restore(irq);
       tcp_conn_emit(conn, ack_pkt, sizeof(ack_pkt));
+      irq = irq_save();
+      tcp_lock();
 
       if (conn->state == TCP_ESTABLISHED) {
         conn->state = TCP_CLOSE_WAIT;
@@ -931,6 +1246,9 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
   default:
     break;
   }
+
+  tcp_unlock();
+  irq_restore(irq);
 }
 
 void tcp_receive(struct ipv4_addr src, const void *data, usize size) {
@@ -962,44 +1280,82 @@ int tcp_network_ready(void) {
           ip.bytes[3] != 0);
 }
 
+static volatile int tcp_timer_ticking = 0;
+
 void tcp_timer_tick(void) {
+  if (__atomic_test_and_set(&tcp_timer_ticking, __ATOMIC_ACQUIRE)) {
+    return;
+  }
   u64 now = scheduler_get_uptime_ticks();
   for (int i = 0; i < MAX_TCP_CONNS; i++) {
     struct tcp_conn *conn = &tcp_conns[i];
-    if (!conn->used)
-      continue;
-
-    if (conn->state == TCP_TIME_WAIT) {
-      if (now - conn->time_wait_since >= TCP_TIME_WAIT_TICKS) {
-        tcp_clear_retransmit_queue(conn);
-        conn->used = 0;
-      }
+    
+    u64 irq = irq_save();
+    tcp_lock();
+    
+    if (!conn->used) {
+      tcp_unlock();
+      irq_restore(irq);
       continue;
     }
 
-    u64 irq = irq_save();
-    tcp_lock();
+    if (conn->state == TCP_TIME_WAIT) {
+      if (now - conn->time_wait_since >= TCP_TIME_WAIT_TICKS) {
+        tcp_unlock();
+        irq_restore(irq);
+        tcp_clear_retransmit_queue(conn);
+        irq = irq_save();
+        tcp_lock();
+        conn->used = 0;
+      }
+      tcp_unlock();
+      irq_restore(irq);
+      continue;
+    }
+
     struct tcp_retransmit_pkt *rp = conn->retransmit_queue;
     while (rp) {
       if (now - rp->timestamp >= 50) { // 500ms
         if (rp->retries >= 5) {
           conn->state = TCP_CLOSED;
-          conn->used = 0;
           tcp_unlock();
           irq_restore(irq);
           tcp_clear_retransmit_queue(conn);
           irq = irq_save();
           tcp_lock();
+          conn->used = 0;
           break;
         }
-        tcp_l3_send(conn->family, conn->remote_ip, &conn->remote_ip6, rp->data,
-                    rp->len);
+        
+        // Copy retransmit packet to stack to avoid Use-After-Free
+        u8 family = conn->family;
+        struct ipv4_addr remote_ip = conn->remote_ip;
+        struct in6_addr_k remote_ip6 = conn->remote_ip6;
+        u8 stack_buf[1500];
+        usize pkt_len = rp->len;
+        if (pkt_len > sizeof(stack_buf))
+          pkt_len = sizeof(stack_buf);
+        memcpy(stack_buf, rp->data, pkt_len);
+        
         rp->timestamp = now;
         rp->retries++;
+        
+        tcp_unlock();
+        irq_restore(irq);
+        
+        tcp_l3_send(family, remote_ip, &remote_ip6, stack_buf, pkt_len);
+        
+        irq = irq_save();
+        tcp_lock();
+        
+        // Restart iteration since lock was released and queue could be modified
+        rp = conn->retransmit_queue;
+        continue;
       }
       rp = rp->next;
     }
     tcp_unlock();
     irq_restore(irq);
   }
+  __atomic_clear(&tcp_timer_ticking, __ATOMIC_RELEASE);
 }

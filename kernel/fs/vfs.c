@@ -1558,7 +1558,11 @@ struct vfs_handle *alloc_raw_handle(enum vfs_handle_kind kind) {
 void vfs_handle_retain(struct vfs_handle *h) {
   if (!h || h->used != 1 || h->refcount <= 0)
     return;
-  h->refcount++;
+  /* SMP-safe: fork retains every shared fd's handle (scheduler.c) on the
+   * forking CPU while the original holder may run on another. A non-atomic
+   * increment would lose updates, breaking the refcount and ultimately
+   * double-freeing the underlying socket/pipe state in ->release. */
+  __atomic_add_fetch(&h->refcount, 1, __ATOMIC_RELAXED);
 }
 
 static struct vfs_handle *get_handle(int fd) {
@@ -1580,10 +1584,14 @@ static void copy_path(char *dst, usize dst_size, const char *src) {
 void vfs_handle_release(struct vfs_handle *h) {
   if (!h || h->used != 1 || h->refcount <= 0)
     return;
-  if (h->refcount > 1) {
-    h->refcount--;
+  /* SMP-safe dec-and-test: a fork'd parent and child closing a shared socket
+   * fd on different CPUs both release the same handle. A non-atomic
+   * "if (refcount > 1) refcount--" lost the update under that race, so both
+   * fell through to ->release → kfree(socket_state) twice → kheap double-free
+   * ("bucket_unlink ... magic 0x...dead110c"). The atomic sub-and-test makes
+   * exactly one releaser observe 0 and run teardown. */
+  if (__atomic_sub_fetch(&h->refcount, 1, __ATOMIC_ACQ_REL) > 0)
     return;
-  }
 
   h->used = 0;
   if (h->ops && h->ops->release) {
@@ -1783,6 +1791,12 @@ void vfs_init(void) {
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
+  /* M32b pseudo-terminals: /dev/ptmx + the /dev/pts mountpoint directory. Both
+   * opens are intercepted in vfs_open_flags; the nodes exist so stat()/ls and
+   * ptsname() paths resolve. */
+  pty_init();
+  add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
+  add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
@@ -1822,6 +1836,26 @@ int vfs_open_flags(const char *path, int flags) {
   if (!resolved)
     return -ENOMEM;
   vfs_resolve_path(path, resolved);
+
+  /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
+   * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
+   * intercept the open before the path lookup. */
+  if (strcmp(resolved, "/dev/ptmx") == 0) {
+    int fd = pty_open_master(flags);
+    kfree(resolved);
+    return fd;
+  }
+  if (strncmp(resolved, "/dev/pts/", 9) == 0) {
+    const char *num = resolved + 9;
+    if (*num >= '0' && *num <= '9') {
+      int idx = 0;
+      for (const char *q = num; *q >= '0' && *q <= '9'; q++)
+        idx = idx * 10 + (*q - '0');
+      int fd = pty_open_slave(idx, flags);
+      kfree(resolved);
+      return fd;
+    }
+  }
 
   struct vfs_node *node = vfs_find_node_internal(resolved, 1, 0);
   if (IS_ERR(node)) {
@@ -2171,7 +2205,9 @@ int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
     pfd->revents = B1NIX_POLLNVAL;
     return -1;
   }
-  return h->ops->poll(h, pfd);
+  int res = h->ops->poll(h, pfd);
+  pfd->revents &= (pfd->events | B1NIX_POLLERR | B1NIX_POLLHUP | B1NIX_POLLNVAL);
+  return res;
 }
 
 void vfs_close(int fd) {
@@ -3487,6 +3523,12 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
 }
 
 int vfs_ioctl(int fd, u64 request, void *arg) {
+  /* Handles with their own ioctl op (pty master/slave) take priority — they
+   * are raw handles with no backing VFS node. */
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (h && h->ops && h->ops->ioctl)
+    return h->ops->ioctl(h, request, arg);
+
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);

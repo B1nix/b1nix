@@ -60,14 +60,39 @@
 
 #define B1NIX_TCGETS 0x5401
 #define B1NIX_TCSETS 0x5402
+#define B1NIX_TIOCSCTTY 0x540E
 #define B1NIX_TIOCGPGRP 0x540F
 #define B1NIX_TIOCSPGRP 0x5410
+#define B1NIX_TIOCGWINSZ 0x5413
+#define B1NIX_TIOCSWINSZ 0x5414
+#define B1NIX_TIOCNOTTY 0x5422
+#define B1NIX_TIOCGPTN 0x80045430   /* get pty number (master) */
+#define B1NIX_TIOCSPTLCK 0x40045431 /* (un)lock slave (unlockpt) */
 
+/* c_lflag */
 #define B1NIX_ECHO 0x00000008
 #define B1NIX_ICANON 0x00000002
 #define B1NIX_ISIG 0x00000001
-#define B1NIX_OPOST 0x00000001
 #define B1NIX_TOSTOP 0x00000100
+/* c_oflag */
+#define B1NIX_OPOST 0x00000001
+#define B1NIX_ONLCR 0x00000004
+/* c_iflag */
+#define B1NIX_ICRNL 0x00000100
+
+/* c_cc indices (Linux-compatible). */
+#define B1NIX_VINTR  0
+#define B1NIX_VQUIT  1
+#define B1NIX_VERASE 2
+#define B1NIX_VEOF   4
+#define B1NIX_VSUSP  10
+
+struct b1nix_winsize {
+  u16 ws_row;
+  u16 ws_col;
+  u16 ws_xpixel;
+  u16 ws_ypixel;
+};
 
 struct b1nix_stat {
   u64 st_dev;

@@ -1,27 +1,51 @@
 #ifndef B1NIX_U_SIGNAL_H
 #define B1NIX_U_SIGNAL_H
 
-#define SIGINT  2
 #ifdef __cplusplus
 extern "C" {
 #endif
-#define SIGILL  4
-#define SIGABRT 6
-#define SIGBUS  7
-#define SIGFPE  8
-#define SIGPIPE 13
-#define SIGSEGV 11
+/* Signal numbers MUST match the kernel's table (kernel/include/b1nix/sched.h):
+ * kernel-generated signals (segfault, the tty/job-control signals) carry these
+ * numbers, so userspace handlers/masks must agree or they silently miss them.
+ * (The historic POSIX-Linux numbering here did not match the kernel.) */
+#define SIGABRT 1
+#define SIGALRM 2
+#define SIGBUS  3
+#define SIGCHLD 4
+#define SIGCONT 5
+#define SIGFPE  6
+#define SIGHUP  7
+#define SIGILL  8
+#define SIGINT  9
+#define SIGKILL 10
+#define SIGPIPE 11
+#define SIGQUIT 12
+#define SIGSEGV 13
+#define SIGSTOP 14
 #define SIGTERM 15
-#define NSIG    64
+#define SIGTSTP 16
+#define SIGTTIN 17
+#define SIGTTOU 18
+#define SIGUSR1 19
+#define SIGUSR2 20
+#define SIGSYS  21
+#define SIGTRAP 22
+#define SIGWINCH 28
+#define NSIG    31
 
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
 #define SIG_UNBLOCK 2
 #define SIG_BLOCK   0
 #define SIG_SETMASK 1
+#define SA_NOCLDSTOP 0x00000001
+#define SA_NOCLDWAIT 0x00000002
 #define SA_SIGINFO 4
+#define SA_ONSTACK  0x08000000
+#define SA_RESTART  0x10000000
 #define SA_RESTORER 0x04000000
 #define SA_NODEFER  0x40000000
+#define SA_RESETHAND 0x80000000
 
 typedef void (*sighandler_t)(int);
 typedef int sig_atomic_t;

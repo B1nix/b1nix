@@ -17,6 +17,21 @@ typedef unsigned int gid_t;
 typedef unsigned long dev_t;
 typedef unsigned long ino_t;
 typedef unsigned int nlink_t;
+typedef long blksize_t;
+typedef long blkcnt_t;
+typedef unsigned long fsblkcnt_t;
+typedef unsigned long fsfilcnt_t;
+typedef long suseconds_t;
+typedef unsigned int useconds_t;
+typedef long clock_t;
+
+/* BSD-style aliases expected by older portable C (dropbear et al.). */
+typedef unsigned char u_char;
+typedef unsigned short u_short;
+typedef unsigned int u_int;
+typedef unsigned long u_long;
+typedef unsigned char uchar;
+typedef unsigned int uint;
 
 #ifndef FD_SETSIZE
 #define FD_SETSIZE 1024

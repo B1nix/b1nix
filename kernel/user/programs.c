@@ -616,17 +616,13 @@ static int sh_func_run(const char *name, char **args, int num_args, char *cwd) {
   set_env("#", nbuf);
 
   usize blen = strlen(sh_funcs[idx].body);
-  usize cap = blen * 4 + 256;
+  usize cap = blen + 1;
   char *body = malloc(cap);
-  char *expanded = malloc(blen * 8 + 256);
-  if (body && expanded) {
+  if (body) {
     memcpy(body, sh_funcs[idx].body, blen + 1);
-    sh_expand_cmdsubst(body, (int)cap, cwd);
-    expand_env(body, expanded);
-    sh_execute_line(expanded, cwd);
+    sh_execute_line(body, cwd);
   }
   free(body);
-  free(expanded);
   int status = sh_last_status;
 
   for (int i = 1; i <= 9; i++) {
@@ -1467,6 +1463,9 @@ static int run_external_command(const char *cwd, char **args, int num_args,
   }
   /* Background job — register in jobs list */
   sh_job_add(pid, args[0]);
+  char pid_str[16];
+  snprintf(pid_str, sizeof(pid_str), "%d", (int)pid);
+  set_env("!", pid_str);
   return 0;
 }
 
@@ -2022,7 +2021,14 @@ static void sh_execute_line(char *line, char *cwd) {
     }
 
     if (!skip) {
-      sh_last_status = sh_execute_pipeline(p, cwd);
+      char cmd_buf[SH_LINE_MAX * 4];
+      strncpy(cmd_buf, p, sizeof(cmd_buf) - 1);
+      cmd_buf[sizeof(cmd_buf) - 1] = '\0';
+      sh_expand_cmdsubst(cmd_buf, sizeof(cmd_buf), cwd);
+
+      char expanded[SH_LINE_MAX * 2];
+      expand_env(cmd_buf, expanded);
+      sh_last_status = sh_execute_pipeline(expanded, cwd);
     }
 
     if (op == 0)
@@ -2197,11 +2203,9 @@ static int sh_capture_command(const char *inner, char *out, int outcap,
   }
 
   char inbuf[SH_LINE_MAX];
-  char expanded[SH_LINE_MAX * 2];
   strncpy(inbuf, inner, sizeof(inbuf) - 1);
   inbuf[sizeof(inbuf) - 1] = '\0';
-  expand_env(inbuf, expanded);
-  sh_execute_line(expanded, cwd);
+  sh_execute_line(inbuf, cwd);
 
   restore_stdio(saved);
 
@@ -2461,20 +2465,16 @@ static void sh_run_case(char *block, char *cwd) {
         expand_env(one, pe);
         if (glob_match(pe, wexp)) {
           matched = 1;
-          char *body = malloc((usize)blen * 4 + 256);
-          char *bexp = malloc((usize)blen * 8 + 256);
-          if (body && bexp) {
+          char *body = malloc((usize)blen + 1);
+          if (body) {
             memcpy(body, bstart, (usize)blen);
             body[blen] = '\0';
             for (int i = 0; i < blen; i++)
               if (body[i] == '\n')
                 body[i] = ';';
-            sh_expand_cmdsubst(body, blen * 4 + 256, cwd);
-            expand_env(body, bexp);
-            sh_execute_line(bexp, cwd);
+            sh_execute_line(body, cwd);
           }
           free(body);
-          free(bexp);
           break;
         }
       }
@@ -2535,16 +2535,12 @@ static char *sh_substr(const char *a, const char *b) {
 /* cmdsubst + variable-expand a fragment, then execute it as a command line. */
 static void sh_run_fragment(const char *frag, char *cwd) {
   usize n = strlen(frag);
-  char *buf = malloc(n * 4 + 256);
-  char *exp = malloc(n * 8 + 256);
-  if (buf && exp) {
+  char *buf = malloc(n + 1);
+  if (buf) {
     memcpy(buf, frag, n + 1);
-    sh_expand_cmdsubst(buf, (int)(n * 4 + 256), cwd);
-    expand_env(buf, exp);
-    sh_execute_line(exp, cwd);
+    sh_execute_line(buf, cwd);
   }
   free(buf);
-  free(exp);
 }
 
 /* cmdsubst + variable-expand a fragment into a fresh malloc'd string. */
@@ -2744,7 +2740,6 @@ static void sh_run_script(const char *path, char *cwd) {
     return;
   }
   char line[SH_LINE_MAX];
-  char expanded[SH_LINE_MAX * 2];
   int i = 0;
   while (1) {
     char c;
@@ -2756,10 +2751,8 @@ static void sh_run_script(const char *path, char *cwd) {
       if (line[0] && strncmp(line, "#!", 2) != 0) {
         struct hdoc_fd_ctx hc = {fd};
         if (!sh_handle_compound(line, hdoc_read_fd, &hc, cwd)) {
-          sh_expand_cmdsubst(line, SH_LINE_MAX, cwd);
           sh_resolve_heredoc(line, SH_LINE_MAX, hdoc_read_fd, &hc);
-          expand_env(line, expanded);
-          sh_execute_line(expanded, cwd);
+          sh_execute_line(line, cwd);
         }
       }
       i = 0;
@@ -2770,9 +2763,7 @@ static void sh_run_script(const char *path, char *cwd) {
     line[i] = '\0';
     struct hdoc_fd_ctx hc = {fd};
     if (!sh_handle_compound(line, hdoc_read_fd, &hc, cwd)) {
-      sh_expand_cmdsubst(line, SH_LINE_MAX, cwd);
-      expand_env(line, expanded);
-      sh_execute_line(expanded, cwd);
+      sh_execute_line(line, cwd);
     }
   }
   syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
@@ -2793,28 +2784,33 @@ static int sh_main(int argc, const char **argv) {
       set_env(key, argv[i]);
     }
     char line[SH_LINE_MAX];
-    char expanded[SH_LINE_MAX * 2];
     usize len = strlen(argv[2]);
     if (len >= sizeof(line))
       len = sizeof(line) - 1;
     memcpy(line, argv[2], len);
     line[len] = '\0';
-    sh_expand_cmdsubst(line, sizeof(line), cwd);
-    expand_env(line, expanded);
-    sh_execute_line(expanded, cwd);
+    sh_execute_line(line, cwd);
     return sh_last_status;
   }
   if (argc > 1) {
+    set_env("0", argv[1]);
+    for (int i = 1; i <= 9; i++) {
+      char key[2];
+      key[0] = (char)('0' + i);
+      key[1] = '\0';
+      set_env(key, (i + 1 < argc) ? argv[i + 1] : "");
+    }
+    char nbuf[12];
+    snprintf(nbuf, sizeof(nbuf), "%d", argc > 2 ? argc - 2 : 0);
+    set_env("#", nbuf);
     sh_run_script(argv[1], cwd);
     return sh_last_status;
   }
 
   uwrite("Welcome to b1nix shell!\nType 'help' for a list of commands.\n\n");
   /* SH_LINE_MAX-char input handles long toolchain command lines (a kernel-flag
-   * gcc invocation is ~260 chars); `line` is 2x for env-expansion headroom
-   * (expand_env has no output bound). 256 truncated such lines mid-argument. */
+   * gcc invocation is ~260 chars). 256 truncated such lines mid-argument. */
   char raw_line[SH_LINE_MAX];
-  char line[SH_LINE_MAX * 2];
   set_env("PATH", "/bin");
 
   while (1) {
@@ -2826,10 +2822,8 @@ static int sh_main(int argc, const char **argv) {
     }
 
     if (!sh_handle_compound(raw_line, hdoc_read_tty, 0, cwd)) {
-      sh_expand_cmdsubst(raw_line, sizeof(raw_line), cwd);
       sh_resolve_heredoc(raw_line, sizeof(raw_line), hdoc_read_tty, 0);
-      expand_env(raw_line, line);
-      sh_execute_line(line, cwd);
+      sh_execute_line(raw_line, cwd);
     }
 
     /* Simple history add */

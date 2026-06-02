@@ -114,7 +114,11 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 	memcpy(buffer + sizeof(struct ipv4_header), payload, size);
 
 	if (ipv4_is_loopback(dst)) {
-		ipv4_receive(buffer, total_size);
+		/* Defer delivery instead of recursing into ipv4_receive here: a
+		 * synchronous loopback path re-enters the TCP state machine mid-send
+		 * and deadlocks multi-packet exchanges (SSH handshake). net_poll drains
+		 * the queue in a clean context. */
+		net_loopback_enqueue(buffer, total_size, 0);
 		kfree(buffer);
 		return;
 	}

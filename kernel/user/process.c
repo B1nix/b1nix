@@ -477,8 +477,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     /* Walk DT_RELA. */
     if (rela_off && rela_sz) {
       usize nrela = rela_sz / sizeof(struct elf64_rela);
-      struct elf64_rela *rela_arr = (struct elf64_rela *)0;
-      /* Find rela_arr in the file. The DT_RELA address is a PIE vaddr;
+      /* The DT_RELA address is a PIE vaddr;
        * convert it to a staging-buffer pointer. We use a small helper. */
       for (usize r = 0; r < nrela; r++) {
         /* Read the rela entry out of the staging buffer (kernel-mapped
@@ -571,10 +570,14 @@ void user_image_free(struct user_loaded_image *image) {
   if (!image)
     return;
 
-  if (image->refcount > 1) {
-    image->refcount--;
+  /* Atomic dec-and-test: a fork'd process shares its parent's user_image
+   * (the read-only ELF), so under -smp two cores exiting tasks that share one
+   * image race here. A non-atomic `if (refcount > 1) refcount--` lets both read
+   * the same value and either double-free the image or free it while the other
+   * core still references it — the heap/page-table corruption seen in the
+   * fork-heavy M33 shell tests. Only the core that drops the count to 0 frees. */
+  if (__atomic_sub_fetch(&image->refcount, 1, __ATOMIC_ACQ_REL) > 0)
     return;
-  }
 
   if (image->path)
     kfree((void *)image->path);
@@ -732,6 +735,15 @@ void user_address_space_cleanup(struct task *t) {
     kfree(vma);
     vma = next;
   }
+
+  /* execve/exit tear down whole user images, often at the same virtual
+   * addresses that the next exec will immediately reuse. A process may have
+   * run on another CPU before this cleanup, so that CPU can retain stale TLB
+   * translations for the old image and later resume the same task after exec.
+   * Flush all CPUs after the bulk unmap; per-page remote shootdowns would be
+   * much more expensive and still need the same cross-CPU guarantee. */
+  extern void tlb_shootdown_all(void);
+  tlb_shootdown_all();
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {
@@ -1047,6 +1059,11 @@ int user_execve_current(const char *path, const char **argv,
     user_image_free(current_task->user_image);
   }
   current_task->user_image = image;
+  task_set_tls_base(current_task, 0);
+  {
+    extern void arch_set_fs_base(u64 base);
+    arch_set_fs_base(0);
+  }
 
   int code = 0;
   if (image->kind == USER_IMAGE_ELF64) {

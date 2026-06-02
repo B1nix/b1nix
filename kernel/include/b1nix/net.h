@@ -17,6 +17,14 @@ struct in6_addr_k {
 
 void net_init(void);
 void net_poll(void);
+/* Loopback (127.0.0.0/8, ::1) datagrams are NOT delivered synchronously inside
+ * the sender's call stack — that recursion (ipv4_send -> ipv4_receive ->
+ * tcp_input -> tcp_send -> ipv4_send -> ...) re-enters the TCP state machine
+ * mid-send and deadlocks multi-packet exchanges such as an SSH handshake.
+ * Instead the IP layer enqueues the finished datagram and net_poll()/net_task
+ * drains it in a clean context. is_v6 picks ipv4_receive vs ipv6_receive. */
+void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6);
+void net_loopback_drain(void);
 int net_is_ready(void);
 void net_dump_info(void);
 void net_interrupt_handler(void);
@@ -118,6 +126,8 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_is_established(struct tcp_conn *conn);
 int tcp_is_readable(struct tcp_conn *conn);
+int tcp_is_close_wait(struct tcp_conn *conn);
+int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);

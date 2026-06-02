@@ -31,7 +31,11 @@ static int in6_is_v4mapped(const struct in6_addr_k *a) {
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
   (void)flags;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-  
+
+  /* After shutdown(SHUT_WR) the write half is closed: POSIX requires EPIPE. */
+  if (s->shut_wr)
+    return -EPIPE;
+
   if (s->domain == B1NIX_AF_UNIX) {
     return unix_send(s, buf, len);
   }
@@ -89,7 +93,11 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
 
 isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-  
+
+  /* After shutdown(SHUT_RD) the read half is closed: report EOF. */
+  if (s->shut_rd)
+    return 0;
+
   if (s->domain == B1NIX_AF_UNIX) {
     return unix_recv(s, buf, len);
   }
@@ -98,7 +106,13 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     while (s->udp_q_count == 0) {
       if (h->flags & B1NIX_O_NONBLOCK)
         return -EAGAIN;
-      scheduler_block_on(s);
+      /* SMP-safe wait — see the TCP recv path below. */
+      scheduler_wait_prepare(s);
+      if (s->udp_q_count != 0) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
 
     u8 slot = s->udp_q_head;
@@ -124,7 +138,14 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
       if (h->flags & B1NIX_O_NONBLOCK) {
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait: publish BLOCKED, then re-test so a wake_all(vfs_poll_chan)
+       * racing in from tcp_input on another CPU can't be lost. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      if (tcp_is_readable(conn)) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     return tcp_recv(conn, buf, len, flags);
   }
@@ -154,13 +175,21 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
         tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
       s->connected = 1;
     }
-    /* Simple poll for TCP */
     if (s->connected) {
       struct tcp_conn *conn = (struct tcp_conn *)s->tcp_conn;
-      if (conn && tcp_is_readable(conn)) {
-        pfd->revents |= B1NIX_POLLIN;
+      if (conn) {
+        if (tcp_is_readable(conn)) {
+          pfd->revents |= B1NIX_POLLIN;
+        }
+        if (tcp_is_established(conn)) {
+          pfd->revents |= B1NIX_POLLOUT;
+        } else if (tcp_is_close_wait(conn)) {
+          pfd->revents |= B1NIX_POLLOUT;
+          pfd->revents |= B1NIX_POLLHUP;
+        } else {
+          pfd->revents |= B1NIX_POLLHUP;
+        }
       }
-      pfd->revents |= B1NIX_POLLOUT;
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
       if (tcp_pending_connections(port)) {
@@ -171,7 +200,14 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
-static int socket_close(struct vfs_handle *h) {
+/* Tear down the underlying socket: send the TCP FIN, drop UDP bindings, free
+ * the shared vfs_socket_state. This MUST run only when the LAST fd referencing
+ * the handle is closed (refcount -> 0), i.e. from ->release, never from a
+ * per-fd ->close. dropbear's accept()+fork() server keeps the connection fd
+ * open in the child while the parent close()s its copy: tearing down on the
+ * parent's close would FIN the peer (client sees "Remote closed") and free the
+ * state out from under the child mid-handshake. */
+static int socket_teardown(struct vfs_handle *h) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s)
     return 0;
@@ -197,11 +233,14 @@ static int socket_close(struct vfs_handle *h) {
 }
 
 static void socket_release(struct vfs_handle *h) {
-  socket_close(h);
+  socket_teardown(h);
 }
 
+/* No per-fd ->close: a close() on one of several dup'd/forked references must
+ * not disturb the connection. Teardown happens once, in ->release, when the
+ * handle refcount reaches zero (see socket_teardown). */
 const struct vfs_file_ops socket_file_ops = {
-  .read = socket_read, .write = socket_write, .poll = socket_poll, .close = socket_close, .release = socket_release
+  .read = socket_read, .write = socket_write, .poll = socket_poll, .release = socket_release
 };
 
 void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
@@ -256,9 +295,11 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
     s->bound = 1;
     if (s->type == B1NIX_SOCK_DGRAM) {
       u16 port = s->local.in6.sin6_port;
-      for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-        if (udp_bindings[i].used && udp_bindings[i].port == port)
-          return -EADDRINUSE;
+      if (!s->so_reuseaddr) {
+        for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+          if (udp_bindings[i].used && udp_bindings[i].port == port)
+            return -EADDRINUSE;
+        }
       }
       for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
         if (!udp_bindings[i].used) {
@@ -278,9 +319,11 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   s->bound = 1;
   if (s->type == B1NIX_SOCK_DGRAM) {
     u16 port = s->local.in.sin_port;
-    for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
-      if (udp_bindings[i].used && udp_bindings[i].port == port) {
-        return -EADDRINUSE;
+    if (!s->so_reuseaddr) {
+      for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
+        if (udp_bindings[i].used && udp_bindings[i].port == port) {
+          return -EADDRINUSE;
+        }
       }
     }
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -301,6 +344,7 @@ int vfs_listen(int fd, int backlog) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  s->backlog = backlog < 0 ? 0 : backlog;
   if (s->domain == B1NIX_AF_UNIX) return unix_listen(s, backlog);
   
   if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
@@ -333,7 +377,11 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   if (!new_s) { vfs_handle_release(new_vh); return -ENOMEM; }
   new_s->domain = s->domain;
   new_s->type = s->type;
-  
+  /* The accepted socket's local address is the listener's bound address. Copy
+   * it so getsockname() on the connection returns a valid family/addr (sshd
+   * calls getsockname right after accept; a zeroed family fails getnameinfo). */
+  new_s->local = s->local;
+
   int res = 0;
   if (s->domain == B1NIX_AF_UNIX) {
     unix_init_state(new_s);
@@ -355,7 +403,16 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
         vfs_handle_release(new_vh);
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait: publish BLOCKED, then re-poll tcp_accept so a connection
+       * that lands (and its wake_all(vfs_poll_chan)) between the test and the
+       * block isn't lost. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      conn = tcp_accept(local_port, &client_ip, &client_port);
+      if (conn) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;
@@ -382,7 +439,14 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
         vfs_handle_release(new_vh);
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait — see the IPv4 accept path above. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      conn = tcp_accept6(local_port, &client_ip6, &client_port);
+      if (conn) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;
@@ -491,6 +555,142 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   return vfs_socket_recv_h(h, buf, len, flags);
+}
+
+/* ---- M32b: socket option / address / shutdown API ----
+ * Option name/level values match userspace <sys/socket.h>/<netinet/tcp.h>
+ * (Linux-compatible numbering). */
+#define SOCK_SOL_SOCKET   1
+#define SOCK_IPPROTO_TCP  6
+#define SOCK_SO_REUSEADDR 2
+#define SOCK_SO_TYPE      3
+#define SOCK_SO_ERROR     4
+#define SOCK_SO_SNDBUF    7
+#define SOCK_SO_RCVBUF    8
+#define SOCK_SO_KEEPALIVE 9
+#define SOCK_SO_REUSEPORT 15
+#define SOCK_SO_ACCEPTCONN 30
+#define SOCK_TCP_NODELAY  1
+#define SOCK_SHUT_RD      0
+#define SOCK_SHUT_WR      1
+#define SOCK_SHUT_RDWR    2
+
+static struct vfs_socket_state *socket_state_for_fd(int fd, int *err) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h) { *err = -EBADF; return 0; }
+  if (h->kind != VFS_HANDLE_SOCKET) { *err = -ENOTSOCK; return 0; }
+  *err = 0;
+  return (struct vfs_socket_state *)h->private_data;
+}
+
+int vfs_setsockopt(int fd, int level, int optname, const void *optval,
+                   usize optlen) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  if (!optval || optlen < sizeof(int)) return -EINVAL;
+  int v = *(const int *)optval;
+
+  if (level == SOCK_SOL_SOCKET) {
+    switch (optname) {
+    case SOCK_SO_REUSEADDR:
+    case SOCK_SO_REUSEPORT: s->so_reuseaddr = v ? 1 : 0; return 0;
+    case SOCK_SO_KEEPALIVE: s->so_keepalive = v ? 1 : 0; return 0;
+    case SOCK_SO_SNDBUF:    s->so_sndbuf = v; return 0;
+    case SOCK_SO_RCVBUF:    s->so_rcvbuf = v; return 0;
+    case SOCK_SO_ERROR:     return -ENOPROTOOPT; /* read-only */
+    default:                return -ENOPROTOOPT;
+    }
+  }
+  if (level == SOCK_IPPROTO_TCP) {
+    if (optname == SOCK_TCP_NODELAY) {
+      /* b1nix TCP already sends each segment promptly (no Nagle), so this is
+       * a stored, honoured-by-construction flag. */
+      s->tcp_nodelay = v ? 1 : 0;
+      return 0;
+    }
+    return -ENOPROTOOPT;
+  }
+  return -ENOPROTOOPT;
+}
+
+int vfs_getsockopt(int fd, int level, int optname, void *optval,
+                   usize *optlen) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  if (!optval || !optlen || *optlen < sizeof(int)) return -EINVAL;
+  int v = 0;
+
+  if (level == SOCK_SOL_SOCKET) {
+    switch (optname) {
+    case SOCK_SO_REUSEADDR:
+    case SOCK_SO_REUSEPORT: v = s->so_reuseaddr; break;
+    case SOCK_SO_KEEPALIVE: v = s->so_keepalive; break;
+    case SOCK_SO_TYPE:      v = s->type; break;
+    case SOCK_SO_ERROR:     v = s->so_error; s->so_error = 0; break;
+    case SOCK_SO_SNDBUF:    v = s->so_sndbuf; break;
+    case SOCK_SO_RCVBUF:    v = s->so_rcvbuf; break;
+    case SOCK_SO_ACCEPTCONN: v = s->listening; break;
+    default:                return -ENOPROTOOPT;
+    }
+  } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {
+    v = s->tcp_nodelay;
+  } else {
+    return -ENOPROTOOPT;
+  }
+
+  *(int *)optval = v;
+  *optlen = sizeof(int);
+  return 0;
+}
+
+static int sock_copy_local_peer(struct vfs_socket_state *s, int want_peer,
+                                void *addr, usize *addrlen) {
+  if (!addr || !addrlen) return -EINVAL;
+  union {
+    struct b1nix_sockaddr_in in;
+    struct b1nix_sockaddr_in6 in6;
+    struct b1nix_sockaddr_un un;
+  } *src = want_peer ? (void *)&s->peer : (void *)&s->local;
+  usize need;
+  if (s->domain == B1NIX_AF_INET) need = sizeof(struct b1nix_sockaddr_in);
+  else if (s->domain == B1NIX_AF_INET6) need = sizeof(struct b1nix_sockaddr_in6);
+  else need = sizeof(struct b1nix_sockaddr_un);
+
+  usize copy = *addrlen < need ? *addrlen : need;
+  memcpy(addr, src, copy);
+  *addrlen = need; /* report the full (untruncated) length, like Linux */
+  return 0;
+}
+
+int vfs_getsockname(int fd, void *addr, usize *addrlen) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  return sock_copy_local_peer(s, 0, addr, addrlen);
+}
+
+int vfs_getpeername(int fd, void *addr, usize *addrlen) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  if (!s->connected) return -ENOTCONN;
+  return sock_copy_local_peer(s, 1, addr, addrlen);
+}
+
+int vfs_shutdown(int fd, int how) {
+  int err;
+  struct vfs_socket_state *s = socket_state_for_fd(fd, &err);
+  if (!s) return err;
+  if (how != SOCK_SHUT_RD && how != SOCK_SHUT_WR && how != SOCK_SHUT_RDWR)
+    return -EINVAL;
+  if (how == SOCK_SHUT_RD || how == SOCK_SHUT_RDWR) s->shut_rd = 1;
+  if (how == SOCK_SHUT_WR || how == SOCK_SHUT_RDWR) s->shut_wr = 1;
+  /* Wake any blocked reader so it observes the now-closed half. */
+  scheduler_wake_all(s);
+  scheduler_wake_all(vfs_poll_chan);
+  return 0;
 }
 
 int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {

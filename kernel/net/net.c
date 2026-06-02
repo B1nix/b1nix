@@ -2,6 +2,7 @@
 #include <b1nix/net.h>
 #include <b1nix/pci.h>
 #include <b1nix/virtio.h>
+#include <b1nix/ipi.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch_x86.h>
@@ -19,6 +20,7 @@ static volatile int net_ready;
 static volatile int net_tx_lock = 0;
 static volatile int net_rx_lock = 0;
 static volatile int net_irq_pending = 0;
+static volatile int net_task_id = -1;
 static void **tx_buffers;       /* Pre-allocated TX buffer pool */
 static u8 *tx_inflight;
 static u16 *tx_pool_free;       /* Stack of free buffer indices */
@@ -368,7 +370,7 @@ void net_init(void)
 		dhcp_init();
 	}
 
-	kthread_create("net_task", net_task, 0);
+	net_task_id = kthread_create("net_task", net_task, 0);
 }
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
@@ -447,8 +449,77 @@ void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, 
 	tx_pool_count++;
 }
 
+/* ── Loopback deferral queue (see net.h) ── */
+#define NET_LOOPBACK_Q 256
+struct net_loopback_pkt { u8 *data; usize len; int is_v6; };
+static struct net_loopback_pkt net_loopback_q[NET_LOOPBACK_Q];
+static volatile u32 net_lb_head; /* consumer */
+static volatile u32 net_lb_tail; /* producer */
+static volatile int net_lb_lock;
+static volatile int net_lb_draining = 0;
+
+void net_loopback_enqueue(const void *ip_pkt, usize len, int is_v6)
+{
+	int kick_net_task = 0;
+
+	if (!ip_pkt || len == 0)
+		return;
+	u8 *copy = kmalloc(len);
+	if (!copy)
+		return; /* drop on OOM — TCP retransmit recovers */
+	memcpy(copy, ip_pkt, len);
+	while (__atomic_test_and_set(&net_lb_lock, __ATOMIC_ACQUIRE)) { }
+	u32 next = (net_lb_tail + 1) % NET_LOOPBACK_Q;
+	if (next == net_lb_head) { /* full — drop, retransmit recovers */
+		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+		kfree(copy);
+		return;
+	}
+	net_loopback_q[net_lb_tail].data = copy;
+	net_loopback_q[net_lb_tail].len = len;
+	net_loopback_q[net_lb_tail].is_v6 = is_v6;
+	net_lb_tail = next;
+	if (!__atomic_load_n(&net_lb_draining, __ATOMIC_ACQUIRE))
+		kick_net_task = 1;
+	__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+
+	if (kick_net_task && net_task_id >= 0) {
+		scheduler_wake_task((usize)net_task_id);
+		ipi_reschedule_all();
+	}
+}
+
+void net_loopback_drain(void)
+{
+	if (__atomic_test_and_set(&net_lb_draining, __ATOMIC_ACQUIRE)) {
+		return;
+	}
+	while (1) {
+		while (__atomic_test_and_set(&net_lb_lock, __ATOMIC_ACQUIRE)) { }
+		if (net_lb_head == net_lb_tail) {
+			__atomic_clear(&net_lb_draining, __ATOMIC_RELEASE);
+			__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+			break;
+		}
+		u8 *data = net_loopback_q[net_lb_head].data;
+		usize len = net_loopback_q[net_lb_head].len;
+		int is_v6 = net_loopback_q[net_lb_head].is_v6;
+		net_lb_head = (net_lb_head + 1) % NET_LOOPBACK_Q;
+		__atomic_clear(&net_lb_lock, __ATOMIC_RELEASE);
+
+		if (is_v6)
+			ipv6_receive(data, len);
+		else
+			ipv4_receive(data, len);
+		kfree(data);
+	}
+}
+
 void net_poll(void)
 {
+	/* Drain loopback first, and unconditionally — loopback must work even
+	 * before/without a virtio NIC (the guard below would otherwise skip it). */
+	net_loopback_drain();
 	if (!net_ready || net_rx_vq.queue_size == 0 || !net_rx_vq.used) {
 		return;
 	}

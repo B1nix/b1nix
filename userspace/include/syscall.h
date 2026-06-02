@@ -135,6 +135,13 @@ enum {
   /* --- M25 libc completeness --- */
   SYS_UTIME        = 112,
   SYS_GETRANDOM    = 113,
+
+  /* --- M32b: socket option / address API hardening --- */
+  SYS_SETSOCKOPT   = 114,
+  SYS_GETSOCKOPT   = 115,
+  SYS_GETSOCKNAME  = 116,
+  SYS_GETPEERNAME  = 117,
+  SYS_SHUTDOWN     = 118,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

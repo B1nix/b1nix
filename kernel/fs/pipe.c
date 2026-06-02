@@ -2,6 +2,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/arch.h>
 #include <b1nix/spinlock.h>
 #include <stdlib.h>
 #include <string.h>
@@ -27,8 +28,13 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
     if (pipe->size == 0) {
       if (pipe->writers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return 0; }
       if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      interrupts_disable();
+      current_task->wait_chan = pipe;
+      current_task->stack_released = 0;
+      current_task->state = TASK_BLOCKED;
       __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
-      scheduler_block_on(pipe);
+      scheduler_yield();
+      interrupts_enable();
       continue;
     }
     break;
@@ -63,8 +69,13 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
     usize free_space = PIPE_BUFFER_SIZE - pipe->size;
     if (free_space == 0) {
       if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      interrupts_disable();
+      current_task->wait_chan = pipe;
+      current_task->stack_released = 0;
+      current_task->state = TASK_BLOCKED;
       __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
-      scheduler_block_on(pipe);
+      scheduler_yield();
+      interrupts_enable();
       continue;
     }
     break;

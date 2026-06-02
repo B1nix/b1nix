@@ -19,8 +19,21 @@ extern "C" {
 
 extern char **environ;
 
-int write(int fd, const void *buf, size_t n);
-int read(int fd, void *buf, size_t n);
+#ifndef STDIN_FILENO
+#define STDIN_FILENO  0
+#define STDOUT_FILENO 1
+#define STDERR_FILENO 2
+#endif
+
+ssize_t write(int fd, const void *buf, size_t n);
+ssize_t read(int fd, void *buf, size_t n);
+int gethostname(char *name, size_t len);
+int sethostname(const char *name, size_t len);
+int chown(const char *path, uid_t owner, gid_t group);
+int fchown(int fd, uid_t owner, gid_t group);
+char *ttyname(int fd);
+int ttyname_r(int fd, char *buf, size_t buflen);
+char *getpass(const char *prompt);
 int close(int fd);
 void _exit(int status) __attribute__((noreturn));
 int sleep(unsigned int seconds);

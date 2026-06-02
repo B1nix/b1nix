@@ -28,8 +28,13 @@ static inline int _check_err(long rc) {
   return (int)rc;
 }
 
-int write(int fd, const void *buf, size_t n) {
-  return _check_err(syscall(SYS_WRITE, fd, buf, n));
+ssize_t write(int fd, const void *buf, size_t n) {
+  long rc = syscall(SYS_WRITE, fd, buf, n);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return (ssize_t)rc;
 }
 
 ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
@@ -42,8 +47,13 @@ ssize_t getrandom(void *buf, size_t buflen, unsigned int flags) {
   return (ssize_t)rc;
 }
 
-int read(int fd, void *buf, size_t n) {
-  return _check_err(syscall(SYS_READ, fd, buf, n));
+ssize_t read(int fd, void *buf, size_t n) {
+  long rc = syscall(SYS_READ, fd, buf, n);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return (ssize_t)rc;
 }
 
 int close(int fd) { return _check_err(syscall(SYS_CLOSE, fd)); }
@@ -470,34 +480,25 @@ ssize_t recv(int fd, void *buf, size_t len, int flags) {
 
 int setsockopt(int sockfd, int level, int optname, const void *optval,
                socklen_t optlen) {
-  (void)sockfd;
-  (void)level;
-  (void)optname;
-  (void)optval;
-  (void)optlen;
-  return 0;
+  return _check_err(syscall(SYS_SETSOCKOPT, sockfd, level, optname, optval,
+                            (size_t)optlen));
 }
 
 int getsockopt(int sockfd, int level, int optname, void *optval,
                socklen_t *optlen) {
-  (void)sockfd;
-  (void)level;
-  if (!optval || !optlen || *optlen < sizeof(int)) {
+  if (!optlen) {
     errno = EINVAL;
     return -1;
   }
-  if (optname == SO_TYPE) {
-    *(int *)optval = SOCK_STREAM;
-    *optlen = sizeof(int);
-    return 0;
+  /* The kernel reads/writes the length as a 64-bit usize; bridge via size_t. */
+  size_t klen = *optlen;
+  long rc = syscall(SYS_GETSOCKOPT, sockfd, level, optname, optval, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
   }
-  if (optname == SO_ERROR) {
-    *(int *)optval = 0;
-    *optlen = sizeof(int);
-    return 0;
-  }
-  errno = ENOPROTOOPT;
-  return -1;
+  *optlen = (socklen_t)klen;
+  return 0;
 }
 
 int listen(int fd, int backlog) {
@@ -519,9 +520,7 @@ ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
 }
 
 int shutdown(int sockfd, int how) {
-  (void)sockfd;
-  (void)how;
-  return 0;
+  return _check_err(syscall(SYS_SHUTDOWN, sockfd, how));
 }
 
 int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
@@ -529,28 +528,32 @@ int accept(int fd, struct sockaddr *addr, socklen_t *addrlen) {
 }
 
 int getsockname(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-  (void)sockfd;
-  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    sin->sin_port = 0x5000; // htons(80) -> 0x0050 in big-endian, so 0x5000 in little-endian representation of short
-    sin->sin_addr.s_addr = 0x0100007f; // 127.0.0.1 in little-endian
-    *addrlen = sizeof(struct sockaddr_in);
+  if (!addrlen) {
+    errno = EINVAL;
+    return -1;
   }
+  size_t klen = *addrlen;
+  long rc = syscall(SYS_GETSOCKNAME, sockfd, addr, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  *addrlen = (socklen_t)klen;
   return 0;
 }
 
 int getpeername(int sockfd, struct sockaddr *addr, socklen_t *addrlen) {
-  (void)sockfd;
-  if (addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
-    struct sockaddr_in *sin = (struct sockaddr_in *)addr;
-    memset(sin, 0, sizeof(*sin));
-    sin->sin_family = AF_INET;
-    sin->sin_port = 0x5000;
-    sin->sin_addr.s_addr = 0x0100007f;
-    *addrlen = sizeof(struct sockaddr_in);
+  if (!addrlen) {
+    errno = EINVAL;
+    return -1;
   }
+  size_t klen = *addrlen;
+  long rc = syscall(SYS_GETPEERNAME, sockfd, addr, &klen);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  *addrlen = (socklen_t)klen;
   return 0;
 }
 
@@ -722,6 +725,131 @@ int getrlimit(int resource, struct rlimit *rlim) {
   (void)rlim;
   errno = ENOSYS;
   return -1;
+}
+
+#include <sys/uio.h>
+ssize_t writev(int fd, const struct iovec *iov, int iovcnt) {
+  ssize_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    ssize_t w = write(fd, iov[i].iov_base, iov[i].iov_len);
+    if (w < 0)
+      return total > 0 ? total : -1;
+    total += w;
+    if ((size_t)w < iov[i].iov_len)
+      break; /* short write: stop, report progress */
+  }
+  return total;
+}
+
+ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
+  ssize_t total = 0;
+  for (int i = 0; i < iovcnt; i++) {
+    if (iov[i].iov_len == 0)
+      continue;
+    ssize_t r = read(fd, iov[i].iov_base, iov[i].iov_len);
+    if (r < 0)
+      return total > 0 ? total : -1;
+    total += r;
+    if ((size_t)r < iov[i].iov_len)
+      break; /* short read: stop */
+  }
+  return total;
+}
+
+#include <termios.h>
+char *getpass(const char *prompt) {
+  static char buf[256];
+  if (prompt)
+    write(2, prompt, strlen(prompt));
+  /* Disable echo on stdin while reading the password. */
+  struct termios old, raw;
+  int have_tio = (tcgetattr(0, &old) == 0);
+  if (have_tio) {
+    raw = old;
+    raw.c_lflag &= ~ECHO;
+    tcsetattr(0, TCSANOW, &raw);
+  }
+  ssize_t n = read(0, buf, sizeof(buf) - 1);
+  if (have_tio)
+    tcsetattr(0, TCSANOW, &old);
+  write(2, "\n", 1);
+  if (n <= 0)
+    return 0;
+  while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+    n--;
+  buf[n] = '\0';
+  return buf;
+}
+
+int chown(const char *path, uid_t owner, gid_t group) {
+  return _check_err(syscall(SYS_CHOWN, path, owner, group));
+}
+
+int fchown(int fd, uid_t owner, gid_t group) {
+  return _check_err(syscall(SYS_FCHOWN, fd, owner, group));
+}
+
+int ttyname_r(int fd, char *buf, size_t buflen) {
+  if (fd < 0) return EBADF;
+  const char *nm = "/dev/tty";
+  size_t n = strlen(nm);
+  if (buflen <= n) return ERANGE;
+  memcpy(buf, nm, n + 1);
+  return 0;
+}
+
+char *ttyname(int fd) {
+  static char buf[32];
+  if (ttyname_r(fd, buf, sizeof(buf)) != 0)
+    return 0;
+  return buf;
+}
+
+int gethostname(char *name, size_t len) {
+  if (!name || len == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  const char *host = "b1nix";
+  /* Prefer /etc/hostname if present. */
+  int fd = open("/etc/hostname", 0 /* O_RDONLY */);
+  char filebuf[64];
+  if (fd >= 0) {
+    ssize_t r = read(fd, filebuf, sizeof(filebuf) - 1);
+    close(fd);
+    if (r > 0) {
+      while (r > 0 && (filebuf[r - 1] == '\n' || filebuf[r - 1] == '\r'))
+        r--;
+      filebuf[r] = '\0';
+      if (filebuf[0])
+        host = filebuf;
+    }
+  }
+  size_t hlen = strlen(host);
+  if (hlen >= len) {
+    memcpy(name, host, len - 1);
+    name[len - 1] = '\0';
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  memcpy(name, host, hlen + 1);
+  return 0;
+}
+
+int sethostname(const char *name, size_t len) {
+  (void)name;
+  (void)len;
+  return 0; /* b1nix hostname is fixed/boot-configured */
+}
+
+int setrlimit(int resource, const struct rlimit *rlim) {
+  /* b1nix has no per-process resource limits; accept the request as a no-op so
+   * callers that lower RLIMIT_CORE etc. (dropbear) proceed. */
+  (void)resource;
+  (void)rlim;
+  return 0;
 }
 
 #include <syslog.h>
