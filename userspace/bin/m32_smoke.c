@@ -18,7 +18,9 @@
 #include <signal.h>
 #include <termios.h>
 #include <pty.h>
+#include <crypt.h>
 #include <sys/ioctl.h>
+#include <sys/random.h>
 #include <sys/select.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -1502,6 +1504,56 @@ static int test_session(void) {
   return 0;
 }
 
+/* M32b: crypto/RNG baseline. getrandom (secure random bytes), the userspace
+ * SHA-512 + "$b1$" password KDF (what dropbear's password auth verifies against
+ * /etc/shadow), and a constant-time-style sensitivity check. The full bundled
+ * libtomcrypt SSH primitives (curve25519/ed25519/chacha20poly1305/aes) build for
+ * b1nix and are exercised end-to-end by the real SSH handshake. */
+extern void sha512(const void *data, size_t len, unsigned char out[64]);
+
+static int test_crypto(void) {
+  unsigned char r1[32], r2[32];
+  if (getrandom(r1, sizeof(r1), 0) != (ssize_t)sizeof(r1)) {
+    emit("M32B-CRYPTO: FAIL getrandom\n");
+    return -1;
+  }
+  getrandom(r2, sizeof(r2), 0);
+  int allzero = 1, same = 1;
+  for (int i = 0; i < 32; i++) {
+    if (r1[i]) allzero = 0;
+    if (r1[i] != r2[i]) same = 0;
+  }
+  if (allzero || same) {
+    emit("M32B-CRYPTO: FAIL getrandom\n");
+    return -1;
+  }
+  emit("M32B-CRYPTO: ok getrandom\n");
+
+  /* SHA-512("abc") = ddaf35a193617aba...a54ca49f (FIPS 180-4 vector). */
+  unsigned char d[64];
+  sha512("abc", 3, d);
+  if (d[0] != 0xdd || d[1] != 0xaf || d[2] != 0x35 || d[63] != 0x9f) {
+    emit("M32B-CRYPTO: FAIL sha512\n");
+    return -1;
+  }
+  emit("M32B-CRYPTO: ok sha512\n");
+
+  /* crypt() must be deterministic for a given password+salt and sensitive to a
+   * wrong password (the property /etc/shadow verification relies on). */
+  char *p = crypt("hunter2", "$b1$testsalt$");
+  if (!p) { emit("M32B-CRYPTO: FAIL crypt\n"); return -1; }
+  char hcopy[160];
+  strncpy(hcopy, p, sizeof(hcopy) - 1);
+  hcopy[sizeof(hcopy) - 1] = '\0';
+  p = crypt("hunter2", "$b1$testsalt$");
+  if (!p || strcmp(hcopy, p) != 0) { emit("M32B-CRYPTO: FAIL crypt\n"); return -1; }
+  p = crypt("wrongpw", "$b1$testsalt$");
+  if (!p || strcmp(hcopy, p) == 0) { emit("M32B-CRYPTO: FAIL crypt\n"); return -1; }
+  emit("M32B-CRYPTO: ok crypt\n");
+  emit("M32B-CRYPTO: done\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   /* Self-reexec env probe (see test_session): report whether the env we were
    * exec'd with reached getenv(). */
@@ -1512,6 +1564,7 @@ int main(int argc, char **argv) {
   emit("M32-NET: start\n");
   if (test_pty() != 0)                 return 1;
   if (test_session() != 0)             return 1;
+  if (test_crypto() != 0)              return 1;
   if (test_socket_options() != 0)      return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
