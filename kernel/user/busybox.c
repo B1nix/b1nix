@@ -2180,11 +2180,26 @@ static int login_main(int argc, const char **argv) {
   }
   syscall_dispatch(SYS_CHDIR, (u64)(usize)home, 0, 0, 0, 0, 0);
 
+  /* Build the login-shell environment (POSIX: a login program sets at least
+   * HOME, SHELL, USER, LOGNAME and a sane PATH). Userspace-ELF shells receive
+   * this via execve's envp (crt0 wires it into `environ`). */
+  char env_home[160], env_shell[160], env_user[96], env_logname[96];
+  char env_path[96], env_term[32];
+  snprintf(env_home, sizeof(env_home), "HOME=%s", home);
+  snprintf(env_shell, sizeof(env_shell), "SHELL=%s", shell);
+  snprintf(env_user, sizeof(env_user), "USER=%s", name);
+  snprintf(env_logname, sizeof(env_logname), "LOGNAME=%s", name);
+  snprintf(env_path, sizeof(env_path), "PATH=%s",
+           uid == 0 ? "/sbin:/bin:/usr/sbin:/usr/bin" : "/bin:/usr/bin");
+  snprintf(env_term, sizeof(env_term), "TERM=%s", "xterm");
+  const char *shell_envp[] = {env_home, env_shell, env_user,
+                              env_logname, env_path, env_term, 0};
+
   const char *shell_argv[] = {shell, 0};
   int pid = (int)syscall_dispatch(SYS_FORK, 0, 0, 0, 0, 0, 0);
   if (pid == 0) {
-    syscall_dispatch(SYS_EXECVE, (u64)(usize)shell, (u64)(usize)shell_argv, 0, 0,
-                     0, 0);
+    syscall_dispatch(SYS_EXECVE, (u64)(usize)shell, (u64)(usize)shell_argv,
+                     (u64)(usize)shell_envp, 0, 0, 0);
     syscall_dispatch(SYS_EXIT, 1, 0, 0, 0, 0, 0);
   } else if (pid > 0) {
     int status;

@@ -1481,9 +1481,37 @@ static int test_pty(void) {
   return 0;
 }
 
-int main(void) {
+/* M32b: login/session plumbing — env survives execve (crt0 -> environ -> getenv),
+ * the mechanism /bin/login uses to hand a real environment to the login shell. */
+static int test_session(void) {
+  int pid = fork();
+  if (pid < 0) { emit("M32B-SESS: FAIL fork\n"); return -1; }
+  if (pid == 0) {
+    char *av[] = {"/bin/m32-smoke", "--envcheck", 0};
+    char *ev[] = {"B1NIX_SESS=loginok", 0};
+    execve("/bin/m32-smoke", av, ev);
+    _exit(127);
+  }
+  int st = 0;
+  waitpid(pid, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 42) {
+    emit("M32B-SESS: FAIL env-execve\n");
+    return -1;
+  }
+  emit("M32B-SESS: ok env-execve\n");
+  return 0;
+}
+
+int main(int argc, char **argv) {
+  /* Self-reexec env probe (see test_session): report whether the env we were
+   * exec'd with reached getenv(). */
+  if (argc >= 2 && strcmp(argv[1], "--envcheck") == 0) {
+    const char *v = getenv("B1NIX_SESS");
+    _exit(v && strcmp(v, "loginok") == 0 ? 42 : 1);
+  }
   emit("M32-NET: start\n");
   if (test_pty() != 0)                 return 1;
+  if (test_session() != 0)             return 1;
   if (test_socket_options() != 0)      return 1;
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
