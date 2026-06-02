@@ -1050,6 +1050,11 @@ int user_execve_current(const char *path, const char **argv,
     user_image_free(current_task->user_image);
   }
   current_task->user_image = image;
+  task_set_tls_base(current_task, 0);
+  {
+    extern void arch_set_fs_base(u64 base);
+    arch_set_fs_base(0);
+  }
 
   int code = 0;
   if (image->kind == USER_IMAGE_ELF64) {

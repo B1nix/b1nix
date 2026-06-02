@@ -1278,17 +1278,13 @@ int scheduler_yield(void) {
   paging_switch_address_space(new_task->pml4_phys);
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
 
-  /* M29: reload userspace FS base for TLS, but only for tasks that have
-   * actually set one. Unconditionally writing MSR_FS_BASE on every
-   * context switch is correct in isolation, but to stay maximally
-   * conservative vs. the existing M28 baseline we skip the MSR write
-   * when tls_base==0 (i.e. no thread has touched TLS yet). */
+  /* M29: reload userspace FS base for TLS on every context switch. Writing 0
+   * matters just as much as writing a nonzero TLS base: IA32_FS_BASE is per-CPU
+   * state, so a task with no TLS must not inherit the previous task's FS base. */
   {
     u64 fsbase = task_tls_base(new_task);
-    if (fsbase) {
-      extern void arch_set_fs_base(u64 base);
-      arch_set_fs_base(fsbase);
-    }
+    extern void arch_set_fs_base(u64 base);
+    arch_set_fs_base(fsbase);
   }
 
   /* Preserve userspace FPU/SSE/MXCSR/x87 across the switch. Save the outgoing
@@ -1347,9 +1343,26 @@ void scheduler_wake_task(usize task_id) {
   interrupts_disable();
 
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == task_id && T(i)->state == TASK_BLOCKED) {
-      T(i)->state = TASK_READY;
+    if (T(i)->id != task_id) continue;
+
+    /* Explicit id wakeups are used both for waiters (futex) and for timer-
+     * sleeping kernel daemons with external work (net_task loopback kick). */
+    enum task_state expected = TASK_BLOCKED;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                    0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
       T(i)->wait_chan = 0;
+      T(i)->wake_tick = 0;
+      sched_rq_enqueue_current(T(i));
+      break;
+    }
+
+    expected = TASK_SLEEPING;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                    0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      T(i)->wait_chan = 0;
+      T(i)->wake_tick = 0;
       sched_rq_enqueue_current(T(i));
       break;
     }
