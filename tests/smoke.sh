@@ -105,7 +105,7 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123" iso >/dev/null 2>&1 || {
+make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
 	echo "  ${RED}BUILD FAILED${NC}"
 	exit 1
 }
@@ -582,6 +582,7 @@ check_output "$LOG" "M32B-SSH: ok dropbearkey" "M32b: ported Dropbear runs on b1
 check_output "$LOG" "M32B-SSH: ok handshake" "M32b: end-to-end localhost SSH login (KEX + chacha20-poly1305 + password auth + remote command) over loopback"
 check_output "$LOG" "M32B-SSH: ok negauth" "M32b: SSH daemon rejects a wrong password — remote command never runs, client terminates"
 check_output "$LOG" "M32B-SSH: ok pty" "M32b: interactive shell over a remote PTY (sshd allocates a pty + spawns /bin/sh) runs a command"
+check_output "$LOG" "M32B-SSH: ok service-lifecycle" "M32b: SSH daemon service control script and lifecycle management work"
 check_output "$LOG" "M32-NET: ok inet-pton-ntop" "libc inet_pton/inet_ntop round-trip"
 check_output "$LOG" "M32-NET: ok inet6-pton-ntop" "libc inet_pton/inet_ntop AF_INET6 round-trip"
 check_output "$LOG" "M32-NET: ok gethostbyname-numeric" "libc gethostbyname resolves a dotted-quad"

@@ -11,9 +11,11 @@ struct task;
 /* Enqueue / Dequeue */
 void rq_enqueue(struct runqueue *rq, struct task *t);
 struct task *rq_dequeue(struct runqueue *rq);
+int rq_remove(struct runqueue *rq, struct task *t);
 
 /* Per-CPU enqueue + work stealing */
 void sched_rq_enqueue_current(struct task *t);
+void sched_rq_remove_task(struct task *t);
 struct task *sched_steal_task(void);
 
 #endif

@@ -1785,12 +1785,131 @@ static int ssh_test_pty(void) {
   return 0;
 }
 
+static int test_sshd_service(void) {
+  /* 1. Verify init.d script exists and is executable. */
+  int fd = open("/etc/init.d/sshd", O_RDONLY);
+  if (fd < 0) {
+    emit("M32B-SSH: FAIL service-script-missing\n");
+    return -1;
+  }
+  close(fd);
+
+  /* 2. Since init ran it, check if pid file exists. */
+  /* Wait a little for it to start up from init. */
+  sleep(1);
+  int pid_fd = open("/var/run/sshd.pid", O_RDONLY);
+  if (pid_fd < 0) {
+    emit("M32B-SSH: FAIL service-pid-missing\n");
+    return -1;
+  }
+  char pid_str[64];
+  int r = read(pid_fd, pid_str, sizeof(pid_str) - 1);
+  close(pid_fd);
+  if (r <= 0) {
+    emit("M32B-SSH: FAIL service-pid-empty\n");
+    return -1;
+  }
+  pid_str[r] = '\0';
+  int daemon_pid = atoi(pid_str);
+  if (daemon_pid <= 0) {
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "M32B-SSH: FAIL service-pid-invalid (content: '%s')\n", pid_str);
+    emit(dbg);
+    return -1;
+  }
+
+  /* 3. Check status. */
+  int p = fork();
+  if (p == 0) {
+    char *av[] = {"/bin/sh", "/etc/init.d/sshd", "status", 0};
+    char *ev[] = {0};
+    execve("/bin/sh", av, ev);
+    _exit(127);
+  }
+  int st = 0;
+  waitpid(p, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    emit("M32B-SSH: FAIL service-status\n");
+    return -1;
+  }
+
+  /* 4. Check log output. */
+  int log_fd = open("/var/log/sshd.log", O_RDONLY);
+  if (log_fd < 0) {
+    emit("M32B-SSH: FAIL service-log-missing\n");
+    return -1;
+  }
+  char log_buf[64];
+  int log_read = read(log_fd, log_buf, sizeof(log_buf) - 1);
+  close(log_fd);
+  if (log_read <= 0) {
+    emit("M32B-SSH: FAIL service-log-empty\n");
+    return -1;
+  }
+
+  /* 5. Test clean shutdown (stop). */
+  p = fork();
+  if (p == 0) {
+    char *av[] = {"/bin/sh", "/etc/init.d/sshd", "stop", 0};
+    char *ev[] = {0};
+    execve("/bin/sh", av, ev);
+    _exit(127);
+  }
+  st = 0;
+  waitpid(p, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    emit("M32B-SSH: FAIL service-stop\n");
+    return -1;
+  }
+
+  /* Verify PID file is gone and daemon process is terminated. */
+  pid_fd = open("/var/run/sshd.pid", O_RDONLY);
+  if (pid_fd >= 0) {
+    close(pid_fd);
+    emit("M32B-SSH: FAIL service-pid-not-removed\n");
+    return -1;
+  }
+  
+  /* Verify daemon process is dead (kill with 0 should return ESRCH/EPERM/etc or fail if gone). */
+  if (kill(daemon_pid, 0) == 0) {
+    emit("M32B-SSH: FAIL service-process-still-running\n");
+    return -1;
+  }
+
+  /* 6. Test restart/start. */
+  p = fork();
+  if (p == 0) {
+    char *av[] = {"/bin/sh", "/etc/init.d/sshd", "start", 0};
+    char *ev[] = {0};
+    execve("/bin/sh", av, ev);
+    _exit(127);
+  }
+  st = 0;
+  waitpid(p, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    emit("M32B-SSH: FAIL service-start\n");
+    return -1;
+  }
+  
+  sleep(1);
+  pid_fd = open("/var/run/sshd.pid", O_RDONLY);
+  if (pid_fd < 0) {
+    emit("M32B-SSH: FAIL service-restart-pid-missing\n");
+    return -1;
+  }
+  close(pid_fd);
+
+  emit("M32B-SSH: ok service-lifecycle\n");
+  return 0;
+}
+
 /* M32b: end-to-end localhost SSH against one dropbear instance — exercises TCP
  * loopback, the full SSH KEX + chacha20-poly1305, server fork-per-connection,
  * and three login paths: a positive password login running a remote command, a
  * negative wrong-password rejection, and an interactive shell over a remote
  * PTY. Each sub-test emits its own M32B-SSH ok/FAIL marker (non-fatal). */
 static int test_ssh_handshake(void) {
+  test_sshd_service();
   if (ssh_ensure_hostkey() != 0) {
     emit("M32B-SSH: FAIL handshake-hostkey\n");
     return -1;

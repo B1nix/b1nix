@@ -1052,6 +1052,15 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   }
 
   while (1) {
+    /* Publish BLOCKED on vfs_poll_chan BEFORE scanning the fds. Under -smp a
+     * wake_all(vfs_poll_chan) from another CPU (data arriving on a socket/pipe)
+     * firing between the scan and the sleep would otherwise be lost and the
+     * poller would hang forever (the SSH/dropbear poll wedge). The SEQ_CST
+     * fence in scheduler_wait_prepare orders the BLOCKED store ahead of the
+     * vfs_poll reads, so a racing waker either is seen by the scan or observes
+     * our BLOCKED state. */
+    scheduler_wait_prepare(vfs_poll_chan);
+
     int ready = 0;
     for (usize i = 0; i < nfds; i++) {
       if (fds[i].fd < 0) {
@@ -1069,22 +1078,21 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
         ready++;
     }
 
-    if (ready > 0 || timeout == 0) {
+    int timed_out = 0;
+    if (ready == 0 && timeout != 0 && timeout != (u64)-1) {
+      u64 now = scheduler_get_uptime_ticks();
+      if (now - start_ticks >= timeout_ticks)
+        timed_out = 1;
+    }
+
+    if (ready > 0 || timeout == 0 || timed_out) {
+      scheduler_wait_cancel();
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
       return (u64)ready;
     }
 
-    if (timeout != (u64)-1) {
-      u64 now = scheduler_get_uptime_ticks();
-      if (now - start_ticks >= timeout_ticks) {
-        current_task->wake_tick = 0;
-        syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
-        return 0;
-      }
-    }
-
-    scheduler_block_on(vfs_poll_chan);
+    scheduler_wait_commit();
   }
 }
 
@@ -2208,6 +2216,9 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     extern void *vfs_poll_chan;
     int ready_count = 0;
     while (1) {
+      /* Publish BLOCKED before the fd scan — same SMP lost-wakeup fix as
+       * sys_poll above (the SSH/select wedge). */
+      scheduler_wait_prepare(vfs_poll_chan);
       ready_count = 0;
       for (int i = 0; i < np; i++) {
         if (pfds[i].fd < 0) { pfds[i].revents = 0; continue; }
@@ -2217,12 +2228,16 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
         vfs_poll(pfds[i].fd, &pfds[i]);
         if (pfds[i].revents) ready_count++;
       }
-      if (ready_count > 0 || timeout_ms == 0) break;
-      if (timeout_ms != (u64)-1) {
+      int timed_out = 0;
+      if (ready_count == 0 && timeout_ms != 0 && timeout_ms != (u64)-1) {
         u64 now = scheduler_get_uptime_ticks();
-        if (now - start_ticks >= timeout_ticks) break;
+        if (now - start_ticks >= timeout_ticks) timed_out = 1;
       }
-      scheduler_block_on(vfs_poll_chan);
+      if (ready_count > 0 || timeout_ms == 0 || timed_out) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
 
     current_task->wake_tick = 0;

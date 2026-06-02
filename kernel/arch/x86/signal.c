@@ -93,6 +93,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     if (current_task->state == TASK_STOPPED) {
                         current_task->state = TASK_READY;
                         current_task->continued_report_pending = 1;
+                        scheduler_notify_wait_event(current_task->parent_id);
                     }
                 } else if (i == SIGSTOP || i == SIGTSTP ||
                            i == SIGTTIN || i == SIGTTOU) {
@@ -100,6 +101,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     current_task->last_stop_signal = i;
                     current_task->stop_report_pending = 1;
                     __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+                    scheduler_notify_wait_event(current_task->parent_id);
                     interrupts_enable();
                     scheduler_yield();
                     return;

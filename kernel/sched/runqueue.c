@@ -36,6 +36,31 @@ struct task *rq_dequeue(struct runqueue *rq) {
     return t;
 }
 
+int rq_remove(struct runqueue *rq, struct task *t) {
+    int removed = 0;
+    spin_lock(&rq->lock);
+    LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
+    struct task *prev = 0;
+    struct task *cur = rq->head;
+    while (cur) {
+        struct task *next = cur->next_run;
+        if (cur == t) {
+            if (prev) prev->next_run = next;
+            else rq->head = next;
+            if (rq->tail == cur) rq->tail = prev;
+            cur->next_run = 0;
+            removed = 1;
+            cur = next;
+            continue;
+        }
+        prev = cur;
+        cur = next;
+    }
+    LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+    spin_unlock(&rq->lock);
+    return removed;
+}
+
 /* Make a READY task runnable.
  *
  * Stealable CPU-bound workers go on THIS CPU's per-CPU runqueue so an idle AP
@@ -51,6 +76,17 @@ void sched_rq_enqueue_current(struct task *t) {
         if (pcpu) rq_enqueue(&pcpu->runqueue, t);
     } else {
         rq_enqueue(sched_global_rq(), t);
+    }
+}
+
+void sched_rq_remove_task(struct task *t) {
+    if (t->stealable) {
+        for (int i = 0; i < g_max_cpus; i++) {
+            struct percpu *pcpu = get_percpu_n(i);
+            if (pcpu) rq_remove(&pcpu->runqueue, t);
+        }
+    } else {
+        rq_remove(sched_global_rq(), t);
     }
 }
 

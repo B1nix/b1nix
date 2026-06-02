@@ -89,6 +89,61 @@ static const char initramfs_shadow[] =
     "root:$b1$rootsalt$YLR0bb6kf/9n3oGVFfPVbAVfAqs.k/9jnNVshpAFNbj6hBY2OZmMg6Jav8muEuSt8vkIU8mahAr9KwerDzvv6Q:0:0:99999:7:::\n"
     "user:$b1$usersalt$BaxHIimflG4IPjGvD7HDPKcnI1nRIILqEKYNIyHy6iDPeyxWpyqT4p5Hir8Iauy.ZiTCnjIUPj1KKlgdLNBHXQ:0:0:99999:7:::\n";
 
+static const char initramfs_sshd_service[] =
+    "#!/bin/sh\n"
+    "# System-wide SSH daemon service control script\n"
+    "\n"
+    "export PATH=\"/bin\"\n"
+    "export PIDFILE=\"/var/run/sshd.pid\"\n"
+    "export LOGFILE=\"/var/log/sshd.log\"\n"
+    "\n"
+    "case $1 in\n"
+    "  start)\n"
+    "    [ -f $PIDFILE ] && export pid=$(cat $PIDFILE) && kill -0 $pid 2>/dev/null && echo \"sshd is already running (PID: $pid)\" && exit 0\n"
+    "    [ -f $PIDFILE ] && rm -f $PIDFILE\n"
+    "\n"
+    "    [ -f /etc/ssh/hk_ed25519 ] || mkdir -p /etc/ssh\n"
+    "    [ -f /etc/ssh/hk_ed25519 ] || echo \"sshd: generating host key...\"\n"
+    "    [ -f /etc/ssh/hk_ed25519 ] || /bin/dropbearkey -t ed25519 -f /etc/ssh/hk_ed25519\n"
+    "\n"
+    "    mkdir -p /var/run /var/log\n"
+    "\n"
+    "    export BIND_ADDR=\"\"\n"
+    "    [ -f /proc/cmdline ] && grep -q \"b1nix.ssh-loopback\" /proc/cmdline && export BIND_ADDR=\"127.0.0.1:\"\n"
+    "\n"
+    "    echo \"sshd: starting daemon (bind: ${BIND_ADDR}22)...\"\n"
+    "    /bin/dropbear -r /etc/ssh/hk_ed25519 -p ${BIND_ADDR}22 -F >$LOGFILE 2>&1 &\n"
+    "    echo $! > $PIDFILE\n"
+    "    echo \"sshd: started (PID: $(cat $PIDFILE))\"\n"
+    "    ;;\n"
+    "  stop)\n"
+    "    [ -f $PIDFILE ] || echo \"sshd is not running\"\n"
+    "    [ -f $PIDFILE ] || exit 0\n"
+    "    export pid=$(cat $PIDFILE)\n"
+    "    echo \"sshd: stopping daemon (PID: $pid)...\"\n"
+    "    kill $pid 2>/dev/null\n"
+    "    sleep 1\n"
+    "    kill -0 $pid 2>/dev/null && sleep 1\n"
+    "    kill -0 $pid 2>/dev/null && kill -9 $pid 2>/dev/null\n"
+    "    rm -f $PIDFILE\n"
+    "    echo \"sshd: stopped\"\n"
+    "    ;;\n"
+    "  restart)\n"
+    "    /bin/sh $0 stop\n"
+    "    sleep 1\n"
+    "    /bin/sh $0 start\n"
+    "    ;;\n"
+    "  status)\n"
+    "    [ -f $PIDFILE ] && export pid=$(cat $PIDFILE) && kill -0 $pid 2>/dev/null && echo \"sshd is running (PID: $pid)\" && exit 0\n"
+    "    echo \"sshd: stopped\"\n"
+    "    exit 1\n"
+    "    ;;\n"
+    "  *)\n"
+    "    echo \"Usage: $0 {start|stop|restart|status}\"\n"
+    "    exit 1\n"
+    "    ;;\n"
+    "esac\n";
+
 /* Boot rc script: init runs this once at startup, before the login shell.
  * The /persist block is first-boot setup for the persistent root image; it is
  * inert when /persist is not mounted (e.g. the smoke harness uses its own
@@ -102,6 +157,8 @@ static const char initramfs_rc[] =
     "&& mkdir -p /persist/etc && mkdir -p /persist/tmp "
     "&& echo ready > /persist/.b1nix-setup "
     "&& echo \"M27-INIT: first-boot /persist initialised\"\n"
+    "# Start SSH daemon service\n"
+    "[ -f /etc/init.d/sshd ] && /bin/sh /etc/init.d/sshd start\n"
     "echo \"M27-INIT: ok rc-script\"\n";
 
 /* Resolver configuration. The kernel DNS client parses the first
@@ -418,6 +475,7 @@ static const struct initramfs_file files[] = {
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
+    {"/etc/init.d/sshd", initramfs_sshd_service, sizeof(initramfs_sshd_service) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/resolv.conf", initramfs_resolv_conf,
      sizeof(initramfs_resolv_conf) - 1, 0},

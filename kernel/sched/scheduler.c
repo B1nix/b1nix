@@ -260,6 +260,23 @@ static usize task_index(const struct task *task) {
   return 0;
 }
 
+/* True if `t` is the live current task on some CPU — i.e. it is executing
+ * right now, not merely parked READY. scheduler_yield reassigns this CPU's
+ * cur_task to the *incoming* task BEFORE arch_context_switch saves+publishes
+ * the outgoing task's stack_released, so a task that is genuinely mid-switch-out
+ * is NOT cur_task anywhere during its stack_released==0 window. A task that is
+ * cur_task somewhere with stack_released==0 is therefore actively running (it
+ * was woken BLOCKED->READY mid-flight and kept running) and will not publish
+ * stack_released soon — the picker must not wait on it. */
+static int task_running_somewhere(struct task *t) {
+  for (int c = 0; c < g_max_cpus; c++) {
+    struct percpu *pc = get_percpu_n(c);
+    if (pc && (struct task *)pc->cur_task == t)
+      return 1;
+  }
+  return 0;
+}
+
 static struct task *pick_next_task(void) {
   if (current_task == 0) {
     return 0;
@@ -296,10 +313,31 @@ static struct task *pick_next_task(void) {
        * only published once we leave it via arch_context_switch — waiting on
        * our own publish would self-deadlock. Resuming ourselves is a no-op
        * switch, always safe. */
+      /* Stay in the wait ONLY while the task is still READY. A waker
+       * (e.g. a child's exit / STOPPED / CONTINUED notify) can CAS a task
+       * BLOCKED->READY and enqueue it here while the task is still executing
+       * its own block loop with stack_released==0. If that task then re-blocks
+       * (its waitpid found only a STOPPED child, or scheduler_yield returned 0
+       * so it never context-switched) it goes BLOCKED again WITHOUT ever
+       * reaching arch_context_switch — so stack_released never becomes 1 and a
+       * naive `while (!stack_released)` spins forever (a real -smp livelock,
+       * the m27-smoke wedge). Bailing when state!=READY drops the now-stale rq
+       * entry: the CAS below fails and the next real wake re-enqueues the task
+       * once it has genuinely switched out. */
       while (t != current_task &&
-             !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+             __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_READY &&
+             !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
+             !task_running_somewhere(t)) {
         __asm__ volatile("pause");
         tlb_shootdown_poll();
+      }
+      /* If the wait bailed with stack_released still 0 (the task is running on
+       * another CPU as its live cur_task, or it re-blocked), its saved context
+       * is NOT safe to load — drop this rq entry and try the next. The task is
+       * still found by the scan / re-enqueued by its next genuine wake. */
+      if (t != current_task &&
+          !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) {
+        continue;
       }
       /* F5 (M28 #7): atomic claim. CAS READY -> RUNNING so a concurrent
        * scan on another CPU can't pick the same task between our check and
@@ -348,20 +386,31 @@ static struct task *pick_next_task(void) {
      * kernel stack the other CPU is still saving to. Skip for our own task
      * (re-picked after a cross-CPU wake) — its stack is live here and the
      * publish only happens once we leave it; see the global-rq comment. */
+    /* Same READY guard as the global-rq path above — bail if the task
+     * re-blocked or was claimed elsewhere so we never spin forever on a
+     * stack_released that a never-context-switched task won't publish. */
     while (best_task != current_task &&
-           !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+           __atomic_load_n(&best_task->state, __ATOMIC_ACQUIRE) == TASK_READY &&
+           !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE) &&
+           !task_running_somewhere(best_task)) {
       __asm__ volatile("pause");
       tlb_shootdown_poll();
     }
-    /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
-     * the CAS, return 0 (no work this iteration) and let the caller retry;
-     * starting a fresh scan here can spin under contention without ever
-     * settling, so the cleaner shape is "treat as no-work and try again". */
-    enum task_state expected = TASK_READY;
-    if (__atomic_compare_exchange_n(&best_task->state, &expected,
-                                    TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
-                                    __ATOMIC_RELAXED)) {
-      return best_task;
+    /* If the wait bailed with stack_released still 0 (task running on another
+     * CPU or re-blocked), do not claim it — its context isn't safe to load.
+     * Treat as no-work; the next pick re-finds it once it has switched out. */
+    if (best_task == current_task ||
+        __atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE)) {
+      /* F5 (M28 #7): atomic claim — see global-rq comment above. If we lose
+       * the CAS, return 0 (no work this iteration) and let the caller retry;
+       * starting a fresh scan here can spin under contention without ever
+       * settling, so the cleaner shape is "treat as no-work and try again". */
+      enum task_state expected = TASK_READY;
+      if (__atomic_compare_exchange_n(&best_task->state, &expected,
+                                      TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
+                                      __ATOMIC_RELAXED)) {
+        return best_task;
+      }
     }
   }
 
@@ -425,6 +474,20 @@ static int scheduler_wake_blocked_parent(usize parent_id) {
     return 0;
   }
   return 0;
+}
+
+void scheduler_notify_wait_event(usize parent_id) {
+  if (scheduler_wake_blocked_parent(parent_id))
+    ipi_reschedule_all();
+}
+
+static void scheduler_waitpid_fast_return(void) {
+  current_task->state = TASK_RUNNING;
+  /* A child may have won BLOCKED -> READY and enqueued us while we were still
+   * scanning. If this waitpid iteration resolves without actually yielding,
+   * scrub that stale self-wakeup so the global runqueue doesn't accumulate
+   * duplicate entries across many fast child exits. */
+  sched_rq_remove_task(current_task);
 }
 
 static void kernel_thread_trampoline(void) {
@@ -733,7 +796,7 @@ int scheduler_fork_current(void) {
   }
 
   if (child->user_image) {
-    ((struct user_loaded_image *)child->user_image)->refcount++;
+    __atomic_fetch_add(&((struct user_loaded_image *)child->user_image)->refcount, 1, __ATOMIC_RELAXED);
   }
 
   // Clear inherited pending signals and sleep/block states
@@ -1020,7 +1083,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     child->heap_start = parent->heap_start;
     child->user_image = parent->user_image;
     if (child->user_image) {
-      ((struct user_loaded_image *)child->user_image)->refcount++;
+      __atomic_fetch_add(&((struct user_loaded_image *)child->user_image)->refcount, 1, __ATOMIC_RELAXED);
     }
   } else {
     /* Without CLONE_VM we'd need a full address-space clone like fork.
@@ -1168,6 +1231,29 @@ int scheduler_yield(void) {
       panic("dead task has nowhere to yield");
     }
 
+    /* Nothing else is runnable, so we never context-switch here: we just keep
+     * running. But a blocker set state=BLOCKED before calling us, and a waker
+     * on another CPU may already have CAS'd us BLOCKED->READY and enqueued us.
+     * If we return now leaving a non-RUNNING state, two things break:
+     *   1. our own stack_released stays 0 (no arch_context_switch ran), so a
+     *      picker that grabbed our stale rq entry spins on stack_released==1
+     *      forever — the -smp producer/consumer pipe livelock; and
+     *   2. timer-tick preemption is skipped for us (it only yields RUNNING
+     *      tasks), so we can monopolise the CPU with a stale state.
+     * Reclaim RUNNING. If a waker had promoted+enqueued us (state==READY),
+     * also scrub that now-stale runqueue entry; a concurrent waker that
+     * promotes us *after* this still leaves only a RUNNING entry, which
+     * pick_next_task drops via its READY guard. */
+    if (old_task != 0) {
+      enum task_state st = old_task->state;
+      if (st == TASK_READY) {
+        old_task->state = TASK_RUNNING;
+        sched_rq_remove_task(old_task);
+      } else if (st == TASK_BLOCKED || st == TASK_SLEEPING) {
+        old_task->state = TASK_RUNNING;
+      }
+    }
+
     interrupts_enable();
     return 0; /* nothing runnable — caller's idle loop may drop the BKL */
   }
@@ -1295,6 +1381,46 @@ void scheduler_block_on(void *chan) {
   current_task->stack_released = 0;
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
+  interrupts_enable();
+}
+
+/* SMP-safe condition wait, split into three steps so the caller can re-test its
+ * wait predicate AFTER the BLOCKED state is published. This closes the classic
+ * check-then-block lost-wakeup window: with plain scheduler_block_on, a
+ * scheduler_wake_all(chan) firing on another CPU between the caller's last
+ * predicate test and the block is lost, and the task sleeps forever (the
+ * loopback-TCP / dropbear-recv -smp wedge).
+ *
+ * Usage:
+ *     while (!ready()) {
+ *         scheduler_wait_prepare(chan);   // publish BLOCKED + full barrier
+ *         if (ready()) { scheduler_wait_cancel(); continue; }  // racing wake
+ *         scheduler_wait_commit();        // actually sleep
+ *     }
+ *
+ * The __ATOMIC_SEQ_CST store + fence order our BLOCKED publication ahead of the
+ * caller's re-test load, so a concurrent waker either (a) is observed by the
+ * re-test (it set the predicate before its wake_all's CAS, which is a full
+ * barrier) or (b) observes our BLOCKED state and wakes us. Interrupts stay
+ * disabled between prepare and commit/cancel. */
+void scheduler_wait_prepare(void *chan) {
+  interrupts_disable();
+  if (current_task == 0)
+    panic("scheduler_wait_prepare without running task");
+  current_task->wait_chan = chan;
+  current_task->stack_released = 0;
+  __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+void scheduler_wait_commit(void) {
+  scheduler_yield();
+  interrupts_enable();
+}
+
+void scheduler_wait_cancel(void) {
+  current_task->wait_chan = 0;
+  current_task->state = TASK_RUNNING;
   interrupts_enable();
 }
 
@@ -1461,17 +1587,12 @@ void scheduler_exit_current(int exit_code) {
   current_task->state = TASK_DEAD;
 
 
-  /* F6 (M28 #7): atomic CAS BLOCKED -> READY so concurrent waitpid paths on
-   * multiple CPUs can't double-promote and double-enqueue the parent. */
-  int woke_parent = scheduler_wake_blocked_parent(current_task->parent_id);
-
-
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
    * out of sti;hlt so it picks the parent immediately instead of waiting
    * for the next 10 ms LAPIC tick. Particularly important for the
    * test-driver init kthread on the BSP, which sits in sti;hlt during
    * userspace test runs. */
-  if (woke_parent) ipi_reschedule_all();
+  scheduler_notify_wait_event(current_task->parent_id);
 
   scheduler_yield();
   panic("dead task resumed");
@@ -1491,9 +1612,35 @@ int scheduler_waitpid(usize pid, int *status, int options) {
    * waitpid(-1, &status, WNOHANG); without the -1 case it matched no task and
    * the syscall's -1 return was mapped to EPERM by the libc. */
   int wait_any = (pid == 0 || pid == (usize)-1);
+  int may_block = ((options & B1NIX_WNOHANG) == 0);
 
   while (1) {
     interrupts_disable();
+    if (may_block) {
+      /* Same yield-returned-0 recovery as the other voluntary blockers. */
+      if (current_task->state == TASK_BLOCKED ||
+          current_task->state == TASK_SLEEPING) {
+        current_task->state = TASK_RUNNING;
+      }
+
+      /* Publish the blocked wait state before scanning children so an exiting
+       * child on another CPU cannot miss the wakeup between the scan and yield.
+       * Skip this for WNOHANG polling calls: they never sleep, so publishing
+       * BLOCKED would let child events enqueue a stale self-wakeup.
+       *
+       * The SEQ_CST store + fence are REQUIRED, not decorative: without the
+       * store-before-load barrier, x86 store buffering lets the child-scan loads
+       * below execute before our BLOCKED store is globally visible. A child
+       * exiting on another CPU would then store DEAD + CAS our state, read a
+       * stale RUNNING (CAS fails, no wake), while our scan reads the child as
+       * still-alive — the wakeup is lost and the parent sleeps forever (the
+       * -smp pipeline / waitpid wedge). The fence pairs with the full barrier in
+       * scheduler_wake_blocked_parent's CAS. */
+      current_task->stack_released = 0;
+      __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+
     int has_children = 0;
     for (usize i = 0; i < g_task_hwm; i++) {
       if (T(i)->state != TASK_UNUSED &&
@@ -1561,6 +1708,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               T(i)->name = 0;
             }
             kfree(T(i)->stack);
+            if (may_block)
+              scheduler_waitpid_fast_return();
             interrupts_enable();
             free_task_slot(T(i));
             if (status) {
@@ -1582,6 +1731,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               if (status)
                 *status = ((T(i)->last_stop_signal & 0xFF) << 8) | 0x7F;
               T(i)->stop_report_pending = 0;
+              if (may_block)
+                scheduler_waitpid_fast_return();
               interrupts_enable();
               return child_id;
             }
@@ -1590,6 +1741,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
               if (status)
                 *status = 0xFFFF;
               T(i)->continued_report_pending = 0;
+              if (may_block)
+                scheduler_waitpid_fast_return();
               interrupts_enable();
               return child_id;
             }
@@ -1599,16 +1752,19 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     }
 
     if (!has_children) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
       interrupts_enable();
       return -ECHILD;
     }
 
     if (options & B1NIX_WNOHANG) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
       interrupts_enable();
       return 0;
     }
 
-    current_task->state = TASK_BLOCKED;
     scheduler_yield();
     interrupts_enable();
   }
@@ -1915,21 +2071,17 @@ int scheduler_kill(usize task_id, int sig) {
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
-        for (usize j = 0; j < g_task_hwm; j++) {
-          if (T(j)->id == T(i)->parent_id && T(j)->state == TASK_BLOCKED) {
-            T(j)->state = TASK_READY;
-            sched_rq_enqueue_current(T(j));
-            break;
-          }
-        }
         interrupts_enable();
-        ipi_reschedule_all();
+        scheduler_notify_wait_event(T(i)->parent_id);
         return 0;
       }
 
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
+        interrupts_enable();
+        scheduler_notify_wait_event(T(i)->parent_id);
+        interrupts_disable();
       }
       if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
         T(i)->state = TASK_READY;
@@ -1954,9 +2106,27 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
 
+      if (T(i) != current_task &&
+          (sig == SIGSTOP || sig == SIGTSTP ||
+           sig == SIGTTIN || sig == SIGTTOU)) {
+        __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
+                           __ATOMIC_RELAXED);
+        T(i)->last_stop_signal = sig;
+        T(i)->stop_report_pending = 1;
+        T(i)->state = TASK_STOPPED;
+        interrupts_enable();
+        scheduler_notify_wait_event(T(i)->parent_id);
+        interrupts_disable();
+        sent++;
+        continue;
+      }
+
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
+        interrupts_enable();
+        scheduler_notify_wait_event(T(i)->parent_id);
+        interrupts_disable();
       }
       if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
         T(i)->state = TASK_READY;
@@ -2252,8 +2422,7 @@ void scheduler_deliver_pending_signals(void) {
       /* See scheduler_exit_current — claim stack_released before DEAD. */
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
-      if (scheduler_wake_blocked_parent(current_task->parent_id))
-        ipi_reschedule_all();
+      scheduler_notify_wait_event(current_task->parent_id);
       return;
       /* unreachable */
     }
@@ -2288,8 +2457,7 @@ void scheduler_deliver_pending_signals(void) {
         /* See scheduler_exit_current — claim stack_released before DEAD. */
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
-        if (scheduler_wake_blocked_parent(current_task->parent_id))
-          ipi_reschedule_all();
+        scheduler_notify_wait_event(current_task->parent_id);
         return;
         /* unreachable */
       case SIGCONT:
@@ -2298,6 +2466,7 @@ void scheduler_deliver_pending_signals(void) {
         if (current_task->state == TASK_STOPPED) {
           current_task->state = TASK_READY;
           current_task->continued_report_pending = 1;
+          scheduler_notify_wait_event(current_task->parent_id);
         }
         continue;
       case SIGSTOP:
@@ -2309,6 +2478,7 @@ void scheduler_deliver_pending_signals(void) {
         current_task->stop_report_pending = 1;
         __atomic_fetch_and(&current_task->pending_signals,
                            ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+        scheduler_notify_wait_event(current_task->parent_id);
         continue;
       case SIGCHLD:
       case SIGURG:

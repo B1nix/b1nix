@@ -20,6 +20,7 @@
  *    pids seen over a boot), which avoids freeing a node a reader still holds.
  */
 
+#include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
@@ -237,6 +238,16 @@ static int r_filesystems(usize pid, struct sbuf *s) {
   return 0;
 }
 
+static int r_cmdline(usize pid, struct sbuf *s) {
+  (void)pid;
+  const char *cmd = bootinfo_cmdline();
+  if (cmd) {
+    sb_puts(s, cmd);
+    sb_puts(s, "\n");
+  }
+  return 0;
+}
+
 /* ── per-process files ── */
 static const char *state_long(const char *abbr) {
   switch (abbr[0]) {
@@ -380,6 +391,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "cpuinfo", VFS_DEVICE, r_cpuinfo, 0);
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
+  procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
 
   /* /proc/self — per-process view of the *calling* task (pid resolved at read
    * time via pid_from_parent → scheduler_get_pid). */

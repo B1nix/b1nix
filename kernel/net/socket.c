@@ -106,7 +106,13 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     while (s->udp_q_count == 0) {
       if (h->flags & B1NIX_O_NONBLOCK)
         return -EAGAIN;
-      scheduler_block_on(s);
+      /* SMP-safe wait — see the TCP recv path below. */
+      scheduler_wait_prepare(s);
+      if (s->udp_q_count != 0) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
 
     u8 slot = s->udp_q_head;
@@ -132,7 +138,14 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
       if (h->flags & B1NIX_O_NONBLOCK) {
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait: publish BLOCKED, then re-test so a wake_all(vfs_poll_chan)
+       * racing in from tcp_input on another CPU can't be lost. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      if (tcp_is_readable(conn)) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     return tcp_recv(conn, buf, len, flags);
   }
@@ -390,7 +403,16 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
         vfs_handle_release(new_vh);
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait: publish BLOCKED, then re-poll tcp_accept so a connection
+       * that lands (and its wake_all(vfs_poll_chan)) between the test and the
+       * block isn't lost. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      conn = tcp_accept(local_port, &client_ip, &client_port);
+      if (conn) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;
@@ -417,7 +439,14 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
         vfs_handle_release(new_vh);
         return -EAGAIN;
       }
-      scheduler_block_on(vfs_poll_chan);
+      /* SMP-safe wait — see the IPv4 accept path above. */
+      scheduler_wait_prepare(vfs_poll_chan);
+      conn = tcp_accept6(local_port, &client_ip6, &client_port);
+      if (conn) {
+        scheduler_wait_cancel();
+        break;
+      }
+      scheduler_wait_commit();
     }
     new_s->tcp_conn = conn;
     new_s->connected = 1;

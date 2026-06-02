@@ -477,8 +477,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     /* Walk DT_RELA. */
     if (rela_off && rela_sz) {
       usize nrela = rela_sz / sizeof(struct elf64_rela);
-      struct elf64_rela *rela_arr = (struct elf64_rela *)0;
-      /* Find rela_arr in the file. The DT_RELA address is a PIE vaddr;
+      /* The DT_RELA address is a PIE vaddr;
        * convert it to a staging-buffer pointer. We use a small helper. */
       for (usize r = 0; r < nrela; r++) {
         /* Read the rela entry out of the staging buffer (kernel-mapped
@@ -571,10 +570,14 @@ void user_image_free(struct user_loaded_image *image) {
   if (!image)
     return;
 
-  if (image->refcount > 1) {
-    image->refcount--;
+  /* Atomic dec-and-test: a fork'd process shares its parent's user_image
+   * (the read-only ELF), so under -smp two cores exiting tasks that share one
+   * image race here. A non-atomic `if (refcount > 1) refcount--` lets both read
+   * the same value and either double-free the image or free it while the other
+   * core still references it — the heap/page-table corruption seen in the
+   * fork-heavy M33 shell tests. Only the core that drops the count to 0 frees. */
+  if (__atomic_sub_fetch(&image->refcount, 1, __ATOMIC_ACQ_REL) > 0)
     return;
-  }
 
   if (image->path)
     kfree((void *)image->path);
