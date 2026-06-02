@@ -50,7 +50,13 @@ struct tcp_pseudo {
   u16 tcp_length;
 } __attribute__((packed));
 
-#define MAX_TCP_CONNS 16
+/* 32, not 16: b1nix now runs a fork-per-connection SSH daemon. A single SSH
+ * session occupies several slots at once (client conn + server listener +
+ * accepted child conn), and a SIGKILLed client/server leaves connections that
+ * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
+ * plus the white-box kernel TCP tests that run right after would otherwise
+ * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
+#define MAX_TCP_CONNS 32
 #define TCP_RECV_BUF_SIZE 4096
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
@@ -427,6 +433,19 @@ int tcp_is_readable(struct tcp_conn *conn) {
   }
   return 0;
 }
+
+int tcp_is_close_wait(struct tcp_conn *conn) {
+  if (!conn || !conn->used)
+    return 0;
+  return conn->state == TCP_CLOSE_WAIT;
+}
+
+int tcp_is_closed(struct tcp_conn *conn) {
+  if (!conn || !conn->used)
+    return 1;
+  return conn->state != TCP_ESTABLISHED && conn->state != TCP_CLOSE_WAIT;
+}
+
 
 /* ── TCP Listen ── */
 int tcp_listen(u16 local_port, int backlog) {

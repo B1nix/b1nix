@@ -2197,7 +2197,9 @@ int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
     pfd->revents = B1NIX_POLLNVAL;
     return -1;
   }
-  return h->ops->poll(h, pfd);
+  int res = h->ops->poll(h, pfd);
+  pfd->revents &= (pfd->events | B1NIX_POLLERR | B1NIX_POLLHUP | B1NIX_POLLNVAL);
+  return res;
 }
 
 void vfs_close(int fd) {

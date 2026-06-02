@@ -2232,17 +2232,30 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     int hits = 0;
     for (int i = 0; i < np; i++) {
       int fd = pfds[i].fd;
+      int r_set = 0, w_set = 0;
       if (pfds[i].revents & B1NIX_POLLIN) {
         r_kout[fd / 8] |= (u8)(1 << (fd & 7));
+        r_set = 1;
         hits++;
       }
       if (pfds[i].revents & B1NIX_POLLOUT) {
         w_kout[fd / 8] |= (u8)(1 << (fd & 7));
+        w_set = 1;
         hits++;
       }
       if (pfds[i].revents & (B1NIX_POLLERR | B1NIX_POLLHUP | B1NIX_POLLNVAL)) {
-        e_kout[fd / 8] |= (u8)(1 << (fd & 7));
-        hits++;
+        if (!r_set && ((r_kset[fd / 8] >> (fd & 7)) & 1)) {
+          r_kout[fd / 8] |= (u8)(1 << (fd & 7));
+          hits++;
+        }
+        if (!w_set && ((w_kset[fd / 8] >> (fd & 7)) & 1)) {
+          w_kout[fd / 8] |= (u8)(1 << (fd & 7));
+          hits++;
+        }
+        if ((e_kset[fd / 8] >> (fd & 7)) & 1) {
+          e_kout[fd / 8] |= (u8)(1 << (fd & 7));
+          hits++;
+        }
       }
     }
     if (arg1 && syscall_copyout((void *)(usize)arg1, r_kout, 128) < 0)

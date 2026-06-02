@@ -182,10 +182,13 @@ static int pty_master_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
-static int pty_master_close(struct vfs_handle *h) {
+/* Teardown (and the controlling-terminal SIGHUP hangup) runs ONLY from
+ * ->release at refcount 0, never from a per-fd ->close — so a master shared
+ * across dup2/fork hangs up only when its LAST fd is closed, not the first. */
+static void pty_master_release(struct vfs_handle *h) {
   struct pty *p = (struct pty *)h->private_data;
   if (!p)
-    return 0;
+    return;
   p->master_open = 0;
   /* Hangup: signal the foreground group, then wake blocked slave readers so
    * they observe EOF. */
@@ -197,10 +200,7 @@ static int pty_master_close(struct vfs_handle *h) {
     memset(p, 0, sizeof(*p));
   }
   h->private_data = 0;
-  return 0;
 }
-
-static void pty_master_release(struct vfs_handle *h) { pty_master_close(h); }
 
 /* ── slave file ops ── */
 static isize pty_slave_read(struct vfs_handle *h, char *buf, usize size) {
@@ -253,10 +253,15 @@ static int pty_slave_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
-static int pty_slave_close(struct vfs_handle *h) {
+/* Teardown runs ONLY from ->release (at refcount 0), never from a per-fd
+ * ->close: a slave fd shared across dup2/fork (e.g. login_tty dups the slave to
+ * 0/1/2 then closes the original) must not be torn down while other fds still
+ * reference it. A premature teardown nulls private_data and every later ioctl/
+ * read on the shared handle fails (tcgetattr -> EINVAL). Same fix as sockets. */
+static void pty_slave_release(struct vfs_handle *h) {
   struct pty *p = (struct pty *)h->private_data;
   if (!p)
-    return 0;
+    return;
   p->slave_open = 0;
   scheduler_wake_all(&p->out_count); /* master readers observe EOF */
   scheduler_wake_all(vfs_poll_chan);
@@ -264,10 +269,7 @@ static int pty_slave_close(struct vfs_handle *h) {
     memset(p, 0, sizeof(*p));
   }
   h->private_data = 0;
-  return 0;
 }
-
-static void pty_slave_release(struct vfs_handle *h) { pty_slave_close(h); }
 
 /* ── shared ioctl (master + slave) ── */
 static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
@@ -332,7 +334,6 @@ static const struct vfs_file_ops pty_master_ops = {
   .read = pty_master_read,
   .write = pty_master_write,
   .poll = pty_master_poll,
-  .close = pty_master_close,
   .release = pty_master_release,
   .ioctl = pty_ioctl,
 };
@@ -341,7 +342,6 @@ static const struct vfs_file_ops pty_slave_ops = {
   .read = pty_slave_read,
   .write = pty_slave_write,
   .poll = pty_slave_poll,
-  .close = pty_slave_close,
   .release = pty_slave_release,
   .ioctl = pty_ioctl,
 };

@@ -126,6 +126,8 @@ struct tcp_conn *tcp_connect(struct ipv4_addr dst_ip, u16 dst_port);
 struct tcp_conn *tcp_connect_async(struct ipv4_addr dst_ip, u16 dst_port);
 int tcp_is_established(struct tcp_conn *conn);
 int tcp_is_readable(struct tcp_conn *conn);
+int tcp_is_close_wait(struct tcp_conn *conn);
+int tcp_is_closed(struct tcp_conn *conn);
 int tcp_send(struct tcp_conn *conn, const void *data, usize len);
 int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);

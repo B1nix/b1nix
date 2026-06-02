@@ -1587,16 +1587,16 @@ static int test_dropbear_keygen(void) {
   return 0;
 }
 
-/* M32b: end-to-end localhost SSH — generate a host key, start dropbear bound to
- * loopback, then connect with dbclient using password auth (verified against
- * /etc/shadow) and run a single remote command. Exercises TCP loopback, the
- * full SSH KEX + chacha20-poly1305, server fork-per-connection, password auth,
- * and remote command exec. */
-static int test_ssh_handshake(void) {
-  syscall(SYS_MKDIR, (long)"/etc/ssh", 0700, 0, 0, 0);
-  unlink("/etc/ssh/hk_ed25519");
+/* ── M32b SSH helpers (shared by the positive, negative-auth, and PTY tests) ──
+ *
+ * One dropbear server (fork-per-connection) serves every sub-test, so the
+ * accept→fork→serve path is exercised repeatedly on a single instance. */
 
-  /* 1) host key */
+/* Generate the persistent Ed25519 host key once if it is not already present. */
+static int ssh_ensure_hostkey(void) {
+  syscall(SYS_MKDIR, (long)"/etc/ssh", 0700, 0, 0, 0);
+  int fd = open("/etc/ssh/hk_ed25519", O_RDONLY);
+  if (fd >= 0) { close(fd); return 0; }
   int kp = fork();
   if (kp == 0) {
     char *av[] = {"/bin/dropbearkey", "-t", "ed25519", "-f",
@@ -1607,23 +1607,54 @@ static int test_ssh_handshake(void) {
   }
   int st = 0;
   waitpid(kp, &st, 0);
-  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-    emit("M32B-SSH: FAIL handshake-hostkey\n");
-    return -1;
-  }
+  return (WIFEXITED(st) && WEXITSTATUS(st) == 0) ? 0 : -1;
+}
 
-  /* 2) server on 127.0.0.1:2222, foreground */
+/* Fork a foreground dropbear bound to a loopback port; returns the server pid. */
+static int ssh_start_server(const char *portspec) {
   int srv = fork();
   if (srv == 0) {
     char *av[] = {"/bin/dropbear", "-r", "/etc/ssh/hk_ed25519",
-                  "-p", "127.0.0.1:2222", "-F", 0};
+                  "-p", (char *)portspec, "-F", 0};
     char *ev[] = {0};
     execve("/bin/dropbear", av, ev);
     _exit(127);
   }
   sleep(3); /* let the server load the key and bind */
+  return srv;
+}
 
-  /* 3) client: password auth + run a remote command, output to a file */
+/* Reap a client without ever blocking the suite. The loopback handshake is
+ * paced by net_task (one tick per round trip), so poll WNOHANG with a real
+ * sleep between checks, give up after ~20s, and SIGKILL a stuck client.
+ * Returns 1 if the client exited on its own, 0 if it had to be killed. */
+static int ssh_reap_client(int cli, int *status) {
+  for (int i = 0; i < 20; i++) {
+    int r = (int)syscall(SYS_WAITPID, cli, (long)status, WNOHANG, 0, 0);
+    if (r == cli) return 1;
+    if (r < 0) return 0;
+    sleep(1);
+  }
+  syscall(SYS_KILL, cli, SIGKILL, 0, 0, 0);
+  return 0;
+}
+
+/* Bounded teardown: SIGTERM+SIGKILL then WNOHANG-reap so a listener parked in a
+ * blocking accept() can never hang the suite (worst case leaks one task). */
+static void ssh_kill_server(int srv) {
+  syscall(SYS_KILL, srv, SIGTERM, 0, 0, 0);
+  syscall(SYS_KILL, srv, SIGKILL, 0, 0, 0);
+  for (int i = 0; i < 200; i++) {
+    int r = (int)syscall(SYS_WAITPID, srv, 0, WNOHANG, 0, 0);
+    if (r == srv || r < 0)
+      break;
+    syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+  }
+}
+
+/* Positive path: full KEX + chacha20-poly1305 + password auth (verified against
+ * /etc/shadow) + a single remote command, captured to a file. */
+static int ssh_test_login(void) {
   unlink("/tmp/ssh_out");
   int cli = fork();
   if (cli == 0) {
@@ -1635,49 +1666,140 @@ static int test_ssh_handshake(void) {
     execve("/bin/dbclient", av, ev);
     _exit(127);
   }
-  /* Reap the client without blocking forever. The loopback SSH handshake is
-   * paced by net_task (one tick of latency per round trip), so poll with a
-   * real sleep between checks — that yields the many ticks the KEX/auth/exec
-   * exchange needs — and give up after ~20s so a stuck client can never hang
-   * the whole smoke suite. */
   int cst = 0;
-  int cli_done = 0;
-  for (int i = 0; i < 20; i++) {
-    int r = (int)syscall(SYS_WAITPID, cli, (long)&cst, WNOHANG, 0, 0);
-    if (r == cli) { cli_done = 1; break; }
-    if (r < 0) break;
-    sleep(1);
-  }
-  if (!cli_done)
-    syscall(SYS_KILL, cli, SIGKILL, 0, 0, 0);
-
-  /* 4) tear the server down. The listener may be parked in a blocking accept();
-   * send SIGTERM then SIGKILL and reap without ever blocking — a bounded
-   * WNOHANG loop so a server that refuses to die can never hang the whole
-   * smoke suite (the worst case leaks one reparented task, not a deadlock). */
-  syscall(SYS_KILL, srv, SIGTERM, 0, 0, 0);
-  syscall(SYS_KILL, srv, SIGKILL, 0, 0, 0);
-  for (int i = 0; i < 200; i++) {
-    int r = (int)syscall(SYS_WAITPID, srv, 0, WNOHANG, 0, 0);
-    if (r == srv || r < 0)
-      break;
-    syscall(SYS_YIELD, 0, 0, 0, 0, 0);
-  }
-
+  int done = ssh_reap_client(cli, &cst);
   char buf[256];
   int fd = open("/tmp/ssh_out", O_RDONLY);
   int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
   if (fd >= 0) close(fd);
   buf[n > 0 ? n : 0] = '\0';
+  /* Pass on the captured remote-command output: the client may not self-exit
+   * within the poll window (loopback connection-close pacing), but a correct
+   * marker in the file proves KEX + auth + remote exec all succeeded. */
   if (!strstr(buf, "M32B-SSH-LOGIN-OK")) {
     char dbg[320];
     snprintf(dbg, sizeof(dbg),
-             "M32B-SSH: dbg handshake cli=0x%x out=[%s]\n", cst, buf);
+             "M32B-SSH: dbg handshake done=%d cli=0x%x out=[%s]\n",
+             done, cst, buf);
     emit(dbg);
     emit("M32B-SSH: FAIL handshake\n");
     return -1;
   }
   emit("M32B-SSH: ok handshake\n");
+  return 0;
+}
+
+/* Negative auth: a WRONG password must be rejected by the daemon — the remote
+ * command must never run, and the client must terminate rather than hang. The
+ * client cannot fall back to an interactive prompt here: DROPBEAR_PASSWORD is
+ * reused on every attempt, so the server disconnects after its auth-try limit
+ * (and stdin is /dev/null as a belt-and-suspenders against any tty fallback). */
+static int ssh_test_negauth(void) {
+  unlink("/tmp/ssh_neg");
+  int cli = fork();
+  if (cli == 0) {
+    int z = open("/dev/null", O_RDONLY);
+    if (z >= 0) { dup2(z, 0); if (z > 2) close(z); }
+    int o = open("/tmp/ssh_neg", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (o >= 0) { dup2(o, 1); dup2(o, 2); if (o > 2) close(o); }
+    char *av[] = {"/bin/dbclient", "-y", "-y", "-p", "2222",
+                  "root@127.0.0.1", "echo", "SHOULD-NOT-RUN", 0};
+    char *ev[] = {"DROPBEAR_PASSWORD=wrongpw", 0};
+    execve("/bin/dbclient", av, ev);
+    _exit(127);
+  }
+  int cst = 0;
+  int done = ssh_reap_client(cli, &cst);
+  char buf[256];
+  int fd = open("/tmp/ssh_neg", O_RDONLY);
+  int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+  if (fd >= 0) close(fd);
+  buf[n > 0 ? n : 0] = '\0';
+  if (!done) {
+    emit("M32B-SSH: FAIL negauth-hung\n");
+    return -1;
+  }
+  if (strstr(buf, "SHOULD-NOT-RUN")) {
+    /* the daemon accepted a wrong password and ran the command — a real bug */
+    emit("M32B-SSH: FAIL negauth-accepted\n");
+    return -1;
+  }
+  emit("M32B-SSH: ok negauth\n");
+  return 0;
+}
+
+/* Command over a remote PTY. `dbclient -t <cmd>` forces a remote pseudo-terminal
+ * AND runs a command on it (like `ssh -t host cmd`): the daemon allocates a pty,
+ * spawns the login shell (/bin/sh) on the slave, and runs the command there.
+ * This exercises the sshd pty path + login shell + command exec. dbclient also
+ * requires its OWN stdin to be a tty (it puts the local terminal in raw mode),
+ * so we give the client a local pty slave via login_tty. The command writes a
+ * marker FILE — checked over the shared VFS, not the pty output, so the remote
+ * pty ECHO of the command line can't cause a false pass. */
+static int ssh_test_pty(void) {
+  unlink("/tmp/ptyresult");
+  int master, slave;
+  char ptyname[64];
+  if (openpty(&master, &slave, ptyname, NULL, NULL) != 0) {
+    emit("M32B-SSH: FAIL pty-openpty\n");
+    return -1;
+  }
+  int cli = fork();
+  if (cli == 0) {
+    close(master);
+    login_tty(slave); /* setsid + controlling tty + slave -> stdin/out/err */
+    char *av[] = {"/bin/dbclient", "-y", "-y", "-t", "-p", "2222",
+                  "root@127.0.0.1",
+                  "echo M32B-SSH-PTY-OK > /tmp/ptyresult", 0};
+    char *ev[] = {"DROPBEAR_PASSWORD=root", "TERM=vt100", 0};
+    execve("/bin/dbclient", av, ev);
+    _exit(127);
+  }
+  close(slave);
+  int cst = 0;
+  int done = ssh_reap_client(cli, &cst);
+  /* Drain anything the remote pty echoed back so a full master buffer can't
+   * wedge the remote side mid-teardown (and so we can surface it on failure). */
+  char drain[256];
+  int dn = (int)read(master, drain, sizeof(drain) - 1);
+  drain[dn > 0 ? dn : 0] = '\0';
+  for (int i = 0; drain[i]; i++)
+    if (drain[i] == '\n' || drain[i] == '\r') drain[i] = '|';
+  close(master);
+
+  char buf[128];
+  int fd = open("/tmp/ptyresult", O_RDONLY);
+  int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+  if (fd >= 0) close(fd);
+  buf[n > 0 ? n : 0] = '\0';
+  if (!strstr(buf, "M32B-SSH-PTY-OK")) {
+    char dbg[400];
+    snprintf(dbg, sizeof(dbg),
+             "M32B-SSH: dbg pty done=%d cli=0x%x result=[%s] pty=[%s]\n",
+             done, cst, buf, drain);
+    emit(dbg);
+    emit("M32B-SSH: FAIL pty\n");
+    return -1;
+  }
+  emit("M32B-SSH: ok pty\n");
+  return 0;
+}
+
+/* M32b: end-to-end localhost SSH against one dropbear instance — exercises TCP
+ * loopback, the full SSH KEX + chacha20-poly1305, server fork-per-connection,
+ * and three login paths: a positive password login running a remote command, a
+ * negative wrong-password rejection, and an interactive shell over a remote
+ * PTY. Each sub-test emits its own M32B-SSH ok/FAIL marker (non-fatal). */
+static int test_ssh_handshake(void) {
+  if (ssh_ensure_hostkey() != 0) {
+    emit("M32B-SSH: FAIL handshake-hostkey\n");
+    return -1;
+  }
+  int srv = ssh_start_server("127.0.0.1:2222");
+  ssh_test_login();
+  ssh_test_negauth();
+  ssh_test_pty();
+  ssh_kill_server(srv);
   return 0;
 }
 

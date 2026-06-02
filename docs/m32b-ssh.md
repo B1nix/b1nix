@@ -114,15 +114,59 @@ real kernel bugs that also harden the whole networking stack:
 With both fixes the localhost SSH exchange now runs the full key exchange:
 banner exchange, KEXINIT algorithm negotiation (ssh-ed25519 host key,
 chacha20-poly1305 cipher), and the curve25519 ECDH packet exchange in both
-directions all complete and deliver in order. **Open:** the client receives the
-server's `KEX_ECDH_REPLY` but does not yet run `recv_msg_kexdh_reply` to
-finish KEX → NEWKEYS → password auth → remote command. The `M32B-SSH-LOGIN-OK`
-end-to-end marker is therefore not yet emitted; the smoke test is **non-fatal**
-(it logs `M32B-SSH: FAIL handshake` like `test_external_net`) so a regression in
-the daemon cannot mask the rest of the M32-NET suite. `dropbearkey` host-key
-generation and the crypto baseline (item 2) are green.
+directions all complete and deliver in order.
+
+**UPDATE (2026-06-02):** The loopback SSH handshake hang/failure has been resolved. The client (`dbclient`) successfully receives `KEX_ECDH_REPLY`, runs `recv_msg_kexdh_reply` to finish KEX, sends `NEWKEYS`, performs password authentication (verifying against `/etc/shadow`), and runs the remote command (`echo M32B-SSH-LOGIN-OK`), which outputs to the client and prints `M32B-SSH: ok handshake`. This was resolved by fixing `SYS_SELECT` FD mapping and updating `socket_poll` to return `B1NIX_POLLHUP` and control `B1NIX_POLLOUT` based on connection state transitions (e.g. `TCP_CLOSE_WAIT`), avoiding select-loop starvation on single-CPU. `dropbearkey` host-key generation and the crypto baseline are green.
 
 Auth groundwork landed alongside: libc `getpwnam`/`getpwuid` now substitutes the
 real `/etc/shadow` hash when `/etc/passwd` records the `x` marker
 (`userspace/libc/pwd.c`), and a POSIX `getpass()` was added — both prerequisites
 for dropbear's `/etc/shadow` password auth (item 7).
+
+## Status — item-9 negative-auth and interactive-PTY coverage (2026-06-02)
+
+The localhost smoke now drives **three** logins against one dropbear instance
+(fork-per-connection), each emitting its own `M32B-SSH` marker:
+
+1. `ok handshake` — positive password login + a remote command (the path above).
+2. `ok negauth` — a **wrong** password is rejected by the daemon: it retries to
+   the server's auth-try limit, the server disconnects, the client exits, and
+   the remote command never runs (verified: the `SHOULD-NOT-RUN` marker is
+   absent from the captured output).
+3. `ok pty` — an **interactive shell over a remote PTY**: `dbclient -t` forces a
+   remote pseudo-terminal, so sshd allocates a pty and spawns the login shell
+   (`/bin/sh`) on the slave; the shell runs a command that writes a marker file,
+   checked over the shared VFS (not stdout, so the pty ECHO of the typed line
+   cannot cause a false pass). dbclient also needs its *own* stdin to be a tty
+   (it sets the local terminal raw), so the test hands it a local pty slave via
+   `login_tty`.
+
+Bringing up the PTY path surfaced and fixed a **third real kernel bug** of the
+same class as the earlier socket/loopback fixes: `kernel/dev/pty.c` did its pty
+teardown (which nulls `private_data`) from a per-fd `.close` op, and `vfs_close`
+invokes `.close` on *every* descriptor close. `login_tty` dups the slave onto
+fd 0/1/2 and then closes the original slave fd — that close tore down the shared
+pty, so the next `tcgetattr` saw `private_data == NULL` and returned `EINVAL`,
+and dbclient aborted with "Failed to set raw TTY mode" before it ever sent the
+command. Fix: teardown (and the master-close `SIGHUP` hangup) now runs **only**
+from the refcount-zero `.release` op; `.close` was removed from both pty op
+tables. The in-process PTY tests (`M32B-PTY: ok …`, including `hangup`) still
+pass.
+
+`MAX_TCP_CONNS` was also raised 16 → 32 (`kernel/net/tcp.c`): three back-to-back
+SSH logins plus a SIGKILLed client leave several connections occupying the conn
+table (some stuck, some in TIME_WAIT), and the white-box kernel TCP tests that
+run immediately afterwards could no longer allocate a connection (`tcp_accept`
+returning NULL). b1nix now runs a fork-per-connection SSH daemon, so a larger
+table is warranted.
+
+**Single-CPU: all green** — `handshake` + `negauth` + `pty` + the kernel TCP
+`window-throttle` test all pass and the suite reaches `B1NIX-TEST: done`.
+
+**SMP caveat (pre-existing).** Under `-smp 4` the full suite hangs
+intermittently (no `B1NIX-TEST: done`; the stall point varies — loopback TCP,
+the M11 pipe tests, …). This is **not** introduced by the SSH work: stashing all
+in-progress changes and running the committed branch tip under `-smp 4` hangs on
+roughly one run in three as well, so a latent race lives in the committed
+loopback-deferral / `net_task` path. The extra loopback traffic from three SSH
+logins simply raises the hit rate. Tracked separately from the SSH items.

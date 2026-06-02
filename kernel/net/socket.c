@@ -162,13 +162,21 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
         tcp_is_established((struct tcp_conn *)s->tcp_conn)) {
       s->connected = 1;
     }
-    /* Simple poll for TCP */
     if (s->connected) {
       struct tcp_conn *conn = (struct tcp_conn *)s->tcp_conn;
-      if (conn && tcp_is_readable(conn)) {
-        pfd->revents |= B1NIX_POLLIN;
+      if (conn) {
+        if (tcp_is_readable(conn)) {
+          pfd->revents |= B1NIX_POLLIN;
+        }
+        if (tcp_is_established(conn)) {
+          pfd->revents |= B1NIX_POLLOUT;
+        } else if (tcp_is_close_wait(conn)) {
+          pfd->revents |= B1NIX_POLLOUT;
+          pfd->revents |= B1NIX_POLLHUP;
+        } else {
+          pfd->revents |= B1NIX_POLLHUP;
+        }
       }
-      pfd->revents |= B1NIX_POLLOUT;
     } else if (s->listening) {
       u16 port = ntoh16(s->local.in.sin_port);
       if (tcp_pending_connections(port)) {
