@@ -33,6 +33,7 @@ int chown(const char *path, uid_t owner, gid_t group);
 int fchown(int fd, uid_t owner, gid_t group);
 char *ttyname(int fd);
 int ttyname_r(int fd, char *buf, size_t buflen);
+char *getpass(const char *prompt);
 int close(int fd);
 void _exit(int status) __attribute__((noreturn));
 int sleep(unsigned int seconds);

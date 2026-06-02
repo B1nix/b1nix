@@ -396,6 +396,8 @@ static const struct initramfs_file files[] = {
      * basename, so the same image is registered under each name. */
     {"/bin/dropbear", (const char *)vfs_dropbear_elf, sizeof(vfs_dropbear_elf),
      INITRAMFS_EXECUTABLE},
+    {"/bin/dbclient", (const char *)vfs_dropbear_elf,
+     sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/dropbearkey", (const char *)vfs_dropbear_elf,
      sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/dropbearconvert", (const char *)vfs_dropbear_elf,

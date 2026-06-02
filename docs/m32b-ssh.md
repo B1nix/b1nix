@@ -84,3 +84,45 @@ Dropbear is configured for the b1nix environment via `localoptions.h`:
    run one command, interactive shell over pty, negative auth cases.
 
 See [`docs/roadmap.md`](roadmap.md) M32b for live status.
+
+## Status — loopback handshake (2026-06-02)
+
+Bringing up the end-to-end loopback handshake (item 9) surfaced and fixed two
+real kernel bugs that also harden the whole networking stack:
+
+1. **Sockets shared across `fork()` were torn down by a sibling's `close()`.**
+   `vfs_close()` invoked the socket's `->close` op (TCP FIN + free of the shared
+   `vfs_socket_state`) on *every* fd close, ignoring the handle refcount. A
+   dropbear `accept()`+`fork()` server, where the parent `close()`s its copy of
+   the connection fd while the child keeps serving, therefore FIN'd the peer
+   mid-handshake (client saw "Remote closed") and freed the state out from under
+   the child (later `getsockname`/`getpeername` returned garbage). Fix: the
+   teardown moved to the `->release` op, which only runs when the refcount
+   reaches zero (`kernel/net/socket.c`). The accepted socket also now copies the
+   listener's bound address into its `local` so `getsockname()` on the
+   connection returns a valid family.
+
+2. **Loopback TCP delivered synchronously, re-entering the TCP state machine.**
+   `ipv4_send()` for a `127.0.0.0/8` destination called `ipv4_receive()` inline,
+   so `tcp_send → ipv4_send → ipv4_receive → tcp_input → tcp_send → …` recursed
+   within a single send and corrupted/wedged multi-packet exchanges. Fix:
+   loopback datagrams are now enqueued (`net_loopback_enqueue`) and drained in a
+   clean context by `net_poll()`/`net_task` (`kernel/net/net.c`, `ipv4.c`,
+   `net.h`). This made every loopback TCP smoke test pass (tcp-echo, http-get,
+   wget-loopback, …) and removed a suite hang.
+
+With both fixes the localhost SSH exchange now runs the full key exchange:
+banner exchange, KEXINIT algorithm negotiation (ssh-ed25519 host key,
+chacha20-poly1305 cipher), and the curve25519 ECDH packet exchange in both
+directions all complete and deliver in order. **Open:** the client receives the
+server's `KEX_ECDH_REPLY` but does not yet run `recv_msg_kexdh_reply` to
+finish KEX → NEWKEYS → password auth → remote command. The `M32B-SSH-LOGIN-OK`
+end-to-end marker is therefore not yet emitted; the smoke test is **non-fatal**
+(it logs `M32B-SSH: FAIL handshake` like `test_external_net`) so a regression in
+the daemon cannot mask the rest of the M32-NET suite. `dropbearkey` host-key
+generation and the crypto baseline (item 2) are green.
+
+Auth groundwork landed alongside: libc `getpwnam`/`getpwuid` now substitutes the
+real `/etc/shadow` hash when `/etc/passwd` records the `x` marker
+(`userspace/libc/pwd.c`), and a POSIX `getpass()` was added — both prerequisites
+for dropbear's `/etc/shadow` password auth (item 7).

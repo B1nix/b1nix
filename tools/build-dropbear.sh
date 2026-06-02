@@ -70,6 +70,11 @@ find "$SRC_DIR" -exec touch {} +
 
 make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 
+# Configure only once: re-running configure regenerates config.h and has shown
+# non-deterministic getpass detection (HAVE_GETPASS flipping), which then leaves
+# stale objects referencing a non-existent rpl_getpass. Locking the first good
+# config.h makes incremental rebuilds reproducible.
+if [ ! -f "$SRC_DIR/config.h" ]; then
 (
   cd "$SRC_DIR"
   ./configure \
@@ -86,6 +91,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     1>&2
 )
+fi
 
 if [ "$PHASE" = "crypto" ]; then
   make -C "$SRC_DIR" -j"${JOBS:-4}" \
@@ -95,11 +101,11 @@ if [ "$PHASE" = "crypto" ]; then
   exit 0
 fi
 
-# Server-side only: the SSH daemon + key tools. The client (dbclient/scp) pulls
-# in cli-* sources b1nix does not need yet.
+# SSH daemon + key tools + client (dbclient), so the loopback handshake smoke
+# can drive the server from inside b1nix. scp is omitted (deferred).
 make -C "$SRC_DIR" -j"${JOBS:-4}" \
   CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-  PROGRAMS="dropbear dropbearkey dropbearconvert" \
+  PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
   MULTI=1 dropbearmulti 1>&2
 
 echo "$SRC_DIR"

@@ -50,6 +50,52 @@ static int parse_pwline(char *line, struct passwd *out) {
     return 1;
 }
 
+/* When /etc/passwd records the password as "x" (or "*"), the real hash lives in
+ * /etc/shadow. Fill `out` (size 256) with the shadow hash for `name`; returns 1
+ * on success. This is what lets sshd/login verify against /etc/shadow via the
+ * standard getpwnam()->pw_passwd path. */
+static int shadow_hash(const char *name, char *out, int outsz) {
+  int fd = open("/etc/shadow", O_RDONLY);
+  if (fd < 0)
+    return 0;
+  char buf[1024];
+  char acc[512];
+  int acc_len = 0, found = 0;
+  ssize_t r;
+  size_t nlen = strlen(name);
+  while (!found && (r = read(fd, buf, sizeof(buf))) > 0) {
+    for (ssize_t i = 0; i < r; i++) {
+      char c = buf[i];
+      if (c == '\n' || acc_len == (int)sizeof(acc) - 1) {
+        acc[acc_len] = '\0';
+        /* format: name:hash:... */
+        if ((size_t)acc_len > nlen && acc[nlen] == ':' &&
+            strncmp(acc, name, nlen) == 0) {
+          char *h = acc + nlen + 1;
+          char *end = h;
+          while (*end && *end != ':')
+            end++;
+          int hlen = (int)(end - h);
+          if (hlen > 0 && hlen < outsz) {
+            memcpy(out, h, (size_t)hlen);
+            out[hlen] = '\0';
+            found = 1;
+          }
+        }
+        acc_len = 0;
+        if (found)
+          break;
+      } else {
+        acc[acc_len++] = c;
+      }
+    }
+  }
+  close(fd);
+  return found;
+}
+
+static char pw_shadow[256];
+
 /* Scan /etc/passwd for a matching entry. want_name non-NULL matches pw_name;
  * otherwise matches pw_uid == want_uid. Returns &pw_ent or NULL. */
 static struct passwd *lookup(const char *want_name, uid_t want_uid) {
@@ -75,6 +121,15 @@ static struct passwd *lookup(const char *want_name, uid_t want_uid) {
                                       ? strcmp(pw_ent.pw_name, want_name) == 0
                                       : pw_ent.pw_uid == want_uid;
                         if (hit) {
+                            /* Substitute the real hash from /etc/shadow when
+                             * the passwd field is the "x"/"*" shadow marker. */
+                            if (pw_ent.pw_passwd &&
+                                (strcmp(pw_ent.pw_passwd, "x") == 0 ||
+                                 strcmp(pw_ent.pw_passwd, "*") == 0) &&
+                                shadow_hash(pw_ent.pw_name, pw_shadow,
+                                            sizeof(pw_shadow))) {
+                                pw_ent.pw_passwd = pw_shadow;
+                            }
                             result = &pw_ent;
                             break;
                         }

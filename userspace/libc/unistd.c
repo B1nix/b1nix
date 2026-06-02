@@ -758,6 +758,31 @@ ssize_t readv(int fd, const struct iovec *iov, int iovcnt) {
   return total;
 }
 
+#include <termios.h>
+char *getpass(const char *prompt) {
+  static char buf[256];
+  if (prompt)
+    write(2, prompt, strlen(prompt));
+  /* Disable echo on stdin while reading the password. */
+  struct termios old, raw;
+  int have_tio = (tcgetattr(0, &old) == 0);
+  if (have_tio) {
+    raw = old;
+    raw.c_lflag &= ~ECHO;
+    tcsetattr(0, TCSANOW, &raw);
+  }
+  ssize_t n = read(0, buf, sizeof(buf) - 1);
+  if (have_tio)
+    tcsetattr(0, TCSANOW, &old);
+  write(2, "\n", 1);
+  if (n <= 0)
+    return 0;
+  while (n > 0 && (buf[n - 1] == '\n' || buf[n - 1] == '\r'))
+    n--;
+  buf[n] = '\0';
+  return buf;
+}
+
 int chown(const char *path, uid_t owner, gid_t group) {
   return _check_err(syscall(SYS_CHOWN, path, owner, group));
 }

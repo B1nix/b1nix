@@ -113,6 +113,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-nls \
     --enable-ipv6 \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+    gl_cv_func_getpass_good=yes \
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
     PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \
     OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include" \

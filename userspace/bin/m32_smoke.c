@@ -1587,6 +1587,100 @@ static int test_dropbear_keygen(void) {
   return 0;
 }
 
+/* M32b: end-to-end localhost SSH — generate a host key, start dropbear bound to
+ * loopback, then connect with dbclient using password auth (verified against
+ * /etc/shadow) and run a single remote command. Exercises TCP loopback, the
+ * full SSH KEX + chacha20-poly1305, server fork-per-connection, password auth,
+ * and remote command exec. */
+static int test_ssh_handshake(void) {
+  syscall(SYS_MKDIR, (long)"/etc/ssh", 0700, 0, 0, 0);
+  unlink("/etc/ssh/hk_ed25519");
+
+  /* 1) host key */
+  int kp = fork();
+  if (kp == 0) {
+    char *av[] = {"/bin/dropbearkey", "-t", "ed25519", "-f",
+                  "/etc/ssh/hk_ed25519", 0};
+    char *ev[] = {0};
+    execve("/bin/dropbearkey", av, ev);
+    _exit(127);
+  }
+  int st = 0;
+  waitpid(kp, &st, 0);
+  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
+    emit("M32B-SSH: FAIL handshake-hostkey\n");
+    return -1;
+  }
+
+  /* 2) server on 127.0.0.1:2222, foreground */
+  int srv = fork();
+  if (srv == 0) {
+    char *av[] = {"/bin/dropbear", "-r", "/etc/ssh/hk_ed25519",
+                  "-p", "127.0.0.1:2222", "-F", 0};
+    char *ev[] = {0};
+    execve("/bin/dropbear", av, ev);
+    _exit(127);
+  }
+  sleep(3); /* let the server load the key and bind */
+
+  /* 3) client: password auth + run a remote command, output to a file */
+  unlink("/tmp/ssh_out");
+  int cli = fork();
+  if (cli == 0) {
+    int o = open("/tmp/ssh_out", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+    if (o >= 0) { dup2(o, 1); if (o > 2) close(o); }
+    char *av[] = {"/bin/dbclient", "-y", "-y", "-p", "2222",
+                  "root@127.0.0.1", "echo", "M32B-SSH-LOGIN-OK", 0};
+    char *ev[] = {"DROPBEAR_PASSWORD=root", 0};
+    execve("/bin/dbclient", av, ev);
+    _exit(127);
+  }
+  /* Reap the client without blocking forever. The loopback SSH handshake is
+   * paced by net_task (one tick of latency per round trip), so poll with a
+   * real sleep between checks — that yields the many ticks the KEX/auth/exec
+   * exchange needs — and give up after ~20s so a stuck client can never hang
+   * the whole smoke suite. */
+  int cst = 0;
+  int cli_done = 0;
+  for (int i = 0; i < 20; i++) {
+    int r = (int)syscall(SYS_WAITPID, cli, (long)&cst, WNOHANG, 0, 0);
+    if (r == cli) { cli_done = 1; break; }
+    if (r < 0) break;
+    sleep(1);
+  }
+  if (!cli_done)
+    syscall(SYS_KILL, cli, SIGKILL, 0, 0, 0);
+
+  /* 4) tear the server down. The listener may be parked in a blocking accept();
+   * send SIGTERM then SIGKILL and reap without ever blocking — a bounded
+   * WNOHANG loop so a server that refuses to die can never hang the whole
+   * smoke suite (the worst case leaks one reparented task, not a deadlock). */
+  syscall(SYS_KILL, srv, SIGTERM, 0, 0, 0);
+  syscall(SYS_KILL, srv, SIGKILL, 0, 0, 0);
+  for (int i = 0; i < 200; i++) {
+    int r = (int)syscall(SYS_WAITPID, srv, 0, WNOHANG, 0, 0);
+    if (r == srv || r < 0)
+      break;
+    syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+  }
+
+  char buf[256];
+  int fd = open("/tmp/ssh_out", O_RDONLY);
+  int n = fd >= 0 ? (int)read(fd, buf, sizeof(buf) - 1) : -1;
+  if (fd >= 0) close(fd);
+  buf[n > 0 ? n : 0] = '\0';
+  if (!strstr(buf, "M32B-SSH-LOGIN-OK")) {
+    char dbg[320];
+    snprintf(dbg, sizeof(dbg),
+             "M32B-SSH: dbg handshake cli=0x%x out=[%s]\n", cst, buf);
+    emit(dbg);
+    emit("M32B-SSH: FAIL handshake\n");
+    return -1;
+  }
+  emit("M32B-SSH: ok handshake\n");
+  return 0;
+}
+
 int main(int argc, char **argv) {
   /* Self-reexec env probe (see test_session): report whether the env we were
    * exec'd with reached getenv(). */
@@ -1615,6 +1709,11 @@ int main(int argc, char **argv) {
   if (test_wget_ntlm_enabled() != 0)   return 1;
   if (test_wget_idn_punycode() != 0)   return 1;
   if (test_wget_https() != 0)          return 1;
+  /* Non-fatal (like test_external_net): the end-to-end SSH login exercises the
+   * whole daemon and must not mask the rest of the suite if it regresses. It
+   * emits its own M32B-SSH ok/FAIL marker. Run last so its long handshake does
+   * not delay the other checks. */
+  test_ssh_handshake();
   emit("M32-NET: done\n");
   return 0;
 }
