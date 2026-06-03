@@ -4370,6 +4370,31 @@ static int b1fetch_main(int argc, const char **argv) {
   return 0;
 }
 
+/* `meminfo` — dedicated RAM diagnostic, runnable any time from the shell
+ * (mirrors the boot-time "pmm: firmware RAM ..." line). Distinguishes what the
+ * firmware (BIOS e820) reports, what the kernel can actually use (clamped to the
+ * direct map), how much is free now, and the direct-map ceiling. Useful on real
+ * hardware whose BIOS over-reports RAM. */
+static int meminfo_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  const u64 mb = 1024ULL * 1024ULL;
+  uwrite("b1nix meminfo:\n");
+  uwrite("  firmware RAM (BIOS e820): ");
+  uwrite_dec_value(pmm_phys_total_memory() / mb);
+  uwrite(" MiB\n");
+  uwrite("  usable (direct-mapped):   ");
+  uwrite_dec_value(pmm_total_usable_memory() / mb);
+  uwrite(" MiB\n");
+  uwrite("  free now:                 ");
+  uwrite_dec_value(pmm_free_memory_estimate() / mb);
+  uwrite(" MiB\n");
+  uwrite("  direct-map cap:           ");
+  uwrite_dec_value(DIRECT_MAP_SIZE / mb);
+  uwrite(" MiB\n");
+  return 0;
+}
+
 /* Inline pipe-EOF smoke: creates a pipe, writes to write-end, closes write-end,
  * reads until EOF, confirms 0-byte return means EOF (not hang). */
 static void m11_pipe_eof_smoke(void) {
@@ -4894,6 +4919,7 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/gpuinfo", gpuinfo_main);
   user_register_program("/bin/b1fetch", b1fetch_main);
   user_register_program("/bin/neofetch", b1fetch_main);
+  user_register_program("/bin/meminfo", meminfo_main);
 
   /* Misc */
   user_register_program("/bin/true", busybox_main);
