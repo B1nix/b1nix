@@ -160,7 +160,27 @@ static void parse_madt(const struct acpi_madt *madt) {
 /* ── SDT walker ────────────────────────────────────────────────── */
 
 static const struct acpi_sdt_header *map_sdt(u64 phys) {
-    const struct acpi_sdt_header *h = (const struct acpi_sdt_header *)phys_to_virt(phys);
+    const struct acpi_sdt_header *h;
+    if (phys < DIRECT_MAP_SIZE) {
+        /* Low ACPI RAM — already covered by the direct map (the common case). */
+        h = (const struct acpi_sdt_header *)phys_to_virt(phys);
+    } else {
+        /* Firmware on a large-RAM machine (or QEMU with a big -m) places the
+         * RSDT/XSDT and their tables just below 4 GiB, beyond the direct map.
+         * Map the header first to read the length, then map the whole table
+         * into the MMIO window. (mmio mappings are never reclaimed, but ACPI
+         * init touches only a handful of small tables once at boot.) */
+        h = (const struct acpi_sdt_header *)vmm_map_mmio(phys, sizeof(*h),
+                                                         VMM_PRESENT);
+        if (!h)
+            return (const struct acpi_sdt_header *)0;
+        u32 len = h->length;
+        if (len < sizeof(*h) || len > 65536)
+            return (const struct acpi_sdt_header *)0;
+        h = (const struct acpi_sdt_header *)vmm_map_mmio(phys, len, VMM_PRESENT);
+        if (!h)
+            return (const struct acpi_sdt_header *)0;
+    }
     if (h->length < sizeof(*h))
         return (const struct acpi_sdt_header *)0;
     /* Bound the table length (largest legitimate tables are a few KB). */
@@ -198,11 +218,10 @@ static const struct acpi_madt *find_madt_via_xsdt(u64 xsdt_phys) {
         u64 phys = 0;
         for (int b = 0; b < 8; b++)
             phys |= ((u64)base[i * 8 + b]) << (b * 8);
-        /* XSDT can point above 4 GiB on real hardware; we only have 8 GiB
-         * direct map, so skip the few entries that exceed it rather than
-         * faulting. The MADT lives in low ACPI RAM in every QEMU/firmware
-         * configuration we ship to today. */
-        if (phys >= DIRECT_MAP_SIZE)
+        /* XSDT can point above 4 GiB on real hardware, which the 32-bit kernel
+         * cannot address at all (no PAE); skip those. Tables between the direct
+         * map and 4 GiB are reachable via map_sdt's MMIO fallback. */
+        if (phys > 0xFFFFFFFFULL)
             continue;
         const struct acpi_sdt_header *t = map_sdt(phys);
         if (t && sig_eq(t->signature, "APIC", 4))
