@@ -1,8 +1,10 @@
 /* B1NIX Userspace Linker Script
  *
- * Produces position-independent ELF executables for x86_64-b1nix.
- * Entry point: _start (from crt0.o)
- * Base address: 0x400000 (standard Linux-compatible)
+ * Produces statically-linked ET_EXEC ELF executables for both b1nix targets
+ * (x86_64-b1nix and i686-b1nix; the -m flag in userspace/Makefile selects the
+ * ELF class). Entry point: _start (from crt0.o).
+ * Load base: 0x02000000 (32 MiB) — above the kernel image; 0x400000 collides
+ * with the 32-bit kernel. See docs/x86-32bit-port.md and CLAUDE.md (ABI).
  */
 
 ENTRY(_start)

@@ -2,6 +2,11 @@
 
 This document describes all changes made to port b1nix from x86_64-only to also support genuine 32-bit x86 (`ARCH=x86`), including kernel, userspace, and boot infrastructure.
 
+> Porting b1nix to a *different* architecture? Start with the arch-agnostic
+> playbook in [`docs/porting-guide.md`](porting-guide.md), which distills the
+> reusable lessons (pitfall catalog + debugging methodology) from this port.
+> This file is the concrete record of what x86 actually changed.
+
 ---
 
 ## Overview
@@ -298,9 +303,10 @@ The smoke test script was already `x86`-aware and uses `qemu-system-x86_64` for 
 | Builtin `/bin/init` starts | ✅ |
 | rc script runs | ✅ |
 | `/bin/sh` spawns | ✅ |
-| SMP (4 cores) | ⚠️ (single CPU in test env) |
-| Native ELF32 binaries | 🔧 (loader added, testing in progress) |
-| Full smoke suite pass | 🔧 (in progress) |
+| SMP (4 cores) | ✅ (`-smp 4` reaches `B1NIX-TEST: done`; ELF32 userspace pinned to BSP, APs run stealable workers) |
+| Native ELF32 binaries | ✅ (`user_load_elf32`; all VFS-loaded smoke binaries run) |
+| SSH (dropbear: keygen, handshake, negauth, pty, service-lifecycle) | ✅ |
+| Full smoke suite pass | ✅ **369/369** (single-CPU and `-smp 4`) |
 
 ---
 

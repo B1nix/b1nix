@@ -58,11 +58,14 @@ slow under TCG and can exceed the 120 s default on a loaded host.
 
 ## Verification
 
-`TIMEOUT=300 sh tests/smoke.sh x86` → **368/369**, single-CPU and `-smp 4` both
-reach `B1NIX-TEST: done`. `NATIVE-SMOKE: ok` + `NATIVE-SMOKE: done` now print in
-both passes, and native loads via the correct `ELF32 load:` path. The only
-remaining failure is `M32B-SSH: ok service-lifecycle` (dropbear keygen on 32-bit,
-a separate WIP; rc-script auto-skips sshd).
+`TIMEOUT=300 sh tests/smoke.sh x86` → **369/369** (full green), single-CPU and
+`-smp 4` both reach `B1NIX-TEST: done`. `NATIVE-SMOKE: ok` + `NATIVE-SMOKE: done`
+now print in both passes, and native loads via the correct `ELF32 load:` path.
+
+(At the time this fix landed, `M32B-SSH: ok service-lifecycle` was still failing
+because init auto-skipped sshd on 32-bit; that was fixed separately right after —
+dropbear works on 32-bit now, so init auto-starts it. See
+[`docs/m32b-ssh.md`](m32b-ssh.md).)
 
 ---
 

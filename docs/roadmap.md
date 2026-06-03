@@ -13,6 +13,10 @@ Detailed closeout instructions for the POSIX-facing `VFS/path/files` and
 The stable no-surprises checklist for closing POSIX-facing work lives in
 [`docs/posix-requirements.md`](posix-requirements.md).
 
+Bringing b1nix up on a new CPU architecture? The reusable playbook (pitfall
+catalog + debugging methodology, distilled from the x86 i386 port) lives in
+[`docs/porting-guide.md`](porting-guide.md).
+
 ## Current POSIX Estimate
 
 - Overall practical POSIX compatibility: roughly 75-82%.

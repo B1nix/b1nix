@@ -120,7 +120,7 @@ limits the audit named. Remaining future work is captured under
 
 ## D. Must STAY fixed (contracts, not hardcoding — do NOT "fix")
 
-- Userspace ELF load base `0x400000` and AP trampoline phys `0x8000` — ABI /
+- Userspace ELF load base `0x02000000` and AP trampoline phys `0x8000` — ABI /
   boot contracts.
 - `PAGE_SIZE 4096`, `IDT_ENTRY_COUNT 256`, alignment boundaries, `KHEAP_HEADER_SIZE`.
 - `KERNEL_STACK_SIZE 32 KB` — a tuned safety value (see M26 stack-overflow fix);
