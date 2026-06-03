@@ -388,6 +388,20 @@ void pmm_init(const struct boot_info *boot_info) {
   console_write("pmm: total usable bytes 0x");
   console_write_hex64(pmm.total_usable);
   console_write("\n");
+
+  /* One-line MiB summary so a real-hardware screen unambiguously shows where
+   * the numbers come from: firmware-reported RAM (sum of e820 AVAILABLE),
+   * what the kernel can actually use (clamped to the direct map), and the
+   * direct-map ceiling. If "firmware" > the box's physical RAM, the BIOS e820
+   * is over-reporting (e.g. shared-GPU/remapped regions) — the kernel still
+   * only ever hands out frames it freed from real regions. */
+  console_write("pmm: firmware RAM ");
+  console_write_dec(pmm.phys_total / (1024 * 1024));
+  console_write(" MiB, usable ");
+  console_write_dec(pmm.total_usable / (1024 * 1024));
+  console_write(" MiB, direct-map cap ");
+  console_write_dec(DIRECT_MAP_SIZE / (1024 * 1024));
+  console_write(" MiB\n");
 }
 
 void pmm_ref_frame(u64 frame) {
