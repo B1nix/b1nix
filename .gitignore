@@ -13,3 +13,7 @@ CLAUDE.md
 /graphify-out/manifest.json
 /graphify-out/[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]/
 /graphify-out/memory/
+/docs/agent-memory
+
+# Claude memory transport bundle (regenerable; same content tracked in docs/agent-memory/)
+b1nix-claude-memory.tar.gz

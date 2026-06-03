@@ -7,7 +7,14 @@ set -e
 
 ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=${TIMEOUT:-120}  # seconds to let each test run (kernel takes longer under macOS load; override via env)
+# Seconds to let each test run (override via env). x86_64 emulates notably slower
+# than i386 under TCG (no KVM on macOS) and the single-CPU suite lands right at
+# ~110-120s, so give 64-bit more headroom to avoid false timeouts.
+if [ "$ARCH" = "x86_64" ]; then
+	TIMEOUT=${TIMEOUT:-240}
+else
+	TIMEOUT=${TIMEOUT:-120}
+fi
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"

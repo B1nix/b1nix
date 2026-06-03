@@ -102,17 +102,38 @@ static const char initramfs_sshd_service[] =
     "    [ -f $PIDFILE ] && export pid=$(cat $PIDFILE) && kill -0 $pid 2>/dev/null && echo \"sshd is already running (PID: $pid)\" && exit 0\n"
     "    [ -f $PIDFILE ] && rm -f $PIDFILE\n"
     "\n"
-    "    [ -f /etc/ssh/hk_ed25519 ] || mkdir -p /etc/ssh\n"
-    "    [ -f /etc/ssh/hk_ed25519 ] || echo \"sshd: generating host key...\"\n"
-    "    [ -f /etc/ssh/hk_ed25519 ] || /bin/dropbearkey -t ed25519 -f /etc/ssh/hk_ed25519\n"
+    /* M32c host-key persistence: prefer the persistent root image (/persist)
+     * over the volatile initramfs /etc/ssh so the host key survives reboots
+     * once non-initramfs storage is mounted. Falls back to /etc/ssh when no
+     * persistent store is present (e.g. the automated smoke harness). */
+    "    export HOSTKEY=/etc/ssh/hk_ed25519\n"
+    "    [ -d /persist ] && mkdir -p /persist/etc/ssh && export HOSTKEY=/persist/etc/ssh/hk_ed25519\n"
+    "    mkdir -p /etc/ssh\n"
+    "    [ -f $HOSTKEY ] || echo \"sshd: generating host key...\"\n"
+    "    [ -f $HOSTKEY ] || /bin/dropbearkey -t ed25519 -f $HOSTKEY\n"
     "\n"
     "    mkdir -p /var/run /var/log\n"
     "\n"
-    "    export BIND_ADDR=\"\"\n"
+    /* M32c bind policy: loopback-only is the SAFE default so the daemon is
+     * never exposed by accident. b1nix.ssh-external opts in to all interfaces
+     * (0.0.0.0); b1nix.ssh-loopback is the explicit, back-compatible way to
+     * keep the loopback default. NOTE: keep shell '#' comments out of this
+     * case arm — comment text containing ')' collides with case pattern
+     * syntax in the in-kernel shell and silently aborts the arm. */
+    "    export BIND_ADDR=\"127.0.0.1:\"\n"
+    "    [ -f /proc/cmdline ] && grep -q \"b1nix.ssh-external\" /proc/cmdline && export BIND_ADDR=\"\"\n"
     "    [ -f /proc/cmdline ] && grep -q \"b1nix.ssh-loopback\" /proc/cmdline && export BIND_ADDR=\"127.0.0.1:\"\n"
     "\n"
+    /* M32c hardening: sane connection lifecycle defaults are always on; the
+     * root/password restrictions are opt-in so the automated smoke (root +
+     * password over loopback) keeps working while an exposed deployment can
+     * tighten policy via b1nix.ssh-no-root (-w) / b1nix.ssh-pubkey-only (-s). */
+    "    export HARDEN=\"-I 300 -K 60 -T 6\"\n"
+    "    [ -f /proc/cmdline ] && grep -q \"b1nix.ssh-no-root\" /proc/cmdline && export HARDEN=\"$HARDEN -w\"\n"
+    "    [ -f /proc/cmdline ] && grep -q \"b1nix.ssh-pubkey-only\" /proc/cmdline && export HARDEN=\"$HARDEN -s\"\n"
+    "\n"
     "    echo \"sshd: starting daemon (bind: ${BIND_ADDR}22)...\"\n"
-    "    /bin/dropbear -r /etc/ssh/hk_ed25519 -p ${BIND_ADDR}22 -F >$LOGFILE 2>&1 &\n"
+    "    /bin/dropbear -r $HOSTKEY -p ${BIND_ADDR}22 $HARDEN -F >$LOGFILE 2>&1 &\n"
     "    echo $! > $PIDFILE\n"
     "    echo \"sshd: started (PID: $(cat $PIDFILE))\"\n"
     "    ;;\n"
@@ -153,6 +174,9 @@ static const char initramfs_rc[] =
     "# b1nix boot rc script - runs once at startup, before the login shell.\n"
     "echo \"M27-INIT: rc-script start\"\n"
     "[ -f /etc/motd ] && cat /etc/motd\n"
+    /* Home directories for the accounts in /etc/passwd so a login shell (local
+     * or over SSH) has a valid working directory instead of warning on chdir. */
+    "mkdir -p /root /home/user /tmp\n"
     "[ -d /persist ] && [ ! -f /persist/.b1nix-setup ] && mkdir -p /persist/home "
     "&& mkdir -p /persist/etc && mkdir -p /persist/tmp "
     "&& echo ready > /persist/.b1nix-setup "

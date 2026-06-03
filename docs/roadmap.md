@@ -543,13 +543,14 @@ Plan, rationale, and per-item commit map: [`docs/m32b-ssh.md`](m32b-ssh.md).
 
 This is intentionally a small operational follow-up, not a blocker for the next
 porting milestones. M32b proves the SSH daemon, auth, PTY, service lifecycle,
-and localhost TCP path. M32c is about making that daemon reachable from outside
-the guest in controlled ways.
+and localhost TCP path. M32c makes that daemon reachable from outside the guest
+in controlled ways. **You can now `ssh -p 2222 root@127.0.0.1` from the host
+straight into a b1nix VM.** Full details in [`docs/m32c-external-ssh.md`](m32c-external-ssh.md).
 
-- [ ] `planned` Add a QEMU host-to-guest SSH smoke path. Run b1nix with user-mode networking and `hostfwd=tcp::2222-:22`, boot without `b1nix.ssh-loopback=1` (or with an explicit non-loopback bind option), start `/etc/init.d/sshd`, and verify from the host with `ssh -p 2222 root@127.0.0.1` / `dbclient` equivalent. Keep this separate from the default restricted smoke so CI remains deterministic and does not expose port 22 by accident.
-- [ ] `planned` Add explicit sshd bind policy. Keep loopback-only as the safe default for automated smoke (`b1nix.ssh-loopback=1`), add a deliberate opt-in for `0.0.0.0:22` / selected interface addresses, and document the command-line knobs for QEMU hostfwd versus real NIC use.
-- [ ] `planned` Verify inbound TCP service exposure on a real link. Reuse the existing DHCP/static-IP path plus the virtio/e1000 receive path to prove an external client can connect to a b1nix listener, first with a tiny TCP echo/http service and then with Dropbear. This is the bridge from “loopback SSH is correct” to “the machine is administrable over the network.”
-- [ ] `planned` Harden external-login defaults before treating SSH as a normal exposed service: password/root-login policy, host-key persistence across non-initramfs storage, basic connection limits/timeouts, and clear logging under `/var/log/sshd.log`.
+- [x] `done` QEMU host-to-guest SSH smoke path (`tests/ssh-hostfwd.sh`). Boots b1nix in normal mode (no in-kernel test suite) with `-netdev user,hostfwd=tcp:127.0.0.1:2222-:22`, `b1nix.ssh-external=1`, then logs in from the host's OpenSSH client (password auth driven by `expect`) and runs a remote command, verifying a guest-computed marker (`EXTSSH-42-OK`) plus the SSH banner over the NIC. Kept separate from `tests/smoke.sh` so CI stays deterministic and never exposes a forwarded port by accident.
+- [x] `done` Explicit sshd bind policy (`/etc/init.d/sshd`). **Loopback-only is now the SAFE default** (was bind-all); `b1nix.ssh-external` opts in to all interfaces (`0.0.0.0:22`), `b1nix.ssh-loopback` is the explicit back-compatible loopback knob. Knobs are read from `/proc/cmdline`.
+- [x] `done` Inbound TCP service exposure on a real link. The host's OpenSSH client completing a full KEX + password auth + remote-exec over `hostfwd` → virtio-net proves the kernel TCP passive-open path (LISTEN→SYN_RCVD→ESTABLISHED, ARP/gateway routing, DHCP-assigned destination matching) works for unsolicited inbound connections, not just the `127.0.0.1` loopback fast path. **Networking is now on by default** (DHCP runs whenever a NIC is present; opt out with `b1nix.net=off`).
+- [x] `done` Hardened external-login defaults. Sane connection-lifecycle defaults are always on (`-I 300` idle, `-K 60` keepalive, `-T 6` max auth tries); root/password restrictions are opt-in (`b1nix.ssh-no-root`→`-w`, `b1nix.ssh-pubkey-only`→`-s`) so the loopback smoke (root+password) keeps working; host key prefers persistent storage (`/persist/etc/ssh`) over the volatile initramfs when mounted; logging stays under `/var/log/sshd.log`; login home dirs (`/root`, `/home/user`) are created at boot.
 - [ ] `deferred` Bare-metal SSH reachability. Once M37 real-hardware boot + NIC-driver coverage are far enough along, verify the same Dropbear service from another machine on the LAN. This does not need to block near-term userspace ports; it becomes important when b1nix is meant to run unattended or on real hardware.
 
 ## M33: POSIX Shell Compliance & Job Control Polish

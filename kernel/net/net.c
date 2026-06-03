@@ -366,7 +366,10 @@ void net_init(void)
 	if (!net_ready) {
 		return;
 	}
-	if (bootinfo_has_flag("b1nix.test=1") || bootinfo_has_flag("b1nix.net=dhcp")) {
+	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
+	 * present. Opt out with b1nix.net=off (or b1nix.nonet) for an isolated boot;
+	 * b1nix.net=dhcp is still accepted as an explicit no-op for back-compat. */
+	if (!bootinfo_has_flag("b1nix.net=off") && !bootinfo_has_flag("b1nix.nonet")) {
 		dhcp_init();
 	}
 
