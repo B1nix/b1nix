@@ -30,8 +30,97 @@ static const char scancode_map_shift[128] = {
     '-', 0, 0, 0, '+', 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0
 };
 
+/* i8042 controller access helpers. Status port 0x64: bit0 = output buffer full
+ * (data ready to read from 0x60), bit1 = input buffer full (do not write yet).
+ * All waits are bounded so a wedged/absent controller can never hang boot. */
+static int kbd_wait_input_clear(void)
+{
+	for (int i = 0; i < 100000; i++)
+		if (!(inb(0x64) & 0x02))
+			return 0;
+	return -1;
+}
+
+static int kbd_wait_output_full(void)
+{
+	for (int i = 0; i < 100000; i++)
+		if (inb(0x64) & 0x01)
+			return 0;
+	return -1;
+}
+
+static void kbd_flush(void)
+{
+	for (int i = 0; i < 32 && (inb(0x64) & 0x01); i++)
+		(void)inb(0x60);
+}
+
+static void kbd_ctrl_cmd(u8 cmd) /* command to the controller (port 0x64) */
+{
+	kbd_wait_input_clear();
+	outb(0x64, cmd);
+}
+
+static void kbd_dev_write(u8 data) /* byte to the device / data port 0x60 */
+{
+	kbd_wait_input_clear();
+	outb(0x60, data);
+}
+
+static u8 kbd_dev_read(void)
+{
+	if (kbd_wait_output_full() == 0)
+		return inb(0x60);
+	return 0;
+}
+
+/* Real-hardware i8042/keyboard bring-up. QEMU comes up with scanning enabled
+ * and IRQ1 already on, so the old no-op "worked" there; bare metal (e.g. Acer
+ * Aspire One ZG5) needs the full sequence. We also cannot rely on the PS/2
+ * mouse driver to enable IRQ1 as a side effect of its config-byte write — it
+ * bails out early when there is no framebuffer, which would leave the keyboard
+ * dead. The controller config byte is read-modify-written so kbd and mouse
+ * init compose regardless of order. */
 void ps2_kbd_init(void)
 {
+	/* Disable the first port while we reconfigure, then drain stale bytes. */
+	kbd_ctrl_cmd(0xAD);
+	kbd_flush();
+
+	/* IRQ off during init (so device ACKs don't get eaten by the handler or
+	 * mis-read as scancodes), translation on (our map is scancode set 1),
+	 * first-port clock enabled. */
+	kbd_ctrl_cmd(0x20);
+	u8 cfg = kbd_dev_read();
+	cfg &= ~0x01u;  /* first-port interrupt off (for now) */
+	cfg |=  0x40u;  /* scancode translation set2 -> set1 */
+	cfg &= ~0x10u;  /* first-port clock enabled */
+	kbd_ctrl_cmd(0x60);
+	kbd_dev_write(cfg);
+
+	/* Enable the first port and bring the keyboard device up. */
+	kbd_ctrl_cmd(0xAE);
+	kbd_flush();
+
+	kbd_dev_write(0xFF);        /* reset; device replies 0xFA then 0xAA */
+	(void)kbd_dev_read();
+	(void)kbd_dev_read();
+	kbd_flush();
+
+	kbd_dev_write(0xF4);        /* enable scanning; device replies 0xFA */
+	(void)kbd_dev_read();
+	kbd_flush();
+
+	/* Now arm IRQ1 (re-read config in case the device handshake touched it). */
+	kbd_ctrl_cmd(0x20);
+	cfg = kbd_dev_read();
+	cfg |=  0x01u;  /* first-port interrupt on */
+	cfg |=  0x40u;  /* keep translation */
+	cfg &= ~0x10u;  /* keep first-port clock enabled */
+	kbd_ctrl_cmd(0x60);
+	kbd_dev_write(cfg);
+	kbd_flush();
+
 	console_write("ps2_kbd: initialized on irq1\n");
 }
 

@@ -293,6 +293,14 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
     int is_bsp = pcpu ? (pcpu->cpu_id == 0) : 1;
     lapic_eoi();
     if (is_bsp) {
+      /* Poll the i8042 from the timer tick as a keyboard fallback. The
+       * scheduler runs off the LAPIC timer, so a live scheduler does NOT prove
+       * the IOAPIC delivers ISA IRQs — on some bare-metal boxes (e.g. Acer
+       * Aspire One ZG5) IRQ1 never arrives even though the device is fine.
+       * Draining here makes the keyboard work regardless; if IRQ1 does fire,
+       * this just finds an empty buffer. Both paths run on the BSP in ISR
+       * context (non-reentrant), so the single-producer kbd ring is safe. */
+      ps2_kbd_interrupt_handler();
       timer_ticks++;
       if (timer_ticks % 50 == 0) {
         fb_console_blink_cursor();
@@ -303,6 +311,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   }
 
   if (frame->vector == 32) {
+    ps2_kbd_interrupt_handler(); /* i8042 poll fallback — see vector 64 above */
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();

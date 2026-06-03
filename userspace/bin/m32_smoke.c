@@ -1035,7 +1035,11 @@ static int test_wget_ipv6(void) {
   }
   int wst = 0;
   waitpid(wpid, &wst, 0);
-  
+
+  /* If wget failed to connect, the server is still blocked in accept() with no
+   * timeout — force it out with SIGTERM so the waitpid below cannot hang the
+   * whole suite until the QEMU watchdog. Harmless if it already exited. */
+  kill(pid, SIGTERM);
   int sst = 0;
   waitpid(pid, &sst, 0);
 
