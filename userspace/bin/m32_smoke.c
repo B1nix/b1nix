@@ -1763,9 +1763,28 @@ static int ssh_test_pty(void) {
   int cst = 0;
   int done = ssh_reap_client(cli, &cst);
   /* Drain anything the remote pty echoed back so a full master buffer can't
-   * wedge the remote side mid-teardown (and so we can surface it on failure). */
+   * wedge the remote side mid-teardown (and so we can surface it on failure).
+   * This MUST be bounded: the master fd is blocking, and under -smp the remote
+   * slave may not have been released yet when we get here (dbclient/its shell
+   * still tearing down on another CPU), so a plain read(master) would park in
+   * the kernel's pty_master_read forever and hang the whole suite — this was
+   * the silent ~33% -smp "fork/exec" flake. select() with a finite per-attempt
+   * timeout caps the wait (~2 s total) and stops on EOF (slave closed). */
   char drain[256];
-  int dn = (int)read(master, drain, sizeof(drain) - 1);
+  int dn = 0;
+  for (int tries = 0; tries < 20 && dn < (int)sizeof(drain) - 1; tries++) {
+    fd_set rfds;
+    FD_ZERO(&rfds);
+    FD_SET(master, &rfds);
+    struct timeval tv = {.tv_sec = 0, .tv_usec = 100000}; /* 100 ms */
+    int sr = select(master + 1, &rfds, 0, 0, &tv);
+    if (sr <= 0)
+      break; /* timeout or error: stop draining, never block */
+    int r = (int)read(master, drain + dn, (size_t)(sizeof(drain) - 1 - dn));
+    if (r <= 0)
+      break; /* EOF (slave gone) or error */
+    dn += r;
+  }
   drain[dn > 0 ? dn : 0] = '\0';
   for (int i = 0; drain[i]; i++)
     if (drain[i] == '\n' || drain[i] == '\r') drain[i] = '|';
