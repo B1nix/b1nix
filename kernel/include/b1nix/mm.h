@@ -93,6 +93,7 @@ void pmm_unref_frame(u64 frame);
 void pmm_free_frame(u64 frame);
 u16 pmm_get_refcount(u64 frame);
 u64 pmm_total_usable_memory(void);
+u64 pmm_phys_total_memory(void);
 u64 pmm_free_memory_estimate(void);
 usize pmm_free_frame_count(void);
 

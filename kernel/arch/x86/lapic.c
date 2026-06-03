@@ -310,6 +310,27 @@ static void apic_timer_calibrate_against_pit(void) {
     console_write(" ticks/ms (div=16)\n");
 }
 
+/* Accurate busy-delay using PIT channel 2 in one-shot (mode 0). Unlike a fixed
+ * pause-loop iteration count, this is independent of CPU clock: a fast core
+ * burns through 5M `pause` instructions in a fraction of the time a slow one
+ * does, so the old AP-startup delay was both wrong (no guaranteed wall-clock
+ * time) and slow (~hundreds of ms per AP on a fast box). Counter is 16-bit at
+ * 1.193182 MHz, so `ms` must be <= 54. */
+static void pit2_delay_ms(u32 ms) {
+    u32 count = (1193182U / 1000U) * ms;
+    if (count == 0) count = 1;
+    if (count > 0xFFFFU) count = 0xFFFFU;
+    u8 gate = inb(PIT2_GATE);
+    outb(PIT2_GATE, (u8)(gate & ~0x03));          /* gate low, speaker off: stop ch2 */
+    outb(PIT2_COMMAND, 0xB0);                     /* ch2, lo/hi byte, mode 0, binary */
+    outb(PIT2_CHANNEL, (u8)(count & 0xFF));
+    outb(PIT2_CHANNEL, (u8)((count >> 8) & 0xFF));
+    outb(PIT2_GATE, (u8)((gate & ~0x02) | 0x01)); /* raise gate (speaker off): start */
+    while ((inb(PIT2_GATE) & 0x20) == 0)          /* OUT (bit 5) high at terminal count */
+        __asm__ volatile("pause");
+    outb(PIT2_GATE, (u8)(gate & ~0x03));          /* restore */
+}
+
 struct gdt_ptr {
   u16 limit;
   u32 base;
@@ -425,7 +446,7 @@ int smp_boot_aps(void) {
 
         console_write("smp: sending INIT...\n");
         lapic_send_ipi(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_ASSERT | LAPIC_ICR_TRIGGER_LEVEL);
-        for (volatile int j = 0; j < 5000000; j++) __asm__ volatile("pause");
+        pit2_delay_ms(10);  /* Intel MP spec: 10 ms after INIT assert */
         lapic_send_ipi(apic_id, LAPIC_ICR_INIT | LAPIC_ICR_LEVEL_DEASSERT | LAPIC_ICR_TRIGGER_LEVEL);
 
         console_write("smp: sending SIPI...\n");

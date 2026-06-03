@@ -17,7 +17,8 @@ struct pmm_state {
   u64 kernel_start;
   u64 kernel_end;
   u64 max_address;
-  u64 total_usable;
+  u64 total_usable;   /* RAM the kernel can actually use (clamped to direct map) */
+  u64 phys_total;     /* installed RAM reported by firmware (uncapped, for display) */
   u64 free_frames;
   usize bitmap_bytes;
   u8 *bitmap;
@@ -264,6 +265,7 @@ void pmm_init(const struct boot_info *boot_info) {
   pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
   pmm.max_address = 0;
   pmm.total_usable = 0;
+  pmm.phys_total = 0;
   pmm.free_frames = 0;
 
   /* Compute the runtime direct-map size before the loops below consult it. */
@@ -274,6 +276,12 @@ void pmm_init(const struct boot_info *boot_info) {
     if (region->type != BOOT_MEMORY_AVAILABLE) {
       continue;
     }
+
+    /* Installed RAM as the firmware reports it — uncapped, for display only.
+     * The kernel can only *use* what fits in the direct map (clamped below),
+     * but a 32-bit box with 16 GiB should still report 16 GiB, not the 1 GiB
+     * direct-map ceiling. */
+    pmm.phys_total += region->length;
 
     u64 end = align_down_u64(region->base + region->length, PAGE_SIZE);
 
@@ -817,6 +825,7 @@ u64 pmm_alloc_frames(usize count) {
 }
 
 u64 pmm_total_usable_memory(void) { return pmm.total_usable; }
+u64 pmm_phys_total_memory(void) { return pmm.phys_total; }
 
 u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 

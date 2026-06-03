@@ -4267,9 +4267,13 @@ static int b1fetch_main(int argc, const char **argv) {
     strcpy(cwd, "/");
   }
 
-  u64 uptime = syscall_dispatch(SYS_TIME, 0, 0, 0, 0, 0, 0);
-  u64 minutes = uptime / 60;
-  u64 seconds = uptime % 60;
+  /* Real uptime (seconds since boot), not SYS_TIME — that returns wall-clock
+   * seconds since the Unix epoch, which rendered as "minutes" read ~29.6M. */
+  u64 uptime = scheduler_get_uptime_ticks() / 100; /* LAPIC timer runs at 100 Hz */
+  u64 up_days = uptime / 86400;
+  u64 up_hours = (uptime % 86400) / 3600;
+  u64 up_mins = (uptime % 3600) / 60;
+  u64 up_secs = uptime % 60;
 
   uwrite("      _     user@b1nix\n");
   uwrite("  ___| |_   os: ");
@@ -4293,17 +4297,34 @@ static int b1fetch_main(int argc, const char **argv) {
   uwrite(cwd);
   uwrite("\n");
   uwrite("           uptime: ");
-  char num[24];
-  snprintf(num, sizeof(num), "%d:%02d", (int)minutes, (int)seconds);
+  char num[32];
+  if (up_days > 0) {
+    snprintf(num, sizeof(num), "%dd %02d:%02d:%02d", (int)up_days,
+             (int)up_hours, (int)up_mins, (int)up_secs);
+  } else {
+    snprintf(num, sizeof(num), "%02d:%02d:%02d", (int)up_hours,
+             (int)up_mins, (int)up_secs);
+  }
   uwrite(num);
   uwrite("\n");
 
-  u64 total_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
+  u64 phys_mb = pmm_phys_total_memory() / (1024ULL * 1024ULL);
+  u64 usable_mb = pmm_total_usable_memory() / (1024ULL * 1024ULL);
   u64 free_mb = pmm_free_memory_estimate() / (1024ULL * 1024ULL);
-  u64 used_mb = total_mb > free_mb ? total_mb - free_mb : 0;
-  snprintf(num, sizeof(num), "%d/%d MB", (int)used_mb, (int)total_mb);
+  u64 used_mb = usable_mb > free_mb ? usable_mb - free_mb : 0;
   uwrite("           memory: ");
-  uwrite(num);
+  uwrite_dec_value(used_mb);
+  uwrite("/");
+  uwrite_dec_value(usable_mb);
+  uwrite(" MB");
+  /* On the 32-bit port the kernel can only use RAM that fits in the direct map
+   * (~1 GiB), so show the real installed amount when it exceeds the usable pool
+   * — otherwise a 16 GiB box would just read "1024 MB". */
+  if (phys_mb > usable_mb) {
+    uwrite(" (");
+    uwrite_dec_value(phys_mb);
+    uwrite(" MB installed)");
+  }
   uwrite("\n");
 
   uwrite("           video: ");
