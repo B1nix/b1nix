@@ -616,3 +616,35 @@ against b1nix libc) is the cheaper, higher-leverage path and should be exhausted
 - [ ] `planned` Provide Linux-compatible process/thread startup: full `auxv`, vDSO, TLS via `%fs`, and a Linux-shaped signal trampoline.
 - [ ] `planned` Implement the `/proc` and `/sys` entries glibc and common tools probe at startup (depends on M34).
 - [ ] `planned` Add a binary "personality" switch so Linux ELFs are detected and dispatched to the compat layer without affecting native b1nix binaries.
+
+## M41: Large Physical Memory Support (use the full installed RAM)
+
+Today the kernel direct-maps physical RAM 1:1 into its virtual window and only
+uses what fits there: **1 GiB cap on 32-bit** (`DIRECT_MAP_MAX`, bounded by
+`KHEAP_START` at `0xC0000000`) and **64 GiB on 64-bit**. A real machine with
+more RAM only gets that much used (b1fetch/`meminfo` already show "firmware RAM"
+vs "usable" so the gap is visible). Goal: take the full installed RAM, capped at
+the 4 GiB the 32-bit address space allows. See
+[`docs/`](roadmap.md) and the `meminfo` command for the live numbers.
+
+- [ ] `partial` 32-bit: raise the cap from 1 GiB toward ~1.5–1.75 GiB without
+  highmem by moving the kernel heap + MMIO window up into the
+  `[0xE0000000, 0xFEC00000)` gap and growing the direct map to
+  `[0x80000000, ~0xE0000000)`. Touches `DIRECT_MAP_MAX`/`KHEAP_START` (mm.h),
+  `MMIO_MAP_BASE` + the kernel-PT setup loop (paging.c). Must not disturb the
+  user stack, which now sits just under `0x80000000` (see M37 bring-up).
+- [ ] `planned` 32-bit: true up-to-4 GiB via **highmem** — direct-map only the
+  low region and access higher physical frames on demand through temporary
+  per-CPU mappings (Linux `kmap`/`kmap_atomic` style). Every
+  `phys + DIRECT_MAP_BASE` deref on a high frame (block cache, page cache, user
+  page zeroing) must route through the temp map. Optionally PAE first if >4 GiB
+  physical is ever wanted.
+- [ ] `planned` 64-bit: raise `DIRECT_MAP_MAX` beyond 64 GiB (the direct-map
+  region at `0xffff800000000000` spans up to 64 TiB, so no highmem is needed —
+  just map the larger range in `vmm_init` and let `size_direct_map`'s clamp
+  follow). Low risk; cost is page-table setup + boot-time frame-free walk.
+- [ ] `planned` Verify on real hardware that "firmware RAM" == "usable" once the
+  cap is raised, and that BIOS-over-reported e820 maps (a 512 MiB box whose
+  firmware claims more) never let the pmm hand out non-existent frames (it marks
+  the bitmap all-used and only frees genuine AVAILABLE regions today — keep that
+  invariant).
