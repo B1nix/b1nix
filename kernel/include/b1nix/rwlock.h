@@ -84,23 +84,45 @@ static inline void rw_write_unlock(rwlock_t *lock) {
 }
 
 static inline void rw_read_lock_irqsave(rwlock_t *lock, u64 *flags) {
+#ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#else
+    u32 f32;
+    __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
+    *flags = f32;
+#endif
     rw_read_lock(lock);
 }
 
 static inline void rw_read_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_read_unlock(lock);
+#ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#else
+    u32 f32 = (u32)flags;
+    __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");
+#endif
 }
 
 static inline void rw_write_lock_irqsave(rwlock_t *lock, u64 *flags) {
+#ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#else
+    u32 f32;
+    __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
+    *flags = f32;
+#endif
     rw_write_lock(lock);
 }
 
 static inline void rw_write_unlock_irqrestore(rwlock_t *lock, u64 flags) {
     rw_write_unlock(lock);
+#ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#else
+    u32 f32 = (u32)flags;
+    __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");
+#endif
 }
 
 #endif /* B1NIX_RWLOCK_H */

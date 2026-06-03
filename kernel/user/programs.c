@@ -12,6 +12,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/lapic.h>
 #include <b1nix/dirent.h>
+#include <b1nix/console.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>

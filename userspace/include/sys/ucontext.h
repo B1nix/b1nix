@@ -1,8 +1,13 @@
 #ifndef B1NIX_U_SYS_UCONTEXT_H
 #define B1NIX_U_SYS_UCONTEXT_H
 
+#ifdef __x86_64__
 #define REG_RIP 16
 #define REG_RBP 10
+#else
+#define REG_EIP 14
+#define REG_EBP 6
+#endif
 
 typedef struct mcontext {
     long gregs[23];

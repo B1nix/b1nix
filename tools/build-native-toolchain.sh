@@ -4,9 +4,13 @@
 # Requires: cross-toolchain already built (run build-toolchain.sh first)
 set -euo pipefail
 
-TARGET="x86_64-b1nix"
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+
+# Per-architecture build identity (B1NIX_ARCH -> triplet, shared sources,
+# per-triplet build/output paths).
+. "$PROJECT_DIR/tools/toolchain-env.sh"
+TARGET="$B1NIX_TRIPLET"
 
 BINUTILS_VER="2.41"
 GCC_VER="13.2.0"
@@ -21,16 +25,10 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
-# ── Space-free build directory ────────────────────────────────────────────────
-if echo "$PROJECT_DIR" | grep -q ' '; then
-    # Path has spaces → build on the Linux-side filesystem
-    BUILD_HOME="$HOME/b1nix-toolchain"
-    echo "Note: project path has spaces; building native toolchain in $BUILD_HOME"
-else
-    BUILD_HOME="$PROJECT_DIR/build/toolchain_build"
-fi
+# ── Shared source tree + per-triplet build/output directories ────────────────
+BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
-SRC_DIR="$BUILD_HOME/src"
+SRC_DIR="$TOOLCHAIN_SRC_DIR"
 WORK_DIR="$BUILD_HOME/native_build"
 CROSS_PREFIX="$BUILD_HOME/cross"
 NATIVE_DEST="$BUILD_HOME/native_root"
@@ -45,15 +43,25 @@ fi
 
 export PATH="$CROSS_PREFIX/bin:$PATH"
 export ac_cv_c_bigendian=no
+# b1nix exposes some libc helpers as static inline functions in public headers.
+# Autoconf's cross AC_CHECK_FUNC probes do not include those headers, so they
+# can misdetect the helpers as missing and libiberty then builds replacement
+# objects that collide with the inline definitions.
+export ac_cv_func_clock=yes
+export ac_cv_func_tmpnam=yes
+export ac_cv_header_fcntl_h=yes
+export ac_cv_header_sys_resource_h=yes
 
 CC_VAL="${TARGET}-gcc"
 CXX_VAL="${TARGET}-g++"
 AR_VAL="${TARGET}-ar"
 RANLIB_VAL="${TARGET}-ranlib"
-CFLAGS_VAL="-isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
-CPPFLAGS_VAL="-isystem $SYSROOT/include"
-LDFLAGS_VAL="-Wl,-Ttext-segment=0x2000000"
-LIBS_VAL="-lb1nix -lgcc"
+CFLAGS_VAL="--sysroot=$SYSROOT -isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000 -Wl,--allow-multiple-definition"
+CXXFLAGS_VAL="--sysroot=$SYSROOT -idirafter $SYSROOT/include -Wl,-Ttext-segment=0x2000000 -Wl,--allow-multiple-definition -O2 -DCODY_NETWORKING=0"
+CPPFLAGS_VAL="--sysroot=$SYSROOT -isystem $SYSROOT/include"
+LDFLAGS_VAL="--sysroot=$SYSROOT -Wl,-Ttext-segment=0x2000000 -Wl,--allow-multiple-definition"
+LIBS_VAL="-lgcc -lb1nix"
+HOST_LIBS_VAL="$LIBS_VAL"
 
 mkdir -p "$WORK_DIR" "$NATIVE_DEST"
 
@@ -113,7 +121,7 @@ fi
 # ── 3. Build native GCC ───────────────────────────────────────────────────────
 if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     echo "Building Native GCC (host=$TARGET)..."
-    export CXXFLAGS="-O2 -DCODY_NETWORKING=0"
+    export CXXFLAGS="$CXXFLAGS_VAL"
     export CXXFLAGS_FOR_BUILD="-O2"
     export CFLAGS_FOR_BUILD="-O2"
     if [ ! -f "$WORK_DIR/build-native-gcc/Makefile" ]; then
@@ -126,9 +134,11 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
             AR="$AR_VAL" \
             RANLIB="$RANLIB_VAL" \
             CFLAGS="$CFLAGS_VAL" \
+            CXXFLAGS="$CXXFLAGS_VAL" \
             CPPFLAGS="$CPPFLAGS_VAL" \
             LDFLAGS="$LDFLAGS_VAL" \
             LIBS="$LIBS_VAL" \
+            HOST_LIBS="$HOST_LIBS_VAL" \
             --host="$TARGET" \
             --target="$TARGET" \
             --prefix="" \
@@ -149,7 +159,13 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     else
         cd "$WORK_DIR/build-native-gcc"
     fi
-    make -j"$NPROC" all-gcc MAKEINFO=true
+    if [ -f "$WORK_DIR/build-native-gcc/gcc/Makefile" ]; then
+        SED_INPLACE "s|^HOST_LIBS =.*|HOST_LIBS = $HOST_LIBS_VAL|" "$WORK_DIR/build-native-gcc/gcc/Makefile"
+        if ! grep -q '^override HOST_LIBS' "$WORK_DIR/build-native-gcc/gcc/Makefile"; then
+            printf '\noverride HOST_LIBS += %s\n' "$HOST_LIBS_VAL" >> "$WORK_DIR/build-native-gcc/gcc/Makefile"
+        fi
+    fi
+    make -j"$NPROC" all-gcc MAKEINFO=true HOST_LIBS="$HOST_LIBS_VAL"
     make install-gcc DESTDIR="$NATIVE_DEST" MAKEINFO=true
     unset CXXFLAGS CXXFLAGS_FOR_BUILD CFLAGS_FOR_BUILD
 fi

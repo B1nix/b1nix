@@ -71,10 +71,11 @@ when the kernel `.text` has grown past the TCC tolerance threshold.
 
 ## Permanent Fix (Applied)
 
-### ✅ Option B: Fixed kernel `.text` size (256 KB alignment)
-Added `. = ALIGN(256K)` after the `.text` section in `kernel/arch/x86/linker.ld`.
-This pads the `.text` section to the nearest 256 KB boundary, so adding or
-removing up to 256 KB of code never shifts subsequent sections. No memory is
+### ✅ Option B: Fixed kernel section layout (512 KB alignment)
+Added `. = ALIGN(512K)` after `.text`, `.rodata`, and `.data` in
+`kernel/arch/x86/linker.ld` (originally 256 KB, raised to 512 KB as the kernel
+grew). This pads each section to the nearest 512 KB boundary, so adding or
+removing up to 512 KB of code never shifts subsequent sections. No memory is
 wasted inside the kernel binary — the alignment adds zero-fill padding that the
 ELF loader handles naturally.
 
@@ -88,4 +89,6 @@ ELF loader handles naturally.
 | 2026-05-25 | M10 (TX buffer pool) and M16 (MC clipboard) changes also triggered it |
 | 2026-05-25 | `b1nix.skip-m25` workaround added |
 | 2026-05-26 | **Fixed:** `. = ALIGN(256K)` in `kernel/arch/x86/linker.ld` — stabilises .text layout, TCC passes, B1NIX-TEST: done |
-| 2026-05-26 | Fixed: changed userspace load address from `0x2000000` to `0x400000` in `userspace/linker.ld`. The old address conflicted with kernel page table allocations when kernel `.text` grew past a certain threshold. `0x400000` is the standard Linux userspace base and avoids the collision zone. |
+| 2026-05-26 | Tried: changed userspace load address from `0x2000000` to `0x400000` in `userspace/linker.ld`. **(Superseded — see below.)** |
+| 2026-06-?? | **Reverted to `0x02000000`** during the `ARCH=x86` (i386) port: `0x400000` (4 MiB) lands *inside* the 32-bit kernel image (which extends to ~16 MiB), so it can't be the userspace base there. Both arches now use `0x02000000` (32 MiB, above `__kernel_end`). The durable layout-stability fix is the per-section `. = ALIGN(512K)` in `kernel/arch/x86/linker.ld` (raised from 256K), not the userspace base. |
+| 2026-06-03 | Clarification: the separate `NATIVE-SMOKE`/`0x2000000` "collision" was **not** this `.text`-shift class at all — it was a stale x86_64 binary embedded in the 32-bit initramfs (a build bug). See [`docs/native-smoke-collision.md`](native-smoke-collision.md). |

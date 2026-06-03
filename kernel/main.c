@@ -42,18 +42,21 @@ extern void bootinfo_init_from_fdt(u64 dtb_address);
 extern void m35_diag_run(void);
 extern void m36_diag_run(void);
 
-void kernel_main(u64 arg0, u64 arg1)
+void kernel_main(usize arg0, usize arg1)
 {
 	serial_init();
 	console_init();
 	console_write("b1nix kernel starting...\n");
 
+	console_write("arg0 (magic): 0x");
+	console_write_hex32((u32)arg0);
+	console_write("\n");
+	console_write("arg1 (info):  0x");
+	console_write_hex32((u32)arg1);
+	console_write("\n");
+
 	if (arg0 != 0x36d76289) {
-		/* Not multiboot2 magic, but maybe we can still try to parse? 
-		   Actually, better to just log it. */
-		console_write("Warning: Multiboot2 magic mismatch: 0x");
-		console_write_hex32((u32)arg0);
-		console_write("\n");
+		console_write("Warning: Multiboot2 magic mismatch\n");
 	}
 
 #ifdef __aarch64__

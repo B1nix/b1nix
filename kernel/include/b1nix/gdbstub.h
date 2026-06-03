@@ -1,7 +1,7 @@
 #ifndef B1NIX_GDBSTUB_H
 #define B1NIX_GDBSTUB_H
 
-#include <b1nix/arch_x86_64.h>
+#include <b1nix/arch.h>
 #include <b1nix/types.h>
 
 /* GDB Remote Serial Protocol stub (M36). See kernel/arch/x86_64/gdbstub.c. */

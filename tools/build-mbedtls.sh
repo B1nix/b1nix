@@ -7,17 +7,20 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 MBEDTLS_VERSION="${MBEDTLS_VERSION:-3.6.0}"
 MBEDTLS_TARBALL="mbedtls-${MBEDTLS_VERSION}.tar.gz"
 MBEDTLS_URL="https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v${MBEDTLS_VERSION}.tar.gz"
-SRC_DIR="$ROOT_DIR/build/mbedtls-src/mbedtls-${MBEDTLS_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/mbedtls-b1nix"
-INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+SRC_PARENT="$ROOT_DIR/build/mbedtls-src"
+SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/mbedtls-${MBEDTLS_VERSION}"
+BUILD_DIR="$ROOT_DIR/build/mbedtls-b1nix/$B1NIX_TRIPLET"
+INSTALL_DIR="$BUILD_DIR/install"
 
-mkdir -p "$ROOT_DIR/build/mbedtls-src" "$BUILD_DIR"
+mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/mbedtls-src/${MBEDTLS_TARBALL}"
+  tmp="$SRC_PARENT/${MBEDTLS_TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$MBEDTLS_URL" -o "$tmp"
@@ -28,7 +31,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/mbedtls-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$B1NIX_TRIPLET"
 fi
 
 CFG="$SRC_DIR/include/mbedtls/mbedtls_config.h"

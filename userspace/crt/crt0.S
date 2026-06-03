@@ -13,6 +13,7 @@
  *   5. Call exit() with main's return value
  */
 
+#ifdef __x86_64__
 /* Weak references to libgcc's DWARF frame-registration entry points. They are
  * defined only when a program links libgcc (e.g. the GCC-built native
  * toolchain: cc1/gcc/as/ld). For clang-linked b1nix programs they resolve to 0
@@ -110,5 +111,60 @@ _start:
 	/* Should never reach here */
 	hlt
 	jmp .
+#else
+.section .text
+.globl _start
+.type _start, @function
+
+_start:
+	/* Pop argc into %eax */
+	popl %eax
+
+	/* argv = ESP */
+	movl %esp, %edx
+
+	/* envp = argv + (argc + 1) * 4 */
+	leal 4(%esp,%eax,4), %ecx
+
+	/* Store envp in global environ variable */
+	movl %ecx, environ
+
+	/* Stash argc, argv, envp in callee-saved registers */
+	movl %eax, %ebx                 /* argc */
+	movl %edx, %esi                 /* argv */
+	movl %ecx, %edi                 /* envp */
+
+	/* Run ELF .init_array constructors before main(). */
+	movl $__init_array_start, %ecx
+	movl $__init_array_end, %edx
+1:
+	cmpl %edx, %ecx
+	jae 2f
+	subl $12, %esp
+	pushl %edx
+	pushl %ecx
+	call *(%ecx)
+	popl %ecx
+	popl %edx
+	addl $12, %esp
+	addl $4, %ecx
+	jmp 1b
+2:
+	/* Align stack to 16 bytes, then push arguments to main: main(argc, argv, envp) */
+	andl $-16, %esp
+	subl $4, %esp
+	pushl %edi
+	pushl %esi
+	pushl %ebx
+	call main
+
+	/* Exit with main's return value */
+	pushl %eax
+	call exit
+
+	/* Should never reach here */
+	hlt
+	jmp .
+#endif
 
 .size _start, . - _start

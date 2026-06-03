@@ -173,3 +173,16 @@ wget/curl/argv-shift markers. The one non-completion passed all M32b markers,
 including `M32B-SSH: ok service-lifecycle` and `M32B-SSH: ok handshake`, then
 timed out in a later dbclient/full-suite tail after the SSH handshake. Track
 that residual timeout outside M32b.
+
+## Status — 32-bit (`ARCH=x86`) fully green (2026-06-03)
+
+All five M32b SSH markers now pass on the 32-bit port too — `dropbearkey`,
+`handshake`, `negauth`, `pty`, and `service-lifecycle` — and the suite reaches
+`B1NIX-TEST: done` on single-CPU and `-smp 4` (**369/369**). `service-lifecycle`
+was the last 32-bit holdout: the boot rc used to `#ifdef __x86_64__`-skip sshd
+auto-start (the ported dropbear's keygen once hung), so `/var/run/sshd.pid` never
+existed and `test_sshd_service` failed `service-pid-missing`. Both blockers are
+gone — dropbearkey completes and the ELF32-on-AP fork/waitpid race was fixed
+(ae948eb, ELF32 pinned to BSP) — so the skip was removed and init now auto-starts
+sshd on both arches (commit 1873697). The init.d `start` backgrounds dropbear and
+writes the pid file, so boot rc returns promptly.

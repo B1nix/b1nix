@@ -19,13 +19,18 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 DB_VERSION="${DROPBEAR_VERSION:-2022.83}"
 DB_TARBALL="dropbear-${DB_VERSION}.tar.bz2"
 DB_URL="https://matt.ucc.asn.au/dropbear/releases/${DB_TARBALL}"
-SRC_PARENT="$ROOT_DIR/build/dropbear-src"
-SRC_DIR="$SRC_PARENT/dropbear-${DB_VERSION}"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
-mkdir -p "$SRC_PARENT"
+# Per-architecture build identity (B1NIX_ARCH -> triplet).
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+# Per-triplet source tree so x86 and x86_64 never share objects.
+SRC_PARENT="$ROOT_DIR/build/dropbear-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/dropbear-${DB_VERSION}"
+
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET"
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/${DB_TARBALL}"
@@ -39,7 +44,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xjf "$tmp" -C "$SRC_PARENT"
+  tar -xjf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
 fi
 
 # Patch config.sub to accept the x86_64-b1nix host triplet. Modern config.sub
@@ -78,7 +83,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
 (
   cd "$SRC_DIR"
   ./configure \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --disable-zlib \
     --disable-pam \
     --disable-syslog \

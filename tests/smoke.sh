@@ -7,7 +7,7 @@ set -e
 
 ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-TIMEOUT=120  # seconds to let each test run (kernel takes longer under macOS load)
+TIMEOUT=${TIMEOUT:-120}  # seconds to let each test run (kernel takes longer under macOS load; override via env)
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
@@ -38,13 +38,13 @@ run_qemu() {
 	shift
 	local pid
 
-	if [ "$ARCH" = "x86_64" ]; then
+	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		qemu-system-x86_64 \
 			${EXTRA_QEMU_ARGS:-} \
-			-cdrom "$PROJECT_DIR/build/x86_64/b1nix.iso" \
+			-cdrom "$PROJECT_DIR/build/$ARCH/b1nix.iso" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-				-netdev user,id=net0 -device virtio-net-pci,netdev=net0 \
+				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/smoke_run/net.pcap" \
 				-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
@@ -680,8 +680,8 @@ check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine res
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"
 check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 
-# Network tests are only wired for the current x86_64 QEMU path.
-if [ "$ARCH" = "x86_64" ]; then
+# Network tests are only wired for the current x86_64/x86 QEMU path.
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	echo ""
 	echo "[TEST] Network..."
 	if grep -q "virtio-net: initialized with MAC" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then

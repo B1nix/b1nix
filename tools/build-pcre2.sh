@@ -10,17 +10,22 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 PCRE2_VERSION="${PCRE2_VERSION:-10.44}"
 PCRE2_TARBALL="pcre2-${PCRE2_VERSION}.tar.gz"
 PCRE2_URL="https://github.com/PCRE2Project/pcre2/releases/download/pcre2-${PCRE2_VERSION}/${PCRE2_TARBALL}"
-SRC_DIR="$ROOT_DIR/build/pcre2-src/pcre2-${PCRE2_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/pcre2-b1nix"
-INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
-mkdir -p "$ROOT_DIR/build/pcre2-src" "$BUILD_DIR"
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/pcre2-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/pcre2-${PCRE2_VERSION}"
+BUILD_DIR="$ROOT_DIR/build/pcre2-b1nix/$HOST_TRIPLET"
+INSTALL_DIR="$BUILD_DIR/install"
+
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/pcre2-src/${PCRE2_TARBALL}"
+  tmp="$SRC_PARENT/${PCRE2_TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$PCRE2_URL" -o "$tmp" 1>&2
@@ -31,7 +36,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/pcre2-src" 1>&2
+  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET" 1>&2
 fi
 
 # Force the autotools-generated files strictly newer than their sources so
@@ -57,7 +62,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 (
   cd "$BUILD_DIR"
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
     --disable-jit \

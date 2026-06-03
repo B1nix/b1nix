@@ -164,6 +164,7 @@ enum {
 
 /* Raw syscall for the x86_64 B1NIX syscall ABI. */
 static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, long a4, long a5) {
+#ifdef __x86_64__
   long ret;
   register long rdi __asm__("rdi") = a0;
   register long rsi __asm__("rsi") = a1;
@@ -178,6 +179,49 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
                    : "r"(rax), "r"(rdi), "r"(rsi), "r"(rdx), "r"(r10), "r"(r8), "r"(r9)
                    : "rcx", "r11", "memory");
   return ret;
+#else
+  long ret;
+  register long ebx __asm__("ebx") = a0;
+  register long ecx __asm__("ecx") = a1;
+  register long edx __asm__("edx") = a2;
+  register long esi __asm__("esi") = a3;
+  register long edi __asm__("edi") = a4;
+  register long eax __asm__("eax") = num;
+
+  /* arg5 travels in EBP, which is also the compiler's frame-pointer register, so
+   * touching it is dangerous. The kernel only reads EBP for genuine 6-argument
+   * syscalls; for everything else arg5 is the macro's filler 0 and the handler
+   * ignores it. So:
+   *
+   *  - When arg5 is a compile-time 0 (the overwhelming majority — every <6-arg
+   *    call, including fork/clone-less paths), DON'T touch EBP at all. The trap
+   *    frame then records the caller's real frame pointer, which matters because
+   *    fork() copies that frame into the child: if EBP were 0 there, the child
+   *    would resume with a null frame pointer and crash at the next function
+   *    epilogue (`lea -k(%ebp),%esp`). The kernel harmlessly sees the real EBP
+   *    as an unused arg5.
+   *  - When arg5 is non-zero/non-constant (true 6-arg syscalls like mmap with a
+   *    real offset), save/restore EBP around the trap and load arg5 into it.
+   */
+  if (__builtin_constant_p(a5) && (a5) == 0) {
+    __asm__ volatile("int $0x80"
+                     : "=a"(ret)
+                     : "r"(eax), "r"(ebx), "r"(ecx), "r"(edx), "r"(esi),
+                       "r"(edi)
+                     : "memory");
+  } else {
+    __asm__ volatile(
+        "pushl %%ebp\n\t"
+        "movl %[a5v], %%ebp\n\t"
+        "int $0x80\n\t"
+        "popl %%ebp\n\t"
+        : "=a"(ret)
+        : "r"(eax), "r"(ebx), "r"(ecx), "r"(edx), "r"(esi), "r"(edi),
+          [a5v] "g"(a5)
+        : "memory", "cc");
+  }
+  return ret;
+#endif
 }
 
 #define syscall(num, ...) _syscall_route(num, ##__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0)

@@ -64,12 +64,12 @@ struct stat {
   unsigned int st_uid;
   unsigned int st_gid;
   unsigned long long st_rdev;
-  unsigned long long st_size;
+  off_t st_size;
   unsigned long long st_blksize;
   unsigned long long st_blocks;
-  unsigned long long st_atime;
-  unsigned long long st_mtime;
-  unsigned long long st_ctime;
+  time_t st_atime;
+  time_t st_mtime;
+  time_t st_ctime;
 };
 int stat(const char *path, struct stat *st);
 

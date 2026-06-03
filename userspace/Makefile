@@ -3,14 +3,23 @@
 # Builds the userspace C library (libb1nix.a) and example programs.
 # All binaries are ELF executables loadable by the B1NIX kernel.
 
-CC       := clang
+B1NIX_ARCH ?= x86_64
+ifeq ($(B1NIX_ARCH),x86)
+TARGET   := i686-unknown-elf
+LDFLAGS  := -m elf_i386
+# Host triplet for the per-triplet ported-library install trees (must match
+# tools/toolchain-env.sh: x86 -> i686-b1nix, x86_64 -> x86_64-b1nix).
+B1NIX_TRIPLET := i686-b1nix
+else
 TARGET   := x86_64-unknown-elf
+LDFLAGS  := -m elf_x86_64
+B1NIX_TRIPLET := x86_64-b1nix
+endif
+CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MMD -MP
-LDFLAGS  := -m elf_x86_64
 BUILD    := build
-B1NIX_ARCH ?= x86_64
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
 CRT0     := $(BUILD)/crt/crt0.o
@@ -30,7 +39,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/pthread.o \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \
-	$(BUILD)/libc/wctype.o
+	$(BUILD)/libc/wctype.o \
+	$(BUILD)/libc/div64.o
 
 BINARIES := \
 	$(BUILD)/bin/hello \
@@ -96,7 +106,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
-MBEDTLS_DIR := ../build/mbedtls-b1nix/install
+MBEDTLS_DIR := ../build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
@@ -112,7 +122,7 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	fi
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
-PCRE2_DIR := ../build/pcre2-b1nix/install
+PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
@@ -131,7 +141,11 @@ $(BUILD)/bin/m30_pie: bin/m30_pie.c linker_pie.ld
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)
 	cd tcc && clang -DC2STR conftest.c -o c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
-	../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
+ifeq ($(B1NIX_ARCH),x86)
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
+else
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
+endif
 
 # ── Install to rootfs ──
 install: all

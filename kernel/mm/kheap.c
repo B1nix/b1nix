@@ -4,6 +4,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/arch.h>
 #include <string.h>
 
 struct kheap_block {
@@ -64,8 +65,23 @@ struct kheap_state {
  * setup: a PD/PT installed for an arena page lands in the shared PDPT and is
  * visible in every address space, exactly like a general-heap growth.
  * -----------------------------------------------------------------------*/
+#ifdef __x86_64__
 #define KLARGE_START     (KHEAP_START + 0x1000000000ULL) /* +64 GB, same PML4[384] */
 #define KLARGE_END       (KHEAP_START + 0x8000000000ULL) /* +512 GB (PML4[384] top) */
+#else
+/* 32-bit: the +64 GB offset above overflows the 32-bit virtual address space and
+ * aliases straight back onto the general kheap
+ * (0xc0000000 + 0x1000000000 == 0x10c0000000, truncated to 0xc0000000 by the
+ * 2-level pager), so a single >=256 KB allocation (e.g. the boot block cache)
+ * mapped and zeroed frames on top of live kheap objects — including the boot
+ * task struct, whose corrupted state field let find_unused_task recycle slot 0.
+ * The 32-bit map leaves 0xE0000000-0xFFFFFFFF free above the kheap (0xC0000000)
+ * and the MMIO window (0xD0000000-0xE0000000), so site the arena there. PD
+ * index 0xE0000000>>22 == 896 falls in the cloned kernel half (>=512), so arena
+ * page tables stay globally visible just like the 64-bit case. */
+#define KLARGE_START     0xE0000000ULL
+#define KLARGE_END       0xFF000000ULL   /* leave the top 16 MB unmapped */
+#endif
 #define KLARGE_THRESHOLD (256u * 1024u)
 #define KLARGE_MAGIC     0xB1A11A6EULL
 #define KLARGE_HEADER_SIZE 32
@@ -172,12 +188,10 @@ static inline int kheap_mag_ready(void) {
 }
 
 static inline u64 kheap_irq_save_cli(void) {
-  u64 f;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(f) : : "memory");
-  return f;
+  return interrupts_save();
 }
 static inline void kheap_irq_restore(u64 f) {
-  __asm__ volatile("pushq %0; popfq" : : "r"(f) : "memory", "cc");
+  interrupts_restore(f);
 }
 
 /* Try to satisfy a small alloc from this CPU's magazine. Returns a ready-to-use
@@ -349,7 +363,11 @@ static u64 align_up_u64(u64 value, u64 alignment) {
 }
 
 static int is_canonical_addr(u64 addr) {
+#ifdef __x86_64__
   return ((isize)addr >> 47) == 0 || ((isize)addr >> 47) == -1;
+#else
+  return (addr >> 32) == 0;
+#endif
 }
 
 static void heap_grow(usize minimum_bytes) {

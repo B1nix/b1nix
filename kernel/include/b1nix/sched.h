@@ -49,7 +49,7 @@ struct cpu_context {
   u64 fp;
   u64 lr;
   u64 sp;
-#else
+#elif defined(__x86_64__)
   u64 rsp;
   u64 rbp;
   u64 rbx;
@@ -57,6 +57,12 @@ struct cpu_context {
   u64 r13;
   u64 r14;
   u64 r15;
+#else
+  u32 esp;
+  u32 ebp;
+  u32 ebx;
+  u32 esi;
+  u32 edi;
 #endif
 };
 

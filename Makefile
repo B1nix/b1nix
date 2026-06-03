@@ -1,5 +1,17 @@
+.DEFAULT_GOAL := all
 ARCH ?= x86_64
+export B1NIX_ARCH := $(ARCH)
+$(shell $(MAKE) -C userspace B1NIX_ARCH=$(ARCH) build/libb1nix.a build/crt/crt0.o >/dev/null)
 BUILD_DIR := build/$(ARCH)
+# Host triplet for the ported userspace toolchain + programs. Their build trees
+# live under per-triplet directories (build/toolchain_build/<triplet>,
+# build/<prog>-{src,b1nix}/<triplet>) so x86 and x86_64 never share objects.
+# Keep this mapping in sync with tools/toolchain-env.sh.
+ifeq ($(ARCH),x86)
+B1NIX_TRIPLET := i686-b1nix
+else
+B1NIX_TRIPLET := x86_64-b1nix
+endif
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 RUN_ISO := /tmp/b1nix-run.iso
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
@@ -30,10 +42,20 @@ INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
-CURL_ELF := build/curl-b1nix/src/curl
-WGET_ELF := build/wget-b1nix/src/wget
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
+	$(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) \
+	$(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) \
+	$(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) \
+	$(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) \
+	$(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) \
+	$(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) \
+	$(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) \
+	$(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) \
+	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
+CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
+WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
-DROPBEAR_ELF := build/dropbear-src/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
+DROPBEAR_ELF := build/dropbear-src/$(B1NIX_TRIPLET)/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
 B1NIX_TLS ?= mbedtls
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -54,15 +76,15 @@ GRUB_TIMEOUT ?= 0
 ROOT_IMAGE_SIZE ?= 512
 
 # Locate the native toolchain that tools/build-native-toolchain.sh produced.
-# The script writes to build/toolchain_build/native_root by default, or to
-# ~/b1nix-toolchain/native_root when the project path contains spaces (WSL).
+# Per-triplet: build/toolchain_build/<triplet>/native_root by default, or
+# ~/b1nix-toolchain/<triplet>/native_root when the project path has spaces (WSL).
 # /root/b1nix-toolchain is the legacy Docker-builder location kept as fallback.
 NATIVE_TOOLCHAIN_ROOT := $(shell \
-	for p in build/toolchain_build/native_root $$HOME/b1nix-toolchain/native_root /root/b1nix-toolchain/native_root; do \
+	for p in build/toolchain_build/$(B1NIX_TRIPLET)/native_root $$HOME/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root /root/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root; do \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 CROSS_TOOLCHAIN_ROOT := $(shell \
-	for p in build/toolchain_build/cross $$HOME/b1nix-toolchain/cross /root/b1nix-toolchain/cross; do \
+	for p in build/toolchain_build/$(B1NIX_TRIPLET)/cross $$HOME/b1nix-toolchain/$(B1NIX_TRIPLET)/cross /root/b1nix-toolchain/$(B1NIX_TRIPLET)/cross; do \
 		if [ -d "$$p" ]; then echo "$$p"; break; fi; \
 	done)
 
@@ -102,6 +124,7 @@ COMMON_CFLAGS := \
 	-Wall \
 	-Wextra \
 	-I kernel/include \
+	-I $(BUILD_DIR) \
 	$(CFLAGS_EXTRA)
 
 
@@ -119,9 +142,18 @@ LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
 ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c
 else ifeq ($(ARCH),x86)
-$(error ARCH=x86 is reserved for the future 32-bit port; the current 64-bit port is ARCH=x86_64)
+TARGET := i686-elf
+ifeq ($(TOOLCHAIN),gcc)
+ARCH_CFLAGS := -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 else
-$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64)
+ARCH_CFLAGS := --target=$(TARGET) -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
+endif
+ARCH_LDFLAGS := -m elf_i386 -z max-page-size=0x1000
+LINKER_SCRIPT := kernel/arch/x86/linker.ld
+ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
+ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c kernel/arch/x86/coredump.c kernel/arch/x86/gdbstub.c
+else
+$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64 or ARCH=x86)
 endif
 
 KERNEL_SOURCES := \
@@ -180,7 +212,7 @@ KERNEL_SOURCES := \
 	kernel/user/editor.c \
 	$(ARCH_SOURCES)
 
-ifeq ($(ARCH),x86_64)
+ifneq ($(filter $(ARCH),x86_64 x86),)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
@@ -217,7 +249,7 @@ OBJECTS := \
 ANALYZE_DIR := $(BUILD_DIR)/analyze
 
 # ── Static Analysis ──
-analyze: $(KERNEL_SOURCES) $(ASM_SOURCES)
+analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@mkdir -p $(ANALYZE_DIR)
 	@echo "Running clang static analyzer..."
 	@for src in $(KERNEL_SOURCES); do \
@@ -264,13 +296,40 @@ $(BUILD_DIR)/%.o: %.c
 # whole kernel).
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
-$(BUILD_DIR)/kernel/arch/x86_64/lapic.o: $(AP_TRAMPOLINE_INC)
+$(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
+
+# Arch guard for the SHARED userspace build dir.
+#
+# userspace/build/ is not arch-qualified — both ARCH=x86 and ARCH=x86_64 compile
+# into the same tree. Switching ARCH must invalidate every embedded binary, but
+# most binaries only rebuild because their per-arch prereqs ($(LIB)/$(CRT0)) get
+# rebuilt; native_smoke/tcc/m30_pie link neither, so a leftover binary from the
+# other arch survives an arch switch and gets xxd-bundled into the wrong-arch
+# initramfs. A 64-bit native_smoke embedded in the 32-bit kernel is accepted by
+# the ELF64 loader and SIGILLs the moment it runs in ring3 (the "0x2000000
+# collision" — it was never a PMM/layout bug, just a stale .inc).
+#
+# The stamp records the arch the shared tree was last built for. When ARCH
+# changes it wipes the tree so every output relinks for the new arch, then
+# rewrites itself; its mtime advances only on a real switch, so same-arch builds
+# don't churn. It is part of USERSPACE_DEPS so all *.inc re-bundle after a wipe.
+USERSPACE_ARCH_STAMP := userspace/build/.arch
+.PHONY: FORCE
+FORCE:
+$(USERSPACE_ARCH_STAMP): FORCE
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(ARCH)" ]; then \
+		echo "  [arch-guard] userspace tree was not built for ARCH=$(ARCH) — wiping userspace/build"; \
+		rm -rf userspace/build; \
+		mkdir -p userspace/build; \
+		echo "$(ARCH)" > $@; \
+	fi
 
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
 USERSPACE_DEPS := \
+	$(USERSPACE_ARCH_STAMP) \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/include/*.h) \
 	$(wildcard userspace/include/arpa/*.h) \
@@ -374,7 +433,7 @@ $(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CU
 	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
-PCRE2_LIB := build/pcre2-b1nix/install/lib/libpcre2-8.a
+PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
 $(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-pcre2.sh >/dev/null
 
@@ -399,11 +458,11 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
-OPENSSL_LIB := build/openssl-b1nix/install/lib/libssl.a
+OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
 $(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-openssl.sh >/dev/null
 
-LIBIDN2_LIB := build/libidn2-b1nix/install/lib/libidn2.a
+LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
 $(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-libidn2.sh >/dev/null
 
@@ -451,7 +510,7 @@ $(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
-AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/x86_64/ap_trampoline_tmp.o
+AP_TRAMP_OBJ := $(BUILD_DIR)/kernel/arch/$(ARCH)/ap_trampoline_tmp.o
 AP_TRAMP_BIN := $(BUILD_DIR)/ap_trampoline.bin
 # ld.lld defaults its image base to 0x200000 and rejects -Ttext 0x8000 unless
 # we pin the image base to 0. GNU ld doesn't recognise --image-base; pass it
@@ -460,12 +519,12 @@ ifneq (,$(findstring lld,$(LD)))
 AP_IMAGE_BASE := --image-base=0
 endif
 
-$(AP_TRAMP_OBJ): kernel/arch/x86_64/ap_trampoline.S
+$(AP_TRAMP_OBJ): kernel/arch/$(ARCH)/ap_trampoline.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 $(AP_TRAMP_BIN): $(AP_TRAMP_OBJ)
-	$(LD) -m elf_x86_64 -z max-page-size=0x1000 $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
+	$(LD) $(ARCH_LDFLAGS) $(AP_IMAGE_BASE) -Ttext 0x8000 -o $@ --oformat binary $<
 
 $(AP_TRAMPOLINE_INC): $(AP_TRAMP_BIN)
 	@mkdir -p $(dir $@)
@@ -492,13 +551,13 @@ userspace-install: userspace
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
 		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
-		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0; \
+		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0; \
 		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
-		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" ]; then \
-			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/x86_64-b1nix/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/x86_64-b1nix/13.2.0/; \
+		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" ]; then \
+			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
 		fi; \
 	else \
-		echo "Note: native toolchain not built (looked in build/toolchain_build/native_root and ~/b1nix-toolchain/native_root)."; \
+		echo "Note: native toolchain not built (looked in build/toolchain_build/$(B1NIX_TRIPLET)/native_root and ~/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root)."; \
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
 	fi
 
@@ -524,11 +583,11 @@ install-kernel-source:
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
 	@if [ -f README.md ]; then cp README.md $(BUILD_DIR)/rootfs/usr/src/b1nix/; fi
 	@# The in-guest kernel build (self-host) compiles lapic.c and initramfs.c,
-	@# which #include generated artifacts from build/x86_64 (ap_trampoline.inc and
+	@# which #include generated artifacts from build/$(ARCH) (ap_trampoline.inc and
 	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
 	@# host output, so stage just these generated *.inc inputs the compile needs.
-	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64
-	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/x86_64/ 2>/dev/null || true
+	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)
+	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 iso-full: userspace-install install-native-toolchain install-kernel-source iso
@@ -577,7 +636,8 @@ smoke:
 smoke-x86_64: ARCH=x86_64
 smoke-x86_64: smoke
 
-smoke-x86: smoke-x86_64
+smoke-x86: ARCH=x86
+smoke-x86: smoke
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh

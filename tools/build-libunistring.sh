@@ -7,17 +7,20 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 VER="${LIBUNISTRING_VERSION:-1.2}"
 TARBALL="libunistring-${VER}.tar.gz"
 URL="https://ftp.gnu.org/gnu/libunistring/${TARBALL}"
-SRC_DIR="$ROOT_DIR/build/libunistring-src/libunistring-${VER}"
-BUILD_DIR="$ROOT_DIR/build/libunistring-b1nix"
-INSTALL_DIR="$BUILD_DIR/install"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
-
-mkdir -p "$ROOT_DIR/build/libunistring-src" "$BUILD_DIR"
+# Per-architecture build identity + per-triplet source/build dirs.
+. "$ROOT_DIR/tools/toolchain-env.sh"
+HOST_TRIPLET="$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/libunistring-src"
+SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/libunistring-${VER}"
+BUILD_DIR="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET"
+INSTALL_DIR="$BUILD_DIR/install"
+mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
-  tmp="$ROOT_DIR/build/libunistring-src/${TARBALL}"
+  tmp="$SRC_PARENT/${TARBALL}"
   if [ ! -f "$tmp" ]; then
     if command -v curl >/dev/null 2>&1; then
       curl -L "$URL" -o "$tmp"
@@ -28,7 +31,7 @@ if [ ! -d "$SRC_DIR" ]; then
       exit 1
     fi
   fi
-  tar -xzf "$tmp" -C "$ROOT_DIR/build/libunistring-src"
+  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
 fi
 
 if ! grep -q 'b1nix\*' "$SRC_DIR/build-aux/config.sub"; then
@@ -50,7 +53,7 @@ mkdir -p "$BUILD_DIR"
 (
   cd "$BUILD_DIR"
   "$SRC_DIR/configure" \
-    --host=x86_64-b1nix \
+    --host="$HOST_TRIPLET" \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
     --disable-nls \

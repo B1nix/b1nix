@@ -1,4 +1,4 @@
-#include <b1nix/arch_x86_64.h>
+#include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/compositor.h>
 #include <b1nix/console.h>

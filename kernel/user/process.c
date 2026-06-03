@@ -9,7 +9,7 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 
-extern void x86_user_jump(u64 entry, u64 stack, u64 argc, u64 argv);
+extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
 /* Built-in program registry (C2 audit): grows on demand from the kheap
@@ -63,7 +63,11 @@ struct elf64_dyn {
  * above the standard 0x400000 ET_EXEC load base and below the user
  * stack top (0x800000000000) so a PIE binary and the existing static
  * binaries don't collide. */
+#ifdef __x86_64__
 #define PIE_LOAD_BASE 0x0000500000000000ULL
+#else
+#define PIE_LOAD_BASE 0x40000000ULL
+#endif
 
 struct process_start {
   struct user_loaded_image *image;
@@ -182,15 +186,15 @@ static int copy_string_vector(const char **src, int max_count,
   return 0;
 }
 
-static int user_stack_push_u64(char *stack, usize *sp, u64 value) {
-  if (*sp < sizeof(u64))
+static int user_stack_push_usize(char *stack, usize *sp, usize value) {
+  if (*sp < sizeof(usize))
     return -1;
-  *sp -= sizeof(u64);
+  *sp -= sizeof(usize);
   memcpy(stack + *sp, &value, sizeof(value));
   return 0;
 }
 
-static u64 user_stack_push_string(char *stack, usize *sp, const char *text) {
+static usize user_stack_push_string(char *stack, usize *sp, const char *text) {
   usize len = strlen(text) + 1;
   if (*sp < len)
     return 0; // Return 0 to indicate error (0 is never a valid user pointer for strings)
@@ -201,8 +205,8 @@ static u64 user_stack_push_string(char *stack, usize *sp, const char *text) {
 
 static int user_build_initial_stack(struct user_loaded_image *image) {
   char *stack = image->address_space.stack_image;
-  u64 argv_ptrs[USER_MAX_ARGS];
-  u64 envp_ptrs[USER_MAX_ENVS];
+  usize argv_ptrs[USER_MAX_ARGS];
+  usize envp_ptrs[USER_MAX_ENVS];
   usize sp = USER_STACK_SIZE;
 
   if (!stack)
@@ -225,32 +229,42 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 
   sp &= ~(usize)0xf;
 
-  /* FIX: Ensure the final stack pointer will be 16-byte aligned.
-   * We push: argc(1), argv(argc), NULL(1), envp(envc), NULL(1), auxv(5).
-   * Total slots = 1 + image->argc + 1 + envc + 1 + 5 = image->argc + envc + 8.
-   * If total_slots is odd, we need 8 bytes of padding to keep 16-byte alignment.
-   */
+  /* Ensure the final stack pointer (which becomes ESP/RSP at _start) is
+   * 16-byte aligned, as the SysV ABI requires. We are about to push exactly
+   * total_slots pointer-sized words: argc(1), argv(argc), NULL(1), envp(envc),
+   * NULL(1), auxv(5). sp is 16-aligned right now, so after the pushes it stays
+   * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
+   * many zero words as needed to reach the next 16-byte boundary.
+   *
+   * On x86_64 sizeof(usize)==8, so a single pad word always sufficed (16/8==2
+   * words per 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
+   * pad words may be required — the old "push one if misaligned" left ESP 4- or
+   * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
+   * the unaligned ring3 stack, so every ELF32 spawn failed. */
   usize total_slots = 8 + (usize)image->argc + (usize)envc;
-  if (total_slots % 2 != 0) {
-    if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
+  usize words_per_16 = 16 / sizeof(usize);
+  usize rem = total_slots % words_per_16;
+  usize pad = rem ? (words_per_16 - rem) : 0;
+  for (usize p = 0; p < pad; p++) {
+    if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   }
 
-  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1; /* AT_NULL */
-  if (user_stack_push_u64(stack, &sp, 9) < 0) return -1; /* AT_ENTRY */
-  if (user_stack_push_u64(stack, &sp, image->entry) < 0) return -1;
-  if (user_stack_push_u64(stack, &sp, 3) < 0) return -1; /* AT_PHDR */
-  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL */
+  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1; /* AT_ENTRY */
+  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1; /* AT_PHDR */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
 
-  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
-    if (user_stack_push_u64(stack, &sp, envp_ptrs[i]) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, envp_ptrs[i]) < 0) return -1;
   }
 
-  if (user_stack_push_u64(stack, &sp, 0) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = image->argc - 1; i >= 0; i--) {
-    if (user_stack_push_u64(stack, &sp, argv_ptrs[i]) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, argv_ptrs[i]) < 0) return -1;
   }
-  if (user_stack_push_u64(stack, &sp, (u64)image->argc) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)image->argc) < 0) return -1;
 
   image->address_space.stack_base = USER_STACK_TOP - USER_STACK_SIZE + sp;
   image->address_space.stack_size = USER_STACK_TOP - image->address_space.stack_base;
@@ -610,6 +624,209 @@ void user_image_free(struct user_loaded_image *image) {
   kfree(image);
 }
 
+#define ELF_CLASS_32 1
+#define ELF_MACHINE_386 3
+#define DT_REL 17
+#define DT_RELSZ 18
+#define R_386_RELATIVE 8
+
+struct elf32_ehdr {
+  u8 e_ident[16];
+  u16 e_type;
+  u16 e_machine;
+  u32 e_version;
+  u32 e_entry;
+  u32 e_phoff;
+  u32 e_shoff;
+  u32 e_flags;
+  u16 e_ehsize;
+  u16 e_phentsize;
+  u16 e_phnum;
+  u16 e_shentsize;
+  u16 e_shnum;
+  u16 e_shstrndx;
+} __attribute__((packed));
+
+struct elf32_phdr {
+  u32 p_type;
+  u32 p_offset;
+  u32 p_vaddr;
+  u32 p_paddr;
+  u32 p_filesz;
+  u32 p_memsz;
+  u32 p_flags;
+  u32 p_align;
+} __attribute__((packed));
+
+struct elf32_rel {
+  u32 r_offset;
+  u32 r_info;
+} __attribute__((packed));
+
+struct elf32_dyn {
+  i32 d_tag;
+  u32 d_val;
+} __attribute__((packed));
+
+static int user_load_elf32(struct user_loaded_image *image, const char *path) {
+  char *file_data = 0;
+  usize file_size = 0;
+  if (user_image_read_vfs_file(path, &file_data, &file_size) != 0)
+    return -1;
+  if (file_size < sizeof(struct elf32_ehdr)) {
+    kfree(file_data);
+    return -1;
+  }
+
+  struct elf32_ehdr *ehdr = (struct elf32_ehdr *)file_data;
+  if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
+      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_ident[4] != ELF_CLASS_32 || ehdr->e_ident[5] != ELF_DATA_LE) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_machine != ELF_MACHINE_386) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
+    kfree(file_data);
+    return -1;
+  }
+
+  image->kind = USER_IMAGE_ELF32;
+  image->path = kernel_strdup(path);
+
+  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+
+  image->entry = ehdr->e_entry + load_base;
+  console_write("ELF32 load: ");
+  console_write(path);
+  console_write(" entry=0x");
+  console_write_hex64(image->entry);
+  if (load_base) {
+    console_write(" (PIE base=0x");
+    console_write_hex64(load_base);
+    console_write(")");
+  }
+  console_write("\n");
+  image->address_space = user_address_space_create();
+
+  /* PT_INTERP */
+  for (u16 j = 0; j < ehdr->e_phnum; j++) {
+    struct elf32_phdr *p =
+        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)j * ehdr->e_phentsize));
+    if (p->p_type != PT_INTERP) continue;
+    if (p->p_offset + p->p_filesz > file_size) continue;
+    char interp[64];
+    usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
+                                              : sizeof(interp) - 1;
+    memcpy(interp, file_data + p->p_offset, ilen);
+    interp[ilen] = '\0';
+    console_write("ELF32 load: PT_INTERP=");
+    console_write(interp);
+    console_write(" (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n");
+  }
+
+  /* First pass: PT_LOAD segments */
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    struct elf32_phdr *phdr =
+        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)i * ehdr->e_phentsize));
+    if (phdr->p_type != PT_LOAD)
+      continue;
+    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS) {
+      kfree(file_data);
+      return -1;
+    }
+    if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
+        phdr->p_offset + phdr->p_filesz > file_size ||
+        phdr->p_filesz > phdr->p_memsz) {
+      kfree(file_data);
+      return -1;
+    }
+    u64 reloc_vaddr = phdr->p_vaddr + load_base;
+    if (reloc_vaddr + phdr->p_memsz < reloc_vaddr ||
+        reloc_vaddr + phdr->p_memsz > USER_SPACE_LIMIT) {
+      kfree(file_data);
+      return -1;
+    }
+
+    struct user_image_segment *segment =
+        &image->segments[image->segment_count++];
+    segment->vaddr = reloc_vaddr;
+    segment->memsz = phdr->p_memsz;
+    segment->filesz = phdr->p_filesz;
+    segment->flags = phdr->p_flags;
+
+    if (phdr->p_filesz > 0) {
+      segment->data = kzalloc(phdr->p_filesz);
+      if (!segment->data) {
+        kfree(file_data);
+        return -1;
+      }
+      memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
+    } else {
+      segment->data = 0;
+    }
+  }
+
+  /* Second pass: apply relocations */
+  if (load_base != 0) {
+    u64 rel_off = 0, rel_sz = 0;
+    for (u16 i = 0; i < ehdr->e_phnum; i++) {
+      struct elf32_phdr *phdr =
+          (struct elf32_phdr *)(file_data + ehdr->e_phoff +
+                                ((u64)i * ehdr->e_phentsize));
+      if (phdr->p_type != PT_DYNAMIC) continue;
+      if (phdr->p_offset + phdr->p_filesz > file_size) continue;
+      struct elf32_dyn *dyn =
+          (struct elf32_dyn *)(file_data + phdr->p_offset);
+      usize ndyn = phdr->p_filesz / sizeof(struct elf32_dyn);
+      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
+        switch (dyn[d].d_tag) {
+          case DT_REL:    rel_off = dyn[d].d_val; break;
+          case DT_RELSZ:  rel_sz = dyn[d].d_val; break;
+        }
+      }
+      break;
+    }
+
+    if (rel_off && rel_sz) {
+      usize nrel = rel_sz / sizeof(struct elf32_rel);
+      u8 *rel_stage = _vaddr_to_stage(image, rel_off + load_base, rel_sz);
+      if (!rel_stage) {
+        kfree(file_data);
+        return -1;
+      }
+      struct elf32_rel *rel = (struct elf32_rel *)rel_stage;
+      for (usize r = 0; r < nrel; r++) {
+        u32 r_type = rel[r].r_info & 0xff;
+        if (r_type == R_386_RELATIVE) {
+          u8 *target = _vaddr_to_stage(image, rel[r].r_offset + load_base, 4);
+          if (!target) {
+            kfree(file_data);
+            return -1;
+          }
+          u32 addend = *(u32 *)target;
+          *(u32 *)target = addend + (u32)load_base;
+        }
+      }
+    }
+  }
+
+  kfree(file_data);
+  return 0;
+}
+
 static struct user_loaded_image *user_load_image(const char *path, int argc,
                                                  const char **argv,
                                                  const char **envp,
@@ -645,6 +862,15 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
   if (user_load_elf64(image, path) == 0) {
     if (user_build_initial_stack(image) != 0) {
       console_write("user_load_image: user_build_initial_stack ELF64 failed\n");
+      user_image_free(image);
+      return 0;
+    }
+    return image;
+  }
+
+  if (user_load_elf32(image, path) == 0) {
+    if (user_build_initial_stack(image) != 0) {
+      console_write("user_load_image: user_build_initial_stack ELF32 failed\n");
       user_image_free(image);
       return 0;
     }
@@ -909,8 +1135,8 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     console_write("user: reject unaligned ring3 stack\n");
     return -1;
   }
-  if (image->entry >= 0x0000800000000000ULL ||
-      image->address_space.stack_base >= 0x0000800000000000ULL) {
+  if (image->entry >= USER_SPACE_LIMIT ||
+      image->address_space.stack_base >= USER_SPACE_LIMIT) {
     console_write("user: reject non-canonical ring3 frame\n");
     return -1;
   }
@@ -919,9 +1145,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * live FPU here since exec replaces the image without a context switch. */
   arch_fpu_init_current();
 
-  x86_user_jump(image->entry, image->address_space.stack_base,
-                (u64)image->argc,
-                image->address_space.stack_base + sizeof(u64));
+  x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
+                (usize)image->argc,
+                (usize)(image->address_space.stack_base + sizeof(usize)));
 
   return 0; // Should not reach here
 }
@@ -934,7 +1160,9 @@ static void user_process_thread(void *arg) {
   kfree(start);
 
   int code = 0;
-  if (image->kind == USER_IMAGE_ELF64) {
+  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
+    /* Real ELF (both 64- and 32-bit) enters ring 3 via x86_user_jump; its
+     * entry is a userspace virtual address, NOT a kernel function pointer. */
     code = user_run_elf_image(image);
   } else {
     user_program_entry entry = (user_program_entry)(usize)image->entry;
@@ -993,7 +1221,15 @@ int user_spawn(const char *path, int argc, const char **argv) {
 
   /* Real userspace ELF processes may run on Application Processors: they enter
    * ring 3 and so release the Big Kernel Lock. Builtins run in kernel mode and
-   * stay on the BSP (ap_runnable=0). */
+   * stay on the BSP (ap_runnable=0).
+   *
+   * 32-bit caveat: an AP that picks up a freshly forked ELF32 child wedges the
+   * suite (M27's fork()+waitpid) — the child's first ring-3 syscall on the AP
+   * can't make progress against the BKL while the parent is blocked in
+   * waitpid, so the parent never reaps it. The 32-bit AP/BKL hand-off is not
+   * yet safe for ordinary userspace, so ELF32 processes stay on the BSP; APs
+   * still run stealable kernel workers (M24b work-stealing). ELF64 (x86_64)
+   * keeps running userspace on APs. */
   int ap_runnable = (image->kind == USER_IMAGE_ELF64);
   int tid = kthread_create_user(safe_name, user_process_thread, start, ap_runnable);
   if (tid < 0) {
@@ -1007,8 +1243,8 @@ int user_spawn(const char *path, int argc, const char **argv) {
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
   struct vfs_node *node = vfs_find_node(path);
-  if (IS_ERR(node))
-    return (int)PTR_ERR(node);
+  if (!node || IS_ERR(node))
+    return node ? (int)PTR_ERR(node) : -ENOENT;
 
   /* POSIX: Check execute permission */
   const struct cred *cred = scheduler_get_current_cred();
@@ -1066,7 +1302,7 @@ int user_execve_current(const char *path, const char **argv,
   }
 
   int code = 0;
-  if (image->kind == USER_IMAGE_ELF64) {
+  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
     code = user_run_elf_image(image);
   } else {
     user_program_entry entry = (user_program_entry)(usize)image->entry;

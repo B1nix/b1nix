@@ -3,6 +3,7 @@
 #include <b1nix/net.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
+#include <b1nix/arch.h>
 #include <string.h>
 
 /* TCP protocol number in IPv4 */
@@ -119,13 +120,11 @@ static u32 tcp_iss_counter = 0;
 static volatile int tcp_queue_lock;
 
 static u64 irq_save(void) {
-  u64 flags;
-  __asm__ volatile("pushfq; popq %0; cli" : "=r"(flags) : : "memory");
-  return flags;
+  return interrupts_save();
 }
 
 static void irq_restore(u64 flags) {
-  __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory", "cc");
+  interrupts_restore(flags);
 }
 
 /* Defined in kernel/arch/x86_64/tlb.c. tcp_lock() is always taken with IRQs

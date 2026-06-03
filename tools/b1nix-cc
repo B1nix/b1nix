@@ -12,7 +12,16 @@ LIB="$USR/build/libb1nix.a"
 CRT0="$USR/build/crt/crt0.o"
 LINKER="$USR/linker.ld"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
-TARGET="x86_64-unknown-elf"
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+	TARGET="i686-unknown-elf"
+	LD_EMULATION="elf_i386"
+	ARCH_FLAGS="-fomit-frame-pointer"
+else
+	TARGET="x86_64-unknown-elf"
+	LD_EMULATION="elf_x86_64"
+	ARCH_FLAGS=""
+fi
 
 [ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make -C "$USR" -s; }
 
@@ -30,13 +39,20 @@ while [ $# -gt 0 ]; do
 	shift
 done
 
+CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
+if [ -n "$CLANG_RES_DIR" ]; then
+	RES_INC="-isystem $CLANG_RES_DIR/include"
+else
+	RES_INC=""
+fi
+
 OBJS=""
 for src in $SOURCES; do
 	obj="${src%.c}.o"
-	clang --target="$TARGET" -ffreestanding -fno-builtin -fno-stack-protector \
-		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" -Wall -O2 -msoft-float -mno-implicit-float -Db1nix $FLAGS -c "$src" -o "$obj"
+	clang --target="$TARGET" $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector \
+		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" $RES_INC -Wall -O2 -msoft-float -mno-implicit-float -Db1nix $FLAGS -c "$src" -o "$obj"
 	OBJS="$OBJS $obj"
 done
 
-"$LD" -m elf_x86_64 -T "$LINKER" -o "$OUTPUT" "$CRT0" $OBJS --whole-archive "$LIB" --no-whole-archive
+"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$OUTPUT" "$CRT0" $OBJS --whole-archive "$LIB" --no-whole-archive
 echo "b1nix-cc: $OUTPUT ready" >&2

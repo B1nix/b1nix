@@ -60,13 +60,24 @@ static inline int spin_is_locked(spinlock_t *lock) {
  * spin_lock, which polls TLB shootdowns — so an IRQs-off waiter here still
  * drains them and cannot deadlock the initiator. */
 static inline void spin_lock_irqsave(spinlock_t *lock, u64 *flags) {
+#ifdef __x86_64__
     __asm__ volatile("pushfq; popq %0; cli" : "=r"(*flags) : : "memory");
+#else
+    u32 f32;
+    __asm__ volatile("pushfd; popl %0; cli" : "=r"(f32) : : "memory");
+    *flags = f32;
+#endif
     spin_lock(lock);
 }
 
 static inline void spin_unlock_irqrestore(spinlock_t *lock, u64 flags) {
     spin_unlock(lock);
+#ifdef __x86_64__
     __asm__ volatile("pushq %0; popfq" : : "r"(flags) : "memory");
+#else
+    u32 f32 = (u32)flags;
+    __asm__ volatile("pushl %0; popfd" : : "r"(f32) : "memory");
+#endif
 }
 
 #endif /* B1NIX_SPINLOCK_H */

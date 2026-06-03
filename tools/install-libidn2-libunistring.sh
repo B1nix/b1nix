@@ -4,10 +4,12 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-PREFIX="${1:-$ROOT_DIR/build/idn-b1nix/install}"
+# Per-architecture build identity (B1NIX_ARCH -> triplet).
+. "$ROOT_DIR/tools/toolchain-env.sh"
+PREFIX="${1:-$ROOT_DIR/build/idn-b1nix/$B1NIX_TRIPLET/install}"
 
-UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/install"
-IDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/install"
+UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$B1NIX_TRIPLET/install"
+IDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/$B1NIX_TRIPLET/install"
 
 if [ ! -f "$UNISTR_PREFIX/lib/libunistring.a" ]; then
   UNISTR_PREFIX="$("$ROOT_DIR/tools/build-libunistring.sh")"
