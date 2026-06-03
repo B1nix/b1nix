@@ -2,6 +2,7 @@
 #include <b1nix/sched.h>
 #include <b1nix/signal.h>
 #include <b1nix/syscall.h>
+#include <b1nix/user.h>
 #include <b1nix/arch.h>
 #include <b1nix/klog.h>
 #include <b1nix/console.h>
@@ -11,7 +12,7 @@
 static int is_valid_user_code_ptr(u64 ptr) {
   if (ptr == 0)
     return 0;
-  return ptr < 0x80000000ULL;
+  return ptr < USER_SPACE_LIMIT;
 }
 
 static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
@@ -61,10 +62,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
   interrupts_disable();
 
   u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                __ATOMIC_ACQUIRE) & current_task->blocked_signals;
-  /* Note: pending should be pending NOT blocked. So: & ~current_task->blocked_signals */
-  pending = __atomic_load_n(&current_task->pending_signals,
-                            __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
 
   if (pending == 0) {
     interrupts_enable();
@@ -131,8 +129,8 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   if (sf.saved_frame.cs != 0x1B || sf.saved_frame.ss != 0x23) {
     return (u64)-EINVAL;
   }
-  if (sf.saved_frame.eip >= 0x80000000ULL ||
-      sf.saved_frame.esp >= 0x80000000ULL) {
+  if (sf.saved_frame.eip >= USER_SPACE_LIMIT ||
+      sf.saved_frame.esp >= USER_SPACE_LIMIT) {
     return (u64)-EINVAL;
   }
 

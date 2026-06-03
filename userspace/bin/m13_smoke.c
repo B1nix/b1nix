@@ -247,7 +247,15 @@ int main(int argc, char **argv, char **envp) {
     marker("M13-SMOKE: fail argc-argv0\n");
   }
 
-  if (((unsigned long)argv & 0xF) == 8) {
+  /* At _start the kernel leaves ESP/RSP 16-byte aligned with argc at [SP].
+   * crt0 then advances past argc, so the argv pointer handed to main is
+   * SP + sizeof(void*): &0xF == 8 on x86_64 (8-byte words), == 4 on i386. */
+#ifdef __x86_64__
+  unsigned long want_argv_align = 8;
+#else
+  unsigned long want_argv_align = 4;
+#endif
+  if (((unsigned long)argv & 0xF) == want_argv_align) {
     marker("M13-SMOKE: ok stack-align\n");
   } else {
     marker("M13-SMOKE: fail stack-align\n");

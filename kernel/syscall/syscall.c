@@ -1670,7 +1670,15 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_FCHMOD:
     return (u64)sys_fchmod((int)arg0, (u16)arg1);
   case SYS_UTIME:
+#ifdef __x86_64__
     return (u64)sys_utime((const char *)(usize)arg0, (u64)arg1, (u64)arg2);
+#else
+    /* i386: each 64-bit timestamp arrives split as lo/hi 32-bit args so that
+     * post-2038 (>32-bit) times survive the int $0x80 register ABI. */
+    return (u64)sys_utime((const char *)(usize)arg0,
+                          (u64)(u32)arg1 | ((u64)(u32)arg2 << 32),
+                          (u64)(u32)arg3 | ((u64)(u32)arg4 << 32));
+#endif
   case SYS_GETRANDOM: {
     void *user_buf = (void *)(usize)arg0;
     usize len = (usize)arg1;

@@ -73,38 +73,35 @@ static void x86_set_gdt_entry(struct gdt_entry *entry, u32 base, u32 limit, u8 a
   entry->base_high = (base >> 24) & 0xff;
 }
 
-static void x86_gdt_init_cpu(int cpu) {
+/* Build the per-CPU GDT tables for `cpu` without touching live CPU state.
+ * Safe for the BSP to call on behalf of an AP before that AP is started: the
+ * AP trampoline lgdt's g_cpu_gdt_ptrs[cpu] and loads FS=0x38 (entry 7), so the
+ * descriptors must already exist or the AP triple-faults before signalling
+ * readiness. Requires ap_cpu_data[cpu] to be set for cpu != 0. */
+void x86_gdt_build_cpu(int cpu) {
   /* Copy template GDT */
   memcpy(g_cpu_gdts[cpu], gdt32, 8 * sizeof(struct gdt_entry));
-  
-  u32 *src = (u32 *)&gdt32[1];
-  console_write("gdt32[1]: 0x");
-  console_write_hex32(src[1]);
-  console_write_hex32(src[0]);
-  console_write("\n");
 
-  u32 *desc = (u32 *)&g_cpu_gdts[cpu][1];
-  console_write("g_cpu_gdts[0][1]: 0x");
-  console_write_hex32(desc[1]);
-  console_write_hex32(desc[0]);
-  console_write("\n");
-  
   /* Set up TSS descriptor in entry 5 */
   struct x86_32_tss *t = &x86_tss_arr[cpu];
   x86_set_gdt_entry(&g_cpu_gdts[cpu][5], (u32)t, sizeof(*t) - 1, 0x89, 0x00);
-  
+
   /* Set up Kernel per-CPU descriptor in entry 7 */
   extern struct percpu boot_cpu_data;
   extern struct percpu *ap_cpu_data[MAX_CPUS];
   struct percpu *pcpu = (cpu == 0) ? &boot_cpu_data : ap_cpu_data[cpu];
   pcpu->self_ptr = (u32)pcpu;
   x86_set_gdt_entry(&g_cpu_gdts[cpu][7], (u32)pcpu, sizeof(struct percpu) - 1, 0x92, 0xcf);
-  
+
   /* Set up User TLS in entry 6 */
   x86_set_gdt_entry(&g_cpu_gdts[cpu][6], 0, 0xfffff, 0xf2, 0xcf);
 
   g_cpu_gdt_ptrs[cpu].limit = 8 * sizeof(struct gdt_entry) - 1;
   g_cpu_gdt_ptrs[cpu].base = (u32)&g_cpu_gdts[cpu];
+}
+
+static void x86_gdt_init_cpu(int cpu) {
+  x86_gdt_build_cpu(cpu);
 
   __asm__ volatile("lgdt %0" : : "m"(g_cpu_gdt_ptrs[cpu]) : "memory");
   __asm__ volatile("ltr %0" : : "r"((u16)0x28) : "memory");

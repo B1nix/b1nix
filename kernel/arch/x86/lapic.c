@@ -412,6 +412,12 @@ int smp_boot_aps(void) {
 
         ap_cpu_data[cpu_id] = pcpu;
 
+        /* Build this AP's GDT now, on the BSP: the trampoline lgdt's
+         * g_cpu_gdt_ptrs[cpu_id] and loads FS=0x38 before it can signal
+         * readiness, so the descriptors must exist before SIPI. */
+        extern void x86_gdt_build_cpu(int cpu);
+        x86_gdt_build_cpu(cpu_id);
+
         /* We need the AP to load a copy of the virtual GDT. Pass pointer to g_cpu_gdt_ptrs[cpu_id] */
         u32 gdt_descriptor = (u32)&g_cpu_gdt_ptrs[cpu_id];
 

@@ -106,7 +106,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
-MBEDTLS_DIR := ../build/mbedtls-b1nix/install
+MBEDTLS_DIR := ../build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \

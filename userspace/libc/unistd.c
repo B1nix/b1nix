@@ -617,14 +617,26 @@ int utime(const char *filename, const struct utimbuf *times) {
   /* POSIX: a NULL times argument sets both atime and mtime to the current
    * time. Pass the two timestamps as scalar args (seconds) so the kernel
    * never has to copy a struct from user memory. */
-  long atime, mtime;
+  long long atime, mtime;
   if (times) {
-    atime = (long)times->actime;
-    mtime = (long)times->modtime;
+    atime = (long long)times->actime;
+    mtime = (long long)times->modtime;
   } else {
-    atime = mtime = (long)syscall(SYS_TIME);
+    atime = mtime = (long long)time(NULL);
   }
-  return _check_err(syscall(SYS_UTIME, filename, atime, mtime));
+#ifdef __x86_64__
+  /* One 64-bit register per scalar arg. */
+  return _check_err(syscall(SYS_UTIME, filename, (long)atime, (long)mtime));
+#else
+  /* i386: int $0x80 arg registers are 32-bit, so each 64-bit timestamp is
+   * passed as a lo/hi pair (the kernel reassembles them). A plain (long)
+   * cast would truncate post-2038 timestamps to 32 bits. */
+  return _check_err(syscall(SYS_UTIME, filename,
+                            (long)(unsigned)(unsigned long long)atime,
+                            (long)(unsigned)((unsigned long long)atime >> 32),
+                            (long)(unsigned)(unsigned long long)mtime,
+                            (long)(unsigned)((unsigned long long)mtime >> 32)));
+#endif
 }
 
 int fork(void) {

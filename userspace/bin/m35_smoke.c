@@ -38,6 +38,21 @@ static void fail(const char *name) {
   write(1, buf, n);
 }
 
+/* ELF header/phdr layout differs between the 64-bit and 32-bit cores the kernel
+ * writes (ELF64 vs ELF32). Select the right offsets, machine type, and program
+ * header stride per arch so the same checker validates both. */
+#ifdef __x86_64__
+#define CORE_EM       62 /* EM_X86_64 */
+#define OFF_E_PHOFF   32 /* Elf64_Ehdr.e_phoff */
+#define OFF_E_PHNUM   56 /* Elf64_Ehdr.e_phnum */
+#define PHDR_SIZE     56 /* sizeof(Elf64_Phdr) */
+#else
+#define CORE_EM       3  /* EM_386 */
+#define OFF_E_PHOFF   28 /* Elf32_Ehdr.e_phoff */
+#define OFF_E_PHNUM   44 /* Elf32_Ehdr.e_phnum */
+#define PHDR_SIZE     32 /* sizeof(Elf32_Phdr) */
+#endif
+
 static unsigned rd16(const unsigned char *p) {
   return (unsigned)p[0] | ((unsigned)p[1] << 8);
 }
@@ -84,9 +99,9 @@ int main(void) {
   }
   unsigned e_type = rd16(hdr + 16);
   unsigned e_machine = rd16(hdr + 18);
-  unsigned e_phnum = rd16(hdr + 56);
-  unsigned long e_phoff = (unsigned long)rd32(hdr + 32); /* low 32 bits suffice */
-  if (e_type != 4 /*ET_CORE*/ || e_machine != 62 /*EM_X86_64*/ ||
+  unsigned e_phnum = rd16(hdr + OFF_E_PHNUM);
+  unsigned long e_phoff = (unsigned long)rd32(hdr + OFF_E_PHOFF); /* low 32 bits suffice */
+  if (e_type != 4 /*ET_CORE*/ || e_machine != CORE_EM ||
       e_phnum < 1) {
     close(fd);
     fail("core-elf");
@@ -97,9 +112,9 @@ int main(void) {
   /* Walk the program headers looking for PT_NOTE (the NT_PRSTATUS reg file). */
   int found_note = 0;
   for (unsigned i = 0; i < e_phnum && i < 64; i++) {
-    unsigned char ph[56];
-    lseek(fd, (long)(e_phoff + (unsigned long)i * 56), SEEK_SET);
-    if (read(fd, ph, 56) != 56)
+    unsigned char ph[PHDR_SIZE];
+    lseek(fd, (long)(e_phoff + (unsigned long)i * PHDR_SIZE), SEEK_SET);
+    if (read(fd, ph, PHDR_SIZE) != PHDR_SIZE)
       break;
     if (rd32(ph) == 4 /*PT_NOTE*/)
       found_note = 1;
