@@ -299,10 +299,37 @@ $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-function
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
 $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
 
+# Arch guard for the SHARED userspace build dir.
+#
+# userspace/build/ is not arch-qualified — both ARCH=x86 and ARCH=x86_64 compile
+# into the same tree. Switching ARCH must invalidate every embedded binary, but
+# most binaries only rebuild because their per-arch prereqs ($(LIB)/$(CRT0)) get
+# rebuilt; native_smoke/tcc/m30_pie link neither, so a leftover binary from the
+# other arch survives an arch switch and gets xxd-bundled into the wrong-arch
+# initramfs. A 64-bit native_smoke embedded in the 32-bit kernel is accepted by
+# the ELF64 loader and SIGILLs the moment it runs in ring3 (the "0x2000000
+# collision" — it was never a PMM/layout bug, just a stale .inc).
+#
+# The stamp records the arch the shared tree was last built for. When ARCH
+# changes it wipes the tree so every output relinks for the new arch, then
+# rewrites itself; its mtime advances only on a real switch, so same-arch builds
+# don't churn. It is part of USERSPACE_DEPS so all *.inc re-bundle after a wipe.
+USERSPACE_ARCH_STAMP := userspace/build/.arch
+.PHONY: FORCE
+FORCE:
+$(USERSPACE_ARCH_STAMP): FORCE
+	@if [ "$$(cat $@ 2>/dev/null)" != "$(ARCH)" ]; then \
+		echo "  [arch-guard] userspace tree was not built for ARCH=$(ARCH) — wiping userspace/build"; \
+		rm -rf userspace/build; \
+		mkdir -p userspace/build; \
+		echo "$(ARCH)" > $@; \
+	fi
+
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
 USERSPACE_DEPS := \
+	$(USERSPACE_ARCH_STAMP) \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/include/*.h) \
 	$(wildcard userspace/include/arpa/*.h) \
