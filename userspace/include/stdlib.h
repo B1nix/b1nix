@@ -22,6 +22,7 @@ typedef struct {
     long rem;
 } ldiv_t;
 
+void  abort(void) __attribute__((noreturn));
 void  exit(int status) __attribute__((noreturn));
 void *malloc(size_t size);
 void  free(void *ptr);
@@ -66,10 +67,6 @@ static inline size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
         dest[i] = 0;
     }
     return i;
-}
-
-static inline void abort(void) {
-    exit(127);
 }
 
 static inline long labs(long x) {

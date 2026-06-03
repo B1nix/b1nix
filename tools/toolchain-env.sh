@@ -12,18 +12,20 @@
 #   B1NIX_ROOTFS         per-arch sysroot           $PROJECT_DIR/build/<arch>/rootfs
 #   TOOLCHAIN_BUILD_ROOT shared build parent        .../build/toolchain_build (or $HOME/b1nix-toolchain)
 #   TOOLCHAIN_DIST_DIR   shared tarball cache        $TOOLCHAIN_BUILD_ROOT/dist
+#   TOOLCHAIN_SRC_DIR    shared patched sources      $TOOLCHAIN_BUILD_ROOT/src
 #   TOOLCHAIN_BUILD_HOME per-triplet build home     $TOOLCHAIN_BUILD_ROOT/<triplet>
 #
-# Keying the build home (and the port source trees) by triplet keeps the x86
-# (i686-b1nix) and x86_64 (x86_64-b1nix) cross + native toolchains and their
-# port build trees in completely separate directories, so switching ARCH never
-# reuses stale objects compiled for the other architecture.
+# Keying the build home by triplet keeps the x86 (i686-b1nix) and x86_64
+# (x86_64-b1nix) cross + native build objects and installed outputs in
+# completely separate directories, so switching ARCH never reuses stale objects
+# compiled for the other architecture.
 #
 # The cross COMPILERS are necessarily per-target (x86_64-b1nix-gcc and
 # i686-b1nix-gcc are different compilers, not one built twice — GCC is
-# --disable-multilib), so each lives under its own <triplet>/cross. Only the
-# downloaded source tarballs are shared, via TOOLCHAIN_DIST_DIR, so binutils/gcc
-# are fetched once and merely extracted+compiled per triplet.
+# --disable-multilib), so each lives under its own <triplet>/cross. The
+# downloaded source tarballs and the patched binutils/gcc source trees are
+# shared, via TOOLCHAIN_DIST_DIR and TOOLCHAIN_SRC_DIR; only configure/build
+# directories and installed toolchains are per triplet.
 
 : "${PROJECT_DIR:=${ROOT_DIR:-}}"
 if [ -z "$PROJECT_DIR" ]; then
@@ -60,6 +62,7 @@ else
 fi
 TOOLCHAIN_BUILD_HOME="$TOOLCHAIN_BUILD_ROOT/$B1NIX_TRIPLET"
 TOOLCHAIN_DIST_DIR="$TOOLCHAIN_BUILD_ROOT/dist"
+TOOLCHAIN_SRC_DIR="$TOOLCHAIN_BUILD_ROOT/src"
 
 export B1NIX_ARCH B1NIX_TRIPLET B1NIX_GCC_ARCH B1NIX_ROOTFS
-export TOOLCHAIN_BUILD_ROOT TOOLCHAIN_BUILD_HOME TOOLCHAIN_DIST_DIR
+export TOOLCHAIN_BUILD_ROOT TOOLCHAIN_BUILD_HOME TOOLCHAIN_DIST_DIR TOOLCHAIN_SRC_DIR

@@ -25,6 +25,11 @@ void exit(int status)
 	while (1);
 }
 
+void abort(void)
+{
+	exit(127);
+}
+
 /* ── Dynamic memory allocator ───────────────────────────────────────────────
  * Explicit free list with boundary tags, backed by anonymous mmap. This
  * replaces an earlier 16 MB static bump pool whose free() was a no-op: large

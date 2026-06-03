@@ -52,18 +52,20 @@ b1nix builds for two targets, selected by `ARCH` / `B1NIX_ARCH`:
 The single source of truth for this mapping is **`tools/toolchain-env.sh`**, a
 POSIX-sh helper sourced by every toolchain/port build script (it reads
 `B1NIX_ARCH`, default `x86_64`, and exports `B1NIX_TRIPLET`, `B1NIX_GCC_ARCH`,
-`B1NIX_ROOTFS`, `TOOLCHAIN_BUILD_HOME`, `TOOLCHAIN_DIST_DIR`). The Makefile keeps
-a matching `B1NIX_TRIPLET` mapping.
+`B1NIX_ROOTFS`, `TOOLCHAIN_BUILD_HOME`, `TOOLCHAIN_DIST_DIR`,
+`TOOLCHAIN_SRC_DIR`). The Makefile keeps a matching `B1NIX_TRIPLET` mapping.
 
-Everything that is target-specific lives under a **per-triplet** directory so the
-x86 and x86_64 trees never share objects:
+The downloaded tarballs and the patched binutils/gcc source trees are shared.
+Everything that is target-specific lives under a **per-triplet** directory so
+the x86 and x86_64 trees never share objects:
 
 ```
 build/
   toolchain_build/
     dist/                       # shared: binutils/gcc/make tarballs (downloaded once)
-    x86_64-b1nix/{cross, native_root, native_build, src, sysroot}
-    i686-b1nix/  {cross, native_root, native_build, src, sysroot}
+    src/                        # shared: patched binutils/gcc source trees
+    x86_64-b1nix/{cross, native_root, native_build, build, sysroot}
+    i686-b1nix/  {cross, native_root, native_build, build, sysroot}
   <prog>-src/<triplet>/<prog>-X.Y/      # per-arch source tree (curl, wget, pcre2,
   <prog>-b1nix/<triplet>/[install]      # openssl, mbedtls, dropbear, libidn2, ...)
 ```
@@ -71,9 +73,9 @@ build/
 Why the **cross compilers are per-triplet, not shared**: `x86_64-b1nix-gcc` and
 `i686-b1nix-gcc` are *different* compilers (different target backend; GCC is
 `--disable-multilib`), so the 64-bit cross cannot emit 32-bit `i686-b1nix` ELF.
-They must be built separately. Only the *source tarballs* are genuinely
-shareable, so they are cached once under `dist/` and merely extracted+compiled
-per triplet. (A single multilib cross is an alternative but is a larger GCC
+They must be built separately. The tarballs and patched source trees are
+shareable, so they are cached once under `dist/` / `src/` and compiled per
+triplet. (A single multilib cross is an alternative but is a larger GCC
 reconfiguration and is not used.)
 
 Build the cross + native toolchain for a given arch with:

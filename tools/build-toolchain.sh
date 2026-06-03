@@ -7,8 +7,9 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 
-# Per-architecture build identity: resolves B1NIX_ARCH -> B1NIX_TRIPLET and the
-# per-triplet TOOLCHAIN_BUILD_HOME / B1NIX_ROOTFS (see tools/toolchain-env.sh).
+# Per-architecture build identity: resolves B1NIX_ARCH -> B1NIX_TRIPLET,
+# shared TOOLCHAIN_SRC_DIR, and per-triplet TOOLCHAIN_BUILD_HOME / B1NIX_ROOTFS
+# (see tools/toolchain-env.sh).
 . "$PROJECT_DIR/tools/toolchain-env.sh"
 TARGET="$B1NIX_TRIPLET"
 
@@ -35,27 +36,28 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
-# ── Per-triplet build directory ───────────────────────────────────────────────
-# TOOLCHAIN_BUILD_HOME (from tools/toolchain-env.sh) is build/toolchain_build/
-# <triplet>, or $HOME/b1nix-toolchain/<triplet> when the project path has spaces
-# (WSL: GNU make/libtool resolve symlinks to the real path and break on spaces).
-# Keying by triplet keeps the i686-b1nix and x86_64-b1nix toolchains separate.
+# ── Shared source tree + per-triplet build/output directories ────────────────
+# TOOLCHAIN_SRC_DIR holds one patched binutils/gcc source tree shared by every
+# target. TOOLCHAIN_BUILD_HOME remains per triplet, because configure output,
+# object files, sysroot symlink, and installed cross compilers are target-
+# specific (GCC is --disable-multilib).
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 echo "Building $TARGET cross toolchain in $BUILD_HOME"
 
-WORK_DIR="$BUILD_HOME/src"
+SRC_DIR="$TOOLCHAIN_SRC_DIR"
+WORK_DIR="$BUILD_HOME/build"
 PREFIX="$BUILD_HOME/cross"
 # Binutils/GCC configure scripts break if sysroot contains spaces; the
 # per-triplet sysroot is a symlink to the matching build/<arch>/rootfs.
 SYSROOT="$BUILD_HOME/sysroot"
 
-mkdir -p "$WORK_DIR" "$PREFIX"
+mkdir -p "$SRC_DIR" "$WORK_DIR" "$PREFIX"
 
 # Sysroot symlink → the per-arch userspace rootfs (build/<arch>/rootfs).
 mkdir -p "$B1NIX_ROOTFS"
 ln -sfn "$B1NIX_ROOTFS" "$SYSROOT" 2>/dev/null || true
 
-cd "$WORK_DIR"
+cd "$SRC_DIR"
 
 # ── 1. Download sources (shared cache — fetched once, reused by every triplet) ─
 mkdir -p "$TOOLCHAIN_DIST_DIR"
@@ -69,7 +71,7 @@ if [ ! -f "$TOOLCHAIN_DIST_DIR/gcc-${GCC_VER}.tar.xz" ]; then
     curl -L -o "$TOOLCHAIN_DIST_DIR/gcc-${GCC_VER}.tar.xz" "$GCC_URL"
 fi
 
-# ── 2. Extract & Patch Binutils (into the per-triplet src tree) ───────────────
+# ── 2. Extract & Patch Binutils (shared source tree) ─────────────────────────
 if [ ! -d "binutils-${BINUTILS_VER}" ]; then
     echo "Extracting Binutils..."
     tar -xf "$TOOLCHAIN_DIST_DIR/binutils-${BINUTILS_VER}.tar.xz"
@@ -80,12 +82,12 @@ if [ ! -d "binutils-${BINUTILS_VER}" ]; then
     cd ..
 fi
 
-# ── 3. Extract & Patch GCC ───────────────────────────────────────────────────
+# ── 3. Extract & Patch GCC (shared source tree) ──────────────────────────────
 if [ ! -d "gcc-${GCC_VER}" ]; then
     echo "Extracting GCC..."
     tar -xf "$TOOLCHAIN_DIST_DIR/gcc-${GCC_VER}.tar.xz"
     echo "Patching GCC (b1nix target)..."
-    python3 "$PROJECT_DIR/tools/patch-gcc.py" "$WORK_DIR/gcc-${GCC_VER}"
+    python3 "$PROJECT_DIR/tools/patch-gcc.py" "$SRC_DIR/gcc-${GCC_VER}"
     cd "gcc-${GCC_VER}"
     SED_INPLACE 's/| fiwix\*/| fiwix* | b1nix*/g' config.sub
     if [ -f "libgcc/config.sub" ]; then
@@ -101,12 +103,13 @@ if [ ! -d "gcc-${GCC_VER}" ]; then
 fi
 
 # ── 4. Build cross-binutils ───────────────────────────────────────────────────
+cd "$WORK_DIR"
 if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
     echo "Building Cross-Binutils..."
     rm -rf build-binutils
     mkdir -p build-binutils
     cd build-binutils
-    ../binutils-${BINUTILS_VER}/configure \
+    "$SRC_DIR/binutils-${BINUTILS_VER}/configure" \
         --target="$TARGET" \
         --prefix="$PREFIX" \
         --with-sysroot="$SYSROOT" \
@@ -125,7 +128,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
     rm -rf build-gcc
     mkdir -p build-gcc
     cd build-gcc
-    ../gcc-${GCC_VER}/configure \
+    "$SRC_DIR/gcc-${GCC_VER}/configure" \
         --target="$TARGET" \
         --prefix="$PREFIX" \
         --with-sysroot="$SYSROOT" \
@@ -141,6 +144,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --disable-libquadmath \
         --with-newlib \
         --with-system-zlib \
+        --without-isl \
         ${GMP_FLAG:+"$GMP_FLAG"} \
         ${MPFR_FLAG:+"$MPFR_FLAG"} \
         ${MPC_FLAG:+"$MPC_FLAG"} \
@@ -157,6 +161,33 @@ fi
 # fails at libcpp with: "fatal error: new: No such file or directory".
 if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
     echo "Building target libstdc++-v3 for ${TARGET}..."
+    if [ ! -f build-gcc/Makefile ]; then
+        rm -rf build-gcc
+        mkdir -p build-gcc
+        cd build-gcc
+        "$SRC_DIR/gcc-${GCC_VER}/configure" \
+            --target="$TARGET" \
+            --prefix="$PREFIX" \
+            --with-sysroot="$SYSROOT" \
+            --disable-nls \
+            --enable-languages=c,c++ \
+            --without-headers \
+            --disable-shared \
+            --disable-multilib \
+            --disable-threads \
+            --disable-libgomp \
+            --disable-libmudflap \
+            --disable-libssp \
+            --disable-libquadmath \
+            --with-newlib \
+            --with-system-zlib \
+            --without-isl \
+            ${GMP_FLAG:+"$GMP_FLAG"} \
+            ${MPFR_FLAG:+"$MPFR_FLAG"} \
+            ${MPC_FLAG:+"$MPC_FLAG"} \
+            MAKEINFO=true
+        cd ..
+    fi
     cd build-gcc
     make -j"$NPROC" all-target-libstdc++-v3 MAKEINFO=true
     make install-target-libstdc++-v3 MAKEINFO=true

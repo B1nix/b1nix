@@ -19,7 +19,15 @@ struct rlimit {
 #define RLIMIT_AS     9
 #define RLIM_INFINITY ((rlim_t)-1)
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 int getrlimit(int resource, struct rlimit *rlim);
 int setrlimit(int resource, const struct rlimit *rlim);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

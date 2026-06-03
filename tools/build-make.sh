@@ -43,10 +43,10 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
-# ── Per-triplet build directory (build/toolchain_build/<triplet>) ───────────
+# ── Shared source tree + per-triplet build/output directories ───────────────
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
-SRC_DIR="$BUILD_HOME/src"
+SRC_DIR="$TOOLCHAIN_SRC_DIR"
 WORK_DIR="$BUILD_HOME/native_build"
 CROSS_PREFIX="$BUILD_HOME/cross"
 NATIVE_DEST="$BUILD_HOME/native_root"
@@ -80,7 +80,7 @@ LIBS_VAL="-lb1nix -lgcc"
 
 mkdir -p "$SRC_DIR" "$WORK_DIR" "$NATIVE_DEST"
 
-# ── 1. Fetch (shared cache) + unpack GNU Make (per-triplet src) ─────────────
+# ── 1. Fetch (shared cache) + unpack GNU Make (shared src) ──────────────────
 mkdir -p "$TOOLCHAIN_DIST_DIR"
 MAKE_TARBALL="$TOOLCHAIN_DIST_DIR/make-${MAKE_VER}.tar.gz"
 if [ ! -f "$MAKE_TARBALL" ]; then

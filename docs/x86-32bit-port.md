@@ -89,9 +89,11 @@ All files were written from scratch for the 32-bit target:
   `B1NIX_ARCH` → host triplet (`x86` → `i686-b1nix`, `x86_64` → `x86_64-b1nix`)
   and per-triplet build paths. Every toolchain/port build script sources it.
 - Cross + native toolchains build under `build/toolchain_build/<triplet>/`
-  (`cross`, `native_root`, `native_build`, `src`, `sysroot`); source tarballs are
-  cached once in the shared `build/toolchain_build/dist/`. The cross compilers are
-  necessarily per-triplet (different target backends, `--disable-multilib`).
+  (`cross`, `native_root`, `native_build`, `build`, `sysroot`); source tarballs
+  are cached once in the shared `build/toolchain_build/dist/`, and patched
+  binutils/gcc sources are shared under `build/toolchain_build/src/`. The cross
+  compilers are necessarily per-triplet (different target backends,
+  `--disable-multilib`).
 - Ported programs (curl, wget, pcre2, openssl, mbedtls, dropbear, libidn2,
   libunistring) build under `build/<prog>-{src,b1nix}/<triplet>/` so x86 and
   x86_64 never share objects. `tools/patch-gcc.py` now emits both the
