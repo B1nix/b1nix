@@ -73,7 +73,10 @@ export ac_cv_c_bigendian=no
 CC_VAL="${TARGET}-gcc"
 AR_VAL="${TARGET}-ar"
 RANLIB_VAL="${TARGET}-ranlib"
-CFLAGS_VAL="-isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
+# -fcommon: GNU Make 3.82 has tentative definitions (e.g. `stack_limit`) in
+# headers without `extern`; GCC 10+ defaults to -fno-common, which turns those
+# into multiple-definition link errors. Restore the legacy common semantics.
+CFLAGS_VAL="-fcommon -isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
 CPPFLAGS_VAL="-isystem $SYSROOT/include"
 LDFLAGS_VAL="-Wl,-Ttext-segment=0x2000000"
 LIBS_VAL="-lb1nix -lgcc"
