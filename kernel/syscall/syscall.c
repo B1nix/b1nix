@@ -2006,10 +2006,12 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     copy_cstr(uts.nodename, sizeof(uts.nodename), "b1nix");
     copy_cstr(uts.release, sizeof(uts.release), "0.22.0");
     copy_cstr(uts.version, sizeof(uts.version), "M22 Core Utilities");
-#ifdef __aarch64__
+#if defined(__aarch64__)
     copy_cstr(uts.machine, sizeof(uts.machine), "aarch64");
-#else
+#elif defined(__x86_64__)
     copy_cstr(uts.machine, sizeof(uts.machine), "x86_64");
+#else
+    copy_cstr(uts.machine, sizeof(uts.machine), "i686");
 #endif
     return syscall_copyout((void *)(usize)arg0, &uts, sizeof(uts)) == 0
                ? 0

@@ -528,7 +528,20 @@ static int addr_is_kernel_text(u32 addr) {
 static int fp_is_safe(u32 fp) {
   if (fp < 0x1000ULL || fp == (u32)-1)
     return 0;
-  return fp + 8 <= 0xffffffffULL;
+  if (fp + 8 > 0xffffffffULL)
+    return 0;
+  /* arch_backtrace dereferences [fp] and [fp+4] directly from kernel mode while
+   * unwinding a *faulting* task, so fp is frequently garbage (a corrupted user
+   * frame pointer). A range check alone is not enough — a plausible-but-unmapped
+   * user address sails through and the dereference itself page-faults in the
+   * kernel, turning a recoverable userspace SIGSEGV into a kernel panic. Verify
+   * both words are actually mapped in the current address space first. */
+  extern u64 vmm_virt_to_phys(void *ptr);
+  if (vmm_virt_to_phys((void *)(usize)fp) == 0)
+    return 0;
+  if (vmm_virt_to_phys((void *)(usize)(fp + 4)) == 0)
+    return 0;
+  return 1;
 }
 
 void arch_backtrace(u64 rbp, u64 rip) {

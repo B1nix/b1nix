@@ -334,8 +334,18 @@ void nvme_init(void)
     console_write_hex64(bar0);
     console_write("\n");
     
-    // Map registers via direct map
+    // Map the controller registers.
+#ifdef __x86_64__
+    // x86_64: the direct map already covers PCI MMIO BARs.
     u64 regs_virt = vmm_direct_map_base() + bar0;
+#else
+    // 32-bit: BAR0 lives at ~4 GB of MMIO space, above the 1 GB direct map, so
+    // vmm_direct_map_base()+BAR0 overflows the 32-bit address (cap reads 0 ->
+    // "failed to enable"). Map it into the dedicated MMIO window. The doorbell
+    // registers extend past the fixed header, so map a few pages.
+    u64 regs_virt = (u64)(usize)vmm_map_mmio(bar0, 0x2000,
+                                             VMM_WRITABLE | VMM_PCD);
+#endif
     volatile struct nvme_registers *regs = (volatile struct nvme_registers *)(usize)regs_virt;
     
     memset(&nvme, 0, sizeof(nvme));

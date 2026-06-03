@@ -129,6 +129,19 @@ isr_common:
 	call x86_exception_handler
 	addl $16, %esp       /* Clean up argument and padding */
 
+	/* Restore user segments (when returning to ring 3) BEFORE the GP pops — the
+	 * %ax segment loads would otherwise clobber the low 16 bits of the user's
+	 * restored EAX, corrupting it on every interrupt/exception return to user
+	 * (see syscall_entry.S). CS is at offset 40 before any pops. */
+	testl $3, 40(%esp)
+	jz 1f
+	movw $0x23, %ax
+	movw %ax, %ds
+	movw %ax, %es
+	movw %ax, %fs
+	movw $0x33, %ax
+	movw %ax, %gs
+1:
 	popl %eax
 	popl %ebx
 	popl %ecx
@@ -138,17 +151,6 @@ isr_common:
 	popl %esi
 	addl $8, %esp       /* Clean up vector and error_code */
 
-	/* Check if returning to user mode (RPL of CS is 3) */
-	testl $3, 4(%esp)
-	jz 1f
-	/* Restore user segment registers */
-	movw $0x23, %ax
-	movw %ax, %ds
-	movw %ax, %es
-	movw %ax, %fs
-	movw $0x33, %ax
-	movw %ax, %gs
-1:
 	/* Return to user mode */
 	iret
 
@@ -179,6 +181,18 @@ irq_common:
 	call x86_irq_handler
 	addl $16, %esp
 
+	/* Restore user segments (when returning to ring 3) BEFORE the GP pops, so
+	 * the %ax segment loads don't clobber the user's restored EAX. CS is at
+	 * offset 40 before any pops. */
+	testl $3, 40(%esp)
+	jz 1f
+	movw $0x23, %ax
+	movw %ax, %ds
+	movw %ax, %es
+	movw %ax, %fs
+	movw $0x33, %ax
+	movw %ax, %gs
+1:
 	popl %eax
 	popl %ebx
 	popl %ecx
@@ -188,16 +202,5 @@ irq_common:
 	popl %esi
 	addl $8, %esp
 
-	/* Check if returning to user mode (RPL of CS is 3) */
-	testl $3, 4(%esp)
-	jz 1f
-	/* Restore user segment registers */
-	movw $0x23, %ax
-	movw %ax, %ds
-	movw %ax, %es
-	movw %ax, %fs
-	movw $0x33, %ax
-	movw %ax, %gs
-1:
 	/* Return to user mode */
 	iret

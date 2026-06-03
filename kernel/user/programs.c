@@ -3399,9 +3399,7 @@ static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
 
-  console_write("[DEBUG] init_main: started\n");
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
-  console_write("[DEBUG] init_main: SYS_CLEAR returned\n");
 
   if (bootinfo_has_flag("b1nix.test=1")) {
   /* M27: kernel command line key=value parser self-test. The smoke harness

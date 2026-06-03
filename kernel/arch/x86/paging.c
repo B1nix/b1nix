@@ -125,8 +125,21 @@ void vmm_init(void) {
     pd[pd_index(physical)] = physical | VMM_PRESENT | VMM_WRITABLE | HUGE_PAGE_FLAG;
   }
 
-  /* Pre-allocate kernel heap page tables */
-  ensure_child_table(pd, pd_index(KHEAP_START));
+  /* Pre-allocate every kernel-half page table above the direct map (kheap,
+   * MMIO and the klarge arena, PD indices pd_index(KHEAP_START)..1023). This is
+   * essential on 32-bit: paging_create_address_space clones the kernel-half PD
+   * entries (512-1023) by value at address-space creation time. If a PD entry
+   * is empty then and the kernel heap later grows into that 4 MB region, the new
+   * PT/PDE is installed only in whatever address space happened to be current —
+   * other (already-created) address spaces never see it, so a kernel pointer
+   * into the grown heap faults there (kmalloc #PF with PDE==0). Allocating all
+   * the PTs up front means every clone copies PDEs that point at these shared
+   * tables, so any later kernel mapping lands in a table visible everywhere.
+   * ~1 MB of PTs once at boot; the direct-map region below 0xC0000000 keeps its
+   * 4 MB huge-page PDEs and is intentionally skipped. */
+  for (usize i = pd_index(KHEAP_START); i < 1024; i++) {
+    ensure_child_table(pd, i);
+  }
 
   console_write("vmm: direct map 0x");
   console_write_hex32(DIRECT_MAP_BASE);
@@ -330,8 +343,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
   extern void eviction_unregister_page(u64 frame);
 
-  // Lazy Allocation for User Heap/Mmap
-  if (!(error_code & PF_PRESENT) && va >= 0x40000000 && va < 0x80000000) {
+  // Lazy Allocation for User Heap/Mmap and the downward-growing user stack.
+  // The upper bound is USER_STACK_TOP (0xC0000000): the stack lives just below
+  // it (USER_STACK_TOP - 8 MB .. USER_STACK_TOP) and is mapped one page at a
+  // time, so on-demand faults there must allocate (the old 0x80000000 ceiling
+  // stopped at the direct-map base and left every stack-growth fault unhandled,
+  // killing any non-trivial ELF32 process). Direct-map pages (0x80000000..) are
+  // PRESENT, so the !PF_PRESENT guard already excludes them.
+  if (!(error_code & PF_PRESENT) && va >= 0x40000000 && va < 0xC0000000) {
     u64 frame = pmm_alloc_frame();
     if (!frame) {
       eviction_evict_page();
@@ -523,8 +542,19 @@ u64 paging_create_address_space(void) {
     pd[i] = kernel_pml4_virt[i];
   }
 
-  /* Clone kernel identity map entries (0 to DIRECT_MAP_SIZE / 4MB) */
-  usize identity_entries = DIRECT_MAP_SIZE >> 22;
+  /* Clone the kernel's low identity map — but ONLY enough 4 MB entries to cover
+   * the kernel image (1 MB .. __kernel_end). The kernel is linked at 0x100000
+   * and executes from those identity-mapped low addresses, so a user address
+   * space must keep them mapped to survive a CR3 switch (the original
+   * triple-fault fix). Cloning the FULL direct-map span (>=256 MB) was wrong:
+   * userspace ELF executables link at 0x02000000 (32 MB), and a cloned kernel
+   * *huge-page* identity PDE there shadowed the loader's 4 KB user mapping —
+   * ensure_child_table treated the huge-page PDE as a page-table pointer, so the
+   * binary actually executed from identity-mapped physical 0x02000000 (garbage)
+   * and faulted on its first instructions. Capping the clone at the kernel image
+   * leaves PD index 8 (0x02000000) free for a clean per-process user mapping. */
+  extern char __kernel_end[];
+  usize identity_entries = ((u32)(usize)__kernel_end >> 22) + 1;
   if (identity_entries > 512) {
     identity_entries = 512;
   }
@@ -543,8 +573,15 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
   u64 _vmflags;
   vmm_write_acquire(&_vmflags);
 
-  /* Loop userspace entries (0-511) */
-  for (usize i = 0; i < 512; i++) {
+  /* Loop userspace entries. On 32-bit the user address space runs to
+   * USER_SPACE_LIMIT (0xC0000000) = PD index 768, NOT 512 — the downward-growing
+   * user stack lives at ~0xBFFFxxxx (PD 766-767). Cloning only 0-511 left the
+   * child's stack unmapped, so fork() handed the child a FRESH ZERO stack (via
+   * the lazy-alloc fault path) instead of a COW copy of the parent's: the
+   * child's saved return addresses were gone, so it `ret`'d to 0 and SIGSEGV'd.
+   * The direct-map huge pages at PD 512-575 (kernel) are skipped by the
+   * HUGE_PAGE_FLAG guard below, so widening the bound is safe. */
+  for (usize i = 0; i < 768; i++) {
     u32 pde = src_pd[i];
     if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
       u32 *src_pt = table_from_entry(pde);
@@ -582,8 +619,12 @@ void paging_free_address_space(u64 pml4_phys) {
   freed_tables_count = 0;
   u32 *pd = (u32 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
 
-  /* Free userspace entries (0-511) */
-  for (usize i = 0; i < 512; i++) {
+  /* Free userspace entries (0..PD 767 — the 32-bit user range up to
+   * USER_SPACE_LIMIT/0xC0000000, matching paging_clone_address_space; the user
+   * stack PTs at PD 766-767 must be freed here too). The direct-map huge pages
+   * at 512-575 are skipped by HUGE_PAGE_FLAG, and the shared kernel page tables
+   * at PD 768+ are intentionally left untouched. */
+  for (usize i = 0; i < 768; i++) {
     u32 pde = pd[i];
     if ((pde & VMM_PRESENT) && !(pde & HUGE_PAGE_FLAG)) {
       u32 *pt = table_from_entry(pde);

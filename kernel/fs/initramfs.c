@@ -158,7 +158,18 @@ static const char initramfs_rc[] =
     "&& echo ready > /persist/.b1nix-setup "
     "&& echo \"M27-INIT: first-boot /persist initialised\"\n"
     "# Start SSH daemon service\n"
+#ifdef __x86_64__
     "[ -f /etc/init.d/sshd ] && /bin/sh /etc/init.d/sshd start\n"
+#else
+    /* 32-bit port: the ported dropbear's Ed25519 host-key generation currently
+     * hangs (SSH on x86 is still WIP / M32b follow-up). Auto-starting it here
+     * either wedges the boot rc synchronously or, if backgrounded, runs the hung
+     * keygen concurrently with the smoke tests and trips 32-bit concurrency
+     * races. Skip the auto-start on x86 so the core test suite runs cleanly;
+     * `sh /etc/init.d/sshd start` can still be invoked manually once dropbear
+     * works. */
+    "echo \"sshd: auto-start skipped on 32-bit (dropbear keygen WIP)\"\n"
+#endif
     "echo \"M27-INIT: ok rc-script\"\n";
 
 /* Resolver configuration. The kernel DNS client parses the first

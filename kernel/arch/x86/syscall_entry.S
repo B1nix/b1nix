@@ -87,9 +87,27 @@ x86_syscall_entry:
 
 .global x86_syscall_return
 x86_syscall_return:
-	/* EAX now holds the return value. Store it to the saved EAX slot in interrupt_frame */
+	/* EAX holds the return value. Store it into the saved EAX slot. */
 	movl %eax, 0(%esp)
 
+	/* If returning to user mode (CS RPL == 3), restore the user segment
+	 * selectors — BEFORE the GP-register pops. The segment loads go through
+	 * %ax; doing them after `popl %eax` overwrote the low 16 bits of the
+	 * just-restored return value with 0x33, silently corrupting EVERY ring-3
+	 * syscall result (fork()'s 0 became 0x33 so children took the parent
+	 * branch, pids/byte-counts were mangled, …). EAX is still scratch here, so
+	 * clobbering %ax is harmless — the trailing `popl %eax` restores the clean
+	 * value. CS is at offset 40 before any pops:
+	 *   eax0 ebx4 ecx8 edx12 ebp16 edi20 esi24 vec28 err32 eip36 cs40 */
+	testl $3, 40(%esp)
+	jz 1f
+	movw $0x23, %ax
+	movw %ax, %ds
+	movw %ax, %es
+	movw %ax, %fs
+	movw $0x33, %ax
+	movw %ax, %gs
+1:
 	/* Restore registers from the interrupt_frame */
 	popl %eax
 	popl %ebx
@@ -102,17 +120,6 @@ x86_syscall_return:
 	/* Clean up vector and error code */
 	addl $8, %esp
 
-	/* Check if returning to user mode (RPL of CS is 3) */
-	testl $3, 4(%esp)
-	jz 1f
-	/* Restore user segment registers */
-	movw $0x23, %ax
-	movw %ax, %ds
-	movw %ax, %es
-	movw %ax, %fs
-	movw $0x33, %ax
-	movw %ax, %gs
-1:
 	/* Return to user mode */
 	iret
 

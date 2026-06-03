@@ -7,9 +7,13 @@ B1NIX_ARCH ?= x86_64
 ifeq ($(B1NIX_ARCH),x86)
 TARGET   := i686-unknown-elf
 LDFLAGS  := -m elf_i386
+# Host triplet for the per-triplet ported-library install trees (must match
+# tools/toolchain-env.sh: x86 -> i686-b1nix, x86_64 -> x86_64-b1nix).
+B1NIX_TRIPLET := i686-b1nix
 else
 TARGET   := x86_64-unknown-elf
 LDFLAGS  := -m elf_x86_64
+B1NIX_TRIPLET := x86_64-b1nix
 endif
 CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
@@ -118,7 +122,7 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	fi
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
-PCRE2_DIR := ../build/pcre2-b1nix/install
+PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o

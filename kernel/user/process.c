@@ -229,13 +229,23 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
 
   sp &= ~(usize)0xf;
 
-  /* FIX: Ensure the final stack pointer will be 16-byte aligned.
-   * We push: argc(1), argv(argc), NULL(1), envp(envc), NULL(1), auxv(5).
-   * Total slots = 1 + image->argc + 1 + envc + 1 + 5 = image->argc + envc + 8.
-   * If total_slots * sizeof(usize) is not a multiple of 16, we need padding.
-   */
+  /* Ensure the final stack pointer (which becomes ESP/RSP at _start) is
+   * 16-byte aligned, as the SysV ABI requires. We are about to push exactly
+   * total_slots pointer-sized words: argc(1), argv(argc), NULL(1), envp(envc),
+   * NULL(1), auxv(5). sp is 16-aligned right now, so after the pushes it stays
+   * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
+   * many zero words as needed to reach the next 16-byte boundary.
+   *
+   * On x86_64 sizeof(usize)==8, so a single pad word always sufficed (16/8==2
+   * words per 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
+   * pad words may be required — the old "push one if misaligned" left ESP 4- or
+   * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
+   * the unaligned ring3 stack, so every ELF32 spawn failed. */
   usize total_slots = 8 + (usize)image->argc + (usize)envc;
-  if ((total_slots * sizeof(usize)) % 16 != 0) {
+  usize words_per_16 = 16 / sizeof(usize);
+  usize rem = total_slots % words_per_16;
+  usize pad = rem ? (words_per_16 - rem) : 0;
+  for (usize p = 0; p < pad; p++) {
     if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   }
 
@@ -612,6 +622,8 @@ void user_image_free(struct user_loaded_image *image) {
   }
 
   kfree(image);
+}
+
 #define ELF_CLASS_32 1
 #define ELF_MACHINE_386 3
 #define DT_REL 17
@@ -1144,32 +1156,17 @@ static void user_process_thread(void *arg) {
   struct process_start *start = arg;
   struct user_loaded_image *image = start ? start->image : 0;
 
-  console_write("[DEBUG] user_process_thread: starting ");
-  if (image) {
-    console_write(image->path);
-    console_write(" kind=");
-    if (image->kind == USER_IMAGE_ELF64) console_write("ELF64");
-    else if (image->kind == USER_IMAGE_ELF32) console_write("ELF32");
-    else if (image->kind == USER_IMAGE_BUILTIN) console_write("BUILTIN");
-    else console_write("UNKNOWN");
-  } else {
-    console_write("NULL");
-  }
-  console_write("\n");
-
   scheduler_set_user_image(image);
   kfree(start);
 
   int code = 0;
-  if (image->kind == USER_IMAGE_ELF64) {
+  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
+    /* Real ELF (both 64- and 32-bit) enters ring 3 via x86_user_jump; its
+     * entry is a userspace virtual address, NOT a kernel function pointer. */
     code = user_run_elf_image(image);
   } else {
     user_program_entry entry = (user_program_entry)(usize)image->entry;
-    console_write("[DEBUG] user_process_thread: calling entry point at 0x");
-    console_write_hex64((u64)(usize)entry);
-    console_write("\n");
     code = entry(image->argc, image->argv);
-    console_write("[DEBUG] user_process_thread: entry point returned\n");
   }
   syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0, 0, 0);
 
@@ -1225,7 +1222,8 @@ int user_spawn(const char *path, int argc, const char **argv) {
   /* Real userspace ELF processes may run on Application Processors: they enter
    * ring 3 and so release the Big Kernel Lock. Builtins run in kernel mode and
    * stay on the BSP (ap_runnable=0). */
-  int ap_runnable = (image->kind == USER_IMAGE_ELF64);
+  int ap_runnable =
+      (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32);
   int tid = kthread_create_user(safe_name, user_process_thread, start, ap_runnable);
   if (tid < 0) {
     kfree(start);
@@ -1238,8 +1236,8 @@ int user_spawn(const char *path, int argc, const char **argv) {
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
   struct vfs_node *node = vfs_find_node(path);
-  if (IS_ERR(node))
-    return (int)PTR_ERR(node);
+  if (!node || IS_ERR(node))
+    return node ? (int)PTR_ERR(node) : -ENOENT;
 
   /* POSIX: Check execute permission */
   const struct cred *cred = scheduler_get_current_cred();
@@ -1297,7 +1295,7 @@ int user_execve_current(const char *path, const char **argv,
   }
 
   int code = 0;
-  if (image->kind == USER_IMAGE_ELF64) {
+  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
     code = user_run_elf_image(image);
   } else {
     user_program_entry entry = (user_program_entry)(usize)image->entry;

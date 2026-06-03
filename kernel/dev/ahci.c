@@ -440,8 +440,19 @@ void ahci_init(void) {
     return;
   }
 
-  // Map ABAR into kernel's virtual address space via direct map
+  // Map ABAR into kernel's virtual address space.
+#ifdef __x86_64__
+  // x86_64: the direct map spans >=4 GB and already covers PCI MMIO BARs.
   u64 abar_virt = vmm_direct_map_base() + ahci_pci_bar5;
+#else
+  // 32-bit: the direct map only covers low RAM (<=1 GB), but the ABAR lives at
+  // ~4 GB of MMIO space. Computing vmm_direct_map_base()+ABAR there overflows
+  // the 32-bit address and aliases to junk (cap reads back 0 -> "0 devices").
+  // Map it explicitly into the MMIO window instead.
+  u64 abar_virt = (u64)(usize)vmm_map_mmio(ahci_pci_bar5,
+                                           sizeof(struct ahci_hba_mem),
+                                           VMM_WRITABLE | VMM_PCD);
+#endif
   ahci_bar = (volatile struct ahci_hba_mem *)(usize)abar_virt;
 
   // Check capabilities

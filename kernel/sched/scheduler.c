@@ -207,8 +207,9 @@ static struct task *find_unused_task(void) {
   u64 flags;
   tasks_lock(&flags);
 
-  /* 1) Fast path: reuse a slot already in [0, g_task_hwm). */
-  for (usize i = 0; i < g_task_hwm; i++) {
+  /* 1) Fast path: reuse a slot already in [0, g_task_hwm). Never recycle slot 0
+   * — it is the permanent boot/idle task (the BSP's idle-fallback target). */
+  for (usize i = 1; i < g_task_hwm; i++) {
     if (T(i)->state == TASK_UNUSED) {
       memset(T(i), 0, sizeof(struct task));
       /* M29: clear side-table metadata so the reused slot starts clean. */
@@ -504,10 +505,6 @@ static void kernel_thread_trampoline(void) {
     panic("scheduler entered invalid task");
   }
 
-  console_write("[DEBUG] trampoline: entering task ");
-  console_write(current_task->name);
-  console_write("\n");
-
   current_task->entry(current_task->arg);
   scheduler_exit_current(0);
 }
@@ -782,7 +779,16 @@ int scheduler_fork_current(void) {
   if (!parent) {
     return -1;
   }
-  int is_user = (parent->user_image != NULL);
+  /* "User" forks resume the child by iret'ing through the interrupt_frame the
+   * int $0x80 entry pushed onto the parent's kernel stack. A *builtin* (kind ==
+   * USER_IMAGE_BUILTIN) runs entirely in ring 0 and calls scheduler_fork_current
+   * directly via syscall_dispatch, so there is NO such frame at the stack top —
+   * treating it as a user fork made the child iret through stack garbage (a
+   * #GP with a bogus CS). Builtins fork through the kernel trampoline instead,
+   * resuming the C code right after fork() returns 0. Only real ELF processes
+   * (ELF32/ELF64) take the iret path. */
+  struct user_loaded_image *parent_img = parent->user_image;
+  int is_user = (parent_img != NULL && parent_img->kind != USER_IMAGE_BUILTIN);
 
   /* If no swap device is attached, no PT entry can ever carry VMM_SWAPPED,
    * so walking the full user page-table tree on every fork is pure overhead.
@@ -917,7 +923,14 @@ int scheduler_fork_current(void) {
     struct interrupt_frame *child_iframe = (struct interrupt_frame *)(usize)(child->kernel_stack_ptr - sizeof(struct interrupt_frame));
     child_iframe->eax = 0;
 
-    child->context.esp = (u32)(usize)child_iframe - 16;
+    /* x86_fork_child_trampoline jmps into x86_syscall_return, whose first pop
+     * expects ESP at the very base of the interrupt_frame (the saved EAX slot).
+     * arch_context_switch's `ret` pops the trampoline address we push below and
+     * leaves ESP at context.esp + 4, so context.esp must be child_iframe - 4
+     * for ESP to land exactly on child_iframe after the return. (An earlier
+     * stray `- 16` here left ESP 16 bytes low, so the 7 register pops + iret
+     * read EIP/CS from the wrong slots and iret faulted with a garbage CS.) */
+    child->context.esp = (u32)(usize)child_iframe;
     child->context.ebp = current_ebp + (u32)stack_offset;
 
     child->context.esp -= 4;
@@ -948,6 +961,20 @@ int scheduler_fork_current(void) {
 
   // 3. Clone address space with interrupts disabled
   child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
+
+  /* paging_clone_address_space just flipped every writable user page in the
+   * PARENT's page tables to read-only/COW, but the parent keeps running on the
+   * same CR3 and its TLB still caches the old writable translations. Without a
+   * flush the parent's very next stack write (returning from fork(), pushing a
+   * waitpid frame, …) bypasses the COW fault via the stale TLB entry and writes
+   * straight into the now-shared frame — scribbling the child's copy of the
+   * stack, so the child later `ret`s through a corrupted (often 0) return
+   * address and SIGSEGVs. The page tables were edited in place, so reloading
+   * CR3 (parent == current task) flushes the stale entries. */
+  if (parent == current_task) {
+    extern void paging_switch_address_space(u64 pml4_phys);
+    paging_switch_address_space(parent->pml4_phys);
+  }
 
   // 4. Clone VMAs
   child->vma_list = 0;
@@ -1070,7 +1097,22 @@ static void clone_thread_kentry(void *arg) {
   u64 stack = cta->user_stack;
   u64 user_arg = cta->user_arg;
   kfree(cta);
+#ifdef __x86_64__
+  /* SysV AMD64: x86_user_jump drops its 3rd positional (user_arg) into %rdi,
+   * which is the first argument of pthread's start_routine(void*). */
   x86_user_jump((usize)entry, (usize)stack, (usize)user_arg, 0);
+#else
+  /* SysV i386 passes arguments on the stack, not in registers, and the 32-bit
+   * x86_user_jump clears the GPRs — so the thread's start_routine(void*) would
+   * read a zero arg from [esp+4] and dereference it (the M29 pthread crash).
+   * Build the expected call frame on the (CLONE_VM-shared, already-mapped) user
+   * stack: a fake return address at [esp] and the void* arg at [esp+4]. */
+  u32 sp = (u32)stack & ~0xFU; /* keep the 16-byte ABI alignment */
+  sp -= 8;
+  *(volatile u32 *)(usize)(sp + 4) = (u32)user_arg;
+  *(volatile u32 *)(usize)(sp + 0) = 0; /* return address: threads exit via SYS_EXIT_THREAD */
+  x86_user_jump((usize)entry, (usize)sp, 0, 0);
+#endif
 }
 
 /* Look up the number of live tasks currently using this pml4 (excluding
@@ -2315,11 +2357,8 @@ void scheduler_set_user_image(void *image) {
   if (current_task) {
     current_task->user_image = image;
     if (current_task->pml4_phys == 0) {
-      console_write("[DEBUG] scheduler_set_user_image: creating address space\n");
       current_task->pml4_phys = paging_create_address_space();
-      console_write("[DEBUG] scheduler_set_user_image: switching address space\n");
       paging_switch_address_space(current_task->pml4_phys);
-      console_write("[DEBUG] scheduler_set_user_image: address space switched\n");
     }
   }
 }

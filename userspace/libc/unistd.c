@@ -192,7 +192,18 @@ int ioctl(int fd, unsigned long request, ...) {
 }
 
 time_t time(time_t *tloc) {
-  time_t t = (time_t)syscall(SYS_TIME);
+  /* time_t is 64-bit (long long) on every b1nix ABI, including the 32-bit
+   * x86 port. The SYS_TIME syscall return value travels through a single
+   * machine register (EAX on i386), so on 32-bit it would truncate the epoch
+   * seconds to 32 bits — re-introducing the year-2038 wrap. Read the full
+   * 64-bit tv_sec out of clock_gettime() (copied through a struct, not a
+   * register) so wall-clock time stays full-width on both architectures. */
+  struct timespec ts;
+  time_t t;
+  if (clock_gettime(CLOCK_REALTIME, &ts) == 0)
+    t = ts.tv_sec;
+  else
+    t = (time_t)(long)syscall(SYS_TIME); /* fallback: may truncate on i386 */
   if (tloc)
     *tloc = t;
   return t;
