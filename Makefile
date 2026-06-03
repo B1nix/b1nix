@@ -556,6 +556,11 @@ install-native-toolchain:
 		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" ]; then \
 			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
 		fi; \
+		for o in crtbegin.o crtend.o crtbeginT.o crtbeginS.o crtendS.o; do \
+			if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/$$o" ]; then \
+				cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/$$o" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
+			fi; \
+		done; \
 	else \
 		echo "Note: native toolchain not built (looked in build/toolchain_build/$(B1NIX_TRIPLET)/native_root and ~/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root)."; \
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \

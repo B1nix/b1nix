@@ -2387,7 +2387,14 @@ u64 scheduler_brk_get(void) {
 
 u64 vm_find_free_area(struct task *t, usize length) {
   u64 start = 0x40000000ULL;
+#ifdef __x86_64__
   u64 end = 0x7FFFFFFFFFFFULL;
+#else
+  /* 32-bit: anonymous mmap must stay below the kernel split at 0x80000000 so it
+   * never aliases the direct map [0x80000000, 0xC0000000). The user stack VMA
+   * (just under 0x80000000) further bounds the search. */
+  u64 end = 0x80000000ULL;
+#endif
 
   // Simple first-fit hole finding
   u64 current_addr = start;

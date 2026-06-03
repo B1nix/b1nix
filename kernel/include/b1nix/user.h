@@ -13,8 +13,18 @@ typedef int (*user_program_entry)(int argc, const char **argv);
 #define USER_SPACE_LIMIT 0x0000800000000000ULL
 #define USER_STACK_TOP 0x0000800000000000ULL
 #else
+/* 32-bit layout: user [0, 2 GiB), kernel [2 GiB, 4 GiB). The kernel direct-maps
+ * physical RAM at DIRECT_MAP_BASE (0x80000000) for up to DIRECT_MAP_MAX (1 GiB),
+ * i.e. [0x80000000, 0xC0000000). The user stack MUST stay below 0x80000000 or
+ * it aliases that direct map once RAM is large enough for the map to reach the
+ * stack (>~1 GiB): the stack page at the old 0xBFFFF000 then resolves to the
+ * supervisor direct-map page instead of the task's stack, so argv/locals read
+ * back as NULL/garbage and userspace crashes (this is the native gcc driver
+ * SIGSEGV at -m 1024+ and on the 16 GiB box). Keep the stack just under the
+ * 2 GiB kernel split. USER_SPACE_LIMIT stays 0xC0000000 so the address-space
+ * clone / lazy-fault range (PD index < 768) is unchanged. */
 #define USER_SPACE_LIMIT 0xC0000000ULL
-#define USER_STACK_TOP 0xC0000000ULL
+#define USER_STACK_TOP 0x80000000ULL
 #endif
 
 enum user_image_kind {
