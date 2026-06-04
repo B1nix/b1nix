@@ -21,6 +21,7 @@
 #include <b1nix/io.h>
 #include <b1nix/sched.h>
 #include <b1nix/usb.h>
+#include <b1nix/bootinfo.h>
 #include <string.h>
 
 /* ── Capability registers ───────────────────────────────────────────────── */
@@ -30,6 +31,11 @@
 #define XHCI_CAP_HCCPARAMS1  0x10
 #define XHCI_CAP_DBOFF       0x14
 #define XHCI_CAP_RTSOFF      0x18
+
+/* Extended capability IDs (offset from BAR0, linked via HCCPARAMS1.xECP). */
+#define XHCI_EXT_LEGACY      1
+#define XHCI_LEGACY_BIOS_OWNED (1u << 16)
+#define XHCI_LEGACY_OS_OWNED   (1u << 24)
 
 /* ── Operational registers (relative to op base = BAR0 + CAPLENGTH) ─────── */
 #define XHCI_OP_USBCMD       0x00
@@ -51,6 +57,9 @@
 #define PORTSC_PRC   (1u << 21)  /* port reset change      */
 #define PORTSC_SPEED_SHIFT 10
 #define PORTSC_SPEED_MASK  0xf
+#define PORTSC_RW1C_MASK ((1u << 17) | (1u << 18) | (1u << 19) | \
+                          (1u << 20) | (1u << 21) | (1u << 22) | \
+                          (1u << 23))
 
 /* ── Runtime / interrupter 0 (relative to rt base = BAR0 + RTSOFF) ──────── */
 #define XHCI_IR0             0x20
@@ -85,6 +94,7 @@
 struct trb { u64 param; u32 status; u32 control; } __attribute__((packed));
 
 #define RING_LEN 16   /* TRBs per ring (small; one report in flight) */
+#define XHCI_MMIO_WINDOW 0x10000u
 
 /* ── Driver state ───────────────────────────────────────────────────────── */
 static volatile u8 *cap_base;     /* BAR0                       */
@@ -111,6 +121,8 @@ static u8 prev_report[8];
 
 /* ── MMIO helpers ───────────────────────────────────────────────────────── */
 static inline u32 rd32(volatile u8 *b, u32 off) { return *(volatile u32 *)(b + off); }
+static inline u8 rd8(volatile u8 *b, u32 off) { return *(volatile u8 *)(b + off); }
+static inline void wr8(volatile u8 *b, u32 off, u8 v) { *(volatile u8 *)(b + off) = v; }
 static inline void wr32(volatile u8 *b, u32 off, u32 v) { *(volatile u32 *)(b + off) = v; }
 static inline void wr64(volatile u8 *b, u32 off, u64 v)
 {
@@ -121,6 +133,55 @@ static inline void wr64(volatile u8 *b, u32 off, u64 v)
 }
 
 static void udelay(int loops) { for (int i = 0; i < loops; i++) (void)inb(0x80); }
+
+static void xhci_pci_set_d0(const struct pci_device_info *p)
+{
+	u16 status = pci_config_read16(p->bus, p->slot, p->func, 0x06);
+	if (!(status & (1u << 4)))
+		return;
+	u8 cap = pci_config_read8(p->bus, p->slot, p->func, 0x34) & 0xFC;
+	for (int guard = 0; cap && guard < 48; guard++) {
+		u8 id = pci_config_read8(p->bus, p->slot, p->func, cap);
+		if (id == 0x01) {
+			u16 pmcsr = pci_config_read16(p->bus, p->slot, p->func, cap + 4);
+			if (pmcsr & 0x3) {
+				pci_config_write16(p->bus, p->slot, p->func, cap + 4, pmcsr & ~0x3u);
+				udelay(10000);
+			}
+			return;
+		}
+		cap = pci_config_read8(p->bus, p->slot, p->func, cap + 1) & 0xFC;
+	}
+}
+
+static void xhci_legacy_handoff(u32 hcc1)
+{
+	u32 off = (hcc1 >> 16) & 0xffff;
+	for (int guard = 0; off && guard < 64; guard++) {
+		u32 cap = rd32(cap_base, off);
+		u8 id = (u8)(cap & 0xff);
+		u8 next = (u8)((cap >> 8) & 0xff);
+		if (id == XHCI_EXT_LEGACY) {
+			if (cap & XHCI_LEGACY_BIOS_OWNED) {
+				/* The spec requires byte accesses so BIOS-owned and OS-owned
+				 * semaphores can be modified independently. */
+				wr8(cap_base, off + 3, rd8(cap_base, off + 3) | 0x01);
+				for (int i = 0; i < 100000; i++) {
+					cap = rd32(cap_base, off);
+					if (!(cap & XHCI_LEGACY_BIOS_OWNED))
+						break;
+					udelay(10);
+				}
+			}
+			/* Disable legacy SMI sources if the BIOS left them armed. */
+			wr32(cap_base, off + 4, 0);
+			return;
+		}
+		if (!next)
+			break;
+		off += (u32)next * 4;
+	}
+}
 
 /* Allocate one zeroed, page-aligned, physically contiguous frame. */
 static void *dma_alloc(u64 *phys_out)
@@ -293,12 +354,12 @@ static int reset_port(u32 port)
 {
 	u32 off = XHCI_OP_PORTS + (port - 1) * 0x10;
 	u32 portsc = rd32(op_base, off);
-	/* Preserve RW1C bits we don't want to clear; set PR. */
-	wr32(op_base, off, (portsc & ~(PORTSC_PED)) | PORTSC_PR);
+	/* Preserve state, keep RW1C bits clear unless intentionally clearing PRC. */
+	wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | PORTSC_PR);
 	for (int i = 0; i < 100000; i++) {
 		portsc = rd32(op_base, off);
 		if (portsc & PORTSC_PRC) {            /* reset complete */
-			wr32(op_base, off, portsc | PORTSC_PRC); /* clear change (RW1C) */
+			wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK) | PORTSC_PRC);
 			return (portsc & PORTSC_PED) ? 0 : -1;
 		}
 		udelay(10);
@@ -478,12 +539,30 @@ int xhci_probe(void)
 {
 	struct pci_device_info pci;
 	int found = 0;
+
+	if (bootinfo_has_flag("b1nix.skip-xhci")) {
+		console_write("xhci: skipped (b1nix.skip-xhci)\n");
+		return 0;
+	}
+
+	int xhci_run_requested = bootinfo_has_flag("b1nix.xhci.run") ||
+	                         bootinfo_has_flag("b1nix.xhci.enum") ||
+	                         bootinfo_has_flag("b1nix.test=1");
+	if (!xhci_run_requested) {
+		/* On metal, touching xHCI and then not running it tears down firmware
+		 * USB ownership, which kills USB keyboards. Leave the controller fully
+		 * alone unless the caller explicitly opts into the native driver path. */
+		return 0;
+	}
+
 	for (u8 idx = 0; idx < 16; idx++) {
 		if (!pci_find_class(0x0C, 0x03, idx, &pci)) break;
 		if (pci.prog_if == 0x30) { found = 1; break; } /* xHCI */
 	}
 	if (!found)
 		return 0;
+
+	xhci_pci_set_d0(&pci);
 
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
 	cmd |= 0x0006; /* memory space + bus master */
@@ -497,36 +576,82 @@ int xhci_probe(void)
 	} else {
 		mmio = bar0 & 0xFFFFFFF0u;
 	}
-#ifdef __x86_64__
-	cap_base = (volatile u8 *)(usize)(vmm_direct_map_base() + mmio);
-#else
-	cap_base = (volatile u8 *)vmm_map_mmio(mmio, 0x4000, VMM_WRITABLE | VMM_PCD);
-#endif
+	if (!mmio) {
+		console_write("xhci: no MMIO BAR, skipping\n");
+		return 0;
+	}
+
+	/* Use explicit cache-disabled MMIO mappings on all x86 variants. Real xHCI
+	 * BARs can place doorbells/runtime registers well past the first 16 KiB, so
+	 * map a larger controller window than the minimal QEMU path needed. */
+	cap_base = (volatile u8 *)vmm_map_mmio(mmio, XHCI_MMIO_WINDOW,
+	                                       VMM_WRITABLE | VMM_PCD);
 
 	u8 caplen = *(volatile u8 *)(cap_base + XHCI_CAP_CAPLENGTH);
+	if (caplen < 0x20 || caplen > 0x80) {
+		console_write("xhci: invalid caplength 0x");
+		console_write_hex32(caplen);
+		console_write("\n");
+		return 0;
+	}
 	op_base = cap_base + caplen;
-	rt_base = cap_base + (rd32(cap_base, XHCI_CAP_RTSOFF) & ~0x1fu);
-	db_array = (volatile u32 *)(cap_base + (rd32(cap_base, XHCI_CAP_DBOFF) & ~0x3u));
+	u32 rtsoff = rd32(cap_base, XHCI_CAP_RTSOFF) & ~0x1fu;
+	u32 dboff = rd32(cap_base, XHCI_CAP_DBOFF) & ~0x3u;
+	if (rtsoff >= XHCI_MMIO_WINDOW || dboff >= XHCI_MMIO_WINDOW) {
+		console_write("xhci: BAR window too small rt=0x");
+		console_write_hex32(rtsoff);
+		console_write(" db=0x");
+		console_write_hex32(dboff);
+		console_write("\n");
+		return 0;
+	}
+	rt_base = cap_base + rtsoff;
+	db_array = (volatile u32 *)(cap_base + dboff);
 
 	u32 hcs1 = rd32(cap_base, XHCI_CAP_HCSPARAMS1);
 	num_ports = (hcs1 >> 24) & 0xff;
+	u32 max_mapped_ports = 0;
+	if ((u32)caplen + XHCI_OP_PORTS < XHCI_MMIO_WINDOW)
+		max_mapped_ports = (XHCI_MMIO_WINDOW - (u32)caplen - XHCI_OP_PORTS) / 0x10;
+	if (num_ports > max_mapped_ports) {
+		num_ports = max_mapped_ports;
+	}
 	u32 max_slots = hcs1 & 0xff;
 	u32 hcc1 = rd32(cap_base, XHCI_CAP_HCCPARAMS1);
 	ctx_bytes = (hcc1 & (1u << 2)) ? 64 : 32;
+
+	xhci_legacy_handoff(hcc1);
 
 	/* Reset the controller. */
 	u32 sts = rd32(op_base, XHCI_OP_USBSTS);
 	if (!(sts & USBSTS_HCH)) {
 		wr32(op_base, XHCI_OP_USBCMD, rd32(op_base, XHCI_OP_USBCMD) & ~USBCMD_RUN);
-		for (int i = 0; i < 100000 && !(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH); i++)
+		int halted = 0;
+		for (int i = 0; i < 100000; i++) {
+			if (rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH) {
+				halted = 1;
+				break;
+			}
 			udelay(1);
+		}
+		if (!halted) {
+			console_write("xhci: halt timeout, skipping\n");
+			return 0;
+		}
 	}
 	wr32(op_base, XHCI_OP_USBCMD, USBCMD_HCRST);
+	int reset_done = 0;
 	for (int i = 0; i < 100000; i++) {
 		if (!(rd32(op_base, XHCI_OP_USBCMD) & USBCMD_HCRST) &&
-		    !(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_CNR))
+		    !(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_CNR)) {
+			reset_done = 1;
 			break;
+		}
 		udelay(10);
+	}
+	if (!reset_done) {
+		console_write("xhci: reset timeout, skipping\n");
+		return 0;
 	}
 
 	/* Program MaxSlotsEnabled. */
@@ -561,8 +686,18 @@ int xhci_probe(void)
 
 	/* Run. */
 	wr32(op_base, XHCI_OP_USBCMD, rd32(op_base, XHCI_OP_USBCMD) | USBCMD_RUN);
-	for (int i = 0; i < 100000 && (rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH); i++)
+	int running = 0;
+	for (int i = 0; i < 100000; i++) {
+		if (!(rd32(op_base, XHCI_OP_USBSTS) & USBSTS_HCH)) {
+			running = 1;
+			break;
+		}
 		udelay(1);
+	}
+	if (!running) {
+		console_write("xhci: run timeout, skipping\n");
+		return 0;
+	}
 
 	xhci_ready = 1;
 	console_write("xhci: ");
@@ -574,11 +709,15 @@ int xhci_probe(void)
 	console_write("\n");
 	console_write("M37-USB: ok xhci-init\n");
 
-	/* Give a freshly powered port a moment to report a connection. */
-	for (int i = 0; i < 50 && find_connected_port(0) < 0; i++)
-		scheduler_sleep_ticks(1);
-
-	enumerate_keyboard();
+	/* The controller is usable at this point. Device enumeration is opt-in on
+	 * metal while we harden the port/slot path; a bad root-port transaction
+	 * must not block the rest of boot. */
+	if (bootinfo_has_flag("b1nix.xhci.enum") ||
+	    bootinfo_has_flag("b1nix.test=1")) {
+		for (int i = 0; i < 500 && find_connected_port(0) < 0; i++)
+			udelay(1000);
+		enumerate_keyboard();
+	}
 	return 1;
 }
 
@@ -606,12 +745,21 @@ static const u8 hid_to_set1[0x68] = {
 	[0x33] = 0x27, /* ; */       [0x34] = 0x28, /* ' */
 	[0x35] = 0x29, /* ` */       [0x36] = 0x33, /* , */
 	[0x37] = 0x34, /* . */       [0x38] = 0x35, /* / */
+	[0x55] = 0x37, /* KP * */    [0x56] = 0x4A, /* KP - */
+	[0x57] = 0x4E, /* KP + */    [0x59] = 0x4F, /* KP 1 */
+	[0x5A] = 0x50, /* KP 2 */    [0x5B] = 0x51, /* KP 3 */
+	[0x5C] = 0x4B, /* KP 4 */    [0x5D] = 0x4C, /* KP 5 */
+	[0x5E] = 0x4D, /* KP 6 */    [0x5F] = 0x47, /* KP 7 */
+	[0x60] = 0x48, /* KP 8 */    [0x61] = 0x49, /* KP 9 */
+	[0x62] = 0x52, /* KP 0 */    [0x63] = 0x53, /* KP . */
 };
 
 /* Extended (E0-prefixed) usages: arrows, etc. Returns set1 code or 0. */
 static u8 hid_to_set1_ext(u8 usage)
 {
 	switch (usage) {
+	case 0x54: return 0x35; /* Keypad / */
+	case 0x58: return 0x1C; /* Keypad Enter */
 	case 0x4F: return 0x4D; /* Right */
 	case 0x50: return 0x4B; /* Left  */
 	case 0x51: return 0x50; /* Down  */

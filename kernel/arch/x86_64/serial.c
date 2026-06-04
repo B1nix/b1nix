@@ -16,8 +16,14 @@ void serial_init(void)
 
 void serial_putc(char ch)
 {
-	while ((inb(COM1 + 5) & 0x20) == 0);
-	outb(COM1, (u8)ch);
+	for (int i = 0; i < 100000; i++) {
+		if (inb(COM1 + 5) & 0x20) {
+			outb(COM1, (u8)ch);
+			return;
+		}
+	}
+	/* Real hardware may have no usable COM1; console output must not wedge. */
+	(void)ch;
 }
 
 int serial_has_data(void)

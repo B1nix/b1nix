@@ -1,6 +1,7 @@
 #include <b1nix/net.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
+#include <b1nix/bootinfo.h>
 #include <string.h>
 
 #define DHCP_OP_REQUEST 1
@@ -10,8 +11,10 @@
 #define DHCP_OPT_SUBNET_MASK 1
 #define DHCP_OPT_ROUTER 3
 #define DHCP_OPT_DNS 6
+#define DHCP_OPT_REQUESTED_IP 50
 #define DHCP_OPT_LEASE_TIME 51
 #define DHCP_OPT_SERVER_ID 54
+#define DHCP_OPT_PARAM_REQUEST_LIST 55
 #define DHCP_OPT_END 255
 
 struct dhcp_packet {
@@ -43,9 +46,108 @@ static u64 rebind_ticks = 0;
 static u64 last_request_ticks = 0;
 static int dhcp_udp_registered = 0;
 static int dhcp_fallback_announced = 0;
+static struct ipv4_addr offered_gw = {{0, 0, 0, 0}};
+static struct ipv4_addr offered_mask = {{0, 0, 0, 0}};
+static struct ipv4_addr offered_dns = {{0, 0, 0, 0}};
+
+struct dhcp_reply_diag {
+	int valid;
+	struct ipv4_addr yiaddr;
+	struct ipv4_addr gw;
+	struct ipv4_addr mask;
+	struct ipv4_addr dns;
+	struct ipv4_addr srv;
+	u32 xid;
+};
+
+static struct dhcp_reply_diag last_offer_diag;
+static struct dhcp_reply_diag last_ack_diag;
 
 static u32 be32(const u8 *p) {
   return ((u32)p[0] << 24) | ((u32)p[1] << 16) | ((u32)p[2] << 8) | (u32)p[3];
+}
+
+static int ipv4_is_zero(struct ipv4_addr ip)
+{
+	return ip.bytes[0] == 0 && ip.bytes[1] == 0 &&
+	       ip.bytes[2] == 0 && ip.bytes[3] == 0;
+}
+
+static void dhcp_print_ipv4(struct ipv4_addr ip)
+{
+	console_write_dec(ip.bytes[0]); console_write(".");
+	console_write_dec(ip.bytes[1]); console_write(".");
+	console_write_dec(ip.bytes[2]); console_write(".");
+	console_write_dec(ip.bytes[3]);
+}
+
+static void dhcp_save_reply_diag(struct dhcp_reply_diag *diag,
+                                 struct ipv4_addr yiaddr,
+                                 struct ipv4_addr gw,
+                                 struct ipv4_addr mask,
+                                 struct ipv4_addr dns,
+                                 struct ipv4_addr srv)
+{
+	diag->valid = 1;
+	diag->yiaddr = yiaddr;
+	diag->gw = gw;
+	diag->mask = mask;
+	diag->dns = dns;
+	diag->srv = srv;
+	diag->xid = current_xid;
+}
+
+static void dhcp_dump_saved_reply(const char *kind,
+                                  const struct dhcp_reply_diag *diag)
+{
+	console_write(" dhcp-");
+	console_write(kind);
+	console_write(": ");
+	if (!diag->valid) {
+		console_write("none\n");
+		return;
+	}
+	console_write("yiaddr=");
+	dhcp_print_ipv4(diag->yiaddr);
+	console_write(" gw=");
+	dhcp_print_ipv4(diag->gw);
+	console_write(" mask=");
+	dhcp_print_ipv4(diag->mask);
+	console_write(" dns=");
+	dhcp_print_ipv4(diag->dns);
+	console_write(" srv=");
+	dhcp_print_ipv4(diag->srv);
+	console_write(" xid=0x");
+	console_write_hex32(diag->xid);
+	console_write("\n");
+}
+
+void dhcp_dump_info(void)
+{
+	dhcp_dump_saved_reply("offer", &last_offer_diag);
+	dhcp_dump_saved_reply("ack", &last_ack_diag);
+}
+
+static int dhcp_chaddr_matches_local(const struct dhcp_packet *pkt)
+{
+	struct mac_addr mac = net_get_mac();
+	if (pkt->htype != 1 || pkt->hlen != 6)
+		return 0;
+	for (int i = 0; i < 6; i++) {
+		if (pkt->chaddr[i] != mac.bytes[i])
+			return 0;
+	}
+	return 1;
+}
+
+static u32 dhcp_seed_xid_from_mac(void)
+{
+	struct mac_addr mac = net_get_mac();
+	u32 x = 0x11223344u;
+	for (int i = 0; i < 6; i++)
+		x = (x * 33u) ^ mac.bytes[i];
+	x ^= (u32)scheduler_get_uptime_ticks();
+	return x ? x : 0x11223344u;
 }
 
 static void dhcp_send_request(struct ipv4_addr requested_ip, int broadcast) {
@@ -64,10 +166,15 @@ static void dhcp_send_request(struct ipv4_addr requested_ip, int broadcast) {
   req.options[0] = DHCP_OPT_MSG_TYPE;
   req.options[1] = 1;
   req.options[2] = 3; // DHCP Request
-  req.options[3] = 50; // Requested IP Option
-  req.options[4] = 4;
-  memcpy(&req.options[5], requested_ip.bytes, 4);
-  req.options[9] = DHCP_OPT_END;
+	req.options[3] = DHCP_OPT_REQUESTED_IP;
+	req.options[4] = 4;
+	memcpy(&req.options[5], requested_ip.bytes, 4);
+	req.options[9] = DHCP_OPT_PARAM_REQUEST_LIST;
+	req.options[10] = 3;
+	req.options[11] = DHCP_OPT_SUBNET_MASK;
+	req.options[12] = DHCP_OPT_ROUTER;
+	req.options[13] = DHCP_OPT_DNS;
+	req.options[14] = DHCP_OPT_END;
 
   struct ipv4_addr dst = broadcast ? (struct ipv4_addr){{255, 255, 255, 255}} : dhcp_server;
   udp_send(dst, 68, 67, &req, sizeof(req));
@@ -80,9 +187,15 @@ void dhcp_init(void)
 		udp_register_handler(68, dhcp_receive);
 		dhcp_udp_registered = 1;
 	}
-	current_xid++;
+	if (current_xid == 0x11223344u)
+		current_xid = dhcp_seed_xid_from_mac();
+	else
+		current_xid++;
 	dhcp_state = 0;
 	dhcp_fallback_announced = 0;
+	offered_gw = (struct ipv4_addr){{0, 0, 0, 0}};
+	offered_mask = (struct ipv4_addr){{0, 0, 0, 0}};
+	offered_dns = (struct ipv4_addr){{0, 0, 0, 0}};
 	struct dhcp_packet pkt;
 	memset(&pkt, 0, sizeof(pkt));
 
@@ -104,7 +217,12 @@ void dhcp_init(void)
 	pkt.options[0] = DHCP_OPT_MSG_TYPE;
 	pkt.options[1] = 1; // len
 	pkt.options[2] = 1; // DHCP Discover
-	pkt.options[3] = DHCP_OPT_END;
+	pkt.options[3] = DHCP_OPT_PARAM_REQUEST_LIST;
+	pkt.options[4] = 3;
+	pkt.options[5] = DHCP_OPT_SUBNET_MASK;
+	pkt.options[6] = DHCP_OPT_ROUTER;
+	pkt.options[7] = DHCP_OPT_DNS;
+	pkt.options[8] = DHCP_OPT_END;
 
 	struct ipv4_addr bcast = { { 255, 255, 255, 255 } };
 	udp_send(bcast, 68, 67, &pkt, sizeof(pkt));
@@ -129,7 +247,12 @@ void dhcp_receive(const void *data, usize size)
 	const struct dhcp_packet *pkt = data;
 
 	if (pkt->op != DHCP_OP_REPLY) return;
+	if (pkt->magic_cookie != 0x63538263) return;
 	if (pkt->xid != current_xid) return;
+	if (!dhcp_chaddr_matches_local(pkt)) {
+		console_write("dhcp: ignoring reply for foreign chaddr\n");
+		return;
+	}
 
 	u8 msg_type = 0;
 	struct ipv4_addr offer_ip = pkt->yiaddr;
@@ -137,6 +260,7 @@ void dhcp_receive(const void *data, usize size)
 	struct ipv4_addr parsed_gw   = {{0,0,0,0}};
 	struct ipv4_addr parsed_mask = {{0,0,0,0}};
 	struct ipv4_addr parsed_srv  = {{0,0,0,0}};
+	struct ipv4_addr parsed_dns  = {{0,0,0,0}};
 
 	const u8 *opt = pkt->options;
 	while (opt < (const u8 *)data + size && *opt != DHCP_OPT_END) {
@@ -151,7 +275,8 @@ void dhcp_receive(const void *data, usize size)
 			memcpy(parsed_mask.bytes, opt, 4);
 		} else if (type == DHCP_OPT_ROUTER && len >= 4) {
 			memcpy(parsed_gw.bytes, opt, 4);
-			net_set_gateway(parsed_gw);
+		} else if (type == DHCP_OPT_DNS && len >= 4) {
+			memcpy(parsed_dns.bytes, opt, 4);
 		} else if (type == DHCP_OPT_SERVER_ID && len >= 4) {
 			memcpy(parsed_srv.bytes, opt, 4);
 			memcpy(dhcp_server.bytes, opt, 4);
@@ -165,41 +290,39 @@ void dhcp_receive(const void *data, usize size)
 	}
 
 	if (msg_type == 2 && dhcp_state == 0) { // Offer
+		dhcp_save_reply_diag(&last_offer_diag, offer_ip, parsed_gw,
+		                     parsed_mask, parsed_dns, parsed_srv);
+		offered_gw = parsed_gw;
+		offered_mask = parsed_mask;
+		offered_dns = parsed_dns;
 		dhcp_state = 1;
 		dhcp_send_request(offer_ip, 1);
 
 	} else if (msg_type == 5 &&
 	           (dhcp_state == 1 || dhcp_state == 3 || dhcp_state == 4)) { // Ack
+		if (ipv4_is_zero(parsed_gw))
+			parsed_gw = offered_gw;
+		if (ipv4_is_zero(parsed_mask))
+			parsed_mask = offered_mask;
+		if (ipv4_is_zero(parsed_dns))
+			parsed_dns = offered_dns;
+		dhcp_save_reply_diag(&last_ack_diag, pkt->yiaddr, parsed_gw,
+		                     parsed_mask, parsed_dns, parsed_srv);
 		net_set_ip(pkt->yiaddr);
+		net_set_gateway(parsed_gw);
+		if (parsed_dns.bytes[0] || parsed_dns.bytes[1] ||
+		    parsed_dns.bytes[2] || parsed_dns.bytes[3])
+			dns_set_server(parsed_dns);
 		dhcp_state = 2; // Bound
-		console_write("DHCP-SMOKE: lease-acquired\n");
+		if (bootinfo_has_flag("b1nix.test=1"))
+			console_write("DHCP-SMOKE: lease-acquired\n");
 		u64 now = scheduler_get_uptime_ticks();
 		lease_expire_ticks = now + (u64)lease_seconds * 100;
 		renew_ticks = now + ((u64)lease_seconds * 100) / 2;
 		rebind_ticks = now + ((u64)lease_seconds * 100 * 7) / 8;
 
 		console_write("net: dhcp bound to ");
-		for (int i = 0; i < 4; i++) {
-			console_write_dec(pkt->yiaddr.bytes[i]);
-			if (i < 3) console_write(".");
-		}
-		console_write("\n");
-		/* Compact diagnostic — visible at bottom of screen without scrolling */
-		console_write("dhcp: gw=");
-		console_write_dec(parsed_gw.bytes[0]); console_write(".");
-		console_write_dec(parsed_gw.bytes[1]); console_write(".");
-		console_write_dec(parsed_gw.bytes[2]); console_write(".");
-		console_write_dec(parsed_gw.bytes[3]);
-		console_write(" mask=");
-		console_write_dec(parsed_mask.bytes[0]); console_write(".");
-		console_write_dec(parsed_mask.bytes[1]); console_write(".");
-		console_write_dec(parsed_mask.bytes[2]); console_write(".");
-		console_write_dec(parsed_mask.bytes[3]);
-		console_write(" srv=");
-		console_write_dec(parsed_srv.bytes[0]); console_write(".");
-		console_write_dec(parsed_srv.bytes[1]); console_write(".");
-		console_write_dec(parsed_srv.bytes[2]); console_write(".");
-		console_write_dec(parsed_srv.bytes[3]);
+		dhcp_print_ipv4(pkt->yiaddr);
 		console_write("\n");
 	}
 }
@@ -209,11 +332,12 @@ void dhcp_tick(u64 now_ticks) {
     struct ipv4_addr fallback_ip = {{10, 0, 2, 15}};
     struct ipv4_addr fallback_gw = {{10, 0, 2, 2}};
     net_set_ip(fallback_ip);
-    net_set_gateway(fallback_gw);
-    dhcp_state = 2;
-    dhcp_fallback_announced = 1;
-    console_write("DHCP-SMOKE: fallback-static\n");
-    return;
+	    net_set_gateway(fallback_gw);
+	    dhcp_state = 2;
+	    dhcp_fallback_announced = 1;
+	    if (bootinfo_has_flag("b1nix.test=1"))
+	      console_write("DHCP-SMOKE: fallback-static\n");
+	    return;
   }
   if (dhcp_state == 2) {
     if (renew_ticks && now_ticks >= renew_ticks) {

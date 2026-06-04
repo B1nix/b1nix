@@ -96,6 +96,7 @@ int udp_register_handler(u16 port, udp_port_handler_t handler);
 void dhcp_init(void);
 void dhcp_receive(const void *data, usize size);
 void dhcp_tick(u64 now_ticks);
+void dhcp_dump_info(void);
 
 // NTP (SNTP client)
 void ntp_tick(u64 now_ticks);

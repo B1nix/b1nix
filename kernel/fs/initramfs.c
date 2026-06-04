@@ -483,6 +483,8 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     {"/bin/dbclient", (const char *)vfs_dropbear_elf,
      sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/ssh", (const char *)vfs_dropbear_elf,
+     sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/dropbearkey", (const char *)vfs_dropbear_elf,
      sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/dropbearconvert", (const char *)vfs_dropbear_elf,

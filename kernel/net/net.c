@@ -193,6 +193,7 @@ void net_dump_info(void)
 	                     (u32)gateway_ip.bytes[3]);
 	console_write("]");
 	console_write("\n");
+	dhcp_dump_info();
 
 	if (net_adapter_count == 0) {
 		console_write(" pci:    no network adapters found\n");
@@ -263,10 +264,8 @@ void net_init(void)
 
 	/* NIC driver probe: the first driver to register becomes the active
 	 * interface (netdev_register is first-wins). virtio-net is tried first so
-	 * it stays the active NIC under QEMU; e1000 is then probed unconditionally
-	 * so its hardware comes up for the M37-E1000 self-test even when virtio
-	 * already won. On real hardware virtio-net is absent, so e1000 (the host's
-	 * Intel I219-V and the rest of the gigabit family) becomes active. */
+	 * it stays the active NIC under QEMU; e1000 is the primary metal path for
+	 * Intel I219 desktops, and r8169 covers Realtek-only machines. */
 	virtio_net_probe();
 	e1000_probe();
 	r8169_probe();   /* Realtek RTL8169/8168/8111/810x family (e.g. ZG5 RTL8102E) */

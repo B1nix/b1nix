@@ -31,6 +31,7 @@
 #define E1000_STATUS  0x0008   /* Device Status             */
 #define E1000_EECD    0x0010   /* EEPROM/Flash Control      */
 #define E1000_EERD    0x0014   /* EEPROM Read               */
+#define E1000_FEXTNVM11 0x5BBC /* Future Extended NVM 11    */
 #define E1000_ICR     0x00C0   /* Interrupt Cause Read      */
 #define E1000_ITR     0x00C4   /* Interrupt Throttling      */
 #define E1000_IMS     0x00D0   /* Interrupt Mask Set        */
@@ -85,6 +86,8 @@
 #define EERD_DONE     (1u << 4)    /* DONE bit (82540 layout) */
 
 #define RAH_AV        (1u << 31)   /* Address Valid           */
+
+#define FEXTNVM11_DISABLE_MULR_FIX (1u << 13)
 
 /* Legacy descriptors (16 bytes). DMA-coherent on x86 — accessed volatile. */
 struct e1000_rx_desc {
@@ -221,20 +224,45 @@ static void e1000_read_mac(struct mac_addr *mac)
 }
 
 /* ── Hardware bring-up ──────────────────────────────────────────────────── */
-static void e1000_reset(void)
+static int e1000_device_is_pch_i219(u16 device_id)
 {
-	/* Mask + clear all interrupts before touching anything. */
+	switch (device_id) {
+	case 0x156F: case 0x1570:
+	case 0x15B7: case 0x15B8:
+	case 0x15D6: case 0x15D7: case 0x15D8:
+	case 0x15E3:
+	case 0x0DC7:
+		return 1;
+	default:
+		return 0;
+	}
+}
+
+static void e1000_reset(int pch_i219)
+{
+	/* Quiesce RX/TX first. Linux e1000e's PCH reset path allows pending MAC
+	 * transactions to drain before the global reset; I219 is known to hang if
+	 * descriptor/MMIO activity overlaps reset or D3 transitions. */
+	e1000_write(E1000_RCTL, 0);
+	e1000_write(E1000_TCTL, TCTL_PSP);
+	e1000_udelay(10000);
+
+	if (pch_i219) {
+		u32 fext = e1000_read(E1000_FEXTNVM11);
+		e1000_write(E1000_FEXTNVM11, fext | FEXTNVM11_DISABLE_MULR_FIX);
+	}
+
+	/* Mask + clear all interrupts before the reset. */
 	e1000_write(E1000_IMC, 0xFFFFFFFF);
 	(void)e1000_read(E1000_ICR);
 
 	u32 ctrl = e1000_read(E1000_CTRL);
 	e1000_write(E1000_CTRL, ctrl | CTRL_RST);
-	/* Reset self-clears within ~1 µs; bound the wait. */
-	for (int i = 0; i < 1000; i++) {
-		if (!(e1000_read(E1000_CTRL) & CTRL_RST))
-			break;
-		e1000_udelay(1);
-	}
+
+	/* Do not read/flush immediately after asserting CTRL.RST on PCH/I219.
+	 * Upstream e1000e explicitly waits here because touching the MAC while the
+	 * global reset is in flight can hang the hardware. */
+	e1000_udelay(pch_i219 ? 20000 : 1000);
 
 	e1000_write(E1000_IMC, 0xFFFFFFFF);
 	(void)e1000_read(E1000_ICR);
@@ -451,14 +479,11 @@ int e1000_probe(void)
 		mmio_phys = bar0 & 0xFFFFFFF0u;
 	}
 
-#ifdef __x86_64__
-	/* The direct map already covers PCI MMIO BARs (same as ahci/nvme). */
-	e1000_regs = (volatile u8 *)(usize)(vmm_direct_map_base() + mmio_phys);
-#else
-	/* 32-bit: BARs live above the 1 GiB direct map — use the MMIO window. */
+	/* Map the register BAR through the MMIO window even on x86_64 so the PTEs
+	 * carry cache-disable attributes. The legacy direct-map path uses huge,
+	 * cacheable pages; some real Intel NICs are much less forgiving than QEMU. */
 	e1000_regs = (volatile u8 *)vmm_map_mmio(mmio_phys, 0x20000,
 	                                         VMM_WRITABLE | VMM_PCD);
-#endif
 
 	console_write("e1000: ");
 	console_write_hex32(pci.device_id);
@@ -466,7 +491,7 @@ int e1000_probe(void)
 	console_write_hex64(mmio_phys);
 	console_write("\n");
 
-	e1000_reset();
+	e1000_reset(e1000_device_is_pch_i219(pci.device_id));
 
 	/* Set link up + auto-speed. */
 	u32 ctrl = e1000_read(E1000_CTRL);
