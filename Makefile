@@ -220,6 +220,7 @@ KERNEL_SOURCES += \
 	kernel/dev/virtio_blk.c \
 	kernel/dev/virtio_net.c \
 	kernel/dev/e1000.c \
+	kernel/dev/r8169.c \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
 	kernel/dev/ps2_kbd.c \

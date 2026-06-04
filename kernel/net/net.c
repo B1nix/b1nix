@@ -186,6 +186,12 @@ void net_dump_info(void)
 	console_write("\n gateway:");
 	console_putc(' ');
 	print_ipv4(gateway_ip);
+	console_write(" [raw:");
+	console_write_hex32(((u32)gateway_ip.bytes[0] << 24) |
+	                    ((u32)gateway_ip.bytes[1] << 16) |
+	                    ((u32)gateway_ip.bytes[2] <<  8) |
+	                     (u32)gateway_ip.bytes[3]);
+	console_write("]");
 	console_write("\n");
 
 	if (net_adapter_count == 0) {
@@ -263,6 +269,7 @@ void net_init(void)
 	 * Intel I219-V and the rest of the gigabit family) becomes active. */
 	virtio_net_probe();
 	e1000_probe();
+	r8169_probe();   /* Realtek RTL8169/8168/8111/810x family (e.g. ZG5 RTL8102E) */
 
 	struct netdev *nd = netdev_active();
 	console_write("net: pci adapters 0x");

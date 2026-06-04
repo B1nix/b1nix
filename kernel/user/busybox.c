@@ -2534,21 +2534,40 @@ static int wget_main(int argc, const char **argv) {
 
 /* ── dmesg — print kernel log buffer ── */
 static int dmesg_main(int argc, const char **argv) {
-  (void)argc;
-  (void)argv;
-
-  char buf[2048];
+  /* static (not stack): big enough for the whole 64 KiB kernel log ring so a
+   * single `dmesg` prints the entire boot log (driver/PCI/DHCP lines). */
+  static char buf[65536];
   long n =
       (long)syscall_dispatch(SYS_DMESG, (u64)(usize)buf, sizeof(buf), 0, 0, 0, 0);
   if (n < 0) {
     printf("dmesg: error reading kernel log\n");
     return 1;
   }
-  if (n > 0) {
+  if (n == 0)
+    return 0;
+
+  /* Optional substring filter: `dmesg pci`, `dmesg r8169` — prints only lines
+   * containing the argument. Built in so it works without a '|' (handy on
+   * keyboards where the pipe key isn't reachable). With no argument, print all. */
+  const char *filter = (argc >= 2 && argv[1] && argv[1][0]) ? argv[1] : 0;
+  if (!filter) {
     printf("%s", buf);
     if (buf[n - 1] != '\n')
       putchar('\n');
+    return 0;
   }
+
+  char *line = buf;
+  for (long i = 0; i < n; i++) {
+    if (buf[i] == '\n') {
+      buf[i] = '\0';
+      if (strstr(line, filter))
+        printf("%s\n", line);
+      line = &buf[i + 1];
+    }
+  }
+  if (line < buf + n && *line && strstr(line, filter))
+    printf("%s\n", line);
   return 0;
 }
 

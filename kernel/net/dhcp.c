@@ -55,6 +55,8 @@ static void dhcp_send_request(struct ipv4_addr requested_ip, int broadcast) {
   req.htype = 1;
   req.hlen = 6;
   req.xid = current_xid;
+  if (broadcast)
+    req.flags = 0x0080;   /* broadcast flag (wire 0x8000) — see dhcp_init */
   req.magic_cookie = 0x63538263;
   struct mac_addr mac = net_get_mac();
   memcpy(req.chaddr, mac.bytes, 6);
@@ -88,6 +90,12 @@ void dhcp_init(void)
 	pkt.htype = 1; // Ethernet
 	pkt.hlen = 6;
 	pkt.xid = current_xid;
+	/* Set the BROADCAST flag (wire 0x8000; little-endian u16 == 0x0080) so the
+	 * server broadcasts its OFFER/ACK instead of unicasting it to the not-yet-
+	 * assigned IP. We have no IP yet (0.0.0.0), so a unicast reply is dropped by
+	 * ipv4_receive — which is exactly why DHCP got no lease on real hardware
+	 * (QEMU's SLIRP server happened to reply in a way we accepted). */
+	pkt.flags = 0x0080;
 	pkt.magic_cookie = 0x63538263; // 99.130.83.99 network byte order
 	
 	struct mac_addr mac = net_get_mac();
@@ -102,7 +110,17 @@ void dhcp_init(void)
 	udp_send(bcast, 68, 67, &pkt, sizeof(pkt));
 	last_request_ticks = scheduler_get_uptime_ticks();
 
-	console_write("net: dhcp discover sent\n");
+	/* Announce the first discover only. net_task re-runs dhcp_init() every few
+	 * seconds while there is no lease, so printing on every attempt floods the
+	 * console (and buries the shell prompt) when no DHCP server answers — e.g.
+	 * on a link with no DHCP. Retries continue silently; a successful bind still
+	 * prints "dhcp bound to ..." exactly once. */
+	static int discover_announced = 0;
+	if (!discover_announced) {
+		console_write("net: dhcp discover sent (retrying silently until a lease "
+		              "or link)\n");
+		discover_announced = 1;
+	}
 }
 
 void dhcp_receive(const void *data, usize size)
@@ -115,7 +133,11 @@ void dhcp_receive(const void *data, usize size)
 
 	u8 msg_type = 0;
 	struct ipv4_addr offer_ip = pkt->yiaddr;
-	
+	/* Parsed from options — collected for diagnostics */
+	struct ipv4_addr parsed_gw   = {{0,0,0,0}};
+	struct ipv4_addr parsed_mask = {{0,0,0,0}};
+	struct ipv4_addr parsed_srv  = {{0,0,0,0}};
+
 	const u8 *opt = pkt->options;
 	while (opt < (const u8 *)data + size && *opt != DHCP_OPT_END) {
 		u8 type = *opt++;
@@ -125,11 +147,13 @@ void dhcp_receive(const void *data, usize size)
 		if ((usize)((const u8 *)data + size - opt) < len) break;
 		if (type == DHCP_OPT_MSG_TYPE && len == 1) {
 			msg_type = *opt;
+		} else if (type == DHCP_OPT_SUBNET_MASK && len >= 4) {
+			memcpy(parsed_mask.bytes, opt, 4);
 		} else if (type == DHCP_OPT_ROUTER && len >= 4) {
-			struct ipv4_addr gw;
-			memcpy(gw.bytes, opt, 4);
-			net_set_gateway(gw);
+			memcpy(parsed_gw.bytes, opt, 4);
+			net_set_gateway(parsed_gw);
 		} else if (type == DHCP_OPT_SERVER_ID && len >= 4) {
+			memcpy(parsed_srv.bytes, opt, 4);
 			memcpy(dhcp_server.bytes, opt, 4);
 		} else if (type == DHCP_OPT_LEASE_TIME && len >= 4) {
 			lease_seconds = be32(opt);
@@ -153,12 +177,29 @@ void dhcp_receive(const void *data, usize size)
 		lease_expire_ticks = now + (u64)lease_seconds * 100;
 		renew_ticks = now + ((u64)lease_seconds * 100) / 2;
 		rebind_ticks = now + ((u64)lease_seconds * 100 * 7) / 8;
-		
+
 		console_write("net: dhcp bound to ");
 		for (int i = 0; i < 4; i++) {
 			console_write_dec(pkt->yiaddr.bytes[i]);
 			if (i < 3) console_write(".");
 		}
+		console_write("\n");
+		/* Compact diagnostic — visible at bottom of screen without scrolling */
+		console_write("dhcp: gw=");
+		console_write_dec(parsed_gw.bytes[0]); console_write(".");
+		console_write_dec(parsed_gw.bytes[1]); console_write(".");
+		console_write_dec(parsed_gw.bytes[2]); console_write(".");
+		console_write_dec(parsed_gw.bytes[3]);
+		console_write(" mask=");
+		console_write_dec(parsed_mask.bytes[0]); console_write(".");
+		console_write_dec(parsed_mask.bytes[1]); console_write(".");
+		console_write_dec(parsed_mask.bytes[2]); console_write(".");
+		console_write_dec(parsed_mask.bytes[3]);
+		console_write(" srv=");
+		console_write_dec(parsed_srv.bytes[0]); console_write(".");
+		console_write_dec(parsed_srv.bytes[1]); console_write(".");
+		console_write_dec(parsed_srv.bytes[2]); console_write(".");
+		console_write_dec(parsed_srv.bytes[3]);
 		console_write("\n");
 	}
 }

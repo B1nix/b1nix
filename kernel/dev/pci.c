@@ -50,17 +50,52 @@ void pci_config_write8(u8 bus, u8 slot, u8 func, u8 offset, u8 value)
 	pci_config_write32(bus, slot, func, offset, current);
 }
 
-// A simple scan just to keep records or log. For finding devices, we use pci_find_device.
+static void pci_print_hex16(u16 v)
+{
+	static const char hx[] = "0123456789abcdef";
+	for (int i = 12; i >= 0; i -= 4)
+		console_putc(hx[(v >> i) & 0xf]);
+}
+
+/* Enumerate and print EVERY PCI function so unrecognised hardware (e.g. a NIC
+ * with no driver yet) is identifiable by vendor:device — visible later via
+ * `dmesg | grep pci`. Class 0x02 (network) / 0x01 (storage) / 0x0c03 (usb) are
+ * flagged so they stand out. */
 void pci_init(void)
 {
-	console_write("pci: enumerating bus...\n");
-	// A simple sanity check on bus 0
+	console_write("pci: enumerating devices (bus:slot.func vendor:device class)\n");
 	for (u16 bus = 0; bus < 256; bus++) {
 		for (u8 slot = 0; slot < 32; slot++) {
-			u16 vendor = pci_config_read16((u8)bus, slot, 0, 0);
-			if (vendor != 0xFFFF) {
-				// We found a device
-				// Just basic logging could be added here if needed, but not necessary.
+			if (pci_config_read16((u8)bus, slot, 0, 0) == 0xFFFF)
+				continue;
+			u8 htype = pci_config_read8((u8)bus, slot, 0, 0x0E);
+			u8 nfuncs = (htype & 0x80) ? 8 : 1;
+			for (u8 func = 0; func < nfuncs; func++) {
+				u16 vendor = pci_config_read16((u8)bus, slot, func, 0);
+				if (vendor == 0xFFFF)
+					continue;
+				u16 device = pci_config_read16((u8)bus, slot, func, 2);
+				u8 cls = pci_config_read8((u8)bus, slot, func, 0x0B);
+				u8 sub = pci_config_read8((u8)bus, slot, func, 0x0A);
+				console_write("pci: ");
+				console_write_dec((u32)bus);
+				console_putc(':');
+				console_write_dec((u32)slot);
+				console_putc('.');
+				console_write_dec((u32)func);
+				console_write("  ");
+				pci_print_hex16(vendor);
+				console_putc(':');
+				pci_print_hex16(device);
+				console_write("  class=");
+				pci_print_hex16(((u16)cls << 8) | sub);
+				if (cls == 0x02)
+					console_write("  [network]");
+				else if (cls == 0x01)
+					console_write("  [storage]");
+				else if (cls == 0x0C && sub == 0x03)
+					console_write("  [usb]");
+				console_putc('\n');
 			}
 		}
 	}

@@ -59,6 +59,7 @@ struct netdev *netdev_active(void);
  * it found and initialised its device (and called netdev_register), else 0.
  */
 int e1000_probe(void);        /* kernel/dev/e1000.c       */
+int r8169_probe(void);        /* kernel/dev/r8169.c       */
 int virtio_net_probe(void);   /* kernel/dev/virtio_net.c  */
 
 /*

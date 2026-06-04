@@ -10,13 +10,16 @@
 #define KLOG_ERROR 3
 #define KLOG_PANIC 4
 
-#define KLOG_BUF_SIZE 4096
+#define KLOG_BUF_SIZE 65536
 
 /* Core logging functions */
 void klog_debug(const char *msg);
 void klog_info(const char *msg);
 void klog_warn(const char *msg);
 void klog_error(const char *msg);
+
+/* Capture one console character into the ring (called from console_putc). */
+void klog_putc(char ch);
 
 /* Ring buffer access for userspace (dmesg) */
 usize klog_read(char *buf, usize max_len);

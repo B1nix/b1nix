@@ -2080,7 +2080,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
       arg1 = KLOG_BUF_SIZE;
     if (!is_user_range_valid((const void *)arg0, arg1, 1))
       return (u64)-EFAULT;
-    char tmp[KLOG_BUF_SIZE];
+    /* static, not stack: KLOG_BUF_SIZE is now 64 KiB which would overflow the
+     * kernel stack. dmesg is rare so the shared buffer's only hazard is a
+     * concurrent dmesg garbling output — never a crash. */
+    static char tmp[KLOG_BUF_SIZE];
     usize copied = klog_read(tmp, (usize)arg1);
     if (syscall_copyout((void *)(usize)arg0, tmp, copied) != 0)
       return (u64)-EFAULT;

@@ -4,8 +4,9 @@
 #include <b1nix/serial.h>
 #include <b1nix/klog.h>
 
-/* ── Kernel log ring buffer ── */
-#define KLOG_BUF_SIZE 4096
+/* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (64 KiB) so
+ * the whole boot (PCI/driver/dhcp output, fed in via klog_putc from
+ * console_putc) survives until the shell, where `dmesg` can read it back. */
 
 static const char *klog_level_names[] = {
 	"DEBUG", "INFO", "WARN", "ERROR", "PANIC"
@@ -121,6 +122,14 @@ static void klog_ring_put(char ch)
     klog_write_pos = next;
 }
 
+/* Capture a single console character into the ring. Called from console_putc so
+ * that EVERYTHING printed to the screen/serial (driver init, PCI, DHCP, ...) is
+ * retrievable later via `dmesg` — the console itself does not scroll back. */
+void klog_putc(char ch)
+{
+    klog_ring_put(ch);
+}
+
 /* ── Core log function ── */
 static void klog_write(int level, const char *message)
 {
@@ -174,20 +183,27 @@ usize klog_read(char *buf, usize max_len)
 		available = KLOG_BUF_SIZE;
 
 	if (available == 0) return 0;
-	if (available > max_len - 1) available = max_len - 1;
+
+	/* Return the MOST RECENT bytes that fit. A small reader (e.g. m15_smoke's
+	 * 4 KiB buffer checking for the latest "audit:" lines) then sees the tail it
+	 * cares about, while `dmesg`'s full-size (64 KiB) read gets the whole log —
+	 * including the early boot driver/PCI/DHCP lines — since the buffer is the
+	 * size of the ring. */
+	usize start = klog_read_pos;
+	if (available > max_len - 1) {
+		start = (klog_read_pos + (available - (max_len - 1))) % KLOG_BUF_SIZE;
+		available = max_len - 1;
+	}
 
 	for (usize i = 0; i < available; i++) {
-		buf[i] = klog_buf[(klog_read_pos + i) % KLOG_BUF_SIZE];
+		buf[i] = klog_buf[(start + i) % KLOG_BUF_SIZE];
 	}
 	buf[available] = '\0';
 
-	klog_read_pos = (klog_read_pos + available) % KLOG_BUF_SIZE;
-	if (klog_read_pos == klog_write_pos) {
-		klog_read_pos = 0;
-		klog_write_pos = 0;
-		klog_overflow = 0;
-	}
-
+	/* Non-destructive: do NOT advance klog_read_pos. `dmesg` returns the full
+	 * retained log every time, so the user can grep it repeatedly (and a second
+	 * `dmesg | grep ...` isn't empty). The oldest end is still evicted by
+	 * klog_ring_put on overflow. */
 	return available;
 }
 

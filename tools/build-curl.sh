@@ -13,6 +13,16 @@ RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew
 # Per-architecture build identity (B1NIX_ARCH -> triplet).
 . "$ROOT_DIR/tools/toolchain-env.sh"
 HOST_TRIPLET="$B1NIX_TRIPLET"
+# Pin the arch the wrapper compiles for to the triplet we're building, and
+# export it so every sub-make / libtool invocation that runs b1nix-autotools-cc
+# sees it (otherwise a leaked CC=clang or a scrubbed env makes the wrapper fall
+# back to its x86_64 default — curl then compiles x86_64 and fails to link the
+# i686 mbedTLS archives with "skipping incompatible").
+case "$HOST_TRIPLET" in
+  i686*) B1NIX_ARCH=x86 ;;
+  *)     B1NIX_ARCH=x86_64 ;;
+esac
+export B1NIX_ARCH
 # Per-triplet source tree + build dir so x86 and x86_64 never share objects.
 SRC_PARENT="$ROOT_DIR/build/curl-src"
 SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/curl-${CURL_VERSION}"
@@ -70,8 +80,17 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
 
 (
   cd "$BUILD_DIR"
+  # Pass an explicit --build distinct from --host so autoconf KNOWS this is a
+  # cross build and never tries to *run* a freshly compiled i686-b1nix test
+  # binary. Without it, on an x86_64 Linux host with 32-bit binfmt the
+  # "checking whether we are cross compiling" conftest is executed and hangs
+  # forever (the b1nix binary has no Linux ABI). cross_compiling=yes belt-and-
+  # suspenders for any sub-configure that still slips through.
+  BUILD_TRIPLET="$("$SRC_DIR/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+  export cross_compiling=yes
   "$SRC_DIR/configure" \
     --host="$HOST_TRIPLET" \
+    --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
     "$SSL_FLAGS" --without-zlib --without-brotli --without-zstd \
     --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \

@@ -371,11 +371,52 @@ static int e1000_irq_ack(struct netdev *nd)
 	return icr ? 1 : 0;
 }
 
+/* Force the device into power state D0 via its PCI Power-Management capability.
+ *
+ * On real hardware the firmware can leave an integrated NIC — notably the PCH
+ * I219 — parked in D3. In D3 the MAC's memory BAR does not respond, and an MMIO
+ * access to it never completes: the CPU hangs hard on the very first register
+ * read of e1000_reset(). QEMU always presents the device in D0, so this only
+ * bites on metal (the boot freezes right after the "e1000: ... BAR0 ..." line).
+ * Walking the capability list and clearing the PowerState bits is pure config-
+ * space I/O — it cannot itself hang — and the spec-mandated 10 ms D3->D0
+ * recovery delay lets the MAC come back before we touch its registers. */
+static void e1000_pci_set_d0(const struct pci_device_info *p)
+{
+	u16 status = pci_config_read16(p->bus, p->slot, p->func, 0x06);
+	if (!(status & (1u << 4)))            /* no Capabilities List */
+		return;
+	u8 cap = pci_config_read8(p->bus, p->slot, p->func, 0x34) & 0xFC;
+	for (int guard = 0; cap && guard < 48; guard++) {
+		u8 id = pci_config_read8(p->bus, p->slot, p->func, cap);
+		if (id == 0x01) {                 /* PCI Power Management capability */
+			u16 pmcsr = pci_config_read16(p->bus, p->slot, p->func, cap + 4);
+			if ((pmcsr & 0x3) != 0) {     /* not already D0 */
+				console_write("e1000: device in D");
+				console_putc('0' + (char)(pmcsr & 0x3));
+				console_write(", forcing D0\n");
+				pmcsr &= ~0x3u;
+				pci_config_write16(p->bus, p->slot, p->func, cap + 4, pmcsr);
+				e1000_udelay(10000);      /* ~10 ms D3->D0 recovery */
+			}
+			return;
+		}
+		cap = pci_config_read8(p->bus, p->slot, p->func, cap + 1) & 0xFC;
+	}
+}
+
 /* ── Probe ──────────────────────────────────────────────────────────────── */
 int e1000_probe(void)
 {
 	struct pci_device_info pci;
 	int found = 0;
+
+	/* Escape hatch: skip the NIC entirely if its bring-up wedges on a given
+	 * machine, so the system still boots to a shell. */
+	if (bootinfo_has_flag("b1nix.skip-e1000")) {
+		console_write("e1000: skipped (b1nix.skip-e1000)\n");
+		return 0;
+	}
 
 	/* Walk the ethernet-class (0x02/0x00) PCI devices and pick the first
 	 * Intel gigabit part we recognise. This naturally skips a co-resident
@@ -395,6 +436,10 @@ int e1000_probe(void)
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
 	cmd |= 0x0006;
 	pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, cmd);
+
+	/* Power the device up to D0 BEFORE any MMIO — a D3-parked I219 would hang
+	 * the CPU on the first register access otherwise (see e1000_pci_set_d0). */
+	e1000_pci_set_d0(&pci);
 
 	/* BAR0: 32- or 64-bit memory BAR. */
 	u32 bar0 = pci_config_read32(pci.bus, pci.slot, pci.func, 0x10);
