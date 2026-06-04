@@ -353,6 +353,29 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     kfree(file_data);
     return -1;
   }
+  /* Architecture match against the running kernel. A binary built for a
+   * different CPU cannot execute; report the mismatch explicitly instead of
+   * silently failing or — worse — attempting to run it. This is exactly the
+   * failure mode behind the native-smoke "stale x86_64 .inc embedded in the
+   * 32-bit image" bug, which otherwise only showed up as a cryptic fault. */
+#ifdef __x86_64__
+  if (ehdr->e_machine != ELF_MACHINE_X86_64) {
+    console_write("ELF load: ARCH MISMATCH — non-x86_64 binary (e_machine=0x");
+    console_write_hex64(ehdr->e_machine);
+    console_write(") on x86_64 kernel, refusing: ");
+    console_write(path);
+    console_write("\n");
+    kfree(file_data);
+    return -1;
+  }
+#else
+  console_write("ELF load: ARCH MISMATCH — 64-bit binary on 32-bit kernel, "
+                "refusing: ");
+  console_write(path);
+  console_write("\n");
+  kfree(file_data);
+  return -1;
+#endif
   if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
     kfree(file_data);
     return -1;
@@ -696,6 +719,16 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
     kfree(file_data);
     return -1;
   }
+  /* See user_load_elf64: report an architecture mismatch clearly. A 32-bit i386
+   * binary cannot run on the 64-bit kernel (no compat mode). */
+#ifdef __x86_64__
+  console_write("ELF32 load: ARCH MISMATCH — i386 binary on x86_64 kernel, "
+                "refusing: ");
+  console_write(path);
+  console_write("\n");
+  kfree(file_data);
+  return -1;
+#endif
   if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
     kfree(file_data);
     return -1;
