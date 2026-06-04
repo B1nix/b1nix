@@ -275,6 +275,7 @@ void x86_timer_init(void) {
 }
 
 extern void ps2_kbd_interrupt_handler(void);
+extern void usb_kbd_poll(void);
 extern void ps2_mouse_interrupt_handler(void);
 
 extern void fb_console_blink_cursor(void);
@@ -339,6 +340,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       }
 
       scheduler_on_timer_tick();
+      usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
     }
     return;
   }

@@ -298,7 +298,15 @@ static int editor_handle_key(int key)
 	case KEY_CTRL_Q:
 	case KEY_CTRL_X:
 	case KEY_ESC:
-		if (ed.dirty) {
+		/* The "save modified buffer?" prompt reads a key. Every other
+		 * interactive prompt in this editor is gated on !editor_smoke_mode; this
+		 * one was not, so the scripted M16 smoke could reach tui_get_key() and
+		 * block in the tty read forever whenever ed.dirty was still set at quit
+		 * time — the parent init then waits on the editor child indefinitely.
+		 * Under -smp that occasionally happened (timer preemption between the
+		 * scripted Ctrl-S save and the Ctrl-Q quit), surfacing as an intermittent
+		 * SMP hang. In smoke mode just quit without prompting. */
+		if (ed.dirty && !editor_smoke_mode) {
 			tui_write_at(TUI_ROWS - 1, 1, "Save modified buffer? (y/n): ", TUI_COLS - 2, 0, 7);
 			int c = tui_get_key();
 			if (c == 'y' || c == 'Y') {

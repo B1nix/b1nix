@@ -5,6 +5,8 @@
 #include <b1nix/errno.h>
 #include <b1nix/filelock.h>
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
+#include <b1nix/usb.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
@@ -3794,6 +3796,13 @@ static int init_main(int argc, const char **argv) {
   dns_smoke_check();
   ipv6_loopback_smoke();
   ipv6_realink_smoke();
+
+  /* M37: exercise the real-hardware e1000 NIC driver end-to-end (ARP over the
+   * second SLIRP backend), independent of the virtio-net-bound stack above. */
+  e1000_selftest();
+
+  /* M37: USB xHCI controller bring-up + HID boot-keyboard enumeration. */
+  usb_selftest();
 
   /* M24b BKL proof: run several CPU-bound userspace processes at once so the
    * cooperative scheduler distributes them across the BSP and Application

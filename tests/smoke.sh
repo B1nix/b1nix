@@ -53,6 +53,8 @@ run_qemu() {
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/smoke_run/net.pcap" \
+				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
+				-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 				-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
@@ -112,10 +114,18 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
-	echo "  ${RED}BUILD FAILED${NC}"
-	exit 1
-}
+# SKIP_BUILD=1 reuses an existing build/$ARCH/b1nix.iso (e.g. when the toolchain
+# can't rebuild every userspace port locally). SMOKE_MAKE_ARGS lets the caller
+# inject extra make flags (e.g. CC=clang LD=ld.lld on Fedora, where `cc` is gcc).
+if [ "${SKIP_BUILD:-0}" = "1" ]; then
+	test -f "build/$ARCH/b1nix.iso" || { echo "  ${RED}no prebuilt build/$ARCH/b1nix.iso${NC}"; exit 1; }
+	echo "  (SKIP_BUILD=1 — reusing build/$ARCH/b1nix.iso)"
+else
+	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
+		echo "  ${RED}BUILD FAILED${NC}"
+		exit 1
+	}
+fi
 pass "kernel builds without errors"
 
 # Create dummy images for SATA, NVMe and Swap tests
@@ -700,6 +710,33 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		fi
 	else
 		fail "virtio-net initialized" "virtio-net message not found"
+	fi
+
+	# ── M37: real-hardware e1000/e1000e NIC driver ──
+	# A second NIC (-device ${E1000_MODEL:-e1000} on net1) exercises the new
+	# Intel gigabit driver end-to-end while virtio-net stays the active stack.
+	if grep -q "e1000: initialized with MAC" "$LOG" 2>/dev/null; then
+		pass "e1000 driver initialized"
+		check_output "$LOG" "M37-E1000: ok init" "M37: e1000 ring/MMIO init"
+		check_output "$LOG" "M37-E1000: ok mac" "M37: e1000 MAC read"
+		check_output "$LOG" "M37-E1000: ok tx" "M37: e1000 transmit"
+		check_output "$LOG" "M37-E1000: ok rx-arp" "M37: e1000 receive (ARP reply over SLIRP)"
+	else
+		fail "e1000 driver initialized" "e1000 init message not found"
+	fi
+
+	# ── M37: USB xHCI controller + HID boot keyboard ──
+	# A qemu-xhci controller with a usb-kbd is enumerated end-to-end.
+	if grep -q "M37-USB: ok xhci-init" "$LOG" 2>/dev/null; then
+		pass "xHCI controller initialized"
+		check_output "$LOG" "M37-USB: ok port-reset" "M37: xHCI port reset"
+		check_output "$LOG" "M37-USB: ok slot-enabled" "M37: xHCI Enable Slot"
+		check_output "$LOG" "M37-USB: ok device-addressed" "M37: xHCI Address Device"
+		check_output "$LOG" "M37-USB: ok descriptors" "M37: USB device descriptor read (EP0 control transfer)"
+		check_output "$LOG" "M37-USB: ok hid-config" "M37: HID interrupt endpoint configured"
+		check_output "$LOG" "M37-USB: ok hid-translate" "M37: HID boot report -> scancode translation"
+	else
+		fail "xHCI controller initialized" "M37-USB xhci-init marker not found"
 	fi
 fi
 

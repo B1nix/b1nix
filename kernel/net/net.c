@@ -1,7 +1,7 @@
 #include <b1nix/console.h>
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/pci.h>
-#include <b1nix/virtio.h>
 #include <b1nix/ipi.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -9,23 +9,27 @@
 #include <b1nix/bootinfo.h>
 #include <string.h>
 
-#define VIRTIO_VENDOR_ID 0x1AF4
-#define VIRTIO_NET_DEVICE_ID 0x1000
+/*
+ * Driver-agnostic network glue. The actual NIC drivers live in kernel/dev/
+ * (virtio_net.c, e1000.c) and register a struct netdev here; this file owns the
+ * interface address state (MAC/IPv4/IPv6), the ethernet TX entry point, the
+ * net_poll() pump, the loopback datapath, and the net_task daemon.
+ */
 
-static struct virtio_device net_dev;
-static struct virtqueue net_rx_vq;
-static struct virtqueue net_tx_vq;
-static volatile int net_ready;
+/* ── Active NIC registry ────────────────────────────────────────────────── */
+static struct netdev *g_netdev;
 
-static volatile int net_tx_lock = 0;
-static volatile int net_rx_lock = 0;
+void netdev_register(struct netdev *nd)
+{
+	/* First driver to register wins (probe order in net_init sets preference). */
+	if (!g_netdev) g_netdev = nd;
+}
+
+struct netdev *netdev_active(void) { return g_netdev; }
+
+/* ── Interface address state ────────────────────────────────────────────── */
 static volatile int net_irq_pending = 0;
 static volatile int net_task_id = -1;
-static void **tx_buffers;       /* Pre-allocated TX buffer pool */
-static u8 *tx_inflight;
-static u16 *tx_pool_free;       /* Stack of free buffer indices */
-static u16 tx_pool_count;       /* Number of buffers free in pool */
-static u16 *tx_pool_map;        /* Virtqueue desc idx → pool idx */
 
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
@@ -80,16 +84,24 @@ static void net_compute_link_local(void)
 	local_ip6_ll.bytes[14] = local_mac.bytes[4];
 	local_ip6_ll.bytes[15] = local_mac.bytes[5];
 }
-int net_is_ready(void) { return net_ready; }
-int net_get_irq(void) { return net_ready ? net_dev.irq : -1; }
 
-void net_interrupt_handler(void) {
-	if (!net_ready) return;
-	u8 isr = virtio_read_isr(&net_dev);
-	if (isr & 1) {
-		net_irq_pending = 1;
-	}
+int net_is_ready(void) { return netdev_active() != 0; }
+
+int net_get_irq(void)
+{
+	struct netdev *nd = netdev_active();
+	return nd ? nd->irq : -1;
 }
+
+void net_interrupt_handler(void)
+{
+	struct netdev *nd = netdev_active();
+	if (!nd || !nd->irq_ack) return;
+	if (nd->irq_ack(nd))
+		net_irq_pending = 1;
+}
+
+/* ── PCI adapter inventory (for `ifconfig`/`net` listing) ───────────────── */
 
 static const char *net_vendor_name(u16 vendor)
 {
@@ -161,11 +173,12 @@ static void net_scan_pci_adapters(void)
 
 void net_dump_info(void)
 {
+	struct netdev *nd = netdev_active();
 	console_write("Network\n");
 	console_write(" driver: ");
-	console_write(net_ready ? "virtio-net" : "none");
+	console_write(nd ? nd->name : "none");
 	console_write("\n link:   ");
-	console_write(net_ready ? "up" : "down");
+	console_write(nd ? "up" : "down");
 	console_write("\n mac:    ");
 	print_mac(local_mac);
 	console_write("\n ip:     ");
@@ -203,122 +216,7 @@ void net_dump_info(void)
 	}
 }
 
-#define RX_BUFFER_SIZE 2048
-
-struct rx_buffer {
-	struct virtio_net_hdr hdr;
-	u8 data[RX_BUFFER_SIZE];
-} __attribute__((packed));
-
-static struct rx_buffer **rx_buffers;
-static u16 rx_buffer_count;
-
-static int is_power_of_two_u16(u16 v)
-{
-	return v && ((v & (u16)(v - 1)) == 0);
-}
-
-static void fill_rx_buffer(u16 idx)
-{
-	u16 d0 = idx;
-	net_rx_vq.desc[d0].addr = vmm_virt_to_phys(rx_buffers[idx]);
-	net_rx_vq.desc[d0].len = sizeof(struct rx_buffer);
-	net_rx_vq.desc[d0].flags = VRING_DESC_F_WRITE;
-	net_rx_vq.desc[d0].next = 0;
-
-	u16 avail_idx = net_rx_vq.avail->idx % net_rx_vq.queue_size;
-	net_rx_vq.avail->ring[avail_idx] = d0;
-
-	__asm__ volatile("" ::: "memory");
-	net_rx_vq.avail->idx++;
-	__asm__ volatile("" ::: "memory");
-}
-
-static void virtio_net_probe(void)
-{
-	if (!virtio_init_device(&net_dev, VIRTIO_VENDOR_ID, VIRTIO_NET_DEVICE_ID)) {
-		console_write("virtio-net: no device found\n");
-		net_ready = 0;
-		return;
-	}
-
-	virtio_set_guest_features(&net_dev, 0);
-
-	virtio_set_status(&net_dev, VIRTIO_STATUS_ACKNOWLEDGE | VIRTIO_STATUS_DRIVER | VIRTIO_STATUS_FEATURES_OK);
-
-
-	if (!virtq_init(&net_dev, 0, &net_rx_vq)) {
-		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
-		return;
-	}
-	if (!virtq_init(&net_dev, 1, &net_tx_vq)) {
-		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
-		return;
-	}
-	net_tx_vq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
-	if (net_rx_vq.queue_size == 0 || net_tx_vq.queue_size == 0 ||
-	    !is_power_of_two_u16(net_rx_vq.queue_size) ||
-	    !is_power_of_two_u16(net_tx_vq.queue_size)) {
-		console_write("virtio-net: invalid virtqueue size (must be power-of-two)\n");
-		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
-		return;
-	}
-	tx_buffers = kzalloc(sizeof(void *) * net_tx_vq.queue_size);
-	tx_inflight = kzalloc(sizeof(u8) * net_tx_vq.queue_size);
-	tx_pool_free = kzalloc(sizeof(u16) * net_tx_vq.queue_size);
-	tx_pool_map = kzalloc(sizeof(u16) * net_tx_vq.queue_size);
-	if (!tx_buffers || !tx_inflight || !tx_pool_free || !tx_pool_map) {
-		virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_FAILED);
-		return;
-	}
-	/* Pre-allocate TX buffer pool */
-	tx_pool_count = net_tx_vq.queue_size;
-	for (u16 i = 0; i < net_tx_vq.queue_size; i++) {
-		u64 frame = pmm_alloc_frame();
-		if (!frame) { tx_pool_count = i; break; }
-		tx_buffers[i] = (void *)(usize)(frame + vmm_direct_map_base());
-		memset(tx_buffers[i], 0, PAGE_SIZE);
-		tx_pool_free[i] = i;
-	}
-
-	// Read MAC from device config space (ports + 20 for legacy virtio pci)
-	for (int i = 0; i < 6; i++) {
-		// Port I/O read from config space
-		u16 port = net_dev.port_base + 20 + i;
-		u8 val;
-		__asm__ volatile("inb %w1, %b0" : "=a"(val) : "Nd"(port));
-		local_mac.bytes[i] = val;
-	}
-
-	net_compute_link_local();
-
-	virtio_set_status(&net_dev, virtio_get_status(&net_dev) | VIRTIO_STATUS_DRIVER_OK);
-
-	// Populate RX queue
-	rx_buffer_count = net_rx_vq.queue_size;
-	rx_buffers = kzalloc(sizeof(struct rx_buffer *) * rx_buffer_count);
-	for (u16 i = 0; i < rx_buffer_count; i++) {
-		u64 frame = pmm_alloc_frame();
-		if (!frame) {
-			console_write("virtio-net: failed to allocate RX buffer frame\n");
-			return;
-		}
-		rx_buffers[i] = (struct rx_buffer *)(usize)(frame + vmm_direct_map_base());
-		memset(rx_buffers[i], 0, PAGE_SIZE);
-		fill_rx_buffer(i);
-	}
-
-	virtq_kick(&net_dev, &net_rx_vq);
-	net_ready = 1;
-
-	console_write("virtio-net: initialized with MAC ");
-	print_mac(local_mac);
-	console_write("\n");
-
-	if (net_dev.irq != 0xFF) {
-		x86_pic_unmask(net_dev.irq);
-	}
-}
+/* ── net_task daemon ────────────────────────────────────────────────────── */
 
 static void net_task(void *arg)
 {
@@ -351,19 +249,36 @@ static void net_task(void *arg)
 
 void net_init(void)
 {
-	net_ready = 0;
+	g_netdev = 0;
 	memset(&local_mac, 0, sizeof(local_mac));
 	local_ip = (struct ipv4_addr){{0, 0, 0, 0}};
 	gateway_ip = (struct ipv4_addr){{0, 0, 0, 0}};
 	net_scan_pci_adapters();
+
+	/* NIC driver probe: the first driver to register becomes the active
+	 * interface (netdev_register is first-wins). virtio-net is tried first so
+	 * it stays the active NIC under QEMU; e1000 is then probed unconditionally
+	 * so its hardware comes up for the M37-E1000 self-test even when virtio
+	 * already won. On real hardware virtio-net is absent, so e1000 (the host's
+	 * Intel I219-V and the rest of the gigabit family) becomes active. */
 	virtio_net_probe();
+	e1000_probe();
+
+	struct netdev *nd = netdev_active();
 	console_write("net: pci adapters 0x");
 	console_write_hex64(net_adapter_count);
 	console_write(", driver ");
-	console_write(net_ready ? "virtio-net\n" : "none\n");
+	console_write(nd ? nd->name : "none");
+	console_write("\n");
+
+	if (nd) {
+		local_mac = nd->mac;
+		net_compute_link_local();
+	}
+
 	arp_init();
 	ndp_init();
-	if (!net_ready) {
+	if (!nd) {
 		return;
 	}
 	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
@@ -378,78 +293,18 @@ void net_init(void)
 
 void net_send_ethernet(struct mac_addr dst, u16 ethertype, const void *payload, usize size)
 {
-	if (!net_ready || net_tx_vq.queue_size == 0 || !net_tx_vq.desc || !net_tx_vq.avail || !net_tx_vq.used) {
+	struct netdev *nd = netdev_active();
+	if (!nd || !nd->transmit) {
 		return;
 	}
 
-	// Grab a pre-allocated TX buffer from the pool (no IRQ-time allocation).
-	usize packet_size = sizeof(struct virtio_net_hdr) + 14 + size;
-	if (packet_size > PAGE_SIZE) return;
+	u8 hdr[14];
+	memcpy(hdr, dst.bytes, 6);
+	memcpy(hdr + 6, local_mac.bytes, 6);
+	hdr[12] = (ethertype >> 8) & 0xFF;
+	hdr[13] = ethertype & 0xFF;
 
-	u8 *buffer = 0;
-	u16 pool_idx;
-	for (int tries = 0; tries < 2; tries++) {
-		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-		if (tx_pool_count > 0) {
-			tx_pool_count--;
-			pool_idx = tx_pool_free[tx_pool_count];
-			buffer = tx_buffers[pool_idx];
-			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
-			break;
-		}
-		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
-		net_poll();
-	}
-	if (!buffer) return;
-	memset(buffer, 0, PAGE_SIZE);
-
-	struct virtio_net_hdr *hdr = (struct virtio_net_hdr *)buffer;
-	hdr->flags = 0;
-	hdr->gso_type = 0;
-
-	u8 *eth_hdr = buffer + sizeof(struct virtio_net_hdr);
-	memcpy(eth_hdr, dst.bytes, 6);
-	memcpy(eth_hdr + 6, local_mac.bytes, 6);
-	eth_hdr[12] = (ethertype >> 8) & 0xFF;
-	eth_hdr[13] = ethertype & 0xFF;
-	memcpy(eth_hdr + 14, payload, size);
-
-	for (int tries = 0; tries < 2; tries++) {
-		while (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) scheduler_yield();
-
-		u16 d0 = 0xFFFF;
-		for (u16 i = 0; i < net_tx_vq.queue_size; i++) {
-			if (!tx_inflight[i]) {
-				d0 = i;
-				break;
-			}
-		}
-		if (d0 == 0xFFFF) {
-			__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
-			net_poll();
-			continue;
-		}
-
-		tx_pool_map[d0] = pool_idx;
-		tx_inflight[d0] = 1;
-		net_tx_vq.desc[d0].addr = vmm_virt_to_phys(buffer);
-		net_tx_vq.desc[d0].len = packet_size;
-		net_tx_vq.desc[d0].flags = 0;
-		net_tx_vq.desc[d0].next = 0;
-
-		u16 avail_idx = net_tx_vq.avail->idx % net_tx_vq.queue_size;
-		net_tx_vq.avail->ring[avail_idx] = d0;
-		__asm__ volatile("" ::: "memory");
-		net_tx_vq.avail->idx++;
-		__asm__ volatile("" ::: "memory");
-		virtq_kick(&net_dev, &net_tx_vq);
-		__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
-		return;
-	}
-
-	/* Return buffer to pool on send failure */
-	tx_pool_free[tx_pool_count] = pool_idx;
-	tx_pool_count++;
+	nd->transmit(nd, hdr, payload, size);
 }
 
 /* ── Loopback deferral queue (see net.h) ── */
@@ -521,56 +376,16 @@ void net_loopback_drain(void)
 void net_poll(void)
 {
 	/* Drain loopback first, and unconditionally — loopback must work even
-	 * before/without a virtio NIC (the guard below would otherwise skip it). */
+	 * before/without a NIC (the guard below would otherwise skip it). */
 	net_loopback_drain();
-	if (!net_ready || net_rx_vq.queue_size == 0 || !net_rx_vq.used) {
+
+	struct netdev *nd = netdev_active();
+	if (!nd) {
 		return;
 	}
 
 	tcp_timer_tick();
 
-	if (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) {
-		return;
-	}
-	while (net_tx_vq.used && net_tx_vq.used->idx != net_tx_vq.last_used_idx) {
-		u16 used_idx = net_tx_vq.last_used_idx % net_tx_vq.queue_size;
-		u32 id = net_tx_vq.used->ring[used_idx].id;
-		if (id < net_tx_vq.queue_size && tx_inflight[id]) {
-			tx_inflight[id] = 0;
-			u16 pool_ret = tx_pool_map[id];
-			if (pool_ret < net_tx_vq.queue_size) {
-				tx_pool_free[tx_pool_count] = pool_ret;
-				tx_pool_count++;
-			}
-		}
-		net_tx_vq.last_used_idx++;
-	}
-	__atomic_clear(&net_tx_lock, __ATOMIC_RELEASE);
-
-	if (__atomic_test_and_set(&net_rx_lock, __ATOMIC_ACQUIRE)) return; // Don't block if someone else is already polling
-
-	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx) {
-		u16 used_idx = net_rx_vq.last_used_idx % net_rx_vq.queue_size;
-		u32 id = net_rx_vq.used->ring[used_idx].id;
-		u32 len = net_rx_vq.used->ring[used_idx].len;
-
-		if (id < rx_buffer_count) {
-			struct rx_buffer *buf = rx_buffers[id];
-			if (len > sizeof(struct virtio_net_hdr)) {
-				usize payload_len = len - sizeof(struct virtio_net_hdr);
-				if (payload_len > sizeof(buf->data)) {
-					payload_len = sizeof(buf->data);
-				}
-				ethernet_receive(buf->data, payload_len);
-			}
-
-			// Re-arm
-			fill_rx_buffer((u16)id);
-			virtq_kick(&net_dev, &net_rx_vq);
-		}
-
-		net_rx_vq.last_used_idx++;
-	}
-
-	__atomic_clear(&net_rx_lock, __ATOMIC_RELEASE);
+	if (nd->poll)
+		nd->poll(nd);
 }

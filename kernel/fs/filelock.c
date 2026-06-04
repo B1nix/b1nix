@@ -99,6 +99,24 @@ static void merge_adjacent_locks(struct vfs_inode *inode, int pid) {
   } while (merged);
 }
 
+/* True if some *other* pid holds a lock on `inode` that conflicts with a
+ * [start, start+len) request of type `l_type`. Factored out so the blocking
+ * F_SETLKW path can re-test the predicate after publishing BLOCKED. */
+static int filelock_conflict_exists(struct vfs_inode *inode, int my_pid,
+                                    u64 start, u64 len, int l_type) {
+  for (int i = 0; i < MAX_FILE_LOCKS; i++) {
+    if (file_locks[i].active && file_locks[i].inode == inode &&
+        file_locks[i].pid != my_pid) {
+      if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, len)) {
+        if (lock_conflicts(&file_locks[i], l_type)) {
+          return 1;
+        }
+      }
+    }
+  }
+  return 0;
+}
+
 int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   if (!filelock_initialized || fd < 0)
     return -EINVAL;
@@ -143,25 +161,25 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   }
 
   if (fl->l_type != F_UNLCK) {
-    while (1) {
-      int conflict = 0;
-      for (int i = 0; i < MAX_FILE_LOCKS; i++) {
-        if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid != my_pid) {
-          if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, fl->l_len)) {
-            if (lock_conflicts(&file_locks[i], fl->l_type)) {
-              conflict = 1;
-              break;
-            }
-          }
-        }
-      }
-      if (!conflict) {
-        break;
-      }
+    while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (cmd == F_SETLK) {
         return -EAGAIN;
       }
-      scheduler_block_on(inode);
+      /* SMP-safe blocking acquire (F_SETLKW). A plain scheduler_block_on(inode)
+       * here has a check-then-block lost-wakeup window: the lock holder's
+       * release path (filelock_unlock / close → scheduler_wake_all(inode)) can
+       * run on another CPU between the conflict test above and the block, and
+       * its wake is lost — this task then sleeps on `inode` forever and any
+       * waitpid() on it hangs. That was the silent LOCK-SMOKE -smp wedge.
+       * Publish BLOCKED first, then re-test the predicate before committing to
+       * sleep, so a racing wake is either observed by the re-test or observes
+       * our BLOCKED state. */
+      scheduler_wait_prepare(inode);
+      if (!filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
+        scheduler_wait_cancel();
+        continue;
+      }
+      scheduler_wait_commit();
     }
   }
 

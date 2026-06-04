@@ -1046,6 +1046,13 @@ int scheduler_fork_current(void) {
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
+  /* Kick the other CPUs out of `sti; hlt` so an idle AP (or the BSP, once the
+   * forking task blocks in waitpid) picks the freshly runnable child now rather
+   * than after the next 10 ms LAPIC tick. Every other make-runnable enqueue
+   * (scheduler_wake_all / wake_sleepers / notify_wait_event) already issues this
+   * kick; fork was the lone exception, which left a window where a child could
+   * sit in the runqueue while all CPUs idled. */
+  ipi_reschedule_all();
   return child_id;
 }
 
@@ -1470,7 +1477,10 @@ void scheduler_block_current(void) {
 }
 
 void scheduler_wake_task(usize task_id) {
-  interrupts_disable();
+  /* Interrupt-state-preserving for the same reason as scheduler_wake_all: this
+   * may be called from an IRQs-off context (futex/loopback kicks), and a
+   * force-enable there would drop interrupt masking a caller is relying on. */
+  u64 flags = interrupts_save();
 
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->id != task_id) continue;
@@ -1498,7 +1508,7 @@ void scheduler_wake_task(usize task_id) {
     }
   }
 
-  interrupts_enable();
+  interrupts_restore(flags);
 }
 
 void scheduler_block_on(void *chan) {
@@ -1568,7 +1578,17 @@ void scheduler_wait_cancel(void) {
 }
 
 void scheduler_wake_all(void *chan) {
-  interrupts_disable();
+  /* Preserve the caller's interrupt state instead of force-enabling. This is
+   * called from inside IRQs-off spinlock critical sections (e.g. tcp_input
+   * holds tcp_queue_lock via irq_save() when it wakes pollers on vfs_poll_chan).
+   * A plain interrupts_enable() there re-enabled IRQs while the spinlock was
+   * still held, letting a timer tick preempt and deschedule the lock holder —
+   * after which any other BSP context spinning on that lock with IRQs disabled
+   * waits forever (the holder, a BSP-only kernel thread, can never be rescheduled
+   * because the spinner monopolises the BSP and the APs don't run kernel threads).
+   * That was the intermittent -smp wedge. interrupts_save()/restore() keeps a
+   * caller that had IRQs off off. */
+  u64 flags = interrupts_save();
 
   int woken = 0;
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -1588,10 +1608,10 @@ void scheduler_wake_all(void *chan) {
     }
   }
 
-  interrupts_enable();
-  /* M28 #6: same reschedule kick as wake_sleepers. Outside the IRQ-off
-   * window because lapic_send_ipi spins on ICR delivery — cheap, but no
-   * reason to do it with interrupts disabled. */
+  interrupts_restore(flags);
+  /* M28 #6: same reschedule kick as wake_sleepers. lapic_send_ipi spins on ICR
+   * delivery (no IRQs required), so running it after restoring the caller's
+   * state — even if that leaves IRQs disabled — is safe. */
   if (woken > 0) ipi_reschedule_all();
 }
 
@@ -1999,6 +2019,16 @@ void scheduler_dump_tasks(void) {
       }
 
       console_write(state_str);
+      console_write("\tppid=0x");
+      console_write_hex64(T(i)->parent_id);
+      console_write(" chan=0x");
+      console_write_hex64((u64)(usize)T(i)->wait_chan);
+      console_write(" rel=");
+      console_write_dec(T(i)->stack_released);
+      console_write(" ap=");
+      console_write_dec(T(i)->ap_runnable);
+      console_write(" steal=");
+      console_write_dec(T(i)->stealable);
       console_write("\t");
       console_write(T(i)->name);
       console_write("\n");
