@@ -34,6 +34,9 @@ struct boot_info {
 	struct boot_framebuffer framebuffer;
 	int has_framebuffer;
 	char command_line[128];
+	u64 ramdisk_addr;
+	u64 ramdisk_size;
+	int has_ramdisk;
 };
 
 void bootinfo_init_from_multiboot2(u32 magic, u32 info_address);

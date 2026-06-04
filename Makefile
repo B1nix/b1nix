@@ -13,7 +13,6 @@ else
 B1NIX_TRIPLET := x86_64-b1nix
 endif
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
-RUN_ISO := /tmp/b1nix-run.iso
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_M12_SMOKE_INC := $(BUILD_DIR)/initramfs_m12_smoke.inc
 INITRAMFS_M13_SMOKE_INC := $(BUILD_DIR)/initramfs_m13_smoke.inc
@@ -194,6 +193,7 @@ KERNEL_SOURCES := \
 	kernel/dev/acpi.c \
 	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
+	kernel/dev/ramdisk.c \
 	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
 	kernel/ipc/shm.c \
@@ -266,7 +266,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all clean run-x86_64 run-x86 run-root smoke-m18 root-image iso check-tools objects graphics-smoke analyze
+.PHONY: all clean run-x86_64 run-x86 run-root root-image iso iso-live iso-test check-tools objects graphics-smoke analyze
 
 all: $(KERNEL_ELF)
 
@@ -542,8 +542,33 @@ iso: $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
+
+iso-live: root-image $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-live/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img|g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
+
+iso-test: root-image $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-test/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img|g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
 # ── M25 Userspace ──
 userspace:
@@ -603,8 +628,7 @@ iso-full: userspace-install install-native-toolchain install-kernel-source iso
 
 run-x86_64: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	cp $(BUILD_DIR)/b1nix.iso $(RUN_ISO)
-	$(QEMU_X86_64) -cdrom $(RUN_ISO) -serial stdio -no-reboot -boot d \
+	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
@@ -651,4 +675,4 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools run-persistent graphics-smoke install-native-toolchain install-kernel-source
+.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-test userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source

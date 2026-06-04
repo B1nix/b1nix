@@ -19,7 +19,7 @@ int main(int argc, char **argv) {
   marker("M14-SMOKE: start\n");
 
   /* 1. Test invalid device mount */
-  isize rc_nodev = syscall(SYS_MOUNT, "nosuchdevice", "/ext3", "ext2", 0);
+  isize rc_nodev = syscall(SYS_MOUNT, "nosuchdevice", "/mnt/ext3", "ext2", 0);
   if (rc_nodev < 0) {
     marker("M14-SMOKE: ok invalid-device\n");
   } else {
@@ -27,7 +27,7 @@ int main(int argc, char **argv) {
   }
 
   /* 2. Test invalid filesystem type mount */
-  isize rc_badfs = syscall(SYS_MOUNT, "sata0", "/ext3", "invalid_fs_type", 0);
+  isize rc_badfs = syscall(SYS_MOUNT, "sata0", "/mnt/ext3", "invalid_fs_type", 0);
   if (rc_badfs < 0) {
     marker("M14-SMOKE: ok invalid-fs\n");
   } else {
@@ -35,7 +35,7 @@ int main(int argc, char **argv) {
   }
 
   /* 3. Mount sata0 as ext4 (primary) */
-  isize rc_sata = syscall(SYS_MOUNT, "sata0", "/ext4", "ext4", 0);
+  isize rc_sata = syscall(SYS_MOUNT, "sata0", "/mnt/ext4", "ext4", 0);
   if (rc_sata == 0) {
     marker("M14-SMOKE: ok mount-ext4-sata\n");
   } else {
@@ -45,9 +45,9 @@ int main(int argc, char **argv) {
   }
 
   /* 4. Mount nvme0 as ext4 and test read/write persistence */
-  isize rc_nvme = syscall(SYS_MOUNT, "nvme0", "/ext4nvme", "ext4", 0);
+  isize rc_nvme = syscall(SYS_MOUNT, "nvme0", "/mnt/ext4nvme", "ext4", 0);
   if (rc_nvme == 0) {
-    int fd_ext4 = open("/ext4nvme/persist_ext4.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int fd_ext4 = open("/mnt/ext4nvme/persist_ext4.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd_ext4 >= 0) {
       const char *ext4_msg = "B1NIX ext4 persistent validation";
       int wr = write(fd_ext4, ext4_msg, strlen(ext4_msg));
@@ -55,10 +55,10 @@ int main(int argc, char **argv) {
       syscall(SYS_SYNC);
       close(fd_ext4);
 
-      isize um_rc = syscall(SYS_UMOUNT, "/ext4nvme");
-      isize m_rc = syscall(SYS_MOUNT, "nvme0", "/ext4nvme", "ext4", 0);
+      isize um_rc = syscall(SYS_UMOUNT, "/mnt/ext4nvme");
+      isize m_rc = syscall(SYS_MOUNT, "nvme0", "/mnt/ext4nvme", "ext4", 0);
 
-      int fd_read = open("/ext4nvme/persist_ext4.txt", O_RDONLY);
+      int fd_read = open("/mnt/ext4nvme/persist_ext4.txt", O_RDONLY);
       char buf[64];
       memset(buf, 0, sizeof(buf));
       int rd = -1;
@@ -87,7 +87,7 @@ int main(int argc, char **argv) {
   }
 
   /* 5. Test Block Cache (Cached read and verify through flush & remount) */
-  int fd_cache = open("/ext4/cache_test.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
+  int fd_cache = open("/mnt/ext4/cache_test.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
   if (fd_cache >= 0) {
     const char *test_data = "cached_block_data_validation";
     int wr = write(fd_cache, test_data, strlen(test_data));
@@ -95,10 +95,10 @@ int main(int argc, char **argv) {
     syscall(SYS_SYNC);
     close(fd_cache);
 
-    isize um_rc = syscall(SYS_UMOUNT, "/ext4");
-    isize m_rc = syscall(SYS_MOUNT, "sata0", "/ext4", "ext4", 0);
+    isize um_rc = syscall(SYS_UMOUNT, "/mnt/ext4");
+    isize m_rc = syscall(SYS_MOUNT, "sata0", "/mnt/ext4", "ext4", 0);
 
-    int fd_read = open("/ext4/cache_test.txt", O_RDONLY);
+    int fd_read = open("/mnt/ext4/cache_test.txt", O_RDONLY);
     char buf[64];
     memset(buf, 0, sizeof(buf));
     int rd = -1;
@@ -121,7 +121,7 @@ int main(int argc, char **argv) {
   }
 
   /* 6. Test Persistence (sync, umount, remount, read back) */
-  int fd_persist = open("/ext4/persist.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
+  int fd_persist = open("/mnt/ext4/persist.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
   if (fd_persist >= 0) {
     const char *persist_msg = "B1NIX persistent block storage validation";
     int wr = write(fd_persist, persist_msg, strlen(persist_msg));
@@ -129,10 +129,10 @@ int main(int argc, char **argv) {
     syscall(SYS_SYNC);
     close(fd_persist);
 
-    isize um_rc = syscall(SYS_UMOUNT, "/ext4");
-    isize m_rc = syscall(SYS_MOUNT, "sata0", "/ext4", "ext4", 0);
+    isize um_rc = syscall(SYS_UMOUNT, "/mnt/ext4");
+    isize m_rc = syscall(SYS_MOUNT, "sata0", "/mnt/ext4", "ext4", 0);
 
-    int fd_read = open("/ext4/persist.txt", O_RDONLY);
+    int fd_read = open("/mnt/ext4/persist.txt", O_RDONLY);
     char buf[128];
     memset(buf, 0, sizeof(buf));
     int rd = -1;
@@ -158,7 +158,7 @@ int main(int argc, char **argv) {
   int stress_ok = 1;
   for (int i = 0; i < 10; i++) {
     char path[64];
-    snprintf(path, sizeof(path), "/ext4/stress_%d.txt", i);
+    snprintf(path, sizeof(path), "/mnt/ext4/stress_%d.txt", i);
     int fd = open(path, O_CREAT | O_RDWR | O_TRUNC, 0666);
     if (fd < 0) {
       stress_ok = 0;
@@ -192,7 +192,7 @@ int main(int argc, char **argv) {
   }
 
   /* 8. Large file boundary (within safe QEMU memory limits) */
-  int fd_large = open("/ext4/large_file.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
+  int fd_large = open("/mnt/ext4/large_file.txt", O_CREAT | O_RDWR | O_TRUNC, 0666);
   if (fd_large >= 0) {
     /* Write 128KB in chunks of 4KB */
     char *chunk_data = malloc(4096);
@@ -210,9 +210,9 @@ int main(int argc, char **argv) {
 
     /* Read back and verify size and pattern */
     struct stat st;
-    isize stat_rc = syscall(SYS_STAT, "/ext4/large_file.txt", &st);
+    isize stat_rc = syscall(SYS_STAT, "/mnt/ext4/large_file.txt", &st);
     
-    int fd_read_large = open("/ext4/large_file.txt", O_RDONLY);
+    int fd_read_large = open("/mnt/ext4/large_file.txt", O_RDONLY);
     int read_ok = 1;
     if (fd_read_large >= 0) {
       char *read_chunk = malloc(4096);
@@ -249,7 +249,7 @@ int main(int argc, char **argv) {
   }
 
   /* 9. VFS Path Normalization */
-  int fd_norm = open("/ext4/../ext4/./large_file.txt", O_RDONLY);
+  int fd_norm = open("/mnt/ext4/../ext4/./large_file.txt", O_RDONLY);
   if (fd_norm >= 0) {
     struct stat st;
     isize stat_rc = syscall(SYS_FSTAT, fd_norm, &st);
@@ -264,13 +264,13 @@ int main(int argc, char **argv) {
   }
 
   /* Clean up files and unmount filesystems */
-  syscall(SYS_UNLINK, "/ext4/large_file.txt");
-  syscall(SYS_UNLINK, "/ext4/persist.txt");
-  syscall(SYS_UNLINK, "/ext4/cache_test.txt");
-  syscall(SYS_UNLINK, "/ext4nvme/persist_ext4.txt");
+  syscall(SYS_UNLINK, "/mnt/ext4/large_file.txt");
+  syscall(SYS_UNLINK, "/mnt/ext4/persist.txt");
+  syscall(SYS_UNLINK, "/mnt/ext4/cache_test.txt");
+  syscall(SYS_UNLINK, "/mnt/ext4nvme/persist_ext4.txt");
 
-  syscall(SYS_UMOUNT, "/ext4");
-  syscall(SYS_UMOUNT, "/ext4nvme");
+  syscall(SYS_UMOUNT, "/mnt/ext4");
+  syscall(SYS_UMOUNT, "/mnt/ext4nvme");
 
   marker("M14-SMOKE: done\n");
   return 0;

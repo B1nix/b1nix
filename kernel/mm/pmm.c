@@ -222,6 +222,14 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
       search_addr = start;
     }
 
+    if (boot_info->has_ramdisk) {
+      u64 rd_start = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
+      u64 rd_end = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
+      if (!(search_addr + size <= rd_start || search_addr >= rd_end)) {
+        search_addr = rd_end;
+      }
+    }
+
     if (search_addr + size > 0x100000000ULL) {
       continue;
     }
@@ -234,6 +242,7 @@ static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
 
   panic("no space for early physical memory allocation");
 }
+
 
 /* Size the direct map to actual hardware: walk usable regions, take the top
  * end, align UP to a 2 MiB boundary (vmm_init maps in 2 MiB hugepages), then
@@ -377,6 +386,14 @@ void pmm_init(const struct boot_info *boot_info) {
   for (u64 frame = (u64)(usize)pmm.frame_refcounts;
        frame < (u64)(usize)pmm.frame_refcounts + refcounts_bytes; frame += PAGE_SIZE) {
     mark_frame_used(frame);
+  }
+
+  if (boot_info->has_ramdisk) {
+    u64 start_frame = align_down_u64(boot_info->ramdisk_addr, PAGE_SIZE);
+    u64 end_frame = align_up_u64(boot_info->ramdisk_addr + boot_info->ramdisk_size, PAGE_SIZE);
+    for (u64 frame = start_frame; frame < end_frame; frame += PAGE_SIZE) {
+      mark_frame_used(frame);
+    }
   }
 
   console_write("pmm: bitmap 0x");

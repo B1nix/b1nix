@@ -3391,8 +3391,8 @@ static int ext_stress_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
   uwrite("EXT-STRESS: start\n");
-  run_ext_stress("/ext4");
-  run_ext_stress("/ext3");
+  run_ext_stress("/mnt/ext4");
+  run_ext_stress("/mnt/ext3");
   uwrite("EXT-STRESS: done\n");
   return 0;
 }

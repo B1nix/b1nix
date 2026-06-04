@@ -29,6 +29,7 @@
 #include <b1nix/video.h>
 #include <b1nix/acpi.h>
 #include <b1nix/ioapic.h>
+#include <b1nix/ramdisk.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -156,6 +157,7 @@ void kernel_main(usize arg0, usize arg1)
 	video_init();
 	compositor_init();
 	virtio_gpu_init();
+	ramdisk_init();
 	/* M34: mount the synthetic /proc and /sys filesystems. /proc already
 	 * exists as a mount point (created in vfs_init); /sys is created here. */
 	if (vfs_mount("proc", "/proc", "procfs", 0) == 0)
@@ -208,6 +210,15 @@ void kernel_main(usize arg0, usize arg1)
 		int rc = vfs_mount("virtio-blk0", "/persist", "ext4", 0);
 		if (rc == 0) {
 			console_write("persistent root: virtio-blk0 mounted at /persist\n");
+		} else {
+			rc = vfs_mount("ram0", "/persist", "ext4", 0);
+			if (rc == 0) {
+				console_write("persistent root: ram0 mounted at /persist (Live CD)\n");
+			} else {
+				char mount_err_buf[64];
+				snprintf(mount_err_buf, sizeof(mount_err_buf), "persistent root: ram0 mount failed: %d\n", rc);
+				console_write(mount_err_buf);
+			}
 		}
 	}
 #endif

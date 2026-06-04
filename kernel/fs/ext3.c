@@ -836,5 +836,5 @@ static struct vfs_fs ext3_vfs = { .name = "ext3", .mount = ext3_vfs_mount_cb, .u
 
 void ext3_init(void) {
   vfs_register_fs(&ext3_vfs);
-  vfs_mount("virtio-blk0", "/ext3", "ext3", 0);
+  vfs_mount("virtio-blk0", "/mnt/ext3", "ext3", 0);
 }

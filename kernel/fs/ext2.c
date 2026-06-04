@@ -1262,5 +1262,5 @@ void ext2_init(void) {
   vfs_register_fs(&ext2_fs);
   /* The vfs_mount calls will trigger ext2_vfs_mount_cb which handles allocation */
   if (vfs_mount("virtio-blk0", "/", "ext2", 0) == 0) return;
-  if (vfs_mount("virtio-blk1", "/ext2", "ext2", 0) == 0) return;
+  if (vfs_mount("virtio-blk1", "/mnt/ext2", "ext2", 0) == 0) return;
 }

@@ -1804,8 +1804,11 @@ void vfs_init(void) {
   add_node("/var", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/ext4", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext1", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext2", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
   add_node("/persist", VFS_DIRECTORY, 0, 0, 0); /* M26: mountpoint for the
                                                    persistent root image (native
                                                    toolchain + kernel source) */

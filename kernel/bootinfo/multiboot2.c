@@ -6,8 +6,17 @@
 #define MULTIBOOT2_BOOTLOADER_MAGIC 0x36d76289
 #define MULTIBOOT2_TAG_TYPE_END 0
 #define MULTIBOOT2_TAG_TYPE_CMDLINE 1
+#define MULTIBOOT2_TAG_TYPE_MODULE 3
 #define MULTIBOOT2_TAG_TYPE_MMAP 6
 #define MULTIBOOT2_TAG_TYPE_FRAMEBUFFER 8
+
+struct multiboot2_module_tag {
+	u32 type;
+	u32 size;
+	u32 mod_start;
+	u32 mod_end;
+	char cmdline[1];
+} __attribute__((packed));
 
 struct multiboot2_info {
 	u32 total_size;
@@ -102,6 +111,9 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 	current_boot_info.memory_region_count = 0;
 	current_boot_info.has_framebuffer = 0;
 	current_boot_info.command_line[0] = '\0';
+	current_boot_info.ramdisk_addr = 0;
+	current_boot_info.ramdisk_size = 0;
+	current_boot_info.has_ramdisk = 0;
 
 	while (cursor < end) {
 		const struct multiboot2_tag *tag = (const struct multiboot2_tag *)cursor;
@@ -112,6 +124,13 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_MMAP) {
 			parse_mmap_tag((const struct multiboot2_mmap_tag *)tag);
+		}
+
+		if (tag->type == MULTIBOOT2_TAG_TYPE_MODULE) {
+			const struct multiboot2_module_tag *mod = (const struct multiboot2_module_tag *)tag;
+			current_boot_info.ramdisk_addr = mod->mod_start;
+			current_boot_info.ramdisk_size = mod->mod_end - mod->mod_start;
+			current_boot_info.has_ramdisk = 1;
 		}
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_CMDLINE) {
