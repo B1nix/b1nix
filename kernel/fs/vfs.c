@@ -652,7 +652,20 @@ static void vfs_inode_lock_read(struct vfs_inode *inode) {
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       break;
     }
-    scheduler_block_on((void *)&inode->rw_lock);
+    /* SMP-safe block (closes the check-then-block lost-wakeup window): publish
+     * BLOCKED, then retry the acquire before sleeping. Otherwise a writer's
+     * vfs_inode_unlock_write -> scheduler_wake_all(&rw_lock) on another CPU,
+     * landing between the failed CAS and the block, is lost and this reader
+     * sleeps on the inode forever (a silent -smp wedge on the file read path). */
+    scheduler_wait_prepare((void *)&inode->rw_lock);
+    val = inode->rw_lock;
+    if (val >= 0 &&
+        __atomic_compare_exchange_n(&inode->rw_lock, &val, val + 1, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      scheduler_wait_cancel();
+      break;
+    }
+    scheduler_wait_commit();
   }
   /* INODE rwlock is a sleeping lock — scheduler_block_on can wake the
    * caller on a different CPU than it slept on, so the release-CPU and
@@ -681,7 +694,15 @@ static void vfs_inode_lock_write(struct vfs_inode *inode) {
                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
       break;
     }
-    scheduler_block_on((void *)&inode->rw_lock);
+    /* SMP-safe block — see vfs_inode_lock_read for the lost-wakeup rationale. */
+    scheduler_wait_prepare((void *)&inode->rw_lock);
+    val = 0;
+    if (__atomic_compare_exchange_n(&inode->rw_lock, &val, -1, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+      scheduler_wait_cancel();
+      break;
+    }
+    scheduler_wait_commit();
   }
   /* Sleeping lock — see read-lock variant for why this uses _GLOBAL. */
   LOCKDEP_ACQUIRE_GLOBAL(LOCKDEP_LVL_INODE);

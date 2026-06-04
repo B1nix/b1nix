@@ -121,7 +121,12 @@ fi
 # ── 3. Build native GCC ───────────────────────────────────────────────────────
 if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
     echo "Building Native GCC (host=$TARGET)..."
-    export CXXFLAGS="$CXXFLAGS_VAL"
+    # Do NOT export CXXFLAGS/CFLAGS (the target --sysroot flags): GCC's build-side
+    # modules (build-libcpp etc., compiled by the HOST g++) would inherit them
+    # from the environment and redirect their include search into the b1nix
+    # sysroot, where host headers like bits/wordsize.h don't exist. The host-side
+    # (the gcc binary built FOR b1nix) gets these flags via the explicit configure
+    # CFLAGS=/CXXFLAGS= args below; the build side uses *_FOR_BUILD.
     export CXXFLAGS_FOR_BUILD="-O2"
     export CFLAGS_FOR_BUILD="-O2"
     if [ ! -f "$WORK_DIR/build-native-gcc/Makefile" ]; then
@@ -139,6 +144,13 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
             LDFLAGS="$LDFLAGS_VAL" \
             LIBS="$LIBS_VAL" \
             HOST_LIBS="$HOST_LIBS_VAL" \
+            CC_FOR_BUILD="$PROJECT_DIR/tools/b1nix-buildcc" \
+            CXX_FOR_BUILD="$PROJECT_DIR/tools/b1nix-buildcxx" \
+            CFLAGS_FOR_BUILD="-O2" \
+            CXXFLAGS_FOR_BUILD="-O2" \
+            CPPFLAGS_FOR_BUILD="" \
+            BUILD_CPPFLAGS="" \
+            GCC_FOR_TARGET="$CC_VAL" \
             --host="$TARGET" \
             --target="$TARGET" \
             --prefix="" \

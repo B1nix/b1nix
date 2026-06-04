@@ -6,24 +6,51 @@
 
 /* ── Locked enqueue / dequeue ──
  *
- * Use plain spin_lock (not irqsave) here: all callers of rq_enqueue /
- * rq_dequeue already hold interrupts disabled via scheduler_yield /
- * interrupts_disable().  Using irqsave would restore RFLAGS (enabling IRQs)
- * in the middle of the scheduler's critical section, causing re-entrancy.
+ * MUST use spin_lock_irqsave: the runqueue lock is taken from BOTH thread
+ * context (scheduler_yield, fork, waitpid's sched_rq_remove_task, ...) AND
+ * interrupt context (the LAPIC timer tick runs scheduler_on_timer_tick ->
+ * scheduler_yield -> wake_sleepers/pick_next_task -> rq_dequeue). A thread-side
+ * acquirer that runs with interrupts enabled — e.g. scheduler_waitpid_fast_return
+ * — would otherwise be interrupted mid-critical-section by the timer, whose ISR
+ * re-enters rq_dequeue on the SAME CPU and spins on the lock its own interrupted
+ * frame still holds: an unrecoverable self-deadlock (caught as the residual
+ * -smp 4 silent hang). irqsave/irqrestore makes every acquirer interrupt-safe
+ * regardless of its caller's IRQ state. NOTE: this is NOT the same as a plain
+ * irqsave "re-enabling IRQs mid-section" — save/restore captures and restores
+ * the caller's flags, so an already-IRQs-off scheduler critical section stays
+ * off across the whole pick/switch; only a careless IRQs-on caller is corrected.
  */
 
 void rq_enqueue(struct runqueue *rq, struct task *t) {
-    spin_lock(&rq->lock);
+    u64 flags;
+    spin_lock_irqsave(&rq->lock, &flags);
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
+    /* Idempotent enqueue: a task must appear on a runqueue at most once.
+     * Linking a task that is already queued corrupts the singly-linked
+     * next_run chain — in particular enqueuing the current tail does
+     * rq->tail->next_run = t with tail == t, i.e. t->next_run = t, a self
+     * cycle that makes rq_remove / rq_dequeue traversal loop forever (a silent
+     * -smp hang: caught with CPU0 spinning in rq_remove's list walk). This
+     * happens when a task races two make-runnable events — e.g. a waitpid that
+     * re-publishes BLOCKED and is woken again before its previous stale runqueue
+     * entry was scrubbed. Skip the re-link; the task is already runnable. */
+    for (struct task *c = rq->head; c; c = c->next_run) {
+        if (c == t) {
+            LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
+            spin_unlock_irqrestore(&rq->lock, flags);
+            return;
+        }
+    }
     t->next_run = NULL;
     if (rq->tail) { rq->tail->next_run = t; rq->tail = t; }
     else          { rq->head = t; rq->tail = t; }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
-    spin_unlock(&rq->lock);
+    spin_unlock_irqrestore(&rq->lock, flags);
 }
 
 struct task *rq_dequeue(struct runqueue *rq) {
-    spin_lock(&rq->lock);
+    u64 flags;
+    spin_lock_irqsave(&rq->lock, &flags);
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *t = rq->head;
     if (t) {
@@ -32,13 +59,14 @@ struct task *rq_dequeue(struct runqueue *rq) {
         if (!rq->head) rq->tail = NULL;
     }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
-    spin_unlock(&rq->lock);
+    spin_unlock_irqrestore(&rq->lock, flags);
     return t;
 }
 
 int rq_remove(struct runqueue *rq, struct task *t) {
     int removed = 0;
-    spin_lock(&rq->lock);
+    u64 flags;
+    spin_lock_irqsave(&rq->lock, &flags);
     LOCKDEP_ACQUIRE(LOCKDEP_LVL_RUNQUEUE);
     struct task *prev = 0;
     struct task *cur = rq->head;
@@ -57,7 +85,7 @@ int rq_remove(struct runqueue *rq, struct task *t) {
         cur = next;
     }
     LOCKDEP_RELEASE(LOCKDEP_LVL_RUNQUEUE);
-    spin_unlock(&rq->lock);
+    spin_unlock_irqrestore(&rq->lock, flags);
     return removed;
 }
 

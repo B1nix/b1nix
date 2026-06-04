@@ -218,10 +218,13 @@ KERNEL_SOURCES += \
 	kernel/dev/pci.c \
 	kernel/dev/virtio.c \
 	kernel/dev/virtio_blk.c \
+	kernel/dev/virtio_net.c \
+	kernel/dev/e1000.c \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/ps2_mouse.c \
+	kernel/dev/usb_xhci.c \
 	kernel/dev/pty.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \

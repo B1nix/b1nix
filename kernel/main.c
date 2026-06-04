@@ -34,6 +34,7 @@
 
 extern void ps2_kbd_init(void);
 extern void ps2_mouse_init(void);
+extern int xhci_probe(void);
 extern void compositor_init(void);
 extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
@@ -151,6 +152,7 @@ void kernel_main(usize arg0, usize arg1)
 	net_init();
 	ps2_kbd_init();
 	ps2_mouse_init();
+	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
 	video_init();
 	compositor_init();
 	virtio_gpu_init();
