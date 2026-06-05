@@ -138,6 +138,7 @@ struct vfs_fs {
 
 u64 vfs_get_unix_time(void);
 void vfs_init(void);
+void vfs_repopulate_after_root_mount(void);
 void vfs_resolve_path(const char *path, char *out);
 struct vfs_node *find_child(struct vfs_node *parent, const char *name);
 struct vfs_node *vfs_find_node(const char *path);

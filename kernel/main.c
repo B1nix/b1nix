@@ -44,6 +44,118 @@ extern void bootinfo_init_from_fdt(u64 dtb_address);
 extern void m35_diag_run(void);
 extern void m36_diag_run(void);
 
+static int parse_hex_digit(char c) {
+	if (c >= '0' && c <= '9') return c - '0';
+	if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
+	if (c >= 'A' && c <= 'F') return 10 + (c - 'A');
+	return -1;
+}
+
+static int parse_uuid(const char *str, u8 *uuid_out) {
+	int out_idx = 0;
+	for (int i = 0; str[i] != '\0' && out_idx < 16; i++) {
+		if (str[i] == '-') {
+			continue;
+		}
+		int high = parse_hex_digit(str[i]);
+		if (high < 0) return 0;
+		i++;
+		if (str[i] == '\0') return 0;
+		int low = parse_hex_digit(str[i]);
+		if (low < 0) return 0;
+		uuid_out[out_idx++] = (u8)((high << 4) | low);
+	}
+	return (out_idx == 16);
+}
+
+static int match_label(const char *expected, const char *s_volume_name) {
+	int len = 0;
+	while (expected[len] != '\0') {
+		if (len >= 16) return 0;
+		if (expected[len] != s_volume_name[len]) return 0;
+		len++;
+	}
+	for (int i = len; i < 16; i++) {
+		if (s_volume_name[i] != '\0' && s_volume_name[i] != ' ' &&
+		    s_volume_name[i] != '\r' && s_volume_name[i] != '\n') {
+			return 0;
+		}
+	}
+	return 1;
+}
+
+static struct block_device *find_device_by_uuid(const u8 *expected_uuid) {
+	u8 *sb_buf = kmalloc(1024);
+	if (!sb_buf) return 0;
+
+	struct block_device *found = 0;
+	usize count = blk_count();
+	for (usize i = 0; i < count; i++) {
+		struct block_device *dev = blk_at(i);
+		if (!dev || dev->block_size != 512 || dev->block_count < 4) {
+			continue;
+		}
+		if (blk_read_cached(dev, 2, 2, sb_buf) == 0) {
+			struct ext2_superblock *sb = (struct ext2_superblock *)sb_buf;
+			if (sb->s_magic == EXT2_SUPER_MAGIC) {
+				if (memcmp(sb->s_uuid, expected_uuid, 16) == 0) {
+					found = dev;
+					break;
+				}
+			}
+		}
+	}
+
+	kfree(sb_buf);
+	return found;
+}
+
+static struct block_device *find_device_by_label(const char *expected_label) {
+	u8 *sb_buf = kmalloc(1024);
+	if (!sb_buf) return 0;
+
+	struct block_device *found = 0;
+	usize count = blk_count();
+	for (usize i = 0; i < count; i++) {
+		struct block_device *dev = blk_at(i);
+		if (!dev || dev->block_size != 512 || dev->block_count < 4) {
+			continue;
+		}
+		if (blk_read_cached(dev, 2, 2, sb_buf) == 0) {
+			struct ext2_superblock *sb = (struct ext2_superblock *)sb_buf;
+			if (sb->s_magic == EXT2_SUPER_MAGIC) {
+				if (match_label(expected_label, sb->s_volume_name)) {
+					found = dev;
+					break;
+				}
+			}
+		}
+	}
+
+	kfree(sb_buf);
+	return found;
+}
+
+static struct block_device *find_root_device(const char *root_val) {
+	if (strncmp(root_val, "UUID=", 5) == 0) {
+		const char *uuid_str = root_val + 5;
+		u8 expected_uuid[16];
+		if (!parse_uuid(uuid_str, expected_uuid)) {
+			return 0;
+		}
+		return find_device_by_uuid(expected_uuid);
+	} else if (strncmp(root_val, "LABEL=", 6) == 0) {
+		const char *label_str = root_val + 6;
+		return find_device_by_label(label_str);
+	} else {
+		const char *dev_name = root_val;
+		if (strncmp(dev_name, "/dev/", 5) == 0) {
+			dev_name += 5;
+		}
+		return blk_get(dev_name);
+	}
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
 	serial_init();
@@ -158,8 +270,76 @@ void kernel_main(usize arg0, usize arg1)
 	compositor_init();
 	virtio_gpu_init();
 	ramdisk_init();
-	/* M34: mount the synthetic /proc and /sys filesystems. /proc already
-	 * exists as a mount point (created in vfs_init); /sys is created here. */
+#endif
+#ifndef __aarch64__
+	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use
+	 * virtio-blk0; Live CD boots use the multiboot ramdisk block device ram0.
+	 * In test mode the smoke suite owns the drives, so keep initramfs as /. */
+	{
+		int rc = -1;
+		int test_mode = bootinfo_has_flag("b1nix.test=1");
+		char root_val[64];
+		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
+			struct block_device *root_dev = find_root_device(root_val);
+			if (!root_dev) {
+				console_write("rootfs: waiting for root device ");
+				console_write(root_val);
+				console_write("...\n");
+				int retries = 0;
+				while (retries < 50) {
+					scheduler_sleep_ticks(10);
+					root_dev = find_root_device(root_val);
+					if (root_dev) {
+						break;
+					}
+					retries++;
+				}
+			}
+			if (root_dev) {
+				const char *fs_types[] = {"ext4", "ext3", "ext2"};
+				for (int i = 0; i < 3; i++) {
+					rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+					if (rc == 0) {
+						char mounted_buf[96];
+						snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
+						console_write(mounted_buf);
+						vfs_repopulate_after_root_mount();
+						break;
+					}
+				}
+			}
+			if (rc != 0) {
+				char mount_err_buf[96];
+				snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
+				console_write(mount_err_buf);
+				vfs_repopulate_after_root_mount();
+			}
+		} else {
+			if (!test_mode) {
+				rc = vfs_mount("virtio-blk0", "/", "ext4", 0);
+			}
+			if (rc == 0) {
+				console_write("rootfs: virtio-blk0 mounted at /\n");
+				vfs_repopulate_after_root_mount();
+			} else {
+				if (!test_mode)
+					rc = vfs_mount("ram0", "/", "ext4", 0);
+				if (rc == 0) {
+					console_write("rootfs: ram0 mounted at / (Live CD)\n");
+					vfs_repopulate_after_root_mount();
+				} else {
+					char mount_err_buf[64];
+					snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, mount failed: %d\n", rc);
+					console_write(mount_err_buf);
+					vfs_repopulate_after_root_mount();
+				}
+			}
+		}
+	}
+
+	/* M34: mount synthetic filesystems after the final root is selected, so
+	 * they sit on top of /proc and /sys in the real root image. */
+	vfs_mkdir("/proc", 0555);
 	if (vfs_mount("proc", "/proc", "procfs", 0) == 0)
 		console_write("procfs: mounted at /proc\n");
 	vfs_mkdir("/sys", 0555);
@@ -200,28 +380,6 @@ void kernel_main(usize arg0, usize arg1)
 	 * under the Big Kernel Lock. From here, userspace runs on Application
 	 * Processors too. */
 	g_ap_userspace_enabled = 1;
-
-#ifndef __aarch64__
-	/* Try to mount persistent root device.
-	 * If virtio-blk0 has an ext4 filesystem (created via `make root-image`),
-	 * it becomes available at /persist.  In test mode (b1nix.test=1) the smoke
-	 * test controls its own drives, so the mount may fail — that's fine.    */
-	{
-		int rc = vfs_mount("virtio-blk0", "/persist", "ext4", 0);
-		if (rc == 0) {
-			console_write("persistent root: virtio-blk0 mounted at /persist\n");
-		} else {
-			rc = vfs_mount("ram0", "/persist", "ext4", 0);
-			if (rc == 0) {
-				console_write("persistent root: ram0 mounted at /persist (Live CD)\n");
-			} else {
-				char mount_err_buf[64];
-				snprintf(mount_err_buf, sizeof(mount_err_buf), "persistent root: ram0 mount failed: %d\n", rc);
-				console_write(mount_err_buf);
-			}
-		}
-	}
-#endif
 
 	userspace_init();
 	int init_pid = user_spawn("/bin/init", 0, 0);

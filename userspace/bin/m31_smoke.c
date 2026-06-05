@@ -6,6 +6,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
+#include <sys/stat.h>
 #include "syscall.h"
 
 static void emit(const char *s) {
@@ -54,6 +55,15 @@ static int test_shadow_readable(void) {
  * task's euid should become 0 even though the calling task is uid 1000.
  * The setuid binary exits 0 if its euid is root, 1 otherwise. */
 static int test_setuid_elevate(void) {
+  struct stat st;
+  if (stat("/bin/m31-setuid", &st) == 0) {
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "M31-DBG: m31-setuid mode=%o uid=%d gid=%d size=%d\n", (int)st.st_mode, (int)st.st_uid, (int)st.st_gid, (int)st.st_size);
+    emit(dbg);
+  } else {
+    emit("M31-DBG: stat failed\n");
+  }
+
   int pid = (int)syscall(SYS_FORK);
   if (pid < 0) { fail("setuid-fork"); return -1; }
 
@@ -65,7 +75,10 @@ static int test_setuid_elevate(void) {
       _exit(2);
     }
     const char *argv2[] = {"/bin/m31-setuid", 0};
-    syscall(SYS_EXECVE, "/bin/m31-setuid", argv2, 0);
+    long exec_rc = syscall(SYS_EXECVE, "/bin/m31-setuid", argv2, 0);
+    if (exec_rc < 0) {
+      _exit((int)-exec_rc);
+    }
     _exit(3);
   }
 
@@ -79,7 +92,9 @@ static int test_setuid_elevate(void) {
     ok("setuid-elevate");
     return 0;
   }
-  fail("setuid-elevate");
+  char err_msg[64];
+  snprintf(err_msg, sizeof(err_msg), "setuid-elevate-failed-code-%d", code);
+  fail(err_msg);
   return -1;
 }
 

@@ -102,12 +102,9 @@ static const char initramfs_sshd_service[] =
     "    [ -f $PIDFILE ] && export pid=$(cat $PIDFILE) && kill -0 $pid 2>/dev/null && echo \"sshd is already running (PID: $pid)\" && exit 0\n"
     "    [ -f $PIDFILE ] && rm -f $PIDFILE\n"
     "\n"
-    /* M32c host-key persistence: prefer the persistent root image (/persist)
-     * over the volatile initramfs /etc/ssh so the host key survives reboots
-     * once non-initramfs storage is mounted. Falls back to /etc/ssh when no
-     * persistent store is present (e.g. the automated smoke harness). */
+    /* M32c host-key persistence: the host key is stored in /etc/ssh/hk_ed25519,
+     * which resides on the mounted persistent rootfs (if mounted). */
     "    export HOSTKEY=/etc/ssh/hk_ed25519\n"
-    "    [ -d /persist ] && mkdir -p /persist/etc/ssh && export HOSTKEY=/persist/etc/ssh/hk_ed25519\n"
     "    mkdir -p /etc/ssh\n"
     "    [ -f $HOSTKEY ] || echo \"sshd: generating host key...\"\n"
     "    [ -f $HOSTKEY ] || /bin/dropbearkey -t ed25519 -f $HOSTKEY\n"
@@ -166,9 +163,8 @@ static const char initramfs_sshd_service[] =
     "esac\n";
 
 /* Boot rc script: init runs this once at startup, before the login shell.
- * The /persist block is first-boot setup for the persistent root image; it is
- * inert when /persist is not mounted (e.g. the smoke harness uses its own
- * drives) and idempotent afterwards via the .b1nix-setup marker. */
+ * The first-boot block is setup for the persistent root image; it is
+ * idempotent via the .b1nix-setup marker. */
 static const char initramfs_rc[] =
     "#!/bin/sh\n"
     "# b1nix boot rc script - runs once at startup, before the login shell.\n"
@@ -177,10 +173,9 @@ static const char initramfs_rc[] =
     /* Home directories for the accounts in /etc/passwd so a login shell (local
      * or over SSH) has a valid working directory instead of warning on chdir. */
     "mkdir -p /root /home/user /tmp\n"
-    "[ -d /persist ] && [ ! -f /persist/.b1nix-setup ] && mkdir -p /persist/home "
-    "&& mkdir -p /persist/etc && mkdir -p /persist/tmp "
-    "&& echo ready > /persist/.b1nix-setup "
-    "&& echo \"M27-INIT: first-boot /persist initialised\"\n"
+    "[ ! -f /.b1nix-setup ] && mkdir -p /root /home/user /tmp "
+    "&& echo ready > /.b1nix-setup "
+    "&& echo \"M27-INIT: first-boot rootfs initialised\"\n"
     /* Start the SSH daemon service. The init.d script generates the Ed25519
      * host key on first start (now working on both x86 and x86_64) and
      * backgrounds dropbear, so this returns promptly and leaves a pid file for
@@ -559,7 +554,11 @@ static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags,
   if (!root)
     return ERR_PTR(-ENOMEM);
 
+  root->inode->mode = 0755;
+  root->inode->uid = 0;
+  root->inode->gid = 0;
   root->inode->statfs_cb = initramfs_vfs_statfs;
+  vfs_set_currently_mounting_root(root);
 
   for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
     struct vfs_node *node =

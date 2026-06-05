@@ -747,7 +747,7 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name,
 	
 	struct ext2_inode new_inode;
 	memset(&new_inode, 0, sizeof(new_inode));
-	new_inode.i_mode = EXT2_S_IFREG | (mode & 0777);
+	new_inode.i_mode = EXT2_S_IFREG | (mode & 07777);
 	new_inode.i_links_count = 1;
 	ext2_write_inode(fs, new_inode_num, &new_inode);
 	
@@ -841,7 +841,7 @@ static int ext2_vfs_setattr(struct vfs_node *node) {
   if (ext2_read_inode(fs, inode_num, &inode) < 0) return -EIO;
   
   node->inode->ctime = vfs_get_unix_time();
-  inode.i_mode = (inode.i_mode & ~0777) | (node->inode->mode & 0777);
+  inode.i_mode = (inode.i_mode & ~07777) | (node->inode->mode & 07777);
   inode.i_uid = node->inode->uid;
   inode.i_gid = node->inode->gid;
   inode.i_size = (u32)node->inode->size;
@@ -1060,7 +1060,7 @@ static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
 
     struct ext2_inode new_inode;
     memset(&new_inode, 0, sizeof(new_inode));
-    new_inode.i_mode = EXT2_S_IFDIR | (mode & 0777);
+    new_inode.i_mode = EXT2_S_IFDIR | (mode & 07777);
     new_inode.i_links_count = 2; // . and parent
     ext2_write_inode(fs, new_inode_num, &new_inode);
 
@@ -1237,6 +1237,9 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   
   struct ext2_inode ri;
   if (ext2_read_inode(fs, 2, &ri) == 0) {
+      root->inode->mode = ri.i_mode & 07777;
+      root->inode->uid = ri.i_uid;
+      root->inode->gid = ri.i_gid;
       ext2_load_acls(fs, &ri, root->inode);
   }
   

@@ -555,7 +555,7 @@ iso-live: root-image $(KERNEL_ELF)
 	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img|g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
@@ -566,7 +566,7 @@ iso-test: root-image $(KERNEL_ELF)
 	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img|g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
@@ -638,6 +638,9 @@ run-root: run-x86_64
 
 root-image: userspace-install install-native-toolchain install-kernel-source
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
+	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
+	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
+	@ln -sfn . $(BUILD_DIR)/rootfs/persist
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
 	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \

@@ -479,7 +479,7 @@ static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *f
     return -ENOSPC;
   }
   struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
-  inode.i_mode = EXT2_S_IFREG | (mode & 0777); inode.i_links_count = 1;
+  inode.i_mode = EXT2_S_IFREG | (mode & 07777); inode.i_links_count = 1;
   inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
   struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
   eh->eh_magic = EXT4_EXTENT_MAGIC; eh->eh_entries = 0; eh->eh_max = 4; eh->eh_depth = 0; eh->eh_generation = 0;
@@ -512,7 +512,7 @@ static int ext4_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     return -ENOSPC;
   }
   struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
-  inode.i_mode = EXT2_S_IFDIR | (mode & 0777); inode.i_links_count = 2;
+  inode.i_mode = EXT2_S_IFDIR | (mode & 07777); inode.i_links_count = 2;
   inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
   if (ext4_write_inode_tx(fs, h, new_ino, &inode) < 0) {
     if (h) journal_abort_transaction(h);
@@ -751,7 +751,7 @@ static int ext4_vfs_setattr(struct vfs_node *node) {
   struct ext4_fs *fs = info->fs; struct ext2_inode inode;
   if (ext4_read_inode(fs, info->inode_num, &inode) < 0) return -EIO;
   node->inode->ctime = vfs_get_unix_time();
-  inode.i_mode = (inode.i_mode & ~0777) | (node->inode->mode & 0777);
+  inode.i_mode = (inode.i_mode & ~07777) | (node->inode->mode & 07777);
   inode.i_uid = node->inode->uid; inode.i_gid = node->inode->gid;
   inode.i_size = (u32)node->inode->size;
   inode.i_atime = node->inode->atime; inode.i_mtime = node->inode->mtime; inode.i_ctime = node->inode->ctime;
@@ -860,6 +860,14 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
                     struct vfs_node *n = vfs_add_node(full, (fmt == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
                     if (n) {
                         ext4_setup_node(n, fs, e->inode, ci.i_mode);
+                        n->inode->mode = ci.i_mode & 07777;
+                        n->inode->uid = ci.i_uid;
+                        n->inode->gid = ci.i_gid;
+                        n->inode->atime = ci.i_atime;
+                        n->inode->mtime = ci.i_mtime;
+                        n->inode->ctime = ci.i_ctime;
+                        n->inode->nlink = ci.i_links_count;
+                        n->inode->fs_id = n->parent->inode->fs_id;
                         if (fmt == EXT2_S_IFDIR) ext4_populate_vfs(fs, e->inode, full);
                     }
                 }
@@ -909,6 +917,12 @@ static struct vfs_node *ext4_vfs_mount_cb(const char *source, u64 flags, void *d
     kfree(sb_buf);
     struct vfs_node *root = vfs_create_node(VFS_DIRECTORY);
     ext4_setup_node(root, fs, 2, EXT2_S_IFDIR);
+    struct ext2_inode ri;
+    if (ext4_read_inode(fs, 2, &ri) == 0) {
+        root->inode->mode = ri.i_mode & 07777;
+        root->inode->uid = ri.i_uid;
+        root->inode->gid = ri.i_gid;
+    }
     vfs_set_currently_mounting_root(root);
     if (data) ext4_populate_vfs(fs, 2, (const char *)data);
     return root;

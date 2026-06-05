@@ -753,6 +753,26 @@ static char tty_line[TTY_INPUT_SIZE];
 static usize tty_line_pos;
 static usize tty_line_len;
 
+static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
+  if (!node || node != root_node)
+    return node;
+
+  struct vfs_node *mounted_root = 0;
+  for (int i = 0; i < MAX_MOUNTS; i++) {
+    if (mounts[i].used && mounts[i].root_node &&
+        strcmp(mounts[i].target, "/") == 0) {
+      mounted_root = mounts[i].root_node;
+    }
+  }
+
+  if (!mounted_root || mounted_root == node)
+    return node;
+
+  vfs_node_get(mounted_root);
+  vfs_node_put(node);
+  return mounted_root;
+}
+
 void virtio_blk_init(void);
 #ifndef __aarch64__
 extern char ps2_kbd_getc(void);
@@ -1114,6 +1134,7 @@ vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
 
   vfs_node_get(root_node);
   struct vfs_node *current = root_node;
+  current = vfs_cross_root_mount(current);
   vfs_inode_lock_read(current->inode);
 
   char part[64];
@@ -1304,6 +1325,7 @@ restart_traversal:
       vfs_node_put(current);
       vfs_node_get(root_node);
       current = root_node;
+      current = vfs_cross_root_mount(current);
       vfs_inode_lock_read(current->inode);
       parent_path[0] = '/';
       parent_path[1] = '\0';
@@ -1356,11 +1378,19 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
   char part[64];
   const char *rest = path;
   struct vfs_node *current = root_node;
+  vfs_node_get(current);
+  current = vfs_cross_root_mount(current);
+  /* Note: vfs_cross_root_mount already manages refcount correctly.
+   * If it redirected, it got the new root (+1) and put the old one (-1).
+   * current now holds one reference valid throughout the loop below. */
 
   while (1) {
     split_path(rest, part, sizeof(part), &rest);
-    if (part[0] == '\0')
-      return current;
+    if (part[0] == '\0') {
+      struct vfs_node *ret = current;
+      vfs_node_put(current);
+      return ret;
+    }
 
     struct vfs_node *child = find_child(current, part);
     int child_was_found = (child != NULL);
@@ -1379,12 +1409,15 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     if (is_leaf) {
       if (!child) {
         child = alloc_node();
-        if (!child)
+        if (!child) {
+          vfs_node_put(current);
           return ERR_PTR(-ENOMEM);
+        }
         child->inode = alloc_inode();
         if (!child->inode) {
           vfs_free_node(child);
           __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
+          vfs_node_put(current);
           return ERR_PTR(-ENOMEM);
         }
 
@@ -1441,21 +1474,28 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         if (child_was_found) {
           vfs_node_put(child);
         }
-        return child;
+        struct vfs_node *ret = child;
+        vfs_node_put(current);
+        return ret;
       }
       if (child_was_found) {
         vfs_node_put(child);
       }
-      return child;
+      struct vfs_node *ret = child;
+      vfs_node_put(current);
+      return ret;
     } else {
       if (!child) {
         child = alloc_node();
-        if (!child)
+        if (!child) {
+          vfs_node_put(current);
           return ERR_PTR(-ENOMEM);
+        }
         child->inode = alloc_inode();
         if (!child->inode) {
           vfs_free_node(child);
           __atomic_sub_fetch(&node_count, 1, __ATOMIC_RELAXED);
+          vfs_node_put(current);
           return ERR_PTR(-ENOMEM);
         }
 
@@ -1481,9 +1521,13 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
         vfs_tree_write_release(_tlflags);
         vfs_inode_unlock_write(current->inode);
       }
-      current = child;
       if (child_was_found) {
-        vfs_node_put(child);
+        vfs_node_put(current);
+        current = child;
+      } else {
+        vfs_node_get(child);
+        vfs_node_put(current);
+        current = child;
       }
     }
   }
@@ -1809,9 +1853,7 @@ void vfs_init(void) {
   add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/persist", VFS_DIRECTORY, 0, 0, 0); /* M26: mountpoint for the
-                                                   persistent root image (native
-                                                   toolchain + kernel source) */
+  vfs_symlink("/", "/persist");
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/virtio-blk0", VFS_DEVICE, 0, 0, 0);
@@ -1846,6 +1888,37 @@ void vfs_init(void) {
 
   console_write(
       "vfs: full featured initialized (POSIX+, Refcounting, Mount Crossing)\n");
+}
+
+void vfs_repopulate_after_root_mount(void) {
+  add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
+  add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
+  add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  tty_init_node();
+
+  add_node("/home", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/var", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext1", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext2", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  vfs_unlink("/persist");
+  vfs_rmdir("/persist");
+  vfs_symlink("/", "/persist");
+
+  for (usize i = 0; i < blk_count(); i++) {
+    struct block_device *dev = blk_at(i);
+    if (!dev || !dev->name)
+      continue;
+    char dev_path[64];
+    strcpy(dev_path, "/dev/");
+    strcat(dev_path, dev->name);
+    add_node(dev_path, VFS_DEVICE, 0, 0, 0);
+  }
 }
 
 int vfs_open(const char *path) { return vfs_open_flags(path, B1NIX_O_RDONLY); }
@@ -2558,7 +2631,7 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
   st->st_blksize = 512;
   st->st_blocks = (inode->size + 511) / 512;
   st->st_nlink = (u32)inode->nlink;
-  st->st_mode = vfs_node_type_mode(node) | (inode->mode & 0777);
+  st->st_mode = vfs_node_type_mode(node) | (inode->mode & 07777);
 
   st->st_atime = inode->atime;
   st->st_mtime = inode->mtime;
@@ -3304,6 +3377,10 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   mounts[midx].used = 1;
   mounts[midx].mount_point = target_node;
   mounts[midx].root_node = NULL;
+  copy_path(mounts[midx].source, sizeof(mounts[midx].source), source ? source : "");
+  copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
+  copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
+  mounts[midx].flags = flags;
 
   currently_mounting = &mounts[midx];
   struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
@@ -3618,7 +3695,7 @@ int vfs_chmod(const char *path, u16 mode) {
       return -EPERM;
   }
 
-  node->inode->mode = (node->inode->mode & ~0777) | (mode & 0777);
+  node->inode->mode = (node->inode->mode & ~07777) | (mode & 07777);
   vfs_update_times(node->inode, VFS_CTIME);
   if (node->inode->setattr_cb)
     return node->inode->setattr_cb(node);
@@ -3665,7 +3742,7 @@ int vfs_fchmod(int fd, u16 mode) {
   }
 
   handle->node->inode->mode =
-      (handle->node->inode->mode & ~0777) | (mode & 0777);
+      (handle->node->inode->mode & ~07777) | (mode & 07777);
   vfs_update_times(handle->node->inode, VFS_CTIME);
   if (handle->node->inode->setattr_cb)
     return handle->node->inode->setattr_cb(handle->node);
