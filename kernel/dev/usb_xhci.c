@@ -1100,7 +1100,10 @@ static void usb_probe_port(u32 port, u32 speed)
 	/* Parse config. We can scan for interface type. */
 	u8 cfg_val = xfer_buf[5];
 	u16 i = 0;
-	u8 interface_class = 0;
+	u8 cur_is_msc = 0;
+	u8 cur_is_kbd = 0;
+	u8 has_msc = 0;
+	u8 has_kbd = 0;
 	u8 ep_in_addr = 0, ep_out_addr = 0;
 	u16 ep_in_mps = 0, ep_out_mps = 0;
 	u8 ep_in_burst = 0, ep_out_burst = 0;
@@ -1121,20 +1124,26 @@ static void usb_probe_port(u32 port, u32 speed)
 		u8 type = xfer_buf[i + 1];
 		if (len == 0) break;
 		if (type == 0x04 && i + 9 <= total) {           /* INTERFACE */
-			interface_class = xfer_buf[i + 5];
+			u8 iclass = xfer_buf[i + 5];
+			u8 ialt = xfer_buf[i + 3];
+			u8 iproto = xfer_buf[i + 7];
+			cur_is_kbd = (iclass == 3);
+			cur_is_msc = (iclass == 8 && iproto == 0x50 && ialt == 0);
+			if (cur_is_kbd) has_kbd = 1;
+			if (cur_is_msc) has_msc = 1;
 		} else if (type == 0x05 && i + 7 <= total) {     /* ENDPOINT */
 			u8 addr = xfer_buf[i + 2];
 			u8 attr = xfer_buf[i + 3];
 			u16 mps = (u16)(xfer_buf[i + 4] | (xfer_buf[i + 5] << 8));
 			u8 interval = xfer_buf[i + 6];
 
-			if (interface_class == 3) { /* HID */
+			if (cur_is_kbd) { /* HID */
 				if ((addr & 0x80) && (attr & 0x03) == 0x03) { /* int IN */
 					kbd_ep_addr = addr;
 					kbd_ep_mps = mps;
 					kbd_ep_interval = interval;
 				}
-			} else if (interface_class == 8) { /* Mass Storage */
+			} else if (cur_is_msc) { /* Bulk-Only Transport Mass Storage */
 				if ((attr & 0x03) == 0x02) { /* Bulk */
 					if (addr & 0x80) {
 						ep_in_addr = addr;
@@ -1149,7 +1158,7 @@ static void usb_probe_port(u32 port, u32 speed)
 			}
 		} else if (type == 0x30 && len >= 6 && i + 6 <= total) { /* SS Companion */
 			u8 max_burst = xfer_buf[i + 2];
-			if (interface_class == 8) {
+			if (cur_is_msc) {
 				if (last_ep_is_in) ep_in_burst = max_burst;
 				else ep_out_burst = max_burst;
 			}
@@ -1157,7 +1166,7 @@ static void usb_probe_port(u32 port, u32 speed)
 		i += len;
 	}
 
-	if (interface_class == 3 && kbd_ep_addr != 0) {
+	if (has_kbd && kbd_ep_addr != 0) {
 		/* It is a keyboard! */
 		kbd_slot = slot;
 		kbd_mps = kbd_ep_mps;
@@ -1228,7 +1237,7 @@ static void usb_probe_port(u32 port, u32 speed)
 		console_write_hex32(kbd_ep_addr);
 		console_write("\n");
 
-	} else if (interface_class == 8 && ep_in_addr != 0 && ep_out_addr != 0) {
+	} else if (has_msc && ep_in_addr != 0 && ep_out_addr != 0) {
 		/* It is a mass storage device! */
 		console_write("xhci: mass storage device detected in_addr=0x");
 		console_write_hex32(ep_in_addr);
