@@ -312,11 +312,6 @@ static void usb_handle_transfer_event(struct trb *e)
 		spin_lock_irqsave(&xhci_kbd_lock, &flags);
 		u8 cc = (u8)((e->status >> 24) & 0xff);
 		u32 length = e->status & 0xffffff;
-		console_write("xhci: kbd transfer event cc=");
-		console_write_dec(cc);
-		console_write(" len=");
-		console_write_dec(length);
-		console_write("\n");
 
 		usb_hid_translate_report(int_buf);
 		/* Re-queue the read. */
@@ -1127,7 +1122,7 @@ static void usb_probe_port(u32 port, u32 speed)
 			u8 iclass = xfer_buf[i + 5];
 			u8 ialt = xfer_buf[i + 3];
 			u8 iproto = xfer_buf[i + 7];
-			cur_is_kbd = (iclass == 3);
+			cur_is_kbd = (iclass == 3 && iproto == 1);
 			cur_is_msc = (iclass == 8 && iproto == 0x50 && ialt == 0);
 			if (cur_is_kbd) has_kbd = 1;
 			if (cur_is_msc) has_msc = 1;
