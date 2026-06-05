@@ -47,8 +47,7 @@ run_qemu() {
 
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		qemu-system-x86_64 \
-			${EXTRA_QEMU_ARGS:-} \
-			-cdrom "$PROJECT_DIR/build/$ARCH/b1nix.iso" \
+			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
@@ -62,6 +61,7 @@ run_qemu() {
 				-device ide-hd,drive=swapdrive,bus=ahci.1 \
 				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw \
 				-device nvme,serial=deadbeef,drive=nvmedrive \
+				${EXTRA_QEMU_ARGS:-} \
 				>"$log" 2>&1 &
 		pid=$!
 
@@ -738,6 +738,28 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	else
 		fail "xHCI controller initialized" "M37-USB xhci-init marker not found"
 	fi
+fi
+
+# ── M37 Live CD On-Demand Boot from USB ──
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
+	echo ""
+	echo "[TEST] M37 on-demand Live CD USB path (test-mode verification mount)..."
+	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1" iso-live-ondemand >/dev/null 2>&1 || {
+		echo "  ${RED}LIVE ISO BUILD FAILED${NC}"
+		exit 1
+	}
+	ONDEMAND_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-ondemand.log"
+	B1NIX_ISO_NAME="b1nix-live-ondemand.iso"
+	EXTRA_QEMU_ARGS="-drive file=$PROJECT_DIR/build/$ARCH/b1nix-live-ondemand.iso,if=none,id=usbdisk,format=raw,readonly=on -device usb-storage,bus=xhci.0,drive=usbdisk"
+	run_qemu "$ONDEMAND_LOG"
+	B1NIX_ISO_NAME=""
+	EXTRA_QEMU_ARGS=""
+
+	check_output "$ONDEMAND_LOG" "isofs: mounted usb" "isofs mounts USB device"
+	check_output "$ONDEMAND_LOG" "loop: loop0 backing /boot/rootfs.img" "loop device backs rootfs.img"
+	check_output "$ONDEMAND_LOG" "rootfs: loop0 mounted at /mnt/root as ext4" "test mode mounts loop0 at /mnt/root for verification"
+	check_output "$ONDEMAND_LOG" "M37-LIVEISO: ok isofs-loop-root" "M37 Live ISO boot success marker appears"
+	check_output "$ONDEMAND_LOG" "B1NIX-TEST: done" "on-demand Live CD boot completes successfully"
 fi
 
 # ── M24b SMP work-stealing (multi-core) ──

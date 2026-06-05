@@ -122,3 +122,32 @@ OS does not need it.
 Real machines have no PS/2 controller, so console input comes from the USB HID
 keyboard via the xHCI driver (above). The `ps2_kbd` path is kept for QEMU and
 the rare board that still exposes an i8042.
+
+## True On-Demand Live CD Booting from USB
+
+To avoid copying the entire `rootfs.img` into RAM, b1nix implements a Unix-like USB on-demand boot sequence:
+1. Probes xHCI controllers and registers USB mass storage devices.
+2. Mounts the ISO9660 filesystem on the USB device at `/mnt/iso`.
+3. Registers a loopback block device `loop0` backed by the file `/boot/rootfs.img` inside the ISO.
+4. Mounts the loopback device as the primary `ext4` rootfs at `/` on normal boots.
+   In `b1nix.test=1` smoke mode it mounts at `/mnt/root` instead, preserving the initramfs so the test harness can keep running.
+5. After a normal root switch, remounts the ISO at the new root's `/mnt/iso`; the loop device keeps its original backing node open, so the rootfs remains readable throughout the switch.
+
+### Kernel Command Line Options
+
+To boot using this method on real hardware, specify the following parameters in `grub.cfg` or the GRUB command line:
+- `root=liveiso`: Requests the loopback mount flow.
+- `b1nix.xhci.run` (or `b1nix.xhci.enum`): Forces the native xHCI host controller driver to initialize and probe connected USB devices. Without this flag, xHCI is left uninitialized to prevent bios-handoff issues from breaking BIOS keyboard emulation.
+
+### Whole-Disk ISO vs Partition Probing
+
+Depending on how the USB drive is partitioned or written (e.g. raw hybrid ISO written via `dd` versus written to a specific partition), the kernel might see the ISO9660 filesystem on the whole disk (e.g. `usb0`) or on a partition (e.g. `usb0p1`).
+To handle this dynamically, the boot flow iterates through all registered block devices starting with `"usb"` (e.g., `usb0`, `usb0p1`, `usb1`) and attempts to mount each as `iso9660` at `/mnt/iso`. Probing succeeds at the first device that mounts successfully and contains `/boot/rootfs.img`.
+
+### Timing and Retries
+
+USB mass storage devices and controllers (especially on real hardware) require time to initialize, reset the port, assign slots, read descriptors, and register the storage device.
+The boot process handles this asynchronously:
+- The kernel loops up to 50 times, sleeping for 10 scheduler ticks (100ms) per iteration (total up to 5 seconds), waiting for the first block device starting with `"usb"` to be registered.
+- Once at least one USB block device is discovered, the kernel initiates the partition/disk probing sequence.
+- If no USB devices are registered within the timeout, or if mounting the ISO/loopback fails, the boot process automatically falls back to the standard `ram0` ramdisk module boot so the system remains bootable.

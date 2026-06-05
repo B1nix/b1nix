@@ -1853,6 +1853,8 @@ void vfs_init(void) {
   add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/iso", VFS_DIRECTORY, 0, 0, 0);
+  add_node("/mnt/root", VFS_DIRECTORY, 0, 0, 0);
   vfs_symlink("/", "/persist");
 
   add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
@@ -1952,6 +1954,12 @@ void vfs_repopulate_after_root_mount(void) {
   if (node && !IS_ERR(node)) vfs_node_put(node);
 
   node = add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/iso", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/root", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) vfs_node_put(node);
 
   vfs_unlink("/persist");

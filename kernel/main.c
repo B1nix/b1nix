@@ -22,6 +22,9 @@
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
 #include <b1nix/filelock.h>
+#include <b1nix/errno.h>
+#include <b1nix/isofs.h>
+#include <b1nix/loop.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/shm.h>
 #include <b1nix/uidgid.h>
@@ -256,6 +259,7 @@ void kernel_main(usize arg0, usize arg1)
 	ahci_init();
 	nvme_init();
 	btrfs_init();
+	isofs_init();
 	procfs_init();
 	sysfs_init();
 	filelock_init();
@@ -280,39 +284,124 @@ void kernel_main(usize arg0, usize arg1)
 		int test_mode = bootinfo_has_flag("b1nix.test=1");
 		char root_val[64];
 		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
-			struct block_device *root_dev = find_root_device(root_val);
-			if (!root_dev) {
-				console_write("rootfs: waiting for root device ");
-				console_write(root_val);
-				console_write("...\n");
+			if (strcmp(root_val, "liveiso") == 0) {
+				console_write("rootfs: liveiso mount requested, searching for USB storage...\n");
+				struct block_device *iso_dev = NULL;
+				char mounted_iso_name[64];
+				mounted_iso_name[0] = '\0';
 				int retries = 0;
 				while (retries < 50) {
-					scheduler_sleep_ticks(10);
-					root_dev = find_root_device(root_val);
-					if (root_dev) {
-						break;
+					for (usize i = 0; i < blk_count(); i++) {
+						struct block_device *dev = blk_at(i);
+						if (dev && strncmp(dev->name, "usb", 3) == 0) {
+							iso_dev = dev;
+							break;
+						}
 					}
+					if (iso_dev) break;
+					scheduler_sleep_ticks(10);
 					retries++;
 				}
-			}
-			if (root_dev) {
-				const char *fs_types[] = {"ext4", "ext3", "ext2"};
-				for (int i = 0; i < 3; i++) {
-					rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-					if (rc == 0) {
-						char mounted_buf[96];
-						snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
-						console_write(mounted_buf);
-						vfs_repopulate_after_root_mount();
-						break;
+
+				if (iso_dev) {
+					/* Try each USB block device (whole disk + partitions) in order */
+					for (usize i = 0; i < blk_count(); i++) {
+						struct block_device *dev = blk_at(i);
+						if (dev && strncmp(dev->name, "usb", 3) == 0) {
+							rc = vfs_mount(dev->name, "/mnt/iso", "iso9660", 0);
+							if (rc == 0) {
+								snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
+								console_write("isofs: mounted ");
+								console_write(dev->name);
+								console_write(" at /mnt/iso\n");
+								break;
+							}
+						}
 					}
 				}
-			}
-			if (rc != 0) {
-				char mount_err_buf[96];
-				snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
-				console_write(mount_err_buf);
-				vfs_repopulate_after_root_mount();
+
+				if (rc == 0) {
+					struct block_device *loop_dev = loop_register_file("/mnt/iso/boot/rootfs.img", "loop0");
+					if (loop_dev && !IS_ERR(loop_dev)) {
+						console_write("loop: loop0 backing /boot/rootfs.img\n");
+						/* If we are running in test/smoke mode, we mount at /mnt/root
+						 * to keep the bootstrap initramfs as active root.
+						 * Otherwise (on real hardware or normal boots), we mount
+						 * loop0 as the primary rootfs at /. */
+						const char *target = test_mode ? "/mnt/root" : "/";
+						rc = vfs_mount("loop0", target, "ext4", 0);
+						if (rc == 0) {
+							if (test_mode) {
+								console_write("rootfs: loop0 mounted at /mnt/root as ext4\n");
+							} else {
+								console_write("rootfs: loop0 mounted at / as ext4\n");
+								vfs_repopulate_after_root_mount();
+								if (mounted_iso_name[0] != '\0') {
+									int iso_rc = vfs_mount(mounted_iso_name, "/mnt/iso", "iso9660", 0);
+									if (iso_rc == 0) {
+										console_write("isofs: remounted at /mnt/iso after root switch\n");
+									} else {
+										char iso_err_buf[80];
+										snprintf(iso_err_buf, sizeof(iso_err_buf), "isofs: remount after root switch failed: %d\n", iso_rc);
+										console_write(iso_err_buf);
+									}
+								}
+							}
+							console_write("M37-LIVEISO: ok isofs-loop-root\n");
+						}
+					} else {
+						rc = -1;
+					}
+				}
+
+				if (rc != 0) {
+					console_write("rootfs: liveiso mount failed, falling back to ram0...\n");
+					rc = vfs_mount("ram0", "/", "ext4", 0);
+					if (rc == 0) {
+						console_write("rootfs: ram0 mounted at / (Live CD fallback)\n");
+						vfs_repopulate_after_root_mount();
+					} else {
+						char mount_err_buf[64];
+						snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: fallback mount failed: %d\n", rc);
+						console_write(mount_err_buf);
+						vfs_repopulate_after_root_mount();
+					}
+				}
+			} else {
+				struct block_device *root_dev = find_root_device(root_val);
+				if (!root_dev) {
+					console_write("rootfs: waiting for root device ");
+					console_write(root_val);
+					console_write("...\n");
+					int retries = 0;
+					while (retries < 50) {
+						scheduler_sleep_ticks(10);
+						root_dev = find_root_device(root_val);
+						if (root_dev) {
+							break;
+						}
+						retries++;
+					}
+				}
+				if (root_dev) {
+					const char *fs_types[] = {"ext4", "ext3", "ext2"};
+					for (int i = 0; i < 3; i++) {
+						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+						if (rc == 0) {
+							char mounted_buf[96];
+							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s mounted at / as %s\n", root_dev->name, fs_types[i]);
+							console_write(mounted_buf);
+							vfs_repopulate_after_root_mount();
+							break;
+						}
+					}
+				}
+				if (rc != 0) {
+					char mount_err_buf[96];
+					snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, failed to mount root: %s\n", root_val);
+					console_write(mount_err_buf);
+					vfs_repopulate_after_root_mount();
+				}
 			}
 		} else {
 			if (!test_mode) {

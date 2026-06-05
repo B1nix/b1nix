@@ -194,6 +194,7 @@ KERNEL_SOURCES := \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/fat32.c \
+	kernel/fs/isofs.c \
 	kernel/fs/ext2.c \
 	kernel/fs/ext1.c \
 	kernel/fs/ext3.c \
@@ -206,6 +207,7 @@ KERNEL_SOURCES := \
 	kernel/dev/acpi.c \
 	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
+	kernel/dev/loop.c \
 	kernel/dev/ramdisk.c \
 	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
@@ -279,7 +281,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all clean run-x86_64 run-x86 run-root root-image iso iso-live iso-test check-tools objects graphics-smoke analyze
+.PHONY: all clean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test check-tools objects graphics-smoke analyze
 
 all: $(KERNEL_ELF)
 
@@ -623,6 +625,18 @@ iso-live: root-image $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
+iso-live-ondemand: root-image $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-live-ondemand/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live-ondemand/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live-ondemand/boot/rootfs.img
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) root=liveiso b1nix.xhci.run|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live-ondemand/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live-ondemand.iso $(BUILD_DIR)/iso-live-ondemand
+
+
 iso-test: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
@@ -742,4 +756,4 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-test userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source
+.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source

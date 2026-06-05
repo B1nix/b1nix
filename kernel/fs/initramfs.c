@@ -550,6 +550,15 @@ static const struct initramfs_file files[] = {
     {"/bin/groupadd", (const char *)vfs_groupadd_elf, sizeof(vfs_groupadd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/chown", (const char *)vfs_chown_elf, sizeof(vfs_chown_elf), INITRAMFS_EXECUTABLE},
     {"/bin/chmod", (const char *)vfs_chmod_elf, sizeof(vfs_chmod_elf), INITRAMFS_EXECUTABLE},
+    /* M37: mount point for the live ISO; the initramfs must contain a node
+     * under /mnt/iso so that vfs_mount() can find the target directory after
+     * the initramfs is mounted at "/".  Without this entry add_node() never
+     * creates the /mnt/iso branch inside the initramfs root, and vfs_find_node
+     * returns ENOENT when the liveiso boot code calls vfs_mount(usb0,
+     * "/mnt/iso", "iso9660", 0). */
+    {"/mnt/iso/.keep", "", 0, 0},
+    /* M37: mount point for the verified live rootfs (loop0 ext4). */
+    {"/mnt/root/.keep", "", 0, 0},
     TCC_INITRAMFS_FILES
 };
 
