@@ -18,3 +18,4 @@ CLAUDE.md
 # Claude memory transport bundle (regenerable; same content tracked in docs/agent-memory/)
 b1nix-claude-memory.tar.gz
 /docs/b1nix-claude-memory
+/scratch
