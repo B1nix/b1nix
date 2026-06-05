@@ -418,6 +418,7 @@ static int evt_wait_transfer(int target_slot, int target_dci, struct trb *out, i
 			u32 slot = (e.control >> 24) & 0xff;
 			u32 dci = (e.control >> 16) & 0x1f;
 			u8 cc = (u8)((e.status >> 24) & 0xff);
+			/* Log all events — verbose but essential for real-HW diagnosis. */
 			console_write("xhci: event type=");
 			console_write_dec(et);
 			console_write(" slot=");
@@ -435,6 +436,11 @@ static int evt_wait_transfer(int target_slot, int target_dci, struct trb *out, i
 				if ((int)slot == kbd_slot && (int)dci == kbd_ep_dci) {
 					usb_handle_transfer_event(&e);
 				}
+				/* Stash unexpected transfer events so they are not lost.
+				 * On real hardware, the controller may deliver events for
+				 * endpoints we are not currently waiting on (e.g. old slot
+				 * residue). Saving them prevents event-ring desync. */
+				push_saved_event(&e);
 			}
 		}
 	}
@@ -471,7 +477,8 @@ static int cmd_exec(u64 param, u32 status, u32 control_type_flags, int *slot_out
 	ring_doorbell(0, 0); /* command ring doorbell */
 
 	struct trb e;
-	if (!evt_wait_type(TRB_EVT_CMD_COMP, &e, 16))
+	/* 32 outer loops × ≤8 ms each = ≤256 ms; enough for slow real-HW controllers. */
+	if (!evt_wait_type(TRB_EVT_CMD_COMP, &e, 32))
 		return -1;
 	if (slot_out)
 		*slot_out = (int)((e.control >> 24) & 0xff);
@@ -532,7 +539,8 @@ static int ctrl_xfer(struct usb_device *dev, u8 bmRequestType, u8 bRequest, u16 
 	ring_doorbell((u32)dev->slot, 1); /* EP0 DCI = 1 */
 
 	struct trb e;
-	if (!evt_wait_transfer(dev->slot, 1, &e, 16))
+	/* 32 outer loops × ≤8 ms each = ≤256 ms; enough for slow real-HW devices. */
+	if (!evt_wait_transfer(dev->slot, 1, &e, 32))
 		return -1;
 	int cc = (int)((e.status >> 24) & 0xff);
 	return (cc == CC_SUCCESS || cc == 13 /* short packet */) ? 0 : -1;
@@ -584,7 +592,17 @@ static int reset_port(u32 port)
 	for (int i = 0; i < 100000; i++) {
 		portsc = rd32(op_base, off);
 		if (portsc & PORTSC_PRC) {            /* reset complete */
+			/* Clear PRC (and only PRC) — write 0 to other RW1C bits to preserve them. */
 			wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK) | PORTSC_PRC);
+			/* Log PLS (Port Link State) for real-HW diagnostics.
+			 * PLS is bits [8:5]. After reset: 0=U0 (OK), 5=Rx.Detect (device missing),
+			 * 7=Polling (SS link training in progress). */
+			u32 pls = (portsc >> 5) & 0xf;
+			console_write("xhci: port reset done pls=");
+			console_write_dec(pls);
+			console_write(" ped=");
+			console_write_dec((portsc & PORTSC_PED) ? 1 : 0);
+			console_write("\n");
 			return (portsc & PORTSC_PED) ? 0 : -1;
 		}
 		udelay(10);
@@ -917,6 +935,11 @@ static void usb_probe_port(u32 port, u32 speed)
 	u32 actual_mps = mps0_for_speed(speed);
 
 	if (use_two_step) {
+		/* Short pause after BSR=1 Address Device before the first control
+		 * transfer: some real devices (especially USB3 SS) need a few ms
+		 * after being addressed before EP0 is ready to accept transfers. */
+		udelay(5000); /* 5 ms */
+
 		/* Step 2: Retrieve the first 8 bytes of the Device Descriptor to find the actual bMaxPacketSize0 */
 		console_write("xhci: get initial device descriptor (8 bytes)...\n");
 		if (ctrl_xfer(&dev, 0x80, 6, (1 << 8), 0, 8) == 0) {
@@ -925,9 +948,21 @@ static void usb_probe_port(u32 port, u32 speed)
 			console_write_dec(actual_mps);
 			console_write("\n");
 
+			/* USB 3.x spec Table 9-8: for SuperSpeed devices bMaxPacketSize0
+			 * is an exponent n such that MPS = 2^n (e.g. 9 → 512).  Decode
+			 * it before the validity check so we never log "invalid". */
+			if (speed == 4 && actual_mps <= 16) {
+				actual_mps = 1u << actual_mps; /* e.g. 9 → 512 */
+				console_write("xhci: SS exponent decoded MPS0=");
+				console_write_dec(actual_mps);
+				console_write("\n");
+			}
+
 			/* Validate bMaxPacketSize0 is reasonable for EP0 (8, 16, 32, 64, or 512 for SS) */
 			if (actual_mps != 8 && actual_mps != 16 && actual_mps != 32 && actual_mps != 64 && actual_mps != 512) {
-				console_write("xhci: invalid bMaxPacketSize0, using speed default\n");
+				console_write("xhci: invalid bMaxPacketSize0=");
+				console_write_dec(actual_mps);
+				console_write(", using speed default\n");
 				actual_mps = mps0_for_speed(speed);
 			}
 		} else {
@@ -955,14 +990,29 @@ static void usb_probe_port(u32 port, u32 speed)
 
 	if (use_two_step) {
 		/* Step 3: Update the EP0 context with the actual MaxPacketSize and evaluate the context */
-		console_write("xhci: evaluate context with actual MPS0...\n");
+		console_write("xhci: evaluate context with actual MPS0=");
+		console_write_dec(actual_mps);
+		console_write("...\n");
 
-		/* EP0 context (index 2): Update MPS0 */
+		/* Evaluate Context only needs EP0 in the Add context (A1).
+		 * Per xHCI spec §4.6.7, the Slot context (A0) is not required here.
+		 * Clear A0 to avoid confusing strict real-HW controllers. */
+		u32 *icc_eval = ctx_at(inctx, 0);
+		icc_eval[1] = (1u << 1); /* A1=EP0 only, A0=Slot cleared */
+
+		/* EP0 context (index 2): Update MPS0 and Average TRB Length.
+		 * Average TRB Length (DW4 bits[15:0]) should match MPS0 for control EPs. */
 		u32 *ep0 = ctx_at(inctx, 2);
 		ep0[1] = (ep0[1] & ~(0xFFFFu << 16)) | (actual_mps << 16);
+		ep0[4] = actual_mps; /* Average TRB Length = MPS0 */
 
 		int eval_res = cmd_exec(inctx_phys, 0, (TRB_EVAL_CONTEXT << TRB_TYPE_SHIFT) |
 		                        ((u32)slot << 24), 0);
+
+		/* MUST restore A0+A1 before Address Device BSR=0: that command requires
+		 * both Slot (A0) and EP0 (A1) in the Add context or the controller
+		 * returns CC_CONTEXT_STATE_ERROR (cc=5). */
+		icc_eval[1] = (1u << 0) | (1u << 1);
 		if (eval_res != CC_SUCCESS) {
 			console_write("xhci: evaluate context failed res=");
 			console_write_dec(eval_res);
