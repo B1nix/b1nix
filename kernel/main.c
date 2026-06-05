@@ -322,16 +322,35 @@ void kernel_main(usize arg0, usize arg1)
 				console_write("rootfs: virtio-blk0 mounted at /\n");
 				vfs_repopulate_after_root_mount();
 			} else {
-				if (!test_mode)
-					rc = vfs_mount("ram0", "/", "ext4", 0);
-				if (rc == 0) {
-					console_write("rootfs: ram0 mounted at / (Live CD)\n");
-					vfs_repopulate_after_root_mount();
-				} else {
-					char mount_err_buf[64];
-					snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, mount failed: %d\n", rc);
-					console_write(mount_err_buf);
-					vfs_repopulate_after_root_mount();
+				if (!test_mode) {
+					/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
+					struct block_device *root_dev = find_device_by_label("b1nix-root");
+					if (root_dev) {
+						const char *fs_types[] = {"ext4", "ext3", "ext2"};
+						for (int i = 0; i < 3; i++) {
+							rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+							if (rc == 0) {
+								char mounted_buf[96];
+								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, fs_types[i]);
+								console_write(mounted_buf);
+								vfs_repopulate_after_root_mount();
+								break;
+							}
+						}
+					}
+				}
+				if (rc != 0) {
+					if (!test_mode)
+						rc = vfs_mount("ram0", "/", "ext4", 0);
+					if (rc == 0) {
+						console_write("rootfs: ram0 mounted at / (Live CD)\n");
+						vfs_repopulate_after_root_mount();
+					} else {
+						char mount_err_buf[64];
+						snprintf(mount_err_buf, sizeof(mount_err_buf), "rootfs: staying on initramfs, mount failed: %d\n", rc);
+						console_write(mount_err_buf);
+						vfs_repopulate_after_root_mount();
+					}
 				}
 			}
 		}

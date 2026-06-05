@@ -1591,7 +1591,7 @@ int xhci_probe(void)
 	if (xhci_run_requested) {
 		console_write("xhci: waiting 1000ms for ports to settle...\n");
 		for (int i = 0; i < 1000; i++) {
-			if (i % 100 == 0) {
+			if (bootinfo_has_flag("b1nix.xhci.debug") && i % 100 == 0) {
 				console_write("xhci: waiting ");
 				console_write_dec(1000 - i);
 				console_write(" ms...\n");

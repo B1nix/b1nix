@@ -370,12 +370,14 @@ static int is_canonical_addr(u64 addr) {
 #endif
 }
 
+#include <b1nix/bootinfo.h>
+
 static void heap_grow(usize minimum_bytes) {
   static u64 grow_calls;
   usize pages = (minimum_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
   grow_calls++;
 
-  if (minimum_bytes >= 1024 * 1024 || is_power_of_two_u64(grow_calls)) {
+  if (bootinfo_has_flag("b1nix.debug.heap") && (minimum_bytes >= 1024 * 1024 || is_power_of_two_u64(grow_calls))) {
     console_write("[M26DIAG] kheap_grow call=");
     console_write_dec(grow_calls);
     console_write(" bytes=");

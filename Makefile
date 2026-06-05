@@ -643,8 +643,8 @@ root-image: userspace-install install-native-toolchain install-kernel-source
 	@ln -sfn . $(BUILD_DIR)/rootfs/persist
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
-	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
-	 $(MKE2FS) -t ext4 -q -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
+	 $(MKE2FS) -t ext4 -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
 
 check-tools:

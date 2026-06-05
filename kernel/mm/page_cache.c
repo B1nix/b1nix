@@ -5,6 +5,7 @@
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
 #include <string.h>
+#include <b1nix/bootinfo.h>
 
 #define PC_HASH_SIZE 1024
 
@@ -226,7 +227,7 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
   }
   unlock_pc();
 
-  if (invalidated > 0) {
+  if (bootinfo_has_flag("b1nix.debug.heap") && invalidated > 0) {
     console_write("[M26DIAG] pc_invalidate inode=0x");
     console_write_hex64((u64)(usize)inode);
     console_write(" pages=");
@@ -291,8 +292,8 @@ usize page_cache_evict(usize target_pages) {
   }
   
   unlock_pc();
-  if (evict_calls <= 16 || is_power_of_two_u64(evict_calls) ||
-      dirty_skipped > 0 || evicted < target_pages) {
+  if (bootinfo_has_flag("b1nix.debug.heap") && (evict_calls <= 16 || is_power_of_two_u64(evict_calls) ||
+      dirty_skipped > 0 || evicted < target_pages)) {
     console_write("[M26DIAG] pc_evict call=");
     console_write_dec(evict_calls);
     console_write(" target=");

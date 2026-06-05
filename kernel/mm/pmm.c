@@ -7,6 +7,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/lapic.h>   /* struct percpu + MAX_CPUS for the per-CPU PCP cache */
 #include <string.h>
+#include <b1nix/bootinfo.h>
 
 #define BITS_PER_BYTE 8
 
@@ -776,7 +777,7 @@ u64 pmm_alloc_frames(usize count) {
 
     // OOM. Reclaim and retry. Try evicting clean page-cache pages first.
     reclaim_attempts++;
-    if (reclaim_attempts <= 16 || is_power_of_two_u64(reclaim_attempts)) {
+    if (bootinfo_has_flag("b1nix.debug.heap") && (reclaim_attempts <= 16 || is_power_of_two_u64(reclaim_attempts))) {
       console_write("[M26DIAG] pmm_reclaim attempt=");
       console_write_dec(reclaim_attempts);
       console_write(" count=");
@@ -819,10 +820,12 @@ u64 pmm_alloc_frames(usize count) {
       extern u64 swap_evict_page(void);
       u64 evicted_frame = swap_evict_page();
       if (evicted_frame != 0) {
-        console_write("[M26DIAG] swap_evict frame=0x");
-        console_write_hex64(evicted_frame);
-        m26_diag_task();
-        console_write("\n");
+        if (bootinfo_has_flag("b1nix.debug.heap")) {
+          console_write("[M26DIAG] swap_evict frame=0x");
+          console_write_hex64(evicted_frame);
+          m26_diag_task();
+          console_write("\n");
+        }
         pmm_free_frame(evicted_frame);
         continue;
       }
