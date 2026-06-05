@@ -22,7 +22,7 @@ void exit(int status)
 		atexit_funcs[--atexit_count]();
 	}
 	syscall(SYS_EXIT, status, 0, 0, 0);
-	while (1);
+	__builtin_trap();
 }
 
 void abort(void)

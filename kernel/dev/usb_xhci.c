@@ -274,6 +274,7 @@ static void xhci_legacy_handoff(u32 hcc1)
 					console_write("xhci: handoff successful\n");
 				} else {
 					console_write("xhci: handoff timed out, forcing...\n");
+					wr8(cap_base, off + 2, 0);
 				}
 			} else {
 				console_write("xhci: OS already owns controller\n");
@@ -413,16 +414,17 @@ static int evt_wait_transfer(int target_slot, int target_dci, struct trb *out, i
 			u32 slot = (e.control >> 24) & 0xff;
 			u32 dci = (e.control >> 16) & 0x1f;
 			u8 cc = (u8)((e.status >> 24) & 0xff);
-			/* Log all events — verbose but essential for real-HW diagnosis. */
-			console_write("xhci: event type=");
-			console_write_dec(et);
-			console_write(" slot=");
-			console_write_dec(slot);
-			console_write(" dci=");
-			console_write_dec(dci);
-			console_write(" cc=");
-			console_write_dec(cc);
-			console_write("\n");
+			if (cc != CC_SUCCESS && cc != 13) {
+				console_write("xhci: event type=");
+				console_write_dec(et);
+				console_write(" slot=");
+				console_write_dec(slot);
+				console_write(" dci=");
+				console_write_dec(dci);
+				console_write(" cc=");
+				console_write_dec(cc);
+				console_write("\n");
+			}
 			if (et == TRB_EVT_TRANSFER) {
 				if ((int)slot == target_slot && (int)dci == target_dci) {
 					*out = e;
@@ -534,8 +536,8 @@ static int ctrl_xfer(struct usb_device *dev, u8 bmRequestType, u8 bRequest, u16 
 	ring_doorbell((u32)dev->slot, 1); /* EP0 DCI = 1 */
 
 	struct trb e;
-	/* 32 outer loops × ≤8 ms each = ≤256 ms; enough for slow real-HW devices. */
-	if (!evt_wait_transfer(dev->slot, 1, &e, 32))
+	/* 100 outer loops × ≤8 ms each = ≤800 ms; enough for slow real-HW devices. */
+	if (!evt_wait_transfer(dev->slot, 1, &e, 100))
 		return -1;
 	int cc = (int)((e.status >> 24) & 0xff);
 	return (cc == CC_SUCCESS || cc == 13 /* short packet */) ? 0 : -1;
@@ -584,25 +586,55 @@ static int reset_port(u32 port)
 	u32 portsc = rd32(op_base, off);
 	/* Preserve state, keep RW1C bits clear unless intentionally clearing PRC. */
 	wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | PORTSC_PR);
+	int reset_ok = 0;
 	for (int i = 0; i < 100000; i++) {
 		portsc = rd32(op_base, off);
 		if (portsc & PORTSC_PRC) {            /* reset complete */
 			/* Clear PRC (and only PRC) — write 0 to other RW1C bits to preserve them. */
-			wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK) | PORTSC_PRC);
-			/* Log PLS (Port Link State) for real-HW diagnostics.
-			 * PLS is bits [8:5]. After reset: 0=U0 (OK), 5=Rx.Detect (device missing),
-			 * 7=Polling (SS link training in progress). */
-			u32 pls = (portsc >> 5) & 0xf;
-			console_write("xhci: port reset done pls=");
-			console_write_dec(pls);
-			console_write(" ped=");
-			console_write_dec((portsc & PORTSC_PED) ? 1 : 0);
-			console_write("\n");
-			return (portsc & PORTSC_PED) ? 0 : -1;
+			wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | PORTSC_PRC);
+			reset_ok = 1;
+			break;
 		}
 		udelay(10);
 	}
-	return -1;
+
+	if (!reset_ok) {
+		return -1;
+	}
+
+	/* Wait up to 200ms for the port to become enabled (PED=1) or U0 (for USB3) */
+	for (int i = 0; i < 20000; i++) {
+		portsc = rd32(op_base, off);
+		if (portsc & PORTSC_PED) {
+			break;
+		}
+		u32 pls = (portsc >> 5) & 0xf;
+		if (pls == 6) { /* Inactive state, needs Warm Port Reset */
+			console_write("xhci: USB3 port inactive, issuing Warm Reset...\n");
+			wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | (1u << 31) /* WPR */);
+			/* Wait for WRC (Warm Port Reset Change, bit 19) to be set */
+			for (int k = 0; k < 20000; k++) {
+				portsc = rd32(op_base, off);
+				if (portsc & (1u << 19) /* WRC */) {
+					/* Clear WRC */
+					wr32(op_base, off, (portsc & ~PORTSC_RW1C_MASK & ~PORTSC_PED) | (1u << 19));
+					break;
+				}
+				udelay(10);
+			}
+		}
+		udelay(10);
+	}
+
+	portsc = rd32(op_base, off);
+	u32 pls = (portsc >> 5) & 0xf;
+	console_write("xhci: port reset done pls=");
+	console_write_dec(pls);
+	console_write(" ped=");
+	console_write_dec((portsc & PORTSC_PED) ? 1 : 0);
+	console_write("\n");
+
+	return (portsc & PORTSC_PED) ? 0 : -1;
 }
 
 static int bulk_xfer(struct usb_msc_device *msc, int is_in, void *buf, u64 buf_phys, u32 len)
@@ -870,10 +902,17 @@ static void usb_probe_port(u32 port, u32 speed)
 		console_write("xhci: port reset failed\n");
 		return;
 	}
+	udelay(300000); /* 300 ms recovery delay after reset (TRSTRCY) */
+
+	/* Read actual speed after reset completes. */
+	u32 portsc = rd32(op_base, XHCI_OP_PORTS + (port - 1) * 0x10);
+	speed = (portsc >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK;
+
 	console_write("xhci: port ");
 	console_write_dec(port);
-	console_write(" reset ok\n");
-	udelay(300000); /* 300 ms recovery delay after reset (TRSTRCY) */
+	console_write(" reset ok, actual speed=");
+	console_write_dec(speed);
+	console_write("\n");
 
 	console_write("xhci: enable slot...\n");
 	int slot = -1;
@@ -1106,13 +1145,7 @@ static void usb_probe_port(u32 port, u32 speed)
 	u8 kbd_ep_addr = 0, kbd_ep_interval = 0;
 	u16 kbd_ep_mps = 0;
 
-	/* Debug: Print config descriptor raw bytes. */
-	console_write("xhci: config descriptor raw bytes: ");
-	for (u16 idx = 0; idx < total; idx++) {
-		console_write_hex32(xfer_buf[idx]);
-		console_write(" ");
-	}
-	console_write("\n");
+
 
 	while (i + 2 <= total) {
 		u8 len = xfer_buf[i];
@@ -1328,12 +1361,12 @@ static void usb_enumerate_ports(void)
 {
 	for (u32 p = 1; p <= num_ports; p++) {
 		u32 portsc = rd32(op_base, XHCI_OP_PORTS + (p - 1) * 0x10);
-		console_write("xhci: port ");
-		console_write_dec(p);
-		console_write(" status=0x");
-		console_write_hex32(portsc);
-		console_write("\n");
 		if (portsc & PORTSC_CCS) {
+			console_write("xhci: port ");
+			console_write_dec(p);
+			console_write(" status=0x");
+			console_write_hex32(portsc);
+			console_write("\n");
 			u32 speed = (portsc >> PORTSC_SPEED_SHIFT) & PORTSC_SPEED_MASK;
 			usb_probe_port(p, speed);
 		}
@@ -1382,7 +1415,7 @@ int xhci_probe(void)
 	xhci_pci_set_d0(&pci);
 
 	u16 cmd = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
-	cmd |= 0x0006; /* memory space + bus master */
+	cmd |= 0x0406; /* memory space + bus master + interrupt disable */
 	pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, cmd);
 
 	u32 bar0 = pci_config_read32(pci.bus, pci.slot, pci.func, 0x10);
@@ -1522,6 +1555,7 @@ int xhci_probe(void)
 	erst[0] = evt_ring_phys;           /* segment base */
 	erst[1] = RING_LEN;                /* segment size (TRB count) */
 	wr32(rt_base, XHCI_IR0 + IR_ERSTSZ, 1);
+	wr32(rt_base, XHCI_IR0 + IR_IMAN, 0x00000001);
 	wr64(rt_base, XHCI_IR0 + IR_ERDP, evt_ring_phys);
 	wr64(rt_base, XHCI_IR0 + IR_ERSTBA, erst_phys);
 

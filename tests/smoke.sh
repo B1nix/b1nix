@@ -143,14 +143,14 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
 fi
 
 # Format with minimal ext4 features (metadata_csum, 64bit, flex_bg not supported by kernel driver)
-"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || {
-    "$MKE2FS" -t ext4 -q "$SATA_IMG" 2>/dev/null || {
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$SATA_IMG" 2>/dev/null || {
         echo "Error: Failed to format sata.img as ext4."
         exit 1
     }
 }
-"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || {
-    "$MKE2FS" -t ext4 -q "$NVME_IMG" 2>/dev/null || {
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$NVME_IMG" 2>/dev/null || {
         echo "Error: Failed to format nvme.img as ext4."
         exit 1
     }
@@ -744,8 +744,8 @@ fi
 echo ""
 echo "[TEST] M24b SMP work-stealing (-smp 4)..."
 # Re-create the disk images so the SMP boot starts from a clean state.
-"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || true
-"$MKE2FS" -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || true
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || true
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || true
 dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp.log"
 EXTRA_QEMU_ARGS="-smp 4"

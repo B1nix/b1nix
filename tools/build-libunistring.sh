@@ -52,8 +52,11 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 mkdir -p "$BUILD_DIR"
 (
   cd "$BUILD_DIR"
+  BUILD_TRIPLET="$("$SRC_DIR/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+  export cross_compiling=yes
   "$SRC_DIR/configure" \
     --host="$HOST_TRIPLET" \
+    --build="$BUILD_TRIPLET" \
     --prefix="$INSTALL_DIR" \
     --disable-shared --enable-static \
     --disable-nls \

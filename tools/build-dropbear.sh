@@ -82,8 +82,11 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
 if [ ! -f "$SRC_DIR/config.h" ]; then
 (
   cd "$SRC_DIR"
+  BUILD_TRIPLET="$("./config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+  export cross_compiling=yes
   ./configure \
     --host="$HOST_TRIPLET" \
+    --build="$BUILD_TRIPLET" \
     --disable-zlib \
     --disable-pam \
     --disable-syslog \

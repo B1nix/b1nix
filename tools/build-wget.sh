@@ -104,11 +104,14 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
 
 (
   cd "$BUILD_DIR"
+  BUILD_TRIPLET="$("$SRC_DIR/build-aux/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+  export cross_compiling=yes
   # PCRE2_CFLAGS/PCRE2_LIBS override pkg-config (absent in this cross env), so
   # configure trusts our static lib and defines HAVE_LIBPCRE2 -> --regex-type
   # pcre becomes available. Keep --disable-pcre (only PCRE2 is ported).
   "$SRC_DIR/configure" \
     --host="$HOST_TRIPLET" \
+    --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
     --with-ssl=openssl \
     --without-zlib \
