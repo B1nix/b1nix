@@ -40,6 +40,16 @@ INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
 INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
 INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
+INITRAMFS_SU_INC := $(BUILD_DIR)/initramfs_su.inc
+INITRAMFS_PASSWD_INC := $(BUILD_DIR)/initramfs_passwd.inc
+INITRAMFS_ID_INC := $(BUILD_DIR)/initramfs_id.inc
+INITRAMFS_WHOAMI_INC := $(BUILD_DIR)/initramfs_whoami.inc
+INITRAMFS_GROUPS_INC := $(BUILD_DIR)/initramfs_groups.inc
+INITRAMFS_USERADD_INC := $(BUILD_DIR)/initramfs_useradd.inc
+INITRAMFS_USERDEL_INC := $(BUILD_DIR)/initramfs_userdel.inc
+INITRAMFS_GROUPADD_INC := $(BUILD_DIR)/initramfs_groupadd.inc
+INITRAMFS_CHOWN_INC := $(BUILD_DIR)/initramfs_chown.inc
+INITRAMFS_CHMOD_INC := $(BUILD_DIR)/initramfs_chmod.inc
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
 	$(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) \
@@ -50,7 +60,10 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
 	$(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) \
 	$(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) \
-	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
+	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) \
+	$(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) \
+	$(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) \
+	$(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -301,7 +314,7 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) $(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) $(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) $(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC)
 
 # Arch guard for the SHARED userspace build dir.
 #
@@ -511,6 +524,57 @@ $(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/bin/m35_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m35_smoke_elf userspace/build/bin/m35_smoke > $@
+
+$(INITRAMFS_SU_INC): userspace/bin/su.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/su
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_su_elf userspace/build/bin/su > $@
+
+$(INITRAMFS_PASSWD_INC): userspace/bin/passwd.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/passwd
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_passwd_elf userspace/build/bin/passwd > $@
+
+$(INITRAMFS_ID_INC): userspace/bin/id.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/id
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_id_elf userspace/build/bin/id > $@
+
+$(INITRAMFS_WHOAMI_INC): userspace/bin/whoami.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/whoami
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_whoami_elf userspace/build/bin/whoami > $@
+
+$(INITRAMFS_GROUPS_INC): userspace/bin/groups.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/groups
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_groups_elf userspace/build/bin/groups > $@
+
+$(INITRAMFS_USERADD_INC): userspace/bin/useradd.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/useradd
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_useradd_elf userspace/build/bin/useradd > $@
+
+$(INITRAMFS_USERDEL_INC): userspace/bin/userdel.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/userdel
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_userdel_elf userspace/build/bin/userdel > $@
+
+$(INITRAMFS_GROUPADD_INC): userspace/bin/groupadd.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/groupadd
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_groupadd_elf userspace/build/bin/groupadd > $@
+
+$(INITRAMFS_CHOWN_INC): userspace/bin/chown.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/chown
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_chown_elf userspace/build/bin/chown > $@
+
+$(INITRAMFS_CHMOD_INC): userspace/bin/chmod.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/chmod
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_chmod_elf userspace/build/bin/chmod > $@
+
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──

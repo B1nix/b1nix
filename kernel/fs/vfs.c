@@ -18,6 +18,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
+#include <b1nix/posix.h>
 #include <stdio.h>
 #include <string.h>
 
@@ -86,7 +87,6 @@ static void copy_path(char *dst, usize dst_size, const char *src);
 static int split_parent_path(const char *path, char *parent_path, char *name);
 static int vfs_create_at_internal(const char *resolved_path, u32 mode);
 static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode);
-static int vfs_unlink_at_internal(const char *resolved_path);
 
 static struct vfs_fs *filesystems = NULL;
 
@@ -1891,21 +1891,69 @@ void vfs_init(void) {
 }
 
 void vfs_repopulate_after_root_mount(void) {
-  add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
-  add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
-  add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  struct vfs_node *node;
+
+  node = add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/dev/console", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0620;
+    node->inode->uid = 0;
+    node->inode->gid = 5; // group tty
+    vfs_node_put(node);
+  }
+
+  node = add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0666;
+    node->inode->uid = 0;
+    node->inode->gid = 5; // group tty
+    vfs_node_put(node);
+  }
+
+  node = add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0755;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
   tty_init_node();
 
-  add_node("/home", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/var", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt/ext1", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt/ext2", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
-  add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 01777; // Sticky bit + rwxrwxrwx
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = add_node("/var", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/ext1", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/ext2", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/ext3", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/ext4", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
+  node = add_node("/mnt/ext4nvme", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) vfs_node_put(node);
+
   vfs_unlink("/persist");
   vfs_rmdir("/persist");
   vfs_symlink("/", "/persist");
@@ -1917,7 +1965,33 @@ void vfs_repopulate_after_root_mount(void) {
     char dev_path[64];
     strcpy(dev_path, "/dev/");
     strcat(dev_path, dev->name);
-    add_node(dev_path, VFS_DEVICE, 0, 0, 0);
+    node = add_node(dev_path, VFS_DEVICE, 0, 0, 0);
+    if (node && !IS_ERR(node)) vfs_node_put(node);
+  }
+
+  // Shadow, passwd, group nodes (loaded from initramfs, exist on mount point or in VFS)
+  node = vfs_find_node("/etc/shadow");
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0600;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = vfs_find_node("/etc/passwd");
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0644;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = vfs_find_node("/etc/group");
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0644;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
   }
 }
 
@@ -1938,6 +2012,21 @@ int vfs_open_flags(const char *path, int flags) {
    * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
    * intercept the open before the path lookup. */
   if (strcmp(resolved, "/dev/ptmx") == 0) {
+    struct vfs_node *ptmx_node = vfs_find_node("/dev/ptmx");
+    if (!IS_ERR(ptmx_node)) {
+      int access_mask = 0;
+      if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+        access_mask |= W_OK;
+      if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+        access_mask |= R_OK;
+      const struct cred *cred = get_current_cred();
+      if (cred && !vfs_get_node_perm(ptmx_node, cred, (u32)access_mask)) {
+        vfs_node_put(ptmx_node);
+        kfree(resolved);
+        return -EACCES;
+      }
+      vfs_node_put(ptmx_node);
+    }
     int fd = pty_open_master(flags);
     kfree(resolved);
     return fd;
@@ -1948,6 +2037,21 @@ int vfs_open_flags(const char *path, int flags) {
       int idx = 0;
       for (const char *q = num; *q >= '0' && *q <= '9'; q++)
         idx = idx * 10 + (*q - '0');
+      struct vfs_node *pts_dir = vfs_find_node("/dev/pts");
+      if (!IS_ERR(pts_dir)) {
+        int access_mask = X_OK;
+        if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+          access_mask |= W_OK;
+        if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+          access_mask |= R_OK;
+        const struct cred *cred = get_current_cred();
+        if (cred && !vfs_get_node_perm(pts_dir, cred, (u32)access_mask)) {
+          vfs_node_put(pts_dir);
+          kfree(resolved);
+          return -EACCES;
+        }
+        vfs_node_put(pts_dir);
+      }
       int fd = pty_open_slave(idx, flags);
       kfree(resolved);
       return fd;
@@ -2773,6 +2877,12 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
   struct vfs_node *prev = 0, *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
+      if (cred && (parent->inode->mode & B1NIX_S_ISVTX)) {
+        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid) {
+          res = -EACCES;
+          goto out_unlock;
+        }
+      }
       if (is_rmdir) {
         if (child->inode->type != VFS_DIRECTORY) {
           res = -ENOTDIR;
@@ -2832,90 +2942,8 @@ out_unlock:
   return res;
 }
 
-static int vfs_unlink_at_internal(const char *resolved_path) {
-  int res = 0;
-  char *p_path = kmalloc(VFS_MAX_PATH);
-  char name[64];
-  if (!p_path)
-    return -ENOMEM;
-  if (split_parent_path(resolved_path, p_path, name) < 0) {
-    kfree(p_path);
-    return -EINVAL;
-  }
-
-  struct vfs_node *parent = vfs_find_node_internal(p_path, 1, 0);
-  if (IS_ERR(parent)) {
-    kfree(p_path);
-    return (int)PTR_ERR(parent);
-  }
-  kfree(p_path);
-
-  struct vfs_node *node = 0;
-  vfs_inode_lock(parent->inode);
-  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
-  if (mnt && (mnt->flags & MS_RDONLY)) {
-    res = -EROFS;
-    goto out_unlock;
-  }
-  node = find_child(parent, name);
-  if (!node) {
-    res = -ENOENT;
-    goto out_unlock;
-  }
-  /* find_child() returns with refcount incremented, caller owns it */
-  if (node->inode->type == VFS_DIRECTORY) {
-    res = -EISDIR;
-    goto out_unlock;
-  }
-
-  if (parent->inode->unlink_cb) {
-    int err = parent->inode->unlink_cb(parent, name);
-    if (err < 0) {
-      res = err;
-      goto out_unlock;
-    }
-  }
-
-  /* Remove from parent's children list under the vfs_tree_lock write side
-   * (M28-B). The walk-and-splice happens entirely inside the critical section
-   * so a concurrent find_child reader cannot observe a freed-or-spliced
-   * next_sibling. */
-  {
-    u64 _tlflags;
-    vfs_tree_write_acquire(&_tlflags);
-    struct vfs_node **prev = &parent->first_child;
-    while (*prev) {
-      if (*prev == node) {
-        *prev = node->next_sibling;
-        break;
-      }
-      prev = &(*prev)->next_sibling;
-    }
-    vfs_tree_write_release(_tlflags);
-  }
-
-  node->deleted = 1;
-  node->inode->nlink--;
-  if (node->inode)
-    icache_invalidate(node->inode->fs_id, node->inode->ino);
-  dcache_invalidate(parent, name);
-
-out_unlock:
-  if (node)
-    vfs_node_put(node);
-  vfs_inode_unlock(parent->inode);
-  vfs_node_put(parent);
-  return res;
-}
-
 int vfs_unlink(const char *path) {
-  char *resolved = kmalloc(VFS_MAX_PATH);
-  if (!resolved)
-    return -ENOMEM;
-  vfs_resolve_path(path, resolved);
-  int res = vfs_unlink_at_internal(resolved);
-  kfree(resolved);
-  return res;
+  return vfs_remove_node(path, 0);
 }
 
 int vfs_link(const char *target, const char *link_path) {
@@ -3160,6 +3188,14 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
     goto out_put_parents;
   }
 
+  const struct cred *cred = get_current_cred();
+  if (cred && (old_parent->inode->mode & B1NIX_S_ISVTX)) {
+    if (cred->euid != ROOT_UID && cred->euid != node->inode->uid && cred->euid != old_parent->inode->uid) {
+      res = -EACCES;
+      goto out_put_parents;
+    }
+  }
+
   /* Рекурсивная защита */
   struct vfs_node *tmp = new_parent;
   while (tmp) {
@@ -3208,6 +3244,12 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
   /* POSIX type-consistency checks */
   existing = find_child(new_parent, new_n);
   if (existing) {
+    if (cred && (new_parent->inode->mode & B1NIX_S_ISVTX)) {
+      if (cred->euid != ROOT_UID && cred->euid != existing->inode->uid && cred->euid != new_parent->inode->uid) {
+        res = -EACCES;
+        goto out_unlock;
+      }
+    }
     if (node->inode->type == VFS_DIRECTORY &&
         existing->inode->type != VFS_DIRECTORY) {
       res = -ENOTDIR;
@@ -3686,20 +3728,30 @@ int vfs_chmod(const char *path, u16 mode) {
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
+  int res = 0;
   const struct cred *cred = get_current_cred();
-  if (!cred)
-    return -EACCES;
+  if (!cred) {
+    res = -EACCES;
+    goto out;
+  }
 
   if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER))
-      return -EPERM;
+    if (!cred_has_cap(cred, CAP_FOWNER)) {
+      res = -EPERM;
+      goto out;
+    }
   }
 
   node->inode->mode = (node->inode->mode & ~07777) | (mode & 07777);
   vfs_update_times(node->inode, VFS_CTIME);
-  if (node->inode->setattr_cb)
-    return node->inode->setattr_cb(node);
-  return 0;
+  if (node->inode->setattr_cb) {
+    res = node->inode->setattr_cb(node);
+    goto out;
+  }
+
+out:
+  vfs_node_put(node);
+  return res;
 }
 
 int vfs_utime(const char *path, u64 atime, u64 mtime) {
@@ -3707,22 +3759,32 @@ int vfs_utime(const char *path, u64 atime, u64 mtime) {
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
+  int res = 0;
   const struct cred *cred = get_current_cred();
-  if (!cred)
-    return -EACCES;
+  if (!cred) {
+    res = -EACCES;
+    goto out;
+  }
 
   /* POSIX: setting explicit times needs ownership (or CAP_FOWNER). */
   if (cred->euid != ROOT_UID && cred->euid != node->inode->uid) {
-    if (!cred_has_cap(cred, CAP_FOWNER))
-      return -EPERM;
+    if (!cred_has_cap(cred, CAP_FOWNER)) {
+      res = -EPERM;
+      goto out;
+    }
   }
 
   node->inode->atime = atime;
   node->inode->mtime = mtime;
   node->inode->ctime = vfs_get_unix_time();
-  if (node->inode->setattr_cb)
-    return node->inode->setattr_cb(node);
-  return 0;
+  if (node->inode->setattr_cb) {
+    res = node->inode->setattr_cb(node);
+    goto out;
+  }
+
+out:
+  vfs_node_put(node);
+  return res;
 }
 
 int vfs_fchmod(int fd, u16 mode) {
@@ -3754,22 +3816,32 @@ int vfs_chown(const char *path, u16 uid, u16 gid) {
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
+  int res = 0;
   const struct cred *cred = get_current_cred();
-  if (!cred)
-    return -EACCES;
+  if (!cred) {
+    res = -EACCES;
+    goto out;
+  }
 
   /* Only root can change owner */
-  if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_CHOWN))
-    return -EPERM;
+  if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_CHOWN)) {
+    res = -EPERM;
+    goto out;
+  }
 
   if (uid != (u16)-1)
     node->inode->uid = uid;
   if (gid != (u16)-1)
     node->inode->gid = gid;
   vfs_update_times(node->inode, VFS_CTIME);
-  if (node->inode->setattr_cb)
-    return node->inode->setattr_cb(node);
-  return 0;
+  if (node->inode->setattr_cb) {
+    res = node->inode->setattr_cb(node);
+    goto out;
+  }
+
+out:
+  vfs_node_put(node);
+  return res;
 }
 
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl) {

@@ -65,6 +65,16 @@ BINARIES := \
 	$(BUILD)/bin/m32_pcre2_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
+	$(BUILD)/bin/su \
+	$(BUILD)/bin/passwd \
+	$(BUILD)/bin/id \
+	$(BUILD)/bin/whoami \
+	$(BUILD)/bin/groups \
+	$(BUILD)/bin/useradd \
+	$(BUILD)/bin/userdel \
+	$(BUILD)/bin/groupadd \
+	$(BUILD)/bin/chown \
+	$(BUILD)/bin/chmod \
 	$(BUILD)/bin/m30_pie
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))

@@ -678,17 +678,15 @@ char *getlogin(void) {
 }
 
 int getgroups(int size, gid_t list[]) {
-  (void)size;
-  (void)list;
-  return 0;
+  return _check_err(syscall(SYS_GETGROUPS, size, list));
 }
 
 int seteuid(uid_t uid) {
-  return _check_err(syscall(SYS_SETUID, uid));
+  return _check_err(syscall(SYS_SETEUID, uid));
 }
 
 int setegid(gid_t gid) {
-  return _check_err(syscall(SYS_SETGID, gid));
+  return _check_err(syscall(SYS_SETEGID, gid));
 }
 
 uid_t getuid(void) {

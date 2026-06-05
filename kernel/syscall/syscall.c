@@ -1758,6 +1758,66 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     struct cred *c = scheduler_get_current_cred();
     return c ? (u64)cred_set_gid(c, (u16)arg0) : (u64)-EACCES;
   }
+  case SYS_SETEUID: {
+    klog_info("audit: seteuid called");
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    int rc = cred_set_euid(c, (u16)arg0);
+    return rc == 0 ? 0 : (u64)-EPERM;
+  }
+  case SYS_SETEGID: {
+    klog_info("audit: setegid called");
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    int rc = cred_set_egid(c, (u16)arg0);
+    return rc == 0 ? 0 : (u64)-EPERM;
+  }
+  case SYS_GETGROUPS: {
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    int size = (int)arg0;
+    u32 *user_list = (u32 *)(usize)arg1;
+    if (size == 0) {
+      return (u64)c->ngroups;
+    }
+    if (size < c->ngroups) {
+      return (u64)-EINVAL;
+    }
+    if (!user_list) return (u64)-EFAULT;
+    u32 k_list[MAX_GROUPS];
+    for (int i = 0; i < c->ngroups && i < MAX_GROUPS; i++) {
+      k_list[i] = c->groups[i];
+    }
+    if (syscall_copyout(user_list, k_list, c->ngroups * sizeof(u32)) != 0) {
+      return (u64)-EFAULT;
+    }
+    return (u64)c->ngroups;
+  }
+  case SYS_SETGROUPS: {
+    klog_info("audit: setgroups called");
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    if (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SETGID)) {
+      return (u64)-EPERM;
+    }
+    usize size = (usize)arg0;
+    const u32 *user_list = (const u32 *)(usize)arg1;
+    if (size > MAX_GROUPS) {
+      return (u64)-EINVAL;
+    }
+    if (size > 0 && !user_list) return (u64)-EFAULT;
+    u32 k_list[MAX_GROUPS];
+    if (size > 0) {
+      if (syscall_copyin(k_list, user_list, size * sizeof(u32)) != 0) {
+        return (u64)-EFAULT;
+      }
+    }
+    for (usize i = 0; i < size; i++) {
+      c->groups[i] = (u16)k_list[i];
+    }
+    c->ngroups = (int)size;
+    return 0;
+  }
   case SYS_SLEEP:
     scheduler_sleep_ticks(arg0);
     return 0;

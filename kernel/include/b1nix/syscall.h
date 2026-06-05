@@ -143,6 +143,10 @@ enum {
 	SYS_GETSOCKNAME  = 116,
 	SYS_GETPEERNAME  = 117,
 	SYS_SHUTDOWN     = 118,
+	SYS_SETEUID      = 119,
+	SYS_SETEGID      = 120,
+	SYS_GETGROUPS    = 121,
+	SYS_SETGROUPS    = 122,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

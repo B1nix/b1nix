@@ -16,6 +16,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/klog.h>
@@ -49,6 +50,8 @@ struct pty {
   struct b1nix_winsize winsize;
   usize fg_pgrp;     /* foreground process group for job control + signals */
   usize session_id;  /* session that claimed this pty via TIOCSCTTY */
+  u16 uid;
+  u16 gid;
 };
 
 static struct pty ptys[PTY_MAX];
@@ -385,6 +388,10 @@ int pty_open_master(int flags) {
   p->slave_open = 0;
   pty_reset_termios(p);
 
+  const struct cred *cred = scheduler_get_current_cred();
+  p->uid = cred ? cred->euid : ROOT_UID;
+  p->gid = cred ? cred->egid : ROOT_GID;
+
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_PTY_MASTER);
   if (!h) {
     p->used = 0;
@@ -411,6 +418,16 @@ int pty_open_slave(int index, int flags) {
   struct pty *p = &ptys[index];
   if (!p->used || !p->master_open)
     return -ENXIO;
+
+  const struct cred *cred = scheduler_get_current_cred();
+  int access_mask = 0;
+  if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+    access_mask |= W_OK;
+  if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+    access_mask |= R_OK;
+
+  if (cred && !cred_can_access(cred, p->uid, p->gid, 0620, access_mask))
+    return -EACCES;
 
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_PTY_SLAVE);
   if (!h)

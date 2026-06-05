@@ -24,6 +24,13 @@ void uidgid_init(void)
     group_add(ROOT_GID, "root");
     group_add_member(ROOT_GID, ROOT_UID);
 
+    /* Create default groups */
+    group_add(5, "tty");
+    group_add(6, "disk");
+    group_add(7, "net");
+    group_add(10, "wheel");
+    group_add_member(10, ROOT_UID); /* Add root to wheel */
+
     /* Create default users */
     user_add(1, 1, "daemon");
     group_add(1, "daemon");
@@ -200,7 +207,8 @@ int cred_set_gid(struct cred *cred, u16 gid)
 int cred_set_egid(struct cred *cred, u16 egid)
 {
     if (!cred) return -1;
-    if (cred->egid != ROOT_GID && !cred_has_cap(cred, CAP_SETGID)) {
+    int is_privileged = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
+    if (!is_privileged) {
         if (egid != cred->gid && egid != cred->sgid && egid != cred->egid) {
             return -1;
         }

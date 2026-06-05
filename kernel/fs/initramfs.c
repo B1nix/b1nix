@@ -32,6 +32,17 @@
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
 #include "initramfs_dropbear.inc"
+#include "initramfs_su.inc"
+#include "initramfs_passwd.inc"
+#include "initramfs_id.inc"
+#include "initramfs_whoami.inc"
+#include "initramfs_groups.inc"
+#include "initramfs_useradd.inc"
+#include "initramfs_userdel.inc"
+#include "initramfs_groupadd.inc"
+#include "initramfs_chown.inc"
+#include "initramfs_chmod.inc"
+
 
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
@@ -88,6 +99,15 @@ static const char initramfs_passwd[] =
 static const char initramfs_shadow[] =
     "root:$b1$rootsalt$YLR0bb6kf/9n3oGVFfPVbAVfAqs.k/9jnNVshpAFNbj6hBY2OZmMg6Jav8muEuSt8vkIU8mahAr9KwerDzvv6Q:0:0:99999:7:::\n"
     "user:$b1$usersalt$BaxHIimflG4IPjGvD7HDPKcnI1nRIILqEKYNIyHy6iDPeyxWpyqT4p5Hir8Iauy.ZiTCnjIUPj1KKlgdLNBHXQ:0:0:99999:7:::\n";
+
+static const char initramfs_group[] =
+    "root:x:0:\n"
+    "daemon:x:1:\n"
+    "tty:x:5:\n"
+    "disk:x:6:\n"
+    "net:x:7:\n"
+    "wheel:x:10:root\n"
+    "users:x:1000:user\n";
 
 static const char initramfs_sshd_service[] =
     "#!/bin/sh\n"
@@ -499,6 +519,7 @@ static const struct initramfs_file files[] = {
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
+    {"/etc/group", initramfs_group, sizeof(initramfs_group) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/init.d/sshd", initramfs_sshd_service, sizeof(initramfs_sshd_service) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
@@ -519,6 +540,16 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m25_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m26-smoke", (const char *)vfs_m26_smoke_elf,
      sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/su", (const char *)vfs_su_elf, sizeof(vfs_su_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
+    {"/bin/passwd", (const char *)vfs_passwd_elf, sizeof(vfs_passwd_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
+    {"/bin/id", (const char *)vfs_id_elf, sizeof(vfs_id_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/whoami", (const char *)vfs_whoami_elf, sizeof(vfs_whoami_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/groups", (const char *)vfs_groups_elf, sizeof(vfs_groups_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/useradd", (const char *)vfs_useradd_elf, sizeof(vfs_useradd_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/userdel", (const char *)vfs_userdel_elf, sizeof(vfs_userdel_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/groupadd", (const char *)vfs_groupadd_elf, sizeof(vfs_groupadd_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/chown", (const char *)vfs_chown_elf, sizeof(vfs_chown_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/chmod", (const char *)vfs_chmod_elf, sizeof(vfs_chmod_elf), INITRAMFS_EXECUTABLE},
     TCC_INITRAMFS_FILES
 };
 

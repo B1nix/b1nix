@@ -85,8 +85,6 @@ static int test_setuid_elevate(void) {
   /* Parent: wait + check status. */
   int status = 0;
   syscall(SYS_WAITPID, pid, &status, 0);
-  /* WIFEXITED + WEXITSTATUS — b1nix encodes normal exit as
-   * (code & 0xFF) << 8. See scheduler_waitpid. */
   int code = (status >> 8) & 0xff;
   if (code == 0) {
     ok("setuid-elevate");
@@ -130,12 +128,174 @@ static int test_uid_syscalls(void) {
   return 0;
 }
 
+/* Verify unprivileged user cannot read /etc/shadow. */
+static int test_shadow_denied_for_user(void) {
+  int pid = (int)syscall(SYS_FORK);
+  if (pid < 0) { fail("shadow-denied-fork"); return -1; }
+  if (pid == 0) {
+    long rc = syscall(SYS_SETUID, 1000);
+    if (rc != 0) _exit(2);
+    int fd = open("/etc/shadow", O_RDONLY);
+    if (fd >= 0) {
+      close(fd);
+      _exit(1);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  syscall(SYS_WAITPID, pid, &status, 0);
+  int code = (status >> 8) & 0xff;
+  if (code == 0) {
+    ok("shadow-denied-user");
+    return 0;
+  }
+  fail("shadow-denied-user");
+  return -1;
+}
+
+/* Test seteuid/setegid behavior. */
+static int test_seteuid_setegid(void) {
+  long rc = syscall(SYS_SETEUID, 1000);
+  if (rc != 0) { fail("seteuid-1000"); return -1; }
+  if (syscall(SYS_GETEUID) != 1000) { fail("seteuid-get"); return -1; }
+  
+  rc = syscall(SYS_SETEUID, 0);
+  if (rc != 0) { fail("seteuid-0"); return -1; }
+  if (syscall(SYS_GETEUID) != 0) { fail("seteuid-get-0"); return -1; }
+  
+  ok("seteuid-setegid");
+  return 0;
+}
+
+/* Test getgroups/setgroups. */
+static int test_groups_syscalls(void) {
+  unsigned int list[3] = { 5, 10, 1000 };
+  long rc = syscall(SYS_SETGROUPS, 3, list);
+  if (rc != 0) { fail("setgroups"); return -1; }
+  
+  unsigned int read_list[32];
+  long count = syscall(SYS_GETGROUPS, 32, read_list);
+  if (count != 3) { fail("getgroups-count"); return -1; }
+  
+  int has_5 = 0, has_10 = 0, has_1000 = 0;
+  for (int i = 0; i < count; i++) {
+    if (read_list[i] == 5) has_5 = 1;
+    if (read_list[i] == 10) has_10 = 1;
+    if (read_list[i] == 1000) has_1000 = 1;
+  }
+  if (!has_5 || !has_10 || !has_1000) { fail("getgroups-verify"); return -1; }
+  
+  ok("groups-syscalls");
+  return 0;
+}
+
+/* Test sticky bit behavior on /tmp. */
+static int test_sticky_bit(void) {
+  unlink("/tmp/sticky_test"); // Clean up just in case
+  int pid = (int)syscall(SYS_FORK);
+  if (pid < 0) { fail("sticky-fork1"); return -1; }
+  if (pid == 0) {
+    if (syscall(SYS_SETUID, 1000) != 0) _exit(2);
+    int fd = open("/tmp/sticky_test", O_CREAT | O_WRONLY, 0644);
+    if (fd < 0) _exit(3);
+    write(fd, "test", 4);
+    close(fd);
+    _exit(0);
+  }
+  int status = 0;
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("sticky-create"); return -1; }
+  
+  pid = (int)syscall(SYS_FORK);
+  if (pid < 0) { fail("sticky-fork2"); return -1; }
+  if (pid == 0) {
+    if (syscall(SYS_SETUID, 1001) != 0) _exit(2);
+    int rc = unlink("/tmp/sticky_test");
+    _exit(rc == 0 ? 1 : 0);
+  }
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("sticky-unlink-denied"); return -1; }
+  
+  pid = (int)syscall(SYS_FORK);
+  if (pid < 0) { fail("sticky-fork3"); return -1; }
+  if (pid == 0) {
+    if (syscall(SYS_SETUID, 1000) != 0) _exit(2);
+    int rc = unlink("/tmp/sticky_test");
+    _exit(rc == 0 ? 0 : 1);
+  }
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("sticky-unlink-allowed"); return -1; }
+  
+  ok("sticky-bit");
+  return 0;
+}
+
+/* Test that unprivileged user cannot write to /etc/passwd. */
+static int test_passwd_write_denied(void) {
+  int pid = (int)syscall(SYS_FORK);
+  if (pid < 0) { fail("passwd-write-fork"); return -1; }
+  if (pid == 0) {
+    if (syscall(SYS_SETUID, 1000) != 0) _exit(2);
+    int fd = open("/etc/passwd", O_WRONLY);
+    if (fd >= 0) {
+      close(fd);
+      _exit(1);
+    }
+    _exit(0);
+  }
+  int status = 0;
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("passwd-write-denied"); return -1; }
+  ok("passwd-write-denied");
+  return 0;
+}
+
+/* Test basic commands execution. */
+static int test_commands(void) {
+  int pid = (int)syscall(SYS_FORK);
+  if (pid == 0) {
+    const char *argv[] = { "/bin/whoami", NULL };
+    syscall(SYS_EXECVE, "/bin/whoami", argv, NULL);
+    _exit(1);
+  }
+  int status = 0;
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("cmd-whoami"); return -1; }
+
+  pid = (int)syscall(SYS_FORK);
+  if (pid == 0) {
+    const char *argv[] = { "/bin/id", NULL };
+    syscall(SYS_EXECVE, "/bin/id", argv, NULL);
+    _exit(1);
+  }
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("cmd-id"); return -1; }
+
+  pid = (int)syscall(SYS_FORK);
+  if (pid == 0) {
+    const char *argv[] = { "/bin/groups", NULL };
+    syscall(SYS_EXECVE, "/bin/groups", argv, NULL);
+    _exit(1);
+  }
+  syscall(SYS_WAITPID, pid, &status, 0);
+  if (((status >> 8) & 0xff) != 0) { fail("cmd-groups"); return -1; }
+
+  ok("commands-exec");
+  return 0;
+}
+
 int main(void) {
   emit("M31-SEC: start\n");
-  if (test_uid_syscalls() != 0)    return 1;
-  if (test_shadow_readable() != 0) return 1;
-  if (test_setuid_elevate() != 0)  return 1;
-  if (test_setuid_denied() != 0)   return 1;
+  if (test_uid_syscalls() != 0)          return 1;
+  if (test_seteuid_setegid() != 0)       return 1;
+  if (test_groups_syscalls() != 0)       return 1;
+  if (test_shadow_readable() != 0)       return 1;
+  if (test_shadow_denied_for_user() != 0)return 1;
+  if (test_setuid_elevate() != 0)        return 1;
+  if (test_setuid_denied() != 0)         return 1;
+  if (test_passwd_write_denied() != 0)   return 1;
+  if (test_sticky_bit() != 0)            return 1;
+  if (test_commands() != 0)              return 1;
   emit("M31-SEC: done\n");
   return 0;
 }
