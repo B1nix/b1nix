@@ -139,10 +139,15 @@ To boot using this method on real hardware, specify the following parameters in 
 - `root=liveiso`: Requests the loopback mount flow.
 - `b1nix.xhci.run` (or `b1nix.xhci.enum`): Forces the native xHCI host controller driver to initialize and probe connected USB devices. Without this flag, xHCI is left uninitialized to prevent bios-handoff issues from breaking BIOS keyboard emulation.
 
-### Whole-Disk ISO vs Partition Probing
+### Whole-Disk ISO vs Partition Probing and Experimental exFAT Fallback
 
-Depending on how the USB drive is partitioned or written (e.g. raw hybrid ISO written via `dd` versus written to a specific partition), the kernel might see the ISO9660 filesystem on the whole disk (e.g. `usb0`) or on a partition (e.g. `usb0p1`).
-To handle this dynamically, the boot flow iterates through all registered block devices starting with `"usb"` (e.g., `usb0`, `usb0p1`, `usb1`) and attempts to mount each as `iso9660` at `/mnt/iso`. Probing succeeds at the first device that mounts successfully and contains `/boot/rootfs.img`.
+Depending on how the USB drive is partitioned or written (e.g., raw hybrid ISO written via `dd` versus written to an exFAT partition such as on Ventoy or a Windows-formatted flash drive), the kernel might see the filesystem on the whole disk (e.g., `usb0`) or on a partition (e.g., `usb0p1`).
+
+To support both configurations:
+1. The kernel first iterates through all registered USB block devices (`usb0`, `usb0p1`, `usb0p2`, etc.) trying to mount them as `iso9660`. Probing succeeds at the first device that mounts successfully and contains `/boot/rootfs.img`.
+2. If `iso9660` mounting fails or `/boot/rootfs.img` is not found, the kernel performs a fallback phase by attempting to mount each USB block device/partition as `exfat`. Probing succeeds at the first exFAT volume containing `/boot/rootfs.img`.
+
+Status: the exFAT driver and probing path are present as experimental read-only support, but the exFAT LiveCD flow is not yet verified end-to-end on real hardware and currently should not be treated as a working boot path. The reliable path remains raw `iso-live-ondemand` media. NTFS partitions are not supported yet.
 
 ### Timing and Retries
 

@@ -15,6 +15,7 @@
 #include <b1nix/ext2.h>
 #include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
+#include <b1nix/exfat.h>
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
@@ -260,6 +261,7 @@ void kernel_main(usize arg0, usize arg1)
 	nvme_init();
 	btrfs_init();
 	isofs_init();
+	exfat_init();
 	procfs_init();
 	sysfs_init();
 	filelock_init();
@@ -303,18 +305,49 @@ void kernel_main(usize arg0, usize arg1)
 					retries++;
 				}
 
+				int is_exfat = 0;
 				if (iso_dev) {
-					/* Try each USB block device (whole disk + partitions) in order */
+					/* Try each USB block device (whole disk + partitions) in order with iso9660 */
 					for (usize i = 0; i < blk_count(); i++) {
 						struct block_device *dev = blk_at(i);
 						if (dev && strncmp(dev->name, "usb", 3) == 0) {
 							rc = vfs_mount(dev->name, "/mnt/iso", "iso9660", 0);
 							if (rc == 0) {
-								snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
-								console_write("isofs: mounted ");
-								console_write(dev->name);
-								console_write(" at /mnt/iso\n");
-								break;
+								struct vfs_node *check = vfs_find_node("/mnt/iso/boot/rootfs.img");
+								if (!IS_ERR(check)) {
+									vfs_node_put(check);
+									snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
+									console_write("isofs: mounted ");
+									console_write(dev->name);
+									console_write(" at /mnt/iso\n");
+									break;
+								}
+								vfs_umount("/mnt/iso");
+								rc = -1;
+							}
+						}
+					}
+
+					/* If not found on iso9660, try exfat */
+					if (rc != 0) {
+						for (usize i = 0; i < blk_count(); i++) {
+							struct block_device *dev = blk_at(i);
+							if (dev && strncmp(dev->name, "usb", 3) == 0) {
+								rc = vfs_mount(dev->name, "/mnt/iso", "exfat", 0);
+								if (rc == 0) {
+									struct vfs_node *check = vfs_find_node("/mnt/iso/boot/rootfs.img");
+									if (!IS_ERR(check)) {
+										vfs_node_put(check);
+										is_exfat = 1;
+										snprintf(mounted_iso_name, sizeof(mounted_iso_name), "%s", dev->name);
+										console_write("exfat: mounted ");
+										console_write(dev->name);
+										console_write(" at /mnt/iso\n");
+										break;
+									}
+									vfs_umount("/mnt/iso");
+									rc = -1;
+								}
 							}
 						}
 					}
@@ -323,7 +356,11 @@ void kernel_main(usize arg0, usize arg1)
 				if (rc == 0) {
 					struct block_device *loop_dev = loop_register_file("/mnt/iso/boot/rootfs.img", "loop0");
 					if (loop_dev && !IS_ERR(loop_dev)) {
-						console_write("loop: loop0 backing /boot/rootfs.img\n");
+						if (is_exfat) {
+							console_write("livefile: loop0 backing /boot/rootfs.img\n");
+						} else {
+							console_write("loop: loop0 backing /boot/rootfs.img\n");
+						}
 						/* If we are running in test/smoke mode, we mount at /mnt/root
 						 * to keep the bootstrap initramfs as active root.
 						 * Otherwise (on real hardware or normal boots), we mount
@@ -337,17 +374,25 @@ void kernel_main(usize arg0, usize arg1)
 								console_write("rootfs: loop0 mounted at / as ext4\n");
 								vfs_repopulate_after_root_mount();
 								if (mounted_iso_name[0] != '\0') {
-									int iso_rc = vfs_mount(mounted_iso_name, "/mnt/iso", "iso9660", 0);
-									if (iso_rc == 0) {
-										console_write("isofs: remounted at /mnt/iso after root switch\n");
+									int remount_rc = vfs_mount(mounted_iso_name, "/mnt/iso", is_exfat ? "exfat" : "iso9660", 0);
+									if (remount_rc == 0) {
+										if (is_exfat) {
+											console_write("exfat: remounted at /mnt/iso after root switch\n");
+										} else {
+											console_write("isofs: remounted at /mnt/iso after root switch\n");
+										}
 									} else {
-										char iso_err_buf[80];
-										snprintf(iso_err_buf, sizeof(iso_err_buf), "isofs: remount after root switch failed: %d\n", iso_rc);
-										console_write(iso_err_buf);
+										char err_buf[80];
+										snprintf(err_buf, sizeof(err_buf), "%s: remount after root switch failed: %d\n", is_exfat ? "exfat" : "isofs", remount_rc);
+										console_write(err_buf);
 									}
 								}
 							}
-							console_write("M37-LIVEISO: ok isofs-loop-root\n");
+							if (is_exfat) {
+								console_write("M37-LIVEFILE: ok exfat-loop-root\n");
+							} else {
+								console_write("M37-LIVEISO: ok isofs-loop-root\n");
+							}
 						}
 					} else {
 						rc = -1;

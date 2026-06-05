@@ -126,6 +126,7 @@ struct usb_msc_device {
 	u32 out_cycle;
 	u32 block_size;
 	u64 block_count;
+	int single_block_io;
 	struct block_device bdev;
 };
 
@@ -154,6 +155,7 @@ static volatile u32 *db_array;    /* doorbell array             */
 static u32 ctx_bytes;             /* 32 or 64 (CSZ)             */
 static u32 num_ports;
 static int xhci_ready;
+static int xhci_msc_single_block_requested;
 
 static u64 *dcbaa;                /* device context base addr array */
 static struct trb *cmd_ring;     u64 cmd_ring_phys; u32 cmd_enq; u32 cmd_cycle;
@@ -784,11 +786,20 @@ static int msc_read_capacity(struct usb_msc_device *msc)
 	return -1;
 }
 
+static void msc_request_sense(struct usb_msc_device *msc)
+{
+	u8 cmd[6] = { 0x03, 0, 0, 0, 18, 0 };
+	u8 data[18];
+	(void)msc_exec_cmd(msc, cmd, 6, 1, data, sizeof(data));
+}
+
 static int msc_read_blocks(struct block_device *dev, u64 lba, u32 count, void *buffer)
 {
 	struct usb_msc_device *msc = (struct usb_msc_device *)dev->priv;
 	u32 max_blocks = PAGE_SIZE / msc->block_size;
 	if (max_blocks == 0) max_blocks = 1;
+	if (msc->single_block_io)
+		max_blocks = 1;
 
 	u8 *ptr = (u8 *)buffer;
 	u64 current_lba = lba;
@@ -805,13 +816,14 @@ static int msc_read_blocks(struct block_device *dev, u64 lba, u32 count, void *b
 			0
 		};
 		int ok = 0;
-		for (int retry = 0; retry < 3; retry++) {
-			if (msc_exec_cmd(msc, cmd, 10, 1, ptr, chunk * msc->block_size) == 0) {
-				ok = 1;
-				break;
+			for (int retry = 0; retry < 3; retry++) {
+				if (msc_exec_cmd(msc, cmd, 10, 1, ptr, chunk * msc->block_size) == 0) {
+					ok = 1;
+					break;
+				}
+				msc_request_sense(msc);
+				udelay(20000);
 			}
-			udelay(5000);
-		}
 		if (!ok) {
 			console_write("msc: read blocks failed lba=");
 			console_write_dec(current_lba);
@@ -830,6 +842,8 @@ static int msc_write_blocks(struct block_device *dev, u64 lba, u32 count, const 
 	struct usb_msc_device *msc = (struct usb_msc_device *)dev->priv;
 	u32 max_blocks = PAGE_SIZE / msc->block_size;
 	if (max_blocks == 0) max_blocks = 1;
+	if (msc->single_block_io)
+		max_blocks = 1;
 
 	const u8 *ptr = (const u8 *)buffer;
 	u64 current_lba = lba;
@@ -846,13 +860,14 @@ static int msc_write_blocks(struct block_device *dev, u64 lba, u32 count, const 
 			0
 		};
 		int ok = 0;
-		for (int retry = 0; retry < 3; retry++) {
-			if (msc_exec_cmd(msc, cmd, 10, 0, (void *)ptr, chunk * msc->block_size) == 0) {
-				ok = 1;
-				break;
+			for (int retry = 0; retry < 3; retry++) {
+				if (msc_exec_cmd(msc, cmd, 10, 0, (void *)ptr, chunk * msc->block_size) == 0) {
+					ok = 1;
+					break;
+				}
+				msc_request_sense(msc);
+				udelay(20000);
 			}
-			udelay(5000);
-		}
 		if (!ok) {
 			console_write("msc: write blocks failed lba=");
 			console_write_dec(current_lba);
@@ -1283,16 +1298,17 @@ static void usb_probe_port(u32 port, u32 speed)
 
 		msc_dev.slot = slot;
 		msc_dev.bulk_in_dci = in_dci;
-		msc_dev.bulk_out_dci = out_dci;
-		msc_dev.in_ring = dma_alloc(&msc_dev.in_ring_phys);
-		msc_dev.in_enq = 0; msc_dev.in_cycle = 1;
-		msc_dev.out_ring = dma_alloc(&msc_dev.out_ring_phys);
-		msc_dev.out_enq = 0; msc_dev.out_cycle = 1;
+			msc_dev.bulk_out_dci = out_dci;
+			msc_dev.in_ring = dma_alloc(&msc_dev.in_ring_phys);
+			msc_dev.in_enq = 0; msc_dev.in_cycle = 1;
+			msc_dev.out_ring = dma_alloc(&msc_dev.out_ring_phys);
+			msc_dev.out_enq = 0; msc_dev.out_cycle = 1;
+			msc_dev.single_block_io = xhci_msc_single_block_requested;
 
-		if (!msc_dev.in_ring || !msc_dev.out_ring) {
-			console_write("xhci: failed to allocate rings for mass storage\n");
-			return;
-		}
+			if (!msc_dev.in_ring || !msc_dev.out_ring) {
+				console_write("xhci: failed to allocate rings for mass storage\n");
+				return;
+			}
 
 		memset(inctx, 0, PAGE_SIZE);
 		u32 *icc = ctx_at(inctx, 0);
@@ -1341,11 +1357,13 @@ static void usb_probe_port(u32 port, u32 speed)
 			return;
 		}
 
-		console_write("usb: storage device initialized size=");
-		console_write_dec((msc_dev.block_count * msc_dev.block_size) / (1024 * 1024));
-		console_write(" MiB\n");
+			console_write("usb: storage device initialized size=");
+			console_write_dec((msc_dev.block_count * msc_dev.block_size) / (1024 * 1024));
+			console_write(" MiB\n");
+			if (msc_dev.single_block_io)
+				console_write("msc: single-block I/O mode enabled\n");
 
-		/* Register Block Device */
+			/* Register Block Device */
 		msc_dev.bdev.name = "usb0";
 		msc_dev.bdev.block_size = msc_dev.block_size;
 		msc_dev.bdev.block_count = msc_dev.block_count;
@@ -1385,14 +1403,19 @@ int xhci_probe(void)
 	}
 
 	char root_val[64];
+	root_val[0] = '\0';
 	int usb_root_requested = 0;
 	if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
-		if (strncmp(root_val, "LABEL=", 6) == 0 ||
+		if (strcmp(root_val, "liveiso") == 0 ||
+		    strncmp(root_val, "LABEL=", 6) == 0 ||
 		    strncmp(root_val, "UUID=", 5) == 0 ||
 		    strstr(root_val, "usb0") != NULL) {
 			usb_root_requested = 1;
 		}
 	}
+	xhci_msc_single_block_requested = bootinfo_has_flag("b1nix.usb.msc.single") ||
+	                                  bootinfo_has_flag("b1nix.usb.msc.safe") ||
+	                                  (root_val[0] != '\0' && strcmp(root_val, "liveiso") == 0);
 
 	int xhci_run_requested = bootinfo_has_flag("b1nix.xhci.run") ||
 	                         bootinfo_has_flag("b1nix.xhci.enum") ||
