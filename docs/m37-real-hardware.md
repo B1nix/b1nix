@@ -125,6 +125,8 @@ the rare board that still exposes an i8042.
 
 ## True On-Demand Live CD Booting from USB
 
+Status: parked. The raw ISO on-demand path works in QEMU and remains useful as a prototype, but it is not the current recommended real-hardware installer path. For now, prefer the RAM-backed `iso-live` flow for boot/install experiments, and return to on-demand media after M41 memory work, stronger filesystem diagnostics, and real-hardware USB storage recovery are in better shape.
+
 To avoid copying the entire `rootfs.img` into RAM, b1nix implements a Unix-like USB on-demand boot sequence:
 1. Probes xHCI controllers and registers USB mass storage devices.
 2. Mounts the ISO9660 filesystem on the USB device at `/mnt/iso`.
@@ -147,7 +149,7 @@ To support both configurations:
 1. The kernel first iterates through all registered USB block devices (`usb0`, `usb0p1`, `usb0p2`, etc.) trying to mount them as `iso9660`. Probing succeeds at the first device that mounts successfully and contains `/boot/rootfs.img`.
 2. If `iso9660` mounting fails or `/boot/rootfs.img` is not found, the kernel performs a fallback phase by attempting to mount each USB block device/partition as `exfat`. Probing succeeds at the first exFAT volume containing `/boot/rootfs.img`.
 
-Status: the exFAT driver and probing path are present as experimental read-only support, but the exFAT LiveCD flow is not yet verified end-to-end on real hardware and currently should not be treated as a working boot path. The reliable path remains raw `iso-live-ondemand` media. NTFS partitions are not supported yet.
+Status: the exFAT driver and probing path are present as experimental read-only support, but the exFAT LiveCD flow is not yet verified end-to-end on real hardware and currently should not be treated as a working boot path. NTFS partitions are not supported yet. This whole on-demand/livefile branch is parked until the memory/filesystem groundwork is stronger.
 
 ### Timing and Retries
 
