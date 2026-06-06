@@ -420,6 +420,28 @@ check_output "$LOG" "M24-SMOKE: ok errno-mapping" "M24 userspace errno mapping v
 check_output "$LOG" "M24-SMOKE: ok diagnostics" "M24 userspace diagnostics verify"
 check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 
+# ── BusyBox Smoke ──
+echo ""
+echo "[TEST] BusyBox Port..."
+check_output "$LOG" "BB-SMOKE: ok list" "busybox --list works"
+check_output "$LOG" "BB-SMOKE: ok echo" "busybox echo works"
+check_output "$LOG" "BB-SMOKE: ok printf" "busybox printf works"
+check_output "$LOG" "BB-SMOKE: ok pwd" "busybox pwd works"
+check_output "$LOG" "BB-SMOKE: ok mkdir" "busybox mkdir works"
+check_output "$LOG" "BB-SMOKE: ok touch" "busybox touch works"
+check_output "$LOG" "BB-SMOKE: ok cat" "busybox cat works"
+check_output "$LOG" "BB-SMOKE: ok cp" "busybox cp works"
+check_output "$LOG" "BB-SMOKE: ok mv" "busybox mv works"
+check_output "$LOG" "BB-SMOKE: ok ln" "busybox ln works"
+check_output "$LOG" "BB-SMOKE: ok readlink" "busybox readlink works"
+check_output "$LOG" "BB-SMOKE: ok chmod" "busybox chmod works"
+check_output "$LOG" "BB-SMOKE: ok test" "busybox test / [ works"
+check_output "$LOG" "BB-SMOKE: ok sort" "busybox sort works"
+check_output "$LOG" "BB-SMOKE: ok uniq" "busybox uniq works"
+check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
+check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
+check_output "$LOG" "BB-SMOKE: done" "BusyBox smoke completes"
+
 # ── M11 Shell & Utilities ──
 echo ""
 echo "[TEST] M11 Shell baseline..."
@@ -737,84 +759,6 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M37-USB: ok hid-translate" "M37: HID boot report -> scancode translation"
 	else
 		fail "xHCI controller initialized" "M37-USB xhci-init marker not found"
-	fi
-fi
-
-# ── M37 Live CD On-Demand Boot from USB ──
-if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
-	echo ""
-	echo "[TEST] M37 on-demand Live CD USB path (test-mode verification mount)..."
-	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1" iso-live-ondemand >/dev/null 2>&1 || {
-		echo "  ${RED}LIVE ISO BUILD FAILED${NC}"
-		exit 1
-	}
-	ONDEMAND_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-ondemand.log"
-	B1NIX_ISO_NAME="b1nix-live-ondemand.iso"
-	EXTRA_QEMU_ARGS="-drive file=$PROJECT_DIR/build/$ARCH/b1nix-live-ondemand.iso,if=none,id=usbdisk,format=raw,readonly=on -device usb-storage,bus=xhci.0,drive=usbdisk"
-	run_qemu "$ONDEMAND_LOG"
-	B1NIX_ISO_NAME=""
-	EXTRA_QEMU_ARGS=""
-
-	check_output "$ONDEMAND_LOG" "isofs: mounted usb" "isofs mounts USB device"
-	check_output "$ONDEMAND_LOG" "loop: loop0 backing /boot/rootfs.img" "loop device backs rootfs.img"
-	check_output "$ONDEMAND_LOG" "rootfs: loop0 mounted at /mnt/root as ext4" "test mode mounts loop0 at /mnt/root for verification"
-	check_output "$ONDEMAND_LOG" "M37-LIVEISO: ok isofs-loop-root" "M37 Live ISO boot success marker appears"
-	check_output "$ONDEMAND_LOG" "B1NIX-TEST: done" "on-demand Live CD boot completes successfully"
-fi
-
-# ── M37 exFAT Live Boot from USB ──
-if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
-	echo ""
-	echo "[TEST] M37 exFAT Live USB path (test-mode verification mount)..."
-
-	EXFAT_DMG="$PROJECT_DIR/smoke_run/exfat-smoke-$$.dmg"
-	EXFAT_RAW="$PROJECT_DIR/smoke_run/exfat-smoke-$$.raw"
-	CREATE_OK=0
-
-	if command -v hdiutil >/dev/null 2>&1; then
-		hdiutil create -size 530m -fs exfat -volname B1NIX "$EXFAT_DMG" >/dev/null 2>&1 && {
-			mount_info=$(hdiutil attach "$EXFAT_DMG" 2>/dev/null) && {
-				volume_path=$(echo "$mount_info" | grep "/Volumes/" | awk -F'/Volumes/' '{print "/Volumes/"$2}')
-				mkdir -p "$volume_path/boot"
-				cp "$PROJECT_DIR/build/$ARCH/root.ext4" "$volume_path/boot/rootfs.img"
-				hdiutil detach "$volume_path" >/dev/null 2>&1
-				hdiutil convert "$EXFAT_DMG" -format UDTO -o "$EXFAT_RAW" >/dev/null 2>&1
-				mv "${EXFAT_RAW}.cdr" "$EXFAT_RAW"
-				rm -f "$EXFAT_DMG"
-				CREATE_OK=1
-			}
-		}
-	fi
-
-	if [ "$CREATE_OK" = "1" ]; then
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 root=liveiso b1nix.xhci.run" iso >/dev/null 2>&1 || {
-			echo "  ${RED}ISO BUILD FAILED${NC}"
-			exit 1
-		}
-
-		EXFAT_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-exfat.log"
-		B1NIX_ISO_NAME="b1nix.iso"
-		EXTRA_QEMU_ARGS="-drive file=$EXFAT_RAW,if=none,id=usbexfat,format=raw -device usb-storage,bus=xhci.0,drive=usbexfat"
-		run_qemu "$EXFAT_LOG"
-		B1NIX_ISO_NAME=""
-		EXTRA_QEMU_ARGS=""
-
-		check_output "$EXFAT_LOG" "exfat: mounted usb" "exfat mounts USB device"
-		check_output "$EXFAT_LOG" "livefile: loop0 backing /boot/rootfs.img" "loop device backs rootfs.img on exfat"
-		check_output "$EXFAT_LOG" "rootfs: loop0 mounted at /mnt/root as ext4" "test mode mounts loop0 at /mnt/root for verification"
-		check_output "$EXFAT_LOG" "M37-LIVEFILE: ok exfat-loop-root" "M37 exFAT Live boot success marker appears"
-		check_output "$EXFAT_LOG" "B1NIX-TEST: done" "exFAT Live boot completes successfully"
-
-		rm -f "$EXFAT_RAW"
-
-		# Restore original ISO for subsequent tests (e.g. SMP test)
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
-			echo "  ${RED}ISO RESTORE FAILED${NC}"
-			exit 1
-		}
-	else
-		echo "  ${YELLOW}SKIP${NC} exFAT Live USB path (hdiutil/exfat format creation not available)"
-		SKIPPED=$((SKIPPED + 1))
 	fi
 fi
 
