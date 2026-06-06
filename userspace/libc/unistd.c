@@ -6,11 +6,15 @@
 #include <sys/time.h>
 #include <time.h>
 #include <sys/types.h>
+#include <sys/stat.h>
+#include <sys/utsname.h>
+#include <signal.h>
 #include <sys/socket.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #include <termios.h>
+#include <poll.h>
 #include <errno.h>
 
 int normalize_errno(long rc) {
@@ -347,6 +351,13 @@ struct tm *gmtime(const time_t *timep) {
   return &t;
 }
 
+struct tm *gmtime_r(const time_t *timep, struct tm *result) {
+  if (!timep || !result) return NULL;
+  seconds_to_tm(*timep, result);
+  result->tm_isdst = 0;
+  return result;
+}
+
 struct tm *localtime(const time_t *timep) {
   static struct tm t;
   if (!timep) return NULL;
@@ -358,6 +369,17 @@ struct tm *localtime(const time_t *timep) {
   t.tm_isdst = dst_on ? 1 : 0;
 
   return &t;
+}
+
+struct tm *localtime_r(const time_t *timep, struct tm *result) {
+  if (!timep || !result) return NULL;
+  tzset();
+  int std_offset_east = (int)(-timezone);
+  int dst_on = daylight ? is_dst_active(*timep, std_offset_east) : 0;
+  time_t local = *timep + (time_t)std_offset_east + (dst_on ? 3600 : 0);
+  seconds_to_tm(local, result);
+  result->tm_isdst = dst_on ? 1 : 0;
+  return result;
 }
 
 char *ctime(const time_t *timep) { return asctime(localtime(timep)); }
@@ -457,6 +479,10 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
     ms = (unsigned long)total;
   }
   return _check_err(syscall(SYS_SELECT, nfds, readfds, writefds, exceptfds, ms));
+}
+
+int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
+  return _check_err(syscall(SYS_POLL, fds, nfds, timeout));
 }
 
 int socket(int domain, int type, int protocol) {
@@ -885,4 +911,266 @@ void closelog(void) {
 int setlogmask(int mask) {
   (void)mask;
   return 0;
+}
+
+int utimes(const char *filename, const struct timeval times[2]) {
+  if (!times) {
+    return utime(filename, NULL);
+  }
+  struct utimbuf buf;
+  buf.actime = times[0].tv_sec;
+  buf.modtime = times[1].tv_sec;
+  return utime(filename, &buf);
+}
+
+int mknod(const char *pathname, mode_t mode, dev_t dev) {
+  (void)pathname;
+  (void)mode;
+  (void)dev;
+  errno = ENOSYS;
+  return -1;
+}
+
+int clock_settime(int clk_id, const struct timespec *tp) {
+  (void)clk_id;
+  (void)tp;
+  errno = EPERM;
+  return -1;
+}
+
+char *strptime(const char *buf, const char *format, struct tm *tm) {
+  const char *bp = buf;
+  const char *fp = format;
+
+  while (*fp) {
+    if (*fp == '%') {
+      fp++;
+      if (*fp == '\0') return NULL;
+
+      switch (*fp) {
+        case '%': {
+          if (*bp != '%') return NULL;
+          bp++;
+          break;
+        }
+        case 'Y': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 4) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0) return NULL;
+          tm->tm_year = val - 1900;
+          break;
+        }
+        case 'y': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0) return NULL;
+          if (val < 69) val += 100;
+          tm->tm_year = val;
+          break;
+        }
+        case 'm': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0 || val < 1 || val > 12) return NULL;
+          tm->tm_mon = val - 1;
+          break;
+        }
+        case 'd':
+        case 'e': {
+          if (*fp == 'e' && *bp == ' ') bp++;
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0 || val < 1 || val > 31) return NULL;
+          tm->tm_mday = val;
+          break;
+        }
+        case 'H': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0 || val < 0 || val > 23) return NULL;
+          tm->tm_hour = val;
+          break;
+        }
+        case 'M': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0 || val < 0 || val > 59) return NULL;
+          tm->tm_min = val;
+          break;
+        }
+        case 'S': {
+          int val = 0;
+          int len = 0;
+          while (*bp >= '0' && *bp <= '9' && len < 2) {
+            val = val * 10 + (*bp - '0');
+            bp++;
+            len++;
+          }
+          if (len == 0 || val < 0 || val > 60) return NULL;
+          tm->tm_sec = val;
+          break;
+        }
+        default: {
+          return NULL;
+        }
+      }
+      fp++;
+    } else if (*fp == ' ' || *fp == '\t' || *fp == '\r' || *fp == '\n') {
+      while (*bp == ' ' || *bp == '\t' || *bp == '\r' || *bp == '\n') {
+        bp++;
+      }
+      fp++;
+    } else {
+      if (*bp != *fp) return NULL;
+      bp++;
+      fp++;
+    }
+  }
+  return (char *)bp;
+}
+
+int symlink(const char *target, const char *linkpath) {
+  return _check_err(syscall(SYS_SYMLINK, target, linkpath));
+}
+
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
+  return _check_err(syscall(SYS_READLINK, pathname, buf, bufsiz));
+}
+
+int lchown(const char *path, uid_t owner, gid_t group) {
+  struct stat st;
+  if (lstat(path, &st) < 0) {
+    return -1;
+  }
+  if (S_ISLNK(st.st_mode)) {
+    errno = ENOSYS;
+    return -1;
+  }
+  return chown(path, owner, group);
+}
+
+int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
+  if (dirfd != AT_FDCWD) {
+    errno = ENOSYS;
+    return -1;
+  }
+
+  long long actime, modtime;
+  if (!times) {
+    actime = modtime = time(NULL);
+  } else {
+    struct timespec now;
+    int has_now = (times[0].tv_nsec == UTIME_NOW || times[1].tv_nsec == UTIME_NOW);
+    if (has_now) {
+      clock_gettime(CLOCK_REALTIME, &now);
+    }
+
+    struct stat st;
+    int has_omit = (times[0].tv_nsec == UTIME_OMIT || times[1].tv_nsec == UTIME_OMIT);
+    if (has_omit) {
+      int stat_res = (flags & AT_SYMLINK_NOFOLLOW) ? lstat(pathname, &st) : stat(pathname, &st);
+      if (stat_res < 0) {
+        return -1;
+      }
+    }
+
+    if (times[0].tv_nsec == UTIME_NOW) {
+      actime = now.tv_sec;
+    } else if (times[0].tv_nsec == UTIME_OMIT) {
+      actime = st.st_atime;
+    } else {
+      actime = times[0].tv_sec;
+    }
+
+    if (times[1].tv_nsec == UTIME_NOW) {
+      modtime = now.tv_sec;
+    } else if (times[1].tv_nsec == UTIME_OMIT) {
+      modtime = st.st_mtime;
+    } else {
+      modtime = times[1].tv_sec;
+    }
+  }
+
+  struct utimbuf buf;
+  buf.actime = actime;
+  buf.modtime = modtime;
+  return utime(pathname, &buf);
+}
+
+int futimens(int fd, const struct timespec times[2]) {
+  (void)fd;
+  (void)times;
+  errno = ENOSYS;
+  return -1;
+}
+
+int uname(struct utsname *buf) {
+  return _check_err(syscall(SYS_UNAME, buf));
+}
+
+int sigsuspend(const sigset_t *mask) {
+  (void)mask;
+  errno = ENOSYS;
+  return -1;
+}
+
+long sysconf(int name) {
+  if (name == _SC_CLK_TCK) {
+    return 100;
+  }
+  errno = EINVAL;
+  return -1;
+}
+
+pid_t vfork(void) {
+  return fork();
+}
+
+int fchdir(int fd) {
+  (void)fd;
+  errno = ENOSYS;
+  return -1;
+}
+
+int chroot(const char *path) {
+  (void)path;
+  errno = EPERM;
+  return -1;
+}
+
+int settimeofday(const struct timeval *tv, const struct timezone *tz) {
+  (void)tv;
+  (void)tz;
+  errno = EPERM;
+  return -1;
 }

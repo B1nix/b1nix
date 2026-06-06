@@ -30,6 +30,9 @@ extern "C" {
 #define SIGUSR2 20
 #define SIGSYS  21
 #define SIGTRAP 22
+#define SIGXCPU 24
+#define SIGXFSZ 25
+#define SIGVTALRM 26
 #define SIGWINCH 28
 #define NSIG    31
 
@@ -89,6 +92,7 @@ int sigdelset(sigset_t *set, int signum);
 int sigismember(const sigset_t *set, int signum);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
+int sigsuspend(const sigset_t *mask);
 int kill(int pid, int sig);
 #ifdef __cplusplus
 }

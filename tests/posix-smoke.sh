@@ -297,4 +297,77 @@ fi
 /bin/m13-smoke --m24 && echo "M24-SMOKE: ok errno-mapping" && echo "M24-SMOKE: ok diagnostics"
 
 echo "M22-POLISH: done"
+
+# ── Optional upstream BusyBox package smoke tests ──
+if [ -x /opt/busybox/bin/busybox ]; then
+  echo "BB-SMOKE: start"
+
+  # This source copy documents the generated initramfs script. The package is
+  # installed at /opt/busybox and never shadows the native /bin commands.
+  /opt/busybox/bin/busybox --list | grep -q "echo" && echo "BB-SMOKE: ok list"
+
+# 2. upstream BusyBox echo
+/opt/busybox/bin/busybox echo "hello bb" | grep -q "hello bb" && echo "BB-SMOKE: ok echo"
+
+# 3. upstream BusyBox printf
+/opt/busybox/bin/busybox printf "hello %s\n" bb | grep -q "hello bb" && echo "BB-SMOKE: ok printf"
+
+# 4. upstream BusyBox pwd
+/opt/busybox/bin/busybox pwd | grep -q "/" && echo "BB-SMOKE: ok pwd"
+
+# 5. upstream BusyBox mkdir
+/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir
+[ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok mkdir"
+
+# 6. upstream BusyBox touch
+/opt/busybox/bin/busybox touch /tmp/bb_dir/bb_file
+[ -f /tmp/bb_dir/bb_file ] && echo "BB-SMOKE: ok touch"
+
+# 7. upstream BusyBox cat
+echo "content123" > /tmp/bb_dir/bb_file
+/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file | grep -q "content123" && echo "BB-SMOKE: ok cat"
+
+# 8. upstream BusyBox cp
+/opt/busybox/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp
+/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q "content123" && [ -f /tmp/bb_dir/bb_file_cp ] && echo "BB-SMOKE: ok cp"
+
+# 9. upstream BusyBox mv
+/opt/busybox/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv
+[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q "content123" && echo "BB-SMOKE: ok mv"
+
+# 10. upstream BusyBox ln
+/opt/busybox/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk
+# Verify it resolves correctly
+/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q "content123" && echo "BB-SMOKE: ok ln"
+
+# 11. upstream BusyBox readlink
+/opt/busybox/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q "bb_file_mv" && echo "BB-SMOKE: ok readlink"
+
+# 12. upstream BusyBox chmod
+/opt/busybox/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv
+[ -x /tmp/bb_dir/bb_file_mv ] && echo "BB-SMOKE: ok chmod"
+
+# 13. upstream BusyBox test & [
+/opt/busybox/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /opt/busybox/bin/busybox [ -d /tmp/bb_dir ] && echo "BB-SMOKE: ok test"
+
+# 14. upstream BusyBox sort
+printf "b\nc\na\n" > /tmp/bb_dir/bb_sort
+/opt/busybox/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q "a" && echo "BB-SMOKE: ok sort"
+
+# 15. upstream BusyBox uniq
+printf "a\na\nb\n" > /tmp/bb_dir/bb_uniq
+/opt/busybox/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
+
+# 16. upstream BusyBox rm
+/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq
+[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo "BB-SMOKE: ok rm"
+
+# 17. upstream BusyBox rmdir
+/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file
+/opt/busybox/bin/busybox rmdir /tmp/bb_dir
+[ ! -d /tmp/bb_dir ] && echo "BB-SMOKE: ok rmdir"
+
+  echo "BB-SMOKE: done"
+fi
+
 echo "POSIX-SMOKE: done"

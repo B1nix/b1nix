@@ -45,10 +45,13 @@ long lseek(int fd, long offset, int whence);
 int execvp(const char *file, char *const argv[]);
 int execv(const char *pathname, char *const argv[]);
 int fork(void);
+pid_t vfork(void);
 int pipe(int pipefd[2]);
 int dup2(int oldfd, int newfd);
 int mkdir(const char *path, unsigned int mode);
 int chdir(const char *path);
+int fchdir(int fd);
+int chroot(const char *path);
 char *getcwd(char *buf, size_t size);
 int fsync(int fd);
 void sync(void);
@@ -168,6 +171,17 @@ static inline int isatty(int fd) {
 }
 
 char *getlogin(void);
+
+int symlink(const char *target, const char *linkpath);
+ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
+int lchown(const char *path, uid_t owner, gid_t group);
+
+#define _SC_CLK_TCK 2
+long sysconf(int name);
+
+extern char *optarg;
+extern int optind, opterr, optopt;
+int getopt(int argc, char *const argv[], const char *optstring);
 
 #ifdef __cplusplus
 }

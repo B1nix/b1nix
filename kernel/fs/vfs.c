@@ -2559,6 +2559,9 @@ struct vfs_node *vfs_find_node_by_fd(int fd) {
 }
 
 static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
+  if (strcmp(resolved_path, "/") == 0) {
+    return -EEXIST;
+  }
   int res = 0;
   char *p_path = kmalloc(VFS_MAX_PATH);
   char name[64];
@@ -2818,12 +2821,22 @@ isize vfs_lseek(int handle, isize offset, int whence) {
 static int split_parent_path(const char *path, char *parent_path, char *name) {
   if (!path || path[0] == '\0')
     return -1;
-  usize len = strlen(path);
+
+  char local_path[VFS_MAX_PATH];
+  strncpy(local_path, path, VFS_MAX_PATH);
+  local_path[VFS_MAX_PATH - 1] = '\0';
+
+  usize len = strlen(local_path);
+  while (len > 1 && local_path[len - 1] == '/') {
+    local_path[len - 1] = '\0';
+    len--;
+  }
+
   if (len == 0 || len >= 256)
     return -1;
   isize last_slash = -1;
   for (isize i = (isize)len - 1; i >= 0; i--) {
-    if (path[i] == '/') {
+    if (local_path[i] == '/') {
       last_slash = i;
       break;
     }
@@ -2832,7 +2845,7 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
   if (last_slash < 0) {
     parent_path[0] = '/';
     parent_path[1] = '\0';
-    memcpy(name, path, len + 1);
+    memcpy(name, local_path, len + 1);
     return 0;
   }
 
@@ -2842,10 +2855,10 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
     parent_path[0] = '/';
     parent_path[1] = '\0';
   } else {
-    memcpy(parent_path, path, (usize)last_slash);
+    memcpy(parent_path, local_path, (usize)last_slash);
     parent_path[last_slash] = '\0';
   }
-  memcpy(name, path + last_slash + 1, len - (usize)last_slash);
+  memcpy(name, local_path + last_slash + 1, len - (usize)last_slash);
   return 0;
 }
 

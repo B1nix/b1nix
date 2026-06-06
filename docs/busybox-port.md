@@ -1,0 +1,259 @@
+# Porting Upstream BusyBox 1.36.1 to b1nix (Stage 1)
+
+This document describes the initial phase of porting upstream BusyBox 1.36.1
+as a static, multicall ELF to the `b1nix` operating system.
+
+The upstream binary is intentionally kept separate from the native b1nix
+utilities. It is installed as `/opt/busybox/bin/busybox` and does not create
+links in `/bin`.
+
+Build the standalone package with:
+
+```sh
+make ARCH=x86_64 busybox-package
+```
+
+Embed and test it without replacing native commands with:
+
+```sh
+UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
+```
+
+## Enabled Applets
+
+The first phase configures the following **31 core applets**:
+
+- **Logic & Flow Control**: `true`, `false`, `yes`
+- **Output & Print**: `echo`, `printf`, `pwd`
+- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`
+- **Path Manipulation**: `basename`, `dirname`
+- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`
+- **Shell Builtins & Pipelines**: `test`, `[` (alias of test), `sort`, `uniq`
+
+## What b1nix Already Provides
+
+The port does not start from a minimal kernel. The following foundations are
+already implemented and smoke-tested on both `x86_64` and `i686`:
+
+- Processes: `fork`, `execve`, `waitpid`, credentials, supplementary groups,
+  sessions and process groups.
+- Signals: handlers, masks, delivery, process-group signals and job-control
+  stop signals.
+- Terminal support: console termios, PTYs, `openpty`, `forkpty`, controlling
+  PTYs, foreground process groups and window-size ioctls.
+- VFS: files, directories, hard links, symbolic links, rename, permissions,
+  ownership, timestamps, file locking, `statfs`, mounts and unmounts.
+- Filesystems: initramfs, ext2, ext3, ext4, FAT32, exFAT, ISO9660 and partial
+  Btrfs support.
+- Networking: IPv4, IPv6, TCP, UDP, Unix sockets, DNS, DHCP, NDP, `poll` and
+  `select`.
+- Runtime state: `/proc` process directories, memory/CPU information and a
+  small `/sys` tree.
+- Storage: block-device registry, MBR/GPT partition discovery, loop devices,
+  AHCI, NVMe and virtio block devices.
+
+Therefore the remaining work is not "implement the Linux ABI". BusyBox needs
+specific missing contracts exposed through normal libc/POSIX interfaces or,
+where the operation is inherently OS-specific, through a small b1nix BusyBox
+backend.
+
+## Concrete Remaining Interfaces
+
+### Required for a warning-clean base build
+
+- Add `<alloca.h>` or a supported `alloca` builtin declaration.
+- Add `getsid()` to the process/session syscall interface.
+- Add group database iteration: `setgrent`, `getgrent`, `endgrent`.
+- Add `hstrerror()` and complete the legacy resolver error interface.
+- Add `fseeko()` and `ftello()` with the same `off_t` width used by libc.
+- Fix BusyBox's `OFF_FMT` detection for b1nix, where `off_t` is `long long`
+  even on `x86_64`.
+- Remove the incorrect `noreturn` assumption reported while compiling the
+  upstream `test` applet.
+
+These warnings currently occur even though the affected library objects are not
+all reachable from the enabled Stage 1 applets. They must be fixed before
+enabling more applets because an implicit `hstrerror()` declaration can truncate
+a pointer on `x86_64`.
+
+### Required libc/POSIX semantics
+
+- Implement atomic `sigsuspend()` in the scheduler. The current libc correctly
+  returns `ENOSYS`; `ash` must not be enabled until this is real.
+- Implement `alarm()`; the current function is a no-op and cannot deliver
+  `SIGALRM`.
+- Implement `getrlimit()` and make `setrlimit()` report actual state instead of
+  an unconditional success.
+- Replace the placeholder `dup()`, `isatty()`, `access()` and `ftruncate()`
+  implementations with fd-table, VFS permission and truncate operations.
+- Complete `fnmatch()` support for `FNM_PATHNAME`, `FNM_PERIOD` and bracket
+  expressions.
+- Implement the declared `regcomp`, `regexec`, `regerror` and `regfree` API, or
+  adapt BusyBox to the already ported PCRE2 library.
+- Complete `utimensat`, `futimens` and `lchown`, including symlink and
+  nanosecond semantics.
+- Implement `fchdir`, `mknod` and `chroot`.
+- Add userspace wrappers and headers for `mount`, `umount`, mount enumeration
+  and mount flags. The kernel syscalls already exist.
+- Add `getopt_long` only for external software compatibility. BusyBox itself
+  primarily uses its internal `getopt32`.
+- Replace the no-op syslog functions with `/dev/log`, a kernel log interface,
+  or an explicitly documented b1nix logging backend.
+
+### Required kernel-visible state
+
+- Extend `/proc/<pid>/stat` to the field layout expected by upstream `ps` and
+  `top`; the current file only exposes pid, name, state and parent pid.
+- Add `/proc/<pid>/fd`, `/proc/mounts` (or `/proc/self/mounts`) and the required
+  `/proc/net/*` files.
+- Extend `/sys/class/block` with device name, size, partition relationship and
+  read-only state.
+- Extend `/sys/class/net` with interface name, flags, MTU, MAC and addresses.
+- Expose block size/capacity through a userspace ioctl or a b1nix-specific
+  query syscall. The information already exists in `struct block_device`.
+- Add loop-device attach/detach/status operations for upstream `losetup`.
+- Add interface enumeration/configuration operations for `ifconfig`, `ip` and
+  `route`. The current `struct ifreq` header exists, but socket ioctls do not.
+- Add raw ICMP sockets, or adapt upstream `ping` to `SYS_NET_PING`. TCP and UDP
+  sockets are already sufficient for `nc` and most of `wget`.
+- Complete controlling-terminal ownership for the physical console. PTYs
+  support `TIOCSCTTY`, but the console path currently relaxes the POSIX session
+  check and does not implement terminal reassignment.
+
+## Replacement Plan
+
+The replacement target is the command set currently dispatched by
+`kernel/user/busybox.c`, not every optional BusyBox applet.
+
+### Wave 1: low-risk utilities
+
+Enable and test:
+
+`ls`, `whoami`, `id`, `clear`, `stat`, `env`, `printenv`, `cut`, `tr`, `tee`,
+`cmp`, `seq`, `which` and `hexdump`.
+
+Most kernel support already exists. `hexdump` first needs `fseeko`; identity
+applets need the passwd/group API to be warning-clean.
+
+### Wave 2: text and traversal
+
+Enable:
+
+`grep`, `find`, `sed`, `awk`, `xargs` and `diff`.
+
+Finish regex and `fnmatch` before allowing these applets to replace native
+commands. Test recursive traversal, symlink loops, pathname matching and error
+exit statuses.
+
+### Wave 3: upstream `ash`
+
+The existing shell proves that pipes, redirection, `fork`/`exec`, process
+groups, PTYs and job-control signals work. Remaining blockers are:
+
+- atomic `sigsuspend`;
+- `getsid` and complete session validation;
+- physical-console `TIOCSCTTY`;
+- real resource-limit reporting;
+- focused tests for `SIGCHLD`, stopped jobs, orphaned groups and interrupted
+  waits.
+
+Install `ash` as `/opt/busybox/bin/ash` first. Do not replace `/bin/sh` until
+the complete POSIX and SSH PTY suites pass with it.
+
+### Wave 4: process and diagnostics
+
+Enable:
+
+`ps`, `top`, `free`, `uptime`, `dmesg`, `sysctl`, `kill`, `killall` and
+`pidof`.
+
+`free`, `uptime`, `kill` and `dmesg` need thin libc wrappers around facilities
+that already exist. `ps` and `top` require the expanded `/proc` layouts.
+Writable `sysctl` requires an explicit b1nix policy; read-only keys can be
+ported first.
+
+### Wave 5: mounts and storage
+
+Enable:
+
+`mount`, `umount`, `df`, `lsblk`, `blkid`, `fdisk` and `losetup`.
+
+Use the existing b1nix mount and block-device APIs. Provide a small BusyBox
+platform backend for device enumeration instead of reproducing unrelated Linux
+netlink/udev behavior. `fdisk` additionally needs raw block-device read/write
+access and geometry ioctls.
+
+### Wave 6: networking
+
+Enable `nc` and `wget` first because the normal socket stack already supports
+their core TCP/UDP paths. Then add:
+
+- interface query/configuration for `ifconfig`;
+- route and address operations for `ip` and `route`;
+- raw ICMP or a b1nix backend for `ping`;
+- `/proc/net` data for `netstat`.
+
+### Wave 7: privileged system applets
+
+Enable:
+
+`su`, `login`, `reboot`, `poweroff`, `halt`, `chroot`, `mknod`, `init` and
+eventually `mdev`.
+
+Credentials, passwd/shadow parsing and reboot commands already exist.
+`chroot`, device-node creation and a device-event model are still missing.
+`init` and `mdev` should be last because they change boot and device-management
+ownership rather than merely replacing a command.
+
+## Applet Promotion Rule
+
+Track every upstream applet through these states:
+
+1. `builds-warning-clean`
+2. `runs-from-/opt`
+3. `behavior-smoke-passed`
+4. `error-paths-passed`
+5. `x86_64-and-i686-passed`
+6. `full-suite-and-SMP-passed`
+7. `replaces-native`
+
+Only the final state may create a `/bin/<applet>` link. Keep the native
+implementation registered until the upstream applet has passed the full suite;
+this makes every replacement independently reversible.
+
+## Initial Libc Compatibility Work
+
+Stage 1 added the following headers and functions. Items described as partial
+below are sufficient for the currently enabled applets but are not considered
+complete compatibility contracts.
+
+### New Header Files
+- `byteswap.h`, `endian.h`, `features.h`, `fnmatch.h`, `libgen.h`, `malloc.h`, `paths.h`, `poll.h`, `regex.h`
+- `sys/sysmacros.h`, `sys/utsname.h`
+- `net/if.h`
+
+### Implemented Functions in `libb1nix`
+- **String Manipulation**: `stpcpy`, `strndup`, `strchrnul`, `mempcpy`
+- **I/O & Formatting**: `getline`, `vasprintf`, `asprintf`, `vdprintf`, `dprintf`
+- **Temporary Files**: `mkstemp`
+- **Path Resolution & Links**: `symlink`, `readlink`, `libgen.h` functions
+  (`basename`, `dirname`), and partial `fnmatch`
+- **System Information**: `uname`, `sysconf` (for `_SC_CLK_TCK`)
+- **Process & Signals**: `vfork` (implemented via `fork`)
+- **File Status & Times**: `utimes`, plus partial `utimensat` and `lchown`
+- **Multiplexing**: `poll`
+- **Time Utilities**: `gmtime_r`, `localtime_r`, `strptime`
+- **Fallback Stubs**: `mknod` (returns `ENOSYS`), `clock_settime` (returns `EPERM`), `futimens` (returns `ENOSYS`), `fchdir` (returns `ENOSYS`), `chroot` (returns `EPERM`), `settimeofday` (returns `EPERM`)
+- **Option Parsing**: short-option `getopt` with grouped options and BusyBox's
+  `optind = 0` reset convention. GNU permutation, optional arguments and
+  `getopt_long` are not implemented.
+
+## Key Integration and Bug Fixes
+
+1. **getopt reset**: BusyBox resets the option parser using `optind = 0`. The custom libc `getopt` implementation was updated to handle `optind == 0` correctly (resetting internal state and setting `optind = 1`), preventing command-line arguments from getting mismatched.
+2. **Trailing slash support in VFS**: `split_parent_path` in `kernel/fs/vfs.c` was updated to strip trailing slashes (except for `/`), allowing recursive creation of parent directories via BusyBox's `mkdir -p` (which internally executes `mkdir` calls on paths like `/tmp/`).
+
+Native commands should be replaced one applet at a time only after the
+upstream implementation passes the complete regression suite. Until the kernel
+can atomically replace a signal mask and wait, `sigsuspend()` returns `ENOSYS`
+instead of pretending to provide POSIX semantics.

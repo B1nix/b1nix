@@ -80,6 +80,9 @@ struct msghdr {
 
 #define SOCK_STREAM     1
 #define SOCK_DGRAM      2
+#define SOCK_RAW        3
+#define SOCK_RDM        4
+#define SOCK_SEQPACKET  5
 
 #define IPPROTO_IP      0
 #define IPPROTO_TCP     6
@@ -92,6 +95,7 @@ struct msghdr {
 #define SO_SNDBUF       7
 #define SO_RCVBUF       8
 #define SO_KEEPALIVE    9
+#define SO_BROADCAST    6
 #define SO_LINGER       13
 #define SO_REUSEPORT    15
 #define SO_ACCEPTCONN   30

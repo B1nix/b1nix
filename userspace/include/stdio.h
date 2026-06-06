@@ -31,6 +31,10 @@ int putchar(int c);
 int puts(const char *s);
 int snprintf(char *buf, size_t size, const char *fmt, ...);
 int fprintf(FILE *stream, const char *fmt, ...);
+int asprintf(char **strp, const char *fmt, ...);
+int vasprintf(char **strp, const char *fmt, va_list ap);
+int dprintf(int fd, const char *format, ...);
+int vdprintf(int fd, const char *format, va_list ap);
 int vfprintf(FILE *stream, const char *fmt, va_list ap);
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap);
 
@@ -165,6 +169,22 @@ static inline void rewind(FILE *stream) {
 static inline int getchar(void) {
     return fgetc(stdin);
 }
+
+ssize_t getline(char **lineptr, size_t *n, FILE *stream);
+
+static inline int getc_unlocked(FILE *stream) { return getc(stream); }
+static inline int getchar_unlocked(void) { return getchar(); }
+static inline int putc_unlocked(int c, FILE *stream) { return putc(c, stream); }
+static inline int putchar_unlocked(int c) { return putchar(c); }
+static inline int fgetc_unlocked(FILE *stream) { return fgetc(stream); }
+static inline int fputc_unlocked(int c, FILE *stream) { return fputc(c, stream); }
+static inline char *fgets_unlocked(char *s, int n, FILE *stream) { return fgets(s, n, stream); }
+static inline int fputs_unlocked(const char *s, FILE *stream) { return fputs(s, stream); }
+static inline int ferror_unlocked(FILE *stream) { return ferror(stream); }
+static inline int feof_unlocked(FILE *stream) { return feof(stream); }
+static inline int fflush_unlocked(FILE *stream) { return fflush(stream); }
+static inline void clearerr_unlocked(FILE *stream) { clearerr(stream); }
+static inline int fileno_unlocked(FILE *stream) { return fileno(stream); }
 
 #ifdef __cplusplus
 }

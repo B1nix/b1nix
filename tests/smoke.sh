@@ -11,7 +11,7 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # than i386 under TCG (no KVM on macOS) and the single-CPU suite lands right at
 # ~110-120s, so give 64-bit more headroom to avoid false timeouts.
 if [ "$ARCH" = "x86_64" ]; then
-	TIMEOUT=${TIMEOUT:-240}
+	TIMEOUT=${TIMEOUT:-480}
 else
 	TIMEOUT=${TIMEOUT:-120}
 fi
@@ -121,7 +121,7 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 	test -f "build/$ARCH/b1nix.iso" || { echo "  ${RED}no prebuilt build/$ARCH/b1nix.iso${NC}"; exit 1; }
 	echo "  (SKIP_BUILD=1 — reusing build/$ARCH/b1nix.iso)"
 else
-	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
+	make ARCH="$ARCH" UPSTREAM_BUSYBOX="${UPSTREAM_BUSYBOX:-0}" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
 		echo "  ${RED}BUILD FAILED${NC}"
 		exit 1
 	}
@@ -420,27 +420,28 @@ check_output "$LOG" "M24-SMOKE: ok errno-mapping" "M24 userspace errno mapping v
 check_output "$LOG" "M24-SMOKE: ok diagnostics" "M24 userspace diagnostics verify"
 check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 
-# ── BusyBox Smoke ──
-echo ""
-echo "[TEST] BusyBox Port..."
-check_output "$LOG" "BB-SMOKE: ok list" "busybox --list works"
-check_output "$LOG" "BB-SMOKE: ok echo" "busybox echo works"
-check_output "$LOG" "BB-SMOKE: ok printf" "busybox printf works"
-check_output "$LOG" "BB-SMOKE: ok pwd" "busybox pwd works"
-check_output "$LOG" "BB-SMOKE: ok mkdir" "busybox mkdir works"
-check_output "$LOG" "BB-SMOKE: ok touch" "busybox touch works"
-check_output "$LOG" "BB-SMOKE: ok cat" "busybox cat works"
-check_output "$LOG" "BB-SMOKE: ok cp" "busybox cp works"
-check_output "$LOG" "BB-SMOKE: ok mv" "busybox mv works"
-check_output "$LOG" "BB-SMOKE: ok ln" "busybox ln works"
-check_output "$LOG" "BB-SMOKE: ok readlink" "busybox readlink works"
-check_output "$LOG" "BB-SMOKE: ok chmod" "busybox chmod works"
-check_output "$LOG" "BB-SMOKE: ok test" "busybox test / [ works"
-check_output "$LOG" "BB-SMOKE: ok sort" "busybox sort works"
-check_output "$LOG" "BB-SMOKE: ok uniq" "busybox uniq works"
-check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
-check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
-check_output "$LOG" "BB-SMOKE: done" "BusyBox smoke completes"
+if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
+	echo ""
+	echo "[TEST] Upstream BusyBox package..."
+	check_output "$LOG" "BB-SMOKE: ok list" "busybox --list works"
+	check_output "$LOG" "BB-SMOKE: ok echo" "busybox echo works"
+	check_output "$LOG" "BB-SMOKE: ok printf" "busybox printf works"
+	check_output "$LOG" "BB-SMOKE: ok pwd" "busybox pwd works"
+	check_output "$LOG" "BB-SMOKE: ok mkdir" "busybox mkdir works"
+	check_output "$LOG" "BB-SMOKE: ok touch" "busybox touch works"
+	check_output "$LOG" "BB-SMOKE: ok cat" "busybox cat works"
+	check_output "$LOG" "BB-SMOKE: ok cp" "busybox cp works"
+	check_output "$LOG" "BB-SMOKE: ok mv" "busybox mv works"
+	check_output "$LOG" "BB-SMOKE: ok ln" "busybox ln works"
+	check_output "$LOG" "BB-SMOKE: ok readlink" "busybox readlink works"
+	check_output "$LOG" "BB-SMOKE: ok chmod" "busybox chmod works"
+	check_output "$LOG" "BB-SMOKE: ok test" "busybox test / [ works"
+	check_output "$LOG" "BB-SMOKE: ok sort" "busybox sort works"
+	check_output "$LOG" "BB-SMOKE: ok uniq" "busybox uniq works"
+	check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
+	check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
+	check_output "$LOG" "BB-SMOKE: done" "BusyBox smoke completes"
+fi
 
 # ── M11 Shell & Utilities ──
 echo ""

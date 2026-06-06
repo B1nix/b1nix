@@ -680,3 +680,104 @@ FILE *tmpfile(void) {
     return NULL;
   return fopen(name, "w+");
 }
+
+ssize_t getline(char **lineptr, size_t *n, FILE *stream) {
+  if (!lineptr || !n || !stream) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  if (!*lineptr) {
+    *n = 128;
+    *lineptr = malloc(*n);
+    if (!*lineptr) {
+      return -1;
+    }
+  }
+
+  size_t pos = 0;
+  while (1) {
+    int c = fgetc(stream);
+    if (c == EOF) {
+      if (pos == 0) {
+        return -1;
+      }
+      break;
+    }
+
+    if (pos + 1 >= *n) {
+      size_t new_n = *n * 2;
+      char *new_ptr = realloc(*lineptr, new_n);
+      if (!new_ptr) {
+        return -1;
+      }
+      *lineptr = new_ptr;
+      *n = new_n;
+    }
+
+    (*lineptr)[pos++] = (char)c;
+    if (c == '\n') {
+      break;
+    }
+  }
+
+  (*lineptr)[pos] = '\0';
+  return (ssize_t)pos;
+}
+
+int vasprintf(char **strp, const char *fmt, va_list ap) {
+  va_list ap_copy;
+  va_copy(ap_copy, ap);
+  int len = vsnprintf(NULL, 0, fmt, ap_copy);
+  va_end(ap_copy);
+  if (len < 0) return -1;
+
+  char *buf = malloc((size_t)len + 1);
+  if (!buf) return -1;
+
+  int r = vsnprintf(buf, (size_t)len + 1, fmt, ap);
+  if (r < 0) {
+    free(buf);
+    return -1;
+  }
+  *strp = buf;
+  return r;
+}
+
+int asprintf(char **strp, const char *fmt, ...) {
+  va_list ap;
+  va_start(ap, fmt);
+  int r = vasprintf(strp, fmt, ap);
+  va_end(ap);
+  return r;
+}
+
+#include <errno.h>
+
+int vdprintf(int fd, const char *format, va_list ap) {
+  char *buf = NULL;
+  int r = vasprintf(&buf, format, ap);
+  if (r < 0) return -1;
+  int written = 0;
+  while (written < r) {
+    ssize_t nw = write(fd, buf + written, (size_t)(r - written));
+    if (nw < 0) {
+      if (errno == EINTR) continue;
+      free(buf);
+      return -1;
+    }
+    if (nw == 0) break;
+    written += (int)nw;
+  }
+  free(buf);
+  return written;
+}
+
+int dprintf(int fd, const char *format, ...) {
+  va_list ap;
+  va_start(ap, format);
+  int r = vdprintf(fd, format, ap);
+  va_end(ap);
+  return r;
+}
+

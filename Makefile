@@ -50,6 +50,14 @@ INITRAMFS_USERDEL_INC := $(BUILD_DIR)/initramfs_userdel.inc
 INITRAMFS_GROUPADD_INC := $(BUILD_DIR)/initramfs_groupadd.inc
 INITRAMFS_CHOWN_INC := $(BUILD_DIR)/initramfs_chown.inc
 INITRAMFS_CHMOD_INC := $(BUILD_DIR)/initramfs_chmod.inc
+INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
+INITRAMFS_BUSYBOX_MODE := $(BUILD_DIR)/upstream_busybox_mode
+UPSTREAM_BUSYBOX ?= 0
+ifeq ($(UPSTREAM_BUSYBOX),1)
+UPSTREAM_BUSYBOX_DEPS := $(INITRAMFS_BUSYBOX_INC)
+else
+UPSTREAM_BUSYBOX_DEPS :=
+endif
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
 	$(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) \
@@ -63,7 +71,8 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
 	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) \
 	$(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) \
 	$(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) \
-	$(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC)
+	$(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC) \
+	$(UPSTREAM_BUSYBOX_DEPS)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -317,7 +326,14 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) $(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) $(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) $(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) $(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) $(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) $(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC) $(UPSTREAM_BUSYBOX_DEPS) $(INITRAMFS_BUSYBOX_MODE)
+$(BUILD_DIR)/kernel/fs/initramfs.o: INSTRUMENT_FLAGS += -include $(abspath $(INITRAMFS_BUSYBOX_MODE))
+
+$(INITRAMFS_BUSYBOX_MODE): FORCE
+	@mkdir -p $(dir $@)
+	@printf '#define B1NIX_UPSTREAM_BUSYBOX %s\n' '$(UPSTREAM_BUSYBOX)' > $@.tmp
+	@cmp -s $@.tmp $@ 2>/dev/null || cp $@.tmp $@
+	@rm -f $@.tmp
 
 # Arch guard for the SHARED userspace build dir.
 #
@@ -578,6 +594,12 @@ $(INITRAMFS_CHMOD_INC): userspace/bin/chmod.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_chmod_elf userspace/build/bin/chmod > $@
 
+$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_upstream_busybox_elf build/busybox-b1nix/$(B1NIX_TRIPLET)/busybox > $@
+
+
 
 
 # ── AP Trampoline (flat binary linked at 0x8000) ──
@@ -655,6 +677,12 @@ userspace:
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
+
+busybox-package:
+	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
+
+busybox-iso: UPSTREAM_BUSYBOX=1
+busybox-iso: iso
 
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
@@ -757,4 +785,4 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source
+.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install busybox-package busybox-iso iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source

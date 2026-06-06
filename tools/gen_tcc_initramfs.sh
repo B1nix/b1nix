@@ -10,6 +10,8 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+USERSPACE_BUILD="userspace/build/$B1NIX_ARCH"
 
 cd "$PROJECT_DIR"
 
@@ -22,13 +24,13 @@ echo "" >> "$OUT"
 
 # 1. Package key files using xxd
 echo "Packing /bin/tcc..." >&2
-xxd -i -n vfs_tcc_elf userspace/build/bin/tcc >> "$OUT"
+xxd -i -n vfs_tcc_elf "$USERSPACE_BUILD/bin/tcc" >> "$OUT"
 
 echo "Packing /lib/crt0.o..." >&2
-xxd -i -n vfs_crt0_o userspace/build/crt/crt0.o >> "$OUT"
+xxd -i -n vfs_crt0_o "$USERSPACE_BUILD/crt/crt0.o" >> "$OUT"
 
 echo "Packing /lib/libb1nix.a..." >&2
-xxd -i -n vfs_libb1nix_a userspace/build/libb1nix.a >> "$OUT"
+xxd -i -n vfs_libb1nix_a "$USERSPACE_BUILD/libb1nix.a" >> "$OUT"
 
 # 2. Package standard headers
 echo "Packing userspace/include/*.h..." >&2

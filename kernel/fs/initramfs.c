@@ -42,6 +42,10 @@
 #include "initramfs_groupadd.inc"
 #include "initramfs_chown.inc"
 #include "initramfs_chmod.inc"
+#if B1NIX_UPSTREAM_BUSYBOX
+#include "initramfs_busybox.inc"
+#endif
+
 
 
 static const unsigned char vfs_init_elf[] = {
@@ -443,6 +447,40 @@ static const char posix_smoke_script[] =
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
     "echo \"M22-POLISH: done\"\n"
+#if B1NIX_UPSTREAM_BUSYBOX
+    "# ── Upstream BusyBox package smoke tests ──\n"
+    "echo \"BB-SMOKE: start\"\n"
+    "/opt/busybox/bin/busybox --list | grep -q \"echo\" && echo \"BB-SMOKE: ok list\"\n"
+    "/opt/busybox/bin/busybox echo \"hello bb\" | grep -q \"hello bb\" && echo \"BB-SMOKE: ok echo\"\n"
+    "/opt/busybox/bin/busybox printf \"hello %s\\\\n\" bb | grep -q \"hello bb\" && echo \"BB-SMOKE: ok printf\"\n"
+    "/opt/busybox/bin/busybox pwd | grep -q \"/\" && echo \"BB-SMOKE: ok pwd\"\n"
+    "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir\n"
+    "[ -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok mkdir\"\n"
+    "/opt/busybox/bin/busybox touch /tmp/bb_dir/bb_file\n"
+    "[ -f /tmp/bb_dir/bb_file ] && echo \"BB-SMOKE: ok touch\"\n"
+    "echo \"content123\" > /tmp/bb_dir/bb_file\n"
+    "/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file | grep -q \"content123\" && echo \"BB-SMOKE: ok cat\"\n"
+    "/opt/busybox/bin/busybox cp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file_cp\n"
+    "/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_cp | grep -q \"content123\" && [ -f /tmp/bb_dir/bb_file_cp ] && echo \"BB-SMOKE: ok cp\"\n"
+    "/opt/busybox/bin/busybox mv /tmp/bb_dir/bb_file_cp /tmp/bb_dir/bb_file_mv\n"
+    "[ ! -f /tmp/bb_dir/bb_file_cp ] && [ -f /tmp/bb_dir/bb_file_mv ] && /opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_mv | grep -q \"content123\" && echo \"BB-SMOKE: ok mv\"\n"
+    "/opt/busybox/bin/busybox ln -s /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk\n"
+    "/opt/busybox/bin/busybox cat /tmp/bb_dir/bb_file_lnk | grep -q \"content123\" && echo \"BB-SMOKE: ok ln\"\n"
+    "/opt/busybox/bin/busybox readlink /tmp/bb_dir/bb_file_lnk | grep -q \"bb_file_mv\" && echo \"BB-SMOKE: ok readlink\"\n"
+    "/opt/busybox/bin/busybox chmod 755 /tmp/bb_dir/bb_file_mv\n"
+    "[ -x /tmp/bb_dir/bb_file_mv ] && echo \"BB-SMOKE: ok chmod\"\n"
+    "/opt/busybox/bin/busybox test -f /tmp/bb_dir/bb_file_mv && /opt/busybox/bin/busybox [ -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok test\"\n"
+    "printf \"b\\\\nc\\\\na\\\\n\" > /tmp/bb_dir/bb_sort\n"
+    "/opt/busybox/bin/busybox sort /tmp/bb_dir/bb_sort | head -n 1 | grep -q \"a\" && echo \"BB-SMOKE: ok sort\"\n"
+    "printf \"a\\\\na\\\\nb\\\\n\" > /tmp/bb_dir/bb_uniq\n"
+    "/opt/busybox/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q \"2\" && echo \"BB-SMOKE: ok uniq\"\n"
+    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq\n"
+    "[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo \"BB-SMOKE: ok rm\"\n"
+    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file\n"
+    "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"
+    "[ ! -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok rmdir\"\n"
+    "echo \"BB-SMOKE: done\"\n"
+#endif
     "echo \"POSIX-SMOKE: done\"\n";
 
 
@@ -453,6 +491,10 @@ static const struct initramfs_file files[] = {
     {"/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE},
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf),
      INITRAMFS_EXECUTABLE},
+#if B1NIX_UPSTREAM_BUSYBOX
+    {"/opt/busybox/bin/busybox", (const char *)vfs_upstream_busybox_elf,
+     sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
+#endif
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
@@ -601,8 +643,9 @@ static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags,
   vfs_set_currently_mounting_root(root);
 
   for (usize i = 0; i < (sizeof(files) / sizeof(files[0])); i++) {
+    enum vfs_node_type type = (files[i].flags & INITRAMFS_SYMLINK) ? VFS_SYMLINK : VFS_FILE;
     struct vfs_node *node =
-        vfs_add_node(files[i].path, VFS_FILE, (void *)files[i].data,
+        vfs_add_node(files[i].path, type, (void *)files[i].data,
                      files[i].size, files[i].flags);
     if (node) {
       node->inode->statfs_cb = initramfs_vfs_statfs;

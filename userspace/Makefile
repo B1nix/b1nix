@@ -19,7 +19,7 @@ CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MMD -MP
-BUILD    := build
+BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
 CRT0     := $(BUILD)/crt/crt0.o
@@ -40,6 +40,9 @@ LIBC_OBJS := \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \
+	$(BUILD)/libc/libgen.o \
+	$(BUILD)/libc/getopt.o \
+	$(BUILD)/libc/fnmatch.o \
 	$(BUILD)/libc/div64.o
 
 BINARIES := \
@@ -83,7 +86,8 @@ DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
-.PHONY: all clean install
+.PHONY: all clean install install-headers-libs
+.SECONDARY:
 
 all: $(LIB) $(BINARIES)
 
@@ -101,6 +105,20 @@ $(BUILD)/libc/%.o: libc/%.c
 $(LIB): $(LIBC_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIBC_OBJS)
+
+build/libb1nix.a: $(LIB)
+	@mkdir -p build
+	ln -sf $(B1NIX_ARCH)/libb1nix.a $@
+
+build/crt/crt0.o: $(CRT0)
+	@mkdir -p build/crt
+	ln -sf ../$(B1NIX_ARCH)/crt/crt0.o $@
+
+build/bin/%: build/$(B1NIX_ARCH)/bin/%
+	@mkdir -p build/bin
+	ln -sf ../$(B1NIX_ARCH)/bin/$* $@
+
+
 
 # ── User programs ──
 $(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0) $(LINKER)
@@ -158,12 +176,10 @@ else
 endif
 
 # ── Install to rootfs ──
-install: all
-	@echo "Installing userspace binaries..."
-	@mkdir -p $(ROOTFS)/bin
+install-headers-libs: $(LIB) $(CRT0)
+	@echo "Installing userspace headers and libraries..."
 	@mkdir -p $(ROOTFS)/include
 	@mkdir -p $(ROOTFS)/lib
-	cp $(BINARIES) $(ROOTFS)/bin/
 	cp -r include/* $(ROOTFS)/include/
 	cp $(LIB) $(ROOTFS)/lib/
 	cp $(CRT0) $(ROOTFS)/lib/
@@ -172,10 +188,16 @@ install: all
 	@mkdir -p $(ROOTFS)/usr
 	ln -sfn ../include $(ROOTFS)/usr/include
 	ln -sfn ../lib $(ROOTFS)/usr/lib
+
+install: all install-headers-libs
+	@echo "Installing userspace binaries..."
+	@mkdir -p $(ROOTFS)/bin
+	cp $(BINARIES) $(ROOTFS)/bin/
 	@mkdir -p $(ROOTFS)/home
 	cp hello_native.c $(ROOTFS)/home/
 	@mkdir -p $(ROOTFS)/lib/tcc/include
 	cp tcc/include/*.h $(ROOTFS)/lib/tcc/include/
+
 
 clean:
 	rm -rf $(BUILD)

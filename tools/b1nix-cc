@@ -8,10 +8,6 @@ SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
 USR="$PROJECT_DIR/userspace"
 INCLUDE="$USR/include"
-LIB="$USR/build/libb1nix.a"
-CRT0="$USR/build/crt/crt0.o"
-LINKER="$USR/linker.ld"
-LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
 if [ "$B1NIX_ARCH" = "x86" ]; then
 	TARGET="i686-unknown-elf"
@@ -22,8 +18,12 @@ else
 	LD_EMULATION="elf_x86_64"
 	ARCH_FLAGS=""
 fi
+LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
+CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
+LINKER="$USR/linker.ld"
+LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 
-[ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make -C "$USR" -s; }
+[ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$LIB" "$CRT0"; }
 
 # Parse: find sources, output, and keep other flags
 OUTPUT="a.out"

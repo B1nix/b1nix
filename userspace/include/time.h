@@ -38,6 +38,7 @@ struct tm {
 
 time_t time(time_t *tloc);
 int gettimeofday(struct timeval *tv, struct timezone *tz);
+int settimeofday(const struct timeval *tv, const struct timezone *tz);
 void tzset(void);
 extern char *tzname[2];
 extern long timezone;
@@ -59,6 +60,11 @@ struct timespec {
 
 int clock_gettime(int clk_id, struct timespec *tp);
 int nanosleep(const struct timespec *req, struct timespec *rem);
+
+struct tm *localtime_r(const time_t *timep, struct tm *result);
+struct tm *gmtime_r(const time_t *timep, struct tm *result);
+int clock_settime(int clk_id, const struct timespec *tp);
+char *strptime(const char *s, const char *format, struct tm *tm);
 
 typedef long clock_t;
 #define CLOCKS_PER_SEC 1000000

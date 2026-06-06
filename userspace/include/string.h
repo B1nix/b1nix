@@ -8,6 +8,7 @@ extern "C" {
 #include <stddef.h>
 
 void *memcpy(void *dest, const void *src, size_t count);
+void *mempcpy(void *dest, const void *src, size_t count);
 void *memset(void *dest, int value, size_t count);
 void *memmove(void *dest, const void *src, size_t count);
 int   memcmp(const void *p1, const void *p2, size_t count);
@@ -18,10 +19,13 @@ int   strcasecmp(const char *a, const char *b);
 int   strncasecmp(const char *a, const char *b, size_t n);
 size_t strlen(const char *s);
 char *strcpy(char *dest, const char *src);
+char *stpcpy(char *dest, const char *src);
 char *strncpy(char *dest, const char *src, size_t n);
 char *strchr(const char *s, int c);
+char *strchrnul(const char *s, int c);
 char *strstr(const char *haystack, const char *needle);
 char *strdup(const char *s);
+char *strndup(const char *s, size_t n);
 char *strcat(char *dest, const char *src);
 char *strncat(char *dest, const char *src, size_t n);
 char *strrchr(const char *s, int c);

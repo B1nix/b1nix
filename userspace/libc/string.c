@@ -74,6 +74,15 @@ char *strcpy(char *dest, const char *src)
 	return dest;
 }
 
+char *stpcpy(char *dest, const char *src)
+{
+	while ((*dest = *src)) {
+		dest++;
+		src++;
+	}
+	return dest;
+}
+
 char *strncpy(char *dest, const char *src, size_t n)
 {
 	size_t i;
@@ -107,6 +116,18 @@ char *strdup(const char *s)
 	size_t len = strlen(s) + 1;
 	char *p = malloc(len);
 	if (p) memcpy(p, s, len);
+	return p;
+}
+
+char *strndup(const char *s, size_t n)
+{
+	size_t len = 0;
+	while (len < n && s[len]) len++;
+	char *p = malloc(len + 1);
+	if (p) {
+		memcpy(p, s, len);
+		p[len] = '\0';
+	}
 	return p;
 }
 
@@ -294,6 +315,13 @@ size_t strspn(const char *s, const char *accept) {
     return p - s;
 }
 
+char *strchrnul(const char *s, int c) {
+    while (*s && *s != (char)c) {
+        s++;
+    }
+    return (char *)s;
+}
+
 #include <wchar.h>
 
 wchar_t *wmemcpy(wchar_t *dest, const wchar_t *src, size_t n) {
@@ -337,6 +365,11 @@ wchar_t *wcscpy(wchar_t *dest, const wchar_t *src) {
 	while ((*d++ = *src++));
 	return dest;
 }
+
+void *mempcpy(void *dest, const void *src, size_t n) {
+  return (char *)memcpy(dest, src, n) + n;
+}
+
 
 
 

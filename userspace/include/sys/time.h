@@ -3,4 +3,14 @@
 
 #include <time.h>
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int utimes(const char *filename, const struct timeval times[2]);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif

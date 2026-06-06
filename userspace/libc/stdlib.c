@@ -1126,3 +1126,34 @@ void tzset(void) {
 		}
 	}
 }
+
+#include <fcntl.h>
+#include <unistd.h>
+
+int mkstemp(char *tmpl) {
+	int len = strlen(tmpl);
+	if (len < 6 || strcmp(tmpl + len - 6, "XXXXXX") != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	static unsigned int seed = 12345;
+	for (int pass = 0; pass < 100; pass++) {
+		unsigned int val = seed;
+		seed = seed * 1103515245 + 12345;
+		for (int i = 0; i < 6; i++) {
+			int c = val % 62;
+			val /= 62;
+			char ch;
+			if (c < 10) ch = '0' + c;
+			else if (c < 36) ch = 'a' + (c - 10);
+			else ch = 'A' + (c - 36);
+			tmpl[len - 6 + i] = ch;
+		}
+		int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0) return fd;
+		if (errno != EEXIST) return -1;
+	}
+	errno = EEXIST;
+	return -1;
+}
+

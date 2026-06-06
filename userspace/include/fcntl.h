@@ -16,6 +16,7 @@ extern "C" {
 #define O_CLOEXEC   0x0800
 #define O_NONBLOCK  0x4000
 #define O_DIRECTORY 0x10000
+#define O_NOCTTY    0x0100
 #define O_BINARY    0
 #define O_TEXT      0
 

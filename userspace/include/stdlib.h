@@ -137,6 +137,8 @@ static inline char *mktemp(char *tmpl) {
     return tmpl;
 }
 
+int mkstemp(char *tmpl);
+
 const char *getprogname(void);
 
 #ifdef __cplusplus

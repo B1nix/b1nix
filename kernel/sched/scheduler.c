@@ -1365,6 +1365,16 @@ int scheduler_yield(void) {
 
   if (new_task == 0) {
     if (old_task != 0 && old_task->state == TASK_DEAD) {
+      struct percpu *p = get_percpu();
+      console_write("PANIC INFO: pcpu=0x");
+      console_write_hex64((u64)p);
+      if (p) {
+        console_write(" cpu_id=");
+        console_write_dec(p->cpu_id);
+        console_write(" idle_task=0x");
+        console_write_hex64((u64)p->idle_task);
+      }
+      console_write("\n");
       panic("dead task has nowhere to yield");
     }
 

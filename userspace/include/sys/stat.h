@@ -40,4 +40,23 @@
 #define S_ISFIFO(m) (((m) & S_IFMT) == S_IFIFO)
 #define S_ISSOCK(m) (((m) & S_IFMT) == S_IFSOCK)
 
+#define UTIME_NOW  ((1l << 30) - 1l)
+#define UTIME_OMIT ((1l << 30) - 2l)
+#define AT_FDCWD -100
+#define AT_SYMLINK_NOFOLLOW 0x100
+
+#ifdef __cplusplus
+extern "C" {
+#endif
+
+int mknod(const char *pathname, mode_t mode, dev_t dev);
+
+struct timespec;
+int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);
+int futimens(int fd, const struct timespec times[2]);
+
+#ifdef __cplusplus
+}
+#endif
+
 #endif
