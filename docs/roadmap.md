@@ -653,3 +653,68 @@ the 4 GiB the 32-bit address space allows. See
   firmware claims more) never let the pmm hand out non-existent frames (it marks
   the bitmap all-used and only frees genuine AVAILABLE regions today — keep that
   invariant).
+
+## M42: Upstream BusyBox Port & Native Utility Replacement
+
+Replace the locally implemented BusyBox-style utility table with an actual
+upstream BusyBox build, without breaking the currently working system during
+the transition. Upstream BusyBox remains isolated under
+`/opt/busybox/bin/busybox` until each applet group is build-clean and
+smoke-tested on both `x86_64` and `i686`. Native `/bin` utilities stay the
+default throughout the migration and are retired only after equivalent
+upstream applets pass the same workflows.
+
+- [x] `done` Establish the isolated upstream port (BusyBox 1.36.1). Add a
+  reproducible source/configuration pipeline, cross-build it against b1nix
+  libc, install one static multicall ELF at `/opt/busybox/bin/busybox`, and
+  gate initramfs inclusion behind `UPSTREAM_BUSYBOX=1`. No `/bin` symlinks are
+  created at this stage, so the port cannot silently replace native commands.
+- [x] `done` Complete the baseline applet set: `true`, `false`, `yes`, `echo`,
+  `printf`, `pwd`, `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`,
+  `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `basename`, `dirname`,
+  `sync`, `sleep`, `date`, `uname`, `kill`, `test`, `[`, `sort` and `uniq`.
+  Cover filesystem creation, copying, links, permissions, pipelines and exit
+  statuses with optional `BB-SMOKE` tests.
+- [x] `done` Complete migration wave 1: enable `ls`, `cmp`, `cut`, `env`, `id`,
+  `printenv`, `tee`, `tr`, `whoami`, `seq`, `which`, `clear` and `hexdump`.
+  Close the libc/ABI gaps exposed by real upstream code: `strsep`,
+  `getgrouplist`, `endgrent`, `hstrerror`, `fseeko`/`ftello`, architecture
+  correct `off_t`, `getsid`, `alloca`, `longjmp` noreturn metadata, and
+  dynamic-width/precision plus `%f` formatting in `vsnprintf`. Verified by the
+  full smoke suite on both architectures: 412 passed, 0 failed.
+- [ ] `planned` Migration wave 2, low-risk POSIX file/text utilities. Enable
+  applets such as `stat`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`,
+  `realpath`, `mktemp`, `dd`, `du`, `df`, checksums and archive tools in small
+  groups. Fix shared libc or VFS semantics rather than adding applet-specific
+  fake Linux behavior. The first explicit blocker is the POSIX timestamp shape
+  of `struct stat` (`st_atim`, `st_mtim`, `st_ctim`).
+- [ ] `planned` Migration wave 3, process and system inspection. Bring up
+  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`/`pkill`, `lsof`,
+  `dmesg` and related tools. Extend `/proc/<pid>/stat`, `/proc/<pid>/fd`,
+  `/proc/mounts`, `/proc/net/*` and `/sys` only where an enabled applet has a
+  concrete tested requirement.
+- [ ] `planned` Migration wave 4, storage and networking. Port `mount`,
+  `umount`, `lsblk`, `blkid`, `losetup`, `fdisk`, `ifconfig`, `ip`, `route`,
+  `netstat`, `ping`, `nslookup` and DHCP/network service applets. Expose b1nix
+  block-device, mount and network state through stable userspace APIs or a
+  narrow BusyBox platform backend; do not implement a general Linux syscall
+  personality as part of this milestone.
+- [ ] `planned` Migration wave 5, shell/login/init applets. Enable upstream
+  `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
+  `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
+  available. Treat `init`, `getty`, `login`, `su`, account-management and
+  service applets as a separate security-sensitive gate.
+- [ ] `planned` Introduce an explicit applet-selection manifest for `/bin`
+  replacement. For each migrated command, compare native and upstream behavior
+  against existing M11/M22/M33 tests, add BusyBox-specific regression coverage,
+  then switch only that command's `/bin` entry to the upstream multicall ELF.
+  Keep an easy build-time fallback to the native implementation during this
+  period.
+- [ ] `planned` Retire the local BusyBox-style utility implementation only
+  after every command still referenced by boot scripts, recovery paths and the
+  smoke suite has an upstream replacement. Remove dead dispatch entries and
+  duplicated tests incrementally; keep genuinely b1nix-specific tools as
+  separate native programs instead of forcing them into upstream BusyBox.
+
+Detailed interface inventory and current applet list:
+[`docs/busybox-port.md`](busybox-port.md).
