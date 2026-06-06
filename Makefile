@@ -502,7 +502,11 @@ LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
 $(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-libidn2.sh >/dev/null
 
-$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB) $(LIBIDN2_LIB)
+LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
+$(LIBPSL_LIB): tools/build-libpsl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+	tools/build-libpsl.sh >/dev/null
+
+$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)

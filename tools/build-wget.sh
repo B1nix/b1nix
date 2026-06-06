@@ -50,6 +50,14 @@ if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
   fi
 fi
 
+LIBPSL_PREFIX="$ROOT_DIR/build/libpsl-b1nix/$HOST_TRIPLET/install"
+if [ ! -f "$LIBPSL_PREFIX/lib/libpsl.a" ]; then
+  if ! "$ROOT_DIR/tools/build-libpsl.sh" >/dev/null; then
+    echo "tools/build-wget.sh: libpsl build failed" >&2
+    exit 1
+  fi
+fi
+
 mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -115,6 +123,7 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     --disable-shared --enable-static \
     --with-ssl=openssl \
     --without-zlib \
+    --with-libpsl \
     --enable-iri \
     --disable-pcre \
     --disable-threads \
@@ -127,7 +136,9 @@ make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
     OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include" \
     OPENSSL_LIBS="-L$OPENSSL_PREFIX/lib -lssl -lcrypto" \
     LIBIDN2_CFLAGS="-I$LIBIDN2_PREFIX/include -I$LIBUNISTRING_PREFIX/include" \
-    LIBIDN2_LIBS="-L$LIBIDN2_PREFIX/lib -lidn2 -L$LIBUNISTRING_PREFIX/lib -lunistring"
+    LIBIDN2_LIBS="-L$LIBIDN2_PREFIX/lib -lidn2 -L$LIBUNISTRING_PREFIX/lib -lunistring" \
+    LIBPSL_CFLAGS="-I$LIBPSL_PREFIX/include" \
+    LIBPSL_LIBS="-L$LIBPSL_PREFIX/lib -lpsl"
 )
 
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"
