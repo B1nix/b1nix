@@ -399,6 +399,12 @@ static int e1000_irq_ack(struct netdev *nd)
 	return icr ? 1 : 0;
 }
 
+static int e1000_link_up(struct netdev *nd)
+{
+	(void)nd;
+	return e1000_inited && (e1000_read(E1000_STATUS) & STATUS_LU) ? 1 : 0;
+}
+
 /* Force the device into power state D0 via its PCI Power-Management capability.
  *
  * On real hardware the firmware can leave an integrated NIC — notably the PCH
@@ -522,6 +528,7 @@ int e1000_probe(void)
 	e1000_netdev.transmit = e1000_transmit;
 	e1000_netdev.poll = e1000_poll;
 	e1000_netdev.irq_ack = e1000_irq_ack;
+	e1000_netdev.link_up = e1000_link_up;
 	e1000_netdev.priv = 0;
 	netdev_register(&e1000_netdev);
 

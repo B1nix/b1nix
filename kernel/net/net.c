@@ -17,19 +17,49 @@
  */
 
 /* ── Active NIC registry ────────────────────────────────────────────────── */
+#define NET_MAX_NETDEVS 8
+
 static struct netdev *g_netdev;
+static struct netdev *g_netdevs[NET_MAX_NETDEVS];
+static usize g_netdev_count;
 
 void netdev_register(struct netdev *nd)
 {
-	/* First driver to register wins (probe order in net_init sets preference). */
-	if (!g_netdev) g_netdev = nd;
+	if (!nd)
+		return;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (g_netdevs[i] == nd)
+			return;
+	}
+	if (g_netdev_count < NET_MAX_NETDEVS)
+		g_netdevs[g_netdev_count++] = nd;
+	if (!g_netdev)
+		g_netdev = nd;
 }
 
 struct netdev *netdev_active(void) { return g_netdev; }
 
+static int netdev_link_state(struct netdev *nd)
+{
+	if (!nd)
+		return 0;
+	return nd->link_up ? nd->link_up(nd) : -1;
+}
+
+static struct netdev *netdev_best(void)
+{
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (netdev_link_state(g_netdevs[i]) == 1)
+			return g_netdevs[i];
+	}
+	return g_netdev ? g_netdev : (g_netdev_count ? g_netdevs[0] : 0);
+}
+
 /* ── Interface address state ────────────────────────────────────────────── */
 static volatile int net_irq_pending = 0;
 static volatile int net_task_id = -1;
+static int networking_enabled;
+static int last_link_state = -2;
 
 static struct mac_addr local_mac;
 static struct ipv4_addr local_ip = { { 0, 0, 0, 0 } };
@@ -67,6 +97,37 @@ int net_get_prefix6_valid(void) { return prefix6_valid; }
 void net_set_ip6(struct in6_addr_k a) { local_ip6 = a; }
 void net_set_gateway6(struct in6_addr_k a) { gateway_ip6 = a; }
 void net_set_prefix6(struct in6_addr_k p) { prefix6 = p; prefix6_valid = 1; }
+
+static void net_compute_link_local(void);
+
+static void net_reset_interface_state(struct netdev *nd)
+{
+	struct ipv4_addr zero4 = {{0, 0, 0, 0}};
+
+	local_mac = nd->mac;
+	local_ip = zero4;
+	gateway_ip = zero4;
+	memset(&local_ip6, 0, sizeof(local_ip6));
+	memset(&gateway_ip6, 0, sizeof(gateway_ip6));
+	memset(&prefix6, 0, sizeof(prefix6));
+	prefix6_valid = 0;
+	net_compute_link_local();
+	arp_init();
+	ndp_init();
+}
+
+static void net_switch_active(struct netdev *nd)
+{
+	if (!nd || nd == g_netdev)
+		return;
+	dhcp_stop();
+	g_netdev = nd;
+	net_reset_interface_state(nd);
+	net_irq_pending = 0;
+	console_write("net: switched active driver to ");
+	console_write(nd->name);
+	console_write("\n");
+}
 
 /* Build the EUI-64 modified interface identifier from the 48-bit MAC and
  * compose the fe80::/64 link-local address. */
@@ -178,7 +239,8 @@ void net_dump_info(void)
 	console_write(" driver: ");
 	console_write(nd ? nd->name : "none");
 	console_write("\n link:   ");
-	console_write(nd ? "up" : "down");
+	int link = netdev_link_state(nd);
+	console_write(link > 0 ? "up" : (link == 0 ? "down" : "unknown"));
 	console_write("\n mac:    ");
 	print_mac(local_mac);
 	console_write("\n ip:     ");
@@ -228,8 +290,24 @@ void net_dump_info(void)
 static void net_task(void *arg)
 {
 	(void)arg;
-	u64 last_dhcp_retry = 0;
 	while (1) {
+		struct netdev *best = netdev_best();
+		if (best != g_netdev && netdev_link_state(g_netdev) != 1)
+			net_switch_active(best);
+
+		int link = netdev_link_state(g_netdev);
+		if (link != last_link_state) {
+			if (link == 0) {
+				console_write("net: link down\n");
+				dhcp_stop();
+			} else {
+				console_write(link > 0 ? "net: link up\n"
+				                       : "net: link state unknown\n");
+				if (networking_enabled)
+					dhcp_init();
+			}
+			last_link_state = link;
+		}
 		if (net_irq_pending) {
 			net_irq_pending = 0;
 		}
@@ -237,13 +315,6 @@ static void net_task(void *arg)
 		dhcp_tick(scheduler_get_uptime_ticks());
 		ntp_tick(scheduler_get_uptime_ticks());
 		ndp_tick(scheduler_get_uptime_ticks());
-		if (local_ip.bytes[0] == 0) {
-			u64 now = scheduler_get_uptime_ticks();
-			if (now - last_dhcp_retry >= 300) {
-				dhcp_init();
-				last_dhcp_retry = now;
-			}
-		}
 		/* Sleep a tick between polls rather than busy-yielding. As a perpetually
 		 * runnable kernel daemon, busy-yielding would keep net_task READY and —
 		 * under the Big Kernel Lock — let it monopolise the lock across its
@@ -257,19 +328,19 @@ static void net_task(void *arg)
 void net_init(void)
 {
 	g_netdev = 0;
+	g_netdev_count = 0;
+	memset(g_netdevs, 0, sizeof(g_netdevs));
 	memset(&local_mac, 0, sizeof(local_mac));
 	local_ip = (struct ipv4_addr){{0, 0, 0, 0}};
 	gateway_ip = (struct ipv4_addr){{0, 0, 0, 0}};
 	net_scan_pci_adapters();
 
-	/* NIC driver probe: the first driver to register becomes the active
-	 * interface (netdev_register is first-wins). virtio-net is tried first so
-	 * it stays the active NIC under QEMU; e1000 is the primary metal path for
-	 * Intel I219 desktops, and r8169 covers Realtek-only machines. */
+	/* Probe every supported NIC, then prefer one whose PHY reports carrier. */
 	virtio_net_probe();
 	e1000_probe();
 	r8169_probe();   /* Realtek RTL8169/8168/8111/810x family (e.g. ZG5 RTL8102E) */
 
+	g_netdev = netdev_best();
 	struct netdev *nd = netdev_active();
 	console_write("net: pci adapters 0x");
 	console_write_hex64(net_adapter_count);
@@ -278,20 +349,25 @@ void net_init(void)
 	console_write("\n");
 
 	if (nd) {
-		local_mac = nd->mac;
-		net_compute_link_local();
+		net_reset_interface_state(nd);
+	} else {
+		arp_init();
+		ndp_init();
 	}
 
-	arp_init();
-	ndp_init();
 	if (!nd) {
 		return;
 	}
 	/* Networking is on by default: bring the link up via DHCP whenever a NIC is
 	 * present. Opt out with b1nix.net=off (or b1nix.nonet) for an isolated boot;
 	 * b1nix.net=dhcp is still accepted as an explicit no-op for back-compat. */
-	if (!bootinfo_has_flag("b1nix.net=off") && !bootinfo_has_flag("b1nix.nonet")) {
+	networking_enabled = !bootinfo_has_flag("b1nix.net=off") &&
+	                     !bootinfo_has_flag("b1nix.nonet");
+	last_link_state = netdev_link_state(nd);
+	if (networking_enabled && last_link_state != 0) {
 		dhcp_init();
+	} else if (networking_enabled && last_link_state == 0) {
+		console_write("net: waiting for link\n");
 	}
 
 	net_task_id = kthread_create("net_task", net_task, 0);

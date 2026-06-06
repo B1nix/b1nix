@@ -44,6 +44,12 @@ struct netdev {
 	 */
 	int (*irq_ack)(struct netdev *nd);
 
+	/*
+	 * Return 1 when carrier is present, 0 when the PHY reports link down,
+	 * or -1 when the transport has no usable carrier indication.
+	 */
+	int (*link_up)(struct netdev *nd);
+
 	void *priv;                /* driver-private state */
 };
 

@@ -37,18 +37,22 @@ struct dhcp_packet {
 } __attribute__((packed));
 
 static u32 current_xid = 0x11223344;
-static int dhcp_state = 0; // 0=init, 1=offered, 2=bound, 3=renewing, 4=rebinding
+static int dhcp_state = -1; // -1=stopped, 0=discover, 1=request, 2=bound, 3=renew, 4=rebind
 static struct ipv4_addr dhcp_server = {{0, 0, 0, 0}};
 static u32 lease_seconds = 300;
 static u64 lease_expire_ticks = 0;
 static u64 renew_ticks = 0;
 static u64 rebind_ticks = 0;
 static u64 last_request_ticks = 0;
+static u64 transaction_start_ticks = 0;
+static u32 discover_attempts = 0;
+static u32 request_attempts = 0;
 static int dhcp_udp_registered = 0;
 static int dhcp_fallback_announced = 0;
 static struct ipv4_addr offered_gw = {{0, 0, 0, 0}};
 static struct ipv4_addr offered_mask = {{0, 0, 0, 0}};
 static struct ipv4_addr offered_dns = {{0, 0, 0, 0}};
+static struct ipv4_addr offered_ip = {{0, 0, 0, 0}};
 
 struct dhcp_reply_diag {
 	int valid;
@@ -124,6 +128,17 @@ static void dhcp_dump_saved_reply(const char *kind,
 
 void dhcp_dump_info(void)
 {
+	static const char *states[] = {"discover", "request", "bound", "renew", "rebind"};
+	console_write(" dhcp-state: ");
+	if (dhcp_state < 0 || dhcp_state > 4)
+		console_write("stopped");
+	else
+		console_write(states[dhcp_state]);
+	console_write(" discovers=");
+	console_write_dec(discover_attempts);
+	console_write(" requests=");
+	console_write_dec(request_attempts);
+	console_write("\n");
 	dhcp_dump_saved_reply("offer", &last_offer_diag);
 	dhcp_dump_saved_reply("ack", &last_ack_diag);
 }
@@ -150,35 +165,83 @@ static u32 dhcp_seed_xid_from_mac(void)
 	return x ? x : 0x11223344u;
 }
 
-static void dhcp_send_request(struct ipv4_addr requested_ip, int broadcast) {
-  struct dhcp_packet req;
-  memset(&req, 0, sizeof(req));
-  req.op = DHCP_OP_REQUEST;
-  req.htype = 1;
-  req.hlen = 6;
-  req.xid = current_xid;
-  if (broadcast)
-    req.flags = 0x0080;   /* broadcast flag (wire 0x8000) — see dhcp_init */
-  req.magic_cookie = 0x63538263;
-  struct mac_addr mac = net_get_mac();
-  memcpy(req.chaddr, mac.bytes, 6);
+static void dhcp_send_discover(void)
+{
+	struct dhcp_packet pkt;
+	memset(&pkt, 0, sizeof(pkt));
+	pkt.op = DHCP_OP_REQUEST;
+	pkt.htype = 1;
+	pkt.hlen = 6;
+	pkt.xid = current_xid;
+	pkt.flags = 0x0080; /* wire 0x8000 on little-endian x86 */
+	pkt.magic_cookie = 0x63538263;
+	struct mac_addr mac = net_get_mac();
+	memcpy(pkt.chaddr, mac.bytes, 6);
 
-  req.options[0] = DHCP_OPT_MSG_TYPE;
-  req.options[1] = 1;
-  req.options[2] = 3; // DHCP Request
-	req.options[3] = DHCP_OPT_REQUESTED_IP;
-	req.options[4] = 4;
-	memcpy(&req.options[5], requested_ip.bytes, 4);
-	req.options[9] = DHCP_OPT_PARAM_REQUEST_LIST;
-	req.options[10] = 3;
-	req.options[11] = DHCP_OPT_SUBNET_MASK;
-	req.options[12] = DHCP_OPT_ROUTER;
-	req.options[13] = DHCP_OPT_DNS;
-	req.options[14] = DHCP_OPT_END;
+	pkt.options[0] = DHCP_OPT_MSG_TYPE;
+	pkt.options[1] = 1;
+	pkt.options[2] = 1;
+	pkt.options[3] = DHCP_OPT_PARAM_REQUEST_LIST;
+	pkt.options[4] = 3;
+	pkt.options[5] = DHCP_OPT_SUBNET_MASK;
+	pkt.options[6] = DHCP_OPT_ROUTER;
+	pkt.options[7] = DHCP_OPT_DNS;
+	pkt.options[8] = DHCP_OPT_END;
 
-  struct ipv4_addr dst = broadcast ? (struct ipv4_addr){{255, 255, 255, 255}} : dhcp_server;
-  udp_send(dst, 68, 67, &req, sizeof(req));
-  last_request_ticks = scheduler_get_uptime_ticks();
+	struct ipv4_addr bcast = {{255, 255, 255, 255}};
+	udp_send(bcast, 68, 67, &pkt, sizeof(pkt));
+	last_request_ticks = scheduler_get_uptime_ticks();
+	discover_attempts++;
+}
+
+static void dhcp_send_request(struct ipv4_addr requested_ip, int broadcast)
+{
+	struct dhcp_packet req;
+	memset(&req, 0, sizeof(req));
+	req.op = DHCP_OP_REQUEST;
+	req.htype = 1;
+	req.hlen = 6;
+	req.xid = current_xid;
+	if (broadcast)
+		req.flags = 0x0080; /* wire 0x8000 on little-endian x86 */
+	req.magic_cookie = 0x63538263;
+	struct mac_addr mac = net_get_mac();
+	memcpy(req.chaddr, mac.bytes, 6);
+
+	u8 *opt = req.options;
+	*opt++ = DHCP_OPT_MSG_TYPE;
+	*opt++ = 1;
+	*opt++ = 3; /* DHCPREQUEST */
+
+	if (dhcp_state == 1) {
+		*opt++ = DHCP_OPT_REQUESTED_IP;
+		*opt++ = 4;
+		memcpy(opt, requested_ip.bytes, 4);
+		opt += 4;
+		if (!ipv4_is_zero(dhcp_server)) {
+			*opt++ = DHCP_OPT_SERVER_ID;
+			*opt++ = 4;
+			memcpy(opt, dhcp_server.bytes, 4);
+			opt += 4;
+		}
+	} else {
+		/* RENEWING/REBINDING identifies the lease through ciaddr. */
+		req.ciaddr = requested_ip;
+	}
+
+	*opt++ = DHCP_OPT_PARAM_REQUEST_LIST;
+	*opt++ = 3;
+	*opt++ = DHCP_OPT_SUBNET_MASK;
+	*opt++ = DHCP_OPT_ROUTER;
+	*opt++ = DHCP_OPT_DNS;
+	*opt = DHCP_OPT_END;
+
+	struct ipv4_addr dst = broadcast
+		? (struct ipv4_addr){{255, 255, 255, 255}}
+		: dhcp_server;
+	udp_send(dst, 68, 67, &req, sizeof(req));
+	last_request_ticks = scheduler_get_uptime_ticks();
+	request_attempts++;
 }
 
 void dhcp_init(void)
@@ -193,52 +256,38 @@ void dhcp_init(void)
 		current_xid++;
 	dhcp_state = 0;
 	dhcp_fallback_announced = 0;
+	discover_attempts = 0;
+	request_attempts = 0;
+	lease_seconds = 300;
+	lease_expire_ticks = 0;
+	renew_ticks = 0;
+	rebind_ticks = 0;
+	transaction_start_ticks = scheduler_get_uptime_ticks();
 	offered_gw = (struct ipv4_addr){{0, 0, 0, 0}};
 	offered_mask = (struct ipv4_addr){{0, 0, 0, 0}};
 	offered_dns = (struct ipv4_addr){{0, 0, 0, 0}};
-	struct dhcp_packet pkt;
-	memset(&pkt, 0, sizeof(pkt));
+	offered_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+	dhcp_server = (struct ipv4_addr){{0, 0, 0, 0}};
+	memset(&last_offer_diag, 0, sizeof(last_offer_diag));
+	memset(&last_ack_diag, 0, sizeof(last_ack_diag));
+	dhcp_send_discover();
 
-	pkt.op = DHCP_OP_REQUEST;
-	pkt.htype = 1; // Ethernet
-	pkt.hlen = 6;
-	pkt.xid = current_xid;
-	/* Set the BROADCAST flag (wire 0x8000; little-endian u16 == 0x0080) so the
-	 * server broadcasts its OFFER/ACK instead of unicasting it to the not-yet-
-	 * assigned IP. We have no IP yet (0.0.0.0), so a unicast reply is dropped by
-	 * ipv4_receive — which is exactly why DHCP got no lease on real hardware
-	 * (QEMU's SLIRP server happened to reply in a way we accepted). */
-	pkt.flags = 0x0080;
-	pkt.magic_cookie = 0x63538263; // 99.130.83.99 network byte order
-	
-	struct mac_addr mac = net_get_mac();
-	memcpy(pkt.chaddr, mac.bytes, 6);
-
-	pkt.options[0] = DHCP_OPT_MSG_TYPE;
-	pkt.options[1] = 1; // len
-	pkt.options[2] = 1; // DHCP Discover
-	pkt.options[3] = DHCP_OPT_PARAM_REQUEST_LIST;
-	pkt.options[4] = 3;
-	pkt.options[5] = DHCP_OPT_SUBNET_MASK;
-	pkt.options[6] = DHCP_OPT_ROUTER;
-	pkt.options[7] = DHCP_OPT_DNS;
-	pkt.options[8] = DHCP_OPT_END;
-
-	struct ipv4_addr bcast = { { 255, 255, 255, 255 } };
-	udp_send(bcast, 68, 67, &pkt, sizeof(pkt));
-	last_request_ticks = scheduler_get_uptime_ticks();
-
-	/* Announce the first discover only. net_task re-runs dhcp_init() every few
-	 * seconds while there is no lease, so printing on every attempt floods the
-	 * console (and buries the shell prompt) when no DHCP server answers — e.g.
-	 * on a link with no DHCP. Retries continue silently; a successful bind still
-	 * prints "dhcp bound to ..." exactly once. */
+	/* Retries are handled by dhcp_tick(), so keep the normal no-server case
+	 * quiet while still showing that automatic configuration has started. */
 	static int discover_announced = 0;
 	if (!discover_announced) {
 		console_write("net: dhcp discover sent (retrying silently until a lease "
 		              "or link)\n");
 		discover_announced = 1;
 	}
+}
+
+void dhcp_stop(void)
+{
+	struct ipv4_addr zero = {{0, 0, 0, 0}};
+	dhcp_state = -1;
+	net_set_ip(zero);
+	net_set_gateway(zero);
 }
 
 void dhcp_receive(const void *data, usize size)
@@ -295,20 +344,25 @@ void dhcp_receive(const void *data, usize size)
 		offered_gw = parsed_gw;
 		offered_mask = parsed_mask;
 		offered_dns = parsed_dns;
+		offered_ip = offer_ip;
 		dhcp_state = 1;
+		transaction_start_ticks = scheduler_get_uptime_ticks();
 		dhcp_send_request(offer_ip, 1);
 
 	} else if (msg_type == 5 &&
 	           (dhcp_state == 1 || dhcp_state == 3 || dhcp_state == 4)) { // Ack
+		struct ipv4_addr ack_ip = pkt->yiaddr;
+		if (ipv4_is_zero(ack_ip))
+			ack_ip = net_get_ip();
 		if (ipv4_is_zero(parsed_gw))
 			parsed_gw = offered_gw;
 		if (ipv4_is_zero(parsed_mask))
 			parsed_mask = offered_mask;
 		if (ipv4_is_zero(parsed_dns))
 			parsed_dns = offered_dns;
-		dhcp_save_reply_diag(&last_ack_diag, pkt->yiaddr, parsed_gw,
+		dhcp_save_reply_diag(&last_ack_diag, ack_ip, parsed_gw,
 		                     parsed_mask, parsed_dns, parsed_srv);
-		net_set_ip(pkt->yiaddr);
+		net_set_ip(ack_ip);
 		net_set_gateway(parsed_gw);
 		if (parsed_dns.bytes[0] || parsed_dns.bytes[1] ||
 		    parsed_dns.bytes[2] || parsed_dns.bytes[3])
@@ -322,13 +376,19 @@ void dhcp_receive(const void *data, usize size)
 		rebind_ticks = now + ((u64)lease_seconds * 100 * 7) / 8;
 
 		console_write("net: dhcp bound to ");
-		dhcp_print_ipv4(pkt->yiaddr);
+		dhcp_print_ipv4(ack_ip);
 		console_write("\n");
+	} else if (msg_type == 6) { // NAK
+		console_write("net: dhcp NAK, restarting discovery\n");
+		dhcp_init();
 	}
 }
 
 void dhcp_tick(u64 now_ticks) {
-  if (dhcp_state == 0 && now_ticks - last_request_ticks >= 600 && !dhcp_fallback_announced) {
+  if (dhcp_state < 0)
+    return;
+  if (dhcp_state == 0 && bootinfo_has_flag("b1nix.test=1") &&
+      now_ticks - transaction_start_ticks >= 600 && !dhcp_fallback_announced) {
     struct ipv4_addr fallback_ip = {{10, 0, 2, 15}};
     struct ipv4_addr fallback_gw = {{10, 0, 2, 2}};
     net_set_ip(fallback_ip);
@@ -338,6 +398,24 @@ void dhcp_tick(u64 now_ticks) {
 	    if (bootinfo_has_flag("b1nix.test=1"))
 	      console_write("DHCP-SMOKE: fallback-static\n");
 	    return;
+  }
+  if (dhcp_state == 0) {
+    if (now_ticks - transaction_start_ticks >= 3000) {
+      console_write("net: dhcp transaction timed out, restarting\n");
+      dhcp_init();
+    } else if (now_ticks - last_request_ticks >= 300) {
+      dhcp_send_discover();
+    }
+    return;
+  }
+  if (dhcp_state == 1) {
+    if (now_ticks - transaction_start_ticks >= 3000) {
+      console_write("net: dhcp request timed out, restarting\n");
+      dhcp_init();
+    } else if (now_ticks - last_request_ticks >= 300) {
+      dhcp_send_request(offered_ip, 1);
+    }
+    return;
   }
   if (dhcp_state == 2) {
     if (renew_ticks && now_ticks >= renew_ticks) {

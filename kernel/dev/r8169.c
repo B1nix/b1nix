@@ -46,6 +46,8 @@
 #define R_CFG9346   0x50   /* EEPROM/lock register (8-bit)                  */
 #define   CFG9346_UNLOCK 0xC0
 #define   CFG9346_LOCK   0x00
+#define R_PHYSTATUS 0x6C   /* PHY status; bit 1 is link status               */
+#define   PHYSTATUS_LINK 0x02
 #define R_RXMAXSZ   0xDA   /* Rx max packet size (16-bit)                   */
 #define R_CPCMD     0xE0   /* C+ command (16-bit)                           */
 #define R_RXDESC_LO 0xE4   /* Rx descriptor ring phys (lo)                  */
@@ -295,6 +297,12 @@ static int r8169_irq_ack(struct netdev *nd)
 	return isr ? 1 : 0;
 }
 
+static int r8169_link_up(struct netdev *nd)
+{
+	(void)nd;
+	return r8169_inited && (r_r8(R_PHYSTATUS) & PHYSTATUS_LINK) ? 1 : 0;
+}
+
 /* ── Probe ──────────────────────────────────────────────────────────────── */
 int r8169_probe(void)
 {
@@ -390,6 +398,7 @@ int r8169_probe(void)
 	r8169_netdev.transmit = r8169_transmit;
 	r8169_netdev.poll = r8169_poll;
 	r8169_netdev.irq_ack = r8169_irq_ack;
+	r8169_netdev.link_up = r8169_link_up;
 	r8169_netdev.priv = 0;
 	netdev_register(&r8169_netdev);
 

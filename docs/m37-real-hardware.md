@@ -17,12 +17,17 @@ The target machine (the development host) is an ASRock/Coffee-Lake box:
 ## Generic netdev model
 
 `kernel/include/b1nix/netdev.h` defines `struct netdev` — `{mac, irq,
-transmit(hdr, payload), poll, irq_ack}` — with a first-wins registry
-(`netdev_register` / `netdev_active`) in `kernel/net/net.c`. The protocol stack
-is now driver-agnostic: `net_send_ethernet` builds the 14-byte ethernet header
-and hands it (plus the payload) to `nd->transmit`; `net_poll` pumps `nd->poll`;
-the IRQ/MAC/link plumbing reads the active device. The header and payload are
-passed separately so no large frame buffer is needed on a deep send stack.
+transmit(hdr, payload), poll, irq_ack, link_up}` — with a small registry in
+`kernel/net/net.c`. All successfully probed drivers are retained and the stack
+prefers an adapter whose PHY reports carrier. If the active link goes down and
+another registered adapter has carrier, the stack switches interfaces and
+restarts address configuration with the new MAC.
+
+The protocol stack is driver-agnostic: `net_send_ethernet` builds the 14-byte
+ethernet header and hands it (plus the payload) to `nd->transmit`; `net_poll`
+pumps `nd->poll`; the IRQ/MAC/link plumbing reads the active device. The header
+and payload are passed separately so no large frame buffer is needed on a deep
+send stack.
 
 virtio-net moved verbatim into `kernel/dev/virtio_net.c` implementing this
 interface; behaviour is unchanged.
@@ -37,8 +42,35 @@ I217/I218/I219 parts including the host's I219-V (`8086:15b8`).
 - BAR0 mapped arch-guarded (direct map on x86-64, `vmm_map_mmio` on 32-bit).
 - Reset, MAC from RAL/RAH (EEPROM fallback), set-link-up, multicast clear,
   RX/TX legacy descriptor rings, RCTL/TCTL/TIPG. All hardware waits are bounded.
-- `net_init` probes virtio-net first (so it stays active under QEMU) then e1000
-  unconditionally; on real hardware virtio is absent and e1000 becomes active.
+- `net_init` probes virtio-net, e1000 and r8169, then chooses an initialized
+  device with carrier. QEMU still selects virtio-net; a real machine can select
+  the wired Intel or Realtek device that actually has a cable.
+
+## DHCP and link recovery
+
+DHCP runs as a persistent state machine. DISCOVER and REQUEST packets are
+retransmitted without changing the transaction ID; a new transaction starts
+only after the 30-second transaction timeout or a DHCP NAK. The selecting
+`DHCPREQUEST` includes both requested-address option 50 and the server
+identifier option 54 copied from the offer, as expected by normal routers.
+Renew and rebind requests identify the existing lease through `ciaddr`.
+
+Carrier transitions control DHCP. A down link clears the stale IPv4 lease; an
+up transition starts discovery. The QEMU-only `10.0.2.15` static fallback is
+restricted to `b1nix.test=1` and is never installed on a normal hardware boot.
+
+On hardware, run `ifconfig` (or the `net` diagnostic command). Useful fields:
+
+```text
+link:   up
+dhcp-state: discover|request|bound
+dhcp-offer: yiaddr=... srv=... xid=...
+dhcp-ack:   yiaddr=... gw=... xid=...
+```
+
+`link: down` means the PHY has no carrier. `link: up` with repeated discovers
+and no saved offer means no DHCP response reached the kernel. A saved offer
+followed by repeated requests narrows the failure to REQUEST/ACK handling.
 
 ## USB xHCI + HID keyboard (`kernel/dev/usb_xhci.c`)
 

@@ -221,6 +221,12 @@ static int vnet_irq_ack(struct netdev *nd)
 	return (isr & 1) ? 1 : 0;
 }
 
+static int vnet_link_up(struct netdev *nd)
+{
+	(void)nd;
+	return vnet_ready ? 1 : 0;
+}
+
 /* ── probe ──────────────────────────────────────────────────────────────── */
 
 int virtio_net_probe(void)
@@ -303,6 +309,7 @@ int virtio_net_probe(void)
 	vnet_netdev.transmit = vnet_transmit;
 	vnet_netdev.poll = vnet_poll;
 	vnet_netdev.irq_ack = vnet_irq_ack;
+	vnet_netdev.link_up = vnet_link_up;
 	vnet_netdev.priv = 0;
 	netdev_register(&vnet_netdev);
 
