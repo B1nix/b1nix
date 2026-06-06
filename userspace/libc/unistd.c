@@ -767,6 +767,10 @@ pid_t setsid(void) {
   return _check_err(syscall(SYS_SETSID));
 }
 
+pid_t getsid(pid_t pid) {
+  return _check_err(syscall(SYS_GETSID, pid));
+}
+
 int getrlimit(int resource, struct rlimit *rlim) {
   (void)resource;
   (void)rlim;

@@ -277,6 +277,25 @@ char *strtok(char *str, const char *delim) {
     return start;
 }
 
+char *strsep(char **stringp, const char *delim) {
+    if (!stringp || !*stringp) {
+        return NULL;
+    }
+
+    char *start = *stringp;
+    char *p = start;
+    while (*p) {
+        if (strchr(delim, *p)) {
+            *p = '\0';
+            *stringp = p + 1;
+            return start;
+        }
+        p++;
+    }
+    *stringp = NULL;
+    return start;
+}
+
 size_t strxfrm(char *dest, const char *src, size_t n) {
     size_t len = strlen(src);
     if (n > len) {
@@ -369,7 +388,6 @@ wchar_t *wcscpy(wchar_t *dest, const wchar_t *src) {
 void *mempcpy(void *dest, const void *src, size_t n) {
   return (char *)memcpy(dest, src, n) + n;
 }
-
 
 
 

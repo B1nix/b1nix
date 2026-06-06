@@ -372,6 +372,7 @@ u64 scheduler_mmap_bump_alloc(usize length);
 int scheduler_set_priority(usize pid, int priority);
 int scheduler_get_priority(usize pid);
 usize scheduler_setsid(void);
+isize scheduler_getsid(usize pid);
 usize scheduler_getpgrp(void);
 int scheduler_setpgrp(usize pid, usize pgrp);
 int scheduler_is_pgrp_in_session(usize pgrp, usize session_id);

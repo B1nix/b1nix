@@ -50,6 +50,8 @@ int fputc(int c, FILE *stream);
 int ungetc(int c, FILE *stream);
 int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
+int fseeko(FILE *stream, off_t offset, int whence);
+off_t ftello(FILE *stream);
 int fflush(FILE *stream);
 int feof(FILE *stream);
 int ferror(FILE *stream);

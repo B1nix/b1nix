@@ -2543,6 +2543,24 @@ usize scheduler_setsid(void) {
   return current_task->session_id;
 }
 
+isize scheduler_getsid(usize pid) {
+  if (!current_task)
+    return -ESRCH;
+  if (pid == 0)
+    pid = current_task->id;
+
+  interrupts_disable();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
+      isize sid = (isize)T(i)->session_id;
+      interrupts_enable();
+      return sid;
+    }
+  }
+  interrupts_enable();
+  return -ESRCH;
+}
+
 usize scheduler_getpgrp(void) {
   if (!current_task)
     return 0;

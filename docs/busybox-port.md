@@ -21,13 +21,16 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The first phase configures the following **31 core applets**:
+The isolated package currently configures **44 applets**. The first migration
+wave added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
+`seq`, `which`, `clear` and `hexdump`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
-- **Output & Print**: `echo`, `printf`, `pwd`
-- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`
+- **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
+- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`
 - **Path Manipulation**: `basename`, `dirname`
-- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`
+- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`
+- **Text & Sequences**: `tr`, `seq`
 - **Shell Builtins & Pipelines**: `test`, `[` (alias of test), `sort`, `uniq`
 
 ## What b1nix Already Provides
@@ -59,22 +62,17 @@ backend.
 
 ## Concrete Remaining Interfaces
 
-### Required for a warning-clean base build
+### Completed for the first migration wave
 
-- Add `<alloca.h>` or a supported `alloca` builtin declaration.
-- Add `getsid()` to the process/session syscall interface.
-- Add group database iteration: `setgrent`, `getgrent`, `endgrent`.
-- Add `hstrerror()` and complete the legacy resolver error interface.
-- Add `fseeko()` and `ftello()` with the same `off_t` width used by libc.
-- Fix BusyBox's `OFF_FMT` detection for b1nix, where `off_t` is `long long`
-  even on `x86_64`.
-- Remove the incorrect `noreturn` assumption reported while compiling the
-  upstream `test` applet.
-
-These warnings currently occur even though the affected library objects are not
-all reachable from the enabled Stage 1 applets. They must be fixed before
-enabling more applets because an implicit `hstrerror()` declaration can truncate
-a pointer on `x86_64`.
+- Added builtin `alloca`, `strsep`, `getgrouplist`, `endgrent`, `hstrerror`,
+  `fseeko` and `ftello` declarations and implementations.
+- Added `getsid()` across the userspace ABI, syscall dispatcher and scheduler.
+- Made `off_t` match the architecture ABI while remaining 64-bit.
+- Marked `longjmp()` as `noreturn`, matching its implementation and removing
+  the upstream `test` applet warning.
+- Kept `stat` disabled for now. Upstream BusyBox expects POSIX `st_atim`,
+  `st_mtim` and `st_ctim` fields, which need a deliberate `struct stat` ABI
+  update rather than a BusyBox-only workaround.
 
 ### Required libc/POSIX semantics
 

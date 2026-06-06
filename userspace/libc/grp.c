@@ -238,3 +238,68 @@ int initgroups(const char *user, gid_t group) {
   }
   return setgroups((size_t)count, list);
 }
+
+int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups) {
+  if (!user || !ngroups) {
+    errno = EINVAL;
+    return -1;
+  }
+
+  gid_t found[32];
+  int count = 0;
+  found[count++] = group;
+
+  int fd = open("/etc/group", O_RDONLY);
+  if (fd >= 0) {
+    char buf[1024];
+    char acc[256];
+    int acc_len = 0;
+    ssize_t r;
+    while ((r = read(fd, buf, sizeof(buf))) > 0) {
+      for (ssize_t i = 0; i < r; i++) {
+        char c = buf[i];
+        if (c == '\n' || acc_len == (int)sizeof(acc) - 1) {
+          acc[acc_len] = '\0';
+          if (acc_len > 0 && acc[0] != '#') {
+            struct group temp;
+            char line[256];
+            memcpy(line, acc, (size_t)acc_len + 1);
+            if (parse_grline(line, &temp)) {
+              int member = 0;
+              for (int j = 0; temp.gr_mem[j]; j++) {
+                if (strcmp(temp.gr_mem[j], user) == 0) {
+                  member = 1;
+                  break;
+                }
+              }
+              if (member) {
+                int duplicate = 0;
+                for (int j = 0; j < count; j++)
+                  if (found[j] == temp.gr_gid)
+                    duplicate = 1;
+                if (!duplicate && count < (int)(sizeof(found) / sizeof(found[0])))
+                  found[count++] = temp.gr_gid;
+              }
+            }
+          }
+          acc_len = 0;
+        } else {
+          acc[acc_len++] = c;
+        }
+      }
+    }
+    close(fd);
+  }
+
+  int capacity = *ngroups;
+  *ngroups = count;
+  if (!groups || capacity < count) {
+    return -1;
+  }
+  for (int i = 0; i < count; i++)
+    groups[i] = found[i];
+  return count;
+}
+
+void endgrent(void) {
+}

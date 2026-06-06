@@ -12,6 +12,10 @@ extern "C" {
 #define MB_CUR_MAX 1
 #define RAND_MAX 32767
 
+#ifndef alloca
+#define alloca(size) __builtin_alloca(size)
+#endif
+
 typedef struct {
     int quot;
     int rem;

@@ -105,6 +105,7 @@ pid_t getpgrp(void);
 pid_t tcgetpgrp(int fd);
 int tcsetpgrp(int fd, pid_t pgrp);
 pid_t setsid(void);
+pid_t getsid(pid_t pid);
 int execve(const char *pathname, char *const argv[], char *const envp[]);
 int getgroups(int size, gid_t list[]);
 #include <sys/select.h>

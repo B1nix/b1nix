@@ -5,7 +5,11 @@
 #include <stdint.h>
 
 typedef long ssize_t;
+#if defined(__x86_64__) || defined(__LP64__)
+typedef long off_t;
+#else
 typedef long long off_t;
+#endif
 #ifndef B1NIX_TIME_T_DEFINED
 #define B1NIX_TIME_T_DEFINED
 typedef long long time_t;

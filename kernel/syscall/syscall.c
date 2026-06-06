@@ -1871,6 +1871,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
   case SYS_SETSID:
     return (u64)scheduler_setsid();
+  case SYS_GETSID:
+    return (u64)scheduler_getsid((usize)arg0);
   case SYS_GETPGRP:
     return (u64)scheduler_getpgrp();
   case SYS_SETPGRP:

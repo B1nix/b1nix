@@ -255,6 +255,16 @@ const char *gai_strerror(int errcode) {
   }
 }
 
+const char *hstrerror(int errcode) {
+  switch (errcode) {
+  case HOST_NOT_FOUND: return "Unknown host";
+  case TRY_AGAIN:      return "Temporary name resolution failure";
+  case NO_RECOVERY:    return "Non-recoverable name resolution failure";
+  case NO_DATA:        return "No address associated with name";
+  default:             return "Resolver error";
+  }
+}
+
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res) {
   if (!res)

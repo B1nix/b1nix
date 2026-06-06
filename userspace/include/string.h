@@ -34,6 +34,7 @@ char *strerror(int errnum);
 
 void *memchr(const void *s, int c, size_t n);
 char *strtok(char *str, const char *delim);
+char *strsep(char **stringp, const char *delim);
 size_t strxfrm(char *dest, const char *src, size_t n);
 size_t strcspn(const char *s, const char *reject);
 size_t strspn(const char *s, const char *accept);

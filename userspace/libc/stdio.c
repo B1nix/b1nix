@@ -218,6 +218,22 @@ long ftell(FILE *stream) {
   return lseek(stream->fd, 0, SEEK_CUR);
 }
 
+int fseeko(FILE *stream, off_t offset, int whence) {
+  if (!stream)
+    return -1;
+  off_t pos = (off_t)lseek(stream->fd, (long)offset, whence);
+  if (pos < 0)
+    return -1;
+  stream->eof = 0;
+  return 0;
+}
+
+off_t ftello(FILE *stream) {
+  if (!stream)
+    return (off_t)-1;
+  return (off_t)lseek(stream->fd, 0, SEEK_CUR);
+}
+
 int fflush(FILE *stream) {
   // No buffering yet, so fflush is a no-op
   (void)stream;
@@ -275,6 +291,14 @@ static void _vsnprintf_puts(char *str, size_t size, int *pos, const char *s) {
     _vsnprintf_putc(str, size, pos, *s++);
 }
 
+static void _vsnprintf_putsn(char *str, size_t size, int *pos, const char *s,
+                             int length) {
+  if (!s)
+    s = "(null)";
+  while (*s && length-- > 0)
+    _vsnprintf_putc(str, size, pos, *s++);
+}
+
 static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base,
                             int signed_val) {
   char buf[32];
@@ -293,6 +317,37 @@ static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base,
     _vsnprintf_putc(str, size, pos, buf[--p]);
 }
 
+static void _vsnprintf_putf(char *str, size_t size, int *pos, double value,
+                            int precision) {
+  if (precision < 0)
+    precision = 6;
+  if (precision > 9)
+    precision = 9;
+
+  if (value < 0) {
+    _vsnprintf_putc(str, size, pos, '-');
+    value = -value;
+  }
+
+  unsigned long scale = 1;
+  for (int i = 0; i < precision; i++)
+    scale *= 10;
+  unsigned long rounded = (unsigned long)(value * scale + 0.5);
+  unsigned long whole = scale ? rounded / scale : rounded;
+  unsigned long fraction = scale ? rounded % scale : 0;
+  _vsnprintf_putd(str, size, pos, (long)whole, 10, 0);
+
+  if (precision > 0) {
+    _vsnprintf_putc(str, size, pos, '.');
+    unsigned long divisor = scale / 10;
+    while (divisor > 0) {
+      _vsnprintf_putc(str, size, pos,
+                      (char)('0' + (fraction / divisor) % 10));
+      divisor /= 10;
+    }
+  }
+}
+
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   int pos = 0;
   /* Format the whole string regardless of buffer size so the return value is
@@ -307,18 +362,40 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
     i++;
 
     /* Flags. */
+    int left_align = 0;
     while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' ||
-           fmt[i] == '0')
+           fmt[i] == '0') {
+      if (fmt[i] == '-')
+        left_align = 1;
       i++;
-    /* Field width (parsed but not applied — values are still correct, which is
-     * all the assembler output from cc1 needs). */
-    while (fmt[i] >= '0' && fmt[i] <= '9')
+    }
+    int width = 0;
+    if (fmt[i] == '*') {
+      width = va_arg(ap, int);
       i++;
-    /* Precision. */
+      if (width < 0) {
+        left_align = 1;
+        width = -width;
+      }
+    } else {
+      while (fmt[i] >= '0' && fmt[i] <= '9') {
+        width = width * 10 + fmt[i] - '0';
+        i++;
+      }
+    }
+    int precision = -1;
     if (fmt[i] == '.') {
       i++;
-      while (fmt[i] >= '0' && fmt[i] <= '9')
+      precision = 0;
+      if (fmt[i] == '*') {
+        precision = va_arg(ap, int);
         i++;
+      } else {
+        while (fmt[i] >= '0' && fmt[i] <= '9') {
+          precision = precision * 10 + fmt[i] - '0';
+          i++;
+        }
+      }
     }
 
     /* Length modifiers. On x86_64 long, long long, size_t, intmax_t and
@@ -341,9 +418,22 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
     }
 
     switch (fmt[i]) {
-    case 's':
-      _vsnprintf_puts(str, size, &pos, va_arg(ap, const char *));
+    case 's': {
+      const char *value = va_arg(ap, const char *);
+      if (!value)
+        value = "(null)";
+      int length = (int)strlen(value);
+      if (precision >= 0 && length > precision)
+        length = precision;
+      if (!left_align)
+        for (int pad = width - length; pad > 0; pad--)
+          _vsnprintf_putc(str, size, &pos, ' ');
+      _vsnprintf_putsn(str, size, &pos, value, length);
+      if (left_align)
+        for (int pad = width - length; pad > 0; pad--)
+          _vsnprintf_putc(str, size, &pos, ' ');
       break;
+    }
     case 'd':
     case 'i':
       _vsnprintf_putd(str, size, &pos,
@@ -375,6 +465,9 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       break;
     case 'c':
       _vsnprintf_putc(str, size, &pos, (char)va_arg(ap, int));
+      break;
+    case 'f':
+      _vsnprintf_putf(str, size, &pos, va_arg(ap, double), precision);
       break;
     case '%':
       _vsnprintf_putc(str, size, &pos, '%');
@@ -780,4 +873,3 @@ int dprintf(int fd, const char *format, ...) {
   va_end(ap);
   return r;
 }
-

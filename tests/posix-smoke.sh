@@ -358,8 +358,25 @@ printf "b\nc\na\n" > /tmp/bb_dir/bb_sort
 printf "a\na\nb\n" > /tmp/bb_dir/bb_uniq
 /opt/busybox/bin/busybox uniq /tmp/bb_dir/bb_uniq | wc -l | grep -q "2" && echo "BB-SMOKE: ok uniq"
 
+# First migration wave
+/opt/busybox/bin/busybox ls /tmp/bb_dir | grep -q "bb_file" && echo "BB-W1: ok ls"
+/opt/busybox/bin/busybox cmp /tmp/bb_dir/bb_file /tmp/bb_dir/bb_file && echo "BB-W1: ok cmp"
+printf "left:right\n" | /opt/busybox/bin/busybox cut -d: -f2 | grep -q "right" && echo "BB-W1: ok cut"
+/opt/busybox/bin/busybox env BB_W1=value | grep -q "BB_W1=value" && echo "BB-W1: ok env"
+BB_ID_OUT=$(/opt/busybox/bin/busybox id -u)
+[ "$BB_ID_OUT" = "0" ] && echo "BB-W1: ok id"
+/opt/busybox/bin/busybox printenv PATH >/dev/null && echo "BB-W1: ok printenv"
+printf "tee-data\n" | /opt/busybox/bin/busybox tee /tmp/bb_dir/bb_tee | grep -q "tee-data" && grep -q "tee-data" /tmp/bb_dir/bb_tee && echo "BB-W1: ok tee"
+printf "abc\n" | /opt/busybox/bin/busybox tr a-z A-Z | grep -q "ABC" && echo "BB-W1: ok tr"
+/opt/busybox/bin/busybox whoami | grep -q "root" && echo "BB-W1: ok whoami"
+/opt/busybox/bin/busybox seq 1 3 > /tmp/bb_dir/bb_seq
+tail -n 1 /tmp/bb_dir/bb_seq | grep -q "3" && echo "BB-W1: ok seq"
+/opt/busybox/bin/busybox which ls | grep -q "/bin/ls" && echo "BB-W1: ok which"
+/opt/busybox/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
+printf "AB" | /opt/busybox/bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
+
 # 16. upstream BusyBox rm
-/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq
+/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq
 [ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo "BB-SMOKE: ok rm"
 
 # 17. upstream BusyBox rmdir

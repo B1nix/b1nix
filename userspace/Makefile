@@ -168,7 +168,7 @@ $(BUILD)/bin/m30_pie: bin/m30_pie.c linker_pie.ld
 
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)
-	cd tcc && clang -DC2STR conftest.c -o c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
+	cd tcc && test -x c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
 ifeq ($(B1NIX_ARCH),x86)
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 else

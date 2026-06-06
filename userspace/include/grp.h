@@ -23,6 +23,8 @@ int getgrgid_r(gid_t gid, struct group *grp, char *buf, size_t buflen,
                struct group **result);
 int initgroups(const char *user, gid_t group);
 int setgroups(size_t size, const gid_t *list);
+int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups);
+void endgrent(void);
 
 #ifdef __cplusplus
 }
