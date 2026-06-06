@@ -21,16 +21,19 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **44 applets**. The first migration
-wave added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
-`seq`, `which`, `clear` and `hexdump`:
+The isolated package currently configures **56 applets**. Migration wave 1
+added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
+`seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
+`mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
+and `sha256sum`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
-- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`
-- **Path Manipulation**: `basename`, `dirname`
+- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`
+- **Path Manipulation**: `basename`, `dirname`, `realpath`
 - **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`
-- **Text & Sequences**: `tr`, `seq`
+- **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
+- **Checksums**: `cksum`, `md5sum`, `sha256sum`
 - **Shell Builtins & Pipelines**: `test`, `[` (alias of test), `sort`, `uniq`
 
 ## What b1nix Already Provides
@@ -62,7 +65,7 @@ backend.
 
 ## Concrete Remaining Interfaces
 
-### Completed for the first migration wave
+### Completed for migration waves 1 and 2
 
 - Added builtin `alloca`, `strsep`, `getgrouplist`, `endgrent`, `hstrerror`,
   `fseeko` and `ftello` declarations and implementations.
@@ -70,9 +73,15 @@ backend.
 - Made `off_t` match the architecture ABI while remaining 64-bit.
 - Marked `longjmp()` as `noreturn`, matching its implementation and removing
   the upstream `test` applet warning.
-- Kept `stat` disabled for now. Upstream BusyBox expects POSIX `st_atim`,
-  `st_mtim` and `st_ctim` fields, which need a deliberate `struct stat` ABI
-  update rather than a BusyBox-only workaround.
+- Updated the kernel/userspace `struct stat` ABI to expose POSIX `st_atim`,
+  `st_mtim` and `st_ctim` timestamps while retaining the traditional
+  `st_atime`, `st_mtime` and `st_ctime` aliases.
+- Added `strcasestr`, `mkdtemp`, `popen` and `pclose`, and made `rand()` use
+  the declared 31-bit `RAND_MAX`.
+- Added a compact libc BRE/ERE engine with literals, groups, alternation,
+  bracket and named character classes, anchors, backreferences, `*`, `+`,
+  `?`, captures, `REG_ICASE` and `REG_NEWLINE`. This is sufficient for the
+  enabled Wave 2 workflows but is not yet full POSIX regex conformance.
 
 ### Required libc/POSIX semantics
 
@@ -86,8 +95,8 @@ backend.
   implementations with fd-table, VFS permission and truncate operations.
 - Complete `fnmatch()` support for `FNM_PATHNAME`, `FNM_PERIOD` and bracket
   expressions.
-- Implement the declared `regcomp`, `regexec`, `regerror` and `regfree` API, or
-  adapt BusyBox to the already ported PCRE2 library.
+- Complete POSIX regex intervals (`{m,n}`), error reporting and edge-case
+  semantics beyond the Wave 2 BRE/ERE subset.
 - Complete `utimensat`, `futimens` and `lchown`, including symlink and
   nanosecond semantics.
 - Implement `fchdir`, `mknod` and `chroot`.
@@ -127,7 +136,7 @@ The replacement target is the command set currently dispatched by
 
 Enable and test:
 
-`ls`, `whoami`, `id`, `clear`, `stat`, `env`, `printenv`, `cut`, `tr`, `tee`,
+`ls`, `whoami`, `id`, `clear`, `env`, `printenv`, `cut`, `tr`, `tee`,
 `cmp`, `seq`, `which` and `hexdump`.
 
 Most kernel support already exists. `hexdump` first needs `fseeko`; identity
@@ -135,13 +144,21 @@ applets need the passwd/group API to be warning-clean.
 
 ### Wave 2: text and traversal
 
-Enable:
+Enabled and smoke-tested:
 
-`grep`, `find`, `sed`, `awk`, `xargs` and `diff`.
+`stat`, `realpath`, `mktemp`, `grep`, `find`, `sed`, `awk`, `xargs`, `diff`,
+`cksum`, `md5sum` and `sha256sum`.
 
-Finish regex and `fnmatch` before allowing these applets to replace native
-commands. Test recursive traversal, symlink loops, pathname matching and error
-exit statuses.
+The applets remain isolated under `/opt`; recursive traversal, regular
+expressions, substitutions, field processing, argument batching, checksums and
+error exit statuses are covered by the optional BusyBox smoke suite. The full
+suite, including SMP, passes 425/425 on both `x86_64` and `i686`.
+
+### Wave 2b: larger file and archive utilities
+
+Enable `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `xz`
+and `unxz` in small groups. Add focused large-file, sparse-file, filesystem
+accounting, archive traversal and malformed-input tests before promotion.
 
 ### Wave 3: upstream `ash`
 
@@ -233,7 +250,7 @@ complete compatibility contracts.
 ### Implemented Functions in `libb1nix`
 - **String Manipulation**: `stpcpy`, `strndup`, `strchrnul`, `mempcpy`
 - **I/O & Formatting**: `getline`, `vasprintf`, `asprintf`, `vdprintf`, `dprintf`
-- **Temporary Files**: `mkstemp`
+- **Temporary Files**: `mkstemp`, `mkdtemp`
 - **Path Resolution & Links**: `symlink`, `readlink`, `libgen.h` functions
   (`basename`, `dirname`), and partial `fnmatch`
 - **System Information**: `uname`, `sysconf` (for `_SC_CLK_TCK`)
@@ -245,6 +262,9 @@ complete compatibility contracts.
 - **Option Parsing**: short-option `getopt` with grouped options and BusyBox's
   `optind = 0` reset convention. GNU permutation, optional arguments and
   `getopt_long` are not implemented.
+- **Regex**: libc `regcomp`, `regexec`, `regerror` and `regfree` with the
+  Wave 2 BRE/ERE subset described above.
+- **Process I/O**: `popen` and `pclose` through `/bin/sh -c`.
 
 ## Key Integration and Bug Fixes
 

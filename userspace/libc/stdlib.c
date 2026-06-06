@@ -978,7 +978,7 @@ static unsigned long next_rand = 1;
 
 int rand(void) {
 	next_rand = next_rand * 1103515245 + 12345;
-	return (unsigned int)(next_rand / 65536) % 32768;
+	return (int)(next_rand & RAND_MAX);
 }
 
 void srand(unsigned int seed) {
@@ -1157,3 +1157,27 @@ int mkstemp(char *tmpl) {
 	return -1;
 }
 
+char *mkdtemp(char *tmpl) {
+	int len = strlen(tmpl);
+	if (len < 6 || strcmp(tmpl + len - 6, "XXXXXX") != 0) {
+		errno = EINVAL;
+		return NULL;
+	}
+	static unsigned int seed = 0x4d3c2b1a;
+	for (int pass = 0; pass < 100; pass++) {
+		unsigned int val = seed;
+		seed = seed * 1103515245 + 12345;
+		for (int i = 0; i < 6; i++) {
+			int c = val % 62;
+			val /= 62;
+			tmpl[len - 6 + i] =
+				c < 10 ? '0' + c : c < 36 ? 'a' + c - 10 : 'A' + c - 36;
+		}
+		if (mkdir(tmpl, 0700) == 0)
+			return tmpl;
+		if (errno != EEXIST)
+			return NULL;
+	}
+	errno = EEXIST;
+	return NULL;
+}

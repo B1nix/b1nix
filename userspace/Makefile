@@ -43,6 +43,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/libgen.o \
 	$(BUILD)/libc/getopt.o \
 	$(BUILD)/libc/fnmatch.o \
+	$(BUILD)/libc/regex.o \
 	$(BUILD)/libc/div64.o
 
 BINARIES := \

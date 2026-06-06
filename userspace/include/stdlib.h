@@ -10,7 +10,7 @@ extern "C" {
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
 #define MB_CUR_MAX 1
-#define RAND_MAX 32767
+#define RAND_MAX 2147483647
 
 #ifndef alloca
 #define alloca(size) __builtin_alloca(size)
@@ -142,6 +142,7 @@ static inline char *mktemp(char *tmpl) {
 }
 
 int mkstemp(char *tmpl);
+char *mkdtemp(char *tmpl);
 
 const char *getprogname(void);
 

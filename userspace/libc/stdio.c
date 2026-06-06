@@ -4,11 +4,12 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
 #include <unistd.h>
 
-static FILE _stdin = {0, 0, 0, 0, 0};
-static FILE _stdout = {1, 0, 0, 0, 0};
-static FILE _stderr = {2, 0, 0, 0, 0};
+static FILE _stdin = {0, 0, 0, 0, 0, 0};
+static FILE _stdout = {1, 0, 0, 0, 0, 0};
+static FILE _stderr = {2, 0, 0, 0, 0, 0};
 
 FILE *stdin = &_stdin;
 FILE *stdout = &_stdout;
@@ -82,23 +83,26 @@ FILE *fopen(const char *pathname, const char *mode) {
   f->error = 0;
   f->unget_buf = 0;
   f->has_unget = 0;
+  f->pipe_pid = 0;
   return f;
 }
 
 FILE *freopen(const char *pathname, const char *mode, FILE *stream) {
-  if (stream)
-    fclose(stream);
+  if (!stream)
+    return fopen(pathname, mode);
+  close(stream->fd);
   FILE *f = fopen(pathname, mode);
-  if (!f)
+  if (!f) {
+    stream->fd = -1;
+    stream->eof = 0;
+    stream->error = 1;
+    stream->has_unget = 0;
+    stream->pipe_pid = 0;
     return NULL;
-  if (stream) {
-    stream->fd = f->fd;
-    stream->eof = f->eof;
-    stream->error = f->error;
-    free(f);
-    return stream;
   }
-  return f;
+  *stream = *f;
+  free(f);
+  return stream;
 }
 
 FILE *fdopen(int fd, const char *mode) {
@@ -111,7 +115,61 @@ FILE *fdopen(int fd, const char *mode) {
   f->fd = fd;
   f->eof = 0;
   f->error = 0;
+  f->unget_buf = 0;
+  f->has_unget = 0;
+  f->pipe_pid = 0;
   return f;
+}
+
+FILE *popen(const char *command, const char *mode) {
+  if (!command || !mode || (mode[0] != 'r' && mode[0] != 'w')) {
+    errno = EINVAL;
+    return NULL;
+  }
+  int fds[2];
+  if (pipe(fds) < 0)
+    return NULL;
+  int pid = fork();
+  if (pid < 0) {
+    close(fds[0]);
+    close(fds[1]);
+    return NULL;
+  }
+  if (pid == 0) {
+    if (mode[0] == 'r') {
+      close(fds[0]);
+      dup2(fds[1], STDOUT_FILENO);
+      close(fds[1]);
+    } else {
+      close(fds[1]);
+      dup2(fds[0], STDIN_FILENO);
+      close(fds[0]);
+    }
+    char *argv[] = {"/bin/sh", "-c", (char *)command, NULL};
+    execv("/bin/sh", argv);
+    _exit(127);
+  }
+  int fd = mode[0] == 'r' ? fds[0] : fds[1];
+  close(mode[0] == 'r' ? fds[1] : fds[0]);
+  FILE *stream = fdopen(fd, mode);
+  if (!stream) {
+    close(fd);
+    waitpid(pid, NULL, 0);
+    return NULL;
+  }
+  stream->pipe_pid = pid;
+  return stream;
+}
+
+int pclose(FILE *stream) {
+  if (!stream || stream->pipe_pid <= 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  int pid = stream->pipe_pid;
+  fclose(stream);
+  int status = 0;
+  return waitpid(pid, &status, 0) < 0 ? -1 : status;
 }
 
 int fclose(FILE *stream) {

@@ -682,12 +682,21 @@ upstream applets pass the same workflows.
   correct `off_t`, `getsid`, `alloca`, `longjmp` noreturn metadata, and
   dynamic-width/precision plus `%f` formatting in `vsnprintf`. Verified by the
   full smoke suite on both architectures: 412 passed, 0 failed.
-- [ ] `planned` Migration wave 2, low-risk POSIX file/text utilities. Enable
-  applets such as `stat`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`,
-  `realpath`, `mktemp`, `dd`, `du`, `df`, checksums and archive tools in small
-  groups. Fix shared libc or VFS semantics rather than adding applet-specific
-  fake Linux behavior. The first explicit blocker is the POSIX timestamp shape
-  of `struct stat` (`st_atim`, `st_mtim`, `st_ctim`).
+- [x] `done` Complete migration wave 2: enable `stat`, `realpath`, `mktemp`,
+  `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum` and
+  `sha256sum`. Update the shared `struct stat` ABI to POSIX `st_atim`,
+  `st_mtim` and `st_ctim`; add `strcasestr`, `mkdtemp`, `popen`/`pclose`, a
+  31-bit `RAND_MAX`, and a compact BRE/ERE libc implementation supporting the
+  expressions used by these applets. Cover traversal, ERE matching, BRE
+  groups/backreferences, field processing, argument batching, diff statuses
+  and known checksum vectors in the optional BusyBox smoke suite. Verified by
+  the full suite, including SMP, on both architectures: 425 passed, 0 failed
+  on `x86_64` and 425 passed, 0 failed on `i686`.
+- [ ] `planned` Continue the low-risk file/archive track as migration wave 2b.
+  Enable `dd`, `du`, `df`, `tar`, `gzip`/`gunzip`, `bzip2`/`bunzip2` and
+  `xz`/`unxz` in small groups. Add large-file, sparse-file, filesystem
+  accounting, archive traversal and malformed-input tests; complete remaining
+  regex and `fnmatch` edge cases only where the enabled applets require them.
 - [ ] `planned` Migration wave 3, process and system inspection. Bring up
   upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`/`pkill`, `lsof`,
   `dmesg` and related tools. Extend `/proc/<pid>/stat`, `/proc/<pid>/fd`,

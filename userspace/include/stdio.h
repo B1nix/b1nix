@@ -18,6 +18,7 @@ typedef struct {
     int error;
     int unget_buf;
     int has_unget;
+    int pipe_pid;
 } FILE;
 
 extern FILE *stdin;
@@ -41,6 +42,8 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap);
 FILE *fopen(const char *pathname, const char *mode);
 FILE *freopen(const char *pathname, const char *mode, FILE *stream);
 FILE *fdopen(int fd, const char *mode);
+FILE *popen(const char *command, const char *mode);
+int pclose(FILE *stream);
 int fclose(FILE *stream);
 int fputs(const char *s, FILE *stream);
 size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream);

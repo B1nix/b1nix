@@ -375,6 +375,32 @@ tail -n 1 /tmp/bb_dir/bb_seq | grep -q "3" && echo "BB-W1: ok seq"
 /opt/busybox/bin/busybox clear >/tmp/bb_dir/bb_clear && echo "BB-W1: ok clear"
 printf "AB" | /opt/busybox/bin/busybox hexdump | grep -q "4241" && echo "BB-W1: ok hexdump"
 
+# Second migration wave
+mkdir -p /tmp/bb_dir/w2/sub
+printf "alpha1\nbeta2\n" > /tmp/bb_dir/w2/sub/data.txt
+/opt/busybox/bin/busybox stat -c %s /tmp/bb_dir/w2/sub/data.txt | grep -q "13" && echo "BB-W2: ok stat"
+/opt/busybox/bin/busybox realpath /tmp/bb_dir/w2/sub/data.txt | grep -q "/tmp/bb_dir/w2/sub/data.txt" && echo "BB-W2: ok realpath"
+BB_TMP=$(/opt/busybox/bin/busybox mktemp -d /tmp/bb_dir/w2/tmp.XXXXXX)
+[ -d "$BB_TMP" ] && echo "BB-W2: ok mktemp"
+/opt/busybox/bin/busybox find /tmp/bb_dir/w2 -name "*.txt" | grep -q "data.txt" && echo "BB-W2: ok find"
+/opt/busybox/bin/busybox grep -E "alpha[0-9]+" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep"
+/opt/busybox/bin/busybox grep -Ei "[A-Z]+[0-9]" /tmp/bb_dir/w2/sub/data.txt | grep -q "alpha1" && echo "BB-W2: ok grep-icase"
+printf "name-42\n" | /opt/busybox/bin/busybox sed "s/\([a-z]*\)-\([0-9]*\)/\2:\1/" | grep -q "42:name" && echo "BB-W2: ok sed"
+printf "left:right\n" | /opt/busybox/bin/busybox awk -F: '{ print NF }' | grep -q "2" && echo "BB-W2: ok awk"
+printf "one two\n" | /opt/busybox/bin/busybox xargs /opt/busybox/bin/busybox echo | grep -q "one two" && echo "BB-W2: ok xargs"
+cp /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
+/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt
+BB_DIFF_SAME=$?
+printf "changed\n" >> /tmp/bb_dir/w2/sub/same.txt
+/opt/busybox/bin/busybox diff /tmp/bb_dir/w2/sub/data.txt /tmp/bb_dir/w2/sub/same.txt >/dev/null
+BB_DIFF_CHANGED=$?
+[ $BB_DIFF_SAME -eq 0 ] && [ $BB_DIFF_CHANGED -ne 0 ] && echo "BB-W2: ok diff"
+printf "abc" > /tmp/bb_dir/w2/abc
+/opt/busybox/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q "1219131554 3" && echo "BB-W2: ok cksum"
+/opt/busybox/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q "900150983cd24fb0d6963f7d28e17f72" && echo "BB-W2: ok md5sum"
+/opt/busybox/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q "ba7816bf8f01cfea414140de5dae2223" && echo "BB-W2: ok sha256sum"
+rm -rf /tmp/bb_dir/w2
+
 # 16. upstream BusyBox rm
 /opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq
 [ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo "BB-SMOKE: ok rm"

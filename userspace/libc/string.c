@@ -296,6 +296,22 @@ char *strsep(char **stringp, const char *delim) {
     return start;
 }
 
+char *strcasestr(const char *haystack, const char *needle) {
+  if (!*needle)
+    return (char *)haystack;
+  for (; *haystack; haystack++) {
+    const char *h = haystack;
+    const char *n = needle;
+    while (*h && *n && to_lower(*h) == to_lower(*n)) {
+      h++;
+      n++;
+    }
+    if (!*n)
+      return (char *)haystack;
+  }
+  return NULL;
+}
+
 size_t strxfrm(char *dest, const char *src, size_t n) {
     size_t len = strlen(src);
     if (n > len) {
@@ -388,6 +404,4 @@ wchar_t *wcscpy(wchar_t *dest, const wchar_t *src) {
 void *mempcpy(void *dest, const void *src, size_t n) {
   return (char *)memcpy(dest, src, n) + n;
 }
-
-
 

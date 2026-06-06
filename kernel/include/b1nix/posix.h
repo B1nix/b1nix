@@ -105,9 +105,18 @@ struct b1nix_stat {
   u64 st_size;
   u64 st_blksize;
   u64 st_blocks;
-  u64 st_atime;
-  u64 st_mtime;
-  u64 st_ctime;
+  struct {
+    u64 tv_sec;
+    u64 tv_nsec;
+  } st_atim;
+  struct {
+    u64 tv_sec;
+    u64 tv_nsec;
+  } st_mtim;
+  struct {
+    u64 tv_sec;
+    u64 tv_nsec;
+  } st_ctim;
 };
 
 struct b1nix_termios {

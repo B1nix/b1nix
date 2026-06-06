@@ -2748,9 +2748,9 @@ static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
   st->st_nlink = (u32)inode->nlink;
   st->st_mode = vfs_node_type_mode(node) | (inode->mode & 07777);
 
-  st->st_atime = inode->atime;
-  st->st_mtime = inode->mtime;
-  st->st_ctime = inode->ctime;
+  st->st_atim.tv_sec = inode->atime;
+  st->st_mtim.tv_sec = inode->mtime;
+  st->st_ctim.tv_sec = inode->ctime;
 
   st->st_dev = inode->fs_id;
   if (inode->type == VFS_DEVICE) {
