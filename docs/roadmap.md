@@ -626,11 +626,24 @@ against b1nix libc) is the cheaper, higher-leverage path and should be exhausted
 
 Today the kernel direct-maps physical RAM 1:1 into its virtual window and only
 uses what fits there: **1 GiB cap on 32-bit** (`DIRECT_MAP_MAX`, bounded by
-`KHEAP_START` at `0xC0000000`) and **64 GiB on 64-bit**. A real machine with
+`KHEAP_START` at `0xC0000000`) and **64 TiB on 64-bit**. A real machine with
 more RAM only gets that much used (b1fetch/`meminfo` already show "firmware RAM"
 vs "usable" so the gap is visible). Goal: take the full installed RAM, capped at
-the 4 GiB the 32-bit address space allows. See
+the 4 GiB the 32-bit physical address space allows. RAM up to 4 GiB does not
+require PAE, but it does require highmem because it cannot all be permanently
+mapped into the 2 GiB kernel half. See
 [`docs/`](roadmap.md) and the `meminfo` command for the live numbers.
+
+- [x] `done` Verify the 64-bit path with a 16 GiB firmware map and remove the
+  old 64 GiB software ceiling. The direct-map ceiling now spans the full
+  64 TiB window reserved by the current 4-level layout; boot still maps only
+  the discovered top of RAM. `tests/memory-smoke.sh` boots `ARCH=x86_64` with
+  QEMU `-m 16G` and requires at least 15000 MiB usable. Observed result:
+  16383 MiB firmware RAM and 16383 MiB usable. GRUB and `meminfo` now print the
+  architecture and memory model explicitly so a 32-bit ISO cannot be mistaken
+  for x86_64. In the current tree, `16 GiB installed / 1 GiB usable` identifies
+  an `ARCH=x86` boot; an x86_64 boot has a 4 GiB minimum direct-map window and
+  cannot produce that pair of values.
 
 - [ ] `partial` 32-bit: raise the cap from 1 GiB toward ~1.5–1.75 GiB without
   highmem by moving the kernel heap + MMIO window up into the
@@ -642,12 +655,8 @@ the 4 GiB the 32-bit address space allows. See
   low region and access higher physical frames on demand through temporary
   per-CPU mappings (Linux `kmap`/`kmap_atomic` style). Every
   `phys + DIRECT_MAP_BASE` deref on a high frame (block cache, page cache, user
-  page zeroing) must route through the temp map. Optionally PAE first if >4 GiB
-  physical is ever wanted.
-- [ ] `planned` 64-bit: raise `DIRECT_MAP_MAX` beyond 64 GiB (the direct-map
-  region at `0xffff800000000000` spans up to 64 TiB, so no highmem is needed —
-  just map the larger range in `vmm_init` and let `size_direct_map`'s clamp
-  follow). Low risk; cost is page-table setup + boot-time frame-free walk.
+  page zeroing) must route through the temp map. PAE is only needed later if
+  physical memory above 4 GiB should be usable by the 32-bit kernel.
 - [ ] `planned` Verify on real hardware that "firmware RAM" == "usable" once the
   cap is raised, and that BIOS-over-reported e820 maps (a 512 MiB box whose
   firmware claims more) never let the pmm hand out non-existent frames (it marks

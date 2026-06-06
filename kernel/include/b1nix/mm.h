@@ -9,7 +9,11 @@
 #ifdef __x86_64__
 #define DIRECT_MAP_BASE 0xffff800000000000ULL
 #define DIRECT_MAP_MIN  (4ULL * 1024ULL * 1024ULL * 1024ULL)
-#define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL)
+/* The current 4-level page-table layout reserves [ffff8000_00000000,
+ * ffffc000_00000000) for the physical direct map: 64 TiB. Only the
+ * firmware-reported top of RAM is mapped at boot, so using the full window as
+ * the ceiling does not add page tables or boot work on smaller machines. */
+#define DIRECT_MAP_MAX  (64ULL * 1024ULL * 1024ULL * 1024ULL * 1024ULL)
 #define KHEAP_START 0xffffc00000000000ULL
 #else
 #define DIRECT_MAP_BASE 0x80000000ULL

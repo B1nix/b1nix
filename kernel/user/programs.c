@@ -4389,6 +4389,13 @@ static int meminfo_main(int argc, const char **argv) {
   (void)argv;
   const u64 mb = 1024ULL * 1024ULL;
   uwrite("b1nix meminfo:\n");
+#ifdef __x86_64__
+  uwrite("  architecture:              x86_64\n");
+  uwrite("  memory model:              64-bit direct map\n");
+#else
+  uwrite("  architecture:              i686 (32-bit)\n");
+  uwrite("  memory model:              1 GiB lowmem (highmem pending)\n");
+#endif
   uwrite("  firmware RAM (BIOS e820): ");
   uwrite_dec_value(pmm_phys_total_memory() / mb);
   uwrite(" MiB\n");

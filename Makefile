@@ -632,6 +632,7 @@ iso: $(KERNEL_ELF)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
@@ -643,6 +644,7 @@ iso-live: root-image $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live/boot/kernel.elf
 	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
@@ -654,6 +656,7 @@ iso-live-ondemand: root-image $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live-ondemand/boot/kernel.elf
 	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live-ondemand/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) root=liveiso b1nix.xhci.run|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live-ondemand/boot/grub/grub.cfg
@@ -666,6 +669,7 @@ iso-test: root-image $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-test/boot/kernel.elf
 	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
@@ -785,4 +789,7 @@ smoke-x86: smoke
 graphics-smoke:
 	sh tests/graphics-smoke.sh
 
-.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install busybox-package busybox-iso iso-full smoke smoke-x86_64 smoke-x86 check-tools graphics-smoke install-native-toolchain install-kernel-source
+.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install busybox-package busybox-iso iso-full smoke smoke-x86_64 smoke-x86 memory-smoke check-tools graphics-smoke install-native-toolchain install-kernel-source
+
+memory-smoke:
+	@sh tests/memory-smoke.sh

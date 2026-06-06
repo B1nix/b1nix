@@ -103,7 +103,21 @@ sudo dd if=build/x86_64/b1nix.iso of=/dev/sdX bs=4M conv=fsync status=progress
 
 Then boot the target machine from USB. On a UEFI box, pick the USB entry in the
 firmware boot menu (Secure Boot must be off — GRUB's image is unsigned). GRUB
-shows the b1nix menu; the default entry boots the kernel.
+shows `b1nix (x86_64)` in the menu; the default entry boots the kernel. Do not
+flash `build/x86/b1nix.iso` on a machine where more than 1 GiB must be usable:
+that image is the separate 32-bit port and still has the M41 lowmem limit.
+
+After boot, run:
+
+```sh
+uname -m
+meminfo
+b1fetch
+```
+
+The current 64-bit image reports `x86_64` and `memory model: 64-bit direct
+map`. If it instead reports `i686 (32-bit)` and `1 GiB lowmem`, the machine is
+running the 32-bit ISO even when the processor itself supports 64-bit mode.
 
 ### Graphics
 
