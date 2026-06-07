@@ -41,6 +41,11 @@ usize blk_count(void);
 struct block_device *blk_at(usize index);
 const char *blk_probe_fstype(struct block_device *dev);
 
+/* Create a /dev/<name> node for every registered block device (read/write
+ * translated to cached block I/O + BLK* size ioctls). Call once after all
+ * storage drivers have probed. Backs BusyBox blkid/fdisk and /proc/partitions. */
+void blk_create_dev_nodes(void);
+
 // Block Cache API
 void blk_cache_init(void);
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count, void *buffer);

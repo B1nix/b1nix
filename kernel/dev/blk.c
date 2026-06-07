@@ -3,7 +3,10 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/vfs.h>
+#include <b1nix/errno.h>
 #include <stdbool.h>
+#include <stdio.h>
 #include <string.h>
 
 #define MAX_BLK_DEVICES 32
@@ -681,5 +684,90 @@ void blk_cache_invalidate(struct block_device *dev) {
       block_cache[i].block_no = 0;
     }
     bcache_release(flags);
+  }
+}
+
+/* ── /dev block-device nodes (for BusyBox blkid/fdisk) ──
+ * Each registered block device gets a /dev/<name> node whose byte-addressed
+ * reads/writes translate to cached block I/O. Sub-block writes do a
+ * read-modify-write so fdisk can rewrite just the MBR. */
+static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
+                              usize size, int flags) {
+  (void)flags;
+  struct block_device *dev = node->inode->blk_dev;
+  if (!dev)
+    return -EIO;
+  usize bs = dev->block_size ? dev->block_size : 512;
+  u64 total = (u64)bs * dev->block_count;
+  if (offset >= total)
+    return 0;
+  if (size > total - offset)
+    size = (usize)(total - offset);
+  if (size == 0)
+    return 0;
+  u64 first = offset / bs;
+  u64 last = (offset + size - 1) / bs;
+  u32 nblk = (u32)(last - first + 1);
+  u8 *tmp = kmalloc((usize)nblk * bs);
+  if (!tmp)
+    return -ENOMEM;
+  if (blk_read_cached(dev, first, nblk, tmp) != 0) {
+    kfree(tmp);
+    return -EIO;
+  }
+  memcpy(buffer, tmp + (usize)(offset - first * bs), size);
+  kfree(tmp);
+  return (isize)size;
+}
+
+static isize blkdev_node_write(struct vfs_node *node, u64 offset,
+                               const char *buffer, usize size, int flags) {
+  (void)flags;
+  struct block_device *dev = node->inode->blk_dev;
+  if (!dev)
+    return -EIO;
+  usize bs = dev->block_size ? dev->block_size : 512;
+  u64 total = (u64)bs * dev->block_count;
+  if (offset >= total)
+    return 0;
+  if (size > total - offset)
+    size = (usize)(total - offset);
+  if (size == 0)
+    return 0;
+  u64 first = offset / bs;
+  u64 last = (offset + size - 1) / bs;
+  u32 nblk = (u32)(last - first + 1);
+  u8 *tmp = kmalloc((usize)nblk * bs);
+  if (!tmp)
+    return -ENOMEM;
+  if (blk_read_cached(dev, first, nblk, tmp) != 0) {
+    kfree(tmp);
+    return -EIO;
+  }
+  memcpy(tmp + (usize)(offset - first * bs), buffer, size);
+  if (blk_write_cached(dev, first, nblk, tmp) != 0) {
+    kfree(tmp);
+    return -EIO;
+  }
+  kfree(tmp);
+  return (isize)size;
+}
+
+void blk_create_dev_nodes(void) {
+  usize n = blk_count();
+  for (usize i = 0; i < n; i++) {
+    struct block_device *dev = blk_at(i);
+    if (!dev || !dev->name)
+      continue;
+    char path[64];
+    snprintf(path, sizeof(path), "/dev/%s", dev->name);
+    struct vfs_node *node = vfs_add_node(path, VFS_DEVICE, 0, 0, 0);
+    if (!node)
+      continue;
+    node->inode->blk_dev = dev;
+    node->inode->read_cb = blkdev_node_read;
+    node->inode->write_cb = blkdev_node_write;
+    node->inode->size = (usize)(dev->block_size * dev->block_count);
+    node->inode->mode = 0660;
   }
 }

@@ -21,20 +21,24 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **74 applets**. Migration wave 1
+The isolated package currently configures **83 applets**. Migration wave 1
 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
 `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
 and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
 `bzip2`, `bunzip2`, `unxz` and `xzcat`. Wave 3 added `ps`, `top`, `free`,
-`uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`:
+`uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`. Wave 4 added `mount`,
+`umount`, `nslookup`, `lsof`, `netstat`, `route`, `ifconfig`, `blkid` and
+`fdisk`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
 - **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`
 - **Path Manipulation**: `basename`, `dirname`, `realpath`
 - **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`
-- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`
+- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`, `lsof`
+- **Storage & Mount**: `mount`, `umount`, `blkid`, `fdisk`
+- **Networking**: `nslookup`, `netstat`, `route`, `ifconfig`
 - **Archive & Compression**: `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `unxz`, `xzcat`
 - **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
 - **Checksums**: `cksum`, `md5sum`, `sha256sum`
@@ -213,6 +217,48 @@ Kernel/libc/build changes this wave needed:
 
 `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks) is
 deferred to a follow-up sub-wave.
+
+### Migration wave 4: storage & networking (partial)
+
+Enabled and smoke-tested (`BB-W4:` markers), green on **both** arches (`x86_64`
+and `i686`): `mount`, `umount`, `nslookup`, `lsof`, `netstat`, `route`,
+`ifconfig`, `blkid`, `fdisk`. Coverage: a `mount`/`umount` round trip on
+`sata0`; `nslookup` of a numeric address (deterministic, no live DNS);
+`netstat -tln` finding the dropbear `:22` listener via `/proc/net/tcp`;
+`route -n` showing the on-link `10.0.2.0/24` route; `ifconfig eth0` reading the
+DHCP `10.0.2.15` via SIOCGIF* ioctls; `blkid /dev/sata0` identifying ext4;
+`fdisk -l /dev/sata0` reading geometry via the BLK* ioctls; `lsof` listing open
+files from `/proc/<pid>/fd/`.
+
+Kernel/libc infrastructure this wave added:
+
+- **`/proc/net/{tcp,tcp6,udp,unix}`** from the kernel socket tables, and
+  **`/proc/net/route`** — netstat/route parse these. The scanf engine gained
+  the **`%[...]` scanset** conversion they rely on (without it netstat reported
+  "bogus data" and route a "read error").
+- **`socket_file_ops.ioctl`** serving the `SIOCGIF*` interface queries for a
+  single modelled `eth0` (ifconfig); `SIOCADDRT/DELRT` accepted as no-ops.
+- **`/dev/<name>` block-device nodes** (byte-addressed cached read/write +
+  read-modify-write) with the **BLK\* size ioctls** and **`/proc/partitions`**
+  — blkid and fdisk read through these.
+- **`/proc/<pid>/fd/`** fd symlinks (lsof); `<sys/mount.h>` + `mount()`/
+  `umount()`; minimal `<resolv.h>` + `res_init()`; `getservbyport`, `strnlen`,
+  `if_nametoindex`, `_IOC`/`_IOR` macros, `caddr_t`; headers `net/route.h`,
+  `net/if.h` (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`.
+
+Deferred to **wave 4b** (each needs a distinct new kernel subsystem):
+
+- `ping` — raw `SOCK_RAW`/ICMP sockets plus ICMP-receive routing into the
+  socket's recv queue (the kernel already does ICMP echo for the built-in
+  ping).
+- `losetup` — a loop-device ioctl surface: `/dev/loop-control`
+  (LOOP_CTL_GET_FREE) and LOOP_SET_FD/CLR_FD on `/dev/loopN` (the kernel has a
+  `loop_register_file` internal API but no ioctl front end).
+- `ip` — BusyBox `ip` speaks **rtnetlink** exclusively, so it needs an
+  `AF_NETLINK` socket personality answering RTM_GETLINK/GETADDR/GETROUTE dumps.
+
+`lsblk` is **not shipped by upstream BusyBox 1.36** — `blkid` and `fdisk -l`
+cover the block-inspection role.
 
 ### Wave 3: upstream `ash`
 

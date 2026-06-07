@@ -5,6 +5,8 @@
 #include <stdlib.h>
 #include <string.h>
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
+#include <b1nix/syscall.h>
 
 struct udp_binding {
   int used;
@@ -239,8 +241,149 @@ static void socket_release(struct vfs_handle *h) {
 /* No per-fd ->close: a close() on one of several dup'd/forked references must
  * not disturb the connection. Teardown happens once, in ->release, when the
  * handle refcount reaches zero (see socket_teardown). */
+/* ── Interface ioctls (SIOCGIF*) for BusyBox ifconfig ──
+ * b1nix models a single configured interface, "eth0", carrying the
+ * DHCP-assigned IPv4 address and the active NIC's MAC. Route-mutation ioctls
+ * (SIOCADDRT/SIOCDELRT) are accepted as no-ops. */
+#define SIOC_ADDRT      0x890B
+#define SIOC_DELRT      0x890C
+#define SIOC_GIFNAME    0x8910
+#define SIOC_GIFCONF    0x8912
+#define SIOC_GIFFLAGS   0x8913
+#define SIOC_GIFADDR    0x8915
+#define SIOC_GIFBRDADDR 0x8919
+#define SIOC_GIFNETMASK 0x891B
+#define SIOC_GIFMETRIC  0x891D
+#define SIOC_GIFMTU     0x8921
+#define SIOC_GIFHWADDR  0x8927
+#define SIOC_GIFINDEX   0x8933
+#define SIOC_GIFTXQLEN  0x8942
+
+#define IFF_UP        0x1
+#define IFF_BROADCAST 0x2
+#define IFF_RUNNING   0x40
+#define IFF_MULTICAST 0x1000
+
+#define ARPHRD_ETHER 1
+
+struct k_ifreq {
+  char ifr_name[16];
+  union {
+    struct b1nix_sockaddr_in addr; /* 16 bytes */
+    struct {
+      u16 sa_family;
+      u8 sa_data[14];
+    } sa;
+    short flags;
+    int ival;
+  } u;
+};
+
+struct k_ifconf {
+  int len;
+  char *buf; /* user pointer (natural alignment matches userspace per arch) */
+};
+
+static u32 net_ip_as_be(struct ipv4_addr a) {
+  return (u32)a.bytes[0] | ((u32)a.bytes[1] << 8) | ((u32)a.bytes[2] << 16) |
+         ((u32)a.bytes[3] << 24);
+}
+
+static int socket_ioctl(struct vfs_handle *h, u64 request, void *arg) {
+  (void)h;
+  if (!arg)
+    return -EFAULT;
+
+  if (request == SIOC_ADDRT || request == SIOC_DELRT)
+    return 0; /* routing table is implicit; accept the request */
+
+  if (request == SIOC_GIFCONF) {
+    struct k_ifconf ifc;
+    if (syscall_copyin(&ifc, arg, sizeof(ifc)) != 0)
+      return -EFAULT;
+    struct k_ifreq r;
+    memset(&r, 0, sizeof(r));
+    int n = 0;
+    if (netdev_active()) {
+      strncpy(r.ifr_name, "eth0", sizeof(r.ifr_name) - 1);
+      r.u.addr.sin_family = B1NIX_AF_INET;
+      r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
+      n = 1;
+    }
+    if (ifc.buf && n && ifc.len >= (int)sizeof(r)) {
+      if (syscall_copyout(ifc.buf, &r, sizeof(r)) != 0)
+        return -EFAULT;
+    }
+    ifc.len = n * (int)sizeof(r);
+    if (syscall_copyout(arg, &ifc, sizeof(ifc)) != 0)
+      return -EFAULT;
+    return 0;
+  }
+
+  /* All remaining commands take a struct ifreq. */
+  struct k_ifreq r;
+  if (syscall_copyin(&r, arg, sizeof(r)) != 0)
+    return -EFAULT;
+  if (!netdev_active())
+    return -ENODEV;
+
+  switch (request) {
+  case SIOC_GIFADDR:
+    memset(&r.u, 0, sizeof(r.u));
+    r.u.addr.sin_family = B1NIX_AF_INET;
+    r.u.addr.sin_addr = net_ip_as_be(net_get_ip());
+    break;
+  case SIOC_GIFNETMASK: {
+    struct ipv4_addr nm = {{255, 255, 255, 0}};
+    memset(&r.u, 0, sizeof(r.u));
+    r.u.addr.sin_family = B1NIX_AF_INET;
+    r.u.addr.sin_addr = net_ip_as_be(nm);
+    break;
+  }
+  case SIOC_GIFBRDADDR: {
+    struct ipv4_addr ip = net_get_ip();
+    struct ipv4_addr bc = {{ip.bytes[0], ip.bytes[1], ip.bytes[2], 255}};
+    memset(&r.u, 0, sizeof(r.u));
+    r.u.addr.sin_family = B1NIX_AF_INET;
+    r.u.addr.sin_addr = net_ip_as_be(bc);
+    break;
+  }
+  case SIOC_GIFFLAGS:
+    r.u.flags = IFF_UP | IFF_BROADCAST | IFF_RUNNING | IFF_MULTICAST;
+    break;
+  case SIOC_GIFHWADDR: {
+    struct mac_addr m = net_get_mac();
+    memset(&r.u, 0, sizeof(r.u));
+    r.u.sa.sa_family = ARPHRD_ETHER;
+    memcpy(r.u.sa.sa_data, m.bytes, 6);
+    break;
+  }
+  case SIOC_GIFMTU:
+    r.u.ival = 1500;
+    break;
+  case SIOC_GIFINDEX:
+    r.u.ival = 1;
+    break;
+  case SIOC_GIFMETRIC:
+    r.u.ival = 0;
+    break;
+  case SIOC_GIFTXQLEN:
+    r.u.ival = 1000;
+    break;
+  case SIOC_GIFNAME:
+    strncpy(r.ifr_name, "eth0", sizeof(r.ifr_name) - 1);
+    break;
+  default:
+    return -ENOTTY;
+  }
+  if (syscall_copyout(arg, &r, sizeof(r)) != 0)
+    return -EFAULT;
+  return 0;
+}
+
 const struct vfs_file_ops socket_file_ops = {
-  .read = socket_read, .write = socket_write, .poll = socket_poll, .release = socket_release
+  .read = socket_read, .write = socket_write, .poll = socket_poll,
+  .release = socket_release, .ioctl = socket_ioctl
 };
 
 void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
@@ -721,4 +864,18 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len) {
     }
   }
   return 0;
+}
+
+usize udp_binding_snapshot(struct net_sock_info *out, usize max) {
+  usize n = 0;
+  for (int i = 0; i < MAX_UDP_BINDINGS && n < max; i++) {
+    if (!udp_bindings[i].used)
+      continue;
+    struct net_sock_info *e = &out[n++];
+    memset(e, 0, sizeof(*e));
+    e->family = 4;
+    e->local_port = udp_bindings[i].port;
+    e->state = 0x07; /* Linux marks UDP sockets CLOSE(7); netstat ignores it */
+  }
+  return n;
 }

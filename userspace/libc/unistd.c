@@ -1256,6 +1256,22 @@ int klogctl(int type, char *bufp, int len) {
   }
 }
 
+int mount(const char *source, const char *target, const char *filesystemtype,
+          unsigned long mountflags, const void *data) {
+  (void)data; /* b1nix SYS_MOUNT takes no fs-specific data argument */
+  return _check_err(syscall(SYS_MOUNT, source, target, filesystemtype,
+                            (long)mountflags));
+}
+
+int umount(const char *target) {
+  return _check_err(syscall(SYS_UMOUNT, target));
+}
+
+int umount2(const char *target, int flags) {
+  (void)flags; /* b1nix has no lazy/force unmount distinction yet */
+  return _check_err(syscall(SYS_UMOUNT, target));
+}
+
 int usleep(unsigned int usec) {
   struct timespec req;
   req.tv_sec = (time_t)(usec / 1000000u);

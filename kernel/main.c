@@ -278,6 +278,7 @@ void kernel_main(usize arg0, usize arg1)
 	compositor_init();
 	virtio_gpu_init();
 	ramdisk_init();
+	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk */
 #endif
 #ifndef __aarch64__
 	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use

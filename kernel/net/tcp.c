@@ -1358,3 +1358,54 @@ void tcp_timer_tick(void) {
   }
   __atomic_clear(&tcp_timer_ticking, __ATOMIC_RELEASE);
 }
+
+/* Map a b1nix TCP state to the Linux /proc/net/tcp "st" code that BusyBox
+ * netstat parses. */
+static int tcp_linux_st(int state) {
+  switch (state) {
+  case TCP_ESTABLISHED:  return 0x01;
+  case TCP_SYN_SENT:     return 0x02;
+  case TCP_SYN_RECEIVED: return 0x03;
+  case TCP_FIN_WAIT1:    return 0x04;
+  case TCP_FIN_WAIT2:    return 0x05;
+  case TCP_TIME_WAIT:    return 0x06;
+  case TCP_CLOSED:       return 0x07;
+  case TCP_CLOSE_WAIT:   return 0x08;
+  case TCP_LAST_ACK:     return 0x09;
+  case TCP_LISTEN:       return 0x0A;
+  case TCP_CLOSING:      return 0x0B;
+  default:               return 0x07;
+  }
+}
+
+usize tcp_conn_snapshot(struct net_sock_info *out, usize max) {
+  usize n = 0;
+  struct ipv4_addr myip = net_get_ip();
+  u64 irq = irq_save();
+  tcp_lock();
+  for (int i = 0; i < MAX_TCP_CONNS && n < max; i++) {
+    if (!tcp_conns[i].used)
+      continue;
+    struct net_sock_info *e = &out[n++];
+    memset(e, 0, sizeof(*e));
+    e->family = (tcp_conns[i].family == B1NIX_AF_INET6) ? 6 : 4;
+    e->local_port = tcp_conns[i].local_port;
+    e->remote_port = tcp_conns[i].remote_port;
+    e->state = tcp_linux_st(tcp_conns[i].state);
+    if (e->family == 6) {
+      memcpy(e->remote_ip, tcp_conns[i].remote_ip6.bytes, 16);
+      /* listeners bind the wildcard address; established use the host IP6 */
+      if (tcp_conns[i].state != TCP_LISTEN) {
+        struct in6_addr_k l = net_get_ip6();
+        memcpy(e->local_ip, l.bytes, 16);
+      }
+    } else {
+      memcpy(e->remote_ip, tcp_conns[i].remote_ip.bytes, 4);
+      if (tcp_conns[i].state != TCP_LISTEN)
+        memcpy(e->local_ip, myip.bytes, 4);
+    }
+  }
+  tcp_unlock();
+  irq_restore(irq);
+  return n;
+}

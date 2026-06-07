@@ -591,6 +591,33 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox pgrep busybox | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W3: ok pgrep\"\n"
     "/opt/busybox/bin/busybox pkill busybox && echo \"BB-W3: ok pkill\"\n"
     "echo \"BB-W3: done\"\n"
+    /* ── Migration wave 4: storage & networking inspection/config. ── */
+    "echo \"BB-W4: start\"\n"
+    /* mount/umount round trip on sata0 (ext4), which M14 leaves unmounted. */
+    "/opt/busybox/bin/busybox mkdir -p /mnt/w4\n"
+    "/opt/busybox/bin/busybox mount -t ext4 sata0 /mnt/w4\n"
+    "/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q \"/mnt/w4\" && echo \"BB-W4: ok mount\"\n"
+    "/opt/busybox/bin/busybox umount /mnt/w4\n"
+    "/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q \"/mnt/w4\" || echo \"BB-W4: ok umount\"\n"
+    /* nslookup on a numeric address: getaddrinfo numeric fast path, no live DNS
+     * query, so deterministic offline. */
+    "/opt/busybox/bin/busybox nslookup 10.0.2.2 | /opt/busybox/bin/busybox grep -q \"10.0.2.2\" && echo \"BB-W4: ok nslookup\"\n"
+    /* lsof reads /proc/<pid>/fd/ symlinks; every process has open files. */
+    "/opt/busybox/bin/busybox lsof 2>/dev/null | /opt/busybox/bin/busybox grep -q \"/\" && echo \"BB-W4: ok lsof\"\n"
+    /* netstat reads /proc/net/tcp; the dropbear SSH daemon listens on :22. */
+    "/opt/busybox/bin/busybox netstat -tln | /opt/busybox/bin/busybox grep -q \":22\" && echo \"BB-W4: ok netstat\"\n"
+    /* route reads /proc/net/route; the on-link 10.0.2.0/24 route is always
+     * present once DHCP assigns 10.0.2.15. */
+    "/opt/busybox/bin/busybox route -n | /opt/busybox/bin/busybox grep -q \"10.0.2\" && echo \"BB-W4: ok route\"\n"
+    /* ifconfig queries the interface via SIOCGIF* ioctls; eth0 carries the
+     * DHCP-assigned 10.0.2.15. */
+    "/opt/busybox/bin/busybox ifconfig eth0 | /opt/busybox/bin/busybox grep -q \"10.0.2.15\" && echo \"BB-W4: ok ifconfig\"\n"
+    /* blkid reads the /dev/sata0 block node and identifies the ext4 fs that
+     * M14 wrote and left unmounted. */
+    "/opt/busybox/bin/busybox blkid /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -qi \"ext\" && echo \"BB-W4: ok blkid\"\n"
+    /* fdisk -l reads the /dev/sata0 geometry via the BLK* ioctls. */
+    "/opt/busybox/bin/busybox fdisk -l /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -q \"Disk /dev/sata0\" && echo \"BB-W4: ok fdisk\"\n"
+    "echo \"BB-W4: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq\n"

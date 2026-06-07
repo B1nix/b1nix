@@ -775,12 +775,29 @@ upstream applets pass the same workflows.
     three include guards to also fire for `__b1nix__`.
   `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks)
   is deferred to a follow-up sub-wave.
-- [ ] `planned` Migration wave 4, storage and networking. Port `mount`,
-  `umount`, `lsblk`, `blkid`, `losetup`, `fdisk`, `ifconfig`, `ip`, `route`,
-  `netstat`, `ping`, `nslookup` and DHCP/network service applets. Expose b1nix
-  block-device, mount and network state through stable userspace APIs or a
-  narrow BusyBox platform backend; do not implement a general Linux syscall
-  personality as part of this milestone.
+- [~] `partial` Migration wave 4, storage and networking. **Nine applets
+  enabled and smoke-tested** (`BB-W4:` markers), green on **both** arches —
+  `x86_64` and `i686` both pass all ten markers, suite ~451/0 modulo the
+  pre-existing M37 e1000/SMP timing flake: `mount`, `umount` (libc wrappers +
+  `<sys/mount.h>` over SYS_MOUNT/UMOUNT), `nslookup` (minimal `<resolv.h>` +
+  `res_init`; resolution via `getaddrinfo`→SYS_NET_DNS), `netstat` (new
+  `/proc/net/{tcp,tcp6,udp,unix}` from the kernel socket tables), `route` (new
+  `/proc/net/route`, on-link subnet + default gateway), `ifconfig` (new
+  `socket_file_ops.ioctl` serving SIOCGIF* from netdev/net state for a single
+  modelled `eth0`), `blkid` + `fdisk` (new `/dev/<name>` block nodes with cached
+  byte I/O + BLK* size ioctls, `/proc/partitions`), and `lsof`
+  (`/proc/<pid>/fd/` fd symlinks — the deferred wave-3 item). Enabling
+  infrastructure that landed: the scanf engine gained the `%[...]` **scanset**
+  conversion (netstat/route parse `/proc/net/*` with it), `getservbyport`,
+  `strnlen`, `_IOC`/`_IOR` macros, and headers `net/route.h`, `net/if.h`
+  (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`, `caddr_t`.
+  **Deferred to a wave-4b sub-wave** (each needs a distinct new kernel
+  subsystem): `ping` (raw `SOCK_RAW`/ICMP sockets + ICMP receive routing),
+  `losetup` (a loop-device ioctl surface — `/dev/loop-control` + LOOP_SET_FD on
+  `/dev/loopN`), and `ip` (it speaks **rtnetlink** exclusively, so it needs an
+  `AF_NETLINK` socket personality with RTM_GETLINK/GETADDR/GETROUTE dumps).
+  `lsblk` is **not shipped by BusyBox 1.36** at all — `blkid` + `fdisk -l`
+  cover its inspection role.
 - [ ] `planned` Migration wave 5, shell/login/init applets. Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are

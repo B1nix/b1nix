@@ -140,6 +140,19 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags);
 int tcp_close(struct tcp_conn *conn);
 int tcp_listen(u16 local_port, int backlog);
 struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip, u16 *client_port);
+/* Socket-table snapshot for /proc/net/{tcp,udp} (netstat). Fills up to `max`
+ * entries and returns the count written. `state` carries the Linux
+ * /proc/net/tcp st code (0x0A = LISTEN, 0x01 = ESTABLISHED, ...); 0 for UDP. */
+struct net_sock_info {
+	u8 family;          /* 4 = IPv4, 6 = IPv6 */
+	u8 local_ip[16];
+	u8 remote_ip[16];
+	u16 local_port;
+	u16 remote_port;
+	int state;
+};
+usize tcp_conn_snapshot(struct net_sock_info *out, usize max);
+usize udp_binding_snapshot(struct net_sock_info *out, usize max);
 /* TCP over IPv6 (loopback ::1). */
 void tcp6_receive(struct in6_addr_k src, const void *data, usize size);
 struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port);

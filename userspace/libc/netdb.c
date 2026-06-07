@@ -5,6 +5,9 @@
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
+#include <fcntl.h>
+#include <unistd.h>
+#include <resolv.h>
 #include "syscall.h"
 
 int h_errno = 0;
@@ -398,6 +401,41 @@ int getnameinfo(const struct sockaddr *sa, socklen_t salen, char *host,
   return 0;
 }
 
+/* Reverse of getservbyname: map a well-known port (network byte order) back to
+ * a service name. BusyBox netstat calls this to label ports; unknown ports
+ * return NULL and netstat falls back to the numeric form. */
+struct servent *getservbyport(int port, const char *proto) {
+  static struct servent se;
+  static char *aliases[1] = {NULL};
+  static char s_name_buf[16];
+  static char s_proto_buf[16];
+  unsigned short p = ntohs((unsigned short)port);
+  const char *name = 0;
+  switch (p) {
+  case 21:  name = "ftp";   break;
+  case 22:  name = "ssh";   break;
+  case 23:  name = "telnet"; break;
+  case 25:  name = "smtp";  break;
+  case 53:  name = "domain"; break;
+  case 80:  name = "http";  break;
+  case 443: name = "https"; break;
+  default:  return NULL;
+  }
+  strncpy(s_name_buf, name, sizeof(s_name_buf) - 1);
+  s_name_buf[sizeof(s_name_buf) - 1] = '\0';
+  se.s_name = s_name_buf;
+  se.s_aliases = aliases;
+  se.s_port = (unsigned short)port;
+  if (proto) {
+    strncpy(s_proto_buf, proto, sizeof(s_proto_buf) - 1);
+    s_proto_buf[sizeof(s_proto_buf) - 1] = '\0';
+    se.s_proto = s_proto_buf;
+  } else {
+    se.s_proto = "tcp";
+  }
+  return &se;
+}
+
 struct servent *getservbyname(const char *name, const char *proto) {
   static struct servent se;
   static char *aliases[1] = {NULL};
@@ -443,4 +481,55 @@ struct servent *getservbyname(const char *name, const char *proto) {
   }
 
   return &se;
+}
+
+/* ── Minimal resolver state for BusyBox nslookup ──
+ * Real name resolution goes through the kernel (getaddrinfo -> SYS_NET_DNS);
+ * _res only exists so nslookup can print the default nameserver. res_init()
+ * reads the first "nameserver" line from /etc/resolv.conf. */
+struct __res_state _res;
+
+int res_init(void) {
+  memset(&_res, 0, sizeof(_res));
+  _res.options = RES_INIT;
+  _res.nscount = 0;
+
+  int fd = open("/etc/resolv.conf", O_RDONLY);
+  if (fd >= 0) {
+    char buf[512];
+    ssize_t n = read(fd, buf, sizeof(buf) - 1);
+    close(fd);
+    if (n > 0) {
+      buf[n] = '\0';
+      char *line = buf;
+      while (line && *line && _res.nscount < MAXNS) {
+        char *nl = strchr(line, '\n');
+        if (nl)
+          *nl = '\0';
+        if (strncmp(line, "nameserver", 10) == 0) {
+          char *p = line + 10;
+          while (*p == ' ' || *p == '\t')
+            p++;
+          struct in_addr a;
+          if (inet_aton(p, &a)) {
+            struct sockaddr_in *sin = &_res.nsaddr_list[_res.nscount];
+            sin->sin_family = AF_INET;
+            sin->sin_port = htons(53);
+            sin->sin_addr = a;
+            _res.nscount++;
+          }
+        }
+        line = nl ? nl + 1 : 0;
+      }
+    }
+  }
+  return 0;
+}
+
+/* Single modelled interface: eth0 has index 1, "lo" index 1 too (b1nix has no
+ * separate loopback ifindex); unknown names return 0. */
+unsigned int if_nametoindex(const char *ifname) {
+  if (ifname && ifname[0])
+    return 1;
+  return 0;
 }
