@@ -20,6 +20,7 @@
 #define NET_MAX_NETDEVS 8
 
 static struct netdev *g_netdev;
+static struct netdev *g_receiving_netdev;
 static struct netdev *g_netdevs[NET_MAX_NETDEVS];
 static usize g_netdev_count;
 
@@ -38,6 +39,7 @@ void netdev_register(struct netdev *nd)
 }
 
 struct netdev *netdev_active(void) { return g_netdev; }
+struct netdev *netdev_receiving(void) { return g_receiving_netdev; }
 
 static int netdev_link_state(struct netdev *nd)
 {
@@ -127,6 +129,39 @@ static void net_switch_active(struct netdev *nd)
 	console_write("net: switched active driver to ");
 	console_write(nd->name);
 	console_write("\n");
+}
+
+int net_dhcp_try_failover(void)
+{
+	if (g_netdev_count < 2)
+		return 0;
+
+	usize active_index = 0;
+	for (usize i = 0; i < g_netdev_count; i++) {
+		if (g_netdevs[i] == g_netdev) {
+			active_index = i;
+			break;
+		}
+	}
+
+	/* Prefer a definite carrier, then allow devices whose driver cannot report
+	 * carrier. Walk from the current interface so registration order is only a
+	 * starting point, not a permanent preference. */
+	for (int pass = 0; pass < 2; pass++) {
+		for (usize step = 1; step < g_netdev_count; step++) {
+			struct netdev *candidate =
+				g_netdevs[(active_index + step) % g_netdev_count];
+			int link = netdev_link_state(candidate);
+			if ((pass == 0 && link != 1) || (pass == 1 && link >= 0))
+				continue;
+			net_switch_active(candidate);
+			last_link_state = link;
+			if (networking_enabled)
+				dhcp_init();
+			return 1;
+		}
+	}
+	return 0;
 }
 
 /* Build the EUI-64 modified interface identifier from the 48-bit MAC and
@@ -328,6 +363,7 @@ static void net_task(void *arg)
 void net_init(void)
 {
 	g_netdev = 0;
+	g_receiving_netdev = 0;
 	g_netdev_count = 0;
 	memset(g_netdevs, 0, sizeof(g_netdevs));
 	memset(&local_mac, 0, sizeof(local_mac));
@@ -468,6 +504,12 @@ void net_poll(void)
 
 	tcp_timer_tick();
 
-	if (nd->poll)
-		nd->poll(nd);
+	for (usize i = 0; i < g_netdev_count; i++) {
+		struct netdev *polled = g_netdevs[i];
+		if (!polled || !polled->poll)
+			continue;
+		g_receiving_netdev = polled;
+		polled->poll(polled);
+	}
+	g_receiving_netdev = 0;
 }

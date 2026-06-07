@@ -1,5 +1,6 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/io.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
@@ -11,6 +12,7 @@
 
 #define VIRTIO_BLK_T_IN 0
 #define VIRTIO_BLK_T_OUT 1
+#define VIRTIO_BLK_CONFIG_CAPACITY 0x14
 
 /* Support multiple virtio-blk devices */
 #define MAX_VIRTIO_BLK 8
@@ -257,7 +259,11 @@ void virtio_blk_init(void) {
 
     inst->blk.name = name;
     inst->blk.block_size = 512;
-    inst->blk.block_count = 0;
+    inst->blk.block_count =
+        (u64)inl((u16)(inst->dev.port_base + VIRTIO_BLK_CONFIG_CAPACITY)) |
+        ((u64)inl((u16)(inst->dev.port_base +
+                        VIRTIO_BLK_CONFIG_CAPACITY + 4))
+         << 32);
     inst->blk.read_blocks = virtio_blk_read;
     inst->blk.write_blocks = virtio_blk_write;
     inst->blk.priv = inst;

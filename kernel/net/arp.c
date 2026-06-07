@@ -1,5 +1,6 @@
 #include <b1nix/net.h>
 #include <b1nix/console.h>
+#include <b1nix/bootinfo.h>
 #include <string.h>
 
 #define ARP_HW_ETHERNET 1
@@ -37,7 +38,7 @@ static int arp_smoke_reply_logged;
 
 static void arp_smoke_mark_resolution(void)
 {
-	if (!arp_smoke_resolution_logged) {
+	if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_resolution_logged) {
 		arp_smoke_resolution_logged = 1;
 		console_write("\nARP-SMOKE: resolution-ready\n");
 	}
@@ -82,7 +83,9 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
 		}
 	}
 
-	if (!found || !arp_smoke_request_logged) {
+	int smoke_probe = bootinfo_has_flag("b1nix.test=1") &&
+	                  !arp_smoke_request_logged;
+	if (!found || smoke_probe) {
 		// Send ARP request
 		struct arp_packet req;
 		req.hw_type = bswap16(ARP_HW_ETHERNET);
@@ -98,7 +101,7 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac)
 		struct mac_addr bcast = { { 0xFF, 0xFF, 0xFF, 0xFF, 0xFF, 0xFF } };
 		net_send_ethernet(bcast, 0x0806, &req, sizeof(req));
 		
-		if (!arp_smoke_request_logged) {
+			if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_request_logged) {
 			console_write("\nARP-SMOKE: request-sent\n");
 			arp_smoke_request_logged = 1;
 		}
@@ -124,7 +127,7 @@ void arp_receive(const void *data, usize size)
 	arp_smoke_mark_resolution();
 	
 	if (bswap16(pkt->op) == ARP_OP_REPLY) {
-		if (!arp_smoke_reply_logged) {
+		if (bootinfo_has_flag("b1nix.test=1") && !arp_smoke_reply_logged) {
 			console_write("\nARP-SMOKE: reply-received\n");
 			arp_smoke_reply_logged = 1;
 		}

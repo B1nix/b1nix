@@ -47,6 +47,8 @@ static u64 last_request_ticks = 0;
 static u64 transaction_start_ticks = 0;
 static u32 discover_attempts = 0;
 static u32 request_attempts = 0;
+static u32 consecutive_naks = 0;
+static u64 retry_not_before_ticks = 0;
 static int dhcp_udp_registered = 0;
 static int dhcp_fallback_announced = 0;
 static struct ipv4_addr offered_gw = {{0, 0, 0, 0}};
@@ -263,6 +265,7 @@ void dhcp_init(void)
 	renew_ticks = 0;
 	rebind_ticks = 0;
 	transaction_start_ticks = scheduler_get_uptime_ticks();
+	retry_not_before_ticks = 0;
 	offered_gw = (struct ipv4_addr){{0, 0, 0, 0}};
 	offered_mask = (struct ipv4_addr){{0, 0, 0, 0}};
 	offered_dns = (struct ipv4_addr){{0, 0, 0, 0}};
@@ -286,6 +289,8 @@ void dhcp_stop(void)
 {
 	struct ipv4_addr zero = {{0, 0, 0, 0}};
 	dhcp_state = -1;
+	consecutive_naks = 0;
+	retry_not_before_ticks = 0;
 	net_set_ip(zero);
 	net_set_gateway(zero);
 }
@@ -368,6 +373,8 @@ void dhcp_receive(const void *data, usize size)
 		    parsed_dns.bytes[2] || parsed_dns.bytes[3])
 			dns_set_server(parsed_dns);
 		dhcp_state = 2; // Bound
+		consecutive_naks = 0;
+		retry_not_before_ticks = 0;
 		if (bootinfo_has_flag("b1nix.test=1"))
 			console_write("DHCP-SMOKE: lease-acquired\n");
 		u64 now = scheduler_get_uptime_ticks();
@@ -378,15 +385,40 @@ void dhcp_receive(const void *data, usize size)
 		console_write("net: dhcp bound to ");
 		dhcp_print_ipv4(ack_ip);
 		console_write("\n");
-	} else if (msg_type == 6) { // NAK
-		console_write("net: dhcp NAK, restarting discovery\n");
-		dhcp_init();
+	} else if (msg_type == 6 &&
+	           (dhcp_state == 1 || dhcp_state == 3 || dhcp_state == 4)) { // NAK
+		u64 now = scheduler_get_uptime_ticks();
+		consecutive_naks++;
+		if (consecutive_naks >= 3 && net_dhcp_try_failover()) {
+			consecutive_naks = 0;
+			return;
+		}
+
+		/* A server can NAK every immediate retry. Back off instead of filling
+		 * the console and network with a tight DISCOVER/REQUEST loop. */
+		if (consecutive_naks == 1)
+			console_write("net: dhcp NAK, retrying with backoff\n");
+		current_xid++;
+		dhcp_state = 0;
+		transaction_start_ticks = now;
+		last_request_ticks = now;
+		retry_not_before_ticks = now + 300;
+		offered_ip = (struct ipv4_addr){{0, 0, 0, 0}};
+		dhcp_server = (struct ipv4_addr){{0, 0, 0, 0}};
 	}
 }
 
 void dhcp_tick(u64 now_ticks) {
   if (dhcp_state < 0)
     return;
+  if (retry_not_before_ticks) {
+    if (now_ticks < retry_not_before_ticks)
+      return;
+    retry_not_before_ticks = 0;
+    transaction_start_ticks = now_ticks;
+    dhcp_send_discover();
+    return;
+  }
   if (dhcp_state == 0 && bootinfo_has_flag("b1nix.test=1") &&
       now_ticks - transaction_start_ticks >= 600 && !dhcp_fallback_announced) {
     struct ipv4_addr fallback_ip = {{10, 0, 2, 15}};

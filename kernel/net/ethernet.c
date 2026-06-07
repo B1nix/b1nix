@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/console.h>
 
 #define ETHERTYPE_IPV4 0x0800
@@ -7,6 +8,13 @@
 
 void ethernet_receive(const void *data, usize size)
 {
+	/* Drivers are all polled so their RX/TX rings keep moving, but the current
+	 * stack has one L3 address context. Do not let traffic from a standby NIC
+	 * poison ARP/DHCP state or produce replies on the active NIC. */
+	struct netdev *rx = netdev_receiving();
+	if (rx && rx != netdev_active())
+		return;
+
 	if (size < 14) return;
 
 	const u8 *header = data;

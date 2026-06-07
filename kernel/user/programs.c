@@ -347,6 +347,18 @@ static int readline(char *buffer, usize max_len) {
               buffer[0] = '\0';
             }
           }
+        } else if (b2 >= '0' && b2 <= '9') {
+          int parameter = 0;
+          char final = b2;
+          while (final >= '0' && final <= '9') {
+            parameter = parameter * 10 + (final - '0');
+            final =
+                (char)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+          }
+          if (final == '~' && parameter == 3 && len > 0) {
+            len--;
+            uwrite("\b \b");
+          }
         }
       }
       continue;

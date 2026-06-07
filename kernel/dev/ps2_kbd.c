@@ -2,15 +2,18 @@
 #include <b1nix/io.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
+#include <b1nix/bootinfo.h>
 
 #define KBD_BUFFER_SIZE 256
 
 static char kbd_buffer[KBD_BUFFER_SIZE];
 static usize kbd_head = 0;
 static usize kbd_tail = 0;
-static int shift_pressed = 0;
+static u8 shift_mask = 0;
 static int ctrl_pressed = 0;
 static int extended_scancode = 0;
+static int num_lock_enabled = 1;
+static int kbd_debug_enabled;
 
 static const char scancode_map[128] = {
     0, 27, '1', '2', '3', '4', '5', '6', '7', '8', '9', '0', '-', '=', '\b',
@@ -83,6 +86,8 @@ static u8 kbd_dev_read(void)
  * init compose regardless of order. */
 void ps2_kbd_init(void)
 {
+	kbd_debug_enabled = bootinfo_has_flag("b1nix.kbd-debug");
+
 	/* Disable the first port while we reconfigure, then drain stale bytes. */
 	kbd_ctrl_cmd(0xAD);
 	kbd_flush();
@@ -109,6 +114,14 @@ void ps2_kbd_init(void)
 
 	kbd_dev_write(0xF4);        /* enable scanning; device replies 0xFA */
 	(void)kbd_dev_read();
+	kbd_flush();
+
+	/* Keep the physical PS/2 LED in sync with our initial numeric mode. */
+	kbd_dev_write(0xED);        /* set LEDs */
+	if (kbd_dev_read() == 0xFA) {
+		kbd_dev_write(0x02);    /* Num Lock */
+		(void)kbd_dev_read();
+	}
 	kbd_flush();
 
 	/* Now arm IRQ1 (re-read config in case the device handshake touched it). */
@@ -150,6 +163,14 @@ static void kbd_push_escape(char final)
 	kbd_push(final);
 }
 
+static void kbd_push_escape_tilde(char number)
+{
+	kbd_push(27);
+	kbd_push('[');
+	kbd_push(number);
+	kbd_push('~');
+}
+
 static void kbd_push_fkey(int f)
 {
 	kbd_push(27);
@@ -158,10 +179,59 @@ static void kbd_push_fkey(int f)
 	kbd_push((char)f);
 }
 
+static void kbd_handle_keypad(u8 scancode)
+{
+	/* Console-friendly policy: keypad digits work immediately even when the
+	 * firmware LED state cannot be read. Num Lock on means numbers; when it is
+	 * off, holding Shift still requests numbers, matching the usual inversion
+	 * rule. Holding Shift with Num Lock on requests navigation. */
+	int shift_pressed = shift_mask != 0;
+	int numeric = num_lock_enabled ? !shift_pressed : shift_pressed;
+
+	if (numeric) {
+		switch (scancode) {
+		case 0x47: kbd_push('7'); break;
+		case 0x48: kbd_push('8'); break;
+		case 0x49: kbd_push('9'); break;
+		case 0x4B: kbd_push('4'); break;
+		case 0x4C: kbd_push('5'); break;
+		case 0x4D: kbd_push('6'); break;
+		case 0x4F: kbd_push('1'); break;
+		case 0x50: kbd_push('2'); break;
+		case 0x51: kbd_push('3'); break;
+		case 0x52: kbd_push('0'); break;
+		case 0x53: kbd_push('.'); break;
+		default: break;
+		}
+		return;
+	}
+
+	switch (scancode) {
+	case 0x47: kbd_push_escape('H'); break;       /* Home */
+	case 0x48: kbd_push_escape('A'); break;       /* Up */
+	case 0x49: kbd_push_escape_tilde('5'); break; /* Page Up */
+	case 0x4B: kbd_push_escape('D'); break;       /* Left */
+	case 0x4C: break;                              /* Keypad 5 */
+	case 0x4D: kbd_push_escape('C'); break;       /* Right */
+	case 0x4F: kbd_push_escape('F'); break;       /* End */
+	case 0x50: kbd_push_escape('B'); break;       /* Down */
+	case 0x51: kbd_push_escape_tilde('6'); break; /* Page Down */
+	case 0x52: kbd_push_escape_tilde('2'); break; /* Insert */
+	case 0x53: kbd_push_escape_tilde('3'); break; /* Delete */
+	default: break;
+	}
+}
+
 extern void ps2_mouse_handle_byte(u8 data);
 
 void ps2_kbd_handle_byte(u8 scancode)
 {
+	if (kbd_debug_enabled) {
+		console_write("kbd: raw=0x");
+		console_write_hex32(scancode);
+		console_write("\n");
+	}
+
 	if (scancode == 0xE0) {
 		extended_scancode = 1;
 		return;
@@ -170,8 +240,12 @@ void ps2_kbd_handle_byte(u8 scancode)
 	if (scancode & 0x80) {
 		// Key release
 		u8 key = scancode & 0x7F;
-		if (key == 0x2A || key == 0x36) { // Left or Right Shift
-			shift_pressed = 0;
+		if (extended_scancode && (key == 0x2A || key == 0x36)) {
+			/* Fake Shift used by some set-1 keypad/PrintScreen sequences. */
+		} else if (key == 0x2A) {
+			shift_mask &= (u8)~1u;
+		} else if (key == 0x36) {
+			shift_mask &= (u8)~2u;
 		} else if (key == 0x1D) {
 			ctrl_pressed = 0;
 		}
@@ -182,12 +256,21 @@ void ps2_kbd_handle_byte(u8 scancode)
 	} else {
 		if (extended_scancode) {
 			switch (scancode) {
+			case 0x2A: /* Fake Shift in keypad/PrintScreen sequence. */
+			case 0x36:
+				break;
 			case 0x48: kbd_push_escape('A'); break; /* up */
 			case 0x50: kbd_push_escape('B'); break; /* down */
 			case 0x4D: kbd_push_escape('C'); break; /* right */
 			case 0x4B: kbd_push_escape('D'); break; /* left */
 			case 0x47: kbd_push_escape('H'); break; /* home */
 			case 0x4F: kbd_push_escape('F'); break; /* end */
+			case 0x49: kbd_push_escape_tilde('5'); break; /* page up */
+			case 0x51: kbd_push_escape_tilde('6'); break; /* page down */
+			case 0x52: kbd_push_escape_tilde('2'); break; /* insert */
+			case 0x53: kbd_push_escape_tilde('3'); break; /* delete */
+			case 0x1C: kbd_push('\n'); break;             /* keypad enter */
+			case 0x35: kbd_push('/'); break;              /* keypad slash */
 			case 0x1D: /* Right Ctrl */
 			case 0x5B: /* Left GUI (Mac Cmd) */
 			case 0x5C: /* Right GUI (Mac Cmd) */
@@ -200,10 +283,14 @@ void ps2_kbd_handle_byte(u8 scancode)
 		}
 
 		// Key press
-		if (scancode == 0x2A || scancode == 0x36) {
-			shift_pressed = 1;
+		if (scancode == 0x2A) {
+			shift_mask |= 1u;
+		} else if (scancode == 0x36) {
+			shift_mask |= 2u;
 		} else if (scancode == 0x1D) {
 			ctrl_pressed = 1;
+		} else if (scancode == 0x45) {
+			num_lock_enabled = !num_lock_enabled;
 		} else if (scancode >= 0x3B && scancode <= 0x44) {
 			// F1 to F10
 			kbd_push_fkey((int)(scancode - 0x3B + 1));
@@ -211,8 +298,11 @@ void ps2_kbd_handle_byte(u8 scancode)
 			kbd_push_fkey(11);
 		} else if (scancode == 0x58) {
 			kbd_push_fkey(12);
+		} else if (scancode >= 0x47 && scancode <= 0x53 &&
+		           scancode != 0x4A && scancode != 0x4E) {
+			kbd_handle_keypad(scancode);
 		} else if (scancode < 128) {
-			char c = shift_pressed ? scancode_map_shift[scancode] : scancode_map[scancode];
+			char c = shift_mask ? scancode_map_shift[scancode] : scancode_map[scancode];
 			if (c != 0) {
 				if (ctrl_pressed && c >= 'a' && c <= 'z') {
 					c = (char)(c - 'a' + 1);

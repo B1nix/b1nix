@@ -18,6 +18,12 @@ URL="https://github.com/rockdaboot/libpsl/releases/download/${VER}/${TARBALL}"
 WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+PYTHON_BIN="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
+
+if [ -z "$PYTHON_BIN" ]; then
+  echo "tools/build-libpsl.sh: need host python3 (or set PYTHON=/path/to/python)" >&2
+  exit 1
+fi
 
 # Per-architecture build identity + per-triplet source/build dirs.
 . "$ROOT_DIR/tools/toolchain-env.sh"
@@ -103,7 +109,7 @@ mkdir -p "$BUILD_DIR"
 # through make which can trigger automake reconstruction).
 PSL_DAT="$SRC_DIR/list/public_suffix_list.dat"
 DAFSA_H="$BUILD_DIR/src/suffixes_dafsa.h"
-python "$SRC_DIR/src/psl-make-dafsa" --output-format=cxx+ "$PSL_DAT" "$DAFSA_H" 1>&2
+"$PYTHON_BIN" "$SRC_DIR/src/psl-make-dafsa" --output-format=cxx+ "$PSL_DAT" "$DAFSA_H" 1>&2
 
 # Disable autotools maintainer-mode rebuild rules. The release tarball ships
 # all generated files (configure, *.in, aclocal.m4) and we never edit the .ac/.am

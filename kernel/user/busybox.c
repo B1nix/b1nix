@@ -1812,7 +1812,7 @@ static int lsblk_main(int argc, const char **argv) {
   if (mount_count < 0)
     mount_count = 0;
 
-  printf("NAME       SIZE  BLKSZ  RO  MOUNTPOINT\n");
+  printf("NAME       SIZE  BLKSZ  MODE FSTYPE   MOUNTPOINT\n");
   usize count = blk_count();
   if (count == 0) {
     printf("(no block devices)\n");
@@ -1830,10 +1830,11 @@ static int lsblk_main(int argc, const char **argv) {
     if (!dev)
       continue;
     u64 bytes = dev->block_count * (u64)dev->block_size;
-    printf("%-10s ", dev->name);
+    printf("%s ", dev->name);
     print_size(bytes);
-    printf("  %5d  %s   %s\n", (int)dev->block_size,
+    printf("  %d  %s  %s  %s\n", (int)dev->block_size,
            dev->write_blocks ? "rw" : "ro",
+           blk_probe_fstype(dev),
            mountpoint_for_source(dev->name, mounts, mount_count));
   }
 #ifndef __aarch64__

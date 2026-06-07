@@ -83,7 +83,7 @@ static void ntp_receive(const void *data, usize size) {
 static int ntp_send_query(void) {
   if (!ntp_server_cached) {
     u8 ip[4];
-    if (dns_resolve_sync("pool.ntp.org", ip) != 0) return -1;
+    if (dns_resolve_sync_quiet("pool.ntp.org", ip) != 0) return -1;
     ntp_server_ip.bytes[0] = ip[0];
     ntp_server_ip.bytes[1] = ip[1];
     ntp_server_ip.bytes[2] = ip[2];

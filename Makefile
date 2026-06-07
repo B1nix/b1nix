@@ -740,7 +740,9 @@ install-kernel-source:
 	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)/ 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
-iso-full: userspace-install install-native-toolchain install-kernel-source iso
+# A full ISO must carry the staged rootfs. The old dependency on plain `iso`
+# built the toolchain and then omitted it from the resulting image.
+iso-full: iso-live
 
 run-x86_64: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)

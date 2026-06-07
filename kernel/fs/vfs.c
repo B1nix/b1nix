@@ -1734,7 +1734,22 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
       if (c == 27) {
         char next = tty_getc_blocking();
         if (next == '[') {
-          (void)tty_getc_blocking();
+          char final = tty_getc_blocking();
+          int parameter = 0;
+          while (final >= '0' && final <= '9') {
+            parameter = parameter * 10 + (final - '0');
+            final = tty_getc_blocking();
+          }
+          if (final == '~' && parameter == 3 && tty_line_len > 0) {
+            /*
+             * The canonical console does not track a movable cursor yet, so
+             * make Delete useful at the prompt by erasing the previous byte.
+             * This also handles NumPad '.' with NumLock disabled (CSI 3~).
+             */
+            tty_line_len--;
+            if (console.termios.c_lflag & B1NIX_ECHO)
+              console_write("\b \b");
+          }
           continue;
         }
         continue;

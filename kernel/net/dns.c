@@ -28,6 +28,7 @@ static volatile int g_dns_have = 0;
 static u8 g_dns_ip[4];
 static volatile int g_dns6_have = 0;
 static u8 g_dns6_ip[16];
+static int g_dns_verbose = 1;
 
 void dns_receive(const void *data, usize size);
 
@@ -101,9 +102,10 @@ int dns_load_resolv_conf(void)
 	return 0;
 }
 
-void dns_resolve(const char *domain)
+static void dns_resolve_start(const char *domain, int verbose)
 {
 	if (!domain || !*domain) return;
+	g_dns_verbose = verbose;
 	dns_load_resolv_conf();
 	if (!dns_udp_registered) {
 		udp_register_handler(12345, dns_receive);
@@ -148,9 +150,16 @@ void dns_resolve(const char *domain)
 
 	udp_send(g_dns_server, 12345, 53, buffer, req_size);
 
-	console_write("net: dns query sent for ");
-	console_write(domain);
-	console_write("\n");
+	if (g_dns_verbose) {
+		console_write("net: dns query sent for ");
+		console_write(domain);
+		console_write("\n");
+	}
+}
+
+void dns_resolve(const char *domain)
+{
+	dns_resolve_start(domain, 1);
 }
 
 void dns_receive(const void *data, usize size)
@@ -165,7 +174,8 @@ void dns_receive(const void *data, usize size)
 
 	u16 ancount = bswap16(hdr->ancount);
 	if (ancount == 0) {
-		console_write("net: dns returned 0 answers\n");
+		if (g_dns_verbose)
+			console_write("net: dns returned 0 answers\n");
 		return;
 	}
 
@@ -199,18 +209,21 @@ void dns_receive(const void *data, usize size)
 		if (type == 1 && rdlength == 4 && ptr + 4 <= (const u8 *)data + size) {
 			memcpy(g_dns_ip, ptr, 4);
 			g_dns_have = 1;
-			console_write("net: dns resolved to ");
-			for (int i = 0; i < 4; i++) {
-				console_write_dec(ptr[i]);
-				if (i < 3) console_write(".");
+			if (g_dns_verbose) {
+				console_write("net: dns resolved to ");
+				for (int i = 0; i < 4; i++) {
+					console_write_dec(ptr[i]);
+					if (i < 3) console_write(".");
+				}
+				console_write("\n");
 			}
-			console_write("\n");
 		} else if (type == 28 && rdlength == 16 &&
 		           ptr + 16 <= (const u8 *)data + size) {
 			/* AAAA record: capture the 128-bit address. */
 			memcpy(g_dns6_ip, ptr, 16);
 			g_dns6_have = 1;
-			console_write("net: dns resolved AAAA\n");
+			if (g_dns_verbose)
+				console_write("net: dns resolved AAAA\n");
 		}
 	}
 }
@@ -229,11 +242,11 @@ int dns_last_result6(u8 out[16])
 	return 1;
 }
 
-int dns_resolve_sync(const char *domain, u8 out[4])
+static int dns_resolve_sync_impl(const char *domain, u8 out[4], int verbose)
 {
 	if (!domain || !*domain || !out) return -1;
 	g_dns_have = 0;
-	dns_resolve(domain);
+	dns_resolve_start(domain, verbose);
 	/* Poll the network for the response (a few hundred ms total). */
 	for (int i = 0; i < 100 && !g_dns_have; i++) {
 		net_poll();
@@ -243,4 +256,14 @@ int dns_resolve_sync(const char *domain, u8 out[4])
 	if (!g_dns_have) return -1;
 	memcpy(out, g_dns_ip, 4);
 	return 0;
+}
+
+int dns_resolve_sync(const char *domain, u8 out[4])
+{
+	return dns_resolve_sync_impl(domain, out, 1);
+}
+
+int dns_resolve_sync_quiet(const char *domain, u8 out[4])
+{
+	return dns_resolve_sync_impl(domain, out, 0);
 }

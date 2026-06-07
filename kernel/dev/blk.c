@@ -123,6 +123,8 @@ static u32 le32(const u8 *p) {
   return (u32)p[0] | ((u32)p[1] << 8) | ((u32)p[2] << 16) | ((u32)p[3] << 24);
 }
 
+static u16 le16(const u8 *p) { return (u16)p[0] | ((u16)p[1] << 8); }
+
 static u64 le64(const u8 *p) { return (u64)le32(p) | ((u64)le32(p + 4) << 32); }
 
 /* ── Partition I/O ── */
@@ -312,6 +314,83 @@ struct block_device *blk_at(usize index) {
   if (index >= blk_device_count)
     return 0;
   return blk_devices[index];
+}
+
+static int blk_read_bytes(struct block_device *dev, u64 offset, void *buffer,
+                          usize size) {
+  if (!dev || !dev->read_blocks || dev->block_size == 0 || size == 0)
+    return -1;
+  if (dev->block_count > 0) {
+    u64 device_size = dev->block_count * (u64)dev->block_size;
+    if (offset >= device_size || size > device_size - offset)
+      return -1;
+  }
+
+  u8 *block = kmalloc(dev->block_size);
+  if (!block)
+    return -1;
+
+  u8 *out = buffer;
+  while (size > 0) {
+    u64 lba = offset / dev->block_size;
+    usize within = (usize)(offset % dev->block_size);
+    usize chunk = dev->block_size - within;
+    if (chunk > size)
+      chunk = size;
+    if (blk_read_cached(dev, lba, 1, block) < 0) {
+      kfree(block);
+      return -1;
+    }
+    memcpy(out, block + within, chunk);
+    out += chunk;
+    offset += chunk;
+    size -= chunk;
+  }
+
+  kfree(block);
+  return 0;
+}
+
+const char *blk_probe_fstype(struct block_device *dev) {
+  u8 boot[512];
+  if (blk_read_bytes(dev, 0, boot, sizeof(boot)) < 0)
+    return "-";
+
+  if (memcmp(boot + 3, "NTFS    ", 8) == 0)
+    return "ntfs";
+  if (memcmp(boot + 3, "EXFAT   ", 8) == 0)
+    return "exfat";
+  if (memcmp(boot + 82, "FAT32   ", 8) == 0)
+    return "fat32";
+  if (memcmp(boot + 54, "FAT16   ", 8) == 0)
+    return "fat16";
+  if (memcmp(boot + 54, "FAT12   ", 8) == 0)
+    return "fat12";
+
+  u8 ext_sb[104];
+  if (blk_read_bytes(dev, 1024, ext_sb, sizeof(ext_sb)) == 0 &&
+      le16(ext_sb + 0x38) == 0xef53) {
+    u32 compat = le32(ext_sb + 0x5c);
+    u32 incompat = le32(ext_sb + 0x60);
+    if (incompat & (0x0040u | 0x0080u | 0x0100u | 0x0200u |
+                    0x4000u | 0x8000u))
+      return "ext4";
+    if (compat & 0x0004u)
+      return "ext3";
+    return "ext2";
+  }
+
+  u8 magic[8];
+  if (blk_read_bytes(dev, 65536 + 0x40, magic, sizeof(magic)) == 0 &&
+      memcmp(magic, "_BHRfS_M", 8) == 0)
+    return "btrfs";
+
+  u8 iso_magic[5];
+  if (blk_read_bytes(dev, 32768 + 1, iso_magic, sizeof(iso_magic)) == 0 &&
+      memcmp(iso_magic, "CD001", 5) == 0)
+    return "iso9660";
+
+  return "-";
 }
 
 /* ── Write-Back Cache Implementation ── */

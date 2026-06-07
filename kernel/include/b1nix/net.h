@@ -98,6 +98,9 @@ void dhcp_receive(const void *data, usize size);
 void dhcp_tick(u64 now_ticks);
 void dhcp_dump_info(void);
 void dhcp_stop(void);
+/* Called after repeated DHCP failures. Returns 1 when another interface was
+ * selected and DHCP was restarted there. */
+int net_dhcp_try_failover(void);
 
 // NTP (SNTP client)
 void ntp_tick(u64 now_ticks);
@@ -109,6 +112,8 @@ void dns_receive(const void *data, usize size);
  * arrives or a short timeout elapses. Returns 0 and fills out[4] on success,
  * -1 on timeout/failure. */
 int dns_resolve_sync(const char *domain, u8 out[4]);
+/* Internal-service variant: same lookup without console diagnostics. */
+int dns_resolve_sync_quiet(const char *domain, u8 out[4]);
 /* Last A-record result captured by dns_receive (1 if available, fills out). */
 int dns_last_result(u8 out[4]);
 /* Last AAAA-record result captured by dns_receive (1 if available, fills 16). */

@@ -11,9 +11,9 @@
  * driver-agnostic: it builds an ethernet header and a payload and hands them to
  * ->transmit, and it pumps received frames out of ->poll into
  * ethernet_receive(). Each NIC driver (virtio-net, e1000, ...) fills one of
- * these structs and calls netdev_register() once its device is fully up. The
- * first driver to register becomes the active interface; probe order is decided
- * in net_init().
+ * these structs and calls netdev_register() once its device is fully up.
+ * Registered devices are polled in parallel; one is selected as the active
+ * L3 interface and DHCP can fail over to another device with carrier.
  */
 struct netdev {
 	const char *name;          /* "virtio-net", "e1000", ...           */
@@ -53,12 +53,14 @@ struct netdev {
 	void *priv;                /* driver-private state */
 };
 
-/* Register the active NIC. The first successful registration wins; later
- * registrations are ignored (so probe order in net_init picks the preference). */
+/* Register a NIC. All registered devices remain serviced by net_poll(). */
 void netdev_register(struct netdev *nd);
 
 /* The active NIC, or NULL if none was probed. */
 struct netdev *netdev_active(void);
+
+/* The NIC whose ->poll callback is currently delivering received frames. */
+struct netdev *netdev_receiving(void);
 
 /*
  * Driver probe entry points, invoked in order by net_init(). Each returns 1 if
