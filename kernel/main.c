@@ -16,6 +16,7 @@
 #include <b1nix/ext1.h>
 #include <b1nix/fat32.h>
 #include <b1nix/exfat.h>
+#include <b1nix/ntfs.h>
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
@@ -262,6 +263,7 @@ void kernel_main(usize arg0, usize arg1)
 	btrfs_init();
 	isofs_init();
 	exfat_init();
+	ntfs_init();
 	procfs_init();
 	sysfs_init();
 	filelock_init();

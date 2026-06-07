@@ -737,3 +737,57 @@ upstream applets pass the same workflows.
 
 Detailed interface inventory and current applet list:
 [`docs/busybox-port.md`](busybox-port.md).
+
+## M43: Real-Filesystem Validation & NTFS
+
+Goal: prove the in-kernel filesystem drivers work against *genuine* on-disk
+filesystems — partitions formatted by the standard Linux/Windows mkfs tools and
+populated with a real directory tree — rather than only the tiny synthetic
+mke2fs scratch images the main smoke uses. This exposed (and fixed) several
+bugs that the synthetic images never hit.
+
+- [x] `done` One-time real-filesystem validation pass: captured five genuine
+  partitions (ext2/ext3/ext4/exfat/ntfs), attached them as sata0..sata4 via
+  writable qcow2 overlays under a dedicated `b1nix.fsread` boot mode, and
+  byte-verified a fixed fixture tree per filesystem — small files, a deep nested
+  file, an empty directory, a directory listing, and a 512 MiB file read at
+  head/mid/tail (driving extent / indirect-block / cluster / data-run mapping at
+  high logical block indices). Result: ext2/ext3/ext4/exfat/ntfs all read 12/12;
+  ext2/ext3/ext4 in-place writes persisted across remount. The scaffolding
+  (harness, capture script, fsread userspace test, `b1nix.fsread` wiring) was
+  removed once the drivers were polished; the bug fixes below are the lasting
+  result and stay covered by the normal smoke suite.
+- [x] `done` Fix AHCI DMA across physical page boundaries. A single-PRDT
+  transfer into a heap buffer whose backing pages were virtually but not
+  physically contiguous (the block cache's straddling 512-byte slots) spilled
+  into the wrong frame and corrupted page tables — only triggered by real
+  4 KiB-block filesystems. Now one PRD entry per page-contiguous segment.
+- [x] `done` Fix ext2 ACL-block parsing: a real Linux xattr block's header
+  magic was read as a signed entry count, bypassing the clamp and triggering a
+  multi-gigabyte memcpy on mount. Counts are now bounded; foreign xattr blocks
+  are ignored.
+- [x] `done` Fix exFAT filename case: the name decoder force-lowercased every
+  character (exFAT is case-preserving), which hid mixed/upper-case files from
+  readdir and exact open(). Names are now emitted verbatim.
+- [x] `done` Skip swap auto-attach (which claims sata1) in `b1nix.fsread` mode
+  so it cannot write its header over the real filesystem under test.
+- [x] `done` Read-only NTFS driver (`kernel/fs/ntfs.c`): boot sector, FILE/INDX
+  records with fixup, resident + non-resident attributes, data-run decoding,
+  `$INDEX_ROOT` + non-resident `$INDEX_ALLOCATION` directory indexes, and
+  `$DATA` reads (resident or via the cluster run list).
+- [x] `done` Real-filesystem write validation for the ext family (ext2/ext3/
+  ext4): in-place overwrite of an existing file's data block -> fsync -> umount
+  -> remount -> read-back on a genuine on-disk layout persisted correctly.
+  exFAT and NTFS are read-only in b1nix (no write/create/unlink callbacks) and
+  were not write-tested.
+- [ ] `planned` Fix file creation at the root of a freshly-mounted disk
+  filesystem when the mountpoint was created at runtime (mkdir then mount): the
+  create path resolves the parent to the underlying initramfs mountpoint node,
+  and on a real multi-group ext volume the allocator path then faults. Pre-
+  existing mountpoints (e.g. M14's `/mnt/ext4`) and reads are unaffected, so the
+  write validation above overwrites an existing file rather than creating one.
+- [ ] `planned` exFAT write support (currently read-only).
+- [ ] `planned` NTFS write support (currently read-only).
+- [ ] `planned` Lazy (on-demand) directory population for the disk filesystems;
+  the drivers currently eager-walk the whole tree at mount, which is wasteful
+  for large real volumes.

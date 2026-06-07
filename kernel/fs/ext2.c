@@ -239,11 +239,20 @@ static int ext2_load_acls(struct ext2_fs *fs, struct ext2_inode *ei, struct vfs_
     u8 *buf = kmalloc(fs->block_size);
     if (ext2_read_block(fs, ei->i_file_acl, buf) < 0) { kfree(buf); return -1; }
     
-    /* Simple flat storage: first 4 bytes is count, then entries */
-    int count = *(int *)buf;
-    if (count > ACL_MAX_ENTRIES) count = ACL_MAX_ENTRIES;
+    /* b1nix uses a simple flat storage: first 4 bytes is an entry count, then
+     * the entries. A block written by a real Linux mkfs/setfacl instead begins
+     * with the standard ext2 xattr header magic (0xEA020000) — reading that as
+     * a count yields a huge/negative value, and the original unclamped
+     * `count * sizeof` memcpy then scribbled gigabytes over the heap. Read the
+     * count unsigned and treat anything out of range (foreign xattr blocks
+     * included) as "no ACLs" so genuine on-disk filesystems mount safely. We do
+     * not interpret Linux POSIX ACL xattrs here (read-only path doesn't need
+     * them); ignoring them is correct, not a silent failure. */
+    u32 count = *(u32 *)buf;
+    if (count > ACL_MAX_ENTRIES) count = 0;
     vi->acl_count = count;
-    memcpy(vi->acls, buf + 4, count * sizeof(struct acl_entry));
+    if (count)
+        memcpy(vi->acls, buf + 4, count * sizeof(struct acl_entry));
     kfree(buf);
     return 0;
 }
@@ -1080,10 +1089,10 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
 	struct ext2_inode inode;
   if (ext2_read_inode(fs, inode_num, &inode) < 0)
     return;
-	
+
   if ((inode.i_mode & EXT2_S_IFMT) != EXT2_S_IFDIR)
     return;
-	
+
 	u8 *dir_buf = kmalloc(inode.i_size);
   if (!dir_buf)
     return;
@@ -1247,7 +1256,6 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   if (data) {
     ext2_populate_vfs(fs, 2, (const char *)data);
   }
-  
   return root;
 }
 
