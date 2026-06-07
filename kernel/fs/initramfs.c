@@ -214,6 +214,22 @@ static const char initramfs_rc[] =
 static const char initramfs_resolv_conf[] =
     "nameserver 10.0.2.3\n";
 
+#if B1NIX_UPSTREAM_BUSYBOX
+/* Migration wave 2b: a tiny .xz fixture so the upstream BusyBox smoke can
+ * exercise xz decompression (xzcat/unxz). BusyBox ships an xz *decompressor*
+ * only — there is no xz compressor applet — so the compressed input cannot be
+ * produced inside b1nix and is embedded here instead. Plaintext: "b1nix-xz-OK\n"
+ * Compressed with `xz -0 --check=crc32`: a 256 KiB dictionary (NOT -9's 64 MiB,
+ * which would OOM the 128 MiB test VM) and a CRC32 integrity check. */
+static const unsigned char initramfs_bb_w2b_xz[] = {
+    0xfd, 0x37, 0x7a, 0x58, 0x5a, 0x00, 0x00, 0x01, 0x69, 0x22, 0xde, 0x36,
+    0x03, 0xc0, 0x10, 0x0c, 0x21, 0x01, 0x0c, 0x00, 0x00, 0x00, 0x00, 0x00,
+    0x14, 0xe3, 0x11, 0x88, 0x01, 0x00, 0x0b, 0x62, 0x31, 0x6e, 0x69, 0x78,
+    0x2d, 0x78, 0x7a, 0x2d, 0x4f, 0x4b, 0x0a, 0x00, 0x6d, 0xc4, 0xbc, 0x36,
+    0x00, 0x01, 0x24, 0x0c, 0xa6, 0x18, 0xd8, 0xd8, 0x90, 0x42, 0x99, 0x0d,
+    0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a};
+#endif
+
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
     "echo \"POSIX-SMOKE: start\"\n"
@@ -512,6 +528,47 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox cksum /tmp/bb_dir/w2/abc | grep -q \"1219131554 3\" && echo \"BB-W2: ok cksum\"\n"
     "/opt/busybox/bin/busybox md5sum /tmp/bb_dir/w2/abc | grep -q \"900150983cd24fb0d6963f7d28e17f72\" && echo \"BB-W2: ok md5sum\"\n"
     "/opt/busybox/bin/busybox sha256sum /tmp/bb_dir/w2/abc | grep -q \"ba7816bf8f01cfea414140de5dae2223\" && echo \"BB-W2: ok sha256sum\"\n"
+    /* ── Migration wave 2b: file/archive utilities ── */
+    "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b\n"
+    "/opt/busybox/bin/busybox seq 1 4000 > /tmp/bb_dir/w2b/big.txt\n"
+    /* dd: byte-exact copy with bs/count */
+    "/opt/busybox/bin/busybox dd if=/tmp/bb_dir/w2/abc of=/tmp/bb_dir/w2b/abc.dd bs=1 count=3 2>/dev/null\n"
+    "/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2/abc /tmp/bb_dir/w2b/abc.dd && echo \"BB-W2B: ok dd\"\n"
+    /* du: reports a numeric block count for the file. Use busybox grep — the
+     * native shell grep is a literal substring matcher and cannot evaluate the
+     * [0-9] character class. */
+    "/opt/busybox/bin/busybox du -k /tmp/bb_dir/w2b/big.txt | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W2B: ok du\"\n"
+    /* df: lists the root mount via /proc/mounts */
+    "/opt/busybox/bin/busybox df / | grep -q \"/\" && echo \"BB-W2B: ok df\"\n"
+    /* tar: create + extract, byte-verify the round trip */
+    "/opt/busybox/bin/busybox tar -cf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b big.txt\n"
+    "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/ex\n"
+    "/opt/busybox/bin/busybox tar -xf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b/ex\n"
+    "/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/ex/big.txt && echo \"BB-W2B: ok tar\"\n"
+    /* tar + gzip seamless extract (-xz): gzip the plain tar with the gzip
+     * applet, then let tar auto-decompress it on extract (internal inflate,
+     * no external compressor process). */
+    "/opt/busybox/bin/busybox gzip -c /tmp/bb_dir/w2b/t.tar > /tmp/bb_dir/w2b/tz.tar.gz\n"
+    "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/exz\n"
+    "/opt/busybox/bin/busybox tar -xzf /tmp/bb_dir/w2b/tz.tar.gz -C /tmp/bb_dir/w2b/exz\n"
+    "/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/exz/big.txt && echo \"BB-W2B: ok tar-gzip\"\n"
+    /* gzip round trip */
+    "/opt/busybox/bin/busybox gzip -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.gz\n"
+    "/opt/busybox/bin/busybox gunzip -c /tmp/bb_dir/w2b/big.gz > /tmp/bb_dir/w2b/big.gunzip\n"
+    "/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.gunzip && echo \"BB-W2B: ok gzip\"\n"
+    /* bzip2 round trip */
+    "/opt/busybox/bin/busybox bzip2 -c /tmp/bb_dir/w2b/big.txt > /tmp/bb_dir/w2b/big.bz2\n"
+    "/opt/busybox/bin/busybox bunzip2 -c /tmp/bb_dir/w2b/big.bz2 > /tmp/bb_dir/w2b/big.bunzip2\n"
+    "/opt/busybox/bin/busybox cmp /tmp/bb_dir/w2b/big.txt /tmp/bb_dir/w2b/big.bunzip2 && echo \"BB-W2B: ok bzip2\"\n"
+    /* xz decompression of an embedded fixture (BusyBox has no xz compressor) */
+    "/opt/busybox/bin/busybox xzcat /etc/bb-w2b/hello.xz | grep -q \"b1nix-xz-OK\" && echo \"BB-W2B: ok xzcat\"\n"
+    "/opt/busybox/bin/busybox unxz -c /etc/bb-w2b/hello.xz | grep -q \"b1nix-xz-OK\" && echo \"BB-W2B: ok unxz\"\n"
+    /* malformed input: gunzip on non-gzip data must fail (nonzero status) */
+    "echo \"not a gzip stream\" > /tmp/bb_dir/w2b/bad.gz\n"
+    "/opt/busybox/bin/busybox gunzip -c /tmp/bb_dir/w2b/bad.gz > /dev/null 2>&1\n"
+    "BB_GZ_BAD=$?\n"
+    "[ $BB_GZ_BAD -ne 0 ] && echo \"BB-W2B: ok gunzip-malformed\"\n"
+    "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq\n"
     "[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo \"BB-SMOKE: ok rm\"\n"
@@ -533,6 +590,8 @@ static const struct initramfs_file files[] = {
 #if B1NIX_UPSTREAM_BUSYBOX
     {"/opt/busybox/bin/busybox", (const char *)vfs_upstream_busybox_elf,
      sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
+    {"/etc/bb-w2b/hello.xz", (const char *)initramfs_bb_w2b_xz,
+     sizeof(initramfs_bb_w2b_xz), 0},
 #endif
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},

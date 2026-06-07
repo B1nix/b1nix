@@ -304,6 +304,16 @@ int unsetenv(const char *name)
 	return 0;
 }
 
+int clearenv(void)
+{
+	/* Detach from any heap-allocated environ array and present an empty
+	 * environment. The previous array (if malloc'd by setenv/putenv) is
+	 * intentionally not freed: callers may still hold pointers into the old
+	 * strings, matching the conservative glibc behaviour. */
+	environ = empty_env;
+	return 0;
+}
+
 char *realpath(const char *path, char *resolved_path)
 {
 	if (!resolved_path) return strdup(path);

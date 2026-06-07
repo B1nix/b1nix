@@ -18,7 +18,13 @@ endif
 CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MMD -MP
+# NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
+# `-isystem include`, which makes them *system* headers — and -MMD omits system
+# headers from the generated .d files. With -MMD, editing a header in
+# userspace/include/ would NOT trigger a recompile (observed: a struct-size
+# change to <unistd.h> left a stale statvfs.o, crashing BusyBox df on i686).
+# -MD records every header so header edits rebuild the affected objects.
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MD -MP
 BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
@@ -44,6 +50,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/getopt.o \
 	$(BUILD)/libc/fnmatch.o \
 	$(BUILD)/libc/regex.o \
+	$(BUILD)/libc/mntent.o \
+	$(BUILD)/libc/statvfs.o \
 	$(BUILD)/libc/div64.o
 
 BINARIES := \

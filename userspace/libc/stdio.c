@@ -357,22 +357,46 @@ static void _vsnprintf_putsn(char *str, size_t size, int *pos, const char *s,
     _vsnprintf_putc(str, size, pos, *s++);
 }
 
-static void _vsnprintf_putd(char *str, size_t size, int *pos, long v, int base,
-                            int signed_val) {
+static void _vsnprintf_putd(char *str, size_t size, int *pos, long long v,
+                            int base, int signed_val, int width, int pad_zero,
+                            int left_align, int uppercase) {
   char buf[32];
   int p = 0;
-  unsigned long uv = (unsigned long)v;
+  int neg = 0;
+  unsigned long long uv = (unsigned long long)v;
   if (signed_val && v < 0) {
-    _vsnprintf_putc(str, size, pos, '-');
-    uv = (unsigned long)-v;
+    neg = 1;
+    uv = -(unsigned long long)v;
   }
-  const char *digits = "0123456789abcdef";
+  const char *digits = uppercase ? "0123456789ABCDEF" : "0123456789abcdef";
   do {
     buf[p++] = digits[uv % base];
     uv /= base;
   } while (uv > 0);
-  while (p > 0)
-    _vsnprintf_putc(str, size, pos, buf[--p]);
+
+  int total = p + (neg ? 1 : 0);
+  int pad = width > total ? width - total : 0;
+
+  /* '0' padding is ignored for left-justified conversions (POSIX). */
+  if (pad_zero && !left_align) {
+    if (neg)
+      _vsnprintf_putc(str, size, pos, '-');
+    for (int k = 0; k < pad; k++)
+      _vsnprintf_putc(str, size, pos, '0');
+    while (p > 0)
+      _vsnprintf_putc(str, size, pos, buf[--p]);
+  } else {
+    if (!left_align)
+      for (int k = 0; k < pad; k++)
+        _vsnprintf_putc(str, size, pos, ' ');
+    if (neg)
+      _vsnprintf_putc(str, size, pos, '-');
+    while (p > 0)
+      _vsnprintf_putc(str, size, pos, buf[--p]);
+    if (left_align)
+      for (int k = 0; k < pad; k++)
+        _vsnprintf_putc(str, size, pos, ' ');
+  }
 }
 
 static void _vsnprintf_putf(char *str, size_t size, int *pos, double value,
@@ -393,7 +417,7 @@ static void _vsnprintf_putf(char *str, size_t size, int *pos, double value,
   unsigned long rounded = (unsigned long)(value * scale + 0.5);
   unsigned long whole = scale ? rounded / scale : rounded;
   unsigned long fraction = scale ? rounded % scale : 0;
-  _vsnprintf_putd(str, size, pos, (long)whole, 10, 0);
+  _vsnprintf_putd(str, size, pos, (long)whole, 10, 0, 0, 0, 0, 0);
 
   if (precision > 0) {
     _vsnprintf_putc(str, size, pos, '.');
@@ -421,10 +445,13 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
 
     /* Flags. */
     int left_align = 0;
+    int zero_pad = 0;
     while (fmt[i] == '-' || fmt[i] == '+' || fmt[i] == ' ' || fmt[i] == '#' ||
            fmt[i] == '0') {
       if (fmt[i] == '-')
         left_align = 1;
+      else if (fmt[i] == '0')
+        zero_pad = 1;
       i++;
     }
     int width = 0;
@@ -456,17 +483,24 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       }
     }
 
-    /* Length modifiers. On x86_64 long, long long, size_t, intmax_t and
-     * ptrdiff_t are all 64-bit, so they collapse to a single "is 64-bit" flag.
-     * Handling "ll" (and z/j/t) is what GCC's HOST_WIDE_INT_PRINT ("%lld")
-     * needs — without it the native cc1 emitted literal "%ld" into its asm. */
-    int is_long = 0;
+    /* Length modifiers. `ll`/`j`/`L` are 64-bit on every target; `l`/`z`/`t`
+     * are word-width (64-bit on x86_64, 32-bit on i686). Distinguishing them
+     * matters on i686, where reading a 64-bit `%llu`/`%llo` arg as a 32-bit
+     * `long` (the old behaviour) consumed only half the value and misaligned
+     * every following argument — BusyBox `cksum` (`%llu`) hung and `tar`'s
+     * `putOctal` (`%llo`) wrote garbage. */
+    int lcount = 0;
     while (fmt[i] == 'l') {
-      is_long = 1;
+      lcount++;
       i++;
     }
-    if (fmt[i] == 'z' || fmt[i] == 'j' || fmt[i] == 't' || fmt[i] == 'L') {
-      is_long = 1;
+    int is_ll = (lcount >= 2);
+    int is_l = (lcount == 1);
+    if (fmt[i] == 'j' || fmt[i] == 'L') {
+      is_ll = 1;
+      i++;
+    } else if (fmt[i] == 'z' || fmt[i] == 't') {
+      is_l = 1;
       i++;
     }
     if (fmt[i] == 'h') { /* h / hh: still passed as int via default promotion */
@@ -495,31 +529,38 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
     case 'd':
     case 'i':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? va_arg(ap, long) : (long)va_arg(ap, int), 10, 1);
+                      is_ll ? va_arg(ap, long long)
+                            : is_l ? (long long)va_arg(ap, long)
+                                   : (long long)va_arg(ap, int),
+                      10, 1, width, zero_pad, left_align, 0);
       break;
     case 'u':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? (long)va_arg(ap, unsigned long)
-                              : (long)va_arg(ap, unsigned int),
-                      10, 0);
+                      is_ll ? (long long)va_arg(ap, unsigned long long)
+                            : is_l ? (long long)va_arg(ap, unsigned long)
+                                   : (long long)va_arg(ap, unsigned int),
+                      10, 0, width, zero_pad, left_align, 0);
       break;
     case 'x':
     case 'X':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? (long)va_arg(ap, unsigned long)
-                              : (long)va_arg(ap, unsigned int),
-                      16, 0);
+                      is_ll ? (long long)va_arg(ap, unsigned long long)
+                            : is_l ? (long long)va_arg(ap, unsigned long)
+                                   : (long long)va_arg(ap, unsigned int),
+                      16, 0, width, zero_pad, left_align, fmt[i] == 'X');
       break;
     case 'o':
       _vsnprintf_putd(str, size, &pos,
-                      is_long ? (long)va_arg(ap, unsigned long)
-                              : (long)va_arg(ap, unsigned int),
-                      8, 0);
+                      is_ll ? (long long)va_arg(ap, unsigned long long)
+                            : is_l ? (long long)va_arg(ap, unsigned long)
+                                   : (long long)va_arg(ap, unsigned int),
+                      8, 0, width, zero_pad, left_align, 0);
       break;
     case 'p':
       _vsnprintf_puts(str, size, &pos, "0x");
-      _vsnprintf_putd(str, size, &pos, (long)(unsigned long)va_arg(ap, void *),
-                      16, 0);
+      _vsnprintf_putd(str, size, &pos,
+                      (long long)(unsigned long)va_arg(ap, void *), 16, 0, 0, 0,
+                      0, 0);
       break;
     case 'c':
       _vsnprintf_putc(str, size, &pos, (char)va_arg(ap, int));

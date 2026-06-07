@@ -44,6 +44,7 @@ int link(const char *oldpath, const char *newpath);
 int rmdir(const char *pathname);
 long lseek(int fd, long offset, int whence);
 int execvp(const char *file, char *const argv[]);
+int execlp(const char *file, const char *arg, ...);
 int execv(const char *pathname, char *const argv[]);
 int fork(void);
 pid_t vfork(void);
@@ -80,21 +81,26 @@ struct stat {
 #define st_ctime st_ctim.tv_sec
 int stat(const char *path, struct stat *st);
 
+/* Must mirror the kernel `struct b1nix_statfs` (all u64) byte-for-byte: the
+ * SYS_STATFS handler copies sizeof(b1nix_statfs) bytes into this buffer. Using
+ * `unsigned long` would be 32-bit on i686 and the kernel's 64-bit fields would
+ * overflow the struct (observed: BusyBox `df` crashed on i686). */
 struct statfs {
-  unsigned long f_type;
-  unsigned long f_bsize;
-  unsigned long f_blocks;
-  unsigned long f_bfree;
-  unsigned long f_bavail;
-  unsigned long f_files;
-  unsigned long f_ffree;
-  unsigned long f_fsid;
-  unsigned long f_namelen;
-  unsigned long f_frsize;
-  unsigned long f_flags;
-  unsigned long f_spare[4];
+  unsigned long long f_type;
+  unsigned long long f_bsize;
+  unsigned long long f_blocks;
+  unsigned long long f_bfree;
+  unsigned long long f_bavail;
+  unsigned long long f_files;
+  unsigned long long f_ffree;
+  unsigned long long f_fsid;
+  unsigned long long f_namelen;
+  unsigned long long f_frsize;
+  unsigned long long f_flags;
+  unsigned long long f_spare[4];
 };
 int statfs(const char *path, struct statfs *buf);
+int fstatfs(int fd, struct statfs *buf);
 
 int setuid(unsigned short uid);
 int setgid(unsigned short gid);
@@ -154,13 +160,13 @@ static inline int access(const char *path, int mode) {
     return -1;
 }
 
-static inline int lstat(const char *path, struct stat *st) {
-    return syscall(SYS_LSTAT, path, st);
-}
-
-static inline int fstat(int fd, struct stat *st) {
-    return syscall(SYS_FSTAT, fd, st);
-}
+/* lstat/fstat are real out-of-line functions (not static inline): code such as
+ * BusyBox's recursive_action takes their address via `(follow ? stat : lstat)`,
+ * and a static-inline syscall wrapper emitted per-TU for an address-of misbuilds
+ * the local-register-variable asm (observed: tar saw st_size/st_mode as 0). A
+ * single extern definition is taken by address correctly. */
+int lstat(const char *path, struct stat *st);
+int fstat(int fd, struct stat *st);
 
 static inline int getpid(void) {
     return syscall(SYS_GETPID);
@@ -171,9 +177,7 @@ static inline int getcpu(void) {
     return syscall(SYS_GETCPU);
 }
 
-static inline int isatty(int fd) {
-    return fd >= 0 && fd <= 2;
-}
+int isatty(int fd);
 
 char *getlogin(void);
 

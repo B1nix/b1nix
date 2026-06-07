@@ -238,6 +238,21 @@ static int r_filesystems(usize pid, struct sbuf *s) {
   return 0;
 }
 
+static int r_mounts(usize pid, struct sbuf *s) {
+  (void)pid;
+  struct b1nix_mount_entry ents[MAX_MOUNTS];
+  isize n = vfs_mounts(ents, MAX_MOUNTS);
+  for (isize i = 0; i < n; i++) {
+    const char *src = ents[i].source[0] ? ents[i].source : "none";
+    const char *tgt = ents[i].target[0] ? ents[i].target : "/";
+    const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
+    const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
+    /* device mountpoint fstype options dump pass */
+    sb_addf(s, "%s %s %s %s 0 0\n", src, tgt, fstype, opts);
+  }
+  return 0;
+}
+
 static int r_cmdline(usize pid, struct sbuf *s) {
   (void)pid;
   const char *cmd = bootinfo_cmdline();
@@ -391,6 +406,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "cpuinfo", VFS_DEVICE, r_cpuinfo, 0);
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
+  procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
 
   /* /proc/self — per-process view of the *calling* task (pid resolved at read
