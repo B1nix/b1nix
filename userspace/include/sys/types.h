@@ -5,6 +5,7 @@
 #include <stdint.h>
 
 typedef long ssize_t;
+typedef char *caddr_t;
 #if defined(__x86_64__) || defined(__LP64__)
 typedef long off_t;
 #else

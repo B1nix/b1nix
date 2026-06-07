@@ -172,6 +172,12 @@ static inline int getpid(void) {
     return syscall(SYS_GETPID);
 }
 
+static inline int getppid(void) {
+    return syscall(SYS_GETPPID);
+}
+
+int usleep(unsigned int usec);
+
 /* Index of the CPU currently executing this thread (0 = BSP, 1+ = AP). */
 static inline int getcpu(void) {
     return syscall(SYS_GETCPU);

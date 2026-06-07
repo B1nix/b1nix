@@ -67,6 +67,7 @@ extern int h_errno;
 
 struct hostent *gethostbyname(const char *name);
 struct servent *getservbyname(const char *name, const char *proto);
+struct servent *getservbyport(int port, const char *proto);
 int getaddrinfo(const char *node, const char *service,
                 const struct addrinfo *hints, struct addrinfo **res);
 void freeaddrinfo(struct addrinfo *res);

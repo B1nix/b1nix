@@ -72,6 +72,20 @@ if [ ! -d "$SRC_DIR" ]; then
     tar xjf "$BUSYBOX_TAR" -C "$TOOLCHAIN_SRC_DIR"
 fi
 
+# b1nix is a Linux-like target, but the cross GCC predefines __b1nix__/__unix__,
+# not __linux__. The procps applets (free/uptime, and the ps uptime helper)
+# include <sys/sysinfo.h> and use `struct sysinfo` only under `#ifdef __linux__`,
+# so without this they fail to compile ("storage size of 'info' isn't known").
+# b1nix ships <sys/sysinfo.h> in its sysroot and implements the SYS_SYSINFO
+# syscall, so widen those include guards to also fire for __b1nix__. Idempotent:
+# keyed on the rewritten token so a re-extracted tree is patched exactly once.
+for bb_src in procps/free.c procps/uptime.c procps/ps.c; do
+    if [ -f "$SRC_DIR/$bb_src" ] && ! grep -q "__b1nix__" "$SRC_DIR/$bb_src"; then
+        sed -i 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
+            "$SRC_DIR/$bb_src"
+    fi
+done
+
 # ── 2. Configure ────────────────────────────────────────────────────────────
 mkdir -p "$BUILD_DIR"
 

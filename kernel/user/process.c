@@ -1243,13 +1243,21 @@ int user_spawn(const char *path, int argc, const char **argv) {
   }
   start->image = image;
 
-  /* FIX: Truncate thread name to 15 chars to prevent kthread_create from
-   * failing */
+  /* Thread name = the executable's basename, truncated to 15 chars (Linux
+   * TASK_COMM_LEN-1). This is the process "comm" that /proc/<pid>/stat and
+   * /proc/<pid>/comm expose and that BusyBox procps (ps/pidof/pgrep/pkill)
+   * match on. Truncating the full PATH instead (e.g. "/opt/busybox/bin/busybox"
+   * -> "/opt/busybox/bi") yields a useless comm "bi" and breaks process lookup
+   * by name; take the basename first. */
   char safe_name[16];
-  usize plen = strlen(path);
+  const char *base = strrchr(path, '/');
+  base = base ? base + 1 : path;
+  if (!*base) /* path ended in '/', fall back to the whole string */
+    base = path;
+  usize plen = strlen(base);
   if (plen > 15)
     plen = 15;
-  memcpy(safe_name, path, plen);
+  memcpy(safe_name, base, plen);
   safe_name[plen] = '\0';
 
   /* Real userspace ELF processes may run on Application Processors: they enter

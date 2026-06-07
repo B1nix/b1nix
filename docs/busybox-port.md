@@ -21,18 +21,24 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **66 applets**. Migration wave 1
+The isolated package currently configures **86 applets**. Migration wave 1
 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
 `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
 and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
-`bzip2`, `bunzip2`, `unxz` and `xzcat`:
+`bzip2`, `bunzip2`, `unxz` and `xzcat`. Wave 3 added `ps`, `top`, `free`,
+`uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`. Wave 4 added `mount`,
+`umount`, `nslookup`, `lsof`, `netstat`, `route`, `ifconfig`, `blkid` and
+`fdisk`. Wave 4b added `ping`, `losetup` and `ip`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
 - **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`
 - **Path Manipulation**: `basename`, `dirname`, `realpath`
 - **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`
+- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`, `lsof`
+- **Storage & Mount**: `mount`, `umount`, `blkid`, `fdisk`
+- **Networking**: `nslookup`, `netstat`, `route`, `ifconfig`
 - **Archive & Compression**: `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `unxz`, `xzcat`
 - **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
 - **Checksums**: `cksum`, `md5sum`, `sha256sum`
@@ -176,6 +182,104 @@ embedded fixture, and a malformed-input negative test (`gunzip` on non-gzip
 data returns nonzero). `xz` is decompress-only (no upstream xz compressor),
 so `tar -J` create is unavailable. Kernel change: added `/proc/mounts`.
 
+### Migration wave 3: process & system inspection (done)
+
+Enabled and smoke-tested: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`,
+`pkill` (procps) and `dmesg` (util-linux). Coverage is the `BB-W3:` markers in
+the posix smoke: `ps`/`top` enumerate `/proc`, `uptime` prints the load line
+from `sysinfo()` + `/proc/uptime`/`/proc/loadavg`, `free` reports memory from
+`sysinfo()` + `/proc/meminfo`, `dmesg` drains the kernel ring buffer, and
+`pidof`/`pgrep`/`pkill` find and signal a backgrounded process by name.
+Verified: `x86_64` **443/0** (full suite, single-CPU + `-smp 4`); `i686` all
+eight `BB-W3:` markers green, suite at **442/1** — the only failure is the
+pre-existing, i686-only `M37 e1000` ARP-receive-over-SLIRP timing test (green
+on `x86_64`, introduced before this branch, untouched by W3 code).
+Kernel/libc/build changes this wave needed:
+
+- **`/proc/<pid>/stat`** grew from 4 fields to the full 24-field Linux layout
+  BusyBox procps parses (state is a single `%c`; b1nix has no per-task CPU
+  time/start ticks yet, so utime/stime/starttime are 0; vsize = heap span,
+  rss = page count).
+- **Process "comm" is now the executable basename**, not the full exec path
+  truncated to 15 chars. `sys_spawn` truncated `path` directly, so
+  `/opt/busybox/bin/busybox` became comm `/opt/busybox/bi` (basename `bi`) and
+  `pidof`/`pgrep`/`pkill` could not match by name. It now takes the basename
+  first; `/proc/<pid>/{stat,comm,status}` expose it (matching Linux's
+  `TASK_COMM_LEN`).
+- New **`SYS_SYSINFO`** syscall + `struct sysinfo` (`<sys/sysinfo.h>`) and a
+  `sysinfo()` wrapper, filling totalram/freeram/procs/mem_unit from the PMM
+  (`mem_unit = 1` byte). New **`klogctl()`** (`<sys/klog.h>`) mapping syslog(2)
+  read actions onto `SYS_DMESG`. New **`SYS_GETPPID`** + `getppid()`, and a
+  `usleep()` wrapper (via `nanosleep`).
+- **Build:** the cross GCC predefines `__b1nix__`/`__unix__`, not `__linux__`,
+  so procps `free`/`uptime`/`ps` skipped `<sys/sysinfo.h>`. `build-busybox.sh`
+  idempotently widens those three include guards to also fire for `__b1nix__`.
+
+`lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks) is
+deferred to a follow-up sub-wave.
+
+### Migration wave 4: storage & networking (done)
+
+Enabled and smoke-tested (`BB-W4:` markers), green on **both** arches (`x86_64`
+and `i686`): `mount`, `umount`, `nslookup`, `lsof`, `netstat`, `route`,
+`ifconfig`, `blkid`, `fdisk`. Coverage: a `mount`/`umount` round trip on
+`sata0`; `nslookup` of a numeric address (deterministic, no live DNS);
+`netstat -tln` finding the dropbear `:22` listener via `/proc/net/tcp`;
+`route -n` showing the on-link `10.0.2.0/24` route; `ifconfig eth0` reading the
+DHCP `10.0.2.15` via SIOCGIF* ioctls; `blkid /dev/sata0` identifying ext4;
+`fdisk -l /dev/sata0` reading geometry via the BLK* ioctls; `lsof` listing open
+files from `/proc/<pid>/fd/`.
+
+Kernel/libc infrastructure this wave added:
+
+- **`/proc/net/{tcp,tcp6,udp,unix}`** from the kernel socket tables, and
+  **`/proc/net/route`** — netstat/route parse these. The scanf engine gained
+  the **`%[...]` scanset** conversion they rely on (without it netstat reported
+  "bogus data" and route a "read error").
+- **`socket_file_ops.ioctl`** serving the `SIOCGIF*` interface queries for a
+  single modelled `eth0` (ifconfig); `SIOCADDRT/DELRT` accepted as no-ops.
+- **`/dev/<name>` block-device nodes** (byte-addressed cached read/write +
+  read-modify-write) with the **BLK\* size ioctls** and **`/proc/partitions`**
+  — blkid and fdisk read through these.
+- **`/proc/<pid>/fd/`** fd symlinks (lsof); `<sys/mount.h>` + `mount()`/
+  `umount()`; minimal `<resolv.h>` + `res_init()`; `getservbyport`, `strnlen`,
+  `if_nametoindex`, `_IOC`/`_IOR` macros, `caddr_t`; headers `net/route.h`,
+  `net/if.h` (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`.
+
+`lsblk` is **not shipped by upstream BusyBox 1.36** — `blkid` and `fdisk -l`
+cover the block-inspection role.
+
+### Migration wave 4b: ping / losetup / ip (done)
+
+Enabled and smoke-tested (`BB-W4B:` markers), green on **both** arches
+(`x86_64` and `i686`): `ping`, `losetup`, `ip`. Each required a distinct new
+kernel subsystem:
+
+- **`ping`** — raw `SOCK_RAW`/ICMP sockets. A raw-socket registry in
+  `kernel/net/socket.c` (`raw_sock_register/unregister`); `icmp_receive()`
+  delivers every echo reply to registered raw sockets via
+  `vfs_socket_push_raw_icmp()`, prepending a synthetic 20-byte IPv4 header.
+  libc `recvfrom()` recovers the peer from that header; `sendto()` records the
+  per-packet destination as the socket's connected peer.
+- **`losetup`** — a loop-device ioctl surface. `kernel/dev/loop.c` registers 8
+  `/dev/loopN` block devices plus `/dev/loop-control`, answering
+  LOOP_CTL_GET_FREE, LOOP_SET_FD/CLR_FD and the status ioctls. `vfs_ioctl()`
+  routes the `0x4C` ioctl group (and the `loop-control` node) to the loop
+  handler **before** the `!arg` guard, since LOOP_CTL_GET_FREE takes no arg.
+- **`ip`** — BusyBox `ip` speaks **rtnetlink** exclusively, so it needs an
+  `AF_NETLINK` socket personality. `netlink_build_dump()` encodes
+  RTM_NEWLINK/NEWADDR/NEWROUTE responses (nlmsghdr + rtattr TLVs) terminated by
+  NLMSG_DONE for a single modelled `eth0`; `vfs_socket()`/`vfs_bind()` accept
+  `AF_NETLINK`, and `getsockname()` reports `nl_pid 0`. libc `sendmsg`/`recvmsg`
+  gained single-iov scatter-gather; **`recvmsg` zeroes `msg_name`** so the
+  source `nl_pid` reads as 0 — BusyBox libnetlink rejects (and would hang on)
+  any reply whose recvmsg source `nl_pid` is non-zero.
+
+Headers this wave added: `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,
+loop,version,types}.h`, `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`,
+`netpacket/packet.h`, `resolv.h`; `PF_PACKET`, `SIOCSIFHWBROADCAST`,
+`RTNH_F_*`/`RTAX_*` constants.
+
 ### Wave 3: upstream `ash`
 
 The existing shell proves that pipes, redirection, `fork`/`exec`, process
@@ -193,15 +297,19 @@ the complete POSIX and SSH PTY suites pass with it.
 
 ### Wave 4: process and diagnostics
 
-Enable:
+**Mostly done** — see "Migration wave 3: process & system inspection (done)"
+above. `ps`, `top`, `free`, `uptime`, `dmesg`, `pidof`, `pgrep` and `pkill` are
+enabled and smoke-tested; `kill` already shipped in wave 1. The expanded
+`/proc/<pid>/stat` layout, basename `comm`, `SYS_SYSINFO`/`sysinfo()` and
+`klogctl()` that these needed are in place.
 
-`ps`, `top`, `free`, `uptime`, `dmesg`, `sysctl`, `kill`, `killall` and
-`pidof`.
+Still to do:
 
-`free`, `uptime`, `kill` and `dmesg` need thin libc wrappers around facilities
-that already exist. `ps` and `top` require the expanded `/proc` layouts.
-Writable `sysctl` requires an explicit b1nix policy; read-only keys can be
-ported first.
+- `lsof` — needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks.
+- `killall` — name-based bulk kill (the basename `comm` work makes this
+  straightforward now).
+- `sysctl` — read-only keys can be ported first; writable `sysctl` requires an
+  explicit b1nix policy.
 
 ### Wave 5: mounts and storage
 

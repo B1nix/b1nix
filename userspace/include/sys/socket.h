@@ -71,12 +71,17 @@ struct msghdr {
 #define AF_INET         2
 #define AF_UNSPEC       0
 #define AF_INET6        10
+#define AF_NETLINK      16
+#define AF_ROUTE        AF_NETLINK
+#define AF_PACKET       17
 
 #define PF_UNSPEC       AF_UNSPEC
 #define PF_UNIX         AF_UNIX
 #define PF_LOCAL        AF_LOCAL
 #define PF_INET         AF_INET
 #define PF_INET6        AF_INET6
+#define PF_PACKET       AF_PACKET
+#define PF_NETLINK      AF_NETLINK
 
 #define SOCK_STREAM     1
 #define SOCK_DGRAM      2
@@ -100,7 +105,9 @@ struct msghdr {
 #define SO_REUSEPORT    15
 #define SO_ACCEPTCONN   30
 
+#define MSG_OOB         0x01
 #define MSG_PEEK        0x02
+#define MSG_TRUNC       0x20
 #define MSG_DONTWAIT    0x40
 #define MSG_NOSIGNAL    0x4000
 
@@ -125,6 +132,8 @@ ssize_t sendto(int sockfd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest_addr, socklen_t addrlen);
 ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                  struct sockaddr *src_addr, socklen_t *addrlen);
+ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
+ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
 int shutdown(int sockfd, int how);
 
 #ifdef __cplusplus

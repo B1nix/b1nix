@@ -10,12 +10,15 @@
 #include <sys/utsname.h>
 #include <signal.h>
 #include <sys/socket.h>
+#include <sys/uio.h>
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
 #include <termios.h>
 #include <poll.h>
 #include <errno.h>
+#include <sys/klog.h>
+#include <sys/sysinfo.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -574,18 +577,106 @@ int listen(int fd, int backlog) {
   return _check_err(syscall(SYS_LISTEN, fd, backlog));
 }
 
+/* Single-iov scatter/gather sendmsg/recvmsg, enough for BusyBox `ip` (which
+ * uses one iov over an AF_NETLINK socket). recvmsg leaves msg_namelen as the
+ * caller set it — libnetlink pre-sets it to sizeof(sockaddr_nl) and only
+ * checks that it is unchanged. */
+ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
+  if (!msg || msg->msg_iovlen < 1) {
+    errno = EINVAL;
+    return -1;
+  }
+  if (msg->msg_iovlen == 1)
+    return send(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
+  size_t total = 0;
+  for (int i = 0; i < msg->msg_iovlen; i++)
+    total += msg->msg_iov[i].iov_len;
+  char *tmp = malloc(total ? total : 1);
+  if (!tmp) {
+    errno = ENOMEM;
+    return -1;
+  }
+  size_t off = 0;
+  for (int i = 0; i < msg->msg_iovlen; i++) {
+    memcpy(tmp + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
+    off += msg->msg_iov[i].iov_len;
+  }
+  ssize_t rc = send(fd, tmp, total, flags);
+  free(tmp);
+  return rc;
+}
+
+ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
+  if (!msg || msg->msg_iovlen < 1) {
+    errno = EINVAL;
+    return -1;
+  }
+  msg->msg_flags = 0;
+  /* Report the source address as the kernel (all-zero => nl_pid 0 for AF_NETLINK,
+   * INADDR_ANY otherwise). b1nix delivers netlink dumps and raw replies from the
+   * kernel itself, and BusyBox libnetlink rejects any message whose recvmsg
+   * source nl_pid is non-zero — leaving msg_name as uninitialised caller stack
+   * would make `ip` skip every reply (including NLMSG_DONE) and hang. We keep
+   * msg_namelen unchanged: libnetlink pre-sets it to sizeof(sockaddr_nl) and
+   * fails if the kernel alters it. */
+  if (msg->msg_name && msg->msg_namelen)
+    memset(msg->msg_name, 0, msg->msg_namelen);
+  if (msg->msg_iovlen == 1)
+    return recv(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
+  size_t total = 0;
+  for (int i = 0; i < msg->msg_iovlen; i++)
+    total += msg->msg_iov[i].iov_len;
+  char *tmp = malloc(total ? total : 1);
+  if (!tmp) {
+    errno = ENOMEM;
+    return -1;
+  }
+  ssize_t rc = recv(fd, tmp, total, flags);
+  if (rc > 0) {
+    size_t off = 0, remaining = (size_t)rc;
+    for (int i = 0; i < msg->msg_iovlen && remaining; i++) {
+      size_t c = msg->msg_iov[i].iov_len < remaining ? msg->msg_iov[i].iov_len
+                                                      : remaining;
+      memcpy(msg->msg_iov[i].iov_base, tmp + off, c);
+      off += c;
+      remaining -= c;
+    }
+  }
+  free(tmp);
+  return rc;
+}
+
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
                const struct sockaddr *dest_addr, socklen_t addrlen) {
-  (void)dest_addr;
-  (void)addrlen;
+  /* b1nix send() targets the socket's connected peer. POSIX sendto() with an
+   * explicit destination sets that peer first (the kernel connect() on a
+   * datagram/raw socket just records the default peer). This makes BusyBox
+   * ping's per-packet sendto(raw_sock, ..., &dst) reach the target. */
+  if (dest_addr && addrlen)
+    connect(fd, dest_addr, addrlen);
   return send(fd, buf, len, flags);
 }
 
 ssize_t recvfrom(int fd, void *buf, size_t len, int flags,
                  struct sockaddr *src_addr, socklen_t *addrlen) {
-  (void)src_addr;
-  (void)addrlen;
-  return recv(fd, buf, len, flags);
+  ssize_t n = recv(fd, buf, len, flags);
+  /* SOCK_RAW/ICMP packets arrive with the IPv4 header included (version 4,
+   * IHL 5, protocol 1 = ICMP); recover the peer address from that header so
+   * recvfrom() callers like BusyBox ping get the real source. This is gated
+   * tightly enough that it never misfires on a UDP datagram payload. */
+  if (n >= 20 && src_addr && addrlen && *addrlen >= sizeof(struct sockaddr_in)) {
+    const unsigned char *p = (const unsigned char *)buf;
+    if ((p[0] & 0xF0) == 0x40 && (p[0] & 0x0F) == 0x05 && p[9] == 1) {
+      struct sockaddr_in *sin = (struct sockaddr_in *)src_addr;
+      sin->sin_family = AF_INET;
+      sin->sin_port = 0;
+      sin->sin_addr.s_addr = (unsigned int)p[12] | ((unsigned int)p[13] << 8) |
+                             ((unsigned int)p[14] << 16) |
+                             ((unsigned int)p[15] << 24);
+      *addrlen = sizeof(struct sockaddr_in);
+    }
+  }
+  return n;
 }
 
 int shutdown(int sockfd, int how) {
@@ -658,6 +749,31 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 
 unsigned int alarm(unsigned int seconds) {
   (void)seconds;
+  return 0;
+}
+
+/* No SIGALRM-driven interval timer yet; accept and report "disarmed". */
+int setitimer(int which, const struct itimerval *new_value,
+              struct itimerval *old_value) {
+  (void)which;
+  (void)new_value;
+  if (old_value) {
+    old_value->it_interval.tv_sec = 0;
+    old_value->it_interval.tv_usec = 0;
+    old_value->it_value.tv_sec = 0;
+    old_value->it_value.tv_usec = 0;
+  }
+  return 0;
+}
+
+int getitimer(int which, struct itimerval *curr_value) {
+  (void)which;
+  if (curr_value) {
+    curr_value->it_interval.tv_sec = 0;
+    curr_value->it_interval.tv_usec = 0;
+    curr_value->it_value.tv_sec = 0;
+    curr_value->it_value.tv_usec = 0;
+  }
   return 0;
 }
 
@@ -1222,4 +1338,65 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz) {
   (void)tz;
   errno = EPERM;
   return -1;
+}
+
+/* klogctl(): the Linux syslog(2) interface BusyBox dmesg uses. b1nix exposes
+ * the kernel ring buffer through SYS_DMESG (read-only), so map the read
+ * actions onto it and answer the size/console queries locally. KLOG_BUF_SIZE
+ * mirrors <b1nix/klog.h> (64 KiB). */
+int klogctl(int type, char *bufp, int len) {
+  switch (type) {
+  case SYSLOG_ACTION_READ_ALL:   /* 3 */
+  case SYSLOG_ACTION_READ_CLEAR: /* 4: b1nix has no clear-on-read; same as 3 */
+    if (!bufp || len <= 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    return _check_err(syscall(SYS_DMESG, bufp, (size_t)len));
+  case SYSLOG_ACTION_SIZE_BUFFER: /* 10 */
+    return 65536;
+  case SYSLOG_ACTION_SIZE_UNREAD: /* 9 */
+    return 0;
+  case SYSLOG_ACTION_CONSOLE_OFF:   /* 6 */
+  case SYSLOG_ACTION_CONSOLE_ON:    /* 7 */
+  case SYSLOG_ACTION_CONSOLE_LEVEL: /* 8: no console loglevel in b1nix */
+  case SYSLOG_ACTION_CLOSE:         /* 0 */
+  case SYSLOG_ACTION_OPEN:          /* 1 */
+  case SYSLOG_ACTION_CLEAR:         /* 5 */
+    return 0;
+  default:
+    errno = EINVAL;
+    return -1;
+  }
+}
+
+int mount(const char *source, const char *target, const char *filesystemtype,
+          unsigned long mountflags, const void *data) {
+  (void)data; /* b1nix SYS_MOUNT takes no fs-specific data argument */
+  return _check_err(syscall(SYS_MOUNT, source, target, filesystemtype,
+                            (long)mountflags));
+}
+
+int umount(const char *target) {
+  return _check_err(syscall(SYS_UMOUNT, target));
+}
+
+int umount2(const char *target, int flags) {
+  (void)flags; /* b1nix has no lazy/force unmount distinction yet */
+  return _check_err(syscall(SYS_UMOUNT, target));
+}
+
+int usleep(unsigned int usec) {
+  struct timespec req;
+  req.tv_sec = (time_t)(usec / 1000000u);
+  req.tv_nsec = (long)(usec % 1000000u) * 1000L;
+  return nanosleep(&req, 0);
+}
+
+int sysinfo(struct sysinfo *info) {
+  if (!info) {
+    errno = EFAULT;
+    return -1;
+  }
+  return _check_err(syscall(SYS_SYSINFO, info));
 }

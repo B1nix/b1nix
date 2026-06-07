@@ -26,6 +26,9 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
+#include <b1nix/net.h>
+#include <b1nix/netdev.h>
+#include <b1nix/blk.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -264,6 +267,28 @@ static int r_cmdline(usize pid, struct sbuf *s) {
 }
 
 /* ── per-process files ── */
+
+/* Linux /proc/<pid>/stat and /proc/<pid>/comm expose the process "comm": the
+ * basename of the executable, truncated to TASK_COMM_LEN-1 (15) chars — NOT the
+ * full exec path. b1nix stores the exec path in t->name (e.g.
+ * "/opt/busybox/bin/busybox"), so derive comm here. BusyBox procps
+ * (pidof/pgrep/pkill/ps) match on this field, so getting it wrong silently
+ * breaks process lookup by name. `out` must hold at least 16 bytes. */
+#define PROC_COMM_LEN 16
+static void proc_comm(const struct task *t, char out[PROC_COMM_LEN]) {
+  const char *name = (t && t->name) ? t->name : "?";
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (!*base) /* trailing slash, e.g. a directory exec path */
+    base = name;
+  usize i = 0;
+  while (base[i] && i < PROC_COMM_LEN - 1) {
+    out[i] = base[i];
+    i++;
+  }
+  out[i] = '\0';
+}
+
 static const char *state_long(const char *abbr) {
   switch (abbr[0]) {
   case 'R': return "R (running)";
@@ -283,7 +308,9 @@ static int r_pid_status(usize pid, struct sbuf *s) {
     return 0;
   }
   const char *st = scheduler_state_name((int)t->state);
-  sb_addf(s, "Name:\t%s\n", t->name ? t->name : "?");
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s, "Name:\t%s\n", comm);
   sb_addf(s, "State:\t%s\n", state_long(st));
   sb_addf(s, "Pid:\t%lu\n", (unsigned long)t->id);
   sb_addf(s, "PPid:\t%lu\n", (unsigned long)t->parent_id);
@@ -307,7 +334,13 @@ static int r_pid_cmdline(usize pid, struct sbuf *s) {
 
 static int r_pid_comm(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
-  sb_addf(s, "%s\n", (t && t->name) ? t->name : "(gone)");
+  if (!t) {
+    sb_puts(s, "(gone)\n");
+    return 0;
+  }
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s, "%s\n", comm);
   return 0;
 }
 
@@ -320,6 +353,15 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
   sb_addf(s, "%lu (%s) %s %lu\n", (unsigned long)t->id,
           t->name ? t->name : "?", scheduler_state_name((int)t->state),
           (unsigned long)t->parent_id);
+  u64 vsz = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s,
+          "%lu (%s) %s %lu %lu %lu 0 -1 0 0 0 0 0 0 0 0 0 %d 0 1 0 0 %lu %lu\n",
+          (unsigned long)t->id, comm,
+          scheduler_state_name((int)t->state), (unsigned long)t->parent_id,
+          (unsigned long)t->process_group_id, (unsigned long)t->session_id,
+          t->priority, (unsigned long)vsz, (unsigned long)(vsz / 4096));
   return 0;
 }
 
@@ -342,6 +384,88 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
 }
 
 /* ── /proc/<pid> directory builder ── */
+/* ── /proc/<pid>/fd/ — one symlink per open file descriptor (for lsof) ──
+ * Linux exposes each fd as a symlink whose readlink yields the open file's
+ * path (or a "socket:[..]"/"pipe:[..]" synthetic name). BusyBox lsof reads the
+ * dir and readlinks each entry. We snapshot the task's fd table under its
+ * fd_lock (no allocation while locked), then materialise the symlink children
+ * outside the lock. Children are created on demand and left in place — procfs
+ * nodes are permanent, so a closed fd's stale symlink is harmless. */
+#define PROCFS_FD_SNAP_MAX 64
+struct procfs_fd_snap {
+  int fd;
+  char target[80];
+};
+
+static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) {
+  char name[16];
+  snprintf(name, sizeof(name), "%d", fd);
+  if (find_child(dir, name))
+    return; /* already materialised */
+  struct vfs_node *n = vfs_create_node(VFS_SYMLINK);
+  if (!n)
+    return;
+  usize nl = strlen(name);
+  memcpy(n->name, name, nl);
+  n->name[nl] = '\0';
+  char *dup = strdup(target);
+  n->inode->data = dup;
+  n->inode->size = dup ? strlen(dup) : 0;
+  n->inode->mode = 0777;
+  n->inode->nlink = 1;
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
+}
+
+static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
+                               struct dirent *buf, usize max_entries) {
+  usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
+  struct task *t = scheduler_task_by_pid(pid);
+  if (t) {
+    struct procfs_fd_snap snap[PROCFS_FD_SNAP_MAX];
+    usize nsnap = 0;
+    u64 flags;
+    spin_lock_irqsave(&t->fd_lock, &flags);
+    usize cap = t->fd_capacity;
+    for (usize i = 0; i < cap && nsnap < PROCFS_FD_SNAP_MAX; i++) {
+      struct vfs_handle *h = t->fd_table ? t->fd_table[i] : 0;
+      if (!h || !h->used)
+        continue;
+      snap[nsnap].fd = (int)i;
+      const char *kind = "anon_inode:[unknown]";
+      char *tg = snap[nsnap].target;
+      switch (h->kind) {
+      case VFS_HANDLE_PIPE_READ:
+      case VFS_HANDLE_PIPE_WRITE:
+        snprintf(tg, sizeof(snap[nsnap].target), "pipe:[%d]", (int)i);
+        break;
+      case VFS_HANDLE_SOCKET:
+        snprintf(tg, sizeof(snap[nsnap].target), "socket:[%d]", (int)i);
+        break;
+      case VFS_HANDLE_PTY_MASTER:
+      case VFS_HANDLE_PTY_SLAVE:
+        snprintf(tg, sizeof(snap[nsnap].target), "/dev/pts/%d", (int)i);
+        break;
+      case VFS_HANDLE_NODE:
+        if (h->node && h->node->name[0])
+          snprintf(tg, sizeof(snap[nsnap].target), "/%s", h->node->name);
+        else
+          snprintf(tg, sizeof(snap[nsnap].target), "%s", kind);
+        break;
+      default:
+        snprintf(tg, sizeof(snap[nsnap].target), "%s", kind);
+        break;
+      }
+      nsnap++;
+    }
+    spin_unlock_irqrestore(&t->fd_lock, flags);
+    for (usize i = 0; i < nsnap; i++)
+      procfs_fd_symlink(dir, snap[i].fd, snap[i].target);
+  }
+  return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
                                            const char *name, usize pid) {
   struct vfs_node *d = procfs_mkchild(parent, name, VFS_DIRECTORY, 0, 0);
@@ -352,6 +476,9 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
+  struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
+  if (fddir)
+    fddir->inode->readdir_cb = procfs_fd_readdir;
   return d;
 }
 
@@ -387,6 +514,135 @@ static isize procfs_root_readdir(struct vfs_node *dir, usize offset,
 /* ──────────────────────────────────────────────────────────────────────────
  * Mount
  * ────────────────────────────────────────────────────────────────────────── */
+/* ──────────────────────────────────────────────────────────────────────────
+ * /proc/net — socket, route and interface tables (netstat, route, netstat -i)
+ * ────────────────────────────────────────────────────────────────────────── */
+
+/* Linux /proc/net/{tcp,udp} print the local/remote IPv4 as 8 hex digits in
+ * little-endian byte order (so 127.0.0.1 -> "0100007F") and the port as 4 hex
+ * digits in host order. BusyBox netstat decodes both. */
+static void sb_hexaddr4(struct sbuf *s, const u8 ip[4], u16 port) {
+  sb_addf(s, "%02X%02X%02X%02X:%04X", ip[3], ip[2], ip[1], ip[0], port);
+}
+
+static void net_render_inet(struct sbuf *s, int family /*4 or 6*/, int udp) {
+  struct net_sock_info info[64];
+  usize n = udp ? udp_binding_snapshot(info, 64) : tcp_conn_snapshot(info, 64);
+  usize sl = 0;
+  for (usize i = 0; i < n; i++) {
+    if (info[i].family != family)
+      continue;
+    sb_addf(s, "%4lu: ", (unsigned long)sl++);
+    if (family == 6) {
+      const u8 *l = info[i].local_ip, *r = info[i].remote_ip;
+      sb_addf(s, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X:%04X ",
+              l[3], l[2], l[1], l[0], l[7], l[6], l[5], l[4], l[11], l[10], l[9],
+              l[8], l[15], l[14], l[13], l[12], info[i].local_port);
+      sb_addf(s, "%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X%02X:%04X ",
+              r[3], r[2], r[1], r[0], r[7], r[6], r[5], r[4], r[11], r[10], r[9],
+              r[8], r[15], r[14], r[13], r[12], info[i].remote_port);
+    } else {
+      sb_hexaddr4(s, info[i].local_ip, info[i].local_port);
+      sb_puts(s, " ");
+      sb_hexaddr4(s, info[i].remote_ip, info[i].remote_port);
+      sb_puts(s, " ");
+    }
+    sb_addf(s, "%02X 00000000:00000000 00:00000000 00000000     0        0 0\n",
+            info[i].state);
+  }
+}
+
+static int r_net_tcp(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "  sl  local_address rem_address   st tx_queue rx_queue tr "
+             "tm->when retrnsmt   uid  timeout inode\n");
+  net_render_inet(s, 4, 0);
+  return 0;
+}
+
+static int r_net_tcp6(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "  sl  local_address                         "
+             "remote_address                        st tx_queue rx_queue tr "
+             "tm->when retrnsmt   uid  timeout inode\n");
+  net_render_inet(s, 6, 0);
+  return 0;
+}
+
+static int r_net_udp(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "  sl  local_address rem_address   st tx_queue rx_queue tr "
+             "tm->when retrnsmt   uid  timeout inode ref pointer drops\n");
+  net_render_inet(s, 4, 1);
+  return 0;
+}
+
+static int r_net_unix(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "Num       RefCount Protocol Flags    Type St Inode Path\n");
+  return 0;
+}
+
+/* /proc/net/route: hex, tab-separated. Destination/Gateway/Mask are 8 hex
+ * digits in little-endian byte order. BusyBox `route` parses this. We emit the
+ * default route via the DHCP-learnt gateway. */
+static int r_net_route(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "Iface\tDestination\tGateway \tFlags\tRefCnt\tUse\tMetric\tMask"
+             "\t\tMTU\tWindow\tIRTT\n");
+  struct ipv4_addr ip = net_get_ip();
+  struct ipv4_addr gw = net_get_gateway();
+  const char *ifn = "eth0";
+  if ((ip.bytes[0] | ip.bytes[1] | ip.bytes[2] | ip.bytes[3]) != 0) {
+    /* On-link subnet route, assumed /24 (the QEMU SLIRP default and what the
+     * smoke uses): dest = ip & 0xFFFFFF00, no gateway, flags UP (0x0001). */
+    sb_addf(s,
+            "%s\t%02X%02X%02X00\t00000000\t0001\t0\t0\t0\t00FFFFFF\t0\t0\t0\n",
+            ifn, ip.bytes[2], ip.bytes[1], ip.bytes[0]);
+  }
+  if ((gw.bytes[0] | gw.bytes[1] | gw.bytes[2] | gw.bytes[3]) != 0) {
+    /* default route: 0.0.0.0/0 -> gateway, flags UP|GATEWAY (0x0003) */
+    sb_addf(s,
+            "%s\t00000000\t%02X%02X%02X%02X\t0003\t0\t0\t0\t00000000\t0\t0\t0\n",
+            ifn, gw.bytes[3], gw.bytes[2], gw.bytes[1], gw.bytes[0]);
+  }
+  return 0;
+}
+
+/* /proc/net/dev: per-interface byte/packet counters. b1nix has no per-iface
+ * counters, so they are zero; the interface list itself is real (netstat -i,
+ * and a fallback path for some tools). */
+static int r_net_dev(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "Inter-|   Receive                                                "
+             "|  Transmit\n");
+  sb_puts(s, " face |bytes    packets errs drop fifo frame compressed multicast"
+             "|bytes    packets errs drop fifo colls carrier compressed\n");
+  sb_puts(s, "    lo:       0       0    0    0    0     0          0         0"
+             "       0       0    0    0    0     0       0          0\n");
+  if (netdev_active())
+    sb_puts(s, "  eth0:       0       0    0    0    0     0          0       "
+               "  0       0       0    0    0    0     0       0          0\n");
+  return 0;
+}
+
+/* /proc/partitions: one line per block device. #blocks is in 1 KiB units (the
+ * Linux convention). BusyBox blkid/lsblk enumerate from this. */
+static int r_partitions(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "major minor  #blocks  name\n\n");
+  usize n = blk_count();
+  for (usize i = 0; i < n; i++) {
+    struct block_device *d = blk_at(i);
+    if (!d || !d->name)
+      continue;
+    u64 kblocks = ((u64)d->block_size * d->block_count) / 1024;
+    sb_addf(s, "%4d %7lu %10lu %s\n", 8, (unsigned long)i,
+            (unsigned long)kblocks, d->name);
+  }
+  return 0;
+}
+
 static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
                                         void *data) {
   (void)source;
@@ -408,6 +664,17 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
+  procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+
+  struct vfs_node *netd = procfs_mkchild(root, "net", VFS_DIRECTORY, 0, 0);
+  if (netd) {
+    procfs_mkchild(netd, "tcp", VFS_DEVICE, r_net_tcp, 0);
+    procfs_mkchild(netd, "tcp6", VFS_DEVICE, r_net_tcp6, 0);
+    procfs_mkchild(netd, "udp", VFS_DEVICE, r_net_udp, 0);
+    procfs_mkchild(netd, "unix", VFS_DEVICE, r_net_unix, 0);
+    procfs_mkchild(netd, "route", VFS_DEVICE, r_net_route, 0);
+    procfs_mkchild(netd, "dev", VFS_DEVICE, r_net_dev, 0);
+  }
 
   /* /proc/self — per-process view of the *calling* task (pid resolved at read
    * time via pid_from_parent → scheduler_get_pid). */

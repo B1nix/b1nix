@@ -804,6 +804,50 @@ static int _vscan(struct _scan_src *s, const char *fmt, va_list ap) {
       }
       continue;
     }
+    if (conv == '[') {
+      /* Scanset %[...] / %[^...]: read characters that are in (or, with a
+       * leading ^, not in) the bracket set, up to the field width. Unlike %s
+       * it does NOT skip leading whitespace. A ']' right after '[' or '[^' is
+       * a literal member; "a-z" denotes an inclusive range. */
+      const char *setp = f + 1;
+      int negate = 0;
+      if (*setp == '^') { negate = 1; setp++; }
+      unsigned char inset[256];
+      memset(inset, 0, sizeof(inset));
+      if (*setp == ']') { inset[(unsigned char)']'] = 1; setp++; }
+      while (*setp && *setp != ']') {
+        if (setp[1] == '-' && setp[2] && setp[2] != ']') {
+          unsigned char lo = (unsigned char)setp[0], hi = (unsigned char)setp[2];
+          if (lo <= hi)
+            for (int ch = lo; ch <= hi; ch++) inset[ch] = 1;
+          setp += 3;
+        } else {
+          inset[(unsigned char)*setp] = 1;
+          setp++;
+        }
+      }
+      /* Leave f on the closing ']' so the loop's f++ steps past it. */
+      f = (*setp == ']') ? setp : setp - 1;
+      char *p = suppress ? 0 : va_arg(ap, char *);
+      int n = 0;
+      int w = width ? width : 0x7fffffff;
+      int c;
+      while (n < w) {
+        c = _sc_get(s);
+        if (c == EOF) break;
+        int member = inset[(unsigned char)c] ? 1 : 0;
+        if (negate) member = !member;
+        if (!member) { _sc_unget(s, c); break; }
+        saw_input = 1;
+        if (p) p[n] = (char)c;
+        n++;
+      }
+      if (n == 0)
+        return saw_input ? assigned : (assigned ? assigned : EOF);
+      if (p) p[n] = '\0';
+      if (!suppress) assigned++;
+      continue;
+    }
     if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' ||
         conv == 'G' || conv == 'a' || conv == 'A') {
       double v = 0;

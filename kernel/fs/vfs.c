@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/loop.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/ext2.h>
@@ -3711,8 +3712,48 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
-  if (node->inode->type != VFS_DEVICE || !arg)
+  if (node->inode->type != VFS_DEVICE)
     return -EINVAL;
+
+  /* Loop-device control ioctls (BusyBox losetup): the LOOP_* family is type
+   * 0x4C, plus the /dev/loop-control node. Handled before the `arg` check
+   * because LOOP_CTL_GET_FREE / LOOP_CLR_FD carry no argument. */
+  if (((request >> 8) & 0xFF) == 0x4C ||
+      strcmp(node->name, "loop-control") == 0)
+    return loop_ioctl(node, request, arg);
+
+  if (!arg)
+    return -EINVAL;
+
+  /* Block-device size ioctls for BusyBox fdisk. Match on the Linux ioctl
+   * "type 0x12" + command number, ignoring the size/dir bits that differ
+   * between the 32- and 64-bit ABIs. */
+  if (node->inode->blk_dev && ((request >> 8) & 0xFF) == 0x12) {
+    struct block_device *bd = node->inode->blk_dev;
+    u64 bytes = (u64)bd->block_size * bd->block_count;
+    switch (request & 0xFF) {
+    case 0x60: { /* BLKGETSIZE: size in 512-byte sectors (unsigned long) */
+      unsigned long sectors = (unsigned long)(bytes / 512);
+      return syscall_copyout(arg, &sectors, sizeof(sectors)) < 0 ? -EFAULT : 0;
+    }
+    case 0x68: { /* BLKSSZGET: logical sector size (int) */
+      int ss = (int)(bd->block_size ? bd->block_size : 512);
+      return syscall_copyout(arg, &ss, sizeof(ss)) < 0 ? -EFAULT : 0;
+    }
+    case 0x70: { /* BLKBSZGET: block size (size_t) */
+      unsigned long bs = (unsigned long)(bd->block_size ? bd->block_size : 512);
+      return syscall_copyout(arg, &bs, sizeof(bs)) < 0 ? -EFAULT : 0;
+    }
+    case 0x72: /* BLKGETSIZE64: size in bytes (u64) */
+      return syscall_copyout(arg, &bytes, sizeof(bytes)) < 0 ? -EFAULT : 0;
+    case 0x5F: /* BLKRRPART: reread partition table — accept */
+    case 0x61: /* BLKFLSBUF: flush buffers — accept */
+      return 0;
+    default:
+      return -ENOTTY;
+    }
+  }
+
   if (strcmp(node->name, "tty") != 0 && strcmp(node->name, "console") != 0)
     return -ENOTTY;
 

@@ -1728,6 +1728,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
   case SYS_GETPID:
     return (u64)scheduler_get_pid();
+  case SYS_GETPPID:
+    return (u64)(current_task ? current_task->parent_id : 0);
   case SYS_GETCPU: {
     struct percpu *p = get_percpu();
     return (u64)(p ? p->cpu_id : 0);
@@ -2150,6 +2152,40 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     if (syscall_copyout((void *)(usize)arg0, tmp, copied) != 0)
       return (u64)-EFAULT;
     return (u64)copied;
+  case SYS_SYSINFO: {
+    /* Linux struct sysinfo (sysinfo(2)). Mirror byte-for-byte the userspace
+     * <sys/sysinfo.h>: native `unsigned long` on both sides (32-bit i686 /
+     * 64-bit x86_64). b1nix has no per-buffer-cache accounting or swap-size
+     * API, so bufferram/sharedram/swap are 0; mem_unit stays 1 (bytes) so
+     * BusyBox free does no scaling. */
+    struct k_sysinfo {
+      long uptime;
+      unsigned long loads[3];
+      unsigned long totalram;
+      unsigned long freeram;
+      unsigned long sharedram;
+      unsigned long bufferram;
+      unsigned long totalswap;
+      unsigned long freeswap;
+      unsigned short procs;
+      unsigned short pad;
+      unsigned long totalhigh;
+      unsigned long freehigh;
+      unsigned int mem_unit;
+      char _f[20 - 2 * sizeof(long) - sizeof(int)];
+    } info;
+    memset(&info, 0, sizeof(info));
+    info.uptime = (long)(scheduler_get_uptime_ticks() / 100u);
+    info.totalram = (unsigned long)pmm_total_usable_memory();
+    info.freeram = (unsigned long)pmm_free_memory_estimate();
+    info.procs = (unsigned short)scheduler_task_count();
+    info.mem_unit = 1;
+    if (!arg0)
+      return (u64)-EFAULT;
+    if (syscall_copyout((void *)(usize)arg0, &info, sizeof(info)) != 0)
+      return (u64)-EFAULT;
+    return 0;
+  }
   case SYS_MOUNT:
     return (u64)sys_mount((const char *)(usize)arg0, (const char *)(usize)arg1,
                           (const char *)(usize)arg2, arg3);

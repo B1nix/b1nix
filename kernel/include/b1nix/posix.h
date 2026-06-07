@@ -35,9 +35,11 @@
 #define B1NIX_AF_LOCAL B1NIX_AF_UNIX
 #define B1NIX_AF_INET 2
 #define B1NIX_AF_INET6 10
+#define B1NIX_AF_NETLINK 16
 
 #define B1NIX_SOCK_STREAM 1
 #define B1NIX_SOCK_DGRAM 2
+#define B1NIX_SOCK_RAW 3
 
 /* Mount flags */
 #define B1NIX_MS_RDONLY   0x0001ULL

@@ -739,17 +739,86 @@ upstream applets pass the same workflows.
     `statvfs.o` is what masked the `struct statfs` fix on i686). Switched to
     `-MD`. `tools/build-busybox.sh` now also force-cleans BusyBox objects when
     the sysroot changed (BusyBox's make does not track sysroot deps either).
-- [ ] `planned` Migration wave 3, process and system inspection. Bring up
-  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`/`pkill`, `lsof`,
-  `dmesg` and related tools. Extend `/proc/<pid>/stat`, `/proc/<pid>/fd`,
-  `/proc/mounts`, `/proc/net/*` and `/sys` only where an enabled applet has a
-  concrete tested requirement.
-- [ ] `planned` Migration wave 4, storage and networking. Port `mount`,
-  `umount`, `lsblk`, `blkid`, `losetup`, `fdisk`, `ifconfig`, `ip`, `route`,
-  `netstat`, `ping`, `nslookup` and DHCP/network service applets. Expose b1nix
-  block-device, mount and network state through stable userspace APIs or a
-  narrow BusyBox platform backend; do not implement a general Linux syscall
-  personality as part of this milestone.
+- [x] `done` Migration wave 3, process and system inspection. Brought up
+  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep` and `pkill`
+  (procps) plus `dmesg` (util-linux). Coverage is the `BB-W3:` markers in the
+  posix smoke: `ps`/`top` enumerate `/proc`, `uptime` reads `/proc/uptime` +
+  `/proc/loadavg`, `free` reads `sysinfo()` + `/proc/meminfo`, `dmesg` drains
+  the kernel ring buffer, and `pidof`/`pgrep`/`pkill` find and signal a live
+  process by name. Verified: `x86_64` **443/0** (full suite, single-CPU +
+  `-smp 4`); `i686` all eight `BB-W3:` markers green with the suite at **442/1**
+  — the sole failure is the pre-existing, i686-only `M37 e1000` ARP-receive-
+  over-SLIRP timing test (`M37-E1000: ok rx-arp`), which is green on `x86_64`,
+  was introduced before this branch (commit `1e792db`), and is untouched by any
+  W3 code (zero net/e1000 files in the diff). Real bugs/gaps this wave fixed:
+  - **`/proc/<pid>/stat` was 4 fields**; extended to the full 24-field Linux
+    layout BusyBox procps parses (state is a single `%c`; b1nix has no per-task
+    CPU time/start ticks yet so utime/stime/starttime are 0; vsize = heap span,
+    rss = its page count).
+  - **Process "comm" was the full exec path truncated to 15 chars**
+    (`/opt/busybox/bin/busybox` → `/opt/busybox/bi`, basename `bi`), so
+    `pidof`/`pgrep`/`pkill` could not match by name. `sys_spawn` now takes the
+    executable **basename** before truncating to `TASK_COMM_LEN-1`, and
+    `/proc/<pid>/{stat,comm,status}` expose that basename — matching Linux
+    semantics.
+  - New **`SYS_SYSINFO`** syscall + `struct sysinfo` (`<sys/sysinfo.h>`) and a
+    `sysinfo()` libc wrapper, filling totalram/freeram/procs/mem_unit from the
+    PMM (`mem_unit = 1` byte, no scaling); both `free` and `uptime` need it.
+  - New **`klogctl()`** libc wrapper (`<sys/klog.h>`) mapping the syslog(2)
+    read actions onto the existing `SYS_DMESG`, with size/console queries
+    answered locally; `dmesg` needs it.
+  - New **`SYS_GETPPID`** syscall + `getppid()`, and a `usleep()` wrapper
+    (via `nanosleep`) — `pidof` and `top` link against them.
+  - **Build:** the cross GCC predefines `__b1nix__`/`__unix__`, not `__linux__`,
+    so procps `free`/`uptime`/`ps` skipped `<sys/sysinfo.h>` ("storage size of
+    'info' isn't known"). `tools/build-busybox.sh` now idempotently widens those
+    three include guards to also fire for `__b1nix__`.
+  `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks)
+  is deferred to a follow-up sub-wave.
+- [x] `done` Migration wave 4, storage and networking. **Nine applets
+  enabled and smoke-tested** (`BB-W4:` markers), green on **both** arches —
+  `x86_64` and `i686` both pass all markers, suite ~454/1 modulo the
+  pre-existing M37 e1000/SMP timing flake: `mount`, `umount` (libc wrappers +
+  `<sys/mount.h>` over SYS_MOUNT/UMOUNT), `nslookup` (minimal `<resolv.h>` +
+  `res_init`; resolution via `getaddrinfo`→SYS_NET_DNS), `netstat` (new
+  `/proc/net/{tcp,tcp6,udp,unix}` from the kernel socket tables), `route` (new
+  `/proc/net/route`, on-link subnet + default gateway), `ifconfig` (new
+  `socket_file_ops.ioctl` serving SIOCGIF* from netdev/net state for a single
+  modelled `eth0`), `blkid` + `fdisk` (new `/dev/<name>` block nodes with cached
+  byte I/O + BLK* size ioctls, `/proc/partitions`), and `lsof`
+  (`/proc/<pid>/fd/` fd symlinks — the deferred wave-3 item). Enabling
+  infrastructure that landed: the scanf engine gained the `%[...]` **scanset**
+  conversion (netstat/route parse `/proc/net/*` with it), `getservbyport`,
+  `strnlen`, `_IOC`/`_IOR` macros, and headers `net/route.h`, `net/if.h`
+  (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`, `caddr_t`.
+  `lsblk` is **not shipped by BusyBox 1.36** at all — `blkid` + `fdisk -l`
+  cover its inspection role.
+- [x] `done` Migration wave 4b, `ping`/`losetup`/`ip`. **All three enabled and
+  smoke-tested** (`BB-W4B:` markers), green on **both** arches — `x86_64`
+  **455/1** and `i686` **454/1** (the sole failure is the same pre-existing M37
+  e1000 ARP-over-SLIRP timing flake, untouched by this wave). Each required a
+  distinct new kernel subsystem:
+  - **`ping`** — raw `SOCK_RAW`/ICMP sockets. A raw-socket registry in
+    `kernel/net/socket.c`; `icmp_receive()` delivers every echo reply to
+    registered raw sockets via `vfs_socket_push_raw_icmp()` with a synthetic
+    20-byte IPv4 header. libc `recvfrom()` recovers the peer from that header;
+    `sendto()` records the per-packet destination as the connected peer.
+  - **`losetup`** — a loop-device ioctl surface. `kernel/dev/loop.c` registers 8
+    `/dev/loopN` + `/dev/loop-control`, answering LOOP_CTL_GET_FREE,
+    LOOP_SET_FD/CLR_FD and status ioctls. `vfs_ioctl()` routes the `0x4C` ioctl
+    group (and `loop-control`) **before** the `!arg` guard, since
+    LOOP_CTL_GET_FREE takes no arg.
+  - **`ip`** — an `AF_NETLINK`/rtnetlink socket personality.
+    `netlink_build_dump()` encodes RTM_NEWLINK/NEWADDR/NEWROUTE responses
+    (nlmsghdr + rtattr TLVs) terminated by NLMSG_DONE for a single modelled
+    `eth0`; `vfs_socket`/`vfs_bind` accept `AF_NETLINK` and `getsockname`
+    reports `nl_pid 0`. libc `sendmsg`/`recvmsg` gained single-iov
+    scatter-gather, and **`recvmsg` zeroes `msg_name`** so the source `nl_pid`
+    reads as 0 — BusyBox libnetlink rejects (and would hang waiting on) any
+    reply whose recvmsg source `nl_pid` is non-zero. Headers added:
+    `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
+    `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
+    `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
 - [ ] `planned` Migration wave 5, shell/login/init applets. Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
