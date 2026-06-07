@@ -114,6 +114,26 @@ int execve(const char *pathname, char *const argv[], char *const envp[]) {
 
 extern char **environ;
 
+int execlp(const char *file, const char *arg, ...) {
+  va_list ap;
+
+  /* Count the NULL-terminated trailing argument list (arg is argv[0]). */
+  va_start(ap, arg);
+  size_t n = 1;
+  while (va_arg(ap, char *) != NULL)
+    n++;
+  va_end(ap);
+
+  char *argv[n + 1];
+  argv[0] = (char *)arg;
+  va_start(ap, arg);
+  for (size_t i = 1; i <= n; i++) /* i == n collects the terminating NULL */
+    argv[i] = va_arg(ap, char *);
+  va_end(ap);
+
+  return execvp(file, argv);
+}
+
 int execvp(const char *file, char *const argv[]) {
   if (file && strchr(file, '/')) {
     return execve(file, argv, environ);
@@ -447,8 +467,20 @@ int stat(const char *path, struct stat *st) {
   return _check_err(syscall(SYS_STAT, path, st));
 }
 
+int lstat(const char *path, struct stat *st) {
+  return _check_err(syscall(SYS_LSTAT, path, st));
+}
+
+int fstat(int fd, struct stat *st) {
+  return _check_err(syscall(SYS_FSTAT, fd, st));
+}
+
 int statfs(const char *path, struct statfs *buf) {
   return _check_err(syscall(SYS_STATFS, path, buf));
+}
+
+int fstatfs(int fd, struct statfs *buf) {
+  return _check_err(syscall(SYS_FSTATFS, fd, buf));
 }
 
 void *mmap(void *addr, size_t length, int prot, int flags, int fd,
@@ -756,6 +788,19 @@ int tcsetpgrp(int fd, pid_t pgrp) {
 
 int tcgetattr(int fd, struct termios *termios_p) {
   return _check_err(syscall(SYS_TERMIOS_GET, fd, termios_p));
+}
+
+/* A descriptor is a terminal iff a TCGETS-class query succeeds on it. The
+ * kernel returns an error (EINVAL/ENOTTY) for regular files, pipes and
+ * non-tty devices, so this distinguishes a redirected fd from the console or
+ * a pty — unlike the old "fd <= 2" placeholder, which mis-reported every
+ * redirected stdio fd as a tty. */
+int isatty(int fd) {
+  struct termios t;
+  if (tcgetattr(fd, &t) == 0)
+    return 1;
+  errno = ENOTTY;
+  return 0;
 }
 
 int tcsetattr(int fd, int optional_actions, const struct termios *termios_p) {

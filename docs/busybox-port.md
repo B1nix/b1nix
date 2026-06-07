@@ -21,20 +21,28 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **56 applets**. Migration wave 1
+The isolated package currently configures **66 applets**. Migration wave 1
 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
 `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
-and `sha256sum`:
+and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
+`bzip2`, `bunzip2`, `unxz` and `xzcat`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
-- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`
+- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`
 - **Path Manipulation**: `basename`, `dirname`, `realpath`
-- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`
+- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`
+- **Archive & Compression**: `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `unxz`, `xzcat`
 - **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
 - **Checksums**: `cksum`, `md5sum`, `sha256sum`
 - **Shell Builtins & Pipelines**: `test`, `[` (alias of test), `sort`, `uniq`
+
+`tar`, `gzip`/`bzip2` compress and decompress; `xz` is **decompress-only**
+(`unxz`/`xzcat`) because upstream BusyBox ships no xz compressor — `tar -J`
+create is therefore unavailable, while `tar -z` (gzip) create/extract and
+`xz` extraction both work. `df` reads `/proc/mounts`, which was added to the
+kernel procfs for this wave.
 
 ## What b1nix Already Provides
 
@@ -91,8 +99,11 @@ backend.
   `SIGALRM`.
 - Implement `getrlimit()` and make `setrlimit()` report actual state instead of
   an unconditional success.
-- Replace the placeholder `dup()`, `isatty()`, `access()` and `ftruncate()`
+- Replace the remaining placeholder `dup()`, `access()` and `ftruncate()`
   implementations with fd-table, VFS permission and truncate operations.
+  (`isatty()` is done — it now queries `tcgetattr`, so a redirected stdio fd is
+  correctly reported as a non-tty; this was required for the wave 2b
+  gzip/bzip2/xz applets.)
 - Complete `fnmatch()` support for `FNM_PATHNAME`, `FNM_PERIOD` and bracket
   expressions.
 - Complete POSIX regex intervals (`{m,n}`), error reporting and edge-case
@@ -111,8 +122,8 @@ backend.
 
 - Extend `/proc/<pid>/stat` to the field layout expected by upstream `ps` and
   `top`; the current file only exposes pid, name, state and parent pid.
-- Add `/proc/<pid>/fd`, `/proc/mounts` (or `/proc/self/mounts`) and the required
-  `/proc/net/*` files.
+- Add `/proc/<pid>/fd` and the required `/proc/net/*` files. (`/proc/mounts`
+  is implemented — it backs upstream `df` in wave 2b.)
 - Extend `/sys/class/block` with device name, size, partition relationship and
   read-only state.
 - Extend `/sys/class/net` with interface name, flags, MTU, MAC and addresses.
@@ -154,11 +165,16 @@ expressions, substitutions, field processing, argument batching, checksums and
 error exit statuses are covered by the optional BusyBox smoke suite. The full
 suite, including SMP, passes 425/425 on both `x86_64` and `i686`.
 
-### Wave 2b: larger file and archive utilities
+### Wave 2b: larger file and archive utilities (done)
 
-Enable `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `xz`
-and `unxz` in small groups. Add focused large-file, sparse-file, filesystem
-accounting, archive traversal and malformed-input tests before promotion.
+Enabled and smoke-tested: `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
+`bzip2`, `bunzip2`, `unxz` and `xzcat`. Coverage (`BB-W2B:` markers in the
+posix smoke): byte-exact `dd` copy, `du` block accounting, `df` against the
+new `/proc/mounts`, `tar` create/extract round trip, `tar -z` seamless gzip,
+`gzip`/`gunzip` and `bzip2`/`bunzip2` round trips, `xz` decompression of an
+embedded fixture, and a malformed-input negative test (`gunzip` on non-gzip
+data returns nonzero). `xz` is decompress-only (no upstream xz compressor),
+so `tar -J` create is unavailable. Kernel change: added `/proc/mounts`.
 
 ### Wave 3: upstream `ash`
 

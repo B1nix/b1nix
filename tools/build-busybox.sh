@@ -98,6 +98,19 @@ while IFS= read -r setting; do
 done < "$CONFIG_FRAGMENT"
 make -C "$SRC_DIR" O="$BUILD_DIR" CROSS_COMPILE="${TARGET}-" oldconfig < /dev/null
 
+# Force a clean rebuild when the b1nix sysroot changed since the last BusyBox
+# build. BusyBox's make does not track the sysroot headers / libb1nix.a as
+# dependencies, so an incremental build would silently keep object files
+# compiled against stale headers — e.g. an inline syscall wrapper or a struct
+# layout — and link them with no warning. Keeping the .config (only the objects
+# are removed) lets the configure step above stand.
+if [ -f "$BUILD_DIR/busybox" ] &&
+   [ "$SYSROOT/lib/libb1nix.a" -nt "$BUILD_DIR/busybox" ]; then
+    echo "b1nix sysroot changed since last BusyBox build; cleaning objects..."
+    make -C "$BUILD_DIR" CROSS_COMPILE="${TARGET}-" clean < /dev/null ||
+        rm -f "$BUILD_DIR/busybox"
+fi
+
 # ── 3. Build ────────────────────────────────────────────────────────────────
 echo "Building BusyBox..."
 # Link using userspace library and load at 0x2000000

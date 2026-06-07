@@ -11,10 +11,21 @@ PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 # than i386 under TCG (no KVM on macOS) and the single-CPU suite lands right at
 # ~110-120s, so give 64-bit more headroom to avoid false timeouts.
 if [ "$ARCH" = "x86_64" ]; then
-	TIMEOUT=${TIMEOUT:-480}
+	DEFAULT_TIMEOUT=480
 else
-	TIMEOUT=${TIMEOUT:-120}
+	DEFAULT_TIMEOUT=120
 fi
+# The optional upstream-BusyBox smoke (UPSTREAM_BUSYBOX=1) spawns ~45 extra ELF
+# loads; under TCG that overruns the tight default budgets (the i686 run already
+# lands near its 120s limit), so widen both arches when it is enabled.
+if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
+	if [ "$ARCH" = "x86_64" ]; then
+		DEFAULT_TIMEOUT=600
+	else
+		DEFAULT_TIMEOUT=300
+	fi
+fi
+TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
@@ -464,6 +475,16 @@ if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	check_output "$LOG" "BB-W2: ok cksum" "busybox cksum works"
 	check_output "$LOG" "BB-W2: ok md5sum" "busybox md5sum works"
 	check_output "$LOG" "BB-W2: ok sha256sum" "busybox sha256sum works"
+	check_output "$LOG" "BB-W2B: ok dd" "busybox dd works"
+	check_output "$LOG" "BB-W2B: ok du" "busybox du works"
+	check_output "$LOG" "BB-W2B: ok df" "busybox df works (/proc/mounts)"
+	check_output "$LOG" "BB-W2B: ok tar" "busybox tar create/extract works"
+	check_output "$LOG" "BB-W2B: ok tar-gzip" "busybox tar -z seamless gzip works"
+	check_output "$LOG" "BB-W2B: ok gzip" "busybox gzip/gunzip round trip works"
+	check_output "$LOG" "BB-W2B: ok bzip2" "busybox bzip2/bunzip2 round trip works"
+	check_output "$LOG" "BB-W2B: ok xzcat" "busybox xzcat decompresses xz"
+	check_output "$LOG" "BB-W2B: ok unxz" "busybox unxz decompresses xz"
+	check_output "$LOG" "BB-W2B: ok gunzip-malformed" "busybox gunzip rejects malformed input"
 	check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
 	check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
 	check_output "$LOG" "BB-SMOKE: done" "BusyBox smoke completes"

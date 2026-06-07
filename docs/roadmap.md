@@ -702,11 +702,43 @@ upstream applets pass the same workflows.
   and known checksum vectors in the optional BusyBox smoke suite. Verified by
   the full suite, including SMP, on both architectures: 425 passed, 0 failed
   on `x86_64` and 425 passed, 0 failed on `i686`.
-- [ ] `planned` Continue the low-risk file/archive track as migration wave 2b.
-  Enable `dd`, `du`, `df`, `tar`, `gzip`/`gunzip`, `bzip2`/`bunzip2` and
-  `xz`/`unxz` in small groups. Add large-file, sparse-file, filesystem
-  accounting, archive traversal and malformed-input tests; complete remaining
-  regex and `fnmatch` edge cases only where the enabled applets require them.
+- [x] `done` Continue the low-risk file/archive track as migration wave 2b.
+  Enabled and smoke-tested `dd`, `du`, `df`, `tar`, `gzip`/`gunzip`,
+  `bzip2`/`bunzip2` and `unxz`/`xzcat` (`xz` is decompress-only — upstream
+  BusyBox ships no xz compressor, so `tar -J` create is unavailable). Coverage
+  is the `BB-W2B:` markers in the posix smoke: byte-exact `dd`, `du` block
+  accounting, `df` against the new `/proc/mounts`, `tar` create/extract round
+  trip, `tar -z` seamless gzip extract, gzip/bzip2 round trips, `xz`
+  decompression of an embedded small-dictionary fixture, and a malformed-input
+  negative (`gunzip` on non-gzip → nonzero). Verified on **both** arches:
+  `x86_64` **435/0** and `i686` **435/0** (single-CPU + `-smp 4`). This wave
+  uncovered and fixed several real libc/kernel/build bugs the synthetic tests
+  never hit:
+  - **`vsnprintf` ignored field width and the `0` flag for integer conversions**
+    (`%d/%u/%x/%o`). BusyBox `tar`'s `putOctal` does `sprintf("%0*lo", len, v)`
+    and relies on zero-padding to the field width, then `tempString += width -
+    len`; with no padding that index went negative and `memcpy`'d junk, so every
+    octal tar-header field (size/mode/uid/gid/mtime) came out zero →
+    "invalid tar magic". Now width + `0`/`-` flags + `%X` uppercase are honored.
+  - **`isatty()` was a `fd <= 2` placeholder** → gzip/bzip2/xz refused to
+    de/compress a redirected fd ("compressed data not read from terminal"). Now
+    backed by `tcgetattr` (ENOTTY for non-tty fds).
+  - Added libc `mntent` (`getmntent` family), `sys/statvfs.h` + `statvfs`/
+    `fstatvfs`, `sys/statfs.h`, `fstatfs`, `execlp`, `clearenv`, `strverscmp`;
+    made `lstat`/`fstat` real out-of-line functions; added `/proc/mounts`.
+  - **i686-only:** `vsnprintf` read 64-bit `ll`/`%llu`/`%llo` args as 32-bit
+    `long` (it collapsed `l`/`ll`), which mis-consumed varargs — `cksum`
+    (`%llu`) hung and `putOctal` (`%llo`) wrote garbage. Now `ll`/`j`/`L` are a
+    distinct 64-bit class. The userspace `struct statfs` used `unsigned long`,
+    which is 32-bit on i686 while the kernel writes 64-bit fields → a 120→60
+    byte overrun that crashed `df`; the struct is now `unsigned long long` to
+    match the kernel ABI on both arches.
+  - **Build hygiene:** the userspace Makefile used `-isystem include` with
+    `-MMD`, which omits "system" headers from the .d files — so editing any
+    `userspace/include/` header did NOT trigger a recompile (a stale
+    `statvfs.o` is what masked the `struct statfs` fix on i686). Switched to
+    `-MD`. `tools/build-busybox.sh` now also force-cleans BusyBox objects when
+    the sysroot changed (BusyBox's make does not track sysroot deps either).
 - [ ] `planned` Migration wave 3, process and system inspection. Bring up
   upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`/`pkill`, `lsof`,
   `dmesg` and related tools. Extend `/proc/<pid>/stat`, `/proc/<pid>/fd`,
