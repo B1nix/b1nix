@@ -264,6 +264,28 @@ static int r_cmdline(usize pid, struct sbuf *s) {
 }
 
 /* ── per-process files ── */
+
+/* Linux /proc/<pid>/stat and /proc/<pid>/comm expose the process "comm": the
+ * basename of the executable, truncated to TASK_COMM_LEN-1 (15) chars — NOT the
+ * full exec path. b1nix stores the exec path in t->name (e.g.
+ * "/opt/busybox/bin/busybox"), so derive comm here. BusyBox procps
+ * (pidof/pgrep/pkill/ps) match on this field, so getting it wrong silently
+ * breaks process lookup by name. `out` must hold at least 16 bytes. */
+#define PROC_COMM_LEN 16
+static void proc_comm(const struct task *t, char out[PROC_COMM_LEN]) {
+  const char *name = (t && t->name) ? t->name : "?";
+  const char *base = strrchr(name, '/');
+  base = base ? base + 1 : name;
+  if (!*base) /* trailing slash, e.g. a directory exec path */
+    base = name;
+  usize i = 0;
+  while (base[i] && i < PROC_COMM_LEN - 1) {
+    out[i] = base[i];
+    i++;
+  }
+  out[i] = '\0';
+}
+
 static const char *state_long(const char *abbr) {
   switch (abbr[0]) {
   case 'R': return "R (running)";
@@ -283,7 +305,9 @@ static int r_pid_status(usize pid, struct sbuf *s) {
     return 0;
   }
   const char *st = scheduler_state_name((int)t->state);
-  sb_addf(s, "Name:\t%s\n", t->name ? t->name : "?");
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s, "Name:\t%s\n", comm);
   sb_addf(s, "State:\t%s\n", state_long(st));
   sb_addf(s, "Pid:\t%lu\n", (unsigned long)t->id);
   sb_addf(s, "PPid:\t%lu\n", (unsigned long)t->parent_id);
@@ -307,7 +331,13 @@ static int r_pid_cmdline(usize pid, struct sbuf *s) {
 
 static int r_pid_comm(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
-  sb_addf(s, "%s\n", (t && t->name) ? t->name : "(gone)");
+  if (!t) {
+    sb_puts(s, "(gone)\n");
+    return 0;
+  }
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s, "%s\n", comm);
   return 0;
 }
 
@@ -320,6 +350,15 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
   sb_addf(s, "%lu (%s) %s %lu\n", (unsigned long)t->id,
           t->name ? t->name : "?", scheduler_state_name((int)t->state),
           (unsigned long)t->parent_id);
+  u64 vsz = t->user_brk > t->heap_start ? t->user_brk - t->heap_start : 0;
+  char comm[PROC_COMM_LEN];
+  proc_comm(t, comm);
+  sb_addf(s,
+          "%lu (%s) %s %lu %lu %lu 0 -1 0 0 0 0 0 0 0 0 0 %d 0 1 0 0 %lu %lu\n",
+          (unsigned long)t->id, comm,
+          scheduler_state_name((int)t->state), (unsigned long)t->parent_id,
+          (unsigned long)t->process_group_id, (unsigned long)t->session_id,
+          t->priority, (unsigned long)vsz, (unsigned long)(vsz / 4096));
   return 0;
 }
 

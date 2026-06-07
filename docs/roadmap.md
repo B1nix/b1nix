@@ -739,11 +739,42 @@ upstream applets pass the same workflows.
     `statvfs.o` is what masked the `struct statfs` fix on i686). Switched to
     `-MD`. `tools/build-busybox.sh` now also force-cleans BusyBox objects when
     the sysroot changed (BusyBox's make does not track sysroot deps either).
-- [ ] `planned` Migration wave 3, process and system inspection. Bring up
-  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`/`pkill`, `lsof`,
-  `dmesg` and related tools. Extend `/proc/<pid>/stat`, `/proc/<pid>/fd`,
-  `/proc/mounts`, `/proc/net/*` and `/sys` only where an enabled applet has a
-  concrete tested requirement.
+- [x] `done` Migration wave 3, process and system inspection. Brought up
+  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep` and `pkill`
+  (procps) plus `dmesg` (util-linux). Coverage is the `BB-W3:` markers in the
+  posix smoke: `ps`/`top` enumerate `/proc`, `uptime` reads `/proc/uptime` +
+  `/proc/loadavg`, `free` reads `sysinfo()` + `/proc/meminfo`, `dmesg` drains
+  the kernel ring buffer, and `pidof`/`pgrep`/`pkill` find and signal a live
+  process by name. Verified: `x86_64` **443/0** (full suite, single-CPU +
+  `-smp 4`); `i686` all eight `BB-W3:` markers green with the suite at **442/1**
+  — the sole failure is the pre-existing, i686-only `M37 e1000` ARP-receive-
+  over-SLIRP timing test (`M37-E1000: ok rx-arp`), which is green on `x86_64`,
+  was introduced before this branch (commit `1e792db`), and is untouched by any
+  W3 code (zero net/e1000 files in the diff). Real bugs/gaps this wave fixed:
+  - **`/proc/<pid>/stat` was 4 fields**; extended to the full 24-field Linux
+    layout BusyBox procps parses (state is a single `%c`; b1nix has no per-task
+    CPU time/start ticks yet so utime/stime/starttime are 0; vsize = heap span,
+    rss = its page count).
+  - **Process "comm" was the full exec path truncated to 15 chars**
+    (`/opt/busybox/bin/busybox` → `/opt/busybox/bi`, basename `bi`), so
+    `pidof`/`pgrep`/`pkill` could not match by name. `sys_spawn` now takes the
+    executable **basename** before truncating to `TASK_COMM_LEN-1`, and
+    `/proc/<pid>/{stat,comm,status}` expose that basename — matching Linux
+    semantics.
+  - New **`SYS_SYSINFO`** syscall + `struct sysinfo` (`<sys/sysinfo.h>`) and a
+    `sysinfo()` libc wrapper, filling totalram/freeram/procs/mem_unit from the
+    PMM (`mem_unit = 1` byte, no scaling); both `free` and `uptime` need it.
+  - New **`klogctl()`** libc wrapper (`<sys/klog.h>`) mapping the syslog(2)
+    read actions onto the existing `SYS_DMESG`, with size/console queries
+    answered locally; `dmesg` needs it.
+  - New **`SYS_GETPPID`** syscall + `getppid()`, and a `usleep()` wrapper
+    (via `nanosleep`) — `pidof` and `top` link against them.
+  - **Build:** the cross GCC predefines `__b1nix__`/`__unix__`, not `__linux__`,
+    so procps `free`/`uptime`/`ps` skipped `<sys/sysinfo.h>` ("storage size of
+    'info' isn't known"). `tools/build-busybox.sh` now idempotently widens those
+    three include guards to also fire for `__b1nix__`.
+  `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks)
+  is deferred to a follow-up sub-wave.
 - [ ] `planned` Migration wave 4, storage and networking. Port `mount`,
   `umount`, `lsblk`, `blkid`, `losetup`, `fdisk`, `ifconfig`, `ip`, `route`,
   `netstat`, `ping`, `nslookup` and DHCP/network service applets. Expose b1nix

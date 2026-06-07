@@ -568,6 +568,29 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox gunzip -c /tmp/bb_dir/w2b/bad.gz > /dev/null 2>&1\n"
     "BB_GZ_BAD=$?\n"
     "[ $BB_GZ_BAD -ne 0 ] && echo \"BB-W2B: ok gunzip-malformed\"\n"
+    /* ── Migration wave 3: process & system inspection (procps + dmesg). ──
+     * Native shell grep is strstr-only and wc -c caps at 4096, so every check
+     * pipes through /opt/busybox/bin/busybox grep. */
+    "echo \"BB-W3: start procps\"\n"
+    /* ps: process table; every row carries the resolved owner in the USER
+     * column, so "root" proves ps enumerated /proc and formatted it. */
+    "/opt/busybox/bin/busybox ps | /opt/busybox/bin/busybox grep -q \"root\" && echo \"BB-W3: ok ps\"\n"
+    /* top: one batch iteration, stdin from /dev/null so it never waits on a tty. */
+    "/opt/busybox/bin/busybox top -b -n 1 </dev/null | /opt/busybox/bin/busybox grep -q \"root\" && echo \"BB-W3: ok top\"\n"
+    /* uptime: reads /proc/uptime + /proc/loadavg. */
+    "/opt/busybox/bin/busybox uptime | /opt/busybox/bin/busybox grep -q \"load average\" && echo \"BB-W3: ok uptime\"\n"
+    /* free: sysinfo() syscall + /proc/meminfo. */
+    "/opt/busybox/bin/busybox free | /opt/busybox/bin/busybox grep -q \"Mem:\" && echo \"BB-W3: ok free\"\n"
+    /* dmesg: drains the kernel ring buffer through klogctl -> SYS_DMESG. */
+    "/opt/busybox/bin/busybox dmesg | /opt/busybox/bin/busybox grep -qi \"b1nix\" && echo \"BB-W3: ok dmesg\"\n"
+    /* pidof/pgrep/pkill: a backgrounded busybox sleep gives a live target whose
+     * comm is the exec basename "busybox". pgrep/pkill skip their own pid, so
+     * pkill terminates only the backgrounded sleep. */
+    "/opt/busybox/bin/busybox sleep 30 &\n"
+    "/opt/busybox/bin/busybox pidof busybox | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W3: ok pidof\"\n"
+    "/opt/busybox/bin/busybox pgrep busybox | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W3: ok pgrep\"\n"
+    "/opt/busybox/bin/busybox pkill busybox && echo \"BB-W3: ok pkill\"\n"
+    "echo \"BB-W3: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq\n"

@@ -147,6 +147,8 @@ enum {
   SYS_GETGROUPS    = 121,
   SYS_SETGROUPS    = 122,
   SYS_GETSID       = 123,
+  SYS_SYSINFO      = 124,
+  SYS_GETPPID      = 125,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

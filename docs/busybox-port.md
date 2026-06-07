@@ -21,18 +21,20 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **66 applets**. Migration wave 1
+The isolated package currently configures **74 applets**. Migration wave 1
 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
 `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
 and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
-`bzip2`, `bunzip2`, `unxz` and `xzcat`:
+`bzip2`, `bunzip2`, `unxz` and `xzcat`. Wave 3 added `ps`, `top`, `free`,
+`uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
 - **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`
 - **Path Manipulation**: `basename`, `dirname`, `realpath`
 - **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`
+- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`
 - **Archive & Compression**: `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `unxz`, `xzcat`
 - **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
 - **Checksums**: `cksum`, `md5sum`, `sha256sum`
@@ -176,6 +178,42 @@ embedded fixture, and a malformed-input negative test (`gunzip` on non-gzip
 data returns nonzero). `xz` is decompress-only (no upstream xz compressor),
 so `tar -J` create is unavailable. Kernel change: added `/proc/mounts`.
 
+### Migration wave 3: process & system inspection (done)
+
+Enabled and smoke-tested: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`,
+`pkill` (procps) and `dmesg` (util-linux). Coverage is the `BB-W3:` markers in
+the posix smoke: `ps`/`top` enumerate `/proc`, `uptime` prints the load line
+from `sysinfo()` + `/proc/uptime`/`/proc/loadavg`, `free` reports memory from
+`sysinfo()` + `/proc/meminfo`, `dmesg` drains the kernel ring buffer, and
+`pidof`/`pgrep`/`pkill` find and signal a backgrounded process by name.
+Verified: `x86_64` **443/0** (full suite, single-CPU + `-smp 4`); `i686` all
+eight `BB-W3:` markers green, suite at **442/1** — the only failure is the
+pre-existing, i686-only `M37 e1000` ARP-receive-over-SLIRP timing test (green
+on `x86_64`, introduced before this branch, untouched by W3 code).
+Kernel/libc/build changes this wave needed:
+
+- **`/proc/<pid>/stat`** grew from 4 fields to the full 24-field Linux layout
+  BusyBox procps parses (state is a single `%c`; b1nix has no per-task CPU
+  time/start ticks yet, so utime/stime/starttime are 0; vsize = heap span,
+  rss = page count).
+- **Process "comm" is now the executable basename**, not the full exec path
+  truncated to 15 chars. `sys_spawn` truncated `path` directly, so
+  `/opt/busybox/bin/busybox` became comm `/opt/busybox/bi` (basename `bi`) and
+  `pidof`/`pgrep`/`pkill` could not match by name. It now takes the basename
+  first; `/proc/<pid>/{stat,comm,status}` expose it (matching Linux's
+  `TASK_COMM_LEN`).
+- New **`SYS_SYSINFO`** syscall + `struct sysinfo` (`<sys/sysinfo.h>`) and a
+  `sysinfo()` wrapper, filling totalram/freeram/procs/mem_unit from the PMM
+  (`mem_unit = 1` byte). New **`klogctl()`** (`<sys/klog.h>`) mapping syslog(2)
+  read actions onto `SYS_DMESG`. New **`SYS_GETPPID`** + `getppid()`, and a
+  `usleep()` wrapper (via `nanosleep`).
+- **Build:** the cross GCC predefines `__b1nix__`/`__unix__`, not `__linux__`,
+  so procps `free`/`uptime`/`ps` skipped `<sys/sysinfo.h>`. `build-busybox.sh`
+  idempotently widens those three include guards to also fire for `__b1nix__`.
+
+`lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks) is
+deferred to a follow-up sub-wave.
+
 ### Wave 3: upstream `ash`
 
 The existing shell proves that pipes, redirection, `fork`/`exec`, process
@@ -193,15 +231,19 @@ the complete POSIX and SSH PTY suites pass with it.
 
 ### Wave 4: process and diagnostics
 
-Enable:
+**Mostly done** — see "Migration wave 3: process & system inspection (done)"
+above. `ps`, `top`, `free`, `uptime`, `dmesg`, `pidof`, `pgrep` and `pkill` are
+enabled and smoke-tested; `kill` already shipped in wave 1. The expanded
+`/proc/<pid>/stat` layout, basename `comm`, `SYS_SYSINFO`/`sysinfo()` and
+`klogctl()` that these needed are in place.
 
-`ps`, `top`, `free`, `uptime`, `dmesg`, `sysctl`, `kill`, `killall` and
-`pidof`.
+Still to do:
 
-`free`, `uptime`, `kill` and `dmesg` need thin libc wrappers around facilities
-that already exist. `ps` and `top` require the expanded `/proc` layouts.
-Writable `sysctl` requires an explicit b1nix policy; read-only keys can be
-ported first.
+- `lsof` — needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks.
+- `killall` — name-based bulk kill (the basename `comm` work makes this
+  straightforward now).
+- `sysctl` — read-only keys can be ported first; writable `sysctl` requires an
+  explicit b1nix policy.
 
 ### Wave 5: mounts and storage
 

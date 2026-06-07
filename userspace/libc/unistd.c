@@ -16,6 +16,8 @@
 #include <termios.h>
 #include <poll.h>
 #include <errno.h>
+#include <sys/klog.h>
+#include <sys/sysinfo.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -1222,4 +1224,49 @@ int settimeofday(const struct timeval *tv, const struct timezone *tz) {
   (void)tz;
   errno = EPERM;
   return -1;
+}
+
+/* klogctl(): the Linux syslog(2) interface BusyBox dmesg uses. b1nix exposes
+ * the kernel ring buffer through SYS_DMESG (read-only), so map the read
+ * actions onto it and answer the size/console queries locally. KLOG_BUF_SIZE
+ * mirrors <b1nix/klog.h> (64 KiB). */
+int klogctl(int type, char *bufp, int len) {
+  switch (type) {
+  case SYSLOG_ACTION_READ_ALL:   /* 3 */
+  case SYSLOG_ACTION_READ_CLEAR: /* 4: b1nix has no clear-on-read; same as 3 */
+    if (!bufp || len <= 0) {
+      errno = EINVAL;
+      return -1;
+    }
+    return _check_err(syscall(SYS_DMESG, bufp, (size_t)len));
+  case SYSLOG_ACTION_SIZE_BUFFER: /* 10 */
+    return 65536;
+  case SYSLOG_ACTION_SIZE_UNREAD: /* 9 */
+    return 0;
+  case SYSLOG_ACTION_CONSOLE_OFF:   /* 6 */
+  case SYSLOG_ACTION_CONSOLE_ON:    /* 7 */
+  case SYSLOG_ACTION_CONSOLE_LEVEL: /* 8: no console loglevel in b1nix */
+  case SYSLOG_ACTION_CLOSE:         /* 0 */
+  case SYSLOG_ACTION_OPEN:          /* 1 */
+  case SYSLOG_ACTION_CLEAR:         /* 5 */
+    return 0;
+  default:
+    errno = EINVAL;
+    return -1;
+  }
+}
+
+int usleep(unsigned int usec) {
+  struct timespec req;
+  req.tv_sec = (time_t)(usec / 1000000u);
+  req.tv_nsec = (long)(usec % 1000000u) * 1000L;
+  return nanosleep(&req, 0);
+}
+
+int sysinfo(struct sysinfo *info) {
+  if (!info) {
+    errno = EFAULT;
+    return -1;
+  }
+  return _check_err(syscall(SYS_SYSINFO, info));
 }
