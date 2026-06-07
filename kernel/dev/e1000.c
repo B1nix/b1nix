@@ -571,6 +571,10 @@ void e1000_selftest(void)
 		console_write("M37-E1000: skip no-device\n");
 		return;
 	}
+	/* Prevent the concurrent background net_task poll from stealing packets during the selftest */
+	while (__atomic_test_and_set(&e1000_rx_lock, __ATOMIC_ACQUIRE))
+		scheduler_yield();
+
 	console_write("M37-E1000: ok init\n");
 
 	console_write("M37-E1000: ok mac ");
@@ -627,4 +631,6 @@ void e1000_selftest(void)
 	}
 	console_write(got ? "M37-E1000: ok rx-arp\n"
 	                  : "M37-E1000: FAIL rx-arp (no reply)\n");
+
+	__atomic_clear(&e1000_rx_lock, __ATOMIC_RELEASE);
 }

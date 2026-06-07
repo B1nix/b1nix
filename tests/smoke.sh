@@ -96,12 +96,17 @@ run_qemu() {
 	local pid
 
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
+		local filter_dump_args=""
+		if qemu-system-x86_64 -object filter-dump,help >/dev/null 2>&1; then
+			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=$PROJECT_DIR/smoke_run/net.pcap"
+		fi
+
 		qemu-system-x86_64 \
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
-				-object filter-dump,id=f0,netdev=net0,file="$PROJECT_DIR/smoke_run/net.pcap" \
+				${filter_dump_args} \
 				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
 				-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 				-device ich9-ahci,id=ahci \

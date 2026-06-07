@@ -11,8 +11,9 @@ uint64_t __udivmod64(uint64_t num, uint64_t den, uint64_t *rem_p) {
     uint64_t quot = 0;
     uint64_t rem = 0;
     for (int i = 63; i >= 0; i--) {
+        int carry = (int)(rem >> 63);
         rem = (rem << 1) | ((num >> i) & 1);
-        if (rem >= den) {
+        if (carry || rem >= den) {
             rem -= den;
             quot |= (1ULL << i);
         }

@@ -11,8 +11,9 @@ static u128 udivmod128(u128 n, u128 d, u128 *rem) {
   u128 q = 0;
   u128 r = 0;
   for (int i = 127; i >= 0; --i) {
+    int carry = (int)(r >> 127);
     r = (r << 1) | ((n >> i) & 1);
-    if (r >= d) {
+    if (carry || r >= d) {
       r -= d;
       q |= ((u128)1 << i);
     }

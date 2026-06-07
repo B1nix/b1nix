@@ -144,7 +144,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 # archives are present (built by tools/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
 MBEDTLS_DIR := ../build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install
-$(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
+$(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
 	  echo "  CC+TLS  m32_nettool"; \
@@ -157,6 +157,7 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER)
 	  $(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/m32_nettool.o; \
 	  $(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_nettool.o --whole-archive $(LIB) --no-whole-archive; \
 	fi
+
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install

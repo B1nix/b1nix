@@ -60,19 +60,37 @@ fi
 
 mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
-if [ ! -d "$SRC_DIR" ]; then
-  tmp="$SRC_PARENT/${WGET_TARBALL}"
-  if [ ! -f "$tmp" ]; then
+SOURCE_READY="$SRC_DIR/.b1nix-source-ready"
+if [ ! -f "$SOURCE_READY" ]; then
+  tarball="$SRC_PARENT/${WGET_TARBALL}"
+  if [ -f "$tarball" ] && ! gzip -t "$tarball" 2>/dev/null; then
+    echo "tools/build-wget.sh: removing truncated cached archive $tarball" >&2
+    rm -f "$tarball"
+  fi
+  if [ ! -f "$tarball" ]; then
+    download="$tarball.part.$$"
+    rm -f "$download"
     if command -v curl >/dev/null 2>&1; then
-      curl -L "$WGET_URL" -o "$tmp"
+      curl -fL --retry 3 "$WGET_URL" -o "$download"
     elif command -v wget >/dev/null 2>&1; then
-      wget -O "$tmp" "$WGET_URL"
+      wget -O "$download" "$WGET_URL"
     else
       echo "tools/build-wget.sh: need host curl or wget to fetch $WGET_URL" >&2
       exit 1
     fi
+    if ! gzip -t "$download"; then
+      echo "tools/build-wget.sh: downloaded archive is invalid: $WGET_URL" >&2
+      rm -f "$download"
+      exit 1
+    fi
+    mv "$download" "$tarball"
   fi
-  tar -xzf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
+  rm -rf "$SRC_DIR"
+  if ! tar -xzf "$tarball" -C "$SRC_PARENT/$HOST_TRIPLET"; then
+    rm -rf "$SRC_DIR"
+    exit 1
+  fi
+  touch "$SOURCE_READY"
 fi
 
 if ! grep -q 'b1nix\*' "$SRC_DIR/build-aux/config.sub"; then
