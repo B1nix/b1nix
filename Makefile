@@ -1,7 +1,6 @@
 .DEFAULT_GOAL := all
 ARCH ?= x86_64
 export B1NIX_ARCH := $(ARCH)
-$(shell $(MAKE) -C userspace B1NIX_ARCH=$(ARCH) build/libb1nix.a build/crt/crt0.o >/dev/null)
 BUILD_DIR := build/$(ARCH)
 # Host triplet for the ported userspace toolchain + programs. Their build trees
 # live under per-triplet directories (build/toolchain_build/<triplet>,
@@ -14,44 +13,40 @@ B1NIX_TRIPLET := x86_64-b1nix
 endif
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
-INITRAMFS_M12_SMOKE_INC := $(BUILD_DIR)/initramfs_m12_smoke.inc
-INITRAMFS_M13_SMOKE_INC := $(BUILD_DIR)/initramfs_m13_smoke.inc
-INITRAMFS_M13_JOB_CONTROL_INC := $(BUILD_DIR)/initramfs_m13_job_control.inc
-INITRAMFS_M8_AIO_TEST_INC := $(BUILD_DIR)/initramfs_m8_aio_test.inc
-INITRAMFS_M17_SMOKE_INC := $(BUILD_DIR)/initramfs_m17_smoke.inc
-INITRAMFS_M14_SMOKE_INC := $(BUILD_DIR)/initramfs_m14_smoke.inc
-INITRAMFS_M15_SMOKE_INC := $(BUILD_DIR)/initramfs_m15_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
-INITRAMFS_M25_SMOKE_INC := $(BUILD_DIR)/initramfs_m25_smoke.inc
-INITRAMFS_M26_SMOKE_INC := $(BUILD_DIR)/initramfs_m26_smoke.inc
-INITRAMFS_M24B_SMOKE_INC := $(BUILD_DIR)/initramfs_m24b_smoke.inc
-INITRAMFS_M27_SMOKE_INC := $(BUILD_DIR)/initramfs_m27_smoke.inc
-INITRAMFS_M29_SMOKE_INC := $(BUILD_DIR)/initramfs_m29_smoke.inc
-INITRAMFS_M31_SMOKE_INC := $(BUILD_DIR)/initramfs_m31_smoke.inc
-INITRAMFS_M31_SETUID_INC := $(BUILD_DIR)/initramfs_m31_setuid.inc
-INITRAMFS_M32_SMOKE_INC := $(BUILD_DIR)/initramfs_m32_smoke.inc
-INITRAMFS_M32_NETTOOL_INC := $(BUILD_DIR)/initramfs_m32_nettool.inc
 INITRAMFS_CURL_INC := $(BUILD_DIR)/initramfs_curl.inc
 INITRAMFS_WGET_INC := $(BUILD_DIR)/initramfs_wget.inc
 INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
-INITRAMFS_M32_PCRE2_SMOKE_INC := $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc
-INITRAMFS_M30_PIE_INC := $(BUILD_DIR)/initramfs_m30_pie.inc
-INITRAMFS_M34_SMOKE_INC := $(BUILD_DIR)/initramfs_m34_smoke.inc
-INITRAMFS_M35_SMOKE_INC := $(BUILD_DIR)/initramfs_m35_smoke.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
-INITRAMFS_SU_INC := $(BUILD_DIR)/initramfs_su.inc
-INITRAMFS_PASSWD_INC := $(BUILD_DIR)/initramfs_passwd.inc
-INITRAMFS_ID_INC := $(BUILD_DIR)/initramfs_id.inc
-INITRAMFS_WHOAMI_INC := $(BUILD_DIR)/initramfs_whoami.inc
-INITRAMFS_GROUPS_INC := $(BUILD_DIR)/initramfs_groups.inc
-INITRAMFS_USERADD_INC := $(BUILD_DIR)/initramfs_useradd.inc
-INITRAMFS_USERDEL_INC := $(BUILD_DIR)/initramfs_userdel.inc
-INITRAMFS_GROUPADD_INC := $(BUILD_DIR)/initramfs_groupadd.inc
-INITRAMFS_CHOWN_INC := $(BUILD_DIR)/initramfs_chown.inc
-INITRAMFS_CHMOD_INC := $(BUILD_DIR)/initramfs_chmod.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
 INITRAMFS_BUSYBOX_MODE := $(BUILD_DIR)/upstream_busybox_mode
+
+EMBEDDED_USER_PROGRAMS := \
+	m8_aio_test \
+	m12_smoke \
+	m13_smoke \
+	m13_job_control \
+	m14_smoke \
+	m15_smoke \
+	m17_smoke \
+	m24b_smoke \
+	m25_smoke \
+	m26_smoke \
+	m27_smoke \
+	m29_smoke \
+	m30_pie \
+	m31_smoke \
+	m31_setuid \
+	m32_smoke \
+	m32_nettool \
+	m32_pcre2_smoke \
+	m34_smoke \
+	m35_smoke \
+	su passwd id whoami groups useradd userdel groupadd chown chmod
+
+INITRAMFS_USER_PROGRAM_INCS := \
+	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 UPSTREAM_BUSYBOX ?= 0
 ifeq ($(UPSTREAM_BUSYBOX),1)
 UPSTREAM_BUSYBOX_DEPS := $(INITRAMFS_BUSYBOX_INC)
@@ -59,20 +54,17 @@ else
 UPSTREAM_BUSYBOX_DEPS :=
 endif
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
-GENERATED_INCS := $(AP_TRAMPOLINE_INC) \
-	$(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) \
-	$(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) \
-	$(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) \
-	$(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) \
-	$(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) \
-	$(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) \
-	$(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) \
-	$(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) \
-	$(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) \
-	$(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) \
-	$(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) \
-	$(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC) \
+INITRAMFS_INCS := \
+	$(INITRAMFS_NATIVE_SMOKE_INC) \
+	$(INITRAMFS_TCC_FILES_INC) \
+	$(INITRAMFS_USER_PROGRAM_INCS) \
+	$(INITRAMFS_CURL_INC) \
+	$(INITRAMFS_WGET_INC) \
+	$(INITRAMFS_CACERT_INC) \
+	$(INITRAMFS_TLSTEST_INC) \
+	$(INITRAMFS_DROPBEAR_INC) \
 	$(UPSTREAM_BUSYBOX_DEPS)
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -292,7 +284,11 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all clean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test check-tools objects graphics-smoke analyze
+.PHONY: all analyze objects FORCE iso iso-live iso-test iso-full \
+	userspace userspace-install busybox-package busybox-iso \
+	install-native-toolchain install-kernel-source root-image \
+	run-x86_64 run-x86 run-root check-tools clean distclean \
+	smoke smoke-x86_64 smoke-x86 graphics-smoke memory-smoke
 
 all: $(KERNEL_ELF)
 
@@ -327,7 +323,7 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_NATIVE_SMOKE_INC) $(INITRAMFS_M12_SMOKE_INC) $(INITRAMFS_M13_SMOKE_INC) $(INITRAMFS_M13_JOB_CONTROL_INC) $(INITRAMFS_M8_AIO_TEST_INC) $(INITRAMFS_M17_SMOKE_INC) $(INITRAMFS_M14_SMOKE_INC) $(INITRAMFS_M15_SMOKE_INC) $(INITRAMFS_TCC_FILES_INC) $(INITRAMFS_M25_SMOKE_INC) $(INITRAMFS_M26_SMOKE_INC) $(INITRAMFS_M24B_SMOKE_INC) $(INITRAMFS_M27_SMOKE_INC) $(INITRAMFS_M29_SMOKE_INC) $(INITRAMFS_M31_SMOKE_INC) $(INITRAMFS_M31_SETUID_INC) $(INITRAMFS_M32_SMOKE_INC) $(INITRAMFS_M32_NETTOOL_INC) $(INITRAMFS_M32_PCRE2_SMOKE_INC) $(INITRAMFS_CURL_INC) $(INITRAMFS_WGET_INC) $(INITRAMFS_CACERT_INC) $(INITRAMFS_TLSTEST_INC) $(INITRAMFS_M30_PIE_INC) $(INITRAMFS_M34_SMOKE_INC) $(INITRAMFS_M35_SMOKE_INC) $(INITRAMFS_DROPBEAR_INC) $(INITRAMFS_SU_INC) $(INITRAMFS_PASSWD_INC) $(INITRAMFS_ID_INC) $(INITRAMFS_WHOAMI_INC) $(INITRAMFS_GROUPS_INC) $(INITRAMFS_USERADD_INC) $(INITRAMFS_USERDEL_INC) $(INITRAMFS_GROUPADD_INC) $(INITRAMFS_CHOWN_INC) $(INITRAMFS_CHMOD_INC) $(UPSTREAM_BUSYBOX_DEPS) $(INITRAMFS_BUSYBOX_MODE)
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(INITRAMFS_BUSYBOX_MODE)
 $(BUILD_DIR)/kernel/fs/initramfs.o: INSTRUMENT_FLAGS += -include $(abspath $(INITRAMFS_BUSYBOX_MODE))
 
 $(INITRAMFS_BUSYBOX_MODE): FORCE
@@ -352,7 +348,6 @@ $(INITRAMFS_BUSYBOX_MODE): FORCE
 # rewrites itself; its mtime advances only on a real switch, so same-arch builds
 # don't churn. It is part of USERSPACE_DEPS so all *.inc re-bundle after a wipe.
 USERSPACE_ARCH_STAMP := userspace/build/.arch
-.PHONY: FORCE
 FORCE:
 $(USERSPACE_ARCH_STAMP): FORCE
 	@if [ "$$(cat $@ 2>/dev/null)" != "$(ARCH)" ]; then \
@@ -381,90 +376,20 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/bin/native_smoke > $@
 
-$(INITRAMFS_M12_SMOKE_INC): userspace/bin/m12_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m12_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m12_smoke_elf userspace/build/bin/m12_smoke > $@
-
-$(INITRAMFS_M13_SMOKE_INC): userspace/bin/m13_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m13_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m13_smoke_elf userspace/build/bin/m13_smoke > $@
-
-$(INITRAMFS_M13_JOB_CONTROL_INC): userspace/bin/m13_job_control.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m13_job_control
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m13_job_control_elf userspace/build/bin/m13_job_control > $@
-
-$(INITRAMFS_M8_AIO_TEST_INC): userspace/bin/m8_aio_test.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m8_aio_test
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m8_aio_test_elf userspace/build/bin/m8_aio_test > $@
-
-$(INITRAMFS_M17_SMOKE_INC): userspace/bin/m17_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m17_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m17_smoke_elf userspace/build/bin/m17_smoke > $@
-
-$(INITRAMFS_M14_SMOKE_INC): userspace/bin/m14_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m14_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m14_smoke_elf userspace/build/bin/m14_smoke > $@
-
-$(INITRAMFS_M15_SMOKE_INC): userspace/bin/m15_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m15_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m15_smoke_elf userspace/build/bin/m15_smoke > $@
-
 $(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/include/*.h)
 	@$(MAKE) -C userspace build/bin/tcc
 	@mkdir -p $(dir $@)
 	sh tools/gen_tcc_initramfs.sh $@
 
-$(INITRAMFS_M25_SMOKE_INC): userspace/bin/m25_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m25_smoke
+$(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/bin/$*
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m25_smoke_elf userspace/build/bin/m25_smoke > $@
-
-$(INITRAMFS_M26_SMOKE_INC): userspace/bin/m26_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m26_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m26_smoke_elf userspace/build/bin/m26_smoke > $@
-
-$(INITRAMFS_M24B_SMOKE_INC): userspace/bin/m24b_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m24b_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m24b_smoke_elf userspace/build/bin/m24b_smoke > $@
-
-$(INITRAMFS_M27_SMOKE_INC): userspace/bin/m27_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m27_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m27_smoke_elf userspace/build/bin/m27_smoke > $@
-
-$(INITRAMFS_M29_SMOKE_INC): userspace/bin/m29_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m29_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m29_smoke_elf userspace/build/bin/m29_smoke > $@
-
-$(INITRAMFS_M31_SMOKE_INC): userspace/bin/m31_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m31_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m31_smoke_elf userspace/build/bin/m31_smoke > $@
-
-$(INITRAMFS_M31_SETUID_INC): userspace/bin/m31_setuid.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m31_setuid
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m31_setuid_elf userspace/build/bin/m31_setuid > $@
-
-$(INITRAMFS_M32_SMOKE_INC): userspace/bin/m32_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m32_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m32_smoke_elf userspace/build/bin/m32_smoke > $@
+	xxd -i -n vfs_$*_elf userspace/build/bin/$* > $@
 
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
 # must build first to guarantee the libs exist.
-$(INITRAMFS_M32_NETTOOL_INC): userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
+$(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
 	@$(MAKE) -C userspace build/bin/m32_nettool
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
@@ -474,7 +399,7 @@ PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
 $(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-pcre2.sh >/dev/null
 
-$(INITRAMFS_M32_PCRE2_SMOKE_INC): userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
+$(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/bin/m32_pcre2_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/bin/m32_pcre2_smoke > $@
@@ -534,70 +459,10 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 	xxd -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
 	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
-$(INITRAMFS_M30_PIE_INC): userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
+$(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
 	@$(MAKE) -C userspace build/bin/m30_pie
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
-
-$(INITRAMFS_M34_SMOKE_INC): userspace/bin/m34_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m34_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m34_smoke_elf userspace/build/bin/m34_smoke > $@
-
-$(INITRAMFS_M35_SMOKE_INC): userspace/bin/m35_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/m35_smoke
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m35_smoke_elf userspace/build/bin/m35_smoke > $@
-
-$(INITRAMFS_SU_INC): userspace/bin/su.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/su
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_su_elf userspace/build/bin/su > $@
-
-$(INITRAMFS_PASSWD_INC): userspace/bin/passwd.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/passwd
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_passwd_elf userspace/build/bin/passwd > $@
-
-$(INITRAMFS_ID_INC): userspace/bin/id.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/id
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_id_elf userspace/build/bin/id > $@
-
-$(INITRAMFS_WHOAMI_INC): userspace/bin/whoami.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/whoami
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_whoami_elf userspace/build/bin/whoami > $@
-
-$(INITRAMFS_GROUPS_INC): userspace/bin/groups.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/groups
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_groups_elf userspace/build/bin/groups > $@
-
-$(INITRAMFS_USERADD_INC): userspace/bin/useradd.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/useradd
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_useradd_elf userspace/build/bin/useradd > $@
-
-$(INITRAMFS_USERDEL_INC): userspace/bin/userdel.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/userdel
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_userdel_elf userspace/build/bin/userdel > $@
-
-$(INITRAMFS_GROUPADD_INC): userspace/bin/groupadd.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/groupadd
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_groupadd_elf userspace/build/bin/groupadd > $@
-
-$(INITRAMFS_CHOWN_INC): userspace/bin/chown.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/chown
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_chown_elf userspace/build/bin/chown > $@
-
-$(INITRAMFS_CHMOD_INC): userspace/bin/chmod.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/chmod
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_chmod_elf userspace/build/bin/chmod > $@
 
 $(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
@@ -655,19 +520,6 @@ iso-live: root-image $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
-iso-live-ondemand: root-image $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-live-ondemand/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live-ondemand/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live-ondemand/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) root=liveiso b1nix.xhci.run|g' \
-	     -e 's|@MODULE_CMD@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live-ondemand/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live-ondemand.iso $(BUILD_DIR)/iso-live-ondemand
-
-
 iso-test: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
@@ -680,7 +532,6 @@ iso-test: root-image $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
-# ── M25 Userspace ──
 userspace:
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
 
@@ -795,8 +646,6 @@ smoke-x86: smoke
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh
-
-.PHONY: all clean distclean run-x86_64 run-x86 run-root root-image iso iso-live iso-live-ondemand iso-test userspace userspace-install busybox-package busybox-iso iso-full smoke smoke-x86_64 smoke-x86 memory-smoke check-tools graphics-smoke install-native-toolchain install-kernel-source
 
 memory-smoke:
 	@sh tests/memory-smoke.sh

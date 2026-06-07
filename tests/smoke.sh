@@ -26,6 +26,8 @@ if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	fi
 fi
 TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
+SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}
+SMOKE_PROGRESS_MODE=full
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
 NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
@@ -41,13 +43,50 @@ FAILED=0
 SKIPPED=0
 
 pass() {
-	echo "  ${GREEN}PASS${NC} $1"
+	if [ "$SMOKE_VERBOSE" = "1" ]; then
+		printf "  ${GREEN}PASS${NC} %s\n" "$1"
+	fi
 	PASSED=$((PASSED + 1))
 }
 
 fail() {
-	echo "  ${RED}FAIL${NC} $1 — $2"
+	printf "  ${RED}FAIL${NC} %s - %s\n" "$1" "$2"
 	FAILED=$((FAILED + 1))
+}
+
+section() {
+	if [ "$SMOKE_VERBOSE" = "1" ]; then
+		echo ""
+		echo "[CHECK] $1"
+	fi
+}
+
+report_progress_line() {
+	local line="$1"
+
+	if [ "$SMOKE_PROGRESS_MODE" = "smp" ]; then
+		case "$line" in
+			smp:\ AP*|M24B-*|B1NIX-TEST:*|*PANIC*) ;;
+			*) return ;;
+		esac
+	else
+		case "$line" in
+			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|B1NIX-TEST:*|*PANIC*) ;;
+			*) return ;;
+		esac
+	fi
+
+	case "$line" in
+		*": FAIL"*|*": fail "*|*": failed"*|*PANIC*)
+			printf "  ${RED}%s${NC}\n" "$line"
+			;;
+		*": ok"*|*": done"*|B1NIX-TEST:\ done)
+			printf "  ${GREEN}%s${NC}\n" "$line"
+			;;
+		*)
+			printf "  ${YELLOW}%s${NC}\n" "$line"
+			;;
+	esac
 }
 
 # Run QEMU and capture output
@@ -80,8 +119,30 @@ run_qemu() {
 		# Keep this POSIX-portable (macOS doesn't ship GNU timeout by default).
 		(
 			start_ts=$(date +%s)
+			reported_lines=0
 			while :; do
+				line_count=$(wc -l <"$log" | tr -d ' ')
+				if [ "$line_count" -gt "$reported_lines" ]; then
+					sed -n "$((reported_lines + 1)),${line_count}p" "$log" |
+						while IFS= read -r line; do
+							report_progress_line "$line"
+						done
+					reported_lines=$line_count
+				fi
 				if grep -q -E 'B1NIX-TEST: done|KERNEL PANIC|\[PANIC\]' "$log" 2>/dev/null; then
+					break
+				fi
+				if ! kill -0 "$pid" 2>/dev/null; then
+					# QEMU may exit before stdio has flushed the last serial burst.
+					sleep 1
+					line_count=$(wc -l <"$log" | tr -d ' ')
+					if [ "$line_count" -gt "$reported_lines" ]; then
+						sed -n "$((reported_lines + 1)),${line_count}p" "$log" |
+							while IFS= read -r line; do
+								report_progress_line "$line"
+							done
+						reported_lines=$line_count
+					fi
 					break
 				fi
 				now_ts=$(date +%s)
@@ -97,7 +158,6 @@ run_qemu() {
 		local watcher_pid=$!
 
 		wait "$pid" 2>/dev/null || true
-		kill "$watcher_pid" 2>/dev/null || true
 		wait "$watcher_pid" 2>/dev/null || true
 		kill -9 "$pid" 2>/dev/null || true
 	else
@@ -138,6 +198,7 @@ else
 	}
 fi
 pass "kernel builds without errors"
+echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
 
 # Create dummy images for SATA, NVMe and Swap tests
 dd if=/dev/zero of="$SATA_IMG" bs=1M count=4 2>/dev/null
@@ -170,7 +231,7 @@ fi
 
 # ── Test 1: Kernel boots ──
 echo ""
-echo "[TEST] Boot and basic output..."
+echo "[RUN] Boot smoke (live serial progress)..."
 mkdir -p "$PROJECT_DIR/smoke_run"
 LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot.log"
 run_qemu "$LOG"
@@ -195,8 +256,7 @@ check_output "$LOG" "M11-SMOKE: start" "shell appears"
 check_output "$LOG" "M28-BENCH: ok" "M28 ctx-switch benchmark completes"
 
 # ── M12 Syscalls & Process Management ──
-echo ""
-echo "[TEST] M12 Syscalls & Process Management..."
+section "M12 Syscalls & Process Management"
 check_output "$LOG" "M12-SMOKE: start" "M12 smoke starts"
 check_output "$LOG" "M12-SMOKE: ok spawn" "spawn basic command works"
 check_output "$LOG" "M12-SMOKE: ok execve" "execve works"
@@ -217,8 +277,7 @@ check_output "$LOG" "M12-SMOKE: ok uid-gid" "uid/gid getter/setter sanity works"
 check_output "$LOG" "M12-SMOKE: done" "M12 smoke completes successfully"
 
 # ── M13 Userspace ABI / libc / POSIX runtime hardening ──
-echo ""
-echo "[TEST] M13 Userspace ABI / libc / POSIX runtime..."
+section "M13 Userspace ABI / libc / POSIX runtime"
 check_output "$LOG" "M13-SMOKE: start" "M13 smoke starts"
 check_output "$LOG" "M13-SMOKE: ok argc-argv0" "argc/argv[0] baseline is stable"
 check_output "$LOG" "M13-SMOKE: ok stack-align" "initial userspace stack alignment is sane"
@@ -286,8 +345,7 @@ check_output "$LOG" "M13-JC-SMOKE: ok sigttou" "background terminal write stops 
 check_output "$LOG" "M13-JC-SMOKE: done" "M13 job-control smoke completes"
 
 # ── M17 errno matrix smoke ──
-echo ""
-echo "[TEST] M17 errno matrix..."
+section "M17 errno matrix"
 check_output "$LOG" "M17-SMOKE: start" "M17 smoke starts"
 check_output "$LOG" "M17-SMOKE: ok eloop" "M17 ELOOP symlink-depth behavior is correct"
 check_output "$LOG" "M17-SMOKE: ok enametoolong" "M17 ENAMETOOLONG path-component limit is correct"
@@ -304,16 +362,14 @@ check_output "$LOG" "M17-SMOKE: ok errno-isolation" "M17 errno isolation across 
 check_output "$LOG" "M17-SMOKE: done" "M17 smoke completes successfully"
 
 # ── M8 AIO / completion queues ──
-echo ""
-echo "[TEST] M8 AIO completion queues..."
+section "M8 AIO completion queues"
 check_output "$LOG" "M8-AIO-SMOKE: start" "M8 AIO smoke starts"
 check_output "$LOG" "M8-AIO-SMOKE: ok write" "M8 AIO async write completes"
 check_output "$LOG" "M8-AIO-SMOKE: ok read" "M8 AIO async read completes"
 check_output "$LOG" "M8-AIO-SMOKE: done" "M8 AIO smoke completes"
 
 # ── M14 Advanced Storage, Swap & File Systems ──
-echo ""
-echo "[TEST] M14 Storage, Swap & File Systems..."
+section "M14 Storage, Swap & File Systems"
 check_output "$LOG" "M14-SMOKE: ok swap-smoke" "swap page swap-out and swap-in verified"
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sata0 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0 as ext4 successful"
@@ -328,8 +384,7 @@ check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization wo
 check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
 
 # ── M15 IPC, Security & Standard OS Features ──
-echo ""
-echo "[TEST] M15 IPC, security, and OS baseline..."
+section "M15 IPC, security, and OS baseline"
 check_output "$LOG" "M15-SMOKE: start" "M15 smoke starts"
 check_output "$LOG" "M15-SMOKE: ok signal-baseline" "signal baseline syscall path works"
 check_output "$LOG" "M15-SMOKE: ok signal-ignore" "ignored signal does not terminate process"
@@ -345,8 +400,7 @@ check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after pr
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 
 # ── M25 Native Toolchain ──
-echo ""
-echo "[TEST] M25 Native C Toolchain..."
+section "M25 Native C Toolchain"
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
 check_output "$LOG" "M25-SMOKE: ok tcc-launch" "tcc launches"
 check_output "$LOG" "M25-SMOKE: ok compile-hello" "tcc compiles hello.c"
@@ -366,8 +420,7 @@ check_output "$LOG" "M25-SMOKE: ok fileops" "libc fchmod/utime/tmpfile work (ver
 check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 
 # ── M26 Native Toolchain & Self-Host ──
-echo ""
-echo "[TEST] M26 Native C Toolchain & Self-Host..."
+section "M26 Native C Toolchain & Self-Host"
 check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
 check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
 check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (gcc/binutils/make) is ported"
@@ -379,8 +432,7 @@ check_output "$LOG" "M26-SMOKE: done" "M26 smoke completes"
 
 
 # ── M16 User Space Applications & TUI ──
-echo ""
-echo "[TEST] M16 user space applications and TUI..."
+section "M16 user space applications and TUI"
 check_output "$LOG" "M16-SMOKE: start" "M16 smoke starts"
 check_output "$LOG" "M16-SMOKE: ok tui-key-decode" "shared TUI key decoding works"
 check_output "$LOG" "M16-SMOKE: ok file-explorer-hotkeys" "file explorer hotkeys work"
@@ -392,8 +444,7 @@ check_output "$LOG" "M16-SMOKE: ok app-lifecycle" "app lifecycle completes"
 check_output "$LOG" "M16-SMOKE: done" "M16 smoke completes"
 
 # ── M22 utility init-path smoke ──
-echo ""
-echo "[TEST] M22 utilities..."
+section "M22 utilities"
 check_output "$LOG" "NATIVE-SMOKE: ok" "native ELF enters ring3 and performs syscall"
 check_output "$LOG" "NATIVE-SMOKE: done" "native ELF exits cleanly"
 check_output "$LOG" "M22-SMOKE: start" "M22 utility smoke starts from init"
@@ -433,7 +484,7 @@ check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 
 if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	echo ""
-	echo "[TEST] Upstream BusyBox package..."
+	section "Upstream BusyBox package"
 	check_output "$LOG" "BB-SMOKE: ok list" "busybox --list works"
 	check_output "$LOG" "BB-SMOKE: ok echo" "busybox echo works"
 	check_output "$LOG" "BB-SMOKE: ok printf" "busybox printf works"
@@ -511,8 +562,7 @@ if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 fi
 
 # ── M11 Shell & Utilities ──
-echo ""
-echo "[TEST] M11 Shell baseline..."
+section "M11 Shell baseline"
 check_output "$LOG" "M11-SMOKE: start" "M11 shell smoke starts"
 check_output "$LOG" "M11-SMOKE: ok pipe-eof" "pipe EOF when all writers close"
 check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-read" "pipe nonblocking read returns EAGAIN"
@@ -568,8 +618,7 @@ else
 	fail "shebang behavior marker emitted" "missing shebang support/unsupported marker"
 fi
 
-echo ""
-echo "[TEST] M11 Coreutils via shell..."
+section "M11 Coreutils via shell"
 check_output "$LOG" "M11-UTIL: ok cat" "cat reads file via pipeline"
 check_output "$LOG" "M11-UTIL: ok grep" "grep finds pattern (exit 0)"
 check_output "$LOG" "M11-UTIL: ok grep-nomatch" "grep exits nonzero when no match"
@@ -790,7 +839,7 @@ check_output "$LOG" "nvme: registered nvme0" "NVMe block device registered"
 # Network tests are only wired for the current x86_64/x86 QEMU path.
 if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	echo ""
-	echo "[TEST] Network..."
+	section "Network"
 	if grep -q "virtio-net: initialized with MAC" "$LOG" 2>/dev/null && ! grep -q "virtio-net: no device found" "$LOG" 2>/dev/null; then
 		pass "virtio-net initialized"
 		if grep -q "DHCP-SMOKE: lease-acquired\|DHCP-SMOKE: fallback-static" "$LOG" 2>/dev/null; then
@@ -832,15 +881,17 @@ fi
 
 # ── M24b SMP work-stealing (multi-core) ──
 echo ""
-echo "[TEST] M24b SMP work-stealing (-smp 4)..."
+echo "[RUN] M24b SMP work-stealing (-smp 4)..."
 # Re-create the disk images so the SMP boot starts from a clean state.
 "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || true
 "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || true
 dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp.log"
 EXTRA_QEMU_ARGS="-smp 4"
+SMOKE_PROGRESS_MODE=smp
 run_qemu "$SMP_LOG"
 EXTRA_QEMU_ARGS=""
+SMOKE_PROGRESS_MODE=full
 check_output "$SMP_LOG" "smp: AP 1 ready" "Application Processor boots (INIT-SIPI)"
 check_output "$SMP_LOG" "M24B-SMP: ok work-stealing" "cross-CPU work-stealing runs stolen tasks on APs"
 check_output "$SMP_LOG" "B1NIX-TEST: done" "full suite completes under SMP"
