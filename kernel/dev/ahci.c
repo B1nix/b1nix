@@ -74,6 +74,48 @@ static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
 
 
 
+/* Build the PRDT for a (possibly multi-page) DMA buffer.
+ *
+ * A single PRD entry describes a PHYSICALLY contiguous region. DMA buffers are
+ * frequently kernel-heap allocations (e.g. the block cache, whose per-entry
+ * 512-byte data field straddles 4 KiB page boundaries because sizeof(struct
+ * block_buffer) is not a power of two) — and adjacent heap *pages* are not
+ * necessarily adjacent *frames*. Emitting one PRD entry per page-contiguous
+ * segment (translating each segment's virtual base with vmm_virt_to_phys)
+ * prevents a transfer that crosses a page boundary from spilling into the
+ * wrong physical frame — which previously corrupted unrelated frames (page
+ * tables, etc.) and triple-faulted the kernel. Returns the PRD entry count
+ * (-> cmd_hdr->prdtl). The command table is page-sized, leaving room for far
+ * more entries than any real transfer (count<=8 -> at most a few pages).
+ */
+static int ahci_build_prdt(struct ahci_cmd_table *cmd_table, void *buffer,
+                           u32 total_bytes) {
+  u64 vaddr = (u64)(usize)buffer;
+  u64 remaining = total_bytes;
+  int n = 0;
+  while (remaining > 0) {
+    u64 page_off = vaddr & (PAGE_SIZE - 1);
+    u64 seg = PAGE_SIZE - page_off; /* bytes to the end of this page */
+    if (seg > remaining)
+      seg = remaining;
+    u64 phys = vmm_virt_to_phys((void *)(usize)vaddr);
+    struct ahci_prdt_entry *e = &cmd_table->prdt[n];
+    memset(e, 0, sizeof(*e));
+    e->dba = (u32)(phys & 0xFFFFFFFF);
+    e->dbau = (u32)((phys >> 32) & 0xFFFFFFFF);
+    e->dbc = (u32)(seg - 1); /* byte count - 1 */
+    vaddr += seg;
+    remaining -= seg;
+    n++;
+  }
+  if (n == 0) { /* defensive: zero-length transfer */
+    memset(&cmd_table->prdt[0], 0, sizeof(struct ahci_prdt_entry));
+    n = 1;
+  }
+  cmd_table->prdt[n - 1].dbc |= (1u << 31); /* I=1 on the final entry */
+  return n;
+}
+
 static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
                           void *buffer) {
   if (!port->present)
@@ -104,16 +146,9 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 0; // Read
-  cmd_hdr->prdtl = 1; // One PRD entry
 
-  // Setup PRD
-  struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
-  memset(prdt, 0, sizeof(struct ahci_prdt_entry));
-  u64 phys_buf = vmm_virt_to_phys(buffer);
-  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
-  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
-  prdt->dbc = (count * 512 - 1) |
-              (1ULL << 31); // byte count, I=1 (interrupt on completion)
+  // Setup PRD(s) — split across physical page boundaries (see ahci_build_prdt).
+  cmd_hdr->prdtl = (u16)ahci_build_prdt(cmd_table, buffer, count * 512);
 
   // Setup FIS
   memset(cmd_table->cfis, 0, 64);
@@ -187,14 +222,9 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 1; // Write
-  cmd_hdr->prdtl = 1;
 
-  struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
-  memset(prdt, 0, sizeof(struct ahci_prdt_entry));
-  u64 phys_buf = vmm_virt_to_phys((void *)buffer);
-  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
-  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
-  prdt->dbc = (count * 512 - 1) | (1ULL << 31);
+  // Setup PRD(s) — split across physical page boundaries (see ahci_build_prdt).
+  cmd_hdr->prdtl = (u16)ahci_build_prdt(cmd_table, (void *)buffer, count * 512);
 
   memset(cmd_table->cfis, 0, 64);
   struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;
@@ -226,7 +256,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
 
   cmd_hdr->write = 1;
   cmd_hdr->prdtl = 0; // No data for flush
-  memset(prdt, 0, sizeof(struct ahci_prdt_entry));
+  memset(&cmd_table->prdt[0], 0, sizeof(struct ahci_prdt_entry));
 
   p->ci = (1 << 1);
   ahci_wait_ci_clear(p, (1 << 1), "flush", port->port_num);

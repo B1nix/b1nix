@@ -205,6 +205,7 @@ KERNEL_SOURCES := \
 	kernel/fs/fat32.c \
 	kernel/fs/isofs.c \
 	kernel/fs/exfat.c \
+	kernel/fs/ntfs.c \
 	kernel/fs/ext2.c \
 	kernel/fs/ext1.c \
 	kernel/fs/ext3.c \

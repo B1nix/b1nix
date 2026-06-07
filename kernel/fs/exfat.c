@@ -146,9 +146,13 @@ static isize exfat_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent
                                 u16 utf16_char = name_entry->file_name[c];
                                 char ascii = (char)(utf16_char & 0xFF);
                                 if (ascii == '\0') break;
-                                if (ascii >= 'A' && ascii <= 'Z') {
-                                    ascii = ascii - 'A' + 'a';
-                                }
+                                /* exFAT is case-PRESERVING: the on-disk name
+                                 * entries keep the original case (the upcase
+                                 * table is only for case-insensitive compares).
+                                 * Emit the name verbatim so readdir and exact
+                                 * open() of mixed/upper-case names (e.g.
+                                 * CASETEST.TXT, README.txt) work — lowercasing
+                                 * here silently renamed every file. */
                                 if (fn_idx < 255) {
                                     filename[fn_idx++] = ascii;
                                 }
@@ -256,9 +260,13 @@ static void exfat_populate_vfs(struct exfat_fs *fs, u32 dir_cluster, u8 dir_no_f
                                 u16 utf16_char = name_entry->file_name[c];
                                 char ascii = (char)(utf16_char & 0xFF);
                                 if (ascii == '\0') break;
-                                if (ascii >= 'A' && ascii <= 'Z') {
-                                    ascii = ascii - 'A' + 'a';
-                                }
+                                /* exFAT is case-PRESERVING: the on-disk name
+                                 * entries keep the original case (the upcase
+                                 * table is only for case-insensitive compares).
+                                 * Emit the name verbatim so readdir and exact
+                                 * open() of mixed/upper-case names (e.g.
+                                 * CASETEST.TXT, README.txt) work — lowercasing
+                                 * here silently renamed every file. */
                                 if (fn_idx < 255) {
                                     filename[fn_idx++] = ascii;
                                 }
