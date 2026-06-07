@@ -36,6 +36,15 @@
 #define ARPHRD_SIT        776
 #define ARPHRD_FDDI       774
 #define ARPHRD_IRDA       783
+#define ARPHRD_IPGRE      778
+#define ARPHRD_TUNNEL6    769
+#define ARPHRD_APPLETLK   8
+#define ARPHRD_IP6GRE     823
+#define ARPHRD_RAWIP      519
+#define ARPHRD_IEEE802_TR 800
+#define ARPHRD_IEEE80211  801
+#define ARPHRD_VOID       0xFFFF
+#define ARPHRD_NONE       0xFFFE
 
 /* ARP flags for struct arpreq (SIOCGARP/SIOCSARP). */
 #define ATF_COM       0x02

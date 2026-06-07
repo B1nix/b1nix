@@ -36,6 +36,9 @@ static u16 icmp_checksum(const u8 *data, usize size) {
 void icmp_receive(struct ipv4_addr src, const void *data, usize size) {
   if (size < sizeof(struct icmp_header))
     return;
+  /* Hand a copy to any SOCK_RAW/ICMP sockets (BusyBox ping reads echo replies
+   * here); the built-in echo responder below still runs for echo requests. */
+  vfs_socket_push_raw_icmp(src, data, size);
   const struct icmp_header *hdr = data;
 
 	if (hdr->type == ICMP_TYPE_ECHO_REQUEST) {

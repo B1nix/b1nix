@@ -617,6 +617,12 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox blkid /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -qi \"ext\" && echo \"BB-W4: ok blkid\"\n"
     /* fdisk -l reads the /dev/sata0 geometry via the BLK* ioctls. */
     "/opt/busybox/bin/busybox fdisk -l /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -q \"Disk /dev/sata0\" && echo \"BB-W4: ok fdisk\"\n"
+    /* ping uses a raw ICMP socket; the gateway 10.0.2.2 answers echo. */
+    "/opt/busybox/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /opt/busybox/bin/busybox grep -q \"bytes from 10.0.2.2\" && echo \"BB-W4B: ok ping\"\n"
+    /* losetup -f returns the first free loop device via /dev/loop-control. */
+    "/opt/busybox/bin/busybox losetup -f 2>/dev/null | /opt/busybox/bin/busybox grep -q \"/dev/loop\" && echo \"BB-W4B: ok losetup\"\n"
+    /* ip uses rtnetlink (AF_NETLINK); RTM_GETLINK lists the eth0 interface. */
+    "/opt/busybox/bin/busybox ip link show 2>&1 | /opt/busybox/bin/busybox grep -q \"eth0\" && echo \"BB-W4B: ok ip\"\n"
     "echo \"BB-W4: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"

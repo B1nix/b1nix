@@ -21,7 +21,7 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **83 applets**. Migration wave 1
+The isolated package currently configures **86 applets**. Migration wave 1
 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
 `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
@@ -29,7 +29,7 @@ and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
 `bzip2`, `bunzip2`, `unxz` and `xzcat`. Wave 3 added `ps`, `top`, `free`,
 `uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`. Wave 4 added `mount`,
 `umount`, `nslookup`, `lsof`, `netstat`, `route`, `ifconfig`, `blkid` and
-`fdisk`:
+`fdisk`. Wave 4b added `ping`, `losetup` and `ip`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
@@ -218,7 +218,7 @@ Kernel/libc/build changes this wave needed:
 `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks) is
 deferred to a follow-up sub-wave.
 
-### Migration wave 4: storage & networking (partial)
+### Migration wave 4: storage & networking (done)
 
 Enabled and smoke-tested (`BB-W4:` markers), green on **both** arches (`x86_64`
 and `i686`): `mount`, `umount`, `nslookup`, `lsof`, `netstat`, `route`,
@@ -246,19 +246,39 @@ Kernel/libc infrastructure this wave added:
   `if_nametoindex`, `_IOC`/`_IOR` macros, `caddr_t`; headers `net/route.h`,
   `net/if.h` (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`.
 
-Deferred to **wave 4b** (each needs a distinct new kernel subsystem):
-
-- `ping` — raw `SOCK_RAW`/ICMP sockets plus ICMP-receive routing into the
-  socket's recv queue (the kernel already does ICMP echo for the built-in
-  ping).
-- `losetup` — a loop-device ioctl surface: `/dev/loop-control`
-  (LOOP_CTL_GET_FREE) and LOOP_SET_FD/CLR_FD on `/dev/loopN` (the kernel has a
-  `loop_register_file` internal API but no ioctl front end).
-- `ip` — BusyBox `ip` speaks **rtnetlink** exclusively, so it needs an
-  `AF_NETLINK` socket personality answering RTM_GETLINK/GETADDR/GETROUTE dumps.
-
 `lsblk` is **not shipped by upstream BusyBox 1.36** — `blkid` and `fdisk -l`
 cover the block-inspection role.
+
+### Migration wave 4b: ping / losetup / ip (done)
+
+Enabled and smoke-tested (`BB-W4B:` markers), green on **both** arches
+(`x86_64` and `i686`): `ping`, `losetup`, `ip`. Each required a distinct new
+kernel subsystem:
+
+- **`ping`** — raw `SOCK_RAW`/ICMP sockets. A raw-socket registry in
+  `kernel/net/socket.c` (`raw_sock_register/unregister`); `icmp_receive()`
+  delivers every echo reply to registered raw sockets via
+  `vfs_socket_push_raw_icmp()`, prepending a synthetic 20-byte IPv4 header.
+  libc `recvfrom()` recovers the peer from that header; `sendto()` records the
+  per-packet destination as the socket's connected peer.
+- **`losetup`** — a loop-device ioctl surface. `kernel/dev/loop.c` registers 8
+  `/dev/loopN` block devices plus `/dev/loop-control`, answering
+  LOOP_CTL_GET_FREE, LOOP_SET_FD/CLR_FD and the status ioctls. `vfs_ioctl()`
+  routes the `0x4C` ioctl group (and the `loop-control` node) to the loop
+  handler **before** the `!arg` guard, since LOOP_CTL_GET_FREE takes no arg.
+- **`ip`** — BusyBox `ip` speaks **rtnetlink** exclusively, so it needs an
+  `AF_NETLINK` socket personality. `netlink_build_dump()` encodes
+  RTM_NEWLINK/NEWADDR/NEWROUTE responses (nlmsghdr + rtattr TLVs) terminated by
+  NLMSG_DONE for a single modelled `eth0`; `vfs_socket()`/`vfs_bind()` accept
+  `AF_NETLINK`, and `getsockname()` reports `nl_pid 0`. libc `sendmsg`/`recvmsg`
+  gained single-iov scatter-gather; **`recvmsg` zeroes `msg_name`** so the
+  source `nl_pid` reads as 0 — BusyBox libnetlink rejects (and would hang on)
+  any reply whose recvmsg source `nl_pid` is non-zero.
+
+Headers this wave added: `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,
+loop,version,types}.h`, `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`,
+`netpacket/packet.h`, `resolv.h`; `PF_PACKET`, `SIOCSIFHWBROADCAST`,
+`RTNH_F_*`/`RTAX_*` constants.
 
 ### Wave 3: upstream `ash`
 

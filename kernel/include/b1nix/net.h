@@ -153,6 +153,9 @@ struct net_sock_info {
 };
 usize tcp_conn_snapshot(struct net_sock_info *out, usize max);
 usize udp_binding_snapshot(struct net_sock_info *out, usize max);
+/* Deliver an inbound ICMP packet to every SOCK_RAW/ICMP socket (BusyBox ping),
+ * prepending a synthetic IPv4 header. Called from icmp_receive(). */
+void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp, usize len);
 /* TCP over IPv6 (loopback ::1). */
 void tcp6_receive(struct in6_addr_k src, const void *data, usize size);
 struct tcp_conn *tcp_connect6(struct in6_addr_k dst_ip6, u16 dst_port);

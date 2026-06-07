@@ -30,6 +30,225 @@ static int in6_is_v4mapped(const struct in6_addr_k *a) {
 }
 
 /* Bridge functions to avoid including private net headers in vfs.h */
+/* ── Raw ICMP sockets (BusyBox ping) ──
+ * A small registry of SOCK_RAW/IPPROTO_ICMP sockets. icmp_receive() delivers
+ * each ICMP packet to every raw socket, wrapped in a synthetic IPv4 header
+ * (SOCK_RAW readers expect the IP header included). Recv/poll reuse the
+ * datagram queue. */
+#define MAX_RAW_SOCKS 8
+static struct vfs_socket_state *raw_socks[MAX_RAW_SOCKS];
+
+static void raw_sock_register(struct vfs_socket_state *s) {
+  for (int i = 0; i < MAX_RAW_SOCKS; i++)
+    if (!raw_socks[i]) {
+      raw_socks[i] = s;
+      return;
+    }
+}
+
+static void raw_sock_unregister(struct vfs_socket_state *s) {
+  for (int i = 0; i < MAX_RAW_SOCKS; i++)
+    if (raw_socks[i] == s)
+      raw_socks[i] = 0;
+}
+
+void vfs_socket_push_raw_icmp(struct ipv4_addr src, const void *icmp,
+                              usize len) {
+  static u8 pkt[2048];
+  usize iphl = 20;
+  if (len > sizeof(pkt) - iphl)
+    len = sizeof(pkt) - iphl;
+  memset(pkt, 0, iphl);
+  pkt[0] = 0x45; /* IPv4, IHL=5 */
+  u16 tot = (u16)(iphl + len);
+  pkt[2] = (u8)(tot >> 8);
+  pkt[3] = (u8)(tot & 0xFF);
+  pkt[8] = 64; /* TTL */
+  pkt[9] = 1;  /* protocol = ICMP */
+  struct ipv4_addr myip = net_get_ip();
+  pkt[12] = src.bytes[0];
+  pkt[13] = src.bytes[1];
+  pkt[14] = src.bytes[2];
+  pkt[15] = src.bytes[3];
+  pkt[16] = myip.bytes[0];
+  pkt[17] = myip.bytes[1];
+  pkt[18] = myip.bytes[2];
+  pkt[19] = myip.bytes[3];
+  memcpy(pkt + iphl, icmp, len);
+  usize total = iphl + len;
+  for (int i = 0; i < MAX_RAW_SOCKS; i++) {
+    struct vfs_socket_state *s = raw_socks[i];
+    if (!s || s->udp_q_count >= 8)
+      continue;
+    u8 slot = s->udp_q_tail;
+    usize copy =
+        total > sizeof(s->udp_q_buf[slot]) ? sizeof(s->udp_q_buf[slot]) : total;
+    memcpy(s->udp_q_buf[slot], pkt, copy);
+    s->udp_q_len[slot] = copy;
+    s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+    s->udp_q_count++;
+    s->recv_len = s->udp_q_len[s->udp_q_head];
+    scheduler_wake_all(s);
+    scheduler_wake_all(vfs_poll_chan);
+  }
+}
+
+/* ── Minimal rtnetlink (AF_NETLINK) for BusyBox `ip` ──
+ * `ip` speaks rtnetlink exclusively. We model a single interface "eth0" and
+ * answer the three dump requests it issues. A dump request sent on the socket
+ * is answered synchronously: the encoded reply is enqueued to the socket's
+ * datagram queue, so the following recvmsg() returns it. */
+#define NL_RTM_GETLINK  18
+#define NL_RTM_NEWLINK  16
+#define NL_RTM_GETADDR  22
+#define NL_RTM_NEWADDR  20
+#define NL_RTM_GETROUTE 26
+#define NL_RTM_NEWROUTE 24
+#define NL_NLMSG_DONE   3
+#define NL_NLM_F_MULTI  2
+#define NL_ARPHRD_ETHER 1
+#define NL_IFF_UP_RUN_BC 0x43 /* UP|BROADCAST|RUNNING */
+
+static usize nl_align(usize n) { return (n + 3u) & ~3u; }
+
+/* Append an rtattr {len, type, data} at p, return bytes consumed (aligned). */
+static usize nl_put_attr(u8 *p, u16 type, const void *data, u16 dlen) {
+  u16 rta_len = (u16)(4 + dlen);
+  p[0] = (u8)(rta_len & 0xFF);
+  p[1] = (u8)(rta_len >> 8);
+  p[2] = (u8)(type & 0xFF);
+  p[3] = (u8)(type >> 8);
+  if (dlen)
+    memcpy(p + 4, data, dlen);
+  return nl_align(rta_len);
+}
+
+static void nl_put_u32(u8 *p, u32 v) {
+  p[0] = (u8)v;
+  p[1] = (u8)(v >> 8);
+  p[2] = (u8)(v >> 16);
+  p[3] = (u8)(v >> 24);
+}
+
+/* Build the dump reply for `rtm_type` into out[]; returns total length. */
+static usize netlink_build_dump(int rtm_type, u32 seq, u8 *out, usize cap) {
+  usize off = 0;
+  u8 *msg;       /* start of the current nlmsghdr */
+  usize body;    /* offset just past the nlmsghdr */
+  struct ipv4_addr ip = net_get_ip();
+  struct mac_addr mac = net_get_mac();
+
+  if (off + 64 > cap)
+    return 0;
+  msg = out + off;
+  body = off + 16; /* nlmsghdr is 16 bytes */
+
+  if (rtm_type == NL_RTM_GETLINK) {
+    u8 *b = out + body;
+    usize a = 0;
+    memset(b, 0, 16);            /* ifinfomsg */
+    b[2] = NL_ARPHRD_ETHER;      /* ifi_type */
+    nl_put_u32(b + 4, 1);        /* ifi_index = 1 */
+    nl_put_u32(b + 8, NL_IFF_UP_RUN_BC); /* ifi_flags */
+    a = 16;
+    a += nl_put_attr(b + a, 3 /*IFLA_IFNAME*/, "eth0", 5);
+    u32 mtu = 1500;
+    a += nl_put_attr(b + a, 4 /*IFLA_MTU*/, &mtu, 4);
+    a += nl_put_attr(b + a, 1 /*IFLA_ADDRESS*/, mac.bytes, 6);
+    off = body + a;
+  } else if (rtm_type == NL_RTM_GETADDR) {
+    u8 *b = out + body;
+    usize a = 0;
+    memset(b, 0, 8);             /* ifaddrmsg */
+    b[0] = B1NIX_AF_INET;        /* ifa_family */
+    b[1] = 24;                   /* ifa_prefixlen */
+    b[3] = 0;                    /* ifa_scope = global */
+    nl_put_u32(b + 4, 1);        /* ifa_index = 1 */
+    a = 8;
+    a += nl_put_attr(b + a, 2 /*IFA_LOCAL*/, ip.bytes, 4);
+    a += nl_put_attr(b + a, 1 /*IFA_ADDRESS*/, ip.bytes, 4);
+    a += nl_put_attr(b + a, 3 /*IFA_LABEL*/, "eth0", 5);
+    off = body + a;
+  } else if (rtm_type == NL_RTM_GETROUTE) {
+    u8 *b = out + body;
+    usize a = 0;
+    memset(b, 0, 12);            /* rtmsg */
+    b[0] = B1NIX_AF_INET;        /* rtm_family */
+    b[1] = 24;                   /* rtm_dst_len */
+    b[4] = 254;                  /* rtm_table = RT_TABLE_MAIN */
+    b[5] = 3;                    /* rtm_protocol = RTPROT_BOOT */
+    b[6] = 253;                  /* rtm_scope = RT_SCOPE_LINK */
+    b[7] = 1;                    /* rtm_type = RTN_UNICAST */
+    a = 12;
+    struct ipv4_addr net = {{ip.bytes[0], ip.bytes[1], ip.bytes[2], 0}};
+    a += nl_put_attr(b + a, 1 /*RTA_DST*/, net.bytes, 4);
+    u32 oif = 1;
+    a += nl_put_attr(b + a, 4 /*RTA_OIF*/, &oif, 4);
+    off = body + a;
+  } else {
+    return 0;
+  }
+
+  /* Back-fill the first nlmsghdr: len, type=NEW*, flags=MULTI, seq, pid=0. */
+  u16 newtype = (rtm_type == NL_RTM_GETLINK)   ? NL_RTM_NEWLINK
+                : (rtm_type == NL_RTM_GETADDR) ? NL_RTM_NEWADDR
+                                               : NL_RTM_NEWROUTE;
+  u32 mlen = (u32)(off - (usize)(msg - out));
+  nl_put_u32(msg + 0, mlen);
+  msg[4] = (u8)(newtype & 0xFF);
+  msg[5] = (u8)(newtype >> 8);
+  msg[6] = (u8)(NL_NLM_F_MULTI & 0xFF);
+  msg[7] = (u8)(NL_NLM_F_MULTI >> 8);
+  nl_put_u32(msg + 8, seq);
+  nl_put_u32(msg + 12, 0);
+
+  /* NLMSG_DONE terminator: nlmsghdr(16) + int(0). */
+  off = nl_align(off);
+  if (off + 20 > cap)
+    return off;
+  u8 *d = out + off;
+  nl_put_u32(d + 0, 20);
+  d[4] = (u8)(NL_NLMSG_DONE & 0xFF);
+  d[5] = (u8)(NL_NLMSG_DONE >> 8);
+  d[6] = (u8)(NL_NLM_F_MULTI & 0xFF);
+  d[7] = (u8)(NL_NLM_F_MULTI >> 8);
+  nl_put_u32(d + 8, seq);
+  nl_put_u32(d + 12, 0);
+  nl_put_u32(d + 16, 0); /* done code */
+  off += 20;
+  return off;
+}
+
+/* Enqueue a ready datagram into a socket's recv queue. */
+static void netlink_enqueue(struct vfs_socket_state *s, const u8 *data,
+                            usize len) {
+  if (s->udp_q_count >= 8)
+    return;
+  u8 slot = s->udp_q_tail;
+  usize copy = len > sizeof(s->udp_q_buf[slot]) ? sizeof(s->udp_q_buf[slot]) : len;
+  memcpy(s->udp_q_buf[slot], data, copy);
+  s->udp_q_len[slot] = copy;
+  s->udp_q_tail = (u8)((s->udp_q_tail + 1) % 8);
+  s->udp_q_count++;
+  s->recv_len = s->udp_q_len[s->udp_q_head];
+  scheduler_wake_all(s);
+  scheduler_wake_all(vfs_poll_chan);
+}
+
+static isize netlink_send(struct vfs_socket_state *s, const void *buf,
+                          usize len) {
+  if (len < 16)
+    return -EINVAL;
+  const u8 *p = (const u8 *)buf;
+  u16 type = (u16)(p[4] | (p[5] << 8));
+  u32 seq = (u32)(p[8] | (p[9] << 8) | (p[10] << 16) | (p[11] << 24));
+  static u8 reply[2048];
+  usize n = netlink_build_dump(type, seq, reply, sizeof(reply));
+  if (n)
+    netlink_enqueue(s, reply, n);
+  return (isize)len;
+}
+
 isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int flags) {
   (void)flags;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
@@ -37,6 +256,9 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   /* After shutdown(SHUT_WR) the write half is closed: POSIX requires EPIPE. */
   if (s->shut_wr)
     return -EPIPE;
+
+  if (s->domain == B1NIX_AF_NETLINK)
+    return netlink_send(s, buf, len);
 
   if (s->domain == B1NIX_AF_UNIX) {
     return unix_send(s, buf, len);
@@ -75,6 +297,12 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
   dst_ip.bytes[2] = (s->peer.in.sin_addr >> 16) & 0xFF;
   dst_ip.bytes[3] = (s->peer.in.sin_addr >> 24) & 0xFF;
 
+  if (s->type == B1NIX_SOCK_RAW) {
+    /* The payload is a complete L4 packet (BusyBox ping builds the ICMP
+     * header). Wrap it in IPv4 with the socket's protocol and ship it. */
+    ipv4_send(dst_ip, (u8)(s->protocol ? s->protocol : 1), buf, len);
+    return (isize)len;
+  }
   if (s->type == B1NIX_SOCK_DGRAM) {
     if (!s->connected && s->peer.in.sin_port == 0)
       return -ENOTCONN;
@@ -104,7 +332,8 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
     return unix_recv(s, buf, len);
   }
 
-  if (s->type == B1NIX_SOCK_DGRAM) {
+  if (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW ||
+      s->domain == B1NIX_AF_NETLINK) {
     while (s->udp_q_count == 0) {
       if (h->flags & B1NIX_O_NONBLOCK)
         return -EAGAIN;
@@ -169,7 +398,8 @@ static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   }
   
   pfd->revents = 0;
-  if (s->type == B1NIX_SOCK_DGRAM) {
+  if (s->type == B1NIX_SOCK_DGRAM || s->type == B1NIX_SOCK_RAW ||
+      s->domain == B1NIX_AF_NETLINK) {
     if (s->udp_q_count > 0) pfd->revents |= B1NIX_POLLIN;
     pfd->revents |= B1NIX_POLLOUT;
   } else if (s->type == B1NIX_SOCK_STREAM) {
@@ -213,6 +443,8 @@ static int socket_teardown(struct vfs_handle *h) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (!s)
     return 0;
+  if (s->type == B1NIX_SOCK_RAW)
+    raw_sock_unregister(s);
   if ((s->domain == B1NIX_AF_INET || s->domain == B1NIX_AF_INET6) &&
       s->type == B1NIX_SOCK_DGRAM && s->bound) {
     for (int i = 0; i < MAX_UDP_BINDINGS; i++) {
@@ -394,22 +626,30 @@ void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
 
 int vfs_socket(int domain, int type, int protocol) {
   if (domain != B1NIX_AF_INET && domain != B1NIX_AF_INET6 &&
-      domain != B1NIX_AF_UNIX) return -EAFNOSUPPORT;
-  if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM) return -ESOCKTNOSUPPORT;
-  
+      domain != B1NIX_AF_UNIX && domain != B1NIX_AF_NETLINK)
+    return -EAFNOSUPPORT;
+  if (type != B1NIX_SOCK_DGRAM && type != B1NIX_SOCK_STREAM &&
+      type != B1NIX_SOCK_RAW) return -ESOCKTNOSUPPORT;
+  /* Raw sockets are IPv4 (BusyBox ping/ICMP) or netlink (BusyBox ip). */
+  if (type == B1NIX_SOCK_RAW && domain != B1NIX_AF_INET &&
+      domain != B1NIX_AF_NETLINK)
+    return -EAFNOSUPPORT;
+
   struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_SOCKET);
   if (!h) return -ENFILE;
-  
+
   struct vfs_socket_state *socket = kzalloc(sizeof(*socket));
   if (!socket) { vfs_handle_release(h); return -ENOMEM; }
   socket->domain = domain;
   socket->type = type;
   socket->protocol = protocol;
-  
+
   if (domain == B1NIX_AF_UNIX) {
     int res = unix_init_state(socket);
     if (res < 0) { kfree(socket); vfs_handle_release(h); return res; }
   }
+  if (type == B1NIX_SOCK_RAW && domain == B1NIX_AF_INET)
+    raw_sock_register(socket);
   
   vfs_socket_init_handle(h, socket);
   
@@ -426,7 +666,15 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   if (!h) return -EBADF;
   if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
-  
+
+  if (s->domain == B1NIX_AF_NETLINK) {
+    /* Record AF_NETLINK at offset 0 so a later getsockname() reports the
+     * nl_family BusyBox libnetlink checks. */
+    s->local.in.sin_family = B1NIX_AF_NETLINK;
+    s->bound = 1;
+    return 0;
+  }
+
   if (s->domain == B1NIX_AF_UNIX) {
     if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
     return unix_bind(s, (const struct b1nix_sockaddr_un *)addr);

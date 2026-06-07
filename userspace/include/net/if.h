@@ -69,6 +69,7 @@ struct ifreq {
 #define ifr_mtu       ifr_ifru.ifru_mtu
 #define ifr_ifindex   ifr_ifru.ifru_ivalue
 #define ifr_ifqlen    ifr_ifru.ifru_ivalue
+#define ifr_qlen      ifr_ifru.ifru_ivalue
 #define ifr_data      ifr_ifru.ifru_data
 #define ifr_map       ifr_ifru.ifru_map
 #define ifr_slave     ifr_ifru.ifru_slave

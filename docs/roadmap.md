@@ -775,9 +775,9 @@ upstream applets pass the same workflows.
     three include guards to also fire for `__b1nix__`.
   `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks)
   is deferred to a follow-up sub-wave.
-- [~] `partial` Migration wave 4, storage and networking. **Nine applets
+- [x] `done` Migration wave 4, storage and networking. **Nine applets
   enabled and smoke-tested** (`BB-W4:` markers), green on **both** arches —
-  `x86_64` and `i686` both pass all ten markers, suite ~451/0 modulo the
+  `x86_64` and `i686` both pass all markers, suite ~454/1 modulo the
   pre-existing M37 e1000/SMP timing flake: `mount`, `umount` (libc wrappers +
   `<sys/mount.h>` over SYS_MOUNT/UMOUNT), `nslookup` (minimal `<resolv.h>` +
   `res_init`; resolution via `getaddrinfo`→SYS_NET_DNS), `netstat` (new
@@ -791,13 +791,34 @@ upstream applets pass the same workflows.
   conversion (netstat/route parse `/proc/net/*` with it), `getservbyport`,
   `strnlen`, `_IOC`/`_IOR` macros, and headers `net/route.h`, `net/if.h`
   (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`, `caddr_t`.
-  **Deferred to a wave-4b sub-wave** (each needs a distinct new kernel
-  subsystem): `ping` (raw `SOCK_RAW`/ICMP sockets + ICMP receive routing),
-  `losetup` (a loop-device ioctl surface — `/dev/loop-control` + LOOP_SET_FD on
-  `/dev/loopN`), and `ip` (it speaks **rtnetlink** exclusively, so it needs an
-  `AF_NETLINK` socket personality with RTM_GETLINK/GETADDR/GETROUTE dumps).
   `lsblk` is **not shipped by BusyBox 1.36** at all — `blkid` + `fdisk -l`
   cover its inspection role.
+- [x] `done` Migration wave 4b, `ping`/`losetup`/`ip`. **All three enabled and
+  smoke-tested** (`BB-W4B:` markers), green on **both** arches — `x86_64`
+  **455/1** and `i686` **454/1** (the sole failure is the same pre-existing M37
+  e1000 ARP-over-SLIRP timing flake, untouched by this wave). Each required a
+  distinct new kernel subsystem:
+  - **`ping`** — raw `SOCK_RAW`/ICMP sockets. A raw-socket registry in
+    `kernel/net/socket.c`; `icmp_receive()` delivers every echo reply to
+    registered raw sockets via `vfs_socket_push_raw_icmp()` with a synthetic
+    20-byte IPv4 header. libc `recvfrom()` recovers the peer from that header;
+    `sendto()` records the per-packet destination as the connected peer.
+  - **`losetup`** — a loop-device ioctl surface. `kernel/dev/loop.c` registers 8
+    `/dev/loopN` + `/dev/loop-control`, answering LOOP_CTL_GET_FREE,
+    LOOP_SET_FD/CLR_FD and status ioctls. `vfs_ioctl()` routes the `0x4C` ioctl
+    group (and `loop-control`) **before** the `!arg` guard, since
+    LOOP_CTL_GET_FREE takes no arg.
+  - **`ip`** — an `AF_NETLINK`/rtnetlink socket personality.
+    `netlink_build_dump()` encodes RTM_NEWLINK/NEWADDR/NEWROUTE responses
+    (nlmsghdr + rtattr TLVs) terminated by NLMSG_DONE for a single modelled
+    `eth0`; `vfs_socket`/`vfs_bind` accept `AF_NETLINK` and `getsockname`
+    reports `nl_pid 0`. libc `sendmsg`/`recvmsg` gained single-iov
+    scatter-gather, and **`recvmsg` zeroes `msg_name`** so the source `nl_pid`
+    reads as 0 — BusyBox libnetlink rejects (and would hang waiting on) any
+    reply whose recvmsg source `nl_pid` is non-zero. Headers added:
+    `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
+    `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
+    `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
 - [ ] `planned` Migration wave 5, shell/login/init applets. Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are

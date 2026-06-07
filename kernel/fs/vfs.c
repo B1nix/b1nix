@@ -1,5 +1,6 @@
 #include <b1nix/arch.h>
 #include <b1nix/blk.h>
+#include <b1nix/loop.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/ext2.h>
@@ -3711,7 +3712,17 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
-  if (node->inode->type != VFS_DEVICE || !arg)
+  if (node->inode->type != VFS_DEVICE)
+    return -EINVAL;
+
+  /* Loop-device control ioctls (BusyBox losetup): the LOOP_* family is type
+   * 0x4C, plus the /dev/loop-control node. Handled before the `arg` check
+   * because LOOP_CTL_GET_FREE / LOOP_CLR_FD carry no argument. */
+  if (((request >> 8) & 0xFF) == 0x4C ||
+      strcmp(node->name, "loop-control") == 0)
+    return loop_ioctl(node, request, arg);
+
+  if (!arg)
     return -EINVAL;
 
   /* Block-device size ioctls for BusyBox fdisk. Match on the Linux ioctl

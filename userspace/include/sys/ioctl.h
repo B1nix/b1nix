@@ -57,8 +57,9 @@ int ioctl(int fd, unsigned long request, ...);
 #define SIOCSIFMTU     0x8922
 #define SIOCSIFHWADDR  0x8924
 #define SIOCSIFTXQLEN  0x8943
-#define SIOCADDMULTI   0x8931
-#define SIOCDELMULTI   0x8932
+#define SIOCADDMULTI        0x8931
+#define SIOCDELMULTI        0x8932
+#define SIOCSIFHWBROADCAST  0x8937
 
 #ifdef __cplusplus
 }
