@@ -311,38 +311,52 @@ Still to do:
 - `sysctl` — read-only keys can be ported first; writable `sysctl` requires an
   explicit b1nix policy.
 
-### Wave 5: mounts and storage
+### Completed storage applets
 
-Enable:
+Delivered across migration waves 4 and 4b:
 
-`mount`, `umount`, `df`, `lsblk`, `blkid`, `fdisk` and `losetup`.
+`mount`, `umount`, `df`, `blkid`, `fdisk` and `losetup`.
 
-Use the existing b1nix mount and block-device APIs. Provide a small BusyBox
-platform backend for device enumeration instead of reproducing unrelated Linux
-netlink/udev behavior. `fdisk` additionally needs raw block-device read/write
-access and geometry ioctls.
+These use the existing b1nix mount and block-device APIs, raw block-device I/O,
+geometry ioctls and the loop-device interface. BusyBox 1.36 does not ship an
+`lsblk` applet; `blkid` and `fdisk -l` cover the inspection role.
 
-### Wave 6: networking
+### Completed networking applets
 
-Enable `nc` and `wget` first because the normal socket stack already supports
-their core TCP/UDP paths. Then add:
+Migration waves 4 and 4b delivered:
 
 - interface query/configuration for `ifconfig`;
 - route and address operations for `ip` and `route`;
 - raw ICMP or a b1nix backend for `ping`;
 - `/proc/net` data for `netstat`.
 
-### Wave 7: privileged system applets
+### Privileged login and account applets
 
 Enable:
 
-`su`, `login`, `reboot`, `poweroff`, `halt`, `chroot`, `mknod`, `init` and
-eventually `mdev`.
+`su`, `login`, `getty`, `passwd`, account-management applets, `reboot`,
+`poweroff`, `halt`, `chroot` and `mknod`.
 
 Credentials, passwd/shadow parsing and reboot commands already exist.
-`chroot`, device-node creation and a device-event model are still missing.
-`init` and `mdev` should be last because they change boot and device-management
-ownership rather than merely replacing a command.
+`chroot` and device-node creation are still missing. BusyBox `init` and `mdev`
+are intentionally excluded: B1NIX keeps its own `/bin/init` as PID 1 and will
+develop `/etc/inittab`, runlevels, respawn policy and service supervision in
+M39. BusyBox `getty` and `login` may be launched by that native init without
+transferring ownership of the boot process to BusyBox.
+
+### Migration wave 5: shell, login and accounts
+
+The next migration wave combines the earlier upstream-`ash` and privileged
+login/account work:
+
+- bring up `ash` under `/opt/busybox/bin/ash` without replacing `/bin/sh`;
+- enable `getty`, `login`, `su`, `passwd` and account-management applets behind
+  a security-sensitive test gate;
+- leave `/bin/init`, `/etc/rc` and PID 1 service supervision owned by B1NIX.
+
+BusyBox `init` is not a migration target. Replacing the current shell or login
+commands remains independently reversible, while the native init evolves
+separately according to M39 in `docs/roadmap.md`.
 
 ## Applet Promotion Rule
 

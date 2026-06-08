@@ -602,8 +602,12 @@ straight into a b1nix VM.** Full details in [`docs/m32c-external-ssh.md`](m32c-e
 - [ ] `planned` Expose sound interfaces via `/dev/dsp` or a simple ALSA-like API.
 - [ ] `planned` Build a WAV file parser and player utility for user-space.
 
-## M39: Configurable Init System (SysVinit & /etc/inittab)
+## M39: Configurable B1NIX Init System (SysV-style & /etc/inittab)
 
+- [ ] `planned` Keep the B1NIX-owned `/bin/init` as PID 1. BusyBox `init` is
+  explicitly outside the migration plan; BusyBox may provide supporting
+  `getty`/`login` applets, but it does not take ownership of boot or service
+  supervision.
 - [ ] `planned` Implement a parser for the `/etc/inittab` configuration file to define system startups, runlevels, and respawn targets.
 - [ ] `planned` Add support for runlevels (e.g., single-user, multi-user, GUI) and transition control via `telinit` / `init Q`.
 - [ ] `planned` Implement multiple virtual terminal (TTY) lines or serial consoles handled by independent `getty` / `login` process spawners.
@@ -819,11 +823,13 @@ upstream applets pass the same workflows.
     `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
     `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
     `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
-- [ ] `planned` Migration wave 5, shell/login/init applets. Enable upstream
+- [ ] `planned` Migration wave 5, shell/login/account applets. Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
-  available. Treat `init`, `getty`, `login`, `su`, account-management and
-  service applets as a separate security-sensitive gate.
+  available. Treat `getty`, `login`, `su` and account-management applets as a
+  separate security-sensitive gate. Do not enable or promote BusyBox `init`:
+  the existing B1NIX init remains PID 1, and its configurable service model is
+  developed separately in M39.
 - [ ] `planned` Introduce an explicit applet-selection manifest for `/bin`
   replacement. For each migrated command, compare native and upstream behavior
   against existing M11/M22/M33 tests, add BusyBox-specific regression coverage,

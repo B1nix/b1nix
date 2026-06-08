@@ -286,8 +286,8 @@ smoke_run/          generated test logs, captures, and temporary images
   images use a conservative ext4 feature set; exFAT and NTFS are read-only.
 - The 32-bit port currently uses at most 1 GiB of RAM; x86_64 has been tested
   with a 16 GiB QEMU memory map.
-- Audio, configurable SysV-style init, multiple virtual consoles, Wi-Fi, and
-  general USB device support are not implemented.
+- Audio, a configurable SysV-style mode for the native B1NIX init, multiple
+  virtual consoles, Wi-Fi, and general USB device support are not implemented.
 - Security hardening has not reached production quality.
 
 ## Documentation
