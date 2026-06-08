@@ -941,9 +941,14 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	struct sigaction kernel_act;
 	if (act) {
 		kernel_act = *act;
-		if (!kernel_act.sa_restorer) {
-			kernel_act.sa_restorer = __sig_restorer;
-		}
+		/* sa_restorer is a non-portable, b1nix-internal implementation detail:
+		 * the kernel returns from a signal handler by jumping to it. POSIX apps
+		 * do not set it and routinely leave the field uninitialized (e.g.
+		 * dropbear's SIGCHLD handler only sets sa_handler/sa_flags/sa_mask).
+		 * Trusting a garbage value there made the handler "return" to a random
+		 * address → SIGSEGV. Always force our own trampoline regardless of what
+		 * the caller left in the field. */
+		kernel_act.sa_restorer = __sig_restorer;
 		kernel_act.sa_flags |= SA_RESTORER;
 		act = &kernel_act;
 	}
