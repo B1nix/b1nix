@@ -1171,6 +1171,31 @@ static isize sys_umask(u16 mask) {
   return old_mask;
 }
 
+/* True if a caught signal (one with an installed user handler) is deliverable
+ * now. Used to make blocking select()/poll() return EINTR, as POSIX requires —
+ * b1nix historically never interrupted them. Unlike the waitpid predicate this
+ * DOES include SIGCHLD: dropbear's session loop arms a SIGCHLD handler that
+ * writes a self-pipe to wake select(), and relies on select() returning EINTR
+ * so it can reap the exited child and forward its output/exit-status in order.
+ * SIGKILL/SIGSTOP are never caught, so excluding the SIG_DFL/SIG_IGN cases here
+ * leaves their default handling to the normal delivery path. */
+static int select_poll_signal_pending(void) {
+  if (!current_task)
+    return 0;
+  u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+  if (pending == 0)
+    return 0;
+  for (int i = 1; i <= NSIG; i++) {
+    if (!(pending & (1ULL << (i - 1))))
+      continue;
+    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
+    if (h != SIG_IGN && h != SIG_DFL)
+      return 1;
+  }
+  return 0;
+}
+
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   struct b1nix_pollfd fds[16];
   if (nfds > 16)
@@ -1227,6 +1252,16 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
       return (u64)ready;
+    }
+
+    /* Interrupted by a caught signal? Abort with -ERESTARTSYS so the dispatch
+     * tail returns EINTR (or restarts under SA_RESTART) and delivers the
+     * handler. Checked with IRQs still disabled (from wait_prepare) so a signal
+     * posted concurrently is not missed before we sleep. */
+    if (select_poll_signal_pending()) {
+      scheduler_wait_cancel();
+      current_task->wake_tick = 0;
+      return (u64)-ERESTARTSYS;
     }
 
     scheduler_wait_commit();
@@ -2424,7 +2459,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)vfs_link(target, link_path);
   }
   case SYS_POLL:
-    return sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
+    /* Through the tail so a -ERESTARTSYS from an interrupting signal becomes
+     * -EINTR (or a restart) and the pending handler is delivered. */
+    ret = sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
+    break;
   case SYS_SIGRETURN:
     ret = sys_sigreturn(frame);
     break;
@@ -2537,6 +2575,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 
     extern void *vfs_poll_chan;
     int ready_count = 0;
+    int select_eintr = 0;
     while (1) {
       /* Publish BLOCKED before the fd scan — same SMP lost-wakeup fix as
        * sys_poll above (the SSH/select wedge). */
@@ -2559,10 +2598,22 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
         scheduler_wait_cancel();
         break;
       }
+      /* Interrupted by a caught signal (incl. SIGCHLD)? Bail to the tail with
+       * -ERESTARTSYS — dropbear's session loop expects select() to return EINTR
+       * so it can reap the exited child and forward its output in order. */
+      if (select_poll_signal_pending()) {
+        scheduler_wait_cancel();
+        select_eintr = 1;
+        break;
+      }
       scheduler_wait_commit();
     }
 
     current_task->wake_tick = 0;
+    if (select_eintr) {
+      ret = (u64)-ERESTARTSYS;
+      break;
+    }
 
     /* Translate revents back to fd_sets. */
     u8 r_kout[128] = {0}, w_kout[128] = {0}, e_kout[128] = {0};
@@ -2637,8 +2688,16 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     }
   }
 
-  /* Check for pending signals before returning to userspace */
+  /* Check for pending signals before returning to userspace. Publish the
+   * return value into the frame FIRST: arch_build_signal_frame snapshots the
+   * interrupt frame as the sigreturn restore point, but the arch entry writes
+   * this function's return value into frame->rax only AFTER we return (too late
+   * for the snapshot). Without this, delivering a handler right after a normal
+   * syscall (e.g. read()) would make sigreturn restore the saved rax — still
+   * the syscall *number* — and the call's real result (bytes read, etc.) would
+   * be lost. SYS_KILL/SYS_YIELD/SYS_SIGSUSPEND already do this individually. */
   if (frame) {
+    frame->rax = ret;
     arch_check_and_deliver_signals(frame);
     if (!user_frame_is_valid(frame)) {
       scheduler_exit_current(-SIGSEGV);
