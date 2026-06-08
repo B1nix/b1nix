@@ -423,7 +423,7 @@ static u32 ext4_idx_leaf_phys(const struct ext4_extent_idx *idx) {
 }
 
 static u16 ext4_extent_len(const struct ext4_extent *ext) {
-    return ext->ee_len & 0x7fff;
+    return ext->ee_len <= 0x8000 ? ext->ee_len : ext->ee_len - 0x8000;
 }
 
 static int ext4_truncate_extent_node(struct ext4_fs *fs,
