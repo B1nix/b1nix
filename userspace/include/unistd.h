@@ -140,25 +140,14 @@ static inline int chmod(const char *path, unsigned int mode) {
 int fchmod(int fd, unsigned int mode);
 int ftruncate(int fd, off_t length);
 
-static inline int dup(int oldfd) {
-    static int next_fd = 100;
-    return syscall(SYS_DUP2, oldfd, next_fd++);
-}
-
 #define F_OK 0
 #define X_OK 1
 #define W_OK 2
 #define R_OK 4
 
-static inline int access(const char *path, int mode) {
-    (void)mode;
-    int fd = open(path, 0); // O_RDONLY
-    if (fd >= 0) {
-        close(fd);
-        return 0;
-    }
-    return -1;
-}
+int dup(int oldfd);
+int access(const char *path, int mode);
+int fchdir(int fd);
 
 /* lstat/fstat are real out-of-line functions (not static inline): code such as
  * BusyBox's recursive_action takes their address via `(follow ? stat : lstat)`,

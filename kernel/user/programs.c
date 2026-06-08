@@ -3616,6 +3616,21 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M42 wave-5 prerequisites: atomic sigsuspend, alarm, resource limits,
+   * dup/access/ftruncate, fchdir, fuller fnmatch/regex, and job control —
+   * the gate the roadmap requires before enabling the upstream ash shell. */
+  {
+    u64 m42_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m42-w5pre-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m42_pid < 0) {
+      uwrite("M42-W5PRE: spawn-fail\n");
+    } else {
+      int m42_status = 0;
+      syscall_dispatch(SYS_WAIT, m42_pid, (u64)(usize)&m42_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
    * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
    * the base offset correctly, the pointer-table dereferences land on

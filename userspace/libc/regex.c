@@ -84,6 +84,10 @@ static void rx_add_named_class(unsigned char cls[32], const char *name,
     else if (length == 6 && memcmp(name, "xdigit", 6) == 0) match = isxdigit(c);
     else if (length == 5 && memcmp(name, "blank", 5) == 0)
       match = c == ' ' || c == '\t';
+    else if (length == 5 && memcmp(name, "cntrl", 5) == 0) match = iscntrl(c);
+    else if (length == 5 && memcmp(name, "graph", 5) == 0) match = isgraph(c);
+    else if (length == 5 && memcmp(name, "print", 5) == 0) match = isprint(c);
+    else if (length == 5 && memcmp(name, "punct", 5) == 0) match = ispunct(c);
     if (match)
       rx_set_class(cls, (unsigned char)c);
   }
@@ -200,13 +204,77 @@ static struct rx_node *rx_parse_piece(struct rx_parser *ps) {
   if (!atom)
     return NULL;
   int min = -1, max = -1, consumed = 0;
-  if (*ps->p == '*') min = 0, max = -1, consumed = 1;
-  else if (ps->extended && *ps->p == '+') min = 1, max = -1, consumed = 1;
-  else if (ps->extended && *ps->p == '?') min = 0, max = 1, consumed = 1;
-  else if (!ps->extended && ps->p[0] == '\\' && ps->p[1] == '+')
-    min = 1, max = -1, consumed = 2;
-  else if (!ps->extended && ps->p[0] == '\\' && ps->p[1] == '?')
-    min = 0, max = 1, consumed = 2;
+  if (*ps->p == '*') {
+    min = 0;
+    max = -1;
+    consumed = 1;
+  } else if (ps->extended && *ps->p == '+') {
+    min = 1;
+    max = -1;
+    consumed = 1;
+  } else if (ps->extended && *ps->p == '?') {
+    min = 0;
+    max = 1;
+    consumed = 1;
+  } else if (!ps->extended && ps->p[0] == '\\' && ps->p[1] == '+') {
+    min = 1;
+    max = -1;
+    consumed = 2;
+  } else if (!ps->extended && ps->p[0] == '\\' && ps->p[1] == '?') {
+    min = 0;
+    max = 1;
+    consumed = 2;
+  } else {
+    int is_interval = 0;
+    const char *start_ptr = ps->p;
+    if (ps->extended && *start_ptr == '{') {
+      is_interval = 1;
+      start_ptr++;
+    } else if (!ps->extended && start_ptr[0] == '\\' && start_ptr[1] == '{') {
+      is_interval = 2;
+      start_ptr += 2;
+    }
+
+    if (is_interval) {
+      const char *curr = start_ptr;
+      int m = 0, n = -1, has_comma = 0;
+      if (curr[0] >= '0' && curr[0] <= '9') {
+        while (curr[0] >= '0' && curr[0] <= '9') {
+          m = m * 10 + (curr[0] - '0');
+          curr++;
+        }
+        if (*curr == ',') {
+          has_comma = 1;
+          curr++;
+          if (curr[0] >= '0' && curr[0] <= '9') {
+            n = 0;
+            while (curr[0] >= '0' && curr[0] <= '9') {
+              n = n * 10 + (curr[0] - '0');
+              curr++;
+            }
+          }
+        } else {
+          n = m;
+        }
+
+        int closed = 0;
+        if (is_interval == 1 && *curr == '}') {
+          closed = 1;
+          curr++;
+        } else if (is_interval == 2 && curr[0] == '\\' && curr[1] == '}') {
+          closed = 2;
+          curr += 2;
+        }
+
+        if (closed) {
+          min = m;
+          max = n;
+          consumed = (int)(curr - ps->p);
+        }
+      }
+    }
+  }
+
   if (!consumed)
     return atom;
   ps->p += consumed;

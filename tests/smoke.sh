@@ -821,6 +821,22 @@ check_output "$LOG" "M35-CORE: ok crash-signal" "faulting child is terminated by
 check_output "$LOG" "M35-CORE: ok core-elf" "/tmp/core is an ET_CORE x86_64 ELF"
 check_output "$LOG" "M35-CORE: ok core-prstatus" "core carries a PT_NOTE register file"
 check_output "$LOG" "M35-CORE: done" "M35 core-dump smoke completes"
+
+# ── M42 wave-5 prerequisites: POSIX limits, VFS, pattern matching & signal /
+#    job control (the gate before enabling the upstream ash shell) ──
+check_output "$LOG" "M42-W5PRE: start" "M42 wave-5 prerequisite suite starts"
+check_output "$LOG" "M42-W5PRE: ok rlimit-enforcement" "RLIMIT_NOFILE limits the open fd count"
+check_output "$LOG" "M42-W5PRE: ok getrlimit-setrlimit" "getrlimit/setrlimit sets limits correctly"
+check_output "$LOG" "M42-W5PRE: ok dup" "dup() returns lowest available descriptor"
+check_output "$LOG" "M42-W5PRE: ok access" "access() checks exist/perm modes"
+check_output "$LOG" "M42-W5PRE: ok ftruncate" "ftruncate() resizes and zeroes memory buffers"
+check_output "$LOG" "M42-W5PRE: ok fchdir" "fchdir() changes current working directory"
+check_output "$LOG" "M42-W5PRE: ok fnmatch" "POSIX fnmatch matches brackets and PERIOD/PATHNAME flags"
+check_output "$LOG" "M42-W5PRE: ok regex" "POSIX regex matches intervals and named classes"
+check_output "$LOG" "M42-W5PRE: ok sigsuspend-alarm" "atomic sigsuspend waits for alarm and restores mask"
+check_output "$LOG" "M42-W5PRE: ok interrupted-waitpid" "waitpid is interrupted by signal with EINTR"
+check_output "$LOG" "M42-W5PRE: ok job-control" "Job control SIGSTOP/SIGCONT changes state"
+check_output "$LOG" "M42-W5PRE: done" "M42 wave-5 prerequisite suite completes"
 # ── M36 GDB stub + ftrace ──
 check_output "$LOG" "M36-GDB: start" "M36 GDB-stub diag starts"
 check_output "$LOG" "M36-GDB: ok stop-reply" "GDB stub answers ? with a stop reply"

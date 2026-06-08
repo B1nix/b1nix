@@ -43,6 +43,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m32_pcre2_smoke \
 	m34_smoke \
 	m35_smoke \
+	m42_w5pre_smoke \
 	su passwd id whoami groups useradd userdel groupadd chown chmod
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -396,7 +397,7 @@ $(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
 PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
-$(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc
 	tools/build-pcre2.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
@@ -404,7 +405,7 @@ $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(US
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/bin/m32_pcre2_smoke > $@
 
-$(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-curl.sh
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
@@ -413,7 +414,7 @@ $(INITRAMFS_CURL_INC): $(CURL_ELF)
 
 # Dropbear SSH server (dropbearmulti: server + dropbearkey + dropbearconvert,
 # dispatched by argv[0]). Built static against the b1nix userspace libc.
-$(DROPBEAR_ELF): tools/build-dropbear.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(DROPBEAR_ELF): tools/build-dropbear.sh tools/b1nix-autotools-cc
 	tools/build-dropbear.sh all >/dev/null
 
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
@@ -421,18 +422,18 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
 OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
-$(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc
 	tools/build-openssl.sh >/dev/null
 
 LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
-$(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc
 	tools/build-libidn2.sh >/dev/null
 
 LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
-$(LIBPSL_LIB): tools/build-libpsl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(LIBPSL_LIB): tools/build-libpsl.sh tools/b1nix-autotools-cc
 	tools/build-libpsl.sh >/dev/null
 
-$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
+$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)
@@ -464,7 +465,7 @@ $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) us
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
 
-$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
+$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_upstream_busybox_elf build/busybox-b1nix/$(B1NIX_TRIPLET)/busybox > $@

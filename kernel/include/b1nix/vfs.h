@@ -140,6 +140,8 @@ u64 vfs_get_unix_time(void);
 void vfs_init(void);
 void vfs_repopulate_after_root_mount(void);
 void vfs_resolve_path(const char *path, char *out);
+int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len);
+int vfs_node_is_readonly(struct vfs_node *node);
 struct vfs_node *find_child(struct vfs_node *parent, const char *name);
 struct vfs_node *vfs_find_node(const char *path);
 struct vfs_node *vfs_add_node(const char *path, enum vfs_node_type type,
@@ -183,7 +185,9 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);
+int vfs_dup(int oldfd);
 int vfs_dup2(int oldfd, int newfd);
+int vfs_ftruncate(int fd, u64 length);
 int vfs_fcntl(int fd, int cmd, u64 arg);
 int vfs_ioctl(int fd, u64 request, void *arg);
 void vfs_close_on_exec(void);

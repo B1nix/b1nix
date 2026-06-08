@@ -33,7 +33,12 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   struct b1nix_sigframe sf;
   memset(&sf, 0, sizeof(sf));
   sf.magic = B1NIX_SIGFRAME_MAGIC;
-  sf.old_blocked_signals = t->blocked_signals;
+  if (task_has_saved_sigmask(t)) {
+    sf.old_blocked_signals = task_saved_sigmask(t);
+    task_clear_saved_sigmask(t);
+  } else {
+    sf.old_blocked_signals = t->blocked_signals;
+  }
   sf.saved_frame = *frame;
 
   if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
@@ -124,6 +129,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
 
 u64 sys_sigreturn(struct interrupt_frame *frame) {
   struct task *t = current_task;
+
   u64 sp = frame->rsp;
   u64 sf_addr = sp;
   struct b1nix_sigframe sf;

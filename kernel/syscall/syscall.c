@@ -883,6 +883,139 @@ static isize sys_chdir(const char *user_path) {
   return res;
 }
 
+static isize sys_access(const char *user_path, int mode) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  struct vfs_node *node = vfs_find_node(resolved);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  if (mode & 2) { // W_OK
+    if (vfs_node_is_readonly(node)) {
+      vfs_node_put(node);
+      return -EROFS;
+    }
+  }
+
+  vfs_node_put(node);
+  return 0;
+}
+
+static isize sys_fchdir(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || !h->used)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_NODE || !h->node || !h->node->inode)
+    return -EINVAL;
+  if (h->node->inode->type != VFS_DIRECTORY)
+    return -ENOTDIR;
+
+  char resolved[VFS_MAX_PATH];
+  int err = vfs_get_node_path(h->node, resolved, VFS_MAX_PATH);
+  if (err < 0)
+    return err;
+
+  return (isize)scheduler_set_cwd(resolved);
+}
+
+static u64 sys_alarm(unsigned int seconds) {
+  if (!current_task)
+    return 0;
+
+  u64 current_ticks = scheduler_get_uptime_ticks();
+  u64 old_alarm = task_alarm_ticks(current_task);
+  u64 remaining = 0;
+  if (old_alarm > 0) {
+    if (old_alarm > current_ticks) {
+      remaining = (old_alarm - current_ticks + 99) / 100;
+    } else {
+      remaining = 0;
+    }
+  }
+
+  if (seconds == 0) {
+    task_set_alarm_ticks(current_task, 0);
+  } else {
+    task_set_alarm_ticks(current_task, current_ticks + (u64)seconds * 100);
+  }
+
+  return remaining;
+}
+
+static u64 sys_sigsuspend(const u64 *user_mask) {
+  if (!current_task)
+    return (u64)-EINVAL;
+  if (!user_mask)
+    return (u64)-EFAULT;
+
+  u64 mask;
+  if (syscall_copyin(&mask, user_mask, sizeof(u64)) < 0) {
+    return (u64)-EFAULT;
+  }
+
+  task_set_saved_sigmask(current_task, current_task->blocked_signals, 1);
+
+  u64 new_mask = mask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  current_task->blocked_signals = new_mask;
+
+  u64 flags = interrupts_save();
+  while (1) {
+    u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+    int has_deliverable = 0;
+    for (int i = 1; i <= NSIG; i++) {
+      if (pending & (1ULL << (i - 1))) {
+        sighandler_t handler = current_task->sigactions[i - 1].sa_handler;
+        if (handler == SIG_IGN || (handler == SIG_DFL && (i == SIGCHLD || i == SIGURG || i == SIGWINCH || (i == SIGCONT && current_task->state != TASK_STOPPED)))) {
+          __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+        } else {
+          has_deliverable = 1;
+        }
+      }
+    }
+    if (has_deliverable) {
+      break;
+    }
+    current_task->state = TASK_BLOCKED;
+    scheduler_yield();
+  }
+  interrupts_restore(flags);
+
+  return (u64)-EINTR;
+}
+
+static isize sys_getrlimit(int resource, struct rlimit *user_rlim) {
+  struct rlimit rlim;
+  int err = scheduler_getrlimit(resource, &rlim);
+  if (err < 0)
+    return err;
+
+  if (syscall_copyout(user_rlim, &rlim, sizeof(rlim)) < 0)
+    return -EFAULT;
+
+  return 0;
+}
+
+static isize sys_setrlimit(int resource, const struct rlimit *user_rlim) {
+  struct rlimit rlim;
+  if (syscall_copyin(&rlim, user_rlim, sizeof(rlim)) < 0)
+    return -EFAULT;
+
+  return scheduler_setrlimit(resource, &rlim);
+}
+
+
+
 static isize sys_mount(const char *user_src, const char *user_target,
                        const char *user_type, u64 flags) {
   char *ksrc = kmalloc(VFS_MAX_PATH);
@@ -1724,12 +1857,86 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
      * The userspace libc does NOT use SYS_WAIT — its wait() maps to
      * SYS_WAITPID(-1, status, 0). */
     return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
-  case SYS_WAITPID:
-    return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+  case SYS_WAITPID: {
+    u64 wr = (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+    /* Normal returns keep the historical fast path untouched. Only when the
+     * wait was aborted by an interrupting signal (-ERESTARTSYS) do we convert
+     * it to -EINTR — or restart the call if the handler used SA_RESTART — and
+     * deliver the pending handler before returning to userspace. */
+    if (frame && wr == (u64)-ERESTARTSYS) {
+      u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                    __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+      int restart = 1;
+      for (int i = 1; i < NSIG; i++) {
+        if (pending & (1ULL << (i - 1))) {
+          struct sigaction *sa = &current_task->sigactions[i - 1];
+          if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL &&
+              !(sa->sa_flags & SA_RESTART)) {
+            restart = 0;
+            break;
+          }
+        }
+      }
+      if (restart) {
+        /* Re-execute int $0x80 (2 bytes) with the original syscall number. */
+        frame->rip -= 2;
+        frame->rax = number;
+        wr = number;
+      } else {
+        frame->rax = (usize)-EINTR;
+        wr = (u64)-EINTR;
+      }
+      arch_check_and_deliver_signals(frame);
+      if (!user_frame_is_valid(frame)) {
+        scheduler_exit_current(-SIGSEGV);
+        return (u64)-EFAULT;
+      }
+    }
+    return wr;
+  }
   case SYS_GETPID:
     return (u64)scheduler_get_pid();
   case SYS_GETPPID:
     return (u64)(current_task ? current_task->parent_id : 0);
+  case SYS_SIGSUSPEND: {
+    /* sigsuspend() returns only when a signal whose handler must run becomes
+     * deliverable. Deliver it before returning to userspace: set frame->rax to
+     * the return value FIRST so the signal frame snapshot captures -EINTR (the
+     * ASM stores ret into frame->eax only after we return — too late for the
+     * snapshot, same reason the EINTR-restart block below pre-sets frame->rax).
+     * Going through the direct-return path here would skip the tail's
+     * arch_check_and_deliver_signals and leave the waking signal undelivered. */
+    u64 r = sys_sigsuspend((const u64 *)(usize)arg0);
+    if (frame) {
+      frame->rax = r;
+      arch_check_and_deliver_signals(frame);
+      if (!user_frame_is_valid(frame)) {
+        scheduler_exit_current(-SIGSEGV);
+        return (u64)-EFAULT;
+      }
+    }
+    return r;
+  }
+  case SYS_ALARM:
+    return (u64)sys_alarm((unsigned int)arg0);
+  case SYS_FCHDIR:
+    return (u64)sys_fchdir((int)arg0);
+  case SYS_ACCESS:
+    return (u64)sys_access((const char *)(usize)arg0, (int)arg1);
+  case SYS_FTRUNCATE: {
+#ifdef __x86_64__
+    return (u64)vfs_ftruncate((int)arg0, arg1);
+#else
+    u64 len = ((u64)arg2 << 32) | (u32)arg1;
+    return (u64)vfs_ftruncate((int)arg0, len);
+#endif
+  }
+  case SYS_DUP:
+    return (u64)vfs_dup((int)arg0);
+  case SYS_GETRLIMIT:
+    return (u64)sys_getrlimit((int)arg0, (struct rlimit *)(usize)arg1);
+  case SYS_SETRLIMIT:
+    return (u64)sys_setrlimit((int)arg0, (const struct rlimit *)(usize)arg1);
   case SYS_GETCPU: {
     struct percpu *p = get_percpu();
     return (u64)(p ? p->cpu_id : 0);
@@ -2426,7 +2633,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
       ret = number;
     } else {
       ret = (u64)-EINTR;
-      frame->rax = (u64)-EINTR;
+      frame->rax = (usize)-EINTR;
     }
   }
 

@@ -3660,12 +3660,39 @@ int vfs_sync(void) {
   return 0;
 }
 
+int vfs_node_is_readonly(struct vfs_node *node) {
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return 1;
+  return 0;
+}
+
+int vfs_dup(int oldfd) {
+  struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
+  if (!old_handle)
+    return -EBADF;
+
+  int newfd = scheduler_fd_alloc(old_handle);
+  if (newfd < 0)
+    return newfd;
+
+  vfs_handle_retain(old_handle);
+  return newfd;
+}
+
 int vfs_dup2(int oldfd, int newfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
     return -EBADF;
   if (newfd < 0 || (usize)newfd >= SCHED_MAX_FD_LIMIT)
     return -EBADF;
+
+  struct rlimit rlim;
+  if (scheduler_getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+    if ((usize)newfd >= rlim.rlim_cur)
+      return -EBADF;
+  }
+
   if (oldfd == newfd)
     return newfd;
 
@@ -3675,6 +3702,110 @@ int vfs_dup2(int oldfd, int newfd) {
     return -EMFILE;
   vfs_handle_retain(old_handle);
   return newfd;
+}
+
+int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
+  if (!node || !buf || buf_len == 0)
+    return -EINVAL;
+
+  struct vfs_node *path_nodes[128];
+  int count = 0;
+  struct vfs_node *curr = node;
+  while (curr && count < 128) {
+    path_nodes[count++] = curr;
+    if (curr->parent == curr || curr->parent == NULL) {
+      break;
+    }
+    curr = curr->parent;
+  }
+
+  usize pos = 0;
+  buf[0] = '\0';
+  for (int i = count - 1; i >= 0; i--) {
+    struct vfs_node *n = path_nodes[i];
+    if (n->parent == NULL) {
+      continue;
+    }
+    usize name_len = strlen(n->name);
+    if (pos + name_len + 2 > buf_len)
+      return -ENAMETOOLONG;
+    buf[pos++] = '/';
+    memcpy(buf + pos, n->name, name_len);
+    pos += name_len;
+    buf[pos] = '\0';
+  }
+  if (pos == 0) {
+    buf[0] = '/';
+    buf[1] = '\0';
+  }
+  return 0;
+}
+
+int vfs_ftruncate(int fd, u64 length) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h || !h->used)
+    return -EBADF;
+
+  if (h->kind != VFS_HANDLE_NODE || !h->node || !h->node->inode)
+    return -EINVAL;
+
+  struct vfs_node *node = h->node;
+  struct vfs_inode *inode = node->inode;
+
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+
+  if ((h->flags & 3) == B1NIX_O_RDONLY)
+    return -EINVAL;
+
+  vfs_inode_lock(inode);
+
+  if (inode->type != VFS_FILE) {
+    vfs_inode_unlock(inode);
+    return -EINVAL;
+  }
+
+  if (inode->setattr_cb) {
+    inode->size = (usize)length;
+    int res = inode->setattr_cb(node);
+    vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
+    vfs_inode_unlock(inode);
+    return res;
+  }
+
+  if (length > MAX_FILE_SIZE) {
+    vfs_inode_unlock(inode);
+    return -EFBIG;
+  }
+
+  if (length > inode->capacity) {
+    usize new_cap = inode->capacity == 0 ? 1024 : inode->capacity * 2;
+    while (new_cap < length)
+      new_cap *= 2;
+    void *new_data = kzalloc(new_cap);
+    if (!new_data) {
+      vfs_inode_unlock(inode);
+      return -ENOMEM;
+    }
+    if (inode->data) {
+      memcpy(new_data, inode->data, inode->size);
+      if (inode->flags & VFS_NODE_OWNS_DATA)
+        kfree(inode->data);
+    }
+    inode->data = new_data;
+    inode->capacity = new_cap;
+    inode->flags |= VFS_NODE_OWNS_DATA;
+  } else if (length > inode->size) {
+    if (inode->data) {
+      memset((char *)inode->data + inode->size, 0, (usize)(length - inode->size));
+    }
+  }
+
+  inode->size = (usize)length;
+  vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
+  vfs_inode_unlock(inode);
+  return 0;
 }
 
 int vfs_fcntl(int fd, int cmd, u64 arg) {

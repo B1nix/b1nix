@@ -138,6 +138,21 @@ struct sigaction {
   u64 sa_mask; /* signals to block during handler */
 };
 
+typedef unsigned long rlim_t;
+struct rlimit {
+  rlim_t rlim_cur;
+  rlim_t rlim_max;
+};
+
+#define RLIMIT_CPU    0
+#define RLIMIT_FSIZE  1
+#define RLIMIT_DATA   2
+#define RLIMIT_STACK  3
+#define RLIMIT_CORE   4
+#define RLIMIT_NOFILE 7
+#define RLIMIT_AS     9
+#define RLIM_INFINITY ((rlim_t)-1)
+
 struct task {
   usize id;
   const char *name;
@@ -244,6 +259,14 @@ u64  task_tls_base(const struct task *t);
 void task_set_tls_base(struct task *t, u64 base);
 u64  task_child_tid_clear(const struct task *t);
 void task_set_child_tid_clear(struct task *t, u64 addr);
+u64  task_saved_sigmask(const struct task *t);
+int  task_has_saved_sigmask(const struct task *t);
+void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);
+void task_clear_saved_sigmask(struct task *t);
+u64  task_alarm_ticks(const struct task *t);
+void task_set_alarm_ticks(struct task *t, u64 ticks);
+int  scheduler_getrlimit(int resource, struct rlimit *rlim);
+int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
 
 /* Per-CPU current task. `current_task` is the task running on THIS CPU; each
  * core has its own slot in struct percpu (cur_task), so APs and the BSP never

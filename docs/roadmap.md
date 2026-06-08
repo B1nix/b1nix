@@ -823,13 +823,21 @@ upstream applets pass the same workflows.
     `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
     `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
     `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
-- [ ] `planned` Migration wave 5, shell/login/account applets. Enable upstream
+- [ ] `partial` Migration wave 5, shell/login/account applets. Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
-  available. Treat `getty`, `login`, `su` and account-management applets as a
-  separate security-sensitive gate. Do not enable or promote BusyBox `init`:
-  the existing B1NIX init remains PID 1, and its configurable service model is
-  developed separately in M39.
+  available. **Prerequisites are now done and verified** (`M42-W5PRE` smoke,
+  `userspace/bin/m42_w5pre_smoke.c`): atomic `sigsuspend` (delivers the waking
+  handler + restores the mask), working `alarm`/`SIGALRM`, real
+  `getrlimit`/`setrlimit` with `RLIMIT_NOFILE` enforcement, `dup`/`isatty`/
+  `access`/`ftruncate`, `fchdir`, fuller `fnmatch` (brackets, `FNM_PERIOD`,
+  `FNM_PATHNAME`) and POSIX `regex` (intervals, named classes), plus
+  signal-interruptible `waitpid` (EINTR) and `SIGSTOP`/`SIGCONT` job control
+  with SIGCHLD notification. x86 + x86_64 smoke 394/0 (single-CPU + `-smp 4`).
+  Still **planned**: actually enabling the upstream `ash` shell. Treat `getty`,
+  `login`, `su` and account-management applets as a separate security-sensitive
+  gate. Do not enable or promote BusyBox `init`: the existing B1NIX init remains
+  PID 1, and its configurable service model is developed separately in M39.
 - [ ] `planned` Introduce an explicit applet-selection manifest for `/bin`
   replacement. For each migrated command, compare native and upstream behavior
   against existing M11/M22/M33 tests, add BusyBox-specific regression coverage,

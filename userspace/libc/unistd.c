@@ -75,6 +75,14 @@ int sleep(unsigned int seconds) {
   return (int)syscall(SYS_SLEEP, (unsigned long)seconds * 100);
 }
 
+int dup(int oldfd) {
+  return _check_err(syscall(SYS_DUP, oldfd));
+}
+
+int access(const char *path, int mode) {
+  return _check_err(syscall(SYS_ACCESS, path, mode));
+}
+
 int open(const char *path, int flags, ...) {
   unsigned int mode = 0;
   if (flags & O_CREAT) {
@@ -748,8 +756,7 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 }
 
 unsigned int alarm(unsigned int seconds) {
-  (void)seconds;
-  return 0;
+  return (unsigned int)syscall(SYS_ALARM, seconds);
 }
 
 /* No SIGALRM-driven interval timer yet; accept and report "disarmed". */
@@ -782,8 +789,13 @@ int fchmod(int fd, mode_t mode) {
 }
 
 int ftruncate(int fd, off_t length) {
-  (void)fd;
-  return length == 0 ? 0 : -1;
+#ifdef __x86_64__
+  return _check_err(syscall(SYS_FTRUNCATE, fd, (long)length));
+#else
+  return _check_err(syscall(SYS_FTRUNCATE, fd,
+                            (long)(unsigned)(unsigned long long)length,
+                            (long)(unsigned)((unsigned long long)length >> 32)));
+#endif
 }
 
 #include <utime.h>
@@ -933,10 +945,7 @@ pid_t getsid(pid_t pid) {
 }
 
 int getrlimit(int resource, struct rlimit *rlim) {
-  (void)resource;
-  (void)rlim;
-  errno = ENOSYS;
-  return -1;
+  return _check_err(syscall(SYS_GETRLIMIT, resource, rlim));
 }
 
 #include <sys/uio.h>
@@ -1057,11 +1066,7 @@ int sethostname(const char *name, size_t len) {
 }
 
 int setrlimit(int resource, const struct rlimit *rlim) {
-  /* b1nix has no per-process resource limits; accept the request as a no-op so
-   * callers that lower RLIMIT_CORE etc. (dropbear) proceed. */
-  (void)resource;
-  (void)rlim;
-  return 0;
+  return _check_err(syscall(SYS_SETRLIMIT, resource, rlim));
 }
 
 #include <syslog.h>
@@ -1304,8 +1309,10 @@ int uname(struct utsname *buf) {
 }
 
 int sigsuspend(const sigset_t *mask) {
-  (void)mask;
-  errno = ENOSYS;
+  if (mask) {
+    return _check_err(syscall(SYS_SIGSUSPEND, mask));
+  }
+  errno = EINVAL;
   return -1;
 }
 
@@ -1322,9 +1329,7 @@ pid_t vfork(void) {
 }
 
 int fchdir(int fd) {
-  (void)fd;
-  errno = ENOSYS;
-  return -1;
+  return _check_err(syscall(SYS_FCHDIR, fd));
 }
 
 int chroot(const char *path) {
