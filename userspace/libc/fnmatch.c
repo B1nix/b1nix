@@ -79,6 +79,8 @@ int fnmatch(const char *pattern, const char *string, int flags) {
             p++;
             if (!*p) {
                 if (*s != '\\') return FNM_NOMATCH;
+                s++;
+                break;
             } else {
                 if (*p != *s) {
                     return FNM_NOMATCH;

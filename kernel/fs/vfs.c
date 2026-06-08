@@ -3771,7 +3771,7 @@ int vfs_ftruncate(int fd, u64 length) {
     return -EFBIG;
   }
 
-  if (inode->setattr_cb) {
+  if (inode->truncate_cb || inode->setattr_cb) {
     if (length > inode->size && inode->write_cb) {
       char *zeroes = kzalloc(4096);
       if (!zeroes) {
@@ -3797,6 +3797,12 @@ int vfs_ftruncate(int fd, u64 length) {
         off += (u64)written;
       }
       kfree(zeroes);
+    }
+
+    if (inode->truncate_cb) {
+      int res = inode->truncate_cb(node, length);
+      vfs_inode_unlock(inode);
+      return res;
     }
 
     inode->size = (usize)length;

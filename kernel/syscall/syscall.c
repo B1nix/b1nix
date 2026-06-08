@@ -919,6 +919,11 @@ static isize sys_access(const char *user_path, int mode) {
     struct cred access_cred = *cred;
     access_cred.euid = cred->uid;
     access_cred.egid = cred->gid;
+    if (access_cred.euid == ROOT_UID && (mode & X_OK) &&
+        (node->inode->mode & 0111) == 0) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
     if (!cred_can_access(&access_cred, node->inode->uid, node->inode->gid,
                          node->inode->mode, (u32)mode)) {
       vfs_node_put(node);
@@ -1003,6 +1008,21 @@ static u64 sys_sigsuspend(const u64 *user_mask) {
         sighandler_t handler = current_task->sigactions[i - 1].sa_handler;
         if (handler == SIG_IGN || (handler == SIG_DFL && (i == SIGCHLD || i == SIGURG || i == SIGWINCH || (i == SIGCONT && current_task->state != TASK_STOPPED)))) {
           __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+        } else if (handler == SIG_DFL &&
+                   (i == SIGSTOP || i == SIGTSTP ||
+                    i == SIGTTIN || i == SIGTTOU)) {
+          current_task->state = TASK_STOPPED;
+          current_task->last_stop_signal = i;
+          current_task->stop_report_pending = 1;
+          __atomic_fetch_and(&current_task->pending_signals,
+                             ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+          scheduler_notify_wait_event(current_task->parent_id);
+          interrupts_restore(flags);
+          scheduler_yield();
+          flags = interrupts_save();
+        } else if (handler == SIG_DFL && i == SIGCONT) {
+          __atomic_fetch_and(&current_task->pending_signals,
+                             ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         } else {
           has_deliverable = 1;
         }

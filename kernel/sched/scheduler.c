@@ -1807,7 +1807,7 @@ void scheduler_on_timer_tick(void) {
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
-static void post_sigchld_to_parent(usize parent_id);
+static void post_sigchld_to_parent(usize parent_id, int job_control_event);
 
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
@@ -1878,7 +1878,7 @@ void scheduler_exit_current(int exit_code) {
   current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
 
-  post_sigchld_to_parent(current_task->parent_id);
+  post_sigchld_to_parent(current_task->parent_id, 0);
 
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
    * out of sti;hlt so it picks the parent immediately instead of waiting
@@ -2410,12 +2410,13 @@ void scheduler_fd_close_on_exec(void) {
  * next return to userspace. Caller must already hold IRQs disabled. SIGCHLD is
  * excluded from waitpid interruption, so this never spuriously aborts a parent
  * blocked reaping another child. */
-static void post_sigchld_to_parent(usize parent_id) {
+static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
   if (parent_id == 0)
     return;
   for (usize p = 0; p < g_task_hwm; p++) {
     if (T(p)->id == parent_id && T(p)->state != TASK_UNUSED) {
-      if (T(p)->sigactions[SIGCHLD - 1].sa_flags & SA_NOCLDSTOP)
+      if (job_control_event &&
+          (T(p)->sigactions[SIGCHLD - 1].sa_flags & SA_NOCLDSTOP))
         return;
       __atomic_fetch_or(&T(p)->pending_signals, (1ULL << (SIGCHLD - 1)),
                         __ATOMIC_RELEASE);
@@ -2445,7 +2446,7 @@ int scheduler_kill(usize task_id, int sig) {
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
-        post_sigchld_to_parent(T(i)->parent_id);
+        post_sigchld_to_parent(T(i)->parent_id, 1);
         interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
         return 0;
@@ -2454,7 +2455,7 @@ int scheduler_kill(usize task_id, int sig) {
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
-        post_sigchld_to_parent(T(i)->parent_id);
+        post_sigchld_to_parent(T(i)->parent_id, 1);
         interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
@@ -2490,7 +2491,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
-        post_sigchld_to_parent(T(i)->parent_id);
+        post_sigchld_to_parent(T(i)->parent_id, 1);
         interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
@@ -2501,7 +2502,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
-        post_sigchld_to_parent(T(i)->parent_id);
+        post_sigchld_to_parent(T(i)->parent_id, 1);
         interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();

@@ -105,6 +105,7 @@ struct vfs_inode {
                  const char *name);
   int (*symlink_cb)(struct vfs_node *dir, const char *name, const char *target);
   void (*release_cb)(struct vfs_node *node);
+  int (*truncate_cb)(struct vfs_node *node, u64 length);
   int (*setattr_cb)(struct vfs_node *node);
   int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
   int (*fsync_cb)(struct vfs_node *node);

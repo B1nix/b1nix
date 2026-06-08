@@ -22,6 +22,7 @@ static int ext2_write_block(struct ext2_fs *fs, u32 block, const void *buffer) {
 }
 
 static int ext2_vfs_fsync(struct vfs_node *node);
+static int ext2_vfs_setattr(struct vfs_node *node);
 
 static void ext2_read_bgd(struct ext2_fs *fs, u32 group, struct ext2_block_group_desc *bgd) {
 	u32 bg_desc_block = (fs->block_size == 1024) ? 2 : 1;
@@ -552,6 +553,103 @@ static isize ext2_vfs_write(struct vfs_node *node, u64 offset,
 	return bytes_written;
 }
 
+static void ext2_inode_blocks_sub(struct ext2_fs *fs, struct ext2_inode *inode,
+                                  u32 blocks) {
+  u32 sectors = blocks * (fs->block_size / 512);
+  inode->i_blocks = inode->i_blocks > sectors ? inode->i_blocks - sectors : 0;
+}
+
+static int ext2_block_table_empty(u32 *table, u32 entries) {
+  for (u32 i = 0; i < entries; i++) {
+    if (table[i])
+      return 0;
+  }
+  return 1;
+}
+
+static int ext2_vfs_truncate(struct vfs_node *node, u64 length) {
+  u32 inode_num = get_ino(node);
+  struct ext2_fs *fs = get_fs(node);
+  struct ext2_inode inode;
+  if (ext2_read_inode(fs, inode_num, &inode) < 0)
+    return -EIO;
+
+  u32 ptrs = fs->block_size / 4;
+  u32 old_blocks = (inode.i_size + fs->block_size - 1) / fs->block_size;
+  u32 new_blocks = (length + fs->block_size - 1) / fs->block_size;
+
+  for (u32 b = new_blocks; b < old_blocks; b++) {
+    if (b < EXT2_NDIR_BLOCKS) {
+      if (inode.i_block[b]) {
+        ext2_free_block(fs, inode.i_block[b]);
+        ext2_inode_blocks_sub(fs, &inode, 1);
+        inode.i_block[b] = 0;
+      }
+      continue;
+    }
+
+    u32 rel = b - EXT2_NDIR_BLOCKS;
+    if (rel < ptrs) {
+      if (!inode.i_block[EXT2_IND_BLOCK])
+        continue;
+      u32 *ind = kmalloc(fs->block_size);
+      ext2_read_block(fs, inode.i_block[EXT2_IND_BLOCK], ind);
+      if (ind[rel]) {
+        ext2_free_block(fs, ind[rel]);
+        ext2_inode_blocks_sub(fs, &inode, 1);
+        ind[rel] = 0;
+        ext2_write_block(fs, inode.i_block[EXT2_IND_BLOCK], ind);
+      }
+      if (ext2_block_table_empty(ind, ptrs)) {
+        ext2_free_block(fs, inode.i_block[EXT2_IND_BLOCK]);
+        ext2_inode_blocks_sub(fs, &inode, 1);
+        inode.i_block[EXT2_IND_BLOCK] = 0;
+      }
+      kfree(ind);
+      continue;
+    }
+
+    rel -= ptrs;
+    if (rel < ptrs * ptrs && inode.i_block[EXT2_DIND_BLOCK]) {
+      u32 *dind = kmalloc(fs->block_size);
+      u32 *ind = kmalloc(fs->block_size);
+      ext2_read_block(fs, inode.i_block[EXT2_DIND_BLOCK], dind);
+      u32 idx1 = rel / ptrs;
+      u32 idx2 = rel % ptrs;
+      if (dind[idx1]) {
+        ext2_read_block(fs, dind[idx1], ind);
+        if (ind[idx2]) {
+          ext2_free_block(fs, ind[idx2]);
+          ext2_inode_blocks_sub(fs, &inode, 1);
+          ind[idx2] = 0;
+          ext2_write_block(fs, dind[idx1], ind);
+        }
+        if (ext2_block_table_empty(ind, ptrs)) {
+          ext2_free_block(fs, dind[idx1]);
+          ext2_inode_blocks_sub(fs, &inode, 1);
+          dind[idx1] = 0;
+          ext2_write_block(fs, inode.i_block[EXT2_DIND_BLOCK], dind);
+        }
+      }
+      if (ext2_block_table_empty(dind, ptrs)) {
+        ext2_free_block(fs, inode.i_block[EXT2_DIND_BLOCK]);
+        ext2_inode_blocks_sub(fs, &inode, 1);
+        inode.i_block[EXT2_DIND_BLOCK] = 0;
+      }
+      kfree(ind);
+      kfree(dind);
+    }
+  }
+
+  inode.i_size = (u32)length;
+  node->inode->size = (usize)length;
+  node->inode->mtime = vfs_get_unix_time();
+  node->inode->ctime = node->inode->mtime;
+  inode.i_mtime = node->inode->mtime;
+  inode.i_ctime = node->inode->ctime;
+  return ext2_write_inode(fs, inode_num, &inode);
+}
+
 static int ext2_add_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, u32 inode_num,
                                const char *name, u8 type) {
 	struct ext2_inode dir_inode;
@@ -770,6 +868,8 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name,
 		node->inode->blk_dev = dir->inode->blk_dev;
 		node->inode->read_cb = ext2_vfs_read;
 		node->inode->write_cb = ext2_vfs_write;
+    node->inode->truncate_cb = ext2_vfs_truncate;
+    node->inode->setattr_cb = ext2_vfs_setattr;
     node->inode->fsync_cb = ext2_vfs_fsync;
     
     struct ext2_inode_info *info = kmalloc(sizeof(struct ext2_inode_info));
@@ -1170,6 +1270,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
 							node->inode->blk_dev = fs->bdev;
 							node->inode->read_cb = ext2_vfs_read;
 							node->inode->write_cb = ext2_vfs_write;
+              node->inode->truncate_cb = ext2_vfs_truncate;
               node->inode->mode = child_inode.i_mode & 0xFFFF;
               node->inode->uid = child_inode.i_uid;
               node->inode->gid = child_inode.i_gid;
@@ -1239,6 +1340,7 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   root->inode->symlink_cb = ext2_vfs_symlink;
   root->inode->link_cb = ext2_vfs_link;
   root->inode->release_cb = ext2_vfs_release;
+  root->inode->truncate_cb = ext2_vfs_truncate;
   root->inode->setattr_cb = ext2_vfs_setattr;
   root->inode->statfs_cb = ext2_vfs_statfs;
   root->inode->readdir_cb = ext2_vfs_readdir;
