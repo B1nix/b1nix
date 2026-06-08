@@ -836,6 +836,7 @@ check_output "$LOG" "M42-W5PRE: ok regex" "POSIX regex matches intervals and nam
 check_output "$LOG" "M42-W5PRE: ok sigsuspend-alarm" "atomic sigsuspend waits for alarm and restores mask"
 check_output "$LOG" "M42-W5PRE: ok interrupted-waitpid" "waitpid is interrupted by signal with EINTR"
 check_output "$LOG" "M42-W5PRE: ok job-control" "Job control SIGSTOP/SIGCONT changes state"
+check_output "$LOG" "M42-W5PRE: ok sigchld-on-exit" "SIGCHLD is delivered to the parent on child exit"
 check_output "$LOG" "M42-W5PRE: done" "M42 wave-5 prerequisite suite completes"
 # ── M36 GDB stub + ftrace ──
 check_output "$LOG" "M36-GDB: start" "M36 GDB-stub diag starts"

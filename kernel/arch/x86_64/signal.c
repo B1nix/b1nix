@@ -57,6 +57,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   frame->rip = (u64)(usize)sa->sa_handler;
   frame->rsp = restorer_slot;
   frame->rdi = (u64)sig;
+  frame->vector = 0; /* Force return via iretq to honor the modified rip */
   /* Note: do NOT update saved_user_rsp here — it already holds the original
    * user RSP and will be refreshed by the SYSCALL entry on the next entry.
    * Updating it with restorer_slot (the modified RSP) would be wrong. */
@@ -143,7 +144,7 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   }
 
   /* Privilege checks: user cannot forge kernel return state. */
-  if (sf.saved_frame.cs != 0x1B || sf.saved_frame.ss != 0x23) {
+  if (sf.saved_frame.cs != 0x23 || sf.saved_frame.ss != 0x1B) {
     return (u64)-EINVAL;
   }
   if (sf.saved_frame.rip >= 0x0000800000000000ULL ||

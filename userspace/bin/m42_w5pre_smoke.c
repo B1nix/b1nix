@@ -328,6 +328,35 @@ int main(void) {
     kill(child, SIGKILL);
     waitpid(child, &status, 0);
 
+    // 7. Test SIGCHLD on child exit
+    sigset_t current_mask;
+    sigprocmask(0, NULL, &current_mask);
+    char mask_buf[256];
+    snprintf(mask_buf, sizeof(mask_buf), "sigchld-on-exit: mask=%llu\n", (unsigned long long)current_mask);
+    emit(mask_buf);
+
+    g_sigchld_count = 0;
+    int exit_child = fork();
+    if (exit_child == 0) {
+        _exit(42);
+    }
+    int exit_status = 0;
+    int reaped_pid = waitpid(exit_child, &exit_status, 0);
+    if (reaped_pid != exit_child || !WIFEXITED(exit_status) || WEXITSTATUS(exit_status) != 42) {
+        fail("sigchld-on-exit-wait");
+        return 1;
+    }
+    usleep(10000);
+    if (g_sigchld_count != 1) {
+        char err_buf[256];
+        sigprocmask(0, NULL, &current_mask);
+        snprintf(err_buf, sizeof(err_buf), "sigchld-on-exit: count=%d post_mask=%llu\n", g_sigchld_count, (unsigned long long)current_mask);
+        emit(err_buf);
+        fail("sigchld-on-exit");
+        return 1;
+    }
+    ok("sigchld-on-exit");
+
     emit("M42-W5PRE: done\n");
     return 0;
 }

@@ -544,8 +544,13 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
 static int user_frame_is_valid(const struct interrupt_frame *frame) {
   if (!frame)
     return 1;
+#ifdef __x86_64__
+  if (frame->cs != 0x23 || frame->ss != 0x1B)
+    return 0;
+#else
   if (frame->cs != 0x1B || frame->ss != 0x23)
     return 0;
+#endif
   if (frame->rip >= USER_SPACE_LIMIT ||
       frame->rsp >= USER_SPACE_LIMIT)
     return 0;
@@ -1716,7 +1721,51 @@ static volatile u32 g_user_cpu_mask = 0;
 
 u32 sched_user_cpu_mask(void) { return g_user_cpu_mask; }
 
+static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5, struct interrupt_frame *frame);
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+  u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+
+  if (frame) {
+    if (ret == (u64)-ERESTARTSYS) {
+      u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                    __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+      int restart = 1;
+      for (int i = 1; i < NSIG; i++) {
+        if (pending & (1ULL << (i - 1))) {
+          struct sigaction *sa = &current_task->sigactions[i - 1];
+          if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
+            if (!(sa->sa_flags & SA_RESTART)) {
+              restart = 0;
+            }
+            break;
+          }
+        }
+      }
+      if (restart) {
+        frame->rip -= 2;
+        frame->rax = number;
+        ret = number;
+      } else {
+        ret = (u64)-EINTR;
+        frame->rax = (usize)-EINTR;
+      }
+    }
+
+    frame->rax = ret;
+    arch_check_and_deliver_signals(frame);
+    if (!user_frame_is_valid(frame)) {
+      scheduler_exit_current(-SIGSEGV);
+      return (u64)-EFAULT;
+    }
+  }
+
+  return ret;
+}
+
+static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   u64 ret = 0;
 
@@ -1753,10 +1802,6 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
   case SYS_YIELD:
     scheduler_yield();
-    if (frame) {
-      frame->rax = 0;
-      arch_check_and_deliver_signals(frame);
-    }
     return 0;
   case SYS_OPEN: {
     return (u64)sys_open((const char *)(usize)arg0, (int)arg1);
@@ -1894,39 +1939,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
   case SYS_WAITPID: {
     u64 wr = (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
-    /* Normal returns keep the historical fast path untouched. Only when the
-     * wait was aborted by an interrupting signal (-ERESTARTSYS) do we convert
-     * it to -EINTR — or restart the call if the handler used SA_RESTART — and
-     * deliver the pending handler before returning to userspace. */
-    if (frame && wr == (u64)-ERESTARTSYS) {
-      u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                    __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
-      int restart = 1;
-      for (int i = 1; i < NSIG; i++) {
-        if (pending & (1ULL << (i - 1))) {
-          struct sigaction *sa = &current_task->sigactions[i - 1];
-          if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL &&
-              !(sa->sa_flags & SA_RESTART)) {
-            restart = 0;
-            break;
-          }
-        }
-      }
-      if (restart) {
-        /* Re-execute int $0x80 (2 bytes) with the original syscall number. */
-        frame->rip -= 2;
-        frame->rax = number;
-        wr = number;
-      } else {
-        frame->rax = (usize)-EINTR;
-        wr = (u64)-EINTR;
-      }
-      arch_check_and_deliver_signals(frame);
-      if (!user_frame_is_valid(frame)) {
-        scheduler_exit_current(-SIGSEGV);
-        return (u64)-EFAULT;
-      }
-    }
+    /* ERESTARTSYS conversion and signal delivery handled by the wrapper. */
     return wr;
   }
   case SYS_GETPID:
@@ -1934,22 +1947,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_GETPPID:
     return (u64)(current_task ? current_task->parent_id : 0);
   case SYS_SIGSUSPEND: {
-    /* sigsuspend() returns only when a signal whose handler must run becomes
-     * deliverable. Deliver it before returning to userspace: set frame->rax to
-     * the return value FIRST so the signal frame snapshot captures -EINTR (the
-     * ASM stores ret into frame->eax only after we return — too late for the
-     * snapshot, same reason the EINTR-restart block below pre-sets frame->rax).
-     * Going through the direct-return path here would skip the tail's
-     * arch_check_and_deliver_signals and leave the waking signal undelivered. */
+    /* Signal delivery handled by the wrapper after we return. */
     u64 r = sys_sigsuspend((const u64 *)(usize)arg0);
-    if (frame) {
-      frame->rax = r;
-      arch_check_and_deliver_signals(frame);
-      if (!user_frame_is_valid(frame)) {
-        scheduler_exit_current(-SIGSEGV);
-        return (u64)-EFAULT;
-      }
-    }
     return r;
   }
   case SYS_ALARM:
@@ -2073,10 +2072,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     } else {
       kill_ret = (u64)scheduler_kill((usize)target, (int)arg1);
     }
-    if (frame) {
-      frame->rax = kill_ret;
-      arch_check_and_deliver_signals(frame);
-    }
+    /* Signal delivery handled by the wrapper. */
     return kill_ret;
   }
   case SYS_SIGNAL: {
@@ -2662,48 +2658,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     break;
   }
 
-  if (frame && ret == (u64)-ERESTARTSYS) {
-    /* Acquire-load: a concurrent killer publishes bits with a release RMW. */
-    u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                  __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
-    int restart = 1;
-    for (int i = 1; i < NSIG; i++) {
-      if (pending & (1ULL << (i - 1))) {
-        struct sigaction *sa = &current_task->sigactions[i - 1];
-        if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
-          if (!(sa->sa_flags & SA_RESTART)) {
-            restart = 0;
-          }
-          break;
-        }
-      }
-    }
-    if (restart) {
-      frame->rip -= 2;
-      frame->rax = number;
-      ret = number;
-    } else {
-      ret = (u64)-EINTR;
-      frame->rax = (usize)-EINTR;
-    }
-  }
-
-  /* Check for pending signals before returning to userspace. Publish the
-   * return value into the frame FIRST: arch_build_signal_frame snapshots the
-   * interrupt frame as the sigreturn restore point, but the arch entry writes
-   * this function's return value into frame->rax only AFTER we return (too late
-   * for the snapshot). Without this, delivering a handler right after a normal
-   * syscall (e.g. read()) would make sigreturn restore the saved rax — still
-   * the syscall *number* — and the call's real result (bytes read, etc.) would
-   * be lost. SYS_KILL/SYS_YIELD/SYS_SIGSUSPEND already do this individually. */
-  if (frame) {
-    frame->rax = ret;
-    arch_check_and_deliver_signals(frame);
-    if (!user_frame_is_valid(frame)) {
-      scheduler_exit_current(-SIGSEGV);
-      return (u64)-EFAULT;
-    }
-  }
+  /* ERESTARTSYS conversion, frame->rax publication, and signal delivery are
+   * all handled uniformly by the outer syscall_dispatch_impl wrapper. */
 
   return ret;
 }

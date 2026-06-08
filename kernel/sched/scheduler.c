@@ -1793,6 +1793,8 @@ void scheduler_on_timer_tick(void) {
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
+static void post_sigchld_to_parent(usize parent_id);
+
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
@@ -1862,6 +1864,7 @@ void scheduler_exit_current(int exit_code) {
   current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
 
+  post_sigchld_to_parent(current_task->parent_id);
 
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
    * out of sti;hlt so it picks the parent immediately instead of waiting
