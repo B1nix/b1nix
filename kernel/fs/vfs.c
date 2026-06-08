@@ -3766,17 +3766,44 @@ int vfs_ftruncate(int fd, u64 length) {
     return -EINVAL;
   }
 
-  if (inode->setattr_cb) {
-    inode->size = (usize)length;
-    int res = inode->setattr_cb(node);
-    vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
-    vfs_inode_unlock(inode);
-    return res;
-  }
-
   if (length > MAX_FILE_SIZE) {
     vfs_inode_unlock(inode);
     return -EFBIG;
+  }
+
+  if (inode->setattr_cb) {
+    if (length > inode->size && inode->write_cb) {
+      char *zeroes = kzalloc(4096);
+      if (!zeroes) {
+        vfs_inode_unlock(inode);
+        return -ENOMEM;
+      }
+      u64 off = inode->size;
+      while (off < length) {
+        usize chunk = (usize)(length - off);
+        if (chunk > 4096)
+          chunk = 4096;
+        isize written = inode->write_cb(node, off, zeroes, chunk, h->flags);
+        if (written < 0) {
+          kfree(zeroes);
+          vfs_inode_unlock(inode);
+          return (int)written;
+        }
+        if (written == 0) {
+          kfree(zeroes);
+          vfs_inode_unlock(inode);
+          return -EIO;
+        }
+        off += (u64)written;
+      }
+      kfree(zeroes);
+    }
+
+    inode->size = (usize)length;
+    vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
+    int res = inode->setattr_cb(node);
+    vfs_inode_unlock(inode);
+    return res;
   }
 
   if (length > inode->capacity) {

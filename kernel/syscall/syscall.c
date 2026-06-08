@@ -889,6 +889,9 @@ static isize sys_chdir(const char *user_path) {
 }
 
 static isize sys_access(const char *user_path, int mode) {
+  if ((mode & ~(R_OK | W_OK | X_OK)) != 0)
+    return -EINVAL;
+
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
     return -ENOMEM;
@@ -905,6 +908,23 @@ static isize sys_access(const char *user_path, int mode) {
   struct vfs_node *node = vfs_find_node(resolved);
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
+
+  if (mode != 0) {
+    const struct cred *cred = scheduler_get_current_cred();
+    if (!cred) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
+
+    struct cred access_cred = *cred;
+    access_cred.euid = cred->uid;
+    access_cred.egid = cred->gid;
+    if (!cred_can_access(&access_cred, node->inode->uid, node->inode->gid,
+                         node->inode->mode, (u32)mode)) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
+  }
 
   if (mode & 2) { // W_OK
     if (vfs_node_is_readonly(node)) {
@@ -995,6 +1015,11 @@ static u64 sys_sigsuspend(const u64 *user_mask) {
     scheduler_yield();
   }
   interrupts_restore(flags);
+
+  if (task_has_saved_sigmask(current_task)) {
+    current_task->blocked_signals = task_saved_sigmask(current_task);
+    task_clear_saved_sigmask(current_task);
+  }
 
   return (u64)-EINTR;
 }

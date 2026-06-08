@@ -1176,6 +1176,15 @@ int scheduler_setrlimit(int resource, const struct rlimit *rlim) {
     }
   }
   g_task_rlimits[idx][resource] = *rlim;
+  if (current_task->pml4_phys != 0) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+      if (t->state == TASK_UNUSED || t->state == TASK_REAPING)
+        continue;
+      if (t->pml4_phys == current_task->pml4_phys)
+        g_task_rlimits[i][resource] = *rlim;
+    }
+  }
   return 0;
 }
 
@@ -1306,6 +1315,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
   /* Name — keep short (kthread_create truncates at 15 chars). */
   child->name = strdup("pthread");
+
+  usize p_idx = task_index(parent);
+  usize c_idx = task_index(child);
+  for (int r = 0; r < 16; r++)
+    g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
   /* Address-space inheritance. */
   if (flags & B1NIX_CLONE_VM) {
@@ -2401,6 +2415,8 @@ static void post_sigchld_to_parent(usize parent_id) {
     return;
   for (usize p = 0; p < g_task_hwm; p++) {
     if (T(p)->id == parent_id && T(p)->state != TASK_UNUSED) {
+      if (T(p)->sigactions[SIGCHLD - 1].sa_flags & SA_NOCLDSTOP)
+        return;
       __atomic_fetch_or(&T(p)->pending_signals, (1ULL << (SIGCHLD - 1)),
                         __ATOMIC_RELEASE);
       return;
