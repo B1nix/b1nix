@@ -850,27 +850,32 @@ upstream applets pass the same workflows.
   (`scheduler_kill`/`scheduler_kill_process_group` rejected `sig 0`; the sshd
   init-script `status` arm depends on `kill -0`). `/bin/dropbear` was also
   rebuilt against the current libc (it predated the `4ab0fd3` `sa_restorer`
-  fix and was crashing on SIGCHLD). Result: upstream-BusyBox smoke **197/283 →
-  478/2** on x86 and x86_64 (single-CPU + `-smp 4`); `BB-W5` (incl. `vars`,
-  `math`, `pipe`, `redir`, `wait`) and `M32B-SSH` `dropbearkey`/`handshake`/
-  `negauth`/`pty`/`service-status` all green. Treat `getty`, `login`, `su` and
-  account-management applets as a separate security-sensitive gate. Do not enable
-  or promote BusyBox `init`: the existing B1NIX init remains PID 1, and its
-  configurable service model is developed separately in M39.
-- [ ] `planned` Reap reparented/daemon zombies (closes `M32B-SSH:
-  service-lifecycle`, the one remaining SSH red). After the sshd init script
-  `stop`s the daemon it becomes a zombie; `kill(pid,0)` correctly still reports
-  it alive until reaped, so the test's "process gone" check fails. Two gaps:
-  (1) orphans are never reparented when their parent exits — they keep a dead
-  `parent_id` and no one reaps them; (2) in test mode `/bin/init` is the smoke
-  driver, not a general orphan-reaper. A first attempt to reparent orphans to
-  init inside `scheduler_exit_current` was reverted because the unsynchronised
-  task-table walk raced under `-smp 4` (GPF in `user_process_thread` on the M30
-  PIE load). The real fix needs SMP-safe reparenting (under the task-table lock)
-  plus a real reaper for orphaned zombies. This was previously masked because
-  `kill(pid,0)` always failed; it is now honestly exposed. (Separately: `ash`
-  SIGSEGVs on a `while [ $i -lt N ]; …; i=$((i+1)); done` poll loop — a distinct
-  ash/arith bug to investigate.)
+  fix and was crashing on SIGCHLD). Two further bugs the test surfaced, both
+  fixed: orphaned daemon zombies were never reaped (closed below), and a stray
+  NUL byte in the klog ring truncated `dmesg` readers (`M15` audit test) —
+  `klog_putc` now drops NULs so the ring stays a clean text string
+  (`kernel/lib/klog.c`). Result: upstream-BusyBox smoke **197/283 → 480/0** on
+  x86 and x86_64 (single-CPU + `-smp 4`, fully green); `BB-W5` and the whole
+  `M32B-SSH` suite (`dropbearkey`/`handshake`/`negauth`/`pty`/`service-lifecycle`)
+  pass. Treat `getty`, `login`, `su` and account-management applets as a separate
+  security-sensitive gate. Do not enable or promote BusyBox `init`: the existing
+  B1NIX init remains PID 1, and its configurable service model is developed
+  separately in M39.
+- [x] `done` Reap orphaned daemon zombies (closed `M32B-SSH: service-lifecycle`).
+  After the sshd init script `stop`s the daemon it becomes a zombie; `kill(pid,0)`
+  correctly reports it alive until reaped, but its shell parent had already
+  exited and (in test mode) `/bin/init` is the smoke driver, not a general
+  reaper, so nothing reaped it. `scheduler_reap_orphan_zombies()`
+  (`kernel/sched/scheduler.c`) runs from `scheduler_yield` (gated by
+  `g_have_proc_zombies`) and frees process zombies that have NO living parent —
+  monotonic pids (`next_task_id++`) make the orphan test exact, and zombies with
+  a live parent are left for that parent's `waitpid` (init's child-respawn is
+  untouched). It claims each zombie with the same DEAD→REAPING CAS the waitpid
+  reap uses, so it is SMP-safe — unlike an earlier reparenting attempt that wrote
+  `parent_id` during an unsynchronised table walk and GPF'd under `-smp 4`. This
+  was previously masked because `kill(pid,0)` always failed. (Separately, still
+  open: `ash` SIGSEGVs on a `while [ $i -lt N ]; …; i=$((i+1)); done` poll loop —
+  a distinct ash/arith bug to investigate.)
 - [ ] `planned` Harden kernel signal delivery so it does not depend on a valid
   userspace `sa_restorer`. Today `arch_build_signal_frame`
   (`kernel/arch/x86/signal.c`) sets the handler's return address to the

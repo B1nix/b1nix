@@ -365,16 +365,19 @@ login/account work:
   `kill -0`). `/bin/dropbear` was also **rebuilt** against the current libc (it
   predated the `4ab0fd3` `sa_restorer` fix and was crashing on SIGCHLD; dropbear
   builds with clang via `tools/b1nix-autotools-cc`, so no cross-GCC is needed).
-  Upstream-BusyBox smoke went **197/283 → 478/2** on x86 and x86_64; `BB-W5` and
-  `M32B-SSH` `dropbearkey`/`handshake`/`negauth`/`pty`/`service-status` are green.
-- **One remaining SSH red — `M32B-SSH: service-lifecycle`:** after `stop`, the
-  daemon is a zombie that nothing reaps (orphans are not reparented on parent
-  exit, and test-mode `/bin/init` is the smoke driver, not a general reaper), so
-  the test's `kill(pid,0)` "process gone" check fails. This was masked before by
-  the broken `kill -0`. Tracked as `planned` in `docs/roadmap.md` (needs SMP-safe
-  orphan reparenting + a real zombie reaper). A kernel-injected `sigreturn`
-  trampoline (so delivery never trusts a userspace `sa_restorer`) is also tracked
-  there as a forward-compatible hardening.
+  Two more bugs the bring-up surfaced were fixed: orphaned daemon zombies were
+  never reaped (`M32B-SSH: service-lifecycle`), and a stray NUL byte in the klog
+  ring truncated `dmesg` readers so the `M15` audit test missed its lines
+  (`klog_putc` now drops NULs). Upstream-BusyBox smoke went **197/283 → 480/0**
+  on x86 and x86_64 (single-CPU + `-smp 4`, fully green); `BB-W5` and the whole
+  `M32B-SSH` suite (`dropbearkey`/`handshake`/`negauth`/`pty`/`service-lifecycle`)
+  pass.
+- The orphan-zombie reaper: `scheduler_reap_orphan_zombies()` runs from
+  `scheduler_yield` and frees process zombies with no living parent (a daemon
+  whose shell parent has exited), using the same DEAD→REAPING CAS as the waitpid
+  reap so it is SMP-safe. A kernel-injected `sigreturn` trampoline (so signal
+  delivery never trusts a userspace `sa_restorer`) is still tracked as `planned`
+  in `docs/roadmap.md` as forward-compatible hardening.
 - enable `getty`, `login`, `su`, `passwd` and account-management applets behind
   a security-sensitive test gate (not yet done);
 - leave `/bin/init`, `/etc/rc` and PID 1 service supervision owned by B1NIX.

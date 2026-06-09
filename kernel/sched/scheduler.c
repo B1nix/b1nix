@@ -1450,6 +1450,73 @@ void scheduler_reap_dead_threads(void) {
   }
 }
 
+/* Set when a process (non-thread) becomes a zombie; gates the orphan sweep
+ * below so scheduler_yield only walks the table while zombies may exist. The
+ * sweep clears it again once no process zombie remains. */
+static int g_have_proc_zombies = 0;
+
+/* Reap process zombies that can never be collected by waitpid because they have
+ * no living parent — e.g. a daemon backgrounded by a shell that has since
+ * exited (dropbear under /etc/init.d/sshd). Without this such a zombie keeps
+ * its slot + address space forever, and kill(pid,0) keeps reporting it alive.
+ * A zombie WITH a live parent is left untouched for that parent's waitpid (so
+ * init's child-respawn accounting is unaffected). Monotonic pids guarantee a
+ * dead parent's id never aliases a live task, so the orphan test is exact.
+ * Called from scheduler_yield with interrupts disabled, mirroring
+ * scheduler_reap_dead_threads. */
+void scheduler_reap_orphan_zombies(void) {
+  int still_have = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t == current_task) continue;
+    if (t->state != TASK_DEAD) continue;
+    if (task_is_thread(t)) continue; /* threads: scheduler_reap_dead_threads */
+    still_have = 1;
+    if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+
+    int has_live_parent = 0;
+    for (usize p = 0; p < g_task_hwm; p++) {
+      struct task *pt = T(p);
+      if (pt->id == t->parent_id && pt->state != TASK_UNUSED &&
+          pt->state != TASK_DEAD && pt->state != TASK_REAPING) {
+        has_live_parent = 1;
+        break;
+      }
+    }
+    if (has_live_parent) continue; /* its parent will waitpid it */
+
+    /* Claim DEAD->REAPING so a racing waitpid on another CPU can't double-free. */
+    enum task_state expected = TASK_DEAD;
+    if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      continue;
+
+    if (t->user_image) { user_image_free(t->user_image); t->user_image = 0; }
+    if (pml4_other_refs(t->pml4_phys, t) == 0) {
+      user_address_space_cleanup(t);
+      paging_free_address_space(t->pml4_phys);
+    } else {
+      t->vma_list = 0;
+    }
+    t->pml4_phys = 0;
+    if (t->cred) { cred_free(t->cred); t->cred = 0; }
+    if (t->fd_table) {
+      kfree(t->fd_table);
+      kfree(t->fd_flags);
+      t->fd_table = 0;
+      t->fd_flags = 0;
+      t->fd_capacity = 0;
+    }
+    if (t->name && strcmp(t->name, "boot") != 0) {
+      kfree((void *)t->name);
+      t->name = 0;
+    }
+    if (t->stack) { kfree(t->stack); t->stack = 0; }
+    free_task_slot(t);
+  }
+  g_have_proc_zombies = still_have;
+}
+
 
 
 int scheduler_yield(void) {
@@ -1463,6 +1530,11 @@ int scheduler_yield(void) {
    * O(g_task_hwm) which is nontrivial overhead on every yield otherwise. */
   extern int g_has_any_thread;
   if (g_has_any_thread) scheduler_reap_dead_threads();
+
+  /* Reap orphaned process zombies (no living parent) so daemons whose shell
+   * parent has exited don't leak their slot/address space forever. Gated so
+   * the table walk only runs while a process zombie may exist. */
+  if (g_have_proc_zombies) scheduler_reap_orphan_zombies();
 
   /* Deliver pending signals for current task */
   if (current_task) {
@@ -1877,6 +1949,7 @@ void scheduler_exit_current(int exit_code) {
    * RSP swap below. See struct task::stack_released in sched.h. */
   current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
+  g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
 
   post_sigchld_to_parent(current_task->parent_id, 0);
 
