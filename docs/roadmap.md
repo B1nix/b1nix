@@ -678,11 +678,12 @@ smoke-tested on both `x86_64` and `i686`. Native `/bin` utilities stay the
 default throughout the migration and are retired only after equivalent
 upstream applets pass the same workflows.
 
-- [x] `done` Establish the isolated upstream port (BusyBox 1.36.1). Add a
-  reproducible source/configuration pipeline, cross-build it against b1nix
-  libc, install one static multicall ELF at `/opt/busybox/bin/busybox`, and
-  gate initramfs inclusion behind `UPSTREAM_BUSYBOX=1`. No `/bin` symlinks are
-  created at this stage, so the port cannot silently replace native commands.
+- [x] `done` Establish the isolated upstream port (BusyBox 1.36.1, later
+  upgraded to 1.38.0 in M44). Add a reproducible source/configuration pipeline,
+  cross-build it against b1nix libc, install one static multicall ELF at
+  `/opt/busybox/bin/busybox`, and gate initramfs inclusion behind
+  `UPSTREAM_BUSYBOX=1`. No `/bin` symlinks are created at this stage, so the
+  port cannot silently replace native commands.
 - [x] `done` Complete the baseline applet set: `true`, `false`, `yes`, `echo`,
   `printf`, `pwd`, `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`,
   `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `basename`, `dirname`,
@@ -795,8 +796,8 @@ upstream applets pass the same workflows.
   conversion (netstat/route parse `/proc/net/*` with it), `getservbyport`,
   `strnlen`, `_IOC`/`_IOR` macros, and headers `net/route.h`, `net/if.h`
   (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`, `caddr_t`.
-  `lsblk` is **not shipped by BusyBox 1.36** at all — `blkid` + `fdisk -l`
-  cover its inspection role.
+  `lsblk` is **not shipped by BusyBox 1.36** (added in 1.38, see M44 for
+  evaluation — b1nix keeps its native lsblk dispatch for now).
 - [x] `done` Migration wave 4b, `ping`/`losetup`/`ip`. **All three enabled and
   smoke-tested** (`BB-W4B:` markers), green on **both** arches — `x86_64`
   **455/1** and `i686` **454/1** (the sole failure is the same pre-existing M37
@@ -998,3 +999,80 @@ bugs that the synthetic images never hit.
 - [ ] `planned` Lazy (on-demand) directory population for the disk filesystems;
   the drivers currently eager-walk the whole tree at mount, which is wasteful
   for large real volumes.
+
+## M44: BusyBox 1.38.0 Upgrade & New Applet Wave
+
+Upgrade the upstream BusyBox port from 1.36.1 to 1.38.0 and enable the new
+applets shipped by the 1.37 and 1.38 releases. This is a pure superset upgrade:
+the existing 86-applet config is carried forward and the new applets below are
+added. The ~400 commits between 1.36.1 and 1.38.0 also bring numerous fixes,
+security patches (CVE-2023-39810 path traversal), ash `<<<` here-strings, hush
+alias support, `cut --output-delimiter`, and server-side TLS.
+
+- [x] `done` Upgrade the build pipeline: update `tools/build-busybox.sh` to
+  fetch BusyBox 1.38.0, update SHA256 checksum, extend the `__b1nix__` include
+  guard patch to cover the new `procps/vmstat.c`, and create
+  `tools/configs/busybox-1.38.0.config` carrying forward all existing settings
+  and adding the new applet enables. The Makefile dependency now points at the
+  1.38.0 config fragment.
+- [x] `done` **`sha384sum`** — enabled CONFIG_SHA384SUM. Added `sha384()`
+  function to `kernel/lib/sha512.c` and `kernel/include/b1nix/crypt.h` (FIPS
+  180-4 SHA-384 with different IVs and truncated 48-byte output). Added native
+  `sha384sum_main` to the busybox.c dispatch table. Verify with `BB-W7` smoke
+  markers.
+- [x] `done` **`vmstat`** — enabled CONFIG_VMSTAT. A native `vmstat_main` in
+  busybox.c provides `/bin/vmstat` (reads `/proc/meminfo` + `/proc/stat`). The
+  **upstream** `vmstat` applet additionally `xfopen_for_read("/proc/vmstat")`s —
+  which *aborts* if the file is missing — so it was failing
+  (`BB-W7: ok vmstat-upstream` absent) until this wave added a `/proc/vmstat`
+  procfs node (`r_vmstat` in `kernel/fs/procfs.c`, reporting nr_free_pages and
+  zeroed paging/swap event counters). Now green on both arches.
+- [x] `done` **`uuidgen`** — enabled CONFIG_UUIDGEN. Added native `uuidgen_main`
+  to busybox.c: generates RFC 4122 v4 UUIDs using a xorshift64 PRNG seeded
+  from `SYS_TIME` + stack address. No kernel-side changes needed. Verify with
+  `BB-W7` smoke markers.
+- [x] `done` **`tsort`** — enable CONFIG_TSORT. Topological sort of partial
+  order pairs. Served by upstream BusyBox 1.38; no native dispatch entry needed.
+  Verified by `BB-W7: ok tsort` smoke marker.
+- [x] `done` **`tree`** — enabled CONFIG_TREE. A native `tree_main` in
+  busybox.c provides `/bin/tree`. The **upstream** `tree` applet
+  (`miscutils/tree.c`, which *does* ship in BusyBox 1.38) was silently not being
+  built: `tools/build-busybox.sh` replaces that file with a scandir/alphasort-
+  free reimplementation, and the replacement had dropped BusyBox's
+  `//config://applet://kbuild://usage:` metadata headers — so `gen_build_files`
+  never registered `CONFIG_TREE`, `make oldconfig` dropped it, and `tree.o` was
+  never compiled (`BB-W7: ok tree-upstream` absent). The TREEPATCH heredoc now
+  carries those headers verbatim, so the upstream applet builds and runs. Green
+  on both arches.
+- [x] `done` **`getfattr`** — enabled CONFIG_GETFATTR. Retrieves extended
+  attributes from files. This required building the previously-missing kernel
+  xattr backend: a per-inode in-memory xattr list (`struct vfs_xattr` on
+  `struct vfs_inode`), four `vfs_setxattr`/`getxattr`/`listxattr`/`removexattr`
+  operations in `kernel/fs/vfs.c` (freed in `vfs_inode_put`), the
+  `SYS_SETXATTR`/`SYS_GETXATTR`/`SYS_LISTXATTR`/`SYS_REMOVEXATTR` syscalls
+  (134–137) with their handlers, libc wrappers + `<sys/xattr.h>`
+  (`setxattr`/`getxattr`/`listxattr`/`removexattr` and the `l*` no-follow
+  variants), and the `ENODATA` errno. Upstream BusyBox ships only the read-side
+  `getfattr`, so the write side is a b1nix-native `setfattr`
+  (`-n`/`-v`/`-x`, registered at `/bin/setfattr`). `BB-W7: ok getfattr` sets
+  `user.b1nix="wave7"` via native `setfattr` and reads it back through upstream
+  `getfattr` (exercising both the kernel-pointer built-in path and the real
+  userspace `getxattr`/`listxattr` syscalls). Persistence to disk filesystems is
+  out of scope — xattrs live on the in-memory inode only.
+- [x] `done` **`FEATURE_VERSION`** — enable CONFIG_FEATURE_VERSION. Adds
+  `busybox --version` support. Trivial config enable, already in
+  `busybox-1.38.0.config`. Verify with a smoke marker.
+- [x] `stub` **Upstream `lsblk` evaluation** — BusyBox 1.38 ships its own
+  `lsblk` applet for the first time. Evaluated: it depends entirely on Linux
+  sysfs (`/sys/block/`, `/sys/dev/block/`) and procfs (`/proc/self/mountinfo`),
+  neither of which b1nix exposes at those exact paths. The upstream version is
+  **not suitable** for b1nix. The native dispatch entry (via `blk_count()`,
+  `SYS_MOUNTS`) is kept as the only working path. Marked `stub` — re-evaluate
+  if b1nix's sysfs grows the `/sys/block/` layout.
+- [x] `done` Add `BB-W7` smoke markers to `kernel/fs/initramfs.c` (and
+  `tests/smoke.sh`) covering the new applets: uuidgen format validity, sha384sum
+  known vectors, vmstat field format, tree recursive output, tsort deterministic
+  ordering, getfattr xattr round-trip, and `--version` reporting 1.38.0. Full
+  suite green on **both** arches, single-CPU + `-smp 4`: `i686` **504/0** (up
+  from 501/2 — the two regressions were the upstream `vmstat`/`tree` applets
+  fixed above) and `x86_64` equivalently green.

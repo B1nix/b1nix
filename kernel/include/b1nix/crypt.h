@@ -16,6 +16,7 @@ void sha512(const void *data, usize len, u8 out[64]);
 void sha512_init(struct sha512_ctx *c);
 void sha512_update(struct sha512_ctx *c, const void *data, usize len);
 void sha512_final(struct sha512_ctx *c, u8 out[64]);
+void sha384(const void *data, usize len, u8 out[48]);
 
 int b1nix_crypt(const char *password, const char *salt, char *out, usize outsz);
 int b1nix_crypt_equal(const char *a, const char *b);

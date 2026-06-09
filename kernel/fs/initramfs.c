@@ -720,6 +720,21 @@ static const char posix_smoke_script[] =
      * '$'-heavy account logic (hashes, command substitution, regex grep) is not
      * mangled by the in-kernel builtin shell. */
     "/bin/sh /etc/bb-w6/run.sh\n"
+    /* ── Migration wave 7: new applets in BusyBox 1.38 (uuidgen, tree, vmstat, sha384sum, tsort) ── */
+    "/opt/busybox/bin/busybox uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo \"BB-W7: ok uuidgen\"\n"
+    "/opt/busybox/bin/busybox sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo \"BB-W7: ok sha384sum-upstream\"\n"
+    "/opt/busybox/bin/busybox vmstat 2>/dev/null | grep -qE '[0-9]+' && echo \"BB-W7: ok vmstat-upstream\"\n"
+    "printf 'libc kernel\\\\nkernel user\\\\nuser libc\\\\n' | /opt/busybox/bin/busybox tsort 2>/dev/null | head -n 1 | grep -q \"libc\" && echo \"BB-W7: ok tsort\"\n"
+    "mkdir -p /tmp/bb_dir/w7/sub\n"
+    "printf 'leaf\\\\n' > /tmp/bb_dir/w7/leaf.txt\n"
+    "ln -sf leaf.txt /tmp/bb_dir/w7/link.txt 2>/dev/null || :\n"
+    "/opt/busybox/bin/busybox tree /tmp/bb_dir/w7 2>/dev/null | grep -qE 'leaf' && echo \"BB-W7: ok tree-upstream\"\n"
+    /* getfattr (upstream read side) over a user.* xattr set by the b1nix-native
+     * setfattr (SYS_SETXATTR -> per-inode backend -> SYS_GETXATTR). */
+    "/bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt\n"
+    "/opt/busybox/bin/busybox getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix=\"wave7\"' && echo \"BB-W7: ok getfattr\"\n"
+    "rm -rf /tmp/bb_dir/w7\n"
+    "/opt/busybox/bin/busybox --version 2>/dev/null | grep -qF \"1.38.0\" && echo \"BB-W7: ok version\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"

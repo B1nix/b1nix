@@ -20,6 +20,7 @@
 #include <sys/klog.h>
 #include <sys/sysinfo.h>
 #include <sys/times.h>
+#include <sys/xattr.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -527,6 +528,44 @@ int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,
 
 int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
   return _check_err(syscall(SYS_POLL, fds, nfds, timeout));
+}
+
+int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout_ts, const sigset_t *sigmask) {
+  (void)sigmask;
+  int timeout = -1;
+  if (timeout_ts) {
+    timeout = timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000;
+  }
+  return _check_err(syscall(SYS_POLL, fds, nfds, timeout));
+}
+
+/* ── Extended attributes (M44 / BusyBox getfattr). The l*xattr variants pass
+ * nofollow=1 so a terminal symlink is operated on rather than its target. ── */
+int setxattr(const char *path, const char *name, const void *value,
+             size_t size, int flags) {
+  return _check_err(syscall(SYS_SETXATTR, path, name, value, size, flags, 0));
+}
+int lsetxattr(const char *path, const char *name, const void *value,
+              size_t size, int flags) {
+  return _check_err(syscall(SYS_SETXATTR, path, name, value, size, flags, 1));
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+  return _check_err(syscall(SYS_GETXATTR, path, name, value, size, 0));
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+  return _check_err(syscall(SYS_GETXATTR, path, name, value, size, 1));
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+  return _check_err(syscall(SYS_LISTXATTR, path, list, size, 0));
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+  return _check_err(syscall(SYS_LISTXATTR, path, list, size, 1));
+}
+int removexattr(const char *path, const char *name) {
+  return _check_err(syscall(SYS_REMOVEXATTR, path, name, 0));
+}
+int lremovexattr(const char *path, const char *name) {
+  return _check_err(syscall(SYS_REMOVEXATTR, path, name, 1));
 }
 
 int socket(int domain, int type, int protocol) {

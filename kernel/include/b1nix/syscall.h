@@ -158,6 +158,10 @@ enum {
 	SYS_DUP          = 131,
 	SYS_GETRLIMIT    = 132,
 	SYS_SETRLIMIT    = 133,
+	SYS_SETXATTR     = 134,
+	SYS_GETXATTR     = 135,
+	SYS_LISTXATTR    = 136,
+	SYS_REMOVEXATTR  = 137,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

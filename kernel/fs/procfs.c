@@ -230,6 +230,32 @@ static int r_stat(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/vmstat — virtual-memory event counters. BusyBox `vmstat` opens this
+ * with xfopen_for_read() (which aborts if the file is missing) and reads the
+ * paging/swap fields (pgpgin/pgpgout/pswpin/pswpout). b1nix has no swap-event
+ * accounting yet, so the counters are reported as zero — enough for `vmstat`
+ * to run and print its single report without dying. */
+static int r_vmstat(usize pid, struct sbuf *s) {
+  (void)pid;
+  u64 total = pmm_total_usable_memory();
+  u64 freeb = pmm_free_memory_estimate();
+  unsigned long pages = (unsigned long)(total / 4096);
+  unsigned long free_pages = (unsigned long)(freeb / 4096);
+  sb_addf(s, "nr_free_pages %lu\n", free_pages);
+  sb_addf(s, "nr_inactive_anon 0\n");
+  sb_addf(s, "nr_active_anon 0\n");
+  sb_addf(s, "nr_inactive_file 0\n");
+  sb_addf(s, "nr_active_file 0\n");
+  sb_addf(s, "nr_mapped %lu\n", pages - free_pages);
+  sb_addf(s, "pgpgin 0\n");
+  sb_addf(s, "pgpgout 0\n");
+  sb_addf(s, "pswpin 0\n");
+  sb_addf(s, "pswpout 0\n");
+  sb_addf(s, "pgfault 0\n");
+  sb_addf(s, "pgmajfault 0\n");
+  return 0;
+}
+
 static int r_filesystems(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "nodev\tprocfs\n");
@@ -661,6 +687,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "version", VFS_DEVICE, r_version, 0);
   procfs_mkchild(root, "cpuinfo", VFS_DEVICE, r_cpuinfo, 0);
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
+  procfs_mkchild(root, "vmstat", VFS_DEVICE, r_vmstat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);

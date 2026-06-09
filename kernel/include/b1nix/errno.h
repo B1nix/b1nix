@@ -66,6 +66,7 @@
 #define EHOSTUNREACH    113 /* No route to host */
 #define EALREADY        114 /* Operation already in progress */
 #define EINPROGRESS     115 /* Operation now in progress */
+#define ENODATA         61  /* No data available (no such xattr) */
 
 /* Internal kernel errors */
 #define ERESTARTSYS     512 /* Restart system call */

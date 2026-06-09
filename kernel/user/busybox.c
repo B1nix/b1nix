@@ -785,6 +785,30 @@ static int free_main(int argc, const char **argv) {
   return 0;
 }
 
+/* vmstat — virtual memory statistics (M44). Minimal: memory + proc summary. */
+static int vmstat_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  char buf[1024];
+  if (bb_read_file("/proc/meminfo", buf, sizeof(buf)) <= 0) {
+    printf("vmstat: cannot read /proc/meminfo\n");
+    return 1;
+  }
+  long total = bb_proc_val(buf, "MemTotal:");
+  long freeb = bb_proc_val(buf, "MemFree:");
+  char sbuf[1024];
+  long nproc = 0;
+  if (bb_read_file("/proc/stat", sbuf, sizeof(sbuf)) > 0)
+    nproc = bb_proc_val(sbuf, "processes");
+  if (nproc < 0) nproc = 1;
+  printf("procs  -----------memory----------\n");
+  printf("  r  b    total     free    used\n");
+  long used = total - freeb;
+  printf("  0  0  %6ld  %6ld  %6ld\n",
+    total / 1024, freeb / 1024, used / 1024);
+  return 0;
+}
+
 /* top — single-snapshot system summary + process table (M34). Non-interactive:
  * prints uptime/loadavg/memory from /proc, then the live process list. */
 static int top_main(int argc, const char **argv) {
@@ -1194,6 +1218,69 @@ static int find_main(int argc, const char **argv) {
   bb_resolve(start, base, sizeof(base));
   int found = 0;
   find_recurse(base, name, &found);
+  return 0;
+}
+
+/* ── tree — recursive directory listing with tree formatting ── */
+static void tree_dir(const char *base, const char *prefix) {
+  struct dirent *entries = malloc(32 * sizeof(struct dirent));
+  if (!entries)
+    return;
+  usize bl = strlen(base);
+  int count = (int)syscall_dispatch(SYS_READDIR, (u64)(usize)base,
+    (u64)(usize)entries, 32, 0, 0, 0);
+  if (count < 0) {
+    free(entries);
+    return;
+  }
+  int visible = 0;
+  for (int i = 0; i < count; i++) {
+    if (strcmp(entries[i].name, ".") != 0 && strcmp(entries[i].name, "..") != 0)
+      visible++;
+  }
+  int idx = 0;
+  for (int i = 0; i < count; i++) {
+    if (strcmp(entries[i].name, ".") == 0 || strcmp(entries[i].name, "..") == 0)
+      continue;
+    idx++;
+    int is_last = (idx == visible);
+    printf("%s%s%s\n", prefix, is_last ? "└── " : "├── ", entries[i].name);
+    if (entries[i].is_dir) {
+      char path[256];
+      memcpy(path, base, bl);
+      usize off = bl;
+      if (off > 0 && path[off - 1] != '/')
+        path[off++] = '/';
+      usize nl = strlen(entries[i].name);
+      memcpy(path + off, entries[i].name, nl + 1);
+      char sub_prefix[256];
+      snprintf(sub_prefix, sizeof(sub_prefix), "%s%s",
+               prefix, is_last ? "    " : "│   ");
+      tree_dir(path, sub_prefix);
+    }
+  }
+  free(entries);
+}
+
+static int tree_main(int argc, const char **argv) {
+  const char *dir = argc > 1 ? argv[1] : ".";
+  const char *opt = 0;
+  for (int i = 1; i < argc; i++) {
+    if (argv[i][0] == '-' && argv[i][1] != '\0') {
+      opt = argv[i];
+      continue;
+    }
+    if (argv[i][0] != '-')
+      dir = argv[i];
+  }
+  if (opt && strcmp(opt, "--help") == 0) {
+    printf("Usage: tree [-L <depth>] [directory]\n");
+    return 0;
+  }
+  char path[256];
+  bb_resolve(dir, path, sizeof(path));
+  printf("%s\n", dir);
+  tree_dir(path, "");
   return 0;
 }
 
@@ -1929,6 +2016,101 @@ static int yes_main(int argc, const char **argv) {
   return 0;
 }
 
+/* ── uuidgen — generate UUID (v4) ── */
+static int uuidgen_main(int argc, const char **argv) {
+  (void)argc;
+  (void)argv;
+  u64 seed = (u64)syscall_dispatch(SYS_TIME, 0, 0, 0, 0, 0, 0);
+  seed ^= ~(u64)(usize)&seed;
+  u8 uuid[16];
+  for (int i = 0; i < 2; i++) {
+    seed ^= seed << 13;
+    seed ^= seed >> 7;
+    seed ^= seed << 17;
+    ((u64 *)uuid)[i] = seed;
+  }
+  uuid[6] = (uuid[6] & 0x0F) | 0x40;
+  uuid[8] = (uuid[8] & 0x3F) | 0x80;
+  printf("%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x\n",
+    uuid[0], uuid[1], uuid[2], uuid[3],
+    uuid[4], uuid[5], uuid[6], uuid[7],
+    uuid[8], uuid[9], uuid[10], uuid[11],
+    uuid[12], uuid[13], uuid[14], uuid[15]);
+  return 0;
+}
+
+/* ── sha384sum — compute SHA-384 checksum ── */
+static int sha384sum_main(int argc, const char **argv) {
+  int check = 0;
+  const char *file = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-c") == 0)
+      check = 1;
+    else if (argv[i][0] != '-')
+      file = argv[i];
+    else if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+      printf("Usage: sha384sum [-c] [file]\n");
+      return 0;
+    }
+  }
+  if (!file && !check) {
+    printf("sha384sum: missing file\n");
+    return 1;
+  }
+  char buf[16384];
+  isize total = bb_read_file(file, buf, sizeof(buf));
+  if (total < 0) {
+    printf("sha384sum: %s: %s\n", file, bb_strerror((int)total));
+    return 1;
+  }
+  u8 out[48];
+  sha384(buf, (usize)total, out);
+  for (int i = 0; i < 48; i++)
+    printf("%02x", out[i]);
+  printf("  %s\n", file);
+  return 0;
+}
+
+/* ── setfattr — set/remove an extended attribute ──
+ * b1nix-native: upstream BusyBox ships only the read-side `getfattr`, so the
+ * write side lives here (over SYS_SETXATTR/SYS_REMOVEXATTR). Supports
+ * `-n name -v value` to set and `-x name` to remove. The value is taken as a
+ * literal string (hex/base64 encodings are not interpreted). */
+static int setfattr_main(int argc, const char **argv) {
+  const char *name = 0, *value = "", *xname = 0, *file = 0;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-n") == 0 && i + 1 < argc)
+      name = argv[++i];
+    else if (strcmp(argv[i], "-v") == 0 && i + 1 < argc)
+      value = argv[++i];
+    else if (strcmp(argv[i], "-x") == 0 && i + 1 < argc)
+      xname = argv[++i];
+    else if (argv[i][0] != '-')
+      file = argv[i];
+  }
+  if (!file) {
+    printf("setfattr: missing file operand\n");
+    return 1;
+  }
+  long rc;
+  if (xname) {
+    rc = (long)syscall_dispatch(SYS_REMOVEXATTR, (u64)(usize)file,
+                                (u64)(usize)xname, 0, 0, 0, 0);
+  } else if (name) {
+    rc = (long)syscall_dispatch(SYS_SETXATTR, (u64)(usize)file,
+                                (u64)(usize)name, (u64)(usize)value,
+                                (u64)strlen(value), 0, 0);
+  } else {
+    printf("setfattr: need -n <name> or -x <name>\n");
+    return 1;
+  }
+  if (rc < 0) {
+    printf("setfattr: %s: %s\n", file, bb_strerror((int)rc));
+    return 1;
+  }
+  return 0;
+}
+
 /* ── sleep — delay for seconds ── */
 static int sleep_main(int argc, const char **argv) {
   if (argc < 2) {
@@ -2601,6 +2783,7 @@ static struct bb_app bb_apps[] = {
     {"ps", ps_main},
     {"top", top_main},
     {"free", free_main},
+    {"vmstat", vmstat_main},
     {"sysctl", sysctl_main},
     {"kill", kill_main},
     {"date", date_main},
@@ -2613,6 +2796,7 @@ static struct bb_app bb_apps[] = {
     {"tail", tail_main},
     {"grep", grep_main},
     {"find", find_main},
+    {"tree", tree_main},
     {"wc", wc_main},
     {"sort", sort_main},
     {"uniq", uniq_main},
@@ -2635,6 +2819,9 @@ static struct bb_app bb_apps[] = {
     {"test", test_main},
     {"[", test_main},
     {"yes", yes_main},
+    {"uuidgen", uuidgen_main},
+    {"sha384sum", sha384sum_main},
+    {"setfattr", setfattr_main},
     {"sleep", sleep_main},
     {"whoami", whoami_main},
     {"id", id_main},

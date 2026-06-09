@@ -4082,6 +4082,19 @@ static int m22_smoke_main(int argc, const char **argv) {
   const char *ps_argv[] = {"ps", 0};
   failures += m22_run("ps", "/bin/ps", 1, ps_argv);
 
+  const char *uuidgen_argv[] = {"uuidgen", 0};
+  failures += m22_run("uuidgen", "/bin/uuidgen", 1, uuidgen_argv);
+
+  const char *tree_argv[] = {"tree", "/", 0};
+  failures += m22_run("tree", "/bin/tree", 2, tree_argv);
+
+  const char *sha384sum_argv[] = {"sha384sum", "/tmp/m22.txt", 0};
+  failures += m22_run("sha384sum", "/bin/sha384sum", 2, sha384sum_argv);
+
+  // vmstat reads /proc/meminfo and /proc/stat
+  const char *vmstat_argv[] = {"vmstat", 0};
+  failures += m22_run("vmstat", "/bin/vmstat", 1, vmstat_argv);
+
   // Run the new compliance checks for M0-M5 gaps
   int m22_check_posix_compliance(void);
   failures += m22_check_posix_compliance();
@@ -4916,6 +4929,11 @@ void user_register_builtin_programs(void) {
 
   /* Also register the busybox dispatcher itself (always native) */
   user_register_program("/bin/busybox", busybox_main);
+
+  /* setfattr — b1nix-native write side for extended attributes (upstream
+   * BusyBox ships only the read-side getfattr). Not in the manifest because it
+   * has no upstream counterpart to retire to. */
+  user_register_program("/bin/setfattr", busybox_main);
 
   /* M24 — Diagnostics (b1nix-specific, standalone handlers) */
   user_register_program("/bin/gpuinfo", gpuinfo_main);

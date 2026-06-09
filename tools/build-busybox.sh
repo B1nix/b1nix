@@ -1,11 +1,11 @@
 #!/usr/bin/env bash
-# tools/build-busybox.sh - Porting/building upstream BusyBox 1.36.1 for b1nix
+# tools/build-busybox.sh - Porting/building upstream BusyBox 1.38.0 for b1nix
 set -euo pipefail
 
-BUSYBOX_VER="1.36.1"
+BUSYBOX_VER="1.38.0"
 BUSYBOX_TARBALL="busybox-${BUSYBOX_VER}.tar.bz2"
 BUSYBOX_URL="https://busybox.net/downloads/${BUSYBOX_TARBALL}"
-BUSYBOX_SHA256="b8cc24c9574d809e7279c3be349795c5d5ceb6fdf19ca709f80cde50e47de314"
+BUSYBOX_SHA256="34f9ea6ff8636f2c9241153b9114eefa9e65674a45318ae1ef95bb5f31c53bb2"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
@@ -88,12 +88,120 @@ fi
 # b1nix ships <sys/sysinfo.h> in its sysroot and implements the SYS_SYSINFO
 # syscall, so widen those include guards to also fire for __b1nix__. Idempotent:
 # keyed on the rewritten token so a re-extracted tree is patched exactly once.
-for bb_src in procps/free.c procps/uptime.c procps/ps.c; do
+for bb_src in procps/free.c procps/uptime.c procps/ps.c procps/vmstat.c; do
     if [ -f "$SRC_DIR/$bb_src" ] && ! grep -q "__b1nix__" "$SRC_DIR/$bb_src"; then
         sed -i '' 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
             "$SRC_DIR/$bb_src"
     fi
 done
+
+# BusyBox 1.38 added libbb/alloc_affinity.c which #include <sched.h> for
+# CPU-affinity syscalls (sched_getaffinity). b1nix has no CPU-affinity syscall,
+# so replace the file with a stub that returns a single-CPU mask (CPU 0).
+if [ -f "$SRC_DIR/libbb/alloc_affinity.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/libbb/alloc_affinity.c"; then
+    cat > "$SRC_DIR/libbb/alloc_affinity.c" << 'ALLOFF'
+#include "libbb.h"
+unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid UNUSED_PARAM, unsigned *sz) {
+    unsigned long *mask = xzalloc(*sz);
+    if (*sz >= sizeof(long)) mask[0] = 1;
+    *sz = sizeof(long);
+    return mask;
+}
+ALLOFF
+fi
+
+# BusyBox 1.38 miscutils/tree.c uses scandir() + alphasort() which b1nix libc
+# does not provide. Replace the scandir/alphasort call with opendir/readdir/
+# closedir + manual sorting via a simple strcmp-based insertion sort.
+# CRITICAL: keep BusyBox's //config://applet://kbuild://usage: metadata headers
+# verbatim — the build system scans them to register the applet, generate
+# Config.in/applets.h and emit the kbuild object rule. Without them CONFIG_TREE
+# is dropped by `make oldconfig` and tree.o is never compiled (so `busybox tree`
+# silently does not exist). The `__b1nix__` marker comment makes this idempotent.
+if [ -f "$SRC_DIR/miscutils/tree.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/miscutils/tree.c"; then
+    cat > "$SRC_DIR/miscutils/tree.c" << 'TREEPATCH'
+/* __b1nix__: scandir/alphasort-free reimplementation of BusyBox tree. */
+//config:config TREE
+//config:	bool "tree (2.5 kb)"
+//config:	default y
+//config:	help
+//config:	List files and directories in a tree structure.
+//config:
+//applet:IF_TREE(APPLET(tree, BB_DIR_USR_BIN, BB_SUID_DROP))
+//kbuild:lib-$(CONFIG_TREE) += tree.o
+//usage:#define tree_trivial_usage NOUSAGE_STR
+//usage:#define tree_full_usage ""
+
+#include "libbb.h"
+#include "common_bufsiz.h"
+#include "unicode.h"
+#define prefix_buf bb_common_bufsiz1
+static void tree_print(unsigned count[2], const char *directory_name, char *prefix_pos) {
+    DIR *d;
+    struct dirent **sorted = NULL;
+    int n = 0, cap = 0, i;
+    const char *bar = "|   ";
+    const char *mid = "|-- ";
+    const char *end = "`-- ";
+    if (ENABLE_UNICODE_SUPPORT && unicode_status == UNICODE_ON) {
+        bar = "│   ";
+        mid = "├── ";
+        end = "└── ";
+    }
+    d = opendir(directory_name);
+    fputs_stdout(directory_name);
+    if (!d) { puts(" [error opening dir]"); return; }
+    puts("");
+    struct dirent *de;
+    while ((de = readdir(d)) != NULL) {
+        if (de->d_name[0] == '.') continue;
+        if (n >= cap) { cap = cap ? cap * 2 : 64; sorted = xrealloc(sorted, cap * sizeof(sorted[0])); }
+        sorted[n] = xstrdup(de->d_name);
+        n++;
+    }
+    closedir(d);
+    for (i = 0; i < n; i++) {
+        int j;
+        for (j = i; j > 0 && strcmp(sorted[j - 1], sorted[j]) > 0; j--) {
+            char *tmp = sorted[j]; sorted[j] = sorted[j - 1]; sorted[j - 1] = tmp;
+        }
+    }
+    xchdir(directory_name);
+    for (i = 0; i < n; i++) {
+        const char *name = sorted[i];
+        int is_last = (i == n - 1);
+        struct stat statBuf;
+        strcpy(prefix_pos, is_last ? end : mid);
+        fputs_stdout(prefix_buf);
+        int status = lstat(name, &statBuf);
+        if (status == 0 && S_ISLNK(statBuf.st_mode)) {
+            char *symlink_path = xmalloc_readlink(name);
+            printf("%s -> %s\n", name, symlink_path);
+            free(symlink_path);
+        } else {
+            puts(name);
+        }
+        if (status == 0 && S_ISDIR(statBuf.st_mode)) {
+            char *sub_prefix = prefix_pos + strlen(prefix_pos);
+            strcpy(sub_prefix, is_last ? "    " : bar);
+            tree_print(count, name, sub_prefix);
+        }
+        free(sorted[i]);
+    }
+    free(sorted);
+    xchdir("..");
+}
+int tree_main(int argc, char **argv) MAIN_EXTERNALLY_VISIBLE;
+int tree_main(int argc, char **argv) {
+    unsigned count[2] = {0, 0};
+    const char *dir = ".";
+    if (argc > 1) dir = argv[1];
+    char *prefix = prefix_buf;
+    tree_print(count, dir, prefix);
+    return 0;
+}
+TREEPATCH
+fi
 
 # ── 2. Configure ────────────────────────────────────────────────────────────
 mkdir -p "$BUILD_DIR"

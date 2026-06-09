@@ -891,6 +891,7 @@ void vfs_inode_put(struct vfs_inode *inode) {
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }
+    vfs_free_xattrs(inode);
     vfs_free_inode(inode);
   }
 }
@@ -4197,6 +4198,199 @@ int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
   for (int i = 0; i < count; i++)
     out_acl[i] = node->inode->acls[i];
   return count;
+}
+
+/* ── Extended attributes ──
+ * Per-inode in-memory name/value list. Path-based; the syscall layer copies
+ * names/values in and out, so these take kernel pointers. */
+
+void vfs_free_xattrs(struct vfs_inode *inode) {
+  if (!inode)
+    return;
+  struct vfs_xattr *x = inode->xattrs;
+  while (x) {
+    struct vfs_xattr *next = x->next;
+    if (x->value)
+      kfree(x->value);
+    kfree(x);
+    x = next;
+  }
+  inode->xattrs = 0;
+}
+
+static struct vfs_node *xattr_lookup(const char *path, int nofollow) {
+  return nofollow ? vfs_find_node_no_follow(path) : vfs_find_node(path);
+}
+
+/* Modifying xattrs needs ownership (or CAP_FOWNER), matching chmod/utime. */
+static int xattr_check_write(struct vfs_node *node) {
+  const struct cred *cred = get_current_cred();
+  if (!cred)
+    return -EACCES;
+  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid &&
+      !cred_has_cap(cred, CAP_FOWNER))
+    return -EPERM;
+  return 0;
+}
+
+isize vfs_setxattr(const char *path, const char *name, const void *value,
+                   usize size, int flags, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  usize nlen = strlen(name);
+  if (nlen == 0 || nlen > XATTR_NAME_MAX)
+    return -ERANGE;
+  if (size > XATTR_VALUE_MAX)
+    return -E2BIG;
+
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = xattr_check_write(node);
+  if (ret != 0)
+    goto out;
+
+  struct vfs_xattr **pp = &node->inode->xattrs;
+  struct vfs_xattr *existing = 0;
+  while (*pp) {
+    if (strcmp((*pp)->name, name) == 0) {
+      existing = *pp;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  if (existing && (flags & XATTR_CREATE)) {
+    ret = -EEXIST;
+    goto out;
+  }
+  if (!existing && (flags & XATTR_REPLACE)) {
+    ret = -ENODATA;
+    goto out;
+  }
+
+  void *newval = 0;
+  if (size) {
+    newval = kmalloc(size);
+    if (!newval) {
+      ret = -ENOMEM;
+      goto out;
+    }
+    memcpy(newval, value, size);
+  }
+
+  if (existing) {
+    if (existing->value)
+      kfree(existing->value);
+    existing->value = newval;
+    existing->size = size;
+  } else {
+    struct vfs_xattr *x = kmalloc(sizeof(struct vfs_xattr));
+    if (!x) {
+      if (newval)
+        kfree(newval);
+      ret = -ENOMEM;
+      goto out;
+    }
+    x->next = 0;
+    memcpy(x->name, name, nlen);
+    x->name[nlen] = '\0';
+    x->value = newval;
+    x->size = size;
+    *pp = x; /* pp points at the tail's NULL link */
+  }
+  vfs_update_times(node->inode, VFS_CTIME);
+  ret = 0;
+
+out:
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_getxattr(const char *path, const char *name, void *value,
+                   usize size, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = -ENODATA;
+  for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
+    if (strcmp(x->name, name) != 0)
+      continue;
+    if (size == 0) {
+      ret = (isize)x->size; /* size query */
+    } else if (size < x->size) {
+      ret = -ERANGE;
+    } else {
+      if (x->size)
+        memcpy(value, x->value, x->size);
+      ret = (isize)x->size;
+    }
+    break;
+  }
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  usize total = 0;
+  for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next)
+    total += strlen(x->name) + 1;
+
+  isize ret;
+  if (size == 0) {
+    ret = (isize)total; /* size query */
+  } else if (size < total) {
+    ret = -ERANGE;
+  } else {
+    usize off = 0;
+    for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
+      usize n = strlen(x->name) + 1;
+      memcpy(list + off, x->name, n);
+      off += n;
+    }
+    ret = (isize)total;
+  }
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_removexattr(const char *path, const char *name, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = xattr_check_write(node);
+  if (ret != 0)
+    goto out;
+
+  ret = -ENODATA;
+  struct vfs_xattr **pp = &node->inode->xattrs;
+  while (*pp) {
+    if (strcmp((*pp)->name, name) == 0) {
+      struct vfs_xattr *dead = *pp;
+      *pp = dead->next;
+      if (dead->value)
+        kfree(dead->value);
+      kfree(dead);
+      vfs_update_times(node->inode, VFS_CTIME);
+      ret = 0;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+
+out:
+  vfs_node_put(node);
+  return ret;
 }
 
 int vfs_fchown(int fd, u16 uid, u16 gid) {

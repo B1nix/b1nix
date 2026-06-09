@@ -479,7 +479,7 @@ $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) us
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
 
-$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
+$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_upstream_busybox_elf build/busybox-b1nix/$(B1NIX_TRIPLET)/busybox > $@

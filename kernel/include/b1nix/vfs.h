@@ -59,6 +59,20 @@ struct acl_entry {
 
 struct vfs_node;
 
+/* Extended-attribute entry: one name/value pair on an inode's xattr list. */
+struct vfs_xattr {
+  struct vfs_xattr *next;
+  usize size;       /* value length in bytes */
+  void *value;      /* kmalloc'd value buffer (may be NULL when size==0) */
+  char name[256];   /* full attribute name, e.g. "user.foo" */
+};
+
+/* setxattr flags (Linux ABI). */
+#define XATTR_CREATE  0x1 /* fail if the attribute already exists */
+#define XATTR_REPLACE 0x2 /* fail if the attribute does not exist */
+#define XATTR_NAME_MAX 255
+#define XATTR_VALUE_MAX 4096
+
 struct vfs_inode {
   u64 ino;
   enum vfs_node_type type;
@@ -78,6 +92,10 @@ struct vfs_inode {
   /* ACL support */
   struct acl_entry acls[ACL_MAX_ENTRIES];
   int acl_count;
+
+  /* Extended attributes (in-memory, per-inode list). Head of a singly-linked
+   * list of name/value pairs; NULL when the inode has no xattrs. */
+  struct vfs_xattr *xattrs;
 
   /* Timestamps */
   u64 atime;
@@ -228,6 +246,17 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl);
 int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
                 int max_entries);
+
+/* Extended attributes (kernel/fs/vfs.c). Path-based; nofollow selects the
+ * l*xattr (do-not-dereference-symlink) variant. Return values follow the
+ * Linux getxattr/listxattr contract: a non-negative size, or -errno. */
+isize vfs_setxattr(const char *path, const char *name, const void *value,
+                   usize size, int flags, int nofollow);
+isize vfs_getxattr(const char *path, const char *name, void *value,
+                   usize size, int nofollow);
+isize vfs_listxattr(const char *path, char *list, usize size, int nofollow);
+isize vfs_removexattr(const char *path, const char *name, int nofollow);
+void vfs_free_xattrs(struct vfs_inode *inode);
 
 enum vfs_handle_kind {
   VFS_HANDLE_NONE = 0,

@@ -34,7 +34,7 @@ current build.
   arithmetic substitution, here-documents, functions, loops, `case`, arrays,
   traps, and foreground/background job control.
 - Native utilities plus curl, GNU Wget, Dropbear SSH, TinyCC, and an optional
-  upstream BusyBox 1.36.1 port.
+  upstream BusyBox 1.38.0 port.
 - Ported binutils, GCC, libstdc++, and GNU Make. The x86_64 kernel can be
   compiled and linked from inside B1NIX.
 - Automated QEMU coverage for boot, SMP, memory, storage, filesystems,

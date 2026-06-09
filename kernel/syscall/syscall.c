@@ -1064,7 +1064,144 @@ static isize sys_setrlimit(int resource, const struct rlimit *user_rlim) {
   return scheduler_setrlimit(resource, &rlim);
 }
 
+/* ── Extended-attribute syscalls (M44 / wave 7) ──
+ * The path and name are NUL-terminated user strings; the value is a raw
+ * byte buffer of `size` bytes. `nofollow` selects the l*xattr variant. */
+static isize sys_setxattr(const char *user_path, const char *user_name,
+                          const void *user_value, usize size, int flags,
+                          int nofollow) {
+  if (size > XATTR_VALUE_MAX)
+    return -E2BIG;
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  void *kval = 0;
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out_path;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out_path;
+  }
+  if (size) {
+    kval = kmalloc(size);
+    if (!kval) {
+      ret = -ENOMEM;
+      goto out_path;
+    }
+    if (syscall_copyin(kval, user_value, size) < 0) {
+      ret = -EFAULT;
+      goto out_val;
+    }
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  ret = vfs_setxattr(resolved, kname, kval, size, flags, nofollow);
+out_val:
+  if (kval)
+    kfree(kval);
+out_path:
+  kfree(kpath);
+  return ret;
+}
 
+static isize sys_getxattr(const char *user_path, const char *user_name,
+                          void *user_value, usize size, int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  if (size == 0) {
+    ret = vfs_getxattr(resolved, kname, 0, 0, nofollow); /* size query */
+    goto out;
+  }
+  usize cap = size > XATTR_VALUE_MAX ? XATTR_VALUE_MAX : size;
+  void *kbuf = kmalloc(cap);
+  if (!kbuf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+  ret = vfs_getxattr(resolved, kname, kbuf, cap, nofollow);
+  if (ret > 0 && syscall_copyout(user_value, kbuf, (usize)ret) < 0)
+    ret = -EFAULT;
+  kfree(kbuf);
+out:
+  kfree(kpath);
+  return ret;
+}
+
+static isize sys_listxattr(const char *user_path, char *user_list, usize size,
+                           int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  if (size == 0) {
+    ret = vfs_listxattr(resolved, 0, 0, nofollow); /* size query */
+    goto out;
+  }
+  /* Bound the kernel buffer; the full xattr name set cannot exceed this. */
+  usize cap = size > 8192 ? 8192 : size;
+  char *kbuf = kmalloc(cap);
+  if (!kbuf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+  ret = vfs_listxattr(resolved, kbuf, cap, nofollow);
+  if (ret > 0 && syscall_copyout(user_list, kbuf, (usize)ret) < 0)
+    ret = -EFAULT;
+  kfree(kbuf);
+out:
+  kfree(kpath);
+  return ret;
+}
+
+static isize sys_removexattr(const char *user_path, const char *user_name,
+                             int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  ret = vfs_removexattr(resolved, kname, nofollow);
+out:
+  kfree(kpath);
+  return ret;
+}
 
 static isize sys_mount(const char *user_src, const char *user_target,
                        const char *user_type, u64 flags) {
@@ -2016,6 +2153,21 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_getrlimit((int)arg0, (struct rlimit *)(usize)arg1);
   case SYS_SETRLIMIT:
     return (u64)sys_setrlimit((int)arg0, (const struct rlimit *)(usize)arg1);
+  case SYS_SETXATTR:
+    return (u64)sys_setxattr((const char *)(usize)arg0,
+                             (const char *)(usize)arg1,
+                             (const void *)(usize)arg2, (usize)arg3,
+                             (int)arg4, (int)arg5);
+  case SYS_GETXATTR:
+    return (u64)sys_getxattr((const char *)(usize)arg0,
+                             (const char *)(usize)arg1, (void *)(usize)arg2,
+                             (usize)arg3, (int)arg4);
+  case SYS_LISTXATTR:
+    return (u64)sys_listxattr((const char *)(usize)arg0, (char *)(usize)arg1,
+                              (usize)arg2, (int)arg3);
+  case SYS_REMOVEXATTR:
+    return (u64)sys_removexattr((const char *)(usize)arg0,
+                                (const char *)(usize)arg1, (int)arg2);
   case SYS_GETCPU: {
     struct percpu *p = get_percpu();
     return (u64)(p ? p->cpu_id : 0);
