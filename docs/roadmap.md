@@ -873,9 +873,21 @@ upstream applets pass the same workflows.
   untouched). It claims each zombie with the same DEAD→REAPING CAS the waitpid
   reap uses, so it is SMP-safe — unlike an earlier reparenting attempt that wrote
   `parent_id` during an unsynchronised table walk and GPF'd under `-smp 4`. This
-  was previously masked because `kill(pid,0)` always failed. (Separately, still
-  open: `ash` SIGSEGVs on a `while [ $i -lt N ]; …; i=$((i+1)); done` poll loop —
-  a distinct ash/arith bug to investigate.)
+  was previously masked because `kill(pid,0)` always failed.
+- [x] `done` Fix `ash` SIGSEGV on arithmetic-in-loop (`while [ $i -lt N ]; do
+  i=$((i+1)); done`) — two libc bugs: (1) `strtol` did not advance `endptr` for a
+  leading-0 number followed by a non-octal char, so ash's `$((..))` parser spun
+  forever and overflowed its value stack into kernel space; (2) `vsnprintf` had
+  no `%g`/`%e` (only `%f`), so BusyBox awk's `%.6g` CONVFMT printed "%g". Both in
+  `userspace/libc/`, host-verified against glibc; `BB-W5: ok arith-loop` covers
+  it. The `INITRAMFS_BUSYBOX_INC`/`$(DROPBEAR_ELF)`/`$(CURL_ELF)` rules now depend
+  on `$(USERSPACE_DEPS)` so a libc change rebuilds these binaries. Both arches
+  481/0 (UP + `-smp 4`).
+- [ ] `planned` Investigate a rare `-smp 4` heap double-free seen once during SSH
+  daemon stop (`bucket_unlink: ... magic 0xdead110c not in bucket`, during the
+  `service-lifecycle` stop/reap). Did not reproduce on re-run (481/0). Suspect
+  the orphan-zombie reaper racing dropbear's per-connection child teardown, or a
+  pre-existing socket-teardown race; pin down with `KHEAP_VALIDATE=1`.
 - [ ] `planned` Harden kernel signal delivery so it does not depend on a valid
   userspace `sa_restorer`. Today `arch_build_signal_frame`
   (`kernel/arch/x86/signal.c`) sets the handler's return address to the
