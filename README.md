@@ -207,7 +207,7 @@ make smoke-x86
 make graphics-smoke
 make memory-smoke
 make analyze
-UPSTREAM_BUSYBOX=1 make smoke
+make smoke
 ```
 
 Smoke logs, packet captures, and temporary disk images are written to

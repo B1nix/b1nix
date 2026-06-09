@@ -41,6 +41,15 @@ export PATH="$CROSS_PREFIX/bin:$PATH"
 echo "Installing/updating userspace libc and headers in sysroot..."
 make -C "$PROJECT_DIR/userspace" install-headers-libs
 
+# Workaround for spaces in path (e.g. "Documents/GitHub"): build tools like
+# BusyBox's make / autotools split EXTRA_*FLAGS on whitespace and don't
+# tolerate --sysroot=/path/with spaces. Create a symlink at a space-free path.
+SPACEFREE_SYSROOT="$TOOLCHAIN_BUILD_HOME/sysroot-$B1NIX_TRIPLET"
+rm -f "$SPACEFREE_SYSROOT" 2>/dev/null || true
+mkdir -p "$(dirname "$SPACEFREE_SYSROOT")"
+ln -sf "$SYSROOT" "$SPACEFREE_SYSROOT"
+SYSROOT="$SPACEFREE_SYSROOT"
+
 # ── 1. Fetch (shared cache) + unpack BusyBox ──────────────────
 mkdir -p "$TOOLCHAIN_DIST_DIR"
 BUSYBOX_TAR="$TOOLCHAIN_DIST_DIR/${BUSYBOX_TARBALL}"
@@ -81,7 +90,7 @@ fi
 # keyed on the rewritten token so a re-extracted tree is patched exactly once.
 for bb_src in procps/free.c procps/uptime.c procps/ps.c; do
     if [ -f "$SRC_DIR/$bb_src" ] && ! grep -q "__b1nix__" "$SRC_DIR/$bb_src"; then
-        sed -i 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
+        sed -i '' 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
             "$SRC_DIR/$bb_src"
     fi
 done

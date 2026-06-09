@@ -20,7 +20,11 @@ INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
-INITRAMFS_BUSYBOX_MODE := $(BUILD_DIR)/upstream_busybox_mode
+
+# Applet manifest for /bin replacement (M42 items 3 and 4).
+APPLET_MANIFEST := tools/applet-manifest.conf
+APPLET_SYMLINKS_INC := $(BUILD_DIR)/initramfs_applet_symlinks.inc
+APPLET_REGISTRATION_INC := $(BUILD_DIR)/initramfs_applet_registration.inc
 
 EMBEDDED_USER_PROGRAMS := \
 	m8_aio_test \
@@ -48,13 +52,8 @@ EMBEDDED_USER_PROGRAMS := \
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
-UPSTREAM_BUSYBOX ?= 0
-ifeq ($(UPSTREAM_BUSYBOX),1)
-UPSTREAM_BUSYBOX_DEPS := $(INITRAMFS_BUSYBOX_INC)
-else
-UPSTREAM_BUSYBOX_DEPS :=
-endif
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
+# Upstream BusyBox is always embedded (M42 full integration).
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
@@ -64,8 +63,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_CACERT_INC) \
 	$(INITRAMFS_TLSTEST_INC) \
 	$(INITRAMFS_DROPBEAR_INC) \
-	$(UPSTREAM_BUSYBOX_DEPS)
-GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS)
+	$(INITRAMFS_BUSYBOX_INC)
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -324,14 +323,29 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(INITRAMFS_BUSYBOX_MODE)
-$(BUILD_DIR)/kernel/fs/initramfs.o: INSTRUMENT_FLAGS += -include $(abspath $(INITRAMFS_BUSYBOX_MODE))
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
-$(INITRAMFS_BUSYBOX_MODE): FORCE
+# programs.c includes the generated applet registration .inc
+$(BUILD_DIR)/kernel/user/programs.o: $(APPLET_REGISTRATION_INC)
+
+# ── Applet manifest generation (M42 items 3 & 4) ──
+# Reads tools/applet-manifest.conf and generates:
+#   (a) initramfs_applet_symlinks.inc — symlink entries for upstream applets
+#   (b) initramfs_applet_registration.inc — conditional user_register_program calls
+#
+# The manifest controls per-command selection; upstream commands get a VFS
+# symlink to the embedded upstream BusyBox ELF, and their native registration
+# is skipped.  Native-only applets are always registered.
+
+$(APPLET_SYMLINKS_INC): $(APPLET_MANIFEST)
 	@mkdir -p $(dir $@)
-	@printf '#define B1NIX_UPSTREAM_BUSYBOX %s\n' '$(UPSTREAM_BUSYBOX)' > $@.tmp
-	@cmp -s $@.tmp $@ 2>/dev/null || cp $@.tmp $@
-	@rm -f $@.tmp
+	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") { cmd = $$1; if (cmd == "[") printf "  {\"/bin/[\", \"/opt/busybox/bin/busybox\", 24, INITRAMFS_SYMLINK},\n"; else printf "  {\"/bin/%s\", \"/opt/busybox/bin/busybox\", 24, INITRAMFS_SYMLINK},\n", cmd; } }' $< > $@
+
+$(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
+	@mkdir -p $(dir $@)
+	@printf '/* Generated from %s — native-only applets (upstream handled by VFS symlinks) */\n' '$<' > $@
+	@printf '\n' >> $@
+	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "native") printf "  user_register_program(\"/bin/%s\", busybox_main);\n", $$1; }' $< >> $@
 
 # Arch guard for the SHARED userspace build dir.
 #
@@ -541,9 +555,6 @@ userspace-install: userspace
 
 busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
-
-busybox-iso: UPSTREAM_BUSYBOX=1
-busybox-iso: iso
 
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \

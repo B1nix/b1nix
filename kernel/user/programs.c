@@ -4905,83 +4905,23 @@ void user_register_builtin_programs(void) {
   user_register_program("/bin/lock-smoke", lock_smoke_main);
   user_register_program("/bin/ext-stress", ext_stress_main);
 
-  /* M22 — Core Terminal Utilities (BusyBox multi-call) */
+  /* M22/M42 — Core Terminal Utilities (BusyBox multi-call dispatch).
+   *
+   * Applet registration is controlled by tools/applet-manifest.conf (M42
+   * items 3 & 4).  Commands marked "upstream" skip native registration; they
+   * are served by an initramfs symlink to the upstream BusyBox ELF.  Commands
+   * marked "native" are always registered here.  The .inc below is generated
+   * by the Makefile. */
+#include "initramfs_applet_registration.inc"
 
-  /* File/directory utilities */
-  user_register_program("/bin/pwd", busybox_main);
-  user_register_program("/bin/ls", busybox_main);
-  user_register_program("/bin/cp", busybox_main);
-  user_register_program("/bin/mv", busybox_main);
-  user_register_program("/bin/rm", busybox_main);
-  user_register_program("/bin/mkdir", busybox_main);
-  user_register_program("/bin/rmdir", busybox_main);
-  user_register_program("/bin/chmod", busybox_main);
-  user_register_program("/bin/chown", busybox_main);
-  user_register_program("/bin/ln", busybox_main);
-  user_register_program("/bin/readlink", busybox_main);
-  user_register_program("/bin/touch", busybox_main);
-  user_register_program("/bin/basename", busybox_main);
-  user_register_program("/bin/dirname", busybox_main);
+  /* Also register the busybox dispatcher itself (always native) */
+  user_register_program("/bin/busybox", busybox_main);
 
-  /* System utilities */
-  user_register_program("/bin/ps", busybox_main);
-  user_register_program("/bin/top", busybox_main);
-  user_register_program("/bin/free", busybox_main);
-  user_register_program("/bin/sysctl", busybox_main);
-  user_register_program("/bin/kill", busybox_main);
-  user_register_program("/bin/date", busybox_main);
-  user_register_program("/bin/uname", busybox_main);
-
-  /* Text utilities */
-  user_register_program("/bin/cat", busybox_main);
-  user_register_program("/bin/echo", busybox_main);
-  user_register_program("/bin/printf", busybox_main);
-  user_register_program("/bin/head", busybox_main);
-  user_register_program("/bin/tail", busybox_main);
-  user_register_program("/bin/grep", busybox_main);
-  user_register_program("/bin/find", busybox_main);
-  user_register_program("/bin/wc", busybox_main);
-  user_register_program("/bin/sort", busybox_main);
-  user_register_program("/bin/uniq", busybox_main);
-
-  /* Filesystem utilities */
-  user_register_program("/bin/mount", busybox_main);
-  user_register_program("/bin/df", busybox_main);
-  user_register_program("/bin/lsblk", busybox_main);
-  user_register_program("/bin/sync", busybox_main);
-  user_register_program("/bin/hexdump", busybox_main);
-
-  /* M23 — Network utilities */
-  user_register_program("/bin/ifconfig", busybox_main);
-  user_register_program("/bin/ping", busybox_main);
-  user_register_program("/bin/nc", busybox_main);
-  user_register_program("/bin/wget", busybox_main);
-
-  /* M24 — Diagnostics */
-  user_register_program("/bin/dmesg", busybox_main);
+  /* M24 — Diagnostics (b1nix-specific, standalone handlers) */
   user_register_program("/bin/gpuinfo", gpuinfo_main);
   user_register_program("/bin/b1fetch", b1fetch_main);
   user_register_program("/bin/neofetch", b1fetch_main);
   user_register_program("/bin/meminfo", meminfo_main);
-
-  /* Misc */
-  user_register_program("/bin/true", busybox_main);
-  user_register_program("/bin/false", busybox_main);
-  user_register_program("/bin/test", busybox_main);
-  user_register_program("/bin/[", busybox_main);
-  user_register_program("/bin/yes", busybox_main);
-  user_register_program("/bin/sleep", busybox_main);
-  user_register_program("/bin/whoami", busybox_main);
-  user_register_program("/bin/id", busybox_main);
-  user_register_program("/bin/clear", busybox_main);
-  user_register_program("/bin/login", busybox_main);
-  user_register_program("/bin/reboot", busybox_main);
-  user_register_program("/bin/poweroff", busybox_main);
-  user_register_program("/bin/halt", busybox_main);
-  user_register_program("/bin/shutdown", busybox_main);
-
-  /* Also register the busybox dispatcher itself */
-  user_register_program("/bin/busybox", busybox_main);
 
   /* M16 — TUI Applications */
   user_register_program("/bin/mc", mc_main); /* Mini Commander file manager */

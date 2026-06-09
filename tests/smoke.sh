@@ -15,15 +15,13 @@ if [ "$ARCH" = "x86_64" ]; then
 else
 	DEFAULT_TIMEOUT=120
 fi
-# The optional upstream-BusyBox smoke (UPSTREAM_BUSYBOX=1) spawns ~45 extra ELF
-# loads; under TCG that overruns the tight default budgets (the i686 run already
-# lands near its 120s limit), so widen both arches when it is enabled.
-if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
-	if [ "$ARCH" = "x86_64" ]; then
-		DEFAULT_TIMEOUT=600
-	else
-		DEFAULT_TIMEOUT=300
-	fi
+# The upstream-BusyBox smoke spawns ~45 extra ELF loads; under TCG that overruns
+# the tight default budgets (the i686 run already lands near its 120s limit), so
+# widen both arches.
+if [ "$ARCH" = "x86_64" ]; then
+	DEFAULT_TIMEOUT=600
+else
+	DEFAULT_TIMEOUT=300
 fi
 TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}
@@ -197,7 +195,7 @@ if [ "${SKIP_BUILD:-0}" = "1" ]; then
 	test -f "build/$ARCH/b1nix.iso" || { echo "  ${RED}no prebuilt build/$ARCH/b1nix.iso${NC}"; exit 1; }
 	echo "  (SKIP_BUILD=1 — reusing build/$ARCH/b1nix.iso)"
 else
-	make ARCH="$ARCH" UPSTREAM_BUSYBOX="${UPSTREAM_BUSYBOX:-0}" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
+	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
 		echo "  ${RED}BUILD FAILED${NC}"
 		exit 1
 	}
@@ -487,7 +485,6 @@ check_output "$LOG" "M24-SMOKE: ok errno-mapping" "M24 userspace errno mapping v
 check_output "$LOG" "M24-SMOKE: ok diagnostics" "M24 userspace diagnostics verify"
 check_output "$LOG" "M22-POLISH: done" "M22 Polish completes successfully"
 
-if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	echo ""
 	section "Upstream BusyBox package"
 	check_output "$LOG" "BB-SMOKE: ok list" "busybox --list works"
@@ -592,7 +589,6 @@ if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
 	check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
 	check_output "$LOG" "BB-SMOKE: done" "BusyBox smoke completes"
-fi
 
 # ── M11 Shell & Utilities ──
 section "M11 Shell baseline"

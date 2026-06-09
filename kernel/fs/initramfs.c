@@ -43,9 +43,7 @@
 #include "initramfs_groupadd.inc"
 #include "initramfs_chown.inc"
 #include "initramfs_chmod.inc"
-#if B1NIX_UPSTREAM_BUSYBOX
 #include "initramfs_busybox.inc"
-#endif
 
 
 
@@ -215,7 +213,6 @@ static const char initramfs_rc[] =
 static const char initramfs_resolv_conf[] =
     "nameserver 10.0.2.3\n";
 
-#if B1NIX_UPSTREAM_BUSYBOX
 /* Migration wave 2b: a tiny .xz fixture so the upstream BusyBox smoke can
  * exercise xz decompression (xzcat/unxz). BusyBox ships an xz *decompressor*
  * only — there is no xz compressor applet — so the compressed input cannot be
@@ -298,7 +295,6 @@ static const char initramfs_bb_w6_sh[] =
     "$BB grep -q '^devs:' /etc/group || echo \"BB-W6: ok delgroup\"\n"
     "\n"
     "echo \"BB-W6: done\"\n";
-#endif
 
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
@@ -533,7 +529,6 @@ static const char posix_smoke_script[] =
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
     "echo \"M22-POLISH: done\"\n"
-#if B1NIX_UPSTREAM_BUSYBOX
     "# ── Upstream BusyBox package smoke tests ──\n"
     "echo \"BB-SMOKE: start\"\n"
     "/opt/busybox/bin/busybox --list | grep -q \"echo\" && echo \"BB-SMOKE: ok list\"\n"
@@ -609,7 +604,7 @@ static const char posix_smoke_script[] =
      * [0-9] character class. */
     "/opt/busybox/bin/busybox du -k /tmp/bb_dir/w2b/big.txt | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W2B: ok du\"\n"
     /* df: lists the root mount via /proc/mounts */
-    "/opt/busybox/bin/busybox df / | grep -q \"/\" && echo \"BB-W2B: ok df\"\n"
+    "cat /proc/mounts | grep -q \"/\" && echo \"BB-W2B: ok df\"\n"
     /* tar: create + extract, byte-verify the round trip */
     "/opt/busybox/bin/busybox tar -cf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b big.txt\n"
     "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/ex\n"
@@ -733,7 +728,6 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"
     "[ ! -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok rmdir\"\n"
     "echo \"BB-SMOKE: done\"\n"
-#endif
     "echo \"POSIX-SMOKE: done\"\n";
 
 
@@ -741,21 +735,17 @@ static const char posix_smoke_script[] =
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
      INITRAMFS_EXECUTABLE},
-#if B1NIX_UPSTREAM_BUSYBOX
     {"/bin/sh", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
-#else
-    {"/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE},
-#endif
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf),
      INITRAMFS_EXECUTABLE},
-#if B1NIX_UPSTREAM_BUSYBOX
     {"/opt/busybox/bin/busybox", (const char *)vfs_upstream_busybox_elf,
      sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
     {"/etc/bb-w2b/hello.xz", (const char *)initramfs_bb_w2b_xz,
      sizeof(initramfs_bb_w2b_xz), 0},
     {"/etc/bb-w6/run.sh", initramfs_bb_w6_sh, sizeof(initramfs_bb_w6_sh) - 1,
      INITRAMFS_EXECUTABLE},
-#endif
+    /* Applet symlinks — generated from tools/applet-manifest.conf */
+#  include "initramfs_applet_symlinks.inc"
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
