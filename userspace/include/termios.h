@@ -157,6 +157,7 @@ int tcsetattr(int fd, int optional_actions, const struct termios *termios_p);
 void cfmakeraw(struct termios *termios_p);
 pid_t tcgetpgrp(int fd);
 int tcsetpgrp(int fd, pid_t pgrp);
+pid_t tcgetsid(int fd);
 speed_t cfgetispeed(const struct termios *t);
 speed_t cfgetospeed(const struct termios *t);
 int cfsetispeed(struct termios *t, speed_t speed);

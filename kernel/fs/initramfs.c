@@ -229,6 +229,75 @@ static const unsigned char initramfs_bb_w2b_xz[] = {
     0x2d, 0x78, 0x7a, 0x2d, 0x4f, 0x4b, 0x0a, 0x00, 0x6d, 0xc4, 0xbc, 0x36,
     0x00, 0x01, 0x24, 0x0c, 0xa6, 0x18, 0xd8, 0xd8, 0x90, 0x42, 0x99, 0x0d,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a};
+
+/* Migration wave 6: account-management applet smoke (login/su/passwd suite).
+ * Driven by the upstream BusyBox ash so the shell semantics are real ($, $(...),
+ * regex grep) — the in-kernel builtin shell that runs the POSIX smoke script
+ * mangles '$' even inside single quotes, so this whole flow lives in a file that
+ * is executed with `/bin/sh /etc/bb-w6/run.sh`. Stored verbatim (file content,
+ * not shell-interpreted at storage time), so no '$' escaping is needed here.
+ *
+ * Every marker is gated on the real operation: addgroup/adduser/deluser/delgroup
+ * mutate /etc/group, /etc/passwd, /etc/shadow and the home dir; chpasswd writes
+ * a standard sha512-crypt ($6$) hash; passwd-verify recomputes that hash from the
+ * stored salt and byte-compares it (proving the password is verifiable); su
+ * actually drops root->user and the switched uid is read back. No fake markers. */
+static const char initramfs_bb_w6_sh[] =
+    "#!/bin/sh\n"
+    "BB=/opt/busybox/bin/busybox\n"
+    "echo \"BB-W6: start accounts\"\n"
+    "\n"
+    "# cryptpw: standard sha512-crypt of a known password with a fixed salt.\n"
+    "H=$($BB cryptpw -m sha512 -S w6salt secret)\n"
+    "case \"$H\" in\n"
+    "'$6$w6salt$'*) echo \"BB-W6: ok cryptpw\" ;;\n"
+    "esac\n"
+    "\n"
+    "# addgroup: create a group, verify its /etc/group record.\n"
+    "$BB addgroup devs\n"
+    "$BB grep -q '^devs:' /etc/group && echo \"BB-W6: ok addgroup\"\n"
+    "\n"
+    "# adduser: create a normal user with no password (-D), home dir, shell.\n"
+    "$BB adduser -D bob\n"
+    "$BB grep -q '^bob:' /etc/passwd && echo \"BB-W6: ok adduser\"\n"
+    "$BB grep -q '^bob:' /etc/shadow && echo \"BB-W6: ok adduser-shadow\"\n"
+    "[ -d /home/bob ] && echo \"BB-W6: ok adduser-home\"\n"
+    "BOB_UID=$($BB grep '^bob:' /etc/passwd | $BB cut -d: -f3)\n"
+    "\n"
+    "# chpasswd: set bob's password (sha512). A $6$ hash must land in shadow.\n"
+    "echo \"bob:hunter2\" | $BB chpasswd -c sha512\n"
+    "$BB grep -q '^bob:\\$6\\$' /etc/shadow && echo \"BB-W6: ok chpasswd\"\n"
+    "\n"
+    "# passwd-verify: recompute sha512-crypt('hunter2') with the stored salt and\n"
+    "# confirm it equals the stored hash — proves the password is verifiable.\n"
+    "STORED=$($BB grep '^bob:' /etc/shadow | $BB cut -d: -f2)\n"
+    "SALT=$(echo \"$STORED\" | $BB cut -d'$' -f3)\n"
+    "RECOMP=$($BB cryptpw -m sha512 -S \"$SALT\" hunter2)\n"
+    "[ \"$STORED\" = \"$RECOMP\" ] && echo \"BB-W6: ok passwd-verify\"\n"
+    "\n"
+    "# su: drop from root to bob, run a command, confirm the uid switched.\n"
+    "SU_UID=$($BB su bob -c \"$BB id -u\")\n"
+    "[ \"$SU_UID\" = \"$BOB_UID\" ] && echo \"BB-W6: ok su\"\n"
+    "\n"
+    "# passwd -l / -u: lock then unlock bob, observing the '!' shadow prefix.\n"
+    "$BB passwd -l bob >/dev/null 2>&1\n"
+    "$BB grep -q '^bob:!' /etc/shadow && echo \"BB-W6: ok passwd-lock\"\n"
+    "$BB passwd -u bob >/dev/null 2>&1\n"
+    "$BB grep -q '^bob:!' /etc/shadow || echo \"BB-W6: ok passwd-unlock\"\n"
+    "\n"
+    "# login/getty: present & dispatchable. A full session needs a dedicated tty\n"
+    "# and PID 1 stays with B1NIX, so this asserts the applet links and selects.\n"
+    "$BB --list | $BB grep -q '^login$' && echo \"BB-W6: ok login-applet\"\n"
+    "$BB --list | $BB grep -q '^getty$' && echo \"BB-W6: ok getty-applet\"\n"
+    "\n"
+    "# deluser/delgroup: tear the user and group back down, verify removal.\n"
+    "$BB deluser bob\n"
+    "$BB grep -q '^bob:' /etc/passwd || echo \"BB-W6: ok deluser\"\n"
+    "$BB grep -q '^bob:' /etc/shadow || echo \"BB-W6: ok deluser-shadow\"\n"
+    "$BB delgroup devs\n"
+    "$BB grep -q '^devs:' /etc/group || echo \"BB-W6: ok delgroup\"\n"
+    "\n"
+    "echo \"BB-W6: done\"\n";
 #endif
 
 static const char posix_smoke_script[] =
@@ -651,6 +720,11 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox printf 'i=0\\nwhile [ \\044i -lt 3 ]; do i=\\044((i+1)); done\\necho loop-ok \\044i\\n' > /tmp/bb_dir/w5-loop.sh\n"
     "/bin/sh /tmp/bb_dir/w5-loop.sh | /opt/busybox/bin/busybox grep -q \"loop-ok 3\" && echo \"BB-W5: ok arith-loop\"\n"
     "echo \"BB-W5: done\"\n"
+    /* ── Migration wave 6: account management (login/su/passwd suite). ──
+     * The whole flow lives in /etc/bb-w6/run.sh and runs under real ash so the
+     * '$'-heavy account logic (hashes, command substitution, regex grep) is not
+     * mangled by the in-kernel builtin shell. */
+    "/bin/sh /etc/bb-w6/run.sh\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"
@@ -679,6 +753,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
     {"/etc/bb-w2b/hello.xz", (const char *)initramfs_bb_w2b_xz,
      sizeof(initramfs_bb_w2b_xz), 0},
+    {"/etc/bb-w6/run.sh", initramfs_bb_w6_sh, sizeof(initramfs_bb_w6_sh) - 1,
+     INITRAMFS_EXECUTABLE},
 #endif
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},

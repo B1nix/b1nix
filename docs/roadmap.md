@@ -823,7 +823,8 @@ upstream applets pass the same workflows.
     `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
     `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
     `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
-- [ ] `partial` Migration wave 5, shell/login/account applets. Enable upstream
+- [x] `done` Migration wave 5, shell/login/account applets (account applets
+  closed in wave 6 below). Enable upstream
   `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
   `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
   available. **Prerequisites are now done and verified** (`M42-W5PRE` smoke,
@@ -857,10 +858,36 @@ upstream applets pass the same workflows.
   (`kernel/lib/klog.c`). Result: upstream-BusyBox smoke **197/283 → 480/0** on
   x86 and x86_64 (single-CPU + `-smp 4`, fully green); `BB-W5` and the whole
   `M32B-SSH` suite (`dropbearkey`/`handshake`/`negauth`/`pty`/`service-lifecycle`)
-  pass. Treat `getty`, `login`, `su` and account-management applets as a separate
-  security-sensitive gate. Do not enable or promote BusyBox `init`: the existing
-  B1NIX init remains PID 1, and its configurable service model is developed
-  separately in M39.
+  pass. Do not enable or promote BusyBox `init`: the existing B1NIX init remains
+  PID 1, and its configurable service model is developed separately in M39.
+- [x] `done` Migration wave 6, account-management applets (`login`/`su`/`passwd`
+  suite) behind the security-sensitive `UPSTREAM_BUSYBOX` gate. Enabled upstream
+  `login`, `su`, `passwd`, `chpasswd`, `cryptpw`, `adduser`, `deluser`,
+  `addgroup`, `delgroup`, `getty` with BusyBox's own internal pwd/grp/shadow
+  parsers and SHA-256/512 crypt (`USE_BB_PWD_GRP`/`USE_BB_SHADOW`/`USE_BB_CRYPT`/
+  `USE_BB_CRYPT_SHA`, default algo `sha512`). The applets are fully self-contained:
+  they read/write `/etc/passwd`, `/etc/shadow`, `/etc/group` and hash new
+  passwords with standard `$6$` sha512-crypt. New `BB-W6` smoke
+  (`/etc/bb-w6/run.sh`, run under real ash) exercises the whole flow end to end —
+  cryptpw → addgroup → adduser (passwd+shadow+group+home) → chpasswd → a
+  recompute-and-compare **passwd-verify** (proves the stored hash is verifiable)
+  → `su` root→user with a read-back uid switch → passwd lock/unlock → login/getty
+  applet presence → deluser/delgroup teardown. Both arches **481/0 → 497/0**
+  (single-CPU + `-smp 4`). Two reusable libc additions the applets needed: GNU
+  `getopt_long`/`getopt_long_only` + `<getopt.h>` (`adduser` selects `LONG_OPTS`)
+  and `tcgetsid` (`getty`), both in `userspace/libc/`. BusyBox `init` stays
+  disabled; B1NIX remains PID 1.
+- [x] `done` Fix `vfs_rename()` self-deadlock when replacing an existing target
+  in the same directory (e.g. `rename("/etc/passwd+", "/etc/passwd")`, the atomic
+  pattern every BusyBox account applet uses via `update_passwd`). The replace path
+  called the lock-taking `vfs_remove_node()` for the existing target while already
+  holding the new-parent inode lock, re-acquiring the same lock and wedging the
+  CPU (single-CPU: full hang; the smoke driver hit its 120 s timeout). Never seen
+  before because no tested path renamed onto an existing same-dir file — `mv a b`
+  smoke only renamed to a *new* name. Fixed by extracting `vfs_remove_child_locked`
+  (assumes the parent inode lock is held) and calling it from both
+  `vfs_remove_node` (which takes the lock) and the rename replace path
+  (`kernel/fs/vfs.c`). `BB-W6: ok addgroup/adduser/chpasswd/deluser` cover it.
 - [x] `done` Reap orphaned daemon zombies (closed `M32B-SSH: service-lifecycle`).
   After the sshd init script `stop`s the daemon it becomes a zombie; `kill(pid,0)`
   correctly reports it alive until reaped, but its shell parent had already

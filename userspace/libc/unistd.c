@@ -949,6 +949,19 @@ pid_t getsid(pid_t pid) {
   return _check_err(syscall(SYS_GETSID, pid));
 }
 
+/* POSIX tcgetsid(): the session ID of the session for which `fd` is the
+ * controlling terminal. b1nix has no per-tty session query (no TIOCGSID), so
+ * this is a best-effort: fd must be a terminal (else ENOTTY), and the answer is
+ * the caller's own session — correct whenever fd is the caller's controlling
+ * terminal, which is how getty/login use it. */
+pid_t tcgetsid(int fd) {
+  if (!isatty(fd)) {
+    errno = ENOTTY;
+    return -1;
+  }
+  return getsid(0);
+}
+
 int getrlimit(int resource, struct rlimit *rlim) {
   return _check_err(syscall(SYS_GETRLIMIT, resource, rlim));
 }

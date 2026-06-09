@@ -2941,75 +2941,52 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
   return 0;
 }
 
-static int vfs_remove_node(const char *path, int is_rmdir) {
-  int res = 0;
-  char r_path[VFS_MAX_PATH];
-  vfs_resolve_path(path, r_path);
-  char p_path[VFS_MAX_PATH], name[64];
-  split_parent_path(r_path, p_path, name);
-  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-    return -EINVAL;
-
-  struct vfs_node *parent = vfs_find_node(p_path);
-  if (IS_ERR(parent))
-    return (int)PTR_ERR(parent);
-
-  vfs_inode_lock(parent->inode);
+/* Core child-removal logic. The caller MUST already hold parent->inode's lock
+ * and a ref on parent; this neither locks/unlocks the inode nor drops the
+ * parent ref. `r_path` is the fully-resolved path of the child (used only for
+ * the mount-point guard); `name` is its final component. Shared by
+ * vfs_remove_node (which takes the lock) and vfs_rename_internal, which already
+ * holds the new-parent lock when replacing an existing rename target — calling
+ * the lock-taking vfs_remove_node there self-deadlocks on the parent inode. */
+static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
+                                   const char *name, int is_rmdir) {
   struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
-  if (mnt && (mnt->flags & MS_RDONLY)) {
-    res = -EROFS;
-    goto out_unlock;
-  }
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
   const struct cred *cred = get_current_cred();
-  if (cred && !vfs_get_node_perm(parent, cred, 2)) {
-    res = -EACCES;
-    goto out_unlock;
-  }
+  if (cred && !vfs_get_node_perm(parent, cred, 2))
+    return -EACCES;
 
   /* Защита точек монтирования */
   for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, r_path) == 0) {
-      res = -EBUSY;
-      goto out_unlock;
-    }
+    if (mounts[i].used && strcmp(mounts[i].target, r_path) == 0)
+      return -EBUSY;
   }
 
   struct vfs_node *prev = 0, *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
       if (cred && (parent->inode->mode & B1NIX_S_ISVTX)) {
-        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid) {
-          res = -EACCES;
-          goto out_unlock;
-        }
+        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid)
+          return -EACCES;
       }
       if (is_rmdir) {
-        if (child->inode->type != VFS_DIRECTORY) {
-          res = -ENOTDIR;
-          goto out_unlock;
-        }
-        if (child->first_child) {
-          res = -ENOTEMPTY;
-          goto out_unlock;
-        }
+        if (child->inode->type != VFS_DIRECTORY)
+          return -ENOTDIR;
+        if (child->first_child)
+          return -ENOTEMPTY;
       } else {
-        if (child->inode->type == VFS_DIRECTORY) {
-          res = -EISDIR;
-          goto out_unlock;
-        }
+        if (child->inode->type == VFS_DIRECTORY)
+          return -EISDIR;
       }
       if (parent->inode->unlink_cb && !is_rmdir) {
         int err = parent->inode->unlink_cb(parent, name);
-        if (err < 0) {
-          res = err;
-          goto out_unlock;
-        }
+        if (err < 0)
+          return err;
       } else if (parent->inode->rmdir_cb && is_rmdir) {
         int err = parent->inode->rmdir_cb(parent, name);
-        if (err < 0) {
-          res = err;
-          goto out_unlock;
-        }
+        if (err < 0)
+          return err;
       }
 
       vfs_node_get(child);
@@ -3028,15 +3005,28 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
       }
       vfs_node_put(child);
       dcache_invalidate(parent, name);
-      res = 0;
-      goto out_unlock;
+      return 0;
     }
     prev = child;
     child = child->next_sibling;
   }
-  res = -ENOENT;
+  return -ENOENT;
+}
 
-out_unlock:
+static int vfs_remove_node(const char *path, int is_rmdir) {
+  char r_path[VFS_MAX_PATH];
+  vfs_resolve_path(path, r_path);
+  char p_path[VFS_MAX_PATH], name[64];
+  split_parent_path(r_path, p_path, name);
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+    return -EINVAL;
+
+  struct vfs_node *parent = vfs_find_node(p_path);
+  if (IS_ERR(parent))
+    return (int)PTR_ERR(parent);
+
+  vfs_inode_lock(parent->inode);
+  int res = vfs_remove_child_locked(parent, r_path, name, is_rmdir);
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
   return res;
@@ -3364,7 +3354,11 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
       res = -ENOTEMPTY;
       goto out_unlock;
     }
-    vfs_remove_node(new_res, 0);
+    /* Drop the existing target in place: new_parent->inode is already locked
+     * here, so the lock-taking vfs_remove_node() would self-deadlock on it
+     * (e.g. `rename("/etc/passwd+", "/etc/passwd")`). The `existing` ref is
+     * released at out_put_parents. */
+    vfs_remove_child_locked(new_parent, new_res, new_n, 0);
   }
 
   /* Move the node between parents under the vfs_tree_lock write side
