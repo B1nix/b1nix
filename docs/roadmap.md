@@ -834,10 +834,58 @@ upstream applets pass the same workflows.
   `FNM_PATHNAME`) and POSIX `regex` (intervals, named classes), plus
   signal-interruptible `waitpid` (EINTR) and `SIGSTOP`/`SIGCONT` job control
   with SIGCHLD notification. x86 + x86_64 smoke 394/0 (single-CPU + `-smp 4`).
-  Still **planned**: actually enabling the upstream `ash` shell. Treat `getty`,
-  `login`, `su` and account-management applets as a separate security-sensitive
-  gate. Do not enable or promote BusyBox `init`: the existing B1NIX init remains
-  PID 1, and its configurable service model is developed separately in M39.
+  **Upstream `ash` is now enabled and `/bin/sh` points at it** (BusyBox config
+  `CONFIG_SH_IS_ASH=y`; `/bin/sh` → `/opt/busybox/bin/busybox` under
+  `B1NIX_UPSTREAM_BUSYBOX`). New `BB-W5` smoke (`kernel/fs/initramfs.c` +
+  `tests/smoke.sh`) covers `ash`/`sh` applet listing, `-c`, variable
+  assignment+`test`, arithmetic, pipelines, redirection and child wait — all
+  green, and `M32B-SSH: ok pty` (interactive `ash` over a remote PTY) passes.
+  Enabling interactive `ash` surfaced a latent kernel bug: **`/dev/tty` had no
+  `poll_cb`**, so `node_poll` jumped through an uninitialised pointer the first
+  time anything polled the console (the old builtin shell never did). Fixed by
+  adding `tty_poll` (`kernel/fs/vfs.c`) + `ps2_kbd_has_data()`
+  (`kernel/dev/ps2_kbd.c`). Two further real fixes the bring-up needed: a genuine
+  **`/dev/null`** device node (the builtin shell faked `2>/dev/null`, but `ash`
+  really `open()`s it) and **`kill(pid, 0)` existence-probe semantics**
+  (`scheduler_kill`/`scheduler_kill_process_group` rejected `sig 0`; the sshd
+  init-script `status` arm depends on `kill -0`). `/bin/dropbear` was also
+  rebuilt against the current libc (it predated the `4ab0fd3` `sa_restorer`
+  fix and was crashing on SIGCHLD). Result: upstream-BusyBox smoke **197/283 →
+  478/2** on x86 and x86_64 (single-CPU + `-smp 4`); `BB-W5` (incl. `vars`,
+  `math`, `pipe`, `redir`, `wait`) and `M32B-SSH` `dropbearkey`/`handshake`/
+  `negauth`/`pty`/`service-status` all green. Treat `getty`, `login`, `su` and
+  account-management applets as a separate security-sensitive gate. Do not enable
+  or promote BusyBox `init`: the existing B1NIX init remains PID 1, and its
+  configurable service model is developed separately in M39.
+- [ ] `planned` Reap reparented/daemon zombies (closes `M32B-SSH:
+  service-lifecycle`, the one remaining SSH red). After the sshd init script
+  `stop`s the daemon it becomes a zombie; `kill(pid,0)` correctly still reports
+  it alive until reaped, so the test's "process gone" check fails. Two gaps:
+  (1) orphans are never reparented when their parent exits — they keep a dead
+  `parent_id` and no one reaps them; (2) in test mode `/bin/init` is the smoke
+  driver, not a general orphan-reaper. A first attempt to reparent orphans to
+  init inside `scheduler_exit_current` was reverted because the unsynchronised
+  task-table walk raced under `-smp 4` (GPF in `user_process_thread` on the M30
+  PIE load). The real fix needs SMP-safe reparenting (under the task-table lock)
+  plus a real reaper for orphaned zombies. This was previously masked because
+  `kill(pid,0)` always failed; it is now honestly exposed. (Separately: `ash`
+  SIGSEGVs on a `while [ $i -lt N ]; …; i=$((i+1)); done` poll loop — a distinct
+  ash/arith bug to investigate.)
+- [ ] `planned` Harden kernel signal delivery so it does not depend on a valid
+  userspace `sa_restorer`. Today `arch_build_signal_frame`
+  (`kernel/arch/x86/signal.c`) sets the handler's return address to the
+  caller-supplied `sa_restorer`; a stale/garbage value (as in the pre-`4ab0fd3`
+  dropbear binary above) makes the handler "return" into hyperspace and crashes
+  the process. Provide a kernel-injected `sigreturn` trampoline instead (e.g. a
+  tiny `mov $SYS_SIGRETURN,%eax; int $0x80` written by the kernel into the signal
+  frame on the user stack, or a fixed kernel-mapped trampoline page / vDSO-style
+  region) and point the handler's return there, ignoring (or only using as a
+  fallback) the userspace `sa_restorer`. This makes signal handling robust for
+  any binary regardless of which libc it was linked against — the
+  forward-compatible complement to the libc-side `4ab0fd3` fix. Note: the
+  on-stack variant needs an executable user stack on the 32-bit port; the
+  mapped-trampoline variant avoids that. Also reset `sa_restorer`/`sa_flags`
+  (not just `sa_handler`) across `execve` in `kernel/user/process.c` while here.
 - [ ] `planned` Introduce an explicit applet-selection manifest for `/bin`
   replacement. For each migrated command, compare native and upstream behavior
   against existing M11/M22/M33 tests, add BusyBox-specific regression coverage,

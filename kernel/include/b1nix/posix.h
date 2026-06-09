@@ -22,6 +22,7 @@
 #define B1NIX_S_ISGID 0002000
 #define B1NIX_S_ISVTX 0001000
 
+#define B1NIX_F_DUPFD 0
 #define B1NIX_F_GETFL 3
 #define B1NIX_F_SETFL 4
 #define B1NIX_F_GETFD 1

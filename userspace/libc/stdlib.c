@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "syscall.h"
 #include <errno.h>
 #include <math.h>
@@ -909,6 +910,42 @@ int sigismember(const sigset_t *set, int signum) {
   }
   return (*set & (1UL << (signum - 1))) ? 1 : 0;
 }
+
+char *strsignal(int sig) {
+  static char unknown[24];
+  switch (sig) {
+  case SIGABRT: return "Aborted";
+  case SIGALRM: return "Alarm clock";
+  case SIGBUS: return "Bus error";
+  case SIGCHLD: return "Child exited";
+  case SIGCONT: return "Continued";
+  case SIGFPE: return "Floating point exception";
+  case SIGHUP: return "Hangup";
+  case SIGILL: return "Illegal instruction";
+  case SIGINT: return "Interrupt";
+  case SIGKILL: return "Killed";
+  case SIGPIPE: return "Broken pipe";
+  case SIGQUIT: return "Quit";
+  case SIGSEGV: return "Segmentation fault";
+  case SIGSTOP: return "Stopped";
+  case SIGTERM: return "Terminated";
+  case SIGTSTP: return "Stopped";
+  case SIGTTIN: return "Stopped (tty input)";
+  case SIGTTOU: return "Stopped (tty output)";
+  case SIGUSR1: return "User signal 1";
+  case SIGUSR2: return "User signal 2";
+  case SIGSYS: return "Bad system call";
+  case SIGTRAP: return "Trace/breakpoint trap";
+  case SIGXCPU: return "CPU time limit exceeded";
+  case SIGXFSZ: return "File size limit exceeded";
+  case SIGVTALRM: return "Virtual timer expired";
+  case SIGWINCH: return "Window changed";
+  default:
+    snprintf(unknown, sizeof(unknown), "Signal %d", sig);
+    return unknown;
+  }
+}
+
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
   if (rc < 0) {

@@ -777,7 +777,9 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
 void virtio_blk_init(void);
 #ifndef __aarch64__
 extern char ps2_kbd_getc(void);
+extern int ps2_kbd_has_data(void);
 #endif
+int serial_has_data(void);
 
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
@@ -1813,6 +1815,54 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
   return (isize)size;
 }
 
+/* /dev/null: reads return EOF, writes are discarded, always ready to poll. */
+static isize null_read(struct vfs_node *node, u64 offset, char *buffer,
+                       usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)size;
+  (void)flags;
+  return 0;
+}
+
+static isize null_write(struct vfs_node *node, u64 offset, const char *buffer,
+                        usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)flags;
+  return (isize)size;
+}
+
+static int null_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  pfd->revents = B1NIX_POLLIN | B1NIX_POLLOUT;
+  return 0;
+}
+
+static void null_init_node(void) {
+  struct vfs_node *n = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
+  if (n) {
+    n->inode->read_cb = null_read;
+    n->inode->write_cb = null_write;
+    n->inode->poll_cb = null_poll;
+    n->inode->mode =
+        VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
+  }
+}
+
+static int tty_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  short revents = B1NIX_POLLOUT; /* the console is always writable */
+#ifndef __aarch64__
+  if (ps2_kbd_has_data() || serial_has_data())
+    revents |= B1NIX_POLLIN;
+#endif
+  pfd->revents = revents;
+  return 0;
+}
+
 static void tty_init_node(void) {
   memset(&console.termios, 0, sizeof(console.termios));
   console.termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
@@ -1823,6 +1873,7 @@ static void tty_init_node(void) {
   if (tty) {
     tty->inode->read_cb = tty_read;
     tty->inode->write_cb = tty_write;
+    tty->inode->poll_cb = tty_poll;
     tty->inode->mode =
         VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
   }
@@ -1884,6 +1935,7 @@ void vfs_init(void) {
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
+  null_init_node();
   vfs_init_stdio();
 
 #ifndef __aarch64__
@@ -1933,6 +1985,17 @@ void vfs_repopulate_after_root_mount(void) {
   node = add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) {
     node->inode->mode = 0755;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->read_cb = null_read;
+    node->inode->write_cb = null_write;
+    node->inode->poll_cb = null_poll;
+    node->inode->mode = 0666;
     node->inode->uid = 0;
     node->inode->gid = 0;
     vfs_node_put(node);
@@ -3680,6 +3743,31 @@ int vfs_dup(int oldfd) {
   return newfd;
 }
 
+static int vfs_dup_min(int oldfd, int minfd) {
+  struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
+  if (!old_handle)
+    return -EBADF;
+  if (minfd < 0 || (usize)minfd >= SCHED_MAX_FD_LIMIT)
+    return -EINVAL;
+
+  usize limit = SCHED_MAX_FD_LIMIT;
+  struct rlimit rlim;
+  if (scheduler_getrlimit(RLIMIT_NOFILE, &rlim) == 0 && rlim.rlim_cur < limit)
+    limit = rlim.rlim_cur;
+  if ((usize)minfd >= limit)
+    return -EMFILE;
+
+  for (usize fd = (usize)minfd; fd < limit; fd++) {
+    if (scheduler_fd_get((int)fd) == 0) {
+      if (scheduler_fd_set((int)fd, old_handle) < 0)
+        return -EMFILE;
+      vfs_handle_retain(old_handle);
+      return (int)fd;
+    }
+  }
+  return -EMFILE;
+}
+
 int vfs_dup2(int oldfd, int newfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
@@ -3846,6 +3934,8 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
   if (!h)
     return -1;
   switch (cmd) {
+  case B1NIX_F_DUPFD:
+    return vfs_dup_min(fd, (int)arg);
   case B1NIX_F_GETFD:
     return scheduler_fd_flags_get(fd);
   case B1NIX_F_SETFD:

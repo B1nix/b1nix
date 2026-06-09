@@ -19,6 +19,7 @@
 #include <errno.h>
 #include <sys/klog.h>
 #include <sys/sysinfo.h>
+#include <sys/times.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -846,6 +847,10 @@ int kill(int pid, int sig) {
   return _check_err(syscall(SYS_KILL, pid, sig));
 }
 
+int killpg(int pgrp, int sig) {
+  return kill(-pgrp, sig);
+}
+
 pid_t wait(int *wstatus) {
   /* POSIX wait(status) == waitpid(-1, status, 0): reap any child. Route via
    * SYS_WAITPID (kernel SYS_WAIT uses a different in-kernel (pid,status) ABI). */
@@ -1322,6 +1327,23 @@ long sysconf(int name) {
   }
   errno = EINVAL;
   return -1;
+}
+
+clock_t times(struct tms *buf) {
+  if (buf) {
+    buf->tms_utime = 0;
+    buf->tms_stime = 0;
+    buf->tms_cutime = 0;
+    buf->tms_cstime = 0;
+  }
+
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL) < 0) {
+    return (clock_t)-1;
+  }
+
+  return (clock_t)tv.tv_sec * sysconf(_SC_CLK_TCK) +
+         (clock_t)((tv.tv_usec * sysconf(_SC_CLK_TCK)) / 1000000);
 }
 
 pid_t vfork(void) {

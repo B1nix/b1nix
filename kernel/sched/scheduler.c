@@ -2426,12 +2426,18 @@ static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
 }
 
 int scheduler_kill(usize task_id, int sig) {
-  if (sig < 1 || sig >= NSIG)
+  if (sig < 0 || sig >= NSIG)
     return -1;
 
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
+      /* Signal 0 is the POSIX existence/permission probe: the target was just
+       * found alive, so report success without posting any signal. */
+      if (sig == 0) {
+        interrupts_restore(flags);
+        return 0;
+      }
       /* SIGKILL and SIGSTOP cannot be blocked/ignored. Atomic RMW: post-BKL
        * the target task (or another killer) may concurrently set/clear its own
        * pending bits, so a plain |= would drop a racing update. */
@@ -2473,13 +2479,19 @@ int scheduler_kill(usize task_id, int sig) {
 }
 
 int scheduler_kill_process_group(usize pgrp, int sig) {
-  if (sig < 1 || sig >= NSIG || pgrp == 0)
+  if (sig < 0 || sig >= NSIG || pgrp == 0)
     return -1;
 
   int sent = 0;
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+      /* Signal 0: existence probe only — the group has a live member, so
+       * count it as found without posting anything. */
+      if (sig == 0) {
+        sent++;
+        continue;
+      }
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
 

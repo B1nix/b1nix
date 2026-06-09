@@ -366,3 +366,11 @@ char ps2_kbd_getc(void)
 	__atomic_store_n(&kbd_tail, (tail + 1) % KBD_BUFFER_SIZE, __ATOMIC_RELEASE);
 	return c;
 }
+
+/* Non-consuming readiness probe used by the tty poll path. */
+int ps2_kbd_has_data(void)
+{
+	usize tail = __atomic_load_n(&kbd_tail, __ATOMIC_RELAXED);
+	usize head = __atomic_load_n(&kbd_head, __ATOMIC_ACQUIRE);
+	return head != tail;
+}

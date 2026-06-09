@@ -98,6 +98,15 @@ char *strncpy(char *dest, const char *src, size_t n)
 	return dest;
 }
 
+char *stpncpy(char *dest, const char *src, size_t n)
+{
+	size_t i;
+	for (i = 0; i < n && src[i]; i++) dest[i] = src[i];
+	char *end = dest + i;
+	for (; i < n; i++) dest[i] = '\0';
+	return end;
+}
+
 char *strchr(const char *s, int c)
 {
 	while (*s) {
@@ -280,6 +289,26 @@ char *strtok(char *str, const char *delim) {
             d++;
         }
         last++;
+    }
+    return start;
+}
+
+char *strtok_r(char *str, const char *delim, char **saveptr) {
+    if (!saveptr) return NULL;
+    char *s = str ? str : *saveptr;
+    if (!s || *s == '\0') return NULL;
+    while (*s && strchr(delim, *s)) s++;
+    if (*s == '\0') {
+        *saveptr = NULL;
+        return NULL;
+    }
+    char *start = s;
+    while (*s && !strchr(delim, *s)) s++;
+    if (*s) {
+        *s++ = '\0';
+        *saveptr = s;
+    } else {
+        *saveptr = NULL;
     }
     return start;
 }
@@ -468,4 +497,3 @@ int strverscmp(const char *s1, const char *s2) {
     return state;
   }
 }
-

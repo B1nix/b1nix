@@ -625,9 +625,28 @@ static const char posix_smoke_script[] =
     /* ip uses rtnetlink (AF_NETLINK); RTM_GETLINK lists the eth0 interface. */
     "/opt/busybox/bin/busybox ip link show 2>&1 | /opt/busybox/bin/busybox grep -q \"eth0\" && echo \"BB-W4B: ok ip\"\n"
     "echo \"BB-W4: done\"\n"
+    /* ── Migration wave 5: upstream ash/sh shell bring-up. ── */
+    "echo \"BB-W5: start ash\"\n"
+    "/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q \"^ash$\" && echo \"BB-W5: ok list-ash\"\n"
+    "/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q \"^sh$\" && echo \"BB-W5: ok list-sh\"\n"
+    "/opt/busybox/bin/busybox ash -c 'echo ash-ok' | /opt/busybox/bin/busybox grep -q \"ash-ok\" && echo \"BB-W5: ok ash-c\"\n"
+    "/opt/busybox/bin/busybox sh -c 'echo sh-ok' | /opt/busybox/bin/busybox grep -q \"sh-ok\" && echo \"BB-W5: ok busybox-sh-c\"\n"
+    "/bin/sh -c 'echo bin-sh-ok' | /opt/busybox/bin/busybox grep -q \"bin-sh-ok\" && echo \"BB-W5: ok bin-sh-c\"\n"
+    /* Drive ash variable expansion from a script file: the in-kernel builtin
+     * shell that runs this smoke script expands $VAR even inside single quotes,
+     * so a literal '$x' on the command line would be eaten before ash sees it.
+     * Emitting the '$' via printf's \044 octal escape keeps it out of the outer
+     * shell entirely; ash then parses and expands $x itself. */
+    "/opt/busybox/bin/busybox printf 'x=7\\ntest \"\\044x\" = 7 && echo var-ok\\n' > /tmp/bb_dir/w5-vars.sh\n"
+    "/bin/sh /tmp/bb_dir/w5-vars.sh | /opt/busybox/bin/busybox grep -q \"var-ok\" && echo \"BB-W5: ok vars\"\n"
+    "/bin/sh -c 'echo $((2 + 3))' | /opt/busybox/bin/busybox grep -q \"5\" && echo \"BB-W5: ok math\"\n"
+    "/bin/sh -c 'printf \"a\\\\nb\\\\n\" | grep -q b && echo pipe-ok' | /opt/busybox/bin/busybox grep -q \"pipe-ok\" && echo \"BB-W5: ok pipe\"\n"
+    "/bin/sh -c 'echo redir-ok > /tmp/bb_dir/w5-redir; cat /tmp/bb_dir/w5-redir' | /opt/busybox/bin/busybox grep -q \"redir-ok\" && echo \"BB-W5: ok redir\"\n"
+    "/bin/sh -c 'sleep 0; echo wait-ok' | /opt/busybox/bin/busybox grep -q \"wait-ok\" && echo \"BB-W5: ok wait\"\n"
+    "echo \"BB-W5: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
-    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq\n"
+    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh\n"
     "[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo \"BB-SMOKE: ok rm\"\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file\n"
     "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"
@@ -641,7 +660,11 @@ static const char posix_smoke_script[] =
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
      INITRAMFS_EXECUTABLE},
+#if B1NIX_UPSTREAM_BUSYBOX
+    {"/bin/sh", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
+#else
     {"/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE},
+#endif
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf),
      INITRAMFS_EXECUTABLE},
 #if B1NIX_UPSTREAM_BUSYBOX

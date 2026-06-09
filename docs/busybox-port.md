@@ -346,12 +346,37 @@ transferring ownership of the boot process to BusyBox.
 
 ### Migration wave 5: shell, login and accounts
 
-The next migration wave combines the earlier upstream-`ash` and privileged
+This migration wave combines the earlier upstream-`ash` and privileged
 login/account work:
 
-- bring up `ash` under `/opt/busybox/bin/ash` without replacing `/bin/sh`;
+- **`ash` is enabled and `/bin/sh` now points at it** (in progress). BusyBox is
+  configured `CONFIG_SH_IS_ASH=y`; `/bin/sh` is a symlink to
+  `/opt/busybox/bin/busybox` under `B1NIX_UPSTREAM_BUSYBOX`. The `BB-W5:` smoke
+  markers cover applet listing, `-c`, variables + `test`, arithmetic, pipes,
+  redirection and child wait, and the interactive `M32B-SSH: ok pty` test runs a
+  command through `ash` over a remote PTY. Bringing it up exposed and fixed a
+  latent kernel gap — `/dev/tty` had no `poll_cb`, so the first `poll()` on the
+  console (which the old builtin shell never issued but `ash`'s line editor does)
+  jumped through an uninitialised pointer and panicked. Fixed with `tty_poll`
+  (`kernel/fs/vfs.c`) + `ps2_kbd_has_data()` (`kernel/dev/ps2_kbd.c`). Two more
+  real fixes followed: a genuine **`/dev/null`** node (the builtin shell faked
+  `2>/dev/null`; `ash` really opens it) and **`kill(pid,0)` existence-probe
+  semantics** (the kernel rejected `sig 0`, breaking the sshd `status` arm's
+  `kill -0`). `/bin/dropbear` was also **rebuilt** against the current libc (it
+  predated the `4ab0fd3` `sa_restorer` fix and was crashing on SIGCHLD; dropbear
+  builds with clang via `tools/b1nix-autotools-cc`, so no cross-GCC is needed).
+  Upstream-BusyBox smoke went **197/283 → 478/2** on x86 and x86_64; `BB-W5` and
+  `M32B-SSH` `dropbearkey`/`handshake`/`negauth`/`pty`/`service-status` are green.
+- **One remaining SSH red — `M32B-SSH: service-lifecycle`:** after `stop`, the
+  daemon is a zombie that nothing reaps (orphans are not reparented on parent
+  exit, and test-mode `/bin/init` is the smoke driver, not a general reaper), so
+  the test's `kill(pid,0)` "process gone" check fails. This was masked before by
+  the broken `kill -0`. Tracked as `planned` in `docs/roadmap.md` (needs SMP-safe
+  orphan reparenting + a real zombie reaper). A kernel-injected `sigreturn`
+  trampoline (so delivery never trusts a userspace `sa_restorer`) is also tracked
+  there as a forward-compatible hardening.
 - enable `getty`, `login`, `su`, `passwd` and account-management applets behind
-  a security-sensitive test gate;
+  a security-sensitive test gate (not yet done);
 - leave `/bin/init`, `/etc/rc` and PID 1 service supervision owned by B1NIX.
 
 BusyBox `init` is not a migration target. Replacing the current shell or login
