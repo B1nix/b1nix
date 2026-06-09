@@ -643,10 +643,17 @@ static const char posix_smoke_script[] =
     "/bin/sh -c 'printf \"a\\\\nb\\\\n\" | grep -q b && echo pipe-ok' | /opt/busybox/bin/busybox grep -q \"pipe-ok\" && echo \"BB-W5: ok pipe\"\n"
     "/bin/sh -c 'echo redir-ok > /tmp/bb_dir/w5-redir; cat /tmp/bb_dir/w5-redir' | /opt/busybox/bin/busybox grep -q \"redir-ok\" && echo \"BB-W5: ok redir\"\n"
     "/bin/sh -c 'sleep 0; echo wait-ok' | /opt/busybox/bin/busybox grep -q \"wait-ok\" && echo \"BB-W5: ok wait\"\n"
+    /* ash arithmetic-in-while-loop regression: $((i+1)) drives strtoull, which
+     * must advance its endptr past a leading-0 number ("0+1") or ash's arith
+     * parser spins forever and overflows its value stack. Driven from a script
+     * file so the in-kernel builtin shell does not pre-expand the '$' (the '$'
+     * is emitted via printf's \044). */
+    "/opt/busybox/bin/busybox printf 'i=0\\nwhile [ \\044i -lt 3 ]; do i=\\044((i+1)); done\\necho loop-ok \\044i\\n' > /tmp/bb_dir/w5-loop.sh\n"
+    "/bin/sh /tmp/bb_dir/w5-loop.sh | /opt/busybox/bin/busybox grep -q \"loop-ok 3\" && echo \"BB-W5: ok arith-loop\"\n"
     "echo \"BB-W5: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
-    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh\n"
+    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"
     "[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo \"BB-SMOKE: ok rm\"\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file\n"
     "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"

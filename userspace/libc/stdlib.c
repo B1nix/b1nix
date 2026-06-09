@@ -350,16 +350,19 @@ long strtol(const char *nptr, char **endptr, int base)
 				base = 16;
 				s += 2;
 			} else {
+				/* Leading 0 selects octal, but the 0 is itself a digit: do
+				 * NOT skip it, or a "0" followed by a non-octal char (e.g.
+				 * "0+1") would consume no digits, leave any==0, and report
+				 * endptr==nptr — making strtoull-driven parsers (ash's
+				 * arithmetic) spin forever on a stuck cursor. The digit loop
+				 * below consumes the 0. */
 				base = 8;
-				s++;
 			}
 		} else {
 			base = 10;
 		}
 	} else if (base == 16) {
 		if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-	} else if (base == 8) {
-		if (s[0] == '0') s++;
 	}
 
 	if (base == 0) base = 10;

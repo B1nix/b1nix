@@ -405,7 +405,7 @@ $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(US
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/bin/m32_pcre2_smoke > $@
 
-$(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc
+$(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-curl.sh
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
@@ -414,7 +414,7 @@ $(INITRAMFS_CURL_INC): $(CURL_ELF)
 
 # Dropbear SSH server (dropbearmulti: server + dropbearkey + dropbearconvert,
 # dispatched by argv[0]). Built static against the b1nix userspace libc.
-$(DROPBEAR_ELF): tools/build-dropbear.sh tools/b1nix-autotools-cc
+$(DROPBEAR_ELF): tools/build-dropbear.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/build-dropbear.sh all >/dev/null
 
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
@@ -465,7 +465,7 @@ $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) us
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
 
-$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config
+$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_upstream_busybox_elf build/busybox-b1nix/$(B1NIX_TRIPLET)/busybox > $@

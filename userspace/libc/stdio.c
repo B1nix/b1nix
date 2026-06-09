@@ -430,6 +430,78 @@ static void _vsnprintf_putf(char *str, size_t size, int *pos, double value,
   }
 }
 
+/* printf %g: shortest of %e/%f for the value, trailing zeros stripped. Needed
+ * by e.g. BusyBox awk (CONVFMT/OFMT default "%.6g"); without it the format was
+ * copied through literally ("%g"). */
+static void _vsnprintf_putg(char *str, size_t size, int *pos, double value,
+                            int precision) {
+  char buf[72];
+  int n = 0;
+
+  if (precision < 0)
+    precision = 6;
+  if (precision == 0)
+    precision = 1;
+  if (precision > 17)
+    precision = 17;
+
+  if (value < 0) {
+    buf[n++] = '-';
+    value = -value;
+  }
+
+  /* Decimal exponent X with value ~ m * 10^X, 1 <= m < 10 (0 for value 0). */
+  int X = 0;
+  double m = value;
+  if (m != 0.0) {
+    while (m >= 10.0) { m /= 10.0; X++; }
+    while (m < 1.0)  { m *= 10.0; X--; }
+  }
+
+  if (X < -4 || X >= precision) {
+    /* %e form: one mantissa digit + (precision-1) fraction digits. */
+    int fprec = precision - 1;
+    unsigned long scale = 1;
+    for (int i = 0; i < fprec; i++) scale *= 10;
+    unsigned long r = (unsigned long)(m * scale + 0.5);
+    if (scale && r >= 10UL * scale) { r /= 10; X++; } /* rounding carried to 10.x */
+    unsigned long whole = scale ? r / scale : r;
+    unsigned long frac = scale ? r % scale : 0;
+    buf[n++] = (char)('0' + (whole % 10));
+    char fb[20]; int fn = 0; unsigned long div = scale / 10;
+    for (int i = 0; i < fprec; i++) { fb[fn++] = (char)('0' + (frac / (div ? div : 1)) % 10); if (div) div /= 10; }
+    while (fn > 0 && fb[fn - 1] == '0') fn--;
+    if (fn > 0) { buf[n++] = '.'; for (int i = 0; i < fn; i++) buf[n++] = fb[i]; }
+    buf[n++] = 'e';
+    buf[n++] = X < 0 ? '-' : '+';
+    int ax = X < 0 ? -X : X;
+    buf[n++] = (char)('0' + (ax / 10) % 10);
+    buf[n++] = (char)('0' + ax % 10);
+  } else {
+    /* %f form with precision (precision-1-X), trailing zeros stripped. */
+    int fprec = precision - 1 - X;
+    if (fprec < 0) fprec = 0;
+    if (fprec > 17) fprec = 17;
+    unsigned long scale = 1;
+    for (int i = 0; i < fprec; i++) scale *= 10;
+    unsigned long rounded = (unsigned long)(value * scale + 0.5);
+    unsigned long whole = scale ? rounded / scale : rounded;
+    unsigned long frac = scale ? rounded % scale : 0;
+    char wb[24]; int wn = 0;
+    if (whole == 0) { wb[wn++] = '0'; }
+    else { char t[24]; int tn = 0; unsigned long w = whole; while (w) { t[tn++] = (char)('0' + w % 10); w /= 10; } while (tn) wb[wn++] = t[--tn]; }
+    for (int i = 0; i < wn; i++) buf[n++] = wb[i];
+    if (fprec > 0) {
+      char fb[20]; int fn = 0; unsigned long div = scale / 10;
+      for (int i = 0; i < fprec; i++) { fb[fn++] = (char)('0' + (frac / (div ? div : 1)) % 10); if (div) div /= 10; }
+      while (fn > 0 && fb[fn - 1] == '0') fn--;
+      if (fn > 0) { buf[n++] = '.'; for (int i = 0; i < fn; i++) buf[n++] = fb[i]; }
+    }
+  }
+  buf[n] = '\0';
+  for (int i = 0; i < n; i++) _vsnprintf_putc(str, size, pos, buf[i]);
+}
+
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
   int pos = 0;
   /* Format the whole string regardless of buffer size so the return value is
@@ -566,7 +638,12 @@ int vsnprintf(char *str, size_t size, const char *fmt, va_list ap) {
       _vsnprintf_putc(str, size, &pos, (char)va_arg(ap, int));
       break;
     case 'f':
+    case 'F':
       _vsnprintf_putf(str, size, &pos, va_arg(ap, double), precision);
+      break;
+    case 'g':
+    case 'G':
+      _vsnprintf_putg(str, size, &pos, va_arg(ap, double), precision);
       break;
     case '%':
       _vsnprintf_putc(str, size, &pos, '%');

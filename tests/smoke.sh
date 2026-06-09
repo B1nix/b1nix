@@ -571,6 +571,7 @@ if [ "${UPSTREAM_BUSYBOX:-0}" = "1" ]; then
 	check_output "$LOG" "BB-W5: ok pipe" "ash pipeline"
 	check_output "$LOG" "BB-W5: ok redir" "ash output redirection"
 	check_output "$LOG" "BB-W5: ok wait" "ash waits for a child"
+	check_output "$LOG" "BB-W5: ok arith-loop" "ash while-loop with \$((i+1)) arithmetic terminates (strtoull endptr)"
 	check_output "$LOG" "BB-W5: done" "BusyBox wave 5 ash smoke completes"
 	check_output "$LOG" "BB-SMOKE: ok rm" "busybox rm works"
 	check_output "$LOG" "BB-SMOKE: ok rmdir" "busybox rmdir works"
