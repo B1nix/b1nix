@@ -42,8 +42,9 @@
 #include "initramfs_useradd.inc"
 #include "initramfs_userdel.inc"
 #include "initramfs_groupadd.inc"
-#include "initramfs_chown.inc"
-#include "initramfs_chmod.inc"
+/* chmod, chown — migrated to upstream BusyBox (M44 wave 9); /bin/{chmod,chown}
+ * are now applet-manifest symlinks to /opt/busybox/bin/busybox, so the
+ * standalone b1nix ELFs are no longer embedded. */
 #include "initramfs_busybox.inc"
 
 
@@ -757,6 +758,21 @@ static const char posix_smoke_script[] =
     "/bin/tree /tmp/bb_dir/w8 2>/dev/null | grep -q 'leaf' && echo \"BB-W8: ok tree\"\n"
     "rm -rf /tmp/bb_dir/w8\n"
     "echo \"BB-W8: done\"\n"
+    /* ── Migration wave 9: retire chmod/chown ELFs to upstream + /bin/tsort ──
+     * /bin/{chmod,chown} are now manifest symlinks (the standalone b1nix ELFs
+     * are no longer embedded); tsort gains a /bin entry for the first time.
+     * Verify the action via the promoted /bin/<cmd>, reading back the result
+     * with the upstream stat (which has no /bin entry of its own). */
+    "echo \"BB-W9: start promote\"\n"
+    "printf x > /tmp/bb_dir/w9f\n"
+    "/bin/chmod 600 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%a' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^600$' && echo \"BB-W9: ok chmod\"\n"
+    "/bin/chown 0:0 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%u' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^0$' && echo \"BB-W9: ok chown\"\n"
+    "echo 'a b' > /tmp/bb_dir/w9t\n"
+    "echo 'b c' >> /tmp/bb_dir/w9t\n"
+    "/bin/tsort /tmp/bb_dir/w9t 2>/dev/null | head -n 1 | grep -q a && echo \"BB-W9: ok tsort\"\n"
+    "rm -f /tmp/bb_dir/w9t\n"
+    "rm -f /tmp/bb_dir/w9f\n"
+    "echo \"BB-W9: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"
@@ -880,8 +896,8 @@ static const struct initramfs_file files[] = {
     {"/bin/useradd", (const char *)vfs_useradd_elf, sizeof(vfs_useradd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/userdel", (const char *)vfs_userdel_elf, sizeof(vfs_userdel_elf), INITRAMFS_EXECUTABLE},
     {"/bin/groupadd", (const char *)vfs_groupadd_elf, sizeof(vfs_groupadd_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/chown", (const char *)vfs_chown_elf, sizeof(vfs_chown_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/chmod", (const char *)vfs_chmod_elf, sizeof(vfs_chmod_elf), INITRAMFS_EXECUTABLE},
+    /* /bin/chown and /bin/chmod — served by applet-manifest upstream symlinks
+     * (M44 wave 9), emitted from initramfs_applet_symlinks.inc below. */
     /* M37: mount point for the live ISO; the initramfs must contain a node
      * under /mnt/iso so that vfs_mount() can find the target directory after
      * the initramfs is mounted at "/".  Without this entry add_node() never

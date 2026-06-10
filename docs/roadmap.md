@@ -1117,3 +1117,29 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   not the explicit `/opt/busybox/...` invocation of wave 7: `id -u`=0,
   `whoami`=root, uuidgen format, sha384sum hash, vmstat stats, tree output.
   Full suite **513/0** on both arches, single-CPU + `-smp 4`.
+
+#### M44 — Migration wave 9: retire chmod/chown ELFs + promote tsort
+
+- [x] `done` **Promote `chmod` and `chown` from standalone b1nix ELFs to
+  upstream BusyBox.** Same retirement shape as wave 8's id/whoami: the dedicated
+  `userspace/bin/{chmod,chown}.c` ELFs are no longer embedded (dropped from
+  `EMBEDDED_USER_PROGRAMS` and the `initramfs.c` file table / includes);
+  `/bin/{chmod,chown}` are now manifest symlinks to `/opt/busybox/bin/busybox`.
+  Upstream `chmod` was already proven by `BB-SMOKE: ok chmod`; `BB-W9` adds a
+  `chown` proof. No boot/rc path depends on these (only the smoke exercises
+  them), so the retirement is safe.
+- [x] `done` **Promote `tsort` to `/bin`** (new shell-reachable entry; was
+  reachable only via `busybox tsort`, proven upstream by `BB-W7`).
+- [x] `done` Add `BB-W9` markers exercising the promoted `/bin/<cmd>`: `chmod
+  600` verified via upstream `stat -c %a`, `chown 0:0` via `stat -c %u`, and
+  `tsort` over a two-edge DAG. Full suite **517/0** on both arches, single-CPU
+  + `-smp 4`.
+- Note (builtin-shell quirk surfaced here): a **promoted `/bin/<applet>`
+  symlink reading stdin from a pipe** in the in-kernel builtin shell does not
+  receive its stdin — `printf … | /bin/tsort | …` produced no output, while the
+  identical pipeline with the explicit `/opt/busybox/bin/busybox tsort`
+  (proven by `BB-W7`) works. The `BB-W9` tsort test therefore feeds tsort a
+  **file argument** (like chmod/chown/tree, which take paths and work fine)
+  rather than piping stdin. Root-causing the symlink+stdin-pipe path in the
+  builtin shell is a separate follow-up; it does not affect the `/opt/...`
+  invocation or file-argument applets.
