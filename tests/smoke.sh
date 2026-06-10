@@ -719,6 +719,7 @@ check_output "$LOG" "M29-PTHREAD: ok mutex" "pthread mutex serialises two thread
 check_output "$LOG" "M29-PTHREAD: ok condvar" "pthread condvar signal/wait works"
 check_output "$LOG" "M29-PTHREAD: ok tls" "SYS_SET_TLS + %fs:0 round-trip works"
 check_output "$LOG" "M29-PTHREAD: ok gettid" "SYS_GETTID returns distinct ids per thread"
+check_output "$LOG" "M29-PTHREAD: ok stress-smp" "120 rounds of unjoined-thread exit reclaim the shared mm (no PMM leak)"
 check_output "$LOG" "M29-PTHREAD: done" "M29 pthread smoke completes"
 # ── M31 User Security / Passwords / Setuid ──
 check_output "$LOG" "M31-SEC: start" "M31 user-security smoke starts"

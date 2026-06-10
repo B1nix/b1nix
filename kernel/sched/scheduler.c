@@ -1226,19 +1226,40 @@ static void clone_thread_kentry(void *arg) {
 #endif
 }
 
-/* Look up the number of live tasks currently using this pml4 (excluding
- * `except`). Caller must hold interrupts disabled (matches the reap path's
- * existing convention). */
-static int pml4_other_refs(u64 pml4_phys, const struct task *except) {
-  if (pml4_phys == 0) return 0;
-  int n = 0;
-  for (usize i = 0; i < g_task_hwm; i++) {
-    struct task *t = T(i);
-    if (t == except) continue;
-    if (t->state == TASK_UNUSED || t->state == TASK_REAPING) continue;
-    if (t->pml4_phys == pml4_phys) n++;
+/* Serializes the "last user of this mm" decision across CPUs. Leaf lock:
+ * nothing else is acquired while it is held, and the critical section is a
+ * bounded table scan. */
+static spinlock_t g_mm_release_lock = SPINLOCK_INIT;
+
+/* Atomically drop t's reference to its shared address space. Clears
+ * t->pml4_phys under g_mm_release_lock and counts the remaining holders;
+ * returns the pml4 root iff t was the LAST user (the caller must then tear
+ * the mm down), 0 otherwise. The lock is what makes the decision sound:
+ * with an unlocked refs scan, two reapers on different CPUs could each
+ * claim a different "last" sibling (each excluding itself and skipping the
+ * other's REAPING state), both observe zero refs, and both free the same
+ * page tables — a pmm double-free that resurfaced as poison in whatever
+ * process reused the frames (the M29 no-join stress hang under -smp 4).
+ * Serializing drop-then-count means exactly one caller — the one whose
+ * drop empties the holder set — wins the teardown. REAPING holders still
+ * count as refs here: their own mm_release_user call hasn't dropped them
+ * yet, and it will see the updated holder set when it runs. */
+static u64 mm_release_user(struct task *t) {
+  u64 flags;
+  spin_lock_irqsave(&g_mm_release_lock, &flags);
+  u64 p = t->pml4_phys;
+  t->pml4_phys = 0;
+  int refs = 0;
+  if (p) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *o = T(i);
+      if (o == t) continue;
+      if (o->state == TASK_UNUSED) continue;
+      if (o->pml4_phys == p) refs++;
+    }
   }
-  return n;
+  spin_unlock_irqrestore(&g_mm_release_lock, flags);
+  return (p && refs == 0) ? p : 0;
 }
 
 static int fdtable_other_refs(struct vfs_handle **tbl, const struct task *except) {
@@ -1428,15 +1449,48 @@ void scheduler_reap_dead_threads(void) {
   /* Called from scheduler_yield with interrupts already disabled. Free the
    * kernel stack + slot of any DEAD thread (is_thread=1) whose
    * arch_context_switch has finished swapping RSP off its kernel stack
-   * (stack_released==1). The shared mm/fds/user_image are NOT touched here
-   * — they are freed by either the leader's waitpid reap (if pml4 has no
-   * more users) or stay live for whichever sibling is still running. */
+   * (stack_released==1). The thread's shareable resources (fd table,
+   * user_image, cred) were already released on its exit path; the shared
+   * mm however is freed HERE when this thread is its LAST user. A leader
+   * that exit()s without joining is waitpid-reaped while its threads still
+   * hold pml4 refs (mm_release_user returns 0 for it), so without this
+   * last-user teardown the whole address space — pml4, page tables, vmas —
+   * leaked on every unjoined multithreaded exit until PMM OOM. */
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
     if (t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (!task_is_thread(t)) continue;
     if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+
+    /* Claim DEAD->REAPING first. Load-bearing twice over: (a) a racing
+     * reaper/waitpid on another CPU must not double-free this slot, and
+     * (b) user_address_space_cleanup below re-enables IRQs mid-walk, so a
+     * timer tick can nest another scheduler_yield -> reap sweep on this
+     * same CPU — the claim makes the nested sweep skip this slot instead
+     * of tearing the same mm down twice. */
+    enum task_state expected = TASK_DEAD;
+    if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      continue;
+
+    u64 last_pml4 = mm_release_user(t);
+    if (last_pml4) {
+      /* Last user of the shared mm — tear it down exactly like the
+       * waitpid reap path. cleanup reads t->pml4_phys, so put the value
+       * back while we work: no other task can observe this mm anymore
+       * (mm_release_user counted zero holders), so republishing it cannot
+       * be seen by another release scan. cleanup also returns with IRQs
+       * enabled; restore the yield invariant (IRQs off) before continuing
+       * the sweep. */
+      t->pml4_phys = last_pml4;
+      user_address_space_cleanup(t);
+      paging_free_address_space(last_pml4);
+      t->pml4_phys = 0;
+      interrupts_disable();
+    } else {
+      t->vma_list = 0; /* shared list lives on in the surviving users */
+    }
 
     /* Release any per-thread (non-shared) resources. */
     if (t->cred) { cred_free(t->cred); t->cred = 0; }
@@ -1492,13 +1546,16 @@ void scheduler_reap_orphan_zombies(void) {
       continue;
 
     if (t->user_image) { user_image_free(t->user_image); t->user_image = 0; }
-    if (pml4_other_refs(t->pml4_phys, t) == 0) {
+    u64 last_pml4 = mm_release_user(t);
+    if (last_pml4) {
+      t->pml4_phys = last_pml4; /* see scheduler_reap_dead_threads */
       user_address_space_cleanup(t);
-      paging_free_address_space(t->pml4_phys);
+      paging_free_address_space(last_pml4);
+      t->pml4_phys = 0;
+      interrupts_disable(); /* cleanup exits IRQs-on; restore yield invariant */
     } else {
       t->vma_list = 0;
     }
-    t->pml4_phys = 0;
     if (t->cred) { cred_free(t->cred); t->cred = 0; }
     if (t->fd_table) {
       kfree(t->fd_table);
@@ -2080,14 +2137,17 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             /* M29: keep the address space alive if a CLONE_VM sibling
              * still uses it. The dying thread's reaper handles its own
              * kernel stack; the mm/vmas/fd-table belong to the surviving
-             * sibling. */
-            if (pml4_other_refs(T(i)->pml4_phys, T(i)) == 0) {
+             * sibling. mm_release_user serializes the last-user decision
+             * against the thread reaper on another CPU. */
+            u64 last_pml4 = mm_release_user(T(i));
+            if (last_pml4) {
+              T(i)->pml4_phys = last_pml4; /* see scheduler_reap_dead_threads */
               user_address_space_cleanup(T(i));
-              paging_free_address_space(T(i)->pml4_phys);
+              paging_free_address_space(last_pml4);
+              T(i)->pml4_phys = 0;
             } else {
               T(i)->vma_list = 0;
             }
-            T(i)->pml4_phys = 0;
             if (T(i)->fd_table &&
                 fdtable_other_refs(T(i)->fd_table, T(i)) > 0) {
               T(i)->fd_table = 0;

@@ -171,6 +171,41 @@ static int test_gettid(void) {
   return 0;
 }
 
+/* ── 6: stress — leader exit() WITHOUT joining its threads ── */
+
+static void *t6_spin(void *arg) {
+  /* Variable-length spin so across rounds the threads die in every order
+   * relative to the leader's _exit (before, racing, after). */
+  long n = (long)arg;
+  for (volatile long i = 0; i < n * 4000; i++) { (void)i; }
+  return 0;
+}
+
+static int test_stress_smp(void) {
+  for (int round = 0; round < 120; round++) {
+    int pid = fork();
+    if (pid < 0) { fail("stress-fork"); return -1; }
+    if (pid == 0) {
+      /* Child: spawn 3 CLONE_VM threads and _exit immediately, never
+       * joining. The kernel must free the shared address space when the
+       * LAST thread is reaped — leaking it (pml4 + page tables + vmas)
+       * every round ends in a PMM OOM panic well before round 120. */
+      pthread_t th[3];
+      for (int t = 0; t < 3; t++) {
+        if (pthread_create(&th[t], 0, t6_spin, (void *)(long)(round % 7)) != 0)
+          _exit(2);
+      }
+      _exit(0);
+    }
+    int status = -1;
+    int wr = (int)syscall(SYS_WAITPID, pid, &status, 0);
+    if (wr != pid) { fail("stress-waitpid"); return -1; }
+    if (status != 0) { fail("stress-exit-code"); return -1; }
+  }
+  ok("stress-smp");
+  return 0;
+}
+
 int main(void) {
   emit("M29-PTHREAD: start\n");
   if (test_create_join() != 0) return 1;
@@ -178,6 +213,7 @@ int main(void) {
   if (test_condvar() != 0)     return 1;
   if (test_tls() != 0)         return 1;
   if (test_gettid() != 0)      return 1;
+  if (test_stress_smp() != 0)  return 1;
   emit("M29-PTHREAD: done\n");
   return 0;
 }
