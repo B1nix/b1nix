@@ -208,6 +208,36 @@ static void register_partition(struct block_device *parent, usize number,
   console_write("\n");
 }
 
+/* ── Partition introspection (backs sysfs /sys/block) ── */
+
+int blk_is_partition(struct block_device *dev) {
+  return dev && dev->read_blocks == partition_read;
+}
+
+struct block_device *blk_partition_parent(struct block_device *dev) {
+  if (!blk_is_partition(dev))
+    return 0;
+  return ((struct partition_device *)dev->priv)->parent;
+}
+
+/* Partition number parsed from the "<parent>pN" name suffix (1-based), or -1. */
+int blk_partition_number(struct block_device *dev) {
+  if (!blk_is_partition(dev) || !dev->name)
+    return -1;
+  const char *last_p = 0;
+  for (const char *c = dev->name; *c; c++)
+    if (*c == 'p')
+      last_p = c;
+  if (!last_p)
+    return -1;
+  int num = 0, any = 0;
+  for (const char *c = last_p + 1; *c >= '0' && *c <= '9'; c++) {
+    num = num * 10 + (*c - '0');
+    any = 1;
+  }
+  return any ? num : -1;
+}
+
 /* ── GPT / MBR Scanning ── */
 
 static int scan_gpt(struct block_device *dev, const u8 *mbr) {

@@ -41,6 +41,13 @@ usize blk_count(void);
 struct block_device *blk_at(usize index);
 const char *blk_probe_fstype(struct block_device *dev);
 
+/* Partition introspection (backs sysfs /sys/block). A registered device is a
+ * partition if it was created by the MBR/GPT scanner; otherwise it is a whole
+ * disk. blk_partition_number parses the trailing "pN" of the name (1-based). */
+int blk_is_partition(struct block_device *dev);
+struct block_device *blk_partition_parent(struct block_device *dev);
+int blk_partition_number(struct block_device *dev);
+
 /* Create a /dev/<name> node for every registered block device (read/write
  * translated to cached block I/O + BLK* size ioctls). Call once after all
  * storage drivers have probed. Backs BusyBox blkid/fdisk and /proc/partitions. */

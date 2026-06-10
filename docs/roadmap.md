@@ -1062,17 +1062,29 @@ alias support, `cut --output-delimiter`, and server-side TLS.
 - [x] `done` **`FEATURE_VERSION`** — enable CONFIG_FEATURE_VERSION. Adds
   `busybox --version` support. Trivial config enable, already in
   `busybox-1.38.0.config`. Verify with a smoke marker.
-- [x] `stub` **Upstream `lsblk` evaluation** — BusyBox 1.38 ships its own
-  `lsblk` applet for the first time. Evaluated: it depends entirely on Linux
-  sysfs (`/sys/block/`, `/sys/dev/block/`) and procfs (`/proc/self/mountinfo`),
-  neither of which b1nix exposes at those exact paths. The upstream version is
-  **not suitable** for b1nix. The native dispatch entry (via `blk_count()`,
-  `SYS_MOUNTS`) is kept as the only working path. Marked `stub` — re-evaluate
-  if b1nix's sysfs grows the `/sys/block/` layout.
+- [x] `done` **Upstream `lsblk`** — BusyBox 1.38 ships its own `lsblk` for the
+  first time; it depends entirely on Linux sysfs (`/sys/block/`,
+  `/sys/dev/block/`) and `/proc/self/mountinfo`. Rather than leave it a stub,
+  this wave **grew that layout** in the kernel: sysfs now builds
+  `/sys/block/<disk>/{dev,size,removable,ro}` with partition subdirs,
+  `/sys/dev/block/<maj:min>/{size,partition}` mirrors and `/sys/class/block/`
+  (`kernel/fs/sysfs.c`, from the block registry via new
+  `blk_is_partition`/`blk_partition_parent`/`blk_partition_number` accessors;
+  synthetic major 8, minor = registry index, matching `/proc/partitions`), and
+  procfs gained `/proc/self/mountinfo` (`r_mountinfo`). `BB-W7: ok lsblk` runs
+  the upstream applet and finds `sata0`. The native `lsblk` dispatch stays
+  registered as the `/bin/lsblk` default (applet-promotion rule). xattrs/loop
+  hot-plug aside, the tree is built once at mount, so devices attached at
+  runtime (e.g. `losetup`) are not reflected — acceptable for the smoke set.
+- [ ] `stub` **`ssl_server`** — the other applet new in BusyBox 1.38 (an
+  inetd-style "test TLS server", `select TLS`). Enabling it would pull in
+  BusyBox's own built-in TLS stack for the first time (currently `CONFIG_TLS`
+  is off — b1nix gets TLS via mbedTLS/curl/dropbear instead) and needs a real
+  TLS-handshake smoke. Deferred as out-of-scope for the applet wave; revisit if
+  a BusyBox-TLS sub-wave is wanted.
 - [x] `done` Add `BB-W7` smoke markers to `kernel/fs/initramfs.c` (and
   `tests/smoke.sh`) covering the new applets: uuidgen format validity, sha384sum
   known vectors, vmstat field format, tree recursive output, tsort deterministic
-  ordering, getfattr xattr round-trip, and `--version` reporting 1.38.0. Full
-  suite green on **both** arches, single-CPU + `-smp 4`: `i686` **504/0** (up
-  from 501/2 — the two regressions were the upstream `vmstat`/`tree` applets
-  fixed above) and `x86_64` equivalently green.
+  ordering, getfattr xattr round-trip, lsblk device enumeration, and
+  `--version` reporting 1.38.0. Full suite green on **both** arches,
+  single-CPU + `-smp 4`.

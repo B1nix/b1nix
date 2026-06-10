@@ -21,7 +21,7 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **106 applets** (`NUM_APPLETS`, up
+The isolated package currently configures **107 applets** (`NUM_APPLETS`, up
 from 86 in 1.36.1).
 Migration wave 1 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`,
 `whoami`, `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
@@ -31,7 +31,8 @@ and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
 `uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`. Wave 4 added `mount`,
 `umount`, `nslookup`, `lsof`, `netstat`, `route`, `ifconfig`, `blkid` and
 `fdisk`. Wave 4b added `ping`, `losetup` and `ip`. Wave 7 (BusyBox 1.38.0
-upgrade) added `sha384sum`, `vmstat`, `uuidgen`, `tsort`, `tree`, `getfattr`
+upgrade) added `sha384sum`, `vmstat`, `uuidgen`, `tsort`, `tree`, `getfattr`,
+`lsblk`
 and `FEATURE_VERSION`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
@@ -249,8 +250,10 @@ Kernel/libc infrastructure this wave added:
   `if_nametoindex`, `_IOC`/`_IOR` macros, `caddr_t`; headers `net/route.h`,
   `net/if.h` (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`.
 
-`lsblk` is **not shipped by upstream BusyBox 1.36** (added in 1.38, but b1nix
-keeps its native `lsblk` dispatch — see roadmap wave 7).
+`lsblk` is **not shipped by upstream BusyBox 1.36** but was added in 1.38; it is
+now enabled — wave 7 grew the kernel `/sys/block` + `/sys/dev/block` +
+`/proc/self/mountinfo` layout it needs (the native `/bin/lsblk` dispatch is kept
+as the default per the applet-promotion rule). See roadmap M44.
 
 ### Migration wave 4b: ping / losetup / ip (done)
 
@@ -321,9 +324,9 @@ Delivered across migration waves 4 and 4b:
 `mount`, `umount`, `df`, `blkid`, `fdisk` and `losetup`.
 
 These use the existing b1nix mount and block-device APIs, raw block-device I/O,
-geometry ioctls and the loop-device interface. Upstream BusyBox 1.38 ships
-an `lsblk` applet; b1nix keeps its native `lsblk` dispatch for now (see
-roadmap wave 7 sub-item for evaluation).
+geometry ioctls and the loop-device interface. Upstream BusyBox 1.38's `lsblk`
+applet is now enabled too (wave 7 grew the `/sys/block` + `/proc/self/mountinfo`
+layout it parses); the native `lsblk` dispatch remains the `/bin/lsblk` default.
 
 ### Completed networking applets
 

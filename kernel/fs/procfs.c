@@ -282,6 +282,39 @@ static int r_mounts(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/self/mountinfo — Linux mountinfo format, needed by BusyBox `lsblk`
+ * (which xopen()s it and would abort if it were missing). The maj:min in
+ * field 3 is the synthetic 8:<blk-index> used by /sys/block + /proc/partitions
+ * for a `/dev/<blk>` source, else 0:<mount-index>. Layout:
+ *   id parent maj:min root mountpoint opts - fstype source superopts */
+static int r_mountinfo(usize pid, struct sbuf *s) {
+  (void)pid;
+  struct b1nix_mount_entry ents[MAX_MOUNTS];
+  isize n = vfs_mounts(ents, MAX_MOUNTS);
+  for (isize i = 0; i < n; i++) {
+    const char *src = ents[i].source[0] ? ents[i].source : "none";
+    const char *tgt = ents[i].target[0] ? ents[i].target : "/";
+    const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
+    const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
+    int maj = 0, min = (int)i;
+    const char *devname = src;
+    if (strncmp(devname, "/dev/", 5) == 0)
+      devname += 5;
+    usize bn = blk_count();
+    for (usize b = 0; b < bn; b++) {
+      struct block_device *d = blk_at(b);
+      if (d && d->name && strcmp(d->name, devname) == 0) {
+        maj = 8;
+        min = (int)b;
+        break;
+      }
+    }
+    sb_addf(s, "%ld 1 %d:%d / %s %s - %s %s %s\n", (long)(i + 1), maj, min,
+            tgt, opts, fstype, src, opts);
+  }
+  return 0;
+}
+
 static int r_cmdline(usize pid, struct sbuf *s) {
   (void)pid;
   const char *cmd = bootinfo_cmdline();
@@ -502,6 +535,7 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
+  procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
   if (fddir)
     fddir->inode->readdir_cb = procfs_fd_readdir;
