@@ -783,11 +783,6 @@ upstream applets pass the same workflows.
   process zombies under the DEAD→REAPING CAS — closed `M32B-SSH:
   service-lifecycle`); and **`ash` SIGSEGV on `$((..))` in a loop** (libc `strtol`
   didn't advance `endptr` past a leading-0; `vsnprintf` lacked `%g`/`%e`).
-- [ ] `planned` Investigate a rare `-smp 4` heap double-free seen once during SSH
-  daemon stop (`bucket_unlink: ... magic 0xdead110c not in bucket`, during the
-  `service-lifecycle` stop/reap). Did not reproduce on re-run (481/0). Suspect
-  the orphan-zombie reaper racing dropbear's per-connection child teardown, or a
-  pre-existing socket-teardown race; pin down with `KHEAP_VALIDATE=1`.
 - [ ] `planned` Harden kernel signal delivery so it does not depend on a valid
   userspace `sa_restorer`. Today `arch_build_signal_frame`
   (`kernel/arch/x86/signal.c`) sets the handler's return address to the
