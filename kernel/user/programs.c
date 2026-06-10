@@ -4904,9 +4904,19 @@ int shell_smoke_main(int argc, const char **argv) {
   /* Inline pipe-EOF deterministic check */
   m11_pipe_eof_smoke();
   m11_pipe_nonblock_smoke();
-  /* Shell-driven POSIX smoke markers */
-  char cwd[128] = "/";
-  sh_run_script("/etc/posix-smoke.sh", cwd);
+  /* Shell-driven POSIX smoke markers. Run the script under the real upstream
+   * shell (/bin/sh -> BusyBox ash) instead of the in-kernel builtin
+   * interpreter: production init/rc/login already use ash, so this aligns the
+   * test harness with the shipping shell (and retires ~2700 lines of
+   * kernel-mode shell code). ash is more POSIX-compliant than the builtin, so
+   * the script's parsing/pipes/expansion behave correctly. */
+  const char *smoke_argv[] = {"/bin/sh", "/etc/posix-smoke.sh", 0};
+  u64 smoke_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)smoke_argv[0], 2,
+                                   (u64)(usize)smoke_argv, 0, 0, 0);
+  if ((isize)smoke_pid >= 0) {
+    int smoke_status = 0;
+    syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0, 0, 0);
+  }
   uwrite("M11-SMOKE: done\n");
   return 0;
 }
