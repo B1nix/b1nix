@@ -4085,7 +4085,9 @@ static int m22_smoke_main(int argc, const char **argv) {
   const char *uuidgen_argv[] = {"uuidgen", 0};
   failures += m22_run("uuidgen", "/bin/uuidgen", 1, uuidgen_argv);
 
-  const char *tree_argv[] = {"tree", "/", 0};
+  /* Bounded path: walking all of "/" pulls in /proc + /sys + /usr and emits
+   * thousands of lines over slow TCG serial, dominating the suite runtime. */
+  const char *tree_argv[] = {"tree", "/etc", 0};
   failures += m22_run("tree", "/bin/tree", 2, tree_argv);
 
   const char *sha384sum_argv[] = {"sha384sum", "/tmp/m22.txt", 0};

@@ -15,13 +15,14 @@ if [ "$ARCH" = "x86_64" ]; then
 else
 	DEFAULT_TIMEOUT=120
 fi
-# The upstream-BusyBox smoke spawns ~45 extra ELF loads; under TCG that overruns
-# the tight default budgets (the i686 run already lands near its 120s limit), so
-# widen both arches.
+# The upstream-BusyBox smoke spawns ~60 extra ELF loads (waves 5-7: account
+# applets, xattr/lsblk round-trips, ...); under TCG that overruns the tight
+# default budgets, and the -smp 4 full-suite pass is the slowest of all, so give
+# both arches generous headroom.
 if [ "$ARCH" = "x86_64" ]; then
 	DEFAULT_TIMEOUT=600
 else
-	DEFAULT_TIMEOUT=300
+	DEFAULT_TIMEOUT=480
 fi
 TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}

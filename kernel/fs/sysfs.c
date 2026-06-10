@@ -22,7 +22,15 @@ typedef int (*sysfs_render)(char *buf, usize cap);
 struct sysfs_node {
   sysfs_render render;
   const char *content; /* if set: emitted verbatim (kmalloc'd, never freed) */
+  int live_blk;        /* >=0: emit the live 512-sector count of blk_at(live_blk)
+                        * (so e.g. losetup size changes are reflected); else -1 */
 };
+
+/* Whole-device size in 512-byte sectors, regardless of the device block size. */
+static u64 blk_sectors(struct block_device *d) {
+  u64 spb = d->block_size >= 512 ? d->block_size / 512 : 1;
+  return d->block_count * spb;
+}
 
 static isize sysfs_emit(const char *buf, usize len, u64 offset, char *out,
                         usize size) {
@@ -40,6 +48,13 @@ static isize sysfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
   struct sysfs_node *sn = (struct sysfs_node *)node->inode->data;
   if (!sn)
     return 0;
+  if (sn->live_blk >= 0) {
+    struct block_device *d = blk_at((usize)sn->live_blk);
+    char tmp[32];
+    int len = snprintf(tmp, sizeof(tmp), "%lu\n",
+                       d ? (unsigned long)blk_sectors(d) : 0UL);
+    return sysfs_emit(tmp, (usize)len, offset, buffer, size);
+  }
   if (sn->content)
     return sysfs_emit(sn->content, strlen(sn->content), offset, buffer, size);
   if (!sn->render)
@@ -67,8 +82,10 @@ static struct vfs_node *sysfs_mkchild(struct vfs_node *parent,
   n->inode->nlink = (type == VFS_DIRECTORY) ? 2 : 1;
   if (render) {
     struct sysfs_node *sn = kzalloc(sizeof(*sn));
-    if (sn)
+    if (sn) {
       sn->render = render;
+      sn->live_blk = -1;
+    }
     n->inode->data = sn;
     n->inode->read_cb = sysfs_read_cb;
   }
@@ -102,27 +119,41 @@ static void sysfs_mkstr(struct vfs_node *parent, const char *name,
     return;
   }
   sn->content = copy;
+  sn->live_blk = -1;
   n->inode->data = sn;
   n->inode->read_cb = sysfs_read_cb;
 }
 
-/* Whole-disk sectors (512-byte units) regardless of the device block size. */
-static u64 blk_sectors(struct block_device *d) {
-  u64 spb = d->block_size >= 512 ? d->block_size / 512 : 1;
-  return d->block_count * spb;
+/* Create a VFS_DEVICE node whose `size` is recomputed live from blk_at(index)
+ * on each read, so e.g. a losetup attach is reflected without rebuilding. */
+static void sysfs_mk_live_size(struct vfs_node *parent, int blk_index) {
+  struct vfs_node *n = sysfs_mkchild(parent, "size", VFS_DEVICE, 0);
+  if (!n)
+    return;
+  struct sysfs_node *sn = kzalloc(sizeof(*sn));
+  if (!sn)
+    return;
+  sn->live_blk = blk_index;
+  n->inode->data = sn;
+  n->inode->read_cb = sysfs_read_cb;
 }
 
-/* Build the Linux-style block topology: /sys/block/<disk>/{dev,size,...} with
- * partition subdirs, /sys/dev/block/<maj:min>/ mirrors, and /sys/class/block.
- * Major is a synthetic 8 (sd-like); minor is the blk registry index, matching
- * /proc/partitions and /proc/self/mountinfo. Built once at mount — all storage
- * drivers have probed by the time /sys is mounted (kernel/main.c). */
+/* Build the Linux-style block topology from the block registry: a
+ * /sys/block/<disk>/{dev,size,removable,ro} dir with partition subdirs, a
+ * /sys/dev/block/<maj:min>/{size,partition} mirror, and a flat /sys/class/block.
+ * Major is a synthetic 8 (sd-like); minor is the registry index, matching
+ * /proc/partitions and /proc/self/mountinfo. The *structure* is built once at
+ * mount — every storage driver (incl. the eight loopN) has registered by the
+ * time /sys mounts (kernel/main.c), so no readdir-time refresh (and its
+ * cross-CPU locking) is needed. `size` is still a **live** read of the device's
+ * current block_count, so a `losetup` attach is reflected without a rebuild. */
 static void sysfs_build_block(struct vfs_node *root) {
   struct vfs_node *block = sysfs_mkchild(root, "block", VFS_DIRECTORY, 0);
   struct vfs_node *devp = sysfs_mkchild(root, "dev", VFS_DIRECTORY, 0);
-  struct vfs_node *devblock = sysfs_mkchild(devp, "block", VFS_DIRECTORY, 0);
+  struct vfs_node *devblock = devp ? sysfs_mkchild(devp, "block", VFS_DIRECTORY, 0) : 0;
   struct vfs_node *classp = sysfs_mkchild(root, "class", VFS_DIRECTORY, 0);
-  struct vfs_node *classblock = sysfs_mkchild(classp, "block", VFS_DIRECTORY, 0);
+  struct vfs_node *classblock =
+      classp ? sysfs_mkchild(classp, "block", VFS_DIRECTORY, 0) : 0;
   if (!block || !devblock || !classblock)
     return;
 
@@ -138,12 +169,12 @@ static void sysfs_build_block(struct vfs_node *root) {
     struct vfs_node *dbd = sysfs_mkchild(devblock, majmin, VFS_DIRECTORY, 0);
     if (bd) {
       sysfs_mkstr(bd, "dev", "8:%lu\n", (unsigned long)i);
-      sysfs_mkstr(bd, "size", "%lu\n", (unsigned long)blk_sectors(d));
+      sysfs_mk_live_size(bd, (int)i);
       sysfs_mkstr(bd, "removable", "0\n");
       sysfs_mkstr(bd, "ro", "0\n");
     }
     if (dbd)
-      sysfs_mkstr(dbd, "size", "%lu\n", (unsigned long)blk_sectors(d));
+      sysfs_mk_live_size(dbd, (int)i);
     struct vfs_node *cb = sysfs_mkchild(classblock, d->name, VFS_DIRECTORY, 0);
     if (cb)
       sysfs_mkstr(cb, "dev", "8:%lu\n", (unsigned long)i);
@@ -157,11 +188,9 @@ static void sysfs_build_block(struct vfs_node *root) {
       if (num < 0)
         num = (int)(j + 1);
 
-      if (bd) {
-        struct vfs_node *pd = sysfs_mkchild(bd, p->name, VFS_DIRECTORY, 0);
-        if (pd)
-          sysfs_mkstr(pd, "dev", "8:%lu\n", (unsigned long)j);
-      }
+      struct vfs_node *pd = bd ? sysfs_mkchild(bd, p->name, VFS_DIRECTORY, 0) : 0;
+      if (pd)
+        sysfs_mkstr(pd, "dev", "8:%lu\n", (unsigned long)j);
       /* Entry under the disk's /sys/dev/block dir so its getdents enumerates
        * the partition (lsblk only reads the entry name here). */
       if (dbd)
@@ -171,7 +200,7 @@ static void sysfs_build_block(struct vfs_node *root) {
       snprintf(pmajmin, sizeof(pmajmin), "8:%lu", (unsigned long)j);
       struct vfs_node *dpd = sysfs_mkchild(devblock, pmajmin, VFS_DIRECTORY, 0);
       if (dpd) {
-        sysfs_mkstr(dpd, "size", "%lu\n", (unsigned long)blk_sectors(p));
+        sysfs_mk_live_size(dpd, (int)j);
         sysfs_mkstr(dpd, "partition", "%d\n", num);
       }
       struct vfs_node *cbp =

@@ -1071,11 +1071,18 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   (`kernel/fs/sysfs.c`, from the block registry via new
   `blk_is_partition`/`blk_partition_parent`/`blk_partition_number` accessors;
   synthetic major 8, minor = registry index, matching `/proc/partitions`), and
-  procfs gained `/proc/self/mountinfo` (`r_mountinfo`). `BB-W7: ok lsblk` runs
-  the upstream applet and finds `sata0`. The native `lsblk` dispatch stays
-  registered as the `/bin/lsblk` default (applet-promotion rule). xattrs/loop
-  hot-plug aside, the tree is built once at mount, so devices attached at
-  runtime (e.g. `losetup`) are not reflected — acceptable for the smoke set.
+  procfs gained `/proc/self/mountinfo` (`r_mountinfo`). The block *structure* is
+  built once at mount (every driver, incl. the eight loopN, has registered by
+  then), but each `size` is a **live read** of `blk_at(idx)->block_count` — so a
+  `losetup` attach is reflected without a rebuild. (An earlier readdir-time
+  refresh was dropped: its cross-CPU lock perturbed the timing of the
+  pre-existing x86_64 AP fork/exec race in `M32B-SESS`, and b1nix registers no
+  block devices after mount anyway.)
+  `lsblk` is **promoted to upstream**: `tools/applet-manifest.conf` now maps it
+  `upstream`, so `/bin/lsblk` is a symlink to `/opt/busybox/bin/busybox` and the
+  native `lsblk_main` is retired from `/bin` (kept in the dispatch table for an
+  easy revert, per the applet-promotion rule). `BB-W7: ok lsblk` runs
+  `/bin/lsblk` and finds `sata0`.
 - [ ] `stub` **`ssl_server`** — the other applet new in BusyBox 1.38 (an
   inetd-style "test TLS server", `select TLS`). Enabling it would pull in
   BusyBox's own built-in TLS stack for the first time (currently `CONFIG_TLS`

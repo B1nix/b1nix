@@ -733,9 +733,10 @@ static const char posix_smoke_script[] =
      * setfattr (SYS_SETXATTR -> per-inode backend -> SYS_GETXATTR). */
     "/bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt\n"
     "/opt/busybox/bin/busybox getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix=\"wave7\"' && echo \"BB-W7: ok getfattr\"\n"
-    /* lsblk (upstream) enumerates /sys/block + /sys/dev/block + reads
-     * /proc/self/mountinfo — all newly grown in the kernel for this wave. */
-    "/opt/busybox/bin/busybox lsblk 2>/dev/null | grep -qw sata0 && echo \"BB-W7: ok lsblk\"\n"
+    /* lsblk is migrated to upstream (/bin/lsblk -> /opt/busybox/bin/busybox).
+     * It enumerates /sys/block + /sys/dev/block and reads /proc/self/mountinfo,
+     * all grown in the kernel for this wave. */
+    "/bin/lsblk 2>/dev/null | grep -qw sata0 && echo \"BB-W7: ok lsblk\"\n"
     "rm -rf /tmp/bb_dir/w7\n"
     "/opt/busybox/bin/busybox --version 2>/dev/null | grep -qF \"1.38.0\" && echo \"BB-W7: ok version\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
