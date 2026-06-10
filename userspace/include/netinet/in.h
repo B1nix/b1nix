@@ -4,6 +4,12 @@
 #include <arpa/inet.h>
 #include <sys/socket.h>
 
+struct in_pktinfo {
+  int ipi_ifindex;
+  struct in_addr ipi_spec_dst;
+  struct in_addr ipi_addr;
+};
+
 typedef uint32_t in_addr_t;
 
 #define INADDR_ANY 0x00000000

@@ -383,6 +383,7 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old);
 int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset);
 void scheduler_deliver_pending_signals(void);
+int  scheduler_signal_pending(void);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
 void scheduler_set_user_image(void *image);

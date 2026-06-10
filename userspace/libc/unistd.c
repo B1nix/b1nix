@@ -799,11 +799,18 @@ unsigned int alarm(unsigned int seconds) {
   return (unsigned int)syscall(SYS_ALARM, seconds);
 }
 
-/* No SIGALRM-driven interval timer yet; accept and report "disarmed". */
+/* Map ITIMER_REAL to alarm() for BusyBox ping. */
 int setitimer(int which, const struct itimerval *new_value,
               struct itimerval *old_value) {
-  (void)which;
-  (void)new_value;
+  if (which == 0 /* ITIMER_REAL */) {
+    if (new_value) {
+      unsigned int sec = (unsigned int)new_value->it_value.tv_sec;
+      if (sec == 0 && new_value->it_value.tv_usec > 0) {
+        sec = 1;
+      }
+      alarm(sec);
+    }
+  }
   if (old_value) {
     old_value->it_interval.tv_sec = 0;
     old_value->it_interval.tv_usec = 0;

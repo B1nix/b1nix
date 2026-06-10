@@ -157,7 +157,6 @@ static int m16_termios_unchanged(const struct b1nix_termios *before)
 }
 
 
-extern int busybox_main(int argc, const char **argv);
 extern int mc_main(int argc, const char **argv);
 extern int editor_main(int argc, const char **argv);
 
@@ -893,13 +892,17 @@ static int init_main(int argc, const char **argv) {
 
     /* Verify the procfs/sysfs-backed monitoring tools actually run and read
      * back kernel state (they open /proc and /sys under the hood). */
-    const char *free_argv[] = {"free", 0};
-    const char *sysctl_argv[] = {"sysctl", "kernel.osrelease", 0};
-    const char *top_argv[] = {"top", 0};
-    int rc_free = busybox_main(1, free_argv);
-    int rc_sysctl = busybox_main(2, sysctl_argv);
-    int rc_top = busybox_main(1, top_argv);
-    if (rc_free == 0 && rc_sysctl == 0 && rc_top == 0)
+    int rc_tools = 0;
+    const char *free_argv[] = {"/bin/free", 0};
+    u64 free_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)free_argv[0], 1, (u64)(usize)free_argv, 0, 0, 0);
+    if ((isize)free_pid >= 0) { int st = 0; syscall_dispatch(SYS_WAIT, free_pid, (u64)(usize)&st, 0, 0, 0, 0); if (st) rc_tools = 1; }
+    const char *sysctl_argv[] = {"/bin/sysctl", "kernel.osrelease", 0};
+    u64 sysctl_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)sysctl_argv[0], 2, (u64)(usize)sysctl_argv, 0, 0, 0);
+    if ((isize)sysctl_pid >= 0) { int st = 0; syscall_dispatch(SYS_WAIT, sysctl_pid, (u64)(usize)&st, 0, 0, 0, 0); if (st) rc_tools = 1; }
+    const char *top_argv[] = {"/bin/top", "-b", "-n", "1", 0};
+    u64 top_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)top_argv[0], 4, (u64)(usize)top_argv, 0, 0, 0);
+    if ((isize)top_pid >= 0) { int st = 0; syscall_dispatch(SYS_WAIT, top_pid, (u64)(usize)&st, 0, 0, 0, 0); if (st) rc_tools = 1; }
+    if (rc_tools == 0)
       uwrite("M34-PROC: ok tools\n");
     else
       uwrite("M34-PROC: fail tools\n");
@@ -1101,8 +1104,14 @@ static int init_main(int argc, const char **argv) {
   (void)lock_smoke_main(0, 0);
   (void)ext_stress_main(0, 0);
 
-  const char *net_ping_argv[] = {"ping", "-c", "2", "10.0.2.2", 0};
-  int net_ping_status = busybox_main(4, net_ping_argv);
+  const char *net_ping_argv[] = {"/bin/ping", "-c", "2", "10.0.2.2", 0};
+  u64 net_ping_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)net_ping_argv[0], 4, (u64)(usize)net_ping_argv, 0, 0, 0);
+  int net_ping_status = 1;
+  if ((isize)net_ping_pid >= 0) {
+    int st = 0;
+    syscall_dispatch(SYS_WAIT, net_ping_pid, (u64)(usize)&st, 0, 0, 0, 0);
+    net_ping_status = st;
+  }
   if (net_ping_status == 0) {
     uwrite("NET-SMOKE: ok ping-gateway\n");
   } else {
@@ -1255,8 +1264,16 @@ static int init_main(int argc, const char **argv) {
 
 static int m22_run(const char *label, const char *path, int argc,
                    const char **argv) {
-  (void)path;
-  int status = busybox_main(argc, argv);
+  u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)path, argc,
+                             (u64)(usize)argv, 0, 0, 0);
+  if ((isize)pid < 0) {
+    uwrite("M22-SMOKE: fail ");
+    uwrite(label);
+    uwrite("\n");
+    return 1;
+  }
+  int status = 0;
+  syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
   if (status != 0) {
     uwrite("M22-SMOKE: fail ");
     uwrite(label);
@@ -1318,14 +1335,14 @@ static int m22_smoke_main(int argc, const char **argv) {
 
   int failures = 0;
 
-  const char *pwd_argv[] = {"pwd", 0};
+  const char *pwd_argv[] = {"/bin/pwd", 0};
   failures += m22_run("pwd", "/bin/pwd", 1, pwd_argv);
 
-  const char *mkdir_argv[] = {"mkdir", "/tmp/m22dir", 0};
+  const char *mkdir_argv[] = {"/bin/mkdir", "/tmp/m22dir", 0};
   failures += m22_run("mkdir", "/bin/mkdir", 2, mkdir_argv);
   failures += m22_check_parent_enforcement();
 
-  const char *ls_argv[] = {"ls", "/tmp", 0};
+  const char *ls_argv[] = {"/bin/ls", "/tmp", 0};
   failures += m22_run("ls", "/bin/ls", 2, ls_argv);
 
   u64 grep_fd = syscall_dispatch(SYS_OPEN, (u64)(usize)"/tmp/m22_grep.txt",
@@ -1337,66 +1354,66 @@ static int m22_smoke_main(int argc, const char **argv) {
                      0, 0, 0);
     syscall_dispatch(SYS_CLOSE, grep_fd, 0, 0, 0, 0, 0);
   }
-  const char *grep_argv[] = {"grep", "beta", "/tmp/m22_grep.txt", 0};
+  const char *grep_argv[] = {"/bin/grep", "beta", "/tmp/m22_grep.txt", 0};
   failures += m22_run("grep", "/bin/grep", 3, grep_argv);
 
-  const char *cp_argv[] = {"cp", "/tmp/m22.txt", "/tmp/m22dir/copy.txt", 0};
+  const char *cp_argv[] = {"/bin/cp", "/tmp/m22.txt", "/tmp/m22dir/copy.txt", 0};
   failures += m22_run("cp", "/bin/cp", 3, cp_argv);
 
-  const char *ln_argv[] = {"ln", "-s", "/tmp/m22.txt", "/tmp/m22dir/m22.link",
+  const char *ln_argv[] = {"/bin/ln", "-s", "/tmp/m22.txt", "/tmp/m22dir/m22.link",
                            0};
   failures += m22_run("ln-s", "/bin/ln", 4, ln_argv);
 
-  const char *readlink_argv[] = {"readlink", "/tmp/m22dir/m22.link", 0};
+  const char *readlink_argv[] = {"/bin/readlink", "/tmp/m22dir/m22.link", 0};
   failures += m22_run("readlink", "/bin/readlink", 2, readlink_argv);
   failures += m22_check_symlink_stat();
 
-  const char *cat_argv[] = {"cat", "/tmp/m22.txt", 0};
+  const char *cat_argv[] = {"/bin/cat", "/tmp/m22.txt", 0};
   failures += m22_run("cat", "/bin/cat", 2, cat_argv);
 
-  const char *cat_link_argv[] = {"cat", "/tmp/m22dir/m22.link", 0};
+  const char *cat_link_argv[] = {"/bin/cat", "/tmp/m22dir/m22.link", 0};
   failures += m22_run("cat-link", "/bin/cat", 2, cat_link_argv);
 
-  const char *cat_norm_argv[] = {"cat", "/tmp//m22dir/../m22dir/./m22.link", 0};
+  const char *cat_norm_argv[] = {"/bin/cat", "/tmp//m22dir/../m22dir/./m22.link", 0};
   failures += m22_run("path-norm", "/bin/cat", 2, cat_norm_argv);
 
-  const char *head_argv[] = {"head", "-n", "10", "/tmp/m22.txt", 0};
+  const char *head_argv[] = {"/bin/head", "-n", "10", "/tmp/m22.txt", 0};
   failures += m22_run("head", "/bin/head", 4, head_argv);
 
-  const char *tail_argv[] = {"tail", "-n", "10", "/tmp/m22.txt", 0};
+  const char *tail_argv[] = {"/bin/tail", "-n", "10", "/tmp/m22.txt", 0};
   failures += m22_run("tail", "/bin/tail", 4, tail_argv);
 
-  const char *wc_argv[] = {"wc", "/tmp/m22.txt", 0};
+  const char *wc_argv[] = {"/bin/wc", "/tmp/m22.txt", 0};
   failures += m22_run("wc", "/bin/wc", 2, wc_argv);
 
-  const char *date_argv[] = {"date", 0};
+  const char *date_argv[] = {"/bin/date", 0};
   failures += m22_run("date", "/bin/date", 1, date_argv);
 
-  const char *uname_argv[] = {"uname", "-a", 0};
+  const char *uname_argv[] = {"/bin/uname", "-a", 0};
   failures += m22_run("uname", "/bin/uname", 2, uname_argv);
 
-  const char *id_argv[] = {"id", 0};
+  const char *id_argv[] = {"/bin/id", 0};
   failures += m22_run("id", "/bin/id", 1, id_argv);
 
-  const char *whoami_argv[] = {"whoami", 0};
+  const char *whoami_argv[] = {"/bin/whoami", 0};
   failures += m22_run("whoami", "/bin/whoami", 1, whoami_argv);
 
-  const char *ps_argv[] = {"ps", 0};
+  const char *ps_argv[] = {"/bin/ps", 0};
   failures += m22_run("ps", "/bin/ps", 1, ps_argv);
 
-  const char *uuidgen_argv[] = {"uuidgen", 0};
+  const char *uuidgen_argv[] = {"/bin/uuidgen", 0};
   failures += m22_run("uuidgen", "/bin/uuidgen", 1, uuidgen_argv);
 
   /* Bounded path: walking all of "/" pulls in /proc + /sys + /usr and emits
    * thousands of lines over slow TCG serial, dominating the suite runtime. */
-  const char *tree_argv[] = {"tree", "/etc", 0};
+  const char *tree_argv[] = {"/bin/tree", "/etc", 0};
   failures += m22_run("tree", "/bin/tree", 2, tree_argv);
 
-  const char *sha384sum_argv[] = {"sha384sum", "/tmp/m22.txt", 0};
+  const char *sha384sum_argv[] = {"/bin/sha384sum", "/tmp/m22.txt", 0};
   failures += m22_run("sha384sum", "/bin/sha384sum", 2, sha384sum_argv);
 
   // vmstat reads /proc/meminfo and /proc/stat
-  const char *vmstat_argv[] = {"vmstat", 0};
+  const char *vmstat_argv[] = {"/bin/vmstat", 0};
   failures += m22_run("vmstat", "/bin/vmstat", 1, vmstat_argv);
 
   // Run the new compliance checks for M0-M5 gaps
@@ -1867,13 +1884,8 @@ void user_register_builtin_programs(void) {
    * by the Makefile. */
 #include "initramfs_applet_registration.inc"
 
-  /* Also register the busybox dispatcher itself (always native) */
-  user_register_program("/bin/busybox", busybox_main);
-
-  /* setfattr — b1nix-native write side for extended attributes (upstream
-   * BusyBox ships only the read-side getfattr). Not in the manifest because it
-   * has no upstream counterpart to retire to. */
-  user_register_program("/bin/setfattr", busybox_main);
+  /* The busybox dispatcher and setfattr are now served by the VFS initramfs
+   * (upstream BusyBox ELF / standalone ELF) — no native registration needed. */
 
   /* M24 — Diagnostics (b1nix-specific, standalone handlers) */
   user_register_program("/bin/gpuinfo", gpuinfo_main);

@@ -48,7 +48,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m34_smoke \
 	m35_smoke \
 	m42_w5pre_smoke \
-	su passwd groups useradd userdel groupadd
+	su passwd groups useradd userdel groupadd halt setfattr
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
@@ -224,7 +224,6 @@ KERNEL_SOURCES := \
 	kernel/sched/futex.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
-	kernel/user/busybox.c \
 	kernel/user/tui_common.c \
 	kernel/user/mc.c \
 	kernel/user/editor.c \

@@ -28,6 +28,7 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
     if (pipe->size == 0) {
       if (pipe->writers == 0) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return 0; }
       if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
       current_task->stack_released = 0;
@@ -69,6 +70,7 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
     usize free_space = PIPE_BUFFER_SIZE - pipe->size;
     if (free_space == 0) {
       if (h->flags & B1NIX_O_NONBLOCK) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -EAGAIN; }
+      if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
       current_task->stack_released = 0;

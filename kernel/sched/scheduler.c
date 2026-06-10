@@ -3045,3 +3045,21 @@ void scheduler_deliver_pending_signals(void) {
     return;
   }
 }
+
+int scheduler_signal_pending(void) {
+  if (!current_task)
+    return 0;
+  u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+  if (pending == 0)
+    return 0;
+  for (int i = 1; i <= NSIG; i++) {
+    if (!(pending & (1ULL << (i - 1))))
+      continue;
+    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
+    if (h != SIG_IGN && h != SIG_DFL)
+      return 1;
+  }
+  return 0;
+}
+

@@ -1367,20 +1367,7 @@ static isize sys_umask(u16 mask) {
  * SIGKILL/SIGSTOP are never caught, so excluding the SIG_DFL/SIG_IGN cases here
  * leaves their default handling to the normal delivery path. */
 static int select_poll_signal_pending(void) {
-  if (!current_task)
-    return 0;
-  u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
-  if (pending == 0)
-    return 0;
-  for (int i = 1; i <= NSIG; i++) {
-    if (!(pending & (1ULL << (i - 1))))
-      continue;
-    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
-    if (h != SIG_IGN && h != SIG_DFL)
-      return 1;
-  }
-  return 0;
+  return scheduler_signal_pending();
 }
 
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
@@ -2543,7 +2530,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_CHDIR:
     return (u64)sys_chdir((const char *)(usize)arg0);
 
-  case SYS_REBOOT:
+  case SYS_REBOOT: {
+    /* Privileged: like Linux reboot()/CAP_SYS_BOOT, only root may halt or
+     * reboot the machine. A NULL cred is an in-kernel caller (init kthread),
+     * which is allowed. This is why /bin/{halt,reboot,poweroff,shutdown} are
+     * NOT setuid — they are plain root-owned binaries. */
+    const struct cred *rb_cred = scheduler_get_current_cred();
+    if (rb_cred && rb_cred->euid != ROOT_UID)
+      return (u64)-EPERM;
     if ((int)arg0 == B1NIX_REBOOT_POWEROFF) {
       console_write("reboot: powering off\n");
       /* QEMU/Bochs ACPI shutdown ports - no full ACPI parsing needed. */
@@ -2572,6 +2566,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       arch_halt();
     }
     break;
+  }
   case SYS_DMESG:
     if (!arg0 || arg1 == 0)
       return (u64)-EINVAL;

@@ -45,6 +45,8 @@
 /* chmod, chown — migrated to upstream BusyBox (M44 wave 9); /bin/{chmod,chown}
  * are now applet-manifest symlinks to /opt/busybox/bin/busybox, so the
  * standalone b1nix ELFs are no longer embedded. */
+#include "initramfs_halt.inc"
+#include "initramfs_setfattr.inc"
 #include "initramfs_busybox.inc"
 
 
@@ -821,6 +823,7 @@ static const struct initramfs_file files[] = {
     {"/etc/bb-w6/run.sh", initramfs_bb_w6_sh, sizeof(initramfs_bb_w6_sh) - 1,
      INITRAMFS_EXECUTABLE},
     /* Applet symlinks — generated from tools/applet-manifest.conf */
+    {"/bin/busybox", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
 #  include "initramfs_applet_symlinks.inc"
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -911,6 +914,14 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m25_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m26-smoke", (const char *)vfs_m26_smoke_elf,
      sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
+    /* The halt ELF handles reboot/poweroff/halt/shutdown by argv[0] inspection.
+     * Plain root-owned binaries (NOT setuid): SYS_REBOOT itself enforces root,
+     * matching Linux reboot()/CAP_SYS_BOOT. */
+    {"/bin/halt", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/reboot", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/poweroff", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/shutdown", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/setfattr", (const char *)vfs_setfattr_elf, sizeof(vfs_setfattr_elf), INITRAMFS_EXECUTABLE},
     {"/bin/su", (const char *)vfs_su_elf, sizeof(vfs_su_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     {"/bin/passwd", (const char *)vfs_passwd_elf, sizeof(vfs_passwd_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     /* /bin/id and /bin/whoami — served by applet-manifest upstream symlinks
