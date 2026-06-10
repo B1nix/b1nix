@@ -343,6 +343,10 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
         scheduler_wait_cancel();
         break;
       }
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        return -ERESTARTSYS;
+      }
       scheduler_wait_commit();
     }
 
@@ -375,6 +379,10 @@ isize vfs_socket_recv_h(struct vfs_handle *h, void *buf, usize len, int flags) {
       if (tcp_is_readable(conn)) {
         scheduler_wait_cancel();
         break;
+      }
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        return -ERESTARTSYS;
       }
       scheduler_wait_commit();
     }
@@ -803,6 +811,12 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
         scheduler_wait_cancel();
         break;
       }
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        kfree(new_s);
+        vfs_handle_release(new_vh);
+        return -ERESTARTSYS;
+      }
       scheduler_wait_commit();
     }
     new_s->tcp_conn = conn;
@@ -836,6 +850,12 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
       if (conn) {
         scheduler_wait_cancel();
         break;
+      }
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        kfree(new_s);
+        vfs_handle_release(new_vh);
+        return -ERESTARTSYS;
       }
       scheduler_wait_commit();
     }

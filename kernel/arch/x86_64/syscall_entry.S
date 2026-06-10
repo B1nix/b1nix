@@ -37,10 +37,10 @@ x86_syscall_entry:
 
     /* Build a full struct interrupt_frame on the kernel stack */
     /* Order (highest address to lowest): SS, RSP, RFLAGS, CS, RIP, Error, Vector, R15...RAX */
-    pushq $0x23        /* SS */
+    pushq $0x1B        /* SS */
     pushq 112(%rax)    /* RSP */
     pushq %r11         /* RFLAGS (stored by SYSCALL in R11) */
-    pushq $0x1B        /* CS */
+    pushq $0x23        /* CS */
     pushq %rcx         /* RIP (stored by SYSCALL in RCX) */
     pushq $0           /* error_code */
     pushq $0x80        /* vector */
@@ -94,6 +94,10 @@ x86_syscall_return:
     /* Store the return value into the saved RAX slot in the interrupt frame */
     movq %rax, (%rsp)
 
+    /* If vector != 0x80, return via iretq to preserve rcx and r11 (e.g. from sys_sigreturn) */
+    cmpq $0x80, 120(%rsp)
+    jne .Liret_return
+
     /* BKL fully retired (M28 #7): no lock to release on the way back to ring 3. */
 
     /* Restore GPRs from the interrupt_frame */
@@ -124,6 +128,25 @@ x86_syscall_return:
     /* Skip SS */
 
     sysretq
+
+.Liret_return:
+    popq %rax
+    popq %rbx
+    popq %rcx
+    popq %rdx
+    popq %rbp
+    popq %rdi
+    popq %rsi
+    popq %r8
+    popq %r9
+    popq %r10
+    popq %r11
+    popq %r12
+    popq %r13
+    popq %r14
+    popq %r15
+    addq $16, %rsp   /* Skip vector and error code */
+    iretq
 
 .global x86_fork_child_trampoline
 x86_fork_child_trampoline:

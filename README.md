@@ -34,7 +34,7 @@ current build.
   arithmetic substitution, here-documents, functions, loops, `case`, arrays,
   traps, and foreground/background job control.
 - Native utilities plus curl, GNU Wget, Dropbear SSH, TinyCC, and an optional
-  upstream BusyBox 1.36.1 port.
+  upstream BusyBox 1.38.0 port.
 - Ported binutils, GCC, libstdc++, and GNU Make. The x86_64 kernel can be
   compiled and linked from inside B1NIX.
 - Automated QEMU coverage for boot, SMP, memory, storage, filesystems,
@@ -207,7 +207,7 @@ make smoke-x86
 make graphics-smoke
 make memory-smoke
 make analyze
-UPSTREAM_BUSYBOX=1 make smoke
+make smoke
 ```
 
 Smoke logs, packet captures, and temporary disk images are written to
@@ -286,8 +286,8 @@ smoke_run/          generated test logs, captures, and temporary images
   images use a conservative ext4 feature set; exFAT and NTFS are read-only.
 - The 32-bit port currently uses at most 1 GiB of RAM; x86_64 has been tested
   with a 16 GiB QEMU memory map.
-- Audio, configurable SysV-style init, multiple virtual consoles, Wi-Fi, and
-  general USB device support are not implemented.
+- Audio, a configurable SysV-style mode for the native B1NIX init, multiple
+  virtual consoles, Wi-Fi, and general USB device support are not implemented.
 - Security hardening has not reached production quality.
 
 ## Documentation

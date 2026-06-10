@@ -179,6 +179,10 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
         scheduler_wait_cancel();
         continue;
       }
+      if (scheduler_signal_pending()) {
+        scheduler_wait_cancel();
+        return -ERESTARTSYS;
+      }
       scheduler_wait_commit();
     }
   }

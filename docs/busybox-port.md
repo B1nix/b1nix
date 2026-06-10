@@ -1,6 +1,6 @@
-# Porting Upstream BusyBox 1.36.1 to b1nix (Stage 1)
+# Porting Upstream BusyBox 1.38.0 to b1nix (Stage 1 + 2)
 
-This document describes the initial phase of porting upstream BusyBox 1.36.1
+This document describes the porting of upstream BusyBox 1.38.0
 as a static, multicall ELF to the `b1nix` operating system.
 
 The upstream binary is intentionally kept separate from the native b1nix
@@ -21,27 +21,31 @@ UPSTREAM_BUSYBOX=1 make ARCH=x86_64 smoke
 
 ## Enabled Applets
 
-The isolated package currently configures **86 applets**. Migration wave 1
-added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`, `whoami`,
-`seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
+The isolated package currently configures **107 applets** (`NUM_APPLETS`, up
+from 86 in 1.36.1).
+Migration wave 1 added `cmp`, `cut`, `env`, `id`, `ls`, `printenv`, `tee`, `tr`,
+`whoami`, `seq`, `which`, `clear` and `hexdump`. Wave 2 added `stat`, `realpath`,
 `mktemp`, `find`, `grep`, `sed`, `awk`, `xargs`, `diff`, `cksum`, `md5sum`
 and `sha256sum`. Wave 2b added `dd`, `du`, `df`, `tar`, `gzip`, `gunzip`,
 `bzip2`, `bunzip2`, `unxz` and `xzcat`. Wave 3 added `ps`, `top`, `free`,
 `uptime`, `pidof`, `pgrep`, `pkill` and `dmesg`. Wave 4 added `mount`,
 `umount`, `nslookup`, `lsof`, `netstat`, `route`, `ifconfig`, `blkid` and
-`fdisk`. Wave 4b added `ping`, `losetup` and `ip`:
+`fdisk`. Wave 4b added `ping`, `losetup` and `ip`. Wave 7 (BusyBox 1.38.0
+upgrade) added `sha384sum`, `vmstat`, `uuidgen`, `tsort`, `tree`, `getfattr`,
+`lsblk`
+and `FEATURE_VERSION`:
 
 - **Logic & Flow Control**: `true`, `false`, `yes`
 - **Output & Print**: `echo`, `printf`, `pwd`, `printenv`, `tee`
-- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`
+- **File Utilities**: `cat`, `head`, `tail`, `wc`, `mkdir`, `rmdir`, `rm`, `cp`, `mv`, `ln`, `readlink`, `touch`, `chmod`, `chown`, `ls`, `cmp`, `cut`, `stat`, `mktemp`, `find`, `diff`, `dd`, `tree`, `getfattr`
 - **Path Manipulation**: `basename`, `dirname`, `realpath`
-- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`
-- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`, `lsof`
+- **System Utilities**: `sync`, `sleep`, `date`, `uname`, `kill`, `id`, `whoami`, `env`, `which`, `clear`, `hexdump`, `du`, `df`, `uuidgen`
+- **Process & Diagnostics**: `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill`, `dmesg`, `lsof`, `vmstat`
 - **Storage & Mount**: `mount`, `umount`, `blkid`, `fdisk`
 - **Networking**: `nslookup`, `netstat`, `route`, `ifconfig`
 - **Archive & Compression**: `tar`, `gzip`, `gunzip`, `bzip2`, `bunzip2`, `unxz`, `xzcat`
-- **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`
-- **Checksums**: `cksum`, `md5sum`, `sha256sum`
+- **Text & Sequences**: `tr`, `seq`, `grep`, `sed`, `awk`, `xargs`, `tsort`
+- **Checksums**: `cksum`, `md5sum`, `sha256sum`, `sha384sum`
 - **Shell Builtins & Pipelines**: `test`, `[` (alias of test), `sort`, `uniq`
 
 `tar`, `gzip`/`bzip2` compress and decompress; `xz` is **decompress-only**
@@ -246,8 +250,10 @@ Kernel/libc infrastructure this wave added:
   `if_nametoindex`, `_IOC`/`_IOR` macros, `caddr_t`; headers `net/route.h`,
   `net/if.h` (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`.
 
-`lsblk` is **not shipped by upstream BusyBox 1.36** — `blkid` and `fdisk -l`
-cover the block-inspection role.
+`lsblk` is **not shipped by upstream BusyBox 1.36** but was added in 1.38; it is
+now enabled — wave 7 grew the kernel `/sys/block` + `/sys/dev/block` +
+`/proc/self/mountinfo` layout it needs (the native `/bin/lsblk` dispatch is kept
+as the default per the applet-promotion rule). See roadmap M44.
 
 ### Migration wave 4b: ping / losetup / ip (done)
 
@@ -311,38 +317,118 @@ Still to do:
 - `sysctl` — read-only keys can be ported first; writable `sysctl` requires an
   explicit b1nix policy.
 
-### Wave 5: mounts and storage
+### Completed storage applets
 
-Enable:
+Delivered across migration waves 4 and 4b:
 
-`mount`, `umount`, `df`, `lsblk`, `blkid`, `fdisk` and `losetup`.
+`mount`, `umount`, `df`, `blkid`, `fdisk` and `losetup`.
 
-Use the existing b1nix mount and block-device APIs. Provide a small BusyBox
-platform backend for device enumeration instead of reproducing unrelated Linux
-netlink/udev behavior. `fdisk` additionally needs raw block-device read/write
-access and geometry ioctls.
+These use the existing b1nix mount and block-device APIs, raw block-device I/O,
+geometry ioctls and the loop-device interface. Upstream BusyBox 1.38's `lsblk`
+applet is now enabled too (wave 7 grew the `/sys/block` + `/proc/self/mountinfo`
+layout it parses); the native `lsblk` dispatch remains the `/bin/lsblk` default.
 
-### Wave 6: networking
+### Completed networking applets
 
-Enable `nc` and `wget` first because the normal socket stack already supports
-their core TCP/UDP paths. Then add:
+Migration waves 4 and 4b delivered:
 
 - interface query/configuration for `ifconfig`;
 - route and address operations for `ip` and `route`;
 - raw ICMP or a b1nix backend for `ping`;
 - `/proc/net` data for `netstat`.
 
-### Wave 7: privileged system applets
+### Privileged login and account applets
 
 Enable:
 
-`su`, `login`, `reboot`, `poweroff`, `halt`, `chroot`, `mknod`, `init` and
-eventually `mdev`.
+`su`, `login`, `getty`, `passwd`, account-management applets, `reboot`,
+`poweroff`, `halt`, `chroot` and `mknod`.
 
 Credentials, passwd/shadow parsing and reboot commands already exist.
-`chroot`, device-node creation and a device-event model are still missing.
-`init` and `mdev` should be last because they change boot and device-management
-ownership rather than merely replacing a command.
+`chroot` and device-node creation are still missing. BusyBox `init` and `mdev`
+are intentionally excluded: B1NIX keeps its own `/bin/init` as PID 1 and will
+develop `/etc/inittab`, runlevels, respawn policy and service supervision in
+M39. BusyBox `getty` and `login` may be launched by that native init without
+transferring ownership of the boot process to BusyBox.
+
+### Migration wave 5: shell, login and accounts
+
+This migration wave combines the earlier upstream-`ash` and privileged
+login/account work:
+
+- **`ash` is enabled and `/bin/sh` now points at it** (in progress). BusyBox is
+  configured `CONFIG_SH_IS_ASH=y`; `/bin/sh` is a symlink to
+  `/opt/busybox/bin/busybox` under `B1NIX_UPSTREAM_BUSYBOX`. The `BB-W5:` smoke
+  markers cover applet listing, `-c`, variables + `test`, arithmetic, pipes,
+  redirection and child wait, and the interactive `M32B-SSH: ok pty` test runs a
+  command through `ash` over a remote PTY. Bringing it up exposed and fixed a
+  latent kernel gap — `/dev/tty` had no `poll_cb`, so the first `poll()` on the
+  console (which the old builtin shell never issued but `ash`'s line editor does)
+  jumped through an uninitialised pointer and panicked. Fixed with `tty_poll`
+  (`kernel/fs/vfs.c`) + `ps2_kbd_has_data()` (`kernel/dev/ps2_kbd.c`). Two more
+  real fixes followed: a genuine **`/dev/null`** node (the builtin shell faked
+  `2>/dev/null`; `ash` really opens it) and **`kill(pid,0)` existence-probe
+  semantics** (the kernel rejected `sig 0`, breaking the sshd `status` arm's
+  `kill -0`). `/bin/dropbear` was also **rebuilt** against the current libc (it
+  predated the `4ab0fd3` `sa_restorer` fix and was crashing on SIGCHLD; dropbear
+  builds with clang via `tools/b1nix-autotools-cc`, so no cross-GCC is needed).
+  Two more bugs the bring-up surfaced were fixed: orphaned daemon zombies were
+  never reaped (`M32B-SSH: service-lifecycle`), and a stray NUL byte in the klog
+  ring truncated `dmesg` readers so the `M15` audit test missed its lines
+  (`klog_putc` now drops NULs). Upstream-BusyBox smoke went **197/283 → 480/0**
+  on x86 and x86_64 (single-CPU + `-smp 4`, fully green); `BB-W5` and the whole
+  `M32B-SSH` suite (`dropbearkey`/`handshake`/`negauth`/`pty`/`service-lifecycle`)
+  pass.
+- The orphan-zombie reaper: `scheduler_reap_orphan_zombies()` runs from
+  `scheduler_yield` and frees process zombies with no living parent (a daemon
+  whose shell parent has exited), using the same DEAD→REAPING CAS as the waitpid
+  reap so it is SMP-safe. A kernel-injected `sigreturn` trampoline (so signal
+  delivery never trusts a userspace `sa_restorer`) is still tracked as `planned`
+  in `docs/roadmap.md` as forward-compatible hardening.
+- enable `getty`, `login`, `su`, `passwd` and account-management applets behind
+  a security-sensitive test gate (not yet done);
+- leave `/bin/init`, `/etc/rc` and PID 1 service supervision owned by B1NIX.
+
+BusyBox `init` is not a migration target. Replacing the current shell or login
+commands remains independently reversible, while the native init evolves
+separately according to M39 in `docs/roadmap.md`.
+
+### Migration wave 7: BusyBox 1.38.0 upgrade (new applets)
+
+Upgraded the upstream BusyBox from 1.36.1 to 1.38.0 and enabled new applets
+shipped by the later releases:
+
+- **`sha384sum`** — SHA-384 checksum, natural sibling of the existing `sha256sum`.
+  Same libc infrastructure, trivial addition.
+- **`vmstat`** — virtual memory statistics from `/proc/meminfo` + `sysinfo()`.
+  Closely related to the existing `free`/`top` procps group; its kernel deps
+  are already in place (SYS_SYSINFO, /proc/meminfo).
+- **`uuidgen`** — generate a random UUID (`/proc/sys/kernel/random/uuid` or
+  time-based). Small, self-contained util-linux applet; adds a new useful
+  capability without kernel-side changes.
+- **`tsort`** — topological sort (read partial-order pairs, emit sorted list).
+  Small text-processing applet, no kernel dependencies.
+- **`tree`** — recursive directory listing in tree format. Uses the same
+  VFS readdir infrastructure as `ls`/`find`.
+- **`getfattr`** — get extended attributes from files. Required building the
+  kernel xattr backend from scratch: a per-inode in-memory xattr list, the
+  `SYS_SETXATTR`/`GETXATTR`/`LISTXATTR`/`REMOVEXATTR` syscalls + libc
+  `<sys/xattr.h>` wrappers (with `l*` no-follow variants) and `ENODATA`. Upstream
+  BusyBox has only the read side, so the write side is a b1nix-native
+  `setfattr` (`/bin/setfattr`, `-n`/`-v`/`-x`).
+- **`FEATURE_VERSION`** — enables `busybox --version` for all applets.
+
+Two upstream applets in this set needed kernel/build fixes before they would
+run on b1nix, both surfaced by the `BB-W7` smoke: `vmstat` aborts on a missing
+`/proc/vmstat` (added a procfs node for it), and the upstream `tree` applet was
+not being compiled because `tools/build-busybox.sh`'s scandir-free replacement
+of `miscutils/tree.c` had stripped BusyBox's `//config://applet://kbuild:`
+metadata (restored, so `CONFIG_TREE` registers and `tree.o` builds).
+
+The upgrade also pulls in numerous fixes and improvements from the 1.37 and
+1.38 releases (TLS server code, ash `<<<` here-strings, hush alias support,
+`cut` `--output-delimiter`, path traversal hardening (CVE-2023-39810), and
+~400 other commits). Enablement status is tracked in roadmap M44.
 
 ## Applet Promotion Rule
 

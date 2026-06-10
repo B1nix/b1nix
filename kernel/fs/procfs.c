@@ -230,6 +230,32 @@ static int r_stat(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/vmstat — virtual-memory event counters. BusyBox `vmstat` opens this
+ * with xfopen_for_read() (which aborts if the file is missing) and reads the
+ * paging/swap fields (pgpgin/pgpgout/pswpin/pswpout). b1nix has no swap-event
+ * accounting yet, so the counters are reported as zero — enough for `vmstat`
+ * to run and print its single report without dying. */
+static int r_vmstat(usize pid, struct sbuf *s) {
+  (void)pid;
+  u64 total = pmm_total_usable_memory();
+  u64 freeb = pmm_free_memory_estimate();
+  unsigned long pages = (unsigned long)(total / 4096);
+  unsigned long free_pages = (unsigned long)(freeb / 4096);
+  sb_addf(s, "nr_free_pages %lu\n", free_pages);
+  sb_addf(s, "nr_inactive_anon 0\n");
+  sb_addf(s, "nr_active_anon 0\n");
+  sb_addf(s, "nr_inactive_file 0\n");
+  sb_addf(s, "nr_active_file 0\n");
+  sb_addf(s, "nr_mapped %lu\n", pages - free_pages);
+  sb_addf(s, "pgpgin 0\n");
+  sb_addf(s, "pgpgout 0\n");
+  sb_addf(s, "pswpin 0\n");
+  sb_addf(s, "pswpout 0\n");
+  sb_addf(s, "pgfault 0\n");
+  sb_addf(s, "pgmajfault 0\n");
+  return 0;
+}
+
 static int r_filesystems(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "nodev\tprocfs\n");
@@ -252,6 +278,39 @@ static int r_mounts(usize pid, struct sbuf *s) {
     const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
     /* device mountpoint fstype options dump pass */
     sb_addf(s, "%s %s %s %s 0 0\n", src, tgt, fstype, opts);
+  }
+  return 0;
+}
+
+/* /proc/self/mountinfo — Linux mountinfo format, needed by BusyBox `lsblk`
+ * (which xopen()s it and would abort if it were missing). The maj:min in
+ * field 3 is the synthetic 8:<blk-index> used by /sys/block + /proc/partitions
+ * for a `/dev/<blk>` source, else 0:<mount-index>. Layout:
+ *   id parent maj:min root mountpoint opts - fstype source superopts */
+static int r_mountinfo(usize pid, struct sbuf *s) {
+  (void)pid;
+  struct b1nix_mount_entry ents[MAX_MOUNTS];
+  isize n = vfs_mounts(ents, MAX_MOUNTS);
+  for (isize i = 0; i < n; i++) {
+    const char *src = ents[i].source[0] ? ents[i].source : "none";
+    const char *tgt = ents[i].target[0] ? ents[i].target : "/";
+    const char *fstype = ents[i].fstype[0] ? ents[i].fstype : "none";
+    const char *opts = (ents[i].flags & B1NIX_MS_RDONLY) ? "ro" : "rw";
+    int maj = 0, min = (int)i;
+    const char *devname = src;
+    if (strncmp(devname, "/dev/", 5) == 0)
+      devname += 5;
+    usize bn = blk_count();
+    for (usize b = 0; b < bn; b++) {
+      struct block_device *d = blk_at(b);
+      if (d && d->name && strcmp(d->name, devname) == 0) {
+        maj = 8;
+        min = (int)b;
+        break;
+      }
+    }
+    sb_addf(s, "%ld 1 %d:%d / %s %s - %s %s %s\n", (long)(i + 1), maj, min,
+            tgt, opts, fstype, src, opts);
   }
   return 0;
 }
@@ -476,6 +535,7 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
+  procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
   if (fddir)
     fddir->inode->readdir_cb = procfs_fd_readdir;
@@ -661,6 +721,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "version", VFS_DEVICE, r_version, 0);
   procfs_mkchild(root, "cpuinfo", VFS_DEVICE, r_cpuinfo, 0);
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
+  procfs_mkchild(root, "vmstat", VFS_DEVICE, r_vmstat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);

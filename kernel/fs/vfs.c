@@ -777,7 +777,9 @@ static struct vfs_node *vfs_cross_root_mount(struct vfs_node *node) {
 void virtio_blk_init(void);
 #ifndef __aarch64__
 extern char ps2_kbd_getc(void);
+extern int ps2_kbd_has_data(void);
 #endif
+int serial_has_data(void);
 
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
@@ -889,6 +891,7 @@ void vfs_inode_put(struct vfs_inode *inode) {
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }
+    vfs_free_xattrs(inode);
     vfs_free_inode(inode);
   }
 }
@@ -1813,6 +1816,54 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
   return (isize)size;
 }
 
+/* /dev/null: reads return EOF, writes are discarded, always ready to poll. */
+static isize null_read(struct vfs_node *node, u64 offset, char *buffer,
+                       usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)size;
+  (void)flags;
+  return 0;
+}
+
+static isize null_write(struct vfs_node *node, u64 offset, const char *buffer,
+                        usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)flags;
+  return (isize)size;
+}
+
+static int null_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  pfd->revents = B1NIX_POLLIN | B1NIX_POLLOUT;
+  return 0;
+}
+
+static void null_init_node(void) {
+  struct vfs_node *n = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
+  if (n) {
+    n->inode->read_cb = null_read;
+    n->inode->write_cb = null_write;
+    n->inode->poll_cb = null_poll;
+    n->inode->mode =
+        VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
+  }
+}
+
+static int tty_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
+  (void)node;
+  short revents = B1NIX_POLLOUT; /* the console is always writable */
+#ifndef __aarch64__
+  if (ps2_kbd_has_data() || serial_has_data())
+    revents |= B1NIX_POLLIN;
+#endif
+  pfd->revents = revents;
+  return 0;
+}
+
 static void tty_init_node(void) {
   memset(&console.termios, 0, sizeof(console.termios));
   console.termios.c_lflag = B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG;
@@ -1823,6 +1874,7 @@ static void tty_init_node(void) {
   if (tty) {
     tty->inode->read_cb = tty_read;
     tty->inode->write_cb = tty_write;
+    tty->inode->poll_cb = tty_poll;
     tty->inode->mode =
         VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
   }
@@ -1884,6 +1936,7 @@ void vfs_init(void) {
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
+  null_init_node();
   vfs_init_stdio();
 
 #ifndef __aarch64__
@@ -1933,6 +1986,17 @@ void vfs_repopulate_after_root_mount(void) {
   node = add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) {
     node->inode->mode = 0755;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->read_cb = null_read;
+    node->inode->write_cb = null_write;
+    node->inode->poll_cb = null_poll;
+    node->inode->mode = 0666;
     node->inode->uid = 0;
     node->inode->gid = 0;
     vfs_node_put(node);
@@ -2878,75 +2942,52 @@ static int split_parent_path(const char *path, char *parent_path, char *name) {
   return 0;
 }
 
-static int vfs_remove_node(const char *path, int is_rmdir) {
-  int res = 0;
-  char r_path[VFS_MAX_PATH];
-  vfs_resolve_path(path, r_path);
-  char p_path[VFS_MAX_PATH], name[64];
-  split_parent_path(r_path, p_path, name);
-  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
-    return -EINVAL;
-
-  struct vfs_node *parent = vfs_find_node(p_path);
-  if (IS_ERR(parent))
-    return (int)PTR_ERR(parent);
-
-  vfs_inode_lock(parent->inode);
+/* Core child-removal logic. The caller MUST already hold parent->inode's lock
+ * and a ref on parent; this neither locks/unlocks the inode nor drops the
+ * parent ref. `r_path` is the fully-resolved path of the child (used only for
+ * the mount-point guard); `name` is its final component. Shared by
+ * vfs_remove_node (which takes the lock) and vfs_rename_internal, which already
+ * holds the new-parent lock when replacing an existing rename target — calling
+ * the lock-taking vfs_remove_node there self-deadlocks on the parent inode. */
+static int vfs_remove_child_locked(struct vfs_node *parent, const char *r_path,
+                                   const char *name, int is_rmdir) {
   struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
-  if (mnt && (mnt->flags & MS_RDONLY)) {
-    res = -EROFS;
-    goto out_unlock;
-  }
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
   const struct cred *cred = get_current_cred();
-  if (cred && !vfs_get_node_perm(parent, cred, 2)) {
-    res = -EACCES;
-    goto out_unlock;
-  }
+  if (cred && !vfs_get_node_perm(parent, cred, 2))
+    return -EACCES;
 
   /* Защита точек монтирования */
   for (int i = 0; i < MAX_MOUNTS; i++) {
-    if (mounts[i].used && strcmp(mounts[i].target, r_path) == 0) {
-      res = -EBUSY;
-      goto out_unlock;
-    }
+    if (mounts[i].used && strcmp(mounts[i].target, r_path) == 0)
+      return -EBUSY;
   }
 
   struct vfs_node *prev = 0, *child = parent->first_child;
   while (child) {
     if (!child->deleted && strcmp(child->name, name) == 0) {
       if (cred && (parent->inode->mode & B1NIX_S_ISVTX)) {
-        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid) {
-          res = -EACCES;
-          goto out_unlock;
-        }
+        if (cred->euid != ROOT_UID && cred->euid != child->inode->uid && cred->euid != parent->inode->uid)
+          return -EACCES;
       }
       if (is_rmdir) {
-        if (child->inode->type != VFS_DIRECTORY) {
-          res = -ENOTDIR;
-          goto out_unlock;
-        }
-        if (child->first_child) {
-          res = -ENOTEMPTY;
-          goto out_unlock;
-        }
+        if (child->inode->type != VFS_DIRECTORY)
+          return -ENOTDIR;
+        if (child->first_child)
+          return -ENOTEMPTY;
       } else {
-        if (child->inode->type == VFS_DIRECTORY) {
-          res = -EISDIR;
-          goto out_unlock;
-        }
+        if (child->inode->type == VFS_DIRECTORY)
+          return -EISDIR;
       }
       if (parent->inode->unlink_cb && !is_rmdir) {
         int err = parent->inode->unlink_cb(parent, name);
-        if (err < 0) {
-          res = err;
-          goto out_unlock;
-        }
+        if (err < 0)
+          return err;
       } else if (parent->inode->rmdir_cb && is_rmdir) {
         int err = parent->inode->rmdir_cb(parent, name);
-        if (err < 0) {
-          res = err;
-          goto out_unlock;
-        }
+        if (err < 0)
+          return err;
       }
 
       vfs_node_get(child);
@@ -2965,15 +3006,28 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
       }
       vfs_node_put(child);
       dcache_invalidate(parent, name);
-      res = 0;
-      goto out_unlock;
+      return 0;
     }
     prev = child;
     child = child->next_sibling;
   }
-  res = -ENOENT;
+  return -ENOENT;
+}
 
-out_unlock:
+static int vfs_remove_node(const char *path, int is_rmdir) {
+  char r_path[VFS_MAX_PATH];
+  vfs_resolve_path(path, r_path);
+  char p_path[VFS_MAX_PATH], name[64];
+  split_parent_path(r_path, p_path, name);
+  if (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)
+    return -EINVAL;
+
+  struct vfs_node *parent = vfs_find_node(p_path);
+  if (IS_ERR(parent))
+    return (int)PTR_ERR(parent);
+
+  vfs_inode_lock(parent->inode);
+  int res = vfs_remove_child_locked(parent, r_path, name, is_rmdir);
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
   return res;
@@ -3301,7 +3355,11 @@ static int vfs_rename_internal(const char *old_path, const char *new_path) {
       res = -ENOTEMPTY;
       goto out_unlock;
     }
-    vfs_remove_node(new_res, 0);
+    /* Drop the existing target in place: new_parent->inode is already locked
+     * here, so the lock-taking vfs_remove_node() would self-deadlock on it
+     * (e.g. `rename("/etc/passwd+", "/etc/passwd")`). The `existing` ref is
+     * released at out_put_parents. */
+    vfs_remove_child_locked(new_parent, new_res, new_n, 0);
   }
 
   /* Move the node between parents under the vfs_tree_lock write side
@@ -3660,12 +3718,64 @@ int vfs_sync(void) {
   return 0;
 }
 
+int vfs_node_is_readonly(struct vfs_node *node) {
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return 1;
+  return 0;
+}
+
+int vfs_dup(int oldfd) {
+  struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
+  if (!old_handle)
+    return -EBADF;
+
+  int newfd = scheduler_fd_alloc(old_handle);
+  if (newfd < 0)
+    return newfd;
+
+  vfs_handle_retain(old_handle);
+  return newfd;
+}
+
+static int vfs_dup_min(int oldfd, int minfd) {
+  struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
+  if (!old_handle)
+    return -EBADF;
+  if (minfd < 0 || (usize)minfd >= SCHED_MAX_FD_LIMIT)
+    return -EINVAL;
+
+  usize limit = SCHED_MAX_FD_LIMIT;
+  struct rlimit rlim;
+  if (scheduler_getrlimit(RLIMIT_NOFILE, &rlim) == 0 && rlim.rlim_cur < limit)
+    limit = rlim.rlim_cur;
+  if ((usize)minfd >= limit)
+    return -EMFILE;
+
+  for (usize fd = (usize)minfd; fd < limit; fd++) {
+    if (scheduler_fd_get((int)fd) == 0) {
+      if (scheduler_fd_set((int)fd, old_handle) < 0)
+        return -EMFILE;
+      vfs_handle_retain(old_handle);
+      return (int)fd;
+    }
+  }
+  return -EMFILE;
+}
+
 int vfs_dup2(int oldfd, int newfd) {
   struct vfs_handle *old_handle = scheduler_fd_get(oldfd);
   if (!old_handle)
     return -EBADF;
   if (newfd < 0 || (usize)newfd >= SCHED_MAX_FD_LIMIT)
     return -EBADF;
+
+  struct rlimit rlim;
+  if (scheduler_getrlimit(RLIMIT_NOFILE, &rlim) == 0) {
+    if ((usize)newfd >= rlim.rlim_cur)
+      return -EBADF;
+  }
+
   if (oldfd == newfd)
     return newfd;
 
@@ -3677,11 +3787,150 @@ int vfs_dup2(int oldfd, int newfd) {
   return newfd;
 }
 
+int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
+  if (!node || !buf || buf_len == 0)
+    return -EINVAL;
+
+  struct vfs_node *path_nodes[128];
+  int count = 0;
+  struct vfs_node *curr = node;
+  while (curr && count < 128) {
+    path_nodes[count++] = curr;
+    if (curr->parent == curr || curr->parent == NULL) {
+      break;
+    }
+    curr = curr->parent;
+  }
+
+  usize pos = 0;
+  buf[0] = '\0';
+  for (int i = count - 1; i >= 0; i--) {
+    struct vfs_node *n = path_nodes[i];
+    if (n->parent == NULL) {
+      continue;
+    }
+    usize name_len = strlen(n->name);
+    if (pos + name_len + 2 > buf_len)
+      return -ENAMETOOLONG;
+    buf[pos++] = '/';
+    memcpy(buf + pos, n->name, name_len);
+    pos += name_len;
+    buf[pos] = '\0';
+  }
+  if (pos == 0) {
+    buf[0] = '/';
+    buf[1] = '\0';
+  }
+  return 0;
+}
+
+int vfs_ftruncate(int fd, u64 length) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h || !h->used)
+    return -EBADF;
+
+  if (h->kind != VFS_HANDLE_NODE || !h->node || !h->node->inode)
+    return -EINVAL;
+
+  struct vfs_node *node = h->node;
+  struct vfs_inode *inode = node->inode;
+
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+
+  if ((h->flags & 3) == B1NIX_O_RDONLY)
+    return -EINVAL;
+
+  vfs_inode_lock(inode);
+
+  if (inode->type != VFS_FILE) {
+    vfs_inode_unlock(inode);
+    return -EINVAL;
+  }
+
+  if (length > MAX_FILE_SIZE) {
+    vfs_inode_unlock(inode);
+    return -EFBIG;
+  }
+
+  if (inode->truncate_cb || inode->setattr_cb) {
+    if (length > inode->size && inode->write_cb) {
+      char *zeroes = kzalloc(4096);
+      if (!zeroes) {
+        vfs_inode_unlock(inode);
+        return -ENOMEM;
+      }
+      u64 off = inode->size;
+      while (off < length) {
+        usize chunk = (usize)(length - off);
+        if (chunk > 4096)
+          chunk = 4096;
+        isize written = inode->write_cb(node, off, zeroes, chunk, h->flags);
+        if (written < 0) {
+          kfree(zeroes);
+          vfs_inode_unlock(inode);
+          return (int)written;
+        }
+        if (written == 0) {
+          kfree(zeroes);
+          vfs_inode_unlock(inode);
+          return -EIO;
+        }
+        off += (u64)written;
+      }
+      kfree(zeroes);
+    }
+
+    if (inode->truncate_cb) {
+      int res = inode->truncate_cb(node, length);
+      vfs_inode_unlock(inode);
+      return res;
+    }
+
+    inode->size = (usize)length;
+    vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
+    int res = inode->setattr_cb(node);
+    vfs_inode_unlock(inode);
+    return res;
+  }
+
+  if (length > inode->capacity) {
+    usize new_cap = inode->capacity == 0 ? 1024 : inode->capacity * 2;
+    while (new_cap < length)
+      new_cap *= 2;
+    void *new_data = kzalloc(new_cap);
+    if (!new_data) {
+      vfs_inode_unlock(inode);
+      return -ENOMEM;
+    }
+    if (inode->data) {
+      memcpy(new_data, inode->data, inode->size);
+      if (inode->flags & VFS_NODE_OWNS_DATA)
+        kfree(inode->data);
+    }
+    inode->data = new_data;
+    inode->capacity = new_cap;
+    inode->flags |= VFS_NODE_OWNS_DATA;
+  } else if (length > inode->size) {
+    if (inode->data) {
+      memset((char *)inode->data + inode->size, 0, (usize)(length - inode->size));
+    }
+  }
+
+  inode->size = (usize)length;
+  vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
+  vfs_inode_unlock(inode);
+  return 0;
+}
+
 int vfs_fcntl(int fd, int cmd, u64 arg) {
   struct vfs_handle *h = get_handle(fd);
   if (!h)
     return -1;
   switch (cmd) {
+  case B1NIX_F_DUPFD:
+    return vfs_dup_min(fd, (int)arg);
   case B1NIX_F_GETFD:
     return scheduler_fd_flags_get(fd);
   case B1NIX_F_SETFD:
@@ -3949,6 +4198,199 @@ int vfs_get_acl(struct vfs_node *node, struct acl_entry *out_acl,
   for (int i = 0; i < count; i++)
     out_acl[i] = node->inode->acls[i];
   return count;
+}
+
+/* ── Extended attributes ──
+ * Per-inode in-memory name/value list. Path-based; the syscall layer copies
+ * names/values in and out, so these take kernel pointers. */
+
+void vfs_free_xattrs(struct vfs_inode *inode) {
+  if (!inode)
+    return;
+  struct vfs_xattr *x = inode->xattrs;
+  while (x) {
+    struct vfs_xattr *next = x->next;
+    if (x->value)
+      kfree(x->value);
+    kfree(x);
+    x = next;
+  }
+  inode->xattrs = 0;
+}
+
+static struct vfs_node *xattr_lookup(const char *path, int nofollow) {
+  return nofollow ? vfs_find_node_no_follow(path) : vfs_find_node(path);
+}
+
+/* Modifying xattrs needs ownership (or CAP_FOWNER), matching chmod/utime. */
+static int xattr_check_write(struct vfs_node *node) {
+  const struct cred *cred = get_current_cred();
+  if (!cred)
+    return -EACCES;
+  if (cred->euid != ROOT_UID && cred->euid != node->inode->uid &&
+      !cred_has_cap(cred, CAP_FOWNER))
+    return -EPERM;
+  return 0;
+}
+
+isize vfs_setxattr(const char *path, const char *name, const void *value,
+                   usize size, int flags, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  usize nlen = strlen(name);
+  if (nlen == 0 || nlen > XATTR_NAME_MAX)
+    return -ERANGE;
+  if (size > XATTR_VALUE_MAX)
+    return -E2BIG;
+
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = xattr_check_write(node);
+  if (ret != 0)
+    goto out;
+
+  struct vfs_xattr **pp = &node->inode->xattrs;
+  struct vfs_xattr *existing = 0;
+  while (*pp) {
+    if (strcmp((*pp)->name, name) == 0) {
+      existing = *pp;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  if (existing && (flags & XATTR_CREATE)) {
+    ret = -EEXIST;
+    goto out;
+  }
+  if (!existing && (flags & XATTR_REPLACE)) {
+    ret = -ENODATA;
+    goto out;
+  }
+
+  void *newval = 0;
+  if (size) {
+    newval = kmalloc(size);
+    if (!newval) {
+      ret = -ENOMEM;
+      goto out;
+    }
+    memcpy(newval, value, size);
+  }
+
+  if (existing) {
+    if (existing->value)
+      kfree(existing->value);
+    existing->value = newval;
+    existing->size = size;
+  } else {
+    struct vfs_xattr *x = kmalloc(sizeof(struct vfs_xattr));
+    if (!x) {
+      if (newval)
+        kfree(newval);
+      ret = -ENOMEM;
+      goto out;
+    }
+    x->next = 0;
+    memcpy(x->name, name, nlen);
+    x->name[nlen] = '\0';
+    x->value = newval;
+    x->size = size;
+    *pp = x; /* pp points at the tail's NULL link */
+  }
+  vfs_update_times(node->inode, VFS_CTIME);
+  ret = 0;
+
+out:
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_getxattr(const char *path, const char *name, void *value,
+                   usize size, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = -ENODATA;
+  for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
+    if (strcmp(x->name, name) != 0)
+      continue;
+    if (size == 0) {
+      ret = (isize)x->size; /* size query */
+    } else if (size < x->size) {
+      ret = -ERANGE;
+    } else {
+      if (x->size)
+        memcpy(value, x->value, x->size);
+      ret = (isize)x->size;
+    }
+    break;
+  }
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  usize total = 0;
+  for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next)
+    total += strlen(x->name) + 1;
+
+  isize ret;
+  if (size == 0) {
+    ret = (isize)total; /* size query */
+  } else if (size < total) {
+    ret = -ERANGE;
+  } else {
+    usize off = 0;
+    for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
+      usize n = strlen(x->name) + 1;
+      memcpy(list + off, x->name, n);
+      off += n;
+    }
+    ret = (isize)total;
+  }
+  vfs_node_put(node);
+  return ret;
+}
+
+isize vfs_removexattr(const char *path, const char *name, int nofollow) {
+  if (!name)
+    return -EFAULT;
+  struct vfs_node *node = xattr_lookup(path, nofollow);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  isize ret = xattr_check_write(node);
+  if (ret != 0)
+    goto out;
+
+  ret = -ENODATA;
+  struct vfs_xattr **pp = &node->inode->xattrs;
+  while (*pp) {
+    if (strcmp((*pp)->name, name) == 0) {
+      struct vfs_xattr *dead = *pp;
+      *pp = dead->next;
+      if (dead->value)
+        kfree(dead->value);
+      kfree(dead);
+      vfs_update_times(node->inode, VFS_CTIME);
+      ret = 0;
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+
+out:
+  vfs_node_put(node);
+  return ret;
 }
 
 int vfs_fchown(int fd, u16 uid, u16 gid) {

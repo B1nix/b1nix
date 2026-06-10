@@ -19,6 +19,8 @@
 #include <errno.h>
 #include <sys/klog.h>
 #include <sys/sysinfo.h>
+#include <sys/times.h>
+#include <sys/xattr.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -73,6 +75,14 @@ void _exit(int status) {
 
 int sleep(unsigned int seconds) {
   return (int)syscall(SYS_SLEEP, (unsigned long)seconds * 100);
+}
+
+int dup(int oldfd) {
+  return _check_err(syscall(SYS_DUP, oldfd));
+}
+
+int access(const char *path, int mode) {
+  return _check_err(syscall(SYS_ACCESS, path, mode));
 }
 
 int open(const char *path, int flags, ...) {
@@ -520,6 +530,44 @@ int poll(struct pollfd *fds, nfds_t nfds, int timeout) {
   return _check_err(syscall(SYS_POLL, fds, nfds, timeout));
 }
 
+int ppoll(struct pollfd *fds, nfds_t nfds, const struct timespec *timeout_ts, const sigset_t *sigmask) {
+  (void)sigmask;
+  int timeout = -1;
+  if (timeout_ts) {
+    timeout = timeout_ts->tv_sec * 1000 + timeout_ts->tv_nsec / 1000000;
+  }
+  return _check_err(syscall(SYS_POLL, fds, nfds, timeout));
+}
+
+/* ── Extended attributes (M44 / BusyBox getfattr). The l*xattr variants pass
+ * nofollow=1 so a terminal symlink is operated on rather than its target. ── */
+int setxattr(const char *path, const char *name, const void *value,
+             size_t size, int flags) {
+  return _check_err(syscall(SYS_SETXATTR, path, name, value, size, flags, 0));
+}
+int lsetxattr(const char *path, const char *name, const void *value,
+              size_t size, int flags) {
+  return _check_err(syscall(SYS_SETXATTR, path, name, value, size, flags, 1));
+}
+ssize_t getxattr(const char *path, const char *name, void *value, size_t size) {
+  return _check_err(syscall(SYS_GETXATTR, path, name, value, size, 0));
+}
+ssize_t lgetxattr(const char *path, const char *name, void *value, size_t size) {
+  return _check_err(syscall(SYS_GETXATTR, path, name, value, size, 1));
+}
+ssize_t listxattr(const char *path, char *list, size_t size) {
+  return _check_err(syscall(SYS_LISTXATTR, path, list, size, 0));
+}
+ssize_t llistxattr(const char *path, char *list, size_t size) {
+  return _check_err(syscall(SYS_LISTXATTR, path, list, size, 1));
+}
+int removexattr(const char *path, const char *name) {
+  return _check_err(syscall(SYS_REMOVEXATTR, path, name, 0));
+}
+int lremovexattr(const char *path, const char *name) {
+  return _check_err(syscall(SYS_REMOVEXATTR, path, name, 1));
+}
+
 int socket(int domain, int type, int protocol) {
   return _check_err(syscall(SYS_SOCKET, domain, type, protocol));
 }
@@ -748,15 +796,21 @@ int nanosleep(const struct timespec *req, struct timespec *rem) {
 }
 
 unsigned int alarm(unsigned int seconds) {
-  (void)seconds;
-  return 0;
+  return (unsigned int)syscall(SYS_ALARM, seconds);
 }
 
-/* No SIGALRM-driven interval timer yet; accept and report "disarmed". */
+/* Map ITIMER_REAL to alarm() for BusyBox ping. */
 int setitimer(int which, const struct itimerval *new_value,
               struct itimerval *old_value) {
-  (void)which;
-  (void)new_value;
+  if (which == 0 /* ITIMER_REAL */) {
+    if (new_value) {
+      unsigned int sec = (unsigned int)new_value->it_value.tv_sec;
+      if (sec == 0 && new_value->it_value.tv_usec > 0) {
+        sec = 1;
+      }
+      alarm(sec);
+    }
+  }
   if (old_value) {
     old_value->it_interval.tv_sec = 0;
     old_value->it_interval.tv_usec = 0;
@@ -782,8 +836,13 @@ int fchmod(int fd, mode_t mode) {
 }
 
 int ftruncate(int fd, off_t length) {
-  (void)fd;
-  return length == 0 ? 0 : -1;
+#ifdef __x86_64__
+  return _check_err(syscall(SYS_FTRUNCATE, fd, (long)length));
+#else
+  return _check_err(syscall(SYS_FTRUNCATE, fd,
+                            (long)(unsigned)(unsigned long long)length,
+                            (long)(unsigned)((unsigned long long)length >> 32)));
+#endif
 }
 
 #include <utime.h>
@@ -832,6 +891,10 @@ int execv(const char *pathname, char *const argv[]) {
 
 int kill(int pid, int sig) {
   return _check_err(syscall(SYS_KILL, pid, sig));
+}
+
+int killpg(int pgrp, int sig) {
+  return kill(-pgrp, sig);
 }
 
 pid_t wait(int *wstatus) {
@@ -932,11 +995,21 @@ pid_t getsid(pid_t pid) {
   return _check_err(syscall(SYS_GETSID, pid));
 }
 
+/* POSIX tcgetsid(): the session ID of the session for which `fd` is the
+ * controlling terminal. b1nix has no per-tty session query (no TIOCGSID), so
+ * this is a best-effort: fd must be a terminal (else ENOTTY), and the answer is
+ * the caller's own session — correct whenever fd is the caller's controlling
+ * terminal, which is how getty/login use it. */
+pid_t tcgetsid(int fd) {
+  if (!isatty(fd)) {
+    errno = ENOTTY;
+    return -1;
+  }
+  return getsid(0);
+}
+
 int getrlimit(int resource, struct rlimit *rlim) {
-  (void)resource;
-  (void)rlim;
-  errno = ENOSYS;
-  return -1;
+  return _check_err(syscall(SYS_GETRLIMIT, resource, rlim));
 }
 
 #include <sys/uio.h>
@@ -1057,11 +1130,7 @@ int sethostname(const char *name, size_t len) {
 }
 
 int setrlimit(int resource, const struct rlimit *rlim) {
-  /* b1nix has no per-process resource limits; accept the request as a no-op so
-   * callers that lower RLIMIT_CORE etc. (dropbear) proceed. */
-  (void)resource;
-  (void)rlim;
-  return 0;
+  return _check_err(syscall(SYS_SETRLIMIT, resource, rlim));
 }
 
 #include <syslog.h>
@@ -1304,8 +1373,10 @@ int uname(struct utsname *buf) {
 }
 
 int sigsuspend(const sigset_t *mask) {
-  (void)mask;
-  errno = ENOSYS;
+  if (mask) {
+    return _check_err(syscall(SYS_SIGSUSPEND, mask));
+  }
+  errno = EINVAL;
   return -1;
 }
 
@@ -1317,14 +1388,29 @@ long sysconf(int name) {
   return -1;
 }
 
+clock_t times(struct tms *buf) {
+  if (buf) {
+    buf->tms_utime = 0;
+    buf->tms_stime = 0;
+    buf->tms_cutime = 0;
+    buf->tms_cstime = 0;
+  }
+
+  struct timeval tv;
+  if (gettimeofday(&tv, NULL) < 0) {
+    return (clock_t)-1;
+  }
+
+  return (clock_t)tv.tv_sec * sysconf(_SC_CLK_TCK) +
+         (clock_t)((tv.tv_usec * sysconf(_SC_CLK_TCK)) / 1000000);
+}
+
 pid_t vfork(void) {
   return fork();
 }
 
 int fchdir(int fd) {
-  (void)fd;
-  errno = ENOSYS;
-  return -1;
+  return _check_err(syscall(SYS_FCHDIR, fd));
 }
 
 int chroot(const char *path) {

@@ -20,7 +20,11 @@ INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
-INITRAMFS_BUSYBOX_MODE := $(BUILD_DIR)/upstream_busybox_mode
+
+# Applet manifest for /bin replacement (M42 items 3 and 4).
+APPLET_MANIFEST := tools/applet-manifest.conf
+APPLET_SYMLINKS_INC := $(BUILD_DIR)/initramfs_applet_symlinks.inc
+APPLET_REGISTRATION_INC := $(BUILD_DIR)/initramfs_applet_registration.inc
 
 EMBEDDED_USER_PROGRAMS := \
 	m8_aio_test \
@@ -43,17 +47,13 @@ EMBEDDED_USER_PROGRAMS := \
 	m32_pcre2_smoke \
 	m34_smoke \
 	m35_smoke \
-	su passwd id whoami groups useradd userdel groupadd chown chmod
+	m42_w5pre_smoke \
+	su passwd groups useradd userdel groupadd halt setfattr
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
-UPSTREAM_BUSYBOX ?= 0
-ifeq ($(UPSTREAM_BUSYBOX),1)
-UPSTREAM_BUSYBOX_DEPS := $(INITRAMFS_BUSYBOX_INC)
-else
-UPSTREAM_BUSYBOX_DEPS :=
-endif
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
+# Upstream BusyBox is always embedded (M42 full integration).
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
@@ -63,8 +63,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_CACERT_INC) \
 	$(INITRAMFS_TLSTEST_INC) \
 	$(INITRAMFS_DROPBEAR_INC) \
-	$(UPSTREAM_BUSYBOX_DEPS)
-GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS)
+	$(INITRAMFS_BUSYBOX_INC)
+GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
@@ -224,7 +224,6 @@ KERNEL_SOURCES := \
 	kernel/sched/futex.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
-	kernel/user/busybox.c \
 	kernel/user/tui_common.c \
 	kernel/user/mc.c \
 	kernel/user/editor.c \
@@ -323,14 +322,29 @@ $(BUILD_DIR)/%.o: %.c
 $(BUILD_DIR)/kernel/lib/ftrace_demo.o: INSTRUMENT_FLAGS := -finstrument-functions
 
 $(BUILD_DIR)/kernel/arch/$(ARCH)/lapic.o: $(AP_TRAMPOLINE_INC)
-$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(INITRAMFS_BUSYBOX_MODE)
-$(BUILD_DIR)/kernel/fs/initramfs.o: INSTRUMENT_FLAGS += -include $(abspath $(INITRAMFS_BUSYBOX_MODE))
+$(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 
-$(INITRAMFS_BUSYBOX_MODE): FORCE
+# programs.c includes the generated applet registration .inc
+$(BUILD_DIR)/kernel/user/programs.o: $(APPLET_REGISTRATION_INC)
+
+# ── Applet manifest generation (M42 items 3 & 4) ──
+# Reads tools/applet-manifest.conf and generates:
+#   (a) initramfs_applet_symlinks.inc — symlink entries for upstream applets
+#   (b) initramfs_applet_registration.inc — conditional user_register_program calls
+#
+# The manifest controls per-command selection; upstream commands get a VFS
+# symlink to the embedded upstream BusyBox ELF, and their native registration
+# is skipped.  Native-only applets are always registered.
+
+$(APPLET_SYMLINKS_INC): $(APPLET_MANIFEST)
 	@mkdir -p $(dir $@)
-	@printf '#define B1NIX_UPSTREAM_BUSYBOX %s\n' '$(UPSTREAM_BUSYBOX)' > $@.tmp
-	@cmp -s $@.tmp $@ 2>/dev/null || cp $@.tmp $@
-	@rm -f $@.tmp
+	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") { cmd = $$1; if (cmd == "[") printf "  {\"/bin/[\", \"/opt/busybox/bin/busybox\", 24, INITRAMFS_SYMLINK},\n"; else printf "  {\"/bin/%s\", \"/opt/busybox/bin/busybox\", 24, INITRAMFS_SYMLINK},\n", cmd; } }' $< > $@
+
+$(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
+	@mkdir -p $(dir $@)
+	@printf '/* Generated from %s — native-only applets (upstream handled by VFS symlinks) */\n' '$<' > $@
+	@printf '\n' >> $@
+	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "native") printf "  user_register_program(\"/bin/%s\", busybox_main);\n", $$1; }' $< >> $@
 
 # Arch guard for the SHARED userspace build dir.
 #
@@ -396,7 +410,7 @@ $(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
 PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
-$(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc
 	tools/build-pcre2.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
@@ -421,18 +435,18 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
 OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
-$(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc
 	tools/build-openssl.sh >/dev/null
 
 LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
-$(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(LIBIDN2_LIB): tools/build-libidn2.sh tools/build-libunistring.sh tools/b1nix-autotools-cc
 	tools/build-libidn2.sh >/dev/null
 
 LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
-$(LIBPSL_LIB): tools/build-libpsl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(LIBPSL_LIB): tools/build-libpsl.sh tools/b1nix-autotools-cc
 	tools/build-libpsl.sh >/dev/null
 
-$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS) $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
+$(WGET_ELF): tools/build-wget.sh tools/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)
@@ -464,7 +478,7 @@ $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) us
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
 
-$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.36.1.config $(USERSPACE_DEPS)
+$(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_upstream_busybox_elf build/busybox-b1nix/$(B1NIX_TRIPLET)/busybox > $@
@@ -540,9 +554,6 @@ userspace-install: userspace
 
 busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh
-
-busybox-iso: UPSTREAM_BUSYBOX=1
-busybox-iso: iso
 
 install-native-toolchain:
 	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \

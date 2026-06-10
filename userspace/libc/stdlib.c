@@ -1,5 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
+#include <stdio.h>
 #include "syscall.h"
 #include <errno.h>
 #include <math.h>
@@ -349,16 +350,19 @@ long strtol(const char *nptr, char **endptr, int base)
 				base = 16;
 				s += 2;
 			} else {
+				/* Leading 0 selects octal, but the 0 is itself a digit: do
+				 * NOT skip it, or a "0" followed by a non-octal char (e.g.
+				 * "0+1") would consume no digits, leave any==0, and report
+				 * endptr==nptr — making strtoull-driven parsers (ash's
+				 * arithmetic) spin forever on a stuck cursor. The digit loop
+				 * below consumes the 0. */
 				base = 8;
-				s++;
 			}
 		} else {
 			base = 10;
 		}
 	} else if (base == 16) {
 		if (s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) s += 2;
-	} else if (base == 8) {
-		if (s[0] == '0') s++;
 	}
 
 	if (base == 0) base = 10;
@@ -909,6 +913,42 @@ int sigismember(const sigset_t *set, int signum) {
   }
   return (*set & (1UL << (signum - 1))) ? 1 : 0;
 }
+
+char *strsignal(int sig) {
+  static char unknown[24];
+  switch (sig) {
+  case SIGABRT: return "Aborted";
+  case SIGALRM: return "Alarm clock";
+  case SIGBUS: return "Bus error";
+  case SIGCHLD: return "Child exited";
+  case SIGCONT: return "Continued";
+  case SIGFPE: return "Floating point exception";
+  case SIGHUP: return "Hangup";
+  case SIGILL: return "Illegal instruction";
+  case SIGINT: return "Interrupt";
+  case SIGKILL: return "Killed";
+  case SIGPIPE: return "Broken pipe";
+  case SIGQUIT: return "Quit";
+  case SIGSEGV: return "Segmentation fault";
+  case SIGSTOP: return "Stopped";
+  case SIGTERM: return "Terminated";
+  case SIGTSTP: return "Stopped";
+  case SIGTTIN: return "Stopped (tty input)";
+  case SIGTTOU: return "Stopped (tty output)";
+  case SIGUSR1: return "User signal 1";
+  case SIGUSR2: return "User signal 2";
+  case SIGSYS: return "Bad system call";
+  case SIGTRAP: return "Trace/breakpoint trap";
+  case SIGXCPU: return "CPU time limit exceeded";
+  case SIGXFSZ: return "File size limit exceeded";
+  case SIGVTALRM: return "Virtual timer expired";
+  case SIGWINCH: return "Window changed";
+  default:
+    snprintf(unknown, sizeof(unknown), "Signal %d", sig);
+    return unknown;
+  }
+}
+
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
   if (rc < 0) {
@@ -941,9 +981,14 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	struct sigaction kernel_act;
 	if (act) {
 		kernel_act = *act;
-		if (!kernel_act.sa_restorer) {
-			kernel_act.sa_restorer = __sig_restorer;
-		}
+		/* sa_restorer is a non-portable, b1nix-internal implementation detail:
+		 * the kernel returns from a signal handler by jumping to it. POSIX apps
+		 * do not set it and routinely leave the field uninitialized (e.g.
+		 * dropbear's SIGCHLD handler only sets sa_handler/sa_flags/sa_mask).
+		 * Trusting a garbage value there made the handler "return" to a random
+		 * address → SIGSEGV. Always force our own trampoline regardless of what
+		 * the caller left in the field. */
+		kernel_act.sa_restorer = __sig_restorer;
 		kernel_act.sa_flags |= SA_RESTORER;
 		act = &kernel_act;
 	}

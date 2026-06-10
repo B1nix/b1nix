@@ -33,7 +33,12 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   struct b1nix_sigframe sf;
   memset(&sf, 0, sizeof(sf));
   sf.magic = B1NIX_SIGFRAME_MAGIC;
-  sf.old_blocked_signals = t->blocked_signals;
+  if (task_has_saved_sigmask(t)) {
+    sf.old_blocked_signals = task_saved_sigmask(t);
+    task_clear_saved_sigmask(t);
+  } else {
+    sf.old_blocked_signals = t->blocked_signals;
+  }
   sf.saved_frame = *frame;
 
   u32 sig_arg = (u32)sig;

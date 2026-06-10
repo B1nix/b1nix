@@ -2,6 +2,7 @@
 #define B1NIX_U_SYS_SOCKET_H
 
 #include <sys/types.h>
+#include <sys/uio.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -65,6 +66,36 @@ struct msghdr {
   socklen_t msg_controllen;
   int msg_flags;
 };
+
+/* Ancillary data (control messages). Standard Linux/musl layout — provided so
+ * recvmsg/sendmsg-with-cmsg consumers (e.g. BusyBox libbb/udp_io.c, which is
+ * linked into the nc applet but unused on the basic client/server paths) can
+ * compile and walk the control buffer. */
+struct cmsghdr {
+  socklen_t cmsg_len;
+  int cmsg_level;
+  int cmsg_type;
+};
+
+#define CMSG_ALIGN(len) (((len) + sizeof(size_t) - 1) & (size_t) ~(sizeof(size_t) - 1))
+#define CMSG_DATA(cmsg) ((unsigned char *)(((struct cmsghdr *)(cmsg)) + 1))
+#define CMSG_FIRSTHDR(mhdr) \
+  ((size_t)(mhdr)->msg_controllen >= sizeof(struct cmsghdr) \
+       ? (struct cmsghdr *)(mhdr)->msg_control \
+       : (struct cmsghdr *)0)
+#define __CMSG_LEN(cmsg) (((cmsg)->cmsg_len + sizeof(long) - 1) & (size_t) ~(sizeof(long) - 1))
+#define __CMSG_NEXT(cmsg) ((unsigned char *)(cmsg) + __CMSG_LEN(cmsg))
+#define __MHDR_END(mhdr) ((unsigned char *)(mhdr)->msg_control + (mhdr)->msg_controllen)
+#define CMSG_NXTHDR(mhdr, cmsg) \
+  ((cmsg)->cmsg_len < sizeof(struct cmsghdr) || \
+           __CMSG_LEN(cmsg) + sizeof(struct cmsghdr) >= \
+               (size_t)(__MHDR_END(mhdr) - (unsigned char *)(cmsg)) \
+       ? (struct cmsghdr *)0 \
+       : (struct cmsghdr *)__CMSG_NEXT(cmsg))
+#define CMSG_SPACE(len) (CMSG_ALIGN(len) + CMSG_ALIGN(sizeof(struct cmsghdr)))
+#define CMSG_LEN(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
+
+#define SCM_RIGHTS 0x01
 
 #define AF_UNIX         1
 #define AF_LOCAL        AF_UNIX

@@ -544,8 +544,13 @@ static u64 sys_ioctl(int fd, u64 request, void *arg) {
 static int user_frame_is_valid(const struct interrupt_frame *frame) {
   if (!frame)
     return 1;
+#ifdef __x86_64__
+  if (frame->cs != 0x23 || frame->ss != 0x1B)
+    return 0;
+#else
   if (frame->cs != 0x1B || frame->ss != 0x23)
     return 0;
+#endif
   if (frame->rip >= USER_SPACE_LIMIT ||
       frame->rsp >= USER_SPACE_LIMIT)
     return 0;
@@ -883,6 +888,321 @@ static isize sys_chdir(const char *user_path) {
   return res;
 }
 
+static isize sys_access(const char *user_path, int mode) {
+  if ((mode & ~(R_OK | W_OK | X_OK)) != 0)
+    return -EINVAL;
+
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  struct vfs_node *node = vfs_find_node(resolved);
+  if (IS_ERR(node))
+    return (isize)PTR_ERR(node);
+
+  if (mode != 0) {
+    const struct cred *cred = scheduler_get_current_cred();
+    if (!cred) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
+
+    struct cred access_cred = *cred;
+    access_cred.euid = cred->uid;
+    access_cred.egid = cred->gid;
+    if (access_cred.euid == ROOT_UID && (mode & X_OK) &&
+        (node->inode->mode & 0111) == 0) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
+    if (!cred_can_access(&access_cred, node->inode->uid, node->inode->gid,
+                         node->inode->mode, (u32)mode)) {
+      vfs_node_put(node);
+      return -EACCES;
+    }
+  }
+
+  if (mode & 2) { // W_OK
+    if (vfs_node_is_readonly(node)) {
+      vfs_node_put(node);
+      return -EROFS;
+    }
+  }
+
+  vfs_node_put(node);
+  return 0;
+}
+
+static isize sys_fchdir(int fd) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h || !h->used)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_NODE || !h->node || !h->node->inode)
+    return -EINVAL;
+  if (h->node->inode->type != VFS_DIRECTORY)
+    return -ENOTDIR;
+
+  char resolved[VFS_MAX_PATH];
+  int err = vfs_get_node_path(h->node, resolved, VFS_MAX_PATH);
+  if (err < 0)
+    return err;
+
+  return (isize)scheduler_set_cwd(resolved);
+}
+
+static u64 sys_alarm(unsigned int seconds) {
+  if (!current_task)
+    return 0;
+
+  u64 current_ticks = scheduler_get_uptime_ticks();
+  u64 old_alarm = task_alarm_ticks(current_task);
+  u64 remaining = 0;
+  if (old_alarm > 0) {
+    if (old_alarm > current_ticks) {
+      remaining = (old_alarm - current_ticks + 99) / 100;
+    } else {
+      remaining = 0;
+    }
+  }
+
+  if (seconds == 0) {
+    task_set_alarm_ticks(current_task, 0);
+  } else {
+    task_set_alarm_ticks(current_task, current_ticks + (u64)seconds * 100);
+  }
+
+  return remaining;
+}
+
+static u64 sys_sigsuspend(const u64 *user_mask) {
+  if (!current_task)
+    return (u64)-EINVAL;
+  if (!user_mask)
+    return (u64)-EFAULT;
+
+  u64 mask;
+  if (syscall_copyin(&mask, user_mask, sizeof(u64)) < 0) {
+    return (u64)-EFAULT;
+  }
+
+  task_set_saved_sigmask(current_task, current_task->blocked_signals, 1);
+
+  u64 new_mask = mask & ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  current_task->blocked_signals = new_mask;
+
+  u64 flags = interrupts_save();
+  while (1) {
+    u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+    int has_deliverable = 0;
+    for (int i = 1; i <= NSIG; i++) {
+      if (pending & (1ULL << (i - 1))) {
+        sighandler_t handler = current_task->sigactions[i - 1].sa_handler;
+        if (handler == SIG_IGN || (handler == SIG_DFL && (i == SIGCHLD || i == SIGURG || i == SIGWINCH || (i == SIGCONT && current_task->state != TASK_STOPPED)))) {
+          __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+        } else if (handler == SIG_DFL &&
+                   (i == SIGSTOP || i == SIGTSTP ||
+                    i == SIGTTIN || i == SIGTTOU)) {
+          current_task->state = TASK_STOPPED;
+          current_task->last_stop_signal = i;
+          current_task->stop_report_pending = 1;
+          __atomic_fetch_and(&current_task->pending_signals,
+                             ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+          scheduler_notify_wait_event(current_task->parent_id);
+          interrupts_restore(flags);
+          scheduler_yield();
+          flags = interrupts_save();
+        } else if (handler == SIG_DFL && i == SIGCONT) {
+          __atomic_fetch_and(&current_task->pending_signals,
+                             ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+        } else {
+          has_deliverable = 1;
+        }
+      }
+    }
+    if (has_deliverable) {
+      break;
+    }
+    current_task->state = TASK_BLOCKED;
+    scheduler_yield();
+  }
+  interrupts_restore(flags);
+
+  if (task_has_saved_sigmask(current_task)) {
+    current_task->blocked_signals = task_saved_sigmask(current_task);
+    task_clear_saved_sigmask(current_task);
+  }
+
+  return (u64)-EINTR;
+}
+
+static isize sys_getrlimit(int resource, struct rlimit *user_rlim) {
+  struct rlimit rlim;
+  int err = scheduler_getrlimit(resource, &rlim);
+  if (err < 0)
+    return err;
+
+  if (syscall_copyout(user_rlim, &rlim, sizeof(rlim)) < 0)
+    return -EFAULT;
+
+  return 0;
+}
+
+static isize sys_setrlimit(int resource, const struct rlimit *user_rlim) {
+  struct rlimit rlim;
+  if (syscall_copyin(&rlim, user_rlim, sizeof(rlim)) < 0)
+    return -EFAULT;
+
+  return scheduler_setrlimit(resource, &rlim);
+}
+
+/* ── Extended-attribute syscalls (M44 / wave 7) ──
+ * The path and name are NUL-terminated user strings; the value is a raw
+ * byte buffer of `size` bytes. `nofollow` selects the l*xattr variant. */
+static isize sys_setxattr(const char *user_path, const char *user_name,
+                          const void *user_value, usize size, int flags,
+                          int nofollow) {
+  if (size > XATTR_VALUE_MAX)
+    return -E2BIG;
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  void *kval = 0;
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out_path;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out_path;
+  }
+  if (size) {
+    kval = kmalloc(size);
+    if (!kval) {
+      ret = -ENOMEM;
+      goto out_path;
+    }
+    if (syscall_copyin(kval, user_value, size) < 0) {
+      ret = -EFAULT;
+      goto out_val;
+    }
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  ret = vfs_setxattr(resolved, kname, kval, size, flags, nofollow);
+out_val:
+  if (kval)
+    kfree(kval);
+out_path:
+  kfree(kpath);
+  return ret;
+}
+
+static isize sys_getxattr(const char *user_path, const char *user_name,
+                          void *user_value, usize size, int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  if (size == 0) {
+    ret = vfs_getxattr(resolved, kname, 0, 0, nofollow); /* size query */
+    goto out;
+  }
+  usize cap = size > XATTR_VALUE_MAX ? XATTR_VALUE_MAX : size;
+  void *kbuf = kmalloc(cap);
+  if (!kbuf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+  ret = vfs_getxattr(resolved, kname, kbuf, cap, nofollow);
+  if (ret > 0 && syscall_copyout(user_value, kbuf, (usize)ret) < 0)
+    ret = -EFAULT;
+  kfree(kbuf);
+out:
+  kfree(kpath);
+  return ret;
+}
+
+static isize sys_listxattr(const char *user_path, char *user_list, usize size,
+                           int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  if (size == 0) {
+    ret = vfs_listxattr(resolved, 0, 0, nofollow); /* size query */
+    goto out;
+  }
+  /* Bound the kernel buffer; the full xattr name set cannot exceed this. */
+  usize cap = size > 8192 ? 8192 : size;
+  char *kbuf = kmalloc(cap);
+  if (!kbuf) {
+    ret = -ENOMEM;
+    goto out;
+  }
+  ret = vfs_listxattr(resolved, kbuf, cap, nofollow);
+  if (ret > 0 && syscall_copyout(user_list, kbuf, (usize)ret) < 0)
+    ret = -EFAULT;
+  kfree(kbuf);
+out:
+  kfree(kpath);
+  return ret;
+}
+
+static isize sys_removexattr(const char *user_path, const char *user_name,
+                             int nofollow) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  char kname[XATTR_NAME_MAX + 1];
+  isize ret;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  if (strncpy_from_user(kname, user_name, sizeof(kname)) < 0) {
+    ret = -EFAULT;
+    goto out;
+  }
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  ret = vfs_removexattr(resolved, kname, nofollow);
+out:
+  kfree(kpath);
+  return ret;
+}
+
 static isize sys_mount(const char *user_src, const char *user_target,
                        const char *user_type, u64 flags) {
   char *ksrc = kmalloc(VFS_MAX_PATH);
@@ -1038,6 +1358,18 @@ static isize sys_umask(u16 mask) {
   return old_mask;
 }
 
+/* True if a caught signal (one with an installed user handler) is deliverable
+ * now. Used to make blocking select()/poll() return EINTR, as POSIX requires —
+ * b1nix historically never interrupted them. Unlike the waitpid predicate this
+ * DOES include SIGCHLD: dropbear's session loop arms a SIGCHLD handler that
+ * writes a self-pipe to wake select(), and relies on select() returning EINTR
+ * so it can reap the exited child and forward its output/exit-status in order.
+ * SIGKILL/SIGSTOP are never caught, so excluding the SIG_DFL/SIG_IGN cases here
+ * leaves their default handling to the normal delivery path. */
+static int select_poll_signal_pending(void) {
+  return scheduler_signal_pending();
+}
+
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
   struct b1nix_pollfd fds[16];
   if (nfds > 16)
@@ -1094,6 +1426,16 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       current_task->wake_tick = 0;
       syscall_copyout(user_fds, fds, nfds * sizeof(struct b1nix_pollfd));
       return (u64)ready;
+    }
+
+    /* Interrupted by a caught signal? Abort with -ERESTARTSYS so the dispatch
+     * tail returns EINTR (or restarts under SA_RESTART) and delivers the
+     * handler. Checked with IRQs still disabled (from wait_prepare) so a signal
+     * posted concurrently is not missed before we sleep. */
+    if (select_poll_signal_pending()) {
+      scheduler_wait_cancel();
+      current_task->wake_tick = 0;
+      return (u64)-ERESTARTSYS;
     }
 
     scheduler_wait_commit();
@@ -1548,7 +1890,51 @@ static volatile u32 g_user_cpu_mask = 0;
 
 u32 sched_user_cpu_mask(void) { return g_user_cpu_mask; }
 
+static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5, struct interrupt_frame *frame);
+
 u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
+                     u64 arg4, u64 arg5, struct interrupt_frame *frame) {
+  u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
+
+  if (frame) {
+    if (ret == (u64)-ERESTARTSYS) {
+      u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                    __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+      int restart = 1;
+      for (int i = 1; i < NSIG; i++) {
+        if (pending & (1ULL << (i - 1))) {
+          struct sigaction *sa = &current_task->sigactions[i - 1];
+          if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
+            if (!(sa->sa_flags & SA_RESTART)) {
+              restart = 0;
+            }
+            break;
+          }
+        }
+      }
+      if (restart) {
+        frame->rip -= 2;
+        frame->rax = number;
+        ret = number;
+      } else {
+        ret = (u64)-EINTR;
+        frame->rax = (usize)-EINTR;
+      }
+    }
+
+    frame->rax = ret;
+    arch_check_and_deliver_signals(frame);
+    if (!user_frame_is_valid(frame)) {
+      scheduler_exit_current(-SIGSEGV);
+      return (u64)-EFAULT;
+    }
+  }
+
+  return ret;
+}
+
+static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
                      u64 arg4, u64 arg5, struct interrupt_frame *frame) {
   u64 ret = 0;
 
@@ -1585,10 +1971,6 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   }
   case SYS_YIELD:
     scheduler_yield();
-    if (frame) {
-      frame->rax = 0;
-      arch_check_and_deliver_signals(frame);
-    }
     return 0;
   case SYS_OPEN: {
     return (u64)sys_open((const char *)(usize)arg0, (int)arg1);
@@ -1724,12 +2106,55 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
      * The userspace libc does NOT use SYS_WAIT — its wait() maps to
      * SYS_WAITPID(-1, status, 0). */
     return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
-  case SYS_WAITPID:
-    return (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+  case SYS_WAITPID: {
+    u64 wr = (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+    /* ERESTARTSYS conversion and signal delivery handled by the wrapper. */
+    return wr;
+  }
   case SYS_GETPID:
     return (u64)scheduler_get_pid();
   case SYS_GETPPID:
     return (u64)(current_task ? current_task->parent_id : 0);
+  case SYS_SIGSUSPEND: {
+    /* Signal delivery handled by the wrapper after we return. */
+    u64 r = sys_sigsuspend((const u64 *)(usize)arg0);
+    return r;
+  }
+  case SYS_ALARM:
+    return (u64)sys_alarm((unsigned int)arg0);
+  case SYS_FCHDIR:
+    return (u64)sys_fchdir((int)arg0);
+  case SYS_ACCESS:
+    return (u64)sys_access((const char *)(usize)arg0, (int)arg1);
+  case SYS_FTRUNCATE: {
+#ifdef __x86_64__
+    return (u64)vfs_ftruncate((int)arg0, arg1);
+#else
+    u64 len = ((u64)arg2 << 32) | (u32)arg1;
+    return (u64)vfs_ftruncate((int)arg0, len);
+#endif
+  }
+  case SYS_DUP:
+    return (u64)vfs_dup((int)arg0);
+  case SYS_GETRLIMIT:
+    return (u64)sys_getrlimit((int)arg0, (struct rlimit *)(usize)arg1);
+  case SYS_SETRLIMIT:
+    return (u64)sys_setrlimit((int)arg0, (const struct rlimit *)(usize)arg1);
+  case SYS_SETXATTR:
+    return (u64)sys_setxattr((const char *)(usize)arg0,
+                             (const char *)(usize)arg1,
+                             (const void *)(usize)arg2, (usize)arg3,
+                             (int)arg4, (int)arg5);
+  case SYS_GETXATTR:
+    return (u64)sys_getxattr((const char *)(usize)arg0,
+                             (const char *)(usize)arg1, (void *)(usize)arg2,
+                             (usize)arg3, (int)arg4);
+  case SYS_LISTXATTR:
+    return (u64)sys_listxattr((const char *)(usize)arg0, (char *)(usize)arg1,
+                              (usize)arg2, (int)arg3);
+  case SYS_REMOVEXATTR:
+    return (u64)sys_removexattr((const char *)(usize)arg0,
+                                (const char *)(usize)arg1, (int)arg2);
   case SYS_GETCPU: {
     struct percpu *p = get_percpu();
     return (u64)(p ? p->cpu_id : 0);
@@ -1831,10 +2256,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     } else {
       kill_ret = (u64)scheduler_kill((usize)target, (int)arg1);
     }
-    if (frame) {
-      frame->rax = kill_ret;
-      arch_check_and_deliver_signals(frame);
-    }
+    /* Signal delivery handled by the wrapper. */
     return kill_ret;
   }
   case SYS_SIGNAL: {
@@ -2108,7 +2530,14 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   case SYS_CHDIR:
     return (u64)sys_chdir((const char *)(usize)arg0);
 
-  case SYS_REBOOT:
+  case SYS_REBOOT: {
+    /* Privileged: like Linux reboot()/CAP_SYS_BOOT, only root may halt or
+     * reboot the machine. A NULL cred is an in-kernel caller (init kthread),
+     * which is allowed. This is why /bin/{halt,reboot,poweroff,shutdown} are
+     * NOT setuid — they are plain root-owned binaries. */
+    const struct cred *rb_cred = scheduler_get_current_cred();
+    if (rb_cred && rb_cred->euid != ROOT_UID)
+      return (u64)-EPERM;
     if ((int)arg0 == B1NIX_REBOOT_POWEROFF) {
       console_write("reboot: powering off\n");
       /* QEMU/Bochs ACPI shutdown ports - no full ACPI parsing needed. */
@@ -2137,6 +2566,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
       arch_halt();
     }
     break;
+  }
   case SYS_DMESG:
     if (!arg0 || arg1 == 0)
       return (u64)-EINVAL;
@@ -2217,7 +2647,10 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     return (u64)vfs_link(target, link_path);
   }
   case SYS_POLL:
-    return sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
+    /* Through the tail so a -ERESTARTSYS from an interrupting signal becomes
+     * -EINTR (or a restart) and the pending handler is delivered. */
+    ret = sys_poll((struct b1nix_pollfd *)arg0, arg1, arg2);
+    break;
   case SYS_SIGRETURN:
     ret = sys_sigreturn(frame);
     break;
@@ -2330,6 +2763,7 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
 
     extern void *vfs_poll_chan;
     int ready_count = 0;
+    int select_eintr = 0;
     while (1) {
       /* Publish BLOCKED before the fd scan — same SMP lost-wakeup fix as
        * sys_poll above (the SSH/select wedge). */
@@ -2352,10 +2786,22 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
         scheduler_wait_cancel();
         break;
       }
+      /* Interrupted by a caught signal (incl. SIGCHLD)? Bail to the tail with
+       * -ERESTARTSYS — dropbear's session loop expects select() to return EINTR
+       * so it can reap the exited child and forward its output in order. */
+      if (select_poll_signal_pending()) {
+        scheduler_wait_cancel();
+        select_eintr = 1;
+        break;
+      }
       scheduler_wait_commit();
     }
 
     current_task->wake_tick = 0;
+    if (select_eintr) {
+      ret = (u64)-ERESTARTSYS;
+      break;
+    }
 
     /* Translate revents back to fd_sets. */
     u8 r_kout[128] = {0}, w_kout[128] = {0}, e_kout[128] = {0};
@@ -2404,40 +2850,8 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
     break;
   }
 
-  if (frame && ret == (u64)-ERESTARTSYS) {
-    /* Acquire-load: a concurrent killer publishes bits with a release RMW. */
-    u64 pending = __atomic_load_n(&current_task->pending_signals,
-                                  __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
-    int restart = 1;
-    for (int i = 1; i < NSIG; i++) {
-      if (pending & (1ULL << (i - 1))) {
-        struct sigaction *sa = &current_task->sigactions[i - 1];
-        if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
-          if (!(sa->sa_flags & SA_RESTART)) {
-            restart = 0;
-          }
-          break;
-        }
-      }
-    }
-    if (restart) {
-      frame->rip -= 2;
-      frame->rax = number;
-      ret = number;
-    } else {
-      ret = (u64)-EINTR;
-      frame->rax = (u64)-EINTR;
-    }
-  }
-
-  /* Check for pending signals before returning to userspace */
-  if (frame) {
-    arch_check_and_deliver_signals(frame);
-    if (!user_frame_is_valid(frame)) {
-      scheduler_exit_current(-SIGSEGV);
-      return (u64)-EFAULT;
-    }
-  }
+  /* ERESTARTSYS conversion, frame->rax publication, and signal delivery are
+   * all handled uniformly by the outer syscall_dispatch_impl wrapper. */
 
   return ret;
 }

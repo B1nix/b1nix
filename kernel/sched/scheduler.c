@@ -94,6 +94,10 @@ static usize        g_task_hwm = 0;  /* one past highest slot ever used */
 static int  g_task_is_thread[MAX_TASKS];
 static u64  g_task_tls_base[MAX_TASKS];
 static u64  g_task_child_tid_clear[MAX_TASKS];
+static u64  g_task_saved_sigmask[MAX_TASKS];
+static int  g_task_has_saved_sigmask[MAX_TASKS];
+static u64  g_task_alarm_ticks[MAX_TASKS];
+static struct rlimit g_task_rlimits[MAX_TASKS][16];
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -216,6 +220,15 @@ static struct task *find_unused_task(void) {
       g_task_is_thread[i] = 0;
       g_task_tls_base[i] = 0;
       g_task_child_tid_clear[i] = 0;
+      g_task_saved_sigmask[i] = 0;
+      g_task_has_saved_sigmask[i] = 0;
+      g_task_alarm_ticks[i] = 0;
+      for (int r = 0; r < 16; r++) {
+        g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
+        g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
+      }
+      g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
+      g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
       T(i)->state = TASK_BLOCKED;
       T(i)->id = next_task_id++;
       tasks_unlock(flags);
@@ -237,6 +250,18 @@ static struct task *find_unused_task(void) {
   /* Chunk was kzalloc'd, but be explicit so a slot that gets reused after
    * free_task_slot starts from a clean state too (same as the old path). */
   memset(T(i), 0, sizeof(struct task));
+  g_task_is_thread[i] = 0;
+  g_task_tls_base[i] = 0;
+  g_task_child_tid_clear[i] = 0;
+  g_task_saved_sigmask[i] = 0;
+  g_task_has_saved_sigmask[i] = 0;
+  g_task_alarm_ticks[i] = 0;
+  for (int r = 0; r < 16; r++) {
+    g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
+    g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
+  }
+  g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
+  g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
   T(i)->state = TASK_BLOCKED;
   T(i)->id = next_task_id++;
   tasks_unlock(flags);
@@ -540,6 +565,18 @@ void scheduler_init(void) {
   boot->pml4_phys = 0; // Kernel PML4
   boot->vma_list = 0;
   task_init_cred(boot);
+  g_task_is_thread[0] = 0;
+  g_task_tls_base[0] = 0;
+  g_task_child_tid_clear[0] = 0;
+  g_task_saved_sigmask[0] = 0;
+  g_task_has_saved_sigmask[0] = 0;
+  g_task_alarm_ticks[0] = 0;
+  for (int r = 0; r < 16; r++) {
+    g_task_rlimits[0][r].rlim_cur = RLIM_INFINITY;
+    g_task_rlimits[0][r].rlim_max = RLIM_INFINITY;
+  }
+  g_task_rlimits[0][RLIMIT_NOFILE].rlim_cur = 1024;
+  g_task_rlimits[0][RLIMIT_NOFILE].rlim_max = 1024;
   current_task = boot;
   scheduler_started = 1;
 
@@ -842,6 +879,16 @@ int scheduler_fork_current(void) {
   child->wake_tick = 0;
   child->wait_chan = 0;
 
+  // Copy side-table metadata from parent to child
+  usize p_idx = task_index(parent);
+  usize c_idx = task_index(child);
+  g_task_saved_sigmask[c_idx] = 0;
+  g_task_has_saved_sigmask[c_idx] = 0;
+  g_task_alarm_ticks[c_idx] = 0;
+  for (int r = 0; r < 16; r++) {
+    g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
+  }
+
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
   memcpy(child_stack, parent_stack, KERNEL_STACK_SIZE);
@@ -1083,6 +1130,63 @@ void task_set_child_tid_clear(struct task *t, u64 addr) {
   if (!t) return;
   g_task_child_tid_clear[task_index(t)] = addr;
 }
+u64 task_saved_sigmask(const struct task *t) {
+  if (!t) return 0;
+  return g_task_saved_sigmask[task_index(t)];
+}
+int task_has_saved_sigmask(const struct task *t) {
+  if (!t) return 0;
+  return g_task_has_saved_sigmask[task_index(t)];
+}
+void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved) {
+  if (!t) return;
+  usize idx = task_index(t);
+  g_task_saved_sigmask[idx] = mask;
+  g_task_has_saved_sigmask[idx] = has_saved;
+}
+void task_clear_saved_sigmask(struct task *t) {
+  if (!t) return;
+  g_task_has_saved_sigmask[task_index(t)] = 0;
+}
+u64 task_alarm_ticks(const struct task *t) {
+  if (!t) return 0;
+  return g_task_alarm_ticks[task_index(t)];
+}
+void task_set_alarm_ticks(struct task *t, u64 ticks) {
+  if (!t) return;
+  g_task_alarm_ticks[task_index(t)] = ticks;
+}
+int scheduler_getrlimit(int resource, struct rlimit *rlim) {
+  if (resource < 0 || resource >= 16 || !rlim || !current_task)
+    return -EINVAL;
+  usize idx = task_index(current_task);
+  *rlim = g_task_rlimits[idx][resource];
+  return 0;
+}
+int scheduler_setrlimit(int resource, const struct rlimit *rlim) {
+  if (resource < 0 || resource >= 16 || !rlim || !current_task)
+    return -EINVAL;
+  if (rlim->rlim_cur > rlim->rlim_max)
+    return -EINVAL;
+  const struct cred *cred = scheduler_get_current_cred();
+  usize idx = task_index(current_task);
+  if (cred && cred->euid != ROOT_UID) {
+    if (rlim->rlim_max > g_task_rlimits[idx][resource].rlim_max) {
+      return -EPERM;
+    }
+  }
+  g_task_rlimits[idx][resource] = *rlim;
+  if (current_task->pml4_phys != 0) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *t = T(i);
+      if (t->state == TASK_UNUSED || t->state == TASK_REAPING)
+        continue;
+      if (t->pml4_phys == current_task->pml4_phys)
+        g_task_rlimits[i][resource] = *rlim;
+    }
+  }
+  return 0;
+}
 
 /* M29: thread-task user entry. Runs in ring 0 on the new thread's kernel
  * stack via kernel_thread_trampoline, then drops to ring 3 at the user
@@ -1122,19 +1226,40 @@ static void clone_thread_kentry(void *arg) {
 #endif
 }
 
-/* Look up the number of live tasks currently using this pml4 (excluding
- * `except`). Caller must hold interrupts disabled (matches the reap path's
- * existing convention). */
-static int pml4_other_refs(u64 pml4_phys, const struct task *except) {
-  if (pml4_phys == 0) return 0;
-  int n = 0;
-  for (usize i = 0; i < g_task_hwm; i++) {
-    struct task *t = T(i);
-    if (t == except) continue;
-    if (t->state == TASK_UNUSED || t->state == TASK_REAPING) continue;
-    if (t->pml4_phys == pml4_phys) n++;
+/* Serializes the "last user of this mm" decision across CPUs. Leaf lock:
+ * nothing else is acquired while it is held, and the critical section is a
+ * bounded table scan. */
+static spinlock_t g_mm_release_lock = SPINLOCK_INIT;
+
+/* Atomically drop t's reference to its shared address space. Clears
+ * t->pml4_phys under g_mm_release_lock and counts the remaining holders;
+ * returns the pml4 root iff t was the LAST user (the caller must then tear
+ * the mm down), 0 otherwise. The lock is what makes the decision sound:
+ * with an unlocked refs scan, two reapers on different CPUs could each
+ * claim a different "last" sibling (each excluding itself and skipping the
+ * other's REAPING state), both observe zero refs, and both free the same
+ * page tables — a pmm double-free that resurfaced as poison in whatever
+ * process reused the frames (the M29 no-join stress hang under -smp 4).
+ * Serializing drop-then-count means exactly one caller — the one whose
+ * drop empties the holder set — wins the teardown. REAPING holders still
+ * count as refs here: their own mm_release_user call hasn't dropped them
+ * yet, and it will see the updated holder set when it runs. */
+static u64 mm_release_user(struct task *t) {
+  u64 flags;
+  spin_lock_irqsave(&g_mm_release_lock, &flags);
+  u64 p = t->pml4_phys;
+  t->pml4_phys = 0;
+  int refs = 0;
+  if (p) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *o = T(i);
+      if (o == t) continue;
+      if (o->state == TASK_UNUSED) continue;
+      if (o->pml4_phys == p) refs++;
+    }
   }
-  return n;
+  spin_unlock_irqrestore(&g_mm_release_lock, flags);
+  return (p && refs == 0) ? p : 0;
 }
 
 static int fdtable_other_refs(struct vfs_handle **tbl, const struct task *except) {
@@ -1211,6 +1336,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
   /* Name — keep short (kthread_create truncates at 15 chars). */
   child->name = strdup("pthread");
+
+  usize p_idx = task_index(parent);
+  usize c_idx = task_index(child);
+  for (int r = 0; r < 16; r++)
+    g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
   /* Address-space inheritance. */
   if (flags & B1NIX_CLONE_VM) {
@@ -1319,15 +1449,48 @@ void scheduler_reap_dead_threads(void) {
   /* Called from scheduler_yield with interrupts already disabled. Free the
    * kernel stack + slot of any DEAD thread (is_thread=1) whose
    * arch_context_switch has finished swapping RSP off its kernel stack
-   * (stack_released==1). The shared mm/fds/user_image are NOT touched here
-   * — they are freed by either the leader's waitpid reap (if pml4 has no
-   * more users) or stay live for whichever sibling is still running. */
+   * (stack_released==1). The thread's shareable resources (fd table,
+   * user_image, cred) were already released on its exit path; the shared
+   * mm however is freed HERE when this thread is its LAST user. A leader
+   * that exit()s without joining is waitpid-reaped while its threads still
+   * hold pml4 refs (mm_release_user returns 0 for it), so without this
+   * last-user teardown the whole address space — pml4, page tables, vmas —
+   * leaked on every unjoined multithreaded exit until PMM OOM. */
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *t = T(i);
     if (t == current_task) continue;
     if (t->state != TASK_DEAD) continue;
     if (!task_is_thread(t)) continue;
     if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+
+    /* Claim DEAD->REAPING first. Load-bearing twice over: (a) a racing
+     * reaper/waitpid on another CPU must not double-free this slot, and
+     * (b) user_address_space_cleanup below re-enables IRQs mid-walk, so a
+     * timer tick can nest another scheduler_yield -> reap sweep on this
+     * same CPU — the claim makes the nested sweep skip this slot instead
+     * of tearing the same mm down twice. */
+    enum task_state expected = TASK_DEAD;
+    if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      continue;
+
+    u64 last_pml4 = mm_release_user(t);
+    if (last_pml4) {
+      /* Last user of the shared mm — tear it down exactly like the
+       * waitpid reap path. cleanup reads t->pml4_phys, so put the value
+       * back while we work: no other task can observe this mm anymore
+       * (mm_release_user counted zero holders), so republishing it cannot
+       * be seen by another release scan. cleanup also returns with IRQs
+       * enabled; restore the yield invariant (IRQs off) before continuing
+       * the sweep. */
+      t->pml4_phys = last_pml4;
+      user_address_space_cleanup(t);
+      paging_free_address_space(last_pml4);
+      t->pml4_phys = 0;
+      interrupts_disable();
+    } else {
+      t->vma_list = 0; /* shared list lives on in the surviving users */
+    }
 
     /* Release any per-thread (non-shared) resources. */
     if (t->cred) { cred_free(t->cred); t->cred = 0; }
@@ -1339,6 +1502,76 @@ void scheduler_reap_dead_threads(void) {
     if (t->name) { kfree((void *)t->name); t->name = 0; }
     free_task_slot(t);
   }
+}
+
+/* Set when a process (non-thread) becomes a zombie; gates the orphan sweep
+ * below so scheduler_yield only walks the table while zombies may exist. The
+ * sweep clears it again once no process zombie remains. */
+static int g_have_proc_zombies = 0;
+
+/* Reap process zombies that can never be collected by waitpid because they have
+ * no living parent — e.g. a daemon backgrounded by a shell that has since
+ * exited (dropbear under /etc/init.d/sshd). Without this such a zombie keeps
+ * its slot + address space forever, and kill(pid,0) keeps reporting it alive.
+ * A zombie WITH a live parent is left untouched for that parent's waitpid (so
+ * init's child-respawn accounting is unaffected). Monotonic pids guarantee a
+ * dead parent's id never aliases a live task, so the orphan test is exact.
+ * Called from scheduler_yield with interrupts disabled, mirroring
+ * scheduler_reap_dead_threads. */
+void scheduler_reap_orphan_zombies(void) {
+  int still_have = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t == current_task) continue;
+    if (t->state != TASK_DEAD) continue;
+    if (task_is_thread(t)) continue; /* threads: scheduler_reap_dead_threads */
+    still_have = 1;
+    if (!__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE)) continue;
+
+    int has_live_parent = 0;
+    for (usize p = 0; p < g_task_hwm; p++) {
+      struct task *pt = T(p);
+      if (pt->id == t->parent_id && pt->state != TASK_UNUSED &&
+          pt->state != TASK_DEAD && pt->state != TASK_REAPING) {
+        has_live_parent = 1;
+        break;
+      }
+    }
+    if (has_live_parent) continue; /* its parent will waitpid it */
+
+    /* Claim DEAD->REAPING so a racing waitpid on another CPU can't double-free. */
+    enum task_state expected = TASK_DEAD;
+    if (!__atomic_compare_exchange_n(&t->state, &expected, TASK_REAPING, 0,
+                                     __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      continue;
+
+    if (t->user_image) { user_image_free(t->user_image); t->user_image = 0; }
+    u64 last_pml4 = mm_release_user(t);
+    if (last_pml4) {
+      t->pml4_phys = last_pml4; /* see scheduler_reap_dead_threads */
+      user_address_space_cleanup(t);
+      paging_free_address_space(last_pml4);
+      t->pml4_phys = 0;
+      interrupts_disable(); /* cleanup exits IRQs-on; restore yield invariant */
+    } else {
+      t->vma_list = 0;
+    }
+    if (t->cred) { cred_free(t->cred); t->cred = 0; }
+    if (t->fd_table) {
+      kfree(t->fd_table);
+      kfree(t->fd_flags);
+      t->fd_table = 0;
+      t->fd_flags = 0;
+      t->fd_capacity = 0;
+    }
+    if (t->name && strcmp(t->name, "boot") != 0) {
+      kfree((void *)t->name);
+      t->name = 0;
+    }
+    if (t->stack) { kfree(t->stack); t->stack = 0; }
+    free_task_slot(t);
+  }
+  g_have_proc_zombies = still_have;
 }
 
 
@@ -1354,6 +1587,11 @@ int scheduler_yield(void) {
    * O(g_task_hwm) which is nontrivial overhead on every yield otherwise. */
   extern int g_has_any_thread;
   if (g_has_any_thread) scheduler_reap_dead_threads();
+
+  /* Reap orphaned process zombies (no living parent) so daemons whose shell
+   * parent has exited don't leak their slot/address space forever. Gated so
+   * the table walk only runs while a process zombie may exist. */
+  if (g_have_proc_zombies) scheduler_reap_orphan_zombies();
 
   /* Deliver pending signals for current task */
   if (current_task) {
@@ -1663,6 +1901,14 @@ void scheduler_on_timer_tick(void) {
   }
 
   scheduler_ticks++;
+
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && g_task_alarm_ticks[i] != 0 && g_task_alarm_ticks[i] <= scheduler_ticks) {
+      g_task_alarm_ticks[i] = 0;
+      scheduler_kill(T(i)->id, SIGALRM);
+    }
+  }
+
   wake_sleepers();
 
   /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
@@ -1689,6 +1935,8 @@ void scheduler_on_timer_tick(void) {
 }
 
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
+
+static void post_sigchld_to_parent(usize parent_id, int job_control_event);
 
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
@@ -1758,7 +2006,9 @@ void scheduler_exit_current(int exit_code) {
    * RSP swap below. See struct task::stack_released in sched.h. */
   current_task->stack_released = 0;
   current_task->state = TASK_DEAD;
+  g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
 
+  post_sigchld_to_parent(current_task->parent_id, 0);
 
   /* F6 (M28 #7): kick the BSP (or whichever CPU runs the parent kthread)
    * out of sti;hlt so it picks the parent immediately instead of waiting
@@ -1773,6 +2023,31 @@ void scheduler_exit_current(int exit_code) {
 
 int scheduler_wait(usize pid, int *status) {
   return scheduler_waitpid(pid, status, 0);
+}
+
+/* True if a caught signal (one with an installed user handler) that must
+ * interrupt a blocking wait is deliverable for the current task. Only caught
+ * signals interrupt the wait — this is the POSIX EINTR contract and matches the
+ * historical behaviour for default-action signals (a waitpid-blocked task was
+ * never interrupted by an uncaught signal, so we don't start now). SIGCHLD is
+ * deliberately excluded: it is the child-reaping signal, and interrupting
+ * waitpid on it would spuriously abort a parent waiting on one child while
+ * another child changes state (breaks dropbear/wget child reaping). */
+static int wait_interrupted_by_signal(void) {
+  u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+  if (pending == 0)
+    return 0;
+  for (int sig = 1; sig <= NSIG; sig++) {
+    if (sig == SIGCHLD)
+      continue;
+    if (!(pending & (1ULL << (sig - 1))))
+      continue;
+    sighandler_t h = current_task->sigactions[sig - 1].sa_handler;
+    if (h != SIG_IGN && h != SIG_DFL)
+      return 1;
+  }
+  return 0;
 }
 
 int scheduler_waitpid(usize pid, int *status, int options) {
@@ -1862,14 +2137,17 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             /* M29: keep the address space alive if a CLONE_VM sibling
              * still uses it. The dying thread's reaper handles its own
              * kernel stack; the mm/vmas/fd-table belong to the surviving
-             * sibling. */
-            if (pml4_other_refs(T(i)->pml4_phys, T(i)) == 0) {
+             * sibling. mm_release_user serializes the last-user decision
+             * against the thread reaper on another CPU. */
+            u64 last_pml4 = mm_release_user(T(i));
+            if (last_pml4) {
+              T(i)->pml4_phys = last_pml4; /* see scheduler_reap_dead_threads */
               user_address_space_cleanup(T(i));
-              paging_free_address_space(T(i)->pml4_phys);
+              paging_free_address_space(last_pml4);
+              T(i)->pml4_phys = 0;
             } else {
               T(i)->vma_list = 0;
             }
-            T(i)->pml4_phys = 0;
             if (T(i)->fd_table &&
                 fdtable_other_refs(T(i)->fd_table, T(i)) > 0) {
               T(i)->fd_table = 0;
@@ -1939,6 +2217,18 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     }
 
     scheduler_yield();
+
+    /* Woken — possibly by a signal rather than a child state change. If a
+     * signal that must interrupt the wait is now deliverable, abort with
+     * -ERESTARTSYS; the syscall tail converts it to -EINTR (or restarts the
+     * call when the handler used SA_RESTART). Without this, a caught signal
+     * (e.g. SIGALRM) wakes the task but the loop just re-blocks forever. */
+    if (wait_interrupted_by_signal()) {
+      current_task->state = TASK_RUNNING;
+      interrupts_enable();
+      return -ERESTARTSYS;
+    }
+
     interrupts_enable();
   }
 }
@@ -2083,7 +2373,14 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
 
   fd_lock_acquire();
 
+  usize idx = task_index(current_task);
+  usize nofile_limit = g_task_rlimits[idx][RLIMIT_NOFILE].rlim_cur;
+
   for (usize i = 0; i < current_task->fd_capacity; i++) {
+    if (i >= nofile_limit) {
+      fd_lock_release();
+      return -EMFILE;
+    }
     if (current_task->fd_table[i] == 0) {
       current_task->fd_table[i] = handle;
       current_task->fd_flags[i] = 0;
@@ -2092,25 +2389,31 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
     }
   }
 
-  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT) {
+  if (current_task->fd_capacity >= SCHED_MAX_FD_LIMIT || current_task->fd_capacity >= nofile_limit) {
     fd_lock_release();
-    return -1;
+    return -EMFILE;
   }
 
   usize new_capacity = current_task->fd_capacity * 2;
   if (new_capacity > SCHED_MAX_FD_LIMIT)
     new_capacity = SCHED_MAX_FD_LIMIT;
+  if (new_capacity > nofile_limit)
+    new_capacity = nofile_limit;
+  if (new_capacity <= current_task->fd_capacity) {
+    fd_lock_release();
+    return -EMFILE;
+  }
 
   struct vfs_handle **new_table = kzalloc(new_capacity * sizeof(struct vfs_handle *));
   if (!new_table) {
     fd_lock_release();
-    return -1;
+    return -ENOMEM;
   }
   int *new_flags = kzalloc(new_capacity * sizeof(int));
   if (!new_flags) {
     kfree(new_table);
     fd_lock_release();
-    return -1;
+    return -ENOMEM;
   }
 
   memcpy(new_table, current_task->fd_table, current_task->fd_capacity * sizeof(struct vfs_handle *));
@@ -2233,13 +2536,41 @@ void scheduler_fd_close_on_exec(void) {
 
 /* ── Signal Delivery ── */
 
+/* Post SIGCHLD to a parent task when one of its children stops or continues, so
+ * a parent that installed a SIGCHLD handler is notified of job-control state
+ * transitions (POSIX delivers SIGCHLD on child stop/continue, not just exit).
+ * The bit is just set pending; it is delivered to the handler on the parent's
+ * next return to userspace. Caller must already hold IRQs disabled. SIGCHLD is
+ * excluded from waitpid interruption, so this never spuriously aborts a parent
+ * blocked reaping another child. */
+static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
+  if (parent_id == 0)
+    return;
+  for (usize p = 0; p < g_task_hwm; p++) {
+    if (T(p)->id == parent_id && T(p)->state != TASK_UNUSED) {
+      if (job_control_event &&
+          (T(p)->sigactions[SIGCHLD - 1].sa_flags & SA_NOCLDSTOP))
+        return;
+      __atomic_fetch_or(&T(p)->pending_signals, (1ULL << (SIGCHLD - 1)),
+                        __ATOMIC_RELEASE);
+      return;
+    }
+  }
+}
+
 int scheduler_kill(usize task_id, int sig) {
-  if (sig < 1 || sig >= NSIG)
+  if (sig < 0 || sig >= NSIG)
     return -1;
 
-  interrupts_disable();
+  u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
+      /* Signal 0 is the POSIX existence/permission probe: the target was just
+       * found alive, so report success without posting any signal. */
+      if (sig == 0) {
+        interrupts_restore(flags);
+        return 0;
+      }
       /* SIGKILL and SIGSTOP cannot be blocked/ignored. Atomic RMW: post-BKL
        * the target task (or another killer) may concurrently set/clear its own
        * pending bits, so a plain |= would drop a racing update. */
@@ -2254,7 +2585,8 @@ int scheduler_kill(usize task_id, int sig) {
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
-        interrupts_enable();
+        post_sigchld_to_parent(T(i)->parent_id, 1);
+        interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
         return 0;
       }
@@ -2262,30 +2594,37 @@ int scheduler_kill(usize task_id, int sig) {
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
-        interrupts_enable();
+        post_sigchld_to_parent(T(i)->parent_id, 1);
+        interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
-        interrupts_disable();
+        flags = interrupts_save();
       }
       if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
         T(i)->state = TASK_READY;
         sched_rq_enqueue_current(T(i));
       }
-      interrupts_enable();
+      interrupts_restore(flags);
       return 0;
     }
   }
-  interrupts_enable();
+  interrupts_restore(flags);
   return -1;
 }
 
 int scheduler_kill_process_group(usize pgrp, int sig) {
-  if (sig < 1 || sig >= NSIG || pgrp == 0)
+  if (sig < 0 || sig >= NSIG || pgrp == 0)
     return -1;
 
   int sent = 0;
-  interrupts_disable();
+  u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+      /* Signal 0: existence probe only — the group has a live member, so
+       * count it as found without posting anything. */
+      if (sig == 0) {
+        sent++;
+        continue;
+      }
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
 
@@ -2297,9 +2636,10 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
         T(i)->last_stop_signal = sig;
         T(i)->stop_report_pending = 1;
         T(i)->state = TASK_STOPPED;
-        interrupts_enable();
+        post_sigchld_to_parent(T(i)->parent_id, 1);
+        interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
-        interrupts_disable();
+        flags = interrupts_save();
         sent++;
         continue;
       }
@@ -2307,9 +2647,10 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       /* Wake blocked task so it can handle signal */
       if (sig == SIGCONT && T(i)->state == TASK_STOPPED) {
         T(i)->continued_report_pending = 1;
-        interrupts_enable();
+        post_sigchld_to_parent(T(i)->parent_id, 1);
+        interrupts_restore(flags);
         scheduler_notify_wait_event(T(i)->parent_id);
-        interrupts_disable();
+        flags = interrupts_save();
       }
       if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
         T(i)->state = TASK_READY;
@@ -2318,7 +2659,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       sent++;
     }
   }
-  interrupts_enable();
+  interrupts_restore(flags);
   return sent > 0 ? 0 : -1;
 }
 
@@ -2704,3 +3045,21 @@ void scheduler_deliver_pending_signals(void) {
     return;
   }
 }
+
+int scheduler_signal_pending(void) {
+  if (!current_task)
+    return 0;
+  u64 pending = __atomic_load_n(&current_task->pending_signals,
+                                __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+  if (pending == 0)
+    return 0;
+  for (int i = 1; i <= NSIG; i++) {
+    if (!(pending & (1ULL << (i - 1))))
+      continue;
+    sighandler_t h = current_task->sigactions[i - 1].sa_handler;
+    if (h != SIG_IGN && h != SIG_DFL)
+      return 1;
+  }
+  return 0;
+}
+

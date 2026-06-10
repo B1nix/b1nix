@@ -502,6 +502,9 @@ void kernel_main(usize arg0, usize arg1)
 	vfs_mkdir("/sys", 0555);
 	if (vfs_mount("sys", "/sys", "sysfs", 0) == 0)
 		console_write("sysfs: mounted at /sys\n");
+	/* BusyBox sysctl chdirs to /proc/sys; point at /sys where the actual
+	 * files live (kernel.osrelease → /sys/kernel/osrelease). */
+	vfs_symlink("/sys", "/proc/sys");
 #endif
 	console_write("Step 11: Drivers initialized\n");
 

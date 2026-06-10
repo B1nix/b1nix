@@ -127,6 +127,12 @@ static void klog_ring_put(char ch)
  * retrievable later via `dmesg` — the console itself does not scroll back. */
 void klog_putc(char ch)
 {
+    /* The ring is a text log read back via dmesg with C string functions; a
+     * stray NUL from console output (e.g. a binary byte printed during a
+     * program load) would truncate every reader's view at that point. Drop
+     * NULs so the log stays a clean, searchable string. */
+    if (ch == '\0')
+        return;
     klog_ring_put(ch);
 }
 

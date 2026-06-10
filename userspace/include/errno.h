@@ -86,5 +86,9 @@ int normalize_errno(long rc);
 #define ENOMSG          42      /* No message of desired type */
 #define EILSEQ          84      /* Illegal byte sequence */
 #define EOVERFLOW       75      /* Value too large for defined data type */
+#define ENODATA         61      /* No data available (no such xattr) */
+#ifndef ENOATTR
+#define ENOATTR         ENODATA /* No such attribute (BSD spelling) */
+#endif
 
 #endif

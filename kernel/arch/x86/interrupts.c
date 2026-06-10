@@ -107,6 +107,12 @@ static u32 read_cr2(void) {
   return value;
 }
 
+static u32 read_cr3(void) {
+  u32 value;
+  __asm__ volatile("movl %%cr3, %0" : "=r"(value));
+  return value;
+}
+
 static const char *exception_names[] = {
     "divide error",
     "debug",
@@ -413,6 +419,36 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   console_write_hex64(frame->cs);
   console_write("\neflags: 0x");
   console_write_hex64(frame->eflags);
+  console_write("\neax: 0x");
+  console_write_hex64(frame->eax);
+  console_write(" ebx: 0x");
+  console_write_hex64(frame->ebx);
+  console_write(" ecx: 0x");
+  console_write_hex64(frame->ecx);
+  console_write(" edx: 0x");
+  console_write_hex64(frame->edx);
+  console_write("\nesi: 0x");
+  console_write_hex64(frame->esi);
+  console_write(" edi: 0x");
+  console_write_hex64(frame->edi);
+  console_write(" ebp: 0x");
+  console_write_hex64(frame->ebp);
+  if (frame->cs & 3) {
+    /* esp/ss are only pushed by the CPU on a privilege change */
+    console_write(" esp: 0x");
+    console_write_hex64(frame->esp);
+  } else {
+    console_write(" esp(k): 0x");
+    console_write_hex64((u32)(usize)frame + 36); /* frame end = pre-fault esp */
+  }
+  console_write("\ncr3: 0x");
+  console_write_hex64(read_cr3());
+  console_write(" cpu: ");
+  console_write_dec(get_percpu() ? get_percpu()->cpu_id : 0);
+  if (current_task && current_task->name) {
+    console_write(" task: ");
+    console_write(current_task->name);
+  }
   console_write("\n");
 
   arch_backtrace(frame->ebp, frame->eip);

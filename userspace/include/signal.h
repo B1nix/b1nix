@@ -54,6 +54,8 @@ typedef void (*sighandler_t)(int);
 typedef int sig_atomic_t;
 
 int kill(int pid, int sig);
+int killpg(int pgrp, int sig);
+char *strsignal(int sig);
 
 int raise(int sig);
 
@@ -93,7 +95,6 @@ int sigismember(const sigset_t *set, int signum);
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigsuspend(const sigset_t *mask);
-int kill(int pid, int sig);
 #ifdef __cplusplus
 }
 #endif

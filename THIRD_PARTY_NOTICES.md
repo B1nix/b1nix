@@ -25,7 +25,7 @@ statically links, or embeds the following software:
 
 | Component | Default version | License summary |
 | --- | ---: | --- |
-| BusyBox | 1.36.1 | GNU GPL version 2 |
+| BusyBox | 1.38.0 | GNU GPL version 2 |
 | GNU Wget | 1.21.4 | GNU GPL version 3 or later |
 | curl | 8.20.0 | curl license |
 | Dropbear | 2022.83 | Dropbear license; bundled libraries have their own notices |

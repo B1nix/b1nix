@@ -150,6 +150,18 @@ enum {
 	SYS_GETSID       = 123,
 	SYS_SYSINFO      = 124,
 	SYS_GETPPID      = 125,
+	SYS_SIGSUSPEND   = 126,
+	SYS_ALARM        = 127,
+	SYS_FCHDIR       = 128,
+	SYS_ACCESS       = 129,
+	SYS_FTRUNCATE    = 130,
+	SYS_DUP          = 131,
+	SYS_GETRLIMIT    = 132,
+	SYS_SETRLIMIT    = 133,
+	SYS_SETXATTR     = 134,
+	SYS_GETXATTR     = 135,
+	SYS_LISTXATTR    = 136,
+	SYS_REMOVEXATTR  = 137,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

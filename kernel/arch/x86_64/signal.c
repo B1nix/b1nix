@@ -33,7 +33,12 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   struct b1nix_sigframe sf;
   memset(&sf, 0, sizeof(sf));
   sf.magic = B1NIX_SIGFRAME_MAGIC;
-  sf.old_blocked_signals = t->blocked_signals;
+  if (task_has_saved_sigmask(t)) {
+    sf.old_blocked_signals = task_saved_sigmask(t);
+    task_clear_saved_sigmask(t);
+  } else {
+    sf.old_blocked_signals = t->blocked_signals;
+  }
   sf.saved_frame = *frame;
 
   if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
@@ -52,6 +57,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   frame->rip = (u64)(usize)sa->sa_handler;
   frame->rsp = restorer_slot;
   frame->rdi = (u64)sig;
+  frame->vector = 0; /* Force return via iretq to honor the modified rip */
   /* Note: do NOT update saved_user_rsp here — it already holds the original
    * user RSP and will be refreshed by the SYSCALL entry on the next entry.
    * Updating it with restorer_slot (the modified RSP) would be wrong. */
@@ -124,6 +130,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
 
 u64 sys_sigreturn(struct interrupt_frame *frame) {
   struct task *t = current_task;
+
   u64 sp = frame->rsp;
   u64 sf_addr = sp;
   struct b1nix_sigframe sf;
@@ -137,7 +144,7 @@ u64 sys_sigreturn(struct interrupt_frame *frame) {
   }
 
   /* Privilege checks: user cannot forge kernel return state. */
-  if (sf.saved_frame.cs != 0x1B || sf.saved_frame.ss != 0x23) {
+  if (sf.saved_frame.cs != 0x23 || sf.saved_frame.ss != 0x1B) {
     return (u64)-EINVAL;
   }
   if (sf.saved_frame.rip >= 0x0000800000000000ULL ||

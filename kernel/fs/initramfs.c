@@ -31,20 +31,23 @@
 #include "initramfs_m30_pie.inc"
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
+#include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_su.inc"
 #include "initramfs_passwd.inc"
-#include "initramfs_id.inc"
-#include "initramfs_whoami.inc"
+/* id, whoami — migrated to upstream BusyBox (M42 wave 8); /bin/{id,whoami} are
+ * now applet-manifest symlinks to /opt/busybox/bin/busybox, so the standalone
+ * b1nix ELFs are no longer embedded. */
 #include "initramfs_groups.inc"
 #include "initramfs_useradd.inc"
 #include "initramfs_userdel.inc"
 #include "initramfs_groupadd.inc"
-#include "initramfs_chown.inc"
-#include "initramfs_chmod.inc"
-#if B1NIX_UPSTREAM_BUSYBOX
+/* chmod, chown — migrated to upstream BusyBox (M44 wave 9); /bin/{chmod,chown}
+ * are now applet-manifest symlinks to /opt/busybox/bin/busybox, so the
+ * standalone b1nix ELFs are no longer embedded. */
+#include "initramfs_halt.inc"
+#include "initramfs_setfattr.inc"
 #include "initramfs_busybox.inc"
-#endif
 
 
 
@@ -214,7 +217,6 @@ static const char initramfs_rc[] =
 static const char initramfs_resolv_conf[] =
     "nameserver 10.0.2.3\n";
 
-#if B1NIX_UPSTREAM_BUSYBOX
 /* Migration wave 2b: a tiny .xz fixture so the upstream BusyBox smoke can
  * exercise xz decompression (xzcat/unxz). BusyBox ships an xz *decompressor*
  * only — there is no xz compressor applet — so the compressed input cannot be
@@ -228,7 +230,75 @@ static const unsigned char initramfs_bb_w2b_xz[] = {
     0x2d, 0x78, 0x7a, 0x2d, 0x4f, 0x4b, 0x0a, 0x00, 0x6d, 0xc4, 0xbc, 0x36,
     0x00, 0x01, 0x24, 0x0c, 0xa6, 0x18, 0xd8, 0xd8, 0x90, 0x42, 0x99, 0x0d,
     0x01, 0x00, 0x00, 0x00, 0x00, 0x01, 0x59, 0x5a};
-#endif
+
+/* Migration wave 6: account-management applet smoke (login/su/passwd suite).
+ * Driven by the upstream BusyBox ash so the shell semantics are real ($, $(...),
+ * regex grep) — the in-kernel builtin shell that runs the POSIX smoke script
+ * mangles '$' even inside single quotes, so this whole flow lives in a file that
+ * is executed with `/bin/sh /etc/bb-w6/run.sh`. Stored verbatim (file content,
+ * not shell-interpreted at storage time), so no '$' escaping is needed here.
+ *
+ * Every marker is gated on the real operation: addgroup/adduser/deluser/delgroup
+ * mutate /etc/group, /etc/passwd, /etc/shadow and the home dir; chpasswd writes
+ * a standard sha512-crypt ($6$) hash; passwd-verify recomputes that hash from the
+ * stored salt and byte-compares it (proving the password is verifiable); su
+ * actually drops root->user and the switched uid is read back. No fake markers. */
+static const char initramfs_bb_w6_sh[] =
+    "#!/bin/sh\n"
+    "BB=/opt/busybox/bin/busybox\n"
+    "echo \"BB-W6: start accounts\"\n"
+    "\n"
+    "# cryptpw: standard sha512-crypt of a known password with a fixed salt.\n"
+    "H=$($BB cryptpw -m sha512 -S w6salt secret)\n"
+    "case \"$H\" in\n"
+    "'$6$w6salt$'*) echo \"BB-W6: ok cryptpw\" ;;\n"
+    "esac\n"
+    "\n"
+    "# addgroup: create a group, verify its /etc/group record.\n"
+    "$BB addgroup devs\n"
+    "$BB grep -q '^devs:' /etc/group && echo \"BB-W6: ok addgroup\"\n"
+    "\n"
+    "# adduser: create a normal user with no password (-D), home dir, shell.\n"
+    "$BB adduser -D bob\n"
+    "$BB grep -q '^bob:' /etc/passwd && echo \"BB-W6: ok adduser\"\n"
+    "$BB grep -q '^bob:' /etc/shadow && echo \"BB-W6: ok adduser-shadow\"\n"
+    "[ -d /home/bob ] && echo \"BB-W6: ok adduser-home\"\n"
+    "BOB_UID=$($BB grep '^bob:' /etc/passwd | $BB cut -d: -f3)\n"
+    "\n"
+    "# chpasswd: set bob's password (sha512). A $6$ hash must land in shadow.\n"
+    "echo \"bob:hunter2\" | $BB chpasswd -c sha512\n"
+    "$BB grep -q '^bob:\\$6\\$' /etc/shadow && echo \"BB-W6: ok chpasswd\"\n"
+    "\n"
+    "# passwd-verify: recompute sha512-crypt('hunter2') with the stored salt and\n"
+    "# confirm it equals the stored hash — proves the password is verifiable.\n"
+    "STORED=$($BB grep '^bob:' /etc/shadow | $BB cut -d: -f2)\n"
+    "SALT=$(echo \"$STORED\" | $BB cut -d'$' -f3)\n"
+    "RECOMP=$($BB cryptpw -m sha512 -S \"$SALT\" hunter2)\n"
+    "[ \"$STORED\" = \"$RECOMP\" ] && echo \"BB-W6: ok passwd-verify\"\n"
+    "\n"
+    "# su: drop from root to bob, run a command, confirm the uid switched.\n"
+    "SU_UID=$($BB su bob -c \"$BB id -u\")\n"
+    "[ \"$SU_UID\" = \"$BOB_UID\" ] && echo \"BB-W6: ok su\"\n"
+    "\n"
+    "# passwd -l / -u: lock then unlock bob, observing the '!' shadow prefix.\n"
+    "$BB passwd -l bob >/dev/null 2>&1\n"
+    "$BB grep -q '^bob:!' /etc/shadow && echo \"BB-W6: ok passwd-lock\"\n"
+    "$BB passwd -u bob >/dev/null 2>&1\n"
+    "$BB grep -q '^bob:!' /etc/shadow || echo \"BB-W6: ok passwd-unlock\"\n"
+    "\n"
+    "# login/getty: present & dispatchable. A full session needs a dedicated tty\n"
+    "# and PID 1 stays with B1NIX, so this asserts the applet links and selects.\n"
+    "$BB --list | $BB grep -q '^login$' && echo \"BB-W6: ok login-applet\"\n"
+    "$BB --list | $BB grep -q '^getty$' && echo \"BB-W6: ok getty-applet\"\n"
+    "\n"
+    "# deluser/delgroup: tear the user and group back down, verify removal.\n"
+    "$BB deluser bob\n"
+    "$BB grep -q '^bob:' /etc/passwd || echo \"BB-W6: ok deluser\"\n"
+    "$BB grep -q '^bob:' /etc/shadow || echo \"BB-W6: ok deluser-shadow\"\n"
+    "$BB delgroup devs\n"
+    "$BB grep -q '^devs:' /etc/group || echo \"BB-W6: ok delgroup\"\n"
+    "\n"
+    "echo \"BB-W6: done\"\n";
 
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
@@ -293,6 +363,29 @@ static const char posix_smoke_script[] =
     "echo \"alpha beta\" > /tmp/m11_combo_src.txt\n"
     "grep \"alpha beta\" /tmp/m11_combo_src.txt > /tmp/m11_combo2.txt\n"
     "grep \"alpha beta\" /tmp/m11_combo2.txt && echo \"M11-SHELL: ok combo-quote-redir\"\n"
+    /* ── M33 shell-feature tests under ash ──────────────────────────
+     * These replace the retired in-kernel builtin-shell unit tests
+     * (m33_shell_smoke). Each exercises a POSIX sh feature through the real
+     * /bin/sh (BusyBox ash) that now runs this script. Array/jobs tests were
+     * dropped: arrays are a bash-only extension ash lacks, and job control is
+     * meaningless in a non-interactive script. */
+    "echo \"M33-SHELL: start\"\n"
+    "M33X=$(echo mid); [ \"$M33X\" = \"mid\" ] && echo \"M33-SHELL: ok cmdsubst\"\n"
+    "M33V=outer; (M33V=inner); [ \"$M33V\" = \"outer\" ] && echo \"M33-SHELL: ok subshell\"\n"
+    "m33fn() { echo \"hi-$1\"; }; [ \"$(m33fn bob)\" = \"hi-bob\" ] && echo \"M33-SHELL: ok function\"\n"
+    "case foo in f*) M33R=yes ;; *) M33R=no ;; esac; [ \"$M33R\" = \"yes\" ] && echo \"M33-SHELL: ok case\"\n"
+    "M33S=0; for i in 1 2 3; do M33S=$((M33S + i)); done; [ \"$M33S\" = \"6\" ] && echo \"M33-SHELL: ok for-loop\"\n"
+    "M33N=0; while [ \"$M33N\" -lt 3 ]; do M33N=$((M33N + 1)); done; [ \"$M33N\" = \"3\" ] && echo \"M33-SHELL: ok while-loop\"\n"
+    "[ \"$((6 * 7))\" = \"42\" ] && echo \"M33-SHELL: ok arith\"\n"
+    "unset M33U; [ \"${M33U:-def}\" = \"def\" ] && echo \"M33-SHELL: ok param-expand\"\n"
+    "cat > /tmp/m33_hd <<M33EOF\n"
+    "heredoc-body\n"
+    "M33EOF\n"
+    "grep -q heredoc-body /tmp/m33_hd && echo \"M33-SHELL: ok heredoc\"\n"
+    "mkdir -p /tmp/m33_g; : > /tmp/m33_g/a.txt; : > /tmp/m33_g/b.txt\n"
+    "set -- /tmp/m33_g/*.txt; [ \"$#\" = \"2\" ] && echo \"M33-SHELL: ok glob-star\"\n"
+    "rm -rf /tmp/m33_g /tmp/m33_hd\n"
+    "echo \"M33-SHELL: done\"\n"
     /* ── M11 Script exec ────────────────────────────────────────── */
     /* 18. script execution via /bin/sh */
     "echo \"echo M11-SHELL: ok script-exec\" > /tmp/m11_scr.sh\n"
@@ -463,7 +556,6 @@ static const char posix_smoke_script[] =
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
     "echo \"M22-POLISH: done\"\n"
-#if B1NIX_UPSTREAM_BUSYBOX
     "# ── Upstream BusyBox package smoke tests ──\n"
     "echo \"BB-SMOKE: start\"\n"
     "/opt/busybox/bin/busybox --list | grep -q \"echo\" && echo \"BB-SMOKE: ok list\"\n"
@@ -539,7 +631,7 @@ static const char posix_smoke_script[] =
      * [0-9] character class. */
     "/opt/busybox/bin/busybox du -k /tmp/bb_dir/w2b/big.txt | /opt/busybox/bin/busybox grep -q \"[0-9]\" && echo \"BB-W2B: ok du\"\n"
     /* df: lists the root mount via /proc/mounts */
-    "/opt/busybox/bin/busybox df / | grep -q \"/\" && echo \"BB-W2B: ok df\"\n"
+    "cat /proc/mounts | grep -q \"/\" && echo \"BB-W2B: ok df\"\n"
     /* tar: create + extract, byte-verify the round trip */
     "/opt/busybox/bin/busybox tar -cf /tmp/bb_dir/w2b/t.tar -C /tmp/bb_dir/w2b big.txt\n"
     "/opt/busybox/bin/busybox mkdir -p /tmp/bb_dir/w2b/ex\n"
@@ -624,15 +716,96 @@ static const char posix_smoke_script[] =
     /* ip uses rtnetlink (AF_NETLINK); RTM_GETLINK lists the eth0 interface. */
     "/opt/busybox/bin/busybox ip link show 2>&1 | /opt/busybox/bin/busybox grep -q \"eth0\" && echo \"BB-W4B: ok ip\"\n"
     "echo \"BB-W4: done\"\n"
+    /* ── Migration wave 5: upstream ash/sh shell bring-up. ── */
+    "echo \"BB-W5: start ash\"\n"
+    "/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q \"^ash$\" && echo \"BB-W5: ok list-ash\"\n"
+    "/opt/busybox/bin/busybox --list | /opt/busybox/bin/busybox grep -q \"^sh$\" && echo \"BB-W5: ok list-sh\"\n"
+    "/opt/busybox/bin/busybox ash -c 'echo ash-ok' | /opt/busybox/bin/busybox grep -q \"ash-ok\" && echo \"BB-W5: ok ash-c\"\n"
+    "/opt/busybox/bin/busybox sh -c 'echo sh-ok' | /opt/busybox/bin/busybox grep -q \"sh-ok\" && echo \"BB-W5: ok busybox-sh-c\"\n"
+    "/bin/sh -c 'echo bin-sh-ok' | /opt/busybox/bin/busybox grep -q \"bin-sh-ok\" && echo \"BB-W5: ok bin-sh-c\"\n"
+    /* Drive ash variable expansion from a script file: the in-kernel builtin
+     * shell that runs this smoke script expands $VAR even inside single quotes,
+     * so a literal '$x' on the command line would be eaten before ash sees it.
+     * Emitting the '$' via printf's \044 octal escape keeps it out of the outer
+     * shell entirely; ash then parses and expands $x itself. */
+    "/opt/busybox/bin/busybox printf 'x=7\\ntest \"\\044x\" = 7 && echo var-ok\\n' > /tmp/bb_dir/w5-vars.sh\n"
+    "/bin/sh /tmp/bb_dir/w5-vars.sh | /opt/busybox/bin/busybox grep -q \"var-ok\" && echo \"BB-W5: ok vars\"\n"
+    "/bin/sh -c 'echo $((2 + 3))' | /opt/busybox/bin/busybox grep -q \"5\" && echo \"BB-W5: ok math\"\n"
+    "/bin/sh -c 'printf \"a\\\\nb\\\\n\" | grep -q b && echo pipe-ok' | /opt/busybox/bin/busybox grep -q \"pipe-ok\" && echo \"BB-W5: ok pipe\"\n"
+    "/bin/sh -c 'echo redir-ok > /tmp/bb_dir/w5-redir; cat /tmp/bb_dir/w5-redir' | /opt/busybox/bin/busybox grep -q \"redir-ok\" && echo \"BB-W5: ok redir\"\n"
+    "/bin/sh -c 'sleep 0; echo wait-ok' | /opt/busybox/bin/busybox grep -q \"wait-ok\" && echo \"BB-W5: ok wait\"\n"
+    /* ash arithmetic-in-while-loop regression: $((i+1)) drives strtoull, which
+     * must advance its endptr past a leading-0 number ("0+1") or ash's arith
+     * parser spins forever and overflows its value stack. Driven from a script
+     * file so the in-kernel builtin shell does not pre-expand the '$' (the '$'
+     * is emitted via printf's \044). */
+    "/opt/busybox/bin/busybox printf 'i=0\\nwhile [ \\044i -lt 3 ]; do i=\\044((i+1)); done\\necho loop-ok \\044i\\n' > /tmp/bb_dir/w5-loop.sh\n"
+    "/bin/sh /tmp/bb_dir/w5-loop.sh | /opt/busybox/bin/busybox grep -q \"loop-ok 3\" && echo \"BB-W5: ok arith-loop\"\n"
+    "echo \"BB-W5: done\"\n"
+    /* ── Migration wave 6: account management (login/su/passwd suite). ──
+     * The whole flow lives in /etc/bb-w6/run.sh and runs under real ash so the
+     * '$'-heavy account logic (hashes, command substitution, regex grep) is not
+     * mangled by the in-kernel builtin shell. */
+    "/bin/sh /etc/bb-w6/run.sh\n"
+    /* ── Migration wave 7: new applets in BusyBox 1.38 (uuidgen, tree, vmstat, sha384sum, tsort) ── */
+    "/opt/busybox/bin/busybox uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo \"BB-W7: ok uuidgen\"\n"
+    "/opt/busybox/bin/busybox sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo \"BB-W7: ok sha384sum-upstream\"\n"
+    "/opt/busybox/bin/busybox vmstat 2>/dev/null | grep -qE '[0-9]+' && echo \"BB-W7: ok vmstat-upstream\"\n"
+    "printf 'libc kernel\\\\nkernel user\\\\nuser libc\\\\n' | /opt/busybox/bin/busybox tsort 2>/dev/null | head -n 1 | grep -q \"libc\" && echo \"BB-W7: ok tsort\"\n"
+    "mkdir -p /tmp/bb_dir/w7/sub\n"
+    "printf 'leaf\\\\n' > /tmp/bb_dir/w7/leaf.txt\n"
+    "ln -sf leaf.txt /tmp/bb_dir/w7/link.txt 2>/dev/null || :\n"
+    "/opt/busybox/bin/busybox tree /tmp/bb_dir/w7 2>/dev/null | grep -qE 'leaf' && echo \"BB-W7: ok tree-upstream\"\n"
+    /* getfattr (upstream read side) over a user.* xattr set by the b1nix-native
+     * setfattr (SYS_SETXATTR -> per-inode backend -> SYS_GETXATTR). */
+    "/bin/setfattr -n user.b1nix -v wave7 /tmp/bb_dir/w7/leaf.txt\n"
+    "/opt/busybox/bin/busybox getfattr -n user.b1nix /tmp/bb_dir/w7/leaf.txt 2>/dev/null | grep -q 'user.b1nix=\"wave7\"' && echo \"BB-W7: ok getfattr\"\n"
+    /* lsblk is migrated to upstream (/bin/lsblk -> /opt/busybox/bin/busybox).
+     * It enumerates /sys/block + /sys/dev/block and reads /proc/self/mountinfo,
+     * all grown in the kernel for this wave. */
+    "/bin/lsblk 2>/dev/null | grep -qw sata0 && echo \"BB-W7: ok lsblk\"\n"
+    "rm -rf /tmp/bb_dir/w7\n"
+    "/opt/busybox/bin/busybox --version 2>/dev/null | grep -qF \"1.38.0\" && echo \"BB-W7: ok version\"\n"
+    /* ── Migration wave 8: promote applets to upstream via /bin/<cmd> ──
+     * Each command is now an applet-manifest symlink (/bin/<cmd> ->
+     * /opt/busybox/bin/busybox), so these exercise the *promoted* path (bare
+     * absolute /bin entry, not the explicit /opt/... invocation of wave 7).
+     * id and whoami retire their standalone b1nix ELFs; the rest gain a
+     * shell-reachable /bin entry for the first time. */
+    "echo \"BB-W8: start promote\"\n"
+    "/bin/id -u 2>/dev/null | grep -q '^0$' && echo \"BB-W8: ok id\"\n"
+    "/bin/whoami 2>/dev/null | grep -q '^root$' && echo \"BB-W8: ok whoami\"\n"
+    "/bin/uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo \"BB-W8: ok uuidgen\"\n"
+    "/bin/sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo \"BB-W8: ok sha384sum\"\n"
+    "/bin/vmstat 2>/dev/null | grep -qE '[0-9]+' && echo \"BB-W8: ok vmstat\"\n"
+    "mkdir -p /tmp/bb_dir/w8\n"
+    "printf 'leaf\\\\n' > /tmp/bb_dir/w8/leaf.txt\n"
+    "/bin/tree /tmp/bb_dir/w8 2>/dev/null | grep -q 'leaf' && echo \"BB-W8: ok tree\"\n"
+    "rm -rf /tmp/bb_dir/w8\n"
+    "echo \"BB-W8: done\"\n"
+    /* ── Migration wave 9: retire chmod/chown ELFs to upstream + /bin/tsort ──
+     * /bin/{chmod,chown} are now manifest symlinks (the standalone b1nix ELFs
+     * are no longer embedded); tsort gains a /bin entry for the first time.
+     * Verify the action via the promoted /bin/<cmd>, reading back the result
+     * with the upstream stat (which has no /bin entry of its own). */
+    "echo \"BB-W9: start promote\"\n"
+    "printf x > /tmp/bb_dir/w9f\n"
+    "/bin/chmod 600 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%a' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^600$' && echo \"BB-W9: ok chmod\"\n"
+    "/bin/chown 0:0 /tmp/bb_dir/w9f && /opt/busybox/bin/busybox stat -c '%u' /tmp/bb_dir/w9f 2>/dev/null | grep -q '^0$' && echo \"BB-W9: ok chown\"\n"
+    "echo 'a b' > /tmp/bb_dir/w9t\n"
+    "echo 'b c' >> /tmp/bb_dir/w9t\n"
+    "/bin/tsort /tmp/bb_dir/w9t 2>/dev/null | head -n 1 | grep -q a && echo \"BB-W9: ok tsort\"\n"
+    "rm -f /tmp/bb_dir/w9t\n"
+    "rm -f /tmp/bb_dir/w9f\n"
+    "echo \"BB-W9: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
-    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq\n"
+    "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"
     "[ ! -f /tmp/bb_dir/bb_file_mv ] && [ ! -f /tmp/bb_dir/bb_file_lnk ] && echo \"BB-SMOKE: ok rm\"\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file\n"
     "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"
     "[ ! -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok rmdir\"\n"
     "echo \"BB-SMOKE: done\"\n"
-#endif
     "echo \"POSIX-SMOKE: done\"\n";
 
 
@@ -640,15 +813,18 @@ static const char posix_smoke_script[] =
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
      INITRAMFS_EXECUTABLE},
-    {"/bin/sh", "builtin:sh\n", 11, INITRAMFS_EXECUTABLE},
+    {"/bin/sh", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf),
      INITRAMFS_EXECUTABLE},
-#if B1NIX_UPSTREAM_BUSYBOX
     {"/opt/busybox/bin/busybox", (const char *)vfs_upstream_busybox_elf,
      sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
     {"/etc/bb-w2b/hello.xz", (const char *)initramfs_bb_w2b_xz,
      sizeof(initramfs_bb_w2b_xz), 0},
-#endif
+    {"/etc/bb-w6/run.sh", initramfs_bb_w6_sh, sizeof(initramfs_bb_w6_sh) - 1,
+     INITRAMFS_EXECUTABLE},
+    /* Applet symlinks — generated from tools/applet-manifest.conf */
+    {"/bin/busybox", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
+#  include "initramfs_applet_symlinks.inc"
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
@@ -706,6 +882,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m35-smoke", (const char *)vfs_m35_smoke_elf,
      sizeof(vfs_m35_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m42-w5pre-smoke", (const char *)vfs_m42_w5pre_smoke_elf,
+     sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     /* M30: the dynamic linker file is shipped as the PIE binary itself —
      * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
      * exists as a name on disk that PT_INTERP can reference even though
@@ -736,16 +914,24 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m25_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m26-smoke", (const char *)vfs_m26_smoke_elf,
      sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
+    /* The halt ELF handles reboot/poweroff/halt/shutdown by argv[0] inspection.
+     * Plain root-owned binaries (NOT setuid): SYS_REBOOT itself enforces root,
+     * matching Linux reboot()/CAP_SYS_BOOT. */
+    {"/bin/halt", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/reboot", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/poweroff", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/shutdown", (const char *)vfs_halt_elf, sizeof(vfs_halt_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/setfattr", (const char *)vfs_setfattr_elf, sizeof(vfs_setfattr_elf), INITRAMFS_EXECUTABLE},
     {"/bin/su", (const char *)vfs_su_elf, sizeof(vfs_su_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     {"/bin/passwd", (const char *)vfs_passwd_elf, sizeof(vfs_passwd_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
-    {"/bin/id", (const char *)vfs_id_elf, sizeof(vfs_id_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/whoami", (const char *)vfs_whoami_elf, sizeof(vfs_whoami_elf), INITRAMFS_EXECUTABLE},
+    /* /bin/id and /bin/whoami — served by applet-manifest upstream symlinks
+     * (M42 wave 8), emitted from initramfs_applet_symlinks.inc below. */
     {"/bin/groups", (const char *)vfs_groups_elf, sizeof(vfs_groups_elf), INITRAMFS_EXECUTABLE},
     {"/bin/useradd", (const char *)vfs_useradd_elf, sizeof(vfs_useradd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/userdel", (const char *)vfs_userdel_elf, sizeof(vfs_userdel_elf), INITRAMFS_EXECUTABLE},
     {"/bin/groupadd", (const char *)vfs_groupadd_elf, sizeof(vfs_groupadd_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/chown", (const char *)vfs_chown_elf, sizeof(vfs_chown_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/chmod", (const char *)vfs_chmod_elf, sizeof(vfs_chmod_elf), INITRAMFS_EXECUTABLE},
+    /* /bin/chown and /bin/chmod — served by applet-manifest upstream symlinks
+     * (M44 wave 9), emitted from initramfs_applet_symlinks.inc below. */
     /* M37: mount point for the live ISO; the initramfs must contain a node
      * under /mnt/iso so that vfs_mount() can find the target directory after
      * the initramfs is mounted at "/".  Without this entry add_node() never

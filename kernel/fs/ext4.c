@@ -401,6 +401,171 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
     return (isize)done;
 }
 
+static void ext4_inode_blocks_sub(struct ext4_fs *fs, struct ext2_inode *inode,
+                                  u32 blocks) {
+    u32 sectors = blocks * (fs->block_size / 512);
+    inode->i_blocks = inode->i_blocks > sectors ? inode->i_blocks - sectors : 0;
+}
+
+static int ext4_block_table_empty(u32 *table, u32 entries) {
+    for (u32 i = 0; i < entries; i++) {
+        if (table[i]) return 0;
+    }
+    return 1;
+}
+
+static u32 ext4_extent_phys(const struct ext4_extent *ext) {
+    return ext->ee_start_lo | ((u32)ext->ee_start_hi << 16);
+}
+
+static u32 ext4_idx_leaf_phys(const struct ext4_extent_idx *idx) {
+    return idx->ei_leaf_lo | ((u32)idx->ei_leaf_hi << 16);
+}
+
+static u16 ext4_extent_len(const struct ext4_extent *ext) {
+    return ext->ee_len <= 0x8000 ? ext->ee_len : ext->ee_len - 0x8000;
+}
+
+static int ext4_truncate_extent_node(struct ext4_fs *fs,
+                                     struct ext4_extent_header *eh,
+                                     u32 node_phys, u32 new_blocks,
+                                     struct ext2_inode *inode) {
+    if (eh->eh_magic != EXT4_EXTENT_MAGIC)
+        return -EIO;
+
+    if (eh->eh_depth == 0) {
+        struct ext4_extent *exts = (struct ext4_extent *)(eh + 1);
+        u16 out = 0;
+        for (u16 i = 0; i < eh->eh_entries; i++) {
+            u32 start = exts[i].ee_block;
+            u32 len = ext4_extent_len(&exts[i]);
+            u32 end = start + len;
+            u32 phys = ext4_extent_phys(&exts[i]);
+            if (end <= new_blocks) {
+                exts[out++] = exts[i];
+                continue;
+            }
+
+            u32 free_from = new_blocks > start ? new_blocks : start;
+            for (u32 b = free_from; b < end; b++) {
+                ext4_free_block(fs, phys + (b - start));
+                ext4_inode_blocks_sub(fs, inode, 1);
+            }
+
+            if (start < new_blocks) {
+                u16 flags = exts[i].ee_len & 0x8000;
+                exts[i].ee_len = flags | (u16)(new_blocks - start);
+                exts[out++] = exts[i];
+            }
+        }
+        eh->eh_entries = out;
+        if (node_phys)
+            ext4_journal_write(fs, node_phys, eh);
+        return 0;
+    }
+
+    struct ext4_extent_idx *idx = (struct ext4_extent_idx *)(eh + 1);
+    u16 out = 0;
+    for (u16 i = 0; i < eh->eh_entries; i++) {
+        u32 subtree_start = idx[i].ei_block;
+        u32 subtree_end = (i + 1 < eh->eh_entries) ? idx[i + 1].ei_block : 0xffffffffu;
+        if (subtree_end <= new_blocks) {
+            idx[out++] = idx[i];
+            continue;
+        }
+
+        u32 child_phys = ext4_idx_leaf_phys(&idx[i]);
+        u8 *child_buf = kmalloc(fs->block_size);
+        if (!child_buf)
+            return -ENOMEM;
+        if (ext4_read_block(fs, child_phys, child_buf) < 0) {
+            kfree(child_buf);
+            return -EIO;
+        }
+
+        struct ext4_extent_header *child_eh = (struct ext4_extent_header *)child_buf;
+        int err = ext4_truncate_extent_node(fs, child_eh, child_phys,
+                                            new_blocks, inode);
+        if (err < 0) {
+            kfree(child_buf);
+            return err;
+        }
+
+        if (child_eh->eh_entries > 0 && subtree_start < new_blocks) {
+            idx[out++] = idx[i];
+        } else {
+            ext4_free_block(fs, child_phys);
+            ext4_inode_blocks_sub(fs, inode, 1);
+        }
+        kfree(child_buf);
+    }
+
+    eh->eh_entries = out;
+    if (node_phys)
+        ext4_journal_write(fs, node_phys, eh);
+    return 0;
+}
+
+static int ext4_vfs_truncate(struct vfs_node *node, u64 length) {
+    struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
+    struct ext4_fs *fs = info->fs;
+    struct ext2_inode inode;
+    if (ext4_read_inode(fs, info->inode_num, &inode) < 0) return -EIO;
+
+    u64 old_size = ext4_get_inode_size(fs, &inode);
+    u32 old_blocks = (old_size + fs->block_size - 1) / fs->block_size;
+    u32 new_blocks = (length + fs->block_size - 1) / fs->block_size;
+
+    if (new_blocks < old_blocks) {
+        if (inode.i_flags & EXT4_EXTENTS_FL) {
+            struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
+            int err = ext4_truncate_extent_node(fs, eh, 0, new_blocks, &inode);
+            if (err < 0)
+                return err;
+        } else {
+            u32 ptrs = fs->block_size / 4;
+            for (u32 b = new_blocks; b < old_blocks; b++) {
+                if (b < EXT2_NDIR_BLOCKS) {
+                    if (inode.i_block[b]) {
+                        ext4_free_block(fs, inode.i_block[b]);
+                        ext4_inode_blocks_sub(fs, &inode, 1);
+                        inode.i_block[b] = 0;
+                    }
+                    continue;
+                }
+                u32 rel = b - EXT2_NDIR_BLOCKS;
+                if (rel < ptrs && inode.i_block[EXT2_IND_BLOCK]) {
+                    u32 *ind = kmalloc(fs->block_size);
+                    ext4_read_block(fs, inode.i_block[EXT2_IND_BLOCK], ind);
+                    if (ind[rel]) {
+                        ext4_free_block(fs, ind[rel]);
+                        ext4_inode_blocks_sub(fs, &inode, 1);
+                        ind[rel] = 0;
+                        ext4_journal_write(fs, inode.i_block[EXT2_IND_BLOCK], ind);
+                    }
+                    if (ext4_block_table_empty(ind, ptrs)) {
+                        ext4_free_block(fs, inode.i_block[EXT2_IND_BLOCK]);
+                        ext4_inode_blocks_sub(fs, &inode, 1);
+                        inode.i_block[EXT2_IND_BLOCK] = 0;
+                    }
+                    kfree(ind);
+                }
+            }
+        }
+    }
+
+    inode.i_size = (u32)length;
+    if (fs->features_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) {
+        inode.i_dir_acl = (u32)(length >> 32);
+    }
+    node->inode->size = (usize)length;
+    node->inode->mtime = vfs_get_unix_time();
+    node->inode->ctime = node->inode->mtime;
+    inode.i_mtime = node->inode->mtime;
+    inode.i_ctime = node->inode->ctime;
+    return ext4_write_inode(fs, info->inode_num, &inode);
+}
+
 static int ext4_add_dir_entry_tx(struct ext4_fs *fs, u32 dir_ino, u32 child_ino, const char *name, u8 type, struct journal_handle *h) {
     struct ext2_inode dir; if (ext4_read_inode(fs, dir_ino, &dir) < 0) return -1;
     usize name_len = strlen(name); if (name_len > 255) name_len = 255;
@@ -800,6 +965,7 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
   ni->fs = fs; ni->inode_num = ino;
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext4_vfs_read; n->inode->write_cb = ext4_vfs_write;
+  n->inode->truncate_cb = ext4_vfs_truncate;
   n->inode->setattr_cb = ext4_vfs_setattr; n->inode->statfs_cb = ext4_vfs_statfs;
   n->inode->unlink_cb = ext4_vfs_unlink; n->inode->release_cb = ext4_vfs_release;
   n->inode->fsync_cb = ext4_vfs_fsync;

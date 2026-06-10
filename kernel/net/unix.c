@@ -94,7 +94,10 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     scheduler_wake_all(vfs_poll_chan);
     
     /* Block until connected (simplified: just wait for peer to link us) */
-    while (!s->connected) scheduler_yield();
+    while (!s->connected) {
+      if (scheduler_signal_pending()) return -ERESTARTSYS;
+      scheduler_yield();
+    }
   } else {
     /* DGRAM */
     u->peer = peer_u;
@@ -126,6 +129,7 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
       return 0;
     }
     unix_unlock(u);
+    if (scheduler_signal_pending()) return -ERESTARTSYS;
     scheduler_block_on(s);
   }
 }
@@ -178,6 +182,7 @@ isize unix_recv(struct vfs_socket_state *s, void *buf, usize len) {
     }
     unix_unlock(u);
     if (s->type == B1NIX_SOCK_STREAM && !s->connected) return 0;
+    if (scheduler_signal_pending()) return -ERESTARTSYS;
     scheduler_block_on(s);
   }
 }
