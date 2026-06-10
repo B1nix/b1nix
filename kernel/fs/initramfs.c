@@ -361,6 +361,29 @@ static const char posix_smoke_script[] =
     "echo \"alpha beta\" > /tmp/m11_combo_src.txt\n"
     "grep \"alpha beta\" /tmp/m11_combo_src.txt > /tmp/m11_combo2.txt\n"
     "grep \"alpha beta\" /tmp/m11_combo2.txt && echo \"M11-SHELL: ok combo-quote-redir\"\n"
+    /* ── M33 shell-feature tests under ash ──────────────────────────
+     * These replace the retired in-kernel builtin-shell unit tests
+     * (m33_shell_smoke). Each exercises a POSIX sh feature through the real
+     * /bin/sh (BusyBox ash) that now runs this script. Array/jobs tests were
+     * dropped: arrays are a bash-only extension ash lacks, and job control is
+     * meaningless in a non-interactive script. */
+    "echo \"M33-SHELL: start\"\n"
+    "M33X=$(echo mid); [ \"$M33X\" = \"mid\" ] && echo \"M33-SHELL: ok cmdsubst\"\n"
+    "M33V=outer; (M33V=inner); [ \"$M33V\" = \"outer\" ] && echo \"M33-SHELL: ok subshell\"\n"
+    "m33fn() { echo \"hi-$1\"; }; [ \"$(m33fn bob)\" = \"hi-bob\" ] && echo \"M33-SHELL: ok function\"\n"
+    "case foo in f*) M33R=yes ;; *) M33R=no ;; esac; [ \"$M33R\" = \"yes\" ] && echo \"M33-SHELL: ok case\"\n"
+    "M33S=0; for i in 1 2 3; do M33S=$((M33S + i)); done; [ \"$M33S\" = \"6\" ] && echo \"M33-SHELL: ok for-loop\"\n"
+    "M33N=0; while [ \"$M33N\" -lt 3 ]; do M33N=$((M33N + 1)); done; [ \"$M33N\" = \"3\" ] && echo \"M33-SHELL: ok while-loop\"\n"
+    "[ \"$((6 * 7))\" = \"42\" ] && echo \"M33-SHELL: ok arith\"\n"
+    "unset M33U; [ \"${M33U:-def}\" = \"def\" ] && echo \"M33-SHELL: ok param-expand\"\n"
+    "cat > /tmp/m33_hd <<M33EOF\n"
+    "heredoc-body\n"
+    "M33EOF\n"
+    "grep -q heredoc-body /tmp/m33_hd && echo \"M33-SHELL: ok heredoc\"\n"
+    "mkdir -p /tmp/m33_g; : > /tmp/m33_g/a.txt; : > /tmp/m33_g/b.txt\n"
+    "set -- /tmp/m33_g/*.txt; [ \"$#\" = \"2\" ] && echo \"M33-SHELL: ok glob-star\"\n"
+    "rm -rf /tmp/m33_g /tmp/m33_hd\n"
+    "echo \"M33-SHELL: done\"\n"
     /* ── M11 Script exec ────────────────────────────────────────── */
     /* 18. script execution via /bin/sh */
     "echo \"echo M11-SHELL: ok script-exec\" > /tmp/m11_scr.sh\n"
