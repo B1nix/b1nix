@@ -35,8 +35,9 @@
 #include "initramfs_dropbear.inc"
 #include "initramfs_su.inc"
 #include "initramfs_passwd.inc"
-#include "initramfs_id.inc"
-#include "initramfs_whoami.inc"
+/* id, whoami — migrated to upstream BusyBox (M42 wave 8); /bin/{id,whoami} are
+ * now applet-manifest symlinks to /opt/busybox/bin/busybox, so the standalone
+ * b1nix ELFs are no longer embedded. */
 #include "initramfs_groups.inc"
 #include "initramfs_useradd.inc"
 #include "initramfs_userdel.inc"
@@ -739,6 +740,23 @@ static const char posix_smoke_script[] =
     "/bin/lsblk 2>/dev/null | grep -qw sata0 && echo \"BB-W7: ok lsblk\"\n"
     "rm -rf /tmp/bb_dir/w7\n"
     "/opt/busybox/bin/busybox --version 2>/dev/null | grep -qF \"1.38.0\" && echo \"BB-W7: ok version\"\n"
+    /* ── Migration wave 8: promote applets to upstream via /bin/<cmd> ──
+     * Each command is now an applet-manifest symlink (/bin/<cmd> ->
+     * /opt/busybox/bin/busybox), so these exercise the *promoted* path (bare
+     * absolute /bin entry, not the explicit /opt/... invocation of wave 7).
+     * id and whoami retire their standalone b1nix ELFs; the rest gain a
+     * shell-reachable /bin entry for the first time. */
+    "echo \"BB-W8: start promote\"\n"
+    "/bin/id -u 2>/dev/null | grep -q '^0$' && echo \"BB-W8: ok id\"\n"
+    "/bin/whoami 2>/dev/null | grep -q '^root$' && echo \"BB-W8: ok whoami\"\n"
+    "/bin/uuidgen 2>/dev/null | grep -qE '^[0-9a-f-]{36}$' && echo \"BB-W8: ok uuidgen\"\n"
+    "/bin/sha384sum /proc/version 2>/dev/null | grep -qE '^[0-9a-f]{96}' && echo \"BB-W8: ok sha384sum\"\n"
+    "/bin/vmstat 2>/dev/null | grep -qE '[0-9]+' && echo \"BB-W8: ok vmstat\"\n"
+    "mkdir -p /tmp/bb_dir/w8\n"
+    "printf 'leaf\\\\n' > /tmp/bb_dir/w8/leaf.txt\n"
+    "/bin/tree /tmp/bb_dir/w8 2>/dev/null | grep -q 'leaf' && echo \"BB-W8: ok tree\"\n"
+    "rm -rf /tmp/bb_dir/w8\n"
+    "echo \"BB-W8: done\"\n"
     "rm -rf /tmp/bb_dir/w2b\n"
     "rm -rf /tmp/bb_dir/w2\n"
     "/opt/busybox/bin/busybox rm -f /tmp/bb_dir/bb_file_mv /tmp/bb_dir/bb_file_lnk /tmp/bb_dir/bb_sort /tmp/bb_dir/bb_uniq /tmp/bb_dir/bb_tee /tmp/bb_dir/bb_clear /tmp/bb_dir/bb_seq /tmp/bb_dir/w5-redir /tmp/bb_dir/w5-vars.sh /tmp/bb_dir/w5-loop.sh\n"
@@ -856,8 +874,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m26_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/su", (const char *)vfs_su_elf, sizeof(vfs_su_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
     {"/bin/passwd", (const char *)vfs_passwd_elf, sizeof(vfs_passwd_elf), INITRAMFS_EXECUTABLE | INITRAMFS_SETUID},
-    {"/bin/id", (const char *)vfs_id_elf, sizeof(vfs_id_elf), INITRAMFS_EXECUTABLE},
-    {"/bin/whoami", (const char *)vfs_whoami_elf, sizeof(vfs_whoami_elf), INITRAMFS_EXECUTABLE},
+    /* /bin/id and /bin/whoami — served by applet-manifest upstream symlinks
+     * (M42 wave 8), emitted from initramfs_applet_symlinks.inc below. */
     {"/bin/groups", (const char *)vfs_groups_elf, sizeof(vfs_groups_elf), INITRAMFS_EXECUTABLE},
     {"/bin/useradd", (const char *)vfs_useradd_elf, sizeof(vfs_useradd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/userdel", (const char *)vfs_userdel_elf, sizeof(vfs_userdel_elf), INITRAMFS_EXECUTABLE},

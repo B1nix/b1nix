@@ -1095,3 +1095,25 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   ordering, getfattr xattr round-trip, lsblk device enumeration, and
   `--version` reporting 1.38.0. Full suite green on **both** arches,
   single-CPU + `-smp 4`.
+
+#### M42 — Migration wave 8: promote six applets to upstream `/bin`
+
+- [x] `done` **Promote `id` and `whoami` from standalone b1nix ELFs to upstream
+  BusyBox.** Their dedicated `userspace/bin/{id,whoami}.c` ELFs were embedded at
+  `/bin/{id,whoami}`; `tools/applet-manifest.conf` now maps both `upstream`, so
+  `/bin/{id,whoami}` are symlinks to `/opt/busybox/bin/busybox` and the
+  standalone ELFs are no longer embedded (dropped from the top-level
+  `EMBEDDED_USER_PROGRAMS` list and the `initramfs.c` file table / includes).
+  This retires real native code and, as a bonus, fixes the native `id -u`
+  flag-ignore bug — upstream `id -u` correctly prints `0`. The native handlers
+  in `busybox.c` stay for `busybox id`/`busybox whoami` revert.
+- [x] `done` **Promote `vmstat`, `tree`, `uuidgen`, `sha384sum` to `/bin`.**
+  These had no `/bin` entry at all (reachable only via `busybox <cmd>`); the
+  manifest now maps them `upstream`, giving each a shell-reachable `/bin/<cmd>`
+  symlink for the first time. All four were already proven working upstream by
+  `BB-W7`.
+- [x] `done` Add `BB-W8` promotion smoke markers (`kernel/fs/initramfs.c` +
+  `tests/smoke.sh`) that exercise the **promoted** path — bare `/bin/<cmd>`,
+  not the explicit `/opt/busybox/...` invocation of wave 7: `id -u`=0,
+  `whoami`=root, uuidgen format, sha384sum hash, vmstat stats, tree output.
+  Full suite **513/0** on both arches, single-CPU + `-smp 4`.
