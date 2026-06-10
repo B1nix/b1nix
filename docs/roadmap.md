@@ -931,12 +931,15 @@ upstream applets pass the same workflows.
   on-stack variant needs an executable user stack on the 32-bit port; the
   mapped-trampoline variant avoids that. Also reset `sa_restorer`/`sa_flags`
   (not just `sa_handler`) across `execve` in `kernel/user/process.c` while here.
-- [ ] `planned` Introduce an explicit applet-selection manifest for `/bin`
-  replacement. For each migrated command, compare native and upstream behavior
-  against existing M11/M22/M33 tests, add BusyBox-specific regression coverage,
-  then switch only that command's `/bin` entry to the upstream multicall ELF.
-  Keep an easy build-time fallback to the native implementation during this
-  period.
+- [x] `done` Introduce an explicit applet-selection manifest for `/bin`
+  replacement (`tools/applet-manifest.conf`). Each command line maps to
+  `native` or `upstream`; the Makefile generates `initramfs_applet_symlinks.inc`
+  (upstream → `/bin/<cmd>` symlink to `/opt/busybox/bin/busybox`) and
+  `initramfs_applet_registration.inc` (native → `user_register_program`). Flip
+  one line to switch a command's `/bin` entry between the native dispatch and
+  the upstream multicall ELF at build time, with the native handler kept in
+  `busybox.c` as an easy fallback. In active use: lsblk (M44 wave 7) and
+  id/whoami/vmstat/tree/uuidgen/sha384sum (M44 wave 8) were promoted through it.
 - [ ] `planned` Retire the local BusyBox-style utility implementation only
   after every command still referenced by boot scripts, recovery paths and the
   smoke suite has an upstream replacement. Remove dead dispatch entries and
@@ -1095,9 +1098,6 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   ordering, getfattr xattr round-trip, lsblk device enumeration, and
   `--version` reporting 1.38.0. Full suite green on **both** arches,
   single-CPU + `-smp 4`.
-
-#### M42 — Migration wave 8: promote six applets to upstream `/bin`
-
 - [x] `done` **Promote `id` and `whoami` from standalone b1nix ELFs to upstream
   BusyBox.** Their dedicated `userspace/bin/{id,whoami}.c` ELFs were embedded at
   `/bin/{id,whoami}`; `tools/applet-manifest.conf` now maps both `upstream`, so
