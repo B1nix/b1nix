@@ -707,79 +707,28 @@ upstream applets pass the same workflows.
   and known checksum vectors in the optional BusyBox smoke suite. Verified by
   the full suite, including SMP, on both architectures: 425 passed, 0 failed
   on `x86_64` and 425 passed, 0 failed on `i686`.
-- [x] `done` Continue the low-risk file/archive track as migration wave 2b.
-  Enabled and smoke-tested `dd`, `du`, `df`, `tar`, `gzip`/`gunzip`,
-  `bzip2`/`bunzip2` and `unxz`/`xzcat` (`xz` is decompress-only — upstream
-  BusyBox ships no xz compressor, so `tar -J` create is unavailable). Coverage
-  is the `BB-W2B:` markers in the posix smoke: byte-exact `dd`, `du` block
-  accounting, `df` against the new `/proc/mounts`, `tar` create/extract round
-  trip, `tar -z` seamless gzip extract, gzip/bzip2 round trips, `xz`
-  decompression of an embedded small-dictionary fixture, and a malformed-input
-  negative (`gunzip` on non-gzip → nonzero). Verified on **both** arches:
-  `x86_64` **435/0** and `i686` **435/0** (single-CPU + `-smp 4`). This wave
-  uncovered and fixed several real libc/kernel/build bugs the synthetic tests
-  never hit:
-  - **`vsnprintf` ignored field width and the `0` flag for integer conversions**
-    (`%d/%u/%x/%o`). BusyBox `tar`'s `putOctal` does `sprintf("%0*lo", len, v)`
-    and relies on zero-padding to the field width, then `tempString += width -
-    len`; with no padding that index went negative and `memcpy`'d junk, so every
-    octal tar-header field (size/mode/uid/gid/mtime) came out zero →
-    "invalid tar magic". Now width + `0`/`-` flags + `%X` uppercase are honored.
-  - **`isatty()` was a `fd <= 2` placeholder** → gzip/bzip2/xz refused to
-    de/compress a redirected fd ("compressed data not read from terminal"). Now
-    backed by `tcgetattr` (ENOTTY for non-tty fds).
-  - Added libc `mntent` (`getmntent` family), `sys/statvfs.h` + `statvfs`/
-    `fstatvfs`, `sys/statfs.h`, `fstatfs`, `execlp`, `clearenv`, `strverscmp`;
-    made `lstat`/`fstat` real out-of-line functions; added `/proc/mounts`.
-  - **i686-only:** `vsnprintf` read 64-bit `ll`/`%llu`/`%llo` args as 32-bit
-    `long` (it collapsed `l`/`ll`), which mis-consumed varargs — `cksum`
-    (`%llu`) hung and `putOctal` (`%llo`) wrote garbage. Now `ll`/`j`/`L` are a
-    distinct 64-bit class. The userspace `struct statfs` used `unsigned long`,
-    which is 32-bit on i686 while the kernel writes 64-bit fields → a 120→60
-    byte overrun that crashed `df`; the struct is now `unsigned long long` to
-    match the kernel ABI on both arches.
-  - **Build hygiene:** the userspace Makefile used `-isystem include` with
-    `-MMD`, which omits "system" headers from the .d files — so editing any
-    `userspace/include/` header did NOT trigger a recompile (a stale
-    `statvfs.o` is what masked the `struct statfs` fix on i686). Switched to
-    `-MD`. `tools/build-busybox.sh` now also force-cleans BusyBox objects when
-    the sysroot changed (BusyBox's make does not track sysroot deps either).
-- [x] `done` Migration wave 3, process and system inspection. Brought up
-  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep` and `pkill`
-  (procps) plus `dmesg` (util-linux). Coverage is the `BB-W3:` markers in the
-  posix smoke: `ps`/`top` enumerate `/proc`, `uptime` reads `/proc/uptime` +
-  `/proc/loadavg`, `free` reads `sysinfo()` + `/proc/meminfo`, `dmesg` drains
-  the kernel ring buffer, and `pidof`/`pgrep`/`pkill` find and signal a live
-  process by name. Verified: `x86_64` **443/0** (full suite, single-CPU +
-  `-smp 4`); `i686` all eight `BB-W3:` markers green with the suite at **442/1**
-  — the sole failure is the pre-existing, i686-only `M37 e1000` ARP-receive-
-  over-SLIRP timing test (`M37-E1000: ok rx-arp`), which is green on `x86_64`,
-  was introduced before this branch (commit `1e792db`), and is untouched by any
-  W3 code (zero net/e1000 files in the diff). Real bugs/gaps this wave fixed:
-  - **`/proc/<pid>/stat` was 4 fields**; extended to the full 24-field Linux
-    layout BusyBox procps parses (state is a single `%c`; b1nix has no per-task
-    CPU time/start ticks yet so utime/stime/starttime are 0; vsize = heap span,
-    rss = its page count).
-  - **Process "comm" was the full exec path truncated to 15 chars**
-    (`/opt/busybox/bin/busybox` → `/opt/busybox/bi`, basename `bi`), so
-    `pidof`/`pgrep`/`pkill` could not match by name. `sys_spawn` now takes the
-    executable **basename** before truncating to `TASK_COMM_LEN-1`, and
-    `/proc/<pid>/{stat,comm,status}` expose that basename — matching Linux
-    semantics.
-  - New **`SYS_SYSINFO`** syscall + `struct sysinfo` (`<sys/sysinfo.h>`) and a
-    `sysinfo()` libc wrapper, filling totalram/freeram/procs/mem_unit from the
-    PMM (`mem_unit = 1` byte, no scaling); both `free` and `uptime` need it.
-  - New **`klogctl()`** libc wrapper (`<sys/klog.h>`) mapping the syslog(2)
-    read actions onto the existing `SYS_DMESG`, with size/console queries
-    answered locally; `dmesg` needs it.
-  - New **`SYS_GETPPID`** syscall + `getppid()`, and a `usleep()` wrapper
-    (via `nanosleep`) — `pidof` and `top` link against them.
-  - **Build:** the cross GCC predefines `__b1nix__`/`__unix__`, not `__linux__`,
-    so procps `free`/`uptime`/`ps` skipped `<sys/sysinfo.h>` ("storage size of
-    'info' isn't known"). `tools/build-busybox.sh` now idempotently widens those
-    three include guards to also fire for `__b1nix__`.
-  `lsof` (needs a `/proc/<pid>/fd/` dynamic dir of readlink-able fd symlinks)
-  is deferred to a follow-up sub-wave.
+- [x] `done` Migration wave 2b, file/archive track (`BB-W2B:` markers, both
+  arches **435/0**): `dd`, `du`, `df`, `tar`, `gzip`/`gunzip`, `bzip2`/`bunzip2`,
+  `unxz`/`xzcat` (xz decompress-only — no upstream xz compressor, so `tar -J`
+  create is unavailable). Surfaced real bugs the synthetic tests never hit:
+  `vsnprintf` ignored field-width + the `0` flag (broke tar's octal headers →
+  "invalid tar magic"); `isatty()` was an `fd<=2` stub (gzip/bzip2/xz refused a
+  redirected fd) → now `tcgetattr`-backed; i686 `vsnprintf` collapsed `ll`→`l`
+  (cksum hung, putOctal wrote garbage) and `struct statfs` was 32-bit vs the
+  kernel's 64-bit (df overran/crashed). Added libc `mntent`/`statvfs`/`statfs`/
+  `execlp`/`clearenv`/`strverscmp`, `/proc/mounts`. Build hygiene: `-MMD`→`-MD`
+  so userspace-header edits recompile, and build-busybox force-cleans on sysroot
+  change.
+- [x] `done` Migration wave 3, process/system inspection (`BB-W3:` markers):
+  upstream `ps`, `top`, `free`, `uptime`, `pidof`, `pgrep`, `pkill` (procps) +
+  `dmesg`. `x86_64` **443/0**; `i686` all markers green, suite **442/1** (sole
+  failure = the pre-existing i686 M37 e1000 ARP-over-SLIRP timing flake,
+  untouched here). Needed: `/proc/<pid>/stat` widened from 4 to the full
+  24-field Linux layout; process "comm" fixed to the exec **basename** (was the
+  truncated full path, so pidof/pgrep/pkill couldn't match by name); new
+  `SYS_SYSINFO`+`sysinfo()`, `klogctl()` (over `SYS_DMESG`), `SYS_GETPPID`+
+  `getppid()`, `usleep()`; and build-busybox widening the procps `__linux__`
+  include guards to also fire for `__b1nix__`. `lsof` deferred (→ done in wave 4).
 - [x] `done` Migration wave 4, storage and networking. **Nine applets
   enabled and smoke-tested** (`BB-W4:` markers), green on **both** arches —
   `x86_64` and `i686` both pass all markers, suite ~454/1 modulo the
@@ -798,119 +747,42 @@ upstream applets pass the same workflows.
   (full Linux `ifreq`), `net/if_arp.h`, `net/ethernet.h`, `caddr_t`.
   `lsblk` is **not shipped by BusyBox 1.36** (added in 1.38, see M44 for
   evaluation — b1nix keeps its native lsblk dispatch for now).
-- [x] `done` Migration wave 4b, `ping`/`losetup`/`ip`. **All three enabled and
-  smoke-tested** (`BB-W4B:` markers), green on **both** arches — `x86_64`
-  **455/1** and `i686` **454/1** (the sole failure is the same pre-existing M37
-  e1000 ARP-over-SLIRP timing flake, untouched by this wave). Each required a
-  distinct new kernel subsystem:
-  - **`ping`** — raw `SOCK_RAW`/ICMP sockets. A raw-socket registry in
-    `kernel/net/socket.c`; `icmp_receive()` delivers every echo reply to
-    registered raw sockets via `vfs_socket_push_raw_icmp()` with a synthetic
-    20-byte IPv4 header. libc `recvfrom()` recovers the peer from that header;
-    `sendto()` records the per-packet destination as the connected peer.
-  - **`losetup`** — a loop-device ioctl surface. `kernel/dev/loop.c` registers 8
-    `/dev/loopN` + `/dev/loop-control`, answering LOOP_CTL_GET_FREE,
-    LOOP_SET_FD/CLR_FD and status ioctls. `vfs_ioctl()` routes the `0x4C` ioctl
-    group (and `loop-control`) **before** the `!arg` guard, since
-    LOOP_CTL_GET_FREE takes no arg.
-  - **`ip`** — an `AF_NETLINK`/rtnetlink socket personality.
-    `netlink_build_dump()` encodes RTM_NEWLINK/NEWADDR/NEWROUTE responses
-    (nlmsghdr + rtattr TLVs) terminated by NLMSG_DONE for a single modelled
-    `eth0`; `vfs_socket`/`vfs_bind` accept `AF_NETLINK` and `getsockname`
-    reports `nl_pid 0`. libc `sendmsg`/`recvmsg` gained single-iov
-    scatter-gather, and **`recvmsg` zeroes `msg_name`** so the source `nl_pid`
-    reads as 0 — BusyBox libnetlink rejects (and would hang waiting on) any
-    reply whose recvmsg source `nl_pid` is non-zero. Headers added:
-    `linux/{netlink,rtnetlink,if_vlan,if_arp,neighbour,loop,version,types}.h`,
-    `asm/types.h`, `netinet/{ip,ip_icmp,if_ether}.h`, `netpacket/packet.h`;
-    `PF_PACKET`, `SIOCSIFHWBROADCAST`, `RTNH_F_*`/`RTAX_*` constants.
-- [x] `done` Migration wave 5, shell/login/account applets (account applets
-  closed in wave 6 below). Enable upstream
-  `ash` only after atomic `sigsuspend`, `alarm`, real resource limits,
-  `dup`/`isatty`/`access`/`ftruncate`, complete `fnmatch` and regex behavior are
-  available. **Prerequisites are now done and verified** (`M42-W5PRE` smoke,
-  `userspace/bin/m42_w5pre_smoke.c`): atomic `sigsuspend` (delivers the waking
-  handler + restores the mask), working `alarm`/`SIGALRM`, real
-  `getrlimit`/`setrlimit` with `RLIMIT_NOFILE` enforcement, `dup`/`isatty`/
-  `access`/`ftruncate`, `fchdir`, fuller `fnmatch` (brackets, `FNM_PERIOD`,
-  `FNM_PATHNAME`) and POSIX `regex` (intervals, named classes), plus
-  signal-interruptible `waitpid` (EINTR) and `SIGSTOP`/`SIGCONT` job control
-  with SIGCHLD notification. x86 + x86_64 smoke 394/0 (single-CPU + `-smp 4`).
-  **Upstream `ash` is now enabled and `/bin/sh` points at it** (BusyBox config
-  `CONFIG_SH_IS_ASH=y`; `/bin/sh` → `/opt/busybox/bin/busybox` under
-  `B1NIX_UPSTREAM_BUSYBOX`). New `BB-W5` smoke (`kernel/fs/initramfs.c` +
-  `tests/smoke.sh`) covers `ash`/`sh` applet listing, `-c`, variable
-  assignment+`test`, arithmetic, pipelines, redirection and child wait — all
-  green, and `M32B-SSH: ok pty` (interactive `ash` over a remote PTY) passes.
-  Enabling interactive `ash` surfaced a latent kernel bug: **`/dev/tty` had no
-  `poll_cb`**, so `node_poll` jumped through an uninitialised pointer the first
-  time anything polled the console (the old builtin shell never did). Fixed by
-  adding `tty_poll` (`kernel/fs/vfs.c`) + `ps2_kbd_has_data()`
-  (`kernel/dev/ps2_kbd.c`). Two further real fixes the bring-up needed: a genuine
-  **`/dev/null`** device node (the builtin shell faked `2>/dev/null`, but `ash`
-  really `open()`s it) and **`kill(pid, 0)` existence-probe semantics**
-  (`scheduler_kill`/`scheduler_kill_process_group` rejected `sig 0`; the sshd
-  init-script `status` arm depends on `kill -0`). `/bin/dropbear` was also
-  rebuilt against the current libc (it predated the `4ab0fd3` `sa_restorer`
-  fix and was crashing on SIGCHLD). Two further bugs the test surfaced, both
-  fixed: orphaned daemon zombies were never reaped (closed below), and a stray
-  NUL byte in the klog ring truncated `dmesg` readers (`M15` audit test) —
-  `klog_putc` now drops NULs so the ring stays a clean text string
-  (`kernel/lib/klog.c`). Result: upstream-BusyBox smoke **197/283 → 480/0** on
-  x86 and x86_64 (single-CPU + `-smp 4`, fully green); `BB-W5` and the whole
-  `M32B-SSH` suite (`dropbearkey`/`handshake`/`negauth`/`pty`/`service-lifecycle`)
-  pass. Do not enable or promote BusyBox `init`: the existing B1NIX init remains
-  PID 1, and its configurable service model is developed separately in M39.
-- [x] `done` Migration wave 6, account-management applets (`login`/`su`/`passwd`
-  suite) behind the security-sensitive `UPSTREAM_BUSYBOX` gate. Enabled upstream
-  `login`, `su`, `passwd`, `chpasswd`, `cryptpw`, `adduser`, `deluser`,
-  `addgroup`, `delgroup`, `getty` with BusyBox's own internal pwd/grp/shadow
-  parsers and SHA-256/512 crypt (`USE_BB_PWD_GRP`/`USE_BB_SHADOW`/`USE_BB_CRYPT`/
-  `USE_BB_CRYPT_SHA`, default algo `sha512`). The applets are fully self-contained:
-  they read/write `/etc/passwd`, `/etc/shadow`, `/etc/group` and hash new
-  passwords with standard `$6$` sha512-crypt. New `BB-W6` smoke
-  (`/etc/bb-w6/run.sh`, run under real ash) exercises the whole flow end to end —
-  cryptpw → addgroup → adduser (passwd+shadow+group+home) → chpasswd → a
-  recompute-and-compare **passwd-verify** (proves the stored hash is verifiable)
-  → `su` root→user with a read-back uid switch → passwd lock/unlock → login/getty
-  applet presence → deluser/delgroup teardown. Both arches **481/0 → 497/0**
-  (single-CPU + `-smp 4`). Two reusable libc additions the applets needed: GNU
-  `getopt_long`/`getopt_long_only` + `<getopt.h>` (`adduser` selects `LONG_OPTS`)
-  and `tcgetsid` (`getty`), both in `userspace/libc/`. BusyBox `init` stays
-  disabled; B1NIX remains PID 1.
-- [x] `done` Fix `vfs_rename()` self-deadlock when replacing an existing target
-  in the same directory (e.g. `rename("/etc/passwd+", "/etc/passwd")`, the atomic
-  pattern every BusyBox account applet uses via `update_passwd`). The replace path
-  called the lock-taking `vfs_remove_node()` for the existing target while already
-  holding the new-parent inode lock, re-acquiring the same lock and wedging the
-  CPU (single-CPU: full hang; the smoke driver hit its 120 s timeout). Never seen
-  before because no tested path renamed onto an existing same-dir file — `mv a b`
-  smoke only renamed to a *new* name. Fixed by extracting `vfs_remove_child_locked`
-  (assumes the parent inode lock is held) and calling it from both
-  `vfs_remove_node` (which takes the lock) and the rename replace path
-  (`kernel/fs/vfs.c`). `BB-W6: ok addgroup/adduser/chpasswd/deluser` cover it.
-- [x] `done` Reap orphaned daemon zombies (closed `M32B-SSH: service-lifecycle`).
-  After the sshd init script `stop`s the daemon it becomes a zombie; `kill(pid,0)`
-  correctly reports it alive until reaped, but its shell parent had already
-  exited and (in test mode) `/bin/init` is the smoke driver, not a general
-  reaper, so nothing reaped it. `scheduler_reap_orphan_zombies()`
-  (`kernel/sched/scheduler.c`) runs from `scheduler_yield` (gated by
-  `g_have_proc_zombies`) and frees process zombies that have NO living parent —
-  monotonic pids (`next_task_id++`) make the orphan test exact, and zombies with
-  a live parent are left for that parent's `waitpid` (init's child-respawn is
-  untouched). It claims each zombie with the same DEAD→REAPING CAS the waitpid
-  reap uses, so it is SMP-safe — unlike an earlier reparenting attempt that wrote
-  `parent_id` during an unsynchronised table walk and GPF'd under `-smp 4`. This
-  was previously masked because `kill(pid,0)` always failed.
-- [x] `done` Fix `ash` SIGSEGV on arithmetic-in-loop (`while [ $i -lt N ]; do
-  i=$((i+1)); done`) — two libc bugs: (1) `strtol` did not advance `endptr` for a
-  leading-0 number followed by a non-octal char, so ash's `$((..))` parser spun
-  forever and overflowed its value stack into kernel space; (2) `vsnprintf` had
-  no `%g`/`%e` (only `%f`), so BusyBox awk's `%.6g` CONVFMT printed "%g". Both in
-  `userspace/libc/`, host-verified against glibc; `BB-W5: ok arith-loop` covers
-  it. The `INITRAMFS_BUSYBOX_INC`/`$(DROPBEAR_ELF)`/`$(CURL_ELF)` rules now depend
-  on `$(USERSPACE_DEPS)` so a libc change rebuilds these binaries. Both arches
-  481/0 (UP + `-smp 4`).
+- [x] `done` Migration wave 4b, `ping`/`losetup`/`ip` (`BB-W4B:` markers; `x86_64`
+  **455/1**, `i686` **454/1** — same M37 flake). Each needed a new kernel
+  subsystem: **ping** = raw `SOCK_RAW`/ICMP sockets (raw-socket registry,
+  `icmp_receive()` pushes echo replies with a synthetic IPv4 header that libc
+  `recvfrom` decodes); **losetup** = loop-device ioctls (`kernel/dev/loop.c`: 8
+  `/dev/loopN` + `/dev/loop-control`, LOOP_CTL_GET_FREE/SET_FD/CLR_FD); **ip** =
+  an `AF_NETLINK`/rtnetlink socket personality (`netlink_build_dump()` encodes
+  RTM_NEW{LINK,ADDR,ROUTE} TLVs for a modelled `eth0`; `recvmsg` must zero
+  `msg_name` or BusyBox libnetlink hangs on a non-zero source `nl_pid`). Added
+  the `linux/*`/`netinet/*`/`netpacket/*` headers these pull in.
+- [x] `done` Migration wave 5, upstream `ash` as `/bin/sh` (`BB-W5` markers).
+  Prerequisites (`M42-W5PRE` smoke): atomic `sigsuspend`, `alarm`/`SIGALRM`, real
+  `getrlimit`/`setrlimit`, `dup`/`isatty`/`access`/`ftruncate`/`fchdir`, fuller
+  `fnmatch` + POSIX `regex`, signal-interruptible `waitpid` (EINTR), and
+  `SIGSTOP`/`SIGCONT` job control. Enabling interactive `ash` exposed real kernel
+  bugs: `/dev/tty` had no `poll_cb` (uninitialised-pointer jump on first poll →
+  added `tty_poll` + `ps2_kbd_has_data()`); no real `/dev/null` node (the builtin
+  faked `2>/dev/null`); `kill(pid,0)` existence-probe rejected `sig 0` (sshd
+  `status` needs it); a stray NUL in the klog ring truncated `dmesg`. `/bin/
+  dropbear` was rebuilt against the post-`4ab0fd3` libc. Result **197/283 →
+  480/0** both arches; `BB-W5` + the whole `M32B-SSH` suite pass. BusyBox `init`
+  stays disabled — B1NIX is PID 1 (service model is M39).
+- [x] `done` Migration wave 6, account applets (`BB-W6` smoke under real ash,
+  both arches **481/0 → 497/0**): upstream `login`/`su`/`passwd`/`chpasswd`/
+  `cryptpw`/`adduser`/`deluser`/`addgroup`/`delgroup`/`getty` with BusyBox's own
+  pwd/grp/shadow parsers + `$6$` sha512-crypt — self-contained over `/etc/passwd`/
+  `shadow`/`group`. End-to-end flow: cryptpw → addgroup → adduser → chpasswd →
+  passwd-verify → `su` uid-switch → passwd lock/unlock → deluser/delgroup. Needed
+  libc `getopt_long`(+`<getopt.h>`) and `tcgetsid`. Three real bugs this wave
+  fixed: **`vfs_rename()` self-deadlock** replacing an existing same-dir target
+  (`update_passwd`'s atomic pattern; re-took the held parent inode lock → hang →
+  extracted `vfs_remove_child_locked`); **orphaned daemon zombies never reaped**
+  (`scheduler_reap_orphan_zombies()` from `scheduler_yield`, frees parentless
+  process zombies under the DEAD→REAPING CAS — closed `M32B-SSH:
+  service-lifecycle`); and **`ash` SIGSEGV on `$((..))` in a loop** (libc `strtol`
+  didn't advance `endptr` past a leading-0; `vsnprintf` lacked `%g`/`%e`).
 - [ ] `planned` Investigate a rare `-smp 4` heap double-free seen once during SSH
   daemon stop (`bucket_unlink: ... magic 0xdead110c not in bucket`, during the
   `service-lifecycle` stop/reap). Did not reproduce on re-run (481/0). Suspect
@@ -932,19 +804,15 @@ upstream applets pass the same workflows.
   mapped-trampoline variant avoids that. Also reset `sa_restorer`/`sa_flags`
   (not just `sa_handler`) across `execve` in `kernel/user/process.c` while here.
 - [x] `done` Introduce an explicit applet-selection manifest for `/bin`
-  replacement (`tools/applet-manifest.conf`). Each command line maps to
-  `native` or `upstream`; the Makefile generates `initramfs_applet_symlinks.inc`
-  (upstream → `/bin/<cmd>` symlink to `/opt/busybox/bin/busybox`) and
-  `initramfs_applet_registration.inc` (native → `user_register_program`). Flip
-  one line to switch a command's `/bin` entry between the native dispatch and
-  the upstream multicall ELF at build time, with the native handler kept in
-  `busybox.c` as an easy fallback. In active use: lsblk (M44 wave 7) and
-  id/whoami/vmstat/tree/uuidgen/sha384sum (M44 wave 8) were promoted through it.
-- [ ] `planned` Retire the local BusyBox-style utility implementation only
-  after every command still referenced by boot scripts, recovery paths and the
-  smoke suite has an upstream replacement. Remove dead dispatch entries and
-  duplicated tests incrementally; keep genuinely b1nix-specific tools as
-  separate native programs instead of forcing them into upstream BusyBox.
+  replacement (`tools/applet-manifest.conf`). Each command maps to `native` or
+  `upstream`; the Makefile generates symlink entries (upstream → `/bin/<cmd>` →
+  `/opt/busybox/bin/busybox`) and native `user_register_program` entries. It
+  drove the incremental promotion of every applet through M44 waves 7–11.
+- [x] `done` **Retire the local BusyBox-style utility implementation** —
+  completed in M44 wave 11: `kernel/user/busybox.c` is deleted entirely, the
+  manifest has no `native` entries left, and the only genuinely b1nix-specific
+  tools that stayed native are separate standalone ELFs (the reboot-family
+  `halt` multicall, `setfattr`, and the setuid account tools su/passwd/…).
 
 Detailed interface inventory and current applet list:
 [`docs/busybox-port.md`](busybox-port.md).
@@ -1018,74 +886,25 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   `tools/configs/busybox-1.38.0.config` carrying forward all existing settings
   and adding the new applet enables. The Makefile dependency now points at the
   1.38.0 config fragment.
-- [x] `done` **`sha384sum`** — enabled CONFIG_SHA384SUM. Added `sha384()`
-  function to `kernel/lib/sha512.c` and `kernel/include/b1nix/crypt.h` (FIPS
-  180-4 SHA-384 with different IVs and truncated 48-byte output). Added native
-  `sha384sum_main` to the busybox.c dispatch table. Verify with `BB-W7` smoke
-  markers.
-- [x] `done` **`vmstat`** — enabled CONFIG_VMSTAT. A native `vmstat_main` in
-  busybox.c provides `/bin/vmstat` (reads `/proc/meminfo` + `/proc/stat`). The
-  **upstream** `vmstat` applet additionally `xfopen_for_read("/proc/vmstat")`s —
-  which *aborts* if the file is missing — so it was failing
-  (`BB-W7: ok vmstat-upstream` absent) until this wave added a `/proc/vmstat`
-  procfs node (`r_vmstat` in `kernel/fs/procfs.c`, reporting nr_free_pages and
-  zeroed paging/swap event counters). Now green on both arches.
-- [x] `done` **`uuidgen`** — enabled CONFIG_UUIDGEN. Added native `uuidgen_main`
-  to busybox.c: generates RFC 4122 v4 UUIDs using a xorshift64 PRNG seeded
-  from `SYS_TIME` + stack address. No kernel-side changes needed. Verify with
-  `BB-W7` smoke markers.
-- [x] `done` **`tsort`** — enable CONFIG_TSORT. Topological sort of partial
-  order pairs. Served by upstream BusyBox 1.38; no native dispatch entry needed.
-  Verified by `BB-W7: ok tsort` smoke marker.
-- [x] `done` **`tree`** — enabled CONFIG_TREE. A native `tree_main` in
-  busybox.c provides `/bin/tree`. The **upstream** `tree` applet
-  (`miscutils/tree.c`, which *does* ship in BusyBox 1.38) was silently not being
-  built: `tools/build-busybox.sh` replaces that file with a scandir/alphasort-
-  free reimplementation, and the replacement had dropped BusyBox's
-  `//config://applet://kbuild://usage:` metadata headers — so `gen_build_files`
-  never registered `CONFIG_TREE`, `make oldconfig` dropped it, and `tree.o` was
-  never compiled (`BB-W7: ok tree-upstream` absent). The TREEPATCH heredoc now
-  carries those headers verbatim, so the upstream applet builds and runs. Green
-  on both arches.
-- [x] `done` **`getfattr`** — enabled CONFIG_GETFATTR. Retrieves extended
-  attributes from files. This required building the previously-missing kernel
-  xattr backend: a per-inode in-memory xattr list (`struct vfs_xattr` on
-  `struct vfs_inode`), four `vfs_setxattr`/`getxattr`/`listxattr`/`removexattr`
-  operations in `kernel/fs/vfs.c` (freed in `vfs_inode_put`), the
-  `SYS_SETXATTR`/`SYS_GETXATTR`/`SYS_LISTXATTR`/`SYS_REMOVEXATTR` syscalls
-  (134–137) with their handlers, libc wrappers + `<sys/xattr.h>`
-  (`setxattr`/`getxattr`/`listxattr`/`removexattr` and the `l*` no-follow
-  variants), and the `ENODATA` errno. Upstream BusyBox ships only the read-side
-  `getfattr`, so the write side is a b1nix-native `setfattr`
-  (`-n`/`-v`/`-x`, registered at `/bin/setfattr`). `BB-W7: ok getfattr` sets
-  `user.b1nix="wave7"` via native `setfattr` and reads it back through upstream
-  `getfattr` (exercising both the kernel-pointer built-in path and the real
-  userspace `getxattr`/`listxattr` syscalls). Persistence to disk filesystems is
-  out of scope — xattrs live on the in-memory inode only.
-- [x] `done` **`FEATURE_VERSION`** — enable CONFIG_FEATURE_VERSION. Adds
-  `busybox --version` support. Trivial config enable, already in
-  `busybox-1.38.0.config`. Verify with a smoke marker.
-- [x] `done` **Upstream `lsblk`** — BusyBox 1.38 ships its own `lsblk` for the
-  first time; it depends entirely on Linux sysfs (`/sys/block/`,
-  `/sys/dev/block/`) and `/proc/self/mountinfo`. Rather than leave it a stub,
-  this wave **grew that layout** in the kernel: sysfs now builds
-  `/sys/block/<disk>/{dev,size,removable,ro}` with partition subdirs,
-  `/sys/dev/block/<maj:min>/{size,partition}` mirrors and `/sys/class/block/`
-  (`kernel/fs/sysfs.c`, from the block registry via new
-  `blk_is_partition`/`blk_partition_parent`/`blk_partition_number` accessors;
-  synthetic major 8, minor = registry index, matching `/proc/partitions`), and
-  procfs gained `/proc/self/mountinfo` (`r_mountinfo`). The block *structure* is
-  built once at mount (every driver, incl. the eight loopN, has registered by
-  then), but each `size` is a **live read** of `blk_at(idx)->block_count` — so a
-  `losetup` attach is reflected without a rebuild. (An earlier readdir-time
-  refresh was dropped: its cross-CPU lock perturbed the timing of the
-  pre-existing x86_64 AP fork/exec race in `M32B-SESS`, and b1nix registers no
-  block devices after mount anyway.)
-  `lsblk` is **promoted to upstream**: `tools/applet-manifest.conf` now maps it
-  `upstream`, so `/bin/lsblk` is a symlink to `/opt/busybox/bin/busybox` and the
-  native `lsblk_main` is retired from `/bin` (kept in the dispatch table for an
-  easy revert, per the applet-promotion rule). `BB-W7: ok lsblk` runs
-  `/bin/lsblk` and finds `sata0`.
+- [x] `done` **New-1.38 applets** (`BB-W7` markers, both arches): `sha384sum`
+  (added FIPS-180-4 `sha384()` to `kernel/lib/sha512.c`), `uuidgen` (RFC-4122 v4,
+  no kernel change), `tsort` (pure upstream), `vmstat` (needed a `/proc/vmstat`
+  procfs node — upstream aborts if it's missing), `tree` (the build-script's
+  scandir-free reimpl had dropped BusyBox's `//config:` metadata headers, so
+  `tree.o` was never compiled — restored), `getfattr`/`setfattr` (built the whole
+  kernel xattr backend: per-inode in-memory xattr list in `kernel/fs/vfs.c` +
+  `SYS_{SET,GET,LIST,REMOVE}XATTR` 134–137 + libc `<sys/xattr.h>` + `ENODATA`;
+  write side `setfattr` is b1nix-native since upstream ships only read-side
+  `getfattr`; xattrs are in-memory-inode only, not persisted), and
+  `busybox --version`.
+- [x] `done` **Upstream `lsblk`** — BusyBox 1.38 ships its own, depending on
+  Linux sysfs + `/proc/self/mountinfo`. Grew that layout in the kernel:
+  `/sys/block/<disk>/{dev,size,removable,ro}` + partition subdirs,
+  `/sys/dev/block/<maj:min>/` mirrors, `/sys/class/block/` (`kernel/fs/sysfs.c`,
+  synthetic major 8, minor = registry index) and `/proc/self/mountinfo`
+  (`r_mountinfo`). Built once at mount; each `size` is a live read of
+  `blk_at(idx)->block_count` (so `losetup` is reflected). Promoted to upstream
+  (`/bin/lsblk` symlink). `BB-W7: ok lsblk`.
 - [ ] `stub` **`ssl_server`** — the other applet new in BusyBox 1.38 (an
   inetd-style "test TLS server", `select TLS`). Enabling it would pull in
   BusyBox's own built-in TLS stack for the first time (currently `CONFIG_TLS`
@@ -1098,48 +917,38 @@ alias support, `cut --output-delimiter`, and server-side TLS.
   ordering, getfattr xattr round-trip, lsblk device enumeration, and
   `--version` reporting 1.38.0. Full suite green on **both** arches,
   single-CPU + `-smp 4`.
-- [x] `done` **Promote `id` and `whoami` from standalone b1nix ELFs to upstream
-  BusyBox.** Their dedicated `userspace/bin/{id,whoami}.c` ELFs were embedded at
-  `/bin/{id,whoami}`; `tools/applet-manifest.conf` now maps both `upstream`, so
-  `/bin/{id,whoami}` are symlinks to `/opt/busybox/bin/busybox` and the
-  standalone ELFs are no longer embedded (dropped from the top-level
-  `EMBEDDED_USER_PROGRAMS` list and the `initramfs.c` file table / includes).
-  This retires real native code and, as a bonus, fixes the native `id -u`
-  flag-ignore bug — upstream `id -u` correctly prints `0`. The native handlers
-  in `busybox.c` stay for `busybox id`/`busybox whoami` revert.
-- [x] `done` **Promote `vmstat`, `tree`, `uuidgen`, `sha384sum` to `/bin`.**
-  These had no `/bin` entry at all (reachable only via `busybox <cmd>`); the
-  manifest now maps them `upstream`, giving each a shell-reachable `/bin/<cmd>`
-  symlink for the first time. All four were already proven working upstream by
-  `BB-W7`.
-- [x] `done` Add `BB-W8` promotion smoke markers (`kernel/fs/initramfs.c` +
-  `tests/smoke.sh`) that exercise the **promoted** path — bare `/bin/<cmd>`,
-  not the explicit `/opt/busybox/...` invocation of wave 7: `id -u`=0,
-  `whoami`=root, uuidgen format, sha384sum hash, vmstat stats, tree output.
-  Full suite **513/0** on both arches, single-CPU + `-smp 4`.
-
-#### M44 — Migration wave 9: retire chmod/chown ELFs + promote tsort
-
-- [x] `done` **Promote `chmod` and `chown` from standalone b1nix ELFs to
-  upstream BusyBox.** Same retirement shape as wave 8's id/whoami: the dedicated
-  `userspace/bin/{chmod,chown}.c` ELFs are no longer embedded (dropped from
-  `EMBEDDED_USER_PROGRAMS` and the `initramfs.c` file table / includes);
-  `/bin/{chmod,chown}` are now manifest symlinks to `/opt/busybox/bin/busybox`.
-  Upstream `chmod` was already proven by `BB-SMOKE: ok chmod`; `BB-W9` adds a
-  `chown` proof. No boot/rc path depends on these (only the smoke exercises
-  them), so the retirement is safe.
-- [x] `done` **Promote `tsort` to `/bin`** (new shell-reachable entry; was
-  reachable only via `busybox tsort`, proven upstream by `BB-W7`).
-- [x] `done` Add `BB-W9` markers exercising the promoted `/bin/<cmd>`: `chmod
-  600` verified via upstream `stat -c %a`, `chown 0:0` via `stat -c %u`, and
-  `tsort` over a two-edge DAG. Full suite **517/0** on both arches, single-CPU
-  + `-smp 4`.
-- Note (builtin-shell quirk surfaced here): a **promoted `/bin/<applet>`
-  symlink reading stdin from a pipe** in the in-kernel builtin shell does not
-  receive its stdin — `printf … | /bin/tsort | …` produced no output, while the
-  identical pipeline with the explicit `/opt/busybox/bin/busybox tsort`
-  (proven by `BB-W7`) works. The `BB-W9` tsort test therefore feeds tsort a
-  **file argument** (like chmod/chown/tree, which take paths and work fine)
-  rather than piping stdin. Root-causing the symlink+stdin-pipe path in the
-  builtin shell is a separate follow-up; it does not affect the `/opt/...`
-  invocation or file-argument applets.
+- [x] `done` **Promotion waves 8–9** (`BB-W8`/`BB-W9`, both arches): retired the
+  standalone b1nix ELFs `id`/`whoami` (wave 8) and `chmod`/`chown` (wave 9) to
+  upstream symlinks — dropped from `EMBEDDED_USER_PROGRAMS` + the `initramfs.c`
+  table; bonus, upstream `id -u` fixes the native flag-ignore bug. Also gave
+  `vmstat`/`tree`/`uuidgen`/`sha384sum` (wave 8) and `tsort` (wave 9) their first
+  shell-reachable `/bin/<cmd>` symlinks. New markers exercise the bare
+  `/bin/<cmd>` path (not `/opt/busybox/...`). 517/0 at the end of wave 9.
+- [x] `done` **Retire the in-kernel builtin shell** (wave 10, commits `3192652`
+  + `53001c2`). b1nix had two shells — upstream BusyBox **ash** (`/bin/sh`,
+  already used by production init/rc/login) and a ~3000-line in-kernel
+  `sh_main`/`sh_*` interpreter that ran only the smoke harness. `shell_smoke_main`
+  now spawns `/bin/sh /etc/posix-smoke.sh` (the script was POSIX-clean, passed
+  unedited), then the whole `sh_*` implementation + `m33_shell_smoke()` unit
+  tests were deleted — 3076 lines net. M33-SHELL coverage re-implemented as
+  ash-script tests (arrays/job-control dropped — bash-only / non-interactive).
+  **bash was deliberately not ported.** Both arches **511/0**.
+- [x] `done` **Retire `kernel/user/busybox.c` entirely** (wave 11). The
+  2872-line in-kernel BusyBox reimplementation (`busybox_main`) is deleted — all
+  coreutils now come from the upstream BusyBox ELF; the manifest has no `native`
+  entries left and `/bin/busybox` is a symlink to the upstream ELF. Holdouts
+  moved out: **sysctl + nc → upstream** (`CONFIG_BB_SYSCTL` + `CONFIG_NC`; nc
+  drags in dead-code `libbb/udp_io.c`, so `struct cmsghdr`/`CMSG_*` +
+  `struct in_pktinfo` were added to the userspace libc, and a `/proc/sys → /sys`
+  symlink in `kernel/main.c` points BusyBox `sysctl` at b1nix's sysfs);
+  **reboot/poweroff/halt/shutdown → one multicall ELF** (`userspace/bin/halt.c`,
+  mode from `argv[0]`; the four `/bin` names share it; **not setuid** —
+  `SYS_REBOOT` now enforces root, matching Linux `reboot()`; can't be upstream as
+  BusyBox issues the Linux `reboot()` syscall b1nix lacks); **setfattr →
+  standalone ELF** (write-side xattrs; upstream ships only read-side `getfattr`).
+  To let upstream nc/ping break out of blocking I/O on a signal, TCP recv/accept,
+  unix connect/accept/recv, pipes, and `fcntl` locks gained
+  `scheduler_signal_pending()` + `-ERESTARTSYS` (→ `EINTR`/restart in the syscall
+  wrapper, releasing their lock/wait first), and `setitimer(ITIMER_REAL)`→
+  `alarm()`. The M22/M34-PROC/NET test harness was rewired off the
+  `busybox_main()` C-call to `spawn`+`wait` `/bin/<cmd>` (`top -b -n 1`).
