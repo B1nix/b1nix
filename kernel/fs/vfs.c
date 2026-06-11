@@ -2128,6 +2128,27 @@ int vfs_open_flags(const char *path, int flags) {
     return -ENOMEM;
   vfs_resolve_path(path, resolved);
 
+  if (strcmp(resolved, "/dev/tty") == 0) {
+    int type = 0;
+    int index = 0;
+    scheduler_get_ctty(&type, &index);
+    if (type == 0) {
+      kfree(resolved);
+      return -ENXIO;
+    }
+    if (type == 2) {
+      int fd = serial_tty_open(index, flags);
+      kfree(resolved);
+      return fd;
+    }
+    if (type == 3) {
+      int fd = pty_open_slave(index, flags);
+      kfree(resolved);
+      return fd;
+    }
+    /* type == 1 is console, fall through to normal /dev/tty open */
+  }
+
   /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
    * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
    * intercept the open before the path lookup. */

@@ -1,10 +1,8 @@
 #ifndef B1NIX_SCHED_H
 #define B1NIX_SCHED_H
-#define B1NIX_WNOHANG 1
-#define B1NIX_WUNTRACED 2
-#define B1NIX_WCONTINUED 8
 
 #include <b1nix/types.h>
+#include <b1nix/posix.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/lapic.h>   /* struct percpu + get_percpu() for the current_task macro */
 
@@ -271,6 +269,11 @@ void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);
 void task_clear_saved_sigmask(struct task *t);
 u64  task_alarm_ticks(const struct task *t);
 void task_set_alarm_ticks(struct task *t, u64 ticks);
+usize task_tgid(const struct task *t);
+u64  task_utime(const struct task *t);
+u64  task_stime(const struct task *t);
+u64  task_cutime(const struct task *t);
+u64  task_cstime(const struct task *t);
 int  scheduler_getrlimit(int resource, struct rlimit *rlim);
 int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
 
@@ -361,9 +364,12 @@ void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);
 void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
+void scheduler_charge_tick(int is_user);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
+void scheduler_exit_group(int exit_code) __attribute__((noreturn));
 int scheduler_wait(usize pid, int *status);
 int scheduler_waitpid(usize pid, int *status, int options);
+int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
 /* M34: read-only task-table introspection for procfs / ps / top. */
@@ -371,6 +377,8 @@ usize scheduler_task_slots(void);
 struct task *scheduler_task_slot(usize index);
 struct task *scheduler_task_by_pid(usize pid);
 const char *scheduler_state_name(int state);
+void scheduler_get_ctty(int *type, int *index);
+void scheduler_set_ctty(struct task *t, int type, int index);
 void scheduler_set_stdout(int fd);
 int scheduler_get_stdout(void);
 void scheduler_fd_table_init_current(void);

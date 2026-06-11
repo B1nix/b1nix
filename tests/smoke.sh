@@ -898,6 +898,12 @@ check_output "$LOG" "M46-SMOKE: ok append-atomic" "concurrent O_APPEND writers n
 check_output "$LOG" "M46-SMOKE: ok truncate-zeros" "shrink-then-grow truncate reads back zeros"
 check_output "$LOG" "M46-SHEBANG-OK" "the #! script's interpreter actually ran"
 check_output "$LOG" "M46-SMOKE: ok shebang-exec" "direct execve() of a #! script works"
+check_output "$LOG" "M46-SMOKE: ok exit-group" "exit_group semantics terminate all thread group members"
+check_output "$LOG" "M46-SMOKE: ok setresuid-setresgid" "setresuid/setresgid set credentials and EPERM is enforced"
+check_output "$LOG" "M46-SMOKE: ok waitid" "waitid waiting for child state transitions works"
+check_output "$LOG" "M46-SMOKE: ok times-getrusage" "times() and getrusage() accounting works"
+check_output "$LOG" "M46-SMOKE: ok orphaned-pgrp" "orphaned process groups with stopped tasks receive SIGHUP+SIGCONT"
+check_output "$LOG" "M46-SMOKE: ok nice-biasing" "nice value biases cooperative stride scheduling"
 check_output "$LOG" "M46-SMOKE: done" "M46 conformance suite completes"
 # ── bash: GNU bash 5.2 port (default shell) ──
 check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"

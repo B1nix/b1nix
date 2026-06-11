@@ -1,12 +1,35 @@
 #ifndef B1NIX_U_SYS_RESOURCE_H
 #define B1NIX_U_SYS_RESOURCE_H
 
-#include <sys/types.h>
+#include <sys/time.h>
 
 /* getpriority/setpriority `which` values (PRIO_PROCESS only is honored). */
 #define PRIO_PROCESS 0
 #define PRIO_PGRP    1
 #define PRIO_USER    2
+
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+#define RUSAGE_THREAD   1
+
+struct rusage {
+  struct timeval ru_utime;
+  struct timeval ru_stime;
+  long   ru_maxrss;
+  long   ru_ixrss;
+  long   ru_idrss;
+  long   ru_isrss;
+  long   ru_minflt;
+  long   ru_majflt;
+  long   ru_nswap;
+  long   ru_inblock;
+  long   ru_oublock;
+  long   ru_msgsnd;
+  long   ru_msgrcv;
+  long   ru_nsignals;
+  long   ru_nvcsw;
+  long   ru_nivcsw;
+};
 
 typedef unsigned long rlim_t;
 
@@ -32,6 +55,7 @@ int getrlimit(int resource, struct rlimit *rlim);
 int setrlimit(int resource, const struct rlimit *rlim);
 int getpriority(int which, id_t who);
 int setpriority(int which, id_t who, int prio);
+int getrusage(int who, struct rusage *usage);
 
 #ifdef __cplusplus
 }

@@ -489,11 +489,11 @@ findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
   fork inherits the blocked-signal mask.
 - [x] Add `getpgid`, `nice`/`getpriority`/`setpriority`, `setreuid`/
   `setregid`, and in-kernel `#!` interpreter execution.
-- [ ] `planned` exit_group semantics (leader exit terminates all threads).
-- [ ] `planned` Controlling-terminal linkage (`setsid` ctty detach) and
+- [x] Add `exit_group` semantics (process exit terminates all threads).
+- [x] Add controlling-terminal linkage (`setsid` ctty detach) and
   orphaned-process-group SIGHUP+SIGCONT.
-- [ ] `planned` Per-task CPU accounting for `times()`/`getrusage`;
+- [x] Add per-task CPU accounting for `times()`/`getrusage`;
   `setresuid`/`setresgid`; `waitid`.
-- [ ] `planned` Make the nice value actually bias the cooperative scheduler
+- [x] Make the nice value bias the cooperative scheduler
   (it round-trips via a side-table; mapping it onto the strict-priority
   `pick_next_task` scan starves tasks — see the audit doc).

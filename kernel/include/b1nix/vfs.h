@@ -237,6 +237,7 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len);
 void pty_init(void);
 int pty_open_master(int flags);    /* opening /dev/ptmx */
 int pty_open_slave(int index, int flags); /* opening /dev/pts/N */
+usize pty_fg_pgrp(int idx);
 
 extern void *vfs_poll_chan;
 

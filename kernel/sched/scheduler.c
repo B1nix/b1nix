@@ -11,6 +11,7 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/serial_tty.h>
 
 /* Drain cross-CPU TLB shootdowns while spin-waiting with IRQs disabled (these
  * stack_released hand-off spins run inside scheduler_yield, IRQs off). Without
@@ -105,6 +106,15 @@ static int  g_task_execed[MAX_TASKS];
  * this is NOT task->priority. Inherited across fork. */
 static int  g_task_nice[MAX_TASKS];
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
+static usize g_task_tgid[MAX_TASKS];
+static int   g_task_ctty_type[MAX_TASKS];
+static int   g_task_ctty_index[MAX_TASKS];
+static u64   g_task_utime[MAX_TASKS];
+static u64   g_task_stime[MAX_TASKS];
+static u64   g_task_cutime[MAX_TASKS];
+static u64   g_task_cstime[MAX_TASKS];
+static u64   g_task_pass[MAX_TASKS];
+static u64   g_min_pass = 0;
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -246,6 +256,14 @@ static struct task *find_unused_task(void) {
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
       g_task_fdlock_owner[i] = 0;
+      g_task_tgid[i] = 0;
+      g_task_ctty_type[i] = 0;
+      g_task_ctty_index[i] = 0;
+      g_task_utime[i] = 0;
+      g_task_stime[i] = 0;
+      g_task_cutime[i] = 0;
+      g_task_cstime[i] = 0;
+      g_task_pass[i] = g_min_pass;
       for (int r = 0; r < 16; r++) {
         g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
         g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -404,6 +422,7 @@ static struct task *pick_next_task(void) {
       if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
                                       0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        g_min_pass = g_task_pass[task_index(t)];
         return t;
       }
       /* Lost the CAS (someone else already picked, or task transitioned to
@@ -415,9 +434,14 @@ static struct task *pick_next_task(void) {
   /* O(n) scan over the task table. A task that yields is marked READY without
    * being re-enqueued (scheduler_yield), so this scan — not the rq — re-picks
    * voluntarily-yielding tasks. Stealable workers are always skipped; on an AP
-   * only ap_runnable userspace processes are eligible. */
+   * only ap_runnable userspace processes are eligible.
+   *
+   * Nice biases otherwise-equal tasks with stride scheduling. Kernel/internal
+   * priorities remain the primary ordering so adding nice support does not
+   * change the scheduler's existing priority contract. */
   usize start = task_index(current_task);
   int max_priority = -1;
+  u64 min_pass = -1ULL;
   struct task *best_task = 0;
 
   for (usize offset = 1; offset <= g_task_hwm; offset++) {
@@ -430,8 +454,12 @@ static struct task *pick_next_task(void) {
     if (on_ap && !T(index)->ap_runnable)
       continue; /* APs run only userspace ELF processes */
 
-    if (T(index)->priority > max_priority) {
-      max_priority = T(index)->priority;
+    int priority = T(index)->priority;
+    u64 pass = g_task_pass[index];
+    if (priority > max_priority ||
+        (priority == max_priority && pass < min_pass)) {
+      max_priority = priority;
+      min_pass = pass;
       best_task = T(index);
     }
   }
@@ -465,6 +493,7 @@ static struct task *pick_next_task(void) {
       if (__atomic_compare_exchange_n(&best_task->state, &expected,
                                       TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        g_min_pass = g_task_pass[task_index(best_task)];
         return best_task;
       }
     }
@@ -594,6 +623,14 @@ void scheduler_init(void) {
   g_task_saved_sigmask[0] = 0;
   g_task_has_saved_sigmask[0] = 0;
   g_task_alarm_ticks[0] = 0;
+  g_task_tgid[0] = boot->id;
+  g_task_ctty_type[0] = 1; /* 1 = console */
+  g_task_ctty_index[0] = 0;
+  g_task_utime[0] = 0;
+  g_task_stime[0] = 0;
+  g_task_cutime[0] = 0;
+  g_task_cstime[0] = 0;
+  g_task_pass[0] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[0][r].rlim_cur = RLIM_INFINITY;
     g_task_rlimits[0][r].rlim_max = RLIM_INFINITY;
@@ -779,6 +816,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
+  g_task_tgid[task_index(task)] = task->id;
   if (!stealable)
     task_init_cred(task);
 
@@ -911,6 +949,9 @@ int scheduler_fork_current(void) {
   g_task_has_saved_sigmask[c_idx] = 0;
   g_task_alarm_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
+  g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
+  g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
+  g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
   }
@@ -1182,6 +1223,26 @@ void task_set_alarm_ticks(struct task *t, u64 ticks) {
   if (!t) return;
   g_task_alarm_ticks[task_index(t)] = ticks;
 }
+usize task_tgid(const struct task *t) {
+  if (!t) return 0;
+  return g_task_tgid[task_index(t)];
+}
+u64 task_utime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_utime[task_index(t)];
+}
+u64 task_stime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_stime[task_index(t)];
+}
+u64 task_cutime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cutime[task_index(t)];
+}
+u64 task_cstime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cstime[task_index(t)];
+}
 int scheduler_getrlimit(int resource, struct rlimit *rlim) {
   if (resource < 0 || resource >= 16 || !rlim || !current_task)
     return -EINVAL;
@@ -1388,6 +1449,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
   usize p_idx = task_index(parent);
   usize c_idx = task_index(child);
+  if (flags & B1NIX_CLONE_THREAD) {
+    g_task_tgid[c_idx] = g_task_tgid[p_idx];
+  } else {
+    g_task_tgid[c_idx] = child->id;
+  }
+  g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
+  g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++)
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
@@ -1711,6 +1779,15 @@ int scheduler_yield(void) {
   }
 
   if (old_task->state == TASK_RUNNING) {
+    /* Stride Scheduler: increment pass of yielding task by its stride */
+    usize old_idx = task_index(old_task);
+    int nice = g_task_nice[old_idx];
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    int tickets = 20 - nice;
+    int stride = 1000 / tickets;
+    g_task_pass[old_idx] += stride;
+
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
      * the save side of arch_context_switch (the movq %rsp,0(%rdi) +
      * movq 0(%rsi),%rsp sequence) is no longer serialised by the BKL, so a
@@ -2001,13 +2078,103 @@ void scheduler_on_timer_tick(void) {
   }
 }
 
+void scheduler_charge_tick(int is_user) {
+  if (!scheduler_started || current_task == 0) {
+    return;
+  }
+  usize idx = task_index(current_task);
+  if (is_user) {
+    g_task_utime[idx]++;
+  } else {
+    g_task_stime[idx]++;
+  }
+}
+
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
 static void post_sigchld_to_parent(usize parent_id, int job_control_event);
 
+static void terminate_group_siblings(struct task *t) {
+  usize tgid = g_task_tgid[task_index(t)];
+  if (tgid == 0) return;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *sibling = T(i);
+    if (sibling->state != TASK_UNUSED && sibling != t && g_task_tgid[i] == tgid) {
+      /* Post SIGKILL to sibling */
+      __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
+      /* Wake them if they are blocked/sleeping/stopped */
+      if (sibling->state == TASK_BLOCKED || sibling->state == TASK_SLEEPING || sibling->state == TASK_STOPPED) {
+        sibling->state = TASK_READY;
+        sched_rq_enqueue_current(sibling);
+      }
+    }
+  }
+}
+
+static int is_pgrp_orphaned(usize pgid, const struct task *exiting) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t != exiting && t->state != TASK_UNUSED &&
+        t->process_group_id == pgid) {
+      usize parent_id = t->parent_id;
+      for (usize j = 0; j < g_task_hwm; j++) {
+        struct task *parent = T(j);
+        if (parent->state != TASK_UNUSED && parent->id == parent_id) {
+          /* POSIX: init (PID 1) does not count as a parent outside pgid in same session */
+          if (parent->id != 1 && parent->process_group_id != pgid && parent->session_id == t->session_id) {
+            return 0; /* not orphaned */
+          }
+        }
+      }
+    }
+  }
+  return 1; /* orphaned */
+}
+
+void scheduler_exit_group(int exit_code) {
+  if (current_task == 0) {
+    panic("scheduler_exit_group without current task");
+  }
+  u64 flags = interrupts_save();
+  terminate_group_siblings(current_task);
+  interrupts_restore(flags);
+  scheduler_exit_current(exit_code);
+}
+
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
+  }
+
+  /* If process leader exits, or crash/signal exit, terminate siblings first */
+  if (g_task_tgid[task_index(current_task)] == current_task->id ||
+      (exit_code & TASK_EXIT_SIGNALED) || (exit_code < 0)) {
+    u64 flags = interrupts_save();
+    terminate_group_siblings(current_task);
+    interrupts_restore(flags);
+  }
+
+  /* If session leader exits, detach ctty and send SIGHUP/SIGCONT to fg pgrp */
+  if (current_task->session_id == current_task->id) {
+    usize idx = task_index(current_task);
+    int type = g_task_ctty_type[idx];
+    int ctty_idx = g_task_ctty_index[idx];
+    g_task_ctty_type[idx] = 0;
+    g_task_ctty_index[idx] = 0;
+
+    usize fg = 0;
+    if (type == 1) {
+      fg = console.fg_pgrp;
+    } else if (type == 2) {
+      fg = serial_tty_fg_pgrp(ctty_idx);
+    } else if (type == 3) {
+      fg = pty_fg_pgrp(ctty_idx);
+    }
+
+    if (fg > 0) {
+      scheduler_kill_process_group(fg, SIGHUP);
+      scheduler_kill_process_group(fg, SIGCONT);
+    }
   }
 
   /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
@@ -2058,6 +2225,28 @@ void scheduler_exit_current(int exit_code) {
   }
 
   interrupts_disable();
+
+  /* Reparent children to init (task 1) and check for orphaned process groups */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *child = T(i);
+    if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
+      child->parent_id = 1;
+      usize pgid = child->process_group_id;
+      if (is_pgrp_orphaned(pgid, current_task)) {
+        int has_stopped = 0;
+        for (usize j = 0; j < g_task_hwm; j++) {
+          if (T(j)->state == TASK_STOPPED && T(j)->process_group_id == pgid) {
+            has_stopped = 1;
+            break;
+          }
+        }
+        if (has_stopped) {
+          scheduler_kill_process_group(pgid, SIGHUP);
+          scheduler_kill_process_group(pgid, SIGCONT);
+        }
+      }
+    }
+  }
 
   /* Free credentials */
   if (current_task->cred) {
@@ -2209,6 +2398,10 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
+            /* Accumulate child times in parent */
+            usize p_idx = task_index(current_task);
+            g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
+            g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
             if (T(i)->user_image) {
               user_image_free(T(i)->user_image);
               T(i)->user_image = 0;
@@ -2324,6 +2517,228 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     }
 
     interrupts_enable();
+  }
+}
+
+int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
+  if (current_task == 0)
+    return -ECHILD;
+  if (!infop)
+    return -EFAULT;
+  if (idtype != P_ALL && idtype != P_PID && idtype != P_PGID)
+    return -EINVAL;
+  if (idtype == P_PID && id == 0)
+    return -EINVAL;
+
+  const int allowed = B1NIX_WNOHANG | B1NIX_WSTOPPED | B1NIX_WEXITED |
+                      B1NIX_WCONTINUED | B1NIX_WNOWAIT;
+  if ((options & ~allowed) != 0 ||
+      (options & (B1NIX_WSTOPPED | B1NIX_WEXITED |
+                  B1NIX_WCONTINUED)) == 0)
+    return -EINVAL;
+  if (idtype == P_PGID && id == 0)
+    id = current_task->process_group_id;
+
+  int may_block = ((options & B1NIX_WNOHANG) == 0);
+
+  while (1) {
+    interrupts_disable();
+    if (may_block) {
+      if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+        current_task->state = TASK_RUNNING;
+      }
+      current_task->stack_released = 0;
+      __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+
+    int has_children = 0;
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *child = T(i);
+      if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
+        int match = 0;
+        if (idtype == P_ALL) {
+          match = 1;
+        } else if (idtype == P_PID) {
+          match = (child->id == id);
+        } else if (idtype == P_PGID) {
+          match = (child->process_group_id == id);
+        }
+
+        if (match) {
+          has_children = 1;
+
+          /* Check exited child */
+          if ((options & B1NIX_WEXITED) && child->state == TASK_DEAD) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            int code = child->exit_code;
+            if (code & TASK_EXIT_SIGNALED) {
+              info.si_code = 2; /* CLD_KILLED */
+              info.si_status = code & 0x7F;
+            } else {
+              info.si_code = 1; /* CLD_EXITED */
+              info.si_status = code & 0xFF;
+            }
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              /* Perform actual reap */
+              enum task_state _expected = TASK_DEAD;
+              if (__atomic_compare_exchange_n(&child->state, &_expected,
+                                              TASK_REAPING, 0,
+                                              __ATOMIC_ACQUIRE,
+                                              __ATOMIC_RELAXED)) {
+                while (!__atomic_load_n(&child->stack_released, __ATOMIC_ACQUIRE)) {
+                  __asm__ volatile("pause");
+                  tlb_shootdown_poll();
+                }
+
+                usize p_idx = task_index(current_task);
+                g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
+                g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
+
+                if (child->user_image) {
+                  user_image_free(child->user_image);
+                  child->user_image = 0;
+                }
+                u64 last_pml4 = mm_release_user(child);
+                if (last_pml4) {
+                  child->pml4_phys = last_pml4;
+                  user_address_space_cleanup(child);
+                  paging_free_address_space(last_pml4);
+                  child->pml4_phys = 0;
+                } else {
+                  child->vma_list = 0;
+                }
+                {
+                  int *fl = 0;
+                  usize cap = 0;
+                  struct vfs_handle **tbl = fdtable_release(child, &fl, &cap);
+                  if (tbl) {
+                    interrupts_enable();
+                    for (usize j = 0; j < cap; j++) {
+                      if (tbl[j])
+                        vfs_close_handle(tbl[j], (int)child->id);
+                    }
+                    kfree(tbl);
+                    kfree(fl);
+                    interrupts_disable();
+                  }
+                }
+                if (child->name && strcmp(child->name, "boot") != 0) {
+                  kfree((void *)child->name);
+                  child->name = 0;
+                }
+                kfree(child->stack);
+                if (may_block)
+                  scheduler_waitpid_fast_return();
+                interrupts_enable();
+                free_task_slot(child);
+
+                if (infop) {
+                  if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                    return -EFAULT;
+                  }
+                }
+                return 0;
+              } else {
+                continue;
+              }
+            } else {
+              if (may_block)
+                scheduler_waitpid_fast_return();
+              interrupts_enable();
+              if (infop) {
+                if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                  return -EFAULT;
+                }
+              }
+              return 0;
+            }
+          }
+
+          /* Check stopped child */
+          if ((options & B1NIX_WSTOPPED) && child->state == TASK_STOPPED && child->stop_report_pending) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_code = 5; /* CLD_STOPPED */
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            info.si_status = child->last_stop_signal;
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              child->stop_report_pending = 0;
+            }
+            if (may_block)
+              scheduler_waitpid_fast_return();
+            interrupts_enable();
+            if (infop) {
+              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                return -EFAULT;
+              }
+            }
+            return 0;
+          }
+
+          /* Check continued child */
+          if ((options & B1NIX_WCONTINUED) && child->continued_report_pending) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_code = 6; /* CLD_CONTINUED */
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            info.si_status = SIGCONT;
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              child->continued_report_pending = 0;
+            }
+            if (may_block)
+              scheduler_waitpid_fast_return();
+            interrupts_enable();
+            if (infop) {
+              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                return -EFAULT;
+              }
+            }
+            return 0;
+          }
+        }
+      }
+    }
+
+    if (!has_children) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
+      interrupts_enable();
+      return -ECHILD;
+    }
+
+    if (options & B1NIX_WNOHANG) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
+      interrupts_enable();
+      if (infop) {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+          return -EFAULT;
+        }
+      }
+      return 0;
+    }
+
+    scheduler_yield();
+
+    if (wait_interrupted_by_signal()) {
+      current_task->state = TASK_RUNNING;
+      interrupts_enable();
+      return -ERESTARTSYS;
+    }
   }
 }
 
@@ -2693,7 +3108,8 @@ int scheduler_kill(usize task_id, int sig) {
 
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
+    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED &&
+        T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING) {
       /* Signal 0 is the POSIX existence/permission probe: the target was just
        * found alive, so report success without posting any signal. */
       if (sig == 0) {
@@ -2749,7 +3165,8 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
   int sent = 0;
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+    if (T(i)->state != TASK_UNUSED && T(i)->state != TASK_DEAD &&
+        T(i)->state != TASK_REAPING && T(i)->process_group_id == pgrp) {
       /* Signal 0: existence probe only — the group has a live member, so
        * count it as found without posting anything. */
       if (sig == 0) {
@@ -3049,8 +3466,47 @@ isize scheduler_setsid(void) {
   }
   current_task->session_id = current_task->id;
   current_task->process_group_id = current_task->id;
+  usize idx = task_index(current_task);
+  g_task_ctty_type[idx] = 0;
+  g_task_ctty_index[idx] = 0;
   interrupts_enable();
   return (isize)current_task->session_id;
+}
+
+void scheduler_get_ctty(int *type, int *index) {
+  if (!current_task) {
+    *type = 0;
+    *index = 0;
+    return;
+  }
+  u64 flags = interrupts_save();
+  usize session_id = current_task->session_id;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == session_id) {
+      *type = g_task_ctty_type[i];
+      *index = g_task_ctty_index[i];
+      interrupts_restore(flags);
+      return;
+    }
+  }
+  *type = 0;
+  *index = 0;
+  interrupts_restore(flags);
+}
+
+void scheduler_set_ctty(struct task *t, int type, int index) {
+  if (!t) return;
+  u64 flags = interrupts_save();
+  usize session_id = t->session_id;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == session_id) {
+      g_task_ctty_type[i] = type;
+      g_task_ctty_index[i] = index;
+      interrupts_restore(flags);
+      return;
+    }
+  }
+  interrupts_restore(flags);
 }
 
 isize scheduler_getsid(usize pid) {
@@ -3191,14 +3647,14 @@ void scheduler_deliver_pending_signals(void) {
     sighandler_t handler = current_task->sigactions[sig - 1].sa_handler;
 
     if (sig == SIGKILL) {
-      /* SIGKILL — terminate immediately */
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
-      /* See scheduler_exit_current — claim stack_released before DEAD. */
+      terminate_group_siblings(current_task);
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
+      g_have_proc_zombies = 1;
+      post_sigchld_to_parent(current_task->parent_id, 0);
       scheduler_notify_wait_event(current_task->parent_id);
       return;
-      /* unreachable */
     }
 
     if (handler == SIG_IGN) {
@@ -3226,14 +3682,14 @@ void scheduler_deliver_pending_signals(void) {
       case SIGXFSZ:
       case SIGVTALRM:
       case SIGPROF:
-        /* Terminate */
         current_task->exit_code = TASK_EXIT_SIGNALED | sig;
-        /* See scheduler_exit_current — claim stack_released before DEAD. */
+        terminate_group_siblings(current_task);
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
+        g_have_proc_zombies = 1;
+        post_sigchld_to_parent(current_task->parent_id, 0);
         scheduler_notify_wait_event(current_task->parent_id);
         return;
-        /* unreachable */
       case SIGCONT:
         __atomic_fetch_and(&current_task->pending_signals,
                            ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
@@ -3287,4 +3743,3 @@ int scheduler_signal_pending(void) {
   }
   return 0;
 }
-

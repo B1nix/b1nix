@@ -1955,7 +1955,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
     break;
   case SYS_EXIT:
-    scheduler_exit_current((int)arg0);
+    scheduler_exit_group((int)arg0);
     ret = 0;
     break;
   case SYS_SPAWN: {
@@ -2214,6 +2214,88 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return cred_setregid(c, (int)(isize)arg0, (int)(isize)arg1) == 0
                ? 0
                : (u64)-EPERM;
+  }
+  case SYS_SETRESUID: {
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    int ruid = (int)(isize)arg0;
+    int euid = (int)(isize)arg1;
+    int suid = (int)(isize)arg2;
+    if (ruid < -1 || ruid > 0xFFFF || euid < -1 || euid > 0xFFFF ||
+        suid < -1 || suid > 0xFFFF)
+      return (u64)-EINVAL;
+    return cred_setresuid(c, ruid, euid, suid) == 0
+               ? 0
+               : (u64)-EPERM;
+  }
+  case SYS_SETRESGID: {
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    int rgid = (int)(isize)arg0;
+    int egid = (int)(isize)arg1;
+    int sgid = (int)(isize)arg2;
+    if (rgid < -1 || rgid > 0xFFFF || egid < -1 || egid > 0xFFFF ||
+        sgid < -1 || sgid > 0xFFFF)
+      return (u64)-EINVAL;
+    return cred_setresgid(c, rgid, egid, sgid) == 0
+               ? 0
+               : (u64)-EPERM;
+  }
+  case SYS_WAITID: {
+    return (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1, (siginfo_t *)(usize)arg2, (int)arg3);
+  }
+  case SYS_TIMES: {
+    struct tms *user_tms = (struct tms *)(usize)arg0;
+    if (user_tms) {
+      struct tms k_tms;
+      k_tms.tms_utime = (clock_t)task_utime(current_task);
+      k_tms.tms_stime = (clock_t)task_stime(current_task);
+      k_tms.tms_cutime = (clock_t)task_cutime(current_task);
+      k_tms.tms_cstime = (clock_t)task_cstime(current_task);
+      if (syscall_copyout(user_tms, &k_tms, sizeof(struct tms)) < 0) {
+        return (u64)-EFAULT;
+      }
+    }
+    return (u64)scheduler_get_uptime_ticks();
+  }
+  case SYS_GETRUSAGE: {
+    int who = (int)arg0;
+    struct rusage *user_ru = (struct rusage *)(usize)arg1;
+    if (!user_ru) {
+      return (u64)-EFAULT;
+    }
+    struct rusage k_ru;
+    memset(&k_ru, 0, sizeof(struct rusage));
+
+    if (who == RUSAGE_SELF) {
+      u64 utime = task_utime(current_task);
+      u64 stime = task_stime(current_task);
+      k_ru.ru_utime.tv_sec = (i64)(utime / 100);
+      k_ru.ru_utime.tv_usec = (i64)((utime % 100) * 10000);
+      k_ru.ru_stime.tv_sec = (i64)(stime / 100);
+      k_ru.ru_stime.tv_usec = (i64)((stime % 100) * 10000);
+    } else if (who == RUSAGE_CHILDREN) {
+      u64 cutime = task_cutime(current_task);
+      u64 cstime = task_cstime(current_task);
+      k_ru.ru_utime.tv_sec = (i64)(cutime / 100);
+      k_ru.ru_utime.tv_usec = (i64)((cutime % 100) * 10000);
+      k_ru.ru_stime.tv_sec = (i64)(cstime / 100);
+      k_ru.ru_stime.tv_usec = (i64)((cstime % 100) * 10000);
+    } else if (who == RUSAGE_THREAD) {
+      u64 utime = task_utime(current_task);
+      u64 stime = task_stime(current_task);
+      k_ru.ru_utime.tv_sec = (i64)(utime / 100);
+      k_ru.ru_utime.tv_usec = (i64)((utime % 100) * 10000);
+      k_ru.ru_stime.tv_sec = (i64)(stime / 100);
+      k_ru.ru_stime.tv_usec = (i64)((stime % 100) * 10000);
+    } else {
+      return (u64)-EINVAL;
+    }
+
+    if (syscall_copyout(user_ru, &k_ru, sizeof(struct rusage)) < 0) {
+      return (u64)-EFAULT;
+    }
+    return 0;
   }
   case SYS_GETPGID:
     return (u64)scheduler_getpgid((usize)arg0);

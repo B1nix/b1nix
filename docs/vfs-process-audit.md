@@ -230,17 +230,20 @@ empty). `scheduler_fork_current` zeroed both; it now copies
   direct `execve("/script")` works (one interpreter level, optional single
   argument, `ENOEXEC` fallback preserved).
 
-### P8. Remaining gaps — planned (tracked in the M46 roadmap entry)
+### P8. Follow-up process semantics — fixed
 
-- **exit_group semantics**: leader `exit()` should terminate all threads.
-- **Controlling-terminal model**: `struct task` has no ctty linkage, so
-  `setsid()` cannot detach one (the tty layer tracks only per-device
-  `fg_pgrp`).
-- **Orphaned process groups**: no SIGHUP+SIGCONT to a newly-orphaned stopped
-  group on exit.
-- **`getrusage` / `times()` CPU fields**: no per-task CPU accounting; `times`
-  returns real ticks with zeroed CPU times.
-- **`setresuid`/`setresgid`, `waitid`**: not implemented.
+- `exit_group` terminates the full thread group.
+- Sessions track their controlling terminal; `setsid()` detaches it and
+  session-leader exit hangs up the foreground process group.
+- Newly orphaned stopped process groups receive SIGHUP followed by SIGCONT.
+- Timer ticks feed per-task user/system CPU accounting for `times()` and
+  `getrusage()`.
+- `setresuid`, `setresgid`, and `waitid` are implemented.
+- Nice values bias otherwise-equal runnable tasks with stride accounting while
+  preserving the scheduler's existing strict-priority ordering.
+
+Remaining intentional limitations:
+
 - **waitpid not interruptible by SIGCHLD** — *intentional* (wontfix for now):
   a caught SIGCHLD does not EINTR a parent blocked in waitpid; interrupting
   it broke dropbear/wget child reaping. Conformance gap documented in

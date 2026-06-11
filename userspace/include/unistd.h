@@ -121,6 +121,8 @@ pid_t getpgrp(void);
 pid_t getpgid(pid_t pid);
 int setreuid(uid_t ruid, uid_t euid);
 int setregid(gid_t rgid, gid_t egid);
+int setresuid(uid_t ruid, uid_t euid, uid_t suid);
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid);
 int nice(int incr);
 pid_t tcgetpgrp(int fd);
 int tcsetpgrp(int fd, pid_t pgrp);

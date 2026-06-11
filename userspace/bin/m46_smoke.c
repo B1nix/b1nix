@@ -11,6 +11,9 @@
 #include <sys/stat.h>
 #include <sys/resource.h>
 #include <sys/wait.h>
+#include <sys/times.h>
+#include <pthread.h>
+#include <stdlib.h>
 #include <syscall.h>
 #include <unistd.h>
 
@@ -303,6 +306,246 @@ static void test_shebang(void) {
   unlink(path);
 }
 
+static void *exit_group_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    (void)syscall(SYS_YIELD);
+  }
+  return 0;
+}
+
+static void test_exit_group(void) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    pthread_t th;
+    pthread_create(&th, 0, exit_group_thread, 0);
+    for (int i = 0; i < 10; i++) {
+      (void)syscall(SYS_YIELD);
+    }
+    _exit(42);
+  }
+  int st = 0;
+  pid_t got = waitpid(pid, &st, 0);
+  if (got == pid && WIFEXITED(st) && WEXITSTATUS(st) == 42) {
+    ok("exit-group");
+  } else {
+    fail("exit-group", got, pid);
+  }
+}
+
+static void test_resuid_resgid(void) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    if (setresgid(4000, 5000, 6000) < 0) {
+      _exit(1);
+    }
+    if (getgid() != 4000 || getegid() != 5000) {
+      _exit(2);
+    }
+    if (setresuid(1000, 2000, 3000) < 0) {
+      _exit(3);
+    }
+    if (getuid() != 1000 || geteuid() != 2000) {
+      _exit(4);
+    }
+    if (setresuid(0, 0, 0) == 0 || errno != EPERM) {
+      _exit(5);
+    }
+    if (setresgid(0, 0, 0) == 0 || errno != EPERM) {
+      _exit(6);
+    }
+    _exit(0);
+  }
+
+  int st = 0;
+  pid_t got = waitpid(pid, &st, 0);
+  if (got == pid && WIFEXITED(st) && WEXITSTATUS(st) == 0) {
+    ok("setresuid-setresgid");
+  } else {
+    fail("setresuid-setresgid", WEXITSTATUS(st), 0);
+  }
+}
+
+static void test_waitid(void) {
+  pid_t pid = fork();
+  if (pid == 0) {
+    _exit(12);
+  }
+  siginfo_t info;
+  memset(&info, 0, sizeof(info));
+  int rc = waitid(P_PID, pid, &info, WEXITED);
+  if (rc == 0 && info.si_pid == pid && info.si_status == 12 && info.si_code == 1 /* CLD_EXITED */) {
+    ok("waitid");
+  } else {
+    fail("waitid", rc, 0);
+  }
+}
+
+static void test_times_rusage(void) {
+  struct tms t;
+  clock_t clk = times(&t);
+  if (clk == (clock_t)-1) {
+    fail("times-call", clk, 0);
+    return;
+  }
+  struct rusage ru;
+  int rc = getrusage(RUSAGE_SELF, &ru);
+  if (rc < 0) {
+    fail("getrusage-call", rc, 0);
+    return;
+  }
+  ok("times-getrusage");
+}
+
+static volatile sig_atomic_t got_sighup;
+static void sighup_handler(int sig) {
+  (void)sig;
+  got_sighup = 1;
+}
+
+static void test_orphaned_pgrp(void) {
+  const char *path = "/tmp/m46orphan";
+  unlink(path);
+  got_sighup = 0;
+  struct sigaction sa;
+  memset(&sa, 0, sizeof(sa));
+  sa.sa_handler = sighup_handler;
+  sigaction(SIGHUP, &sa, 0);
+
+  pid_t p_pid = fork();
+  if (p_pid == 0) {
+    setpgid(0, 0);
+    pid_t grandchild = fork();
+    if (grandchild == 0) {
+      kill(getpid(), SIGSTOP);
+      for (int i = 0; i < 1000 && !got_sighup; i++) {
+        (void)syscall(SYS_YIELD);
+      }
+      if (got_sighup) {
+        int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+        if (fd >= 0) {
+          write(fd, "OK\n", 3);
+          close(fd);
+        }
+      }
+      _exit(0);
+    }
+    int st = 0;
+    waitpid(grandchild, &st, WUNTRACED);
+    _exit(0);
+  }
+  int st = 0;
+  waitpid(p_pid, &st, 0);
+  for (int i = 0; i < 50; i++) {
+    (void)syscall(SYS_YIELD);
+  }
+  int fd = open(path, O_RDONLY);
+  char buf[32];
+  memset(buf, 0, sizeof(buf));
+  if (fd >= 0) {
+    read(fd, buf, sizeof(buf));
+    close(fd);
+  }
+  unlink(path);
+  if (strcmp(buf, "OK\n") == 0) {
+    ok("orphaned-pgrp");
+  } else {
+    fail("orphaned-pgrp", 0, 1);
+  }
+}
+
+static void nice_worker(const char *path, int nice_val, int start_fd) {
+  char token;
+  if (read(start_fd, &token, 1) != 1) {
+    _exit(1);
+  }
+  close(start_fd);
+  nice(nice_val);
+  volatile unsigned long count = 0;
+  struct timeval start, now;
+  gettimeofday(&start, NULL);
+  while (1) {
+    count++;
+    gettimeofday(&now, NULL);
+    long ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_usec - start.tv_usec) / 1000;
+    if (ms >= 150) {
+      break;
+    }
+  }
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (fd >= 0) {
+    char buf[64];
+    snprintf(buf, sizeof(buf), "%lu\n", count);
+    write(fd, buf, strlen(buf));
+    close(fd);
+  }
+  _exit(0);
+}
+
+#define NICE_WORKERS 4
+
+static void test_nice_biasing(void) {
+  int barrier[2];
+  if (pipe(barrier) < 0) {
+    fail("nice-biasing", errno, 0);
+    return;
+  }
+
+  unsigned long count_high = 0;
+  unsigned long count_low = 0;
+  pid_t pids[NICE_WORKERS * 2];
+  char path[64];
+
+  for (int i = 0; i < NICE_WORKERS * 2; i++) {
+    snprintf(path, sizeof(path), "/tmp/m46nice_%c%d",
+             i < NICE_WORKERS ? 'h' : 'l', i % NICE_WORKERS);
+    unlink(path);
+    pids[i] = fork();
+    if (pids[i] == 0) {
+      close(barrier[1]);
+      nice_worker(path, i < NICE_WORKERS ? -20 : 19, barrier[0]);
+    }
+  }
+
+  close(barrier[0]);
+  char starts[NICE_WORKERS * 2];
+  memset(starts, 1, sizeof(starts));
+  write(barrier[1], starts, sizeof(starts));
+  close(barrier[1]);
+
+  int st = 0;
+  for (int i = 0; i < NICE_WORKERS * 2; i++) {
+    waitpid(pids[i], &st, 0);
+  }
+
+  for (int i = 0; i < NICE_WORKERS * 2; i++) {
+    snprintf(path, sizeof(path), "/tmp/m46nice_%c%d",
+             i < NICE_WORKERS ? 'h' : 'l', i % NICE_WORKERS);
+    int fd = open(path, O_RDONLY);
+    if (fd >= 0) {
+      char buf[64];
+      memset(buf, 0, sizeof(buf));
+      read(fd, buf, sizeof(buf) - 1);
+      if (i < NICE_WORKERS) {
+        count_high += strtoul(buf, NULL, 10);
+      } else {
+        count_low += strtoul(buf, NULL, 10);
+      }
+      close(fd);
+    }
+    unlink(path);
+  }
+
+  if (count_high * 2 > count_low * 3) {
+    ok("nice-biasing");
+  } else {
+    char dbg[128];
+    snprintf(dbg, sizeof(dbg), "nice-biasing: high=%lu low=%lu", count_high, count_low);
+    marker(dbg);
+    fail("nice-biasing", count_high, count_low);
+  }
+}
+
 int main(void) {
   marker("M46-SMOKE: start");
   test_exit_status();
@@ -316,6 +559,12 @@ int main(void) {
   test_append_atomic();
   test_truncate_zeros();
   test_shebang();
+  test_exit_group();
+  test_resuid_resgid();
+  test_waitid();
+  test_times_rusage();
+  test_orphaned_pgrp();
+  test_nice_biasing();
   /* The failure string must not contain "M46-SMOKE: done" — the host-side
    * grep is a substring match. */
   marker(g_fail ? "M46-SMOKE: completed-with-failures" : "M46-SMOKE: done");
