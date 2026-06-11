@@ -248,6 +248,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ps2_mouse.c \
 	kernel/dev/usb_xhci.c \
 	kernel/dev/pty.c \
+	kernel/dev/serial_tty.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
 	kernel/net/net.c \

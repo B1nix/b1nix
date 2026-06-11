@@ -7,6 +7,7 @@
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
+#include <b1nix/serial_tty.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/blk.h>
@@ -164,6 +165,7 @@ static struct block_device *find_root_device(const char *root_val) {
 void kernel_main(usize arg0, usize arg1)
 {
 	serial_init();
+	serial_tty_init();
 	console_init();
 	console_write("b1nix kernel starting...\n");
 

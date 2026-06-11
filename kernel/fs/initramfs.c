@@ -264,7 +264,7 @@ static const char initramfs_inittab[] =
     "id:3:initdefault:\n"
     "si::sysinit:/etc/rc\n"
     "console:2345:respawn:/bin/bash\n"
-    "ttyS0:23:respawn:/bin/getty ttyS0\n"
+    "ttyS0:2345:respawn:/bin/getty -L 115200 ttyS0 vt100\n"
     "ca::ctrlaltdel:/bin/reboot\n"
     "sd::shutdown:/etc/rc.shutdown\n";
 

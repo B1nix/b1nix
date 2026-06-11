@@ -388,13 +388,16 @@ Supporting documents:
 - [x] Parse `/etc/inittab`.
 - [x] Add runlevels and `telinit` (via the `/run/initctl` control file, since
   PID 1 is an in-kernel task).
-- [x] `initial` Spawn independent TTY/serial `getty` sessions — the BusyBox
-  `getty` applet and inittab `respawn` plumbing are in place; b1nix's
-  interactive hardware is effectively a single console.
+- [x] Spawn independent TTY/serial `getty` sessions — `/dev/ttyS0`/`/dev/ttyS1`
+  are real per-device ttys (own line discipline, termios, session/job-control
+  state); the full `getty → login → bash` chain runs on the serial line while
+  the console bash session stays independent.
 - [x] Replace hardcoded boot programs with file-based services (inittab-driven
-  supervisor; legacy path kept as fallback).
+  supervisor with a SysV rate-based respawn storm guard; legacy path kept as
+  fallback).
 - Details: [`m39-init.md`](m39-init.md). Verified by `M39-INIT` smoke markers
-  (i686 528/0, single-CPU and `-smp 4`).
+  (single-CPU and `-smp 4`, both arches) and the end-to-end
+  `tests/serial-getty.sh` login-over-serial test.
 
 ## M40: Linux ABI Compatibility
 

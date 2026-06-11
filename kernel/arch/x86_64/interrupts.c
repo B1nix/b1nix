@@ -13,6 +13,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial_tty.h>
 #include <b1nix/net.h>
 #include <b1nix/tlb.h>
 #include <b1nix/types.h>
@@ -339,6 +340,10 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
         fb_console_blink_cursor();
       }
 
+      /* Drain input BEFORE scheduler_on_timer_tick: the tick may context-
+       * switch away (T8) and delay anything placed after it. */
+      serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
+
       scheduler_on_timer_tick();
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
     }
@@ -350,6 +355,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * tick on all cores and PIT IRQ0 is masked at the IOAPIC; this branch is
      * kept so an unsuspected stray (e.g. calibration failed → IOAPIC mask
      * skipped) still progresses the BSP tick instead of console-spamming. */
+    serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();
