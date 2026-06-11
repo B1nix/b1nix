@@ -51,15 +51,13 @@ byte-oriented). This needed a UTF-8 wide-character module in the libc
 string helpers (`wcscmp`/`wcscoll`/`wcschr`/`wcsdup`/…), plus a `mbstate_t`
 type in `<wchar.h>`. Conversion is UTF-8-only and stateless (an incomplete
 trailing sequence is reported as `(size_t)-2` rather than carried across
-calls). Two knobs are build-scoped so other ports stay byte-oriented:
-`MB_CUR_MAX` (defaulted to 1 in the libc, overridden to 4 for the bash build)
-and the conversion functions themselves are detected by bash's `configure`.
+calls). UTF-8 is the libc-wide default: `MB_CUR_MAX` is 4 in `<stdlib.h>` and
+the non-restartable conversions (`mbtowc`/`wctomb`/`mbstowcs`/`wcstombs`)
+delegate to the same UTF-8 primitives, so every port sees one encoding.
 
 ## Limitations / future work
 
 - `/bin/sh` stays BusyBox `ash`; bash is not (yet) the POSIX `sh`.
-- The libc default `MB_CUR_MAX` is still 1; only bash opts into UTF-8. A global
-  switch would let every port handle multibyte text.
 
 ## Verification
 

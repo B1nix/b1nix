@@ -216,6 +216,63 @@ size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps) {
 	return count;
 }
 
+/* Non-restartable string conversions (UTF-8). */
+size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
+	const char *p = src;
+	mbstate_t st = {0, 0};
+	if (!dest) {
+		/* count characters */
+		size_t count = 0;
+		while (*p) {
+			wchar_t wc;
+			size_t r = mbrtowc(&wc, p, 4, &st);
+			if (r == (size_t)-1 || r == (size_t)-2)
+				return (size_t)-1;
+			if (r == 0)
+				break;
+			p += r;
+			count++;
+		}
+		return count;
+	}
+	size_t i = 0;
+	while (i < n) {
+		wchar_t wc;
+		size_t r = mbrtowc(&wc, p, 4, &st);
+		if (r == (size_t)-1)
+			return (size_t)-1;
+		dest[i] = wc;
+		if (r == 0)
+			return i; /* not counting the terminating NUL */
+		p += r;
+		i++;
+	}
+	return i;
+}
+
+size_t wcstombs(char *dest, const wchar_t *src, size_t n) {
+	const wchar_t *p = src;
+	mbstate_t st = {0, 0};
+	char tmp[4];
+	size_t count = 0;
+	while (*p) {
+		size_t r = wcrtomb(tmp, *p, &st);
+		if (r == (size_t)-1)
+			return (size_t)-1;
+		if (dest) {
+			if (count + r > n)
+				break;
+			for (size_t i = 0; i < r; i++)
+				dest[count + i] = tmp[i];
+		}
+		count += r;
+		p++;
+	}
+	if (dest && count < n)
+		dest[count] = '\0';
+	return count;
+}
+
 wint_t btowc(int c) {
 	if (c == EOF || (unsigned)c >= 0x80)
 		return WEOF;

@@ -459,6 +459,7 @@ Source-level ports remain preferable to a Linux compatibility layer.
   `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
 - [x] Add a UTF-8 wide-character libc module (`wchar.c`: `mbrtowc`/`wcwidth`/
   `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
-  character-aware.
+  character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
+  `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
 - Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` markers
   (i686 and x86_64 530/0, single-CPU and `-smp 4`).
