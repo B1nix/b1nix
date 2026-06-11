@@ -958,7 +958,9 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
       }
       while (1) {
         int status = 0;
-        scheduler_wait(0, &status);
+        /* -1 = reap ANY child. pid 0 now means "my process group" (POSIX),
+         * which would skip orphans reparented here from other groups. */
+        scheduler_wait((usize)-1, &status);
         scheduler_yield();
       }
     }
@@ -1283,7 +1285,11 @@ int user_spawn(const char *path, int argc, const char **argv) {
 
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
-  struct vfs_node *node = vfs_find_node(path);
+  int interp_level = 0;
+  struct vfs_node *node;
+
+resolve:
+  node = vfs_find_node(path);
   if (!node || IS_ERR(node))
     return node ? (int)PTR_ERR(node) : -ENOENT;
 
@@ -1297,6 +1303,71 @@ int user_execve_current(const char *path, const char **argv,
   u16 file_mode = node->inode->mode;
   u16 file_uid = node->inode->uid;
   u16 file_gid = node->inode->gid;
+
+  /* POSIX `#!` interpreter files: rewrite the exec into
+   * "interpreter [optional-arg] script-path argv[1..]". One level only —
+   * an interpreter that is itself a script is ENOEXEC. Previously a direct
+   * execve() of a script failed at the ELF loader and scripts only ran
+   * because the userspace shell retried them via /bin/sh. */
+  if (node->inode->type == VFS_FILE) {
+    char head[128];
+    isize hn = 0;
+    if (node->inode->read_cb) {
+      hn = node->inode->read_cb(node, 0, head, sizeof(head) - 1, 0);
+    } else if (node->inode->data) {
+      hn = node->inode->size < sizeof(head) - 1 ? (isize)node->inode->size
+                                                : (isize)(sizeof(head) - 1);
+      memcpy(head, node->inode->data, (usize)hn);
+    }
+    if (hn >= 2 && head[0] == '#' && head[1] == '!') {
+      vfs_node_put(node);
+      if (interp_level++ > 0)
+        return -ENOEXEC;
+      head[hn] = '\0';
+      char *line = head + 2;
+      while (*line == ' ' || *line == '\t')
+        line++;
+      char *nl = line;
+      while (*nl && *nl != '\n' && *nl != '\r')
+        nl++;
+      *nl = '\0';
+      if (*line == '\0')
+        return -ENOEXEC;
+      char *opt = 0;
+      char *sp = line;
+      while (*sp && *sp != ' ' && *sp != '\t')
+        sp++;
+      if (*sp) {
+        *sp = '\0';
+        opt = sp + 1;
+        while (*opt == ' ' || *opt == '\t')
+          opt++;
+        if (*opt == '\0')
+          opt = 0;
+      }
+      usize argc_old = 0;
+      if (argv)
+        while (argv[argc_old])
+          argc_old++;
+      usize tail = argc_old > 0 ? argc_old - 1 : 0;
+      usize extra = opt ? 3 : 2;
+      char **nargv = kmalloc((extra + tail + 1) * sizeof(char *));
+      if (!nargv)
+        return -ENOMEM;
+      usize k = 0;
+      nargv[k++] = strdup(line);
+      if (opt)
+        nargv[k++] = strdup(opt);
+      nargv[k++] = strdup(path);
+      for (usize a = 1; a < argc_old; a++)
+        nargv[k++] = strdup(argv[a]);
+      nargv[k] = 0;
+      free_kernel_array((char **)argv);
+      argv = (const char **)nargv;
+      path = nargv[0];
+      goto resolve;
+    }
+  }
 
   vfs_node_put(node);
 
@@ -1336,6 +1407,9 @@ int user_execve_current(const char *path, const char **argv,
     user_image_free(current_task->user_image);
   }
   current_task->user_image = image;
+  /* The new image is committed: from here on, a parent's setpgid() on this
+   * (child) task must fail with EACCES (POSIX). */
+  scheduler_mark_execed_current();
   task_set_tls_base(current_task, 0);
   {
     extern void arch_set_fs_base(u64 base);

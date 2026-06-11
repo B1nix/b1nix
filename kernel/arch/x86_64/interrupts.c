@@ -605,7 +605,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       coredump_write(frame, sig);
       console_write("coredump: wrote /tmp/core\n");
     }
-    scheduler_exit_current(128 + sig);
+    scheduler_exit_current(TASK_EXIT_SIGNALED | sig);
     /* scheduler_exit_current never returns */
     arch_halt();
   }

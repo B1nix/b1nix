@@ -51,6 +51,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m35_smoke \
 	m38_sound \
 	m42_w5pre_smoke \
+	m46_smoke \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 INITRAMFS_USER_PROGRAM_INCS := \

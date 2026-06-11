@@ -237,6 +237,52 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
   }
 }
 
+void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
+  if (!inode)
+    return;
+
+  lock_pc();
+  struct page_cache_entry *curr = lru_head;
+  while (curr) {
+    struct page_cache_entry *next = curr->lru_next;
+    if (curr->inode == inode && curr->offset + PAGE_SIZE > new_size) {
+      void *virt = (void *)(usize)(curr->frame + vmm_direct_map_base());
+      if (curr->offset >= new_size) {
+        /* Page lies fully beyond the new EOF. Drop it so a later re-grow
+         * reads zeros instead of resurrecting pre-truncate contents. If a
+         * reader still holds a reference, neutralize in place instead. */
+        if (curr->refcount == 0) {
+          u32 h = pc_hash(curr->inode, curr->offset);
+          struct page_cache_entry **prev = &hash_table[h];
+          struct page_cache_entry *hcurr = *prev;
+          while (hcurr) {
+            if (hcurr == curr) {
+              *prev = hcurr->hash_next;
+              break;
+            }
+            prev = &hcurr->hash_next;
+            hcurr = hcurr->hash_next;
+          }
+          lru_remove(curr);
+          pmm_free_frame(curr->frame);
+          curr->inode = 0;
+          curr->hash_next = to_free_list;
+          to_free_list = curr;
+        } else {
+          memset(virt, 0, PAGE_SIZE);
+          curr->flags &= ~PAGE_CACHE_DIRTY;
+        }
+      } else {
+        /* Partial tail page: zero the bytes beyond the new EOF. */
+        usize keep = (usize)(new_size - curr->offset);
+        memset((u8 *)virt + keep, 0, PAGE_SIZE - keep);
+      }
+    }
+    curr = next;
+  }
+  unlock_pc();
+}
+
 void page_cache_put_page(struct page_cache_entry *page) {
   lock_pc();
   if (page->refcount > 0) {

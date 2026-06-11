@@ -946,6 +946,51 @@ int setpgid(pid_t pid, pid_t pgid) {
   return _check_err(syscall(SYS_SETPGRP, pid, pgid));
 }
 
+pid_t getpgid(pid_t pid) {
+  return _check_err(syscall(SYS_GETPGID, pid));
+}
+
+int setreuid(uid_t ruid, uid_t euid) {
+  return _check_err(syscall(SYS_SETREUID, ruid, euid));
+}
+
+int setregid(gid_t rgid, gid_t egid) {
+  return _check_err(syscall(SYS_SETREGID, rgid, egid));
+}
+
+/* The kernel returns getpriority(2)'s Linux encoding 20 - nice (always
+ * positive) so errnos stay unambiguous; convert back to POSIX -20..19. */
+int getpriority(int which, id_t who) {
+  (void)which; /* PRIO_PROCESS only */
+  long rc = syscall(SYS_GETPRIORITY, who);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 20 - (int)rc;
+}
+
+int setpriority(int which, id_t who, int prio) {
+  (void)which; /* PRIO_PROCESS only */
+  return _check_err(syscall(SYS_SETPRIORITY, who, prio));
+}
+
+int nice(int incr) {
+  long rc = syscall(SYS_GETPRIORITY, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  int next = (20 - (int)rc) + incr;
+  if (next < -20)
+    next = -20;
+  if (next > 19)
+    next = 19;
+  if (setpriority(PRIO_PROCESS, 0, next) < 0)
+    return -1;
+  return next;
+}
+
 #define B1NIX_TIOCGPGRP 0x540F
 #define B1NIX_TIOCSPGRP 0x5410
 

@@ -117,6 +117,8 @@ int  cred_set_uid(struct cred *cred, u16 uid);
 int  cred_set_euid(struct cred *cred, u16 euid);
 int  cred_set_gid(struct cred *cred, u16 gid);
 int  cred_set_egid(struct cred *cred, u16 egid);
+int  cred_setreuid(struct cred *cred, int ruid, int euid);
+int  cred_setregid(struct cred *cred, int rgid, int egid);
 
 /* Permission checks */
 int  cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 file_mode, u32 access_mask);

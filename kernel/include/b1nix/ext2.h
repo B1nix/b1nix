@@ -116,6 +116,9 @@ struct ext2_fs {
     u32 inodes_per_group;
     u32 inode_size;
     int bitmaps_dirty;
+    /* Serializes the block/inode allocator bitmaps + superblock counters.
+     * Sleeping lock (vfs_meta_lock_*): the holder does block I/O. */
+    int alloc_lock;
     struct ext2_fs *next;
 };
 

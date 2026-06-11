@@ -174,6 +174,10 @@ static int ext4_write_inode(struct ext4_fs *fs, u32 inode_num, const struct ext2
 }
 
 static u32 ext4_alloc_block_tx(struct ext4_fs *fs, struct journal_handle *h) {
+  /* The bitmap+superblock read-modify-write below must be atomic per fs: two
+   * CPUs allocating concurrently can otherwise hand the same block to two
+   * files (silent cross-file data corruption under parallel writes). */
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 groups = (fs->sb.s_blocks_count + fs->sb.s_blocks_per_group - 1) / fs->sb.s_blocks_per_group;
   for (u32 g = 0; g < groups; g++) {
     struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd); if (bgd.bg_free_blocks_count_lo == 0) continue;
@@ -185,11 +189,14 @@ static u32 ext4_alloc_block_tx(struct ext4_fs *fs, struct journal_handle *h) {
         fs->sb.s_free_blocks_count--; ext4_write_superblock(fs);
         u32 block_num = g * fs->sb.s_blocks_per_group + i + (fs->sb.s_log_block_size == 0 ? 1 : 0);
         u8 *zero = kzalloc(fs->block_size); ext4_journal_write_tx(fs, h, block_num, zero);
-        kfree(zero); return block_num;
+        kfree(zero);
+        vfs_meta_lock_release(&fs->alloc_lock);
+        return block_num;
       }
     }
     kfree(bitmap);
   }
+  vfs_meta_lock_release(&fs->alloc_lock);
   return 0;
 }
 
@@ -198,6 +205,7 @@ static u32 ext4_alloc_block(struct ext4_fs *fs) {
 }
 
 static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 groups = (fs->sb.s_inodes_count + fs->inodes_per_group - 1) / fs->inodes_per_group;
   for (u32 g = 0; g < groups; g++) {
     struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd); if (bgd.bg_free_inodes_count_lo == 0) continue;
@@ -209,16 +217,19 @@ static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
         fs->sb.s_free_inodes_count--; ext4_write_superblock(fs);
         u32 inode_num = g * fs->inodes_per_group + i + 1;
         struct ext2_inode ni; memset(&ni, 0, sizeof(ni)); ext4_write_inode_tx(fs, h, inode_num, &ni);
+        vfs_meta_lock_release(&fs->alloc_lock);
         return inode_num;
       }
     }
     kfree(bitmap);
   }
+  vfs_meta_lock_release(&fs->alloc_lock);
   return 0;
 }
 
 static void ext4_free_block_tx(struct ext4_fs *fs, u32 block_num, struct journal_handle *h) {
   if (block_num == 0) return;
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 g = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) / fs->sb.s_blocks_per_group;
   u32 i = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) % fs->sb.s_blocks_per_group;
   struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd);
@@ -226,6 +237,7 @@ static void ext4_free_block_tx(struct ext4_fs *fs, u32 block_num, struct journal
   bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_block_bitmap(fs, &bgd), bitmap);
   kfree(bitmap); bgd.bg_free_blocks_count_lo++; ext4_write_bgd_tx(fs, g, &bgd, h);
   fs->sb.s_free_blocks_count++; ext4_write_superblock(fs);
+  vfs_meta_lock_release(&fs->alloc_lock);
 }
 
 static void ext4_free_block(struct ext4_fs *fs, u32 block_num) {
@@ -234,6 +246,7 @@ static void ext4_free_block(struct ext4_fs *fs, u32 block_num) {
 
 static void ext4_free_inode_tx(struct ext4_fs *fs, u32 inode_num, struct journal_handle *h) {
   if (inode_num == 0) return;
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 g = (inode_num - 1) / fs->inodes_per_group;
   u32 i = (inode_num - 1) % fs->inodes_per_group;
   struct ext4_bgd_64 bgd; ext4_read_bgd(fs, g, &bgd);
@@ -241,6 +254,7 @@ static void ext4_free_inode_tx(struct ext4_fs *fs, u32 inode_num, struct journal
   bitmap[i / 8] &= ~(1 << (i % 8)); ext4_journal_write_tx(fs, h, ext4_bgd_inode_bitmap(fs, &bgd), bitmap);
   kfree(bitmap); bgd.bg_free_inodes_count_lo++; ext4_write_bgd_tx(fs, g, &bgd, h);
   fs->sb.s_free_inodes_count++; ext4_write_superblock(fs);
+  vfs_meta_lock_release(&fs->alloc_lock);
 }
 
 static void ext4_free_inode(struct ext4_fs *fs, u32 inode_num) {
@@ -842,8 +856,53 @@ static int ext4_vfs_rename(struct vfs_node *old_dir, const char *old_name,
   }
   struct ext2_inode moved;
   if (ext4_read_inode(fs, ino, &moved) == 0) {
+    /* ext4_vfs_unlink_tx dropped the moved inode's link count when it removed
+     * the old entry, but the new entry added above still references it —
+     * restore the count or every rename silently leaks a link (a renamed
+     * regular file ends up with i_links_count == 0 on disk). */
+    moved.i_links_count++;
     moved.i_ctime = vfs_get_unix_time();
     ext4_write_inode_tx(fs, h, ino, &moved);
+  }
+  if (type == EXT2_FT_DIR && old_dir_info->inode_num != new_dir_info->inode_num) {
+    /* Directory moved to a different parent: rewrite its ".." entry and move
+     * the back-link between the parents' link counts, or "cd .." resolves to
+     * the old parent after a remount and both parents' counts go stale. */
+    struct ext2_inode mdi;
+    if (ext4_read_inode(fs, ino, &mdi) == 0) {
+      u8 *db = kmalloc(fs->block_size);
+      u32 mblocks = (mdi.i_size + fs->block_size - 1) / fs->block_size;
+      int rewrote = 0;
+      for (u32 b = 0; b < mblocks && !rewrote; b++) {
+        u32 phys = ext4_get_block(fs, &mdi, b);
+        if (!phys) continue;
+        ext4_read_block(fs, phys, db);
+        usize off = 0;
+        while (off < fs->block_size) {
+          struct ext2_dir_entry *e = (struct ext2_dir_entry *)(db + off);
+          if (e->rec_len == 0) break;
+          if (e->inode != 0 && e->name_len == 2 && e->name[0] == '.' &&
+              e->name[1] == '.') {
+            e->inode = new_dir_info->inode_num;
+            ext4_journal_write_tx(fs, h, phys, db);
+            rewrote = 1;
+            break;
+          }
+          off += e->rec_len;
+        }
+      }
+      kfree(db);
+    }
+    struct ext2_inode pdi;
+    if (ext4_read_inode(fs, old_dir_info->inode_num, &pdi) == 0 &&
+        pdi.i_links_count > 2) {
+      pdi.i_links_count--;
+      ext4_write_inode_tx(fs, h, old_dir_info->inode_num, &pdi);
+    }
+    if (ext4_read_inode(fs, new_dir_info->inode_num, &pdi) == 0) {
+      pdi.i_links_count++;
+      ext4_write_inode_tx(fs, h, new_dir_info->inode_num, &pdi);
+    }
   }
   if (h) journal_commit_transaction(h);
   return 0;

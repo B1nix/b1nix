@@ -467,3 +467,33 @@ Source-level ports remain preferable to a Linux compatibility layer.
   `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
 - Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` +
   `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.
+
+## M46: VFS Integrity and POSIX Process Conformance
+
+A corruption-focused VFS audit plus a POSIX process-management gap audit;
+findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
+
+- [x] Lock the ext4/ext2 block & inode allocators (per-fs sleeping mutex) —
+  fixes cross-file block double-allocation under parallel writes.
+- [x] Make O_APPEND sample the file size under the inode lock (no lost
+  concurrent appends) and make truncate drop/zero stale page-cache pages.
+- [x] Fix the shared fd-table lifecycle: last-user close+free under
+  `g_mm_release_lock`, shared fd_lock for CLONE_FILES siblings, pointer
+  propagation on table growth, atomic fetch-and-clear in `close()`.
+- [x] Fix rename link-count leak and cross-parent directory `..` rewriting
+  (ext4 + ext2); lock `vfs_mount` slot claim; fix `vfs_link` error-path
+  refcount.
+- [x] Separate exit-status from signal-death encoding (`exit(139)` no longer
+  reads as SIGSEGV); fix `kill(0)`/`kill(-1)` targets; `waitpid(-pgid)` and
+  `waitpid(0)` group waits; ESRCH/EINVAL errnos; full `setpgid` POSIX rules;
+  fork inherits the blocked-signal mask.
+- [x] Add `getpgid`, `nice`/`getpriority`/`setpriority`, `setreuid`/
+  `setregid`, and in-kernel `#!` interpreter execution.
+- [ ] `planned` exit_group semantics (leader exit terminates all threads).
+- [ ] `planned` Controlling-terminal linkage (`setsid` ctty detach) and
+  orphaned-process-group SIGHUP+SIGCONT.
+- [ ] `planned` Per-task CPU accounting for `times()`/`getrusage`;
+  `setresuid`/`setresgid`; `waitid`.
+- [ ] `planned` Make the nice value actually bias the cooperative scheduler
+  (it round-trips via a side-table; mapping it onto the strict-priority
+  `pick_next_task` scan starves tasks — see the audit doc).

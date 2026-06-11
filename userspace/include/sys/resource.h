@@ -3,6 +3,11 @@
 
 #include <sys/types.h>
 
+/* getpriority/setpriority `which` values (PRIO_PROCESS only is honored). */
+#define PRIO_PROCESS 0
+#define PRIO_PGRP    1
+#define PRIO_USER    2
+
 typedef unsigned long rlim_t;
 
 struct rlimit {
@@ -25,6 +30,8 @@ extern "C" {
 
 int getrlimit(int resource, struct rlimit *rlim);
 int setrlimit(int resource, const struct rlimit *rlim);
+int getpriority(int which, id_t who);
+int setpriority(int which, id_t who, int prio);
 
 #ifdef __cplusplus
 }

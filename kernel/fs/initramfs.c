@@ -34,6 +34,7 @@
 #include "initramfs_m38_sound.inc"
 #include "initramfs_testwav.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
+#include "initramfs_m46_smoke.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
 #include "initramfs_telinit.inc"
@@ -955,6 +956,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_testwav), 0},
     {"/bin/m42-w5pre-smoke", (const char *)vfs_m42_w5pre_smoke_elf,
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m46-smoke", (const char *)vfs_m46_smoke_elf,
+     sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
     /* M30: the dynamic linker file is shipped as the PIE binary itself —
      * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
      * exists as a name on disk that PT_INTERP can reference even though

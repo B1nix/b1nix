@@ -2199,6 +2199,24 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int rc = cred_set_egid(c, (u16)arg0);
     return rc == 0 ? 0 : (u64)-EPERM;
   }
+  case SYS_SETREUID: {
+    klog_info("audit: setreuid called");
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    return cred_setreuid(c, (int)(isize)arg0, (int)(isize)arg1) == 0
+               ? 0
+               : (u64)-EPERM;
+  }
+  case SYS_SETREGID: {
+    klog_info("audit: setregid called");
+    struct cred *c = scheduler_get_current_cred();
+    if (!c) return (u64)-EACCES;
+    return cred_setregid(c, (int)(isize)arg0, (int)(isize)arg1) == 0
+               ? 0
+               : (u64)-EPERM;
+  }
+  case SYS_GETPGID:
+    return (u64)scheduler_getpgid((usize)arg0);
   case SYS_GETGROUPS: {
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
@@ -2249,9 +2267,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     scheduler_sleep_ticks(arg0);
     return 0;
   case SYS_KILL: {
+    /* POSIX kill(2) pid decoding: 0 = caller's process group, -1 = every
+     * process the caller may signal, < -1 = process group |pid|, > 0 = that
+     * process. The old code sent pid 0 to a task lookup (always failing) and
+     * pid -1 to process group 1. */
     isize target = (isize)arg0;
-    u64 kill_ret = (u64)-EINVAL;
-    if (target < 0) {
+    u64 kill_ret;
+    if (target == 0) {
+      kill_ret = (u64)scheduler_kill_process_group(scheduler_getpgrp(),
+                                                   (int)arg1);
+    } else if (target == -1) {
+      kill_ret = (u64)scheduler_kill_all((int)arg1);
+    } else if (target < 0) {
       kill_ret = (u64)scheduler_kill_process_group((usize)(-target), (int)arg1);
     } else {
       kill_ret = (u64)scheduler_kill((usize)target, (int)arg1);
