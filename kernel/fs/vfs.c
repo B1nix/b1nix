@@ -915,6 +915,12 @@ void vfs_inode_put(struct vfs_inode *inode) {
   if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
       inode->nlink == 0) {
     page_cache_invalidate_inode(inode);
+    /* IC-1: drop any icache entry that maps to this inode BEFORE freeing it,
+     * so a later icache_get(fs_id, ino) can't resurrect a dangling pointer
+     * into freed slab memory. (The icache currently stores a raw, unreferenced
+     * inode pointer; full reference-pinning of cached inodes is deferred.) */
+    if (inode->fs_id)
+      icache_invalidate(inode->fs_id, inode->ino);
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }
@@ -2623,7 +2629,9 @@ void vfs_close(int fd) {
   if (!h)
     return;
 
-  vfs_close_handle(h, current_task ? (int)current_task->id : 0);
+  /* Pass the PROCESS (thread-group) id: POSIX file locks are process-owned, so
+   * release must use the same key filelock_set_lock stored. */
+  vfs_close_handle(h, current_task ? (int)task_tgid(current_task) : 0);
 }
 
 static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
@@ -4386,6 +4394,11 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   if (ret != 0)
     goto out;
 
+  /* Exclusive inode lock: the xattr list is shared mutable inode state; a
+   * concurrent setxattr/removexattr on another CPU would corrupt the list and
+   * a concurrent getxattr could walk a freed node (UAF). */
+  vfs_inode_lock(node->inode);
+
   struct vfs_xattr **pp = &node->inode->xattrs;
   struct vfs_xattr *existing = 0;
   while (*pp) {
@@ -4397,11 +4410,11 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   }
   if (existing && (flags & XATTR_CREATE)) {
     ret = -EEXIST;
-    goto out;
+    goto out_unlock;
   }
   if (!existing && (flags & XATTR_REPLACE)) {
     ret = -ENODATA;
-    goto out;
+    goto out_unlock;
   }
 
   void *newval = 0;
@@ -4409,7 +4422,7 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
     newval = kmalloc(size);
     if (!newval) {
       ret = -ENOMEM;
-      goto out;
+      goto out_unlock;
     }
     memcpy(newval, value, size);
   }
@@ -4425,7 +4438,7 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
       if (newval)
         kfree(newval);
       ret = -ENOMEM;
-      goto out;
+      goto out_unlock;
     }
     x->next = 0;
     memcpy(x->name, name, nlen);
@@ -4437,6 +4450,8 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   vfs_update_times(node->inode, VFS_CTIME);
   ret = 0;
 
+out_unlock:
+  vfs_inode_unlock(node->inode);
 out:
   vfs_node_put(node);
   return ret;
@@ -4451,6 +4466,7 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
     return (isize)PTR_ERR(node);
 
   isize ret = -ENODATA;
+  vfs_inode_lock_read(node->inode);
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
     if (strcmp(x->name, name) != 0)
       continue;
@@ -4465,6 +4481,7 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
     }
     break;
   }
+  vfs_inode_unlock_read(node->inode);
   vfs_node_put(node);
   return ret;
 }
@@ -4474,6 +4491,7 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
 
+  vfs_inode_lock_read(node->inode);
   usize total = 0;
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next)
     total += strlen(x->name) + 1;
@@ -4492,6 +4510,7 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
     }
     ret = (isize)total;
   }
+  vfs_inode_unlock_read(node->inode);
   vfs_node_put(node);
   return ret;
 }
@@ -4508,6 +4527,7 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
     goto out;
 
   ret = -ENODATA;
+  vfs_inode_lock(node->inode);
   struct vfs_xattr **pp = &node->inode->xattrs;
   while (*pp) {
     if (strcmp((*pp)->name, name) == 0) {
@@ -4522,6 +4542,7 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
     }
     pp = &(*pp)->next;
   }
+  vfs_inode_unlock(node->inode);
 
 out:
   vfs_node_put(node);

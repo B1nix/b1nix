@@ -278,7 +278,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
 
 ## Confirmed — memory safety / corruption (verified)
 
-- **FL-1 — CRITICAL — POSIX file locks have no lock at all.** `[verified]`
+- **FL-1 — CRITICAL — POSIX file locks have no lock at all.** **[FIXED]** `[verified]`
   `kernel/fs/filelock.c` — `file_locks[]` is a bare global; `filelock_set_lock`
   does a check-then-grant with nothing atomic between the conflict scan and the
   install, `alloc_lock()` is a non-atomic test-and-set, and its NULL return is
@@ -286,7 +286,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   callers double-claim a slot or NULL-deref. Fix: one global spinlock around all
   table access; on `F_SETLKW` drop it before `scheduler_wait_commit`.
 
-- **F1-unix — HIGH — UNIX-socket peer back-pointer UAF.** `[verified]`
+- **F1-unix — HIGH — UNIX-socket peer back-pointer UAF.** **[FIXED]** `[verified]`
   `kernel/net/unix.c:43` (`unix_free_state`) — closing one end frees its
   `unix_socket_data` but never clears the surviving peer's `->peer`; the peer's
   next `send`/`recv` writes through the dangling pointer. Fix: clear
@@ -294,7 +294,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   refcount `unix_socket_data`.
 
 - **F1-journal — HIGH — concurrent journal transactions corrupt the heap and
-  the on-disk journal.** `[verified]` `kernel/fs/journal.c` — no per-`journal_dev`
+  the on-disk journal.** **[FIXED]** `[verified]` `kernel/fs/journal.c` — no per-`journal_dev`
   lock; `journal_start_transaction` claims `handles[]` non-atomically and
   `journal_commit_transaction` advances shared `s_start`/`next_seq` unlocked.
   ext4 only holds the *parent inode* lock, so two CPUs creating files in
@@ -302,7 +302,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   `handle->data_blocks` / interleaved journal blocks. Fix: per-`journal_dev`
   sleeping mutex held start→commit; atomic-CAS handle-slot claim.
 
-- **F2-blk — HIGH — block cache keeps two valid entries for one (dev,lba).**
+- **F2-blk — HIGH — block cache keeps two valid entries for one (dev,lba).** **[FIXED]**
   `[verified]` `kernel/dev/blk.c` — after `bcache_evict` drops the lock for
   write-back, the read/write miss paths do **not** re-run `bcache_find` before
   claiming and hash-inserting their slot. Two CPUs missing the same key create
@@ -312,13 +312,13 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   dropping the lock for the fill.
 
 - **FL-3 — HIGH — file locks owned by an exited CLONE_FILES thread never
-  release.** `[verified]` `filelock.c` + `scheduler.c` — ownership is keyed by
+  release.** **[FIXED]** `[verified]` `filelock.c` + `scheduler.c` — ownership is keyed by
   task id, but the shared fd table is closed only by the *last* table user with
   *that* task's id, which never matches the original owner. Stale lock persists
   → other processes' `F_SETLK` get EAGAIN forever, the 64-slot table fills. Fix:
   key lock ownership by the thread-group/leader id.
 
-- **X-1 — HIGH — xattr list mutated/traversed with no inode lock.** `[verified]`
+- **X-1 — HIGH — xattr list mutated/traversed with no inode lock.** **[FIXED]** `[verified]`
   `kernel/fs/vfs.c` setxattr/getxattr/removexattr/listxattr — `removexattr`
   frees a node a concurrent `getxattr` is walking (UAF); two `setxattr` race the
   tail append (list corruption + leak). Fix: take the inode rwlock (write for
@@ -338,7 +338,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   reading → torn/zeroed data on disk. (Directly adjacent to the M46 truncate
   work.) Fix: hold `vfs_inode_lock` in fsync/close around the flush.
 
-- **IC-1 — MEDIUM (latent) — icache stores raw `vfs_inode*` with no reference.**
+- **IC-1 — MEDIUM (latent) — icache stores raw `vfs_inode*` with no reference.** **[FIXED]**
   `kernel/fs/vfs.c` — `icache_insert`/`icache_get` never `vfs_inode_get`, and
   `vfs_inode_put` frees the inode without removing it from the cache. Harmless
   *today* only because every `icache_get` result is used as a presence boolean
@@ -358,7 +358,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   `__atomic_compare_exchange_n(&sibling->state, &expected, TASK_READY, …)`,
   skipping DEAD/REAPING/UNUSED — mirror `wake_sleepers`.
 
-- **M46-2 — MEDIUM — orphaned-pgrp false-negative with ≥2 children in one pgrp.**
+- **M46-2 — MEDIUM — orphaned-pgrp false-negative with ≥2 children in one pgrp.** **[FIXED]**
   `scheduler.c:2229-2249` — the exit path reparents one child then immediately
   tests `is_pgrp_orphaned`, while not-yet-reparented siblings still point at the
   (still-RUNNING) exiting parent → the group reads as "not orphaned" and the

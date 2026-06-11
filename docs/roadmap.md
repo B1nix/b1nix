@@ -504,29 +504,36 @@ A follow-up SMP/lifetime sweep of the subsystems outside the VFS/process core
 found further real bugs, none yet fixed. Ordered by severity; details and
 mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
 
-- [ ] `bug` **filelock has no lock at all** (FL-1, critical) — conflicting
-  `F_WRLCK`s granted under SMP, NULL-deref on a full table; also locks owned
-  by an exited CLONE_FILES thread never release (FL-3).
+- [x] `bug` **filelock has no lock at all** (FL-1, critical) — FIXED: global
+  spinlock around file_locks[] (dropped before the F_SETLKW sleep), NULL-checked
+  alloc, and lock ownership keyed by the process tgid so a CLONE_FILES thread's
+  locks release at fd-table teardown (FL-3).
 - [x] `bug` **`terminate_group_siblings` resurrects DEAD/REAPING siblings**
   (M46-1, high) — FIXED: per-state CAS instead of a plain store. — plain `state = READY` store instead of a CAS; UAF/double-run
   under CLONE_THREAD on APs. Regression in the exit_group code.
-- [ ] `bug` **UNIX-socket peer back-pointer UAF** (F1-unix, high) — close frees
-  one end's state without clearing the peer's `->peer`.
-- [ ] `bug` **concurrent journal transactions corrupt heap + on-disk journal**
-  (F1-journal, high) — no per-`journal_dev` lock; ext4 commits concurrently.
-- [ ] `bug` **block cache keeps two valid entries per (dev,lba)** (F2-blk, high)
-  — no re-find after the evict drops the lock → stale-data corruption.
-- [ ] `bug` **xattr list mutated/walked with no inode lock** (X-1, high) — UAF
-  on concurrent get/remove.
+- [x] `bug` **UNIX-socket peer back-pointer UAF** (F1-unix, high) — FIXED:
+  refcounted unix_socket_data; peer links + backlog slots are counted refs,
+  send/poll pin the peer while using it, close tears the link + marks the peer
+  disconnected.
+- [x] `bug` **concurrent journal transactions corrupt heap + on-disk journal**
+  (F1-journal, high) — FIXED: a global sleeping mutex serializes whole
+  transactions (start→commit/abort), removing the handles[]/s_start races.
+- [x] `bug` **block cache keeps two valid entries per (dev,lba)** (F2-blk, high)
+  — FIXED: re-find after evict, and a BUSY in-progress entry is hash-published
+  before the DMA so concurrent misses wait instead of filling a duplicate.
+- [x] `bug` **xattr list mutated/walked with no inode lock** (X-1, high) —
+  FIXED: inode write-lock for set/remove, read-lock for get/list.
 - [x] `bug` **`page_cache_flush_inode` races truncate's in-place zeroing**
   (PC-1, medium-high) — FIXED: fsync/close hold the inode lock across the flush.
 - [x] `bug` **loop device stores backing node with no `vfs_node_get`** (F4-loop,
   medium) — FIXED: SET_FD pins the node + rejects non-regular files; CLR_FD
   releases it; block cache invalidated on swap.
-- [ ] `bug` **icache stores raw `vfs_inode*` with no reference** (IC-1, medium,
-  latent — benign only until someone dereferences a cached inode).
-- [ ] `bug` **orphaned-pgrp false-negative with ≥2 children in one pgrp**
-  (M46-2, medium) — reparent-then-test interleaving misses SIGHUP+SIGCONT.
+- [x] `bug` **icache stores raw `vfs_inode*` with no reference** (IC-1, medium,
+  latent) — FIXED (dangling pointer): vfs_inode_put invalidates the icache entry
+  before freeing the inode; full reference-pinning still deferred.
+- [x] `bug` **orphaned-pgrp false-negative with ≥2 children in one pgrp**
+  (M46-2, medium) — FIXED: is_pgrp_orphaned ignores the exiting task as a
+  parent (its children are about to be reparented to init).
 - [ ] `bug` Lower-severity / pending-verification leads: mqueue & shm have no
   locking (shm also leaks on exit — `shm_detach_all` is never called); futex
   lacks exit-time waiter cleanup and PROCESS_SHARED wakeups; aio ctx UAF on

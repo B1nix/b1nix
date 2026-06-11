@@ -1626,7 +1626,7 @@ void scheduler_reap_dead_threads(void) {
         interrupts_enable();
         for (usize j = 0; j < cap; j++) {
           if (tbl[j])
-            vfs_close_handle(tbl[j], (int)t->id);
+            vfs_close_handle(tbl[j], (int)task_tgid(t));
         }
         kfree(tbl);
         kfree(fl);
@@ -2141,8 +2141,13 @@ static int is_pgrp_orphaned(usize pgid, const struct task *exiting) {
       for (usize j = 0; j < g_task_hwm; j++) {
         struct task *parent = T(j);
         if (parent->state != TASK_UNUSED && parent->id == parent_id) {
-          /* POSIX: init (PID 1) does not count as a parent outside pgid in same session */
-          if (parent->id != 1 && parent->process_group_id != pgid && parent->session_id == t->session_id) {
+          /* The exiting task is about to reparent all its children to init, so
+           * it must NOT count as an outside-pgrp parent here — otherwise a group
+           * whose only outside parent is us reads as "not orphaned" and misses
+           * its SIGHUP+SIGCONT (M46-2). init (PID 1) never counts either. */
+          if (parent != exiting && parent->id != 1 &&
+              parent->process_group_id != pgid &&
+              parent->session_id == t->session_id) {
             return 0; /* not orphaned */
           }
         }
@@ -2238,7 +2243,7 @@ void scheduler_exit_current(int exit_code) {
     if (tbl) {
       for (usize i = 0; i < cap; i++) {
         if (tbl[i])
-          vfs_close_handle(tbl[i], (int)current_task->id);
+          vfs_close_handle(tbl[i], (int)task_tgid(current_task));
       }
       kfree(tbl);
       kfree(fl);
@@ -2247,7 +2252,10 @@ void scheduler_exit_current(int exit_code) {
 
   interrupts_disable();
 
-  /* Reparent children to init (task 1) and check for orphaned process groups */
+  /* Reparent children to init (task 1) and check for orphaned process groups.
+   * is_pgrp_orphaned ignores us (the exiting task) as a parent, so a group with
+   * several of our children is correctly judged orphaned even though some of
+   * those children have not been reparented yet in this loop (M46-2). */
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *child = T(i);
     if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
@@ -2454,7 +2462,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
                 interrupts_enable();
                 for (usize j = 0; j < cap; j++) {
                   if (tbl[j])
-                    vfs_close_handle(tbl[j], (int)T(i)->id);
+                    vfs_close_handle(tbl[j], (int)task_tgid(T(i)));
                 }
                 kfree(tbl);
                 kfree(fl);
@@ -2642,7 +2650,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
                     interrupts_enable();
                     for (usize j = 0; j < cap; j++) {
                       if (tbl[j])
-                        vfs_close_handle(tbl[j], (int)child->id);
+                        vfs_close_handle(tbl[j], (int)task_tgid(child));
                     }
                     kfree(tbl);
                     kfree(fl);

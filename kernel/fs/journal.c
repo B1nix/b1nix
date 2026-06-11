@@ -2,7 +2,18 @@
 #include <b1nix/console.h>
 #include <b1nix/journal.h>
 #include <b1nix/mm.h>
+#include <b1nix/vfs.h>
 #include <string.h>
+
+/* Serializes ALL journal transactions across every journaled mount. A
+ * transaction spans journal_start_transaction -> commit/abort and performs
+ * block I/O throughout, so this is a SLEEPING mutex (vfs_meta_lock_*), never a
+ * spinlock. A single global lock (rather than per-journal_dev) also removes the
+ * race on the shared global handles[] pool and is simple to reason about; b1nix
+ * rarely has more than one journaled filesystem mounted. The ext4 callers never
+ * nest transactions, so this cannot self-deadlock. Lock order:
+ * inode lock -> journal_tx_lock -> fs alloc_lock / block-cache lock. */
+static int journal_tx_lock = 0;
 
 /* JBD format magic values, compatible with ext3/ext4. */
 #define JBD_MAGIC 0xC03B3998
@@ -224,6 +235,9 @@ int journal_recover(struct journal_dev *jdev) {
 }
 
 struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
+  /* Hold the global transaction lock for the whole start->commit/abort span;
+   * commit_transaction and abort_transaction release it. */
+  vfs_meta_lock_acquire(&journal_tx_lock);
   for (int i = 0; i < MAX_JOURNAL_HANDLES; i++) {
     if (!handles[i].active) {
       handles[i].active = 1;
@@ -235,6 +249,9 @@ struct journal_handle *journal_start_transaction(struct journal_dev *jdev) {
       return &handles[i];
     }
   }
+  /* Unreachable while transactions are globally serialized; release rather
+   * than leak the lock if it ever happens. */
+  vfs_meta_lock_release(&journal_tx_lock);
   return 0;
 }
 
@@ -261,6 +278,7 @@ int journal_commit_transaction(struct journal_handle *handle) {
     return -1;
   if (handle->modified_count == 0) {
     handle->active = 0;
+    vfs_meta_lock_release(&journal_tx_lock);
     return 0;
   }
 
@@ -325,6 +343,7 @@ int journal_commit_transaction(struct journal_handle *handle) {
   kfree(sb_buf);
 
   handle->active = 0;
+  vfs_meta_lock_release(&journal_tx_lock);
   return 0;
 }
 
@@ -339,4 +358,5 @@ void journal_abort_transaction(struct journal_handle *handle) {
   }
   handle->modified_count = 0;
   handle->active = 0;
+  vfs_meta_lock_release(&journal_tx_lock);
 }
