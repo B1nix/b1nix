@@ -2600,7 +2600,13 @@ void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
     filelock_release_all_by_pid_inode(owner_pid, h->node->inode);
 
     if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
+      /* Hold the inode lock across the flush: writeback drops the page-cache
+       * lock around write_cb while reading the frame, and a concurrent
+       * ftruncate's page_cache_truncate_inode would otherwise memset that live
+       * frame mid-DMA. read/write/truncate all serialize on this same lock. */
+      vfs_inode_lock(h->node->inode);
       page_cache_flush_inode(h->node->inode);
+      vfs_inode_unlock(h->node->inode);
     }
   }
 
@@ -3559,7 +3565,11 @@ int vfs_fsync(int fd) {
     return -EBADF;
   struct vfs_node *node = h->node;
 
+  /* Inode lock across the flush — see vfs_close_handle (flush vs a concurrent
+   * truncate's in-place page zeroing). */
+  vfs_inode_lock(node->inode);
   page_cache_flush_inode(node->inode);
+  vfs_inode_unlock(node->inode);
 
   if (node->inode->fsync_cb) {
     int err = node->inode->fsync_cb(node);

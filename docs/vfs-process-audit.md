@@ -324,14 +324,14 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
   tail append (list corruption + leak). Fix: take the inode rwlock (write for
   set/remove, read for get/list).
 
-- **F4-loop — MEDIUM — loop device stores the backing node with no reference.**
+- **F4-loop — MEDIUM — loop device stores the backing node with no reference.** **[FIXED]**
   `[verified]` `kernel/dev/loop.c` — `LOOP_SET_FD` does `lo->backing_node =
   h->node` with no `vfs_node_get`; after the setup process exits and the file is
   unlinked the node is freed, and `loop_read_blocks` dereferences it (UAF). Fix:
   `vfs_node_get` on SET_FD, `vfs_node_put` on CLR_FD; invalidate the block cache
   on SET/CLR; reject non-regular backing files (recursion DoS).
 
-- **PC-1 — MEDIUM-HIGH — `page_cache_flush_inode` races `page_cache_truncate_inode`.**
+- **PC-1 — MEDIUM-HIGH — `page_cache_flush_inode` races `page_cache_truncate_inode`.** **[FIXED]**
   `kernel/mm/page_cache.c` + `kernel/fs/vfs.c` — `vfs_fsync`/`vfs_close_handle`
   flush without holding the inode lock; the M46 truncate path's refcount≠0 branch
   does `memset(frame,0,PAGE_SIZE)` on a frame a lockless writeback may be mid-DMA
@@ -349,7 +349,7 @@ fixed yet** — this section is the to-do list (see roadmap M46 "open hardening"
 ## Confirmed — process-semantics commit 9dce201 (this milestone's own code)
 
 - **M46-1 — HIGH — `terminate_group_siblings` can resurrect a DEAD/REAPING
-  sibling.** `kernel/sched/scheduler.c:2100-2110` — it wakes siblings with a
+  sibling.** **[FIXED]** `kernel/sched/scheduler.c:2100-2110` — it wakes siblings with a
   plain check-then-act `sibling->state = TASK_READY` instead of the
   compare-exchange every other wakeup in the file uses. Under CLONE_THREAD with
   siblings on APs, a sibling transitioning to DEAD/REAPING between the read and

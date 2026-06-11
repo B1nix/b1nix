@@ -2102,9 +2102,30 @@ static void terminate_group_siblings(struct task *t) {
     if (sibling->state != TASK_UNUSED && sibling != t && g_task_tgid[i] == tgid) {
       /* Post SIGKILL to sibling */
       __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
-      /* Wake them if they are blocked/sleeping/stopped */
-      if (sibling->state == TASK_BLOCKED || sibling->state == TASK_SLEEPING || sibling->state == TASK_STOPPED) {
-        sibling->state = TASK_READY;
+      /* Wake them if they are blocked/sleeping/stopped. Use a per-state CAS,
+       * NOT a plain store: a sibling running on another AP can transition to
+       * DEAD/REAPING between the read and the write, and a bare
+       * `state = READY` would resurrect it and re-queue a task whose stack/slot
+       * is being freed (UAF). Mirror wake_sleepers — only a state we still
+       * observe as BLOCKED/SLEEPING/STOPPED is promoted. */
+      enum task_state expected = TASK_BLOCKED;
+      int woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                             TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                             __ATOMIC_RELAXED);
+      if (!woke) {
+        expected = TASK_SLEEPING;
+        woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                           TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                           __ATOMIC_RELAXED);
+      }
+      if (!woke) {
+        expected = TASK_STOPPED;
+        woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                           TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                           __ATOMIC_RELAXED);
+      }
+      if (woke) {
+        sibling->wait_chan = 0;
         sched_rq_enqueue_current(sibling);
       }
     }
