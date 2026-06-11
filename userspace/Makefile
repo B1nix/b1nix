@@ -87,6 +87,7 @@ BINARIES := \
 	$(BUILD)/bin/groupadd \
 	$(BUILD)/bin/chown \
 	$(BUILD)/bin/chmod \
+	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))

@@ -384,11 +384,17 @@ Supporting documents:
 
 ## M39: Configurable Init System
 
-- [ ] `planned` Keep B1NIX `/bin/init` as PID 1.
-- [ ] `planned` Parse `/etc/inittab`.
-- [ ] `planned` Add runlevels and `telinit`.
-- [ ] `planned` Spawn independent TTY/serial `getty` sessions.
-- [ ] `planned` Replace hardcoded boot programs with file-based services.
+- [x] Keep B1NIX `/bin/init` as PID 1.
+- [x] Parse `/etc/inittab`.
+- [x] Add runlevels and `telinit` (via the `/run/initctl` control file, since
+  PID 1 is an in-kernel task).
+- [x] `initial` Spawn independent TTY/serial `getty` sessions — the BusyBox
+  `getty` applet and inittab `respawn` plumbing are in place; b1nix's
+  interactive hardware is effectively a single console.
+- [x] Replace hardcoded boot programs with file-based services (inittab-driven
+  supervisor; legacy path kept as fallback).
+- Details: [`m39-init.md`](m39-init.md). Verified by `M39-INIT` smoke markers
+  (i686 528/0, single-CPU and `-smp 4`).
 
 ## M40: Linux ABI Compatibility
 

@@ -34,6 +34,7 @@
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
+#include "initramfs_telinit.inc"
 #include "initramfs_su.inc"
 #include "initramfs_passwd.inc"
 /* id, whoami — migrated to upstream BusyBox (M42 wave 8); /bin/{id,whoami} are
@@ -236,6 +237,24 @@ static const char initramfs_bash_smoke[] =
     "f() { local x=inner; echo \"$x\"; }\n"
     "[ \"$(f)\" = inner ] && echo \"BASH-SMOKE: ok local-vars\"\n"
     "echo \"BASH-SMOKE: done\"\n";
+
+/* M39: configurable init. /etc/inittab drives the production init's service
+ * supervision. Format (BusyBox/SysV-flavoured):
+ *   id:runlevels:action:process
+ *   runlevels  digit string 0-6 the entry applies to (empty = all runlevels)
+ *   action     sysinit | wait | once | respawn | initdefault | ctrlaltdel
+ *              | shutdown
+ * The default runlevel is 3; the console "terminal" is GNU bash. /bin/init
+ * (PID 1) parses this at boot; `telinit <N>` requests a runlevel switch. */
+static const char initramfs_inittab[] =
+    "# /etc/inittab — b1nix configurable init (M39). See telinit(8).\n"
+    "# Format: id:runlevels:action:process\n"
+    "id:3:initdefault:\n"
+    "si::sysinit:/etc/rc\n"
+    "console:2345:respawn:/bin/bash\n"
+    "ttyS0:23:respawn:/bin/getty ttyS0\n"
+    "ca::ctrlaltdel:/bin/reboot\n"
+    "sd::shutdown:/etc/rc.shutdown\n";
 
 /* Resolver configuration. The kernel DNS client parses the first
  * "nameserver" line lazily (kernel/net/dns.c); 10.0.2.3 is the QEMU
@@ -850,6 +869,10 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     /* Applet symlinks — generated from tools/applet-manifest.conf */
     {"/bin/busybox", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
+    /* M39: getty for inittab serial/tty sessions — the upstream BusyBox applet,
+     * reachable under the conventional /bin and /sbin names. */
+    {"/bin/getty", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
+    {"/sbin/getty", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
 #  include "initramfs_applet_symlinks.inc"
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -927,6 +950,12 @@ static const struct initramfs_file files[] = {
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/bash-smoke.sh", initramfs_bash_smoke,
      sizeof(initramfs_bash_smoke) - 1, INITRAMFS_EXECUTABLE},
+    /* M39: configurable init — inittab + telinit. */
+    {"/etc/inittab", initramfs_inittab, sizeof(initramfs_inittab) - 1, 0},
+    {"/sbin/telinit", (const char *)vfs_telinit_elf, sizeof(vfs_telinit_elf),
+     INITRAMFS_EXECUTABLE},
+    {"/bin/telinit", (const char *)vfs_telinit_elf, sizeof(vfs_telinit_elf),
+     INITRAMFS_EXECUTABLE},
     {"/etc/init.d/sshd", initramfs_sshd_service, sizeof(initramfs_sshd_service) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/resolv.conf", initramfs_resolv_conf,

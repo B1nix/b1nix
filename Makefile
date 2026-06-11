@@ -49,7 +49,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m34_smoke \
 	m35_smoke \
 	m42_w5pre_smoke \
-	su passwd groups useradd userdel groupadd halt setfattr
+	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
