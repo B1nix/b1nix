@@ -309,15 +309,19 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
   case B1NIX_TIOCSPTLCK:
     /* unlockpt: b1nix slaves are never locked; accept and ignore the value. */
     return 0;
-  case B1NIX_TIOCGPGRP:
-    if (!arg || syscall_copyout(arg, &p->fg_pgrp, sizeof(usize)) < 0)
+  case B1NIX_TIOCGPGRP: {
+    /* The user buffer is a pid_t (32-bit) — copying sizeof(usize) would
+     * read/write 4 bytes of adjacent user stack on x86_64. */
+    int fg32 = (int)p->fg_pgrp;
+    if (!arg || syscall_copyout(arg, &fg32, sizeof(fg32)) < 0)
       return -EFAULT;
     return 0;
+  }
   case B1NIX_TIOCSPGRP: {
-    usize fg;
-    if (!arg || syscall_copyin(&fg, arg, sizeof(usize)) < 0)
+    int fg32;
+    if (!arg || syscall_copyin(&fg32, arg, sizeof(fg32)) < 0)
       return -EFAULT;
-    p->fg_pgrp = fg;
+    p->fg_pgrp = (usize)fg32;
     return 0;
   }
   case B1NIX_TIOCSCTTY:

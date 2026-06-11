@@ -16,6 +16,7 @@
 #include <b1nix/rwlock.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial_tty.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/vfs.h>
@@ -1679,7 +1680,9 @@ static char tty_getc_blocking(void) {
   char c = 0;
   while (c == 0) {
     c = ps2_kbd_getc();
-    if (c == 0)
+    /* COM1 input belongs to /dev/ttyS0 while that device is open (M39 serial
+     * getty); the merged boot console only reads it when unclaimed. */
+    if (c == 0 && !serial_tty_claimed(0))
       c = serial_getc();
     if (c == 0)
       scheduler_yield();
@@ -1723,7 +1726,7 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
       char c = 0;
       if (flags & B1NIX_O_NONBLOCK) {
         c = ps2_kbd_getc();
-        if (c == 0)
+        if (c == 0 && !serial_tty_claimed(0))
           c = serial_getc();
         if (c == 0) {
           if (tty_line_len > 0)
@@ -1857,7 +1860,8 @@ static int tty_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
   (void)node;
   short revents = B1NIX_POLLOUT; /* the console is always writable */
 #ifndef __aarch64__
-  if (ps2_kbd_has_data() || serial_has_data())
+  if (ps2_kbd_has_data() ||
+      (!serial_tty_claimed(0) && serial_has_data()))
     revents |= B1NIX_POLLIN;
 #endif
   pfd->revents = revents;
@@ -1933,6 +1937,7 @@ void vfs_init(void) {
   pty_init();
   add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
   add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  serial_tty_register_nodes();
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
   tty_init_node();
@@ -2003,6 +2008,7 @@ void vfs_repopulate_after_root_mount(void) {
   }
 
   tty_init_node();
+  serial_tty_register_nodes();
 
   node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) vfs_node_put(node);
@@ -2118,6 +2124,31 @@ int vfs_open_flags(const char *path, int flags) {
     int fd = pty_open_master(flags);
     kfree(resolved);
     return fd;
+  }
+  /* M39 serial ttys: /dev/ttySn opens bind to the per-port tty (dynamic
+   * handles like ptys, with their own line discipline + session state). */
+  {
+    int sidx = serial_tty_path_index(resolved);
+    if (sidx >= 0) {
+      struct vfs_node *snode = vfs_find_node(resolved);
+      if (!IS_ERR(snode)) {
+        int access_mask = 0;
+        if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+          access_mask |= W_OK;
+        if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+          access_mask |= R_OK;
+        const struct cred *cred = get_current_cred();
+        if (cred && !vfs_get_node_perm(snode, cred, (u32)access_mask)) {
+          vfs_node_put(snode);
+          kfree(resolved);
+          return -EACCES;
+        }
+        vfs_node_put(snode);
+      }
+      int fd = serial_tty_open(sidx, flags);
+      kfree(resolved);
+      return fd;
+    }
   }
   if (strncmp(resolved, "/dev/pts/", 9) == 0) {
     const char *num = resolved + 9;
@@ -4017,20 +4048,26 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return 0;
   }
   if (request == B1NIX_TIOCGPGRP) {
-    if (!arg || syscall_copyout(arg, &console.fg_pgrp, sizeof(usize)) < 0)
+    /* The user buffer is a pid_t (32-bit) — copying sizeof(usize) would
+     * read/write 4 bytes of adjacent user stack on x86_64. */
+    int fg32 = (int)console.fg_pgrp;
+    if (!arg || syscall_copyout(arg, &fg32, sizeof(fg32)) < 0)
       return -EFAULT;
     return 0;
   }
   if (request == B1NIX_TIOCSPGRP) {
-    usize fg;
-    if (!arg || syscall_copyin(&fg, arg, sizeof(usize)) < 0)
+    int fg32;
+    if (!arg || syscall_copyin(&fg32, arg, sizeof(fg32)) < 0)
       return -EFAULT;
-      
-    /* Временно отключаем строгую POSIX-проверку совпадения сессий 
-     * (current_task->session_id == console.session_id), так как 
-     * в B1NIX еще не реализован захват терминала новой сессией через TIOCSCTTY.
-     */
-    console.fg_pgrp = fg;
+    /* The strict POSIX same-session check (current_task->session_id ==
+     * console.session_id) stays disabled: the boot console predates every
+     * session and is never claimed via TIOCSCTTY. */
+    console.fg_pgrp = (usize)fg32;
+    return 0;
+  }
+  if (request == B1NIX_TIOCNOTTY) {
+    /* Detach-from-controlling-tty: accepted as a no-op on the boot console
+     * (getty's setsid-fallback path calls this and only needs success). */
     return 0;
   }
   return -1;

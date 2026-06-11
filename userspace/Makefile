@@ -46,6 +46,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \
+	$(BUILD)/libc/wchar.o \
 	$(BUILD)/libc/libgen.o \
 	$(BUILD)/libc/getopt.o \
 	$(BUILD)/libc/fnmatch.o \
@@ -87,6 +88,7 @@ BINARIES := \
 	$(BUILD)/bin/groupadd \
 	$(BUILD)/bin/chown \
 	$(BUILD)/bin/chmod \
+	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))

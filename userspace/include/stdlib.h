@@ -9,7 +9,13 @@ extern "C" {
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
-#define MB_CUR_MAX 1
+/* Bytes in the longest multibyte character of the current locale. The b1nix
+ * libc is UTF-8, so the multibyte conversion functions (mbtowc/mbrtowc/...) and
+ * MB_CUR_MAX advertise up to 4 bytes per character; ports key their multibyte
+ * code paths off MB_CUR_MAX > 1. */
+#ifndef MB_CUR_MAX
+#define MB_CUR_MAX 4
+#endif
 #define RAND_MAX 2147483647
 
 #ifndef alloca
@@ -60,19 +66,11 @@ typedef int wchar_t;
 
 int wctomb(char *s, wchar_t wc);
 int mbtowc(wchar_t *pwc, const char *s, size_t n);
+int mblen(const char *s, size_t n);
 
-static inline size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
-    size_t i;
-    for (i = 0; i < n && src[i]; i++) {
-        if (dest) {
-            dest[i] = (wchar_t)(unsigned char)src[i];
-        }
-    }
-    if (i < n && dest) {
-        dest[i] = 0;
-    }
-    return i;
-}
+/* UTF-8 string conversions (implemented in wchar.c). */
+size_t mbstowcs(wchar_t *dest, const char *src, size_t n);
+size_t wcstombs(char *dest, const wchar_t *src, size_t n);
 
 static inline long labs(long x) {
     return x < 0 ? -x : x;

@@ -203,6 +203,34 @@ int tree_main(int argc, char **argv) {
 TREEPATCH
 fi
 
+# The system password scheme is the libc crypt()'s "$b1$" (b1nix /etc/shadow,
+# dropbear, native su/passwd). BusyBox's builtin crypt (CONFIG_USE_BB_CRYPT,
+# kept for $1$/$5$/$6$ in cryptpw/chpasswd) dies with "bad salt" on it, which
+# broke login on the M39 serial getty. Patch pw_encrypt() to defer "$b1$"
+# settings to the libc crypt(). Idempotent via the __b1nix__ marker.
+if [ -f "$SRC_DIR/libbb/pw_encrypt.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/libbb/pw_encrypt.c"; then
+    python3 - "$SRC_DIR/libbb/pw_encrypt.c" << 'PWCRYPT'
+import sys
+path = sys.argv[1]
+src = open(path).read()
+anchor = "\tencrypted = my_crypt(clear, salt);"
+patch = """\t/* __b1nix__: the system password scheme is the libc crypt()'s "$b1$"
+\t * (b1nix /etc/shadow, dropbear, native su/passwd). The builtin crypt
+\t * would die with "bad salt" on it, so defer those settings to libc. */
+\tif (salt && strncmp(salt, "$b1$", 4) == 0) {
+\t\textern char *crypt(const char *key, const char *setting);
+\t\tencrypted = crypt(clear, salt);
+\t\tif (!encrypted || !encrypted[0])
+\t\t\tbb_simple_error_msg_and_die("bad salt");
+\t\treturn xstrdup(encrypted);
+\t}
+"""
+assert anchor in src, "pw_encrypt.c anchor not found"
+src = src.replace(anchor, patch + anchor, 1)
+open(path, "w").write(src)
+PWCRYPT
+fi
+
 # ── 2. Configure ────────────────────────────────────────────────────────────
 mkdir -p "$BUILD_DIR"
 

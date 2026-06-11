@@ -301,5 +301,74 @@ int getgrouplist(const char *user, gid_t group, gid_t *groups, int *ngroups) {
   return count;
 }
 
+/* Sequential /etc/group enumeration (setgrent/getgrent/endgrent). bash uses
+ * this for group-name tab completion. A single persistent fd is rewound by
+ * setgrent and advanced one entry per getgrent; the returned struct points at
+ * static storage that is overwritten on the next call (POSIX). */
+static int grent_fd = -1;
+static char grent_buf[1024];
+static int grent_buf_len = 0;
+static int grent_buf_pos = 0;
+static struct group grent_ent;
+static char grent_line[256];
+
+void setgrent(void) {
+  if (grent_fd >= 0)
+    close(grent_fd);
+  grent_fd = open("/etc/group", O_RDONLY);
+  grent_buf_len = 0;
+  grent_buf_pos = 0;
+}
+
+struct group *getgrent(void) {
+  if (grent_fd < 0) {
+    setgrent();
+    if (grent_fd < 0)
+      return 0;
+  }
+
+  char acc[256];
+  int acc_len = 0;
+
+  for (;;) {
+    if (grent_buf_pos >= grent_buf_len) {
+      ssize_t r = read(grent_fd, grent_buf, sizeof(grent_buf));
+      if (r <= 0) {
+        /* Flush a trailing line with no terminating newline. */
+        if (acc_len > 0) {
+          acc[acc_len] = '\0';
+          if (acc[0] != '#') {
+            memcpy(grent_line, acc, (size_t)acc_len + 1);
+            if (parse_grline(grent_line, &grent_ent))
+              return &grent_ent;
+          }
+        }
+        return 0;
+      }
+      grent_buf_len = (int)r;
+      grent_buf_pos = 0;
+    }
+    char c = grent_buf[grent_buf_pos++];
+    if (c == '\n' || acc_len == (int)sizeof(acc) - 1) {
+      acc[acc_len] = '\0';
+      int had = acc_len;
+      acc_len = 0;
+      if (had > 0 && acc[0] != '#') {
+        memcpy(grent_line, acc, (size_t)had + 1);
+        if (parse_grline(grent_line, &grent_ent))
+          return &grent_ent;
+      }
+    } else {
+      acc[acc_len++] = c;
+    }
+  }
+}
+
 void endgrent(void) {
+  if (grent_fd >= 0) {
+    close(grent_fd);
+    grent_fd = -1;
+  }
+  grent_buf_len = 0;
+  grent_buf_pos = 0;
 }

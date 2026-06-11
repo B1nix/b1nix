@@ -384,11 +384,20 @@ Supporting documents:
 
 ## M39: Configurable Init System
 
-- [ ] `planned` Keep B1NIX `/bin/init` as PID 1.
-- [ ] `planned` Parse `/etc/inittab`.
-- [ ] `planned` Add runlevels and `telinit`.
-- [ ] `planned` Spawn independent TTY/serial `getty` sessions.
-- [ ] `planned` Replace hardcoded boot programs with file-based services.
+- [x] Keep B1NIX `/bin/init` as PID 1.
+- [x] Parse `/etc/inittab`.
+- [x] Add runlevels and `telinit` (via the `/run/initctl` control file, since
+  PID 1 is an in-kernel task).
+- [x] Spawn independent TTY/serial `getty` sessions — `/dev/ttyS0`/`/dev/ttyS1`
+  are real per-device ttys (own line discipline, termios, session/job-control
+  state); the full `getty → login → bash` chain runs on the serial line while
+  the console bash session stays independent.
+- [x] Replace hardcoded boot programs with file-based services (inittab-driven
+  supervisor with a SysV rate-based respawn storm guard; legacy path kept as
+  fallback).
+- Details: [`m39-init.md`](m39-init.md). Verified by `M39-INIT` smoke markers
+  (single-CPU and `-smp 4`, both arches) and the end-to-end
+  `tests/serial-getty.sh` login-over-serial test.
 
 ## M40: Linux ABI Compatibility
 
@@ -441,3 +450,20 @@ Source-level ports remain preferable to a Linux compatibility layer.
 - [x] Retire the in-kernel shell and utility table.
 - [ ] `stub` BusyBox `ssl_server` is disabled pending a dedicated TLS port and
   handshake test.
+
+## M45: GNU bash
+
+- [x] Cross-build upstream GNU bash 5.2.37 against the b1nix userspace ABI and
+  embed it as `/bin/bash`.
+- [x] Make bash the login shell everywhere — the console terminal `/bin/init`
+  launches and the `/etc/passwd` shell used by SSH/login; `/bin/sh` stays
+  BusyBox `ash` for `#!/bin/sh` scripts. Required shipping `/etc/shells` and
+  fixing a libc `fgets(size<=1)` bug that hung dropbear's `/etc/shells` parser.
+- [x] Add the libc surface bash needs (`sigsetjmp`/`siglongjmp`,
+  `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
+- [x] Add a UTF-8 wide-character libc module (`wchar.c`: `mbrtowc`/`wcwidth`/
+  `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
+  character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
+  `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
+- Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` +
+  `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.

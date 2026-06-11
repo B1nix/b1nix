@@ -12,6 +12,7 @@
 #include <b1nix/user.h>
 #include <b1nix/video.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial_tty.h>
 #include <b1nix/lapic.h>
 #include <b1nix/dirent.h>
 #include <b1nix/console.h>
@@ -710,6 +711,457 @@ static int ext_stress_main(int argc, const char **argv) {
   return 0;
 }
 
+/* ─────────────────────────── M39: configurable init ───────────────────────
+ * PID 1 (/bin/init) parses /etc/inittab and supervises file-based services
+ * across runlevels. `telinit <N>` requests a runlevel switch via /run/initctl,
+ * which the supervisor polls. The parser is pure (no I/O) so the M39 self-test
+ * can drive it with a literal inittab. */
+
+enum init_action {
+  IA_IGNORE = 0,
+  IA_SYSINIT,
+  IA_WAIT,
+  IA_ONCE,
+  IA_RESPAWN,
+  IA_INITDEFAULT,
+  IA_CTRLALTDEL,
+  IA_SHUTDOWN,
+};
+
+#define INITTAB_MAX 16
+#define INITTAB_CMD_MAX 96
+/* SysV-style respawn storm guard: a respawn child that exits within
+ * INIT_RESPAWN_FAST_SECS of its spawn this many times IN A ROW gets the
+ * entry disabled (a long-lived child resets the streak). Unlike a lifetime
+ * cap this never silences a getty that respawns on every normal logout. */
+#define INIT_RESPAWN_FAST_SECS 2
+#define INIT_RESPAWN_FAST_MAX 5
+
+struct inittab_entry {
+  char id[12];
+  char runlevels[8];
+  enum init_action action;
+  char command[INITTAB_CMD_MAX];
+  u64 pid;        /* live pid of a respawn child, 0 if not running */
+  u64 spawn_time; /* SYS_TIME seconds at last spawn (storm guard) */
+  int fast_exits; /* consecutive fast exits (storm guard) */
+  int disabled;   /* respawning too fast: entry parked until telinit */
+};
+
+static struct inittab_entry g_inittab[INITTAB_MAX];
+static int g_inittab_count;
+static int g_runlevel = 3;    /* current runlevel */
+static int g_initdefault = 3; /* runlevel from the initdefault entry */
+
+static enum init_action init_parse_action(const char *s) {
+  if (strcmp(s, "sysinit") == 0) return IA_SYSINIT;
+  if (strcmp(s, "wait") == 0) return IA_WAIT;
+  if (strcmp(s, "once") == 0) return IA_ONCE;
+  if (strcmp(s, "respawn") == 0) return IA_RESPAWN;
+  if (strcmp(s, "initdefault") == 0) return IA_INITDEFAULT;
+  if (strcmp(s, "ctrlaltdel") == 0) return IA_CTRLALTDEL;
+  if (strcmp(s, "shutdown") == 0) return IA_SHUTDOWN;
+  return IA_IGNORE;
+}
+
+/* Parse an inittab image (id:runlevels:action:process per line) into
+ * g_inittab[]. Returns the entry count and records g_initdefault. */
+static int init_parse_inittab(const char *buf, int len) {
+  g_inittab_count = 0;
+  g_initdefault = 3;
+  int i = 0;
+  while (i < len && g_inittab_count < INITTAB_MAX) {
+    char line[256];
+    int n = 0;
+    while (i < len && buf[i] != '\n') {
+      if (n < (int)sizeof(line) - 1) line[n++] = buf[i];
+      i++;
+    }
+    if (i < len) i++; /* consume the newline */
+    line[n] = '\0';
+
+    char *p = line;
+    while (*p == ' ' || *p == '\t') p++;
+    if (*p == '\0' || *p == '#') continue;
+
+    char *f[4];
+    int nf = 0;
+    f[nf++] = p;
+    while (*p && nf < 4) {
+      if (*p == ':') { *p = '\0'; f[nf++] = p + 1; }
+      p++;
+    }
+    if (nf < 4) continue; /* need all four fields */
+
+    enum init_action act = init_parse_action(f[2]);
+    if (act == IA_IGNORE) continue;
+
+    struct inittab_entry *e = &g_inittab[g_inittab_count];
+    strncpy(e->id, f[0], sizeof(e->id) - 1);
+    e->id[sizeof(e->id) - 1] = '\0';
+    strncpy(e->runlevels, f[1], sizeof(e->runlevels) - 1);
+    e->runlevels[sizeof(e->runlevels) - 1] = '\0';
+    e->action = act;
+    strncpy(e->command, f[3], sizeof(e->command) - 1);
+    e->command[sizeof(e->command) - 1] = '\0';
+    e->pid = 0;
+    e->spawn_time = 0;
+    e->fast_exits = 0;
+    e->disabled = 0;
+
+    if (act == IA_INITDEFAULT && f[1][0] >= '0' && f[1][0] <= '6')
+      g_initdefault = f[1][0] - '0';
+    g_inittab_count++;
+  }
+  return g_inittab_count;
+}
+
+static int init_entry_in_runlevel(const struct inittab_entry *e, int rl) {
+  if (e->runlevels[0] == '\0') return 1; /* empty = all runlevels */
+  char d = (char)('0' + rl);
+  for (const char *p = e->runlevels; *p; p++)
+    if (*p == d) return 1;
+  return 0;
+}
+
+/* Tokenise a command string on spaces and spawn it. Honours a leading '-'
+ * (login-shell convention) by stripping it. Returns the child pid or -1. */
+static u64 init_spawn_cmd(const char *cmd) {
+  static char cbuf[INITTAB_CMD_MAX];
+  int n = 0;
+  while (cmd[n] && n < INITTAB_CMD_MAX - 1) { cbuf[n] = cmd[n]; n++; }
+  cbuf[n] = '\0';
+  const char *argv[16];
+  int argc = 0;
+  int i = 0;
+  if (cbuf[0] == '-') i++;
+  while (cbuf[i] && argc < 15) {
+    while (cbuf[i] == ' ' || cbuf[i] == '\t') i++;
+    if (!cbuf[i]) break;
+    argv[argc++] = &cbuf[i];
+    while (cbuf[i] && cbuf[i] != ' ' && cbuf[i] != '\t') i++;
+    if (cbuf[i]) cbuf[i++] = '\0';
+  }
+  argv[argc] = 0;
+  if (argc == 0) return (u64)-1;
+  u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)argv[0], argc,
+                             (u64)(usize)argv, 0, 0, 0);
+  if ((isize)pid >= 0)
+    return pid;
+  /* The kernel exec path has no shebang support, so a script entry (e.g. the
+   * sysinit "/etc/rc") fails the direct spawn. Retry through /bin/sh — the
+   * same way the legacy init path always ran rc. */
+  if (argc < 15) {
+    for (int k = argc; k > 0; k--)
+      argv[k] = argv[k - 1];
+    argv[0] = "/bin/sh";
+    argv[argc + 1] = 0;
+    pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)argv[0], argc + 1,
+                           (u64)(usize)argv, 0, 0, 0);
+  }
+  return pid;
+}
+
+/* Read and consume a pending telinit request from /run/initctl. Returns the
+ * requested runlevel 0-6, or -1 if none/invalid. */
+static int init_poll_initctl(void) {
+  u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/run/initctl", 0, 0, 0, 0, 0);
+  if ((isize)fd < 0) return -1;
+  char c[4] = {0, 0, 0, 0};
+  isize r = (isize)syscall_dispatch(SYS_READ, fd, (u64)(usize)c, 3, 0, 0, 0);
+  syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+  syscall_dispatch(SYS_UNLINK, (u64)(usize) "/run/initctl", 0, 0, 0, 0, 0);
+  if (r <= 0) return -1;
+  if (c[0] >= '0' && c[0] <= '6') return c[0] - '0';
+  return -1;
+}
+
+/* Start the wait/once/respawn entries valid in runlevel rl. wait blocks. */
+static void init_enter_runlevel(int rl) {
+  for (int i = 0; i < g_inittab_count; i++) {
+    struct inittab_entry *e = &g_inittab[i];
+    if (!init_entry_in_runlevel(e, rl)) continue;
+    if (e->action == IA_WAIT) {
+      u64 pid = init_spawn_cmd(e->command);
+      if ((isize)pid >= 0) {
+        int st = 0;
+        syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&st, 0, 0, 0, 0);
+      }
+    } else if (e->action == IA_ONCE) {
+      init_spawn_cmd(e->command);
+    } else if (e->action == IA_RESPAWN) {
+      if (e->pid == 0 && !e->disabled) {
+        e->pid = init_spawn_cmd(e->command);
+        e->spawn_time = syscall_dispatch(SYS_TIME, 0, 0, 0, 0, 0, 0);
+      }
+    }
+  }
+}
+
+/* Switch to runlevel rl: stop respawn entries no longer valid, then start the
+ * ones that are. */
+static void init_switch_runlevel(int rl) {
+  for (int i = 0; i < g_inittab_count; i++) {
+    struct inittab_entry *e = &g_inittab[i];
+    if (e->pid && e->action == IA_RESPAWN && !init_entry_in_runlevel(e, rl)) {
+      syscall_dispatch(SYS_KILL, e->pid, SIGTERM, 0, 0, 0, 0);
+      e->pid = 0;
+    }
+    /* A runlevel switch un-parks storm-disabled entries (sysvinit-style). */
+    e->disabled = 0;
+    e->fast_exits = 0;
+  }
+  g_runlevel = rl;
+  init_enter_runlevel(rl);
+}
+
+/* Inittab-driven service supervisor (production PID 1 main loop). Runs sysinit
+ * entries, enters the default runlevel, then reaps + respawns children and
+ * honours telinit runlevel requests. Never returns. */
+static void init_supervise(void) {
+  for (int i = 0; i < g_inittab_count; i++) {
+    if (g_inittab[i].action == IA_SYSINIT) {
+      u64 pid = init_spawn_cmd(g_inittab[i].command);
+      if ((isize)pid >= 0) {
+        int st = 0;
+        syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&st, 0, 0, 0, 0);
+      }
+    }
+  }
+
+  g_runlevel = g_initdefault;
+  init_enter_runlevel(g_runlevel);
+
+  for (;;) {
+    int status = 0;
+    isize reaped = (isize)syscall_dispatch(SYS_WAITPID, 0, (u64)(usize)&status,
+                                           B1NIX_WNOHANG, 0, 0, 0);
+    if (reaped > 0) {
+      for (int i = 0; i < g_inittab_count; i++) {
+        struct inittab_entry *e = &g_inittab[i];
+        if (e->pid != (u64)reaped) continue;
+        e->pid = 0;
+        if (e->action == IA_RESPAWN && init_entry_in_runlevel(e, g_runlevel) &&
+            !e->disabled) {
+          u64 now = syscall_dispatch(SYS_TIME, 0, 0, 0, 0, 0, 0);
+          if (now - e->spawn_time < INIT_RESPAWN_FAST_SECS)
+            e->fast_exits++;
+          else
+            e->fast_exits = 0;
+          if (e->fast_exits >= INIT_RESPAWN_FAST_MAX) {
+            e->disabled = 1;
+            uwrite("init: ");
+            uwrite(e->id);
+            uwrite(": respawning too fast -- disabled until next runlevel "
+                   "switch\n");
+          } else {
+            e->pid = init_spawn_cmd(e->command);
+            e->spawn_time = now;
+          }
+        }
+      }
+      continue; /* drain all dead children before sleeping */
+    }
+
+    int req = init_poll_initctl();
+    if (req >= 0 && req != g_runlevel) {
+      if (req == 0) {
+        uwrite("init: telinit 0 — halting\n");
+        syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_HALT, 0, 0, 0, 0, 0);
+      } else if (req == 6) {
+        uwrite("init: telinit 6 — rebooting\n");
+        syscall_dispatch(SYS_REBOOT, B1NIX_REBOOT_RESTART, 0, 0, 0, 0, 0);
+      } else {
+        uwrite("init: telinit — switching runlevel\n");
+        init_switch_runlevel(req);
+      }
+    }
+
+    syscall_dispatch(SYS_SLEEP, 5, 0, 0, 0, 0, 0); /* poll interval */
+  }
+}
+
+/* M39 self-test (test mode). Exercises the inittab parser, runlevel matching,
+ * the telinit → /run/initctl round-trip, and getty applet presence. */
+static void m39_init_test(void) {
+  uwrite("M39-INIT: start\n");
+
+  static const char test_tab[] =
+      "# comment line\n"
+      "id:4:initdefault:\n"
+      "si::sysinit:/etc/rc\n"
+      "co:2345:respawn:/bin/bash\n"
+      "tt:23:respawn:/bin/getty ttyS0\n"
+      "lo:5:wait:/bin/true\n";
+  int count = init_parse_inittab(test_tab, (int)sizeof(test_tab) - 1);
+  if (count == 5)
+    uwrite("M39-INIT: ok parse-inittab\n");
+  else
+    uwrite("M39-INIT: fail parse-inittab\n");
+
+  if (g_initdefault == 4)
+    uwrite("M39-INIT: ok initdefault\n");
+  else
+    uwrite("M39-INIT: fail initdefault\n");
+
+  /* g_inittab[3] is the "tt:23:..." getty entry: valid in 2/3, not 4/5. */
+  if (init_entry_in_runlevel(&g_inittab[3], 2) &&
+      init_entry_in_runlevel(&g_inittab[3], 3) &&
+      !init_entry_in_runlevel(&g_inittab[3], 4) &&
+      init_entry_in_runlevel(&g_inittab[1], 4) /* empty runlevels = all */)
+    uwrite("M39-INIT: ok runlevel-match\n");
+  else
+    uwrite("M39-INIT: fail runlevel-match\n");
+
+  /* telinit round-trip: /sbin/telinit 5 must leave runlevel 5 in /run/initctl,
+   * which init_poll_initctl() then reads back and consumes. */
+  {
+    const char *tl_argv[] = {"/sbin/telinit", "5", 0};
+    u64 tl_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)tl_argv[0], 2,
+                                  (u64)(usize)tl_argv, 0, 0, 0);
+    int ok = 0;
+    if ((isize)tl_pid >= 0) {
+      int st = 0;
+      syscall_dispatch(SYS_WAIT, tl_pid, (u64)(usize)&st, 0, 0, 0, 0);
+      if (st == 0 && init_poll_initctl() == 5)
+        ok = 1;
+    }
+    uwrite(ok ? "M39-INIT: ok telinit\n" : "M39-INIT: fail telinit\n");
+  }
+
+  /* getty applet present (BusyBox), reachable via the /bin/getty symlink. */
+  {
+    u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize) "/bin/getty", 0, 0, 0, 0, 0);
+    if ((isize)fd >= 0) {
+      syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+      uwrite("M39-INIT: ok getty-applet\n");
+    } else {
+      uwrite("M39-INIT: fail getty-applet\n");
+    }
+  }
+
+  /* M39 serial tty layer: /dev/ttyS0 is an independent tty (own line
+   * discipline, termios, and job-control state) backed by COM1, so a getty
+   * session on the serial line is fully separate from the boot console. */
+  isize sfd = (isize)syscall_dispatch(SYS_OPEN, (u64)(usize) "/dev/ttyS0",
+                                      B1NIX_O_RDWR, 0, 0, 0, 0);
+  uwrite(sfd >= 0 ? "M39-INIT: ok ttys0-open\n" : "M39-INIT: fail ttys0-open\n");
+
+  if (sfd >= 0) {
+    struct b1nix_termios tio, saved, con;
+    char rbuf[32];
+    int own_pgrp = 0; /* TIOC[GS]PGRP carry a 32-bit pid_t */
+    isize r;
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCGPGRP,
+                     (u64)(usize)&own_pgrp, 0, 0, 0);
+
+    /* Termios independence: raw mode on ttyS0 must not touch the console. */
+    int ok = 0;
+    if (syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCGETS, (u64)(usize)&tio,
+                         0, 0, 0) == 0 &&
+        (tio.c_lflag & B1NIX_ICANON)) {
+      saved = tio;
+      tio.c_lflag = 0;
+      syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCSETS, (u64)(usize)&tio, 0,
+                       0, 0);
+      if (syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS, (u64)(usize)&con, 0, 0,
+                           0) == 0 &&
+          (con.c_lflag & B1NIX_ICANON))
+        ok = 1;
+      syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCSETS, (u64)(usize)&saved,
+                       0, 0, 0);
+    }
+    uwrite(ok ? "M39-INIT: ok tty-termios-independent\n"
+              : "M39-INIT: fail tty-termios-independent\n");
+
+    /* Canonical read through the per-device line discipline. */
+    serial_tty_test_inject(0, "m39ldisc\n", 9);
+    r = (isize)syscall_dispatch(SYS_READ, (u64)sfd, (u64)(usize)rbuf,
+                                sizeof(rbuf), 0, 0, 0);
+    uwrite((r == 9 && memcmp(rbuf, "m39ldisc\n", 9) == 0)
+               ? "M39-INIT: ok tty-canon-read\n"
+               : "M39-INIT: fail tty-canon-read\n");
+
+    /* VEOF on an empty line reads back as EOF (0 bytes). */
+    serial_tty_test_inject(0, "\x04", 1);
+    r = (isize)syscall_dispatch(SYS_READ, (u64)sfd, (u64)(usize)rbuf,
+                                sizeof(rbuf), 0, 0, 0);
+    uwrite(r == 0 ? "M39-INIT: ok tty-eof\n" : "M39-INIT: fail tty-eof\n");
+
+    /* Raw (non-canonical) mode: bytes pass through without line assembly. */
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCGETS, (u64)(usize)&saved, 0,
+                     0, 0);
+    tio = saved;
+    tio.c_lflag = 0;
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCSETS, (u64)(usize)&tio, 0, 0,
+                     0);
+    serial_tty_test_inject(0, "xy", 2);
+    r = (isize)syscall_dispatch(SYS_READ, (u64)sfd, (u64)(usize)rbuf,
+                                sizeof(rbuf), 0, 0, 0);
+    uwrite((r == 2 && rbuf[0] == 'x' && rbuf[1] == 'y')
+               ? "M39-INIT: ok tty-raw-read\n"
+               : "M39-INIT: fail tty-raw-read\n");
+
+    /* ISIG: VINTR (^C) is routed as a signal to the tty's foreground pgrp
+     * and never queued as data. Point the fg pgrp at a nonexistent group so
+     * the SIGINT goes nowhere, then verify only 'q' arrives. */
+    tio.c_lflag = B1NIX_ISIG;
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCSETS, (u64)(usize)&tio, 0, 0,
+                     0);
+    int bogus_pgrp = 59999;
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCSPGRP,
+                     (u64)(usize)&bogus_pgrp, 0, 0, 0);
+    serial_tty_test_inject(0, "\x03", 1);
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCSPGRP,
+                     (u64)(usize)&own_pgrp, 0, 0, 0);
+    serial_tty_test_inject(0, "q", 1);
+    r = (isize)syscall_dispatch(SYS_READ, (u64)sfd, (u64)(usize)rbuf,
+                                sizeof(rbuf), 0, 0, 0);
+    uwrite((r == 1 && rbuf[0] == 'q') ? "M39-INIT: ok tty-isig\n"
+                                      : "M39-INIT: fail tty-isig\n");
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TCSETS, (u64)(usize)&saved, 0,
+                     0, 0);
+
+    /* Foreground-pgrp independence: changing ttyS0's fg pgrp must not move
+     * the boot console's. */
+    int con_before = 0, con_after = 0, marker_pgrp = 4242;
+    syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCGPGRP, (u64)(usize)&con_before, 0,
+                     0, 0);
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCSPGRP,
+                     (u64)(usize)&marker_pgrp, 0, 0, 0);
+    syscall_dispatch(SYS_IOCTL, 0, B1NIX_TIOCGPGRP, (u64)(usize)&con_after, 0,
+                     0, 0);
+    uwrite((con_before == con_after && serial_tty_fg_pgrp(0) == 4242)
+               ? "M39-INIT: ok tty-pgrp-independent\n"
+               : "M39-INIT: fail tty-pgrp-independent\n");
+    syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCSPGRP,
+                     (u64)(usize)&own_pgrp, 0, 0, 0);
+
+    /* TIOCSCTTY: a session leader can claim the tty (getty relies on it). */
+    uwrite(syscall_dispatch(SYS_IOCTL, (u64)sfd, B1NIX_TIOCSCTTY, 0, 0, 0,
+                            0) == 0
+               ? "M39-INIT: ok tty-sctty\n"
+               : "M39-INIT: fail tty-sctty\n");
+
+    /* Real TX: this marker reaches the smoke log through the ttyS0 write
+     * path (OPOST + UART), not through the console. */
+    static const char tx_marker[] = "M39-TTYS0-TX-OK\n";
+    r = (isize)syscall_dispatch(SYS_WRITE, (u64)sfd, (u64)(usize)tx_marker,
+                                sizeof(tx_marker) - 1, 0, 0, 0);
+    uwrite(r == (isize)(sizeof(tx_marker) - 1)
+               ? "M39-INIT: ok ttys0-write\n"
+               : "M39-INIT: fail ttys0-write\n");
+
+    /* Closing the last handle releases the claim: COM1 input falls back to
+     * the merged boot console. */
+    syscall_dispatch(SYS_CLOSE, (u64)sfd, 0, 0, 0, 0, 0);
+    uwrite(!serial_tty_claimed(0) ? "M39-INIT: ok ttys0-release\n"
+                                  : "M39-INIT: fail ttys0-release\n");
+  }
+
+  uwrite("M39-INIT: done\n");
+}
+
 static int init_main(int argc, const char **argv) {
   (void)argc;
   (void)argv;
@@ -935,6 +1387,24 @@ static int init_main(int argc, const char **argv) {
       syscall_dispatch(SYS_WAIT, m42_pid, (u64)(usize)&m42_status, 0, 0, 0, 0);
     }
   }
+
+  /* bash: the upstream GNU bash 5.2 port is the default shell. Run its feature
+   * smoke through /bin/bash to prove the real bash (arrays, [[ ]], regex, brace
+   * ranges, C-style for, pattern substitution) is what /bin/sh now resolves to. */
+  {
+    const char *bash_argv[] = {"/bin/bash", "/etc/bash-smoke.sh", 0};
+    u64 bash_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bash_argv[0], 2,
+                                    (u64)(usize)bash_argv, 0, 0, 0);
+    if ((isize)bash_pid < 0) {
+      uwrite("BASH-SMOKE: spawn-fail\n");
+    } else {
+      int bash_status = 0;
+      syscall_dispatch(SYS_WAIT, bash_pid, (u64)(usize)&bash_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M39: configurable init — inittab parser, runlevels, telinit, getty. */
+  m39_init_test();
 
   /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
    * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
@@ -1186,6 +1656,41 @@ static int init_main(int argc, const char **argv) {
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
+  /* M39: configurable init. When /etc/inittab is present and no override boot
+   * mode is requested (init=, single, login, ui), run the inittab-driven
+   * supervisor: it runs /etc/rc via its sysinit entry, brings up the default
+   * runlevel's services (the bash console), and honours telinit. It never
+   * returns. Absent/empty inittab or any override falls through to the legacy
+   * rc + respawn-shell path below. */
+  {
+    int m39_override = bootinfo_has_flag("b1nix.single") ||
+                       bootinfo_has_flag("single") ||
+                       bootinfo_has_flag("b1nix.login") ||
+                       bootinfo_has_flag("login") ||
+                       bootinfo_has_flag("b1nix.ui=1") ||
+                       bootinfo_has_flag("ui=1");
+    char ov[64];
+    if (bootinfo_get_kv("init", ov, sizeof(ov)) && ov[0])
+      m39_override = 1;
+    if (!m39_override) {
+      isize fd = (isize)syscall_dispatch(SYS_OPEN, (u64)(usize) "/etc/inittab",
+                                         0, 0, 0, 0, 0);
+      if (fd >= 0) {
+        static char tab[2048];
+        isize total = 0, r;
+        while ((r = (isize)syscall_dispatch(
+                    SYS_READ, (u64)fd, (u64)(usize)(tab + total),
+                    sizeof(tab) - 1 - (usize)total, 0, 0, 0)) > 0) {
+          total += r;
+          if (total >= (isize)sizeof(tab) - 1) break;
+        }
+        syscall_dispatch(SYS_CLOSE, (u64)fd, 0, 0, 0, 0, 0);
+        if (init_parse_inittab(tab, (int)total) > 0)
+          init_supervise(); /* never returns */
+      }
+    }
+  }
+
   /* M27: run the boot rc script once at startup (service/init setup) if
    * present, before the login shell. /etc/rc is shipped in the initramfs. */
   {
@@ -1230,7 +1735,10 @@ static int init_main(int argc, const char **argv) {
     uwrite("init: launching graphical UI /bin/mc\n");
     init_prog = "/bin/mc";
   } else {
-    init_prog = "/bin/sh";
+    /* Default interactive console shell is GNU bash (the b1nix default
+     * terminal). /bin/sh stays BusyBox ash for #!/bin/sh system scripts; bash
+     * failing to spawn falls back to /bin/sh below. */
+    init_prog = "/bin/bash";
   }
 
   u64 init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)init_prog, 0, 0, 0, 0, 0);

@@ -75,6 +75,13 @@ if SWAP_MB > 0:
 f = open(LOG, "wb", buffering=0)
 p = subprocess.Popen(qemu, stdin=subprocess.PIPE, stdout=f, stderr=subprocess.STDOUT)
 sent = False
+# M39: in normal boots a getty owns the serial line (/dev/ttyS0), so the
+# build session must log in as root first. The legacy raw-console triggers
+# below still work for boots without the inittab supervisor (single, init=).
+login_sent = False
+pw_sent = False
+last_probe = 0.0
+READY = "RB-SHELL-1234"  # probe output; the typed probe line never matches
 status = "timeout"
 start = time.time()
 last = 0
@@ -87,9 +94,24 @@ try:
         time.sleep(1)
         rc = p.poll()
         text = open(LOG, "rb").read().decode("latin1", "replace")
-        if not sent and ("Welcome to b1nix shell" in text or "/> " in text):
-            p.stdin.write(CMD.encode()); p.stdin.flush(); sent = True
-            print(f"[{int(time.time()-start)}s] sent build command", flush=True)
+        if not sent:
+            nl0 = text.replace("\r", "\n")
+            if not login_sent and "login:" in text:
+                p.stdin.write(b"root\n"); p.stdin.flush(); login_sent = True
+                print(f"[{int(time.time()-start)}s] getty login prompt: sent user", flush=True)
+            elif login_sent and not pw_sent and "Password:" in text:
+                p.stdin.write(b"root\n"); p.stdin.flush(); pw_sent = True
+                print(f"[{int(time.time()-start)}s] sent password", flush=True)
+            elif pw_sent and re.search(rf"^\s*{READY}\s*$", nl0, re.M):
+                p.stdin.write(CMD.encode()); p.stdin.flush(); sent = True
+                print(f"[{int(time.time()-start)}s] sent build command (serial login session)", flush=True)
+            elif pw_sent and time.time() - last_probe > 5:
+                # Arithmetic keeps the echoed probe line distinct from its output.
+                p.stdin.write(b"echo RB-SHELL-$((1000+234))\n")
+                p.stdin.flush(); last_probe = time.time()
+            elif not login_sent and ("Welcome to b1nix shell" in text or "/> " in text):
+                p.stdin.write(CMD.encode()); p.stdin.flush(); sent = True
+                print(f"[{int(time.time()-start)}s] sent build command", flush=True)
         # Host-wall-clock bracket of the build itself (the in-guest clock is
         # unreliable on TCG). BUILD_BEGIN/BUILD_END are echoed around `make`.
         # Match on its own line (the typed command also echoes "echo BUILD_END").

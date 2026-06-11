@@ -20,6 +20,7 @@ INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
+INITRAMFS_BASH_INC := $(BUILD_DIR)/initramfs_bash.inc
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
 APPLET_MANIFEST := tools/applet-manifest.conf
@@ -48,7 +49,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m34_smoke \
 	m35_smoke \
 	m42_w5pre_smoke \
-	su passwd groups useradd userdel groupadd halt setfattr
+	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
@@ -63,12 +64,15 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_CACERT_INC) \
 	$(INITRAMFS_TLSTEST_INC) \
 	$(INITRAMFS_DROPBEAR_INC) \
-	$(INITRAMFS_BUSYBOX_INC)
+	$(INITRAMFS_BUSYBOX_INC) \
+	$(INITRAMFS_BASH_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/dropbear-src/$(B1NIX_TRIPLET)/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
+BASH_VERSION_NUM := 5.2.37
+BASH_ELF := build/bash-src/$(B1NIX_TRIPLET)/bash-$(BASH_VERSION_NUM)/bash
 B1NIX_TLS ?= mbedtls
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
@@ -244,6 +248,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ps2_mouse.c \
 	kernel/dev/usb_xhci.c \
 	kernel/dev/pty.c \
+	kernel/dev/serial_tty.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
 	kernel/net/net.c \
@@ -433,6 +438,16 @@ $(DROPBEAR_ELF): tools/build-dropbear.sh tools/b1nix-autotools-cc $(USERSPACE_DE
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
+
+# GNU bash 5.2 — the default interactive shell (and /bin/sh). Built static
+# against the b1nix userspace libc by tools/build-bash.sh (autotools cross
+# build with a preseeded config.cache).
+$(BASH_ELF): tools/build-bash.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-bash.sh >/dev/null
+
+$(INITRAMFS_BASH_INC): $(BASH_ELF)
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_bash_elf $(BASH_ELF) > $@
 
 OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
 $(OPENSSL_LIB): tools/build-openssl.sh tools/b1nix-autotools-cc

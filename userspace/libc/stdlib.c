@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <setjmp.h>
+#include <signal.h>
 
 extern int normalize_errno(long rc);
 
@@ -726,6 +728,28 @@ __asm__(
 );
 #endif
 
+/* sigsetjmp/siglongjmp signal-mask handling (see <setjmp.h>). __sigsetjmp_save
+ * runs (via the sigsetjmp macro) immediately before the inline setjmp and, when
+ * savemask is non-zero, records the current signal mask so siglongjmp can
+ * restore it on the way out. */
+int __sigsetjmp_save(struct __sigjmp_buf *env, int savemask) {
+	env->__savemask = savemask;
+	if (savemask) {
+		sigset_t cur = 0;
+		sigprocmask(SIG_BLOCK, NULL, &cur);
+		env->__mask = (unsigned long long)cur;
+	}
+	return 0;
+}
+
+void siglongjmp(sigjmp_buf env, int val) {
+	if (env[0].__savemask) {
+		sigset_t m = (sigset_t)env[0].__mask;
+		sigprocmask(SIG_SETMASK, &m, NULL);
+	}
+	longjmp(env[0].__jb, val);
+}
+
 /* -----------------------------------------------------------------------
  * dlfcn stubs — B1NIX supports static linking only; dynamic loading is
  * not available.  These stubs follow the POSIX error-reporting contract:
@@ -1073,18 +1097,23 @@ int raise(int sig) {
 	return (int)syscall(SYS_KILL, pid, sig);
 }
 
+/* UTF-8 (non-restartable) conversions, delegating to the wchar.c primitives so
+ * the whole libc agrees on the encoding. */
+extern size_t mbrtowc(wchar_t *pwc, const char *s, size_t n, void *ps);
+extern size_t wcrtomb(char *s, wchar_t wc, void *ps);
+
 int wctomb(char *s, wchar_t wc) {
 	if (!s) return 0;
-	if (wc < 0 || wc > 255) return -1;
-	s[0] = (char)wc;
-	return 1;
+	size_t r = wcrtomb(s, wc, 0);
+	return r == (size_t)-1 ? -1 : (int)r;
 }
 
 int mbtowc(wchar_t *pwc, const char *s, size_t n) {
 	if (!s) return 0;
 	if (n == 0) return -1;
-	if (pwc) *pwc = (wchar_t)(unsigned char)s[0];
-	return s[0] == '\0' ? 0 : 1;
+	size_t r = mbrtowc(pwc, s, n, 0);
+	if (r == (size_t)-1 || r == (size_t)-2) return -1;
+	return (int)r;
 }
 
 char *tzname[2] = { (char *)"UTC", (char *)"UTC" };

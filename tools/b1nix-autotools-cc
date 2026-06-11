@@ -102,4 +102,7 @@ for input in $inputs; do
 done
 
 [ -n "$output" ] || output="a.out"
-"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs --whole-archive "$LIB" --no-whole-archive
+# Optional extra linker flags (opt-in via env; empty by default so existing
+# ports are unaffected). bash, for instance, ships its own getenv/setenv set
+# that intentionally shadows libb1nix's, needing --allow-multiple-definition.
+"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive

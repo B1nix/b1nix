@@ -5,6 +5,12 @@
 #include <sys/types.h>
 #include <time.h>
 
+/* NB: _POSIX_VERSION is intentionally NOT defined globally. Advertising it here
+ * flips feature paths in already-ported software (e.g. OpenSSL's secure-memory
+ * code starts calling mlock/madvise we do not provide). bash needs it (to pick
+ * `int` over BSD `union wait` for process status), so it is defined per-build
+ * via CFLAGS in tools/build-bash.sh instead of for every port. */
+
 #define _PC_NAME_MAX 3
 #define _PC_PATH_MAX 4
 static inline long pathconf(const char *path, int name) {

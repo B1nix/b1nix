@@ -12,6 +12,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial_tty.h>
 #include <b1nix/net.h>
 #include <b1nix/tlb.h>
 #include <b1nix/types.h>
@@ -309,6 +310,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
        * context (non-reentrant), so the single-producer kbd ring is safe. */
       ps2_kbd_interrupt_handler();
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
+      serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
       timer_ticks++;
       if (timer_ticks % 50 == 0) {
         fb_console_blink_cursor();
@@ -320,6 +322,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
 
   if (frame->vector == 32) {
     ps2_kbd_interrupt_handler(); /* i8042 poll fallback — see vector 64 above */
+    serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
     timer_ticks++;
     if (timer_ticks % 50 == 0) {
       fb_console_blink_cursor();
