@@ -262,3 +262,163 @@ Remaining intentional limitations:
   SIGCHLD posted on exit *and* stop/continue (with SA_NOCLDSTOP honored).
 - setuid/seteuid/setgid/setegid saved-set rules; getgroups/setgroups;
   kill permission probe (signal 0); setsid leader-EPERM rule.
+
+---
+
+# Part 3 — Second-round audit (subsystems beyond VFS/process core)
+
+A follow-up sweep of the subsystems flagged as "likely to hide bugs" in the
+codebase-quality review: file locks, xattr, the inode/page caches, swap,
+loop devices, the block cache, the journal, IPC (mqueue/shm/futex/aio), and
+UNIX sockets — plus an audit of the M46 process-semantics commit (9dce201)
+itself. Findings below were produced by fan-out audit agents; the ones marked
+**[verified]** were independently re-checked by an adversarial verifier that
+traced the exact failing interleaving in the current tree. **None of these are
+fixed yet** — this section is the to-do list (see roadmap M46 "open hardening").
+
+## Confirmed — memory safety / corruption (verified)
+
+- **FL-1 — CRITICAL — POSIX file locks have no lock at all.** `[verified]`
+  `kernel/fs/filelock.c` — `file_locks[]` is a bare global; `filelock_set_lock`
+  does a check-then-grant with nothing atomic between the conflict scan and the
+  install, `alloc_lock()` is a non-atomic test-and-set, and its NULL return is
+  dereferenced unchecked. Two CPUs grant conflicting `F_WRLCK`s; concurrent
+  callers double-claim a slot or NULL-deref. Fix: one global spinlock around all
+  table access; on `F_SETLKW` drop it before `scheduler_wait_commit`.
+
+- **F1-unix — HIGH — UNIX-socket peer back-pointer UAF.** `[verified]`
+  `kernel/net/unix.c:43` (`unix_free_state`) — closing one end frees its
+  `unix_socket_data` but never clears the surviving peer's `->peer`; the peer's
+  next `send`/`recv` writes through the dangling pointer. Fix: clear
+  `peer->peer` (and mark it disconnected) under the peer lock on teardown, or
+  refcount `unix_socket_data`.
+
+- **F1-journal — HIGH — concurrent journal transactions corrupt the heap and
+  the on-disk journal.** `[verified]` `kernel/fs/journal.c` — no per-`journal_dev`
+  lock; `journal_start_transaction` claims `handles[]` non-atomically and
+  `journal_commit_transaction` advances shared `s_start`/`next_seq` unlocked.
+  ext4 only holds the *parent inode* lock, so two CPUs creating files in
+  different directories commit on the same `jdev` → double-free of
+  `handle->data_blocks` / interleaved journal blocks. Fix: per-`journal_dev`
+  sleeping mutex held start→commit; atomic-CAS handle-slot claim.
+
+- **F2-blk — HIGH — block cache keeps two valid entries for one (dev,lba).**
+  `[verified]` `kernel/dev/blk.c` — after `bcache_evict` drops the lock for
+  write-back, the read/write miss paths do **not** re-run `bcache_find` before
+  claiming and hash-inserting their slot. Two CPUs missing the same key create
+  two VALID entries; a later write updates one, reads via the other return
+  stale data, and eviction of the dirty stale copy clobbers newer data. Fix:
+  re-`bcache_find` after `bcache_evict` returns; insert into the hash before
+  dropping the lock for the fill.
+
+- **FL-3 — HIGH — file locks owned by an exited CLONE_FILES thread never
+  release.** `[verified]` `filelock.c` + `scheduler.c` — ownership is keyed by
+  task id, but the shared fd table is closed only by the *last* table user with
+  *that* task's id, which never matches the original owner. Stale lock persists
+  → other processes' `F_SETLK` get EAGAIN forever, the 64-slot table fills. Fix:
+  key lock ownership by the thread-group/leader id.
+
+- **X-1 — HIGH — xattr list mutated/traversed with no inode lock.** `[verified]`
+  `kernel/fs/vfs.c` setxattr/getxattr/removexattr/listxattr — `removexattr`
+  frees a node a concurrent `getxattr` is walking (UAF); two `setxattr` race the
+  tail append (list corruption + leak). Fix: take the inode rwlock (write for
+  set/remove, read for get/list).
+
+- **F4-loop — MEDIUM — loop device stores the backing node with no reference.**
+  `[verified]` `kernel/dev/loop.c` — `LOOP_SET_FD` does `lo->backing_node =
+  h->node` with no `vfs_node_get`; after the setup process exits and the file is
+  unlinked the node is freed, and `loop_read_blocks` dereferences it (UAF). Fix:
+  `vfs_node_get` on SET_FD, `vfs_node_put` on CLR_FD; invalidate the block cache
+  on SET/CLR; reject non-regular backing files (recursion DoS).
+
+- **PC-1 — MEDIUM-HIGH — `page_cache_flush_inode` races `page_cache_truncate_inode`.**
+  `kernel/mm/page_cache.c` + `kernel/fs/vfs.c` — `vfs_fsync`/`vfs_close_handle`
+  flush without holding the inode lock; the M46 truncate path's refcount≠0 branch
+  does `memset(frame,0,PAGE_SIZE)` on a frame a lockless writeback may be mid-DMA
+  reading → torn/zeroed data on disk. (Directly adjacent to the M46 truncate
+  work.) Fix: hold `vfs_inode_lock` in fsync/close around the flush.
+
+- **IC-1 — MEDIUM (latent) — icache stores raw `vfs_inode*` with no reference.**
+  `kernel/fs/vfs.c` — `icache_insert`/`icache_get` never `vfs_inode_get`, and
+  `vfs_inode_put` frees the inode without removing it from the cache. Harmless
+  *today* only because every `icache_get` result is used as a presence boolean
+  and never dereferenced — it becomes a critical UAF the moment anyone reads
+  `icache_get(...)->field`. Fix: refcount cached inodes; remove from the icache
+  in `vfs_inode_put` before free.
+
+## Confirmed — process-semantics commit 9dce201 (this milestone's own code)
+
+- **M46-1 — HIGH — `terminate_group_siblings` can resurrect a DEAD/REAPING
+  sibling.** `kernel/sched/scheduler.c:2100-2110` — it wakes siblings with a
+  plain check-then-act `sibling->state = TASK_READY` instead of the
+  compare-exchange every other wakeup in the file uses. Under CLONE_THREAD with
+  siblings on APs, a sibling transitioning to DEAD/REAPING between the read and
+  the store is overwritten back to READY and re-queued onto a task whose
+  stack/slot is being freed → double-run / UAF / pmm poisoning. Fix: per-state
+  `__atomic_compare_exchange_n(&sibling->state, &expected, TASK_READY, …)`,
+  skipping DEAD/REAPING/UNUSED — mirror `wake_sleepers`.
+
+- **M46-2 — MEDIUM — orphaned-pgrp false-negative with ≥2 children in one pgrp.**
+  `scheduler.c:2229-2249` — the exit path reparents one child then immediately
+  tests `is_pgrp_orphaned`, while not-yet-reparented siblings still point at the
+  (still-RUNNING) exiting parent → the group reads as "not orphaned" and the
+  stopped members miss SIGHUP+SIGCONT. Fix: reparent ALL children first, then
+  compute orphan status once per distinct pgrp.
+
+- **M46-3 — LOW — signal-death exit doesn't reparent children / run orphan
+  handling.** The two signal-death sites call `terminate_group_siblings` but,
+  unlike `scheduler_exit_current`, skip child reparenting and orphan-pgrp
+  signalling. Fix: factor the reparent+orphan block into a helper, call it from
+  both paths.
+
+- **M46-4 — LOW — possibly spurious SIGHUP to the console fg pgrp.** ctty type
+  defaults to 1 (console) and is inherited, so a session leader that never owned
+  the console can still HUP `console.fg_pgrp` on exit. Low impact (real leaders
+  setsid first). Fix: default ctty to "none" unless a TIOCSCTTY-equivalent set it.
+
+- **M46-5 — LOW (cosmetic) — `frame->cs == 0x1B || 0x23` in `scheduler_charge_tick`
+  callers** is the OR of both arches' user-CS; accidentally-correct but should be
+  the per-arch constant.
+
+## Traced but not adversarially re-verified (high-confidence, pending check)
+
+These came from the first round's deep readers and were not run through the
+verifier; treat as strong leads to confirm before fixing:
+
+- **mqueue (`kernel/ipc/mqueue.c`)** — no locking at all; circular-buffer
+  head/tail/count raced; duplicate-create on the same name; blocking is a bare
+  `scheduler_yield` busy-spin (no wakeup).
+- **shm (`kernel/ipc/shm.c`)** — `shm_detach_all` has no caller, so
+  `shm_nattch` is never decremented on exit (segment + slot leak, IPC_RMID can
+  never free); no table lock; attach table keyed by recyclable pid.
+- **futex (`kernel/sched/futex.c`)** — no waiter cleanup on task exit (stale
+  entry → wake-after-reuse spuriously wakes an unrelated task); FUTEX_WAIT is
+  uninterruptible (no signal check); PROCESS_SHARED across separate mmaps never
+  wakes (keyed by pml4+uaddr, not physical frame). *(Note: the lost-wakeup claim
+  against the WAIT/WAKE handshake was a FALSE POSITIVE — the waiter is enqueued
+  under the bucket lock before the block, so that window is closed.)*
+- **aio (`kernel/fs/aio.c`)** — `aio_ctx_find_by_task` returns a `ctx` pointer
+  after dropping the list lock with no refcount; a worker can use it after
+  `aio_task_cleanup` frees it (UAF).
+- **unix sockets (`kernel/net/unix.c`)** — `accept`/`recv` use bare
+  `scheduler_block_on` after dropping the lock (lost-wakeup vs the TCP path which
+  uses wait_prepare/recheck/commit); `connect` leaves itself in the listener
+  backlog on signal/close (stale/UAF entry); blocking `send` on a full buffer
+  returns EAGAIN instead of blocking.
+- **journal crash-atomicity (`journal.c`/`ext4.c`)** — write-ahead ordering not
+  enforced (no flush/barrier between data, commit, checkpoint); `ext4_journal_write_tx`
+  writes the fs block pre-commit; `ext4_write_superblock` bypasses the journal
+  mid-transaction; recovery replay has an unbounded tag walk and unvalidated
+  target block numbers (crafted/torn-journal hazard); >32 logged blocks per op
+  silently half-journal.
+- **block flush (`blk.c`)** — `blk_flush_buffer` runs fully unlocked (lost DIRTY
+  bit, stuck-BUSY wedge, torn flush); single-pass `blk_sync_all` can leave
+  partition-parent blocks dirty after sync returns.
+
+## Verifier correction
+
+- **F3-futex — FALSE POSITIVE.** The earlier claim that FUTEX_WAIT loses wakeups
+  was wrong: the waiter is linked into the bucket *under* `b->lock` and only then
+  is the lock dropped and `scheduler_block_on` called, so any waker observes a
+  published waiter. The futex *exit-cleanup* and *PROCESS_SHARED* gaps above are
+  separate and real.

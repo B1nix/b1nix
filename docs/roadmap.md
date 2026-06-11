@@ -497,3 +497,38 @@ findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
 - [x] Make the nice value bias the cooperative scheduler
   (it round-trips via a side-table; mapping it onto the strict-priority
   `pick_next_task` scan starves tasks — see the audit doc).
+
+### Open hardening (second-round audit — Part 3 of the audit doc)
+
+A follow-up SMP/lifetime sweep of the subsystems outside the VFS/process core
+found further real bugs, none yet fixed. Ordered by severity; details and
+mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
+
+- [ ] `bug` **filelock has no lock at all** (FL-1, critical) — conflicting
+  `F_WRLCK`s granted under SMP, NULL-deref on a full table; also locks owned
+  by an exited CLONE_FILES thread never release (FL-3).
+- [ ] `bug` **`terminate_group_siblings` resurrects DEAD/REAPING siblings**
+  (M46-1, high) — plain `state = READY` store instead of a CAS; UAF/double-run
+  under CLONE_THREAD on APs. Regression in the exit_group code.
+- [ ] `bug` **UNIX-socket peer back-pointer UAF** (F1-unix, high) — close frees
+  one end's state without clearing the peer's `->peer`.
+- [ ] `bug` **concurrent journal transactions corrupt heap + on-disk journal**
+  (F1-journal, high) — no per-`journal_dev` lock; ext4 commits concurrently.
+- [ ] `bug` **block cache keeps two valid entries per (dev,lba)** (F2-blk, high)
+  — no re-find after the evict drops the lock → stale-data corruption.
+- [ ] `bug` **xattr list mutated/walked with no inode lock** (X-1, high) — UAF
+  on concurrent get/remove.
+- [ ] `bug` **`page_cache_flush_inode` races truncate's in-place zeroing**
+  (PC-1, medium-high) — fsync/close flush without the inode lock.
+- [ ] `bug` **loop device stores backing node with no `vfs_node_get`** (F4-loop,
+  medium) — UAF after the setup process exits.
+- [ ] `bug` **icache stores raw `vfs_inode*` with no reference** (IC-1, medium,
+  latent — benign only until someone dereferences a cached inode).
+- [ ] `bug` **orphaned-pgrp false-negative with ≥2 children in one pgrp**
+  (M46-2, medium) — reparent-then-test interleaving misses SIGHUP+SIGCONT.
+- [ ] `bug` Lower-severity / pending-verification leads: mqueue & shm have no
+  locking (shm also leaks on exit — `shm_detach_all` is never called); futex
+  lacks exit-time waiter cleanup and PROCESS_SHARED wakeups; aio ctx UAF on
+  exit; UNIX accept/recv lost-wakeups; journal crash-atomicity (write-ahead
+  ordering, pre-commit fs writes, unbounded recovery walk); swap/eviction ring
+  tables unlocked; signal-death exit skips reparent/orphan handling (M46-3).
