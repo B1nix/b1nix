@@ -724,6 +724,32 @@ static void vfs_inode_unlock(struct vfs_inode *inode) {
   vfs_inode_unlock_write(inode);
 }
 
+/* Sleeping mutex for filesystem-wide metadata (ext4/ext2 allocator bitmaps and
+ * superblock counters). Uses the same publish-BLOCKED-then-retry pattern as the
+ * inode rwlock above so a release on another CPU cannot be lost. The holder
+ * sleeps on block I/O, so this must never be a spinlock. */
+void vfs_meta_lock_acquire(int *lock) {
+  while (1) {
+    int expected = 0;
+    if (__atomic_compare_exchange_n(lock, &expected, 1, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED))
+      return;
+    scheduler_wait_prepare((void *)lock);
+    expected = 0;
+    if (__atomic_compare_exchange_n(lock, &expected, 1, 0, __ATOMIC_ACQUIRE,
+                                    __ATOMIC_RELAXED)) {
+      scheduler_wait_cancel();
+      return;
+    }
+    scheduler_wait_commit();
+  }
+}
+
+void vfs_meta_lock_release(int *lock) {
+  __atomic_store_n(lock, 0, __ATOMIC_RELEASE);
+  scheduler_wake_all((void *)lock);
+}
+
 static const struct cred *get_current_cred(void) {
   return scheduler_get_current_cred();
 }
@@ -889,6 +915,12 @@ void vfs_inode_put(struct vfs_inode *inode) {
   if (__atomic_sub_fetch(&inode->refcount, 1, __ATOMIC_RELAXED) == 0 &&
       inode->nlink == 0) {
     page_cache_invalidate_inode(inode);
+    /* IC-1: drop any icache entry that maps to this inode BEFORE freeing it,
+     * so a later icache_get(fs_id, ino) can't resurrect a dangling pointer
+     * into freed slab memory. (The icache currently stores a raw, unreferenced
+     * inode pointer; full reference-pinning of cached inodes is deferred.) */
+    if (inode->fs_id)
+      icache_invalidate(inode->fs_id, inode->ino);
     if (inode->data && (inode->flags & VFS_NODE_OWNS_DATA)) {
       kfree(inode->data);
     }
@@ -2102,6 +2134,27 @@ int vfs_open_flags(const char *path, int flags) {
     return -ENOMEM;
   vfs_resolve_path(path, resolved);
 
+  if (strcmp(resolved, "/dev/tty") == 0) {
+    int type = 0;
+    int index = 0;
+    scheduler_get_ctty(&type, &index);
+    if (type == 0) {
+      kfree(resolved);
+      return -ENXIO;
+    }
+    if (type == 2) {
+      int fd = serial_tty_open(index, flags);
+      kfree(resolved);
+      return fd;
+    }
+    if (type == 3) {
+      int fd = pty_open_slave(index, flags);
+      kfree(resolved);
+      return fd;
+    }
+    /* type == 1 is console, fall through to normal /dev/tty open */
+  }
+
   /* M32b pseudo-terminals: /dev/ptmx allocates a fresh master; /dev/pts/<N>
    * binds to that pair's slave. These are dynamic handles, not VFS nodes, so
    * intercept the open before the path lookup. */
@@ -2247,11 +2300,20 @@ int vfs_open_flags(const char *path, int flags) {
       goto out;
     }
     vfs_inode_lock(node->inode);
-    node->inode->size = 0;
-    if (node->inode->data && !node->inode->write_cb && !node->inode->read_cb)
-      ((char *)node->inode->data)[0] = '\0';
-    if (node->inode->setattr_cb)
-      node->inode->setattr_cb(node);
+    /* Drop cached pages first: dirty pages of the discarded content must not
+     * be written back, and a later re-grow must read zeros, not stale data. */
+    page_cache_truncate_inode(node->inode, 0);
+    if (node->inode->truncate_cb) {
+      /* Let the filesystem free the data blocks (it also updates size/times),
+       * matching ftruncate semantics instead of only zeroing the size field. */
+      node->inode->truncate_cb(node, 0);
+    } else {
+      node->inode->size = 0;
+      if (node->inode->data && !node->inode->write_cb && !node->inode->read_cb)
+        ((char *)node->inode->data)[0] = '\0';
+      if (node->inode->setattr_cb)
+        node->inode->setattr_cb(node);
+    }
     vfs_inode_unlock(node->inode);
   }
 
@@ -2373,10 +2435,13 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
   if (!h->node)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
+  vfs_inode_lock(node->inode);
+  /* O_APPEND: sample the size under the exclusive inode lock. Reading it
+   * before the lock loses concurrent appends — a writer blocked on the lock
+   * would rewind to a stale EOF and overwrite what the lock holder appended. */
   if (h->flags & B1NIX_O_APPEND)
     h->offset = node->inode->size;
   u64 offset = h->offset;
-  vfs_inode_lock(node->inode);
   isize res = 0;
   if (node->inode->type == VFS_FILE && node->inode->write_cb) {
     usize remaining = size;
@@ -2530,25 +2595,43 @@ int vfs_poll(int fd, struct b1nix_pollfd *pfd) {
   return res;
 }
 
-void vfs_close(int fd) {
-  struct vfs_handle *h = scheduler_fd_get(fd);
+/* Close an open-file handle outside any fd table — the shared close tail of
+ * vfs_close and of task teardown freeing the last reference to a CLONE_FILES
+ * fd table (where the dying task's fds are no longer reachable by index). */
+void vfs_close_handle(struct vfs_handle *h, int owner_pid) {
   if (!h)
     return;
 
   if (h->kind == VFS_HANDLE_NODE && h->node && h->node->inode) {
-    int my_pid = current_task ? (int)current_task->id : 0;
-    filelock_release_all_by_pid_inode(my_pid, h->node->inode);
+    filelock_release_all_by_pid_inode(owner_pid, h->node->inode);
 
     if (h->flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR)) {
+      /* Hold the inode lock across the flush: writeback drops the page-cache
+       * lock around write_cb while reading the frame, and a concurrent
+       * ftruncate's page_cache_truncate_inode would otherwise memset that live
+       * frame mid-DMA. read/write/truncate all serialize on this same lock. */
+      vfs_inode_lock(h->node->inode);
       page_cache_flush_inode(h->node->inode);
+      vfs_inode_unlock(h->node->inode);
     }
   }
 
   if (h->ops && h->ops->close)
     h->ops->close(h);
 
-  scheduler_fd_close(fd);
   vfs_handle_release(h);
+}
+
+void vfs_close(int fd) {
+  /* Take (fetch-and-clear) the slot atomically: two threads racing close()
+   * on the same fd of a shared table must not both run the release path. */
+  struct vfs_handle *h = scheduler_fd_take(fd);
+  if (!h)
+    return;
+
+  /* Pass the PROCESS (thread-group) id: POSIX file locks are process-owned, so
+   * release must use the same key filelock_set_lock stored. */
+  vfs_close_handle(h, current_task ? (int)task_tgid(current_task) : 0);
 }
 
 static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
@@ -3139,6 +3222,11 @@ int vfs_link(const char *target, const char *link_path) {
       vfs_tree_write_release(_tlflags);
       new_node->inode->nlink--;
       new_node->inode = 0;
+      /* The fresh node was allocated with refcount 0; give it the reference
+       * we are about to drop and mark it deleted so vfs_node_put's 0+deleted
+       * check actually frees it (a bare put underflowed to -1 and leaked). */
+      new_node->deleted = 1;
+      __atomic_store_n(&new_node->refcount, 1, __ATOMIC_RELAXED);
       vfs_node_put(new_node);
     }
   }
@@ -3485,7 +3573,11 @@ int vfs_fsync(int fd) {
     return -EBADF;
   struct vfs_node *node = h->node;
 
+  /* Inode lock across the flush — see vfs_close_handle (flush vs a concurrent
+   * truncate's in-place page zeroing). */
+  vfs_inode_lock(node->inode);
   page_cache_flush_inode(node->inode);
+  vfs_inode_unlock(node->inode);
 
   if (node->inode->fsync_cb) {
     int err = node->inode->fsync_cb(node);
@@ -3528,6 +3620,13 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return -ENODEV;
   }
 
+  /* Claim and initialize the slot under vfs_mount_lock — the unlocked scan
+   * let two concurrent mounts pick the same index, and lookups walking
+   * mounts[] could observe a half-written entry. The fs->mount() callback
+   * itself runs outside the lock (it sleeps on block I/O). */
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
   int midx = -1;
   for (usize i = 0; i < MAX_MOUNTS; i++) {
     if (!mounts[i].used) {
@@ -3537,6 +3636,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   }
 
   if (midx == -1) {
+    __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
     vfs_node_put(target_node);
     return -ENOMEM;
   }
@@ -3549,6 +3649,7 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
   copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
   copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
   mounts[midx].flags = flags;
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   currently_mounting = &mounts[midx];
   struct vfs_node *root_node = fs->mount(source, flags, (void *)target);
@@ -3560,16 +3661,11 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
     return (int)PTR_ERR(root_node);
   }
 
-  interrupts_disable();
-  copy_path(mounts[midx].source, sizeof(mounts[midx].source),
-            source ? source : "");
-  copy_path(mounts[midx].target, sizeof(mounts[midx].target), target);
-  copy_path(mounts[midx].fstype, sizeof(mounts[midx].fstype), fstype);
-  mounts[midx].flags = flags;
+  while (__atomic_test_and_set(&vfs_mount_lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
   mounts[midx].root_node = root_node;
-
   root_node->inode->fs_id = next_fs_id++;
-  interrupts_enable();
+  __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
   return 0;
 }
@@ -3588,8 +3684,10 @@ int vfs_umount(const char *target) {
         return -EBUSY;
       }
 
-      /* Basic busy check: if root_node has other refs than our mount entry */
-      if (mounts[i].root_node->refcount > 1) {
+      /* Basic busy check: if root_node has other refs than our mount entry.
+       * Acquire-load: pairs with the atomic refcount updates so a ref taken
+       * on another CPU just before umount is observed. */
+      if (__atomic_load_n(&mounts[i].root_node->refcount, __ATOMIC_ACQUIRE) > 1) {
         __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
         return -EBUSY;
       }
@@ -3884,6 +3982,14 @@ int vfs_ftruncate(int fd, u64 length) {
     vfs_inode_unlock(inode);
     return -EFBIG;
   }
+
+  /* Invalidate cached pages beyond min(old, new) size BEFORE the fs callback
+   * runs: dirty pages past the new EOF must never reach the disk, and the
+   * stale tail of the partial page must read back as zeros after a
+   * shrink-then-grow (POSIX) instead of resurrecting pre-truncate contents. */
+  page_cache_truncate_inode(inode,
+                            length < (u64)inode->size ? length
+                                                      : (u64)inode->size);
 
   if (inode->truncate_cb || inode->setattr_cb) {
     if (length > inode->size && inode->write_cb) {
@@ -4288,6 +4394,11 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   if (ret != 0)
     goto out;
 
+  /* Exclusive inode lock: the xattr list is shared mutable inode state; a
+   * concurrent setxattr/removexattr on another CPU would corrupt the list and
+   * a concurrent getxattr could walk a freed node (UAF). */
+  vfs_inode_lock(node->inode);
+
   struct vfs_xattr **pp = &node->inode->xattrs;
   struct vfs_xattr *existing = 0;
   while (*pp) {
@@ -4299,11 +4410,11 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   }
   if (existing && (flags & XATTR_CREATE)) {
     ret = -EEXIST;
-    goto out;
+    goto out_unlock;
   }
   if (!existing && (flags & XATTR_REPLACE)) {
     ret = -ENODATA;
-    goto out;
+    goto out_unlock;
   }
 
   void *newval = 0;
@@ -4311,7 +4422,7 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
     newval = kmalloc(size);
     if (!newval) {
       ret = -ENOMEM;
-      goto out;
+      goto out_unlock;
     }
     memcpy(newval, value, size);
   }
@@ -4327,7 +4438,7 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
       if (newval)
         kfree(newval);
       ret = -ENOMEM;
-      goto out;
+      goto out_unlock;
     }
     x->next = 0;
     memcpy(x->name, name, nlen);
@@ -4339,6 +4450,8 @@ isize vfs_setxattr(const char *path, const char *name, const void *value,
   vfs_update_times(node->inode, VFS_CTIME);
   ret = 0;
 
+out_unlock:
+  vfs_inode_unlock(node->inode);
 out:
   vfs_node_put(node);
   return ret;
@@ -4353,6 +4466,7 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
     return (isize)PTR_ERR(node);
 
   isize ret = -ENODATA;
+  vfs_inode_lock_read(node->inode);
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next) {
     if (strcmp(x->name, name) != 0)
       continue;
@@ -4367,6 +4481,7 @@ isize vfs_getxattr(const char *path, const char *name, void *value,
     }
     break;
   }
+  vfs_inode_unlock_read(node->inode);
   vfs_node_put(node);
   return ret;
 }
@@ -4376,6 +4491,7 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
   if (IS_ERR(node))
     return (isize)PTR_ERR(node);
 
+  vfs_inode_lock_read(node->inode);
   usize total = 0;
   for (struct vfs_xattr *x = node->inode->xattrs; x; x = x->next)
     total += strlen(x->name) + 1;
@@ -4394,6 +4510,7 @@ isize vfs_listxattr(const char *path, char *list, usize size, int nofollow) {
     }
     ret = (isize)total;
   }
+  vfs_inode_unlock_read(node->inode);
   vfs_node_put(node);
   return ret;
 }
@@ -4410,6 +4527,7 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
     goto out;
 
   ret = -ENODATA;
+  vfs_inode_lock(node->inode);
   struct vfs_xattr **pp = &node->inode->xattrs;
   while (*pp) {
     if (strcmp((*pp)->name, name) == 0) {
@@ -4424,6 +4542,7 @@ isize vfs_removexattr(const char *path, const char *name, int nofollow) {
     }
     pp = &(*pp)->next;
   }
+  vfs_inode_unlock(node->inode);
 
 out:
   vfs_node_put(node);

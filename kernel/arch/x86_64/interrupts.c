@@ -334,6 +334,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * service and never delivers another tick. Issue EOI first so the
      * LAPIC unblocks immediately, then run the (preemptible) tick work. */
     lapic_eoi();
+    scheduler_charge_tick(frame->cs == 0x1B || frame->cs == 0x23);
     if (is_bsp) {
       timer_ticks++;
       if (timer_ticks % 50 == 0) {
@@ -361,6 +362,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       fb_console_blink_cursor();
     }
     irq_eoi(frame->vector);
+    scheduler_charge_tick(frame->cs == 0x1B || frame->cs == 0x23);
     scheduler_on_timer_tick();
     return;
   }
@@ -605,7 +607,7 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       coredump_write(frame, sig);
       console_write("coredump: wrote /tmp/core\n");
     }
-    scheduler_exit_current(128 + sig);
+    scheduler_exit_current(TASK_EXIT_SIGNALED | sig);
     /* scheduler_exit_current never returns */
     arch_halt();
   }

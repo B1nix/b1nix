@@ -162,6 +162,14 @@ enum {
 	SYS_GETXATTR     = 135,
 	SYS_LISTXATTR    = 136,
 	SYS_REMOVEXATTR  = 137,
+	SYS_GETPGID      = 138,
+	SYS_SETREUID     = 139,
+	SYS_SETREGID     = 140,
+	SYS_SETRESUID    = 141,
+	SYS_SETRESGID    = 142,
+	SYS_WAITID       = 143,
+	SYS_TIMES        = 144,
+	SYS_GETRUSAGE    = 145,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

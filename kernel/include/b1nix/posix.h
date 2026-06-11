@@ -216,4 +216,60 @@ struct timespec {
   i64 tv_nsec;
 };
 
+struct timeval {
+  i64 tv_sec;
+  i64 tv_usec;
+};
+
+#define RUSAGE_SELF     0
+#define RUSAGE_CHILDREN (-1)
+#define RUSAGE_THREAD   1
+
+struct rusage {
+  struct timeval ru_utime;
+  struct timeval ru_stime;
+  long   ru_maxrss;
+  long   ru_ixrss;
+  long   ru_idrss;
+  long   ru_isrss;
+  long   ru_minflt;
+  long   ru_majflt;
+  long   ru_nswap;
+  long   ru_inblock;
+  long   ru_oublock;
+  long   ru_msgsnd;
+  long   ru_msgrcv;
+  long   ru_nsignals;
+  long   ru_nvcsw;
+  long   ru_nivcsw;
+};
+
+typedef long clock_t;
+
+struct tms {
+  clock_t tms_utime;
+  clock_t tms_stime;
+  clock_t tms_cutime;
+  clock_t tms_cstime;
+};
+
+#define B1NIX_WEXITED 4
+#define B1NIX_WSTOPPED 2
+#define B1NIX_WNOWAIT 0x01000000
+
+typedef enum {
+  P_ALL = 0,
+  P_PID = 1,
+  P_PGID = 2
+} idtype_t;
+
+typedef struct {
+  int si_signo;
+  int si_code;
+  int si_errno;
+  int si_pid;
+  int si_uid;
+  int si_status;
+} siginfo_t;
+
 #endif

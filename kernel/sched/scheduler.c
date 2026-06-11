@@ -11,6 +11,7 @@
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/serial_tty.h>
 
 /* Drain cross-CPU TLB shootdowns while spin-waiting with IRQs disabled (these
  * stack_released hand-off spins run inside scheduler_yield, IRQs off). Without
@@ -97,7 +98,23 @@ static u64  g_task_child_tid_clear[MAX_TASKS];
 static u64  g_task_saved_sigmask[MAX_TASKS];
 static int  g_task_has_saved_sigmask[MAX_TASKS];
 static u64  g_task_alarm_ticks[MAX_TASKS];
+/* Set once the task has successfully execve()d. POSIX setpgid: changing a
+ * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
+ * by fork — the fresh child has not exec'd yet. */
+static int  g_task_execed[MAX_TASKS];
+/* POSIX nice value (-20..19, 0 default) — see scheduler_set_priority for why
+ * this is NOT task->priority. Inherited across fork. */
+static int  g_task_nice[MAX_TASKS];
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
+static usize g_task_tgid[MAX_TASKS];
+static int   g_task_ctty_type[MAX_TASKS];
+static int   g_task_ctty_index[MAX_TASKS];
+static u64   g_task_utime[MAX_TASKS];
+static u64   g_task_stime[MAX_TASKS];
+static u64   g_task_cutime[MAX_TASKS];
+static u64   g_task_cstime[MAX_TASKS];
+static u64   g_task_pass[MAX_TASKS];
+static u64   g_min_pass = 0;
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -171,17 +188,30 @@ static inline void tasks_unlock(u64 flags) {
   spin_unlock_irqrestore(&g_tasks_lock, flags);
 }
 
-/* fd_lock helpers — wraps spin_lock/unlock on current_task->fd_lock with
- * lockdep tracking. fd_lock is plain (no irq-save) because fd ops never
- * fire from ISR context and the lock is process-local (only the owning
- * task touches it). */
+/* fd_lock helpers — wraps spin_lock/unlock on the fd table owner's fd_lock
+ * with lockdep tracking. fd_lock is plain (no irq-save) because fd ops never
+ * fire from ISR context.
+ *
+ * A CLONE_FILES thread shares the parent's fd TABLE, so it must take the
+ * parent's fd LOCK too: the per-task lock copies the old code used serialized
+ * nothing across siblings (two threads could claim the same free slot or torn-
+ * update a shared entry). g_task_fdlock_owner points at the lock-owning task
+ * (the thread-group leader); NULL means "use your own lock". Task slot memory
+ * is never freed, so a stale owner pointer after the leader is reaped degrades
+ * to harmless lock sharing with whatever reuses the slot, not a dangling ref. */
+static usize task_index(const struct task *task);
+static struct task *g_task_fdlock_owner[MAX_TASKS];
+static inline struct task *fd_lock_task(void) {
+  struct task *owner = g_task_fdlock_owner[task_index(current_task)];
+  return owner ? owner : current_task;
+}
 static inline void fd_lock_acquire(void) {
-  spin_lock(&current_task->fd_lock);
+  spin_lock(&fd_lock_task()->fd_lock);
   LOCKDEP_ACQUIRE(LOCKDEP_LVL_FD);
 }
 static inline void fd_lock_release(void) {
   LOCKDEP_RELEASE(LOCKDEP_LVL_FD);
-  spin_unlock(&current_task->fd_lock);
+  spin_unlock(&fd_lock_task()->fd_lock);
 }
 
 #include <b1nix/arch.h>
@@ -223,6 +253,17 @@ static struct task *find_unused_task(void) {
       g_task_saved_sigmask[i] = 0;
       g_task_has_saved_sigmask[i] = 0;
       g_task_alarm_ticks[i] = 0;
+      g_task_execed[i] = 0;
+      g_task_nice[i] = 0;
+      g_task_fdlock_owner[i] = 0;
+      g_task_tgid[i] = 0;
+      g_task_ctty_type[i] = 0;
+      g_task_ctty_index[i] = 0;
+      g_task_utime[i] = 0;
+      g_task_stime[i] = 0;
+      g_task_cutime[i] = 0;
+      g_task_cstime[i] = 0;
+      g_task_pass[i] = g_min_pass;
       for (int r = 0; r < 16; r++) {
         g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
         g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -381,6 +422,7 @@ static struct task *pick_next_task(void) {
       if (__atomic_compare_exchange_n(&t->state, &expected, TASK_RUNNING,
                                       0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        g_min_pass = g_task_pass[task_index(t)];
         return t;
       }
       /* Lost the CAS (someone else already picked, or task transitioned to
@@ -392,9 +434,14 @@ static struct task *pick_next_task(void) {
   /* O(n) scan over the task table. A task that yields is marked READY without
    * being re-enqueued (scheduler_yield), so this scan — not the rq — re-picks
    * voluntarily-yielding tasks. Stealable workers are always skipped; on an AP
-   * only ap_runnable userspace processes are eligible. */
+   * only ap_runnable userspace processes are eligible.
+   *
+   * Nice biases otherwise-equal tasks with stride scheduling. Kernel/internal
+   * priorities remain the primary ordering so adding nice support does not
+   * change the scheduler's existing priority contract. */
   usize start = task_index(current_task);
   int max_priority = -1;
+  u64 min_pass = -1ULL;
   struct task *best_task = 0;
 
   for (usize offset = 1; offset <= g_task_hwm; offset++) {
@@ -407,8 +454,12 @@ static struct task *pick_next_task(void) {
     if (on_ap && !T(index)->ap_runnable)
       continue; /* APs run only userspace ELF processes */
 
-    if (T(index)->priority > max_priority) {
-      max_priority = T(index)->priority;
+    int priority = T(index)->priority;
+    u64 pass = g_task_pass[index];
+    if (priority > max_priority ||
+        (priority == max_priority && pass < min_pass)) {
+      max_priority = priority;
+      min_pass = pass;
       best_task = T(index);
     }
   }
@@ -442,6 +493,7 @@ static struct task *pick_next_task(void) {
       if (__atomic_compare_exchange_n(&best_task->state, &expected,
                                       TASK_RUNNING, 0, __ATOMIC_ACQUIRE,
                                       __ATOMIC_RELAXED)) {
+        g_min_pass = g_task_pass[task_index(best_task)];
         return best_task;
       }
     }
@@ -571,6 +623,14 @@ void scheduler_init(void) {
   g_task_saved_sigmask[0] = 0;
   g_task_has_saved_sigmask[0] = 0;
   g_task_alarm_ticks[0] = 0;
+  g_task_tgid[0] = boot->id;
+  g_task_ctty_type[0] = 1; /* 1 = console */
+  g_task_ctty_index[0] = 0;
+  g_task_utime[0] = 0;
+  g_task_stime[0] = 0;
+  g_task_cutime[0] = 0;
+  g_task_cstime[0] = 0;
+  g_task_pass[0] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[0][r].rlim_cur = RLIM_INFINITY;
     g_task_rlimits[0][r].rlim_max = RLIM_INFINITY;
@@ -756,6 +816,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
 
+  g_task_tgid[task_index(task)] = task->id;
   if (!stealable)
     task_init_cred(task);
 
@@ -870,9 +931,11 @@ int scheduler_fork_current(void) {
     __atomic_fetch_add(&((struct user_loaded_image *)child->user_image)->refcount, 1, __ATOMIC_RELAXED);
   }
 
-  // Clear inherited pending signals and sleep/block states
+  // Clear inherited pending signals and sleep/block states.
+  // POSIX fork: the child starts with an EMPTY pending set but INHERITS the
+  // parent's blocked-signal mask.
   child->pending_signals = 0;
-  child->blocked_signals = 0;
+  child->blocked_signals = parent->blocked_signals;
   child->last_stop_signal = 0;
   child->stop_report_pending = 0;
   child->continued_report_pending = 0;
@@ -885,6 +948,10 @@ int scheduler_fork_current(void) {
   g_task_saved_sigmask[c_idx] = 0;
   g_task_has_saved_sigmask[c_idx] = 0;
   g_task_alarm_ticks[c_idx] = 0;
+  g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
+  g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
+  g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
+  g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
   }
@@ -1156,6 +1223,26 @@ void task_set_alarm_ticks(struct task *t, u64 ticks) {
   if (!t) return;
   g_task_alarm_ticks[task_index(t)] = ticks;
 }
+usize task_tgid(const struct task *t) {
+  if (!t) return 0;
+  return g_task_tgid[task_index(t)];
+}
+u64 task_utime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_utime[task_index(t)];
+}
+u64 task_stime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_stime[task_index(t)];
+}
+u64 task_cutime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cutime[task_index(t)];
+}
+u64 task_cstime(const struct task *t) {
+  if (!t) return 0;
+  return g_task_cstime[task_index(t)];
+}
 int scheduler_getrlimit(int resource, struct rlimit *rlim) {
   if (resource < 0 || resource >= 16 || !rlim || !current_task)
     return -EINVAL;
@@ -1262,16 +1349,39 @@ static u64 mm_release_user(struct task *t) {
   return (p && refs == 0) ? p : 0;
 }
 
-static int fdtable_other_refs(struct vfs_handle **tbl, const struct task *except) {
-  if (!tbl) return 0;
-  int n = 0;
-  for (usize i = 0; i < g_task_hwm; i++) {
-    struct task *t = T(i);
-    if (t == except) continue;
-    if (t->state == TASK_UNUSED || t->state == TASK_REAPING) continue;
-    if (t->fd_table == tbl) n++;
+/* Atomically drop t's reference to its (possibly CLONE_FILES-shared) fd
+ * table. Mirrors mm_release_user: clear our own pointer under
+ * g_mm_release_lock, then count the remaining holders — exactly one releaser
+ * observes zero and gets the table back to close + free. Any non-UNUSED
+ * holder counts (DEAD/REAPING included): its own release call hasn't dropped
+ * it yet and will see the updated holder set when it runs. Returns the table
+ * iff t was the last user (caller must vfs_close_handle each entry and kfree
+ * both arrays), 0 otherwise. */
+static struct vfs_handle **fdtable_release(struct task *t, int **flags_out,
+                                           usize *cap_out) {
+  u64 flags;
+  spin_lock_irqsave(&g_mm_release_lock, &flags);
+  struct vfs_handle **tbl = t->fd_table;
+  int *fl = t->fd_flags;
+  usize cap = t->fd_capacity;
+  t->fd_table = 0;
+  t->fd_flags = 0;
+  t->fd_capacity = 0;
+  int holders = 0;
+  if (tbl) {
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *o = T(i);
+      if (o == t) continue;
+      if (o->state == TASK_UNUSED) continue;
+      if (o->fd_table == tbl) holders++;
+    }
   }
-  return n;
+  spin_unlock_irqrestore(&g_mm_release_lock, flags);
+  if (!tbl || holders > 0)
+    return 0;
+  *flags_out = fl;
+  *cap_out = cap;
+  return tbl;
 }
 
 int g_has_any_thread = 0;
@@ -1339,6 +1449,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
   usize p_idx = task_index(parent);
   usize c_idx = task_index(child);
+  if (flags & B1NIX_CLONE_THREAD) {
+    g_task_tgid[c_idx] = g_task_tgid[p_idx];
+  } else {
+    g_task_tgid[c_idx] = child->id;
+  }
+  g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
+  g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++)
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
@@ -1366,14 +1483,15 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     child->fd_table   = parent->fd_table;
     child->fd_flags   = parent->fd_flags;
     child->fd_capacity = parent->fd_capacity;
-    /* fd_lock is shared via the parent's lock pointer-equivalence: both
-     * tasks reference the same fd_table address so they both lock-step
-     * around the parent's spinlock. Practically: parent's fd_lock IS the
-     * shared lock; routines that lock via current_task->fd_lock have a
-     * separate copy. The cost of cleanly fixing this is intrusive; for
-     * M29's smoke (single-process pthreads doing modest fd traffic) the
-     * existing parent_id-based path is sufficient. */
     child->fd_lock = 0;
+    /* Share the table owner's fd_lock: per-task lock copies would let two
+     * siblings race the same table (see fd_lock_task). If the parent is
+     * itself a thread, point at ITS owner so the whole group converges on
+     * one lock. */
+    {
+      struct task *owner = g_task_fdlock_owner[task_index(parent)];
+      g_task_fdlock_owner[task_index(child)] = owner ? owner : parent;
+    }
   } else {
     /* Copy parent's table. */
     child->fd_capacity = parent->fd_capacity;
@@ -1495,9 +1613,26 @@ void scheduler_reap_dead_threads(void) {
     /* Release any per-thread (non-shared) resources. */
     if (t->cred) { cred_free(t->cred); t->cred = 0; }
 
-    /* If this thread did NOT share fds with anyone (theoretical: CLONE
-     * without CLONE_FILES — currently unreachable because we reject it),
-     * its private fd table would have been freed here. */
+    /* Drop this thread's reference to the shared fd table; the LAST user
+     * closes the handles and frees it (a leader that exit()ed earlier
+     * detached its own reference the same way). Closing can sleep on
+     * writeback, so run it with IRQs enabled and restore the sweep
+     * invariant after — same pattern as user_address_space_cleanup above. */
+    {
+      int *fl = 0;
+      usize cap = 0;
+      struct vfs_handle **tbl = fdtable_release(t, &fl, &cap);
+      if (tbl) {
+        interrupts_enable();
+        for (usize j = 0; j < cap; j++) {
+          if (tbl[j])
+            vfs_close_handle(tbl[j], (int)task_tgid(t));
+        }
+        kfree(tbl);
+        kfree(fl);
+        interrupts_disable();
+      }
+    }
     if (t->stack) { kfree(t->stack); t->stack = 0; }
     if (t->name) { kfree((void *)t->name); t->name = 0; }
     free_task_slot(t);
@@ -1644,6 +1779,15 @@ int scheduler_yield(void) {
   }
 
   if (old_task->state == TASK_RUNNING) {
+    /* Stride Scheduler: increment pass of yielding task by its stride */
+    usize old_idx = task_index(old_task);
+    int nice = g_task_nice[old_idx];
+    if (nice < -20) nice = -20;
+    if (nice > 19) nice = 19;
+    int tickets = 20 - nice;
+    int stride = 1000 / tickets;
+    g_task_pass[old_idx] += stride;
+
     /* M28 T4: claim the kernel stack BEFORE publishing state=READY. Under T4
      * the save side of arch_context_switch (the movq %rsp,0(%rdi) +
      * movq 0(%rsi),%rsp sequence) is no longer serialised by the BKL, so a
@@ -1934,13 +2078,129 @@ void scheduler_on_timer_tick(void) {
   }
 }
 
+void scheduler_charge_tick(int is_user) {
+  if (!scheduler_started || current_task == 0) {
+    return;
+  }
+  usize idx = task_index(current_task);
+  if (is_user) {
+    g_task_utime[idx]++;
+  } else {
+    g_task_stime[idx]++;
+  }
+}
+
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
 static void post_sigchld_to_parent(usize parent_id, int job_control_event);
 
+static void terminate_group_siblings(struct task *t) {
+  usize tgid = g_task_tgid[task_index(t)];
+  if (tgid == 0) return;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *sibling = T(i);
+    if (sibling->state != TASK_UNUSED && sibling != t && g_task_tgid[i] == tgid) {
+      /* Post SIGKILL to sibling */
+      __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
+      /* Wake them if they are blocked/sleeping/stopped. Use a per-state CAS,
+       * NOT a plain store: a sibling running on another AP can transition to
+       * DEAD/REAPING between the read and the write, and a bare
+       * `state = READY` would resurrect it and re-queue a task whose stack/slot
+       * is being freed (UAF). Mirror wake_sleepers — only a state we still
+       * observe as BLOCKED/SLEEPING/STOPPED is promoted. */
+      enum task_state expected = TASK_BLOCKED;
+      int woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                             TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                             __ATOMIC_RELAXED);
+      if (!woke) {
+        expected = TASK_SLEEPING;
+        woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                           TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                           __ATOMIC_RELAXED);
+      }
+      if (!woke) {
+        expected = TASK_STOPPED;
+        woke = __atomic_compare_exchange_n(&sibling->state, &expected,
+                                           TASK_READY, 0, __ATOMIC_ACQUIRE,
+                                           __ATOMIC_RELAXED);
+      }
+      if (woke) {
+        sibling->wait_chan = 0;
+        sched_rq_enqueue_current(sibling);
+      }
+    }
+  }
+}
+
+static int is_pgrp_orphaned(usize pgid, const struct task *exiting) {
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t != exiting && t->state != TASK_UNUSED &&
+        t->process_group_id == pgid) {
+      usize parent_id = t->parent_id;
+      for (usize j = 0; j < g_task_hwm; j++) {
+        struct task *parent = T(j);
+        if (parent->state != TASK_UNUSED && parent->id == parent_id) {
+          /* The exiting task is about to reparent all its children to init, so
+           * it must NOT count as an outside-pgrp parent here — otherwise a group
+           * whose only outside parent is us reads as "not orphaned" and misses
+           * its SIGHUP+SIGCONT (M46-2). init (PID 1) never counts either. */
+          if (parent != exiting && parent->id != 1 &&
+              parent->process_group_id != pgid &&
+              parent->session_id == t->session_id) {
+            return 0; /* not orphaned */
+          }
+        }
+      }
+    }
+  }
+  return 1; /* orphaned */
+}
+
+void scheduler_exit_group(int exit_code) {
+  if (current_task == 0) {
+    panic("scheduler_exit_group without current task");
+  }
+  u64 flags = interrupts_save();
+  terminate_group_siblings(current_task);
+  interrupts_restore(flags);
+  scheduler_exit_current(exit_code);
+}
+
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
+  }
+
+  /* If process leader exits, or crash/signal exit, terminate siblings first */
+  if (g_task_tgid[task_index(current_task)] == current_task->id ||
+      (exit_code & TASK_EXIT_SIGNALED) || (exit_code < 0)) {
+    u64 flags = interrupts_save();
+    terminate_group_siblings(current_task);
+    interrupts_restore(flags);
+  }
+
+  /* If session leader exits, detach ctty and send SIGHUP/SIGCONT to fg pgrp */
+  if (current_task->session_id == current_task->id) {
+    usize idx = task_index(current_task);
+    int type = g_task_ctty_type[idx];
+    int ctty_idx = g_task_ctty_index[idx];
+    g_task_ctty_type[idx] = 0;
+    g_task_ctty_index[idx] = 0;
+
+    usize fg = 0;
+    if (type == 1) {
+      fg = console.fg_pgrp;
+    } else if (type == 2) {
+      fg = serial_tty_fg_pgrp(ctty_idx);
+    } else if (type == 3) {
+      fg = pty_fg_pgrp(ctty_idx);
+    }
+
+    if (fg > 0) {
+      scheduler_kill_process_group(fg, SIGHUP);
+      scheduler_kill_process_group(fg, SIGCONT);
+    }
   }
 
   /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
@@ -1971,29 +2231,56 @@ void scheduler_exit_current(int exit_code) {
     panic("dead thread resumed");
   }
 
-  /* Close all open file descriptors with interrupts enabled, so writebacks can sleep/block */
-  if (current_task->fd_table) {
-    for (usize i = 0; i < current_task->fd_capacity; i++) {
-      if (current_task->fd_table[i]) {
-        vfs_close((int)i);
+  /* fd-table teardown, with interrupts enabled so writebacks can sleep.
+   * Drop our reference first: with CLONE_FILES threads still alive the table
+   * must survive — only the LAST user closes the handles and frees the
+   * arrays. The old unconditional close+kfree here freed the shared table
+   * out from under surviving sibling threads (use-after-free). */
+  {
+    int *fl = 0;
+    usize cap = 0;
+    struct vfs_handle **tbl = fdtable_release(current_task, &fl, &cap);
+    if (tbl) {
+      for (usize i = 0; i < cap; i++) {
+        if (tbl[i])
+          vfs_close_handle(tbl[i], (int)task_tgid(current_task));
       }
+      kfree(tbl);
+      kfree(fl);
     }
   }
 
   interrupts_disable();
 
+  /* Reparent children to init (task 1) and check for orphaned process groups.
+   * is_pgrp_orphaned ignores us (the exiting task) as a parent, so a group with
+   * several of our children is correctly judged orphaned even though some of
+   * those children have not been reparented yet in this loop (M46-2). */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *child = T(i);
+    if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
+      child->parent_id = 1;
+      usize pgid = child->process_group_id;
+      if (is_pgrp_orphaned(pgid, current_task)) {
+        int has_stopped = 0;
+        for (usize j = 0; j < g_task_hwm; j++) {
+          if (T(j)->state == TASK_STOPPED && T(j)->process_group_id == pgid) {
+            has_stopped = 1;
+            break;
+          }
+        }
+        if (has_stopped) {
+          scheduler_kill_process_group(pgid, SIGHUP);
+          scheduler_kill_process_group(pgid, SIGCONT);
+        }
+      }
+    }
+  }
+
   /* Free credentials */
   if (current_task->cred) {
     cred_free(current_task->cred);
     current_task->cred = 0;
-  }
-
-  if (current_task->fd_table) {
-    kfree(current_task->fd_table);
-    kfree(current_task->fd_flags);
-    current_task->fd_table = 0;
-    current_task->fd_flags = 0;
-    current_task->fd_capacity = 0;
   }
 
   aio_task_cleanup(current_task);
@@ -2054,12 +2341,15 @@ int scheduler_waitpid(usize pid, int *status, int options) {
   if (current_task == 0)
     return -ECHILD;
 
-  /* pid 0 ("any child in my process group") and pid -1 ("any child", which
-   * arrives as (usize)-1 from a userspace waitpid(-1, ...)) both mean "reap any
-   * child" in b1nix's flat process model. GNU Make's reap_children() relies on
-   * waitpid(-1, &status, WNOHANG); without the -1 case it matched no task and
-   * the syscall's -1 return was mapped to EPERM by the libc. */
-  int wait_any = (pid == 0 || pid == (usize)-1);
+  /* POSIX pid decoding: -1 = any child (GNU Make's reap_children() relies on
+   * waitpid(-1, ..., WNOHANG)); 0 = any child in the CALLER's process group;
+   * < -1 = any child of process group |pid|; > 0 = that specific child. */
+  int wait_any = (pid == (usize)-1);
+  usize wait_pgid = 0;
+  if (pid == 0)
+    wait_pgid = current_task->process_group_id;
+  else if ((isize)pid < -1)
+    wait_pgid = (usize)(-(isize)pid);
   int may_block = ((options & B1NIX_WNOHANG) == 0);
 
   while (1) {
@@ -2093,7 +2383,14 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     for (usize i = 0; i < g_task_hwm; i++) {
       if (T(i)->state != TASK_UNUSED &&
           T(i)->parent_id == current_task->id) {
-        if (wait_any || T(i)->id == pid) {
+        int match;
+        if (wait_any)
+          match = 1;
+        else if (wait_pgid)
+          match = (T(i)->process_group_id == wait_pgid);
+        else
+          match = (T(i)->id == pid);
+        if (match) {
           has_children = 1;
 
           /* F1 (M28): atomic CAS DEAD -> REAPING so only one CPU drives the
@@ -2130,6 +2427,10 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 
             int code = T(i)->exit_code;
             int child_id = T(i)->id;
+            /* Accumulate child times in parent */
+            usize p_idx = task_index(current_task);
+            g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
+            g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
             if (T(i)->user_image) {
               user_image_free(T(i)->user_image);
               T(i)->user_image = 0;
@@ -2148,11 +2449,25 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             } else {
               T(i)->vma_list = 0;
             }
-            if (T(i)->fd_table &&
-                fdtable_other_refs(T(i)->fd_table, T(i)) > 0) {
-              T(i)->fd_table = 0;
-              T(i)->fd_flags = 0;
-              T(i)->fd_capacity = 0;
+            /* Normally a no-op: the child's exit path already closed and
+             * detached its table. A live table here means we reaped a
+             * CLONE_FILES sibling that was the last user of the shared
+             * table — close + free it on its behalf (IRQs back on: the
+             * writeback in vfs_close_handle can sleep). */
+            {
+              int *fl = 0;
+              usize cap = 0;
+              struct vfs_handle **tbl = fdtable_release(T(i), &fl, &cap);
+              if (tbl) {
+                interrupts_enable();
+                for (usize j = 0; j < cap; j++) {
+                  if (tbl[j])
+                    vfs_close_handle(tbl[j], (int)task_tgid(T(i)));
+                }
+                kfree(tbl);
+                kfree(fl);
+                interrupts_disable();
+              }
             }
             if (T(i)->name && strcmp(T(i)->name, "boot") != 0) {
               kfree((void *)T(i)->name);
@@ -2164,11 +2479,12 @@ int scheduler_waitpid(usize pid, int *status, int options) {
             interrupts_enable();
             free_task_slot(T(i));
             if (status) {
-              if (code >= 128 && code < 128 + NSIG) {
+              if (code & TASK_EXIT_SIGNALED) {
                 /* Task was killed by a signal */
-                *status = (code - 128) & 0x7F;
+                *status = code & 0x7F;
               } else {
-                /* Normal exit */
+                /* Normal exit — exit(128..158) must NOT read as a signal
+                 * death, so the encoding is a flag bit, not a value range. */
                 *status = (code & 0xFF) << 8;
               }
             }
@@ -2230,6 +2546,228 @@ int scheduler_waitpid(usize pid, int *status, int options) {
     }
 
     interrupts_enable();
+  }
+}
+
+int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
+  if (current_task == 0)
+    return -ECHILD;
+  if (!infop)
+    return -EFAULT;
+  if (idtype != P_ALL && idtype != P_PID && idtype != P_PGID)
+    return -EINVAL;
+  if (idtype == P_PID && id == 0)
+    return -EINVAL;
+
+  const int allowed = B1NIX_WNOHANG | B1NIX_WSTOPPED | B1NIX_WEXITED |
+                      B1NIX_WCONTINUED | B1NIX_WNOWAIT;
+  if ((options & ~allowed) != 0 ||
+      (options & (B1NIX_WSTOPPED | B1NIX_WEXITED |
+                  B1NIX_WCONTINUED)) == 0)
+    return -EINVAL;
+  if (idtype == P_PGID && id == 0)
+    id = current_task->process_group_id;
+
+  int may_block = ((options & B1NIX_WNOHANG) == 0);
+
+  while (1) {
+    interrupts_disable();
+    if (may_block) {
+      if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+        current_task->state = TASK_RUNNING;
+      }
+      current_task->stack_released = 0;
+      __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+      __atomic_thread_fence(__ATOMIC_SEQ_CST);
+    }
+
+    int has_children = 0;
+    for (usize i = 0; i < g_task_hwm; i++) {
+      struct task *child = T(i);
+      if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
+        int match = 0;
+        if (idtype == P_ALL) {
+          match = 1;
+        } else if (idtype == P_PID) {
+          match = (child->id == id);
+        } else if (idtype == P_PGID) {
+          match = (child->process_group_id == id);
+        }
+
+        if (match) {
+          has_children = 1;
+
+          /* Check exited child */
+          if ((options & B1NIX_WEXITED) && child->state == TASK_DEAD) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            int code = child->exit_code;
+            if (code & TASK_EXIT_SIGNALED) {
+              info.si_code = 2; /* CLD_KILLED */
+              info.si_status = code & 0x7F;
+            } else {
+              info.si_code = 1; /* CLD_EXITED */
+              info.si_status = code & 0xFF;
+            }
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              /* Perform actual reap */
+              enum task_state _expected = TASK_DEAD;
+              if (__atomic_compare_exchange_n(&child->state, &_expected,
+                                              TASK_REAPING, 0,
+                                              __ATOMIC_ACQUIRE,
+                                              __ATOMIC_RELAXED)) {
+                while (!__atomic_load_n(&child->stack_released, __ATOMIC_ACQUIRE)) {
+                  __asm__ volatile("pause");
+                  tlb_shootdown_poll();
+                }
+
+                usize p_idx = task_index(current_task);
+                g_task_cutime[p_idx] += g_task_utime[i] + g_task_cutime[i];
+                g_task_cstime[p_idx] += g_task_stime[i] + g_task_cstime[i];
+
+                if (child->user_image) {
+                  user_image_free(child->user_image);
+                  child->user_image = 0;
+                }
+                u64 last_pml4 = mm_release_user(child);
+                if (last_pml4) {
+                  child->pml4_phys = last_pml4;
+                  user_address_space_cleanup(child);
+                  paging_free_address_space(last_pml4);
+                  child->pml4_phys = 0;
+                } else {
+                  child->vma_list = 0;
+                }
+                {
+                  int *fl = 0;
+                  usize cap = 0;
+                  struct vfs_handle **tbl = fdtable_release(child, &fl, &cap);
+                  if (tbl) {
+                    interrupts_enable();
+                    for (usize j = 0; j < cap; j++) {
+                      if (tbl[j])
+                        vfs_close_handle(tbl[j], (int)task_tgid(child));
+                    }
+                    kfree(tbl);
+                    kfree(fl);
+                    interrupts_disable();
+                  }
+                }
+                if (child->name && strcmp(child->name, "boot") != 0) {
+                  kfree((void *)child->name);
+                  child->name = 0;
+                }
+                kfree(child->stack);
+                if (may_block)
+                  scheduler_waitpid_fast_return();
+                interrupts_enable();
+                free_task_slot(child);
+
+                if (infop) {
+                  if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                    return -EFAULT;
+                  }
+                }
+                return 0;
+              } else {
+                continue;
+              }
+            } else {
+              if (may_block)
+                scheduler_waitpid_fast_return();
+              interrupts_enable();
+              if (infop) {
+                if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                  return -EFAULT;
+                }
+              }
+              return 0;
+            }
+          }
+
+          /* Check stopped child */
+          if ((options & B1NIX_WSTOPPED) && child->state == TASK_STOPPED && child->stop_report_pending) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_code = 5; /* CLD_STOPPED */
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            info.si_status = child->last_stop_signal;
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              child->stop_report_pending = 0;
+            }
+            if (may_block)
+              scheduler_waitpid_fast_return();
+            interrupts_enable();
+            if (infop) {
+              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                return -EFAULT;
+              }
+            }
+            return 0;
+          }
+
+          /* Check continued child */
+          if ((options & B1NIX_WCONTINUED) && child->continued_report_pending) {
+            siginfo_t info;
+            memset(&info, 0, sizeof(info));
+            info.si_signo = SIGCHLD;
+            info.si_code = 6; /* CLD_CONTINUED */
+            info.si_pid = (int)child->id;
+            info.si_uid = child->cred ? (int)child->cred->uid : 0;
+            info.si_status = SIGCONT;
+
+            if (!(options & B1NIX_WNOWAIT)) {
+              child->continued_report_pending = 0;
+            }
+            if (may_block)
+              scheduler_waitpid_fast_return();
+            interrupts_enable();
+            if (infop) {
+              if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+                return -EFAULT;
+              }
+            }
+            return 0;
+          }
+        }
+      }
+    }
+
+    if (!has_children) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
+      interrupts_enable();
+      return -ECHILD;
+    }
+
+    if (options & B1NIX_WNOHANG) {
+      if (may_block)
+        scheduler_waitpid_fast_return();
+      interrupts_enable();
+      if (infop) {
+        siginfo_t info;
+        memset(&info, 0, sizeof(info));
+        if (syscall_copyout(infop, &info, sizeof(siginfo_t)) < 0) {
+          return -EFAULT;
+        }
+      }
+      return 0;
+    }
+
+    scheduler_yield();
+
+    if (wait_interrupted_by_signal()) {
+      current_task->state = TASK_RUNNING;
+      interrupts_enable();
+      return -ERESTARTSYS;
+    }
   }
 }
 
@@ -2367,6 +2905,37 @@ void scheduler_fd_table_init_current(void) {
   current_task->fd_lock = 0; /* reset lock for new table */
 }
 
+/* Publish a grown fd table to current_task AND every CLONE_FILES sibling that
+ * aliases the old allocation, then free the old arrays. The old code updated
+ * only current_task, leaving every sibling thread's fd_table pointing at the
+ * freed old arrays (use-after-free on their next fd op). Caller holds the
+ * shared fd_lock; the swap additionally takes g_mm_release_lock so an exiting
+ * sibling's fdtable_release cannot snapshot the old pointer mid-swap and read
+ * it after the kfree. */
+static void fdtable_publish_grown(struct vfs_handle **new_table, int *new_flags,
+                                  usize new_capacity) {
+  struct vfs_handle **old_table = current_task->fd_table;
+  int *old_flags = current_task->fd_flags;
+  u64 mmflags;
+  spin_lock_irqsave(&g_mm_release_lock, &mmflags);
+  for (usize ti = 0; ti < g_task_hwm; ti++) {
+    struct task *o = T(ti);
+    if (o == current_task || o->state == TASK_UNUSED)
+      continue;
+    if (o->fd_table == old_table) {
+      o->fd_table = new_table;
+      o->fd_flags = new_flags;
+      o->fd_capacity = new_capacity;
+    }
+  }
+  current_task->fd_table = new_table;
+  current_task->fd_flags = new_flags;
+  current_task->fd_capacity = new_capacity;
+  spin_unlock_irqrestore(&g_mm_release_lock, mmflags);
+  kfree(old_table);
+  kfree(old_flags);
+}
+
 int scheduler_fd_alloc(struct vfs_handle *handle) {
   if (!current_task || !handle)
     return -1;
@@ -2419,14 +2988,8 @@ int scheduler_fd_alloc(struct vfs_handle *handle) {
   memcpy(new_table, current_task->fd_table, current_task->fd_capacity * sizeof(struct vfs_handle *));
   memcpy(new_flags, current_task->fd_flags, current_task->fd_capacity * sizeof(int));
 
-  kfree(current_task->fd_table);
-  kfree(current_task->fd_flags);
-
-  current_task->fd_table = new_table;
-  current_task->fd_flags = new_flags;
-
   int allocated_fd = (int)current_task->fd_capacity;
-  current_task->fd_capacity = new_capacity;
+  fdtable_publish_grown(new_table, new_flags, new_capacity);
   current_task->fd_table[allocated_fd] = handle;
   current_task->fd_flags[allocated_fd] = 0;
 
@@ -2476,12 +3039,7 @@ int scheduler_fd_set(int fd, struct vfs_handle *handle) {
     memcpy(new_table, current_task->fd_table, current_task->fd_capacity * sizeof(struct vfs_handle *));
     memcpy(new_flags, current_task->fd_flags, current_task->fd_capacity * sizeof(int));
 
-    kfree(current_task->fd_table);
-    kfree(current_task->fd_flags);
-
-    current_task->fd_table = new_table;
-    current_task->fd_flags = new_flags;
-    current_task->fd_capacity = new_capacity;
+    fdtable_publish_grown(new_table, new_flags, new_capacity);
   }
 
   current_task->fd_table[fd] = handle;
@@ -2498,6 +3056,21 @@ int scheduler_fd_close(int fd) {
   current_task->fd_flags[fd] = 0;
   fd_lock_release();
   return 0;
+}
+
+/* Atomically fetch AND clear an fd slot. vfs_close needs the two as one
+ * critical section: a peek-then-clear pair lets two threads closing the same
+ * fd both retrieve the handle and both run the release path (double release /
+ * touch-after-free on the recycled handle). Exactly one caller gets non-NULL. */
+struct vfs_handle *scheduler_fd_take(int fd) {
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
+    return 0;
+  fd_lock_acquire();
+  struct vfs_handle *h = current_task->fd_table[fd];
+  current_task->fd_table[fd] = 0;
+  current_task->fd_flags[fd] = 0;
+  fd_lock_release();
+  return h;
 }
 
 int scheduler_fd_flags_get(int fd) {
@@ -2560,11 +3133,12 @@ static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
 
 int scheduler_kill(usize task_id, int sig) {
   if (sig < 0 || sig >= NSIG)
-    return -1;
+    return -EINVAL;
 
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED) {
+    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED &&
+        T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING) {
       /* Signal 0 is the POSIX existence/permission probe: the target was just
        * found alive, so report success without posting any signal. */
       if (sig == 0) {
@@ -2608,17 +3182,20 @@ int scheduler_kill(usize task_id, int sig) {
     }
   }
   interrupts_restore(flags);
-  return -1;
+  return -ESRCH;
 }
 
 int scheduler_kill_process_group(usize pgrp, int sig) {
-  if (sig < 0 || sig >= NSIG || pgrp == 0)
-    return -1;
+  if (sig < 0 || sig >= NSIG)
+    return -EINVAL;
+  if (pgrp == 0)
+    return -ESRCH;
 
   int sent = 0;
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
-    if (T(i)->state != TASK_UNUSED && T(i)->process_group_id == pgrp) {
+    if (T(i)->state != TASK_UNUSED && T(i)->state != TASK_DEAD &&
+        T(i)->state != TASK_REAPING && T(i)->process_group_id == pgrp) {
       /* Signal 0: existence probe only — the group has a live member, so
        * count it as found without posting anything. */
       if (sig == 0) {
@@ -2660,7 +3237,34 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
     }
   }
   interrupts_restore(flags);
-  return sent > 0 ? 0 : -1;
+  return sent > 0 ? 0 : -ESRCH;
+}
+
+/* POSIX kill(-1, sig): signal every process the caller may signal, except
+ * the caller itself and init (pid 1). Kernel threads (no user address
+ * space) are never targeted. */
+int scheduler_kill_all(int sig) {
+  if (sig < 0 || sig >= NSIG)
+    return -EINVAL;
+  int sent = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t->state == TASK_UNUSED || t->state == TASK_DEAD ||
+        t->state == TASK_REAPING)
+      continue;
+    if (t == current_task)
+      continue;
+    if (t->id == 1)
+      continue;
+    if (t->pml4_phys == 0)
+      continue; /* kernel thread */
+    if (task_is_thread(t))
+      continue; /* signal processes, not their CLONE_VM threads */
+    if (sig != 0)
+      scheduler_kill(t->id, sig);
+    sent++;
+  }
+  return sent > 0 ? 0 : -ESRCH;
 }
 
 int scheduler_sigaction(int sig, const struct sigaction *act,
@@ -2839,49 +3443,99 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
 
 /* ── Priority ── */
 
+/* The POSIX nice value lives in a side-table and deliberately does NOT map
+ * onto task->priority: pick_next_task is a strict highest-priority scan with
+ * a -1 floor and a default of 1, so writing "10 - nice" there made any task
+ * with nice > 9 permanently unschedulable once preempted (negative priority
+ * never beats the -1 floor — the M46 nice() hang), and any nice < 9 would
+ * starve every default task. The value round-trips per POSIX; biasing the
+ * cooperative scheduler with it is tracked as planned work. */
 int scheduler_set_priority(usize pid, int priority) {
   if (priority < -20 || priority > 19)
-    return -1;
+    return -EINVAL;
   interrupts_disable();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
-      T(i)->priority = 10 - priority; /* nice → internal (higher = better) */
+      g_task_nice[i] = priority;
       interrupts_enable();
       return 0;
     }
   }
   interrupts_enable();
-  return -1;
+  return -ESRCH;
 }
 
+/* Returns the Linux getpriority(2) kernel encoding 20 - nice (1..40, always
+ * positive) so a negative return unambiguously means an errno — a raw nice
+ * of e.g. -3 would otherwise collide with -ESRCH. The libc wrapper converts
+ * back to the POSIX -20..19 range. */
 int scheduler_get_priority(usize pid) {
   interrupts_disable();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
-      int p = 10 - T(i)->priority; /* internal → nice */
+      int nice_val = g_task_nice[i];
       interrupts_enable();
-      return p;
+      return 20 - nice_val;
     }
   }
   interrupts_enable();
-  return -1;
+  return -ESRCH;
 }
 
 /* ── Session / Process Group ── */
 
-usize scheduler_setsid(void) {
+isize scheduler_setsid(void) {
   if (!current_task)
-    return (usize)-1;
+    return -ESRCH;
   interrupts_disable();
   /* A process cannot be a process group leader to call setsid */
   if (current_task->process_group_id == current_task->id) {
     interrupts_enable();
-    return (usize)-1;
+    return -EPERM;
   }
   current_task->session_id = current_task->id;
   current_task->process_group_id = current_task->id;
+  usize idx = task_index(current_task);
+  g_task_ctty_type[idx] = 0;
+  g_task_ctty_index[idx] = 0;
   interrupts_enable();
-  return current_task->session_id;
+  return (isize)current_task->session_id;
+}
+
+void scheduler_get_ctty(int *type, int *index) {
+  if (!current_task) {
+    *type = 0;
+    *index = 0;
+    return;
+  }
+  u64 flags = interrupts_save();
+  usize session_id = current_task->session_id;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == session_id) {
+      *type = g_task_ctty_type[i];
+      *index = g_task_ctty_index[i];
+      interrupts_restore(flags);
+      return;
+    }
+  }
+  *type = 0;
+  *index = 0;
+  interrupts_restore(flags);
+}
+
+void scheduler_set_ctty(struct task *t, int type, int index) {
+  if (!t) return;
+  u64 flags = interrupts_save();
+  usize session_id = t->session_id;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == session_id) {
+      g_task_ctty_type[i] = type;
+      g_task_ctty_index[i] = index;
+      interrupts_restore(flags);
+      return;
+    }
+  }
+  interrupts_restore(flags);
 }
 
 isize scheduler_getsid(usize pid) {
@@ -2908,25 +3562,81 @@ usize scheduler_getpgrp(void) {
   return current_task->process_group_id;
 }
 
-int scheduler_setpgrp(usize pid, usize pgrp) {
+isize scheduler_getpgid(usize pid) {
+  if (!current_task)
+    return -ESRCH;
   if (pid == 0)
-    pid = current_task ? current_task->id : 0;
-  if (pgrp == 0)
-    pgrp = pid;
+    return (isize)current_task->process_group_id;
+  isize ret = -ESRCH;
   interrupts_disable();
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
-      if (T(i)->session_id != current_task->session_id) {
-        interrupts_enable();
-        return -EPERM;
-      }
-      T(i)->process_group_id = pgrp;
-      interrupts_enable();
-      return 0;
+      ret = (isize)T(i)->process_group_id;
+      break;
     }
   }
   interrupts_enable();
-  return -1;
+  return ret;
+}
+
+/* Called by the exec path once the new image is committed (see setpgid's
+ * EACCES rule and g_task_execed above). */
+void scheduler_mark_execed_current(void) {
+  if (current_task)
+    g_task_execed[task_index(current_task)] = 1;
+}
+
+int scheduler_setpgrp(usize pid, usize pgrp) {
+  if (!current_task)
+    return -ESRCH;
+  if ((isize)pgrp < 0)
+    return -EINVAL;
+  if (pid == 0)
+    pid = current_task->id;
+  if (pgrp == 0)
+    pgrp = pid;
+  int ret = -ESRCH; /* POSIX: pid is not the caller or a child of the caller */
+  interrupts_disable();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->state != TASK_UNUSED && T(i)->id == pid) {
+      struct task *t = T(i);
+      int is_self = (t == current_task);
+      if (!is_self && t->parent_id != current_task->id)
+        break; /* not the caller and not a child → ESRCH */
+      if (t->session_id != current_task->session_id) {
+        ret = -EPERM;
+        break;
+      }
+      if (t->id == t->session_id) {
+        ret = -EPERM; /* session leader's pgid is immutable */
+        break;
+      }
+      if (!is_self && g_task_execed[task_index(t)]) {
+        ret = -EACCES; /* child has already exec'd */
+        break;
+      }
+      if (pgrp != t->id) {
+        /* Joining an existing group: it must live in the caller's session. */
+        int found = 0;
+        for (usize j = 0; j < g_task_hwm; j++) {
+          if (T(j)->state != TASK_UNUSED && T(j)->process_group_id == pgrp &&
+              T(j)->session_id == current_task->session_id) {
+            found = 1;
+            break;
+          }
+        }
+        if (!found) {
+          ret = -EPERM;
+          break;
+        }
+      }
+      t->process_group_id = pgrp;
+      ret = 0;
+      break;
+    }
+  }
+  interrupts_enable();
+  return ret;
 }
 
 int scheduler_is_pgrp_in_session(usize pgrp, usize session_id) {
@@ -2966,14 +3676,14 @@ void scheduler_deliver_pending_signals(void) {
     sighandler_t handler = current_task->sigactions[sig - 1].sa_handler;
 
     if (sig == SIGKILL) {
-      /* SIGKILL — terminate immediately */
-      current_task->exit_code = 128 + SIGKILL;
-      /* See scheduler_exit_current — claim stack_released before DEAD. */
+      current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
+      terminate_group_siblings(current_task);
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
+      g_have_proc_zombies = 1;
+      post_sigchld_to_parent(current_task->parent_id, 0);
       scheduler_notify_wait_event(current_task->parent_id);
       return;
-      /* unreachable */
     }
 
     if (handler == SIG_IGN) {
@@ -3001,14 +3711,14 @@ void scheduler_deliver_pending_signals(void) {
       case SIGXFSZ:
       case SIGVTALRM:
       case SIGPROF:
-        /* Terminate */
-        current_task->exit_code = 128 + sig;
-        /* See scheduler_exit_current — claim stack_released before DEAD. */
+        current_task->exit_code = TASK_EXIT_SIGNALED | sig;
+        terminate_group_siblings(current_task);
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
+        g_have_proc_zombies = 1;
+        post_sigchld_to_parent(current_task->parent_id, 0);
         scheduler_notify_wait_event(current_task->parent_id);
         return;
-        /* unreachable */
       case SIGCONT:
         __atomic_fetch_and(&current_task->pending_signals,
                            ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
@@ -3062,4 +3772,3 @@ int scheduler_signal_pending(void) {
   }
   return 0;
 }
-

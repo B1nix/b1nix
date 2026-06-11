@@ -157,6 +157,10 @@ struct vfs_fs {
 
 u64 vfs_get_unix_time(void);
 void vfs_init(void);
+/* Sleeping mutex for filesystem-wide metadata (allocator bitmaps, superblock
+ * counters). Legal to hold across block I/O — never a spinlock. */
+void vfs_meta_lock_acquire(int *lock);
+void vfs_meta_lock_release(int *lock);
 void vfs_repopulate_after_root_mount(void);
 void vfs_resolve_path(const char *path, char *out);
 int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len);
@@ -179,6 +183,9 @@ isize vfs_read(int handle, char *buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
 int vfs_poll(int handle_idx, struct b1nix_pollfd *pfd);
 void vfs_close(int handle);
+/* Close a handle not (or no longer) reachable through an fd table. */
+struct vfs_handle;
+void vfs_close_handle(struct vfs_handle *h, int owner_pid);
 int vfs_create(const char *path, u32 mode);
 int vfs_mkdir(const char *path, u32 mode);
 isize vfs_list(const char *dir_path, const char **names, usize max_names);
@@ -230,6 +237,7 @@ int vfs_socket_push_udp(u16 local_port_net, const void *data, usize len);
 void pty_init(void);
 int pty_open_master(int flags);    /* opening /dev/ptmx */
 int pty_open_slave(int index, int flags); /* opening /dev/pts/N */
+usize pty_fg_pgrp(int idx);
 
 extern void *vfs_poll_chan;
 

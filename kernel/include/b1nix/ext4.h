@@ -153,6 +153,9 @@ struct ext4_fs {
     u32 journal_inum;
     struct ext2_inode journal_inode_cache;
     struct journal_dev *jdev;
+    /* Serializes the block/inode allocator bitmaps + superblock counters.
+     * Sleeping lock (vfs_meta_lock_*): the holder does block I/O. */
+    int alloc_lock;
 };
 
 struct ext4_inode_info {

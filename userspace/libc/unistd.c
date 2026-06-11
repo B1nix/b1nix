@@ -21,6 +21,7 @@
 #include <sys/sysinfo.h>
 #include <sys/times.h>
 #include <sys/xattr.h>
+#include <sys/wait.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -907,6 +908,10 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
   return _check_err(syscall(SYS_WAITPID, pid, wstatus, options));
 }
 
+int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options) {
+  return _check_err(syscall(SYS_WAITID, (long)idtype, (long)id, infop, options));
+}
+
 /* b1nix runs as root and has no login/passwd database; report "root" so tilde
  * (~) expansion in GNU Make's glob resolves to root's home. */
 char *getlogin(void) {
@@ -944,6 +949,63 @@ gid_t getegid(void) {
 
 int setpgid(pid_t pid, pid_t pgid) {
   return _check_err(syscall(SYS_SETPGRP, pid, pgid));
+}
+
+pid_t getpgid(pid_t pid) {
+  return _check_err(syscall(SYS_GETPGID, pid));
+}
+
+int setreuid(uid_t ruid, uid_t euid) {
+  return _check_err(syscall(SYS_SETREUID, ruid, euid));
+}
+
+int setregid(gid_t rgid, gid_t egid) {
+  return _check_err(syscall(SYS_SETREGID, rgid, egid));
+}
+
+int setresuid(uid_t ruid, uid_t euid, uid_t suid) {
+  return _check_err(syscall(SYS_SETRESUID, ruid, euid, suid));
+}
+
+int setresgid(gid_t rgid, gid_t egid, gid_t sgid) {
+  return _check_err(syscall(SYS_SETRESGID, rgid, egid, sgid));
+}
+
+int getrusage(int who, struct rusage *usage) {
+  return _check_err(syscall(SYS_GETRUSAGE, who, usage));
+}
+
+/* The kernel returns getpriority(2)'s Linux encoding 20 - nice (always
+ * positive) so errnos stay unambiguous; convert back to POSIX -20..19. */
+int getpriority(int which, id_t who) {
+  (void)which; /* PRIO_PROCESS only */
+  long rc = syscall(SYS_GETPRIORITY, who);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 20 - (int)rc;
+}
+
+int setpriority(int which, id_t who, int prio) {
+  (void)which; /* PRIO_PROCESS only */
+  return _check_err(syscall(SYS_SETPRIORITY, who, prio));
+}
+
+int nice(int incr) {
+  long rc = syscall(SYS_GETPRIORITY, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  int next = (20 - (int)rc) + incr;
+  if (next < -20)
+    next = -20;
+  if (next > 19)
+    next = 19;
+  if (setpriority(PRIO_PROCESS, 0, next) < 0)
+    return -1;
+  return next;
 }
 
 #define B1NIX_TIOCGPGRP 0x540F
@@ -1389,20 +1451,12 @@ long sysconf(int name) {
 }
 
 clock_t times(struct tms *buf) {
-  if (buf) {
-    buf->tms_utime = 0;
-    buf->tms_stime = 0;
-    buf->tms_cutime = 0;
-    buf->tms_cstime = 0;
-  }
-
-  struct timeval tv;
-  if (gettimeofday(&tv, NULL) < 0) {
+  long rc = syscall(SYS_TIMES, buf);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
     return (clock_t)-1;
   }
-
-  return (clock_t)tv.tv_sec * sysconf(_SC_CLK_TCK) +
-         (clock_t)((tv.tv_usec * sysconf(_SC_CLK_TCK)) / 1000000);
+  return (clock_t)rc;
 }
 
 pid_t vfork(void) {

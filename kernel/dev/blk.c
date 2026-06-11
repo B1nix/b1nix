@@ -454,14 +454,18 @@ void blk_cache_init(void) {
 }
 
 static struct block_buffer *bcache_find(struct block_device *dev, u64 lba) {
-  /* O(chain-length) lookup via the (bdev, lba)-keyed hash table. The hash
-   * is filled on cache fill / evict so stale (invalid) entries don't linger
-   * in chains — but defensively skip any whose flags say invalid. */
+  /* O(chain-length) lookup via the (bdev, lba)-keyed hash table. Matches both
+   * VALID entries and in-progress BUSY entries: a slot mid-fill or mid-eviction
+   * is hash-linked under its key so a concurrent miss on the same key finds it
+   * and waits, instead of evicting a second slot and creating a DUPLICATE entry
+   * for one (dev,lba) — the F2 stale-data bug. Callers must therefore check
+   * BLK_CACHE_BUSY before reading the data. */
   u32 h = bcache_bucket(dev, lba);
   i32 idx = bcache_hash[h];
   while (idx >= 0) {
     struct block_buffer *e = &block_cache[idx];
-    if ((e->flags & BLK_CACHE_VALID) && e->bdev == dev && e->block_no == lba) {
+    if ((e->flags & (BLK_CACHE_VALID | BLK_CACHE_BUSY)) &&
+        e->bdev == dev && e->block_no == lba) {
       e->last_used = ++bcache_tick;
       return e;
     }
@@ -550,6 +554,13 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       struct block_buffer *entry = bcache_find(dev, current_lba);
 
       if (entry) {
+        /* In-progress (mid-fill or mid-eviction): wait, don't read garbage or
+         * spawn a duplicate. */
+        if (entry->flags & BLK_CACHE_BUSY) {
+          bcache_release(flags);
+          scheduler_yield();
+          continue;
+        }
         memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
         bcache_release(flags);
         break;
@@ -561,16 +572,30 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
         scheduler_yield(); /* all slots in-flight; let a filler finish */
         continue;
       }
+      /* bcache_evict may have dropped the lock for a dirty write-back; another
+       * CPU could have filled this key meanwhile. Re-check and, if so, abandon
+       * our (now free/invalid) slot and retry to use the winner. */
+      if (bcache_find(dev, current_lba)) {
+        bcache_release(flags);
+        continue;
+      }
       entry->bdev = dev;
       entry->block_no = current_lba;
-      /* Claim the slot for our lock-free DMA so no other CPU reuses it. */
+      /* Claim the slot AND publish it in the hash as in-progress (BUSY, not yet
+       * VALID) BEFORE dropping the lock for the DMA, so a concurrent miss on
+       * the same key finds it via bcache_find and waits instead of filling a
+       * second slot. */
       entry->flags |= BLK_CACHE_BUSY;
+      entry->flags &= ~(BLK_CACHE_VALID | BLK_CACHE_DIRTY);
+      bcache_hash_insert((i32)(entry - block_cache));
       bcache_release(flags);
 
       int rc = dev->read_blocks(dev, current_lba, 1, entry->data);
       if (rc < 0) {
         flags = bcache_acquire();
-        entry->flags &= ~BLK_CACHE_BUSY; /* release the slot on error */
+        /* Unpublish the failed in-progress slot and free it. */
+        bcache_hash_remove((i32)(entry - block_cache));
+        entry->flags &= ~(BLK_CACHE_BUSY | BLK_CACHE_VALID);
         bcache_release(flags);
         console_write("blk_read_cached: read_blocks failed for ");
         console_write(dev->name);
@@ -583,9 +608,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       entry->flags |= BLK_CACHE_VALID;
       entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
       entry->last_used = ++bcache_tick;
-      /* Link this freshly-filled slot into its (bdev, block_no) hash bucket
-       * so subsequent bcache_find lookups for the same key are O(chain). */
-      bcache_hash_insert((i32)(entry - block_cache));
+      /* Already hash-linked (as BUSY) before the DMA. */
       memcpy(buf8 + i * CACHE_BLOCK_SIZE, entry->data, CACHE_BLOCK_SIZE);
       bcache_release(flags);
       break;
@@ -632,11 +655,24 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
           scheduler_yield();
           continue;
         }
-        entry->bdev = dev;
-        entry->block_no = current_lba;
-        entry->flags |= BLK_CACHE_VALID;
-        entry->last_used = ++bcache_tick;
-        bcache_hash_insert((i32)(entry - block_cache));
+        /* bcache_evict may have dropped the lock for a write-back; re-check
+         * for a concurrently-filled entry to avoid a duplicate (dev,lba). */
+        struct block_buffer *raced = bcache_find(dev, current_lba);
+        if (raced) {
+          if (raced->flags & BLK_CACHE_BUSY) {
+            bcache_release(flags);
+            scheduler_yield();
+            continue;
+          }
+          entry = raced; /* our evicted slot stays free; write into the winner */
+        } else {
+          entry->bdev = dev;
+          entry->block_no = current_lba;
+          entry->flags |= BLK_CACHE_VALID;
+          entry->flags &= ~BLK_CACHE_BUSY;
+          entry->last_used = ++bcache_tick;
+          bcache_hash_insert((i32)(entry - block_cache));
+        }
       }
 
       /* The whole fill happens under the lock (no yielding DMA), so no BUSY

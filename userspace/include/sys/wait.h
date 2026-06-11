@@ -2,6 +2,13 @@
 #define B1NIX_SYS_WAIT_H
 
 #include <sys/types.h>
+#include <signal.h>
+
+typedef enum {
+  P_ALL = 0,
+  P_PID = 1,
+  P_PGID = 2
+} idtype_t;
 
 #ifdef __cplusplus
 extern "C" {
@@ -9,6 +16,7 @@ extern "C" {
 
 pid_t wait(int *wstatus);
 pid_t waitpid(pid_t pid, int *wstatus, int options);
+int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
 
 #ifdef __cplusplus
 }
@@ -16,7 +24,10 @@ pid_t waitpid(pid_t pid, int *wstatus, int options);
 
 #define WNOHANG 1
 #define WUNTRACED 2
+#define WSTOPPED 2
+#define WEXITED 4
 #define WCONTINUED 8
+#define WNOWAIT 0x01000000
 
 #define WIFEXITED(status)   (((status) & 0x7f) == 0)
 #define WEXITSTATUS(status) (((status) >> 8) & 0xff)

@@ -137,16 +137,34 @@ int loop_ioctl(struct vfs_node *node, u64 request, void *arg) {
   case 0x4C00: { /* LOOP_SET_FD: arg is the backing file descriptor */
     int backing_fd = (int)(usize)arg;
     struct vfs_handle *h = scheduler_fd_get(backing_fd);
-    if (!h || !h->node)
+    if (!h || !h->node || !h->node->inode)
       return -EBADF;
-    lo->backing_node = h->node;
+    /* Only a regular file may back a loop device — a device node (especially
+     * the loop's own /dev/loopN) would recurse loop_read_blocks → blkdev read
+     * → loop_read_blocks into a stack overflow; a pipe/tty would block inside
+     * the block layer. */
+    if (h->node->inode->type != VFS_FILE)
+      return -EINVAL;
+    if (lo->backing_node)
+      return -EBUSY; /* already associated — CLR_FD first */
+    /* Pin the backing node: the setup process's fd will be closed (and the
+     * file may be unlinked) while the loop device lives on. Without this ref
+     * loop_read_blocks would dereference a freed node (UAF). */
+    lo->backing_node = vfs_node_get(h->node);
     lo->bdev.block_count = (h->node->inode->size + 511) / 512;
+    /* Drop any cached blocks keyed to this bdev from a previous association. */
+    blk_cache_invalidate(&lo->bdev);
     return 0;
   }
-  case 0x4C01: /* LOOP_CLR_FD */
+  case 0x4C01: { /* LOOP_CLR_FD */
+    struct vfs_node *old = lo->backing_node;
     lo->backing_node = 0;
     lo->bdev.block_count = 0;
+    blk_cache_invalidate(&lo->bdev);
+    if (old)
+      vfs_node_put(old);
     return 0;
+  }
   case 0x4C03: /* LOOP_GET_STATUS */
   case 0x4C05: /* LOOP_GET_STATUS64 */
     return lo->backing_node ? 0 : -ENXIO;

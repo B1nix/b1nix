@@ -204,6 +204,85 @@ int cred_set_gid(struct cred *cred, u16 gid)
     return 0;
 }
 
+/* POSIX setreuid(): -1 leaves a field unchanged. Non-privileged callers may
+ * set the real uid to {uid, euid} and the effective uid to {uid, euid, suid}.
+ * If the real uid is set, or the effective uid is set to a value different
+ * from the old real uid, the saved set-user-ID takes the new effective uid. */
+int cred_setreuid(struct cred *cred, int ruid, int euid)
+{
+    if (!cred) return -1;
+    int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
+    u16 old_uid = cred->uid;
+    if (ruid != -1 && !priv &&
+        (u16)ruid != cred->uid && (u16)ruid != cred->euid)
+        return -1;
+    if (euid != -1 && !priv &&
+        (u16)euid != cred->uid && (u16)euid != cred->euid &&
+        (u16)euid != cred->suid)
+        return -1;
+    if (ruid != -1) cred->uid = (u16)ruid;
+    if (euid != -1) cred->euid = (u16)euid;
+    if (ruid != -1 || (euid != -1 && (u16)euid != old_uid))
+        cred->suid = cred->euid;
+    return 0;
+}
+
+/* POSIX setregid() — mirror of cred_setreuid for the group ids. */
+int cred_setregid(struct cred *cred, int rgid, int egid)
+{
+    if (!cred) return -1;
+    int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
+    u16 old_gid = cred->gid;
+    if (rgid != -1 && !priv &&
+        (u16)rgid != cred->gid && (u16)rgid != cred->egid)
+        return -1;
+    if (egid != -1 && !priv &&
+        (u16)egid != cred->gid && (u16)egid != cred->egid &&
+        (u16)egid != cred->sgid)
+        return -1;
+    if (rgid != -1) cred->gid = (u16)rgid;
+    if (egid != -1) cred->egid = (u16)egid;
+    if (rgid != -1 || (egid != -1 && (u16)egid != old_gid))
+        cred->sgid = cred->egid;
+    return 0;
+}
+
+int cred_setresuid(struct cred *cred, int ruid, int euid, int suid)
+{
+    if (!cred) return -1;
+    int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETUID));
+    if (!priv) {
+        if (ruid != -1 && (u16)ruid != cred->uid && (u16)ruid != cred->euid && (u16)ruid != cred->suid)
+            return -1;
+        if (euid != -1 && (u16)euid != cred->uid && (u16)euid != cred->euid && (u16)euid != cred->suid)
+            return -1;
+        if (suid != -1 && (u16)suid != cred->uid && (u16)suid != cred->euid && (u16)suid != cred->suid)
+            return -1;
+    }
+    if (ruid != -1) cred->uid = (u16)ruid;
+    if (euid != -1) cred->euid = (u16)euid;
+    if (suid != -1) cred->suid = (u16)suid;
+    return 0;
+}
+
+int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
+{
+    if (!cred) return -1;
+    int priv = (cred->euid == ROOT_UID || cred_has_cap(cred, CAP_SETGID));
+    if (!priv) {
+        if (rgid != -1 && (u16)rgid != cred->gid && (u16)rgid != cred->egid && (u16)rgid != cred->sgid)
+            return -1;
+        if (egid != -1 && (u16)egid != cred->gid && (u16)egid != cred->egid && (u16)egid != cred->sgid)
+            return -1;
+        if (sgid != -1 && (u16)sgid != cred->gid && (u16)sgid != cred->egid && (u16)sgid != cred->sgid)
+            return -1;
+    }
+    if (rgid != -1) cred->gid = (u16)rgid;
+    if (egid != -1) cred->egid = (u16)egid;
+    if (sgid != -1) cred->sgid = (u16)sgid;
+    return 0;
+}
+
 int cred_set_egid(struct cred *cred, u16 egid)
 {
     if (!cred) return -1;

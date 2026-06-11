@@ -66,6 +66,10 @@ int raise(int sig);
 typedef struct {
     int si_signo;
     int si_code;
+    int si_errno;
+    int si_pid;
+    int si_uid;
+    int si_status;
 } siginfo_t;
 
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,

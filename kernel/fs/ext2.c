@@ -112,6 +112,8 @@ static int ext2_write_inode(struct ext2_fs *fs, u32 inode_num, const struct ext2
 }
 
 static u32 ext2_alloc_block(struct ext2_fs *fs) {
+  /* Bitmap+superblock RMW must be atomic per fs — see ext4_alloc_block_tx. */
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 groups = (fs->sb.s_blocks_count + fs->sb.s_blocks_per_group - 1) /
                fs->sb.s_blocks_per_group;
 	for (u32 g = 0; g < groups; g++) {
@@ -142,18 +144,21 @@ static u32 ext2_alloc_block(struct ext2_fs *fs) {
 					memset(zero_block, 0, fs->block_size);
 					ext2_write_block(fs, block_num, zero_block);
 					kfree(zero_block);
-					
+
+					vfs_meta_lock_release(&fs->alloc_lock);
 					return block_num;
 				}
 			}
 			kfree(bitmap);
 		}
 	}
+	vfs_meta_lock_release(&fs->alloc_lock);
 	return 0;
 }
 
 static void ext2_free_block(struct ext2_fs *fs, u32 block_num) {
   if (block_num == 0) return;
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 g = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) / fs->sb.s_blocks_per_group;
   u32 i = (block_num - (fs->sb.s_log_block_size == 0 ? 1 : 0)) % fs->sb.s_blocks_per_group;
 
@@ -162,6 +167,7 @@ static void ext2_free_block(struct ext2_fs *fs, u32 block_num) {
   u8 *bitmap = kmalloc(fs->block_size);
   if (ext2_read_block(fs, bgd.bg_block_bitmap, bitmap) < 0) {
     kfree(bitmap);
+    vfs_meta_lock_release(&fs->alloc_lock);
     return;
   }
   bitmap[i / 8] &= ~(1 << (i % 8));
@@ -172,10 +178,12 @@ static void ext2_free_block(struct ext2_fs *fs, u32 block_num) {
   ext2_write_bgd(fs, g, &bgd);
   fs->sb.s_free_blocks_count++;
   fs->bitmaps_dirty = 1;
+  vfs_meta_lock_release(&fs->alloc_lock);
 }
 
 static void ext2_free_inode(struct ext2_fs *fs, u32 inode_num) {
   if (inode_num == 0) return;
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 g = (inode_num - 1) / fs->inodes_per_group;
   u32 i = (inode_num - 1) % fs->inodes_per_group;
 
@@ -184,6 +192,7 @@ static void ext2_free_inode(struct ext2_fs *fs, u32 inode_num) {
   u8 *bitmap = kmalloc(fs->block_size);
   if (ext2_read_block(fs, bgd.bg_inode_bitmap, bitmap) < 0) {
     kfree(bitmap);
+    vfs_meta_lock_release(&fs->alloc_lock);
     return;
   }
   bitmap[i / 8] &= ~(1 << (i % 8));
@@ -194,9 +203,11 @@ static void ext2_free_inode(struct ext2_fs *fs, u32 inode_num) {
   ext2_write_bgd(fs, g, &bgd);
   fs->sb.s_free_inodes_count++;
   fs->bitmaps_dirty = 1;
+  vfs_meta_lock_release(&fs->alloc_lock);
 }
 
 static u32 ext2_alloc_inode(struct ext2_fs *fs) {
+  vfs_meta_lock_acquire(&fs->alloc_lock);
   u32 groups = (fs->sb.s_inodes_count + fs->inodes_per_group - 1) /
                fs->inodes_per_group;
 	for (u32 g = 0; g < groups; g++) {
@@ -225,13 +236,15 @@ static u32 ext2_alloc_inode(struct ext2_fs *fs) {
 					struct ext2_inode new_inode;
 					memset(&new_inode, 0, sizeof(new_inode));
 					ext2_write_inode(fs, inode_num, &new_inode);
-					
+
+					vfs_meta_lock_release(&fs->alloc_lock);
 					return inode_num;
 				}
 			}
 			kfree(bitmap);
 		}
 	}
+	vfs_meta_lock_release(&fs->alloc_lock);
 	return 0;
 }
 
@@ -1117,8 +1130,48 @@ static int ext2_vfs_rename(struct vfs_node *old_dir, const char *old_name,
  
   if (ext2_add_dir_entry(fs, new_dir_inode_num, inode_num, new_name, type) < 0)
     return -EIO;
-  
+
   ext2_remove_dir_entry(fs, old_dir_inode_num, old_name);
+
+  if (type == EXT2_FT_DIR && old_dir_inode_num != new_dir_inode_num) {
+    /* Directory moved to a different parent: rewrite its ".." entry and move
+     * the back-link between the parents' link counts (see ext4_vfs_rename). */
+    struct ext2_inode mdi;
+    if (ext2_read_inode(fs, inode_num, &mdi) == 0) {
+      u8 *db = kmalloc(fs->block_size);
+      u32 mblocks = (mdi.i_size + fs->block_size - 1) / fs->block_size;
+      int rewrote = 0;
+      for (u32 b = 0; b < mblocks && !rewrote && db; b++) {
+        u32 phys = ext2_get_inode_block(fs, &mdi, b);
+        if (!phys) continue;
+        ext2_read_block(fs, phys, db);
+        usize off = 0;
+        while (off < fs->block_size) {
+          struct ext2_dir_entry *e = (struct ext2_dir_entry *)(db + off);
+          if (e->rec_len == 0) break;
+          if (e->inode != 0 && e->name_len == 2 && e->name[0] == '.' &&
+              e->name[1] == '.') {
+            e->inode = new_dir_inode_num;
+            ext2_write_block(fs, phys, db);
+            rewrote = 1;
+            break;
+          }
+          off += e->rec_len;
+        }
+      }
+      if (db) kfree(db);
+    }
+    struct ext2_inode pdi;
+    if (ext2_read_inode(fs, old_dir_inode_num, &pdi) == 0 &&
+        pdi.i_links_count > 2) {
+      pdi.i_links_count--;
+      ext2_write_inode(fs, old_dir_inode_num, &pdi);
+    }
+    if (ext2_read_inode(fs, new_dir_inode_num, &pdi) == 0) {
+      pdi.i_links_count++;
+      ext2_write_inode(fs, new_dir_inode_num, &pdi);
+    }
+  }
   return 0;
 }
 

@@ -38,6 +38,10 @@ int page_cache_flush_inode(struct vfs_inode *inode);
 // Drop cached pages for an inode that is being destroyed.
 void page_cache_invalidate_inode(struct vfs_inode *inode);
 
+// Truncate-time invalidation: drop pages at/after new_size and zero the tail
+// of the partial page so a later re-grow reads zeros, not stale contents.
+void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size);
+
 // Decrease refcount. If 0, page is eligible for eviction (stays in cache).
 void page_cache_put_page(struct page_cache_entry *page);
 

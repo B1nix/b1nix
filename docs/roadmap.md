@@ -467,3 +467,76 @@ Source-level ports remain preferable to a Linux compatibility layer.
   `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
 - Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` +
   `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.
+
+## M46: VFS Integrity and POSIX Process Conformance
+
+A corruption-focused VFS audit plus a POSIX process-management gap audit;
+findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
+
+- [x] Lock the ext4/ext2 block & inode allocators (per-fs sleeping mutex) —
+  fixes cross-file block double-allocation under parallel writes.
+- [x] Make O_APPEND sample the file size under the inode lock (no lost
+  concurrent appends) and make truncate drop/zero stale page-cache pages.
+- [x] Fix the shared fd-table lifecycle: last-user close+free under
+  `g_mm_release_lock`, shared fd_lock for CLONE_FILES siblings, pointer
+  propagation on table growth, atomic fetch-and-clear in `close()`.
+- [x] Fix rename link-count leak and cross-parent directory `..` rewriting
+  (ext4 + ext2); lock `vfs_mount` slot claim; fix `vfs_link` error-path
+  refcount.
+- [x] Separate exit-status from signal-death encoding (`exit(139)` no longer
+  reads as SIGSEGV); fix `kill(0)`/`kill(-1)` targets; `waitpid(-pgid)` and
+  `waitpid(0)` group waits; ESRCH/EINVAL errnos; full `setpgid` POSIX rules;
+  fork inherits the blocked-signal mask.
+- [x] Add `getpgid`, `nice`/`getpriority`/`setpriority`, `setreuid`/
+  `setregid`, and in-kernel `#!` interpreter execution.
+- [x] Add `exit_group` semantics (process exit terminates all threads).
+- [x] Add controlling-terminal linkage (`setsid` ctty detach) and
+  orphaned-process-group SIGHUP+SIGCONT.
+- [x] Add per-task CPU accounting for `times()`/`getrusage`;
+  `setresuid`/`setresgid`; `waitid`.
+- [x] Make the nice value bias the cooperative scheduler
+  (it round-trips via a side-table; mapping it onto the strict-priority
+  `pick_next_task` scan starves tasks — see the audit doc).
+
+### Open hardening (second-round audit — Part 3 of the audit doc)
+
+A follow-up SMP/lifetime sweep of the subsystems outside the VFS/process core
+found further real bugs, none yet fixed. Ordered by severity; details and
+mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
+
+- [x] `bug` **filelock has no lock at all** (FL-1, critical) — FIXED: global
+  spinlock around file_locks[] (dropped before the F_SETLKW sleep), NULL-checked
+  alloc, and lock ownership keyed by the process tgid so a CLONE_FILES thread's
+  locks release at fd-table teardown (FL-3).
+- [x] `bug` **`terminate_group_siblings` resurrects DEAD/REAPING siblings**
+  (M46-1, high) — FIXED: per-state CAS instead of a plain store. — plain `state = READY` store instead of a CAS; UAF/double-run
+  under CLONE_THREAD on APs. Regression in the exit_group code.
+- [x] `bug` **UNIX-socket peer back-pointer UAF** (F1-unix, high) — FIXED:
+  refcounted unix_socket_data; peer links + backlog slots are counted refs,
+  send/poll pin the peer while using it, close tears the link + marks the peer
+  disconnected.
+- [x] `bug` **concurrent journal transactions corrupt heap + on-disk journal**
+  (F1-journal, high) — FIXED: a global sleeping mutex serializes whole
+  transactions (start→commit/abort), removing the handles[]/s_start races.
+- [x] `bug` **block cache keeps two valid entries per (dev,lba)** (F2-blk, high)
+  — FIXED: re-find after evict, and a BUSY in-progress entry is hash-published
+  before the DMA so concurrent misses wait instead of filling a duplicate.
+- [x] `bug` **xattr list mutated/walked with no inode lock** (X-1, high) —
+  FIXED: inode write-lock for set/remove, read-lock for get/list.
+- [x] `bug` **`page_cache_flush_inode` races truncate's in-place zeroing**
+  (PC-1, medium-high) — FIXED: fsync/close hold the inode lock across the flush.
+- [x] `bug` **loop device stores backing node with no `vfs_node_get`** (F4-loop,
+  medium) — FIXED: SET_FD pins the node + rejects non-regular files; CLR_FD
+  releases it; block cache invalidated on swap.
+- [x] `bug` **icache stores raw `vfs_inode*` with no reference** (IC-1, medium,
+  latent) — FIXED (dangling pointer): vfs_inode_put invalidates the icache entry
+  before freeing the inode; full reference-pinning still deferred.
+- [x] `bug` **orphaned-pgrp false-negative with ≥2 children in one pgrp**
+  (M46-2, medium) — FIXED: is_pgrp_orphaned ignores the exiting task as a
+  parent (its children are about to be reparented to init).
+- [ ] `bug` Lower-severity / pending-verification leads: mqueue & shm have no
+  locking (shm also leaks on exit — `shm_detach_all` is never called); futex
+  lacks exit-time waiter cleanup and PROCESS_SHARED wakeups; aio ctx UAF on
+  exit; UNIX accept/recv lost-wakeups; journal crash-atomicity (write-ahead
+  ordering, pre-commit fs writes, unbounded recovery walk); swap/eviction ring
+  tables unlocked; signal-death exit skips reparent/orphan handling (M46-3).

@@ -935,7 +935,11 @@ static void init_supervise(void) {
 
   for (;;) {
     int status = 0;
-    isize reaped = (isize)syscall_dispatch(SYS_WAITPID, 0, (u64)(usize)&status,
+    /* -1 = reap ANY child: pid 0 now means "my process group" (POSIX), and
+     * supervised children (getty -> setsid) leave init's group — they would
+     * never be reaped and respawn would break. */
+    isize reaped = (isize)syscall_dispatch(SYS_WAITPID, (u64)(usize)-1,
+                                           (u64)(usize)&status,
                                            B1NIX_WNOHANG, 0, 0, 0);
     if (reaped > 0) {
       for (int i = 0; i < g_inittab_count; i++) {
@@ -1401,6 +1405,22 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M46: VFS integrity + POSIX process-conformance fixes (exit-status
+   * encoding, kill(0)/kill(-1), waitpid(-pgid), setpgid rules, getpgid,
+   * nice/priority, fork sigmask, O_APPEND atomicity, truncate zeroing,
+   * direct #! execve). */
+  {
+    u64 m46_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m46-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m46_pid < 0) {
+      uwrite("M46-SMOKE: spawn-fail\n");
+    } else {
+      int m46_status = 0;
+      syscall_dispatch(SYS_WAIT, m46_pid, (u64)(usize)&m46_status, 0, 0, 0, 0);
+    }
+  }
+
   /* bash: the upstream GNU bash 5.2 port is the default shell. Run its feature
    * smoke through /bin/bash to prove the real bash (arrays, [[ ]], regex, brace
    * ranges, C-style for, pattern substitution) is what /bin/sh now resolves to. */
@@ -1772,8 +1792,10 @@ static int init_main(int argc, const char **argv) {
    * started at all we halt rather than spin. */
   while (1) {
     int status = 0;
-    isize reaped =
-        (isize)syscall_dispatch(SYS_WAIT, 0, (u64)(usize)&status, 0, 0, 0, 0);
+    /* -1 = reap ANY child; pid 0 now means "my process group" (POSIX) and a
+     * shell that setsid()s would escape it. */
+    isize reaped = (isize)syscall_dispatch(SYS_WAIT, (u64)(usize)-1,
+                                           (u64)(usize)&status, 0, 0, 0, 0);
     if (reaped == (isize)init_pid || reaped < 0) {
       init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)init_prog, 0, 0, 0, 0, 0);
       if ((isize)init_pid < 0) {

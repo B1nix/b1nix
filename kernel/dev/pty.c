@@ -330,6 +330,9 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     if (current_task) {
       p->session_id = current_task->session_id;
       p->fg_pgrp = current_task->process_group_id;
+      if (current_task->session_id == current_task->id) {
+        scheduler_set_ctty(current_task, 3, (int)p->index);
+      }
     }
     return 0;
   default:
@@ -458,4 +461,10 @@ int pty_open_slave(int index, int flags) {
   if (flags & B1NIX_O_CLOEXEC)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   return fd;
+}
+
+usize pty_fg_pgrp(int idx) {
+  if (idx < 0 || idx >= PTY_MAX)
+    return 0;
+  return ptys[idx].fg_pgrp;
 }

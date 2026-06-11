@@ -290,6 +290,9 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     if (current_task) {
       t->session_id = current_task->session_id;
       t->fg_pgrp = current_task->process_group_id;
+      if (current_task->session_id == current_task->id) {
+        scheduler_set_ctty(current_task, 2, 0); /* COM1 (index 0) */
+      }
     }
     return 0;
   case B1NIX_TIOCNOTTY:
