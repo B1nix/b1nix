@@ -890,6 +890,8 @@ check_output "$LOG" "BASH-SMOKE: ok brace-range" "bash {a..b} brace ranges work"
 check_output "$LOG" "BASH-SMOKE: ok cstyle-for" "bash C-style for loops work"
 check_output "$LOG" "BASH-SMOKE: ok pattern-subst" "bash \${var//x/y} substitution works"
 check_output "$LOG" "BASH-SMOKE: ok local-vars" "bash function local variables work"
+check_output "$LOG" "BASH-SMOKE: ok utf8-length" "bash counts UTF-8 characters, not bytes (HANDLE_MULTIBYTE)"
+check_output "$LOG" "BASH-SMOKE: ok utf8-substr" "bash substring extraction is UTF-8 character-aware"
 check_output "$LOG" "BASH-SMOKE: done" "bash feature smoke completes"
 # ── M39: configurable init system ──
 check_output "$LOG" "M39-INIT: start" "M39 configurable-init self-test starts"

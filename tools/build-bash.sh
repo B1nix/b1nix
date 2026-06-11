@@ -161,9 +161,10 @@ fi
 # definitions that modern clang's -fno-common turns into clashing strong
 # symbols; -fcommon restores the merge-into-one-common behaviour they expect.
 # -D_POSIX_VERSION: makes bash's posixwait.h pick `int` over the BSD `union wait`
-# process-status type. Scoped here (not in the global libc headers) so it does
-# not perturb other ports' feature detection.
-LEGACY_CFLAGS="-g -O2 -fcommon -D_POSIX_VERSION=200809L -Wno-implicit-function-declaration -Wno-int-conversion -Wno-implicit-int"
+# process-status type. -DMB_CUR_MAX=4: opt bash into the UTF-8 multibyte code
+# paths (the libc default is 1). Both are scoped to this build, not the global
+# libc headers, so they do not perturb other ports' feature detection.
+LEGACY_CFLAGS="-g -O2 -fcommon -D_POSIX_VERSION=200809L -DMB_CUR_MAX=4 -Wno-implicit-function-declaration -Wno-int-conversion -Wno-implicit-int"
 # bash provides its own getenv/setenv/putenv/unsetenv (lib/sh/getenv.c) that
 # deliberately override libb1nix's; they appear first in the link line, so
 # --allow-multiple-definition makes the linker keep bash's set.

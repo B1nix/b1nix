@@ -9,7 +9,13 @@ extern "C" {
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
+/* Bytes in the longest multibyte character of the current locale. Defaults to 1
+ * (the libc treats text as single-byte). A port that opts into UTF-8 — bash,
+ * built with -DMB_CUR_MAX=4 — overrides it so the multibyte code paths engage;
+ * leaving the default unchanged keeps every other port byte-oriented. */
+#ifndef MB_CUR_MAX
 #define MB_CUR_MAX 1
+#endif
 #define RAND_MAX 2147483647
 
 #ifndef alloca
@@ -60,6 +66,7 @@ typedef int wchar_t;
 
 int wctomb(char *s, wchar_t wc);
 int mbtowc(wchar_t *pwc, const char *s, size_t n);
+int mblen(const char *s, size_t n);
 
 static inline size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
     size_t i;

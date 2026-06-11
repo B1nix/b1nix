@@ -236,6 +236,11 @@ static const char initramfs_bash_smoke[] =
     "v=foobarbar; [ \"${v//bar/X}\" = fooXX ] && echo \"BASH-SMOKE: ok pattern-subst\"\n"
     "f() { local x=inner; echo \"$x\"; }\n"
     "[ \"$(f)\" = inner ] && echo \"BASH-SMOKE: ok local-vars\"\n"
+    /* UTF-8 multibyte: αβγ is 3 characters but 6 bytes. With HANDLE_MULTIBYTE
+     * ${#v} counts characters and ${v:1:1} is the 2nd character (β). */
+    "v=$'\\u03b1\\u03b2\\u03b3'\n"
+    "[ \"${#v}\" -eq 3 ] && echo \"BASH-SMOKE: ok utf8-length\"\n"
+    "[ \"${v:1:1}\" = $'\\u03b2' ] && echo \"BASH-SMOKE: ok utf8-substr\"\n"
     "echo \"BASH-SMOKE: done\"\n";
 
 /* M39: configurable init. /etc/inittab drives the production init's service

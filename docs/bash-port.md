@@ -41,18 +41,31 @@ Key flags / patches:
 - `setlinebuf` (`stdio.h`), `ffs` (`strings.h`), and `<signal.h>` pulled into
   `<sys/select.h>` so `sigset_t` is visible where readline reaches for it.
 
+## UTF-8 / multibyte
+
+bash is built with `HANDLE_MULTIBYTE` on, so `${#var}`, `${var:off:len}`,
+case conversion, and readline line editing are UTF-8 character-aware (not
+byte-oriented). This needed a UTF-8 wide-character module in the libc
+(`userspace/libc/wchar.c`): `mbrtowc`/`mbrlen`/`mblen`/`wcrtomb`/`mbsinit`,
+`wcwidth`/`wcswidth`, `mbsrtowcs`/`wcsrtombs`, `btowc`/`wctob`, and the wide
+string helpers (`wcscmp`/`wcscoll`/`wcschr`/`wcsdup`/…), plus a `mbstate_t`
+type in `<wchar.h>`. Conversion is UTF-8-only and stateless (an incomplete
+trailing sequence is reported as `(size_t)-2` rather than carried across
+calls). Two knobs are build-scoped so other ports stay byte-oriented:
+`MB_CUR_MAX` (defaulted to 1 in the libc, overridden to 4 for the bash build)
+and the conversion functions themselves are detected by bash's `configure`.
+
 ## Limitations / future work
 
-- **No multibyte/UTF-8** (`HAVE_MULTIBYTE` off): the libc lacks `mbrtowc`,
-  `wcwidth`, `mbsrtowcs`, etc. Line editing and string ops are byte-oriented.
-  Implementing the wide-char functions would let bash enable UTF-8.
 - `/bin/sh` stays BusyBox `ash`; bash is not (yet) the POSIX `sh`.
+- The libc default `MB_CUR_MAX` is still 1; only bash opts into UTF-8. A global
+  switch would let every port handle multibyte text.
 
 ## Verification
 
 `BASH-SMOKE` in the boot self-test runs `/etc/bash-smoke.sh` under `/bin/bash`
 and checks bash-only syntax ash does not implement: `BASH_VERSION`, indexed
 arrays, `[[ ]]` glob + `=~` regex, `$(( ))`, `{a..b}` brace ranges, C-style
-`for`, `${var//x/y}` substitution, and function `local`s. Verified green on the
-i686 smoke suite (single-CPU and `-smp 4`); the x86_64 binary builds with the
-same recipe.
+`for`, `${var//x/y}` substitution, function `local`s, and UTF-8 awareness
+(`${#var}` counts characters and `${var:1:1}` is character-indexed). Verified
+green on i686 and x86_64, single-CPU and `-smp 4`.

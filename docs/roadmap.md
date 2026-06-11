@@ -457,7 +457,8 @@ Source-level ports remain preferable to a Linux compatibility layer.
   and SSH/login sessions.
 - [x] Add the libc surface bash needs (`sigsetjmp`/`siglongjmp`,
   `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
-- [ ] `partial` No multibyte/UTF-8: the libc lacks `mbrtowc`/`wcwidth`/etc., so
-  `HANDLE_MULTIBYTE` is off and bash is byte-oriented.
+- [x] Add a UTF-8 wide-character libc module (`wchar.c`: `mbrtowc`/`wcwidth`/
+  `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
+  character-aware.
 - Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` markers
-  (i686 528/0, single-CPU and `-smp 4`).
+  (i686 and x86_64 530/0, single-CPU and `-smp 4`).
