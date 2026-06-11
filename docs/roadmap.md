@@ -378,9 +378,9 @@ Supporting documents:
 
 ## M38: Sound
 
-- [ ] `planned` Add Intel HDA or AC97 support.
-- [ ] `planned` Expose a simple sound device API.
-- [ ] `planned` Add a WAV parser/player.
+- [x] Add Intel HDA PCI controller driver with CORB/RIRB codec verb transport.
+- [x] Expose a simple sound device API (`struct sound_device`) and `/dev/dsp`.
+- [x] Add a WAV parser/player smoke test (`m38_sound`) with kernel self-test.
 
 ## M39: Configurable Init System
 

@@ -36,6 +36,7 @@
 #include <b1nix/acpi.h>
 #include <b1nix/ioapic.h>
 #include <b1nix/ramdisk.h>
+#include <b1nix/sound.h>
 #include <string.h>
 #include <stdio.h>
 
@@ -45,6 +46,7 @@ extern int xhci_probe(void);
 extern void compositor_init(void);
 extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
+extern void hda_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
 extern void m35_diag_run(void);
@@ -276,6 +278,7 @@ void kernel_main(usize arg0, usize arg1)
 	ps2_kbd_init();
 	ps2_mouse_init();
 	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
+	hda_init();   /* M38: Intel HDA sound controller (/dev/dsp) */
 	video_init();
 	compositor_init();
 	virtio_gpu_init();

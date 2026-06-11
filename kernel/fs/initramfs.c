@@ -31,6 +31,8 @@
 #include "initramfs_m30_pie.inc"
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
+#include "initramfs_m38_sound.inc"
+#include "initramfs_testwav.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
@@ -947,6 +949,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m35-smoke", (const char *)vfs_m35_smoke_elf,
      sizeof(vfs_m35_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m38-sound", (const char *)vfs_m38_sound_elf,
+     sizeof(vfs_m38_sound_elf), INITRAMFS_EXECUTABLE},
+    {"/test.wav", (const char *)vfs_testwav,
+     sizeof(vfs_testwav), 0},
     {"/bin/m42-w5pre-smoke", (const char *)vfs_m42_w5pre_smoke_elf,
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     /* M30: the dynamic linker file is shipped as the PIE binary itself —

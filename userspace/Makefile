@@ -89,7 +89,8 @@ BINARIES := \
 	$(BUILD)/bin/chown \
 	$(BUILD)/bin/chmod \
 	$(BUILD)/bin/telinit \
-	$(BUILD)/bin/m30_pie
+	$(BUILD)/bin/m30_pie \
+	$(BUILD)/bin/m38_sound
 
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)

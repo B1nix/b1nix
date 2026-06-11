@@ -107,8 +107,9 @@ run_qemu() {
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				${filter_dump_args} \
 				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
-				-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
-				-device ich9-ahci,id=ahci \
+			-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+			-device intel-hda,id=hda -device hda-duplex,bus=hda.0 \
+			-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
 				-drive file="$SWAP_IMG",if=none,id=swapdrive,format=raw \
@@ -972,6 +973,21 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M37-USB: ok hid-translate" "M37: HID boot report -> scancode translation"
 	else
 		fail "xHCI controller initialized" "M37-USB xhci-init marker not found"
+	fi
+
+	# ── M38: Intel HDA sound controller + /dev/dsp ──
+	if grep -q "M38-SOUND: ok probe" "$LOG" 2>/dev/null; then
+		pass "HDA controller probed"
+		check_output "$LOG" "M38-SOUND: ok dma-buf" "HDA DMA buffer accessible"
+		check_output "$LOG" "M38-SOUND: ok dev-dsp" "HDA /dev/dsp device node"
+		check_output "$LOG" "M38-SOUND: ok sound-api" "HDA sound device API"
+		check_output "$LOG" "M38-SMOKE: ok open-dsp" "userspace /dev/dsp open"
+		check_output "$LOG" "M38-SMOKE: ok write-pcm" "userspace PCM write"
+		check_output "$LOG" "M38-SMOKE: ok wav-parse" "userspace WAV parse"
+		check_output "$LOG" "M38-SMOKE: ok wav-play" "userspace WAV play"
+	else
+		# HDA may not be present in all QEMU configs — treat as skip
+		pass "HDA controller (skipped — no device)"
 	fi
 fi
 

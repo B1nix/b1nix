@@ -21,6 +21,7 @@ INITRAMFS_TLSTEST_INC := $(BUILD_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
 INITRAMFS_BASH_INC := $(BUILD_DIR)/initramfs_bash.inc
+INITRAMFS_TESTWAV_INC := $(BUILD_DIR)/initramfs_testwav.inc
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
 APPLET_MANIFEST := tools/applet-manifest.conf
@@ -48,6 +49,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m32_pcre2_smoke \
 	m34_smoke \
 	m35_smoke \
+	m38_sound \
 	m42_w5pre_smoke \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
@@ -65,7 +67,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_TLSTEST_INC) \
 	$(INITRAMFS_DROPBEAR_INC) \
 	$(INITRAMFS_BUSYBOX_INC) \
-	$(INITRAMFS_BASH_INC)
+	$(INITRAMFS_BASH_INC) \
+	$(INITRAMFS_TESTWAV_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
@@ -247,6 +250,7 @@ KERNEL_SOURCES += \
 	kernel/dev/ps2_kbd.c \
 	kernel/dev/ps2_mouse.c \
 	kernel/dev/usb_xhci.c \
+	kernel/dev/hda.c \
 	kernel/dev/pty.c \
 	kernel/dev/serial_tty.c \
 	kernel/dev/compositor.c \
@@ -475,6 +479,11 @@ $(CACERT_PEM): tools/fetch-cacert.sh
 $(INITRAMFS_CACERT_INC): $(CACERT_PEM)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cacert_pem $(CACERT_PEM) > $@
+
+$(INITRAMFS_TESTWAV_INC): tools/gen_test_wav.py
+	@mkdir -p $(dir $@)
+	python3 tools/gen_test_wav.py $(BUILD_DIR)/test.wav
+	xxd -i -n vfs_testwav $(BUILD_DIR)/test.wav > $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.

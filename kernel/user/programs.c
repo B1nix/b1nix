@@ -7,6 +7,7 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/usb.h>
+#include <b1nix/sound.h>
 #include <b1nix/posix.h>
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
@@ -1373,6 +1374,18 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M38: sound — userspace /dev/dsp write test + WAV parse. */
+  {
+    u64 m38_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m38-sound", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m38_pid < 0) {
+      uwrite("M38-SMOKE: spawn-fail\n");
+    } else {
+      int m38_status = 0;
+      syscall_dispatch(SYS_WAIT, m38_pid, (u64)(usize)&m38_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M42 wave-5 prerequisites: atomic sigsuspend, alarm, resource limits,
    * dup/access/ftruncate, fchdir, fuller fnmatch/regex, and job control —
    * the gate the roadmap requires before enabling the upstream ash shell. */
@@ -1605,12 +1618,15 @@ static int init_main(int argc, const char **argv) {
   ipv6_loopback_smoke();
   ipv6_realink_smoke();
 
-  /* M37: exercise the real-hardware e1000 NIC driver end-to-end (ARP over the
-   * second SLIRP backend), independent of the virtio-net-bound stack above. */
-  e1000_selftest();
+	/* M37: exercise the real-hardware e1000 NIC driver end-to-end (ARP over the
+	 * second SLIRP backend), independent of the virtio-net-bound stack above. */
+	e1000_selftest();
 
-  /* M37: USB xHCI controller bring-up + HID boot-keyboard enumeration. */
-  usb_selftest();
+	/* M37: USB xHCI controller bring-up + HID boot-keyboard enumeration. */
+	usb_selftest();
+
+	/* M38: Intel HDA sound controller verification. */
+	hda_selftest();
 
   /* M24b BKL proof: run several CPU-bound userspace processes at once so the
    * cooperative scheduler distributes them across the BSP and Application
