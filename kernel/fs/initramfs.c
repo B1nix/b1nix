@@ -97,13 +97,20 @@ static const char initramfs_fstab[] =
 
 /* User database. name:passwd:uid:gid:gecos:home:shell. The pw_passwd
  * field is "x", meaning the real hash lives in /etc/shadow. */
-/* Login shell is BusyBox ash (/bin/sh): it is what dropbear execs for SSH
- * sessions, where ash's predictable non-interactive behaviour keeps the M32b
- * SSH tests green. The *local console* default terminal is GNU bash, launched
- * directly by init (see init_main / the inittab respawn entry). */
+/* Login shell is GNU bash for both the local console and SSH/login sessions. */
 static const char initramfs_passwd[] =
-    "root:x:0:0:root:/root:/bin/sh\n"
-    "user:x:1000:1000:b1nix user:/home/user:/bin/sh\n";
+    "root:x:0:0:root:/root:/bin/bash\n"
+    "user:x:1000:1000:b1nix user:/home/user:/bin/bash\n";
+
+/* Valid login shells (/etc/shells). dropbear (and getusershell()-based tools)
+ * reject a login whose passwd shell is not listed here; without this file it
+ * falls back to a "/bin/sh","/bin/csh" default that excludes bash, so SSH login
+ * with the bash shell was refused ("invalid shell, rejected"). */
+static const char initramfs_shells[] =
+    "/bin/sh\n"
+    "/bin/bash\n"
+    "/bin/ash\n"
+    "/opt/busybox/bin/busybox\n";
 
 /* M31: shadow database. Format: name:hash:lastchange:min:max:warn:inactive:expire:reserved
  * Empty fields after the hash are POSIX-compliant placeholders. The hash
@@ -950,6 +957,7 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
+    {"/etc/shells", initramfs_shells, sizeof(initramfs_shells) - 1, 0},
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
     {"/etc/group", initramfs_group, sizeof(initramfs_group) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},

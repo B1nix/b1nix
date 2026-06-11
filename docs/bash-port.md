@@ -55,6 +55,30 @@ calls). UTF-8 is the libc-wide default: `MB_CUR_MAX` is 4 in `<stdlib.h>` and
 the non-restartable conversions (`mbtowc`/`wctomb`/`mbstowcs`/`wcstombs`)
 delegate to the same UTF-8 primitives, so every port sees one encoding.
 
+## bash as the login shell (and the dropbear saga)
+
+`/etc/passwd` sets `/bin/bash` for root and user, so SSH logins and `login`
+get bash too. Making that work surfaced three layered problems, none of them
+actually bash's fault:
+
+1. **`/etc/shells` did not exist.** dropbear validates the passwd shell with
+   `getusershell()`; its bundled fallback list is `{"/bin/sh","/bin/csh"}`, so
+   a bash login was refused outright ("User 'root' has invalid shell,
+   rejected"). The initramfs now ships `/etc/shells` listing `/bin/sh`,
+   `/bin/bash`, `/bin/ash`, and the BusyBox path.
+2. **A real libc bug in `fgets`.** dropbear's `initshells()` parses
+   `/etc/shells` with `while (fgets(cp, flen - (cp - strings), fp))` over a
+   shrinking buffer. Our `fgets` returned non-NULL without reading anything
+   when `size <= 1`, so once the buffer was exhausted the loop spun forever —
+   the SSH session hung *during auth* for every login. `fgets` now returns
+   NULL for `size <= 0` and handles `size == 1` with a real EOF probe
+   (`fgetc`/`ungetc`).
+3. **A stale-object build trap.** dropbear's own Makefile does not track our
+   libc headers, so a top-level rebuild after the `fgets` fix only *relinked*
+   old objects — the fix was not in the binary even though every mtime said
+   otherwise. (`rm *.o` in the dropbear tree before rebuilding was required;
+   the same applies to any header-level libc fix that must reach a port.)
+
 ## Limitations / future work
 
 - `/bin/sh` stays BusyBox `ash`; bash is not (yet) the POSIX `sh`.

@@ -452,14 +452,15 @@ Source-level ports remain preferable to a Linux compatibility layer.
 
 - [x] Cross-build upstream GNU bash 5.2.37 against the b1nix userspace ABI and
   embed it as `/bin/bash`.
-- [x] Make bash the default interactive terminal (the local console shell that
-  `/bin/init` launches); `/bin/sh` stays BusyBox `ash` for `#!/bin/sh` scripts
-  and SSH/login sessions.
+- [x] Make bash the login shell everywhere — the console terminal `/bin/init`
+  launches and the `/etc/passwd` shell used by SSH/login; `/bin/sh` stays
+  BusyBox `ash` for `#!/bin/sh` scripts. Required shipping `/etc/shells` and
+  fixing a libc `fgets(size<=1)` bug that hung dropbear's `/etc/shells` parser.
 - [x] Add the libc surface bash needs (`sigsetjmp`/`siglongjmp`,
   `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
 - [x] Add a UTF-8 wide-character libc module (`wchar.c`: `mbrtowc`/`wcwidth`/
   `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
   character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
   `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
-- Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` markers
-  (i686 and x86_64 530/0, single-CPU and `-smp 4`).
+- Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` +
+  `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.

@@ -133,6 +133,20 @@ static inline void setlinebuf(FILE *stream) {
 int vprintf(const char *format, va_list ap);
 
 static inline char *fgets(char *s, int size, FILE *stream) {
+    if (size <= 0)
+        return NULL;
+    /* size == 1 stores only the NUL, but must still report EOF (return NULL)
+     * rather than a non-NULL empty string — callers that loop `while (fgets())`
+     * over a shrinking buffer (e.g. dropbear's /etc/shells parser) would
+     * otherwise spin forever once the buffer is exhausted. */
+    if (size == 1) {
+        int c = fgetc(stream);
+        if (c == EOF)
+            return NULL;
+        ungetc(c, stream);
+        s[0] = '\0';
+        return s;
+    }
     int i = 0;
     while (i < size - 1) {
         int c = fgetc(stream);
