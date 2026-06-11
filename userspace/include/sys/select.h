@@ -3,16 +3,13 @@
 
 #include <sys/types.h>
 #include <sys/time.h>
+/* fd_set and the FD_* macros live in <sys/types.h>. Ports (readline) reach
+ * sigset_t through <sys/select.h> (for pselect-shaped prototypes), so pull the
+ * signal types in here too. */
+#include <signal.h>
 
 #ifndef FD_SETSIZE
 #define FD_SETSIZE 1024
-#endif
-
-#ifndef B1NIX_FD_SET_DEFINED
-#define B1NIX_FD_SET_DEFINED
-typedef struct {
-  unsigned char bits[FD_SETSIZE / 8];
-} fd_set;
 #endif
 
 int select(int nfds, fd_set *readfds, fd_set *writefds, fd_set *exceptfds,

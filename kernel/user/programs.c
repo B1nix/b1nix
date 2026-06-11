@@ -936,6 +936,21 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* bash: the upstream GNU bash 5.2 port is the default shell. Run its feature
+   * smoke through /bin/bash to prove the real bash (arrays, [[ ]], regex, brace
+   * ranges, C-style for, pattern substitution) is what /bin/sh now resolves to. */
+  {
+    const char *bash_argv[] = {"/bin/bash", "/etc/bash-smoke.sh", 0};
+    u64 bash_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bash_argv[0], 2,
+                                    (u64)(usize)bash_argv, 0, 0, 0);
+    if ((isize)bash_pid < 0) {
+      uwrite("BASH-SMOKE: spawn-fail\n");
+    } else {
+      int bash_status = 0;
+      syscall_dispatch(SYS_WAIT, bash_pid, (u64)(usize)&bash_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M30: PIE/ET_DYN loader smoke. The binary is itself an ET_DYN with
    * R_X86_64_RELATIVE relocations; if the loader (process.c) applied
    * the base offset correctly, the pointer-table dereferences land on
@@ -1230,7 +1245,10 @@ static int init_main(int argc, const char **argv) {
     uwrite("init: launching graphical UI /bin/mc\n");
     init_prog = "/bin/mc";
   } else {
-    init_prog = "/bin/sh";
+    /* Default interactive console shell is GNU bash (the b1nix default
+     * terminal). /bin/sh stays BusyBox ash for #!/bin/sh system scripts; bash
+     * failing to spawn falls back to /bin/sh below. */
+    init_prog = "/bin/bash";
   }
 
   u64 init_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)init_prog, 0, 0, 0, 0, 0);

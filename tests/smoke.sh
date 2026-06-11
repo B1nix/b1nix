@@ -880,6 +880,17 @@ check_output "$LOG" "M42-W5PRE: ok interrupted-waitpid" "waitpid is interrupted 
 check_output "$LOG" "M42-W5PRE: ok job-control" "Job control SIGSTOP/SIGCONT changes state"
 check_output "$LOG" "M42-W5PRE: ok sigchld-on-exit" "SIGCHLD is delivered to the parent on child exit"
 check_output "$LOG" "M42-W5PRE: done" "M42 wave-5 prerequisite suite completes"
+# ── bash: GNU bash 5.2 port (default shell) ──
+check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"
+check_output "$LOG" "BASH-SMOKE: ok arrays" "bash indexed arrays work"
+check_output "$LOG" "BASH-SMOKE: ok dbracket-glob" "bash [[ ]] glob matching works"
+check_output "$LOG" "BASH-SMOKE: ok regex-match" "bash [[ =~ ]] regex matching works"
+check_output "$LOG" "BASH-SMOKE: ok arithmetic" "bash \$(( )) arithmetic works"
+check_output "$LOG" "BASH-SMOKE: ok brace-range" "bash {a..b} brace ranges work"
+check_output "$LOG" "BASH-SMOKE: ok cstyle-for" "bash C-style for loops work"
+check_output "$LOG" "BASH-SMOKE: ok pattern-subst" "bash \${var//x/y} substitution works"
+check_output "$LOG" "BASH-SMOKE: ok local-vars" "bash function local variables work"
+check_output "$LOG" "BASH-SMOKE: done" "bash feature smoke completes"
 # ── M36 GDB stub + ftrace ──
 check_output "$LOG" "M36-GDB: start" "M36 GDB-stub diag starts"
 check_output "$LOG" "M36-GDB: ok stop-reply" "GDB stub answers ? with a stop reply"

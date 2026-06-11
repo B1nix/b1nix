@@ -126,6 +126,10 @@ static inline int setvbuf(FILE *stream, char *buf, int mode, size_t size) {
     return 0;
 }
 
+static inline void setlinebuf(FILE *stream) {
+    (void)setvbuf(stream, (char *)0, 1 /* _IOLBF */, 0);
+}
+
 int vprintf(const char *format, va_list ap);
 
 static inline char *fgets(char *s, int size, FILE *stream) {

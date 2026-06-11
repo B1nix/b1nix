@@ -33,6 +33,7 @@
 #include "initramfs_m35_smoke.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_dropbear.inc"
+#include "initramfs_bash.inc"
 #include "initramfs_su.inc"
 #include "initramfs_passwd.inc"
 /* id, whoami — migrated to upstream BusyBox (M42 wave 8); /bin/{id,whoami} are
@@ -95,6 +96,10 @@ static const char initramfs_fstab[] =
 
 /* User database. name:passwd:uid:gid:gecos:home:shell. The pw_passwd
  * field is "x", meaning the real hash lives in /etc/shadow. */
+/* Login shell is BusyBox ash (/bin/sh): it is what dropbear execs for SSH
+ * sessions, where ash's predictable non-interactive behaviour keeps the M32b
+ * SSH tests green. The *local console* default terminal is GNU bash, launched
+ * directly by init (see init_main / the inittab respawn entry). */
 static const char initramfs_passwd[] =
     "root:x:0:0:root:/root:/bin/sh\n"
     "user:x:1000:1000:b1nix user:/home/user:/bin/sh\n";
@@ -210,6 +215,27 @@ static const char initramfs_rc[] =
     "# Start SSH daemon service\n"
     "[ -f /etc/init.d/sshd ] && /bin/sh /etc/init.d/sshd start\n"
     "echo \"M27-INIT: ok rc-script\"\n";
+
+/* bash feature smoke: run by /bin/bash to prove the real GNU bash (not ash) is
+ * the shell. Each test emits a "BASH-SMOKE: ok <feature>" marker the host smoke
+ * script greps for. Exercises bash-only syntax ash does not implement: indexed
+ * arrays, [[ ]] with glob/regex, $(( )) arithmetic, {a..b} brace ranges,
+ * C-style for, ${var//x/y} substitution, and local function variables. */
+static const char initramfs_bash_smoke[] =
+    "#!/bin/bash\n"
+    "[ -n \"$BASH_VERSION\" ] && echo \"BASH-SMOKE: ok version $BASH_VERSION\"\n"
+    "a=(alpha beta gamma)\n"
+    "[ \"${a[1]}\" = beta ] && [ \"${#a[@]}\" -eq 3 ] && echo \"BASH-SMOKE: ok arrays\"\n"
+    "[[ abcde == a*e ]] && echo \"BASH-SMOKE: ok dbracket-glob\"\n"
+    "[[ hello123 =~ ^[a-z]+[0-9]+$ ]] && echo \"BASH-SMOKE: ok regex-match\"\n"
+    "[ $((6 * 7)) -eq 42 ] && echo \"BASH-SMOKE: ok arithmetic\"\n"
+    "[ \"$(echo {1..5})\" = \"1 2 3 4 5\" ] && echo \"BASH-SMOKE: ok brace-range\"\n"
+    "s=0; for ((i=1;i<=4;i++)); do s=$((s+i)); done\n"
+    "[ \"$s\" -eq 10 ] && echo \"BASH-SMOKE: ok cstyle-for\"\n"
+    "v=foobarbar; [ \"${v//bar/X}\" = fooXX ] && echo \"BASH-SMOKE: ok pattern-subst\"\n"
+    "f() { local x=inner; echo \"$x\"; }\n"
+    "[ \"$(f)\" = inner ] && echo \"BASH-SMOKE: ok local-vars\"\n"
+    "echo \"BASH-SMOKE: done\"\n";
 
 /* Resolver configuration. The kernel DNS client parses the first
  * "nameserver" line lazily (kernel/net/dns.c); 10.0.2.3 is the QEMU
@@ -876,6 +902,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
     {"/bin/dropbearconvert", (const char *)vfs_dropbear_elf,
      sizeof(vfs_dropbear_elf), INITRAMFS_EXECUTABLE},
+    /* GNU bash 5.2 — default interactive shell. Also reachable as /bin/sh via
+     * the symlink below (bash runs in POSIX mode when invoked as "sh"). */
+    {"/bin/bash", (const char *)vfs_bash_elf, sizeof(vfs_bash_elf),
+     INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
@@ -895,6 +925,8 @@ static const struct initramfs_file files[] = {
     {"/etc/shadow", initramfs_shadow, sizeof(initramfs_shadow) - 1, 0},
     {"/etc/group", initramfs_group, sizeof(initramfs_group) - 1, 0},
     {"/etc/rc", initramfs_rc, sizeof(initramfs_rc) - 1, INITRAMFS_EXECUTABLE},
+    {"/etc/bash-smoke.sh", initramfs_bash_smoke,
+     sizeof(initramfs_bash_smoke) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/init.d/sshd", initramfs_sshd_service, sizeof(initramfs_sshd_service) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
     {"/etc/resolv.conf", initramfs_resolv_conf,

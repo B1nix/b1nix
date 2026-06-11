@@ -5,6 +5,8 @@
 #include <errno.h>
 #include <math.h>
 #include <sys/mman.h>
+#include <setjmp.h>
+#include <signal.h>
 
 extern int normalize_errno(long rc);
 
@@ -725,6 +727,28 @@ __asm__(
 "    jmp *%ecx\n"
 );
 #endif
+
+/* sigsetjmp/siglongjmp signal-mask handling (see <setjmp.h>). __sigsetjmp_save
+ * runs (via the sigsetjmp macro) immediately before the inline setjmp and, when
+ * savemask is non-zero, records the current signal mask so siglongjmp can
+ * restore it on the way out. */
+int __sigsetjmp_save(struct __sigjmp_buf *env, int savemask) {
+	env->__savemask = savemask;
+	if (savemask) {
+		sigset_t cur = 0;
+		sigprocmask(SIG_BLOCK, NULL, &cur);
+		env->__mask = (unsigned long long)cur;
+	}
+	return 0;
+}
+
+void siglongjmp(sigjmp_buf env, int val) {
+	if (env[0].__savemask) {
+		sigset_t m = (sigset_t)env[0].__mask;
+		sigprocmask(SIG_SETMASK, &m, NULL);
+	}
+	longjmp(env[0].__jb, val);
+}
 
 /* -----------------------------------------------------------------------
  * dlfcn stubs — B1NIX supports static linking only; dynamic loading is

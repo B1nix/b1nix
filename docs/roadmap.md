@@ -441,3 +441,17 @@ Source-level ports remain preferable to a Linux compatibility layer.
 - [x] Retire the in-kernel shell and utility table.
 - [ ] `stub` BusyBox `ssl_server` is disabled pending a dedicated TLS port and
   handshake test.
+
+## M45: GNU bash
+
+- [x] Cross-build upstream GNU bash 5.2.37 against the b1nix userspace ABI and
+  embed it as `/bin/bash`.
+- [x] Make bash the default interactive terminal (the local console shell that
+  `/bin/init` launches); `/bin/sh` stays BusyBox `ash` for `#!/bin/sh` scripts
+  and SSH/login sessions.
+- [x] Add the libc surface bash needs (`sigsetjmp`/`siglongjmp`,
+  `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
+- [ ] `partial` No multibyte/UTF-8: the libc lacks `mbrtowc`/`wcwidth`/etc., so
+  `HANDLE_MULTIBYTE` is off and bash is byte-oriented.
+- Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` markers
+  (i686 528/0, single-CPU and `-smp 4`).
