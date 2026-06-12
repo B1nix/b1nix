@@ -14,6 +14,7 @@
  */
 
 #ifdef __x86_64__
+#ifndef B1NIX_DYNAMIC
 /* Weak references to libgcc's DWARF frame-registration entry points. They are
  * defined only when a program links libgcc (e.g. the GCC-built native
  * toolchain: cc1/gcc/as/ld). For clang-linked b1nix programs they resolve to 0
@@ -26,6 +27,7 @@
 .local __b1nix_eh_object
 __b1nix_eh_object:
 	.skip 48                        /* sizeof(struct object) in libgcc */
+#endif
 
 .section .text
 .globl _start
@@ -55,7 +57,9 @@ _start:
 	leaq 8(%rsp, %rdi, 8), %rdx
 
 	/* Store envp in global environ variable */
+#ifndef B1NIX_DYNAMIC
 	movq %rdx, environ(%rip)
+#endif
 
 	/* Align for C call ABI while preserving decoded argc/argv/envp. */
 	andq $-16, %rsp
@@ -66,6 +70,7 @@ _start:
 	movq %rsi, %r12                 /* argv */
 	movq %rdx, %r13                 /* envp */
 
+#ifndef B1NIX_DYNAMIC
 	/* Register the program's .eh_frame with libgcc so its DWARF unwinder can
 	 * find FDEs. This is normally done by frame_dummy() called from _init,
 	 * but the x86_64-b1nix target has no crti.o/crtn.o (so no callable _init)
@@ -83,6 +88,7 @@ _start:
 	leaq __b1nix_eh_object(%rip), %rsi
 	call *%rax
 3:
+#endif
 
 	/* Run ELF .init_array constructors before main(). C++ static
 	 * constructors and __attribute__((constructor)) functions live here;

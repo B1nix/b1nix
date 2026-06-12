@@ -49,6 +49,8 @@ void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize siz
 void ipv6_receive(const void *data, usize size);
 void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload, usize size);
 u32 icmpv6_echo_reply_count(void);
+void icmpv6_send_dest_unreachable(struct in6_addr_k dst, u8 code,
+                                  const void *quoted, usize quoted_len);
 
 // IPv6 interface state
 struct in6_addr_k net_get_ip6_ll(void);
@@ -63,6 +65,10 @@ void net_set_prefix6(struct in6_addr_k p);
 // Neighbor Discovery + SLAAC (kernel/net/ndp.c)
 void ndp_init(void);
 void ndp_tick(u64 now_ticks);
+void mld_join_solicited_node(struct in6_addr_k address);
+void mld_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
+                 const void *data, usize size);
+void mld_smoke(void);
 /* Handle an incoming ICMPv6 Neighbor Discovery message (RS/RA/NS/NA),
  * dispatched from ipv6_receive for types 133-136. */
 void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
@@ -73,7 +79,8 @@ int ndp_resolve(struct in6_addr_k ip, struct mac_addr *mac);
 /* UDP over IPv6 (loopback ::1 datapath). */
 void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
                const void *payload, usize size);
-void udp6_receive(struct in6_addr_k src, const void *data, usize size);
+void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
+                  const void *data, usize size);
 /* Offline self-test: ping ::1 through the loopback datapath and verify an
  * ICMPv6 echo reply comes back. Emits an M32-IP6 marker. */
 void ipv6_loopback_smoke(void);

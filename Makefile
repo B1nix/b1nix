@@ -54,6 +54,11 @@ EMBEDDED_USER_PROGRAMS := \
 	m46_smoke \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
+ifeq ($(ARCH),x86_64)
+EMBEDDED_USER_PROGRAMS += m30_dynamic
+INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
+endif
+
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
@@ -62,6 +67,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
+	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -502,6 +508,18 @@ $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) us
 	@$(MAKE) -C userspace build/bin/m30_pie
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
+
+$(BUILD_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS) userspace/linker_pie.ld userspace/linker_shared.ld
+	@$(MAKE) -C userspace build/bin/m30_dynamic
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m30_dynamic_elf userspace/build/bin/m30_dynamic > $@
+
+ifeq ($(ARCH),x86_64)
+$(INITRAMFS_SHARED_LIBC_INC): $(USERSPACE_DEPS) userspace/linker_shared.ld
+	@$(MAKE) -C userspace build/$(ARCH)/libc.so.1
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_shared_libc_elf userspace/build/$(ARCH)/libc.so.1 > $@
+endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-busybox.sh

@@ -8,40 +8,52 @@
 
 ENTRY(_start)
 
+PHDRS
+{
+	text PT_LOAD FLAGS(5);
+	ro PT_LOAD FLAGS(4);
+	data PT_LOAD FLAGS(6);
+	dynamic PT_DYNAMIC FLAGS(6);
+	interp PT_INTERP FLAGS(4);
+}
+
 SECTIONS
 {
 	. = 0;
 
 	.text : ALIGN(0x1000) {
 		*(.text .text.*)
-	}
+	} :text
 
 	.rodata : ALIGN(0x1000) {
 		*(.rodata .rodata.*)
-	}
+	} :ro
+
+	.rela.dyn : ALIGN(0x1000) { *(.rela.dyn) } :ro
+	.rela.plt : { *(.rela.plt) } :ro
+	.dynsym   : { *(.dynsym) } :ro
+	.dynstr   : { *(.dynstr) } :ro
+	.hash     : { *(.hash) } :ro
+	.gnu.hash : { *(.gnu.hash) } :ro
+	.interp   : { *(.interp) } :ro :interp
 
 	.data : ALIGN(0x1000) {
 		*(.data .data.*)
-	}
+	} :data
 
 	.bss : ALIGN(0x1000) {
 		*(COMMON)
 		*(.bss .bss.*)
-	}
+	} :data
 
-	.rela.dyn : { *(.rela.dyn) }
-	.rela.plt : { *(.rela.plt) }
-	.dynsym   : { *(.dynsym) }
-	.dynstr   : { *(.dynstr) }
-	.dynamic  : { *(.dynamic) }
-	.hash     : { *(.hash) }
-	.gnu.hash : { *(.gnu.hash) }
+	.dynamic  : ALIGN(0x1000) { *(.dynamic) } :data :dynamic
+	.got      : { *(.got .got.*) } :data
+	.got.plt  : { *(.got.plt) } :data
 
 	/DISCARD/ : {
 		*(.comment)
 		*(.note.*)
 		*(.eh_frame)
 		*(.eh_frame_hdr)
-		*(.interp)
 	}
 }

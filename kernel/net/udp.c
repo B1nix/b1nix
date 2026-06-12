@@ -171,9 +171,10 @@ void udp6_send(struct in6_addr_k dst, u16 src_port_net, u16 dst_port_net,
 	kfree(buffer);
 }
 
-void udp6_receive(struct in6_addr_k src, const void *data, usize size)
+void udp6_receive(struct in6_addr_k src, struct in6_addr_k dst,
+                  const void *data, usize size)
 {
-	(void)src;
+	(void)dst;
 	if (size < sizeof(struct udp_header)) return;
 	const struct udp_header *hdr = data;
 
@@ -183,5 +184,7 @@ void udp6_receive(struct in6_addr_k src, const void *data, usize size)
 	const void *payload = (const u8 *)data + sizeof(struct udp_header);
 	usize payload_size = length - sizeof(struct udp_header);
 
-	vfs_socket_push_udp(hdr->dst_port, payload, payload_size);
+	if (!vfs_socket_push_udp(hdr->dst_port, payload, payload_size))
+		icmpv6_send_dest_unreachable(src, 4 /* port unreachable */, data,
+		                             length);
 }

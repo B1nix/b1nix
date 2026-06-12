@@ -18,6 +18,14 @@
 
 #define ICMP6_ECHO_REQUEST 128
 #define ICMP6_ECHO_REPLY   129
+#define ICMP6_DEST_UNREACH 1
+#define ICMP6_PACKET_TOO_BIG 2
+#define ICMP6_TIME_EXCEEDED 3
+#define ICMP6_PARAM_PROBLEM 4
+#define ICMP6_MLD_QUERY 130
+#define ICMP6_MLD_REPORT 131
+#define ICMP6_MLD_DONE 132
+#define ICMP6_MLDV2_REPORT 143
 
 struct ipv6_header {
 	u8 ver_tc_hi;     /* version (high nibble) + traffic class (high nibble) */
@@ -41,6 +49,7 @@ struct icmpv6_header {
 static u16 bswap16(u16 v) { return (u16)((v << 8) | (v >> 8)); }
 
 static volatile u32 g_icmpv6_echo_replies = 0;
+static volatile u32 g_icmpv6_errors = 0;
 
 u32 icmpv6_echo_reply_count(void)
 {
@@ -54,6 +63,8 @@ static int in6_is_loopback(const struct in6_addr_k *a)
 			return 0;
 	return a->bytes[15] == 1;
 }
+
+static int in6_is_multicast(const struct in6_addr_k *a);
 
 /* ICMPv6 checksum: 16-bit ones' complement over the IPv6 pseudo-header
  * (src, dst, 32-bit upper-layer length, next header) followed by the message. */
@@ -102,7 +113,30 @@ static void icmpv6_receive(const struct in6_addr_k *src,
 		kfree(reply);
 	} else if (hdr->type == ICMP6_ECHO_REPLY) {
 		__atomic_add_fetch(&g_icmpv6_echo_replies, 1, __ATOMIC_RELAXED);
+	} else if (hdr->type >= ICMP6_DEST_UNREACH &&
+	           hdr->type <= ICMP6_PARAM_PROBLEM) {
+		__atomic_add_fetch(&g_icmpv6_errors, 1, __ATOMIC_RELAXED);
 	}
+}
+
+void icmpv6_send_dest_unreachable(struct in6_addr_k dst, u8 code,
+                                  const void *quoted, usize quoted_len)
+{
+	if (in6_is_multicast(&dst))
+		return;
+	if (quoted_len > 256)
+		quoted_len = 256;
+	usize len = sizeof(struct icmpv6_header) + quoted_len;
+	u8 *pkt = kzalloc(len);
+	if (!pkt)
+		return;
+	struct icmpv6_header *hdr = (struct icmpv6_header *)pkt;
+	hdr->type = ICMP6_DEST_UNREACH;
+	hdr->code = code;
+	if (quoted_len)
+		memcpy(pkt + sizeof(*hdr), quoted, quoted_len);
+	ipv6_send(dst, IP6_NH_ICMPV6, pkt, len);
+	kfree(pkt);
 }
 
 void ipv6_receive(const void *data, usize size)
@@ -129,11 +163,14 @@ void ipv6_receive(const void *data, usize size)
 		u8 type = ((const u8 *)payload)[0];
 		if (type >= 133 && type <= 136) {
 			ndp_receive(hdr->src, hdr->dst, type, payload, payload_len);
+		} else if (type == ICMP6_MLD_QUERY || type == ICMP6_MLD_REPORT ||
+		           type == ICMP6_MLD_DONE || type == ICMP6_MLDV2_REPORT) {
+			mld_receive(hdr->src, hdr->dst, type, payload, payload_len);
 		} else {
 			icmpv6_receive(&hdr->src, &hdr->dst, payload, payload_len);
 		}
 	} else if (hdr->next_header == IP6_NH_UDP) {
-		udp6_receive(hdr->src, payload, payload_len);
+		udp6_receive(hdr->src, hdr->dst, payload, payload_len);
 	} else if (hdr->next_header == IP6_NH_TCP) {
 		tcp6_receive(hdr->src, payload, payload_len);
 	}
@@ -307,6 +344,23 @@ void ipv6_loopback_smoke(void)
 		console_write("M32-IP6: ok icmpv6-loopback\n");
 	else
 		console_write("M32-IP6: fail icmpv6-loopback\n");
+
+	/* A datagram to an unbound ::1 UDP port must produce ICMPv6 type 1,
+	 * code 4 rather than disappearing silently. */
+	u8 udp[9];
+	memset(udp, 0, sizeof(udp));
+	udp[0] = 0x12; udp[1] = 0x34;
+	udp[2] = 0xfd; udp[3] = 0xe8; /* closed port 65000 */
+	udp[4] = 0; udp[5] = sizeof(udp);
+	udp[8] = 'x';
+	u32 err_before = __atomic_load_n(&g_icmpv6_errors, __ATOMIC_RELAXED);
+	ipv6_send(loop, IP6_NH_UDP, udp, sizeof(udp));
+	if (__atomic_load_n(&g_icmpv6_errors, __ATOMIC_RELAXED) > err_before)
+		console_write("M32-IP6: ok icmpv6-errors\n");
+	else
+		console_write("M32-IP6: fail icmpv6-errors\n");
+
+	mld_smoke();
 }
 
 /* Real-link IPv6 over QEMU usernet: wait for SLAAC (RS->RA gives a prefix and

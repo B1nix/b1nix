@@ -28,7 +28,9 @@ CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector 
 BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
+SHARED_LIBC := $(BUILD)/libc.so.1
 CRT0     := $(BUILD)/crt/crt0.o
+DYNAMIC_CRT0 := $(BUILD)/crt/crt0-dynamic.o
 LINKER   := linker.ld
 
 LIBC_OBJS := \
@@ -54,6 +56,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/mntent.o \
 	$(BUILD)/libc/statvfs.o \
 	$(BUILD)/libc/div64.o
+
+PIC_LIBC_OBJS := $(patsubst $(BUILD)/libc/%.o,$(BUILD)/libc-pic/%.o,$(LIBC_OBJS))
 
 BINARIES := \
 	$(BUILD)/bin/hello \
@@ -92,31 +96,45 @@ BINARIES := \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound
 
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
-DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
+ifeq ($(B1NIX_ARCH),x86_64)
+BINARIES += $(BUILD)/bin/m30_dynamic
+DYNAMIC_TARGETS := $(SHARED_LIBC)
+endif
 
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
 .PHONY: all clean install install-headers-libs
 .SECONDARY:
 
-all: $(LIB) $(BINARIES)
+all: $(LIB) $(DYNAMIC_TARGETS) $(BINARIES)
 
 # ── crt0 ──
 $(BUILD)/crt/crt0.o: crt/crt0.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(DYNAMIC_CRT0): crt/crt0.S
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -DB1NIX_DYNAMIC -c $< -o $@
+
 # ── libc objects ──
 $(BUILD)/libc/%.o: libc/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $@
 
+$(BUILD)/libc-pic/%.o: libc/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
+
 # ── libb1nix.a ──
 $(LIB): $(LIBC_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIBC_OBJS)
+
+$(SHARED_LIBC): $(PIC_LIBC_OBJS) linker_shared.ld
+	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=sysv -soname libc.so.1 \
+		-T linker_shared.ld -o $@ $(PIC_LIBC_OBJS)
 
 build/libb1nix.a: $(LIB)
 	@mkdir -p build
@@ -178,6 +196,12 @@ $(BUILD)/bin/m30_pie: bin/m30_pie.c linker_pie.ld
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_pie.o
 	$(LD) $(LDFLAGS) -pie -T linker_pie.ld -o $@ $(BUILD)/bin/m30_pie.o
+
+$(BUILD)/bin/m30_dynamic: bin/m30_dynamic.c $(SHARED_LIBC) $(DYNAMIC_CRT0) linker_pie.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_dynamic.o
+	$(LD) $(LDFLAGS) -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-b1nix.so \
+		-T linker_pie.ld -o $@ $(DYNAMIC_CRT0) $(BUILD)/bin/m30_dynamic.o $(SHARED_LIBC)
 
 $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
 	@mkdir -p $(dir $@)

@@ -852,6 +852,35 @@ static int test_v4mapped_udp(void) {
   return 0;
 }
 
+static int test_ipv6_v6only(void) {
+  int fd = socket(AF_INET6, SOCK_DGRAM, 0);
+  if (fd < 0) { fail("ipv6-v6only-socket"); return -1; }
+  int one = 1;
+  if (setsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &one, sizeof(one)) != 0) {
+    fail("ipv6-v6only-set"); close(fd); return -1;
+  }
+  int value = 0;
+  socklen_t len = sizeof(value);
+  if (getsockopt(fd, IPPROTO_IPV6, IPV6_V6ONLY, &value, &len) != 0 ||
+      value != 1) {
+    fail("ipv6-v6only-get"); close(fd); return -1;
+  }
+  struct sockaddr_in6 mapped;
+  memset(&mapped, 0, sizeof(mapped));
+  mapped.sin6_family = AF_INET6;
+  mapped.sin6_port = htons(6791);
+  mapped.sin6_addr.s6_addr[10] = 0xff;
+  mapped.sin6_addr.s6_addr[11] = 0xff;
+  mapped.sin6_addr.s6_addr[12] = 127;
+  mapped.sin6_addr.s6_addr[15] = 1;
+  if (connect(fd, (struct sockaddr *)&mapped, sizeof(mapped)) == 0) {
+    fail("ipv6-v6only-mapped"); close(fd); return -1;
+  }
+  close(fd);
+  ok("ipv6-v6only");
+  return 0;
+}
+
 /* PCRE2-backed regex filtering for wget. A recursive fetch is driven with an
  * --accept-regex that only a real PCRE2 matcher honours ("yes-\d+": POSIX would
  * treat \d as a literal 'd' and reject "yes-1"), and --regex-type pcre, which
@@ -1961,6 +1990,7 @@ int main(int argc, char **argv) {
   test_external_net();
   if (test_getnameinfo() != 0)         return 1;
   if (test_v4mapped_udp() != 0)        return 1;
+  if (test_ipv6_v6only() != 0)         return 1;
   if (test_select_timeout_zero() != 0) return 1;
   if (test_select_pipe_ready() != 0)   return 1;
   if (test_select_multi_fd() != 0)     return 1;

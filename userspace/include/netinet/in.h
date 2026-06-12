@@ -50,4 +50,6 @@ extern const struct in6_addr in6addr_loopback;
 #define IP_ADD_MEMBERSHIP  35
 #define IP_DROP_MEMBERSHIP 36
 
+#define IPV6_V6ONLY        26
+
 #endif

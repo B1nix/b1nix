@@ -271,6 +271,8 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
       struct in6_addr_k dst;
       memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
       if (in6_is_v4mapped(&dst)) {
+        if (s->ipv6_v6only)
+          return -EAFNOSUPPORT;
         /* Dual-stack: ::ffff:a.b.c.d is delivered over the IPv4 path. */
         struct ipv4_addr v4 = {{dst.bytes[12], dst.bytes[13], dst.bytes[14],
                                 dst.bytes[15]}};
@@ -916,9 +918,11 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
     if (!addr || addrlen < sizeof(struct b1nix_sockaddr_in6)) return -EINVAL;
     s->peer.in6 = *(const struct b1nix_sockaddr_in6 *)addr;
     s->connected = 0;
+    struct in6_addr_k dst;
+    memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
+    if (s->ipv6_v6only && in6_is_v4mapped(&dst))
+      return -EAFNOSUPPORT;
     if (s->type == B1NIX_SOCK_STREAM) {
-      struct in6_addr_k dst;
-      memcpy(dst.bytes, s->peer.in6.sin6_addr.s6_addr, 16);
       s->tcp_conn = tcp_connect6(dst, ntoh16(s->peer.in6.sin6_port));
       if (!s->tcp_conn)
         return -ECONNREFUSED;
@@ -973,6 +977,7 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
  * (Linux-compatible numbering). */
 #define SOCK_SOL_SOCKET   1
 #define SOCK_IPPROTO_TCP  6
+#define SOCK_IPPROTO_IPV6 41
 #define SOCK_SO_REUSEADDR 2
 #define SOCK_SO_TYPE      3
 #define SOCK_SO_ERROR     4
@@ -982,6 +987,7 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
 #define SOCK_SO_REUSEPORT 15
 #define SOCK_SO_ACCEPTCONN 30
 #define SOCK_TCP_NODELAY  1
+#define SOCK_IPV6_V6ONLY  26
 #define SOCK_SHUT_RD      0
 #define SOCK_SHUT_WR      1
 #define SOCK_SHUT_RDWR    2
@@ -1022,6 +1028,14 @@ int vfs_setsockopt(int fd, int level, int optname, const void *optval,
     }
     return -ENOPROTOOPT;
   }
+  if (level == SOCK_IPPROTO_IPV6 && optname == SOCK_IPV6_V6ONLY) {
+    if (s->domain != B1NIX_AF_INET6)
+      return -ENOPROTOOPT;
+    if (s->bound || s->connected || s->listening)
+      return -EINVAL;
+    s->ipv6_v6only = v ? 1 : 0;
+    return 0;
+  }
   return -ENOPROTOOPT;
 }
 
@@ -1047,6 +1061,9 @@ int vfs_getsockopt(int fd, int level, int optname, void *optval,
     }
   } else if (level == SOCK_IPPROTO_TCP && optname == SOCK_TCP_NODELAY) {
     v = s->tcp_nodelay;
+  } else if (level == SOCK_IPPROTO_IPV6 && optname == SOCK_IPV6_V6ONLY &&
+             s->domain == B1NIX_AF_INET6) {
+    v = s->ipv6_v6only;
   } else {
     return -ENOPROTOOPT;
   }

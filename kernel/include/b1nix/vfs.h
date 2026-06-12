@@ -323,6 +323,7 @@ struct vfs_socket_state {
   int so_reuseaddr;
   int so_keepalive;
   int tcp_nodelay;
+  int ipv6_v6only;
   int so_error;
   int so_rcvbuf;
   int so_sndbuf;

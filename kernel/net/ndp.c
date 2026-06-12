@@ -199,6 +199,72 @@ static int nd_find_prefix(const u8 *opts, usize len, struct in6_addr_k *out)
 
 static volatile int slaac_configured;
 
+#define ICMP6_MLD_QUERY 130
+#define ICMP6_MLD_REPORT 131
+#define MLD_MAX_GROUPS 8
+
+static struct in6_addr_k mld_groups[MLD_MAX_GROUPS];
+static int mld_group_count;
+static volatile u32 mld_reports;
+
+static void mld_send_report(struct in6_addr_k group)
+{
+	u8 report[24];
+	memset(report, 0, sizeof(report));
+	report[0] = ICMP6_MLD_REPORT;
+	memcpy(report + 8, group.bytes, 16);
+	ipv6_send(group, IP6_NH_ICMPV6, report, sizeof(report));
+	__atomic_add_fetch(&mld_reports, 1, __ATOMIC_RELAXED);
+}
+
+static void mld_join(struct in6_addr_k group)
+{
+	for (int i = 0; i < mld_group_count; i++)
+		if (in6_eq(&mld_groups[i], &group))
+			return;
+	if (mld_group_count >= MLD_MAX_GROUPS)
+		return;
+	mld_groups[mld_group_count++] = group;
+	if (net_is_ready())
+		mld_send_report(group);
+}
+
+void mld_join_solicited_node(struct in6_addr_k address)
+{
+	mld_join(solicited_node(&address));
+}
+
+void mld_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
+                 const void *data, usize size)
+{
+	(void)src;
+	(void)dst;
+	if (type != ICMP6_MLD_QUERY || size < 24)
+		return;
+	struct in6_addr_k requested;
+	memcpy(requested.bytes, (const u8 *)data + 8, 16);
+	for (int i = 0; i < mld_group_count; i++)
+		if (in6_is_zero(&requested) || in6_eq(&requested, &mld_groups[i]))
+			mld_send_report(mld_groups[i]);
+}
+
+void mld_smoke(void)
+{
+	struct in6_addr_k loop;
+	memset(&loop, 0, sizeof(loop));
+	loop.bytes[15] = 1;
+	u32 before = __atomic_load_n(&mld_reports, __ATOMIC_RELAXED);
+	mld_join_solicited_node(loop);
+	u8 query[24];
+	memset(query, 0, sizeof(query));
+	query[0] = ICMP6_MLD_QUERY;
+	mld_receive(loop, loop, ICMP6_MLD_QUERY, query, sizeof(query));
+	if (__atomic_load_n(&mld_reports, __ATOMIC_RELAXED) > before)
+		console_write("M32-IP6: ok mld\n");
+	else
+		console_write("M32-IP6: fail mld\n");
+}
+
 void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
                  const void *data, usize size)
 {
@@ -247,6 +313,7 @@ void ndp_receive(struct in6_addr_k src, struct in6_addr_k dst, u8 type,
 			memcpy(global.bytes, prefix.bytes, 8);
 			memcpy(global.bytes + 8, ll.bytes + 8, 8);
 			net_set_ip6(global);
+			mld_join_solicited_node(global);
 			if (!slaac_configured) {
 				slaac_configured = 1;
 				console_write("net: ipv6 SLAAC configured a global address\n");

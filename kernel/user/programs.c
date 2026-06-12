@@ -1452,6 +1452,19 @@ static int init_main(int argc, const char **argv) {
       int m30_status = 0;
       syscall_dispatch(SYS_WAIT, m30_pid, (u64)(usize)&m30_status, 0, 0, 0, 0);
     }
+
+#ifdef __x86_64__
+    u64 dynamic_pid =
+        syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m30-dynamic", 0,
+                         0, 0, 0, 0);
+    if ((isize)dynamic_pid < 0) {
+      uwrite("M30-DYN: shared-spawn-fail\n");
+    } else {
+      int dynamic_status = 0;
+      syscall_dispatch(SYS_WAIT, dynamic_pid, (u64)(usize)&dynamic_status,
+                       0, 0, 0, 0);
+    }
+#endif
   }
 
   uwrite("M16-SMOKE: start\n");

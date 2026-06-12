@@ -620,9 +620,9 @@ check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-write" "pipe nonblocking write 
 check_output "$LOG" "M11-SMOKE: done" "M11 shell smoke completes"
 
 # ── M33 Shell compliance: POSIX sh features under BusyBox ash ──
-# (Re-implemented as ash-script tests after the in-kernel builtin shell was
-#  retired; array/jobs/glob-class/glob-nomatch/grep-flags/trap dropped — arrays
-#  are bash-only and job control is meaningless in a non-interactive script.)
+# Re-implemented as ash-script tests after the in-kernel builtin shell was
+# retired. Arrays are bash-only and job control is meaningless here; signal
+# traps are exercised asynchronously while ash is blocked in wait.
 check_output "$LOG" "M33-SHELL: start" "M33 shell smoke starts"
 check_output "$LOG" "M33-SHELL: ok pipe-large" "concurrent pipeline streams >512B without deadlock"
 check_output "$LOG" "M33-SHELL: ok cmdsubst" "command substitution \$(...)"
@@ -635,6 +635,7 @@ check_output "$LOG" "M33-SHELL: ok arith" "arithmetic expansion \$((...)) evalua
 check_output "$LOG" "M33-SHELL: ok param-expand" "parameter expansion \${x:-w}"
 check_output "$LOG" "M33-SHELL: ok heredoc" "here-document body"
 check_output "$LOG" "M33-SHELL: ok glob-star" "pathname glob '*.txt' expands"
+check_output "$LOG" "M33-SHELL: ok async-trap" "concurrent SIGUSR1 runs an ash trap"
 check_output "$LOG" "M33-SHELL: done" "M33 shell smoke completes"
 
 check_output "$LOG" "M11-SHELL: ok simple-success" "simple command success"
@@ -821,6 +822,9 @@ check_output "$LOG" "DNS-SMOKE: ok parse-a-record" "DNS A-record parser extracts
 check_output "$LOG" "DNS-SMOKE: ok parse-aaaa-record" "DNS AAAA-record parser extracts a 128-bit IPv6 address"
 check_output "$LOG" "DNS-SMOKE: ok resolv-conf" "/etc/resolv.conf nameserver parsed by the kernel resolver"
 check_output "$LOG" "M32-IP6: ok icmpv6-loopback" "ICMPv6 echo over the ::1 loopback datapath round-trips"
+check_output "$LOG" "M32-IP6: ok icmpv6-errors" "ICMPv6 reports an unreachable closed UDP port"
+check_output "$LOG" "M32-IP6: ok mld" "MLD joins solicited-node groups and answers membership queries"
+check_output "$LOG" "M32-NET: ok ipv6-v6only" "IPV6_V6ONLY rejects IPv4-mapped peers"
 # Real-link IPv6 over QEMU usernet (SLAAC + NDP + ICMPv6 ping the v6 gateway).
 # Skips cleanly when the link has no IPv6 router.
 if grep -q "M32-IP6: unsupported real-link" "$LOG" 2>/dev/null; then
@@ -952,6 +956,9 @@ check_output "$LOG" "M36-FTRACE: done" "M36 ftrace diag completes"
 check_output "$LOG" "M30-DYN: ok pie-binary" "PIE ET_DYN binary loads at PIE base"
 check_output "$LOG" "M30-DYN: ok pie-relocs" "R_X86_64_RELATIVE relocations applied"
 check_output "$LOG" "M30-DYN: done" "M30 dyn-linking smoke completes"
+if [ "$ARCH" = "x86_64" ]; then
+  check_output "$LOG" "M30-DYN: ok shared-libc" "DT_NEEDED libc.so.1 resolves GOT/PLT symbols"
+fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"
 check_output "$LOG" "ahci: registered sata0" "AHCI block device registered"

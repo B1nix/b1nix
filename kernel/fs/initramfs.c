@@ -29,6 +29,10 @@
 #include "initramfs_cacert.inc"
 #include "initramfs_tlstest.inc"
 #include "initramfs_m30_pie.inc"
+#ifdef __x86_64__
+#include "initramfs_m30_dynamic.inc"
+#include "initramfs_shared_libc.inc"
+#endif
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
 #include "initramfs_m38_sound.inc"
@@ -444,6 +448,15 @@ static const char posix_smoke_script[] =
     "grep -q heredoc-body /tmp/m33_hd && echo \"M33-SHELL: ok heredoc\"\n"
     "mkdir -p /tmp/m33_g; : > /tmp/m33_g/a.txt; : > /tmp/m33_g/b.txt\n"
     "set -- /tmp/m33_g/*.txt; [ \"$#\" = \"2\" ] && echo \"M33-SHELL: ok glob-star\"\n"
+    /* Deliver SIGUSR1 from a concurrent process. External commands provide
+     * deterministic user-return points where ash can run the pending trap. */
+    "M33TRAP=none\n"
+    "trap 'M33TRAP=delivered' USR1\n"
+    "/bin/kill -USR1 $$ &\n"
+    "for M33I in 1 2 3 4 5 6 7 8; do "
+    "/bin/true; [ \"$M33TRAP\" = delivered ] && break; done\n"
+    "[ \"$M33TRAP\" = delivered ] && echo \"M33-SHELL: ok async-trap\"\n"
+    "trap - USR1\n"
     "rm -rf /tmp/m33_g /tmp/m33_hd\n"
     "echo \"M33-SHELL: done\"\n"
     /* ── M11 Script exec ────────────────────────────────────────── */
@@ -946,6 +959,13 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     {"/bin/m30-pie", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+#ifdef __x86_64__
+    {"/bin/m30-dynamic", (const char *)vfs_m30_dynamic_elf,
+     sizeof(vfs_m30_dynamic_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc.so.1", (const char *)vfs_shared_libc_elf,
+     sizeof(vfs_shared_libc_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc.so", "/lib/libc.so.1", 15, INITRAMFS_SYMLINK},
+#endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m35-smoke", (const char *)vfs_m35_smoke_elf,
@@ -958,10 +978,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m46-smoke", (const char *)vfs_m46_smoke_elf,
      sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
-    /* M30: the dynamic linker file is shipped as the PIE binary itself —
-     * the in-kernel loader does relocation work, so /lib/ld-b1nix.so
-     * exists as a name on disk that PT_INTERP can reference even though
-     * b1nix doesn't hand control off to a separate userspace ld.so. */
+    /* M30: compatibility interpreter path. Startup dependency loading,
+     * symbol lookup, and relocation are performed eagerly by the kernel. */
     {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},

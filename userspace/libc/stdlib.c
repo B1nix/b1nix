@@ -751,8 +751,8 @@ void siglongjmp(sigjmp_buf env, int val) {
 }
 
 /* -----------------------------------------------------------------------
- * dlfcn stubs — B1NIX supports static linking only; dynamic loading is
- * not available.  These stubs follow the POSIX error-reporting contract:
+ * dlfcn stubs — B1NIX supports eager startup linking, but runtime loading is
+ * not available. These stubs follow the POSIX error-reporting contract:
  *   • dlopen()  always fails → returns NULL, sets dlerror buffer.
  *   • dlerror() returns the last error string and clears the buffer.
  *   • dlsym()   always fails → returns NULL, sets dlerror buffer.
@@ -770,7 +770,7 @@ void *dlopen(const char *filename, int flag)
          * dlsym rather than a misleading dlerror from dlopen itself. */
         return (void *)(unsigned long)1;
     }
-    _dl_errmsg = "dlopen: dynamic loading not supported on b1nix";
+    _dl_errmsg = "dlopen: runtime loading not supported on b1nix";
     return NULL;
 }
 
@@ -793,7 +793,7 @@ void *dlsym(void *handle, const char *symbol)
 int dlclose(void *handle)
 {
     (void)handle;
-    _dl_errmsg = "dlclose: dynamic loading not supported on b1nix";
+    _dl_errmsg = "dlclose: runtime loading not supported on b1nix";
     return -1;
 }
 

@@ -34,10 +34,16 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 /* M30 — ELF64 dynamic-tag identifiers (subset honoured by the in-kernel
  * loader). Standard `Elf64_Dyn` tag values. */
 #define DT_NULL    0
+#define DT_NEEDED  1
 #define DT_PLTRELSZ 2
+#define DT_HASH    4
+#define DT_STRTAB  5
+#define DT_SYMTAB  6
 #define DT_RELA    7
 #define DT_RELASZ  8
 #define DT_RELAENT 9
+#define DT_STRSZ   10
+#define DT_SYMENT  11
 #define DT_JMPREL  23
 #define DT_PLTREL  20
 
@@ -58,6 +64,37 @@ struct elf64_dyn {
   i64 d_tag;
   u64 d_val;
 } __attribute__((packed));
+
+struct elf64_sym {
+  u32 st_name;
+  u8 st_info;
+  u8 st_other;
+  u16 st_shndx;
+  u64 st_value;
+  u64 st_size;
+} __attribute__((packed));
+
+#define ELF64_ST_BIND(info) ((info) >> 4)
+#define STB_WEAK 2
+#define SHN_UNDEF 0
+#define DYN_MAX_OBJECTS 8
+#define DYN_MAX_NEEDED 8
+
+struct elf64_dyn_object {
+  u64 base;
+  usize first_segment;
+  usize segment_count;
+  u64 rela;
+  u64 rela_size;
+  u64 jmprel;
+  u64 jmprel_size;
+  u64 symtab;
+  u64 strtab;
+  u64 strsz;
+  u64 hash;
+  u64 needed[DYN_MAX_NEEDED];
+  usize needed_count;
+};
 
 /* M30 — base address at which PIE/ET_DYN images get loaded. Picked well
  * above the standard 0x400000 ET_EXEC load base and below the user
@@ -105,6 +142,8 @@ static struct user_program *programs = 0;
 static usize program_count = 0;
 static usize programs_capacity = 0;
 static const u64 USER_STACK_MAX_SIZE = 8ULL * 1024ULL * 1024ULL;
+static int user_image_read_vfs_file(const char *path, char **out_data,
+                                    usize *out_size);
 
 static struct user_address_space user_address_space_create(void) {
   struct user_address_space address_space;
@@ -117,6 +156,203 @@ static struct user_address_space user_address_space_create(void) {
   address_space.stack_image = kzalloc(USER_STACK_SIZE);
 
   return address_space;
+}
+
+static u8 *elf64_stage_ptr(struct user_loaded_image *image, u64 va, usize n)
+{
+  if (va + n < va)
+    return 0;
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    if (va >= s->vaddr && va + n <= s->vaddr + s->memsz)
+      return (u8 *)s->data + (va - s->vaddr);
+  }
+  return 0;
+}
+
+static int elf64_parse_dynamic(struct user_loaded_image *image,
+                               struct elf64_dyn_object *obj,
+                               const struct elf64_ehdr *ehdr,
+                               const char *file_data, usize file_size)
+{
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph =
+        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                                    (u64)i * ehdr->e_phentsize);
+    if (ph->p_type != PT_DYNAMIC)
+      continue;
+    if (ph->p_offset + ph->p_filesz < ph->p_offset ||
+        ph->p_offset + ph->p_filesz > file_size)
+      return -1;
+    const struct elf64_dyn *dyn =
+        (const struct elf64_dyn *)(file_data + ph->p_offset);
+    usize count = ph->p_filesz / sizeof(*dyn);
+    for (usize d = 0; d < count && dyn[d].d_tag != DT_NULL; d++) {
+      switch (dyn[d].d_tag) {
+      case DT_NEEDED:
+        if (obj->needed_count < DYN_MAX_NEEDED)
+          obj->needed[obj->needed_count++] = dyn[d].d_val;
+        break;
+      case DT_HASH: obj->hash = dyn[d].d_val + obj->base; break;
+      case DT_STRTAB: obj->strtab = dyn[d].d_val + obj->base; break;
+      case DT_SYMTAB: obj->symtab = dyn[d].d_val + obj->base; break;
+      case DT_STRSZ: obj->strsz = dyn[d].d_val; break;
+      case DT_RELA: obj->rela = dyn[d].d_val + obj->base; break;
+      case DT_RELASZ: obj->rela_size = dyn[d].d_val; break;
+      case DT_JMPREL: obj->jmprel = dyn[d].d_val + obj->base; break;
+      case DT_PLTRELSZ: obj->jmprel_size = dyn[d].d_val; break;
+      default: break;
+      }
+    }
+    return 0;
+  }
+  (void)image;
+  return 0;
+}
+
+static int elf64_load_shared_object(struct user_loaded_image *image,
+                                    const char *path, u64 base,
+                                    struct elf64_dyn_object *obj)
+{
+  char *data = 0;
+  usize size = 0;
+  if (user_image_read_vfs_file(path, &data, &size) != 0)
+    return -1;
+  if (size < sizeof(struct elf64_ehdr)) {
+    kfree(data);
+    return -1;
+  }
+  const struct elf64_ehdr *ehdr = (const struct elf64_ehdr *)data;
+  if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
+      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3 ||
+      ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_type != ELF_TYPE_DYN ||
+      ehdr->e_machine != ELF_MACHINE_X86_64 ||
+      ehdr->e_phentsize != sizeof(struct elf64_phdr) ||
+      ehdr->e_phoff + (u64)ehdr->e_phnum * ehdr->e_phentsize > size) {
+    kfree(data);
+    return -1;
+  }
+
+  memset(obj, 0, sizeof(*obj));
+  obj->base = base;
+  obj->first_segment = image->segment_count;
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph =
+        (const struct elf64_phdr *)(data + ehdr->e_phoff +
+                                    (u64)i * ehdr->e_phentsize);
+    if (ph->p_type != PT_LOAD)
+      continue;
+    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS ||
+        ph->p_filesz > ph->p_memsz ||
+        ph->p_offset + ph->p_filesz > size) {
+      kfree(data);
+      return -1;
+    }
+    struct user_image_segment *seg =
+        &image->segments[image->segment_count++];
+    seg->vaddr = base + ph->p_vaddr;
+    seg->memsz = ph->p_memsz;
+    seg->filesz = ph->p_memsz;
+    seg->flags = ph->p_flags;
+    seg->data = kzalloc(ph->p_memsz ? ph->p_memsz : 1);
+    if (!seg->data) {
+      kfree(data);
+      return -1;
+    }
+    if (ph->p_filesz)
+      memcpy(seg->data, data + ph->p_offset, ph->p_filesz);
+    obj->segment_count++;
+  }
+  int rc = elf64_parse_dynamic(image, obj, ehdr, data, size);
+  kfree(data);
+  return rc;
+}
+
+static int elf64_symbol_count(struct user_loaded_image *image,
+                              const struct elf64_dyn_object *obj,
+                              u32 *out)
+{
+  u32 *hash = (u32 *)elf64_stage_ptr(image, obj->hash, 8);
+  if (!hash)
+    return -1;
+  *out = hash[1]; /* SysV hash nchain equals the dynamic symbol count. */
+  return 0;
+}
+
+static int elf64_resolve_symbol(struct user_loaded_image *image,
+                                struct elf64_dyn_object *objects,
+                                usize object_count, const char *name,
+                                u64 *value)
+{
+  for (usize o = 0; o < object_count; o++) {
+    u32 count = 0;
+    if (!objects[o].symtab || !objects[o].strtab ||
+        elf64_symbol_count(image, &objects[o], &count) != 0)
+      continue;
+    for (u32 i = 1; i < count; i++) {
+      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+          image, objects[o].symtab + (u64)i * sizeof(*sym), sizeof(*sym));
+      if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_name >= objects[o].strsz)
+        continue;
+      const char *candidate = (const char *)elf64_stage_ptr(
+          image, objects[o].strtab + sym->st_name, 1);
+      if (candidate && strcmp(candidate, name) == 0) {
+        *value = objects[o].base + sym->st_value;
+        return 0;
+      }
+    }
+  }
+  return -1;
+}
+
+static int elf64_apply_rela_table(struct user_loaded_image *image,
+                                  struct elf64_dyn_object *objects,
+                                  usize object_count, usize owner,
+                                  u64 table, u64 table_size)
+{
+  if (!table || !table_size)
+    return 0;
+  usize count = table_size / sizeof(struct elf64_rela);
+  for (usize i = 0; i < count; i++) {
+    struct elf64_rela *rela = (struct elf64_rela *)elf64_stage_ptr(
+        image, table + i * sizeof(*rela), sizeof(*rela));
+    if (!rela)
+      return -1;
+    u32 type = (u32)rela->r_info;
+    u32 sym_index = (u32)(rela->r_info >> 32);
+    u64 *target = (u64 *)elf64_stage_ptr(
+        image, objects[owner].base + rela->r_offset, sizeof(u64));
+    if (!target)
+      return -1;
+    if (type == R_X86_64_NONE)
+      continue;
+    if (type == R_X86_64_RELATIVE) {
+      *target = objects[owner].base + (u64)rela->r_addend;
+      continue;
+    }
+    if (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT ||
+        type == R_X86_64_JUMP_SLOT) {
+      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+          image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
+          sizeof(*sym));
+      if (!sym || sym->st_name >= objects[owner].strsz)
+        return -1;
+      const char *name = (const char *)elf64_stage_ptr(
+          image, objects[owner].strtab + sym->st_name, 1);
+      u64 resolved = 0;
+      if (!name ||
+          elf64_resolve_symbol(image, objects, object_count, name, &resolved) != 0) {
+        if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+          resolved = 0;
+        else
+          return -1;
+      }
+      *target = resolved + (u64)rela->r_addend;
+      continue;
+    }
+    return -1;
+  }
+  return 0;
 }
 
 static char *kernel_strdup(const char *src) {
@@ -407,11 +643,9 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   console_write("\n");
   image->address_space = user_address_space_create();
 
-  /* PT_INTERP: log which interpreter the binary asks for. With PIE +
-   * RELATIVE relocations the kernel does the relocation work itself; a
-   * proper userspace dynamic linker is still future work, so binaries
-   * that have undefined external symbols won't run. We accept the
-   * PT_INTERP segment as informational rather than rejecting outright. */
+  /* PT_INTERP is informational: the ELF64 loader performs startup dependency
+   * loading, symbol resolution, and relocation eagerly before entering user
+   * mode rather than handing control to a separate ld.so process. */
   for (u16 j = 0; j < ehdr->e_phnum; j++) {
     struct elf64_phdr *p =
         (struct elf64_phdr *)(file_data + ehdr->e_phoff +
@@ -425,7 +659,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     interp[ilen] = '\0';
     console_write("ELF load: PT_INTERP=");
     console_write(interp);
-    console_write(" (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n");
+    console_write(" (eager in-kernel dynamic linking)\n");
   }
 
   /* First pass: PT_LOAD segments. Vaddrs are offset by `load_base` for
@@ -457,130 +691,81 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         &image->segments[image->segment_count++];
     segment->vaddr = reloc_vaddr;
     segment->memsz = phdr->p_memsz;
-    segment->filesz = phdr->p_filesz;
+    segment->filesz = phdr->p_memsz;
     segment->flags = phdr->p_flags;
 
-    /* Allocate only p_filesz to avoid huge .bss kernel-heap allocations. */
-    if (phdr->p_filesz > 0) {
-      segment->data = kzalloc(phdr->p_filesz);
+    /* Relocations may target .bss or the zero-filled tail of a PT_LOAD, so the
+     * staging image must cover p_memsz, not only the bytes present on disk. */
+    if (phdr->p_memsz > 0) {
+      segment->data = kzalloc(phdr->p_memsz);
       if (!segment->data) {
         kfree(file_data);
         return -1;
       }
-      memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
+      if (phdr->p_filesz)
+        memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
     } else {
       segment->data = 0;
     }
   }
 
-  /* Second pass: apply PIE relocations. Skipped for ET_EXEC since
-   * static binaries have no PT_DYNAMIC. Only R_X86_64_RELATIVE is
-   * handled — that covers PIE binaries with no external symbol
-   * references (the only flavour b1nix currently supports). */
+  /* Eager dynamic linking. The kernel loads each DT_NEEDED ET_DYN object into
+   * the process image, resolves symbols globally (main first, then libraries),
+   * and patches GOT/PLT before userspace starts. */
   if (load_base != 0) {
-    u64 rela_off = 0, rela_sz = 0;
-    u64 jmprel_off = 0, jmprel_sz = 0;
-    int jmprel_is_rela = 1;
-    for (u16 i = 0; i < ehdr->e_phnum; i++) {
-      struct elf64_phdr *phdr =
-          (struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                                ((u64)i * ehdr->e_phentsize));
-      if (phdr->p_type != PT_DYNAMIC) continue;
-      if (phdr->p_offset + phdr->p_filesz > file_size) continue;
-      struct elf64_dyn *dyn =
-          (struct elf64_dyn *)(file_data + phdr->p_offset);
-      usize ndyn = phdr->p_filesz / sizeof(struct elf64_dyn);
-      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
-        switch (dyn[d].d_tag) {
-          case DT_RELA:    rela_off = dyn[d].d_val; break;
-          case DT_RELASZ:  rela_sz = dyn[d].d_val; break;
-          case DT_JMPREL:  jmprel_off = dyn[d].d_val; break;
-          case DT_PLTRELSZ: jmprel_sz = dyn[d].d_val; break;
-          case DT_PLTREL:  jmprel_is_rela = (dyn[d].d_val == DT_RELA); break;
-        }
-      }
-      break;
+    struct elf64_dyn_object objects[DYN_MAX_OBJECTS];
+    memset(objects, 0, sizeof(objects));
+    usize object_count = 1;
+    objects[0].base = load_base;
+    objects[0].first_segment = 0;
+    objects[0].segment_count = image->segment_count;
+    if (elf64_parse_dynamic(image, &objects[0], ehdr, file_data, file_size) != 0) {
+      kfree(file_data);
+      return -1;
     }
 
-    /* Translate a PIE-relative virtual address to a kernel pointer into
-     * one of the staging buffers we just kzalloc'd. Returns 0 if the
-     * vaddr lies outside any loaded segment. */
-    #define VADDR_TO_STAGE(v, n) \
-      _vaddr_to_stage(image, (v) + load_base, (n))
-
-    /* Inline helper as a static-scope lambda-replacement. */
-    /* (declared inline above; body further down) */
-
-    /* Walk DT_RELA. */
-    if (rela_off && rela_sz) {
-      usize nrela = rela_sz / sizeof(struct elf64_rela);
-      /* The DT_RELA address is a PIE vaddr;
-       * convert it to a staging-buffer pointer. We use a small helper. */
-      for (usize r = 0; r < nrela; r++) {
-        /* Read the rela entry out of the staging buffer (kernel-mapped
-         * pre-relocation snapshot of the segments). */
-        u8 *rela_stage = 0;
-        for (usize s = 0; s < image->segment_count; s++) {
-          u64 sv = image->segments[s].vaddr;
-          u64 sf = image->segments[s].filesz;
-          u64 target = rela_off + load_base + r * sizeof(struct elf64_rela);
-          if (target >= sv && target + sizeof(struct elf64_rela) <= sv + sf) {
-            rela_stage = (u8 *)image->segments[s].data + (target - sv);
-            break;
-          }
-        }
-        if (!rela_stage) continue;
-        struct elf64_rela rr;
-        memcpy(&rr, rela_stage, sizeof(rr));
-        u32 type = (u32)(rr.r_info & 0xffffffff);
-        if (type != R_X86_64_RELATIVE) continue;
-        u64 target_va = rr.r_offset + load_base;
-        u64 value = (u64)((i64)load_base + rr.r_addend);
-        /* Find the segment that contains target_va and write `value`
-         * into the staging buffer at the appropriate offset. */
-        for (usize s = 0; s < image->segment_count; s++) {
-          u64 sv = image->segments[s].vaddr;
-          u64 sf = image->segments[s].filesz;
-          if (target_va >= sv && target_va + 8 <= sv + sf) {
-            memcpy((u8 *)image->segments[s].data + (target_va - sv), &value, 8);
-            break;
-          }
-        }
+    for (usize n = 0; n < objects[0].needed_count; n++) {
+      if (object_count >= DYN_MAX_OBJECTS || !objects[0].strtab) {
+        kfree(file_data);
+        return -1;
       }
+      const char *name = (const char *)elf64_stage_ptr(
+          image, objects[0].strtab + objects[0].needed[n], 1);
+      if (!name || strchr(name, '/')) {
+        kfree(file_data);
+        return -1;
+      }
+      char libpath[96] = "/lib/";
+      usize name_len = strlen(name);
+      if (name_len + 6 > sizeof(libpath)) {
+        kfree(file_data);
+        return -1;
+      }
+      memcpy(libpath + 5, name, name_len + 1);
+      u64 lib_base = 0x0000600000000000ULL +
+                     (u64)(object_count - 1) * 0x0000010000000000ULL;
+      if (elf64_load_shared_object(image, libpath, lib_base,
+                                   &objects[object_count]) != 0) {
+        console_write("ELF load: missing/invalid DT_NEEDED ");
+        console_write(libpath);
+        console_write("\n");
+        kfree(file_data);
+        return -1;
+      }
+      object_count++;
     }
 
-    /* DT_JMPREL (PLT relocations) — same shape, applied separately. */
-    if (jmprel_off && jmprel_sz && jmprel_is_rela) {
-      usize nrela = jmprel_sz / sizeof(struct elf64_rela);
-      for (usize r = 0; r < nrela; r++) {
-        u8 *rela_stage = 0;
-        for (usize s = 0; s < image->segment_count; s++) {
-          u64 sv = image->segments[s].vaddr;
-          u64 sf = image->segments[s].filesz;
-          u64 target = jmprel_off + load_base + r * sizeof(struct elf64_rela);
-          if (target >= sv && target + sizeof(struct elf64_rela) <= sv + sf) {
-            rela_stage = (u8 *)image->segments[s].data + (target - sv);
-            break;
-          }
-        }
-        if (!rela_stage) continue;
-        struct elf64_rela rr;
-        memcpy(&rr, rela_stage, sizeof(rr));
-        u32 type = (u32)(rr.r_info & 0xffffffff);
-        if (type != R_X86_64_RELATIVE) continue;
-        u64 target_va = rr.r_offset + load_base;
-        u64 value = (u64)((i64)load_base + rr.r_addend);
-        for (usize s = 0; s < image->segment_count; s++) {
-          u64 sv = image->segments[s].vaddr;
-          u64 sf = image->segments[s].filesz;
-          if (target_va >= sv && target_va + 8 <= sv + sf) {
-            memcpy((u8 *)image->segments[s].data + (target_va - sv), &value, 8);
-            break;
-          }
-        }
+    for (usize o = 0; o < object_count; o++) {
+      if (elf64_apply_rela_table(image, objects, object_count, o,
+                                 objects[o].rela, objects[o].rela_size) != 0 ||
+          elf64_apply_rela_table(image, objects, object_count, o,
+                                 objects[o].jmprel,
+                                 objects[o].jmprel_size) != 0) {
+        console_write("ELF load: unresolved/unsupported dynamic relocation\n");
+        kfree(file_data);
+        return -1;
       }
     }
-    #undef VADDR_TO_STAGE
   }
 
   kfree(file_data);

@@ -285,8 +285,8 @@ Supporting documents:
 - [x] Load `ET_DYN`/PIE binaries and apply `R_X86_64_RELATIVE` relocations.
 - [x] Detect `PT_INTERP` and ship `/lib/ld-b1nix.so` as a compatibility stub.
 - [x] Add PIE relocation tests and POSIX-shaped `dl*` stubs.
-- [ ] `partial` A real userspace dynamic linker, `DT_NEEDED`, GOT/PLT symbol
-  resolution, and shared `libc.so` are not implemented.
+- [x] Add eager ELF64 startup linking with `DT_NEEDED`, SysV symbol lookup,
+  GOT/PLT relocation, and shared `libc.so.1`.
 
 ## M31: Users, Passwords, and Permissions
 
@@ -311,7 +311,8 @@ Supporting documents:
 - [x] Add external IPv4/IPv6 HTTP and HTTPS support.
 - [x] Add PCRE2, IRI/IDN, and NTLM support for Wget.
 - [x] Make system timestamps and `time_t` Y2038-safe.
-- [ ] `partial` Remaining IPv6 work: ICMPv6 errors, MLD, and `IPV6_V6ONLY`.
+- [x] Add ICMPv6 error delivery, MLDv1 membership handling, and
+  `IPV6_V6ONLY`.
 
 ## M32b: SSH Daemon Prerequisites
 
@@ -341,7 +342,7 @@ Supporting documents:
   expansion.
 - [x] Complete foreground/background job control and concurrent pipelines.
 - [x] Add common coreutils flags and basic `trap` support.
-- [ ] `partial` Asynchronous signal-triggered shell traps remain incomplete.
+- [x] Verify asynchronous signal-triggered traps in upstream BusyBox `ash`.
 - [x] The in-kernel shell was later retired in favor of upstream BusyBox `ash`.
 
 ## M34: Virtual Filesystems

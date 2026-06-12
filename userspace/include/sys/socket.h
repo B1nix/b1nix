@@ -123,6 +123,7 @@ struct cmsghdr {
 #define IPPROTO_IP      0
 #define IPPROTO_TCP     6
 #define IPPROTO_UDP     17
+#define IPPROTO_IPV6    41
 
 #define SOL_SOCKET      1
 #define SO_REUSEADDR    2
