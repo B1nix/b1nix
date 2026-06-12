@@ -7,6 +7,7 @@ struct compositor_window;
 
 void compositor_init(void);
 void compositor_wake(void);
+void compositor_reclaim_display(void);
 struct compositor_window *compositor_window_create(int x, int y, int width, int height);
 void compositor_window_destroy(struct compositor_window *win);
 void compositor_window_move(struct compositor_window *win, int x, int y);

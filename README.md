@@ -91,10 +91,22 @@ Build an ISO:
 make iso
 ```
 
-Boot it in QEMU with a persistent ext4 root disk and user-mode networking:
+Boot the self-contained ISO in QEMU with user-mode networking:
 
 ```sh
-make run-x86_64
+make run
+```
+
+Boot directly into graphical runlevel 5 with a virtio GPU:
+
+```sh
+make run-graphics
+```
+
+Use the separately built persistent ext4 root image when needed:
+
+```sh
+make run-root
 ```
 
 The first complete build downloads and cross-builds several userspace
@@ -104,7 +116,8 @@ For the 32-bit port:
 
 ```sh
 make ARCH=x86 iso
-make ARCH=x86 run-x86_64
+make ARCH=x86 run
+make ARCH=x86 run-graphics
 ```
 
 Build output is architecture-qualified under `build/x86_64/` or `build/x86/`.

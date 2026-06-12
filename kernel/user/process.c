@@ -1269,6 +1269,8 @@ void user_address_space_cleanup(struct task *t) {
     }
 
     if (vma->node) {
+      if (vma->node->inode && vma->node->inode->mmap_close_cb)
+        vma->node->inode->mmap_close_cb(vma->node);
       vfs_node_put(vma->node);
     }
     kfree(vma);

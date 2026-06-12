@@ -37,7 +37,7 @@ separation in daemons).
 
 ## M47: Userspace Display Server
 
-### Phase 1 — kernel substrate (LANDED, reclaim deferred)
+### Phase 1 — kernel substrate (LANDED)
 
 Status: implemented and green on both arches (`M47-GFX` markers in the main
 smoke suite, single-CPU and `-smp 4`). What landed vs. the plan below:
@@ -59,9 +59,9 @@ smoke suite, single-CPU and `-smp 4`). What landed vs. the plan below:
   mouse burst received through a blocking read (`m47-inject` kthread in
   `programs.c`; the injector feeds `input_event_push` directly since a
   headless QEMU has no mouse to wiggle — i8042 decode is real-HW-only).
-- Deferred: console *reclaim* when the last fb0 user exits (needs displayd
-  lifecycle, Phase 2); `compositor.c` currently just stops flushing once
-  fb0 is claimed.
+- Console reclaim: device-mmap VMA lifecycle hooks count mappings across
+  fork/split/munmap/exec/exit. The last mapping returns scanout ownership and
+  requests a full kernel-compositor redraw.
 - Fixed en route: `userspace/include/sys/resource.h` used `id_t` without
   including `<sys/types.h>` (M46 regression) — broke every fresh autotools
   configure (`ac_cv_header_sys_resource_h=no` → bash build failure).
@@ -84,7 +84,51 @@ smoke suite, single-CPU and `-smp 4`). What landed vs. the plan below:
 
 ### Phase 2 — protocol + server
 
-`b1display` protocol v1 over a UNIX socket (`/run/display.sock`).
+Status: implemented and smoke-tested on x86_64 and x86. `b1display` v1 has
+Wayland-style object framing, SysV-SHM buffers, surface attach/damage/commit,
+frame and sync callbacks, seat pointer/keyboard/focus events, and a toplevel
+role with title, serial-authorized move/resize and close events. `displayd`
+is a single-threaded UNIX-socket compositor with damage-driven framebuffer
+updates, a software cursor, click-to-focus/raise, draggable title bars,
+`Alt+Tab`, `Alt+F4`, and server-side decorations. It is available as an
+inittab-supervised runlevel-5 service.
+
+The M47 smoke starts the server and two independent protocol clients, verifies
+SHM composition, callbacks, framebuffer checksum, pointer/button focus and
+`Alt+Tab`, requests a clean shutdown, checks scanout handback to the kernel
+compositor, then starts a second server and completes another handshake.
+
+#### Desktop-integration fixes (interactive `make run-graphics`)
+
+Bringing the real runlevel-5 desktop up (vs. the headless smoke, which uses a
+synthetic input injector) surfaced four issues, all now fixed:
+
+- **Kernel console fought displayd for the framebuffer.** `fb_console`
+  (text + the blinking cursor) and the runlevel-5 `console` bash both drew
+  straight into `/dev/fb0` while displayd composited there — a blinking line,
+  windows getting half-erased, and a stray block. Fix: every `fb_console`
+  draw path early-returns when `fb_dev_claimed()` (both arches), and the
+  inittab `console` shell now runs at runlevels 2-4 only (not 5), so no shell
+  scribbles on or steals keystrokes from the desktop. The serial getty stays
+  at runlevel 5 as a rescue path.
+- **The mouse never moved (`ps2_mouse: enable failed`).** The keyboard
+  IRQ/timer-tick i8042 poll fallback drained the mouse's 0xFA ACK out of the
+  shared output buffer mid-`ps2_mouse_init` (and dropped it, since
+  `mouse_ready` was still 0), so init always timed out. Fix: the init
+  handshake now runs with interrupts disabled, does a proper `0xFF` reset for
+  presence detection, and tolerates late/stale ACKs. The "stray block" in the
+  middle of the screen was simply displayd's cursor stuck at its start
+  position because no motion events were arriving.
+- **`SURFACE_SET_POSITION` request added** so a client can place its own
+  window (used by the smoke client to sit under the cursor; available to
+  desktop apps for explicit layout). Server placement applies only when no
+  explicit position was requested.
+- **macOS-style top bar:** the panel now shows `b1nix` + the focused app's
+  title on the left and a live `HH:MM` clock (RTC, repainted on the minute)
+  flush right; title-bar dragging is clamped so a window can't be lost under
+  the bar or off-screen.
+
+`b1display` protocol v1 over a UNIX socket (`/run/b1display.sock`).
 **Wayland-shaped on purpose** — these constraints are load-bearing for M49:
 
 - Wire format: little-endian 8-byte header (object id u32, opcode u16,
@@ -114,18 +158,18 @@ smoke suite, single-CPU and `-smp 4`). What landed vs. the plan below:
 
 ### Phase 3 — client library + apps + smoke
 
-- `libb1gui`: connection handling, object marshalling, SHM pool helper,
+- Status: implemented and green on x86_64 and x86.
+- `libb1gui`: connection handling, object marshalling, SHM buffer helper,
   damage/commit/frame helpers, simple event dispatch.
-- Demo clients: `gclock` (animated, exercises frame callbacks), `gterm`
-  (terminal emulator on the existing pty layer), `gpaint` or similar
-  (exercises pointer input).
-- Smoke: extend `tests/graphics-smoke.sh` (QEMU with `-device
+- Demo clients: `gclock` (animated frame callbacks), `gterm` (shell over the
+  existing `forkpty` layer with raw-key input), and `gpaint` (pointer-driven
+  drawing).
+- Smoke: `tests/graphics-smoke.sh` (QEMU with `-device
   virtio-gpu-pci`, headless). Pixel correctness is verified server-side: the
-  server checksums the composited framebuffer region and emits markers —
-  no screenshot needed over serial. Markers (`M47-GFX:`): `ok fb-mmap`,
-  `ok fb-flush`, `ok input-event`, `ok connect`, `ok shm-attach`,
-  `ok commit-damage`, `ok frame-callback`, `ok two-clients`,
-  `ok focus-switch`, `ok server-restart` (console reclaim works).
+  server returns a composited framebuffer checksum, so no screenshot is
+  needed over serial. The test verifies fb mmap/flush, input delivery,
+  commit/frame callbacks, two clients, checksum, click focus, `Alt+Tab`,
+  console reclaim and server restart.
 
 ## M48: FD Passing and Anonymous Shared Memory
 

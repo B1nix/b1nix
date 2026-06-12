@@ -88,6 +88,8 @@
 #define B1NIX_VQUIT  1
 #define B1NIX_VERASE 2
 #define B1NIX_VEOF   4
+#define B1NIX_VTIME  5
+#define B1NIX_VMIN   6
 #define B1NIX_VSUSP  10
 
 struct b1nix_winsize {

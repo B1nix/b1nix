@@ -548,28 +548,32 @@ Own compositor + own protocol, deliberately Wayland-shaped so M49 is a short
 step, not a rewrite. Design and decision record:
 [`display-server.md`](display-server.md).
 
-- [ ] `partial` Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
+- [x] Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
   ioctl) over virtio-gpu; kernel `compositor.c` becomes the console fallback
   with claim/reclaim handoff. — Device, shared-frame mmap (`mmap_phys_cb` +
   `VMM_SHARED`), `FBIOGET_INFO`/`FBIOFLUSH`, and the claim side (compositor
-  stops flushing once userspace maps fb0) are done and smoke-tested
-  (`M47-GFX` fb markers, both arches); console *reclaim* on release is
-  deferred to the displayd phase.
+  stops flushing once userspace maps fb0) are done. VMA lifecycle hooks now
+  release ownership on munmap/exec/exit and request a full kernel-compositor
+  redraw; `M47-DSP: ok console-reclaim` covers the displayd exit path.
 - [x] Add evdev-style `/dev/input/event*` devices for PS/2 keyboard and
   mouse (pollable, raw keycodes; keymaps in userspace) — per-client queues,
   O_NONBLOCK/EAGAIN, signal-interruptible blocking reads; verified by the
   `M47-GFX` input markers (kernel-injected burst through the real
   queue/read path; i8042 decode wiring exercised on real HW only).
-- [ ] `planned` Define the `b1display` v1 protocol: Wayland wire framing,
+- [x] Define the `b1display` v1 protocol: Wayland wire framing,
   client-allocated buffers (SysV SHM transport in v1, behind an
   abstraction), attach/damage/commit surfaces, frame callbacks, seat input,
-  toplevel role.
-- [ ] `planned` Implement the `displayd` compositor: damage-driven SHM
+  toplevel role. — Includes title, serial-authorized move/resize, configure
+  and close events.
+- [x] Implement the `displayd` compositor: damage-driven SHM
   compositing into `/dev/fb0`, cursor, focus, alt-tab, minimal decorations;
-  started from `/etc/inittab`, clean console handback on exit.
-- [ ] `planned` Add `libb1gui` plus demo clients (`gclock`, `gterm`,
+  started from `/etc/inittab`, clean console handback on exit. — Includes
+  draggable title bars, click-to-focus/raise, `Alt+Tab`, `Alt+F4`, runlevel-5
+  supervision and restart after framebuffer reclaim.
+- [x] Add `libb1gui` plus demo clients (`gclock`, `gterm`,
   `gpaint`) and extend `tests/graphics-smoke.sh` with `M47-GFX` markers
-  (server-side framebuffer checksums, no screenshots).
+  (server-side framebuffer checksum, two clients, focus switching, console
+  reclaim and restart; green on x86_64 and x86).
 
 ## M48: UNIX-Socket FD Passing and memfd
 

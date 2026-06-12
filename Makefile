@@ -53,6 +53,12 @@ EMBEDDED_USER_PROGRAMS := \
 	m42_w5pre_smoke \
 	m46_smoke \
 	m47_smoke \
+	m47d_smoke \
+	displayd \
+	gclock \
+	gterm \
+	gpaint \
+	gdesktop \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 ifeq ($(ARCH),x86_64)
@@ -149,6 +155,8 @@ COMMON_CFLAGS := \
 	-fno-stack-protector \
 	-fno-pic \
 	-mno-red-zone \
+	-MMD \
+	-MP \
 	-Wall \
 	-Wextra \
 	-I kernel/include \
@@ -285,6 +293,9 @@ endif
 OBJECTS := \
 	$(patsubst %.c,$(BUILD_DIR)/%.o,$(KERNEL_SOURCES)) \
 	$(patsubst %.S,$(BUILD_DIR)/%.o,$(ASM_SOURCES))
+KERNEL_DEPS := $(OBJECTS:.o=.d)
+
+-include $(KERNEL_DEPS)
 
 ANALYZE_DIR := $(BUILD_DIR)/analyze
 
@@ -305,7 +316,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 .PHONY: all analyze objects FORCE iso iso-live iso-test iso-full \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source root-image \
-	run-x86_64 run-x86 run-root check-tools clean distclean \
+	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
 	smoke smoke-x86_64 smoke-x86 graphics-smoke memory-smoke
 
 all: $(KERNEL_ELF)
@@ -396,7 +407,9 @@ $(USERSPACE_ARCH_STAMP): FORCE
 USERSPACE_DEPS := \
 	$(USERSPACE_ARCH_STAMP) \
 	$(wildcard userspace/libc/*.c) \
+	$(wildcard userspace/libgui/*.c) \
 	$(wildcard userspace/include/*.h) \
+	$(wildcard userspace/include/b1nix/*.h) \
 	$(wildcard userspace/include/arpa/*.h) \
 	$(wildcard userspace/include/netinet/*.h) \
 	$(wildcard userspace/include/sys/*.h) \
@@ -652,15 +665,27 @@ install-kernel-source:
 # built the toolchain and then omitted it from the resulting image.
 iso-full: iso-live
 
-run-x86_64: iso userspace-install root-image
+run: iso
+	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
+
+run-graphics: KERNEL_CMDLINE += b1nix.runlevel=5
+run-graphics: iso
+	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
+	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
+		-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
+		-device virtio-gpu-pci
+
+run-x86_64: run
+
+run-x86: run
+
+run-root: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
-
-run-x86: run-x86_64
-
-run-root: run-x86_64
 
 root-image: userspace-install install-native-toolchain install-kernel-source
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
@@ -702,7 +727,7 @@ smoke-x86: ARCH=x86
 smoke-x86: smoke
 
 graphics-smoke:
-	sh tests/graphics-smoke.sh
+	sh tests/graphics-smoke.sh $(ARCH)
 
 memory-smoke:
 	@sh tests/memory-smoke.sh

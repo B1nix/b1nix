@@ -40,6 +40,12 @@
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
 #include "initramfs_m47_smoke.inc"
+#include "initramfs_m47d_smoke.inc"
+#include "initramfs_displayd.inc"
+#include "initramfs_gclock.inc"
+#include "initramfs_gterm.inc"
+#include "initramfs_gpaint.inc"
+#include "initramfs_gdesktop.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
 #include "initramfs_telinit.inc"
@@ -271,8 +277,15 @@ static const char initramfs_inittab[] =
     "# Format: id:runlevels:action:process\n"
     "id:3:initdefault:\n"
     "si::sysinit:/etc/rc\n"
-    "console:2345:respawn:/bin/bash\n"
+    /* The framebuffer console shell runs at runlevels 2-4 only. At runlevel 5
+     * the graphical session (displayd) owns /dev/fb0 and the raw keyboard via
+     * /dev/input; a bash on /dev/console there would both scribble over the
+     * desktop and silently consume keystrokes. The serial getty stays up at 5
+     * as a rescue path. */
+    "console:234:respawn:/bin/bash --noediting\n"
     "ttyS0:2345:respawn:/bin/getty -L 115200 ttyS0 vt100\n"
+    "display:5:respawn:/bin/displayd\n"
+    "desktop:5:respawn:/bin/gdesktop\n"
     "ca::ctrlaltdel:/bin/reboot\n"
     "sd::shutdown:/etc/rc.shutdown\n";
 
@@ -981,6 +994,18 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m47-smoke", (const char *)vfs_m47_smoke_elf,
      sizeof(vfs_m47_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m47d-smoke", (const char *)vfs_m47d_smoke_elf,
+     sizeof(vfs_m47d_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/displayd", (const char *)vfs_displayd_elf,
+     sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/gclock", (const char *)vfs_gclock_elf,
+     sizeof(vfs_gclock_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/gterm", (const char *)vfs_gterm_elf,
+     sizeof(vfs_gterm_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/gpaint", (const char *)vfs_gpaint_elf,
+     sizeof(vfs_gpaint_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/gdesktop", (const char *)vfs_gdesktop_elf,
+     sizeof(vfs_gdesktop_elf), INITRAMFS_EXECUTABLE},
     /* M30: compatibility interpreter path. Startup dependency loading,
      * symbol lookup, and relocation are performed eagerly by the kernel. */
     {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,

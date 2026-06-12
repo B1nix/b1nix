@@ -6,6 +6,10 @@
 #include <string.h>
 #include "font8x8.h"
 
+/* M47: suppress kernel console drawing while a userspace display server owns
+ * /dev/fb0 (see the x86_64 fb_console.c note). Defined in kernel/dev/fb.c. */
+int fb_dev_claimed(void);
+
 static struct boot_framebuffer fb;
 static u32 cursor_x;
 static u32 cursor_y;
@@ -107,6 +111,8 @@ void fb_console_clear(void)
 	cursor_x = 0;
 	cursor_y = 0;
 
+	if (fb_dev_claimed()) return;
+
 	for (u32 y = 0; y < fb.height; y++) {
 		for (u32 x = 0; x < fb.width; x++) {
 			put_pixel(x, y, bg_color);
@@ -197,7 +203,7 @@ static int ansi_cursor_hidden = 0;
 
 void fb_console_blink_cursor(void)
 {
-    if (!fb_ptr || ansi_cursor_hidden) return;
+    if (!fb_ptr || ansi_cursor_hidden || fb_dev_claimed()) return;
 
     cursor_visible = !cursor_visible;
     u32 color = cursor_visible ? fg_color : bg_color;
@@ -216,7 +222,7 @@ void fb_console_blink_cursor(void)
 
 void fb_console_putchar(char c)
 {
-    if (!fb_ptr) return;
+    if (!fb_ptr || fb_dev_claimed()) return;
 
     if (ansi_state == 1) {
         if (c == '[') {

@@ -28,6 +28,7 @@ CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector 
 BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
+GUI_LIB  := $(BUILD)/libb1gui.a
 SHARED_LIBC := $(BUILD)/libc.so.1
 CRT0     := $(BUILD)/crt/crt0.o
 DYNAMIC_CRT0 := $(BUILD)/crt/crt0-dynamic.o
@@ -56,6 +57,9 @@ LIBC_OBJS := \
 	$(BUILD)/libc/mntent.o \
 	$(BUILD)/libc/statvfs.o \
 	$(BUILD)/libc/div64.o
+GUI_OBJS := $(BUILD)/libgui/gui.o
+GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
+	$(BUILD)/bin/gdesktop $(BUILD)/bin/m47d_smoke
 
 PIC_LIBC_OBJS := $(patsubst $(BUILD)/libc/%.o,$(BUILD)/libc-pic/%.o,$(LIBC_OBJS))
 
@@ -107,7 +111,7 @@ DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 .PHONY: all clean install install-headers-libs
 .SECONDARY:
 
-all: $(LIB) $(DYNAMIC_TARGETS) $(BINARIES)
+all: $(LIB) $(GUI_LIB) $(DYNAMIC_TARGETS) $(BINARIES) $(GUI_BINARIES)
 
 # ── crt0 ──
 $(BUILD)/crt/crt0.o: crt/crt0.S
@@ -127,10 +131,18 @@ $(BUILD)/libc-pic/%.o: libc/%.c
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
+$(BUILD)/libgui/%.o: libgui/%.c
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $@
+
 # ── libb1nix.a ──
 $(LIB): $(LIBC_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(LIBC_OBJS)
+
+$(GUI_LIB): $(GUI_OBJS)
+	@mkdir -p $(dir $@)
+	$(AR) rcs $@ $(GUI_OBJS)
 
 $(SHARED_LIBC): $(PIC_LIBC_OBJS) linker_shared.ld
 	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=sysv -soname libc.so.1 \
@@ -153,8 +165,14 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # ── User programs ──
 $(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/$*.o
+	$(CC) $(CFLAGS) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o --whole-archive $(LIB) --no-whole-archive
+
+$(GUI_BINARIES): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o \
+		--whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
 $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	@mkdir -p $(dir $@)
@@ -213,12 +231,13 @@ else
 endif
 
 # ── Install to rootfs ──
-install-headers-libs: $(LIB) $(CRT0)
+install-headers-libs: $(LIB) $(GUI_LIB) $(CRT0)
 	@echo "Installing userspace headers and libraries..."
 	@mkdir -p $(ROOTFS)/include
 	@mkdir -p $(ROOTFS)/lib
 	cp -r include/* $(ROOTFS)/include/
 	cp $(LIB) $(ROOTFS)/lib/
+	cp $(GUI_LIB) $(ROOTFS)/lib/
 	cp $(CRT0) $(ROOTFS)/lib/
 	ln -sf libb1nix.a $(ROOTFS)/lib/libc.a
 	ln -sf libb1nix.a $(ROOTFS)/lib/libm.a
@@ -230,6 +249,7 @@ install: all install-headers-libs
 	@echo "Installing userspace binaries..."
 	@mkdir -p $(ROOTFS)/bin
 	cp $(BINARIES) $(ROOTFS)/bin/
+	cp $(GUI_BINARIES) $(ROOTFS)/bin/
 	@mkdir -p $(ROOTFS)/home
 	cp hello_native.c $(ROOTFS)/home/
 	@mkdir -p $(ROOTFS)/lib/tcc/include
@@ -239,4 +259,4 @@ install: all install-headers-libs
 clean:
 	rm -rf $(BUILD)
 
--include $(DEPS)
+-include $(DEPS) $(GUI_OBJS:.o=.d)

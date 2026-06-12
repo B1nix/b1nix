@@ -405,6 +405,16 @@ void compositor_wake(void)
     }
 }
 
+void compositor_reclaim_display(void)
+{
+    if (!backbuffer)
+        return;
+    force_full_redraw = 1;
+    compositor_mark_dirty_rect(0, 0, (int)fb_console_width(),
+                               (int)fb_console_height());
+    compositor_wake();
+}
+
 struct compositor_window *compositor_window_create(int x, int y, int width, int height)
 {
     if (width <= 0 || height <= 0) return 0;

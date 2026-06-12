@@ -49,16 +49,46 @@ static void ps2_write_data(u8 data)
     outb(PS2_DATA_PORT, data);
 }
 
-static u8 ps2_read_data(void)
+/* Read one controller byte, distinguishing a real 0x00 from a timeout
+ * (returns -1 on timeout). The ACK scan needs this: folding both into 0
+ * made the old loop give up the instant the ACK was a few microseconds
+ * late — the actual cause of "enable failed" under QEMU/macOS. */
+static int ps2_read_byte_to(void)
 {
-    if (!ps2_wait_output_full()) return 0;
-    return inb(PS2_DATA_PORT);
+    if (!ps2_wait_output_full()) return -1;
+    return (int)inb(PS2_DATA_PORT);
+}
+
+static void ps2_drain_output(void)
+{
+    for (u32 i = 0; i < 64; i++) {
+        if (!(inb(PS2_STATUS_PORT) & PS2_STATUS_OUT_FULL)) return;
+        (void)inb(PS2_DATA_PORT);
+    }
 }
 
 static void ps2_mouse_write(u8 value)
 {
     ps2_write_cmd(0xD4);
     ps2_write_data(value);
+}
+
+/* Send a mouse command and wait for the 0xFA ACK. Tolerant of stale bytes
+ * (skipped), late ACKs (scans several reads), and resend requests (0xFE,
+ * retried). Returns 1 on ACK, 0 if no ACK after a few attempts. */
+static int ps2_mouse_command(u8 command)
+{
+    for (int attempt = 0; attempt < 3; attempt++) {
+        ps2_mouse_write(command);
+        for (int i = 0; i < 24; i++) {
+            int value = ps2_read_byte_to();
+            if (value < 0) break;        /* timed out waiting — retry */
+            if (value == 0xFA) return 1; /* ACK */
+            if (value == 0xFE) break;    /* resend — retry the command */
+            /* anything else: a stale/streaming byte, keep scanning */
+        }
+    }
+    return 0;
 }
 
 static void ps2_mouse_event_worker(void *arg)
@@ -89,20 +119,50 @@ void ps2_mouse_init(void)
     mouse_state.y = (int)(bi->framebuffer.height / 2);
     mouse_state.buttons = 0;
 
-    // Drain any pending data in the PS/2 controller output buffer
-    while (inb(PS2_STATUS_PORT) & PS2_STATUS_OUT_FULL) {
-        (void)inb(PS2_DATA_PORT);
-    }
+    /* The init handshake polls the i8042 output buffer for each command's
+     * 0xFA ACK. Interrupts must stay OFF across the whole sequence: the
+     * keyboard IRQ path and the timer-tick i8042 poll both drain the SAME
+     * output buffer, and since mouse_ready is still 0 they would route the
+     * mouse's ACK into ps2_mouse_handle_byte, which drops it — leaving our
+     * poll to time out as a spurious "enable failed". (This is exactly what
+     * regressed once the tick-poll keyboard fallback was added.) */
+    int irqs_were_on = interrupts_enabled();
+    interrupts_disable();
+
+    ps2_drain_output();
 
     ps2_write_cmd(0xA8); // Enable auxiliary device (mouse)
+    ps2_drain_output();  // swallow any ACK/status the enable produced
     ps2_write_cmd(0x60); // Write Command Byte
-    ps2_write_data(0x47); // 0x47: enable keyboard, mouse, translation, and system flag
+    ps2_write_data(0x47); // enable kbd+mouse IRQ, translation, system flag
+    ps2_drain_output();
 
-    ps2_mouse_write(0xF6);
-    (void)ps2_read_data();
-    ps2_mouse_write(0xF4);
-    u8 ack = ps2_read_data();
-    if (ack != 0xFA) {
+    /* Reset the mouse (0xFF) to put it in a known state and confirm it's
+     * actually there: a present device ACKs (0xFA) then self-tests (0xAA,
+     * 0x00). This is far more reliable on QEMU than jumping straight to
+     * enable. */
+    int present = ps2_mouse_command(0xFF);
+    if (present) {
+        /* Consume the BAT result (0xAA) + device id (0x00). */
+        for (int i = 0; i < 4; i++) {
+            int v = ps2_read_byte_to();
+            if (v < 0 || v == 0xAA)
+                break;
+        }
+        ps2_drain_output();
+    }
+
+    int defaults = ps2_mouse_command(0xF6); /* set defaults */
+    int enabled = ps2_mouse_command(0xF4);  /* enable data reporting */
+
+    if (irqs_were_on)
+        interrupts_enable();
+
+    /* QEMU often enables data reporting even when a single ACK read slips;
+     * treat the device as usable if reset OR either enable step succeeded.
+     * The packet-sync check in ps2_mouse_handle_byte filters any noise on a
+     * machine that genuinely has no mouse. */
+    if (!present && !defaults && !enabled) {
         console_write("ps2_mouse: enable failed\n");
         return;
     }

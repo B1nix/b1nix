@@ -1746,9 +1746,24 @@ static isize tty_read(struct vfs_node *node, u64 offset, char *buffer,
   }
 
   if ((console.termios.c_lflag & B1NIX_ICANON) == 0) {
-    for (usize i = 0; i < size; i++)
-      buffer[i] = tty_getc_blocking();
-    return (isize)size;
+    usize minimum = console.termios.c_cc[B1NIX_VMIN];
+    if (minimum > size)
+      minimum = size;
+    usize n = 0;
+    while (n < size) {
+      char c;
+      if (n < minimum) {
+        c = tty_getc_blocking();
+      } else {
+        c = ps2_kbd_getc();
+        if (c == 0 && !serial_tty_claimed(0))
+          c = serial_getc();
+        if (c == 0)
+          break;
+      }
+      buffer[n++] = c;
+    }
+    return (isize)n;
   }
 
   while (tty_line_pos >= tty_line_len) {

@@ -2,6 +2,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/fb_console.h>
+#include <b1nix/fb.h>
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
 #include <b1nix/serial.h>
@@ -85,7 +86,8 @@ void console_clear(void)
 void console_putc(char ch)
 {
 	klog_putc(ch);   /* capture every console char into the dmesg ring buffer */
-	if (bootinfo_get()->has_framebuffer && fb_console_ready()) {
+	if (bootinfo_get()->has_framebuffer && fb_console_ready() &&
+	    !fb_dev_claimed()) {
 		fb_console_putchar(ch);
 		serial_putc(ch);
 		return;

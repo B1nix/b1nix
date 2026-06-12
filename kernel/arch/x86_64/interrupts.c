@@ -343,6 +343,10 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
 
       /* Drain input BEFORE scheduler_on_timer_tick: the tick may context-
        * switch away (T8) and delay anything placed after it. */
+      /* Poll i8042 as a fallback as well as handling IRQ1. QEMU/macOS and
+       * some real IOAPIC setups can leave bytes pending without delivering
+       * another edge; draining an empty controller is harmless. */
+      ps2_kbd_interrupt_handler();
       serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
 
       scheduler_on_timer_tick();

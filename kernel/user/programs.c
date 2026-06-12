@@ -17,6 +17,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/dirent.h>
 #include <b1nix/console.h>
+#include <b1nix/fb.h>
 #include <b1nix/input.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -44,6 +45,14 @@ static void m47_input_injector_thread(void *arg) {
       input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -3);
       input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, 1);
       input_event_sync(INPUT_DEV_MOUSE);
+    }
+    if (spins >= 5 && (spins % 10) == 5 &&
+        input_dev_has_clients(INPUT_DEV_KBD)) {
+      input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x38, 1);
+      input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x0f, 1);
+      input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x0f, 0);
+      input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x38, 0);
+      input_event_sync(INPUT_DEV_KBD);
     }
     scheduler_sleep_ticks(50);
   }
@@ -867,8 +876,11 @@ static u64 init_spawn_cmd(const char *cmd) {
   if (argc == 0) return (u64)-1;
   u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)argv[0], argc,
                              (u64)(usize)argv, 0, 0, 0);
-  if ((isize)pid >= 0)
+  if ((isize)pid >= 0) {
+    if (strcmp(argv[0], "/bin/bash") == 0)
+      console.fg_pgrp = (usize)scheduler_getpgid(pid);
     return pid;
+  }
   /* The kernel exec path has no shebang support, so a script entry (e.g. the
    * sysinit "/etc/rc") fails the direct spawn. Retry through /bin/sh — the
    * same way the legacy init path always ran rc. */
@@ -1457,6 +1469,74 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M47 Phase 2: displayd + b1display protocol. The server runs in the
+   * background while the client drives the full protocol (HELLO/INFO, SHM
+   * buffer, attach/damage/commit, frame callback, sync, seat input from the
+   * still-running m47-inject thread) and finally asks it to shut down. The
+   * SIGTERM afterwards is a safety net so a failed client can't leave the
+   * suite stuck waiting on the server. */
+  {
+    u64 dsp_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/displayd", 0,
+                                   0, 0, 0, 0);
+    if ((isize)dsp_pid < 0) {
+      uwrite("M47-DSP: spawn-fail\n");
+    } else {
+      u64 cli_pid = syscall_dispatch(SYS_SPAWN,
+                                     (u64)(usize) "/bin/m47d-smoke", 0,
+                                     0, 0, 0, 0);
+      if ((isize)cli_pid < 0) {
+        uwrite("M47-DSP: spawn-fail\n");
+      } else {
+        int cli_status = 0;
+        syscall_dispatch(SYS_WAIT, cli_pid, (u64)(usize)&cli_status, 0, 0, 0,
+                         0);
+      }
+      int dsp_status = 0;
+      int dsp_reaped = 0;
+      for (int spins = 0; spins < 100; spins++) {
+        u64 wr = syscall_dispatch(SYS_WAITPID, dsp_pid,
+                                  (u64)(usize)&dsp_status, B1NIX_WNOHANG,
+                                  0, 0, 0);
+        if (wr == dsp_pid) {
+          dsp_reaped = 1;
+          break;
+        }
+        syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+      }
+      if (!dsp_reaped) {
+        syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);
+        syscall_dispatch(SYS_WAIT, dsp_pid, (u64)(usize)&dsp_status,
+                         0, 0, 0, 0);
+      }
+      uwrite(!fb_dev_claimed() ? "M47-DSP: ok console-reclaim\n"
+                               : "M47-DSP: fail console-reclaim\n");
+
+      /* Start a fresh server against the reclaimed framebuffer and verify
+       * that a new client can complete HELLO before shutting it down. */
+      const char *probe_argv[] = {"/bin/m47d-smoke", "probe", 0};
+      u64 restart_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/displayd", 0, 0, 0, 0, 0);
+      if ((isize)restart_pid < 0) {
+        uwrite("M47-DSP: fail server-restart\n");
+      } else {
+        u64 probe_pid = syscall_dispatch(
+            SYS_SPAWN, (u64)(usize)probe_argv[0], 2,
+            (u64)(usize)probe_argv, 0, 0, 0);
+        if ((isize)probe_pid < 0) {
+          uwrite("M47-DSP: fail server-restart\n");
+          syscall_dispatch(SYS_KILL, restart_pid, SIGTERM, 0, 0, 0, 0);
+        } else {
+          int probe_status = 0;
+          syscall_dispatch(SYS_WAIT, probe_pid, (u64)(usize)&probe_status,
+                           0, 0, 0, 0);
+        }
+        int restart_status = 0;
+        syscall_dispatch(SYS_WAIT, restart_pid, (u64)(usize)&restart_status,
+                         0, 0, 0, 0);
+      }
+    }
+  }
+
   /* bash: the upstream GNU bash 5.2 port is the default shell. Run its feature
    * smoke through /bin/bash to prove the real bash (arrays, [[ ]], regex, brace
    * ranges, C-style for, pattern substitution) is what /bin/sh now resolves to. */
@@ -1770,8 +1850,15 @@ static int init_main(int argc, const char **argv) {
           if (total >= (isize)sizeof(tab) - 1) break;
         }
         syscall_dispatch(SYS_CLOSE, (u64)fd, 0, 0, 0, 0, 0);
-        if (init_parse_inittab(tab, (int)total) > 0)
+        if (init_parse_inittab(tab, (int)total) > 0) {
+          char runlevel[8];
+          if (bootinfo_get_kv("b1nix.runlevel", runlevel,
+                              sizeof(runlevel)) &&
+              runlevel[0] >= '0' && runlevel[0] <= '6' &&
+              runlevel[1] == '\0')
+            g_initdefault = runlevel[0] - '0';
           init_supervise(); /* never returns */
+        }
       }
     }
   }

@@ -137,6 +137,10 @@ struct vfs_inode {
    * own reference so the frames outlive every user mapping. */
   int (*mmap_phys_cb)(struct vfs_node *node, u64 offset, usize length,
                       u64 *out_phys);
+  /* Mapping-lifetime hooks. Called once per VMA, including fork copies and
+   * VMA splits, with a matching close on munmap/exec/exit. */
+  void (*mmap_open_cb)(struct vfs_node *node);
+  void (*mmap_close_cb)(struct vfs_node *node);
 };
 
 /* Inode cache API */

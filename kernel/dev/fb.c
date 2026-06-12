@@ -8,11 +8,11 @@
  * virtio-gpu transfer+flush, fall back to a row copy into the boot
  * framebuffer.
  *
- * The shadow buffer is allocated lazily on first use and owned by the
- * kernel forever (its pmm refcount never drops to zero), so user mappings
- * can come and go freely. Once a mapping exists the device counts as
- * "claimed" and the kernel compositor stops flushing (console handback on
- * release is Phase-2 displayd work). */
+ * The shadow buffer remains kernel-owned, while mmap_open/mmap_close hooks
+ * count live userspace VMAs. The first mapping claims scanout from the kernel
+ * compositor; the last unmap or process exit returns it and requests a full
+ * kernel redraw. */
+#include <b1nix/compositor.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/fb.h>
@@ -27,10 +27,12 @@
 static u32 *fb_shadow;     /* direct-map virtual address */
 static u64 fb_shadow_phys; /* contiguous physical base */
 static usize fb_shadow_size;
-static int fb_claimed;
+static unsigned fb_mapping_count;
 static spinlock_t fb_lock;
 
-int fb_dev_claimed(void) { return fb_claimed; }
+int fb_dev_claimed(void) {
+  return __atomic_load_n(&fb_mapping_count, __ATOMIC_ACQUIRE) != 0;
+}
 
 /* Allocate the contiguous shadow buffer on first use. Returns 0 or -errno.
  * Called with fb_lock held. */
@@ -52,7 +54,6 @@ static int fb_shadow_ensure(void) {
 static int fb_mmap_phys(struct vfs_node *node, u64 offset, usize length,
                         u64 *out_phys) {
   (void)node;
-  int first_claim = 0;
   u64 flags;
   spin_lock_irqsave(&fb_lock, &flags);
   int rc = fb_shadow_ensure();
@@ -61,14 +62,37 @@ static int fb_mmap_phys(struct vfs_node *node, u64 offset, usize length,
       rc = -EINVAL;
     } else {
       *out_phys = fb_shadow_phys + offset;
-      first_claim = !fb_claimed;
-      fb_claimed = 1;
     }
   }
   spin_unlock_irqrestore(&fb_lock, flags);
+  return rc;
+}
+
+static void fb_mmap_open(struct vfs_node *node) {
+  (void)node;
+  int first_claim;
+  u64 flags;
+  spin_lock_irqsave(&fb_lock, &flags);
+  first_claim = fb_mapping_count++ == 0;
+  spin_unlock_irqrestore(&fb_lock, flags);
   if (first_claim)
     console_write("fb0: claimed by userspace mapping\n");
-  return rc;
+}
+
+static void fb_mmap_close(struct vfs_node *node) {
+  (void)node;
+  int released = 0;
+  u64 flags;
+  spin_lock_irqsave(&fb_lock, &flags);
+  if (fb_mapping_count > 0) {
+    fb_mapping_count--;
+    released = fb_mapping_count == 0;
+  }
+  spin_unlock_irqrestore(&fb_lock, flags);
+  if (released) {
+    console_write("fb0: released to kernel console\n");
+    compositor_reclaim_display();
+  }
 }
 
 static int fb_flush_rect(struct b1nix_fb_rect *r) {
@@ -145,6 +169,8 @@ void fb_dev_init(void) {
   node->inode->mode = 0600;
   node->inode->ioctl_cb = fb_ioctl;
   node->inode->mmap_phys_cb = fb_mmap_phys;
+  node->inode->mmap_open_cb = fb_mmap_open;
+  node->inode->mmap_close_cb = fb_mmap_close;
   vfs_node_put(node);
   console_write("fb0: ready ");
   console_write_dec(fb_console_width());

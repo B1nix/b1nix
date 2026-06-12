@@ -1035,6 +1035,24 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M47-GFX: ok input-open" "M47: input devices open + EAGAIN"
 	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
 	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
+
+	# ── M47 Phase 2: displayd + b1display protocol ──
+	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
+		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"
+		check_output "$LOG" "M47-DSP: ok connect" "M47: client connected to displayd"
+		check_output "$LOG" "M47-DSP: ok info" "M47: HELLO/INFO roundtrip"
+		check_output "$LOG" "M47-DSP: ok commit-frame" "M47: attach/damage/commit + frame callback"
+		check_output "$LOG" "M47-DSP: ok sync" "M47: sync roundtrip"
+		check_output "$LOG" "M47-DSP: ok two-clients" "M47: two display clients"
+		check_output "$LOG" "M47-DSP: ok checksum" "M47: nonzero framebuffer checksum"
+		check_output "$LOG" "M47-DSP: ok pointer" "M47: seat pointer enter/motion delivered"
+		check_output "$LOG" "M47-DSP: ok button-focus" "M47: button + click-to-focus delivered"
+		check_output "$LOG" "M47-DSP: ok alt-tab" "M47: Alt-Tab focus switch"
+		check_output "$LOG" "M47-DSP: done" "M47 display-protocol smoke completed"
+		check_output "$LOG" "displayd: bye" "M47: displayd clean shutdown"
+		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
+		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
+	fi
 fi
 
 # ── M24b SMP work-stealing (multi-core) ──

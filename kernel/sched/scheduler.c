@@ -1101,6 +1101,8 @@ int scheduler_fork_current(void) {
       new_vma->next = 0;
       if (new_vma->node) {
         vfs_node_get(new_vma->node);
+        if (new_vma->node->inode && new_vma->node->inode->mmap_open_cb)
+          new_vma->node->inode->mmap_open_cb(new_vma->node);
       }
       *dst_prev = new_vma;
       dst_prev = &new_vma->next;
@@ -3448,6 +3450,11 @@ struct vm_area *vma_split(struct task *t, struct vm_area *vma, u64 addr) {
   memcpy(new_vma, vma, sizeof(struct vm_area));
   new_vma->start = addr;
   vma->end = addr;
+  if (new_vma->node) {
+    vfs_node_get(new_vma->node);
+    if (new_vma->node->inode && new_vma->node->inode->mmap_open_cb)
+      new_vma->node->inode->mmap_open_cb(new_vma->node);
+  }
 
   new_vma->next = vma->next;
   vma->next = new_vma;
@@ -3476,6 +3483,11 @@ void vma_delete_range(struct task *task, u64 start, u64 end) {
 
     /* Now vma is entirely within [start, end] */
     *curr = vma->next;
+    if (vma->node) {
+      if (vma->node->inode && vma->node->inode->mmap_close_cb)
+        vma->node->inode->mmap_close_cb(vma->node);
+      vfs_node_put(vma->node);
+    }
     kfree(vma);
   }
 }

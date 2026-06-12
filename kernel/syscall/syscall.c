@@ -1722,6 +1722,8 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   }
   vma->next = curr;
   *prev = vma;
+  if (vma->node && vma->node->inode && vma->node->inode->mmap_open_cb)
+    vma->node->inode->mmap_open_cb(vma->node);
 
   return vaddr;
 }
