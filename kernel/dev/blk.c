@@ -514,6 +514,11 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
     struct block_device *wb_dev = entry->bdev;
     u64 wb_lba = entry->block_no;
     bcache_release(*flags_inout);            /* RELEASE — write_blocks may yield */
+    /* Eviction write-back: the slot is recycled regardless (the caller resets
+     * its flags below), so a failed write here loses the data under memory
+     * pressure — a documented limitation. The sync/fsync path in
+     * blk_flush_buffer keeps DIRTY on failure so explicit syncs don't lose
+     * data silently (R3-13). */
     wb_dev->write_blocks(wb_dev, wb_lba, 1, entry->data);
     *flags_inout = bcache_acquire();         /* REACQUIRE before returning */
     entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
@@ -692,8 +697,11 @@ void blk_flush_buffer(struct block_buffer *buf) {
     return;
 
   if (buf->bdev && buf->bdev->write_blocks) {
-    buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data);
-    buf->flags &= ~BLK_CACHE_DIRTY;
+    /* Only clear DIRTY when the device actually accepted the write. Clearing it
+     * unconditionally on a failed write silently loses the data and lets
+     * blk_sync_all()/umount report success (R3-13). Leave it dirty for retry. */
+    if (buf->bdev->write_blocks(buf->bdev, buf->block_no, 1, buf->data) == 0)
+      buf->flags &= ~BLK_CACHE_DIRTY;
   }
 }
 

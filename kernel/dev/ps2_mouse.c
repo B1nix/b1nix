@@ -124,6 +124,12 @@ void ps2_mouse_handle_byte(u8 data)
         return;
     }
 
+    /* Defensive bound: the i8042 decode state is non-atomic across two IRQ
+     * entry points plus the timer-tick poll; an unexpected re-entry could push
+     * packet_index past the 3-byte buffer. Reset rather than overrun (R4-11). */
+    if (packet_index >= 3)
+        packet_index = 0;
+
     packet[packet_index++] = data;
     if (packet_index < 3) return;
     packet_index = 0;

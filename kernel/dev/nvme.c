@@ -220,6 +220,14 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 
 static int nvme_io_transfer(struct nvme_device *nd, u64 lba, u32 count, void *buffer, int is_write)
 {
+    /* NLB is zero-based (cdw12 = count - 1), so count == 0 would underflow to
+     * 0xFFFFFFFF and request a 4 GiB transfer the device DMAs over unrelated
+     * memory. The PRP list (one page of u64 entries) also caps the page count;
+     * reject transfers larger than it can describe (R4-9). */
+    if (count == 0)
+        return -1;
+    if ((u64)count * 512 > NVME_PAGE_SIZE * (NVME_PAGE_SIZE / sizeof(u64)))
+        return -1;
     nvme_io_lock(nd);
     struct nvme_sqe sqe;
     memset(&sqe, 0, sizeof(sqe));

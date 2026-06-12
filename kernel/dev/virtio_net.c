@@ -169,7 +169,14 @@ static void vnet_poll(struct netdev *nd)
 	if (__atomic_test_and_set(&net_tx_lock, __ATOMIC_ACQUIRE)) {
 		return;
 	}
-	while (net_tx_vq.used && net_tx_vq.used->idx != net_tx_vq.last_used_idx) {
+	/* Bound each drain to queue_size iterations: a malicious/buggy device that
+	 * keeps used->idx perpetually ahead of last_used_idx would otherwise spin
+	 * here forever holding net_tx_lock (R4-5). One poll never has more than
+	 * queue_size genuine completions. */
+	u32 tx_drained = 0;
+	while (net_tx_vq.used && net_tx_vq.used->idx != net_tx_vq.last_used_idx &&
+	       tx_drained < net_tx_vq.queue_size) {
+		tx_drained++;
 		u16 used_idx = net_tx_vq.last_used_idx % net_tx_vq.queue_size;
 		u32 id = net_tx_vq.used->ring[used_idx].id;
 		if (id < net_tx_vq.queue_size && tx_inflight[id]) {
@@ -187,7 +194,10 @@ static void vnet_poll(struct netdev *nd)
 	/* Don't block if someone else is already polling RX. */
 	if (__atomic_test_and_set(&net_rx_lock, __ATOMIC_ACQUIRE)) return;
 
-	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx) {
+	u32 rx_drained = 0;
+	while (net_rx_vq.used->idx != net_rx_vq.last_used_idx &&
+	       rx_drained < net_rx_vq.queue_size) {
+		rx_drained++;
 		u16 used_idx = net_rx_vq.last_used_idx % net_rx_vq.queue_size;
 		u32 id = net_rx_vq.used->ring[used_idx].id;
 		u32 len = net_rx_vq.used->ring[used_idx].len;

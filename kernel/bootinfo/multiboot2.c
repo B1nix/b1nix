@@ -92,7 +92,16 @@ static void parse_mmap_tag(const struct multiboot2_mmap_tag *tag)
 	usize entries_start = (usize)tag + sizeof(*tag);
 	usize entries_end = (usize)tag + tag->size;
 
-	for (usize cursor = entries_start; cursor < entries_end; cursor += tag->entry_size) {
+	/* Reject a bootloader-supplied entry_size that would not advance the cursor
+	 * (entry_size == 0 → infinite loop) or that is too small to hold an entry
+	 * (misaligned/overlapping reads). Use cursor+entry_size <= end so the last
+	 * entry cannot straddle past entries_end. */
+	if (tag->entry_size < sizeof(struct multiboot2_mmap_entry))
+		return;
+
+	for (usize cursor = entries_start;
+	     cursor + tag->entry_size <= entries_end;
+	     cursor += tag->entry_size) {
 		const struct multiboot2_mmap_entry *entry = (const struct multiboot2_mmap_entry *)cursor;
 		add_memory_region(entry->addr, entry->len, entry->type);
 	}
@@ -118,6 +127,13 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 	while (cursor < end) {
 		const struct multiboot2_tag *tag = (const struct multiboot2_tag *)cursor;
 
+		/* A tag whose size is 0 (or smaller than the header, or that runs past
+		 * the info block) cannot be trusted: align_up(cursor + size, 8) would
+		 * not advance and the walk would spin forever before serial init can
+		 * report. Stop the walk instead. */
+		if (tag->size < sizeof(*tag) || cursor + tag->size > end)
+			break;
+
 		if (tag->type == MULTIBOOT2_TAG_TYPE_END) {
 			break;
 		}
@@ -128,9 +144,12 @@ void bootinfo_init_from_multiboot2(u32 magic, u32 info_address)
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_MODULE) {
 			const struct multiboot2_module_tag *mod = (const struct multiboot2_module_tag *)tag;
-			current_boot_info.ramdisk_addr = mod->mod_start;
-			current_boot_info.ramdisk_size = mod->mod_end - mod->mod_start;
-			current_boot_info.has_ramdisk = 1;
+			/* Guard against mod_end < mod_start underflowing ramdisk_size. */
+			if (mod->mod_end >= mod->mod_start) {
+				current_boot_info.ramdisk_addr = mod->mod_start;
+				current_boot_info.ramdisk_size = mod->mod_end - mod->mod_start;
+				current_boot_info.has_ramdisk = 1;
+			}
 		}
 
 		if (tag->type == MULTIBOOT2_TAG_TYPE_CMDLINE) {

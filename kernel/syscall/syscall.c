@@ -2439,8 +2439,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     char name[64];
     if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg0) < 0)
       return (u64)-EFAULT;
-    struct mqueue *mq = mqueue_create(name);
-    return mq ? (u64)(usize)mq : (u64)-ENOMEM;
+    /* Returns a table index (mqd), not a kernel pointer — see mqueue.h. */
+    return (u64)mqueue_create(name);
   }
   case SYS_MQ_SEND: {
     u32 len = (u32)arg2;
@@ -2451,12 +2451,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (syscall_copyin(kbuf, (const void *)(usize)arg1, len) != 0)
         return (u64)-EFAULT;
     }
-    return (u64)mqueue_send((struct mqueue *)(usize)arg0, kbuf, len);
+    return (u64)mqueue_send((int)arg0, kbuf, len);
   }
   case SYS_MQ_RECEIVE: {
     char kbuf[256];
     u32 klen = 0;
-    int ret = mqueue_receive((struct mqueue *)(usize)arg0, kbuf, &klen);
+    int ret = mqueue_receive((int)arg0, kbuf, &klen);
     if (ret == 0) {
       if (arg2 && syscall_copyout((void *)(usize)arg2, &klen, sizeof(u32)) != 0)
         return (u64)-EFAULT;
@@ -2466,7 +2466,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)ret;
   }
   case SYS_MQ_CLOSE:
-    mqueue_close((struct mqueue *)(usize)arg0);
+    mqueue_close((int)arg0);
     return 0;
   case SYS_MQ_UNLINK: {
     char name[64];

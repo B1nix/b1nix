@@ -2330,7 +2330,11 @@ int vfs_open_flags(const char *path, int flags) {
 
   int fd = scheduler_fd_alloc(h);
   if (fd < 0) {
+    /* vfs_handle_release() drops the node ref it now owns (node_file_ops has no
+     * ->release, so it falls to vfs_node_put(h->node)); NULL it so the out:
+     * label does not put the same reference a second time (double-decref UAF). */
     vfs_handle_release(h);
+    node = NULL;
     res = -EMFILE;
     goto out;
   }
@@ -2727,8 +2731,15 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   goto out_unlock;
 
 out_node_put:
-  if (node)
+  if (node) {
+    /* The fresh node was allocated with refcount 0; give it the reference we
+     * are about to drop and mark it deleted so vfs_node_put's 0+deleted check
+     * actually frees it (a bare put underflows to -1 and leaks). Mirrors the
+     * vfs_link error path (R3-15). */
+    node->deleted = 1;
+    __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
     vfs_node_put(node);
+  }
 out_unlock:
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
@@ -2847,8 +2858,13 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   goto out_unlock;
 
 out_node_put:
-  if (node)
+  if (node) {
+    /* See vfs_create_at_internal: refcount-0 node needs deleted=1 + refcount=1
+     * before the put or it underflows and leaks (R3-15). */
+    node->deleted = 1;
+    __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
     vfs_node_put(node);
+  }
 out_unlock:
   vfs_inode_unlock(parent->inode);
   vfs_node_put(parent);
@@ -3324,6 +3340,10 @@ int vfs_symlink(const char *target, const char *link_path) {
       vfs_tree_write_acquire(&_tlflags);
       parent->first_child = node->next_sibling;
       vfs_tree_write_release(_tlflags);
+      /* refcount-0 node: deleted=1 + refcount=1 before the put or it underflows
+       * and leaks (R3-15, mirrors vfs_link). */
+      node->deleted = 1;
+      __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
       vfs_node_put(node);
       res = err;
       goto out_unlock;

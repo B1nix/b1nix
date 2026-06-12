@@ -68,15 +68,26 @@ static u32 cluster_to_sector(struct fat32_fs *fs, u32 cluster) {
 }
 
 static u32 get_next_cluster(struct fat32_fs *fs, u32 cluster) {
+	/* Reject an out-of-range cluster (corrupt/crafted FAT) — walking it would
+	 * read a wild FAT sector. Returning an end-of-chain marker terminates the
+	 * caller's chain walk safely (R3-9). */
+	if (cluster < 2 || (fs->total_clusters && cluster >= fs->total_clusters + 2))
+		return 0x0FFFFFFF;
+
 	u32 fat_sector = fs->fat_start_sector + (cluster * 4) / fs->bytes_per_sector;
 	u32 fat_offset = (cluster * 4) % fs->bytes_per_sector;
-	u8 sector_buf[512]; 
-	
+	u8 sector_buf[512];
+
 	if (blk_read_cached(fs->bdev, fat_sector, 1, sector_buf) < 0)
         return 0x0FFFFFF7; // Bad cluster
 
 	u32 next = *(u32 *)(sector_buf + fat_offset);
-	return next & 0x0FFFFFFF;
+	next &= 0x0FFFFFFF;
+	/* A self-referential entry (next == cluster) would loop the chain walk
+	 * forever — treat it as end-of-chain. */
+	if (next == cluster)
+		return 0x0FFFFFFF;
+	return next;
 }
 
 static void trim_spaces(char *str) {
@@ -334,6 +345,11 @@ static struct vfs_node *fat32_vfs_mount_cb(const char *source, u64 flags, void *
 
     struct fat32_bpb *bpb = (struct fat32_bpb *)boot_sector;
     if (bpb->bytes_per_sector != 512) return ERR_PTR(-EINVAL);
+    /* Reject a crafted/corrupt BPB before it divides by these (R3-9):
+     * sectors_per_cluster == 0 makes total_clusters a divide-by-zero panic, and
+     * fat_count == 0 produces a degenerate data_start_sector. */
+    if (bpb->sectors_per_cluster == 0 || bpb->fat_count == 0)
+        return ERR_PTR(-EINVAL);
 
     struct fat32_fs *fs = kmalloc(sizeof(struct fat32_fs));
     memset(fs, 0, sizeof(struct fat32_fs));

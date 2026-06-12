@@ -710,3 +710,123 @@ no OOB. execve argv/envp is bounded (`MAX_EXEC_ARGS`→`USER_MAX_ARGS=32`,
 per-string space checks). PT_LOAD bounds, relocation target writes (via
 `elf64_stage_ptr`), `vsnprintf_impl`, keyboard/serial SPSC rings, RNG copyout —
 all correct.
+
+---
+
+# Round-fixes pass (2026-06-12) — Rounds 3 & 4 + remaining Part-3 leads
+
+A focused pass landing the actionable Round 3/4 findings and the unverified
+Part-3 leads. Both arches build clean; the x86 smoke suite is green except the
+two pre-existing failures noted at the end (neither is caused by this work).
+
+## Fixed and verified this pass
+
+**Round 3 (CONFIRMED criticals):**
+- **R3-1** — `vfs_open_flags` double-decref UAF on the EMFILE path: `node = NULL`
+  after `vfs_handle_release(h)` so `out:` does not re-put.
+- **R3-2** — IPv6 `::1` loopback now deferred via `net_loopback_enqueue(buf, len, 1)`
+  instead of recursing into `ipv6_receive` (TCP re-entrancy). The `ipv6_loopback_smoke`
+  self-test pumps `net_loopback_drain()` after each send so the deferred two-hop
+  echo/error cascade completes before it samples the counters.
+- **R3-3** — mqueue handle is now a validated table index (0..MQ_MAX_QUEUES-1),
+  never a raw kernel pointer; `kernel/ipc/mqueue.c` gained a global table spinlock
+  (covers the "no locking" mqueue lead too).
+- **R3-4 / R3-5** — ext4 uninitialized-extent high bit masked in lookup + merge via
+  `ext4_extent_len()`; `ext4_set_block` no longer routes a block-mapped inode into
+  `ext4_add_extent` (which would memset `i_block[]`).
+
+**Round 3 (leads, now fixed):** R3-10 (ext2 dir-grow uses the indirect-aware
+set-block helper + hole-read memset clamp), R3-11 (aio ctx refcount: worker-vs-
+cleanup UAF closed under the list lock), R3-12 (CAS BLOCKED/STOPPED→READY in
+`scheduler_kill`/`_process_group`), R3-13 (`blk_flush_buffer` keeps DIRTY on a
+failed write-back), R3-14 (32-bit fork no longer COWs `VMM_SHARED`), R3-15
+(create/mkdir/symlink error paths set deleted+refcount before the put), plus the
+mqueue, futex-exit-cleanup (`scheduler_futex_cleanup_task`) and aio leads.
+
+**Round 4:** R4-1 (RTC UIP spin bounded, both arches), R4-2/R4-3 (multiboot2 mmap
+`entry_size`/tag `size` guards), R4-4 (ELF64/32 `e_phentsize` + subtraction-form
+`e_phoff` bounds), R4-5 (virtio-net RX/TX drain capped at queue_size), R4-6 (ELF
+PT_INTERP/PT_DYNAMIC offset wrap guards), R4-7 (PMM region + multiboot2 module
+underflow guards), R4-9 (NVMe `count==0` + PRP cap, virtio_blk `(u64)count*512`),
+R4-10 (ELF `p_memsz` ceiling before kzalloc), R4-11 (PS/2 mouse `packet_index`
+bound).
+
+**Process semantics:** M46-3 — signal-death (in-scheduler SIGKILL / default-
+terminate) now reparents children and runs orphaned-pgrp SIGHUP/SIGCONT via the
+shared `reparent_children_and_signal_orphans()` helper (and futex cleanup),
+instead of skipping all of that. It deliberately does NOT route through
+`scheduler_exit_current` because that path runs inside `scheduler_yield` and the
+full yield-based fd teardown there would re-enter the scheduler.
+
+**Round 3 / Round 4 partial (R3-9 parser hardening):** fat32 (sectors-per-cluster
+== 0 / fat_count == 0 rejected at mount; `get_next_cluster` rejects out-of-range
+and self-referential entries → terminates corrupt chains) and dns (answer-parse
+bounds: bounded label/pointer skips + re-validate after the name skip).
+
+## Follow-up batch (same day) — additional fixes landed
+
+- **R3-8 (shm), safe subset** — `shmctl` now enforces an owner/creator/root
+  credential check on `IPC_RMID` and `IPC_SET`, and `shmat` honours
+  `SHM_RDONLY` (maps without `VMM_WRITABLE` and sets the VMA prot to read-only).
+  (The "PMM recycles still-mapped frames" hazard turned out NOT to be real:
+  `pmm_free_frame` is refcounted and fork ref's the shared frames, so IPC_RMID
+  only drops the segment's own reference — the frames survive while a child maps
+  them. The fork-nattch undercount and the no-detach-on-exit leak remain, see
+  below.)
+- **R3-9 (ext dir walkers)** — every ext2/ext4 directory-entry walk (lookup,
+  readdir/getdents, is-empty, remove, rename, add, `..` rewrite) now rejects a
+  corrupt `rec_len` (`rec_len < 8` or `off + rec_len > block/i_size`) instead of
+  advancing off the block buffer. The guards never trigger on a valid directory,
+  so M14/M22 readdir/lookup stay green.
+- **R4-8 (ELF strtab)** — the PIE dynamic-link symbol resolver (`elf64_resolve_symbol`,
+  `elf64_apply_rela_table`) and the DT_NEEDED reader now use bounded
+  `elf64_str_at_equals` / `elf64_copy_str` accessors that stop at the containing
+  segment's end, instead of `strcmp`/`strlen`/`strchr` on a possibly
+  non-NUL-terminated strtab pointer.
+
+## Not done this pass — deliberately deferred (rationale)
+
+These are real but were judged too risky to land safely without targeted
+concurrency / crafted-image tests the smoke suite does not provide; landing a
+partial fix (e.g. a deadlocking fault-path lock) would be a worse regression than
+the documented known-issue:
+
+- **R3-6 — shared `vma_list` lock.** HIGH and reachable, but correct closure needs
+  a vma-list lock taken around ~15 traversal/mutation sites across scheduler.c,
+  syscall.c, shm.c and the page-fault handler on *both* arches, with the fault
+  handler snapshotting + ref'ing `vma->node` under the lock across the blocking
+  `read_cb`. The smoke suite does not exercise concurrent mmap/munmap from
+  threads, so it cannot validate the fix — only catch a fault-path deadlock.
+- **R3-8 remainder — shm fork-nattch accounting + no-detach-on-exit leak.** The
+  creds + SHM_RDONLY parts are now fixed (above). What remains: a forked child's
+  inherited attachment is not counted in `shm_nattch`, and `shm_detach_all` is
+  still uncalled on exit, so `IPC_RMID` can stay blocked after an implicit
+  detach (a resource leak, not a UAF — frames are refcounted). Wiring detach
+  into the exit path safely needs ordering w.r.t. `mm_release_user`; do with a
+  fork+IPC_RMID test.
+- **unix-socket lost-wakeup / connect-backlog / blocking-send**, and **journal
+  crash-atomicity (write-ahead ordering, recovery validation)** — both need
+  fault-injection / crash-replay coverage.
+- **R3-9 remainder** — ext3 + ext1 dir walkers (same `rec_len` pattern as the
+  now-fixed ext2/ext4 ones), exfat `secondary_count==0`, ntfs resident-`$DATA`/
+  index bounds, fat32 `cluster_to_sector` callers: crafted-image hardening; do
+  with a fuzz/crafted-image harness.
+- **R3-16** — verifier reclassified as a FALSE POSITIVE (the demand-paging
+  `read_cb` runs with IRQs enabled; the real issue there is R3-6).
+- **M46-4 / M46-5** — LOW: M46-4 is already mitigated (setsid clears ctty, so the
+  spurious-console-HUP only affects the legitimate login/console chain); M46-5 is
+  cosmetic and accidentally-correct.
+- **futex** signal-interruptibility and PROCESS_SHARED cross-mmap wakeups —
+  feature gaps, not corruption; the exit-cleanup leak (the dangerous part) is
+  fixed above.
+
+## Smoke status
+
+x86 single-CPU: fully green. x86 `-smp 4`: green except two **pre-existing**
+failures unrelated to this work — `M24B-BKL: userspace-on-ap` (the known 32-bit
+ELF32-BSP-only limitation, reproduced on a clean baseline) and `M46-SMOKE
+nice-biasing` (flaky cross-CPU stride fairness — returns a different value each
+run and passes consistently single-CPU; none of this pass's scheduler changes run
+during the test's measurement window). Both arches compile warning-clean
+(modulo the pre-existing 32-bit `-Watomic-alignment` and the pre-existing ext4
+shift-count notes).

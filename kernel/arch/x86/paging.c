@@ -595,7 +595,10 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
           if (frame) {
             pmm_ref_frame(frame);
           }
-          if (pte & VMM_WRITABLE) {
+          /* Do not COW VMM_SHARED pages (SysV shm) — they must stay writable
+           * and shared across fork. Mirrors the x86_64 path's guard (R3-14);
+           * without it a shmat'd segment becomes private on first write. */
+          if ((pte & VMM_WRITABLE) && !(pte & VMM_SHARED)) {
             pte = (pte & ~VMM_WRITABLE) | VMM_COW;
             src_pt[j] = pte;
           }

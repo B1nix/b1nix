@@ -19,7 +19,11 @@ static int is_updating() {
 }
 
 void rtc_init(void) {
-  while (is_updating())
+  /* Bounded UIP wait: a dead/absent RTC or a wedged southbridge can leave the
+   * update-in-progress bit stuck forever; an unbounded spin here would hang the
+   * boot before the test 'done' marker (the 120s policy). Proceed regardless
+   * after a generous spin — a slightly-torn read is far better than a hang. */
+  for (int i = 0; i < 1000000 && is_updating(); i++)
     ;
 
   u8 second = read_cmos(0x00);

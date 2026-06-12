@@ -181,32 +181,39 @@ void dns_receive(const void *data, usize size)
 
 	const u8 *ptr = (const u8 *)data + sizeof(struct dns_header);
 
-	// Skip queries
+	const u8 *end = (const u8 *)data + size;
+
+	// Skip queries. Every dereference is bounded against `end` so a malformed or
+	// spoofed reply cannot walk a label/pointer past the packet (R3-9).
 	u16 qdcount = bswap16(hdr->qdcount);
 	for (int i = 0; i < qdcount; i++) {
-		while (ptr < (const u8 *)data + size && *ptr != 0) {
+		while (ptr < end && *ptr != 0) {
 			if ((*ptr & 0xC0) == 0xC0) { ptr += 2; break; } // Pointer
 			ptr += *ptr + 1;
 		}
-		if ((*ptr & 0xC0) != 0xC0) ptr++; // Null byte
+		if (ptr < end && (*ptr & 0xC0) != 0xC0) ptr++; // Null byte
 		ptr += 4; // QTYPE and QCLASS
+		if (ptr > end) return;
 	}
 
 	// Parse first answer
-	if (ptr + 12 <= (const u8 *)data + size) {
+	if (ptr + 12 <= end) {
 		if ((*ptr & 0xC0) == 0xC0) {
 			ptr += 2; // Pointer
 		} else {
-			while (*ptr != 0) ptr += *ptr + 1;
+			while (ptr < end && *ptr != 0) ptr += *ptr + 1;
 			ptr++;
 		}
 
+		// Re-validate after the name skip: we need TYPE(2)+CLASS(2)+TTL(4)+
+		// RDLENGTH(2) = 10 bytes available before reading them.
+		if (ptr + 10 > end) return;
 		u16 type = (ptr[0] << 8) | ptr[1];
 		ptr += 8; // TYPE, CLASS, TTL
 		u16 rdlength = (ptr[0] << 8) | ptr[1];
 		ptr += 2;
 
-		if (type == 1 && rdlength == 4 && ptr + 4 <= (const u8 *)data + size) {
+		if (type == 1 && rdlength == 4 && ptr + 4 <= end) {
 			memcpy(g_dns_ip, ptr, 4);
 			g_dns_have = 1;
 			if (g_dns_verbose) {

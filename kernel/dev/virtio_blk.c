@@ -114,7 +114,7 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
   if (vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->req,
                       sizeof(struct virtio_blk_req), 0) < 0 ||
       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)buffer,
-                      count * 512,
+                      (u64)count * 512,
                       type == VIRTIO_BLK_T_IN ? VRING_DESC_F_WRITE : 0) < 0 ||
       vblk_add_region(&inst->vq, &next_desc, &prev, (u64)(usize)&dma->status, 1,
                       VRING_DESC_F_WRITE) < 0) {

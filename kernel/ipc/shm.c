@@ -3,7 +3,19 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/panic.h>
+
+/* POSIX: only the segment's owner/creator or the superuser may IPC_RMID or
+ * IPC_SET a segment. Returns 1 if the caller is permitted. */
+static int shm_caller_may_control(const struct shm_segment *seg) {
+    const struct cred *c = scheduler_get_current_cred();
+    if (!c)
+        return 1; /* no creds (early boot / kernel) — allow */
+    if (c->euid == 0)
+        return 1; /* root */
+    return c->euid == seg->ds.shm_perm.uid || c->euid == seg->ds.shm_perm.cuid;
+}
 
 /* ── Global shared memory segments ── */
 
@@ -160,8 +172,7 @@ int shmget(u32 key, usize size, int shmflg)
 
 void *shmat(int shmid, const void *shmaddr, int shmflg)
 {
-    (void)shmaddr; /* We ignore requested addr for simplicity */
-    (void)shmflg;  /* SHM_RDONLY/SHM_RND not yet honored */
+    (void)shmaddr; /* We ignore requested addr for simplicity (SHM_RND moot) */
 
     if (shmid < 0 || shmid >= SHMMNI) return (void *)-1;
     if (!shm_segments[shmid].used) return (void *)-1;
@@ -179,12 +190,18 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     u64 vaddr = vm_find_free_area(current_task, seg->page_count * PAGE_SIZE);
     if (vaddr == (u64)-1) return (void *)-1;
 
+    /* SHM_RDONLY: map without VMM_WRITABLE so writes fault (POSIX read-only
+     * attach), instead of always mapping writable. */
+    u64 map_flags = VMM_USER | VMM_SHARED | VMM_PRESENT;
+    if (!(shmflg & SHM_RDONLY))
+        map_flags |= VMM_WRITABLE;
+
     /* Map all pages into user virtual space */
     int npages = seg->page_count;
     for (int p = 0; p < npages; p++) {
         u64 page_vaddr = vaddr + p * PAGE_SIZE;
-        /* Map with VMM_SHARED to bypass CoW on fork */
-        vmm_map_page(page_vaddr, seg->physical_pages[p], VMM_WRITABLE | VMM_USER | VMM_SHARED | VMM_PRESENT);
+        /* VMM_SHARED bypasses CoW on fork. */
+        vmm_map_page(page_vaddr, seg->physical_pages[p], map_flags);
         /* Explicitly increment physical frame refcount for this new mapping */
         pmm_ref_frame(seg->physical_pages[p]);
     }
@@ -199,7 +216,7 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     }
     vma->start = vaddr;
     vma->end = vaddr + npages * PAGE_SIZE;
-    vma->prot = PROT_READ | PROT_WRITE;
+    vma->prot = (shmflg & SHM_RDONLY) ? PROT_READ : (PROT_READ | PROT_WRITE);
     vma->flags = MAP_SHARED;
     vma->node = 0;
     vma->offset = 0;
@@ -287,6 +304,8 @@ int shmctl(int shmid, int cmd, struct shmid_ds *buf)
 
     switch (cmd) {
     case IPC_RMID:
+        /* Only the owner/creator or root may remove the segment (POSIX). */
+        if (!shm_caller_may_control(seg)) return -1;
         /* Remove segment if no attachments */
         if (seg->ds.shm_nattch > 0) return -1;
         
@@ -310,6 +329,8 @@ int shmctl(int shmid, int cmd, struct shmid_ds *buf)
         return -1;
 
     case IPC_SET:
+        /* Only the owner/creator or root may change ownership/permissions. */
+        if (!shm_caller_may_control(seg)) return -1;
         if (buf) {
             seg->ds.shm_perm.uid = buf->shm_perm.uid;
             seg->ds.shm_perm.gid = buf->shm_perm.gid;

@@ -106,6 +106,11 @@ struct elf64_dyn_object {
 #define PIE_LOAD_BASE 0x40000000ULL
 #endif
 
+/* Sanity ceiling on a single ELF segment's p_memsz. Any real b1nix binary is a
+ * few MiB; a crafted multi-GiB p_memsz must be rejected before kzalloc (OOM =
+ * panic in this kernel). 512 MiB is well above any legitimate image segment. */
+#define USER_IMAGE_MAX_SEGMENT (512ULL * 1024 * 1024)
+
 struct process_start {
   struct user_loaded_image *image;
 };
@@ -166,6 +171,56 @@ static u8 *elf64_stage_ptr(struct user_loaded_image *image, u64 va, usize n)
     struct user_image_segment *s = &image->segments[i];
     if (va >= s->vaddr && va + n <= s->vaddr + s->memsz)
       return (u8 *)s->data + (va - s->vaddr);
+  }
+  return 0;
+}
+
+/* Copy the NUL-terminated string at `va` into `out` (always NUL-terminated),
+ * bounded by both `out_size` and the containing segment's end (R4-8). Returns 1
+ * on success, 0 if `va` is not inside any segment. */
+static int elf64_copy_str(struct user_loaded_image *image, u64 va, char *out,
+                          usize out_size)
+{
+  if (out_size == 0)
+    return 0;
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    if (va < s->vaddr || va >= s->vaddr + s->memsz)
+      continue;
+    const char *str = (const char *)s->data + (va - s->vaddr);
+    usize avail = (usize)(s->vaddr + s->memsz - va);
+    usize limit = avail < out_size - 1 ? avail : out_size - 1;
+    usize k = 0;
+    for (; k < limit && str[k]; k++)
+      out[k] = str[k];
+    out[k] = '\0';
+    return 1;
+  }
+  return 0;
+}
+
+/* Compare a NUL-terminated string that lives at `va` inside the staged image
+ * against `name`, but never scan past the containing segment's end — a crafted
+ * strtab string with no NUL before the segment boundary would otherwise drive
+ * an OOB read out of the kmalloc'd segment (R4-8). Returns 1 on equal. */
+static int elf64_str_at_equals(struct user_loaded_image *image, u64 va,
+                               const char *name)
+{
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    if (va < s->vaddr || va >= s->vaddr + s->memsz)
+      continue;
+    const char *str = (const char *)s->data + (va - s->vaddr);
+    usize avail = (usize)(s->vaddr + s->memsz - va);
+    usize k = 0;
+    for (; k < avail; k++) {
+      if (str[k] != name[k])
+        return 0;
+      if (name[k] == '\0') /* both reached NUL at the same position */
+        return 1;
+    }
+    /* Ran off the segment with no NUL — not a valid/equal string. */
+    return 0;
   }
   return 0;
 }
@@ -294,9 +349,9 @@ static int elf64_resolve_symbol(struct user_loaded_image *image,
           image, objects[o].symtab + (u64)i * sizeof(*sym), sizeof(*sym));
       if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_name >= objects[o].strsz)
         continue;
-      const char *candidate = (const char *)elf64_stage_ptr(
-          image, objects[o].strtab + sym->st_name, 1);
-      if (candidate && strcmp(candidate, name) == 0) {
+      /* Bounded compare — the strtab string is not guaranteed NUL-terminated
+       * before its segment ends (R4-8). */
+      if (elf64_str_at_equals(image, objects[o].strtab + sym->st_name, name)) {
         *value = objects[o].base + sym->st_value;
         return 0;
       }
@@ -337,10 +392,13 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
           sizeof(*sym));
       if (!sym || sym->st_name >= objects[owner].strsz)
         return -1;
-      const char *name = (const char *)elf64_stage_ptr(
-          image, objects[owner].strtab + sym->st_name, 1);
+      /* Copy the undefined symbol's name into a bounded buffer before using it
+       * as a lookup key — the raw strtab pointer may not be NUL-terminated
+       * within its segment (R4-8). */
+      char name[256];
       u64 resolved = 0;
-      if (!name ||
+      if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
+                          sizeof(name)) ||
           elf64_resolve_symbol(image, objects, object_count, name, &resolved) != 0) {
         if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
           resolved = 0;
@@ -612,7 +670,17 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   kfree(file_data);
   return -1;
 #endif
-  if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
+  /* The primary entry point must validate e_phentsize like the shared-object
+   * loader already does: with a small/zero phentsize the phdr-walk casts would
+   * read sizeof(struct elf64_phdr) bytes per slot past the kmalloc(file_size)
+   * buffer. Use subtraction-form bounds so a huge e_phoff cannot wrap the sum
+   * below file_size and slip a wild pointer through the check (R4-4). */
+  if (ehdr->e_phentsize != sizeof(struct elf64_phdr)) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_phoff > file_size ||
+      (u64)ehdr->e_phentsize * ehdr->e_phnum > file_size - ehdr->e_phoff) {
     kfree(file_data);
     return -1;
   }
@@ -651,7 +719,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         (struct elf64_phdr *)(file_data + ehdr->e_phoff +
                               ((u64)j * ehdr->e_phentsize));
     if (p->p_type != PT_INTERP) continue;
-    if (p->p_offset + p->p_filesz > file_size) continue;
+    if (p->p_offset + p->p_filesz < p->p_offset ||
+        p->p_offset + p->p_filesz > file_size) continue;
     char interp[64];
     usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
                                               : sizeof(interp) - 1;
@@ -683,6 +752,13 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     u64 reloc_vaddr = phdr->p_vaddr + load_base;
     if (reloc_vaddr + phdr->p_memsz < reloc_vaddr ||
         reloc_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL) {
+      kfree(file_data);
+      return -1;
+    }
+    /* Cap p_memsz before kzalloc: the project rule is OOM = panic, so a crafted
+     * multi-GiB p_memsz (well under the vaddr ceiling above) would turn a merely
+     * unloadable file into a kernel panic (R4-10). */
+    if (phdr->p_memsz > USER_IMAGE_MAX_SEGMENT) {
       kfree(file_data);
       return -1;
     }
@@ -729,9 +805,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         kfree(file_data);
         return -1;
       }
-      const char *name = (const char *)elf64_stage_ptr(
-          image, objects[0].strtab + objects[0].needed[n], 1);
-      if (!name || strchr(name, '/')) {
+      /* Bound the DT_NEEDED name into a local buffer before strchr/strlen — the
+       * raw strtab pointer may run past its segment without a NUL (R4-8). */
+      char name[96];
+      if (!elf64_copy_str(image, objects[0].strtab + objects[0].needed[n], name,
+                          sizeof(name)) ||
+          strchr(name, '/')) {
         kfree(file_data);
         return -1;
       }
@@ -914,7 +993,14 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
   kfree(file_data);
   return -1;
 #endif
-  if (ehdr->e_phoff + ((u64)ehdr->e_phentsize * ehdr->e_phnum) > file_size) {
+  /* Validate e_phentsize and use subtraction-form bounds — see user_load_elf64
+   * (R4-4). */
+  if (ehdr->e_phentsize != sizeof(struct elf32_phdr)) {
+    kfree(file_data);
+    return -1;
+  }
+  if (ehdr->e_phoff > file_size ||
+      (u64)ehdr->e_phentsize * ehdr->e_phnum > file_size - ehdr->e_phoff) {
     kfree(file_data);
     return -1;
   }
@@ -943,7 +1029,8 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
         (struct elf32_phdr *)(file_data + ehdr->e_phoff +
                               ((u64)j * ehdr->e_phentsize));
     if (p->p_type != PT_INTERP) continue;
-    if (p->p_offset + p->p_filesz > file_size) continue;
+    if (p->p_offset + p->p_filesz < p->p_offset ||
+        p->p_offset + p->p_filesz > file_size) continue;
     char interp[64];
     usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
                                               : sizeof(interp) - 1;
@@ -977,6 +1064,11 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
       kfree(file_data);
       return -1;
     }
+    /* Cap p_memsz before allocating — see user_load_elf64 (R4-10). */
+    if (phdr->p_memsz > USER_IMAGE_MAX_SEGMENT) {
+      kfree(file_data);
+      return -1;
+    }
 
     struct user_image_segment *segment =
         &image->segments[image->segment_count++];
@@ -1005,7 +1097,8 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
           (struct elf32_phdr *)(file_data + ehdr->e_phoff +
                                 ((u64)i * ehdr->e_phentsize));
       if (phdr->p_type != PT_DYNAMIC) continue;
-      if (phdr->p_offset + phdr->p_filesz > file_size) continue;
+      if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
+          phdr->p_offset + phdr->p_filesz > file_size) continue;
       struct elf32_dyn *dyn =
           (struct elf32_dyn *)(file_data + phdr->p_offset);
       usize ndyn = phdr->p_filesz / sizeof(struct elf32_dyn);

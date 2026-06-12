@@ -337,6 +337,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
  * waiters on uaddr. */
 int scheduler_futex(u64 uaddr, int op, int val);
 void scheduler_futex_wake_addr(u64 uaddr, int val);
+void scheduler_futex_cleanup_task(usize task_id);
 
 /* M29: reap any DEAD thread tasks (created via SYS_CLONE with is_thread=1)
  * whose kernel stack is no longer in use. Called from scheduler_yield. */

@@ -308,7 +308,11 @@ void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
 	                     buffer + sizeof(struct ipv6_header), size);
 
 	if (in6_is_loopback(&dst)) {
-		ipv6_receive(buffer, total);
+		/* Defer delivery instead of recursing into ipv6_receive here: a
+		 * synchronous loopback path re-enters the TCP state machine mid-send
+		 * and deadlocks multi-packet exchanges. net_poll drains the queue in a
+		 * clean context. Mirrors the IPv4 fix in ipv4.c. */
+		net_loopback_enqueue(buffer, total, 1);
 		kfree(buffer);
 		return;
 	}
@@ -339,6 +343,12 @@ void ipv6_loopback_smoke(void)
 	hdr->checksum = bswap16(csum);
 
 	ipv6_send(loop, IP6_NH_ICMPV6, req, sizeof(req));
+	/* Loopback delivery is now deferred (net_loopback_enqueue) to avoid TCP
+	 * state-machine re-entrancy; pump the queue so the request is received, the
+	 * echo reply is sent (also deferred) and then received before we sample the
+	 * counter. A single drain processes the whole cascade — items enqueued while
+	 * draining are picked up in the same loop. */
+	net_loopback_drain();
 
 	if (icmpv6_echo_reply_count() > before)
 		console_write("M32-IP6: ok icmpv6-loopback\n");
@@ -355,6 +365,10 @@ void ipv6_loopback_smoke(void)
 	udp[8] = 'x';
 	u32 err_before = __atomic_load_n(&g_icmpv6_errors, __ATOMIC_RELAXED);
 	ipv6_send(loop, IP6_NH_UDP, udp, sizeof(udp));
+	/* Drain the deferred loopback queue: the UDP datagram is received, the
+	 * port-unreachable ICMPv6 error is sent (deferred) and then received,
+	 * incrementing g_icmpv6_errors — all within this one drain cascade. */
+	net_loopback_drain();
 	if (__atomic_load_n(&g_icmpv6_errors, __ATOMIC_RELAXED) > err_before)
 		console_write("M32-IP6: ok icmpv6-errors\n");
 	else

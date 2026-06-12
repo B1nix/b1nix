@@ -2093,6 +2093,37 @@ void scheduler_charge_tick(int is_user) {
 u64 scheduler_get_uptime_ticks(void) { return scheduler_ticks; }
 
 static void post_sigchld_to_parent(usize parent_id, int job_control_event);
+static int is_pgrp_orphaned(usize pgid, const struct task *exiting);
+
+/* Reparent every child of `exiting` to init (PID 1) and, for each process group
+ * that thereby becomes orphaned and still has stopped members, deliver the
+ * POSIX SIGHUP+SIGCONT. Shared by normal exit and the in-scheduler signal-death
+ * paths so both reparent consistently (M46-3). Caller holds interrupts. */
+static void reparent_children_and_signal_orphans(struct task *exiting) {
+  /* is_pgrp_orphaned ignores `exiting` as a parent, so a group with several of
+   * our children is judged orphaned even though some have not been reparented
+   * yet in this loop (M46-2). */
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *child = T(i);
+    if (child->state != TASK_UNUSED && child->parent_id == exiting->id) {
+      child->parent_id = 1;
+      usize pgid = child->process_group_id;
+      if (is_pgrp_orphaned(pgid, exiting)) {
+        int has_stopped = 0;
+        for (usize j = 0; j < g_task_hwm; j++) {
+          if (T(j)->state == TASK_STOPPED && T(j)->process_group_id == pgid) {
+            has_stopped = 1;
+            break;
+          }
+        }
+        if (has_stopped) {
+          scheduler_kill_process_group(pgid, SIGHUP);
+          scheduler_kill_process_group(pgid, SIGCONT);
+        }
+      }
+    }
+  }
+}
 
 static void terminate_group_siblings(struct task *t) {
   usize tgid = g_task_tgid[task_index(t)];
@@ -2203,6 +2234,11 @@ void scheduler_exit_current(int exit_code) {
     }
   }
 
+  /* Drop any futex waiter this task still owns (e.g. it was signalled out of
+   * FUTEX_WAIT and terminated before self-detaching) so a later wake on the
+   * same key cannot target this slot once it is recycled. */
+  scheduler_futex_cleanup_task(current_task->id);
+
   /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
    * parent process. Skip the per-task fd/cred/mm teardown, let the reaper
    * (scheduler_reap_dead_threads) free what's exclusively this thread's
@@ -2252,30 +2288,7 @@ void scheduler_exit_current(int exit_code) {
 
   interrupts_disable();
 
-  /* Reparent children to init (task 1) and check for orphaned process groups.
-   * is_pgrp_orphaned ignores us (the exiting task) as a parent, so a group with
-   * several of our children is correctly judged orphaned even though some of
-   * those children have not been reparented yet in this loop (M46-2). */
-  for (usize i = 0; i < g_task_hwm; i++) {
-    struct task *child = T(i);
-    if (child->state != TASK_UNUSED && child->parent_id == current_task->id) {
-      child->parent_id = 1;
-      usize pgid = child->process_group_id;
-      if (is_pgrp_orphaned(pgid, current_task)) {
-        int has_stopped = 0;
-        for (usize j = 0; j < g_task_hwm; j++) {
-          if (T(j)->state == TASK_STOPPED && T(j)->process_group_id == pgid) {
-            has_stopped = 1;
-            break;
-          }
-        }
-        if (has_stopped) {
-          scheduler_kill_process_group(pgid, SIGHUP);
-          scheduler_kill_process_group(pgid, SIGCONT);
-        }
-      }
-    }
-  }
+  reparent_children_and_signal_orphans(current_task);
 
   /* Free credentials */
   if (current_task->cred) {
@@ -3173,9 +3186,22 @@ int scheduler_kill(usize task_id, int sig) {
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
       }
-      if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
-        T(i)->state = TASK_READY;
-        sched_rq_enqueue_current(T(i));
+      /* CAS BLOCKED/STOPPED -> READY so a kill racing the target's exit on
+       * another CPU cannot resurrect a DEAD/REAPING task into the runqueue
+       * (R3-12, mirrors wake_sleepers). */
+      {
+        enum task_state expected = TASK_BLOCKED;
+        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+          sched_rq_enqueue_current(T(i));
+        } else {
+          expected = TASK_STOPPED;
+          if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                          0, __ATOMIC_ACQUIRE,
+                                          __ATOMIC_RELAXED)) {
+            sched_rq_enqueue_current(T(i));
+          }
+        }
       }
       interrupts_restore(flags);
       return 0;
@@ -3229,9 +3255,22 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
         scheduler_notify_wait_event(T(i)->parent_id);
         flags = interrupts_save();
       }
-      if (T(i)->state == TASK_BLOCKED || T(i)->state == TASK_STOPPED) {
-        T(i)->state = TASK_READY;
-        sched_rq_enqueue_current(T(i));
+      /* CAS BLOCKED/STOPPED -> READY so a kill racing the target's exit on
+       * another CPU cannot resurrect a DEAD/REAPING task into the runqueue
+       * (R3-12, mirrors wake_sleepers). */
+      {
+        enum task_state expected = TASK_BLOCKED;
+        if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                        __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+          sched_rq_enqueue_current(T(i));
+        } else {
+          expected = TASK_STOPPED;
+          if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY,
+                                          0, __ATOMIC_ACQUIRE,
+                                          __ATOMIC_RELAXED)) {
+            sched_rq_enqueue_current(T(i));
+          }
+        }
       }
       sent++;
     }
@@ -3678,6 +3717,12 @@ void scheduler_deliver_pending_signals(void) {
     if (sig == SIGKILL) {
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
       terminate_group_siblings(current_task);
+      /* Reparent children + signal newly-orphaned stopped pgrps and drop our
+       * futex waiters — this path used to skip all of that (M46-3). It runs
+       * inside the scheduler so it must NOT do the yield-based fd teardown that
+       * scheduler_exit_current performs; the zombie reaper handles the rest. */
+      reparent_children_and_signal_orphans(current_task);
+      scheduler_futex_cleanup_task(current_task->id);
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
@@ -3713,6 +3758,10 @@ void scheduler_deliver_pending_signals(void) {
       case SIGPROF:
         current_task->exit_code = TASK_EXIT_SIGNALED | sig;
         terminate_group_siblings(current_task);
+        /* Reparent + orphan-pgrp signalling + futex cleanup, as for SIGKILL
+         * above (M46-3). No yield-based teardown — we are inside the scheduler. */
+        reparent_children_and_signal_orphans(current_task);
+        scheduler_futex_cleanup_task(current_task->id);
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;

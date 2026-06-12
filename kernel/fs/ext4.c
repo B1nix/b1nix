@@ -261,6 +261,13 @@ static void ext4_free_inode(struct ext4_fs *fs, u32 inode_num) {
   ext4_free_inode_tx(fs, inode_num, 0);
 }
 
+/* Defined later; forward-declared so the lookup/merge paths can mask the
+ * uninitialized-extent high bit out of ee_len the same way the truncate path
+ * already does (an ee_len > 0x8000 marks an uninitialized extent of true
+ * length ee_len - 0x8000). */
+static u16 ext4_extent_len(const struct ext4_extent *ext);
+static u32 ext4_extent_phys(const struct ext4_extent *ext);
+
 static u32 ext4_extent_lookup(struct ext4_fs *fs, struct ext2_inode *inode, u32 logical_block) {
     struct ext4_extent_header *eh = (struct ext4_extent_header *)inode->i_block;
   if (eh->eh_magic != EXT4_EXTENT_MAGIC) return 0;
@@ -268,7 +275,7 @@ static u32 ext4_extent_lookup(struct ext4_fs *fs, struct ext2_inode *inode, u32 
     if (eh->eh_depth == 0) {
         struct ext4_extent *exts = (struct ext4_extent *)(eh + 1);
         for (u16 i = 0; i < eh->eh_entries; i++) {
-            if (logical_block >= exts[i].ee_block && logical_block < exts[i].ee_block + exts[i].ee_len) {
+            if (logical_block >= exts[i].ee_block && logical_block < exts[i].ee_block + ext4_extent_len(&exts[i])) {
                 u32 result = (exts[i].ee_start_lo | ((u32)exts[i].ee_start_hi << 16)) + (logical_block - exts[i].ee_block);
                 kfree(block_buf); return result;
             }
@@ -284,7 +291,7 @@ static u32 ext4_extent_lookup(struct ext4_fs *fs, struct ext2_inode *inode, u32 
         if (level == 1) {
             struct ext4_extent *exts = (struct ext4_extent *)(node_hdr + 1);
             for (u16 i = 0; i < node_hdr->eh_entries; i++) {
-                if (logical_block >= exts[i].ee_block && logical_block < exts[i].ee_block + exts[i].ee_len) {
+                if (logical_block >= exts[i].ee_block && logical_block < exts[i].ee_block + ext4_extent_len(&exts[i])) {
                     u32 result = (exts[i].ee_start_lo | ((u32)exts[i].ee_start_hi << 16)) + (logical_block - exts[i].ee_block);
                     kfree(block_buf); return result;
                 }
@@ -304,7 +311,12 @@ static int ext4_add_extent(struct ext2_inode *inode, u32 logical, u32 physical, 
         struct ext4_extent *exts = (struct ext4_extent *)(eh + 1); u16 n = eh->eh_entries;
         if (n > 0) {
             struct ext4_extent *last = &exts[n - 1];
-      if (logical == last->ee_block + last->ee_len && (last->ee_start_lo + last->ee_len) == physical) { if ((u32)last->ee_len + len <= 32768) { last->ee_len += len; return 1; } }
+            /* Only merge into an *initialized* extent (ee_len <= 0x8000); merging
+             * into an uninitialized one would scramble its high-bit length. */
+            u16 last_len = ext4_extent_len(last);
+            if (last->ee_len <= 0x8000 && logical == last->ee_block + last_len &&
+                (ext4_extent_phys(last) + last_len) == physical &&
+                (u32)last_len + len <= 32768) { last->ee_len += len; return 1; }
         }
         if (n < eh->eh_max) { exts[n].ee_block = logical; exts[n].ee_len = len; exts[n].ee_start_lo = physical; exts[n].ee_start_hi = 0; eh->eh_entries = n + 1; return 1; }
         return 0;
@@ -328,8 +340,15 @@ static u32 ext4_get_block(struct ext4_fs *fs, struct ext2_inode *inode, u32 bloc
 }
 
 static int ext4_set_block(struct ext2_inode *inode, u32 block_idx, u32 phys) {
-    if (inode->i_flags & EXT4_EXTENTS_FL || block_idx >= EXT2_NDIR_BLOCKS) return ext4_add_extent(inode, block_idx, phys, 1);
-    inode->i_block[block_idx] = phys; return 1;
+    if (inode->i_flags & EXT4_EXTENTS_FL)
+        return ext4_add_extent(inode, block_idx, phys, 1);
+    if (block_idx < EXT2_NDIR_BLOCKS) { inode->i_block[block_idx] = phys; return 1; }
+    /* A block-mapped inode (no EXTENTS_FL — only from external images) growing
+     * past the 12 direct blocks needs single/double-indirect write support,
+     * which this driver does not implement. Refuse rather than route into
+     * ext4_add_extent, which would memset(i_block) and destroy all 12 existing
+     * direct pointers — silent data loss plus orphaned blocks (R3-5). */
+    return 0;
 }
 
 static u64 ext4_get_inode_size(struct ext4_fs *fs, struct ext2_inode *inode) {
@@ -590,7 +609,7 @@ static int ext4_add_dir_entry_tx(struct ext4_fs *fs, u32 dir_ino, u32 child_ino,
         ext4_read_block(fs, phys, buf); usize off = 0;
         while (off < fs->block_size) {
             struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-            if (e->rec_len == 0) break;
+            if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
             u32 actual = 8 + ((e->name_len + 3) & ~3);
             if (e->rec_len >= actual + needed) {
                 u32 old_rec_len = e->rec_len;
@@ -630,7 +649,10 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
         ext4_read_block(fs, phys, dir_buf); usize off = 0;
         while (off < fs->block_size && count < max_entries) {
             struct ext2_dir_entry *e = (struct ext2_dir_entry *)(dir_buf + off);
-            if (e->rec_len == 0) break;
+            /* Stop on a corrupt entry rather than advancing off the block
+             * (rec_len < 8 → no progress / heap overrun) (R3-9). Valid entries
+             * always satisfy this. */
+            if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
             if (e->inode != 0) {
                 if (entry_idx >= offset) {
                     usize name_len = e->name_len > 63 ? 63 : e->name_len;
@@ -736,7 +758,7 @@ static int ext4_vfs_unlink_tx(struct vfs_node *dir, const char *name, struct jou
     ext4_read_block(fs, phys, buf); usize off = 0; usize local_prev = (usize)-1;
     while (off < fs->block_size) {
       struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-      if (e->rec_len == 0) break;
+      if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
       if (e->inode != 0 && strlen(name) == e->name_len && memcmp(e->name, name, e->name_len) == 0) {
         ino = e->inode; target_phys = phys; target_off = off; prev_off = local_prev; break;
       }
@@ -832,7 +854,7 @@ static int ext4_vfs_rename(struct vfs_node *old_dir, const char *old_name,
     ext4_read_block(fs, phys, buf); usize off = 0;
     while (off < fs->block_size) {
       struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-      if (e->rec_len == 0) break;
+      if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
       if (e->inode != 0 && strlen(old_name) == e->name_len && memcmp(e->name, old_name, e->name_len) == 0) {
         ino = e->inode; type = e->file_type; break;
       }
@@ -880,7 +902,7 @@ static int ext4_vfs_rename(struct vfs_node *old_dir, const char *old_name,
         usize off = 0;
         while (off < fs->block_size) {
           struct ext2_dir_entry *e = (struct ext2_dir_entry *)(db + off);
-          if (e->rec_len == 0) break;
+          if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
           if (e->inode != 0 && e->name_len == 2 && e->name[0] == '.' &&
               e->name[1] == '.') {
             e->inode = new_dir_info->inode_num;
@@ -1046,7 +1068,10 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
     usize off = 0;
     while (off < inode.i_size) {
         struct ext2_dir_entry *e = (struct ext2_dir_entry *)(buf + off);
-        if (e->rec_len == 0 || e->inode == 0) { off += e->rec_len ? e->rec_len : 4; continue; }
+        /* Stop on a corrupt entry rather than reading past the buffer (R3-9);
+         * valid entries satisfy rec_len >= 8 and stay within i_size. */
+        if (e->rec_len < 8 || off + e->rec_len > inode.i_size) break;
+        if (e->inode == 0) { off += e->rec_len; continue; }
         char name[256]; memcpy(name, e->name, e->name_len); name[e->name_len] = '\0';
         if (strcmp(name, ".") && strcmp(name, "..")) {
             char full[256]; usize len = strlen(base_path);

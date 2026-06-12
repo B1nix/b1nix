@@ -478,7 +478,13 @@ static isize ext2_vfs_read(struct vfs_node *node, u64 offset, char *buffer,
 		
 		u32 phys_block = ext2_get_inode_block(fs, &inode, block_idx);
 		if (phys_block == 0) {
-			memset(buffer + bytes_read, 0, fs->block_size - block_offset);
+			/* Clamp the hole zero-fill to the bytes actually requested — an
+			 * unclamped block_size-block_offset overruns the caller buffer on a
+			 * trailing partial block (R3-10). */
+			usize hole = fs->block_size - block_offset;
+			if (hole > to_read - bytes_read)
+				hole = to_read - bytes_read;
+			memset(buffer + bytes_read, 0, hole);
 		} else {
 			ext2_read_block(fs, phys_block, block_buf);
 			usize chunk = fs->block_size - block_offset;
@@ -710,7 +716,7 @@ static int ext2_add_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, u32 inode_n
 		while (offset < fs->block_size) {
       struct ext2_dir_entry *entry =
           (struct ext2_dir_entry *)(dir_buf + offset);
-      if (entry->rec_len == 0)
+      if (entry->rec_len < 8 || offset + entry->rec_len > fs->block_size)
         break;
 			
 			u32 actual_len = 8 + ((entry->name_len + 3) & ~3);
@@ -734,13 +740,17 @@ static int ext2_add_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, u32 inode_n
 		}
 	}
 	
-	u32 new_phys = ext2_alloc_block(fs);
+	/* Use the indirect-aware set-block helper instead of writing
+	 * i_block[blocks] directly: past 12 blocks a raw write clobbers the
+	 * single/double-indirect pointer slots with a data block number, after
+	 * which reads treat directory data as block pointers (arbitrary-block I/O).
+	 * The helper allocates the block, places it (direct or indirect), updates
+	 * i_blocks and writes the inode (R3-10). */
+	u32 new_phys = ext2_allocate_block_for_inode(fs, dir_inode_num, &dir_inode, blocks);
 	if (new_phys) {
-		dir_inode.i_block[blocks] = new_phys;
-		dir_inode.i_blocks += (fs->block_size / 512);
 		dir_inode.i_size += fs->block_size;
 		ext2_write_inode(fs, dir_inode_num, &dir_inode);
-		
+
 		memset(dir_buf, 0, fs->block_size);
 		struct ext2_dir_entry *new_entry = (struct ext2_dir_entry *)dir_buf;
 		new_entry->inode = inode_num;
@@ -771,7 +781,7 @@ static u32 ext2_find_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const char
     usize offset = 0;
     while (offset < fs->block_size) {
       struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
-      if (entry->rec_len == 0) break;
+      if (entry->rec_len < 8 || offset + entry->rec_len > fs->block_size) break;
       if (entry->inode != 0 && strlen(name) == entry->name_len &&
           memcmp(entry->name, name, entry->name_len) == 0) {
         u32 ino = entry->inode;
@@ -800,7 +810,7 @@ static int ext2_is_dir_empty(struct ext2_fs *fs, u32 inode_num) {
         usize offset = 0;
         while (offset < fs->block_size) {
             struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(buf + offset);
-            if (entry->rec_len == 0) break;
+            if (entry->rec_len < 8 || offset + entry->rec_len > fs->block_size) break;
             if (entry->inode != 0) {
                 if (entry->name_len > 2 || (entry->name_len == 1 && entry->name[0] != '.') ||
                     (entry->name_len == 2 && (entry->name[0] != '.' || entry->name[1] != '.'))) {
@@ -832,8 +842,8 @@ static int ext2_remove_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const ch
     struct ext2_dir_entry *prev_entry = 0;
     while (offset < fs->block_size) {
       struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
-      if (entry->rec_len == 0) break;
-      
+      if (entry->rec_len < 8 || offset + entry->rec_len > fs->block_size) break;
+
       if (entry->inode != 0 && strlen(name) == entry->name_len &&
           memcmp(entry->name, name, entry->name_len) == 0) {
         if (prev_entry) {
@@ -1148,7 +1158,7 @@ static int ext2_vfs_rename(struct vfs_node *old_dir, const char *old_name,
         usize off = 0;
         while (off < fs->block_size) {
           struct ext2_dir_entry *e = (struct ext2_dir_entry *)(db + off);
-          if (e->rec_len == 0) break;
+          if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
           if (e->inode != 0 && e->name_len == 2 && e->name[0] == '.' &&
               e->name[1] == '.') {
             e->inode = new_dir_inode_num;
@@ -1193,7 +1203,7 @@ static isize ext2_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
         usize off = 0;
         while (off < fs->block_size && count < max_entries) {
             struct ext2_dir_entry *e = (struct ext2_dir_entry *)(dir_buf + off);
-            if (e->rec_len == 0) break;
+            if (e->rec_len < 8 || off + e->rec_len > fs->block_size) break;
             if (e->inode != 0) {
                 if (entry_idx >= offset) {
                     usize name_len = e->name_len > 63 ? 63 : e->name_len;
@@ -1261,7 +1271,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
 	usize offset = 0;
 	while (offset < inode.i_size) {
 		struct ext2_dir_entry *entry = (struct ext2_dir_entry *)(dir_buf + offset);
-    if (entry->rec_len == 0)
+    if (entry->rec_len < 8 || offset + entry->rec_len > inode.i_size)
       break;
 		
 		if (entry->inode != 0) {

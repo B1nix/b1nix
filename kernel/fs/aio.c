@@ -26,6 +26,13 @@ struct aio_context {
   u32 cq_tail;
   struct aio_request **completed;
   volatile int lock;
+  /* R3-11: the worker thread looks a ctx up by task and uses it after dropping
+   * the list lock, while the owner's aio_task_cleanup may free it concurrently.
+   * `refcount` counts transient holders (only the worker takes one); `dying` is
+   * set by cleanup after unlinking. Whoever drops the last ref under the list
+   * lock with dying set performs the free. */
+  volatile int refcount;
+  volatile int dying;
   struct aio_context *next;
 };
 
@@ -59,6 +66,36 @@ static struct aio_context *aio_ctx_find_by_task(struct task *owner) {
   }
   aio_ctx_list_release();
   return 0;
+}
+
+/* Like aio_ctx_find_by_task but takes a transient reference under the list lock
+ * so the ctx cannot be freed while the caller (the worker thread) uses it. */
+static struct aio_context *aio_ctx_find_and_ref(struct task *owner) {
+  aio_ctx_list_acquire();
+  struct aio_context *it = aio_ctx_list;
+  while (it) {
+    if (it->owner == owner) {
+      it->refcount++;
+      aio_ctx_list_release();
+      return it;
+    }
+    it = it->next;
+  }
+  aio_ctx_list_release();
+  return 0;
+}
+
+/* Drop a transient reference. Frees the ctx if this was the last reference and
+ * cleanup has marked it dying. The decision is made under the list lock so it
+ * cannot race aio_task_cleanup's own free decision. */
+static void aio_ctx_unref(struct aio_context *ctx) {
+  aio_ctx_list_acquire();
+  int freeit = (--ctx->refcount == 0) && ctx->dying;
+  aio_ctx_list_release();
+  if (freeit) {
+    kfree(ctx->completed);
+    kfree(ctx);
+  }
 }
 
 static void aio_ctx_list_add(struct aio_context *ctx) {
@@ -133,8 +170,8 @@ static struct aio_request *aio_dequeue_pending(void) {
 }
 
 static void aio_complete_request(struct aio_request *req) {
-  struct aio_context *ctx = aio_ctx_find_by_task(req->owner);
-  if (!ctx || ctx->owner != req->owner) {
+  struct aio_context *ctx = aio_ctx_find_and_ref(req->owner);
+  if (!ctx) {
     if (req->kbuf)
       kfree(req->kbuf);
     vfs_handle_release(req->handle);
@@ -143,6 +180,18 @@ static void aio_complete_request(struct aio_request *req) {
   }
 
   aio_ctx_acquire(ctx);
+  /* The owner may have started exiting after we found the ctx: if cleanup has
+   * marked it dying it has already drained the CQ, so don't enqueue into a
+   * doomed ctx — drop the request instead (R3-11). */
+  if (ctx->dying) {
+    aio_ctx_release(ctx);
+    if (req->kbuf)
+      kfree(req->kbuf);
+    vfs_handle_release(req->handle);
+    kfree(req);
+    aio_ctx_unref(ctx);
+    return;
+  }
   u32 next_tail = (ctx->cq_tail + 1) % ctx->entries;
   if (next_tail == ctx->cq_head) {
     /* CQ overflow should not happen due to inflight bound; drop oldest safely. */
@@ -161,6 +210,7 @@ static void aio_complete_request(struct aio_request *req) {
   ctx->cq_tail = next_tail;
   aio_ctx_release(ctx);
   scheduler_wake_all((void *)ctx);
+  aio_ctx_unref(ctx);
 }
 
 static void aio_worker_thread(void *arg) {
@@ -214,6 +264,7 @@ void aio_task_cleanup(struct task *task) {
   struct aio_context *ctx = aio_ctx_find_by_task(task);
   if (!ctx)
     return;
+  /* Unlink first so no new aio_ctx_find_and_ref can take a reference. */
   aio_ctx_list_remove(ctx);
   aio_ctx_acquire(ctx);
   for (u32 i = 0; i < ctx->entries; i++) {
@@ -227,8 +278,18 @@ void aio_task_cleanup(struct task *task) {
     kfree(req);
   }
   aio_ctx_release(ctx);
-  kfree(ctx->completed);
-  kfree(ctx);
+
+  /* Mark dying and decide who frees under the list lock: if the worker still
+   * holds a transient reference it will free on its aio_ctx_unref; otherwise we
+   * free here. Exactly one side observes refcount==0 && dying (R3-11). */
+  aio_ctx_list_acquire();
+  ctx->dying = 1;
+  int freeit = (ctx->refcount == 0);
+  aio_ctx_list_release();
+  if (freeit) {
+    kfree(ctx->completed);
+    kfree(ctx);
+  }
 }
 
 int vfs_submit_aio(struct task *owner, const struct b1nix_aio_sqe *sqe) {

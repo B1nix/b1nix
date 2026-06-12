@@ -165,3 +165,27 @@ int scheduler_futex(u64 uaddr, int op, int val) {
 void scheduler_futex_wake_addr(u64 uaddr, int val) {
   (void)scheduler_futex(uaddr, B1NIX_FUTEX_WAKE, val);
 }
+
+/* Remove every waiter owned by an exiting task from all buckets. A task killed
+ * while parked in FUTEX_WAIT (woken by a signal, then terminated before it ran
+ * the self-detach in scheduler_futex) would otherwise leave a stale waiter that
+ * leaks and, worse, makes a later FUTEX_WAKE on the same key call
+ * scheduler_wake_task() on a recycled task id. */
+void scheduler_futex_cleanup_task(usize task_id) {
+  for (unsigned h = 0; h < FUTEX_BUCKETS; h++) {
+    struct futex_bucket *b = &g_futex[h];
+    u64 flags;
+    spin_lock_irqsave(&b->lock, &flags);
+    struct futex_waiter **pp = &b->head;
+    while (*pp) {
+      if ((*pp)->task_id == task_id) {
+        struct futex_waiter *w = *pp;
+        *pp = w->next;
+        kfree(w);
+      } else {
+        pp = &(*pp)->next;
+      }
+    }
+    spin_unlock_irqrestore(&b->lock, flags);
+  }
+}

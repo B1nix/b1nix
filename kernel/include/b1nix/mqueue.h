@@ -31,13 +31,15 @@ struct mqueue {
     usize  writers_waiting;
 };
 
-/* ── Kernel API ── */
+/* ── Kernel API ──
+ * Handles are table indices (0..MQ_MAX_QUEUES-1), never raw kernel pointers:
+ * a userspace handle must not be a dereferenceable kernel address, or any
+ * process could pass an arbitrary kernel VA and read/write through it. */
 void       mqueue_init(void);
-struct mqueue *mqueue_find(const char *name);
-struct mqueue *mqueue_create(const char *name);
-int        mqueue_send(struct mqueue *mq, const void *data, u32 len);
-int        mqueue_receive(struct mqueue *mq, void *data, u32 *len);
-void       mqueue_close(struct mqueue *mq);
+int        mqueue_create(const char *name);          /* returns mqd or -errno */
+int        mqueue_send(int mqd, const void *data, u32 len);
+int        mqueue_receive(int mqd, void *data, u32 *len);
+void       mqueue_close(int mqd);
 int        mqueue_unlink(const char *name);
 
 #endif /* B1NIX_MQUEUE_H */
