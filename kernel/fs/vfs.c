@@ -4122,6 +4122,69 @@ int vfs_ftruncate(int fd, u64 length) {
   return 0;
 }
 
+static isize memfd_read(struct vfs_node *node, u64 offset, char *buffer,
+                        usize size, int flags) {
+  (void)flags;
+  if (!node || !node->inode || offset >= node->inode->size)
+    return 0;
+  usize available = node->inode->size - (usize)offset;
+  usize count = size < available ? size : available;
+  if (count > 0 && node->inode->data)
+    memcpy(buffer, (const char *)node->inode->data + offset, count);
+  return (isize)count;
+}
+
+static isize memfd_write(struct vfs_node *node, u64 offset,
+                         const char *buffer, usize size, int flags) {
+  (void)flags;
+  if (!node || !node->inode || offset >= node->inode->size)
+    return 0;
+  usize available = node->inode->size - (usize)offset;
+  usize count = size < available ? size : available;
+  if (count > 0 && node->inode->data)
+    memcpy((char *)node->inode->data + offset, buffer, count);
+  return (isize)count;
+}
+
+int vfs_memfd_create(const char *name, u32 flags) {
+  if (flags & ~1u)
+    return -EINVAL;
+
+  struct vfs_node *node = vfs_create_node(VFS_FILE);
+  if (!node)
+    return -ENOMEM;
+
+  copy_path(node->name, sizeof(node->name), name && name[0] ? name : "memfd");
+  node->deleted = 1;
+  node->inode->nlink = 0;
+  node->inode->mode = 0600;
+  const struct cred *cred = get_current_cred();
+  node->inode->uid = cred ? cred->euid : ROOT_UID;
+  node->inode->gid = cred ? cred->egid : ROOT_GID;
+  node->inode->read_cb = memfd_read;
+  node->inode->write_cb = memfd_write;
+  node->inode->atime = node->inode->mtime = node->inode->ctime =
+      vfs_get_unix_time();
+
+  struct vfs_handle *h = alloc_raw_handle(VFS_HANDLE_NODE);
+  if (!h) {
+    vfs_node_put(node);
+    return -ENFILE;
+  }
+  h->node = node;
+  h->ops = &node_file_ops;
+  h->flags = B1NIX_O_RDWR;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return fd == -ENOMEM ? -ENOMEM : -EMFILE;
+  }
+  if (flags & 1u)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
+}
+
 int vfs_fcntl(int fd, int cmd, u64 arg) {
   struct vfs_handle *h = get_handle(fd);
   if (!h)

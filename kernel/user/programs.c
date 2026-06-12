@@ -1461,6 +1461,20 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M48: ancillary data on UNIX sockets, in-flight fd references, sender
+   * credentials, and anonymous mmap-able files. */
+  {
+    u64 m48_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m48-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m48_pid < 0) {
+      uwrite("M48-FDPASS: spawn-fail\n");
+    } else {
+      int m48_status = 0;
+      syscall_dispatch(SYS_WAIT, m48_pid, (u64)(usize)&m48_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M47: display substrate — /dev/fb0 mmap + flush, /dev/input/event*
    * queues. The injector thread feeds the mouse-event burst the test binary
    * expects (no real input source exists in a headless smoke run). */

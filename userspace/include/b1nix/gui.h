@@ -12,7 +12,7 @@ struct b1gui_event {
 
 struct b1gui_window {
 	int fd;
-	int shmid;
+	int buffer_fd;
 	uint32_t *pixels;
 	uint32_t width;
 	uint32_t height;

@@ -99,6 +99,7 @@ BINARIES := \
 	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound
+BINARIES += $(BUILD)/bin/m48_smoke
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic

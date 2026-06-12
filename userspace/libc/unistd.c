@@ -635,24 +635,12 @@ ssize_t sendmsg(int fd, const struct msghdr *msg, int flags) {
     errno = EINVAL;
     return -1;
   }
-  if (msg->msg_iovlen == 1)
-    return send(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
-  size_t total = 0;
-  for (int i = 0; i < msg->msg_iovlen; i++)
-    total += msg->msg_iov[i].iov_len;
-  char *tmp = malloc(total ? total : 1);
-  if (!tmp) {
-    errno = ENOMEM;
+  long rc = syscall(SYS_SENDMSG, fd, msg, flags);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
     return -1;
   }
-  size_t off = 0;
-  for (int i = 0; i < msg->msg_iovlen; i++) {
-    memcpy(tmp + off, msg->msg_iov[i].iov_base, msg->msg_iov[i].iov_len);
-    off += msg->msg_iov[i].iov_len;
-  }
-  ssize_t rc = send(fd, tmp, total, flags);
-  free(tmp);
-  return rc;
+  return (ssize_t)rc;
 }
 
 ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
@@ -660,39 +648,16 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
     errno = EINVAL;
     return -1;
   }
-  msg->msg_flags = 0;
-  /* Report the source address as the kernel (all-zero => nl_pid 0 for AF_NETLINK,
-   * INADDR_ANY otherwise). b1nix delivers netlink dumps and raw replies from the
-   * kernel itself, and BusyBox libnetlink rejects any message whose recvmsg
-   * source nl_pid is non-zero — leaving msg_name as uninitialised caller stack
-   * would make `ip` skip every reply (including NLMSG_DONE) and hang. We keep
-   * msg_namelen unchanged: libnetlink pre-sets it to sizeof(sockaddr_nl) and
-   * fails if the kernel alters it. */
-  if (msg->msg_name && msg->msg_namelen)
-    memset(msg->msg_name, 0, msg->msg_namelen);
-  if (msg->msg_iovlen == 1)
-    return recv(fd, msg->msg_iov[0].iov_base, msg->msg_iov[0].iov_len, flags);
-  size_t total = 0;
-  for (int i = 0; i < msg->msg_iovlen; i++)
-    total += msg->msg_iov[i].iov_len;
-  char *tmp = malloc(total ? total : 1);
-  if (!tmp) {
-    errno = ENOMEM;
+  long rc = syscall(SYS_RECVMSG, fd, msg, flags);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
     return -1;
   }
-  ssize_t rc = recv(fd, tmp, total, flags);
-  if (rc > 0) {
-    size_t off = 0, remaining = (size_t)rc;
-    for (int i = 0; i < msg->msg_iovlen && remaining; i++) {
-      size_t c = msg->msg_iov[i].iov_len < remaining ? msg->msg_iov[i].iov_len
-                                                      : remaining;
-      memcpy(msg->msg_iov[i].iov_base, tmp + off, c);
-      off += c;
-      remaining -= c;
-    }
-  }
-  free(tmp);
-  return rc;
+  return (ssize_t)rc;
+}
+
+int memfd_create(const char *name, unsigned int flags) {
+  return _check_err(syscall(SYS_MEMFD_CREATE, name, flags));
 }
 
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,

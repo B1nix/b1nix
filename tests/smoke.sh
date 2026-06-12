@@ -1110,6 +1110,11 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
 	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
 
+	check_output "$LOG" "M48-FDPASS: ok scm-rights" "M48: SCM_RIGHTS fd transfer"
+	check_output "$LOG" "M48-FDPASS: ok scm-refcount-close" "M48: in-flight fd survives sender close"
+	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
+	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
+
 	# ── M47 Phase 2: displayd + b1display protocol ──
 	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
 		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"
@@ -1126,6 +1131,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "displayd: bye" "M47: displayd clean shutdown"
 		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
 		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
+		check_output "$LOG" "M48-FDPASS: ok display-fd-buffers" "M48: display buffers use memfd + SCM_RIGHTS"
 	fi
 fi
 

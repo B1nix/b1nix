@@ -3021,6 +3021,17 @@ struct vfs_handle *scheduler_fd_get(int fd) {
   return h;
 }
 
+struct vfs_handle *scheduler_fd_get_retain(int fd) {
+  if (!current_task || fd < 0 || (usize)fd >= current_task->fd_capacity)
+    return 0;
+  fd_lock_acquire();
+  struct vfs_handle *h = current_task->fd_table[fd];
+  if (h)
+    vfs_handle_retain(h);
+  fd_lock_release();
+  return h;
+}
+
 int scheduler_fd_set(int fd, struct vfs_handle *handle) {
   if (!current_task || fd < 0)
     return -1;
@@ -3412,10 +3423,13 @@ u64 scheduler_brk_get(void) {
 }
 
 u64 vm_find_free_area(struct task *t, usize length) {
-  u64 start = 0x40000000ULL;
 #ifdef __x86_64__
+  /* The bootstrap identity map occupies the low 4 GiB with huge pages.
+   * File-backed lazy mappings need ordinary leaf PTEs, so start above it. */
+  u64 start = 0x100000000ULL;
   u64 end = 0x7FFFFFFFFFFFULL;
 #else
+  u64 start = 0x40000000ULL;
   /* 32-bit: anonymous mmap must stay below the kernel split at 0x80000000 so it
    * never aliases the direct map [0x80000000, 0xC0000000). The user stack VMA
    * (just under 0x80000000) further bounds the search. */

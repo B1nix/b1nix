@@ -3,7 +3,7 @@
  *
  * Single-threaded poll loop over: one listening UNIX socket
  * (B1D_SOCKET_PATH), connected clients, and /dev/input/event0+1.
- * Composites client SHM surfaces damage-driven into the mmap'd /dev/fb0
+ * Composites client memfd surfaces damage-driven into the mmap'd /dev/fb0
  * shadow buffer and pushes dirty rectangles with B1NIX_FBIOFLUSH.
  *
  * Protocol: b1nix/display.h (b1display v1, Wayland-shaped — see
@@ -61,8 +61,9 @@ struct dbuffer {
 	int used;
 	uint32_t id;
 	int client;
-	void *mem; /* shmat'd base + offset applied */
-	void *shm_base;
+	void *mem;
+	void *map_base;
+	size_t map_size;
 	uint32_t w, h, stride;
 };
 
@@ -97,6 +98,7 @@ struct dclient {
 	int fd;
 	uint8_t inbuf[512];
 	unsigned inlen;
+	int pending_fd;
 };
 
 static struct dclient clients[MAX_CLIENTS];
@@ -341,10 +343,8 @@ static void zorder_raise(int slot) {
 }
 
 static void buffer_destroy(struct dbuffer *b) {
-	/* Detach the whole SHM segment; surfaces still pointing here are
-	 * unmapped by the callers. */
-	if (b->shm_base)
-		syscall(SYS_SHMDT, (long)(uintptr_t)b->shm_base, 0, 0, 0, 0, 0);
+	if (b->map_base)
+		munmap(b->map_base, b->map_size);
 	memset(b, 0, sizeof(*b));
 }
 
@@ -382,6 +382,8 @@ static void client_disconnect(int ci) {
 	for (int i = 0; i < MAX_TOPLEVELS; i++)
 		if (toplevels[i].used && toplevels[i].client == ci)
 			memset(&toplevels[i], 0, sizeof(toplevels[i]));
+	if (clients[ci].pending_fd >= 0)
+		close(clients[ci].pending_fd);
 	close(clients[ci].fd);
 	memset(&clients[ci], 0, sizeof(clients[ci]));
 }
@@ -419,13 +421,17 @@ static void handle_display_req(int ci, uint16_t op, const uint32_t *a,
 		break;
 	}
 	case B1D_REQ_DISPLAY_CREATE_BUFFER: {
-		if (n < 6)
+		if (n < 5)
 			return;
-		uint32_t id = a[0], key = a[1], off = a[2], w = a[3], h = a[4],
-		         stride = a[5];
+		uint32_t id = a[0], off = a[1], w = a[2], h = a[3], stride = a[4];
+		int passed_fd = clients[ci].pending_fd;
+		clients[ci].pending_fd = -1;
 		if (w == 0 || h == 0 || w > 2048 || h > 2048 || stride < w * 4 ||
-		    (uint64_t)off + (uint64_t)stride * h > 0x100000) {
+		    (uint64_t)off + (uint64_t)stride * h > 0x100000 ||
+		    passed_fd < 0) {
 			send_err(ci, id, B1D_ERR_BAD_BUFFER);
+			if (passed_fd >= 0)
+				close(passed_fd);
 			return;
 		}
 		int slot = -1;
@@ -433,15 +439,14 @@ static void handle_display_req(int ci, uint16_t op, const uint32_t *a,
 			if (!buffers[i].used) { slot = i; break; }
 		if (slot < 0) {
 			send_err(ci, id, B1D_ERR_NO_RESOURCE);
+			close(passed_fd);
 			return;
 		}
-		int shmid = (int)syscall(SYS_SHMGET, key, off + stride * h, 0666, 0, 0, 0);
-		if (shmid < 0) {
-			send_err(ci, id, B1D_ERR_BAD_BUFFER);
-			return;
-		}
-		void *mem = (void *)syscall(SYS_SHMAT, shmid, 0, 0, 0, 0, 0);
-		if (mem == (void *)-1) {
+		size_t map_size = (size_t)off + (size_t)stride * h;
+		void *mem = mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+		                 passed_fd, 0);
+		close(passed_fd);
+		if (mem == MAP_FAILED) {
 			send_err(ci, id, B1D_ERR_BAD_BUFFER);
 			return;
 		}
@@ -449,7 +454,8 @@ static void handle_display_req(int ci, uint16_t op, const uint32_t *a,
 		b->used = 1;
 		b->id = id;
 		b->client = ci;
-		b->shm_base = mem;
+		b->map_base = mem;
+		b->map_size = map_size;
 		b->mem = (uint8_t *)mem + off;
 		b->w = w;
 		b->h = h;
@@ -710,11 +716,28 @@ static void handle_msg(int ci, const struct b1d_hdr *h, const uint32_t *args,
 
 static void client_data(int ci) {
 	struct dclient *c = &clients[ci];
-	ssize_t n = recv(c->fd, c->inbuf + c->inlen, sizeof(c->inbuf) - c->inlen, 0);
+	char control[CMSG_SPACE(sizeof(int))];
+	struct iovec iov = {c->inbuf + c->inlen, sizeof(c->inbuf) - c->inlen};
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	memset(control, 0, sizeof(control));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = control;
+	mh.msg_controllen = sizeof(control);
+	ssize_t n = recvmsg(c->fd, &mh, 0);
 	if (n <= 0) {
 		client_disconnect(ci);
 		return;
 	}
+	for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm;
+	     cm = CMSG_NXTHDR(&mh, cm))
+		if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+		    cm->cmsg_len >= CMSG_LEN(sizeof(int))) {
+			if (c->pending_fd >= 0)
+				close(c->pending_fd);
+			memcpy(&c->pending_fd, CMSG_DATA(cm), sizeof(int));
+		}
 	c->inlen += (unsigned)n;
 	for (;;) {
 		if (c->inlen < sizeof(struct b1d_hdr))
@@ -1068,6 +1091,7 @@ int main(int argc, char **argv) {
 					clients[slot].used = 1;
 					clients[slot].fd = cfd;
 					clients[slot].inlen = 0;
+					clients[slot].pending_fd = -1;
 				}
 			}
 		}

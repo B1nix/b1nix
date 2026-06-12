@@ -30,10 +30,9 @@ transfer/flush path), `kernel/dev/video.c`, an in-kernel `compositor.c`
 (~500 lines, becomes the console fallback), `ps2_kbd.c`/`ps2_mouse.c`,
 SysV SHM, UNIX sockets, poll/select, pthreads, mmap.
 
-Missing (checked 2026-06: no hits in `kernel/`): `sendmsg`/`recvmsg`,
-`SCM_RIGHTS` fd passing, `memfd_create`. These are the M48 prerequisites for
-real libwayland, and independently useful POSIX features (dbus, privilege
-separation in daemons).
+M48 now provides `sendmsg`/`recvmsg`, `SCM_RIGHTS`, `SCM_CREDENTIALS`, and
+`memfd_create`. The display protocol uses memfd-backed buffers passed over its
+UNIX socket, leaving the M49 libwayland/protocol work as the next layer.
 
 ## M47: Userspace Display Server
 
@@ -176,6 +175,7 @@ synthetic input injector) surfaced four issues, all now fixed:
 Standalone POSIX milestone; the display stack is the first consumer but not
 the only one (dbus-style daemons, dropbear privilege separation).
 
+- Status: implemented and smoke-tested on x86_64 and x86.
 - `sendmsg`/`recvmsg` syscalls with `msg_control` ancillary data on UNIX
   sockets.
 - `SCM_RIGHTS`: fd transfer with correct refcounting across the existing

@@ -437,7 +437,8 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
         (pte & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
   } else if (pte & (VMM_LAZY | VMM_SWAPPED)) {
     // For non-present pages, update the saved flags
-    pt[pt_index(virtual_address)] = (pte & PAGE_ENTRY_ADDRESS_MASK) | flags;
+    pt[pt_index(virtual_address)] =
+        (pte & (PAGE_ENTRY_ADDRESS_MASK | VMM_LAZY | VMM_SWAPPED)) | flags;
   }
 
   invalidate_page(virtual_address);
@@ -489,8 +490,11 @@ void vmm_set_lazy(u64 virtual_address) {
 
   u64 *pml4 = get_current_pml4();
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
+  pml4[pml4_index(virtual_address)] |= VMM_USER;
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+  pdpt[pdpt_index(virtual_address)] |= VMM_USER;
   u64 *pt = ensure_child_table(pd, pd_index(virtual_address));
+  pd[pd_index(virtual_address)] |= VMM_USER;
 
   // Set a non-present entry with LAZY flag so we know it's a lazy page
   pt[pt_index(virtual_address)] = VMM_LAZY;
@@ -542,8 +546,19 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   extern void eviction_register_page(struct task *task, u64 vaddr, u64 frame);
   extern void eviction_unregister_page(u64 frame);
 
+  /* A non-present leaf can be an explicit lazy/swap entry. Do not let the
+   * heap growth fast path overwrite that metadata with a zero page. */
+  int has_deferred_leaf = 0;
+  u64 deferred_flags;
+  vmm_read_acquire(&deferred_flags);
+  u64 *deferred_leaf = pf_leaf_pte_ptr(page_aligned);
+  if (deferred_leaf && (*deferred_leaf & (VMM_LAZY | VMM_SWAPPED)))
+    has_deferred_leaf = 1;
+  vmm_read_release(deferred_flags);
+
   // Lazy Allocation for User Heap/Mmap region (anonymous, no leaf PTE yet).
-  if (!(error_code & PF_PRESENT) && fault_addr >= 0x40000000 &&
+  if (!(error_code & PF_PRESENT) && !has_deferred_leaf &&
+      fault_addr >= 0x40000000 &&
       fault_addr < 0x00007FFFFFFFFFFF) {
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
     u64 frame = pmm_alloc_frame();
@@ -612,9 +627,16 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
     // File-backed fill happens OUTSIDE vmm_lock (read_cb / blk_*_cached block).
     int shared_cache_frame = 0;
+    int vma_shared = 0;
     struct vm_area *vma = current_task->vma_list;
     while (vma) {
       if (page_aligned >= vma->start && page_aligned < vma->end) {
+        /* MAP_SHARED file pages must stay shared across fork: the page-cache
+         * frame is the single backing store for every mapper (e.g. an M48
+         * memfd shared between a client and displayd). Without VMM_SHARED the
+         * fork CoW path (clone_table) would copy the page on the next write,
+         * silently de-sharing the mapping. */
+        vma_shared = (vma->flags & MAP_SHARED) != 0;
         if (vma->node && vma->node->inode) {
           u64 file_offset = vma->offset + (page_aligned - vma->start);
           u64 file_page = file_offset & ~(PAGE_SIZE - 1);
@@ -663,10 +685,15 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     }
     u64 flags = VMM_PRESENT | VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
+    if (vma_shared) flags |= VMM_SHARED;
     *slot = frame | flags;
     invalidate_page(page_aligned);
     vmm_write_release(cflags);
-    eviction_register_page(current_task, page_aligned, frame);
+    /* Shared page-cache frames are owned by the cache and mapped in several
+     * address spaces — leave them out of the per-task swap set (same as SysV
+     * shm, which never registers either). */
+    if (!vma_shared)
+      eviction_register_page(current_task, page_aligned, frame);
     return 0;
   }
 
@@ -1074,5 +1101,3 @@ void paging_swap_in_all_swapped(u64 pml4_phys) {
   u64 *pml4 = (u64 *)(usize)(pml4_phys + DIRECT_MAP_BASE);
   swap_in_recursive(pml4, 0, 0, pml4_phys);
 }
-
-

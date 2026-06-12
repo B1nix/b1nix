@@ -227,6 +227,7 @@ int vfs_pipe(int pipefd[2]);
 int vfs_dup(int oldfd);
 int vfs_dup2(int oldfd, int newfd);
 int vfs_ftruncate(int fd, u64 length);
+int vfs_memfd_create(const char *name, u32 flags);
 int vfs_fcntl(int fd, int cmd, u64 arg);
 int vfs_ioctl(int fd, u64 request, void *arg);
 void vfs_close_on_exec(void);
@@ -237,6 +238,19 @@ int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
+struct b1nix_ucred {
+  int pid;
+  u32 uid;
+  u32 gid;
+};
+#define VFS_SCM_MAX_FDS 8
+isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
+                         struct vfs_handle **handles, usize nhandles,
+                         const struct b1nix_ucred *cred);
+isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
+                         int *received_fds, usize fd_capacity,
+                         usize *received_count, struct b1nix_ucred *cred,
+                         int *has_cred, int *control_truncated);
 int vfs_setsockopt(int fd, int level, int optname, const void *optval,
                    usize optlen);
 int vfs_getsockopt(int fd, int level, int optname, void *optval,

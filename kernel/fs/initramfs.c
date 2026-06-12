@@ -41,6 +41,7 @@
 #include "initramfs_m46_smoke.inc"
 #include "initramfs_m47_smoke.inc"
 #include "initramfs_m47d_smoke.inc"
+#include "initramfs_m48_smoke.inc"
 #include "initramfs_displayd.inc"
 #include "initramfs_gclock.inc"
 #include "initramfs_gterm.inc"
@@ -996,6 +997,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m47_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m47d-smoke", (const char *)vfs_m47d_smoke_elf,
      sizeof(vfs_m47d_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m48-smoke", (const char *)vfs_m48_smoke_elf,
+     sizeof(vfs_m48_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/displayd", (const char *)vfs_displayd_elf,
      sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gclock", (const char *)vfs_gclock_elf,

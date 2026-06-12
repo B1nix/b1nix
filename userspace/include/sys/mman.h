@@ -15,6 +15,8 @@
 
 #define MAP_FAILED      ((void *)-1)
 
+#define MFD_CLOEXEC     0x0001U
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -22,6 +24,7 @@ extern "C" {
 void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t len, int prot);
+int memfd_create(const char *name, unsigned int flags);
 
 #ifdef __cplusplus
 }

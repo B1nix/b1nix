@@ -4,6 +4,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <syscall.h>
@@ -23,10 +24,37 @@ static int request(int fd, uint32_t object_id, uint16_t opcode,
 	return send(fd, msg, header.size, 0) == header.size ? 0 : -1;
 }
 
+static int request_fd(int fd, uint32_t object_id, uint16_t opcode,
+                      const uint32_t *words, unsigned nwords, int passed_fd) {
+	uint8_t msg[B1D_MAX_MSG];
+	char control[CMSG_SPACE(sizeof(int))];
+	struct b1d_hdr header = {
+	    object_id, opcode, (uint16_t)(sizeof(struct b1d_hdr) + nwords * 4)};
+	if (header.size > sizeof(msg))
+		return -1;
+	memcpy(msg, &header, sizeof(header));
+	if (nwords)
+		memcpy(msg + sizeof(header), words, nwords * 4);
+	memset(control, 0, sizeof(control));
+	struct iovec iov = {msg, header.size};
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = control;
+	mh.msg_controllen = sizeof(control);
+	struct cmsghdr *c = CMSG_FIRSTHDR(&mh);
+	c->cmsg_level = SOL_SOCKET;
+	c->cmsg_type = SCM_RIGHTS;
+	c->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(c), &passed_fd, sizeof(passed_fd));
+	return sendmsg(fd, &mh, 0) == header.size ? 0 : -1;
+}
+
 int b1gui_connect(struct b1gui_window *win) {
 	memset(win, 0, sizeof(*win));
 	win->fd = socket(AF_UNIX, SOCK_STREAM, 0);
-	win->shmid = -1;
+	win->buffer_fd = -1;
 	if (win->fd < 0)
 		return -1;
 	struct sockaddr_un addr;
@@ -57,27 +85,24 @@ int b1gui_create_window(struct b1gui_window *win, uint32_t width,
 	win->width = width;
 	win->height = height;
 
-	struct timespec now;
-	clock_gettime(CLOCK_MONOTONIC, &now);
-	uint32_t key = 0xB1000000u ^ ((uint32_t)now.tv_nsec & 0x00ffffffu) ^
-	               ((uint32_t)getpid() << 8) ^ (width << 4) ^ height;
-	win->shmid = (int)syscall(SYS_SHMGET, key, width * height * 4,
-	                          0x1000 | 0666);
-	if (win->shmid < 0)
+	size_t buffer_size = (size_t)width * height * 4;
+	win->buffer_fd = memfd_create("b1display-buffer", MFD_CLOEXEC);
+	if (win->buffer_fd < 0 || ftruncate(win->buffer_fd, (off_t)buffer_size) < 0)
 		return -1;
-	win->pixels = (uint32_t *)syscall(SYS_SHMAT, win->shmid, 0, 0);
-	if (win->pixels == (void *)-1) {
+	win->pixels = mmap(0, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                   win->buffer_fd, 0);
+	if (win->pixels == MAP_FAILED) {
 		win->pixels = 0;
 		return -1;
 	}
 
 	uint32_t surface[1] = {win->surface_id};
-	uint32_t buffer[6] = {win->buffer_id, key, 0, width, height, width * 4};
+	uint32_t buffer[5] = {win->buffer_id, 0, width, height, width * 4};
 	uint32_t top[2] = {win->toplevel_id, win->surface_id};
 	if (request(win->fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_SURFACE,
 	            surface, 1) ||
-	    request(win->fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_BUFFER,
-	            buffer, 6) ||
+	    request_fd(win->fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_BUFFER,
+	               buffer, 5, win->buffer_fd) ||
 	    request(win->fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_TOPLEVEL,
 	            top, 2))
 		return -1;
@@ -162,10 +187,10 @@ void b1gui_destroy(struct b1gui_window *win) {
 		close(win->fd);
 	}
 	if (win->pixels)
-		syscall(SYS_SHMDT, (long)(uintptr_t)win->pixels, 0, 0, 0, 0, 0);
-	if (win->shmid >= 0)
-		syscall(SYS_SHMCTL, win->shmid, 0, 0, 0, 0, 0);
+		munmap(win->pixels, (size_t)win->width * win->height * 4);
+	if (win->buffer_fd >= 0)
+		close(win->buffer_fd);
 	memset(win, 0, sizeof(*win));
 	win->fd = -1;
-	win->shmid = -1;
+	win->buffer_fd = -1;
 }

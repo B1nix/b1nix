@@ -181,6 +181,8 @@ void net_set_ip(struct ipv4_addr ip);
 void net_set_gateway(struct ipv4_addr gw);
  
 struct vfs_socket_state;
+struct vfs_handle;
+struct b1nix_ucred;
 struct b1nix_sockaddr_un;
 struct b1nix_pollfd;
 
@@ -193,6 +195,13 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
 int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s);
 isize unix_send(struct vfs_socket_state *s, const void *buf, usize len);
 isize unix_recv(struct vfs_socket_state *s, void *buf, usize len);
+isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
+                        struct vfs_handle **handles, usize nhandles,
+                        const struct b1nix_ucred *cred);
+isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
+                        int flags, struct vfs_handle **handles,
+                        usize *nhandles, struct b1nix_ucred *cred,
+                        int *has_cred);
 int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd);
 
 #endif

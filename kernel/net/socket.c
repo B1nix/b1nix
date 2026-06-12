@@ -972,6 +972,74 @@ isize vfs_socket_recv(int fd, void *buf, usize len, int flags) {
   return vfs_socket_recv_h(h, buf, len, flags);
 }
 
+isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
+                         struct vfs_handle **handles, usize nhandles,
+                         const struct b1nix_ucred *cred) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET)
+    return -ENOTSOCK;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (nhandles || cred) {
+    if (s->domain != B1NIX_AF_UNIX)
+      return -EOPNOTSUPP;
+    if (nhandles > VFS_SCM_MAX_FDS)
+      return -EINVAL;
+    return unix_send_control(s, buf, len, handles, nhandles, cred);
+  }
+  return vfs_socket_send_h(h, buf, len, flags);
+}
+
+isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
+                         int *received_fds, usize fd_capacity,
+                         usize *received_count, struct b1nix_ucred *cred,
+                         int *has_cred, int *control_truncated) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET)
+    return -ENOTSOCK;
+  if (received_count)
+    *received_count = 0;
+  if (has_cred)
+    *has_cred = 0;
+  if (control_truncated)
+    *control_truncated = 0;
+
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (s->domain != B1NIX_AF_UNIX)
+    return vfs_socket_recv_h(h, buf, len, flags);
+
+  struct vfs_handle *handles[VFS_SCM_MAX_FDS] = {0};
+  usize nhandles = 0;
+  isize rc = unix_recv_control(s, buf, len, flags, handles, &nhandles, cred,
+                               has_cred);
+  if (rc < 0 || (flags & B1NIX_MSG_PEEK))
+    return rc;
+
+  usize installed = 0;
+  for (usize i = 0; i < nhandles; i++) {
+    if (installed < fd_capacity) {
+      int newfd = scheduler_fd_alloc(handles[i]);
+      if (newfd >= 0) {
+        received_fds[installed++] = newfd;
+        handles[i] = 0;
+        continue;
+      }
+    }
+    if (handles[i]) {
+      vfs_handle_release(handles[i]);
+      handles[i] = 0;
+    }
+    if (control_truncated)
+      *control_truncated = 1;
+  }
+  if (received_count)
+    *received_count = installed;
+  return rc;
+}
+
 /* ---- M32b: socket option / address / shutdown API ----
  * Option name/level values match userspace <sys/socket.h>/<netinet/tcp.h>
  * (Linux-compatible numbering). */

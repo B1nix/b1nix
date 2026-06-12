@@ -8,8 +8,8 @@
  * Deliberately Wayland-shaped (see docs/display-server.md): object-id wire
  * framing, client-allocated objects and buffers, attach/damage/commit
  * surface lifecycle, frame callbacks, a seat for input. The differences
- * from real Wayland (no registry, fixed well-known objects, SysV-SHM
- * buffer transport) are exactly the parts M48/M49 replace.
+ * from real Wayland (no registry, fixed well-known objects) are exactly the
+ * parts M49 replaces. Buffers use M48 memfd + SCM_RIGHTS transport.
  *
  * Wire format, little-endian:
  *   struct b1d_hdr { u32 object_id; u16 opcode; u16 size; }
@@ -38,7 +38,7 @@ struct b1d_hdr {
 /* display */
 #define B1D_REQ_DISPLAY_HELLO 0          /* () → EV_DISPLAY_INFO */
 #define B1D_REQ_DISPLAY_CREATE_SURFACE 1 /* (new_id) */
-#define B1D_REQ_DISPLAY_CREATE_BUFFER 2  /* (new_id, shm_key, offset, w, h, stride) */
+#define B1D_REQ_DISPLAY_CREATE_BUFFER 2  /* fd + (new_id, offset, w, h, stride) */
 #define B1D_REQ_DISPLAY_SYNC 3           /* (new_callback_id) → EV_CALLBACK_DONE */
 #define B1D_REQ_DISPLAY_SHUTDOWN 4       /* () — server exits (admin/test) */
 #define B1D_REQ_DISPLAY_CREATE_TOPLEVEL 5 /* (new_id, surface_id) */

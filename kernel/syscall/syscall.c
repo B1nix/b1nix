@@ -1504,6 +1504,255 @@ static u64 sys_recv(int fd, void *user_buf, usize len, int flags) {
   return (u64)rc;
 }
 
+struct syscall_iovec {
+  void *iov_base;
+  usize iov_len;
+};
+
+struct syscall_msghdr {
+  void *msg_name;
+  u32 msg_namelen;
+  struct syscall_iovec *msg_iov;
+  int msg_iovlen;
+  void *msg_control;
+  usize msg_controllen;
+  int msg_flags;
+};
+
+struct syscall_cmsghdr {
+  usize cmsg_len;
+  int cmsg_level;
+  int cmsg_type;
+};
+
+#define K_SOL_SOCKET 1
+#define K_SCM_RIGHTS 1
+#define K_SCM_CREDENTIALS 2
+#define K_MSG_CTRUNC 0x08
+#define K_CMSG_ALIGN(n) (((n) + sizeof(usize) - 1) & ~(sizeof(usize) - 1))
+
+static int copyin_message(const struct syscall_msghdr *user_msg,
+                          struct syscall_msghdr *msg,
+                          struct syscall_iovec *iov, char **payload,
+                          usize *payload_len) {
+  if (!user_msg || syscall_copyin(msg, user_msg, sizeof(*msg)) < 0)
+    return -EFAULT;
+  if (msg->msg_iovlen < 1 || msg->msg_iovlen > 16 || !msg->msg_iov)
+    return -EINVAL;
+  if (syscall_copyin(iov, msg->msg_iov,
+                     (usize)msg->msg_iovlen * sizeof(*iov)) < 0)
+    return -EFAULT;
+
+  usize total = 0;
+  for (int i = 0; i < msg->msg_iovlen; i++) {
+    if (iov[i].iov_len > 65536 || total > 65536 - iov[i].iov_len)
+      return -EMSGSIZE;
+    total += iov[i].iov_len;
+  }
+  if (total == 0)
+    return -EINVAL;
+  char *buf = kmalloc(total);
+  if (!buf)
+    return -ENOMEM;
+  *payload = buf;
+  *payload_len = total;
+  return 0;
+}
+
+static u64 sys_sendmsg(int fd, const struct syscall_msghdr *user_msg,
+                       int flags) {
+  struct syscall_msghdr msg;
+  struct syscall_iovec iov[16];
+  char *payload = 0;
+  usize payload_len = 0;
+  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
+  if (err < 0)
+    return (u64)err;
+
+  usize off = 0;
+  for (int i = 0; i < msg.msg_iovlen; i++) {
+    if (iov[i].iov_len &&
+        syscall_copyin(payload + off, iov[i].iov_base, iov[i].iov_len) < 0) {
+      kfree(payload);
+      return (u64)-EFAULT;
+    }
+    off += iov[i].iov_len;
+  }
+
+  struct vfs_handle *handles[VFS_SCM_MAX_FDS] = {0};
+  usize nhandles = 0;
+  int wants_cred = 0;
+  if (msg.msg_control && msg.msg_controllen) {
+    if (msg.msg_controllen > 512) {
+      kfree(payload);
+      return (u64)-EINVAL;
+    }
+    u8 control[512];
+    if (syscall_copyin(control, msg.msg_control, msg.msg_controllen) < 0) {
+      kfree(payload);
+      return (u64)-EFAULT;
+    }
+    usize pos = 0;
+    while (pos + sizeof(struct syscall_cmsghdr) <= msg.msg_controllen) {
+      struct syscall_cmsghdr *c = (struct syscall_cmsghdr *)(control + pos);
+      if (c->cmsg_len < sizeof(*c) ||
+          c->cmsg_len > msg.msg_controllen - pos) {
+        err = -EINVAL;
+        goto sendmsg_fail;
+      }
+      usize header_len = K_CMSG_ALIGN(sizeof(*c));
+      usize data_len = c->cmsg_len > header_len ? c->cmsg_len - header_len : 0;
+      u8 *data = (u8 *)c + sizeof(*c);
+      if (c->cmsg_level == K_SOL_SOCKET && c->cmsg_type == K_SCM_RIGHTS) {
+        if (data_len == 0 || data_len % sizeof(int) != 0 ||
+            data_len / sizeof(int) > VFS_SCM_MAX_FDS - nhandles) {
+          err = -EINVAL;
+          goto sendmsg_fail;
+        }
+        int *fds = (int *)data;
+        usize count = data_len / sizeof(int);
+        for (usize i = 0; i < count; i++) {
+          struct vfs_handle *h = scheduler_fd_get_retain(fds[i]);
+          if (!h) {
+            err = -EBADF;
+            goto sendmsg_fail;
+          }
+          handles[nhandles++] = h;
+        }
+      } else if (c->cmsg_level == K_SOL_SOCKET &&
+                 c->cmsg_type == K_SCM_CREDENTIALS) {
+        wants_cred = 1;
+      } else {
+        err = -EINVAL;
+        goto sendmsg_fail;
+      }
+      usize next = K_CMSG_ALIGN(c->cmsg_len);
+      if (next == 0)
+        break;
+      pos += next;
+    }
+  }
+
+  struct b1nix_ucred cred;
+  struct b1nix_ucred *cred_ptr = 0;
+  if (wants_cred) {
+    const struct cred *current_cred = scheduler_get_current_cred();
+    cred.pid = current_task ? (int)task_tgid(current_task) : 0;
+    cred.uid = current_cred ? current_cred->euid : 0;
+    cred.gid = current_cred ? current_cred->egid : 0;
+    cred_ptr = &cred;
+  }
+  isize rc = vfs_socket_sendmsg(fd, payload, payload_len, flags, handles,
+                                nhandles, cred_ptr);
+  if (rc >= 0) {
+    kfree(payload);
+    return (u64)rc;
+  }
+  err = (int)rc;
+
+sendmsg_fail:
+  for (usize i = 0; i < nhandles; i++)
+    if (handles[i])
+      vfs_handle_release(handles[i]);
+  kfree(payload);
+  return (u64)err;
+}
+
+static u64 sys_recvmsg(int fd, struct syscall_msghdr *user_msg, int flags) {
+  struct syscall_msghdr msg;
+  struct syscall_iovec iov[16];
+  char *payload = 0;
+  usize payload_len = 0;
+  int err = copyin_message(user_msg, &msg, iov, &payload, &payload_len);
+  if (err < 0)
+    return (u64)err;
+
+  usize header_space = K_CMSG_ALIGN(sizeof(struct syscall_cmsghdr));
+  usize fd_capacity = 0;
+  if (msg.msg_control && msg.msg_controllen > header_space)
+    fd_capacity = (msg.msg_controllen - header_space) / sizeof(int);
+  if (fd_capacity > VFS_SCM_MAX_FDS)
+    fd_capacity = VFS_SCM_MAX_FDS;
+
+  int received_fds[VFS_SCM_MAX_FDS];
+  usize received_count = 0;
+  struct b1nix_ucred cred;
+  int has_cred = 0;
+  int ctrunc = 0;
+  isize rc = vfs_socket_recvmsg(fd, payload, payload_len, flags, received_fds,
+                                fd_capacity, &received_count, &cred, &has_cred,
+                                &ctrunc);
+  if (rc < 0) {
+    kfree(payload);
+    return (u64)rc;
+  }
+
+  usize copied = 0;
+  for (int i = 0; i < msg.msg_iovlen && copied < (usize)rc; i++) {
+    usize chunk = iov[i].iov_len;
+    if (chunk > (usize)rc - copied)
+      chunk = (usize)rc - copied;
+    if (chunk && syscall_copyout(iov[i].iov_base, payload + copied, chunk) < 0) {
+      for (usize j = 0; j < received_count; j++)
+        vfs_close(received_fds[j]);
+      kfree(payload);
+      return (u64)-EFAULT;
+    }
+    copied += chunk;
+  }
+  kfree(payload);
+
+  if (msg.msg_name && msg.msg_namelen) {
+    u8 zero[128] = {0};
+    usize n = msg.msg_namelen < sizeof(zero) ? msg.msg_namelen : sizeof(zero);
+    if (syscall_copyout(msg.msg_name, zero, n) < 0)
+      return (u64)-EFAULT;
+  }
+
+  u8 control[512] = {0};
+  usize control_len = 0;
+  if (received_count) {
+    usize data_len = received_count * sizeof(int);
+    usize cmsg_len = header_space + data_len;
+    usize space = header_space + K_CMSG_ALIGN(data_len);
+    if (space <= msg.msg_controllen) {
+      struct syscall_cmsghdr *c = (struct syscall_cmsghdr *)control;
+      c->cmsg_len = cmsg_len;
+      c->cmsg_level = K_SOL_SOCKET;
+      c->cmsg_type = K_SCM_RIGHTS;
+      memcpy(control + sizeof(*c), received_fds, data_len);
+      control_len = space;
+    } else {
+      for (usize i = 0; i < received_count; i++)
+        vfs_close(received_fds[i]);
+      ctrunc = 1;
+    }
+  }
+  if (has_cred) {
+    usize cmsg_len = header_space + sizeof(cred);
+    usize space = header_space + K_CMSG_ALIGN(sizeof(cred));
+    if (control_len + space <= msg.msg_controllen) {
+      struct syscall_cmsghdr *c =
+          (struct syscall_cmsghdr *)(control + control_len);
+      c->cmsg_len = cmsg_len;
+      c->cmsg_level = K_SOL_SOCKET;
+      c->cmsg_type = K_SCM_CREDENTIALS;
+      memcpy((u8 *)c + sizeof(*c), &cred, sizeof(cred));
+      control_len += space;
+    } else {
+      ctrunc = 1;
+    }
+  }
+  if (control_len && syscall_copyout(msg.msg_control, control, control_len) < 0)
+    return (u64)-EFAULT;
+
+  msg.msg_controllen = control_len;
+  msg.msg_flags = ctrunc ? K_MSG_CTRUNC : 0;
+  if (syscall_copyout(user_msg, &msg, sizeof(msg)) < 0)
+    return (u64)-EFAULT;
+  return (u64)rc;
+}
+
 static u64 sys_listen(int fd, int backlog) {
   return (u64)vfs_listen(fd, backlog);
 }
@@ -1741,7 +1990,11 @@ static isize sys_munmap(void *addr, usize length) {
   if (!t)
     return -ESRCH;
 
-  u64 end = start + length;
+  if (length > (usize)(0x00007FFFFFFFFFFFULL - start))
+    return -EINVAL;
+  u64 end = start + ((length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1));
+  if (end < start || end > 0x00007FFFFFFFFFFFULL)
+    return -EINVAL;
 
   // 1. Unmap pages from hardware page tables and free physical frames
   for (u64 v = start; v < end; v += PAGE_SIZE) {
@@ -2523,6 +2776,18 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                     (int)arg3);
   case SYS_RECV:
     return sys_recv((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3);
+  case SYS_SENDMSG:
+    return sys_sendmsg((int)arg0,
+                       (const struct syscall_msghdr *)(usize)arg1, (int)arg2);
+  case SYS_RECVMSG:
+    return sys_recvmsg((int)arg0, (struct syscall_msghdr *)(usize)arg1,
+                       (int)arg2);
+  case SYS_MEMFD_CREATE: {
+    char name[64];
+    if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg0) < 0)
+      return (u64)-EFAULT;
+    return (u64)vfs_memfd_create(name, (u32)arg1);
+  }
   case SYS_LISTEN:
     return sys_listen((int)arg0, (int)arg1);
   case SYS_ACCEPT:

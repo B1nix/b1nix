@@ -6,6 +6,16 @@
 #include <string.h>
 
 #define UNIX_RB_SIZE 4096
+#define UNIX_CONTROL_SLOTS 16
+
+struct unix_control {
+  int used;
+  u64 seq;
+  struct vfs_handle *handles[VFS_SCM_MAX_FDS];
+  usize nhandles;
+  struct b1nix_ucred cred;
+  int has_cred;
+};
 
 struct unix_socket_data {
   struct vfs_socket_state *socket;
@@ -18,6 +28,9 @@ struct unix_socket_data {
   usize rb_head;
   usize rb_tail;
   usize rb_count;
+  u64 read_seq;
+  u64 write_seq;
+  struct unix_control control[UNIX_CONTROL_SLOTS];
 
   volatile int lock;
   /* Lifetime: a unix_socket_data outlives its own socket as long as a PEER (or
@@ -43,6 +56,10 @@ static void unix_data_get(struct unix_socket_data *u) {
 static void unix_data_put(struct unix_socket_data *u) {
   if (!u) return;
   if (__atomic_sub_fetch(&u->refcount, 1, __ATOMIC_ACQ_REL) == 0) {
+    for (int i = 0; i < UNIX_CONTROL_SLOTS; i++)
+      for (usize j = 0; j < u->control[i].nhandles; j++)
+        if (u->control[i].handles[j])
+          vfs_handle_release(u->control[i].handles[j]);
     if (u->rb_buffer) kfree(u->rb_buffer);
     kfree(u);
   }
@@ -210,8 +227,12 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
   }
 }
 
-isize unix_send(struct vfs_socket_state *s, const void *buf, usize len) {
+isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
+                        struct vfs_handle **handles, usize nhandles,
+                        const struct b1nix_ucred *cred) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  if ((nhandles || cred) && len == 0)
+    return -EINVAL;
 
   /* Pin the peer for the duration of the write. Reading u->peer and taking the
    * reference under u's lock is what makes this safe: the peer closing on
@@ -235,12 +256,40 @@ isize unix_send(struct vfs_socket_state *s, const void *buf, usize len) {
     return -EAGAIN;
   }
 
+  int control_slot = -1;
+  if (nhandles || cred) {
+    for (int i = 0; i < UNIX_CONTROL_SLOTS; i++)
+      if (!peer_u->control[i].used) {
+        control_slot = i;
+        break;
+      }
+    if (control_slot < 0) {
+      unix_unlock(peer_u);
+      unix_data_put(peer_u);
+      return -ENOBUFS;
+    }
+  }
+
   usize to_copy = (len < free_space) ? len : free_space;
+  if (control_slot >= 0) {
+    struct unix_control *ctl = &peer_u->control[control_slot];
+    memset(ctl, 0, sizeof(*ctl));
+    ctl->used = 1;
+    ctl->seq = peer_u->write_seq;
+    ctl->nhandles = nhandles;
+    for (usize i = 0; i < nhandles; i++)
+      ctl->handles[i] = handles[i];
+    if (cred) {
+      ctl->cred = *cred;
+      ctl->has_cred = 1;
+    }
+  }
   for (usize i = 0; i < to_copy; i++) {
     peer_u->rb_buffer[peer_u->rb_tail] = ((const char *)buf)[i];
     peer_u->rb_tail = (peer_u->rb_tail + 1) % UNIX_RB_SIZE;
   }
   peer_u->rb_count += to_copy;
+  peer_u->write_seq += to_copy;
 
   struct vfs_socket_state *peer_sock = peer_u->socket;
   unix_unlock(peer_u);
@@ -250,18 +299,62 @@ isize unix_send(struct vfs_socket_state *s, const void *buf, usize len) {
   return (isize)to_copy;
 }
 
-isize unix_recv(struct vfs_socket_state *s, void *buf, usize len) {
+isize unix_send(struct vfs_socket_state *s, const void *buf, usize len) {
+  return unix_send_control(s, buf, len, 0, 0, 0);
+}
+
+isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
+                        int flags, struct vfs_handle **handles,
+                        usize *nhandles, struct b1nix_ucred *cred,
+                        int *has_cred) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
+  if (nhandles)
+    *nhandles = 0;
+  if (has_cred)
+    *has_cred = 0;
   
   while (1) {
     unix_lock(u);
     if (u->rb_count > 0) {
       usize to_copy = (len < u->rb_count) ? len : u->rb_count;
+      struct unix_control *ctl = 0;
+      for (int i = 0; i < UNIX_CONTROL_SLOTS; i++) {
+        struct unix_control *candidate = &u->control[i];
+        if (!candidate->used)
+          continue;
+        if (candidate->seq > u->read_seq &&
+            candidate->seq < u->read_seq + to_copy)
+          to_copy = (usize)(candidate->seq - u->read_seq);
+        if (candidate->seq == u->read_seq)
+          ctl = candidate;
+      }
       for (usize i = 0; i < to_copy; i++) {
         ((char *)buf)[i] = u->rb_buffer[u->rb_head];
-        u->rb_head = (u->rb_head + 1) % UNIX_RB_SIZE;
+        if (!(flags & B1NIX_MSG_PEEK))
+          u->rb_head = (u->rb_head + 1) % UNIX_RB_SIZE;
       }
-      u->rb_count -= to_copy;
+      if (!(flags & B1NIX_MSG_PEEK)) {
+        u->rb_count -= to_copy;
+        u->read_seq += to_copy;
+        if (ctl) {
+          if (handles && nhandles) {
+            for (usize i = 0; i < ctl->nhandles; i++) {
+              handles[i] = ctl->handles[i];
+              ctl->handles[i] = 0;
+            }
+            *nhandles = ctl->nhandles;
+          } else {
+            for (usize i = 0; i < ctl->nhandles; i++)
+              if (ctl->handles[i])
+                vfs_handle_release(ctl->handles[i]);
+          }
+          if (ctl->has_cred && cred && has_cred) {
+            *cred = ctl->cred;
+            *has_cred = 1;
+          }
+          memset(ctl, 0, sizeof(*ctl));
+        }
+      }
       unix_unlock(u);
       
       /* Wake up anyone waiting to send more data */
@@ -275,6 +368,10 @@ isize unix_recv(struct vfs_socket_state *s, void *buf, usize len) {
     if (scheduler_signal_pending()) return -ERESTARTSYS;
     scheduler_block_on(s);
   }
+}
+
+isize unix_recv(struct vfs_socket_state *s, void *buf, usize len) {
+  return unix_recv_control(s, buf, len, 0, 0, 0, 0, 0);
 }
 
 int unix_poll(struct vfs_socket_state *s, struct b1nix_pollfd *pfd) {

@@ -63,7 +63,7 @@ struct msghdr {
   struct iovec *msg_iov;
   int msg_iovlen;
   void *msg_control;
-  socklen_t msg_controllen;
+  size_t msg_controllen;
   int msg_flags;
 };
 
@@ -72,7 +72,7 @@ struct msghdr {
  * linked into the nc applet but unused on the basic client/server paths) can
  * compile and walk the control buffer. */
 struct cmsghdr {
-  socklen_t cmsg_len;
+  size_t cmsg_len;
   int cmsg_level;
   int cmsg_type;
 };
@@ -96,6 +96,13 @@ struct cmsghdr {
 #define CMSG_LEN(len) (CMSG_ALIGN(sizeof(struct cmsghdr)) + (len))
 
 #define SCM_RIGHTS 0x01
+#define SCM_CREDENTIALS 0x02
+
+struct ucred {
+  int pid;
+  unsigned int uid;
+  unsigned int gid;
+};
 
 #define AF_UNIX         1
 #define AF_LOCAL        AF_UNIX
@@ -138,6 +145,7 @@ struct cmsghdr {
 #define SO_ACCEPTCONN   30
 
 #define MSG_OOB         0x01
+#define MSG_CTRUNC      0x08
 #define MSG_PEEK        0x02
 #define MSG_TRUNC       0x20
 #define MSG_DONTWAIT    0x40

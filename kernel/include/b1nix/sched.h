@@ -385,6 +385,7 @@ int scheduler_get_stdout(void);
 void scheduler_fd_table_init_current(void);
 int scheduler_fd_alloc(struct vfs_handle *handle);
 struct vfs_handle *scheduler_fd_get(int fd);
+struct vfs_handle *scheduler_fd_get_retain(int fd);
 int scheduler_fd_set(int fd, struct vfs_handle *handle);
 int scheduler_fd_close(int fd);
 struct vfs_handle *scheduler_fd_take(int fd);

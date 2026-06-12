@@ -582,12 +582,12 @@ Kernel prerequisite for real Wayland (M49) with standalone POSIX value
 (dbus-style daemons, privilege separation). Details in
 [`display-server.md`](display-server.md).
 
-- [ ] `planned` Add `sendmsg`/`recvmsg` with ancillary data on UNIX sockets.
-- [ ] `planned` Add `SCM_RIGHTS` fd transfer with correct refcounting,
+- [x] Add `sendmsg`/`recvmsg` with ancillary data on UNIX sockets.
+- [x] Add `SCM_RIGHTS` fd transfer with correct refcounting,
   including in-flight fds when the receiver dies (fd-table lifetime is a
   known sharp edge — see the M46 fd-table fixes).
-- [ ] `planned` Add `SCM_CREDENTIALS` and `memfd_create`.
-- [ ] `planned` Switch `b1display` buffer transport from SysV SHM keys to
+- [x] Add `SCM_CREDENTIALS` and `memfd_create`.
+- [x] Switch `b1display` buffer transport from SysV SHM keys to
   memfd + `SCM_RIGHTS`; `M48-FDPASS` smoke markers.
 
 ## M49: Wayland Protocol Compatibility

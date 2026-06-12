@@ -170,6 +170,9 @@ enum {
 	SYS_WAITID       = 143,
 	SYS_TIMES        = 144,
 	SYS_GETRUSAGE    = 145,
+	SYS_SENDMSG      = 146,
+	SYS_RECVMSG      = 147,
+	SYS_MEMFD_CREATE = 148,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

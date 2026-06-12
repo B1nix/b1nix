@@ -2,7 +2,7 @@
  * M47 Phase-2 Smoke Test — b1display protocol client against displayd.
  *
  * Exercises the full client path: connect to /run/b1display.sock (retry
- * while displayd starts), HELLO→INFO roundtrip, SHM buffer + surface
+ * while displayd starts), HELLO→INFO roundtrip, memfd buffer + surface
  * creation, attach/damage/commit with a frame callback, a SYNC roundtrip,
  * and seat input (the kernel m47-inject thread keeps feeding mouse bursts:
  * the cursor starts inside our centered surface, so displayd must deliver
@@ -19,6 +19,7 @@
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
+#include <sys/mman.h>
 #include <sys/socket.h>
 #include <sys/un.h>
 #include <syscall.h>
@@ -32,7 +33,6 @@
 #define SYNC_CB_ID 0x13
 #define TOPLEVEL_ID 0x14
 #define CHECKSUM_CB_ID 0x15
-#define SHM_KEY 0x47D15000u
 
 static void marker(const char *text) {
 	write(1, text, strlen(text));
@@ -48,6 +48,30 @@ static int send_req(int fd, uint32_t obj, uint16_t op, const uint32_t *words,
 	memcpy(msg, &h, sizeof(h));
 	memcpy(msg + sizeof(h), words, nwords * 4);
 	return (int)send(fd, msg, h.size, 0) == (int)h.size ? 0 : -1;
+}
+
+static int send_req_fd(int fd, uint32_t obj, uint16_t op,
+                       const uint32_t *words, unsigned nwords, int passed_fd) {
+	uint8_t msg[B1D_MAX_MSG];
+	char control[CMSG_SPACE(sizeof(int))];
+	struct b1d_hdr h = {
+	    obj, op, (uint16_t)(sizeof(struct b1d_hdr) + nwords * 4)};
+	memcpy(msg, &h, sizeof(h));
+	memcpy(msg + sizeof(h), words, nwords * 4);
+	memset(control, 0, sizeof(control));
+	struct iovec iov = {msg, h.size};
+	struct msghdr mh;
+	memset(&mh, 0, sizeof(mh));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = control;
+	mh.msg_controllen = sizeof(control);
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &passed_fd, sizeof(passed_fd));
+	return sendmsg(fd, &mh, 0) == h.size ? 0 : -1;
 }
 
 /* Incoming event, decoded. */
@@ -167,16 +191,17 @@ int main(int argc, char **argv) {
 	(void)scr_w;
 	(void)scr_h;
 
-	/* 3: SHM buffer + surface, draw, attach/damage/frame/commit */
-	int shmid = (int)syscall(SYS_SHMGET, SHM_KEY,
-	                         (long)(SURF_W * SURF_H * 4), 0x1000 | 0666);
-	if (shmid < 0) {
-		marker("M47-DSP: fail shm\n");
+	/* 3: memfd buffer + surface, draw, attach/damage/frame/commit */
+	size_t buffer_size = SURF_W * SURF_H * 4;
+	int buffer_fd = memfd_create("m48-display-smoke", MFD_CLOEXEC);
+	if (buffer_fd < 0 || ftruncate(buffer_fd, (off_t)buffer_size) < 0) {
+		marker("M47-DSP: fail memfd\n");
 		return 1;
 	}
-	uint32_t *pix = (uint32_t *)syscall(SYS_SHMAT, shmid, 0, 0);
-	if (pix == (void *)-1) {
-		marker("M47-DSP: fail shm\n");
+	uint32_t *pix = mmap(0, buffer_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                     buffer_fd, 0);
+	if (pix == MAP_FAILED) {
+		marker("M47-DSP: fail memfd\n");
 		return 1;
 	}
 	for (int y = 0; y < SURF_H; y++)
@@ -192,8 +217,9 @@ int main(int argc, char **argv) {
 	uint32_t pos[2] = {(uint32_t)((int)scr_w / 2 - SURF_W / 2),
 	                   (uint32_t)((int)scr_h / 2 - SURF_H / 2)};
 	send_req(fd, SURF_ID, B1D_REQ_SURFACE_SET_POSITION, pos, 2);
-	uint32_t bargs[6] = {BUF_ID, SHM_KEY, 0, SURF_W, SURF_H, SURF_W * 4};
-	send_req(fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_BUFFER, bargs, 6);
+	uint32_t bargs[5] = {BUF_ID, 0, SURF_W, SURF_H, SURF_W * 4};
+	send_req_fd(fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_BUFFER, bargs, 5,
+	            buffer_fd);
 	uint32_t top[2] = {TOPLEVEL_ID, SURF_ID};
 	send_req(fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_CREATE_TOPLEVEL, top, 2);
 	uint32_t title[3] = {7, 0, 0};
@@ -292,8 +318,9 @@ int main(int argc, char **argv) {
 	b1gui_destroy(&second);
 	send_req(fd, B1D_OBJ_DISPLAY, B1D_REQ_DISPLAY_SHUTDOWN, 0, 0);
 	close(fd);
-	syscall(SYS_SHMDT, (long)(uintptr_t)pix, 0, 0);
-	syscall(SYS_SHMCTL, shmid, 0, 0);
+	munmap(pix, buffer_size);
+	close(buffer_fd);
+	marker("M48-FDPASS: ok display-fd-buffers\n");
 
 	int ok = g_seen_pointer && g_seen_button && g_seen_focus && saw_alt_tab;
 	marker("M47-DSP: done\n");

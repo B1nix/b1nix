@@ -54,6 +54,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m46_smoke \
 	m47_smoke \
 	m47d_smoke \
+	m48_smoke \
 	displayd \
 	gclock \
 	gterm \
