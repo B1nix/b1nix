@@ -2,6 +2,7 @@
 #define B1NIX_U_SYS_RESOURCE_H
 
 #include <sys/time.h>
+#include <sys/types.h> /* id_t for getpriority/setpriority */
 
 /* getpriority/setpriority `which` values (PRIO_PROCESS only is honored). */
 #define PRIO_PROCESS 0

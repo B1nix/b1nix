@@ -1020,6 +1020,21 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		# HDA may not be present in all QEMU configs — treat as skip
 		pass "HDA controller (skipped — no device)"
 	fi
+
+	# ── M47: display substrate — /dev/fb0 + /dev/input/event* ──
+	check_output "$LOG" "M47-GFX: start" "M47 smoke started"
+	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
+		check_output "$LOG" "M47-GFX: ok fb-info" "M47: /dev/fb0 mode query"
+		check_output "$LOG" "M47-GFX: ok fb-mmap" "M47: fb mmap aliases device memory"
+		check_output "$LOG" "M47-GFX: ok fb-flush" "M47: FBIOFLUSH dirty-rect push"
+		check_output "$LOG" "M47-GFX: ok fb-persist" "M47: fb survives munmap+remap"
+	else
+		# No 32bpp boot framebuffer in this config — device legitimately absent
+		check_output "$LOG" "M47-GFX: skip no-fb" "M47: fb skipped (no framebuffer)"
+	fi
+	check_output "$LOG" "M47-GFX: ok input-open" "M47: input devices open + EAGAIN"
+	check_output "$LOG" "M47-GFX: ok input-event" "M47: injected mouse events received"
+	check_output "$LOG" "M47-GFX: done" "M47 smoke completed"
 fi
 
 # ── M24b SMP work-stealing (multi-core) ──

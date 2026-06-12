@@ -7,6 +7,7 @@
 #include <b1nix/fat32.h>
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
+#include <b1nix/input.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
@@ -2203,6 +2204,31 @@ int vfs_open_flags(const char *path, int flags) {
       return fd;
     }
   }
+  /* M47 input event devices: /dev/input/eventN opens bind a per-client
+   * event queue (raw handles with their own file ops, like the ttys). */
+  {
+    int iidx = input_path_index(resolved);
+    if (iidx >= 0) {
+      struct vfs_node *inode_node = vfs_find_node(resolved);
+      if (!IS_ERR(inode_node)) {
+        int access_mask = 0;
+        if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+          access_mask |= W_OK;
+        if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+          access_mask |= R_OK;
+        const struct cred *cred = get_current_cred();
+        if (cred && !vfs_get_node_perm(inode_node, cred, (u32)access_mask)) {
+          vfs_node_put(inode_node);
+          kfree(resolved);
+          return -EACCES;
+        }
+        vfs_node_put(inode_node);
+      }
+      int fd = input_dev_open(iidx, flags);
+      kfree(resolved);
+      return fd;
+    }
+  }
   if (strncmp(resolved, "/dev/pts/", 9) == 0) {
     const char *num = resolved + 9;
     if (*num >= '0' && *num <= '9') {
@@ -4120,6 +4146,11 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     return (int)PTR_ERR(node);
   if (node->inode->type != VFS_DEVICE)
     return -EINVAL;
+
+  /* Devices with their own ioctl hook (M47 /dev/fb0) dispatch before the
+   * legacy name-based special cases below. */
+  if (node->inode->ioctl_cb)
+    return node->inode->ioctl_cb(node, request, arg);
 
   /* Loop-device control ioctls (BusyBox losetup): the LOOP_* family is type
    * 0x4C, plus the /dev/loop-control node. Handled before the `arg` check

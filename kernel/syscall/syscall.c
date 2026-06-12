@@ -1670,6 +1670,21 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
 
       vmm_map_page(v, frame, vmm_flags | VMM_PRESENT);
     }
+  } else if (node && node->inode && node->inode->type == VFS_DEVICE &&
+             node->inode->mmap_phys_cb) {
+    /* M47 device-memory mmap (/dev/fb0): map the device's physical frames
+     * directly, shared across fork (VMM_SHARED bypasses CoW) and refcounted
+     * per mapping like SysV shm — munmap/teardown decrement, the device's
+     * own reference keeps the frames alive. */
+    u64 phys = 0;
+    int rc = node->inode->mmap_phys_cb(node, (u64)offset, length, &phys);
+    if (rc < 0) /* node is borrowed from the fd table — nothing to put */
+      return (u64)rc;
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      u64 frame = phys + (v - vaddr);
+      vmm_map_page(v, frame, vmm_flags | VMM_SHARED | VMM_PRESENT);
+      pmm_ref_frame(frame);
+    }
   } else {
     // For file-backed, we use lazy allocation.
     // Connect to VFS by setting VMM_LAZY flag.

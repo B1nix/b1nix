@@ -52,6 +52,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m38_sound \
 	m42_w5pre_smoke \
 	m46_smoke \
+	m47_smoke \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 ifeq ($(ARCH),x86_64)
@@ -262,6 +263,8 @@ KERNEL_SOURCES += \
 	kernel/dev/serial_tty.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
+	kernel/dev/fb.c \
+	kernel/dev/input.c \
 	kernel/net/net.c \
 	kernel/net/socket.c \
 	kernel/net/unix.c \

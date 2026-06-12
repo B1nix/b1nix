@@ -1,6 +1,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/compositor.h>
 #include <b1nix/console.h>
+#include <b1nix/fb.h>
 #include <b1nix/fb_console.h>
 #include <b1nix/mm.h>
 #include <b1nix/ps2_mouse.h>
@@ -284,6 +285,9 @@ static void compositor_log_stats(void)
 
 static void compositor_flush(void)
 {
+    /* M47: once userspace maps /dev/fb0 it owns the display — the kernel
+     * compositor must not fight it for the scanout. */
+    if (fb_dev_claimed()) return;
     if (!backbuffer || !dirty_valid) return;
 
     u32 width = fb_console_width();

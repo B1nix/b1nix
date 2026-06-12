@@ -128,6 +128,15 @@ struct vfs_inode {
   int (*statfs_cb)(struct vfs_node *node, struct b1nix_statfs *st);
   int (*fsync_cb)(struct vfs_node *node);
   int (*poll_cb)(struct vfs_node *node, struct b1nix_pollfd *pfd);
+  /* Device ioctl hook, dispatched by vfs_ioctl before the legacy name-based
+   * special cases. The callee validates/copies its own user arg. */
+  int (*ioctl_cb)(struct vfs_node *node, u64 request, void *arg);
+  /* Device-memory mmap hook (M47 /dev/fb0): translate a page-aligned file
+   * offset to the physical base to map. sys_mmap maps the range with
+   * VMM_SHARED and takes a pmm reference per page; the device must keep its
+   * own reference so the frames outlive every user mapping. */
+  int (*mmap_phys_cb)(struct vfs_node *node, u64 offset, usize length,
+                      u64 *out_phys);
 };
 
 /* Inode cache API */
@@ -274,7 +283,8 @@ enum vfs_handle_kind {
   VFS_HANDLE_SOCKET,
   VFS_HANDLE_PTY_MASTER,
   VFS_HANDLE_PTY_SLAVE,
-  VFS_HANDLE_SERIAL_TTY
+  VFS_HANDLE_SERIAL_TTY,
+  VFS_HANDLE_INPUT
 };
 
 struct vfs_handle;

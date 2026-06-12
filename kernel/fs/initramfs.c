@@ -39,6 +39,7 @@
 #include "initramfs_testwav.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
+#include "initramfs_m47_smoke.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
 #include "initramfs_telinit.inc"
@@ -978,6 +979,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m46-smoke", (const char *)vfs_m46_smoke_elf,
      sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m47-smoke", (const char *)vfs_m47_smoke_elf,
+     sizeof(vfs_m47_smoke_elf), INITRAMFS_EXECUTABLE},
     /* M30: compatibility interpreter path. Startup dependency loading,
      * symbol lookup, and relocation are performed eagerly by the kernel. */
     {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,

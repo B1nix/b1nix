@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/input.h>
 #include <b1nix/io.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
@@ -236,6 +237,10 @@ void ps2_kbd_handle_byte(u8 scancode)
 		extended_scancode = 1;
 		return;
 	}
+
+	/* M47: mirror the raw make/break stream to /dev/input/event0 before the
+	 * console line discipline consumes it (keymaps live in userspace). */
+	input_kbd_scancode(scancode, extended_scancode);
 
 	if (scancode & 0x80) {
 		// Key release

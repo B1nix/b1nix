@@ -17,6 +17,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/dirent.h>
 #include <b1nix/console.h>
+#include <b1nix/input.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -28,6 +29,25 @@ static int m24_stress_main(int argc, const char **argv);
 static int lock_smoke_main(int argc, const char **argv);
 static int ext_stress_main(int argc, const char **argv);
 int shell_smoke_main(int argc, const char **argv);
+
+/* M47 smoke support: synthetic mouse-event source. The headless smoke run
+ * has no way to wiggle a real PS/2 mouse, so while the m47 test binary holds
+ * /dev/input/event1 open this thread feeds a known burst through the same
+ * input_event_push path the IRQ decoder uses (queue fan-out, blocking read,
+ * and the 16-byte record ABI are all exercised for real; only the i8042
+ * decode step is bypassed). Gives up after ~30 s if no client ever appears. */
+static void m47_input_injector_thread(void *arg) {
+  (void)arg;
+  for (int spins = 0; spins < 600; spins++) {
+    if (input_dev_has_clients(INPUT_DEV_MOUSE)) {
+      input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 7);
+      input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -3);
+      input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, 1);
+      input_event_sync(INPUT_DEV_MOUSE);
+    }
+    scheduler_sleep_ticks(50);
+  }
+}
 
 static void uwrite(const char *text) {
   syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0, 0, 0);
@@ -1418,6 +1438,22 @@ static int init_main(int argc, const char **argv) {
     } else {
       int m46_status = 0;
       syscall_dispatch(SYS_WAIT, m46_pid, (u64)(usize)&m46_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M47: display substrate — /dev/fb0 mmap + flush, /dev/input/event*
+   * queues. The injector thread feeds the mouse-event burst the test binary
+   * expects (no real input source exists in a headless smoke run). */
+  {
+    (void)kthread_create("m47-inject", m47_input_injector_thread, 0);
+    u64 m47_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m47-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m47_pid < 0) {
+      uwrite("M47-GFX: spawn-fail\n");
+    } else {
+      int m47_status = 0;
+      syscall_dispatch(SYS_WAIT, m47_pid, (u64)(usize)&m47_status, 0, 0, 0, 0);
     }
   }
 

@@ -541,3 +541,60 @@ mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
   exit; UNIX accept/recv lost-wakeups; journal crash-atomicity (write-ahead
   ordering, pre-commit fs writes, unbounded recovery walk); swap/eviction ring
   tables unlocked; signal-death exit skips reparent/orphan handling (M46-3).
+
+## M47: Userspace Display Server
+
+Own compositor + own protocol, deliberately Wayland-shaped so M49 is a short
+step, not a rewrite. Design and decision record:
+[`display-server.md`](display-server.md).
+
+- [ ] `partial` Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
+  ioctl) over virtio-gpu; kernel `compositor.c` becomes the console fallback
+  with claim/reclaim handoff. — Device, shared-frame mmap (`mmap_phys_cb` +
+  `VMM_SHARED`), `FBIOGET_INFO`/`FBIOFLUSH`, and the claim side (compositor
+  stops flushing once userspace maps fb0) are done and smoke-tested
+  (`M47-GFX` fb markers, both arches); console *reclaim* on release is
+  deferred to the displayd phase.
+- [x] Add evdev-style `/dev/input/event*` devices for PS/2 keyboard and
+  mouse (pollable, raw keycodes; keymaps in userspace) — per-client queues,
+  O_NONBLOCK/EAGAIN, signal-interruptible blocking reads; verified by the
+  `M47-GFX` input markers (kernel-injected burst through the real
+  queue/read path; i8042 decode wiring exercised on real HW only).
+- [ ] `planned` Define the `b1display` v1 protocol: Wayland wire framing,
+  client-allocated buffers (SysV SHM transport in v1, behind an
+  abstraction), attach/damage/commit surfaces, frame callbacks, seat input,
+  toplevel role.
+- [ ] `planned` Implement the `displayd` compositor: damage-driven SHM
+  compositing into `/dev/fb0`, cursor, focus, alt-tab, minimal decorations;
+  started from `/etc/inittab`, clean console handback on exit.
+- [ ] `planned` Add `libb1gui` plus demo clients (`gclock`, `gterm`,
+  `gpaint`) and extend `tests/graphics-smoke.sh` with `M47-GFX` markers
+  (server-side framebuffer checksums, no screenshots).
+
+## M48: UNIX-Socket FD Passing and memfd
+
+Kernel prerequisite for real Wayland (M49) with standalone POSIX value
+(dbus-style daemons, privilege separation). Details in
+[`display-server.md`](display-server.md).
+
+- [ ] `planned` Add `sendmsg`/`recvmsg` with ancillary data on UNIX sockets.
+- [ ] `planned` Add `SCM_RIGHTS` fd transfer with correct refcounting,
+  including in-flight fds when the receiver dies (fd-table lifetime is a
+  known sharp edge — see the M46 fd-table fixes).
+- [ ] `planned` Add `SCM_CREDENTIALS` and `memfd_create`.
+- [ ] `planned` Switch `b1display` buffer transport from SysV SHM keys to
+  memfd + `SCM_RIGHTS`; `M48-FDPASS` smoke markers.
+
+## M49: Wayland Protocol Compatibility
+
+Builds on M47's Wayland-shaped core + M48's fd passing; mapping is 1:1 by
+construction. Details in [`display-server.md`](display-server.md).
+
+- [ ] `planned` Port libwayland (client + server) over UNIX sockets + cmsg.
+- [ ] `planned` Teach `displayd` the real protocol: `wl_shm`,
+  `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset.
+- [ ] `planned` Keyboard keymaps: minimal shim or an xkbcommon port.
+- [ ] `planned` Run one stock SHM-based Wayland client unmodified
+  (weston-simple-shm class).
+- [ ] `parked` TinyX/kdrive `Xfbdev` on the same `/dev/fb0` + input
+  substrate, as the route to real X11 apps.

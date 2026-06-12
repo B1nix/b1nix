@@ -2,6 +2,7 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/compositor.h>
 #include <b1nix/console.h>
+#include <b1nix/input.h>
 #include <b1nix/io.h>
 #include <b1nix/sched.h>
 #include <b1nix/ps2_mouse.h>
@@ -155,6 +156,28 @@ void ps2_mouse_handle_byte(u8 data)
     if (mouse_state.x != old_x || mouse_state.y != old_y || mouse_state.buttons != old_buttons) {
         __atomic_store_n(&mouse_event_pending, 1, __ATOMIC_RELEASE);
     }
+
+    /* M47: mirror the decoded packet to /dev/input/event1 — relative motion,
+     * button edges, plus the kernel-clamped absolute cursor position. */
+    if (dx)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, dx);
+    if (dy)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -dy);
+    u8 changed = (u8)(mouse_state.buttons ^ old_buttons);
+    if (changed & 0x01)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT,
+                         (mouse_state.buttons & 0x01) ? 1 : 0);
+    if (changed & 0x02)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_RIGHT,
+                         (mouse_state.buttons & 0x02) ? 1 : 0);
+    if (changed & 0x04)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_MIDDLE,
+                         (mouse_state.buttons & 0x04) ? 1 : 0);
+    if (mouse_state.x != old_x)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_ABS, B1NIX_ABS_X, mouse_state.x);
+    if (mouse_state.y != old_y)
+        input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_ABS, B1NIX_ABS_Y, mouse_state.y);
+    input_event_sync(INPUT_DEV_MOUSE);
 }
 
 void ps2_mouse_interrupt_handler(void)
