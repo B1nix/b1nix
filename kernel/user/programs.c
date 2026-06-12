@@ -1050,17 +1050,25 @@ static void m39_init_test(void) {
   else
     uwrite("M39-INIT: fail runlevel-match\n");
 
-  /* telinit round-trip: /sbin/telinit 5 must leave runlevel 5 in /run/initctl,
-   * which init_poll_initctl() then reads back and consumes. */
+  /* telinit round-trip: /sbin/telinit 4 must leave runlevel 4 in /run/initctl,
+   * which init_poll_initctl() then reads back and consumes.
+   *
+   * Deliberately runlevel 4, NOT 5: this selftest and the real PID-1 init both
+   * poll the same /run/initctl, so under -smp the real init can also observe
+   * this request and actually switch runlevels. Runlevel 4 carries no extra
+   * services; runlevel 5 would spuriously start the graphical desktop
+   * (displayd/gdesktop) mid-smoke, which is interactive software not meant for
+   * the headless suite and which would stall the run. The round-trip mechanism
+   * is exercised identically with 4. */
   {
-    const char *tl_argv[] = {"/sbin/telinit", "5", 0};
+    const char *tl_argv[] = {"/sbin/telinit", "4", 0};
     u64 tl_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)tl_argv[0], 2,
                                   (u64)(usize)tl_argv, 0, 0, 0);
     int ok = 0;
     if ((isize)tl_pid >= 0) {
       int st = 0;
       syscall_dispatch(SYS_WAIT, tl_pid, (u64)(usize)&st, 0, 0, 0, 0);
-      if (st == 0 && init_poll_initctl() == 5)
+      if (st == 0 && init_poll_initctl() == 4)
         ok = 1;
     }
     uwrite(ok ? "M39-INIT: ok telinit\n" : "M39-INIT: fail telinit\n");

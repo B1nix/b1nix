@@ -115,69 +115,89 @@ int main(void) {
 	if (b1gui_connect(&win) ||
 	    b1gui_create_window(&win, COLS * CELL_W, ROWS * CELL_H, "Terminal"))
 		return 1;
-	for (unsigned row = 0; row < ROWS; row++)
-		clear_row(row);
-	/* Ensure displayd has accepted this connection and created all objects
-	 * before fork duplicates the socket into the terminal child. */
-	(void)b1gui_checksum(&win);
-
-	int master = -1;
-	pid_t child = forkpty(&master, 0, 0, 0);
-	if (child == 0) {
-		execlp("/bin/bash", "bash", (char *)0);
-		_exit(127);
-	}
-	if (master < 0)
-		return 1;
-	fcntl(master, F_SETFL, O_NONBLOCK);
-	usleep(100000);
-	render(&win);
+	(void)b1gui_checksum(&win); /* ensure objects exist before any fork */
 
 	int shift = 0;
-	for (;;) {
-		int changed = 0;
-		char text[256];
-		ssize_t n;
-		while ((n = read(master, text, sizeof(text))) > 0) {
-			for (ssize_t i = 0; i < n; i++)
-				put_terminal_char(text[i]);
-			changed = 1;
-		}
-		if (n == 0) {
-			int status;
-			if (waitpid(child, &status, WNOHANG) == child)
-				break;
-		}
+	int running = 1;
 
-		struct b1gui_event event;
-		int rc = b1gui_next_event(&win, &event, 20);
-		if (rc < 0)
-			break;
-		if (rc == 1 && event.object_id == win.toplevel_id &&
-		    event.opcode == B1D_EV_TOPLEVEL_CLOSE)
-			break;
-		if (rc == 1 && event.object_id == B1D_OBJ_SEAT &&
-		    event.opcode == B1D_EV_SEAT_KEY && event.nargs >= 2) {
-			unsigned scan = event.args[0];
-			int pressed = event.args[1] != 0;
-			if (scan == 0x2a || scan == 0x36) {
-				shift = pressed;
-			} else if (pressed) {
-				char c = key_char(scan, shift);
-				if (c)
-					write(master, &c, 1);
-				else if (scan == 0x1c)
-					write(master, "\n", 1);
-				else if (scan == 0x0e)
-					write(master, "\177", 1);
-				else if (scan == 0x0f)
-					write(master, "\t", 1);
-			}
+	/* Keep one shell alive in this window. If the shell exits (e.g. the user
+	 * types `exit`), reset the screen and start a fresh one in place instead
+	 * of tearing down the whole terminal — that keeps gdesktop from having to
+	 * respawn (and cascade) a new window. The display socket is FD_CLOEXEC
+	 * (set in b1gui_connect), so the shell never inherits it. */
+	while (running) {
+		for (unsigned row = 0; row < ROWS; row++)
+			clear_row(row);
+		cursor_x = cursor_y = 0;
+
+		int master = -1;
+		pid_t child = forkpty(&master, 0, 0, 0);
+		if (child == 0) {
+			execlp("/bin/bash", "bash", (char *)0);
+			_exit(127);
 		}
-		if (changed)
-			render(&win);
+		if (master < 0)
+			break; /* pty allocation failed — give up the window */
+		fcntl(master, F_SETFL, O_NONBLOCK);
+		usleep(100000);
+		render(&win);
+
+		int shell_alive = 1;
+		while (shell_alive && running) {
+			int changed = 0;
+			char text[256];
+			ssize_t n;
+			while ((n = read(master, text, sizeof(text))) > 0) {
+				for (ssize_t i = 0; i < n; i++)
+					put_terminal_char(text[i]);
+				changed = 1;
+			}
+			if (n == 0) {
+				int status;
+				if (waitpid(child, &status, WNOHANG) == child)
+					shell_alive = 0;
+			}
+
+			struct b1gui_event event;
+			int rc = b1gui_next_event(&win, &event, 20);
+			if (rc < 0) {
+				running = 0;
+				break;
+			}
+			if (rc == 1 && event.object_id == win.toplevel_id &&
+			    event.opcode == B1D_EV_TOPLEVEL_CLOSE) {
+				running = 0;
+				break;
+			}
+			if (rc == 1 && event.object_id == B1D_OBJ_SEAT &&
+			    event.opcode == B1D_EV_SEAT_KEY && event.nargs >= 2) {
+				unsigned scan = event.args[0];
+				int pressed = event.args[1] != 0;
+				if (scan == 0x2a || scan == 0x36) {
+					shift = pressed;
+				} else if (pressed) {
+					char c = key_char(scan, shift);
+					if (c)
+						write(master, &c, 1);
+					else if (scan == 0x1c)
+						write(master, "\n", 1);
+					else if (scan == 0x0e)
+						write(master, "\177", 1);
+					else if (scan == 0x0f)
+						write(master, "\t", 1);
+				}
+			}
+			if (changed)
+				render(&win);
+		}
+		close(master);
+		/* Reap the shell if it died, and back off so a shell that exits
+		 * instantly can't spin this loop. */
+		int status;
+		waitpid(child, &status, WNOHANG);
+		if (running)
+			usleep(400000);
 	}
-	close(master);
 	b1gui_destroy(&win);
 	return 0;
 }

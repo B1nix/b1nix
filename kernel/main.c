@@ -48,6 +48,7 @@ extern void virtio_gpu_init(void);
 extern void fb_console_init(void);
 extern void hda_init(void);
 extern void input_init(void);
+extern void input_gfxtest_start(void);
 extern void fb_dev_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
@@ -280,6 +281,8 @@ void kernel_main(usize arg0, usize arg1)
 	ps2_kbd_init();
 	ps2_mouse_init();
 	input_init(); /* M47: /dev/input/event* (PS/2 kbd + mouse event streams) */
+	if (bootinfo_has_flag("b1nix.gfxtest=1"))
+		input_gfxtest_start(); /* diagnostic: headless window-drag injector */
 	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
 	hda_init();   /* M38: Intel HDA sound controller (/dev/dsp) */
 	video_init();

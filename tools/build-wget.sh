@@ -126,7 +126,7 @@ if ! grep -q 'defined b1nix' "$SRC_DIR/lib/getdtablesize.c"; then
   mv "$tmp_getdtablesize" "$SRC_DIR/lib/getdtablesize.c"
 fi
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o"
 
 (
   cd "$BUILD_DIR"

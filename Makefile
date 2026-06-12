@@ -391,21 +391,10 @@ $(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
 # changes it wipes the tree so every output relinks for the new arch, then
 # rewrites itself; its mtime advances only on a real switch, so same-arch builds
 # don't churn. It is part of USERSPACE_DEPS so all *.inc re-bundle after a wipe.
-USERSPACE_ARCH_STAMP := userspace/build/.arch
-FORCE:
-$(USERSPACE_ARCH_STAMP): FORCE
-	@if [ "$$(cat $@ 2>/dev/null)" != "$(ARCH)" ]; then \
-		echo "  [arch-guard] userspace tree was not built for ARCH=$(ARCH) — wiping userspace/build"; \
-		rm -rf userspace/build; \
-		mkdir -p userspace/build; \
-		echo "$(ARCH)" > $@; \
-	fi
-
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
 USERSPACE_DEPS := \
-	$(USERSPACE_ARCH_STAMP) \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/libgui/*.c) \
 	$(wildcard userspace/include/*.h) \
@@ -418,27 +407,27 @@ USERSPACE_DEPS := \
 	userspace/linker.ld
 
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/native_smoke
+	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_native_smoke_elf userspace/build/bin/native_smoke > $@
+	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
 
 $(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/include/*.h)
-	@$(MAKE) -C userspace build/bin/tcc
+	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
 	@mkdir -p $(dir $@)
 	sh tools/gen_tcc_initramfs.sh $@
 
 $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/bin/$*
+	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_$*_elf userspace/build/bin/$* > $@
+	xxd -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
 
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
 # must build first to guarantee the libs exist.
 $(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
-	@$(MAKE) -C userspace build/bin/m32_nettool
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_nettool
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m32_nettool_elf userspace/build/bin/m32_nettool > $@
+	xxd -i -n vfs_m32_nettool_elf userspace/build/$(ARCH)/bin/m32_nettool > $@
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
 PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
@@ -446,9 +435,9 @@ $(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc
 	tools/build-pcre2.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
-	@$(MAKE) -C userspace build/bin/m32_pcre2_smoke
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/bin/m32_pcre2_smoke > $@
+	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/$(ARCH)/bin/m32_pcre2_smoke > $@
 
 $(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-curl.sh
@@ -521,14 +510,14 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
 $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
-	@$(MAKE) -C userspace build/bin/m30_pie
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_pie
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m30_pie_elf userspace/build/bin/m30_pie > $@
+	xxd -i -n vfs_m30_pie_elf userspace/build/$(ARCH)/bin/m30_pie > $@
 
 $(BUILD_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS) userspace/linker_pie.ld userspace/linker_shared.ld
-	@$(MAKE) -C userspace build/bin/m30_dynamic
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_dynamic
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_m30_dynamic_elf userspace/build/bin/m30_dynamic > $@
+	xxd -i -n vfs_m30_dynamic_elf userspace/build/$(ARCH)/bin/m30_dynamic > $@
 
 ifeq ($(ARCH),x86_64)
 $(INITRAMFS_SHARED_LIBC_INC): $(USERSPACE_DEPS) userspace/linker_shared.ld
@@ -717,14 +706,18 @@ distclean: clean
 
 # ── Smoke Tests ──
 smoke:
-	@echo "Running smoke tests..."
+	@echo "Running smoke tests for $(ARCH)..."
 	sh tests/smoke.sh $(ARCH)
 
-smoke-x86_64: ARCH=x86_64
-smoke-x86_64: smoke
+smoke-x86_64:
+	@$(MAKE) ARCH=x86_64 smoke
 
-smoke-x86: ARCH=x86
-smoke-x86: smoke
+smoke-x86:
+	@$(MAKE) ARCH=x86 smoke
+
+smoke-all-parallel:
+	@echo "Running smoke tests for both architectures in parallel..."
+	@$(MAKE) -j2 smoke-x86_64 smoke-x86
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)

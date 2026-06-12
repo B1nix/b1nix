@@ -73,7 +73,7 @@ EOF
 # Time discipline so make never tries to re-run autoconf/automake.
 find "$SRC_DIR" -exec touch {} +
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 # Configure only once: re-running configure regenerates config.h and has shown
 # non-deterministic getpass detection (HAVE_GETPASS flipping), which then leaves

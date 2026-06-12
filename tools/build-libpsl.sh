@@ -74,7 +74,7 @@ find "$SRC_DIR" \( -name 'configure' -o -name 'aclocal.m4' -o -name 'Makefile.in
   -exec touch -t 202001010000 {} + 1>&2
 
 # ── Ensure b1nix libc stubs are up-to-date ───────────────────────────────────
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 # ── Clean build dir to avoid stale state from interrupted builds ─────────────
 rm -rf "$BUILD_DIR"

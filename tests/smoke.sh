@@ -7,6 +7,22 @@ set -e
 
 ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
+
+if [ "$ARCH" = "x86" ]; then
+	ARCH_LABEL="x86   "
+else
+	ARCH_LABEL="$ARCH"
+fi
+
+echo() {
+	command echo "[$ARCH_LABEL] $*"
+}
+
+printf() {
+	local fmt="$1"
+	shift
+	command printf "[$ARCH_LABEL]$fmt" "$@"
+}
 # Seconds to let each test run (override via env). x86_64 emulates notably slower
 # than i386 under TCG (no KVM on macOS) and the single-CPU suite lands right at
 # ~110-120s, so give 64-bit more headroom to avoid false timeouts.
@@ -28,9 +44,13 @@ TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}
 SMOKE_PROGRESS_MODE=full
 mkdir -p "$PROJECT_DIR/smoke_run"
-SATA_IMG="$PROJECT_DIR/smoke_run/sata-smoke-$$.img"
-NVME_IMG="$PROJECT_DIR/smoke_run/nvme-smoke-$$.img"
-SWAP_IMG="$PROJECT_DIR/smoke_run/swap-smoke-$$.img"
+SATA_IMG_BOOT="$PROJECT_DIR/smoke_run/sata-smoke-boot-$$.img"
+NVME_IMG_BOOT="$PROJECT_DIR/smoke_run/nvme-smoke-boot-$$.img"
+SWAP_IMG_BOOT="$PROJECT_DIR/smoke_run/swap-smoke-boot-$$.img"
+
+SATA_IMG_SMP="$PROJECT_DIR/smoke_run/sata-smoke-smp-$$.img"
+NVME_IMG_SMP="$PROJECT_DIR/smoke_run/nvme-smoke-smp-$$.img"
+SWAP_IMG_SMP="$PROJECT_DIR/smoke_run/swap-smoke-smp-$$.img"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -77,13 +97,13 @@ report_progress_line() {
 
 	case "$line" in
 		*": FAIL"*|*": fail "*|*": failed"*|*PANIC*)
-			printf "  ${RED}%s${NC}\n" "$line"
+			printf "  ${PROGRESS_PREFIX:-}${RED}%s${NC}\n" "$line"
 			;;
 		*": ok"*|*": done"*|B1NIX-TEST:\ done)
-			printf "  ${GREEN}%s${NC}\n" "$line"
+			printf "  ${PROGRESS_PREFIX:-}${GREEN}%s${NC}\n" "$line"
 			;;
 		*)
-			printf "  ${YELLOW}%s${NC}\n" "$line"
+			printf "  ${PROGRESS_PREFIX:-}${YELLOW}%s${NC}\n" "$line"
 			;;
 	esac
 }
@@ -93,11 +113,11 @@ run_qemu() {
 	local log="$1"
 	shift
 	local pid
-
+  
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		local filter_dump_args=""
 		if qemu-system-x86_64 -object filter-dump,help >/dev/null 2>&1; then
-			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=$PROJECT_DIR/smoke_run/net.pcap"
+			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=${NET_PCAP:-$PROJECT_DIR/smoke_run/net-$ARCH.pcap}"
 		fi
 
 		qemu-system-x86_64 \
@@ -152,7 +172,7 @@ run_qemu() {
 				fi
 				now_ts=$(date +%s)
 				if [ $((now_ts - start_ts)) -ge "$TIMEOUT" ]; then
-					echo "[smoke] run_qemu timeout after ${TIMEOUT}s" >>"$log"
+					command echo "[smoke] run_qemu timeout after ${TIMEOUT}s" >>"$log"
 					break
 				fi
 				sleep 1
@@ -205,10 +225,15 @@ fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
 
-# Create dummy images for SATA, NVMe and Swap tests
-dd if=/dev/zero of="$SATA_IMG" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$NVME_IMG" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
+# Create dummy images for SATA, NVMe and Swap tests (Boot run)
+dd if=/dev/zero of="$SATA_IMG_BOOT" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$NVME_IMG_BOOT" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$SWAP_IMG_BOOT" bs=1M count=2 2>/dev/null
+
+# Create dummy images for SATA, NVMe and Swap tests (SMP run)
+dd if=/dev/zero of="$SATA_IMG_SMP" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$NVME_IMG_SMP" bs=1M count=4 2>/dev/null
+dd if=/dev/zero of="$SWAP_IMG_SMP" bs=1M count=2 2>/dev/null
 
 MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
 if [ ! -x "$MKE2FS" ]; then
@@ -219,27 +244,76 @@ if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     exit 1
 fi
 
-# Format with minimal ext4 features (metadata_csum, 64bit, flex_bg not supported by kernel driver)
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$SATA_IMG" 2>/dev/null || {
-        echo "Error: Failed to format sata.img as ext4."
+# Format Boot run images with minimal ext4 features (metadata_csum, 64bit, flex_bg not supported by kernel driver)
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_BOOT" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$SATA_IMG_BOOT" 2>/dev/null || {
+        echo "Error: Failed to format sata boot image as ext4."
         exit 1
     }
 }
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$NVME_IMG" 2>/dev/null || {
-        echo "Error: Failed to format nvme.img as ext4."
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_BOOT" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$NVME_IMG_BOOT" 2>/dev/null || {
+        echo "Error: Failed to format nvme boot image as ext4."
         exit 1
     }
 }
 
+# Format SMP run images
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SMP" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$SATA_IMG_SMP" 2>/dev/null || {
+        echo "Error: Failed to format sata smp image as ext4."
+        exit 1
+    }
+}
+"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SMP" 2>/dev/null || {
+    "$MKE2FS" -F -t ext4 -q "$NVME_IMG_SMP" 2>/dev/null || {
+        echo "Error: Failed to format nvme smp image as ext4."
+        exit 1
+    }
+}
+
+# Define logs
+LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot-$ARCH.log"
+SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
+
+echo ""
+echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
+
+# Run Boot QEMU in the background
+(
+	SATA_IMG="$SATA_IMG_BOOT"
+	NVME_IMG="$NVME_IMG_BOOT"
+	SWAP_IMG="$SWAP_IMG_BOOT"
+	NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-boot.pcap"
+	SMOKE_PROGRESS_MODE=full
+	PROGRESS_PREFIX="[boot] "
+	run_qemu "$LOG"
+) &
+pid_boot=$!
+
+# Run SMP QEMU in the background
+(
+	SATA_IMG="$SATA_IMG_SMP"
+	NVME_IMG="$NVME_IMG_SMP"
+	SWAP_IMG="$SWAP_IMG_SMP"
+	NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-smp.pcap"
+	EXTRA_QEMU_ARGS="-smp 4"
+	SMOKE_PROGRESS_MODE=smp
+	PROGRESS_PREFIX="[smp]  "
+	run_qemu "$SMP_LOG"
+) &
+pid_smp=$!
+
+# Wait for both runs to complete
+wait $pid_boot
+wait $pid_smp
+
+echo ""
+echo "=== Analyzing Test Results ==="
 
 # ── Test 1: Kernel boots ──
 echo ""
-echo "[RUN] Boot smoke (live serial progress)..."
-mkdir -p "$PROJECT_DIR/smoke_run"
-LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot.log"
-run_qemu "$LOG"
+echo "[RUN] Boot smoke checks..."
 check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
 check_output "$LOG" "kheap:" "kernel heap initializes"
@@ -1057,17 +1131,7 @@ fi
 
 # ── M24b SMP work-stealing (multi-core) ──
 echo ""
-echo "[RUN] M24b SMP work-stealing (-smp 4)..."
-# Re-create the disk images so the SMP boot starts from a clean state.
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG" 2>/dev/null || true
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG" 2>/dev/null || true
-dd if=/dev/zero of="$SWAP_IMG" bs=1M count=2 2>/dev/null
-SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp.log"
-EXTRA_QEMU_ARGS="-smp 4"
-SMOKE_PROGRESS_MODE=smp
-run_qemu "$SMP_LOG"
-EXTRA_QEMU_ARGS=""
-SMOKE_PROGRESS_MODE=full
+echo "[RUN] M24b SMP work-stealing (-smp 4) checks..."
 check_output "$SMP_LOG" "smp: AP 1 ready" "Application Processor boots (INIT-SIPI)"
 check_output "$SMP_LOG" "M24B-SMP: ok work-stealing" "cross-CPU work-stealing runs stolen tasks on APs"
 check_output "$SMP_LOG" "B1NIX-TEST: done" "full suite completes under SMP"
@@ -1079,7 +1143,8 @@ echo "  Passed:  $PASSED"
 echo "  Failed:  $FAILED"
 echo "  Skipped: $SKIPPED"
 
-rm -f "$SATA_IMG" "$NVME_IMG" "$SWAP_IMG"
+rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
+rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images

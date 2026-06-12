@@ -37,7 +37,7 @@ fi
 # Time discipline/touching to avoid autotools/make rebuild dependencies
 find "$SRC_DIR" -exec touch {} +
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 (
   cd "$SRC_DIR"

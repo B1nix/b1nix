@@ -1,5 +1,6 @@
 #include <b1nix/display.h>
 #include <b1nix/gui.h>
+#include <fcntl.h>
 #include <poll.h>
 #include <stdint.h>
 #include <string.h>
@@ -37,6 +38,11 @@ int b1gui_connect(struct b1gui_window *win) {
 		win->fd = -1;
 		return -1;
 	}
+	/* Don't let a fork()+exec child (e.g. gterm's shell) inherit the display
+	 * connection: an inherited fd keeps the socket — and thus the client's
+	 * surfaces and server slot — alive after the GUI process exits, which
+	 * leaks slots and leaves ghost windows on screen. */
+	fcntl(win->fd, F_SETFD, FD_CLOEXEC);
 	return 0;
 }
 

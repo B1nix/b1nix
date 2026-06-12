@@ -47,7 +47,7 @@ if ! grep -q 'defined b1nix' "$SRC_DIR/lib/fseterr.c"; then
   mv "$tmp_fseterr" "$SRC_DIR/lib/fseterr.c"
 fi
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 mkdir -p "$BUILD_DIR"
 (

@@ -239,6 +239,67 @@ int input_dev_open(int idx, int flags) {
   return fd;
 }
 
+/* ── M47 diagnostic: synthetic window-drag injector ───────────────────────
+ * Headless reproduction of the interactive "drag a window" path (the smoke
+ * suite otherwise never drags). Enabled with b1nix.gfxtest=1 on a runlevel-5
+ * boot: once displayd has /dev/input/event1 open, repeatedly grab a window by
+ * its title bar and drag it, so a drag-triggered server/client crash shows up
+ * as repeated app reloads in the serial log. Not built into normal boots. */
+static void inj_move(int dx, int dy) {
+  if (dx)
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, dx);
+  if (dy)
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, dy);
+  input_event_sync(INPUT_DEV_MOUSE);
+}
+
+static void inj_btn(int down) {
+  input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, down);
+  input_event_sync(INPUT_DEV_MOUSE);
+}
+
+/* Park the cursor at a known spot: a huge negative delta clamps to (0,0) in
+ * displayd, then a positive delta lands on the target. */
+static void inj_goto(int x, int y) {
+  inj_move(-4000, -4000);
+  scheduler_sleep_ticks(2);
+  inj_move(x, y);
+  scheduler_sleep_ticks(2);
+}
+
+static void inj_drag(int x, int y, int dx, int dy, int steps) {
+  inj_goto(x, y);
+  inj_btn(1);
+  scheduler_sleep_ticks(2);
+  for (int i = 0; i < steps; i++) {
+    inj_move(dx, dy);
+    scheduler_sleep_ticks(2);
+  }
+  inj_btn(0);
+  scheduler_sleep_ticks(5);
+}
+
+static void gfxtest_thread(void *arg) {
+  (void)arg;
+  while (!input_dev_has_clients(INPUT_DEV_MOUSE))
+    scheduler_sleep_ticks(10);
+  scheduler_sleep_ticks(200); /* let the desktop apps map their windows */
+  console_write("gfxtest: drag injector active\n");
+  for (;;) {
+    /* gpaint title (placement 0 ≈ (48,92), title row ~84). */
+    inj_drag(120, 84, 24, 6, 12);
+    /* terminal title (placement 2 ≈ x208,y430, title row ~422). */
+    inj_drag(400, 422, 20, -8, 12);
+    /* gclock title (placement 1, top-right). */
+    inj_drag(860, 46, -18, 10, 12);
+  }
+}
+
+void input_gfxtest_start(void) {
+  (void)kthread_create("gfxtest-drag", gfxtest_thread, 0);
+  console_write("gfxtest: drag injector scheduled\n");
+}
+
 /* ── init ── */
 
 void input_init(void) {

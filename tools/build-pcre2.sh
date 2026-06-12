@@ -57,7 +57,7 @@ if ! grep -q 'b1nix\*' "$SRC_DIR/config.sub"; then
   mv "$tmp_config_sub" "$SRC_DIR/config.sub"
 fi
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 (
   cd "$BUILD_DIR"

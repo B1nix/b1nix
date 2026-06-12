@@ -60,7 +60,7 @@ if ! grep -q "B1NIX_GETRANDOM_SHIM" "$ENTROPY_POLL"; then
   perl -0pi -e 's@#include <stdio\.h>\n@#include <stdio.h>\n\n#if defined(b1nix)\n#include <sys/random.h>\n#include <errno.h>\n#define HAVE_GETRANDOM\n#define B1NIX_GETRANDOM_SHIM\nstatic int getrandom_wrapper(void *buf, size_t buflen, unsigned int flags)\n{\n    return (int) getrandom(buf, buflen, flags);\n}\n#endif\n@' "$ENTROPY_POLL"
 fi
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 # mbedTLS PSA wrapper generation depends on python jsonschema.
 # Keep this hermetic by provisioning a local venv under build/.

@@ -46,7 +46,7 @@ if ! grep -q 'b1nix\*' "$SRC_DIR/build-aux/config.sub"; then
   chmod +x "$SRC_DIR/build-aux/config.sub"
 fi
 
-make -C "$ROOT_DIR/userspace" -s build/libb1nix.a build/crt/crt0.o 1>&2
+make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 
 # libidn2's autotools tree is brittle after interrupted/failed builds in this
 # cross environment. Recreate the build dir to avoid incremental corruption.

@@ -355,8 +355,10 @@ static void surface_destroy(struct dsurface *s) {
 	zorder_remove(slot);
 	if (enter_slot == slot)
 		enter_slot = -1;
-	if (focus_slot == slot)
+	if (focus_slot == slot) {
 		focus_slot = -1;
+		composite_rect(0, 0, (int)scr_w, PANEL_H);
+	}
 	int x = s->x, y = s->y;
 	int w = s->buf ? (int)s->buf->w : 0, h = s->buf ? (int)s->buf->h : 0;
 	int was_mapped = s->mapped;
@@ -609,7 +611,6 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 		int first_map = !s->mapped;
 		s->mapped = 1;
 		if (first_map) {
-			composite_surface_region(s);
 			struct dsurface *old = slot_surface(focus_slot);
 			if (old) {
 				uint32_t leave[1] = {old->id};
@@ -621,6 +622,10 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 			uint32_t enter[1] = {s->id};
 			send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER,
 			         enter, 1);
+			if (old) {
+				composite_surface_region(old);
+			}
+			composite_rect(0, 0, (int)scr_w, PANEL_H);
 			composite_surface_region(s);
 		} else if (s->pend_dmg_valid) {
 			int dx = (int)s->dx0, dy = (int)s->dy0;
@@ -642,15 +647,23 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 			return;
 		int nx = (int32_t)a[0], ny = (int32_t)a[1];
 		if (s->mapped) {
-			composite_surface_region(s);
+			int ox_pos = s->x;
+			int oy_pos = s->y;
 			s->x = nx;
 			s->y = ny;
+			int sw = s->buf ? (int)s->buf->w : 0;
+			int sh = s->buf ? (int)s->buf->h : 0;
+			int top = 1;
+			for (int i = 0; i < MAX_TOPLEVELS; i++)
+				if (toplevels[i].used && toplevels[i].surface == s)
+					top = TITLE_H;
+			composite_rect(ox_pos - 1, oy_pos - top, sw + 2, sh + top + 1);
 			composite_surface_region(s);
 		} else {
 			s->x = nx;
 			s->y = ny;
+			s->has_pos = 1;
 		}
-		s->has_pos = 1;
 		break;
 	}
 	case B1D_REQ_SURFACE_DESTROY:
@@ -760,8 +773,16 @@ static void pointer_moved(void) {
 	}
 }
 
+/* A left-press that landed on a window's server-side decoration (title bar /
+ * close box) is consumed by the server (focus, drag, close) and must NOT be
+ * forwarded to the client — otherwise e.g. gpaint sees it as a canvas click
+ * and starts drawing while you drag the title. Tracked so the matching
+ * release is suppressed too. */
+static int btn_on_decoration;
+
 static void pointer_button(uint16_t code, int state) {
 	input_serial++;
+	int on_decoration = 0;
 	if (state) {
 		int slot = surface_at(px, py);
 		struct dsurface *s = slot_surface(slot);
@@ -775,10 +796,14 @@ static void pointer_button(uint16_t code, int state) {
 			uint32_t w[1] = {s->id};
 			send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER, w, 1);
 			zorder_raise(slot);
+			if (old) {
+				composite_surface_region(old);
+			}
+			composite_rect(0, 0, (int)scr_w, PANEL_H);
 			composite_surface_region(s);
 		}
-		if (s && code == B1NIX_BTN_LEFT && surface_toplevel(s) &&
-		    py < s->y) {
+		if (s && code == B1NIX_BTN_LEFT && surface_toplevel(s) && py < s->y) {
+			on_decoration = 1;
 			if (px >= s->x + (int)s->buf->w - 16) {
 				struct dtoplevel *t = surface_toplevel(s);
 				send_msg(t->client, t->id, B1D_EV_TOPLEVEL_CLOSE, 0, 0);
@@ -786,9 +811,17 @@ static void pointer_button(uint16_t code, int state) {
 				drag_slot = slot;
 			}
 		}
-	} else if (code == B1NIX_BTN_LEFT) {
-		drag_slot = -1;
+		if (code == B1NIX_BTN_LEFT)
+			btn_on_decoration = on_decoration;
+	} else {
+		if (code == B1NIX_BTN_LEFT) {
+			drag_slot = -1;
+			on_decoration = btn_on_decoration;
+			btn_on_decoration = 0;
+		}
 	}
+	if (on_decoration)
+		return; /* decoration interaction — don't reach the client */
 	struct dsurface *f = slot_surface(focus_slot);
 	if (f) {
 		uint32_t w[2] = {code, (uint32_t)state};
@@ -811,12 +844,15 @@ static void focus_cycle(void) {
 	if (old) {
 		uint32_t w[1] = {old->id};
 		send_msg(old->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_LEAVE, w, 1);
-		composite_surface_region(old);
 	}
 	focus_slot = slot;
 	zorder_raise(slot);
 	uint32_t w[1] = {next->id};
 	send_msg(next->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER, w, 1);
+	if (old) {
+		composite_surface_region(old);
+	}
+	composite_rect(0, 0, (int)scr_w, PANEL_H);
 	composite_surface_region(next);
 }
 
@@ -880,7 +916,8 @@ static void input_drain(int which) {
 					if (px != ox || py != oy) {
 						struct dsurface *drag = slot_surface(drag_slot);
 						if (drag) {
-							composite_surface_region(drag);
+							int ox_pos = drag->x;
+							int oy_pos = drag->y;
 							drag->x += px - ox;
 							drag->y += py - oy;
 							/* Keep the title bar reachable: never under the top
@@ -897,6 +934,12 @@ static void input_drain(int which) {
 							if (drag->x > (int)scr_w - 48)
 								drag->x = (int)scr_w - 48;
 							(void)dh;
+
+							int top = 1;
+							for (int i = 0; i < MAX_TOPLEVELS; i++)
+								if (toplevels[i].used && toplevels[i].surface == drag)
+									top = TITLE_H;
+							composite_rect(ox_pos - 1, oy_pos - top, dw + 2, dh + top + 1);
 							composite_surface_region(drag);
 						}
 						composite_rect(ox, oy, CURSOR_SIZE + 1, CURSOR_SIZE + 1);

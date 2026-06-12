@@ -32,14 +32,14 @@ mkdir -p "$STAGING/bin" "$STAGING/etc" "$STAGING/dev" \
          "$STAGING/home" "$STAGING/tmp" "$STAGING/var"
 
 # Copy userspace binaries if available
-if [ -d "$PROJECT_DIR/userspace/build/bin" ]; then
-    cp -r "$PROJECT_DIR/userspace/build/bin/"* "$STAGING/bin/" 2>/dev/null || true
+if [ -d "$PROJECT_DIR/userspace/build/$B1NIX_ARCH/bin" ]; then
+    cp -r "$PROJECT_DIR/userspace/build/$B1NIX_ARCH/bin/"* "$STAGING/bin/" 2>/dev/null || true
 fi
 
 # Install libc and headers
-if [ -d "$PROJECT_DIR/userspace/build/libc" ]; then
+if [ -d "$PROJECT_DIR/userspace/build/$B1NIX_ARCH/libc" ]; then
     mkdir -p "$STAGING/lib"
-    cp -r "$PROJECT_DIR/userspace/build/libc/"* "$STAGING/lib/" 2>/dev/null || true
+    cp -r "$PROJECT_DIR/userspace/build/$B1NIX_ARCH/libc/"* "$STAGING/lib/" 2>/dev/null || true
 fi
 
 # Create /etc/motd
