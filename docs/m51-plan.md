@@ -166,6 +166,23 @@ wired into `tests/graphics-smoke.sh` + `tests/smoke.sh`, both arches.
 7. xkbcommon (precompiled keymap) → keysym smoke.
 8. Full `m51_smoke` end-to-end render against displayd; update roadmap M51 → done.
 
+## HarfBuzz: deferred to M53 (C++ userspace runtime needed)
+
+HarfBuzz is C++ and must be built with the cross g++ + libstdc++. A probe got it
+compiling deep into the unified `harfbuzz.cc` but it needs a real C++ userspace
+runtime that b1nix doesn't have yet: extending the userspace C headers
+(`uint_fast16_t` etc. absent from `stdint.h`, `mbstate_t` clash between gcc's
+`<cwchar>` and our `wchar.h`), a libstdc++ sysroot, plus exception unwinding and
+static-constructor (`init_array`) support in a freestanding userspace ELF. That
+is the "robust C++ runtime / ICU" infrastructure the roadmap explicitly scopes
+to **M53 (Browser Platform)**. Pulling it into M51 is premature.
+
+Practically, Cairo's toy text API already shapes and renders Latin/monospace
+text via FreeType (the `cairo-wayland` demo), which covers the milestone's
+visible "text" deliverable for B1nix Mono. HarfBuzz adds *complex* shaping
+(ligatures, Arabic/Indic, kerning) — valuable, but not required for the desktop
+demo and best done alongside the M53 C++ runtime work.
+
 ## Deliberate scope reductions (flag, don't hide)
 
 - **Fontconfig deferred**: bundle a font + use the FT face directly. The

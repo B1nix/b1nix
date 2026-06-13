@@ -92,6 +92,7 @@ enum wobject_type {
 	WOBJ_REGION,
 	WOBJ_XDG_WM_BASE,
 	WOBJ_XDG_SURFACE,
+	WOBJ_OUTPUT,
 };
 
 struct wobject {
@@ -982,6 +983,37 @@ static void surface_action(int ci, struct dsurface *s, uint16_t op,
 	}
 }
 
+/* Pack a Wayland wire string (length-prefixed, NUL-terminated, 4-byte padded)
+ * into a uint32 word buffer; returns the new word index. */
+static unsigned wl_pack_string(uint32_t *w, unsigned i, const char *s) {
+	unsigned len = (unsigned)strlen(s) + 1;
+	w[i++] = len;
+	unsigned words = (len + 3) / 4;
+	memset(&w[i], 0, words * 4);
+	memcpy(&w[i], s, len - 1);
+	return i + words;
+}
+
+/* wl_output advertises one fixed 1024x768 output so toolkits can lay out. */
+static void wl_send_output_events(int ci, uint32_t id) {
+	uint32_t geo[32];
+	unsigned k = 0;
+	geo[k++] = 0;     /* x */
+	geo[k++] = 0;     /* y */
+	geo[k++] = 270;   /* physical width mm */
+	geo[k++] = 203;   /* physical height mm */
+	geo[k++] = 0;     /* subpixel unknown */
+	k = wl_pack_string(geo, k, "b1nix");
+	k = wl_pack_string(geo, k, "b1nix-display");
+	geo[k++] = 0;     /* transform normal */
+	send_msg(ci, id, 0, geo, k); /* geometry */
+	uint32_t mode[4] = {0x3 /* current|preferred */, 1024, 768, 60000};
+	send_msg(ci, id, 1, mode, 4); /* mode */
+	uint32_t scale = 1;
+	send_msg(ci, id, 3, &scale, 1); /* scale (v2) */
+	send_msg(ci, id, 2, 0, 0);      /* done (v2) */
+}
+
 static void wl_registry_globals(int ci, uint32_t registry) {
 	static const struct {
 		uint32_t name;
@@ -992,6 +1024,7 @@ static void wl_registry_globals(int ci, uint32_t registry) {
 	    {2, "wl_shm", 1},
 	    {3, "wl_seat", 5},
 	    {4, "xdg_wm_base", 1},
+	    {5, "wl_output", 2},
 	};
 	for (unsigned i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
 		uint32_t prefix = globals[i].name;
@@ -1128,6 +1161,7 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			else if (a[0] == 2) type = WOBJ_SHM;
 			else if (a[0] == 3) type = WOBJ_SEAT;
 			else if (a[0] == 4) type = WOBJ_XDG_WM_BASE;
+			else if (a[0] == 5) type = WOBJ_OUTPUT;
 			else break;
 			if (wobject_add(ci, new_id, type, 0)) {
 				if (type == WOBJ_SHM) {
@@ -1139,6 +1173,8 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 					uint32_t capabilities = 3;
 					send_msg(ci, new_id, 0, &capabilities, 1);
 					wl_send_string(ci, new_id, 1, 0, 0, "b1nix", 0, 0);
+				} else if (type == WOBJ_OUTPUT) {
+					wl_send_output_events(ci, new_id);
 				}
 			}
 		}
