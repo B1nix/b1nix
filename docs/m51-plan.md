@@ -1,7 +1,30 @@
 # M51 — Desktop Graphics Stack: Port Plan
 
-Status: **in progress** — rungs 1 (libm), 2 (pixman), 3 (FreeType) done;
-rungs 4-8 planned.
+Status: **in progress** — rungs 1 (libm), 2 (pixman), 3 (FreeType),
+5 (Cairo) done; remaining: displayd protocol (wl_output+clipboard), HarfBuzz,
+xkbcommon, end-to-end render.
+
+## Rung 5 done: Cairo
+
+`tools/build-cairo.sh` ports Cairo 1.16.0 → `libcairo.a` both triplets (image
+surface + FreeType backend + user font only; no PNG/fontconfig/PS/PDF/SVG/Xlib;
+`CAIRO_NO_MUTEX` single-threaded; atomics via `__atomic`; hand-written
+`config.h`/`cairo-features.h`; the source list is `cairo.c` + the dashed
+`cairo_sources` from Makefile.sources + `cairo-ft-font.c`). Without fontconfig,
+`cairo_ft_font_face_create_for_ft_face` takes an FT_Face directly. The only link
+snag was a duplicate `frexp` (libm vs libc) — fixed by weakening openlibm's
+`frexp`/`ldexp` so the libc definitions win. Verified by `m51_cairo_smoke`
+(`M51-GFX: ok cairo`): draws "Ab1" in B1nix Mono onto an ARGB32 image surface and
+asserts the glyphs painted dark ink over a white background — the whole
+cairo→pixman→freetype path end-to-end.
+
+## Note: smoke-all-parallel + cold port builds overloads the host
+
+`make smoke-all-parallel` runs 4 TCG VMs; if the Cairo/FreeType archives aren't
+built yet it also runs two cold library builds concurrently, which starved the
+slow i386-SMP VM and timed it out (uuidgen, near the end). Pre-build the port
+libs first (or run arches sequentially); with a warm cache the parallel run is
+fine. Both arches are 609/0 when run this way.
 
 ## Rung 3 done: FreeType
 

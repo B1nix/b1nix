@@ -62,6 +62,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_smoke \
 	m51_pixman_smoke \
 	m51_freetype_smoke \
+	m51_cairo_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -474,6 +475,16 @@ $(BUILD_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/m51_freetype_smoke.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_freetype_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_freetype_smoke_elf userspace/build/$(ARCH)/bin/m51_freetype_smoke > $@
+
+# M51: Cairo (image surface + FreeType backend), cross-built static.
+CAIRO_LIB := build/cairo-b1nix/$(B1NIX_TRIPLET)/install/lib/libcairo.a
+$(CAIRO_LIB): tools/build-cairo.sh tools/build-pixman.sh tools/build-freetype.sh
+	B1NIX_ARCH=$(ARCH) tools/build-cairo.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_cairo_smoke.inc: userspace/bin/m51_cairo_smoke.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_cairo_smoke_elf userspace/build/$(ARCH)/bin/m51_cairo_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

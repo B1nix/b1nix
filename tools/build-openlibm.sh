@@ -31,6 +31,10 @@ if [ ! -d "$SRC_DIR" ]; then
   # Make it weak so the libc definition wins when both archives are linked.
   sed -i '' 's/openlibm_strong_reference(scalbn, ldexp)/openlibm_weak_reference(scalbn, ldexp)/' \
     "$SRC_DIR/src/s_scalbn.c"
+  # Same for frexp (a real definition, not an alias): make it weak so the
+  # libc frexp wins when both archives are linked.
+  sed -i '' 's/^frexp(double x, int \*eptr)/__attribute__((__weak__)) frexp(double x, int *eptr)/' \
+    "$SRC_DIR/src/s_frexp.c"
 fi
 
 if [ "$B1NIX_ARCH" = "x86" ]; then

@@ -1543,6 +1543,21 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M51: Cairo draws real text (B1nix Mono via FreeType) onto an image
+   * surface -- the full stack integration. */
+  {
+    u64 cairo_pid = syscall_dispatch(SYS_SPAWN,
+                                     (u64)(usize) "/bin/m51-cairo-smoke", 0,
+                                     0, 0, 0, 0);
+    if ((isize)cairo_pid < 0) {
+      uwrite("M51-GFX: spawn-fail cairo\n");
+    } else {
+      int cairo_status = 0;
+      syscall_dispatch(SYS_WAIT, cairo_pid, (u64)(usize)&cairo_status, 0, 0, 0,
+                       0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {

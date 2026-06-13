@@ -250,6 +250,17 @@ $(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(LIB) $(CRT0) $(LINKE
 	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(LIB) --no-whole-archive
 
+# M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
+CAIRO_DIR := ../build/cairo-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	  -c $< -o $(BUILD)/bin/m51_cairo_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_cairo_smoke.o \
+	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
+	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)
