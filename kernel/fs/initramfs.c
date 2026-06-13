@@ -54,6 +54,7 @@
 #include "initramfs_m51_xkb_smoke.inc"
 #include "initramfs_m51_clipboard_smoke.inc"
 #include "initramfs_m51_harfbuzz_smoke.inc"
+#include "initramfs_m51_fontconfig_smoke.inc"
 #include "initramfs_displayd.inc"
 #include "initramfs_gclock.inc"
 #include "initramfs_gterm.inc"
@@ -1037,6 +1038,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m51_clipboard_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-harfbuzz-smoke", (const char *)vfs_m51_harfbuzz_smoke_elf,
      sizeof(vfs_m51_harfbuzz_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-fontconfig-smoke", (const char *)vfs_m51_fontconfig_smoke_elf,
+     sizeof(vfs_m51_fontconfig_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/displayd", (const char *)vfs_displayd_elf,
      sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gclock", (const char *)vfs_gclock_elf,

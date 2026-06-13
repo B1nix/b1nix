@@ -67,6 +67,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_xkb_smoke \
 	m51_clipboard_smoke \
 	m51_harfbuzz_smoke \
+	m51_fontconfig_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -514,6 +515,19 @@ $(BUILD_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/m51_harfbuzz_smoke.
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_harfbuzz_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_harfbuzz_smoke_elf userspace/build/$(ARCH)/bin/m51_harfbuzz_smoke > $@
+
+# M51: expat (XML) + Fontconfig (font discovery), cross-built static.
+EXPAT_LIB := build/expat-b1nix/$(B1NIX_TRIPLET)/install/lib/libexpat.a
+$(EXPAT_LIB): tools/build-expat.sh
+	B1NIX_ARCH=$(ARCH) tools/build-expat.sh >/dev/null
+FONTCONFIG_LIB := build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install/lib/libfontconfig.a
+$(FONTCONFIG_LIB): tools/build-fontconfig.sh tools/build-expat.sh tools/build-freetype.sh
+	B1NIX_ARCH=$(ARCH) tools/build-fontconfig.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/m51_fontconfig_smoke.c $(USERSPACE_DEPS) $(FONTCONFIG_LIB) $(EXPAT_LIB) $(FREETYPE_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_fontconfig_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_fontconfig_smoke_elf userspace/build/$(ARCH)/bin/m51_fontconfig_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

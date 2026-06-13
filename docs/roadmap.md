@@ -626,6 +626,8 @@ Port plan and progress: [`m51-plan.md`](m51-plan.md).
 - [x] Port pixman (generic C). `M51-GFX: ok pixman`.
 - [x] Port FreeType (TrueType + smooth rasterizer); bundle the project's own
   B1nix Mono font. `M51-GFX: ok freetype`.
+- [x] Port Fontconfig (+ expat); scans `/share/fonts` and matches families.
+  `M51-GFX: ok fontconfig`.
 - [x] Port Cairo (image surface + FreeType backend); render text end-to-end.
   `M51-GFX: ok cairo`.
 - [x] Port xkbcommon (keymap compile + keycode→keysym); ships a built-in
@@ -638,9 +640,13 @@ Port plan and progress: [`m51-plan.md`](m51-plan.md).
   input (`wl_seat`) and window (`xdg-shell`) already present from M47-M49.
   `M51-GFX: ok wl-output`, `ok clipboard`.
 - [x] Run a Cairo Wayland app with scalable fonts via displayd
-  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`); keyboard keysyms via the
-  xkbcommon port; clipboard round-trip verified. Complex shaped text (HarfBuzz)
-  is the one deferred piece (→ M53 C++ runtime).
+  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`); shaped text via HarfBuzz,
+  keyboard keysyms via xkbcommon, clipboard round-trip, and font matching via
+  Fontconfig all verified.
+
+**M51 complete** — all six libraries ported (pixman, FreeType, Fontconfig,
+HarfBuzz, Cairo, xkbcommon; plus libm + expat), the Wayland protocol surface
+completed, and the Cairo desktop app demo running. Nothing deferred.
 
 ## M52: Mesa and Accelerated OpenGL
 

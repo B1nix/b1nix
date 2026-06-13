@@ -282,6 +282,17 @@ $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKE
 	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a $(LIBGCC) \
 	  --whole-archive $(LIB) --no-whole-archive
 
+# M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
+FC_DIR := ../build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install
+EXPAT_DIR := ../build/expat-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(FC_DIR)/include -c $< -o $(BUILD)/bin/m51_fontconfig_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_fontconfig_smoke.o \
+	  $(FC_DIR)/lib/libfontconfig.a $(EXPAT_DIR)/lib/libexpat.a \
+	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
 # M51: m51_xkb_smoke links the ported static xkbcommon.
 XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(LIB) $(CRT0) $(LINKER)

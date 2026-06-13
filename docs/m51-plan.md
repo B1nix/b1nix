@@ -1,12 +1,14 @@
 # M51 — Desktop Graphics Stack: Port Plan
 
-Status: **closed**, with HarfBuzz deferred to M53. Done: libm, pixman,
-FreeType, Cairo, xkbcommon; the Wayland protocol surface completed in displayd
-(wl_output + clipboard, atop the existing wl_seat/xdg-shell); an end-to-end
-Cairo Wayland app rendering scalable text; a clipboard selection round-trip.
-Deferred: Fontconfig (not needed — Cairo uses the FT face directly) and HarfBuzz
-(needs the M53 C++ userspace runtime). Markers: `M51-GFX: ok
-libm|pixman|freetype|cairo|xkbcommon|wl-output|cairo-wayland|clipboard`.
+Status: **fully closed — nothing deferred.** All six libraries ported (pixman,
+FreeType, Fontconfig, HarfBuzz, Cairo, xkbcommon) plus libm and expat; the
+Wayland protocol surface completed in displayd (wl_output + clipboard atop the
+existing wl_seat/xdg-shell); an end-to-end Cairo Wayland app rendering scalable
+text; clipboard selection round-trip; Fontconfig family matching. HarfBuzz
+(C++) was ported with the cross g++ kept entirely off the C++ runtime
+(`-fno-exceptions/-rtti/-threadsafe-statics`, HB_TINY) so it links with no
+libstdc++. Markers: `M51-GFX: ok libm|pixman|freetype|fontconfig|cairo|
+xkbcommon|harfbuzz|wl-output|cairo-wayland|clipboard`. Version bumped to 0.51.0.
 
 ## End-to-end done: a Cairo Wayland app (`m51_cairo_wayland`)
 
