@@ -1,8 +1,10 @@
 #!/bin/sh
 # Build HarfBuzz (HB_TINY, no FreeType/glib/icu) as a static libharfbuzz.a for
 # the b1nix userspace ABI. Unified build via src/harfbuzz.cc, compiled with the
-# cross g++. -fno-exceptions/-rtti/-threadsafe-statics keep it off the C++
-# runtime entirely (no libstdc++ link needed). Prints the install dir.
+# cross g++. HarfBuzz is designed to build -fno-exceptions/-rtti (no C++ runtime
+# link), so we keep that. What changed: the toolchain's C++ headers are now
+# correct (tools/enable-cxx-toolchain.sh stages the b1nix libc into the sysroot
+# and fixes mbstate_t), so the old per-build header hacks are gone. Prints dir.
 
 set -eu
 
@@ -30,18 +32,13 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xJf "$tmp" -C "$SRC_PARENT" 1>&2
 fi
 
-UINC="$ROOT_DIR/userspace/include"
-# The cross g++ sysroot ($B1NIX_ROOTFS/include) holds a copy of the userspace
-# headers that gcc's <stdint.h>/<cmath> reach via include_next. Keep it in sync
-# so newly added types (uint_fast*, hypotf) are visible to the C++ build.
-if [ -d "$B1NIX_ROOTFS/include" ]; then
-  cp -f "$UINC/stdint.h" "$UINC/math.h" "$B1NIX_ROOTFS/include/" 2>/dev/null || true
-fi
-# -idirafter so libstdc++'s headers win for <cmath> etc. and include_next finds
-# our C headers. _GLIBCXX_HAVE_MBSTATE_T stops <cwchar> redefining mbstate_t.
-"$GXX" -c -O2 -DHB_TINY -DHB_NO_MT -D_GLIBCXX_HAVE_MBSTATE_T \
+# The b1nix libc headers and libstdc++'s mbstate_t config live in the toolchain
+# sysroot now (idempotent; see the script). No per-build header hacks needed.
+"$ROOT_DIR/tools/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" >/dev/null 2>&1 || true
+
+"$GXX" -c -O2 -DHB_TINY -DHB_NO_MT \
   -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++14 \
-  -idirafter "$UINC" -I"$SRC_DIR/src" "$SRC_DIR/src/harfbuzz.cc" \
+  -I"$SRC_DIR/src" "$SRC_DIR/src/harfbuzz.cc" \
   -o "$OBJ_DIR/harfbuzz.o"
 
 "$AR_BIN" rcs "$INSTALL_DIR/lib/libharfbuzz.a" "$OBJ_DIR/harfbuzz.o"
