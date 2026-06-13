@@ -1504,6 +1504,99 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M51: ported libm (openlibm) computes correctly at runtime. */
+  {
+    u64 m51_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m51-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m51_pid < 0) {
+      uwrite("M51-GFX: spawn-fail\n");
+    } else {
+      int m51_status = 0;
+      syscall_dispatch(SYS_WAIT, m51_pid, (u64)(usize)&m51_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported pixman composites pixels. */
+  {
+    u64 px_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-pixman-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)px_pid < 0) {
+      uwrite("M51-GFX: spawn-fail pixman\n");
+    } else {
+      int px_status = 0;
+      syscall_dispatch(SYS_WAIT, px_pid, (u64)(usize)&px_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported FreeType rasterizes a glyph from the bundled B1nix Mono TTF. */
+  {
+    u64 ft_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-freetype-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)ft_pid < 0) {
+      uwrite("M51-GFX: spawn-fail freetype\n");
+    } else {
+      int ft_status = 0;
+      syscall_dispatch(SYS_WAIT, ft_pid, (u64)(usize)&ft_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: Cairo draws real text (B1nix Mono via FreeType) onto an image
+   * surface -- the full stack integration. */
+  {
+    u64 cairo_pid = syscall_dispatch(SYS_SPAWN,
+                                     (u64)(usize) "/bin/m51-cairo-smoke", 0,
+                                     0, 0, 0, 0);
+    if ((isize)cairo_pid < 0) {
+      uwrite("M51-GFX: spawn-fail cairo\n");
+    } else {
+      int cairo_status = 0;
+      syscall_dispatch(SYS_WAIT, cairo_pid, (u64)(usize)&cairo_status, 0, 0, 0,
+                       0);
+    }
+  }
+
+  /* M51: ported xkbcommon compiles a keymap and translates keycode->keysym. */
+  {
+    u64 xkb_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m51-xkb-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)xkb_pid < 0) {
+      uwrite("M51-GFX: spawn-fail xkb\n");
+    } else {
+      int xkb_status = 0;
+      syscall_dispatch(SYS_WAIT, xkb_pid, (u64)(usize)&xkb_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported HarfBuzz shapes text with the built-in OpenType shaper. */
+  {
+    u64 hb_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-harfbuzz-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)hb_pid < 0) {
+      uwrite("M51-GFX: spawn-fail harfbuzz\n");
+    } else {
+      int hb_status = 0;
+      syscall_dispatch(SYS_WAIT, hb_pid, (u64)(usize)&hb_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported Fontconfig scans /share/fonts and matches B1nix Mono. */
+  {
+    u64 fc_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-fontconfig-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)fc_pid < 0) {
+      uwrite("M51-GFX: spawn-fail fontconfig\n");
+    } else {
+      int fc_status = 0;
+      syscall_dispatch(SYS_WAIT, fc_pid, (u64)(usize)&fc_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {
@@ -1538,6 +1631,28 @@ static int init_main(int argc, const char **argv) {
         int libwl_status = 0;
         syscall_dispatch(SYS_WAIT, libwl_pid,
                          (u64)(usize)&libwl_status, 0, 0, 0, 0);
+      }
+      /* M51 end-to-end: a Cairo app renders scalable text into a wl_shm
+       * window and presents it to displayd. */
+      u64 cwl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m51-cairo-wayland", 0, 0, 0, 0, 0);
+      if ((isize)cwl_pid < 0) {
+        uwrite("M51-GFX: spawn-fail cairo-wayland\n");
+      } else {
+        int cwl_status = 0;
+        syscall_dispatch(SYS_WAIT, cwl_pid,
+                         (u64)(usize)&cwl_status, 0, 0, 0, 0);
+      }
+      /* M51: clipboard (wl_data_device) selection round-trip between two
+       * client connections. */
+      u64 clip_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m51-clipboard-smoke", 0, 0, 0, 0, 0);
+      if ((isize)clip_pid < 0) {
+        uwrite("M51-GFX: spawn-fail clipboard\n");
+      } else {
+        int clip_status = 0;
+        syscall_dispatch(SYS_WAIT, clip_pid,
+                         (u64)(usize)&clip_status, 0, 0, 0, 0);
       }
       int dsp_status = 0;
       syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);

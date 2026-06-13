@@ -92,6 +92,11 @@ enum wobject_type {
 	WOBJ_REGION,
 	WOBJ_XDG_WM_BASE,
 	WOBJ_XDG_SURFACE,
+	WOBJ_OUTPUT,
+	WOBJ_DDM,
+	WOBJ_DATA_SOURCE,
+	WOBJ_DATA_DEVICE,
+	WOBJ_DATA_OFFER,
 };
 
 struct wobject {
@@ -101,6 +106,7 @@ struct wobject {
 	enum wobject_type type;
 	uint32_t link;
 	int configured;
+	char mime[64]; /* data_source: the single offered MIME type */
 };
 
 struct wpool {
@@ -982,6 +988,60 @@ static void surface_action(int ci, struct dsurface *s, uint16_t op,
 	}
 }
 
+/* Pack a Wayland wire string (length-prefixed, NUL-terminated, 4-byte padded)
+ * into a uint32 word buffer; returns the new word index. */
+static unsigned wl_pack_string(uint32_t *w, unsigned i, const char *s) {
+	unsigned len = (unsigned)strlen(s) + 1;
+	w[i++] = len;
+	unsigned words = (len + 3) / 4;
+	memset(&w[i], 0, words * 4);
+	memcpy(&w[i], s, len - 1);
+	return i + words;
+}
+
+/* wl_output advertises one fixed 1024x768 output so toolkits can lay out. */
+static void wl_send_output_events(int ci, uint32_t id) {
+	uint32_t geo[32];
+	unsigned k = 0;
+	geo[k++] = 0;     /* x */
+	geo[k++] = 0;     /* y */
+	geo[k++] = 270;   /* physical width mm */
+	geo[k++] = 203;   /* physical height mm */
+	geo[k++] = 0;     /* subpixel unknown */
+	k = wl_pack_string(geo, k, "b1nix");
+	k = wl_pack_string(geo, k, "b1nix-display");
+	geo[k++] = 0;     /* transform normal */
+	send_msg(ci, id, 0, geo, k); /* geometry */
+	uint32_t mode[4] = {0x3 /* current|preferred */, 1024, 768, 60000};
+	send_msg(ci, id, 1, mode, 4); /* mode */
+	uint32_t scale = 1;
+	send_msg(ci, id, 3, &scale, 1); /* scale (v2) */
+	send_msg(ci, id, 2, 0, 0);      /* done (v2) */
+}
+
+/* --- Clipboard (wl_data_device selection) ---
+ * One active selection at a time: the owning client + its data_source id and
+ * MIME. Server-allocated data_offer ids live in the >= 0xff000000 range so they
+ * never collide with client ids. */
+static int sel_client = -1;
+static uint32_t sel_source = 0;
+static char sel_mime[64];
+static uint32_t server_id_next = 0xff000000u;
+
+/* Push the current selection to one data_device: server-create a data_offer,
+ * announce its MIME, then make it the selection. */
+static void clipboard_offer_to(int ci, uint32_t device_id) {
+	if (sel_client < 0 || ci == sel_client)
+		return;
+	uint32_t offer_id = server_id_next++;
+	wobject_add(ci, offer_id, WOBJ_DATA_OFFER, 0); /* so receive() resolves it */
+	send_msg(ci, device_id, 0, &offer_id, 1); /* data_device.data_offer */
+	uint32_t buf[20];
+	unsigned k = wl_pack_string(buf, 0, sel_mime);
+	send_msg(ci, offer_id, 0, buf, k);        /* data_offer.offer(mime) */
+	send_msg(ci, device_id, 5, &offer_id, 1); /* data_device.selection(offer) */
+}
+
 static void wl_registry_globals(int ci, uint32_t registry) {
 	static const struct {
 		uint32_t name;
@@ -992,6 +1052,8 @@ static void wl_registry_globals(int ci, uint32_t registry) {
 	    {2, "wl_shm", 1},
 	    {3, "wl_seat", 5},
 	    {4, "xdg_wm_base", 1},
+	    {5, "wl_output", 2},
+	    {6, "wl_data_device_manager", 3},
 	};
 	for (unsigned i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
 		uint32_t prefix = globals[i].name;
@@ -1128,6 +1190,8 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			else if (a[0] == 2) type = WOBJ_SHM;
 			else if (a[0] == 3) type = WOBJ_SEAT;
 			else if (a[0] == 4) type = WOBJ_XDG_WM_BASE;
+			else if (a[0] == 5) type = WOBJ_OUTPUT;
+			else if (a[0] == 6) type = WOBJ_DDM;
 			else break;
 			if (wobject_add(ci, new_id, type, 0)) {
 				if (type == WOBJ_SHM) {
@@ -1139,6 +1203,8 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 					uint32_t capabilities = 3;
 					send_msg(ci, new_id, 0, &capabilities, 1);
 					wl_send_string(ci, new_id, 1, 0, 0, "b1nix", 0, 0);
+				} else if (type == WOBJ_OUTPUT) {
+					wl_send_output_events(ci, new_id);
 				}
 			}
 		}
@@ -1195,6 +1261,51 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 	case WOBJ_POINTER:
 	case WOBJ_KEYBOARD:
 		if (h->opcode == 0)
+			wobject_remove(obj);
+		break;
+	case WOBJ_DDM:
+		if (h->opcode == 0 && n >= 1) /* create_data_source */
+			wobject_add(ci, a[0], WOBJ_DATA_SOURCE, 0);
+		else if (h->opcode == 1 && n >= 1) { /* get_data_device(new_id, seat) */
+			if (wobject_add(ci, a[0], WOBJ_DATA_DEVICE, 0))
+				clipboard_offer_to(ci, a[0]); /* push any existing selection */
+		}
+		break;
+	case WOBJ_DATA_SOURCE:
+		if (h->opcode == 0 && n >= 1) { /* offer(mime) */
+			strncpy(obj->mime, (const char *)&a[1], sizeof(obj->mime) - 1);
+			obj->mime[sizeof(obj->mime) - 1] = 0;
+		} else if (h->opcode == 1) /* destroy */
+			wobject_remove(obj);
+		break;
+	case WOBJ_DATA_DEVICE:
+		if (h->opcode == 1 && n >= 1) { /* set_selection(source, serial) */
+			struct wobject *src = a[0] ? wobject_find(ci, a[0]) : 0;
+			if (src && src->type == WOBJ_DATA_SOURCE) {
+				sel_client = ci;
+				sel_source = a[0];
+				strncpy(sel_mime, src->mime, sizeof(sel_mime) - 1);
+				sel_mime[sizeof(sel_mime) - 1] = 0;
+				for (int i = 0; i < MAX_WOBJECTS; i++)
+					if (wobjects[i].used && wobjects[i].type == WOBJ_DATA_DEVICE)
+						clipboard_offer_to(wobjects[i].client, wobjects[i].id);
+			}
+		} else if (h->opcode == 2) /* release */
+			wobject_remove(obj);
+		break;
+	case WOBJ_DATA_OFFER:
+		if (h->opcode == 1) { /* receive(mime, fd): forward fd to the source */
+			if (sel_client >= 0 && clients[ci].pending_fd >= 0) {
+				uint32_t buf[20];
+				unsigned k = wl_pack_string(buf, 0, sel_mime);
+				send_msg_fd(sel_client, sel_source, 1 /* data_source.send */,
+				            buf, k, clients[ci].pending_fd);
+			}
+			if (clients[ci].pending_fd >= 0) {
+				close(clients[ci].pending_fd);
+				clients[ci].pending_fd = -1;
+			}
+		} else if (h->opcode == 2) /* destroy */
 			wobject_remove(obj);
 		break;
 	default:

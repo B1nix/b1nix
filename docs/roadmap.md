@@ -619,12 +619,34 @@ construction. Details in [`display-server.md`](display-server.md).
 
 ## M51: Desktop Graphics Stack
 
-- [ ] `planned` Port pixman, FreeType, Fontconfig, HarfBuzz, Cairo, and
-  xkbcommon.
-- [ ] `planned` Complete the Wayland input, clipboard, output, and window
-  protocol surface required by desktop applications.
-- [ ] `planned` Run a Cairo-based Wayland application with shaped text,
-  scalable fonts, keyboard input, and clipboard support.
+Port plan and progress: [`m51-plan.md`](m51-plan.md).
+
+- [x] Prerequisite: port a real libm (openlibm) — the previous `math.h` had no
+  working runtime libm (recursive-inline `jmp .` trap). `M51-GFX: ok libm`.
+- [x] Port pixman (generic C). `M51-GFX: ok pixman`.
+- [x] Port FreeType (TrueType + smooth rasterizer); bundle the project's own
+  B1nix Mono font. `M51-GFX: ok freetype`.
+- [x] Port Fontconfig (+ expat); scans `/share/fonts` and matches families.
+  `M51-GFX: ok fontconfig`.
+- [x] Port Cairo (image surface + FreeType backend); render text end-to-end.
+  `M51-GFX: ok cairo`.
+- [x] Port xkbcommon (keymap compile + keycode→keysym); ships a built-in
+  keymap, no xkeyboard-config dependency. `M51-GFX: ok xkbcommon`.
+- [x] Port HarfBuzz (HB_TINY, built-in OpenType shaper, no FreeType/glib/icu).
+  Built with the cross g++; `-fno-exceptions/-rtti/-threadsafe-statics` keep it
+  off the C++ runtime so it links with no libstdc++. `M51-GFX: ok harfbuzz`.
+- [x] Complete the Wayland protocol surface: `wl_output` (mode/scale/geometry)
+  and clipboard (`wl_data_device` selection with fd-forwarded transfer) added;
+  input (`wl_seat`) and window (`xdg-shell`) already present from M47-M49.
+  `M51-GFX: ok wl-output`, `ok clipboard`.
+- [x] Run a Cairo Wayland app with scalable fonts via displayd
+  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`); shaped text via HarfBuzz,
+  keyboard keysyms via xkbcommon, clipboard round-trip, and font matching via
+  Fontconfig all verified.
+
+**M51 complete** — all six libraries ported (pixman, FreeType, Fontconfig,
+HarfBuzz, Cairo, xkbcommon; plus libm + expat), the Wayland protocol surface
+completed, and the Cairo desktop app demo running. Nothing deferred.
 
 ## M52: Mesa and Accelerated OpenGL
 

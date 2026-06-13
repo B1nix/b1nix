@@ -224,6 +224,83 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER) $(wildcard 
 	fi
 
 
+# M51: m51_smoke links the ported static libm (openlibm).
+LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_smoke: bin/m51_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBM_DIR)/include -c $< -o $(BUILD)/bin/m51_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_smoke.o \
+	  $(LIBM_DIR)/lib/libm.a --whole-archive $(LIB) --no-whole-archive
+
+# M51: m51_pixman_smoke links the ported static pixman (+libm).
+PIXMAN_DIR := ../build/pixman-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_pixman_smoke: bin/m51_pixman_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(PIXMAN_DIR)/include/pixman-1 -c $< -o $(BUILD)/bin/m51_pixman_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_pixman_smoke.o \
+	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# M51: m51_freetype_smoke links the ported static FreeType (+libm).
+FT_DIR := ../build/freetype-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(FT_DIR)/include -c $< -o $(BUILD)/bin/m51_freetype_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_freetype_smoke.o \
+	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
+CAIRO_DIR := ../build/cairo-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	  -c $< -o $(BUILD)/bin/m51_cairo_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_cairo_smoke.o \
+	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
+	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# M51 end-to-end: Cairo + libb1gui (Wayland client) -> displayd.
+$(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	  -c $< -o $(BUILD)/bin/m51_cairo_wayland.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_cairo_wayland.o \
+	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
+	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
+
+# M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
+# __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
+HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install
+LIBGCC := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a
+$(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
+	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive $(LIBGCC)
+
+# M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
+FC_DIR := ../build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install
+EXPAT_DIR := ../build/expat-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(FC_DIR)/include -c $< -o $(BUILD)/bin/m51_fontconfig_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_fontconfig_smoke.o \
+	  $(FC_DIR)/lib/libfontconfig.a $(EXPAT_DIR)/lib/libexpat.a \
+	  $(FT_DIR)/lib/libfreetype.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# M51: m51_xkb_smoke links the ported static xkbcommon.
+XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(XKB_DIR)/include -c $< -o $(BUILD)/bin/m51_xkb_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_xkb_smoke.o \
+	  $(XKB_DIR)/lib/libxkbcommon.a --whole-archive $(LIB) --no-whole-archive
+
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)

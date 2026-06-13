@@ -150,6 +150,17 @@ int main(void) {
 	bind_prefix[0] = 4; bind_suffix[0] = 1; bind_suffix[1] = 6;
 	request_string(fd, 2, 0, bind_prefix, 1, "xdg_wm_base", bind_suffix, 2);
 
+	/* M51: bind wl_output and confirm it reports its mode geometry. */
+	bind_prefix[0] = 5; bind_suffix[0] = 2; bind_suffix[1] = 10;
+	request_string(fd, 2, 0, bind_prefix, 1, "wl_output", bind_suffix, 2);
+	uint32_t out_w = 0;
+	int out_tries = 0;
+	while (!out_w && out_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 10 && ev.opcode == 1 && ev.nargs >= 3)
+			out_w = ev.args[1];
+	marker(out_w == 1024 ? "M51-GFX: ok wl-output\n"
+	                     : "M51-GFX: fail wl-output\n");
+
 	id = 7;
 	request(fd, 4, 0, &id, 1); /* wl_compositor.create_surface */
 	uint32_t xdg_args[2] = {8, 7};

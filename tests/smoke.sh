@@ -124,6 +124,7 @@ run_qemu() {
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+				-device virtio-gpu-pci \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				${filter_dump_args} \
 				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
@@ -1123,6 +1124,14 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M50-DRM: ok rmfb" "M50: framebuffer removal"
 	check_output "$LOG" "M50-DRM: ok cleanup" "M50: close/munmap cleanup"
 
+	check_output "$LOG" "M51-GFX: ok libm" "M51: ported libm (openlibm) runtime math"
+	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
+	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"
+	check_output "$LOG" "M51-GFX: ok cairo" "M51: ported Cairo text rendering (full stack)"
+	check_output "$LOG" "M51-GFX: ok xkbcommon" "M51: ported xkbcommon keycode->keysym"
+	check_output "$LOG" "M51-GFX: ok harfbuzz" "M51: ported HarfBuzz OpenType shaping"
+	check_output "$LOG" "M51-GFX: ok fontconfig" "M51: ported Fontconfig font matching"
+
 	# ── M49: displayd Wayland protocol ──
 	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
 		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"
@@ -1133,6 +1142,9 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M49-LIBWL: ok upstream-client" "M49: upstream libwayland-client"
 		check_output "$LOG" "M49-LIBWL: ok keymap" "M49: wl_keyboard keymap fd"
 		check_output "$LOG" "M49-LIBWLS: ok server-core" "M49: upstream libwayland-server core"
+		check_output "$LOG" "M51-GFX: ok wl-output" "M51: wl_output advertises mode geometry"
+		check_output "$LOG" "M51-GFX: ok cairo-wayland" "M51: Cairo Wayland app renders text to displayd"
+		check_output "$LOG" "M51-GFX: ok clipboard" "M51: wl_data_device clipboard selection round-trip"
 		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
 		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
 	fi

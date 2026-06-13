@@ -37,6 +37,7 @@
 #include "initramfs_m35_smoke.inc"
 #include "initramfs_m38_sound.inc"
 #include "initramfs_testwav.inc"
+#include "initramfs_testfont.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
 #include "initramfs_m47_smoke.inc"
@@ -45,6 +46,15 @@
 #include "initramfs_m49_libwayland.inc"
 #include "initramfs_m49_libwayland_server.inc"
 #include "initramfs_m50_smoke.inc"
+#include "initramfs_m51_smoke.inc"
+#include "initramfs_m51_pixman_smoke.inc"
+#include "initramfs_m51_freetype_smoke.inc"
+#include "initramfs_m51_cairo_smoke.inc"
+#include "initramfs_m51_cairo_wayland.inc"
+#include "initramfs_m51_xkb_smoke.inc"
+#include "initramfs_m51_clipboard_smoke.inc"
+#include "initramfs_m51_harfbuzz_smoke.inc"
+#include "initramfs_m51_fontconfig_smoke.inc"
 #include "initramfs_displayd.inc"
 #include "initramfs_gclock.inc"
 #include "initramfs_gterm.inc"
@@ -993,6 +1003,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m38_sound_elf), INITRAMFS_EXECUTABLE},
     {"/test.wav", (const char *)vfs_testwav,
      sizeof(vfs_testwav), 0},
+    {"/share/fonts/B1nixMono-Regular.ttf", (const char *)vfs_testfont,
+     sizeof(vfs_testfont), 0},
     {"/bin/m42-w5pre-smoke", (const char *)vfs_m42_w5pre_smoke_elf,
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m46-smoke", (const char *)vfs_m46_smoke_elf,
@@ -1010,6 +1022,24 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m49_libwayland_server_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m50-smoke", (const char *)vfs_m50_smoke_elf,
      sizeof(vfs_m50_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-smoke", (const char *)vfs_m51_smoke_elf,
+     sizeof(vfs_m51_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-pixman-smoke", (const char *)vfs_m51_pixman_smoke_elf,
+     sizeof(vfs_m51_pixman_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-freetype-smoke", (const char *)vfs_m51_freetype_smoke_elf,
+     sizeof(vfs_m51_freetype_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-cairo-smoke", (const char *)vfs_m51_cairo_smoke_elf,
+     sizeof(vfs_m51_cairo_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-cairo-wayland", (const char *)vfs_m51_cairo_wayland_elf,
+     sizeof(vfs_m51_cairo_wayland_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-xkb-smoke", (const char *)vfs_m51_xkb_smoke_elf,
+     sizeof(vfs_m51_xkb_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-clipboard-smoke", (const char *)vfs_m51_clipboard_smoke_elf,
+     sizeof(vfs_m51_clipboard_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-harfbuzz-smoke", (const char *)vfs_m51_harfbuzz_smoke_elf,
+     sizeof(vfs_m51_harfbuzz_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-fontconfig-smoke", (const char *)vfs_m51_fontconfig_smoke_elf,
+     sizeof(vfs_m51_fontconfig_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/displayd", (const char *)vfs_displayd_elf,
      sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gclock", (const char *)vfs_gclock_elf,
