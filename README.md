@@ -210,6 +210,8 @@ Run the full smoke suite across three parallel test VMs plus a short SMP VM:
 
 ```sh
 make smoke
+# equivalent:
+sh tests/smoke.sh
 ```
 
 Other useful targets:
@@ -220,6 +222,12 @@ make ARCH=x86 smoke
 make graphics-smoke
 make memory-smoke
 make analyze
+```
+
+Run the former two-VM full smoke explicitly with:
+
+```sh
+SMOKE_LEGACY=1 sh tests/smoke.sh
 ```
 
 Smoke logs and temporary disk images are written to `smoke_run/`. Set

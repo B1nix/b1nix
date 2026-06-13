@@ -830,7 +830,7 @@ distclean: clean
 # ── Smoke Tests ──
 smoke:
 	@echo "Running parallel full smoke tests for $(ARCH)..."
-	SMOKE_PARALLEL=1 sh tests/smoke.sh $(ARCH)
+	sh tests/smoke.sh $(ARCH)
 
 smoke-quick:
 	@echo "Running quick smoke tests for $(ARCH)..."
