@@ -1,4 +1,3 @@
-#include <b1nix/display.h>
 #include <b1nix/gui.h>
 #include <errno.h>
 #include <fcntl.h>
@@ -164,13 +163,11 @@ int main(void) {
 				running = 0;
 				break;
 			}
-			if (rc == 1 && event.object_id == win.toplevel_id &&
-			    event.opcode == B1D_EV_TOPLEVEL_CLOSE) {
+			if (rc == 1 && event.type == B1GUI_EV_CLOSE) {
 				running = 0;
 				break;
 			}
-			if (rc == 1 && event.object_id == B1D_OBJ_SEAT &&
-			    event.opcode == B1D_EV_SEAT_KEY && event.nargs >= 2) {
+			if (rc == 1 && event.type == B1GUI_EV_KEY && event.nargs >= 2) {
 				unsigned scan = event.args[0];
 				int pressed = event.args[1] != 0;
 				if (scan == 0x2a || scan == 0x36) {

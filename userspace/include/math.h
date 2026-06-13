@@ -37,6 +37,7 @@ static inline double log(double x) { return __builtin_log(x); }
 static inline double log10(double x) { return __builtin_log10(x); }
 static inline double modf(double x, double *iptr) { return __builtin_modf(x, iptr); }
 static inline double pow(double x, double y) { return __builtin_pow(x, y); }
+static inline double round(double x) { return __builtin_round(x); }
 static inline double sin(double x) { return __builtin_sin(x); }
 static inline double sinh(double x) { return __builtin_sinh(x); }
 static inline double sqrt(double x) { return __builtin_sqrt(x); }

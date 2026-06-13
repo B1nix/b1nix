@@ -53,8 +53,10 @@ EMBEDDED_USER_PROGRAMS := \
 	m42_w5pre_smoke \
 	m46_smoke \
 	m47_smoke \
-	m47d_smoke \
 	m48_smoke \
+	m49_smoke \
+	m49_libwayland \
+	m49_libwayland_server \
 	displayd \
 	gclock \
 	gterm \

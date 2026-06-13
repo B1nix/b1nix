@@ -59,7 +59,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/div64.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
-	$(BUILD)/bin/gdesktop $(BUILD)/bin/m47d_smoke $(BUILD)/bin/gabout
+	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke
 
 PIC_LIBC_OBJS := $(patsubst $(BUILD)/libc/%.o,$(BUILD)/libc-pic/%.o,$(LIBC_OBJS))
 
@@ -100,6 +100,8 @@ BINARIES := \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound
 BINARIES += $(BUILD)/bin/m48_smoke
+BINARIES += $(BUILD)/bin/m49_libwayland
+BINARIES += $(BUILD)/bin/m49_libwayland_server
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -174,6 +176,29 @@ $(GUI_BINARIES): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
 	$(CC) $(CFLAGS) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o \
 		--whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
+
+# M49: upstream libwayland-client, with libffi for protocol dispatch.
+WAYLAND_DIR := ../build/wayland-b1nix/$(B1NIX_TRIPLET)/install
+$(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/build-wayland.sh ../tools/build-libffi.sh \
+		../tools/wayland/os.c ../tools/wayland/compat.c ../tools/wayland/compat.h
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/build-wayland.sh >/dev/null
+$(WAYLAND_DIR)/lib/libwayland-server.a: $(WAYLAND_DIR)/lib/libwayland-client.a
+
+$(BUILD)/bin/m49_libwayland: bin/m49_libwayland.c $(LIB) $(CRT0) $(LINKER) \
+		$(WAYLAND_DIR)/lib/libwayland-client.a
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m49_libwayland.o \
+		$(WAYLAND_DIR)/lib/libwayland-client.a $(WAYLAND_DIR)/lib/libffi.a \
+		--whole-archive $(LIB) --no-whole-archive
+
+$(BUILD)/bin/m49_libwayland_server: bin/m49_libwayland_server.c $(LIB) $(CRT0) \
+		$(LINKER) $(WAYLAND_DIR)/lib/libwayland-server.a
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(WAYLAND_DIR)/include -c $< -o $(BUILD)/bin/m49_libwayland_server.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m49_libwayland_server.o \
+		$(WAYLAND_DIR)/lib/libwayland-server.a $(WAYLAND_DIR)/lib/libffi.a \
+		--whole-archive $(LIB) --no-whole-archive
 
 $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	@mkdir -p $(dir $@)

@@ -365,6 +365,7 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     }
     unix_unlock(u);
     if (s->type == B1NIX_SOCK_STREAM && !s->connected) return 0;
+    if (flags & B1NIX_MSG_DONTWAIT) return -EAGAIN;
     if (scheduler_signal_pending()) return -ERESTARTSYS;
     scheduler_block_on(s);
   }

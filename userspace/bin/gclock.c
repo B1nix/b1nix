@@ -1,4 +1,3 @@
-#include <b1nix/display.h>
 #include <b1nix/gui.h>
 #include <stdint.h>
 #include <time.h>
@@ -40,8 +39,7 @@ int main(void) {
 		struct b1gui_event event;
 		for (int i = 0; i < 10; i++)
 			if (b1gui_next_event(&win, &event, 100) == 1 &&
-			    event.object_id == win.toplevel_id &&
-			    event.opcode == B1D_EV_TOPLEVEL_CLOSE) {
+			    event.type == B1GUI_EV_CLOSE) {
 				b1gui_destroy(&win);
 				return 0;
 			}

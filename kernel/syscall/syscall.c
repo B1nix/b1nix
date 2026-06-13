@@ -1447,6 +1447,7 @@ static u64 sys_bind(int fd, const void *user_addr, usize addrlen) {
   u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
   if (!user_addr || addrlen == 0 || addrlen > sizeof(kaddr))
     return (u64)-EINVAL;
+  memset(kaddr, 0, sizeof(kaddr));
   if (syscall_copyin(kaddr, user_addr, addrlen) < 0)
     return (u64)-EFAULT;
   return (u64)vfs_bind(fd, kaddr, addrlen);
@@ -1456,6 +1457,7 @@ static u64 sys_connect(int fd, const void *user_addr, usize addrlen) {
   u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
   if (!user_addr || addrlen == 0 || addrlen > sizeof(kaddr))
     return (u64)-EINVAL;
+  memset(kaddr, 0, sizeof(kaddr));
   if (syscall_copyin(kaddr, user_addr, addrlen) < 0)
     return (u64)-EFAULT;
   return (u64)vfs_connect(fd, kaddr, addrlen);
@@ -2891,7 +2893,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     copy_cstr(uts.sysname, sizeof(uts.sysname), "B1NIX");
     copy_cstr(uts.nodename, sizeof(uts.nodename), "b1nix");
     copy_cstr(uts.release, sizeof(uts.release), B1NIX_VERSION_STR);
-    copy_cstr(uts.version, sizeof(uts.version), "M22 Core Utilities");
+    copy_cstr(uts.version, sizeof(uts.version), "#1 SMP");
 #if defined(__aarch64__)
     copy_cstr(uts.machine, sizeof(uts.machine), "aarch64");
 #elif defined(__x86_64__)

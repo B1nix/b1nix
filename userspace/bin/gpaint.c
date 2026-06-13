@@ -1,4 +1,3 @@
-#include <b1nix/display.h>
 #include <b1nix/gui.h>
 #include <b1nix/input.h>
 #include <stdint.h>
@@ -23,19 +22,16 @@ int main(void) {
 		struct b1gui_event event;
 		if (b1gui_next_event(&win, &event, 100) != 1)
 			continue;
-		if (event.object_id == win.toplevel_id &&
-		    event.opcode == B1D_EV_TOPLEVEL_CLOSE)
+		if (event.type == B1GUI_EV_CLOSE)
 			break;
-		if (event.object_id != B1D_OBJ_SEAT)
-			continue;
-		if (event.opcode == B1D_EV_SEAT_POINTER_BUTTON &&
+		if (event.type == B1GUI_EV_POINTER_BUTTON &&
 		    event.nargs >= 2 && event.args[0] == B1NIX_BTN_LEFT)
 			drawing = event.args[1] != 0;
-		if ((event.opcode == B1D_EV_SEAT_POINTER_ENTER ||
-		     event.opcode == B1D_EV_SEAT_POINTER_MOTION) &&
+		if ((event.type == B1GUI_EV_POINTER_ENTER ||
+		     event.type == B1GUI_EV_POINTER_MOTION) &&
 		    event.nargs >= 2) {
-			px = event.args[event.opcode == B1D_EV_SEAT_POINTER_ENTER ? 1 : 0];
-			py = event.args[event.opcode == B1D_EV_SEAT_POINTER_ENTER ? 2 : 1];
+			px = event.args[0];
+			py = event.args[1];
 		}
 		if (drawing && px < win.width && py >= 24 && py < win.height) {
 			for (int dy = -2; dy <= 2; dy++)

@@ -1,22 +1,20 @@
 /*
  * displayd — the b1nix userspace display server (M47 Phase 2).
  *
- * Single-threaded poll loop over: one listening UNIX socket
- * (B1D_SOCKET_PATH), connected clients, and /dev/input/event0+1.
+ * Single-threaded poll loop over /run/wayland-0, connected clients, and
+ * /dev/input/event0+1.
  * Composites client memfd surfaces damage-driven into the mmap'd /dev/fb0
  * shadow buffer and pushes dirty rectangles with B1NIX_FBIOFLUSH.
  *
- * Protocol: b1nix/display.h (b1display v1, Wayland-shaped — see
- * docs/display-server.md). Server-side policy kept deliberately small:
+ * Protocol: Wayland core + xdg-shell subset. Server-side policy stays small:
  * first surface is centered, later ones cascade; 1-px border around each
  * surface; focus follows click (click raises); software crosshair cursor.
  *
  * Buffer release semantics (v1): the server reads a committed buffer on
- * every recomposite (cursor crossing, raise), so B1D_EV_BUFFER_RELEASE is
+ * every recomposite (cursor crossing, raise), so 0 is
  * only sent when the buffer stops being the committed one (replaced by a
  * new attach+commit, or the surface is destroyed).
  */
-#include <b1nix/display.h>
 #include <b1nix/fb.h>
 #include <b1nix/input.h>
 #include <errno.h>
@@ -55,6 +53,63 @@
 #define MENU_ITEM_H 18
 #define MENU_W 176
 #define CLOSE_COLOR 0x00E05263u
+#define WAYLAND_SOCKET_PATH "/run/wayland-0"
+#define MAX_MSG 256
+#define MAX_WOBJECTS 64
+#define MAX_WPOOLS 8
+
+enum surface_action {
+	SURFACE_ATTACH,
+	SURFACE_DAMAGE,
+	SURFACE_FRAME,
+	SURFACE_COMMIT,
+	SURFACE_DESTROY,
+};
+
+enum seat_event {
+	SEAT_POINTER_ENTER,
+	SEAT_POINTER_LEAVE,
+	SEAT_POINTER_MOTION,
+	SEAT_POINTER_BUTTON,
+	SEAT_KEY,
+	SEAT_FOCUS_ENTER,
+	SEAT_FOCUS_LEAVE,
+};
+
+struct wl_hdr {
+	uint32_t object_id;
+	uint16_t opcode;
+	uint16_t size;
+};
+
+enum wobject_type {
+	WOBJ_REGISTRY,
+	WOBJ_COMPOSITOR,
+	WOBJ_SHM,
+	WOBJ_SEAT,
+	WOBJ_POINTER,
+	WOBJ_KEYBOARD,
+	WOBJ_REGION,
+	WOBJ_XDG_WM_BASE,
+	WOBJ_XDG_SURFACE,
+};
+
+struct wobject {
+	int used;
+	uint32_t id;
+	int client;
+	enum wobject_type type;
+	uint32_t link;
+	int configured;
+};
+
+struct wpool {
+	int used;
+	uint32_t id;
+	int client;
+	int fd;
+	uint32_t size;
+};
 
 static void out(const char *s) { write(1, s, strlen(s)); }
 static void out_dec(unsigned v) {
@@ -81,7 +136,6 @@ struct dsurface {
 	int client;
 	int x, y;
 	int mapped;            /* committed at least once */
-	int has_pos;           /* client requested an explicit position */
 	unsigned placement;    /* desktop launch order */
 	struct dbuffer *buf;   /* committed buffer */
 	/* pending (until commit) */
@@ -113,6 +167,8 @@ static struct dclient clients[MAX_CLIENTS];
 static struct dsurface surfaces[MAX_SURFACES];
 static struct dbuffer buffers[MAX_BUFFERS];
 static struct dtoplevel toplevels[MAX_TOPLEVELS];
+static struct wobject wobjects[MAX_WOBJECTS];
+static struct wpool wpools[MAX_WPOOLS];
 static int zorder[MAX_SURFACES]; /* surface slot indices, bottom → top */
 static int zcount;
 
@@ -157,8 +213,8 @@ static void send_msg(int client, uint32_t obj, uint16_t opcode,
                      const uint32_t *words, unsigned nwords) {
 	if (client < 0 || client >= MAX_CLIENTS || !clients[client].used)
 		return;
-	uint8_t msg[B1D_MAX_MSG];
-	struct b1d_hdr h;
+	uint8_t msg[MAX_MSG];
+	struct wl_hdr h;
 	h.object_id = obj;
 	h.opcode = opcode;
 	h.size = (uint16_t)(sizeof(h) + nwords * 4);
@@ -167,9 +223,173 @@ static void send_msg(int client, uint32_t obj, uint16_t opcode,
 	send(clients[client].fd, msg, h.size, 0);
 }
 
-static void send_err(int client, uint32_t obj, uint32_t code) {
-	uint32_t w[2] = {obj, code};
-	send_msg(client, B1D_OBJ_DISPLAY, B1D_EV_DISPLAY_ERROR, w, 2);
+static void send_msg_fd(int client, uint32_t obj, uint16_t opcode,
+                        const uint32_t *words, unsigned nwords, int fd) {
+	uint8_t msg[MAX_MSG];
+	char control[CMSG_SPACE(sizeof(int))];
+	struct wl_hdr h = {obj, opcode, (uint16_t)(sizeof(h) + nwords * 4)};
+	struct iovec iov = {msg, h.size};
+	struct msghdr mh;
+	struct cmsghdr *cm;
+
+	memcpy(msg, &h, sizeof(h));
+	memcpy(msg + sizeof(h), words, nwords * 4);
+	memset(&mh, 0, sizeof(mh));
+	memset(control, 0, sizeof(control));
+	mh.msg_iov = &iov;
+	mh.msg_iovlen = 1;
+	mh.msg_control = control;
+	mh.msg_controllen = sizeof(control);
+	cm = CMSG_FIRSTHDR(&mh);
+	cm->cmsg_level = SOL_SOCKET;
+	cm->cmsg_type = SCM_RIGHTS;
+	cm->cmsg_len = CMSG_LEN(sizeof(int));
+	memcpy(CMSG_DATA(cm), &fd, sizeof(fd));
+	sendmsg(clients[client].fd, &mh, 0);
+}
+
+static void keyboard_init(int client, uint32_t id) {
+	int fd = memfd_create("wayland-keymap", MFD_CLOEXEC);
+	uint32_t keymap[2] = {0, 0}; /* no_keymap: clients consume raw evdev codes */
+	uint32_t repeat[2] = {25, 400};
+
+	if (fd >= 0) {
+		send_msg_fd(client, id, 0, keymap, 2, fd);
+		close(fd);
+	}
+	send_msg(client, id, 5, repeat, 2);
+}
+
+static struct wobject *wobject_type_find(int client, enum wobject_type type) {
+	for (int i = 0; i < MAX_WOBJECTS; i++)
+		if (wobjects[i].used && wobjects[i].client == client &&
+		    wobjects[i].type == type)
+			return &wobjects[i];
+	return 0;
+}
+
+static void send_seat_event(int client, uint16_t opcode, const uint32_t *words,
+                            unsigned nwords) {
+	struct wobject *obj = 0;
+	uint32_t event[5];
+	unsigned count = 0;
+	uint16_t wl_opcode = 0;
+	if (opcode <= SEAT_POINTER_BUTTON) {
+		obj = wobject_type_find(client, WOBJ_POINTER);
+		if (!obj)
+			return;
+		if (opcode == SEAT_POINTER_ENTER && nwords >= 3) {
+			event[0] = input_serial;
+			event[1] = words[0];
+			event[2] = words[1] << 8;
+			event[3] = words[2] << 8;
+			count = 4;
+		} else if (opcode == SEAT_POINTER_LEAVE && nwords >= 1) {
+			wl_opcode = 1;
+			event[0] = input_serial;
+			event[1] = words[0];
+			count = 2;
+		} else if (opcode == SEAT_POINTER_MOTION && nwords >= 2) {
+			wl_opcode = 2;
+			event[0] = frame_serial;
+			event[1] = words[0] << 8;
+			event[2] = words[1] << 8;
+			count = 3;
+		} else if (opcode == SEAT_POINTER_BUTTON && nwords >= 2) {
+			wl_opcode = 3;
+			event[0] = input_serial;
+			event[1] = frame_serial;
+			event[2] = words[0];
+			event[3] = words[1];
+			count = 4;
+		}
+	} else {
+		obj = wobject_type_find(client, WOBJ_KEYBOARD);
+		if (!obj)
+			return;
+		if (opcode == SEAT_KEY && nwords >= 2) {
+			wl_opcode = 3;
+			event[0] = input_serial;
+			event[1] = frame_serial;
+			event[2] = words[0];
+			event[3] = words[1];
+			count = 4;
+		} else if (opcode == SEAT_FOCUS_ENTER && nwords >= 1) {
+			wl_opcode = 1;
+			event[0] = input_serial;
+			event[1] = words[0];
+			event[2] = 0;
+			count = 3;
+		} else if (opcode == SEAT_FOCUS_LEAVE && nwords >= 1) {
+			wl_opcode = 2;
+			event[0] = input_serial;
+			event[1] = words[0];
+			count = 2;
+		}
+	}
+	if (obj && count)
+		send_msg(client, obj->id, wl_opcode, event, count);
+}
+
+static void wl_send_string(int client, uint32_t obj, uint16_t opcode,
+                           const uint32_t *prefix, unsigned nprefix,
+                           const char *text, const uint32_t *suffix,
+                           unsigned nsuffix) {
+	uint32_t words[32];
+	unsigned len = (unsigned)strlen(text) + 1;
+	unsigned ntext = (len + 3) / 4;
+	if (nprefix + 1 + ntext + nsuffix > 32)
+		return;
+	memcpy(words, prefix, nprefix * 4);
+	words[nprefix] = len;
+	memset(&words[nprefix + 1], 0, ntext * 4);
+	memcpy(&words[nprefix + 1], text, len);
+	memcpy(&words[nprefix + 1 + ntext], suffix, nsuffix * 4);
+	send_msg(client, obj, opcode, words, nprefix + 1 + ntext + nsuffix);
+}
+
+static struct wobject *wobject_find(int client, uint32_t id) {
+	for (int i = 0; i < MAX_WOBJECTS; i++)
+		if (wobjects[i].used && wobjects[i].client == client &&
+		    wobjects[i].id == id)
+			return &wobjects[i];
+	return 0;
+}
+
+static struct wobject *wobject_add(int client, uint32_t id,
+                                   enum wobject_type type, uint32_t link) {
+	if (id < 2 || wobject_find(client, id))
+		return 0;
+	for (int i = 0; i < MAX_WOBJECTS; i++)
+		if (!wobjects[i].used) {
+			wobjects[i].used = 1;
+			wobjects[i].id = id;
+			wobjects[i].client = client;
+			wobjects[i].type = type;
+			wobjects[i].link = link;
+			wobjects[i].configured = 0;
+			return &wobjects[i];
+		}
+	return 0;
+}
+
+static void wl_delete_id(int client, uint32_t id) {
+	send_msg(client, 1, 1, &id, 1);
+}
+
+static void wobject_remove(struct wobject *obj) {
+	uint32_t id = obj->id;
+	int client = obj->client;
+	memset(obj, 0, sizeof(*obj));
+	wl_delete_id(client, id);
+}
+
+static struct wpool *wpool_find(int client, uint32_t id) {
+	for (int i = 0; i < MAX_WPOOLS; i++)
+		if (wpools[i].used && wpools[i].client == client &&
+		    wpools[i].id == id)
+			return &wpools[i];
+	return 0;
 }
 
 /* ── compositor ── */
@@ -584,7 +804,7 @@ static void buffer_destroy(struct dbuffer *b) {
 static void surface_destroy(struct dsurface *s) {
 	int slot = (int)(s - surfaces);
 	if (s->buf)
-		send_msg(s->client, s->buf->id, B1D_EV_BUFFER_RELEASE, 0, 0);
+		send_msg(s->client, s->buf->id, 0, 0, 0);
 	zorder_remove(slot);
 	if (enter_slot == slot)
 		enter_slot = -1;
@@ -615,6 +835,14 @@ static void client_disconnect(int ci) {
 	for (int i = 0; i < MAX_TOPLEVELS; i++)
 		if (toplevels[i].used && toplevels[i].client == ci)
 			memset(&toplevels[i], 0, sizeof(toplevels[i]));
+	for (int i = 0; i < MAX_WOBJECTS; i++)
+		if (wobjects[i].used && wobjects[i].client == ci)
+			memset(&wobjects[i], 0, sizeof(wobjects[i]));
+	for (int i = 0; i < MAX_WPOOLS; i++)
+		if (wpools[i].used && wpools[i].client == ci) {
+			close(wpools[i].fd);
+			memset(&wpools[i], 0, sizeof(wpools[i]));
+		}
 	if (clients[ci].pending_fd >= 0)
 		close(clients[ci].pending_fd);
 	close(clients[ci].fd);
@@ -623,185 +851,52 @@ static void client_disconnect(int ci) {
 
 /* ── request handlers ── */
 
-static void handle_display_req(int ci, uint16_t op, const uint32_t *a,
-                               unsigned n) {
-	switch (op) {
-	case B1D_REQ_DISPLAY_HELLO: {
-		uint32_t w[3] = {scr_w, scr_h, B1D_FORMAT_XRGB8888};
-		send_msg(ci, B1D_OBJ_DISPLAY, B1D_EV_DISPLAY_INFO, w, 3);
-		break;
-	}
-	case B1D_REQ_DISPLAY_CREATE_SURFACE: {
-		if (n < 1)
-			return;
+static void create_surface(int ci, uint32_t id) {
 		int slot = -1;
 		for (int i = 0; i < MAX_SURFACES; i++)
 			if (!surfaces[i].used) { slot = i; break; }
-		if (slot < 0) {
-			send_err(ci, a[0], B1D_ERR_NO_RESOURCE);
+		if (slot < 0)
 			return;
-		}
 		struct dsurface *s = &surfaces[slot];
 		memset(s, 0, sizeof(*s));
 		s->used = 1;
-		s->id = a[0];
+		s->id = id;
 		s->client = ci;
 		s->placement = (unsigned)surfaces_created;
 		s->x = 48 + 40 * (surfaces_created % 8);
 		s->y = 48 + 32 * (surfaces_created % 8);
 		surfaces_created++;
 		zorder[zcount++] = slot;
-		break;
-	}
-	case B1D_REQ_DISPLAY_CREATE_BUFFER: {
-		if (n < 5)
+}
+
+static void create_toplevel(int ci, uint32_t id, uint32_t surface_id) {
+		struct dsurface *s = find_surface(ci, surface_id);
+		if (!s || surface_toplevel(s))
 			return;
-		uint32_t id = a[0], off = a[1], w = a[2], h = a[3], stride = a[4];
-		int passed_fd = clients[ci].pending_fd;
-		clients[ci].pending_fd = -1;
-		if (w == 0 || h == 0 || w > 2048 || h > 2048 || stride < w * 4 ||
-		    (uint64_t)off + (uint64_t)stride * h > 0x100000 ||
-		    passed_fd < 0) {
-			send_err(ci, id, B1D_ERR_BAD_BUFFER);
-			if (passed_fd >= 0)
-				close(passed_fd);
-			return;
-		}
-		int slot = -1;
-		for (int i = 0; i < MAX_BUFFERS; i++)
-			if (!buffers[i].used) { slot = i; break; }
-		if (slot < 0) {
-			send_err(ci, id, B1D_ERR_NO_RESOURCE);
-			close(passed_fd);
-			return;
-		}
-		size_t map_size = (size_t)off + (size_t)stride * h;
-		void *mem = mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
-		                 passed_fd, 0);
-		close(passed_fd);
-		if (mem == MAP_FAILED) {
-			send_err(ci, id, B1D_ERR_BAD_BUFFER);
-			return;
-		}
-		struct dbuffer *b = &buffers[slot];
-		b->used = 1;
-		b->id = id;
-		b->client = ci;
-		b->map_base = mem;
-		b->map_size = map_size;
-		b->mem = (uint8_t *)mem + off;
-		b->w = w;
-		b->h = h;
-		b->stride = stride;
-		break;
-	}
-	case B1D_REQ_DISPLAY_SYNC: {
-		if (n < 1)
-			return;
-		uint32_t w[1] = {frame_serial};
-		send_msg(ci, a[0], B1D_EV_CALLBACK_DONE, w, 1);
-		break;
-	}
-	case B1D_REQ_DISPLAY_SHUTDOWN:
-		running = 0;
-		break;
-	case B1D_REQ_DISPLAY_CREATE_TOPLEVEL: {
-		if (n < 2)
-			return;
-		struct dsurface *s = find_surface(ci, a[1]);
-		if (!s || surface_toplevel(s)) {
-			send_err(ci, a[0], B1D_ERR_BAD_OBJECT);
-			return;
-		}
 		int slot = -1;
 		for (int i = 0; i < MAX_TOPLEVELS; i++)
 			if (!toplevels[i].used) { slot = i; break; }
-		if (slot < 0) {
-			send_err(ci, a[0], B1D_ERR_NO_RESOURCE);
+		if (slot < 0)
 			return;
-		}
 		struct dtoplevel *t = &toplevels[slot];
 		memset(t, 0, sizeof(*t));
 		t->used = 1;
-		t->id = a[0];
+		t->id = id;
 		t->client = ci;
 		t->surface = s;
-		strcpy(t->title, "b1nix");
-		break;
-	}
-	case B1D_REQ_DISPLAY_CHECKSUM: {
-		if (n < 1)
-			return;
-		uint32_t sum = 2166136261u;
-		for (uint32_t y = 0; y < scr_h; y += 7)
-			for (uint32_t x = 0; x < scr_w; x += 7)
-				sum = (sum ^ fb[y * scr_w + x]) * 16777619u;
-		uint32_t w[1] = {sum};
-		send_msg(ci, a[0], B1D_EV_CALLBACK_VALUE, w, 1);
-		break;
-	}
-	default:
-		send_err(ci, B1D_OBJ_DISPLAY, B1D_ERR_BAD_REQUEST);
-	}
+		strcpy(t->title, "Wayland");
 }
 
-static void handle_toplevel_req(int ci, struct dtoplevel *t, uint16_t op,
-                                const uint32_t *a, unsigned n) {
-	struct dsurface *s = t->surface;
+static void surface_action(int ci, struct dsurface *s, uint16_t op,
+                           const uint32_t *a, unsigned n) {
 	switch (op) {
-	case B1D_REQ_TOPLEVEL_SET_TITLE: {
-		if (n < 1)
-			return;
-		unsigned len = a[0];
-		if (len > sizeof(t->title) - 1)
-			len = sizeof(t->title) - 1;
-		if (len > (n - 1) * 4)
-			len = (n - 1) * 4;
-		memcpy(t->title, &a[1], len);
-		t->title[len] = 0;
-		if (s->mapped) {
-			composite_surface_region(s);
-			if ((int)(s - surfaces) == focus_slot)
-				composite_rect(0, 0, (int)scr_w, PANEL_H);
-		}
-		break;
-	}
-	case B1D_REQ_TOPLEVEL_MOVE:
-		if (n < 3 || a[0] != input_serial)
-			return;
-		composite_surface_region(s);
-		s->x += (int32_t)a[1];
-		s->y += (int32_t)a[2];
-		composite_surface_region(s);
-		break;
-	case B1D_REQ_TOPLEVEL_RESIZE:
-		if (n < 3 || a[0] != input_serial || a[1] == 0 || a[2] == 0)
-			return;
-		{
-			uint32_t w[4] = {(uint32_t)s->x, (uint32_t)s->y, a[1], a[2]};
-			send_msg(ci, t->id, B1D_EV_TOPLEVEL_CONFIGURE, w, 4);
-		}
-		break;
-	case B1D_REQ_TOPLEVEL_DESTROY:
-		memset(t, 0, sizeof(*t));
-		if (s->mapped)
-			composite_surface_region(s);
-		break;
-	default:
-		send_err(ci, t->id, B1D_ERR_BAD_REQUEST);
-	}
-}
-
-static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
-                               const uint32_t *a, unsigned n) {
-	switch (op) {
-	case B1D_REQ_SURFACE_ATTACH:
+	case SURFACE_ATTACH:
 		if (n < 1)
 			return;
 		s->pend_buffer_id = a[0];
 		s->pend_attach = 1;
 		break;
-	case B1D_REQ_SURFACE_DAMAGE: {
+	case SURFACE_DAMAGE: {
 		if (n < 4)
 			return;
 		uint32_t x0 = a[0], y0 = a[1], x1 = a[0] + a[2], y1 = a[1] + a[3];
@@ -816,26 +911,23 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 		}
 		break;
 	}
-	case B1D_REQ_SURFACE_FRAME:
+	case SURFACE_FRAME:
 		if (n < 1)
 			return;
 		s->frame_cb = a[0];
 		s->has_frame_cb = 1;
 		break;
-	case B1D_REQ_SURFACE_COMMIT: {
+	case SURFACE_COMMIT: {
 		if (s->pend_attach) {
 			struct dbuffer *nb = find_buffer(ci, s->pend_buffer_id);
-			if (!nb) {
-				send_err(ci, s->id, B1D_ERR_BAD_BUFFER);
+			if (!nb)
 				return;
-			}
 			if (s->buf && s->buf != nb)
-				send_msg(ci, s->buf->id, B1D_EV_BUFFER_RELEASE, 0, 0);
+				send_msg(ci, s->buf->id, 0, 0, 0);
 			s->buf = nb;
 			s->pend_attach = 0;
-			if (!s->mapped && !s->has_pos) {
-				/* Give the default desktop apps distinct, useful positions.
-				 * A client that called SET_POSITION keeps its own spot. */
+			if (!s->mapped) {
+				/* Give the default desktop apps distinct, useful positions. */
 				if (s->placement == 0) {
 					s->x = 48;
 					s->y = 92;
@@ -856,14 +948,12 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 			struct dsurface *old = slot_surface(focus_slot);
 			if (old) {
 				uint32_t leave[1] = {old->id};
-				send_msg(old->client, B1D_OBJ_SEAT,
-				         B1D_EV_SEAT_FOCUS_LEAVE, leave, 1);
+				send_seat_event(old->client, SEAT_FOCUS_LEAVE, leave, 1);
 			}
 			focus_slot = (int)(s - surfaces);
 			zorder_raise(focus_slot);
 			uint32_t enter[1] = {s->id};
-			send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER,
-			         enter, 1);
+			send_seat_event(s->client, SEAT_FOCUS_ENTER, enter, 1);
 			if (old) {
 				composite_surface_region(old);
 			}
@@ -879,75 +969,237 @@ static void handle_surface_req(int ci, struct dsurface *s, uint16_t op,
 		frame_serial++;
 		if (s->has_frame_cb) {
 			uint32_t w[1] = {frame_serial};
-			send_msg(ci, s->frame_cb, B1D_EV_CALLBACK_DONE, w, 1);
+			send_msg(ci, s->frame_cb, 0, w, 1);
 			s->has_frame_cb = 0;
 		}
 		break;
 	}
-	case B1D_REQ_SURFACE_SET_POSITION: {
-		if (n < 2)
-			return;
-		int nx = (int32_t)a[0], ny = (int32_t)a[1];
-		if (s->mapped) {
-			int ox_pos = s->x;
-			int oy_pos = s->y;
-			s->x = nx;
-			s->y = ny;
-			int sw = s->buf ? (int)s->buf->w : 0;
-			int sh = s->buf ? (int)s->buf->h : 0;
-			int top = 1;
-			for (int i = 0; i < MAX_TOPLEVELS; i++)
-				if (toplevels[i].used && toplevels[i].surface == s)
-					top = TITLE_H;
-			composite_rect(ox_pos - 1, oy_pos - top, sw + 2, sh + top + 1);
-			composite_surface_region(s);
-		} else {
-			s->x = nx;
-			s->y = ny;
-			s->has_pos = 1;
-		}
-		break;
-	}
-	case B1D_REQ_SURFACE_DESTROY:
+	case SURFACE_DESTROY:
 		surface_destroy(s);
 		break;
 	default:
-		send_err(ci, s->id, B1D_ERR_BAD_REQUEST);
+		break;
 	}
 }
 
-static void handle_msg(int ci, const struct b1d_hdr *h, const uint32_t *args,
-                       unsigned nargs) {
-	if (h->object_id == B1D_OBJ_DISPLAY) {
-		handle_display_req(ci, h->opcode, args, nargs);
-		return;
+static void wl_registry_globals(int ci, uint32_t registry) {
+	static const struct {
+		uint32_t name;
+		const char *interface;
+		uint32_t version;
+	} globals[] = {
+	    {1, "wl_compositor", 4},
+	    {2, "wl_shm", 1},
+	    {3, "wl_seat", 5},
+	    {4, "xdg_wm_base", 1},
+	};
+	for (unsigned i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
+		uint32_t prefix = globals[i].name;
+		uint32_t suffix = globals[i].version;
+		wl_send_string(ci, registry, 0, &prefix, 1, globals[i].interface,
+		               &suffix, 1);
 	}
-	struct dsurface *s = find_surface(ci, h->object_id);
-	if (s) {
-		handle_surface_req(ci, s, h->opcode, args, nargs);
+}
+
+static void wl_surface_configure(int ci, struct wobject *xdg) {
+	struct dsurface *surface = find_surface(ci, xdg->link);
+	struct dtoplevel *t = surface ? surface_toplevel(surface) : 0;
+	if (!t)
 		return;
-	}
-	struct dbuffer *b = find_buffer(ci, h->object_id);
-	if (b) {
-		if (h->opcode == B1D_REQ_BUFFER_DESTROY) {
-			/* Unmap from any surface still showing it. */
-			for (int i = 0; i < MAX_SURFACES; i++)
-				if (surfaces[i].used && surfaces[i].buf == b) {
-					surfaces[i].buf = 0;
-					surfaces[i].mapped = 0;
-				}
-			buffer_destroy(b);
-		} else {
-			send_err(ci, h->object_id, B1D_ERR_BAD_REQUEST);
+	uint32_t top[3] = {0, 0, 0}; /* width, height, empty states array */
+	send_msg(ci, t->id, 0, top, 3);
+	uint32_t serial = ++frame_serial;
+	send_msg(ci, xdg->id, 0, &serial, 1);
+	xdg->configured = 1;
+}
+
+static void wl_create_buffer(int ci, struct wpool *pool, const uint32_t *a,
+                             unsigned n) {
+	if (n < 6 || (a[5] != 0 && a[5] != 1) || a[2] == 0 || a[3] == 0 ||
+	    a[4] < a[2] * 4 ||
+	    (uint64_t)a[1] + (uint64_t)a[4] * a[3] > pool->size)
+		return;
+	int slot = -1;
+	for (int i = 0; i < MAX_BUFFERS; i++)
+		if (!buffers[i].used) { slot = i; break; }
+	if (slot < 0)
+		return;
+	size_t map_size = (size_t)a[1] + (size_t)a[4] * a[3];
+	void *mem = mmap(0, map_size, PROT_READ | PROT_WRITE, MAP_SHARED,
+	                 pool->fd, 0);
+	if (mem == MAP_FAILED)
+		return;
+	struct dbuffer *b = &buffers[slot];
+	b->used = 1;
+	b->id = a[0];
+	b->client = ci;
+	b->map_base = mem;
+	b->map_size = map_size;
+	b->mem = (uint8_t *)mem + a[1];
+	b->w = a[2];
+	b->h = a[3];
+	b->stride = a[4];
+}
+
+static void handle_wayland_msg(int ci, const struct wl_hdr *h,
+                               const uint32_t *a, unsigned n) {
+	if (h->object_id == 1) {
+		if (h->opcode == 0 && n >= 1) {
+			uint32_t serial = frame_serial;
+			send_msg(ci, a[0], 0, &serial, 1);
+			wl_delete_id(ci, a[0]);
+		} else if (h->opcode == 1 && n >= 1 &&
+		           wobject_add(ci, a[0], WOBJ_REGISTRY, 0)) {
+			wl_registry_globals(ci, a[0]);
 		}
 		return;
 	}
-	struct dtoplevel *t = find_toplevel(ci, h->object_id);
-	if (t) {
-		handle_toplevel_req(ci, t, h->opcode, args, nargs);
+
+	struct dsurface *surface = find_surface(ci, h->object_id);
+	if (surface) {
+		if (h->opcode == 0)
+			surface_action(ci, surface, SURFACE_DESTROY, a, n);
+		else if (h->opcode == 1 && n >= 1)
+			surface_action(ci, surface, SURFACE_ATTACH, a, 1);
+		else if (h->opcode == 2 || h->opcode == 9)
+			surface_action(ci, surface, SURFACE_DAMAGE, a, n);
+		else if (h->opcode == 3)
+			surface_action(ci, surface, SURFACE_FRAME, a, n);
+		else if (h->opcode == 6) {
+			struct wobject *xdg = 0;
+			for (int i = 0; i < MAX_WOBJECTS; i++)
+				if (wobjects[i].used && wobjects[i].client == ci &&
+				    wobjects[i].type == WOBJ_XDG_SURFACE &&
+				    wobjects[i].link == surface->id)
+					xdg = &wobjects[i];
+			if (!surface->buf && xdg && !xdg->configured)
+				wl_surface_configure(ci, xdg);
+			else
+				surface_action(ci, surface, SURFACE_COMMIT, a, n);
+		}
 		return;
 	}
-	send_err(ci, h->object_id, B1D_ERR_BAD_OBJECT);
+
+	struct dbuffer *buffer = find_buffer(ci, h->object_id);
+	if (buffer) {
+		if (h->opcode == 0)
+			buffer_destroy(buffer);
+		return;
+	}
+
+	struct dtoplevel *top = find_toplevel(ci, h->object_id);
+	if (top) {
+		if (h->opcode == 0)
+			memset(top, 0, sizeof(*top));
+		else if (h->opcode == 2 && n >= 1) {
+			unsigned len = a[0];
+			if (len > sizeof(top->title))
+				len = sizeof(top->title);
+			if (len)
+				memcpy(top->title, &a[1], len - 1);
+			top->title[len ? len - 1 : 0] = 0;
+		}
+		return;
+	}
+
+	struct wpool *pool = wpool_find(ci, h->object_id);
+	if (pool) {
+		if (h->opcode == 0)
+			wl_create_buffer(ci, pool, a, n);
+		else if (h->opcode == 1) {
+			close(pool->fd);
+			memset(pool, 0, sizeof(*pool));
+			wl_delete_id(ci, h->object_id);
+		} else if (h->opcode == 2 && n >= 1 && a[0] > pool->size) {
+			pool->size = a[0];
+		}
+		return;
+	}
+
+	struct wobject *obj = wobject_find(ci, h->object_id);
+	if (!obj)
+		return;
+	switch (obj->type) {
+	case WOBJ_REGISTRY:
+		if (h->opcode == 0 && n >= 4) {
+			uint32_t new_id = a[n - 1];
+			enum wobject_type type;
+			if (a[0] == 1) type = WOBJ_COMPOSITOR;
+			else if (a[0] == 2) type = WOBJ_SHM;
+			else if (a[0] == 3) type = WOBJ_SEAT;
+			else if (a[0] == 4) type = WOBJ_XDG_WM_BASE;
+			else break;
+			if (wobject_add(ci, new_id, type, 0)) {
+				if (type == WOBJ_SHM) {
+					uint32_t format = 0;
+					send_msg(ci, new_id, 0, &format, 1);
+					format = 1;
+					send_msg(ci, new_id, 0, &format, 1);
+				} else if (type == WOBJ_SEAT) {
+					uint32_t capabilities = 3;
+					send_msg(ci, new_id, 0, &capabilities, 1);
+					wl_send_string(ci, new_id, 1, 0, 0, "b1nix", 0, 0);
+				}
+			}
+		}
+		break;
+	case WOBJ_COMPOSITOR:
+		if (h->opcode == 0 && n >= 1)
+			create_surface(ci, a[0]);
+		else if (h->opcode == 1 && n >= 1)
+			wobject_add(ci, a[0], WOBJ_REGION, 0);
+		break;
+	case WOBJ_SHM:
+		if (h->opcode == 0 && n >= 2 && clients[ci].pending_fd >= 0)
+			for (int i = 0; i < MAX_WPOOLS; i++)
+				if (!wpools[i].used) {
+					wpools[i].used = 1;
+					wpools[i].id = a[0];
+					wpools[i].client = ci;
+					wpools[i].fd = clients[ci].pending_fd;
+					wpools[i].size = a[1];
+					clients[ci].pending_fd = -1;
+					break;
+				}
+		break;
+	case WOBJ_XDG_WM_BASE:
+		if (h->opcode == 0)
+			wobject_remove(obj);
+		else if (h->opcode == 2 && n >= 2)
+			wobject_add(ci, a[0], WOBJ_XDG_SURFACE, a[1]);
+		break;
+	case WOBJ_XDG_SURFACE:
+		if (h->opcode == 0)
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 1) {
+			create_toplevel(ci, a[0], obj->link);
+			struct dtoplevel *created = find_toplevel(ci, a[0]);
+			if (created)
+				strcpy(created->title, "Wayland");
+		}
+		break;
+	case WOBJ_REGION:
+		if (h->opcode == 0)
+			wobject_remove(obj);
+		break;
+	case WOBJ_SEAT:
+		if (h->opcode == 0 && n >= 1)
+			wobject_add(ci, a[0], WOBJ_POINTER, 0);
+		else if (h->opcode == 1 && n >= 1) {
+			if (wobject_add(ci, a[0], WOBJ_KEYBOARD, 0))
+				keyboard_init(ci, a[0]);
+		}
+		else if (h->opcode == 3)
+			wobject_remove(obj);
+		break;
+	case WOBJ_POINTER:
+	case WOBJ_KEYBOARD:
+		if (h->opcode == 0)
+			wobject_remove(obj);
+		break;
+	default:
+		break;
+	}
 }
 
 static void client_data(int ci) {
@@ -976,25 +1228,40 @@ static void client_data(int ci) {
 		}
 	c->inlen += (unsigned)n;
 	for (;;) {
-		if (c->inlen < sizeof(struct b1d_hdr))
+		if (c->inlen < sizeof(struct wl_hdr))
 			break;
-		struct b1d_hdr h;
+		struct wl_hdr h;
 		memcpy(&h, c->inbuf, sizeof(h));
-		if (h.size < sizeof(h) || h.size > B1D_MAX_MSG || (h.size & 3)) {
+		if (h.size < sizeof(h) || h.size > MAX_MSG || (h.size & 3)) {
 			client_disconnect(ci);
 			return;
 		}
 		if (c->inlen < h.size)
 			break;
-		uint32_t args[(B1D_MAX_MSG - sizeof(struct b1d_hdr)) / 4];
+		uint32_t args[(MAX_MSG - sizeof(struct wl_hdr)) / 4];
 		unsigned nargs = (h.size - sizeof(h)) / 4;
 		memcpy(args, c->inbuf + sizeof(h), nargs * 4);
 		memmove(c->inbuf, c->inbuf + h.size, c->inlen - h.size);
 		c->inlen -= h.size;
-		handle_msg(ci, &h, args, nargs);
+		handle_wayland_msg(ci, &h, args, nargs);
 		if (!clients[ci].used)
 			return; /* disconnected during handling */
 	}
+}
+
+static void accept_client(int fd) {
+	int cfd = accept(fd, 0, 0);
+	if (cfd < 0)
+		return;
+	for (int i = 0; i < MAX_CLIENTS; i++)
+		if (!clients[i].used) {
+			clients[i].used = 1;
+			clients[i].fd = cfd;
+			clients[i].inlen = 0;
+			clients[i].pending_fd = -1;
+			return;
+		}
+	close(cfd);
 }
 
 /* ── input ── */
@@ -1019,7 +1286,7 @@ static void close_focused_window(void) {
 	struct dsurface *f = slot_surface(focus_slot);
 	struct dtoplevel *t = f ? surface_toplevel(f) : 0;
 	if (t)
-		send_msg(t->client, t->id, B1D_EV_TOPLEVEL_CLOSE, 0, 0);
+		send_msg(t->client, t->id, 1, 0, 0);
 }
 
 static void send_focused_shortcut(uint32_t key) {
@@ -1030,10 +1297,10 @@ static void send_focused_shortcut(uint32_t key) {
 	uint32_t key_down[2] = {key, 1};
 	uint32_t key_up[2] = {key, 0};
 	uint32_t ctrl_up[2] = {0x1d, 0};
-	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, ctrl_down, 2);
-	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, key_down, 2);
-	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, key_up, 2);
-	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, ctrl_up, 2);
+	send_seat_event(f->client, SEAT_KEY, ctrl_down, 2);
+	send_seat_event(f->client, SEAT_KEY, key_down, 2);
+	send_seat_event(f->client, SEAT_KEY, key_up, 2);
+	send_seat_event(f->client, SEAT_KEY, ctrl_up, 2);
 }
 
 static void close_panel_menu(void) {
@@ -1128,16 +1395,16 @@ static void pointer_moved(void) {
 		struct dsurface *old = slot_surface(enter_slot);
 		if (old) {
 			uint32_t w[1] = {old->id};
-			send_msg(old->client, B1D_OBJ_SEAT, B1D_EV_SEAT_POINTER_LEAVE, w, 1);
+			send_seat_event(old->client, SEAT_POINTER_LEAVE, w, 1);
 		}
 		if (s) {
 			uint32_t w[3] = {s->id, (uint32_t)(px - s->x), (uint32_t)(py - s->y)};
-			send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_POINTER_ENTER, w, 3);
+			send_seat_event(s->client, SEAT_POINTER_ENTER, w, 3);
 		}
 		enter_slot = slot;
 	} else if (s) {
 		uint32_t w[2] = {(uint32_t)(px - s->x), (uint32_t)(py - s->y)};
-		send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_POINTER_MOTION, w, 2);
+		send_seat_event(s->client, SEAT_POINTER_MOTION, w, 2);
 	}
 }
 
@@ -1186,11 +1453,11 @@ static void pointer_button(uint16_t code, int state) {
 			struct dsurface *old = slot_surface(focus_slot);
 			if (old) {
 				uint32_t w[1] = {old->id};
-				send_msg(old->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_LEAVE, w, 1);
+				send_seat_event(old->client, SEAT_FOCUS_LEAVE, w, 1);
 			}
 			focus_slot = slot;
 			uint32_t w[1] = {s->id};
-			send_msg(s->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER, w, 1);
+			send_seat_event(s->client, SEAT_FOCUS_ENTER, w, 1);
 			zorder_raise(slot);
 			if (old) {
 				composite_surface_region(old);
@@ -1202,7 +1469,7 @@ static void pointer_button(uint16_t code, int state) {
 			on_decoration = 1;
 			if (px >= s->x + (int)s->buf->w - 16) {
 				struct dtoplevel *t = surface_toplevel(s);
-				send_msg(t->client, t->id, B1D_EV_TOPLEVEL_CLOSE, 0, 0);
+				send_msg(t->client, t->id, 1, 0, 0);
 			} else {
 				drag_slot = slot;
 			}
@@ -1221,7 +1488,7 @@ static void pointer_button(uint16_t code, int state) {
 	struct dsurface *f = slot_surface(focus_slot);
 	if (f) {
 		uint32_t w[2] = {code, (uint32_t)state};
-		send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_POINTER_BUTTON, w, 2);
+		send_seat_event(f->client, SEAT_POINTER_BUTTON, w, 2);
 	}
 }
 
@@ -1239,12 +1506,12 @@ static void focus_cycle(void) {
 	struct dsurface *old = slot_surface(focus_slot);
 	if (old) {
 		uint32_t w[1] = {old->id};
-		send_msg(old->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_LEAVE, w, 1);
+		send_seat_event(old->client, SEAT_FOCUS_LEAVE, w, 1);
 	}
 	focus_slot = slot;
 	zorder_raise(slot);
 	uint32_t w[1] = {next->id};
-	send_msg(next->client, B1D_OBJ_SEAT, B1D_EV_SEAT_FOCUS_ENTER, w, 1);
+	send_seat_event(next->client, SEAT_FOCUS_ENTER, w, 1);
 	if (old) {
 		composite_surface_region(old);
 	}
@@ -1284,11 +1551,11 @@ static void input_drain(int which) {
 							struct dtoplevel *t = surface_toplevel(f);
 							if (t)
 								send_msg(t->client, t->id,
-								         B1D_EV_TOPLEVEL_CLOSE, 0, 0);
+								         1, 0, 0);
 							continue;
 						}
 						uint32_t w[2] = {e->code, (uint32_t)e->value};
-						send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, w, 2);
+						send_seat_event(f->client, SEAT_KEY, w, 2);
 					}
 				}
 				continue;
@@ -1422,7 +1689,7 @@ int main(int argc, char **argv) {
 	ev_fds[0] = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
 	ev_fds[1] = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
 
-	unlink(B1D_SOCKET_PATH);
+	unlink(WAYLAND_SOCKET_PATH);
 	listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (listen_fd < 0) {
 		out("displayd: socket failed\n");
@@ -1431,7 +1698,7 @@ int main(int argc, char **argv) {
 	struct sockaddr_un addr;
 	memset(&addr, 0, sizeof(addr));
 	addr.sun_family = AF_UNIX;
-	strcpy(addr.sun_path, B1D_SOCKET_PATH);
+	strcpy(addr.sun_path, WAYLAND_SOCKET_PATH);
 	if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
 	    listen(listen_fd, MAX_CLIENTS) < 0) {
 		out("displayd: bind/listen failed\n");
@@ -1474,22 +1741,8 @@ int main(int argc, char **argv) {
 		if (pr < 0)
 			continue;
 
-		if (pfds[0].revents & POLLIN) {
-			int cfd = accept(listen_fd, 0, 0);
-			if (cfd >= 0) {
-				int slot = -1;
-				for (int i = 0; i < MAX_CLIENTS; i++)
-					if (!clients[i].used) { slot = i; break; }
-				if (slot < 0) {
-					close(cfd);
-				} else {
-					clients[slot].used = 1;
-					clients[slot].fd = cfd;
-					clients[slot].inlen = 0;
-					clients[slot].pending_fd = -1;
-				}
-			}
-		}
+		if (pfds[0].revents & POLLIN)
+			accept_client(listen_fd);
 		if (pfds[1].revents & POLLIN)
 			input_drain(0);
 		if (pfds[2].revents & POLLIN)
@@ -1502,7 +1755,7 @@ int main(int argc, char **argv) {
 
 	for (int i = 0; i < MAX_CLIENTS; i++)
 		client_disconnect(i);
-	unlink(B1D_SOCKET_PATH);
+	unlink(WAYLAND_SOCKET_PATH);
 	out("displayd: bye\n");
 	return 0;
 }

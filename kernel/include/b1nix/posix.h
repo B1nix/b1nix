@@ -206,6 +206,7 @@ struct b1nix_statfs {
 #define B1NIX_POLLNVAL 0x020
 
 #define B1NIX_MSG_PEEK 0x02
+#define B1NIX_MSG_DONTWAIT 0x40
 
 struct b1nix_pollfd {
   int fd;

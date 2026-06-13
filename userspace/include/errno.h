@@ -58,6 +58,7 @@ int normalize_errno(long rc);
 #define EDESTADDRREQ    89      /* Destination address required */
 #define EMSGSIZE        90      /* Message too long */
 #define EPROTOTYPE      91      /* Protocol wrong type for socket */
+#define EPROTO          71      /* Protocol error */
 #define ENOPROTOOPT     92      /* Protocol not available */
 #define EPROTONOSUPPORT 93      /* Protocol not supported */
 #define ESOCKTNOSUPPORT 94      /* Socket type not supported */

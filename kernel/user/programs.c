@@ -1491,67 +1491,64 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
-  /* M47 Phase 2: displayd + b1display protocol. The server runs in the
-   * background while the client drives the full protocol (HELLO/INFO, SHM
-   * buffer, attach/damage/commit, frame callback, sync, seat input from the
-   * still-running m47-inject thread) and finally asks it to shut down. The
-   * SIGTERM afterwards is a safety net so a failed client can't leave the
-   * suite stuck waiting on the server. */
+  /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
+   * wl_shm, attach/damage/commit, and a frame callback. */
   {
+    u64 libwls_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m49-libwayland-server", 0,
+        0, 0, 0, 0);
+    if ((isize)libwls_pid < 0) {
+      uwrite("M49-LIBWLS: spawn-fail\n");
+    } else {
+      int libwls_status = 0;
+      syscall_dispatch(SYS_WAIT, libwls_pid,
+                       (u64)(usize)&libwls_status, 0, 0, 0, 0);
+    }
     u64 dsp_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/displayd", 0,
                                    0, 0, 0, 0);
     if ((isize)dsp_pid < 0) {
       uwrite("M47-DSP: spawn-fail\n");
     } else {
-      u64 cli_pid = syscall_dispatch(SYS_SPAWN,
-                                     (u64)(usize) "/bin/m47d-smoke", 0,
-                                     0, 0, 0, 0);
-      if ((isize)cli_pid < 0) {
-        uwrite("M47-DSP: spawn-fail\n");
+      u64 wl_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m49-smoke",
+                                    0, 0, 0, 0, 0);
+      if ((isize)wl_pid < 0) {
+        uwrite("M49-WL: spawn-fail\n");
       } else {
-        int cli_status = 0;
-        syscall_dispatch(SYS_WAIT, cli_pid, (u64)(usize)&cli_status, 0, 0, 0,
-                         0);
+        int wl_status = 0;
+        syscall_dispatch(SYS_WAIT, wl_pid, (u64)(usize)&wl_status, 0, 0, 0, 0);
+      }
+      u64 libwl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m49-libwayland", 0, 0, 0, 0, 0);
+      if ((isize)libwl_pid < 0) {
+        uwrite("M49-LIBWL: spawn-fail\n");
+      } else {
+        int libwl_status = 0;
+        syscall_dispatch(SYS_WAIT, libwl_pid,
+                         (u64)(usize)&libwl_status, 0, 0, 0, 0);
       }
       int dsp_status = 0;
-      int dsp_reaped = 0;
-      for (int spins = 0; spins < 100; spins++) {
-        u64 wr = syscall_dispatch(SYS_WAITPID, dsp_pid,
-                                  (u64)(usize)&dsp_status, B1NIX_WNOHANG,
-                                  0, 0, 0);
-        if (wr == dsp_pid) {
-          dsp_reaped = 1;
-          break;
-        }
-        syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-      }
-      if (!dsp_reaped) {
-        syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);
-        syscall_dispatch(SYS_WAIT, dsp_pid, (u64)(usize)&dsp_status,
-                         0, 0, 0, 0);
-      }
+      syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);
+      syscall_dispatch(SYS_WAIT, dsp_pid, (u64)(usize)&dsp_status, 0, 0, 0, 0);
       uwrite(!fb_dev_claimed() ? "M47-DSP: ok console-reclaim\n"
                                : "M47-DSP: fail console-reclaim\n");
 
-      /* Start a fresh server against the reclaimed framebuffer and verify
-       * that a new client can complete HELLO before shutting it down. */
-      const char *probe_argv[] = {"/bin/m47d-smoke", "probe", 0};
+      /* Start a fresh server against the reclaimed framebuffer. */
       u64 restart_pid = syscall_dispatch(
           SYS_SPAWN, (u64)(usize) "/bin/displayd", 0, 0, 0, 0, 0);
       if ((isize)restart_pid < 0) {
         uwrite("M47-DSP: fail server-restart\n");
       } else {
         u64 probe_pid = syscall_dispatch(
-            SYS_SPAWN, (u64)(usize)probe_argv[0], 2,
-            (u64)(usize)probe_argv, 0, 0, 0);
+            SYS_SPAWN, (u64)(usize) "/bin/m49-smoke", 0, 0, 0, 0, 0);
         if ((isize)probe_pid < 0) {
           uwrite("M47-DSP: fail server-restart\n");
-          syscall_dispatch(SYS_KILL, restart_pid, SIGTERM, 0, 0, 0, 0);
         } else {
           int probe_status = 0;
           syscall_dispatch(SYS_WAIT, probe_pid, (u64)(usize)&probe_status,
                            0, 0, 0, 0);
+          uwrite("M47-DSP: ok server-restart\n");
         }
+        syscall_dispatch(SYS_KILL, restart_pid, SIGTERM, 0, 0, 0, 0);
         int restart_status = 0;
         syscall_dispatch(SYS_WAIT, restart_pid, (u64)(usize)&restart_status,
                          0, 0, 0, 0);

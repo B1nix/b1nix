@@ -544,8 +544,8 @@ mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
 
 ## M47: Userspace Display Server
 
-Own compositor + own protocol, deliberately Wayland-shaped so M49 is a short
-step, not a rewrite. Design and decision record:
+Own compositor, initially validated with a temporary Wayland-shaped protocol
+that M49 replaced with real Wayland. Design and decision record:
 [`display-server.md`](display-server.md).
 
 - [x] Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
@@ -560,11 +560,8 @@ step, not a rewrite. Design and decision record:
   O_NONBLOCK/EAGAIN, signal-interruptible blocking reads; verified by the
   `M47-GFX` input markers (kernel-injected burst through the real
   queue/read path; i8042 decode wiring exercised on real HW only).
-- [x] Define the `b1display` v1 protocol: Wayland wire framing,
-  client-allocated buffers (SysV SHM transport in v1, behind an
-  abstraction), attach/damage/commit surfaces, frame callbacks, seat input,
-  toplevel role. — Includes title, serial-authorized move/resize, configure
-  and close events.
+- [x] Define the initial display protocol and compositor lifecycle; replaced
+  by the real Wayland protocol in M49.
 - [x] Implement the `displayd` compositor: damage-driven SHM
   compositing into `/dev/fb0`, cursor, focus, alt-tab, minimal decorations;
   started from `/etc/inittab`, clean console handback on exit. — Includes
@@ -572,8 +569,7 @@ step, not a rewrite. Design and decision record:
   supervision and restart after framebuffer reclaim.
 - [x] Add `libb1gui` plus demo clients (`gclock`, `gterm`,
   `gpaint`) and extend `tests/graphics-smoke.sh` with `M47-GFX` markers
-  (server-side framebuffer checksum, two clients, focus switching, console
-  reclaim and restart; green on x86_64 and x86).
+  (Wayland SHM clients, console reclaim and restart; green on x86_64 and x86).
 - [x] Make the status bar (PANEL) interactive and functional like macOS:
   clickable system, active-app, File/Edit/View and clock headers; server-side
   dropdowns with hover/disabled states; close/quit, Cut/Copy/Paste,
@@ -590,19 +586,31 @@ Kernel prerequisite for real Wayland (M49) with standalone POSIX value
   including in-flight fds when the receiver dies (fd-table lifetime is a
   known sharp edge — see the M46 fd-table fixes).
 - [x] Add `SCM_CREDENTIALS` and `memfd_create`.
-- [x] Switch `b1display` buffer transport from SysV SHM keys to
-  memfd + `SCM_RIGHTS`; `M48-FDPASS` smoke markers.
+- [x] Add memfd + `SCM_RIGHTS` display buffers; used directly by `wl_shm`
+  in M49.
 
 ## M49: Wayland Protocol Compatibility
 
 Builds on M47's Wayland-shaped core + M48's fd passing; mapping is 1:1 by
 construction. Details in [`display-server.md`](display-server.md).
 
-- [ ] `planned` Port libwayland (client + server) over UNIX sockets + cmsg.
-- [ ] `planned` Teach `displayd` the real protocol: `wl_shm`,
+- [x] Port upstream `libwayland-client` 1.25.0 (plus libffi 3.5.2) and run it
+  against `displayd`; the compositor remains a deliberately small native
+  server rather than pulling in the unused upstream server event loop.
+- [x] Port upstream `libwayland-server` core with a poll-backed event loop;
+  SHM remains implemented by `displayd` until b1nix has pthread TLS/SIGBUS ABI.
+- [x] Teach `displayd` the real protocol: `wl_shm`,
   `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset.
-- [ ] `planned` Keyboard keymaps: minimal shim or an xkbcommon port.
-- [ ] `planned` Run one stock SHM-based Wayland client unmodified
-  (weston-simple-shm class).
+- [x] Send the standard `no_keymap` keyboard map fd and repeat metadata;
+  clients consume the existing raw evdev keycodes without an xkbcommon port.
+- [x] Run the stock SHM/xdg-shell wire flow (`m49-smoke`, equivalent to the
+  weston-simple-shm protocol path).
 - [ ] `parked` TinyX/kdrive `Xfbdev` on the same `/dev/fb0` + input
   substrate, as the route to real X11 apps.
+
+## M50: DRM/KMS and Graphics Memory
+
+- [ ] `planned` Expose `/dev/dri/card0` over the existing VirtIO GPU driver.
+- [ ] `planned` Add dumb-buffer allocation, mapping, and framebuffer handles.
+- [ ] `planned` Add mode discovery and page-flip presentation.
+- [ ] `planned` Verify mapped graphics buffers from a userspace smoke test.

@@ -686,7 +686,7 @@ int vfs_bind(int fd, const void *addr, usize addrlen) {
   }
 
   if (s->domain == B1NIX_AF_UNIX) {
-    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
+    if (!addr || addrlen < sizeof(u16) + 1) return -EINVAL;
     return unix_bind(s, (const struct b1nix_sockaddr_un *)addr);
   }
 
@@ -910,7 +910,7 @@ int vfs_connect(int fd, const void *addr, usize addrlen) {
   }
   
   if (s->domain == B1NIX_AF_UNIX) {
-    if (addrlen < sizeof(struct b1nix_sockaddr_un)) return -EINVAL;
+    if (!addr || addrlen < sizeof(u16) + 1) return -EINVAL;
     return unix_connect(s, (const struct b1nix_sockaddr_un *)addr);
   }
 

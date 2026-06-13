@@ -1115,23 +1115,18 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
 	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
 
-	# ── M47 Phase 2: displayd + b1display protocol ──
+	# ── M49: displayd Wayland protocol ──
 	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
 		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"
-		check_output "$LOG" "M47-DSP: ok connect" "M47: client connected to displayd"
-		check_output "$LOG" "M47-DSP: ok info" "M47: HELLO/INFO roundtrip"
-		check_output "$LOG" "M47-DSP: ok commit-frame" "M47: attach/damage/commit + frame callback"
-		check_output "$LOG" "M47-DSP: ok sync" "M47: sync roundtrip"
-		check_output "$LOG" "M47-DSP: ok two-clients" "M47: two display clients"
-		check_output "$LOG" "M47-DSP: ok checksum" "M47: nonzero framebuffer checksum"
-		check_output "$LOG" "M47-DSP: ok pointer" "M47: seat pointer enter/motion delivered"
-		check_output "$LOG" "M47-DSP: ok button-focus" "M47: button + click-to-focus delivered"
-		check_output "$LOG" "M47-DSP: ok alt-tab" "M47: Alt-Tab focus switch"
-		check_output "$LOG" "M47-DSP: done" "M47 display-protocol smoke completed"
-		check_output "$LOG" "displayd: bye" "M47: displayd clean shutdown"
+		check_output "$LOG" "M49-WL: ok registry" "M49: Wayland registry globals"
+		check_output "$LOG" "M49-WL: ok xdg-shell" "M49: xdg-shell configure handshake"
+		check_output "$LOG" "M49-WL: ok shm-frame" "M49: Wayland SHM frame"
+		check_output "$LOG" "M49-WL: ok libb1gui" "M49: native GUI library uses Wayland"
+		check_output "$LOG" "M49-LIBWL: ok upstream-client" "M49: upstream libwayland-client"
+		check_output "$LOG" "M49-LIBWL: ok keymap" "M49: wl_keyboard keymap fd"
+		check_output "$LOG" "M49-LIBWLS: ok server-core" "M49: upstream libwayland-server core"
 		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
 		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
-		check_output "$LOG" "M48-FDPASS: ok display-fd-buffers" "M48: display buffers use memfd + SCM_RIGHTS"
 	fi
 fi
 

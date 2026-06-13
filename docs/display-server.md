@@ -4,9 +4,9 @@ Decision record and phased plan for graphics/windowing in b1nix.
 
 ## Decision
 
-Write our **own userspace display server speaking our own protocol** (M47),
-but shape the protocol after Wayland's core concepts so that real Wayland
-compatibility (M49) is a short follow-up, not a rewrite. Porting was rejected:
+Write our own userspace compositor, then speak the real Wayland protocol.
+M47 used a temporary Wayland-shaped protocol to validate the compositor;
+M49 removed it rather than maintaining two wire formats.
 
 - **Full X.org**: the server itself plus the dependency pyramid
   (pixman, libX11/libxcb, xkbcommon/xkbcomp, freetype/fontconfig) is an
@@ -30,9 +30,9 @@ transfer/flush path), `kernel/dev/video.c`, an in-kernel `compositor.c`
 (~500 lines, becomes the console fallback), `ps2_kbd.c`/`ps2_mouse.c`,
 SysV SHM, UNIX sockets, poll/select, pthreads, mmap.
 
-M48 now provides `sendmsg`/`recvmsg`, `SCM_RIGHTS`, `SCM_CREDENTIALS`, and
-`memfd_create`. The display protocol uses memfd-backed buffers passed over its
-UNIX socket, leaving the M49 libwayland/protocol work as the next layer.
+M48 provides `sendmsg`/`recvmsg`, `SCM_RIGHTS`, `SCM_CREDENTIALS`, and
+`memfd_create`. Wayland `wl_shm` uses memfd-backed buffers over
+`/run/wayland-0`.
 
 ## M47: Userspace Display Server
 
@@ -83,19 +83,11 @@ smoke suite, single-CPU and `-smp 4`). What landed vs. the plan below:
 
 ### Phase 2 — protocol + server
 
-Status: implemented and smoke-tested on x86_64 and x86. `b1display` v1 has
-Wayland-style object framing, SysV-SHM buffers, surface attach/damage/commit,
-frame and sync callbacks, seat pointer/keyboard/focus events, and a toplevel
-role with title, serial-authorized move/resize and close events. `displayd`
-is a single-threaded UNIX-socket compositor with damage-driven framebuffer
-updates, a software cursor, click-to-focus/raise, draggable title bars,
-`Alt+Tab`, `Alt+F4`, and server-side decorations. It is available as an
+Status: the compositor work landed in M47; its temporary protocol was removed
+in M49. `displayd` is a single-threaded Wayland compositor with damage-driven
+framebuffer updates, a software cursor, click-to-focus/raise, draggable title
+bars, `Alt+Tab`, `Alt+F4`, and server-side decorations. It is available as an
 inittab-supervised runlevel-5 service.
-
-The M47 smoke starts the server and two independent protocol clients, verifies
-SHM composition, callbacks, framebuffer checksum, pointer/button focus and
-`Alt+Tab`, requests a clean shutdown, checks scanout handback to the kernel
-compositor, then starts a second server and completes another handshake.
 
 #### Desktop-integration fixes (interactive `make run-graphics`)
 
@@ -118,10 +110,6 @@ synthetic input injector) surfaced four issues, all now fixed:
   presence detection, and tolerates late/stale ACKs. The "stray block" in the
   middle of the screen was simply displayd's cursor stuck at its start
   position because no motion events were arriving.
-- **`SURFACE_SET_POSITION` request added** so a client can place its own
-  window (used by the smoke client to sit under the cursor; available to
-  desktop apps for explicit layout). Server placement applies only when no
-  explicit position was requested.
 - **macOS-style top bar:** the panel now shows `b1nix` + the focused app's
   title on the left and a live `HH:MM` clock (RTC, repainted on the minute)
   flush right. System, active-app, File/Edit/View, and clock headers open
@@ -130,25 +118,6 @@ synthetic input injector) surfaced four issues, all now fixed:
   track pointer hover, switch while traversing the bar, and dismiss on
   click-away or Escape. Title-bar dragging is clamped so a window can't be
   lost under the bar or off-screen.
-
-`b1display` protocol v1 over a UNIX socket (`/run/b1display.sock`).
-**Wayland-shaped on purpose** — these constraints are load-bearing for M49:
-
-- Wire format: little-endian 8-byte header (object id u32, opcode u16,
-  size u16) + arguments — exactly Wayland's framing.
-- Object model: client-allocated object ids, requests (client→server) and
-  events (server→client), explicit destructors.
-- Buffers are **always client-allocated**; the server never hands out
-  drawing surfaces. v1 transport: SysV SHM key + offset (M48 switches this
-  to fd passing; the transport sits behind one small abstraction).
-- Surface lifecycle: `attach(buffer)` → `damage(x,y,w,h)` → `commit`;
-  nothing is visible until commit (atomic updates, like `wl_surface`).
-- `frame` callback for client-driven redraw pacing (no server-side timers
-  per client).
-- `seat` abstraction for input: enter/leave + focus, keyboard events with
-  serials, pointer events in surface-local coordinates.
-- Toplevel role (`xdg_toplevel` analog): title, move/resize initiated via
-  input serials, close event.
 
 `displayd` server (userspace, single-threaded poll loop):
 
@@ -162,17 +131,14 @@ synthetic input injector) surfaced four issues, all now fixed:
 ### Phase 3 — client library + apps + smoke
 
 - Status: implemented and green on x86_64 and x86.
-- `libb1gui`: connection handling, object marshalling, SHM buffer helper,
-  damage/commit/frame helpers, simple event dispatch.
+- `libb1gui`: Wayland connection/registry handling, object marshalling,
+  `wl_shm` buffer helper, damage/commit/frame helpers, simple event dispatch.
 - Demo clients: `gclock` (animated frame callbacks), `gterm` (shell over the
   existing `forkpty` layer with raw-key input), and `gpaint` (pointer-driven
   drawing).
 - Smoke: `tests/graphics-smoke.sh` (QEMU with `-device
-  virtio-gpu-pci`, headless). Pixel correctness is verified server-side: the
-  server returns a composited framebuffer checksum, so no screenshot is
-  needed over serial. The test verifies fb mmap/flush, input delivery,
-  commit/frame callbacks, two clients, checksum, click focus, `Alt+Tab`,
-  console reclaim and server restart.
+  virtio-gpu-pci`, headless). It verifies Wayland registry, xdg-shell,
+  `wl_shm`, frame callbacks, `libb1gui`, console reclaim, and server restart.
 
 ## M48: FD Passing and Anonymous Shared Memory
 
@@ -190,23 +156,26 @@ the only one (dbus-style daemons, dropbear privilege separation).
 - `SCM_CREDENTIALS` (cheap once the cmsg plumbing exists; lets the server
   identify clients).
 - `memfd_create` (anonymous mmap-able file, no sealing needed for v1).
-- Switch the `b1display` buffer transport from SysV SHM keys to
-  memfd + `SCM_RIGHTS` (the abstraction from M47 Phase 2 makes this a
-  contained change). Markers: `M48-FDPASS:` `ok scm-rights`,
-  `ok scm-refcount-close`, `ok memfd`, `ok display-fd-buffers`.
+- Display buffers use memfd + `SCM_RIGHTS` through Wayland `wl_shm`.
 
-## M49: Wayland Protocol Compatibility (planned)
+## M49: Wayland Protocol Compatibility
 
 With M47's Wayland-shaped core and M48's fd passing in place:
 
-- Port libwayland (client + server); needs only UNIX sockets + cmsg + an
-  epoll-shim over poll. Run `wayland-scanner` on the host at build time.
-- Teach `displayd` the real protocol: `wl_display`, `wl_registry`, `wl_shm`,
-  `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset —
-  each maps 1:1 onto a `b1display` concept by construction.
-- Keyboard: minimal keymap shim or an xkbcommon port (xkbcommon is
-  self-contained C, no X dependency — the realistic choice).
-- Success criterion: one stock SHM-based Wayland client runs unmodified
-  (e.g. weston-simple-shm class).
+- `displayd` speaks `wl_display`, `wl_registry`, `wl_shm`,
+  `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset on
+  `/run/wayland-0`.
+- `libb1gui` and all bundled GUI applications use Wayland exclusively.
+- The temporary M47 protocol, socket, header, and smoke client are deleted.
+- Upstream `libwayland-client` 1.25.0 is ported and covered by boot smoke;
+  `libb1gui` and the native compositor also marshal the standard wire format
+  directly.
+- Upstream `libwayland-server` core is also ported with a poll-backed event
+  loop; `displayd` stays native because replacing working compositor policy
+  would add risk without changing protocol compatibility.
+- Keyboard uses the standard `no_keymap` fd event, raw evdev keycodes, and
+  repeat metadata; xkbcommon is unnecessary until layouts compose symbols.
+- Smoke covers the stock SHM/xdg-shell protocol path and a `libb1gui` client
+  on x86_64 and x86.
 - Parked alternative for X11 apps: TinyX/kdrive `Xfbdev` on the same
   `/dev/fb0` + input substrate.

@@ -1,4 +1,3 @@
-#include <b1nix/display.h>
 #include <b1nix/gui.h>
 #include <b1nix/input.h>
 #include <stdint.h>
@@ -361,11 +360,12 @@ int main(int argc, char **argv) {
 
 	// Query kernel version dynamically
 	struct utsname uts;
-	char os_ver[32] = "0.47.0";
-	char kernel_ver_str[64] = "0.47.0 #1 SMP";
+	char os_ver[32] = "unknown";
+	char kernel_ver_str[64] = "unknown";
 	if (uname(&uts) == 0) {
-		strncpy(os_ver, uts.release, sizeof(os_ver));
-		snprintf(kernel_ver_str, sizeof(kernel_ver_str), "%s #1 SMP", uts.release);
+		snprintf(os_ver, sizeof(os_ver), "%s", uts.release);
+		snprintf(kernel_ver_str, sizeof(kernel_ver_str), "%s %s",
+		         uts.release, uts.version);
 	}
 
 	int has_gpu = (strcmp(gpu_model, "Basic Framebuffer") != 0 || gpu_vram[0]);
@@ -462,7 +462,7 @@ int main(int argc, char **argv) {
 
 					draw_section(&win, dy, "System");
 					dy += 14;
-					draw_detail_row(&win, dy, "OS     :", "b1nix Tahoe");
+					draw_detail_row(&win, dy, "OS     :", "b1nix");
 					dy += 12;
 					draw_detail_row(&win, dy, "Kernel :", kernel_ver_str);
 					dy += 12;
@@ -509,17 +509,16 @@ int main(int argc, char **argv) {
 		struct b1gui_event event;
 		int status = b1gui_next_event(&win, &event, 500);
 		if (status == 1) {
-			if (event.object_id == win.toplevel_id &&
-			    event.opcode == B1D_EV_TOPLEVEL_CLOSE) {
+			if (event.type == B1GUI_EV_CLOSE) {
 				break;
 			}
 
-			if (event.object_id == B1D_OBJ_SEAT) {
-				if ((event.opcode == B1D_EV_SEAT_POINTER_ENTER ||
-				     event.opcode == B1D_EV_SEAT_POINTER_MOTION) &&
+			{
+				if ((event.type == B1GUI_EV_POINTER_ENTER ||
+				     event.type == B1GUI_EV_POINTER_MOTION) &&
 				    event.nargs >= 2) {
-					int ex = (int)event.args[event.opcode == B1D_EV_SEAT_POINTER_ENTER ? 1 : 0];
-					int ey = (int)event.args[event.opcode == B1D_EV_SEAT_POINTER_ENTER ? 2 : 1];
+					int ex = (int)event.args[0];
+					int ey = (int)event.args[1];
 					px = ex;
 					py = ey;
 
@@ -538,7 +537,7 @@ int main(int argc, char **argv) {
 						hover = new_hover;
 						needs_redraw = 1;
 					}
-				} else if (event.opcode == B1D_EV_SEAT_POINTER_BUTTON &&
+				} else if (event.type == B1GUI_EV_POINTER_BUTTON &&
 				           event.nargs >= 2 && event.args[0] == B1NIX_BTN_LEFT && event.args[1] != 0) {
 					if (strcmp(mode, "b1nix") == 0) {
 						if (!show_details) {
@@ -559,7 +558,7 @@ int main(int argc, char **argv) {
 							break;
 						}
 					}
-				} else if (event.opcode == B1D_EV_SEAT_KEY && event.nargs >= 2) {
+				} else if (event.type == B1GUI_EV_KEY && event.nargs >= 2) {
 					uint32_t keycode = event.args[0];
 					uint32_t state = event.args[1];
 					if (state != 0 && (keycode == 0x01 || keycode == 0x1c)) { // ESC or Enter
