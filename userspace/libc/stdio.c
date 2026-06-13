@@ -7,9 +7,9 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
-static FILE _stdin = {0, 0, 0, 0, 0, 0};
-static FILE _stdout = {1, 0, 0, 0, 0, 0};
-static FILE _stderr = {2, 0, 0, 0, 0, 0};
+static FILE _stdin = {.fd = 0};
+static FILE _stdout = {.fd = 1};
+static FILE _stderr = {.fd = 2};
 
 FILE *stdin = &_stdin;
 FILE *stdout = &_stdout;
@@ -73,7 +73,7 @@ FILE *fopen(const char *pathname, const char *mode) {
   if (fd < 0)
     return NULL;
 
-  FILE *f = malloc(sizeof(FILE));
+  FILE *f = calloc(1, sizeof(FILE)); /* zero ms_* and all fields */
   if (!f) {
     close(fd);
     return NULL;
@@ -109,7 +109,7 @@ FILE *fdopen(int fd, const char *mode) {
   (void)mode;
   if (fd < 0)
     return NULL;
-  FILE *f = malloc(sizeof(FILE));
+  FILE *f = calloc(1, sizeof(FILE)); /* zero ms_* and all fields */
   if (!f)
     return NULL;
   f->fd = fd;
@@ -175,11 +175,71 @@ int pclose(FILE *stream) {
 int fclose(FILE *stream) {
   if (!stream)
     return -1;
+  if (stream->ms_active) {
+    /* Finalize the caller-owned buffer; do NOT free ms_buf (the caller owns it
+     * after close per open_memstream(3)). */
+    if (stream->ms_userbuf)
+      *stream->ms_userbuf = stream->ms_buf;
+    if (stream->ms_usersize)
+      *stream->ms_usersize = stream->ms_size;
+    free(stream);
+    return 0;
+  }
   int res = close(stream->fd);
   if (stream != stdin && stream != stdout && stream != stderr) {
     free(stream);
   }
   return res;
+}
+
+/* Single write funnel: routes to the open_memstream heap buffer when active,
+ * otherwise to the fd. Returns bytes written, or -1 on error. */
+long _file_write(FILE *f, const void *buf, size_t n) {
+  if (f->ms_active) {
+    if (f->ms_size + n + 1 > f->ms_cap) {
+      size_t cap = f->ms_cap ? f->ms_cap : 64;
+      while (f->ms_size + n + 1 > cap)
+        cap *= 2;
+      char *nb = (char *)realloc(f->ms_buf, cap);
+      if (!nb) {
+        f->error = 1;
+        return -1;
+      }
+      f->ms_buf = nb;
+      f->ms_cap = cap;
+    }
+    memcpy(f->ms_buf + f->ms_size, buf, n);
+    f->ms_size += n;
+    f->ms_buf[f->ms_size] = '\0';
+    if (f->ms_userbuf)
+      *f->ms_userbuf = f->ms_buf;
+    if (f->ms_usersize)
+      *f->ms_usersize = f->ms_size;
+    return (long)n;
+  }
+  return write(f->fd, buf, n);
+}
+
+FILE *open_memstream(char **bufp, size_t *sizep) {
+  if (!bufp || !sizep)
+    return NULL;
+  FILE *f = (FILE *)calloc(1, sizeof(FILE));
+  if (!f)
+    return NULL;
+  f->fd = -1;
+  f->ms_active = 1;
+  f->ms_cap = 64;
+  f->ms_buf = (char *)malloc(f->ms_cap);
+  if (!f->ms_buf) {
+    free(f);
+    return NULL;
+  }
+  f->ms_buf[0] = '\0';
+  f->ms_userbuf = bufp;
+  f->ms_usersize = sizep;
+  *bufp = f->ms_buf;
+  *sizep = 0;
+  return f;
 }
 
 int fputs(const char *s, FILE *stream) {
@@ -188,7 +248,7 @@ int fputs(const char *s, FILE *stream) {
   int len = strlen(s);
   if (len == 0)
     return 0;
-  int n = write(stream->fd, s, len);
+  long n = _file_write(stream, s, len);
   if (n < 0) {
     stream->error = 1;
     return EOF;
@@ -229,7 +289,7 @@ size_t fread(void *ptr, size_t size, size_t nmemb, FILE *stream) {
 size_t fwrite(const void *ptr, size_t size, size_t nmemb, FILE *stream) {
   if (!stream || size == 0 || nmemb == 0)
     return 0;
-  int n = write(stream->fd, ptr, size * nmemb);
+  long n = _file_write(stream, ptr, size * nmemb);
   if (n < 0) {
     stream->error = 1;
     return 0;
@@ -293,8 +353,14 @@ off_t ftello(FILE *stream) {
 }
 
 int fflush(FILE *stream) {
-  // No buffering yet, so fflush is a no-op
-  (void)stream;
+  /* Memstreams publish the current buffer/size to the caller's pointers;
+   * fd streams are unbuffered so flush is a no-op. */
+  if (stream && stream->ms_active) {
+    if (stream->ms_userbuf)
+      *stream->ms_userbuf = stream->ms_buf;
+    if (stream->ms_usersize)
+      *stream->ms_usersize = stream->ms_size;
+  }
   return 0;
 }
 
@@ -316,7 +382,7 @@ int fprintf(FILE *stream, const char *fmt, ...) {
   va_end(args);
 
   if (stream && n > 0) {
-    write(stream->fd, buf, n);
+    _file_write(stream, buf, n);
   }
   return n;
 }
@@ -325,7 +391,7 @@ int vfprintf(FILE *stream, const char *fmt, va_list ap) {
   char buf[512];
   int n = vsnprintf(buf, sizeof(buf), fmt, ap);
   if (stream && n > 0) {
-    write(stream->fd, buf, n);
+    _file_write(stream, buf, n);
   }
   return n;
 }

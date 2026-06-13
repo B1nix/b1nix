@@ -60,6 +60,7 @@ struct timespec {
 
 int clock_gettime(int clk_id, struct timespec *tp);
 int nanosleep(const struct timespec *req, struct timespec *rem);
+int clock_nanosleep(int clk_id, int flags, const struct timespec *req, struct timespec *rem);
 
 struct tm *localtime_r(const time_t *timep, struct tm *result);
 struct tm *gmtime_r(const time_t *timep, struct tm *result);

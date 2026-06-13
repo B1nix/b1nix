@@ -89,6 +89,7 @@ float floorf(float);
 float ceilf(float);
 float truncf(float);
 float roundf(float);
+float rintf(float);
 float fmodf(float, float);
 float logf(float);
 float log2f(float);
@@ -113,5 +114,12 @@ long double strtold(const char *nptr, char **endptr);
 #ifdef __cplusplus
 }
 #endif
+
+
+/* round-to-nearest-integer (in libm) */
+long lrint(double);
+long lrintf(float);
+long long llrint(double);
+long long llrintf(float);
 
 #endif

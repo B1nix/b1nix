@@ -22,6 +22,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <time.h>
 #include <unistd.h>
 
 #define DEFAULT_STACK_SIZE (256 * 1024)
@@ -66,6 +67,8 @@ struct pthread_state {
 
 /* ── Internal trampoline ── */
 
+void __pthread_tsd_run_dtors(void); /* defined with the TSD code below */
+
 static void pthread_bootstrap(void *raw) {
   struct pthread_state *st = (struct pthread_state *)raw;
 
@@ -76,6 +79,7 @@ static void pthread_bootstrap(void *raw) {
 
   void *r = st->start_routine(st->arg);
   st->retval = r;
+  __pthread_tsd_run_dtors(); /* POSIX: TSD destructors run at thread exit */
   if (st->detached) {
     /* Detached: nobody will join us. Unmap the user stack and free state
      * BEFORE exit — exit_thread doesn't return, so this is the last
@@ -147,6 +151,7 @@ void pthread_exit(void *retval) {
    * Issue a thread-only exit; if this is the main thread, the kernel
    * treats it as a process exit. */
   (void)retval;
+  __pthread_tsd_run_dtors(); /* POSIX: TSD destructors run at thread exit */
   syscall(SYS_EXIT_THREAD, 0);
   __builtin_unreachable();
 }
@@ -393,4 +398,218 @@ int pthread_attr_init(pthread_attr_t *a) {
 int pthread_attr_destroy(pthread_attr_t *a) {
   (void)a;
   return 0;
+}
+
+/* ── Thread-specific data (TLS keys) + timed mutex lock ──────────────────────
+ * ponytail: fixed table — PTHREAD_KEYS_MAX keys x TSD_MAX_THREADS threads,
+ * linear tid scan, one global lock. Right for ports like Mesa (a handful of
+ * keys, few worker threads). Grow the bounds or switch to a real TLS slab if a
+ * future port needs many threads/keys. */
+#define TSD_MAX_THREADS 64
+
+static struct {
+  int used;
+  void (*dtor)(void *);
+} g_keys[PTHREAD_KEYS_MAX];
+
+static struct tsd_thread {
+  long tid;
+  int in_use;
+  const void *vals[PTHREAD_KEYS_MAX];
+} g_tsd[TSD_MAX_THREADS];
+
+static pthread_mutex_t g_tsd_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct tsd_thread *tsd_find(long tid, int create) {
+  struct tsd_thread *spare = NULL;
+  for (int i = 0; i < TSD_MAX_THREADS; i++) {
+    if (g_tsd[i].in_use && g_tsd[i].tid == tid)
+      return &g_tsd[i];
+    if (!g_tsd[i].in_use && !spare)
+      spare = &g_tsd[i];
+  }
+  if (create && spare) {
+    spare->tid = tid;
+    spare->in_use = 1;
+    for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
+      spare->vals[k] = NULL;
+    return spare;
+  }
+  return NULL;
+}
+
+int pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
+  pthread_mutex_lock(&g_tsd_lock);
+  for (unsigned i = 0; i < PTHREAD_KEYS_MAX; i++) {
+    if (!g_keys[i].used) {
+      g_keys[i].used = 1;
+      g_keys[i].dtor = destructor;
+      *key = i;
+      pthread_mutex_unlock(&g_tsd_lock);
+      return 0;
+    }
+  }
+  pthread_mutex_unlock(&g_tsd_lock);
+  return EAGAIN;
+}
+
+int pthread_key_delete(pthread_key_t key) {
+  if (key >= PTHREAD_KEYS_MAX)
+    return EINVAL;
+  pthread_mutex_lock(&g_tsd_lock);
+  g_keys[key].used = 0;
+  g_keys[key].dtor = NULL;
+  for (int i = 0; i < TSD_MAX_THREADS; i++)
+    if (g_tsd[i].in_use)
+      g_tsd[i].vals[key] = NULL;
+  pthread_mutex_unlock(&g_tsd_lock);
+  return 0;
+}
+
+int pthread_setspecific(pthread_key_t key, const void *value) {
+  if (key >= PTHREAD_KEYS_MAX || !g_keys[key].used)
+    return EINVAL;
+  long tid = (long)pthread_self();
+  pthread_mutex_lock(&g_tsd_lock);
+  struct tsd_thread *t = tsd_find(tid, 1);
+  int rc = t ? 0 : ENOMEM;
+  if (t)
+    t->vals[key] = value;
+  pthread_mutex_unlock(&g_tsd_lock);
+  return rc;
+}
+
+void *pthread_getspecific(pthread_key_t key) {
+  if (key >= PTHREAD_KEYS_MAX)
+    return NULL;
+  long tid = (long)pthread_self();
+  pthread_mutex_lock(&g_tsd_lock);
+  struct tsd_thread *t = tsd_find(tid, 0);
+  void *v = t ? (void *)t->vals[key] : NULL;
+  pthread_mutex_unlock(&g_tsd_lock);
+  return v;
+}
+
+/* Run the calling thread's TSD destructors and free its slot. Called from
+ * pthread_exit(). POSIX iterates destructors a bounded number of times because
+ * a destructor may set new values. */
+void __pthread_tsd_run_dtors(void) {
+  long tid = (long)pthread_self();
+  for (int iter = 0; iter < PTHREAD_DESTRUCTOR_ITERATIONS; iter++) {
+    int ran = 0;
+    pthread_mutex_lock(&g_tsd_lock);
+    struct tsd_thread *t = tsd_find(tid, 0);
+    if (!t) {
+      pthread_mutex_unlock(&g_tsd_lock);
+      return;
+    }
+    for (unsigned k = 0; k < PTHREAD_KEYS_MAX; k++) {
+      void *v = (void *)t->vals[k];
+      if (v && g_keys[k].used && g_keys[k].dtor) {
+        void (*dtor)(void *) = g_keys[k].dtor;
+        t->vals[k] = NULL;
+        pthread_mutex_unlock(&g_tsd_lock);
+        dtor(v); /* may re-enter pthread_*; must not hold the lock */
+        ran = 1;
+        pthread_mutex_lock(&g_tsd_lock);
+        t = tsd_find(tid, 0);
+        if (!t)
+          break;
+      }
+    }
+    pthread_mutex_unlock(&g_tsd_lock);
+    if (!ran)
+      break;
+  }
+  pthread_mutex_lock(&g_tsd_lock);
+  struct tsd_thread *t = tsd_find(tid, 0);
+  if (t)
+    t->in_use = 0;
+  pthread_mutex_unlock(&g_tsd_lock);
+}
+
+int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *abstime) {
+  if (pthread_mutex_trylock(m) == 0)
+    return 0;
+  for (;;) {
+    struct timespec now;
+    clock_gettime(CLOCK_REALTIME, &now);
+    if (abstime && (now.tv_sec > abstime->tv_sec ||
+                    (now.tv_sec == abstime->tv_sec &&
+                     now.tv_nsec >= abstime->tv_nsec)))
+      return ETIMEDOUT;
+    struct timespec nap = {0, 1000000}; /* 1 ms */
+    nanosleep(&nap, NULL);
+    if (pthread_mutex_trylock(m) == 0)
+      return 0;
+  }
+}
+
+/* ── Barrier ── (mutex + condvar; phase counter avoids lost wakeups) */
+int pthread_barrier_init(pthread_barrier_t *b, const pthread_barrierattr_t *attr,
+                         unsigned count) {
+  (void)attr;
+  if (!b || count == 0)
+    return EINVAL;
+  pthread_mutex_init(&b->lock, NULL);
+  pthread_cond_init(&b->cond, NULL);
+  b->count = count;
+  b->waiting = 0;
+  b->phase = 0;
+  return 0;
+}
+
+int pthread_barrier_destroy(pthread_barrier_t *b) {
+  if (!b)
+    return EINVAL;
+  pthread_mutex_destroy(&b->lock);
+  pthread_cond_destroy(&b->cond);
+  return 0;
+}
+
+int pthread_barrier_wait(pthread_barrier_t *b) {
+  if (!b)
+    return EINVAL;
+  pthread_mutex_lock(&b->lock);
+  unsigned phase = b->phase;
+  if (++b->waiting == b->count) {
+    b->phase++;
+    b->waiting = 0;
+    pthread_cond_broadcast(&b->cond);
+    pthread_mutex_unlock(&b->lock);
+    return PTHREAD_BARRIER_SERIAL_THREAD;
+  }
+  while (phase == b->phase)
+    pthread_cond_wait(&b->cond, &b->lock);
+  pthread_mutex_unlock(&b->lock);
+  return 0;
+}
+
+/* ── Read-write lock ── (mutex-backed)
+ * ponytail: a single mutex serializes readers too — correct but no read
+ * parallelism. Right for a 1-worker software renderer; swap for a real
+ * reader-count + writer rwlock if a port becomes read-contended. */
+int pthread_rwlock_init(pthread_rwlock_t *rw, const pthread_rwlockattr_t *attr) {
+  (void)attr;
+  if (!rw)
+    return EINVAL;
+  return pthread_mutex_init(&rw->mtx, NULL);
+}
+int pthread_rwlock_destroy(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_destroy(&rw->mtx) : EINVAL;
+}
+int pthread_rwlock_rdlock(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_lock(&rw->mtx) : EINVAL;
+}
+int pthread_rwlock_wrlock(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_lock(&rw->mtx) : EINVAL;
+}
+int pthread_rwlock_tryrdlock(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_trylock(&rw->mtx) : EINVAL;
+}
+int pthread_rwlock_trywrlock(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_trylock(&rw->mtx) : EINVAL;
+}
+int pthread_rwlock_unlock(pthread_rwlock_t *rw) {
+  return rw ? pthread_mutex_unlock(&rw->mtx) : EINVAL;
 }

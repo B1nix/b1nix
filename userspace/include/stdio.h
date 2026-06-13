@@ -19,6 +19,15 @@ typedef struct {
     int unget_buf;
     int has_unget;
     int pipe_pid;
+    /* open_memstream(3): when ms_active, writes append to a grown heap buffer
+     * instead of fd, and the caller's buf/size pointers track it. Zero on
+     * normal streams (partial {0,...} init leaves these clear). */
+    int ms_active;
+    char *ms_buf;
+    size_t ms_size;
+    size_t ms_cap;
+    char **ms_userbuf;
+    size_t *ms_usersize;
 } FILE;
 
 extern FILE *stdin;
@@ -39,6 +48,7 @@ int vdprintf(int fd, const char *format, va_list ap);
 int vfprintf(FILE *stream, const char *fmt, va_list ap);
 int vsnprintf(char *str, size_t size, const char *fmt, va_list ap);
 
+FILE *open_memstream(char **bufp, size_t *sizep);
 FILE *fopen(const char *pathname, const char *mode);
 FILE *freopen(const char *pathname, const char *mode, FILE *stream);
 FILE *fdopen(int fd, const char *mode);

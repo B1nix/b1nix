@@ -193,6 +193,12 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
 int lchown(const char *path, uid_t owner, gid_t group);
 
 #define _SC_CLK_TCK 2
+#define _SC_PAGESIZE 30
+#define _SC_PAGE_SIZE _SC_PAGESIZE
+#define _SC_NPROCESSORS_CONF 83
+#define _SC_NPROCESSORS_ONLN 84
+#define _SC_PHYS_PAGES 85
+#define _SC_AVPHYS_PAGES 86
 long sysconf(int name);
 
 extern char *optarg;

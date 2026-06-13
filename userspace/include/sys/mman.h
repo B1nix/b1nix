@@ -15,7 +15,8 @@
 
 #define MAP_FAILED      ((void *)-1)
 
-#define MFD_CLOEXEC     0x0001U
+#define MFD_CLOEXEC       0x0001U
+#define MFD_ALLOW_SEALING 0x0002U
 
 #ifdef __cplusplus
 extern "C" {

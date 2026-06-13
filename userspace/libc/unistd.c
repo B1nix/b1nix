@@ -1408,11 +1408,31 @@ int sigsuspend(const sigset_t *mask) {
 }
 
 long sysconf(int name) {
-  if (name == _SC_CLK_TCK) {
+  switch (name) {
+  case _SC_CLK_TCK:
     return 100;
+  case _SC_PAGESIZE:
+    return 4096;
+  case _SC_NPROCESSORS_CONF:
+  case _SC_NPROCESSORS_ONLN:
+    /* ponytail: report 1 — no userspace CPU-count primitive yet, and a single
+     * worker is plenty for a software renderer. Wire to /sys/.../cpu/online if
+     * a port ever needs real parallelism. */
+    return 1;
+  case _SC_PHYS_PAGES:
+  case _SC_AVPHYS_PAGES: {
+    struct sysinfo si;
+    if (sysinfo(&si) == 0) {
+      unsigned long unit = si.mem_unit ? si.mem_unit : 1;
+      unsigned long ram = (name == _SC_PHYS_PAGES) ? si.totalram : si.freeram;
+      return (long)((ram * unit) / 4096UL);
+    }
+    return -1;
   }
-  errno = EINVAL;
-  return -1;
+  default:
+    errno = EINVAL;
+    return -1;
+  }
 }
 
 clock_t times(struct tms *buf) {
@@ -1504,4 +1524,29 @@ int sysinfo(struct sysinfo *info) {
     return -1;
   }
   return _check_err(syscall(SYS_SYSINFO, info));
+}
+
+/* sched_yield(2): hand the CPU to another runnable task. Backs the C11
+ * thrd_yield() that Mesa and other threaded ports use. */
+int sched_yield(void) {
+  syscall(SYS_YIELD);
+  return 0;
+}
+
+/* clock_nanosleep(2): relative (flags==0) defers to nanosleep; TIMER_ABSTIME
+ * sleeps until the absolute deadline by subtracting the current clock. */
+int clock_nanosleep(int clk_id, int flags, const struct timespec *req,
+                    struct timespec *rem) {
+  if (!req)
+    return EINVAL;
+  if (flags == 0)
+    return nanosleep(req, rem) == 0 ? 0 : errno;
+  struct timespec now, delta;
+  if (clock_gettime(clk_id, &now) != 0)
+    return errno;
+  delta.tv_sec = req->tv_sec - now.tv_sec;
+  delta.tv_nsec = req->tv_nsec - now.tv_nsec;
+  if (delta.tv_nsec < 0) { delta.tv_sec--; delta.tv_nsec += 1000000000L; }
+  if (delta.tv_sec < 0) return 0;
+  return nanosleep(&delta, rem) == 0 ? 0 : errno;
 }

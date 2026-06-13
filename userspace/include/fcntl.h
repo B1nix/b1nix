@@ -51,3 +51,12 @@ int fcntl(int fd, int cmd, ...);
 #endif
 
 #endif
+
+/* memfd file sealing (fcntl). Constants for ports that seal memfds; b1nix may
+ * reject the operation at runtime, which callers like Mesa handle gracefully. */
+#define F_ADD_SEALS   1033
+#define F_GET_SEALS   1034
+#define F_SEAL_SEAL   0x0001
+#define F_SEAL_SHRINK 0x0002
+#define F_SEAL_GROW   0x0004
+#define F_SEAL_WRITE  0x0008

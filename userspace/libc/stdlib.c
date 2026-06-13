@@ -1265,3 +1265,24 @@ char *mkdtemp(char *tmpl) {
 	errno = EEXIST;
 	return NULL;
 }
+
+/* posix_memalign / aligned_alloc. b1nix malloc already returns 16-byte aligned
+ * payloads, which satisfies SSE2 (the only vector ISA b1nix enables — no AVX).
+ * ponytail: alignments > 16 still get 16-byte alignment, keeping the result
+ * free()-compatible (callers like Mesa free aligned memory with plain free()).
+ * Upgrade the allocator if a port ever needs strict >16-byte alignment. */
+int posix_memalign(void **memptr, size_t alignment, size_t size) {
+  if (!memptr || (alignment & (alignment - 1)) != 0 ||
+      alignment % sizeof(void *) != 0)
+    return EINVAL;
+  void *p = malloc(size ? size : 1);
+  if (!p)
+    return ENOMEM;
+  *memptr = p;
+  return 0;
+}
+
+void *aligned_alloc(size_t alignment, size_t size) {
+  (void)alignment;
+  return malloc(size ? size : 1);
+}
