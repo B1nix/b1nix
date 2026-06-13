@@ -574,7 +574,10 @@ step, not a rewrite. Design and decision record:
   `gpaint`) and extend `tests/graphics-smoke.sh` with `M47-GFX` markers
   (server-side framebuffer checksum, two clients, focus switching, console
   reclaim and restart; green on x86_64 and x86).
-- [ ] `planned` Make the status bar (PANEL) interactive and functional like macOS (e.g. clickable system menu on the logo/clock, dropdown menu headers, active application settings, etc.).
+- [x] Make the status bar (PANEL) interactive and functional like macOS:
+  clickable system, active-app, File/Edit/View and clock headers; server-side
+  dropdowns with hover/disabled states; close/quit, Cut/Copy/Paste,
+  next-window and bring-to-front actions; click-away and Escape dismissal.
 
 ## M48: UNIX-Socket FD Passing and memfd
 

@@ -124,8 +124,12 @@ synthetic input injector) surfaced four issues, all now fixed:
   explicit position was requested.
 - **macOS-style top bar:** the panel now shows `b1nix` + the focused app's
   title on the left and a live `HH:MM` clock (RTC, repainted on the minute)
-  flush right; title-bar dragging is clamped so a window can't be lost under
-  the bar or off-screen.
+  flush right. System, active-app, File/Edit/View, and clock headers open
+  server-rendered dropdowns; supported actions close/quit windows, dispatch
+  Cut/Copy/Paste shortcuts, cycle focus, and raise the active window. Menus
+  track pointer hover, switch while traversing the bar, and dismiss on
+  click-away or Escape. Title-bar dragging is clamped so a window can't be
+  lost under the bar or off-screen.
 
 `b1display` protocol v1 over a UNIX socket (`/run/b1display.sock`).
 **Wayland-shaped on purpose** — these constraints are load-bearing for M49:

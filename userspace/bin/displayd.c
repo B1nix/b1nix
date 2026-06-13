@@ -46,6 +46,13 @@
 #define TITLE_FOCUS_COLOR 0x005078B0u
 #define PANEL_H 28
 #define PANEL_COLOR 0x00111924u
+#define PANEL_ACTIVE_COLOR 0x00354A5Du
+#define MENU_BG_COLOR 0x00E8EDF1u
+#define MENU_TEXT_COLOR 0x00131A20u
+#define MENU_DISABLED_COLOR 0x00828B92u
+#define MENU_HOVER_COLOR 0x003D78B5u
+#define MENU_ITEM_H 18
+#define MENU_W 176
 #define CLOSE_COLOR 0x00E05263u
 
 static void out(const char *s) { write(1, s, strlen(s)); }
@@ -121,6 +128,19 @@ static int surfaces_created;
 static char clock_hhmm[6] = "--:--";
 static int clock_last_min = -1;
 
+enum panel_menu {
+	MENU_NONE,
+	MENU_SYSTEM,
+	MENU_APP,
+	MENU_FILE,
+	MENU_EDIT,
+	MENU_VIEW,
+	MENU_CLOCK,
+};
+
+static enum panel_menu open_menu;
+static int menu_hover = -1;
+
 /* pointer state */
 static int px, py;
 static int enter_slot = -1; /* surface slot pointer is inside, -1 none */
@@ -189,6 +209,189 @@ static const char *active_app_title(void) {
 	return "Finder";
 }
 
+struct panel_layout {
+	int system_x, system_w;
+	int app_x, app_w;
+	int file_x, file_w;
+	int edit_x, edit_w;
+	int view_x, view_w;
+	int clock_x, clock_w;
+};
+
+static int text_len(const char *s, int limit) {
+	int n = 0;
+	while (s[n] && n < limit)
+		n++;
+	return n;
+}
+
+static struct panel_layout get_panel_layout(void) {
+	struct panel_layout p;
+	int app_chars = text_len(active_app_title(), 14);
+	p.system_x = 6;
+	p.system_w = 6 * 8 + 8;
+	p.app_x = p.system_x + p.system_w;
+	p.app_w = app_chars * 8 + 16;
+	p.file_x = p.app_x + p.app_w;
+	p.file_w = 6 * 8;
+	p.edit_x = p.file_x + p.file_w;
+	p.edit_w = 6 * 8;
+	p.view_x = p.edit_x + p.edit_w;
+	p.view_w = 6 * 8;
+	p.clock_w = 5 * 8 + 16;
+	p.clock_x = (int)scr_w - p.clock_w - 4;
+	return p;
+}
+
+static int menu_item_count(enum panel_menu menu) {
+	switch (menu) {
+	case MENU_SYSTEM: return 4;
+	case MENU_APP: return 3;
+	case MENU_FILE: return 2;
+	case MENU_EDIT: return 3;
+	case MENU_VIEW: return 2;
+	case MENU_CLOCK: return 3;
+	default: return 0;
+	}
+}
+
+static const char *menu_item_label(enum panel_menu menu, int item) {
+	switch (menu) {
+	case MENU_SYSTEM: {
+		static const char *labels[] = {
+		    "About b1nix", "Desktop", "Next Window", "Close Window"};
+		return labels[item];
+	}
+	case MENU_APP: {
+		static const char *labels[] = {
+		    "About This App", "Next Window", "Quit"};
+		return labels[item];
+	}
+	case MENU_FILE: {
+		static const char *labels[] = {"Close Window", "Quit"};
+		return labels[item];
+	}
+	case MENU_EDIT: {
+		static const char *labels[] = {"Cut", "Copy", "Paste"};
+		return labels[item];
+	}
+	case MENU_VIEW: {
+		static const char *labels[] = {"Next Window", "Bring to Front"};
+		return labels[item];
+	}
+	case MENU_CLOCK: {
+		static const char *labels[] = {
+		    "Date & Time", "24-hour clock", "b1nix local time"};
+		return labels[item];
+	}
+	default:
+		return "";
+	}
+}
+
+static int menu_item_enabled(enum panel_menu menu, int item) {
+	if (menu == MENU_CLOCK)
+		return 0;
+	if ((menu == MENU_APP || menu == MENU_FILE || menu == MENU_EDIT) &&
+	    !slot_surface(focus_slot))
+		return 0;
+	if (menu == MENU_SYSTEM && (item == 0 || item == 1))
+		return 0;
+	return 1;
+}
+
+static int menu_x(enum panel_menu menu) {
+	struct panel_layout p = get_panel_layout();
+	int x;
+	switch (menu) {
+	case MENU_SYSTEM: x = p.system_x; break;
+	case MENU_APP: x = p.app_x; break;
+	case MENU_FILE: x = p.file_x; break;
+	case MENU_EDIT: x = p.edit_x; break;
+	case MENU_VIEW: x = p.view_x; break;
+	case MENU_CLOCK: x = p.clock_x + p.clock_w - MENU_W; break;
+	default: x = 0; break;
+	}
+	if (x + MENU_W > (int)scr_w)
+		x = (int)scr_w - MENU_W;
+	if (x < 0)
+		x = 0;
+	return x;
+}
+
+static int menu_h(enum panel_menu menu) {
+	return menu_item_count(menu) * MENU_ITEM_H + 8;
+}
+
+static enum panel_menu panel_menu_at(int x) {
+	struct panel_layout p = get_panel_layout();
+	if (x >= p.system_x && x < p.system_x + p.system_w)
+		return MENU_SYSTEM;
+	if (x >= p.app_x && x < p.app_x + p.app_w)
+		return MENU_APP;
+	if (x >= p.file_x && x < p.file_x + p.file_w && x < p.clock_x)
+		return MENU_FILE;
+	if (x >= p.edit_x && x < p.edit_x + p.edit_w && x < p.clock_x)
+		return MENU_EDIT;
+	if (x >= p.view_x && x < p.view_x + p.view_w && x < p.clock_x)
+		return MENU_VIEW;
+	if (x >= p.clock_x && x < p.clock_x + p.clock_w)
+		return MENU_CLOCK;
+	return MENU_NONE;
+}
+
+static int menu_item_at(int x, int y) {
+	if (open_menu == MENU_NONE || x < menu_x(open_menu) ||
+	    x >= menu_x(open_menu) + MENU_W || y < PANEL_H + 4 ||
+	    y >= PANEL_H + menu_h(open_menu) - 4)
+		return -1;
+	int item = (y - PANEL_H - 4) / MENU_ITEM_H;
+	return item < menu_item_count(open_menu) ? item : -1;
+}
+
+static void draw_panel_overlay(int rx, int ry, int rw, int rh) {
+	if (open_menu == MENU_NONE)
+		return;
+	int mx = menu_x(open_menu);
+	int mh = menu_h(open_menu);
+	int x0 = mx - 2, x1 = mx + MENU_W + 3;
+	int y0 = PANEL_H, y1 = PANEL_H + mh + 3;
+	for (int y = ry; y < ry + rh; y++) {
+		if (y < y0 || y >= y1)
+			continue;
+		uint32_t *row = fb + (uint32_t)y * scr_w;
+		for (int x = rx; x < rx + rw; x++) {
+			if (x < x0 || x >= x1)
+				continue;
+			if (x >= mx + 3 && x < mx + MENU_W + 3 &&
+			    y >= PANEL_H + 3)
+				row[x] = 0x00060A0Du;
+			if (x >= mx && x < mx + MENU_W &&
+			    y < PANEL_H + mh) {
+				int border = x == mx || x == mx + MENU_W - 1 ||
+				             y == PANEL_H || y == PANEL_H + mh - 1;
+				row[x] = border ? 0x006B7780u : MENU_BG_COLOR;
+			}
+		}
+		for (int item = 0; item < menu_item_count(open_menu); item++) {
+			int iy = PANEL_H + 4 + item * MENU_ITEM_H;
+			if (y < iy || y >= iy + MENU_ITEM_H)
+				continue;
+			int enabled = menu_item_enabled(open_menu, item);
+			if (enabled && item == menu_hover)
+				for (int x = mx + 4; x < mx + MENU_W - 4; x++)
+					if (x >= rx && x < rx + rw)
+						row[x] = MENU_HOVER_COLOR;
+			uint32_t color = !enabled ? MENU_DISABLED_COLOR
+			                         : item == menu_hover
+			                               ? 0x00FFFFFFu
+			                               : MENU_TEXT_COLOR;
+			draw_text_clipped(row, y, rx, rw, mx + 12, iy + 5,
+			                  menu_item_label(open_menu, item), color);
+		}
+	}
+}
+
 static void composite_rect(int rx, int ry, int rw, int rh) {
 	if (rx < 0) { rw += rx; rx = 0; }
 	if (ry < 0) { rh += ry; ry = 0; }
@@ -197,17 +400,14 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 	if ((uint32_t)(rx + rw) > scr_w) rw = (int)scr_w - rx;
 	if ((uint32_t)(ry + rh) > scr_h) rh = (int)scr_h - ry;
 
-	/* macOS-style top bar layout, computed once for this rect's panel rows:
-	 *   [● b1nix]  [ActiveApp]  File  Edit  View ............ [HH:MM]
-	 * The bullet + b1nix is the system menu, ActiveApp is the focused
-	 * window's title, the File/Edit/View labels are display-only for now,
-	 * and the clock sits flush right. */
-	const char *app = active_app_title();
-	int app_x = 12 + (5 + 1) * 8;          /* after "b1nix " */
-	int applen = 0;
-	while (app[applen] && applen < 18) applen++;
-	int menu_x = app_x + (applen + 1) * 8;
-	int clock_x = (int)scr_w - (5 * 8) - 12; /* "HH:MM" flush right */
+	/* macOS-style top bar. The focused application's title becomes its menu,
+	 * with common server-owned menus alongside it and the clock flush right. */
+	const char *active_app = active_app_title();
+	char app[15];
+	int app_len = text_len(active_app, 14);
+	memcpy(app, active_app, (size_t)app_len);
+	app[app_len] = 0;
+	struct panel_layout panel = get_panel_layout();
 
 	/* background */
 	for (int y = ry; y < ry + rh; y++) {
@@ -219,12 +419,37 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 			                      : (BG_COLOR + (shade << 8) + shade + glow);
 		}
 		if (y < PANEL_H) {
-			draw_text_clipped(row, y, rx, rw, 12, 10, "b1nix", 0x00DCE8F2u);
-			draw_text_clipped(row, y, rx, rw, app_x, 10, app, 0x00F4F7FAu);
-			draw_text_clipped(row, y, rx, rw, menu_x, 10,
-			                  "File  Edit  View", 0x008DA5B8u);
-			draw_text_clipped(row, y, rx, rw, clock_x, 10, clock_hhmm,
-			                  0x00DCE8F2u);
+			struct {
+				enum panel_menu menu;
+				int x, w;
+				const char *label;
+				uint32_t color;
+			} headers[] = {
+			    {MENU_SYSTEM, panel.system_x, panel.system_w, "b1nix",
+			     0x00DCE8F2u},
+			    {MENU_APP, panel.app_x, panel.app_w, app, 0x00F4F7FAu},
+			    {MENU_FILE, panel.file_x, panel.file_w, "File",
+			     0x00DCE8F2u},
+			    {MENU_EDIT, panel.edit_x, panel.edit_w, "Edit",
+			     0x00DCE8F2u},
+			    {MENU_VIEW, panel.view_x, panel.view_w, "View",
+			     0x00DCE8F2u},
+			    {MENU_CLOCK, panel.clock_x, panel.clock_w, clock_hhmm,
+			     0x00DCE8F2u},
+			};
+			for (unsigned hi = 0; hi < sizeof(headers) / sizeof(headers[0]);
+			     hi++) {
+				if (headers[hi].x >= panel.clock_x &&
+				    headers[hi].menu != MENU_CLOCK)
+					continue;
+				if (headers[hi].menu == open_menu)
+					for (int x = headers[hi].x;
+					     x < headers[hi].x + headers[hi].w; x++)
+						if (x >= rx && x < rx + rw)
+							row[x] = PANEL_ACTIVE_COLOR;
+				draw_text_clipped(row, y, rx, rw, headers[hi].x + 8, 10,
+				                  headers[hi].label, headers[hi].color);
+			}
 		}
 	}
 
@@ -270,6 +495,9 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 				                  0x00F4F7FAu);
 		}
 	}
+
+	/* Menus belong to the desktop shell and always sit above client windows. */
+	draw_panel_overlay(rx, ry, rw, rh);
 
 	/* crosshair cursor on top */
 	for (int i = 0; i < CURSOR_SIZE; i++) {
@@ -526,8 +754,11 @@ static void handle_toplevel_req(int ci, struct dtoplevel *t, uint16_t op,
 			len = (n - 1) * 4;
 		memcpy(t->title, &a[1], len);
 		t->title[len] = 0;
-		if (s->mapped)
+		if (s->mapped) {
 			composite_surface_region(s);
+			if ((int)(s - surfaces) == focus_slot)
+				composite_rect(0, 0, (int)scr_w, PANEL_H);
+		}
 		break;
 	}
 	case B1D_REQ_TOPLEVEL_MOVE:
@@ -776,7 +1007,80 @@ static int surface_at(int x, int y) {
 	return -1;
 }
 
+static void focus_cycle(void);
+
+static void close_focused_window(void) {
+	struct dsurface *f = slot_surface(focus_slot);
+	struct dtoplevel *t = f ? surface_toplevel(f) : 0;
+	if (t)
+		send_msg(t->client, t->id, B1D_EV_TOPLEVEL_CLOSE, 0, 0);
+}
+
+static void send_focused_shortcut(uint32_t key) {
+	struct dsurface *f = slot_surface(focus_slot);
+	if (!f)
+		return;
+	uint32_t ctrl_down[2] = {0x1d, 1};
+	uint32_t key_down[2] = {key, 1};
+	uint32_t key_up[2] = {key, 0};
+	uint32_t ctrl_up[2] = {0x1d, 0};
+	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, ctrl_down, 2);
+	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, key_down, 2);
+	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, key_up, 2);
+	send_msg(f->client, B1D_OBJ_SEAT, B1D_EV_SEAT_KEY, ctrl_up, 2);
+}
+
+static void close_panel_menu(void) {
+	if (open_menu == MENU_NONE)
+		return;
+	open_menu = MENU_NONE;
+	menu_hover = -1;
+	composite_rect(0, 0, (int)scr_w, (int)scr_h);
+}
+
+static void open_panel_menu(enum panel_menu menu) {
+	open_menu = menu;
+	menu_hover = menu_item_at(px, py);
+	composite_rect(0, 0, (int)scr_w, (int)scr_h);
+}
+
+static void activate_menu_item(enum panel_menu menu, int item) {
+	if (!menu_item_enabled(menu, item))
+		return;
+	close_panel_menu();
+	if ((menu == MENU_SYSTEM && item == 2) ||
+	    (menu == MENU_APP && item == 1) ||
+	    (menu == MENU_VIEW && item == 0))
+		focus_cycle();
+	else if ((menu == MENU_SYSTEM && item == 3) ||
+	         (menu == MENU_APP && item == 2) ||
+	         menu == MENU_FILE)
+		close_focused_window();
+	else if (menu == MENU_EDIT) {
+		static const uint32_t edit_keys[] = {0x2d, 0x2e, 0x2f};
+		send_focused_shortcut(edit_keys[item]);
+	}
+	else if (menu == MENU_VIEW && item == 1 && focus_slot >= 0) {
+		zorder_raise(focus_slot);
+		composite_rect(0, PANEL_H, (int)scr_w, (int)scr_h - PANEL_H);
+	}
+}
+
 static void pointer_moved(void) {
+	if (open_menu != MENU_NONE) {
+		enum panel_menu header = py < PANEL_H ? panel_menu_at(px) : MENU_NONE;
+		if (header != MENU_NONE && header != open_menu) {
+			open_panel_menu(header);
+			return;
+		}
+		int hover = menu_item_at(px, py);
+		if (hover != menu_hover) {
+			menu_hover = hover;
+			composite_rect(menu_x(open_menu) - 2, PANEL_H,
+			               MENU_W + 5, menu_h(open_menu) + 3);
+		}
+		return;
+	}
 	int slot = surface_at(px, py);
 	struct dsurface *s = slot_surface(slot);
 	if (slot != enter_slot) {
@@ -802,10 +1106,38 @@ static void pointer_moved(void) {
  * and starts drawing while you drag the title. Tracked so the matching
  * release is suppressed too. */
 static int btn_on_decoration;
+static int btn_on_panel;
 
 static void pointer_button(uint16_t code, int state) {
 	input_serial++;
 	int on_decoration = 0;
+	if (code == B1NIX_BTN_LEFT) {
+		if (state) {
+			enum panel_menu header =
+			    py < PANEL_H ? panel_menu_at(px) : MENU_NONE;
+			if (header != MENU_NONE) {
+				btn_on_panel = 1;
+				if (open_menu == header)
+					close_panel_menu();
+				else
+					open_panel_menu(header);
+				return;
+			}
+			if (open_menu != MENU_NONE) {
+				enum panel_menu menu = open_menu;
+				int item = menu_item_at(px, py);
+				btn_on_panel = 1;
+				if (item >= 0)
+					activate_menu_item(menu, item);
+				else
+					close_panel_menu();
+				return;
+			}
+		} else if (btn_on_panel) {
+			btn_on_panel = 0;
+			return;
+		}
+	}
 	if (state) {
 		int slot = surface_at(px, py);
 		struct dsurface *s = slot_surface(slot);
@@ -892,6 +1224,11 @@ static void input_drain(int which) {
 			if (which == 0) { /* keyboard */
 				if (e->type == B1NIX_EV_KEY) {
 					input_serial++;
+					if (e->value && e->code == 0x01 &&
+					    open_menu != MENU_NONE) {
+						close_panel_menu();
+						continue;
+					}
 					if (e->code == 0x38) {
 						left_alt = e->value != 0;
 						continue;
