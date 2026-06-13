@@ -64,6 +64,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_freetype_smoke \
 	m51_cairo_smoke \
 	m51_cairo_wayland \
+	m51_xkb_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -491,6 +492,16 @@ $(BUILD_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/m51_cairo_wayland.c 
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_wayland
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_cairo_wayland_elf userspace/build/$(ARCH)/bin/m51_cairo_wayland > $@
+
+# M51: xkbcommon (keymap compile + keysym translation), cross-built static.
+XKB_LIB := build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install/lib/libxkbcommon.a
+$(XKB_LIB): tools/build-xkbcommon.sh
+	B1NIX_ARCH=$(ARCH) tools/build-xkbcommon.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSPACE_DEPS) $(XKB_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_xkb_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_xkb_smoke_elf userspace/build/$(ARCH)/bin/m51_xkb_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

@@ -271,6 +271,14 @@ $(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0
 	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
+# M51: m51_xkb_smoke links the ported static xkbcommon.
+XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(XKB_DIR)/include -c $< -o $(BUILD)/bin/m51_xkb_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_xkb_smoke.o \
+	  $(XKB_DIR)/lib/libxkbcommon.a --whole-archive $(LIB) --no-whole-archive
+
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)

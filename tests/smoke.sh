@@ -1128,6 +1128,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
 	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"
 	check_output "$LOG" "M51-GFX: ok cairo" "M51: ported Cairo text rendering (full stack)"
+	check_output "$LOG" "M51-GFX: ok xkbcommon" "M51: ported xkbcommon keycode->keysym"
 
 	# ── M49: displayd Wayland protocol ──
 	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then

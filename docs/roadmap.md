@@ -628,8 +628,10 @@ Port plan and progress: [`m51-plan.md`](m51-plan.md).
   B1nix Mono font. `M51-GFX: ok freetype`.
 - [x] Port Cairo (image surface + FreeType backend); render text end-to-end.
   `M51-GFX: ok cairo`.
-- [ ] `partial` Port HarfBuzz, xkbcommon (Fontconfig deferred — Cairo uses the
-  FT face directly).
+- [x] Port xkbcommon (keymap compile + keycode→keysym); ships a built-in
+  keymap, no xkeyboard-config dependency. `M51-GFX: ok xkbcommon`.
+- [ ] `partial` Port HarfBuzz (Fontconfig deferred — Cairo uses the FT face
+  directly).
 - [ ] `planned` Complete the Wayland input, clipboard, output, and window
   protocol surface required by desktop applications.
 - [ ] `planned` Run a Cairo-based Wayland application with shaped text,

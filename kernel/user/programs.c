@@ -1558,6 +1558,19 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M51: ported xkbcommon compiles a keymap and translates keycode->keysym. */
+  {
+    u64 xkb_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m51-xkb-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)xkb_pid < 0) {
+      uwrite("M51-GFX: spawn-fail xkb\n");
+    } else {
+      int xkb_status = 0;
+      syscall_dispatch(SYS_WAIT, xkb_pid, (u64)(usize)&xkb_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {
