@@ -1617,6 +1617,17 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, cwl_pid,
                          (u64)(usize)&cwl_status, 0, 0, 0, 0);
       }
+      /* M51: clipboard (wl_data_device) selection round-trip between two
+       * client connections. */
+      u64 clip_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m51-clipboard-smoke", 0, 0, 0, 0, 0);
+      if ((isize)clip_pid < 0) {
+        uwrite("M51-GFX: spawn-fail clipboard\n");
+      } else {
+        int clip_status = 0;
+        syscall_dispatch(SYS_WAIT, clip_pid,
+                         (u64)(usize)&clip_status, 0, 0, 0, 0);
+      }
       int dsp_status = 0;
       syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);
       syscall_dispatch(SYS_WAIT, dsp_pid, (u64)(usize)&dsp_status, 0, 0, 0, 0);

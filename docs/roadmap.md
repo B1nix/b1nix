@@ -635,12 +635,14 @@ Port plan and progress: [`m51-plan.md`](m51-plan.md).
   (libstdc++ sysroot, exceptions, static ctors) — that infrastructure is scoped
   to M53; see [`m51-plan.md`](m51-plan.md). Cairo's toy text already shapes/
   renders Latin/monospace via FreeType.
-- [x] Wayland protocol: `wl_output` (mode/scale/geometry) added; input
-  (`wl_seat` keyboard/pointer) and window (`xdg-shell`) already present from
-  M47-M49. `M51-GFX: ok wl-output`. Clipboard (`wl_data_device`) still `planned`.
+- [x] Complete the Wayland protocol surface: `wl_output` (mode/scale/geometry)
+  and clipboard (`wl_data_device` selection with fd-forwarded transfer) added;
+  input (`wl_seat`) and window (`xdg-shell`) already present from M47-M49.
+  `M51-GFX: ok wl-output`, `ok clipboard`.
 - [x] Run a Cairo Wayland app with scalable fonts via displayd
-  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`). Keyboard keysyms available
-  via the xkbcommon port; complex shaped text and clipboard pending.
+  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`); keyboard keysyms via the
+  xkbcommon port; clipboard round-trip verified. Complex shaped text (HarfBuzz)
+  is the one deferred piece (→ M53 C++ runtime).
 
 ## M52: Mesa and Accelerated OpenGL
 

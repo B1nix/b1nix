@@ -52,6 +52,7 @@
 #include "initramfs_m51_cairo_smoke.inc"
 #include "initramfs_m51_cairo_wayland.inc"
 #include "initramfs_m51_xkb_smoke.inc"
+#include "initramfs_m51_clipboard_smoke.inc"
 #include "initramfs_displayd.inc"
 #include "initramfs_gclock.inc"
 #include "initramfs_gterm.inc"
@@ -1031,6 +1032,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m51_cairo_wayland_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-xkb-smoke", (const char *)vfs_m51_xkb_smoke_elf,
      sizeof(vfs_m51_xkb_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m51-clipboard-smoke", (const char *)vfs_m51_clipboard_smoke_elf,
+     sizeof(vfs_m51_clipboard_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/displayd", (const char *)vfs_displayd_elf,
      sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gclock", (const char *)vfs_gclock_elf,

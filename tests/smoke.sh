@@ -1142,6 +1142,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M49-LIBWLS: ok server-core" "M49: upstream libwayland-server core"
 		check_output "$LOG" "M51-GFX: ok wl-output" "M51: wl_output advertises mode geometry"
 		check_output "$LOG" "M51-GFX: ok cairo-wayland" "M51: Cairo Wayland app renders text to displayd"
+		check_output "$LOG" "M51-GFX: ok clipboard" "M51: wl_data_device clipboard selection round-trip"
 		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
 		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"
 	fi

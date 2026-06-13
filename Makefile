@@ -65,6 +65,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_cairo_smoke \
 	m51_cairo_wayland \
 	m51_xkb_smoke \
+	m51_clipboard_smoke \
 	displayd \
 	gclock \
 	gterm \
