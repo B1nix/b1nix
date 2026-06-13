@@ -1504,6 +1504,45 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M51: ported libm (openlibm) computes correctly at runtime. */
+  {
+    u64 m51_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m51-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m51_pid < 0) {
+      uwrite("M51-GFX: spawn-fail\n");
+    } else {
+      int m51_status = 0;
+      syscall_dispatch(SYS_WAIT, m51_pid, (u64)(usize)&m51_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported pixman composites pixels. */
+  {
+    u64 px_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-pixman-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)px_pid < 0) {
+      uwrite("M51-GFX: spawn-fail pixman\n");
+    } else {
+      int px_status = 0;
+      syscall_dispatch(SYS_WAIT, px_pid, (u64)(usize)&px_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M51: ported FreeType rasterizes a glyph from the bundled B1nix Mono TTF. */
+  {
+    u64 ft_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-freetype-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)ft_pid < 0) {
+      uwrite("M51-GFX: spawn-fail freetype\n");
+    } else {
+      int ft_status = 0;
+      syscall_dispatch(SYS_WAIT, ft_pid, (u64)(usize)&ft_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {

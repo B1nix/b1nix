@@ -22,6 +22,7 @@ INITRAMFS_DROPBEAR_INC := $(BUILD_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
 INITRAMFS_BASH_INC := $(BUILD_DIR)/initramfs_bash.inc
 INITRAMFS_TESTWAV_INC := $(BUILD_DIR)/initramfs_testwav.inc
+INITRAMFS_TESTFONT_INC := $(BUILD_DIR)/initramfs_testfont.inc
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
 APPLET_MANIFEST := tools/applet-manifest.conf
@@ -58,6 +59,9 @@ EMBEDDED_USER_PROGRAMS := \
 	m49_libwayland \
 	m49_libwayland_server \
 	m50_smoke \
+	m51_smoke \
+	m51_pixman_smoke \
+	m51_freetype_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -87,7 +91,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_DROPBEAR_INC) \
 	$(INITRAMFS_BUSYBOX_INC) \
 	$(INITRAMFS_BASH_INC) \
-	$(INITRAMFS_TESTWAV_INC)
+	$(INITRAMFS_TESTWAV_INC) \
+	$(INITRAMFS_TESTFONT_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
@@ -440,6 +445,36 @@ PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
 $(PCRE2_LIB): tools/build-pcre2.sh tools/b1nix-autotools-cc
 	tools/build-pcre2.sh >/dev/null
 
+# M51: libm (openlibm), cross-built static, linked into m51_smoke.
+LIBM_LIB := build/openlibm-b1nix/$(B1NIX_TRIPLET)/install/lib/libm.a
+$(LIBM_LIB): tools/build-openlibm.sh
+	B1NIX_ARCH=$(ARCH) tools/build-openlibm.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_smoke.inc: userspace/bin/m51_smoke.c $(USERSPACE_DEPS) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_smoke_elf userspace/build/$(ARCH)/bin/m51_smoke > $@
+
+# M51: pixman (generic C), cross-built static, linked into m51_pixman_smoke.
+PIXMAN_LIB := build/pixman-b1nix/$(B1NIX_TRIPLET)/install/lib/libpixman-1.a
+$(PIXMAN_LIB): tools/build-pixman.sh tools/build-openlibm.sh
+	B1NIX_ARCH=$(ARCH) tools/build-pixman.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/m51_pixman_smoke.c $(USERSPACE_DEPS) $(PIXMAN_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_pixman_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_pixman_smoke_elf userspace/build/$(ARCH)/bin/m51_pixman_smoke > $@
+
+# M51: FreeType (TrueType + smooth rasterizer), cross-built static.
+FREETYPE_LIB := build/freetype-b1nix/$(B1NIX_TRIPLET)/install/lib/libfreetype.a
+$(FREETYPE_LIB): tools/build-freetype.sh
+	B1NIX_ARCH=$(ARCH) tools/build-freetype.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/m51_freetype_smoke.c $(USERSPACE_DEPS) $(FREETYPE_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_freetype_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_freetype_smoke_elf userspace/build/$(ARCH)/bin/m51_freetype_smoke > $@
+
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	@mkdir -p $(dir $@)
@@ -502,6 +537,12 @@ $(INITRAMFS_TESTWAV_INC): tools/gen_test_wav.py
 	@mkdir -p $(dir $@)
 	python3 tools/gen_test_wav.py $(BUILD_DIR)/test.wav
 	xxd -i -n vfs_testwav $(BUILD_DIR)/test.wav > $@
+
+# M51: the project's own scalable font (B1nix Mono) used by the
+# FreeType/Cairo/HarfBuzz smokes. Mounted at /share/fonts/B1nixMono-Regular.ttf.
+$(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.

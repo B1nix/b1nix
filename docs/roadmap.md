@@ -619,8 +619,14 @@ construction. Details in [`display-server.md`](display-server.md).
 
 ## M51: Desktop Graphics Stack
 
-- [ ] `planned` Port pixman, FreeType, Fontconfig, HarfBuzz, Cairo, and
-  xkbcommon.
+Port plan and progress: [`m51-plan.md`](m51-plan.md).
+
+- [x] Prerequisite: port a real libm (openlibm) — the previous `math.h` had no
+  working runtime libm (recursive-inline `jmp .` trap). `M51-GFX: ok libm`.
+- [x] Port pixman (generic C). `M51-GFX: ok pixman`.
+- [x] Port FreeType (TrueType + smooth rasterizer); bundle the project's own
+  B1nix Mono font. `M51-GFX: ok freetype`.
+- [ ] `partial` Port Cairo, HarfBuzz, Fontconfig, and xkbcommon.
 - [ ] `planned` Complete the Wayland input, clipboard, output, and window
   protocol surface required by desktop applications.
 - [ ] `planned` Run a Cairo-based Wayland application with shaped text,

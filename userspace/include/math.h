@@ -7,9 +7,98 @@
 #define FP_SUBNORMAL    3
 #define FP_NORMAL       4
 
+#define M_E             2.7182818284590452354
+#define M_LOG2E         1.4426950408889634074
+#define M_LOG10E        0.43429448190325182765
+#define M_LN2           0.69314718055994530942
+#define M_LN10          2.30258509299404568402
+#define M_PI            3.14159265358979323846
+#define M_PI_2          1.57079632679489661923
+#define M_PI_4          0.78539816339744830962
+#define M_1_PI          0.31830988618379067154
+#define M_2_PI          0.63661977236758134308
+#define M_2_SQRTPI      1.12837916709551257390
+#define M_SQRT2         1.41421356237309504880
+#define M_SQRT1_2       0.70710678118654752440
+
+#define HUGE_VAL        __builtin_huge_val()
+#define HUGE_VALF       __builtin_huge_valf()
+#define INFINITY        __builtin_inff()
+#define NAN             __builtin_nanf("")
+
+#define isnan(x)        __builtin_isnan(x)
+#define isinf(x)        __builtin_isinf(x)
+#define isfinite(x)     __builtin_isfinite(x)
+#define signbit(x)      __builtin_signbit(x)
+
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+/* Provided by libm.a (openlibm). These MUST be plain prototypes, never
+ * `static inline { return __builtin_f(...); }`: the builtin lowers to a call
+ * to the same symbol, so an inline wrapper is infinite self-recursion that the
+ * optimizer turns into a `jmp .` hang (it only ever "worked" when the args were
+ * compile-time constant and folded). See docs/m51-plan.md. */
+double acos(double);
+double asin(double);
+double atan(double);
+double atan2(double, double);
+double cos(double);
+double cosh(double);
+double exp(double);
+double exp2(double);
+double expm1(double);
+double fabs(double);
+double floor(double);
+double ceil(double);
+double trunc(double);
+double round(double);
+double rint(double);
+double nearbyint(double);
+double fmod(double, double);
+double remainder(double, double);
+double log(double);
+double log2(double);
+double log10(double);
+double log1p(double);
+double modf(double, double *);
+double pow(double, double);
+double sqrt(double);
+double cbrt(double);
+double hypot(double, double);
+double sin(double);
+double sinh(double);
+double tan(double);
+double tanh(double);
+double copysign(double, double);
+double scalbn(double, int);
+double fmax(double, double);
+double fmin(double, double);
+double fdim(double, double);
+double nextafter(double, double);
+
+float acosf(float);
+float asinf(float);
+float atanf(float);
+float atan2f(float, float);
+float cosf(float);
+float expf(float);
+float fabsf(float);
+float floorf(float);
+float ceilf(float);
+float truncf(float);
+float roundf(float);
+float fmodf(float, float);
+float logf(float);
+float log2f(float);
+float log10f(float);
+float powf(float, float);
+float sqrtf(float);
+float sinf(float);
+float tanf(float);
+float copysignf(float, float);
+float scalbnf(float, int);
 
 double strtod(const char *nptr, char **endptr);
 double ldexp(double x, int exp);
@@ -21,39 +110,5 @@ long double strtold(const char *nptr, char **endptr);
 #ifdef __cplusplus
 }
 #endif
-
-static inline double acos(double x) { return __builtin_acos(x); }
-static inline double asin(double x) { return __builtin_asin(x); }
-static inline double atan(double x) { return __builtin_atan(x); }
-static inline double atan2(double y, double x) { return __builtin_atan2(y, x); }
-static inline double ceil(double x) { return __builtin_ceil(x); }
-static inline double cos(double x) { return __builtin_cos(x); }
-static inline double cosh(double x) { return __builtin_cosh(x); }
-static inline double exp(double x) { return __builtin_exp(x); }
-static inline double fabs(double x) { return __builtin_fabs(x); }
-static inline double floor(double x) { return __builtin_floor(x); }
-static inline double fmod(double x, double y) { return __builtin_fmod(x, y); }
-static inline double log(double x) { return __builtin_log(x); }
-static inline double log10(double x) { return __builtin_log10(x); }
-static inline double modf(double x, double *iptr) { return __builtin_modf(x, iptr); }
-static inline double pow(double x, double y) { return __builtin_pow(x, y); }
-static inline double round(double x) { return __builtin_round(x); }
-static inline double sin(double x) { return __builtin_sin(x); }
-static inline double sinh(double x) { return __builtin_sinh(x); }
-static inline double sqrt(double x) { return __builtin_sqrt(x); }
-static inline double tan(double x) { return __builtin_tan(x); }
-static inline double tanh(double x) { return __builtin_tanh(x); }
-
-/* Float variants for the functions GCC lowers to a single hardware
- * instruction (fabs/sqrt). libstdc++'s crossconfig.m4 b1nix stanza hardcodes
- * HAVE_FABSF/HAVE_SQRTF, so <cmath> does `using ::fabsf/::sqrtf` and the float
- * math stubs are skipped — these MUST be declared here or the libstdc++ build
- * fails with "fabsf/sqrtf not declared".
- * The long-double variants (fabsl/sqrtl) are intentionally NOT declared:
- * HAVE_FABSL/HAVE_SQRTL are left undefined (the long-double decl checks never
- * run for this target), so libstdc++ emits its own fabsl/sqrtl stub definitions
- * in math_stubs_long_double.cc. Declaring them here would collide with those. */
-static inline float fabsf(float x) { return __builtin_fabsf(x); }
-static inline float sqrtf(float x) { return __builtin_sqrtf(x); }
 
 #endif
