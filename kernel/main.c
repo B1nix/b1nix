@@ -50,6 +50,7 @@ extern void hda_init(void);
 extern void input_init(void);
 extern void input_gfxtest_start(void);
 extern void fb_dev_init(void);
+extern void drm_dev_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
 extern void m35_diag_run(void);
@@ -289,6 +290,7 @@ void kernel_main(usize arg0, usize arg1)
 	compositor_init();
 	virtio_gpu_init();
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
+	drm_dev_init(); /* M50: minimal DRM/KMS dumb-buffer device over virtio-gpu */
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */

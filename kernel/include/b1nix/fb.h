@@ -3,6 +3,8 @@
 
 #include <b1nix/types.h>
 
+struct vfs_node;
+
 /* M47: /dev/fb0 — mmap-able linear framebuffer device.
  *
  * Userspace mmaps a kernel-owned contiguous shadow buffer (always 32bpp,
@@ -34,5 +36,7 @@ void fb_dev_init(void);
 /* True once userspace has mapped the framebuffer: the kernel-side
  * compositor must stop flushing so it doesn't fight the userspace owner. */
 int fb_dev_claimed(void);
+void fb_dev_mapping_open(struct vfs_node *node);
+void fb_dev_mapping_close(struct vfs_node *node);
 
 #endif

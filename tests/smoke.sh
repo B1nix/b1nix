@@ -1115,6 +1115,14 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
 	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
 
+	check_output "$LOG" "M50-DRM: ok card0" "M50: /dev/dri/card0"
+	check_output "$LOG" "M50-DRM: ok mode" "M50: KMS mode discovery"
+	check_output "$LOG" "M50-DRM: ok multi-buffer" "M50: multiple dumb buffers"
+	check_output "$LOG" "M50-DRM: ok setcrtc" "M50: SETCRTC presentation"
+	check_output "$LOG" "M50-DRM: ok flip-event" "M50: poll/read page-flip event"
+	check_output "$LOG" "M50-DRM: ok rmfb" "M50: framebuffer removal"
+	check_output "$LOG" "M50-DRM: ok cleanup" "M50: close/munmap cleanup"
+
 	# ── M49: displayd Wayland protocol ──
 	if grep -q "fb0: ready" "$LOG" 2>/dev/null; then
 		check_output "$LOG" "displayd: ready" "M47: displayd started on /dev/fb0"

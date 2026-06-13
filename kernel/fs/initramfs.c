@@ -44,6 +44,7 @@
 #include "initramfs_m49_smoke.inc"
 #include "initramfs_m49_libwayland.inc"
 #include "initramfs_m49_libwayland_server.inc"
+#include "initramfs_m50_smoke.inc"
 #include "initramfs_displayd.inc"
 #include "initramfs_gclock.inc"
 #include "initramfs_gterm.inc"
@@ -1007,6 +1008,8 @@ static const struct initramfs_file files[] = {
     {"/bin/m49-libwayland-server",
      (const char *)vfs_m49_libwayland_server_elf,
      sizeof(vfs_m49_libwayland_server_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m50-smoke", (const char *)vfs_m50_smoke_elf,
+     sizeof(vfs_m50_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/displayd", (const char *)vfs_displayd_elf,
      sizeof(vfs_displayd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gclock", (const char *)vfs_gclock_elf,

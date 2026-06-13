@@ -1491,6 +1491,19 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M50: DRM/KMS dumb buffer, mmap and synchronous page flip. */
+  {
+    u64 m50_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m50-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m50_pid < 0) {
+      uwrite("M50-DRM: spawn-fail\n");
+    } else {
+      int m50_status = 0;
+      syscall_dispatch(SYS_WAIT, m50_pid, (u64)(usize)&m50_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {

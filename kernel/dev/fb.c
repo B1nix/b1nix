@@ -68,7 +68,7 @@ static int fb_mmap_phys(struct vfs_node *node, u64 offset, usize length,
   return rc;
 }
 
-static void fb_mmap_open(struct vfs_node *node) {
+void fb_dev_mapping_open(struct vfs_node *node) {
   (void)node;
   int first_claim;
   u64 flags;
@@ -79,7 +79,7 @@ static void fb_mmap_open(struct vfs_node *node) {
     console_write("fb0: claimed by userspace mapping\n");
 }
 
-static void fb_mmap_close(struct vfs_node *node) {
+void fb_dev_mapping_close(struct vfs_node *node) {
   (void)node;
   int released = 0;
   u64 flags;
@@ -169,8 +169,8 @@ void fb_dev_init(void) {
   node->inode->mode = 0600;
   node->inode->ioctl_cb = fb_ioctl;
   node->inode->mmap_phys_cb = fb_mmap_phys;
-  node->inode->mmap_open_cb = fb_mmap_open;
-  node->inode->mmap_close_cb = fb_mmap_close;
+  node->inode->mmap_open_cb = fb_dev_mapping_open;
+  node->inode->mmap_close_cb = fb_dev_mapping_close;
   vfs_node_put(node);
   console_write("fb0: ready ");
   console_write_dec(fb_console_width());

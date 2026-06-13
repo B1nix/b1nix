@@ -27,6 +27,7 @@
 #define X_OK 1
 
 struct vfs_node;
+struct vfs_handle;
 int vfs_check_access(struct vfs_node *node, int requested_access);
 
 enum vfs_node_type {
@@ -137,10 +138,14 @@ struct vfs_inode {
    * own reference so the frames outlive every user mapping. */
   int (*mmap_phys_cb)(struct vfs_node *node, u64 offset, usize length,
                       u64 *out_phys);
+  int (*mmap_handle_phys_cb)(struct vfs_handle *handle, u64 offset,
+                             usize length, u64 *out_phys);
   /* Mapping-lifetime hooks. Called once per VMA, including fork copies and
    * VMA splits, with a matching close on munmap/exec/exit. */
   void (*mmap_open_cb)(struct vfs_node *node);
   void (*mmap_close_cb)(struct vfs_node *node);
+  void (*mmap_range_open_cb)(struct vfs_node *node, u64 offset, usize length);
+  void (*mmap_range_close_cb)(struct vfs_node *node, u64 offset, usize length);
 };
 
 /* Inode cache API */
@@ -304,8 +309,6 @@ enum vfs_handle_kind {
   VFS_HANDLE_SERIAL_TTY,
   VFS_HANDLE_INPUT
 };
-
-struct vfs_handle;
 
 struct vfs_file_ops {
   isize (*read)(struct vfs_handle *h, char *buf, usize len);

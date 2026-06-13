@@ -57,6 +57,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m49_smoke \
 	m49_libwayland \
 	m49_libwayland_server \
+	m50_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -275,6 +276,7 @@ KERNEL_SOURCES += \
 	kernel/dev/serial_tty.c \
 	kernel/dev/compositor.c \
 	kernel/dev/virtio_gpu.c \
+	kernel/dev/drm.c \
 	kernel/dev/fb.c \
 	kernel/dev/input.c \
 	kernel/net/net.c \
@@ -668,7 +670,7 @@ run-graphics: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
 	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
-		-device virtio-gpu-pci
+		-vga virtio
 
 run-x86_64: run
 

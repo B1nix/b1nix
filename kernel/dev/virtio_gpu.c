@@ -2,6 +2,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/virtio.h>
 #include <b1nix/virtio_gpu.h>
 #include <string.h>
@@ -149,6 +150,11 @@ static u64 gpu_cursor_surface_phys;
 static usize gpu_cursor_surface_bytes;
 static int gpu_modern;
 static volatile u16 *gpu_notify_addr[2];
+static spinlock_t gpu_present_lock;
+static u8 *gpu_control_req_dma;
+static u8 *gpu_control_resp_dma;
+static u8 *gpu_cursor_req_dma;
+static u8 *gpu_cursor_resp_dma;
 
 struct virtio_pci_common_cfg {
     volatile u32 device_feature_select;
@@ -290,11 +296,22 @@ static int virtio_gpu_submit_pair(struct virtio_device *dev, struct virtqueue *v
 
 static int virtio_gpu_send_cmd(const void *req, usize req_len, void *resp, usize resp_len)
 {
+    if (!gpu_control_req_dma || !gpu_control_resp_dma ||
+        req_len > PAGE_SIZE || resp_len > PAGE_SIZE)
+        return -1;
+    memcpy(gpu_control_req_dma, req, req_len);
+    memset(gpu_control_resp_dma, 0, resp_len);
     u16 target_used;
-    if (virtio_gpu_submit_pair(&gpu_dev, &controlq, &controlq_next_pair, req, req_len, resp, resp_len, &target_used) < 0) {
+    if (virtio_gpu_submit_pair(&gpu_dev, &controlq, &controlq_next_pair,
+                               gpu_control_req_dma, req_len,
+                               gpu_control_resp_dma, resp_len,
+                               &target_used) < 0) {
         return -1;
     }
-    return virtio_gpu_wait_used(&controlq, target_used);
+    if (virtio_gpu_wait_used(&controlq, target_used) < 0)
+        return -1;
+    memcpy(resp, gpu_control_resp_dma, resp_len);
+    return 0;
 }
 
 static void virtio_gpu_draw_cursor_surface(int x, int y)
@@ -339,12 +356,20 @@ static int virtio_gpu_cursor_submit(u32 cmd_type, int x, int y, u32 resource_id)
     req.hot_x = 0;
     req.hot_y = 0;
 
-    if (virtio_gpu_submit_pair(&gpu_dev, &cursorq, &cursorq_next_pair, &req, sizeof(req), &resp, sizeof(resp), &target_used) < 0) {
+    if (!gpu_cursor_req_dma || !gpu_cursor_resp_dma)
+        return -1;
+    memcpy(gpu_cursor_req_dma, &req, sizeof(req));
+    memset(gpu_cursor_resp_dma, 0, sizeof(resp));
+    if (virtio_gpu_submit_pair(&gpu_dev, &cursorq, &cursorq_next_pair,
+                               gpu_cursor_req_dma, sizeof(req),
+                               gpu_cursor_resp_dma, sizeof(resp),
+                               &target_used) < 0) {
         return -1;
     }
     if (virtio_gpu_wait_used(&cursorq, target_used) < 0) {
         return -1;
     }
+    memcpy(&resp, gpu_cursor_resp_dma, sizeof(resp));
     return (resp.type == VIRTIO_GPU_RESP_OK_NODATA) ? 0 : -1;
 }
 
@@ -595,6 +620,18 @@ void virtio_gpu_init(void)
                                     VIRTIO_STATUS_FEATURES_OK | VIRTIO_STATUS_DRIVER_OK);
     }
 
+    u64 dma_phys = pmm_alloc_frames(4);
+    if (!dma_phys) {
+        console_write("virtio-gpu: DMA scratch allocation failed\n");
+        return;
+    }
+    u8 *dma = (u8 *)(usize)(dma_phys + vmm_direct_map_base());
+    memset(dma, 0, 4 * PAGE_SIZE);
+    gpu_control_req_dma = dma;
+    gpu_control_resp_dma = dma + PAGE_SIZE;
+    gpu_cursor_req_dma = dma + 2 * PAGE_SIZE;
+    gpu_cursor_resp_dma = dma + 3 * PAGE_SIZE;
+
     gpu_ready = 1;
     controlq_next_pair = 0;
     cursorq_next_pair = 0;
@@ -614,8 +651,16 @@ int virtio_gpu_ready(void)
     return gpu_ready;
 }
 
-int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x, u32 dirty_y, u32 dirty_w, u32 dirty_h,
-                       int cursor_x, int cursor_y, int cursor_visible)
+void virtio_gpu_get_mode(u32 *width, u32 *height)
+{
+    if (width) *width = gpu_scanout_width;
+    if (height) *height = gpu_scanout_height;
+}
+
+static int virtio_gpu_present_locked(const u32 *src, u32 width, u32 height,
+                                     u32 dirty_x, u32 dirty_y, u32 dirty_w,
+                                     u32 dirty_h, int cursor_x, int cursor_y,
+                                     int cursor_visible)
 {
     if (!gpu_ready || !src || width == 0 || height == 0) {
         return -1;
@@ -676,8 +721,8 @@ int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x, u32 d
     transfer.rect.height = dirty_h;
     transfer.offset = ((u64)dirty_y * width + dirty_x) * sizeof(u32);
     transfer.resource_id = gpu_resource_id;
-    u16 t1 = 0, t2 = 0;
-    if (virtio_gpu_submit_pair(&gpu_dev, &controlq, &controlq_next_pair, &transfer, sizeof(transfer), &resp, sizeof(resp), &t1) < 0) {
+    if (virtio_gpu_send_cmd(&transfer, sizeof(transfer), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
     }
 
@@ -690,15 +735,24 @@ int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x, u32 d
     flush.rect.width = dirty_w;
     flush.rect.height = dirty_h;
     flush.resource_id = gpu_resource_id;
-    if (virtio_gpu_submit_pair(&gpu_dev, &controlq, &controlq_next_pair, &flush, sizeof(flush), &resp, sizeof(resp), &t2) < 0) {
-        return -1;
-    }
-    if (virtio_gpu_wait_used(&controlq, t2) < 0) {
-        return -1;
-    }
-    if (resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+    if (virtio_gpu_send_cmd(&flush, sizeof(flush), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
         return -1;
     }
 
     return 0;
+}
+
+int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x,
+                       u32 dirty_y, u32 dirty_w, u32 dirty_h, int cursor_x,
+                       int cursor_y, int cursor_visible)
+{
+    /* ponytail: one queue lock; split control/cursor locks if throughput matters. */
+    u64 flags;
+    spin_lock_irqsave(&gpu_present_lock, &flags);
+    int rc = virtio_gpu_present_locked(src, width, height, dirty_x, dirty_y,
+                                       dirty_w, dirty_h, cursor_x, cursor_y,
+                                       cursor_visible);
+    spin_unlock_irqrestore(&gpu_present_lock, flags);
+    return rc;
 }

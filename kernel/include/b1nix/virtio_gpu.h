@@ -5,6 +5,7 @@
 
 void virtio_gpu_init(void);
 int virtio_gpu_ready(void);
+void virtio_gpu_get_mode(u32 *width, u32 *height);
 int virtio_gpu_present(const u32 *src, u32 width, u32 height, u32 dirty_x, u32 dirty_y, u32 dirty_w, u32 dirty_h,
                        int cursor_x, int cursor_y, int cursor_visible);
 

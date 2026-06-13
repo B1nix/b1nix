@@ -610,10 +610,12 @@ construction. Details in [`display-server.md`](display-server.md).
 
 ## M50: DRM/KMS and Graphics Memory
 
-- [ ] `planned` Expose `/dev/dri/card0` over the existing VirtIO GPU driver.
-- [ ] `planned` Add dumb-buffer allocation, mapping, and framebuffer handles.
-- [ ] `planned` Add mode discovery and page-flip presentation.
-- [ ] `planned` Verify mapped graphics buffers from a userspace smoke test.
+- [x] Expose `/dev/dri/card0` over the existing VirtIO GPU driver.
+- [x] Add dumb-buffer allocation, mapping, and framebuffer handles.
+- [x] Add mode discovery and synchronous page-flip presentation.
+- [x] Verify mapped graphics buffers from a userspace smoke test.
+- [x] Support multiple dumb buffers/framebuffers, `SETCRTC`, `RMFB`,
+  poll/read flip events, and close/munmap cleanup.
 
 ## M51: Desktop Graphics Stack
 

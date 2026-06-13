@@ -2,6 +2,7 @@
 #include <b1nix/blk.h>
 #include <b1nix/loop.h>
 #include <b1nix/console.h>
+#include <b1nix/drm.h>
 #include <b1nix/errno.h>
 #include <b1nix/ext2.h>
 #include <b1nix/fat32.h>
@@ -2218,6 +2219,25 @@ int vfs_open_flags(const char *path, int flags) {
       kfree(resolved);
       return fd;
     }
+  }
+  if (strcmp(resolved, "/dev/dri/card0") == 0) {
+    struct vfs_node *card = vfs_find_node(resolved);
+    if (!IS_ERR(card)) {
+      int access_mask = 0;
+      if (flags & (B1NIX_O_WRONLY | B1NIX_O_RDWR))
+        access_mask |= W_OK;
+      if ((flags & 3) == B1NIX_O_RDONLY || (flags & B1NIX_O_RDWR))
+        access_mask |= R_OK;
+      int access = vfs_check_access(card, access_mask);
+      vfs_node_put(card);
+      if (access < 0) {
+        kfree(resolved);
+        return access;
+      }
+    }
+    int fd = drm_dev_open(flags);
+    kfree(resolved);
+    return fd;
   }
   /* M47 input event devices: /dev/input/eventN opens bind a per-client
    * event queue (raw handles with their own file ops, like the ttys). */
