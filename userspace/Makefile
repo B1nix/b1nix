@@ -261,6 +261,16 @@ $(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(LIB) $(CRT0) $(LINKER)
 	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(LIB) --no-whole-archive
 
+# M51 end-to-end: Cairo + libb1gui (Wayland client) -> displayd.
+$(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
+	  -c $< -o $(BUILD)/bin/m51_cairo_wayland.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_cairo_wayland.o \
+	  $(CAIRO_DIR)/lib/libcairo.a $(FT_DIR)/lib/libfreetype.a \
+	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
+
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
 PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)

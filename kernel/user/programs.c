@@ -1593,6 +1593,17 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, libwl_pid,
                          (u64)(usize)&libwl_status, 0, 0, 0, 0);
       }
+      /* M51 end-to-end: a Cairo app renders scalable text into a wl_shm
+       * window and presents it to displayd. */
+      u64 cwl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m51-cairo-wayland", 0, 0, 0, 0, 0);
+      if ((isize)cwl_pid < 0) {
+        uwrite("M51-GFX: spawn-fail cairo-wayland\n");
+      } else {
+        int cwl_status = 0;
+        syscall_dispatch(SYS_WAIT, cwl_pid,
+                         (u64)(usize)&cwl_status, 0, 0, 0, 0);
+      }
       int dsp_status = 0;
       syscall_dispatch(SYS_KILL, dsp_pid, SIGTERM, 0, 0, 0, 0);
       syscall_dispatch(SYS_WAIT, dsp_pid, (u64)(usize)&dsp_status, 0, 0, 0, 0);

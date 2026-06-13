@@ -63,6 +63,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_pixman_smoke \
 	m51_freetype_smoke \
 	m51_cairo_smoke \
+	m51_cairo_wayland \
 	displayd \
 	gclock \
 	gterm \
@@ -485,6 +486,11 @@ $(BUILD_DIR)/initramfs_m51_cairo_smoke.inc: userspace/bin/m51_cairo_smoke.c $(US
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_cairo_smoke_elf userspace/build/$(ARCH)/bin/m51_cairo_smoke > $@
+
+$(BUILD_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/m51_cairo_wayland.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_wayland
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_cairo_wayland_elf userspace/build/$(ARCH)/bin/m51_cairo_wayland > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

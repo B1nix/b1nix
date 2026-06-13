@@ -1,8 +1,22 @@
 # M51 — Desktop Graphics Stack: Port Plan
 
-Status: **in progress** — rungs 1 (libm), 2 (pixman), 3 (FreeType),
-5 (Cairo) done; remaining: displayd protocol (wl_output+clipboard), HarfBuzz,
-xkbcommon, end-to-end render.
+Status: **in progress** — libm, pixman, FreeType, Cairo, and the end-to-end
+Cairo→Wayland render done; remaining: displayd protocol (wl_output+clipboard),
+HarfBuzz, xkbcommon.
+
+## End-to-end done: a Cairo Wayland app (`m51_cairo_wayland`)
+
+Reuses libb1gui (the M47/M49 Wayland client) + Cairo: opens a real wl_shm
+window, wraps the live buffer as a Cairo image surface, draws scalable text
+("b1nix" in B1nix Mono via the FreeType backend), presents to displayd, waits
+for the frame-complete callback, and asserts the presented buffer holds the dark
+glyph ink. `M51-GFX: ok cairo-wayland`. This is the "run a Cairo Wayland app with
+scalable fonts" deliverable (shaped text via HarfBuzz and keyboard
+input/clipboard still pending).
+
+Lesson: run the two arches sequentially/isolated (2 VMs each). `smoke-all-parallel`
+(4 TCG VMs) overloads this host and times out the SMP runs even with warm
+libs — both arches pass isolated (x86_64 611/0, x86 610/0).
 
 ## Rung 5 done: Cairo
 
