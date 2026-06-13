@@ -1633,6 +1633,10 @@ static void focus_cycle(void) {
 static void input_drain(int which) {
 	struct b1nix_input_event evs[16];
 	static int acc_dx, acc_dy, moved;
+	/* Absolute pointer (virtio-tablet): the kernel scales 0..32767 to screen
+	 * pixels, so an EV_ABS sets the cursor position directly rather than
+	 * accumulating a delta. Lets the mouse track grab-free in QEMU. */
+	static int abs_x, abs_y, have_abs;
 	for (;;) {
 		ssize_t n = read(ev_fds[which], evs, sizeof(evs));
 		if (n <= 0)
@@ -1678,14 +1682,26 @@ static void input_drain(int which) {
 				if (e->code == B1NIX_REL_Y) acc_dy += e->value;
 				moved = 1;
 				break;
+			case B1NIX_EV_ABS:
+				if (e->code == B1NIX_ABS_X) abs_x = e->value;
+				if (e->code == B1NIX_ABS_Y) abs_y = e->value;
+				have_abs = 1;
+				moved = 1;
+				break;
 			case B1NIX_EV_KEY:
 				pointer_button(e->code, e->value);
 				break;
 			case B1NIX_EV_SYN:
 				if (moved) {
 					int ox = px, oy = py;
-					px += acc_dx;
-					py += acc_dy;
+					if (have_abs) {
+						px = abs_x;
+						py = abs_y;
+						have_abs = 0;
+					} else {
+						px += acc_dx;
+						py += acc_dy;
+					}
 					acc_dx = acc_dy = 0;
 					moved = 0;
 					if (px < 0) px = 0;

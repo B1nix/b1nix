@@ -179,3 +179,25 @@ With M47's Wayland-shaped core and M48's fd passing in place:
   on x86_64 and x86.
 - Parked alternative for X11 apps: TinyX/kdrive `Xfbdev` on the same
   `/dev/fb0` + input substrate.
+
+## Display resolution and absolute pointer (mouse)
+
+- **Resolution is 1280x800.** The Multiboot2 framebuffer tag (`kernel/arch/*/boot.S`),
+  the GRUB `gfxmode` (`boot/grub/grub.cfg`), and the virtio-gpu native scanout
+  all agree at 1280x800x32. Keeping them identical avoids a dual-surface
+  mismatch where the kernel framebuffer (GRUB VGA mode) and the virtio-gpu
+  scanout disagreed and QEMU's presented size depended on init order.
+- **Mouse — two input paths feed `/dev/input/event1`:**
+  - **PS/2 relative mouse** (`kernel/dev/ps2_mouse.c`): works, but in a QEMU
+    window relative motion only reaches the guest after you click to grab the
+    pointer. The kernel maintains a framebuffer-clamped absolute position and
+    emits both `EV_REL` and `EV_ABS`.
+  - **virtio-tablet absolute pointer** (`kernel/dev/virtio_input.c`, a modern
+    virtio-input driver): the cursor tracks the host 1:1 with no grab. The
+    device's event virtqueue is drained from the timer tick; each
+    `virtio_input_event` maps 1:1 onto the b1nix input layer (Linux-identical
+    codes), with `EV_ABS` values scaled from the device's 0..32767 range to the
+    live framebuffer resolution. `make run-graphics` attaches
+    `-device virtio-tablet-pci`.
+- **displayd** consumes both: `EV_REL` accumulates a delta; `EV_ABS` sets the
+  cursor position directly (`userspace/bin/displayd.c`).

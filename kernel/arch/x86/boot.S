@@ -9,14 +9,15 @@ multiboot_header:
 	.long multiboot_header_end - multiboot_header
 	.long 0x100000000 - (MULTIBOOT2_MAGIC + MULTIBOOT2_ARCH_I386 + (multiboot_header_end - multiboot_header))
 
-	/* Framebuffer tag (type 5) */
+	/* Framebuffer tag (type 5). 1280x800 matches the virtio-gpu native scanout
+	 * so the multiboot framebuffer, displayd, and the GPU scanout all agree. */
 	.align 8
 framebuffer_tag_start:
 	.short 5
 	.short 0
 	.long 20
-	.long 1024
-	.long 768
+	.long 1280
+	.long 800
 	.long 32
 framebuffer_tag_end:
 

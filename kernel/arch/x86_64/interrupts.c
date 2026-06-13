@@ -276,6 +276,7 @@ void x86_timer_init(void) {
 }
 
 extern void ps2_kbd_interrupt_handler(void);
+extern void virtio_input_poll(void);
 extern void usb_kbd_poll(void);
 extern void ps2_mouse_interrupt_handler(void);
 
@@ -347,6 +348,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
        * some real IOAPIC setups can leave bytes pending without delivering
        * another edge; draining an empty controller is harmless. */
       ps2_kbd_interrupt_handler();
+      virtio_input_poll(); /* drain virtio-tablet absolute-pointer events */
       serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
 
       scheduler_on_timer_tick();

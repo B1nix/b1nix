@@ -267,6 +267,7 @@ void x86_timer_init(void) {
 }
 
 extern void ps2_kbd_interrupt_handler(void);
+extern void virtio_input_poll(void);
 extern void usb_kbd_poll(void);
 extern void ps2_mouse_interrupt_handler(void);
 extern void fb_console_blink_cursor(void);
@@ -310,6 +311,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
        * this just finds an empty buffer. Both paths run on the BSP in ISR
        * context (non-reentrant), so the single-producer kbd ring is safe. */
       ps2_kbd_interrupt_handler();
+      virtio_input_poll(); /* drain virtio-tablet absolute-pointer events */
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
       serial_tty_tick(); /* M39: drain UART RX for open /dev/ttySn sessions */
       timer_ticks++;
