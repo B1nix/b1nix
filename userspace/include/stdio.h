@@ -161,9 +161,9 @@ static inline char *fgets(char *s, int size, FILE *stream) {
     return s;
 }
 
-static inline int vsprintf(char *str, const char *format, va_list ap) {
-    return vsnprintf(str, 0x7fffffff, format, ap);
-}
+/* Real exported symbols (not header-only inlines): libstdc++'s locale code
+ * links against vsprintf/sprintf as external symbols. */
+int vsprintf(char *str, const char *format, va_list ap);
 
 #define BUFSIZ 1024
 #define _IOFBF 0

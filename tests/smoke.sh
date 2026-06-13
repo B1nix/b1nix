@@ -1124,6 +1124,9 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M50-DRM: ok rmfb" "M50: framebuffer removal"
 	check_output "$LOG" "M50-DRM: ok cleanup" "M50: close/munmap cleanup"
 
+	check_output "$LOG" "CXX-SMOKE: ok ctors" "C++: crt0 runs .init_array (static constructors)"
+	check_output "$LOG" "CXX-SMOKE: ok stl" "C++: libstdc++ STL (map/vector/string) runs on b1nix"
+	check_output "$LOG" "CXX-SMOKE: ok exceptions" "C++: exception throw/catch unwinds on b1nix"
 	check_output "$LOG" "M51-GFX: ok libm" "M51: ported libm (openlibm) runtime math"
 	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
 	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"

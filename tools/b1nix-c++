@@ -1,0 +1,69 @@
+#!/bin/sh
+# C++ -> b1nix ELF using the cross GCC's hosted libstdc++.
+#
+# Prereq: run tools/enable-cxx-toolchain.sh once (stages b1nix libc headers into
+# the toolchain sysroot + fixes libstdc++'s mbstate_t config). The b1nix libc
+# also needs vsprintf as a real symbol (libstdc++ locale links it).
+#
+# Usage:
+#   b1nix-c++ a.cpp b.cpp -o prog     # compile + link to a b1nix ELF
+#   b1nix-c++ -c a.cpp -o a.o         # compile only
+# Extra g++ flags pass through. B1NIX_ARCH=x86 selects the i686 toolchain.
+
+set -eu
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
+ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$ARCH" = "x86" ]; then
+  TRIPLET="i686-b1nix"; LDEMU="elf_i386"
+else
+  TRIPLET="x86_64-b1nix"; LDEMU="elf_x86_64"
+fi
+GXX="$ROOT/build/toolchain_build/$TRIPLET/cross/bin/$TRIPLET-g++"
+LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+USR="$ROOT/userspace"
+LIB="$USR/build/$ARCH/libb1nix.a"
+CRT0="$USR/build/$ARCH/crt/crt0.o"
+LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
+[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$LIB" "$CRT0"
+LIBSTDCXX="$("$GXX" -print-file-name=libstdc++.a)"
+LIBSUPCXX="$("$GXX" -print-file-name=libsupc++.a)"
+LIBGCC="$("$GXX" -print-libgcc-file-name)"
+
+CXXFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix"
+compile_only=0
+output="a.out"
+inputs=""
+passthru=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) compile_only=1 ;;
+    -o) shift; output="$1" ;;
+    *.cpp|*.cc|*.cxx|*.C|*.o|*.a) inputs="$inputs $1" ;;
+    *) passthru="$passthru $1" ;;
+  esac
+  shift
+done
+
+# shellcheck disable=SC2086
+if [ "$compile_only" -eq 1 ]; then
+  exec "$GXX" $CXXFLAGS $passthru -c $inputs -o "$output"
+fi
+
+objs=""
+tmp="${TMPDIR:-/tmp}/b1nix-cxx.$$"; mkdir -p "$tmp"
+for in in $inputs; do
+  case "$in" in
+    *.o|*.a) objs="$objs $in" ;;
+    *) o="$tmp/$(basename "$in").o"; "$GXX" $CXXFLAGS $passthru -c "$in" -o "$o"; objs="$objs $o" ;;
+  esac
+done
+
+# Link recipe: crt0 + objects, then the C++ runtime group. --allow-multiple-
+# definition resolves the i686 __divdi3/__moddi3 clash (b1nix div64 vs libgcc).
+# shellcheck disable=SC2086
+"$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
+  "$CRT0" $objs \
+  --start-group "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" \
+  --whole-archive "$LIB" --no-whole-archive --end-group
+rm -rf "$tmp"

@@ -668,6 +668,10 @@ int sprintf(char *str, const char *fmt, ...) {
   return n;
 }
 
+int vsprintf(char *str, const char *fmt, va_list ap) {
+  return vsnprintf(str, 0x7fffffff, fmt, ap);
+}
+
 /* ── scanf family ────────────────────────────────────────────────────────────
  * A single character-source-driven engine backs scanf/fscanf/sscanf. The source
  * is either a FILE* (stream) or a NUL-terminated string. It supports the common

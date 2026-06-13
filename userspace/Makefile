@@ -285,6 +285,12 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER
 	  $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
+# Hosted C++ smoke: built with the cross GCC's libstdc++ via tools/b1nix-c++
+# (NOT clang $(CC)). Requires the C++-enabled toolchain (enable-cxx-toolchain.sh).
+$(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-c++ $< -o $@
+
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
 # __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
 HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install

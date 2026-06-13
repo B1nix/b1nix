@@ -69,6 +69,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_harfbuzz_smoke \
 	m51_fontconfig_smoke \
 	m52_gl_smoke \
+	cxx_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -540,6 +541,15 @@ $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPAC
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
+
+# Hosted C++ runtime smoke. Enable libstdc++ against the b1nix libc first
+# (idempotent: stages headers + fixes mbstate_t config), then build via the
+# cross GCC C++ wrapper.
+$(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/b1nix-c++ tools/enable-cxx-toolchain.sh
+	@tools/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
+	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

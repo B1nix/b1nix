@@ -118,6 +118,19 @@ _start:
 	hlt
 	jmp .
 #else
+#ifndef B1NIX_DYNAMIC
+/* Weak refs to libgcc's DWARF frame registration (see the x86_64 block). 0 for
+ * clang-linked programs; real for libgcc-linked C++ binaries. */
+.weak __register_frame_info
+.weak __EH_FRAME_BEGIN__
+
+.section .bss
+.align 16
+.local __b1nix_eh_object
+__b1nix_eh_object:
+	.skip 48                        /* sizeof(struct object) in libgcc */
+#endif
+
 .section .text
 .globl _start
 .type _start, @function
@@ -139,6 +152,20 @@ _start:
 	movl %eax, %ebx                 /* argc */
 	movl %edx, %esi                 /* argv */
 	movl %ecx, %edi                 /* envp */
+
+#ifndef B1NIX_DYNAMIC
+	/* Register the program's .eh_frame with libgcc's DWARF unwinder so C++
+	 * exceptions work (mirrors the x86_64 path; cdecl, args on the stack).
+	 * No-op for clang binaries where __register_frame_info is weak-undefined. */
+	movl $__register_frame_info, %eax
+	testl %eax, %eax
+	jz 3f
+	pushl $__b1nix_eh_object
+	pushl $__EH_FRAME_BEGIN__
+	call __register_frame_info
+	addl $8, %esp
+3:
+#endif
 
 	/* Run ELF .init_array constructors before main(). */
 	movl $__init_array_start, %ecx

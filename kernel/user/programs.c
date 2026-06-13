@@ -1504,6 +1504,19 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* Hosted C++ toolchain: a libstdc++ binary (STL + exceptions + static ctors)
+   * runs correctly under b1nix. Foundation for Mesa and other C++ ports. */
+  {
+    u64 cxx_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/cxx-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)cxx_pid < 0) {
+      uwrite("CXX-SMOKE: spawn-fail\n");
+    } else {
+      int cxx_status = 0;
+      syscall_dispatch(SYS_WAIT, cxx_pid, (u64)(usize)&cxx_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M51: ported libm (openlibm) computes correctly at runtime. */
   {
     u64 m51_pid = syscall_dispatch(SYS_SPAWN,
