@@ -17,6 +17,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
+#include <sys/utsname.h>
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
 
@@ -132,8 +133,13 @@ int main(void) {
   ok("proc-pid-status");
 
   /* /sys/kernel/osrelease */
+  struct utsname uts;
+  if (uname(&uts) != 0) {
+    fail("sysfs-osrelease");
+    return 1;
+  }
   if (slurp("/sys/kernel/osrelease", buf, sizeof(buf)) <= 0 ||
-      !strstr(buf, "0.22.0")) {
+      !strstr(buf, uts.release)) {
     fail("sysfs-osrelease");
     return 1;
   }

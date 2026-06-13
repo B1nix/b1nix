@@ -60,6 +60,7 @@ EMBEDDED_USER_PROGRAMS := \
 	gterm \
 	gpaint \
 	gdesktop \
+	gabout \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 ifeq ($(ARCH),x86_64)

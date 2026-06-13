@@ -59,7 +59,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/div64.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
-	$(BUILD)/bin/gdesktop $(BUILD)/bin/m47d_smoke
+	$(BUILD)/bin/gdesktop $(BUILD)/bin/m47d_smoke $(BUILD)/bin/gabout
 
 PIC_LIBC_OBJS := $(patsubst $(BUILD)/libc/%.o,$(BUILD)/libc-pic/%.o,$(LIBC_OBJS))
 

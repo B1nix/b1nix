@@ -18,6 +18,7 @@
 #include <b1nix/filelock.h>
 #include <b1nix/aio.h>
 #include <string.h>
+#include <b1nix/version.h>
 
 
 #define MAX_EXEC_ARGS 256
@@ -2889,7 +2890,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     memset(&uts, 0, sizeof(uts));
     copy_cstr(uts.sysname, sizeof(uts.sysname), "B1NIX");
     copy_cstr(uts.nodename, sizeof(uts.nodename), "b1nix");
-    copy_cstr(uts.release, sizeof(uts.release), "0.22.0");
+    copy_cstr(uts.release, sizeof(uts.release), B1NIX_VERSION_STR);
     copy_cstr(uts.version, sizeof(uts.version), "M22 Core Utilities");
 #if defined(__aarch64__)
     copy_cstr(uts.machine, sizeof(uts.machine), "aarch64");

@@ -29,6 +29,8 @@
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
 #include <b1nix/blk.h>
+#include <b1nix/pci.h>
+#include <b1nix/version.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -204,7 +206,7 @@ static int r_loadavg(usize pid, struct sbuf *s) {
 
 static int r_version(usize pid, struct sbuf *s) {
   (void)pid;
-  sb_puts(s, "B1NIX version 0.22.0 (b1nix@localhost) (clang) #1 SMP\n");
+  sb_addf(s, "B1NIX version %s (b1nix@localhost) (clang) #1 SMP\n", B1NIX_VERSION_STR);
   return 0;
 }
 
@@ -216,6 +218,51 @@ static int r_cpuinfo(usize pid, struct sbuf *s) {
     sb_puts(s, "vendor_id\t: B1NIX\n");
     sb_puts(s, "model name\t: b1nix virtual CPU\n");
     sb_puts(s, "\n");
+  }
+  return 0;
+}
+
+static int r_gpuinfo(usize pid, struct sbuf *s) {
+  (void)pid;
+  struct pci_device_info pci;
+  int found = 0;
+  for (int idx = 0; idx < 4; idx++) {
+    if (pci_find_class(0x03, 0x00, (u8)idx, &pci) == 0) {
+      found = 1;
+      sb_addf(s, "vendor\t: 0x%04x\n", pci.vendor_id);
+      sb_addf(s, "device\t: 0x%04x\n", pci.device_id);
+      if (pci.vendor_id == 0x1af4 && pci.device_id == 0x1050) {
+        sb_puts(s, "model name\t: VirtIO GPU\n");
+      } else if (pci.vendor_id == 0x15ad && pci.device_id == 0x0405) {
+        sb_puts(s, "model name\t: VMware SVGA II\n");
+      } else if (pci.vendor_id == 0x80ee && pci.device_id == 0xbeef) {
+        sb_puts(s, "model name\t: VirtualBox Graphics Adapter\n");
+      } else if (pci.vendor_id == 0x1234 && pci.device_id == 0x1111) {
+        sb_puts(s, "model name\t: QEMU Standard VGA\n");
+      } else {
+        sb_puts(s, "model name\t: Generic Display Adapter\n");
+      }
+      u32 vram = pci_get_vram_size(pci.vendor_id, pci.device_id);
+      if (vram > 0) {
+        sb_addf(s, "vram\t: %lu MB\n", (unsigned long)(vram / (1024 * 1024)));
+      }
+      break;
+    }
+  }
+  if (!found) {
+    if (pci_find_class(0x03, 0x02, 0, &pci) == 0) {
+      found = 1;
+      sb_addf(s, "vendor\t: 0x%04x\n", pci.vendor_id);
+      sb_addf(s, "device\t: 0x%04x\n", pci.device_id);
+      sb_puts(s, "model name\t: 3D Graphics Accelerator\n");
+      u32 vram = pci_get_vram_size(pci.vendor_id, pci.device_id);
+      if (vram > 0) {
+        sb_addf(s, "vram\t: %lu MB\n", (unsigned long)(vram / (1024 * 1024)));
+      }
+    }
+  }
+  if (!found) {
+    sb_puts(s, "model name\t: Basic Framebuffer\n");
   }
   return 0;
 }
@@ -720,6 +767,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "loadavg", VFS_DEVICE, r_loadavg, 0);
   procfs_mkchild(root, "version", VFS_DEVICE, r_version, 0);
   procfs_mkchild(root, "cpuinfo", VFS_DEVICE, r_cpuinfo, 0);
+  procfs_mkchild(root, "gpuinfo", VFS_DEVICE, r_gpuinfo, 0);
   procfs_mkchild(root, "stat", VFS_DEVICE, r_stat, 0);
   procfs_mkchild(root, "vmstat", VFS_DEVICE, r_vmstat, 0);
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);

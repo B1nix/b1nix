@@ -31,6 +31,7 @@
 #include <syscall.h>
 #include <time.h>
 #include <unistd.h>
+#include <signal.h>
 
 #include "font8x8.h"
 
@@ -125,8 +126,9 @@ static unsigned frame_serial;
 static int surfaces_created;
 
 /* Top-bar clock, refreshed from the loop when the minute changes. */
-static char clock_hhmm[6] = "--:--";
+static char clock_hhmm[10] = "--:--";
 static int clock_last_min = -1;
+static int clock_24h = 1;
 
 enum panel_menu {
 	MENU_NONE,
@@ -238,14 +240,14 @@ static struct panel_layout get_panel_layout(void) {
 	p.edit_w = 6 * 8;
 	p.view_x = p.edit_x + p.edit_w;
 	p.view_w = 6 * 8;
-	p.clock_w = 5 * 8 + 16;
+	p.clock_w = strlen(clock_hhmm) * 8 + 16;
 	p.clock_x = (int)scr_w - p.clock_w - 4;
 	return p;
 }
 
 static int menu_item_count(enum panel_menu menu) {
 	switch (menu) {
-	case MENU_SYSTEM: return 4;
+	case MENU_SYSTEM: return 6;
 	case MENU_APP: return 3;
 	case MENU_FILE: return 2;
 	case MENU_EDIT: return 3;
@@ -259,7 +261,7 @@ static const char *menu_item_label(enum panel_menu menu, int item) {
 	switch (menu) {
 	case MENU_SYSTEM: {
 		static const char *labels[] = {
-		    "About b1nix", "Desktop", "Next Window", "Close Window"};
+		    "About b1nix", "Terminal", "Paint", "Clock App", "Next Window", "Close Window"};
 		return labels[item];
 	}
 	case MENU_APP: {
@@ -280,9 +282,10 @@ static const char *menu_item_label(enum panel_menu menu, int item) {
 		return labels[item];
 	}
 	case MENU_CLOCK: {
-		static const char *labels[] = {
-		    "Date & Time", "24-hour clock", "b1nix local time"};
-		return labels[item];
+		if (item == 0) return "Open Clock App";
+		if (item == 1) return clock_24h ? "[X] 24-hour clock" : "[ ] 24-hour clock";
+		if (item == 2) return "b1nix local time";
+		return "";
 	}
 	default:
 		return "";
@@ -291,12 +294,14 @@ static const char *menu_item_label(enum panel_menu menu, int item) {
 
 static int menu_item_enabled(enum panel_menu menu, int item) {
 	if (menu == MENU_CLOCK)
-		return 0;
+		return 1;
 	if ((menu == MENU_APP || menu == MENU_FILE || menu == MENU_EDIT) &&
 	    !slot_surface(focus_slot))
 		return 0;
-	if (menu == MENU_SYSTEM && (item == 0 || item == 1))
-		return 0;
+	if (menu == MENU_SYSTEM) {
+		if (item == 4 && zcount == 0) return 0;
+		if (item == 5 && !slot_surface(focus_slot)) return 0;
+	}
 	return 1;
 }
 
@@ -1008,6 +1013,7 @@ static int surface_at(int x, int y) {
 }
 
 static void focus_cycle(void);
+static int update_clock(void);
 
 static void close_focused_window(void) {
 	struct dsurface *f = slot_surface(focus_slot);
@@ -1044,25 +1050,60 @@ static void open_panel_menu(enum panel_menu menu) {
 	composite_rect(0, 0, (int)scr_w, (int)scr_h);
 }
 
+static void spawn_app(const char *path, const char *arg) {
+	pid_t pid = fork();
+	if (pid == 0) {
+		if (arg) {
+			execlp(path, path, arg, (char *)0);
+		} else {
+			execlp(path, path, (char *)0);
+		}
+		_exit(127);
+	}
+}
+
 static void activate_menu_item(enum panel_menu menu, int item) {
 	if (!menu_item_enabled(menu, item))
 		return;
 	close_panel_menu();
-	if ((menu == MENU_SYSTEM && item == 2) ||
-	    (menu == MENU_APP && item == 1) ||
-	    (menu == MENU_VIEW && item == 0))
-		focus_cycle();
-	else if ((menu == MENU_SYSTEM && item == 3) ||
-	         (menu == MENU_APP && item == 2) ||
-	         menu == MENU_FILE)
+	if (menu == MENU_SYSTEM) {
+		if (item == 0) spawn_app("/bin/gabout", NULL);
+		else if (item == 1) spawn_app("/bin/gterm", NULL);
+		else if (item == 2) spawn_app("/bin/gpaint", NULL);
+		else if (item == 3) spawn_app("/bin/gclock", NULL);
+		else if (item == 4) focus_cycle();
+		else if (item == 5) close_focused_window();
+	}
+	else if (menu == MENU_APP) {
+		if (item == 0) spawn_app("/bin/gabout", active_app_title());
+		else if (item == 1) focus_cycle();
+		else if (item == 2) close_focused_window();
+	}
+	else if (menu == MENU_FILE) {
 		close_focused_window();
+	}
 	else if (menu == MENU_EDIT) {
 		static const uint32_t edit_keys[] = {0x2d, 0x2e, 0x2f};
 		send_focused_shortcut(edit_keys[item]);
 	}
-	else if (menu == MENU_VIEW && item == 1 && focus_slot >= 0) {
-		zorder_raise(focus_slot);
-		composite_rect(0, PANEL_H, (int)scr_w, (int)scr_h - PANEL_H);
+	else if (menu == MENU_VIEW) {
+		if (item == 0) focus_cycle();
+		else if (item == 1 && focus_slot >= 0) {
+			zorder_raise(focus_slot);
+			composite_rect(0, PANEL_H, (int)scr_w, (int)scr_h - PANEL_H);
+		}
+	}
+	else if (menu == MENU_CLOCK) {
+		if (item == 0) {
+			spawn_app("/bin/gclock", NULL);
+		} else if (item == 1) {
+			clock_24h = !clock_24h;
+			clock_last_min = -1;
+			update_clock();
+			composite_rect(0, 0, (int)scr_w, PANEL_H);
+		} else if (item == 2) {
+			spawn_app("/bin/gabout", "date");
+		}
 	}
 }
 
@@ -1323,16 +1364,31 @@ static int update_clock(void) {
 	struct tm *t = localtime_r(&now, &tmv);
 	if (!t)
 		return 0;
-	if (t->tm_min == clock_last_min)
+	if (t->tm_min == clock_last_min && clock_last_min >= 0)
 		return 0;
 	clock_last_min = t->tm_min;
 	int h = t->tm_hour, m = t->tm_min;
-	clock_hhmm[0] = (char)('0' + (h / 10) % 10);
-	clock_hhmm[1] = (char)('0' + h % 10);
-	clock_hhmm[2] = ':';
-	clock_hhmm[3] = (char)('0' + (m / 10) % 10);
-	clock_hhmm[4] = (char)('0' + m % 10);
-	clock_hhmm[5] = 0;
+	if (clock_24h) {
+		clock_hhmm[0] = (char)('0' + (h / 10) % 10);
+		clock_hhmm[1] = (char)('0' + h % 10);
+		clock_hhmm[2] = ':';
+		clock_hhmm[3] = (char)('0' + (m / 10) % 10);
+		clock_hhmm[4] = (char)('0' + m % 10);
+		clock_hhmm[5] = 0;
+	} else {
+		int is_pm = h >= 12;
+		int h12 = h % 12;
+		if (h12 == 0) h12 = 12;
+		clock_hhmm[0] = (char)('0' + (h12 / 10) % 10);
+		clock_hhmm[1] = (char)('0' + h12 % 10);
+		clock_hhmm[2] = ':';
+		clock_hhmm[3] = (char)('0' + (m / 10) % 10);
+		clock_hhmm[4] = (char)('0' + m % 10);
+		clock_hhmm[5] = ' ';
+		clock_hhmm[6] = is_pm ? 'P' : 'A';
+		clock_hhmm[7] = 'M';
+		clock_hhmm[8] = 0;
+	}
 	return 1;
 }
 
@@ -1341,6 +1397,8 @@ static int update_clock(void) {
 int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
+
+	signal(SIGCHLD, SIG_IGN);
 
 	fb_fd = open("/dev/fb0", O_RDWR);
 	if (fb_fd < 0) {

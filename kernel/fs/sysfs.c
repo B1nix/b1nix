@@ -13,6 +13,7 @@
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
+#include <b1nix/version.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <string.h>
@@ -213,7 +214,7 @@ static void sysfs_build_block(struct vfs_node *root) {
 
 /* ── content generators ── */
 static int g_ostype(char *b, usize c) { return snprintf(b, c, "B1NIX\n"); }
-static int g_osrelease(char *b, usize c) { return snprintf(b, c, "0.22.0\n"); }
+static int g_osrelease(char *b, usize c) { return snprintf(b, c, "%s\n", B1NIX_VERSION_STR); }
 static int g_hostname(char *b, usize c) { return snprintf(b, c, "b1nix\n"); }
 static int g_kversion(char *b, usize c) {
   return snprintf(b, c, "#1 SMP b1nix\n");

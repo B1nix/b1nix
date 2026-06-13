@@ -176,3 +176,20 @@ int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info 
 
 	return 0;
 }
+
+u32 pci_get_vram_size(u16 vendor_id, u16 device_id)
+{
+	if (vendor_id == 0x1234 && device_id == 0x1111) {
+		return 16 * 1024 * 1024; // QEMU Standard VGA (16 MB)
+	}
+	if (vendor_id == 0x1af4 && device_id == 0x1050) {
+		return 16 * 1024 * 1024; // VirtIO GPU (16 MB)
+	}
+	if (vendor_id == 0x15ad && device_id == 0x0405) {
+		return 16 * 1024 * 1024; // VMware SVGA II (16 MB)
+	}
+	if (vendor_id == 0x80ee && device_id == 0xbeef) {
+		return 16 * 1024 * 1024; // VirtualBox Graphics Adapter (16 MB)
+	}
+	return 0;
+}

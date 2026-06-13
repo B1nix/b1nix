@@ -47,6 +47,7 @@
 #include "initramfs_gterm.inc"
 #include "initramfs_gpaint.inc"
 #include "initramfs_gdesktop.inc"
+#include "initramfs_gabout.inc"
 #include "initramfs_dropbear.inc"
 #include "initramfs_bash.inc"
 #include "initramfs_telinit.inc"
@@ -1009,6 +1010,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_gpaint_elf), INITRAMFS_EXECUTABLE},
     {"/bin/gdesktop", (const char *)vfs_gdesktop_elf,
      sizeof(vfs_gdesktop_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/gabout", (const char *)vfs_gabout_elf,
+     sizeof(vfs_gabout_elf), INITRAMFS_EXECUTABLE},
     /* M30: compatibility interpreter path. Startup dependency loading,
      * symbol lookup, and relocation are performed eagerly by the kernel. */
     {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,
