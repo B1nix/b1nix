@@ -337,7 +337,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source root-image \
 	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
-	smoke smoke-x86_64 smoke-x86 graphics-smoke memory-smoke
+	smoke smoke-quick graphics-smoke memory-smoke
 
 all: $(KERNEL_ELF)
 
@@ -829,18 +829,12 @@ distclean: clean
 
 # ── Smoke Tests ──
 smoke:
-	@echo "Running smoke tests for $(ARCH)..."
-	sh tests/smoke.sh $(ARCH)
+	@echo "Running parallel full smoke tests for $(ARCH)..."
+	SMOKE_PARALLEL=1 sh tests/smoke.sh $(ARCH)
 
-smoke-x86_64:
-	@$(MAKE) ARCH=x86_64 smoke
-
-smoke-x86:
-	@$(MAKE) ARCH=x86 smoke
-
-smoke-all-parallel:
-	@echo "Running smoke tests for both architectures in parallel..."
-	@$(MAKE) -j2 smoke-x86_64 smoke-x86
+smoke-quick:
+	@echo "Running quick smoke tests for $(ARCH)..."
+	SMOKE_QUICK=1 sh tests/smoke.sh $(ARCH)
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)

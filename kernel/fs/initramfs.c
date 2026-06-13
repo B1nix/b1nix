@@ -398,6 +398,7 @@ static const char initramfs_bb_w6_sh[] =
 static const char posix_smoke_script[] =
     "#!/bin/sh\n"
     "echo \"POSIX-SMOKE: start\"\n"
+    "if ! grep -q 'b1nix.smoke=shell' /proc/cmdline; then\n"
     /* ── M11 Shell Baseline ─────────────────────────────────────── */
     /* 1. simple success */
     "true && echo \"M11-SHELL: ok simple-success\"\n"
@@ -660,6 +661,8 @@ static const char posix_smoke_script[] =
     "  echo \"M22-POLISH: ok failure-status\"\n"
     "fi\n"
     "echo \"M22-POLISH: done\"\n"
+    "fi\n"
+    "if ! grep -q 'b1nix.smoke=graphics' /proc/cmdline; then\n"
     "# ── Upstream BusyBox package smoke tests ──\n"
     "echo \"BB-SMOKE: start\"\n"
     "/opt/busybox/bin/busybox --list | grep -q \"echo\" && echo \"BB-SMOKE: ok list\"\n"
@@ -910,6 +913,7 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox rmdir /tmp/bb_dir\n"
     "[ ! -d /tmp/bb_dir ] && echo \"BB-SMOKE: ok rmdir\"\n"
     "echo \"BB-SMOKE: done\"\n"
+    "fi\n"
     "echo \"POSIX-SMOKE: done\"\n";
 
 

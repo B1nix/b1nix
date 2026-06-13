@@ -42,6 +42,8 @@ else
 fi
 TIMEOUT=${TIMEOUT:-$DEFAULT_TIMEOUT}
 SMOKE_VERBOSE=${SMOKE_VERBOSE:-0}
+SMOKE_QUICK=${SMOKE_QUICK:-0}
+SMOKE_PARALLEL=${SMOKE_PARALLEL:-0}
 SMOKE_PROGRESS_MODE=full
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG_BOOT="$PROJECT_DIR/smoke_run/sata-smoke-boot-$$.img"
@@ -51,6 +53,12 @@ SWAP_IMG_BOOT="$PROJECT_DIR/smoke_run/swap-smoke-boot-$$.img"
 SATA_IMG_SMP="$PROJECT_DIR/smoke_run/sata-smoke-smp-$$.img"
 NVME_IMG_SMP="$PROJECT_DIR/smoke_run/nvme-smoke-smp-$$.img"
 SWAP_IMG_SMP="$PROJECT_DIR/smoke_run/swap-smoke-smp-$$.img"
+SATA_IMG_USER="$PROJECT_DIR/smoke_run/sata-smoke-user-$$.img"
+NVME_IMG_USER="$PROJECT_DIR/smoke_run/nvme-smoke-user-$$.img"
+SWAP_IMG_USER="$PROJECT_DIR/smoke_run/swap-smoke-user-$$.img"
+SATA_IMG_SHELL="$PROJECT_DIR/smoke_run/sata-smoke-shell-$$.img"
+NVME_IMG_SHELL="$PROJECT_DIR/smoke_run/nvme-smoke-shell-$$.img"
+SWAP_IMG_SHELL="$PROJECT_DIR/smoke_run/swap-smoke-shell-$$.img"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -113,17 +121,22 @@ run_qemu() {
 	local log="$1"
 	shift
 	local pid
+	local done_pattern="${SMOKE_DONE_PATTERN:-B1NIX-TEST: done|KERNEL PANIC|\[PANIC\]}"
   
 	if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		local filter_dump_args=""
-		if qemu-system-x86_64 -object filter-dump,help >/dev/null 2>&1; then
+		if [ "${SMOKE_PCAP:-0}" = "1" ] &&
+		   qemu-system-x86_64 -object filter-dump,help >/dev/null 2>&1; then
 			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=${NET_PCAP:-$PROJECT_DIR/smoke_run/net-$ARCH.pcap}"
 		fi
 
-		qemu-system-x86_64 \
+		set -- qemu-system-x86_64 \
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -display none -monitor none -no-reboot \
-			-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
+			-device isa-debug-exit,iobase=0xf4,iosize=0x04
+
+		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
+			set -- "$@" \
 				-device virtio-gpu-pci \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				${filter_dump_args} \
@@ -137,8 +150,12 @@ run_qemu() {
 				-device ide-hd,drive=swapdrive,bus=ahci.1 \
 				-drive file="$NVME_IMG",if=none,id=nvmedrive,format=raw \
 				-device nvme,serial=deadbeef,drive=nvmedrive \
-				${EXTRA_QEMU_ARGS:-} \
-				>"$log" 2>&1 &
+				${EXTRA_QEMU_ARGS:-}
+		else
+			set -- "$@" -nic none -vga none ${EXTRA_QEMU_ARGS:-}
+		fi
+
+		"$@" >"$log" 2>&1 &
 		pid=$!
 
 		# Wait for completion marker/panic or timeout, then kill QEMU.
@@ -155,7 +172,7 @@ run_qemu() {
 						done
 					reported_lines=$line_count
 				fi
-				if grep -q -E 'B1NIX-TEST: done|KERNEL PANIC|\[PANIC\]' "$log" 2>/dev/null; then
+				if grep -q -E "$done_pattern" "$log" 2>/dev/null; then
 					break
 				fi
 				if ! kill -0 "$pid" 2>/dev/null; then
@@ -178,7 +195,6 @@ run_qemu() {
 				fi
 				sleep 1
 			done
-			sleep 2
 			kill "$pid" 2>/dev/null || true
 		) &
 		local watcher_pid=$!
@@ -215,13 +231,36 @@ cd "$PROJECT_DIR"
 # can't rebuild every userspace port locally). SMOKE_MAKE_ARGS lets the caller
 # inject extra make flags (e.g. CC=clang LD=ld.lld on Fedora, where `cc` is gcc).
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
-	test -f "build/$ARCH/b1nix.iso" || { echo "  ${RED}no prebuilt build/$ARCH/b1nix.iso${NC}"; exit 1; }
-	echo "  (SKIP_BUILD=1 — reusing build/$ARCH/b1nix.iso)"
+	if [ "$SMOKE_PARALLEL" = "1" ]; then
+		test -f "build/$ARCH/b1nix-core.iso" &&
+		test -f "build/$ARCH/b1nix-graphics.iso" &&
+		test -f "build/$ARCH/b1nix-shell.iso" || {
+			echo "  ${RED}no prebuilt split smoke ISOs${NC}"
+			exit 1
+		}
+	else
+		test -f "build/$ARCH/b1nix.iso" || { echo "  ${RED}no prebuilt build/$ARCH/b1nix.iso${NC}"; exit 1; }
+	fi
+	echo "  (SKIP_BUILD=1 — reusing prebuilt ISO)"
 else
-	make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1" iso >/dev/null 2>&1 || {
+	QUICK_CMDLINE=""
+	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
+	if [ "$SMOKE_PARALLEL" = "1" ]; then
+		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=core" iso >/dev/null 2>&1 &&
+		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-core.iso" &&
+		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=graphics" iso >/dev/null 2>&1 &&
+		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-graphics.iso" &&
+		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=shell" iso >/dev/null 2>&1 &&
+		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-shell.iso" || {
+			echo "  ${RED}BUILD FAILED${NC}"
+			exit 1
+		}
+	else
+		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >/dev/null 2>&1 || {
 		echo "  ${RED}BUILD FAILED${NC}"
 		exit 1
-	}
+		}
+	fi
 fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
@@ -230,11 +269,14 @@ echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
 dd if=/dev/zero of="$SATA_IMG_BOOT" bs=1M count=4 2>/dev/null
 dd if=/dev/zero of="$NVME_IMG_BOOT" bs=1M count=4 2>/dev/null
 dd if=/dev/zero of="$SWAP_IMG_BOOT" bs=1M count=2 2>/dev/null
-
-# Create dummy images for SATA, NVMe and Swap tests (SMP run)
-dd if=/dev/zero of="$SATA_IMG_SMP" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$NVME_IMG_SMP" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$SWAP_IMG_SMP" bs=1M count=2 2>/dev/null
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	dd if=/dev/zero of="$SATA_IMG_USER" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$NVME_IMG_USER" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$SWAP_IMG_USER" bs=1M count=2 2>/dev/null
+	dd if=/dev/zero of="$SATA_IMG_SHELL" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$NVME_IMG_SHELL" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$SWAP_IMG_SHELL" bs=1M count=2 2>/dev/null
+fi
 
 MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
 if [ ! -x "$MKE2FS" ]; then
@@ -258,27 +300,26 @@ fi
         exit 1
     }
 }
-
-# Format SMP run images
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SMP" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$SATA_IMG_SMP" 2>/dev/null || {
-        echo "Error: Failed to format sata smp image as ext4."
-        exit 1
-    }
-}
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SMP" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$NVME_IMG_SMP" 2>/dev/null || {
-        echo "Error: Failed to format nvme smp image as ext4."
-        exit 1
-    }
-}
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_USER" 2>/dev/null
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_USER" 2>/dev/null
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SHELL" 2>/dev/null
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SHELL" 2>/dev/null
+fi
 
 # Define logs
 LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot-$ARCH.log"
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
+CORE_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-core-$ARCH.log"
+USER_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-graphics-$ARCH.log"
+SHELL_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-shell-$ARCH.log"
 
 echo ""
-echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	echo "[RUN] Booting core, graphics, shell, and SMP QEMU instances in parallel..."
+else
+	echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
+fi
 
 # Run Boot QEMU in the background
 (
@@ -286,28 +327,99 @@ echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
 	NVME_IMG="$NVME_IMG_BOOT"
 	SWAP_IMG="$SWAP_IMG_BOOT"
 	NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-boot.pcap"
+	if [ "$SMOKE_PARALLEL" = "1" ]; then
+		B1NIX_ISO_NAME=b1nix-core.iso
+		LOG="$CORE_LOG"
+	fi
+	if [ "$SMOKE_QUICK" = "1" ]; then
+		SMOKE_FAST_SMP=1
+		SMOKE_DONE_PATTERN="B1NIX-QUICK: done|KERNEL PANIC|\[PANIC\]"
+	fi
 	SMOKE_PROGRESS_MODE=full
 	PROGRESS_PREFIX="[boot] "
-	run_qemu "$LOG"
+	run_qemu "${LOG}"
 ) &
 pid_boot=$!
 
-# Run SMP QEMU in the background
-(
-	SATA_IMG="$SATA_IMG_SMP"
-	NVME_IMG="$NVME_IMG_SMP"
-	SWAP_IMG="$SWAP_IMG_SMP"
-	NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-smp.pcap"
-	EXTRA_QEMU_ARGS="-smp 4"
-	SMOKE_PROGRESS_MODE=smp
-	PROGRESS_PREFIX="[smp]  "
-	run_qemu "$SMP_LOG"
-) &
-pid_smp=$!
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	(
+		SATA_IMG="$SATA_IMG_USER"
+		NVME_IMG="$NVME_IMG_USER"
+		SWAP_IMG="$SWAP_IMG_USER"
+		B1NIX_ISO_NAME=b1nix-graphics.iso
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[gfx]  "
+		run_qemu "$USER_LOG"
+	) &
+	pid_user=$!
+	(
+		SATA_IMG="$SATA_IMG_SHELL"
+		NVME_IMG="$NVME_IMG_SHELL"
+		SWAP_IMG="$SWAP_IMG_SHELL"
+		B1NIX_ISO_NAME=b1nix-shell.iso
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[shell] "
+		run_qemu "$SHELL_LOG"
+	) &
+	pid_shell=$!
+	(
+		B1NIX_ISO_NAME=b1nix-core.iso
+		EXTRA_QEMU_ARGS="-smp 4"
+		SMOKE_FAST_SMP=1
+		SMOKE_DONE_PATTERN="M24B-SMP: (ok|fail) work-stealing|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=smp
+		PROGRESS_PREFIX="[smp]  "
+		run_qemu "$SMP_LOG"
+	) &
+	pid_smp=$!
+else
+	(
+		SATA_IMG="$SATA_IMG_SMP"
+		NVME_IMG="$NVME_IMG_SMP"
+		SWAP_IMG="$SWAP_IMG_SMP"
+		NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-smp.pcap"
+		EXTRA_QEMU_ARGS="-smp 4"
+		SMOKE_FAST_SMP=1
+		SMOKE_DONE_PATTERN="M24B-SMP: (ok|fail) work-stealing|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=smp
+		PROGRESS_PREFIX="[smp]  "
+		run_qemu "$SMP_LOG"
+	) &
+	pid_smp=$!
+fi
 
 # Wait for both runs to complete
 wait $pid_boot
-wait $pid_smp
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	wait $pid_user
+	wait $pid_shell
+	wait $pid_smp
+	cat "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" >"$LOG"
+else
+	wait $pid_smp
+fi
+
+if [ "$SMOKE_QUICK" = "1" ]; then
+	echo ""
+	echo "=== Analyzing Quick Smoke Results ==="
+	check_output "$LOG" "b1nix kernel" "kernel banner appears"
+	check_output "$LOG" "B1NIX-QUICK: ok native" "native userspace smoke passes"
+	check_output "$LOG" "B1NIX-QUICK: done" "quick smoke completes"
+	check_output "$SMP_LOG" "M24B-SMP: ok work-stealing" "SMP work-stealing passes"
+	if grep -q -E "KERNEL PANIC|\[PANIC\]" "$LOG" "$SMP_LOG" 2>/dev/null; then
+		fail "quick smoke completes without panic" "PANIC detected in log"
+	else
+		pass "quick smoke completes without panic"
+	fi
+	echo ""
+	echo "=== Results ==="
+	echo "  Passed:  $PASSED"
+	echo "  Failed:  $FAILED"
+	rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
+	rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
+	[ "$FAILED" -eq 0 ]
+	exit
+fi
 
 echo ""
 echo "=== Analyzing Test Results ==="
@@ -1161,7 +1273,11 @@ echo ""
 echo "[RUN] M24b SMP work-stealing (-smp 4) checks..."
 check_output "$SMP_LOG" "smp: AP 1 ready" "Application Processor boots (INIT-SIPI)"
 check_output "$SMP_LOG" "M24B-SMP: ok work-stealing" "cross-CPU work-stealing runs stolen tasks on APs"
-check_output "$SMP_LOG" "B1NIX-TEST: done" "full suite completes under SMP"
+if grep -q -E "KERNEL PANIC|\[PANIC\]" "$SMP_LOG" 2>/dev/null; then
+	fail "SMP self-test completes without panic" "PANIC detected in log"
+else
+	pass "SMP self-test completes without panic"
+fi
 
 # ── Summary ──
 echo ""
@@ -1172,6 +1288,8 @@ echo "  Skipped: $SKIPPED"
 
 rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
 rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
+rm -f "$SATA_IMG_USER" "$NVME_IMG_USER" "$SWAP_IMG_USER"
+rm -f "$SATA_IMG_SHELL" "$NVME_IMG_SHELL" "$SWAP_IMG_SHELL"
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images

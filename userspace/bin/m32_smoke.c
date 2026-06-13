@@ -188,15 +188,17 @@ static int recv_with_retry(int fd, char *buf, int max) {
 }
 
 static int connect_loopback(unsigned short port) {
-  int fd = socket(AF_INET, SOCK_STREAM, 0);
-  if (fd < 0) return -1;
   struct sockaddr_in addr;
   make_loopback_addr(port, &addr);
-  if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  for (int tries = 0; tries < 100; tries++) {
+    int fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) return -1;
+    if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
+      return fd;
     close(fd);
-    return -1;
+    syscall(SYS_YIELD);
   }
-  return fd;
+  return -1;
 }
 
 static int run_server(unsigned short port) {
@@ -283,7 +285,6 @@ static int test_tcp_client_server(void) {
     _exit(run_server(port));
   }
 
-  sleep(1);
   int fd = connect_loopback(port);
   if (fd < 0) {
     fail("tcp-connect");
@@ -675,15 +676,22 @@ static int test_tcp6_loopback(void) {
   if (pid < 0) { fail("tcp6-fork"); return -1; }
   if (pid == 0) _exit(run_server6(port));
 
-  sleep(1);
-  int fd = socket(AF_INET6, SOCK_STREAM, 0);
-  if (fd < 0) { fail("tcp6-socket"); return -1; }
   struct sockaddr_in6 pa;
   memset(&pa, 0, sizeof(pa));
   pa.sin6_family = AF_INET6;
   pa.sin6_port = htons(port);
   pa.sin6_addr = in6addr_loopback;
-  if (connect(fd, (struct sockaddr *)&pa, sizeof(pa)) < 0) {
+  int fd = -1;
+  for (int tries = 0; tries < 100; tries++) {
+    fd = socket(AF_INET6, SOCK_STREAM, 0);
+    if (fd < 0) { fail("tcp6-socket"); return -1; }
+    if (connect(fd, (struct sockaddr *)&pa, sizeof(pa)) == 0)
+      break;
+    close(fd);
+    fd = -1;
+    syscall(SYS_YIELD);
+  }
+  if (fd < 0) {
     fail("tcp6-connect");
     return -1;
   }
@@ -1407,7 +1415,6 @@ static int test_socket_options(void) {
     _exit(r == 5 ? 0 : 5);
   }
 
-  sleep(1);
   int cfd = connect_loopback(sport);
   if (cfd < 0) { fail("getpeername-connect"); return -1; }
   struct sockaddr_in peer;

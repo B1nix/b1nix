@@ -74,7 +74,7 @@ per-inode locking, and durable ext* metadata synchronization move it forward
 significantly. The branch is nearing closure: remaining gaps are primarily in
 exotic cross-mount semantics and edge cases of block-device recovery.
 
-Verification note: `make smoke-x86` currently reaches and passes the M22, M24,
+Verification note: `make ARCH=x86 smoke` currently reaches and passes the M22, M24,
 and POSIX shell-driven smoke markers. This is still smoke coverage, not a full
 POSIX conformance result.
 
@@ -221,7 +221,7 @@ Run at least:
 
 ```sh
 make ARCH=x86
-make smoke-x86
+make ARCH=x86 smoke
 ```
 
 Inside B1NIX, manually exercise:
@@ -283,7 +283,7 @@ unsupported-flag parity with GNU/BSD userlands).
 TCP e2e completeness is tracked under network scope; M11 accepts either
 `TCP-SMOKE: path-exercised` or an explicit `TCP-SMOKE: unsupported` marker.
 
-Verification note: `make smoke-x86` currently reaches and passes the
+Verification note: `make ARCH=x86 smoke` currently reaches and passes the
 shell/coreutils smoke path. Treat the percentage as feature-completeness, not
 full POSIX conformance.
 
@@ -429,7 +429,7 @@ pipes, exit statuses, and common file/text utilities.
 
    Acceptance:
 
-   - `make smoke-x86` includes the shell/coreutils script path.
+   - `make ARCH=x86 smoke` includes the shell/coreutils script path.
    - The smoke log prints one clear `PASS shell/coreutils` marker.
    - Failures print the command that failed.
 
@@ -439,7 +439,7 @@ Run at least:
 
 ```sh
 make ARCH=x86
-make smoke-x86
+make ARCH=x86 smoke
 ```
 
 Inside B1NIX, manually exercise:

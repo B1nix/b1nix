@@ -12,7 +12,7 @@ roadmap from growing surprise requirements after every code change.
 ## Global Close Rules
 
 - `make ARCH=x86` must pass without warnings from touched code.
-- `make smoke-x86` must pass, with only explicitly documented skips allowed.
+- `make ARCH=x86 smoke` must pass, with only explicitly documented skips allowed.
 - No temporary debug output, test-only hacks, or non-English source comments in
   active `kernel`, `userspace`, `tests`, or `docs` paths.
 - A feature can be `done` only when there is at least one automated or written
@@ -63,7 +63,7 @@ Minimum checks:
 
 ```sh
 make ARCH=x86
-make smoke-x86
+make ARCH=x86 smoke
 make root-image
 make run-root
 ```
@@ -117,7 +117,7 @@ Minimum checks:
 
 ```sh
 make ARCH=x86
-make smoke-x86
+make ARCH=x86 smoke
 ```
 
 Manual script to keep passing:

@@ -1214,6 +1214,25 @@ static int init_main(int argc, const char **argv) {
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
   if (bootinfo_has_flag("b1nix.test=1")) {
+  if (bootinfo_has_flag("b1nix.smoke=quick")) {
+    uwrite("B1NIX-QUICK: start\n");
+    u64 pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke",
+                               0, 0, 0, 0, 0);
+    int status = 1;
+    if ((isize)pid >= 0)
+      syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+    uwrite(status == 0 ? "B1NIX-QUICK: ok native\n"
+                       : "B1NIX-QUICK: fail native\n");
+    uwrite("B1NIX-QUICK: done\n");
+    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
+  }
+  int smoke_split = bootinfo_has_flag("b1nix.smoke=core") ||
+                    bootinfo_has_flag("b1nix.smoke=graphics") ||
+                    bootinfo_has_flag("b1nix.smoke=shell");
+  int smoke_core = !smoke_split || bootinfo_has_flag("b1nix.smoke=core");
+  int smoke_graphics = !smoke_split || bootinfo_has_flag("b1nix.smoke=graphics");
+  int smoke_shell = !smoke_split || bootinfo_has_flag("b1nix.smoke=shell");
+
   /* M27: kernel command line key=value parser self-test. The smoke harness
    * passes "b1nix.test=1 b1nix.kvtest=abc123" so we can verify a present key,
    * an absent key, prefix non-matching, and value truncation. */
@@ -1259,6 +1278,7 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  if (smoke_core) {
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
   
   if ((isize)n_pid < 0) {
@@ -1460,7 +1480,9 @@ static int init_main(int argc, const char **argv) {
       syscall_dispatch(SYS_WAIT, m46_pid, (u64)(usize)&m46_status, 0, 0, 0, 0);
     }
   }
+  }
 
+  if (smoke_graphics) {
   /* M48: ancillary data on UNIX sockets, in-flight fd references, sender
    * credentials, and anonymous mmap-able files. */
   {
@@ -1706,7 +1728,9 @@ static int init_main(int argc, const char **argv) {
       }
     }
   }
+  }
 
+  if (smoke_graphics) {
   /* bash: the upstream GNU bash 5.2 port is the default shell. Run its feature
    * smoke through /bin/bash to prove the real bash (arrays, [[ ]], regex, brace
    * ranges, C-style for, pattern substitution) is what /bin/sh now resolves to. */
@@ -1871,7 +1895,10 @@ static int init_main(int argc, const char **argv) {
     uwrite("M16-SMOKE: fail app-lifecycle\n");
     uwrite("M16-SMOKE: fail done\n");
   }
+  (void)shell_smoke_main(0, 0);
+  }
 
+  if (smoke_shell) {
   (void)m22_smoke_main(0, 0);
   (void)m24_stress_main(0, 0);
   (void)shell_smoke_main(0, 0);
@@ -1905,7 +1932,9 @@ static int init_main(int argc, const char **argv) {
 
   (void)lock_smoke_main(0, 0);
   (void)ext_stress_main(0, 0);
+  }
 
+  if (smoke_core) {
   const char *net_ping_argv[] = {"/bin/ping", "-c", "2", "10.0.2.2", 0};
   u64 net_ping_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)net_ping_argv[0], 4, (u64)(usize)net_ping_argv, 0, 0, 0);
   int net_ping_status = 1;
@@ -1983,6 +2012,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M24B-BKL: ok userspace-on-ap\n");
     else
       uwrite("M24B-BKL: fail userspace-on-ap\n");
+  }
   }
 
   uwrite("B1NIX-TEST: done\n");

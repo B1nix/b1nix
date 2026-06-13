@@ -20,7 +20,8 @@ glyph ink. `M51-GFX: ok cairo-wayland`. This is the "run a Cairo Wayland app wit
 scalable fonts" deliverable (shaped text via HarfBuzz and keyboard
 input/clipboard still pending).
 
-Lesson: run the two arches sequentially/isolated (2 VMs each). `smoke-all-parallel`
+Lesson: run the two arches sequentially/isolated (2 VMs each). Parallel
+cross-architecture smoke
 (4 TCG VMs) overloads this host and times out the SMP runs even with warm
 libs — both arches pass isolated (x86_64 611/0, x86 610/0).
 
@@ -38,9 +39,10 @@ snag was a duplicate `frexp` (libm vs libc) — fixed by weakening openlibm's
 asserts the glyphs painted dark ink over a white background — the whole
 cairo→pixman→freetype path end-to-end.
 
-## Note: smoke-all-parallel + cold port builds overloads the host
+## Note: parallel cross-architecture smoke + cold port builds overloads the host
 
-`make smoke-all-parallel` runs 4 TCG VMs; if the Cairo/FreeType archives aren't
+Running both architecture smoke suites together starts 4 TCG VMs; if the
+Cairo/FreeType archives aren't
 built yet it also runs two cold library builds concurrently, which starved the
 slow i386-SMP VM and timed it out (uuidgen, near the end). Pre-build the port
 libs first (or run arches sequentially); with a warm cache the parallel run is

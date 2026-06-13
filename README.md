@@ -206,7 +206,7 @@ ssh -p 2222 root@127.0.0.1
 
 ## Testing
 
-Run the main boot and subsystem suite:
+Run the full smoke suite across three parallel test VMs plus a short SMP VM:
 
 ```sh
 make smoke
@@ -215,17 +215,17 @@ make smoke
 Other useful targets:
 
 ```sh
-make smoke-x86_64
-make smoke-x86
+make smoke-quick
+make ARCH=x86 smoke
 make graphics-smoke
 make memory-smoke
 make analyze
-make smoke
 ```
 
-Smoke logs, packet captures, and temporary disk images are written to
-`smoke_run/`. The default output follows milestone markers live while QEMU is
-running. Set `SMOKE_VERBOSE=1` to also print every post-run assertion:
+Smoke logs and temporary disk images are written to `smoke_run/`. Set
+`SMOKE_PCAP=1` when a network packet capture is needed. The default output
+follows milestone markers live while QEMU is running. Set `SMOKE_VERBOSE=1` to
+also print every post-run assertion:
 
 ```sh
 SMOKE_VERBOSE=1 make smoke
