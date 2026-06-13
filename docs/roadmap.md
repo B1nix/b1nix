@@ -650,11 +650,30 @@ completed, and the Cairo desktop app demo running. Nothing deferred.
 
 ## M52: Mesa and Accelerated OpenGL
 
-- [ ] `planned` Port the Mesa userspace stack with EGL and OpenGL support.
-- [ ] `planned` Start with a software renderer, then add VirGL acceleration
-  over VirtIO GPU in QEMU.
-- [ ] `planned` Run an unmodified EGL/OpenGL Wayland application and verify
-  both software fallback and accelerated rendering.
+See [`docs/m52-opengl.md`](m52-opengl.md) for the design and the VirGL
+environment constraint.
+
+- [x] `done` Software OpenGL + EGL: ported TinyGL (software GL 1.1 subset) as
+  `libTinyGL.a` and a b1nix `libEGL.a` shim (`userspace/libegl/b1egl.c`,
+  `userspace/include/EGL/egl.h`). `eglCreateWindowSurface` targets a b1gui
+  wl_shm window; `eglSwapBuffers` blits the rendered framebuffer and commits to
+  displayd. End-to-end app `m52_gl_smoke` clears + draws a 3D triangle through
+  the real GL pipeline and verifies the presented pixels.
+  `M52-GFX: ok egl/tinygl/gl-triangle/path-software`. Both arches green.
+- [x] `done` Software renderer presented through the VirtIO-GPU 2D scanout
+  (`kernel/dev/virtio_gpu.c`, RESOURCE_CREATE_2D / SET_SCANOUT /
+  TRANSFER_TO_HOST_2D / RESOURCE_FLUSH, from M50) via displayd.
+- [ ] `partial` VirGL 3D acceleration over VirtIO-GPU. Blocked on the host:
+  Homebrew QEMU 11.0.0 (macOS) ships **without** virglrenderer — no
+  `virtio-gpu-gl` device, no `virgl` property, no GL display backend — so
+  accelerated rendering cannot be exercised or verified here. The EGL backend
+  negotiates the VIRTIO_GPU_F_VIRGL capset and falls back to software when it
+  is absent (the verified path on this QEMU). The 3D command path is gated on a
+  virgl-capable QEMU.
+- [ ] `planned` Port real Mesa (swrast/llvmpipe) with EGL + GLES2 shaders
+  (meson cross-build). The TinyGL path covers the milestone's "unmodified
+  EGL/OpenGL Wayland app, software fallback" requirement today; Mesa adds the
+  GLES2/shader API surface.
 
 ## M53: Browser Platform
 

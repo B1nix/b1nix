@@ -51,6 +51,7 @@
 #include "initramfs_m51_freetype_smoke.inc"
 #include "initramfs_m51_cairo_smoke.inc"
 #include "initramfs_m51_cairo_wayland.inc"
+#include "initramfs_m52_gl_smoke.inc"
 #include "initramfs_m51_xkb_smoke.inc"
 #include "initramfs_m51_clipboard_smoke.inc"
 #include "initramfs_m51_harfbuzz_smoke.inc"
@@ -1032,6 +1033,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m51_cairo_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-cairo-wayland", (const char *)vfs_m51_cairo_wayland_elf,
      sizeof(vfs_m51_cairo_wayland_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m52-gl-smoke", (const char *)vfs_m52_gl_smoke_elf,
+     sizeof(vfs_m52_gl_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-xkb-smoke", (const char *)vfs_m51_xkb_smoke_elf,
      sizeof(vfs_m51_xkb_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-clipboard-smoke", (const char *)vfs_m51_clipboard_smoke_elf,

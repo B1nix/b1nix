@@ -68,6 +68,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_clipboard_smoke \
 	m51_harfbuzz_smoke \
 	m51_fontconfig_smoke \
+	m52_gl_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -528,6 +529,16 @@ $(BUILD_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/m51_fontconfig_sm
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_fontconfig_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_fontconfig_smoke_elf userspace/build/$(ARCH)/bin/m51_fontconfig_smoke > $@
+
+# M52: TinyGL (software OpenGL) + b1nix EGL shim, cross-built static.
+TINYGL_LIB := build/tinygl-b1nix/$(B1NIX_TRIPLET)/install/lib/libEGL.a
+$(TINYGL_LIB): tools/build-tinygl.sh userspace/libegl/b1egl.c userspace/include/EGL/egl.h
+	B1NIX_ARCH=$(ARCH) tools/build-tinygl.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPACE_DEPS) $(TINYGL_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

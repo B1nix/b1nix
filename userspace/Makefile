@@ -271,6 +271,20 @@ $(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0
 	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
+# M52 end-to-end: EGL + TinyGL (software GL) + libb1gui (Wayland client) -> displayd.
+TINYGL_DIR := ../build/tinygl-b1nix/$(B1NIX_TRIPLET)/install
+$(TINYGL_DIR)/lib/libEGL.a: ../tools/build-tinygl.sh libegl/b1egl.c \
+		include/EGL/egl.h
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/build-tinygl.sh >/dev/null
+$(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER) \
+		$(TINYGL_DIR)/lib/libEGL.a
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(TINYGL_DIR)/include -c $< -o $(BUILD)/bin/m52_gl_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m52_gl_smoke.o \
+	  $(TINYGL_DIR)/lib/libEGL.a $(TINYGL_DIR)/lib/libTinyGL.a \
+	  $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
+
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
 # __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
 HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install

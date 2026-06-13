@@ -1643,6 +1643,16 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, cwl_pid,
                          (u64)(usize)&cwl_status, 0, 0, 0, 0);
       }
+      /* M52 end-to-end: an EGL + OpenGL (TinyGL software) app renders a 3D
+       * triangle into a wl_shm window and presents it to displayd. */
+      u64 gl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m52-gl-smoke", 0, 0, 0, 0, 0);
+      if ((isize)gl_pid < 0) {
+        uwrite("M52-GFX: spawn-fail gl\n");
+      } else {
+        int gl_status = 0;
+        syscall_dispatch(SYS_WAIT, gl_pid, (u64)(usize)&gl_status, 0, 0, 0, 0);
+      }
       /* M51: clipboard (wl_data_device) selection round-trip between two
        * client connections. */
       u64 clip_pid = syscall_dispatch(
