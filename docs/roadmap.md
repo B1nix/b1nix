@@ -614,3 +614,30 @@ construction. Details in [`display-server.md`](display-server.md).
 - [ ] `planned` Add dumb-buffer allocation, mapping, and framebuffer handles.
 - [ ] `planned` Add mode discovery and page-flip presentation.
 - [ ] `planned` Verify mapped graphics buffers from a userspace smoke test.
+
+## M51: Desktop Graphics Stack
+
+- [ ] `planned` Port pixman, FreeType, Fontconfig, HarfBuzz, Cairo, and
+  xkbcommon.
+- [ ] `planned` Complete the Wayland input, clipboard, output, and window
+  protocol surface required by desktop applications.
+- [ ] `planned` Run a Cairo-based Wayland application with shaped text,
+  scalable fonts, keyboard input, and clipboard support.
+
+## M52: Mesa and Accelerated OpenGL
+
+- [ ] `planned` Port the Mesa userspace stack with EGL and OpenGL support.
+- [ ] `planned` Start with a software renderer, then add VirGL acceleration
+  over VirtIO GPU in QEMU.
+- [ ] `planned` Run an unmodified EGL/OpenGL Wayland application and verify
+  both software fallback and accelerated rendering.
+
+## M53: Browser Platform
+
+- [ ] `planned` Fill the runtime gaps required by a browser: robust pthread,
+  futex, TLS, dynamic loading, process isolation, shared memory, ICU, and
+  audio support.
+- [ ] `planned` Port a smaller Wayland browser first and load interactive
+  HTTPS pages with fonts, images, JavaScript, input, and sound.
+- [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
+  browser or another real application requires it.
