@@ -279,8 +279,8 @@ $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKE
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
-	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a $(LIBGCC) \
-	  --whole-archive $(LIB) --no-whole-archive
+	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive $(LIBGCC)
 
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
 FC_DIR := ../build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install
