@@ -1571,6 +1571,19 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M51: ported HarfBuzz shapes text with the built-in OpenType shaper. */
+  {
+    u64 hb_pid = syscall_dispatch(SYS_SPAWN,
+                                  (u64)(usize) "/bin/m51-harfbuzz-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)hb_pid < 0) {
+      uwrite("M51-GFX: spawn-fail harfbuzz\n");
+    } else {
+      int hb_status = 0;
+      syscall_dispatch(SYS_WAIT, hb_pid, (u64)(usize)&hb_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M49: displayd speaks Wayland only. The client drives registry, xdg-shell,
    * wl_shm, attach/damage/commit, and a frame callback. */
   {

@@ -271,6 +271,17 @@ $(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0
 	  $(PIXMAN_DIR)/lib/libpixman-1.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
+# M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
+# __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
+HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install
+LIBGCC := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a
+$(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
+	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a $(LIBGCC) \
+	  --whole-archive $(LIB) --no-whole-archive
+
 # M51: m51_xkb_smoke links the ported static xkbcommon.
 XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(LIB) $(CRT0) $(LINKER)

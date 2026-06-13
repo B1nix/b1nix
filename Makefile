@@ -66,6 +66,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_cairo_wayland \
 	m51_xkb_smoke \
 	m51_clipboard_smoke \
+	m51_harfbuzz_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -503,6 +504,16 @@ $(BUILD_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSP
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_xkb_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_xkb_smoke_elf userspace/build/$(ARCH)/bin/m51_xkb_smoke > $@
+
+# M51: HarfBuzz (HB_TINY, unified C++ build via cross g++), cross-built static.
+HB_LIB := build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install/lib/libharfbuzz.a
+$(HB_LIB): tools/build-harfbuzz.sh
+	B1NIX_ARCH=$(ARCH) tools/build-harfbuzz.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/m51_harfbuzz_smoke.c $(USERSPACE_DEPS) $(HB_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_harfbuzz_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m51_harfbuzz_smoke_elf userspace/build/$(ARCH)/bin/m51_harfbuzz_smoke > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

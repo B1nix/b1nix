@@ -99,6 +99,9 @@ float sinf(float);
 float tanf(float);
 float copysignf(float, float);
 float scalbnf(float, int);
+float hypotf(float, float);
+float fmaxf(float, float);
+float fminf(float, float);
 
 double strtod(const char *nptr, char **endptr);
 double ldexp(double x, int exp);

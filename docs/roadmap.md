@@ -630,11 +630,9 @@ Port plan and progress: [`m51-plan.md`](m51-plan.md).
   `M51-GFX: ok cairo`.
 - [x] Port xkbcommon (keymap compile + keycode→keysym); ships a built-in
   keymap, no xkeyboard-config dependency. `M51-GFX: ok xkbcommon`.
-- [ ] `deferred` HarfBuzz and Fontconfig. Fontconfig isn't needed — Cairo takes
-  the FT face directly. HarfBuzz is C++ and needs a full C++ userspace runtime
-  (libstdc++ sysroot, exceptions, static ctors) — that infrastructure is scoped
-  to M53; see [`m51-plan.md`](m51-plan.md). Cairo's toy text already shapes/
-  renders Latin/monospace via FreeType.
+- [x] Port HarfBuzz (HB_TINY, built-in OpenType shaper, no FreeType/glib/icu).
+  Built with the cross g++; `-fno-exceptions/-rtti/-threadsafe-statics` keep it
+  off the C++ runtime so it links with no libstdc++. `M51-GFX: ok harfbuzz`.
 - [x] Complete the Wayland protocol surface: `wl_output` (mode/scale/geometry)
   and clipboard (`wl_data_device` selection with fd-forwarded transfer) added;
   input (`wl_seat`) and window (`xdg-shell`) already present from M47-M49.
