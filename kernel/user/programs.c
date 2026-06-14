@@ -1757,6 +1757,17 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, glsl_pid, (u64)(usize)&glsl_status, 0, 0, 0,
                          0);
       }
+      /* M53: userspace VirGL — host-GPU-accelerated 3D via /dev/virtio-gpu (runs
+       * on the graphics instance, which has the virgl-capable device). */
+      u64 uvirgl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m53-virgl-smoke", 0, 0, 0, 0, 0);
+      if ((isize)uvirgl_pid < 0) {
+        uwrite("M53-VIRGL: spawn-fail\n");
+      } else {
+        int uvirgl_status = 0;
+        syscall_dispatch(SYS_WAIT, uvirgl_pid, (u64)(usize)&uvirgl_status, 0, 0,
+                         0, 0);
+      }
       /* M51: clipboard (wl_data_device) selection round-trip between two
        * client connections. */
       u64 clip_pid = syscall_dispatch(

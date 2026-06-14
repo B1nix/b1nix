@@ -88,6 +88,7 @@ BINARIES := \
 	$(BUILD)/bin/m53_libpng_smoke \
 	$(BUILD)/bin/m53_libjpeg_smoke \
 	$(BUILD)/bin/m53_libwebp_smoke \
+	$(BUILD)/bin/m53_virgl_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/su \

@@ -1337,6 +1337,12 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 			check_output "$LOG" "M52-GFX: ok virgl-capset" "M52: host virglrenderer returns a VirGL capset"
 			check_output "$LOG" "M52-GFX: ok virgl-3d-clear" "M52: guest submits a virgl 3D command stream (CTX_CREATE + RESOURCE_CREATE_3D + SUBMIT_3D clear)"
 			check_output "$LOG" "M52-GFX: ok path-accelerated" "M52: host GPU renders the virgl clear; pixels verified via TRANSFER_FROM_HOST_3D"
+			# M53: the same accelerated path driven from USERSPACE via
+			# /dev/virtio-gpu (the kernel/userspace split a Mesa virgl winsys uses).
+			check_output "$LOG" "M53-VIRGL: ok caps" "M53: userspace queries the VirGL capset via /dev/virtio-gpu"
+			check_output "$LOG" "M53-VIRGL: ok resource" "M53: userspace creates a 3D render-target resource + mmap window"
+			check_output "$LOG" "M53-VIRGL: ok submit" "M53: userspace submits a virgl command stream"
+			check_output "$LOG" "M53-VIRGL: ok path-accelerated" "M53: host GPU renders userspace-submitted virgl clear; pixels verified via mmap"
 		else
 			pass "M52: VirGL 3D acceleration (skipped — host QEMU lacks a virglrenderer GL device)"
 		fi

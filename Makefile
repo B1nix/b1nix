@@ -52,6 +52,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_libpng_smoke \
 	m53_libjpeg_smoke \
 	m53_libwebp_smoke \
+	m53_virgl_smoke \
 	m34_smoke \
 	m35_smoke \
 	m38_sound \
@@ -615,6 +616,12 @@ $(BUILD_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/m53_libwebp_smoke.c 
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
+
+# M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
+$(BUILD_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_virgl_smoke_elf userspace/build/$(ARCH)/bin/m53_virgl_smoke > $@
 
 $(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-curl.sh

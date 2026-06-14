@@ -730,9 +730,17 @@ no-fake-pass smoke test.
   - Added the standard `*_10_EXP` macros to `userspace/include/float.h` (libpng
     gamma math needs them).
 - [ ] `planned` Full-motion video codec: libvpx (VP8/VP9) decode.
-- [ ] `in progress` Mesa **through VirGL** — gallium `virgl` driver + a b1nix
-  virgl winsys on the kernel VirGL 3D transport (M52), for host-GPU-accelerated
-  OpenGL (vs softpipe).
+- [~] `partial` Mesa **through VirGL** — host-GPU-accelerated 3D.
+  - [x] `done` Kernel exposes the VirGL 3D transport (M52) to userspace via
+    `/dev/virtio-gpu` (ioctls: GET_CAPS, RES_CREATE + mmap window, SUBMIT a virgl
+    command stream, TRANSFER_FROM_HOST; a single implicit 3D context). `m53_virgl_smoke`
+    creates a render target, submits a virgl CLEAR **from userspace**, and reads
+    the GPU-rendered pixel back through the mmap: `M53-VIRGL: ok
+    caps/resource/submit/path-accelerated`. Same kernel/userspace split a Mesa
+    virgl winsys uses; auto-skips on non-virgl hosts.
+  - [ ] `planned` A Mesa gallium `virgl` winsys on this ABI + Mesa rebuilt with
+    `-Dgallium-drivers=virgl`, so the full OpenGL/GLES API runs on the host GPU
+    (vs softpipe).
 - [ ] `planned` Runtime gaps: robust pthread, futex, TLS (mostly done in M29),
   real dynamic loading (`dlopen` of `.so` — currently a stub), ICU.
 - [ ] `planned` Port NetSurf's own libraries (libwapcaplet, libparserutils,

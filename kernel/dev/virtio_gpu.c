@@ -1,9 +1,12 @@
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
+#include <b1nix/syscall.h>
+#include <b1nix/vfs.h>
 #include <b1nix/virtio.h>
 #include <b1nix/virtio_gpu.h>
 #include <string.h>
@@ -866,6 +869,344 @@ static void virtio_gpu_virgl_selftest(void)
         console_write_hex32(px);
         console_write("\n");
     }
+}
+
+/* ── /dev/virtio-gpu: userspace VirGL 3D transport (M53) ──────────────────
+ * Exposes the VirGL command path to userspace so a renderer (a Mesa virgl
+ * winsys, or the bring-up smoke) can drive the host GPU: create a render-target
+ * resource (kernel allocates + attaches contiguous backing and hands back an
+ * mmap window), submit a userspace-built virgl command stream, copy the
+ * GPU-rendered result back, and read it through the mmap. A single implicit 3D
+ * context is created at device init. The kernel is the transport; userspace
+ * owns the virgl protocol — the same split Mesa's winsys expects. */
+
+/* Kernel copies of the userspace ABI (userspace/include/b1nix/virgl.h). */
+#define B1NIX_VIRGL_GET_CAPS 0x7601
+#define B1NIX_VIRGL_RES_CREATE 0x7603
+#define B1NIX_VIRGL_SUBMIT 0x7604
+#define B1NIX_VIRGL_TRANSFER_FROM_HOST 0x7605
+
+struct b1nix_virgl_caps_abi {
+    u32 capset_id, capset_version, capset_size, _pad;
+};
+struct b1nix_virgl_res_create_abi {
+    u32 target, format, bind, width, height, depth, array_size;
+    u32 res_id;
+    u64 mmap_offset;
+    u64 size;
+};
+struct b1nix_virgl_box_abi {
+    u32 x, y, z, w, h, d;
+};
+struct b1nix_virgl_transfer_abi {
+    u32 res_id, level;
+    struct b1nix_virgl_box_abi box;
+    u64 offset;
+};
+struct b1nix_virgl_submit_abi {
+    u32 cmd_size, _pad;
+    u64 cmd_ptr;
+};
+
+#define VGPU_UDEV_CTX 2
+#define VGPU_UDEV_RES_BASE 64
+#define VGPU_UDEV_MAX_RES 16
+/* mmap window per resource. Kept small enough that MAX_RES windows stay under
+ * 2 GiB so the offset fits the 32-bit mmap offset arg on the i686 port. */
+#define VGPU_UDEV_SLOT (64ull * 1024 * 1024)
+#define VGPU_UDEV_MAX_DIM 4096 /* 4096*4096*4 == one 64 MiB slot */
+
+struct vgpu_udev_res {
+    int used;
+    u32 res_id;
+    u64 phys;
+    u64 size;
+    u64 mmap_offset;
+};
+static struct vgpu_udev_res vgpu_udev_res_tab[VGPU_UDEV_MAX_RES];
+static int vgpu_udev_ready;
+static spinlock_t vgpu_udev_lock;
+static u8 *vgpu_udev_submit_buf; /* one page to build SUBMIT_3D requests */
+
+/* Create a virgl 3D context. */
+static int vgpu_ctx_create(u32 ctx_id)
+{
+    struct virtio_gpu_ctx_create ctx;
+    struct virtio_gpu_ctrl_hdr resp;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    ctx.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    ctx.hdr.fence_id = gpu_fence_id++;
+    ctx.hdr.ctx_id = ctx_id;
+    ctx.nlen = 5;
+    memcpy(ctx.debug_name, "b1nix", 5);
+    if (virtio_gpu_send_cmd(&ctx, sizeof(ctx), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+    return 0;
+}
+
+/* Create a 3D resource, attach contiguous guest backing, bind it into the
+ * context. Returns 0 and fills *out_phys on success. */
+static int vgpu_res_create_attach(u32 ctx_id, const struct b1nix_virgl_res_create_abi *p,
+                                  u64 phys, u64 size)
+{
+    struct virtio_gpu_resource_create_3d c3d;
+    struct virtio_gpu_attach_backing_cmd attach;
+    struct virtio_gpu_ctx_resource ctxres;
+    struct virtio_gpu_ctrl_hdr resp;
+
+    memset(&c3d, 0, sizeof(c3d));
+    c3d.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    c3d.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    c3d.hdr.fence_id = gpu_fence_id++;
+    c3d.resource_id = p->res_id;
+    c3d.target = p->target;
+    c3d.format = p->format;
+    c3d.bind = p->bind;
+    c3d.width = p->width;
+    c3d.height = p->height ? p->height : 1;
+    c3d.depth = p->depth ? p->depth : 1;
+    c3d.array_size = p->array_size ? p->array_size : 1;
+    if (virtio_gpu_send_cmd(&c3d, sizeof(c3d), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+
+    memset(&attach, 0, sizeof(attach));
+    attach.req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach.req.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    attach.req.hdr.fence_id = gpu_fence_id++;
+    attach.req.resource_id = p->res_id;
+    attach.req.nr_entries = 1;
+    attach.entry.addr = phys;
+    attach.entry.length = (u32)size;
+    if (virtio_gpu_send_cmd(&attach, sizeof(attach), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+
+    memset(&ctxres, 0, sizeof(ctxres));
+    ctxres.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    ctxres.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    ctxres.hdr.fence_id = gpu_fence_id++;
+    ctxres.hdr.ctx_id = ctx_id;
+    ctxres.resource_id = p->res_id;
+    if (virtio_gpu_send_cmd(&ctxres, sizeof(ctxres), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+    return 0;
+}
+
+/* Submit a userspace-built virgl command stream on the context. */
+static int vgpu_submit_stream(u32 ctx_id, const u32 *cmd, u32 cmd_bytes)
+{
+    struct virtio_gpu_ctrl_hdr resp;
+    if (!vgpu_udev_submit_buf || cmd_bytes == 0 ||
+        cmd_bytes + sizeof(struct virtio_gpu_ctrl_hdr) + 8 > PAGE_SIZE)
+        return -1;
+    struct virtio_gpu_cmd_submit *s = (struct virtio_gpu_cmd_submit *)vgpu_udev_submit_buf;
+    memset(s, 0, sizeof(struct virtio_gpu_ctrl_hdr) + 8);
+    s->hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    s->hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    s->hdr.fence_id = gpu_fence_id++;
+    s->hdr.ctx_id = ctx_id;
+    s->size = cmd_bytes;
+    memcpy(vgpu_udev_submit_buf + sizeof(struct virtio_gpu_ctrl_hdr) + 8, cmd, cmd_bytes);
+    usize len = sizeof(struct virtio_gpu_ctrl_hdr) + 8 + cmd_bytes;
+    if (virtio_gpu_send_cmd(vgpu_udev_submit_buf, len, &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+    return 0;
+}
+
+/* Copy a GPU-rendered resource region back into its guest backing. */
+static int vgpu_transfer_from_host(u32 ctx_id, const struct b1nix_virgl_transfer_abi *t)
+{
+    struct virtio_gpu_transfer_host_3d xfer;
+    struct virtio_gpu_ctrl_hdr resp;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    xfer.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    xfer.hdr.fence_id = gpu_fence_id++;
+    xfer.hdr.ctx_id = ctx_id;
+    xfer.box.x = t->box.x;
+    xfer.box.y = t->box.y;
+    xfer.box.z = t->box.z;
+    xfer.box.w = t->box.w;
+    xfer.box.h = t->box.h;
+    xfer.box.d = t->box.d ? t->box.d : 1;
+    xfer.offset = t->offset;
+    xfer.resource_id = t->res_id;
+    xfer.level = t->level;
+    if (virtio_gpu_send_cmd(&xfer, sizeof(xfer), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+    return 0;
+}
+
+static struct vgpu_udev_res *vgpu_udev_find(u32 res_id)
+{
+    for (int i = 0; i < VGPU_UDEV_MAX_RES; i++)
+        if (vgpu_udev_res_tab[i].used && vgpu_udev_res_tab[i].res_id == res_id)
+            return &vgpu_udev_res_tab[i];
+    return 0;
+}
+
+static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
+{
+    (void)node;
+    if (!vgpu_udev_ready)
+        return -ENODEV;
+
+    switch (request) {
+    case B1NIX_VIRGL_GET_CAPS: {
+        struct virtio_gpu_get_capset_info capreq;
+        struct virtio_gpu_resp_capset_info capresp;
+        memset(&capreq, 0, sizeof(capreq));
+        memset(&capresp, 0, sizeof(capresp));
+        capreq.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+        capreq.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        capreq.hdr.fence_id = gpu_fence_id++;
+        capreq.capset_index = 0;
+        if (virtio_gpu_send_cmd(&capreq, sizeof(capreq), &capresp, sizeof(capresp)) < 0 ||
+            capresp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO)
+            return -EIO;
+        struct b1nix_virgl_caps_abi out;
+        out.capset_id = capresp.capset_id;
+        out.capset_version = capresp.capset_max_version;
+        out.capset_size = capresp.capset_max_size;
+        out._pad = 0;
+        if (!arg || syscall_copyout(arg, &out, sizeof(out)) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case B1NIX_VIRGL_RES_CREATE: {
+        struct b1nix_virgl_res_create_abi p;
+        if (!arg || syscall_copyin(&p, arg, sizeof(p)) < 0)
+            return -EFAULT;
+        if (p.width == 0 || p.width > VGPU_UDEV_MAX_DIM ||
+            p.height > VGPU_UDEV_MAX_DIM)
+            return -EINVAL;
+        u64 size = (u64)p.width * (p.height ? p.height : 1) * 4ull;
+        u64 pages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+
+        u64 flags;
+        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        int slot = -1;
+        for (int i = 0; i < VGPU_UDEV_MAX_RES; i++)
+            if (!vgpu_udev_res_tab[i].used) { slot = i; break; }
+        if (slot < 0) {
+            spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+            return -ENOSPC;
+        }
+        vgpu_udev_res_tab[slot].used = 1; /* reserve */
+        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+
+        u64 phys = pmm_alloc_frames(pages);
+        if (!phys) {
+            vgpu_udev_res_tab[slot].used = 0;
+            return -ENOMEM;
+        }
+        memset((void *)(usize)(phys + vmm_direct_map_base()), 0, pages * PAGE_SIZE);
+        p.res_id = VGPU_UDEV_RES_BASE + slot;
+        if (vgpu_res_create_attach(VGPU_UDEV_CTX, &p, phys, pages * PAGE_SIZE) < 0) {
+            for (u64 f = 0; f < pages; f++)
+                pmm_free_frame(phys + f * PAGE_SIZE);
+            vgpu_udev_res_tab[slot].used = 0;
+            return -EIO;
+        }
+        vgpu_udev_res_tab[slot].res_id = p.res_id;
+        vgpu_udev_res_tab[slot].phys = phys;
+        vgpu_udev_res_tab[slot].size = pages * PAGE_SIZE;
+        vgpu_udev_res_tab[slot].mmap_offset = (u64)slot * VGPU_UDEV_SLOT;
+        p.mmap_offset = vgpu_udev_res_tab[slot].mmap_offset;
+        p.size = pages * PAGE_SIZE;
+        if (syscall_copyout(arg, &p, sizeof(p)) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case B1NIX_VIRGL_SUBMIT: {
+        struct b1nix_virgl_submit_abi sub;
+        if (!arg || syscall_copyin(&sub, arg, sizeof(sub)) < 0)
+            return -EFAULT;
+        if (sub.cmd_size == 0 || sub.cmd_size > 1024 || (sub.cmd_size & 3))
+            return -EINVAL;
+        u32 cmd[256];
+        if (syscall_copyin(cmd, (void *)(usize)sub.cmd_ptr, sub.cmd_size) < 0)
+            return -EFAULT;
+        u64 flags;
+        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        int rc = vgpu_submit_stream(VGPU_UDEV_CTX, cmd, sub.cmd_size);
+        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+        return rc < 0 ? -EIO : 0;
+    }
+    case B1NIX_VIRGL_TRANSFER_FROM_HOST: {
+        struct b1nix_virgl_transfer_abi t;
+        if (!arg || syscall_copyin(&t, arg, sizeof(t)) < 0)
+            return -EFAULT;
+        if (!vgpu_udev_find(t.res_id))
+            return -EINVAL;
+        u64 flags;
+        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        int rc = vgpu_transfer_from_host(VGPU_UDEV_CTX, &t);
+        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+        return rc < 0 ? -EIO : 0;
+    }
+    default:
+        return -ENOTTY;
+    }
+}
+
+static int vgpu_udev_mmap_phys(struct vfs_node *node, u64 offset, usize length,
+                               u64 *out_phys)
+{
+    (void)node;
+    u64 flags;
+    int rc = -EINVAL;
+    spin_lock_irqsave(&vgpu_udev_lock, &flags);
+    for (int i = 0; i < VGPU_UDEV_MAX_RES; i++) {
+        struct vgpu_udev_res *r = &vgpu_udev_res_tab[i];
+        if (!r->used || !r->phys)
+            continue;
+        if (offset >= r->mmap_offset && offset < r->mmap_offset + r->size) {
+            u64 within = offset - r->mmap_offset;
+            if (within + length <= r->size) {
+                *out_phys = r->phys + within;
+                rc = 0;
+            }
+            break;
+        }
+    }
+    spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+    return rc;
+}
+
+/* Register /dev/virtio-gpu and bring up the implicit context. Only when the
+ * host actually offered VirGL (the virtio-gpu-gl device); otherwise the node is
+ * absent and userspace renderers fall back to software. Call after VFS init. */
+void virtio_gpu_dev_init(void)
+{
+    if (!gpu_ready || !gpu_virgl_ok)
+        return;
+    if (vgpu_ctx_create(VGPU_UDEV_CTX) < 0) {
+        console_write("virtio-gpu: userspace VirGL ctx create failed\n");
+        return;
+    }
+    u64 buf_phys = pmm_alloc_frames(1);
+    if (!buf_phys)
+        return;
+    vgpu_udev_submit_buf = (u8 *)(usize)(buf_phys + vmm_direct_map_base());
+
+    struct vfs_node *node = vfs_add_node("/dev/virtio-gpu", VFS_DEVICE, 0, 0, 0);
+    if (!node || IS_ERR(node)) {
+        console_write("virtio-gpu: failed to register /dev/virtio-gpu\n");
+        return;
+    }
+    node->inode->mode = 0600;
+    node->inode->ioctl_cb = vgpu_udev_ioctl;
+    node->inode->mmap_phys_cb = vgpu_udev_mmap_phys;
+    vfs_node_put(node);
+    vgpu_udev_ready = 1;
+    console_write("virtio-gpu: /dev/virtio-gpu (userspace VirGL) ready\n");
 }
 
 void virtio_gpu_init(void)

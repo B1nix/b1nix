@@ -45,6 +45,7 @@ extern void ps2_mouse_init(void);
 extern int xhci_probe(void);
 extern void compositor_init(void);
 extern void virtio_gpu_init(void);
+extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
 extern void fb_console_init(void);
 extern void hda_init(void);
@@ -293,6 +294,7 @@ void kernel_main(usize arg0, usize arg1)
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
 	drm_dev_init(); /* M50: minimal DRM/KMS dumb-buffer device over virtio-gpu */
+	virtio_gpu_dev_init(); /* M53: /dev/virtio-gpu userspace VirGL 3D transport */
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
