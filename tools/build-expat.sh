@@ -54,7 +54,7 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -O2 -fno-strict-aliasing -Db1nix
   -DXML_GE=1 -DXML_DTD -DXML_NS -DBYTEORDER=1234 -DXML_POOR_ENTROPY
   -DHAVE_MEMMOVE=1 -DHAVE_EXPAT_CONFIG_H=1 -I$GEN_DIR -I$SRC_DIR/lib
-  -Wno-implicit-function-declaration"
+  -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 
 OBJS=""
 for base in xmlparse xmlrole xmltok; do

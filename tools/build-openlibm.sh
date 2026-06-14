@@ -14,6 +14,15 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 
 . "$ROOT_DIR/tools/toolchain-env.sh"
 
+# Portable in-place sed: GNU sed wants `sed -i EXPR`, BSD/macOS sed wants
+# `sed -i '' EXPR`. Passing BSD's empty-suffix arg to GNU sed makes it treat the
+# expression as a filename ("can't read s/.../...").
+if sed --version >/dev/null 2>&1; then
+  sed_inplace() { sed -i "$@"; }
+else
+  sed_inplace() { sed -i '' "$@"; }
+fi
+
 SRC_PARENT="$ROOT_DIR/build/openlibm-src"
 SRC_DIR="$SRC_PARENT/openlibm-${OPENLIBM_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/openlibm-b1nix/$B1NIX_TRIPLET"
@@ -26,16 +35,20 @@ if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
   [ -f "$tmp" ] || curl -L "$URL" -o "$tmp" 1>&2
   tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
-  # b1nix's libc already defines ldexp/frexp (used by binaries that don't link
-  # libm). openlibm exports ldexp as a *strong* alias of scalbn, which collides.
-  # Make it weak so the libc definition wins when both archives are linked.
-  sed -i '' 's/openlibm_strong_reference(scalbn, ldexp)/openlibm_weak_reference(scalbn, ldexp)/' \
-    "$SRC_DIR/src/s_scalbn.c"
-  # Same for frexp (a real definition, not an alias): make it weak so the
-  # libc frexp wins when both archives are linked.
-  sed -i '' 's/^frexp(double x, int \*eptr)/__attribute__((__weak__)) frexp(double x, int *eptr)/' \
-    "$SRC_DIR/src/s_frexp.c"
 fi
+
+# Patch idempotently (each sed is a no-op once applied) and OUTSIDE the
+# extraction guard, so a source tree left over from a previously failed run
+# still gets patched. b1nix's libc already defines ldexp/frexp (used by binaries
+# that don't link libm). openlibm exports ldexp as a *strong* alias of scalbn,
+# which collides. Make it weak so the libc definition wins when both archives
+# are linked.
+sed_inplace 's/openlibm_strong_reference(scalbn, ldexp)/openlibm_weak_reference(scalbn, ldexp)/' \
+  "$SRC_DIR/src/s_scalbn.c"
+# Same for frexp (a real definition, not an alias): make it weak so the
+# libc frexp wins when both archives are linked.
+sed_inplace 's/^frexp(double x, int \*eptr)/__attribute__((__weak__)) frexp(double x, int *eptr)/' \
+  "$SRC_DIR/src/s_frexp.c"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   TARGET="i686-unknown-elf"

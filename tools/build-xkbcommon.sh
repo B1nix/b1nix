@@ -63,7 +63,7 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
   -O2 -fno-strict-aliasing -Db1nix -DHAVE_CONFIG_H
   -I$GEN_DIR -I$S -I$S/xkbcomp -I$SRC_DIR/include
-  -Wno-implicit-function-declaration"
+  -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 
 CORE="atom context context-priv keymap keymap-priv keysym keysym-utf state \
 text utf8 util-list utils"

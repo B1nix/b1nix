@@ -104,7 +104,7 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -O2 -fno-strict-aliasing -Db1nix -DHAVE_CONFIG_H
   -I$GEN_DIR -I$SRC_DIR -I$SRC_DIR/src -I$INSTALL_DIR/include
   -I$EXPAT_DIR/include -I$FT_DIR/include
-  -DHAVE_EXPAT=1 -DFcPublic= -Wno-implicit-function-declaration"
+  -DHAVE_EXPAT=1 -DFcPublic= -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 
 OBJS=""
 for src in "$SRC_DIR/src"/fc*.c "$SRC_DIR/src/ftglue.c"; do

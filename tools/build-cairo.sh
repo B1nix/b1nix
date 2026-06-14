@@ -70,7 +70,8 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -O2 -fno-strict-aliasing -Db1nix -DHAVE_CONFIG_H
   -I$GEN_DIR -I$S -I$LIBM_DIR/include
   -I$PIXMAN_DIR/include/pixman-1 -I$FT_DIR/include
-  -Wno-implicit-function-declaration"
+  -Wno-implicit-function-declaration -Wno-incompatible-pointer-types
+  -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 
 # cairo.c (the public context API) has no dash, so the dash regex misses it.
 SOURCES="cairo.c $(sed -n '137,245p' "$SRC_DIR/src/Makefile.sources" \

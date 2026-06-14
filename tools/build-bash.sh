@@ -135,7 +135,10 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
   cd "$SRC_DIR"
   BUILD_TRIPLET="$("./support/config.guess" 2>/dev/null || echo "$(uname -m)-apple-darwin")"
   export cross_compiling=yes
-  export CC_FOR_BUILD=cc
+  # Host build tools (mkbuiltins, etc.) are K&R C. GCC 15+ defaults to gnu23
+  # where `()` means `(void)`, breaking them ("too many arguments to xmalloc").
+  # Pin the host build-tool compile to gnu17.
+  export CC_FOR_BUILD="cc -std=gnu17"
   ./configure \
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
@@ -148,7 +151,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
     --disable-net-redirections \
     --disable-rpath \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-    CFLAGS_FOR_BUILD="-O2" \
+    CFLAGS_FOR_BUILD="-O2 -std=gnu17" \
     1>&2
 )
 fi

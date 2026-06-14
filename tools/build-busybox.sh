@@ -17,8 +17,10 @@ TARGET="$B1NIX_TRIPLET"
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
     NPROC=$(sysctl -n hw.ncpu)
+    sed_inplace() { sed -i '' "$@"; }
 else
     NPROC=$(nproc)
+    sed_inplace() { sed -i "$@"; }
 fi
 
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
@@ -90,7 +92,7 @@ fi
 # keyed on the rewritten token so a re-extracted tree is patched exactly once.
 for bb_src in procps/free.c procps/uptime.c procps/ps.c procps/vmstat.c; do
     if [ -f "$SRC_DIR/$bb_src" ] && ! grep -q "__b1nix__" "$SRC_DIR/$bb_src"; then
-        sed -i '' 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
+        sed_inplace 's/#ifdef __linux__/#if defined(__linux__) || defined(__b1nix__)/' \
             "$SRC_DIR/$bb_src"
     fi
 done
