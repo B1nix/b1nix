@@ -710,10 +710,33 @@ environment constraint.
 
 ## M53: Browser Platform
 
-- [ ] `planned` Fill the runtime gaps required by a browser: robust pthread,
-  futex, TLS, dynamic loading, process isolation, shared memory, ICU, and
-  audio support.
-- [ ] `planned` Port a smaller Wayland browser first and load interactive
-  HTTPS pages with fonts, images, JavaScript, input, and sound.
+Target browser: **NetSurf** (small, modular, pure-C, framebuffer/Wayland
+frontend). Building the prerequisite codec + runtime stack first, each with a
+no-fake-pass smoke test.
+
+- [x] `done` Image + video-keyframe codecs (NetSurf loader dependencies), all
+  freestanding-compiled against the b1nix userspace ABI and verified by
+  encode/decode roundtrips with pixel checks (`tests/smoke.sh`):
+  - **zlib** 1.3.1 (`tools/build-zlib.sh`) — one-shot + streaming deflate/inflate
+    + crc32. `M53-ZLIB: ok compress/uncompress/roundtrip/crc32/stream`.
+  - **libpng** 1.6.43 (`tools/build-libpng.sh`, over zlib + libm) — PNG
+    encode→decode, pixels byte-for-byte identical. `M53-PNG: ok
+    encode/decode-header/decode`.
+  - **libjpeg** (IJG v9f, `tools/build-libjpeg.sh`) — JPEG encode→decode, pixels
+    within tolerance. `M53-JPEG: ok encode/decode-header/decode`.
+  - **libwebp** 1.4.0 (`tools/build-libwebp.sh`) — WebP lossless encode→decode
+    byte-identical; WebP lossy is a VP8 intra (keyframe) decoder, the WebM video
+    bitstream family. `M53-WEBP: ok encode/info/decode`.
+  - Added the standard `*_10_EXP` macros to `userspace/include/float.h` (libpng
+    gamma math needs them).
+- [ ] `planned` Full-motion video codec: libvpx (VP8/VP9) decode.
+- [ ] `in progress` Mesa **through VirGL** — gallium `virgl` driver + a b1nix
+  virgl winsys on the kernel VirGL 3D transport (M52), for host-GPU-accelerated
+  OpenGL (vs softpipe).
+- [ ] `planned` Runtime gaps: robust pthread, futex, TLS (mostly done in M29),
+  real dynamic loading (`dlopen` of `.so` — currently a stub), ICU.
+- [ ] `planned` Port NetSurf's own libraries (libwapcaplet, libparserutils,
+  libhubbub, libcss, libdom, libnsgif) and the framebuffer/Wayland frontend;
+  load interactive HTTPS pages with fonts, images, input.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
   browser or another real application requires it.

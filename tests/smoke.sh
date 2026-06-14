@@ -1067,6 +1067,28 @@ check_output "$LOG" "M32-PCRE2: ok compile" "ported PCRE2 compiles a pattern"
 check_output "$LOG" "M32-PCRE2: ok match" "ported PCRE2 matches and captures a group"
 check_output "$LOG" "M32-PCRE2: ok nomatch" "ported PCRE2 correctly reports a non-match"
 check_output "$LOG" "M32-PCRE2: done" "PCRE2 smoke completes"
+# ── M53 zlib userspace port (NetSurf image-codec dependency) ──
+check_output "$LOG" "M53-ZLIB: ok compress" "ported zlib compresses (one-shot compress2)"
+check_output "$LOG" "M53-ZLIB: ok uncompress" "ported zlib decompresses (one-shot uncompress)"
+check_output "$LOG" "M53-ZLIB: ok roundtrip" "zlib one-shot roundtrip byte-for-byte identical"
+check_output "$LOG" "M53-ZLIB: ok crc32" "zlib crc32 (incremental == single-shot)"
+check_output "$LOG" "M53-ZLIB: ok stream" "zlib streaming deflate/inflate roundtrip (libpng path)"
+check_output "$LOG" "M53-ZLIB: done" "zlib smoke completes"
+# ── M53 libpng userspace port (NetSurf image-codec dependency) ──
+check_output "$LOG" "M53-PNG: ok encode" "ported libpng encodes a valid PNG stream"
+check_output "$LOG" "M53-PNG: ok decode-header" "libpng decodes IHDR (dimensions/depth/color)"
+check_output "$LOG" "M53-PNG: ok decode" "libpng decodes image; pixels byte-for-byte identical"
+check_output "$LOG" "M53-PNG: done" "libpng smoke completes"
+# ── M53 libjpeg userspace port (NetSurf image-codec dependency) ──
+check_output "$LOG" "M53-JPEG: ok encode" "ported libjpeg encodes a valid JPEG stream"
+check_output "$LOG" "M53-JPEG: ok decode-header" "libjpeg decodes header (dimensions/components)"
+check_output "$LOG" "M53-JPEG: ok decode" "libjpeg decodes image; pixels within tolerance"
+check_output "$LOG" "M53-JPEG: done" "libjpeg smoke completes"
+# ── M53 libwebp userspace port (image + VP8 video-keyframe codec) ──
+check_output "$LOG" "M53-WEBP: ok encode" "ported libwebp encodes a valid RIFF/WEBP stream"
+check_output "$LOG" "M53-WEBP: ok info" "libwebp reads back image dimensions"
+check_output "$LOG" "M53-WEBP: ok decode" "libwebp lossless decode; pixels byte-for-byte identical"
+check_output "$LOG" "M53-WEBP: done" "libwebp smoke completes"
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

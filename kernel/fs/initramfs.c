@@ -24,6 +24,10 @@
 #include "initramfs_m32_smoke.inc"
 #include "initramfs_m32_nettool.inc"
 #include "initramfs_m32_pcre2_smoke.inc"
+#include "initramfs_m53_zlib_smoke.inc"
+#include "initramfs_m53_libpng_smoke.inc"
+#include "initramfs_m53_libjpeg_smoke.inc"
+#include "initramfs_m53_libwebp_smoke.inc"
 #include "initramfs_curl.inc"
 #include "initramfs_wget.inc"
 #include "initramfs_cacert.inc"
@@ -974,6 +978,14 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m32_nettool_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m32-pcre2-smoke", (const char *)vfs_m32_pcre2_smoke_elf,
      sizeof(vfs_m32_pcre2_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-zlib-smoke", (const char *)vfs_m53_zlib_smoke_elf,
+     sizeof(vfs_m53_zlib_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-libpng-smoke", (const char *)vfs_m53_libpng_smoke_elf,
+     sizeof(vfs_m53_libpng_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-libjpeg-smoke", (const char *)vfs_m53_libjpeg_smoke_elf,
+     sizeof(vfs_m53_libjpeg_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-libwebp-smoke", (const char *)vfs_m53_libwebp_smoke_elf,
+     sizeof(vfs_m53_libwebp_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/curl", (const char *)vfs_curl_elf, sizeof(vfs_curl_elf),
      INITRAMFS_EXECUTABLE},
     {"/bin/wget", (const char *)vfs_wget_elf, sizeof(vfs_wget_elf),

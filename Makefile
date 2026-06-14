@@ -48,6 +48,10 @@ EMBEDDED_USER_PROGRAMS := \
 	m32_smoke \
 	m32_nettool \
 	m32_pcre2_smoke \
+	m53_zlib_smoke \
+	m53_libpng_smoke \
+	m53_libjpeg_smoke \
+	m53_libwebp_smoke \
 	m34_smoke \
 	m35_smoke \
 	m38_sound \
@@ -571,6 +575,46 @@ $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(US
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/$(ARCH)/bin/m32_pcre2_smoke > $@
+
+# M53: zlib (image-codec dependency for the NetSurf browser platform).
+ZLIB_LIB := build/zlib-b1nix/$(B1NIX_TRIPLET)/install/lib/libz.a
+$(ZLIB_LIB): tools/build-zlib.sh
+	B1NIX_ARCH=$(ARCH) tools/build-zlib.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/m53_zlib_smoke.c $(USERSPACE_DEPS) $(ZLIB_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_zlib_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_zlib_smoke_elf userspace/build/$(ARCH)/bin/m53_zlib_smoke > $@
+
+# M53: libpng (over zlib + libm) — NetSurf image-codec dependency.
+LIBPNG_LIB := build/libpng-b1nix/$(B1NIX_TRIPLET)/install/lib/libpng16.a
+$(LIBPNG_LIB): tools/build-libpng.sh tools/build-zlib.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libpng.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/m53_libpng_smoke.c $(USERSPACE_DEPS) $(LIBPNG_LIB) $(ZLIB_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libpng_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_libpng_smoke_elf userspace/build/$(ARCH)/bin/m53_libpng_smoke > $@
+
+# M53: libjpeg (IJG) — NetSurf image-codec dependency.
+LIBJPEG_LIB := build/libjpeg-b1nix/$(B1NIX_TRIPLET)/install/lib/libjpeg.a
+$(LIBJPEG_LIB): tools/build-libjpeg.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libjpeg.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/m53_libjpeg_smoke.c $(USERSPACE_DEPS) $(LIBJPEG_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libjpeg_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_libjpeg_smoke_elf userspace/build/$(ARCH)/bin/m53_libjpeg_smoke > $@
+
+# M53: libwebp (image + VP8 video-keyframe codec) — NetSurf codec dependency.
+LIBWEBP_LIB := build/libwebp-b1nix/$(B1NIX_TRIPLET)/install/lib/libwebp.a
+$(LIBWEBP_LIB): tools/build-libwebp.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libwebp.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/m53_libwebp_smoke.c $(USERSPACE_DEPS) $(LIBWEBP_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
 
 $(CURL_ELF): tools/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/build-curl.sh

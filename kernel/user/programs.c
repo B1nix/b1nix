@@ -1396,6 +1396,54 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M53: zlib (NetSurf image-codec dependency). */
+  {
+    u64 zlib_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-zlib-smoke", 0, 0, 0, 0, 0);
+    if ((isize)zlib_pid < 0) {
+      uwrite("M53-ZLIB: spawn-fail\n");
+    } else {
+      int zlib_status = 0;
+      syscall_dispatch(SYS_WAIT, zlib_pid, (u64)(usize)&zlib_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libpng (NetSurf image-codec dependency, over zlib). */
+  {
+    u64 png_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libpng-smoke", 0, 0, 0, 0, 0);
+    if ((isize)png_pid < 0) {
+      uwrite("M53-PNG: spawn-fail\n");
+    } else {
+      int png_status = 0;
+      syscall_dispatch(SYS_WAIT, png_pid, (u64)(usize)&png_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libjpeg (NetSurf image-codec dependency). */
+  {
+    u64 jpg_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libjpeg-smoke", 0, 0, 0, 0, 0);
+    if ((isize)jpg_pid < 0) {
+      uwrite("M53-JPEG: spawn-fail\n");
+    } else {
+      int jpg_status = 0;
+      syscall_dispatch(SYS_WAIT, jpg_pid, (u64)(usize)&jpg_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libwebp (image + VP8 video-keyframe codec). */
+  {
+    u64 webp_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libwebp-smoke", 0, 0, 0, 0, 0);
+    if ((isize)webp_pid < 0) {
+      uwrite("M53-WEBP: spawn-fail\n");
+    } else {
+      int webp_status = 0;
+      syscall_dispatch(SYS_WAIT, webp_pid, (u64)(usize)&webp_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M34: procfs / sysfs synthetic filesystems. */
   {
     u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,

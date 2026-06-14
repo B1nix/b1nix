@@ -84,6 +84,10 @@ BINARIES := \
 	$(BUILD)/bin/m32_smoke \
 	$(BUILD)/bin/m32_nettool \
 	$(BUILD)/bin/m32_pcre2_smoke \
+	$(BUILD)/bin/m53_zlib_smoke \
+	$(BUILD)/bin/m53_libpng_smoke \
+	$(BUILD)/bin/m53_libjpeg_smoke \
+	$(BUILD)/bin/m53_libwebp_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
 	$(BUILD)/bin/su \
@@ -328,6 +332,40 @@ $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(LIB) $(CRT0) $(LINKER)
 	$(CC) $(CFLAGS) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_pcre2_smoke.o \
 	  $(PCRE2_DIR)/lib/libpcre2-8.a --whole-archive $(LIB) --no-whole-archive
+
+# m53_zlib_smoke links the ported static zlib (image-codec dependency, M53).
+ZLIB_DIR := ../build/zlib-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_zlib_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_zlib_smoke.o \
+	  $(ZLIB_DIR)/lib/libz.a --whole-archive $(LIB) --no-whole-archive
+
+# m53_libpng_smoke links the ported static libpng over zlib (M53 image codec).
+LIBPNG_DIR := ../build/libpng-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libpng_smoke.o \
+	  $(LIBPNG_DIR)/lib/libpng16.a $(ZLIB_DIR)/lib/libz.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_libjpeg_smoke links the ported static IJG libjpeg (M53 image codec).
+LIBJPEG_DIR := ../build/libjpeg-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libjpeg_smoke: bin/m53_libjpeg_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBJPEG_DIR)/include -c $< -o $(BUILD)/bin/m53_libjpeg_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libjpeg_smoke.o \
+	  $(LIBJPEG_DIR)/lib/libjpeg.a --whole-archive $(LIB) --no-whole-archive
+
+# m53_libwebp_smoke links the ported static libwebp (M53 image/video codec).
+LIBWEBP_DIR := ../build/libwebp-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libwebp_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libwebp_smoke.o \
+	  $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
 
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the
 # linker emits ET_DYN with R_X86_64_RELATIVE relocations. No crt0 or
