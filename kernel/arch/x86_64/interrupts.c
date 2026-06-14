@@ -11,6 +11,7 @@
 void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/serial.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial_tty.h>
@@ -110,6 +111,17 @@ static u64 read_cr2(void) {
 
   __asm__ volatile("movq %%cr2, %0" : "=r"(value));
   return value;
+}
+
+/* Lock-free hex dump straight to the serial port for the fatal fault path.
+ * Uses no locks and minimal stack so it works even when the console lock is
+ * wedged. */
+static void serial_emerg_hex(u64 v) {
+  static const char d[] = "0123456789abcdef";
+  serial_putc('0');
+  serial_putc('x');
+  for (int i = 60; i >= 0; i -= 4)
+    serial_putc(d[(v >> i) & 0xf]);
 }
 
 static const char *exception_names[] = {
@@ -475,7 +487,41 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     name = exception_names[frame->vector];
   }
 
-  console_write("\nEXCEPTION: ");
+  /* Lock-free emergency line FIRST: a single direct-serial dump of the fatal
+   * fault, using minimal stack and no locks, so it survives even if the console
+   * lock is wedged or a follow-on dump triple-faults. */
+  {
+    serial_write("\n#EXC vec=");
+    serial_emerg_hex(frame->vector);
+    serial_write(" err=");
+    serial_emerg_hex(frame->error_code);
+    serial_write(" rip=");
+    serial_emerg_hex(frame->rip);
+    serial_write(" cs=");
+    serial_emerg_hex(frame->cs);
+    serial_write(" cr2=");
+    serial_emerg_hex(read_cr2());
+    serial_write("\n");
+  }
+
+  /* Fatal path. Bust the console lock first: this fault may have interrupted
+   * code on this CPU that held it (e.g. a log/backtrace mid-print), so the
+   * diagnostic console_write()s below would otherwise self-deadlock (spinlocks
+   * mask IRQs but NOT CPU exceptions). bust_spinlocks pattern. */
+  console_bust_lock();
+
+  /* Recursion guard around the risky diagnostic dump (backtrace + userspace
+   * stack walk both dereference possibly-bad memory). If that dump itself
+   * faults, we re-enter here with the flag set — print a marker and panic
+   * instead of looping forever. Cleared right after the dump, before the
+   * (fault-safe) signal logic, so sequential faults from different processes
+   * don't trip it. */
+  static volatile int in_fault_dump;
+  if (in_fault_dump) {
+    console_write("\n[nested fault while dumping exception — aborting]\n");
+    panic("nested exception in fault handler");
+  }
+  in_fault_dump = 1;
   console_write(name);
   console_write("\nvector: 0x");
   console_write_hex64(frame->vector);
@@ -520,6 +566,10 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     }
     console_write("\n");
   }
+
+  /* Diagnostic dump done (it's the only fault-prone part) — clear the guard so
+   * the next independent fault dumps normally. */
+  in_fault_dump = 0;
 
   /* If exception happened in userspace (CS == 0x1B), send signal instead of
    * panic */

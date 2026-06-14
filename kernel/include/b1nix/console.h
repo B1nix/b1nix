@@ -16,6 +16,7 @@ void console_init(void);
 void console_clear(void);
 void console_putc(char ch);
 void console_write(const char *text);
+void console_bust_lock(void);
 void console_write_hex32(u32 value);
 void console_write_hex64(u64 value);
 void console_write_dec(u64 value);
