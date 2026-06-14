@@ -46,6 +46,7 @@ unsigned long strtoul(const char *nptr, char **endptr, int base);
 long long strtoll(const char *nptr, char **endptr, int base);
 unsigned long long strtoull(const char *nptr, char **endptr, int base);
 double strtod(const char *nptr, char **endptr);
+float strtof(const char *nptr, char **endptr);
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
 char *getenv(const char *name);
 int   putenv(char *string);
@@ -75,6 +76,9 @@ size_t mbstowcs(wchar_t *dest, const char *src, size_t n);
 size_t wcstombs(char *dest, const wchar_t *src, size_t n);
 
 static inline long labs(long x) {
+    return x < 0 ? -x : x;
+}
+static inline long long llabs(long long x) {
     return x < 0 ? -x : x;
 }
 

@@ -18,6 +18,7 @@
 #include "syscall.h"
 #include <errno.h>
 #include <pthread.h>
+#include <signal.h>
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
@@ -612,4 +613,51 @@ int pthread_rwlock_trywrlock(pthread_rwlock_t *rw) {
 }
 int pthread_rwlock_unlock(pthread_rwlock_t *rw) {
   return rw ? pthread_mutex_unlock(&rw->mtx) : EINVAL;
+}
+
+/* gthr-posix / libstdc++ completion stubs. b1nix has no thread cancellation or
+ * scheduling priorities; these exist so the symbols link (gthr weak refs) and
+ * threading is reported active. */
+int pthread_cancel(pthread_t thread) {
+  (void)thread;
+  return ENOSYS;
+}
+int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate) {
+  (void)attr;
+  (void)detachstate;
+  return 0;
+}
+int pthread_getschedparam(pthread_t thread, int *policy,
+                          struct sched_param *param) {
+  (void)thread;
+  if (policy)
+    *policy = SCHED_OTHER;
+  if (param)
+    param->sched_priority = 0;
+  return 0;
+}
+int pthread_setschedparam(pthread_t thread, int policy,
+                          const struct sched_param *param) {
+  (void)thread;
+  (void)policy;
+  (void)param;
+  return 0;
+}
+
+/* Thread-utility shims used by ports (Mesa's u_thread). b1nix has no per-thread
+ * signal masks distinct from the process mask, thread names, or per-thread CPU
+ * clocks — these map to the process equivalents or no-op. */
+int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset) {
+  return sigprocmask(how, set, oldset);
+}
+int pthread_setname_np(pthread_t thread, const char *name) {
+  (void)thread;
+  (void)name;
+  return 0;
+}
+int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id) {
+  (void)thread;
+  if (clock_id)
+    *clock_id = CLOCK_MONOTONIC;
+  return 0;
 }

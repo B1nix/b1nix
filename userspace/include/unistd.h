@@ -3,6 +3,7 @@
 
 #include <stddef.h>
 #include <sys/types.h>
+#include <limits.h>
 #include <time.h>
 
 /* NB: _POSIX_VERSION is intentionally NOT defined globally. Advertising it here

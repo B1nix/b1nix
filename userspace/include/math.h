@@ -111,9 +111,7 @@ long double ldexpl(long double x, int exp);
 float strtof(const char *nptr, char **endptr);
 long double strtold(const char *nptr, char **endptr);
 
-#ifdef __cplusplus
-}
-#endif
+
 
 
 /* round-to-nearest-integer (in libm) */
@@ -121,5 +119,45 @@ long lrint(double);
 long lrintf(float);
 long long llrint(double);
 long long llrintf(float);
+
+
+/* C99 math additions for ports (Mesa/NIR). Backed by openlibm. */
+float exp2f(float);
+float fmaf(float, float, float);
+double fma(double, double, double);
+float ldexpf(float, int);
+#define isnormal(x) __builtin_isnormal(x)
+#define isgreater(x,y) __builtin_isgreater(x,y)
+#define isless(x,y) __builtin_isless(x,y)
+
+
+/* Broad C99 math decls (openlibm-backed) for Mesa/NIR. */
+float frexpf(float, int *);
+float modff(float, float *);
+float nearbyintf(float);
+float nextafterf(float, float);
+float cbrtf(float);
+float expm1f(float);
+float log1pf(float);
+double asinh(double);
+float asinhf(float);
+double acosh(double);
+float acoshf(float);
+double atanh(double);
+float atanhf(float);
+float remainderf(float, float);
+long lround(double);
+
+long lroundf(float);
+
+long long llround(double);
+
+long long llroundf(float);
+
+#define fpclassify(x) __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif

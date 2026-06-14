@@ -49,4 +49,44 @@
 #define SCNo16 "ho"
 #define SCNx16 "hx"
 
+
+/* intmax_t / uintmax_t format macros (intmax_t == long long here). */
+#define PRIdMAX "lld"
+#define PRIiMAX "lli"
+#define PRIoMAX "llo"
+#define PRIuMAX "llu"
+#define PRIxMAX "llx"
+#define PRIXMAX "llX"
+#define SCNdMAX "lld"
+#define SCNiMAX "lli"
+#define SCNoMAX "llo"
+#define SCNuMAX "llu"
+#define SCNxMAX "llx"
+
+
+/* uintptr_t / intptr_t format macros (pointer width is arch-dependent). */
+#if defined(__x86_64__) || defined(__LP64__)
+#define PRIdPTR "ld"
+#define PRIiPTR "li"
+#define PRIoPTR "lo"
+#define PRIuPTR "lu"
+#define PRIxPTR "lx"
+#define PRIXPTR "lX"
+#define SCNdPTR "ld"
+#define SCNiPTR "li"
+#define SCNuPTR "lu"
+#define SCNxPTR "lx"
+#else
+#define PRIdPTR "d"
+#define PRIiPTR "i"
+#define PRIoPTR "o"
+#define PRIuPTR "u"
+#define PRIxPTR "x"
+#define PRIXPTR "X"
+#define SCNdPTR "d"
+#define SCNiPTR "i"
+#define SCNuPTR "u"
+#define SCNxPTR "x"
+#endif
+
 #endif

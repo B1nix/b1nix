@@ -38,7 +38,20 @@ enable_one() {
     if grep -q '/\* #undef _GLIBCXX_HAVE_MBSTATE_T \*/' "$cfg"; then
       sed -i.bak 's|/\* #undef _GLIBCXX_HAVE_MBSTATE_T \*/|#define _GLIBCXX_HAVE_MBSTATE_T 1|' "$cfg"
     fi
+    # 3. Enable libstdc++ threading (std::mutex / call_once). The toolchain was
+    #    built --disable-threads (gthr-default == gthr-single), so select the
+    #    posix gthr model and turn on _GLIBCXX_HAS_GTHREADS. b1nix's pthread is
+    #    complete enough for gthr-posix's header-only path. build-toolchain.sh
+    #    sets --enable-threads=posix so a fresh full build does this natively.
+    bits=$(dirname "$cfg")
+    if [ -f "$bits/gthr-posix.h" ] && ! grep -q '_GLIBCXX_GCC_GTHR_POSIX_H' "$bits/gthr-default.h" 2>/dev/null; then
+      cp "$bits/gthr-posix.h" "$bits/gthr-default.h"
+    fi
+    if grep -q '/\* #undef _GLIBCXX_HAS_GTHREADS \*/' "$cfg"; then
+      sed -i.bak 's|/\* #undef _GLIBCXX_HAS_GTHREADS \*/|#define _GLIBCXX_HAS_GTHREADS 1|' "$cfg"
+    fi
   fi
+  rm -f "$cross"/*/include/c++/*/"$triplet"/bits/c++config.h.bak 2>/dev/null || true
   echo "enable-cxx: $triplet ready" >&2
 }
 

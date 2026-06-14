@@ -1,6 +1,8 @@
 #ifndef B1NIX_PTHREAD_H
 #define B1NIX_PTHREAD_H
 
+#include <sched.h>  /* sched_param, sched_yield — used by gthr-posix */
+
 /* M29: minimal libpthread for b1nix.
  *
  * Built on the kernel's SYS_CLONE / SYS_FUTEX / SYS_SET_TLS primitives. The
@@ -142,5 +144,21 @@ int pthread_attr_destroy(pthread_attr_t *a);
 #ifdef __cplusplus
 }
 #endif
+
+
+/* Completion for gthr-posix / libstdc++ threading. Cancellation and scheduling
+ * priority are stubbed (b1nix has neither); the symbols must exist so the weak
+ * gthr references resolve and __gthread_active_p() sees a live threads model. */
+#define PTHREAD_CREATE_JOINABLE 0
+#define PTHREAD_CREATE_DETACHED 1
+int pthread_cancel(pthread_t thread);
+int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate);
+int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);
+int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param);
+
+
+#include <time.h>  /* clockid_t */
+int pthread_setname_np(pthread_t thread, const char *name);
+int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id);
 
 #endif /* B1NIX_PTHREAD_H */

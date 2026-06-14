@@ -137,7 +137,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --without-headers \
         --disable-shared \
         --disable-multilib \
-        --disable-threads \
+        --enable-threads=posix \
         --disable-libgomp \
         --disable-libmudflap \
         --disable-libssp \
@@ -174,7 +174,7 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
             --without-headers \
             --disable-shared \
             --disable-multilib \
-            --disable-threads \
+            --enable-threads=posix \
             --disable-libgomp \
             --disable-libmudflap \
             --disable-libssp \

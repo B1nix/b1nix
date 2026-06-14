@@ -58,6 +58,7 @@ struct timespec {
     long long tv_nsec;
 };
 
+typedef int clockid_t;
 int clock_gettime(int clk_id, struct timespec *tp);
 int nanosleep(const struct timespec *req, struct timespec *rem);
 int clock_nanosleep(int clk_id, int flags, const struct timespec *req, struct timespec *rem);

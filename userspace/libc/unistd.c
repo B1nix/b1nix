@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include <sys/file.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
@@ -1550,3 +1551,38 @@ int clock_nanosleep(int clk_id, int flags, const struct timespec *req,
   if (delta.tv_sec < 0) return 0;
   return nanosleep(&delta, rem) == 0 ? 0 : errno;
 }
+
+/* Single scheduling class: degenerate priority range. */
+int sched_get_priority_max(int policy) { (void)policy; return 0; }
+int sched_get_priority_min(int policy) { (void)policy; return 0; }
+
+int sched_getcpu(void) { return getcpu(); }
+
+/* flock(2) whole-file advisory lock, backed by fcntl record locking. */
+int flock(int fd, int operation) {
+  struct flock fl;
+  fl.l_type = (operation & LOCK_UN)   ? F_UNLCK
+              : (operation & LOCK_EX) ? F_WRLCK
+                                      : F_RDLCK;
+  fl.l_whence = 0; /* SEEK_SET */
+  fl.l_start = 0;
+  fl.l_len = 0; /* whole file */
+  return fcntl(fd, (operation & LOCK_NB) ? F_SETLK : F_SETLKW, &fl);
+}
+
+/* fenv: b1nix has a fixed userspace FPU mode and no exception-flag plumbing. */
+int feclearexcept(int e) { (void)e; return 0; }
+int feraiseexcept(int e) { (void)e; return 0; }
+int fetestexcept(int e) { (void)e; return 0; }
+int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
+int fesetround(int r) { (void)r; return 0; }
+
+/* openlibm's fma() calls __isnormal; provide the glibc-style classifier. */
+int __isnormal(double x) { return __builtin_isnormal(x); }
+int __isnormalf(float x) { return __builtin_isnormal(x); }
+
+/* The prebuilt libstdc++ (built --without-headers) emits a C++-mangled
+ * reference to _exit from its debug code. Alias the mangled name to the real
+ * C _exit so it links; the debug path is unused at runtime. */
+__attribute__((noreturn)) void __b1nix_exit_cxx(int status) __asm__("_Z5_exiti");
+__attribute__((noreturn)) void __b1nix_exit_cxx(int status) { _exit(status); }

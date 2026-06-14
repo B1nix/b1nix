@@ -6,3 +6,6 @@
  * `#ifdef SYS_kcmp` simply stay undefined, which is the intended fallback. */
 #include <syscall.h>
 #endif
+
+/* Linux lowercase aliases some ports use. */
+#define SYS_gettid SYS_GETTID
