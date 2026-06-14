@@ -81,6 +81,19 @@ c_link_args = [$LINKARGS]
 cpp_link_args = [$LINKARGS]
 EOF
 
+# On i686, Mesa auto-enables its x86 (i386) assembly GL dispatch (USE_X86_ASM,
+# meson.build's cpu_family=='x86' branch — x86_64 takes a different branch and is
+# unaffected). Its glapi entry-point reloc path references _x86_get_dispatch,
+# which the static-glapi (shared-glapi=disabled) build does not provide -> link
+# error. Mesa 24 has no -Dasm option, so neutralise that x86-only block in
+# meson.build; the portable C dispatch is fine for a software port. Idempotent.
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  if sed --version >/dev/null 2>&1; then SEDI() { sed -i "$@"; }
+  else SEDI() { sed -i '' "$@"; } fi
+  SEDI "s/    with_asm_arch = 'x86'/    with_asm_arch = '' # b1nix: no i386 asm dispatch/" "$SRC_DIR/meson.build"
+  SEDI "/    pre_args += \['-DUSE_X86_ASM'\]/d" "$SRC_DIR/meson.build"
+fi
+
 if [ ! -f "$MESON_BUILD/build.ninja" ]; then
   ( cd "$SRC_DIR" && meson setup "$MESON_BUILD" --cross-file "$INI" \
       -Dgallium-drivers=swrast -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
