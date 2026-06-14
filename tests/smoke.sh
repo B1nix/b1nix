@@ -134,7 +134,27 @@ run_qemu() {
 			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=${NET_PCAP:-$PROJECT_DIR/smoke_run/net-$ARCH.pcap}"
 		fi
 
-		set -- qemu-system-x86_64 \
+		# Use KVM hardware acceleration when available (Linux /dev/kvm). The
+		# default QEMU accelerator is TCG (pure emulation), which is many times
+		# slower — heavy software workloads like the Mesa softpipe demo never
+		# finish a context within the timeout under TCG. Auto-detected so this is
+		# a no-op on hosts without KVM (e.g. macOS), which fall back to TCG.
+		local accel_args=""
+		if [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
+			accel_args="-accel kvm"
+		fi
+
+		# RAM: the historical default (no -m → 128 MiB) was enough until the real
+		# Mesa softpipe demo (m52-osmesa) actually ran — it exhausts 127 MiB and
+		# OOMs, starving later graphics tests (setcrtc, console-reclaim) and Mesa
+		# context creation. Give the VM headroom. x86_64 only: the 32-bit port
+		# caps usable RAM at 1 GiB, so keep it modest there.
+		local mem_args="-m ${SMOKE_MEM_MB:-1024}"
+		if [ "$ARCH" = "x86" ]; then
+			mem_args="-m ${SMOKE_MEM_MB:-768}"
+		fi
+
+		set -- qemu-system-x86_64 ${accel_args} ${mem_args} \
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
 			-serial stdio -display none -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04

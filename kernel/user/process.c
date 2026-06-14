@@ -30,6 +30,7 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
 #define PT_INTERP  3
+#define PT_TLS     7
 
 /* M30 — ELF64 dynamic-tag identifiers (subset honoured by the in-kernel
  * loader). Standard `Elf64_Dyn` tag values. */
@@ -785,6 +786,32 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     }
   }
 
+  /* Capture the PT_TLS template so user_run_elf_image can set up the main
+   * thread's TLS block + FS base. Without this, a binary that uses __thread /
+   * std::call_once (e.g. Mesa via util_call_once_data_slow's `mov %fs:0,%rax`)
+   * derefs a zero FS base and SIGSEGVs before main does any real work. */
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    struct elf64_phdr *phdr =
+        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)i * ehdr->e_phentsize));
+    if (phdr->p_type != PT_TLS)
+      continue;
+    if (phdr->p_filesz > phdr->p_memsz ||
+        phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
+        phdr->p_offset + phdr->p_filesz > file_size ||
+        phdr->p_memsz > USER_IMAGE_MAX_SEGMENT)
+      break; /* malformed — leave tls_memsz 0 (no TLS) */
+    image->tls_memsz = phdr->p_memsz;
+    image->tls_filesz = phdr->p_filesz;
+    image->tls_align = phdr->p_align ? phdr->p_align : 8;
+    if (phdr->p_filesz) {
+      image->tls_data = kmalloc(phdr->p_filesz);
+      if (image->tls_data)
+        memcpy(image->tls_data, file_data + phdr->p_offset, phdr->p_filesz);
+    }
+    break; /* at most one PT_TLS */
+  }
+
   /* Eager dynamic linking. The kernel loads each DT_NEEDED ET_DYN object into
    * the process image, resolves symbols globally (main first, then libraries),
    * and patches GOT/PLT before userspace starts. */
@@ -906,6 +933,10 @@ void user_image_free(struct user_loaded_image *image) {
 
   if (image->address_space.stack_image) {
     kfree(image->address_space.stack_image);
+  }
+
+  if (image->tls_data) {
+    kfree(image->tls_data);
   }
 
   kfree(image);
@@ -1087,6 +1118,31 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
     } else {
       segment->data = 0;
     }
+  }
+
+  /* Capture PT_TLS so user_run_elf_image sets up the main thread's TLS block +
+   * GS base (i686 variant II). Without it, a binary using __thread / call_once
+   * (Mesa) derefs a zero GS base and SIGSEGVs. Mirrors the elf64 path. */
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    struct elf32_phdr *phdr =
+        (struct elf32_phdr *)(file_data + ehdr->e_phoff +
+                              ((u64)i * ehdr->e_phentsize));
+    if (phdr->p_type != PT_TLS)
+      continue;
+    if (phdr->p_filesz > phdr->p_memsz ||
+        phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
+        phdr->p_offset + phdr->p_filesz > file_size ||
+        phdr->p_memsz > USER_IMAGE_MAX_SEGMENT)
+      break;
+    image->tls_memsz = phdr->p_memsz;
+    image->tls_filesz = phdr->p_filesz;
+    image->tls_align = phdr->p_align ? phdr->p_align : 8;
+    if (phdr->p_filesz) {
+      image->tls_data = kmalloc(phdr->p_filesz);
+      if (image->tls_data)
+        memcpy(image->tls_data, file_data + phdr->p_offset, phdr->p_filesz);
+    }
+    break;
   }
 
   /* Second pass: apply relocations */
@@ -1306,9 +1362,28 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * because the user pml4 also inherits the kernel's low-4GB identity
    * map (PML4[0]) — `vmm_virt_to_phys((void *)0x2000000)` would return
    * the identity-mapped phys frame and we'd corrupt physical memory. */
-  #define MAX_MAPPED_PAGES 64
-  u64 mapped_va[MAX_MAPPED_PAGES];
-  u64 mapped_frame[MAX_MAPPED_PAGES];
+  /* The reuse tracker must cover EVERY page of the image: a shared page can sit
+   * anywhere (e.g. Mesa's .data/.init_array share a page ~0x2ac5000, thousands
+   * of pages in). A fixed cap silently stopped recording, so the second
+   * segment re-zeroed the shared page and wiped the first segment's data
+   * (.init_array -> NULL ctor -> crash at rip=0). Size it to the total page
+   * count instead. */
+  usize total_pages = 0;
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    u64 vs = s->vaddr & ~(PAGE_SIZE - 1);
+    u64 ve = (s->vaddr + s->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    total_pages += (ve - vs) / PAGE_SIZE;
+  }
+  if (!total_pages)
+    total_pages = 1;
+  u64 *mapped_va = kzalloc(sizeof(u64) * total_pages);
+  u64 *mapped_frame = kzalloc(sizeof(u64) * total_pages);
+  if (!mapped_va || !mapped_frame) {
+    kfree(mapped_va);
+    kfree(mapped_frame);
+    return -ENOMEM;
+  }
   usize n_mapped = 0;
 
   for (usize i = 0; i < image->segment_count; i++) {
@@ -1325,16 +1400,17 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       }
       if (!frame) {
         frame = pmm_alloc_frame();
-        if (!frame)
+        if (!frame) {
+          kfree(mapped_va);
+          kfree(mapped_frame);
           return -ENOMEM;
+        }
         u64 flags = VMM_USER | VMM_WRITABLE;
         vmm_map_page(v, frame, flags);
         memset((void *)(usize)(direct_base + frame), 0, PAGE_SIZE);
-        if (n_mapped < MAX_MAPPED_PAGES) {
-          mapped_va[n_mapped] = v;
-          mapped_frame[n_mapped] = frame;
-          n_mapped++;
-        }
+        mapped_va[n_mapped] = v;
+        mapped_frame[n_mapped] = frame;
+        n_mapped++;
       }
 
       u64 direct_v = direct_base + frame;
@@ -1379,6 +1455,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       segment->data = 0;
     }
   }
+
+  kfree(mapped_va);
+  kfree(mapped_frame);
 
   /* Initialize heap bounds based on the end of the highest segment */
   u64 max_vaddr = 0;
@@ -1444,7 +1523,65 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     current_task->vma_list = stack_vma;
   }
 
+#if defined(__x86_64__) || defined(__i386__)
+  /* Main-thread TLS (x86 variant II). Layout: [ tdata | tbss ][ TCB ], with the
+   * thread pointer (TP) at the TCB and TCB[0] = TP (the self pointer that
+   * `mov %fs:0` (x86_64) / `mov %gs:0` (i686) reads). Thread-local variables
+   * live at negative offsets from TP. arch_set_fs_base() abstracts the register
+   * (FS MSR on x86_64, a GS GDT entry on i686). Only binaries with a PT_TLS
+   * segment need this; others keep the base 0 (set at exec). */
+  if (image->tls_memsz > 0) {
+    u64 align = image->tls_align < 8 ? 8 : image->tls_align;
+    u64 tls_size = (image->tls_memsz + align - 1) & ~(align - 1);
+    u64 tcb_size = 64; /* self pointer (+ spare slots), zero-initialised */
+    u64 block_size = tls_size + tcb_size;
+    /* Place just below the stack growth window, clear of heap and stack. */
+    u64 region = (image->address_space.stack_top - USER_STACK_MAX_SIZE -
+                  block_size - PAGE_SIZE) &
+                 ~(PAGE_SIZE - 1);
+    u64 tp = region + tls_size;
+    u64 db = vmm_direct_map_base();
 
+    for (u64 v = region; v < region + block_size; v += PAGE_SIZE) {
+      u64 frame = pmm_alloc_frame();
+      if (!frame)
+        return -ENOMEM;
+      vmm_map_page(v, frame, VMM_USER | VMM_WRITABLE);
+      u64 direct_v = db + frame;
+      memset((void *)(usize)direct_v, 0, PAGE_SIZE);
+
+      /* Copy any tdata bytes that fall in this page (tbss stays zero). */
+      if (image->tls_data && image->tls_filesz) {
+        u64 copy_start = region > v ? region : v;
+        u64 tdata_end = region + image->tls_filesz;
+        u64 copy_end = tdata_end < v + PAGE_SIZE ? tdata_end : v + PAGE_SIZE;
+        if (copy_end > copy_start)
+          memcpy((void *)(usize)(direct_v + (copy_start - v)),
+                 (char *)image->tls_data + (copy_start - region),
+                 (usize)(copy_end - copy_start));
+      }
+      /* Write the self pointer at TP[0] if TP lands in this page. */
+      if (tp >= v && tp < v + PAGE_SIZE)
+        *(u64 *)(usize)(direct_v + (tp - v)) = tp;
+    }
+
+    struct vm_area *tls_vma = kzalloc(sizeof(struct vm_area));
+    if (tls_vma) {
+      tls_vma->start = region;
+      tls_vma->end = region + block_size;
+      tls_vma->prot = PROT_READ | PROT_WRITE;
+      tls_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+      tls_vma->next = current_task->vma_list;
+      current_task->vma_list = tls_vma;
+    }
+
+    task_set_tls_base(current_task, tp);
+    {
+      extern void arch_set_fs_base(u64 base);
+      arch_set_fs_base(tp);
+    }
+  }
+#endif
 
   if ((image->address_space.stack_base & 0xFULL) != 0) {
     console_write("user: reject unaligned ring3 stack\n");

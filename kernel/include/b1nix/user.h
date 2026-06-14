@@ -66,6 +66,13 @@ struct user_loaded_image {
 	const char **argv;
 	const char **envp;
 	int refcount;
+	/* PT_TLS (thread-local storage) template for the main thread. tls_memsz==0
+	 * means the binary has no TLS. tls_data holds a copy of the initialised
+	 * portion (tdata, tls_filesz bytes); the rest up to tls_memsz is .tbss. */
+	u64 tls_memsz;
+	u64 tls_filesz;
+	u64 tls_align;
+	void *tls_data;
 };
 
 void userspace_init(void);

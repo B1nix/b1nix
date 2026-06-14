@@ -134,6 +134,16 @@ void console_write(const char *text)
 	spin_unlock_irqrestore(&console_lock, flags);
 }
 
+/* Forcibly release the console lock (bust_spinlocks pattern). Called from the
+ * fatal exception path: a fault may have interrupted code on this CPU that held
+ * the lock (e.g. a log/backtrace mid-print), and the handler's own
+ * console_write would then self-deadlock. Best-effort — only used when we are
+ * already crashing, so a momentarily garbled line on another CPU is acceptable. */
+void console_bust_lock(void)
+{
+	console_lock = 0;
+}
+
 void console_write_hex32(u32 value)
 {
 	const char *digits = "0123456789abcdef";

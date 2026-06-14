@@ -1286,3 +1286,11 @@ void *aligned_alloc(size_t alignment, size_t size) {
   (void)alignment;
   return malloc(size ? size : 1);
 }
+
+/* memalign: SVID/BSD aligned allocator (used by libstdc++'s operator new when
+ * its config detects _GLIBCXX_HAVE_MEMALIGN). Same 16-byte, free()-compatible
+ * backing as aligned_alloc above — no strict >16-byte alignment guarantee. */
+void *memalign(size_t alignment, size_t size) {
+  (void)alignment;
+  return malloc(size ? size : 1);
+}

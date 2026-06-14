@@ -200,13 +200,28 @@ static void virtio_gpu_reap_used(struct virtqueue *vq)
     vq->last_used_idx = vq->used->idx;
 }
 
+static inline u64 gpu_rdtsc(void)
+{
+    u32 lo, hi;
+    __asm__ volatile("rdtsc" : "=a"(lo), "=d"(hi));
+    return ((u64)hi << 32) | lo;
+}
+
 static int virtio_gpu_wait_used(struct virtqueue *vq, u16 target_used)
 {
-    u32 spin = 400000;
-    while (vq->used->idx != target_used && spin--) {
-    }
-    if (vq->used->idx != target_used) {
-        return -1;
+    /* Wall-clock-bounded, not iteration-bounded. A fixed spin count is
+     * calibrated for one CPU speed: under fast KVM 400k iterations elapse in
+     * microseconds — before the device finishes a large (e.g. full-frame 4 MiB)
+     * transfer — so the wait falsely times out (M50 setcrtc / DRM present).
+     * Bound by TSC cycles instead so it gives the device the same real time on
+     * TCG and KVM. ~4e9 cycles is ~1-4 s at any reasonable frequency — far more
+     * than a GPU command needs, and only that long on a genuine failure. */
+    u64 start = gpu_rdtsc();
+    const u64 budget = 4000000000ULL;
+    while (vq->used->idx != target_used) {
+        if (gpu_rdtsc() - start > budget) {
+            return -1;
+        }
     }
     vq->last_used_idx = vq->used->idx;
     return 0;

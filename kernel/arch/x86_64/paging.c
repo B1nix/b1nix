@@ -229,10 +229,22 @@ void vmm_init(void) {
     u64 *pd_h = ensure_child_table(pdpt_h, pdpt_index(virtual_high));
     pd_h[pd_index(virtual_high)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
 
-    /* Identity mapping (for transition and kernel-space execution) */
+    /* Identity mapping (for transition and physical access) */
     u64 *pdpt_i = ensure_child_table(pml4, pml4_index(physical));
     u64 *pd_i = ensure_child_table(pdpt_i, pdpt_index(physical));
     pd_i[pd_index(physical)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
+  }
+
+  /* Higher-half kernel window: map KERNEL_VMA (0xFFFFFFFF80000000) -> phys 0..
+   * so the kernel — which is LINKED at KERNEL_VMA — stays mapped after we switch
+   * CR3 to this pml4 below. Mirrors boot.S (pdpt[510] -> pd covering phys
+   * 0-1GiB). 1 GiB is ample for the kernel image; this window is also what keeps
+   * the kernel's data out of the low VA range userspace maps into. */
+  for (u64 physical = 0; physical < 0x40000000ULL; physical += 0x200000ULL) {
+    u64 virt = KERNEL_VMA + physical;
+    u64 *pdpt_k = ensure_child_table(pml4, pml4_index(virt));
+    u64 *pd_k = ensure_child_table(pdpt_k, pdpt_index(virt));
+    pd_k[pd_index(virt)] = physical | VMM_PRESENT | VMM_WRITABLE | (1ULL << 7);
   }
 
   /* Pre-allocate page tables for the kernel heap in the higher half */

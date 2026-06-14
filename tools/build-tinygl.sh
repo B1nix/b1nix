@@ -46,7 +46,7 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
   -O2 -fno-strict-aliasing -Db1nix
   -I$SRC_DIR/include -I$SRC_DIR/src -I$LIBM_DIR/include
-  -Wno-implicit-function-declaration"
+  -Wno-implicit-function-declaration -Wno-incompatible-pointer-types -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 
 OBJS=""
 for c in "$SRC_DIR"/src/*.c; do

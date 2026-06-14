@@ -15,4 +15,10 @@ while [ "$n" -gt 0 ]; do
     *) set -- "$@" "$a" ;;       # keep, preserving the exact argument
   esac
 done
-exec "$real" "$@"
+# Mesa hard-codes -Werror=format in meson.build; on the 32-bit (i686) build the
+# printf width checks trip (e.g. %x vs GLuint which is `long` there — draw.c).
+# A general -Wno-error does NOT override a specific -Werror=format, so un-promote
+# the format warnings specifically, last. Keep -Wformat itself ON (disabling it
+# makes -Wformat-security complain "ignored without -Wformat"). This is a port,
+# not Mesa development; harmless on x86_64 (already builds clean).
+exec "$real" "$@" -Wno-error=format -Wno-error=format-security

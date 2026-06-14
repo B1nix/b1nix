@@ -559,28 +559,29 @@ u64 paging_create_address_space(void) {
   u64 _vmflags;
   vmm_read_acquire(&_vmflags);
 
-  /* Clone kernel-half entries (512-1023) */
+  /* Clone kernel-half entries (512-1023): the direct map (where the kernel is
+   * now LINKED — higher-half, KERNEL_VMA=0x80000000) plus the kheap. That maps
+   * the entire kernel into every address space; the low half (0..0x80000000) is
+   * left wholly to userspace.
+   *
+   * No low-identity clone any more: the kernel used to be linked low and execute
+   * from the identity map, so user spaces had to clone the low PDEs covering the
+   * kernel image to survive a CR3 switch — but once the kernel grew past the
+   * 0x2000000 user base that clone shadowed userspace and every app faulted at
+   * _start. Now the kernel runs in the direct map, so the low half is free. */
   for (usize i = 512; i < 1024; i++) {
     pd[i] = kernel_pml4_virt[i];
   }
 
-  /* Clone the kernel's low identity map — but ONLY enough 4 MB entries to cover
-   * the kernel image (1 MB .. __kernel_end). The kernel is linked at 0x100000
-   * and executes from those identity-mapped low addresses, so a user address
-   * space must keep them mapped to survive a CR3 switch (the original
-   * triple-fault fix). Cloning the FULL direct-map span (>=256 MB) was wrong:
-   * userspace ELF executables link at 0x02000000 (32 MB), and a cloned kernel
-   * *huge-page* identity PDE there shadowed the loader's 4 KB user mapping —
-   * ensure_child_table treated the huge-page PDE as a page-table pointer, so the
-   * binary actually executed from identity-mapped physical 0x02000000 (garbage)
-   * and faulted on its first instructions. Capping the clone at the kernel image
-   * leaves PD index 8 (0x02000000) free for a clean per-process user mapping. */
-  extern char __kernel_end[];
-  usize identity_entries = ((u32)(usize)__kernel_end >> 22) + 1;
-  if (identity_entries > 512) {
-    identity_entries = 512;
-  }
-  for (usize i = 0; i < identity_entries; i++) {
+  /* Clone the low identity ONLY below the userspace base (0 .. 0x2000000, PD
+   * entries 0-7). The kernel runs high now, but a few low-physical accesses
+   * still go through the identity map — notably the VGA text buffer at 0xB8000
+   * and early boot structures. These all sit under 32 MB, so cloning entries
+   * 0-7 keeps them mapped in every process while leaving entry 8 (0x2000000,
+   * the userspace load base) and everything above it free for the loader's
+   * per-process 4 KB user mappings (no huge-page-vs-4KB clash). */
+  /* 0x2000000 = userspace ELF load base; >> 22 = PD index 8. */
+  for (usize i = 0; i < (0x2000000u >> 22); i++) {
     pd[i] = kernel_pml4_virt[i];
   }
 

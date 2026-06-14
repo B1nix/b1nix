@@ -13,6 +13,13 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 
 . "$ROOT_DIR/tools/toolchain-env.sh"
 
+# Portable in-place sed (GNU sed: `-i EXPR`; BSD/macOS sed: `-i '' EXPR`).
+if sed --version >/dev/null 2>&1; then
+  sed_inplace() { sed -i "$@"; }
+else
+  sed_inplace() { sed -i '' "$@"; }
+fi
+
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/freetype-${FT_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/freetype-b1nix/$B1NIX_TRIPLET"
@@ -26,11 +33,13 @@ if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
   [ -f "$tmp" ] || curl -L "$URL" -o "$tmp" 1>&2
   tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
-  # The smooth rasterizer's SSE2 fast path needs <emmintrin.h>, absent in the
-  # freestanding sysroot. Force the generic (correct, unaccelerated) path.
-  sed -i '' 's/^#  define FT_SSE2 1/#  define FT_SSE2 0/' \
-    "$SRC_DIR/src/smooth/ftgrays.c"
 fi
+
+# The smooth rasterizer's SSE2 fast path needs <emmintrin.h>, absent in the
+# freestanding sysroot. Force the generic (correct, unaccelerated) path.
+# Idempotent + outside the extraction guard so a leftover tree is still patched.
+sed_inplace 's/^#  define FT_SSE2 1/#  define FT_SSE2 0/' \
+  "$SRC_DIR/src/smooth/ftgrays.c"
 
 # Trimmed module list: TrueType + CFF/OpenType with the smooth rasterizer.
 # Drops SDF/SVG/BDF/PCF/PFR/Type1/Type42/winfonts which need extra deps or

@@ -207,7 +207,11 @@ static int region_contains(u64 base, u64 length, u64 address, u64 size) {
 }
 
 static u64 find_early_mem(const struct boot_info *boot_info, usize size) {
-  u64 search_addr = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
+  /* __kernel_end is a (possibly higher-half) virtual symbol; the PMM works in
+   * physical addresses, so convert via KERNEL_VMA (0 on the identity-mapped
+   * 32-bit port). */
+  u64 search_addr =
+      align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
 
   for (usize i = 0; i < boot_info->memory_region_count; i++) {
     const struct boot_memory_region *region = &boot_info->memory_regions[i];
@@ -271,8 +275,11 @@ static void size_direct_map(const struct boot_info *boot_info) {
 }
 
 void pmm_init(const struct boot_info *boot_info) {
-  pmm.kernel_start = (u64)(usize)__kernel_start;
-  pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end, PAGE_SIZE);
+  /* Convert the (higher-half) kernel symbols to physical addresses; the two
+   * reservation loops below then cover [0, kernel_end_phys). KERNEL_VMA is 0 on
+   * the identity-mapped 32-bit port, so this is a no-op there. */
+  pmm.kernel_start = (u64)(usize)__kernel_start - KERNEL_VMA;
+  pmm.kernel_end = align_up_u64((u64)(usize)__kernel_end - KERNEL_VMA, PAGE_SIZE);
   pmm.max_address = 0;
   pmm.total_usable = 0;
   pmm.phys_total = 0;

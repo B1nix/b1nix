@@ -42,6 +42,12 @@ Supporting documents:
 
 - [x] Parse the Multiboot2 memory map and manage reusable physical frames.
 - [x] Implement x86_64 paging, higher-half mapping, and a direct-map window.
+- [x] Link **both kernels at a higher-half VA** (x86_64 at 0xFFFFFFFF80000000;
+  i686 into the direct map at 0x80000000), loaded at physical 1M. Kernel symbols
+  no longer share the low address range with userspace (base 0x2000000), so a
+  large kernel image (e.g. an embedded Mesa initramfs) can no longer overlap and
+  corrupt a userspace process's view of kernel data. Both arches boot, single +
+  `-smp 4`.
 - [x] Add the kernel heap, map/unmap helpers, and lazy page allocation.
 - [x] Add swap bookkeeping and page eviction.
 - [x] Add per-process page tables, protection checks, and copy-on-write fork.
@@ -670,10 +676,21 @@ environment constraint.
   negotiates the VIRTIO_GPU_F_VIRGL capset and falls back to software when it
   is absent (the verified path on this QEMU). The 3D command path is gated on a
   virgl-capable QEMU.
-- [ ] `planned` Port real Mesa (swrast/llvmpipe) with EGL + GLES2 shaders
-  (meson cross-build). The TinyGL path covers the milestone's "unmodified
-  EGL/OpenGL Wayland app, software fallback" requirement today; Mesa adds the
-  GLES2/shader API surface.
+- [x] `done` Port **real upstream Mesa** (OSMesa + Gallium **softpipe**, no
+  LLVM) via a meson cross-build (`tools/build-mesa.sh` + `b1nix-mesa-cc` +
+  `enable-cxx-toolchain.sh`). `m52_osmesa` drives the unmodified OSMesa API
+  (`OSMesaCreateContext`/`MakeCurrent`) through the softpipe rasterizer, renders
+  a 3D triangle off-screen, pixel-verifies it, and presents to displayd:
+  `M52-GFX: ok mesa-context/mesa-render/mesa`. **Verified on both arches**
+  (x86_64 625/0, i686 624/0, single-CPU + `-smp 4`) under KVM.
+  - Required converting **both kernels to higher-half** so the ~12 MB Mesa demo
+    (embedded in the initramfs) no longer pushes the kernel image over the
+    0x2000000 userspace base and into userspace's address range — see the
+    higher-half kernel item under M2 (Memory Management). Plus an ELF
+    loader shared-page fix, main-thread TLS, a virtio-gpu TSC-bounded wait, and
+    a libc/toolchain round (memalign, gthr-posix libstdc++, open_memstream, ...).
+- [ ] `planned` EGL + GLES2 shader API on top of Mesa (the OSMesa path covers
+  fixed-function software OpenGL today; GLES2/shaders are the next surface).
 
 ## M53: Browser Platform
 

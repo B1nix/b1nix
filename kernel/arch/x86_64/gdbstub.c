@@ -158,6 +158,11 @@ static int gdb_addr_ok(u64 addr) {
     return 1;
   if (addr >= 0xffff800000000000ULL && addr < 0xffff800100000000ULL)
     return 1;
+  /* Higher-half kernel window (0xFFFFFFFF80000000 + 1 GiB): kernel code/data
+   * symbols now live here, so g/G register dumps and m/M of a kernel address
+   * land in this range. */
+  if (addr >= 0xffffffff80000000ULL && addr < 0xffffffffc0000000ULL)
+    return 1;
   return 0;
 }
 
