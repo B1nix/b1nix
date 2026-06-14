@@ -538,7 +538,16 @@ static void pmm_pcp_drain_all(void) {
 
 void pmm_free_frame(u64 frame) {
   if ((frame & (PAGE_SIZE - 1)) != 0 || frame >= pmm.max_address) {
-    klog_warn("pmm_free_frame: invalid frame");
+    /* Out-of-range or misaligned frames reach here legitimately: unmapping a
+     * shared/device mapping (e.g. the virtio-gpu framebuffer at ~0xfe000000,
+     * which the device owns) hits a PTE whose frame is above usable RAM. We
+     * correctly skip freeing it. Rate-limit the warning — a memory-heavy
+     * process (Mesa) unmaps such pages constantly, and a per-call serial
+     * klog_warn throttles it to a crawl. */
+    static unsigned warned = 0;
+    if (warned < 16)
+      klog_warn("pmm_free_frame: invalid frame (skipped, device/shared?)");
+    warned++;
     return;
   }
   usize idx = frame / PAGE_SIZE;

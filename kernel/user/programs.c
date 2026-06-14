@@ -1688,6 +1688,16 @@ static int init_main(int argc, const char **argv) {
         int gl_status = 0;
         syscall_dispatch(SYS_WAIT, gl_pid, (u64)(usize)&gl_status, 0, 0, 0, 0);
       }
+      /* M52: real Mesa OSMesa (software OpenGL) renders a 3D triangle into a
+       * wl_shm window and presents it to displayd. */
+      u64 osm_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m52-osmesa", 0, 0, 0, 0, 0);
+      if ((isize)osm_pid < 0) {
+        uwrite("M52-GFX: spawn-fail mesa\n");
+      } else {
+        int osm_status = 0;
+        syscall_dispatch(SYS_WAIT, osm_pid, (u64)(usize)&osm_status, 0, 0, 0, 0);
+      }
       /* M51: clipboard (wl_data_device) selection round-trip between two
        * client connections. */
       u64 clip_pid = syscall_dispatch(

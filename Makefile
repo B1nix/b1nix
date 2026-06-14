@@ -69,6 +69,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_harfbuzz_smoke \
 	m51_fontconfig_smoke \
 	m52_gl_smoke \
+	m52_osmesa \
 	cxx_smoke \
 	displayd \
 	gclock \
@@ -550,6 +551,13 @@ $(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DE
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
+
+# M52: real Mesa OSMesa (software OpenGL) demo. tools/build-m52-osmesa.sh builds
+# the whole Mesa stack (build-mesa.sh) and links the demo against it.
+$(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/build-m52-osmesa.sh tools/build-mesa.sh $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-m52-osmesa.sh userspace/build/$(ARCH)/bin/m52_osmesa
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

@@ -1,0 +1,18 @@
+#!/bin/sh
+# Compiler shim for the Mesa cross build. The b1nix-targeted cross GCC has no
+# threading spec, so it rejects -pthread (pthread lives in libb1nix, no flag
+# needed). Strip flags the cross GCC doesn't understand and forward the rest,
+# preserving argument boundaries (Mesa passes -D"..." defines with spaces).
+#
+# Invoked from the meson cross-file as: b1nix-mesa-cc <real-gcc-or-g++> <args...>
+set -eu
+real="$1"; shift
+n=$#
+while [ "$n" -gt 0 ]; do
+  a="$1"; shift; n=$((n - 1))
+  case "$a" in
+    -pthread) ;;                 # unsupported; pthread is in libb1nix
+    *) set -- "$@" "$a" ;;       # keep, preserving the exact argument
+  esac
+done
+exec "$real" "$@"
