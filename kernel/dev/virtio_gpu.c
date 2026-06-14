@@ -1,3 +1,4 @@
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
@@ -13,6 +14,29 @@
 
 #define VIRTIO_GPU_FORMAT_B8G8R8A8_UNORM 1
 #define VIRTIO_GPU_FLAG_FENCE 1
+
+/* VirGL 3D acceleration. VIRTIO_GPU_F_VIRGL is feature bit 0; when the host
+ * exposes a virglrenderer-backed device (qemu -device virtio-gpu-gl-*) it offers
+ * this bit and accepts the 3D command set below. The numbers come straight from
+ * the VirtIO GPU spec and Mesa's src/virtio/virtio-gpu/virgl_protocol.h /
+ * virgl_hw.h, so a hand-built command stream is byte-compatible with what the
+ * Mesa virgl driver emits. */
+#define VIRTIO_GPU_F_VIRGL 0
+
+/* virgl context command stream opcodes (enum virgl_context_cmd). */
+#define VIRGL_CCMD_CREATE_OBJECT 1
+#define VIRGL_CCMD_SET_FRAMEBUFFER_STATE 5
+#define VIRGL_CCMD_CLEAR 7
+#define VIRGL_OBJECT_SURFACE 8
+/* VIRGL_CMD0(cmd, obj, len): obj in bits 8-15, payload dword count in 16-31. */
+#define VIRGL_CMD0(cmd, obj, len) ((u32)(cmd) | ((u32)(obj) << 8) | ((u32)(len) << 16))
+
+/* gallium / virgl_hw.h constants used by the selftest clear. */
+#define VIRGL_FORMAT_B8G8R8A8_UNORM 1
+#define PIPE_TEXTURE_2D 2
+#define VIRGL_BIND_RENDER_TARGET (1u << 1)
+#define VIRGL_BIND_SAMPLER_VIEW (1u << 3)
+#define PIPE_CLEAR_COLOR0 (1u << 2)
 #define PCI_STATUS_CAP_LIST 0x10
 #define PCI_CAP_ID_VENDOR 0x09
 #define VIRTIO_PCI_CAP_COMMON_CFG 1
@@ -32,6 +56,19 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_RESP_OK_DISPLAY_INFO = 0x1101,
     VIRTIO_GPU_CMD_UPDATE_CURSOR = 0x0300,
     VIRTIO_GPU_CMD_MOVE_CURSOR = 0x0301,
+
+    /* VirGL 3D command subset (host virglrenderer). RESOURCE_DETACH_BACKING
+     * occupies 0x0107, so the capset queries start at 0x0108. */
+    VIRTIO_GPU_CMD_GET_CAPSET_INFO = 0x0108,
+    VIRTIO_GPU_CMD_GET_CAPSET = 0x0109,
+    VIRTIO_GPU_CMD_CTX_CREATE = 0x0200,
+    VIRTIO_GPU_CMD_CTX_DESTROY = 0x0201,
+    VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE = 0x0202,
+    VIRTIO_GPU_CMD_RESOURCE_CREATE_3D = 0x0204,
+    VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206,
+    VIRTIO_GPU_CMD_SUBMIT_3D = 0x0207,
+    VIRTIO_GPU_RESP_OK_CAPSET_INFO = 0x1102,
+    VIRTIO_GPU_RESP_OK_CAPSET = 0x1103,
 };
 
 struct virtio_gpu_ctrl_hdr {
@@ -127,6 +164,80 @@ struct virtio_gpu_update_cursor {
     u32 padding;
 } __attribute__((packed));
 
+/* ── VirGL 3D command structs (VirtIO GPU spec) ─────────────────────────── */
+struct virtio_gpu_get_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_index;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resp_capset_info {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_id;
+    u32 capset_max_version;
+    u32 capset_max_size;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_get_capset {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 capset_id;
+    u32 capset_version;
+} __attribute__((packed));
+
+struct virtio_gpu_ctx_create {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 nlen;
+    u32 context_init;
+    char debug_name[64];
+} __attribute__((packed));
+
+struct virtio_gpu_ctx_resource {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_resource_create_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 resource_id;
+    u32 target;
+    u32 format;
+    u32 bind;
+    u32 width;
+    u32 height;
+    u32 depth;
+    u32 array_size;
+    u32 last_level;
+    u32 nr_samples;
+    u32 flags;
+    u32 padding;
+} __attribute__((packed));
+
+struct virtio_gpu_box {
+    u32 x, y, z;
+    u32 w, h, d;
+} __attribute__((packed));
+
+struct virtio_gpu_transfer_host_3d {
+    struct virtio_gpu_ctrl_hdr hdr;
+    struct virtio_gpu_box box;
+    u64 offset;
+    u32 resource_id;
+    u32 level;
+    u32 stride;
+    u32 layer_stride;
+} __attribute__((packed));
+
+/* SUBMIT_3D: header + size + padding, immediately followed by the command
+ * stream dwords. The clear stream is tiny, so an inline tail buffer suffices. */
+struct virtio_gpu_cmd_submit {
+    struct virtio_gpu_ctrl_hdr hdr;
+    u32 size;
+    u32 padding;
+    u32 cmd[32];
+} __attribute__((packed));
+
 static struct virtio_device gpu_dev;
 static struct virtqueue controlq;
 static struct virtqueue cursorq;
@@ -149,6 +260,8 @@ static u32 *gpu_cursor_surface_virt;
 static u64 gpu_cursor_surface_phys;
 static usize gpu_cursor_surface_bytes;
 static int gpu_modern;
+static int gpu_virgl_offered;
+static int gpu_virgl_ok;
 static volatile u16 *gpu_notify_addr[2];
 static spinlock_t gpu_present_lock;
 static u8 *gpu_control_req_dma;
@@ -525,6 +638,236 @@ static int virtio_gpu_init_hw_cursor(void)
     return 0;
 }
 
+/* ── VirGL 3D acceleration selftest ──────────────────────────────────────
+ * Exercises the full accelerated path against the host virglrenderer:
+ * negotiate the capset, create a 3D context + render-target resource, submit a
+ * hand-built virgl command stream that clears the render target to a known
+ * colour, then TRANSFER_FROM_HOST_3D the GPU-rendered pixels back to guest
+ * memory and verify them. Real GPU work — virglrenderer translates the clear to
+ * host OpenGL on the host GPU (egl-headless / renderD128). Only runs when the
+ * device actually offered VIRGL (the virtio-gpu-gl device); on a plain
+ * virtio-gpu-pci host this is a no-op and emits no markers. */
+#define VIRGL_SELFTEST_CTX 1
+#define VIRGL_SELFTEST_RES 16
+#define VIRGL_SELFTEST_SURF 1
+#define VIRGL_SELFTEST_DIM 64
+
+static int virtio_gpu_virgl_hdr_ok(const struct virtio_gpu_ctrl_hdr *h, u32 want)
+{
+    return h->type == want;
+}
+
+static void virtio_gpu_virgl_selftest(void)
+{
+    if (!gpu_ready || !gpu_virgl_ok) return;
+    if (!bootinfo_has_flag("b1nix.test=1")) return;
+
+    console_write("M52-GFX: ok virgl-negotiate\n");
+
+    /* 1. Capset query — proves the host virglrenderer backend is live. */
+    struct virtio_gpu_get_capset_info capreq;
+    struct virtio_gpu_resp_capset_info capresp;
+    memset(&capreq, 0, sizeof(capreq));
+    memset(&capresp, 0, sizeof(capresp));
+    capreq.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+    capreq.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    capreq.hdr.fence_id = gpu_fence_id++;
+    capreq.capset_index = 0;
+    if (virtio_gpu_send_cmd(&capreq, sizeof(capreq), &capresp, sizeof(capresp)) < 0 ||
+        !virtio_gpu_virgl_hdr_ok(&capresp.hdr, VIRTIO_GPU_RESP_OK_CAPSET_INFO) ||
+        capresp.capset_id == 0) {
+        console_write("M52-GFX: fail virgl-capset-info\n");
+        return;
+    }
+
+    struct virtio_gpu_get_capset getcap;
+    /* The response is the header followed by the capset blob (~1 KiB for VIRGL2).
+     * Size the buffer so QEMU copies the whole thing instead of truncating and
+     * logging a guest error; only the header type is inspected. */
+    struct {
+        struct virtio_gpu_ctrl_hdr hdr;
+        u8 capset_data[3072];
+    } __attribute__((packed)) capdata;
+    usize capdata_len = sizeof(capdata);
+    if (capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr) < capdata_len)
+        capdata_len = capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr);
+    if (capdata_len > PAGE_SIZE) capdata_len = PAGE_SIZE;
+    memset(&getcap, 0, sizeof(getcap));
+    memset(&capdata, 0, sizeof(capdata));
+    getcap.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+    getcap.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    getcap.hdr.fence_id = gpu_fence_id++;
+    getcap.capset_id = capresp.capset_id;
+    getcap.capset_version = capresp.capset_max_version;
+    if (virtio_gpu_send_cmd(&getcap, sizeof(getcap), &capdata, capdata_len) < 0 ||
+        !virtio_gpu_virgl_hdr_ok(&capdata.hdr, VIRTIO_GPU_RESP_OK_CAPSET)) {
+        console_write("M52-GFX: fail virgl-capset\n");
+        return;
+    }
+    console_write("M52-GFX: ok virgl-capset\n");
+
+    /* 2. Create a 3D context. */
+    struct virtio_gpu_ctx_create ctx;
+    struct virtio_gpu_ctrl_hdr resp;
+    memset(&ctx, 0, sizeof(ctx));
+    ctx.hdr.type = VIRTIO_GPU_CMD_CTX_CREATE;
+    ctx.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    ctx.hdr.fence_id = gpu_fence_id++;
+    ctx.hdr.ctx_id = VIRGL_SELFTEST_CTX;
+    ctx.nlen = 5;
+    memcpy(ctx.debug_name, "b1nix", 5);
+    if (virtio_gpu_send_cmd(&ctx, sizeof(ctx), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-ctx\n");
+        return;
+    }
+
+    /* 3. Allocate guest backing for the render-target resource. */
+    usize rt_bytes = (usize)VIRGL_SELFTEST_DIM * VIRGL_SELFTEST_DIM * sizeof(u32);
+    usize rt_pages = (rt_bytes + PAGE_SIZE - 1) / PAGE_SIZE;
+    u64 rt_phys = pmm_alloc_frames(rt_pages);
+    if (!rt_phys) {
+        console_write("M52-GFX: fail virgl-backing\n");
+        return;
+    }
+    u32 *rt_virt = (u32 *)(usize)(rt_phys + vmm_direct_map_base());
+    memset(rt_virt, 0, rt_pages * PAGE_SIZE);
+
+    /* 4. Create the 3D render-target resource. */
+    struct virtio_gpu_resource_create_3d c3d;
+    memset(&c3d, 0, sizeof(c3d));
+    c3d.hdr.type = VIRTIO_GPU_CMD_RESOURCE_CREATE_3D;
+    c3d.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    c3d.hdr.fence_id = gpu_fence_id++;
+    c3d.resource_id = VIRGL_SELFTEST_RES;
+    c3d.target = PIPE_TEXTURE_2D;
+    c3d.format = VIRGL_FORMAT_B8G8R8A8_UNORM;
+    c3d.bind = VIRGL_BIND_RENDER_TARGET | VIRGL_BIND_SAMPLER_VIEW;
+    c3d.width = VIRGL_SELFTEST_DIM;
+    c3d.height = VIRGL_SELFTEST_DIM;
+    c3d.depth = 1;
+    c3d.array_size = 1;
+    c3d.last_level = 0;
+    c3d.nr_samples = 0;
+    c3d.flags = 0;
+    if (virtio_gpu_send_cmd(&c3d, sizeof(c3d), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-res3d\n");
+        return;
+    }
+
+    /* 5. Attach the guest backing pages to the resource. */
+    struct virtio_gpu_attach_backing_cmd attach;
+    memset(&attach, 0, sizeof(attach));
+    attach.req.hdr.type = VIRTIO_GPU_CMD_RESOURCE_ATTACH_BACKING;
+    attach.req.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    attach.req.hdr.fence_id = gpu_fence_id++;
+    attach.req.resource_id = VIRGL_SELFTEST_RES;
+    attach.req.nr_entries = 1;
+    attach.entry.addr = rt_phys;
+    attach.entry.length = (u32)(rt_pages * PAGE_SIZE);
+    if (virtio_gpu_send_cmd(&attach, sizeof(attach), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-attach\n");
+        return;
+    }
+
+    /* 6. Bind the resource into the context. */
+    struct virtio_gpu_ctx_resource ctxres;
+    memset(&ctxres, 0, sizeof(ctxres));
+    ctxres.hdr.type = VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE;
+    ctxres.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    ctxres.hdr.fence_id = gpu_fence_id++;
+    ctxres.hdr.ctx_id = VIRGL_SELFTEST_CTX;
+    ctxres.resource_id = VIRGL_SELFTEST_RES;
+    if (virtio_gpu_send_cmd(&ctxres, sizeof(ctxres), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-ctxres\n");
+        return;
+    }
+
+    /* 7. Build + submit the virgl command stream: wrap the resource as a render
+     * surface, bind it as the framebuffer, and CLEAR it to (R=0.25, G=0.5,
+     * B=0.75, A=1.0). Float bit patterns are precomputed — the kernel uses no
+     * FPU. virglrenderer runs this as real host GL on the host GPU. */
+    struct virtio_gpu_cmd_submit submit;
+    memset(&submit, 0, sizeof(submit));
+    submit.hdr.type = VIRTIO_GPU_CMD_SUBMIT_3D;
+    submit.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    submit.hdr.fence_id = gpu_fence_id++;
+    submit.hdr.ctx_id = VIRGL_SELFTEST_CTX;
+    u32 *s = submit.cmd;
+    int n = 0;
+    /* CREATE_OBJECT(SURFACE): handle, res_handle, format, level, layers */
+    s[n++] = VIRGL_CMD0(VIRGL_CCMD_CREATE_OBJECT, VIRGL_OBJECT_SURFACE, 5);
+    s[n++] = VIRGL_SELFTEST_SURF;
+    s[n++] = VIRGL_SELFTEST_RES;
+    s[n++] = VIRGL_FORMAT_B8G8R8A8_UNORM;
+    s[n++] = 0; /* texture level */
+    s[n++] = 0; /* first_layer | last_layer << 16 */
+    /* SET_FRAMEBUFFER_STATE: nr_cbufs, zsurf_handle, cbuf0_handle */
+    s[n++] = VIRGL_CMD0(VIRGL_CCMD_SET_FRAMEBUFFER_STATE, 0, 3);
+    s[n++] = 1;
+    s[n++] = 0;
+    s[n++] = VIRGL_SELFTEST_SURF;
+    /* CLEAR: buffers, color rgba (f32 bits), depth (double), stencil */
+    s[n++] = VIRGL_CMD0(VIRGL_CCMD_CLEAR, 0, 8);
+    s[n++] = PIPE_CLEAR_COLOR0;
+    s[n++] = 0x3E800000; /* 0.25f */
+    s[n++] = 0x3F000000; /* 0.50f */
+    s[n++] = 0x3F400000; /* 0.75f */
+    s[n++] = 0x3F800000; /* 1.00f */
+    s[n++] = 0; /* depth lo */
+    s[n++] = 0; /* depth hi */
+    s[n++] = 0; /* stencil */
+    submit.size = (u32)(n * sizeof(u32));
+    usize submit_len = sizeof(struct virtio_gpu_ctrl_hdr) + 8 + submit.size;
+    if (virtio_gpu_send_cmd(&submit, submit_len, &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-submit\n");
+        return;
+    }
+    console_write("M52-GFX: ok virgl-3d-clear\n");
+
+    /* 8. Read the GPU-rendered surface back into guest memory. */
+    struct virtio_gpu_transfer_host_3d xfer;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    xfer.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    xfer.hdr.fence_id = gpu_fence_id++;
+    xfer.hdr.ctx_id = VIRGL_SELFTEST_CTX;
+    xfer.box.x = 0;
+    xfer.box.y = 0;
+    xfer.box.z = 0;
+    xfer.box.w = VIRGL_SELFTEST_DIM;
+    xfer.box.h = VIRGL_SELFTEST_DIM;
+    xfer.box.d = 1;
+    xfer.offset = 0;
+    xfer.resource_id = VIRGL_SELFTEST_RES;
+    xfer.level = 0;
+    xfer.stride = 0;
+    xfer.layer_stride = 0;
+    if (virtio_gpu_send_cmd(&xfer, sizeof(xfer), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA) {
+        console_write("M52-GFX: fail virgl-readback\n");
+        return;
+    }
+
+    /* 9. Verify the GPU actually rendered the clear colour. B8G8R8A8 memory
+     * order is B,G,R,A. 0.25/0.5/0.75/1.0 * 255 ≈ 64/128/191/255. */
+    u32 px = rt_virt[0];
+    u32 b = px & 0xFF, g = (px >> 8) & 0xFF, r = (px >> 16) & 0xFF, a = (px >> 24) & 0xFF;
+    if (a >= 250 && r >= 60 && r <= 68 && g >= 124 && g <= 132 && b >= 187 && b <= 195) {
+        console_write("M52-GFX: ok path-accelerated\n");
+    } else {
+        /* Log the readback so a host-dependent rounding/ordering mismatch is
+         * diagnosable rather than a silent failure. */
+        console_write("M52-GFX: fail path-accelerated pixel=0x");
+        console_write_hex32(px);
+        console_write("\n");
+    }
+}
+
 void virtio_gpu_init(void)
 {
     struct pci_device_info pci;
@@ -592,16 +935,24 @@ void virtio_gpu_init(void)
                 gpu_common_cfg->device_status |= VIRTIO_STATUS_DRIVER;
 
                 gpu_common_cfg->device_feature_select = 0;
-                u32 _devfeat0 = gpu_common_cfg->device_feature;
-                (void)_devfeat0;
+                u32 devfeat0 = gpu_common_cfg->device_feature;
+                u32 drvfeat0 = 0;
+                /* Negotiate VirGL when the host (virglrenderer) offers it, so we
+                 * can drive the 3D command set. Plain virtio-gpu-pci does not
+                 * offer it — we then fall back to the 2D software path. */
+                if (devfeat0 & (1u << VIRTIO_GPU_F_VIRGL)) {
+                    drvfeat0 |= (1u << VIRTIO_GPU_F_VIRGL);
+                    gpu_virgl_offered = 1;
+                }
                 gpu_common_cfg->driver_feature_select = 0;
-                gpu_common_cfg->driver_feature = 0;
+                gpu_common_cfg->driver_feature = drvfeat0;
                 gpu_common_cfg->driver_feature_select = 1;
                 gpu_common_cfg->driver_feature = 0;
 
                 gpu_common_cfg->device_status |= VIRTIO_STATUS_FEATURES_OK;
                 if (gpu_common_cfg->device_status & VIRTIO_STATUS_FEATURES_OK) {
                     gpu_modern = 1;
+                    if (gpu_virgl_offered) gpu_virgl_ok = 1;
                     if (virtio_gpu_setup_modern_queue(&controlq, 0) == 0 &&
                         virtio_gpu_setup_modern_queue(&cursorq, 1) == 0) {
                         gpu_common_cfg->device_status |= VIRTIO_STATUS_DRIVER_OK;
@@ -653,11 +1004,18 @@ void virtio_gpu_init(void)
     if (gpu_modern) {
         console_write("virtio-gpu: modern transport enabled\n");
     }
+    if (gpu_virgl_ok) {
+        console_write("virtio-gpu: VirGL 3D acceleration negotiated\n");
+    }
     virtio_gpu_query_display_info();
     if (virtio_gpu_init_hw_cursor() == 0) {
         gpu_hw_cursor_ready = 1;
         console_write("virtio-gpu: hw cursor enabled\n");
     }
+    /* Exercise the accelerated 3D path when the host offers VirGL (no-op on a
+     * plain virtio-gpu device). Runs after the 2D scanout is up so a failure
+     * here cannot wedge the console output path. */
+    virtio_gpu_virgl_selftest();
     console_write("virtio-gpu: ready\n");
 }
 

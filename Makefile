@@ -70,6 +70,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m51_fontconfig_smoke \
 	m52_gl_smoke \
 	m52_osmesa \
+	m52_glsl \
 	cxx_smoke \
 	displayd \
 	gclock \
@@ -558,6 +559,13 @@ $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/build-m5
 	B1NIX_ARCH=$(ARCH) tools/build-m52-osmesa.sh userspace/build/$(ARCH)/bin/m52_osmesa
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
+
+# M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
+# demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
+$(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/build-m52-glsl.sh tools/build-mesa.sh $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-m52-glsl.sh userspace/build/$(ARCH)/bin/m52_glsl
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
