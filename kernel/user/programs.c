@@ -1698,6 +1698,17 @@ static int init_main(int argc, const char **argv) {
         int osm_status = 0;
         syscall_dispatch(SYS_WAIT, osm_pid, (u64)(usize)&osm_status, 0, 0, 0, 0);
       }
+      /* M52: real Mesa drives a GLSL shader program (programmable GL 2.x
+       * pipeline) and renders a Gouraud triangle through softpipe. */
+      u64 glsl_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m52-glsl", 0, 0, 0, 0, 0);
+      if ((isize)glsl_pid < 0) {
+        uwrite("M52-GFX: spawn-fail glsl\n");
+      } else {
+        int glsl_status = 0;
+        syscall_dispatch(SYS_WAIT, glsl_pid, (u64)(usize)&glsl_status, 0, 0, 0,
+                         0);
+      }
       /* M51: clipboard (wl_data_device) selection round-trip between two
        * client connections. */
       u64 clip_pid = syscall_dispatch(

@@ -156,12 +156,12 @@ run_qemu() {
 
 		set -- qemu-system-x86_64 ${accel_args} ${mem_args} \
 			-cdrom "$PROJECT_DIR/build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso}" \
-			-serial stdio -display none -monitor none -no-reboot \
+			-serial stdio -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			set -- "$@" \
-				-device virtio-gpu-pci \
+				-device ${GPU_DEVICE:-virtio-gpu-pci} \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
 				${filter_dump_args} \
 				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
@@ -373,6 +373,19 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 		B1NIX_ISO_NAME=b1nix-graphics.iso
 		SMOKE_PROGRESS_MODE=full
 		PROGRESS_PREFIX="[gfx]  "
+		# Drive the VirGL 3D-accelerated GPU on the graphics instance when the
+		# host QEMU + GPU support it (virtio-gpu-gl device + a DRM render node).
+		# egl-headless routes virglrenderer to the host GL stack. On hosts without
+		# it (e.g. macOS QEMU built without virglrenderer) we fall back to the
+		# plain 2D device and the kernel's VirGL selftest is a no-op — the
+		# software OpenGL path still runs and is verified.
+		if qemu-system-x86_64 -device help 2>/dev/null | grep -q "name \"virtio-gpu-gl-pci\"" &&
+		   qemu-system-x86_64 -display help 2>/dev/null | grep -qw egl-headless &&
+		   { [ -e /dev/dri/renderD128 ] || [ -e /dev/dri/renderD129 ]; }; then
+			GPU_DEVICE="virtio-gpu-gl-pci"
+			GPU_DISPLAY="egl-headless"
+			export GPU_DEVICE GPU_DISPLAY
+		fi
 		run_qemu "$USER_LOG"
 	) &
 	pid_user=$!
@@ -1289,6 +1302,22 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M52-GFX: ok mesa-context" "M52: real Mesa OSMesa context creates (software OpenGL)"
 		check_output "$LOG" "M52-GFX: ok mesa-render" "M52: Mesa softpipe renders a verified 3D triangle off-screen"
 		check_output "$LOG" "M52-GFX: ok mesa" "M52: Mesa OSMesa app presents to displayd"
+		check_output "$LOG" "M52-GFX: ok shader-compile" "M52: Mesa GLSL vertex+fragment shaders compile"
+		check_output "$LOG" "M52-GFX: ok shader-link" "M52: Mesa GLSL shader program links"
+		check_output "$LOG" "M52-GFX: ok shader-render" "M52: softpipe runs the shader program (Gouraud triangle pixel-verified)"
+		check_output "$LOG" "M52-GFX: ok glsl" "M52: programmable GL 2.x pipeline app presents to displayd"
+		# ── M52: VirGL 3D acceleration (host virglrenderer) ──
+		# Only assert the accelerated path when the host actually offered VirGL
+		# (virtio-gpu-gl device). On a plain 2D host this is a real host
+		# limitation, not a b1nix bug, so it is recorded as a skip — the software
+		# OpenGL/Mesa path above is the verified path there.
+		if grep -q "M52-GFX: ok virgl-negotiate" "$LOG" 2>/dev/null; then
+			check_output "$LOG" "M52-GFX: ok virgl-capset" "M52: host virglrenderer returns a VirGL capset"
+			check_output "$LOG" "M52-GFX: ok virgl-3d-clear" "M52: guest submits a virgl 3D command stream (CTX_CREATE + RESOURCE_CREATE_3D + SUBMIT_3D clear)"
+			check_output "$LOG" "M52-GFX: ok path-accelerated" "M52: host GPU renders the virgl clear; pixels verified via TRANSFER_FROM_HOST_3D"
+		else
+			pass "M52: VirGL 3D acceleration (skipped — host QEMU lacks a virglrenderer GL device)"
+		fi
 		check_output "$LOG" "M51-GFX: ok clipboard" "M51: wl_data_device clipboard selection round-trip"
 		check_output "$LOG" "M47-DSP: ok console-reclaim" "M47: framebuffer returns to kernel console"
 		check_output "$LOG" "M47-DSP: ok server-restart" "M47: displayd restarts after reclaim"

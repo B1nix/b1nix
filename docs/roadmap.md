@@ -669,13 +669,22 @@ environment constraint.
 - [x] `done` Software renderer presented through the VirtIO-GPU 2D scanout
   (`kernel/dev/virtio_gpu.c`, RESOURCE_CREATE_2D / SET_SCANOUT /
   TRANSFER_TO_HOST_2D / RESOURCE_FLUSH, from M50) via displayd.
-- [ ] `partial` VirGL 3D acceleration over VirtIO-GPU. Blocked on the host:
-  Homebrew QEMU 11.0.0 (macOS) ships **without** virglrenderer — no
-  `virtio-gpu-gl` device, no `virgl` property, no GL display backend — so
-  accelerated rendering cannot be exercised or verified here. The EGL backend
-  negotiates the VIRTIO_GPU_F_VIRGL capset and falls back to software when it
-  is absent (the verified path on this QEMU). The 3D command path is gated on a
-  virgl-capable QEMU.
+- [x] `done` VirGL 3D acceleration over VirtIO-GPU. `kernel/dev/virtio_gpu.c`
+  negotiates `VIRTIO_GPU_F_VIRGL` with a virglrenderer-backed host device,
+  queries the VIRGL capset, creates a 3D context + render-target resource, and
+  submits a hand-built virgl command stream (CREATE_OBJECT SURFACE +
+  SET_FRAMEBUFFER_STATE + CLEAR — byte-compatible with Mesa's
+  `virgl_protocol.h`) via `SUBMIT_3D`. It then `TRANSFER_FROM_HOST_3D`s the
+  GPU-rendered pixels back to guest memory and verifies them: the host GPU
+  renders the clear and the read-back BGRA pixel matches the requested colour
+  exactly (`0xff4080bf`). `M52-GFX: ok virgl-negotiate/virgl-capset/
+  virgl-3d-clear/path-accelerated`. Exercised on the Linux/KVM host
+  (QEMU 11 `-device virtio-gpu-gl-pci -display egl-headless`, virglrenderer
+  1.3.0, AMD Radeon via `/dev/dri/renderD128`); the smoke harness auto-detects
+  the virgl-capable device and the selftest is a clean no-op (recorded as a
+  skip, software path still verified) on hosts without it (e.g. macOS QEMU
+  built without virglrenderer). Full Mesa-on-virgl (gallium `virgl` driver +
+  libdrm winsys) is the remaining layer above this transport.
 - [x] `done` Port **real upstream Mesa** (OSMesa + Gallium **softpipe**, no
   LLVM) via a meson cross-build (`tools/build-mesa.sh` + `b1nix-mesa-cc` +
   `enable-cxx-toolchain.sh`). `m52_osmesa` drives the unmodified OSMesa API
@@ -689,8 +698,15 @@ environment constraint.
     higher-half kernel item under M2 (Memory Management). Plus an ELF
     loader shared-page fix, main-thread TLS, a virtio-gpu TSC-bounded wait, and
     a libc/toolchain round (memalign, gthr-posix libstdc++, open_memstream, ...).
-- [ ] `planned` EGL + GLES2 shader API on top of Mesa (the OSMesa path covers
-  fixed-function software OpenGL today; GLES2/shaders are the next surface).
+- [x] `done` Programmable GLSL shader pipeline on top of Mesa. `m52_glsl`
+  compiles and links a `#version 120` vertex+fragment shader pair through the
+  real Mesa GLSL compiler, draws an interleaved VBO with
+  `glBindAttribLocation`/`glDrawArrays`, and pixel-verifies the resulting
+  Gouraud (per-vertex-interpolated) triangle rendered by softpipe before
+  presenting to displayd: `M52-GFX: ok shader-compile/shader-link/
+  shader-render/glsl`. Verified on both arches (x86_64 629/0, i686 628/0).
+  (Full EGL + GLES2 ES contexts need Mesa's EGL/gbm stack, which rides on the
+  VirGL/libdrm work; desktop GLSL shaders are the verifiable surface today.)
 
 ## M53: Browser Platform
 

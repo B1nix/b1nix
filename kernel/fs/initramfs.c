@@ -53,6 +53,7 @@
 #include "initramfs_m51_cairo_wayland.inc"
 #include "initramfs_m52_gl_smoke.inc"
 #include "initramfs_m52_osmesa.inc"
+#include "initramfs_m52_glsl.inc"
 #include "initramfs_cxx_smoke.inc"
 #include "initramfs_m51_xkb_smoke.inc"
 #include "initramfs_m51_clipboard_smoke.inc"
@@ -1043,6 +1044,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m52_gl_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m52-osmesa", (const char *)vfs_m52_osmesa_elf,
      sizeof(vfs_m52_osmesa_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m52-glsl", (const char *)vfs_m52_glsl_elf,
+     sizeof(vfs_m52_glsl_elf), INITRAMFS_EXECUTABLE},
     {"/bin/cxx-smoke", (const char *)vfs_cxx_smoke_elf,
      sizeof(vfs_cxx_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-xkb-smoke", (const char *)vfs_m51_xkb_smoke_elf,
