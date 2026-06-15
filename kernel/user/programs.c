@@ -1576,6 +1576,31 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M53: INTERACTIVE INPUT — run NetSurf on the /dev/fb0 surface in interactive
+   * mode (-I) and inject synthesized keyboard + mouse events via the input layer
+   * (the same kernel injector the M47 display smoke uses). NetSurf's libnsfb
+   * surface reads /dev/input/event*, fbtk routes the events to the browser, and
+   * the self-test confirms move/click/key all arrive (M53-INPUT). */
+  {
+    (void)kthread_create("m53-inject", m47_input_injector_thread, 0);
+    const char *in_argv[6];
+    int in_argc = 0;
+    in_argv[in_argc++] = "/bin/nsfb";
+    in_argv[in_argc++] = "-f";
+    in_argv[in_argc++] = "b1nix";
+    in_argv[in_argc++] = "-I";
+    in_argv[in_argc++] = "file:///netsurf/test.html";
+    in_argv[in_argc] = 0;
+    u64 in_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)in_argv[0], in_argc,
+                                  (u64)(usize)in_argv, 0, 0, 0);
+    if ((isize)in_pid < 0) {
+      uwrite("M53-INPUT: spawn-fail\n");
+    } else {
+      int in_status = 0;
+      syscall_dispatch(SYS_WAIT, in_pid, (u64)(usize)&in_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M53: NetSurf WEB access — serve a page over HTTP on loopback (m53-httpd)
    * and have NetSurf fetch it over a real TCP connection via libcurl, proving
    * genuine web access (sockets/TCP/HTTP), not just the local file:// path. */
@@ -1644,6 +1669,33 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, tls_pid, (u64)(usize)&tls_status, 0, 0, 0, 0);
       }
       syscall_dispatch(SYS_KILL, httpsd_pid, SIGTERM, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: NetSurf PUBLIC-INTERNET HTTPS — fetch a real site over off-link TLS,
+   * verifying the cert against the shipped Mozilla CA bundle
+   * (/etc/ssl/certs/ca-certificates.crt). Optional: skips cleanly when the
+   * usernet has no off-link route (restrict=on / offline), like M32's ext
+   * probes, so the default offline smoke stays green. Enable outbound with
+   * B1NIX_NET_RESTRICT=off to actually exercise it. */
+  {
+    const char *ext_argv[8];
+    int ext_argc = 0;
+    ext_argv[ext_argc++] = "/bin/nsfb";
+    ext_argv[ext_argc++] = "-f";
+    ext_argv[ext_argc++] = "ram";
+    ext_argv[ext_argc++] = "-w";
+    ext_argv[ext_argc++] = "800";
+    ext_argv[ext_argc++] = "-T";
+    ext_argv[ext_argc++] = "https://example.com/";
+    ext_argv[ext_argc] = 0;
+    u64 ext_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)ext_argv[0], ext_argc,
+                                   (u64)(usize)ext_argv, 0, 0, 0);
+    if ((isize)ext_pid < 0) {
+      uwrite("M53-EXT-HTTPS: spawn-fail\n");
+    } else {
+      int ext_status = 0;
+      syscall_dispatch(SYS_WAIT, ext_pid, (u64)(usize)&ext_status, 0, 0, 0, 0);
     }
   }
 
@@ -1959,6 +2011,29 @@ static int init_main(int argc, const char **argv) {
         int glsl_status = 0;
         syscall_dispatch(SYS_WAIT, glsl_pid, (u64)(usize)&glsl_status, 0, 0, 0,
                          0);
+      }
+      /* M53: NetSurf as a WINDOWED client of the display server (the b1nix
+       * "Wayland frontend") — the framebuffer frontend's displayd libnsfb
+       * surface opens a b1display/libgui window, NetSurf lays out and paints the
+       * page into it, and presents it to the compositor. M53-WL markers. */
+      {
+        const char *wl_argv[6];
+        int wl_argc = 0;
+        wl_argv[wl_argc++] = "/bin/nsfb";
+        wl_argv[wl_argc++] = "-f";
+        wl_argv[wl_argc++] = "displayd";
+        wl_argv[wl_argc++] = "-T";
+        wl_argv[wl_argc++] = "file:///netsurf/test.html";
+        wl_argv[wl_argc] = 0;
+        u64 nswl_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)wl_argv[0],
+                                        wl_argc, (u64)(usize)wl_argv, 0, 0, 0);
+        if ((isize)nswl_pid < 0) {
+          uwrite("M53-WL: spawn-fail\n");
+        } else {
+          int nswl_status = 0;
+          syscall_dispatch(SYS_WAIT, nswl_pid, (u64)(usize)&nswl_status, 0, 0, 0,
+                           0);
+        }
       }
       /* M53: userspace VirGL — host-GPU-accelerated 3D via /dev/virtio-gpu (runs
        * on the graphics instance, which has the virgl-capable device). */

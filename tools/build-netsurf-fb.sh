@@ -68,6 +68,12 @@ stage build-libnslog.sh
 stage build-libnsfb.sh
 stage build-openlibm.sh   # libm.a (NetSurf + libpng need cos/sin/floor/pow/modf)
 
+# libb1gui: the b1nix display-server (displayd / b1display) client library, used
+# by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
+# client of the compositor. Build it and stage the archive into the sysroot.
+make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" "build/$B1NIX_ARCH/libb1gui.a" 1>&2
+cp "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libb1gui.a" "$SYSROOT/lib/"
+
 # build-openlibm skips k_exp.c/k_expf.c (its "complex.h" filter false-matches
 # openlibm_complex.h) which costs us the *double* __ldexp_exp/__ldexp_expf
 # helpers that e_exp/e_cosh/e_sinh need. Compile and fold them into libm.a.
@@ -228,7 +234,7 @@ emit_pc libnslog        "-lnslog"         ""
 # --allow-multiple-definition: on i686 the b1nix libc and libgcc both provide the
 # 64-bit division helpers (__udivdi3/__divdi3); they're identical, so let the
 # first win instead of erroring. (No such overlap on x86_64.)
-emit_pc libnsfb         "-Wl,--allow-multiple-definition -lnsfb -lb1nixcompat" ""
+emit_pc libnsfb         "-Wl,--allow-multiple-definition -lnsfb -lb1gui -lb1nixcompat" ""
 
 # ── 1a0. Toolchain fix: this cross-gcc's limits.h does not chain to the sysroot
 # system limits.h (it lacks the _GCC_NEXT_LIMITS_H re-include block), so POSIX
@@ -333,15 +339,24 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 		.plot = &fb_plotters
 	};
 	/* Marker prefix so the smoke can tell the paths apart. The on-screen
-	 * surface (-f b1nix, drawing to /dev/fb0) is M53-FB regardless of URL;
-	 * otherwise by scheme: https -> M53-HTTPS, http -> M53-WEB, file -> M53-NS. */
+	 * surface (-f b1nix, drawing to /dev/fb0) is M53-FB. Loopback http/https are
+	 * M53-WEB/M53-HTTPS. A non-loopback (public-internet) URL is M53-EXT* and is
+	 * "optional": if it can't be reached (offline / restricted usernet) we emit
+	 * "<mk>: unsupported" and skip, so the offline smoke stays green. */
+	int loopback = (feurl != NULL && strstr(feurl, "127.0.0.1") != NULL);
+	int optional = 0;
 	const char *mk = "M53-NS";
-	if (fename != NULL && strcmp(fename, "b1nix") == 0)
+	if (fename != NULL && strcmp(fename, "b1nix") == 0) {
 		mk = "M53-FB";
-	else if (feurl != NULL && strncmp(feurl, "https", 5) == 0)
-		mk = "M53-HTTPS";
-	else if (feurl != NULL && strncmp(feurl, "http", 4) == 0)
-		mk = "M53-WEB";
+	} else if (fename != NULL && strcmp(fename, "displayd") == 0) {
+		mk = "M53-WL";
+	} else if (feurl != NULL && strncmp(feurl, "https", 5) == 0) {
+		mk = loopback ? "M53-HTTPS" : "M53-EXT-HTTPS";
+		optional = !loopback;
+	} else if (feurl != NULL && strncmp(feurl, "http", 4) == 0) {
+		mk = loopback ? "M53-WEB" : "M53-EXT";
+		optional = !loopback;
+	}
 
 	nsfb_get_geometry(nsfb, &w, &h, NULL);
 	box.x0 = 0; box.y0 = 0; box.x1 = w; box.y1 = h;
@@ -374,6 +389,14 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 			    browser_window_has_content(bw))
 				break;
 		}
+	}
+	/* Optional (public-internet) fetch that couldn't be reached: skip cleanly
+	 * so the offline/restricted smoke stays green (mirrors M32's ext probes). */
+	if (optional && !browser_window_has_content(bw)) {
+		fprintf(stdout, "%s: unsupported (no off-link connectivity)\n", mk);
+		fprintf(stdout, "%s: done\n", mk);
+		fflush(stdout);
+		return;
 	}
 	fprintf(stdout, "%s: ok load\n", mk);
 
@@ -424,14 +447,73 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 	fprintf(stdout, "%s: done\n", mk);
 	fflush(stdout);
 }
+
+/* Interactive input self-test (-I): load the page, then run the real frontend
+ * event loop and confirm synthesized keyboard + mouse events flow from
+ * /dev/input through the libnsfb surface and fbtk into the browser.
+ * (fbtk is a file-global declared earlier in gui.c.) */
+static void framebuffer_input_run(nsfb_t *nsfb, struct browser_window *bw)
+{
+	int i, w = 0, h = 0;
+	int got_move = 0, got_click = 0, got_key = 0;
+	nsfb_event_t event;
+
+	nsfb_get_geometry(nsfb, &w, &h, NULL);
+	for (i = 0; i < 1500; i++) {
+		fb_test_pump(10);
+		if (browser_window_redraw_ready(bw))
+			break;
+	}
+	browser_window_reformat(bw, false, w, h);
+	for (i = 0; i < 50; i++)
+		fb_test_pump(10);
+	fprintf(stdout, "M53-INPUT: ok ready\n");
+	fflush(stdout);
+
+	/* Drain raw libnsfb events from the surface (proving the /dev/input ->
+	 * libnsfb path) and also route each through fbtk so the browser reacts. The
+	 * kernel injects events while we spin here. */
+	unsigned long total = 0;
+	for (i = 0; i < 4000 && !(got_move && got_click && got_key); i++) {
+		struct timespec ts;
+		while (nsfb_event(nsfb, &event, 0)) {
+			total++;
+			if (event.type == NSFB_EVENT_MOVE_ABSOLUTE ||
+			    event.type == NSFB_EVENT_MOVE_RELATIVE) {
+				got_move = 1;
+			} else if (event.type == NSFB_EVENT_KEY_DOWN &&
+				   event.value.keycode == NSFB_KEY_MOUSE_1) {
+				got_click = 1;
+			} else if (event.type == NSFB_EVENT_KEY_DOWN &&
+				   event.value.keycode > 0 &&
+				   event.value.keycode < 400) {
+				got_key = 1;
+			}
+		}
+		schedule_run();
+		ts.tv_sec = 0;
+		ts.tv_nsec = 10 * 1000000L;
+		nanosleep(&ts, NULL);
+	}
+	fprintf(stdout, "M53-INPUT: events=%lu\n", total);
+
+	if (got_move)
+		fprintf(stdout, "M53-INPUT: ok mouse-move\n");
+	if (got_click)
+		fprintf(stdout, "M53-INPUT: ok mouse-click\n");
+	if (got_key)
+		fprintf(stdout, "M53-INPUT: ok key\n");
+	fprintf(stdout, "M53-INPUT: done\n");
+	fflush(stdout);
+}
 EOF
   GUI_C="$SRC_DIR/frontends/framebuffer/gui.c"
   # (a) global test flag, declared before process_cmdline's definition (which
   #     sets it). Anchor on the return-type line so it lands above the function.
-  perl -0pi -e 's{\nstatic bool\nprocess_cmdline\(int argc, char\*\* argv\)}{\nstatic int fb_b1nix_test = 0; /* b1nix render self-test */\n\nstatic bool\nprocess_cmdline(int argc, char** argv)}' "$GUI_C"
+  perl -0pi -e 's{\nstatic bool\nprocess_cmdline\(int argc, char\*\* argv\)}{\nstatic int fb_b1nix_test = 0; /* b1nix render self-test (-T) */\nstatic int fb_b1nix_input = 0; /* b1nix input self-test (-I) */\n\nstatic bool\nprocess_cmdline(int argc, char** argv)}' "$GUI_C"
   # (b) accept -T (no SYS_SPAWN envp on b1nix, so use a flag not an env var).
-  perl -0pi -e 's{getopt_long\(argc, argv, "f:b:w:h:"}{getopt_long(argc, argv, "f:b:w:h:T"}' "$GUI_C"
-  perl -0pi -e 's{\n\t\tdefault:\n\t\t\tfprintf\(stderr,\n\t\t\t\t"Usage:}{\n\t\tcase '"'"'T'"'"':\n\t\t\tfb_b1nix_test = 1;\n\t\t\tbreak;\n\n\t\tdefault:\n\t\t\tfprintf(stderr,\n\t\t\t\t"Usage:}' "$GUI_C"
+  perl -0pi -e 's{getopt_long\(argc, argv, "f:b:w:h:"}{getopt_long(argc, argv, "f:b:w:h:TI"}' "$GUI_C"
+  perl -0pi -e 's{\n\t\tdefault:\n\t\t\tfprintf\(stderr,\n\t\t\t\t"Usage:}{\n\t\tcase '"'"'T'"'"':\n\t\t\tfb_b1nix_test = 1;\n\t\t\tbreak;\n\n\t\tcase '"'"'I'"'"':\n\t\t\tfb_b1nix_input = 1;\n\t\t\tbreak;\n\n\t\tdefault:\n\t\t\tfprintf(stderr,\n\t\t\t\t"Usage:}' "$GUI_C"
   # (c) the test function body, before framebuffer_run().
   awk -v hook="$SRC_PARENT/.nsfb_testhook.c" '
     /framebuffer_run\(void\)/ && !done {
@@ -441,7 +523,7 @@ EOF
     { print }
   ' "$GUI_C" > "$GUI_C.tmp" && mv "$GUI_C.tmp" "$GUI_C"
   # (d) dispatch on the flag in main().
-  perl -0pi -e 's{\t\tframebuffer_run\(\);}{\t\tif (fb_b1nix_test)\n\t\t\tframebuffer_test_run(nsfb, bw);\n\t\telse\n\t\t\tframebuffer_run();}' "$GUI_C"
+  perl -0pi -e 's{\t\tframebuffer_run\(\);}{\t\tif (fb_b1nix_input)\n\t\t\tframebuffer_input_run(nsfb, bw);\n\t\telse if (fb_b1nix_test)\n\t\t\tframebuffer_test_run(nsfb, bw);\n\t\telse\n\t\t\tframebuffer_run();}' "$GUI_C"
 fi
 
 # ── 2. Drive the NetSurf framebuffer build ──

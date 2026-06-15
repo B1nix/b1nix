@@ -34,8 +34,10 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
 fi
 
-# Drop in the b1nix /dev/fb0 surface so NetSurf can draw to the real screen.
+# Drop in the b1nix surfaces: /dev/fb0 (on-screen) and displayd (windowed client
+# of the b1nix Wayland-shaped compositor, with input).
 cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-b1nixfb.c" "$SRC_DIR/src/surface/b1nixfb.c"
+cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-displayd.c" "$SRC_DIR/src/surface/displayd.c"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   TARGET="i686-unknown-elf"
@@ -56,6 +58,7 @@ SOURCES="
   src/plot/8bpp.c src/plot/16bpp.c
   src/plot/32bpp-xbgr8888.c src/plot/32bpp-xrgb8888.c
   src/surface/surface.c src/surface/ram.c src/surface/b1nixfb.c
+  src/surface/displayd.c
 "
 
 OBJS=""

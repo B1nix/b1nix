@@ -61,7 +61,7 @@ fi
 # libparserutils install include dir for <parserutils/...>.
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix
+  -O2 -fno-strict-aliasing -Db1nix -DNDEBUG
   -I$SRC_DIR/include -I$SRC_DIR/src -I$PU_DIR/include
   -Wno-implicit-function-declaration"
 

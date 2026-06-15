@@ -789,9 +789,26 @@ no-fake-pass smoke test.
   surface (`-f b1nix`) opens the M47 fb device, mmaps it and flushes damage via
   `B1NIX_FBIOFLUSH`; NetSurf lays out and paints a page at the real screen
   resolution (1280x800) and presents it on the virtio-gpu display.
-  `M53-FB: ok render`. All four paths green both arches (x86_64 717/0, x86
-  716/0): file:// (off-screen + on-screen), HTTP and HTTPS.
-  Remaining browser work (HTTPS over the public internet, a Wayland frontend,
-  interactive keyboard/mouse input) is future.
+  `M53-FB: ok render`.
+- [x] `done` **Public-internet HTTPS** — NetSurf fetches a real public website
+  (`https://example.com/`) over off-link TLS and renders it, verifying the cert
+  against the shipped Mozilla CA bundle (the same libcurl/mbedTLS path M32's
+  `ext-https` uses). It is optional: it skips cleanly (`M53-EXT-HTTPS:
+  unsupported`) when the usernet has no off-link route, so the offline smoke
+  stays green; with outbound enabled it fetches and paints the full page.
+  With outbound enabled it fetches and paints the full page.
+- [x] `done` **Wayland frontend** — NetSurf runs as a windowed client of the
+  b1nix display server (displayd) over the b1display/libgui (Wayland-shaped)
+  protocol. A new libnsfb "displayd" surface gives NetSurf a compositor window
+  to paint into, presents damage with b1gui_present, and translates compositor
+  pointer/keyboard events to libnsfb events. `M53-WL: ok render`.
+- [x] `done` **Interactive input** — the framebuffer frontend is interactive:
+  the /dev/fb0 libnsfb surface reads /dev/input/event* (keyboard + mouse) and
+  feeds pointer motion, mouse buttons and keysyms into NetSurf's event loop. A
+  self-test (-I) confirms synthesized move + click + key events all arrive
+  (`M53-INPUT: ok mouse-move/mouse-click/key`).
+  Seven render/interaction paths green both arches (x86_64 728/0, x86 727/0):
+  file:// (off-screen + on-screen /dev/fb0 + windowed displayd), loopback HTTP,
+  loopback HTTPS, public-internet HTTPS, and keyboard/mouse input.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
   browser or another real application requires it.

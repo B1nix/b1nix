@@ -16,6 +16,7 @@
 #include <sys/ioctl.h>
 
 #include <b1nix/fb.h>
+#include <b1nix/input.h>
 
 #include "libnsfb.h"
 #include "libnsfb_plot.h"
@@ -30,7 +31,27 @@
 struct b1nixfb_priv {
     int fd;
     size_t maplen;
+    int kfd;   /* /dev/input/event0 (keyboard), -1 if unavailable */
+    int mfd;   /* /dev/input/event1 (mouse),    -1 if unavailable */
+    int px, py; /* tracked absolute pointer position */
 };
+
+/* Minimal PS/2 set-1 scancode -> libnsfb keycode map. Enough to prove keyboard
+ * input flows end to end; a full keymap is future work. */
+static enum nsfb_key_code_e scancode_to_nsfb(uint16_t sc)
+{
+    switch (sc) {
+    case 0x1E: return NSFB_KEY_a;
+    case 0x30: return NSFB_KEY_b;
+    case 0x2E: return NSFB_KEY_c;
+    case 0x1C: return NSFB_KEY_RETURN;
+    case 0x0F: return NSFB_KEY_TAB;
+    case 0x39: return NSFB_KEY_SPACE;
+    case 0x0E: return NSFB_KEY_BACKSPACE;
+    case 0x01: return NSFB_KEY_ESCAPE;
+    default:   return NSFB_KEY_UNKNOWN;
+    }
+}
 
 static int b1nixfb_defaults(nsfb_t *nsfb)
 {
@@ -69,6 +90,11 @@ static int b1nixfb_initialise(nsfb_t *nsfb)
     }
     priv->fd = fd;
     priv->maplen = maplen;
+    /* Open the input devices so the on-screen frontend is interactive. */
+    priv->kfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
+    priv->mfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+    priv->px = (int)info.width / 2;
+    priv->py = (int)info.height / 2;
 
     nsfb->surface_priv = priv;
     nsfb->ptr = fb;
@@ -87,6 +113,10 @@ static int b1nixfb_finalise(nsfb_t *nsfb)
     if (priv != NULL) {
         if (nsfb->ptr != NULL)
             munmap(nsfb->ptr, priv->maplen);
+        if (priv->kfd >= 0)
+            close(priv->kfd);
+        if (priv->mfd >= 0)
+            close(priv->mfd);
         close(priv->fd);
         free(priv);
         nsfb->surface_priv = NULL;
@@ -126,9 +156,54 @@ b1nixfb_geometry(nsfb_t *nsfb, int width, int height, enum nsfb_format_e format)
 
 static bool b1nixfb_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
 {
-    UNUSED(nsfb);
-    UNUSED(event);
+    struct b1nixfb_priv *priv = nsfb->surface_priv;
+    struct b1nix_input_event ie;
     UNUSED(timeout);
+
+    if (priv == NULL)
+        return false;
+
+    /* Mouse: absolute position + left button. (One libnsfb event per call; the
+     * frontend's loop calls us repeatedly.) */
+    if (priv->mfd >= 0 && read(priv->mfd, &ie, sizeof(ie)) == (int)sizeof(ie)) {
+        if (ie.type == B1NIX_EV_ABS) {
+            if (ie.code == B1NIX_ABS_X) priv->px = ie.value;
+            else if (ie.code == B1NIX_ABS_Y) priv->py = ie.value;
+            event->type = NSFB_EVENT_MOVE_ABSOLUTE;
+            event->value.vector.x = priv->px;
+            event->value.vector.y = priv->py;
+            event->value.vector.z = 0;
+            return true;
+        }
+        if (ie.type == B1NIX_EV_REL) {
+            if (ie.code == B1NIX_REL_X) priv->px += ie.value;
+            else if (ie.code == B1NIX_REL_Y) priv->py += ie.value;
+            event->type = NSFB_EVENT_MOVE_ABSOLUTE;
+            event->value.vector.x = priv->px;
+            event->value.vector.y = priv->py;
+            event->value.vector.z = 0;
+            return true;
+        }
+        if (ie.type == B1NIX_EV_KEY && ie.code == B1NIX_BTN_LEFT) {
+            event->type = ie.value ? NSFB_EVENT_KEY_DOWN : NSFB_EVENT_KEY_UP;
+            event->value.keycode = NSFB_KEY_MOUSE_1;
+            return true;
+        }
+        /* EV_SYN or other: no libnsfb event this call. */
+    }
+
+    /* Keyboard: PS/2 set-1 scancode -> keysym. */
+    if (priv->kfd >= 0 && read(priv->kfd, &ie, sizeof(ie)) == (int)sizeof(ie)) {
+        if (ie.type == B1NIX_EV_KEY) {
+            enum nsfb_key_code_e kc = scancode_to_nsfb(ie.code);
+            if (kc != NSFB_KEY_UNKNOWN) {
+                event->type = ie.value ? NSFB_EVENT_KEY_DOWN
+                                       : NSFB_EVENT_KEY_UP;
+                event->value.keycode = kc;
+                return true;
+            }
+        }
+    }
     return false;
 }
 

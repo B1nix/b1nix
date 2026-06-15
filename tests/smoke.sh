@@ -1152,6 +1152,12 @@ check_output "$LOG" "M53-NS: done" "NetSurf framebuffer render self-test complet
 check_output "$LOG" "M53-FB: ok redraw" "NetSurf draws the page directly into the hardware framebuffer (/dev/fb0)"
 check_output "$LOG" "M53-FB: ok render" "the on-screen /dev/fb0 framebuffer is non-blank and structured"
 check_output "$LOG" "M53-FB: done" "NetSurf on-screen render completes"
+# ── M53 NetSurf interactive input: synthesized keyboard/mouse drive the frontend ──
+check_output "$LOG" "M53-INPUT: ok ready" "NetSurf reaches its interactive event loop on the fb frontend"
+check_output "$LOG" "M53-INPUT: ok mouse-move" "synthesized pointer motion reaches NetSurf (via /dev/input -> libnsfb -> fbtk)"
+check_output "$LOG" "M53-INPUT: ok mouse-click" "synthesized mouse click reaches NetSurf"
+check_output "$LOG" "M53-INPUT: ok key" "synthesized keyboard key reaches NetSurf"
+check_output "$LOG" "M53-INPUT: done" "NetSurf interactive-input self-test completes"
 # ── M53 NetSurf WEB access: fetch + render a page over HTTP (loopback) ──
 check_output "$LOG" "M53-HTTPD: ready" "in-VM HTTP server is listening on loopback"
 check_output "$LOG" "M53-WEB: has-content=1" "NetSurf fetched the page over HTTP (content attached)"
@@ -1163,6 +1169,16 @@ check_output "$LOG" "M53-HTTPSD: ready" "in-VM HTTPS (TLS 1.2) server is listeni
 check_output "$LOG" "M53-HTTPS: has-content=1" "NetSurf fetched the page over HTTPS (TLS handshake + cert verified)"
 check_output "$LOG" "M53-HTTPS: ok render" "TLS-fetched page paints a non-blank, structured framebuffer"
 check_output "$LOG" "M53-HTTPS: done" "NetSurf HTTPS render self-test completes"
+# ── M53 NetSurf public-internet HTTPS (off-link TLS to a real site) ──
+# Skips cleanly when the test host/usernet has no off-link route, so the suite
+# stays green offline (same policy as the M32 external probes).
+if grep -q "M53-EXT-HTTPS: unsupported" "$LOG" 2>/dev/null; then
+	pass "NetSurf public-internet HTTPS skipped (no off-link connectivity)"
+else
+	check_output "$LOG" "M53-EXT-HTTPS: has-content=1" "NetSurf fetched a real public site over HTTPS (Mozilla CA verified)"
+	check_output "$LOG" "M53-EXT-HTTPS: ok render" "public HTTPS page paints a non-blank, structured framebuffer"
+	check_output "$LOG" "M53-EXT-HTTPS: done" "NetSurf public-internet HTTPS render completes"
+fi
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"
@@ -1402,6 +1418,10 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M52-GFX: ok shader-link" "M52: Mesa GLSL shader program links"
 		check_output "$LOG" "M52-GFX: ok shader-render" "M52: softpipe runs the shader program (Gouraud triangle pixel-verified)"
 		check_output "$LOG" "M52-GFX: ok glsl" "M52: programmable GL 2.x pipeline app presents to displayd"
+		# ── M53: NetSurf as a windowed display-server client (Wayland frontend) ──
+		check_output "$LOG" "M53-WL: has-content=1" "M53: NetSurf runs as a displayd window and loads the page"
+		check_output "$LOG" "M53-WL: ok render" "M53: NetSurf paints the page into a displayd/libgui window and presents it"
+		check_output "$LOG" "M53-WL: done" "M53: NetSurf windowed (Wayland) frontend completes"
 		# ── M52: VirGL 3D acceleration (host virglrenderer) ──
 		# Only assert the accelerated path when the host actually offered VirGL
 		# (virtio-gpu-gl device). On a plain 2D host this is a real host
