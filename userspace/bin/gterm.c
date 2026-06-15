@@ -182,6 +182,23 @@ int main(void) {
 						write(master, "\177", 1);
 					else if (scan == 0x0f)
 						write(master, "\t", 1);
+					/* Extended (0xE0-prefixed) navigation keys ->
+					 * ANSI escape sequences so line editing / TUIs
+					 * (and shell history) work. */
+					else if (scan == 0xE048)
+						write(master, "\033[A", 3); /* up */
+					else if (scan == 0xE050)
+						write(master, "\033[B", 3); /* down */
+					else if (scan == 0xE04D)
+						write(master, "\033[C", 3); /* right */
+					else if (scan == 0xE04B)
+						write(master, "\033[D", 3); /* left */
+					else if (scan == 0xE047)
+						write(master, "\033[H", 3); /* home */
+					else if (scan == 0xE04F)
+						write(master, "\033[F", 3); /* end */
+					else if (scan == 0xE053)
+						write(master, "\033[3~", 4); /* delete */
 				}
 			}
 			if (changed)

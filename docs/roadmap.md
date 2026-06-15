@@ -806,7 +806,14 @@ no-fake-pass smoke test.
   the /dev/fb0 libnsfb surface reads /dev/input/event* (keyboard + mouse) and
   feeds pointer motion, mouse buttons and keysyms into NetSurf's event loop. A
   self-test (-I) confirms synthesized move + click + key events all arrive
-  (`M53-INPUT: ok mouse-move/mouse-click/key`).
+  (`M53-INPUT: ok mouse-move/mouse-click/key`). Both libnsfb surfaces (`b1nix`
+  and `displayd`) share one scancode→keysym map (`libnsfb-b1keymap.h`) that is
+  shift-aware and resolves the editing/navigation keys NetSurf text fields need
+  — backspace, delete, the arrows, home/end and page up/down — so typing,
+  deletion and caret movement in the address bar all work. gterm grew the
+  matching arrow/nav→ANSI-escape handling, so line editing and shell history
+  work in the terminal too. SysV `SHMMAX` was raised 1 MB → 32 MB so a single
+  shared segment can hold a full-screen graphics/framebuffer buffer.
   Seven render/interaction paths green both arches (x86_64 728/0, x86 727/0):
   file:// (off-screen + on-screen /dev/fb0 + windowed displayd), loopback HTTP,
   loopback HTTPS, public-internet HTTPS, and keyboard/mouse input.

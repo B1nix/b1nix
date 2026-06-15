@@ -4,6 +4,7 @@
 
 struct app {
 	const char *path;
+	const char *argv[6]; /* NULL-terminated argv; if argv[0]==0, run with none */
 	pid_t pid;
 	time_t started;
 };
@@ -12,7 +13,10 @@ static void launch(struct app *a) {
 	a->started = time(0);
 	a->pid = fork();
 	if (a->pid == 0) {
-		execlp(a->path, a->path, (char *)0);
+		if (a->argv[0] != 0)
+			execv(a->path, (char *const *)a->argv);
+		else
+			execlp(a->path, a->path, (char *)0);
 		_exit(127);
 	}
 }
@@ -31,9 +35,15 @@ int main(void) {
 	usleep(1000000);
 
 	struct app apps[] = {
-	    {"/bin/gpaint", 0, 0},
-	    {"/bin/gclock", 0, 0},
-	    {"/bin/gterm", 0, 0},
+	    {"/bin/gpaint", {0}, 0, 0},
+	    {"/bin/gclock", {0}, 0, 0},
+	    {"/bin/gterm", {0}, 0, 0},
+	    /* NetSurf web browser as a windowed displayd client. Opens its start
+	     * page; browse to other URLs from the address bar (or run
+	     * `nsfb -f displayd <url>` from gterm). */
+	    {"/bin/nsfb",
+	     {"/bin/nsfb", "-f", "displayd", "file:///netsurf/test.html", 0},
+	     0, 0},
 	};
 	const int n = (int)(sizeof(apps) / sizeof(apps[0]));
 

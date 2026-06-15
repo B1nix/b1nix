@@ -25,6 +25,7 @@
 #include "nsfb.h"
 #include "surface.h"
 #include "plot.h"
+#include "libnsfb-b1keymap.h"
 
 #define UNUSED(x) ((x) = (x))
 
@@ -34,24 +35,8 @@ struct b1nixfb_priv {
     int kfd;   /* /dev/input/event0 (keyboard), -1 if unavailable */
     int mfd;   /* /dev/input/event1 (mouse),    -1 if unavailable */
     int px, py; /* tracked absolute pointer position */
+    int shift;  /* shift held? for the scancode->keysym map */
 };
-
-/* Minimal PS/2 set-1 scancode -> libnsfb keycode map. Enough to prove keyboard
- * input flows end to end; a full keymap is future work. */
-static enum nsfb_key_code_e scancode_to_nsfb(uint16_t sc)
-{
-    switch (sc) {
-    case 0x1E: return NSFB_KEY_a;
-    case 0x30: return NSFB_KEY_b;
-    case 0x2E: return NSFB_KEY_c;
-    case 0x1C: return NSFB_KEY_RETURN;
-    case 0x0F: return NSFB_KEY_TAB;
-    case 0x39: return NSFB_KEY_SPACE;
-    case 0x0E: return NSFB_KEY_BACKSPACE;
-    case 0x01: return NSFB_KEY_ESCAPE;
-    default:   return NSFB_KEY_UNKNOWN;
-    }
-}
 
 static int b1nixfb_defaults(nsfb_t *nsfb)
 {
@@ -95,6 +80,7 @@ static int b1nixfb_initialise(nsfb_t *nsfb)
     priv->mfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
     priv->px = (int)info.width / 2;
     priv->py = (int)info.height / 2;
+    priv->shift = 0;
 
     nsfb->surface_priv = priv;
     nsfb->ptr = fb;
@@ -192,15 +178,20 @@ static bool b1nixfb_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
         /* EV_SYN or other: no libnsfb event this call. */
     }
 
-    /* Keyboard: PS/2 set-1 scancode -> keysym. */
+    /* Keyboard: PS/2 set-1 scancode -> keysym (shift-aware). */
     if (priv->kfd >= 0 && read(priv->kfd, &ie, sizeof(ie)) == (int)sizeof(ie)) {
         if (ie.type == B1NIX_EV_KEY) {
-            enum nsfb_key_code_e kc = scancode_to_nsfb(ie.code);
-            if (kc != NSFB_KEY_UNKNOWN) {
-                event->type = ie.value ? NSFB_EVENT_KEY_DOWN
-                                       : NSFB_EVENT_KEY_UP;
-                event->value.keycode = kc;
-                return true;
+            if (b1nix_is_shift_scancode(ie.code)) {
+                priv->shift = (ie.value != 0);
+            } else {
+                enum nsfb_key_code_e kc =
+                    b1nix_scancode_to_nsfb(ie.code, priv->shift);
+                if (kc != NSFB_KEY_UNKNOWN) {
+                    event->type = ie.value ? NSFB_EVENT_KEY_DOWN
+                                           : NSFB_EVENT_KEY_UP;
+                    event->value.keycode = kc;
+                    return true;
+                }
             }
         }
     }

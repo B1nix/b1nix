@@ -21,7 +21,10 @@
 #define SHM_EXEC    0x8000  /* Allow execution */
 
 /* Limits */
-#define SHMMAX      0x100000  /* Max segment size (1 MB) */
+#define SHMMAX      0x2000000 /* Max segment size (32 MB) — large enough for
+                               * full-screen graphics/framebuffer buffers
+                               * (1280x800x4 = 4 MB) and several windows. Backing
+                               * is allocated on demand, not pre-reserved. */
 #define SHMMIN      1         /* Min segment size */
 #define SHMMNI      32        /* Max number of shared memory segments system-wide */
 #define SHMSEG      8         /* Max segments per process */

@@ -20,6 +20,7 @@
 #include "nsfb.h"
 #include "surface.h"
 #include "plot.h"
+#include "libnsfb-b1keymap.h"
 
 #define UNUSED(x) ((x) = (x))
 
@@ -111,15 +112,25 @@ static bool displayd_input(nsfb_t *nsfb, nsfb_event_t *event, int timeout)
                                          : NSFB_EVENT_KEY_UP;
         event->value.keycode = NSFB_KEY_MOUSE_1;
         return true;
-    case B1GUI_EV_KEY:
+    case B1GUI_EV_KEY: {
+        /* args[0] = evdev scancode, args[1] = pressed. Track shift and map to a
+         * libnsfb keysym (shared with the /dev/fb0 surface). */
+        static int displayd_shift; /* one window per process */
         if (gev.nargs < 2)
             return false;
-        /* args[0] is the scancode; pass it through as a keycode so the event
-         * reaches NetSurf (a full scancode->keysym map is future work). */
+        if (b1nix_is_shift_scancode(gev.args[0])) {
+            displayd_shift = (gev.args[1] != 0);
+            return false;
+        }
+        enum nsfb_key_code_e kc =
+            b1nix_scancode_to_nsfb(gev.args[0], displayd_shift);
+        if (kc == NSFB_KEY_UNKNOWN)
+            return false;
         event->type = (gev.args[1] != 0) ? NSFB_EVENT_KEY_DOWN
                                          : NSFB_EVENT_KEY_UP;
-        event->value.keycode = (enum nsfb_key_code_e)gev.args[0];
+        event->value.keycode = kc;
         return true;
+    }
     case B1GUI_EV_CLOSE:
         event->type = NSFB_EVENT_CONTROL;
         event->value.controlcode = NSFB_CONTROL_QUIT;

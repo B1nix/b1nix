@@ -36,6 +36,7 @@ fi
 
 # Drop in the b1nix surfaces: /dev/fb0 (on-screen) and displayd (windowed client
 # of the b1nix Wayland-shaped compositor, with input).
+cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-b1keymap.h" "$SRC_DIR/src/surface/libnsfb-b1keymap.h"
 cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-b1nixfb.c" "$SRC_DIR/src/surface/b1nixfb.c"
 cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-displayd.c" "$SRC_DIR/src/surface/displayd.c"
 
