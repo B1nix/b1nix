@@ -177,13 +177,30 @@ int pci_find_class(u8 class_code, u8 subclass, u8 index, struct pci_device_info 
 	return 0;
 }
 
+/* Report the amount of graphics memory a display adapter has.
+ *
+ * virtio-gpu / virtio-vga have NO dedicated VRAM: the host allocates framebuffer
+ * and resource backing from guest RAM on demand (QEMU exposes no vram/vgamem
+ * knob for them — only the optional `hostmem` blob region). For these we report
+ * the kernel's graphics shared-memory budget instead of a fictional aperture —
+ * the maximum size of a single graphics/framebuffer shared segment (SHMMAX, see
+ * kernel/include/b1nix/shm.h; currently 32 MB, room for a 1280x800x4 = 4 MB
+ * screen plus several windows).
+ *
+ * The other adapters expose a real linear-framebuffer aperture whose size is the
+ * VRAM; QEMU's standard VGA defaults to 16 MB (configurable via vgamem_mb). */
+#define GFX_SHMEM_BUDGET_MB 32  /* keep in sync with SHMMAX in b1nix/shm.h */
+
 u32 pci_get_vram_size(u16 vendor_id, u16 device_id)
 {
-	if (vendor_id == 0x1234 && device_id == 0x1111) {
-		return 16 * 1024 * 1024; // QEMU Standard VGA (16 MB)
+	if (vendor_id == 0x1af4 &&
+	    (device_id == 0x1050 ||   // virtio-gpu / virtio-vga (modern)
+	     device_id == 0x1051 ||   // virtio-gpu-gl variants
+	     device_id == 0x1052)) {
+		return GFX_SHMEM_BUDGET_MB * 1024 * 1024;
 	}
-	if (vendor_id == 0x1af4 && device_id == 0x1050) {
-		return 16 * 1024 * 1024; // VirtIO GPU (16 MB)
+	if (vendor_id == 0x1234 && device_id == 0x1111) {
+		return 16 * 1024 * 1024; // QEMU Standard VGA (vgamem default 16 MB)
 	}
 	if (vendor_id == 0x15ad && device_id == 0x0405) {
 		return 16 * 1024 * 1024; // VMware SVGA II (16 MB)
