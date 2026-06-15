@@ -235,6 +235,14 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER) $(wildcard 
 	  $(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m32_nettool.o --whole-archive $(LIB) --no-whole-archive; \
 	fi
 
+# m53_httpsd: loopback HTTPS server (mbedTLS) for the M53 NetSurf web-access smoke.
+$(BUILD)/bin/m53_httpsd: bin/m53_httpsd.c $(LIB) $(CRT0) $(LINKER) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m53_httpsd.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_httpsd.o \
+	  $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
 
 # M51: m51_smoke links the ported static libm (openlibm).
 LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install

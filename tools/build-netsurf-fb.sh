@@ -181,6 +181,32 @@ clang --target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector \
   -O2 -Db1nix -c "$COMPAT_C" -o "$SYSROOT/lib/nscompat.o"
 "${AR:-llvm-ar}" rcs "$SYSROOT/lib/libb1nixcompat.a" "$SYSROOT/lib/nscompat.o"
 
+# ── Stage libcurl + mbedTLS so NetSurf's HTTP(S) fetcher can be enabled. The
+#    b1nix curl port is built static against mbedTLS; we expose libcurl.a, the
+#    curl headers and the mbedTLS archives through a libcurl.pc. ──
+CURL_SRC="$(ls -d "$ROOT_DIR"/build/curl-src/$B1NIX_TRIPLET/curl-*/ 2>/dev/null | head -1)"
+CURL_A="$ROOT_DIR/build/curl-b1nix/$B1NIX_TRIPLET/lib/.libs/libcurl.a"
+MBED_DIR="$ROOT_DIR/build/mbedtls-b1nix/$B1NIX_TRIPLET/install"
+HAVE_CURL=no
+if [ -f "$CURL_A" ] && [ -n "$CURL_SRC" ] && [ -d "$MBED_DIR/lib" ]; then
+  cp -R "$CURL_SRC/include/curl" "$SYSROOT/include/"
+  cp "$CURL_A" "$SYSROOT/lib/libcurl.a"
+  cp "$MBED_DIR"/lib/libmbed*.a "$SYSROOT/lib/"
+  cat >"$PKGDIR/libcurl.pc" <<EOF
+prefix=$SYSROOT
+exec_prefix=\${prefix}
+libdir=\${prefix}/lib
+includedir=\${prefix}/include
+
+Name: libcurl
+Description: libcurl for b1nix (mbedTLS)
+Version: 8.20.0
+Libs: -L\${libdir} -lcurl -lz -lmbedtls -lmbedx509 -lmbedcrypto
+Cflags: -I\${includedir} -DCURL_STATICLIB
+EOF
+  HAVE_CURL=yes
+fi
+
 emit_pc zlib            "-lz"             ""
 # -lm is added ONCE, last, via libnsfb.pc (the framebuffer frontend always links
 # libnsfb after the image libs), so libpng's floor/pow/modf still resolve and the
@@ -278,24 +304,22 @@ if ! grep -q 'b1nix-test-render' "$SRC_DIR/frontends/framebuffer/gui.c"; then
 /* b1nix-test-render: headless render+verify for the M53 smoke. */
 #include <stdlib.h>
 #include <stdint.h>
+#include <string.h>
 #include <time.h>
 #include <sys/stat.h>
 #include <sys/time.h>
-/* Pump the NetSurf scheduler, then busy-wait `ms` of real wall-clock so the
- * timed fetch/reflow callbacks (scheduled on gettimeofday by the fb scheduler)
- * actually become due. nanosleep() is a no-op on b1nix, so spin on gettimeofday
- * instead — under KVM this is cheap and is the only thing the process does. */
+/* Pump the NetSurf scheduler once, then sleep `ms` of real time so the timed
+ * fetch/reflow callbacks (scheduled on gettimeofday by the fb scheduler) become
+ * due. nanosleep maps to the kernel tick sleep (SYS_SLEEP), which genuinely
+ * blocks ~10ms — so a fixed sleep each tick advances wall-clock without spinning
+ * on gettimeofday (hammering it crashed i686 intermittently). */
 static void fb_test_pump(int ms)
 {
-	struct timeval start, now;
-	long elapsed;
+	struct timespec ts;
 	schedule_run();
-	gettimeofday(&start, NULL);
-	do {
-		gettimeofday(&now, NULL);
-		elapsed = (now.tv_sec - start.tv_sec) * 1000 +
-			  (now.tv_usec - start.tv_usec) / 1000;
-	} while (elapsed < ms);
+	ts.tv_sec = ms / 1000;
+	ts.tv_nsec = (long)(ms % 1000) * 1000000L;
+	nanosleep(&ts, NULL);
 }
 static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 {
@@ -308,41 +332,58 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 		.background_images = true,
 		.plot = &fb_plotters
 	};
+	/* Marker prefix so the smoke can tell the paths apart. The on-screen
+	 * surface (-f b1nix, drawing to /dev/fb0) is M53-FB regardless of URL;
+	 * otherwise by scheme: https -> M53-HTTPS, http -> M53-WEB, file -> M53-NS. */
+	const char *mk = "M53-NS";
+	if (fename != NULL && strcmp(fename, "b1nix") == 0)
+		mk = "M53-FB";
+	else if (feurl != NULL && strncmp(feurl, "https", 5) == 0)
+		mk = "M53-HTTPS";
+	else if (feurl != NULL && strncmp(feurl, "http", 4) == 0)
+		mk = "M53-WEB";
 
 	nsfb_get_geometry(nsfb, &w, &h, NULL);
 	box.x0 = 0; box.y0 = 0; box.x1 = w; box.y1 = h;
 	clip.x0 = 0; clip.y0 = 0; clip.x1 = w; clip.y1 = h;
 
 	/* Drive the scheduler (advancing time) until the page is ready to render.
-	 * Bounded (~30s worth of 10ms ticks) so a stuck load can't hang forever. */
-	for (i = 0; i < 3000; i++) {
+	 * Bounded (~15s of 10ms ticks) so a stuck load can't hang forever. */
+	for (i = 0; i < 1500; i++) {
 		fb_test_pump(10);
 		if (browser_window_redraw_ready(bw))
 			break;
 	}
 	/* A few more ticks for any trailing fetch (e.g. the image) + reflow. */
-	for (i = 0; i < 100; i++)
+	for (i = 0; i < 50; i++)
 		fb_test_pump(10);
-	fprintf(stdout, "M53-NS: ok load\n");
 
-	/* Diagnostics: is the page file reachable, did content attach, and what
-	 * are the laid-out extents? */
-	{
-		FILE *tf = fopen("/netsurf/test.html", "rb");
-		fprintf(stdout, "M53-NS: file-readable=%d\n", tf != NULL);
-		if (tf) fclose(tf);
-		{
-			struct stat sb;
-			int sr = stat("/netsurf/test.html", &sb);
-			fprintf(stdout, "M53-NS: stat rc=%d mode=0%o isreg=%d size=%ld\n",
-				sr, (unsigned)sb.st_mode, S_ISREG(sb.st_mode),
-				(long)sb.st_size);
+	/* If no content attached — e.g. a network fetch raced the loopback server
+	 * coming up — re-navigate and pump again. Robust against startup timing. */
+	for (int attempt = 0; attempt < 3 && !browser_window_has_content(bw);
+	     attempt++) {
+		nsurl *rurl = NULL;
+		if (feurl != NULL && nsurl_create(feurl, &rurl) == NSERROR_OK) {
+			browser_window_navigate(bw, rurl, NULL, BW_NAVIGATE_HISTORY,
+						NULL, NULL, NULL);
+			nsurl_unref(rurl);
 		}
-		fprintf(stdout, "M53-NS: has-content=%d\n",
-			browser_window_has_content(bw));
+		for (i = 0; i < 600; i++) {
+			fb_test_pump(10);
+			if (browser_window_redraw_ready(bw) &&
+			    browser_window_has_content(bw))
+				break;
+		}
+	}
+	fprintf(stdout, "%s: ok load\n", mk);
+
+	/* Did content attach over the fetch, and what are the laid-out extents? */
+	fprintf(stdout, "%s: has-content=%d\n", mk,
+		browser_window_has_content(bw));
+	{
 		int ex = 0, ey = 0;
 		browser_window_get_extents(bw, true, &ex, &ey);
-		fprintf(stdout, "M53-NS: extents=%dx%d\n", ex, ey);
+		fprintf(stdout, "%s: extents=%dx%d\n", mk, ex, ey);
 	}
 
 	/* The interactive frontend lays the page out via a reformat triggered on
@@ -353,7 +394,7 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 
 	nsfb_claim(nsfb, &box);
 	if (browser_window_redraw(bw, 0, 0, &clip, &ctx) == true)
-		fprintf(stdout, "M53-NS: ok redraw\n");
+		fprintf(stdout, "%s: ok redraw\n", mk);
 	nsfb_update(nsfb, &box);
 
 	nsfb_get_buffer(nsfb, &fbuf, &stride);
@@ -369,18 +410,18 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 			if (rowhas)
 				rows_with_content++;
 		}
-		fprintf(stdout, "M53-NS: pixels nonbg=%lu rows=%lu of %dx%d\n",
-			nonbg, rows_with_content, w, h);
+		fprintf(stdout, "%s: pixels nonbg=%lu rows=%lu of %dx%d\n",
+			mk, nonbg, rows_with_content, w, h);
 		/* A laid-out page paints many non-background pixels across many
 		 * rows (text lines + the image). Blank would be nonbg==0. */
 		if (nonbg > 200 && rows_with_content > 8)
-			fprintf(stdout, "M53-NS: ok render\n");
+			fprintf(stdout, "%s: ok render\n", mk);
 		else
-			fprintf(stdout, "M53-NS: fail render-blank\n");
+			fprintf(stdout, "%s: fail render-blank\n", mk);
 	} else {
-		fprintf(stdout, "M53-NS: fail no-surface\n");
+		fprintf(stdout, "%s: fail no-surface\n", mk);
 	}
-	fprintf(stdout, "M53-NS: done\n");
+	fprintf(stdout, "%s: done\n", mk);
 	fflush(stdout);
 }
 EOF
@@ -418,7 +459,7 @@ make -C "$SRC_DIR" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \
   NETSURF_FB_FONTLIB=internal \
-  NETSURF_USE_CURL=NO \
+  NETSURF_USE_CURL="$([ "$HAVE_CURL" = yes ] && echo YES || echo NO)" \
   NETSURF_USE_OPENSSL=NO \
   NETSURF_USE_UTF8PROC=NO \
   NETSURF_USE_LIBICONV_PLUG=YES \

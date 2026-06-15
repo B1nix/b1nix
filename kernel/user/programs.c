@@ -1554,6 +1554,99 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M53: NetSurf ON-SCREEN frontend — render the page straight to the real
+   * hardware framebuffer (/dev/fb0) via the b1nix libnsfb surface, not an
+   * off-screen RAM buffer. Verifies the painted /dev/fb0 pixels (M53-FB). */
+  {
+    const char *fb_argv[6];
+    int fb_argc = 0;
+    fb_argv[fb_argc++] = "/bin/nsfb";
+    fb_argv[fb_argc++] = "-f";
+    fb_argv[fb_argc++] = "b1nix";
+    fb_argv[fb_argc++] = "-T";
+    fb_argv[fb_argc++] = "file:///netsurf/test.html";
+    fb_argv[fb_argc] = 0;
+    u64 fb_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)fb_argv[0], fb_argc,
+                                  (u64)(usize)fb_argv, 0, 0, 0);
+    if ((isize)fb_pid < 0) {
+      uwrite("M53-FB: spawn-fail\n");
+    } else {
+      int fb_status = 0;
+      syscall_dispatch(SYS_WAIT, fb_pid, (u64)(usize)&fb_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: NetSurf WEB access — serve a page over HTTP on loopback (m53-httpd)
+   * and have NetSurf fetch it over a real TCP connection via libcurl, proving
+   * genuine web access (sockets/TCP/HTTP), not just the local file:// path. */
+  {
+    u64 httpd_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-httpd", 0, 0, 0, 0, 0);
+    if ((isize)httpd_pid < 0) {
+      uwrite("M53-WEB: httpd-spawn-fail\n");
+    } else {
+      /* The server binds+listens well before NetSurf finishes init and
+       * connects; the browser's own load loop tolerates the brief startup. */
+      const char *web_argv[10];
+      int web_argc = 0;
+      web_argv[web_argc++] = "/bin/nsfb";
+      web_argv[web_argc++] = "-f";
+      web_argv[web_argc++] = "ram";
+      web_argv[web_argc++] = "-w";
+      web_argv[web_argc++] = "800";
+      web_argv[web_argc++] = "-h";
+      web_argv[web_argc++] = "600";
+      web_argv[web_argc++] = "-T";
+      web_argv[web_argc++] = "http://127.0.0.1:8080/";
+      web_argv[web_argc] = 0;
+      u64 web_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)web_argv[0],
+                                     web_argc, (u64)(usize)web_argv, 0, 0, 0);
+      if ((isize)web_pid < 0) {
+        uwrite("M53-WEB: spawn-fail\n");
+      } else {
+        int web_status = 0;
+        syscall_dispatch(SYS_WAIT, web_pid, (u64)(usize)&web_status, 0, 0, 0, 0);
+      }
+      syscall_dispatch(SYS_KILL, httpd_pid, SIGTERM, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: NetSurf HTTPS — serve the page over a real TLS 1.2 connection
+   * (m53-httpsd, mbedTLS) and have NetSurf fetch https://127.0.0.1:8443/ with
+   * the server certificate verified against the test CA. Proves encrypted web
+   * access end to end (TLS handshake + HTTP-over-TLS via libcurl/mbedTLS). */
+  {
+    u64 httpsd_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-httpsd", 0, 0, 0, 0, 0);
+    if ((isize)httpsd_pid < 0) {
+      uwrite("M53-HTTPS: httpsd-spawn-fail\n");
+    } else {
+      const char *tls_argv[12];
+      int tls_argc = 0;
+      tls_argv[tls_argc++] = "/bin/nsfb";
+      /* nsoption args (--name=value) must precede the getopt flags. */
+      tls_argv[tls_argc++] = "--ca_bundle=/etc/tls-test/ca.pem";
+      tls_argv[tls_argc++] = "-f";
+      tls_argv[tls_argc++] = "ram";
+      tls_argv[tls_argc++] = "-w";
+      tls_argv[tls_argc++] = "800";
+      tls_argv[tls_argc++] = "-h";
+      tls_argv[tls_argc++] = "600";
+      tls_argv[tls_argc++] = "-T";
+      tls_argv[tls_argc++] = "https://127.0.0.1:8443/";
+      tls_argv[tls_argc] = 0;
+      u64 tls_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)tls_argv[0],
+                                     tls_argc, (u64)(usize)tls_argv, 0, 0, 0);
+      if ((isize)tls_pid < 0) {
+        uwrite("M53-HTTPS: spawn-fail\n");
+      } else {
+        int tls_status = 0;
+        syscall_dispatch(SYS_WAIT, tls_pid, (u64)(usize)&tls_status, 0, 0, 0, 0);
+      }
+      syscall_dispatch(SYS_KILL, httpsd_pid, SIGTERM, 0, 0, 0, 0);
+    }
+  }
+
   /* M34: procfs / sysfs synthetic filesystems. */
   {
     u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,

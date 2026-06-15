@@ -36,6 +36,8 @@
 #include "initramfs_m53_libcss_smoke.inc"
 #include "initramfs_m53_libdom_smoke.inc"
 #include "initramfs_m53_nslibs_smoke.inc"
+#include "initramfs_m53_httpd.inc"
+#include "initramfs_m53_httpsd.inc"
 #include "initramfs_m53_virgl_smoke.inc"
 #include "initramfs_curl.inc"
 #include "initramfs_wget.inc"
@@ -1009,6 +1011,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m53_libdom_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m53-nslibs-smoke", (const char *)vfs_m53_nslibs_smoke_elf,
      sizeof(vfs_m53_nslibs_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-httpd", (const char *)vfs_m53_httpd_elf,
+     sizeof(vfs_m53_httpd_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-httpsd", (const char *)vfs_m53_httpsd_elf,
+     sizeof(vfs_m53_httpsd_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m53-virgl-smoke", (const char *)vfs_m53_virgl_smoke_elf,
      sizeof(vfs_m53_virgl_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/curl", (const char *)vfs_curl_elf, sizeof(vfs_curl_elf),

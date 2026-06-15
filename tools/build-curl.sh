@@ -46,6 +46,17 @@ if [ "$B1NIX_TLS" = "mbedtls" ]; then
   TLS_LIBS="-lmbedx509 -lmbedcrypto"
 fi
 
+# zlib: enable curl's Content-Encoding (gzip) support against the ported zlib so
+# clients like NetSurf can request compressed transfers (no half-measures).
+ZLIB_FLAG="--without-zlib"
+if ZLIB_OUT="$("$ROOT_DIR/tools/build-zlib.sh")"; then
+  ZLIB_PREFIX="$(printf '%s\n' "$ZLIB_OUT" | tail -n 1)"
+  ZLIB_FLAG="--with-zlib=$ZLIB_PREFIX"
+  TLS_CPPFLAGS="$TLS_CPPFLAGS -I$ZLIB_PREFIX/include"
+  TLS_LDFLAGS="$TLS_LDFLAGS -L$ZLIB_PREFIX/lib"
+  TLS_LIBS="$TLS_LIBS -lz"
+fi
+
 mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -92,7 +103,7 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
-    "$SSL_FLAGS" --without-zlib --without-brotli --without-zstd \
+    "$SSL_FLAGS" "$ZLIB_FLAG" --without-brotli --without-zstd \
     --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \
     --without-ngtcp2 \
     --disable-ldap --disable-ldaps --disable-ftp --disable-file \
@@ -100,8 +111,8 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --disable-rtsp --disable-smb --disable-smtp --disable-telnet \
     --disable-tftp --disable-dict --disable-manual --disable-docs \
     --disable-threaded-resolver --enable-ipv6 --disable-unix-sockets \
-    --disable-cookies --disable-alt-svc --disable-hsts \
-    --disable-websockets --disable-headers-api --disable-mime \
+    --enable-cookies --disable-alt-svc --disable-hsts \
+    --disable-websockets --disable-headers-api \
     --disable-dateparse \
     --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \

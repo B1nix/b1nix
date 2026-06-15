@@ -766,11 +766,32 @@ no-fake-pass smoke test.
   (`tools/gen_netsurf_initramfs.sh`), and a headless `-T` render self-test loads
   a local `file://` HTML page (styled text + a PNG image), lays it out
   (extents 782x552) and paints it into a framebuffer (117849 non-background
-  pixels verified). `M53-NS: ok load/redraw/render`. Both arches green
-  (x86_64 705/0, x86 704/0). Runtime notes: the file:// fetcher uses the
-  `fread()` path (`HAVE_MMAP` off — b1nix can't mmap an initramfs object) and the
-  render self-test busy-waits `gettimeofday` because b1nix `nanosleep` is a no-op.
-  Remaining browser work (interactive HTTPS pages over the network, Wayland
-  frontend, input) is future.
+  pixels verified). `M53-NS: ok load/redraw/render`. Runtime note: the file://
+  fetcher uses the `fread()` path (`HAVE_MMAP` off — b1nix can't mmap an
+  initramfs object).
+- [x] `done` **Web access** — NetSurf fetches pages over a real TCP/HTTP
+  connection through libcurl, not just `file://`. libcurl is enabled with
+  genuine cookie, zlib (gzip) and MIME support (no stubbed/skipped options) and
+  staged into the build via a `libcurl.pc`; `NETSURF_USE_CURL=YES`. A minimal
+  in-VM loopback HTTP server (`m53_httpd`) serves a styled page, NetSurf fetches
+  `http://127.0.0.1:8080/` over the network stack and renders it
+  (`M53-HTTPD: ready`, `M53-WEB: has-content=1 / ok render`). The render
+  self-test advances time with `nanosleep` (kernel tick sleep) rather than
+  spinning on `gettimeofday`.
+- [x] `done` **HTTPS** — NetSurf fetches over a real TLS 1.2 connection with
+  certificate verification. A loopback HTTPS server (`m53_httpsd`, mbedTLS, using
+  the M32 test PKI with SAN IP:127.0.0.1) serves a styled page; NetSurf fetches
+  `https://127.0.0.1:8443/` with `--ca_bundle` pointed at the test CA, so
+  libcurl (mbedTLS) verifies the server certificate. `M53-HTTPS: has-content=1 /
+  ok render`. libcurl is built with genuine cookie + zlib + MIME support.
+- [x] `done` **On-screen frontend** — NetSurf draws straight to the real
+  hardware framebuffer, not just an off-screen buffer. A b1nix `/dev/fb0` libnsfb
+  surface (`-f b1nix`) opens the M47 fb device, mmaps it and flushes damage via
+  `B1NIX_FBIOFLUSH`; NetSurf lays out and paints a page at the real screen
+  resolution (1280x800) and presents it on the virtio-gpu display.
+  `M53-FB: ok render`. All four paths green both arches (x86_64 717/0, x86
+  716/0): file:// (off-screen + on-screen), HTTP and HTTPS.
+  Remaining browser work (HTTPS over the public internet, a Wayland frontend,
+  interactive keyboard/mouse input) is future.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
   browser or another real application requires it.

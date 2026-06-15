@@ -34,6 +34,9 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
 fi
 
+# Drop in the b1nix /dev/fb0 surface so NetSurf can draw to the real screen.
+cp "$ROOT_DIR/tools/netsurf-assets/libnsfb-b1nixfb.c" "$SRC_DIR/src/surface/b1nixfb.c"
+
 if [ "$B1NIX_ARCH" = "x86" ]; then
   TARGET="i686-unknown-elf"
 else
@@ -52,7 +55,7 @@ SOURCES="
   src/plot/api.c src/plot/generic.c src/plot/util.c
   src/plot/8bpp.c src/plot/16bpp.c
   src/plot/32bpp-xbgr8888.c src/plot/32bpp-xrgb8888.c
-  src/surface/surface.c src/surface/ram.c
+  src/surface/surface.c src/surface/ram.c src/surface/b1nixfb.c
 "
 
 OBJS=""

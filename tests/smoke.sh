@@ -1148,6 +1148,21 @@ check_output "$LOG" "M53-NS: ok load" "NetSurf loads the local file:// HTML page
 check_output "$LOG" "M53-NS: ok redraw" "NetSurf redraws the laid-out page into the framebuffer surface"
 check_output "$LOG" "M53-NS: ok render" "rendered framebuffer is non-blank and structured (real page paint)"
 check_output "$LOG" "M53-NS: done" "NetSurf framebuffer render self-test completes"
+# ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
+check_output "$LOG" "M53-FB: ok redraw" "NetSurf draws the page directly into the hardware framebuffer (/dev/fb0)"
+check_output "$LOG" "M53-FB: ok render" "the on-screen /dev/fb0 framebuffer is non-blank and structured"
+check_output "$LOG" "M53-FB: done" "NetSurf on-screen render completes"
+# ── M53 NetSurf WEB access: fetch + render a page over HTTP (loopback) ──
+check_output "$LOG" "M53-HTTPD: ready" "in-VM HTTP server is listening on loopback"
+check_output "$LOG" "M53-WEB: has-content=1" "NetSurf fetched the page over HTTP (content attached)"
+check_output "$LOG" "M53-WEB: ok redraw" "NetSurf redraws the network-fetched page"
+check_output "$LOG" "M53-WEB: ok render" "network-fetched page paints a non-blank, structured framebuffer"
+check_output "$LOG" "M53-WEB: done" "NetSurf HTTP render self-test completes"
+# ── M53 NetSurf HTTPS: fetch + render a page over TLS (loopback, cert verified) ──
+check_output "$LOG" "M53-HTTPSD: ready" "in-VM HTTPS (TLS 1.2) server is listening on loopback"
+check_output "$LOG" "M53-HTTPS: has-content=1" "NetSurf fetched the page over HTTPS (TLS handshake + cert verified)"
+check_output "$LOG" "M53-HTTPS: ok render" "TLS-fetched page paints a non-blank, structured framebuffer"
+check_output "$LOG" "M53-HTTPS: done" "NetSurf HTTPS render self-test completes"
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

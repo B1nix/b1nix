@@ -62,6 +62,8 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_libcss_smoke \
 	m53_libdom_smoke \
 	m53_nslibs_smoke \
+	m53_httpd \
+	m53_httpsd \
 	m53_virgl_smoke \
 	m34_smoke \
 	m35_smoke \
@@ -770,6 +772,12 @@ $(INITRAMFS_TESTWAV_INC): tools/gen_test_wav.py
 $(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
+
+# M53: the loopback HTTPS server links mbedTLS; depend on NSFB_ELF so curl ->
+# mbedTLS is built (its archives present) before this binary is embedded.
+$(BUILD_DIR)/initramfs_m53_httpsd.inc: userspace/bin/m53_httpsd.c $(USERSPACE_DEPS) $(NSFB_ELF)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_httpsd
+	xxd -i -n vfs_m53_httpsd_elf userspace/build/$(ARCH)/bin/m53_httpsd > $@
 
 # M53: build the NetSurf framebuffer browser (the real nsfb binary) and package
 # it + its runtime resources + a test page into the initramfs.
