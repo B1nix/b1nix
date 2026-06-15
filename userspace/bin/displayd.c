@@ -213,6 +213,16 @@ static int drag_slot = -1;
 static int left_alt;
 static uint32_t input_serial;
 
+/* Accumulated pointer motion, applied once per input drain (coalesced) rather
+ * than per kernel report. Under a fast window drag the per-report path does
+ * several full-window composites (each a synchronous GPU flush); coalescing all
+ * batched motion into a single visual update keeps the compositor from falling
+ * behind and removes the drag/scroll lag. */
+static int ptr_acc_dx, ptr_acc_dy; /* pending relative delta */
+static int ptr_abs_x, ptr_abs_y;   /* pending absolute position */
+static int ptr_have_abs;           /* an absolute sample is pending */
+static int ptr_moved;              /* motion pending since last apply */
+
 /* ── wire helpers ── */
 
 static void send_msg(int client, uint32_t obj, uint16_t opcode,
@@ -1630,13 +1640,86 @@ static void focus_cycle(void) {
 	composite_surface_region(next);
 }
 
+/* Apply all pointer motion accumulated since the last call as a single visual
+ * update. Coalescing many kernel reports into one update is what keeps a fast
+ * window drag (or rapid cursor sweep) from flooding the GPU with synchronous
+ * full-window flushes — the cause of the drag/scroll lag. */
+static void apply_pointer_motion(void) {
+	if (!ptr_moved)
+		return;
+	int ox = px, oy = py;
+	/* Absolute pointer (virtio-tablet): the kernel scales 0..32767 to screen
+	 * pixels, so an absolute sample sets the cursor position directly rather
+	 * than accumulating a delta. Lets the mouse track grab-free in QEMU. */
+	if (ptr_have_abs) {
+		px = ptr_abs_x;
+		py = ptr_abs_y;
+		ptr_have_abs = 0;
+	} else {
+		px += ptr_acc_dx;
+		py += ptr_acc_dy;
+	}
+	ptr_acc_dx = ptr_acc_dy = 0;
+	ptr_moved = 0;
+	if (px < 0) px = 0;
+	if (py < 0) py = 0;
+	if (px >= (int)scr_w) px = (int)scr_w - 1;
+	if (py >= (int)scr_h) py = (int)scr_h - 1;
+	if (px == ox && py == oy)
+		return;
+
+	struct dsurface *drag = slot_surface(drag_slot);
+	if (drag) {
+		int ox_pos = drag->x;
+		int oy_pos = drag->y;
+		drag->x += px - ox;
+		drag->y += py - oy;
+		/* Keep the title bar reachable: never under the top panel, and
+		 * always leave a sliver on every edge so a window can't be lost
+		 * off-screen. */
+		int dw = drag->buf ? (int)drag->buf->w : 0;
+		int dh = drag->buf ? (int)drag->buf->h : 0;
+		int min_y = PANEL_H + TITLE_H;
+		if (drag->y < min_y) drag->y = min_y;
+		if (drag->y > (int)scr_h - 24) drag->y = (int)scr_h - 24;
+		if (drag->x < -(dw - 48)) drag->x = -(dw - 48);
+		if (drag->x > (int)scr_w - 48) drag->x = (int)scr_w - 48;
+
+		int top = 1;
+		for (int i = 0; i < MAX_TOPLEVELS; i++)
+			if (toplevels[i].used && toplevels[i].surface == drag)
+				top = TITLE_H;
+
+		/* A single composite over the union of the old and new window
+		 * boxes (and both cursor spots, in case an edge clamp slid the
+		 * pointer off the window) repaints the whole drag step in ONE GPU
+		 * flush instead of four. composite_rect redraws the background,
+		 * every surface and the crosshair, so this both erases the old
+		 * position and draws the new one. */
+		int x0 = ox_pos, y0 = oy_pos - top;
+		int x1 = ox_pos + dw, y1 = oy_pos + dh;
+		if (drag->x < x0) x0 = drag->x;
+		if (drag->y - top < y0) y0 = drag->y - top;
+		if (drag->x + dw > x1) x1 = drag->x + dw;
+		if (drag->y + dh > y1) y1 = drag->y + dh;
+		if (ox < x0) x0 = ox;
+		if (oy < y0) y0 = oy;
+		if (px < x0) x0 = px;
+		if (py < y0) y0 = py;
+		if (ox + CURSOR_SIZE > x1) x1 = ox + CURSOR_SIZE;
+		if (oy + CURSOR_SIZE > y1) y1 = oy + CURSOR_SIZE;
+		if (px + CURSOR_SIZE > x1) x1 = px + CURSOR_SIZE;
+		if (py + CURSOR_SIZE > y1) y1 = py + CURSOR_SIZE;
+		composite_rect(x0 - 1, y0, (x1 - x0) + 2, (y1 - y0) + 1);
+	} else {
+		composite_rect(ox, oy, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
+		composite_rect(px, py, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
+	}
+	pointer_moved();
+}
+
 static void input_drain(int which) {
 	struct b1nix_input_event evs[16];
-	static int acc_dx, acc_dy, moved;
-	/* Absolute pointer (virtio-tablet): the kernel scales 0..32767 to screen
-	 * pixels, so an EV_ABS sets the cursor position directly rather than
-	 * accumulating a delta. Lets the mouse track grab-free in QEMU. */
-	static int abs_x, abs_y, have_abs;
 	for (;;) {
 		ssize_t n = read(ev_fds[which], evs, sizeof(evs));
 		if (n <= 0)
@@ -1678,76 +1761,30 @@ static void input_drain(int which) {
 			/* mouse */
 			switch (e->type) {
 			case B1NIX_EV_REL:
-				if (e->code == B1NIX_REL_X) acc_dx += e->value;
-				if (e->code == B1NIX_REL_Y) acc_dy += e->value;
-				moved = 1;
+				if (e->code == B1NIX_REL_X) ptr_acc_dx += e->value;
+				if (e->code == B1NIX_REL_Y) ptr_acc_dy += e->value;
+				ptr_moved = 1;
 				break;
 			case B1NIX_EV_ABS:
-				if (e->code == B1NIX_ABS_X) abs_x = e->value;
-				if (e->code == B1NIX_ABS_Y) abs_y = e->value;
-				have_abs = 1;
-				moved = 1;
+				if (e->code == B1NIX_ABS_X) ptr_abs_x = e->value;
+				if (e->code == B1NIX_ABS_Y) ptr_abs_y = e->value;
+				ptr_have_abs = 1;
+				ptr_moved = 1;
 				break;
 			case B1NIX_EV_KEY:
+				/* Flush pending motion first so the click lands at
+				 * the current pointer position, then act on it. */
+				apply_pointer_motion();
 				pointer_button(e->code, e->value);
 				break;
 			case B1NIX_EV_SYN:
-				if (moved) {
-					int ox = px, oy = py;
-					if (have_abs) {
-						px = abs_x;
-						py = abs_y;
-						have_abs = 0;
-					} else {
-						px += acc_dx;
-						py += acc_dy;
-					}
-					acc_dx = acc_dy = 0;
-					moved = 0;
-					if (px < 0) px = 0;
-					if (py < 0) py = 0;
-					if (px >= (int)scr_w) px = (int)scr_w - 1;
-					if (py >= (int)scr_h) py = (int)scr_h - 1;
-					if (px != ox || py != oy) {
-						struct dsurface *drag = slot_surface(drag_slot);
-						if (drag) {
-							int ox_pos = drag->x;
-							int oy_pos = drag->y;
-							drag->x += px - ox;
-							drag->y += py - oy;
-							/* Keep the title bar reachable: never under the top
-							 * panel, and always leave a sliver on every edge so
-							 * a window can't be lost off-screen. */
-							int dw = drag->buf ? (int)drag->buf->w : 0;
-							int dh = drag->buf ? (int)drag->buf->h : 0;
-							int min_y = PANEL_H + TITLE_H;
-							if (drag->y < min_y) drag->y = min_y;
-							if (drag->y > (int)scr_h - 24)
-								drag->y = (int)scr_h - 24;
-							if (drag->x < -(dw - 48))
-								drag->x = -(dw - 48);
-							if (drag->x > (int)scr_w - 48)
-								drag->x = (int)scr_w - 48;
-							(void)dh;
-
-							int top = 1;
-							for (int i = 0; i < MAX_TOPLEVELS; i++)
-								if (toplevels[i].used && toplevels[i].surface == drag)
-									top = TITLE_H;
-							composite_rect(ox_pos - 1, oy_pos - top, dw + 2, dh + top + 1);
-							composite_surface_region(drag);
-						}
-						composite_rect(ox, oy, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
-						composite_rect(px, py, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
-						pointer_moved();
-					}
-				}
-				break;
 			default:
 				break;
 			}
 		}
 	}
+	/* Coalesced visual update: apply everything read this wakeup at once. */
+	apply_pointer_motion();
 }
 
 /* Refresh the top-bar clock from the RTC. Returns 1 when the displayed
