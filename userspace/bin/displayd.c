@@ -8,7 +8,7 @@
  *
  * Protocol: Wayland core + xdg-shell subset. Server-side policy stays small:
  * first surface is centered, later ones cascade; 1-px border around each
- * surface; focus follows click (click raises); software crosshair cursor.
+ * surface; focus follows click (click raises); software arrow cursor.
  *
  * Buffer release semantics (v1): the server reads a committed buffer on
  * every recomposite (cursor crossing, raise), so 0 is
@@ -37,7 +37,34 @@
 #define MAX_SURFACES 8
 #define MAX_BUFFERS 8
 #define MAX_TOPLEVELS 8
-#define CURSOR_SIZE 10
+/* Arrow pointer, drawn as white fill with a black outline so it stays visible
+ * on any background (the old all-white crosshair vanished on white windows and
+ * read as two white stripes while moving). Hotspot is the tip at (0,0). 'B' =
+ * black outline, 'W' = white fill, ' ' / end-of-row = transparent. CURSOR_W/H
+ * are the max extents used for damage/erase bookkeeping. */
+#define CURSOR_W 11
+#define CURSOR_H 19
+static const char *const cursor_bitmap[CURSOR_H] = {
+	"B",
+	"BB",
+	"BWB",
+	"BWWB",
+	"BWWWB",
+	"BWWWWB",
+	"BWWWWWB",
+	"BWWWWWWB",
+	"BWWWWWWWB",
+	"BWWWWWWWWB",
+	"BWWWWWBBBBB",
+	"BWWBWWB",
+	"BWB BWWB",
+	"BB  BWWB",
+	"B    BWWB",
+	"     BWWB",
+	"      BWWB",
+	"      BWWB",
+	"       BB",
+};
 #define TITLE_H 14
 #define BG_COLOR 0x00202830u
 #define BORDER_COLOR 0x00E0E0E0u
@@ -740,14 +767,22 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 	/* Menus belong to the desktop shell and always sit above client windows. */
 	draw_panel_overlay(rx, ry, rw, rh);
 
-	/* crosshair cursor on top */
-	for (int i = 0; i < CURSOR_SIZE; i++) {
-		int cx = px + i, cy = py;
-		if (cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh)
-			fb[(uint32_t)cy * scr_w + cx] = 0x00FFFFFFu;
-		cx = px; cy = py + i;
-		if (cx >= rx && cx < rx + rw && cy >= ry && cy < ry + rh)
-			fb[(uint32_t)cy * scr_w + cx] = 0x00FFFFFFu;
+	/* arrow cursor on top (white fill, black outline — visible on any bg) */
+	for (int cyi = 0; cyi < CURSOR_H; cyi++) {
+		int cy = py + cyi;
+		if (cy < ry || cy >= ry + rh)
+			continue;
+		const char *crow = cursor_bitmap[cyi];
+		for (int cxi = 0; crow[cxi]; cxi++) {
+			char c = crow[cxi];
+			if (c == ' ')
+				continue;
+			int cx = px + cxi;
+			if (cx < rx || cx >= rx + rw)
+				continue;
+			fb[(uint32_t)cy * scr_w + cx] =
+			    (c == 'B') ? 0x00000000u : 0x00FFFFFFu;
+		}
 	}
 
 	struct b1nix_fb_rect rect = {(uint32_t)rx, (uint32_t)ry, (uint32_t)rw,
@@ -1690,30 +1725,36 @@ static void apply_pointer_motion(void) {
 			if (toplevels[i].used && toplevels[i].surface == drag)
 				top = TITLE_H;
 
-		/* A single composite over the union of the old and new window
-		 * boxes (and both cursor spots, in case an edge clamp slid the
-		 * pointer off the window) repaints the whole drag step in ONE GPU
-		 * flush instead of four. composite_rect redraws the background,
-		 * every surface and the crosshair, so this both erases the old
-		 * position and draws the new one. */
-		int x0 = ox_pos, y0 = oy_pos - top;
-		int x1 = ox_pos + dw, y1 = oy_pos + dh;
-		if (drag->x < x0) x0 = drag->x;
-		if (drag->y - top < y0) y0 = drag->y - top;
-		if (drag->x + dw > x1) x1 = drag->x + dw;
-		if (drag->y + dh > y1) y1 = drag->y + dh;
-		if (ox < x0) x0 = ox;
-		if (oy < y0) y0 = oy;
-		if (px < x0) x0 = px;
-		if (py < y0) y0 = py;
-		if (ox + CURSOR_SIZE > x1) x1 = ox + CURSOR_SIZE;
-		if (oy + CURSOR_SIZE > y1) y1 = oy + CURSOR_SIZE;
-		if (px + CURSOR_SIZE > x1) x1 = px + CURSOR_SIZE;
-		if (py + CURSOR_SIZE > y1) y1 = py + CURSOR_SIZE;
-		composite_rect(x0 - 1, y0, (x1 - x0) + 2, (y1 - y0) + 1);
+		/* Erase the old window position and draw the new one as two
+		 * window-sized composites rather than one big union spanning the
+		 * whole sweep: on a fast drag the union becomes a near-fullscreen
+		 * region, and the host blits such a large transfer in visible
+		 * bands ("stripes"). Two bounded flushes touch far fewer pixels
+		 * and update cleanly. composite_rect repaints background + all
+		 * surfaces + cursor in each region. If old and new overlap (slow
+		 * drag) the overlap is painted twice — cheap, and still correct. */
+		int overlap = !(drag->x >= ox_pos + dw || drag->x + dw <= ox_pos ||
+		                drag->y >= oy_pos + dh || drag->y + dh <= oy_pos);
+		if (overlap) {
+			/* boxes touch — one composite over their (still small) union
+			 * avoids re-flushing the shared area. */
+			int x0 = ox_pos < drag->x ? ox_pos : drag->x;
+			int y0 = (oy_pos < drag->y ? oy_pos : drag->y) - top;
+			int x1 = ox_pos + dw > drag->x + dw ? ox_pos + dw : drag->x + dw;
+			int y1 = oy_pos + dh > drag->y + dh ? oy_pos + dh : drag->y + dh;
+			composite_rect(x0 - 1, y0, (x1 - x0) + 2, (y1 - y0) + top + 1);
+		} else {
+			composite_rect(ox_pos - 1, oy_pos - top, dw + 2, dh + top + 1);
+			composite_surface_region(drag);
+		}
+		/* The cursor rides on the title bar during a drag, so the window
+		 * composites above already repaint it; only patch the spots an
+		 * edge clamp may have slid it onto bare background. */
+		composite_rect(ox, oy, CURSOR_W + 1, CURSOR_H + 1);
+		composite_rect(px, py, CURSOR_W + 1, CURSOR_H + 1);
 	} else {
-		composite_rect(ox, oy, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
-		composite_rect(px, py, CURSOR_SIZE + 1, CURSOR_SIZE + 1);
+		composite_rect(ox, oy, CURSOR_W + 1, CURSOR_H + 1);
+		composite_rect(px, py, CURSOR_W + 1, CURSOR_H + 1);
 	}
 	pointer_moved();
 }

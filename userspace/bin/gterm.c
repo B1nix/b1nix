@@ -17,6 +17,13 @@
 static char cells[ROWS][COLS];
 static unsigned cursor_x;
 static unsigned cursor_y;
+static int term_master = -1; /* pty master fd, for terminal replies (DSR) */
+
+/* ANSI/VT100 escape-sequence parser state. */
+static int esc_state;   /* 0 = normal, 1 = saw ESC, 2 = collecting CSI */
+static int esc_private; /* CSI '?' private-mode marker (consumed, ignored) */
+static int esc_params[8];
+static int esc_nparams;
 
 static void clear_row(unsigned row) {
 	memset(cells[row], ' ', COLS);
@@ -28,26 +35,134 @@ static void scroll_up(void) {
 	cursor_y = ROWS - 1;
 }
 
-static void put_terminal_char(char c) {
-	if (c == '\r') {
-		cursor_x = 0;
+/* Execute a completed CSI sequence (ESC [ params final). Implements the cursor
+ * movement, erase and line-edit ops bash/readline and curses TUIs depend on, so
+ * arrow keys / Home / End / history move the cursor instead of corrupting the
+ * line. SGR colour ('m') and private modes are accepted and ignored. */
+static void csi_dispatch(char final) {
+	int p0 = esc_params[0];
+	int p1 = esc_params[1];
+	unsigned n;
+	switch (final) {
+	case 'A': n = p0 ? (unsigned)p0 : 1; cursor_y = cursor_y > n ? cursor_y - n : 0; break;
+	case 'B': n = p0 ? (unsigned)p0 : 1; cursor_y += n; if (cursor_y >= ROWS) cursor_y = ROWS - 1; break;
+	case 'C': n = p0 ? (unsigned)p0 : 1; cursor_x += n; if (cursor_x >= COLS) cursor_x = COLS - 1; break;
+	case 'D': n = p0 ? (unsigned)p0 : 1; cursor_x = cursor_x > n ? cursor_x - n : 0; break;
+	case 'G': /* CHA: cursor to 1-based column */
+		cursor_x = p0 ? (unsigned)(p0 - 1) : 0;
+		if (cursor_x >= COLS) cursor_x = COLS - 1;
+		break;
+	case 'd': /* VPA: cursor to 1-based row */
+		cursor_y = p0 ? (unsigned)(p0 - 1) : 0;
+		if (cursor_y >= ROWS) cursor_y = ROWS - 1;
+		break;
+	case 'H': case 'f': /* CUP: cursor to 1-based row;col */
+		cursor_y = p0 ? (unsigned)(p0 - 1) : 0;
+		cursor_x = p1 ? (unsigned)(p1 - 1) : 0;
+		if (cursor_y >= ROWS) cursor_y = ROWS - 1;
+		if (cursor_x >= COLS) cursor_x = COLS - 1;
+		break;
+	case 'K': /* EL: erase in line */
+		if (p0 == 0)      for (unsigned x = cursor_x; x < COLS; x++) cells[cursor_y][x] = ' ';
+		else if (p0 == 1) for (unsigned x = 0; x <= cursor_x && x < COLS; x++) cells[cursor_y][x] = ' ';
+		else if (p0 == 2) clear_row(cursor_y);
+		break;
+	case 'J': /* ED: erase in display */
+		if (p0 == 0) {
+			for (unsigned x = cursor_x; x < COLS; x++) cells[cursor_y][x] = ' ';
+			for (unsigned r = cursor_y + 1; r < ROWS; r++) clear_row(r);
+		} else if (p0 == 1) {
+			for (unsigned r = 0; r < cursor_y; r++) clear_row(r);
+			for (unsigned x = 0; x <= cursor_x && x < COLS; x++) cells[cursor_y][x] = ' ';
+		} else {
+			for (unsigned r = 0; r < ROWS; r++) clear_row(r);
+			cursor_x = cursor_y = 0;
+		}
+		break;
+	case 'P': /* DCH: delete chars, shift rest of line left */
+		n = p0 ? (unsigned)p0 : 1;
+		for (unsigned x = cursor_x; x < COLS; x++)
+			cells[cursor_y][x] = (x + n < COLS) ? cells[cursor_y][x + n] : ' ';
+		break;
+	case '@': /* ICH: insert blanks, shift rest of line right */
+		n = p0 ? (unsigned)p0 : 1;
+		for (unsigned x = COLS; x-- > cursor_x; )
+			cells[cursor_y][x] = (x >= cursor_x + n) ? cells[cursor_y][x - n] : ' ';
+		break;
+	case 'n': /* DSR: report cursor position as ESC[row;colR */
+		if (p0 == 6 && term_master >= 0) {
+			char rep[24], tmp[8];
+			int l = 0, t;
+			unsigned r = cursor_y + 1, c = cursor_x + 1;
+			rep[l++] = '\033'; rep[l++] = '[';
+			t = 0; do { tmp[t++] = (char)('0' + r % 10); r /= 10; } while (r);
+			while (t) rep[l++] = tmp[--t];
+			rep[l++] = ';';
+			t = 0; do { tmp[t++] = (char)('0' + c % 10); c /= 10; } while (c);
+			while (t) rep[l++] = tmp[--t];
+			rep[l++] = 'R';
+			(void)write(term_master, rep, (size_t)l);
+		}
+		break;
+	default: /* 'm' (SGR colour) and anything unhandled: ignore */
+		break;
+	}
+}
+
+static void put_terminal_char(char ch) {
+	unsigned char c = (unsigned char)ch;
+
+	if (esc_state == 1) { /* just saw ESC */
+		if (c == '[') {
+			esc_state = 2;
+			esc_private = 0;
+			esc_nparams = 1;
+			memset(esc_params, 0, sizeof(esc_params));
+		} else {
+			/* other ESC sequences (charset select, keypad mode, …):
+			 * swallow the single following byte and resume. */
+			esc_state = 0;
+		}
 		return;
 	}
-	if (c == '\n') {
-		cursor_x = 0;
-		if (++cursor_y >= ROWS)
-			scroll_up();
-		return;
+	if (esc_state == 2) { /* collecting CSI parameters */
+		if (c == '?') {
+			esc_private = 1;
+			return;
+		}
+		if (c >= '0' && c <= '9') {
+			if (esc_nparams <= 8)
+				esc_params[esc_nparams - 1] =
+				    esc_params[esc_nparams - 1] * 10 + (c - '0');
+			return;
+		}
+		if (c == ';') {
+			if (esc_nparams < 8)
+				esc_nparams++;
+			return;
+		}
+		if (c >= 0x40 && c <= 0x7e) { /* final byte */
+			if (!esc_private)
+				csi_dispatch((char)c);
+			esc_state = 0;
+			return;
+		}
+		return; /* intermediate byte: keep collecting */
 	}
-	if (c == '\b') {
-		if (cursor_x > 0)
-			cursor_x--;
-		cells[cursor_y][cursor_x] = ' ';
-		return;
+
+	/* normal state */
+	switch (c) {
+	case 0x1b: esc_state = 1; return;        /* ESC */
+	case '\r': cursor_x = 0; return;
+	case '\n': cursor_x = 0; if (++cursor_y >= ROWS) scroll_up(); return;
+	case '\b': if (cursor_x > 0) cursor_x--; return; /* non-destructive */
+	case '\t': cursor_x = (cursor_x + 8) & ~7u;
+		if (cursor_x >= COLS) cursor_x = COLS - 1; return;
+	case 0x07: return;                       /* bell */
 	}
-	if ((unsigned char)c < 32 || (unsigned char)c >= 127)
+	if (c < 32 || c >= 127)
 		return;
-	cells[cursor_y][cursor_x++] = c;
+	cells[cursor_y][cursor_x++] = (char)c;
 	if (cursor_x >= COLS) {
 		cursor_x = 0;
 		if (++cursor_y >= ROWS)
@@ -138,6 +253,8 @@ int main(void) {
 		if (master < 0)
 			break; /* pty allocation failed — give up the window */
 		fcntl(master, F_SETFL, O_NONBLOCK);
+		term_master = master; /* let the escape parser send DSR replies */
+		esc_state = 0;        /* reset parser for the fresh shell */
 		usleep(100000);
 		render(&win);
 
