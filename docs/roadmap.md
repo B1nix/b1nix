@@ -729,7 +729,15 @@ no-fake-pass smoke test.
     bitstream family. `M53-WEBP: ok encode/info/decode`.
   - Added the standard `*_10_EXP` macros to `userspace/include/float.h` (libpng
     gamma math needs them).
-- [ ] `planned` Full-motion video codec: libvpx (VP8/VP9) decode.
+- [x] `done` Full-motion video codec: **libvpx** VP8 decode (the WebM / browser
+  video codec). `tools/build-libvpx.sh` runs libvpx's own configure for the
+  portable `generic-gnu` target to generate its `vpx_config.h` + `*_rtcd.h`
+  headers, then recompiles the VP8-decode C sources with the b1nix toolchain.
+  `m53_libvpx_smoke` cross-verifies against libwebp: it encodes a lossy WebP
+  (which *is* a VP8 keyframe), pulls the raw VP8 bitstream from the RIFF "VP8 "
+  chunk, decodes it with libvpx to an I420 frame, and checks the luma plane
+  reproduces the original within tolerance. `M53-VPX: ok
+  webp-vp8-frame/decode-init/decode/luma`.
 - [~] `partial` Mesa **through VirGL** — host-GPU-accelerated 3D.
   - [x] `done` Kernel exposes the VirGL 3D transport (M52) to userspace via
     `/dev/virtio-gpu` (ioctls: GET_CAPS, RES_CREATE + mmap window, SUBMIT a virgl

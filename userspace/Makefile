@@ -88,6 +88,7 @@ BINARIES := \
 	$(BUILD)/bin/m53_libpng_smoke \
 	$(BUILD)/bin/m53_libjpeg_smoke \
 	$(BUILD)/bin/m53_libwebp_smoke \
+	$(BUILD)/bin/m53_libvpx_smoke \
 	$(BUILD)/bin/m53_virgl_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
@@ -366,6 +367,16 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(LIB) $(CRT0) $(LINKER)
 	$(CC) $(CFLAGS) -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libwebp_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libwebp_smoke.o \
 	  $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_libvpx_smoke links the ported libvpx (VP8 decode) + libwebp (VP8 keyframe
+# source) + libm. M53 full-motion video codec.
+LIBVPX_DIR := ../build/libvpx-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libvpx_smoke.o \
+	  $(LIBVPX_DIR)/lib/libvpx.a $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(LIB) --no-whole-archive
 
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the

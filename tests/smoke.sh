@@ -1089,6 +1089,12 @@ check_output "$LOG" "M53-WEBP: ok encode" "ported libwebp encodes a valid RIFF/W
 check_output "$LOG" "M53-WEBP: ok info" "libwebp reads back image dimensions"
 check_output "$LOG" "M53-WEBP: ok decode" "libwebp lossless decode; pixels byte-for-byte identical"
 check_output "$LOG" "M53-WEBP: done" "libwebp smoke completes"
+# ── M53 libvpx userspace port (VP8 full-motion video decode) ──
+check_output "$LOG" "M53-VPX: ok webp-vp8-frame" "extracts a VP8 keyframe from a lossy WebP"
+check_output "$LOG" "M53-VPX: ok decode-init" "libvpx VP8 decoder initializes"
+check_output "$LOG" "M53-VPX: ok decode" "libvpx decodes the VP8 frame to an I420 image"
+check_output "$LOG" "M53-VPX: ok luma" "decoded luma plane matches the original within tolerance"
+check_output "$LOG" "M53-VPX: done" "libvpx smoke completes"
 # ── M34 procfs / sysfs synthetic filesystems ──
 check_output "$LOG" "procfs: mounted at /proc" "procfs mounted at /proc"
 check_output "$LOG" "sysfs: mounted at /sys" "sysfs mounted at /sys"

@@ -1444,6 +1444,18 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M53: libvpx (VP8 full-motion video decode). */
+  {
+    u64 vpx_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libvpx-smoke", 0, 0, 0, 0, 0);
+    if ((isize)vpx_pid < 0) {
+      uwrite("M53-VPX: spawn-fail\n");
+    } else {
+      int vpx_status = 0;
+      syscall_dispatch(SYS_WAIT, vpx_pid, (u64)(usize)&vpx_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M34: procfs / sysfs synthetic filesystems. */
   {
     u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,

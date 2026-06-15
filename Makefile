@@ -52,6 +52,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_libpng_smoke \
 	m53_libjpeg_smoke \
 	m53_libwebp_smoke \
+	m53_libvpx_smoke \
 	m53_virgl_smoke \
 	m34_smoke \
 	m35_smoke \
@@ -616,6 +617,16 @@ $(BUILD_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/m53_libwebp_smoke.c 
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
+
+# M53: libvpx (VP8 full-motion video decode) — NetSurf/WebM video codec.
+LIBVPX_LIB := build/libvpx-b1nix/$(B1NIX_TRIPLET)/install/lib/libvpx.a
+$(LIBVPX_LIB): tools/build-libvpx.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libvpx.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/m53_libvpx_smoke.c $(USERSPACE_DEPS) $(LIBVPX_LIB) $(LIBWEBP_LIB) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libvpx_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_libvpx_smoke_elf userspace/build/$(ARCH)/bin/m53_libvpx_smoke > $@
 
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
 $(BUILD_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(USERSPACE_DEPS)
