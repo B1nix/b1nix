@@ -14,6 +14,7 @@
 #include "initramfs_m14_smoke.inc"
 #include "initramfs_m15_smoke.inc"
 #include "initramfs_tcc_files.inc"
+#include "initramfs_netsurf_files.inc"
 #include "initramfs_m25_smoke.inc"
 #include "initramfs_m26_smoke.inc"
 #include "initramfs_m24b_smoke.inc"
@@ -29,6 +30,12 @@
 #include "initramfs_m53_libjpeg_smoke.inc"
 #include "initramfs_m53_libwebp_smoke.inc"
 #include "initramfs_m53_libvpx_smoke.inc"
+#include "initramfs_m53_wapcaplet_smoke.inc"
+#include "initramfs_m53_parserutils_smoke.inc"
+#include "initramfs_m53_hubbub_smoke.inc"
+#include "initramfs_m53_libcss_smoke.inc"
+#include "initramfs_m53_libdom_smoke.inc"
+#include "initramfs_m53_nslibs_smoke.inc"
 #include "initramfs_m53_virgl_smoke.inc"
 #include "initramfs_curl.inc"
 #include "initramfs_wget.inc"
@@ -990,6 +997,18 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m53_libwebp_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m53-libvpx-smoke", (const char *)vfs_m53_libvpx_smoke_elf,
      sizeof(vfs_m53_libvpx_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-wapcaplet-smoke", (const char *)vfs_m53_wapcaplet_smoke_elf,
+     sizeof(vfs_m53_wapcaplet_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-parserutils-smoke", (const char *)vfs_m53_parserutils_smoke_elf,
+     sizeof(vfs_m53_parserutils_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-hubbub-smoke", (const char *)vfs_m53_hubbub_smoke_elf,
+     sizeof(vfs_m53_hubbub_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-libcss-smoke", (const char *)vfs_m53_libcss_smoke_elf,
+     sizeof(vfs_m53_libcss_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-libdom-smoke", (const char *)vfs_m53_libdom_smoke_elf,
+     sizeof(vfs_m53_libdom_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m53-nslibs-smoke", (const char *)vfs_m53_nslibs_smoke_elf,
+     sizeof(vfs_m53_nslibs_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m53-virgl-smoke", (const char *)vfs_m53_virgl_smoke_elf,
      sizeof(vfs_m53_virgl_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/curl", (const char *)vfs_curl_elf, sizeof(vfs_curl_elf),
@@ -1150,7 +1169,8 @@ static const struct initramfs_file files[] = {
     {"/mnt/iso/.keep", "", 0, 0},
     /* M37: mount point for the verified live rootfs (loop0 ext4). */
     {"/mnt/root/.keep", "", 0, 0},
-    TCC_INITRAMFS_FILES
+    TCC_INITRAMFS_FILES,
+    NETSURF_INITRAMFS_FILES
 };
 
 static int initramfs_vfs_statfs(struct vfs_node *node,

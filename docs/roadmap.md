@@ -751,8 +751,26 @@ no-fake-pass smoke test.
     (vs softpipe).
 - [ ] `planned` Runtime gaps: robust pthread, futex, TLS (mostly done in M29),
   real dynamic loading (`dlopen` of `.so` — currently a stub), ICU.
-- [ ] `planned` Port NetSurf's own libraries (libwapcaplet, libparserutils,
-  libhubbub, libcss, libdom, libnsgif) and the framebuffer/Wayland frontend;
-  load interactive HTTPS pages with fonts, images, input.
+- [x] `done` Port NetSurf's own libraries and the framebuffer frontend, and
+  **render a real page**. The full dependency chain is ported and freestanding-
+  compiled against the b1nix ABI, each with a no-fake-pass smoke:
+  **libwapcaplet** (string internment, `M53-WAPCAPLET`), **libparserutils**
+  (input + bundled charset codecs, `M53-PARSERUTILS`), **libhubbub** (HTML5
+  tokeniser, `M53-HUBBUB`), **libcss** (CSS parse + cascade/selection,
+  `M53-LIBCSS`), **libdom** (DOM via the hubbub binding, `M53-LIBDOM`),
+  **libnsutils/libnsgif/libnsbmp/libnslog** (`M53-NSUTILS/NSGIF/NSBMP/NSLOG`),
+  and **libnsfb** (framebuffer surface + plotters). The complete **NetSurf
+  framebuffer browser** is then cross-built for b1nix with its native build
+  system driven by the b1nix cross-gcc (`tools/build-netsurf-fb.sh`), packaged
+  into the initramfs with its resources + a test page
+  (`tools/gen_netsurf_initramfs.sh`), and a headless `-T` render self-test loads
+  a local `file://` HTML page (styled text + a PNG image), lays it out
+  (extents 782x552) and paints it into a framebuffer (117849 non-background
+  pixels verified). `M53-NS: ok load/redraw/render`. Both arches green
+  (x86_64 705/0, x86 704/0). Runtime notes: the file:// fetcher uses the
+  `fread()` path (`HAVE_MMAP` off — b1nix can't mmap an initramfs object) and the
+  render self-test busy-waits `gettimeofday` because b1nix `nanosleep` is a no-op.
+  Remaining browser work (interactive HTTPS pages over the network, Wayland
+  frontend, input) is future.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
   browser or another real application requires it.

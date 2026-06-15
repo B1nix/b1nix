@@ -89,6 +89,12 @@ BINARIES := \
 	$(BUILD)/bin/m53_libjpeg_smoke \
 	$(BUILD)/bin/m53_libwebp_smoke \
 	$(BUILD)/bin/m53_libvpx_smoke \
+	$(BUILD)/bin/m53_wapcaplet_smoke \
+	$(BUILD)/bin/m53_parserutils_smoke \
+	$(BUILD)/bin/m53_hubbub_smoke \
+	$(BUILD)/bin/m53_libcss_smoke \
+	$(BUILD)/bin/m53_libdom_smoke \
+	$(BUILD)/bin/m53_nslibs_smoke \
 	$(BUILD)/bin/m53_virgl_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
@@ -377,6 +383,69 @@ $(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(LIB) $(CRT0) $(LINKER)
 	$(CC) $(CFLAGS) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libvpx_smoke.o \
 	  $(LIBVPX_DIR)/lib/libvpx.a $(LIBWEBP_DIR)/lib/libwebp.a $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_wapcaplet_smoke links the ported NetSurf libwapcaplet (string internment)
+# — the lowest layer of the NetSurf browser library chain (M53).
+LWC_DIR := ../build/libwapcaplet-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_wapcaplet_smoke: bin/m53_wapcaplet_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_wapcaplet_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_wapcaplet_smoke.o \
+	  $(LWC_DIR)/lib/liblwc.a --whole-archive $(LIB) --no-whole-archive
+
+# m53_parserutils_smoke links the ported NetSurf libparserutils (input streams +
+# bundled charset codecs) — browser lib chain step 2 (M53).
+PU_DIR := ../build/libparserutils-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_parserutils_smoke: bin/m53_parserutils_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_parserutils_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_parserutils_smoke.o \
+	  $(PU_DIR)/lib/libparserutils.a --whole-archive $(LIB) --no-whole-archive
+
+# m53_hubbub_smoke links the ported NetSurf libhubbub (HTML5 tokeniser) over
+# libparserutils — browser lib chain step 3 (M53).
+HUBBUB_DIR := ../build/libhubbub-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_hubbub_smoke: bin/m53_hubbub_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_hubbub_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_hubbub_smoke.o \
+	  $(HUBBUB_DIR)/lib/libhubbub.a $(PU_DIR)/lib/libparserutils.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_libcss_smoke links the ported NetSurf libcss (CSS parser + selection) over
+# libwapcaplet + libparserutils — browser lib chain step 4 (M53).
+LIBCSS_DIR := ../build/libcss-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libcss_smoke: bin/m53_libcss_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBCSS_DIR)/include -I $(LWC_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_libcss_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libcss_smoke.o \
+	  $(LIBCSS_DIR)/lib/libcss.a $(LWC_DIR)/lib/liblwc.a $(PU_DIR)/lib/libparserutils.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_libdom_smoke links the ported NetSurf libdom (DOM) + its hubbub binding
+# over libhubbub + libparserutils + libwapcaplet — browser lib chain step 5.
+LIBDOM_DIR := ../build/libdom-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_libdom_smoke: bin/m53_libdom_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(LIBDOM_DIR)/include -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_libdom_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libdom_smoke.o \
+	  $(LIBDOM_DIR)/lib/libdom.a $(HUBBUB_DIR)/lib/libhubbub.a \
+	  $(PU_DIR)/lib/libparserutils.a $(LWC_DIR)/lib/liblwc.a \
+	  --whole-archive $(LIB) --no-whole-archive
+
+# m53_nslibs_smoke links the ported NetSurf helper/decoder libraries: libnsutils
+# + libnsgif + libnsbmp + libnslog — browser lib chain helpers (step 6, M53).
+NSUTILS_DIR := ../build/libnsutils-b1nix/$(B1NIX_TRIPLET)/install
+NSGIF_DIR := ../build/libnsgif-b1nix/$(B1NIX_TRIPLET)/install
+NSBMP_DIR := ../build/libnsbmp-b1nix/$(B1NIX_TRIPLET)/install
+NSLOG_DIR := ../build/libnslog-b1nix/$(B1NIX_TRIPLET)/install
+$(BUILD)/bin/m53_nslibs_smoke: bin/m53_nslibs_smoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(NSUTILS_DIR)/include -I $(NSGIF_DIR)/include -I $(NSBMP_DIR)/include -I $(NSLOG_DIR)/include -c $< -o $(BUILD)/bin/m53_nslibs_smoke.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_nslibs_smoke.o \
+	  $(NSUTILS_DIR)/lib/libnsutils.a $(NSGIF_DIR)/lib/libnsgif.a \
+	  $(NSBMP_DIR)/lib/libnsbmp.a $(NSLOG_DIR)/lib/libnslog.a \
 	  --whole-archive $(LIB) --no-whole-archive
 
 # M30: PIE smoke binary. Compiled with -fPIC and linked with -pie so the

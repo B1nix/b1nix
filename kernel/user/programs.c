@@ -1456,6 +1456,104 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M53: libwapcaplet (string internment — NetSurf browser-library chain). */
+  {
+    u64 lwc_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-wapcaplet-smoke", 0, 0, 0, 0, 0);
+    if ((isize)lwc_pid < 0) {
+      uwrite("M53-WAPCAPLET: spawn-fail\n");
+    } else {
+      int lwc_status = 0;
+      syscall_dispatch(SYS_WAIT, lwc_pid, (u64)(usize)&lwc_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libparserutils (input streams + charset codecs — NetSurf chain). */
+  {
+    u64 pu_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-parserutils-smoke", 0, 0, 0, 0, 0);
+    if ((isize)pu_pid < 0) {
+      uwrite("M53-PARSERUTILS: spawn-fail\n");
+    } else {
+      int pu_status = 0;
+      syscall_dispatch(SYS_WAIT, pu_pid, (u64)(usize)&pu_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libhubbub (HTML5 tokeniser/tree builder — NetSurf chain). */
+  {
+    u64 hub_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-hubbub-smoke", 0, 0, 0, 0, 0);
+    if ((isize)hub_pid < 0) {
+      uwrite("M53-HUBBUB: spawn-fail\n");
+    } else {
+      int hub_status = 0;
+      syscall_dispatch(SYS_WAIT, hub_pid, (u64)(usize)&hub_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libcss (CSS parser + selection — NetSurf chain). */
+  {
+    u64 css_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libcss-smoke", 0, 0, 0, 0, 0);
+    if ((isize)css_pid < 0) {
+      uwrite("M53-LIBCSS: spawn-fail\n");
+    } else {
+      int css_status = 0;
+      syscall_dispatch(SYS_WAIT, css_pid, (u64)(usize)&css_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: libdom (DOM built from HTML via the hubbub binding — NetSurf chain). */
+  {
+    u64 dom_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-libdom-smoke", 0, 0, 0, 0, 0);
+    if ((isize)dom_pid < 0) {
+      uwrite("M53-LIBDOM: spawn-fail\n");
+    } else {
+      int dom_status = 0;
+      syscall_dispatch(SYS_WAIT, dom_pid, (u64)(usize)&dom_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: NetSurf helper/decoder libs (libnsutils/nsgif/nsbmp/nslog). */
+  {
+    u64 ns_pid = syscall_dispatch(
+        SYS_SPAWN, (u64)(usize) "/bin/m53-nslibs-smoke", 0, 0, 0, 0, 0);
+    if ((isize)ns_pid < 0) {
+      uwrite("M53-NSLIBS: spawn-fail\n");
+    } else {
+      int ns_status = 0;
+      syscall_dispatch(SYS_WAIT, ns_pid, (u64)(usize)&ns_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M53: NetSurf framebuffer browser — render a real HTML page (styled text +
+   * a PNG image) into a RAM framebuffer and verify the painted pixels via the
+   * headless -T self-test. Drives the whole ported NetSurf lib chain end to end. */
+  {
+    const char *nsfb_argv[10];
+    int nsfb_argc = 0;
+    nsfb_argv[nsfb_argc++] = "/bin/nsfb";
+    nsfb_argv[nsfb_argc++] = "-f";
+    nsfb_argv[nsfb_argc++] = "ram";
+    nsfb_argv[nsfb_argc++] = "-w";
+    nsfb_argv[nsfb_argc++] = "800";
+    nsfb_argv[nsfb_argc++] = "-h";
+    nsfb_argv[nsfb_argc++] = "600";
+    nsfb_argv[nsfb_argc++] = "-T";
+    nsfb_argv[nsfb_argc++] = "file:///netsurf/test.html";
+    nsfb_argv[nsfb_argc] = 0;
+    u64 nsfb_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)nsfb_argv[0],
+                                    nsfb_argc, (u64)(usize)nsfb_argv, 0, 0, 0);
+    if ((isize)nsfb_pid < 0) {
+      uwrite("M53-NS: spawn-fail\n");
+    } else {
+      int nsfb_status = 0;
+      syscall_dispatch(SYS_WAIT, nsfb_pid, (u64)(usize)&nsfb_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M34: procfs / sysfs synthetic filesystems. */
   {
     u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m34-smoke", 0,

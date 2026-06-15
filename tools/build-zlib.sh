@@ -45,7 +45,12 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -O2 -fno-strict-aliasing -Db1nix -DHAVE_HIDDEN -I$SRC_DIR
   -Wno-implicit-function-declaration"
 
-CORE="adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil"
+# Core in-memory codec plus the gz* file wrappers: NetSurf's utils/hashtable.c
+# reads gzipped data via gzopen/gzgets/gzclose, so the gz layer is needed for
+# the browser port. (Earlier codec-only consumers never referenced these, but
+# including them is harmless — they only pull in open/read/write/lseek/close.)
+CORE="adler32 compress crc32 deflate infback inffast inflate inftrees trees uncompr zutil \
+gzlib gzread gzwrite gzclose"
 OBJS=""
 for base in $CORE; do
   obj="$OBJ_DIR/$base.o"

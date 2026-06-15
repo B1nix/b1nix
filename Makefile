@@ -23,6 +23,9 @@ INITRAMFS_BUSYBOX_INC := $(BUILD_DIR)/initramfs_busybox.inc
 INITRAMFS_BASH_INC := $(BUILD_DIR)/initramfs_bash.inc
 INITRAMFS_TESTWAV_INC := $(BUILD_DIR)/initramfs_testwav.inc
 INITRAMFS_TESTFONT_INC := $(BUILD_DIR)/initramfs_testfont.inc
+# M53: NetSurf framebuffer browser + resources + test page.
+INITRAMFS_NETSURF_INC := $(BUILD_DIR)/initramfs_netsurf_files.inc
+NSFB_ELF := build/netsurf-fb-b1nix/$(B1NIX_TRIPLET)/nsfb
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
 APPLET_MANIFEST := tools/applet-manifest.conf
@@ -53,6 +56,12 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_libjpeg_smoke \
 	m53_libwebp_smoke \
 	m53_libvpx_smoke \
+	m53_wapcaplet_smoke \
+	m53_parserutils_smoke \
+	m53_hubbub_smoke \
+	m53_libcss_smoke \
+	m53_libdom_smoke \
+	m53_nslibs_smoke \
 	m53_virgl_smoke \
 	m34_smoke \
 	m35_smoke \
@@ -108,7 +117,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_BUSYBOX_INC) \
 	$(INITRAMFS_BASH_INC) \
 	$(INITRAMFS_TESTWAV_INC) \
-	$(INITRAMFS_TESTFONT_INC)
+	$(INITRAMFS_TESTFONT_INC) \
+	$(INITRAMFS_NETSURF_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
@@ -628,6 +638,69 @@ $(BUILD_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/m53_libvpx_smoke.c $(
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_libvpx_smoke_elf userspace/build/$(ARCH)/bin/m53_libvpx_smoke > $@
 
+# M53: libwapcaplet (string internment) — first NetSurf browser-library dep.
+LWC_LIB := build/libwapcaplet-b1nix/$(B1NIX_TRIPLET)/install/lib/liblwc.a
+$(LWC_LIB): tools/build-libwapcaplet.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libwapcaplet.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_wapcaplet_smoke.inc: userspace/bin/m53_wapcaplet_smoke.c $(USERSPACE_DEPS) $(LWC_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_wapcaplet_smoke
+	xxd -i -n vfs_m53_wapcaplet_smoke_elf userspace/build/$(ARCH)/bin/m53_wapcaplet_smoke > $@
+
+# M53: libparserutils (input streams + bundled charset codecs) — NetSurf dep.
+PU_LIB := build/libparserutils-b1nix/$(B1NIX_TRIPLET)/install/lib/libparserutils.a
+$(PU_LIB): tools/build-libparserutils.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libparserutils.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_parserutils_smoke.inc: userspace/bin/m53_parserutils_smoke.c $(USERSPACE_DEPS) $(PU_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_parserutils_smoke
+	xxd -i -n vfs_m53_parserutils_smoke_elf userspace/build/$(ARCH)/bin/m53_parserutils_smoke > $@
+
+# M53: libhubbub (HTML5 tokeniser + tree builder) over libparserutils — NetSurf.
+HUBBUB_LIB := build/libhubbub-b1nix/$(B1NIX_TRIPLET)/install/lib/libhubbub.a
+$(HUBBUB_LIB): tools/build-libhubbub.sh tools/build-libparserutils.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libhubbub.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_hubbub_smoke.inc: userspace/bin/m53_hubbub_smoke.c $(USERSPACE_DEPS) $(HUBBUB_LIB) $(PU_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_hubbub_smoke
+	xxd -i -n vfs_m53_hubbub_smoke_elf userspace/build/$(ARCH)/bin/m53_hubbub_smoke > $@
+
+# M53: libcss (CSS parser + selection) over libwapcaplet + libparserutils.
+LIBCSS_LIB := build/libcss-b1nix/$(B1NIX_TRIPLET)/install/lib/libcss.a
+$(LIBCSS_LIB): tools/build-libcss.sh tools/build-libwapcaplet.sh tools/build-libparserutils.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libcss.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libcss_smoke.inc: userspace/bin/m53_libcss_smoke.c $(USERSPACE_DEPS) $(LIBCSS_LIB) $(LWC_LIB) $(PU_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libcss_smoke
+	xxd -i -n vfs_m53_libcss_smoke_elf userspace/build/$(ARCH)/bin/m53_libcss_smoke > $@
+
+# M53: libdom (DOM) + hubbub binding over libhubbub + libparserutils + lwc.
+LIBDOM_LIB := build/libdom-b1nix/$(B1NIX_TRIPLET)/install/lib/libdom.a
+$(LIBDOM_LIB): tools/build-libdom.sh tools/build-libhubbub.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libdom.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_libdom_smoke.inc: userspace/bin/m53_libdom_smoke.c $(USERSPACE_DEPS) $(LIBDOM_LIB) $(HUBBUB_LIB) $(PU_LIB) $(LWC_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libdom_smoke
+	xxd -i -n vfs_m53_libdom_smoke_elf userspace/build/$(ARCH)/bin/m53_libdom_smoke > $@
+
+# M53: NetSurf helper/decoder libs — libnsutils, libnsgif, libnsbmp, libnslog.
+NSUTILS_LIB := build/libnsutils-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsutils.a
+NSGIF_LIB := build/libnsgif-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsgif.a
+NSBMP_LIB := build/libnsbmp-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsbmp.a
+NSLOG_LIB := build/libnslog-b1nix/$(B1NIX_TRIPLET)/install/lib/libnslog.a
+$(NSUTILS_LIB): tools/build-libnsutils.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libnsutils.sh >/dev/null
+$(NSGIF_LIB): tools/build-libnsgif.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libnsgif.sh >/dev/null
+$(NSBMP_LIB): tools/build-libnsbmp.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libnsbmp.sh >/dev/null
+$(NSLOG_LIB): tools/build-libnslog.sh
+	B1NIX_ARCH=$(ARCH) tools/build-libnslog.sh >/dev/null
+
+$(BUILD_DIR)/initramfs_m53_nslibs_smoke.inc: userspace/bin/m53_nslibs_smoke.c $(USERSPACE_DEPS) $(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_nslibs_smoke
+	xxd -i -n vfs_m53_nslibs_smoke_elf userspace/build/$(ARCH)/bin/m53_nslibs_smoke > $@
+
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
 $(BUILD_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
@@ -697,6 +770,15 @@ $(INITRAMFS_TESTWAV_INC): tools/gen_test_wav.py
 $(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_testfont userspace/share/fonts/B1nixMono-Regular.ttf > $@
+
+# M53: build the NetSurf framebuffer browser (the real nsfb binary) and package
+# it + its runtime resources + a test page into the initramfs.
+$(NSFB_ELF): tools/build-netsurf-fb.sh tools/build-libnsfb.sh
+	B1NIX_ARCH=$(ARCH) tools/build-netsurf-fb.sh >/dev/null
+
+$(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(ARCH) tools/gen_netsurf_initramfs.sh $@
 
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
