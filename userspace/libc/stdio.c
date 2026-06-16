@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include <ctype.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -371,7 +372,13 @@ int ferror(FILE *stream) { return stream ? stream->error : 1; }
 int fileno(FILE *stream) { return stream ? stream->fd : -1; }
 
 int remove(const char *pathname) {
-  return unlink(pathname);
+  /* POSIX remove(3): unlink(2) for files, rmdir(2) for directories. Try the
+   * file path first; if the target is a directory the kernel reports EISDIR
+   * (or EPERM on some POSIX systems), so fall back to rmdir. */
+  int r = unlink(pathname);
+  if (r != 0 && (errno == EISDIR || errno == EPERM))
+    r = rmdir(pathname);
+  return r;
 }
 
 int fprintf(FILE *stream, const char *fmt, ...) {

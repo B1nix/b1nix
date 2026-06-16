@@ -1935,6 +1935,42 @@ void scheduler_block_on(void *chan) {
   interrupts_enable();
 }
 
+/* Like scheduler_block_on but arms a timer deadline: wake_sleepers() (run from
+ * the timer ISR) CAS-promotes a BLOCKED task whose wake_tick has elapsed back
+ * to READY even when no explicit wake arrives. This is what backs the futex
+ * timed-wait path (pthread_cond_timedwait / sem_timedwait / mutex_timedlock).
+ * timeout_ticks == 0 means "no deadline" and behaves exactly like
+ * scheduler_block_on. */
+u64 scheduler_get_ticks(void) {
+  return scheduler_ticks;
+}
+
+void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
+  interrupts_disable();
+
+  if (current_task == 0) {
+    panic("scheduler_block_on_timeout without running task");
+  }
+
+  if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
+    current_task->state = TASK_RUNNING;
+  } else if (current_task->state != TASK_RUNNING) {
+    panic("scheduler_block_on_timeout without running task");
+  }
+
+  current_task->wait_chan = chan;
+  if (timeout_ticks)
+    current_task->wake_tick = scheduler_ticks + timeout_ticks;
+  /* M28 T4: claim the stack lease before publishing BLOCKED — see
+   * scheduler_block_current for the full race. */
+  current_task->stack_released = 0;
+  current_task->state = TASK_BLOCKED;
+  scheduler_yield();
+  /* Drop any unfired deadline: an explicit wake may have resumed us early. */
+  current_task->wake_tick = 0;
+  interrupts_enable();
+}
+
 /* SMP-safe condition wait, split into three steps so the caller can re-test its
  * wait predicate AFTER the BLOCKED state is published. This closes the classic
  * check-then-block lost-wakeup window: with plain scheduler_block_on, a

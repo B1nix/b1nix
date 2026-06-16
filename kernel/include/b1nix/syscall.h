@@ -173,6 +173,7 @@ enum {
 	SYS_SENDMSG      = 146,
 	SYS_RECVMSG      = 147,
 	SYS_MEMFD_CREATE = 148,
+	SYS_SETTIMEOFDAY = 149,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

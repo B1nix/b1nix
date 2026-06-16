@@ -106,11 +106,11 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     "$SSL_FLAGS" "$ZLIB_FLAG" --without-brotli --without-zstd \
     --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \
     --without-ngtcp2 \
-    --disable-ldap --disable-ldaps --disable-ftp --disable-file \
+    --disable-ldap --disable-ldaps --disable-ftp --enable-file \
     --disable-gopher --disable-imap --disable-mqtt --disable-pop3 \
     --disable-rtsp --disable-smb --disable-smtp --disable-telnet \
     --disable-tftp --disable-dict --disable-manual --disable-docs \
-    --disable-threaded-resolver --enable-ipv6 --disable-unix-sockets \
+    --disable-threaded-resolver --enable-ipv6 --enable-unix-sockets \
     --enable-cookies --disable-alt-svc --disable-hsts \
     --disable-websockets --disable-headers-api \
     --disable-dateparse \

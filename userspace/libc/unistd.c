@@ -1194,10 +1194,10 @@ int mknod(const char *pathname, mode_t mode, dev_t dev) {
 }
 
 int clock_settime(int clk_id, const struct timespec *tp) {
-  (void)clk_id;
-  (void)tp;
-  errno = EPERM;
-  return -1;
+  if (!tp) { errno = EINVAL; return -1; }
+  if (clk_id != CLOCK_REALTIME) { errno = EINVAL; return -1; }
+  struct timeval tv = { .tv_sec = tp->tv_sec, .tv_usec = tp->tv_nsec / 1000 };
+  return _check_err(syscall(SYS_SETTIMEOFDAY, &tv));
 }
 
 char *strptime(const char *buf, const char *format, struct tm *tm) {
@@ -1460,10 +1460,9 @@ int chroot(const char *path) {
 }
 
 int settimeofday(const struct timeval *tv, const struct timezone *tz) {
-  (void)tv;
-  (void)tz;
-  errno = EPERM;
-  return -1;
+  (void)tz; /* timezone is obsolete and ignored, as on Linux. */
+  if (!tv) { errno = EINVAL; return -1; }
+  return _check_err(syscall(SYS_SETTIMEOFDAY, tv));
 }
 
 /* klogctl(): the Linux syslog(2) interface BusyBox dmesg uses. b1nix exposes

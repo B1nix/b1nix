@@ -9,8 +9,8 @@
 #include <stdio.h>
 #include <string.h>
 
-#define MAX_BLK_DEVICES 32
-#define MAX_BLK_PARTITIONS 32
+#define MAX_BLK_DEVICES 64
+#define MAX_BLK_PARTITIONS 64
 /* Block-cache sizing (B2 audit): pool capacity is now scaled to actual RAM
  * at blk_cache_init() time so small machines don't waste ~140 KB on a 256-
  * entry pool and big machines aren't starved. ~1 entry per 512 KiB of usable

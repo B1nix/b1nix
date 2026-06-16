@@ -57,10 +57,14 @@ int   clearenv(void);
 char *realpath(const char *path, char *resolved_path);
 extern char **environ;
 
-/* Cooperative spin-based semaphores (no kernel futex; shared-memory safe) */
+/* POSIX semaphores, futex-backed (atomic count; parks in the kernel on wait). */
+struct timespec;
 int sem_init(int *sem, int pshared, unsigned int value);
 int sem_wait(int *sem);
+int sem_trywait(int *sem);
+int sem_timedwait(int *sem, const struct timespec *abs_timeout);
 int sem_post(int *sem);
+int sem_getvalue(int *sem, int *sval);
 int sem_destroy(int *sem);
 
 #ifndef B1NIX_WCHAR_T_DEFINED

@@ -23,7 +23,7 @@ struct udp_handler_entry {
 	udp_port_handler_t handler;
 };
 
-#define MAX_UDP_HANDLERS 8
+#define MAX_UDP_HANDLERS 32
 static struct udp_handler_entry udp_handlers[MAX_UDP_HANDLERS];
 
 static u16 bswap16(u16 value)

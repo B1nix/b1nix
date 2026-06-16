@@ -63,7 +63,10 @@ static u64 futex_key_pml4(void) {
   return t ? t->pml4_phys : 0;
 }
 
-int scheduler_futex(u64 uaddr, int op, int val) {
+/* Scheduler tick cadence (TIMER_HZ) is 100 Hz → 10 ms per tick. */
+#define FUTEX_MS_PER_TICK 10
+
+int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
   if ((uaddr & 0x3) != 0) return -EINVAL;
 
   if (op == B1NIX_FUTEX_WAIT) {
@@ -106,21 +109,43 @@ int scheduler_futex(u64 uaddr, int op, int val) {
     b->head = w;
     spin_unlock_irqrestore(&b->lock, flags);
 
-    /* Block until woken. scheduler_block_on yields with state=BLOCKED
+    /* Optional relative timeout: convert ms → scheduler ticks (round up so a
+     * sub-tick request still waits at least one tick) and arm the deadline. */
+    u64 timeout_ticks = 0;
+    u64 deadline = 0;
+    if (timeout_ms) {
+      timeout_ticks = (timeout_ms + (FUTEX_MS_PER_TICK - 1)) / FUTEX_MS_PER_TICK;
+      if (timeout_ticks == 0) timeout_ticks = 1;
+      deadline = scheduler_get_ticks() + timeout_ticks;
+    }
+
+    /* Block until woken. scheduler_block_on[_timeout] yields with state=BLOCKED
      * and wait_chan=w; the wake path uses scheduler_wake_task by id
      * because the wait_chan pointer is private to this waiter struct. */
-    scheduler_block_on(w);
+    if (timeout_ticks)
+      scheduler_block_on_timeout(w, timeout_ticks);
+    else
+      scheduler_block_on(w);
 
-    /* After wake: detach our waiter from the bucket if it's still there
-     * (the waker normally removes it, but a spurious return is harmless). */
+    /* After wake: detach our waiter from the bucket if it's still there. A
+     * FUTEX_WAKE always unlinks the waiter BEFORE waking it, so finding our
+     * node still linked means no wake reached us — either the timer deadline
+     * fired or this was a spurious resume. */
+    int still_queued = 0;
     spin_lock_irqsave(&b->lock, &flags);
     struct futex_waiter **pp = &b->head;
     while (*pp) {
-      if (*pp == w) { *pp = w->next; break; }
+      if (*pp == w) { *pp = w->next; still_queued = 1; break; }
       pp = &(*pp)->next;
     }
     spin_unlock_irqrestore(&b->lock, flags);
     kfree(w);
+
+    /* Report ETIMEDOUT only when we were still queued and the deadline has
+     * actually elapsed; a spurious early wake returns 0 so the caller re-tests
+     * its predicate and recomputes the remaining timeout. */
+    if (still_queued && deadline && scheduler_get_ticks() >= deadline)
+      return -ETIMEDOUT;
     return 0;
   }
 
@@ -163,7 +188,7 @@ int scheduler_futex(u64 uaddr, int op, int val) {
  * pml4 key comes from current_task; that's correct since the dying thread
  * still has its mm mapped. */
 void scheduler_futex_wake_addr(u64 uaddr, int val) {
-  (void)scheduler_futex(uaddr, B1NIX_FUTEX_WAKE, val);
+  (void)scheduler_futex(uaddr, B1NIX_FUTEX_WAKE, val, 0);
 }
 
 /* Remove every waiter owned by an exiting task from all buckets. A task killed

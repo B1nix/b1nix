@@ -18,7 +18,7 @@ static usize klog_read_pos;
 static int klog_overflow;
 
 /* ── Symbol table for backtraces ── */
-#define MAX_SYMBOLS 128
+#define MAX_SYMBOLS 2048
 
 struct kernel_symbol {
 	u64 address;

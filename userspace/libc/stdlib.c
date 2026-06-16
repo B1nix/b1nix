@@ -7,6 +7,7 @@
 #include <sys/mman.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <time.h>
 
 extern int normalize_errno(long rc);
 
@@ -1026,25 +1027,73 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 
 int errno = 0;
 
+/* POSIX semaphores, futex-backed. The sem_t is a single int holding the count
+ * (always >= 0). Waiters atomically decrement when the count is positive and
+ * otherwise park in the kernel via SYS_FUTEX (no busy-spin, no decrement race —
+ * the old `while (*sem<=0) yield; (*sem)--` lost posts and double-decremented
+ * under contention). */
 int sem_init(int *sem, int pshared, unsigned int value) {
   (void)pshared;
-  if (!sem) return -1;
-  *sem = (int)value;
+  if (!sem) { errno = EINVAL; return -1; }
+  __atomic_store_n(sem, (int)value, __ATOMIC_RELEASE);
   return 0;
+}
+
+/* Try to take one count without blocking. Returns 0 on success, -1/EAGAIN if
+ * the count is currently zero. */
+int sem_trywait(int *sem) {
+  if (!sem) { errno = EINVAL; return -1; }
+  int v = __atomic_load_n(sem, __ATOMIC_ACQUIRE);
+  while (v > 0) {
+    if (__atomic_compare_exchange_n(sem, &v, v - 1, 1,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      return 0;
+    /* v reloaded with the current value on CAS failure; retry. */
+  }
+  errno = EAGAIN;
+  return -1;
 }
 
 int sem_wait(int *sem) {
-  if (!sem) return -1;
-  while (*sem <= 0) {
-    syscall(SYS_YIELD);
+  if (!sem) { errno = EINVAL; return -1; }
+  for (;;) {
+    if (sem_trywait(sem) == 0)
+      return 0;
+    /* Count is zero: wait until a post bumps it. FUTEX_WAIT returns
+     * immediately (-EAGAIN) if *sem != 0, closing the post/park race. */
+    syscall(SYS_FUTEX, sem, FUTEX_WAIT, 0);
   }
-  (*sem)--;
-  return 0;
+}
+
+int sem_timedwait(int *sem, const struct timespec *abs_timeout) {
+  if (!sem) { errno = EINVAL; return -1; }
+  for (;;) {
+    if (sem_trywait(sem) == 0)
+      return 0;
+    long ms = 0;
+    if (abs_timeout) {
+      struct timespec now;
+      clock_gettime(CLOCK_REALTIME, &now);
+      ms = (abs_timeout->tv_sec - now.tv_sec) * 1000L +
+           (abs_timeout->tv_nsec - now.tv_nsec) / 1000000L;
+      if (ms <= 0) { errno = ETIMEDOUT; return -1; }
+    }
+    long rc = syscall(SYS_FUTEX, sem, FUTEX_WAIT, 0, ms);
+    if (rc == -ETIMEDOUT) { errno = ETIMEDOUT; return -1; }
+  }
 }
 
 int sem_post(int *sem) {
-  if (!sem) return -1;
-  (*sem)++;
+  if (!sem) { errno = EINVAL; return -1; }
+  __atomic_add_fetch(sem, 1, __ATOMIC_RELEASE);
+  /* Wake one waiter; harmless if none are parked. */
+  syscall(SYS_FUTEX, sem, FUTEX_WAKE, 1);
+  return 0;
+}
+
+int sem_getvalue(int *sem, int *sval) {
+  if (!sem || !sval) { errno = EINVAL; return -1; }
+  *sval = __atomic_load_n(sem, __ATOMIC_ACQUIRE);
   return 0;
 }
 

@@ -334,8 +334,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
 /* M29: futex. op is B1NIX_FUTEX_WAIT or B1NIX_FUTEX_WAKE. Returns 0 on success,
  * -errno otherwise. WAIT blocks if *uaddr == val; WAKE wakes up to val
- * waiters on uaddr. */
-int scheduler_futex(u64 uaddr, int op, int val);
+ * waiters on uaddr. For WAIT, timeout_ms > 0 arms a relative timer deadline
+ * (10 ms granularity); the call returns -ETIMEDOUT if it elapses before a wake.
+ * timeout_ms == 0 means block indefinitely. */
+int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms);
 void scheduler_futex_wake_addr(u64 uaddr, int val);
 void scheduler_futex_cleanup_task(usize task_id);
 
@@ -357,6 +359,10 @@ struct task *scheduler_setup_ap_idle(int cpu, u64 kstack_top);
 u32 sched_user_cpu_mask(void);
 void scheduler_block_current(void);
 void scheduler_block_on(void *chan);
+void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
+
+/* Monotonic scheduler tick counter (10 ms cadence). */
+u64 scheduler_get_ticks(void);
 void scheduler_wait_prepare(void *chan);
 void scheduler_wait_commit(void);
 void scheduler_wait_cancel(void);

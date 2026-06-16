@@ -15,7 +15,7 @@
 #define VIRTIO_BLK_CONFIG_CAPACITY 0x14
 
 /* Support multiple virtio-blk devices */
-#define MAX_VIRTIO_BLK 8
+#define MAX_VIRTIO_BLK 16
 
 struct virtio_blk_instance {
   struct virtio_device dev;

@@ -6,7 +6,7 @@
 #include <b1nix/spinlock.h>
 #include <string.h>
 
-#define MAX_FILE_LOCKS 64
+#define MAX_FILE_LOCKS 256
 
 static struct file_lock file_locks[MAX_FILE_LOCKS];
 static int filelock_initialized = 0;

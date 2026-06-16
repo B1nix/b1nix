@@ -363,10 +363,40 @@ int pthread_cond_wait(pthread_cond_t *c, pthread_mutex_t *m) {
   return 0;
 }
 
+/* Milliseconds from now until an absolute CLOCK_REALTIME deadline. Returns 0 if
+ * the deadline is already in the past (caller should treat as timed out). */
+static long __abstime_rel_ms(const struct timespec *abstime) {
+  struct timespec now;
+  clock_gettime(CLOCK_REALTIME, &now);
+  long ms = (abstime->tv_sec - now.tv_sec) * 1000L +
+            (abstime->tv_nsec - now.tv_nsec) / 1000000L;
+  return ms > 0 ? ms : 0;
+}
+
 int pthread_cond_timedwait(pthread_cond_t *c, pthread_mutex_t *m,
                            const struct timespec *abstime) {
-  (void)abstime;
-  return pthread_cond_wait(c, m);
+  if (!c || !m) return EINVAL;
+  if (!abstime) return pthread_cond_wait(c, m);
+
+  int seq = __atomic_load_n(&c->seq, __ATOMIC_ACQUIRE);
+  long ms = __abstime_rel_ms(abstime);
+  pthread_mutex_unlock(m);
+
+  int ret = 0;
+  if (ms == 0) {
+    /* Deadline already elapsed — still must re-acquire the mutex per POSIX. */
+    ret = ETIMEDOUT;
+  } else {
+    /* Timed futex wait. Returns -ETIMEDOUT on expiry, -EAGAIN if seq already
+     * advanced (signalled before we parked) — both leave the caller to re-test
+     * its predicate under the mutex. */
+    long rc = syscall(SYS_FUTEX, &c->seq, FUTEX_WAIT, seq, ms);
+    if (rc == -ETIMEDOUT)
+      ret = ETIMEDOUT;
+  }
+
+  pthread_mutex_lock(m);
+  return ret;
 }
 
 /* ── Once ── */
@@ -530,20 +560,34 @@ void __pthread_tsd_run_dtors(void) {
 }
 
 int pthread_mutex_timedlock(pthread_mutex_t *m, const struct timespec *abstime) {
+  if (!m) return EINVAL;
+  /* Fast/recursive path. */
   if (pthread_mutex_trylock(m) == 0)
     return 0;
-  for (;;) {
-    struct timespec now;
-    clock_gettime(CLOCK_REALTIME, &now);
-    if (abstime && (now.tv_sec > abstime->tv_sec ||
-                    (now.tv_sec == abstime->tv_sec &&
-                     now.tv_nsec >= abstime->tv_nsec)))
+  if (!abstime)
+    return pthread_mutex_lock(m); /* no deadline → block indefinitely */
+
+  /* Contended path mirroring pthread_mutex_lock, but each futex park is bounded
+   * by the remaining time until abstime. No busy-spin: the thread sleeps in the
+   * kernel and is woken either by an unlock or by the timer deadline. */
+  pthread_t self = pthread_self();
+  int prev;
+  do {
+    int one = 1;
+    __atomic_compare_exchange_n(&m->state, &one, 2, 0,
+                                __ATOMIC_RELAXED, __ATOMIC_RELAXED);
+    long ms = __abstime_rel_ms(abstime);
+    if (ms == 0)
       return ETIMEDOUT;
-    struct timespec nap = {0, 1000000}; /* 1 ms */
-    nanosleep(&nap, NULL);
-    if (pthread_mutex_trylock(m) == 0)
-      return 0;
-  }
+    long rc = syscall(SYS_FUTEX, &m->state, FUTEX_WAIT, 2, ms);
+    if (rc == -ETIMEDOUT)
+      return ETIMEDOUT;
+    prev = __atomic_exchange_n(&m->state, 2, __ATOMIC_ACQUIRE);
+  } while (prev != 0);
+
+  __atomic_store_n(&m->owner, self, __ATOMIC_RELEASE);
+  m->recursion = (m->kind == PTHREAD_MUTEX_RECURSIVE) ? 1 : 0;
+  return 0;
 }
 
 /* ── Barrier ── (mutex + condvar; phase counter avoids lost wakeups) */

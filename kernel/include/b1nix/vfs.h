@@ -48,7 +48,7 @@ struct acl_entry {
   u16 perms;     /* Permission bitmask */
 };
 
-#define ACL_MAX_ENTRIES 8
+#define ACL_MAX_ENTRIES 16
 
 /* ACL tag types */
 #define ACL_USER_OBJ 0x01
@@ -322,9 +322,9 @@ struct vfs_file_ops {
 };
 
 #define MAX_VFS_NODES 4096
-#define MAX_VFS_PIPES 64
-#define MAX_MOUNTS 16
-#define PIPE_BUFFER_SIZE 512
+#define MAX_VFS_PIPES 128
+#define MAX_MOUNTS 32
+#define PIPE_BUFFER_SIZE 4096
 #define TTY_INPUT_SIZE 256
 
 struct vfs_pipe {

@@ -7,8 +7,8 @@
 #define ROOT_UID 0
 #define ROOT_GID 0
 
-#define MAX_USERS  16
-#define MAX_GROUPS 8
+#define MAX_USERS  64
+#define MAX_GROUPS 32
 
 /* ── User structure ── */
 struct user {

@@ -25,7 +25,7 @@ static u16 bswap16(u16 value)
 	return (u16)((value << 8) | (value >> 8));
 }
 
-#define ARP_TABLE_SIZE 16
+#define ARP_TABLE_SIZE 64
 struct arp_entry {
 	struct ipv4_addr ip;
 	struct mac_addr mac;

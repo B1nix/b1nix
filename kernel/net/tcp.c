@@ -57,7 +57,7 @@ struct tcp_pseudo {
  * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
-#define MAX_TCP_CONNS 32
+#define MAX_TCP_CONNS 64
 #define TCP_RECV_BUF_SIZE 4096
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460

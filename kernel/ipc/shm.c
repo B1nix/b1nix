@@ -29,7 +29,7 @@ struct proc_attachments {
     struct shm_attach attaches[SHM_MAX_ATTACH_PER_PROC];
 };
 
-#define MAX_PROC_ATTACH 16
+#define MAX_PROC_ATTACH 32
 static struct proc_attachments proc_attaches[MAX_PROC_ATTACH];
 
 /* ── Forward declarations ── */

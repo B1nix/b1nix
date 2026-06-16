@@ -9,6 +9,7 @@
 #include <b1nix/mqueue.h>
 #include <b1nix/net.h>
 #include <b1nix/posix.h>
+#include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
 #include <b1nix/syscall.h>
@@ -3072,6 +3073,22 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
     return 0;
   }
+  case SYS_SETTIMEOFDAY: {
+    /* SYS_SETTIMEOFDAY(const struct timeval *tv) — set the wall clock. Only
+     * root may step the clock (POSIX EPERM otherwise). Backed by the RTC time
+     * offset so every subsequent time read reflects the new value. */
+    struct cred *c = scheduler_get_current_cred();
+    if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_TIME)))
+      return (u64)-EPERM;
+    if (!arg0) return (u64)-EFAULT;
+    struct timeval tv;
+    if (syscall_copyin(&tv, (const void *)(usize)arg0, sizeof(tv)) != 0)
+      return (u64)-EFAULT;
+    if (tv.tv_sec < 0 || tv.tv_usec < 0 || tv.tv_usec >= 1000000)
+      return (u64)-EINVAL;
+    rtc_set_unix_time((u64)tv.tv_sec);
+    return 0;
+  }
   case SYS_IO_SETUP:
     return sys_io_setup((u32)arg0, (u64 *)(usize)arg1);
   case SYS_IO_SUBMIT:
@@ -3086,8 +3103,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * Returns the new TID on success or -errno on failure. */
     return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5);
   case SYS_FUTEX:
-    /* SYS_FUTEX(uaddr, op, val) — minimal WAIT/WAKE only. */
-    return (u64)scheduler_futex(arg0, (int)arg1, (int)arg2);
+    /* SYS_FUTEX(uaddr, op, val, timeout_ms) — WAIT/WAKE. timeout_ms>0 arms a
+     * relative deadline on WAIT (returns -ETIMEDOUT on expiry); 0 = forever. */
+    return (u64)scheduler_futex(arg0, (int)arg1, (int)arg2, arg3);
   case SYS_SET_TLS: {
     /* SYS_SET_TLS(addr) — set this task's FS base. Takes effect on the
      * next return-to-userspace transition (the scheduler reloads MSR_FS_BASE

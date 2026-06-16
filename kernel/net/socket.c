@@ -13,7 +13,7 @@ struct udp_binding {
   u16 port;
   struct vfs_handle *handle;
 };
-#define MAX_UDP_BINDINGS 64
+#define MAX_UDP_BINDINGS 128
 struct udp_binding udp_bindings[MAX_UDP_BINDINGS];
 
 static u16 ntoh16(u16 value) {
