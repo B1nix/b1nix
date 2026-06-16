@@ -110,10 +110,10 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --disable-gopher --disable-imap --disable-mqtt --disable-pop3 \
     --disable-rtsp --disable-smb --disable-smtp --disable-telnet \
     --disable-tftp --disable-dict --disable-manual --disable-docs \
-    --disable-threaded-resolver --enable-ipv6 --enable-unix-sockets \
-    --enable-cookies --disable-alt-svc --disable-hsts \
-    --disable-websockets --disable-headers-api \
-    --disable-dateparse \
+    --enable-threaded-resolver --enable-ipv6 --enable-unix-sockets \
+    --enable-cookies --enable-alt-svc --enable-hsts \
+    --enable-websockets --enable-headers-api \
+    --enable-dateparse \
     --with-ca-bundle=/etc/ssl/certs/ca-certificates.crt \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     CPPFLAGS="$TLS_CPPFLAGS" LDFLAGS="$TLS_LDFLAGS" LIBS="$TLS_LIBS"

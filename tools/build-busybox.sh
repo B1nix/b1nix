@@ -97,20 +97,9 @@ for bb_src in procps/free.c procps/uptime.c procps/ps.c procps/vmstat.c; do
     fi
 done
 
-# BusyBox 1.38 added libbb/alloc_affinity.c which #include <sched.h> for
-# CPU-affinity syscalls (sched_getaffinity). b1nix has no CPU-affinity syscall,
-# so replace the file with a stub that returns a single-CPU mask (CPU 0).
-if [ -f "$SRC_DIR/libbb/alloc_affinity.c" ] && ! grep -q "__b1nix__" "$SRC_DIR/libbb/alloc_affinity.c"; then
-    cat > "$SRC_DIR/libbb/alloc_affinity.c" << 'ALLOFF'
-#include "libbb.h"
-unsigned long* FAST_FUNC get_malloc_cpu_affinity(int pid UNUSED_PARAM, unsigned *sz) {
-    unsigned long *mask = xzalloc(*sz);
-    if (*sz >= sizeof(long)) mask[0] = 1;
-    *sz = sizeof(long);
-    return mask;
-}
-ALLOFF
-fi
+# BusyBox 1.38's libbb/alloc_affinity.c calls sched_getaffinity(). b1nix libc
+# now implements that (SYS_SCHED_GETAFFINITY, reporting the online-CPU set), so
+# the upstream file builds and works as-is — no override needed.
 
 # BusyBox 1.38 miscutils/tree.c uses scandir() + alphasort() which b1nix libc
 # does not provide. Replace the scandir/alphasort call with opendir/readdir/

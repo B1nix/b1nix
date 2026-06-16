@@ -3089,6 +3089,25 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     rtc_set_unix_time((u64)tv.tv_sec);
     return 0;
   }
+  case SYS_SCHED_GETAFFINITY: {
+    /* sched_getaffinity(pid, cpusetsize, mask). b1nix does not pin userspace
+     * tasks to CPUs, so every task may run on any online CPU — report the set
+     * of online CPUs (bits 0..online-1). Returns the number of bytes written,
+     * matching the Linux raw-syscall convention. */
+    extern int get_online_cpu_count(void);
+    usize cpusetsize = (usize)arg1;
+    void *umask = (void *)(usize)arg2;
+    if (!umask || cpusetsize == 0) return (u64)-EINVAL;
+    int online = get_online_cpu_count();
+    if (online < 1) online = 1;
+    u8 kmask[128];
+    usize n = cpusetsize < sizeof(kmask) ? cpusetsize : sizeof(kmask);
+    memset(kmask, 0, n);
+    for (int c = 0; c < online && (usize)(c / 8) < n; c++)
+      kmask[c / 8] |= (u8)(1u << (c % 8));
+    if (syscall_copyout(umask, kmask, n) != 0) return (u64)-EFAULT;
+    return (u64)n;
+  }
   case SYS_IO_SETUP:
     return sys_io_setup((u32)arg0, (u64 *)(usize)arg1);
   case SYS_IO_SUBMIT:

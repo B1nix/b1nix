@@ -95,6 +95,8 @@ stage build-libnsgif.sh
 stage build-libnsbmp.sh
 stage build-libnslog.sh
 stage build-libnsfb.sh
+stage build-libjpeg.sh   # libjpeg.a — JPEG image decoding
+stage build-libwebp.sh   # libwebp.a — WebP image decoding
 stage build-openlibm.sh   # libm.a (NetSurf + libpng need cos/sin/floor/pow/modf)
 
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
@@ -257,6 +259,8 @@ emit_pc libnsutils      "-lnsutils"       ""
 emit_pc libnsgif        "-lnsgif"         ""
 emit_pc libnsbmp        "-lnsbmp"         ""
 emit_pc libnslog        "-lnslog"         ""
+emit_pc libjpeg         "-ljpeg"          ""
+emit_pc libwebp         "-lwebp"          ""
 # libnsfb is always linked by the framebuffer frontend. NetSurf already adds its
 # own -lm (after -lpng16), so only the compat shims go here — and they must come
 # last so libm's fenv/scalbnl/creal references resolve against them.
@@ -555,9 +559,21 @@ EOF
   perl -0pi -e 's{\t\tframebuffer_run\(\);}{\t\tif (fb_b1nix_input)\n\t\t\tframebuffer_input_run(nsfb, bw);\n\t\telse if (fb_b1nix_test)\n\t\t\tframebuffer_test_run(nsfb, bw);\n\t\telse\n\t\t\tframebuffer_run();}' "$GUI_C"
 fi
 
+# ── 1c. nsgenbind host tool — generates the Duktape<->DOM JS bindings ──
+# Needed when NETSURF_USE_DUKTAPE=YES: content/handlers/javascript/duktape's
+# Makefile invokes `nsgenbind` from PATH. Build it (host tool) from the
+# source-full bundle into the sysroot and prepend $SYSROOT/bin to PATH.
+NSALL_DIR="$SRC_PARENT/netsurf-all-${NS_VERSION}"
+if [ ! -x "$SYSROOT/bin/nsgenbind" ] && [ -d "$NSALL_DIR/nsgenbind" ]; then
+  make -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
+    NSSHARED="$NSALL_DIR/buildsystem" install 1>&2
+fi
+export PATH="$SYSROOT/bin:$PATH"
+
 # ── 2. Drive the NetSurf framebuffer build ──
-# Use the b1nix cross-gcc via the GCCSDK convention. Disable everything that
-# needs network, JS, SVG, sprite, PSL, extra image codecs, or a real iconv.
+# Use the b1nix cross-gcc via the GCCSDK convention. Image codecs PNG/BMP/GIF/
+# JPEG/WebP and Duktape JavaScript are on; SVG, sprite, PSL, JPEG-XL and a real
+# iconv stay off.
 export GCCSDK_INSTALL_ENV="$SYSROOT"
 export GCCSDK_INSTALL_CROSSBIN="$CROSSBIN"
 export PKG_CONFIG_LIBDIR="$PKGDIR"
@@ -574,9 +590,9 @@ make -C "$SRC_DIR" \
   NETSURF_USE_OPENSSL=NO \
   NETSURF_USE_UTF8PROC=NO \
   NETSURF_USE_LIBICONV_PLUG=YES \
-  NETSURF_USE_JPEG=NO \
+  NETSURF_USE_JPEG=YES \
   NETSURF_USE_JPEGXL=NO \
-  NETSURF_USE_WEBP=NO \
+  NETSURF_USE_WEBP=YES \
   NETSURF_USE_PNG=YES \
   NETSURF_USE_BMP=YES \
   NETSURF_USE_GIF=YES \
@@ -584,7 +600,7 @@ make -C "$SRC_DIR" \
   NETSURF_USE_ROSPRITE=NO \
   NETSURF_USE_NSPSL=NO \
   NETSURF_USE_NSLOG=YES \
-  NETSURF_USE_DUKTAPE=NO \
+  NETSURF_USE_DUKTAPE=YES \
   NETSURF_USE_VIDEO=NO \
   NETSURF_USE_HARU_PDF=NO \
   "$@"

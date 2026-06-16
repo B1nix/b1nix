@@ -56,12 +56,20 @@ if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
   mv "$tmp_sub" "$SRC_DIR/config.sub"
 fi
 
-# b1nix local options: turn off everything that needs OS facilities we lack
-# (zlib, PAM, utmp/wtmp/lastlog, syslog) so the build is self-contained.
+# zlib for SSH traffic compression — b1nix has a working zlib port, so stage it
+# and enable the compression transport (was disabled for self-containedness).
+ZLIB_PREFIX="$("$ROOT_DIR/tools/build-zlib.sh" 2>/dev/null | tail -n 1)"
+if [ -z "$ZLIB_PREFIX" ] || [ ! -f "$ZLIB_PREFIX/lib/libz.a" ]; then
+  echo "tools/build-dropbear.sh: zlib build failed" >&2
+  exit 1
+fi
+
+# b1nix local options. PAM/utmp/wtmp/lastlog/syslog still need OS facilities we
+# lack, but zlib compression and DNS host lookup (getaddrinfo) now work.
 cat > "$SRC_DIR/localoptions.h" <<'EOF'
 /* b1nix Dropbear build options (overrides default_options.h). */
 #define DROPBEAR_SMALL_CODE 1
-#define DO_HOST_LOOKUP 0
+#define DO_HOST_LOOKUP 1
 #define DROPBEAR_SYSLOG 0
 #define DEBUG_TRACE 0
 /* No utmp/wtmp/lastlog/PAM on b1nix. */
@@ -87,7 +95,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
   ./configure \
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
-    --disable-zlib \
+    --enable-zlib \
     --disable-pam \
     --disable-syslog \
     --disable-lastlog \
@@ -97,6 +105,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
     --disable-pututline --disable-pututxline \
     --disable-harden \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+    CPPFLAGS="-I$ZLIB_PREFIX/include" LDFLAGS="-L$ZLIB_PREFIX/lib" LIBS="-lz" \
     1>&2
 )
 fi

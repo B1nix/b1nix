@@ -18,6 +18,7 @@
 #include <termios.h>
 #include <poll.h>
 #include <errno.h>
+#include <sched.h>
 #include <sys/klog.h>
 #include <sys/sysinfo.h>
 #include <sys/times.h>
@@ -1556,6 +1557,17 @@ int sched_get_priority_max(int policy) { (void)policy; return 0; }
 int sched_get_priority_min(int policy) { (void)policy; return 0; }
 
 int sched_getcpu(void) { return getcpu(); }
+
+/* sched_getaffinity(2): fill `mask` with the set of CPUs the task may run on
+ * (all online CPUs on b1nix). Returns 0 on success. */
+int sched_getaffinity(int pid, size_t cpusetsize, cpu_set_t *mask) {
+  long rc = syscall(SYS_SCHED_GETAFFINITY, pid, cpusetsize, mask);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
 
 /* flock(2) whole-file advisory lock, backed by fcntl record locking. */
 int flock(int fd, int operation) {

@@ -60,6 +60,12 @@ while [ $# -gt 0 ]; do
     *.c|*.S|*.s|*.o|*.a)
       inputs="$inputs $1"
       ;;
+    -lpthread|-lc|-lm|-lrt|-ldl|-lutil|-lcrypt|-lresolv|-lnsl)
+      # These are all provided by libb1nix.a (always whole-archived below), so
+      # there is no standalone lib<name>.a to find. Drop them — otherwise a port
+      # configured with --enable-threads (gnulib emits -lpthread) or that links
+      # -lrt/-ldl fails at ld with "unable to find -lX".
+      ;;
     -l*|-L*)
       ldargs="$ldargs $1"
       ;;

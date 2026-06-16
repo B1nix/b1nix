@@ -128,6 +128,13 @@ fi
 
 make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o"
 
+# zlib for Content-Encoding (gzip/deflate) transfer support.
+ZLIB_PREFIX="$("$ROOT_DIR/tools/build-zlib.sh" 2>/dev/null | tail -n 1)"
+if [ -z "$ZLIB_PREFIX" ] || [ ! -f "$ZLIB_PREFIX/lib/libz.a" ]; then
+  echo "tools/build-wget.sh: zlib build failed" >&2
+  exit 1
+fi
+
 (
   cd "$BUILD_DIR"
   BUILD_TRIPLET="$("$SRC_DIR/build-aux/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
@@ -140,14 +147,15 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
     --with-ssl=openssl \
-    --without-zlib \
+    --with-zlib \
     --with-libpsl \
     --enable-iri \
     --disable-pcre \
-    --disable-threads \
+    --enable-threads=posix \
     --disable-nls \
     --enable-ipv6 \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+    CPPFLAGS="-I$ZLIB_PREFIX/include" LDFLAGS="-L$ZLIB_PREFIX/lib" \
     gl_cv_func_getpass_good=yes \
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
     PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \
