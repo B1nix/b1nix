@@ -1,5 +1,6 @@
 #include <dirent.h>
 #include <stdlib.h>
+#include <string.h>
 #include <fcntl.h>
 #include <unistd.h>
 #include "syscall.h"
@@ -99,4 +100,63 @@ void rewinddir(DIR *dirp)
     dirp->count = 0;
     dirp->index = 0;
     dirp->eof = 0;
+}
+
+/* POSIX scandir(3): read every entry of `dir`, keep the ones `filter` accepts
+ * (or all if filter==NULL), sort them with `compar`, and return a malloc'd
+ * array of malloc'd struct dirent* via *namelist. Returns the count, or -1 on
+ * error (with the partial array freed). */
+int scandir(const char *dir, struct dirent ***namelist,
+            int (*filter)(const struct dirent *),
+            int (*compar)(const struct dirent **, const struct dirent **))
+{
+    if (!dir || !namelist)
+        return -1;
+
+    DIR *d = opendir(dir);
+    if (!d)
+        return -1;
+
+    struct dirent **list = NULL;
+    size_t count = 0, cap = 0;
+    struct dirent *ent;
+
+    while ((ent = readdir(d)) != NULL) {
+        if (filter && !filter(ent))
+            continue;
+        if (count == cap) {
+            size_t ncap = cap ? cap * 2 : 16;
+            struct dirent **nl = realloc(list, ncap * sizeof(*list));
+            if (!nl)
+                goto fail;
+            list = nl;
+            cap = ncap;
+        }
+        struct dirent *copy = malloc(sizeof(struct dirent));
+        if (!copy)
+            goto fail;
+        *copy = *ent;
+        list[count++] = copy;
+    }
+    closedir(d);
+
+    if (count > 1 && compar)
+        qsort(list, count, sizeof(*list),
+              (int (*)(const void *, const void *))compar);
+
+    *namelist = list;
+    return (int)count;
+
+fail:
+    for (size_t i = 0; i < count; i++)
+        free(list[i]);
+    free(list);
+    closedir(d);
+    return -1;
+}
+
+/* POSIX alphasort(3): compare two scandir entries by name. */
+int alphasort(const struct dirent **a, const struct dirent **b)
+{
+    return strcmp((*a)->d_name, (*b)->d_name);
 }

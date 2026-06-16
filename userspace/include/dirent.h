@@ -19,6 +19,10 @@ struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
 int dirfd(DIR *dirp);
 void rewinddir(DIR *dirp);
+int scandir(const char *dir, struct dirent ***namelist,
+            int (*filter)(const struct dirent *),
+            int (*compar)(const struct dirent **, const struct dirent **));
+int alphasort(const struct dirent **a, const struct dirent **b);
 
 #ifdef __cplusplus
 }

@@ -148,7 +148,7 @@ if [ ! -f "$SRC_DIR/config.h" ]; then
     --enable-readline \
     --enable-history \
     --enable-job-control \
-    --disable-net-redirections \
+    --enable-net-redirections \
     --disable-rpath \
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     CFLAGS_FOR_BUILD="-O2 -std=gnu17" \

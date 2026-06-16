@@ -35,11 +35,15 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 CFG="$SRC_DIR/include/mbedtls/mbedtls_config.h"
-if grep -q '^#define MBEDTLS_HAVE_TIME$' "$CFG"; then
-  sed -i.bak 's/^#define MBEDTLS_HAVE_TIME$/\/\* #undef MBEDTLS_HAVE_TIME \*\//' "$CFG"
+# Enable time/date support: b1nix libc provides time() (SYS_TIME) and gmtime_r,
+# and the wall clock is now settable (settimeofday / SYS_SETTIMEOFDAY), so
+# mbedTLS can validate certificate notBefore/notAfter windows. Re-enable the
+# config if a prior build had undef'd it (idempotent).
+if grep -q '^/\* #undef MBEDTLS_HAVE_TIME \*/$' "$CFG"; then
+  sed -i.bak 's@^/\* #undef MBEDTLS_HAVE_TIME \*/$@#define MBEDTLS_HAVE_TIME@' "$CFG"
 fi
-if grep -q '^#define MBEDTLS_HAVE_TIME_DATE$' "$CFG"; then
-  sed -i.bak 's/^#define MBEDTLS_HAVE_TIME_DATE$/\/\* #undef MBEDTLS_HAVE_TIME_DATE \*\//' "$CFG"
+if grep -q '^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$' "$CFG"; then
+  sed -i.bak 's@^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$@#define MBEDTLS_HAVE_TIME_DATE@' "$CFG"
 fi
 if grep -q '^#define MBEDTLS_TIMING_C$' "$CFG"; then
   sed -i.bak 's/^#define MBEDTLS_TIMING_C$/\/\* #undef MBEDTLS_TIMING_C \*\//' "$CFG"
@@ -52,6 +56,17 @@ if grep -q '^/\* #undef MBEDTLS_PSA_CRYPTO_C \*/$' "$CFG"; then
   sed -i.bak 's@^/\* #undef MBEDTLS_PSA_CRYPTO_C \*/$@#define MBEDTLS_PSA_CRYPTO_C@' "$CFG"
 fi
 rm -f "$CFG.bak"
+
+# MBEDTLS_HAVE_TIME pulls in mbedtls_ms_time(), whose implementation is gated on
+# _POSIX_VERSION >= 199309L. b1nix does not advertise that macro, yet the body
+# only needs clock_gettime(CLOCK_MONOTONIC) and time() — both of which b1nix
+# libc provides — so the gate, not the code, is the problem. Teach the gate to
+# accept b1nix (the -Db1nix macro is always passed by the cross wrapper).
+PLATFORM_UTIL="$SRC_DIR/library/platform_util.c"
+if ! grep -q 'defined(b1nix)' "$PLATFORM_UTIL"; then
+  sed -i.bak 's@^#if (defined(_POSIX_VERSION) && _POSIX_VERSION >= 199309L) || defined(__HAIKU__)$@#if (defined(_POSIX_VERSION) \&\& _POSIX_VERSION >= 199309L) || defined(__HAIKU__) || defined(b1nix)@' "$PLATFORM_UTIL"
+  rm -f "$PLATFORM_UTIL.bak"
+fi
 
 # On b1nix, /dev/urandom is not guaranteed, but getrandom(2) is.
 # Inject a tiny platform hook so mbedTLS entropy poll uses getrandom directly.
