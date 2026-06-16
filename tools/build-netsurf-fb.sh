@@ -24,6 +24,35 @@ SYSROOT="$ROOT_DIR/build/netsurf-sysroot/$B1NIX_TRIPLET"
 PKGDIR="$SYSROOT/lib/pkgconfig"
 CROSSBIN="$TOOLCHAIN_BUILD_HOME/cross/bin"
 
+# ── 0. Fetch the main NetSurf tree if absent ──
+# The per-library tarballs (libcss, libhubbub, ...) are fetched by their own
+# build-lib*.sh scripts, but the browser core itself is not. Pull it from the
+# upstream "source-full" bundle (netsurf-all-<ver>), which unpacks to
+# netsurf-all-<ver>/netsurf/, and stage that subtree as $SRC_DIR.
+NS_BUNDLE="netsurf-all-${NS_VERSION}.tar.gz"
+NS_URL="https://download.netsurf-browser.org/netsurf/releases/source-full/${NS_BUNDLE}"
+if [ ! -d "$SRC_DIR" ]; then
+  mkdir -p "$SRC_PARENT"
+  tarball="$SRC_PARENT/$NS_BUNDLE"
+  if [ ! -f "$tarball" ]; then
+    if command -v curl >/dev/null 2>&1; then
+      curl -fL --retry 3 "$NS_URL" -o "$tarball"
+    elif command -v wget >/dev/null 2>&1; then
+      wget -O "$tarball" "$NS_URL"
+    else
+      echo "tools/build-netsurf-fb.sh: need host curl or wget to fetch $NS_URL" >&2
+      exit 1
+    fi
+  fi
+  tar -xzf "$tarball" -C "$SRC_PARENT"
+  if [ -d "$SRC_PARENT/netsurf-all-${NS_VERSION}/netsurf" ]; then
+    cp -a "$SRC_PARENT/netsurf-all-${NS_VERSION}/netsurf" "$SRC_DIR"
+  else
+    echo "tools/build-netsurf-fb.sh: $NS_BUNDLE did not contain a netsurf/ subtree" >&2
+    exit 1
+  fi
+fi
+
 if [ "$B1NIX_ARCH" = "x86" ]; then NSC_TARGET="i686-unknown-elf"; else NSC_TARGET="x86_64-unknown-elf"; fi
 
 mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$PKGDIR"

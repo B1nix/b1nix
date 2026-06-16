@@ -122,6 +122,17 @@ if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
     cd ..
 fi
 
+# ── 4b. Stage the b1nix libc headers into the sysroot ───────────────────────
+# cross-GCC is configured with --enable-threads=posix, so libgcc's gthr-posix
+# (#include <pthread.h>) needs the b1nix headers visible in the sysroot. They
+# are produced by the clang-built userspace libc (no cross-GCC dependency), so
+# stage them now — without this, all-target-libgcc dies with
+# "pthread.h: No such file or directory".
+if [ ! -f "$B1NIX_ROOTFS/include/pthread.h" ]; then
+    echo "Staging b1nix libc headers into sysroot ($B1NIX_ROOTFS)..."
+    make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
+fi
+
 # ── 5. Build cross-GCC ───────────────────────────────────────────────────────
 if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
     echo "Building Cross-GCC (bootstrap)..."
