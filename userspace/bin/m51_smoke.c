@@ -1,7 +1,7 @@
 /* M51 rung 0: verify the ported libm (openlibm) actually computes at runtime.
  * Inputs are volatile so the compiler cannot constant-fold the calls away —
  * this is exactly the path the old recursive-inline math.h turned into a
- * `jmp .` hang (see docs/m51-plan.md). */
+ * `jmp .` hang. */
 #include <math.h>
 #include <string.h>
 #include <unistd.h>

@@ -3,9 +3,7 @@
 This document tracks the per-port features that were disabled when each upstream
 project was first ported (to get it building at all), which ones have since been
 **enabled** as the OS gained the required syscalls/libc APIs, and the remaining
-**milestones** for full feature parity. The original "what is disabled and why"
-inventory lives in [`../crutches_audit_report.md`](../crutches_audit_report.md)
-and [`dehardcode-audit.md`](dehardcode-audit.md).
+**milestones** for full feature parity.
 
 Rule of thumb: a port feature is only flipped on once the underlying kernel/libc
 capability is real (no fake markers), and every flip is re-verified by the full

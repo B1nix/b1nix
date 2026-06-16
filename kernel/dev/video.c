@@ -29,9 +29,8 @@ usize video_adapter_count(void)
  * bootinfo_get()->framebuffer. There is no hardcoded mode. Real
  * dynamic mode-setting (VBE INT 10h or UEFI GOP) is out of scope:
  * we boot via BIOS+GRUB in long mode, so INT 10h would require a
- * v86 emulator we don't have; GOP would require UEFI boot. See
- * docs/dehardcode-audit.md "A3" — already runtime-driven via the
- * boot framebuffer; deeper mode-set deferred. */
+ * v86 emulator we don't have; GOP would require UEFI boot. Already
+ * runtime-driven via the boot framebuffer; deeper mode-set deferred. */
 #define VIDEO_MAX_ADAPTERS 8
 
 struct video_adapter {

@@ -11,8 +11,7 @@ Status:
 
 Supporting documents:
 
-- POSIX work: [`posix-branches.md`](posix-branches.md) and
-  [`posix-requirements.md`](posix-requirements.md).
+- POSIX work: [`posix-requirements.md`](posix-requirements.md).
 - Architecture ports: [`porting-guide.md`](porting-guide.md).
 - Userspace ABI: [`abi.md`](abi.md).
 
@@ -167,7 +166,6 @@ Supporting documents:
 - [x] Port GCC and GNU Binutils for `x86_64-b1nix`.
 - [x] Build the kernel inside B1NIX and boot the resulting artifact.
 - [x] Formalize VFS references, inode locking, and expected error matrices.
-- Details: [`m26-selfhost.md`](m26-selfhost.md).
 
 ## M18: Real Userspace and ELF Loader
 
@@ -233,7 +231,6 @@ Supporting documents:
 - [x] Add cross-CPU work stealing for eligible kernel workers.
 - [x] Run userspace on APs; later remove the temporary Big Kernel Lock in M28.
 - [x] Deliver preemptive SMP scheduling in M28 and POSIX threads in M29.
-- Details: [`m24b-bkl.md`](m24b-bkl.md).
 
 ## M25: Minimal Native C Toolchain
 
@@ -255,7 +252,6 @@ Supporting documents:
 - [x] Add heap splitting, coalescing, page return, and a large-allocation arena.
 - [x] Make swap reclaim work under pressure.
 - [x] Complete self-hosting at 256 MiB; lower memory targets are out of scope.
-- Details: [`m26-selfhost.md`](m26-selfhost.md).
 
 ## M27: Terminal OS Polish
 
@@ -265,7 +261,6 @@ Supporting documents:
 - [x] Keep text/serial operation as a first-class mode.
 - [x] Add first-boot persistent-root setup and a usage guide.
 - [x] Document the POSIX compatibility matrix.
-- Details: [`m27-polish.md`](m27-polish.md).
 
 ## M28: Preemptive SMP Scheduling and Fine-Grained Locking
 
@@ -276,7 +271,6 @@ Supporting documents:
 - [x] Fix cross-CPU task state and stack-lifetime races.
 - [x] Optimize PMM/heap contention and verify SMP self-hosting.
 - [x] Benchmark context-switch and syscall overhead.
-- Details: [`m28-locking.md`](m28-locking.md).
 
 ## M29: POSIX Threads and Futexes
 
@@ -329,7 +323,6 @@ Supporting documents:
 - [x] Add `/etc/init.d/sshd` lifecycle management.
 - [x] Verify localhost key exchange, authentication, command execution, and PTY
   support.
-- Details: [`m32b-ssh.md`](m32b-ssh.md).
 
 ## M32c: External SSH Access
 
@@ -339,7 +332,6 @@ Supporting documents:
 - [x] Enable normal NIC/DHCP startup and inbound TCP service handling.
 - [x] Add idle, keepalive, authentication, key-storage, and logging defaults.
 - [ ] `deferred` Verify Dropbear access from another machine on bare metal.
-- Details: [`m32c-external-ssh.md`](m32c-external-ssh.md).
 
 ## M33: POSIX Shell and Job Control
 
@@ -356,7 +348,6 @@ Supporting documents:
 - [x] Add dynamic `/proc` system and per-process files.
 - [x] Add `/sys` kernel, CPU, memory, device, and block information.
 - [x] Add `free`, `top`, `ps`, and `sysctl` integration.
-- Details: [`m34-m36-diagnostics.md`](m34-m36-diagnostics.md).
 
 ## M35: Core Dumps and Analysis
 
@@ -381,7 +372,6 @@ Supporting documents:
 - [x] `parked` ISO9660/loop-backed live boot works in QEMU but awaits installer
   and real-hardware hardening.
 - [x] `parked` Read-only exFAT live-image fallback is experimental.
-- Details: [`m37-real-hardware.md`](m37-real-hardware.md).
 
 ## M38: Sound
 
@@ -402,7 +392,7 @@ Supporting documents:
 - [x] Replace hardcoded boot programs with file-based services (inittab-driven
   supervisor with a SysV rate-based respawn storm guard; legacy path kept as
   fallback).
-- Details: [`m39-init.md`](m39-init.md). Verified by `M39-INIT` smoke markers
+- Verified by `M39-INIT` smoke markers
   (single-CPU and `-smp 4`, both arches) and the end-to-end
   `tests/serial-getty.sh` login-over-serial test.
 
@@ -435,7 +425,6 @@ Source-level ports remain preferable to a Linux compatibility layer.
 - [x] Retire the local in-kernel BusyBox-style utility implementation.
 - [ ] `planned` Replace userspace-provided `sa_restorer` with a kernel-owned
   signal-return trampoline.
-- Details: [`busybox-port.md`](busybox-port.md).
 
 ## M43: Real-Filesystem Validation and NTFS
 
@@ -472,7 +461,7 @@ Source-level ports remain preferable to a Linux compatibility layer.
   `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
   character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
   `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
-- Details: [`bash-port.md`](bash-port.md). Verified by `BASH-SMOKE` +
+- Verified by `BASH-SMOKE` +
   `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.
 
 ## M46: VFS Integrity and POSIX Process Conformance
@@ -551,8 +540,7 @@ mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
 ## M47: Userspace Display Server
 
 Own compositor, initially validated with a temporary Wayland-shaped protocol
-that M49 replaced with real Wayland. Design and decision record:
-[`display-server.md`](display-server.md).
+that M49 replaced with real Wayland.
 
 - [x] Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
   ioctl) over virtio-gpu; kernel `compositor.c` becomes the console fallback
@@ -584,8 +572,7 @@ that M49 replaced with real Wayland. Design and decision record:
 ## M48: UNIX-Socket FD Passing and memfd
 
 Kernel prerequisite for real Wayland (M49) with standalone POSIX value
-(dbus-style daemons, privilege separation). Details in
-[`display-server.md`](display-server.md).
+(dbus-style daemons, privilege separation).
 
 - [x] Add `sendmsg`/`recvmsg` with ancillary data on UNIX sockets.
 - [x] Add `SCM_RIGHTS` fd transfer with correct refcounting,
@@ -598,7 +585,7 @@ Kernel prerequisite for real Wayland (M49) with standalone POSIX value
 ## M49: Wayland Protocol Compatibility
 
 Builds on M47's Wayland-shaped core + M48's fd passing; mapping is 1:1 by
-construction. Details in [`display-server.md`](display-server.md).
+construction.
 
 - [x] Port upstream `libwayland-client` 1.25.0 (plus libffi 3.5.2) and run it
   against `displayd`; the compositor remains a deliberately small native
@@ -624,8 +611,6 @@ construction. Details in [`display-server.md`](display-server.md).
   poll/read flip events, and close/munmap cleanup.
 
 ## M51: Desktop Graphics Stack
-
-Port plan and progress: [`m51-plan.md`](m51-plan.md).
 
 - [x] Prerequisite: port a real libm (openlibm) — the previous `math.h` had no
   working runtime libm (recursive-inline `jmp .` trap). `M51-GFX: ok libm`.
@@ -656,8 +641,9 @@ completed, and the Cairo desktop app demo running. Nothing deferred.
 
 ## M52: Mesa and Accelerated OpenGL
 
-See [`docs/m52-opengl.md`](m52-opengl.md) for the design and the VirGL
-environment constraint.
+Software EGL/TinyGL plus Mesa OSMesa softpipe, GLSL shaders, and VirGL 3D
+hardware acceleration (host virtio-gpu-gl). VirGL needs a host with
+virglrenderer; the smoke auto-detects it and honestly skips elsewhere.
 
 - [x] `done` Software OpenGL + EGL: ported TinyGL (software GL 1.1 subset) as
   `libTinyGL.a` and a b1nix `libEGL.a` shim (`userspace/libegl/b1egl.c`,

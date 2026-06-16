@@ -4,7 +4,7 @@
  * race the moment the iteration count crossed ~1000 (same shape #2 the
  * M14 iretq fault took, before the stack_released lease landed); even
  * with the lease fixed, SMP at this syscall density is still
- * unstable for reasons documented in docs/m28-t4-blocker.md. Single CPU
+ * unstable at this syscall density. Single CPU
  * is unaffected and gives the only baseline numbers worth comparing
  * against any future T4 work.
  *
@@ -38,7 +38,7 @@ void m28_ctxbench_run(void) {
     if (cpus > 1) {
         console_write("M28-BENCH: skip smp (cpus=");
         console_write_dec(cpus);
-        console_write(", see docs/m28-t4-blocker.md)\n");
+        console_write(")\n");
         return;
     }
 

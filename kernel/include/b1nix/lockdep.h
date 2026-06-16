@@ -8,7 +8,7 @@
  * Build with -DKERNEL_LOCKDEP=1 to enable. Default off so production builds
  * pay zero cost: every entry/exit point becomes a no-op the optimiser drops.
  *
- * The DAG (see docs/m28-locking.md) assigns each lock a monotonic level —
+ * The lock-order DAG assigns each lock a monotonic level —
  * outer locks have small numbers, inner locks have large numbers. A thread
  * already holding level N may only acquire level M when M > N. Any attempt
  * to acquire at M <= N panics with the held-lock stack.

@@ -163,7 +163,7 @@ CROSS_TOOLCHAIN_ROOT := $(shell \
 # Lockdep-light (M28 #2): debug-only lock-order validator. Off by default
 # (zero cost — the LOCKDEP_* macros compile to no-ops). Enable with
 # `make ... LOCKDEP=1` to panic on a lock-order inversion / out-of-order
-# release against the DAG in docs/m28-locking.md. Never ship with it on.
+# release against the lock-order DAG. Never ship with it on.
 ifeq ($(LOCKDEP),1)
 CFLAGS_EXTRA += -DKERNEL_LOCKDEP=1
 endif

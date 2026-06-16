@@ -10,7 +10,7 @@
 #
 # Memory files live in docs/agent-memory/ (gitignored — they are internal working
 # notes, not committed). On a host that does not have them yet, carry them over
-# with the b1nix-claude-memory.tar.gz bundle (see docs/HANDOFF.md).
+# with the b1nix-claude-memory.tar.gz bundle.
 #
 # Usage:
 #   sh tools/install-claude-memory.sh            # repo = git root of this script

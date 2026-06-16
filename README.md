@@ -259,8 +259,7 @@ and stages the B1NIX source tree at:
 /usr/src/b1nix
 ```
 
-Detailed ABI and self-hosting notes are in [docs/abi.md](docs/abi.md) and
-[docs/m26-selfhost.md](docs/m26-selfhost.md).
+Detailed ABI notes are in [docs/abi.md](docs/abi.md).
 
 ## Real Hardware
 
@@ -275,8 +274,7 @@ This destroys the selected drive. Secure Boot must be disabled.
 
 The boot path, framebuffer, e1000-family NIC, AHCI/NVMe, and xHCI keyboard
 drivers are designed for physical x86_64 machines, but hardware coverage is
-still limited and some controller-specific quirks remain unverified. Read
-[docs/m37-real-hardware.md](docs/m37-real-hardware.md) before trying it.
+still limited and some controller-specific quirks remain unverified.
 
 ## Project Layout
 
@@ -318,10 +316,6 @@ smoke_run/          generated test logs, captures, and temporary images
 - [Userspace ABI](docs/abi.md)
 - [Architecture porting guide](docs/porting-guide.md)
 - [POSIX requirements](docs/posix-requirements.md)
-- [BusyBox port](docs/busybox-port.md)
-- [External SSH](docs/m32c-external-ssh.md)
-- [Diagnostics and tracing](docs/m34-m36-diagnostics.md)
-- [Real-hardware notes](docs/m37-real-hardware.md)
 
 ## License
 

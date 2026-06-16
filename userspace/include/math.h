@@ -39,7 +39,7 @@ extern "C" {
  * `static inline { return __builtin_f(...); }`: the builtin lowers to a call
  * to the same symbol, so an inline wrapper is infinite self-recursion that the
  * optimizer turns into a `jmp .` hang (it only ever "worked" when the args were
- * compile-time constant and folded). See docs/m51-plan.md. */
+ * compile-time constant and folded). */
 double acos(double);
 double asin(double);
 double atan(double);

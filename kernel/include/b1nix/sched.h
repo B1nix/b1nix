@@ -238,7 +238,7 @@ struct task {
    * returns to kheap, gets handed to some other allocation, and CPU A's
    * subsequent stack pushes (or, much later, the iret frame on this
    * page after a context-switch-back) land on corrupted bytes —
-   * shape #1/#2 from docs/m28-t4-blocker.md.
+   * shape #1/#2 of the SMP context-switch-back race.
    *
    * Protocol: the death-path clears `stack_released = 0` BEFORE writing
    * `state = TASK_DEAD` (x86 TSO orders the stores). `arch_context_switch`

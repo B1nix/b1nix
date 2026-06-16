@@ -64,8 +64,7 @@ now print in both passes, and native loads via the correct `ELF32 load:` path.
 
 (At the time this fix landed, `M32B-SSH: ok service-lifecycle` was still failing
 because init auto-skipped sshd on 32-bit; that was fixed separately right after —
-dropbear works on 32-bit now, so init auto-starts it. See
-[`docs/m32b-ssh.md`](m32b-ssh.md).)
+dropbear works on 32-bit now, so init auto-starts it.)
 
 ---
 
