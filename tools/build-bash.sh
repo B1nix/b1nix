@@ -92,6 +92,26 @@ CACHE="$SRC_DIR/config.cache"
 cat > "$CACHE" <<'EOF'
 ac_cv_func_setvbuf_reversed=no
 ac_cv_func_working_mktime=yes
+# b1nix libc has strerror() and does NOT export the legacy sys_errlist/sys_nerr
+# (removed from modern host glibc too). Without these, cross-configure guesses
+# HAVE_SYS_ERRLIST=1 + HAVE_STRERROR undefined, so bash's host build tools
+# (mksyntax/mksignames) compile a strerror replacement that references the
+# absent sys_errlist and fail to link on the build host.
+ac_cv_func_strerror=yes
+bash_cv_sys_errlist=no
+# Cross-configure cannot run probes and guesses these libc functions absent, so
+# bash compiles its own replacements / K&R redeclarations that then conflict
+# with b1nix's string.h prototypes (e.g. "conflicting types for 'strpbrk'").
+# b1nix libc provides all of these, so mark them present.
+ac_cv_func_strpbrk=yes
+ac_cv_func_strstr=yes
+ac_cv_func_strchr=yes
+ac_cv_func_strcasecmp=yes
+ac_cv_func_strncasecmp=yes
+ac_cv_func_strchrnul=yes
+ac_cv_func_strnlen=yes
+ac_cv_func_strdup=yes
+ac_cv_func_mempcpy=yes
 ac_cv_func_getpgrp_void=yes
 ac_cv_sys_restartable_syscalls=yes
 ac_cv_func_strcoll_works=yes

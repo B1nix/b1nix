@@ -167,5 +167,12 @@ fi
     LIBPSL_LIBS="-L$LIBPSL_PREFIX/lib -lpsl"
 )
 
+# wget bundles gnulib, which (under cross-compilation, where it can't run its
+# probe programs) provides its own strndup/strpbrk/strcasecmp/strncasecmp/
+# strtok_r/strchrnul/mempcpy. b1nix-autotools-cc always whole-archives libb1nix.a
+# (which also defines these), so the final link sees duplicates. Tolerate them —
+# both implementations are correct — the same way build-bash.sh does.
+export B1NIX_LD_EXTRA="--allow-multiple-definition"
+
 make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"
 make -C "$BUILD_DIR/src" -j"${JOBS:-4}" wget

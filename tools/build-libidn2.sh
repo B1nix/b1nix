@@ -59,6 +59,16 @@ mkdir -p "$BUILD_DIR"
   CPPFLAGS="-I$UNISTR_PREFIX/include" \
   LDFLAGS="-L$UNISTR_PREFIX/lib" \
   LIBS="-lunistring" \
+  ac_cv_func_strchrnul=yes \
+  ac_cv_have_decl_strchrnul=yes \
+  gl_cv_onwards_func_strchrnul=yes \
+  ac_cv_func_strverscmp=yes \
+  ac_cv_func_rawmemchr=yes \
+  ac_cv_func_getline=yes \
+  ac_cv_func_getdelim=yes \
+  ac_cv_func_getdtablesize=yes \
+  ac_cv_func_basename=yes \
+  ac_cv_func_strerror=yes \
   "$SRC_DIR/configure" \
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
@@ -74,7 +84,29 @@ mkdir -p "$BUILD_DIR"
 
 # Configure is now forced to use external libunistring, but keep single-job
 # build because this cross tree is sensitive to jobserver propagation.
+# Prevent building the `idn2` CLI tool: it links gnulib's strchrnul which
+# conflicts with libb1nix.a's whole-archive'd copy. curl only needs libidn2.a.
 make -C "$BUILD_DIR" -j1 1>&2
-make -C "$BUILD_DIR" install 1>&2
-
+# Install only the library + headers (skip `idn2` CLI tool which conflicts
+# with libb1nix.a's whole-archive'd strchrnul). The targets live in lib/.
+make -C "$BUILD_DIR/lib" install-libLTLIBRARIES 1>&2
+make -C "$BUILD_DIR/lib" install-includeHEADERS 1>&2
+# Strip gnulib replacement objects from libidn2.a that duplicate symbols
+# already provided by libb1nix.a (when linked --whole-archive). These
+# gnulib objects are only needed on systems without a POSIX libc; b1nix
+# libc already provides strerror, getline, etc.
+#
+# NOTE: do NOT strip strverscmp.o — gnulib renames it to rpl_strverscmp
+# (config.h does `#define strverscmp rpl_strverscmp`), so libidn2's own
+# version.c calls rpl_strverscmp. That object exports only rpl_strverscmp
+# (not plain strverscmp), so it does not collide with libb1nix's strverscmp;
+# stripping it leaves rpl_strverscmp undefined and breaks the nsfb/curl link.
+LIBA="$INSTALL_DIR/lib/libidn2.a"
+CONFLICTS="rawmemchr.o strerror.o strerror-override.o"
+for obj in $CONFLICTS; do
+  llvm-ar d "$LIBA" "libgnu_la-$obj" 2>/dev/null || true
+  llvm-ar d "$LIBA" "libunistring_la-$obj" 2>/dev/null || true
+done
+# Also strip basename-lgpl.o (b1nix provides basename)
+llvm-ar d "$LIBA" "libgnu_la-basename-lgpl.o" 2>/dev/null || true
 echo "$INSTALL_DIR"

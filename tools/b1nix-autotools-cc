@@ -32,6 +32,10 @@ else
 fi
 
 COMMON_FLAGS="--target=$TARGET $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE $RES_INC -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -D__STDC_NO_ATOMICS__"
+# Ported code (libffi, libidn2, etc.) often uses memcpy/memset without
+# including <string.h>. Provide it automatically for C files only — not for
+# assembly (.S), which b1nix's string.h (containing inline asm) would confuse.
+C_ONLY_FLAGS="-include string.h"
 
 compile_only=0
 preprocess_only=0
@@ -101,7 +105,9 @@ for input in $inputs; do
       ;;
     *)
       obj="$tmpdir/$(basename "$input").o"
-      clang $COMMON_FLAGS $args -c "$input" -o "$obj"
+      extra=""
+      case "$input" in *.c) extra="$C_ONLY_FLAGS";; esac
+      clang $COMMON_FLAGS $extra $args -c "$input" -o "$obj"
       objs="$objs $obj"
       ;;
   esac
