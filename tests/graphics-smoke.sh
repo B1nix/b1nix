@@ -7,8 +7,15 @@ mkdir -p "$PROJECT_DIR/smoke_run"
 LOG="$PROJECT_DIR/smoke_run/b1nix-graphics-smoke-$ARCH.log"
 TIMEOUT="${TIMEOUT:-180}"
 
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+  NPROC=$(sysctl -n hw.ncpu)
+else
+  NPROC=$(nproc)
+fi
+
 cd "$PROJECT_DIR"
-make ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1
+make -j"$NPROC" ARCH="$ARCH" KERNEL_CMDLINE="b1nix.test=1" iso >/dev/null 2>&1
 
 if [ "$ARCH" = "x86" ]; then
   QEMU=qemu-system-i386

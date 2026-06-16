@@ -8,6 +8,13 @@ set -e
 ARCH="${1:-x86_64}"
 PROJECT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+OS="$(uname -s)"
+if [ "$OS" = "Darwin" ]; then
+	NPROC=$(sysctl -n hw.ncpu)
+else
+	NPROC=$(nproc)
+fi
+
 if [ "$ARCH" = "x86" ]; then
 	ARCH_LABEL="x86   "
 else
@@ -102,7 +109,7 @@ report_progress_line() {
 		esac
 	else
 		case "$line" in
-			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|B1NIX-TEST:*|*PANIC*) ;;
+			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
 			*) return ;;
 		esac
 	fi
@@ -111,7 +118,7 @@ report_progress_line() {
 		*": FAIL"*|*": fail "*|*": failed"*|*PANIC*)
 			printf "  ${PROGRESS_PREFIX:-}${RED}%s${NC}\n" "$line"
 			;;
-		*": ok"*|*": done"*|B1NIX-TEST:\ done)
+		*": ok"*|*": done"*|B1NIX-TEST:\ done|B1NIX-QUICK:\ done)
 			printf "  ${PROGRESS_PREFIX:-}${GREEN}%s${NC}\n" "$line"
 			;;
 		*)
@@ -134,14 +141,16 @@ run_qemu() {
 			filter_dump_args="-object filter-dump,id=f0,netdev=net0,file=${NET_PCAP:-$PROJECT_DIR/smoke_run/net-$ARCH.pcap}"
 		fi
 
-		# Use KVM hardware acceleration when available (Linux /dev/kvm). The
-		# default QEMU accelerator is TCG (pure emulation), which is many times
+		# Use KVM hardware acceleration when available (Linux /dev/kvm) or HVF on macOS.
+		# The default QEMU accelerator is TCG (pure emulation), which is many times
 		# slower — heavy software workloads like the Mesa softpipe demo never
 		# finish a context within the timeout under TCG. Auto-detected so this is
-		# a no-op on hosts without KVM (e.g. macOS), which fall back to TCG.
+		# a no-op on hosts without KVM/HVF, which fall back to TCG.
 		local accel_args=""
 		if [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
 			accel_args="-accel kvm"
+		elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
+			accel_args="-accel hvf"
 		fi
 
 		# RAM: the historical default (no -m → 128 MiB) was enough until the real
@@ -185,6 +194,7 @@ run_qemu() {
 		# Wait for completion marker/panic or timeout, then kill QEMU.
 		# Keep this POSIX-portable (macOS doesn't ship GNU timeout by default).
 		(
+			set +e
 			start_ts=$(date +%s)
 			reported_lines=0
 			while :; do
@@ -223,9 +233,9 @@ run_qemu() {
 		) &
 		local watcher_pid=$!
 
-		wait "$pid" 2>/dev/null || true
 		wait "$watcher_pid" 2>/dev/null || true
 		kill -9 "$pid" 2>/dev/null || true
+		wait "$pid" 2>/dev/null || true
 	else
 		echo "Unknown ARCH: $ARCH"
 		exit 1
@@ -270,17 +280,12 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=core" iso >/dev/null 2>&1 &&
-		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-core.iso" &&
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=graphics" iso >/dev/null 2>&1 &&
-		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-graphics.iso" &&
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=shell" iso >/dev/null 2>&1 &&
-		cp "build/$ARCH/b1nix.iso" "build/$ARCH/b1nix-shell.iso" || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell >/dev/null 2>&1 || {
 			echo "  ${RED}BUILD FAILED${NC}"
 			exit 1
 		}
 	else
-		make ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >/dev/null 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >/dev/null 2>&1 || {
 		echo "  ${RED}BUILD FAILED${NC}"
 		exit 1
 		}

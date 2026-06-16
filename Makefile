@@ -353,7 +353,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-live iso-test iso-full \
+.PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-live iso-test iso-full \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source root-image \
 	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
@@ -860,6 +860,39 @@ iso: $(KERNEL_ELF)
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
+
+iso-core: $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-core/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=core|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
+
+iso-graphics: $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-graphics/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=graphics|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
+
+iso-shell: $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-shell/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=shell|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
 
 iso-live: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
