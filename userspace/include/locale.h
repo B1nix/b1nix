@@ -29,19 +29,15 @@ struct lconv {
     char n_sign_posn;
 };
 
-static inline char *setlocale(int category, const char *locale) {
-    (void)category;
-    (void)locale;
-    return "C";
-}
+#ifdef __cplusplus
+extern "C" {
+#endif
 
-static inline struct lconv *localeconv(void) {
-    static struct lconv lc = {
-        .decimal_point = ".",
-        .thousands_sep = "",
-        .grouping = ""
-    };
-    return &lc;
+char *setlocale(int category, const char *locale);
+struct lconv *localeconv(void);
+
+#ifdef __cplusplus
 }
+#endif
 
 #endif

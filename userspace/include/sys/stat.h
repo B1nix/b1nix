@@ -45,11 +45,14 @@
 #define AT_FDCWD -100
 #define AT_SYMLINK_NOFOLLOW 0x100
 
+#define AT_REMOVEDIR 0x200
+
 #ifdef __cplusplus
 extern "C" {
 #endif
 
 int mknod(const char *pathname, mode_t mode, dev_t dev);
+int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 
 struct timespec;
 int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);

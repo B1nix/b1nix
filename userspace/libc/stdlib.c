@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <pthread.h>
 #include <string.h>
 #include <stdio.h>
 #include "syscall.h"
@@ -146,7 +147,7 @@ static void ma_place(char *bp, size_t asize) {
 	}
 }
 
-void *malloc(size_t size)
+static void *_malloc_unlocked(size_t size)
 {
 	if (size == 0) return 0;
 	size_t payload = (size + (MA_DSIZE - 1)) & ~(MA_DSIZE - 1);
@@ -161,7 +162,7 @@ void *malloc(size_t size)
 	return bp;
 }
 
-void free(void *ptr)
+static void _free_unlocked(void *ptr)
 {
 	if (!ptr) return;
 	size_t size = MA_SIZE(MA_HDR(ptr));
@@ -170,12 +171,37 @@ void free(void *ptr)
 	ma_coalesce((char *)ptr);
 }
 
-void *calloc(size_t nmemb, size_t size)
+static void *_calloc_unlocked(size_t nmemb, size_t size)
 {
 	size_t total = nmemb * size;
 	if (size != 0 && total / size != nmemb) { errno = ENOMEM; return 0; } /* overflow */
-	void *p = malloc(total);
+	void *p = _malloc_unlocked(total);
 	if (p) memset(p, 0, total);
+	return p;
+}
+
+static pthread_mutex_t g_malloc_lock = PTHREAD_MUTEX_INITIALIZER;
+
+void *malloc(size_t size)
+{
+	pthread_mutex_lock(&g_malloc_lock);
+	void *p = _malloc_unlocked(size);
+	pthread_mutex_unlock(&g_malloc_lock);
+	return p;
+}
+
+void free(void *ptr)
+{
+	pthread_mutex_lock(&g_malloc_lock);
+	_free_unlocked(ptr);
+	pthread_mutex_unlock(&g_malloc_lock);
+}
+
+void *calloc(size_t nmemb, size_t size)
+{
+	pthread_mutex_lock(&g_malloc_lock);
+	void *p = _calloc_unlocked(nmemb, size);
+	pthread_mutex_unlock(&g_malloc_lock);
 	return p;
 }
 
@@ -325,17 +351,25 @@ char *realpath(const char *path, char *resolved_path)
 	return resolved_path;
 }
 
-void *realloc(void *ptr, size_t size)
+static void *_realloc_unlocked(void *ptr, size_t size)
 {
-	if (size == 0) { free(ptr); return NULL; }
-	if (!ptr) return malloc(size);
+	if (size == 0) { _free_unlocked(ptr); return NULL; }
+	if (!ptr) return _malloc_unlocked(size);
 	size_t old_payload = MA_SIZE(MA_HDR(ptr)) - MA_DSIZE; /* usable bytes in old block */
-	void *new_ptr = malloc(size);
+	void *new_ptr = _malloc_unlocked(size);
 	if (!new_ptr) return NULL;
 	size_t copy = size < old_payload ? size : old_payload;
 	memcpy(new_ptr, ptr, copy);
-	free(ptr);
+	_free_unlocked(ptr);
 	return new_ptr;
+}
+
+void *realloc(void *ptr, size_t size)
+{
+	pthread_mutex_lock(&g_malloc_lock);
+	void *p = _realloc_unlocked(ptr, size);
+	pthread_mutex_unlock(&g_malloc_lock);
+	return p;
 }
 
 long strtol(const char *nptr, char **endptr, int base)

@@ -33,15 +33,8 @@ smoke suite on **both** arches.
 | **NetSurf** | JPEG + WebP image decoding | libjpeg/libwebp ports staged into the NS sysroot |
 | **NetSurf** | **JavaScript** (bundled Duktape) | nsgenbind host tool builds the DOM bindings |
 | **BusyBox** | upstream `alloc_affinity.c` (CPU-affinity) | real `sched_getaffinity` (stub removed) |
-
-## Deferred (near-term — feasible, blocked on a build detail)
-
-- **curl `--with-libpsl` / `--with-libidn2`.** The libraries are already built
-  for the ported wget, but curl's cross `configure` libpsl conftest fails to
-  link libpsl.a's transitive deps (`-lidn2 -lunistring`) and reports
-  "libpsl libs ... not found". wget already provides PSL/IDN coverage, so this
-  is low priority. *Condition:* teach curl's libpsl/libidn2 detection to use the
-  full static link chain (or supply pkg-config `.pc` files with `Requires.private`).
+| **curl** | static `libpsl` + `libidn2` + `libunistring` support | static compilation linked to libcurl.a |
+| **libc** | `setlocale()`, `localeconv()`, `nl_langinfo()` | native libc implementations |
 
 ## M54 remaining: full feature parity
 

@@ -57,6 +57,25 @@ if ZLIB_OUT="$("$ROOT_DIR/tools/build-zlib.sh")"; then
   TLS_LIBS="$TLS_LIBS -lz"
 fi
 
+LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET/install"
+if [ ! -f "$LIBUNISTRING_PREFIX/lib/libunistring.a" ]; then
+  "$ROOT_DIR/tools/build-libunistring.sh" >/dev/null
+fi
+
+LIBIDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/$HOST_TRIPLET/install"
+if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
+  "$ROOT_DIR/tools/build-libidn2.sh" >/dev/null
+fi
+
+LIBPSL_PREFIX="$ROOT_DIR/build/libpsl-b1nix/$HOST_TRIPLET/install"
+if [ ! -f "$LIBPSL_PREFIX/lib/libpsl.a" ]; then
+  "$ROOT_DIR/tools/build-libpsl.sh" >/dev/null
+fi
+
+TLS_CPPFLAGS="$TLS_CPPFLAGS -I$LIBPSL_PREFIX/include -I$LIBIDN2_PREFIX/include -I$LIBUNISTRING_PREFIX/include"
+TLS_LDFLAGS="$TLS_LDFLAGS -L$LIBPSL_PREFIX/lib -L$LIBIDN2_PREFIX/lib -L$LIBUNISTRING_PREFIX/lib"
+TLS_LIBS="$TLS_LIBS -lpsl -lidn2 -lunistring"
+
 mkdir -p "$SRC_PARENT/$HOST_TRIPLET" "$BUILD_DIR"
 
 if [ ! -d "$SRC_DIR" ]; then
@@ -104,7 +123,7 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
     "$SSL_FLAGS" "$ZLIB_FLAG" --without-brotli --without-zstd \
-    --without-libpsl --without-libidn2 --without-nghttp2 --without-nghttp3 \
+    --with-libpsl="$LIBPSL_PREFIX" --with-libidn2="$LIBIDN2_PREFIX" --without-nghttp2 --without-nghttp3 \
     --without-ngtcp2 \
     --disable-ldap --disable-ldaps --disable-ftp --enable-file \
     --disable-gopher --disable-imap --disable-mqtt --disable-pop3 \

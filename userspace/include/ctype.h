@@ -69,6 +69,14 @@ static inline int isxdigit(int c) {
 
 int isblank(int c);
 
+static inline int isascii(int c) {
+    return (c >= 0 && c <= 127);
+}
+
+static inline int toascii(int c) {
+    return (c & 0x7f);
+}
+
 static inline int tolower(int c) {
     return (c >= 'A' && c <= 'Z') ? (c - 'A' + 'a') : c;
 }

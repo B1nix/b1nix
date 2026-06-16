@@ -959,6 +959,11 @@ check_output "$LOG" "M29-PTHREAD: ok condvar" "pthread condvar signal/wait works
 check_output "$LOG" "M29-PTHREAD: ok tls" "SYS_SET_TLS + %fs:0 round-trip works"
 check_output "$LOG" "M29-PTHREAD: ok gettid" "SYS_GETTID returns distinct ids per thread"
 check_output "$LOG" "M29-PTHREAD: ok stress-smp" "120 rounds of unjoined-thread exit reclaim the shared mm (no PMM leak)"
+check_output "$LOG" "M29-PTHREAD: ok tsd" "pthread TSD key creation and dtor calls work"
+check_output "$LOG" "M29-PTHREAD: ok syslog" "syslog open/write/close works"
+check_output "$LOG" "M29-PTHREAD: ok utmp" "utmpname/setutent/pututline/getutline login accounting works"
+check_output "$LOG" "M29-PTHREAD: ok pam" "pam_start/pam_get_item/pam_authenticate nonexistent user checks work"
+check_output "$LOG" "M29-PTHREAD: ok locale" "setlocale + localeconv + nl_langinfo work"
 check_output "$LOG" "M29-PTHREAD: done" "M29 pthread smoke completes"
 # ── M31 User Security / Passwords / Setuid ──
 check_output "$LOG" "M31-SEC: start" "M31 user-security smoke starts"

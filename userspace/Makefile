@@ -46,6 +46,9 @@ LIBC_OBJS := \
 	$(BUILD)/libc/crypt.o \
 	$(BUILD)/libc/grp.o \
 	$(BUILD)/libc/pthread.o \
+	$(BUILD)/libc/utmp.o \
+	$(BUILD)/libc/pam.o \
+	$(BUILD)/libc/locale.o \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \

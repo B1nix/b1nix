@@ -1163,17 +1163,141 @@ int setrlimit(int resource, const struct rlimit *rlim) {
 }
 
 #include <syslog.h>
+#include <stdio.h>
+
+static int log_fd = -1;
+static const char *log_ident = NULL;
+static int log_option = 0;
+static int log_facility = LOG_USER;
+static int log_mask = 0xff;
+
+static void connect_log(void) {
+  if (log_fd >= 0) return;
+  log_fd = socket(AF_UNIX, SOCK_DGRAM, 0);
+  if (log_fd < 0) return;
+  fcntl(log_fd, F_SETFD, FD_CLOEXEC);
+  struct sockaddr_un addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sun_family = AF_UNIX;
+  strncpy(addr.sun_path, "/dev/log", sizeof(addr.sun_path) - 1);
+  if (connect(log_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(log_fd);
+    log_fd = -1;
+  }
+}
+
 void openlog(const char *ident, int option, int facility) {
-  (void)ident; (void)option; (void)facility;
+  log_ident = ident;
+  log_option = option;
+  log_facility = facility;
+  if (option & LOG_NDELAY) {
+    connect_log();
+  }
 }
+
 void syslog(int priority, const char *format, ...) {
-  (void)priority; (void)format;
+  if (!(log_mask & LOG_MASK(LOG_PRI(priority)))) return;
+
+  int pri = priority;
+  if ((pri & LOG_FACMASK) == 0) {
+    pri |= log_facility;
+  }
+
+  char new_fmt[1024];
+  int i = 0, j = 0;
+  int saved_errno = errno;
+  while (format[i] && j < 1022) {
+    if (format[i] == '%' && format[i+1] == 'm') {
+      const char *err = strerror(saved_errno);
+      if (!err) err = "Unknown error";
+      size_t len = strlen(err);
+      if (j + len < 1023) {
+        memcpy(new_fmt + j, err, len);
+        j += len;
+      }
+      i += 2;
+    } else {
+      new_fmt[j++] = format[i++];
+    }
+  }
+  new_fmt[j] = '\0';
+
+  char msg[2048];
+  va_list ap;
+  va_start(ap, format);
+  vsnprintf(msg, sizeof(msg), new_fmt, ap);
+  va_end(ap);
+
+  char buf[4096];
+  int len = 0;
+  len += snprintf(buf + len, sizeof(buf) - len, "<%d>", pri);
+
+  time_t now = time(NULL);
+  struct tm *tm_info = localtime(&now);
+  if (tm_info) {
+    char time_str[32];
+    strftime(time_str, sizeof(time_str), "%b %d %H:%M:%S ", tm_info);
+    len += snprintf(buf + len, sizeof(buf) - len, "%s", time_str);
+  }
+
+  if (log_ident) {
+    len += snprintf(buf + len, sizeof(buf) - len, "%s", log_ident);
+  }
+  if (log_option & LOG_PID) {
+    len += snprintf(buf + len, sizeof(buf) - len, "[%d]", getpid());
+  }
+  if (log_ident || (log_option & LOG_PID)) {
+    len += snprintf(buf + len, sizeof(buf) - len, ": ");
+  }
+  len += snprintf(buf + len, sizeof(buf) - len, "%s", msg);
+
+  if (log_fd < 0) {
+    connect_log();
+  }
+
+  int sent = -1;
+  if (log_fd >= 0) {
+    sent = send(log_fd, buf, len, 0);
+    if (sent < 0) {
+      close(log_fd);
+      log_fd = -1;
+      connect_log();
+      if (log_fd >= 0) {
+        sent = send(log_fd, buf, len, 0);
+      }
+    }
+  }
+
+  if (sent < 0) {
+    if (log_option & LOG_CONS) {
+      int cfd = open("/dev/console", O_WRONLY | O_NOCTTY);
+      if (cfd >= 0) {
+        write(cfd, buf, len);
+        write(cfd, "\r\n", 2);
+        close(cfd);
+      }
+    }
+  }
+
+  if (log_option & LOG_PERROR) {
+    write(2, buf, len);
+    write(2, "\n", 1);
+  }
 }
+
 void closelog(void) {
+  if (log_fd >= 0) {
+    close(log_fd);
+    log_fd = -1;
+  }
 }
+
 int setlogmask(int mask) {
-  (void)mask;
-  return 0;
+  int old = log_mask;
+  if (mask != 0) {
+    log_mask = mask;
+  }
+  return old;
 }
 
 int utimes(const char *filename, const struct timeval times[2]) {
@@ -1336,7 +1460,11 @@ int lchown(const char *path, uid_t owner, gid_t group) {
     return -1;
   }
   if (S_ISLNK(st.st_mode)) {
-    errno = ENOSYS;
+    /* b1nix kernel has no lchown(2) syscall variant; symlink ownership
+     * changes are not supported. EPERM is the standard error for an
+     * operation that is blocked by kernel policy (cf. Linux ENOSYS vs
+     * EPERM distinction for privilege-gated calls). */
+    errno = EPERM;
     return -1;
   }
   return chown(path, owner, group);
@@ -1344,8 +1472,12 @@ int lchown(const char *path, uid_t owner, gid_t group) {
 
 int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags) {
   if (dirfd != AT_FDCWD) {
-    errno = ENOSYS;
-    return -1;
+    if (pathname && pathname[0] == '/') {
+      /* absolute path */
+    } else {
+      errno = ENOSYS;
+      return -1;
+    }
   }
 
   long long actime, modtime;
@@ -1390,11 +1522,69 @@ int utimensat(int dirfd, const char *pathname, const struct timespec times[2], i
   return utime(pathname, &buf);
 }
 
+int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) {
+  if (dirfd != AT_FDCWD) {
+    if (pathname && pathname[0] == '/') {
+      /* absolute path */
+    } else {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+  if (flags & AT_SYMLINK_NOFOLLOW) {
+    return lstat(pathname, statbuf);
+  }
+  return stat(pathname, statbuf);
+}
+
+int unlinkat(int dirfd, const char *pathname, int flags) {
+  if (dirfd != AT_FDCWD) {
+    if (pathname && pathname[0] == '/') {
+      /* absolute path */
+    } else {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+  if (flags & AT_REMOVEDIR) {
+    return rmdir(pathname);
+  }
+  return unlink(pathname);
+}
+
+int openat(int dirfd, const char *path, int flags, ...) {
+  unsigned int mode = 0;
+  if (flags & O_CREAT) {
+    va_list ap;
+    va_start(ap, flags);
+    mode = va_arg(ap, unsigned int);
+    va_end(ap);
+  }
+  if (dirfd != AT_FDCWD) {
+    if (path && path[0] == '/') {
+      /* absolute path */
+    } else {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+  return open(path, flags, mode);
+}
+
 int futimens(int fd, const struct timespec times[2]) {
-  (void)fd;
-  (void)times;
-  errno = ENOSYS;
-  return -1;
+  /* Resolve fd → path via /proc/self/fd/<N> and delegate to utimensat.
+   * This is the standard fallback for systems without a futimens(2)
+   * syscall (b1nix has SYS_UTIME but not a direct fd-based variant). */
+  char link[64];
+  char path[4096];
+  snprintf(link, sizeof(link), "/proc/self/fd/%d", fd);
+  ssize_t len = readlink(link, path, sizeof(path) - 1);
+  if (len < 0) {
+    errno = EBADF;
+    return -1;
+  }
+  path[len] = '\0';
+  return utimensat(AT_FDCWD, path, times, 0);
 }
 
 int uname(struct utsname *buf) {

@@ -56,7 +56,30 @@ struct pthread_state {
   /* Entry forwarding. */
   void *(*start_routine)(void *);
   void *arg;
+  int exited;
+  struct pthread_state *next_dead;
 };
+
+static struct pthread_state *g_dead_detached = NULL;
+static pthread_mutex_t g_dead_detached_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static void __pthread_cleanup_dead_detached(void) {
+  pthread_mutex_lock(&g_dead_detached_lock);
+  struct pthread_state **curr = &g_dead_detached;
+  while (*curr) {
+    struct pthread_state *dead = *curr;
+    if (__atomic_load_n(&dead->child_tid, __ATOMIC_ACQUIRE) == 0) {
+      *curr = dead->next_dead;
+      if (dead->stack_base) {
+        munmap(dead->stack_base, dead->stack_size);
+      }
+      free(dead);
+    } else {
+      curr = &dead->next_dead;
+    }
+  }
+  pthread_mutex_unlock(&g_dead_detached_lock);
+}
 
 /* Currently-active TLS pointer per thread. b1nix doesn't compile with
  * `-fpic` or ELF TLS sections (no .tdata yet), so we store the state
@@ -81,17 +104,15 @@ static void pthread_bootstrap(void *raw) {
   void *r = st->start_routine(st->arg);
   st->retval = r;
   __pthread_tsd_run_dtors(); /* POSIX: TSD destructors run at thread exit */
+
+  pthread_mutex_lock(&g_dead_detached_lock);
+  st->exited = 1;
   if (st->detached) {
-    /* Detached: nobody will join us. Unmap the user stack and free state
-     * BEFORE exit — exit_thread doesn't return, so this is the last
-     * chance. But munmap'ing the stack we're running on is a use-after-
-     * free; instead, leak the stack here and let pthread_exit unmap via
-     * a small bounce. For M29 simplicity, leak the stack of detached
-     * threads (kernel reclaims it when the address space is freed at
-     * process exit). The state struct can be freed safely — we're not
-     * standing on it. */
-    free(st);
+    st->next_dead = g_dead_detached;
+    g_dead_detached = st;
   }
+  pthread_mutex_unlock(&g_dead_detached_lock);
+
   syscall(SYS_EXIT_THREAD, 0);
   __builtin_unreachable();
 }
@@ -101,6 +122,8 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   (void)attr;
   if (!thread || !start_routine) return EINVAL;
 
+  __pthread_cleanup_dead_detached();
+
   struct pthread_state *st = (struct pthread_state *)malloc(sizeof(*st));
   if (!st) return EAGAIN;
   st->child_tid = 0;
@@ -108,6 +131,8 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   st->retval = 0;
   st->start_routine = start_routine;
   st->arg = arg;
+  st->exited = 0;
+  st->next_dead = NULL;
 
   size_t stack_size = DEFAULT_STACK_SIZE;
   void *stack = mmap(0, stack_size, PROT_READ | PROT_WRITE,
@@ -183,7 +208,18 @@ int pthread_join(pthread_t thread, void **retval) {
 int pthread_detach(pthread_t thread) {
   struct pthread_state *st = (struct pthread_state *)(long)thread;
   if (!st) return EINVAL;
+
+  pthread_mutex_lock(&g_dead_detached_lock);
+  if (st->detached) {
+    pthread_mutex_unlock(&g_dead_detached_lock);
+    return EINVAL;
+  }
   st->detached = 1;
+  if (st->exited) {
+    st->next_dead = g_dead_detached;
+    g_dead_detached = st;
+  }
+  pthread_mutex_unlock(&g_dead_detached_lock);
   return 0;
 }
 
@@ -436,8 +472,6 @@ int pthread_attr_destroy(pthread_attr_t *a) {
  * linear tid scan, one global lock. Right for ports like Mesa (a handful of
  * keys, few worker threads). Grow the bounds or switch to a real TLS slab if a
  * future port needs many threads/keys. */
-#define TSD_MAX_THREADS 64
-
 static struct {
   int used;
   void (*dtor)(void *);
@@ -445,28 +479,32 @@ static struct {
 
 static struct tsd_thread {
   long tid;
-  int in_use;
   const void *vals[PTHREAD_KEYS_MAX];
-} g_tsd[TSD_MAX_THREADS];
+  struct tsd_thread *next;
+};
+
+static struct tsd_thread *g_tsd_head = NULL;
 
 static pthread_mutex_t g_tsd_lock = PTHREAD_MUTEX_INITIALIZER;
 
 static struct tsd_thread *tsd_find(long tid, int create) {
-  struct tsd_thread *spare = NULL;
-  for (int i = 0; i < TSD_MAX_THREADS; i++) {
-    if (g_tsd[i].in_use && g_tsd[i].tid == tid)
-      return &g_tsd[i];
-    if (!g_tsd[i].in_use && !spare)
-      spare = &g_tsd[i];
+  struct tsd_thread *curr = g_tsd_head;
+  while (curr) {
+    if (curr->tid == tid)
+      return curr;
+    curr = curr->next;
   }
-  if (create && spare) {
-    spare->tid = tid;
-    spare->in_use = 1;
-    for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
-      spare->vals[k] = NULL;
-    return spare;
-  }
-  return NULL;
+  if (!create)
+    return NULL;
+  struct tsd_thread *new_thread = (struct tsd_thread *)malloc(sizeof(struct tsd_thread));
+  if (!new_thread)
+    return NULL;
+  new_thread->tid = tid;
+  new_thread->next = g_tsd_head;
+  for (int k = 0; k < PTHREAD_KEYS_MAX; k++)
+    new_thread->vals[k] = NULL;
+  g_tsd_head = new_thread;
+  return new_thread;
 }
 
 int pthread_key_create(pthread_key_t *key, void (*destructor)(void *)) {
@@ -490,9 +528,11 @@ int pthread_key_delete(pthread_key_t key) {
   pthread_mutex_lock(&g_tsd_lock);
   g_keys[key].used = 0;
   g_keys[key].dtor = NULL;
-  for (int i = 0; i < TSD_MAX_THREADS; i++)
-    if (g_tsd[i].in_use)
-      g_tsd[i].vals[key] = NULL;
+  struct tsd_thread *curr = g_tsd_head;
+  while (curr) {
+    curr->vals[key] = NULL;
+    curr = curr->next;
+  }
   pthread_mutex_unlock(&g_tsd_lock);
   return 0;
 }
@@ -553,9 +593,16 @@ void __pthread_tsd_run_dtors(void) {
       break;
   }
   pthread_mutex_lock(&g_tsd_lock);
-  struct tsd_thread *t = tsd_find(tid, 0);
-  if (t)
-    t->in_use = 0;
+  struct tsd_thread **curr = &g_tsd_head;
+  while (*curr) {
+    if ((*curr)->tid == tid) {
+      struct tsd_thread *to_free = *curr;
+      *curr = to_free->next;
+      free(to_free);
+      break;
+    }
+    curr = &(*curr)->next;
+  }
   pthread_mutex_unlock(&g_tsd_lock);
 }
 

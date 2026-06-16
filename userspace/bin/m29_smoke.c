@@ -11,6 +11,11 @@
 #include <string.h>
 #include <unistd.h>
 #include "syscall.h"
+#include <syslog.h>
+#include <utmp.h>
+#include <security/pam_appl.h>
+#include <locale.h>
+#include <langinfo.h>
 
 static void emit(const char *s) {
   write(1, s, strlen(s));
@@ -181,7 +186,7 @@ static void *t6_spin(void *arg) {
   return 0;
 }
 
-static int test_stress_smp(void) {
+int test_stress_smp(void) {
   for (int round = 0; round < 120; round++) {
     int pid = fork();
     if (pid < 0) { fail("stress-fork"); return -1; }
@@ -206,6 +211,172 @@ static int test_stress_smp(void) {
   return 0;
 }
 
+/* ── 7: Thread-Specific Data (TSD) ── */
+
+static pthread_key_t g_key;
+static volatile int g_dtor_calls = 0;
+
+static void tsd_dtor(void *value) {
+  int val = (int)(long)value;
+  if (val == 0x1234) {
+    __atomic_fetch_add(&g_dtor_calls, 1, __ATOMIC_SEQ_CST);
+  }
+}
+
+static void *t7_entry(void *arg) {
+  (void)arg;
+  if (pthread_setspecific(g_key, (void *)0x1234) != 0) {
+    return (void *)1;
+  }
+  void *val = pthread_getspecific(g_key);
+  if ((long)val != 0x1234) {
+    return (void *)2;
+  }
+  return 0;
+}
+
+static int test_tsd(void) {
+  g_dtor_calls = 0;
+  if (pthread_key_create(&g_key, tsd_dtor) != 0) {
+    fail("tsd-key-create"); return -1;
+  }
+
+  pthread_t th;
+  if (pthread_create(&th, 0, t7_entry, 0) != 0) {
+    fail("tsd-thread-create"); return -1;
+  }
+
+  void *retval = 0;
+  pthread_join(th, &retval);
+  if ((long)retval != 0) {
+    fail("tsd-getspecific-failed"); return -1;
+  }
+
+  if (g_dtor_calls != 1) {
+    fail("tsd-dtor-not-called"); return -1;
+  }
+
+  if (pthread_key_delete(g_key) != 0) {
+    fail("tsd-key-delete"); return -1;
+  }
+
+  ok("tsd");
+  return 0;
+}
+
+/* ── 8: Syslog, Utmp, PAM tests ── */
+static int test_syslog(void) {
+  openlog("m29_smoke_syslog", LOG_PID | LOG_PERROR, LOG_USER);
+  syslog(LOG_INFO, "syslog test message: %s", "success");
+  closelog();
+  ok("syslog");
+  return 0;
+}
+
+static int test_utmp(void) {
+  utmpname("/tmp/utmp_test");
+  struct utmp ut;
+  memset(&ut, 0, sizeof(ut));
+  ut.ut_type = USER_PROCESS;
+  ut.ut_pid = 9999;
+  strcpy(ut.ut_line, "ttyS0");
+  strcpy(ut.ut_id, "s0");
+  strcpy(ut.ut_user, "testuser");
+  strcpy(ut.ut_host, "localhost");
+  ut.ut_tv.tv_sec = 12345678;
+  
+  setutent();
+  if (!pututline(&ut)) {
+    fail("utmp-pututline-failed");
+    return -1;
+  }
+  endutent();
+  
+  setutent();
+  struct utmp *r = getutline(&ut);
+  if (!r) {
+    fail("utmp-getutline-failed");
+    endutent();
+    return -1;
+  }
+  if (r->ut_pid != 9999 || strcmp(r->ut_user, "testuser") != 0) {
+    fail("utmp-data-mismatch");
+    endutent();
+    return -1;
+  }
+  endutent();
+  
+  ok("utmp");
+  return 0;
+}
+
+static int mock_pam_conv(int num_msg, const struct pam_message **msg,
+                         struct pam_response **resp, void *appdata) {
+  (void)num_msg; (void)msg; (void)appdata;
+  struct pam_response *r = calloc(1, sizeof(struct pam_response));
+  r->resp = strdup("testpass");
+  *resp = r;
+  return PAM_SUCCESS;
+}
+
+static int test_pam(void) {
+  pam_handle_t *pamh = NULL;
+  struct pam_conv conv = { mock_pam_conv, NULL };
+  
+  if (pam_start("test_service", "nonexistent_user", &conv, &pamh) != PAM_SUCCESS) {
+    fail("pam-start-failed");
+    return -1;
+  }
+  
+  const char *user = NULL;
+  if (pam_get_item(pamh, PAM_USER, (const void **)&user) != PAM_SUCCESS || 
+      strcmp(user, "nonexistent_user") != 0) {
+    fail("pam-get-item-failed");
+    pam_end(pamh, PAM_AUTH_ERR);
+    return -1;
+  }
+  
+  int rc = pam_authenticate(pamh, 0);
+  if (rc != PAM_USER_UNKNOWN) {
+    fail("pam-authenticate-nonexistent-user-should-fail");
+    pam_end(pamh, PAM_AUTH_ERR);
+    return -1;
+  }
+  
+  pam_end(pamh, PAM_SUCCESS);
+  ok("pam");
+  return 0;
+}
+
+static int test_locale(void) {
+  char *loc = setlocale(LC_ALL, NULL);
+  if (!loc || strcmp(loc, "C.UTF-8") != 0) {
+    fail("locale-get-default-failed");
+    return -1;
+  }
+  
+  loc = setlocale(LC_CTYPE, "en_US.UTF-8");
+  if (!loc || strcmp(loc, "en_US.UTF-8") != 0) {
+    fail("locale-set-failed");
+    return -1;
+  }
+  
+  char *codeset = nl_langinfo(CODESET);
+  if (!codeset || strcmp(codeset, "UTF-8") != 0) {
+    fail("langinfo-codeset-failed");
+    return -1;
+  }
+  
+  struct lconv *lc = localeconv();
+  if (!lc || strcmp(lc->decimal_point, ".") != 0) {
+    fail("localeconv-failed");
+    return -1;
+  }
+  
+  ok("locale");
+  return 0;
+}
+
 int main(void) {
   emit("M29-PTHREAD: start\n");
   if (test_create_join() != 0) return 1;
@@ -213,7 +384,12 @@ int main(void) {
   if (test_condvar() != 0)     return 1;
   if (test_tls() != 0)         return 1;
   if (test_gettid() != 0)      return 1;
+  if (test_tsd() != 0)         return 1;
   if (test_stress_smp() != 0)  return 1;
+  if (test_syslog() != 0)      return 1;
+  if (test_utmp() != 0)        return 1;
+  if (test_pam() != 0)         return 1;
+  if (test_locale() != 0)      return 1;
   emit("M29-PTHREAD: done\n");
   return 0;
 }

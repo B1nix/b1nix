@@ -29,6 +29,14 @@
 #define LOG_CRON   (9<<3)
 #define LOG_AUTHPRIV (10<<3)
 
+#define LOG_PRIMASK  0x07
+#define LOG_PRI(p)   ((p) & LOG_PRIMASK)
+#define LOG_FACMASK  0x03f8
+#define LOG_FAC(p)   (((p) & LOG_FACMASK) >> 3)
+
+#define LOG_MASK(pri) (1 << (pri))
+#define LOG_UPTO(pri) ((1 << ((pri)+1)) - 1)
+
 void openlog(const char *ident, int option, int facility);
 void syslog(int priority, const char *format, ...);
 void closelog(void);
