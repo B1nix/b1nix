@@ -819,3 +819,42 @@ no-fake-pass smoke test.
   loopback HTTPS, public-internet HTTPS, and keyboard/mouse input.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
   browser or another real application requires it.
+
+## M54: Third-Party Port Feature Enablement
+
+Re-enable upstream features that were switched off when each port was first
+brought up, as the OS gains the syscalls/libc APIs they need. Full inventory,
+status table and the conditions for each remaining item:
+[`port-functionality.md`](port-functionality.md).
+
+- [x] `done` **Foundation (libc/kernel).** Timed futex
+  (`pthread_cond_timedwait`/`mutex_timedlock`, atomic+futex semaphores),
+  `SYS_SETTIMEOFDAY` (`settimeofday`/`clock_settime`), `SYS_SCHED_GETAFFINITY`
+  (+`cpu_set_t`/`CPU_*`), `scandir`/`alphasort`, POSIX `remove()`; the autotools
+  wrapper now drops libc-provided `-l` names so `--enable-threads` links in any
+  port.
+- [x] `done` **Ports.** curl: `file://`, unix-sockets, alt-svc, HSTS,
+  WebSockets, headers-api, dateparse, threaded resolver. mbedTLS:
+  `HAVE_TIME`+`HAVE_TIME_DATE` (cert date validation). bash: `/dev/tcp`,
+  `/dev/udp`. dropbear: zlib + host lookup. wget: zlib + threads. NetSurf:
+  JPEG + WebP codecs and **JavaScript** (bundled Duktape via nsgenbind).
+  BusyBox: real `sched_getaffinity` (affinity stub removed). Verified both
+  arches (x86 727/0, x86_64 728/0).
+- [ ] `deferred` **curl `--with-libpsl`/`--with-libidn2`** — libs exist (wget
+  uses them) but curl's cross libpsl conftest cannot link the transitive
+  `idn2`/`unistring` chain. wget already covers PSL/IDN.
+- [ ] `planned` **Full feature parity** — the remaining disabled features, each
+  blocked on a real subsystem or a large library port (details and enable
+  conditions in [`port-functionality.md`](port-functionality.md)):
+  - System logging + login accounting: `/dev/log` and `utmp`/`wtmp`/`lastlog`
+    → dropbear syslog/lastlog/utmp, BusyBox `syslogd`/`last`.
+  - PAM: a minimal `libpam`/policy engine → dropbear `--enable-pam`,
+    login/su/passwd stacks.
+  - Full locale / multibyte: wide-char/locale + a real `iconv` → bash
+    `HANDLE_MULTIBYTE`, `nls`, NetSurf `libiconv`/`utf8proc`.
+  - Modern HTTP + compression: port nghttp2/nghttp3/ngtcp2/brotli/zstd (and
+    libjxl) → curl/wget HTTP/2+HTTP/3, NetSurf JPEG-XL.
+  - Mesa JIT + windowing: port LLVM (LLVMpipe shader JIT) and add a
+    DRI/GLX/EGL/GBM path beyond OSMesa-to-memory.
+  - TLS timing/native-net + harden: mbedTLS `TIMING_C`/`NET_C`, dropbear/curl
+    `--harden`, bash `bash-malloc`.
