@@ -6,6 +6,7 @@
  * for "M29-PTHREAD: done" as the all-passed signal. */
 
 #include <pthread.h>
+#include <errno.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -16,6 +17,9 @@
 #include <security/pam_appl.h>
 #include <locale.h>
 #include <langinfo.h>
+#include <iconv.h>
+#include <time.h>
+#include <sys/time.h>
 
 static void emit(const char *s) {
   write(1, s, strlen(s));
@@ -62,6 +66,87 @@ static int test_create_join(void) {
   if (slot != 0xC0FFEE) { fail("create-side-effect"); return -1; }
   if ((unsigned long)rv != 0xBEEF) { fail("join-retval"); return -1; }
   ok("create-join");
+  return 0;
+}
+
+/* ── 1b: thread attributes (stack size + detach state) ── */
+
+static volatile int g_attr_detached_ran = 0;
+
+static void *t_attr_detached(void *arg) {
+  (void)arg;
+  __atomic_store_n(&g_attr_detached_ran, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static void *t_attr_bigstack(void *arg) {
+  /* Touch a 384 KB on-stack buffer — larger than the 256 KB default stack, so
+   * this only runs without faulting if the 512 KB request was honored. The
+   * volatile reads keep the compiler from optimizing the buffer away. */
+  volatile char buf[384 * 1024];
+  for (size_t i = 0; i < sizeof(buf); i += 4096)
+    buf[i] = (char)i;
+  long sum = 0;
+  for (size_t i = 0; i < sizeof(buf); i += 4096)
+    sum += buf[i];
+  *(volatile long *)arg = sum;
+  return 0;
+}
+
+static int test_attr(void) {
+  pthread_attr_t a;
+  if (pthread_attr_init(&a) != 0) { fail("attr-init"); return -1; }
+
+  /* Detach-state get/set round-trip + EINVAL on a bogus value. */
+  int ds = -1;
+  if (pthread_attr_getdetachstate(&a, &ds) != 0 ||
+      ds != PTHREAD_CREATE_JOINABLE) { fail("attr-detach-default"); return -1; }
+  if (pthread_attr_setdetachstate(&a, 999) != EINVAL) {
+    fail("attr-detach-einval"); return -1;
+  }
+  if (pthread_attr_setdetachstate(&a, PTHREAD_CREATE_DETACHED) != 0 ||
+      pthread_attr_getdetachstate(&a, &ds) != 0 ||
+      ds != PTHREAD_CREATE_DETACHED) { fail("attr-detach-set"); return -1; }
+
+  /* Stack-size get/set round-trip + minimum-size rejection. */
+  size_t sz = 0;
+  if (pthread_attr_setstacksize(&a, 1024) != EINVAL) {
+    fail("attr-stack-toosmall"); return -1;
+  }
+  if (pthread_attr_setstacksize(&a, 512 * 1024) != 0 ||
+      pthread_attr_getstacksize(&a, &sz) != 0 ||
+      sz != 512 * 1024) { fail("attr-stack-set"); return -1; }
+
+  /* A detached thread must run without a join and not be join-able. */
+  g_attr_detached_ran = 0;
+  pthread_t dt;
+  if (pthread_create(&dt, &a, t_attr_detached, 0) != 0) {
+    fail("attr-detached-create"); return -1;
+  }
+  for (int spins = 0; spins < 1000000 &&
+       !__atomic_load_n(&g_attr_detached_ran, __ATOMIC_ACQUIRE); spins++) {
+    if ((spins & 0xFFF) == 0) syscall(SYS_YIELD);
+  }
+  if (!__atomic_load_n(&g_attr_detached_ran, __ATOMIC_ACQUIRE)) {
+    fail("attr-detached-run"); return -1;
+  }
+  if (pthread_join(dt, 0) != EINVAL) { fail("attr-detached-nojoin"); return -1; }
+
+  /* A thread created with a large explicit stack must run a deep frame. */
+  pthread_attr_t big;
+  pthread_attr_init(&big);
+  if (pthread_attr_setstacksize(&big, 512 * 1024) != 0) {
+    fail("attr-bigstack-set"); return -1;
+  }
+  volatile long sum = 0;
+  pthread_t bt;
+  if (pthread_create(&bt, &big, t_attr_bigstack, (void *)&sum) != 0) {
+    fail("attr-bigstack-create"); return -1;
+  }
+  if (pthread_join(bt, 0) != 0) { fail("attr-bigstack-join"); return -1; }
+  pthread_attr_destroy(&big);
+  pthread_attr_destroy(&a);
+  ok("attr");
   return 0;
 }
 
@@ -377,9 +462,143 @@ static int test_locale(void) {
   return 0;
 }
 
+static int test_iconv(void) {
+  /* UTF-8 → Latin-1: "Café" (é = U+00E9, 0xC3 0xA9 in UTF-8 → 0xE9). */
+  iconv_t cd = iconv_open("ISO-8859-1", "UTF-8");
+  if (cd == (iconv_t)-1) { fail("iconv-open"); return -1; }
+  char in[] = { 'C', 'a', 'f', (char)0xC3, (char)0xA9 };
+  char out[16];
+  char *ip = in, *op = out;
+  size_t il = sizeof(in), ol = sizeof(out);
+  size_t r = iconv(cd, &ip, &il, &op, &ol);
+  if (r == (size_t)-1 || il != 0) { fail("iconv-utf8-latin1"); iconv_close(cd); return -1; }
+  if ((size_t)(op - out) != 4 || (unsigned char)out[3] != 0xE9) {
+    fail("iconv-utf8-latin1-bytes"); iconv_close(cd); return -1;
+  }
+  iconv_close(cd);
+
+  /* Round-trip Latin-1 → UTF-8 reproduces the 2-byte é. */
+  cd = iconv_open("UTF-8", "LATIN1");
+  if (cd == (iconv_t)-1) { fail("iconv-open2"); return -1; }
+  ip = out; il = 4; op = in; ol = sizeof(in);
+  r = iconv(cd, &ip, &il, &op, &ol);
+  if (r == (size_t)-1 || (size_t)(op - in) != 5 ||
+      (unsigned char)in[3] != 0xC3 || (unsigned char)in[4] != 0xA9) {
+    fail("iconv-latin1-utf8"); iconv_close(cd); return -1;
+  }
+  iconv_close(cd);
+
+  /* E2BIG when the output buffer is too small. */
+  cd = iconv_open("UTF-8", "UTF-8");
+  if (cd == (iconv_t)-1) { fail("iconv-open3"); return -1; }
+  char src[] = "hello";
+  char tiny[2];
+  ip = src; il = 5; op = tiny; ol = sizeof(tiny);
+  errno = 0;
+  r = iconv(cd, &ip, &il, &op, &ol);
+  if (r != (size_t)-1 || errno != E2BIG) { fail("iconv-e2big"); iconv_close(cd); return -1; }
+  iconv_close(cd);
+
+  /* EILSEQ on a non-ASCII code point converted to US-ASCII. */
+  cd = iconv_open("ASCII", "UTF-8");
+  if (cd == (iconv_t)-1) { fail("iconv-open4"); return -1; }
+  char bad[] = { (char)0xC3, (char)0xA9 };
+  char obuf[8];
+  ip = bad; il = 2; op = obuf; ol = sizeof(obuf);
+  errno = 0;
+  r = iconv(cd, &ip, &il, &op, &ol);
+  if (r != (size_t)-1 || errno != EILSEQ) { fail("iconv-eilseq"); iconv_close(cd); return -1; }
+  iconv_close(cd);
+
+  /* Unsupported conversion name → EINVAL. */
+  errno = 0;
+  if (iconv_open("NO-SUCH-ENC", "UTF-8") != (iconv_t)-1 || errno != EINVAL) {
+    fail("iconv-badname"); return -1;
+  }
+
+  ok("iconv");
+  return 0;
+}
+
+/* Regression guard for the NetSurf fb-scheduler workaround: hammering
+ * gettimeofday()/clock_gettime() in a tight loop was reported to crash i686
+ * intermittently. Drive both hard and check the clocks stay sane — if this
+ * survives, the busy-poll path is safe and the nanosleep pacing in the NetSurf
+ * test pump is pacing only, not papering over a kernel fault. */
+static int test_time_hammer(void) {
+  struct timeval tv, prev_tv = {0, 0};
+  struct timespec mono, prev_mono = {0, 0};
+  const int ITERS = 300000;
+  for (int i = 0; i < ITERS; i++) {
+    if (gettimeofday(&tv, NULL) != 0) { fail("time-gettimeofday"); return -1; }
+    if (tv.tv_usec < 0 || tv.tv_usec >= 1000000) { fail("time-usec-range"); return -1; }
+    if (tv.tv_sec < prev_tv.tv_sec) { fail("time-wall-backwards"); return -1; }
+    prev_tv = tv;
+
+    if (clock_gettime(CLOCK_MONOTONIC, &mono) != 0) { fail("time-clock-mono"); return -1; }
+    if (mono.tv_nsec < 0 || mono.tv_nsec >= 1000000000L) { fail("time-nsec-range"); return -1; }
+    /* Monotonic clock must never run backwards. */
+    if (mono.tv_sec < prev_mono.tv_sec ||
+        (mono.tv_sec == prev_mono.tv_sec && mono.tv_nsec < prev_mono.tv_nsec)) {
+      fail("time-mono-backwards"); return -1;
+    }
+    prev_mono = mono;
+  }
+  ok("time-hammer");
+  return 0;
+}
+
+/* ── Deferred thread cancellation ── */
+static volatile int g_cancel_started = 0;
+static volatile int g_cancel_completed = 0;
+
+static void *t_cancel_loop(void *arg) {
+  (void)arg;
+  __atomic_store_n(&g_cancel_started, 1, __ATOMIC_RELEASE);
+  /* Bounded so a missed cancellation fails deterministically instead of
+   * hanging: when cancellation is honored the thread exits long before the
+   * cap at the testcancel point below. */
+  for (long i = 0; i < 50000000L; i++) {
+    pthread_testcancel();             /* cancellation point */
+  }
+  g_cancel_completed = 1;             /* reached only if never cancelled */
+  return (void *)0xABCD;
+}
+
+static int test_cancel(void) {
+  /* setcancelstate round-trip on the calling thread. */
+  int old = -1;
+  if (pthread_setcancelstate(PTHREAD_CANCEL_DISABLE, &old) != 0) {
+    fail("cancel-setstate"); return -1;
+  }
+  if (pthread_setcancelstate(PTHREAD_CANCEL_ENABLE, &old) != 0 ||
+      old != PTHREAD_CANCEL_DISABLE) { fail("cancel-setstate-old"); return -1; }
+
+  g_cancel_started = 0;
+  g_cancel_completed = 0;
+  pthread_t th;
+  if (pthread_create(&th, 0, t_cancel_loop, 0) != 0) {
+    fail("cancel-create"); return -1;
+  }
+  /* Wait until the worker is actually spinning, then cancel it. */
+  for (int s = 0; s < 2000000 &&
+       !__atomic_load_n(&g_cancel_started, __ATOMIC_ACQUIRE); s++) {
+    if ((s & 0xFFF) == 0) syscall(SYS_YIELD);
+  }
+  syscall(SYS_YIELD);
+  if (pthread_cancel(th) != 0) { fail("cancel-request"); return -1; }
+  pthread_join(th, 0);
+  /* Cancellation delivered → the worker stopped at a testcancel point and
+   * never set completed. */
+  if (g_cancel_completed) { fail("cancel-ignored"); return -1; }
+  ok("cancel");
+  return 0;
+}
+
 int main(void) {
   emit("M29-PTHREAD: start\n");
   if (test_create_join() != 0) return 1;
+  if (test_attr() != 0)        return 1;
   if (test_mutex() != 0)       return 1;
   if (test_condvar() != 0)     return 1;
   if (test_tls() != 0)         return 1;
@@ -390,6 +609,9 @@ int main(void) {
   if (test_utmp() != 0)        return 1;
   if (test_pam() != 0)         return 1;
   if (test_locale() != 0)      return 1;
+  if (test_iconv() != 0)       return 1;
+  if (test_time_hammer() != 0) return 1;
+  if (test_cancel() != 0)      return 1;
   emit("M29-PTHREAD: done\n");
   return 0;
 }

@@ -167,11 +167,33 @@ clang --target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector \
 CURL_SRC="$(ls -d "$ROOT_DIR"/build/curl-src/$B1NIX_TRIPLET/curl-*/ 2>/dev/null | head -1)"
 CURL_A="$ROOT_DIR/build/curl-b1nix/$B1NIX_TRIPLET/lib/.libs/libcurl.a"
 MBED_DIR="$ROOT_DIR/build/mbedtls-b1nix/$B1NIX_TRIPLET/install"
+# The b1nix curl port enables libpsl (Public Suffix List) and libidn2 (IDN),
+# which in turn pulls libunistring. libcurl.a therefore references psl_*/idn2_*
+# /u8_*/u32_* symbols. Stage those archives and list them in libcurl.pc in
+# dependency order (psl → idn2 → unistring), otherwise the static nsfb link
+# fails with undefined references on a clean rebuild. All optional: only wired
+# in when the archives are present.
+PSL_A="$ROOT_DIR/build/libpsl-b1nix/$B1NIX_TRIPLET/install/lib/libpsl.a"
+IDN2_A="$ROOT_DIR/build/libidn2-b1nix/$B1NIX_TRIPLET/install/lib/libidn2.a"
+UNISTRING_A="$ROOT_DIR/build/libunistring-b1nix/$B1NIX_TRIPLET/install/lib/libunistring.a"
+CURL_EXTRA_LIBS=""
 HAVE_CURL=no
 if [ -f "$CURL_A" ] && [ -n "$CURL_SRC" ] && [ -d "$MBED_DIR/lib" ]; then
   cp -R "$CURL_SRC/include/curl" "$SYSROOT/include/"
   cp "$CURL_A" "$SYSROOT/lib/libcurl.a"
   cp "$MBED_DIR"/lib/libmbed*.a "$SYSROOT/lib/"
+  if [ -f "$PSL_A" ]; then
+    cp "$PSL_A" "$SYSROOT/lib/libpsl.a"
+    CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lpsl"
+  fi
+  if [ -f "$IDN2_A" ]; then
+    cp "$IDN2_A" "$SYSROOT/lib/libidn2.a"
+    CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lidn2"
+  fi
+  if [ -f "$UNISTRING_A" ]; then
+    cp "$UNISTRING_A" "$SYSROOT/lib/libunistring.a"
+    CURL_EXTRA_LIBS="$CURL_EXTRA_LIBS -lunistring"
+  fi
   cat >"$PKGDIR/libcurl.pc" <<EOF
 prefix=$SYSROOT
 exec_prefix=\${prefix}
@@ -181,7 +203,7 @@ includedir=\${prefix}/include
 Name: libcurl
 Description: libcurl for b1nix (mbedTLS)
 Version: 8.20.0
-Libs: -L\${libdir} -lcurl -lz -lmbedtls -lmbedx509 -lmbedcrypto
+Libs: -L\${libdir} -lcurl -lz -lmbedtls -lmbedx509 -lmbedcrypto$CURL_EXTRA_LIBS
 Cflags: -I\${includedir} -DCURL_STATICLIB
 EOF
   HAVE_CURL=yes
@@ -293,8 +315,11 @@ if ! grep -q 'b1nix-test-render' "$SRC_DIR/frontends/framebuffer/gui.c"; then
 /* Pump the NetSurf scheduler once, then sleep `ms` of real time so the timed
  * fetch/reflow callbacks (scheduled on gettimeofday by the fb scheduler) become
  * due. nanosleep maps to the kernel tick sleep (SYS_SLEEP), which genuinely
- * blocks ~10ms — so a fixed sleep each tick advances wall-clock without spinning
- * on gettimeofday (hammering it crashed i686 intermittently). */
+ * blocks ~10ms — so a fixed sleep each tick advances wall-clock cheaply instead
+ * of busy-spinning on gettimeofday. This is deliberate pacing, not a crash
+ * workaround: the M29 smoke (test_time_hammer) drives gettimeofday/clock_gettime
+ * 300k times in a tight loop on i686 with no fault, confirming the clock path is
+ * safe under load; the sleep just avoids wasting CPU between scheduler ticks. */
 static void fb_test_pump(int ms)
 {
 	struct timespec ts;

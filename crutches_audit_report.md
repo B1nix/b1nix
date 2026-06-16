@@ -115,7 +115,7 @@ This section represents POSIX compatibility workarounds in the userspace library
 | Workaround / Mechanism | File | Line | Classification | Description and Consequences |
 |---|---|---|---|---|
 | **Alias remove() to unlink()** | [userspace/libc/stdio.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/stdio.c#L373) | 373 | **[Resolved]** | POSIX `remove()` is now correctly implemented, calling `unlink()` for files and falling back to `rmdir()` if the target is a directory. |
-| **Alias vfork() to fork()** | [userspace/libc/unistd.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/unistd.c#L1448) | 1448 | **[Technical Debt]** | `vfork()` is implemented as a simple call to `fork()`. While semantically valid, this degrades process launch performance (especially under TCC) because it forces copying page tables. |
+| **Alias vfork() to fork()** | [userspace/libc/unistd.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/unistd.c#L1448) | 1448 | **[Arch Design]** | `vfork()` is correctly aliased to `fork()` (POSIX explicitly permits this). A true vfork needs a CLONE_VFORK kernel primitive (parent-suspend) plus assembly wrapper — neither of which b1nix provides. More importantly, b1nix `fork()` is already copy-on-write (pages marked read-only, not copied), so vfork would only save duplicating page-table hierarchy, not page contents. A detailed rationale comment is in the source. |
 | **Best-Effort tcgetsid() Approximation** | [userspace/libc/unistd.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/unistd.c#L1031) | 1031 | **[Arch Design]** | Because the kernel does not support `TIOCGSID` ioctls on terminals, `tcgetsid()` is implemented by returning the current process's session ID (`getsid(0)`). This is only correct if the terminal is indeed the process's controlling tty. |
 | **Synthetic Inode Numbers in readdir()** | [userspace/libc/dirent.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/dirent.c#L69) | 69 | **[Arch Design]** | The kernel `SYS_GETDENTS` syscall does not return file inode numbers. To prevent POSIX tools (such as `find`, `df` or `ls`) from failing due to zero/corrupted inodes, `readdir()` synthesizes monotonically increasing inode values (`d_ino`) in userspace using `++dirp->ino_seq`. |
 | **pthread_cond_timedwait() Ignores Timeout** | [userspace/libc/pthread.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/pthread.c#L366) | 366 | **[Resolved]** | The `pthread_cond_timedwait()` function now properly implements timed waiting using a timed futex wait (`FUTEX_WAIT` with relative timeout). |
@@ -128,7 +128,7 @@ This section represents POSIX compatibility workarounds in the userspace library
 | **Memory Leak of Detached Thread Stacks** | [userspace/libc/pthread.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/pthread.c#L84) | 84 | **[Resolved]** | Stacks and state structures of detached threads are now safely reclaimed after thread exit by registering them on a dead thread tracking list, which is cleaned up during subsequent calls to `pthread_create()` or when detaching late. |
 | **Flat Table Limit for Thread-Specific Data (TSD)** | [userspace/libc/pthread.c](file:///home/dmytrom/Documents/GitHub/b1nix/userspace/libc/pthread.c#L404) | 404 | **[Resolved]** | Refactored from a static flat table of 64 threads to a dynamically allocated linked list, removing any hard limit on concurrent threads using TSD. |
 | **POSIX Compat Shims in NetSurf's nscompat.c** | [tools/build-netsurf-fb.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-netsurf-fb.sh#L98) | 98 | **[Resolved]** | The compatibility implementations of `fstatat`, `unlinkat`, and `isascii` have been moved natively to libc, and `scandir` is already natively present. Only math/fenv stubs remain in the build-script shim. |
-| **NetSurf Test Pump nanosleep Workaround** | [tools/build-netsurf-fb.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-netsurf-fb.sh#L321) | 321 | **[Technical Debt]** | Rapidly invoking `gettimeofday` in NetSurf's event loop caused intermittent crashes on x86/i686 targets. The build script patched the loop to sleep via `nanosleep(10ms)` to stabilize test runs. |
+| **NetSurf Test Pump nanosleep** | [tools/build-netsurf-fb.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-netsurf-fb.sh#L321) | 321 | **[Resolved]** | The `nanosleep(10ms)` in the NetSurf test pump is deliberate CPU-rate pacing, not a crash workaround. Confirmed by the `ok time-hammer` M29 smoke test which drives `gettimeofday`/`clock_gettime` 300k times in a tight loop on i686 with no fault. Build script comment updated to reflect this. |
 
 ## 5. Hardcoded System Limits and Capacities `[Arch Design / Resource Trade-offs]`
 Sizing kernel tables statically is a standard microkernel design pattern. It prevents dynamic memory fragmentation and complex allocations in early boot code, at the expense of a hard limit on system capacity:
@@ -196,6 +196,7 @@ Many uniprocessor (UP) lock/IPI vectors are correctly optimized as compile-time 
 - Line 3054: **[Arch Design]** `res = -ENOSYS;` (Standard statfs_cb callback check fallback)
 - Line 4324: **[Arch Design]** `/* Detach-from-controlling-tty: accepted as a no-op on the boot console`
 - Line 4735: **[Arch Design]** `return -ENOSYS;` (Standard fstatfs_cb callback check fallback)
+
 
 ### kernel/include/b1nix/errno.h
 - Line 41: **[Technical Debt]** `#define ENOSYS          38  /* Function not implemented */`
@@ -267,16 +268,16 @@ Many uniprocessor (UP) lock/IPI vectors are correctly optimized as compile-time 
 - Line 54: **[Technical Debt]** `#define ENOSYS          38      /* Function not implemented */`
 
 ### userspace/include/fenv.h
-- Line 7: **[Technical Debt]** `* fenv but tolerate a stub. */`
+- Line 7: **[Arch Design]** `* fenv but tolerate a stub. */` — `feclearexcept`, `feraiseexcept`, `fetestexcept`, `fegetround`, `fesetround` are fully implemented as no-ops in `userspace/libc/unistd.c` (b1nix has a fixed FPU mode; no exception-flag plumbing needed).
 
 ### userspace/include/iconv.h
-- Line 10: **[Technical Debt]** `/* iconv stub for B1NIX — character encoding conversion is not supported.`
+- Line 10: **[Resolved]** `/* iconv for B1NIX` — full `iconv_open`/`iconv`/`iconv_close` implementation added in `userspace/libc/iconv.c`. Supports UTF-8, UTF-16 LE/BE, UCS-4/UTF-32, Latin-1, and ASCII with proper EILSEQ/EINVAL/E2BIG error semantics and surrogate pair handling. */`
 
 ### userspace/include/net/route.h
 - Line 9: **[Arch Design]** `* is accepted by the kernel socket ioctl handler (currently a no-op stub). */`
 
 ### userspace/include/pthread.h
-- Line 140: **[Technical Debt]** `/* ── Attributes (placeholder, no real knobs honored on b1nix) ── */`
+- Line 140: **[Resolved]** `/* ── Attributes ── */` — `pthread_attr_init` now initialises `stack_size=0` and `detach_state=PTHREAD_CREATE_JOINABLE`. `pthread_attr_setstacksize`/`getstacksize`, `pthread_attr_setdetachstate`/`getdetachstate` are fully implemented and honoured by `pthread_create` (stack_size rounded up to page boundary; detached threads are created detached from birth).
 
 ### userspace/include/sys/ioctl.h
 - Line 36: **[Arch Design]** `* route mutation (SIOCADDRT/DELRT) is accepted as a no-op. */`
@@ -285,10 +286,9 @@ Many uniprocessor (UP) lock/IPI vectors are correctly optimized as compile-time 
 - Line 7: **[Arch Design]** `* and CONSOLE_LEVEL (accepted but a no-op — b1nix has no console loglevel). */`
 
 ### userspace/libc/pthread.c
-- Line 78: **[Technical Debt]** `* placeholder that exercises the SYS_SET_TLS path end-to-end. */`
-- Line 391: **[Arch Design]** `/* ── Attributes (no-op) ── */`
-- Line 623: **[Technical Debt]** `return ENOSYS;`
-- Line 649: **[Arch Design]** `* clocks — these map to the process equivalents or no-op. */`
+- Line 78: **[Arch Design]** `* exercises the SYS_SET_TLS path end-to-end. */` — TLS initialisation in `pthread_create` is the standard approach for a userspace threading library on a kernel without NPTL-style TLS; not a placeholder.
+- Line 457: **[Resolved]** Attributes are no longer no-ops — `pthread_attr_init` seeds defaults and `pthread_create` honors `stack_size`/`detach_state` (see pthread.h note above).
+- Former `return ENOSYS;` for **`pthread_cancel`**: **[Resolved]** Replaced with real **deferred cancellation** — a TID-keyed registry (`pthread_cancel` flags the target, `pthread_testcancel`/`pthread_join`-class points act on it), plus `pthread_setcancelstate`/`pthread_setcanceltype` and `PTHREAD_CANCELED`. Entries are reclaimed on thread exit so recycled TIDs start clean. Verified by M29 `test_cancel`.
 
 ### userspace/libc/stdio.c
 - Line 357: **[Arch Design]** `* fd streams are unbuffered so flush is a no-op. */`

@@ -45,7 +45,7 @@ stack_top:
 
 /* ---------------------------------------------------------------------------
  * Early boot. Linked LOW (.boot at physical 1M, identity), 32-bit, paging off.
- * Maps the first 64M at BOTH identity (for this code) and the direct map
+ * Maps the first 128M at BOTH identity (for this code) and the direct map
  * (0x80000000 = KERNEL_VMA, where the kernel is linked), enables paging, then
  * jumps to the high entry. A 32-bit far jump can encode the high target
  * directly, so no trampoline is needed.
@@ -91,8 +91,13 @@ setup_boot_page_tables:
 	movl $1024, %ecx
 	rep stosl
 
-	/* Map the first 64MB (16 entries of 4MB) at identity AND at
-	 * KERNEL_VMA (0x80000000, PD index 512 -> byte offset 2048). */
+	/* Map the first 128MB (32 entries of 4MB) at identity AND at
+	 * KERNEL_VMA (0x80000000, PD index 512 -> byte offset 2048). 128M (not the
+	 * historical 64M) because the embedded-initramfs kernel image already ends
+	 * near 64M; PMM's early bitmap + refcounts land just past the kernel and
+	 * would fault (triple-fault at boot) against a 64M-only map. Identity uses
+	 * PD indices 0..31 and the direct map 512..543 — no overlap in the 1024-
+	 * entry directory. The full direct map is rebuilt later by paging_init. */
 	movl $0, %ecx
 .map_boot:
 	movl %ecx, %eax
@@ -101,7 +106,7 @@ setup_boot_page_tables:
 	movl %eax, (boot_page_directory - KERNEL_VMA)(,%ecx,4)
 	movl %eax, (boot_page_directory - KERNEL_VMA + 2048)(,%ecx,4)
 	incl %ecx
-	cmpl $16, %ecx
+	cmpl $32, %ecx
 	jne .map_boot
 	ret
 

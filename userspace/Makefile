@@ -49,6 +49,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/utmp.o \
 	$(BUILD)/libc/pam.o \
 	$(BUILD)/libc/locale.o \
+	$(BUILD)/libc/iconv.o \
 	$(BUILD)/libc/netdb.o \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \

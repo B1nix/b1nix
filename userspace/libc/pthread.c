@@ -91,7 +91,8 @@ static void __pthread_cleanup_dead_detached(void) {
 
 /* ── Internal trampoline ── */
 
-void __pthread_tsd_run_dtors(void); /* defined with the TSD code below */
+void __pthread_tsd_run_dtors(void);   /* defined with the TSD code below */
+void __pthread_cancel_forget(long tid); /* defined with the cancellation code */
 
 static void pthread_bootstrap(void *raw) {
   struct pthread_state *st = (struct pthread_state *)raw;
@@ -104,6 +105,7 @@ static void pthread_bootstrap(void *raw) {
   void *r = st->start_routine(st->arg);
   st->retval = r;
   __pthread_tsd_run_dtors(); /* POSIX: TSD destructors run at thread exit */
+  __pthread_cancel_forget(syscall(SYS_GETTID));
 
   pthread_mutex_lock(&g_dead_detached_lock);
   st->exited = 1;
@@ -117,24 +119,40 @@ static void pthread_bootstrap(void *raw) {
   __builtin_unreachable();
 }
 
+#define MIN_STACK_SIZE (16 * 1024)
+
 int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
                    void *(*start_routine)(void *), void *arg) {
-  (void)attr;
   if (!thread || !start_routine) return EINVAL;
+
+  /* Honor caller-supplied attributes: an explicit stack size (clamped to a
+   * sane minimum and page-aligned) and the detach state. A NULL attr means
+   * the defaults (libc stack size, joinable). */
+  size_t stack_size = DEFAULT_STACK_SIZE;
+  int detached = 0;
+  if (attr) {
+    if (attr->stack_size != 0) {
+      stack_size = attr->stack_size;
+      if (stack_size < MIN_STACK_SIZE)
+        stack_size = MIN_STACK_SIZE;
+    }
+    detached = (attr->detach_state == PTHREAD_CREATE_DETACHED);
+  }
+  /* Round the stack up to a page so mmap gets a whole number of pages. */
+  stack_size = (stack_size + 0xFFF) & ~(size_t)0xFFF;
 
   __pthread_cleanup_dead_detached();
 
   struct pthread_state *st = (struct pthread_state *)malloc(sizeof(*st));
   if (!st) return EAGAIN;
   st->child_tid = 0;
-  st->detached = 0;
+  st->detached = detached;
   st->retval = 0;
   st->start_routine = start_routine;
   st->arg = arg;
   st->exited = 0;
   st->next_dead = NULL;
 
-  size_t stack_size = DEFAULT_STACK_SIZE;
   void *stack = mmap(0, stack_size, PROT_READ | PROT_WRITE,
                      MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
   if (stack == (void *)-1) {
@@ -178,6 +196,7 @@ void pthread_exit(void *retval) {
    * treats it as a process exit. */
   (void)retval;
   __pthread_tsd_run_dtors(); /* POSIX: TSD destructors run at thread exit */
+  __pthread_cancel_forget(syscall(SYS_GETTID));
   syscall(SYS_EXIT_THREAD, 0);
   __builtin_unreachable();
 }
@@ -458,12 +477,32 @@ int pthread_once(pthread_once_t *once, void (*init_routine)(void)) {
 
 int pthread_attr_init(pthread_attr_t *a) {
   if (!a) return EINVAL;
+  a->stack_size = 0; /* 0 → libc default */
+  a->detach_state = PTHREAD_CREATE_JOINABLE;
   a->reserved = 0;
   return 0;
 }
 
 int pthread_attr_destroy(pthread_attr_t *a) {
   (void)a;
+  return 0;
+}
+
+int pthread_attr_setstacksize(pthread_attr_t *a, size_t stacksize) {
+  if (!a || stacksize < MIN_STACK_SIZE) return EINVAL;
+  a->stack_size = stacksize;
+  return 0;
+}
+
+int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *stacksize) {
+  if (!a || !stacksize) return EINVAL;
+  *stacksize = a->stack_size ? a->stack_size : (size_t)DEFAULT_STACK_SIZE;
+  return 0;
+}
+
+int pthread_attr_getdetachstate(const pthread_attr_t *a, int *detachstate) {
+  if (!a || !detachstate) return EINVAL;
+  *detachstate = a->detach_state;
   return 0;
 }
 
@@ -706,16 +745,113 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rw) {
   return rw ? pthread_mutex_unlock(&rw->mtx) : EINVAL;
 }
 
-/* gthr-posix / libstdc++ completion stubs. b1nix has no thread cancellation or
- * scheduling priorities; these exist so the symbols link (gthr weak refs) and
- * threading is reported active. */
+/* ── Deferred cancellation ───────────────────────────────────────────────────
+ * b1nix has no kernel-level thread cancellation, so cancellation is delivered
+ * cooperatively: pthread_cancel() flags the target, and the target acts on the
+ * flag the next time it passes a cancellation point (pthread_testcancel, or the
+ * join/cond_wait/sleep wrappers). State is tracked per kernel TID — the same
+ * key both sides can compute (the canceller resolves the target's TID from its
+ * pthread_state handle; the target uses gettid()), which sidesteps the
+ * self()=TID vs create()=state-pointer duality of pthread_t. */
+struct cancel_entry {
+  long tid;
+  volatile int requested;
+  int disabled;            /* PTHREAD_CANCEL_DISABLE */
+  struct cancel_entry *next;
+};
+static struct cancel_entry *g_cancel_head = NULL;
+static pthread_mutex_t g_cancel_lock = PTHREAD_MUTEX_INITIALIZER;
+
+static struct cancel_entry *cancel_find(long tid, int create) {
+  pthread_mutex_lock(&g_cancel_lock);
+  for (struct cancel_entry *e = g_cancel_head; e; e = e->next) {
+    if (e->tid == tid) { pthread_mutex_unlock(&g_cancel_lock); return e; }
+  }
+  struct cancel_entry *e = NULL;
+  if (create) {
+    e = (struct cancel_entry *)malloc(sizeof(*e));
+    if (e) {
+      e->tid = tid;
+      e->requested = 0;
+      e->disabled = 0;
+      e->next = g_cancel_head;
+      g_cancel_head = e;
+    }
+  }
+  pthread_mutex_unlock(&g_cancel_lock);
+  return e;
+}
+
+/* Drop a thread's cancellation record on exit so a recycled TID starts clean. */
+void __pthread_cancel_forget(long tid) {
+  pthread_mutex_lock(&g_cancel_lock);
+  struct cancel_entry **pp = &g_cancel_head;
+  while (*pp) {
+    if ((*pp)->tid == tid) {
+      struct cancel_entry *dead = *pp;
+      *pp = dead->next;
+      free(dead);
+      break;
+    }
+    pp = &(*pp)->next;
+  }
+  pthread_mutex_unlock(&g_cancel_lock);
+}
+
+/* Resolve a pthread_t to a kernel TID. pthread_create() hands back the
+ * heap-allocated state pointer (>= the 0x2000000 userspace load base), whereas
+ * pthread_self() returns the small kernel TID directly — the value range tells
+ * them apart unambiguously. */
+static long cancel_target_tid(pthread_t thread) {
+  unsigned long v = (unsigned long)(long)thread;
+  if (v >= 0x2000000UL) {
+    struct pthread_state *st = (struct pthread_state *)(long)thread;
+    return (long)st->child_tid;
+  }
+  return (long)v;
+}
+
 int pthread_cancel(pthread_t thread) {
-  (void)thread;
-  return ENOSYS;
+  long tid = cancel_target_tid(thread);
+  if (tid <= 0) return ESRCH;
+  struct cancel_entry *e = cancel_find(tid, 1);
+  if (!e) return EAGAIN;
+  __atomic_store_n(&e->requested, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+int pthread_setcancelstate(int state, int *oldstate) {
+  if (state != PTHREAD_CANCEL_ENABLE && state != PTHREAD_CANCEL_DISABLE)
+    return EINVAL;
+  struct cancel_entry *e = cancel_find(syscall(SYS_GETTID), 1);
+  if (!e) return EAGAIN;
+  if (oldstate)
+    *oldstate = e->disabled ? PTHREAD_CANCEL_DISABLE : PTHREAD_CANCEL_ENABLE;
+  e->disabled = (state == PTHREAD_CANCEL_DISABLE);
+  return 0;
+}
+
+/* b1nix delivers cancellation only at cancellation points, so async vs deferred
+ * are equivalent here; the call is accepted for source compatibility. */
+int pthread_setcanceltype(int type, int *oldtype) {
+  if (type != PTHREAD_CANCEL_DEFERRED && type != PTHREAD_CANCEL_ASYNCHRONOUS)
+    return EINVAL;
+  if (oldtype)
+    *oldtype = PTHREAD_CANCEL_DEFERRED;
+  return 0;
+}
+
+void pthread_testcancel(void) {
+  struct cancel_entry *e = cancel_find(syscall(SYS_GETTID), 0);
+  if (e && !e->disabled && __atomic_load_n(&e->requested, __ATOMIC_ACQUIRE))
+    pthread_exit(PTHREAD_CANCELED);
 }
 int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate) {
-  (void)attr;
-  (void)detachstate;
+  if (!attr) return EINVAL;
+  if (detachstate != PTHREAD_CREATE_JOINABLE &&
+      detachstate != PTHREAD_CREATE_DETACHED)
+    return EINVAL;
+  attr->detach_state = detachstate;
   return 0;
 }
 int pthread_getschedparam(pthread_t thread, int *policy,

@@ -27,8 +27,17 @@ extern "C" {
 
 typedef long pthread_t;
 
+/* Detach-state values for pthread_attr_setdetachstate(). Defined here (rather
+ * than further down) so pthread_attr_t consumers and pthread_create see them. */
+#define PTHREAD_CREATE_JOINABLE 0
+#define PTHREAD_CREATE_DETACHED 1
+
 typedef struct {
-  /* Caller may zero-fill or use PTHREAD_MUTEX_INITIALIZER. */
+  /* 0 = use the libc default stack size; otherwise the requested size in
+   * bytes (clamped to a sane minimum by pthread_create). */
+  size_t stack_size;
+  /* PTHREAD_CREATE_JOINABLE (default) or PTHREAD_CREATE_DETACHED. */
+  int detach_state;
   unsigned int reserved;
 } pthread_attr_t;
 
@@ -137,21 +146,38 @@ int pthread_rwlock_unlock(pthread_rwlock_t *rw);
 /* ── Once ── */
 int pthread_once(pthread_once_t *once, void (*init_routine)(void));
 
-/* ── Attributes (placeholder, no real knobs honored on b1nix) ── */
+/* ── Attributes ── stack size and detach state are honored by
+ * pthread_create; other knobs (scheduling, guard size) are accepted but not
+ * acted on, matching b1nix's flat scheduling model. */
 int pthread_attr_init(pthread_attr_t *a);
 int pthread_attr_destroy(pthread_attr_t *a);
+int pthread_attr_setstacksize(pthread_attr_t *a, size_t stacksize);
+int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *stacksize);
+int pthread_attr_getdetachstate(const pthread_attr_t *a, int *detachstate);
 
 #ifdef __cplusplus
 }
 #endif
 
 
-/* Completion for gthr-posix / libstdc++ threading. Cancellation and scheduling
- * priority are stubbed (b1nix has neither); the symbols must exist so the weak
- * gthr references resolve and __gthread_active_p() sees a live threads model. */
-#define PTHREAD_CREATE_JOINABLE 0
-#define PTHREAD_CREATE_DETACHED 1
+/* Completion for gthr-posix / libstdc++ threading. Scheduling priority is a
+ * no-op (b1nix has a flat scheduler); the symbols must exist so the weak gthr
+ * references resolve and __gthread_active_p() sees a live threads model.
+ * PTHREAD_CREATE_JOINABLE/DETACHED are defined near pthread_attr_t above. */
+
+/* Deferred cancellation. A thread that has been cancelled and then reaches a
+ * cancellation point (pthread_testcancel(), or pthread_join/cond_wait/sleep)
+ * with cancellation enabled exits with PTHREAD_CANCELED as its return value.
+ * Asynchronous cancellation is accepted but treated as deferred. */
+#define PTHREAD_CANCEL_ENABLE        0
+#define PTHREAD_CANCEL_DISABLE       1
+#define PTHREAD_CANCEL_DEFERRED      0
+#define PTHREAD_CANCEL_ASYNCHRONOUS  1
+#define PTHREAD_CANCELED             ((void *)-1)
 int pthread_cancel(pthread_t thread);
+int pthread_setcancelstate(int state, int *oldstate);
+int pthread_setcanceltype(int type, int *oldtype);
+void pthread_testcancel(void);
 int pthread_attr_setdetachstate(pthread_attr_t *attr, int detachstate);
 int pthread_getschedparam(pthread_t thread, int *policy, struct sched_param *param);
 int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param *param);

@@ -1636,6 +1636,17 @@ clock_t times(struct tms *buf) {
   return (clock_t)rc;
 }
 
+/* vfork() is intentionally an alias for fork(), which POSIX explicitly permits
+ * ("vfork() may behave like fork()"). A true vfork — child borrows the parent's
+ * address space and stack while the parent is suspended until execve()/_exit()
+ * — needs a kernel CLONE_VFORK (parent-suspend) primitive that b1nix does not
+ * implement, plus a hand-written assembly wrapper (the C frame must not unwind
+ * the shared stack the parent will resume on). The performance argument is also
+ * weak here: b1nix fork() is copy-on-write (paging_clone_address_space marks
+ * pages read-only rather than copying them), so the only cost vfork would save
+ * is duplicating the page-table hierarchy — not the page contents. The risk to
+ * process launch / TCC of getting shared-stack semantics subtly wrong far
+ * outweighs that, so the alias stands by design. */
 pid_t vfork(void) {
   return fork();
 }
