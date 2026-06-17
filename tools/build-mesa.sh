@@ -121,9 +121,30 @@ if [ -d "$PATCH_DIR" ]; then
   fi
 fi
 
+# Wire the gallium virgl driver to the b1nix winsys instead of the libdrm/vtest
+# ones (b1nix has no libdrm), and drop the driver's vestigial dep_libdrm (it
+# uses no drm symbols; its lone <libsync.h> resolves to Mesa's own src/util one).
+# Idempotent SED edits (the substituted strings no longer match on re-runs).
+if sed --version >/dev/null 2>&1; then SEDI() { sed -i "$@"; }
+else SEDI() { sed -i '' "$@"; } fi
+SEDI "s|subdir('winsys/virgl/drm')|subdir('winsys/virgl/b1nix')|" "$SRC_DIR/src/gallium/meson.build"
+SEDI "/subdir('winsys\/virgl\/vtest')/d" "$SRC_DIR/src/gallium/meson.build"
+SEDI "s|dependencies : \[dep_libdrm, idep_mesautil, idep_xmlconfig, idep_nir\],|dependencies : [idep_mesautil, idep_xmlconfig, idep_nir],|" "$SRC_DIR/src/gallium/drivers/virgl/meson.build"
+SEDI "s|link_with : \[libvirgl, libvirgldrm, libvirglvtest\],|link_with : [libvirgl, libvirglb1nix],|" "$SRC_DIR/src/gallium/drivers/virgl/meson.build"
+# The virgl driver's lone <libsync.h> (angle-bracket, from libdrm) — point it at
+# Mesa's own src/util/libsync.h instead, since we dropped dep_libdrm.
+SEDI 's|#include <libsync.h>|#include "util/libsync.h"|' "$SRC_DIR/src/gallium/drivers/virgl/virgl_context.c"
+# Stub virgl_disk_cache_create: it uses util/build_id which is empty without
+# HAVE_DL_ITERATE_PHDR (b1nix has none), and the shader/disk cache is disabled
+# anyway. Idempotent (the stubbed body re-matches to the same stub).
+perl -0pi -e 's/static void virgl_disk_cache_create\(struct virgl_screen \*screen\)\n\{.*?\n\}/static void virgl_disk_cache_create(struct virgl_screen *screen)\n{\n   screen->disk_cache = NULL; \/* b1nix: no build-id\/disk cache *\/\n}/s' "$SRC_DIR/src/gallium/drivers/virgl/virgl_screen.c"
+# virgl_video.c uses MIN/MAX (from <sys/param.h> on Linux); b1nix lacks them.
+# Inject portable defines after the first #include (idempotent: skip if present).
+perl -0pi -e 'unless (/#define MIN\(a,\s*b\)/) { s/(#include [^\n]*\n)/$1#ifndef MIN\n#define MIN(a, b) ((a) < (b) ? (a) : (b))\n#endif\n#ifndef MAX\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\n#endif\n/; }' "$SRC_DIR/src/gallium/drivers/virgl/virgl_video.c"
+
 if [ ! -f "$MESON_BUILD/build.ninja" ]; then
   ( cd "$SRC_DIR" && meson setup "$MESON_BUILD" --cross-file "$INI" \
-      -Dgallium-drivers=swrast -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
+      -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
       -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dopengl=true \
       -Dgles1=disabled -Dgles2=disabled -Dshared-glapi=disabled \
       -Ddefault_library=static -Dzstd=disabled -Dlibunwind=disabled \
