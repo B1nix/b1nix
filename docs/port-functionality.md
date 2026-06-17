@@ -33,6 +33,7 @@ smoke suite on **both** arches.
 | **BusyBox** | upstream `alloc_affinity.c` (CPU-affinity) | real `sched_getaffinity` (stub removed) |
 | **curl** | static `libpsl` + `libidn2` + `libunistring` support | static compilation linked to libcurl.a |
 | **libc** | `setlocale()`, `localeconv()`, `nl_langinfo()` | native libc implementations |
+| **kernel/libc** | `syslog`/`openlog`/`closelog` deliver to a kernel `/dev/log` sink (→ serial/kernel log); `utmp`/`wtmp` file API; `pam_*` shim over `crypt`/shadow | `/dev/log` char-device write_cb forwards to the kernel log; libc `unistd.c`/`utmp.c`/`pam.c` (all exercised by M29 smoke) |
 
 ## M54 remaining: full feature parity
 
@@ -42,11 +43,24 @@ work, not flag flips. (They are *not* separate milestones; this is one tracked
 effort.)
 
 ### System logging (`/dev/log`) and login accounting
-- **Unlocks:** dropbear `--enable-syslog`, `lastlog`, `utmp`/`utmpx`,
-  `wtmp`/`wtmpx`; BusyBox `syslogd`/`logger`/`last`/`who`; standard `openlog`/
-  `syslog`/`closelog` for every port.
-- **Work:** a `/dev/log` datagram sink + in-kernel (or `syslogd`) ring, and the
-  `utmp`/`wtmp` file API in libc with a real `/var/run/utmp`, `/var/log/wtmp`.
+- **Foundation: DONE.** `/dev/log` is a kernel char-device sink that forwards
+  every datagram to the kernel log (no userspace syslogd needed); libc
+  `openlog`/`syslog`/`closelog` write there, and the `utmp`/`wtmp` file API and a
+  `pam_*` shim over `crypt`/shadow are real in libc. All verified by the M29
+  smoke (`M29-PTHREAD: ok syslog/utmp/pam`, plus the `/dev/log: …` sink line —
+  which already captures real port traffic, e.g. BusyBox `passwd`).
+- **Remaining (per-port flips), low value:** these now *link*, but were
+  evaluated and left off:
+  - dropbear `--enable-syslog` — **declined.** It works (sshd logs flow to
+    `/dev/log`), but it moves logging *off* the per-service `/var/log/sshd.log`
+    that the service script writes and the M32B lifecycle smoke asserts
+    non-empty. dropbear already logs to a file; routing it to syslog is a
+    lateral move that breaks that, so it stays `--disable-syslog`.
+  - dropbear `--enable-harden` — **declined.** Bundles `-fPIE -pie`, which
+    conflicts with the fixed `0x2000000` load model.
+  - dropbear `--enable-pam`/`-utmp`/`-lastlog` + BusyBox `syslogd`/`last`/`who`
+    — cosmetic (who/last accounting); need `/var/run/utmp`, `/var/log/wtmp`
+    plumbing. Enable per-port only if a real need appears.
 
 ### PAM (pluggable authentication)
 - **Unlocks:** dropbear `--enable-pam`; `login`/`su`/`passwd` PAM stacks.

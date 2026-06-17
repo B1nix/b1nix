@@ -18,6 +18,7 @@
 #include <b1nix/rwlock.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -1894,6 +1895,30 @@ static int null_poll(struct vfs_node *node, struct b1nix_pollfd *pfd) {
   return 0;
 }
 
+/* /dev/log: kernel syslog sink. Datagrams written here (by libc syslog()) are
+ * forwarded straight to the serial console — so logs from any port land in the
+ * kernel log with no userspace syslogd to run.
+ * ponytail: a char-device sink, not an AF_UNIX endpoint. If a real syslogd is
+ * ever added, give it the AF_UNIX SOCK_DGRAM /dev/log path back. */
+static isize log_write(struct vfs_node *node, u64 offset, const char *buffer,
+                       usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (!buffer)
+    return -1;
+  char line[512];
+  usize n = size < sizeof(line) - 1 ? size : sizeof(line) - 1;
+  memcpy(line, buffer, n);
+  while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+    n--;
+  line[n] = '\0';
+  serial_write("/dev/log: ");
+  serial_write(line);
+  serial_write("\n");
+  return (isize)size;
+}
+
 static void null_init_node(void) {
   struct vfs_node *n = add_node("/dev/null", VFS_DEVICE, 0, 0, 0);
   if (n) {
@@ -1901,6 +1926,13 @@ static void null_init_node(void) {
     n->inode->write_cb = null_write;
     n->inode->poll_cb = null_poll;
     n->inode->mode =
+        VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
+  }
+  struct vfs_node *l = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);
+  if (l) {
+    l->inode->write_cb = log_write;
+    l->inode->poll_cb = null_poll;
+    l->inode->mode =
         VFS_IRUSR | VFS_IWUSR | VFS_IRGRP | VFS_IWGRP | VFS_IROTH | VFS_IWOTH;
   }
 }
@@ -2049,6 +2081,16 @@ void vfs_repopulate_after_root_mount(void) {
   if (node && !IS_ERR(node)) {
     node->inode->read_cb = null_read;
     node->inode->write_cb = null_write;
+    node->inode->poll_cb = null_poll;
+    node->inode->mode = 0666;
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = add_node("/dev/log", VFS_DEVICE, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->write_cb = log_write;
     node->inode->poll_cb = null_poll;
     node->inode->mode = 0666;
     node->inode->uid = 0;

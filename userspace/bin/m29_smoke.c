@@ -355,6 +355,13 @@ static int test_syslog(void) {
   syslog(LOG_INFO, "syslog test message: %s", "success");
   closelog();
   ok("syslog");
+
+  /* Sink delivery: no LOG_PERROR/LOG_CONS, so this line can only reach the
+   * serial log via the kernel /dev/log sink. The smoke harness greps for the
+   * sentinel to prove the sink (not the stderr fallback) delivered it. */
+  openlog("m54sink", LOG_PID, LOG_USER);
+  syslog(LOG_INFO, "M54-LOG sink-delivers-ok");
+  closelog();
   return 0;
 }
 

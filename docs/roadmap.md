@@ -857,8 +857,11 @@ no-fake-pass smoke test.
   Seven render/interaction paths green both arches (x86_64 739/0, x86 738/0):
   file:// (off-screen + on-screen /dev/fb0 + windowed displayd), loopback HTTP,
   loopback HTTPS, public-internet HTTPS, and keyboard/mouse input.
-- [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
-  browser or another real application requires it.
+- [ ] `stubbed` Use that port to assess Chromium; add Vulkan only when a
+  browser or another real application requires it. Assessment in progress and
+  tracked in [`chromium-assessment.md`](chromium-assessment.md) — current
+  verdict: blocked on whole subsystems (sandbox/namespaces, GPU EGL/GBM/Vulkan,
+  full C++ runtime), not pursued; revisit conditions listed there.
 
 ## M54: Third-Party Port Feature Enablement
 
@@ -886,8 +889,13 @@ status table and the conditions for each remaining item:
 - [ ] `planned` **Full feature parity** — the remaining disabled features, each
   blocked on a real subsystem or a large library port (details and enable
   conditions in [`port-functionality.md`](port-functionality.md)):
-  - System logging + login accounting: `/dev/log` and `utmp`/`wtmp`/`lastlog`
-    → dropbear syslog/lastlog/utmp, BusyBox `syslogd`/`last`.
+  - System logging + login accounting: **foundation done** — kernel `/dev/log`
+    sink (→ kernel log) + libc `syslog`/`utmp`/`wtmp` + `pam_*` shim, verified by
+    M29 smoke. Per-port flips evaluated and left off (low value): dropbear
+    `--enable-syslog` would break the per-service `/var/log/sshd.log` the M32B
+    lifecycle smoke asserts; `--enable-harden` conflicts with the fixed load
+    address; utmp/pam/lastlog are cosmetic who/last accounting. See
+    [`port-functionality.md`](port-functionality.md).
   - PAM: a minimal `libpam`/policy engine → dropbear `--enable-pam`,
     login/su/passwd stacks.
   - Full locale / multibyte: wide-char/locale + a real `iconv` → bash
