@@ -94,6 +94,33 @@ if [ "$B1NIX_ARCH" = "x86" ]; then
   SEDI "/    pre_args += \['-DUSE_X86_ASM'\]/d" "$SRC_DIR/meson.build"
 fi
 
+# b1nix Mesa source changes (e.g. the VirGL winsys for /dev/virtio-gpu, M53
+# variant B) live in this repo, NOT in the extracted tarball, so they are
+# reproducible on any host. Apply them here, idempotently:
+#   tools/patches/mesa/*.patch     — unified diffs against the Mesa tree (-p1)
+#   tools/patches/mesa/files/...   — whole b1nix-owned files copied into the tree
+# Patches are skipped if already applied (a reverse dry-run succeeds); files are
+# copied verbatim every run (a copy is itself idempotent).
+PATCH_DIR="$ROOT_DIR/tools/patches/mesa"
+if [ -d "$PATCH_DIR" ]; then
+  for p in "$PATCH_DIR"/*.patch; do
+    [ -e "$p" ] || continue
+    if patch -p1 -d "$SRC_DIR" --dry-run -R <"$p" >/dev/null 2>&1; then
+      echo "build-mesa: patch already applied: $(basename "$p")" 1>&2
+    elif patch -p1 -d "$SRC_DIR" --dry-run <"$p" >/dev/null 2>&1; then
+      patch -p1 -d "$SRC_DIR" <"$p" 1>&2
+      echo "build-mesa: applied patch: $(basename "$p")" 1>&2
+    else
+      echo "build-mesa: ERROR: cannot apply $(basename "$p")" 1>&2
+      exit 1
+    fi
+  done
+  if [ -d "$PATCH_DIR/files" ]; then
+    cp -R "$PATCH_DIR/files/." "$SRC_DIR/" 1>&2
+    echo "build-mesa: installed b1nix Mesa files" 1>&2
+  fi
+fi
+
 if [ ! -f "$MESON_BUILD/build.ninja" ]; then
   ( cd "$SRC_DIR" && meson setup "$MESON_BUILD" --cross-file "$INI" \
       -Dgallium-drivers=swrast -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
