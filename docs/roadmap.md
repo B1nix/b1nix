@@ -423,8 +423,15 @@ Source-level ports remain preferable to a Linux compatibility layer.
 - [x] Promote upstream `ash` to `/bin/sh`.
 - [x] Add an explicit applet-selection manifest.
 - [x] Retire the local in-kernel BusyBox-style utility implementation.
-- [ ] `planned` Replace userspace-provided `sa_restorer` with a kernel-owned
-  signal-return trampoline.
+- [x] Replace userspace-provided `sa_restorer` with a kernel-owned signal-return
+  trampoline. The ELF loader maps a per-process **read-only, executable** page
+  (a tiny `mov $SYS_SIGRETURN, %eax; int $0x80`/`syscall` stub) one page below
+  the TLS/stack region; `arch_build_signal_frame` points the handler's return
+  address at it instead of trusting a userspace `sa_restorer` (which a setuid
+  process could not be allowed to control). `sa_restorer` is now only a fallback
+  if the page could not be mapped (OOM). Confirmed used on both arches by
+  forcing the fallback to a garbage address and observing the M15 signal-
+  handler/mask tests still pass (x86 744/0, x86_64 745/0).
 
 ## M43: Real-Filesystem Validation and NTFS
 

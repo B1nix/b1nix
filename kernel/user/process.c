@@ -1534,6 +1534,11 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     current_task->vma_list = stack_vma;
   }
 
+  /* Lowest high-VA region reserved so far (bottom of the stack growth window);
+   * lowered to the TLS region when present. The signal trampoline is mapped one
+   * page below this, where the upward-growing brk heap cannot reach it. */
+  u64 low_reserved = image->address_space.stack_top - USER_STACK_MAX_SIZE;
+
 #if defined(__x86_64__) || defined(__i386__)
   /* Main-thread TLS (x86 variant II). Layout: [ tdata | tbss ][ TCB ], with the
    * thread pointer (TP) at the TCB and TCB[0] = TP (the self pointer that
@@ -1550,6 +1555,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 region = (image->address_space.stack_top - USER_STACK_MAX_SIZE -
                   block_size - PAGE_SIZE) &
                  ~(PAGE_SIZE - 1);
+    low_reserved = region;
     u64 tp = region + tls_size;
     u64 db = vmm_direct_map_base();
 
@@ -1593,6 +1599,44 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     }
   }
 #endif
+
+  /* M42: kernel-owned signal-return trampoline. Map a read-only, executable
+   * page one page below the highest reserved region, holding a tiny
+   * `mov $SYS_SIGRETURN, %eax; <syscall>` stub. arch_build_signal_frame points
+   * the signal handler's return address here instead of trusting a
+   * userspace-supplied sa_restorer — the page is not writable, so userspace
+   * cannot tamper with the return path (matters for setuid). */
+  {
+    u64 tva = (low_reserved - PAGE_SIZE) & ~(PAGE_SIZE - 1);
+    u64 tframe = pmm_alloc_frame();
+    if (tframe) {
+      vmm_map_page(tva, tframe, VMM_USER); /* RO (no WRITABLE) + executable */
+      u8 *code = (u8 *)(usize)(vmm_direct_map_base() + tframe);
+      memset(code, 0, PAGE_SIZE);
+      code[0] = 0xB8; /* mov $imm32, %eax */
+      code[1] = (u8)(SYS_SIGRETURN & 0xff);
+      code[2] = (u8)((SYS_SIGRETURN >> 8) & 0xff);
+      code[3] = (u8)((SYS_SIGRETURN >> 16) & 0xff);
+      code[4] = (u8)((SYS_SIGRETURN >> 24) & 0xff);
+#ifdef __x86_64__
+      code[5] = 0x0F;
+      code[6] = 0x05; /* syscall */
+#else
+      code[5] = 0xCD;
+      code[6] = 0x80; /* int $0x80 */
+#endif
+      struct vm_area *tvma = kzalloc(sizeof(struct vm_area));
+      if (tvma) {
+        tvma->start = tva;
+        tvma->end = tva + PAGE_SIZE;
+        tvma->prot = PROT_READ | PROT_EXEC;
+        tvma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        tvma->next = current_task->vma_list;
+        current_task->vma_list = tvma;
+      }
+      image->sigreturn_trampoline = tva;
+    }
+  }
 
   if ((image->address_space.stack_base & 0xFULL) != 0) {
     console_write("user: reject unaligned ring3 stack\n");

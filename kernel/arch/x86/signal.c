@@ -24,8 +24,16 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   u32 frame_base = (user_esp - sizeof(struct b1nix_sigframe)) & ~0xF;
   u32 restorer_slot = frame_base - 8;
 
+  /* Prefer the kernel-owned signal-return trampoline (mapped RO+exec at exec);
+   * fall back to a userspace-supplied sa_restorer only if it was not mapped
+   * (e.g. OOM at exec). The trampoline is tamper-proof — userspace cannot
+   * redirect the return path, which matters for setuid programs. */
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  u64 restorer = (img && img->sigreturn_trampoline)
+                     ? img->sigreturn_trampoline
+                     : (u64)(usize)sa->sa_restorer;
   if (!is_valid_user_code_ptr((u64)(usize)sa->sa_handler) ||
-      !is_valid_user_code_ptr((u64)(usize)sa->sa_restorer)) {
+      !is_valid_user_code_ptr(restorer)) {
     scheduler_exit_current(-SIGSEGV);
     return;
   }
@@ -42,7 +50,7 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   sf.saved_frame = *frame;
 
   u32 sig_arg = (u32)sig;
-  u32 restorer_val = (u32)(usize)sa->sa_restorer;
+  u32 restorer_val = (u32)restorer;
 
   if (syscall_copyout((void *)(usize)frame_base, &sf, sizeof(sf)) < 0 ||
       syscall_copyout((void *)(usize)(frame_base - 4), &sig_arg, sizeof(sig_arg)) < 0 ||

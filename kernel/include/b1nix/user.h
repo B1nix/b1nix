@@ -73,6 +73,10 @@ struct user_loaded_image {
 	u64 tls_filesz;
 	u64 tls_align;
 	void *tls_data;
+	/* M42: user VA of the kernel-owned signal-return trampoline page (RO+exec),
+	 * mapped at exec. arch_build_signal_frame points the handler's return here
+	 * instead of trusting a userspace-supplied sa_restorer. 0 = not mapped. */
+	u64 sigreturn_trampoline;
 };
 
 void userspace_init(void);
