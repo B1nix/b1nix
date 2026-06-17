@@ -3,8 +3,18 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/panic.h>
+
+/* Global lock for the shm_segments[] and proc_attaches[] tables. Held only
+ * around bookkeeping (segment/slot allocation, shm_nattch, the attach table);
+ * the per-process page-table work (vm_find_free_area / vmm_map_page /
+ * vmm_unmap_page + TLB shootdown) and serial logging are done OUTSIDE the lock
+ * so a shootdown round-trip or a slow UART never runs with the lock held.
+ * A segment reserved with shm_nattch>0 cannot be IPC_RMID'd, which is what
+ * lets shmat map its pages safely after dropping the lock. */
+static spinlock_t shm_lock = SPINLOCK_INIT;
 
 /* POSIX: only the segment's owner/creator or the superuser may IPC_RMID or
  * IPC_SET a segment. Returns 1 if the caller is permitted. */
@@ -35,6 +45,7 @@ static struct proc_attachments proc_attaches[MAX_PROC_ATTACH];
 /* ── Forward declarations ── */
 
 static struct proc_attachments *find_or_create_proc_attaches(usize pid);
+static struct proc_attachments *find_proc_attaches(usize pid);
 static int find_free_shmid(void);
 static int find_proc_attach_slot(struct proc_attachments *pa);
 
@@ -51,7 +62,7 @@ void shm_init(void)
     console_write(" KB max size)\n");
 }
 
-/* ── Helpers ── */
+/* ── Helpers (all callers hold shm_lock) ── */
 
 static int find_free_shmid(void)
 {
@@ -59,6 +70,14 @@ static int find_free_shmid(void)
         if (!shm_segments[i].used) return i;
     }
     return -1;
+}
+
+static struct proc_attachments *find_proc_attaches(usize pid)
+{
+    for (int i = 0; i < MAX_PROC_ATTACH; i++) {
+        if (proc_attaches[i].pid == pid) return &proc_attaches[i];
+    }
+    return 0;
 }
 
 static struct proc_attachments *find_or_create_proc_attaches(usize pid)
@@ -96,43 +115,51 @@ int shmget(u32 key, usize size, int shmflg)
     int create = (shmflg & IPC_CREAT) != 0;
     int excl   = (shmflg & IPC_EXCL) != 0;
 
+    int npages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
+    if (npages > (int)(SHMMAX / PAGE_SIZE)) return -1;
+
+    usize pid = scheduler_get_pid();
+
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+
     /* First, look for existing segment with this key */
     for (int i = 0; i < SHMMNI; i++) {
         if (shm_segments[i].used && shm_segments[i].key == key) {
+            spin_unlock_irqrestore(&shm_lock, flags);
             if (create && excl) return -1; /* IPC_EXCL and exists */
-            return i; /* Return existing shmid */
+            return i;                      /* Return existing shmid */
         }
     }
 
-    if (!create) return -1; /* Doesn't exist and IPC_CREAT not specified */
+    if (!create) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return -1; /* Doesn't exist and IPC_CREAT not specified */
+    }
 
     /* Create new segment */
     int shmid = find_free_shmid();
-    if (shmid < 0) return -1;
+    if (shmid < 0) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return -1;
+    }
 
     struct shm_segment *seg = &shm_segments[shmid];
     memset(seg, 0, sizeof(*seg));
     seg->used = 1;
     seg->key = key;
 
-    usize pid = scheduler_get_pid();
-
-    /* Calculate number of pages needed */
-    int npages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (npages > (int)(SHMMAX / PAGE_SIZE)) {
-        seg->used = 0;
-        return -1;
-    }
-
-    /* Allocate physical pages */
+    /* Allocate physical pages. ponytail: pmm_alloc runs under shm_lock — fine
+     * for typical small segments; a multi-MiB segment holds the lock across a
+     * long alloc loop. Split with a not-ready flag if that ever matters. */
     for (int p = 0; p < npages; p++) {
         seg->physical_pages[p] = pmm_alloc_frame();
         if (seg->physical_pages[p] == 0) {
-            /* Free already allocated pages on failure */
             for (int q = 0; q < p; q++) {
                 pmm_free_frame(seg->physical_pages[q]);
             }
             seg->used = 0;
+            spin_unlock_irqrestore(&shm_lock, flags);
             return -1;
         }
     }
@@ -155,6 +182,8 @@ int shmget(u32 key, usize size, int shmflg)
     seg->ds.shm_npages = npages;
     seg->page_count = npages;
 
+    spin_unlock_irqrestore(&shm_lock, flags);
+
     console_write("shm: created segment id=");
     console_write_dec(shmid);
     console_write(" key=0x");
@@ -175,20 +204,46 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     (void)shmaddr; /* We ignore requested addr for simplicity (SHM_RND moot) */
 
     if (shmid < 0 || shmid >= SHMMNI) return (void *)-1;
-    if (!shm_segments[shmid].used) return (void *)-1;
 
-    struct shm_segment *seg = &shm_segments[shmid];
     usize pid = scheduler_get_pid();
 
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+
+    struct shm_segment *seg = &shm_segments[shmid];
+    if (!seg->used) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return (void *)-1;
+    }
+
     struct proc_attachments *pa = find_or_create_proc_attaches(pid);
-    if (!pa) return (void *)-1;
+    if (!pa) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return (void *)-1;
+    }
 
     int slot = find_proc_attach_slot(pa);
-    if (slot < 0) return (void *)-1; /* Too many attachments */
+    if (slot < 0) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return (void *)-1; /* Too many attachments */
+    }
 
-    /* Find a free virtual address for mapping */
-    u64 vaddr = vm_find_free_area(current_task, seg->page_count * PAGE_SIZE);
-    if (vaddr == (u64)-1) return (void *)-1;
+    /* Reserve the slot and bump shm_nattch BEFORE dropping the lock: while
+     * shm_nattch>0 the segment cannot be IPC_RMID'd, so its pages stay valid
+     * while we map them below without the lock. */
+    int npages = seg->page_count;
+    pa->attaches[slot].used = 1;
+    pa->attaches[slot].shmid = shmid;
+    pa->attaches[slot].virtual_addr = 0; /* finalized after the mapping */
+    seg->ds.shm_nattch++;
+    seg->ds.shm_lpid = (u16)pid;
+
+    spin_unlock_irqrestore(&shm_lock, flags);
+
+    /* Find a free virtual address for mapping (per-process, no shm_lock). */
+    u64 vaddr = vm_find_free_area(current_task, (u64)npages * PAGE_SIZE);
+    if (vaddr == (u64)-1)
+        goto fail_unreserve;
 
     /* SHM_RDONLY: map without VMM_WRITABLE so writes fault (POSIX read-only
      * attach), instead of always mapping writable. */
@@ -196,10 +251,10 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     if (!(shmflg & SHM_RDONLY))
         map_flags |= VMM_WRITABLE;
 
-    /* Map all pages into user virtual space */
-    int npages = seg->page_count;
+    /* Map all pages into user virtual space. seg->physical_pages is stable —
+     * the reserved shm_nattch keeps the segment alive. */
     for (int p = 0; p < npages; p++) {
-        u64 page_vaddr = vaddr + p * PAGE_SIZE;
+        u64 page_vaddr = vaddr + (u64)p * PAGE_SIZE;
         /* VMM_SHARED bypasses CoW on fork. */
         vmm_map_page(page_vaddr, seg->physical_pages[p], map_flags);
         /* Explicitly increment physical frame refcount for this new mapping */
@@ -209,18 +264,17 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     /* Create VMA for this region */
     struct vm_area *vma = kmalloc(sizeof(struct vm_area));
     if (!vma) {
-        for (int p = 0; p < npages; p++) {
-            vmm_unmap_page(vaddr + p * PAGE_SIZE);
-        }
-        return (void *)-1;
+        for (int p = 0; p < npages; p++)
+            vmm_unmap_page(vaddr + (u64)p * PAGE_SIZE);
+        goto fail_unreserve;
     }
     vma->start = vaddr;
-    vma->end = vaddr + npages * PAGE_SIZE;
+    vma->end = vaddr + (u64)npages * PAGE_SIZE;
     vma->prot = (shmflg & SHM_RDONLY) ? PROT_READ : (PROT_READ | PROT_WRITE);
     vma->flags = MAP_SHARED;
     vma->node = 0;
     vma->offset = 0;
-    
+
     /* Insert VMA into current_task */
     struct vm_area **prev = &current_task->vma_list;
     struct vm_area *curr = current_task->vma_list;
@@ -231,14 +285,11 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     vma->next = curr;
     *prev = vma;
 
-    /* Record attachment */
-    pa->attaches[slot].used = 1;
-    pa->attaches[slot].shmid = shmid;
+    /* Finalize the attach record under the lock. */
+    spin_lock_irqsave(&shm_lock, &flags);
     pa->attaches[slot].virtual_addr = vaddr;
-
-    seg->ds.shm_nattch++;
     seg->ds.shm_atime = 0; /* Would use a timestamp */
-    seg->ds.shm_lpid = (u16)pid;
+    spin_unlock_irqrestore(&shm_lock, flags);
 
     console_write("shm: attached id=");
     console_write_dec(shmid);
@@ -247,6 +298,16 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
     console_write("\n");
 
     return (void *)(usize)vaddr;
+
+fail_unreserve:
+    /* Roll back the reservation made above. */
+    spin_lock_irqsave(&shm_lock, &flags);
+    pa->attaches[slot].used = 0;
+    pa->attaches[slot].shmid = 0;
+    if (seg->ds.shm_nattch > 0)
+        seg->ds.shm_nattch--;
+    spin_unlock_irqrestore(&shm_lock, flags);
+    return (void *)-1;
 }
 
 /* ── shmdt: Detach shared memory segment ── */
@@ -254,44 +315,53 @@ void *shmat(int shmid, const void *shmaddr, int shmflg)
 int shmdt(const void *shmaddr)
 {
     usize pid = scheduler_get_pid();
-    struct proc_attachments *pa = find_or_create_proc_attaches(pid);
-    if (!pa) return -1;
 
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+
+    struct proc_attachments *pa = find_proc_attaches(pid);
+    if (!pa) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return -1;
+    }
+
+    int shmid = -1;
+    u64 vaddr = 0, size = 0;
     for (int i = 0; i < SHM_MAX_ATTACH_PER_PROC; i++) {
-        if (pa->attaches[i].used && 
+        if (pa->attaches[i].used &&
             pa->attaches[i].virtual_addr == (u64)(usize)shmaddr) {
-            
-            int shmid = pa->attaches[i].shmid;
+            shmid = pa->attaches[i].shmid;
             struct shm_segment *seg = &shm_segments[shmid];
-            
-            u64 vaddr = pa->attaches[i].virtual_addr;
-            u64 size = seg->page_count * PAGE_SIZE;
+            vaddr = pa->attaches[i].virtual_addr;
+            size = (u64)seg->page_count * PAGE_SIZE;
 
-            /* Unmap pages and drop physical refcounts */
-            for (u64 v = vaddr; v < vaddr + size; v += PAGE_SIZE) {
-                vmm_unmap_page(v);
-            }
-
-            /* Delete VMA */
-            vma_delete_range(current_task, vaddr, vaddr + size);
-
-            /* Clear attach record */
+            /* Release the bookkeeping under the lock; the unmap happens after. */
             pa->attaches[i].used = 0;
             pa->attaches[i].shmid = 0;
             pa->attaches[i].virtual_addr = 0;
-
-            seg->ds.shm_nattch--;
+            if (seg->ds.shm_nattch > 0)
+                seg->ds.shm_nattch--;
             seg->ds.shm_dtime = 0;
-
-            console_write("shm: detached id=");
-            console_write_dec(shmid);
-            console_write("\n");
-
-            return 0;
+            break;
         }
     }
 
-    return -1;
+    spin_unlock_irqrestore(&shm_lock, flags);
+
+    if (shmid < 0)
+        return -1; /* not attached at that address */
+
+    /* Unmap pages (drops the per-mapping frame ref) and delete the VMA —
+     * done outside the lock so the TLB shootdown does not run with it held. */
+    for (u64 v = vaddr; v < vaddr + size; v += PAGE_SIZE)
+        vmm_unmap_page(v);
+    vma_delete_range(current_task, vaddr, vaddr + size);
+
+    console_write("shm: detached id=");
+    console_write_dec(shmid);
+    console_write("\n");
+
+    return 0;
 }
 
 /* ── shmctl: Shared memory control ── */
@@ -299,74 +369,147 @@ int shmdt(const void *shmaddr)
 int shmctl(int shmid, int cmd, struct shmid_ds *buf)
 {
     if (shmid < 0 || shmid >= SHMMNI) return -1;
+
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+
     struct shm_segment *seg = &shm_segments[shmid];
-    if (!seg->used) return -1;
+    if (!seg->used) {
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return -1;
+    }
+
+    int rc = -1;
+    int removed = 0;
 
     switch (cmd) {
     case IPC_RMID:
         /* Only the owner/creator or root may remove the segment (POSIX). */
-        if (!shm_caller_may_control(seg)) return -1;
+        if (!shm_caller_may_control(seg)) break;
         /* Remove segment if no attachments */
-        if (seg->ds.shm_nattch > 0) return -1;
-        
-        /* Free all physical pages */
+        if (seg->ds.shm_nattch > 0) break;
+
+        /* Free all physical pages (pmm_free has no TLB shootdown). */
         for (int p = 0; p < seg->page_count; p++) {
             pmm_free_frame(seg->physical_pages[p]);
             seg->physical_pages[p] = 0;
         }
-        
         memset(seg, 0, sizeof(*seg));
-        console_write("shm: removed id=");
-        console_write_dec(shmid);
-        console_write("\n");
-        return 0;
+        removed = 1;
+        rc = 0;
+        break;
 
     case IPC_STAT:
         if (buf) {
             *buf = seg->ds;
-            return 0;
+            rc = 0;
         }
-        return -1;
+        break;
 
     case IPC_SET:
         /* Only the owner/creator or root may change ownership/permissions. */
-        if (!shm_caller_may_control(seg)) return -1;
+        if (!shm_caller_may_control(seg)) break;
         if (buf) {
             seg->ds.shm_perm.uid = buf->shm_perm.uid;
             seg->ds.shm_perm.gid = buf->shm_perm.gid;
             seg->ds.shm_perm.mode = buf->shm_perm.mode;
             seg->ds.shm_ctime = 0;
-            return 0;
+            rc = 0;
         }
-        return -1;
+        break;
 
     default:
-        return -1;
+        break;
     }
+
+    spin_unlock_irqrestore(&shm_lock, flags);
+
+    if (removed) {
+        console_write("shm: removed id=");
+        console_write_dec(shmid);
+        console_write("\n");
+    }
+    return rc;
 }
 
-/* ── Get process attachments (for cleanup on process exit) ── */
+/* ── Get process attachments (legacy accessor; caller does not hold the lock) ── */
 
 struct shm_attach *shm_get_process_attaches(usize pid)
 {
-    for (int i = 0; i < MAX_PROC_ATTACH; i++) {
-        if (proc_attaches[i].pid == pid) {
-            return proc_attaches[i].attaches;
-        }
-    }
-    return 0;
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+    struct proc_attachments *pa = find_proc_attaches(pid);
+    struct shm_attach *res = pa ? pa->attaches : 0;
+    spin_unlock_irqrestore(&shm_lock, flags);
+    return res;
 }
 
-/* ── Detach all segments for a process (called on exit) ── */
-
-void shm_detach_all(usize pid)
+/* ── Account a process's attachments at address-space teardown ──
+ *
+ * Called from user_address_space_cleanup() — the single chokepoint that
+ * tears down a user address space on voluntary exit, signal kill (OOM) and
+ * execve. The teardown itself unmaps the VMM_SHARED pages and drops the
+ * refcounted frames, so this only undoes the BOOKKEEPING: decrement
+ * shm_nattch for every still-attached segment and free the per-process slot.
+ * It touches no page tables, so it is safe in the reaper's context (the dying
+ * task's address space, not current_task's). Idempotent: a second call for a
+ * pid whose slot is already freed is a no-op. */
+void shm_account_exit(usize pid)
 {
-    struct shm_attach *attaches = shm_get_process_attaches(pid);
-    if (!attaches) return;
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
 
-    for (int i = 0; i < SHM_MAX_ATTACH_PER_PROC; i++) {
-        if (attaches[i].used) {
-            shmdt((const void *)(usize)attaches[i].virtual_addr);
+    struct proc_attachments *pa = find_proc_attaches(pid);
+    if (pa) {
+        for (int i = 0; i < SHM_MAX_ATTACH_PER_PROC; i++) {
+            if (!pa->attaches[i].used) continue;
+            int shmid = pa->attaches[i].shmid;
+            if (shmid >= 0 && shmid < SHMMNI && shm_segments[shmid].used &&
+                shm_segments[shmid].ds.shm_nattch > 0)
+                shm_segments[shmid].ds.shm_nattch--;
         }
+        pa->pid = 0;
+        memset(pa->attaches, 0, sizeof(pa->attaches));
     }
+
+    spin_unlock_irqrestore(&shm_lock, flags);
+}
+
+/* ── Account inherited attachments across fork ── */
+
+void shm_fork_inherit(usize parent_pid, usize child_pid)
+{
+    u64 flags;
+    spin_lock_irqsave(&shm_lock, &flags);
+
+    struct proc_attachments *ppa = find_proc_attaches(parent_pid);
+    if (!ppa) {
+        spin_unlock_irqrestore(&shm_lock, flags); /* parent had no attachments */
+        return;
+    }
+
+    /* fork clones the address space 1:1, so the child's shm vaddrs match the
+     * parent's. Mirror each attach into a child slot and count it in
+     * shm_nattch so IPC_RMID stays blocked until the child also detaches. */
+    struct proc_attachments *cpa = 0;
+    for (int i = 0; i < SHM_MAX_ATTACH_PER_PROC; i++) {
+        if (!ppa->attaches[i].used) continue;
+
+        if (!cpa) {
+            cpa = find_or_create_proc_attaches(child_pid);
+            if (!cpa) break; /* attach-table full — best effort */
+        }
+        int slot = find_proc_attach_slot(cpa);
+        if (slot < 0) break;
+
+        int shmid = ppa->attaches[i].shmid;
+        cpa->attaches[slot].used = 1;
+        cpa->attaches[slot].shmid = shmid;
+        cpa->attaches[slot].virtual_addr = ppa->attaches[i].virtual_addr;
+
+        if (shmid >= 0 && shmid < SHMMNI && shm_segments[shmid].used)
+            shm_segments[shmid].ds.shm_nattch++;
+    }
+
+    spin_unlock_irqrestore(&shm_lock, flags);
 }

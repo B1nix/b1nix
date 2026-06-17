@@ -626,6 +626,8 @@ check_output "$LOG" "M15-SMOKE: ok signal-handler" "userspace signal handler is 
 check_output "$LOG" "M15-SMOKE: ok signal-mask" "blocked signal is delivered after sigprocmask unblock"
 check_output "$LOG" "M15-SMOKE: ok ipc-mq" "message queue roundtrip works"
 check_output "$LOG" "M15-SMOKE: ok shm" "shared memory create/map/read/write lifecycle works"
+check_output "$LOG" "M15-SMOKE: ok shm-exit-cleanup" "shm attachment released on exit (IPC_RMID no longer blocked)"
+check_output "$LOG" "M15-SMOKE: ok shm-kill-cleanup" "shm attachment released when a child is SIGKILL'd (OOM path) + fork nattch accounting"
 check_output "$LOG" "M15-SMOKE: ok semaphore" "cooperative semaphore baseline works"
 check_output "$LOG" "M15-SMOKE: ok clock-timer" "clock_gettime and nanosleep work"
 check_output "$LOG" "M15-SMOKE: ok permissions-chmod" "chmod changes mode bits"

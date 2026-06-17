@@ -797,13 +797,28 @@ the documented known-issue:
   handler snapshotting + ref'ing `vma->node` under the lock across the blocking
   `read_cb`. The smoke suite does not exercise concurrent mmap/munmap from
   threads, so it cannot validate the fix — only catch a fault-path deadlock.
-- **R3-8 remainder — shm fork-nattch accounting + no-detach-on-exit leak.** The
-  creds + SHM_RDONLY parts are now fixed (above). What remains: a forked child's
-  inherited attachment is not counted in `shm_nattch`, and `shm_detach_all` is
-  still uncalled on exit, so `IPC_RMID` can stay blocked after an implicit
-  detach (a resource leak, not a UAF — frames are refcounted). Wiring detach
-  into the exit path safely needs ordering w.r.t. `mm_release_user`; do with a
-  fork+IPC_RMID test.
+- **R3-8 remainder — shm fork-nattch accounting + no-detach-on-exit leak + no
+  table lock.** FIXED (all paths). The bookkeeping cleanup is hooked at the
+  single address-space-teardown chokepoint `user_address_space_cleanup()` via
+  `shm_account_exit(pid)` (bookkeeping only — decrement `shm_nattch`, free the
+  per-process slot; the teardown's own unmap loop frees the refcounted shared
+  frames). That chokepoint runs for **voluntary exit (reaper), signal kill
+  (OOM-killer, reaper) and execve image replacement**, so the leak is closed on
+  every path — including SIGKILL, which never reaches `scheduler_exit_current`.
+  `fork` calls `shm_fork_inherit` to count the child's inherited `VMM_SHARED`
+  attachments. The `shm_segments[]`/`proc_attaches[]` tables are guarded by a
+  global `spin_lock_irqsave` (`shm_lock`), held only around bookkeeping — the
+  page-table work (`vm_find_free_area`/`vmm_map_page`/`vmm_unmap_page`+TLB
+  shootdown) and serial logging run outside it. `shmat` reserves the slot and
+  bumps `shm_nattch` under the lock, drops it to map (the reserved count blocks
+  `IPC_RMID` so the segment can't vanish mid-map), then re-locks to finalize;
+  `shmdt` does its bookkeeping under the lock and unmaps after. Verified by
+  `M15-SMOKE: ok shm-exit-cleanup` and `ok shm-kill-cleanup` (SIGKILL an
+  attached child → `IPC_RMID` then succeeds), both arches (x86 742/0,
+  x86_64 743/0). The execve/thread shmid-reuse-staleness corner is now moot for
+  execve (the chokepoint detaches on exec); the thread case (a non-leader thread
+  doing `shmat` keys by its own id) is the pre-existing recyclable-pid keying
+  weakness, unchanged.
 - **unix-socket lost-wakeup / connect-backlog / blocking-send**, and **journal
   crash-atomicity (write-ahead ordering, recovery validation)** — both need
   fault-injection / crash-replay coverage.

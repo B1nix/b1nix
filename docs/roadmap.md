@@ -530,12 +530,26 @@ mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
 - [x] `bug` **orphaned-pgrp false-negative with ≥2 children in one pgrp**
   (M46-2, medium) — FIXED: is_pgrp_orphaned ignores the exiting task as a
   parent (its children are about to be reparented to init).
-- [ ] `bug` Lower-severity / pending-verification leads: mqueue & shm have no
-  locking (shm also leaks on exit — `shm_detach_all` is never called); futex
-  lacks exit-time waiter cleanup and PROCESS_SHARED wakeups; aio ctx UAF on
-  exit; UNIX accept/recv lost-wakeups; journal crash-atomicity (write-ahead
-  ordering, pre-commit fs writes, unbounded recovery walk); swap/eviction ring
-  tables unlocked; signal-death exit skips reparent/orphan handling (M46-3).
+- [x] `bug` **shm leaked on exit + no table lock** — FIXED. shm bookkeeping is
+  now released at the single address-space-teardown chokepoint
+  (`user_address_space_cleanup` → `shm_account_exit`), which covers **voluntary
+  exit, signal kill (OOM-killer) and execve** — so a SIGKILL'd process no longer
+  leaks its attach (the teardown frees the refcounted frames; `shm_account_exit`
+  decrements `shm_nattch` and frees the per-process slot). `fork` accounts the
+  child's inherited `VMM_SHARED` attachments (`shm_fork_inherit`). The
+  `shm_segments[]`/`proc_attaches[]` tables are now guarded by a global
+  `spin_lock_irqsave` lock, held only around bookkeeping (the per-process
+  page-table work and serial logging run outside it; a reserved `shm_nattch`
+  keeps a segment alive while `shmat` maps it lock-free). Verified by
+  `M15-SMOKE: ok shm-exit-cleanup` and `ok shm-kill-cleanup` (the latter
+  SIGKILLs an attached child, then `IPC_RMID` succeeds), both arches
+  (x86 742/0, x86_64 743/0).
+- [ ] `bug` Remaining lower-severity / pending-verification leads: futex
+  PROCESS_SHARED cross-mmap wakeups; UNIX accept/recv lost-wakeups; journal
+  crash-atomicity (write-ahead ordering, pre-commit fs writes, unbounded
+  recovery walk); swap/eviction ring tables unlocked. (shm leak+lock, mqueue
+  locking, aio-ctx exit UAF, futex exit-time waiter cleanup, and signal-death
+  reparent/orphan handling (M46-3) are all fixed — see the audit doc.)
 
 ## M47: Userspace Display Server
 

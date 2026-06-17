@@ -151,6 +151,70 @@ int main(int argc, char **argv) {
     marker("M15-SMOKE: fail shmget\n");
   }
 
+  /* 5b) shm cleanup on exit: a child that attaches and exits WITHOUT shmdt
+   * must still have its attachment released, so the creator can IPC_RMID.
+   * Before the fix shm_nattch stayed 1 forever (leak) and IPC_RMID failed. */
+  int shmid2 = (int)syscall(SYS_SHMGET, 0x9998, 4096, 0x1000 | 0666);
+  if (shmid2 >= 0) {
+    int cpid = (int)syscall(SYS_FORK);
+    if (cpid == 0) {
+      int *s = (int *)syscall(SYS_SHMAT, shmid2, NULL, 0);
+      if (s != (void *)-1)
+        s[0] = 7;
+      syscall(SYS_EXIT, 0); /* no SHMDT — exercises shm_detach_all on exit */
+    } else if (cpid > 0) {
+      int status = 0;
+      syscall(SYS_WAITPID, cpid, &status, 0);
+      int rm = (int)syscall(SYS_SHMCTL, shmid2, 0, NULL); /* IPC_RMID */
+      if (rm == 0) {
+        marker("M15-SMOKE: ok shm-exit-cleanup\n");
+      } else {
+        marker("M15-SMOKE: fail shm-exit-cleanup\n");
+      }
+    } else {
+      marker("M15-SMOKE: fail shm-exit-cleanup fork\n");
+    }
+  } else {
+    marker("M15-SMOKE: fail shm-exit-cleanup shmget\n");
+  }
+
+  /* 5c) shm cleanup when a child is SIGKILL'd (OOM-killer path) + fork
+   * nattch accounting. Parent attaches; the child inherits that attach across
+   * fork (shm_fork_inherit bumps shm_nattch), signals via the shared page,
+   * then loops until killed. After the child is reaped and the parent detaches
+   * its own attach, IPC_RMID must succeed — proving the killed child's
+   * attachment was accounted (it never called shmdt). */
+  int shmid3 = (int)syscall(SYS_SHMGET, 0x9997, 4096, 0x1000 | 0666);
+  if (shmid3 >= 0) {
+    volatile int *sp = (volatile int *)syscall(SYS_SHMAT, shmid3, NULL, 0);
+    if (sp != (volatile int *)-1) {
+      sp[0] = 0;
+      int kpid = (int)syscall(SYS_FORK);
+      if (kpid == 0) {
+        sp[0] = 1;                       /* inherited attach + running */
+        for (;;) syscall(SYS_YIELD);     /* wait to be killed */
+      } else if (kpid > 0) {
+        while (sp[0] == 0) syscall(SYS_YIELD); /* child attached and ran */
+        syscall(SYS_KILL, kpid, SIGKILL);
+        int status = 0;
+        syscall(SYS_WAITPID, kpid, &status, 0);
+        syscall(SYS_SHMDT, (void *)sp);  /* drop the parent's own attach */
+        int rm = (int)syscall(SYS_SHMCTL, shmid3, 0, NULL); /* IPC_RMID */
+        if (rm == 0) {
+          marker("M15-SMOKE: ok shm-kill-cleanup\n");
+        } else {
+          marker("M15-SMOKE: fail shm-kill-cleanup\n");
+        }
+      } else {
+        marker("M15-SMOKE: fail shm-kill-cleanup fork\n");
+      }
+    } else {
+      marker("M15-SMOKE: fail shm-kill-cleanup attach\n");
+    }
+  } else {
+    marker("M15-SMOKE: fail shm-kill-cleanup shmget\n");
+  }
+
   /* 6) Cooperative userspace semaphore baseline (no kernel futex yet). */
   int sem = 0;
   int sem_ok = 0;

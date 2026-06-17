@@ -1305,6 +1305,17 @@ static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
 void user_address_space_cleanup(struct task *t) {
   if (!t) return;
 
+  /* Release this task's shm bookkeeping (shm_nattch + per-process attach slot)
+   * before we unmap its VMAs. This is the single teardown chokepoint for every
+   * path that drops a user address space — voluntary exit (via the reaper),
+   * signal kill (OOM-killer, also via the reaper) and execve image replacement
+   * — so a SIGKILL'd process no longer leaks its attach forever. The unmap
+   * loop below frees the (refcounted) shared frames. */
+  {
+    extern void shm_account_exit(usize pid);
+    shm_account_exit(t->id);
+  }
+
   extern void swap_free_all_slots(u64 pml4_phys);
   extern void eviction_unregister_all_pages(struct task *task);
   swap_free_all_slots(t->pml4_phys);

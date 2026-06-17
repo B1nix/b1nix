@@ -87,4 +87,16 @@ int  shmctl(int shmid, int cmd, struct shmid_ds *buf);
 /* For per-process tracking need to know current task id */
 struct shm_attach *shm_get_process_attaches(usize pid);
 
+/* Called from user_address_space_cleanup() on address-space teardown
+ * (voluntary exit, signal kill, execve): decrement shm_nattch for every
+ * still-attached segment and free the per-process attach slot. Bookkeeping
+ * only — the teardown unmaps the pages and frees the (refcounted) frames.
+ * Without this shm_nattch never reaches 0, IPC_RMID stays blocked forever and
+ * the attach table leaks. */
+void shm_account_exit(usize pid);
+
+/* fork: account the child's inherited VMM_SHARED attachments so shm_nattch
+ * counts both processes and the child's exit cleans up its own slot. */
+void shm_fork_inherit(usize parent_pid, usize child_pid);
+
 #endif /* B1NIX_SHM_H */

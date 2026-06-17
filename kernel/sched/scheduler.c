@@ -1114,6 +1114,14 @@ int scheduler_fork_current(void) {
     src_vma = src_vma->next;
   }
 
+  /* Account the shm segments the child inherited via the cloned VMM_SHARED
+   * VMAs so shm_nattch counts both processes (otherwise IPC_RMID could free a
+   * segment the child still maps) and the child's exit cleans up its slot. */
+  {
+    extern void shm_fork_inherit(usize parent_pid, usize child_pid);
+    shm_fork_inherit(parent->id, child->id);
+  }
+
   // 5. Clone credentials and file descriptors
   task_init_cred(child);
   child->fd_capacity = parent->fd_capacity;
