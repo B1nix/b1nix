@@ -193,11 +193,12 @@ int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
 int unix_listen(struct vfs_socket_state *s, int backlog);
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
 int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s);
-isize unix_send(struct vfs_socket_state *s, const void *buf, usize len);
+isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,
+                int nonblock);
 isize unix_recv(struct vfs_socket_state *s, void *buf, usize len);
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
-                        const struct b1nix_ucred *cred);
+                        const struct b1nix_ucred *cred, int nonblock);
 isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
                         int flags, struct vfs_handle **handles,
                         usize *nhandles, struct b1nix_ucred *cred,

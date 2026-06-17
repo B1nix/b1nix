@@ -819,9 +819,21 @@ the documented known-issue:
   execve (the chokepoint detaches on exec); the thread case (a non-leader thread
   doing `shmat` keys by its own id) is the pre-existing recyclable-pid keying
   weakness, unchanged.
-- **unix-socket lost-wakeup / connect-backlog / blocking-send**, and **journal
-  crash-atomicity (write-ahead ordering, recovery validation)** — both need
-  fault-injection / crash-replay coverage.
+- **unix-socket blocking-send** — FIXED. `unix_send_control` took O_NONBLOCK was
+  never plumbed in, so a full 4 KiB ring buffer always returned `EAGAIN` even on
+  a blocking socket. Now `socket.c` passes the fd's `O_NONBLOCK`/`MSG_DONTWAIT`
+  down; a blocking send parks on the peer (buffer-owner) socket with the
+  prepare/recheck/commit pattern and resumes as the reader drains
+  (`unix_recv_control` already wakes `peer_u->socket`; `unix_free_state` now also
+  wakes its own socket so a blocked sender sees a hangup). Verified by
+  `M48-FDPASS: ok unix-blocking-send` (16 KiB streamed through the 4 KiB buffer,
+  byte-checked), both arches (x86 743/0, x86_64 744/0). **connect-backlog** UAF
+  on signal was already fixed earlier (splice-out + ERESTARTSYS in
+  `unix_connect`). Still open: **accept/recv lost-wakeup** (bare
+  `scheduler_block_on` after dropping the lock — racy, needs concurrency
+  coverage to validate a wait_prepare/commit conversion).
+- **journal crash-atomicity (write-ahead ordering, recovery validation)** —
+  needs crash-replay / fault-injection coverage.
 - **R3-9 remainder** — ext3 + ext1 dir walkers (same `rec_len` pattern as the
   now-fixed ext2/ext4 ones), exfat `secondary_count==0`, ntfs resident-`$DATA`/
   index bounds, fat32 `cluster_to_sector` callers: crafted-image hardening; do

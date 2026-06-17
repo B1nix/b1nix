@@ -545,11 +545,14 @@ mechanisms in [`vfs-process-audit.md`](vfs-process-audit.md) Part 3.
   SIGKILLs an attached child, then `IPC_RMID` succeeds), both arches
   (x86 742/0, x86_64 743/0).
 - [ ] `bug` Remaining lower-severity / pending-verification leads: futex
-  PROCESS_SHARED cross-mmap wakeups; UNIX accept/recv lost-wakeups; journal
+  PROCESS_SHARED cross-mmap wakeups; UNIX **accept/recv** lost-wakeups (the
+  blocking-**send** EAGAIN bug is now fixed — see audit doc); journal
   crash-atomicity (write-ahead ordering, pre-commit fs writes, unbounded
-  recovery walk); swap/eviction ring tables unlocked. (shm leak+lock, mqueue
-  locking, aio-ctx exit UAF, futex exit-time waiter cleanup, and signal-death
-  reparent/orphan handling (M46-3) are all fixed — see the audit doc.)
+  recovery walk); swap/eviction ring tables unlocked. (shm leak+lock, unix
+  blocking-send + connect-backlog UAF, mqueue locking, aio-ctx exit UAF, futex
+  exit-time waiter cleanup + signal-interruptibility (already works), and
+  signal-death reparent/orphan handling (M46-3) are all fixed — see the audit
+  doc.)
 
 ## M47: Userspace Display Server
 

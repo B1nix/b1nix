@@ -63,8 +63,78 @@ static void test_shared_fork_cow(void) {
 	marker("M48-FDPASS: ok shared-fork-cow\n");
 }
 
+#define BSEND_PATH "/tmp/m48-bsend.sock"
+#define BSEND_TOTAL (16 * 1024) /* 4x the 4 KiB unix ring buffer -> must block */
+
+/* A blocking AF_UNIX socket send must BLOCK when the peer's buffer fills and
+ * resume as the reader drains — it must NOT return EAGAIN (that is O_NONBLOCK
+ * behaviour). Child streams 16 KiB through a 4 KiB buffer while the parent
+ * reads it back in small chunks; without blocking-send the child's send would
+ * fail with EAGAIN partway and the byte count would come up short. */
+static void test_unix_blocking_send(void) {
+	unlink(BSEND_PATH);
+	int listener = socket(AF_UNIX, SOCK_STREAM, 0);
+	struct sockaddr_un a;
+	memset(&a, 0, sizeof(a));
+	a.sun_family = AF_UNIX;
+	strcpy(a.sun_path, BSEND_PATH);
+	if (listener < 0 ||
+	    bind(listener, (struct sockaddr *)&a, sizeof(a)) < 0 ||
+	    listen(listener, 1) < 0) {
+		marker("M48-FDPASS: fail bsend-setup\n");
+		return;
+	}
+
+	int child = fork();
+	if (child == 0) {
+		int fd = socket(AF_UNIX, SOCK_STREAM, 0);
+		if (fd < 0 || connect(fd, (struct sockaddr *)&a, sizeof(a)) < 0)
+			_exit(2);
+		static char buf[BSEND_TOTAL];
+		for (int i = 0; i < BSEND_TOTAL; i++)
+			buf[i] = (char)(i & 0xff);
+		int sent = 0;
+		while (sent < BSEND_TOTAL) {
+			ssize_t r = send(fd, buf + sent, BSEND_TOTAL - sent, 0);
+			if (r <= 0)
+				_exit(3); /* EAGAIN/-1 on a blocking socket = the bug */
+			sent += (int)r;
+		}
+		close(fd);
+		_exit(0);
+	}
+
+	int peer = accept(listener, 0, 0);
+	if (peer < 0) {
+		marker("M48-FDPASS: fail bsend-accept\n");
+		return;
+	}
+	int got = 0, ok = 1;
+	while (got < BSEND_TOTAL) {
+		char rb[512];
+		ssize_t r = recv(peer, rb, sizeof(rb), 0);
+		if (r <= 0)
+			break;
+		for (ssize_t i = 0; i < r; i++)
+			if (rb[i] != (char)((got + i) & 0xff))
+				ok = 0;
+		got += (int)r;
+	}
+	close(peer);
+	close(listener);
+	unlink(BSEND_PATH);
+	int status = 0;
+	waitpid(child, &status, 0);
+	int child_ok = WIFEXITED(status) && WEXITSTATUS(status) == 0;
+	if (ok && child_ok && got == BSEND_TOTAL)
+		marker("M48-FDPASS: ok unix-blocking-send\n");
+	else
+		marker("M48-FDPASS: fail unix-blocking-send\n");
+}
+
 int main(void) {
 	test_shared_fork_cow();
+	test_unix_blocking_send();
 	unlink(SOCK_PATH);
 	int listener = socket(AF_UNIX, SOCK_STREAM, 0);
 	struct sockaddr_un addr;

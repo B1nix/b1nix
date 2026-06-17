@@ -261,7 +261,8 @@ isize vfs_socket_send_h(struct vfs_handle *h, const void *buf, usize len, int fl
     return netlink_send(s, buf, len);
 
   if (s->domain == B1NIX_AF_UNIX) {
-    return unix_send(s, buf, len);
+    return unix_send(s, buf, len, (h->flags & B1NIX_O_NONBLOCK) ||
+                                      (flags & B1NIX_MSG_DONTWAIT));
   }
 
   if (s->domain == B1NIX_AF_INET6) {
@@ -986,7 +987,9 @@ isize vfs_socket_sendmsg(int fd, const void *buf, usize len, int flags,
       return -EOPNOTSUPP;
     if (nhandles > VFS_SCM_MAX_FDS)
       return -EINVAL;
-    return unix_send_control(s, buf, len, handles, nhandles, cred);
+    return unix_send_control(s, buf, len, handles, nhandles, cred,
+                             (h->flags & B1NIX_O_NONBLOCK) ||
+                                 (flags & B1NIX_MSG_DONTWAIT));
   }
   return vfs_socket_send_h(h, buf, len, flags);
 }

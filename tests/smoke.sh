@@ -1396,6 +1396,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M48-FDPASS: ok scm-refcount-close" "M48: in-flight fd survives sender close"
 	check_output "$LOG" "M48-FDPASS: ok memfd" "M48: anonymous mmap-able memfd"
 	check_output "$LOG" "M48-FDPASS: ok shared-fork-cow" "M48: MAP_SHARED pages shared across fork"
+	check_output "$LOG" "M48-FDPASS: ok unix-blocking-send" "M48: blocking AF_UNIX send blocks on a full buffer instead of EAGAIN"
 
 	check_output "$LOG" "M50-DRM: ok card0" "M50: /dev/dri/card0"
 	check_output "$LOG" "M50-DRM: ok mode" "M50: KMS mode discovery"

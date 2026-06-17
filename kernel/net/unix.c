@@ -105,6 +105,10 @@ void unix_free_state(struct vfs_socket_state *s) {
     unix_unlock(peer);
     if (linked) {
       if (peer->socket) scheduler_wake_all(peer->socket);
+      /* Also wake anyone blocked in unix_send_control waiting for space in OUR
+       * ring buffer (they park on our own socket, the buffer-owner) so they see
+       * the hangup and return ENOTCONN instead of sleeping forever. */
+      if (u->socket) scheduler_wake_all(u->socket);
       scheduler_wake_all(vfs_poll_chan);
       unix_data_put(u);    /* drop the peer's reference on us */
     }
@@ -229,11 +233,12 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
 
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
-                        const struct b1nix_ucred *cred) {
+                        const struct b1nix_ucred *cred, int nonblock) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   if ((nhandles || cred) && len == 0)
     return -EINVAL;
 
+retry:
   /* Pin the peer for the duration of the write. Reading u->peer and taking the
    * reference under u's lock is what makes this safe: the peer closing on
    * another CPU clears u->peer and drops the link reference in unix_free_state,
@@ -251,9 +256,36 @@ isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
   unix_lock(peer_u);
   usize free_space = UNIX_RB_SIZE - peer_u->rb_count;
   if (free_space == 0) {
+    /* Buffer full. POSIX: a blocking socket waits for the reader to drain;
+     * only O_NONBLOCK returns EAGAIN. Block on the peer (buffer-owner) socket:
+     * unix_recv_control wakes peer_u->socket after draining, and unix_free_state
+     * wakes it on hangup. Publish BLOCKED before the final full-recheck so a
+     * drain racing in on another CPU can't be lost. */
+    struct vfs_socket_state *psock = peer_u->socket;
+    unix_unlock(peer_u);
+    if (nonblock) {
+      unix_data_put(peer_u);
+      return -EAGAIN;
+    }
+    scheduler_wait_prepare(psock);
+    unix_lock(peer_u);
+    int still_full = (peer_u->rb_count >= UNIX_RB_SIZE);
     unix_unlock(peer_u);
     unix_data_put(peer_u);
-    return -EAGAIN;
+    if (!s->connected) {            /* peer hung up → retry reports ENOTCONN */
+      scheduler_wait_cancel();
+      goto retry;
+    }
+    if (!still_full) {              /* space freed between check and prepare */
+      scheduler_wait_cancel();
+      goto retry;
+    }
+    if (scheduler_signal_pending()) {
+      scheduler_wait_cancel();
+      return -ERESTARTSYS;
+    }
+    scheduler_wait_commit();        /* block until drained / hangup */
+    goto retry;
   }
 
   int control_slot = -1;
@@ -299,8 +331,9 @@ isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
   return (isize)to_copy;
 }
 
-isize unix_send(struct vfs_socket_state *s, const void *buf, usize len) {
-  return unix_send_control(s, buf, len, 0, 0, 0);
+isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,
+                int nonblock) {
+  return unix_send_control(s, buf, len, 0, 0, 0, nonblock);
 }
 
 isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
