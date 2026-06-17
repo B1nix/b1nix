@@ -3197,6 +3197,28 @@ static void post_sigchld_to_parent(usize parent_id, int job_control_event) {
   }
 }
 
+/* OOM reclaim: SIGKILL the current userspace task — the one whose allocation
+ * the PMM cannot satisfy — so its address space is torn down and its memory
+ * reclaimed, instead of returning ENOMEM forever (which a JS engine or any
+ * allocator turns into a console-flooding retry storm). The kill is async: the
+ * task dies at its next return-to-user, then exit teardown frees its frames.
+ * Never targets kernel threads (pml4_phys==0) or init (pid 1). Returns 1 if a
+ * victim was signalled. */
+int scheduler_oom_kill_current(void) {
+  struct task *v = current_task;
+  if (!v || v->pml4_phys == 0 || v->id == 1)
+    return 0;
+  if (v->pending_signals & (1ULL << (SIGKILL - 1)))
+    return 0; /* already condemned */
+  console_write("[OOM-KILL] killing '");
+  console_write(v->name ? v->name : "?");
+  console_write("' pid ");
+  console_write_dec(v->id);
+  console_write(" to reclaim memory\n");
+  scheduler_kill(v->id, SIGKILL);
+  return 1;
+}
+
 int scheduler_kill(usize task_id, int sig) {
   if (sig < 0 || sig >= NSIG)
     return -EINVAL;

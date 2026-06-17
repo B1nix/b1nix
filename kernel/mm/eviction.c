@@ -121,10 +121,21 @@ u64 swap_evict_page(void) {
         if (swap_out(t->pml4_phys, v, f) >= 0) {
             extern void paging_mark_swapped(u64 pml4_phys, u64 vaddr);
             paging_mark_swapped(t->pml4_phys, v);
-            
+
+            /* paging_mark_swapped only invlpg's the CURRENT CPU, but the evicted
+             * page belongs to task t, which may be running (or have threads
+             * sharing its address space) on ANOTHER CPU whose TLB still maps
+             * v -> f. Without a cross-CPU shootdown that stale entry lets the
+             * other CPU write into the frame after we free/reuse it — a
+             * use-after-free that corrupts the PMM free-list (GP fault in
+             * freelist_pop). Shoot v down on all CPUs before the frame is
+             * reused. No-op on a single CPU. */
+            extern void tlb_shootdown_page(u64 vaddr);
+            tlb_shootdown_page(v);
+
             page_ring[idx].used = 0;
             page_count--;
-            
+
             // We don't call pmm_free_frame(f) here because we want to reuse it immediately
             return f;
         }

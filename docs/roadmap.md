@@ -790,6 +790,20 @@ no-fake-pass smoke test.
   throttled receive buffer (`kernel/net/tcp.c`), and the receive buffer/window
   grew 4 KiB → 16 KiB. Measured against a real page: a fresh-host TLS handshake
   dropped 5.5 s → 60 ms and full google.com load ~20 s → ~1.1 s.
+- [x] `done` **Heavy-page memory robustness.** A real google.com tab with JS can
+  exhaust RAM; that exposed kernel OOM-path bugs. Fixed: (1) `freelist_pop`
+  validates each node before dereferencing it, so a freed-frame corruption
+  degrades to a logged recovery (bitmap scan) instead of a GP-fault **panic**;
+  (2) the page-eviction/swap path issues a cross-CPU **TLB shootdown**
+  (`tlb_shootdown_page`) after marking a page swapped — the local `invlpg` left
+  another CPU's stale TLB mapping a freed frame (the use-after-free behind the
+  panic); (3) a last-resort **OOM-killer** SIGKILLs the userspace task demanding
+  the memory (sparing kernel threads and init) instead of returning ENOMEM into
+  a console-flooding retry storm; (4) the OOM diagnostic is throttled to once per
+  pressure episode. `make run` now defaults to `-m 1024` (QEMU's 128 MB default
+  OOM'd on heavy pages) — google.com loads and renders at 1 GB. Verified: forced
+  256 MB cleanly OOM-kills the memory-heavy tests (`[OOM-KILL] killing ...`) with
+  no panic; both arches stay green.
 - [x] `done` **SVG images + JavaScript + public-suffix list.** SVG is decoded by
   **libsvgtiny** (`tools/build-libsvgtiny.sh`, over libdom's expat XML binding)
   and `NETSURF_USE_NSSVG=YES`; the framebuffer frontend's `plot->path` (an

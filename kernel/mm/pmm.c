@@ -138,11 +138,42 @@ static void freelist_push(u64 frame) {
   onlist_set(index);
 }
 
+/* A frame is usable as a freelist node only if it is page-aligned, within
+ * usable RAM and reachable through the direct map (its first 8 bytes hold the
+ * intrusive "next" pointer). A frame that is written to after being freed
+ * corrupts that pointer; validating before the dereference turns a fatal
+ * GP-fault in the allocator into a survivable, logged event. */
+static int freelist_node_valid(u64 frame) {
+  if (frame == 0) return 0;
+  if (frame & (PAGE_SIZE - 1)) return 0;
+  if (frame >= pmm.max_address) return 0;
+  if (frame >= g_direct_map_size) return 0;
+  if (frame_index(frame) >= (usize)pmm.bitmap_bytes * BITS_PER_BYTE) return 0;
+  return 1;
+}
+
 /* Pop the next genuinely-free frame, discarding stale entries (frames that were
- * linked but later taken by a contiguous bitmap scan). Returns 0 if empty. */
+ * linked but later taken by a contiguous bitmap scan). Returns 0 if empty.
+ *
+ * If the intrusive list is found corrupt (a freed frame's next pointer was
+ * clobbered by a use-after-free), truncate it and return 0: the used-bitmap is
+ * the authoritative source of truth, so the caller falls back to the bitmap
+ * scan and no free memory is lost. This degrades gracefully instead of
+ * dereferencing a garbage pointer and panicking the kernel. */
 static u64 freelist_pop(void) {
   while (pmm.free_list_head != 0) {
     u64 frame = pmm.free_list_head;
+    if (!freelist_node_valid(frame)) {
+      static int reported;
+      if (!reported) {
+        reported = 1;
+        console_write("pmm: free-list corruption (bad node ");
+        console_write_hex64(frame);
+        console_write(") — truncating; bitmap scan recovers free frames\n");
+      }
+      pmm.free_list_head = 0; /* drop the corrupt list; bitmap is authoritative */
+      return 0;
+    }
     usize index = frame_index(frame);
     pmm.free_list_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
     onlist_clear(index);
@@ -719,6 +750,7 @@ static u64 bitmap_scan_alloc(usize count) {
 static u64 pmm_total_reclaims = 0;     /* cumulative reclaim iterations */
 static u64 pmm_clean_alloc_streak = 0; /* successful allocs without reclaim */
 static u64 pmm_warned_pressure = 0;    /* one-shot per pressure episode */
+static int pmm_oom_reported = 0;       /* one-shot OOM diag per pressure episode */
 
 u64 pmm_alloc_frames(usize count) {
   u64 flags;
@@ -746,6 +778,7 @@ u64 pmm_alloc_frames(usize count) {
            * pressure episode is over — re-arm the warning. */
           if (++pmm_clean_alloc_streak >= 128) {
             pmm_warned_pressure = 0;
+            pmm_oom_reported = 0;
             pmm_total_reclaims = 0;
             pmm_clean_alloc_streak = 0;
           }
@@ -764,6 +797,7 @@ u64 pmm_alloc_frames(usize count) {
            * pressure episode is over — re-arm the warning. */
           if (++pmm_clean_alloc_streak >= 128) {
             pmm_warned_pressure = 0;
+            pmm_oom_reported = 0;
             pmm_total_reclaims = 0;
             pmm_clean_alloc_streak = 0;
           }
@@ -780,6 +814,7 @@ u64 pmm_alloc_frames(usize count) {
            * pressure episode is over — re-arm the warning. */
           if (++pmm_clean_alloc_streak >= 128) {
             pmm_warned_pressure = 0;
+            pmm_oom_reported = 0;
             pmm_total_reclaims = 0;
             pmm_clean_alloc_streak = 0;
           }
@@ -852,20 +887,36 @@ u64 pmm_alloc_frames(usize count) {
     // the caller can panic with a meaningful upstream message. This is the
     // closest analogue to Linux's "Out of memory: Killed process X" dmesg
     // line — observable, actionable, not a silent hang.
-    extern void kheap_dump_large_allocs(void);
-    kheap_dump_large_allocs();
-    console_write("[OUT OF MEMORY] pmm: cannot satisfy ");
-    console_write_dec(count);
-    console_write("-frame request after ");
-    console_write_dec(pmm_total_reclaims);
-    console_write(" reclaim cycles. Total RAM=");
-    console_write_dec(pmm.total_usable / (1024 * 1024));
-    console_write(" MB free=");
-    console_write_dec(pmm.free_frames * PAGE_SIZE / (1024 * 1024));
-    console_write(" MB. SUGGEST: increase -m or reduce make -j N.");
-    m26_diag_task();
-    console_write("\n");
-    klog_warn("pmm: out of contiguous physical memory");
+    /* Throttle the OOM diagnostic to once per pressure episode. A userspace
+     * allocation storm (e.g. a JS engine GC-thrashing near the RAM ceiling)
+     * hits this path thousands of times; printing the multi-line dump each
+     * time floods the console and makes the box look wedged. The flag is reset
+     * once a clean-alloc streak shows the episode is over (see fast path). */
+    if (!pmm_oom_reported) {
+      pmm_oom_reported = 1;
+      extern void kheap_dump_large_allocs(void);
+      kheap_dump_large_allocs();
+      console_write("[OUT OF MEMORY] pmm: cannot satisfy ");
+      console_write_dec(count);
+      console_write("-frame request after ");
+      console_write_dec(pmm_total_reclaims);
+      console_write(" reclaim cycles. Total RAM=");
+      console_write_dec(pmm.total_usable / (1024 * 1024));
+      console_write(" MB free=");
+      console_write_dec(pmm.free_frames * PAGE_SIZE / (1024 * 1024));
+      console_write(" MB. SUGGEST: increase -m or reduce make -j N.");
+      m26_diag_task();
+      console_write("\n");
+      klog_warn("pmm: out of contiguous physical memory");
+    }
+    /* OOM reclaim of last resort: SIGKILL the userspace task demanding the
+     * memory we cannot supply, so its address space is torn down and its frames
+     * reclaimed — ending the ENOMEM/page-fault retry storm instead of returning
+     * 0 forever. Kernel-thread / init allocations are spared and fall through to
+     * the 0 return (the caller handles failure). Async: the victim dies at its
+     * next return-to-user. */
+    extern int scheduler_oom_kill_current(void);
+    scheduler_oom_kill_current();
     /* Reset pressure flags so the NEXT episode can warn again. */
     pmm_warned_pressure = 0;
     pmm_total_reclaims = 0;

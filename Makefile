@@ -137,6 +137,10 @@ TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
 QEMU_X86_64 := qemu-system-x86_64
+# Default RAM for `make run`. QEMU's own default is only 128 MB, which OOMs on
+# heavy pages (a real browser tab with JavaScript needs far more). Override with
+# `make run RUN_MEM=2048`.
+RUN_MEM ?= 1024
 KERNEL_CMDLINE ?=
 # GRUB menu timeout in seconds. 0 = boot the default entry immediately (used by
 # the smoke harness so QEMU never stalls). Set e.g. GRUB_TIMEOUT=5 for an
@@ -980,13 +984,13 @@ iso-full: iso-live
 
 run: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
+	$(QEMU_X86_64) -m $(RUN_MEM) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
 run-graphics: KERNEL_CMDLINE += b1nix.runlevel=5
 run-graphics: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
-	$(QEMU_X86_64) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
+	$(QEMU_X86_64) -m $(RUN_MEM) -cdrom $(BUILD_DIR)/b1nix.iso -serial stdio -no-reboot -boot d \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0 \
 		-vga virtio -device virtio-tablet-pci
 

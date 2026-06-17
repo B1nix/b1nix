@@ -401,6 +401,9 @@ void scheduler_fd_close_on_exec(void);
 
 /* ── Signal API ── */
 int scheduler_kill(usize task_id, int sig);
+/* OOM reclaim: SIGKILL the current userspace task (the memory demander). Returns
+ * 1 if a victim was signalled (skips kernel threads and init). */
+int scheduler_oom_kill_current(void);
 int scheduler_kill_process_group(usize pgrp, int sig);
 int scheduler_kill_all(int sig);
 int scheduler_sigaction(int sig, const struct sigaction *act,
