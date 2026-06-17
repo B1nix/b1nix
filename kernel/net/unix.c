@@ -226,8 +226,22 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
       return 0;
     }
     unix_unlock(u);
-    if (scheduler_signal_pending()) return -ERESTARTSYS;
-    scheduler_block_on(s);
+    /* SMP-safe wait: publish BLOCKED before re-testing the backlog so a
+     * connector's wake (scheduler_wake_all(listener) in unix_connect) racing
+     * between the check above and the block cannot be lost. */
+    scheduler_wait_prepare(s);
+    unix_lock(u);
+    int have_conn = (u->backlog_count > 0);
+    unix_unlock(u);
+    if (have_conn) {
+      scheduler_wait_cancel();
+      continue;
+    }
+    if (scheduler_signal_pending()) {
+      scheduler_wait_cancel();
+      return -ERESTARTSYS;
+    }
+    scheduler_wait_commit();
   }
 }
 
@@ -399,8 +413,23 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
     unix_unlock(u);
     if (s->type == B1NIX_SOCK_STREAM && !s->connected) return 0;
     if (flags & B1NIX_MSG_DONTWAIT) return -EAGAIN;
-    if (scheduler_signal_pending()) return -ERESTARTSYS;
-    scheduler_block_on(s);
+    /* SMP-safe wait: publish BLOCKED on our socket, then re-test under the lock
+     * so a sender's wake (scheduler_wake_all(u->socket) after a write/close)
+     * racing between the check above and the block cannot be lost. */
+    scheduler_wait_prepare(s);
+    unix_lock(u);
+    int have_data = (u->rb_count > 0);
+    int disconnected = (s->type == B1NIX_SOCK_STREAM && !s->connected);
+    unix_unlock(u);
+    if (have_data || disconnected) {
+      scheduler_wait_cancel();
+      continue;
+    }
+    if (scheduler_signal_pending()) {
+      scheduler_wait_cancel();
+      return -ERESTARTSYS;
+    }
+    scheduler_wait_commit();
   }
 }
 

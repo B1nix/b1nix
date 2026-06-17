@@ -829,9 +829,14 @@ the documented known-issue:
   `M48-FDPASS: ok unix-blocking-send` (16 KiB streamed through the 4 KiB buffer,
   byte-checked), both arches (x86 743/0, x86_64 744/0). **connect-backlog** UAF
   on signal was already fixed earlier (splice-out + ERESTARTSYS in
-  `unix_connect`). Still open: **accept/recv lost-wakeup** (bare
-  `scheduler_block_on` after dropping the lock — racy, needs concurrency
-  coverage to validate a wait_prepare/commit conversion).
+  `unix_connect`). **accept/recv lost-wakeup** — also FIXED: both blocking loops
+  converted from the bare `unix_unlock; scheduler_block_on(s)` (which loses a
+  waker that fires between the unlock and the block) to the prepare/recheck/
+  commit pattern — `scheduler_wait_prepare(s)` publishes BLOCKED, the
+  rb_count/connected (recv) or backlog_count (accept) is re-tested under the
+  lock, then `scheduler_wait_commit()`. Same shape as the TCP recv path. No
+  regression: M48 (connect/accept/recv fd-passing), M49 (Wayland) and
+  unix-blocking-send all green, both arches.
 - **journal crash-atomicity (write-ahead ordering, recovery validation)** —
   needs crash-replay / fault-injection coverage.
 - **R3-9 remainder** — ext3 + ext1 dir walkers (same `rec_len` pattern as the
