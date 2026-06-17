@@ -19,5 +19,19 @@ frontend painted text and the image below.</p>
 <p>Line one of body text.</p>
 <p>Line two of body text.</p>
 <p>Line three of body text.</p>
+
+<!-- M53: SVG image, decoded by libsvgtiny (NETSURF_USE_NSSVG). Loaded as an
+     image/svg+xml resource (the real libsvgtiny path, not inline foreign
+     content) so the green block only paints if the SVG decoder works. -->
+<img src="test.svg" alt="green svg" width="80" height="40">
+
+<!-- M53: JavaScript via Duktape (enable_javascript). The script paints a solid
+     blue bar at load; the bar's distinctive colour only appears if JS ran, so
+     the render self-test can assert JS execution (not just "page rendered"). -->
+<div id="js-slot"></div>
+<script>
+document.getElementById('js-slot').innerHTML =
+    '<div style="background:#2040ff;width:200px;height:30px"></div>';
+</script>
 </body>
 </html>

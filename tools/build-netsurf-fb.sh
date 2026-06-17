@@ -6,8 +6,8 @@
 # Stages a sysroot containing every ported NetSurf dependency (.a + headers +
 # pkg-config .pc files), then drives netsurf-3.11's Makefile with that sysroot
 # via the GCCSDK_INSTALL_ENV / GCCSDK_INSTALL_CROSSBIN convention the framebuffer
-# frontend already understands. Network/JS/SVG are disabled; only the built-in
-# file:// fetcher and the internal bitmap font are used.
+# frontend already understands. HTTP(S) (libcurl+mbedTLS), JavaScript (Duktape)
+# and SVG (libsvgtiny) are all enabled; the internal bitmap font is used.
 #
 # M53 (NetSurf browser platform) — final step (7): the browser itself.
 
@@ -98,6 +98,10 @@ stage build-libnsfb.sh
 stage build-libjpeg.sh   # libjpeg.a — JPEG image decoding
 stage build-libwebp.sh   # libwebp.a — WebP image decoding
 stage build-openlibm.sh   # libm.a (NetSurf + libpng need cos/sin/floor/pow/modf)
+stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + math)
+stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain scoping)
+stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
+stage build-libutf8proc.sh # libutf8proc.a — Unicode/IDNA (utils/idna.c)
 
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
@@ -226,6 +230,10 @@ emit_pc libnsbmp        "-lnsbmp"         ""
 emit_pc libnslog        "-lnslog"         ""
 emit_pc libjpeg         "-ljpeg"          ""
 emit_pc libwebp         "-lwebp"          ""
+emit_pc libsvgtiny      "-lsvgtiny -lexpat" "libdom libwapcaplet"
+emit_pc libnspsl        "-lnspsl"         ""
+emit_pc librosprite     "-lrosprite"      ""
+emit_pc libutf8proc     "-lutf8proc"      ""
 # libnsfb is always linked by the framebuffer frontend. NetSurf already adds its
 # own -lm (after -lpng16), so only the compat shims go here — and they must come
 # last so libm's fenv/scalbnl/creal references resolve against them.
@@ -424,12 +432,28 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 	nsfb_get_buffer(nsfb, &fbuf, &stride);
 	if (fbuf != NULL && w > 0 && h > 0 && stride > 0) {
 		unsigned long nonbg = 0, rows_with_content = 0;
+		unsigned long svg_px = 0, js_px = 0;
 		for (int y = 0; y < h; y++) {
 			uint32_t *row = (uint32_t *)(fbuf + (size_t)y * stride);
 			int rowhas = 0;
 			for (int x = 0; x < w; x++) {
 				uint32_t px = row[x] | 0xff000000u;
 				if (px != 0xffffffffu) { nonbg++; rowhas = 1; }
+				/* Solid-block detection for the file:// self-test page.
+				 * Green (middle byte) is order-independent; blue vs red
+				 * differ only by RGB/BGR order, so gate on a high outer
+				 * channel + low others, and require many such pixels (a
+				 * solid block) to rule out the logo's stray colours.
+				 *   #1eb820 inline-SVG rect  -> svg_px (libsvgtiny ran)
+				 *   #2040ff JS-painted bar    -> js_px  (Duktape ran)   */
+				unsigned b0 = px & 0xff, b1 = (px >> 8) & 0xff,
+					 b2 = (px >> 16) & 0xff;
+				if (b1 > 150 && b0 < 90 && b2 < 90)
+					svg_px++;
+				else if (b1 < 110 &&
+					 ((b0 > 220 && b2 < 90) ||
+					  (b2 > 220 && b0 < 90)))
+					js_px++;
 			}
 			if (rowhas)
 				rows_with_content++;
@@ -442,6 +466,11 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 			fprintf(stdout, "%s: ok render\n", mk);
 		else
 			fprintf(stdout, "%s: fail render-blank\n", mk);
+		/* Positive feature proof on the self-test page (solid blocks only). */
+		if (svg_px > 500)
+			fprintf(stdout, "%s: ok svg svg-px=%lu\n", mk, svg_px);
+		if (js_px > 500)
+			fprintf(stdout, "%s: ok js js-px=%lu\n", mk, js_px);
 	} else {
 		fprintf(stdout, "%s: fail no-surface\n", mk);
 	}
@@ -527,6 +556,132 @@ EOF
   perl -0pi -e 's{\t\tframebuffer_run\(\);}{\t\tif (fb_b1nix_input)\n\t\t\tframebuffer_input_run(nsfb, bw);\n\t\telse if (fb_b1nix_test)\n\t\t\tframebuffer_test_run(nsfb, bw);\n\t\telse\n\t\t\tframebuffer_run();}' "$GUI_C"
 fi
 
+# Enable JavaScript at runtime. Duktape is compiled in (NETSURF_USE_DUKTAPE=YES)
+# but the core default for the enable_javascript option is false, so scripts
+# never run unless we flip it. Inject into the framebuffer set_defaults() hook.
+# Idempotent (guarded on the marker comment).
+GUI_C="$SRC_DIR/frontends/framebuffer/gui.c"
+if ! grep -q 'b1nix-enable-js' "$GUI_C"; then
+  perl -0pi -e 's{(static nserror set_defaults\(struct nsoption_s \*defaults\)\n\{\n)}{$1\tnsoption_set_bool(enable_javascript, true); /* b1nix-enable-js */\n}' "$GUI_C"
+fi
+
+# Implement the framebuffer path plotter. Upstream's framebuffer_plot_path() is
+# a no-op stub ("path unimplemented"), so SVG images — which render entirely via
+# plot->path — decode but paint nothing. Replace the stub with a real plotter
+# that fills each subpath as a polygon and strokes its edges via libnsfb (cubic
+# Beziers are flattened to short line segments). Idempotent (marker guarded).
+FB_C="$SRC_DIR/frontends/framebuffer/framebuffer.c"
+if ! grep -q 'b1nix-plot-path' "$FB_C"; then
+  cat >"$SRC_PARENT/.fb_plot_path.c" <<'B1NIX_FB_PATH_EOF'
+/* b1nix-plot-path: real framebuffer path plotter (upstream stub is a no-op).
+ * Map a path-space point through the 2x3 transform into device space (matches
+ * the cairo/gtk frontend's CTM convention). */
+#define FB_PATH_TX(px, py) \
+	((int)((transform[0] * (px)) + (transform[2] * (py)) + transform[4]))
+#define FB_PATH_TY(px, py) \
+	((int)((transform[1] * (px)) + (transform[3] * (py)) + transform[5]))
+
+static nserror
+framebuffer_plot_path(const struct redraw_context *ctx,
+		const plot_style_t *pstyle,
+		const float *p,
+		unsigned int n,
+		const float transform[6])
+{
+	/* Path of cubic Beziers / lines from libsvgtiny (and CSS borders).
+	 * Build each subpath into a device-space point list, fill it as a
+	 * polygon and stroke its edges. Beziers are flattened to short lines.
+	 * Bounded point buffer; pathological paths are clipped, not unbounded. */
+	enum { FB_PATH_MAX_PTS = 1024, FB_BEZIER_STEPS = 16 };
+	static int pts[FB_PATH_MAX_PTS * 2];
+	unsigned int np = 0;        /* points in the current subpath (pairs) */
+	float cx = 0, cy = 0;       /* current point, path space */
+	unsigned int i = 0;
+
+	if (p == NULL || n == 0 || p[0] != PLOTTER_PATH_MOVE) {
+		return NSERROR_INVALID;
+	}
+
+	nsfb_plot_pen_t pen;
+	pen.stroke_type = NFSB_PLOT_OPTYPE_SOLID;
+	pen.stroke_width = pstyle->stroke_width > 0 ? pstyle->stroke_width : 1;
+	pen.stroke_colour = pstyle->stroke_colour;
+	pen.fill_type = NFSB_PLOT_OPTYPE_NONE;
+	pen.fill_colour = pstyle->fill_colour;
+
+	while (i < n) {
+		if (p[i] == PLOTTER_PATH_MOVE || p[i] == PLOTTER_PATH_LINE) {
+			cx = p[i + 1];
+			cy = p[i + 2];
+			if (np < FB_PATH_MAX_PTS) {
+				pts[np * 2] = FB_PATH_TX(cx, cy);
+				pts[np * 2 + 1] = FB_PATH_TY(cx, cy);
+				np++;
+			}
+			i += 3;
+		} else if (p[i] == PLOTTER_PATH_BEZIER) {
+			float x0 = cx, y0 = cy;
+			float x1 = p[i + 1], y1 = p[i + 2];
+			float x2 = p[i + 3], y2 = p[i + 4];
+			float x3 = p[i + 5], y3 = p[i + 6];
+			for (int s = 1; s <= FB_BEZIER_STEPS; s++) {
+				float t = (float)s / FB_BEZIER_STEPS;
+				float mt = 1.0f - t;
+				float a = mt * mt * mt, b = 3 * mt * mt * t;
+				float c = 3 * mt * t * t, d = t * t * t;
+				float bx = a * x0 + b * x1 + c * x2 + d * x3;
+				float by = a * y0 + b * y1 + c * y2 + d * y3;
+				if (np < FB_PATH_MAX_PTS) {
+					pts[np * 2] = FB_PATH_TX(bx, by);
+					pts[np * 2 + 1] = FB_PATH_TY(bx, by);
+					np++;
+				}
+			}
+			cx = x3;
+			cy = y3;
+			i += 7;
+		} else if (p[i] == PLOTTER_PATH_CLOSE) {
+			if (np > 1) {
+				if (pstyle->fill_colour != NS_TRANSPARENT) {
+					nsfb_plot_polygon(nsfb, pts, np,
+							  pstyle->fill_colour);
+				}
+				if (pstyle->stroke_colour != NS_TRANSPARENT) {
+					for (unsigned int k = 0; k + 1 < np; k++) {
+						nsfb_bbox_t ln = {
+							pts[k * 2], pts[k * 2 + 1],
+							pts[(k + 1) * 2],
+							pts[(k + 1) * 2 + 1]
+						};
+						nsfb_plot_line(nsfb, &ln, &pen);
+					}
+				}
+			}
+			np = 0;
+			i += 1;
+		} else {
+			NSLOG(netsurf, INFO, "bad path command %f", p[i]);
+			return NSERROR_INVALID;
+		}
+	}
+
+	/* Flush a final unclosed subpath (fill is implicitly closed). */
+	if (np > 1 && pstyle->fill_colour != NS_TRANSPARENT) {
+		nsfb_plot_polygon(nsfb, pts, np, pstyle->fill_colour);
+	}
+
+	return NSERROR_OK;
+}
+
+#undef FB_PATH_TX
+#undef FB_PATH_TY
+B1NIX_FB_PATH_EOF
+  perl -0777 -i -pe '
+    BEGIN { local $/; open my $fh, "<", "'"$SRC_PARENT"'/.fb_plot_path.c" or die; our $repl = <$fh>; }
+    s{static nserror\nframebuffer_plot_path\(.*?\n\}\n}{$repl}s;
+  ' "$FB_C"
+fi
+
 # ── 1c. nsgenbind host tool — generates the Duktape<->DOM JS bindings ──
 # Needed when NETSURF_USE_DUKTAPE=YES: content/handlers/javascript/duktape's
 # Makefile invokes `nsgenbind` from PATH. Build it (host tool) from the
@@ -539,9 +694,11 @@ fi
 export PATH="$SYSROOT/bin:$PATH"
 
 # ── 2. Drive the NetSurf framebuffer build ──
-# Use the b1nix cross-gcc via the GCCSDK convention. Image codecs PNG/BMP/GIF/
-# JPEG/WebP and Duktape JavaScript are on; SVG, sprite, PSL, JPEG-XL and a real
-# iconv stay off.
+# Use the b1nix cross-gcc via the GCCSDK convention. On: image codecs PNG/BMP/
+# GIF/JPEG/WebP/SVG + RISC-OS sprite, Duktape JavaScript, the public-suffix list
+# (NSPSL) and utf8proc (Unicode/IDNA). Off: OpenSSL (redundant — mbedTLS is the
+# TLS backend), JPEG-XL (libjxl = C++/highway/brotli), PDF export (libharu) and
+# video (GStreamer) — each needs a heavy upstream port not yet brought up.
 export GCCSDK_INSTALL_ENV="$SYSROOT"
 export GCCSDK_INSTALL_CROSSBIN="$CROSSBIN"
 export PKG_CONFIG_LIBDIR="$PKGDIR"
@@ -556,7 +713,7 @@ make -C "$SRC_DIR" \
   NETSURF_FB_FONTLIB=internal \
   NETSURF_USE_CURL="$([ "$HAVE_CURL" = yes ] && echo YES || echo NO)" \
   NETSURF_USE_OPENSSL=NO \
-  NETSURF_USE_UTF8PROC=NO \
+  NETSURF_USE_UTF8PROC=YES \
   NETSURF_USE_LIBICONV_PLUG=YES \
   NETSURF_USE_JPEG=YES \
   NETSURF_USE_JPEGXL=NO \
@@ -564,9 +721,9 @@ make -C "$SRC_DIR" \
   NETSURF_USE_PNG=YES \
   NETSURF_USE_BMP=YES \
   NETSURF_USE_GIF=YES \
-  NETSURF_USE_NSSVG=NO \
-  NETSURF_USE_ROSPRITE=NO \
-  NETSURF_USE_NSPSL=NO \
+  NETSURF_USE_NSSVG=YES \
+  NETSURF_USE_ROSPRITE=YES \
+  NETSURF_USE_NSPSL=YES \
   NETSURF_USE_NSLOG=YES \
   NETSURF_USE_DUKTAPE=YES \
   NETSURF_USE_VIDEO=NO \

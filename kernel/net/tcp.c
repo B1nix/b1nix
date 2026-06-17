@@ -58,7 +58,13 @@ struct tcp_pseudo {
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
 #define MAX_TCP_CONNS 64
-#define TCP_RECV_BUF_SIZE 4096
+/* Receive buffer / advertised window. Sized to hold a full 16 KiB TLS record
+ * (and a typical TLS handshake cert flight) so HTTPS handshakes don't have to
+ * be drained in 4 KiB chunks. Combined with the window-update ACK in
+ * tcp_recv() (see recv_window_update), this keeps the peer from ever parking on
+ * its zero-window persist timer — which previously cost ~5 s per fresh HTTPS
+ * connection (zero-window stall on multi-KiB cert flights). */
+#define TCP_RECV_BUF_SIZE 16384
 #define TCP_SEND_BUF_SIZE 4096
 #define TCP_MSS 1460
 #define TCP_TIME_WAIT_TICKS 200
@@ -109,6 +115,7 @@ struct tcp_conn {
   u8 recv_buf[TCP_RECV_BUF_SIZE];
   u32 recv_len;
   u32 recv_read;
+  u8 wnd_closed; /* last advertised receive window was < 1 MSS (peer throttled) */
   int handed_to_user;
   u64 time_wait_since;
   struct tcp_retransmit_pkt *retransmit_queue;
@@ -754,6 +761,8 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
     avail = max_len;
 
   memcpy(buf, conn->recv_buf + conn->recv_read, avail);
+  u8 wnd_update_pkt[sizeof(struct tcp_header)];
+  int send_wnd_update = 0;
   if (!(flags & B1NIX_MSG_PEEK)) {
     conn->recv_read += (u32)avail;
 
@@ -762,10 +771,33 @@ int tcp_recv(struct tcp_conn *conn, void *buf, usize max_len, int flags) {
       conn->recv_len = 0;
       conn->recv_read = 0;
     }
+
+    /* If we had throttled the peer below 1 MSS and the app has now freed at
+     * least 1 MSS of buffer, send an unsolicited window-update ACK. Without
+     * this the peer waits out its zero-window persist timer (exponential
+     * backoff, ~5 s) before probing — the dominant cost of a fresh HTTPS
+     * connection whose cert flight overflowed the receive buffer. */
+    u32 free_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+    if (conn->wnd_closed && free_wnd >= TCP_MSS) {
+      conn->wnd_closed = 0;
+      memset(wnd_update_pkt, 0, sizeof(wnd_update_pkt));
+      struct tcp_header *a = (struct tcp_header *)wnd_update_pkt;
+      a->src_port = bswap16(conn->local_port);
+      a->dst_port = bswap16(conn->remote_port);
+      a->seq_num = bswap32(conn->snd_nxt);
+      a->ack_num = bswap32(conn->rcv_nxt);
+      a->data_offset = (5 << 4);
+      a->flags = TCP_ACK;
+      a->window = bswap16(free_wnd);
+      send_wnd_update = 1;
+    }
   }
 
   tcp_unlock();
   irq_restore(irq);
+
+  if (send_wnd_update)
+    tcp_conn_emit(conn, wnd_update_pkt, sizeof(wnd_update_pkt));
 
   return (int)avail;
 }
@@ -1170,7 +1202,13 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
         a->ack_num = bswap32(conn->rcv_nxt);
         a->data_offset = (5 << 4);
         a->flags = TCP_ACK;
-        a->window = bswap16(TCP_RECV_BUF_SIZE - conn->recv_len);
+        u32 adv_wnd = TCP_RECV_BUF_SIZE - conn->recv_len;
+        a->window = bswap16(adv_wnd);
+        /* Remember if we just throttled the peer below 1 MSS so tcp_recv() knows
+         * to send an unsolicited window-update once the app drains the buffer,
+         * instead of leaving the peer parked on its zero-window persist timer. */
+        if (adv_wnd < TCP_MSS)
+          conn->wnd_closed = 1;
 
         tcp_unlock();
         irq_restore(irq);

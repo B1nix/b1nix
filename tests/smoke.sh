@@ -1161,6 +1161,8 @@ check_output "$LOG" "M53-NSLIBS: done" "NetSurf helper/decoder smoke completes"
 check_output "$LOG" "M53-NS: ok load" "NetSurf loads the local file:// HTML page to completion"
 check_output "$LOG" "M53-NS: ok redraw" "NetSurf redraws the laid-out page into the framebuffer surface"
 check_output "$LOG" "M53-NS: ok render" "rendered framebuffer is non-blank and structured (real page paint)"
+check_output "$LOG" "M53-NS: ok svg" "inline SVG painted its solid block (libsvgtiny decoded it — NETSURF_USE_NSSVG)"
+check_output "$LOG" "M53-NS: ok js" "page JavaScript painted its solid block (Duktape executed it — enable_javascript)"
 check_output "$LOG" "M53-NS: done" "NetSurf framebuffer render self-test completes"
 # ── M53 NetSurf on-screen frontend: render straight to /dev/fb0 ──
 check_output "$LOG" "M53-FB: ok redraw" "NetSurf draws the page directly into the hardware framebuffer (/dev/fb0)"

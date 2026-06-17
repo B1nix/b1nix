@@ -782,7 +782,30 @@ no-fake-pass smoke test.
   `ext-https` uses). It is optional: it skips cleanly (`M53-EXT-HTTPS:
   unsupported`) when the usernet has no off-link route, so the offline smoke
   stays green; with outbound enabled it fetches and paints the full page.
-  With outbound enabled it fetches and paints the full page.
+- [x] `done` **TCP zero-window stall fixed** — a multi-host HTTPS page (e.g.
+  google.com) used to take ~20 s because each fresh connection whose TLS cert
+  flight overflowed the 4 KiB receive buffer advertised a zero window and then
+  sat through the peer's persist-timer backoff (~5 s per connection). The kernel
+  TCP stack now sends an unsolicited window-update ACK when the app drains a
+  throttled receive buffer (`kernel/net/tcp.c`), and the receive buffer/window
+  grew 4 KiB → 16 KiB. Measured against a real page: a fresh-host TLS handshake
+  dropped 5.5 s → 60 ms and full google.com load ~20 s → ~1.1 s.
+- [x] `done` **SVG images + JavaScript + public-suffix list.** SVG is decoded by
+  **libsvgtiny** (`tools/build-libsvgtiny.sh`, over libdom's expat XML binding)
+  and `NETSURF_USE_NSSVG=YES`; the framebuffer frontend's `plot->path` (an
+  upstream no-op stub) is given a real polygon-fill/stroke implementation so SVG
+  actually paints. **JavaScript** runs via the compiled-in Duktape engine with
+  the `enable_javascript` option flipped on. The **public-suffix list**
+  (**libnspsl**, `tools/build-libnspsl.sh`, `NETSURF_USE_NSPSL=YES`) scopes
+  cookies to a registrable domain. The render self-test loads a page with an
+  `<img>` SVG (solid green block) and a script that paints a solid blue block,
+  and asserts both colours appear in the framebuffer: `M53-NS: ok svg / ok js`.
+  Also enabled: **RISC-OS sprite** decoding (**librosprite**,
+  `tools/build-librosprite.sh`, `NETSURF_USE_ROSPRITE=YES`) and **utf8proc**
+  (`tools/build-libutf8proc.sh`, `NETSURF_USE_UTF8PROC=YES`) for IDNA Unicode in
+  `utils/idna.c`. Still off (each needs a heavy upstream port not yet brought
+  up): OpenSSL (redundant — mbedTLS is the TLS backend), JPEG-XL (libjxl =
+  C++/highway/brotli), PDF export (libharu) and video (GStreamer).
 - [x] `done` **Wayland frontend** — NetSurf runs as a windowed client of the
   b1nix display server (displayd) over the b1display/libgui (Wayland-shaped)
   protocol. A new libnsfb "displayd" surface gives NetSurf a compositor window
@@ -800,7 +823,7 @@ no-fake-pass smoke test.
   matching arrow/nav→ANSI-escape handling, so line editing and shell history
   work in the terminal too. SysV `SHMMAX` was raised 1 MB → 32 MB so a single
   shared segment can hold a full-screen graphics/framebuffer buffer.
-  Seven render/interaction paths green both arches (x86_64 728/0, x86 727/0):
+  Seven render/interaction paths green both arches (x86_64 739/0, x86 738/0):
   file:// (off-screen + on-screen /dev/fb0 + windowed displayd), loopback HTTP,
   loopback HTTPS, public-internet HTTPS, and keyboard/mouse input.
 - [ ] `planned` Use that port to assess Chromium; add Vulkan only when a
