@@ -813,6 +813,12 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox mkdir -p /mnt/w4\n"
     "/opt/busybox/bin/busybox mount -t ext4 sata0 /mnt/w4\n"
     "/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q \"/mnt/w4\" && echo \"BB-W4: ok mount\"\n"
+    /* M43: create a file + dir at a mountpoint that was created at RUNTIME
+     * (mkdir above), exercising the mount-crossing on a non-static mount node. */
+    "echo m43data > /mnt/w4/m43_create.txt\n"
+    "/opt/busybox/bin/busybox mkdir /mnt/w4/m43_dir\n"
+    "/opt/busybox/bin/busybox cat /mnt/w4/m43_create.txt | /opt/busybox/bin/busybox grep -q m43data && [ -d /mnt/w4/m43_dir ] && echo \"M43: ok create-runtime-mountpoint\"\n"
+    "/opt/busybox/bin/busybox rm -f /mnt/w4/m43_create.txt; /opt/busybox/bin/busybox rmdir /mnt/w4/m43_dir\n"
     "/opt/busybox/bin/busybox umount /mnt/w4\n"
     "/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q \"/mnt/w4\" || echo \"BB-W4: ok umount\"\n"
     /* nslookup on a numeric address: getaddrinfo numeric fast path, no live DNS

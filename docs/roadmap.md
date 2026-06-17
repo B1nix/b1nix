@@ -432,7 +432,12 @@ Source-level ports remain preferable to a Linux compatibility layer.
 - [x] Verify persistent writes on ext2/ext3/ext4.
 - [x] Fix AHCI page-crossing DMA, ext2 xattr parsing, and exFAT filename case.
 - [x] Add a read-only NTFS driver with resident/non-resident data and indexes.
-- [ ] `planned` Fix creation at runtime-created mountpoints.
+- [x] Creation at runtime-created mountpoints works (was `planned`): the
+  downward mount-crossing matches the mountpoint by node identity, and a
+  `mkdir`-at-runtime node is pinned by the mount, so lookups resolve into the
+  mounted fs. Verified by `M43: ok create-runtime-mountpoint` — `mkdir /mnt/w4`
+  at runtime, `mount -t ext4 sata0 /mnt/w4`, then create a file + subdir inside
+  and read them back, both arches.
 - [ ] `planned` Add exFAT and NTFS write support.
 - [ ] `planned` Populate large filesystem directory trees lazily.
 
