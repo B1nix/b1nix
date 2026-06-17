@@ -55,6 +55,27 @@ int main(void) {
   }
   emit("M53-VIRGL: ok caps\n");
 
+  /* Fetch the full capset blob (a Mesa virgl winsys reads this at
+   * screen-create). virgl_caps_v1/v2 begins with a u32 max_version (1 or 2),
+   * so a sane value proves the host actually filled the blob. */
+  {
+    static uint8_t blob[4096];
+    struct b1nix_virgl_caps_data cd;
+    memset(&cd, 0, sizeof(cd));
+    cd.size = sizeof(blob);
+    cd.caps_ptr = (uint64_t)(uintptr_t)blob;
+    if (ioctl(fd, B1NIX_VIRGL_GET_CAPS_DATA, &cd) != 0 || cd.size == 0) {
+      emit("M53-VIRGL: fail caps-data\n");
+      return 1;
+    }
+    uint32_t maxver = *(uint32_t *)blob;
+    if (maxver < 1 || maxver > 100) {
+      emit("M53-VIRGL: fail caps-data-blob\n");
+      return 1;
+    }
+    emit("M53-VIRGL: ok caps-data\n");
+  }
+
   struct b1nix_virgl_res_create rc;
   memset(&rc, 0, sizeof(rc));
   rc.target = PIPE_TEXTURE_2D;

@@ -882,12 +882,17 @@ static void virtio_gpu_virgl_selftest(void)
 
 /* Kernel copies of the userspace ABI (userspace/include/b1nix/virgl.h). */
 #define B1NIX_VIRGL_GET_CAPS 0x7601
+#define B1NIX_VIRGL_GET_CAPS_DATA 0x7602
 #define B1NIX_VIRGL_RES_CREATE 0x7603
 #define B1NIX_VIRGL_SUBMIT 0x7604
 #define B1NIX_VIRGL_TRANSFER_FROM_HOST 0x7605
 
 struct b1nix_virgl_caps_abi {
     u32 capset_id, capset_version, capset_size, _pad;
+};
+struct b1nix_virgl_caps_data_abi {
+    u32 capset_id, capset_version, size, _pad;
+    u64 caps_ptr;
 };
 struct b1nix_virgl_res_create_abi {
     u32 target, format, bind, width, height, depth, array_size;
@@ -1076,6 +1081,59 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
         out.capset_size = capresp.capset_max_size;
         out._pad = 0;
         if (!arg || syscall_copyout(arg, &out, sizeof(out)) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case B1NIX_VIRGL_GET_CAPS_DATA: {
+        /* Fetch the full capset BLOB from the host into a userspace buffer.
+         * The Mesa virgl winsys reads this at screen-create to learn the host
+         * GPU's feature/format/limit set (virgl_caps_v2). */
+        struct b1nix_virgl_caps_data_abi req;
+        if (!arg || syscall_copyin(&req, arg, sizeof(req)) < 0)
+            return -EFAULT;
+
+        struct virtio_gpu_get_capset_info capreq;
+        struct virtio_gpu_resp_capset_info capresp;
+        memset(&capreq, 0, sizeof(capreq));
+        memset(&capresp, 0, sizeof(capresp));
+        capreq.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET_INFO;
+        capreq.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        capreq.hdr.fence_id = gpu_fence_id++;
+        capreq.capset_index = 0;
+        if (virtio_gpu_send_cmd(&capreq, sizeof(capreq), &capresp, sizeof(capresp)) < 0 ||
+            capresp.hdr.type != VIRTIO_GPU_RESP_OK_CAPSET_INFO)
+            return -EIO;
+
+        struct virtio_gpu_get_capset getcap;
+        struct {
+            struct virtio_gpu_ctrl_hdr hdr;
+            u8 capset_data[3072];
+        } __attribute__((packed)) capdata;
+        usize capdata_len = sizeof(capdata);
+        if (capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr) < capdata_len)
+            capdata_len = capresp.capset_max_size + sizeof(struct virtio_gpu_ctrl_hdr);
+        if (capdata_len > PAGE_SIZE) capdata_len = PAGE_SIZE;
+        memset(&getcap, 0, sizeof(getcap));
+        memset(&capdata, 0, sizeof(capdata));
+        getcap.hdr.type = VIRTIO_GPU_CMD_GET_CAPSET;
+        getcap.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+        getcap.hdr.fence_id = gpu_fence_id++;
+        getcap.capset_id = capresp.capset_id;
+        getcap.capset_version = capresp.capset_max_version;
+        if (virtio_gpu_send_cmd(&getcap, sizeof(getcap), &capdata, capdata_len) < 0 ||
+            !virtio_gpu_virgl_hdr_ok(&capdata.hdr, VIRTIO_GPU_RESP_OK_CAPSET))
+            return -EIO;
+
+        u32 blob = capresp.capset_max_size;
+        if (blob > sizeof(capdata.capset_data)) blob = sizeof(capdata.capset_data);
+        u32 copy = req.size < blob ? req.size : blob;
+        if (req.caps_ptr && copy &&
+            syscall_copyout((void *)(usize)req.caps_ptr, capdata.capset_data, copy) < 0)
+            return -EFAULT;
+        req.capset_id = capresp.capset_id;
+        req.capset_version = capresp.capset_max_version;
+        req.size = blob;
+        if (syscall_copyout(arg, &req, sizeof(req)) < 0)
             return -EFAULT;
         return 0;
     }

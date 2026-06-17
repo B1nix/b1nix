@@ -1456,6 +1456,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 			# M53: the same accelerated path driven from USERSPACE via
 			# /dev/virtio-gpu (the kernel/userspace split a Mesa virgl winsys uses).
 			check_output "$LOG" "M53-VIRGL: ok caps" "M53: userspace queries the VirGL capset via /dev/virtio-gpu"
+			check_output "$LOG" "M53-VIRGL: ok caps-data" "M53: userspace fetches the full VirGL capset blob (Mesa winsys prerequisite)"
 			check_output "$LOG" "M53-VIRGL: ok resource" "M53: userspace creates a 3D render-target resource + mmap window"
 			check_output "$LOG" "M53-VIRGL: ok submit" "M53: userspace submits a virgl command stream"
 			check_output "$LOG" "M53-VIRGL: ok path-accelerated" "M53: host GPU renders userspace-submitted virgl clear; pixels verified via mmap"

@@ -17,6 +17,7 @@
 #include <stdint.h>
 
 #define B1NIX_VIRGL_GET_CAPS 0x7601           /* arg: struct b1nix_virgl_caps*  */
+#define B1NIX_VIRGL_GET_CAPS_DATA 0x7602      /* arg: struct b1nix_virgl_caps_data* */
 #define B1NIX_VIRGL_RES_CREATE 0x7603         /* arg: struct b1nix_virgl_res_create* */
 #define B1NIX_VIRGL_SUBMIT 0x7604             /* arg: struct b1nix_virgl_submit* */
 #define B1NIX_VIRGL_TRANSFER_FROM_HOST 0x7605 /* arg: struct b1nix_virgl_transfer* */
@@ -26,6 +27,17 @@ struct b1nix_virgl_caps {
   uint32_t capset_version; /* out */
   uint32_t capset_size;    /* out: bytes of capset data on the host */
   uint32_t _pad;
+};
+
+/* GET_CAPS_DATA: fetch the full capset blob (virgl_caps_v2) into caps_ptr.
+ * A Mesa virgl winsys reads this at screen-create to learn the host GPU's
+ * feature/format/limit set. */
+struct b1nix_virgl_caps_data {
+  uint32_t capset_id;      /* out */
+  uint32_t capset_version; /* out */
+  uint32_t size;           /* in: caps_ptr buffer bytes; out: host blob size */
+  uint32_t _pad;
+  uint64_t caps_ptr;       /* in: userspace buffer to receive the blob */
 };
 
 struct b1nix_virgl_res_create {
