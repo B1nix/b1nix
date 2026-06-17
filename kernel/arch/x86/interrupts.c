@@ -553,6 +553,14 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
     console_write_dec(sig);
     console_write(") at eip=0x");
     console_write_hex64(frame->eip);
+    console_write(" vec=");
+    console_write_dec(frame->vector);
+    console_write(" err=0x");
+    console_write_hex64(frame->error_code);
+    if (frame->vector == 14) {
+      console_write(" cr2=0x");
+      console_write_hex64(read_cr2());
+    }
     console_write(" — terminating\n");
     if (sig == SIGSEGV || sig == SIGABRT || sig == SIGILL || sig == SIGFPE ||
         sig == SIGBUS) {
