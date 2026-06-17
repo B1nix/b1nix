@@ -1002,7 +1002,7 @@ static int ext4_vfs_setattr(struct vfs_node *node) {
   inode.i_size = (u32)node->inode->size;
   inode.i_atime = node->inode->atime; inode.i_mtime = node->inode->mtime; inode.i_ctime = node->inode->ctime;
   if (fs->features_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) {
-    inode.i_dir_acl = (u32)(node->inode->size >> 32);
+    inode.i_dir_acl = (u32)((u64)node->inode->size >> 32);
   }
   return ext4_write_inode(fs, info->inode_num, &inode);
 }

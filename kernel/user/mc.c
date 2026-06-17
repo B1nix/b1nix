@@ -164,7 +164,7 @@ static int read_directory(struct panel *p)
 	}
 	usize count = syscall_dispatch(SYS_READDIR, (u64)(usize)p->current_dir, (u64)(usize)entries, MAX_FILES, 0, 0, 0);
 	
-	if (count == 0 || count == (u64)-1) {
+	if (count == 0 || count == (usize)-1) {
 		/* Fallback: at least show "." */
 		strcpy(p->files[0].name, ".");
 		p->files[0].is_dir = 1;

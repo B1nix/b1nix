@@ -299,33 +299,6 @@ static struct tcp_conn *tcp_find_conn(struct ipv4_addr remote_ip,
   return tcp_find_conn_af(B1NIX_AF_INET, remote_ip, 0, remote_port, local_port);
 }
 
-static void tcp_queue_retransmit(struct tcp_conn *conn, const void *packet,
-                                 usize len, u32 seq) {
-  struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
-  if (!rp)
-    return;
-  rp->data = kmalloc(len);
-  if (!rp->data) {
-    kfree(rp);
-    return;
-  }
-  memcpy(rp->data, packet, len);
-  rp->len = len;
-  rp->seq = seq;
-  rp->timestamp = scheduler_get_uptime_ticks();
-  rp->retries = 0;
-  rp->next = 0;
-
-  u64 irq = irq_save();
-  tcp_lock();
-  struct tcp_retransmit_pkt **prev = &conn->retransmit_queue;
-  while (*prev)
-    prev = &(*prev)->next;
-  *prev = rp;
-  tcp_unlock();
-  irq_restore(irq);
-}
-
 static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
                                              struct in6_addr_k v6,
                                              u16 dst_port) {

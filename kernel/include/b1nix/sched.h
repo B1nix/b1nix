@@ -186,8 +186,12 @@ struct task {
   char env[16][64]; // Replaced TASK_ENV_MAX/TASK_ENV_VALUE_MAX with literals
                     // for header simplicity
 
-  /* Signal handling */
-  u64 pending_signals;             /* bitmask of pending signals */
+  /* Signal handling. pending_signals is updated with 8-byte __atomic ops from
+   * ISR/signal/scheduler paths; force 8-byte alignment so those atomics are
+   * naturally aligned on i686 (where a bare u64 field is only 4-byte aligned —
+   * the lock-prefixed op stays correct but warns and pays a cache penalty).
+   * Tasks are kmalloc'd in chunks, so the small sizeof bump is harmless. */
+  __attribute__((aligned(8))) u64 pending_signals; /* bitmask of pending signals */
   u64 blocked_signals;             /* bitmask of blocked signals */
   struct sigaction sigactions[31]; /* NSIG = 31 */
 

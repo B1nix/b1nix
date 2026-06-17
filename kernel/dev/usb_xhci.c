@@ -313,9 +313,6 @@ static void usb_handle_transfer_event(struct trb *e)
 	if ((int)slot == kbd_slot && (int)dci == kbd_ep_dci) {
 		u64 flags;
 		spin_lock_irqsave(&xhci_kbd_lock, &flags);
-		u8 cc = (u8)((e->status >> 24) & 0xff);
-		u32 length = e->status & 0xffffff;
-
 		usb_hid_translate_report(int_buf);
 		/* Re-queue the read. */
 		struct trb *n = &int_ring[int_enq];

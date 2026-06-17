@@ -22,7 +22,10 @@ static int hexval(char c) {
   return -1;
 }
 
-/* Decode a little-endian 8-byte register from `hex` (16 chars). */
+#ifdef __x86_64__
+/* Decode a little-endian 8-byte register from `hex` (16 chars). Only the
+ * 64-bit GDB register check uses this; the i686 path decodes 4-byte regs
+ * inline, so guard the definition to avoid an unused-function warning there. */
 static u64 decode_le64(const char *hex) {
   u64 v = 0;
   for (int b = 0; b < 8; b++) {
@@ -31,6 +34,7 @@ static u64 decode_le64(const char *hex) {
   }
   return v;
 }
+#endif
 
 /* A known memory probe for the 'm' packet test. */
 static const u8 m36_probe[4] = {0xde, 0xad, 0xbe, 0xef};

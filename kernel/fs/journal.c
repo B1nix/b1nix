@@ -145,13 +145,11 @@ int journal_recover(struct journal_dev *jdev) {
       journal_next_block(jdev, &pos); // skip descriptor block
       u32 tx_data_start = pos;
       int done = 0;
-      int count = 0;
 
       while (!done) {
         if (tag->t_flags & JBD_TAG_LAST_TAG)
           done = 1;
         journal_next_block(jdev, &pos); // skip data block
-        count++;
         tag++;
       }
 
