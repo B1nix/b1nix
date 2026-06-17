@@ -788,7 +788,7 @@ $(BUILD_DIR)/initramfs_m53_httpsd.inc: userspace/bin/m53_httpsd.c $(USERSPACE_DE
 $(NSFB_ELF): tools/build-netsurf-fb.sh tools/build-libnsfb.sh
 	B1NIX_ARCH=$(ARCH) tools/build-netsurf-fb.sh >/dev/null
 
-$(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png tools/netsurf-assets/test.svg
+$(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png tools/netsurf-assets/test.svg tools/netsurf-assets/test.jxl
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) tools/gen_netsurf_initramfs.sh $@
 

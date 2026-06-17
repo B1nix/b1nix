@@ -102,6 +102,7 @@ stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + 
 stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain scoping)
 stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
 stage build-libutf8proc.sh # libutf8proc.a — Unicode/IDNA (utils/idna.c)
+stage build-libjxl.sh      # libjxl_dec.a (+cms/hwy/brotli) — JPEG-XL decode (C++)
 
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
@@ -234,6 +235,9 @@ emit_pc libsvgtiny      "-lsvgtiny -lexpat" "libdom libwapcaplet"
 emit_pc libnspsl        "-lnspsl"         ""
 emit_pc librosprite     "-lrosprite"      ""
 emit_pc libutf8proc     "-lutf8proc"      ""
+# libjxl is C++ (STL/libstdc++) with circular static deps between jxl_dec/jxl_cms
+# /hwy — group them and pull the C++ runtime so the C-linked nsfb resolves them.
+emit_pc libjxl  "-Wl,--start-group -ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotlicommon -Wl,--end-group -lstdc++ -lsupc++" ""
 # libnsfb is always linked by the framebuffer frontend. NetSurf already adds its
 # own -lm (after -lpng16), so only the compat shims go here — and they must come
 # last so libm's fenv/scalbnl/creal references resolve against them.
@@ -432,7 +436,7 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 	nsfb_get_buffer(nsfb, &fbuf, &stride);
 	if (fbuf != NULL && w > 0 && h > 0 && stride > 0) {
 		unsigned long nonbg = 0, rows_with_content = 0;
-		unsigned long svg_px = 0, js_px = 0;
+		unsigned long svg_px = 0, js_px = 0, jxl_px = 0;
 		for (int y = 0; y < h; y++) {
 			uint32_t *row = (uint32_t *)(fbuf + (size_t)y * stride);
 			int rowhas = 0;
@@ -445,7 +449,8 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 				 * channel + low others, and require many such pixels (a
 				 * solid block) to rule out the logo's stray colours.
 				 *   #1eb820 inline-SVG rect  -> svg_px (libsvgtiny ran)
-				 *   #2040ff JS-painted bar    -> js_px  (Duktape ran)   */
+				 *   #2040ff JS-painted bar    -> js_px  (Duktape ran)
+				 *   #e000e0 magenta JXL image -> jxl_px (libjxl ran)   */
 				unsigned b0 = px & 0xff, b1 = (px >> 8) & 0xff,
 					 b2 = (px >> 16) & 0xff;
 				if (b1 > 150 && b0 < 90 && b2 < 90)
@@ -454,6 +459,8 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 					 ((b0 > 220 && b2 < 90) ||
 					  (b2 > 220 && b0 < 90)))
 					js_px++;
+				else if (b1 < 90 && b0 > 180 && b2 > 180)
+					jxl_px++;
 			}
 			if (rowhas)
 				rows_with_content++;
@@ -471,6 +478,8 @@ static void framebuffer_test_run(nsfb_t *nsfb, struct browser_window *bw)
 			fprintf(stdout, "%s: ok svg svg-px=%lu\n", mk, svg_px);
 		if (js_px > 500)
 			fprintf(stdout, "%s: ok js js-px=%lu\n", mk, js_px);
+		if (jxl_px > 500)
+			fprintf(stdout, "%s: ok jxl jxl-px=%lu\n", mk, jxl_px);
 	} else {
 		fprintf(stdout, "%s: fail no-surface\n", mk);
 	}
@@ -682,6 +691,23 @@ B1NIX_FB_PATH_EOF
   ' "$FB_C"
 fi
 
+# Throttle the Duktape uncaught-JS-error log. Modern sites ship ES2020+ minified
+# bundles that Duktape (ES5.1-class) cannot parse, so each script raises an
+# uncaught error and dozens flood the console per page. Cap to the first few +
+# one explanatory line. Idempotent (marker guarded).
+DUKKY_C="$SRC_DIR/content/handlers/javascript/duktape/dukky.c"
+if [ -f "$DUKKY_C" ] && ! grep -q 'b1nix-jserr-throttle' "$DUKKY_C"; then
+  perl -0pi -e 's{(\tduk_dup_top\(ctx\);\n\t/\* \.\.\., errobj, errobj \*/\n)\tNSLOG\(jserrors, WARNING, "Uncaught error in JS: %s", duk_safe_to_stacktrace\(ctx, -1\)\);}{\tstatic unsigned b1nix_jserr_count = 0; /* b1nix-jserr-throttle */\n$1\tif (b1nix_jserr_count < 8) {\n\t\tNSLOG(jserrors, WARNING, "Uncaught error in JS: %s", duk_safe_to_stacktrace(ctx, -1));\n\t} else if (b1nix_jserr_count == 8) {\n\t\tNSLOG(jserrors, WARNING, "Further uncaught JS errors suppressed (Duktape is ES5-class; modern ES2020+ sites won'"'"'t run)");\n\t}\n\tb1nix_jserr_count++;}' "$DUKKY_C"
+fi
+
+# Map the .jxl extension to image/jxl in the framebuffer file:// fetcher (it
+# knows png/jpg/svg/... but not jxl), so a local JPEG-XL <img> reaches the
+# libjxl content handler. Idempotent (marker guarded).
+FBFETCH_C="$SRC_DIR/frontends/framebuffer/fetch.c"
+if [ -f "$FBFETCH_C" ] && ! grep -q 'b1nix-jxl-mime' "$FBFETCH_C"; then
+  perl -0pi -e 's{(\n\treturn "text/html";)}{\n\tif (2 < l \&\& strcasecmp(unix_path + l - 3, "jxl") == 0)\n\t\treturn "image/jxl"; /* b1nix-jxl-mime */$1}' "$FBFETCH_C"
+fi
+
 # ── 1c. nsgenbind host tool — generates the Duktape<->DOM JS bindings ──
 # Needed when NETSURF_USE_DUKTAPE=YES: content/handlers/javascript/duktape's
 # Makefile invokes `nsgenbind` from PATH. Build it (host tool) from the
@@ -716,7 +742,7 @@ make -C "$SRC_DIR" \
   NETSURF_USE_UTF8PROC=YES \
   NETSURF_USE_LIBICONV_PLUG=YES \
   NETSURF_USE_JPEG=YES \
-  NETSURF_USE_JPEGXL=NO \
+  NETSURF_USE_JPEGXL=YES \
   NETSURF_USE_WEBP=YES \
   NETSURF_USE_PNG=YES \
   NETSURF_USE_BMP=YES \

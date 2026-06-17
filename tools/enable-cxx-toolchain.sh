@@ -50,6 +50,21 @@ enable_one() {
     if grep -q '/\* #undef _GLIBCXX_HAS_GTHREADS \*/' "$cfg"; then
       sed -i.bak 's|/\* #undef _GLIBCXX_HAS_GTHREADS \*/|#define _GLIBCXX_HAS_GTHREADS 1|' "$cfg"
     fi
+    # 4. The toolchain was configured against an empty sysroot, so libstdc++
+    #    recorded "libc has no C99 math/stdint/fenv" and #if's std::log2,
+    #    std::isfinite, std::mt19937 (needs <stdint> fast types), etc. out of
+    #    <cmath>/<cstdint>. b1nix's libc/libm (openlibm) now provide them, so
+    #    enable the TR1 feature macros (b1nix's math.h is C99-complete, and its
+    #    classification macros are C++-guarded so std::isfinite resolves). Needed
+    #    by C++ ports like libjxl; harmless for others (a declared-but-unused fn
+    #    only fails if it is actually linked).
+    for m in _GLIBCXX_USE_C99_MATH_TR1 _GLIBCXX_USE_C99_STDINT_TR1 \
+             _GLIBCXX_USE_C99_FENV_TR1 \
+             _GLIBCXX11_USE_C99_MATH _GLIBCXX98_USE_C99_MATH; do
+      if grep -q "/\* #undef $m \*/" "$cfg"; then
+        sed -i.bak "s|/\* #undef $m \*/|#define $m 1|" "$cfg"
+      fi
+    done
   fi
   rm -f "$cross"/*/include/c++/*/"$triplet"/bits/c++config.h.bak 2>/dev/null || true
   echo "enable-cxx: $triplet ready" >&2

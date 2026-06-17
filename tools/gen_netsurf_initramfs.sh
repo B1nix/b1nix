@@ -50,6 +50,7 @@ NRES=$i
 xxd -i -n vfs_ns_testhtml "$ASSETS/test.html" >> "$OUT"
 xxd -i -n vfs_ns_testpng  "$ASSETS/test.png"  >> "$OUT"
 xxd -i -n vfs_ns_testsvg  "$ASSETS/test.svg"  >> "$OUT"
+xxd -i -n vfs_ns_testjxl  "$ASSETS/test.jxl"  >> "$OUT"
 
 # 4. The file table macro.
 {
@@ -64,7 +65,8 @@ xxd -i -n vfs_ns_testsvg  "$ASSETS/test.svg"  >> "$OUT"
   done
   echo "    {\"/netsurf/test.html\", (const char *)vfs_ns_testhtml, sizeof(vfs_ns_testhtml), 0}, \\"
   echo "    {\"/netsurf/test.png\", (const char *)vfs_ns_testpng, sizeof(vfs_ns_testpng), 0}, \\"
-  printf "    {\"/netsurf/test.svg\", (const char *)vfs_ns_testsvg, sizeof(vfs_ns_testsvg), 0}\n"
+  echo "    {\"/netsurf/test.svg\", (const char *)vfs_ns_testsvg, sizeof(vfs_ns_testsvg), 0}, \\"
+  printf "    {\"/netsurf/test.jxl\", (const char *)vfs_ns_testjxl, sizeof(vfs_ns_testjxl), 0}\n"
 } >> "$OUT"
 
 echo "gen_netsurf_initramfs: wrote $OUT" >&2

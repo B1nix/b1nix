@@ -25,6 +25,10 @@ frontend painted text and the image below.</p>
      content) so the green block only paints if the SVG decoder works. -->
 <img src="test.svg" alt="green svg" width="80" height="40">
 
+<!-- M53: JPEG-XL image, decoded by libjxl (NETSURF_USE_JPEGXL). The magenta
+     block only paints if the JXL decoder works. -->
+<img src="test.jxl" alt="magenta jxl" width="80" height="40">
+
 <!-- M53: JavaScript via Duktape (enable_javascript). The script paints a solid
      blue bar at load; the bar's distinctive colour only appears if JS ran, so
      the render self-test can assert JS execution (not just "page rendered"). -->

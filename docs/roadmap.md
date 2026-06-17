@@ -813,13 +813,24 @@ no-fake-pass smoke test.
   (**libnspsl**, `tools/build-libnspsl.sh`, `NETSURF_USE_NSPSL=YES`) scopes
   cookies to a registrable domain. The render self-test loads a page with an
   `<img>` SVG (solid green block) and a script that paints a solid blue block,
-  and asserts both colours appear in the framebuffer: `M53-NS: ok svg / ok js`.
+  and asserts all three colours appear in the framebuffer: `M53-NS: ok svg /
+  ok js / ok jxl`.
   Also enabled: **RISC-OS sprite** decoding (**librosprite**,
-  `tools/build-librosprite.sh`, `NETSURF_USE_ROSPRITE=YES`) and **utf8proc**
+  `tools/build-librosprite.sh`, `NETSURF_USE_ROSPRITE=YES`), **utf8proc**
   (`tools/build-libutf8proc.sh`, `NETSURF_USE_UTF8PROC=YES`) for IDNA Unicode in
-  `utils/idna.c`. Still off (each needs a heavy upstream port not yet brought
-  up): OpenSSL (redundant — mbedTLS is the TLS backend), JPEG-XL (libjxl =
-  C++/highway/brotli), PDF export (libharu) and video (GStreamer).
+  `utils/idna.c`, and **JPEG-XL** (**libjxl** 0.11.1 + highway + brotli + skcms,
+  `tools/build-libjxl.sh` — a CMake cross-build with the b1nix C++ toolchain,
+  decode-only, `NETSURF_USE_JPEGXL=YES`). Enabling libjxl required completing the
+  C++ toolchain: `userspace/include/math.h` filled out to full C99 (erf/lgamma/
+  tgamma/long-double variants, double_t/float_t) with the classification
+  helpers made C++-safe, and `enable-cxx-toolchain.sh` turning on libstdc++'s
+  C99 math/stdint/fenv feature macros (the toolchain had been built against an
+  empty sysroot) — HarfBuzz and Mesa re-verified against the updated toolchain.
+  A real `<img>` JXL (magenta block) is decoded and asserted: `M53-NS: ok jxl`.
+  Still off: OpenSSL (redundant — mbedTLS is the TLS backend), PDF export
+  (libharu, an export-only feature) and video (GStreamer — a whole multimedia
+  framework on GLib/GObject with a dlopen plugin model, not a self-contained
+  codec; the realistic path is a custom libvpx-based content handler).
 - [x] `done` **Wayland frontend** — NetSurf runs as a windowed client of the
   b1nix display server (displayd) over the b1display/libgui (Wayland-shaped)
   protocol. A new libnsfb "displayd" surface gives NetSurf a compositor window
