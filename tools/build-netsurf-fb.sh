@@ -103,6 +103,11 @@ stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain sco
 stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
 stage build-libutf8proc.sh # libutf8proc.a — Unicode/IDNA (utils/idna.c)
 stage build-libjxl.sh      # libjxl_dec.a (+cms/hwy/brotli) — JPEG-XL decode (C++)
+# NOTE: libharu (PDF export) is ported as a standalone library
+# (tools/build-libharu.sh builds libhpdf.a), but NetSurf 3.11's PDF glue is
+# upstream bit-rot — desktop/font_haru.c needs the removed desktop/font.h and a
+# `struct font_functions` model that print_make_settings no longer uses — so
+# NETSURF_USE_HARU_PDF stays NO until that dead code is revived.
 
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive

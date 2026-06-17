@@ -827,10 +827,16 @@ no-fake-pass smoke test.
   C99 math/stdint/fenv feature macros (the toolchain had been built against an
   empty sysroot) — HarfBuzz and Mesa re-verified against the updated toolchain.
   A real `<img>` JXL (magenta block) is decoded and asserted: `M53-NS: ok jxl`.
-  Still off: OpenSSL (redundant — mbedTLS is the TLS backend), PDF export
-  (libharu, an export-only feature) and video (GStreamer — a whole multimedia
+  Still off: **OpenSSL** (redundant — mbedTLS is the TLS backend); **PDF export**
+  (the **libharu** library *is* ported — `tools/build-libharu.sh` builds
+  `libhpdf.a` — but NetSurf 3.11's PDF glue is upstream bit-rot: `font_haru.c`
+  needs the removed `desktop/font.h` and a `struct font_functions` model that
+  `print_make_settings` no longer uses, so enabling it needs that dead code
+  revived, not just a flag); and **video** (GStreamer — a whole multimedia
   framework on GLib/GObject with a dlopen plugin model, not a self-contained
-  codec; the realistic path is a custom libvpx-based content handler).
+  codec; the realistic path is a custom libvpx-based content handler). All
+  *browsing* formats (every image codec incl. JPEG-XL, JS, HTTPS, Unicode, PSL)
+  are now enabled.
 - [x] `done` **Wayland frontend** — NetSurf runs as a windowed client of the
   b1nix display server (displayd) over the b1display/libgui (Wayland-shaped)
   protocol. A new libnsfb "displayd" surface gives NetSurf a compositor window
