@@ -100,6 +100,67 @@ int main(void) {
     return 1;
   }
 
+  /* Step-2 device ioctls a Mesa winsys needs (context, params, res info). */
+  if (ioctl(fd, B1NIX_VIRGL_CONTEXT_INIT, 0) != 0) {
+    emit("M53-VIRGL: fail context-init\n");
+    return 1;
+  }
+  {
+    struct b1nix_virgl_getparam gp;
+    memset(&gp, 0, sizeof(gp));
+    gp.param = 1; /* 3D_FEATURES */
+    if (ioctl(fd, B1NIX_VIRGL_GETPARAM, &gp) != 0 || gp.value != 1) {
+      emit("M53-VIRGL: fail getparam\n");
+      return 1;
+    }
+    struct b1nix_virgl_res_info ri;
+    memset(&ri, 0, sizeof(ri));
+    ri.res_id = rc.res_id;
+    if (ioctl(fd, B1NIX_VIRGL_RES_INFO, &ri) != 0 || ri.stride != DIM * 4 ||
+        ri.size == 0) {
+      emit("M53-VIRGL: fail res-info\n");
+      return 1;
+    }
+  }
+  emit("M53-VIRGL: ok device-api\n");
+
+  /* TRANSFER_TO_HOST round-trip: write a pattern into the backing, upload it to
+   * the host GPU, wipe the local copy, download it back, and check it survived
+   * — proving guest->host upload (every draw uploads vbo/index data this way). */
+  {
+    for (int i = 0; i < DIM * DIM; i++)
+      pixels[i] = 0xCAFE0000u + (uint32_t)i;
+    struct b1nix_virgl_transfer up;
+    memset(&up, 0, sizeof(up));
+    up.res_id = rc.res_id;
+    up.box.w = DIM;
+    up.box.h = DIM;
+    up.box.d = 1;
+    if (ioctl(fd, B1NIX_VIRGL_TRANSFER_TO_HOST, &up) != 0) {
+      emit("M53-VIRGL: fail transfer-to-host\n");
+      return 1;
+    }
+    (void)ioctl(fd, B1NIX_VIRGL_WAIT, 0);
+    uint32_t saved0 = pixels[0], saved7 = pixels[7];
+    for (int i = 0; i < DIM * DIM; i++)
+      pixels[i] = 0; /* wipe the local copy */
+    struct b1nix_virgl_transfer down;
+    memset(&down, 0, sizeof(down));
+    down.res_id = rc.res_id;
+    down.box.w = DIM;
+    down.box.h = DIM;
+    down.box.d = 1;
+    if (ioctl(fd, B1NIX_VIRGL_TRANSFER_FROM_HOST, &down) != 0) {
+      emit("M53-VIRGL: fail transfer-roundtrip\n");
+      return 1;
+    }
+    if (pixels[0] != saved0 || pixels[7] != saved7) {
+      emit("M53-VIRGL: fail transfer-roundtrip\n");
+      return 1;
+    }
+    emit("M53-VIRGL: ok transfer-roundtrip\n");
+  }
+
   /* Build the virgl command stream: wrap the resource as a render surface, bind
    * it as the framebuffer, and CLEAR to (R=0.25, G=0.5, B=0.75, A=1.0). */
   uint32_t cmd[32];

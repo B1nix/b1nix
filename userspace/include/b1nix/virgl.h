@@ -21,6 +21,11 @@
 #define B1NIX_VIRGL_RES_CREATE 0x7603         /* arg: struct b1nix_virgl_res_create* */
 #define B1NIX_VIRGL_SUBMIT 0x7604             /* arg: struct b1nix_virgl_submit* */
 #define B1NIX_VIRGL_TRANSFER_FROM_HOST 0x7605 /* arg: struct b1nix_virgl_transfer* */
+#define B1NIX_VIRGL_TRANSFER_TO_HOST 0x7606   /* arg: struct b1nix_virgl_transfer* */
+#define B1NIX_VIRGL_WAIT 0x7607               /* arg: NULL (synchronous, no-op) */
+#define B1NIX_VIRGL_GETPARAM 0x7608           /* arg: struct b1nix_virgl_getparam* */
+#define B1NIX_VIRGL_RES_INFO 0x7609           /* arg: struct b1nix_virgl_res_info* */
+#define B1NIX_VIRGL_CONTEXT_INIT 0x760A       /* arg: NULL (shares implicit ctx) */
 
 struct b1nix_virgl_caps {
   uint32_t capset_id;      /* out: VIRGL capset id (1 = VIRGL, 2 = VIRGL2) */
@@ -51,6 +56,18 @@ struct b1nix_virgl_res_create {
   uint32_t res_id;      /* out: assigned resource id */
   uint64_t mmap_offset; /* out: offset to pass to mmap() of /dev/virtio-gpu */
   uint64_t size;        /* out: backing size in bytes */
+};
+
+struct b1nix_virgl_getparam {
+  uint32_t param; /* in: 1=3D_FEATURES, 2=CAPSET_QUERY_FIX, 6=CONTEXT_INIT */
+  uint32_t _pad;
+  uint64_t value; /* out */
+};
+
+struct b1nix_virgl_res_info {
+  uint32_t res_id; /* in */
+  uint32_t stride; /* out: bytes per row */
+  uint64_t size;   /* out: backing size */
 };
 
 struct b1nix_virgl_box {

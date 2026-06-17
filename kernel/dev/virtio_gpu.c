@@ -68,6 +68,7 @@ enum virtio_gpu_ctrl_type {
     VIRTIO_GPU_CMD_CTX_DESTROY = 0x0201,
     VIRTIO_GPU_CMD_CTX_ATTACH_RESOURCE = 0x0202,
     VIRTIO_GPU_CMD_RESOURCE_CREATE_3D = 0x0204,
+    VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D = 0x0205,
     VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D = 0x0206,
     VIRTIO_GPU_CMD_SUBMIT_3D = 0x0207,
     VIRTIO_GPU_RESP_OK_CAPSET_INFO = 0x1102,
@@ -886,6 +887,11 @@ static void virtio_gpu_virgl_selftest(void)
 #define B1NIX_VIRGL_RES_CREATE 0x7603
 #define B1NIX_VIRGL_SUBMIT 0x7604
 #define B1NIX_VIRGL_TRANSFER_FROM_HOST 0x7605
+#define B1NIX_VIRGL_TRANSFER_TO_HOST 0x7606
+#define B1NIX_VIRGL_WAIT 0x7607
+#define B1NIX_VIRGL_GETPARAM 0x7608
+#define B1NIX_VIRGL_RES_INFO 0x7609
+#define B1NIX_VIRGL_CONTEXT_INIT 0x760A
 
 struct b1nix_virgl_caps_abi {
     u32 capset_id, capset_version, capset_size, _pad;
@@ -893,6 +899,14 @@ struct b1nix_virgl_caps_abi {
 struct b1nix_virgl_caps_data_abi {
     u32 capset_id, capset_version, size, _pad;
     u64 caps_ptr;
+};
+struct b1nix_virgl_getparam_abi {
+    u32 param, _pad;
+    u64 value;
+};
+struct b1nix_virgl_res_info_abi {
+    u32 res_id, stride;
+    u64 size;
 };
 struct b1nix_virgl_res_create_abi {
     u32 target, format, bind, width, height, depth, array_size;
@@ -927,6 +941,10 @@ struct vgpu_udev_res {
     u64 phys;
     u64 size;
     u64 mmap_offset;
+    u32 width;
+    u32 height;
+    u32 format;
+    u32 bind;
 };
 static struct vgpu_udev_res vgpu_udev_res_tab[VGPU_UDEV_MAX_RES];
 static int vgpu_udev_ready;
@@ -1030,6 +1048,30 @@ static int vgpu_transfer_from_host(u32 ctx_id, const struct b1nix_virgl_transfer
     struct virtio_gpu_ctrl_hdr resp;
     memset(&xfer, 0, sizeof(xfer));
     xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_FROM_HOST_3D;
+    xfer.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
+    xfer.hdr.fence_id = gpu_fence_id++;
+    xfer.hdr.ctx_id = ctx_id;
+    xfer.box.x = t->box.x;
+    xfer.box.y = t->box.y;
+    xfer.box.z = t->box.z;
+    xfer.box.w = t->box.w;
+    xfer.box.h = t->box.h;
+    xfer.box.d = t->box.d ? t->box.d : 1;
+    xfer.offset = t->offset;
+    xfer.resource_id = t->res_id;
+    xfer.level = t->level;
+    if (virtio_gpu_send_cmd(&xfer, sizeof(xfer), &resp, sizeof(resp)) < 0 ||
+        resp.type != VIRTIO_GPU_RESP_OK_NODATA)
+        return -1;
+    return 0;
+}
+
+static int vgpu_transfer_to_host(u32 ctx_id, const struct b1nix_virgl_transfer_abi *t)
+{
+    struct virtio_gpu_transfer_host_3d xfer;
+    struct virtio_gpu_ctrl_hdr resp;
+    memset(&xfer, 0, sizeof(xfer));
+    xfer.hdr.type = VIRTIO_GPU_CMD_TRANSFER_TO_HOST_3D;
     xfer.hdr.flags = VIRTIO_GPU_FLAG_FENCE;
     xfer.hdr.fence_id = gpu_fence_id++;
     xfer.hdr.ctx_id = ctx_id;
@@ -1176,6 +1218,10 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
         vgpu_udev_res_tab[slot].phys = phys;
         vgpu_udev_res_tab[slot].size = pages * PAGE_SIZE;
         vgpu_udev_res_tab[slot].mmap_offset = (u64)slot * VGPU_UDEV_SLOT;
+        vgpu_udev_res_tab[slot].width = p.width;
+        vgpu_udev_res_tab[slot].height = p.height;
+        vgpu_udev_res_tab[slot].format = p.format;
+        vgpu_udev_res_tab[slot].bind = p.bind;
         p.mmap_offset = vgpu_udev_res_tab[slot].mmap_offset;
         p.size = pages * PAGE_SIZE;
         if (syscall_copyout(arg, &p, sizeof(p)) < 0)
@@ -1208,6 +1254,58 @@ static int vgpu_udev_ioctl(struct vfs_node *node, u64 request, void *arg)
         int rc = vgpu_transfer_from_host(VGPU_UDEV_CTX, &t);
         spin_unlock_irqrestore(&vgpu_udev_lock, flags);
         return rc < 0 ? -EIO : 0;
+    }
+    case B1NIX_VIRGL_TRANSFER_TO_HOST: {
+        /* Upload guest resource data (vertex/index/constant buffers, textures)
+         * to the host GPU — the direction a Mesa winsys uses for every draw. */
+        struct b1nix_virgl_transfer_abi t;
+        if (!arg || syscall_copyin(&t, arg, sizeof(t)) < 0)
+            return -EFAULT;
+        if (!vgpu_udev_find(t.res_id))
+            return -EINVAL;
+        u64 flags;
+        spin_lock_irqsave(&vgpu_udev_lock, &flags);
+        int rc = vgpu_transfer_to_host(VGPU_UDEV_CTX, &t);
+        spin_unlock_irqrestore(&vgpu_udev_lock, flags);
+        return rc < 0 ? -EIO : 0;
+    }
+    case B1NIX_VIRGL_WAIT:
+        /* SUBMIT/TRANSFER are synchronous here (virtio_gpu_send_cmd blocks on
+         * the host fence), so by the time userspace calls WAIT the GPU work is
+         * already complete — signal immediately. */
+        return 0;
+    case B1NIX_VIRGL_CONTEXT_INIT:
+        /* The kernel created the implicit 3D context at device init; userspace
+         * shares it (VGPU_UDEV_CTX). Accept context-init as a no-op success. */
+        return 0;
+    case B1NIX_VIRGL_GETPARAM: {
+        struct b1nix_virgl_getparam_abi gp;
+        if (!arg || syscall_copyin(&gp, arg, sizeof(gp)) < 0)
+            return -EFAULT;
+        u64 v = 0;
+        switch (gp.param) {
+        case 1: v = 1; break; /* VIRTGPU_PARAM_3D_FEATURES */
+        case 2: v = 1; break; /* VIRTGPU_PARAM_CAPSET_QUERY_FIX */
+        case 6: v = 1; break; /* VIRTGPU_PARAM_CONTEXT_INIT */
+        default: v = 0; break; /* RESOURCE_BLOB / HOST_VISIBLE / CROSS_DEVICE */
+        }
+        gp.value = v;
+        if (syscall_copyout(arg, &gp, sizeof(gp)) < 0)
+            return -EFAULT;
+        return 0;
+    }
+    case B1NIX_VIRGL_RES_INFO: {
+        struct b1nix_virgl_res_info_abi ri;
+        if (!arg || syscall_copyin(&ri, arg, sizeof(ri)) < 0)
+            return -EFAULT;
+        struct vgpu_udev_res *r = vgpu_udev_find(ri.res_id);
+        if (!r)
+            return -EINVAL;
+        ri.stride = r->width * 4; /* BGRA/RGBA: 4 bytes per texel */
+        ri.size = r->size;
+        if (syscall_copyout(arg, &ri, sizeof(ri)) < 0)
+            return -EFAULT;
+        return 0;
     }
     default:
         return -ENOTTY;
