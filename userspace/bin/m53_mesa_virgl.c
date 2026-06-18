@@ -11,6 +11,7 @@
 #include "pipe/p_state.h"
 #include "pipe/p_defines.h"
 #include "util/format/u_formats.h"
+#include "util/u_inlines.h"
 
 #include "virgl_b1nix_public.h"
 
@@ -106,5 +107,12 @@ int main(void)
       emit("M53-GFX: fail gl-accelerated (pixel)\n");
       return 1;
    }
+
+   /* Tear down so the winsys frees the host resource + device slot (RES_UNREF)
+    * instead of leaking it. */
+   pipe_surface_reference(&surf, NULL);
+   pipe_resource_reference(&rt, NULL);
+   ctx->destroy(ctx);
+   screen->destroy(screen);
    return 0;
 }

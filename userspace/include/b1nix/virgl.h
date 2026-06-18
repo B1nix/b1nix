@@ -26,6 +26,7 @@
 #define B1NIX_VIRGL_GETPARAM 0x7608           /* arg: struct b1nix_virgl_getparam* */
 #define B1NIX_VIRGL_RES_INFO 0x7609           /* arg: struct b1nix_virgl_res_info* */
 #define B1NIX_VIRGL_CONTEXT_INIT 0x760A       /* arg: NULL (shares implicit ctx) */
+#define B1NIX_VIRGL_RES_UNREF 0x760B          /* arg: uint32_t* res_id */
 
 struct b1nix_virgl_caps {
   uint32_t capset_id;      /* out: VIRGL capset id (1 = VIRGL, 2 = VIRGL2) */

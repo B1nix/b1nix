@@ -80,8 +80,13 @@ virgl_b1nix_cmd_buf(struct virgl_cmd_buf *cbuf)
 static void virgl_b1nix_resource_destroy(struct virgl_winsys *vws,
                                          struct virgl_hw_res *res)
 {
+   struct virgl_b1nix_winsys *vws_b = virgl_b1nix_winsys(vws);
+   uint32_t id = res->res_handle;
+
    if (res->ptr)
       munmap(res->ptr, res->size);
+   /* Release the host resource + the device's 16-slot table entry. */
+   ioctl(vws_b->fd, B1NIX_VIRGL_RES_UNREF, &id);
    FREE(res);
 }
 
