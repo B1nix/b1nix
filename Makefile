@@ -90,6 +90,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m52_osmesa \
 	m52_glsl \
 	cxx_smoke \
+	m55_litehtml \
 	displayd \
 	gclock \
 	gterm \
@@ -597,6 +598,14 @@ $(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/build-m52-gl
 	B1NIX_ARCH=$(ARCH) tools/build-m52-glsl.sh userspace/build/$(ARCH)/bin/m52_glsl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
+
+# M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
+# tools/build-m55-litehtml.sh builds litehtml+gumbo (build-litehtml.sh) and
+# links the parse/layout/draw acceptance test against them + libstdc++/libm.
+$(BUILD_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/build-m55-litehtml.sh tools/build-litehtml.sh $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-m55-litehtml.sh userspace/build/$(ARCH)/bin/m55_litehtml
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m55_litehtml_elf userspace/build/$(ARCH)/bin/m55_litehtml > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke

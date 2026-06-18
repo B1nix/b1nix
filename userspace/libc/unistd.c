@@ -1776,11 +1776,19 @@ int flock(int fd, int operation) {
 }
 
 /* fenv: b1nix has a fixed userspace FPU mode and no exception-flag plumbing. */
+#include <fenv.h>
 int feclearexcept(int e) { (void)e; return 0; }
 int feraiseexcept(int e) { (void)e; return 0; }
 int fetestexcept(int e) { (void)e; return 0; }
 int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
 int fesetround(int r) { (void)r; return 0; }
+/* Saving/restoring the FP environment is a no-op under the fixed mode. openlibm
+ * nearbyint/rint wrap rounding in fegetenv/fesetenv only to hide the inexact
+ * flag; the rounding itself is done by the FP path, so these stubs are sound. */
+int fegetenv(fenv_t *envp) { if (envp) envp->__cw = 0; return 0; }
+int fesetenv(const fenv_t *envp) { (void)envp; return 0; }
+int feholdexcept(fenv_t *envp) { if (envp) envp->__cw = 0; return 0; }
+int feupdateenv(const fenv_t *envp) { (void)envp; return 0; }
 
 /* openlibm's fma() calls __isnormal; provide the glibc-style classifier. */
 int __isnormal(double x) { return __builtin_isnormal(x); }

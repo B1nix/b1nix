@@ -1279,8 +1279,24 @@ static int init_main(int argc, const char **argv) {
   }
 
   if (smoke_core) {
+  /* M55: a real C++ HTML/CSS engine (litehtml) parses, lays out and draws a
+   * styled page on b1nix — end-to-end validation of the hosted C++ runtime
+   * (libstdc++ exceptions/RTTI, STL, shared_ptr) on a non-trivial codebase.
+   * Pure CPU work, kept on the core instance (the graphics instance is already
+   * saturated by software Mesa + NetSurf). */
+  {
+    u64 lh_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m55-litehtml", 0,
+                                  0, 0, 0, 0);
+    if ((isize)lh_pid < 0) {
+      uwrite("M55-LITEHTML: spawn-fail\n");
+    } else {
+      int lh_status = 0;
+      syscall_dispatch(SYS_WAIT, lh_pid, (u64)(usize)&lh_status, 0, 0, 0, 0);
+    }
+  }
+
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
-  
+
   if ((isize)n_pid < 0) {
     uwrite("NATIVE-SMOKE: spawn-fail\n");
   } else {

@@ -45,8 +45,13 @@ fi
 if grep -q '^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$' "$CFG"; then
   sed -i.bak 's@^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$@#define MBEDTLS_HAVE_TIME_DATE@' "$CFG"
 fi
-if grep -q '^#define MBEDTLS_TIMING_C$' "$CFG"; then
-  sed -i.bak 's/^#define MBEDTLS_TIMING_C$/\/\* #undef MBEDTLS_TIMING_C \*\//' "$CFG"
+# MBEDTLS_TIMING_C (M54): the timing layer (DTLS retransmit timers,
+# mbedtls_timing_get_timer) only needs gettimeofday in mbedTLS 3.x, which b1nix
+# libc provides. Keep it enabled (re-enable idempotently if a prior build
+# undef'd it). The portability #error gate in timing.c is taught about b1nix
+# below.
+if grep -q '^/\* #undef MBEDTLS_TIMING_C \*/$' "$CFG"; then
+  sed -i.bak 's@^/\* #undef MBEDTLS_TIMING_C \*/$@#define MBEDTLS_TIMING_C@' "$CFG"
 fi
 if grep -q '^#define MBEDTLS_NET_C$' "$CFG"; then
   sed -i.bak 's/^#define MBEDTLS_NET_C$/\/\* #undef MBEDTLS_NET_C \*\//' "$CFG"
@@ -66,6 +71,15 @@ PLATFORM_UTIL="$SRC_DIR/library/platform_util.c"
 if ! grep -q 'defined(b1nix)' "$PLATFORM_UTIL"; then
   sed -i.bak 's@^#if (defined(_POSIX_VERSION) && _POSIX_VERSION >= 199309L) || defined(__HAIKU__)$@#if (defined(_POSIX_VERSION) \&\& _POSIX_VERSION >= 199309L) || defined(__HAIKU__) || defined(b1nix)@' "$PLATFORM_UTIL"
   rm -f "$PLATFORM_UTIL.bak"
+fi
+
+# timing.c has a hard #error unless one of the known Unix/Windows macros is
+# defined; b1nix is Unix-like (the non-Windows path uses only gettimeofday).
+# Teach the gate about b1nix so MBEDTLS_TIMING_C compiles.
+TIMING_C="$SRC_DIR/library/timing.c"
+if ! grep -q 'defined(b1nix)' "$TIMING_C"; then
+  sed -i.bak 's@^    !defined(__APPLE__) && !defined(_WIN32) && !defined(__QNXNTO__) && \\$@    !defined(__APPLE__) \&\& !defined(_WIN32) \&\& !defined(__QNXNTO__) \&\& !defined(b1nix) \&\& \\@' "$TIMING_C"
+  rm -f "$TIMING_C.bak"
 fi
 
 # On b1nix, /dev/urandom is not guaranteed, but getrandom(2) is.

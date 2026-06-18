@@ -928,49 +928,61 @@ status table and the conditions for each remaining item:
   wrapper now drops libc-provided `-l` names so `--enable-threads` links in any
   port.
 - [x] `done` **Ports.** curl: `file://`, unix-sockets, alt-svc, HSTS,
-  WebSockets, headers-api, dateparse, threaded resolver. mbedTLS:
-  `HAVE_TIME`+`HAVE_TIME_DATE` (cert date validation). bash: `/dev/tcp`,
-  `/dev/udp`. dropbear: zlib + host lookup. wget: zlib + threads. NetSurf:
-  JPEG + WebP codecs and **JavaScript** (bundled Duktape via nsgenbind).
-  BusyBox: real `sched_getaffinity` (affinity stub removed). Verified both
-  arches (x86 727/0, x86_64 728/0).
-- [ ] `deferred` **curl `--with-libpsl`/`--with-libidn2`** — libs exist (wget
-  uses them) but curl's cross libpsl conftest cannot link the transitive
-  `idn2`/`unistring` chain. wget already covers PSL/IDN.
-- [ ] `planned` **Full feature parity** — the remaining disabled features, each
-  blocked on a real subsystem or a large library port (details and enable
-  conditions in [`port-functionality.md`](port-functionality.md)):
-  - System logging + login accounting: **foundation done** — kernel `/dev/log`
-    sink (→ kernel log) + libc `syslog`/`utmp`/`wtmp` + `pam_*` shim, verified by
-    M29 smoke. Per-port flips evaluated and left off (low value): dropbear
-    `--enable-syslog` would break the per-service `/var/log/sshd.log` the M32B
-    lifecycle smoke asserts; `--enable-harden` conflicts with the fixed load
-    address; utmp/pam/lastlog are cosmetic who/last accounting. See
-    [`port-functionality.md`](port-functionality.md).
-  - PAM: a minimal `libpam`/policy engine → dropbear `--enable-pam`,
-    login/su/passwd stacks.
-  - Full locale / multibyte: wide-char/locale + a real `iconv` → bash
-    `HANDLE_MULTIBYTE`, `nls`, NetSurf `libiconv`/`utf8proc`.
-  - Modern HTTP + compression: port nghttp2/nghttp3/ngtcp2/brotli/zstd (and
-    libjxl) → curl/wget HTTP/2+HTTP/3, NetSurf JPEG-XL.
-  - Mesa JIT + windowing: port LLVM (LLVMpipe shader JIT) and add a
-    DRI/GLX/EGL/GBM path beyond OSMesa-to-memory.
-  - TLS timing/native-net + harden: mbedTLS `TIMING_C`/`NET_C`, dropbear/curl
-    `--harden`, bash `bash-malloc`.
+  WebSockets, headers-api, dateparse, threaded resolver, **`libpsl`+`libidn2`**
+  (IDN/PSL), **brotli** (`Content-Encoding: br` decode). mbedTLS:
+  `HAVE_TIME`+`HAVE_TIME_DATE` (cert date validation), **`TIMING_C`** (timing
+  layer over `gettimeofday`). bash: `/dev/tcp`, `/dev/udp`. dropbear: zlib +
+  host lookup. wget: zlib + threads + PSL/IDN. NetSurf: JPEG + WebP + **JPEG-XL
+  (libjxl)** codecs, **SVG (libsvgtiny)**, **JavaScript** (bundled Duktape via
+  nsgenbind), `utf8proc`. Locale: `setlocale`/`localeconv`/`nl_langinfo` +
+  `iconv` (UTF-8/UTF-16/UCS4/Latin1/ASCII). BusyBox: real `sched_getaffinity`.
+- [x] `done` **Milestone closeout (M54).** The remaining feature flips are
+  either landed (above), correctly **declined**, or **deferred** behind a real
+  subsystem/large-library port. Full status: [`port-functionality.md`](port-functionality.md).
+  - **Declined (low value / conflicts):** dropbear `--enable-syslog` (moves logs
+    off the per-service `/var/log/sshd.log` the M32B smoke asserts);
+    dropbear/curl `--harden` (`-fPIE -pie` conflicts with the fixed `0x2000000`
+    load model); mbedTLS `NET_C` (the custom socket wrapper works); utmp/pam/
+    lastlog port flips (cosmetic who/last accounting — libc shim already exists).
+  - **Deferred (each its own large effort, revisit conditions in
+    [`port-functionality.md`](port-functionality.md)):**
+    - Modern HTTP: nghttp2 (HTTP/2), nghttp3+ngtcp2 (HTTP/3/QUIC), zstd
+      content-encoding — needs those libraries ported to the b1nix ABI.
+    - Mesa JIT + on-device windowing: port LLVM (LLVMpipe shader JIT) and add a
+      DRI/GLX/EGL/GBM path beyond OSMesa-to-memory. LLVM is the long pole
+      (tracked into M59). The softpipe path already works.
+    - Full wide-char locale / NLS tables → bash `HANDLE_MULTIBYTE`, `nls`. libc
+      is UTF-8-wired (`mbrtowc`/`wcrtomb`) + `iconv`; full locale catalogues are
+      not present.
 
 ## M55: C++ Runtime
 
 Prerequisite for every Chromium-class engine. Feasibility background and the
 revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
 
-- [ ] `planned` Build libstdc++ (or libc++) with C++ exceptions (DWARF unwinding
-  via `libgcc_eh`/libunwind), RTTI, and thread-safe statics; today it is only
-  exercised `-fno-exceptions -fno-rtti` (HarfBuzz).
-- [ ] `planned` Provide `std::thread`/`mutex`/`condvar`/`atomic` over pthreads
-  (base in M29), `std::filesystem`, and locale/iostream.
-- [ ] `planned` Validate by building a smaller modern engine first — litehtml
-  (C++ HTML/CSS) or Ladybird's LibWeb/LibJS — three orders of magnitude smaller
-  than Chromium, before committing to its build.
+- [x] `done` Build and **run** libstdc++ with C++ exceptions (DWARF `.eh_frame`
+  unwinding, registered with `libgcc` by `crt0`), RTTI, and thread-safe statics.
+  The cross GCC 13.2 builds `libstdc++.a`/`libsupc++.a` (`--enable-threads=posix`,
+  staged by `tools/enable-cxx-toolchain.sh`); `tools/b1nix-c++` links them with
+  `libgcc` via `userspace/linker-cxx.ld` (keeps `.eh_frame`/`.gcc_except_table`).
+  Verified end-to-end by `userspace/bin/cxx_smoke.cpp` (`CXX-SMOKE: ok` for
+  ctors, stl, exceptions, **rtti** `dynamic_cast`/`typeid`/`bad_cast`,
+  **static-init** `__cxa_guard`, **threads** `std::thread`/`mutex`/`atomic`).
+- [x] `done` `std::thread`/`mutex`/`atomic` over the M29 pthread layer (verified
+  in `cxx_smoke`). `std::condition_variable` links via gthr-posix.
+- [ ] `deferred` `std::filesystem` and locale/`iostream` (`std::cout`) — thin
+  wrappers over the existing VFS / UTF-8 libc; add when a port needs them.
+- [x] `done` Validate the runtime with a real modern engine: **litehtml** (C++
+  HTML/CSS layout engine + bundled gumbo HTML parser) is ported
+  (`tools/build-litehtml.sh`, CMake cross-build against b1nix libstdc++) and
+  runs end-to-end on b1nix — `userspace/bin/m55_litehtml.cpp` feeds it a styled
+  page, and the engine parses HTML, cascades CSS, lays out the box tree and
+  emits draw calls. Verified both arches: `M55-LITEHTML: ok parse/layout/draw`
+  (asserts the cascade — `h1` 32px above `p` 16px — and block ordering). This
+  exercises libstdc++ exceptions/RTTI, STL and `shared_ptr` on a non-trivial
+  codebase. (Closing this needed a real libc gap fixed: `fegetenv`/`fesetenv`/
+  `feholdexcept`/`feupdateenv`, which openlibm's `nearbyint` pulls in.)
+  Ladybird LibWeb/LibJS remains a future option if a heavier engine is wanted.
 
 ## M56: Event Loop and IPC Primitives
 

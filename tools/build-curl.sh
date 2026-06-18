@@ -57,6 +57,20 @@ if ZLIB_OUT="$("$ROOT_DIR/tools/build-zlib.sh")"; then
   TLS_LIBS="$TLS_LIBS -lz"
 fi
 
+# Brotli decoder: enable curl's "Content-Encoding: br" decompression (common on
+# the modern web; NetSurf fetches through curl). Decoder-only static libs.
+BROTLI_PREFIX="$ROOT_DIR/build/brotli-b1nix/$HOST_TRIPLET/install"
+BROTLI_FLAG="--without-brotli"
+if [ ! -f "$BROTLI_PREFIX/lib/libbrotlidec.a" ] || [ ! -f "$BROTLI_PREFIX/lib/libbrotlicommon.a" ]; then
+  "$ROOT_DIR/tools/build-brotli.sh" >/dev/null
+fi
+if [ -f "$BROTLI_PREFIX/lib/libbrotlidec.a" ]; then
+  BROTLI_FLAG="--with-brotli=$BROTLI_PREFIX"
+  TLS_CPPFLAGS="$TLS_CPPFLAGS -I$BROTLI_PREFIX/include"
+  TLS_LDFLAGS="$TLS_LDFLAGS -L$BROTLI_PREFIX/lib"
+  TLS_LIBS="$TLS_LIBS -lbrotlidec -lbrotlicommon"
+fi
+
 LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET/install"
 if [ ! -f "$LIBUNISTRING_PREFIX/lib/libunistring.a" ]; then
   "$ROOT_DIR/tools/build-libunistring.sh" >/dev/null
@@ -122,7 +136,7 @@ make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_AR
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
     --disable-shared --enable-static \
-    "$SSL_FLAGS" "$ZLIB_FLAG" --without-brotli --without-zstd \
+    "$SSL_FLAGS" "$ZLIB_FLAG" "$BROTLI_FLAG" --without-zstd \
     --with-libpsl="$LIBPSL_PREFIX" --with-libidn2="$LIBIDN2_PREFIX" --without-nghttp2 --without-nghttp3 \
     --without-ngtcp2 \
     --disable-ldap --disable-ldaps --disable-ftp --enable-file \
