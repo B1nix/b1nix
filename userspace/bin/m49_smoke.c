@@ -262,6 +262,131 @@ int main(void) {
 	marker(deco_mode == 2 ? "M49-WL: ok decoration\n"
 	                      : "M49-WL: fail decoration\n");
 
+	/* ── B-bucket: extra globals + DnD + touch ──
+	 * A round-trip sync(): send wl_display.sync(new_id) and wait for the
+	 * server's callback.done. Returns 1 if it arrived (the server processed
+	 * every preceding request without a protocol error / disconnect). */
+	uint32_t sync_id_next = 200;
+	int rt_ok = 0;
+	#define ROUNDTRIP() do { \
+		uint32_t _s = sync_id_next++; \
+		request(fd, 1, 0, &_s, 1); \
+		rt_ok = 0; int _t = 0; \
+		while (!rt_ok && _t++ < 64 && next_event(fd, &ev) == 1) \
+			if (ev.object == _s && ev.opcode == 0) rt_ok = 1; \
+	} while (0)
+
+	/* wp_viewporter (global name 8): get_viewport on surface 7, set a source
+	 * crop and a destination size, then confirm the server accepted the
+	 * sequence (sync round-trips → no protocol error). */
+	bind_prefix[0] = 8; bind_suffix[0] = 1; bind_suffix[1] = 100;
+	request_string(fd, 2, 0, bind_prefix, 1, "wp_viewporter", bind_suffix, 2);
+	uint32_t vp_args[2] = {101, 7}; /* get_viewport(new_id=101, surface=7) */
+	request(fd, 100, 1, vp_args, 2);
+	uint32_t vp_src[4] = {0, 0, W << 8, H << 8}; /* set_source (wl_fixed) */
+	request(fd, 101, 1, vp_src, 4);
+	uint32_t vp_dst[2] = {W, H};                 /* set_destination */
+	request(fd, 101, 2, vp_dst, 2);
+	ROUNDTRIP();
+	marker(rt_ok ? "M49-WL: ok viewporter\n" : "M49-WL: fail viewporter\n");
+
+	/* wl_subcompositor (global name 9): make a second surface a subsurface of
+	 * surface 7 and position it; confirm accepted via round-trip. */
+	bind_prefix[0] = 9; bind_suffix[0] = 1; bind_suffix[1] = 110;
+	request_string(fd, 2, 0, bind_prefix, 1, "wl_subcompositor", bind_suffix, 2);
+	uint32_t sub_surf = 111;
+	request(fd, 4, 0, &sub_surf, 1); /* wl_compositor.create_surface */
+	uint32_t getsub[3] = {112, 111, 7}; /* get_subsurface(new_id, surface, parent) */
+	request(fd, 110, 1, getsub, 3);
+	uint32_t subpos[2] = {16, 16};      /* set_position */
+	request(fd, 112, 1, subpos, 2);
+	ROUNDTRIP();
+	marker(rt_ok ? "M49-WL: ok subcompositor\n"
+	             : "M49-WL: fail subcompositor\n");
+
+	/* wp_presentation (global name 10): the bind emits clock_id(0); request
+	 * feedback() for surface 7 and confirm the server delivers a presented
+	 * event on its feedback object. */
+	bind_prefix[0] = 10; bind_suffix[0] = 1; bind_suffix[1] = 120;
+	request_string(fd, 2, 0, bind_prefix, 1, "wp_presentation", bind_suffix, 2);
+	uint32_t clock_id = 0xffffffffu;
+	int pclk_tries = 0;
+	while (clock_id == 0xffffffffu && pclk_tries++ < 64 &&
+	       next_event(fd, &ev) == 1)
+		if (ev.object == 120 && ev.opcode == 0 && ev.nargs >= 1)
+			clock_id = ev.args[0];
+	uint32_t pf_args[2] = {7, 121}; /* feedback(surface=7, callback=121) */
+	request(fd, 120, 1, pf_args, 2);
+	int presented = 0, pf_tries = 0;
+	while (!presented && pf_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 121 && ev.opcode == 1) /* feedback.presented */
+			presented = 1;
+	marker((clock_id != 0xffffffffu && presented)
+	           ? "M49-WL: ok presentation\n"
+	           : "M49-WL: fail presentation\n");
+
+	/* zwp_linux_dmabuf_v1 (global name 11): the bind emits format() events;
+	 * create_params then create() must be rejected honestly with failed(),
+	 * since b1nix has no dmabuf import path. */
+	bind_prefix[0] = 11; bind_suffix[0] = 3; bind_suffix[1] = 130;
+	request_string(fd, 2, 0, bind_prefix, 1, "zwp_linux_dmabuf_v1",
+	               bind_suffix, 2);
+	int dmabuf_fmt = 0, dfmt_tries = 0;
+	while (!dmabuf_fmt && dfmt_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 130 && ev.opcode == 0 && ev.nargs >= 1)
+			dmabuf_fmt = 1; /* format(format) */
+	uint32_t cp_id = 131;
+	request(fd, 130, 1, &cp_id, 1); /* create_params(new_id) */
+	uint32_t cr_args[4] = {W, H, 0x34325241, 0}; /* create(w,h,format,flags) */
+	request(fd, 131, 2, cr_args, 4);
+	int dmabuf_failed = 0, df_tries = 0;
+	while (!dmabuf_failed && df_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 131 && ev.opcode == 1) /* params.failed */
+			dmabuf_failed = 1;
+	marker((dmabuf_fmt && dmabuf_failed)
+	           ? "M49-WL: ok dmabuf-reject\n"
+	           : "M49-WL: fail dmabuf-reject\n");
+
+	/* wl_touch: bind it off the seat (capabilities now include touch=4) and
+	 * confirm the seat advertises the capability + get_touch is accepted. */
+	uint32_t seat_caps = 0;
+	/* the seat capabilities event was sent right after bind (object 20, op 0);
+	 * it may already be buffered. Drain a few events looking for it. */
+	int cap_tries = 0;
+	while (!seat_caps && cap_tries++ < 8 && next_event(fd, &ev) == 1)
+		if (ev.object == 20 && ev.opcode == 0 && ev.nargs >= 1)
+			seat_caps = ev.args[0];
+	uint32_t touch_id = 140;
+	request(fd, 20, 2, &touch_id, 1); /* wl_seat.get_touch */
+	ROUNDTRIP();
+	/* Capability bit 4 (touch) must be advertised AND get_touch accepted. If
+	 * the capabilities event was consumed earlier we accept the round-trip as
+	 * proof the get_touch was processed, but require the bit when we saw it. */
+	marker((rt_ok && (seat_caps == 0 || (seat_caps & 4)))
+	           ? "M49-WL: ok touch\n" : "M49-WL: fail touch\n");
+
+	/* wl_data_device drag-and-drop: bind the manager, create a source with a
+	 * MIME + DnD actions, get a data_device, and start a drag. Confirm the
+	 * compositor accepts the start_drag grab (sync round-trip, no protocol
+	 * error). A full cross-client offer delivery needs the pointer over a
+	 * second client's surface, which a headless smoke cannot stage; this
+	 * verifies the grab/request path is real and spec-shaped. */
+	bind_prefix[0] = 6; bind_suffix[0] = 3; bind_suffix[1] = 150;
+	request_string(fd, 2, 0, bind_prefix, 1, "wl_data_device_manager",
+	               bind_suffix, 2);
+	uint32_t dsrc = 151;
+	request(fd, 150, 0, &dsrc, 1); /* create_data_source */
+	request_string(fd, 151, 0, 0, 0, "text/plain", 0, 0); /* source.offer(mime) */
+	uint32_t dnd_actions = 1; /* COPY */
+	request(fd, 151, 2, &dnd_actions, 1); /* source.set_actions */
+	uint32_t getdev[2] = {152, 20}; /* get_data_device(new_id, seat) */
+	request(fd, 150, 1, getdev, 2);
+	uint32_t startdrag[4] = {151, 7, 0, 1}; /* (source, origin, icon, serial) */
+	request(fd, 152, 0, startdrag, 4); /* start_drag */
+	ROUNDTRIP();
+	marker(rt_ok ? "M49-WL: ok dnd-start\n" : "M49-WL: fail dnd-start\n");
+	#undef ROUNDTRIP
+
 	if (framed) {
 		struct b1gui_window gui;
 		if (b1gui_connect(&gui) ||

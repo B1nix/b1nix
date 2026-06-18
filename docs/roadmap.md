@@ -583,6 +583,13 @@ construction.
   detection and the `xdg_toplevel` WM requests (title/app_id/ack/close +
   move/resize/maximize/fullscreen). Full conformance delta (what is omitted) in
   [`wayland-conformance.md`](wayland-conformance.md).
+- [x] Extended protocol coverage: full `wl_data_device` drag-and-drop (on top of
+  clipboard), `wp_viewporter`, `wl_subcompositor`, `wp_presentation`,
+  `zwp_linux_dmabuf_v1` (advertised, import honestly rejected — no GEM path),
+  `wl_touch` from a virtio touchscreen (`/dev/input/event2`), and
+  `xdg_toplevel.set_minimized` backed by a panel taskbar. Capacities raised
+  (clients/surfaces/buffers 32). Only the deliberate architecture items (C)
+  remain — see [`wayland-conformance.md`](wayland-conformance.md).
 
 ## M50: DRM/KMS and Graphics Memory
 

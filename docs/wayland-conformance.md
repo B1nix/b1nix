@@ -11,12 +11,23 @@ shim. The list below is the honest delta from a full compositor.
 - `wl_display`, `wl_registry`, `wl_callback` (sync), `wl_compositor`,
   `wl_surface` (attach / damage / frame / commit), `wl_region`.
 - `wl_shm` + `wl_shm_pool` + `wl_buffer`, formats `ARGB8888` and `XRGB8888`.
-- `wl_seat` (pointer + keyboard), `wl_pointer`, `wl_keyboard`, `wl_output` (v2,
-  with `mode`/`scale`/`done`).
+- `wl_seat` (pointer + keyboard + **touch**, capabilities = 7), `wl_pointer`,
+  `wl_keyboard`, `wl_touch` (down / up / motion / frame from
+  `/dev/input/event2`), `wl_output` (v2, with `mode`/`scale`/`done`).
 - `xdg_wm_base`, `xdg_surface`, `xdg_toplevel` (title, app_id, configure/ack,
   close, **move, resize, maximize/unmaximize, fullscreen/unfullscreen**),
   `xdg_wm_base.ping`/`pong` hung-client detection.
-- `wl_data_device_manager` clipboard (selection copy/paste over `SCM_RIGHTS`).
+- `wl_data_device_manager` clipboard (selection copy/paste over `SCM_RIGHTS`)
+  **and drag-and-drop**: `start_drag` opens a server-side drag grab keyed to the
+  pointer button; the surface under the pointer gets `data_device`
+  enter/motion/leave + `drop`, each carrying a server-made `data_offer` that
+  mirrors the source MIME and `source_actions`; the source sees
+  `dnd_drop_performed` / `dnd_finished` / `cancelled`; `data_offer`
+  accept/finish/set_actions are handled.
+- `wp_viewporter` (`set_source` ignored at scale 1, `set_destination` stored as
+  the on-screen extent), `wl_subcompositor` (`get_subsurface` / `set_position`,
+  composited relative to the parent), `wp_presentation` (advertises
+  `clock_id` = `CLOCK_MONOTONIC`, replies `presented` to a feedback request).
 - `zxdg_decoration_manager_v1`: answers `server_side` so clients skip their own
   (client-side) title bars — displayd draws them.
 - **Keyboard: a real `XKB_V1` keymap** (US/evdev, embedded in
@@ -51,26 +62,30 @@ A floating toplevel's first `configure` uses width/height = 0 ("client picks
 its size") plus the `activated` state, since a freshly-mapped window takes
 focus.
 
-**`set_minimized` is acknowledged but not acted on** — there is no taskbar to
-restore from, so unmapping would strand the window. Add it together with a
-taskbar/dock if one is built.
+**`set_minimized` now unmaps the window and surfaces it as a taskbar button** in
+the top panel (between the menu bar and the clock). Clicking a button restores +
+raises + focuses the window; clicking a non-minimized window's button raises it.
 
 ### Absent globals / protocols
 
-- **Drag-and-drop**: only clipboard selection is implemented; `wl_data_device`
-  `start_drag` and the DnD offer/action events are not.
-- **Touch**: `wl_seat` advertises pointer + keyboard only (capabilities = 3).
+- **`zwp_linux_dmabuf_v1`**: advertised (it announces the `ARGB8888` /
+  `XRGB8888` formats and accepts `create_params`), but buffer import is
+  **honestly rejected** — `create()` replies `failed` and `create_immed()` is
+  dropped, because b1nix has no GEM/dmabuf importer. GPU buffers reach the host
+  via `/dev/virtio-gpu` outside Wayland (see M53). This is a real limitation, not
+  a fake stub: a conforming client sees the rejection and falls back to SHM.
 - **HiDPI / transform**: fixed at scale 1, normal transform. `set_buffer_scale`,
   `set_buffer_transform`, `set_opaque_region`, `set_input_region`, surface
-  `offset` are accepted and ignored.
-- **Not advertised at all**: `wp_viewporter`, `wl_subcompositor`,
-  `wp_presentation`, `zwp_linux_dmabuf` — no current client needs them. (GPU
-  buffers reach the host via `/dev/virtio-gpu` outside Wayland — see M53.)
+  `offset` are accepted and ignored. `wp_viewport.set_source` (crop) is likewise
+  a recognised no-op (no scaling at 1x).
+- **Subsurface stacking / sync**: `wl_subsurface.place_above` / `place_below` /
+  `set_sync` / `set_desync` are recognised no-ops — a subsurface composites in
+  commit order above its parent, which is enough for a single overlay child.
 
 ### Fixed capacities
 
-`MAX_CLIENTS` / `MAX_SURFACES` / `MAX_BUFFERS` = 8, `MAX_TOPLEVELS` = 8,
-`MAX_WOBJECTS` = 64, `MAX_WPOOLS` = 8. Raise the `#define`s if a workload needs
+`MAX_CLIENTS` / `MAX_SURFACES` / `MAX_BUFFERS` = 32, `MAX_TOPLEVELS` = 16,
+`MAX_WOBJECTS` = 256, `MAX_WPOOLS` = 32. Raise the `#define`s if a workload needs
 more; nothing else assumes the value.
 
 ## Architecture notes

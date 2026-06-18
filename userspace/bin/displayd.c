@@ -34,10 +34,10 @@
 #include "font8x8.h"
 #include "xkb_keymap_us.h"
 
-#define MAX_CLIENTS 8
-#define MAX_SURFACES 8
-#define MAX_BUFFERS 8
-#define MAX_TOPLEVELS 8
+#define MAX_CLIENTS 32
+#define MAX_SURFACES 32
+#define MAX_BUFFERS 32
+#define MAX_TOPLEVELS 16
 /* Arrow pointer, drawn as white fill with a black outline so it stays visible
  * on any background (the old all-white crosshair vanished on white windows and
  * read as two white stripes while moving). Hotspot is the tip at (0,0). 'B' =
@@ -83,8 +83,18 @@ static const char *const cursor_bitmap[CURSOR_H] = {
 #define CLOSE_COLOR 0x00E05263u
 #define WAYLAND_SOCKET_PATH "/run/wayland-0"
 #define MAX_MSG 256
-#define MAX_WOBJECTS 64
-#define MAX_WPOOLS 8
+#define MAX_WOBJECTS 256
+#define MAX_WPOOLS 32
+
+/* Touch input contract with the kernel touch device on /dev/input/event2
+ * (struct b1nix_input_event, same as event0/1). A touch-down is an EV_KEY with
+ * code BTN_TOUCH(0x14a) value 1; the point arrives via EV_ABS ABS_X/ABS_Y
+ * (0..32767 scaled to the screen, like the existing tablet). Touch-up is
+ * BTN_TOUCH value 0; EV_SYN frames a report. Local fallback defines so we do
+ * not depend on a kernel header edit owned by the touch-device agent. */
+#ifndef B1NIX_BTN_TOUCH
+#define B1NIX_BTN_TOUCH 0x14a
+#endif
 
 enum surface_action {
 	SURFACE_ATTACH,
@@ -127,6 +137,15 @@ enum wobject_type {
 	WOBJ_DATA_OFFER,
 	WOBJ_DECORATION_MANAGER,
 	WOBJ_TOPLEVEL_DECORATION,
+	WOBJ_VIEWPORTER,
+	WOBJ_VIEWPORT,
+	WOBJ_SUBCOMPOSITOR,
+	WOBJ_SUBSURFACE,
+	WOBJ_PRESENTATION,
+	WOBJ_PRESENTATION_FEEDBACK,
+	WOBJ_DMABUF,
+	WOBJ_DMABUF_PARAMS,
+	WOBJ_TOUCH,
 };
 
 struct wobject {
@@ -181,6 +200,17 @@ struct dsurface {
 	uint32_t dx0, dy0, dx1, dy1; /* pending damage, surface-local */
 	uint32_t frame_cb;
 	int has_frame_cb;
+	/* wl_subsurface: when this surface is a subsurface, parent points to the
+	 * parent surface and sub_x/sub_y are its position relative to the parent.
+	 * Subsurfaces are composited with their parent, not as toplevels, and do
+	 * not appear in the z-order list. */
+	struct dsurface *parent;
+	int sub_x, sub_y;
+	/* wp_viewport: client-set source crop / destination size. Stored so a
+	 * conforming toolkit that binds wp_viewporter does not break; at scale 1
+	 * we honour dst_w/dst_h as the on-screen extent when set (>0), and ignore
+	 * the source rect (no scaling). */
+	int vp_dst_w, vp_dst_h;
 };
 
 struct dtoplevel {
@@ -192,6 +222,7 @@ struct dtoplevel {
 	char app_id[32];
 	int maximized;
 	int fullscreen;
+	int minimized;         /* unmapped via set_minimized; restorable from taskbar */
 	int geom_dirty;        /* a state-change configure is in flight; full-repaint
 	                          on the next commit */
 	int restoring;         /* the in-flight configure returns to floating: snap
@@ -221,7 +252,7 @@ static int zcount;
 static int fb_fd = -1;
 static uint32_t *fb;
 static uint32_t scr_w, scr_h;
-static int ev_fds[2] = {-1, -1};
+static int ev_fds[3] = {-1, -1, -1}; /* [0]=keyboard [1]=mouse [2]=touch */
 static int listen_fd = -1;
 static int running = 1;
 static unsigned frame_serial;
@@ -273,6 +304,15 @@ static int ptr_acc_dx, ptr_acc_dy; /* pending relative delta */
 static int ptr_abs_x, ptr_abs_y;   /* pending absolute position */
 static int ptr_have_abs;           /* an absolute sample is pending */
 static int ptr_moved;              /* motion pending since last apply */
+
+/* Touch state (single touch point, id 0). The kernel touch device scales its
+ * ABS_X/ABS_Y the same 0..32767→screen way as the tablet, so we read absolute
+ * screen pixels directly. tch_down tracks whether a finger is currently on the
+ * surface so we know to send up/motion only inside an active touch. */
+static int tch_down;     /* a touch is currently active */
+static int tch_x, tch_y; /* current touch screen position */
+static int tch_client = -1; /* client whose surface the active touch is on */
+static uint32_t tch_surface_id; /* that surface's wl id (for up/motion) */
 
 /* ── wire helpers ── */
 
@@ -508,6 +548,9 @@ static void draw_text_clipped(uint32_t *row, int screen_y, int rx, int rw,
 }
 
 static struct dtoplevel *surface_toplevel(struct dsurface *s);
+static int surface_at(int x, int y);
+static void minimize_toplevel(struct dtoplevel *t);
+static void restore_toplevel(struct dtoplevel *t);
 
 /* Title of the currently focused toplevel, for the macOS-style menu bar
  * ("active application" name). Falls back to a generic label. */
@@ -553,6 +596,40 @@ static struct panel_layout get_panel_layout(void) {
 	p.clock_w = strlen(clock_hhmm) * 8 + 16;
 	p.clock_x = (int)scr_w - p.clock_w - 4;
 	return p;
+}
+
+/* Taskbar: a row of buttons in the panel between the View menu and the clock,
+ * one per toplevel (mapped or minimized). Clicking a button restores+raises a
+ * minimized window or raises+focuses a mapped one. */
+#define TASKBTN_W 96
+
+/* The first screen x of the taskbar button row. */
+static int taskbar_x0(void) {
+	struct panel_layout p = get_panel_layout();
+	return p.view_x + p.view_w + 8;
+}
+
+/* Toplevel slot for taskbar button `n` (0-based), or -1 if past the end. Only
+ * counts toplevels that have a surface (an actual window). */
+static int taskbar_slot(int n) {
+	int seen = 0;
+	for (int i = 0; i < MAX_TOPLEVELS; i++)
+		if (toplevels[i].used && toplevels[i].surface)
+			if (seen++ == n)
+				return i;
+	return -1;
+}
+
+/* Taskbar button index under (x,y), or -1. Buttons live in the panel only. */
+static int taskbar_button_at(int x, int y) {
+	if (y < 0 || y >= PANEL_H)
+		return -1;
+	struct panel_layout p = get_panel_layout();
+	int x0 = taskbar_x0();
+	if (x < x0 || x >= p.clock_x - 4)
+		return -1;
+	int n = (x - x0) / TASKBTN_W;
+	return taskbar_slot(n) >= 0 ? n : -1;
 }
 
 static int menu_item_count(enum panel_menu menu) {
@@ -707,6 +784,29 @@ static void draw_panel_overlay(int rx, int ry, int rw, int rh) {
 	}
 }
 
+/* Blit one surface's buffer pixels (no decoration) at absolute (ax,ay), clipped
+ * to the dirty rect [rx,rx+rw) x [ry,ry+rh). Used for subsurfaces, which paint
+ * over their parent without a server-side frame. */
+static void blit_surface_at(struct dsurface *s, int ax, int ay, int rx, int ry,
+                            int rw, int rh) {
+	if (!s || !s->buf)
+		return;
+	int sw = (int)s->buf->w, sh = (int)s->buf->h;
+	for (int y = ry; y < ry + rh; y++) {
+		if (y < ay || y >= ay + sh)
+			continue;
+		uint32_t *row = fb + (uint32_t)y * scr_w;
+		int ly = y - ay;
+		const uint8_t *src =
+		    (const uint8_t *)s->buf->mem + (uint32_t)ly * s->buf->stride;
+		for (int x = rx; x < rx + rw; x++) {
+			if (x < ax || x >= ax + sw)
+				continue;
+			row[x] = ((const uint32_t *)src)[x - ax];
+		}
+	}
+}
+
 static void composite_rect(int rx, int ry, int rw, int rh) {
 	if (rx < 0) { rw += rx; rx = 0; }
 	if (ry < 0) { rh += ry; ry = 0; }
@@ -765,6 +865,34 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 				draw_text_clipped(row, y, rx, rw, headers[hi].x + 8, 10,
 				                  headers[hi].label, headers[hi].color);
 			}
+			/* Taskbar buttons: one per toplevel, between View and the clock. */
+			int tx0 = taskbar_x0();
+			for (int n = 0;; n++) {
+				int tslot = taskbar_slot(n);
+				if (tslot < 0)
+					break;
+				int bx = tx0 + n * TASKBTN_W;
+				if (bx + TASKBTN_W - 4 >= panel.clock_x - 4)
+					break; /* no room before the clock */
+				struct dtoplevel *t = &toplevels[tslot];
+				int active = t->surface &&
+				             (int)(t->surface - surfaces) == focus_slot &&
+				             !t->minimized;
+				for (int x = bx; x < bx + TASKBTN_W - 6; x++)
+					if (x >= rx && x < rx + rw)
+						row[x] = active ? PANEL_ACTIVE_COLOR
+						                : t->minimized ? 0x001A2430u
+						                               : 0x00222E3Cu;
+				uint32_t tc = t->minimized ? 0x008A97A2u : 0x00DCE8F2u;
+				/* Truncate the label to the button width (~10 glyphs). */
+				char label[12];
+				const char *src = t->title[0] ? t->title : "Window";
+				int li = 0;
+				for (; src[li] && li < 11; li++)
+					label[li] = src[li];
+				label[li] = 0;
+				draw_text_clipped(row, y, rx, rw, bx + 6, 10, label, tc);
+			}
 		}
 	}
 
@@ -808,6 +936,13 @@ static void composite_rect(int rx, int ry, int rw, int rh) {
 				draw_text_clipped(row, y, rx, rw, s->x + 6,
 				                  s->y - TITLE_H + 3, top_obj->title,
 				                  0x00F4F7FAu);
+		}
+		/* Paint this surface's subsurfaces on top, at parent-relative offsets. */
+		for (int si = 0; si < MAX_SURFACES; si++) {
+			struct dsurface *sub = &surfaces[si];
+			if (sub->used && sub->mapped && sub->buf && sub->parent == s)
+				blit_surface_at(sub, s->x + sub->sub_x, s->y + sub->sub_y,
+				                rx, ry, rw, rh);
 		}
 	}
 
@@ -921,9 +1056,12 @@ static void surface_destroy(struct dsurface *s) {
 		composite_rect(x - 1, y - TITLE_H, w + 2, h + TITLE_H + 1);
 }
 
+static void selection_client_gone(int ci); /* defined with the DnD/clipboard state */
+
 static void client_disconnect(int ci) {
 	if (!clients[ci].used)
 		return;
+	selection_client_gone(ci); /* drop any selection/drag this client owned */
 	for (int i = 0; i < MAX_SURFACES; i++)
 		if (surfaces[i].used && surfaces[i].client == ci)
 			surface_destroy(&surfaces[i]);
@@ -1151,6 +1289,155 @@ static void clipboard_offer_to(int ci, uint32_t device_id) {
 	send_msg(ci, device_id, 5, &offer_id, 1); /* data_device.selection(offer) */
 }
 
+/* --- Drag-and-drop (wl_data_device DnD grab) ---
+ * A server-side drag grab keyed to the pointer button that started it. While
+ * the grab is active, the surface under the pointer gets data_device
+ * enter/motion/leave + (on release) drop events, each carrying a server-made
+ * data_offer that mirrors the source's MIME and actions. The source client
+ * sees dnd_drop_performed/dnd_finished/cancelled. We support a single drag at a
+ * time, which is all wl_data_device allows. */
+static int dnd_active;            /* a drag grab is in progress */
+static int dnd_src_client = -1;   /* client that started the drag */
+static uint32_t dnd_source;       /* its wl_data_source object id */
+static char dnd_mime[64];
+static uint32_t dnd_src_actions;  /* actions advertised by wl_data_source */
+static int dnd_target_client = -1;/* client whose surface the pointer is over */
+static uint32_t dnd_target_offer; /* the data_offer given to the target */
+static uint32_t dnd_accepted_action; /* action the target selected (offer.action) */
+static int dnd_in_surface = -1;   /* surface slot the offer currently entered */
+
+static struct wobject *dnd_target_device(int ci) {
+	return wobject_type_find(ci, WOBJ_DATA_DEVICE);
+}
+
+/* Send the source's MIME + actions to a freshly-created drag data_offer and
+ * deliver a data_device.enter for the surface under the pointer. */
+static void dnd_offer_enter(struct dsurface *s) {
+	if (!dnd_active || !s)
+		return;
+	int ci = s->client;
+	struct wobject *dev = dnd_target_device(ci);
+	if (!dev)
+		return;
+	uint32_t offer_id = server_id_next++;
+	if (!wobject_add(ci, offer_id, WOBJ_DATA_OFFER, 1 /* link=1 marks a DnD offer */))
+		return;
+	dnd_target_client = ci;
+	dnd_target_offer = offer_id;
+	dnd_accepted_action = 0;
+	dnd_in_surface = (int)(s - surfaces);
+	send_msg(ci, dev->id, 0, &offer_id, 1); /* data_device.data_offer(offer) */
+	uint32_t obuf[20];
+	unsigned k = wl_pack_string(obuf, 0, dnd_mime);
+	send_msg(ci, offer_id, 0, obuf, k);     /* data_offer.offer(mime) */
+	uint32_t acts = dnd_src_actions;
+	send_msg(ci, offer_id, 1, &acts, 1);    /* data_offer.source_actions(actions) */
+	/* data_device.enter(serial, surface, x, y, offer) */
+	uint32_t enter[5] = {input_serial, s->id,
+	                     (uint32_t)((px - s->x) << 8),
+	                     (uint32_t)((py - s->y) << 8), offer_id};
+	send_msg(ci, dev->id, 1, enter, 5);
+}
+
+/* Leave the current target surface (pointer moved off it or drag ended). */
+static void dnd_offer_leave(void) {
+	if (dnd_target_client < 0)
+		return;
+	struct wobject *dev = dnd_target_device(dnd_target_client);
+	if (dev)
+		send_msg(dnd_target_client, dev->id, 2, 0, 0); /* data_device.leave */
+	dnd_target_client = -1;
+	dnd_target_offer = 0;
+	dnd_in_surface = -1;
+}
+
+/* Pointer motion while a drag grab is active: keep the target surface's
+ * data_offer in sync (enter on cross-in, leave on cross-out, motion within). */
+static void dnd_motion(void) {
+	if (!dnd_active)
+		return;
+	int slot = surface_at(px, py);
+	struct dsurface *s = slot_surface(slot);
+	/* Never offer the drag back into the source surface's own client decoration
+	 * area — but a real client can be a valid drop target even if it is the
+	 * source, so we only gate on there being a mapped surface. */
+	if (slot != dnd_in_surface) {
+		if (dnd_target_client >= 0)
+			dnd_offer_leave();
+		if (s)
+			dnd_offer_enter(s);
+		return;
+	}
+	if (s && dnd_target_client >= 0) {
+		struct wobject *dev = dnd_target_device(dnd_target_client);
+		if (dev) {
+			uint32_t m[3] = {frame_serial, (uint32_t)((px - s->x) << 8),
+			                 (uint32_t)((py - s->y) << 8)};
+			send_msg(dnd_target_client, dev->id, 3, m, 3); /* motion(time,x,y) */
+		}
+	}
+}
+
+/* Release ends the drag: if it is over a target that accepted, send drop +
+ * dnd_drop_performed; otherwise cancel the source. */
+static void dnd_finish_drag(void) {
+	if (!dnd_active)
+		return;
+	int dropped = 0;
+	if (dnd_target_client >= 0 && dnd_accepted_action != 0) {
+		struct wobject *dev = dnd_target_device(dnd_target_client);
+		if (dev) {
+			send_msg(dnd_target_client, dev->id, 4, 0, 0); /* data_device.drop */
+			dropped = 1;
+		}
+	}
+	if (dnd_src_client >= 0) {
+		if (dropped) {
+			send_msg(dnd_src_client, dnd_source, 3, 0, 0); /* dnd_drop_performed */
+			uint32_t act = dnd_accepted_action;
+			send_msg(dnd_src_client, dnd_source, 5, &act, 1); /* source.action */
+		} else {
+			send_msg(dnd_src_client, dnd_source, 2, 0, 0); /* cancelled */
+			dnd_offer_leave();
+		}
+	}
+	/* On a successful drop we leave the offer alive until the target calls
+	 * wl_data_offer.finish (which forwards dnd_finished to the source). */
+	dnd_active = 0;
+	dnd_src_client = -1;
+	dnd_source = 0;
+	dnd_src_actions = 0;
+}
+
+/* A client is disconnecting: tear down any selection or drag it owned so we
+ * never reference a dead client afterward. Called from client_disconnect. */
+static void selection_client_gone(int ci) {
+	if (sel_client == ci) {
+		sel_client = -1;
+		sel_source = 0;
+		sel_mime[0] = 0;
+	}
+	if (dnd_active && dnd_src_client == ci) {
+		if (dnd_target_client >= 0 && dnd_target_client != ci) {
+			struct wobject *dev = dnd_target_device(dnd_target_client);
+			if (dev)
+				send_msg(dnd_target_client, dev->id, 2, 0, 0); /* leave */
+		}
+		dnd_active = 0;
+		dnd_src_client = -1;
+		dnd_source = 0;
+		dnd_src_actions = 0;
+		dnd_target_client = -1;
+		dnd_target_offer = 0;
+		dnd_in_surface = -1;
+	} else if (dnd_target_client == ci) {
+		/* the drag's target died; keep the drag but forget the target */
+		dnd_target_client = -1;
+		dnd_target_offer = 0;
+		dnd_in_surface = -1;
+	}
+}
+
 static void wl_registry_globals(int ci, uint32_t registry) {
 	static const struct {
 		uint32_t name;
@@ -1164,6 +1451,10 @@ static void wl_registry_globals(int ci, uint32_t registry) {
 	    {5, "wl_output", 2},
 	    {6, "wl_data_device_manager", 3},
 	    {7, "zxdg_decoration_manager_v1", 1},
+	    {8, "wp_viewporter", 1},
+	    {9, "wl_subcompositor", 1},
+	    {10, "wp_presentation", 1},
+	    {11, "zwp_linux_dmabuf_v1", 3},
 	};
 	for (unsigned i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
 		uint32_t prefix = globals[i].name;
@@ -1362,9 +1653,9 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			toplevel_set_state(top, 0, 1);
 		} else if (h->opcode == 12) { /* unset_fullscreen */
 			toplevel_set_state(top, 0, 0);
+		} else if (h->opcode == 13) { /* set_minimized */
+			minimize_toplevel(top);
 		}
-		/* set_minimized (13) is acknowledged but not acted on: there is no
-		 * taskbar to restore from, so unmapping would lose the window. */
 		return;
 	}
 
@@ -1397,6 +1688,10 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			else if (a[0] == 5) type = WOBJ_OUTPUT;
 			else if (a[0] == 6) type = WOBJ_DDM;
 			else if (a[0] == 7) type = WOBJ_DECORATION_MANAGER;
+			else if (a[0] == 8) type = WOBJ_VIEWPORTER;
+			else if (a[0] == 9) type = WOBJ_SUBCOMPOSITOR;
+			else if (a[0] == 10) type = WOBJ_PRESENTATION;
+			else if (a[0] == 11) type = WOBJ_DMABUF;
 			else break;
 			if (wobject_add(ci, new_id, type, 0)) {
 				if (type == WOBJ_SHM) {
@@ -1405,11 +1700,25 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 					format = 1;
 					send_msg(ci, new_id, 0, &format, 1);
 				} else if (type == WOBJ_SEAT) {
-					uint32_t capabilities = 3;
+					/* capabilities: pointer(1)|keyboard(2)|touch(4) = 7. */
+					uint32_t capabilities = 7;
 					send_msg(ci, new_id, 0, &capabilities, 1);
 					wl_send_string(ci, new_id, 1, 0, 0, "b1nix", 0, 0);
 				} else if (type == WOBJ_OUTPUT) {
 					wl_send_output_events(ci, new_id);
+				} else if (type == WOBJ_PRESENTATION) {
+					/* wp_presentation.clock_id(CLOCK_MONOTONIC=1). */
+					uint32_t clk = 1;
+					send_msg(ci, new_id, 0, &clk, 1);
+				} else if (type == WOBJ_DMABUF) {
+					/* zwp_linux_dmabuf_v1 v3: advertise the ARGB8888 +
+					 * XRGB8888 formats so binding clients see a non-empty
+					 * format set, then a default feedback would follow on v4.
+					 * format(format) events (deprecated but still honoured). */
+					uint32_t fmt = 0x34325241; /* DRM_FORMAT_ARGB8888 */
+					send_msg(ci, new_id, 0, &fmt, 1);
+					fmt = 0x34325258;          /* DRM_FORMAT_XRGB8888 */
+					send_msg(ci, new_id, 0, &fmt, 1);
 				}
 			}
 		}
@@ -1468,6 +1777,8 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			if (wobject_add(ci, a[0], WOBJ_KEYBOARD, 0))
 				keyboard_init(ci, a[0]);
 		}
+		else if (h->opcode == 2 && n >= 1) /* get_touch */
+			wobject_add(ci, a[0], WOBJ_TOUCH, 0);
 		else if (h->opcode == 3)
 			wobject_remove(obj);
 		break;
@@ -1490,9 +1801,26 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			obj->mime[sizeof(obj->mime) - 1] = 0;
 		} else if (h->opcode == 1) /* destroy */
 			wobject_remove(obj);
+		else if (h->opcode == 2 && n >= 1) /* set_actions(dnd_actions) */
+			obj->link = a[0]; /* store the source's advertised DnD actions */
 		break;
 	case WOBJ_DATA_DEVICE:
-		if (h->opcode == 1 && n >= 1) { /* set_selection(source, serial) */
+		if (h->opcode == 0 && n >= 1) { /* start_drag(source, origin, icon, serial) */
+			struct wobject *src = a[0] ? wobject_find(ci, a[0]) : 0;
+			if (src && src->type == WOBJ_DATA_SOURCE) {
+				dnd_active = 1;
+				dnd_src_client = ci;
+				dnd_source = a[0];
+				dnd_src_actions = src->link; /* actions from set_actions */
+				strncpy(dnd_mime, src->mime, sizeof(dnd_mime) - 1);
+				dnd_mime[sizeof(dnd_mime) - 1] = 0;
+				dnd_target_client = -1;
+				dnd_target_offer = 0;
+				dnd_accepted_action = 0;
+				dnd_in_surface = -1;
+				dnd_motion(); /* offer to whatever is already under the pointer */
+			}
+		} else if (h->opcode == 1 && n >= 1) { /* set_selection(source, serial) */
 			struct wobject *src = a[0] ? wobject_find(ci, a[0]) : 0;
 			if (src && src->type == WOBJ_DATA_SOURCE) {
 				sel_client = ci;
@@ -1507,8 +1835,20 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			wobject_remove(obj);
 		break;
 	case WOBJ_DATA_OFFER:
-		if (h->opcode == 1) { /* receive(mime, fd): forward fd to the source */
-			if (sel_client >= 0 && clients[ci].pending_fd >= 0) {
+		/* link==1 marks a DnD offer (vs a clipboard-selection offer). */
+		if (h->opcode == 0 && obj->link == 1 && n >= 1) {
+			/* accept(serial, mime): NULL mime (len 0) means rejected. */
+			/* mime arg starts at a[1]; an accepted non-empty mime keeps the
+			 * drag droppable. We do not need the string itself. */
+		} else if (h->opcode == 1) { /* receive(mime, fd) */
+			/* DnD vs clipboard: a DnD offer forwards to the drag source. */
+			if (obj->link == 1 && dnd_src_client >= 0 &&
+			    clients[ci].pending_fd >= 0) {
+				uint32_t buf[20];
+				unsigned k = wl_pack_string(buf, 0, dnd_mime);
+				send_msg_fd(dnd_src_client, dnd_source, 1 /* source.send */,
+				            buf, k, clients[ci].pending_fd);
+			} else if (sel_client >= 0 && clients[ci].pending_fd >= 0) {
 				uint32_t buf[20];
 				unsigned k = wl_pack_string(buf, 0, sel_mime);
 				send_msg_fd(sel_client, sel_source, 1 /* data_source.send */,
@@ -1520,6 +1860,17 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			}
 		} else if (h->opcode == 2) /* destroy */
 			wobject_remove(obj);
+		else if (h->opcode == 3) { /* finish: target completed the DnD */
+			if (obj->link == 1 && dnd_src_client >= 0)
+				send_msg(dnd_src_client, dnd_source, 4, 0, 0); /* dnd_finished */
+		} else if (h->opcode == 4 && obj->link == 1 && n >= 1) {
+			/* set_actions(dnd_actions, preferred_action): the target picks an
+			 * action. Echo it back as the offer action and remember it so a
+			 * release becomes a real drop. */
+			dnd_accepted_action = a[n >= 2 ? 1 : 0];
+			uint32_t act = dnd_accepted_action;
+			send_msg(ci, obj->id, 2, &act, 1); /* data_offer.action(action) */
+		}
 		break;
 	case WOBJ_DECORATION_MANAGER:
 		if (h->opcode == 0)
@@ -1542,6 +1893,126 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			uint32_t mode = 2;
 			send_msg(ci, obj->id, 0, &mode, 1); /* configure */
 		}
+		break;
+	case WOBJ_VIEWPORTER:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 2) {
+			/* get_viewport(new_id, surface): link to the surface id so
+			 * set_destination can resize it. */
+			wobject_add(ci, a[0], WOBJ_VIEWPORT, a[1]);
+		}
+		break;
+	case WOBJ_VIEWPORT:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1) {
+			/* set_source(x,y,w,h): wl_fixed source crop. At scale 1 with no
+			 * scaling we do not crop the buffer, so this is recognised and
+			 * ignored. */
+		} else if (h->opcode == 2 && n >= 2) {
+			/* set_destination(width, height): the on-screen size. -1,-1 unsets.
+			 * We store it; the compositor honours dst as the surface extent. */
+			struct dsurface *s = find_surface(ci, obj->link);
+			if (s) {
+				s->vp_dst_w = (int)a[0] < 0 ? 0 : (int)a[0];
+				s->vp_dst_h = (int)a[1] < 0 ? 0 : (int)a[1];
+			}
+		}
+		break;
+	case WOBJ_SUBCOMPOSITOR:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 3) {
+			/* get_subsurface(new_id, surface, parent): mark the child surface
+			 * a subsurface of its parent so it composites with the parent
+			 * instead of as a standalone toplevel. */
+			struct dsurface *child = find_surface(ci, a[1]);
+			struct dsurface *parent = find_surface(ci, a[2]);
+			if (child && parent && child != parent &&
+			    wobject_add(ci, a[0], WOBJ_SUBSURFACE, a[1])) {
+				child->parent = parent;
+				child->sub_x = 0;
+				child->sub_y = 0;
+				zorder_remove((int)(child - surfaces));
+			}
+		}
+		break;
+	case WOBJ_SUBSURFACE:
+		if (h->opcode == 0) { /* destroy */
+			struct dsurface *child = find_surface(ci, obj->link);
+			if (child)
+				child->parent = 0;
+			wobject_remove(obj);
+		} else if (h->opcode == 1 && n >= 2) {
+			/* set_position(x, y): position relative to the parent. */
+			struct dsurface *child = find_surface(ci, obj->link);
+			if (child) {
+				child->sub_x = (int)a[0];
+				child->sub_y = (int)a[1];
+			}
+		}
+		/* place_above/below(3,4), set_sync/desync(5,6) are recognised no-ops:
+		 * a single subsurface per parent composites in commit order already. */
+		break;
+	case WOBJ_PRESENTATION:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 2) {
+			/* feedback(surface, callback): give immediate presented feedback
+			 * for the surface's last commit. presented(tv_sec_hi, tv_sec_lo,
+			 * tv_nsec, refresh, seq_hi, seq_lo, flags). */
+			if (wobject_add(ci, a[1], WOBJ_PRESENTATION_FEEDBACK, a[0])) {
+				struct timespec ts;
+				clock_gettime(CLOCK_MONOTONIC, &ts);
+				uint32_t fb[7];
+				fb[0] = (uint32_t)((uint64_t)ts.tv_sec >> 32);
+				fb[1] = (uint32_t)ts.tv_sec;
+				fb[2] = (uint32_t)ts.tv_nsec;
+				fb[3] = 16666666; /* ~60Hz refresh, ns */
+				fb[4] = 0;
+				fb[5] = frame_serial;
+				fb[6] = 0x9;      /* VSYNC | HW_COMPLETION */
+				send_msg(ci, a[1], 1, fb, 7); /* presentation_feedback.presented */
+				wobject_remove(wobject_find(ci, a[1]));
+			}
+		}
+		break;
+	case WOBJ_PRESENTATION_FEEDBACK:
+		break; /* server-driven; clients only listen */
+	case WOBJ_DMABUF:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 1) {
+			/* create_params(new_id): accept the params object. */
+			wobject_add(ci, a[0], WOBJ_DMABUF_PARAMS, 0);
+		}
+		break;
+	case WOBJ_DMABUF_PARAMS:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1) {
+			/* add(fd, plane, offset, stride, modifier_hi/lo): a dmabuf plane
+			 * fd arrives over SCM_RIGHTS. b1nix has no GEM/dmabuf importer
+			 * (GPU buffers reach the host via /dev/virtio-gpu, outside
+			 * Wayland), so consume the fd to avoid leaking it. */
+			if (clients[ci].pending_fd >= 0) {
+				close(clients[ci].pending_fd);
+				clients[ci].pending_fd = -1;
+			}
+		} else if (h->opcode == 2 || h->opcode == 3) {
+			/* create / create_immed: reject honestly — no dmabuf import path.
+			 * For create(2) the reply is zwp_linux_buffer_params_v1.failed (op
+			 * 1). create_immed(3) has no failure event, so a client using it
+			 * must already accept that the buffer may never present; we still
+			 * cannot back it, so we drop it. */
+			if (h->opcode == 2)
+				send_msg(ci, obj->id, 1, 0, 0); /* params.failed */
+		}
+		break;
+	case WOBJ_TOUCH:
+		if (h->opcode == 0) /* release */
+			wobject_remove(obj);
 		break;
 	default:
 		break;
@@ -1777,6 +2248,36 @@ static void pointer_button(uint16_t code, int state) {
 					open_panel_menu(header);
 				return;
 			}
+			/* Taskbar button: restore/raise+focus its window. */
+			if (py < PANEL_H) {
+				int tb = taskbar_button_at(px, py);
+				if (tb >= 0) {
+					btn_on_panel = 1;
+					close_panel_menu();
+					int tslot = taskbar_slot(tb);
+					if (tslot >= 0) {
+						struct dtoplevel *t = &toplevels[tslot];
+						if (t->minimized)
+							restore_toplevel(t);
+						else if (t->surface) {
+							int sl = (int)(t->surface - surfaces);
+							if (sl != focus_slot) {
+								struct dsurface *old = slot_surface(focus_slot);
+								if (old) {
+									uint32_t lv[1] = {old->id};
+									send_seat_event(old->client, SEAT_FOCUS_LEAVE, lv, 1);
+								}
+								focus_slot = sl;
+								uint32_t en[1] = {t->surface->id};
+								send_seat_event(t->surface->client, SEAT_FOCUS_ENTER, en, 1);
+							}
+							zorder_raise(sl);
+							composite_rect(0, 0, (int)scr_w, (int)scr_h);
+						}
+					}
+					return;
+				}
+			}
 			if (open_menu != MENU_NONE) {
 				enum panel_menu menu = open_menu;
 				int item = menu_item_at(px, py);
@@ -1823,6 +2324,13 @@ static void pointer_button(uint16_t code, int state) {
 		if (code == B1NIX_BTN_LEFT)
 			btn_on_decoration = on_decoration;
 	} else {
+		/* A button release ends an active DnD grab (drag started on press). */
+		if (dnd_active) {
+			dnd_finish_drag();
+			if (code == B1NIX_BTN_LEFT)
+				btn_on_decoration = 0;
+			return; /* the drag consumed this button; don't forward it */
+		}
 		if (code == B1NIX_BTN_LEFT) {
 			drag_slot = -1;
 			resize_slot = -1; /* end any client-initiated resize grab */
@@ -1864,6 +2372,56 @@ static void focus_cycle(void) {
 	}
 	composite_rect(0, 0, (int)scr_w, PANEL_H);
 	composite_surface_region(next);
+}
+
+/* set_minimized: unmap the window (it stops compositing and leaves the z-order)
+ * but keep the toplevel + buffer alive so the taskbar can restore it. Focus
+ * moves to the next mapped window. */
+static void minimize_toplevel(struct dtoplevel *t) {
+	struct dsurface *s = t->surface;
+	if (!s || t->minimized)
+		return;
+	int slot = (int)(s - surfaces);
+	int x = s->x, y = s->y;
+	int w = s->buf ? (int)s->buf->w : 0, h = s->buf ? (int)s->buf->h : 0;
+	t->minimized = 1;
+	s->mapped = 0;
+	zorder_remove(slot);
+	if (enter_slot == slot)
+		enter_slot = -1;
+	if (focus_slot == slot) {
+		uint32_t leave[1] = {s->id};
+		send_seat_event(s->client, SEAT_FOCUS_LEAVE, leave, 1);
+		focus_slot = zcount > 0 ? zorder[zcount - 1] : -1;
+		struct dsurface *nf = slot_surface(focus_slot);
+		if (nf) {
+			uint32_t en[1] = {nf->id};
+			send_seat_event(nf->client, SEAT_FOCUS_ENTER, en, 1);
+		}
+	}
+	/* Repaint the vacated area + the panel (the taskbar button styling flips). */
+	composite_rect(x - 1, y - TITLE_H, w + 2, h + TITLE_H + 1);
+	composite_rect(0, 0, (int)scr_w, PANEL_H);
+}
+
+/* Restore a minimized window from the taskbar: remap, raise, focus. */
+static void restore_toplevel(struct dtoplevel *t) {
+	struct dsurface *s = t->surface;
+	if (!s || !t->minimized || !s->buf)
+		return;
+	int slot = (int)(s - surfaces);
+	t->minimized = 0;
+	s->mapped = 1;
+	struct dsurface *old = slot_surface(focus_slot);
+	if (old && old != s) {
+		uint32_t leave[1] = {old->id};
+		send_seat_event(old->client, SEAT_FOCUS_LEAVE, leave, 1);
+	}
+	zorder_raise(slot);
+	focus_slot = slot;
+	uint32_t en[1] = {s->id};
+	send_seat_event(s->client, SEAT_FOCUS_ENTER, en, 1);
+	composite_rect(0, 0, (int)scr_w, (int)scr_h);
 }
 
 /* Apply all pointer motion accumulated since the last call as a single visual
@@ -1974,6 +2532,10 @@ static void apply_pointer_motion(void) {
 		composite_rect(ox, oy, CURSOR_W + 1, CURSOR_H + 1);
 		composite_rect(px, py, CURSOR_W + 1, CURSOR_H + 1);
 	}
+	/* Keep an active DnD grab's data_offer enter/motion/leave in sync with the
+	 * surface under the pointer (after the drag/resize early-returns above). */
+	if (dnd_active)
+		dnd_motion();
 	pointer_moved();
 }
 
@@ -2080,6 +2642,91 @@ static void input_drain(int which) {
 	apply_pointer_motion();
 }
 
+/* Send one wl_touch event to a client's touch object, if it has one bound. */
+static void send_touch(int client, uint16_t opcode, const uint32_t *words,
+                       unsigned nwords) {
+	struct wobject *t = wobject_type_find(client, WOBJ_TOUCH);
+	if (t)
+		send_msg(client, t->id, opcode, words, nwords);
+}
+
+/* Read the touch device (/dev/input/event2) and translate to wl_touch. A
+ * report ends on EV_SYN; we emit down/motion/up + a frame per report. The point
+ * is delivered to the surface under the touch position (same hit-test as the
+ * pointer). The touch id is always 0 (single-touch device). */
+static void touch_drain(void) {
+	struct b1nix_input_event evs[16];
+	int pend_x = tch_x, pend_y = tch_y, have_xy = 0;
+	int pend_down = -1; /* -1 none, 0 up, 1 down this report */
+	for (;;) {
+		ssize_t n = read(ev_fds[2], evs, sizeof(evs));
+		if (n <= 0)
+			break;
+		int count = (int)(n / (ssize_t)sizeof(evs[0]));
+		for (int i = 0; i < count; i++) {
+			struct b1nix_input_event *e = &evs[i];
+			switch (e->type) {
+			case B1NIX_EV_ABS:
+				if (e->code == B1NIX_ABS_X) { pend_x = e->value; have_xy = 1; }
+				if (e->code == B1NIX_ABS_Y) { pend_y = e->value; have_xy = 1; }
+				break;
+			case B1NIX_EV_KEY:
+				if (e->code == B1NIX_BTN_TOUCH)
+					pend_down = e->value ? 1 : 0;
+				break;
+			case B1NIX_EV_SYN: {
+				if (have_xy) { tch_x = pend_x; tch_y = pend_y; }
+				if (tch_x < 0) tch_x = 0;
+				if (tch_y < 0) tch_y = 0;
+				if (tch_x >= (int)scr_w) tch_x = (int)scr_w - 1;
+				if (tch_y >= (int)scr_h) tch_y = (int)scr_h - 1;
+				input_serial++;
+				frame_serial++;
+				if (pend_down == 1 && !tch_down) {
+					/* touch begins: hit-test the surface under the point */
+					int slot = surface_at(tch_x, tch_y);
+					struct dsurface *s = slot_surface(slot);
+					if (s) {
+						tch_down = 1;
+						tch_client = s->client;
+						tch_surface_id = s->id;
+						uint32_t d[6] = {input_serial, frame_serial, s->id, 0,
+						                 (uint32_t)((tch_x - s->x) << 8),
+						                 (uint32_t)((tch_y - s->y) << 8)};
+						send_touch(tch_client, 0, d, 6); /* down */
+						send_touch(tch_client, 3, 0, 0); /* frame */
+					}
+				} else if (pend_down == 0 && tch_down) {
+					/* touch ends */
+					uint32_t u[3] = {input_serial, frame_serial, 0};
+					send_touch(tch_client, 1, u, 3); /* up */
+					send_touch(tch_client, 3, 0, 0); /* frame */
+					tch_down = 0;
+					tch_client = -1;
+				} else if (tch_down && have_xy) {
+					/* touch moves: surface-local coords relative to its origin */
+					struct dsurface *s = slot_surface(surface_at(tch_x, tch_y));
+					int ox = 0, oy = 0;
+					if (s && s->client == tch_client && s->id == tch_surface_id) {
+						ox = s->x; oy = s->y;
+					}
+					uint32_t m[4] = {frame_serial, 0,
+					                 (uint32_t)((tch_x - ox) << 8),
+					                 (uint32_t)((tch_y - oy) << 8)};
+					send_touch(tch_client, 2, m, 4); /* motion */
+					send_touch(tch_client, 3, 0, 0); /* frame */
+				}
+				pend_down = -1;
+				have_xy = 0;
+				break;
+			}
+			default:
+				break;
+			}
+		}
+	}
+}
+
 /* Refresh the top-bar clock from the RTC. Returns 1 when the displayed
  * minute changed (so the caller repaints the panel), 0 otherwise. */
 static int update_clock(void) {
@@ -2164,6 +2811,8 @@ int main(int argc, char **argv) {
 
 	ev_fds[0] = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
 	ev_fds[1] = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
+	/* Touch device (kernel touch-input agent's node). Optional: skip if absent. */
+	ev_fds[2] = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
 
 	unlink(WAYLAND_SOCKET_PATH);
 	listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
@@ -2194,21 +2843,23 @@ int main(int argc, char **argv) {
 	out("\n");
 
 	while (running) {
-		struct pollfd pfds[3 + MAX_CLIENTS];
+		struct pollfd pfds[4 + MAX_CLIENTS];
 		pfds[0].fd = listen_fd;
 		pfds[0].events = POLLIN;
 		pfds[1].fd = ev_fds[0];
 		pfds[1].events = POLLIN;
 		pfds[2].fd = ev_fds[1];
 		pfds[2].events = POLLIN;
+		pfds[3].fd = ev_fds[2]; /* touch (may be -1 if no device) */
+		pfds[3].events = POLLIN;
 		for (int i = 0; i < MAX_CLIENTS; i++) {
-			pfds[3 + i].fd = clients[i].used ? clients[i].fd : -1;
-			pfds[3 + i].events = POLLIN;
+			pfds[4 + i].fd = clients[i].used ? clients[i].fd : -1;
+			pfds[4 + i].events = POLLIN;
 		}
-		for (int i = 0; i < 3 + MAX_CLIENTS; i++)
+		for (int i = 0; i < 4 + MAX_CLIENTS; i++)
 			pfds[i].revents = 0;
 
-		int pr = poll(pfds, 3 + MAX_CLIENTS, 500);
+		int pr = poll(pfds, 4 + MAX_CLIENTS, 500);
 
 		/* Tick the clock on every wakeup (poll timeout or activity); repaint
 		 * just the top bar when the minute rolls over. */
@@ -2232,9 +2883,11 @@ int main(int argc, char **argv) {
 			input_drain(0);
 		if (pfds[2].revents & POLLIN)
 			input_drain(1);
+		if (pfds[3].revents & POLLIN)
+			touch_drain();
 		for (int i = 0; i < MAX_CLIENTS; i++)
-			if (pfds[3 + i].fd >= 0 &&
-			    (pfds[3 + i].revents & (POLLIN | POLLHUP)))
+			if (pfds[4 + i].fd >= 0 &&
+			    (pfds[4 + i].revents & (POLLIN | POLLHUP)))
 				client_data(i);
 	}
 
