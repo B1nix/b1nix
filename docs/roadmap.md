@@ -580,8 +580,8 @@ construction.
   metadata, so stock toolkits (GTK/Qt/SDL) translate keys correctly.
 - [x] Run the stock SHM/xdg-shell wire flow (`m49-smoke`, equivalent to the
   weston-simple-shm protocol path); `xdg_wm_base.ping`/`pong` hung-client
-  detection and `xdg_toplevel` title/app_id/ack. Full conformance delta (what
-  is deliberately server-side or omitted) in
+  detection and the `xdg_toplevel` WM requests (title/app_id/ack/close +
+  move/resize/maximize/fullscreen). Full conformance delta (what is omitted) in
   [`wayland-conformance.md`](wayland-conformance.md).
 
 ## M50: DRM/KMS and Graphics Memory

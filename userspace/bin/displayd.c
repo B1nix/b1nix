@@ -188,6 +188,13 @@ struct dtoplevel {
 	struct dsurface *surface;
 	char title[32];
 	char app_id[32];
+	int maximized;
+	int fullscreen;
+	int geom_dirty;        /* a state-change configure is in flight; full-repaint
+	                          on the next commit */
+	int restoring;         /* the in-flight configure returns to floating: snap
+	                          back to the saved position on commit */
+	int saved_x, saved_y;  /* floating position to restore from max/fullscreen */
 };
 
 struct dclient {
@@ -241,6 +248,12 @@ static int px, py;
 static int enter_slot = -1; /* surface slot pointer is inside, -1 none */
 static int focus_slot = -1;
 static int drag_slot = -1;
+/* Client-initiated interactive resize grab (xdg_toplevel.resize). */
+static int resize_slot = -1;
+static uint32_t resize_edges;     /* xdg_toplevel_resize_edge bitmask */
+static int resize_ox, resize_oy;  /* pointer origin at grab start */
+static int resize_ow, resize_oh;  /* window size at grab start */
+static int resize_wx, resize_wy;  /* window origin at grab start */
 static int left_alt;
 static uint32_t input_serial;
 
@@ -1048,6 +1061,23 @@ static void surface_action(int ci, struct dsurface *s, uint16_t op,
 			if (dw > 0 && dh > 0)
 				composite_rect(s->x + dx, s->y + dy, dw, dh);
 		}
+		/* A maximize/fullscreen/restore configure just took effect: snap the
+		 * window to the new origin and repaint the whole screen (the size and
+		 * position both changed, so a damage-rect repaint is not enough). */
+		struct dtoplevel *gt = surface_toplevel(s);
+		if (gt && gt->geom_dirty) {
+			if (gt->fullscreen) {
+				s->x = 0; s->y = 0;
+			} else if (gt->maximized) {
+				s->x = 0; s->y = (int)PANEL_H;
+			} else if (gt->restoring) {
+				s->x = gt->saved_x; s->y = gt->saved_y;
+				gt->restoring = 0;
+			}
+			/* else: interactive resize set the origin already — keep it. */
+			gt->geom_dirty = 0;
+			composite_rect(0, 0, (int)scr_w, (int)scr_h);
+		}
 		s->pend_dmg_valid = 0;
 		frame_serial++;
 		if (s->has_frame_cb) {
@@ -1154,6 +1184,64 @@ static void wl_surface_configure(int ci, struct wobject *xdg) {
 	xdg->configured = 1;
 }
 
+/* Send an xdg_toplevel.configure(w,h,states) + the matching
+ * xdg_surface.configure(serial). Used for client-driven state changes
+ * (maximize/fullscreen/resize/restore). Marks the toplevel geom_dirty so the
+ * next commit repositions it and repaints. */
+static void send_state_configure(struct dtoplevel *t, uint32_t w, uint32_t h,
+                                  const uint32_t *states, unsigned nstates) {
+	uint32_t msg[8];
+	if (nstates > 4)
+		nstates = 4;
+	msg[0] = w;
+	msg[1] = h;
+	msg[2] = nstates * 4; /* states array, length in bytes */
+	for (unsigned i = 0; i < nstates; i++)
+		msg[3 + i] = states[i];
+	send_msg(t->client, t->id, 0, msg, 3 + nstates);
+	for (int i = 0; i < MAX_WOBJECTS; i++)
+		if (wobjects[i].used && wobjects[i].client == t->client &&
+		    wobjects[i].type == WOBJ_XDG_SURFACE && t->surface &&
+		    wobjects[i].link == t->surface->id) {
+			uint32_t serial = ++frame_serial;
+			send_msg(t->client, wobjects[i].id, 0, &serial, 1);
+			wobjects[i].configured = 1;
+			break;
+		}
+	t->geom_dirty = 1;
+}
+
+/* work area below the top panel */
+static uint32_t work_w(void) { return scr_w; }
+static uint32_t work_h(void) { return scr_h - PANEL_H; }
+
+/* Apply a window-management state request from a client. */
+static void toplevel_set_state(struct dtoplevel *t, int maximized,
+                               int fullscreen) {
+	struct dsurface *s = t->surface;
+	if (!s)
+		return;
+	if (!t->maximized && !t->fullscreen && (maximized || fullscreen)) {
+		t->saved_x = s->x; /* leaving floating: remember where to return */
+		t->saved_y = s->y;
+	}
+	t->restoring = (!maximized && !fullscreen);
+	t->maximized = maximized;
+	t->fullscreen = fullscreen;
+	uint32_t states[2];
+	unsigned n = 0;
+	uint32_t w = 0, h = 0;
+	if (fullscreen) {
+		states[n++] = 2; /* FULLSCREEN */
+		w = scr_w; h = scr_h;
+	} else if (maximized) {
+		states[n++] = 1; /* MAXIMIZED */
+		w = work_w(); h = work_h();
+	}
+	states[n++] = 4; /* ACTIVATED */
+	send_state_configure(t, w, h, states, n);
+}
+
 static void wl_create_buffer(int ci, struct wpool *pool, const uint32_t *a,
                              unsigned n) {
 	if (n < 6 || (a[5] != 0 && a[5] != 1) || a[2] == 0 || a[3] == 0 ||
@@ -1251,11 +1339,29 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			if (len)
 				memcpy(top->app_id, &a[1], len - 1);
 			top->app_id[len ? len - 1 : 0] = 0;
+		} else if (h->opcode == 5 && top->surface) { /* move */
+			drag_slot = (int)(top->surface - surfaces);
+		} else if (h->opcode == 6 && n >= 3 && top->surface &&
+		           top->surface->buf) { /* resize(seat, serial, edges) */
+			resize_slot = (int)(top->surface - surfaces);
+			resize_edges = a[2];
+			resize_ox = px;
+			resize_oy = py;
+			resize_ow = (int)top->surface->buf->w;
+			resize_oh = (int)top->surface->buf->h;
+			resize_wx = top->surface->x;
+			resize_wy = top->surface->y;
+		} else if (h->opcode == 9) { /* set_maximized */
+			toplevel_set_state(top, 1, 0);
+		} else if (h->opcode == 10) { /* unset_maximized */
+			toplevel_set_state(top, 0, 0);
+		} else if (h->opcode == 11) { /* set_fullscreen */
+			toplevel_set_state(top, 0, 1);
+		} else if (h->opcode == 12) { /* unset_fullscreen */
+			toplevel_set_state(top, 0, 0);
 		}
-		/* move/resize/set_maximized/set_minimized/set_fullscreen (opcodes
-		 * 5,6,9..13) are consumed here as no-ops: window management is
-		 * server-side policy (title-bar drag, Alt+Tab, Alt+F4). See
-		 * docs/wayland-conformance.md. */
+		/* set_minimized (13) is acknowledged but not acted on: there is no
+		 * taskbar to restore from, so unmapping would lose the window. */
 		return;
 	}
 
@@ -1693,6 +1799,7 @@ static void pointer_button(uint16_t code, int state) {
 	} else {
 		if (code == B1NIX_BTN_LEFT) {
 			drag_slot = -1;
+			resize_slot = -1; /* end any client-initiated resize grab */
 			on_decoration = btn_on_decoration;
 			btn_on_decoration = 0;
 		}
@@ -1760,6 +1867,33 @@ static void apply_pointer_motion(void) {
 	if (py >= (int)scr_h) py = (int)scr_h - 1;
 	if (px == ox && py == oy)
 		return;
+
+	/* Client-initiated interactive resize: turn the pointer delta into a new
+	 * size, keep the anchored (opposite) edge fixed, and send a configure. The
+	 * window itself repaints when the client commits the resized buffer
+	 * (geom_dirty → full recompose); here we only refresh the cursor. */
+	struct dsurface *rz = slot_surface(resize_slot);
+	if (rz) {
+		struct dtoplevel *t = surface_toplevel(rz);
+		int dx = px - resize_ox, dy = py - resize_oy;
+		int nw = resize_ow, nh = resize_oh;
+		if (resize_edges & 8) nw = resize_ow + dx;       /* right */
+		else if (resize_edges & 4) nw = resize_ow - dx;  /* left  */
+		if (resize_edges & 2) nh = resize_oh + dy;       /* bottom */
+		else if (resize_edges & 1) nh = resize_oh - dy;  /* top   */
+		if (nw < 64) nw = 64;
+		if (nh < 48) nh = 48;
+		if (resize_edges & 4) rz->x = (resize_wx + resize_ow) - nw;
+		if (resize_edges & 1) rz->y = (resize_wy + resize_oh) - nh;
+		if (t) {
+			uint32_t st[2] = {3 /* RESIZING */, 4 /* ACTIVATED */};
+			send_state_configure(t, (uint32_t)nw, (uint32_t)nh, st, 2);
+		}
+		composite_rect(ox, oy, CURSOR_W + 1, CURSOR_H + 1);
+		composite_rect(px, py, CURSOR_W + 1, CURSOR_H + 1);
+		pointer_moved();
+		return;
+	}
 
 	struct dsurface *drag = slot_surface(drag_slot);
 	if (drag) {

@@ -229,6 +229,20 @@ int main(void) {
 		if (ev.object == 12 && ev.opcode == 0)
 			framed = 1;
 	marker(framed ? "M49-WL: ok shm-frame\n" : "M49-WL: fail shm-frame\n");
+
+	/* A5: maximize and confirm the compositor configures the work-area size
+	 * (1024 wide) with the MAXIMIZED state in the states array. */
+	request(fd, 9, 9, 0, 0); /* xdg_toplevel.set_maximized */
+	uint32_t mx_w = 0, mx_state = 0;
+	int mx_tries = 0;
+	while (!mx_state && mx_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 9 && ev.opcode == 0 && ev.nargs >= 4) {
+			mx_w = ev.args[0];
+			mx_state = ev.args[3]; /* first entry of the states array */
+		}
+	marker(mx_w == 1024 && mx_state == 1 ? "M49-WL: ok maximize\n"
+	                                     : "M49-WL: fail maximize\n");
+
 	if (framed) {
 		struct b1gui_window gui;
 		if (b1gui_connect(&gui) ||

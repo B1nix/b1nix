@@ -14,7 +14,8 @@ shim. The list below is the honest delta from a full compositor.
 - `wl_seat` (pointer + keyboard), `wl_pointer`, `wl_keyboard`, `wl_output` (v2,
   with `mode`/`scale`/`done`).
 - `xdg_wm_base`, `xdg_surface`, `xdg_toplevel` (title, app_id, configure/ack,
-  close), `xdg_wm_base.ping`/`pong` hung-client detection.
+  close, **move, resize, maximize/unmaximize, fullscreen/unfullscreen**),
+  `xdg_wm_base.ping`/`pong` hung-client detection.
 - `wl_data_device_manager` clipboard (selection copy/paste over `SCM_RIGHTS`).
 - **Keyboard: a real `XKB_V1` keymap** (US/evdev, embedded in
   `userspace/bin/xkb_keymap_us.h`, sent over a `memfd`) plus
@@ -27,14 +28,30 @@ These are conscious scope choices, not missing-but-intended work. None of them
 breaks a conforming client — the client simply finds the global absent, or its
 request is accepted and ignored.
 
-### Window management is server-side
+### Window management
 
-`xdg_toplevel` interactive requests — `move`, `resize`, `set_maximized` /
-`unset_maximized`, `set_minimized`, `set_fullscreen` — are accepted and ignored.
-The compositor owns window management itself: title-bar drag, click-to-focus /
-raise, `Alt+Tab` cycle, `Alt+F4` close. Clients do not drive geometry. The
-`configure` the server sends uses width/height = 0 ("client picks its size")
-with the `activated` state for the focused toplevel.
+The compositor runs its own WM (title-bar drag, click-to-focus / raise,
+`Alt+Tab` cycle, `Alt+F4` close), *and* honours the client-driven
+`xdg_toplevel` requests:
+
+- `move` — starts a server-side drag of the window (same path as title-bar
+  drag), ending on button release.
+- `resize` — interactive edge/corner grab; each pointer step sends a
+  `configure` with the new size and the `resizing` state, keeping the anchored
+  edge fixed. The window repaints when the client commits the resized buffer.
+- `set_maximized` / `unset_maximized` — `configure` to the work area
+  (full width, below the top panel) with the `maximized` state; restores the
+  saved floating position on unmaximize.
+- `set_fullscreen` / `unset_fullscreen` — `configure` to the full screen
+  (covering the panel) with the `fullscreen` state.
+
+A floating toplevel's first `configure` uses width/height = 0 ("client picks
+its size") plus the `activated` state, since a freshly-mapped window takes
+focus.
+
+**`set_minimized` is acknowledged but not acted on** — there is no taskbar to
+restore from, so unmapping would strand the window. Add it together with a
+taskbar/dock if one is built.
 
 ### Absent globals / protocols
 
