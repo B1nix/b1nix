@@ -1463,6 +1463,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 			check_output "$LOG" "M53-VIRGL: ok submit" "M53: userspace submits a virgl command stream"
 			check_output "$LOG" "M53-VIRGL: ok path-accelerated" "M53: host GPU renders userspace-submitted virgl clear; pixels verified via mmap"
 			check_output "$LOG" "M53-GFX: ok gl-accelerated" "M53 variant B: Mesa's gallium virgl driver renders on the host GPU (gallium pipe clear, pixels verified) — full hardware OpenGL"
+			check_output "$LOG" "M53-GFX: ok gl-triangle" "M53 variant B: full draw pipeline — Mesa vertex/fragment shaders + vertex buffer rasterise a triangle on the host GPU (centre red, corner black)"
 		else
 			pass "M52: VirGL 3D acceleration (skipped — host QEMU lacks a virglrenderer GL device)"
 		fi

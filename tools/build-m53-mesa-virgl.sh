@@ -32,6 +32,7 @@ mkdir -p "$(dirname "$OUT")"
 GCC_INC="$("$GCC" -print-file-name=include)"
 "$GCC" -O2 -ffunction-sections -fdata-sections -Db1nix \
   -DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0 \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED=1 \
   -nostdinc -isystem "$ROOT_DIR/userspace/include" -isystem "$GCC_INC" \
   -I "$MESA_SRC/include" -I "$MESA_SRC/src" -I "$MESA_SRC/src/gallium/include" \
   -I "$MESA_SRC/src/gallium/auxiliary" -I "$MESA_SRC/src/mapi" \
