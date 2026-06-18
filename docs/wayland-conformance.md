@@ -90,10 +90,29 @@ more; nothing else assumes the value.
 
 ## Architecture notes
 
-- **`wl_shm` lives in displayd, not in the ported `libwayland-server`.** M49
-  ported `libwayland-server`'s core, but SHM compositing stays native until
-  b1nix has the pthread-TLS / SIGBUS ABI the upstream SHM path expects.
-- **Hand-rolled wire marshalling.** Opcodes are literal numbers in
-  `handle_wayland_msg`, not `wayland-scanner`-generated stubs. This keeps the
-  server tiny (one file, no codegen step) at the cost of the opcodes being
-  documented by comment rather than by a generated header.
+These are deliberate, evaluated design choices — both were investigated as
+possible rewrites and both came out **net-negative** (they would degrade a
+green, working compositor for zero functional gain). Keep them.
+
+- **`wl_shm` lives in displayd, not in the ported `libwayland-server`.**
+  Investigated: not cleanly feasible and not worth it. The real blockers (the
+  old "pthread-TLS / SIGBUS ABI" note is stale — M29 delivered pthreads + TLS):
+  (1) b1nix has no **SIGBUS-on-beyond-EOF** semantics — a file/memfd mapping
+  past `i_size` silently zero-fills rather than faulting, and the upstream
+  `wl_shm` keys its crash-guard on `SIGBUS` + `si_addr`; (2) `wayland-shm.c` is
+  not even compiled into the ported `libwayland-server.a`, and adopting it pulls
+  in the whole `wl_display`/`wl_event_loop`/`wl_resource` object model — a
+  ~2,400-LOC rewrite of the standalone wire server. displayd's own
+  `wl_create_buffer` already validates buffer extent against `pool->size`, so it
+  does not need the SIGBUS net for correctness. (Adding SIGBUS-on-EOF is a
+  worthwhile *independent* kernel mm task if other ported software ever needs
+  it — decoupled from Wayland.)
+- **Hand-rolled wire marshalling, not `wayland-scanner` codegen.** Investigated:
+  `wayland-scanner` only emits the `wl_resource`/listener model, so adopting its
+  generated glue means adopting the full `libwayland-server` runtime (same as
+  above). Measured cost: ~9,200 generated LOC + a codegen build step + vendored
+  protocol XML + a `libwayland-server.a` link + high rewrite-regression risk —
+  for zero functional gain. The hand-rolled dispatch keeps the server one tiny
+  file. The only real downside is opcodes documented by comment rather than a
+  generated header; if that ever matters, generating *just* an enum/opcode
+  header (no runtime) is the cheap fix — the full dispatch rewrite is not.

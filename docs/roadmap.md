@@ -572,7 +572,9 @@ construction.
   against `displayd`; the compositor remains a deliberately small native
   server rather than pulling in the unused upstream server event loop.
 - [x] Port upstream `libwayland-server` core with a poll-backed event loop;
-  SHM remains implemented by `displayd` until b1nix has pthread TLS/SIGBUS ABI.
+  SHM stays implemented natively in `displayd` by design (evaluated: adopting
+  upstream `wl_shm` needs SIGBUS-on-EOF + the full server object model — a
+  net-negative rewrite; `displayd` validates buffer extents itself).
 - [x] Teach `displayd` the real protocol: `wl_shm`,
   `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset.
 - [x] Send a real `XKB_V1` keyboard keymap (US/evdev, embedded in
@@ -588,8 +590,10 @@ construction.
   `zwp_linux_dmabuf_v1` (advertised, import honestly rejected — no GEM path),
   `wl_touch` from a virtio touchscreen (`/dev/input/event2`), and
   `xdg_toplevel.set_minimized` backed by a panel taskbar. Capacities raised
-  (clients/surfaces/buffers 32). Only the deliberate architecture items (C)
-  remain — see [`wayland-conformance.md`](wayland-conformance.md).
+  (clients/surfaces/buffers 32). The internal architecture items (`wl_shm` via
+  `libwayland-server`; `wayland-scanner` codegen) were evaluated and
+  intentionally **kept native** — both are net-negative rewrites for zero
+  functional gain (rationale in [`wayland-conformance.md`](wayland-conformance.md)).
 
 ## M50: DRM/KMS and Graphics Memory
 
