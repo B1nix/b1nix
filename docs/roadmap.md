@@ -777,11 +777,15 @@ no-fake-pass smoke test.
     API (screen → context → render target → `set_framebuffer_state` + `clear` →
     `texture_map`); Mesa encodes the virgl command stream, submits it to the
     host virglrenderer over `/dev/virtio-gpu`, and the cleared pixels read back
-    exactly: `M53-GFX: ok gl-accelerated`, both arches (x86 748/0, x86_64 749/0).
-    Follow-ups: a `RES_UNREF`/screen-destroy so the winsys frees device
-    resources (it currently leaks the 16 res slots, so the demo runs last); the
-    kernel SUBMIT/transfer buffers (256-dword / 1-page) need raising for complex
-    draws beyond a clear.
+    exactly: `M53-GFX: ok gl-accelerated`. The demo now also drives the **full
+    draw pipeline** — vertex/fragment TGSI shaders, a vertex buffer, vertex
+    elements, rasteriser/blend/DSA state and `draw_vbo` rasterise a triangle on
+    the host GPU (`M53-GFX: ok gl-triangle`, centre pixel red, corner black).
+    This required `RES_UNREF` + screen/resource teardown (the winsys frees the
+    device's 16 res slots, no leak), raising the kernel SUBMIT staging buffer
+    (1 page → 64 KiB) for the larger shader/draw streams, and building the demo
+    with `-DHAVE_FUNC_ATTRIBUTE_PACKED=1` so its `pipe_draw_info` layout matches
+    Mesa's (the enum-packing ABI). Both arches (x86 749/0, x86_64 750/0).
 - [ ] `planned` Runtime gaps: robust pthread, futex, TLS (mostly done in M29),
   real dynamic loading (`dlopen` of `.so` — currently a stub), ICU.
 - [x] `done` Port NetSurf's own libraries and the framebuffer frontend, and
