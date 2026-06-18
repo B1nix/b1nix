@@ -957,3 +957,65 @@ status table and the conditions for each remaining item:
     DRI/GLX/EGL/GBM path beyond OSMesa-to-memory.
   - TLS timing/native-net + harden: mbedTLS `TIMING_C`/`NET_C`, dropbear/curl
     `--harden`, bash `bash-malloc`.
+
+## M55: C++ Runtime
+
+Prerequisite for every Chromium-class engine. Feasibility background and the
+revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
+
+- [ ] `planned` Build libstdc++ (or libc++) with C++ exceptions (DWARF unwinding
+  via `libgcc_eh`/libunwind), RTTI, and thread-safe statics; today it is only
+  exercised `-fno-exceptions -fno-rtti` (HarfBuzz).
+- [ ] `planned` Provide `std::thread`/`mutex`/`condvar`/`atomic` over pthreads
+  (base in M29), `std::filesystem`, and locale/iostream.
+- [ ] `planned` Validate by building a smaller modern engine first — litehtml
+  (C++ HTML/CSS) or Ladybird's LibWeb/LibJS — three orders of magnitude smaller
+  than Chromium, before committing to its build.
+
+## M56: Event Loop and IPC Primitives
+
+- [ ] `planned` Add `epoll` (edge-triggered), `eventfd`, `timerfd`, and
+  `signalfd` for the Chromium/base message loop.
+- [ ] `planned` Implement `SCM_RIGHTS` ancillary FD passing over `AF_UNIX`
+  (`sendmsg`/`recvmsg` exist; cmsg FD-passing does not).
+- [ ] `planned` Add memfd sealing (`F_ADD_SEALS`) and cross-process shared
+  `mmap` (memfd base in M48), enough to carry Mojo shared buffers.
+
+## M57: Multiprocess Model
+
+- [ ] `planned` Make fork/exec, FD inheritance, and FD brokering robust enough
+  for the `--no-sandbox` model (drops the sandbox, keeps multiple processes).
+- [ ] `planned` Bring up a minimal Mojo core over the M56 primitives.
+
+## M58: V8
+
+- [ ] `planned` Port V8 interpreter-only (`--jitless`, Ignition, no TurboFan) to
+  avoid W^X mappings and GC/deopt signals; run JS through `d8`.
+- [ ] `deferred` Add the optimizing JIT (W^X executable mmap, GC/deopt signals).
+
+## M59: EGL and GL for the Browser
+
+- [ ] `planned` Add an EGL implementation over the M52/M53 virgl host-GPU GL (or
+  ANGLE → b1nix GL), closing the missing DRI/EGL/GBM path.
+- [ ] `planned` Provide a software Skia (Ganesh) raster fallback.
+
+## M60: Ozone Platform
+
+- [ ] `planned` Add an Ozone platform backend (headless first, then a
+  displayd/Wayland-shaped one): window, surface, input, and vsync.
+
+## M61: Chromium Build Target
+
+- [ ] `planned` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
+  `sandbox/` (stubbed), and Ozone, and integrate the cross-toolchain (a
+  multi-month, ~100 GB build that upstream does not support).
+
+## M62: content_shell
+
+- [ ] `planned` Render a page to a bitmap with `content_shell --headless
+  --no-sandbox` and verify the pixels — the "Chromium runs" milestone.
+
+## M63: Sandbox
+
+- [ ] `deferred` Add the real sandbox (seccomp-bpf + user/PID/net namespaces +
+  setuid sandbox); none exist today. Only if process isolation is required.
