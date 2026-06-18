@@ -46,7 +46,11 @@ static void keymap(void *data, struct wl_keyboard *keyboard, uint32_t format,
 {
 	struct globals *globals = data;
 	(void)keyboard;
-	if (format == WL_KEYBOARD_KEYMAP_FORMAT_NO_KEYMAP && size == 0)
+	/* displayd now sends a real XKB_V1 keymap (US/evdev) over the fd, not the
+	 * old no_keymap. Validate the format and a non-trivial size — enough to
+	 * prove it is a real keymap. (Mapping the fd to inspect the bytes is left
+	 * out: mmap of a SCM_RIGHTS-passed memfd is not supported here.) */
+	if (format == WL_KEYBOARD_KEYMAP_FORMAT_XKB_V1 && size > 64)
 		globals->keymap = 1;
 	close(fd);
 }
@@ -60,8 +64,39 @@ static void repeat_info(void *data, struct wl_keyboard *keyboard, int32_t rate,
 	(void)delay;
 }
 
+/* The compositor may send enter/leave/key/modifiers at any time. libwayland
+ * dispatches every event through the listener, so a NULL slot would be called
+ * as a function pointer and crash — all members must be provided even if the
+ * client ignores them. */
+static void kb_enter(void *data, struct wl_keyboard *kb, uint32_t serial,
+		     struct wl_surface *surface, struct wl_array *keys)
+{
+	(void)data; (void)kb; (void)serial; (void)surface; (void)keys;
+}
+static void kb_leave(void *data, struct wl_keyboard *kb, uint32_t serial,
+		     struct wl_surface *surface)
+{
+	(void)data; (void)kb; (void)serial; (void)surface;
+}
+static void kb_key(void *data, struct wl_keyboard *kb, uint32_t serial,
+		   uint32_t time, uint32_t key, uint32_t state)
+{
+	(void)data; (void)kb; (void)serial; (void)time; (void)key; (void)state;
+}
+static void kb_modifiers(void *data, struct wl_keyboard *kb, uint32_t serial,
+			 uint32_t depressed, uint32_t latched, uint32_t locked,
+			 uint32_t group)
+{
+	(void)data; (void)kb; (void)serial; (void)depressed; (void)latched;
+	(void)locked; (void)group;
+}
+
 static const struct wl_keyboard_listener keyboard_listener = {
 	.keymap = keymap,
+	.enter = kb_enter,
+	.leave = kb_leave,
+	.key = kb_key,
+	.modifiers = kb_modifiers,
 	.repeat_info = repeat_info,
 };
 
