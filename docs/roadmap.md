@@ -704,8 +704,14 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
   **static-init** `__cxa_guard`, **threads** `std::thread`/`mutex`/`atomic`).
 - [x] `done` `std::thread`/`mutex`/`atomic` over the M29 pthread layer (verified
   in `cxx_smoke`). `std::condition_variable` links via gthr-posix.
-- [ ] `deferred` `std::filesystem` and locale/`iostream` (`std::cout`) — thin
-  wrappers over the existing VFS / UTF-8 libc; add when a port needs them.
+- [x] `done` `std::filesystem` and locale/`iostream`. `std::cout`/`cin`/`cerr`,
+  `ostringstream`/`istringstream` and `std::filesystem` (create/iterate/stat/
+  remove) run end-to-end against the hosted libstdc++ over the b1nix VFS/UTF-8
+  libc — verified by `userspace/bin/m55_iostream.cpp` (`M55-IOSTREAM: ok
+  cout/sstream/cin/filesystem`, both arches; `cin` reads a real fd 0 fed by a
+  pipe). Needed no new libc symbols; the root-cause fix was `linker-cxx.ld` not
+  collecting libstdc++'s legacy `.ctors.NNNNN` init sections, so the iostream
+  `ios_base::Init` global never ran and the first `std::cout` faulted.
 - [x] `done` Validate the runtime with a real modern engine: **litehtml** (C++
   HTML/CSS layout engine + bundled gumbo HTML parser) is ported
   (`tools/build-litehtml.sh`, CMake cross-build against b1nix libstdc++) and

@@ -1295,6 +1295,20 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M55: std::iostream (std::cout/cerr + locale facets) and std::filesystem
+   * over the b1nix VFS, built against the hosted libstdc++. Pure CPU + VFS
+   * work, kept on the core instance (graphics is saturated by Mesa+NetSurf). */
+  {
+    u64 io_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m55-iostream",
+                                  0, 0, 0, 0, 0);
+    if ((isize)io_pid < 0) {
+      uwrite("M55-IOSTREAM: spawn-fail\n");
+    } else {
+      int io_status = 0;
+      syscall_dispatch(SYS_WAIT, io_pid, (u64)(usize)&io_status, 0, 0, 0, 0);
+    }
+  }
+
   u64 n_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/native-smoke", 0, 0, 0, 0, 0);
 
   if ((isize)n_pid < 0) {

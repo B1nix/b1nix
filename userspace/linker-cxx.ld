@@ -29,10 +29,20 @@ SECTIONS
 		*(.data .data.*)
 	}
 
+	/* Global constructors. GCC/libstdc++ on this target emit a mix of the modern
+	 * .init_array form AND the legacy priority-suffixed .ctors.NNNNN form — the
+	 * iostream initializer (_GLOBAL__sub_I...__ZSt3cin, which constructs
+	 * std::cin/cout/cerr and std::ios_base::Init) lands in .ctors.65445. crt0
+	 * runs this block forward, so the legacy .ctors.* (which the toolchain emits
+	 * with priority encoded so a plain ascending sort matches default-priority
+	 * ctors last) are gathered after the explicit .init_array entries. Missing
+	 * the .ctors.* glob leaves std::cout's streambuf unconstructed → the first
+	 * "std::cout <<" faults in ostream::sentry. */
 	.init_array ALIGN(8) : {
 		__init_array_start = .;
 		KEEP(*(.preinit_array))
 		KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
+		KEEP(*(SORT_BY_NAME(.ctors.*)))
 		KEEP(*(.init_array .ctors))
 		__init_array_end = .;
 	}

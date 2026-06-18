@@ -315,6 +315,12 @@ $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-c++ $< -o $@
 
+# M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
+# b1nix VFS, built against libstdc++ via tools/b1nix-c++.
+$(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-c++ $< -o $@
+
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
 # __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
 HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install

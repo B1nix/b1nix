@@ -90,6 +90,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m52_osmesa \
 	m52_glsl \
 	cxx_smoke \
+	m55_iostream \
 	m55_litehtml \
 	displayd \
 	gclock \
@@ -576,6 +577,13 @@ $(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DE
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
+
+# M55: std::iostream + std::filesystem acceptance test (hosted libstdc++).
+$(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/b1nix-c++ tools/enable-cxx-toolchain.sh
+	@tools/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m55_iostream_elf userspace/build/$(ARCH)/bin/m55_iostream > $@
 
 # M52: real Mesa OSMesa (software OpenGL) demo. tools/build-m52-osmesa.sh builds
 # the whole Mesa stack (build-mesa.sh) and links the demo against it.
