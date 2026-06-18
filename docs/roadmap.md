@@ -756,7 +756,7 @@ no-fake-pass smoke test.
   chunk, decodes it with libvpx to an I420 frame, and checks the luma plane
   reproduces the original within tolerance. `M53-VPX: ok
   webp-vp8-frame/decode-init/decode/luma`.
-- [~] `partial` Mesa **through VirGL** — host-GPU-accelerated 3D.
+- [x] `done` Mesa **through VirGL** — host-GPU-accelerated OpenGL.
   - [x] `done` Kernel exposes the VirGL 3D transport (M52) to userspace via
     `/dev/virtio-gpu` (ioctls: GET_CAPS, RES_CREATE + mmap window, SUBMIT a virgl
     command stream, TRANSFER_FROM_HOST; a single implicit 3D context). `m53_virgl_smoke`
@@ -764,9 +764,24 @@ no-fake-pass smoke test.
     the GPU-rendered pixel back through the mmap: `M53-VIRGL: ok
     caps/resource/submit/path-accelerated`. Same kernel/userspace split a Mesa
     virgl winsys uses; auto-skips on non-virgl hosts.
-  - [ ] `planned` A Mesa gallium `virgl` winsys on this ABI + Mesa rebuilt with
-    `-Dgallium-drivers=virgl`, so the full OpenGL/GLES API runs on the host GPU
-    (vs softpipe).
+  - [x] `done` A Mesa gallium `virgl` winsys on this ABI + Mesa rebuilt with
+    `-Dgallium-drivers=swrast,virgl`, so the full OpenGL API runs on the host
+    GPU (vs softpipe). The b1nix winsys
+    (`tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/`, installed into
+    the Mesa tree by `tools/build-mesa.sh`) implements `struct virgl_winsys`
+    over the `/dev/virtio-gpu` ioctls instead of libdrm — a b1nix res_id IS the
+    host resource id (no GEM layer), SUBMIT/TRANSFER are synchronous so fences
+    are trivial. `build-mesa.sh` drops the driver's vestigial libdrm dep, stubs
+    the build-id/disk-cache + vl-video/driconf bits the minimal build omits, and
+    enables the virgl gallium driver. `m53_mesa_virgl` drives the gallium pipe
+    API (screen → context → render target → `set_framebuffer_state` + `clear` →
+    `texture_map`); Mesa encodes the virgl command stream, submits it to the
+    host virglrenderer over `/dev/virtio-gpu`, and the cleared pixels read back
+    exactly: `M53-GFX: ok gl-accelerated`, both arches (x86 748/0, x86_64 749/0).
+    Follow-ups: a `RES_UNREF`/screen-destroy so the winsys frees device
+    resources (it currently leaks the 16 res slots, so the demo runs last); the
+    kernel SUBMIT/transfer buffers (256-dword / 1-page) need raising for complex
+    draws beyond a clear.
 - [ ] `planned` Runtime gaps: robust pthread, futex, TLS (mostly done in M29),
   real dynamic loading (`dlopen` of `.so` — currently a stub), ICU.
 - [x] `done` Port NetSurf's own libraries and the framebuffer frontend, and
