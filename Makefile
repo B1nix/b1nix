@@ -586,7 +586,7 @@ $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/build-m5
 # M53 variant B: Mesa's gallium virgl driver renders on the host GPU through the
 # b1nix /dev/virtio-gpu winsys. tools/build-m53-mesa-virgl.sh builds the Mesa
 # stack (with the virgl driver) and links the pipe-API render test against it.
-$(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/build-m53-mesa-virgl.sh tools/build-mesa.sh $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/build-m53-mesa-virgl.sh tools/build-mesa.sh $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_mesa_virgl_elf userspace/build/$(ARCH)/bin/m53_mesa_virgl > $@

@@ -103,19 +103,8 @@ int main(void)
        b <= 195) {
       emit("M53-GFX: ok gl-accelerated\n");
    } else {
-      /* The Mesa virgl driver runs on b1nix and created a host-GPU screen
-       * (the structural milestone, M53-GLACCEL: ok screen). The clear's pixel
-       * does not yet read back correctly — the gallium clear-encode/submit path
-       * through this winsys is still being brought up — so report it as
-       * work-in-progress rather than failing the suite. */
-      char buf[64];
-      static const char hx[] = "0123456789abcdef";
-      int i = 0;
-      buf[i++] = 'p'; buf[i++] = 'x'; buf[i++] = '=';
-      for (int s = 28; s >= 0; s -= 4) buf[i++] = hx[(px >> s) & 0xF];
-      buf[i++] = '\n'; buf[i] = 0;
-      emit("M53-GLACCEL: render-wip ");
-      emit(buf);
+      emit("M53-GFX: fail gl-accelerated (pixel)\n");
+      return 1;
    }
    return 0;
 }

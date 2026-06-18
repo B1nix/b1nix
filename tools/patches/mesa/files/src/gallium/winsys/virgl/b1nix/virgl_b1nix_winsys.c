@@ -35,6 +35,7 @@ struct virgl_b1nix_winsys {
    struct virgl_drm_caps caps;
 };
 
+
 /* The winsys-private resource handle the gallium virgl driver passes around. */
 struct virgl_hw_res {
    struct pipe_reference reference;
@@ -109,7 +110,11 @@ virgl_b1nix_resource_create(struct virgl_winsys *vws,
 
    memset(&rc, 0, sizeof(rc));
    rc.target = target;
-   rc.format = format;
+   /* The driver passes a PIPE format here (bind is already a virgl bind); the
+    * host RESOURCE_CREATE_3D wants a VIRGL format, so convert it — otherwise the
+    * resource and the surface that wraps it disagree and the clear reads back
+    * as zero. */
+   rc.format = pipe_to_virgl_format(format);
    rc.bind = bind;
    rc.width = width ? width : 1;
    rc.height = height ? height : 1;
@@ -257,7 +262,13 @@ static void virgl_b1nix_emit_res(struct virgl_winsys *vws,
    struct virgl_b1nix_cmd_buf *cbuf = virgl_b1nix_cmd_buf(_cbuf);
    unsigned i;
 
-   (void)vws; (void)write_buf;
+   (void)vws;
+   /* Emit the resource's host id into the command stream — this is how the
+    * stream references resources (the surface/framebuffer/clear targets). The
+    * b1nix res_id IS the host virtio-gpu resource id (no GEM-handle layer). */
+   if (write_buf)
+      cbuf->buf[cbuf->base.cdw++] = res->res_handle;
+
    for (i = 0; i < cbuf->nres; i++)
       if (cbuf->res_bo[i] == res)
          return;
