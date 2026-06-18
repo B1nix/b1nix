@@ -230,6 +230,11 @@ int b1gui_next_event(struct b1gui_window *win, struct b1gui_event *event,
 		if (rc != 1)
 			return rc;
 		memset(event, 0, sizeof(*event));
+		if (h.object == win->wm_base_id && h.opcode == 0) {
+			/* xdg_wm_base.ping → pong: prove we are alive. */
+			request(win->fd, win->wm_base_id, 3, &args[0], 1);
+			continue;
+		}
 		if (h.object == win->toplevel_id && h.opcode == 1)
 			event->type = B1GUI_EV_CLOSE;
 		else if (h.object == win->pointer_id && h.opcode <= 3) {

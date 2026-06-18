@@ -32,6 +32,7 @@
 #include <signal.h>
 
 #include "font8x8.h"
+#include "xkb_keymap_us.h"
 
 #define MAX_CLIENTS 8
 #define MAX_SURFACES 8
@@ -186,6 +187,7 @@ struct dtoplevel {
 	int client;
 	struct dsurface *surface;
 	char title[32];
+	char app_id[32];
 };
 
 struct dclient {
@@ -194,6 +196,8 @@ struct dclient {
 	uint8_t inbuf[512];
 	unsigned inlen;
 	int pending_fd;
+	int ping_pending;       /* xdg_wm_base.ping sent, awaiting pong */
+	uint32_t ping_serial;
 };
 
 static struct dclient clients[MAX_CLIENTS];
@@ -239,6 +243,11 @@ static int focus_slot = -1;
 static int drag_slot = -1;
 static int left_alt;
 static uint32_t input_serial;
+
+/* wl_keyboard modifier state (standard X11 mask bits, matching the embedded
+ * keymap's real modifiers): Shift=1, Lock=2, Control=4, Mod1/Alt=8, Mod4=64. */
+static uint32_t kbd_mods_depressed;
+static uint32_t kbd_mods_locked;
 
 /* Accumulated pointer motion, applied once per input drain (coalesced) rather
  * than per kernel report. Under a fast window drag the per-report path does
@@ -291,16 +300,39 @@ static void send_msg_fd(int client, uint32_t obj, uint16_t opcode,
 	sendmsg(clients[client].fd, &mh, 0);
 }
 
-static void keyboard_init(int client, uint32_t id) {
-	int fd = memfd_create("wayland-keymap", MFD_CLOEXEC);
-	uint32_t keymap[2] = {0, 0}; /* no_keymap: clients consume raw evdev codes */
-	uint32_t repeat[2] = {25, 400};
+/* wl_keyboard.modifiers(serial, depressed, latched, locked, group). Lets clients
+ * track Shift/Ctrl/CapsLock so the keymap actually produces the right glyphs. */
+static void send_kbd_modifiers(int client, uint32_t id) {
+	uint32_t ev[5] = {input_serial, kbd_mods_depressed, 0, kbd_mods_locked, 0};
+	send_msg(client, id, 4, ev, 5);
+}
 
+static void keyboard_init(int client, uint32_t id) {
+	/* Send a real XKB_V1 keymap (US/evdev) so GTK/Qt/SDL clients can translate
+	 * the raw evdev keycodes we deliver in wl_keyboard.key. size includes the
+	 * NUL terminator, as xkbcommon expects. */
+	size_t size = sizeof(xkb_keymap_us);
+	int fd = memfd_create("wayland-keymap", MFD_CLOEXEC);
 	if (fd >= 0) {
-		send_msg_fd(client, id, 0, keymap, 2, fd);
+		size_t off = 0;
+		while (off < size) {
+			ssize_t w = write(fd, xkb_keymap_us + off, size - off);
+			if (w <= 0)
+				break;
+			off += (size_t)w;
+		}
+		if (off == size) {
+			uint32_t keymap[2] = {1 /* XKB_V1 */, (uint32_t)size};
+			send_msg_fd(client, id, 0, keymap, 2, fd);
+		} else {
+			uint32_t keymap[2] = {0, 0}; /* fall back to no_keymap on write fail */
+			send_msg_fd(client, id, 0, keymap, 2, fd);
+		}
 		close(fd);
 	}
+	uint32_t repeat[2] = {25, 400};
 	send_msg(client, id, 5, repeat, 2);
+	send_kbd_modifiers(client, id);
 }
 
 static struct wobject *wobject_type_find(int client, enum wobject_type type) {
@@ -1113,8 +1145,10 @@ static void wl_surface_configure(int ci, struct wobject *xdg) {
 	struct dtoplevel *t = surface ? surface_toplevel(surface) : 0;
 	if (!t)
 		return;
-	uint32_t top[3] = {0, 0, 0}; /* width, height, empty states array */
-	send_msg(ci, t->id, 0, top, 3);
+	/* configure(width=0, height=0 → client picks size; states = [activated]).
+	 * A freshly-mapped toplevel takes keyboard focus here, so it is active. */
+	uint32_t top[4] = {0, 0, 4 /* states: 4 bytes */, 4 /* ACTIVATED */};
+	send_msg(ci, t->id, 0, top, 4);
 	uint32_t serial = ++frame_serial;
 	send_msg(ci, xdg->id, 0, &serial, 1);
 	xdg->configured = 1;
@@ -1184,6 +1218,11 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			else
 				surface_action(ci, surface, SURFACE_COMMIT, a, n);
 		}
+		/* set_opaque_region(4)/set_input_region(5)/set_buffer_transform(7)/
+		 * set_buffer_scale(8)/offset(10) are accepted and ignored: the
+		 * compositor is fixed at scale 1, normal transform, no region
+		 * clipping (it advertises scale 1 on wl_output, so conforming clients
+		 * never request otherwise). */
 		return;
 	}
 
@@ -1198,14 +1237,25 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 	if (top) {
 		if (h->opcode == 0)
 			memset(top, 0, sizeof(*top));
-		else if (h->opcode == 2 && n >= 1) {
+		else if (h->opcode == 2 && n >= 1) { /* set_title */
 			unsigned len = a[0];
 			if (len > sizeof(top->title))
 				len = sizeof(top->title);
 			if (len)
 				memcpy(top->title, &a[1], len - 1);
 			top->title[len ? len - 1 : 0] = 0;
+		} else if (h->opcode == 3 && n >= 1) { /* set_app_id */
+			unsigned len = a[0];
+			if (len > sizeof(top->app_id))
+				len = sizeof(top->app_id);
+			if (len)
+				memcpy(top->app_id, &a[1], len - 1);
+			top->app_id[len ? len - 1 : 0] = 0;
 		}
+		/* move/resize/set_maximized/set_minimized/set_fullscreen (opcodes
+		 * 5,6,9..13) are consumed here as no-ops: window management is
+		 * server-side policy (title-bar drag, Alt+Tab, Alt+F4). See
+		 * docs/wayland-conformance.md. */
 		return;
 	}
 
@@ -1278,16 +1328,24 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			wobject_remove(obj);
 		else if (h->opcode == 2 && n >= 2)
 			wobject_add(ci, a[0], WOBJ_XDG_SURFACE, a[1]);
+		else if (h->opcode == 3 && n >= 1) { /* pong */
+			if (clients[ci].ping_serial == a[0])
+				clients[ci].ping_pending = 0;
+		}
 		break;
 	case WOBJ_XDG_SURFACE:
 		if (h->opcode == 0)
 			wobject_remove(obj);
-		else if (h->opcode == 1 && n >= 1) {
+		else if (h->opcode == 1 && n >= 1) { /* get_toplevel */
 			create_toplevel(ci, a[0], obj->link);
 			struct dtoplevel *created = find_toplevel(ci, a[0]);
 			if (created)
 				strcpy(created->title, "Wayland");
+		} else if (h->opcode == 4) { /* ack_configure */
+			obj->configured = 1;
 		}
+		/* opcode 5 set_window_geometry: we size windows from the committed
+		 * buffer, so the client hint is consumed without storing it. */
 		break;
 	case WOBJ_REGION:
 		if (h->opcode == 0)
@@ -1759,6 +1817,38 @@ static void apply_pointer_motion(void) {
 	pointer_moved();
 }
 
+/* Fold an evdev key transition into the wl_keyboard modifier masks. Returns 1
+ * if the reported mask changed (and a modifiers event should be sent). */
+static int update_mods(uint16_t code, int value) {
+	uint32_t bit;
+	switch (code) {
+	case 0x2a: case 0x36: bit = 1; break;   /* L/R Shift   */
+	case 0x1d: case 0x61: bit = 4; break;   /* L/R Control */
+	case 0x38: case 0x64: bit = 8; break;   /* L/R Alt (Mod1) */
+	case 0x7d: case 0x7e: bit = 64; break;  /* L/R Meta (Mod4) */
+	case 0x3a:                              /* CapsLock: a lock, toggles on press */
+		if (value == 1) { kbd_mods_locked ^= 2; return 1; }
+		return 0;
+	default:
+		return 0;
+	}
+	uint32_t before = kbd_mods_depressed;
+	if (value == 0)
+		kbd_mods_depressed &= ~bit;
+	else
+		kbd_mods_depressed |= bit; /* press or autorepeat */
+	return kbd_mods_depressed != before;
+}
+
+static void send_focus_modifiers(void) {
+	struct dsurface *f = slot_surface(focus_slot);
+	if (!f)
+		return;
+	struct wobject *kbd = wobject_type_find(f->client, WOBJ_KEYBOARD);
+	if (kbd)
+		send_kbd_modifiers(f->client, kbd->id);
+}
+
 static void input_drain(int which) {
 	struct b1nix_input_event evs[16];
 	for (;;) {
@@ -1771,6 +1861,8 @@ static void input_drain(int which) {
 			if (which == 0) { /* keyboard */
 				if (e->type == B1NIX_EV_KEY) {
 					input_serial++;
+					if (update_mods((uint16_t)e->code, (int)e->value))
+						send_focus_modifiers();
 					if (e->value && e->code == 0x01 &&
 					    open_menu != MENU_NONE) {
 						close_panel_menu();
@@ -1866,6 +1958,25 @@ static int update_clock(void) {
 
 /* ── main ── */
 
+/* xdg_wm_base.ping every client that bound one. A client that did not pong the
+ * previous round is hung — drop it so its surfaces stop occupying the desktop. */
+static void ping_clients(void) {
+	for (int i = 0; i < MAX_CLIENTS; i++) {
+		if (!clients[i].used)
+			continue;
+		struct wobject *wm = wobject_type_find(i, WOBJ_XDG_WM_BASE);
+		if (!wm)
+			continue;
+		if (clients[i].ping_pending) {
+			client_disconnect(i);
+			continue;
+		}
+		clients[i].ping_serial = ++frame_serial;
+		clients[i].ping_pending = 1;
+		send_msg(i, wm->id, 0, &clients[i].ping_serial, 1);
+	}
+}
+
 int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
@@ -1912,6 +2023,7 @@ int main(int argc, char **argv) {
 
 	px = (int)scr_w / 2;
 	py = (int)scr_h / 2;
+	long last_ping = (long)time(0);
 	update_clock();
 	composite_rect(0, 0, (int)scr_w, (int)scr_h); /* clear to background */
 
@@ -1942,6 +2054,14 @@ int main(int argc, char **argv) {
 		 * just the top bar when the minute rolls over. */
 		if (update_clock())
 			composite_rect(0, 0, (int)scr_w, PANEL_H);
+
+		/* Hung-client detection: ping no faster than every 5s so a busy but
+		 * healthy client always has time to pong before the next round. */
+		long now = (long)time(0);
+		if (now - last_ping >= 5) {
+			last_ping = now;
+			ping_clients();
+		}
 
 		if (pr < 0)
 			continue;

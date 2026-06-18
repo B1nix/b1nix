@@ -91,6 +91,11 @@ static int next_event(int fd, struct event *ev) {
 				memcpy(ev->args, inbuf + sizeof(h), ev->nargs * 4);
 				memmove(inbuf, inbuf + h.size, inlen - h.size);
 				inlen -= h.size;
+				if (ev->object == 6 && ev->opcode == 0) {
+					/* xdg_wm_base.ping → pong (object 6 bound above). */
+					request(fd, 6, 3, ev->args, 1);
+					continue;
+				}
 				return 1;
 			}
 		}
@@ -160,6 +165,20 @@ int main(void) {
 			out_w = ev.args[1];
 	marker(out_w == 1024 ? "M51-GFX: ok wl-output\n"
 	                     : "M51-GFX: fail wl-output\n");
+
+	/* M49: bind a keyboard and confirm displayd sends a real XKB_V1 keymap
+	 * (format 1), not the old no_keymap (format 0). */
+	bind_prefix[0] = 3; bind_suffix[0] = 5; bind_suffix[1] = 20;
+	request_string(fd, 2, 0, bind_prefix, 1, "wl_seat", bind_suffix, 2);
+	uint32_t kbd_id = 21;
+	request(fd, 20, 1, &kbd_id, 1); /* wl_seat.get_keyboard */
+	uint32_t km_format = 0xffffffffu;
+	int km_tries = 0;
+	while (km_format == 0xffffffffu && km_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 21 && ev.opcode == 0 && ev.nargs >= 1)
+			km_format = ev.args[0]; /* wl_keyboard.keymap(format, size) */
+	marker(km_format == 1 ? "M49-WL: ok xkb-keymap\n"
+	                      : "M49-WL: fail xkb-keymap\n");
 
 	id = 7;
 	request(fd, 4, 0, &id, 1); /* wl_compositor.create_surface */

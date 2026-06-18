@@ -575,12 +575,14 @@ construction.
   SHM remains implemented by `displayd` until b1nix has pthread TLS/SIGBUS ABI.
 - [x] Teach `displayd` the real protocol: `wl_shm`,
   `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset.
-- [x] Send the standard `no_keymap` keyboard map fd and repeat metadata;
-  clients consume the existing raw evdev keycodes without an xkbcommon port.
+- [x] Send a real `XKB_V1` keyboard keymap (US/evdev, embedded in
+  `userspace/bin/xkb_keymap_us.h`) plus `wl_keyboard.modifiers` and repeat
+  metadata, so stock toolkits (GTK/Qt/SDL) translate keys correctly.
 - [x] Run the stock SHM/xdg-shell wire flow (`m49-smoke`, equivalent to the
-  weston-simple-shm protocol path).
-- [ ] `parked` TinyX/kdrive `Xfbdev` on the same `/dev/fb0` + input
-  substrate, as the route to real X11 apps.
+  weston-simple-shm protocol path); `xdg_wm_base.ping`/`pong` hung-client
+  detection and `xdg_toplevel` title/app_id/ack. Full conformance delta (what
+  is deliberately server-side or omitted) in
+  [`wayland-conformance.md`](wayland-conformance.md).
 
 ## M50: DRM/KMS and Graphics Memory
 
