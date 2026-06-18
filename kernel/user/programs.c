@@ -2046,6 +2046,19 @@ static int init_main(int argc, const char **argv) {
         syscall_dispatch(SYS_WAIT, uvirgl_pid, (u64)(usize)&uvirgl_status, 0, 0,
                          0, 0);
       }
+      /* M53 variant B: Mesa's gallium virgl driver builds + runs on b1nix and
+       * creates a host-GPU pipe_screen over /dev/virtio-gpu. Runs LAST among the
+       * virgl tests: it does not yet free its device resources (winsys has no
+       * RES_UNREF/screen-destroy), so keep its slot leak from starving the other
+       * virgl tests. Skips cleanly with no virgl host device. */
+      u64 mv_pid = syscall_dispatch(
+          SYS_SPAWN, (u64)(usize) "/bin/m53-mesa-virgl", 0, 0, 0, 0, 0);
+      if ((isize)mv_pid < 0) {
+        uwrite("M53-GFX: spawn-fail gl-accelerated\n");
+      } else {
+        int mv_status = 0;
+        syscall_dispatch(SYS_WAIT, mv_pid, (u64)(usize)&mv_status, 0, 0, 0, 0);
+      }
       /* M51: clipboard (wl_data_device) selection round-trip between two
        * client connections. */
       u64 clip_pid = syscall_dispatch(

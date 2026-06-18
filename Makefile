@@ -65,6 +65,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_httpd \
 	m53_httpsd \
 	m53_virgl_smoke \
+	m53_mesa_virgl \
 	m34_smoke \
 	m35_smoke \
 	m38_sound \
@@ -581,6 +582,14 @@ $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/build-m5
 	B1NIX_ARCH=$(ARCH) tools/build-m52-osmesa.sh userspace/build/$(ARCH)/bin/m52_osmesa
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
+
+# M53 variant B: Mesa's gallium virgl driver renders on the host GPU through the
+# b1nix /dev/virtio-gpu winsys. tools/build-m53-mesa-virgl.sh builds the Mesa
+# stack (with the virgl driver) and links the pipe-API render test against it.
+$(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/build-m53-mesa-virgl.sh tools/build-mesa.sh $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m53_mesa_virgl_elf userspace/build/$(ARCH)/bin/m53_mesa_virgl > $@
 
 # M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
 # demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
