@@ -125,6 +125,8 @@ enum wobject_type {
 	WOBJ_DATA_SOURCE,
 	WOBJ_DATA_DEVICE,
 	WOBJ_DATA_OFFER,
+	WOBJ_DECORATION_MANAGER,
+	WOBJ_TOPLEVEL_DECORATION,
 };
 
 struct wobject {
@@ -1161,6 +1163,7 @@ static void wl_registry_globals(int ci, uint32_t registry) {
 	    {4, "xdg_wm_base", 1},
 	    {5, "wl_output", 2},
 	    {6, "wl_data_device_manager", 3},
+	    {7, "zxdg_decoration_manager_v1", 1},
 	};
 	for (unsigned i = 0; i < sizeof(globals) / sizeof(globals[0]); i++) {
 		uint32_t prefix = globals[i].name;
@@ -1393,6 +1396,7 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			else if (a[0] == 4) type = WOBJ_XDG_WM_BASE;
 			else if (a[0] == 5) type = WOBJ_OUTPUT;
 			else if (a[0] == 6) type = WOBJ_DDM;
+			else if (a[0] == 7) type = WOBJ_DECORATION_MANAGER;
 			else break;
 			if (wobject_add(ci, new_id, type, 0)) {
 				if (type == WOBJ_SHM) {
@@ -1516,6 +1520,28 @@ static void handle_wayland_msg(int ci, const struct wl_hdr *h,
 			}
 		} else if (h->opcode == 2) /* destroy */
 			wobject_remove(obj);
+		break;
+	case WOBJ_DECORATION_MANAGER:
+		if (h->opcode == 0)
+			wobject_remove(obj);
+		else if (h->opcode == 1 && n >= 1) {
+			/* get_toplevel_decoration(new_id, toplevel): displayd always
+			 * draws the title bar, so answer server_side and the client
+			 * skips its own (client-side) decorations. */
+			if (wobject_add(ci, a[0], WOBJ_TOPLEVEL_DECORATION, 0)) {
+				uint32_t mode = 2; /* server_side */
+				send_msg(ci, a[0], 0, &mode, 1); /* configure */
+			}
+		}
+		break;
+	case WOBJ_TOPLEVEL_DECORATION:
+		if (h->opcode == 0) /* destroy */
+			wobject_remove(obj);
+		else if (h->opcode == 1 || h->opcode == 2) {
+			/* set_mode / unset_mode: we only ever do server_side. */
+			uint32_t mode = 2;
+			send_msg(ci, obj->id, 0, &mode, 1); /* configure */
+		}
 		break;
 	default:
 		break;

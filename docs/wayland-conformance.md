@@ -17,6 +17,8 @@ shim. The list below is the honest delta from a full compositor.
   close, **move, resize, maximize/unmaximize, fullscreen/unfullscreen**),
   `xdg_wm_base.ping`/`pong` hung-client detection.
 - `wl_data_device_manager` clipboard (selection copy/paste over `SCM_RIGHTS`).
+- `zxdg_decoration_manager_v1`: answers `server_side` so clients skip their own
+  (client-side) title bars — displayd draws them.
 - **Keyboard: a real `XKB_V1` keymap** (US/evdev, embedded in
   `userspace/bin/xkb_keymap_us.h`, sent over a `memfd`) plus
   `wl_keyboard.modifiers` (Shift/Ctrl/CapsLock/Alt/Super). Key events carry raw
@@ -61,9 +63,9 @@ taskbar/dock if one is built.
 - **HiDPI / transform**: fixed at scale 1, normal transform. `set_buffer_scale`,
   `set_buffer_transform`, `set_opaque_region`, `set_input_region`, surface
   `offset` are accepted and ignored.
-- **Not advertised at all**: `xdg-decoration`, `wp_viewporter`,
-  `wl_subcompositor`, `wp_presentation`, `zwp_linux_dmabuf`. (GPU buffers reach
-  the host via `/dev/virtio-gpu` outside Wayland — see M53.)
+- **Not advertised at all**: `wp_viewporter`, `wl_subcompositor`,
+  `wp_presentation`, `zwp_linux_dmabuf` — no current client needs them. (GPU
+  buffers reach the host via `/dev/virtio-gpu` outside Wayland — see M53.)
 
 ### Fixed capacities
 

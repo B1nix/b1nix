@@ -1431,6 +1431,7 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 		check_output "$LOG" "M49-WL: ok xdg-shell" "M49: xdg-shell configure handshake"
 		check_output "$LOG" "M49-WL: ok xkb-keymap" "M49: wl_keyboard sends a real XKB_V1 keymap"
 		check_output "$LOG" "M49-WL: ok maximize" "M49: xdg_toplevel.set_maximized → work-area configure"
+		check_output "$LOG" "M49-WL: ok decoration" "M49: xdg-decoration negotiates server_side mode"
 		check_output "$LOG" "M49-WL: ok shm-frame" "M49: Wayland SHM frame"
 		check_output "$LOG" "M49-WL: ok libb1gui" "M49: native GUI library uses Wayland"
 		check_output "$LOG" "M49-LIBWL: ok upstream-client" "M49: upstream libwayland-client"

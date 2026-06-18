@@ -243,6 +243,21 @@ int main(void) {
 	marker(mx_w == 1024 && mx_state == 1 ? "M49-WL: ok maximize\n"
 	                                     : "M49-WL: fail maximize\n");
 
+	/* B: xdg-decoration — confirm the compositor advertises the manager and
+	 * configures server_side mode (it draws the title bar itself). */
+	bind_prefix[0] = 7; bind_suffix[0] = 1; bind_suffix[1] = 22;
+	request_string(fd, 2, 0, bind_prefix, 1, "zxdg_decoration_manager_v1",
+	               bind_suffix, 2);
+	uint32_t deco_args[2] = {23, 9}; /* get_toplevel_decoration(new_id, toplevel) */
+	request(fd, 22, 1, deco_args, 2);
+	uint32_t deco_mode = 0;
+	int deco_tries = 0;
+	while (!deco_mode && deco_tries++ < 64 && next_event(fd, &ev) == 1)
+		if (ev.object == 23 && ev.opcode == 0 && ev.nargs >= 1)
+			deco_mode = ev.args[0];
+	marker(deco_mode == 2 ? "M49-WL: ok decoration\n"
+	                      : "M49-WL: fail decoration\n");
+
 	if (framed) {
 		struct b1gui_window gui;
 		if (b1gui_connect(&gui) ||
