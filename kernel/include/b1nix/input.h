@@ -33,11 +33,14 @@ struct b1nix_input_event {
 #define B1NIX_BTN_LEFT 0x110
 #define B1NIX_BTN_RIGHT 0x111
 #define B1NIX_BTN_MIDDLE 0x112
+/* Touchscreen contact key (Linux BTN_TOUCH): value 1 = finger down, 0 = up. */
+#define B1NIX_BTN_TOUCH 0x14a
 
 /* Device indices. */
 #define INPUT_DEV_KBD 0
 #define INPUT_DEV_MOUSE 1
-#define INPUT_NDEVS 2
+#define INPUT_DEV_TOUCH 2 /* /dev/input/event2 — virtio touchscreen (wl_touch) */
+#define INPUT_NDEVS 3
 
 void input_init(void);
 

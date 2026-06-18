@@ -31,5 +31,7 @@ struct b1nix_input_event {
 #define B1NIX_BTN_LEFT 0x110
 #define B1NIX_BTN_RIGHT 0x111
 #define B1NIX_BTN_MIDDLE 0x112
+/* Touchscreen contact key (Linux BTN_TOUCH): value 1 = finger down, 0 = up. */
+#define B1NIX_BTN_TOUCH 0x14a
 
 #endif

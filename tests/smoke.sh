@@ -175,6 +175,8 @@ run_qemu() {
 				${filter_dump_args} \
 				-netdev user,id=net1,restrict=${B1NIX_NET_RESTRICT:-on} -device ${E1000_MODEL:-e1000},netdev=net1 \
 			-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
+			-device virtio-tablet-pci,id=vtablet \
+			-device virtio-tablet-pci,id=vtouch \
 			-device intel-hda,id=hda -device hda-duplex,bus=hda.0 \
 			-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \

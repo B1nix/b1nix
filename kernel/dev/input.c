@@ -42,6 +42,7 @@ struct input_device {
 static struct input_device devs[INPUT_NDEVS] = {
   [INPUT_DEV_KBD] = {.name = "event0"},
   [INPUT_DEV_MOUSE] = {.name = "event1"},
+  [INPUT_DEV_TOUCH] = {.name = "event2"},
 };
 static spinlock_t input_lock;
 
@@ -321,5 +322,6 @@ void input_init(void) {
     devs[i].registered = 1;
     vfs_node_put(node);
   }
-  console_write("input: /dev/input/event0 (kbd) + event1 (mouse) ready\n");
+  console_write("input: /dev/input/event0 (kbd) + event1 (mouse) + event2 "
+                "(touch) ready\n");
 }
