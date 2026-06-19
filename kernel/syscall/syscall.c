@@ -1761,6 +1761,24 @@ static u64 sys_listen(int fd, int backlog) {
   return (u64)vfs_listen(fd, backlog);
 }
 
+/* M57: socketpair(domain, type, protocol, int sv[2]). Allocates the two fds in
+ * the kernel, then copies them out; on copyout failure both are closed so no
+ * descriptor leaks into a process that never learns its number. */
+static u64 sys_socketpair(int domain, int type, int protocol, int *user_sv) {
+  if (!user_sv)
+    return (u64)-EFAULT;
+  int sv[2];
+  int rc = vfs_socketpair(domain, type, protocol, sv);
+  if (rc < 0)
+    return (u64)rc;
+  if (syscall_copyout(user_sv, sv, sizeof(sv)) < 0) {
+    vfs_close(sv[0]);
+    vfs_close(sv[1]);
+    return (u64)-EFAULT;
+  }
+  return 0;
+}
+
 static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   /*addrlen is both in and out */
   usize k_addrlen = 0;
@@ -1905,7 +1923,18 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   if (prot & PROT_WRITE)
     vmm_flags |= VMM_WRITABLE;
 
-  if (flags & MAP_ANONYMOUS) {
+  if ((flags & MAP_ANONYMOUS) && (flags & MAP_NORESERVE)) {
+    /* MAP_NORESERVE anonymous: lazy commit. Mark each page VMM_LAZY (no frame
+     * reserved up front); the page-fault handler's Case 1 zero-fills a fresh
+     * frame on first touch (anonymous → no VMA node → stays zeroed). This is
+     * b1nix's only commit model for NORESERVE — no fake reservation accounting,
+     * just defer the physical allocation, which is exactly the documented
+     * semantics. */
+    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      vmm_set_lazy(v);
+      paging_mprotect_page(v, vmm_flags);
+    }
+  } else if (flags & MAP_ANONYMOUS) {
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       u64 frame = pmm_alloc_frame();
@@ -2064,6 +2093,131 @@ static isize sys_mprotect(void *addr, usize length, int prot) {
 
     vma->prot = (u32)prot;
     vma = vma->next;
+  }
+
+  return 0;
+}
+
+/* madvise(addr, length, advice). Only the calling process's own mapping is
+ * touched. MADV_DONTNEED (and MADV_FREE, see below) drop the backing pages of
+ * an anonymous range so the next access lazily refaults to a fresh zeroed page;
+ * the hint advices are accepted as no-ops. */
+static isize sys_madvise(void *addr, usize length, int advice) {
+  u64 start = (u64)(usize)addr;
+  if ((start & (PAGE_SIZE - 1)) != 0)
+    return -EINVAL; /* POSIX: addr must be page-aligned */
+  if (length == 0)
+    return 0;
+  if (start >= USER_SPACE_LIMIT)
+    return -EINVAL;
+  if (length > (usize)(USER_SPACE_LIMIT - start))
+    return -EINVAL;
+  u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+  if (end < start || end > USER_SPACE_LIMIT)
+    return -EINVAL;
+
+  switch (advice) {
+  case MADV_NORMAL:
+  case MADV_RANDOM:
+  case MADV_SEQUENTIAL:
+  case MADV_WILLNEED:
+  case MADV_DONTFORK:
+  case MADV_DOFORK:
+  case MADV_HUGEPAGE:
+  case MADV_NOHUGEPAGE:
+    /* Accepted hints b1nix does not act on (no prefetch, no fork-inherit
+     * control, no transparent hugepages) — legal POSIX no-op. */
+    return 0;
+  case MADV_DONTNEED:
+  case MADV_FREE:
+    break;
+  default:
+    return -EINVAL;
+  }
+
+  struct task *t = current_task;
+  if (!t)
+    return -ESRCH;
+
+  /* The range must lie entirely inside mapped regions (POSIX ENOMEM otherwise).
+   * MADV_DONTNEED/FREE here is implemented only for anonymous, non-shared
+   * mappings — dropping a file-backed or MAP_SHARED page would discard data, so
+   * we leave those untouched (a conservative, data-safe no-op). For anonymous
+   * MAP_PRIVATE pages MADV_FREE is treated as MADV_DONTNEED: the page content is
+   * discarded and the next access yields a zeroed page (documented simplification
+   * — b1nix has no lazy-reclaim queue to keep the old contents on a read). */
+  for (u64 v = start; v < end; v += PAGE_SIZE) {
+    struct vm_area *vma = t->vma_list;
+    struct vm_area *cover = 0;
+    while (vma) {
+      if (v >= vma->start && v < vma->end) {
+        cover = vma;
+        break;
+      }
+      vma = vma->next;
+    }
+    if (!cover)
+      return -ENOMEM; /* unmapped page in range */
+
+    int anon = (cover->flags & MAP_ANONYMOUS) != 0 || cover->node == 0;
+    int shared = (cover->flags & MAP_SHARED) != 0;
+    if (!anon || shared)
+      continue; /* never discard file/shared data */
+
+    u64 vmm_flags = VMM_USER;
+    if (cover->prot & PROT_WRITE)
+      vmm_flags |= VMM_WRITABLE;
+
+    /* Drop the present frame (vmm_unmap_page frees it + unregisters from the
+     * eviction list), then re-arm the page as lazy so the next touch refaults
+     * to a fresh zeroed anonymous page (page-fault Case 1). */
+    vmm_unmap_page(v);
+    vmm_set_lazy(v);
+    paging_mprotect_page(v, vmm_flags);
+  }
+
+  return 0;
+}
+
+/* sigaltstack(ss, old_ss). Per-process alternate signal stack kept in a
+ * scheduler side-table. The kernel honors SA_ONSTACK at signal delivery by
+ * placing the signal frame at the top of this stack. */
+static isize sys_sigaltstack(const void *user_ss, void *user_old) {
+  struct task *t = current_task;
+  if (!t)
+    return -ESRCH;
+
+  /* Report the current setting first (POSIX: old_ss reflects state before the
+   * new ss is applied). SS_ONSTACK is reported when the task is currently
+   * executing on its alt stack, derived from the live user SP. */
+  if (user_old) {
+    kstack_t cur;
+    task_get_altstack(t, &cur);
+    /* saved_user_rsp holds the user SP (rsp/esp) captured at kernel entry. */
+    u64 sp = t->saved_user_rsp;
+    if (cur.ss_size != 0 && task_on_altstack(t, sp))
+      cur.ss_flags |= SS_ONSTACK;
+    if (syscall_copyout(user_old, &cur, sizeof(cur)) < 0)
+      return -EFAULT;
+  }
+
+  if (user_ss) {
+    kstack_t ss;
+    if (syscall_copyin(&ss, user_ss, sizeof(ss)) < 0)
+      return -EFAULT;
+    /* Cannot change the alt stack while executing on it. */
+    if (task_altstack_top(t) && task_on_altstack(t, t->saved_user_rsp))
+      return -EPERM;
+    if (ss.ss_flags & ~(SS_DISABLE | SS_ONSTACK))
+      return -EINVAL;
+    if (!(ss.ss_flags & SS_DISABLE)) {
+      if (ss.ss_size < MINSIGSTKSZ)
+        return -ENOMEM;
+      if (ss.ss_sp == 0 || ss.ss_sp >= USER_SPACE_LIMIT)
+        return -EINVAL;
+    }
+    if (task_set_altstack(t, &ss) < 0)
+      return -ENOMEM;
   }
 
   return 0;
@@ -2708,6 +2862,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
   case SYS_MPROTECT:
     return (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  case SYS_MADVISE:
+    return (u64)sys_madvise((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  case SYS_SIGALTSTACK:
+    return (u64)sys_sigaltstack((const void *)(usize)arg0,
+                                (void *)(usize)arg1);
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));
@@ -2778,6 +2937,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   }
   case SYS_SOCKET:
     return (u64)vfs_socket((int)arg0, (int)arg1, (int)arg2);
+  case SYS_SOCKETPAIR:
+    return sys_socketpair((int)arg0, (int)arg1, (int)arg2,
+                          (int *)(usize)arg3);
   case SYS_BIND:
     return sys_bind((int)arg0, (const void *)(usize)arg1, (usize)arg2);
   case SYS_CONNECT:
@@ -3280,6 +3442,64 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     return (u64)hits;
   }
+
+  /* --- M56: event-loop & IPC primitives (grouped to ease merging) --- */
+  case SYS_EVENTFD2:
+    return (u64)vfs_eventfd((unsigned int)arg0, (int)arg1);
+  case SYS_EPOLL_CREATE1:
+    return (u64)vfs_epoll_create((int)arg0);
+  case SYS_EPOLL_CTL: {
+    /* epoll_ctl(epfd, op, fd, event). EPOLL_CTL_DEL ignores event. */
+    struct b1nix_epoll_event kev;
+    struct b1nix_epoll_event *kevp = 0;
+    if (arg3) {
+      if (syscall_copyin(&kev, (void *)(usize)arg3, sizeof(kev)) < 0)
+        return (u64)-EFAULT;
+      kevp = &kev;
+    }
+    return (u64)vfs_epoll_ctl((int)arg0, (int)arg1, (int)arg2, kevp);
+  }
+  case SYS_EPOLL_WAIT: {
+    /* epoll_wait(epfd, events, maxevents, timeout_ms). */
+    int maxevents = (int)arg2;
+    if (maxevents <= 0)
+      return (u64)-EINVAL;
+    enum { EPOLL_BATCH = 64 };
+    if (maxevents > EPOLL_BATCH)
+      maxevents = EPOLL_BATCH;
+    if (!arg1)
+      return (u64)-EFAULT;
+    struct b1nix_epoll_event kbuf[EPOLL_BATCH];
+    int n = vfs_epoll_wait((int)arg0, kbuf, maxevents, (int)arg3);
+    if (n < 0)
+      return (u64)(isize)n;
+    if (n > 0 &&
+        syscall_copyout((void *)(usize)arg1, kbuf,
+                        (usize)n * sizeof(struct b1nix_epoll_event)) < 0)
+      return (u64)-EFAULT;
+    return (u64)n;
+  }
+  case SYS_TIMERFD_CREATE:
+    return (u64)vfs_timerfd_create((int)arg0, (int)arg1);
+  case SYS_TIMERFD_SETTIME: {
+    /* timerfd_settime(fd, flags, new_value, old_value). */
+    struct b1nix_itimerspec newv, oldv;
+    if (!arg2)
+      return (u64)-EINVAL;
+    if (syscall_copyin(&newv, (void *)(usize)arg2, sizeof(newv)) < 0)
+      return (u64)-EFAULT;
+    int rc = vfs_timerfd_settime((int)arg0, (int)arg1, &newv,
+                                 arg3 ? &oldv : 0);
+    if (rc < 0)
+      return (u64)(isize)rc;
+    if (arg3 && syscall_copyout((void *)(usize)arg3, &oldv, sizeof(oldv)) < 0)
+      return (u64)-EFAULT;
+    return 0;
+  }
+  case SYS_SIGNALFD4:
+    /* signalfd4(fd, mask, flags). mask is a 64-bit signal bitmask. */
+    return (u64)vfs_signalfd((int)arg0, arg1, (int)arg2);
+
   default:
     console_write("syscall: unknown 0x");
     console_write_hex64(number);

@@ -22,10 +22,12 @@ LIBFFI_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/build-libffi.sh")"
 mkdir -p "$SRC_PARENT" "$BUILD_DIR/obj" "$INSTALL_DIR/include" \
   "$INSTALL_DIR/lib" "$HOST_DIR" "$GEN_DIR" "$COMPAT_DIR/sys"
 
-for header in epoll.h eventfd.h file.h signalfd.h timerfd.h; do
-  ln -sf "$ROOT_DIR/tools/wayland/compat.h" \
-    "$COMPAT_DIR/sys/$header"
-done
+# epoll/eventfd/timerfd/signalfd are now real libc headers (M56); only sys/file.h
+# (flock + LOCK_*) still comes from the port compat shim. Symlinking the others
+# to compat.h would shadow the real headers and self-include-guard them out.
+rm -f "$COMPAT_DIR/sys/epoll.h" "$COMPAT_DIR/sys/eventfd.h" \
+  "$COMPAT_DIR/sys/timerfd.h" "$COMPAT_DIR/sys/signalfd.h"
+ln -sf "$ROOT_DIR/tools/wayland/compat.h" "$COMPAT_DIR/sys/file.h"
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$WAYLAND_TARBALL"
