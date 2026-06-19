@@ -1279,6 +1279,21 @@ static int init_main(int argc, const char **argv) {
   }
 
   if (smoke_core) {
+  /* POSIX memory/signal primitives: madvise(MADV_DONTNEED) zeroes a refaulted
+   * anonymous page, MAP_NORESERVE large lazy-commit mapping, and sigaltstack
+   * set/get/disable + an SA_ONSTACK handler delivered on the alt stack. Pure
+   * CPU + VMM work, kept on the core instance. */
+  {
+    u64 mm_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m-posixmm-smoke",
+                                  0, 0, 0, 0, 0);
+    if ((isize)mm_pid < 0) {
+      uwrite("MM-SMOKE: spawn-fail\n");
+    } else {
+      int mm_status = 0;
+      syscall_dispatch(SYS_WAIT, mm_pid, (u64)(usize)&mm_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M55: a real C++ HTML/CSS engine (litehtml) parses, lays out and draws a
    * styled page on b1nix — end-to-end validation of the hosted C++ runtime
    * (libstdc++ exceptions/RTTI, STL, shared_ptr) on a non-trivial codebase.
@@ -1306,6 +1321,34 @@ static int init_main(int argc, const char **argv) {
     } else {
       int io_status = 0;
       syscall_dispatch(SYS_WAIT, io_pid, (u64)(usize)&io_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M56: event-loop & IPC primitives (eventfd, epoll, timerfd, signalfd, memfd
+   * sealing). Pure CPU + fd work, kept on the core instance. */
+  {
+    u64 m56_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m56-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m56_pid < 0) {
+      uwrite("M56-SMOKE: spawn-fail\n");
+    } else {
+      int m56_status = 0;
+      syscall_dispatch(SYS_WAIT, m56_pid, (u64)(usize)&m56_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M58: standalone JavaScript interpreter (/bin/js, embeds the Duktape
+   * ECMAScript engine). m58_smoke spawns /bin/js on real JS snippets and checks
+   * the exact stdout (arithmetic, String methods, JSON round-trip, the print()
+   * binding). Pure CPU work, kept on the core instance. */
+  {
+    u64 js_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m58-smoke", 0,
+                                  0, 0, 0, 0);
+    if ((isize)js_pid < 0) {
+      uwrite("M58-SMOKE: spawn-fail\n");
+    } else {
+      int js_status = 0;
+      syscall_dispatch(SYS_WAIT, js_pid, (u64)(usize)&js_status, 0, 0, 0, 0);
     }
   }
 
@@ -1398,6 +1441,20 @@ static int init_main(int argc, const char **argv) {
     } else {
       int m31_status = 0;
       syscall_dispatch(SYS_WAIT, m31_pid, (u64)(usize)&m31_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M59: a real EGL app over the Mesa OSMesa softpipe renders a triangle into
+   * an off-screen pbuffer through the standard egl* API and verifies the
+   * read-back pixels. Off-screen, so no displayd needed — runs in core. */
+  {
+    u64 m59_pid =
+        syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m59-smoke", 0, 0, 0, 0, 0);
+    if ((isize)m59_pid < 0) {
+      uwrite("M59-SMOKE: spawn-fail\n");
+    } else {
+      int m59_status = 0;
+      syscall_dispatch(SYS_WAIT, m59_pid, (u64)(usize)&m59_status, 0, 0, 0, 0);
     }
   }
 
@@ -1811,6 +1868,22 @@ static int init_main(int argc, const char **argv) {
     } else {
       int m46_status = 0;
       syscall_dispatch(SYS_WAIT, m46_pid, (u64)(usize)&m46_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M57: multiprocess broker primitives — fork fd-offset sharing, FD_CLOEXEC
+   * across exec, non-CLOEXEC inheritance / dup2-onto-stdio survival,
+   * socketpair + SCM_RIGHTS fd brokering (incl. peer-death in-flight cleanup),
+   * and F_DUPFD_CLOEXEC. */
+  {
+    u64 m57_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m57-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m57_pid < 0) {
+      uwrite("M57-SMOKE: spawn-fail\n");
+    } else {
+      int m57_status = 0;
+      syscall_dispatch(SYS_WAIT, m57_pid, (u64)(usize)&m57_status, 0, 0, 0, 0);
     }
   }
   }

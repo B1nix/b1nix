@@ -234,3 +234,27 @@ int eglB1nixAccelerated(EGLDisplay dpy) {
   (void)dpy;
   return 0; /* software path; VirGL backend overrides in Phase C */
 }
+
+/* The TinyGL window-only backend has no off-screen pbuffer path; the
+ * OSMesa-backed b1egl_mesa.c provides the real implementation. */
+EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
+                                   const EGLint *attrib_list) {
+  (void)dpy;
+  (void)config;
+  (void)attrib_list;
+  g_error = EGL_BAD_SURFACE;
+  return EGL_NO_SURFACE;
+}
+
+const uint32_t *eglB1nixSurfacePixels(EGLDisplay dpy, EGLSurface surface,
+                                      EGLint *width, EGLint *height) {
+  (void)dpy;
+  struct b1egl_surface *s = (struct b1egl_surface *)surface;
+  if (!s || !s->win)
+    return NULL;
+  if (width)
+    *width = s->width;
+  if (height)
+    *height = s->height;
+  return s->win->pixels;
+}

@@ -637,6 +637,23 @@ check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enf
 check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 
+# ── M56 Event-loop & IPC primitives ──
+section "M56 Event-loop & IPC Primitives"
+check_output "$LOG" "M56-SMOKE: start" "M56 smoke starts"
+check_output "$LOG" "M56-SMOKE: ok eventfd" "eventfd counter write/read + semaphore mode work"
+check_output "$LOG" "M56-SMOKE: ok epoll" "epoll_wait wakes on a ready fd and times out when idle"
+check_output "$LOG" "M56-SMOKE: ok timerfd" "timerfd fires and is pollable via epoll"
+check_output "$LOG" "M56-SMOKE: ok signalfd" "signalfd delivers a raised signal as a readable record"
+check_output "$LOG" "M56-SMOKE: ok seal" "F_SEAL_WRITE on a sealable memfd rejects writes"
+check_output "$LOG" "M56-SMOKE: done" "M56 smoke completes"
+# ── POSIX memory/signal primitives (madvise, MAP_NORESERVE, sigaltstack) ──
+section "POSIX memory/signal primitives"
+check_output "$LOG" "MM-SMOKE: start" "MM smoke starts"
+check_output "$LOG" "MM-SMOKE: ok madvise" "madvise(MADV_DONTNEED) zeroes a refaulted anonymous page"
+check_output "$LOG" "MM-SMOKE: ok noreserve" "MAP_NORESERVE large mapping commits lazily on touch"
+check_output "$LOG" "MM-SMOKE: ok sigaltstack" "sigaltstack get/set/disable + SA_ONSTACK handler runs on alt stack"
+check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
+
 # ── M25 Native Toolchain ──
 section "M25 Native C Toolchain"
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
@@ -981,6 +998,11 @@ check_output "$LOG" "M31-SEC: ok shadow-format" "/etc/shadow exists and uses b1n
 check_output "$LOG" "M31-SEC: ok setuid-elevate" "setuid initramfs binary elevates euid to root"
 check_output "$LOG" "M31-SEC: ok uid-denial" "non-root setuid(0) is rejected by kernel"
 check_output "$LOG" "M31-SEC: done" "M31 smoke completes"
+# ── M59 EGL over Mesa OSMesa (off-screen, software OpenGL) ──
+check_output "$LOG" "M59-SMOKE: ok egl-init" "M59: eglInitialize/eglChooseConfig over the b1nix display (EGL 1.x)"
+check_output "$LOG" "M59-SMOKE: ok egl-context" "M59: eglCreateContext + pbuffer surface + eglMakeCurrent (real Mesa softpipe GL bound)"
+check_output "$LOG" "M59-SMOKE: ok egl-render" "M59: GL clear + triangle drawn off-screen via EGL; read-back pixels verified (clear color, triangle ink, center == triangle)"
+check_output "$LOG" "M59-SMOKE: done" "M59 EGL smoke completes"
 # ── M32 Networking / Multiplexing ──
 check_output "$LOG" "M32-NET: start" "M32 multiplex smoke starts"
 # External connectivity (off-link TCP over QEMU usernet). Skips cleanly when
@@ -1268,6 +1290,14 @@ check_output "$LOG" "M46-SMOKE: ok times-getrusage" "times() and getrusage() acc
 check_output "$LOG" "M46-SMOKE: ok orphaned-pgrp" "orphaned process groups with stopped tasks receive SIGHUP+SIGCONT"
 check_output "$LOG" "M46-SMOKE: ok nice-biasing" "nice value biases cooperative stride scheduling"
 check_output "$LOG" "M46-SMOKE: done" "M46 conformance suite completes"
+# ── M57: multiprocess broker primitives (fork/exec/FD inheritance + brokering) ──
+check_output "$LOG" "M57-SMOKE: ok fork-fdshare" "fork shares the open-file-description file offset with the child"
+check_output "$LOG" "M57-SMOKE: ok cloexec" "FD_CLOEXEC via F_SETFD/O_CLOEXEC round-trips through F_GETFD"
+check_output "$LOG" "M57-SMOKE: ok exec-inherit" "non-CLOEXEC fd and dup2-stdio survive execve while CLOEXEC fd is closed"
+check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a live fd to a forked child"
+check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
+check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
+check_output "$LOG" "M57-SMOKE: done" "M57 broker-primitive suite completes"
 # ── bash: GNU bash 5.2 port (default shell) ──
 check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"
 check_output "$LOG" "BASH-SMOKE: ok arrays" "bash indexed arrays work"
@@ -1422,6 +1452,10 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "M55-IOSTREAM: ok sstream" "M55 C++: std::ostringstream/istringstream round-trip"
 	check_output "$LOG" "M55-IOSTREAM: ok cin" "M55 C++: std::cin extraction from a real fd 0 (piped stdin)"
 	check_output "$LOG" "M55-IOSTREAM: ok filesystem" "M55 C++: std::filesystem create/iterate/stat/remove over VFS"
+	check_output "$LOG" "M58-SMOKE: ok eval" "M58 JS: /bin/js (Duktape) evaluates arithmetic + String method"
+	check_output "$LOG" "M58-SMOKE: ok json" "M58 JS: JSON.parse/stringify round-trip"
+	check_output "$LOG" "M58-SMOKE: ok print" "M58 JS: print()/console.log native binding"
+	check_output "$LOG" "M58-SMOKE: done" "M58 JS: all interpreter checks passed"
 	check_output "$LOG" "M51-GFX: ok libm" "M51: ported libm (openlibm) runtime math"
 	check_output "$LOG" "M51-GFX: ok pixman" "M51: ported pixman compositing"
 	check_output "$LOG" "M51-GFX: ok freetype" "M51: ported FreeType glyph rasterization"

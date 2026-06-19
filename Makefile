@@ -39,6 +39,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m13_job_control \
 	m14_smoke \
 	m15_smoke \
+	m56_smoke \
 	m17_smoke \
 	m24b_smoke \
 	m25_smoke \
@@ -71,11 +72,13 @@ EMBEDDED_USER_PROGRAMS := \
 	m38_sound \
 	m42_w5pre_smoke \
 	m46_smoke \
+	m57_smoke \
 	m47_smoke \
 	m48_smoke \
 	m49_smoke \
 	m49_libwayland \
 	m49_libwayland_server \
+	m_posixmm_smoke \
 	m50_smoke \
 	m51_smoke \
 	m51_pixman_smoke \
@@ -89,9 +92,12 @@ EMBEDDED_USER_PROGRAMS := \
 	m52_gl_smoke \
 	m52_osmesa \
 	m52_glsl \
+	m59_smoke \
 	cxx_smoke \
 	m55_iostream \
 	m55_litehtml \
+	js \
+	m58_smoke \
 	displayd \
 	gclock \
 	gterm \
@@ -262,6 +268,7 @@ KERNEL_SOURCES := \
 	kernel/fs/aio.c \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
+	kernel/fs/eventpoll.c \
 	kernel/fs/fat32.c \
 	kernel/fs/isofs.c \
 	kernel/fs/exfat.c \
@@ -486,6 +493,16 @@ LIBM_LIB := build/openlibm-b1nix/$(B1NIX_TRIPLET)/install/lib/libm.a
 $(LIBM_LIB): tools/build-openlibm.sh
 	B1NIX_ARCH=$(ARCH) tools/build-openlibm.sh >/dev/null
 
+# M58: /bin/js embeds Duktape and links the ported openlibm — so libm must be
+# built before js. js.c links duktape.c (a vendored amalgamation under
+# userspace/duktape/), both compiled by the userspace Makefile's custom rule.
+$(BUILD_DIR)/initramfs_js.inc: userspace/bin/js.c userspace/duktape/duktape.c \
+		userspace/duktape/duktape.h userspace/duktape/duk_config.h \
+		$(USERSPACE_DEPS) $(LIBM_LIB)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/js
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_js_elf userspace/build/$(ARCH)/bin/js > $@
+
 $(BUILD_DIR)/initramfs_m51_smoke.inc: userspace/bin/m51_smoke.c $(USERSPACE_DEPS) $(LIBM_LIB)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_smoke
 	@mkdir -p $(dir $@)
@@ -606,6 +623,15 @@ $(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/build-m52-gl
 	B1NIX_ARCH=$(ARCH) tools/build-m52-glsl.sh userspace/build/$(ARCH)/bin/m52_glsl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
+
+# M59: EGL over the real Mesa OSMesa softpipe. tools/build-m59-egl.sh compiles
+# the OSMesa-backed EGL implementation (userspace/libegl/b1egl_mesa.c) together
+# with the off-screen pbuffer smoke and links them against the same Mesa stack
+# as the M52 OSMesa demo. The smoke renders entirely off-screen (no displayd).
+$(BUILD_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/build-m59-egl.sh tools/build-mesa.sh $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/build-m59-egl.sh userspace/build/$(ARCH)/bin/m59_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m59_smoke_elf userspace/build/$(ARCH)/bin/m59_smoke > $@
 
 # M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
 # tools/build-m55-litehtml.sh builds litehtml+gumbo (build-litehtml.sh) and

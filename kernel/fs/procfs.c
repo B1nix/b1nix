@@ -482,8 +482,15 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
     perms[2] = (v->prot & 0x4) ? 'x' : '-'; /* PROT_EXEC  */
     perms[3] = (v->flags & 0x1) ? 's' : 'p'; /* MAP_SHARED/PRIVATE */
     perms[4] = '\0';
-    sb_addf(s, "%lx-%lx %s %lx %s\n", (unsigned long)v->start,
-            (unsigned long)v->end, perms, (unsigned long)v->offset,
+    /* Linux-format maps line: "start-end perms offset major:minor inode path".
+     * V8 (and pmap/lsof/glibc backtrace) parse the dev + inode columns
+     * strictly — emit them or the parse aborts. b1nix has no per-VMA block-dev,
+     * so dev is 00:00; inode is the real vfs inode for file-backed maps.
+     * ponytail: dev stays 00:00 until a tool needs real major:minor. */
+    unsigned long ino =
+        (v->node && v->node->inode) ? (unsigned long)v->node->inode->ino : 0;
+    sb_addf(s, "%lx-%lx %s %lx 00:00 %lu %s\n", (unsigned long)v->start,
+            (unsigned long)v->end, perms, (unsigned long)v->offset, ino,
             v->node ? "[file]" : "[anon]");
   }
   return 0;

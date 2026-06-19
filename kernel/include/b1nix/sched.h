@@ -121,6 +121,22 @@ struct cpu_context {
 #define SA_NODEFER 0x40000000
 #define SA_RESETHAND 0x80000000
 
+/* sigaltstack ss_flags and minimum size (must match userspace signal.h). */
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#define MINSIGSTKSZ 2048
+
+/* Alternate signal stack descriptor. Layout MUST match userspace stack_t
+ * (signal.h): { void *ss_sp; int ss_flags; unsigned long ss_size; }. Use
+ * pointer-width (usize) for ss_sp/ss_size so the byte layout is identical on
+ * both the 64-bit and 32-bit ABIs — the syscall copies sizeof(kstack_t) bytes
+ * straight from the user struct. */
+typedef struct {
+  usize ss_sp;   /* user pointer to the base of the alt stack */
+  int ss_flags;  /* SS_DISABLE / SS_ONSTACK (query-only) */
+  usize ss_size; /* size of the alt stack in bytes */
+} kstack_t;
+
 typedef void (*sighandler_t)(int);
 
 struct vm_area {
@@ -271,6 +287,14 @@ u64  task_saved_sigmask(const struct task *t);
 int  task_has_saved_sigmask(const struct task *t);
 void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);
 void task_clear_saved_sigmask(struct task *t);
+/* sigaltstack side-table (per-task, NOT a struct task field). */
+void task_get_altstack(const struct task *t, kstack_t *out);
+int  task_set_altstack(struct task *t, const kstack_t *ss);
+/* Returns the top (highest address) of the registered alt stack, or 0 if no
+ * usable alt stack is set. Signal delivery uses this to honor SA_ONSTACK. */
+u64  task_altstack_top(const struct task *t);
+/* Non-zero if `sp` lies within the registered alt stack range. */
+int  task_on_altstack(const struct task *t, u64 sp);
 u64  task_alarm_ticks(const struct task *t);
 void task_set_alarm_ticks(struct task *t, u64 ticks);
 usize task_tgid(const struct task *t);
@@ -415,6 +439,9 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
 int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset);
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
+/* M56 signalfd helpers. */
+u64  scheduler_peek_pending_signals(u64 mask);
+int  scheduler_consume_pending_signal(int sig);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
 void scheduler_set_user_image(void *image);

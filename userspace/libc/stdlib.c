@@ -1059,6 +1059,16 @@ int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact)
 	return rc;
 }
 
+int sigaltstack(const stack_t *ss, stack_t *old_ss)
+{
+	int rc = (int)syscall(SYS_SIGALTSTACK, (long)ss, (long)old_ss, 0);
+	if (rc < 0) {
+		errno = normalize_errno(rc);
+		return -1;
+	}
+	return 0;
+}
+
 int errno = 0;
 
 /* POSIX semaphores, futex-backed. The sem_t is a single int holding the count

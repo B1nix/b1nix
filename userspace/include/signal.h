@@ -90,6 +90,19 @@ struct sigaction {
     sigset_t sa_mask;
 };
 
+/* Alternate signal stack (sigaltstack). ss_flags bits and the minimum stack
+ * size must match the kernel (kernel/include/b1nix/sched.h). */
+#define SS_ONSTACK 1
+#define SS_DISABLE 2
+#define MINSIGSTKSZ 2048
+#define SIGSTKSZ    8192
+
+typedef struct {
+    void  *ss_sp;
+    int    ss_flags;
+    unsigned long ss_size;
+} stack_t;
+
 sighandler_t signal(int signum, sighandler_t handler);
 int sigemptyset(sigset_t *set);
 int sigaddset(sigset_t *set, int signum);
@@ -100,6 +113,7 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *oldset);
 int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigsuspend(const sigset_t *mask);
+int sigaltstack(const stack_t *ss, stack_t *old_ss);
 #ifdef __cplusplus
 }
 #endif

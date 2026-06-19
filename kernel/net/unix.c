@@ -76,6 +76,24 @@ int unix_init_state(struct vfs_socket_state *s) {
   return 0;
 }
 
+/* socketpair(): cross-connect two freshly-created AF_UNIX sockets without going
+ * through bind/listen/connect/accept (no filesystem name). Each side becomes
+ * the other's connected peer, mirroring what unix_accept establishes. Each
+ * direction is a counted reference, so a close on one end runs through
+ * unix_free_state exactly as a path-connected pair would (waking the survivor,
+ * releasing any in-flight SCM_RIGHTS handles). Both states must already be
+ * AF_UNIX with unix_init_state run. */
+void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b) {
+  struct unix_socket_data *ua = (struct unix_socket_data *)a->unix_data;
+  struct unix_socket_data *ub = (struct unix_socket_data *)b->unix_data;
+  ua->peer = ub;
+  unix_data_get(ub); /* a->peer holds a reference on b */
+  ub->peer = ua;
+  unix_data_get(ua); /* b->peer holds a reference on a */
+  a->connected = 1;
+  b->connected = 1;
+}
+
 void unix_free_state(struct vfs_socket_state *s) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   if (!u) return;

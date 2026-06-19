@@ -665,11 +665,73 @@ int vfs_socket(int domain, int type, int protocol) {
   vfs_socket_init_handle(h, socket);
   
   int fd = scheduler_fd_alloc(h);
-  if (fd < 0) { 
-    vfs_handle_release(h); 
-    return -EMFILE; 
+  if (fd < 0) {
+    vfs_handle_release(h);
+    return -EMFILE;
   }
   return fd;
+}
+
+/* socketpair(domain, type, protocol, sv[2]). Only AF_UNIX is supported (the
+ * one POSIX requires). Creates two connected sockets, installs them as fds in
+ * sv. On any failure nothing is left installed and no handle leaks. The two
+ * sockets tear down independently through socket_release -> unix_free_state,
+ * so closing one wakes the other and releases any in-flight SCM_RIGHTS fds. */
+int vfs_socketpair(int domain, int type, int protocol, int sv[2]) {
+  if (domain != B1NIX_AF_UNIX)
+    return -EAFNOSUPPORT;
+  if (type != B1NIX_SOCK_STREAM && type != B1NIX_SOCK_DGRAM)
+    return -ESOCKTNOSUPPORT;
+
+  struct vfs_handle *ha = 0, *hb = 0;
+  struct vfs_socket_state *sa = 0, *sb = 0;
+  int fda = -1, fdb = -1;
+
+  ha = alloc_raw_handle(VFS_HANDLE_SOCKET);
+  if (!ha) goto fail;
+  hb = alloc_raw_handle(VFS_HANDLE_SOCKET);
+  if (!hb) goto fail;
+
+  sa = kzalloc(sizeof(*sa));
+  if (!sa) goto fail;
+  sb = kzalloc(sizeof(*sb));
+  if (!sb) goto fail;
+
+  sa->domain = sb->domain = domain;
+  sa->type = sb->type = type;
+  sa->protocol = sb->protocol = protocol;
+
+  if (unix_init_state(sa) < 0) { kfree(sa); sa = 0; goto fail; }
+  if (unix_init_state(sb) < 0) { kfree(sb); sb = 0; goto fail; }
+
+  unix_link_pair(sa, sb);
+
+  vfs_socket_init_handle(ha, sa);
+  vfs_socket_init_handle(hb, sb);
+  sa = sb = 0; /* ownership transferred to the handles */
+
+  fda = scheduler_fd_alloc(ha);
+  if (fda < 0) goto fail;
+  fdb = scheduler_fd_alloc(hb);
+  if (fdb < 0) goto fail;
+
+  sv[0] = fda;
+  sv[1] = fdb;
+  return 0;
+
+fail:
+  /* If fds were installed, releasing them tears down the (linked) state via
+   * the normal close path; otherwise release the still-private handles/states
+   * directly. */
+  if (fda >= 0) {
+    vfs_close(fda);
+    ha = 0;
+  }
+  if (sa) { unix_free_state(sa); kfree(sa); }
+  if (sb) { unix_free_state(sb); kfree(sb); }
+  if (ha) vfs_handle_release(ha);
+  if (hb) vfs_handle_release(hb);
+  return -EMFILE;
 }
 
 int vfs_bind(int fd, const void *addr, usize addrlen) {

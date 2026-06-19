@@ -60,6 +60,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/regex.o \
 	$(BUILD)/libc/mntent.o \
 	$(BUILD)/libc/statvfs.o \
+	$(BUILD)/libc/eventpoll.o \
 	$(BUILD)/libc/div64.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
@@ -75,6 +76,7 @@ BINARIES := \
 	$(BUILD)/bin/m13_job_control \
 	$(BUILD)/bin/m14_smoke \
 	$(BUILD)/bin/m15_smoke \
+	$(BUILD)/bin/m56_smoke \
 	$(BUILD)/bin/m8_aio_test \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync \
@@ -118,13 +120,21 @@ BINARIES := \
 BINARIES += $(BUILD)/bin/m48_smoke
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server
+BINARIES += $(BUILD)/bin/m57_smoke
+# M58: standalone JavaScript interpreter (embeds Duktape) + its smoke test.
+BINARIES += $(BUILD)/bin/js
+BINARIES += $(BUILD)/bin/m58_smoke
+# POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
+BINARIES += $(BUILD)/bin/m_posixmm_smoke
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
 DYNAMIC_TARGETS := $(SHARED_LIBC)
 endif
 
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic,$(BINARIES)))
+# /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
+# the generic single-source BIN_OBJS pattern.
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js,$(BINARIES)))
 DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -247,6 +257,25 @@ $(BUILD)/bin/m53_httpsd: bin/m53_httpsd.c $(LIB) $(CRT0) $(LINKER) $(wildcard $(
 	  $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
 	  --whole-archive $(LIB) --no-whole-archive
 
+
+# M58: /bin/js — standalone JavaScript interpreter embedding Duktape 2.7.0.
+# Duktape is a single-file ANSI C amalgamation; it compiles fine with the same
+# freestanding clang path as the rest of userspace. It needs a handful of libm
+# functions (pow/floor/ceil/fmod/...), supplied by the ported openlibm. The
+# duktape.c object is large (~600KB) and slow-ish to build, so it is compiled
+# once into its own .o and linked into js.
+DUK_DIR := duktape
+$(BUILD)/duktape/duktape.o: $(DUK_DIR)/duktape.c $(DUK_DIR)/duktape.h $(DUK_DIR)/duk_config.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -Wno-unused-parameter -Wno-unused-but-set-variable \
+	  -Wno-tautological-constant-out-of-range-compare -I $(DUK_DIR) -c $< -o $@
+
+$(BUILD)/bin/js: bin/js.c $(BUILD)/duktape/duktape.o $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -I $(DUK_DIR) -c $< -o $(BUILD)/bin/js.o
+	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/js.o \
+	  $(BUILD)/duktape/duktape.o $(LIBM_DIR)/lib/libm.a \
+	  --whole-archive $(LIB) --no-whole-archive
 
 # M51: m51_smoke links the ported static libm (openlibm).
 LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install

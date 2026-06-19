@@ -52,6 +52,10 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
   )
 fi
 
-make -C "$BUILD_DIR" -j"${JOBS:-4}" 1>&2
+# libffi's Makefile has a parallel-build race: the archiving step (ar) can fire
+# before src/x86/sysv.o is assembled, so a clean -j build fails with
+# "src/x86/sysv.o: No such file". libffi is tiny — build it serially to avoid
+# the race entirely. ponytail: -j1 here, the few seconds lost are irrelevant.
+make -C "$BUILD_DIR" -j1 1>&2
 make -C "$BUILD_DIR" install 1>&2
 echo "$INSTALL_DIR"

@@ -23,7 +23,11 @@ shim. The list below is the honest delta from a full compositor.
   enter/motion/leave + `drop`, each carrying a server-made `data_offer` that
   mirrors the source MIME and `source_actions`; the source sees
   `dnd_drop_performed` / `dnd_finished` / `cancelled`; `data_offer`
-  accept/finish/set_actions are handled.
+  accept/finish/set_actions are handled. (Test coverage caveat: `m49_smoke`
+  only asserts that the `start_drag` grab is accepted — the full cross-client
+  enter/motion/drop offer delivery needs the pointer over a second client's
+  surface, which the headless smoke can't stage, so that path is exercised at
+  runtime under real input, not in the smoke.)
 - `wp_viewporter` (`set_source` ignored at scale 1, `set_destination` stored as
   the on-screen extent), `wl_subcompositor` (`get_subsurface` / `set_position`,
   composited relative to the parent), `wp_presentation` (advertises

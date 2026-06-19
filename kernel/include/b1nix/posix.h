@@ -30,7 +30,22 @@
 #define B1NIX_F_GETLK 5
 #define B1NIX_F_SETLK 6
 #define B1NIX_F_SETLKW 7
+/* F_DUPFD_CLOEXEC: duplicate to lowest fd >= arg with FD_CLOEXEC set. Linux
+ * uses 1030; matched here so glibc/musl broker code (base/posix) works. */
+#define B1NIX_F_DUPFD_CLOEXEC 1030
 #define B1NIX_FD_CLOEXEC 1
+
+/* M56 file sealing (memfd). Linux ABI values. */
+#define B1NIX_F_ADD_SEALS 1033
+#define B1NIX_F_GET_SEALS 1034
+#define B1NIX_F_SEAL_SEAL   0x0001 /* prevent further seals from being set */
+#define B1NIX_F_SEAL_SHRINK 0x0002 /* prevent file from shrinking */
+#define B1NIX_F_SEAL_GROW   0x0004 /* prevent file from growing */
+#define B1NIX_F_SEAL_WRITE  0x0008 /* prevent writes */
+
+/* M56 memfd_create flags (Linux ABI). */
+#define B1NIX_MFD_CLOEXEC       0x0001
+#define B1NIX_MFD_ALLOW_SEALING 0x0002
 
 #define B1NIX_AF_UNIX 1
 #define B1NIX_AF_LOCAL B1NIX_AF_UNIX
@@ -217,6 +232,81 @@ struct b1nix_pollfd {
 struct timespec {
   i64 tv_sec;
   i64 tv_nsec;
+};
+
+/* M56 eventfd flags (Linux ABI). EFD_SEMAPHORE changes read semantics to a
+ * decrement-by-one. */
+#define B1NIX_EFD_SEMAPHORE 0x00000001
+#define B1NIX_EFD_CLOEXEC   0x00080000
+#define B1NIX_EFD_NONBLOCK  0x00000800
+
+/* M56 timerfd: clockids + flags (Linux ABI). Only relative arming is honored
+ * (TFD_TIMER_ABSTIME is accepted but treated relative — b1nix has a single
+ * monotonic tick base). */
+#define B1NIX_CLOCK_REALTIME      0
+#define B1NIX_CLOCK_MONOTONIC     1
+#define B1NIX_TFD_CLOEXEC         0x00080000
+#define B1NIX_TFD_NONBLOCK        0x00000800
+#define B1NIX_TFD_TIMER_ABSTIME   0x00000001
+
+/* M56 signalfd flags (Linux ABI). */
+#define B1NIX_SFD_CLOEXEC  0x00080000
+#define B1NIX_SFD_NONBLOCK 0x00000800
+
+/* M56 epoll flags + ops (Linux ABI). */
+#define B1NIX_EPOLL_CLOEXEC 0x00080000
+#define B1NIX_EPOLL_CTL_ADD 1
+#define B1NIX_EPOLL_CTL_DEL 2
+#define B1NIX_EPOLL_CTL_MOD 3
+/* epoll event masks reuse the poll bits plus the edge-triggered modifier. */
+#define B1NIX_EPOLLIN  0x001
+#define B1NIX_EPOLLOUT 0x004
+#define B1NIX_EPOLLERR 0x008
+#define B1NIX_EPOLLHUP 0x010
+#define B1NIX_EPOLLPRI 0x002
+#define B1NIX_EPOLLRDHUP 0x2000
+#define B1NIX_EPOLLET  (1u << 31)
+#define B1NIX_EPOLLONESHOT (1u << 30)
+
+/* Packed to match the Linux x86_64 ABI (12 bytes: no padding between the
+ * 4-byte events word and the 8-byte data union). The same layout is used on
+ * i386 where the struct is naturally 12 bytes. */
+struct b1nix_epoll_event {
+  u32 events;
+  union {
+    u64 u64;
+    void *ptr;
+    int fd;
+    u32 u32;
+  } data;
+} __attribute__((packed));
+
+struct b1nix_itimerspec {
+  struct timespec it_interval; /* period for repeating timers */
+  struct timespec it_value;    /* initial expiration */
+};
+
+/* signalfd read record (Linux struct signalfd_siginfo is 128 bytes; b1nix
+ * fills the fields it tracks and zero-pads the rest so the size matches). */
+struct b1nix_signalfd_siginfo {
+  u32 ssi_signo;
+  i32 ssi_errno;
+  i32 ssi_code;
+  u32 ssi_pid;
+  u32 ssi_uid;
+  i32 ssi_fd;
+  u32 ssi_tid;
+  u32 ssi_band;
+  u32 ssi_overrun;
+  u32 ssi_trapno;
+  i32 ssi_status;
+  i32 ssi_int;
+  u64 ssi_ptr;
+  u64 ssi_utime;
+  u64 ssi_stime;
+  u64 ssi_addr;
+  u16 ssi_addr_lsb;
+  u8  pad[46];
 };
 
 struct timeval {

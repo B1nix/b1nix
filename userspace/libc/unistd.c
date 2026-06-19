@@ -1,5 +1,6 @@
 #include "syscall.h"
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <fcntl.h>
 #include <stdarg.h>
 #include <string.h>
@@ -513,6 +514,10 @@ int munmap(void *addr, size_t length) {
   return _check_err(syscall(SYS_MUNMAP, addr, length));
 }
 
+int madvise(void *addr, size_t length, int advice) {
+  return _check_err(syscall(SYS_MADVISE, addr, length, advice));
+}
+
 /* M32: select() — fd-readiness multiplex. Converts tv to ms (with NULL ⇒
  * wait forever, matching the b1nix poll convention). */
 #include <sys/select.h>
@@ -573,6 +578,10 @@ int lremovexattr(const char *path, const char *name) {
 
 int socket(int domain, int type, int protocol) {
   return _check_err(syscall(SYS_SOCKET, domain, type, protocol));
+}
+
+int socketpair(int domain, int type, int protocol, int sv[2]) {
+  return _check_err(syscall(SYS_SOCKETPAIR, domain, type, protocol, sv));
 }
 
 int bind(int fd, const struct sockaddr *addr, socklen_t addrlen) {

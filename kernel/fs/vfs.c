@@ -2542,6 +2542,11 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
   if (!h->node)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
+  /* M56 sealing: a sealed-for-write memfd rejects all writes (EPERM). */
+  if (node->inode->seals & B1NIX_F_SEAL_WRITE) {
+    vfs_node_put(node);
+    return -EPERM;
+  }
   vfs_inode_lock(node->inode);
   /* O_APPEND: sample the size under the exclusive inode lock. Reading it
    * before the lock loses concurrent appends — a writer blocked on the lock
@@ -4101,6 +4106,18 @@ int vfs_ftruncate(int fd, u64 length) {
     return -EINVAL;
   }
 
+  /* M56 sealing: F_SEAL_SHRINK forbids reducing size, F_SEAL_GROW forbids
+   * increasing it. F_SEAL_WRITE also blocks any size change. */
+  if ((inode->seals & B1NIX_F_SEAL_SHRINK) && length < (u64)inode->size) {
+    vfs_inode_unlock(inode);
+    return -EPERM;
+  }
+  if ((inode->seals & (B1NIX_F_SEAL_GROW | B1NIX_F_SEAL_WRITE)) &&
+      length > (u64)inode->size) {
+    vfs_inode_unlock(inode);
+    return -EPERM;
+  }
+
   if (length > MAX_FILE_SIZE) {
     vfs_inode_unlock(inode);
     return -EFBIG;
@@ -4209,7 +4226,7 @@ static isize memfd_write(struct vfs_node *node, u64 offset,
 }
 
 int vfs_memfd_create(const char *name, u32 flags) {
-  if (flags & ~1u)
+  if (flags & ~(u32)(B1NIX_MFD_CLOEXEC | B1NIX_MFD_ALLOW_SEALING))
     return -EINVAL;
 
   struct vfs_node *node = vfs_create_node(VFS_FILE);
@@ -4220,6 +4237,9 @@ int vfs_memfd_create(const char *name, u32 flags) {
   node->deleted = 1;
   node->inode->nlink = 0;
   node->inode->mode = 0600;
+  /* M56: only memfds created with MFD_ALLOW_SEALING accept F_ADD_SEALS. */
+  node->inode->seals_allowed = (flags & B1NIX_MFD_ALLOW_SEALING) ? 1 : 0;
+  node->inode->seals = 0;
   const struct cred *cred = get_current_cred();
   node->inode->uid = cred ? cred->euid : ROOT_UID;
   node->inode->gid = cred ? cred->egid : ROOT_GID;
@@ -4242,7 +4262,7 @@ int vfs_memfd_create(const char *name, u32 flags) {
     vfs_handle_release(h);
     return fd == -ENOMEM ? -ENOMEM : -EMFILE;
   }
-  if (flags & 1u)
+  if (flags & B1NIX_MFD_CLOEXEC)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   return fd;
 }
@@ -4254,6 +4274,16 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
   switch (cmd) {
   case B1NIX_F_DUPFD:
     return vfs_dup_min(fd, (int)arg);
+  case B1NIX_F_DUPFD_CLOEXEC: {
+    /* Like F_DUPFD, but the new descriptor has FD_CLOEXEC set. The new fd is a
+     * fresh table slot (fd_flags zeroed by scheduler_fd_set/alloc), so we set
+     * the flag explicitly after the dup. Used by the multiprocess broker model
+     * (base/posix) to hand a child a descriptor that won't leak across exec. */
+    int newfd = vfs_dup_min(fd, (int)arg);
+    if (newfd >= 0)
+      scheduler_fd_flags_set(newfd, B1NIX_FD_CLOEXEC);
+    return newfd;
+  }
   case B1NIX_F_GETFD:
     return scheduler_fd_flags_get(fd);
   case B1NIX_F_SETFD:
@@ -4263,6 +4293,10 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
   case B1NIX_F_SETFL:
     h->flags = (int)arg;
     return 0;
+  case B1NIX_F_ADD_SEALS:
+    return vfs_fcntl_add_seals(fd, (u32)arg);
+  case B1NIX_F_GET_SEALS:
+    return vfs_fcntl_get_seals(fd);
   case B1NIX_F_GETLK:
   case B1NIX_F_SETLK:
   case B1NIX_F_SETLKW:

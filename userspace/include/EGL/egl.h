@@ -51,6 +51,24 @@ typedef unsigned int EGLenum;
 #define EGL_OPENGL_API 0x30A2
 #define EGL_OPENGL_ES_API 0x30A0
 
+/* EGL 1.4/1.5 additions used by the OSMesa-backed (off-screen pbuffer) path
+ * implemented in b1egl_mesa.c. Window-only TinyGL (b1egl.c) ignores these. */
+#define EGL_BAD_CONFIG 0x3005
+#define EGL_BAD_ATTRIBUTE 0x3004
+#define EGL_BAD_PARAMETER 0x300C
+#define EGL_PBUFFER_BIT 0x0001
+#define EGL_CONFIG_ID 0x3028
+#define EGL_NATIVE_VISUAL_ID 0x302E
+#define EGL_BUFFER_SIZE 0x3020
+#define EGL_STENCIL_SIZE 0x3026
+#define EGL_SAMPLES 0x3031
+#define EGL_CONFORMANT 0x3042
+#define EGL_CLIENT_APIS 0x308D
+#define EGL_EXTENSIONS 0x3055
+#define EGL_CONTEXT_CLIENT_VERSION 0x3098
+#define EGL_CONTEXT_MAJOR_VERSION 0x3098
+#define EGL_LARGEST_PBUFFER 0x3058
+
 EGLDisplay eglGetDisplay(EGLNativeDisplayType display_id);
 EGLBoolean eglInitialize(EGLDisplay dpy, EGLint *major, EGLint *minor);
 EGLBoolean eglTerminate(EGLDisplay dpy);
@@ -75,9 +93,20 @@ EGLBoolean eglMakeCurrent(EGLDisplay dpy, EGLSurface draw, EGLSurface read,
 EGLBoolean eglSwapBuffers(EGLDisplay dpy, EGLSurface surface);
 EGLint eglGetError(void);
 
+/* Off-screen rendering target. Backed by an OSMesa color buffer (b1egl_mesa.c);
+ * a no-op stub in the TinyGL window-only build (b1egl.c). */
+EGLSurface eglCreatePbufferSurface(EGLDisplay dpy, EGLConfig config,
+                                   const EGLint *attrib_list);
+
 /* b1nix extension: which path eglSwapBuffers used last (1 = GPU/VirGL,
  * 0 = software). Lets a smoke test verify acceleration kicked in. */
 int eglB1nixAccelerated(EGLDisplay dpy);
+
+/* b1nix extension: return a pointer to the surface's CPU-visible color buffer
+ * (ARGB32, 0xAARRGGBB, row-major top-down). NULL if unsupported. Lets an
+ * off-screen smoke read back rendered pixels without a window/displayd. */
+const uint32_t *eglB1nixSurfacePixels(EGLDisplay dpy, EGLSurface surface,
+                                      EGLint *width, EGLint *height);
 
 #ifdef __cplusplus
 }

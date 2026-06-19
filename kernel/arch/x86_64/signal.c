@@ -22,6 +22,14 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
 
   /* Preserve x86_64 SysV red zone (128 bytes below RSP). */
   u64 user_rsp = frame->rsp - 128;
+  /* SA_ONSTACK: if the handler asked for the alternate signal stack and one is
+   * registered, deliver the frame at the top of that stack instead — unless we
+   * are already executing on it (POSIX: do not nest onto the alt stack). */
+  if ((sa->sa_flags & SA_ONSTACK) && !task_on_altstack(t, frame->rsp)) {
+    u64 alt_top = task_altstack_top(t);
+    if (alt_top)
+      user_rsp = alt_top;
+  }
   u64 frame_base = (user_rsp - sizeof(struct b1nix_sigframe)) & ~0xFULL;
   u64 restorer_slot = frame_base - sizeof(u64);
 

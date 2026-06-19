@@ -78,7 +78,26 @@ extern u64 g_direct_map_size;
 #define MAP_PRIVATE 0x02
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED 0x10
+/* MAP_NORESERVE: do not reserve swap/commit up front. b1nix anonymous mappings
+ * already commit lazily on first touch (the page-fault handler zero-fills the
+ * faulting page), so this flag selects exactly that existing behavior — we just
+ * accept it instead of rejecting it. No reservation accounting is faked. */
+#define MAP_NORESERVE 0x4000
 #define MAP_FAILED ((void *)-1)
+
+/* madvise() advice values (Linux ABI numbers). */
+#define MADV_NORMAL     0
+#define MADV_RANDOM     1
+#define MADV_SEQUENTIAL 2
+#define MADV_WILLNEED   3
+#define MADV_DONTNEED   4
+#define MADV_FREE       8
+/* Advisory hints accepted as a legal POSIX no-op (b1nix has no fork-inherit
+ * control or transparent hugepages — the kernel just acknowledges them). */
+#define MADV_DONTFORK   10
+#define MADV_DOFORK     11
+#define MADV_HUGEPAGE   14
+#define MADV_NOHUGEPAGE 15
 
 // Page fault error code bits
 #define PF_PRESENT (1ULL << 0)

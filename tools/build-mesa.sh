@@ -152,8 +152,11 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
 fi
 
 # Build the static libraries. The final libOSMesa.so link fails on purpose
-# (static-only b1nix); every .a we need is produced before it, so ignore it.
-( cd "$MESON_BUILD" && ninja 1>&2 ) || true
+# (static-only b1nix). Some driver archives (e.g. libvirgl.a) are scheduled
+# AFTER that .so in ninja order, so a plain `ninja` would abort on the expected
+# .so failure and never build them. `-k 0` keeps going past the failure and
+# builds every reachable target; the `|| true` swallows the final nonzero exit.
+( cd "$MESON_BUILD" && ninja -k 0 1>&2 ) || true
 
 # Repack thin archives into relocatable thick archives in install/lib.
 rm -f "$INSTALL_DIR"/lib/*.a

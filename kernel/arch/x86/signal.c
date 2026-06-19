@@ -21,6 +21,13 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
 
   /* 32-bit: no red zone. */
   u32 user_esp = frame->esp;
+  /* SA_ONSTACK: deliver onto the alternate signal stack when one is registered
+   * and we are not already running on it (POSIX: do not nest onto it). */
+  if ((sa->sa_flags & SA_ONSTACK) && !task_on_altstack(t, frame->esp)) {
+    u64 alt_top = task_altstack_top(t);
+    if (alt_top)
+      user_esp = (u32)alt_top;
+  }
   u32 frame_base = (user_esp - sizeof(struct b1nix_sigframe)) & ~0xF;
   u32 restorer_slot = frame_base - 8;
 

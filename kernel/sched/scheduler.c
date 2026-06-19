@@ -97,6 +97,11 @@ static u64  g_task_tls_base[MAX_TASKS];
 static u64  g_task_child_tid_clear[MAX_TASKS];
 static u64  g_task_saved_sigmask[MAX_TASKS];
 static int  g_task_has_saved_sigmask[MAX_TASKS];
+/* sigaltstack side-table (per-task alternate signal stack). Kept here, NOT in
+ * struct task, to preserve the M29 paging invariant. ss_size == 0 means no alt
+ * stack is registered. */
+static u64  g_task_altstack_sp[MAX_TASKS];
+static u64  g_task_altstack_size[MAX_TASKS];
 static u64  g_task_alarm_ticks[MAX_TASKS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
@@ -252,6 +257,8 @@ static struct task *find_unused_task(void) {
       g_task_child_tid_clear[i] = 0;
       g_task_saved_sigmask[i] = 0;
       g_task_has_saved_sigmask[i] = 0;
+      g_task_altstack_sp[i] = 0;
+      g_task_altstack_size[i] = 0;
       g_task_alarm_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
@@ -296,6 +303,8 @@ static struct task *find_unused_task(void) {
   g_task_child_tid_clear[i] = 0;
   g_task_saved_sigmask[i] = 0;
   g_task_has_saved_sigmask[i] = 0;
+  g_task_altstack_sp[i] = 0;
+  g_task_altstack_size[i] = 0;
   g_task_alarm_ticks[i] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
@@ -622,6 +631,8 @@ void scheduler_init(void) {
   g_task_child_tid_clear[0] = 0;
   g_task_saved_sigmask[0] = 0;
   g_task_has_saved_sigmask[0] = 0;
+  g_task_altstack_sp[0] = 0;
+  g_task_altstack_size[0] = 0;
   g_task_alarm_ticks[0] = 0;
   g_task_tgid[0] = boot->id;
   g_task_ctty_type[0] = 1; /* 1 = console */
@@ -947,6 +958,10 @@ int scheduler_fork_current(void) {
   usize c_idx = task_index(child);
   g_task_saved_sigmask[c_idx] = 0;
   g_task_has_saved_sigmask[c_idx] = 0;
+  /* POSIX: the alternate signal stack is inherited across fork (the child's
+   * address space is a copy, so the same user range is valid). */
+  g_task_altstack_sp[c_idx] = g_task_altstack_sp[p_idx];
+  g_task_altstack_size[c_idx] = g_task_altstack_size[p_idx];
   g_task_alarm_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
@@ -1229,6 +1244,57 @@ void task_clear_saved_sigmask(struct task *t) {
   if (!t) return;
   g_task_has_saved_sigmask[task_index(t)] = 0;
 }
+
+/* sigaltstack side-table accessors. ss_size == 0 means "no alt stack". When a
+ * task is currently executing on its alt stack, sigaltstack() reports
+ * SS_ONSTACK and changing it is forbidden — but b1nix delivers one signal frame
+ * at a time and the alt stack is consulted only at delivery, so the
+ * "executing on the stack" state is derived from the live user SP rather than
+ * stored. */
+void task_get_altstack(const struct task *t, kstack_t *out) {
+  if (!out) return;
+  if (!t || g_task_altstack_size[task_index(t)] == 0) {
+    out->ss_sp = 0;
+    out->ss_size = 0;
+    out->ss_flags = SS_DISABLE;
+    return;
+  }
+  usize i = task_index(t);
+  out->ss_sp = g_task_altstack_sp[i];
+  out->ss_size = g_task_altstack_size[i];
+  out->ss_flags = 0;
+}
+
+int task_set_altstack(struct task *t, const kstack_t *ss) {
+  if (!t || !ss) return -1;
+  usize i = task_index(t);
+  if (ss->ss_flags & SS_DISABLE) {
+    g_task_altstack_sp[i] = 0;
+    g_task_altstack_size[i] = 0;
+    return 0;
+  }
+  if (ss->ss_size < MINSIGSTKSZ)
+    return -1; /* caller maps this to ENOMEM */
+  g_task_altstack_sp[i] = ss->ss_sp;
+  g_task_altstack_size[i] = ss->ss_size;
+  return 0;
+}
+
+u64 task_altstack_top(const struct task *t) {
+  if (!t) return 0;
+  usize i = task_index(t);
+  if (g_task_altstack_size[i] == 0) return 0;
+  return g_task_altstack_sp[i] + g_task_altstack_size[i];
+}
+
+int task_on_altstack(const struct task *t, u64 sp) {
+  if (!t) return 0;
+  usize i = task_index(t);
+  if (g_task_altstack_size[i] == 0) return 0;
+  return sp >= g_task_altstack_sp[i] &&
+         sp < g_task_altstack_sp[i] + g_task_altstack_size[i];
+}
+
 u64 task_alarm_ticks(const struct task *t) {
   if (!t) return 0;
   return g_task_alarm_ticks[task_index(t)];
@@ -2104,6 +2170,15 @@ void scheduler_on_timer_tick(void) {
   }
 
   wake_sleepers();
+
+  /* M56 timerfd: if any timerfd is armed, wake everyone blocked in
+   * poll/select/epoll_wait so they re-scan and notice a fired timer. The hook
+   * is a no-op (single atomic load) when no timerfds are armed, so it costs
+   * nothing on the common path. */
+  {
+    extern void eventpoll_timer_tick(void);
+    eventpoll_timer_tick();
+  }
 
   /* T8 (M28 #8): preemptive yield from the timer ISR. The historical concern
    * that motivated the cooperative model — VFS chain walks (find_child /
@@ -3925,4 +4000,27 @@ int scheduler_signal_pending(void) {
       return 1;
   }
   return 0;
+}
+
+/* M56 signalfd: return the bits of `mask` that are currently pending on the
+ * calling task. Used by signalfd reads/polls to learn which masked signals are
+ * waiting. The caller is expected to keep those signals blocked (so the normal
+ * handler-delivery path leaves them pending) — exactly the POSIX contract. */
+u64 scheduler_peek_pending_signals(u64 mask) {
+  if (!current_task)
+    return 0;
+  u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE);
+  return pending & mask;
+}
+
+/* M56 signalfd: atomically clear one pending signal bit on the calling task
+ * (consume it on read). Returns 1 if the bit was set and is now cleared, 0
+ * otherwise. */
+int scheduler_consume_pending_signal(int sig) {
+  if (!current_task || sig < 1 || sig >= NSIG)
+    return 0;
+  u64 bit = 1ULL << (sig - 1);
+  u64 prev = __atomic_fetch_and(&current_task->pending_signals, ~bit,
+                                __ATOMIC_ACQ_REL);
+  return (prev & bit) ? 1 : 0;
 }

@@ -737,30 +737,70 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
 
 ## M56: Event Loop and IPC Primitives
 
-- [ ] `planned` Add `epoll` (edge-triggered), `eventfd`, `timerfd`, and
-  `signalfd` for the Chromium/base message loop.
-- [ ] `planned` Implement `SCM_RIGHTS` ancillary FD passing over `AF_UNIX`
-  (`sendmsg`/`recvmsg` exist; cmsg FD-passing does not).
-- [ ] `planned` Add memfd sealing (`F_ADD_SEALS`) and cross-process shared
-  `mmap` (memfd base in M48), enough to carry Mojo shared buffers.
+- [x] `done` `epoll` (level + `EPOLLET` + `EPOLLONESHOT`), `eventfd`, `timerfd`,
+  `signalfd` — built on the existing `vfs_poll` readiness layer, all pollable
+  via `poll`/`select` and `epoll` (`M56-SMOKE: ok eventfd/epoll/timerfd/signalfd`).
+- [x] `done` `SCM_RIGHTS` ancillary FD passing over `AF_UNIX` — already worked
+  (Wayland passes buffers/keymap fds through it); verified in M48/M49/M57.
+- [x] `done` memfd sealing (`F_ADD_SEALS`/`F_GET_SEALS`, enforced on
+  write/ftruncate) and cross-process shared `mmap` (Wayland shm). The libwayland
+  port now uses these real primitives instead of emulating them.
 
 ## M57: Multiprocess Model
 
-- [ ] `planned` Make fork/exec, FD inheritance, and FD brokering robust enough
-  for the `--no-sandbox` model (drops the sandbox, keeps multiple processes).
+- [x] `done` fork/exec, FD inheritance, and FD brokering for the `--no-sandbox`
+  model: COW fork with shared open-file offsets, `FD_CLOEXEC` across exec,
+  `SCM_RIGHTS` fd-brokering incl. in-flight-fd cleanup on peer death (audited
+  correct), plus added `socketpair()` (AF_UNIX only — all POSIX requires) and
+  `F_DUPFD_CLOEXEC`
+  (`M57-SMOKE: ok fork-fdshare/cloexec/exec-inherit/fd-broker/fd-broker-death/dupfd-cloexec`).
 - [ ] `planned` Bring up a minimal Mojo core over the M56 primitives.
 
 ## M58: V8
 
-- [ ] `planned` Port V8 interpreter-only (`--jitless`, Ignition, no TurboFan) to
-  avoid W^X mappings and GC/deopt signals; run JS through `d8`.
+- [ ] `blocked` Port V8 interpreter-only (`--jitless`, Ignition) — **assessed
+  NO-GO, ~2–3 months** (`docs/v8-feasibility.md`). The wall is V8's GN build:
+  b1nix is not a GN/V8 `target_os`, so it needs an M61-shaped port of V8's build
+  subtree; the toolchain (GCC 13.2 C++17/20 + M55 libstdc++) actually fits and
+  jitless avoids W^X. Real runtime gaps: `madvise`/`MAP_NORESERVE`/`sigaltstack`.
+  - [x] `partial` GN-target **skeleton** validated against a real V8 checkout
+    (`tools/patches/v8/`): the 6 edits that add `b1nix` as a GN/V8 `target_os`
+    (BUILDCONFIG dispatch, drop-in `//build/toolchain/b1nix`, `v8config.h`
+    `__b1nix__` OS detection, `v8/BUILD.gn` `V8_TARGET_OS`+platform selection).
+    Retires the "does the target even have a shape" risk before the multi-GB
+    fetch. Runtime gaps above are **already closed** (v0.56.6). The 2–3 month
+    `is_linux`-chasing + link-up remains.
+- [x] `done` (pragmatic alt — the actual M58 goal "run JS on b1nix")
+  expose the in-tree **Duktape** (M54/NetSurf) as a standalone `/bin/js`
+  runner/REPL. This is the realistic JS vector the Chromium assessment names,
+  not V8.
 - [ ] `deferred` Add the optimizing JIT (W^X executable mmap, GC/deopt signals).
+- [x] `done` cheap independent POSIX wins surfaced by the probe:
+  `madvise(MADV_DONTNEED/FREE/hints)`, `MAP_NORESERVE` (lazy-commit), and
+  `sigaltstack` with working `SA_ONSTACK` signal delivery — per-process alt stack
+  in scheduler side-tables (M29 invariant). Help any large-heap allocator, not
+  just V8. Verified by `MM-SMOKE: ok madvise/noreserve/sigaltstack` (both arches).
+  *Caveats:* `MADV_FREE` is implemented as `MADV_DONTNEED` (b1nix has no
+  lazy-reclaim queue, so contents are discarded, not preserved on read-back);
+  `madvise` only acts on anonymous, non-shared mappings (file/`MAP_SHARED` =
+  safe no-op); `MAP_NORESERVE` has no reservation accounting (b1nix lazy-commits
+  regardless — nothing faked).
 
 ## M59: EGL and GL for the Browser
 
-- [ ] `planned` Add an EGL implementation over the M52/M53 virgl host-GPU GL (or
-  ANGLE → b1nix GL), closing the missing DRI/EGL/GBM path.
-- [ ] `planned` Provide a software Skia (Ganesh) raster fallback.
+- [x] `done` Real EGL 1.4/1.5 over the M52 Mesa OSMesa softpipe (`b1egl_mesa.c`):
+  `eglGetDisplay`/`Initialize`/`ChooseConfig`/`CreateContext`/`MakeCurrent`/
+  `SwapBuffers` + the previously-missing off-screen `eglCreatePbufferSurface`
+  (the DRI/GBM-shaped path) and the on-screen window path to displayd. Verified
+  by `m59_smoke` (`M59-SMOKE: ok egl-init/egl-context/egl-render` — clears + draws
+  a triangle and checks real read-back pixels, both arches). The existing
+  TinyGL-backed `b1egl.c` stays for that path. *Caveat:* the verified path is the
+  software OSMesa softpipe (off-screen pbuffer); the on-screen window path and the
+  M53 virgl host-GPU path share the same EGL surface model but the smoke runs the
+  off-screen software path.
+- [ ] `deferred` Software Skia (Ganesh) raster fallback — **assessed: a separate
+  GN/Ninja port wall** (Skia is V8/Chromium-scale; not in-tree). Defer as its own
+  milestone.
 
 ## M60: Ozone Platform
 

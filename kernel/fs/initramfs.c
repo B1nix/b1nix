@@ -13,6 +13,7 @@
 #include "initramfs_m17_smoke.inc"
 #include "initramfs_m14_smoke.inc"
 #include "initramfs_m15_smoke.inc"
+#include "initramfs_m56_smoke.inc"
 #include "initramfs_tcc_files.inc"
 #include "initramfs_netsurf_files.inc"
 #include "initramfs_m25_smoke.inc"
@@ -55,9 +56,11 @@
 #include "initramfs_testfont.inc"
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
+#include "initramfs_m57_smoke.inc"
 #include "initramfs_m47_smoke.inc"
 #include "initramfs_m48_smoke.inc"
 #include "initramfs_m49_smoke.inc"
+#include "initramfs_m_posixmm_smoke.inc"
 #include "initramfs_m49_libwayland.inc"
 #include "initramfs_m49_libwayland_server.inc"
 #include "initramfs_m50_smoke.inc"
@@ -70,9 +73,12 @@
 #include "initramfs_m52_osmesa.inc"
 #include "initramfs_m53_mesa_virgl.inc"
 #include "initramfs_m52_glsl.inc"
+#include "initramfs_m59_smoke.inc"
 #include "initramfs_cxx_smoke.inc"
 #include "initramfs_m55_iostream.inc"
 #include "initramfs_m55_litehtml.inc"
+#include "initramfs_js.inc"
+#include "initramfs_m58_smoke.inc"
 #include "initramfs_m51_xkb_smoke.inc"
 #include "initramfs_m51_clipboard_smoke.inc"
 #include "initramfs_m51_harfbuzz_smoke.inc"
@@ -981,6 +987,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m14_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m15-smoke", (const char *)vfs_m15_smoke_elf,
      sizeof(vfs_m15_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m56-smoke", (const char *)vfs_m56_smoke_elf,
+     sizeof(vfs_m56_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m24b-smoke", (const char *)vfs_m24b_smoke_elf,
      sizeof(vfs_m24b_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m27-smoke", (const char *)vfs_m27_smoke_elf,
@@ -1069,12 +1077,16 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m42_w5pre_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m46-smoke", (const char *)vfs_m46_smoke_elf,
      sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m57-smoke", (const char *)vfs_m57_smoke_elf,
+     sizeof(vfs_m57_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m47-smoke", (const char *)vfs_m47_smoke_elf,
      sizeof(vfs_m47_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m48-smoke", (const char *)vfs_m48_smoke_elf,
      sizeof(vfs_m48_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m49-smoke", (const char *)vfs_m49_smoke_elf,
      sizeof(vfs_m49_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m-posixmm-smoke", (const char *)vfs_m_posixmm_smoke_elf,
+     sizeof(vfs_m_posixmm_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m49-libwayland", (const char *)vfs_m49_libwayland_elf,
      sizeof(vfs_m49_libwayland_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m49-libwayland-server",
@@ -1100,12 +1112,18 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m53_mesa_virgl_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m52-glsl", (const char *)vfs_m52_glsl_elf,
      sizeof(vfs_m52_glsl_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m59-smoke", (const char *)vfs_m59_smoke_elf,
+     sizeof(vfs_m59_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/cxx-smoke", (const char *)vfs_cxx_smoke_elf,
      sizeof(vfs_cxx_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m55-iostream", (const char *)vfs_m55_iostream_elf,
      sizeof(vfs_m55_iostream_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m55-litehtml", (const char *)vfs_m55_litehtml_elf,
      sizeof(vfs_m55_litehtml_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/js", (const char *)vfs_js_elf,
+     sizeof(vfs_js_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m58-smoke", (const char *)vfs_m58_smoke_elf,
+     sizeof(vfs_m58_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-xkb-smoke", (const char *)vfs_m51_xkb_smoke_elf,
      sizeof(vfs_m51_xkb_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m51-clipboard-smoke", (const char *)vfs_m51_clipboard_smoke_elf,

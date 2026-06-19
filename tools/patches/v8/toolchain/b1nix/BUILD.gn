@@ -1,0 +1,38 @@
+# Copyright 2026 b1nix. GN toolchain for the b1nix target_os.
+# Drop this file at //build/toolchain/b1nix/BUILD.gn inside the V8 checkout.
+# It is selected by the `target_os == "b1nix"` branch added to
+# //build/config/BUILDCONFIG.gn (see ../../PORT-PLAN.md, patch 1).
+#
+# Models build/toolchain/linux/BUILD.gn:182 gcc_toolchain("x64"), but points
+# every tool at the existing x86_64-b1nix cross GCC (GCC 13.2, C++17/20 +
+# libstdc++ from M55). No clang/libc++ — V8 builds fine with GCC.
+
+import("//build/toolchain/gcc_toolchain.gni")
+
+# Absolute prefix of the b1nix cross toolchain on the build host. Override with
+#   gn gen ... --args='b1nix_toolprefix="/abs/path/x86_64-b1nix-"'
+# Default assumes the in-tree cross build (CLAUDE.md "Tier 1: Cross Toolchain").
+declare_args() {
+  b1nix_toolprefix =
+      rebase_path("//../x86_64-b1nix/cross/bin/x86_64-b1nix-", root_build_dir)
+}
+
+gcc_toolchain("x64") {
+  cc = "${b1nix_toolprefix}gcc"
+  cxx = "${b1nix_toolprefix}g++"
+
+  readelf = "${b1nix_toolprefix}readelf"
+  nm = "${b1nix_toolprefix}nm"
+  ar = "${b1nix_toolprefix}ar"
+  ld = cxx
+
+  enable_linker_map = true
+
+  toolchain_args = {
+    current_cpu = "x64"
+    current_os = "b1nix"
+
+    use_remoteexec = false
+    is_clang = false
+  }
+}

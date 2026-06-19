@@ -106,6 +106,13 @@ struct vfs_inode {
   struct block_device *blk_dev;
   u32 fs_id; /* Unique ID for this filesystem instance */
 
+  /* M56 file sealing (memfd). `seals` holds the active F_SEAL_* bitmask;
+   * `seals_allowed` is set when the memfd was created with MFD_ALLOW_SEALING.
+   * Both are 0 for ordinary files (which therefore behave as F_SEAL_SEAL-set:
+   * F_ADD_SEALS is rejected). */
+  u32 seals;
+  u32 seals_allowed;
+
   /* Callbacks (Inode Operations) */
   isize (*read_cb)(struct vfs_node *node, u64 offset, char *buffer, usize size,
                    int flags);
@@ -235,8 +242,24 @@ int vfs_ftruncate(int fd, u64 length);
 int vfs_memfd_create(const char *name, u32 flags);
 int vfs_fcntl(int fd, int cmd, u64 arg);
 int vfs_ioctl(int fd, u64 request, void *arg);
+
+/* M56 event-loop / IPC primitives (kernel/fs/eventpoll.c). */
+int vfs_eventfd(unsigned int initval, int flags);
+int vfs_timerfd_create(int clockid, int flags);
+int vfs_timerfd_settime(int fd, int flags,
+                        const struct b1nix_itimerspec *new_value,
+                        struct b1nix_itimerspec *old_value);
+int vfs_signalfd(int fd, u64 mask, int flags);
+int vfs_epoll_create(int flags);
+int vfs_epoll_ctl(int epfd, int op, int fd, struct b1nix_epoll_event *event);
+int vfs_epoll_wait(int epfd, struct b1nix_epoll_event *events, int maxevents,
+                   int timeout);
+/* M56 file sealing — implemented in eventpoll.c, called from vfs_fcntl. */
+int vfs_fcntl_add_seals(int fd, u32 seals);
+int vfs_fcntl_get_seals(int fd);
 void vfs_close_on_exec(void);
 int vfs_socket(int domain, int type, int protocol);
+int vfs_socketpair(int domain, int type, int protocol, int sv[2]);
 int vfs_bind(int fd, const void *addr, usize addrlen);
 int vfs_listen(int fd, int backlog);
 int vfs_accept(int fd, void *addr, usize *addrlen);
@@ -307,7 +330,12 @@ enum vfs_handle_kind {
   VFS_HANDLE_PTY_MASTER,
   VFS_HANDLE_PTY_SLAVE,
   VFS_HANDLE_SERIAL_TTY,
-  VFS_HANDLE_INPUT
+  VFS_HANDLE_INPUT,
+  /* M56 event-loop / IPC primitives. */
+  VFS_HANDLE_EVENTFD,
+  VFS_HANDLE_TIMERFD,
+  VFS_HANDLE_SIGNALFD,
+  VFS_HANDLE_EPOLL
 };
 
 struct vfs_file_ops {

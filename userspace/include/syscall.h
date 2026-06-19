@@ -174,6 +174,20 @@ enum {
   SYS_MEMFD_CREATE = 148,
   SYS_SETTIMEOFDAY = 149,
   SYS_SCHED_GETAFFINITY = 150,
+
+  /* --- M56: event-loop & IPC primitives --- */
+  SYS_EVENTFD2        = 151,
+  SYS_EPOLL_CREATE1   = 152,
+  SYS_EPOLL_CTL       = 153,
+  SYS_EPOLL_WAIT      = 154,
+  SYS_TIMERFD_CREATE  = 155,
+  SYS_TIMERFD_SETTIME = 156,
+  SYS_SIGNALFD4       = 157,
+  /* --- M57: multiprocess broker primitives --- */
+  SYS_SOCKETPAIR      = 158,
+  /* --- POSIX memory / signal completeness --- */
+  SYS_MADVISE         = 159,
+  SYS_SIGALTSTACK     = 160,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

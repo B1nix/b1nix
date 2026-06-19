@@ -189,6 +189,9 @@ struct b1nix_pollfd;
 // UNIX Domain Sockets (Internal)
 int unix_init_state(struct vfs_socket_state *s);
 void unix_free_state(struct vfs_socket_state *s);
+/* M57: cross-connect two initialised AF_UNIX states as connected peers
+ * (socketpair, no filesystem name). */
+void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b);
 int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
 int unix_listen(struct vfs_socket_state *s, int backlog);
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
