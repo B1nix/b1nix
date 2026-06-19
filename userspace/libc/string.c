@@ -218,6 +218,22 @@ char *strerror(int errnum)
 	}
 }
 
+/* POSIX/XSI strerror_r: copy the message into the caller's buffer, return 0 on
+ * success or ERANGE if truncated. */
+int strerror_r(int errnum, char *buf, size_t buflen)
+{
+	if (!buf || buflen == 0) return ERANGE;
+	const char *msg = strerror(errnum);
+	size_t len = strlen(msg);
+	if (len >= buflen) {
+		memcpy(buf, msg, buflen - 1);
+		buf[buflen - 1] = '\0';
+		return ERANGE;
+	}
+	memcpy(buf, msg, len + 1);
+	return 0;
+}
+
 char *strpbrk(const char *s, const char *accept)
 {
 	while (*s) {

@@ -273,4 +273,7 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 #define syscall(num, ...) _syscall_route(num, ##__VA_ARGS__, 0, 0, 0, 0, 0, 0, 0)
 #define _syscall_route(num, a0, a1, a2, a3, a4, a5, ...) _syscall_raw(num, (long)(a0), (long)(a1), (long)(a2), (long)(a3), (long)(a4), (long)(a5))
 
+/* Linux __NR_ aliases for ports that call syscall(__NR_*) directly. */
+#define __NR_gettid SYS_GETTID
+
 #endif

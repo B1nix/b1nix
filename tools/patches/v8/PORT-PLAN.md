@@ -5,6 +5,59 @@
 *proven* set of edits that adds `b1nix` as a GN/V8 `target_os`** — the dominant
 blocker from the probe — so the path is mapped before the multi-GB `fetch v8`.
 
+## ✅✅ `ninja v8_libbase` BUILDS for b1nix (real cross-GCC, 41 ELF64 objects)
+
+After a full `gclient sync` + `gn gen target_os=b1nix … v8_jitless=true`, the
+first ninja target — `v8_libbase`, the platform/base layer — **compiles and
+archives** (`AR obj/libv8_libbase.a`, thin archive of 41 `x86_64-b1nix-g++`
+ELF64 objects). This is the PORT-PLAN's "compiles v8_libbase = days" milestone.
+
+**`gn gen` args** (in `tools/sync-v8.sh`): jitless ⇒ all JIT/Wasm tiers off,
+`v8_enable_temporal_support=false` (Temporal is Rust), `v8_enable_sandbox=false`
+(needs libc++ hardening), `use_custom_libcxx=false`, **`is_clang=false`** (the
+critical one — GCC build of V8; without it the toolchain rules inject clang-only
+`-Xclang`/module/raw-ptr-plugin flags). GN-graph patches surfaced: **Patch 7**
+(rust.gni b1nix `rust_abi_target`) + **Patch 8** (clang/BUILD.gn clang_rt dir) —
+both alias b1nix to linux to clear gen-time asserts the `coverage`/`clang`
+default-configs trigger. The Patch-2 toolchain file needed the real cross path
+(`//../../x86_64-b1nix/cross/bin/x86_64-b1nix-`).
+
+**Compile chase = Patches 9–13** (in apply.sh) + **b1nix libc additions** (real
+OS improvements, committed in userspace/, shipped from v0.58.1):
+
+| Break | Fix |
+|---|---|
+| `__has_warning` clang-only | Patch 9: GCC fallback in macros.h |
+| `<linux/auxvec.h>`/`<sys/auxv.h>` (cpu.cc, cpu-x86.cc) | Patch 10: guard, x64 doesn't use HWCAP |
+| PKU (`pthread_getattr_np`/`PROT_GROWSDOWN`) | Patch 11: V8_HAS_PKU_SUPPORT off for b1nix (jitless) |
+| absl `<link.h>` ELF symbolizer | Patch 12: ABSL_HAVE_ELF_MEM_IMAGE off for b1nix |
+| absl `std::wcslen` | Patch 13: `::wcslen` + `<wchar.h>` |
+| llvm-libc math: `math_errhandling`,`FP_ILOGB0`,… | math.h C99 macros |
+| `fegetexceptflag`/`fesetexceptflag` | fenv.h + libc stubs |
+| `prctl` (thread/VMA naming) | new `<sys/prctl.h>` + no-op libc `prctl()` |
+| si_code (`BUS_*`,`FPE_*`,`ILL_*`), `si_addr` | signal.h |
+| `struct tm` `tm_gmtoff`/`tm_zone` | time.h |
+| `malloc_usable_size` | malloc.h + stdlib.c |
+| `pthread_attr_getstack`, `pthread_getattr_np` | pthread.h/.c (via /proc/self/maps + current SP) |
+| `PTHREAD_STACK_MIN` | pthread.h |
+| `__NR_gettid` | syscall.h alias to SYS_GETTID |
+| `strerror_r` | string.h + libc (XSI) |
+| 17 missing errno (`ENOLINK`,`ECANCELED`,…) | errno.h (Linux ABI values) |
+| `std::strtoll`/`atoll`/`lldiv`/`strtold` | C99 stdlib: add atoll/lldiv/lldiv_t/strtold/_Exit + flip libstdc++ `_GLIBCXX11_USE_C99_STDLIB` |
+
+**Machine-local toolchain staging (not committed; redo after a toolchain rebuild,
+or build-toolchain.sh will pick most up once the headers are complete):**
+1. Copy edited `userspace/include/*` into `…/x86_64-b1nix/cross/x86_64-b1nix/include/`.
+2. **Also** copy `stdlib.h` (and any fixincludes header) into
+   `…/cross/lib/gcc/x86_64-b1nix/13.2.0/include-fixed/` — GCC's fixincludes
+   snapshot shadows the sysroot copy.
+3. In `…/c++/13.2.0/x86_64-b1nix/bits/c++config.h` set
+   `#define _GLIBCXX11_USE_C99_STDLIB 1` (libstdc++ was built before b1nix had
+   the C99 stdlib funcs; a fresh toolchain build now auto-detects them).
+
+**Next:** `ninja mksnapshot` (host toolchain) then `ninja d8` (the bulk — links
+all of V8 against libb1nix.a). Goal: `d8 --jitless` prints `print("hello")`.
+
 ## ✅ EMPIRICALLY VALIDATED (v0.56.12)
 
 The 6 edits below were not just inspected — they were **applied to a real V8
@@ -170,16 +223,41 @@ necessary.)
 
 ## Build order (after this skeleton lands in a real checkout)
 
+Two scripts drive it (both "run-it-yourself" — they fetch/build external code,
+which Claude can't do unattended):
+
 ```sh
-# 0. depot_tools + fetch (the multi-GB step this skeleton de-risks)
-fetch v8 && cd v8
-# 1. apply patches 1,3,4 + copy patch-2 toolchain dir + this repo's BUILD.gn
-# 2. host tools first, then target:
-gn gen out/b1nix --args='target_os="b1nix" target_cpu="x64" v8_enable_i18n_support=false is_debug=false v8_jitless=true v8_use_external_startup_data=false'
-ninja -C out/b1nix v8_libbase   # smallest unit that exercises the platform layer
-ninja -C out/b1nix mksnapshot   # host toolchain; proves the host/target split
-ninja -C out/b1nix d8           # the goal: jitless d8
+sh tools/build-gn.sh    # once: builds gn  (cached, survives make clean)
+sh tools/sync-v8.sh     # depot_tools + gclient sync (multi-GB) + apply + gn gen
 ```
+
+`tools/sync-v8.sh` does: clone depot_tools → write a `managed:False` `.gclient`
+(so gclient leaves our shallow v8 git alone and only syncs the DEPS sub-trees) →
+`gclient sync` → **`tools/patches/v8/apply.sh`** → `gn gen out/b1nix`. Then the
+manual chase loop:
+
+```sh
+ninja -C build/toolchain_build/v8-skeleton/v8/out/b1nix v8_libbase   # smallest unit; exercises the platform layer
+ninja -C ...                 mksnapshot   # host toolchain; proves the host/target split
+ninja -C ...                 d8           # the goal: jitless d8
+```
+
+**`tools/patches/v8/apply.sh`** re-applies all six patches idempotently and is
+*self-verifying* (each step greps its own marker, dies loud if upstream drifted —
+re-grep the anchors here then). It MUST run after every `gclient sync`: Patches 1
+& 2 live in `//build`, which sync re-pulls at its DEPS-pinned revision and thus
+wipes. Verified byte-identical to the validated edits on a pristine tree.
+
+The six patches: 1–4 are the GN-target skeleton (above). **5 & 6 are the two
+appendix-A `platform-linux.cc` chase fixes** — pre-applied so the first
+`ninja v8_libbase` clears them: Patch 5 guards the `<sys/prctl.h>` include for
+b1nix (no such header; prctl never called), Patch 6 stubs `OS::RemapShared` to
+`nullptr` under `__b1nix__` (no mremap; shared-cage path, dead under `--jitless`).
+Both confirmed real against the b1nix sysroot and verified on the real source.
+
+The two throwaway stubs the v0.56.12 validation hand-authored (`gclient_args.gni`,
+`third_party/icu/config.gni`) are **no longer needed** — a real `gclient sync`
+provides both. apply.sh does not create them.
 
 `v8_libbase` is the cheapest first ninja target — it's exactly the
 `src/base/platform` set Patch 4b touches, so it fails fast if the OS plumbing
@@ -207,14 +285,21 @@ the "chase is_linux sites" work, made an inventory rather than a guess):
 
 | Linux-ism (file:line) | b1nix today | Action |
 |---|---|---|
-| `#include <sys/prctl.h>` (:15) | **header missing** — but `prctl()` is **not actually called** in the file | drop/guard the include, or ship an empty `sys/prctl.h`. Trivial. |
-| `mremap(…, MREMAP_FIXED\|MREMAP_MAYMOVE)` (:81) | **no `mremap` syscall/libc** | **real gap.** Add `SYS_MREMAP` + libc wrapper, or patch the `RemapPages` call site to munmap+mmap(MAP_FIXED). Under `--jitless` this is in the page-allocator remap path — likely hit. Medium (kernel touch). |
+| `#include <sys/prctl.h>` (:15) | **header missing** — but `prctl()` is **not actually called** in the file (confirmed: only the include) | **DONE — apply.sh Patch 5** guards the include for `__b1nix__`. |
+| `mremap(…, MREMAP_FIXED\|MREMAP_MAYMOVE)` (:81) | **no `mremap` syscall/libc** | **DONE — apply.sh Patch 6** stubs `OS::RemapShared`→`nullptr` under `__b1nix__` (shared-cage only, dead under `--jitless`; see below). Add `SYS_MREMAP` later only if the shared cage is enabled. |
 | `<sys/sysmacros.h>` + `makedev()` (:326) | **present** (`userspace/include/sys/sysmacros.h`) | none ✅ |
 | `<sys/mman.h>` mmap/munmap/madvise | present; `madvise`/`MAP_NORESERVE` landed v0.56.6 | none ✅ |
 | `/proc/self/maps` parse (:276, `SignalSafeMapsParser`) | procfs has `maps` (`kernel/fs/procfs.c`) **but emitted only 4 columns** — V8's parser reads `offset major:minor inode` strictly and aborts on the missing `dev`/`inode` | **FIXED v0.56.9** — `r_pid_maps` now emits Linux-format `start-end perms offset 00:00 inode path` (real vfs inode for file maps). Also fixes pmap/lsof/glibc-style backtrace parsers. |
 
 Net new b1nix gaps surfaced for the platform layer: **one** (`mremap`). Both
-`prctl`-include and the maps-format issue are now trivial/done. The runtime
+`prctl`-include and the maps-format issue are now trivial/done.
+
+**Raw `__linux__` recon (whole `src/`):** exactly **one** site —
+`src/debug/wasm/gdb-server/transport.cc:342` — and **none in `src/base`**, so
+`v8_libbase` is clean (b1nix gets `V8_OS_LINUX` via Patch 3 but not `__linux__`).
+That lone site is the WASM gdb-server (built only with wasm+debug, not in the
+jitless `d8` path; b1nix harmlessly takes the non-`__linux__` branch). Defer
+unless it actually compiles. The runtime
 memory model (`madvise`/`MAP_NORESERVE`/`sigaltstack`) was already closed.
 
 ### `mremap` — confirmed NOT a jitless blocker

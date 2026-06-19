@@ -34,6 +34,8 @@ struct tm {
     int tm_wday;
     int tm_yday;
     int tm_isdst;
+    long tm_gmtoff;      /* seconds east of UTC (BSD/glibc extension) */
+    const char *tm_zone; /* timezone abbreviation (BSD/glibc extension) */
 };
 
 time_t time(time_t *tloc);

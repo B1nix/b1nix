@@ -27,6 +27,8 @@ typedef struct { unsigned int __cw; } fenv_t;
 int feclearexcept(int excepts);
 int feraiseexcept(int excepts);
 int fetestexcept(int excepts);
+int fegetexceptflag(fexcept_t *flagp, int excepts);
+int fesetexceptflag(const fexcept_t *flagp, int excepts);
 int fegetround(void);
 int fesetround(int round);
 int fegetenv(fenv_t *envp);

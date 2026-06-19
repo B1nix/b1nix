@@ -32,13 +32,18 @@ typedef long pthread_t;
 #define PTHREAD_CREATE_JOINABLE 0
 #define PTHREAD_CREATE_DETACHED 1
 
+/* Minimum stack a thread can be created with (matches the libc clamp). */
+#define PTHREAD_STACK_MIN 16384
+
 typedef struct {
   /* 0 = use the libc default stack size; otherwise the requested size in
    * bytes (clamped to a sane minimum by pthread_create). */
   size_t stack_size;
   /* PTHREAD_CREATE_JOINABLE (default) or PTHREAD_CREATE_DETACHED. */
   int detach_state;
-  unsigned int reserved;
+  /* Base of the thread's stack region; filled by pthread_getattr_np, read by
+   * pthread_attr_getstack. 0 when unknown. */
+  void *stack_addr;
 } pthread_attr_t;
 
 typedef struct {
@@ -153,7 +158,9 @@ int pthread_attr_init(pthread_attr_t *a);
 int pthread_attr_destroy(pthread_attr_t *a);
 int pthread_attr_setstacksize(pthread_attr_t *a, size_t stacksize);
 int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *stacksize);
+int pthread_attr_getstack(const pthread_attr_t *a, void **stackaddr, size_t *stacksize);
 int pthread_attr_getdetachstate(const pthread_attr_t *a, int *detachstate);
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *a);
 
 #ifdef __cplusplus
 }

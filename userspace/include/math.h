@@ -7,6 +7,17 @@
 #define FP_SUBNORMAL    3
 #define FP_NORMAL       4
 
+/* C99 ilogb() result values for 0 and NaN (x86/glibc convention). */
+#define FP_ILOGB0       (-2147483647 - 1)
+#define FP_ILOGBNAN     2147483647
+
+/* C99 math error reporting. b1nix's libm reports domain/range errors via errno,
+ * not FP exceptions. ponytail: errno-only; add MATH_ERREXCEPT if libm ever
+ * reliably raises FE_* via fenv. */
+#define MATH_ERRNO      1
+#define MATH_ERREXCEPT  2
+#define math_errhandling MATH_ERRNO
+
 #define M_E             2.7182818284590452354
 #define M_LOG2E         1.4426950408889634074
 #define M_LOG10E        0.43429448190325182765

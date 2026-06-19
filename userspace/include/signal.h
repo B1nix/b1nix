@@ -36,8 +36,30 @@ extern "C" {
 #define SIGWINCH 28
 #define NSIG    31
 
+/* siginfo si_code values (POSIX). Used by crash reporters to describe faults. */
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
+#define FPE_INTOVF 3
+#define FPE_FLTOVF 4
+#define FPE_FLTUND 5
+#define FPE_FLTRES 6
+#define FPE_FLTINV 7
+#define FPE_FLTSUB 8
+#define SEGV_MAPERR 1
+#define SEGV_ACCERR 2
+#define BUS_ADRALN 1
+#define BUS_ADRERR 2
+#define BUS_OBJERR 3
+#define ILL_ILLOPC 1
+#define ILL_ILLOPN 2
+#define ILL_ILLADR 3
+#define ILL_ILLTRP 4
+#define ILL_PRVOPC 5
+#define ILL_PRVREG 6
+#define ILL_COPROC 7
+#define ILL_BADSTK 8
+#define TRAP_BRKPT 1
+#define TRAP_TRACE 2
 #define SIG_UNBLOCK 2
 #define SIG_BLOCK   0
 #define SIG_SETMASK 1
@@ -70,6 +92,7 @@ typedef struct {
     int si_pid;
     int si_uid;
     int si_status;
+    void *si_addr;   /* faulting address for SIGSEGV/SIGBUS/SIGFPE/SIGILL */
 } siginfo_t;
 
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,

@@ -92,4 +92,23 @@ int normalize_errno(long rc);
 #define ENOATTR         ENODATA /* No such attribute (BSD spelling) */
 #endif
 
+/* Additional POSIX/Linux errno values (Linux x86 ABI numbering). */
+#define ECHRNG          44      /* Channel number out of range */
+#define EUNATCH         49      /* Protocol driver not attached */
+#define ENONET          64      /* Machine is not on the network */
+#define ENOPKG          65      /* Package not installed */
+#define ENOLINK         67      /* Link has been severed */
+#define ECOMM           70      /* Communication error on send */
+#define ENOTUNIQ        76      /* Name not unique on network */
+#define EBADFD          77      /* File descriptor in bad state */
+#define EUSERS          87      /* Too many users */
+#define ESHUTDOWN       108     /* Cannot send after transport endpoint shutdown */
+#define EHOSTDOWN       112     /* Host is down */
+#define ESTALE          116     /* Stale file handle */
+#define EISNAM          120     /* Is a named type file */
+#define EDQUOT          122     /* Disk quota exceeded */
+#define ENOMEDIUM       123     /* No medium found */
+#define ECANCELED       125     /* Operation canceled */
+#define ENOKEY          126     /* Required key not available */
+
 #endif

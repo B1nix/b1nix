@@ -12,9 +12,11 @@ import("//build/toolchain/gcc_toolchain.gni")
 # Absolute prefix of the b1nix cross toolchain on the build host. Override with
 #   gn gen ... --args='b1nix_toolprefix="/abs/path/x86_64-b1nix-"'
 # Default assumes the in-tree cross build (CLAUDE.md "Tier 1: Cross Toolchain").
+# Source root `//` is build/toolchain_build/v8-skeleton/v8; the cross toolchain
+# lives at build/toolchain_build/x86_64-b1nix/cross — two levels up from `//`.
 declare_args() {
-  b1nix_toolprefix =
-      rebase_path("//../x86_64-b1nix/cross/bin/x86_64-b1nix-", root_build_dir)
+  b1nix_toolprefix = rebase_path(
+          "//../../x86_64-b1nix/cross/bin/x86_64-b1nix-", root_build_dir)
 }
 
 gcc_toolchain("x64") {

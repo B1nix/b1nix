@@ -30,6 +30,13 @@ void exit(int status)
 	__builtin_trap();
 }
 
+/* C99 _Exit: terminate immediately without running atexit handlers. */
+void _Exit(int status)
+{
+	syscall(SYS_EXIT, status, 0, 0, 0);
+	__builtin_trap();
+}
+
 void abort(void)
 {
 	exit(127);
@@ -205,6 +212,19 @@ void *calloc(size_t nmemb, size_t size)
 	return p;
 }
 
+long long atoll(const char *s)
+{
+	return strtoll(s, (char **)0, 10);
+}
+
+lldiv_t lldiv(long long numer, long long denom)
+{
+	lldiv_t r;
+	r.quot = numer / denom;
+	r.rem = numer % denom;
+	return r;
+}
+
 int atoi(const char *s)
 {
 	int n = 0;
@@ -370,6 +390,14 @@ void *realloc(void *ptr, size_t size)
 	void *p = _realloc_unlocked(ptr, size);
 	pthread_mutex_unlock(&g_malloc_lock);
 	return p;
+}
+
+/* Usable payload of an allocation (>= the requested size). Matches the
+ * old_payload computation in _realloc_unlocked. */
+size_t malloc_usable_size(void *ptr)
+{
+	if (!ptr) return 0;
+	return MA_SIZE(MA_HDR(ptr)) - MA_DSIZE;
 }
 
 long strtol(const char *nptr, char **endptr, int base)

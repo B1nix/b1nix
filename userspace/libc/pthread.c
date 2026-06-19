@@ -17,9 +17,11 @@
 
 #include "syscall.h"
 #include <errno.h>
+#include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
 #include <stddef.h>
+#include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
@@ -479,7 +481,7 @@ int pthread_attr_init(pthread_attr_t *a) {
   if (!a) return EINVAL;
   a->stack_size = 0; /* 0 → libc default */
   a->detach_state = PTHREAD_CREATE_JOINABLE;
-  a->reserved = 0;
+  a->stack_addr = 0;
   return 0;
 }
 
@@ -497,6 +499,89 @@ int pthread_attr_setstacksize(pthread_attr_t *a, size_t stacksize) {
 int pthread_attr_getstacksize(const pthread_attr_t *a, size_t *stacksize) {
   if (!a || !stacksize) return EINVAL;
   *stacksize = a->stack_size ? a->stack_size : (size_t)DEFAULT_STACK_SIZE;
+  return 0;
+}
+
+int pthread_attr_getstack(const pthread_attr_t *a, void **stackaddr,
+                          size_t *stacksize) {
+  if (!a || !stackaddr || !stacksize) return EINVAL;
+  *stackaddr = a->stack_addr;
+  *stacksize = a->stack_size ? a->stack_size : (size_t)DEFAULT_STACK_SIZE;
+  return 0;
+}
+
+/* Parse a leading "<hex>-<hex>" range from a /proc/self/maps line. */
+static int parse_maps_range(const char *line, uintptr_t *start, uintptr_t *end) {
+  uintptr_t s = 0, e = 0;
+  const char *p = line;
+  int n = 0;
+  for (; *p && *p != '-'; p++) {
+    int d;
+    if (*p >= '0' && *p <= '9') d = *p - '0';
+    else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+    else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+    else return 0;
+    s = (s << 4) | (uintptr_t)d; n++;
+  }
+  if (*p != '-' || n == 0) return 0;
+  p++; n = 0;
+  for (; *p && *p != ' '; p++) {
+    int d;
+    if (*p >= '0' && *p <= '9') d = *p - '0';
+    else if (*p >= 'a' && *p <= 'f') d = *p - 'a' + 10;
+    else if (*p >= 'A' && *p <= 'F') d = *p - 'A' + 10;
+    else return 0;
+    e = (e << 4) | (uintptr_t)d; n++;
+  }
+  if (n == 0) return 0;
+  *start = s; *end = e;
+  return 1;
+}
+
+/* glibc extension: report the calling thread's stack region. b1nix's pthread_t
+ * is the kernel TID with no TID->state map, so this only supports the *current*
+ * thread (it locates the stack by finding the VMA that contains the current
+ * frame in /proc/self/maps). That is exactly how V8 uses it. */
+int pthread_getattr_np(pthread_t thread, pthread_attr_t *a) {
+  if (!a) return EINVAL;
+  (void)thread;
+  pthread_attr_init(a);
+  uintptr_t sp = (uintptr_t)__builtin_frame_address(0);
+  int found = 0;
+  int fd = open("/proc/self/maps", O_RDONLY);
+  if (fd >= 0) {
+    char buf[512];
+    char line[256];
+    size_t ll = 0;
+    ssize_t n;
+    while (!found && (n = read(fd, buf, sizeof buf)) > 0) {
+      for (ssize_t i = 0; i < n; i++) {
+        char c = buf[i];
+        if (c == '\n' || ll == sizeof(line) - 1) {
+          line[ll] = 0;
+          uintptr_t start = 0, end = 0;
+          if (parse_maps_range(line, &start, &end) && sp >= start &&
+              sp < end) {
+            a->stack_addr = (void *)start;
+            a->stack_size = end - start;
+            found = 1;
+            break;
+          }
+          ll = 0;
+        } else {
+          line[ll++] = c;
+        }
+      }
+    }
+    close(fd);
+  }
+  if (!found) {
+    /* Fallback: a conservative window around the current frame so the high end
+     * (stack_addr + stack_size) stays above the live stack. */
+    uintptr_t page = sp & ~(uintptr_t)0xFFF;
+    a->stack_addr = (void *)(page - (uintptr_t)DEFAULT_STACK_SIZE);
+    a->stack_size = (size_t)DEFAULT_STACK_SIZE + 0x2000;
+  }
   return 0;
 }
 

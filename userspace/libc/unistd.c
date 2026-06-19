@@ -1789,6 +1789,11 @@ int flock(int fd, int operation) {
 int feclearexcept(int e) { (void)e; return 0; }
 int feraiseexcept(int e) { (void)e; return 0; }
 int fetestexcept(int e) { (void)e; return 0; }
+/* prctl: b1nix has no prctl syscall; the operations callers use (thread/VMA
+ * naming) are cosmetic, so report success without doing anything. */
+int prctl(int option, ...) { (void)option; return 0; }
+int fegetexceptflag(fexcept_t *flagp, int e) { (void)e; if (flagp) *flagp = 0; return 0; }
+int fesetexceptflag(const fexcept_t *flagp, int e) { (void)flagp; (void)e; return 0; }
 int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
 int fesetround(int r) { (void)r; return 0; }
 /* Saving/restoring the FP environment is a no-op under the fixed mode. openlibm

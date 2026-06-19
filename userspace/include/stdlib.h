@@ -32,8 +32,14 @@ typedef struct {
     long rem;
 } ldiv_t;
 
+typedef struct {
+    long long quot;
+    long long rem;
+} lldiv_t;
+
 void  abort(void) __attribute__((noreturn));
 void  exit(int status) __attribute__((noreturn));
+void  _Exit(int status) __attribute__((noreturn));
 void *malloc(size_t size);
 int posix_memalign(void **memptr, size_t alignment, size_t size);
 void *aligned_alloc(size_t alignment, size_t size);
@@ -42,6 +48,9 @@ void  free(void *ptr);
 void *calloc(size_t nmemb, size_t size);
 void *realloc(void *ptr, size_t size);
 int   atoi(const char *s);
+long long atoll(const char *s);
+lldiv_t lldiv(long long numer, long long denom);
+long double strtold(const char *nptr, char **endptr);
 long  strtol(const char *nptr, char **endptr, int base);
 unsigned long strtoul(const char *nptr, char **endptr, int base);
 long long strtoll(const char *nptr, char **endptr, int base);
