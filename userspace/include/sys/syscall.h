@@ -9,3 +9,5 @@
 
 /* Linux lowercase aliases some ports use. */
 #define SYS_gettid SYS_GETTID
+#define SYS_futex SYS_FUTEX
+#define SYS_getrandom SYS_GETRANDOM

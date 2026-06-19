@@ -12,6 +12,10 @@
  * `int` over BSD `union wait` for process status), so it is defined per-build
  * via CFLAGS in tools/build-bash.sh instead of for every port. */
 
+/* b1nix has clock_gettime(CLOCK_MONOTONIC); advertise just that feature (narrow,
+ * unlike the broad _POSIX_VERSION above) so monotonic-clock code paths compile. */
+#define _POSIX_MONOTONIC_CLOCK 200809L
+
 #define _PC_NAME_MAX 3
 #define _PC_PATH_MAX 4
 static inline long pathconf(const char *path, int name) {
@@ -35,6 +39,14 @@ extern char **environ;
 
 ssize_t write(int fd, const void *buf, size_t n);
 ssize_t read(int fd, void *buf, size_t n);
+ssize_t pread(int fd, void *buf, size_t n, off_t offset);
+/* Real syscall() function (Linux-compat). Declared BEFORE the function-like
+ * syscall() macro in <syscall.h> below: direct `syscall(nr, ...)` calls still
+ * hit the fast macro, but using `syscall` as a bare name (e.g. passing it to a
+ * wrapper, as partition_alloc does) resolves to this symbol. The parens around
+ * the name stop the function-like syscall() macro from expanding this
+ * declaration regardless of whether <syscall.h> was included first. */
+long (syscall)(long number, ...);
 int gethostname(char *name, size_t len);
 int sethostname(const char *name, size_t len);
 int chown(const char *path, uid_t owner, gid_t group);

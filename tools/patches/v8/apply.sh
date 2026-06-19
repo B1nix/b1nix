@@ -177,4 +177,16 @@ if [ -f "$F" ] && ! grep -q 'defined(__b1nix__)' "$F"; then
   echo "Patch 15 applied: partition_alloc build_config.h (PA_IS_LINUX)"
 else echo "Patch 15 already present/absent"; fi
 
+# --- Patch 16: //build/config/compiler/BUILD.gn — -std=gnu++20 for GCC --------
+# V8 sets -std=c++20; in strict c++20 mode GCC DISABLES the GNU ", ##__VA_ARGS__"
+# comma-swallowing extension that V8's descriptor macros rely on, producing
+# hundreds of "expected identifier before ',' token" errors. clang keeps it.
+# Use gnu++20 for the GCC (b1nix) target; leave clang (host) on c++20. //build.
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'gnu++20' "$F"; then
+  perl -0777 -i -pe 's~    \} else \{\n      cflags_cc \+= \[ "-std=c\+\+20" \]\n    \}~    } else if (is_clang) {\n      cflags_cc += [ "-std=c++20" ]\n    } else {\n      cflags_cc += [ "-std=gnu++20" ]  # b1nix/GCC: keep GNU ,##__VA_ARGS__\n    }~' "$F"
+  grep -q 'gnu++20' "$F" || die "Patch 16 anchor not found in $F"
+  echo "Patch 16 applied: compiler/BUILD.gn (gnu++20 for GCC)"
+else echo "Patch 16 already present"; fi
+
 echo "All b1nix V8 patches applied to $V8"

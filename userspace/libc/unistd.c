@@ -1,4 +1,5 @@
 #include "syscall.h"
+#include <link.h>
 #include <sys/file.h>
 #include <sys/mman.h>
 #include <fcntl.h>
@@ -1813,3 +1814,54 @@ int __isnormalf(float x) { return __builtin_isnormal(x); }
  * C _exit so it links; the debug path is unused at runtime. */
 __attribute__((noreturn)) void __b1nix_exit_cxx(int status) __asm__("_Z5_exiti");
 __attribute__((noreturn)) void __b1nix_exit_cxx(int status) { _exit(status); }
+
+/* pread via save/seek/read/restore. b1nix has no pread syscall; this is not
+ * atomic w.r.t. concurrent seeks on the same fd, but matches pread's "don't
+ * change the offset" contract for the single-fd-owner case (PA crash reader). */
+ssize_t pread(int fd, void *buf, size_t n, off_t offset) {
+  off_t cur = lseek(fd, 0, SEEK_CUR);
+  if (cur < 0) return -1;
+  if (lseek(fd, offset, SEEK_SET) < 0) return -1;
+  ssize_t r = read(fd, buf, n);
+  lseek(fd, cur, SEEK_SET);
+  return r;
+}
+
+/* b1nix has no mremap syscall; report failure so callers fall back to
+ * munmap+mmap. (V8 perf-jit references it; that path is dead under --jitless.) */
+void *mremap(void *old_address, size_t old_size, size_t new_size, int flags,
+             ...) {
+  (void)old_address;
+  (void)old_size;
+  (void)new_size;
+  (void)flags;
+  errno = ENOMEM;
+  return MAP_FAILED;
+}
+
+/* b1nix is statically linked with no dynamic loader: report zero shared objects
+ * (don't invoke the callback). Symbolizers/backtrace code degrade gracefully. */
+int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
+                    void *data) {
+  (void)callback;
+  (void)data;
+  return 0;
+}
+
+/* Real syscall() function (Linux-compat). Defined last, after all the macro
+ * users above; #undef the fast macro so this is a genuine callable symbol.
+ * Reads up to 6 args (extra args past what a given syscall uses are ignored by
+ * the kernel, matching glibc's syscall()). */
+#undef syscall
+long syscall(long number, ...) {
+  va_list ap;
+  va_start(ap, number);
+  long a0 = va_arg(ap, long);
+  long a1 = va_arg(ap, long);
+  long a2 = va_arg(ap, long);
+  long a3 = va_arg(ap, long);
+  long a4 = va_arg(ap, long);
+  long a5 = va_arg(ap, long);
+  va_end(ap);
+  return _syscall_raw(number, a0, a1, a2, a3, a4, a5);
+}

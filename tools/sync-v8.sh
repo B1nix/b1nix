@@ -67,12 +67,16 @@ sh "$ROOT_DIR/tools/patches/v8/apply.sh" "$SK/v8"
 
 # 5. generate the b1nix target build graph (jitless, no i18n, no snapshot data).
 cd "$SK/v8"
-# Arg notes (validated — gn gen makes 910 targets with these):
+# Arg notes (validated):
+#   is_clang=false                       -> GCC build; else toolchain rules inject
+#                                           clang-only -Xclang/module/plugin flags
+#   treat_warnings_as_errors=false       -> GCC warns differently than clang; V8's
+#                                           -Werror would otherwise fail the build
 #   v8_jitless + all JIT/Wasm tiers off  -> required by the jitless assert
 #   v8_enable_temporal_support=false     -> Temporal is Rust; we build no Rust
 #   v8_enable_sandbox=false              -> sandbox needs libc++ hardening; we use libstdc++
 #   use_custom_libcxx=false              -> GCC/libstdc++, not vendored libc++
-"$GN" gen out/b1nix --args='target_os="b1nix" target_cpu="x64" v8_enable_i18n_support=false is_debug=false v8_jitless=true v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=false v8_enable_maglev=false v8_enable_turbofan=false v8_enable_webassembly=false v8_enable_sandbox=false'
+"$GN" gen out/b1nix --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=true v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=false v8_enable_maglev=false v8_enable_turbofan=false v8_enable_webassembly=false v8_enable_sandbox=false'
 
 echo
 echo "=== gn gen OK. Next (the __linux__-site chase): ==="

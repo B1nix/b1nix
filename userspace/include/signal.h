@@ -60,6 +60,12 @@ extern "C" {
 #define ILL_BADSTK 8
 #define TRAP_BRKPT 1
 #define TRAP_TRACE 2
+#define CLD_EXITED 1
+#define CLD_KILLED 2
+#define CLD_DUMPED 3
+#define CLD_TRAPPED 4
+#define CLD_STOPPED 5
+#define CLD_CONTINUED 6
 #define SIG_UNBLOCK 2
 #define SIG_BLOCK   0
 #define SIG_SETMASK 1

@@ -27,6 +27,14 @@ typedef uint16_t Elf64_Section;
 
 #define EI_NIDENT 16
 
+/* ELF magic (e_ident prefix). */
+#define ELFMAG0 0x7f
+#define ELFMAG1 'E'
+#define ELFMAG2 'L'
+#define ELFMAG3 'F'
+#define ELFMAG  "\177ELF"
+#define SELFMAG 4
+
 typedef struct {
   unsigned char e_ident[EI_NIDENT];
   Elf32_Half e_type;

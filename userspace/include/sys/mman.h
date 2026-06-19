@@ -45,6 +45,12 @@ int mprotect(void *addr, size_t len, int prot);
 int madvise(void *addr, size_t length, int advice);
 int memfd_create(const char *name, unsigned int flags);
 
+/* b1nix has no mremap syscall; the wrapper fails (MAP_FAILED/ENOMEM) so callers
+ * fall back to munmap+mmap. Declared for source compatibility (V8 perf-jit). */
+#define MREMAP_MAYMOVE 1
+#define MREMAP_FIXED   2
+void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...);
+
 #ifdef __cplusplus
 }
 #endif

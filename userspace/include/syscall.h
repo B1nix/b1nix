@@ -275,5 +275,7 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 
 /* Linux __NR_ aliases for ports that call syscall(__NR_*) directly. */
 #define __NR_gettid SYS_GETTID
+#define __NR_getrandom SYS_GETRANDOM
+#define __NR_futex SYS_FUTEX
 
 #endif
