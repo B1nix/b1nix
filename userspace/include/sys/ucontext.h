@@ -4,9 +4,11 @@
 #ifdef __x86_64__
 #define REG_RIP 16
 #define REG_RBP 10
+#define REG_RSP 15
 #else
 #define REG_EIP 14
 #define REG_EBP 6
+#define REG_ESP 7
 #endif
 
 typedef struct mcontext {

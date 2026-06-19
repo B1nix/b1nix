@@ -96,6 +96,7 @@ int  pthread_join(pthread_t thread, void **retval);
 int  pthread_detach(pthread_t thread);
 pthread_t pthread_self(void);
 int  pthread_equal(pthread_t a, pthread_t b);
+int  pthread_kill(pthread_t thread, int sig);
 
 /* ── Mutex ── */
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *attr);

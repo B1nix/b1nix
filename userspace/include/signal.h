@@ -33,6 +33,7 @@ extern "C" {
 #define SIGXCPU 24
 #define SIGXFSZ 25
 #define SIGVTALRM 26
+#define SIGPROF 27
 #define SIGWINCH 28
 #define NSIG    31
 

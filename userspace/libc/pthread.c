@@ -254,6 +254,15 @@ pthread_t pthread_self(void) {
 
 int pthread_equal(pthread_t a, pthread_t b) { return a == b; }
 
+/* Send a signal to a thread. b1nix pthread_t is the kernel TID; route through
+ * kill() on that TID (no separate tkill syscall). Best-effort: adequate for
+ * profilers that signal a sampled thread. */
+int pthread_kill(pthread_t thread, int sig) {
+  int rc = kill((int)thread, sig);
+  if (rc < 0) return errno;
+  return 0;
+}
+
 /* ── Mutex ── */
 
 int pthread_mutex_init(pthread_mutex_t *m, const pthread_mutexattr_t *attr) {

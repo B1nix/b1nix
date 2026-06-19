@@ -34,6 +34,8 @@
 #define MADV_DOFORK     11
 #define MADV_HUGEPAGE   14
 #define MADV_NOHUGEPAGE 15
+#define MADV_DONTDUMP   16
+#define MADV_DODUMP     17
 
 #ifdef __cplusplus
 extern "C" {
