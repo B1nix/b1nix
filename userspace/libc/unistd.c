@@ -1815,6 +1815,15 @@ int __isnormalf(float x) { return __builtin_isnormal(x); }
 __attribute__((noreturn)) void __b1nix_exit_cxx(int status) __asm__("_Z5_exiti");
 __attribute__((noreturn)) void __b1nix_exit_cxx(int status) { _exit(status); }
 
+/* Stack-protector runtime. V8 (and other ports) compile with -fstack-protector,
+ * which references these. Fixed non-zero canary; __stack_chk_fail aborts. */
+unsigned long __stack_chk_guard = 0x595e9fbd94fda766UL;
+void __stack_chk_fail(void) {
+  static const char smsg[] = "*** stack smashing detected ***\n";
+  write(2, smsg, sizeof(smsg) - 1);
+  abort();
+}
+
 /* pread via save/seek/read/restore. b1nix has no pread syscall; this is not
  * atomic w.r.t. concurrent seeks on the same fd, but matches pread's "don't
  * change the offset" contract for the single-fd-owner case (PA crash reader). */
