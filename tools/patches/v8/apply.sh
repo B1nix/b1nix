@@ -155,4 +155,26 @@ if [ -f "$F" ] && ! grep -q '::wcslen' "$F"; then
   echo "Patch 13 applied: abseil arg.cc (::wcslen)"
 else echo "Patch 13 already present/absent"; fi
 
+# --- Patch 14: //build/build_config.h — b1nix is OS_LINUX/IS_POSIX -----------
+# Chromium's build_config.h (partition_alloc, cppgc, ...) keys OS detection on
+# __linux__, which b1nix doesn't define. Without this b1nix isn't IS_POSIX and
+# partition_alloc's per-OS types (ScopedClearLastError, ProcessId, posix
+# sources) don't resolve. Alias b1nix to OS_LINUX. In //build → wiped by sync.
+F="$BUILD/build_config.h"
+if ! grep -q 'defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~(#elif defined\(_WIN32\)\n#define OS_WIN 1)~#elif defined(__b1nix__)\n#define OS_LINUX 1\n${1}~' "$F"
+  grep -q 'defined(__b1nix__)' "$F" || die "Patch 14 anchor not found in $F"
+  echo "Patch 14 applied: build_config.h (b1nix OS_LINUX)"
+else echo "Patch 14 already present"; fi
+
+# --- Patch 15: partition_alloc/build_config.h — b1nix is PA_IS_LINUX ---------
+# partition_alloc has its OWN build_config.h fork (PA_BUILDFLAG(IS_POSIX) etc.),
+# also keyed on __linux__. third_party → wiped by sync.
+F="$V8/third_party/partition_alloc/src/partition_alloc/build_config.h"
+if [ -f "$F" ] && ! grep -q 'defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~(#elif defined\(_WIN32\)\n#define PA_IS_WIN)~#elif defined(__b1nix__)\n#define PA_IS_LINUX\n${1}~' "$F"
+  grep -q 'defined(__b1nix__)' "$F" || die "Patch 15 anchor not found in $F"
+  echo "Patch 15 applied: partition_alloc build_config.h (PA_IS_LINUX)"
+else echo "Patch 15 already present/absent"; fi
+
 echo "All b1nix V8 patches applied to $V8"
