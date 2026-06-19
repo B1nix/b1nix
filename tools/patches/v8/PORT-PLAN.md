@@ -5,6 +5,35 @@
 *proven* set of edits that adds `b1nix` as a GN/V8 `target_os`** — the dominant
 blocker from the probe — so the path is mapped before the multi-GB `fetch v8`.
 
+## ✅✅✅ `d8` COMPILES AND LINKS for b1nix (full V8 engine)
+
+`d8.b1nix` = 22 MB `ET_EXEC` `EM_X86_64`, entry `0x2000000`, **0 undefined refs**.
+The whole engine compiles with `x86_64-b1nix-g++` and links via
+**`tools/v8-link-d8.sh`** (gn's own link uses bare g++ + empty sysroot → wrong;
+the script relinks gn's `out/b1nix/d8.rsp` object set with the b1nix recipe:
+ranlib thin archives + `ld -T userspace/linker-cxx.ld crt0.o --start-group @d8.rsp
+--end-group` + libstdc++/libsupc++/libgcc + openlibm `libm.a` + whole-archived
+`libb1nix.a`). Link-chase fixes: `__stack_chk_*`, extern-C malloc/sched, openlibm
+math, **Patch 17 abseil `config.h` `ABSL_HAVE_MMAP`** (else `LOW_LEVEL_ALLOC_MISSING`
+drops per_thread_sem/thread_identity/LowLevelAlloc → 8 refs), `--start-group` wrap.
+Gotcha: gn uses `-MMD` (no sysroot-header dep tracking) → re-staging sysroot
+headers won't rebuild dependents; `rm` the stale `.o` (once.o, marker.o) + rebuild.
+
+### RUN PHASE (next — not started)
+Artifacts preserved at `build/v8-out/` (`d8.b1nix`, `d8.stripped` 13 MB,
+`v8-ext4.img` = ext4 with d8+hello.js, `d8.rsp`). To run:
+1. Build the **x86_64** b1nix ISO (d8 is x86_64; default smoke is x86/32-bit).
+2. Attach an ext4 SATA disk (`build/v8-out/v8-ext4.img`) — 13 MB is too big for the
+   xxd-embedded initramfs.
+3. Mount + run via kernel `user_load_elf64(path)` (a test in
+   `kernel/user/programs.c`, mounting like M14/run_ext_stress) or an init/rc line:
+   `d8 --jitless -e 'print("...")'`.
+4. Expected runtime chase (likely long, iterative): main-thread **TLS** (the
+   `.tbss` link warnings — V8 has 1000s of `thread_local`; loader sets PT_TLS
+   memsz≈131B via `SYS_SET_TLS`), embedded **snapshot** deserialize
+   (`v8_use_external_startup_data=false`), isolate/heap init.
+Goal: `M58-V8: ok hello` from `d8 --jitless`.
+
 ## ✅✅ `ninja v8_libbase` BUILDS for b1nix (real cross-GCC, 41 ELF64 objects)
 
 After a full `gclient sync` + `gn gen target_os=b1nix … v8_jitless=true`, the
