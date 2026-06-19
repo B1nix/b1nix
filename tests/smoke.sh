@@ -56,6 +56,23 @@ if [ "$SMOKE_QUICK" = "1" ] || [ "$SMOKE_LEGACY" = "1" ]; then
 	SMOKE_PARALLEL=0
 fi
 SMOKE_PROGRESS_MODE=full
+
+# Optional V8/d8 instance. d8 (13 MB x86_64 ELF) and its ext4 disk are pre-built
+# artifacts that `make` cannot reproduce from source (they need a multi-GB V8
+# checkout + manual build), so the v8 instance auto-enables ONLY when those
+# artifacts are present and ARCH=x86_64 — and skips honestly otherwise. It boots
+# a dedicated b1nix-v8.iso (b1nix.v8run, no test rc) with the d8 disk as sata0 and
+# checks the result-gated M58-V8 markers. Force-off with SMOKE_V8=0.
+V8_DISK_SRC="$PROJECT_DIR/build/v8-out/v8-ext4.img"
+SMOKE_V8=${SMOKE_V8:-auto}
+if [ "$SMOKE_V8" = "auto" ]; then
+	if [ "$ARCH" = "x86_64" ] && [ "$SMOKE_PARALLEL" = "1" ] && [ -f "$V8_DISK_SRC" ]; then
+		SMOKE_V8=1
+	else
+		SMOKE_V8=0
+	fi
+fi
+
 mkdir -p "$PROJECT_DIR/smoke_run"
 SATA_IMG_BOOT="$PROJECT_DIR/smoke_run/sata-smoke-boot-$$.img"
 NVME_IMG_BOOT="$PROJECT_DIR/smoke_run/nvme-smoke-boot-$$.img"
@@ -70,6 +87,11 @@ SWAP_IMG_USER="$PROJECT_DIR/smoke_run/swap-smoke-user-$$.img"
 SATA_IMG_SHELL="$PROJECT_DIR/smoke_run/sata-smoke-shell-$$.img"
 NVME_IMG_SHELL="$PROJECT_DIR/smoke_run/nvme-smoke-shell-$$.img"
 SWAP_IMG_SHELL="$PROJECT_DIR/smoke_run/swap-smoke-shell-$$.img"
+# v8 instance: sata0 carries a writable COPY of the d8 ext4 disk (so the source
+# artifact is never mutated by journal recovery). No swap/nvme — d8 needs the AHCI
+# controller uncontended to stream its 13 MB binary off the disk at boot.
+SATA_IMG_V8="$PROJECT_DIR/smoke_run/sata-smoke-v8-$$.img"
+V8_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-v8-$ARCH.log"
 
 RED='\033[0;31m'
 GREEN='\033[0;32m'
@@ -168,7 +190,17 @@ run_qemu() {
 			-serial stdio -display ${GPU_DISPLAY:-none} -monitor none -no-reboot \
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
-		if [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
+		if [ "${SMOKE_V8_MODE:-0}" = "1" ]; then
+			# V8/d8 instance: attach ONLY the d8 ext4 disk as sata0. d8 streams a
+			# 13 MB binary off it at boot; if swap/nvme are also present the rc's
+			# M14 storage test hammers the shared AHCI controller and corrupts/stalls
+			# that load. No GPU/net needed — d8 just runs JavaScript.
+			set -- "$@" -nic none -vga none \
+				-device ich9-ahci,id=ahci \
+				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
+				-device ide-hd,drive=satadrive,bus=ahci.0 \
+				${EXTRA_QEMU_ARGS:-}
+		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			set -- "$@" \
 				-device ${GPU_DEVICE:-virtio-gpu-pci} \
 				-netdev user,id=net0,restrict=${B1NIX_NET_RESTRICT:-on} -device virtio-net-pci,netdev=net0 \
@@ -282,7 +314,9 @@ else
 	QUICK_CMDLINE=""
 	[ "$SMOKE_QUICK" = "1" ] && QUICK_CMDLINE="b1nix.smoke=quick"
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell >/dev/null 2>&1 || {
+		V8_ISO_TARGET=""
+		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell $V8_ISO_TARGET >/dev/null 2>&1 || {
 			echo "  ${RED}BUILD FAILED${NC}"
 			exit 1
 		}
@@ -336,6 +370,11 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_USER" 2>/dev/null
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SHELL" 2>/dev/null
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SHELL" 2>/dev/null
+fi
+if [ "$SMOKE_V8" = "1" ]; then
+	# sata0 = a writable copy of the prebuilt d8 disk (so journal recovery never
+	# mutates the source artifact). The v8 instance attaches no swap/nvme.
+	cp "$V8_DISK_SRC" "$SATA_IMG_V8"
 fi
 
 # Define logs
@@ -406,6 +445,20 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 		run_qemu "$SHELL_LOG"
 	) &
 	pid_shell=$!
+	pid_v8=""
+	if [ "$SMOKE_V8" = "1" ]; then
+		(
+			SATA_IMG="$SATA_IMG_V8"
+			SMOKE_V8_MODE=1
+			B1NIX_ISO_NAME=b1nix-v8.iso
+			SMOKE_MEM_MB=${SMOKE_MEM_MB:-2048}
+			SMOKE_DONE_PATTERN="M58-V8: done|KERNEL PANIC|\[PANIC\]"
+			SMOKE_PROGRESS_MODE=full
+			PROGRESS_PREFIX="[v8]   "
+			run_qemu "$V8_LOG"
+		) &
+		pid_v8=$!
+	fi
 	(
 		B1NIX_ISO_NAME=b1nix-core.iso
 		EXTRA_QEMU_ARGS="-smp 4"
@@ -438,6 +491,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	wait $pid_user
 	wait $pid_shell
 	wait $pid_smp
+	[ -n "$pid_v8" ] && wait $pid_v8
 	cat "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" >"$LOG"
 else
 	wait $pid_smp
@@ -1539,6 +1593,32 @@ else
 	pass "SMP self-test completes without panic"
 fi
 
+# ── M58 V8 / d8: real V8 engine runs JavaScript on b1nix (x86_64 only) ──
+# Runs only when the prebuilt d8 artifacts are present (see SMOKE_V8 gating at the
+# top). d8 boots off the ext4 disk, deserializes its embedded snapshot, inits the
+# isolate, and runs m58.js; each marker is gated on a correct computed result.
+if [ "$SMOKE_V8" = "1" ]; then
+	echo ""
+	echo "[RUN] M58 V8/d8 JavaScript-engine checks..."
+	check_output "$V8_LOG" "ELF load: /mnt/v8/d8" "kernel loads the d8 ELF off the ext4 disk"
+	check_output "$V8_LOG" "M58-V8: ok hello" "d8 inits the V8 isolate and runs print()"
+	check_output "$V8_LOG" "M58-V8: ok loop-sum" "d8 evaluates a 100k-iteration arithmetic loop correctly"
+	check_output "$V8_LOG" "M58-V8: ok array-reduce" "d8 builds an array and reduces it correctly"
+	check_output "$V8_LOG" "M58-V8: ok object-sort" "d8 allocates/sorts 500 objects correctly"
+	check_output "$V8_LOG" "M58-V8: ok json" "d8 round-trips nested JSON correctly"
+	check_output "$V8_LOG" "M58-V8: ok gc-churn" "d8 survives 200k short-lived allocations (GC)"
+	check_output "$V8_LOG" "M58-V8: ok recursion" "d8 computes fib(25) via recursion correctly"
+	check_output "$V8_LOG" "M58-V8: done" "d8 runs m58.js to completion"
+	if grep -qa -E "KERNEL PANIC|\[PANIC\]|task 'd8'.*SIGSEGV" "$V8_LOG" 2>/dev/null; then
+		fail "d8 runs without crashing" "PANIC/SIGSEGV detected in v8 log"
+	else
+		pass "d8 runs without crashing"
+	fi
+elif [ "$ARCH" = "x86_64" ] && [ "$SMOKE_PARALLEL" = "1" ]; then
+	echo ""
+	echo "[RUN] M58 V8/d8 — skipped (no prebuilt build/v8-out/v8-ext4.img; build d8 to enable)"
+fi
+
 # ── Summary ──
 echo ""
 echo "=== Results ==="
@@ -1549,6 +1629,7 @@ echo "  Skipped: $SKIPPED"
 rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
 rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
 rm -f "$SATA_IMG_USER" "$NVME_IMG_USER" "$SWAP_IMG_USER"
+rm -f "$SATA_IMG_V8"
 rm -f "$SATA_IMG_SHELL" "$NVME_IMG_SHELL" "$SWAP_IMG_SHELL"
 echo ""
 

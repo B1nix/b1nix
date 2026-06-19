@@ -950,6 +950,24 @@ iso-shell: $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
 
+# V8 run instance: the kernel hook (gated by b1nix.v8run) mounts sata0 -> /mnt/v8
+# and runs d8 on m58.js. It boots in test mode (b1nix.test=1) on purpose: the hook
+# loads d8 off the disk early — before the rc's M14 test touches sata0 — and the
+# active rc keeps the scheduler busy so d8's thread runs. (Without test mode, init
+# drops to an interactive getty/bash that starves d8 on a single CPU.) Reuses the
+# shared kernel.elf — no recompile, just a different grub cmdline. The d8 binary +
+# m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
+iso-v8: $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-v8/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-v8/boot/kernel.elf
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.v8run b1nix.smoke=v8|g' \
+	     -e 's|@MODULE_CMD@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-v8/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-v8.iso $(BUILD_DIR)/iso-v8
+
 iso-live: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-live/boot/grub

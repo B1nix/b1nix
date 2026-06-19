@@ -34,4 +34,20 @@ char *dlerror(void);
 void *dlsym(void *handle, const char *symbol);
 int   dlclose(void *handle);
 
+/*
+ * dladdr() — translate an address to symbol/module info.  b1nix runs only
+ * static ELF binaries with no runtime symbol tables to query, so there is
+ * nothing to resolve: dladdr always reports "not found" (returns 0, the
+ * glibc convention).  Callers (e.g. Mesa's build-id lookup) treat a zero
+ * return as "no info available" and degrade gracefully.
+ */
+typedef struct {
+    const char *dli_fname;   /* pathname of shared object containing address */
+    void       *dli_fbase;   /* base address at which object is loaded       */
+    const char *dli_sname;   /* name of nearest symbol                       */
+    void       *dli_saddr;   /* exact address of that symbol                 */
+} Dl_info;
+
+int dladdr(const void *addr, Dl_info *info);
+
 #endif /* B1NIX_U_DLFCN_H */

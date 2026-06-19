@@ -25,6 +25,21 @@ SECTIONS
 		*(.data .data.*)
 	}
 
+	/* Thread-local storage. Collect every per-variable COMDAT .tdata.<sym>/
+	 * .tbss.<sym> section into one contiguous PT_TLS. Without this, ld places
+	 * each as an orphan and overlaps them all at the same address, so distinct
+	 * thread_locals alias the same storage (the bug that crashed V8's
+	 * Isolate::Enter — see userspace/linker-cxx.ld). Plain-C b1nix binaries
+	 * rarely have >1 thread_local, but keep the layout correct regardless.
+	 * .tbss is NOBITS and must follow .tdata so the segment memsz spans both. */
+	.tdata ALIGN(8) : {
+		*(.tdata .tdata.* .gnu.linkonce.td.*)
+	}
+	.tbss ALIGN(8) : {
+		*(.tbss .tbss.* .gnu.linkonce.tb.*)
+		*(.tcommon)
+	}
+
 	/* ELF constructor array. crt0 walks [__init_array_start, __init_array_end)
 	 * before main(). Empty for plain-C b1nix binaries, but the boundary
 	 * symbols must be defined so crt0 links. */

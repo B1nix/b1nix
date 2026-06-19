@@ -8,6 +8,7 @@
 #include <sys/mman.h>
 #include <setjmp.h>
 #include <signal.h>
+#include <dlfcn.h>
 #include <time.h>
 
 extern int normalize_errno(long rc);
@@ -858,6 +859,22 @@ int dlclose(void *handle)
     (void)handle;
     _dl_errmsg = "dlclose: runtime loading not supported on b1nix";
     return -1;
+}
+
+int dladdr(const void *addr, Dl_info *info)
+{
+    /* Static-only ELF: no loaded-object symbol tables to walk. Report "not
+     * found" the way glibc does on failure (return 0). Zero out the info so a
+     * caller that ignores the return value still sees empty fields rather than
+     * garbage. */
+    (void)addr;
+    if (info) {
+        info->dli_fname = NULL;
+        info->dli_fbase = NULL;
+        info->dli_sname = NULL;
+        info->dli_saddr = NULL;
+    }
+    return 0;
 }
 
 double ldexp(double x, int exp)

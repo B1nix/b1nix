@@ -19,20 +19,56 @@ drops per_thread_sem/thread_identity/LowLevelAlloc → 8 refs), `--start-group` 
 Gotcha: gn uses `-MMD` (no sysroot-header dep tracking) → re-staging sysroot
 headers won't rebuild dependents; `rm` the stale `.o` (once.o, marker.o) + rebuild.
 
-### RUN PHASE (next — not started)
+### ✅✅✅ RUN PHASE DONE — d8 RUNS JAVASCRIPT ON b1nix (v0.58.2)
+
+`M58-V8: ok hello` — real V8 `d8 --jitless -e 'print(...)'` boots, deserializes
+its embedded snapshot, inits the isolate/heap, and **executes JS** under
+QEMU/x86_64. Serial log: `ELF load: /mnt/v8/d8 entry=0x2000000` →
+`v8: d8 spawn result: 603` → `M58-V8: ok hello`, zero SIGSEGV.
+
+**Reproduce:**
+1. `make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1 b1nix.v8run" iso`
+2. `sh tools/v8-run-qemu.sh` — attaches `build/v8-out/v8-ext4.img` as AHCI sata0,
+   greps the serial log for `M58-V8: ok hello`.
+
+The kernel hook (`kernel/main.c`, guarded by `b1nix.v8run`) mounts sata0 →
+/mnt/v8 then `user_spawn("/mnt/v8/d8", {"d8","--jitless","-e",
+"print('M58-V8: ok hello')"})`. d8 ships on the ext4 disk (13 MB, too big for the
+xxd initramfs). Relink: `tools/v8-link-d8.sh`; restage into image:
+`debugfs -w -R "rm /d8" img; debugfs -w -R "write d8.stripped /d8" img`.
+
+**THE runtime bug — TLS variable overlap (root-caused + fixed).** d8 first
+SIGSEGV'd in `v8::internal::Isolate::Enter()` at `mov %fs:0,%r12; mov
+-0x8(%r12),%rbp; mov (%rbp),%rax` — the TLS slot read back the *thread id*
+(0x25b = pid 603) instead of a pointer. Cause: `userspace/linker-cxx.ld` had **no
+`.tdata`/`.tbss` rule**, so ld placed each of V8's dozens of COMDAT
+`.tbss.<mangled>` sections as an orphan and **overlapped them all at one address**
+(readelf: sections 14–24 all at the same VA; `thread_id`, `g_current_isolate_`,
+`g_current_per_isolate_thread_data_` all at ti=0x18). V8 caching the tid in
+`thread_id` stomped `g_..._thread_data_` → bad pointer → fault. Fix: add
+`.tdata : { *(.tdata .tdata.*) }` + `.tbss : { *(.tbss .tbss.*) *(.tcommon) }`
+so each thread_local gets a distinct PT_TLS offset (now 0x40/0x48/0x50; memsz
+0x83→0x98). The loader's variant-II TLS setup (`process.c:1549`) was correct all
+along — the *linker script* was the bug. (Plain `linker.ld` has the same latent
+gap but survives because its few C binaries have ≤1 TLS var.)
+
+**Two libc gaps surfaced building the (orthogonal) graphics ports for the ISO,
+fixed (ship in ISO):** `dladdr`/`Dl_info` (dlfcn.h + stdlib.c stub returning 0 =
+"not found", correct for static-only ELF; Mesa `util/build_id.c` needs it) and
+`FUTEX_BITSET_MATCH_ANY 0xffffffff` in `<linux/futex.h>` (Mesa `util/futex.c`).
+Build-tree hygiene: parked agent worktrees had baked absolute
+`.claude/worktrees/agent-XXXX/` paths into the shared `build/` `.la`/`.pc`/
+Makefile/CMakeCache files; collapse with
+`sed -i -E 's|/b1nix/\.claude/worktrees/agent-[a-z0-9]+/|/b1nix/|g'` over text
+files + purge contaminated CMakeCache dirs. (Mesa also needed `build-mesa.sh`'s
+`ninja -k 0` to finish `libmesa_util.a` after the intentional libOSMesa.so fail.)
+
+#### Original run-phase plan (kept for reference)
 Artifacts preserved at `build/v8-out/` (`d8.b1nix`, `d8.stripped` 13 MB,
-`v8-ext4.img` = ext4 with d8+hello.js, `d8.rsp`). To run:
-1. Build the **x86_64** b1nix ISO (d8 is x86_64; default smoke is x86/32-bit).
-2. Attach an ext4 SATA disk (`build/v8-out/v8-ext4.img`) — 13 MB is too big for the
-   xxd-embedded initramfs.
-3. Mount + run via kernel `user_load_elf64(path)` (a test in
-   `kernel/user/programs.c`, mounting like M14/run_ext_stress) or an init/rc line:
-   `d8 --jitless -e 'print("...")'`.
-4. Expected runtime chase (likely long, iterative): main-thread **TLS** (the
-   `.tbss` link warnings — V8 has 1000s of `thread_local`; loader sets PT_TLS
-   memsz≈131B via `SYS_SET_TLS`), embedded **snapshot** deserialize
-   (`v8_use_external_startup_data=false`), isolate/heap init.
-Goal: `M58-V8: ok hello` from `d8 --jitless`.
+`v8-ext4.img` = ext4 with d8+hello.js, `d8.rsp`).
+- Expected runtime chase: main-thread **TLS** (✅ was the linker bug above),
+  embedded **snapshot** deserialize (`v8_use_external_startup_data=false` — worked
+  first try), isolate/heap init (worked once TLS fixed).
 
 ## ✅✅ `ninja v8_libbase` BUILDS for b1nix (real cross-GCC, 41 ELF64 objects)
 

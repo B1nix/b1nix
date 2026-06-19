@@ -18,4 +18,9 @@
 #define FUTEX_WAIT_PRIVATE   (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
 #define FUTEX_WAKE_PRIVATE   (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
 
+/* Bitset that matches every waiter (used with FUTEX_WAIT/WAKE_BITSET). b1nix's
+ * futex syscall does not partition waiters by bitset, so MATCH_ANY is the only
+ * meaningful value — it degenerates to a plain WAIT/WAKE, which is correct. */
+#define FUTEX_BITSET_MATCH_ANY 0xffffffff
+
 #endif

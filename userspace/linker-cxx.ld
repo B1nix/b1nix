@@ -29,6 +29,22 @@ SECTIONS
 		*(.data .data.*)
 	}
 
+	/* Thread-local storage. V8/libstdc++ emit one COMDAT .tdata.<sym>/.tbss.<sym>
+	 * section per thread_local (there are dozens). Without an explicit collection
+	 * rule, ld places each as an orphan and overlaps them all at the same address
+	 * — so distinct thread_locals (e.g. V8's thread_id and
+	 * g_current_per_isolate_thread_data_) alias the same storage and stomp each
+	 * other, faulting in Isolate::Enter. Gather them into one contiguous PT_TLS so
+	 * each variable gets its own offset. .tbss is NOBITS and must follow .tdata so
+	 * the segment's memsz spans both. */
+	.tdata ALIGN(8) : {
+		*(.tdata .tdata.* .gnu.linkonce.td.*)
+	}
+	.tbss ALIGN(8) : {
+		*(.tbss .tbss.* .gnu.linkonce.tb.*)
+		*(.tcommon)
+	}
+
 	/* Global constructors. GCC/libstdc++ on this target emit a mix of the modern
 	 * .init_array form AND the legacy priority-suffixed .ctors.NNNNN form — the
 	 * iostream initializer (_GLOBAL__sub_I...__ZSt3cin, which constructs
