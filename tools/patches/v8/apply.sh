@@ -189,4 +189,17 @@ if ! grep -q 'gnu++20' "$F"; then
   echo "Patch 16 applied: compiler/BUILD.gn (gnu++20 for GCC)"
 else echo "Patch 16 already present"; fi
 
+# --- Patch 17: abseil config.h — ABSL_HAVE_MMAP for b1nix --------------------
+# Keys on __linux__ etc.; without it b1nix lacks ABSL_HAVE_MMAP, which sets
+# ABSL_LOW_LEVEL_ALLOC_MISSING and compiles OUT per_thread_sem.cc,
+# create_thread_identity.cc and LowLevelAlloc — leaving CreateThreadIdentity,
+# AbslInternalPerThreadSem*, LowLevelAlloc::Free undefined at d8 link. b1nix has
+# mmap+MAP_ANONYMOUS, so enable it. third_party → wiped by sync.
+F="$V8/third_party/abseil-cpp/absl/base/config.h"
+if [ -f "$F" ] && ! grep -q 'defined(__b1nix__) || defined(__linux__)' "$F"; then
+  perl -0777 -i -pe 's~(#elif )(defined\(__linux__\) \|\| defined\(__APPLE__\))~${1}defined(__b1nix__) || ${2}~' "$F"
+  grep -q 'defined(__b1nix__) || defined(__linux__)' "$F" || die "Patch 17 anchor not found in $F"
+  echo "Patch 17 applied: abseil config.h (ABSL_HAVE_MMAP)"
+else echo "Patch 17 already present/absent"; fi
+
 echo "All b1nix V8 patches applied to $V8"
