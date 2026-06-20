@@ -154,7 +154,7 @@ jobs:
             echo
             echo "### Recent failures"
             echo '```text'
-            grep -RaiE "FAIL|failed|KERNEL PANIC|\\[PANIC\\]|timeout" smoke_run 2>/dev/null | tail -80 || true
+            grep -RaiE "FAIL|failed|fatal error:| error:|undefined reference|No such file|not found|cannot (find|open|create|compute)|FAILED:|make(\\[[0-9]+\\])?: \\*\\*\\*|KERNEL PANIC|\\[PANIC\\]|timeout" smoke_run 2>/dev/null | tail -120 || true
             echo '```'
           } >> "$GITHUB_STEP_SUMMARY"
 
