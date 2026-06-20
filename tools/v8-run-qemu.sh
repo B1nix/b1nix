@@ -14,9 +14,9 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
-ISO="$ROOT_DIR/build/x86_64/b1nix.iso"
-DISK="$ROOT_DIR/build/v8-out/v8-ext4.img"
-LOG="$ROOT_DIR/smoke_run/v8-run.log"
+ISO="${ISO:-$ROOT_DIR/build/x86_64/b1nix.iso}"
+DISK="${DISK:-$ROOT_DIR/build/v8-out/v8-ext4.img}"
+LOG="${LOG:-$ROOT_DIR/smoke_run/v8-run.log}"
 TIMEOUT="${TIMEOUT:-120}"
 
 [ -f "$ISO" ]  || { echo "missing $ISO — build the x86_64 ISO first"; exit 1; }

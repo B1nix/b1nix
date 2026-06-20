@@ -4,8 +4,11 @@
 #
 # Flips v8_jitless=false and turns on the JIT pipeline. TurboFan is mandatory for
 # any non-jitless build (V8 asserts jitless <=> all tiers off), so it goes on with
-# Sparkplug (the baseline JIT). Maglev (mid-tier) and WebAssembly stay OFF to keep
-# the first JIT port's surface area down — enable them once d8 --jit runs.
+# Sparkplug (the baseline JIT) and Maglev (the mid-tier JIT). Maglev is verified on
+# b1nix: the full m58.js suite (12 markers + done) runs fault-free with Maglev on
+# and the code cage off. WebAssembly stays OFF (still out of scope). The code cage
+# (v8_enable_external_code_space) also stays OFF — see the note on it below; enabling
+# it surfaces residual code-pointer/RSP corruption that needs a dedicated V8 chase.
 #
 # Prereqs (same as sync-v8.sh, already cached): gn, the synced+patched v8 checkout.
 # No gclient sync here — the tree is already synced and apply.sh'd.
@@ -28,7 +31,7 @@ cd "$SK/v8"
 #   v8_jitless=false                       -> enable the JIT
 #   v8_enable_sparkplug=true               -> baseline JIT tier
 #   v8_enable_turbofan=true                -> optimizing tier (mandatory when not jitless)
-#   v8_enable_maglev=false                 -> skip the mid-tier for the first port
+#   v8_enable_maglev=true                  -> mid-tier JIT (verified on b1nix)
 #   v8_enable_webassembly=false            -> Wasm still out of scope
 #   v8_enable_pointer_compression=true     -> ON: compressed 32-bit data-heap
 #                                             pointers (the memory win — important on
@@ -41,7 +44,7 @@ cd "$SK/v8"
 #                                             jumps to ~0x400 → crash at isolate init.
 #                                             Off = full 64-bit *code* pointers (no code
 #                                             cage), while data pointers stay compressed.
-"$GN" gen out/b1nix-jit --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=false v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=false'
+"$GN" gen out/b1nix-jit --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=false'
 
 echo
 echo "=== gn gen (JIT) OK -> out/b1nix-jit. Next: ==="
