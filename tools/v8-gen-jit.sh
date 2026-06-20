@@ -30,14 +30,18 @@ cd "$SK/v8"
 #   v8_enable_turbofan=true                -> optimizing tier (mandatory when not jitless)
 #   v8_enable_maglev=false                 -> skip the mid-tier for the first port
 #   v8_enable_webassembly=false            -> Wasm still out of scope
-#   v8_enable_pointer_compression=false    -> JIT'd code decompresses pointers with
-#                                             a cage base that comes out wrong on
-#                                             b1nix (every decompressed pointer lands
-#                                             near-null → crash). Full 64-bit pointers
-#                                             sidestep the cage entirely for the first
-#                                             JIT bring-up; revisit the cage base later.
-#   v8_enable_external_code_space=false    -> depends on pointer compression
-"$GN" gen out/b1nix-jit --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=false v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=false v8_enable_external_code_space=false'
+#   v8_enable_pointer_compression=true     -> ON: compressed 32-bit data-heap
+#                                             pointers (the memory win — important on
+#                                             memory-constrained b1nix). Verified
+#                                             13/13 on b1nix once the code cage is off.
+#   v8_enable_external_code_space=false    -> OFF is REQUIRED on b1nix: the separate
+#                                             *code* cage comes up with a zero base, so
+#                                             JIT'd/builtin code pointers decompress to
+#                                             near-null and the first indirect call
+#                                             jumps to ~0x400 → crash at isolate init.
+#                                             Off = full 64-bit *code* pointers (no code
+#                                             cage), while data pointers stay compressed.
+"$GN" gen out/b1nix-jit --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=false v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=false'
 
 echo
 echo "=== gn gen (JIT) OK -> out/b1nix-jit. Next: ==="

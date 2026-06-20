@@ -60,6 +60,13 @@ struct pthread_state {
   void *arg;
   int exited;
   struct pthread_state *next_dead;
+  /* Per-thread ELF TLS block (variant II). tls_tp is the thread pointer the
+   * bootstrap installs as the FS base (0 = the image has no PT_TLS, fall back
+   * to the legacy state-pointer placeholder). tls_map/tls_map_size is the
+   * mmap'd backing, munmap'd at thread teardown. See build_thread_tls(). */
+  unsigned long tls_tp;
+  void *tls_map;
+  size_t tls_map_size;
 };
 
 static struct pthread_state *g_dead_detached = NULL;
@@ -72,6 +79,9 @@ static void __pthread_cleanup_dead_detached(void) {
     struct pthread_state *dead = *curr;
     if (__atomic_load_n(&dead->child_tid, __ATOMIC_ACQUIRE) == 0) {
       *curr = dead->next_dead;
+      if (dead->tls_map) {
+        munmap(dead->tls_map, dead->tls_map_size);
+      }
       if (dead->stack_base) {
         munmap(dead->stack_base, dead->stack_size);
       }
@@ -96,13 +106,81 @@ static void __pthread_cleanup_dead_detached(void) {
 void __pthread_tsd_run_dtors(void);   /* defined with the TSD code below */
 void __pthread_cancel_forget(long tid); /* defined with the cancellation code */
 
+/* Build a per-thread ELF TLS block (x86 variant II) for `st`, mirroring the
+ * layout the kernel loader gives the main thread (process.c): a region holding
+ * [ .tdata | .tbss ] with the thread pointer (TP) just above it, TP[0] = TP (the
+ * self pointer `mov %fs:0` reads), and thread-locals at negative offsets from
+ * TP. The PT_TLS template (size/align + the .tdata init image) comes from the
+ * kernel via SYS_GET_TLS_INFO; it's identical for every thread, so cache it.
+ * Sets st->tls_tp (0 when the image has no TLS — keep the legacy placeholder).
+ * Returns 0 on success, -1 on allocation failure. */
+static int build_thread_tls(struct pthread_state *st) {
+  static struct b1nix_tls_info info;
+  static unsigned char *init_img; /* cached .tdata init image (filesz bytes) */
+  static int probed, has_tls;
+
+  st->tls_tp = 0;
+  st->tls_map = 0;
+  st->tls_map_size = 0;
+
+  /* The PT_TLS template is identical for every thread, so fetch it once. Guard
+   * the one-time probe: V8 (and other libraries) spawn threads concurrently, and
+   * an unlocked probe could race two creators on init_img (one reading a
+   * half-filled buffer). The lock is held only for the cold path. */
+  if (!__atomic_load_n(&probed, __ATOMIC_ACQUIRE)) {
+    static pthread_mutex_t probe_lock = PTHREAD_MUTEX_INITIALIZER;
+    pthread_mutex_lock(&probe_lock);
+    if (!probed) {
+      if (syscall(SYS_GET_TLS_INFO, &info, 0, 0) == 0 && info.memsz > 0) {
+        has_tls = 1;
+        if (info.filesz) {
+          init_img = (unsigned char *)malloc(info.filesz);
+          if (init_img)
+            syscall(SYS_GET_TLS_INFO, 0, init_img, info.filesz);
+        }
+      }
+      __atomic_store_n(&probed, 1, __ATOMIC_RELEASE);
+    }
+    pthread_mutex_unlock(&probe_lock);
+  }
+  if (!has_tls)
+    return 0;
+
+  unsigned long align = info.align < 8 ? 8 : info.align;
+  unsigned long tls_size = (info.memsz + align - 1) & ~(align - 1);
+  unsigned long tcb = 64; /* self pointer + spare slots */
+  /* +align of slack so we can align `region` up within the mapping. */
+  unsigned long want = tls_size + tcb + align;
+  unsigned long map_size = (want + 0xFFF) & ~0xFFFUL;
+
+  unsigned char *blk = (unsigned char *)mmap(0, map_size, PROT_READ | PROT_WRITE,
+                                             MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+  if (blk == (void *)-1)
+    return -1;
+
+  uintptr_t region = ((uintptr_t)blk + align - 1) & ~(uintptr_t)(align - 1);
+  uintptr_t tp = region + tls_size;
+  /* mmap memory is zero-filled (so .tbss is already clear); lay the .tdata init
+   * image at the bottom of the region. */
+  if (info.filesz && init_img)
+    memcpy((void *)region, init_img, info.filesz);
+  *(uintptr_t *)tp = tp; /* variant-II self pointer at TP[0] */
+
+  st->tls_tp = tp;
+  st->tls_map = blk;
+  st->tls_map_size = map_size;
+  return 0;
+}
+
 static void pthread_bootstrap(void *raw) {
   struct pthread_state *st = (struct pthread_state *)raw;
 
-  /* Publish %fs base so userspace TLS reads land at our state pointer.
-   * b1nix's libc doesn't use TLS-qualified globals yet; this is a
-   * placeholder that exercises the SYS_SET_TLS path end-to-end. */
-  syscall(SYS_SET_TLS, st);
+  /* Publish the %fs base. With a real per-thread TLS block (st->tls_tp, built in
+   * pthread_create) ELF thread-locals work in spawned threads exactly as on the
+   * main thread; without one (image has no PT_TLS) fall back to the legacy
+   * state-pointer placeholder. The libc itself never reads %fs:0 (pthread_self
+   * uses SYS_GETTID), so either base is safe for libc internals. */
+  syscall(SYS_SET_TLS, st->tls_tp ? (void *)st->tls_tp : (void *)st);
 
   void *r = st->start_routine(st->arg);
   st->retval = r;
@@ -164,6 +242,12 @@ int pthread_create(pthread_t *thread, const pthread_attr_t *attr,
   st->stack_base = stack;
   st->stack_size = stack_size;
 
+  /* Build this thread's ELF TLS block up front (in the parent) so the bootstrap
+   * just installs the ready thread pointer. Failure here is non-fatal — leave
+   * tls_tp 0 and fall back to the placeholder base (only matters for binaries
+   * that actually use thread-locals in spawned threads). */
+  build_thread_tls(st);
+
   /* x86-64 SysV: stack grows down; align top to 16 bytes; leave room for a
    * minimal initial frame. We don't need argc/argv on the stack — the
    * kernel transfers control to pthread_bootstrap(state) directly via
@@ -221,6 +305,7 @@ int pthread_join(pthread_t thread, void **retval) {
   }
 
   if (retval) *retval = st->retval;
+  if (st->tls_map) munmap(st->tls_map, st->tls_map_size);
   if (st->stack_base) munmap(st->stack_base, st->stack_size);
   free(st);
   return 0;

@@ -1651,6 +1651,22 @@ static int user_run_elf_image(struct user_loaded_image *image) {
   /* A freshly started program expects a clean FPU/MXCSR (SysV ABI). Reset the
    * live FPU here since exec replaces the image without a context switch. */
   arch_fpu_init_current();
+  /* arch_fpu_init_current() resets the LIVE FPU to the masked ABI default but
+   * leaves this task's fpu_state save-area untouched — and for a fresh slot
+   * that area is still the kzalloc'd zero, i.e. FCW=0x0000 (all x87 exceptions
+   * UNMASKED). A later fork()'s memcpy(child, parent, sizeof(struct task)) then
+   * copies that zero buffer (plus fpu_initialized=1) into the child, so the
+   * child restores an unmasked control word and traps with #MF on the first
+   * x87 op that observes a pending flag — e.g. libm nearbyint's fldenv, hit by
+   * V8 TurboFan tier-up. Flush the clean state into the save-area now so it
+   * always holds the real masked 0x037F. */
+  {
+    extern void arch_fpu_save(void *area);
+    if (current_task) {
+      arch_fpu_save(current_task->fpu_state);
+      current_task->fpu_initialized = 1;
+    }
+  }
 
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,

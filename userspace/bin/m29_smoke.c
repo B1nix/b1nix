@@ -222,6 +222,53 @@ static int test_condvar(void) {
   return 0;
 }
 
+/* ── 3b: real ELF __thread storage across pthreads (the V8 thread_local path) ──
+ * Each spawned thread must get its OWN copy of a __thread variable, initialised
+ * from the .tdata image, with no bleed between siblings or the main thread.
+ * Before per-thread ELF TLS in pthread_create, spawned threads ran with no real
+ * TLS block and a thread_local read faulted (V8 TurboFan #fs:0 null-deref). */
+
+static __thread long tl_value = 0xABBA; /* .tdata init image */
+static __thread long tl_zero;           /* .tbss — must start zero per thread */
+
+static volatile int g_tl_fail = 0;
+
+static void *t_tls_worker(void *arg) {
+  long id = (long)arg;
+  /* Every thread starts from the init image, not a sibling's writes. */
+  if (tl_value != 0xABBA || tl_zero != 0) {
+    __atomic_store_n(&g_tl_fail, 1, __ATOMIC_RELEASE);
+    return 0;
+  }
+  tl_value = id;
+  tl_zero = id ^ 0x5555;
+  /* Spin so siblings run concurrently — a shared slot would get clobbered. */
+  for (volatile int i = 0; i < 200000; i++) { (void)i; }
+  if (tl_value != id || tl_zero != (id ^ 0x5555))
+    __atomic_store_n(&g_tl_fail, 1, __ATOMIC_RELEASE);
+  return 0;
+}
+
+static int test_thread_local(void) {
+  tl_value = 0x1111; /* main thread's own copy (loader-set TLS) */
+  g_tl_fail = 0;
+  pthread_t th[4];
+  for (long i = 0; i < 4; i++) {
+    if (pthread_create(&th[i], 0, t_tls_worker, (void *)(i + 1)) != 0) {
+      fail("thread-local-create"); return -1;
+    }
+  }
+  for (int i = 0; i < 4; i++) pthread_join(th[i], 0);
+  if (__atomic_load_n(&g_tl_fail, __ATOMIC_ACQUIRE)) {
+    fail("thread-local-bleed"); return -1;
+  }
+  if (tl_value != 0x1111) { /* workers must not touch main's copy */
+    fail("thread-local-main-clobbered"); return -1;
+  }
+  ok("thread-local");
+  return 0;
+}
+
 /* ── 4: TLS round-trip ── */
 
 static int test_tls(void) {
@@ -608,6 +655,7 @@ int main(void) {
   if (test_attr() != 0)        return 1;
   if (test_mutex() != 0)       return 1;
   if (test_condvar() != 0)     return 1;
+  if (test_thread_local() != 0) return 1;
   if (test_tls() != 0)         return 1;
   if (test_gettid() != 0)      return 1;
   if (test_tsd() != 0)         return 1;

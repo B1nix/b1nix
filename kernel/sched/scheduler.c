@@ -928,6 +928,13 @@ int scheduler_fork_current(void) {
   // 1. Copy the task structure
   memcpy(child, parent, sizeof(struct task));
   child->id = claimed_id;
+  /* The memcpy copied the parent's fpu_state SAVE-AREA, which is only refreshed
+   * on a context switch-out and may lag the parent's live FPU. Capture the
+   * parent's current (live) FPU directly so the child inherits the real FP
+   * environment — POSIX fork semantics, and it guarantees a masked control word
+   * rather than a stale/zero one (see the exec-time flush in process.c). */
+  arch_fpu_save(child->fpu_state);
+  child->fpu_initialized = 1;
   child->parent_id = parent->id;
   child->state = TASK_BLOCKED;
   child->name = parent->name ? strdup(parent->name) : 0;

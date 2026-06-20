@@ -56,12 +56,19 @@ in ISO, v0.58.3):
 2. **PROT_NONE mmap allocated frames eagerly** → V8's cage/DecommitPages churn
    drained+corrupted the PMM free list. Fixed: PROT_NONE anonymous mmap uses the
    lazy (no-frame) path. kernel/syscall/syscall.c sys_mmap.
-3. **Pointer compression must be OFF.** PC-ON JIT crashed on near-null pointers
-   (0x25b/0x400/0x81a = a compressed pointer decompressed with a wrong/zero cage
-   base — jitless works because the *interpreter* decompresses correctly; JIT'd
-   code uses the base differently) AND drove the PMM corruption. `v8-gen-jit.sh`
-   sets `v8_enable_pointer_compression=false v8_enable_external_code_space=false`.
-   Revisit the cage-base setup later to re-enable PC (smaller heap).
+3. **🎉 Pointer compression WORKS with the CODE CAGE off** (the memory win for
+   b1nix — compressed 32-bit data-heap pointers). The bug was specifically the
+   *external code space* (the separate **code** cage): on b1nix its base comes up
+   ZERO, so JIT'd/builtin code pointers decompress to near-null and the first
+   indirect call jumps to ~0x400 → crash at isolate init. The data cage was fine
+   all along. Root-caused by gdb post-mortem (serial showed the original PC crash
+   `rip=0x400 cr2=0x400` = jump-to-near-null; jitless was immune only because
+   `v8_jitless=true` emits NO JIT code, so its code cage is never exercised).
+   **FIX:** `v8_enable_pointer_compression=true v8_enable_external_code_space=false`
+   in `v8-gen-jit.sh`. Verified: a PC+no-ECS d8 (out/b1nix-jit-pcdata) runs the
+   full 13-marker m58.js suite to completion under Sparkplug (`--no-opt`), 0
+   crashes. (TurboFan tier-up still crashes separately — see below — independent
+   of PC; the working JIT config remains Sparkplug + this PC setting.)
 
 **🎉 SPARKPLUG BASELINE JIT FULLY WORKS — the COMPLETE m58.js suite (13 markers).**
 With `--no-opt` (TurboFan off, Sparkplug baseline JIT only) d8 runs the entire test
@@ -72,26 +79,134 @@ Both jitless (interpreter) AND Sparkplug pass the full 13-marker suite. So a bro
 realistic JS feature set works under the baseline JIT on b1nix. The kernel hook runs
 `d8 --single-threaded --no-opt /mnt/v8/m58.js`; the smoke v8 instance checks all 13.
 
-**TurboFan optimization is the single isolated bug (the next chase).** Without
-`--no-opt`, any function hot enough to tier up to TurboFan crashes — fib(20) and
-fib(25) both crash in isolation at the same site, `DefaultForegroundTaskRunner::
-deque::_M_push_back_aux` (#GP, the optimized-code-install task post); gc-churn 30k
-crashed the same way (the alloc loop tiering up). loop-sum/array-reduce/etc. pass
-because they don't reach the TurboFan threshold. Ruled out: threading
-(single-threaded unchanged), concurrency (`--no-concurrent-recompilation` crashes
-the same — TurboFan runs synchronously and still faults), volume/OOM (4 GB no
-help), cumulative state (fib alone crashes), recursion-specificity (a plain
-non-recursive hot loop also crashes, via OSR), FP (FPU masked FCW=0x037F). The
-earlier #MF-on-`vfork`-`ret` is a misdecode (a `ret` can't raise #MF). Multi-
-threaded is worse (background threads hit near-null). `--trace-opt` pins the exact
-sequence: `[marking <fn> for optimization to TURBOFAN_JS]` →
-`[compiling method <fn> (target TURBOFAN_JS) ... kSynchronous]` → crash at the same
-deque `_M_push_back_aux` (#GP, cr2 a stack addr). So the fault is in the TurboFan
-**compile / optimized-code-install** path — most likely heap/memory corruption
-from TurboFan's heavy Zone-allocation churn (the crash lands on the *next*
-container op), or a codegen/reloc bug in the installed code; Sparkplug's lighter
-allocation is fine. Next: b1nix GDB stub (M36) to break on TurboFan finalize and
-watch the heap, or bisect passes via `--turbo-filter` / `--trace-turbo`.
+**TurboFan layer 1 — the #MF was a real b1nix FPU bug, now FIXED (v0.58.4).**
+The earlier post-mortem analysis (below) was MISLED by a clobbered core and
+wrongly dismissed FP as "FPU masked FCW=0x037F / #MF-on-`ret` is a misdecode."
+A live QEMU-gdbstub session (`qemu … -gdb tcp::1234 -S`, host gdb,
+`hbreak` on the `fldenv` in `nearbyint+32`) showed the FIRST fault under
+TurboFan is a **#MF (x87 FP exception, vec 0x10) inside libm `nearbyint`**:
+`nearbyint` does `fegetenv` → `rint` → `fldenv -0x28(%rbp)`, and the saved env
+it reloads has **FCW=0x0000 (all x87 exceptions UNMASKED) + FSW=0x0001 (Invalid
+pending)** while the live FPU was the correct 0x037f. So the control word had
+been zeroed; `fldenv` unmasks the pending Invalid → #MF → V8 `OS::Abort`.
+
+Root cause: **fork copied a stale/zero FPU save-area.** `exec`
+(`arch_fpu_init_current`) resets the *live* FPU to the masked default but never
+flushed the task's `fpu_state` buffer, which for a fresh slot is the kzalloc'd
+zero (FCW=0x0000). `scheduler_fork_current`'s `memcpy(child, parent, sizeof
+task)` then copied that zero buffer + `fpu_initialized=1` into the child, so the
+child restored an unmasked control word. Fix (two parts): (1) flush the clean
+FPU into the save-area right after `arch_fpu_init_current` at exec
+(`kernel/user/process.c`); (2) snapshot the parent's *live* FPU into the child
+at fork (`arch_fpu_save(child->fpu_state)` in `kernel/sched/scheduler.c`) for
+correct POSIX FP inheritance. This is a general kernel bug — any forked process
+doing FP could inherit a zeroed FCW, not just V8. Verified: the #MF is gone,
+full smoke green (only the v8-instance's by-design M14-nvme/M27-cmdline noise).
+
+**TurboFan layer 2 — the NEXT chase (open): real per-thread ELF TLS.** With the
+FPU fix, d8 TurboFan-ON runs *past* nearbyint and faults deeper: a **page fault
+at cr2=0x0** (err=0x5, user read). The fault `rip=0x32864a1` is in the STATIC d8
+binary (0x2000000–0x347ffff, NOT JIT'd code), so it disassembles directly
+(`x86_64-b1nix-objdump -d --start-address=… build/v8-out/d8-jit.b1nix`). The
+faulting instruction is:
+
+    32864a1:  64 48 8b 1c 25 00 00 00 00   mov %fs:0x0,%rbx   (in v8::base::OS::GetCurrentThreadId)
+
+i.e. a **`thread_local` read** (V8 caches its tid in a thread_local; the fn then
+reads `-0x18(%rbx)`/`-0x10(%rbx)`). `cr2=0x0` ⇒ **FS base is 0** for this thread,
+so the access lands at linear 0. Root cause is architectural: **b1nix libc
+`pthread.c` does NOT implement real ELF TLS for spawned threads** (see its own
+comment, "b1nix doesn't compile with ELF TLS sections… we don't expose
+thread-local-storage to user code"): `pthread_create` clones WITHOUT
+`CLONE_SETTLS` and the bootstrap just `SYS_SET_TLS(st)` parks the `pthread_state`
+pointer at `%fs:0`. But V8 uses genuine `thread_local` variables — the very
+`.tdata/.tbss` COMDATs the `linker-cxx.ld` fix collects — and its worker/platform
+threads (present even under `--single-threaded`) read them. Only the MAIN thread
+gets a proper variant-II TLS image (set up by the ELF loader, process.c:~1549);
+spawned threads get no per-thread `.tdata/.tbss` copy ⇒ thread_local read faults.
+V8's SIGSEGV handler *also* calls GetCurrentThreadId (thread_local) ⇒ re-faults ⇒
+**d8 hangs** instead of aborting. This is the same "background threads hit
+near-null" symptom noted earlier.
+
+**Layer-2a DONE — real per-thread ELF TLS (commit 4232fc7, v0.58.5).** Added
+`SYS_GET_TLS_INFO(161)` (exposes the running image's PT_TLS template) and made
+`pthread_create` build a variant-II TLS block per thread (mirroring the loader's
+main-thread layout: `[.tdata|.tbss][TCB]`, self-pointer at `%fs:0`, install as
+the FS base; probe mutex-guarded for concurrent spawns; munmap'd at join/detach).
+Verified `M29-PTHREAD: ok thread-local` (4 pthreads, per-thread `__thread`, no
+bleed) on boot+v8 instances; x86_64 smoke 804/0 OS-green. Safe for existing
+pthread users (libc never reads `%fs:0` — `pthread_self` uses SYS_GETTID).
+
+**Layer-2b — the SECOND root cause: `user_jump.S` clobbers the FS base at ring3
+entry.** Even after per-thread TLS, a relinked d8 (new libc) faulted at the SAME
+`mov %fs:0` in GetCurrentThreadId — but on the MAIN thread (rsp = `USER_STACK_TOP
+− 2032`; worker stacks mmap at ~4 GB via `vm_find_free_area`). Kernel trace
+(`DBG LTLS`/`STLS`) proved the loader DID set main's FS base (`tp=0x7fffff7fe0b0`)
+yet main ran with FS base 0 and NO intervening SYS_SET_TLS. Root cause:
+`x86_user_jump` does `mov %ax,%fs` (user-data selector) on the way to ring3, and
+**in 64-bit mode loading a segment selector ZEROES that segment's base**, wiping
+the IA32_FS_BASE MSR the loader just programmed. The code already skips `%gs` for
+exactly this reason; it wrongly reloaded `%fs`. The scheduler restores the base
+on the next context switch, so a thread only faults if it reads a `thread_local`
+BEFORE its first preemption — my libc change shifted d8's timing to expose it
+(pre-existing latent bug; affects any TLS-before-first-switch program). Fix
+(`user_jump.S`): snapshot the FS base (`rdmsr 0xC0000100`) before the selector
+load and restore it (`wrmsr`) after — keep the selector correct (arch_set_fs_base
+relies on `%fs` pointing at the user-data descriptor, per arch.c) AND the base
+intact. TWO gotchas: (1) naive "just drop `mov %ax,%fs`" is WRONG — leaving a
+non-user `%fs` selector breaks userspace. (2) `rdmsr`/`wrmsr` clobber eax/edx/ecx
+which ALIAS argc(`%rdx`)/argv(`%rcx`) — must stash BOTH in scratch (r10/r11)
+around the MSR ops, else `main` gets a garbage argc (= FS-base-high = `0x7fff…`
+for a TLS program → mis-parses args → hangs). This was the real cause of the
+"hang" first misdiagnosed as layer-2c.
+
+**Layer-2b VERIFIED: the FS-base+argc fix CRACKS the GetCurrentThreadId crash.**
+With #MF + per-thread TLS + the `user_jump.S` fix, the relinked d8 **runs the
+full Sparkplug suite (`M58-V8: ok hello … ok recursion … done`, 0 faults)** on
+`-smp 1` in test mode, and under TurboFan reaches `M58-V8: ok hello` before the
+next (separate) crash. (Standalone non-`test=1` boots STARVE d8 — getty/bash hog
+the single CPU — always run d8 with `b1nix.test=1` so the rc keeps the scheduler
+busy. And use `-smp 1` to avoid the SMP issue below.)
+
+**Layer-2c — OPEN #1: SMP `tlb_shootdown timeout` panic.** Under `-smp 2`, d8's
+heavy mmap/munmap (per-thread TLS blocks + the V8 cage) triggers cross-CPU TLB
+shootdowns and the kernel panics `[PANIC] tlb_shootdown timeout` (one vCPU not
+acking the IPI in time). `-smp 1` avoids it entirely. Could be host
+oversubscription (the box was hammered) OR a real SMP bug (a CPU stuck with
+interrupts off during a TLS munmap). Next: reproduce idle `-smp 2`; if real,
+audit the munmap/TLB-shootdown path for an irqs-off window.
+
+**Layer-2c #2 — FIXED (v0.58.7): the nearbyint `#MF` was a STUB `fegetenv`.**
+d8 TurboFan hit vec 0x10 at `rip=0x32f7840` (`fldenv` in libm `nearbyint`) on the
+main thread. nearbyint does `fegetenv(&env)` → `rint` → INLINE `fldenv -0x28(%rbp)`
+over the 28-byte x87 env. Pinned by elimination: kernel FPU-save trace never fired
+(not a context-switch bug), `FE_DFL_ENV` is correct (`__INITIAL_FPUCW__=0x037F`),
+and the relinked d8 has ZERO `fldcw`/`fldenv`/`fxrstor`/`fninit` except nearbyint's
+own — so nothing sets FCW. Disasm of `fegetenv` (0x3306120) showed the smoking
+gun: **`movl $0x0,(%rdi); ret`** — a STUB (`userspace/libc/unistd.c`) that wrote a
+ZERO control word (FCW=0, all x87 exceptions unmasked) + left the rest of the env
+as stack garbage, instead of doing a real `fnstenv`. So nearbyint's inline fldenv
+reloaded FCW=0 + garbage → #MF. (`fesetenv`/`feholdexcept` were stubs too.) FIX:
+implement them with real `fnstenv`/`fldenv`/`stmxcsr`/`ldmxcsr`, and grow `fenv_t`
+from 4 bytes (`{unsigned int __cw}`) to the real 32-byte x86_64 layout (28-byte
+x87 env + 4-byte mxcsr) — openlibm's nearbyint already uses that layout, and the
+old 4-byte struct would overflow once fegetenv writes a full env. VERIFIED: d8
+TurboFan runs `ok hello → ok recursion(fib25) → done`, 0 #MF, `-smp 1`. NOTE: a
+benign `#EXC cr2=0xdead0000` (V8 exit-teardown poison write) fires AFTER `done` on
+both Sparkplug and TurboFan — JS already complete; minor follow-up, not a crash.
+GOTCHA: the `fenv.h` change forces a full Mesa rebuild (Mesa includes fenv).
+
+---
+*Historical (pre-fix, partly wrong) post-mortem, kept for the method:* a b1nix
+M35 core (`coredump_write` → `/mnt/v8/core`, `debugfs -R "dump /core out.core"`,
+host `gdb d8-jit.b1nix out.core`) put the apparent fault at
+`DefaultForegroundTaskRunner::deque::_M_push_back_aux`, `rip=0x329375b`
+mid-instruction — read as "control-flow corruption." That core was from a
+*later/secondary* fault with a stack clobbered by V8's own SIGSEGV handler, so
+the deque/`#GP` story was a red herring; the real first fault is the #MF above.
+A boundary-tag libc validator (header==footer on every free) emitted **zero
+`HEAP-CORRUPT` markers** through the fib(25) compile, correctly ruling out libc
+heap corruption. (All that instrumentation was reverted, not committed.)
 
 ## ✅✅✅ `d8` COMPILES AND LINKS for b1nix (full V8 engine)
 

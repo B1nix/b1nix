@@ -188,6 +188,16 @@ enum {
   /* --- POSIX memory / signal completeness --- */
   SYS_MADVISE         = 159,
   SYS_SIGALTSTACK     = 160,
+  SYS_GET_TLS_INFO    = 161,
+};
+
+/* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the
+ * libc can build a per-thread ELF TLS block in pthread_create (the kernel sets
+ * up only the main thread's TLS at exec). memsz==0 => the binary has no TLS. */
+struct b1nix_tls_info {
+  unsigned long memsz;  /* total TLS size (.tdata + .tbss) */
+  unsigned long filesz; /* initialised-image size (.tdata) */
+  unsigned long align;  /* TLS segment alignment (>=1) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

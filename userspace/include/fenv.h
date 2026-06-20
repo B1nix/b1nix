@@ -22,7 +22,14 @@ extern "C" {
 #define FE_TOWARDZERO 0xc00
 
 typedef unsigned int fexcept_t;
-typedef struct { unsigned int __cw; } fenv_t;
+/* x86_64 fenv_t: the 28-byte x87 environment (as written by `fnstenv`) followed
+ * by the 4-byte MXCSR (as written by `stmxcsr`) — matching the layout openlibm's
+ * nearbyint/rint expect for their inline `fldenv`/`ldmxcsr`. Must be 32 bytes:
+ * fegetenv() really does fnstenv+stmxcsr, so a smaller struct would overflow. */
+typedef struct {
+  unsigned int __x87[7]; /* control, status, tag, ip, cs/opcode, dp, ds */
+  unsigned int __mxcsr;
+} fenv_t;
 
 int feclearexcept(int excepts);
 int feraiseexcept(int excepts);

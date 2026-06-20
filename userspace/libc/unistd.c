@@ -1797,13 +1797,42 @@ int fegetexceptflag(fexcept_t *flagp, int e) { (void)e; if (flagp) *flagp = 0; r
 int fesetexceptflag(const fexcept_t *flagp, int e) { (void)flagp; (void)e; return 0; }
 int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
 int fesetround(int r) { (void)r; return 0; }
-/* Saving/restoring the FP environment is a no-op under the fixed mode. openlibm
- * nearbyint/rint wrap rounding in fegetenv/fesetenv only to hide the inexact
- * flag; the rounding itself is done by the FP path, so these stubs are sound. */
-int fegetenv(fenv_t *envp) { if (envp) envp->__cw = 0; return 0; }
-int fesetenv(const fenv_t *envp) { (void)envp; return 0; }
-int feholdexcept(fenv_t *envp) { if (envp) envp->__cw = 0; return 0; }
-int feupdateenv(const fenv_t *envp) { (void)envp; return 0; }
+/* Real save/restore of the x86_64 FP environment (x87 via fnstenv/fldenv + SSE
+ * MXCSR via stmxcsr/ldmxcsr). These MUST be real, not stubs: openlibm's
+ * nearbyint/rint call fegetenv() and then do an INLINE `fldenv` over the saved
+ * 28-byte x87 env. A stub that wrote only a zero control word left the env's FCW
+ * at 0 (all x87 exceptions UNMASKED) + the rest stack garbage, so the inline
+ * fldenv reasserted a pending exception and raised #MF (V8 TurboFan hit this via
+ * nearbyint during optimized codegen). fnstenv masks exceptions as a side
+ * effect, so reload the just-saved env to leave the live FPU as it was. */
+int fegetenv(fenv_t *envp) {
+  if (envp) {
+    __asm__ volatile("fnstenv %0; fldenv %0" : "+m"(*envp));
+    __asm__ volatile("stmxcsr %0" : "=m"(envp->__mxcsr));
+  }
+  return 0;
+}
+int fesetenv(const fenv_t *envp) {
+  if (envp) {
+    __asm__ volatile("fldenv %0" : : "m"(*envp));
+    __asm__ volatile("ldmxcsr %0" : : "m"(envp->__mxcsr));
+  }
+  return 0;
+}
+/* Save the env, then mask + clear all exceptions (x87 and SSE) so subsequent FP
+ * ops can't trap until feupdateenv() restores. */
+int feholdexcept(fenv_t *envp) {
+  if (envp) {
+    __asm__ volatile("fnstenv %0" : "=m"(*envp));
+    __asm__ volatile("fnclex");
+    unsigned int mxcsr;
+    __asm__ volatile("stmxcsr %0" : "=m"(envp->__mxcsr));
+    mxcsr = (envp->__mxcsr | 0x1F80u) & ~0x3Fu; /* mask all, clear flags */
+    __asm__ volatile("ldmxcsr %0" : : "m"(mxcsr));
+  }
+  return 0;
+}
+int feupdateenv(const fenv_t *envp) { return fesetenv(envp); }
 
 /* openlibm's fma() calls __isnormal; provide the glibc-style classifier. */
 int __isnormal(double x) { return __builtin_isnormal(x); }

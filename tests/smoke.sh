@@ -1033,6 +1033,7 @@ check_output "$LOG" "M29-PTHREAD: ok create-join" "pthread_create + pthread_join
 check_output "$LOG" "M29-PTHREAD: ok attr" "pthread_attr stack size + detach state are honored"
 check_output "$LOG" "M29-PTHREAD: ok mutex" "pthread mutex serialises two threads"
 check_output "$LOG" "M29-PTHREAD: ok condvar" "pthread condvar signal/wait works"
+check_output "$LOG" "M29-PTHREAD: ok thread-local" "real ELF __thread storage is per-thread in spawned pthreads"
 check_output "$LOG" "M29-PTHREAD: ok tls" "SYS_SET_TLS + %fs:0 round-trip works"
 check_output "$LOG" "M29-PTHREAD: ok gettid" "SYS_GETTID returns distinct ids per thread"
 check_output "$LOG" "M29-PTHREAD: ok stress-smp" "120 rounds of unjoined-thread exit reclaim the shared mm (no PMM leak)"

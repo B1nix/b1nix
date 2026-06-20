@@ -3304,6 +3304,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     arch_set_fs_base(arg0);
     return 0;
   }
+  case SYS_GET_TLS_INFO: {
+    /* SYS_GET_TLS_INFO(info, image_out, image_cap) — expose the running image's
+     * PT_TLS template so the libc can build a per-thread ELF TLS block in
+     * pthread_create (the kernel only sets up the main thread's TLS at exec).
+     * info (struct b1nix_tls_info: memsz, filesz, align) is filled if non-NULL;
+     * if image_out is non-NULL up to image_cap bytes of the .tdata init image
+     * are copied out. Returns 0, or -errno. */
+    struct task *t = current_task;
+    if (!t || !t->user_image) return (u64)-EINVAL;
+    struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+    if (arg0) {
+      struct { u64 memsz, filesz, align; } info = {
+          img->tls_memsz, img->tls_filesz,
+          img->tls_align ? img->tls_align : 8};
+      if (syscall_copyout((void *)(usize)arg0, &info, sizeof(info)) < 0)
+        return (u64)-EFAULT;
+    }
+    if (arg1 && img->tls_data && img->tls_filesz) {
+      u64 n = img->tls_filesz < arg2 ? img->tls_filesz : arg2;
+      if (syscall_copyout((void *)(usize)arg1, img->tls_data, (usize)n) < 0)
+        return (u64)-EFAULT;
+    }
+    return 0;
+  }
   case SYS_GETTID:
     return (u64)scheduler_get_pid();
   case SYS_EXIT_THREAD:

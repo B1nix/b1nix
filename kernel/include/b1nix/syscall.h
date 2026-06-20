@@ -189,6 +189,7 @@ enum {
 	/* --- POSIX memory / signal completeness --- */
 	SYS_MADVISE         = 159,
 	SYS_SIGALTSTACK     = 160,
+	SYS_GET_TLS_INFO    = 161,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

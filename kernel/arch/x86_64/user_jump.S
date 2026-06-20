@@ -10,14 +10,33 @@ x86_user_jump:
     /* First entry into ring 3 for this task. The BKL is fully retired
      * (M28 #7) — there is no kernel lock to drop before dropping to ring 3. */
 
-    /* Set up segment registers for Ring 3. We deliberately do NOT reload %gs:
-     * in 64-bit mode loading a GS selector resets the GS base, and the kernel
-     * keeps its per-CPU base in GS (no SWAPGS) so the syscall handler can read
-     * the per-CPU current task via %gs:0x10. b1nix userspace does not use %gs. */
+    /* Set up segment registers for Ring 3. The %fs selector must point at the
+     * user-data descriptor (arch_set_fs_base relies on this), but in 64-bit mode
+     * loading a segment selector RESETS that segment's base — which would zero
+     * the userspace TLS base the loader/scheduler just programmed into the
+     * IA32_FS_BASE MSR. A thread that reads %fs:N (a thread_local) before its
+     * first context switch (which would otherwise restore the base) then faults
+     * near null. So: snapshot the FS base, reload the selectors, then restore
+     * the base via wrmsr. (We still do NOT reload %gs: the kernel keeps its
+     * per-CPU base there with no SWAPGS.) */
+    /* rdmsr/wrmsr clobber eax/edx/ecx — which alias argc (%rdx) and argv (%rcx),
+     * still needed below. Stash both in scratch (r10/r11, zeroed before iretq). */
+    movq %rcx, %r10        /* save argv */
+    movq %rdx, %r11        /* save argc */
+    movl $0xC0000100, %ecx /* IA32_FS_BASE */
+    rdmsr                  /* edx:eax = current FS base */
+    movl %eax, %r8d
+    movl %edx, %r9d
     mov $0x1B, %ax /* User Data selector (0x18 | 3) */
     mov %ax, %ds
     mov %ax, %es
-    mov %ax, %fs
+    mov %ax, %fs           /* sets selector, zeroes FS base */
+    movl %r8d, %eax
+    movl %r9d, %edx
+    movl $0xC0000100, %ecx
+    wrmsr                  /* restore FS base the loader/scheduler set */
+    movq %r10, %rcx        /* restore argv */
+    movq %r11, %rdx        /* restore argc */
 
     /* Prepare stack frame for iretq */
     /* [SS] [RSP] [RFLAGS] [CS] [RIP] */
