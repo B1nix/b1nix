@@ -774,16 +774,17 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [x] `done` **Multi-CPU:** `-smp 2` runs both Sparkplug and TurboFan to completion,
   0 faults (3/3 runs each, full suite). Required fixing an SMP `tlb_shootdown`
   deadlock in `sys_mmap` (drain in-flight shootdowns per page) — v0.58.5.
-- [x] `done` **Maglev** (mid-tier JIT) now enabled and verified: the full m58.js
-  suite (12 markers + `done`) runs fault-free with Maglev on (`v8_enable_maglev=true`
-  in `tools/v8-gen-jit.sh`). The earlier "code-cage zero-base" blocker turned out to
-  be the same FS-base/TLS issue fixed for TurboFan — with the cage *off*, Maglev is
-  clean.
-- Config: pointer-compression data cage **on**, **Maglev on**, external code space
-  (code cage) **off**, WebAssembly and i18n disabled. The code cage stays off: it now
-  gets a real base (the zero-base bug is fixed) but surfaces residual code-pointer/RSP
-  corruption (a `0x400` code pointer; faults writing V8 read-only regions) that needs
-  a dedicated live-gdb V8 chase — tracked, not yet fixed. Run via
+- [x] `done` **Maglev** (mid-tier JIT) **and the code cage** (external code space)
+  now both enabled and verified: the full m58.js suite (12 markers + `done`) runs
+  fault-free under Sparkplug AND TurboFan with `v8_enable_maglev=true` and
+  `v8_enable_external_code_space=true` (`tools/v8-gen-jit.sh`). The long-standing
+  "code-cage zero-base / `0x400` crash" was never a V8 bug — it was a b1nix
+  **`sys_mmap`** bug: it honored V8's sub-4 GiB cage hint, which collides with the
+  supervisor-only low-4 GiB identity map (2 MB huge pages cloned into every address
+  space), so a user access there faulted as a present supervisor page. Fixed by
+  relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
+- Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
+  WebAssembly and i18n disabled. Run via
   `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`, d8 on `sata0`.
 - [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
   a standalone `/bin/js` runner/REPL — the lightweight JS vector; superseded for

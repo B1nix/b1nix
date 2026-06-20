@@ -540,6 +540,18 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   console_write_hex64(frame->cs);
   console_write("\nrflags: 0x");
   console_write_hex64(frame->rflags);
+  console_write("\nrax=0x"); console_write_hex64(frame->rax);
+  console_write(" rbx=0x"); console_write_hex64(frame->rbx);
+  console_write(" rcx=0x"); console_write_hex64(frame->rcx);
+  console_write("\nrdx=0x"); console_write_hex64(frame->rdx);
+  console_write(" rsi=0x"); console_write_hex64(frame->rsi);
+  console_write(" rdi=0x"); console_write_hex64(frame->rdi);
+  console_write("\nrbp=0x"); console_write_hex64(frame->rbp);
+  console_write(" r8=0x");  console_write_hex64(frame->r8);
+  console_write(" r9=0x");  console_write_hex64(frame->r9);
+  console_write("\nr12=0x"); console_write_hex64(frame->r12);
+  console_write(" r13=0x"); console_write_hex64(frame->r13);
+  console_write(" r14=0x"); console_write_hex64(frame->r14);
   console_write("\n");
 
   arch_backtrace(frame->rbp, frame->rip);

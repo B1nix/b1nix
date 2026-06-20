@@ -1895,7 +1895,18 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
       vaddr = vm_find_free_area(t, length);
     } else {
       vaddr = (u64)(usize)addr;
-      if ((vaddr & (PAGE_SIZE - 1)) != 0) {
+#ifdef __x86_64__
+      /* A non-FIXED hint is advisory. The low 4 GiB is the bootstrap identity
+       * map (2 MB supervisor huge pages cloned into every address space), where
+       * a 4 KiB user PTE can't be inserted — an access there faults as a present
+       * supervisor page (P=1), which the lazy-map #PF path can't service. So a
+       * hint below 4 GiB (e.g. V8's code-cage reservation requesting ~0x6000000)
+       * must be ignored and relocated, exactly like vm_find_free_area, which
+       * deliberately starts at 0x100000000 for the same reason. */
+      if (vaddr != 0 && vaddr < 0x100000000ULL)
+        vaddr = 0; /* force the relocation paths below */
+#endif
+      if (vaddr == 0 || (vaddr & (PAGE_SIZE - 1)) != 0) {
         vaddr = vm_find_free_area(t, length);
       } else {
         /* Verify hint doesn't overlap existing VMAs */
