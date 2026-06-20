@@ -32,7 +32,7 @@ jobs:
   quick-smoke:
     name: quick smoke (${{ matrix.arch }})
     runs-on: ubuntu-latest
-    timeout-minutes: 90
+    timeout-minutes: 240
     strategy:
       fail-fast: false
       matrix:
@@ -69,6 +69,9 @@ jobs:
             grub-common \
             grub-pc-bin \
             gzip \
+            libgmp-dev \
+            libmpc-dev \
+            libmpfr-dev \
             libtool \
             lld \
             llvm \
@@ -88,7 +91,8 @@ jobs:
             vim-common \
             wget \
             xorriso \
-            xz-utils
+            xz-utils \
+            zlib1g-dev
 
       - name: QEMU/KVM preflight
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
@@ -120,6 +124,18 @@ jobs:
       - name: Check host tools
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
         run: make ARCH=${{ matrix.arch }} check-tools
+
+      - name: Ensure cross toolchain
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        env:
+          B1NIX_ARCH: ${{ matrix.arch }}
+          TRIPLET: ${{ matrix.arch == 'x86' && 'i686-b1nix' || 'x86_64-b1nix' }}
+        run: |
+          if [ ! -x "build/toolchain_build/$TRIPLET/cross/bin/$TRIPLET-g++" ]; then
+            tools/build-toolchain.sh
+          else
+            tools/enable-cxx-toolchain.sh "$TRIPLET"
+          fi
 
       - name: Run quick smoke
         if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
