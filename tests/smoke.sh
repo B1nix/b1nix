@@ -295,6 +295,16 @@ echo ""
 
 echo "[BUILD] Building kernel for $ARCH..."
 cd "$PROJECT_DIR"
+BUILD_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-build-$ARCH.log"
+print_build_failure() {
+	echo "  ${RED}BUILD FAILED${NC}"
+	echo "  build log: $BUILD_LOG"
+	if [ -f "$BUILD_LOG" ]; then
+		echo "  --- build log tail ---"
+		tail -80 "$BUILD_LOG"
+		echo "  --- end build log tail ---"
+	fi
+}
 # SKIP_BUILD=1 reuses an existing build/$ARCH/b1nix.iso (e.g. when the toolchain
 # can't rebuild every userspace port locally). SMOKE_MAKE_ARGS lets the caller
 # inject extra make flags (e.g. CC=clang LD=ld.lld on Fedora, where `cc` is gcc).
@@ -316,14 +326,14 @@ else
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		V8_ISO_TARGET=""
 		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell $V8_ISO_TARGET >/dev/null 2>&1 || {
-			echo "  ${RED}BUILD FAILED${NC}"
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+			print_build_failure
 			exit 1
 		}
 	else
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >/dev/null 2>&1 || {
-		echo "  ${RED}BUILD FAILED${NC}"
-		exit 1
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
+			print_build_failure
+			exit 1
 		}
 	fi
 fi

@@ -15,7 +15,7 @@ TARBALL="libnslog-${NSLOG_VERSION}-src.tar.gz"
 URL="https://download.netsurf-browser.org/libs/releases/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 FLEX_BIN="${FLEX:-$(command -v flex)}"
-BISON_BIN="${BISON:-$(command -v bison)}"
+BISON_BIN="${BISON:-$(command -v /opt/homebrew/opt/bison/bin/bison 2>/dev/null || command -v bison)}"
 
 . "$ROOT_DIR/tools/toolchain-env.sh"
 
@@ -27,6 +27,12 @@ GEN_DIR="$BUILD_DIR/gen"
 INSTALL_DIR="$BUILD_DIR/install"
 
 mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$GEN_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
+
+BISON_MAJOR="$("$BISON_BIN" --version | sed -n '1s/.* \([0-9][0-9]*\)\..*/\1/p')"
+if [ -z "$BISON_MAJOR" ] || [ "$BISON_MAJOR" -lt 3 ]; then
+  echo "build-libnslog.sh: bison 3.x is required for filter-parser.y (found: $("$BISON_BIN" --version | head -1))" >&2
+  exit 1
+fi
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"

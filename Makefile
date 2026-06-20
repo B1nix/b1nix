@@ -553,6 +553,18 @@ $(BUILD_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSP
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m51_xkb_smoke_elf userspace/build/$(ARCH)/bin/m51_xkb_smoke > $@
 
+# M49: libwayland-client/server share one generated source/build tree. Build it
+# once at the top level so parallel initramfs packaging cannot race two nested
+# userspace make invocations through tools/build-wayland.sh.
+WAYLAND_CLIENT_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-client.a
+WAYLAND_SERVER_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-server.a
+$(WAYLAND_CLIENT_LIB): tools/build-wayland.sh tools/build-libffi.sh
+	B1NIX_ARCH=$(ARCH) tools/build-wayland.sh >/dev/null
+$(WAYLAND_SERVER_LIB): $(WAYLAND_CLIENT_LIB)
+
+$(BUILD_DIR)/initramfs_m49_libwayland.inc: $(WAYLAND_CLIENT_LIB)
+$(BUILD_DIR)/initramfs_m49_libwayland_server.inc: $(WAYLAND_SERVER_LIB)
+
 # M51: HarfBuzz (HB_TINY, unified C++ build via cross g++), cross-built static.
 HB_LIB := build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install/lib/libharfbuzz.a
 $(HB_LIB): tools/build-harfbuzz.sh
