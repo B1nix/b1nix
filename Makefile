@@ -967,6 +967,9 @@ iso-v8: $(KERNEL_ELF)
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-v8/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-v8.iso $(BUILD_DIR)/iso-v8
+# NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
+# config and matches the jitless d8 on v8-ext4.img. The JIT d8 is exercised
+# manually (build the default ISO with b1nix.v8jit + the v8-jit-ext4.img disk).
 
 iso-live: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)

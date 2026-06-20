@@ -198,10 +198,42 @@ void *malloc(size_t size)
 	return p;
 }
 
+/* Sentinel marking an over-aligned block (see ma_aligned below). Its bit 0 is
+ * CLEAR; a live boundary-tag header is always MA_PACK(size, 1) with the alloc
+ * bit set, so a real header can never equal the sentinel — no collision on
+ * either arch (the low word is what 32-bit reads). */
+#define MA_ALIGNED_MAGIC ((size_t)0xA11C0CA11C0CA110ULL)
+
+/* For an over-aligned payload, recover the original malloc block pointer; for an
+ * ordinary block, return it unchanged. Every malloc-family entry that reaches
+ * into the boundary-tag header (free/realloc/malloc_usable_size) must go through
+ * this — otherwise it reads the sentinel as a size and corrupts the heap. */
+static void *ma_base_ptr(void *ptr)
+{
+	if (!ptr) return ptr;   /* realloc(NULL, 0) reaches here before any null check */
+	if (((size_t *)ptr)[-1] == MA_ALIGNED_MAGIC)
+		return (void *)(size_t)((size_t *)ptr)[-2];
+	return ptr;
+}
+
+/* Usable bytes reachable from `ptr` (accounting for the alignment shift of an
+ * over-aligned block, whose payload starts above the malloc block). */
+static size_t ma_user_size(void *ptr)
+{
+	void *base = ma_base_ptr(ptr);
+	size_t block_payload = MA_SIZE(MA_HDR(base)) - MA_DSIZE;
+	size_t off = (size_t)ptr - (size_t)base;   /* 0 for an ordinary block */
+	return block_payload - off;
+}
+
 void free(void *ptr)
 {
+	if (!ptr) return;
+	/* Over-aligned blocks stash the sentinel in the word just below the payload
+	 * and the real malloc pointer below that; recover it before freeing. */
+	void *base = ma_base_ptr(ptr);
 	pthread_mutex_lock(&g_malloc_lock);
-	_free_unlocked(ptr);
+	_free_unlocked(base);
 	pthread_mutex_unlock(&g_malloc_lock);
 }
 
@@ -374,14 +406,18 @@ char *realpath(const char *path, char *resolved_path)
 
 static void *_realloc_unlocked(void *ptr, size_t size)
 {
-	if (size == 0) { _free_unlocked(ptr); return NULL; }
+	if (size == 0) { _free_unlocked(ma_base_ptr(ptr)); return NULL; }
 	if (!ptr) return _malloc_unlocked(size);
-	size_t old_payload = MA_SIZE(MA_HDR(ptr)) - MA_DSIZE; /* usable bytes in old block */
+	/* Honour over-aligned blocks: copy from the (possibly shifted) user payload,
+	 * but free the real malloc block. The reallocated block is only 16-aligned —
+	 * standard realloc never promises to preserve over-alignment, and callers that
+	 * need it (e.g. V8's Isolate) do not realloc. */
+	size_t old_usable = ma_user_size(ptr);
 	void *new_ptr = _malloc_unlocked(size);
 	if (!new_ptr) return NULL;
-	size_t copy = size < old_payload ? size : old_payload;
+	size_t copy = size < old_usable ? size : old_usable;
 	memcpy(new_ptr, ptr, copy);
-	_free_unlocked(ptr);
+	_free_unlocked(ma_base_ptr(ptr));
 	return new_ptr;
 }
 
@@ -398,7 +434,7 @@ void *realloc(void *ptr, size_t size)
 size_t malloc_usable_size(void *ptr)
 {
 	if (!ptr) return 0;
-	return MA_SIZE(MA_HDR(ptr)) - MA_DSIZE;
+	return ma_user_size(ptr);
 }
 
 long strtol(const char *nptr, char **endptr, int base)
@@ -1404,16 +1440,36 @@ char *mkdtemp(char *tmpl) {
 	return NULL;
 }
 
-/* posix_memalign / aligned_alloc. b1nix malloc already returns 16-byte aligned
- * payloads, which satisfies SSE2 (the only vector ISA b1nix enables — no AVX).
- * ponytail: alignments > 16 still get 16-byte alignment, keeping the result
- * free()-compatible (callers like Mesa free aligned memory with plain free()).
- * Upgrade the allocator if a port ever needs strict >16-byte alignment. */
+/* Aligned allocation. b1nix malloc returns 16-byte-aligned payloads; for
+ * alignment > 16 (V8's JIT needs the Isolate page-aligned so isolate_data_ is
+ * 64-aligned; some ports want cache-line alignment) we over-allocate, bump the
+ * payload up to the requested boundary, and stash a sentinel + the original
+ * malloc pointer in the two words just below it so plain free() still works
+ * (see free() / MA_ALIGNED_MAGIC). Power-of-two alignment only. */
+static void *ma_aligned(size_t alignment, size_t size) {
+  if (alignment <= MA_DSIZE)                 /* malloc already 16-aligns */
+    return malloc(size ? size : 1);
+  if (alignment == 0 || (alignment & (alignment - 1)) != 0)
+    return 0;                                /* must be a power of two */
+  size_t want = size ? size : 1;
+  size_t slack = alignment + 2 * MA_WSIZE;   /* room to shift up + 2 metadata words */
+  if (want > (size_t)-1 - slack)
+    return 0;                                /* overflow */
+  char *raw = malloc(want + slack);
+  if (!raw)
+    return 0;
+  size_t base = (size_t)raw + 2 * MA_WSIZE;
+  size_t aligned = (base + (alignment - 1)) & ~(alignment - 1);
+  ((size_t *)aligned)[-1] = MA_ALIGNED_MAGIC;          /* sentinel for free() */
+  ((size_t *)aligned)[-2] = (size_t)raw;               /* real block to free */
+  return (void *)aligned;
+}
+
 int posix_memalign(void **memptr, size_t alignment, size_t size) {
   if (!memptr || (alignment & (alignment - 1)) != 0 ||
       alignment % sizeof(void *) != 0)
     return EINVAL;
-  void *p = malloc(size ? size : 1);
+  void *p = ma_aligned(alignment, size);
   if (!p)
     return ENOMEM;
   *memptr = p;
@@ -1421,14 +1477,11 @@ int posix_memalign(void **memptr, size_t alignment, size_t size) {
 }
 
 void *aligned_alloc(size_t alignment, size_t size) {
-  (void)alignment;
-  return malloc(size ? size : 1);
+  return ma_aligned(alignment, size);
 }
 
 /* memalign: SVID/BSD aligned allocator (used by libstdc++'s operator new when
- * its config detects _GLIBCXX_HAVE_MEMALIGN). Same 16-byte, free()-compatible
- * backing as aligned_alloc above — no strict >16-byte alignment guarantee. */
+ * its config detects _GLIBCXX_HAVE_MEMALIGN). */
 void *memalign(size_t alignment, size_t size) {
-  (void)alignment;
-  return malloc(size ? size : 1);
+  return ma_aligned(alignment, size);
 }

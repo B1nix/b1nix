@@ -1923,13 +1923,18 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
   if (prot & PROT_WRITE)
     vmm_flags |= VMM_WRITABLE;
 
-  if ((flags & MAP_ANONYMOUS) && (flags & MAP_NORESERVE)) {
-    /* MAP_NORESERVE anonymous: lazy commit. Mark each page VMM_LAZY (no frame
-     * reserved up front); the page-fault handler's Case 1 zero-fills a fresh
-     * frame on first touch (anonymous → no VMA node → stays zeroed). This is
-     * b1nix's only commit model for NORESERVE — no fake reservation accounting,
-     * just defer the physical allocation, which is exactly the documented
-     * semantics. */
+  if ((flags & MAP_ANONYMOUS) && ((flags & MAP_NORESERVE) || prot == PROT_NONE)) {
+    /* Lazy commit — no frame reserved up front; the page-fault handler's Case 1
+     * zero-fills a fresh frame on first touch (anonymous → no VMA node → stays
+     * zeroed). Used for two cases:
+     *   - MAP_NORESERVE anonymous: defer the physical allocation (documented
+     *     NORESERVE semantics, no fake reservation accounting).
+     *   - PROT_NONE anonymous: a pure reservation/decommit with no access, so a
+     *     physical frame is pointless until the region is mprotect'd to an
+     *     accessible mode and touched. Eagerly allocating frames here drained
+     *     and corrupted the PMM free list under V8's JIT, whose cage reservations
+     *     and OS::DecommitPages (mmap PROT_NONE | MAP_FIXED, no NORESERVE) churn
+     *     large PROT_NONE ranges. */
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       vmm_set_lazy(v);
       paging_mprotect_page(v, vmm_flags);

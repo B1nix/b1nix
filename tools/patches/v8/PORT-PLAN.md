@@ -5,6 +5,94 @@
 *proven* set of edits that adds `b1nix` as a GN/V8 `target_os`** — the dominant
 blocker from the probe — so the path is mapped before the multi-GB `fetch v8`.
 
+## 🚧 JIT PORT (in progress) — enabling V8's JIT on b1nix
+
+The shipped d8 is **jitless** (interpreted Ignition only). Next milestone: the
+JIT pipeline (Sparkplug baseline + TurboFan optimizing). Prep + kickoff:
+
+**Prerequisite audit (b1nix x86_64):**
+- **Executable memory: already works.** mmap'd pages are executable by default
+  (the kernel sets NX = `VMM_NO_EXECUTE` bit 63 only when explicitly asked; mmap
+  never does). b1nix already runs dynamically-generated machine code — TCC (M25)
+  JITs and executes C in-VM. V8's `OS::SetPermissions` (platform-posix.cc) cycles
+  `mprotect` RW↔RX↔RWX; on b1nix's permissive model every one resolves to an
+  executable page, so JIT code runs. **No kernel change needed to get JIT working.**
+- **W^X / NX hardening: NOT enforced** (pages V8 marks RW/R-only stay executable).
+  `sys_mprotect` ignores `PROT_EXEC` and never sets NX; `PROT_NONE` reserves stay
+  readable (guard pages don't trap). Functional-but-not-hardened — a security
+  follow-up, not a JIT blocker. Tighten only if the run-chase shows V8 depending
+  on a real guard-page trap.
+- **I-cache coherence: free on x86_64** (coherent; no explicit flush). (ARM would
+  need `__builtin___clear_cache`.)
+- **Signals: work** (SIGSEGV/handlers proven during the jitless bring-up).
+- **mksnapshot: host-built.** gn builds mksnapshot under the `clang_x64` (host)
+  toolchain and runs it on Linux to emit the embedded snapshot + x64 builtins, so
+  the cross setup is fine for JIT too (confirmed: the JIT `ninja` builds
+  `clang_x64/.../libc++` for the host mksnapshot).
+
+**Build:** `tools/v8-gen-jit.sh` → a SEPARATE `out/b1nix-jit` (keeps the proven
+jitless `out/b1nix` as a fallback). Flips `v8_jitless=false` +
+`v8_enable_sparkplug=true v8_enable_turbofan=true` (TurboFan mandatory when not
+jitless), `v8_enable_maglev=false` + `v8_enable_webassembly=false` to keep the
+surface down. JIT compiles+links cleanly first try — the jitless port already
+paved the whole libc surface (3003 targets PC-on / 2446 PC-off; relink with
+`sh tools/v8-link-d8.sh b1nix-jit`). Run via the default ISO built with
+`b1nix.v8jit` (kernel hook drops `--jitless`; also passes `--single-threaded`
+during bring-up) + the `v8-jit-ext4.img` disk (a copy of v8-ext4.img with the JIT
+d8 swapped in).
+
+**🎉 JIT RUNS JAVASCRIPT (PC-off): 5/8 m58.js markers, ZERO corruption.** Real
+Sparkplug/TurboFan executes JS on b1nix — hello + loop-sum (100k JIT'd loop) +
+array-reduce + object-sort + json. Three real OS bugs fixed to get here (all ship
+in ISO, v0.58.3):
+1. **Aligned allocators were stubs** (`posix_memalign`/`aligned_alloc`/`memalign`
+   ignored alignment → just malloc/16B). V8 needs the Isolate page-aligned
+   (`AlignedAlloc(sizeof(Isolate), 4096)`) so `isolate_data_` is 64-aligned
+   (`Check failed: IsAligned(...)`). Rewrote as real over-aligned allocation with
+   a sentinel + raw-ptr stashed below the payload so plain free() recovers it;
+   the sentinel's bit 0 is clear, which a live boundary-tag header never is.
+   `realloc`/`malloc_usable_size` made aligned-aware too (they were reading the
+   sentinel as a size → heap corruption). userspace/libc/stdlib.c.
+2. **PROT_NONE mmap allocated frames eagerly** → V8's cage/DecommitPages churn
+   drained+corrupted the PMM free list. Fixed: PROT_NONE anonymous mmap uses the
+   lazy (no-frame) path. kernel/syscall/syscall.c sys_mmap.
+3. **Pointer compression must be OFF.** PC-ON JIT crashed on near-null pointers
+   (0x25b/0x400/0x81a = a compressed pointer decompressed with a wrong/zero cage
+   base — jitless works because the *interpreter* decompresses correctly; JIT'd
+   code uses the base differently) AND drove the PMM corruption. `v8-gen-jit.sh`
+   sets `v8_enable_pointer_compression=false v8_enable_external_code_space=false`.
+   Revisit the cage-base setup later to re-enable PC (smaller heap).
+
+**🎉 SPARKPLUG BASELINE JIT FULLY WORKS — the COMPLETE m58.js suite (13 markers).**
+With `--no-opt` (TurboFan off, Sparkplug baseline JIT only) d8 runs the entire test
+to completion, ZERO crashes/corruption, ~90s: hello + loop-sum (100k) + array-reduce
++ object-sort + json + gc-churn (30k objects) + recursion (fib 25) + **closure +
+try/catch + Map/Set + Int32Array typed-array + string split/join + regex** + done.
+Both jitless (interpreter) AND Sparkplug pass the full 13-marker suite. So a broad,
+realistic JS feature set works under the baseline JIT on b1nix. The kernel hook runs
+`d8 --single-threaded --no-opt /mnt/v8/m58.js`; the smoke v8 instance checks all 13.
+
+**TurboFan optimization is the single isolated bug (the next chase).** Without
+`--no-opt`, any function hot enough to tier up to TurboFan crashes — fib(20) and
+fib(25) both crash in isolation at the same site, `DefaultForegroundTaskRunner::
+deque::_M_push_back_aux` (#GP, the optimized-code-install task post); gc-churn 30k
+crashed the same way (the alloc loop tiering up). loop-sum/array-reduce/etc. pass
+because they don't reach the TurboFan threshold. Ruled out: threading
+(single-threaded unchanged), concurrency (`--no-concurrent-recompilation` crashes
+the same — TurboFan runs synchronously and still faults), volume/OOM (4 GB no
+help), cumulative state (fib alone crashes), recursion-specificity (a plain
+non-recursive hot loop also crashes, via OSR), FP (FPU masked FCW=0x037F). The
+earlier #MF-on-`vfork`-`ret` is a misdecode (a `ret` can't raise #MF). Multi-
+threaded is worse (background threads hit near-null). `--trace-opt` pins the exact
+sequence: `[marking <fn> for optimization to TURBOFAN_JS]` →
+`[compiling method <fn> (target TURBOFAN_JS) ... kSynchronous]` → crash at the same
+deque `_M_push_back_aux` (#GP, cr2 a stack addr). So the fault is in the TurboFan
+**compile / optimized-code-install** path — most likely heap/memory corruption
+from TurboFan's heavy Zone-allocation churn (the crash lands on the *next*
+container op), or a codegen/reloc bug in the installed code; Sparkplug's lighter
+allocation is fine. Next: b1nix GDB stub (M36) to break on TurboFan finalize and
+watch the heap, or bisect passes via `--turbo-filter` / `--trace-turbo`.
+
 ## ✅✅✅ `d8` COMPILES AND LINKS for b1nix (full V8 engine)
 
 `d8.b1nix` = 22 MB `ET_EXEC` `EM_X86_64`, entry `0x2000000`, **0 undefined refs**.

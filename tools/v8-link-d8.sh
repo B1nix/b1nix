@@ -14,7 +14,10 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 TC="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/bin"
-OUT="$ROOT_DIR/build/toolchain_build/v8-skeleton/v8/out/b1nix"
+# Out dir defaults to the jitless build; pass "b1nix-jit" (or any out/<name>) to
+# relink the JIT d8:  sh tools/v8-link-d8.sh b1nix-jit
+OUT_NAME="${1:-b1nix}"
+OUT="$ROOT_DIR/build/toolchain_build/v8-skeleton/v8/out/$OUT_NAME"
 GXX="$TC/x86_64-b1nix-g++"
 LD="$TC/x86_64-b1nix-ld"
 RANLIB="$TC/x86_64-b1nix-ranlib"
