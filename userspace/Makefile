@@ -18,6 +18,7 @@ endif
 CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
+HOST_CC  ?= cc
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
 # headers from the generated .d files. With -MMD, editing a header in
@@ -510,9 +511,13 @@ $(BUILD)/bin/m30_dynamic: bin/m30_dynamic.c $(SHARED_LIBC) $(DYNAMIC_CRT0) linke
 	$(LD) $(LDFLAGS) -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-b1nix.so \
 		-T linker_pie.ld -o $@ $(DYNAMIC_CRT0) $(BUILD)/bin/m30_dynamic.o $(SHARED_LIBC)
 
-$(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0)
+$(BUILD)/host/c2str: tcc/conftest.c
 	@mkdir -p $(dir $@)
-	cd tcc && test -x c2str.exe && ./c2str.exe include/tccdefs.h tccdefs_.h
+	$(HOST_CC) -O2 -DC2STR=1 $< -o $@
+
+$(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0) $(BUILD)/host/c2str
+	@mkdir -p $(dir $@)
+	$(BUILD)/host/c2str tcc/include/tccdefs.h tcc/tccdefs_.h
 ifeq ($(B1NIX_ARCH),x86)
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 else
