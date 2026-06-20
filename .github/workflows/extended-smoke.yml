@@ -97,8 +97,10 @@ jobs:
             grub-pc-bin \
             gzip \
             libgmp-dev \
+            libjpeg-dev \
             libmpc-dev \
             libmpfr-dev \
+            libpng-dev \
             libtool \
             lld \
             llvm \
