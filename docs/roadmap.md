@@ -836,3 +836,29 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 
 - [ ] `deferred` Add the real sandbox (seccomp-bpf + user/PID/net namespaces +
   setuid sandbox); none exist today. Only if process isolation is required.
+
+## M64: Native Clang/LLVM Toolchain
+
+`planned` — a **second** native, self-hosting toolchain (clang/LLVM) running
+inside b1nix, **alongside** GCC (M26), not replacing it. Deferred until after the
+Chromium chain (M59–M63), but LLVM has to be ported for that work anyway, so the
+clang self-host is the natural vehicle. Well-precedented: FreeBSD ships clang as
+its base compiler with GCC in ports; Linux distros and macOS carry both natively.
+
+- [ ] `planned` **Additive, no migration.** GCC + libstdc++ stay the backbone
+  (cross toolchain, M26 self-host, the whole M51–M55 C++ ecosystem). b1nix is
+  already a hybrid — clang does kernel + freestanding bring-up (`tools/b1nix-cc`),
+  GCC does cross/native + C++. This formalises that split, it doesn't undo it.
+- [ ] `planned` **Native clang must use libstdc++, NOT libc++.** Then its objects
+  stay ABI-compatible with the GCC-built ecosystem (one C++ runtime, no split).
+  libc++ would mean porting libc++/libc++abi/libunwind AND carrying two
+  incompatible C++ ABIs (GCC self-host still pulls libstdc++) — painful, low value.
+- [ ] `planned` **Phase 1 — clang as a userspace *cross* compiler** for ports
+  where `--target=x86_64-b1nix` simplifies the build (low risk; clang is a strong
+  multi-target cross compiler). No self-host needed yet.
+- [ ] `planned` **Phase 2 — native self-host clang** (the stretch): get LLVM/clang
+  to build and run *inside* b1nix. Harder than the GCC self-host — LLVM is large,
+  C++17, RAM-hungry, CMake/Ninja-driven. The real cost of this milestone.
+- A full GCC→clang switch is **not** a goal: the in-VM self-host is the line not to
+  cross casually. Two native compilers = "the OS rebuilds itself two independent
+  ways," a maturity signal, achieved additively without breaking the GNU runtime.
