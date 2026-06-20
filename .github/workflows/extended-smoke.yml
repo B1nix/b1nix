@@ -1,0 +1,191 @@
+name: Extended Smoke
+
+on:
+  schedule:
+    - cron: "0 3 * * *"
+  workflow_dispatch:
+    inputs:
+      test:
+        description: Extended test to run
+        required: true
+        default: all
+        type: choice
+        options:
+          - all
+          - graphics
+          - memory
+          - ssh
+          - serial
+      arch:
+        description: Architecture to test
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - x86_64
+          - x86
+
+permissions:
+  contents: read
+
+concurrency:
+  group: extended-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  extended-smoke:
+    name: ${{ matrix.test }} smoke (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 240
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - test: graphics
+            arch: x86_64
+            command: make ARCH=x86_64 graphics-smoke
+          - test: graphics
+            arch: x86
+            command: make ARCH=x86 graphics-smoke
+          - test: memory
+            arch: x86_64
+            command: make memory-smoke
+          - test: ssh
+            arch: x86_64
+            command: sh tests/ssh-hostfwd.sh x86_64
+          - test: ssh
+            arch: x86
+            command: sh tests/ssh-hostfwd.sh x86
+          - test: serial
+            arch: x86_64
+            command: sh tests/serial-getty.sh x86_64
+          - test: serial
+            arch: x86
+            command: sh tests/serial-getty.sh x86
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Skip unselected test
+        if: github.event_name == 'workflow_dispatch' && ((github.event.inputs.test != 'all' && github.event.inputs.test != matrix.test) || (github.event.inputs.arch != 'both' && github.event.inputs.arch != matrix.arch))
+        run: echo "Skipping ${{ matrix.test }} ${{ matrix.arch }}."
+
+      - name: Install host tools
+        if: github.event_name != 'workflow_dispatch' || ((github.event.inputs.test == 'all' || github.event.inputs.test == matrix.test) && (github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch))
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            automake \
+            bash \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            e2fsprogs \
+            expect \
+            flex \
+            gettext \
+            git \
+            gperf \
+            grub-common \
+            grub-pc-bin \
+            gzip \
+            libtool \
+            lld \
+            llvm \
+            make \
+            meson \
+            mtools \
+            netcat-openbsd \
+            ninja-build \
+            openssh-client \
+            patch \
+            perl \
+            pkg-config \
+            python3 \
+            qemu-system-x86 \
+            rsync \
+            tar \
+            texinfo \
+            unzip \
+            vim-common \
+            wget \
+            xorriso \
+            xz-utils
+
+      - name: QEMU/KVM preflight
+        if: github.event_name != 'workflow_dispatch' || ((github.event.inputs.test == 'all' || github.event.inputs.test == matrix.test) && (github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch))
+        run: |
+          {
+            echo "## QEMU/KVM preflight (${{ matrix.test }} ${{ matrix.arch }})"
+            echo
+            echo '```text'
+            ls -l /dev/kvm || true
+            qemu-system-x86_64 -accel help || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache generated build products
+        if: github.event_name != 'workflow_dispatch' || ((github.event.inputs.test == 'all' || github.event.inputs.test == matrix.test) && (github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch))
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/*-b1nix
+            build/*-src
+            build/cacert.pem
+            build/toolchain_build/dist
+            build/toolchain_build/src
+            build/toolchain_build/${{ matrix.arch == 'x86' && 'i686-b1nix' || 'x86_64-b1nix' }}
+          key: extended-smoke-${{ runner.os }}-${{ matrix.test }}-${{ matrix.arch }}-${{ hashFiles('Makefile', 'userspace/Makefile', 'tools/**/*.sh', 'tools/**/*.py', 'tools/patches/**') }}
+          restore-keys: |
+            extended-smoke-${{ runner.os }}-${{ matrix.test }}-${{ matrix.arch }}-
+            full-smoke-${{ runner.os }}-${{ matrix.arch }}-
+            quick-smoke-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Check host tools
+        if: github.event_name != 'workflow_dispatch' || ((github.event.inputs.test == 'all' || github.event.inputs.test == matrix.test) && (github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch))
+        run: make ARCH=${{ matrix.arch }} check-tools
+
+      - name: Run extended smoke
+        if: github.event_name != 'workflow_dispatch' || ((github.event.inputs.test == 'all' || github.event.inputs.test == matrix.test) && (github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch))
+        env:
+          SMOKE_VERBOSE: "1"
+        run: ${{ matrix.command }}
+
+      - name: Summarize result
+        if: always()
+        run: |
+          {
+            echo "## Extended smoke (${{ matrix.test }} ${{ matrix.arch }})"
+            echo
+            echo "- Status: ${{ job.status }}"
+            echo "- Command: \`${{ matrix.command }}\`"
+            echo "- Logs artifact: extended-smoke-run-${{ matrix.test }}-${{ matrix.arch }}"
+            echo
+            echo "### Recent failures"
+            echo '```text'
+            grep -RaiE "FAIL|failed|KERNEL PANIC|\\[PANIC\\]|timeout" smoke_run 2>/dev/null | tail -120 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: extended-smoke-run-${{ matrix.test }}-${{ matrix.arch }}
+          path: smoke_run/
+          if-no-files-found: ignore
+
+      - name: Upload ISO
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b1nix-extended-iso-${{ matrix.test }}-${{ matrix.arch }}
+          path: build/${{ matrix.arch }}/b1nix.iso
+          if-no-files-found: ignore

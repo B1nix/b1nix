@@ -1,0 +1,159 @@
+name: Quick Smoke
+
+on:
+  push:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  pull_request:
+    paths-ignore:
+      - "docs/**"
+      - "**/*.md"
+  workflow_dispatch:
+    inputs:
+      arch:
+        description: Architecture to test
+        required: true
+        default: both
+        type: choice
+        options:
+          - both
+          - x86_64
+          - x86
+
+permissions:
+  contents: read
+
+concurrency:
+  group: quick-smoke-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  quick-smoke:
+    name: quick smoke (${{ matrix.arch }})
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, x86]
+
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Skip unselected architecture
+        if: github.event_name == 'workflow_dispatch' && github.event.inputs.arch != 'both' && github.event.inputs.arch != matrix.arch
+        run: echo "Skipping ${{ matrix.arch }}; selected ${{ github.event.inputs.arch }}."
+
+      - name: Install host tools
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            autoconf \
+            automake \
+            bash \
+            bison \
+            build-essential \
+            bzip2 \
+            ca-certificates \
+            clang \
+            cmake \
+            curl \
+            e2fsprogs \
+            flex \
+            gettext \
+            git \
+            gperf \
+            grub-common \
+            grub-pc-bin \
+            gzip \
+            libtool \
+            lld \
+            llvm \
+            make \
+            meson \
+            mtools \
+            ninja-build \
+            patch \
+            perl \
+            pkg-config \
+            python3 \
+            qemu-system-x86 \
+            rsync \
+            tar \
+            texinfo \
+            unzip \
+            vim-common \
+            wget \
+            xorriso \
+            xz-utils
+
+      - name: QEMU/KVM preflight
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        run: |
+          {
+            echo "## QEMU/KVM preflight (${{ matrix.arch }})"
+            echo
+            echo '```text'
+            ls -l /dev/kvm || true
+            qemu-system-x86_64 -accel help || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Cache generated build products
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        uses: actions/cache@v4
+        with:
+          path: |
+            build/*-b1nix
+            build/*-src
+            build/cacert.pem
+            build/toolchain_build/dist
+            build/toolchain_build/src
+            build/toolchain_build/${{ matrix.arch == 'x86' && 'i686-b1nix' || 'x86_64-b1nix' }}
+          key: quick-smoke-${{ runner.os }}-${{ matrix.arch }}-${{ hashFiles('Makefile', 'userspace/Makefile', 'tools/**/*.sh', 'tools/**/*.py', 'tools/patches/**') }}
+          restore-keys: |
+            quick-smoke-${{ runner.os }}-${{ matrix.arch }}-
+
+      - name: Check host tools
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        run: make ARCH=${{ matrix.arch }} check-tools
+
+      - name: Run quick smoke
+        if: github.event_name != 'workflow_dispatch' || github.event.inputs.arch == 'both' || github.event.inputs.arch == matrix.arch
+        env:
+          SMOKE_VERBOSE: "1"
+        run: make ARCH=${{ matrix.arch }} smoke-quick
+
+      - name: Summarize result
+        if: always()
+        run: |
+          {
+            echo "## Quick smoke (${{ matrix.arch }})"
+            echo
+            echo "- Status: ${{ job.status }}"
+            echo "- Logs artifact: smoke-run-${{ matrix.arch }}"
+            echo
+            echo "### Recent failures"
+            echo '```text'
+            grep -RaiE "FAIL|failed|KERNEL PANIC|\\[PANIC\\]|timeout" smoke_run 2>/dev/null | tail -80 || true
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload smoke logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: smoke-run-${{ matrix.arch }}
+          path: smoke_run/
+          if-no-files-found: ignore
+
+      - name: Upload ISO
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: b1nix-quick-iso-${{ matrix.arch }}
+          path: build/${{ matrix.arch }}/b1nix.iso
+          if-no-files-found: ignore
