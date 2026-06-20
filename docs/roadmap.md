@@ -863,10 +863,13 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 `planned` — add Clang incrementally after the sandbox work, alongside the proven
 GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
 
-- [ ] `planned` **Phase 1 — optional cross `clang++` frontend.** Add a small
-  `x86_64-b1nix` wrapper/toolchain choice and one hosted C++ smoke. Compile with
-  Clang, but link the existing libstdc++/libsupc++/libgcc and `libb1nix`; do not
-  port a second C++ runtime. Existing GCC builds remain unchanged and default.
+- [x] `done` **Phase 1 — optional cross `clang++` frontend (x86_64).**
+  `tools/b1nix-clang++` compiles against the staged GCC 13 headers and links the
+  existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
+  `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
+  x86_64-only: clang and the GCC-built libstdc++ disagree on `size_t` mangling
+  for `i686-b1nix` (`unsigned int` vs `unsigned long`), so the i686 clang link
+  fails — GCC stays the C++ compiler on the 32-bit port.
 - [ ] `planned` **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
   directory/config so the working GCC V8 build remains the fallback. Reuse the
   GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.

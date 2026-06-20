@@ -76,7 +76,7 @@ int sem_post(int *sem);
 int sem_getvalue(int *sem, int *sval);
 int sem_destroy(int *sem);
 
-#ifndef B1NIX_WCHAR_T_DEFINED
+#if !defined(__cplusplus) && !defined(B1NIX_WCHAR_T_DEFINED)
 #define B1NIX_WCHAR_T_DEFINED
 typedef int wchar_t;
 #endif

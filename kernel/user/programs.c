@@ -1945,6 +1945,24 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+#ifdef __x86_64__
+  /* M64 clang++ frontend is x86_64-only: clang and the GCC-built libstdc++
+   * disagree on size_t mangling for i686-b1nix (unsigned int vs unsigned long),
+   * so the i686 clang link fails. GCC stays the C++ compiler on the 32-bit port. */
+  {
+    u64 clang_pid = syscall_dispatch(SYS_SPAWN,
+                                     (u64)(usize) "/bin/m64-clang-smoke", 0,
+                                     0, 0, 0, 0);
+    if ((isize)clang_pid < 0) {
+      uwrite("M64-CLANG: spawn-fail\n");
+    } else {
+      int clang_status = 0;
+      syscall_dispatch(SYS_WAIT, clang_pid, (u64)(usize)&clang_status,
+                       0, 0, 0, 0);
+    }
+  }
+#endif
+
   /* M51: ported libm (openlibm) computes correctly at runtime. */
   {
     u64 m51_pid = syscall_dispatch(SYS_SPAWN,

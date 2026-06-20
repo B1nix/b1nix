@@ -1513,6 +1513,9 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	check_output "$LOG" "CXX-SMOKE: ok rtti" "M55 C++: RTTI dynamic_cast/typeid + bad_cast throw"
 	check_output "$LOG" "CXX-SMOKE: ok static-init" "M55 C++: thread-safe function-local static (__cxa_guard)"
 	check_output "$LOG" "CXX-SMOKE: ok threads" "M55 C++: std::thread/mutex/atomic over pthreads"
+	# M64 clang++ frontend is x86_64-only (size_t mangling clash with the
+	# GCC-built libstdc++ on i686-b1nix); GCC stays the C++ compiler on x86.
+	[ "$ARCH" = "x86_64" ] && check_output "$LOG" "M64-CLANG: ok" "M64: clang++ frontend with GNU C++ runtime"
 	check_output "$LOG" "M55-LITEHTML: ok parse" "M55 C++: litehtml parses HTML/CSS (gumbo + STL)"
 	check_output "$LOG" "M55-LITEHTML: ok layout" "M55 C++: litehtml lays out a box tree (render)"
 	check_output "$LOG" "M55-LITEHTML: ok draw" "M55 C++: litehtml cascade+draw (h1>p font, ordered)"

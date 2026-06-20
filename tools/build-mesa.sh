@@ -36,6 +36,17 @@ fi
 
 mkdir -p "$SRC_PARENT" "$BUILD_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 
+# Serialize concurrent invocations. The Makefile builds several Mesa-dependent
+# initramfs targets (m52_osmesa, m53_mesa_virgl, m52_glsl, m59_smoke) in
+# parallel; each calls this script, which rewrites cross.ini and runs ninja in
+# the shared meson dir. Parallel runs collide ("Some other Meson process is
+# already using this build directory"). ponytail: mkdir is atomic on POSIX —
+# spin until we own the lock, drop it on exit. First caller builds Mesa; the
+# rest wait, then find it up to date.
+LOCK="$BUILD_DIR/.build-lock"
+while ! mkdir "$LOCK" 2>/dev/null; do sleep 1; done
+trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+
 # Toolchain prerequisites: b1nix libc/crt + C++-enabled cross toolchain.
 make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
   "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2

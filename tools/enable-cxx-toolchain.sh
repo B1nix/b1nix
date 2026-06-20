@@ -25,11 +25,37 @@ enable_one() {
   gxx="$cross/bin/$triplet-g++"
   [ -x "$gxx" ] || { echo "enable-cxx: $triplet: no cross g++, skipping" >&2; return 0; }
 
+  # copy_if_changed: only copy when content differs, so unchanged headers keep
+  # their mtime. This script runs on every Mesa/port build (build-mesa.sh calls
+  # it); an unconditional cp would bump header mtimes each time and force ninja
+  # to recompile the whole port. ponytail: cmp -s is cheap vs a full rebuild.
+  copy_if_changed() {
+    cmp -s "$1" "$2" 2>/dev/null && return 0
+    mkdir -p "$(dirname "$2")"
+    cp "$1" "$2"
+  }
+
   # 1. Stage b1nix libc headers into the toolchain's target include dir so
   #    libstdc++ headers (#include_next <stdlib.h>, <wchar.h>, ...) resolve.
   tgtinc="$cross/$triplet/include"
   mkdir -p "$tgtinc"
-  cp -R "$ROOT_DIR/userspace/include/." "$tgtinc/"
+  ( cd "$ROOT_DIR/userspace/include" && find . -type f ) | while read -r rel; do
+    copy_if_changed "$ROOT_DIR/userspace/include/$rel" "$tgtinc/$rel"
+  done
+
+  # 1b. GCC's fixincludes baked stale copies of a few b1nix headers into
+  #     include-fixed (assert/stddef/stdio/stdlib/wchar). clang searches
+  #     include-fixed before the target include dir, so it sees the stale ones
+  #     and misses source fixes (e.g. the C++ wchar_t guard). Refresh every
+  #     fixed header that has a b1nix source counterpart; leave GCC's own files.
+  for fixed in "$cross"/lib/gcc/"$triplet"/*/include-fixed; do
+    [ -d "$fixed" ] || continue
+    for f in "$fixed"/*.h; do
+      [ -e "$f" ] || continue
+      src="$ROOT_DIR/userspace/include/$(basename "$f")"
+      [ -f "$src" ] && copy_if_changed "$src" "$f"
+    done
+  done
 
   # 2. Tell libstdc++ the libc now provides mbstate_t (its stale config said
   #    otherwise, causing a conflicting typedef against b1nix's wchar.h).

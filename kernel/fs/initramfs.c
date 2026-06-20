@@ -74,6 +74,9 @@
 #include "initramfs_m53_mesa_virgl.inc"
 #include "initramfs_m52_glsl.inc"
 #include "initramfs_m59_smoke.inc"
+#ifdef __x86_64__
+#include "initramfs_m64_clang_smoke.inc"
+#endif
 #include "initramfs_cxx_smoke.inc"
 #include "initramfs_m55_iostream.inc"
 #include "initramfs_m55_litehtml.inc"
@@ -1114,6 +1117,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m52_glsl_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m59-smoke", (const char *)vfs_m59_smoke_elf,
      sizeof(vfs_m59_smoke_elf), INITRAMFS_EXECUTABLE},
+#ifdef __x86_64__
+    {"/bin/m64-clang-smoke", (const char *)vfs_m64_clang_smoke_elf,
+     sizeof(vfs_m64_clang_smoke_elf), INITRAMFS_EXECUTABLE},
+#endif
     {"/bin/cxx-smoke", (const char *)vfs_cxx_smoke_elf,
      sizeof(vfs_cxx_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m55-iostream", (const char *)vfs_m55_iostream_elf,

@@ -19,6 +19,7 @@ CC       := clang
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 HOST_CC  ?= cc
+B1NIX_CXX ?= ../tools/b1nix-c++
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
 # headers from the generated .d files. With -MMD, editing a header in
@@ -343,13 +344,17 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER
 # (NOT clang $(CC)). Requires the C++-enabled toolchain (enable-cxx-toolchain.sh).
 $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-c++ $< -o $@
+	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
+
+$(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-clang++ $< -o $@
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
 # b1nix VFS, built against libstdc++ via tools/b1nix-c++.
 $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-c++ $< -o $@
+	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
 
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
 # __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.

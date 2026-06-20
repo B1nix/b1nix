@@ -107,7 +107,10 @@ EMBEDDED_USER_PROGRAMS := \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 ifeq ($(ARCH),x86_64)
-EMBEDDED_USER_PROGRAMS += m30_dynamic
+# m64_clang_smoke is x86_64-only: the clang frontend links the GCC-built
+# libstdc++, but clang and that libstdc++ disagree on size_t mangling for
+# i686-b1nix (unsigned int vs unsigned long), so the i686 clang link fails.
+EMBEDDED_USER_PROGRAMS += m30_dynamic m64_clang_smoke
 INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
 endif
 
@@ -606,6 +609,12 @@ $(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DE
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
+
+$(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) tools/b1nix-clang++ tools/b1nix-c++
+	@tools/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
 # M55: std::iostream + std::filesystem acceptance test (hosted libstdc++).
 $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/b1nix-c++ tools/enable-cxx-toolchain.sh

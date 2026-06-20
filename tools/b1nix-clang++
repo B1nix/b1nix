@@ -1,0 +1,2 @@
+#!/bin/sh
+B1NIX_CXX_FRONTEND=clang exec "$(dirname "$0")/b1nix-c++" "$@"
