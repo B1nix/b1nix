@@ -300,6 +300,9 @@ print_build_failure() {
 	echo "  ${RED}BUILD FAILED${NC}"
 	echo "  build log: $BUILD_LOG"
 	if [ -f "$BUILD_LOG" ]; then
+		echo "  --- likely build errors ---"
+		grep -aEn "fatal error:| error:|undefined reference|No such file|not found|cannot (find|open|create|compute)|FAILED:|make(\\[[0-9]+\\])?: \\*\\*\\*" "$BUILD_LOG" | tail -120 || true
+		echo "  --- end likely build errors ---"
 		echo "  --- build log tail ---"
 		tail -80 "$BUILD_LOG"
 		echo "  --- end build log tail ---"
