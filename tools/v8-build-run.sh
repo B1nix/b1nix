@@ -42,6 +42,14 @@ if [ "${SKIP_BUILD:-0}" != "1" ]; then
 	echo "=== [1/6] gn gen -> out/$PROFILE ==="
 	[ -x "$GN" ] || { echo "gn missing — run sh tools/build-gn.sh"; exit 1; }
 	sh "$ROOT_DIR/tools/patches/v8/apply.sh" "$V8" || true
+	# Route the compiler through ccache when available. Flipping a global gn flag
+	# (sandbox/wasm/i18n) changes a define that ~every TU depends on, so ninja
+	# legitimately recompiles almost everything — but ccache turns a re-run of any
+	# config (or a flip back) into near-instant cache hits. No-op if ccache absent.
+	if command -v ccache >/dev/null 2>&1; then
+		GN_ARGS="$GN_ARGS cc_wrapper=\"ccache\""
+		echo "  (ccache detected -> cc_wrapper=ccache)"
+	fi
 	( cd "$V8" && "$GN" gen "out/$PROFILE" --args="$GN_ARGS" )
 
 	echo "=== [2/6] ninja d8 (the final crt0 link is EXPECTED to fail; we relink) ==="

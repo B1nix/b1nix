@@ -784,8 +784,29 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
   space), so a user access there faulted as a present supervisor page. Fixed by
   relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
 - Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
-  WebAssembly and i18n disabled. Run via
+  WebAssembly, the sandbox, and i18n disabled. Run via
   `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`, d8 on `sata0`.
+- [ ] `parked` **WebAssembly** (`v8_enable_webassembly`). Builds + links (the trap
+  handler was the blocker: b1nix is `V8_OS_LINUX` so the x64 gate marks it supported,
+  but gn compiles the POSIX impl only for the `is_linux` GN var → `RegisterDefaultTrapHandler`
+  undefined; fixed by `tools/patches/v8/apply.sh` **Patch 20** = disable the trap
+  handler for b1nix → explicit in-code bounds checks). d8 then **aborts at startup**
+  (before any JS): `Check failed: AllowHeapAllocationInRelease::IsAllowed()` — a heap
+  allocation on a wasm worker/engine thread whose `thread_local` assert-state is
+  unseeded (the same per-thread-ELF-TLS class fixed for the main thread in M58, now
+  surfacing on a wasm-spawned thread). Needs a gdb chase of V8's wasm thread creation
+  vs b1nix `pthread_create` TLS. Re-enabling the trap handler later (guard-page
+  bounds checks) is a separate perf item.
+- [ ] `parked` **Sandbox** (`v8_enable_sandbox`). It is a real port, not a flag flip.
+  Build asserts cleared (**Patch 18** relaxes the libc++-hardening assert for b1nix;
+  hardening is genuinely provided via the build's own `use_safe_libstdcxx`/
+  `_GLIBCXX_ASSERTIONS`, not bypassed). But **link fails**: (1) `V8_ENABLE_SANDBOX`
+  isn't propagating uniformly across V8's gn source-sets for the b1nix target
+  (`maglev`/`compiler` TUs compiled without it use `CompressedObjectSlot` while
+  `heap-write-barrier.cc` uses the sandbox `ProtectedPointerSlot` → undefined
+  `WriteBarrier::SharedSlow/MarkingSlow(TrustedObject,…)`); (2) `partition_alloc`'s
+  `CollectStackTrace` needs a b1nix impl/stub. Runtime (huge VA cage + TrustedSpace)
+  untested. Milestone-sized; comparable to the WebAssembly port.
 - [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
   a standalone `/bin/js` runner/REPL — the lightweight JS vector; superseded for
   capability by real V8.

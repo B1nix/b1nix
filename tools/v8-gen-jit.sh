@@ -51,7 +51,11 @@ cd "$SK/v8"
 #                                             was that mmap bug (V8's low cage hint
 #                                             collided with the supervisor identity
 #                                             map), not a V8 problem.
-"$GN" gen out/b1nix-jit --args='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=true'
+GEN_ARGS='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=true'
+# Route the compiler through ccache when present — flipping global gn flags
+# recompiles ~everything, but ccache makes re-runs/flip-backs near-instant.
+if command -v ccache >/dev/null 2>&1; then GEN_ARGS="$GEN_ARGS cc_wrapper=\"ccache\""; fi
+"$GN" gen out/b1nix-jit --args="$GEN_ARGS"
 
 echo
 echo "=== gn gen (JIT) OK -> out/b1nix-jit. Next: ==="

@@ -202,4 +202,40 @@ if [ -f "$F" ] && ! grep -q 'defined(__b1nix__) || defined(__linux__)' "$F"; the
   echo "Patch 17 applied: abseil config.h (ABSL_HAVE_MMAP)"
 else echo "Patch 17 already present/absent"; fi
 
+# ============================================================================
+# Sandbox support (Patch 18). The V8 sandbox (v8_enable_sandbox) asserts
+# use_safe_libcxx = use_custom_libcxx && enable_safe_libcxx — it demands
+# *hardened libc++*. b1nix builds V8 against libstdc++ (M55 cross GCC), never
+# libc++, so use_safe_libcxx is structurally false. We do NOT bypass the
+# hardening: the real libstdc++ equivalent (_GLIBCXX_ASSERTIONS, container/
+# iterator bounds checks) is enabled via the build's own `use_safe_libstdcxx`
+# arg — set use_safe_libstdcxx=true in v8-gen-jit.sh's gn args. This patch only
+# relaxes the assert (which literally checks use_safe_libcxx, the libc++ flag)
+# for the b1nix target, since b1nix satisfies it through use_safe_libstdcxx.
+# ============================================================================
+
+# --- Patch 18: v8/BUILD.gn — sandbox libc++-hardening assert for b1nix --------
+F="$V8/BUILD.gn"
+if ! grep -q 'b1nix: hardening via libstdc' "$F"; then
+  perl -0777 -i -pe 's~assert\(!v8_enable_sandbox \|\| use_safe_libcxx,\n       "The sandbox requires libc\+\+ hardening"\)~assert(!v8_enable_sandbox || use_safe_libcxx || target_os == "b1nix",  # b1nix: hardening via libstdc++ use_safe_libstdcxx (_GLIBCXX_ASSERTIONS)\n       "The sandbox requires libc++ hardening")~' "$F"
+  grep -q 'b1nix: hardening via libstdc' "$F" || die "Patch 18 anchor not found in $F"
+  echo "Patch 18 applied: BUILD.gn (sandbox libc++-hardening assert)"
+else echo "Patch 18 already present"; fi
+
+# --- Patch 20: trap-handler.h — disable the Wasm trap handler on b1nix --------
+# WebAssembly (v8_enable_webassembly=true). b1nix defines V8_OS_LINUX (Patch 3),
+# so the x64 trap-handler gate marks it SUPPORTED — but BUILD.gn compiles the
+# POSIX trap-handler impl (which DEFINES RegisterDefaultTrapHandler) only when the
+# is_linux GN var is set, which b1nix is not → undefined reference at d8 link.
+# The trap handler is just a perf path (guard-page + SIGSEGV bounds checks needing
+# verified signal-recovery semantics b1nix hasn't proven). Disable it for b1nix:
+# handler-outside.cc then supplies the stub and Wasm uses explicit in-code bounds
+# checks (always correct). Re-enabling it later is a separate perf milestone.
+F="$V8/src/trap-handler/trap-handler.h"
+if [ -f "$F" ] && ! grep -q '!defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~\(V8_OS_LINUX && !V8_OS_ANDROID\)~(V8_OS_LINUX && !V8_OS_ANDROID && !defined(__b1nix__))~g' "$F"
+  grep -q '!defined(__b1nix__)' "$F" || die "Patch 20 anchor not found in $F"
+  echo "Patch 20 applied: trap-handler.h (Wasm trap handler off on b1nix)"
+else echo "Patch 20 already present"; fi
+
 echo "All b1nix V8 patches applied to $V8"
