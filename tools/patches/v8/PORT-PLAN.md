@@ -128,7 +128,7 @@ V8's SIGSEGV handler *also* calls GetCurrentThreadId (thread_local) ⇒ re-fault
 **d8 hangs** instead of aborting. This is the same "background threads hit
 near-null" symptom noted earlier.
 
-**Layer-2a DONE — real per-thread ELF TLS (commit 4232fc7, v0.58.5).** Added
+**Layer-2a DONE — real per-thread ELF TLS (commit 4232fc7, v0.58.4).** Added
 `SYS_GET_TLS_INFO(161)` (exposes the running image's PT_TLS template) and made
 `pthread_create` build a variant-II TLS block per thread (mirroring the loader's
 main-thread layout: `[.tdata|.tbss][TCB]`, self-pointer at `%fs:0`, install as
@@ -168,15 +168,56 @@ next (separate) crash. (Standalone non-`test=1` boots STARVE d8 — getty/bash h
 the single CPU — always run d8 with `b1nix.test=1` so the rc keeps the scheduler
 busy. And use `-smp 1` to avoid the SMP issue below.)
 
-**Layer-2c — OPEN #1: SMP `tlb_shootdown timeout` panic.** Under `-smp 2`, d8's
-heavy mmap/munmap (per-thread TLS blocks + the V8 cage) triggers cross-CPU TLB
-shootdowns and the kernel panics `[PANIC] tlb_shootdown timeout` (one vCPU not
-acking the IPI in time). `-smp 1` avoids it entirely. Could be host
-oversubscription (the box was hammered) OR a real SMP bug (a CPU stuck with
-interrupts off during a TLS munmap). Next: reproduce idle `-smp 2`; if real,
-audit the munmap/TLB-shootdown path for an irqs-off window.
+**Layer-2c — OPEN #1: SMP `tlb_shootdown timeout` panic (REAL, deterministic).**
+Under `-smp 2`, d8 TurboFan panics `[PANIC] tlb_shootdown timeout` — one CPU
+doesn't ACK the shootdown IPI within the 2^28-spin guard (tlb.c:172). CONFIRMED a
+real kernel bug, not host oversubscription: reproduces on an IDLE box 2/2 runs,
+and `-m 4096` (4 GB, ~no eviction — only 2 swap lines) ALSO panics, so it is NOT
+the eviction/swap shootdown (eviction.c) nor memory-pressure — it's d8's regular
+mmap/munmap unmap shootdowns (paging.c). `-smp 1` avoids it entirely
+(`online_cpu_count()==1` short-circuits dispatch). Ruled out: lock-contention
+deadlock — `spin_lock`/`spin_lock_irqsave` already poll `tlb_shootdown_poll()`
+(spinlock.h:44), and the AP idle loop is `sti; hlt` (IRQs on, would ACK). So the
+stuck AP is irqs-off in a NON-lock-spin region for >2^28 spins. **DIAGNOSED
+(v0.58.5): added a timeout diagnostic** (tlb.c names the non-ACKed CPU + its
+`current_task` via new `percpu_cur_task()` in lapic.c). It prints e.g. `tlb:
+STUCK cpu 1 task=d8 (initiator cpu 0)` — and the stuck task is a USERSPACE task
+(d8 on one run, the concurrent `m32-smoke` on another, op=PAGE and op=ALL), NOT a
+kernel thread. So a userspace process is sitting in a long irqs-off kernel
+critical section that neither receives the IPI nor polls. It is during d8's
+compute phase, not disk I/O. STILL OPEN — pinning the exact site needs the stuck
+CPU's live RIP (an NMI capture or a per-CPU "irqs-off entry" breadcrumb, since
+`current_task->context.rip` is only the last switch-out point). **FIXED
+(v0.58.5): the stuck site was `sys_mmap`.** A temporary per-CPU current-syscall
+breadcrumb pinned the non-ACKing CPU to `syscall=58 (SYS_MMAP)` — d8's large JIT
+cage / NORESERVE mmaps walk thousands of pages in `sys_mmap`'s page-mapping loops
+(`vmm_set_lazy`+`paging_mprotect_page`, and the anonymous-with-frames loop), all
+with no chance to take the shootdown IPI, so an initiator on another CPU spun to
+its 2^28 guard. FIX: call `tlb_shootdown_poll()` once per page in both
+`sys_mmap` loops (syscall.c) — a single load when nothing is pending. VERIFIED:
+`-smp 2` now runs d8 with **0 `tlb_shootdown timeout` panics** (2/2 runs), and
+`-smp 1` still completes `ok hello → ok recursion → done`; full smoke 812/0/0.
+Repro: TurboFan hook (drop `--no-opt` main.c:591), `b1nix.test=1 b1nix.v8run`,
+`-smp 2`, relinked `d8-jit-tls.stripped`. **The shipping default (`--no-opt`,
+Sparkplug) now runs the full suite on `-smp 2`** — `ok hello → ok recursion →
+done`, 0 timeouts, only the benign post-`done` dead0000 teardown (identical to
+`-smp 1`). So multi-CPU Sparkplug V8 works.
 
-**Layer-2c #2 — FIXED (v0.58.7): the nearbyint `#MF` was a STUB `fegetenv`.**
+**Layer-2c OPEN #1b — RESOLVED (was an ARTIFACT): `-smp 2` TurboFan runs fully.**
+An earlier diagnostic showed `-smp 2` TurboFan aborting at `cr2=0xdead0000`
+before any marker, suspected a V8 `CHECK` under SMP. It did NOT reproduce under
+controlled conditions — it was a stale/half-written d8 disk and/or host
+oversubscription during the deadlock investigation (4 smoke VMs + many extra d8
+qemu on 8 cores). With the committed kernel (mmap poll), an idle box, and a
+freshly verified d8 disk, **`-smp 2` TurboFan runs the full 12-test m58.js suite
+`ok hello…recursion(fib25 tier-up)…string-regex…done`, 3/3 runs, 12/12 each, 0
+faults** (no dead0000, #EXC, or timeout); `-smp 1` TurboFan identical. So
+multi-CPU TurboFan V8 works — no kernel fix was needed beyond OPEN #1's mmap
+poll. Tier selection is now a clean cmdline flag: `b1nix.v8opt` drops `--no-opt`
+(TurboFan) vs the default Sparkplug; repro `b1nix.test=1 b1nix.v8run b1nix.v8jit
+b1nix.v8opt`, `-smp 2`, d8-jit-tls disk.
+
+**Layer-2c #2 — FIXED (v0.58.4): the nearbyint `#MF` was a STUB `fegetenv`.**
 d8 TurboFan hit vec 0x10 at `rip=0x32f7840` (`fldenv` in libm `nearbyint`) on the
 main thread. nearbyint does `fegetenv(&env)` → `rint` → INLINE `fldenv -0x28(%rbp)`
 over the 28-byte x87 env. Pinned by elimination: kernel FPU-save trace never fired

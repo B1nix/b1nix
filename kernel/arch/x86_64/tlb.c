@@ -23,6 +23,7 @@
 #include <b1nix/ipi.h>
 #include <b1nix/lapic.h>
 #include <b1nix/panic.h>
+#include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/tlb.h>
 
@@ -176,6 +177,28 @@ static void tlb_shootdown_dispatch(int op, u64 vaddr) {
             console_write(" op=");
             console_write_dec((u32)op);
             console_write("\n");
+            /* Name the CPU(s) that never ACKed this generation and what task
+             * they are running, so the stuck irqs-off site is identifiable.
+             * Skip this (initiator) CPU — it never services its own gen. */
+            {
+                extern struct task *percpu_cur_task(int cpu);
+                u64 gen = __atomic_load_n(&g_tlb_gen, __ATOMIC_RELAXED);
+                int self = tlb_this_cpu();
+                int n = online_cpu_count();
+                for (int c = 0; c < n && c < MAX_CPUS; c++) {
+                    if (c == self) continue;
+                    if (__atomic_load_n(&g_tlb_acked_gen[c], __ATOMIC_RELAXED) != gen) {
+                        struct task *t = percpu_cur_task(c);
+                        console_write("tlb: STUCK cpu ");
+                        console_write_dec((u32)c);
+                        console_write(" task=");
+                        console_write(t && t->name ? t->name : "?");
+                        console_write(" (initiator cpu ");
+                        console_write_dec((u32)self);
+                        console_write(")\n");
+                    }
+                }
+            }
             panic("tlb_shootdown timeout");
         }
     }

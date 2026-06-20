@@ -1935,13 +1935,21 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
      *     and corrupted the PMM free list under V8's JIT, whose cage reservations
      *     and OS::DecommitPages (mmap PROT_NONE | MAP_FIXED, no NORESERVE) churn
      *     large PROT_NONE ranges. */
+    extern void tlb_shootdown_poll(void);
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
       vmm_set_lazy(v);
       paging_mprotect_page(v, vmm_flags);
+      /* A large mmap (V8's multi-GB cage / JIT regions) walks many pages; drain
+       * any in-flight cross-CPU TLB shootdown so an initiator on another CPU
+       * isn't left spinning until its timeout guard fires (tlb_shootdown_poll
+       * is a single load when nothing is pending). */
+      tlb_shootdown_poll();
     }
   } else if (flags & MAP_ANONYMOUS) {
+    extern void tlb_shootdown_poll(void);
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+      tlb_shootdown_poll(); /* see the lazy path above */
       u64 frame = pmm_alloc_frame();
       if (!frame) {
         // Cleanup already mapped pages

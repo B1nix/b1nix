@@ -758,23 +758,28 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
 
 ## M58: V8
 
-- [ ] `blocked` Port V8 interpreter-only (`--jitless`, Ignition) — **assessed
-  NO-GO, ~2–3 months** (`docs/v8-feasibility.md`). The wall is V8's GN build:
-  b1nix is not a GN/V8 `target_os`, so it needs an M61-shaped port of V8's build
-  subtree; the toolchain (GCC 13.2 C++17/20 + M55 libstdc++) actually fits and
-  jitless avoids W^X. Real runtime gaps: `madvise`/`MAP_NORESERVE`/`sigaltstack`.
-  - [x] `partial` GN-target **skeleton** validated against a real V8 checkout
-    (`tools/patches/v8/`): the 6 edits that add `b1nix` as a GN/V8 `target_os`
-    (BUILDCONFIG dispatch, drop-in `//build/toolchain/b1nix`, `v8config.h`
-    `__b1nix__` OS detection, `v8/BUILD.gn` `V8_TARGET_OS`+platform selection).
-    Retires the "does the target even have a shape" risk before the multi-GB
-    fetch. Runtime gaps above are **already closed** (v0.56.6). The 2–3 month
-    `is_linux`-chasing + link-up remains.
-- [x] `done` (pragmatic alt — the actual M58 goal "run JS on b1nix")
-  expose the in-tree **Duktape** (M54/NetSurf) as a standalone `/bin/js`
-  runner/REPL. This is the realistic JS vector the Chromium assessment names,
-  not V8.
-- [ ] `deferred` Add the optimizing JIT (W^X executable mmap, GC/deopt signals).
+**DONE — real V8 (`d8`) runs JavaScript on b1nix: all three tiers, single + multi-CPU.**
+Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
+
+- [x] `done` Port, build, link, and **run real V8 `d8`** off an ext4 disk. The GN
+  build was taught `b1nix` as a `target_os` (the `tools/patches/v8/` skeleton — the
+  earlier "NO-GO, GN wall" assessment was wrong), then the engine compiled and
+  linked. Runs the 12-test `m58.js` suite (loops/arrays/objects/JSON/GC/recursion/
+  closures/try-catch/Map-Set/typed-arrays/regex) to `M58-V8: done`.
+- [x] `done` **All three execution tiers:** Ignition interpreter (`--jitless`),
+  **Sparkplug** baseline JIT (`--no-opt`), and **TurboFan** optimizing JIT
+  (`b1nix.v8opt`, incl. fib25 tier-up). Required W^X executable mmap, GC/deopt
+  signals, per-thread ELF TLS, real x87 `fenv` (`fnstenv`/`fldenv`), and a
+  FS-base-preserving ring3 entry path.
+- [x] `done` **Multi-CPU:** `-smp 2` runs both Sparkplug and TurboFan to completion,
+  0 faults (3/3 runs each, full suite). Required fixing an SMP `tlb_shootdown`
+  deadlock in `sys_mmap` (drain in-flight shootdowns per page) — v0.58.5.
+- Config: pointer-compression data cage **on**, external code space off; Maglev,
+  WebAssembly, and i18n disabled by design. Run via
+  `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`, d8 on `sata0`.
+- [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
+  a standalone `/bin/js` runner/REPL — the lightweight JS vector; superseded for
+  capability by real V8.
 - [x] `done` cheap independent POSIX wins surfaced by the probe:
   `madvise(MADV_DONTNEED/FREE/hints)`, `MAP_NORESERVE` (lazy-commit), and
   `sigaltstack` with working `SA_ONSTACK` signal delivery — per-process alt stack

@@ -584,16 +584,25 @@ void kernel_main(usize arg0, usize arg1)
 			 * --jitless so the Sparkplug/TurboFan JIT runs instead of the
 			 * interpreter (the disk must carry the JIT-enabled d8). */
 			int v8_jit = bootinfo_has_flag("b1nix.v8jit");
+			/* b1nix.v8opt selects the optimizing tier (TurboFan): drop --no-opt so
+			 * hot functions tier up past Sparkplug. Default (no flag) keeps
+			 * --no-opt = baseline Sparkplug, which is the stable shipping config. */
+			int v8_opt = bootinfo_has_flag("b1nix.v8opt");
 			const char *v8_argv_jitless[] = {"d8", "--jitless", "/mnt/v8/m58.js", 0};
 			/* JIT: --single-threaded keeps codegen/GC on the main thread while the
 			 * JIT bring-up stabilises (isolates the engine from b1nix's background
 			 * thread + cross-thread memory paths). */
-			const char *v8_argv_jit[] = {"d8", "--single-threaded", "--no-opt", "/mnt/v8/m58.js", 0};
-			int v8_pid = v8_jit
-				? user_spawn("/mnt/v8/d8", 4, v8_argv_jit)
-				: user_spawn("/mnt/v8/d8", 3, v8_argv_jitless);
+			const char *v8_argv_sparkplug[] = {"d8", "--single-threaded", "--no-opt", "/mnt/v8/m58.js", 0};
+			const char *v8_argv_turbofan[] = {"d8", "--single-threaded", "/mnt/v8/m58.js", 0};
+			int v8_pid;
+			if (!v8_jit)
+				v8_pid = user_spawn("/mnt/v8/d8", 3, v8_argv_jitless);
+			else if (v8_opt)
+				v8_pid = user_spawn("/mnt/v8/d8", 3, v8_argv_turbofan);
+			else
+				v8_pid = user_spawn("/mnt/v8/d8", 4, v8_argv_sparkplug);
 			snprintf(v8_buf, sizeof(v8_buf), "v8: d8 spawn result: %d (%s)\n",
-				v8_pid, v8_jit ? "jit" : "jitless");
+				v8_pid, v8_jit ? (v8_opt ? "turbofan" : "sparkplug") : "jitless");
 			console_write(v8_buf);
 		}
 	}
