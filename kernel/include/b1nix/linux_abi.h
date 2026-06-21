@@ -43,6 +43,42 @@ int b1nix_signo_to_linux(int b);
 u64 linux_sigset_to_b1nix(u64 lx);
 u64 b1nix_sigset_to_linux(u64 b);
 
+/* Linux x86_64 siginfo_t (128 bytes). Only the fields a SI_USER (kill) handler
+ * commonly reads are named; si_pid/si_uid sit in the union at offset 16. */
+struct linux_siginfo {
+  int si_signo; /* 0 */
+  int si_errno; /* 4 */
+  int si_code;  /* 8 */
+  int _pad0;    /* 12 */
+  int si_pid;   /* 16 (SI_USER) */
+  int si_uid;   /* 20 */
+  unsigned char _pad[104]; /* -> 128 */
+};
+
+/* Linux x86_64 ucontext_t. uc_mcontext.gregs starts at offset 40 and holds the
+ * 23 registers in REG_* order (R8..CR2). fpregs is left NULL. */
+struct linux_ucontext {
+  u64 uc_flags;            /* 0 */
+  u64 uc_link;             /* 8 */
+  u64 uc_stack_ss_sp;      /* 16 */
+  u32 uc_stack_ss_flags;   /* 24 */
+  u32 _ucpad;              /* 28 */
+  u64 uc_stack_ss_size;    /* 32 */
+  u64 gregs[23];           /* 40 (uc_mcontext) */
+  u64 fpregs;              /* 224 (NULL) */
+  u64 __reserved[8];       /* 232 */
+  u64 uc_sigmask;          /* 296 (kernel sigset) */
+  unsigned char _sigpad[120];
+};
+
+/* gregs[] indices (Linux REG_* enum). */
+enum {
+  LX_REG_R8 = 0, LX_REG_R9, LX_REG_R10, LX_REG_R11, LX_REG_R12, LX_REG_R13,
+  LX_REG_R14, LX_REG_R15, LX_REG_RDI, LX_REG_RSI, LX_REG_RBP, LX_REG_RBX,
+  LX_REG_RDX, LX_REG_RAX, LX_REG_RCX, LX_REG_RSP, LX_REG_RIP, LX_REG_EFL,
+  LX_REG_CSGSFS, LX_REG_ERR, LX_REG_TRAPNO, LX_REG_OLDMASK, LX_REG_CR2
+};
+
 /* arch_prctl options (asm/prctl.h). */
 #define LINUX_ARCH_SET_FS 0x1002
 #define LINUX_ARCH_GET_FS 0x1003

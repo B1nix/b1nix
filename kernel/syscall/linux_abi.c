@@ -87,8 +87,12 @@
 #define LX_setsid          112
 #define LX_getpgid         121
 #define LX_getsid          124
+#define LX_alarm           37
 #define LX_ftruncate       77
+#define LX_fchdir          81
 #define LX_link            86
+#define LX_setpriority     141
+#define LX_sync            162
 #define LX_fchmod          91
 #define LX_fchown          93
 #define LX_gettid          186
@@ -175,8 +179,12 @@ static const struct lx_map lx_table[] = {
 	{LX_setsid,         SYS_SETSID,        "setsid"},
 	{LX_getpgid,        SYS_GETPGID,       "getpgid"},
 	{LX_getsid,         SYS_GETSID,        "getsid"},
+	{LX_alarm,          SYS_ALARM,         "alarm"},
 	{LX_ftruncate,      SYS_FTRUNCATE,     "ftruncate"},
+	{LX_fchdir,         SYS_FCHDIR,        "fchdir"},
 	{LX_link,           SYS_LINK,          "link"},
+	{LX_setpriority,    SYS_SETPRIORITY,   "setpriority"},
+	{LX_sync,           SYS_SYNC,          "sync"},
 	{LX_fchmod,         SYS_FCHMOD,        "fchmod"},
 	{LX_fchown,         SYS_FCHOWN,        "fchown"},
 	{LX_gettid,         SYS_GETTID,        "gettid"},

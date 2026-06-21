@@ -93,6 +93,18 @@ tgkillok:
 tgkillfail:
 	.ascii "M40-LINUX: fail tgkill\n"
 	.set tgkillfail_len, . - tgkillfail
+alarmok:
+	.ascii "M40-LINUX: ok alarm\n"
+	.set alarmok_len, . - alarmok
+alarmfail:
+	.ascii "M40-LINUX: fail alarm\n"
+	.set alarmfail_len, . - alarmfail
+siginfook:
+	.ascii "M40-LINUX: ok siginfo\n"
+	.set siginfook_len, . - siginfook
+siginfofail:
+	.ascii "M40-LINUX: fail siginfo\n"
+	.set siginfofail_len, . - siginfofail
 dirpath:
 	.asciz "/bin"
 
@@ -106,7 +118,14 @@ sigact:
 	.quad 0                 /* sa_flags   */
 	.quad 0                 /* sa_restorer (b1nix uses the kernel trampoline) */
 	.quad 0                 /* sa_mask    */
+sigact_si:
+	.quad siginfo_handler   /* sa_sigaction */
+	.quad 4                 /* sa_flags = SA_SIGINFO */
+	.quad 0                 /* sa_restorer */
+	.quad 0                 /* sa_mask     */
 sigflag:
+	.long 0
+siginfo_flag:
 	.long 0
 	.align 8
 blockset:
@@ -484,13 +503,78 @@ _start:
 	leaq tgkillok(%rip), %rsi
 	movq $tgkillok_len, %rdx
 	syscall
-	jmp .Lexit
+	jmp .Lalarm
 
 .Ltgkill_fail:
 	movq $1, %rax
 	movq $1, %rdi
 	leaq tgkillfail(%rip), %rsi
 	movq $tgkillfail_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Lalarm:
+	/* alarm(0) — Linux nr 37. Cancels any pending timer and returns the seconds
+	 * left on the previous one (0 here). Newly mapped to SYS_ALARM; unmapped it
+	 * would return -ENOSYS. Representative check for the sync/fchdir/setpriority
+	 * batch added alongside it. */
+	movq $37, %rax
+	xorq %rdi, %rdi
+	syscall
+	testq %rax, %rax
+	jnz .Lalarm_fail
+	movq $1, %rax
+	movq $1, %rdi
+	leaq alarmok(%rip), %rsi
+	movq $alarmok_len, %rdx
+	syscall
+	jmp .Lsiginfo
+
+.Lalarm_fail:
+	movq $1, %rax
+	movq $1, %rdi
+	leaq alarmfail(%rip), %rsi
+	movq $alarmfail_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Lsiginfo:
+	/* SA_SIGINFO test: install a 3-arg handler for SIGUSR2 (Linux 12), signal
+	 * ourselves, and confirm the handler read si_signo == 12 out of the
+	 * kernel-built siginfo_t (proving RSI pointed at a valid Linux siginfo). */
+	movl $0, siginfo_flag(%rip)
+	/* rt_sigaction(SIGUSR2=12, &sigact_si, NULL, 8) — nr=13, sa_flags=SA_SIGINFO */
+	movq $13, %rax
+	movq $12, %rdi
+	leaq sigact_si(%rip), %rsi
+	xorq %rdx, %rdx
+	movq $8, %r10
+	syscall
+	testq %rax, %rax
+	jnz .Lsiginfo_fail
+	movq $39, %rax           /* getpid */
+	syscall
+	movq %rax, %rdi
+	movq $62, %rax           /* kill(pid, SIGUSR2=12) */
+	movq $12, %rsi
+	syscall
+	testq %rax, %rax
+	jnz .Lsiginfo_fail
+	movl siginfo_flag(%rip), %eax
+	cmpl $12, %eax           /* handler read info->si_signo == Linux SIGUSR2 */
+	jne .Lsiginfo_fail
+	movq $1, %rax
+	movq $1, %rdi
+	leaq siginfook(%rip), %rsi
+	movq $siginfook_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Lsiginfo_fail:
+	movq $1, %rax
+	movq $1, %rdi
+	leaq siginfofail(%rip), %rsi
+	movq $siginfofail_len, %rdx
 	syscall
 
 .Lexit:
@@ -502,8 +586,14 @@ _start:
 	/* Must not fall through; loop just in case. */
 1:	jmp 1b
 
-	/* SIGUSR1 handler: record the signo it was invoked with, then return — the
-	 * kernel set the return address to the sigreturn trampoline. */
+	/* SIGUSR1 handler (1-arg): record the signo, then return via the trampoline. */
 sigusr1_handler:
 	movl %edi, sigflag(%rip)
+	ret
+
+	/* SIGUSR2 handler (3-arg, SA_SIGINFO): read si_signo from the siginfo_t in
+	 * RSI to prove the kernel built and passed it. */
+siginfo_handler:
+	movl (%rsi), %eax       /* siginfo->si_signo (offset 0) */
+	movl %eax, siginfo_flag(%rip)
 	ret

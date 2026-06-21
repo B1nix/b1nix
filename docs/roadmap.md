@@ -404,9 +404,10 @@ syscall-number translation layer keyed off a per-image binary personality
 (`/bin/m40-linux-hello`, `M40-LINUX: ok run-static`, x86_64 only).
 
 - [ ] `partial` Translate Linux x86_64 syscall numbers and semantics.
-  Number-translation table (`kernel/syscall/linux_abi.c`, ~75 calls incl.
-  gettid/link/fchmod/fchown/ftruncate) maps the Linux x86_64 ABI to the existing
-  native handlers for Linux-personality tasks; unmapped calls return `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and
+  Number-translation table (`kernel/syscall/linux_abi.c`, ~85 calls incl.
+  gettid/link/fchmod/fchown/ftruncate/alarm/sync/fchdir/setpriority) maps the
+  Linux x86_64 ABI to the existing native handlers for Linux-personality tasks;
+  unmapped calls return `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and
   `getdents64` additionally get a semantic translation to the Linux x86_64
   `struct stat` / `struct utsname` / `struct linux_dirent64` layouts
   (`linux_stat_from_b1nix`, `linux_utsname_from_b1nix`, `sys_linux_getdents64`;
@@ -434,8 +435,11 @@ syscall-number translation layer keyed off a per-image binary personality
   `M40-LINUX: ok signal`. `rt_sigprocmask` also remaps the sigset_t bit positions
   and the swapped Linux/b1nix `SIG_UNBLOCK`/`SIG_SETMASK` how-values
   (`M40-LINUX: ok sigmask`). `tkill`/`tgkill` self-signal (glibc raise/pthread_kill
-  path) work with signo remap (`M40-LINUX: ok tgkill`). Still `planned`:
-  `SA_SIGINFO` siginfo/ucontext translation and `sigqueue`.
+  path) work with signo remap (`M40-LINUX: ok tgkill`). `SA_SIGINFO` 3-arg
+  handlers get a kernel-built Linux `siginfo_t` (si_signo) and `ucontext_t`
+  (uc_mcontext gregs from the interrupted frame, fpregs NULL) placed above the
+  sigframe (`M40-LINUX: ok siginfo`). Still `planned`: `sigqueue` and a fully
+  populated siginfo for fault signals (si_addr/si_code).
 - [ ] `planned` Fill Linux-compatible `/proc` and `/sys` entries.
 - [x] `done` Detect Linux ELFs through a separate binary personality.
   `elf64_is_linux_binary` tags `PERSONALITY_LINUX` from `EI_OSABI==ELFOSABI_LINUX`

@@ -737,6 +737,8 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M40-LINUX: ok signal" "Linux rt_sigaction+kill deliver a SIGUSR1 handler with signo remap (b1nix 19 <-> Linux 10) and Linux sigreturn trampoline"
 	check_output "$LOG" "M40-LINUX: ok sigmask" "Linux rt_sigprocmask remaps the sigset_t bit positions and the swapped SIG_UNBLOCK/SIG_SETMASK how-values (blocked SIGUSR1 defers delivery)"
 	check_output "$LOG" "M40-LINUX: ok tgkill" "Linux tgkill(2) self-signal (glibc raise/pthread_kill path) delivers with signo remap"
+	check_output "$LOG" "M40-LINUX: ok alarm" "Linux alarm/sync/fchdir/setpriority mapped to native handlers"
+	check_output "$LOG" "M40-LINUX: ok siginfo" "Linux SA_SIGINFO 3-arg handler gets a kernel-built siginfo_t (si_signo) + ucontext_t"
 	check_output "$LOG" "M40-LINUX: ok run-static" "static Linux ELF ran and exited 0 via translated exit_group(231)"
 	check_output "$LOG" "M40-LINUX: done" "M40 Linux ABI smoke completes"
 fi
