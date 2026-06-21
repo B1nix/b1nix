@@ -199,9 +199,12 @@ endif
 # Default CC is clang for the clang toolchain. macOS aliases `cc`->clang, but on
 # Linux make's built-in `cc` is gcc, which rejects clang-only flags like
 # --target=x86_64-elf. Only override make's built-in default; an explicit
-# `make CC=...` is respected.
+# `make CC=...` is respected. Prefix ccache when present so a `make clean`
+# rebuild (the kernel has no incremental header-dep cache across cleans) hits the
+# compiler cache instead of recompiling every .o — near-instant on the 2nd build.
 ifeq ($(origin CC),default)
-CC := clang
+CCACHE := $(shell command -v ccache 2>/dev/null)
+CC := $(if $(CCACHE),$(CCACHE) clang,clang)
 endif
 endif
 
@@ -880,7 +883,9 @@ $(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/gen_netsurf_initramfs.sh tools/netsu
 # Self-contained TLS test PKI (CA + server cert/key) embedded under
 # /etc/tls-test for the M32 loopback HTTPS smoke. No network dependency.
 TLS_TEST_DIR := build/tls-test
-$(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem: tools/gen-tls-test-certs.sh
+# Grouped target (&:): one script run produces all three PEMs. Without &: a
+# parallel `make -j` runs this recipe once per output, racing on ca-key.pem.
+$(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem &: tools/gen-tls-test-certs.sh
 	sh tools/gen-tls-test-certs.sh $(TLS_TEST_DIR) >/dev/null
 
 $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem $(TLS_TEST_DIR)/server-key.pem

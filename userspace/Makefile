@@ -15,7 +15,10 @@ TARGET   := x86_64-unknown-elf
 LDFLAGS  := -m elf_x86_64
 B1NIX_TRIPLET := x86_64-b1nix
 endif
-CC       := clang
+# Prefix ccache when present so userspace ELFs recompile from cache after a
+# `make clean` (explicit `make CC=...` still wins — command-line beats `:=`).
+CCACHE   := $(shell command -v ccache 2>/dev/null)
+CC       := $(if $(CCACHE),$(CCACHE) clang,clang)
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 HOST_CC  ?= cc

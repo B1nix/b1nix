@@ -109,6 +109,13 @@ stage build-libjxl.sh      # libjxl_dec.a (+cms/hwy/brotli) — JPEG-XL decode (
 # `struct font_functions` model that print_make_settings no longer uses — so
 # NETSURF_USE_HARU_PDF stays NO until that dead code is revived.
 
+# Stage crt0.o + libb1nix.a + headers into the cross sysroot (= build/$ARCH/rootfs).
+# NetSurf links via the raw cross-gcc (GCCSDK convention), which finds crt0.o only
+# in its sysroot lib — unlike other ports that pass crt0 explicitly via b1nix-cc.
+# A prior `make clean` wipes rootfs and the kernel/iso build never repopulates it,
+# so do it here. Idempotent and cheap.
+make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs 1>&2
+
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
 # client of the compositor. Build it and stage the archive into the sysroot.

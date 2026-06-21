@@ -74,6 +74,17 @@ if [ "$SMOKE_V8" = "auto" ]; then
 fi
 
 mkdir -p "$PROJECT_DIR/smoke_run"
+
+# Pause the KDE file indexer (baloo) for the duration of the run: under parallel
+# QEMU it competes for host CPU and is a documented source of smoke flakiness
+# (timeouts/spurious fails). Best-effort and guarded — a no-op where baloo isn't
+# installed. Resumes on exit (incl. interrupt). Set SMOKE_NO_BALOO=1 to skip.
+BALOOCTL="$(command -v balooctl6 2>/dev/null || command -v balooctl 2>/dev/null || true)"
+if [ "${SMOKE_NO_BALOO:-0}" != "1" ] && [ -n "$BALOOCTL" ]; then
+	"$BALOOCTL" suspend >/dev/null 2>&1 || true
+	trap '"$BALOOCTL" resume >/dev/null 2>&1 || true' EXIT INT TERM
+fi
+
 SATA_IMG_BOOT="$PROJECT_DIR/smoke_run/sata-smoke-boot-$$.img"
 NVME_IMG_BOOT="$PROJECT_DIR/smoke_run/nvme-smoke-boot-$$.img"
 SWAP_IMG_BOOT="$PROJECT_DIR/smoke_run/swap-smoke-boot-$$.img"
@@ -170,9 +181,12 @@ run_qemu() {
 		# a no-op on hosts without KVM/HVF, which fall back to TCG.
 		local accel_args=""
 		if [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
-			accel_args="-accel kvm"
+			# -cpu host exposes the full host instruction set to the guest and
+			# cuts KVM exits (vs the conservative default model) — a free speedup
+			# with hardware virt, no extra VMs. Only with KVM/HVF, never TCG.
+			accel_args="-accel kvm -cpu host"
 		elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
-			accel_args="-accel hvf"
+			accel_args="-accel hvf -cpu host"
 		fi
 
 		# RAM: the historical default (no -m → 128 MiB) was enough until the real
