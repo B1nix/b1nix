@@ -383,6 +383,12 @@ void x86_irq_handler(struct interrupt_frame *frame) {
   x86_irq_handler_inner(frame);
 }
 
+/* User segment registers captured at isr_common entry (the CPU does not push
+ * %ds/%es/%fs/%gs on an interrupt; isr.S stashes them here before reloading the
+ * kernel selectors) so the exception dump can reveal a corrupt data segment. */
+volatile unsigned short g_fault_user_ds, g_fault_user_es,
+                        g_fault_user_fs, g_fault_user_gs;
+
 static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   if ((frame->vector == 3 || frame->vector == 1) &&
       bootinfo_has_flag("b1nix.gdb")) {
@@ -424,6 +430,14 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   }
   console_write("\ncs:     0x");
   console_write_hex64(frame->cs);
+  console_write(" ds: 0x");
+  console_write_hex64(g_fault_user_ds);
+  console_write(" es: 0x");
+  console_write_hex64(g_fault_user_es);
+  console_write(" fs: 0x");
+  console_write_hex64(g_fault_user_fs);
+  console_write(" gs: 0x");
+  console_write_hex64(g_fault_user_gs);
   console_write("\neflags: 0x");
   console_write_hex64(frame->eflags);
   console_write("\neax: 0x");

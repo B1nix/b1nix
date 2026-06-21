@@ -194,10 +194,16 @@ enum {
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the
  * libc can build a per-thread ELF TLS block in pthread_create (the kernel sets
  * up only the main thread's TLS at exec). memsz==0 => the binary has no TLS. */
+/* Fixed-width 64-bit fields to match the kernel's `u64 memsz, filesz, align`
+ * layout exactly. `unsigned long` is 4 bytes on i686, which mis-paired the
+ * fields against the kernel's 8-byte fields (userspace filesz read the high
+ * half of the kernel's memsz = 0) and overflowed this buffer by 12 bytes —
+ * breaking per-thread TLS init on the 32-bit port (thread-locals read 0
+ * instead of their .tdata image). 8 bytes on both i686 and x86_64. */
 struct b1nix_tls_info {
-  unsigned long memsz;  /* total TLS size (.tdata + .tbss) */
-  unsigned long filesz; /* initialised-image size (.tdata) */
-  unsigned long align;  /* TLS segment alignment (>=1) */
+  unsigned long long memsz;  /* total TLS size (.tdata + .tbss) */
+  unsigned long long filesz; /* initialised-image size (.tdata) */
+  unsigned long long align;  /* TLS segment alignment (>=1) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

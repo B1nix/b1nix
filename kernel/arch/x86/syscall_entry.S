@@ -90,6 +90,16 @@ x86_syscall_return:
 	/* EAX holds the return value. Store it into the saved EAX slot. */
 	movl %eax, 0(%esp)
 
+	/* Mask interrupts for the rest of the return sequence. Signal delivery
+	 * (arch_check_and_deliver_signals) re-enables interrupts before we get here,
+	 * so without this a timer IRQ could land between the user-segment reload
+	 * below and the final iret. That nested IRQ returns to *kernel* CS, so its
+	 * own `testl $3` skips the user-segment restore and leaves %ds/%es = kernel
+	 * 0x10; we then iret to ring 3 with a DPL-0 data segment live, and the next
+	 * userspace global access #GPs (err 0). iret restores the user IF from the
+	 * saved eflags, so masking here is transparent to userspace. */
+	cli
+
 	/* If returning to user mode (CS RPL == 3), restore the user segment
 	 * selectors — BEFORE the GP-register pops. The segment loads go through
 	 * %ax; doing them after `popl %eax` overwrote the low 16 bits of the

@@ -101,6 +101,14 @@ isr_common:
 	pushl %ebx
 	pushl %eax
 
+	/* Capture the faulting user segment registers before we reload the kernel
+	 * ones, so the exception dump can show a corrupt %ds/%es/%fs/%gs (the CPU
+	 * does not push them on an interrupt, and they are clobbered just below). */
+	movw %ds, g_fault_user_ds
+	movw %es, g_fault_user_es
+	movw %fs, g_fault_user_fs
+	movw %gs, g_fault_user_gs
+
 	/* Reload segment registers for kernel mode */
 	movw $0x10, %ax
 	movw %ax, %ds
@@ -128,6 +136,13 @@ isr_common:
 
 	call x86_exception_handler
 	addl $16, %esp       /* Clean up argument and padding */
+
+	/* Mask interrupts so the user-segment reload + iret below is atomic: signal
+	 * delivery re-enables interrupts, and a nested IRQ landing mid-sequence
+	 * returns to kernel CS, skips its own user-segment restore, and would leave
+	 * %ds/%es = kernel 0x10 live on the iret to ring 3 (next userspace global
+	 * access then #GPs). iret restores the user IF from the saved eflags. */
+	cli
 
 	/* Restore user segments (when returning to ring 3) BEFORE the GP pops — the
 	 * %ax segment loads would otherwise clobber the low 16 bits of the user's
@@ -180,6 +195,12 @@ irq_common:
 
 	call x86_irq_handler
 	addl $16, %esp
+
+	/* Mask interrupts so the user-segment reload + iret below is atomic (see the
+	 * matching note in isr_common): a nested IRQ here would return to kernel CS,
+	 * skip the user-segment restore, and leave kernel %ds/%es live on the iret to
+	 * ring 3. iret restores the user IF from the saved eflags. */
+	cli
 
 	/* Restore user segments (when returning to ring 3) BEFORE the GP pops, so
 	 * the %ax segment loads don't clobber the user's restored EAX. CS is at
