@@ -27,6 +27,21 @@
 #define LINUX_NR_UNAME      63
 #define LINUX_NR_GETDENTS64 217
 #define LINUX_NR_ARCH_PRCTL 158
+#define LINUX_NR_RT_SIGACTION 13
+#define LINUX_NR_RT_SIGPROCMASK 14
+#define LINUX_NR_RT_SIGRETURN 15
+#define LINUX_NR_KILL        62
+#define LINUX_NR_TKILL       200
+#define LINUX_NR_TGKILL      234
+
+/* Linux<->b1nix signal-number remap (b1nix uses different signo values, e.g.
+ * Linux SIGUSR1=10 vs b1nix 19). Returns 0 if there is no equivalent. */
+int linux_signo_to_b1nix(int lx);
+int b1nix_signo_to_linux(int b);
+
+/* Same remap applied to a sigset_t (translates set bit positions). */
+u64 linux_sigset_to_b1nix(u64 lx);
+u64 b1nix_sigset_to_linux(u64 b);
 
 /* arch_prctl options (asm/prctl.h). */
 #define LINUX_ARCH_SET_FS 0x1002

@@ -1434,6 +1434,31 @@ static isize sys_linux_arch_prctl(u64 option, u64 addr) {
   }
 }
 
+/* M40 — Linux rt_sigprocmask. Same as the native call but the sigset_t bit
+ * positions are remapped (b1nix and Linux number signals differently). */
+static isize sys_linux_rt_sigprocmask(int how, u64 set_ptr, u64 oldset_ptr) {
+  /* Linux SIG_UNBLOCK=1/SIG_SETMASK=2 are swapped relative to b1nix
+   * (SIG_SETMASK=1/SIG_UNBLOCK=2); SIG_BLOCK=0 matches. */
+  int b_how = (how == 1) ? 2 : (how == 2) ? 1 : how;
+  u64 b_set = 0, b_old = 0;
+  u64 *b_set_p = 0;
+  if (set_ptr) {
+    u64 lx_set = 0;
+    if (syscall_copyin(&lx_set, (void *)(usize)set_ptr, sizeof(lx_set)) != 0)
+      return -EFAULT;
+    b_set = linux_sigset_to_b1nix(lx_set);
+    b_set_p = &b_set;
+  }
+  if (scheduler_sigprocmask(b_how, b_set_p, oldset_ptr ? &b_old : 0) < 0)
+    return -EINVAL;
+  if (oldset_ptr) {
+    u64 lx_old = b1nix_sigset_to_linux(b_old);
+    if (syscall_copyout((void *)(usize)oldset_ptr, &lx_old, sizeof(lx_old)) != 0)
+      return -EFAULT;
+  }
+  return 0;
+}
+
 static isize sys_spawn(const char *user_path, int argc,
                        const char **user_argv) {
   char *kpath = kmalloc(VFS_MAX_PATH);
@@ -2582,6 +2607,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)sys_linux_getdents64((int)arg0, arg1, (usize)arg2);
       if (number == LINUX_NR_ARCH_PRCTL)
         return (u64)sys_linux_arch_prctl(arg0, arg1);
+      if (number == LINUX_NR_RT_SIGPROCMASK)
+        return (u64)sys_linux_rt_sigprocmask((int)arg0, arg1, arg2);
+      /* tkill(tid, sig) / tgkill(tgid, tid, sig): b1nix has no thread-kill, but
+       * its tids are task ids, so target the tid directly via scheduler_kill
+       * (for a single-threaded process tid == pid). Remap the signo. */
+      if (number == LINUX_NR_TKILL)
+        return (u64)scheduler_kill((usize)arg0,
+                                   linux_signo_to_b1nix((int)arg1));
+      if (number == LINUX_NR_TGKILL)
+        return (u64)scheduler_kill((usize)arg1,
+                                   linux_signo_to_b1nix((int)arg2));
+
+      /* Signal-number remap: b1nix signo values differ from Linux. rt_sigaction
+       * takes the signo in arg0; kill takes it in arg1. Remap in place, then let
+       * the table route to SYS_SIGNAL / SYS_KILL. Signo 0 (kill existence check)
+       * maps to 0 and is left intact. */
+      if (number == LINUX_NR_RT_SIGACTION)
+        arg0 = (u64)linux_signo_to_b1nix((int)arg0);
+      else if (number == LINUX_NR_KILL && arg1 != 0)
+        arg1 = (u64)linux_signo_to_b1nix((int)arg1);
 
       u32 native = linux_syscall_to_b1nix(number);
       if (native == LINUX_SYS_UNMAPPED) {

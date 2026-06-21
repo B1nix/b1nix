@@ -75,14 +75,42 @@ gettidok:
 gettidfail:
 	.ascii "M40-LINUX: fail gettid\n"
 	.set gettidfail_len, . - gettidfail
+signalok:
+	.ascii "M40-LINUX: ok signal\n"
+	.set signalok_len, . - signalok
+signalfail:
+	.ascii "M40-LINUX: fail signal\n"
+	.set signalfail_len, . - signalfail
+sigmaskok:
+	.ascii "M40-LINUX: ok sigmask\n"
+	.set sigmaskok_len, . - sigmaskok
+sigmaskfail:
+	.ascii "M40-LINUX: fail sigmask\n"
+	.set sigmaskfail_len, . - sigmaskfail
+tgkillok:
+	.ascii "M40-LINUX: ok tgkill\n"
+	.set tgkillok_len, . - tgkillok
+tgkillfail:
+	.ascii "M40-LINUX: fail tgkill\n"
+	.set tgkillfail_len, . - tgkillfail
 dirpath:
 	.asciz "/bin"
 
 	/* Writable scratch kept in .data so it is loaded without relying on .bss
-	 * zero-fill: a 144-byte Linux struct stat, a 390-byte struct utsname, a
-	 * 1 KiB getdents64 record buffer, a 16-byte TLS block, and a timespec. */
+	 * zero-fill. ELF is ET_EXEC (fixed VA) so the handler address is a valid
+	 * static initialiser for the Linux struct sigaction. */
 	.section .data
 	.align 8
+sigact:
+	.quad sigusr1_handler   /* sa_handler */
+	.quad 0                 /* sa_flags   */
+	.quad 0                 /* sa_restorer (b1nix uses the kernel trampoline) */
+	.quad 0                 /* sa_mask    */
+sigflag:
+	.long 0
+	.align 8
+blockset:
+	.quad 0x200             /* sigset_t with Linux SIGUSR1 (bit 9) set */
 statbuf:
 	.skip 144
 utsbuf:
@@ -326,13 +354,143 @@ _start:
 	leaq gettidok(%rip), %rsi
 	movq $gettidok_len, %rdx
 	syscall
-	jmp .Lexit
+	jmp .Lsignal
 
 .Lgettid_fail:
 	movq $1, %rax
 	movq $1, %rdi
 	leaq gettidfail(%rip), %rsi
 	movq $gettidfail_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Lsignal:
+	/* End-to-end Linux signal test. Install a SIGUSR1 (Linux nr 10) handler,
+	 * send it to ourselves, and confirm the handler ran AND received the Linux
+	 * signo (10). Exercises the signo remap (install + kill), delivery (rdi
+	 * remap) and the Linux sigreturn trampoline. b1nix numbers SIGUSR1 as 19, so
+	 * none of this works without the remap. */
+	/* rt_sigaction(10, &sigact, NULL, 8) — nr = 13 (4th arg in r10) */
+	movq $13, %rax
+	movq $10, %rdi
+	leaq sigact(%rip), %rsi
+	xorq %rdx, %rdx
+	movq $8, %r10
+	syscall
+	testq %rax, %rax
+	jnz .Lsignal_fail
+	/* getpid() — nr = 39 */
+	movq $39, %rax
+	syscall
+	movq %rax, %rdi
+	/* kill(pid, 10) — nr = 62. On return the kernel delivers the signal: the
+	 * handler runs, then the trampoline's rt_sigreturn resumes us here. */
+	movq $62, %rax
+	movq $10, %rsi
+	syscall
+	testq %rax, %rax
+	jnz .Lsignal_fail
+	movl sigflag(%rip), %eax
+	cmpl $10, %eax           /* handler must have seen Linux SIGUSR1 == 10 */
+	jne .Lsignal_fail
+	movq $1, %rax
+	movq $1, %rdi
+	leaq signalok(%rip), %rsi
+	movq $signalok_len, %rdx
+	syscall
+	jmp .Lsigmask
+
+.Lsignal_fail:
+	movq $1, %rax
+	movq $1, %rdi
+	leaq signalfail(%rip), %rsi
+	movq $signalfail_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Lsigmask:
+	/* rt_sigprocmask bit-remap test. Block Linux SIGUSR1 (bit 9), send it to
+	 * ourselves — the handler must NOT run while blocked — then unblock and
+	 * confirm it runs. b1nix numbers SIGUSR1 as 19 and swaps SIG_UNBLOCK/
+	 * SIG_SETMASK, so this only works with the sigset and `how` remaps. */
+	movl $0, sigflag(%rip)
+	/* rt_sigprocmask(SIG_BLOCK=0, &blockset, NULL, 8) — nr=14 */
+	movq $14, %rax
+	xorq %rdi, %rdi
+	leaq blockset(%rip), %rsi
+	xorq %rdx, %rdx
+	movq $8, %r10
+	syscall
+	testq %rax, %rax
+	jnz .Lsigmask_fail
+	/* kill(getpid(), SIGUSR1=10) while blocked */
+	movq $39, %rax
+	syscall
+	movq %rax, %rdi
+	movq $62, %rax
+	movq $10, %rsi
+	syscall
+	movl sigflag(%rip), %eax
+	testl %eax, %eax         /* blocked: handler must NOT have run */
+	jnz .Lsigmask_fail
+	/* rt_sigprocmask(SIG_UNBLOCK=1, &blockset, NULL, 8) — pending now delivers */
+	movq $14, %rax
+	movq $1, %rdi
+	leaq blockset(%rip), %rsi
+	xorq %rdx, %rdx
+	movq $8, %r10
+	syscall
+	movl sigflag(%rip), %eax
+	cmpl $10, %eax           /* now the handler ran with Linux signo 10 */
+	jne .Lsigmask_fail
+	movq $1, %rax
+	movq $1, %rdi
+	leaq sigmaskok(%rip), %rsi
+	movq $sigmaskok_len, %rdx
+	syscall
+	jmp .Ltgkill
+
+.Lsigmask_fail:
+	movq $1, %rax
+	movq $1, %rdi
+	leaq sigmaskfail(%rip), %rsi
+	movq $sigmaskfail_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Ltgkill:
+	/* tgkill(getpid(), gettid(), SIGUSR1=10) — Linux nr 234. Self-signal via the
+	 * thread-targeted kill (used by glibc raise/pthread_kill). Reuses the
+	 * installed SIGUSR1 handler; confirm it ran with the remapped signo. */
+	movl $0, sigflag(%rip)
+	movq $39, %rax           /* getpid -> tgid */
+	syscall
+	movq %rax, %r12
+	movq $186, %rax          /* gettid -> tid */
+	syscall
+	movq %rax, %r13
+	movq $234, %rax
+	movq %r12, %rdi
+	movq %r13, %rsi
+	movq $10, %rdx
+	syscall
+	testq %rax, %rax
+	jnz .Ltgkill_fail
+	movl sigflag(%rip), %eax
+	cmpl $10, %eax
+	jne .Ltgkill_fail
+	movq $1, %rax
+	movq $1, %rdi
+	leaq tgkillok(%rip), %rsi
+	movq $tgkillok_len, %rdx
+	syscall
+	jmp .Lexit
+
+.Ltgkill_fail:
+	movq $1, %rax
+	movq $1, %rdi
+	leaq tgkillfail(%rip), %rsi
+	movq $tgkillfail_len, %rdx
 	syscall
 
 .Lexit:
@@ -343,3 +501,9 @@ _start:
 
 	/* Must not fall through; loop just in case. */
 1:	jmp 1b
+
+	/* SIGUSR1 handler: record the signo it was invoked with, then return — the
+	 * kernel set the return address to the sigreturn trampoline. */
+sigusr1_handler:
+	movl %edi, sigflag(%rip)
+	ret

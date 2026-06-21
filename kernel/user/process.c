@@ -1,6 +1,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
@@ -1687,11 +1688,18 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       vmm_map_page(tva, tframe, VMM_USER); /* RO (no WRITABLE) + executable */
       u8 *code = (u8 *)(usize)(vmm_direct_map_base() + tframe);
       memset(code, 0, PAGE_SIZE);
+      /* A Linux-personality task's syscalls are number-translated, so the
+       * trampoline must invoke Linux rt_sigreturn (15) — which maps back to
+       * SYS_SIGRETURN — not b1nix's SYS_SIGRETURN (99), which Linux would
+       * re-translate to sysinfo. */
+      u32 sigret_nr = (image->personality == PERSONALITY_LINUX)
+                          ? LINUX_NR_RT_SIGRETURN
+                          : (u32)SYS_SIGRETURN;
       code[0] = 0xB8; /* mov $imm32, %eax */
-      code[1] = (u8)(SYS_SIGRETURN & 0xff);
-      code[2] = (u8)((SYS_SIGRETURN >> 8) & 0xff);
-      code[3] = (u8)((SYS_SIGRETURN >> 16) & 0xff);
-      code[4] = (u8)((SYS_SIGRETURN >> 24) & 0xff);
+      code[1] = (u8)(sigret_nr & 0xff);
+      code[2] = (u8)((sigret_nr >> 8) & 0xff);
+      code[3] = (u8)((sigret_nr >> 16) & 0xff);
+      code[4] = (u8)((sigret_nr >> 24) & 0xff);
 #ifdef __x86_64__
       code[5] = 0x0F;
       code[6] = 0x05; /* syscall */

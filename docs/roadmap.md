@@ -424,7 +424,18 @@ syscall-number translation layer keyed off a per-image binary personality
   The existing SysV initial-stack (argc/argv/envp + minimal auxv AT_ENTRY/AT_PHDR)
   and x86 TLS apply to Linux tasks too; `arch_prctl(ARCH_SET_FS/GET_FS)` is
   translated to the per-task FS base (`M40-LINUX: ok arch-prctl`). A full Linux
-  auxv vector, vDSO and Linux-shaped `rt_sigframe` are `planned`.
+  auxv vector and vDSO are `planned`. Basic signal delivery works: a
+  Linux-personality task can `rt_sigaction` a handler, `kill` itself and have the
+  handler run and return, with a full Linux<->b1nix signo remap
+  (`linux_signo_to_b1nix`/`b1nix_signo_to_linux`, b1nix `SIGUSR1=19` vs Linux
+  `10`) applied to rt_sigaction, kill and the delivered handler's signo argument,
+  plus a Linux-personality sigreturn trampoline emitting `rt_sigreturn` (15) (not
+  b1nix `SYS_SIGRETURN` (99), which would re-translate to `sysinfo`). Verified by
+  `M40-LINUX: ok signal`. `rt_sigprocmask` also remaps the sigset_t bit positions
+  and the swapped Linux/b1nix `SIG_UNBLOCK`/`SIG_SETMASK` how-values
+  (`M40-LINUX: ok sigmask`). `tkill`/`tgkill` self-signal (glibc raise/pthread_kill
+  path) work with signo remap (`M40-LINUX: ok tgkill`). Still `planned`:
+  `SA_SIGINFO` siginfo/ucontext translation and `sigqueue`.
 - [ ] `planned` Fill Linux-compatible `/proc` and `/sys` entries.
 - [x] `done` Detect Linux ELFs through a separate binary personality.
   `elf64_is_linux_binary` tags `PERSONALITY_LINUX` from `EI_OSABI==ELFOSABI_LINUX`

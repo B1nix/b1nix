@@ -734,6 +734,9 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M40-LINUX: ok mmap" "Linux mmap(MAP_ANONYMOUS) gives a Linux binary writable memory (flags/prot already match)"
 	check_output "$LOG" "M40-LINUX: ok clock" "Linux clock_gettime(CLOCK_MONOTONIC) works (timespec layout matches b1nix)"
 	check_output "$LOG" "M40-LINUX: ok gettid" "Linux gettid(2) is mapped to the native SYS_GETTID (returns a valid thread id)"
+	check_output "$LOG" "M40-LINUX: ok signal" "Linux rt_sigaction+kill deliver a SIGUSR1 handler with signo remap (b1nix 19 <-> Linux 10) and Linux sigreturn trampoline"
+	check_output "$LOG" "M40-LINUX: ok sigmask" "Linux rt_sigprocmask remaps the sigset_t bit positions and the swapped SIG_UNBLOCK/SIG_SETMASK how-values (blocked SIGUSR1 defers delivery)"
+	check_output "$LOG" "M40-LINUX: ok tgkill" "Linux tgkill(2) self-signal (glibc raise/pthread_kill path) delivers with signo remap"
 	check_output "$LOG" "M40-LINUX: ok run-static" "static Linux ELF ran and exited 0 via translated exit_group(231)"
 	check_output "$LOG" "M40-LINUX: done" "M40 Linux ABI smoke completes"
 fi

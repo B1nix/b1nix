@@ -1,4 +1,5 @@
 #include <b1nix/arch_x86_64.h>
+#include <b1nix/linux_abi.h>
 #include <b1nix/sched.h>
 #include <b1nix/signal.h>
 #include <b1nix/syscall.h>
@@ -73,7 +74,13 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
 
   frame->rip = (u64)(usize)sa->sa_handler;
   frame->rsp = restorer_slot;
-  frame->rdi = (u64)sig;
+  /* A Linux-personality handler expects the Linux signal number, not b1nix's. */
+  if (img && img->personality == PERSONALITY_LINUX) {
+    int lx = b1nix_signo_to_linux(sig);
+    frame->rdi = (u64)(lx ? lx : sig);
+  } else {
+    frame->rdi = (u64)sig;
+  }
   frame->vector = 0; /* Force return via iretq to honor the modified rip */
   /* Note: do NOT update saved_user_rsp here — it already holds the original
    * user RSP and will be refreshed by the SYSCALL entry on the next entry.

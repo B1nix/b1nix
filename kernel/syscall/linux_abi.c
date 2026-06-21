@@ -31,7 +31,9 @@
 #define LX_mprotect        10
 #define LX_munmap          11
 #define LX_brk             12
+#define LX_rt_sigaction    13
 #define LX_rt_sigprocmask  14
+#define LX_rt_sigreturn    15
 #define LX_ioctl           16
 #define LX_access          21
 #define LX_pipe            22
@@ -117,7 +119,9 @@ static const struct lx_map lx_table[] = {
 	{LX_mprotect,       SYS_MPROTECT,      "mprotect"},
 	{LX_munmap,         SYS_MUNMAP,        "munmap"},
 	{LX_brk,            SYS_BRK,           "brk"},
+	{LX_rt_sigaction,   SYS_SIGNAL,        "rt_sigaction"},
 	{LX_rt_sigprocmask, SYS_SIGPROCMASK,   "rt_sigprocmask"},
+	{LX_rt_sigreturn,   SYS_SIGRETURN,     "rt_sigreturn"},
 	{LX_ioctl,          SYS_IOCTL,         "ioctl"},
 	{LX_access,         SYS_ACCESS,        "access"},
 	{LX_pipe,           SYS_PIPE,          "pipe"},
@@ -232,6 +236,67 @@ static void lx_field_copy(char dst[65], const char *src) {
 		dst[i] = src[i];
 	for (; i < 65; i++)
 		dst[i] = '\0';
+}
+
+/* Linux x86_64 signal number -> b1nix signal number (b1nix uses a different
+ * numbering, e.g. Linux SIGUSR1=10 but b1nix=19). Indexed by Linux signo; 0
+ * means "no b1nix equivalent" (e.g. Linux SIGSTKFLT=16). Built by name. */
+static const u8 lx_signo_to_b1nix_tbl[32] = {
+	[1] = 7,   /* SIGHUP   */ [2] = 9,   /* SIGINT  */
+	[3] = 12,  /* SIGQUIT  */ [4] = 8,   /* SIGILL  */
+	[5] = 22,  /* SIGTRAP  */ [6] = 1,   /* SIGABRT */
+	[7] = 3,   /* SIGBUS   */ [8] = 6,   /* SIGFPE  */
+	[9] = 10,  /* SIGKILL  */ [10] = 19, /* SIGUSR1 */
+	[11] = 13, /* SIGSEGV  */ [12] = 20, /* SIGUSR2 */
+	[13] = 11, /* SIGPIPE  */ [14] = 2,  /* SIGALRM */
+	[15] = 15, /* SIGTERM  */ [16] = 0,  /* SIGSTKFLT (none) */
+	[17] = 4,  /* SIGCHLD  */ [18] = 5,  /* SIGCONT */
+	[19] = 14, /* SIGSTOP  */ [20] = 16, /* SIGTSTP */
+	[21] = 17, /* SIGTTIN  */ [22] = 18, /* SIGTTOU */
+	[23] = 23, /* SIGURG   */ [24] = 24, /* SIGXCPU */
+	[25] = 25, /* SIGXFSZ  */ [26] = 26, /* SIGVTALRM */
+	[27] = 27, /* SIGPROF  */ [28] = 28, /* SIGWINCH */
+	[29] = 29, /* SIGIO    */ [30] = 30, /* SIGPWR  */
+	[31] = 21, /* SIGSYS   */
+};
+
+int linux_signo_to_b1nix(int lx) {
+	if (lx < 1 || lx > 31)
+		return 0;
+	return lx_signo_to_b1nix_tbl[lx];
+}
+
+int b1nix_signo_to_linux(int b) {
+	for (int lx = 1; lx <= 31; lx++)
+		if (lx_signo_to_b1nix_tbl[lx] == b)
+			return lx;
+	return 0;
+}
+
+/* Remap a sigset_t: bit (signo-1) is set for signo, and the signo numbering
+ * differs between Linux and b1nix, so the bit positions must be translated. */
+u64 linux_sigset_to_b1nix(u64 lx) {
+	u64 b = 0;
+	for (int l = 1; l <= 31; l++) {
+		if (lx & (1ULL << (l - 1))) {
+			int bs = linux_signo_to_b1nix(l);
+			if (bs)
+				b |= (1ULL << (bs - 1));
+		}
+	}
+	return b;
+}
+
+u64 b1nix_sigset_to_linux(u64 b) {
+	u64 lx = 0;
+	for (int bs = 1; bs <= 30; bs++) {
+		if (b & (1ULL << (bs - 1))) {
+			int l = b1nix_signo_to_linux(bs);
+			if (l)
+				lx |= (1ULL << (l - 1));
+		}
+	}
+	return lx;
 }
 
 void linux_utsname_from_b1nix(struct linux_utsname *out,
