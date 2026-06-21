@@ -30,7 +30,17 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define PT_LOAD    1
 #define PT_DYNAMIC 2
 #define PT_INTERP  3
+#define PT_NOTE    4
 #define PT_TLS     7
+
+/* M40 — Linux personality detection. EI_OSABI is e_ident byte 7; Linux/GNU
+ * binaries set it to ELFOSABI_LINUX or carry a GNU NT_GNU_ABI_TAG note whose
+ * first descriptor word (the OS) is GNU_ABI_OS_LINUX. b1nix's own freestanding
+ * userspace sets neither. */
+#define EI_OSABI          7
+#define ELFOSABI_LINUX    3
+#define NT_GNU_ABI_TAG    1
+#define GNU_ABI_OS_LINUX  0
 
 /* M30 — ELF64 dynamic-tag identifiers (subset honoured by the in-kernel
  * loader). Standard `Elf64_Dyn` tag values. */
@@ -619,6 +629,58 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
   return 0;
 }
 
+/* M40 — decide whether an ELF64 image is a Linux binary. Two independent
+ * signals, either of which is conclusive:
+ *   1. EI_OSABI (e_ident[7]) == ELFOSABI_LINUX.
+ *   2. A PT_NOTE program header containing a GNU NT_GNU_ABI_TAG note whose first
+ *      descriptor word (the OS) is GNU_ABI_OS_LINUX. This is what glibc-linked
+ *      static Linux binaries carry; b1nix freestanding binaries never emit it.
+ * Returns 1 for a Linux binary, 0 otherwise. All file accesses are bounds-checked
+ * against file_size so a crafted note table cannot drive an OOB read. */
+static int elf64_is_linux_binary(const struct elf64_ehdr *ehdr,
+                                 const char *file_data, usize file_size) {
+  if (ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX)
+    return 1;
+
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph =
+        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                                    (u64)i * ehdr->e_phentsize);
+    if (ph->p_type != PT_NOTE)
+      continue;
+    if (ph->p_offset + ph->p_filesz < ph->p_offset ||
+        ph->p_offset + ph->p_filesz > file_size)
+      continue;
+    /* Walk the note records: [namesz(4)][descsz(4)][type(4)][name, 4-aligned]
+     * [desc, 4-aligned]. */
+    u64 off = ph->p_offset;
+    u64 end = ph->p_offset + ph->p_filesz;
+    while (off + 12 <= end) {
+      u32 namesz = *(const u32 *)(file_data + off);
+      u32 descsz = *(const u32 *)(file_data + off + 4);
+      u32 type = *(const u32 *)(file_data + off + 8);
+      u64 name_off = off + 12;
+      u64 name_pad = ((u64)namesz + 3) & ~3ULL;
+      u64 desc_off = name_off + name_pad;
+      u64 desc_pad = ((u64)descsz + 3) & ~3ULL;
+      u64 next = desc_off + desc_pad;
+      if (next < off || next > end) /* malformed / wrap */
+        break;
+      if (type == NT_GNU_ABI_TAG && namesz == 4 && descsz >= 4 &&
+          name_off + 4 <= end &&
+          file_data[name_off] == 'G' && file_data[name_off + 1] == 'N' &&
+          file_data[name_off + 2] == 'U' && file_data[name_off + 3] == '\0' &&
+          desc_off + 4 <= end) {
+        u32 os = *(const u32 *)(file_data + desc_off);
+        if (os == GNU_ABI_OS_LINUX)
+          return 1;
+      }
+      off = next;
+    }
+  }
+  return 0;
+}
+
 static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   char *file_data = 0;
   usize file_size = 0;
@@ -688,6 +750,18 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
+
+  /* M40: tag the binary personality (e_phoff/e_phentsize already validated
+   * above, so the note walk is in-bounds). A Linux binary gets its syscall
+   * numbers translated at dispatch time. */
+  if (elf64_is_linux_binary(ehdr, file_data, file_size)) {
+    image->personality = PERSONALITY_LINUX;
+    console_write("ELF load: Linux personality detected: ");
+    console_write(path);
+    console_write("\n");
+  } else {
+    image->personality = PERSONALITY_B1NIX;
+  }
 
   /* M30: PIE / ET_DYN support. For ET_DYN the segment vaddrs are 0-based
    * and the loader gets to choose where to place the image. We use a

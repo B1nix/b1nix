@@ -1279,6 +1279,30 @@ static int init_main(int argc, const char **argv) {
   }
 
   if (smoke_core) {
+#ifdef __x86_64__
+  /* M40: Linux ABI compatibility. Spawn a static *Linux* x86_64 ELF that issues
+   * write(1,...) and exit_group(0) using Linux syscall NUMBERS. The kernel
+   * detects the Linux personality (EI_OSABI / GNU note) and translates those
+   * numbers to the native handlers. The binary prints its own line on success;
+   * status==0 proves exit_group(231) was translated to the native group-exit.
+   * Only emitted when both happened. */
+  {
+    uwrite("M40-LINUX: start\n");
+    u64 lx_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m40-linux-hello",
+                                  0, 0, 0, 0, 0);
+    if ((isize)lx_pid < 0) {
+      uwrite("M40-LINUX: spawn-fail\n");
+    } else {
+      int lx_status = -1;
+      syscall_dispatch(SYS_WAIT, lx_pid, (u64)(usize)&lx_status, 0, 0, 0, 0);
+      if (lx_status == 0)
+        uwrite("M40-LINUX: ok run-static\n");
+      else
+        uwrite("M40-LINUX: fail run-static\n");
+    }
+    uwrite("M40-LINUX: done\n");
+  }
+#endif
   /* POSIX memory/signal primitives: madvise(MADV_DONTNEED) zeroes a refaulted
    * anonymous page, MAP_NORESERVE large lazy-commit mapping, and sigaltstack
    * set/get/disable + an SA_ONSTACK handler delivered on the alt stack. Pure

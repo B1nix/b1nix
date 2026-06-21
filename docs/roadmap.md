@@ -398,13 +398,37 @@ Supporting documents:
 
 ## M40: Linux ABI Compatibility
 
-Source-level ports remain preferable to a Linux compatibility layer.
+Source-level ports remain preferable to a Linux compatibility layer. A real
+foundation is in place: a static Linux x86_64 ELF runs on b1nix via a
+syscall-number translation layer keyed off a per-image binary personality
+(`/bin/m40-linux-hello`, `M40-LINUX: ok run-static`, x86_64 only).
 
-- [ ] `planned` Translate Linux x86_64 syscall numbers and semantics.
-- [ ] `planned` Load static Linux binaries and glibc's `PT_INTERP`.
-- [ ] `planned` Add Linux-shaped process startup, auxv, vDSO, TLS, and signals.
+- [ ] `partial` Translate Linux x86_64 syscall numbers and semantics.
+  Number-translation table (`kernel/syscall/linux_abi.c`, ~75 calls incl.
+  gettid/link/fchmod/fchown/ftruncate) maps the Linux x86_64 ABI to the existing
+  native handlers for Linux-personality tasks; unmapped calls return `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and
+  `getdents64` additionally get a semantic translation to the Linux x86_64
+  `struct stat` / `struct utsname` / `struct linux_dirent64` layouts
+  (`linux_stat_from_b1nix`, `linux_utsname_from_b1nix`, `sys_linux_getdents64`;
+  verified by `M40-LINUX: ok fstat` / `ok uname` / `ok getdents64`). Remaining
+  struct/flag differences (signal-frame layout, ioctl/termios) are not yet
+  translated.
+  Linux binaries also reuse the matching native calls verified end to end:
+  anonymous `mmap`/`munmap` (flags/prot already match) and
+  `clock_gettime` (timespec matches), via `M40-LINUX: ok mmap` / `ok clock`.
+- [ ] `partial` Load static Linux binaries and glibc's `PT_INTERP`.
+  Static (`ET_EXEC`) Linux binaries load and run. Dynamic `PT_INTERP` / glibc
+  ld.so is `planned` (the kernel does eager in-kernel linking, not an ld.so
+  handoff).
+- [ ] `partial` Add Linux-shaped process startup, auxv, vDSO, TLS, and signals.
+  The existing SysV initial-stack (argc/argv/envp + minimal auxv AT_ENTRY/AT_PHDR)
+  and x86 TLS apply to Linux tasks too; `arch_prctl(ARCH_SET_FS/GET_FS)` is
+  translated to the per-task FS base (`M40-LINUX: ok arch-prctl`). A full Linux
+  auxv vector, vDSO and Linux-shaped `rt_sigframe` are `planned`.
 - [ ] `planned` Fill Linux-compatible `/proc` and `/sys` entries.
-- [ ] `planned` Detect Linux ELFs through a separate binary personality.
+- [x] `done` Detect Linux ELFs through a separate binary personality.
+  `elf64_is_linux_binary` tags `PERSONALITY_LINUX` from `EI_OSABI==ELFOSABI_LINUX`
+  or a GNU `NT_GNU_ABI_TAG` note with OS=Linux; it gates the translation layer.
 
 ## M41: Large Physical Memory
 

@@ -5,6 +5,7 @@
 #include <b1nix/initramfs.h>
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
+#include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/net.h>
@@ -1284,6 +1285,155 @@ static isize sys_stat(const char *user_path, struct b1nix_stat *user_st) {
   return res;
 }
 
+/* M40 — Linux stat/fstat/lstat. Same native lookup as the b1nix calls, but the
+ * result is copied out in the Linux x86_64 `struct stat` layout (see
+ * linux_stat_from_b1nix). Routed here from the dispatcher for Linux-personality
+ * tasks only; native b1nix tasks keep using sys_stat/sys_fstat/sys_lstat. */
+static isize sys_linux_stat_family(u64 lnr, u64 arg0, u64 arg1) {
+  struct b1nix_stat kst;
+  int res;
+  if (lnr == LINUX_NR_FSTAT) {
+    res = vfs_fstat((int)arg0, &kst);
+  } else {
+    char *kpath = kmalloc(VFS_MAX_PATH);
+    if (!kpath)
+      return -ENOMEM;
+    if (strncpy_from_user(kpath, (const char *)(usize)arg0, VFS_MAX_PATH) < 0) {
+      kfree(kpath);
+      return -EFAULT;
+    }
+    kpath[VFS_MAX_PATH - 1] = '\0';
+    char resolved[VFS_MAX_PATH];
+    vfs_resolve_path(kpath, resolved);
+    kfree(kpath);
+    res = (lnr == LINUX_NR_LSTAT) ? vfs_lstat(resolved, &kst)
+                                  : vfs_stat(resolved, &kst);
+  }
+  if (res != 0)
+    return res;
+  struct linux_stat lst;
+  linux_stat_from_b1nix(&lst, &kst);
+  if (copy_to_user((void *)(usize)arg1, &lst, sizeof(lst)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+/* Fill the b1nix uname result. Single source of truth shared by the native
+ * SYS_UNAME path and the M40 Linux uname translation. */
+static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
+  memset(uts, 0, sizeof(*uts));
+  copy_cstr(uts->sysname, sizeof(uts->sysname), "B1NIX");
+  copy_cstr(uts->nodename, sizeof(uts->nodename), "b1nix");
+  copy_cstr(uts->release, sizeof(uts->release), B1NIX_VERSION_STR);
+  copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
+#if defined(__aarch64__)
+  copy_cstr(uts->machine, sizeof(uts->machine), "aarch64");
+#elif defined(__x86_64__)
+  copy_cstr(uts->machine, sizeof(uts->machine), "x86_64");
+#else
+  copy_cstr(uts->machine, sizeof(uts->machine), "i686");
+#endif
+}
+
+/* M40 — Linux uname. Same data as the native call, copied out in the wider
+ * Linux `struct utsname` layout (six 65-byte fields + domainname). */
+static isize sys_linux_uname(u64 arg0) {
+  struct b1nix_utsname uts;
+  fill_b1nix_utsname(&uts);
+  struct linux_utsname lx;
+  linux_utsname_from_b1nix(&lx, &uts);
+  if (copy_to_user((void *)(usize)arg0, &lx, sizeof(lx)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+/* Map a b1nix dirent type (1=file, 2=device, 3=directory) to a Linux d_type. */
+static u8 lx_dirent_type(const struct dirent *d) {
+  switch (d->type) {
+  case 3:
+    return 4; /* DT_DIR */
+  case 2:
+    return 2; /* DT_CHR (b1nix "device") */
+  case 1:
+    return 8; /* DT_REG */
+  default:
+    return d->is_dir ? 4 : 0; /* DT_DIR or DT_UNKNOWN */
+  }
+}
+
+/* M40 — Linux getdents64. The native getdents returns a fixed-size struct
+ * dirent array; Linux expects variable-length linux_dirent64 records and a
+ * byte count. Read a batch, repack as many as fit into the user buffer, then
+ * rewind the directory index by the unemitted count so nothing is lost. */
+static isize sys_linux_getdents64(int fd, u64 user_buf, usize count) {
+  isize start = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
+  if (start < 0)
+    return start;
+  struct dirent kbuf[32];
+  isize n = vfs_getdents(fd, kbuf, 32);
+  if (n <= 0)
+    return n; /* 0 = end of directory, <0 = -errno */
+
+  usize written = 0;
+  isize emitted = 0;
+  for (isize i = 0; i < n; i++) {
+    usize namelen = 0;
+    while (namelen < sizeof(kbuf[i].name) && kbuf[i].name[namelen])
+      namelen++;
+    /* d_name starts at byte 19; record is padded to an 8-byte multiple. */
+    usize reclen = (19 + namelen + 1 + 7) & ~(usize)7;
+    if (written + reclen > count)
+      break; /* no room; leave this and the rest for the next call */
+
+    char rec[19 + sizeof(kbuf[0].name) + 1 + 7];
+    for (usize z = 0; z < reclen; z++)
+      rec[z] = 0;
+    struct linux_dirent64 *de = (struct linux_dirent64 *)rec;
+    de->d_ino = (u64)(start + i + 1); /* b1nix dirent has no inode; synthesize */
+    de->d_off = (i64)(start + i + 1); /* opaque cookie: index of the next entry */
+    de->d_reclen = (u16)reclen;
+    de->d_type = lx_dirent_type(&kbuf[i]);
+    for (usize z = 0; z < namelen; z++)
+      de->d_name[z] = kbuf[i].name[z];
+    de->d_name[namelen] = '\0';
+
+    if (copy_to_user((void *)(usize)(user_buf + written), rec, reclen) < 0)
+      return -EFAULT;
+    written += reclen;
+    emitted++;
+  }
+
+  /* Consumed n from the handle but only emitted `emitted`; rewind the rest. */
+  vfs_lseek(fd, start + emitted, B1NIX_SEEK_SET);
+  if (emitted == 0)
+    return -EINVAL; /* buffer too small for even one entry */
+  return (isize)written;
+}
+
+/* M40 — Linux arch_prctl. glibc and TLS-using Linux binaries set the FS base
+ * here rather than via a dedicated syscall; b1nix tracks the same per-task FS
+ * base (task_set_tls_base), reloaded on the next return to userspace. */
+static isize sys_linux_arch_prctl(u64 option, u64 addr) {
+  extern void arch_set_fs_base(u64 base);
+  switch (option) {
+  case LINUX_ARCH_SET_FS:
+    task_set_tls_base(current_task, addr);
+    /* Linux arch_prctl is synchronous: the FS base must be live on return to
+     * userspace, not only after the next context switch (which is when the
+     * scheduler otherwise reloads IA32_FS_BASE). Write the MSR now. */
+    arch_set_fs_base(addr);
+    return 0;
+  case LINUX_ARCH_GET_FS: {
+    u64 base = task_tls_base(current_task);
+    if (copy_to_user((void *)(usize)addr, &base, sizeof(base)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  default:
+    return -EINVAL; /* ARCH_SET_GS/ARCH_GET_GS unsupported */
+  }
+}
+
 static isize sys_spawn(const char *user_path, int argc,
                        const char **user_argv) {
   char *kpath = kmalloc(VFS_MAX_PATH);
@@ -2409,6 +2559,43 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
   }
 
+  /* M40 — Linux ABI translation. For a task whose image carries the Linux
+   * personality, `number` is a Linux x86_64 syscall number; translate it to the
+   * b1nix native number before routing. The CPU calling convention is identical,
+   * so the args pass straight through. An unmapped Linux call returns -ENOSYS,
+   * exactly as Linux returns for an unimplemented syscall. Native b1nix tasks
+   * skip this entirely (personality == PERSONALITY_B1NIX). */
+  {
+    struct task *t = current_task;
+    if (t && t->user_image &&
+        ((struct user_loaded_image *)t->user_image)->personality ==
+            PERSONALITY_LINUX) {
+      /* Some calls need a semantic (struct-layout) translation, not just a
+       * number remap, because the result struct differs from b1nix's. Handle
+       * those here and return their result directly. */
+      if (number == LINUX_NR_STAT || number == LINUX_NR_FSTAT ||
+          number == LINUX_NR_LSTAT)
+        return (u64)sys_linux_stat_family(number, arg0, arg1);
+      if (number == LINUX_NR_UNAME)
+        return (u64)sys_linux_uname(arg0);
+      if (number == LINUX_NR_GETDENTS64)
+        return (u64)sys_linux_getdents64((int)arg0, arg1, (usize)arg2);
+      if (number == LINUX_NR_ARCH_PRCTL)
+        return (u64)sys_linux_arch_prctl(arg0, arg1);
+
+      u32 native = linux_syscall_to_b1nix(number);
+      if (native == LINUX_SYS_UNMAPPED) {
+        console_write("linux-abi: unmapped syscall ");
+        console_write(linux_syscall_name(number));
+        console_write(" (nr=");
+        console_write_dec(number);
+        console_write(") -> -ENOSYS\n");
+        return (u64)-ENOSYS;
+      }
+      number = native;
+    }
+  }
+
   switch (number) {
   case SYS_WRITE:
     ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
@@ -3083,18 +3270,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)vfs_get_unix_time();
   case SYS_UNAME: {
     struct b1nix_utsname uts;
-    memset(&uts, 0, sizeof(uts));
-    copy_cstr(uts.sysname, sizeof(uts.sysname), "B1NIX");
-    copy_cstr(uts.nodename, sizeof(uts.nodename), "b1nix");
-    copy_cstr(uts.release, sizeof(uts.release), B1NIX_VERSION_STR);
-    copy_cstr(uts.version, sizeof(uts.version), "#1 SMP");
-#if defined(__aarch64__)
-    copy_cstr(uts.machine, sizeof(uts.machine), "aarch64");
-#elif defined(__x86_64__)
-    copy_cstr(uts.machine, sizeof(uts.machine), "x86_64");
-#else
-    copy_cstr(uts.machine, sizeof(uts.machine), "i686");
-#endif
+    fill_b1nix_utsname(&uts);
     return syscall_copyout((void *)(usize)arg0, &uts, sizeof(uts)) == 0
                ? 0
                : (u64)-EFAULT;

@@ -721,6 +721,23 @@ check_output "$LOG" "MM-SMOKE: ok noreserve" "MAP_NORESERVE large mapping commit
 check_output "$LOG" "MM-SMOKE: ok sigaltstack" "sigaltstack get/set/disable + SA_ONSTACK handler runs on alt stack"
 check_output "$LOG" "MM-SMOKE: done" "MM smoke completes"
 
+# ── M40 Linux ABI compatibility (x86_64 only: it runs a Linux x86_64 ELF) ──
+if [ "$ARCH" = "x86_64" ]; then
+	section "M40 Linux ABI Compatibility"
+	check_output "$LOG" "M40-LINUX: start" "M40 Linux ABI smoke starts"
+	check_output "$LOG" "ELF load: Linux personality detected: /bin/m40-linux-hello" "loader tags the static Linux binary with the Linux personality"
+	check_output "$LOG" "M40-LINUX: hello from a static linux x86_64 binary" "translated Linux write(1,...) reached the console"
+	check_output "$LOG" "M40-LINUX: ok fstat" "Linux fstat(2) result is translated to the Linux struct stat layout (st_mode at offset 24)"
+	check_output "$LOG" "M40-LINUX: ok uname" "Linux uname(2) result is translated to the Linux struct utsname layout (machine at offset 260)"
+	check_output "$LOG" "M40-LINUX: ok getdents64" "Linux getdents64(2) result is repacked into variable-length linux_dirent64 records"
+	check_output "$LOG" "M40-LINUX: ok arch-prctl" "Linux arch_prctl(ARCH_SET_FS) sets the FS base (TLS) and a %fs:0 round-trip works"
+	check_output "$LOG" "M40-LINUX: ok mmap" "Linux mmap(MAP_ANONYMOUS) gives a Linux binary writable memory (flags/prot already match)"
+	check_output "$LOG" "M40-LINUX: ok clock" "Linux clock_gettime(CLOCK_MONOTONIC) works (timespec layout matches b1nix)"
+	check_output "$LOG" "M40-LINUX: ok gettid" "Linux gettid(2) is mapped to the native SYS_GETTID (returns a valid thread id)"
+	check_output "$LOG" "M40-LINUX: ok run-static" "static Linux ELF ran and exited 0 via translated exit_group(231)"
+	check_output "$LOG" "M40-LINUX: done" "M40 Linux ABI smoke completes"
+fi
+
 # ── M25 Native Toolchain ──
 section "M25 Native C Toolchain"
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
