@@ -2143,16 +2143,13 @@ void vfs_repopulate_after_root_mount(void) {
   vfs_rmdir("/persist");
   vfs_symlink("/", "/persist");
 
-  for (usize i = 0; i < blk_count(); i++) {
-    struct block_device *dev = blk_at(i);
-    if (!dev || !dev->name)
-      continue;
-    char dev_path[64];
-    strcpy(dev_path, "/dev/");
-    strcat(dev_path, dev->name);
-    node = add_node(dev_path, VFS_DEVICE, 0, 0, 0);
-    if (node && !IS_ERR(node)) vfs_node_put(node);
-  }
+  /* Re-bind block-device nodes (/dev/sataN, /dev/loopN, ...) WITH their
+   * blk_dev + read_cb/write_cb + size, so userspace can read/write raw disks
+   * after the root switch. The previous open-coded loop created unbound
+   * VFS_DEVICE placeholders (no read_cb/size → read() returned 0), which broke
+   * the disk installer (/bin/b1nix_install) and any disk tool (fdisk/dd) run on
+   * an installed system. blk_create_dev_nodes() is the canonical binder. */
+  blk_create_dev_nodes();
 
   // Shadow, passwd, group nodes (loaded from initramfs, exist on mount point or in VFS)
   node = vfs_find_node("/etc/shadow");

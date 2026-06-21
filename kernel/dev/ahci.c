@@ -60,6 +60,17 @@ static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
                                const char *what, int port_num) {
   u64 spins = 0;
   while (p->ci & slot_mask) {
+    /* Spin briefly on the CPU (plain `pause`, NO MMIO) before yielding. Each
+     * p->ci read is an MMIO access = a VM-exit under KVM (~µs); polling it in a
+     * tight loop costs more than the DMA itself. KVM completes the command in
+     * microseconds, so this short register-only spin usually lets it finish
+     * before the next MMIO check — avoiding both a flood of VM-exits AND a
+     * scheduler round-trip. Yield only if it's genuinely still pending, so we
+     * never hog the CPU or block the swap re-entrancy path. */
+    for (int i = 0; i < 20000; i++)
+      __asm__ volatile("pause");
+    if (!(p->ci & slot_mask))
+      break;
     if (spins == 10000000ULL) {
       console_write("ahci: port ");
       console_write_dec(port_num);
@@ -88,12 +99,22 @@ static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
  * (-> cmd_hdr->prdtl). The command table is page-sized, leaving room for far
  * more entries than any real transfer (count<=8 -> at most a few pages).
  */
+/* prdt[] lives in the page-sized command table starting at offset 128:
+ * (4096 - 128) / sizeof(struct ahci_prdt_entry=16) = 248 usable entries. */
+#define AHCI_PRDT_MAX_ENTRIES 248
+
 static int ahci_build_prdt(struct ahci_cmd_table *cmd_table, void *buffer,
                            u32 total_bytes) {
   u64 vaddr = (u64)(usize)buffer;
   u64 remaining = total_bytes;
   int n = 0;
   while (remaining > 0) {
+    /* The command table is page-sized; prdt[] starts at offset 128, so it holds
+     * (4096-128)/16 = 248 entries. Refuse rather than overflow into adjacent
+     * memory if a caller ever asks for a transfer with more page-segments.
+     * (blk.c's raw-device fast path chunks to 256 KiB to stay well under this.) */
+    if (n >= AHCI_PRDT_MAX_ENTRIES)
+      return -1;
     u64 page_off = vaddr & (PAGE_SIZE - 1);
     u64 seg = PAGE_SIZE - page_off; /* bytes to the end of this page */
     if (seg > remaining)
@@ -148,7 +169,9 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
   cmd_hdr->write = 0; // Read
 
   // Setup PRD(s) — split across physical page boundaries (see ahci_build_prdt).
-  cmd_hdr->prdtl = (u16)ahci_build_prdt(cmd_table, buffer, count * 512);
+  int prdt_n = ahci_build_prdt(cmd_table, buffer, count * 512);
+  if (prdt_n < 0) { ahci_port_unlock(port); return -1; }
+  cmd_hdr->prdtl = (u16)prdt_n;
 
   // Setup FIS
   memset(cmd_table->cfis, 0, 64);
@@ -224,7 +247,9 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   cmd_hdr->write = 1; // Write
 
   // Setup PRD(s) — split across physical page boundaries (see ahci_build_prdt).
-  cmd_hdr->prdtl = (u16)ahci_build_prdt(cmd_table, (void *)buffer, count * 512);
+  int prdt_nw = ahci_build_prdt(cmd_table, (void *)buffer, count * 512);
+  if (prdt_nw < 0) { ahci_port_unlock(port); return -1; }
+  cmd_hdr->prdtl = (u16)prdt_nw;
 
   memset(cmd_table->cfis, 0, 64);
   struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;

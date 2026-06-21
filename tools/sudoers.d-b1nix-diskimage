@@ -1,0 +1,12 @@
+# b1nix disk-image build — passwordless sudo scoped to the loop-device steps of
+# tools/mk-disk-image.sh, so `make disk-image` / the installer image build runs
+# unattended (no password prompt at the keyboard).
+#
+# Install once:
+#   sudo install -m 0440 -o root -g root tools/sudoers.d-b1nix-diskimage /etc/sudoers.d/b1nix-diskimage
+#   sudo visudo -c            # validate syntax
+#
+# Scope: only these four commands get NOPASSWD — NOT blanket root. (Note: with
+# NOPASSWD `mount` a determined local user could still escalate; this is a
+# dev-box convenience. Remove the file to revoke: sudo rm /etc/sudoers.d/b1nix-diskimage)
+dmytrom ALL=(root) NOPASSWD: /usr/bin/losetup, /usr/bin/mount, /usr/bin/umount, /usr/bin/grub-install

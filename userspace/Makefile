@@ -131,6 +131,8 @@ BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
+# Disk installer: copies the pre-baked b1nix-disk.img onto a target disk.
+BINARIES += $(BUILD)/bin/b1nix_install
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic

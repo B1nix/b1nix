@@ -380,7 +380,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 
 .PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-live iso-test iso-full \
 	userspace userspace-install busybox-package busybox-iso \
-	install-native-toolchain install-kernel-source root-image \
+	install-native-toolchain install-kernel-source root-image disk-image \
 	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke
 
@@ -1092,6 +1092,12 @@ install-kernel-source:
 # A full ISO must carry the staged rootfs. The old dependency on plain `iso`
 # built the toolchain and then omitted it from the resulting image.
 iso-full: iso-live
+
+# Standalone-bootable disk image (MBR + real GRUB + ext4 root), excluding
+# V8/Chromium. The in-guest installer (/bin/b1nix_install) copies this onto a
+# target disk. Needs root for losetup/grub-install (the script re-execs sudo).
+disk-image: root-image $(KERNEL_ELF)
+	sh tools/mk-disk-image.sh $(ARCH) $(BUILD_DIR)/b1nix-disk.img
 
 run: iso
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)

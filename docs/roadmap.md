@@ -924,3 +924,25 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   RAM, disk, and bootstrap cost. It is not required for the sandbox milestone.
 - A full GCC-to-Clang migration and a libc++/libc++abi/libunwind port are not
   goals. Add either only when a measured incompatibility makes the GNU path fail.
+
+## M65: Install to Disk
+
+- [x] `done` Standalone **install to a real disk** — the machine boots b1nix on
+  its own (no live USB/ISO) with a writable on-disk root. Verified end-to-end:
+  the host builds a bootable image, `b1nix_install` copies it to a target disk,
+  and that disk boots GRUB → kernel → `rootfs: sata0p1 mounted at /` → userland.
+- [x] `done` **`tools/mk-disk-image.sh`** (host): builds a standalone-bootable
+  `b1nix-disk.img` — MBR + real pre-baked GRUB (BIOS i386-pc via loopback
+  `grub-install`) + an ext4 root staged with the full userland (busybox + bash +
+  applet symlinks + `/etc`). **No in-guest ports** (no in-guest grub/mkfs).
+  Excludes V8/Chromium by construction. `make disk-image`.
+- [x] `done` **`/bin/b1nix_install`** (in-guest): validated whole-disk copy of
+  the image onto a target block device (size check, confirm, progress, fsync).
+- [x] `done` **Block-I/O fixes that unblocked raw `/dev/sataN` use** (also fix
+  fdisk/dd on any installed system): rebind block device nodes after the
+  root-switch (`vfs_repopulate_after_root_mount` → `blk_create_dev_nodes`);
+  device size via `lseek(SEEK_END)`; block-aligned **bulk DMA** fast path
+  (bounce through a kernel buffer, chunked to a PRDT-safe size) in
+  `blkdev_node_read/write`; AHCI PRDT bounds check; cache-invalidate before raw
+  writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
+  path yet) — correct but not fast; interrupt-driven AHCI is future work.

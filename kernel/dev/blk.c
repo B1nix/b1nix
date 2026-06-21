@@ -765,6 +765,12 @@ void blk_cache_invalidate(struct block_device *dev) {
  * Each registered block device gets a /dev/<name> node whose byte-addressed
  * reads/writes translate to cached block I/O. Sub-block writes do a
  * read-modify-write so fdisk can rewrite just the MBR. */
+/* Max blocks per driver command on the raw-device bulk fast path. 1536 × 512B =
+ * 768 KiB → at most ~193 page-segments, still inside the AHCI per-page PRDT
+ * (248 entries) and NVMe/virtio descriptor limits. Larger = fewer commands =
+ * fewer per-command completion waits, which dominate raw-disk throughput. */
+#define BLK_BULK_MAX_BLOCKS 1536u
+
 static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
                               usize size, int flags) {
   (void)flags;
@@ -782,6 +788,34 @@ static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
   u64 first = offset / bs;
   u64 last = (offset + size - 1) / bs;
   u32 nblk = (u32)(last - first + 1);
+  /* Fast path: a block-aligned bulk read (e.g. a disk imager's 1 MiB reads of
+   * /dev/sataN) goes straight to the driver as one DMA, skipping the per-512B
+   * blk_read_cached loop (lock+tiny-DMA+memcpy per block ~ 100x slower for
+   * large raw reads). Raw whole-disk reads bypass the page cache as on Unix. */
+  if (dev->read_blocks && (offset % bs) == 0 && (size % bs) == 0) {
+    u8 *bulk = kmalloc((usize)nblk * bs);   /* DMA needs a kernel buffer */
+    if (bulk) {
+      /* Issue the bulk DMA in driver-safe sub-chunks: a single AHCI command's
+       * PRDT (NVMe PRP / virtio SG likewise) is bounded, so one giant transfer
+       * would overflow the per-page descriptor table. BLK_BULK_MAX_BLOCKS keeps
+       * each command well within that, while still being ~hundreds× fewer, far
+       * larger transfers than the per-512B cache loop. */
+      int ok = 1;
+      for (u32 done = 0; done < nblk; ) {
+        u32 chunk = nblk - done;
+        if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
+        /* read_blocks returns the sector count (>=0) on success, <0 on error. */
+        if (dev->read_blocks(dev, first + done, chunk,
+                             bulk + (usize)done * bs) < 0) { ok = 0; break; }
+        done += chunk;
+      }
+      if (ok) memcpy(buffer, bulk, size);
+      kfree(bulk);
+      if (ok) return (isize)size;
+      return -EIO;
+    }
+    /* OOM on the bulk buffer → fall through to the cached per-block path. */
+  }
   u8 *tmp = kmalloc((usize)nblk * bs);
   if (!tmp)
     return -ENOMEM;
@@ -811,6 +845,34 @@ static isize blkdev_node_write(struct vfs_node *node, u64 offset,
   u64 first = offset / bs;
   u64 last = (offset + size - 1) / bs;
   u32 nblk = (u32)(last - first + 1);
+  /* Fast path: a block-aligned bulk write (disk imager's 1 MiB writes) DMAs
+   * straight to the driver in one shot, then drops any cached copies of those
+   * blocks so later cached reads re-fetch from disk (invalidate flushes dirty
+   * first, so no data loss). Skips the read-modify-write + per-block cache loop. */
+  if (dev->write_blocks && (offset % bs) == 0 && (size % bs) == 0) {
+    u8 *bulk = kmalloc((usize)nblk * bs);   /* DMA needs a kernel buffer */
+    if (bulk) {
+      memcpy(bulk, buffer, size);
+      /* Drop any cached copies of these blocks FIRST (flushing existing dirty
+       * entries to disk), so the direct write below is the authoritative final
+       * state. Doing it AFTER would flush stale dirty entries (e.g. a swap
+       * header on an auto-claimed disk) over the data we just wrote. */
+      blk_cache_invalidate(dev);
+      int ok = 1;
+      for (u32 done = 0; done < nblk; ) {   /* driver-safe sub-chunks (PRDT) */
+        u32 chunk = nblk - done;
+        if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
+        /* write_blocks returns the sector count (>=0) on success, <0 on error. */
+        if (dev->write_blocks(dev, first + done, chunk,
+                              bulk + (usize)done * bs) < 0) { ok = 0; break; }
+        done += chunk;
+      }
+      kfree(bulk);
+      if (ok) return (isize)size;
+      return -EIO;
+    }
+    /* OOM on the bulk buffer → fall through to the cached read-modify path. */
+  }
   u8 *tmp = kmalloc((usize)nblk * bs);
   if (!tmp)
     return -ENOMEM;
