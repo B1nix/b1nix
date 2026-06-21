@@ -70,7 +70,25 @@ cd "$SK/v8"
 #                                             fault-in). Needs use_safe_libstdcxx
 #                                             (the libstdc++ hardening the sandbox
 #                                             assert demands; Patch 18).
-GEN_ARGS='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true'
+#   v8_enable_i18n_support=true            -> ON: ICU (Intl). Data EMBEDDED via
+#                                             icu_use_data_file=false (no external
+#                                             icudtl.dat). Needs LC_MESSAGES in the
+#                                             libc <locale.h> (ICU putil.cpp).
+#                                             Verified: M58-V8: ok intl.
+#   v8_enable_webassembly=true             -> ON. Builds with the trap handler off
+#                                             (Patch 20 -> explicit bounds checks).
+#                                             The startup abort ("AllowHeapAllocation
+#                                             InRelease" during snapshot deserialize)
+#                                             was NOT a V8 bug: b1nix placed the
+#                                             main-thread TLS pointer at
+#                                             region+round_up(memsz,align) while the
+#                                             b1nix linker emits local-exec offsets
+#                                             as symbol_offset-memsz (un-rounded), so
+#                                             a TLS memsz not divisible by align (wasm
+#                                             d8: 0x108) mis-read every __thread by the
+#                                             padding. Fixed in process.c + pthread.c
+#                                             (TP = region+memsz). Verified: ok wasm.
+GEN_ARGS='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true'
 # Route the compiler through ccache when present — flipping global gn flags
 # recompiles ~everything, but ccache makes re-runs/flip-backs near-instant.
 if command -v ccache >/dev/null 2>&1; then GEN_ARGS="$GEN_ARGS cc_wrapper=\"ccache\""; fi

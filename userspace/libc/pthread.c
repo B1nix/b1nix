@@ -159,7 +159,12 @@ static int build_thread_tls(struct pthread_state *st) {
     return -1;
 
   uintptr_t region = ((uintptr_t)blk + align - 1) & ~(uintptr_t)(align - 1);
-  uintptr_t tp = region + tls_size;
+  /* TP sits at region + the UN-rounded memsz: the b1nix linker emits local-exec
+   * offsets as `symbol_offset - p_memsz`, so a rounded TP would shift every
+   * thread-local read by the alignment padding when memsz isn't an align
+   * multiple (e.g. V8 wasm d8: memsz=0x108, align=0x10). tls_size (rounded) is
+   * still used for the mapping size. Matches kernel/user/process.c. */
+  uintptr_t tp = region + info.memsz;
   /* mmap memory is zero-filled (so .tbss is already clear); lay the .tdata init
    * image at the bottom of the region. */
   if (info.filesz && init_img)

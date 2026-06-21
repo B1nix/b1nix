@@ -823,29 +823,34 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
   space), so a user access there faulted as a present supervisor page. Fixed by
   relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
 - Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
-  WebAssembly, the sandbox, and i18n disabled. Run via
-  `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`, d8 on `sata0`.
-- [ ] `parked` **WebAssembly** (`v8_enable_webassembly`). Builds + links (the trap
-  handler was the blocker: b1nix is `V8_OS_LINUX` so the x64 gate marks it supported,
-  but gn compiles the POSIX impl only for the `is_linux` GN var → `RegisterDefaultTrapHandler`
-  undefined; fixed by `tools/patches/v8/apply.sh` **Patch 20** = disable the trap
-  handler for b1nix → explicit in-code bounds checks). d8 then **aborts at startup**
-  (before any JS): `Check failed: AllowHeapAllocationInRelease::IsAllowed()` — a heap
-  allocation on a wasm worker/engine thread whose `thread_local` assert-state is
-  unseeded (the same per-thread-ELF-TLS class fixed for the main thread in M58, now
-  surfacing on a wasm-spawned thread). Needs a gdb chase of V8's wasm thread creation
-  vs b1nix `pthread_create` TLS. Re-enabling the trap handler later (guard-page
-  bounds checks) is a separate perf item.
-- [ ] `parked` **Sandbox** (`v8_enable_sandbox`). It is a real port, not a flag flip.
-  Build asserts cleared (**Patch 18** relaxes the libc++-hardening assert for b1nix;
-  hardening is genuinely provided via the build's own `use_safe_libstdcxx`/
-  `_GLIBCXX_ASSERTIONS`, not bypassed). But **link fails**: (1) `V8_ENABLE_SANDBOX`
-  isn't propagating uniformly across V8's gn source-sets for the b1nix target
-  (`maglev`/`compiler` TUs compiled without it use `CompressedObjectSlot` while
-  `heap-write-barrier.cc` uses the sandbox `ProtectedPointerSlot` → undefined
-  `WriteBarrier::SharedSlow/MarkingSlow(TrustedObject,…)`); (2) `partition_alloc`'s
-  `CollectStackTrace` needs a b1nix impl/stub. Runtime (huge VA cage + TrustedSpace)
-  untested. Milestone-sized; comparable to the WebAssembly port.
+  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**. Only Temporal is
+  off (needs the Rust `temporal_rs` crate; b1nix has no Rust toolchain). d8 ships
+  **inside the ISO** as a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate
+  SATA disk. Run via `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
+- [x] `done` **WebAssembly** (`v8_enable_webassembly`). Trap handler off on b1nix
+  (`apply.sh` **Patch 20** → explicit in-code bounds checks). The startup abort
+  (`AllowHeapAllocationInRelease::IsAllowed()` during startup-snapshot deserialize)
+  was **not** a V8/TLS-seeding bug — it was a b1nix main-thread TLS-placement bug:
+  the kernel put the thread pointer at `region + round_up(p_memsz, p_align)` while
+  the b1nix linker emits local-exec offsets as `symbol_offset - p_memsz` (un-rounded),
+  so any binary whose TLS `p_memsz` is not an `align` multiple (wasm d8: `0x108`,
+  align `0x10`) read every `__thread` 8 bytes off. Fixed by placing the TP at
+  `region + p_memsz` in `kernel/user/process.c` (main thread) and
+  `userspace/libc/pthread.c` (workers). Verified `M58-V8: ok wasm`.
+- [x] `done` **Sandbox** (`v8_enable_sandbox`, TrustedSpace + sandboxed pointers).
+  The "V8_ENABLE_SANDBOX not propagating across gn source-sets" was a stale-object
+  artifact — a clean rebuild fixed it. Two real fixes: **Patch 21** disables the
+  Linux sandbox-testing crash filter on b1nix (`<sys/ucontext.h>`/`greg_t`/`SI_KERNEL`),
+  **Patch 22** compiles `partition_alloc` `stack_trace_linux.cc` for `CollectStackTrace`.
+  Runtime: a `sys_mmap` hang on the sandbox's ~1.4 TiB cage + 256×4 GiB Smi-range
+  PROT_NONE reservations — fixed by skipping eager per-page PTEs for `prot==PROT_NONE`
+  (the `#PF` fast path faults them in lazily). Verified Sparkplug + TurboFan.
+- [x] `done` **i18n** (`v8_enable_i18n_support`) with ICU data embedded
+  (`icu_use_data_file=false`, no external `icudtl.dat`); needed `LC_MESSAGES` in the
+  libc `<locale.h>`. Verified `M58-V8: ok intl`.
+- [ ] `parked` **Temporal** (`v8_enable_temporal_support`). Needs the Rust
+  `temporal_rs`/`temporal_capi` crate (`temporal_rs_*` symbols); b1nix has no
+  Rust→b1nix toolchain. Separate large port, like the AArch64 effort.
 - [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
   a standalone `/bin/js` runner/REPL — the lightweight JS vector; superseded for
   capability by real V8.

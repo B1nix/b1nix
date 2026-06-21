@@ -31,7 +31,7 @@ SEED="$ROOT_DIR/build/v8-out/v8-jit-ext4.img"   # carries m58.js + a d8 to overw
 # Default config: the proven JIT base + Maglev (mid-tier) + external code space
 # (code cage) + the sandbox (TrustedSpace/sandboxed pointers; needs
 # use_safe_libstdcxx for the hardening assert — see tools/v8-gen-jit.sh).
-GN_ARGS="${GN_ARGS:-target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true}"
+GN_ARGS="${GN_ARGS:-target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true}"
 
 case "$TIER" in
 	jitless)   V8FLAGS="b1nix.v8run" ;;

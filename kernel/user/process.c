@@ -1631,7 +1631,18 @@ static int user_run_elf_image(struct user_loaded_image *image) {
                   block_size - PAGE_SIZE) &
                  ~(PAGE_SIZE - 1);
     low_reserved = region;
-    u64 tp = region + tls_size;
+    /* The thread pointer sits at region + tls_memsz, NOT region +
+     * round_up(memsz, align). The b1nix cross linker emits local-exec offsets
+     * as `@tpoff = symbol_offset - p_memsz` (the UN-rounded segment size), so a
+     * thread-local at template offset X is read via %fs:(X - p_memsz). Placing
+     * TP at the rounded size shifts every read by the alignment padding
+     * (p_align - p_memsz%p_align) whenever p_memsz is not an align multiple —
+     * e.g. V8's wasm-enabled d8 has memsz=0x108, align=0x10, so a rounded TP
+     * reads 8 bytes past each thread-local (garbage -> the heap-allocation
+     * assert mis-reads -> snapshot deserialize aborts). For align-aligned memsz
+     * (the common case) region+memsz == region+round_up, so this is a no-op
+     * there. tls_size (rounded) is still used for block/region sizing. */
+    u64 tp = region + image->tls_memsz;
     u64 db = vmm_direct_map_base();
 
     for (u64 v = region; v < region + block_size; v += PAGE_SIZE) {
