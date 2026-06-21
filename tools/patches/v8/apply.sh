@@ -238,4 +238,38 @@ if [ -f "$F" ] && ! grep -q '!defined(__b1nix__)' "$F"; then
   echo "Patch 20 applied: trap-handler.h (Wasm trap handler off on b1nix)"
 else echo "Patch 20 already present"; fi
 
+# --- Patch 21: sandbox/testing.cc — disable the Linux crash filter on b1nix ----
+# Sandbox (v8_enable_sandbox=true). b1nix defines V8_OS_LINUX (Patch 3), so the
+# sandbox-testing crash filter compiles its Linux signal path: <sys/ucontext.h>,
+# greg_t/gregs[], SI_KERNEL — none of which b1nix's headers provide → testing.cc
+# fails to compile. The crash filter is a FUZZING-only feature (it swallows
+# expected sandbox-violation crashes when --sandbox-testing / the memory-corruption
+# API is used); the sandbox itself does not need it. SandboxTesting::Enable/Disable
+# are defined unconditionally and only *call* the Linux filter inside a
+# `#ifdef V8_OS_LINUX ... #else FATAL(...)` — so excluding b1nix from the Linux
+# guards keeps the symbols (the FATAL stub path) while dropping the non-portable
+# code. Enable() is only reached when sandbox-testing mode is explicitly requested,
+# which b1nix never does, so the stub never fires.
+F="$V8/src/sandbox/testing.cc"
+if [ -f "$F" ] && ! grep -q '!defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~#ifdef V8_OS_LINUX~#if defined(V8_OS_LINUX) && !defined(__b1nix__)~g' "$F"
+  grep -q '!defined(__b1nix__)' "$F" || die "Patch 21 anchor not found in $F"
+  echo "Patch 21 applied: sandbox/testing.cc (Linux crash filter off on b1nix)"
+else echo "Patch 21 already present"; fi
+
+# --- Patch 22: partition_alloc BUILD.gn — compile stack_trace_linux.cc on b1nix
+# Sandbox pulls in partition_alloc's LogMessage, whose destructor calls
+# CollectStackTrace (defined per-platform in stack_trace_<os>.cc). b1nix is
+# gn-`is_posix` (so stack_trace_posix.cc compiles) but not gn-`is_linux`, so the
+# file that actually DEFINES CollectStackTrace (stack_trace_linux.cc) is skipped →
+# undefined reference at link. b1nix has CAN_UNWIND_WITH_FRAME_POINTERS=0, so that
+# file degenerates to `return 0` (no backtrace/frame-pointer deps) — safe to
+# compile. Add b1nix to the gn guard.
+F="$V8/third_party/partition_alloc/src/partition_alloc/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'is_chromeos || current_os == "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~if \(is_linux \|\| is_chromeos\) \{\n        sources \+= \[ "partition_alloc_base/debug/stack_trace_linux.cc" \]~if (is_linux || is_chromeos || current_os == "b1nix") {\n        sources += [ "partition_alloc_base/debug/stack_trace_linux.cc" ]~' "$F"
+  grep -q 'is_chromeos || current_os == "b1nix"' "$F" || die "Patch 22 anchor not found in $F"
+  echo "Patch 22 applied: partition_alloc BUILD.gn (stack_trace_linux.cc on b1nix)"
+else echo "Patch 22 already present"; fi
+
 echo "All b1nix V8 patches applied to $V8"

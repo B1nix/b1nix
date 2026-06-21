@@ -51,7 +51,26 @@ cd "$SK/v8"
 #                                             was that mmap bug (V8's low cage hint
 #                                             collided with the supervisor identity
 #                                             map), not a V8 problem.
-GEN_ARGS='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=true'
+#   v8_enable_sandbox=true                 -> ON: the V8 sandbox (TrustedSpace +
+#                                             sandboxed pointers). Verified on
+#                                             b1nix once two things were fixed:
+#                                             (1) build — Patch 21/22 in
+#                                             tools/patches/v8/apply.sh (Linux
+#                                             crash-filter off, stack_trace_linux
+#                                             compiled for CollectStackTrace);
+#                                             (2) runtime — a b1nix sys_mmap bug
+#                                             where a pure PROT_NONE reservation
+#                                             was eagerly marked page-by-page, so
+#                                             the sandbox's ~1.4 TiB cage + 256
+#                                             back-to-back 4 GiB Smi-range
+#                                             reservations ran hundreds of
+#                                             millions of iterations and hung the
+#                                             boot. Fixed by skipping eager
+#                                             marking for PROT_NONE (lazy
+#                                             fault-in). Needs use_safe_libstdcxx
+#                                             (the libstdc++ hardening the sandbox
+#                                             assert demands; Patch 18).
+GEN_ARGS='target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true'
 # Route the compiler through ccache when present — flipping global gn flags
 # recompiles ~everything, but ccache makes re-runs/flip-backs near-instant.
 if command -v ccache >/dev/null 2>&1; then GEN_ARGS="$GEN_ARGS cc_wrapper=\"ccache\""; fi

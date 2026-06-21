@@ -1,26 +1,22 @@
 #!/bin/sh
-# Boot the x86_64 b1nix ISO with the V8 ext4 disk attached and run d8.
+# Boot the x86_64 b1nix ISO and run d8 — one self-contained ISO, no extra disk.
 #
-# The ISO must be built with b1nix.v8run on the cmdline:
-#   make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1 b1nix.v8run" iso
-# That flag makes kernel/main.c mount sata0 -> /mnt/v8 and launch
-#   d8 --jitless /mnt/v8/m58.js
-# m58.js prints "M58-V8: ok hello", a series of result-gated "ok" markers
-# (loop-sum/array-reduce/object-sort/json/gc-churn/recursion), then
-# "M58-V8: done".
+# The ISO must be built with b1nix.v8run on the cmdline AND carry d8 as a GRUB
+# Multiboot2 module (grub.cfg `module2 /boot/v8.img`); tools/v8-build-run.sh does
+# both. That flag makes kernel/main.c mount ram0 (the module) -> /mnt/v8 and
+# launch d8 on /mnt/v8/m58.js, which prints "M58-V8: ok hello", a series of
+# result-gated "ok" markers, then "M58-V8: done".
 #
-# d8 (x86_64, 13 MB) is too big for the xxd-embedded initramfs, so it ships on
-# build/v8-out/v8-ext4.img (ext4: /d8 + /hello.js) attached as the AHCI sata0.
+# d8 (x86_64) is too big for the xxd-embedded initramfs, so it ships inside the
+# ISO as the module image (ext4: /d8 + /m58.js) rather than a separate -drive.
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 ISO="${ISO:-$ROOT_DIR/build/x86_64/b1nix.iso}"
-DISK="${DISK:-$ROOT_DIR/build/v8-out/v8-ext4.img}"
 LOG="${LOG:-$ROOT_DIR/smoke_run/v8-run.log}"
 TIMEOUT="${TIMEOUT:-120}"
 
 [ -f "$ISO" ]  || { echo "missing $ISO — build the x86_64 ISO first"; exit 1; }
-[ -f "$DISK" ] || { echo "missing $DISK"; exit 1; }
 mkdir -p "$ROOT_DIR/smoke_run"
 
 accel=""
@@ -28,13 +24,11 @@ if [ -w /dev/kvm ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm;
 	accel="-accel kvm"
 fi
 
-# d8 needs real RAM headroom (V8 heap + snapshot deserialize).
+# d8 needs real RAM headroom (V8 heap + snapshot deserialize + the in-ISO module
+# image loaded into RAM by GRUB).
 set -- qemu-system-x86_64 $accel -m "${SMOKE_MEM_MB:-2048}" \
 	-cdrom "$ISO" -serial stdio -display none -monitor none -no-reboot \
-	-device isa-debug-exit,iobase=0xf4,iosize=0x04 \
-	-device ich9-ahci,id=ahci \
-	-drive file="$DISK",if=none,id=satadrive,format=raw \
-	-device ide-hd,drive=satadrive,bus=ahci.0
+	-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 echo "[v8-run] $*"
 "$@" >"$LOG" 2>&1 &

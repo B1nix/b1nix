@@ -566,15 +566,17 @@ void kernel_main(usize arg0, usize arg1)
 	console_write(init_spawn_buf);
 
 	/* M58 V8 run phase: d8 (x86_64) is too big for the xxd-embedded initramfs,
-	 * so it ships on an ext4 SATA disk (build/v8-out/v8-ext4.img). When booted
-	 * with b1nix.v8run, mount that disk and launch d8 jitless to prove the V8
-	 * engine actually runs on b1nix. Gated by a cmdline flag so it never fires
-	 * in the ordinary (32-bit) smoke suite. */
+	 * so it ships inside the SAME ISO as a GRUB Multiboot2 module (grub.cfg
+	 * `module2 /boot/v8.img`), which the kernel exposes as the ram0 block device
+	 * (kernel/dev/ramdisk.c). When booted with b1nix.v8run, mount ram0 and launch
+	 * d8 to prove the V8 engine runs on b1nix — no separate QEMU -drive needed,
+	 * the whole thing is one self-contained ISO. Gated by a cmdline flag so it
+	 * never fires in the ordinary (32-bit) smoke suite. */
 	if (bootinfo_has_flag("b1nix.v8run")) {
 		vfs_mkdir("/mnt/v8", 0755);
-		int v8_mrc = vfs_mount("sata0", "/mnt/v8", "ext4", 0);
+		int v8_mrc = vfs_mount("ram0", "/mnt/v8", "ext4", 0);
 		char v8_buf[96];
-		snprintf(v8_buf, sizeof(v8_buf), "v8: mount sata0 -> /mnt/v8: %d\n", v8_mrc);
+		snprintf(v8_buf, sizeof(v8_buf), "v8: mount ram0 -> /mnt/v8: %d\n", v8_mrc);
 		console_write(v8_buf);
 		if (v8_mrc == 0) {
 			/* Run a real script off the disk (exercises V8's file reader, the

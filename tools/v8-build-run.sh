@@ -28,8 +28,10 @@ D8="$OUT/d8.b1nix"
 DISK="$ROOT_DIR/build/v8-out/v8-$PROFILE-ext4.img"
 SEED="$ROOT_DIR/build/v8-out/v8-jit-ext4.img"   # carries m58.js + a d8 to overwrite
 
-# Default config: the proven JIT base + Maglev (mid-tier) + external code space (code cage).
-GN_ARGS="${GN_ARGS:-target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=false v8_enable_pointer_compression=true v8_enable_external_code_space=true}"
+# Default config: the proven JIT base + Maglev (mid-tier) + external code space
+# (code cage) + the sandbox (TrustedSpace/sandboxed pointers; needs
+# use_safe_libstdcxx for the hardening assert — see tools/v8-gen-jit.sh).
+GN_ARGS="${GN_ARGS:-target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=false v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true}"
 
 case "$TIER" in
 	jitless)   V8FLAGS="b1nix.v8run" ;;
@@ -90,12 +92,16 @@ ISODIR="$ROOT_DIR/build/x86_64/iso-v8-$PROFILE"
 ISO="$ROOT_DIR/build/x86_64/b1nix-v8-$PROFILE.iso"
 mkdir -p "$ISODIR/boot/grub"
 cp "$KELF" "$ISODIR/boot/kernel.elf"
+# Ship d8's ext4 image INSIDE the ISO as a GRUB Multiboot2 module (-> kernel
+# ram0), so the whole thing is one self-contained ISO — no separate QEMU -drive.
+cp "$DISK" "$ISODIR/boot/v8.img"
 sed -e 's|@TIMEOUT@|0|g' -e 's|@ARCH@|x86_64|g' \
-    -e "s|@CMDLINE@|b1nix.test=1 $V8FLAGS|g" -e 's|@MODULE_CMD@||g' \
+    -e "s|@CMDLINE@|b1nix.test=1 $V8FLAGS|g" \
+    -e 's|@MODULE_CMD@|module2 /boot/v8.img v8img|g' \
     "$ROOT_DIR/boot/grub/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
 "$MKRESCUE" -o "$ISO" "$ISODIR" 2>/dev/null
 
-echo "=== [6/6] run in QEMU (disk=$PROFILE, tier=$TIER) ==="
+echo "=== [6/6] run in QEMU (module=$PROFILE, tier=$TIER) ==="
 RUNLOG="$ROOT_DIR/smoke_run/v8-run-$PROFILE-$TIER.log"
-ISO="$ISO" DISK="$DISK" LOG="$RUNLOG" TIMEOUT="${TIMEOUT:-120}" sh "$ROOT_DIR/tools/v8-run-qemu.sh"
+ISO="$ISO" LOG="$RUNLOG" TIMEOUT="${TIMEOUT:-120}" sh "$ROOT_DIR/tools/v8-run-qemu.sh"
 echo "serial log: $RUNLOG"

@@ -2122,14 +2122,31 @@ static u64 sys_mmap(void *addr, usize length, int prot, int flags, int fd,
      *     and OS::DecommitPages (mmap PROT_NONE | MAP_FIXED, no NORESERVE) churn
      *     large PROT_NONE ranges. */
     extern void tlb_shootdown_poll(void);
-    for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
-      vmm_set_lazy(v);
-      paging_mprotect_page(v, vmm_flags);
-      /* A large mmap (V8's multi-GB cage / JIT regions) walks many pages; drain
-       * any in-flight cross-CPU TLB shootdown so an initiator on another CPU
-       * isn't left spinning until its timeout guard fires (tlb_shootdown_poll
-       * is a single load when nothing is pending). */
-      tlb_shootdown_poll();
+    /* A pure PROT_NONE reservation needs NO eager per-page PTEs. V8's sandbox
+     * does enormous ones — a ~1.4 TiB cage, plus a Smi-range loop that issues
+     * 256 back-to-back 4 GiB PROT_NONE reservations (sandbox.cc) — and marking
+     * each page would run hundreds of millions of iterations and hang the boot.
+     * The #PF handler's anonymous fast path (paging.c "Lazy Allocation for User
+     * Heap/Mmap region") already zero-fills any not-present anonymous fault in
+     * [0x40000000, USER_SPACE_LIMIT) with no leaf PTE, and every mmap region
+     * lands at >= 0x100000000, so the reserved range faults in lazily on first
+     * touch with no per-page setup. Just record the VMA below.
+     * ponytail: PROT_NONE is not strictly enforced on the skipped range (a wild
+     * touch zero-fills instead of SIGSEGV) — but the eager path didn't enforce
+     * it either (it set VMM_LAZY and lazily mapped on the fault), so there is no
+     * semantic regression. NORESERVE *with* access (prot != PROT_NONE, e.g. a
+     * read-only or RW lazy-commit region) keeps the eager path so its protection
+     * bits are honored on fault-in. */
+    if (prot != PROT_NONE) {
+      for (u64 v = vaddr; v < vaddr + length; v += PAGE_SIZE) {
+        vmm_set_lazy(v);
+        paging_mprotect_page(v, vmm_flags);
+        /* A large mmap (V8's multi-GB JIT regions) walks many pages; drain any
+         * in-flight cross-CPU TLB shootdown so an initiator on another CPU isn't
+         * left spinning until its timeout guard fires (tlb_shootdown_poll is a
+         * single load when nothing is pending). */
+        tlb_shootdown_poll();
+      }
     }
   } else if (flags & MAP_ANONYMOUS) {
     extern void tlb_shootdown_poll(void);
