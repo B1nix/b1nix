@@ -190,6 +190,7 @@ enum {
   SYS_SIGALTSTACK     = 160,
   SYS_GET_TLS_INFO    = 161,
   SYS_RT_TGSIGQUEUEINFO = 162,
+  SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

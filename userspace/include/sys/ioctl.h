@@ -60,6 +60,10 @@ int ioctl(int fd, unsigned long request, ...);
 #define SIOCADDMULTI        0x8931
 #define SIOCDELMULTI        0x8932
 #define SIOCSIFHWBROADCAST  0x8937
+#define SIOCETHTOOL         0x8946  /* ethtool (b1nix: unimplemented, fails) */
+/* Wireless extensions (b1nix has no wifi; these ioctls fail -> not-wifi). */
+#define SIOCGIWNAME         0x8B01
+#define SIOCGIWESSID        0x8B1B
 
 /* Window-size ioctl + struct (glibc exposes these via <sys/ioctl.h>). Guarded so
  * including both <sys/ioctl.h> and <termios.h> is safe. */

@@ -48,6 +48,30 @@ struct flock {
 
 int fcntl(int fd, int cmd, ...);
 
+/* creat(2): equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
+ * posix_fadvise: file access-pattern hint (advisory; b1nix treats it as a
+ * no-op and returns 0). fallocate: b1nix has no preallocation syscall, so it
+ * returns -1/ENOSYS and callers fall back to ftruncate. Added for the Chromium
+ * port (M60-62). */
+int creat(const char *path, mode_t mode);
+int posix_fadvise(int fd, off_t offset, off_t len, int advice);
+int fallocate(int fd, int mode, off_t offset, off_t len);
+
+/* posix_fadvise advice values (Linux ABI). */
+#define POSIX_FADV_NORMAL     0
+#define POSIX_FADV_RANDOM     1
+#define POSIX_FADV_SEQUENTIAL 2
+#define POSIX_FADV_WILLNEED   3
+#define POSIX_FADV_DONTNEED   4
+#define POSIX_FADV_NOREUSE    5
+
+/* fallocate mode flags (Linux ABI). */
+#define FALLOC_FL_KEEP_SIZE      0x01
+#define FALLOC_FL_PUNCH_HOLE     0x02
+#define FALLOC_FL_COLLAPSE_RANGE 0x08
+#define FALLOC_FL_ZERO_RANGE     0x10
+#define FALLOC_FL_INSERT_RANGE   0x20
+
 #ifdef __cplusplus
 }
 #endif

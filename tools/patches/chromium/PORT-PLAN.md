@@ -516,3 +516,125 @@ always run steps 1+2 above so the toolchain headers match `userspace/include`.
 Nothing here belongs in apply.sh -- the source headers are already correct on
 main; only the cached toolchain copies drift. (A one-liner wrapper that runs
 both before `ninja` would prevent this recurring for a 3rd time.)
+
+### Session 4 cont. — base/ + net/ compile wave (libc/header gaps + C21 + C22)
+
+After the header re-sync, the full `-k0` pass surfaced ~108 failures, almost all
+distinct from the stale-header ones. Two GN/tree patches + one big libc/header
+batch, all verified rc=0 in isolation:
+
+C21 (apply.sh) — `base/containers/flat_tree.h`: `KeyT<K>` was a non-deduced
+alias, so transparent flat_map `find(string_view)` failed under GCC-13 (K fell
+back to Key). Made `KeyT = K` (identity, deducible). Unblocked feature_list +
+every transparent flat_map lookup. (The pre-existing in-tree "C21" B1nixKeyHelper
+was a no-op refactor and was NOT in apply.sh; now properly captured.)
+
+C22 (apply.sh, extends C12) — added 5 more GCC-only `-Wno-error=` to the b1nix
+GCC block in compiler/BUILD.gn: unknown-pragmas (`#pragma clang`), dangling-else,
+array-bounds (perfetto inline FP), range-loop-construct (raw_ptr), format-
+truncation (webrtc snprintf). All GCC-vs-Clang false positives on third-party
+code, still emitted as warnings.
+
+GN arg (args.gn, NOT in git — reproduce in the build dir): `use_kerberos = false`
+— b1nix has no GSSAPI/Kerberos library, so Negotiate auth is unsupported. Drops
+the `<gssapi.h>` dependency honestly (Chromium supports building without it).
+
+libc/header additions (v0.65.3 — ship in the ISO sysroot, so version bumped):
+- NEW headers: `ptrauth.h` (no-op on x86), `linux/magic.h` (FS magics),
+  `sys/ptrace.h` (PTRACE_* enum + proto), `sys/vfs.h` (->statfs), `sys/poll.h`
+  (->poll), `sys/sendfile.h`, `ifaddrs.h`, `linux/prctl.h` (->sys/prctl),
+  `linux/if.h` (->net/if), `linux/kdev_t.h` (MAJOR/MINOR/MKDEV->sysmacros),
+  `linux/ethtool.h` (ethtool_cmd + ETHTOOL_GSET), `linux/sockios.h` (->ioctl),
+  `linux/wireless.h` (iwreq + IW_ESSID_MAX_SIZE).
+- header growth: `sched.h` CPU_ALLOC/CPU_*_S dynamic cpu-set API;
+  `net/if.h` IFF_LOWER_UP/DORMANT/ECHO + `ifru_data` char*->void*;
+  `sys/ioctl.h` SIOCETHTOOL/SIOCGIWNAME/SIOCGIWESSID;
+  `linux/rtnetlink.h` RTMGRP_NOTIFY/NEIGH/... ; `fcntl.h` creat/posix_fadvise/
+  fallocate protos + POSIX_FADV_*/FALLOC_FL_* ; `dirent.h` fdopendir ;
+  `unistd.h` pipe2.
+- libc impls (unistd.c/dirent.c): real `sendfile` (read/write emulation),
+  `getifaddrs`/`freeifaddrs` (loopback + eth0 via SIOCGIF* ioctls), `pipe2`
+  (pipe+fcntl), `creat` (open wrapper), `posix_fadvise` (no-op hint=0),
+  `fallocate` (ENOSYS -> caller ftruncate fallback), `fdopendir` (DIR from fd).
+
+Verified rc=0 in isolation: feature_list, partition_root, allocator_shim,
+perfetto time, abseil raw_logging/vdso/sem_waiter, sys_info_posix,
+file_util_posix, drive_info_posix, platform_thread_types, address_tracker_linux,
+network_interfaces_linux. Build continues (next likely: more net/ + crypto/ +
+the field_trial `std::map<pair,..>` `std::less<void>` heterogeneous `operator<`
+gap, which is a libstdc++/pair issue, not yet fixed).
+
+REMEMBER the sync dance (the gitignored toolchain reads from the MAIN checkout's
+userspace/include, not the worktree): after editing userspace headers/libc,
+`cp` them into the main checkout's userspace/, then run
+`make -C userspace B1NIX_ARCH=x86_64 install-headers-libs` +
+`sh tools/enable-cxx-toolchain.sh x86_64-b1nix`.
+
+### Session 4 cont.2 — mojo/skia/expat wave (C23/C24 + getdents64 syscall)
+
+Next batch from the same `-k0` pass, all verified rc=0 in isolation:
+- C23 (apply.sh): `third_party/expat/BUILD.gn` — for is_linux expat assumed a
+  SYSTEM libexpat (no include dir), so skia's SkXMLParser/SkFontMgr_android_parser
+  couldn't find `<expat.h>`. Excluded b1nix from that branch so it builds the
+  bundled expat (which exports the include dir + XML_STATIC). (Validated by
+  reading the BUILD.gn branch; needs a gn-regen to take effect — ninja does this
+  automatically when BUILD.gn changes.)
+- C24 (apply.sh): `net/features.gni` — default `use_kerberos = false` for b1nix
+  (no GSSAPI library), dropping the `<gssapi.h>` dependency. Reproducible form of
+  the args.gn override.
+- NEW kernel syscall `SYS_GETDENTS64 = 162` routing to the existing M40
+  `sys_linux_getdents64` (Linux getdents64 byte layout). Native binaries (mojo
+  dir_reader_linux) `syscall(__NR_getdents64,...)` now hit it. (kernel + both
+  syscall.h.)
+- `sys/syscall.h`: `__NR_*` aliases (the other Linux spelling) for the syscalls
+  b1nix has natively — memfd_create, eventfd2, getdents64, getpid, gettid,
+  getrandom, read, write — mapped to the b1nix SYS_* numbers so raw
+  `syscall(__NR_x,...)` (mojo channel_linux) hits the right entry. Calls b1nix
+  lacks (sched_setattr, perf_event_open, mseal, ...) left UNDEFINED so Chromium's
+  `#ifdef __NR_x` guards fall back.
+- NEW header `linux/memfd.h` (MFD_* flags; mirrors sys/mman.h).
+
+Verified rc=0: channel_linux (memfd/eventfd2 __NR_), linux_util (getdents64).
+v0.65.3 covers these (kernel + libc ship in the ISO). The build is still
+churning through the full 67451-target pass; re-run ninja after it stops to pick
+up every fix on the failed-and-skipped targets. Known not-yet-fixed: the
+field_trial `std::map<std::pair<string,string>,...>` `std::less<void>`
+heterogeneous `operator<` gap (libstdc++/pair, GCC-13).
+
+### Session 4 cont.3 — third_party header wave (alloca/asm.ioctl/execinfo/drm)
+
+Trivial+honest header batch (verified rc=0 in isolation: cpuinfo multiline,
+libdrm xf86drm):
+- NEW `alloca.h` (->__builtin_alloca), `asm/ioctl.h` (->sys/ioctl _IOC/_IOR/...),
+  `execinfo.h` (backtrace family = honest no-op; b1nix has no userspace
+  unwinder), `linux/unistd.h` (->sys/syscall __NR_*).
+- `linux/types.h`: added the `__kernel_*` integer types (size_t/ssize_t/long/
+  ulong/pid_t/uid32/gid32/loff_t/time64/off_t) used by libdrm's <drm/drm.h>.
+
+SYNC FLAKE NOTE: the running full build's gn-regen can re-trigger
+enable-cxx-toolchain mid-edit and race a manual header sync, so an isolated
+`ninja -t commands | sh` may transiently see a stale toolchain header copy. The
+SOURCE (userspace/include) is authoritative and correct; a clean rebuild (or a
+final install-headers-libs + enable-cxx after the build stops) resolves it.
+
+### NEXT WAVE — bigger items deliberately deferred (GN-disable candidates)
+These remaining failures are large optional subsystems better turned OFF via GN
+than stubbed (investigate the right flag, like C24/use_kerberos):
+- `pci/pci.h` (angle SystemInfo_libpci) — no libpci; disable the libpci GPU-info
+  path or `use_libpci=false`.
+- `spawn.h` posix_spawn family + `sys/user.h` user_regs_struct — crashpad. A
+  minimal content_shell usually disables crashpad (`enable_crashpad=false` /
+  the crash_reporter client). Prefer that over a large posix_spawn emulation.
+- swiftshader (execinfo now stubbed, but it pulls llvm-subzero + more) — consider
+  `use_swiftshader=false` since b1nix renders via the Mesa/virgl path.
+- `xkbcommon/xkbcommon.h` — b1nix HAS a ported libxkbcommon at
+  build/xkbcommon-b1nix/.../install/include; the ozone/xkb piece needs its
+  include dir + lib wired into the b1nix GN config (use_xkbcommon path).
+- `linux/input.h` (ui keycode_converter) — needs the KEY_* table; b1nix has
+  kernel/userspace b1nix/input.h, map or add a linux/input.h with the evdev codes.
+- `linux/sync_file.h` (libsync/android ndk path) — likely disable the android
+  sync path; not used on a desktop ozone-headless build.
+Plus the remaining GCC-only -Werror set (address, format=, format-extra-args,
+interference-size, int-in-bool-context, multichar, nonnull-compare, parentheses,
+restrict, subobject-linkage) — triage each (format=/nonnull-compare/address can
+be real; the rest are GCC FPs) before demoting, same as C22.

@@ -2740,6 +2740,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_GETDENTS:
     return (u64)sys_getdents((int)arg0, (struct dirent *)(usize)arg1,
                              (usize)arg2);
+  case SYS_GETDENTS64:
+    /* Native entry to the Linux getdents64 byte layout (variable-length
+     * records with d_reclen), used by ports that read directories via the
+     * Linux dirent ABI (e.g. Chromium base/files/dir_reader_linux). */
+    return (u64)sys_linux_getdents64((int)arg0, arg1, (usize)arg2);
   case SYS_READDIR:
     return (u64)sys_readdir((const char *)(usize)arg0,
                             (struct dirent *)(usize)arg1, (usize)arg2);

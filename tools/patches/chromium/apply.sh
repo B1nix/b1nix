@@ -221,7 +221,7 @@ else echo "Patch C11 already present"; fi
 # warnings for the b1nix build so the GCC port compiles (they are still emitted).
 F="$BUILD/config/compiler/BUILD.gn"
 if ! grep -q 'b1nix builds with GCC, which is stricter' "$F"; then
-  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n        "-Wno-error=tautological-compare",\n        "-Wno-error=attributes",\n        "-Wno-error=changes-meaning",\n        "-Wno-error=return-type",\n      ]\n    }\n~' "$F"
+  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n        "-Wno-error=tautological-compare",\n        "-Wno-error=attributes",\n        "-Wno-error=changes-meaning",\n        "-Wno-error=return-type",\n        "-Wno-error=unknown-pragmas",\n        "-Wno-error=dangling-else",\n        "-Wno-error=array-bounds",\n        "-Wno-error=range-loop-construct",\n        "-Wno-error=format-truncation",\n      ]\n    }\n~' "$F"
   grep -q 'b1nix builds with GCC, which is stricter' "$F" || die "Patch C12 anchor not found in $F"
   echo "Patch C12 applied: treat_warnings_as_errors (GCC -Wno-error for b1nix)"
 else echo "Patch C12 already present"; fi
@@ -341,5 +341,51 @@ if [ -f "$F" ] && grep -q 'consteval explicit ByteSize' "$F"; then
   grep -q 'consteval explicit ByteSize' "$F" && die "Patch C20 failed in $F"
   echo "Patch C20 applied: byte_size.h consteval ctors -> constexpr"
 else echo "Patch C20 already present (or file missing)"; fi
+
+# --- Patch C21: base/containers/flat_tree.h KeyT deducibility (GCC 13) -------
+# flat_tree's heterogeneous-lookup methods are declared as
+#   template <typename K = Key> iterator find(const KeyT<K>& key);
+# where upstream `KeyT<K> = ConditionalT<is_transparent, K, Key>`. `KeyT<K>` is
+# a dependent alias => a NON-deduced context, so calling find(string_view) on a
+# string-keyed transparent flat_map cannot deduce K from the argument; K falls
+# back to the default `Key` and the string_view->const string& conversion fails.
+# Clang accepts this; GCC 13 rejects it (no match for find(string_view&)), which
+# breaks base/feature_list and every transparent flat_map lookup. Make KeyT an
+# identity alias (`using KeyT = K;`) so K is deduced directly from the call
+# argument. For transparent comparators this is exactly upstream's K; for
+# non-transparent ones it requires callers to pass the key type (Chromium's
+# non-transparent flat_maps already do, and a mismatch is a compile error, not
+# silent breakage). Drop once the cross toolchain is GCC 14+.
+F="$SRC/base/containers/flat_tree.h"
+if [ -f "$F" ] && grep -q 'ConditionalT<requires { typename KeyCompare::is_transparent; }, K, Key>' "$F"; then
+  perl -0777 -i -pe 's/  template <typename K>\n  using KeyT =\n      ConditionalT<requires \{ typename KeyCompare::is_transparent; \}, K, Key>;/  template <typename K>\n  using KeyT = K;  \/\/ b1nix\/GCC-13 (C21): keep K deducible for hetero lookup/' "$F"
+  grep -q 'using KeyT = K;  // b1nix' "$F" || die "Patch C21 anchor not found in $F"
+  echo "Patch C21 applied: flat_tree.h KeyT identity (GCC-13 deducibility)"
+else echo "Patch C21 already present (or file missing)"; fi
+
+# --- Patch C23: third_party/expat/BUILD.gn — build bundled expat for b1nix ---
+# For is_linux (which b1nix matches) expat's BUILD.gn assumes a SYSTEM libexpat
+# (`config expat_config { libs = ["expat"] }`, no include dir), so skia's
+# SkXMLParser/SkFontMgr_android_parser can't find <expat.h>. b1nix has no system
+# expat; exclude it from that branch so it builds expat from the bundled source
+# (the `else` branch that exports the include dir + XML_STATIC).
+F="$SRC/third_party/expat/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix has no system libexpat' "$F"; then
+  perl -0777 -i -pe 's~if \(\(\(is_linux && !is_castos\) \|\| is_chromeos\) && !use_fuzzing_engine\) \{~if ((((is_linux && !is_castos) || is_chromeos) && !use_fuzzing_engine) &&\n    target_os != "b1nix") {  # b1nix has no system libexpat: build from bundled source~' "$F"
+  grep -q 'b1nix has no system libexpat' "$F" || die "Patch C23 anchor not found in $F"
+  echo "Patch C23 applied: expat/BUILD.gn (build bundled expat for b1nix)"
+else echo "Patch C23 already present (or file missing)"; fi
+
+# --- Patch C24: net/features.gni — use_kerberos=false for b1nix --------------
+# b1nix has no GSSAPI/Kerberos library, so <gssapi.h> is unavailable and
+# Negotiate auth is unsupported. Default use_kerberos off for b1nix (Chromium
+# supports building without it). This is the reproducible form of the args.gn
+# `use_kerberos = false` override.
+F="$SRC/net/features.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no GSSAPI' "$F"; then
+  perl -0777 -i -pe 's~(  use_kerberos = !is_ios && !is_fuchsia && !is_castos && !is_cast_android)~$1 &&\n      target_os != "b1nix"  # b1nix has no GSSAPI/Kerberos library~' "$F"
+  grep -q 'b1nix has no GSSAPI' "$F" || die "Patch C24 anchor not found in $F"
+  echo "Patch C24 applied: net/features.gni (use_kerberos=false for b1nix)"
+else echo "Patch C24 already present (or file missing)"; fi
 
 echo "b1nix //build patches applied to $SRC"

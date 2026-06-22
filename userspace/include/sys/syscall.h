@@ -21,3 +21,18 @@
 #define SYS_read SYS_READ
 #define SYS_rt_sigprocmask SYS_SIGPROCMASK
 #define SYS_sigprocmask SYS_SIGPROCMASK
+
+/* __NR_* aliases (the other Linux spelling). Only define the ones b1nix
+ * actually implements natively, so raw syscall(__NR_x, ...) hits the correct
+ * b1nix entry (argument order matches Linux). Calls that b1nix lacks
+ * (sched_setattr, perf_event_open, mseal, ...) are left UNDEFINED on purpose:
+ * Chromium guards them with `#ifdef __NR_x` and falls back gracefully. Added
+ * for the Chromium port (M60-62): mojo channel_linux uses raw memfd/eventfd2. */
+#define __NR_memfd_create SYS_MEMFD_CREATE
+#define __NR_eventfd2     SYS_EVENTFD2
+#define __NR_getdents64   SYS_GETDENTS64
+#define __NR_getpid       SYS_GETPID
+#define __NR_gettid       SYS_GETTID
+#define __NR_getrandom    SYS_GETRANDOM
+#define __NR_write        SYS_WRITE
+#define __NR_read         SYS_READ

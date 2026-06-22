@@ -71,6 +71,7 @@ int execv(const char *pathname, char *const argv[]);
 int fork(void);
 pid_t vfork(void);
 int pipe(int pipefd[2]);
+int pipe2(int pipefd[2], int flags);
 int dup2(int oldfd, int newfd);
 int mkdir(const char *path, unsigned int mode);
 int chdir(const char *path);
