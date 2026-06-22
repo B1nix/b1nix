@@ -20,4 +20,9 @@ while [ "$i" -lt "$n" ]; do
     *) set -- "$@" "$a" ;;
   esac
 done
-exec "$real" "$@"
+# The Chromium build's b1nix config emits GCC-only warning flags
+# (-Wno-maybe-uninitialized, -Werror=changes-meaning, -Wno-class-memaccess, ...)
+# that stock clang rejects under -Werror=unknown-warning-option. Injecting
+# -Wno-unknown-warning-option makes clang silently ignore any flag it doesn't
+# know, so we don't have to enumerate the whole GCC-only set.
+exec "$real" -Wno-unknown-warning-option "$@"

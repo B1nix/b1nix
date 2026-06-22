@@ -15,8 +15,18 @@
 #define __END_DECLS
 #endif
 
+/* glibc expands __THROW/__THROWNL to `noexcept(true)` in C++ (empty in C). Match
+ * that: Chromium's partition_alloc declares `operator new(...) __THROW`, which
+ * must carry the same `noexcept` spec as libc++'s declaration or the override is
+ * rejected ("operator new is missing exception specification 'noexcept'"). */
 #ifndef __THROW
+#ifdef __cplusplus
+#define __THROW noexcept(true)
+#define __THROWNL noexcept(true)
+#else
 #define __THROW
+#define __THROWNL
+#endif
 #endif
 #ifndef __THROWNL
 #define __THROWNL
