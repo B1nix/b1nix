@@ -56,13 +56,15 @@ case "$ARCH" in
   *)   TRIPLET=x86_64-b1nix ;;
 esac
 BUSYBOX="$ROOT_DIR/build/busybox-b1nix/$TRIPLET/busybox"
-BASH_BIN="$(ls "$ROOT_DIR"/build/bash-src/$TRIPLET/bash-*/bash 2>/dev/null | head -1)"
 [ -f "$BUSYBOX" ] || { echo "missing busybox ELF: $BUSYBOX"; exit 1; }
-[ -f "$BASH_BIN" ] || { echo "missing bash ELF (build/bash-src/$TRIPLET/bash-*/bash)"; exit 1; }
 echo "staging userland (busybox + bash + applet symlinks)..."
 mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin" "$ROOTFS/opt/busybox/bin" "$ROOTFS/etc" "$ROOTFS/root" "$ROOTFS/home/user"
 cp -f "$BUSYBOX" "$ROOTFS/opt/busybox/bin/busybox"
-cp -f "$BASH_BIN" "$ROOTFS/bin/bash"
+if [ ! -f "$ROOTFS/bin/bash" ]; then
+  BASH_BIN="$(ls "$ROOT_DIR"/build/bash-src/$TRIPLET/bash-*/bash 2>/dev/null | head -1)"
+  [ -f "$BASH_BIN" ] || { echo "missing packaged or locally built bash"; exit 1; }
+  cp -f "$BASH_BIN" "$ROOTFS/bin/bash"
+fi
 # Core symlinks (mirror kernel/fs/initramfs.c) + every upstream applet.
 for s in sh busybox getty "["; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$s"; done
 ln -sf /opt/busybox/bin/busybox "$ROOTFS/sbin/getty"

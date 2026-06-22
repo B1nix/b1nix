@@ -145,6 +145,8 @@ DROPBEAR_ELF := build/dropbear-src/$(B1NIX_TRIPLET)/dropbear-$(DROPBEAR_VERSION)
 BASH_VERSION_NUM := 5.2.37
 BASH_ELF := build/bash-src/$(B1NIX_TRIPLET)/bash-$(BASH_VERSION_NUM)/bash
 B1NIX_TLS ?= mbedtls
+PORTS_SOURCE ?= download
+PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/index
 
 # Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
 # builds the kernel with the ported cross x86_64-b1nix-gcc/ld (toward M26
@@ -380,7 +382,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 
 .PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-live iso-test iso-full \
 	userspace userspace-install busybox-package busybox-iso \
-	install-native-toolchain install-kernel-source root-image disk-image \
+	install-native-toolchain install-kernel-source install-ports root-image disk-image \
 	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke
 
@@ -1070,6 +1072,9 @@ install-native-toolchain:
 		echo "      Run tools/build-toolchain.sh && tools/build-native-toolchain.sh to enable self-host workflow."; \
 	fi
 
+install-ports: userspace-install install-native-toolchain
+	tools/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
+
 # Stage kernel + userspace + build harness source into the rootfs so the
 # in-guest toolchain can rebuild b1nix from inside b1nix (M26 self-host).
 # Excludes generated artifacts (build/, *.o, *.a, *.elf, .git).
@@ -1131,7 +1136,7 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: userspace-install install-native-toolchain install-kernel-source
+root-image: install-ports install-kernel-source
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme

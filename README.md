@@ -109,6 +109,15 @@ Use the separately built persistent ext4 root image when needed:
 make run-root
 ```
 
+Persistent and disk images download matching packages from `b1nix-pkgs` by
+default. Build the ports locally instead with:
+
+```sh
+make PORTS_SOURCE=local root-image
+```
+
+Override `PACKAGE_INDEX_URL` to use another package repository.
+
 The first complete build downloads and cross-builds several userspace
 components, so it is substantially slower than an incremental kernel build.
 
