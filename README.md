@@ -143,6 +143,17 @@ Build output is architecture-qualified under `build/x86_64/` or `build/x86/`.
 | `make iso-test` | `build/<arch>/b1nix-test.iso` | Live image with the test mode enabled |
 | `make iso-full` | `build/<arch>/b1nix-live.iso` | Full live-image workflow |
 
+Build and boot the installer ISO, then install to a whole target disk:
+
+```sh
+make disk-iso
+b1nix_install /dev/sata0
+```
+
+The installer writes the bootable base, mounts its root partition, and installs
+all matching packages from `b1nix-pkgs`. Use `--no-packages` for an offline
+installation with the versions already included in the image.
+
 Override the root image size when needed:
 
 ```sh

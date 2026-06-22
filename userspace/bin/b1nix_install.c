@@ -5,7 +5,7 @@
  * a target block device. No mkfs/grub/partitioning in-guest — the image already
  * has it all. After this, the target disk boots b1nix on its own.
  *
- *   b1nix-install [-y] [<source-image>] <target-disk>
+ *   b1nix-install [-y] [--no-packages] [<source-image>] <target-disk>
  *
  * <source-image> defaults to the live medium's image if omitted.
  * Example: b1nix-install /mnt/iso/boot/b1nix-disk.img /dev/sda
@@ -16,6 +16,8 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <sys/stat.h>
+#include <sys/ioctl.h>
+#include <sys/mount.h>
 
 #define CHUNK (1024 * 1024)           /* 1 MiB copy buffer */
 
@@ -38,8 +40,13 @@ static long file_size(int fd) {
 }
 
 int main(int argc, char **argv) {
-    int force = 0, ai = 1;
-    if (ai < argc && strcmp(argv[ai], "-y") == 0) { force = 1; ai++; }
+    int force = 0, install_packages = 1, ai = 1;
+    while (ai < argc) {
+        if (strcmp(argv[ai], "-y") == 0) force = 1;
+        else if (strcmp(argv[ai], "--no-packages") == 0) install_packages = 0;
+        else break;
+        ai++;
+    }
 
     const char *src = NULL, *dst = NULL;
     int rest = argc - ai;
@@ -55,7 +62,7 @@ int main(int argc, char **argv) {
     } else if (rest == 2) {
         src = argv[ai]; dst = argv[ai + 1];
     } else {
-        fprintf(stderr, "Usage: b1nix-install [-y] [<source-image>] <target-disk>\n");
+        fprintf(stderr, "Usage: b1nix-install [-y] [--no-packages] [<source-image>] <target-disk>\n");
         return 1;
     }
 
@@ -113,8 +120,38 @@ int main(int argc, char **argv) {
     fsync(dfd);
     close(dfd);
     sync();
-    printf("\r  %ld MiB copied\nDone. Remove the install medium and reboot.\n"
-           "The installed system is registered with bpkg; run 'bpkg update' after boot.\n",
-           copied / (1024 * 1024));
+    printf("\r  %ld MiB copied\n", copied / (1024 * 1024));
+
+    if (install_packages) {
+        int fd = open(dst, O_RDONLY);
+        int dummy = 0;
+        if (fd < 0 || ioctl(fd, BLKRRPART, &dummy) != 0) {
+            fprintf(stderr, "b1nix-install: cannot rescan target partitions\n");
+            if (fd >= 0) close(fd);
+            return 1;
+        }
+        close(fd);
+
+        const char *base = strrchr(dst, '/');
+        base = base ? base + 1 : dst;
+        char partition[64];
+        snprintf(partition, sizeof(partition), "%sp1", base);
+        mkdir("/mnt/install", 0755);
+        if (mount(partition, "/mnt/install", "ext4", 0, NULL) != 0) {
+            fprintf(stderr, "b1nix-install: cannot mount %s\n", partition);
+            return 1;
+        }
+
+        printf("Installing packages from b1nix-pkgs...\n");
+        int rc = system("ROOT=/mnt/install bpkg update && ROOT=/mnt/install bpkg install-all");
+        sync();
+        umount("/mnt/install");
+        if (rc != 0) {
+            fprintf(stderr, "b1nix-install: package installation failed; base system remains bootable\n");
+            return 1;
+        }
+    }
+
+    printf("Done. Remove the install medium and reboot.\n");
     return 0;
 }

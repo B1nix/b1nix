@@ -176,10 +176,18 @@ static void register_partition(struct block_device *parent, usize number,
                                u64 start_lba, u64 block_count) {
   if (!parent || start_lba == 0 || block_count == 0)
     return;
-  if (partition_count >= MAX_BLK_PARTITIONS)
-    return;
-
-  struct partition_device *part = &partitions[partition_count++];
+  struct partition_device *part = 0;
+  for (usize i = 0; i < partition_count; i++) {
+    if (!partitions[i].parent) {
+      part = &partitions[i];
+      break;
+    }
+  }
+  if (!part) {
+    if (partition_count >= MAX_BLK_PARTITIONS)
+      return;
+    part = &partitions[partition_count++];
+  }
   memset(part, 0, sizeof(*part));
   part->parent = parent;
   part->start_lba = start_lba;
@@ -328,6 +336,29 @@ static void blk_scan_partitions(struct block_device *dev) {
   if (scan_gpt(dev, mbr))
     return;
   scan_mbr(dev, mbr);
+}
+
+int blk_rescan_partitions(struct block_device *dev) {
+  if (!dev || blk_is_partition(dev))
+    return -1;
+
+  usize out = 0;
+  for (usize i = 0; i < blk_device_count; i++) {
+    struct block_device *candidate = blk_devices[i];
+    if (blk_is_partition(candidate) && blk_partition_parent(candidate) == dev) {
+      struct partition_device *part = (struct partition_device *)candidate->priv;
+      if (candidate->name)
+        kfree((void *)candidate->name);
+      memset(part, 0, sizeof(*part));
+      continue;
+    }
+    blk_devices[out++] = candidate;
+  }
+  blk_device_count = out;
+  blk_cache_invalidate(dev);
+  blk_scan_partitions(dev);
+  blk_create_dev_nodes();
+  return 0;
 }
 
 void blk_register(struct block_device *dev) { blk_register_internal(dev, 1); }

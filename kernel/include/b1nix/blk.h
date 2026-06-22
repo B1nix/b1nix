@@ -47,6 +47,7 @@ const char *blk_probe_fstype(struct block_device *dev);
 int blk_is_partition(struct block_device *dev);
 struct block_device *blk_partition_parent(struct block_device *dev);
 int blk_partition_number(struct block_device *dev);
+int blk_rescan_partitions(struct block_device *dev);
 
 /* Create a /dev/<name> node for every registered block device (read/write
  * translated to cached block I/O + BLK* size ioctls). Call once after all

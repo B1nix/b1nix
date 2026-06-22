@@ -4354,7 +4354,8 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
     }
     case 0x72: /* BLKGETSIZE64: size in bytes (u64) */
       return syscall_copyout(arg, &bytes, sizeof(bytes)) < 0 ? -EFAULT : 0;
-    case 0x5F: /* BLKRRPART: reread partition table — accept */
+    case 0x5F: /* BLKRRPART: reread partition table */
+      return blk_rescan_partitions(bd) == 0 ? 0 : -EIO;
     case 0x61: /* BLKFLSBUF: flush buffers — accept */
       return 0;
     default:
