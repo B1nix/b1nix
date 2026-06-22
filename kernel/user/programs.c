@@ -2448,6 +2448,21 @@ static int init_main(int argc, const char **argv) {
 
   (void)lock_smoke_main(0, 0);
   (void)ext_stress_main(0, 0);
+
+  /* bpkg: drive the package-manager smoke through /bin/sh. The script exercises
+   * the real pipeline (curl file:// -> sha256sum -c -> tar -xzf -> metadata)
+   * against fixtures pre-staged in the initramfs and emits BPKG-SMOKE markers. */
+  {
+    const char *bpkg_argv[] = {"/bin/sh", "/etc/bpkg-smoke.sh", 0};
+    u64 bpkg_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize)bpkg_argv[0], 2,
+                                    (u64)(usize)bpkg_argv, 0, 0, 0);
+    if ((isize)bpkg_pid < 0) {
+      uwrite("BPKG-SMOKE: spawn-fail\n");
+    } else {
+      int bpkg_status = 0;
+      syscall_dispatch(SYS_WAIT, bpkg_pid, (u64)(usize)&bpkg_status, 0, 0, 0, 0);
+    }
+  }
   }
 
   if (smoke_core) {
