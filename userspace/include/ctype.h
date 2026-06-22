@@ -91,4 +91,25 @@ static inline int toupper(int c) {
     return (c >= 'a' && c <= 'z') ? (c - 'a' + 'A') : c;
 }
 
+/* C-locale-only xlocale (_l) variants — ignore the locale, delegate. Used by
+ * libc++'s locale layer. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+static inline int isalnum_l(int c, locale_t l) { (void)l; return isalnum(c); }
+static inline int isalpha_l(int c, locale_t l) { (void)l; return isalpha(c); }
+static inline int isblank_l(int c, locale_t l) { (void)l; return isblank(c); }
+static inline int iscntrl_l(int c, locale_t l) { (void)l; return iscntrl(c); }
+static inline int isdigit_l(int c, locale_t l) { (void)l; return isdigit(c); }
+static inline int isgraph_l(int c, locale_t l) { (void)l; return isgraph(c); }
+static inline int islower_l(int c, locale_t l) { (void)l; return islower(c); }
+static inline int isprint_l(int c, locale_t l) { (void)l; return isprint(c); }
+static inline int ispunct_l(int c, locale_t l) { (void)l; return ispunct(c); }
+static inline int isspace_l(int c, locale_t l) { (void)l; return isspace(c); }
+static inline int isupper_l(int c, locale_t l) { (void)l; return isupper(c); }
+static inline int isxdigit_l(int c, locale_t l) { (void)l; return isxdigit(c); }
+static inline int tolower_l(int c, locale_t l) { (void)l; return tolower(c); }
+static inline int toupper_l(int c, locale_t l) { (void)l; return toupper(c); }
+
 #endif

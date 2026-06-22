@@ -28,6 +28,13 @@ struct lconv {
     char n_sep_by_space;
     char p_sign_posn;
     char n_sign_posn;
+    /* C99 international-monetary fields (libc++ reads them; C-locale = CHAR_MAX). */
+    char int_p_cs_precedes;
+    char int_p_sep_by_space;
+    char int_n_cs_precedes;
+    char int_n_sep_by_space;
+    char int_p_sign_posn;
+    char int_n_sign_posn;
 };
 
 #ifdef __cplusplus
@@ -41,7 +48,10 @@ struct lconv *localeconv(void);
  * C-locale ONLY, so locale_t is an opaque non-NULL handle and the *_l functions
  * ignore the locale (they behave as the C locale, which is all b1nix has). This
  * is correct b1nix behaviour, not a fake — there are no other locales. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
 typedef void *locale_t;
+#endif
 
 /* newlocale category masks. */
 #define LC_CTYPE_MASK    (1 << LC_CTYPE)

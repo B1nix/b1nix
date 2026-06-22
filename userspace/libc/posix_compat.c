@@ -412,3 +412,21 @@ int posix_spawnp(pid_t *pid, const char *file,
                  char *const envp[]) {
   return do_spawn(pid, file, file_actions, attrp, argv, envp, 1);
 }
+
+/* truncate/fchmodat for libc++'s std::filesystem. */
+int truncate(const char *path, off_t length) {
+  int fd = open(path, O_WRONLY);
+  if (fd < 0) return -1;
+  int r = ftruncate(fd, length);
+  int e = errno;
+  close(fd);
+  if (r < 0) errno = e;
+  return r;
+}
+
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
+  (void)flags;
+  if (dirfd == AT_FDCWD) return chmod(path, (unsigned int)mode);
+  errno = ENOSYS;
+  return -1;
+}

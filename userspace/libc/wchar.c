@@ -217,6 +217,68 @@ size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps) {
 	return count;
 }
 
+/* Bounded variants for libc++'s locale fallbacks (bsd_locale_fallbacks.h):
+ * consume at most nmc source bytes / nwc source wide chars. */
+size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nmc, size_t len, mbstate_t *ps) {
+	const char *p = *src;
+	size_t count = 0, consumed = 0;
+	for (;;) {
+		if (dst && count >= len)
+			break;
+		if (consumed >= nmc)
+			break;
+		wchar_t wc;
+		size_t avail = nmc - consumed;
+		size_t r = mbrtowc(&wc, p, avail < 4 ? avail : 4, ps);
+		if (r == (size_t)-1)
+			return (size_t)-1;
+		if (r == (size_t)-2)
+			break; /* multibyte char straddles the nmc bound — stop */
+		if (dst)
+			dst[count] = wc;
+		count++;
+		if (r == 0) { /* source NUL */
+			if (dst)
+				*src = NULL;
+			return count - 1;
+		}
+		p += r;
+		consumed += r;
+	}
+	if (dst)
+		*src = p;
+	return count;
+}
+
+size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps) {
+	const wchar_t *p = *src;
+	size_t count = 0, consumed = 0;
+	char tmp[4];
+	while (consumed < nwc && *p) {
+		size_t r = wcrtomb(tmp, *p, ps);
+		if (r == (size_t)-1)
+			return (size_t)-1;
+		if (dst) {
+			if (count + r > len)
+				break;
+			for (size_t i = 0; i < r; i++)
+				dst[count + i] = tmp[i];
+		}
+		count += r;
+		p++;
+		consumed++;
+	}
+	if (dst) {
+		if (consumed < nwc && *p == 0 && count < len) {
+			dst[count] = '\0'; /* reached source NUL within bounds */
+			*src = NULL;
+		} else {
+			*src = p;
+		}
+	}
+	return count;
+}
+
 /* Non-restartable string conversions (UTF-8). */
 size_t mbstowcs(wchar_t *dest, const char *src, size_t n) {
 	const char *p = src;

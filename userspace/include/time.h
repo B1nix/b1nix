@@ -91,6 +91,15 @@ static inline clock_t clock(void) {
 }
 
 size_t strftime(char *s, size_t max, const char *format, const struct tm *tm);
+/* C-locale-only xlocale (_l) variant for libc++ — ignores the locale. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+static inline size_t strftime_l(char *s, size_t max, const char *fmt,
+                                const struct tm *tm, locale_t l) {
+    (void)l; return strftime(s, max, fmt, tm);
+}
 
 static inline double difftime(time_t time1, time_t time0) {
     return (double)(time1 - time0);

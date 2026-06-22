@@ -35,7 +35,13 @@ B1NIX_OS_DEFINES="-D__b1nix__=1 -D__b1nix=1 -D__unix__=1 -D__unix=1"
 B1NIX_CLANG_MATCH="-mcx16 -fno-use-cxa-atexit"
 # libc++ build: clang resource headers (builtins) + b1nix libc C headers only.
 # NO GCC libstdc++ C++ header dirs — libc++ replaces them (GN adds its -isystem).
-CLANG_CPPFLAGS="--target=x86_64-b1nix $B1NIX_OS_DEFINES $B1NIX_CLANG_MATCH -nostdinc -isystem $RES/include -isystem $CROSS/x86_64-b1nix/include"
+# _LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE: b1nix is an unknown platform to libc++'s
+# locale layer (no glibc/musl/BSD rune table); use libc++'s self-contained
+# default ctype table (C-locale ASCII, which is all b1nix supports anyway).
+# _LIBCPP_HAS_CLOCK_GETTIME: b1nix has clock_gettime(CLOCK_MONOTONIC), so libc++'s
+# steady_clock uses the POSIX clock_gettime path (chrono.cpp); without it libc++
+# errors "Monotonic clock not implemented on this platform".
+CLANG_CPPFLAGS="--target=x86_64-b1nix $B1NIX_OS_DEFINES $B1NIX_CLANG_MATCH -D_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE -D_LIBCPP_HAS_CLOCK_GETTIME=1 -nostdinc -isystem $RES/include -isystem $CROSS/x86_64-b1nix/include"
 FILTER="$ROOT_DIR/tools/v8-clang-filter.sh"
 
 GEN_ARGS="target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false clang_use_chrome_plugins=false \

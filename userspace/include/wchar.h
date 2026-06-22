@@ -62,12 +62,23 @@ int wcwidth(wchar_t wc);
 int wcswidth(const wchar_t *s, size_t n);
 size_t mbsrtowcs(wchar_t *dst, const char **src, size_t len, mbstate_t *ps);
 size_t wcsrtombs(char *dst, const wchar_t **src, size_t len, mbstate_t *ps);
+/* Bounded (GNU/BSD) variants — consume at most nmc source bytes / nwc source
+ * wide chars. Used by libc++'s locale fallbacks (bsd_locale_fallbacks.h). */
+size_t mbsnrtowcs(wchar_t *dst, const char **src, size_t nmc, size_t len, mbstate_t *ps);
+size_t wcsnrtombs(char *dst, const wchar_t **src, size_t nwc, size_t len, mbstate_t *ps);
 wint_t btowc(int c);
 int wctob(wint_t c);
 int wcscmp(const wchar_t *a, const wchar_t *b);
 int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
 int wcscoll(const wchar_t *a, const wchar_t *b);
 size_t wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n);
+/* C-locale-only xlocale (_l) variants for libc++ — ignore the locale. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+static inline int wcscoll_l(const wchar_t *a, const wchar_t *b, locale_t l) { (void)l; return wcscoll(a, b); }
+static inline size_t wcsxfrm_l(wchar_t *d, const wchar_t *s, size_t n, locale_t l) { (void)l; return wcsxfrm(d, s, n); }
 wchar_t *wcschr(const wchar_t *s, wchar_t c);
 wchar_t *wcsrchr(const wchar_t *s, wchar_t c);
 wchar_t *wcsncpy(wchar_t *dest, const wchar_t *src, size_t n);
