@@ -117,6 +117,8 @@ make PORTS_SOURCE=local root-image
 ```
 
 Override `PACKAGE_INDEX_URL` to use another package repository.
+Downloaded packages are recorded in `/var/lib/bpkg`, so the installed disk can
+list, update, and remove them normally with `bpkg`.
 
 The first complete build downloads and cross-builds several userspace
 components, so it is substantially slower than an incremental kernel build.

@@ -37,6 +37,11 @@ download_ports() {
 	tmp="$(mktemp -d)"
 	trap 'rm -rf "$tmp"' EXIT HUP INT TERM
 	fetch "$INDEX_URL" "$tmp/index"
+	state="$ROOTFS/var/lib/bpkg"
+	installed="$state/installed"
+	mkdir -p "$installed" "$ROOTFS/etc"
+	cp "$tmp/index" "$state/index"
+	printf "INDEX_URL='%s'\n" "$INDEX_URL" > "$ROOTFS/etc/bpkg.conf"
 
 	while read -r name version arch sha url extra; do
 		case "$name" in ''|'#'*) continue ;; esac
@@ -54,10 +59,14 @@ download_ports() {
 		echo "FETCH $name $version [$arch]"
 		fetch "$url" "$archive"
 		[ "$(sha256_of "$archive")" = "$sha" ] || { echo "install-ports: checksum failed for $name" >&2; exit 1; }
-		tar -tzf "$archive" | awk '/^\// || /(^|\/)\.\.($|\/)/ { bad=1 } END { exit bad }' || {
+		list="$tmp/$name.list"
+		tar -tzf "$archive" > "$list"
+		awk '/^\// || /(^|\/)\.\.($|\/)/ { bad=1 } END { exit bad }' "$list" || {
 			echo "install-ports: unsafe archive paths in $name" >&2; exit 1;
 		}
 		tar -xzf "$archive" -C "$ROOTFS"
+		cp "$list" "$installed/$name.list"
+		printf '%s\n' "$version" > "$installed/$name.ver"
 	done < "$tmp/index"
 }
 

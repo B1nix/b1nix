@@ -113,7 +113,8 @@ int main(int argc, char **argv) {
     fsync(dfd);
     close(dfd);
     sync();
-    printf("\r  %ld MiB copied\nDone. Remove the install medium and reboot.\n",
+    printf("\r  %ld MiB copied\nDone. Remove the install medium and reboot.\n"
+           "The installed system is registered with bpkg; run 'bpkg update' after boot.\n",
            copied / (1024 * 1024));
     return 0;
 }
