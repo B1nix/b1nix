@@ -409,3 +409,14 @@ if [ -f "$F" ] && ! grep -q 'b1nix has no GSSAPI' "$F"; then
 else echo "Patch C24 already present (or file missing)"; fi
 
 echo "b1nix //build patches applied to $SRC"
+
+# --- Patch C-LSS: don't use third_party/lss on b1nix --------------------------
+# lss issues raw syscalls with REAL Linux numbers (and #defines __NR_* to them),
+# but b1nix has its own syscall numbers. Exclude b1nix from the lss include in
+# rand_util_posix; b1nix then uses the libc syscall() + b1nix __NR_ aliases.
+for F in "$SRC/base/rand_util_posix.cc" "$SRC/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_posix.cc"; do
+  if [ -f "$F" ] && ! grep -q "!defined(__b1nix__)" "$F"; then
+    perl -0777 -i -pe 's~#if BUILDFLAG\(IS_LINUX\) \|\| BUILDFLAG\(IS_CHROMEOS\)\n(#include "third_party/lss/linux_syscall_support.h")~#if (BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)) \&\& !defined(__b1nix__)\n${1}~' "$F"
+    echo "Patch C-LSS applied: $F"
+  fi
+done
