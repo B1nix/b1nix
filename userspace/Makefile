@@ -41,6 +41,7 @@ LINKER   := linker.ld
 
 LIBC_OBJS := \
 	$(BUILD)/libc/string.o \
+	$(BUILD)/libc/atomic.o \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
 	$(BUILD)/libc/unistd.o \
