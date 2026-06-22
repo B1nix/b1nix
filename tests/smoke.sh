@@ -142,7 +142,7 @@ report_progress_line() {
 		esac
 	else
 		case "$line" in
-			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
+			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|BPKG-SMOKE:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
 			*) return ;;
 		esac
 	fi
@@ -824,6 +824,15 @@ check_output "$LOG" "LOCK-SMOKE: done" "LOCK-SMOKE completes successfully"
 check_output "$LOG" "EXT-STRESS: done" "EXT-STRESS completes successfully"
 check_output "$LOG" "ok eloop" "circular symlink returns ELOOP"
 check_output "$LOG" "POSIX-SMOKE: done" "POSIX shell-driven smoke tests complete"
+
+# bpkg minimal package manager: real pipeline (curl file:// + sha256sum -c + tar).
+check_output "$LOG" "BPKG-SMOKE: start" "bpkg smoke starts"
+check_output "$LOG" "BPKG-SMOKE: ok update" "bpkg update fetches the index"
+check_output "$LOG" "BPKG-SMOKE: ok install" "bpkg install verifies sha256 and extracts"
+check_output "$LOG" "BPKG-SMOKE: ok list" "bpkg list reports the installed package"
+check_output "$LOG" "BPKG-SMOKE: ok checksum-reject" "bpkg install rejects a wrong sha256"
+check_output "$LOG" "BPKG-SMOKE: ok remove" "bpkg remove deletes files and metadata"
+check_output "$LOG" "BPKG-SMOKE: done" "bpkg smoke completes"
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"
 check_output "$LOG" "M22-POLISH: ok text-pipeline" "M22 Polish text pipeline verifies"
