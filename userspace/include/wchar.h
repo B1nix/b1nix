@@ -123,6 +123,31 @@ int wscanf(const wchar_t *format, ...);
 
 #ifdef __cplusplus
 }
+
+/* glibc's <wchar.h> exposes the standard wide-char functions in BOTH the global
+ * namespace and std:: (via __BEGIN_NAMESPACE_STD). C++ code that includes
+ * <wchar.h> directly — e.g. Abseil's str_format does `std::wcslen` — then expects
+ * them in std. b1nix declares them only globally above, so mirror the ISO C set
+ * into std:: here. Redundant with libstdc++'s <cwchar> (duplicate
+ * using-declarations are legal). */
+namespace std {
+  using ::wmemcpy; using ::wmemmove; using ::wmemset; using ::wmemcmp;
+  using ::wmemchr; using ::wcslen; using ::wcscat; using ::wcscpy;
+  using ::wcsncat; using ::wcsncpy; using ::wcscmp; using ::wcsncmp;
+  using ::wcscoll; using ::wcsxfrm; using ::wcschr; using ::wcsrchr;
+  using ::wcsspn; using ::wcscspn; using ::wcspbrk; using ::wcsstr;
+  using ::wcstok; using ::wcsftime;
+  using ::wcstol; using ::wcstoul; using ::wcstoll; using ::wcstoull;
+  using ::wcstod; using ::wcstof; using ::wcstold;
+  using ::mbrtowc; using ::mbrlen; using ::wcrtomb; using ::mbsinit;
+  using ::mbsrtowcs; using ::wcsrtombs; using ::btowc; using ::wctob;
+  using ::fgetwc; using ::getwc; using ::getwchar; using ::fputwc;
+  using ::putwc; using ::putwchar; using ::ungetwc; using ::fgetws;
+  using ::fputws; using ::fwide;
+  using ::swprintf; using ::vswprintf; using ::fwprintf; using ::vfwprintf;
+  using ::wprintf; using ::vwprintf; using ::swscanf; using ::fwscanf;
+  using ::wscanf;
+}
 #endif
 
 #endif

@@ -213,10 +213,6 @@ char *getcwd(char *buf, size_t size) {
 }
 
 int fsync(int fd) { return _check_err(syscall(SYS_FSYNC, fd)); }
-/* fdatasync: b1nix has no data-only sync syscall; fsync (which also flushes
- * metadata) is a correct, stronger implementation. Added for the Chromium
- * port (M60-62). */
-int fdatasync(int fd) { return _check_err(syscall(SYS_FSYNC, fd)); }
 
 void sync(void) { syscall(SYS_SYNC); }
 
