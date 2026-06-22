@@ -221,7 +221,7 @@ else echo "Patch C11 already present"; fi
 # warnings for the b1nix build so the GCC port compiles (they are still emitted).
 F="$BUILD/config/compiler/BUILD.gn"
 if ! grep -q 'b1nix builds with GCC, which is stricter' "$F"; then
-  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n        "-Wno-error=tautological-compare",\n      ]\n    }\n~' "$F"
+  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n        "-Wno-error=tautological-compare",\n        "-Wno-error=attributes",\n        "-Wno-error=changes-meaning",\n        "-Wno-error=return-type",\n      ]\n    }\n~' "$F"
   grep -q 'b1nix builds with GCC, which is stricter' "$F" || die "Patch C12 anchor not found in $F"
   echo "Patch C12 applied: treat_warnings_as_errors (GCC -Wno-error for b1nix)"
 else echo "Patch C12 already present"; fi
@@ -236,7 +236,7 @@ else echo "Patch C12 already present"; fi
 # diagnostics, never the generated bindings.
 F="$SRC/build/rust/gni_impl/filter_clang_args.py"
 if [ -f "$F" ] && ! grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F"; then
-  perl -0777 -i -pe 's~(      elif args\[i\] == .-ftime-trace.:\n        pass\n)(      else:\n        yield args\[i\])~${1}      # b1nix port (M60-62): bindgen runs libclang to parse C++, but the b1nix\n      # target compiler is GCC, so {{cflags}} carry GCC-only warning options that\n      # clang rejects with -Werror=unknown-warning-option. Drop them here so\n      # bindgen can parse the headers (these only affect diagnostics, never the\n      # generated bindings).\n      elif args[i] in (\n          "-Wno-maybe-uninitialized",\n          "-Werror=maybe-uninitialized",\n          "-Wno-error=maybe-uninitialized",\n          "-Wno-packed-not-aligned",\n          "-Wno-class-memaccess",\n          "-Wno-error=sign-compare",\n          "-Wno-error=unused-function",\n          "-Wno-error=unused-variable",\n          "-Wno-error=unused-but-set-variable",\n          "-Wno-error=nonnull",\n          "-Wno-error=redundant-move",\n          "-Wno-redundant-move",\n          "-Wno-dangling-reference",\n          "-fno-math-errno",\n      ):\n        pass\n${2}~' "$F"
+  perl -0777 -i -pe 's~(      elif args\[i\] == .-ftime-trace.:\n        pass\n)(      else:\n        yield args\[i\])~${1}      # b1nix port (M60-62): bindgen runs libclang to parse C++, but the b1nix\n      # target compiler is GCC, so {{cflags}} carry GCC-only warning options that\n      # clang rejects with -Werror=unknown-warning-option. Drop them here so\n      # bindgen can parse the headers (these only affect diagnostics, never the\n      # generated bindings).\n      elif args[i] in (\n          "-Wno-maybe-uninitialized",\n          "-Werror=maybe-uninitialized",\n          "-Wno-error=maybe-uninitialized",\n          "-Wno-packed-not-aligned",\n          "-Wno-class-memaccess",\n          "-Wno-error=sign-compare",\n          "-Wno-error=unused-function",\n          "-Wno-error=unused-variable",\n          "-Wno-error=unused-but-set-variable",\n          "-Wno-error=nonnull",\n          "-Wno-error=redundant-move",\n          "-Wno-redundant-move",\n          "-Wno-dangling-reference",\n          "-Wno-error=tautological-compare",\n          "-Wno-error=attributes",\n          "-Wno-error=changes-meaning",\n          "-Wno-error=return-type",\n          "-fno-math-errno",\n      ):\n        pass\n${2}~' "$F"
   grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F" || die "Patch C13 anchor not found in $F"
   echo "Patch C13 applied: filter_clang_args.py (drop GCC-only flags for bindgen)"
 else echo "Patch C13 already present (or file missing)"; fi
@@ -266,5 +266,49 @@ if [ -f "$F" ] && ! grep -q 'b1nix has no memory-protection-keys' "$F"; then
   grep -q 'b1nix has no memory-protection-keys' "$F" || die "Patch C15 anchor not found in $F"
   echo "Patch C15 applied: partition_alloc.gni (disable pkeys for b1nix)"
 else echo "Patch C15 already present (or file missing)"; fi
+
+# --- Patch C16: rust_bindgen.gni — allow newer-rustc deny-by-default lints ----
+# The Chromium-bundled rustc is newer than the bindgen that emitted the binding
+# .rs files, and denies-by-default lints that bindgen output trips (notably
+# unnecessary_transmutes in generated bitfield accessors). The generated code is
+# correct; allow the lint for bindgen crates rather than regenerate.
+F="$SRC/build/rust/rust_bindgen.gni"
+if [ -f "$F" ] && ! grep -q 'unnecessary_transmutes' "$F"; then
+  perl -0777 -i -pe 's~(      "-Anon_upper_case_globals",\n)(    \])~${1}\n      # Bundled rustc is newer than the bindgen that generated these bindings;\n      # allow the deny-by-default lints its output trips (correct code).\n      "-Aunnecessary_transmutes",\n${2}~' "$F"
+  grep -q 'unnecessary_transmutes' "$F" || die "Patch C16 anchor not found in $F"
+  echo "Patch C16 applied: rust_bindgen.gni (allow bindgen lints for b1nix)"
+else echo "Patch C16 already present (or file missing)"; fi
+
+# --- Patch C17: base/numerics CheckOnFailure::HandleFailure constexpr ---------
+# GCC 13's constexpr evaluator requires the never-taken failure branch of
+# checked_cast() to be a constexpr-callable function. CheckOnFailure::
+# HandleFailure (which just traps) was a plain static fn, so any constant
+# expression using checked_cast (e.g. base::ByteSize KiBU(1)) was rejected as
+# "not a constant expression". Marking it constexpr is correct (it still traps
+# when actually evaluated) and matches newer toolchains. (Partial: deeper
+# CheckedNumeric constexpr gaps remain on GCC 13; see PORT-PLAN.)
+F="$SRC/base/numerics/safe_conversions_impl.h"
+if [ -f "$F" ] && ! grep -q 'static constexpr T HandleFailure' "$F"; then
+  perl -0777 -i -pe 's~(  template <typename T>\n)(  static T HandleFailure\(\) \{)~${1}  static constexpr T HandleFailure() {~' "$F"
+  grep -q 'static constexpr T HandleFailure' "$F" || die "Patch C17 anchor not found in $F"
+  echo "Patch C17 applied: safe_conversions_impl.h (HandleFailure constexpr)"
+else echo "Patch C17 already present (or file missing)"; fi
+
+# --- Patch C18: content/shell drop rust test targets (need enable_rust) -------
+# content/shell/BUILD.gn defines testonly rust targets (rust_test_mojom with
+# generate_rust=true, rust_test_service[_ffi]) and lists them in
+# content_shell_lib deps. They require enable_rust, which is OFF for the b1nix
+# headless build (no rustc target), so `gn gen` asserts. content_shell proper
+# does not need these test targets: drop them from the lib deps and guard their
+# definitions behind if(enable_rust).
+F="$SRC/content/shell/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix: rust test targets' "$F"; then
+  perl -0777 -i -pe 's~    ":rust_test_mojom",\n    ":rust_test_mojom_js",\n    ":rust_test_service_ffi",\n(    ":shell_controller_mojom",)~${1}~' "$F"
+  perl -0777 -i -pe 's~(mojom\("rust_test_mojom"\) \{)~# b1nix: rust test targets need enable_rust (off); content_shell does not\n# use them. Guard so gn-gen does not assert(enable_rust).\nif (enable_rust) {\n${1}~' "$F"
+  # close the if(enable_rust) at EOF (the rust block runs to end of file)
+  printf '}\n' >> "$F"
+  grep -q 'b1nix: rust test targets' "$F" || die "Patch C18 anchor not found in $F"
+  echo "Patch C18 applied: content/shell drop rust test targets"
+else echo "Patch C18 already present (or file missing)"; fi
 
 echo "b1nix //build patches applied to $SRC"

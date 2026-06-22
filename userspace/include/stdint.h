@@ -111,5 +111,13 @@ typedef uint64_t uint_fast64_t;
 #endif
 #define WINT_MIN         0U
 #define WINT_MAX         UINT32_MAX
+#define PTRDIFF_MAX 9223372036854775807L
+#define PTRDIFF_MIN (-9223372036854775807L - 1)
+#define SIG_ATOMIC_MAX 2147483647
+#define SIG_ATOMIC_MIN (-2147483647 - 1)
+#define WCHAR_MAX 2147483647
+#define WCHAR_MIN (-2147483647 - 1)
+#define WINT_MAX 4294967295U
+#define WINT_MIN 0U
 
 #endif

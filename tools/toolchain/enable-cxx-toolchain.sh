@@ -92,6 +92,16 @@ enable_one() {
         sed -i.bak "s|/\* #undef $m \*/|#define $m 1|" "$cfg"
       fi
     done
+
+    # 5. C++23 std::from_range_t / std::from_range (P1206). GCC 13.2's libstdc++
+    #    predates this tag (GCC 14 adds it); Chromium's base/containers use it
+    #    for range constructors. Inject the real standard tag type into
+    #    <bits/ranges_base.h> (the GCC 14 location), guarded so a GCC 14+
+    #    libstdc++ (which defines __cpp_lib_containers_ranges) is untouched.
+    rb="$bits/ranges_base.h"
+    if [ -f "$rb" ] && ! grep -q "from_range_t" "$rb"; then
+      perl -0777 -i -pe 's/(\} \/\/ namespace ranges\n)(_GLIBCXX_END_NAMESPACE_VERSION\n\} \/\/ namespace std)/$1\n  \/\/ C++23 std::from_range_t\/std::from_range (P1206); GCC 13.2 lacks it.\n#if __cplusplus >= 202100L && !defined(__cpp_lib_containers_ranges)\n  struct from_range_t { explicit from_range_t() = default; };\n  inline constexpr from_range_t from_range{};\n#endif\n\n$2/' "$rb"
+    fi
   fi
   rm -f "$cross"/*/include/c++/*/"$triplet"/bits/c++config.h.bak 2>/dev/null || true
   echo "enable-cxx: $triplet ready" >&2

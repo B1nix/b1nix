@@ -291,3 +291,145 @@ b1nix target with rc=0** (`ninja -t commands <target>` → ran the exact compile
 ```sh
 sh tools/sync-chromium.sh      # fetch + apply + gn gen (needs ≥90 GB free)
 ```
+
+## Session 3 (2026-06-22): wcslen-unblocked build resumes; libstdc++ C99 + libc gaps (v0.65.2)
+
+Branch `chromium-build` (off main, which already has the wcslen toolchain fix +
+M65). Resumed `ninja -C out/b1nix -j6 -k0 content_shell`. The build now sails
+PAST abseil str_format (wcslen fixed on main) and deep into perfetto/icu/
+boringssl. Two fix classes this session, both REAL:
+
+### A. Stale toolchain header copies (re-synced)
+`gclient sync`/fresh state had left the cross + sysroot include copies of
+`elf.h`, `syscall.h`, `sys/syscall.h` STALE (missing the session-2f
+Elf64_Verdef*/SHN_*/lowercase-SYS_* additions that ARE in the repo source).
+Re-copied repo `userspace/include/{elf.h,syscall.h,sys/syscall.h}` into both the
+cross include dir and the sysroot. (Reminder: those two dirs are gitignored
+build artifacts; the repo `userspace/include` is the source of truth.)
+
+### B. libstdc++ C99 detection macros (THE big unblocker, no rebuild needed)
+The cross libstdc++ was configured against an empty sysroot, so besides wchar_t
+it ALSO recorded that the libc lacked C99 `<math.h>`, `<stdlib.h>`, and the C99
+`<stdint.h>` types. That `#if`'d out, across the whole libstdc++:
+- `std::signbit/isnan/isinf/isfinite/fpclassify` (`<cmath>`, gated by
+  `_GLIBCXX{11,98}_USE_C99_MATH`) — perfetto dynamic_string_writer.
+- `std::strtoll/strtoull/atoll/strtof/strtold` (`<cstdlib>`, gated by
+  `_GLIBCXX{11,98}_USE_C99_STDLIB`).
+- the ENTIRE `<random>` header incl. `std::seed_seq`/engines/distributions
+  (gated by `_GLIBCXX_USE_C99_STDINT_TR1`) — perfetto uuid.
+b1nix's libc genuinely provides all of these now, so the fix is honest:
+`tools/enable-cxx-toolchain.sh` already flipped MATH/STDINT/FENV-TR1 +
+`_GLIBCXX11/98_USE_C99_MATH`; this session ADDED `_GLIBCXX{11,98}_USE_C99_STDLIB`
+and `_GLIBCXX_USE_C99` to that list, then ran the script (header-only; no GCC
+rebuild). Commit 53ed8ec.
+
+### C. b1nix libc gaps (v0.65.2, commit on chromium-build)
+New compile-chase batch (perfetto/abseil/ced/sqlite-ICU), all verified rc=0 in
+isolation, all REAL (no fakes; unsupported paths return ENOPROTOOPT honestly):
+- `<uchar.h>` (NEW) + `uchar.c`: char16_t/char32_t (C-only typedefs) + the C11
+  mbrtoc16/c16rtomb/mbrtoc32/c32rtomb conversions. char32_t == b1nix wchar_t so
+  the c32 funcs delegate to mbrtowc/wcrtomb; char16_t does real UTF-16 surrogate
+  encode/decode (pending surrogate parked in mbstate_t). Needed by ICU (sqlite).
+- `string.h`/`string.c`: `memrchr` (ced compact_enc_det).
+- `unistd.h`/`unistd.c`: `pwrite` (save/seek/write/restore, mirrors pread).
+- `sys/socket.h`: SO_PEERCRED/SO_RCVTIMEO/SO_SNDTIMEO/SO_PASSCRED/SO_RCVLOWAT/
+  SO_SNDLOWAT/SO_DOMAIN/SO_PROTOCOL (Linux values) + SOMAXCONN — compile-time
+  constants; kernel still returns ENOPROTOOPT for the options it lacks.
+- `stdio.h`: FILENAME_MAX/FOPEN_MAX/TMP_MAX.
+- apply.sh C12: add `-Wno-error=tautological-compare` (perfetto
+  typed_proto_field.h template self-comparison = GCC false positive).
+
+LINK-READINESS: rebuilt `userspace/build/x86_64/libb1nix.a` (`make
+B1NIX_ARCH=x86_64`) — now carries memrchr/pwrite/uchar — and copied it over BOTH
+`sysroot/lib/libb1nix.a` and `sysroot/lib/libc.a` (the cross-GCC `-lc` resolves
+to the latter). So the final link will see the new symbols (and all the
+session-2 sched_*/wait4/locale impls, since the whole .a was rebuilt).
+
+Header sync discipline: every changed header copied to repo `userspace/include`
+(tracked), the cross include dir, AND the sysroot. `enable-cxx-toolchain.sh`
+handles the cross copy + include-fixed; the sysroot copy is manual.
+
+State at session pause: build running single-instance, 0 FAILED, past
+icu/boringssl, climbing toward net/mojo/content/blink. NEXT: keep harvesting
+`^FAILED:` compiler diagnostics from
+`build/toolchain_build/gnlogs/ninja_content_shell.log`, batch-fix (libc gap →
+userspace + sync 3 copies + rebuild .a; tree/GN → grep-guarded apply.sh patch;
+.gni/BUILD.gn edit → `gn gen` to rebake), verify each in isolation, restart.
+
+### Session 3 cont. — base/ + net/ compile wave (still v0.65.2)
+
+After the libstdc++ C99 + first libc batch, the build reached `base/` and `net/`
+and hit a WALL of failures — but mostly ONE root cause cascading:
+
+- **`std::from_range_t` missing (THE base/ unblocker).** Chromium
+  `base/containers/circular_deque.h` (transitively included by almost all of
+  base/) declares a `circular_deque(std::from_range_t, Range&&)` constructor.
+  `std::from_range_t`/`std::from_range` are C++23 (P1206), added in GCC **14**'s
+  libstdc++; the b1nix cross compiler is GCC 13.2, which lacks them → a parse
+  error (`expected ')' before ','`) that knocked out nearly every base/, net/,
+  components/, crypto/, sql/ TU. Fixed by injecting the REAL standard tag type
+  into the cross libstdc++ `<bits/ranges_base.h>` (the GCC 14 location), guarded
+  off for GCC 14+. Persisted in `enable-cxx-toolchain.sh` (step 5) so a fresh
+  box gets it. Verified `base/at_exit.o` rc=0.
+
+- **libc gaps (v0.65.2 batch):** stdint.h PTRDIFF_MAX/MIN + WCHAR/WINT/
+  SIG_ATOMIC max/min; endian.h htobe/htole/be*toh/le*toh 16/32/64 (LE host:
+  little=identity, big=__builtin_bswap); syscall.h remaining CLONE_* flag bits
+  (CHILD_SETTID/PARENT_SETTID/NEW{NS,UTS,IPC,USER,PID,NET}/SYSVSEM/IO/...).
+
+KNOWN-NEXT (seen in the -k0 error harvest, likely real once the cascade clears):
+- `clone()` (7-arg glibc wrapper) used by `base/process/launch_posix.cc`
+  `ForkWithFlags`. b1nix has no clone-with-stack; honest fix = declare in
+  <sched.h> + impl returning ENOSYS (only the namespace/sandbox launch path uses
+  it; headless --no-sandbox content_shell shouldn't hit it at runtime).
+- `append_range`/`prepend_range` C++23 vector members (same GCC-13-vs-14 gap as
+  from_range_t) — may need a similar libstdc++ injection or a Chromium-side
+  guard; assess after restart.
+- `-Werror=changes-meaning` (base::Value::BlobStorage) and `-Werror=return-type`
+  GCC-only diagnostics → likely add to the C12 relaxation set.
+- flat_map heterogeneous `find(string_view)` — re-check whether real or cascade.
+
+Restarted the build with all header fixes (header-only → no gn gen). 3 more
+commits this session: 53ed8ec, f747178, c259fd2 (sess.3 part 1) + f0f4ed8
+(PTRDIFF/endian/CLONE/from_range). Build re-baselining; from_range_t cascade
+expected to collapse, leaving the genuine residue above.
+
+### Session 3 cont.2 — base/components/crypto/sql wave (v0.65.2)
+
+The from_range_t fix collapsed the base/ cascade; the remaining failures sorted
+into a small set of root causes, all fixed:
+
+- **GCC-only -Werror diagnostics (C12 extended):** -Wno-error=attributes
+  (gsl::Owner / cfi-icall attribute-ignored), changes-meaning
+  (base::Value::BlobStorage), return-type (switch-covers-all). clang does not
+  flag these; not real bugs. Demoted for the b1nix GCC build only.
+- **libc gaps (v0.65.2):**
+  - <libintl.h> (NEW): no-op GNU gettext (identity). fontconfig's checked-in
+    meson-config.h hard-#defines ENABLE_NLS=1 -> #include <libintl.h>.
+  - sys/mman.h: MAP_ANON, MS_ASYNC/MS_SYNC/MS_INVALIDATE, msync() (honest no-op:
+    b1nix file-mmap is lazy-read through the page cache, no writeback buffer).
+- **C17: base/numerics CheckOnFailure::HandleFailure made constexpr** so
+  checked_cast() works in a constant expression on GCC 13. PARTIAL — see blocker.
+- **C18: content/shell drop testonly rust targets** (rust_test_mojom
+  generate_rust + rust_test_service/_ffi) that assert(enable_rust); content_shell
+  proper does not need them. Unblocked `gn gen` (was rc=1 assert(enable_rust)).
+
+**OPEN BLOCKER — byte_size.cc / base::ByteSize constexpr on GCC 13.**
+`constexpr uint64_t kOneKiB = KiBU(1).InBytes()` (and the 21-ish files that
+force constexpr ByteSize/KiBU/MiBU... evaluation) fail: GCC 13 cannot
+constant-evaluate the base/numerics CheckedNumeric multiply/ValueOrDie chain
+(`ByteSize(kib) * 1024` -> "'kib' is not a constant expression / constexpr call
+flows off the end"). Root is deeper than HandleFailure (C17 fixed that and
+checked_cast<int64_t>(1) now folds): the CheckedNumeric `state_.value()` /
+ValueOrDie path is not constexpr-foldable on GCC 13 (newer GCC/clang handle it).
+__builtin_mul_overflow IS constexpr in GCC 13 (verified), and there is no asm
+fast-op on x86_64 (BASE_HAS_ASSEMBLER_SAFE_MATH=0), so the remaining gap is in
+CheckedNumericState. NEXT: either (a) a targeted base/numerics
+CheckedNumericState constexpr patch, or (b) build a GCC-14 cross toolchain
+(GCC-14 fixed both from_range_t and this constexpr fold natively). (b) is the
+durable fix and would also let us drop the from_range_t/HandleFailure injections.
+
+Commits this sub-session on chromium-build: (libstdc++ C99) 53ed8ec,
+(uchar/memrchr/pwrite/socket) f747178, (PORT-PLAN) c259fd2,
+(PTRDIFF/endian/CLONE/from_range) f0f4ed8, (libintl/mman/relaxations/C17)
+<this batch>, (C18 rust guard) 54df9a6. Build restarted with the full fixset.
