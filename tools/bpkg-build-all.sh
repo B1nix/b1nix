@@ -19,39 +19,51 @@ PUBLISH="$HERE/bpkg-publish.sh"
 [ -d "$ROOTFS" ] || { echo "rootfs '$ROOTFS' not found" >&2; exit 1; }
 [ -x "$PUBLISH" ] || { echo "bpkg-publish.sh not found at $PUBLISH" >&2; exit 1; }
 
-# name | version | space-separated paths relative to the rootfs.
-# tcc bundles its runtime (crt0/libc/libm + headers + tcc's own includes) so a
-# `bpkg install tcc` yields a compiler that can actually build a program.
+# name | version | space-separated paths relative to the rootfs | optional deps
+# The 4th field (comma-separated dependency package names) is OPTIONAL.
+#
+# 'dev' is the compile-capable sysroot: static libs + crt0 + the full headers
+# tree + tcc's own runtime headers. With it installed, an on-target tcc/make can
+# actually build and link programs. tcc and make therefore depend on 'dev', so
+# `bpkg install tcc` pulls the sysroot transitively.
 MANIFEST='
-bash|5.2|bin/bash
-tcc|0.9.27|bin/tcc lib/tcc lib/crt0.o lib/libc.a lib/libb1nix.a lib/libm.a include
-js|1.0|bin/js
-hello|1.0|bin/hello
-gpaint|1.0|bin/gpaint
-gclock|1.0|bin/gclock
-gterm|1.0|bin/gterm
-gdesktop|1.0|bin/gdesktop
-gabout|1.0|bin/gabout
-curl|8.20.0|bin/curl
-wget|1.21.4|bin/wget
-dropbear|2022.83|bin/dropbearmulti bin/dropbear bin/dbclient bin/dropbearkey
-make|3.82|bin/make
-openssl|1.1.1w|bin/openssl
-netsurf|3.11|bin/netsurf-fb
+dev|1.0|lib/libc.a lib/libm.a lib/libb1nix.a lib/libb1gui.a lib/libunwind.a? lib/crt0.o lib/tcc? include|
+bash|5.2|bin/bash|
+tcc|0.9.27|bin/tcc|dev
+js|1.0|bin/js|
+hello|1.0|bin/hello|
+gpaint|1.0|bin/gpaint|
+gclock|1.0|bin/gclock|
+gterm|1.0|bin/gterm|
+gdesktop|1.0|bin/gdesktop|
+gabout|1.0|bin/gabout|
+curl|8.20.0|bin/curl|
+wget|1.21.4|bin/wget|
+dropbear|2022.83|bin/dropbearmulti bin/dropbear bin/dbclient bin/dropbearkey|
+make|3.82|bin/make|dev
+openssl|1.1.1w|bin/openssl|
+netsurf|3.11|bin/netsurf-fb|
 '
 
-printf '%s\n' "$MANIFEST" | while IFS='|' read -r name version paths; do
+printf '%s\n' "$MANIFEST" | while IFS='|' read -r name version paths deps; do
 	[ -n "$name" ] || continue
-	missing=
-	for p in $paths; do [ -e "$ROOTFS/$p" ] || missing="$missing $p"; done
+	# A path is optional if it ends with '?': package it when present, skip it
+	# silently when absent (used for arch-specific extras like libunwind.a).
+	missing=; reqpaths=
+	for p in $paths; do
+		case "$p" in
+			*'?') p="${p%\?}"; [ -e "$ROOTFS/$p" ] && reqpaths="$reqpaths $p" ;;
+			*)    if [ -e "$ROOTFS/$p" ]; then reqpaths="$reqpaths $p"; else missing="$missing $p"; fi ;;
+		esac
+	done
 	if [ -n "$missing" ]; then
 		echo "SKIP  $name (missing:$missing)"
 		continue
 	fi
 	stage="$(mktemp -d)"
-	( cd "$ROOTFS" && cp -a --parents $paths "$stage/" )
-	echo "PACK  $name $version  [$paths]"
-	"$PUBLISH" "$stage" "$name" "$version" "$ARCH" "$SLUG" "$OUT" \
+	( cd "$ROOTFS" && cp -aL --parents $reqpaths "$stage/" )
+	echo "PACK  $name $version  [$reqpaths]${deps:+  deps=$deps}"
+	"$PUBLISH" "$stage" "$name" "$version" "$ARCH" "$SLUG" "$OUT" "$deps" \
 		| grep -E 'sha256|url' | sed 's/^/      /'
 	rm -rf "$stage"
 done

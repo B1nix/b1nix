@@ -1,5 +1,9 @@
 #!/bin/sh
 # Populate a rootfs from published packages (default) or locally built ports.
+#
+# Download mode installs EVERY arch-matching entry from the index, which now
+# includes the 'dev' sysroot package (static libs + crt0 + headers), so the
+# resulting rootfs is build-capable (tcc/make can compile + link on-target).
 set -eu
 
 ROOTFS="$1"
@@ -43,10 +47,15 @@ download_ports() {
 	cp "$tmp/index" "$state/index"
 	printf "INDEX_URL='%s'\n" "$INDEX_URL" > "$ROOTFS/etc/bpkg.conf"
 
-	while read -r name version arch sha url extra; do
+	# Fields: name version arch sha url [deps]. The 6th 'deps' field is optional
+	# (comma-separated package names); we don't resolve deps here (download mode
+	# installs EVERY arch-matching entry anyway, incl. 'dev'), but we must accept
+	# it. 'extra' would catch a stray 7th+ field => malformed.
+	while read -r name version arch sha url deps extra; do
 		case "$name" in ''|'#'*) continue ;; esac
 		[ "$arch" = "$PKG_ARCH" ] || continue
 		[ -z "${extra:-}" ] || { echo "install-ports: malformed index entry for $name" >&2; exit 1; }
+		case "${deps:-}" in *[!A-Za-z0-9._+,-]*) echo "install-ports: bad deps field for $name" >&2; exit 1 ;; esac
 		case "$name:$version:$sha:$url" in
 			*[!A-Za-z0-9._:+~@%/=,-]*) echo "install-ports: unsafe index entry for $name" >&2; exit 1 ;;
 		esac

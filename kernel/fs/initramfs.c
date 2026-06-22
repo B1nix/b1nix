@@ -300,10 +300,14 @@ static const char initramfs_bpkg[] =
     "# no JSON, no database - just a flat-text index and per-package metadata files.\n"
     "#\n"
     "# Index format: one package per line, '#' comments allowed, space-separated:\n"
-    "#   name  version  arch  sha256(64-hex)  url\n"
+    "#   name  version  arch  sha256(64-hex)  url  [deps]\n"
+    "# The 6th 'deps' field is OPTIONAL (comma-separated package names) and\n"
+    "# backward-compatible: legacy 5-field lines parse exactly as before.\n"
     "#\n"
-    "# ponytail: dependency resolution intentionally omitted - most b1nix ports are\n"
-    "#   static & self-contained. Upgrade path: add a 6th \"deps\" field and a topo walk.\n"
+    "# Dependencies are installed transitively before the package, cycle-safe and\n"
+    "# skipping anything already installed.\n"
+    "# ponytail: deps are name-only (no version constraints) - the index pins one\n"
+    "#   version per (name,arch), so a bare name is unambiguous.\n"
     "# ponytail: GPG/signature verification omitted - sha256 in a trusted index is the\n"
     "#   integrity boundary. Upgrade path: detached .sig + minisign/gpg verify.\n"
     "# ponytail: version rollback / hold / autoremove omitted. Upgrade path: keep old\n"
@@ -332,7 +336,7 @@ static const char initramfs_bpkg[] =
     "	cat >&2 <<EOF\n"
     "usage: bpkg <command> [args]\n"
     "  update            fetch the package index from INDEX_URL\n"
-    "  install <name>    install a package (verifies sha256)\n"
+    "  install <name>    install a package + its deps (verifies sha256)\n"
     "  install-all       install every package for this architecture\n"
     "  remove <name>     remove an installed package\n"
     "  list              list installed packages\n"
@@ -348,12 +352,14 @@ static const char initramfs_bpkg[] =
     "	fi\n"
     "}\n"
     "\n"
-    "# Find the index line matching $1 (name) AND the running arch. Prints the line,\n"
-    "# or returns non-zero if no match. Skips blank/comment lines.\n"
+    "# Find the index line matching $1 (name) AND the running arch. Prints the\n"
+    "# normalized line 'name ver arch sha url deps' (deps='-' when absent), or\n"
+    "# returns non-zero if no match. Skips blank/comment lines. The optional 6th\n"
+    "# 'deps' field is comma-separated package names.\n"
     "find_pkg() {\n"
     "	name=\"$1\"\n"
     "	arch=\"$(uname -m)\"\n"
-    "	while read -r f_name f_ver f_arch f_sha f_url _rest; do\n"
+    "	while read -r f_name f_ver f_arch f_sha f_url f_deps _rest; do\n"
     "		case \"$f_name\" in ''|\\#*) continue ;; esac\n"
     "		[ \"$f_name\" = \"$name\" ] || continue\n"
     "		[ \"$f_arch\" = \"$arch\" ] || continue\n"
@@ -361,7 +367,10 @@ static const char initramfs_bpkg[] =
     "			err \"malformed index line for '$name'\"\n"
     "			return 2\n"
     "		fi\n"
-    "		echo \"$f_name $f_ver $f_arch $f_sha $f_url\"\n"
+    "		# deps absent on legacy 5-field lines -> emit '-' as a placeholder so\n"
+    "		# the field count is stable for callers using positional parsing.\n"
+    "		[ -n \"$f_deps\" ] || f_deps=-\n"
+    "		echo \"$f_name $f_ver $f_arch $f_sha $f_url $f_deps\"\n"
     "		return 0\n"
     "	done < \"$INDEX\"\n"
     "	return 1\n"
@@ -379,14 +388,64 @@ static const char initramfs_bpkg[] =
     "	echo \"bpkg: index updated from $INDEX_URL\"\n"
     "}\n"
     "\n"
+    "# is_installed <name> -> 0 if the package already has recorded metadata.\n"
+    "is_installed() { [ -f \"$INSTALLED/$1.ver\" ]; }\n"
+    "\n"
+    "# resolve_deps <name> <seen...> - print the transitive install order for\n"
+    "# <name> (its uninstalled deps first, deepest-first, then <name> itself), one\n"
+    "# package per line, de-duplicated. Cycle-safe via <seen> (the resolution\n"
+    "# stack). POSIX sh has no locals, so EACH recursive call is captured in $(...)\n"
+    "# - that isolates the child's clobbering of positionals/d_* from this frame.\n"
+    "resolve_deps() {\n"
+    "	d_name=\"$1\"; shift; d_seen=\"$*\"\n"
+    "	is_installed \"$d_name\" && return 0\n"
+    "	d_line=\"$(find_pkg \"$d_name\")\" || { err \"package '$d_name' not found for arch $(uname -m)\"; exit 1; }\n"
+    "	# 6th field of the normalized line is deps ('-' when none).\n"
+    "	d_deps=\"${d_line##* }\"\n"
+    "	d_out=\n"
+    "	if [ \"$d_deps\" != \"-\" ] && [ -n \"$d_deps\" ]; then\n"
+    "		old_ifs=\"$IFS\"; IFS=','\n"
+    "		# shellcheck disable=SC2086\n"
+    "		set -- $d_deps\n"
+    "		IFS=\"$old_ifs\"\n"
+    "		for dep in \"$@\"; do\n"
+    "			[ -n \"$dep\" ] || continue\n"
+    "			case \" $d_seen $d_name \" in *\" $dep \"*) continue ;; esac\n"
+    "			# Capture the child's order in a subshell so it cannot clobber\n"
+    "			# this frame's d_name / d_deps / positionals.\n"
+    "			sub=\"$(resolve_deps \"$dep\" $d_seen \"$d_name\")\"\n"
+    "			d_out=\"$d_out$sub\n"
+    "\"\n"
+    "		done\n"
+    "	fi\n"
+    "	# Emit deps (in order, de-duped against this frame) then the package itself.\n"
+    "	printf '%s' \"$d_out\" | while read -r p; do\n"
+    "		[ -n \"$p\" ] || continue\n"
+    "		echo \"$p\"\n"
+    "	done\n"
+    "	echo \"$d_name\"\n"
+    "}\n"
+    "\n"
+    "# cmd_install <name> - resolve deps transitively, then install each package in\n"
+    "# dependency order (deps before dependents), skipping anything already present.\n"
     "cmd_install() {\n"
     "	[ $# -eq 1 ] || usage\n"
-    "	name=\"$1\"\n"
     "	need_index\n"
+    "	if is_installed \"$1\"; then echo \"bpkg: $1 already installed\"; return 0; fi\n"
+    "	order=\"$(resolve_deps \"$1\")\"\n"
+    "	for pkg in $order; do\n"
+    "		is_installed \"$pkg\" && continue\n"
+    "		[ \"$pkg\" = \"$1\" ] || echo \"bpkg: $1 depends on $pkg\"\n"
+    "		do_install \"$pkg\"\n"
+    "	done\n"
+    "}\n"
     "\n"
+    "# do_install <name> - fetch, verify sha256, extract, record metadata for a\n"
+    "# SINGLE package whose deps are already satisfied. No recursion happens here.\n"
+    "do_install() {\n"
+    "	name=\"$1\"\n"
     "	line=\"$(find_pkg \"$name\")\"\n"
     "	rc=$?\n"
-    "	if [ $rc -eq 2 ]; then exit 1; fi\n"
     "	if [ $rc -ne 0 ]; then\n"
     "		err \"package '$name' not found for arch $(uname -m)\"\n"
     "		exit 1\n"
@@ -529,14 +588,21 @@ static const char initramfs_bpkg_conf[] =
  * actually passes; 'badpkg' reuses the same tarball with a wrong sha256 so the
  * reject path is exercised for real. Published for both arches (same bytes). */
 static const char initramfs_bpkg_index[] =
-    "# bpkg package index (test fixture). Fields: name version arch sha256 url\n"
+    "# bpkg package index (test fixture). Fields: name version arch sha256 url [deps]\n"
     "# The 'hello' package is published for both arches with its REAL sha256 so the\n"
     "# install path's checksum verification actually passes. 'badpkg' reuses the same\n"
     "# tarball but lists a deliberately WRONG sha256 so install must reject it.\n"
+    "# 'dep1' is a tiny dependency target; 'needsdep' carries a 6th 'deps' field\n"
+    "# (=dep1) so installing it must transitively install dep1 first - this proves\n"
+    "# real dependency resolution (not a decorative field).\n"
     "hello 1.0 x86_64 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-x86_64.tar.gz\n"
     "hello 1.0 i686 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-i686.tar.gz\n"
     "badpkg 1.0 x86_64 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00 file:///pkgs/hello-1.0-x86_64.tar.gz\n"
-    "badpkg 1.0 i686 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00 file:///pkgs/hello-1.0-i686.tar.gz\n";
+    "badpkg 1.0 i686 deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef00 file:///pkgs/hello-1.0-i686.tar.gz\n"
+    "dep1 1.0 x86_64 d64e9dff466789ba805b4559aed5da5950319d40bf7bbd2a207fa54db59faa80 file:///pkgs/dep1-1.0.tar.gz\n"
+    "dep1 1.0 i686 d64e9dff466789ba805b4559aed5da5950319d40bf7bbd2a207fa54db59faa80 file:///pkgs/dep1-1.0.tar.gz\n"
+    "needsdep 1.0 x86_64 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-x86_64.tar.gz dep1\n"
+    "needsdep 1.0 i686 c89698f1fefb1f6f38b0f6192f3fb5b86f0cafa5da9e92bef92bfee4891fcf6a file:///pkgs/hello-1.0-i686.tar.gz dep1\n";
 
 /* The 'hello-1.0' package tarball: a gzipped tar containing bin/hello whose
  * contents are exactly "hello from bpkg\n". sha256 matches the index above.
@@ -553,6 +619,25 @@ static const unsigned char initramfs_bpkg_hello_tgz[] = {
   0xdc, 0x8e, 0xc3, 0x29, 0x76, 0x97, 0xe3, 0x6e, 0xf1, 0xeb, 0x3d, 0x00,
   0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x7c, 0xe6, 0x01, 0x86,
   0x97, 0x69, 0x44, 0x00, 0x28, 0x00, 0x00};
+
+/* The 'dep1-1.0' dependency fixture: a gzipped tar containing lib/dep1.flag
+ * ("dep1 marker\n"). sha256 matches the 'dep1' index line above. Used by the
+ * dependency-resolution smoke check (needsdep -> dep1). */
+static const unsigned char initramfs_bpkg_dep1_tgz[] = {
+  0x1f, 0x8b, 0x08, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x03, 0xed, 0xd2,
+  0x4d, 0x0a, 0xc2, 0x30, 0x10, 0x40, 0xe1, 0xac, 0x3d, 0x45, 0x4e, 0x90,
+  0x66, 0x9a, 0x9f, 0x9e, 0x27, 0x62, 0x15, 0xb1, 0x82, 0x44, 0xbd, 0xbf,
+  0x69, 0xbb, 0xb2, 0xe0, 0x42, 0x21, 0x55, 0xf0, 0x7d, 0x9b, 0x09, 0xd9,
+  0x64, 0xe0, 0xc5, 0x34, 0xaa, 0x3a, 0x5b, 0x74, 0x21, 0x4c, 0xb3, 0x58,
+  0xce, 0xe9, 0x2c, 0x2e, 0xda, 0xb6, 0x0b, 0xe3, 0x28, 0xf7, 0x51, 0xac,
+  0x57, 0x3a, 0xd4, 0x5f, 0x4d, 0xa9, 0xfb, 0xf5, 0x96, 0xb2, 0xd6, 0x6b,
+  0x3c, 0xf5, 0x8b, 0x4c, 0x33, 0x1c, 0xb7, 0x95, 0xff, 0xc0, 0x07, 0xfd,
+  0x63, 0x68, 0xe9, 0xbf, 0x86, 0xb9, 0xff, 0xae, 0xbf, 0x88, 0xd9, 0x0f,
+  0xe9, 0x50, 0xe5, 0x8d, 0x31, 0x70, 0xf4, 0xfe, 0x75, 0x7f, 0xf1, 0xcf,
+  0xfd, 0xc5, 0x3a, 0x27, 0x4a, 0xdb, 0x2a, 0xdb, 0x2c, 0xfc, 0x79, 0xff,
+  0xb1, 0xbc, 0x3e, 0xa7, 0x7c, 0xea, 0xf3, 0xe6, 0xdb, 0xbb, 0x00, 0x00,
+  0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0xe0, 0x7d,
+  0x0f, 0x34, 0xe9, 0x42, 0x37, 0x00, 0x28, 0x00, 0x00};
 
 /* bpkg-smoke.sh — drives the real bpkg pipeline (run via /bin/sh in test mode);
  * emits BPKG-SMOKE markers the host harness greps for. */
@@ -621,6 +706,19 @@ static const char initramfs_bpkg_smoke[] =
     "	echo \"BPKG-SMOKE: ok remove\"\n"
     "else\n"
     "	echo \"BPKG-SMOKE: fail remove\"\n"
+    "fi\n"
+    "\n"
+    "# dep-resolution: 'needsdep' carries deps=dep1 in the index. Installing it MUST\n"
+    "# transitively install 'dep1' first (its file + metadata) AND 'needsdep' itself.\n"
+    "# This proves real dependency resolution, not a parsed-but-ignored field.\n"
+    "if bpkg install needsdep >/dev/null 2>&1 \\\n"
+    "	&& [ -f \"$ROOT/lib/dep1.flag\" ] \\\n"
+    "	&& [ -f \"$ROOT/var/lib/bpkg/installed/dep1.ver\" ] \\\n"
+    "	&& [ -f \"$ROOT/var/lib/bpkg/installed/needsdep.ver\" ] \\\n"
+    "	&& [ -f \"$ROOT/bin/hello\" ]; then\n"
+    "	echo \"BPKG-SMOKE: ok dep-resolution\"\n"
+    "else\n"
+    "	echo \"BPKG-SMOKE: fail dep-resolution\"\n"
     "fi\n"
     "\n"
     "rm -f /var/lib/bpkg\n"
@@ -1321,6 +1419,8 @@ static const struct initramfs_file files[] = {
      sizeof(initramfs_bpkg_hello_tgz), 0},
     {"/pkgs/hello-1.0-i686.tar.gz", (const char *)initramfs_bpkg_hello_tgz,
      sizeof(initramfs_bpkg_hello_tgz), 0},
+    {"/pkgs/dep1-1.0.tar.gz", (const char *)initramfs_bpkg_dep1_tgz,
+     sizeof(initramfs_bpkg_dep1_tgz), 0},
     /* Applet symlinks — generated from tools/applet-manifest.conf */
     {"/bin/busybox", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
     /* M39: getty for inittab serial/tty sessions — the upstream BusyBox applet,

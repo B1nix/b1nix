@@ -10,10 +10,11 @@
 # your manual step (jsDelivr serves from the public repo over its CDN).
 #
 # Usage:
-#   tools/bpkg-publish.sh <srcdir> <name> <version> <arch> [user/repo@ref] [outdir]
+#   tools/bpkg-publish.sh <srcdir> <name> <version> <arch> [user/repo@ref] [outdir] [deps]
 #
 # Example:
 #   tools/bpkg-publish.sh ./hello-root hello 1.0 x86_64 myuser/b1nix-pkgs@main
+#   tools/bpkg-publish.sh ./tcc-root tcc 0.9.27 x86_64 "" "" dev   # depends on dev
 #
 # Arguments:
 #   srcdir       directory tree to package (its contents are tar'd from inside it,
@@ -24,6 +25,8 @@
 #   user/repo@ref  GitHub <USER>/<REPO>@<REF> for the jsDelivr URL
 #                  (default: the GH_SLUG placeholder below)
 #   outdir       where pkgs/ lives (default: ./pkgs next to the repo root)
+#   deps         OPTIONAL comma-separated dependency package names (no spaces),
+#                emitted as the index's 6th field; omit/empty for none.
 
 set -eu
 
@@ -44,6 +47,15 @@ VERSION="$3"
 ARCH="$4"
 GH_SLUG="${5:-$GH_SLUG_DEFAULT}"
 OUTDIR="${6:-$(pwd)/pkgs}"
+DEPS="${7:-}"
+
+# Normalize deps: strip spaces, reject anything that would break the flat index
+# (no whitespace, only package-name characters and commas).
+DEPS="$(printf '%s' "$DEPS" | tr -d '[:space:]')"
+case "$DEPS" in
+	'') ;;
+	*[!A-Za-z0-9._+,-]*) echo "bpkg-publish: deps must be comma-separated package names (got '$DEPS')" >&2; exit 1 ;;
+esac
 
 case "$ARCH" in
 	x86_64|i686) ;;
@@ -98,7 +110,13 @@ awk -v n="$NAME" -v a="$ARCH" '
 	/^[[:space:]]*$/ { print; next }
 	{ if ($1 == n && $3 == a) next; print }
 ' "$INDEX" > "$TMP"
-printf '%s %s %s %s %s\n' "$NAME" "$VERSION" "$ARCH" "$SHA" "$URL" >> "$TMP"
+# Emit 5 fields for dependency-free packages (legacy-compatible), 6 fields with
+# the optional comma-separated deps appended otherwise.
+if [ -n "$DEPS" ]; then
+	printf '%s %s %s %s %s %s\n' "$NAME" "$VERSION" "$ARCH" "$SHA" "$URL" "$DEPS" >> "$TMP"
+else
+	printf '%s %s %s %s %s\n' "$NAME" "$VERSION" "$ARCH" "$SHA" "$URL" >> "$TMP"
+fi
 mv "$TMP" "$INDEX"
 
 echo "bpkg-publish: wrote $TARBALL"

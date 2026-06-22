@@ -832,6 +832,7 @@ check_output "$LOG" "BPKG-SMOKE: ok install" "bpkg install verifies sha256 and e
 check_output "$LOG" "BPKG-SMOKE: ok list" "bpkg list reports the installed package"
 check_output "$LOG" "BPKG-SMOKE: ok checksum-reject" "bpkg install rejects a wrong sha256"
 check_output "$LOG" "BPKG-SMOKE: ok remove" "bpkg remove deletes files and metadata"
+check_output "$LOG" "BPKG-SMOKE: ok dep-resolution" "bpkg install resolves dependencies transitively"
 check_output "$LOG" "BPKG-SMOKE: done" "bpkg smoke completes"
 check_output "$LOG" "M22-POLISH: start" "M22 Polish starts"
 check_output "$LOG" "M22-POLISH: ok utility-flags" "M22 Polish utility flags verify"
