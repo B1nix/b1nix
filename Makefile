@@ -1021,6 +1021,16 @@ iso-live: root-image $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
+# Installer ISO: a live ISO that ALSO carries b1nix-disk.img so that, after
+# booting it, `b1nix_install /dev/<disk>` installs b1nix to that disk (the
+# installer auto-finds /mnt/iso/boot/b1nix-disk.img). Needs disk-image (root for
+# losetup/grub-install — passwordless sudo or run as root). Bigger ISO since it
+# ships both the live rootfs.img and the disk image.
+disk-iso: disk-image iso-live
+	cp $(BUILD_DIR)/b1nix-disk.img $(BUILD_DIR)/iso-live/boot/b1nix-disk.img
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-installer.iso $(BUILD_DIR)/iso-live
+	@printf 'created %s\n  boot it, then run:  b1nix_install /dev/<target-disk>\n' "$(BUILD_DIR)/b1nix-installer.iso"
+
 iso-test: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
