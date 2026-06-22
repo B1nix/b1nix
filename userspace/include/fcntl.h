@@ -15,6 +15,7 @@ extern "C" {
 #define O_APPEND    0x0400
 #define O_CLOEXEC   0x0800
 #define O_NONBLOCK  0x4000
+#define O_NDELAY    O_NONBLOCK
 #define O_DIRECTORY 0x10000
 #define O_NOFOLLOW  0x20000
 #define O_NOCTTY    0x0100

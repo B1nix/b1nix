@@ -430,3 +430,8 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
   errno = ENOSYS;
   return -1;
 }
+
+/* futimes: set a file's times by fd. b1nix has no per-fd time syscall; accept
+ * and report success (timestamps are cosmetic for content_shell's use). */
+struct timeval;
+int futimes(int fd, const struct timeval tv[2]) { (void)fd; (void)tv; return 0; }

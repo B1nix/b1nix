@@ -8,6 +8,7 @@ extern "C" {
 #endif
 
 int utimes(const char *filename, const struct timeval times[2]);
+int futimes(int fd, const struct timeval times[2]);
 
 /* Interval timers. b1nix has no SIGALRM-driven interval timer yet, so
  * setitimer/getitimer are accepted no-ops (BusyBox ping uses them only to

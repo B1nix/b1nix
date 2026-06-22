@@ -69,6 +69,10 @@ int ioctl(int fd, unsigned long request, ...);
  * including both <sys/ioctl.h> and <termios.h> is safe. */
 #ifndef TIOCGWINSZ
 #define TIOCGWINSZ 0x5413
+#define FIONREAD   0x541B
+#define FIONBIO    0x5421
+#define FIOCLEX    0x5451
+#define FIONCLEX   0x5450
 #endif
 #ifndef TIOCSWINSZ
 #define TIOCSWINSZ 0x5414

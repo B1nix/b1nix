@@ -168,6 +168,7 @@ int chmod(const char *path, unsigned int mode);
 int fchmod(int fd, unsigned int mode);
 int ftruncate(int fd, off_t length);
 int truncate(const char *path, off_t length);
+#define ftruncate64 ftruncate
 
 #define F_OK 0
 #define X_OK 1
