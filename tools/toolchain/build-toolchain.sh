@@ -122,6 +122,25 @@ if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
     cd ..
 fi
 
+# Use LLVM lld as the cross linker (b1nix userspace is lld-based). GNU ld 2.41
+# chokes ("failed to set dynamic section sizes: bad value") on the big shared,
+# TLS-heavy links (libLLVM.so etc.); lld handles b1nix shared objects correctly.
+# Keep the binutils ld as ld.bfd. Re-point on every run so a fresh binutils
+# install doesn't silently restore the GNU ld.
+LLD_BIN="$(command -v ld.lld || echo /usr/bin/ld.lld)"
+if [ -x "$LLD_BIN" ]; then
+    for bindir in "$PREFIX/$TARGET/bin" "$PREFIX/bin"; do
+        [ -d "$bindir" ] || continue
+        if [ "$bindir" = "$PREFIX/$TARGET/bin" ]; then
+            [ -e "$bindir/ld.bfd" ] || cp -P "$bindir/ld" "$bindir/ld.bfd" 2>/dev/null || true
+            ln -sf "$LLD_BIN" "$bindir/ld"
+            ln -sf "$LLD_BIN" "$bindir/ld.lld"
+        else
+            ln -sf "$LLD_BIN" "$bindir/${TARGET}-ld.lld"
+        fi
+    done
+fi
+
 # ── 4b. Stage the b1nix libc headers into the sysroot ───────────────────────
 # cross-GCC is configured with --enable-threads=posix, so libgcc's gthr-posix
 # (#include <pthread.h>) needs the b1nix headers visible in the sysroot. They
@@ -132,6 +151,16 @@ if [ ! -f "$B1NIX_ROOTFS/include/pthread.h" ]; then
     echo "Staging b1nix libc headers into sysroot ($B1NIX_ROOTFS)..."
     make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
 fi
+
+# Empty stub archives for libs that b1nix folds into libc (pthread/rt/dl are all
+# in libc, musl-style). Software and GCC target libs link `-lpthread`/`-lrt`/
+# `-ldl`; provide empty archives so those links resolve instead of failing.
+for _stubdir in "$SYSROOT/usr/lib" "$SYSROOT/lib" "$PREFIX/$TARGET/lib"; do
+    [ -d "$_stubdir" ] || mkdir -p "$_stubdir" 2>/dev/null || continue
+    for _stub in libpthread librt libdl; do
+        [ -f "$_stubdir/$_stub.a" ] || "$PREFIX/bin/${TARGET}-ar" rcs "$_stubdir/$_stub.a" 2>/dev/null || true
+    done
+done
 
 # ── 5. Build cross-GCC ───────────────────────────────────────────────────────
 if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
@@ -146,7 +175,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --disable-nls \
         --enable-languages=c,c++ \
         --without-headers \
-        --disable-shared \
+        --enable-shared \
         --disable-multilib \
         --enable-threads=posix \
         --disable-libgomp \
@@ -155,7 +184,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --disable-libquadmath \
         --with-newlib \
         --with-system-zlib \
-        --without-isl \
+        --with-isl \
         ${GMP_FLAG:+"$GMP_FLAG"} \
         ${MPFR_FLAG:+"$MPFR_FLAG"} \
         ${MPC_FLAG:+"$MPC_FLAG"} \
@@ -164,6 +193,13 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
     make install-gcc install-target-libgcc MAKEINFO=true
     cd ..
 fi
+
+# GCC's fixincludes emits a standalone include-fixed/stdlib.h that SHADOWS the
+# complete b1nix <stdlib.h> with an incomplete copy (missing C99 lldiv/atoll/
+# strtold/_Exit), which breaks libstdc++ <cstdlib> (`using ::strtold;`) for any
+# C++ port (LLVM/rustc). b1nix headers are ours and complete — drop the bogus
+# shadow so the real header is used.
+rm -f "$PREFIX"/lib/gcc/"$TARGET"/*/include-fixed/stdlib.h 2>/dev/null || true
 
 # ── 6. Build target C++ standard library ──────────────────────────────────────
 # The native GCC port (tools/toolchain/build-native-toolchain.sh) cross-compiles GCC's own
@@ -183,7 +219,7 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
             --disable-nls \
             --enable-languages=c,c++ \
             --without-headers \
-            --disable-shared \
+            --enable-shared \
             --disable-multilib \
             --enable-threads=posix \
             --disable-libgomp \
@@ -192,7 +228,7 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
             --disable-libquadmath \
             --with-newlib \
             --with-system-zlib \
-            --without-isl \
+            --with-isl \
             ${GMP_FLAG:+"$GMP_FLAG"} \
             ${MPFR_FLAG:+"$MPFR_FLAG"} \
             ${MPC_FLAG:+"$MPC_FLAG"} \
@@ -200,7 +236,12 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
         cd ..
     fi
     cd build-gcc
-    make -j"$NPROC" all-target-libstdc++-v3 MAKEINFO=true
+    # Build libstdc++ with -fPIC. b1nix has no default-PIE, and libstdc++'s own
+    # configure forces enable_shared=no on this newlib/elf target, so the static
+    # libstdc++.a/libsupc++.a would be non-PIC and unusable in shared objects
+    # (libLLVM.so, any C++ .so). -fPIC keeps the static archives PIC-foldable.
+    make -j"$NPROC" all-target-libstdc++-v3 MAKEINFO=true \
+        CXXFLAGS_FOR_TARGET="-g -O2 -fPIC" CFLAGS_FOR_TARGET="-g -O2 -fPIC"
     make install-target-libstdc++-v3 MAKEINFO=true
     cd ..
 fi

@@ -82,6 +82,31 @@ with open(b1nix_h_path, "w", encoding="utf-8") as f:
 #undef STANDARD_STARTFILE_PREFIX
 #define STANDARD_STARTFILE_PREFIX "/lib/"
 
+/* b1nix supports shared objects (runtime ELF loader = M30 startup linker +
+ * M69 dlopen). Teach the driver to actually produce ET_DYN for -shared/-pie:
+ *   - LINK_SPEC: forward -shared/-static/-pie to the linker (the inherited ELF
+ *     spec left *link: empty, so -shared was swallowed and ld emitted EXEC).
+ *   - STARTFILE/ENDFILE: use the PIC crtbeginS.o/crtendS.o for shared/pie and
+ *     drop crt0 (a shared object has no _start); a static exe keeps crt0 +
+ *     crtbegin.o/crtend.o.
+ *   - LIB_SPEC: link -lc even for -shared so a .so resolves its libc symbols
+ *     (against the shared libc.so.1 when staged, else the static libc.a). */
+#undef LINK_SPEC
+#define LINK_SPEC "%{shared:-shared} %{static:-static} %{pie:-pie} \\
+  %{!shared:%{!static:%{rdynamic:-export-dynamic}}}"
+
+#undef STARTFILE_SPEC
+#define STARTFILE_SPEC \\
+  "%{!shared:%{!symbolic: \\
+     %{pg:gcrt0.o%s}%{!pg:%{p:mcrt0.o%s}%{!p:crt0.o%s}}}} \\
+   %{shared|pie:crtbeginS.o%s;:crtbegin.o%s}"
+
+#undef ENDFILE_SPEC
+#define ENDFILE_SPEC "%{shared|pie:crtendS.o%s;:crtend.o%s}"
+
+#undef LIB_SPEC
+#define LIB_SPEC "%{!p:%{!pg:-lc}}%{p:-lc_p}%{pg:-lc_p}"
+
 #endif
 """))
 
@@ -95,17 +120,56 @@ if "x86_64-*-b1nix*" not in content:
 aarch64*-*-elf | aarch64*-*-rtems*)""")
     replacement = clean("""case ${host} in
 x86_64-*-b1nix*)
-	extra_parts="$extra_parts crtbegin.o crtend.o"
-	tmake_file="$tmake_file i386/t-crtstuff t-fdpbit"
+	extra_parts="$extra_parts crtbegin.o crtend.o crtbeginS.o crtendS.o"
+	tmake_file="$tmake_file t-slibgcc t-slibgcc-elf-ver t-slibgcc-gnu i386/t-crtstuff t-crtstuff-pic"
 	;;
 i[34567]86-*-b1nix*)
-	extra_parts="$extra_parts crtbegin.o crtend.o"
-	tmake_file="$tmake_file i386/t-crtstuff t-fdpbit"
+	extra_parts="$extra_parts crtbegin.o crtend.o crtbeginS.o crtendS.o"
+	tmake_file="$tmake_file t-slibgcc t-slibgcc-elf-ver t-slibgcc-gnu i386/t-crtstuff t-crtstuff-pic"
 	;;
 aarch64*-*-elf | aarch64*-*-rtems*)""")
     content = content.replace(host_case, replacement)
     with open(config_host_path, "w", encoding="utf-8") as f:
         f.write(content)
+
+# 3b. libgcc/configure: force PICFLAG=-fPIC for b1nix. The generic
+# `i[34567]86-*-* | x86_64-*-*` case selects -fpic, but the soft-float TFmode and
+# unwind `_s` objects emit R_X86_64_32S under -fpic, which lld rejects when
+# linking the shared libgcc_s.so. Insert a b1nix case before the generic one.
+libgcc_configure_path = os.path.join(gcc_dir, "libgcc/configure")
+if os.path.exists(libgcc_configure_path):
+    with open(libgcc_configure_path, "r", encoding="utf-8", errors="ignore") as f:
+        content = clean(f.read())
+    if "x86_64-*-b1nix*" not in content:
+        anchor = clean("""    # Some targets support both -fPIC and -fpic, but prefer the latter.
+    # FIXME: Why?
+    i[34567]86-*-* | x86_64-*-*)
+\tPICFLAG=-fpic
+\t;;""")
+        if anchor in content:
+            b1nix_pic = clean("""    x86_64-*-b1nix* | i[34567]86-*-b1nix*)
+\tPICFLAG=-fPIC
+\t;;
+""")
+            content = content.replace(anchor, b1nix_pic + anchor, 1)
+            with open(libgcc_configure_path, "w", encoding="utf-8") as f:
+                f.write(content)
+
+# 3c. libgcc/Makefile.in: the shared (`_s`) object compile must include
+# $(PICFLAG). Upstream relies on the host gcc defaulting to PIE (so _s code is
+# PIC even without the flag); the b1nix cross gcc has no default PIE, so the
+# soft-float/unwind `_s` objects come out non-PIC and lld rejects them in
+# libgcc_s.so. Append $(PICFLAG) to gcc_s_compile so the shared objects are PIC.
+libgcc_makefile_in = os.path.join(gcc_dir, "libgcc/Makefile.in")
+if os.path.exists(libgcc_makefile_in):
+    with open(libgcc_makefile_in, "r", encoding="utf-8", errors="ignore") as f:
+        content = clean(f.read())
+    old = "gcc_s_compile = $(gcc_compile) -DSHARED\n"
+    new = "gcc_s_compile = $(gcc_compile) -DSHARED $(PICFLAG)\n"
+    if old in content and "$(PICFLAG)\n" not in content.split("gcc_s_compile")[1][:60]:
+        content = content.replace(old, new, 1)
+        with open(libgcc_makefile_in, "w", encoding="utf-8") as f:
+            f.write(content)
 
 # 4. Modify gcc/system.h
 system_h_path = os.path.join(gcc_dir, "gcc/system.h")

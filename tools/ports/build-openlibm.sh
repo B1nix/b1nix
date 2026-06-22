@@ -60,7 +60,7 @@ fi
 
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix -Wno-implicit-function-declaration
+  -O2 -fPIC -fno-strict-aliasing -Db1nix -Wno-implicit-function-declaration
   -D__BSD_VISIBLE=1
   -I$SRC_DIR -I$SRC_DIR/src -I$SRC_DIR/include -I$SRC_DIR/$OLM_ARCH
   -I$SRC_DIR/bsdsrc"
