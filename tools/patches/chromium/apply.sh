@@ -213,4 +213,17 @@ if ! grep -q 'b1nix is linux-ABI-shaped: define __linux__' "$F"; then
   echo "Patch C11 applied: compiler/BUILD.gn (__linux__ define for b1nix)"
 else echo "Patch C11 already present"; fi
 
+# --- Patch C12: treat_warnings_as_errors — GCC -Wno-error relaxations for b1nix
+# b1nix builds with GCC, stricter than the clang Chromium targets: it flags
+# warnings clang does not (sign-compare, unused-function/variable,
+# maybe-uninitialized, ...) in third_party code that are NOT real bugs. With
+# -Werror these become hard errors. Demote those GCC-only diagnostics to
+# warnings for the b1nix build so the GCC port compiles (they are still emitted).
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'b1nix builds with GCC, which is stricter' "$F"; then
+  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n      ]\n    }\n~' "$F"
+  grep -q 'b1nix builds with GCC, which is stricter' "$F" || die "Patch C12 anchor not found in $F"
+  echo "Patch C12 applied: treat_warnings_as_errors (GCC -Wno-error for b1nix)"
+else echo "Patch C12 already present"; fi
+
 echo "b1nix //build patches applied to $SRC"

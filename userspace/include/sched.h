@@ -20,6 +20,12 @@ int sched_getcpu(void);
 struct sched_param {
   int sched_priority;
 };
+/* Chromium port: b1nix scheduling is nice-based only (no real policies).
+ * getscheduler always reports SCHED_OTHER; setscheduler accepts SCHED_OTHER and
+ * rejects others (EINVAL); getparam reports priority 0. Honest, not faked. */
+int sched_setscheduler(int pid, int policy, const struct sched_param *param);
+int sched_getscheduler(int pid);
+int sched_getparam(int pid, struct sched_param *param);
 int sched_get_priority_max(int policy);
 int sched_get_priority_min(int policy);
 

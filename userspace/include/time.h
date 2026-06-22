@@ -54,6 +54,17 @@ char *ctime(const time_t *timep);
 
 #define CLOCK_REALTIME 0
 #define CLOCK_MONOTONIC 1
+/* Additional POSIX/Linux clock ids (added for the Chromium port, M60-62).
+ * b1nix has no separate boot/raw/CPU-time clocks yet, so the kernel maps the
+ * monotonic-family ids to the uptime monotonic clock and the CPU-time ids to a
+ * best-effort monotonic value. Values match Linux so ported software compiles
+ * and behaves sanely. */
+#define CLOCK_PROCESS_CPUTIME_ID 2
+#define CLOCK_THREAD_CPUTIME_ID  3
+#define CLOCK_MONOTONIC_RAW      4
+#define CLOCK_REALTIME_COARSE    5
+#define CLOCK_MONOTONIC_COARSE   6
+#define CLOCK_BOOTTIME           7
 
 struct timespec {
     time_t tv_sec;
@@ -86,6 +97,21 @@ static inline double difftime(time_t time1, time_t time0) {
 }
 
 static inline time_t mktime(struct tm *tm) {
+    int y = tm->tm_year + 1900;
+    int m = tm->tm_mon + 1;
+    if (m <= 2) {
+        y -= 1;
+        m += 12;
+    }
+    int d = tm->tm_mday;
+    long days = (365L * y) + (y / 4) - (y / 100) + (y / 400) + ((153 * m + 2) / 5) + d - 719468;
+    return (time_t)(days * 86400L + tm->tm_hour * 3600L + tm->tm_min * 60L + tm->tm_sec);
+}
+
+/* timegm: struct tm (UTC) -> time_t. Added for the Chromium port (M60-62).
+ * mktime above already computes a UTC epoch (it does not apply the local
+ * timezone), so timegm shares the same arithmetic. */
+static inline time_t timegm(struct tm *tm) {
     int y = tm->tm_year + 1900;
     int m = tm->tm_mon + 1;
     if (m <= 2) {

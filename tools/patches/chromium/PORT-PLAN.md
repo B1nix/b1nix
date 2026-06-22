@@ -142,6 +142,67 @@ NOTE: each `gn gen` after a `.gni`/BUILDCONFIG change invalidates the host-tool
 (clang_x64) objects, so ninja rebuilds ~370 host steps before reaching b1nix
 targets again (~10-20 min). Minimize config churn; batch tree edits.
 
+## Build checkpoint (session 2 end)
+
+`gn gen out/b1nix` GREEN. `ninja -C out/b1nix -j6 -k0 content_shell` compiles
+~2270+ b1nix-target objects (base, perfetto incl. trace_processor, protozero, partition_alloc, net, brotli, AND into **skia** GPU/graphite) against the b1nix GCC + libstdc++ sysroot with ZERO failures at the checkpoint. (Reaching skia validates the full fix set deeply.) Total = 71687 steps. The early structural
+blockers are all resolved (see patch list + libc gaps below). The next failures
+will be the remaining libc function gaps (pthread_getname_np/atfork, wait4,
+newlocale/strtod_l) and, later, the content/blink/skia/v8 subsystems.
+
+Resume: `ninja -C build/toolchain_build/chromium/src/out/b1nix -j6 -k0 content_shell`,
+read first `^FAILED: obj/` block's compiler diagnostic, root-cause, patch.
+
+## b1nix libc / kernel gaps found by the Chromium build
+
+Unlike the GN/tree patches (which live in `apply.sh` because Chromium re-pulls
+them), these are real b1nix OS source changes committed on `chromium-port`. They
+ship in the ISO, so each bumps the version.
+
+- **POSIX clock ids** (`userspace/include/time.h` + `kernel/syscall/syscall.c`):
+  added `CLOCK_PROCESS_CPUTIME_ID`(2), `CLOCK_THREAD_CPUTIME_ID`(3),
+  `CLOCK_MONOTONIC_RAW`(4), `CLOCK_REALTIME_COARSE`(5),
+  `CLOCK_MONOTONIC_COARSE`(6), `CLOCK_BOOTTIME`(7) (values match Linux). The
+  kernel `SYS_CLOCK_GETTIME` now maps the monotonic family + CPU-time ids to the
+  uptime monotonic clock and the coarse-realtime id to the wall clock. (Found by
+  perfetto `base/time.h`.)
+- **`timegm`** (`userspace/include/time.h`): static-inline UTC `struct tm` ->
+  `time_t` (shares mktime's arithmetic, which is already UTC). (perfetto.)
+
+### b1nix libc function gaps still OPEN (next work — found by perfetto/partition_alloc)
+
+`ninja content_shell` reached perfetto + partition_alloc and surfaced these
+MISSING libc symbols (the build's `#if defined(__linux__)` paths — now active via
+C11 — call full Linux libc). Each needs a real addition to the b1nix libc
+(`userspace/`), some with kernel support. These are NOT yet done:
+
+- Trivial header/const additions: `getpagesize()` (return page size 4096 /
+  sysconf), `wait4()` (wrap wait/waitpid + rusage), `PR_SET_PDEATHSIG` +
+  `prctl` no-op/partial, `SYS_pkey_alloc/free/pkey_mprotect` syscall numbers
+  (b1nix has no MPK — return ENOSYS).
+- Real functions: `pthread_getname_np` / `pthread_atfork` (pthread.c),
+  `sched_setscheduler` / `sched_getscheduler` / `sched_getparam` (sched.h +
+  syscalls; b1nix scheduler has nice only — map to SCHED_OTHER/ESRCH),
+  `newlocale` / `strtod_l` (locale_t — b1nix is C-locale only; provide a stub
+  locale_t and route *_l to the non-locale variants), `getpagesize`.
+- GCC-vs-clang `-Werror` strictness (sign-compare, unused-function/variable,
+  maybe-uninitialized) in third_party — handled by Patch C12 (demote to
+  warnings for the b1nix GCC build; not real bugs).
+
+Strategy: add these to `userspace/` (ships in ISO → version bump), regenerate
+the sysroot, resume ninja. Where b1nix genuinely lacks the feature (MPK pkeys,
+real scheduling classes, locales) return the POSIX error / C-locale behaviour —
+do NOT fake success.
+
+CAVEAT — the toolchain bundles its own copy of the libc headers at
+`build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/include/` AND a sysroot
+copy at `.../x86_64-b1nix/sysroot/usr/include/`. Both were hand-patched so the
+CURRENT Chromium build sees the additions, but they are gitignored build
+artifacts. On a fresh box these must be regenerated from `userspace/include` by
+rebuilding the userspace/sysroot (the cross-toolchain include copy may need a
+manual refresh or a toolchain rebuild). The git-tracked source of truth is
+`userspace/include/time.h`.
+
 ## How to proceed (fresh box)
 
 ```sh

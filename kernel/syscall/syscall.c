@@ -3497,11 +3497,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     int clk_id = (int)arg0;
     struct timespec ktp;
     u64 ticks = scheduler_get_uptime_ticks();
-    if (clk_id == 1 /* CLOCK_MONOTONIC */) {
+    /* Monotonic family: CLOCK_MONOTONIC(1), CLOCK_PROCESS_CPUTIME_ID(2),
+     * CLOCK_THREAD_CPUTIME_ID(3), CLOCK_MONOTONIC_RAW(4),
+     * CLOCK_MONOTONIC_COARSE(6), CLOCK_BOOTTIME(7) -> uptime monotonic clock.
+     * b1nix has no separate boot/raw clocks and no fine-grained per-task CPU
+     * accounting, so the CPU-time ids are a best-effort monotonic value (added
+     * for the Chromium port; values match Linux). CLOCK_REALTIME(0) and
+     * CLOCK_REALTIME_COARSE(5) -> wall clock. */
+    if (clk_id == 1 || clk_id == 2 || clk_id == 3 || clk_id == 4 ||
+        clk_id == 6 || clk_id == 7) {
       ktp.tv_sec = (i64)(ticks / 100);
       ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
     } else {
-      /* CLOCK_REALTIME: epoch-based wall clock from RTC boot offset. */
+      /* CLOCK_REALTIME / CLOCK_REALTIME_COARSE: epoch-based wall clock. */
       ktp.tv_sec = (i64)vfs_get_unix_time();
       ktp.tv_nsec = (i64)((ticks % 100) * 10000000);
     }
