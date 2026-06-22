@@ -973,3 +973,47 @@ ctor/dtor markers).
   loaded as `.so`) plus general shared-library support. **NOT** required for the
   static native rustc (M68) — that statically links its LLVM backend; this only
   removes the "no dynamic loading" ceiling.
+
+## M70: Interrupt-Driven I/O
+
+- [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,
+  ~100 Hz NIC poll; real AHCI ≈0.5 MB/s) with ISR→wakeup completion.
+
+## M71: ASLR and PIE-by-Default
+
+- [ ] `planned` Randomize the load base (fixed at `0x2000000`/`PIE_LOAD_BASE`,
+  no randomization) and accept `-fPIE -pie` hardened binaries.
+
+## M72: Writable Foreign Filesystems and msync
+
+- [ ] `planned` Add write support for NTFS/FAT32/exFAT/btrfs (currently
+  read-only) and a `msync` syscall (MAP_SHARED only flushes on fsync/umount).
+
+## M73: Modern I/O and Introspection Syscalls
+
+- [ ] `planned` Add `io_uring`, `sendfile`, `splice`, `copy_file_range`,
+  `inotify`, `ptrace`, `statx`, `clone3`, `fallocate`.
+
+## M74: Real-Time Signals
+
+- [ ] `planned` Add `SIGRTMIN..SIGRTMAX` and `sigqueue` payload queuing.
+
+## M75: On-Device GPU Path
+
+- [ ] `planned` Add EGL/GBM/DRI + LLVMpipe (GPU is virtio-gpu only today);
+  unblocks the Chromium GPU process and HW rendering on real hardware.
+
+## M76: USB Host Stack
+
+- [ ] `planned` Add a general xHCI stack (HID + mass storage); input is PS/2 +
+  narrow xHCI keyboard only.
+
+## M77: Raise Global Resource Caps
+
+- [ ] `planned` Raise/make-dynamic hard caps: TCP conns (64), VFS pipes (128),
+  core-dump size (1 MiB), `SHMMAX` (32 MiB).
+
+## M78: i686 Userspace SMP
+
+- [ ] `planned` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
+  runs userspace on APs (currently BSP-pinned).
