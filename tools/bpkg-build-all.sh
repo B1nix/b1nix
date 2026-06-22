@@ -32,11 +32,11 @@ gclock|1.0|bin/gclock
 gterm|1.0|bin/gterm
 gdesktop|1.0|bin/gdesktop
 gabout|1.0|bin/gabout
-curl|8.11|bin/curl
-wget|1.25|bin/wget
-dropbear|2024|bin/dropbear bin/dbclient bin/dropbearkey
-make|4.4|bin/make
-openssl|3.4|bin/openssl
+curl|8.20.0|bin/curl
+wget|1.21.4|bin/wget
+dropbear|2022.83|bin/dropbearmulti bin/dropbear bin/dbclient bin/dropbearkey
+make|3.82|bin/make
+openssl|1.1.1w|bin/openssl
 netsurf|3.11|bin/netsurf-fb
 '
 
