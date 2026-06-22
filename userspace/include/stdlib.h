@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <sys/cdefs.h>  /* __THROW (noexcept in C++) — glibc-compatible specs */
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -40,13 +41,13 @@ typedef struct {
 void  abort(void) __attribute__((noreturn));
 void  exit(int status) __attribute__((noreturn));
 void  _Exit(int status) __attribute__((noreturn));
-void *malloc(size_t size);
-int posix_memalign(void **memptr, size_t alignment, size_t size);
-void *aligned_alloc(size_t alignment, size_t size);
-void *memalign(size_t alignment, size_t size);
-void  free(void *ptr);
-void *calloc(size_t nmemb, size_t size);
-void *realloc(void *ptr, size_t size);
+void *malloc(size_t size) __THROW;
+int posix_memalign(void **memptr, size_t alignment, size_t size) __THROW;
+void *aligned_alloc(size_t alignment, size_t size) __THROW;
+void *memalign(size_t alignment, size_t size) __THROW;
+void  free(void *ptr) __THROW;
+void *calloc(size_t nmemb, size_t size) __THROW;
+void *realloc(void *ptr, size_t size) __THROW;
 int   atoi(const char *s);
 long long atoll(const char *s);
 lldiv_t lldiv(long long numer, long long denom);

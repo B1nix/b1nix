@@ -275,6 +275,12 @@ int atoi(const char *s)
 static char *empty_env[] = { NULL };
 char **environ = empty_env;
 
+/* glibc-compat program-name globals (used by Chromium's set_process_title). Set
+ * from argv[0] by crt0 startup when available; default to a harmless name so the
+ * symbols resolve even for binaries that don't populate them. */
+char *program_invocation_name = (char *)"b1nix";
+char *program_invocation_short_name = (char *)"b1nix";
+
 char *getenv(const char *name)
 {
 	if (!name || !environ) return NULL;

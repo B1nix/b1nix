@@ -8,7 +8,7 @@
 extern "C" {
 #endif
 
-size_t malloc_usable_size(void *ptr);
+size_t malloc_usable_size(void *ptr) __THROW;
 
 /* struct mallinfo (added for the Chromium port, M60-62). The classic glibc
  * layout; partition_alloc's allocator_shim defines mallinfo()/mallinfo2() for
@@ -26,7 +26,7 @@ struct mallinfo {
   int fordblks;
   int keepcost;
 };
-struct mallinfo mallinfo(void);
+struct mallinfo mallinfo(void) __THROW;
 
 struct mallinfo2 {
   size_t arena;
@@ -40,7 +40,7 @@ struct mallinfo2 {
   size_t fordblks;
   size_t keepcost;
 };
-struct mallinfo2 mallinfo2(void);
+struct mallinfo2 mallinfo2(void) __THROW;
 
 #ifdef __cplusplus
 }

@@ -16,6 +16,12 @@ int *__errno_location(void);
    Returns EIO for out-of-range codes. */
 int normalize_errno(long rc);
 
+/* glibc extensions: the program name (argv[0]) and its basename. Used by
+   Chromium's base/process/set_process_title. Defined in libc; set from argv[0]
+   at startup. */
+extern char *program_invocation_name;
+extern char *program_invocation_short_name;
+
 #ifdef __cplusplus
 }
 #endif

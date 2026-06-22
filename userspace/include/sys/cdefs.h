@@ -62,8 +62,14 @@
 #define __USING_NAMESPACE_STD(name)
 #endif
 
+/* __restrict is a GCC/clang keyword in both C and C++. Do NOT remap it to the
+ * C99 `restrict` keyword in C++ (where `restrict` is not a keyword) — that breaks
+ * C++ code like Abseil's `void* __restrict dst`. Only alias it in C, and only if
+ * the compiler somehow lacks it. */
+#if !defined(__cplusplus) && !defined(__GNUC__) && !defined(__clang__)
 #ifndef __restrict
 #define __restrict restrict
+#endif
 #endif
 
 #ifndef __P
