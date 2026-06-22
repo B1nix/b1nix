@@ -40,6 +40,7 @@ int strerror_r(int errnum, char *buf, size_t buflen);
 char *strsignal(int sig);
 
 void *memchr(const void *s, int c, size_t n);
+void *memrchr(const void *s, int c, size_t n);
 char *strtok(char *str, const char *delim);
 char *strtok_r(char *str, const char *delim, char **saveptr);
 char *strsep(char **stringp, const char *delim);

@@ -40,6 +40,7 @@ extern char **environ;
 ssize_t write(int fd, const void *buf, size_t n);
 ssize_t read(int fd, void *buf, size_t n);
 ssize_t pread(int fd, void *buf, size_t n, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t n, off_t offset);
 /* Real syscall() function (Linux-compat). Declared BEFORE the function-like
  * syscall() macro in <syscall.h> below: direct `syscall(nr, ...)` calls still
  * hit the fast macro, but using `syscall` as a bare name (e.g. passing it to a

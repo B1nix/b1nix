@@ -224,6 +224,17 @@ rm -f "$PREFIX"/lib/gcc/"$TARGET"/*/include-fixed/stdlib.h 2>/dev/null || true
 # C++ sources (libcpp, gcc/*.cc) for x86_64-b1nix. Those include <new>, <vector>,
 # etc. and link against libstdc++. Without a target libstdc++ the native build
 # fails at libcpp with: "fatal error: new: No such file or directory".
+#
+# wchar_t: libstdc++'s configure auto-detects wide-char support by compiling a
+# probe against the sysroot <wchar.h>/<wctype.h> (the full ::wcs*/::wmem*/wide-
+# stdio set + ::wcstold/::wcstoll/::wcstoull + ::iswblank). The b1nix headers
+# staged in step 4b declare all of them, so _GLIBCXX_USE_WCHAR_T is set to 1 and
+# std::wcslen and the whole std:: wide-char family are available (required by the
+# Chromium port — abseil str_format). If those probes ever fail again, the cause
+# is a missing prototype in userspace/include/wchar.h or wctype.h, NOT this
+# script. To force a re-detect on an EXISTING build tree, delete
+# build-gcc/$TARGET/libstdc++-v3/config.cache, run ./config.status --recheck
+# then ./config.status in that dir, and rebuild all-target-libstdc++-v3.
 if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
     echo "Building target libstdc++-v3 for ${TARGET}..."
     if [ ! -f build-gcc/Makefile ]; then

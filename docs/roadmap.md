@@ -1098,3 +1098,13 @@ or ported to. The item below is parked for a future dedicated x86 maintainer.
 
 - [ ] `frozen` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
   runs userspace on APs (currently BSP-pinned).
+## M66: Chromium Browser Frontend (planned)
+
+- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
+  M62 `content_shell` renders pages, build a windowed browser frontend (address
+  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
+  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
+  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
+  itself. **Gated on M62** (the engine must render first). Lighter alternative if
+  full Chromium UI is too heavy: drive `content_shell --window-size` output into
+  a libgui window.

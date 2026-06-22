@@ -85,8 +85,9 @@ enable_one() {
     #    by C++ ports like libjxl; harmless for others (a declared-but-unused fn
     #    only fails if it is actually linked).
     for m in _GLIBCXX_USE_C99_MATH_TR1 _GLIBCXX_USE_C99_STDINT_TR1 \
-             _GLIBCXX_USE_C99_FENV_TR1 \
-             _GLIBCXX11_USE_C99_MATH _GLIBCXX98_USE_C99_MATH; do
+             _GLIBCXX_USE_C99_FENV_TR1 _GLIBCXX_USE_C99 \
+             _GLIBCXX11_USE_C99_MATH _GLIBCXX98_USE_C99_MATH \
+             _GLIBCXX11_USE_C99_STDLIB _GLIBCXX98_USE_C99_STDLIB; do
       if grep -q "/\* #undef $m \*/" "$cfg"; then
         sed -i.bak "s|/\* #undef $m \*/|#define $m 1|" "$cfg"
       fi

@@ -17,9 +17,13 @@ typedef int wint_t;
 #endif
 
 typedef unsigned long wctype_t;
+typedef const int *wctrans_t;
 
 wctype_t wctype(const char *name);
 int iswctype(wint_t wc, wctype_t desc);
+
+wctrans_t wctrans(const char *name);
+wint_t towctrans(wint_t wc, wctrans_t desc);
 
 int iswalnum(wint_t wc);
 int iswalpha(wint_t wc);

@@ -206,6 +206,86 @@ rebuilding the userspace/sysroot (the cross-toolchain include copy may need a
 manual refresh or a toolchain rebuild). The git-tracked source of truth is
 `userspace/include/time.h`.
 
+## Compile-chase frontier (session 2 end) — what is fixed vs the next big item
+
+The base/foundational layers now compile against the b1nix GCC+libstdc++ sysroot.
+Resolved this session (verified by isolated compile, rc=0): perfetto (incl.
+trace_processor), abseil (base/debugging/strings incl. the ELF symbolizer +
+raw-syscall paths), partition_alloc, boringssl urandom, skia (reached earlier),
+net/base. 15 grep-guarded GN/tree patches (C1-C15) + an extensive b1nix libc
+completion (clocks, timegm, getpagesize, sched_*, cdefs.h, inotify stubs,
+pthread_getname_np/atfork, ELF DT_*/EI_*/version-types/SHN_, fdatasync, wait4,
+locale_t/newlocale/strto*_l, mallinfo, lowercase SYS_* aliases, linux/random.h).
+
+### ✅ RESOLVED — libstdc++ rebuilt with wchar_t (`_GLIBCXX_USE_WCHAR_T 1`)
+
+abseil str_format `arg.cc` needed `std::wcslen`, which libstdc++'s `<cwchar>`
+only exposes under `#if _GLIBCXX_USE_WCHAR_T`. The b1nix cross libstdc++ (13.2.0)
+had been built with `_GLIBCXX_USE_WCHAR_T` UNDEF because its configure probe
+(compile a TU that does `using ::btowc; ... using ::wscanf;` — the FULL wide
+set, plus a separate C99 probe for `::wcstold/::wcstoll/::wcstoull` and `::wcstof`
+and a `<wctype.h>` `iswblank` probe) failed: the b1nix `<wchar.h>` declared only
+the core funcs (wcslen/wcscmp/wcschr/wmem*/mbrtowc/...), so the whole probe — and
+therefore the flag — came up `no`.
+
+**Fixed (branch `toolchain-wchar`, v0.65.1):**
+1. **`userspace/include/wchar.h`** — added every prototype the probe + `<cwchar>`
+   require: `wcsncat/wcsspn/wcscspn/wcspbrk/wcsstr/wcstok/wcsxfrm`,
+   `wcstol/wcstoul/wcstoll/wcstoull/wcstod/wcstof/wcstold`, `wcsftime`, and the
+   wide-stdio family `fgetwc/getwc/getwchar/fputwc/putwc/putwchar/ungetwc/
+   fgetws/fputws/fwide/swprintf/vswprintf/fwprintf/vfwprintf/wprintf/vwprintf/
+   swscanf/fwscanf/wscanf`. Now pulls `<stdio.h>` (FILE) + `<stdarg.h>` (va_list)
+   and forward-declares `struct tm`.
+2. **`userspace/include/wctype.h`** — added `wctrans_t`, `wctrans`, `towctrans`
+   (for `<cwctype>`). The `isw*/tow*/iswblank` family was already present.
+3. **`userspace/libc/wchar.c` + `wctype.c`** — REAL C-locale implementations:
+   wide-string ops are genuine; the numeric `wcsto*` transcode the leading ASCII
+   run to a narrow buffer and delegate to the narrow `strto*` (a C-locale number
+   is ASCII-only) with the endptr mapped back; wide stdio reads/writes UTF-8
+   bytes via narrow fgetc/fputc; the wide printf family transcodes the wide
+   format to UTF-8 and delegates to vsnprintf/vfprintf; `wscanf`/`fwscanf`/
+   `swscanf` honestly report no conversions (EOF) — not used by the ports, only
+   needed so the wchar_t config links. No fakes.
+4. **Rebuilt the cross libstdc++ with wchar_t auto-detected** (configure now sees
+   the complete sysroot headers). Exact commands (reproducible):
+   ```sh
+   # stage the completed headers into the cross sysroot + include copies
+   cp userspace/include/{wchar.h,wctype.h} build/x86_64/rootfs/include/
+   cp userspace/include/{wchar.h,wctype.h} \
+      build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/include/
+   cp userspace/include/{wchar.h,wctype.h} \
+      build/toolchain_build/x86_64-b1nix/cross/lib/gcc/x86_64-b1nix/13.2.0/include-fixed/
+   cp userspace/include/{wchar.h,wctype.h} \
+      build/toolchain_build/x86_64-b1nix/build/build-gcc/gcc/include-fixed/
+   # re-detect wchar_t in the existing libstdc++ build tree
+   cd build/toolchain_build/x86_64-b1nix/build/build-gcc/x86_64-b1nix/libstdc++-v3
+   rm -f config.cache && ./config.status --recheck && ./config.status   # -> _GLIBCXX_USE_WCHAR_T 1
+   cd ../..                                                              # build-gcc
+   make -j"$(nproc)" all-target-libstdc++-v3 MAKEINFO=true
+   make install-target-libstdc++-v3 MAKEINFO=true
+   # put the rebuilt b1nix libc (with the new wide funcs) in the sysroot
+   cp <worktree>/userspace/build/x86_64/libb1nix.a build/x86_64/rootfs/lib/libb1nix.a
+   ```
+   On a **fresh box** none of the manual cache-clearing is needed: step 4b of
+   `tools/build-toolchain.sh` stages `userspace/include/*` into the sysroot
+   *before* libstdc++ configures, so the probe passes and `_GLIBCXX_USE_WCHAR_T`
+   is set automatically (documented in build-toolchain.sh step 6).
+
+**Verified (rc=0):** the libstdc++ wchar_t/C99-wchar/wcstof/iswblank configure
+probes all compile; a `std::wcslen` + `std::wcstol` + `std::wcsstr` +
+`std::iswalpha`/`std::towupper` TU compiles **and links**; and the originally-
+failing **`third_party/abseil-cpp/.../str_format_internal/arg.o` compiles for the
+b1nix target with rc=0** (`ninja -t commands <target>` → ran the exact compile).
+
+### Other known-remaining
+- More `linux/*.h` UAPI headers may be needed as the build advances (provide the
+  constants ports actually use, like linux/random.h C-port did).
+- More `__linux__`-narrowing for raw-syscall fast paths (cf. C14 abseil mmap) —
+  watch for code that does `syscall(SYS_*)` with assumptions about Linux numbers.
+- The FINAL LINK needs `libb1nix.a` REBUILT in the sysroot (`cd userspace && make`
+  then reinstall) so the new sched_*/wait4/fdatasync/pthread_atfork/locale impls
+  are in the archive — only the HEADERS are synced into the build sysroot now.
+
 ## How to proceed (fresh box)
 
 ```sh

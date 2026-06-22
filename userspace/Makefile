@@ -59,6 +59,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \
 	$(BUILD)/libc/wchar.o \
+	$(BUILD)/libc/uchar.o \
 	$(BUILD)/libc/libgen.o \
 	$(BUILD)/libc/getopt.o \
 	$(BUILD)/libc/fnmatch.o \

@@ -51,3 +51,20 @@ int iswblank(wint_t wc) { return isblank(wc); }
 
 wint_t towlower(wint_t wc) { return tolower(wc); }
 wint_t towupper(wint_t wc) { return toupper(wc); }
+
+/* Mapping selectors for wctrans()/towctrans(). The returned wctrans_t is an
+ * opaque handle; we encode the two C-locale mappings as small sentinel ints. */
+static const int __wctrans_tolower = 1;
+static const int __wctrans_toupper = 2;
+
+wctrans_t wctrans(const char *name) {
+    if (strcmp(name, "tolower") == 0) return &__wctrans_tolower;
+    if (strcmp(name, "toupper") == 0) return &__wctrans_toupper;
+    return (wctrans_t)0;
+}
+
+wint_t towctrans(wint_t wc, wctrans_t desc) {
+    if (desc == &__wctrans_toupper) return towupper(wc);
+    if (desc == &__wctrans_tolower) return towlower(wc);
+    return wc;
+}
