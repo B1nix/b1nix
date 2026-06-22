@@ -311,4 +311,35 @@ if [ -f "$F" ] && ! grep -q 'b1nix: rust test targets' "$F"; then
   echo "Patch C18 applied: content/shell drop rust test targets"
 else echo "Patch C18 already present (or file missing)"; fi
 
+# --- Patch C19: fontconfig clang discards-qualifiers relaxation ---------------
+# fontconfig's NLS-off path expands _(x)/dgettext(d,s) to (s) and assigns the
+# resulting const char* to char* fields; the bundled clang (host toolchain
+# fontconfig build) flags this with -Werror=incompatible-pointer-types-
+# discards-qualifiers. Upstream fontconfig code, not a real bug.
+F="$SRC/third_party/fontconfig/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'discards-qualifiers' "$F"; then
+  perl -0777 -i -pe 's~(        # Work around a pointer-to-bool conversion\.\n        "-Wno-pointer-bool-conversion",\n)(      \])~${1}\n        # fontconfig _(x)/dgettext assigns const char* to char* with NLS off;\n        # clang -Werror flags discarded qualifiers (upstream code, not a bug).\n        "-Wno-incompatible-pointer-types-discards-qualifiers",\n${2}~' "$F"
+  grep -q 'discards-qualifiers' "$F" || die "Patch C19 anchor not found in $F"
+  echo "Patch C19 applied: fontconfig discards-qualifiers"
+else echo "Patch C19 already present (or file missing)"; fi
+
+# --- Patch C20: base/byte_size.h consteval ctors -> constexpr ----------------
+# The signed-integer ByteSize/ByteSizeDelta constructors are `consteval` so that
+# out-of-range CONSTANTS fail at compile time. But the KiBU()/MiBU()/... helpers
+# are `constexpr` and call ByteSize(kib) with their PARAMETER; on a C++23
+# compiler P2564 escalates KiBU to an immediate function so this works. GCC 13
+# does NOT implement P2564, so it rejects "kib is not a constant expression"
+# and base/ fails to build (byte_size.cc + ~21 files force constexpr ByteSize).
+# Relax the two ctors to `constexpr`: the value is still range-checked by
+# checked_cast (now at runtime via CHECK instead of at compile time) — honest,
+# correctness-preserving. Drop this once the cross toolchain is GCC 14+ (which
+# implements P2564 and makes the original consteval work).
+F="$SRC/base/byte_size.h"
+if [ -f "$F" ] && grep -q 'consteval explicit ByteSize' "$F"; then
+  perl -i -pe 's/^  consteval explicit ByteSize\(T bytes\)/  constexpr explicit ByteSize(T bytes)/' "$F"
+  perl -i -pe 's/^  consteval explicit ByteSizeDelta\(T bytes\)/  constexpr explicit ByteSizeDelta(T bytes)/' "$F"
+  grep -q 'consteval explicit ByteSize' "$F" && die "Patch C20 failed in $F"
+  echo "Patch C20 applied: byte_size.h consteval ctors -> constexpr"
+else echo "Patch C20 already present (or file missing)"; fi
+
 echo "b1nix //build patches applied to $SRC"

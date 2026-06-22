@@ -1108,3 +1108,25 @@ or ported to. The item below is parked for a future dedicated x86 maintainer.
   itself. **Gated on M62** (the engine must render first). Lighter alternative if
   full Chromium UI is too heavy: drive `content_shell --window-size` output into
   a libgui window.
+
+## M67: Rust Toolchain Port (for Chromium)
+
+- [ ] `planned` Port **Rust to b1nix** so Chromium's Rust components build (gates
+  M62 if the content_shell link needs them). Scope: a `x86_64-unknown-b1nix`
+  rustc target spec + a Rust **`std` platform layer** for b1nix. b1nix is already
+  `is_linux`/`__linux__` with a POSIX-ish libc (`libb1nix.a`), so the realistic
+  path is to **reuse Rust's `unix` PAL** (not write `std::sys` from scratch) via a
+  custom target + `-Zbuild-std`, linking the b1nix libc — then wire Chromium's
+  `custom_toolchain` Rust config (`rust.gni` `toolchain_has_rust`). Multi-week;
+  the single largest remaining port. Honest fallback if a clean disable is ever
+  preferred: gate the Rust touchpoints (mojo rust bindings, content/shell rust
+  demos) on `enable_rust=false` — not a one-liner but far cheaper.
+
+## M68: Native Rust Compiler (self-hosted, stretch)
+
+- [ ] `stretch` Build **rustc to run ON b1nix** (native, compiling Rust inside
+  the OS) — the Rust analog of M26 (native GCC/Binutils self-host). Gated on
+  **M67** (the Rust cross-toolchain must work first). Largest single undertaking:
+  rustc + its LLVM backend cross-compiled with `--host=x86_64-unknown-b1nix`,
+  linked against the b1nix Rust std + libc, plus cargo. Pursue only after the
+  cross Rust path proves out and there's a concrete need for in-VM Rust builds.

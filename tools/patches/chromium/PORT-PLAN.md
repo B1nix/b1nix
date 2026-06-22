@@ -433,3 +433,86 @@ Commits this sub-session on chromium-build: (libstdc++ C99) 53ed8ec,
 (uchar/memrchr/pwrite/socket) f747178, (PORT-PLAN) c259fd2,
 (PTRDIFF/endian/CLONE/from_range) f0f4ed8, (libintl/mman/relaxations/C17)
 <this batch>, (C18 rust guard) 54df9a6. Build restarted with the full fixset.
+
+### byte_size constexpr — DEEP DIAGNOSIS (don't repeat next session)
+Narrowed by isolated compiles (each rc=0 EXCEPT the last):
+- `base::checked_cast<int64_t>(param)`            -> folds OK
+- `ByteSize(1)`, `ByteSize(1).InBytes()`          -> folds OK
+- `ByteSize(1) * 1024` (literal)                  -> folds OK
+- `CheckedNumeric<int64_t> c=param; c*=1024; c.ValueOrDie()` -> folds OK
+- `checked_cast<uint64_t>(c.ValueOrDie())` w/ param-derived c -> folds OK
+- **`ByteSize(kib) * 1024` where kib is a fn PARAMETER -> FAILS** ('kib' is not
+  a constant expression / constexpr call flows off the end).
+So it's NOT checked_cast, NOT CheckedNumeric mul, NOT ValueOrDie individually —
+it is the specific composition through ByteSize's friend `operator*` -> MulImpl
+-> AsChecked() (CheckedNumeric from the `bytes_` member) -> ResultType(checked)
+ctor, when the seed value is a function parameter (works with a literal). This
+is a GCC-13 constexpr template-resolution bug, fixed in GCC 14. The C13 filter +
+C17 HandleFailure-constexpr are NOT enough. PROPER FIX = GCC-14 cross toolchain
+(also makes from_range_t/HandleFailure injections unnecessary). A Chromium-side
+workaround would have to rewrite KiBU/MiBU/.../the ByteSize operator* to avoid
+the member-AsChecked path for the constexpr-foldable widening case — invasive
+and touches base logic, so prefer the toolchain bump. ~21 non-test files force
+this constexpr eval (grep `constexpr.*=.*[KMGTPE]iBU?\(`).
+
+### byte_size constexpr — RESOLVED (C20). Real root: P2564, not CheckedNumeric.
+The deep-dive above pointed at CheckedNumeric, but the ACTUAL root was simpler:
+`base::ByteSize`/`ByteSizeDelta`'s signed-integer constructors are **consteval**
+(to reject out-of-range constants at compile time), while the KiBU()/MiBU()/...
+helpers are **constexpr** and call `ByteSize(kib)` with their PARAMETER. On a
+C++23 compiler, P2564 (immediate-function escalation) promotes the helper to an
+immediate function so the consteval call is fine. **GCC 13 does not implement
+P2564**, so it rejected "kib is not a constant expression". (That's why every
+isolated piece folded but the composed `ByteSize(param)*N` did not — `ByteSize`'s
+signed ctor was consteval, and only the param-seeded call exercised it.)
+
+FIX (C20): relax those two ctors `consteval` -> `constexpr`. The value is still
+range-checked by checked_cast — at runtime via CHECK instead of compile time —
+so it's correctness-preserving and honest, only deferring the compile-time
+out-of-range diagnostic. Verified base/base/byte_size.o rc=0. This unblocks
+base/ (the gate to net/mojo/content/blink). Drop C20 once the cross toolchain is
+GCC 14+ (implements P2564; would also retire the from_range_t + HandleFailure
+injections). M67 (GCC-14 toolchain) tracked in roadmap as the durable path.
+
+PATCH SET now C1-C20 (+ enable-cxx-toolchain.sh libstdc++ C99/wchar/from_range +
+the v0.65.2 libc additions: uchar/memrchr/pwrite/socket-consts/stdio-maxes/
+PTRDIFF/endian/CLONE/libintl/mman-msync). Build restarted with the FULL set;
+base/ now expected to compile through. Next failures (if any) will be net/mojo/
+content/blink/skia or the final LINK (libb1nix.a already rebuilt in the sysroot).
+
+## Session 4 (2026-06-22): stale toolchain headers (AGAIN) — re-synced, no new code
+
+Resumed on branch `chromium-m62-content-shell` (off main 0141019, which already
+carries C1-C20 + the v0.65.2 libc additions in `userspace/include`). The build
+had ~14000 cached objects. First `ninja -j6 -k0 content_shell` pass produced 97
+FAILED across perfetto (89), abseil (6), partition_alloc (2). EVERY failure was
+the SAME root cause as session-3 §A: the **toolchain's header copies were stale**
+relative to the v0.65.2 source headers. Specifically:
+- `cross/x86_64-b1nix/include/*` (the `$prefix/$target/include` dir GCC searches
+  by default — takes priority over `--sysroot`) and `cross/.../include-fixed/*`
+  were OLD copies missing CLOCK_BOOTTIME/timegm (`time.h`), `struct mallinfo`
+  (`malloc.h`), `pthread_atfork` (`pthread.h`), lowercase `SYS_write`/
+  `SYS_rt_sigprocmask` (`sys/syscall.h`), `Elf64_Versym/Verdef/Verdaux`
+  (`elf.h`); and `include-fixed/stdlib.h` still had the OLD `int*` sem_init/
+  sem_wait/... decls that now conflict with `<semaphore.h>`'s `sem_t*` ones.
+- The sysroot include (`build/x86_64/rootfs/include`, symlinked as the sysroot)
+  was ALSO stale (the userspace `install-headers-libs` had not been re-run after
+  the header edits landed on main).
+
+FIX (no source change — pure re-sync of gitignored build artifacts):
+  1. `make -C userspace B1NIX_ARCH=x86_64 install-headers-libs`
+     -> refreshes `build/x86_64/rootfs/include/*` + reinstalls libb1nix.a.
+  2. `sh tools/enable-cxx-toolchain.sh x86_64-b1nix`
+     -> `copy_if_changed` re-syncs `userspace/include/*` into
+       `cross/x86_64-b1nix/include/*` AND the `include-fixed/*.h` that have a
+       b1nix counterpart (this is what cleared the sem_init/stdlib.h conflict).
+All 97 failures verified rc=0 in isolation after the re-sync (perfetto time.o,
+partition_root.o, allocator_shim, abseil raw_logging/vdso_support/sem_waiter).
+Killed the contaminated ninja, restarted fresh -- partition_alloc now links,
+0 failures through icu/base.
+
+REMINDER for next resume (and a candidate durable fix): BEFORE running ninja,
+always run steps 1+2 above so the toolchain headers match `userspace/include`.
+Nothing here belongs in apply.sh -- the source headers are already correct on
+main; only the cached toolchain copies drift. (A one-liner wrapper that runs
+both before `ninja` would prevent this recurring for a 3rd time.)
