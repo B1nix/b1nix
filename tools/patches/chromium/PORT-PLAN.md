@@ -180,14 +180,17 @@ C11 — call full Linux libc). Each needs a real addition to the b1nix libc
   sysconf), `wait4()` (wrap wait/waitpid + rusage), `PR_SET_PDEATHSIG` +
   `prctl` no-op/partial, `SYS_pkey_alloc/free/pkey_mprotect` syscall numbers
   (b1nix has no MPK — return ENOSYS).
-- Real functions: `pthread_getname_np` / `pthread_atfork` (pthread.c),
-  `sched_setscheduler` / `sched_getscheduler` / `sched_getparam` (sched.h +
-  syscalls; b1nix scheduler has nice only — map to SCHED_OTHER/ESRCH),
-  `newlocale` / `strtod_l` (locale_t — b1nix is C-locale only; provide a stub
-  locale_t and route *_l to the non-locale variants), `getpagesize`.
+- DONE: `pthread_getname_np` (empty name — b1nix stores none), `pthread_atfork`
+  (real LIFO-prepare/FIFO-parent-child registry wired into the fork() libc
+  wrapper), `sys/cdefs.h` (compat macros), `sys/inotify.h` (honest ENOSYS
+  stubs — b1nix has no inotify), `getpagesize`, `sched_*`. 
+- STILL OPEN: `newlocale` / `strtod_l` (locale_t — b1nix is C-locale only;
+  provide a stub locale_t and route *_l to the non-locale variants), `wait4`.
 - GCC-vs-clang `-Werror` strictness (sign-compare, unused-function/variable,
   maybe-uninitialized) in third_party — handled by Patch C12 (demote to
-  warnings for the b1nix GCC build; not real bugs).
+  warnings for the b1nix GCC build; not real bugs). C13 filters those same
+  GCC-only flags out of bindgen's libclang invocation (bindgen parses C++ with
+  clang, which rejects them).
 
 Strategy: add these to `userspace/` (ships in ISO → version bump), regenerate
 the sysroot, resume ninja. Where b1nix genuinely lacks the feature (MPK pkeys,

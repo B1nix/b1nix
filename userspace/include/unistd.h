@@ -77,6 +77,7 @@ int fchdir(int fd);
 int chroot(const char *path);
 char *getcwd(char *buf, size_t size);
 int fsync(int fd);
+int fdatasync(int fd);  /* Chromium port: b1nix has no data-only sync; = fsync */
 void sync(void);
 unsigned int alarm(unsigned int seconds);
 

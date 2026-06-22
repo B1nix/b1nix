@@ -14,3 +14,10 @@
 /* Linux self-re-raise used by LLVM's crash signal handler. b1nix re-raises the
  * signal to the calling process (siginfo payload is not preserved). */
 #define SYS_rt_tgsigqueueinfo SYS_RT_TGSIGQUEUEINFO
+/* Added for the Chromium port (M60-62): more lowercase Linux SYS_* aliases used
+ * by abseil raw-syscall paths. These map onto the matching b1nix syscalls, so
+ * the raw syscall() calls hit the correct b1nix entry. */
+#define SYS_write SYS_WRITE
+#define SYS_read SYS_READ
+#define SYS_rt_sigprocmask SYS_SIGPROCMASK
+#define SYS_sigprocmask SYS_SIGPROCMASK

@@ -226,4 +226,45 @@ if ! grep -q 'b1nix builds with GCC, which is stricter' "$F"; then
   echo "Patch C12 applied: treat_warnings_as_errors (GCC -Wno-error for b1nix)"
 else echo "Patch C12 already present"; fi
 
+# --- Patch C13: filter_clang_args.py — drop GCC-only flags for bindgen --------
+# bindgen runs libclang to parse C++ headers and is handed the target's {{cflags}}
+# — but the b1nix target compiler is GCC, so those carry GCC-only warning options
+# (-Wno-maybe-uninitialized, -Wno-packed-not-aligned, -Wno-class-memaccess, the
+# C12 -Wno-error=* set, ...) that clang rejects with -Werror=unknown-warning
+# -option, failing every *_bindgen_generator. Filter them out in
+# filter_clang_args() (the existing libclang-arg sanitizer). They only affect
+# diagnostics, never the generated bindings.
+F="$SRC/build/rust/gni_impl/filter_clang_args.py"
+if [ -f "$F" ] && ! grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F"; then
+  perl -0777 -i -pe 's~(      elif args\[i\] == .-ftime-trace.:\n        pass\n)(      else:\n        yield args\[i\])~${1}      # b1nix port (M60-62): bindgen runs libclang to parse C++, but the b1nix\n      # target compiler is GCC, so {{cflags}} carry GCC-only warning options that\n      # clang rejects with -Werror=unknown-warning-option. Drop them here so\n      # bindgen can parse the headers (these only affect diagnostics, never the\n      # generated bindings).\n      elif args[i] in (\n          "-Wno-maybe-uninitialized",\n          "-Werror=maybe-uninitialized",\n          "-Wno-error=maybe-uninitialized",\n          "-Wno-packed-not-aligned",\n          "-Wno-class-memaccess",\n          "-Wno-error=sign-compare",\n          "-Wno-error=unused-function",\n          "-Wno-error=unused-variable",\n          "-Wno-error=unused-but-set-variable",\n          "-Wno-error=nonnull",\n          "-Wno-error=redundant-move",\n          "-Wno-redundant-move",\n          "-Wno-dangling-reference",\n          "-fno-math-errno",\n      ):\n        pass\n${2}~' "$F"
+  grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F" || die "Patch C13 anchor not found in $F"
+  echo "Patch C13 applied: filter_clang_args.py (drop GCC-only flags for bindgen)"
+else echo "Patch C13 already present (or file missing)"; fi
+
+# --- Patch C14: abseil direct_mmap.h — b1nix uses the mmap() fallback ----------
+# abseil's DirectMmap issues a RAW mmap syscall on __linux__ (syscall(SYS_mmap)).
+# b1nix defines __linux__ (C11) but its syscall NUMBERS are not Linux's, so a raw
+# Linux mmap syscall would hit the wrong b1nix syscall. abseil already has a
+# regular-mmap() fallback for non-linux; route b1nix to it by excluding b1nix
+# from the __linux__ direct-syscall guard.
+F="$SRC/third_party/abseil-cpp/absl/base/internal/direct_mmap.h"
+if [ -f "$F" ] && ! grep -q 'b1nix port (M60-62): b1nix defines __linux__ but its raw syscall' "$F"; then
+  perl -0777 -i -pe 's~(#ifdef ABSL_HAVE_MMAP\n\n#include <sys/mman.h>\n\n)#ifdef __linux__~${1}// b1nix port (M60-62): b1nix defines __linux__ but its raw syscall NUMBERS are\n// not the Linux ones, so abseil DirectMmap must NOT issue a direct mmap syscall.\n// Route b1nix through the regular mmap()/munmap() fallback below.\n#if defined(__linux__) \&\& !defined(__b1nix__)~' "$F"
+  grep -q 'b1nix port (M60-62): b1nix defines __linux__ but its raw syscall' "$F" || die "Patch C14 anchor not found in $F"
+  echo "Patch C14 applied: abseil direct_mmap.h (mmap fallback for b1nix)"
+else echo "Patch C14 already present (or file missing)"; fi
+
+# --- Patch C15: partition_alloc.gni — disable PKEYS for b1nix -----------------
+# is_pkeys_available is (is_linux||is_chromeos) && x64, which is TRUE for b1nix,
+# so partition_alloc compiles its thread_isolation/pkey.cc which issues
+# syscall(SYS_pkey_alloc/free/pkey_mprotect). b1nix has NO memory-protection-keys
+# (MPK) support and no such syscalls. Disable the feature for b1nix (honest — the
+# hardware/OS feature is genuinely absent, so it must be off, not stubbed).
+F="$SRC/base/allocator/partition_allocator/partition_alloc.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no memory-protection-keys' "$F"; then
+  perl -0777 -i -pe 's~(is_pkeys_available =\n    \(is_linux \|\| is_chromeos\) && current_cpu == "x64" && !is_cronet_build)~is_pkeys_available =\n    (is_linux || is_chromeos) \&\& current_cpu == "x64" \&\& !is_cronet_build \&\&\n    target_os != "b1nix"  # b1nix has no memory-protection-keys (MPK) support~' "$F"
+  grep -q 'b1nix has no memory-protection-keys' "$F" || die "Patch C15 anchor not found in $F"
+  echo "Patch C15 applied: partition_alloc.gni (disable pkeys for b1nix)"
+else echo "Patch C15 already present (or file missing)"; fi
+
 echo "b1nix //build patches applied to $SRC"

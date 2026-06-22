@@ -35,6 +35,30 @@ typedef uint16_t Elf64_Section;
 #define ELFMAG  "\177ELF"
 #define SELFMAG 4
 
+/* e_ident[] index constants + their values (added for the Chromium port, M60-62;
+ * needed by abseil's ELF symbolizer elf_mem_image.cc / vdso_support.cc). */
+#define EI_MAG0       0
+#define EI_MAG1       1
+#define EI_MAG2       2
+#define EI_MAG3       3
+#define EI_CLASS      4
+#define EI_DATA       5
+#define EI_VERSION    6
+#define EI_OSABI      7
+#define EI_ABIVERSION 8
+#define EI_PAD        9
+
+#define ELFCLASSNONE 0
+#define ELFCLASS32   1
+#define ELFCLASS64   2
+
+#define ELFDATANONE 0
+#define ELFDATA2LSB 1
+#define ELFDATA2MSB 2
+
+#define EV_NONE    0
+#define EV_CURRENT 1
+
 typedef struct {
   unsigned char e_ident[EI_NIDENT];
   Elf32_Half e_type;
@@ -135,6 +159,79 @@ typedef struct {
   Elf64_Xword st_size;
 } Elf64_Sym;
 
+/* Symbol versioning types + section-index constants (added for the Chromium
+ * port, M60-62; standard System V gABI layout, needed by abseil's ELF
+ * symbolizer elf_mem_image.h via ElfW(Verdef)/ElfW(Verdaux)/ElfW(Versym)). */
+typedef Elf64_Half Elf64_Versym;
+typedef Elf32_Half Elf32_Versym;
+
+typedef struct {
+  Elf64_Half    vd_version;
+  Elf64_Half    vd_flags;
+  Elf64_Half    vd_ndx;
+  Elf64_Half    vd_cnt;
+  Elf64_Word    vd_hash;
+  Elf64_Word    vd_aux;
+  Elf64_Word    vd_next;
+} Elf64_Verdef;
+typedef struct {
+  Elf32_Half    vd_version;
+  Elf32_Half    vd_flags;
+  Elf32_Half    vd_ndx;
+  Elf32_Half    vd_cnt;
+  Elf32_Word    vd_hash;
+  Elf32_Word    vd_aux;
+  Elf32_Word    vd_next;
+} Elf32_Verdef;
+
+typedef struct {
+  Elf64_Word    vda_name;
+  Elf64_Word    vda_next;
+} Elf64_Verdaux;
+typedef struct {
+  Elf32_Word    vda_name;
+  Elf32_Word    vda_next;
+} Elf32_Verdaux;
+
+typedef struct {
+  Elf64_Half    vn_version;
+  Elf64_Half    vn_cnt;
+  Elf64_Word    vn_file;
+  Elf64_Word    vn_aux;
+  Elf64_Word    vn_next;
+} Elf64_Verneed;
+typedef struct {
+  Elf32_Half    vn_version;
+  Elf32_Half    vn_cnt;
+  Elf32_Word    vn_file;
+  Elf32_Word    vn_aux;
+  Elf32_Word    vn_next;
+} Elf32_Verneed;
+
+typedef struct {
+  Elf64_Word    vna_hash;
+  Elf64_Half    vna_flags;
+  Elf64_Half    vna_other;
+  Elf64_Word    vna_name;
+  Elf64_Word    vna_next;
+} Elf64_Vernaux;
+typedef struct {
+  Elf32_Word    vna_hash;
+  Elf32_Half    vna_flags;
+  Elf32_Half    vna_other;
+  Elf32_Word    vna_name;
+  Elf32_Word    vna_next;
+} Elf32_Vernaux;
+
+/* Special section indices. */
+#define SHN_UNDEF     0
+#define SHN_LORESERVE 0xff00
+#define SHN_LOPROC    0xff00
+#define SHN_HIPROC    0xff1f
+#define SHN_ABS       0xfff1
+#define SHN_COMMON    0xfff2
+#define SHN_HIRESERVE 0xffff
+
 typedef struct {
   Elf32_Addr r_offset;
   Elf32_Word r_info;
@@ -215,6 +312,50 @@ typedef struct {
 #define PT_PHDR 6
 #define PT_TLS 7
 #define PT_GNU_STACK 0x6474e551
+
+/* d_tag — dynamic-section entry tags (added for the Chromium port, M60-62; values
+ * are the standard System V / GNU ELF ABI ones, needed by abseil's ELF/VDSO
+ * symbolizer). */
+#define DT_NULL     0
+#define DT_NEEDED   1
+#define DT_PLTRELSZ 2
+#define DT_PLTGOT   3
+#define DT_HASH     4
+#define DT_STRTAB   5
+#define DT_SYMTAB   6
+#define DT_RELA     7
+#define DT_RELASZ   8
+#define DT_RELAENT  9
+#define DT_STRSZ    10
+#define DT_SYMENT   11
+#define DT_INIT     12
+#define DT_FINI     13
+#define DT_SONAME   14
+#define DT_RPATH    15
+#define DT_SYMBOLIC 16
+#define DT_REL      17
+#define DT_RELSZ    18
+#define DT_RELENT   19
+#define DT_PLTREL   20
+#define DT_DEBUG    21
+#define DT_TEXTREL  22
+#define DT_JMPREL   23
+#define DT_BIND_NOW 24
+#define DT_INIT_ARRAY   25
+#define DT_FINI_ARRAY   26
+#define DT_INIT_ARRAYSZ 27
+#define DT_FINI_ARRAYSZ 28
+#define DT_RUNPATH  29
+#define DT_FLAGS    30
+#define DT_GNU_HASH 0x6ffffef5
+#define DT_VERSYM   0x6ffffff0
+#define DT_RELACOUNT 0x6ffffff9
+#define DT_RELCOUNT  0x6ffffffa
+#define DT_FLAGS_1  0x6ffffffb
+#define DT_VERDEF   0x6ffffffc
+#define DT_VERDEFNUM 0x6ffffffd
+#define DT_VERNEED  0x6ffffffe
+#define DT_VERNEEDNUM 0x6fffffff
 
 /* p_flags */
 #define PF_X 0x1

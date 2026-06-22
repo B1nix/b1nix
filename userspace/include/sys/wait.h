@@ -22,6 +22,12 @@ int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
 pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage);
 pid_t wait3(int *wstatus, int options, struct rusage *rusage);
 
+/* wait4 / wait3 (added for the Chromium port, M60-62). b1nix has no per-child
+ * resource accounting, so the rusage out-param (if non-NULL) is zero-filled. */
+struct rusage;
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage);
+pid_t wait3(int *wstatus, int options, struct rusage *rusage);
+
 #ifdef __cplusplus
 }
 #endif

@@ -295,4 +295,16 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 #define __NR_getrandom SYS_GETRANDOM
 #define __NR_futex SYS_FUTEX
 
+/* Lowercase Linux SYS_* aliases used by ports that include <syscall.h> directly
+ * and call syscall(SYS_<name>) (e.g. abseil raw_logging / address_is_readable).
+ * Added for the Chromium port (M60-62). They map onto the matching b1nix
+ * syscalls, so the raw syscall() hits the correct b1nix entry. */
+#define SYS_write SYS_WRITE
+#define SYS_read SYS_READ
+#define SYS_rt_sigprocmask SYS_SIGPROCMASK
+#define SYS_sigprocmask SYS_SIGPROCMASK
+#define __NR_write SYS_WRITE
+#define __NR_read SYS_READ
+#define __NR_rt_sigprocmask SYS_SIGPROCMASK
+
 #endif
