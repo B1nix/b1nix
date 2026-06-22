@@ -26,9 +26,26 @@ CRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0.o"
 LINKER="$ROOT_DIR/userspace/linker-cxx.ld"
 LIBB1="$ROOT_DIR/userspace/build/x86_64/libb1nix.a"
 LIBM="$ROOT_DIR/build/openlibm-b1nix/x86_64-b1nix/install/lib/libm.a"
-LIBSTDCXX="$("$GXX" -print-file-name=libstdc++.a)"
-LIBSUPCXX="$("$GXX" -print-file-name=libsupc++.a)"
 LIBGCC="$("$GXX" -print-libgcc-file-name)"
+# C++ runtime: a clang+libc++ build (use_custom_libcxx) produces its own
+# libc++.a/libc++abi.a in the out dir — link those instead of GCC's libstdc++/
+# libsupc++. libgcc still provides the _Unwind_* personality routines.
+LIBCXX_A="$OUT/obj/buildtools/third_party/libc++/libc++.a"
+LIBCXXABI_A="$OUT/obj/buildtools/third_party/libc++abi/libc++abi.a"
+if [ -f "$LIBCXX_A" ]; then
+  CXXRT="$LIBCXX_A $LIBCXXABI_A"
+  echo "  C++ runtime: libc++ (built in-tree)"
+else
+  CXXRT="$("$GXX" -print-file-name=libstdc++.a) $("$GXX" -print-file-name=libsupc++.a)"
+  echo "  C++ runtime: GCC libstdc++"
+fi
+
+# powl: d8 needs the long-double pow (openlibm lacks it). Compile the thin
+# wrapper HERE rather than shipping it in libb1nix — libb1nix is whole-archived
+# into the freestanding userspace binaries, which don't link libm, so it must
+# stay self-contained. Here it resolves `pow` from libm, which d8 links.
+MATHL_O="$OUT/mathl-b1nix.o"
+"$GXX" -x c -c "$ROOT_DIR/userspace/libc/mathl.c" -o "$MATHL_O"
 
 [ -f "$OUT/d8.rsp" ] || { echo "missing $OUT/d8.rsp — run 'ninja -C out/b1nix d8' first"; exit 1; }
 [ -f "$CRT0" ] || { echo "missing crt0.o — build userspace (B1NIX_ARCH=x86_64)"; exit 1; }
@@ -59,7 +76,7 @@ RUST_STD=""
   -o d8.b1nix \
   "$CRT0" \
   --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
-  "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" \
+  "$MATHL_O" $CXXRT "$LIBGCC" "$LIBM" \
   --whole-archive "$LIBB1" --no-whole-archive --end-group
 
 echo "=== linked: $OUT/d8.b1nix ==="
