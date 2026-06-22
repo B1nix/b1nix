@@ -896,18 +896,26 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 ## M60: Ozone Platform
 
 - [ ] `planned` Add an Ozone platform backend (headless first, then a
-  displayd/Wayland-shaped one): window, surface, input, and vsync.
+  displayd/Wayland-shaped one): window, surface, input, and vsync. Plan in
+  `tools/patches/chromium/PORT-PLAN.md` (start from upstream `headless`).
 
 ## M61: Chromium Build Target
 
-- [ ] `planned` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
+- [ ] `partial` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
   `sandbox/` (stubbed), and Ozone, and integrate the cross-toolchain (a
-  multi-month, ~100 GB build that upstream does not support).
+  multi-month, ~100 GB build that upstream does not support). **Groundwork done
+  for free by the V8 port:** the shared `//build` module already has
+  `target_os == "b1nix"` + a `//build/toolchain/b1nix` cross-toolchain
+  (`tools/patches/v8/`), applied by `tools/patches/v8/apply.sh` to any checkout.
+  Remaining = the Chromium-only subsystems (`base/`/`net`/`sandbox` stubs/Ozone).
+  Fetch/build scaffolding: `tools/sync-chromium.sh`. **Gated on disk** (~150 GB;
+  current box has 43 GB free).
 
 ## M62: content_shell
 
 - [ ] `planned` Render a page to a bitmap with `content_shell --headless
-  --no-sandbox` and verify the pixels — the "Chromium runs" milestone.
+  --no-sandbox` and verify the pixels — the "Chromium runs" milestone. Reuses
+  V8 (M58) + EGL/OSMesa (M59). Blocked behind M60/M61 + the disk gate above.
 
 ## M63: Sandbox
 
