@@ -10,7 +10,7 @@
  * flips feature paths in already-ported software (e.g. OpenSSL's secure-memory
  * code starts calling mlock/madvise we do not provide). bash needs it (to pick
  * `int` over BSD `union wait` for process status), so it is defined per-build
- * via CFLAGS in tools/build-bash.sh instead of for every port. */
+ * via CFLAGS in tools/ports/build-bash.sh instead of for every port. */
 
 /* b1nix has clock_gettime(CLOCK_MONOTONIC); advertise just that feature (narrow,
  * unlike the broad _POSIX_VERSION above) so monotonic-clock code paths compile. */

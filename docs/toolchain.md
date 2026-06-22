@@ -81,8 +81,8 @@ reconfiguration and is not used.)
 Build the cross + native toolchain for a given arch with:
 
 ```sh
-B1NIX_ARCH=x86    tools/build-toolchain.sh        # i686-b1nix cross
-B1NIX_ARCH=x86    tools/build-native-toolchain.sh # i686-b1nix native (in-guest)
+B1NIX_ARCH=x86    tools/toolchain/build-toolchain.sh        # i686-b1nix cross
+B1NIX_ARCH=x86    tools/toolchain/build-native-toolchain.sh # i686-b1nix native (in-guest)
 # (omit B1NIX_ARCH or set =x86_64 for the 64-bit toolchain)
 ```
 

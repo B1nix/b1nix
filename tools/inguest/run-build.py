@@ -8,8 +8,8 @@ a swap disk as AHCI sata1, waits for the shell, runs the in-guest build, copies
 the resulting kernel.elf to /persist, and watches for a completion marker.
 
 Prereqs (build once on the bench):
-  tools/build-toolchain.sh && make -C userspace && \
-  tools/build-native-toolchain.sh && make ARCH=x86_64 root-image && make ARCH=x86_64 iso
+  tools/toolchain/build-toolchain.sh && make -C userspace && \
+  tools/toolchain/build-native-toolchain.sh && make ARCH=x86_64 root-image && make ARCH=x86_64 iso
 
 Usage:
   python3 tools/inguest/run-build.py <ram_mb> [timeout_s] [swap_mb]

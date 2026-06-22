@@ -36,7 +36,7 @@ virglrenderer; the smoke auto-detects it and honestly skips elsewhere.
   built without virglrenderer). Full Mesa-on-virgl (gallium `virgl` driver +
   libdrm winsys) is the remaining layer above this transport.
 - [x] `done` Port **real upstream Mesa** (OSMesa + Gallium **softpipe**, no
-  LLVM) via a meson cross-build (`tools/build-mesa.sh` + `b1nix-mesa-cc` +
+  LLVM) via a meson cross-build (`tools/ports/build-mesa.sh` + `b1nix-mesa-cc` +
   `enable-cxx-toolchain.sh`). `m52_osmesa` drives the unmodified OSMesa API
   (`OSMesaCreateContext`/`MakeCurrent`) through the softpipe rasterizer, renders
   a 3D triangle off-screen, pixel-verifies it, and presents to displayd:
@@ -67,20 +67,20 @@ no-fake-pass smoke test.
 - [x] `done` Image + video-keyframe codecs (NetSurf loader dependencies), all
   freestanding-compiled against the b1nix userspace ABI and verified by
   encode/decode roundtrips with pixel checks (`tests/smoke.sh`):
-  - **zlib** 1.3.1 (`tools/build-zlib.sh`) — one-shot + streaming deflate/inflate
+  - **zlib** 1.3.1 (`tools/ports/build-zlib.sh`) — one-shot + streaming deflate/inflate
     + crc32. `M53-ZLIB: ok compress/uncompress/roundtrip/crc32/stream`.
-  - **libpng** 1.6.43 (`tools/build-libpng.sh`, over zlib + libm) — PNG
+  - **libpng** 1.6.43 (`tools/ports/build-libpng.sh`, over zlib + libm) — PNG
     encode→decode, pixels byte-for-byte identical. `M53-PNG: ok
     encode/decode-header/decode`.
-  - **libjpeg** (IJG v9f, `tools/build-libjpeg.sh`) — JPEG encode→decode, pixels
+  - **libjpeg** (IJG v9f, `tools/ports/build-libjpeg.sh`) — JPEG encode→decode, pixels
     within tolerance. `M53-JPEG: ok encode/decode-header/decode`.
-  - **libwebp** 1.4.0 (`tools/build-libwebp.sh`) — WebP lossless encode→decode
+  - **libwebp** 1.4.0 (`tools/ports/build-libwebp.sh`) — WebP lossless encode→decode
     byte-identical; WebP lossy is a VP8 intra (keyframe) decoder, the WebM video
     bitstream family. `M53-WEBP: ok encode/info/decode`.
   - Added the standard `*_10_EXP` macros to `userspace/include/float.h` (libpng
     gamma math needs them).
 - [x] `done` Full-motion video codec: **libvpx** VP8 decode (the WebM / browser
-  video codec). `tools/build-libvpx.sh` runs libvpx's own configure for the
+  video codec). `tools/ports/build-libvpx.sh` runs libvpx's own configure for the
   portable `generic-gnu` target to generate its `vpx_config.h` + `*_rtcd.h`
   headers, then recompiles the VP8-decode C sources with the b1nix toolchain.
   `m53_libvpx_smoke` cross-verifies against libwebp: it encodes a lossy WebP
@@ -100,7 +100,7 @@ no-fake-pass smoke test.
     `-Dgallium-drivers=swrast,virgl`, so the full OpenGL API runs on the host
     GPU (vs softpipe). The b1nix winsys
     (`tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/`, installed into
-    the Mesa tree by `tools/build-mesa.sh`) implements `struct virgl_winsys`
+    the Mesa tree by `tools/ports/build-mesa.sh`) implements `struct virgl_winsys`
     over the `/dev/virtio-gpu` ioctls instead of libdrm — a b1nix res_id IS the
     host resource id (no GEM layer), SUBMIT/TRANSFER are synchronous so fences
     are trivial. `build-mesa.sh` drops the driver's vestigial libdrm dep, stubs
@@ -130,9 +130,9 @@ no-fake-pass smoke test.
   **libnsutils/libnsgif/libnsbmp/libnslog** (`M53-NSUTILS/NSGIF/NSBMP/NSLOG`),
   and **libnsfb** (framebuffer surface + plotters). The complete **NetSurf
   framebuffer browser** is then cross-built for b1nix with its native build
-  system driven by the b1nix cross-gcc (`tools/build-netsurf-fb.sh`), packaged
+  system driven by the b1nix cross-gcc (`tools/ports/build-netsurf-fb.sh`), packaged
   into the initramfs with its resources + a test page
-  (`tools/gen_netsurf_initramfs.sh`), and a headless `-T` render self-test loads
+  (`tools/images/gen_netsurf_initramfs.sh`), and a headless `-T` render self-test loads
   a local `file://` HTML page (styled text + a PNG image), lays it out
   (extents 782x552) and paints it into a framebuffer (117849 non-background
   pixels verified). `M53-NS: ok load/redraw/render`. Runtime note: the file://
@@ -188,21 +188,21 @@ no-fake-pass smoke test.
   256 MB cleanly OOM-kills the memory-heavy tests (`[OOM-KILL] killing ...`) with
   no panic; both arches stay green.
 - [x] `done` **SVG images + JavaScript + public-suffix list.** SVG is decoded by
-  **libsvgtiny** (`tools/build-libsvgtiny.sh`, over libdom's expat XML binding)
+  **libsvgtiny** (`tools/ports/build-libsvgtiny.sh`, over libdom's expat XML binding)
   and `NETSURF_USE_NSSVG=YES`; the framebuffer frontend's `plot->path` (an
   upstream no-op stub) is given a real polygon-fill/stroke implementation so SVG
   actually paints. **JavaScript** runs via the compiled-in Duktape engine with
   the `enable_javascript` option flipped on. The **public-suffix list**
-  (**libnspsl**, `tools/build-libnspsl.sh`, `NETSURF_USE_NSPSL=YES`) scopes
+  (**libnspsl**, `tools/ports/build-libnspsl.sh`, `NETSURF_USE_NSPSL=YES`) scopes
   cookies to a registrable domain. The render self-test loads a page with an
   `<img>` SVG (solid green block) and a script that paints a solid blue block,
   and asserts all three colours appear in the framebuffer: `M53-NS: ok svg /
   ok js / ok jxl`.
   Also enabled: **RISC-OS sprite** decoding (**librosprite**,
-  `tools/build-librosprite.sh`, `NETSURF_USE_ROSPRITE=YES`), **utf8proc**
-  (`tools/build-libutf8proc.sh`, `NETSURF_USE_UTF8PROC=YES`) for IDNA Unicode in
+  `tools/ports/build-librosprite.sh`, `NETSURF_USE_ROSPRITE=YES`), **utf8proc**
+  (`tools/ports/build-libutf8proc.sh`, `NETSURF_USE_UTF8PROC=YES`) for IDNA Unicode in
   `utils/idna.c`, and **JPEG-XL** (**libjxl** 0.11.1 + highway + brotli + skcms,
-  `tools/build-libjxl.sh` — a CMake cross-build with the b1nix C++ toolchain,
+  `tools/ports/build-libjxl.sh` — a CMake cross-build with the b1nix C++ toolchain,
   decode-only, `NETSURF_USE_JPEGXL=YES`). Enabling libjxl required completing the
   C++ toolchain: `userspace/include/math.h` filled out to full C99 (erf/lgamma/
   tgamma/long-double variants, double_t/float_t) with the classification
@@ -211,7 +211,7 @@ no-fake-pass smoke test.
   empty sysroot) — HarfBuzz and Mesa re-verified against the updated toolchain.
   A real `<img>` JXL (magenta block) is decoded and asserted: `M53-NS: ok jxl`.
   Still off: **OpenSSL** (redundant — mbedTLS is the TLS backend); **PDF export**
-  (the **libharu** library *is* ported — `tools/build-libharu.sh` builds
+  (the **libharu** library *is* ported — `tools/ports/build-libharu.sh` builds
   `libhpdf.a` — but NetSurf 3.11's PDF glue is upstream bit-rot: `font_haru.c`
   needs the removed `desktop/font.h` and a `struct font_functions` model that
   `print_make_settings` no longer uses, so enabling it needs that dead code

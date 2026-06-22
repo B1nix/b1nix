@@ -747,7 +747,7 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
 - [x] `done` Build and **run** libstdc++ with C++ exceptions (DWARF `.eh_frame`
   unwinding, registered with `libgcc` by `crt0`), RTTI, and thread-safe statics.
   The cross GCC 13.2 builds `libstdc++.a`/`libsupc++.a` (`--enable-threads=posix`,
-  staged by `tools/enable-cxx-toolchain.sh`); `tools/b1nix-c++` links them with
+  staged by `tools/toolchain/enable-cxx-toolchain.sh`); `tools/b1nix-c++` links them with
   `libgcc` via `userspace/linker-cxx.ld` (keeps `.eh_frame`/`.gcc_except_table`).
   Verified end-to-end by `userspace/bin/cxx_smoke.cpp` (`CXX-SMOKE: ok` for
   ctors, stl, exceptions, **rtti** `dynamic_cast`/`typeid`/`bad_cast`,
@@ -764,7 +764,7 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
   `ios_base::Init` global never ran and the first `std::cout` faulted.
 - [x] `done` Validate the runtime with a real modern engine: **litehtml** (C++
   HTML/CSS layout engine + bundled gumbo HTML parser) is ported
-  (`tools/build-litehtml.sh`, CMake cross-build against b1nix libstdc++) and
+  (`tools/ports/build-litehtml.sh`, CMake cross-build against b1nix libstdc++) and
   runs end-to-end on b1nix — `userspace/bin/m55_litehtml.cpp` feeds it a styled
   page, and the engine parses HTML, cascades CSS, lays out the box tree and
   emits draw calls. Verified both arches: `M55-LITEHTML: ok parse/layout/draw`
@@ -816,7 +816,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [x] `done` **Maglev** (mid-tier JIT) **and the code cage** (external code space)
   now both enabled and verified: the full m58.js suite (12 markers + `done`) runs
   fault-free under Sparkplug AND TurboFan with `v8_enable_maglev=true` and
-  `v8_enable_external_code_space=true` (`tools/v8-gen-jit.sh`). The long-standing
+  `v8_enable_external_code_space=true` (`tools/v8/v8-gen-jit.sh`). The long-standing
   "code-cage zero-base / `0x400` crash" was never a V8 bug — it was a b1nix
   **`sys_mmap`** bug: it honored V8's sub-4 GiB cage hint, which collides with the
   supervisor-only low-4 GiB identity map (2 MB huge pages cloned into every address
@@ -931,7 +931,7 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   its own (no live USB/ISO) with a writable on-disk root. Verified end-to-end:
   the host builds a bootable image, `b1nix_install` copies it to a target disk,
   and that disk boots GRUB → kernel → `rootfs: sata0p1 mounted at /` → userland.
-- [x] `done` **`tools/mk-disk-image.sh`** (host): builds a standalone-bootable
+- [x] `done` **`tools/images/mk-disk-image.sh`** (host): builds a standalone-bootable
   `b1nix-disk.img` — MBR + real pre-baked GRUB (BIOS i386-pc via loopback
   `grub-install`) + an ext4 root staged with the full userland (busybox + bash +
   applet symlinks + `/etc`). **No in-guest ports** (no in-guest grub/mkfs).

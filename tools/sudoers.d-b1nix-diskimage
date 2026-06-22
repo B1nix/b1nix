@@ -1,5 +1,5 @@
 # b1nix disk-image build — passwordless sudo scoped to the loop-device steps of
-# tools/mk-disk-image.sh, so `make disk-image` / the installer image build runs
+# tools/images/mk-disk-image.sh, so `make disk-image` / the installer image build runs
 # unattended (no password prompt at the keyboard).
 #
 # Install once:

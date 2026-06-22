@@ -48,7 +48,7 @@ you trust any symptom.
 Checklist:
 1. `tools/toolchain-env.sh`: add the `B1NIX_ARCH` case (triplet, gcc-arch,
    rootfs). Per-triplet build homes keep x86 and x86_64 objects separate.
-2. `tools/patch-gcc.py`: add a target-tuple case so GCC recognizes the new
+2. `tools/toolchain/patch-gcc.py`: add a target-tuple case so GCC recognizes the new
    `*-b1nix` triplet (and `config.sub` accepts the OS). The x86 port added the
    `i686-b1nix` case here.
 3. `userspace/Makefile`: `TARGET`, `LDFLAGS` (`-m elf_i386` vs `-m elf_x86_64`),

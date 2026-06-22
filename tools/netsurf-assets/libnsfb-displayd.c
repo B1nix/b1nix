@@ -3,7 +3,7 @@
  * (Wayland-shaped) protocol. NetSurf draws into the window's shared buffer and
  * presents damage with b1gui_present; pointer/keyboard events from the
  * compositor are translated to libnsfb events, so the window is interactive.
- * Copied into libnsfb's src/surface/ by tools/build-libnsfb.sh; registered as
+ * Copied into libnsfb's src/surface/ by tools/ports/build-libnsfb.sh; registered as
  * "displayd" on the NSFB_SURFACE_WL slot. */
 
 #include <stdbool.h>

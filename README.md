@@ -266,8 +266,8 @@ SMOKE_VERBOSE=1 make smoke
 Build the cross and in-guest toolchains:
 
 ```sh
-tools/build-toolchain.sh
-tools/build-native-toolchain.sh
+tools/toolchain/build-toolchain.sh
+tools/toolchain/build-native-toolchain.sh
 ```
 
 For i686, set `B1NIX_ARCH=x86` for both commands. The toolchain build is large

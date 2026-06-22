@@ -59,7 +59,7 @@ static const char *klog_lookup_symbol(u64 address)
 
 /* ── kallsyms: post-link symbol blob (M35) ──
  * Walks the packed [u64 addr][asciz name] records the two-pass link emitted
- * into the .kallsyms section (see tools/gen_kallsyms.sh, linker.ld). Returns
+ * into the .kallsyms section (see tools/kernel/gen_kallsyms.sh, linker.ld). Returns
  * the name of the function containing `addr` and, via *off, the byte offset
  * into it. Names point into the loaded blob, valid for the kernel's lifetime. */
 extern const unsigned char __kallsyms_start[];

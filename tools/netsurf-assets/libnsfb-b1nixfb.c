@@ -1,7 +1,7 @@
 /* libnsfb b1nix /dev/fb0 surface — draws NetSurf directly to the real hardware
  * framebuffer (M47 fb device), making the framebuffer frontend an on-screen
  * browser rather than an off-screen RAM render. Copied into libnsfb's
- * src/surface/ by tools/build-libnsfb.sh.
+ * src/surface/ by tools/ports/build-libnsfb.sh.
  *
  * The b1nix fb is 32bpp B8G8R8A8 (virtio-gpu), i.e. memory order B,G,R,A — which
  * matches NetSurf's NSFB_FMT_XRGB8888 software plotter. Damage is pushed to the

@@ -101,7 +101,7 @@ All files were written from scratch for the 32-bit target:
   `--disable-multilib`).
 - Ported programs (curl, wget, pcre2, openssl, mbedtls, dropbear, libidn2,
   libunistring) build under `build/<prog>-{src,b1nix}/<triplet>/` so x86 and
-  x86_64 never share objects. `tools/patch-gcc.py` now emits both the
+  x86_64 never share objects. `tools/toolchain/patch-gcc.py` now emits both the
   `x86_64-*-b1nix*` and `i[34567]86-*-b1nix*` GCC target cases.
 - See `docs/toolchain.md` → "Per-architecture toolchain & port layout".
 

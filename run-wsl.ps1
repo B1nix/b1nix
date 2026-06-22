@@ -262,7 +262,7 @@ while ($running) {
                 $confirm = Read-Host "Continue? (Y/n)"
                 if ($confirm -ne 'n' -and $confirm -ne 'N') {
                     Write-Host ""
-                    wsl -d $distro bash tools/build-toolchain.sh
+                    wsl -d $distro bash tools/toolchain/build-toolchain.sh
                     if ($LASTEXITCODE -eq 0) {
                         Write-Host "`n Cross-toolchain built successfully!" -ForegroundColor Green
                         Write-Host " Compiler: build/cross/bin/x86_64-b1nix-gcc" -ForegroundColor Green
@@ -291,7 +291,7 @@ while ($running) {
                     $confirm = Read-Host "Continue? (Y/n)"
                     if ($confirm -ne 'n' -and $confirm -ne 'N') {
                         Write-Host ""
-                        wsl -d $distro bash tools/build-native-toolchain.sh
+                        wsl -d $distro bash tools/toolchain/build-native-toolchain.sh
                         if ($LASTEXITCODE -eq 0) {
                             Write-Host "`n Native toolchain built successfully!" -ForegroundColor Green
                             Write-Host " Output: build/native_root/" -ForegroundColor Green

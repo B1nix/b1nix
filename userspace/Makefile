@@ -212,9 +212,9 @@ $(GUI_BINARIES): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
 
 # M49: upstream libwayland-client, with libffi for protocol dispatch.
 WAYLAND_DIR := ../build/wayland-b1nix/$(B1NIX_TRIPLET)/install
-$(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/build-wayland.sh ../tools/build-libffi.sh \
+$(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/ports/build-wayland.sh ../tools/ports/build-libffi.sh \
 		../tools/wayland/os.c ../tools/wayland/compat.c ../tools/wayland/compat.h
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/build-wayland.sh >/dev/null
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-wayland.sh >/dev/null
 $(WAYLAND_DIR)/lib/libwayland-server.a: $(WAYLAND_DIR)/lib/libwayland-client.a
 
 $(BUILD)/bin/m49_libwayland: bin/m49_libwayland.c $(LIB) $(CRT0) $(LINKER) \
@@ -239,7 +239,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(BUILD)/bin/native_smoke.o
 
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
-# archives are present (built by tools/build-curl.sh with B1NIX_TLS=mbedtls).
+# archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
 MBEDTLS_DIR := ../build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(LIB) $(CRT0) $(LINKER) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
@@ -333,9 +333,9 @@ $(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(LIB) $(CRT0
 
 # M52 end-to-end: EGL + TinyGL (software GL) + libb1gui (Wayland client) -> displayd.
 TINYGL_DIR := ../build/tinygl-b1nix/$(B1NIX_TRIPLET)/install
-$(TINYGL_DIR)/lib/libEGL.a: ../tools/build-tinygl.sh libegl/b1egl.c \
+$(TINYGL_DIR)/lib/libEGL.a: ../tools/ports/build-tinygl.sh libegl/b1egl.c \
 		include/EGL/egl.h
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/build-tinygl.sh >/dev/null
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-tinygl.sh >/dev/null
 $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER) \
 		$(TINYGL_DIR)/lib/libEGL.a
 	@mkdir -p $(dir $@)

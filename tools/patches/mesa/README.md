@@ -1,11 +1,11 @@
-# b1nix Mesa patches (applied by tools/build-mesa.sh)
+# b1nix Mesa patches (applied by tools/ports/build-mesa.sh)
 
 Mesa is built from an upstream tarball extracted into `build/ports-src/` (a
 git-ignored, regenerable tree). Any change to the Mesa source must live HERE,
 in the b1nix repo, so it is reproducible on every host — never edit the
 extracted tree directly (those edits vanish on re-extract / `make clean`).
 
-`tools/build-mesa.sh` applies, right after extraction and idempotently:
+`tools/ports/build-mesa.sh` applies, right after extraction and idempotently:
 
 - `*.patch` — unified diffs against the Mesa source root, applied with
   `patch -p1` (skipped automatically if already applied). Use for changes to

@@ -1,8 +1,8 @@
 # In-guest kernel build, driven by GNU Make running INSIDE b1nix.
 #
 # Closes roadmap 416: a real Makefile (variables, pattern rules, automatic
-# variables, prerequisite/mtime tracking) replaces the flat, hand-unrolled
-# tools/inguest/build-kernel.sh. The ported GNU Make (tools/build-make.sh)
+# variables, prerequisite/mtime tracking) replaces the old hand-unrolled build.
+# The ported GNU Make (tools/toolchain/build-make.sh)
 # drives this exactly like make on any Unix.
 #
 # Invoke in-guest (rootfs mounted at /persist, source staged at

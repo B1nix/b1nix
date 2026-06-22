@@ -7,7 +7,7 @@
  * so fences and resource_wait/is_busy are trivial.
  *
  * This file is b1nix-owned and installed into the Mesa tree by
- * tools/build-mesa.sh (tools/patches/mesa/files/...). It mirrors the role of
+ * tools/ports/build-mesa.sh (tools/patches/mesa/files/...). It mirrors the role of
  * src/gallium/winsys/virgl/drm/virgl_drm_winsys.c.
  */
 #include <fcntl.h>

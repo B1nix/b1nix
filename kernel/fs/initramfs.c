@@ -290,7 +290,7 @@ static const char initramfs_rc[] =
 
 /* bpkg — minimal package manager. A POSIX-sh wrapper over the tools b1nix
  * already ships (curl, busybox tar/gzip/sha256sum, ext4). See /etc/bpkg.conf
- * for INDEX_URL and tools/bpkg-publish.sh for the host-side publisher. */
+ * for INDEX_URL and tools/packages/bpkg-publish.sh for the host-side publisher. */
 static const char initramfs_bpkg[] =
     "#!/bin/sh\n"
     "# bpkg - minimal package manager for b1nix.\n"
@@ -577,7 +577,7 @@ static const char initramfs_bpkg_conf[] =
     "# file://, http:// and https:// (curl + libcurl/mbedTLS handle TLS).\n"
     "#\n"
     "# To install real packages: push pkgs/ to the PUBLIC repo B1nix/b1nix-pkgs\n"
-    "# (see tools/bpkg-publish.sh), then uncomment the jsDelivr line below.\n"
+    "# (see tools/packages/bpkg-publish.sh), then uncomment the jsDelivr line below.\n"
     "#INDEX_URL=https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/index\n"
     "\n"
     "# Smoke/offline default: the index fixture pre-staged in the image.\n"

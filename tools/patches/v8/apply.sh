@@ -10,7 +10,7 @@
 #
 # IMPORTANT: Patches 1 & 2 live in //build (the shared Chromium build module),
 # which `gclient sync` re-pulls at its DEPS-pinned revision — so they MUST be
-# re-applied after every sync. tools/sync-v8.sh calls this for exactly that.
+# re-applied after every sync. tools/v8/sync-v8.sh calls this for exactly that.
 set -eu
 
 V8="${1:?usage: apply.sh <path-to-v8-checkout>}"

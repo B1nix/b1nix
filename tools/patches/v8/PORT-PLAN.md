@@ -30,13 +30,13 @@ JIT pipeline (Sparkplug baseline + TurboFan optimizing). Prep + kickoff:
   the cross setup is fine for JIT too (confirmed: the JIT `ninja` builds
   `clang_x64/.../libc++` for the host mksnapshot).
 
-**Build:** `tools/v8-gen-jit.sh` → a SEPARATE `out/b1nix-jit` (keeps the proven
+**Build:** `tools/v8/v8-gen-jit.sh` → a SEPARATE `out/b1nix-jit` (keeps the proven
 jitless `out/b1nix` as a fallback). Flips `v8_jitless=false` +
 `v8_enable_sparkplug=true v8_enable_turbofan=true` (TurboFan mandatory when not
 jitless), `v8_enable_maglev=false` + `v8_enable_webassembly=false` to keep the
 surface down. JIT compiles+links cleanly first try — the jitless port already
 paved the whole libc surface (3003 targets PC-on / 2446 PC-off; relink with
-`sh tools/v8-link-d8.sh b1nix-jit`). Run via the default ISO built with
+`sh tools/v8/v8-link-d8.sh b1nix-jit`). Run via the default ISO built with
 `b1nix.v8jit` (kernel hook drops `--jitless`; also passes `--single-threaded`
 during bring-up) + the `v8-jit-ext4.img` disk (a copy of v8-ext4.img with the JIT
 d8 swapped in).
@@ -253,7 +253,7 @@ heap corruption. (All that instrumentation was reverted, not committed.)
 
 `d8.b1nix` = 22 MB `ET_EXEC` `EM_X86_64`, entry `0x2000000`, **0 undefined refs**.
 The whole engine compiles with `x86_64-b1nix-g++` and links via
-**`tools/v8-link-d8.sh`** (gn's own link uses bare g++ + empty sysroot → wrong;
+**`tools/v8/v8-link-d8.sh`** (gn's own link uses bare g++ + empty sysroot → wrong;
 the script relinks gn's `out/b1nix/d8.rsp` object set with the b1nix recipe:
 ranlib thin archives + `ld -T userspace/linker-cxx.ld crt0.o --start-group @d8.rsp
 --end-group` + libstdc++/libsupc++/libgcc + openlibm `libm.a` + whole-archived
@@ -272,13 +272,13 @@ QEMU/x86_64. Serial log: `ELF load: /mnt/v8/d8 entry=0x2000000` →
 
 **Reproduce:**
 1. `make ARCH=x86_64 KERNEL_CMDLINE="b1nix.test=1 b1nix.v8run" iso`
-2. `sh tools/v8-run-qemu.sh` — attaches `build/v8-out/v8-ext4.img` as AHCI sata0,
+2. `sh tools/v8/v8-run-qemu.sh` — attaches `build/v8-out/v8-ext4.img` as AHCI sata0,
    greps the serial log for `M58-V8: ok hello`.
 
 The kernel hook (`kernel/main.c`, guarded by `b1nix.v8run`) mounts sata0 →
 /mnt/v8 then `user_spawn("/mnt/v8/d8", {"d8","--jitless","-e",
 "print('M58-V8: ok hello')"})`. d8 ships on the ext4 disk (13 MB, too big for the
-xxd initramfs). Relink: `tools/v8-link-d8.sh`; restage into image:
+xxd initramfs). Relink: `tools/v8/v8-link-d8.sh`; restage into image:
 `debugfs -w -R "rm /d8" img; debugfs -w -R "write d8.stripped /d8" img`.
 
 **THE runtime bug — TLS variable overlap (root-caused + fixed).** d8 first
@@ -321,7 +321,7 @@ first ninja target — `v8_libbase`, the platform/base layer — **compiles and
 archives** (`AR obj/libv8_libbase.a`, thin archive of 41 `x86_64-b1nix-g++`
 ELF64 objects). This is the PORT-PLAN's "compiles v8_libbase = days" milestone.
 
-**`gn gen` args** (in `tools/sync-v8.sh`): jitless ⇒ all JIT/Wasm tiers off,
+**`gn gen` args** (in `tools/v8/sync-v8.sh`): jitless ⇒ all JIT/Wasm tiers off,
 `v8_enable_temporal_support=false` (Temporal is Rust), `v8_enable_sandbox=false`
 (needs libc++ hardening), `use_custom_libcxx=false`, **`is_clang=false`** (the
 critical one — GCC build of V8; without it the toolchain rules inject clang-only
@@ -389,7 +389,7 @@ throwaway stubs were hand-authored to walk the import chain past the infra files
 (`build/config/gclient_args.gni`, `third_party/icu/config.gni`); everything past
 that is real third-party source, i.e. the port itself.
 
-Reproduce: `sh tools/build-gn.sh` (builds gn), then the patches + `gn gen` as in
+Reproduce: `sh tools/v8/build-gn.sh` (builds gn), then the patches + `gn gen` as in
 "Build order" below.
 
 ---
@@ -536,11 +536,11 @@ Two scripts drive it (both "run-it-yourself" — they fetch/build external code,
 which Claude can't do unattended):
 
 ```sh
-sh tools/build-gn.sh    # once: builds gn  (cached, survives make clean)
-sh tools/sync-v8.sh     # depot_tools + gclient sync (multi-GB) + apply + gn gen
+sh tools/v8/build-gn.sh    # once: builds gn  (cached, survives make clean)
+sh tools/v8/sync-v8.sh     # depot_tools + gclient sync (multi-GB) + apply + gn gen
 ```
 
-`tools/sync-v8.sh` does: clone depot_tools → write a `managed:False` `.gclient`
+`tools/v8/sync-v8.sh` does: clone depot_tools → write a `managed:False` `.gclient`
 (so gclient leaves our shallow v8 git alone and only syncs the DEPS sub-trees) →
 `gclient sync` → **`tools/patches/v8/apply.sh`** → `gn gen out/b1nix`. Then the
 manual chase loop:

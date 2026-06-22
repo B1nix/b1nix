@@ -32,7 +32,7 @@ smoke suite on **both** arches.
 | **NetSurf** | **JavaScript** (bundled Duktape) | nsgenbind host tool builds the DOM bindings |
 | **BusyBox** | upstream `alloc_affinity.c` (CPU-affinity) | real `sched_getaffinity` (stub removed) |
 | **curl** | static `libpsl` + `libidn2` + `libunistring` support | static compilation linked to libcurl.a |
-| **curl** | `brotli` (`Content-Encoding: br` decode) | decoder-only `libbrotlidec`+`libbrotlicommon` (`tools/build-brotli.sh`) |
+| **curl** | `brotli` (`Content-Encoding: br` decode) | decoder-only `libbrotlidec`+`libbrotlicommon` (`tools/ports/build-brotli.sh`) |
 | **mbedTLS** | `MBEDTLS_TIMING_C` (timing layer: DTLS retransmit timers, `mbedtls_timing_get_timer`) | `gettimeofday`; timing.c portability `#error` gate taught about b1nix |
 | **libc** | `setlocale()`, `localeconv()`, `nl_langinfo()`, `iconv` (UTF-8/UTF-16/UCS4/Latin1/ASCII), `mbrtowc`/`wcrtomb` | native libc implementations |
 | **NetSurf** | JPEG-XL (`libjxl`), SVG (`libsvgtiny`), `utf8proc` | CMake/autotools ports staged into the NS sysroot |
