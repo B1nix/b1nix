@@ -946,3 +946,17 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `blkdev_node_read/write`; AHCI PRDT bounds check; cache-invalidate before raw
   writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
   path yet) — correct but not fast; interrupt-driven AHCI is future work.
+
+## M69: Dynamic Loading (ELF dynamic linker) — planned
+
+- [ ] `planned` b1nix is **static-only** (no runtime loader). Implement an
+  ELF dynamic linker (`ld.so`-equivalent): honor `PT_INTERP`/`PT_DYNAMIC`,
+  apply load-time relocations + PLT/GOT, and manage shared-object lifetimes.
+- [ ] `planned` Real `dlopen`/`dlsym`/`dlclose`/`dlerror` in libc — today these
+  are **honest stubs** (`dlopen`→`NULL`) because no loader exists.
+- **Motivation:** unblocks rustc **proc-macros** and compiler **plugins** (both
+  loaded as `.so`) plus general shared-library support. **NOT** required for the
+  static native rustc (M68) — that statically links its LLVM backend; this only
+  removes the "no dynamic loading" ceiling.
+- Large effort (full dynamic-linking machinery). Defer until a concrete
+  consumer needs it.
