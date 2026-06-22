@@ -72,4 +72,44 @@ typedef uint64_t uint_fast64_t;
 #define SIZE_MAX  18446744073709551615UL
 #define SSIZE_MAX 9223372036854775807L
 
+/* C99 least/fast-width limits. The least types are the exact-width types; the
+ * fast 16/32 types are `int`/`unsigned int` (32-bit) on this ABI. Required by
+ * libstdc++'s C99-stdint-TR1 probe (gates <random>) and by general C99 code. */
+#define INT_LEAST8_MIN   INT8_MIN
+#define INT_LEAST8_MAX   INT8_MAX
+#define UINT_LEAST8_MAX  UINT8_MAX
+#define INT_LEAST16_MIN  INT16_MIN
+#define INT_LEAST16_MAX  INT16_MAX
+#define UINT_LEAST16_MAX UINT16_MAX
+#define INT_LEAST32_MIN  INT32_MIN
+#define INT_LEAST32_MAX  INT32_MAX
+#define UINT_LEAST32_MAX UINT32_MAX
+#define INT_LEAST64_MIN  INT64_MIN
+#define INT_LEAST64_MAX  INT64_MAX
+#define UINT_LEAST64_MAX UINT64_MAX
+
+#define INT_FAST8_MIN    INT8_MIN
+#define INT_FAST8_MAX    INT8_MAX
+#define UINT_FAST8_MAX   UINT8_MAX
+#define INT_FAST16_MIN   INT32_MIN
+#define INT_FAST16_MAX   INT32_MAX
+#define UINT_FAST16_MAX  UINT32_MAX
+#define INT_FAST32_MIN   INT32_MIN
+#define INT_FAST32_MAX   INT32_MAX
+#define UINT_FAST32_MAX  UINT32_MAX
+#define INT_FAST64_MIN   INT64_MIN
+#define INT_FAST64_MAX   INT64_MAX
+#define UINT_FAST64_MAX  UINT64_MAX
+
+#define PTRDIFF_MIN      INTPTR_MIN
+#define PTRDIFF_MAX      INTPTR_MAX
+#define SIG_ATOMIC_MIN   INT32_MIN
+#define SIG_ATOMIC_MAX   INT32_MAX
+#ifndef WCHAR_MIN
+#define WCHAR_MIN        INT32_MIN
+#define WCHAR_MAX        INT32_MAX
+#endif
+#define WINT_MIN         0U
+#define WINT_MAX         UINT32_MAX
+
 #endif
