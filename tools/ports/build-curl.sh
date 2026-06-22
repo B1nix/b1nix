@@ -62,7 +62,7 @@ fi
 BROTLI_PREFIX="$ROOT_DIR/build/brotli-b1nix/$HOST_TRIPLET/install"
 BROTLI_FLAG="--without-brotli"
 if [ ! -f "$BROTLI_PREFIX/lib/libbrotlidec.a" ] || [ ! -f "$BROTLI_PREFIX/lib/libbrotlicommon.a" ]; then
-  "$ROOT_DIR/tools/ports/build-brotli.sh" >/dev/null
+  "$ROOT_DIR/tools/ports/build-brotli.sh" >/dev/null || true
 fi
 if [ -f "$BROTLI_PREFIX/lib/libbrotlidec.a" ]; then
   BROTLI_FLAG="--with-brotli=$BROTLI_PREFIX"

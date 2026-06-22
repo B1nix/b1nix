@@ -78,7 +78,7 @@ EOF
 
 stage() {
   # $1 builder script  -> copies install/{include,lib} into sysroot
-  inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/$1")"
+  inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/$1")"
   cp -R "$inst/include/." "$SYSROOT/include/" 2>/dev/null || true
   cp -R "$inst/lib/." "$SYSROOT/lib/" 2>/dev/null || true
 }

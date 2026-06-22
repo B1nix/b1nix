@@ -113,6 +113,7 @@ if [ ! -f "$NATIVE_DEST/bin/ld" ]; then
         --with-sysroot="/" \
         --disable-nls \
         --disable-werror \
+        --with-zstd=no \
         MAKEINFO=true
     make -j"$NPROC" MAKEINFO=true
     make install DESTDIR="$NATIVE_DEST" MAKEINFO=true
