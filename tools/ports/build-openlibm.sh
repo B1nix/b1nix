@@ -12,7 +12,7 @@ TARBALL="openlibm-${OPENLIBM_VERSION}.tar.gz"
 URL="https://github.com/JuliaMath/openlibm/archive/refs/tags/v${OPENLIBM_VERSION}.tar.gz"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 # Portable in-place sed: GNU sed wants `sed -i EXPR`, BSD/macOS sed wants
 # `sed -i '' EXPR`. Passing BSD's empty-suffix arg to GNU sed makes it treat the

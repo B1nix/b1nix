@@ -27,7 +27,7 @@ you trust any symptom.
   one) or behind `g_*` runtime globals. A shared header with a hard-coded 64-bit
   constant is a latent bug for the new arch. Rebuild the *old* arch after every
   shared-file edit — `make ARCH=x86_64 iso` must stay warning-free.
-- **One source of truth for arch identity.** `tools/toolchain-env.sh` maps
+- **One source of truth for arch identity.** `tools/toolchain/env.sh` maps
   `B1NIX_ARCH → {triplet, gcc-arch, rootfs}`. Every toolchain/port build script
   sources it. Add the new arch *there first*; do not scatter `if [ arch = … ]`
   across scripts.
@@ -46,7 +46,7 @@ you trust any symptom.
 **Arch-specific:** target triplet, ELF class/machine, `-m` flags, GCC config.
 
 Checklist:
-1. `tools/toolchain-env.sh`: add the `B1NIX_ARCH` case (triplet, gcc-arch,
+1. `tools/toolchain/env.sh`: add the `B1NIX_ARCH` case (triplet, gcc-arch,
    rootfs). Per-triplet build homes keep x86 and x86_64 objects separate.
 2. `tools/toolchain/patch-gcc.py`: add a target-tuple case so GCC recognizes the new
    `*-b1nix` triplet (and `config.sub` accepts the OS). The x86 port added the

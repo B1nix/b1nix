@@ -10,7 +10,7 @@
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:?usage: build-m59-egl.sh <output-elf>}"
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then LDEMU="elf_i386"; else LDEMU="elf_x86_64"; fi
 CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"

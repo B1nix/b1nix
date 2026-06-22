@@ -19,12 +19,12 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DB_VERSION="${DROPBEAR_VERSION:-2022.83}"
 DB_TARBALL="dropbear-${DB_VERSION}.tar.bz2"
 DB_URL="https://matt.ucc.asn.au/dropbear/releases/${DB_TARBALL}"
-WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
+WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
 # Per-architecture build identity (B1NIX_ARCH -> triplet).
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 HOST_TRIPLET="$B1NIX_TRIPLET"
 # Per-triplet source tree so x86 and x86_64 never share objects.
 SRC_PARENT="$ROOT_DIR/build/dropbear-src"

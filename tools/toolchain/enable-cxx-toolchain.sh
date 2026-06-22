@@ -11,7 +11,7 @@
 # exceptions) compiles and links into a b1nix ELF. It is idempotent and runs per
 # triplet. build-toolchain.sh can also call it after the toolchain is built.
 #
-# Link recipe for a b1nix C++ binary (see tools/b1nix-c++):
+# Link recipe for a b1nix C++ binary (see tools/toolchain/bin/b1nix-c++):
 #   ld crt0.o objs --start-group libstdc++.a libsupc++.a libgcc.a \
 #                  --whole-archive libb1nix.a --no-whole-archive --end-group
 

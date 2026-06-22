@@ -24,7 +24,7 @@ done
 # Only the loop-device steps (losetup/mount/umount/grub-install) need root; the
 # rest (mke2fs -d, sfdisk on a file, dd) run as the user. SUDO is empty when
 # already root. With a scoped NOPASSWD sudoers drop-in for those four commands
-# (see tools/sudoers.d-b1nix-diskimage), the whole build runs unattended.
+# (see tools/images/sudoers.d-b1nix-diskimage), the whole build runs unattended.
 SUDO=""; [ "$(id -u)" -ne 0 ] && SUDO="sudo"
 [ -d "$ROOTFS" ] || { echo "rootfs missing — run: make ARCH=$ARCH root-image"; exit 1; }
 [ -f "$KERNEL" ] || { echo "kernel missing: $KERNEL"; exit 1; }
@@ -69,7 +69,7 @@ fi
 for s in sh busybox getty "["; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$s"; done
 ln -sf /opt/busybox/bin/busybox "$ROOTFS/sbin/getty"
 awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/[[:space:]]/,"",$1); gsub(/[[:space:]]/,"",$2);
-  if ($2=="upstream" && $1!="[") print $1 }' "$ROOT_DIR/tools/applet-manifest.conf" \
+  if ($2=="upstream" && $1!="[") print $1 }' "$ROOT_DIR/tools/configs/applet-manifest.conf" \
   | while read -r cmd; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$cmd"; done
 # Minimal /etc so login + a bash console work (built-in init falls back to bash).
 [ -f "$ROOTFS/etc/passwd" ] || printf 'root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n' > "$ROOTFS/etc/passwd"

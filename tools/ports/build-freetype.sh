@@ -11,7 +11,7 @@ TARBALL="freetype-${FT_VERSION}.tar.gz"
 URL="https://download.savannah.gnu.org/releases/freetype/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 # Portable in-place sed (GNU sed: `-i EXPR`; BSD/macOS sed: `-i '' EXPR`).
 if sed --version >/dev/null 2>&1; then

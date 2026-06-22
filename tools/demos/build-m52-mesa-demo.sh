@@ -9,7 +9,7 @@ set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DEMO="${1:?usage: build-m52-mesa-demo.sh <source-stem> <output-elf>}"
 OUT="${2:?usage: build-m52-mesa-demo.sh <source-stem> <output-elf>}"
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then LDEMU="elf_i386"; else LDEMU="elf_x86_64"; fi
 CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"

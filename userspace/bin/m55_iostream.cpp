@@ -1,6 +1,6 @@
 /* M55 acceptance test: std::iostream (std::cout/std::cerr + the iostream locale
  * facets) and std::filesystem run correctly on b1nix, built against the cross
- * GCC's hosted libstdc++ via tools/b1nix-c++.
+ * GCC's hosted libstdc++ via tools/toolchain/bin/b1nix-c++.
  *
  * This proves the deferred M55 bullet ("std::filesystem and locale/iostream
  * (std::cout) — thin wrappers over the existing VFS / UTF-8 libc") works

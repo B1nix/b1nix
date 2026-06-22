@@ -18,7 +18,7 @@ URL="https://download.netsurf-browser.org/libs/releases/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 PERL_BIN="${PERL:-$(command -v perl)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/netsurf-src"
 SRC_DIR="$SRC_PARENT/libparserutils-${PU_VERSION}"

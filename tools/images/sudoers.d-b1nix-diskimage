@@ -3,7 +3,7 @@
 # unattended (no password prompt at the keyboard).
 #
 # Install once:
-#   sudo install -m 0440 -o root -g root tools/sudoers.d-b1nix-diskimage /etc/sudoers.d/b1nix-diskimage
+#   sudo install -m 0440 -o root -g root tools/images/sudoers.d-b1nix-diskimage /etc/sudoers.d/b1nix-diskimage
 #   sudo visudo -c            # validate syntax
 #
 # Scope: only these four commands get NOPASSWD — NOT blanket root. (Note: with

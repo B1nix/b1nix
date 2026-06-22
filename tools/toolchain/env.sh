@@ -1,4 +1,4 @@
-# tools/toolchain-env.sh
+# tools/toolchain/env.sh
 #
 # Shared, POSIX-sh sourceable helper that resolves the per-architecture build
 # identity used by every b1nix toolchain and userspace-port build script.
@@ -29,7 +29,7 @@
 
 : "${PROJECT_DIR:=${ROOT_DIR:-}}"
 if [ -z "$PROJECT_DIR" ]; then
-    echo "tools/toolchain-env.sh: PROJECT_DIR (or ROOT_DIR) must be set before sourcing" >&2
+    echo "tools/toolchain/env.sh: PROJECT_DIR (or ROOT_DIR) must be set before sourcing" >&2
     exit 1
 fi
 
@@ -44,7 +44,7 @@ case "$B1NIX_ARCH" in
         B1NIX_GCC_ARCH="x86_64"
         ;;
     *)
-        echo "tools/toolchain-env.sh: unsupported B1NIX_ARCH='$B1NIX_ARCH' (use x86 or x86_64)" >&2
+        echo "tools/toolchain/env.sh: unsupported B1NIX_ARCH='$B1NIX_ARCH' (use x86 or x86_64)" >&2
         exit 1
         ;;
 esac

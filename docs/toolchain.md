@@ -49,7 +49,7 @@ b1nix builds for two targets, selected by `ARCH` / `B1NIX_ARCH`:
 | `x86_64` | `x86_64-b1nix`  | `x86_64` |
 | `x86`    | `i686-b1nix`    | `i686`   |
 
-The single source of truth for this mapping is **`tools/toolchain-env.sh`**, a
+The single source of truth for this mapping is **`tools/toolchain/env.sh`**, a
 POSIX-sh helper sourced by every toolchain/port build script (it reads
 `B1NIX_ARCH`, default `x86_64`, and exports `B1NIX_TRIPLET`, `B1NIX_GCC_ARCH`,
 `B1NIX_ROOTFS`, `TOOLCHAIN_BUILD_HOME`, `TOOLCHAIN_DIST_DIR`,

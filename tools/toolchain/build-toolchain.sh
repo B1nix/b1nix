@@ -9,8 +9,8 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Per-architecture build identity: resolves B1NIX_ARCH -> B1NIX_TRIPLET,
 # shared TOOLCHAIN_SRC_DIR, and per-triplet TOOLCHAIN_BUILD_HOME / B1NIX_ROOTFS
-# (see tools/toolchain-env.sh).
-. "$PROJECT_DIR/tools/toolchain-env.sh"
+# (see tools/toolchain/env.sh).
+. "$PROJECT_DIR/tools/toolchain/env.sh"
 TARGET="$B1NIX_TRIPLET"
 
 BINUTILS_VER="2.41"

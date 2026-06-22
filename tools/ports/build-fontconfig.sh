@@ -13,7 +13,7 @@ URL="https://www.freedesktop.org/software/fontconfig/release/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 GPERF="${GPERF:-$(command -v /opt/homebrew/opt/gperf/bin/gperf 2>/dev/null || command -v gperf)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/fontconfig-${FC_VERSION}"

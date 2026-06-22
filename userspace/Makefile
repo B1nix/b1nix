@@ -8,7 +8,7 @@ ifeq ($(B1NIX_ARCH),x86)
 TARGET   := i686-unknown-elf
 LDFLAGS  := -m elf_i386
 # Host triplet for the per-triplet ported-library install trees (must match
-# tools/toolchain-env.sh: x86 -> i686-b1nix, x86_64 -> x86_64-b1nix).
+# tools/toolchain/env.sh: x86 -> i686-b1nix, x86_64 -> x86_64-b1nix).
 B1NIX_TRIPLET := i686-b1nix
 else
 TARGET   := x86_64-unknown-elf
@@ -22,7 +22,7 @@ CC       := $(if $(CCACHE),$(CCACHE) clang,clang)
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 HOST_CC  ?= cc
-B1NIX_CXX ?= ../tools/b1nix-c++
+B1NIX_CXX ?= ../tools/toolchain/bin/b1nix-c++
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
 # headers from the generated .d files. With -MMD, editing a header in
@@ -345,7 +345,7 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER
 	  $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) $(LIB) --no-whole-archive
 
-# Hosted C++ smoke: built with the cross GCC's libstdc++ via tools/b1nix-c++
+# Hosted C++ smoke: built with the cross GCC's libstdc++ via tools/toolchain/bin/b1nix-c++
 # (NOT clang $(CC)). Requires the C++-enabled toolchain (enable-cxx-toolchain.sh).
 $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
@@ -353,10 +353,10 @@ $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
 
 $(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-clang++ $< -o $@
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-clang++ $< -o $@
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
-# b1nix VFS, built against libstdc++ via tools/b1nix-c++.
+# b1nix VFS, built against libstdc++ via tools/toolchain/bin/b1nix-c++.
 $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
@@ -537,9 +537,9 @@ $(BUILD)/bin/tcc: tcc/tcc.c $(LIB) $(CRT0) $(BUILD)/host/c2str tcc/config.h
 	@mkdir -p $(dir $@)
 	$(BUILD)/host/c2str tcc/include/tccdefs.h tcc/tccdefs_.h
 ifeq ($(B1NIX_ARCH),x86)
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 else
-	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-cc tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 endif
 
 # ── Install to rootfs ──

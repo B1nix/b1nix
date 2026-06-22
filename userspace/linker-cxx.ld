@@ -1,4 +1,4 @@
-/* B1NIX Userspace Linker Script — C++ variant (tools/b1nix-c++).
+/* B1NIX Userspace Linker Script — C++ variant (tools/toolchain/bin/b1nix-c++).
  *
  * Identical to linker.ld except it KEEPs the DWARF unwind info and exception
  * landing-pad tables that C++ exceptions need. The plain linker.ld discards

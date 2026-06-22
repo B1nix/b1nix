@@ -5,7 +5,7 @@ BUILD_DIR := build/$(ARCH)
 # Host triplet for the ported userspace toolchain + programs. Their build trees
 # live under per-triplet directories (build/toolchain_build/<triplet>,
 # build/<prog>-{src,b1nix}/<triplet>) so x86 and x86_64 never share objects.
-# Keep this mapping in sync with tools/toolchain-env.sh.
+# Keep this mapping in sync with tools/toolchain/env.sh.
 ifeq ($(ARCH),x86)
 B1NIX_TRIPLET := i686-b1nix
 else
@@ -31,7 +31,7 @@ INITRAMFS_NETSURF_INC := $(BUILD_DIR)/initramfs_netsurf_files.inc
 NSFB_ELF := build/netsurf-fb-b1nix/$(B1NIX_TRIPLET)/nsfb
 
 # Applet manifest for /bin replacement (M42 items 3 and 4).
-APPLET_MANIFEST := tools/applet-manifest.conf
+APPLET_MANIFEST := tools/configs/applet-manifest.conf
 APPLET_SYMLINKS_INC := $(BUILD_DIR)/initramfs_applet_symlinks.inc
 APPLET_REGISTRATION_INC := $(BUILD_DIR)/initramfs_applet_registration.inc
 
@@ -425,7 +425,7 @@ $(BUILD_DIR)/kernel/fs/initramfs.o: $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC)
 $(BUILD_DIR)/kernel/user/programs.o: $(APPLET_REGISTRATION_INC)
 
 # ── Applet manifest generation (M42 items 3 & 4) ──
-# Reads tools/applet-manifest.conf and generates:
+# Reads tools/configs/applet-manifest.conf and generates:
 #   (a) initramfs_applet_symlinks.inc — symlink entries for upstream applets
 #   (b) initramfs_applet_registration.inc — conditional user_register_program calls
 #
@@ -498,7 +498,7 @@ $(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_
 
 # PCRE2: cross-build the static 8-bit library, then link the smoke against it.
 PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
-$(PCRE2_LIB): tools/ports/build-pcre2.sh tools/b1nix-autotools-cc
+$(PCRE2_LIB): tools/ports/build-pcre2.sh tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-pcre2.sh >/dev/null
 
 # M51: libm (openlibm), cross-built static, linked into m51_smoke.
@@ -614,20 +614,20 @@ $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPAC
 # Hosted C++ runtime smoke. Enable libstdc++ against the b1nix libc first
 # (idempotent: stages headers + fixes mbstate_t config), then build via the
 # cross GCC C++ wrapper.
-$(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
 
-$(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) tools/b1nix-clang++ tools/b1nix-c++
+$(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
 # M55: std::iostream + std::filesystem acceptance test (hosted libstdc++).
-$(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
 	@mkdir -p $(dir $@)
@@ -796,7 +796,7 @@ $(BUILD_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(US
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_virgl_smoke_elf userspace/build/$(ARCH)/bin/m53_virgl_smoke > $@
 
-$(CURL_ELF): tools/ports/build-curl.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(CURL_ELF): tools/ports/build-curl.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-curl.sh
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
@@ -805,7 +805,7 @@ $(INITRAMFS_CURL_INC): $(CURL_ELF)
 
 # Dropbear SSH server (dropbearmulti: server + dropbearkey + dropbearconvert,
 # dispatched by argv[0]). Built static against the b1nix userspace libc.
-$(DROPBEAR_ELF): tools/ports/build-dropbear.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(DROPBEAR_ELF): tools/ports/build-dropbear.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
 	tools/ports/build-dropbear.sh all >/dev/null
 
 $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
@@ -815,7 +815,7 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 # GNU bash 5.2 — the default interactive shell (and /bin/sh). Built static
 # against the b1nix userspace libc by tools/ports/build-bash.sh (autotools cross
 # build with a preseeded config.cache).
-$(BASH_ELF): tools/ports/build-bash.sh tools/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(BASH_ELF): tools/ports/build-bash.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-bash.sh >/dev/null
 
 $(INITRAMFS_BASH_INC): $(BASH_ELF)
@@ -823,18 +823,18 @@ $(INITRAMFS_BASH_INC): $(BASH_ELF)
 	xxd -i -n vfs_bash_elf $(BASH_ELF) > $@
 
 OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
-$(OPENSSL_LIB): tools/ports/build-openssl.sh tools/b1nix-autotools-cc
+$(OPENSSL_LIB): tools/ports/build-openssl.sh tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-openssl.sh >/dev/null
 
 LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
-$(LIBIDN2_LIB): tools/ports/build-libidn2.sh tools/ports/build-libunistring.sh tools/b1nix-autotools-cc
+$(LIBIDN2_LIB): tools/ports/build-libidn2.sh tools/ports/build-libunistring.sh tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-libidn2.sh >/dev/null
 
 LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
-$(LIBPSL_LIB): tools/ports/build-libpsl.sh tools/b1nix-autotools-cc
+$(LIBPSL_LIB): tools/ports/build-libpsl.sh tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-libpsl.sh >/dev/null
 
-$(WGET_ELF): tools/ports/build-wget.sh tools/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
+$(WGET_ELF): tools/ports/build-wget.sh tools/toolchain/bin/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-wget.sh
 
 $(INITRAMFS_WGET_INC): $(WGET_ELF)

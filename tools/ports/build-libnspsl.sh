@@ -12,7 +12,7 @@ set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 # libnspsl ships inside the netsurf-all bundle that build-netsurf-fb.sh extracts.
 SRC_PARENT="$ROOT_DIR/build/netsurf-src"

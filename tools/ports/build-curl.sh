@@ -7,11 +7,11 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 CURL_VERSION="${CURL_VERSION:-8.20.0}"
 CURL_TARBALL="curl-${CURL_VERSION}.tar.gz"
 CURL_URL="https://curl.se/download/${CURL_TARBALL}"
-WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
+WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 # Per-architecture build identity (B1NIX_ARCH -> triplet).
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 HOST_TRIPLET="$B1NIX_TRIPLET"
 # Pin the arch the wrapper compiles for to the triplet we're building, and
 # export it so every sub-make / libtool invocation that runs b1nix-autotools-cc

@@ -13,7 +13,7 @@ URL="https://xkbcommon.org/download/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 BISON="${BISON:-$(command -v /opt/homebrew/opt/bison/bin/bison 2>/dev/null || command -v bison)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/libxkbcommon-${XKB_VERSION}"

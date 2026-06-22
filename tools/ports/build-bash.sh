@@ -18,12 +18,12 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 BASH_VERSION_NUM="${BASH_VERSION_NUM:-5.2.37}"
 BASH_TARBALL="bash-${BASH_VERSION_NUM}.tar.gz"
 BASH_URL="https://ftp.gnu.org/gnu/bash/${BASH_TARBALL}"
-WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
+WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
 # Per-architecture build identity (B1NIX_ARCH -> triplet).
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 HOST_TRIPLET="$B1NIX_TRIPLET"
 case "$HOST_TRIPLET" in
   i686*) B1NIX_ARCH=x86 ;;

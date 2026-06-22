@@ -747,7 +747,7 @@ revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
 - [x] `done` Build and **run** libstdc++ with C++ exceptions (DWARF `.eh_frame`
   unwinding, registered with `libgcc` by `crt0`), RTTI, and thread-safe statics.
   The cross GCC 13.2 builds `libstdc++.a`/`libsupc++.a` (`--enable-threads=posix`,
-  staged by `tools/toolchain/enable-cxx-toolchain.sh`); `tools/b1nix-c++` links them with
+  staged by `tools/toolchain/enable-cxx-toolchain.sh`); `tools/toolchain/bin/b1nix-c++` links them with
   `libgcc` via `userspace/linker-cxx.ld` (keeps `.eh_frame`/`.gcc_except_table`).
   Verified end-to-end by `userspace/bin/cxx_smoke.cpp` (`CXX-SMOKE: ok` for
   ctors, stl, exceptions, **rtti** `dynamic_cast`/`typeid`/`bad_cast`,
@@ -908,7 +908,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
 
 - [x] `done` **Phase 1 — optional cross `clang++` frontend (x86_64).**
-  `tools/b1nix-clang++` compiles against the staged GCC 13 headers and links the
+  `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
   existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
   `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
   x86_64-only: clang and the GCC-built libstdc++ disagree on `size_t` mangling

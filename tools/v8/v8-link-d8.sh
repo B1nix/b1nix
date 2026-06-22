@@ -4,7 +4,7 @@
 # gn's own link step uses the plain g++ driver with an empty sysroot (no crt0,
 # no libc) and produces a glibc-shaped binary — wrong for b1nix. This relinks
 # the exact object set gn computed (out/b1nix/d8.rsp) with the b1nix C++ recipe
-# from tools/b1nix-c++: crt0.o + linker-cxx.ld + the libstdc++/libsupc++/libgcc
+# from tools/toolchain/bin/b1nix-c++: crt0.o + linker-cxx.ld + the libstdc++/libsupc++/libgcc
 # group + openlibm + whole-archived libb1nix.a, wrapped so inter-archive
 # circular refs resolve.
 #

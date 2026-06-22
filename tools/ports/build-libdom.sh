@@ -17,7 +17,7 @@ TARBALL="libdom-${DOM_VERSION}-src.tar.gz"
 URL="https://download.netsurf-browser.org/libs/releases/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 HUBBUB_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-libhubbub.sh")"
 LWC_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-libwapcaplet.sh")"

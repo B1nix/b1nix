@@ -3290,7 +3290,7 @@ void user_register_builtin_programs(void) {
 
   /* M22/M42 — Core Terminal Utilities (BusyBox multi-call dispatch).
    *
-   * Applet registration is controlled by tools/applet-manifest.conf (M42
+   * Applet registration is controlled by tools/configs/applet-manifest.conf (M42
    * items 3 & 4).  Commands marked "upstream" skip native registration; they
    * are served by an initramfs symlink to the upstream BusyBox ELF.  Commands
    * marked "native" are always registered here.  The .inc below is generated

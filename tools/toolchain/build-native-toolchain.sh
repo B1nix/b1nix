@@ -9,7 +9,7 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Per-architecture build identity (B1NIX_ARCH -> triplet, shared sources,
 # per-triplet build/output paths).
-. "$PROJECT_DIR/tools/toolchain-env.sh"
+. "$PROJECT_DIR/tools/toolchain/env.sh"
 TARGET="$B1NIX_TRIPLET"
 
 BINUTILS_VER="2.41"
@@ -144,8 +144,8 @@ if [ ! -f "$NATIVE_DEST/bin/gcc" ]; then
             LDFLAGS="$LDFLAGS_VAL" \
             LIBS="$LIBS_VAL" \
             HOST_LIBS="$HOST_LIBS_VAL" \
-            CC_FOR_BUILD="$PROJECT_DIR/tools/b1nix-buildcc" \
-            CXX_FOR_BUILD="$PROJECT_DIR/tools/b1nix-buildcxx" \
+            CC_FOR_BUILD="$PROJECT_DIR/tools/toolchain/bin/b1nix-buildcc" \
+            CXX_FOR_BUILD="$PROJECT_DIR/tools/toolchain/bin/b1nix-buildcxx" \
             CFLAGS_FOR_BUILD="-O2" \
             CXXFLAGS_FOR_BUILD="-O2" \
             CPPFLAGS_FOR_BUILD="" \

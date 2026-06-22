@@ -15,7 +15,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 VER="${LIBPSL_VERSION:-0.21.5}"
 TARBALL="libpsl-${VER}.tar.gz"
 URL="https://github.com/rockdaboot/libpsl/releases/download/${VER}/${TARBALL}"
-WRAP="$ROOT_DIR/tools/b1nix-autotools-cc"
+WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 PYTHON_BIN="${PYTHON:-$(command -v python3 2>/dev/null || command -v python 2>/dev/null || true)}"
@@ -26,7 +26,7 @@ if [ -z "$PYTHON_BIN" ]; then
 fi
 
 # Per-architecture build identity + per-triplet source/build dirs.
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 HOST_TRIPLET="$B1NIX_TRIPLET"
 SRC_PARENT="$ROOT_DIR/build/libpsl-src"
 SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/libpsl-${VER}"

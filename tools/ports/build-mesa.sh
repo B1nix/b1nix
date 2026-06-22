@@ -18,7 +18,7 @@ TARBALL="mesa-${MESA_VERSION}.tar.xz"
 URL="https://archive.mesa3d.org/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/mesa-${MESA_VERSION}"
@@ -63,7 +63,7 @@ LIBSUPCXX="$("$GXX" -print-file-name=libsupc++.a)"
 LIBGCC="$("$GXX" -print-libgcc-file-name)"
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 
-# meson cross file. The compiler is wrapped (tools/b1nix-mesa-cc) to strip
+# meson cross file. The compiler is wrapped (tools/toolchain/bin/b1nix-mesa-cc) to strip
 # -pthread, which the b1nix cross GCC has no spec for. PATH_MAX/LLONG_MAX are
 # defined because some generated/flex C++ files use them without including the
 # header that declares them. system='linux' + -D__linux__ make Mesa take its
@@ -73,8 +73,8 @@ DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9
 LINKARGS="'-nostdlib', '-T', '$ROOT_DIR/userspace/linker-cxx.ld', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$LIBSTDCXX', '$LIBSUPCXX', '$LIBGCC', '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
 cat > "$INI" <<EOF
 [binaries]
-c = ['$ROOT_DIR/tools/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
-cpp = ['$ROOT_DIR/tools/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-g++']
+c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
+cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-g++']
 ar = '$CROSS/bin/$B1NIX_TRIPLET-ar'
 strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
 pkg-config = 'false'

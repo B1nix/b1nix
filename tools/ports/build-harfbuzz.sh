@@ -14,7 +14,7 @@ TARBALL="harfbuzz-${HB_VERSION}.tar.xz"
 URL="https://github.com/harfbuzz/harfbuzz/releases/download/${HB_VERSION}/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/harfbuzz-${HB_VERSION}"

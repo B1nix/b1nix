@@ -19,7 +19,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 GPERF_BIN="${GPERF:-$(command -v gperf 2>/dev/null || true)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 if [ -z "$GPERF_BIN" ]; then
   echo "build-libsvgtiny.sh: gperf not found on host (needed for colors table)" >&2

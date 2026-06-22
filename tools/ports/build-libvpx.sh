@@ -16,7 +16,7 @@ TARBALL="libvpx-${VPX_VERSION}.tar.gz"
 URL="https://github.com/webmproject/libvpx/archive/refs/tags/v${VPX_VERSION}.tar.gz"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/libvpx-src"
 SRC_DIR="$SRC_PARENT/libvpx-${VPX_VERSION}"

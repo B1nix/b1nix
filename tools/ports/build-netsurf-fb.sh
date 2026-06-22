@@ -15,7 +15,7 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 PROJECT_DIR="$ROOT_DIR"
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 NS_VERSION="${NS_VERSION:-3.11}"
 SRC_PARENT="$ROOT_DIR/build/netsurf-src"

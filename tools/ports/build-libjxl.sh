@@ -13,7 +13,7 @@ set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 VER="${LIBJXL_VERSION:-0.11.1}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 # Pinned submodule commits (libjxl's GitHub source tarball excludes submodules;
 # deps.sh fetches these — we do the equivalent so the build is self-contained).

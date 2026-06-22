@@ -99,11 +99,11 @@ the entry-assembly details.
 
 ## External Cross-Compilation
 
-Use the `tools/b1nix-cc` wrapper or clang directly:
+Use the `tools/toolchain/bin/b1nix-cc` wrapper or clang directly:
 
 ```sh
 # Using the wrapper
-tools/b1nix-cc hello.c -o hello
+tools/toolchain/bin/b1nix-cc hello.c -o hello
 
 # Using clang directly
 clang --target=x86_64-unknown-elf \

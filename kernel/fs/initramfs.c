@@ -1421,7 +1421,7 @@ static const struct initramfs_file files[] = {
      sizeof(initramfs_bpkg_hello_tgz), 0},
     {"/pkgs/dep1-1.0.tar.gz", (const char *)initramfs_bpkg_dep1_tgz,
      sizeof(initramfs_bpkg_dep1_tgz), 0},
-    /* Applet symlinks — generated from tools/applet-manifest.conf */
+    /* Applet symlinks — generated from tools/configs/applet-manifest.conf */
     {"/bin/busybox", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
     /* M39: getty for inittab serial/tty sessions — the upstream BusyBox applet,
      * reachable under the conventional /bin and /sbin names. */

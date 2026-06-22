@@ -9,7 +9,7 @@ WAYLAND_TARBALL="wayland-${WAYLAND_VERSION}.tar.xz"
 WAYLAND_URL="https://gitlab.freedesktop.org/wayland/wayland/-/releases/${WAYLAND_VERSION}/downloads/${WAYLAND_TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 SRC_PARENT="$ROOT_DIR/build/wayland-src"
 SRC_DIR="$SRC_PARENT/wayland-${WAYLAND_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/wayland-b1nix/$B1NIX_TRIPLET"

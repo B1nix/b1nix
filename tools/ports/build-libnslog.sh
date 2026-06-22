@@ -17,7 +17,7 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 FLEX_BIN="${FLEX:-$(command -v flex)}"
 BISON_BIN="${BISON:-$(command -v /opt/homebrew/opt/bison/bin/bison 2>/dev/null || command -v bison)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/netsurf-src"
 SRC_DIR="$SRC_PARENT/libnslog-${NSLOG_VERSION}"

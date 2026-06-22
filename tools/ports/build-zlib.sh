@@ -15,7 +15,7 @@ TARBALL="zlib-${ZLIB_VERSION}.tar.gz"
 URL="https://github.com/madler/zlib/archive/refs/tags/v${ZLIB_VERSION}.tar.gz"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 SRC_PARENT="$ROOT_DIR/build/zlib-src"
 SRC_DIR="$SRC_PARENT/zlib-${ZLIB_VERSION}"

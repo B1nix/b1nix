@@ -86,11 +86,11 @@ All files were written from scratch for the 32-bit target:
 - Supports `B1NIX_ARCH=x86`: selects `i686-unknown-elf` target, `-m elf_i386` linker flag.
 - Generates 32-bit `crt0.o`, `libc.a`, and ELF32 binaries.
 
-**`tools/b1nix-cc`**
+**`tools/toolchain/bin/b1nix-cc`**
 - Passes `--target=i686-elf -m32` when `B1NIX_ARCH=x86`.
 
 **Per-architecture toolchain & port directories**
-- `tools/toolchain-env.sh` (new) is the single source of truth mapping
+- `tools/toolchain/env.sh` (new) is the single source of truth mapping
   `B1NIX_ARCH` → host triplet (`x86` → `i686-b1nix`, `x86_64` → `x86_64-b1nix`)
   and per-triplet build paths. Every toolchain/port build script sources it.
 - Cross + native toolchains build under `build/toolchain_build/<triplet>/`

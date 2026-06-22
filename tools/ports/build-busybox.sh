@@ -11,7 +11,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 
 # Per-architecture build identity (B1NIX_ARCH -> triplet, per-triplet paths).
-. "$PROJECT_DIR/tools/toolchain-env.sh"
+. "$PROJECT_DIR/tools/toolchain/env.sh"
 TARGET="$B1NIX_TRIPLET"
 
 OS="$(uname -s)"

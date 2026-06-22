@@ -17,7 +17,7 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 PERL_BIN="${PERL:-$(command -v perl)}"
 GPERF_BIN="${GPERF:-$(command -v gperf)}"
 
-. "$ROOT_DIR/tools/toolchain-env.sh"
+. "$ROOT_DIR/tools/toolchain/env.sh"
 
 PU_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-libparserutils.sh")"
 
