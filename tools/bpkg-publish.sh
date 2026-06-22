@@ -67,10 +67,10 @@ sha256_of() {
 	fi
 }
 
-mkdir -p "$OUTDIR"
+mkdir -p "$OUTDIR/$ARCH"
 INDEX="$OUTDIR/index"
 TARBALL_NAME="${NAME}-${VERSION}-${ARCH}.tar.gz"
-TARBALL="$OUTDIR/$TARBALL_NAME"
+TARBALL="$OUTDIR/$ARCH/$TARBALL_NAME"
 
 # Deterministic tarball: stored paths are relative to SRCDIR (so they extract
 # relative to / on the target). GNU tar flags make the bytes reproducible; plain
@@ -83,7 +83,7 @@ else
 fi
 
 SHA="$(sha256_of "$TARBALL")"
-URL="https://cdn.jsdelivr.net/gh/${GH_SLUG%%@*}@${GH_SLUG##*@}/pkgs/${TARBALL_NAME}"
+URL="https://cdn.jsdelivr.net/gh/${GH_SLUG%%@*}@${GH_SLUG##*@}/pkgs/${ARCH}/${TARBALL_NAME}"
 
 # Append/replace the matching (name, arch) line in the index. Lines are kept
 # space-separated: name version arch sha256 url. Comments (#) are preserved.
