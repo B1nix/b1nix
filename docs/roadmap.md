@@ -947,16 +947,29 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
   path yet) — correct but not fast; interrupt-driven AHCI is future work.
 
-## M69: Dynamic Loading (ELF dynamic linker) — planned
+## M69: Dynamic Loading (ELF dynamic linker) — DONE
 
-- [ ] `planned` b1nix is **static-only** (no runtime loader). Implement an
-  ELF dynamic linker (`ld.so`-equivalent): honor `PT_INTERP`/`PT_DYNAMIC`,
-  apply load-time relocations + PLT/GOT, and manage shared-object lifetimes.
-- [ ] `planned` Real `dlopen`/`dlsym`/`dlclose`/`dlerror` in libc — today these
-  are **honest stubs** (`dlopen`→`NULL`) because no loader exists.
+Implemented as a real userspace `ld.so` in `userspace/libc/dlfcn.c` (mmap +
+mprotect, no kernel changes): the kernel still loads the main PIE binary and its
+startup objects eagerly (M30); this handles everything after the process is
+running. Verified end-to-end by the m30-dynamic smoke (`M69-DL*` + `M69-PLUGIN`
+ctor/dtor markers).
+
+- [x] `done` **Phase 1 — lookup in startup-loaded libc.** `dlopen` recognizes
+  `libc.so.1`, `dlsym` walks its ELF `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB`, and
+  `dlclose` succeeds without unloading the process-lifetime object. The dynamic
+  smoke resolves and calls `strlen` through the returned pointer.
+- [x] `done` **Phase 2 — load new objects at runtime.** `dlopen` of a new
+  ET_DYN maps its PT_LOAD segments, parses `PT_DYNAMIC`, loads non-libc
+  `DT_NEEDED` deps, applies `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64` relocations
+  (resolving against the loaded objects), `mprotect`s segments to final perms,
+  and runs `DT_INIT`/`DT_INIT_ARRAY` constructors. Proven by a real plugin .so
+  whose ctor runs and whose exported function is dlsym'd and called.
+- [x] `done` **Phase 3 — lifetimes and full lookup scopes.** Objects are
+  reference-counted (re-`dlopen` returns the same handle), `dlclose` runs
+  `DT_FINI_ARRAY`/`DT_FINI` and `munmap`s at zero, and `RTLD_DEFAULT` /
+  `RTLD_NEXT` lookup scopes are implemented.
 - **Motivation:** unblocks rustc **proc-macros** and compiler **plugins** (both
   loaded as `.so`) plus general shared-library support. **NOT** required for the
   static native rustc (M68) — that statically links its LLVM backend; this only
   removes the "no dynamic loading" ceiling.
-- Large effort (full dynamic-linking machinery). Defer until a concrete
-  consumer needs it.

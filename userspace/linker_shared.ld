@@ -9,6 +9,7 @@ PHDRS
 SECTIONS
 {
 	. = 0;
+	PROVIDE_HIDDEN(__b1nix_image_base = .);
 	.text : ALIGN(0x1000) { *(.text .text.*) } :text
 	.rodata : ALIGN(0x1000) { *(.rodata .rodata.*) } :ro
 	.rela.dyn : ALIGN(0x1000) { *(.rela.dyn) } :ro
@@ -25,6 +26,12 @@ SECTIONS
 		KEEP(*(SORT_BY_INIT_PRIORITY(.init_array.*)))
 		KEEP(*(.init_array .ctors))
 		__init_array_end = .;
+	} :data
+	.fini_array : ALIGN(8) {
+		__fini_array_start = .;
+		KEEP(*(SORT_BY_INIT_PRIORITY(.fini_array.*)))
+		KEEP(*(.fini_array .dtors))
+		__fini_array_end = .;
 	} :data
 	.bss : ALIGN(0x1000) { *(COMMON) *(.bss .bss.*) } :data
 	.dynamic : ALIGN(0x1000) { *(.dynamic) } :data :dynamic

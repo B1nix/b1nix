@@ -115,6 +115,7 @@ ifeq ($(ARCH),x86_64)
 # i686-b1nix (unsigned int vs unsigned long), so the i686 clang link fails.
 EMBEDDED_USER_PROGRAMS += m30_dynamic m64_clang_smoke
 INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
+INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -126,6 +127,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
+	$(INITRAMFS_M69_PLUGIN_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -911,6 +913,12 @@ $(INITRAMFS_SHARED_LIBC_INC): $(USERSPACE_DEPS) userspace/linker_shared.ld
 	@$(MAKE) -C userspace build/$(ARCH)/libc.so.1
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_shared_libc_elf userspace/build/$(ARCH)/libc.so.1 > $@
+
+# M69: a shared object the m30-dynamic smoke dlopen's at runtime.
+$(INITRAMFS_M69_PLUGIN_INC): userspace/bin/m69_plugin.c $(USERSPACE_DEPS) userspace/linker_shared.ld
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m69_plugin_elf userspace/build/$(ARCH)/bin/m69_plugin.so > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)

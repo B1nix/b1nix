@@ -1461,6 +1461,11 @@ check_output "$LOG" "M30-DYN: ok pie-relocs" "R_X86_64_RELATIVE relocations appl
 check_output "$LOG" "M30-DYN: done" "M30 dyn-linking smoke completes"
 if [ "$ARCH" = "x86_64" ]; then
   check_output "$LOG" "M30-DYN: ok shared-libc" "DT_NEEDED libc.so.1 resolves GOT/PLT symbols"
+  check_output "$LOG" "M69-DL: dlsym ok" "M69 P1: dlopen/dlsym resolves+calls a libc.so.1 symbol"
+  check_output "$LOG" "M69-PLUGIN: ctor" "M69 P2: dlopen runs the new object's DT_INIT_ARRAY ctor"
+  check_output "$LOG" "M69-DL2: dlopen-run ok" "M69 P2: runtime-loaded .so relocated, dlsym'd, and called"
+  check_output "$LOG" "M69-DL3: refcount-scope ok" "M69 P3: refcount + RTLD_DEFAULT scope work"
+  check_output "$LOG" "M69-PLUGIN: dtor" "M69 P3: final dlclose runs DT_FINI_ARRAY dtor + unmaps"
 fi
 check_output "$LOG" "B1NIX-TEST: done" "test-mode shutdown marker appears"
 check_output "$LOG" "reboot: restarting" "SYS_REBOOT performs a real machine restart"

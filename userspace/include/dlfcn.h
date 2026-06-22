@@ -6,15 +6,13 @@
 /*
  * dlfcn.h — B1NIX userspace
  *
- * B1NIX supports static ELF binaries only.  Dynamic loading (dlopen/dlsym)
- * is NOT available at runtime.  These declarations are provided so that
- * third-party code that conditionally uses dlopen can compile cleanly.
+ * B1NIX resolves symbols from libc.so.1 when it was loaded at process startup.
+ * Loading additional objects at runtime is not available yet.
  *
  * Runtime behaviour:
- *   dlopen(name, ...)  → always returns NULL (error stored in dlerror buffer)
- *   dlopen(NULL, ...)  → returns a non-NULL sentinel (RTLD_DEFAULT semantics)
- *   dlsym(h, sym)      → always returns NULL (error stored in dlerror buffer)
- *   dlclose(h)         → always returns -1  (error stored in dlerror buffer)
+ *   dlopen("libc.so.1", ...) → handle for the startup-loaded libc
+ *   dlsym(h, sym)            → resolved libc symbol or NULL
+ *   dlclose(h)               → succeeds; startup objects live until exit
  *   dlerror()          → returns last error string and clears it (POSIX)
  */
 

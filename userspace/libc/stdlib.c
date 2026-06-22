@@ -850,68 +850,7 @@ void siglongjmp(sigjmp_buf env, int val) {
 	longjmp(env[0].__jb, val);
 }
 
-/* -----------------------------------------------------------------------
- * dlfcn stubs — B1NIX supports eager startup linking, but runtime loading is
- * not available. These stubs follow the POSIX error-reporting contract:
- *   • dlopen()  always fails → returns NULL, sets dlerror buffer.
- *   • dlerror() returns the last error string and clears the buffer.
- *   • dlsym()   always fails → returns NULL, sets dlerror buffer.
- *   • dlclose() always fails → returns -1, sets dlerror buffer.
- * A program that checks dlerror() after each call will behave correctly.
- * ----------------------------------------------------------------------- */
-static const char *_dl_errmsg;
-
-void *dlopen(const char *filename, int flag)
-{
-    (void)flag;
-    if (filename == NULL) {
-        /* RTLD_DEFAULT / self-handle: return a non-NULL sentinel so that
-         * dlsym(RTLD_DEFAULT, ...) callers get a consistent NULL back from
-         * dlsym rather than a misleading dlerror from dlopen itself. */
-        return (void *)(unsigned long)1;
-    }
-    _dl_errmsg = "dlopen: runtime loading not supported on b1nix";
-    return NULL;
-}
-
-char *dlerror(void)
-{
-    /* POSIX: each successful call to dlerror() resets the error indicator. */
-    const char *msg = _dl_errmsg;
-    _dl_errmsg = NULL;
-    return (char *)msg;
-}
-
-void *dlsym(void *handle, const char *symbol)
-{
-    (void)handle;
-    (void)symbol;
-    _dl_errmsg = "dlsym: dynamic symbol lookup not supported on b1nix";
-    return NULL;
-}
-
-int dlclose(void *handle)
-{
-    (void)handle;
-    _dl_errmsg = "dlclose: runtime loading not supported on b1nix";
-    return -1;
-}
-
-int dladdr(const void *addr, Dl_info *info)
-{
-    /* Static-only ELF: no loaded-object symbol tables to walk. Report "not
-     * found" the way glibc does on failure (return 0). Zero out the info so a
-     * caller that ignores the return value still sees empty fields rather than
-     * garbage. */
-    (void)addr;
-    if (info) {
-        info->dli_fname = NULL;
-        info->dli_fbase = NULL;
-        info->dli_sname = NULL;
-        info->dli_saddr = NULL;
-    }
-    return 0;
-}
+/* dlopen/dlsym/dlclose/dlerror/dladdr live in dlfcn.c (M69 runtime loader). */
 
 double ldexp(double x, int exp)
 {

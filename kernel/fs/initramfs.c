@@ -48,6 +48,7 @@
 #ifdef __x86_64__
 #include "initramfs_m30_dynamic.inc"
 #include "initramfs_shared_libc.inc"
+#include "initramfs_m69_plugin.inc"
 #endif
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
@@ -1521,6 +1522,8 @@ static const struct initramfs_file files[] = {
     {"/lib/libc.so.1", (const char *)vfs_shared_libc_elf,
      sizeof(vfs_shared_libc_elf), INITRAMFS_EXECUTABLE},
     {"/lib/libc.so", "/lib/libc.so.1", 15, INITRAMFS_SYMLINK},
+    {"/lib/m69_plugin.so", (const char *)vfs_m69_plugin_elf,
+     sizeof(vfs_m69_plugin_elf), INITRAMFS_EXECUTABLE},
     /* M40: a static Linux x86_64 ELF that uses Linux syscall numbers; the Linux
      * ABI translation layer maps them to the native handlers. */
     {"/bin/m40-linux-hello", (const char *)vfs_m40_linux_hello,

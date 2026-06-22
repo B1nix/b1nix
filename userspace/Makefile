@@ -66,6 +66,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/mntent.o \
 	$(BUILD)/libc/statvfs.o \
 	$(BUILD)/libc/eventpoll.o \
+	$(BUILD)/libc/dlfcn.o \
 	$(BUILD)/libc/div64.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
@@ -520,6 +521,14 @@ $(BUILD)/bin/m30_dynamic: bin/m30_dynamic.c $(SHARED_LIBC) $(DYNAMIC_CRT0) linke
 	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m30_dynamic.o
 	$(LD) $(LDFLAGS) -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-b1nix.so \
 		-T linker_pie.ld -o $@ $(DYNAMIC_CRT0) $(BUILD)/bin/m30_dynamic.o $(SHARED_LIBC)
+
+# M69: a runtime-dlopen'd shared object. Linked against libc.so.1 so its write()
+# stays an undefined import resolved by the userspace loader (dlfcn.c) at dlopen.
+$(BUILD)/bin/m69_plugin.so: bin/m69_plugin.c $(SHARED_LIBC) linker_shared.ld
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -fPIC -c $< -o $(BUILD)/bin/m69_plugin.o
+	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=sysv -soname m69_plugin.so \
+		-T linker_shared.ld -o $@ $(BUILD)/bin/m69_plugin.o $(SHARED_LIBC)
 
 $(BUILD)/host/c2str: tcc/conftest.c
 	@mkdir -p $(dir $@)
