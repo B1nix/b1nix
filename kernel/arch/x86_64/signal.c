@@ -197,7 +197,13 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     scheduler_yield();
                     return;
                 } else {
-                    console_write("signal: process killed by signal\n");
+                    console_write("signal: process pid=");
+                    console_write_dec(current_task->id);
+                    console_write(" killed by signal ");
+                    console_write_dec(i);
+                    console_write(" rip=");
+                    console_write_hex64(frame->rip);
+                    console_write("\n");
                     /* Encode "killed by signal i" as 128+i so waitpid reports
                      * WIFSIGNALED with WTERMSIG == i (see scheduler_waitpid). */
                     scheduler_exit_current(128 + i);
