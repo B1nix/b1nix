@@ -39,10 +39,27 @@ find "$OUT" -name '*.a' -exec "$RANLIB" {} \; 2>/dev/null || true
 
 echo "linking d8..."
 cd "$OUT"
+
+# Rust-enabled builds (e.g. v8_enable_temporal_support -> the temporal_capi
+# crate): GN's link rule appends the rust rlib set via a separate `rlibs =`
+# binding in obj/d8.ninja, plus the b1nix rust std in prebuilt_rustc_sysroot
+# (via ldflags) — NEITHER is in d8.rsp. Without them the V8 C++ that calls
+# temporal_capi leaves ~558 `temporal_rs_*` C symbols undefined. Pull both into
+# the link group. Empty for a non-rust build, so that path is unchanged.
+RUST_RLIBS=""
+[ -f obj/d8.ninja ] && RUST_RLIBS="$(grep -E '^[[:space:]]*rlibs =' obj/d8.ninja | head -1 | sed 's/^[[:space:]]*rlibs = //')"
+RUST_STD=""
+[ -d prebuilt_rustc_sysroot/lib/rustlib/x86_64-unknown-b1nix/lib ] && \
+  RUST_STD="$(ls prebuilt_rustc_sysroot/lib/rustlib/x86_64-unknown-b1nix/lib/*.rlib 2>/dev/null | tr '\n' ' ')"
+[ -n "$RUST_RLIBS" ] && echo "  + rust: $(printf '%s' "$RUST_RLIBS" | wc -w) app rlibs + $(printf '%s' "$RUST_STD" | wc -w) std rlibs"
+
+# One big --start-group so the C++<->rust<->rust-std<->libc<->libstdc++ circular
+# references all resolve (rust rlibs need rust std; rust std needs libb1nix libc).
 "$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
   -o d8.b1nix \
-  "$CRT0" --start-group @d8.rsp --end-group \
-  --start-group "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" \
+  "$CRT0" \
+  --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
+  "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" \
   --whole-archive "$LIBB1" --no-whole-archive --end-group
 
 echo "=== linked: $OUT/d8.b1nix ==="

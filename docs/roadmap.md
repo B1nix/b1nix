@@ -823,10 +823,22 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
   space), so a user access there faulted as a present supervisor page. Fixed by
   relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
 - Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
-  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**. Only Temporal is
-  off (needs the Rust `temporal_rs` crate; b1nix has no Rust toolchain). d8 ships
-  **inside the ISO** as a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate
-  SATA disk. Run via `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
+  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**, **Temporal on**
+  (see below — now that b1nix has a Rust toolchain). d8 ships **inside the ISO** as
+  a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate SATA disk. Run via
+  `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
+- [x] `done` **Temporal — V8 with Rust (v0.69.8).** `v8_enable_temporal_support`
+  pulls in the Rust `temporal_capi`/`temporal_rs` (+ `icu_calendar`, `diplomat`,
+  ~33 crates) — the first Rust running *inside* V8 on b1nix. Built with the b1nix
+  cross-rust (`build/rust-native/.../x86_64-unknown-linux-gnu/stage2`, target
+  `x86_64-unknown-b1nix`). GN wiring: `apply.sh` Patches **7** (real b1nix
+  `rust_abi_target`), **7b** (known-target-triples), **7c** (profiler_builtins is
+  chromium-toolchain-only); `tools/v8/setup-rust-hoststd.sh` grafts a host std
+  (with `.rmeta`) for proc-macros/build-scripts; `tools/v8/v8-link-d8.sh` pulls the
+  rust rlibs + rust std into the d8 link (GN passes them outside `d8.rsp`). d8 needs
+  `--harmony-temporal` (added to the `kernel/main.c` argv — Temporal is an
+  in-progress harmony flag). Verified in QEMU: `M58-V8: ok temporal-plaindate`,
+  `ok temporal-duration`, `ok temporal-add` (calendar arithmetic runs in Rust).
 - [x] `done` **WebAssembly** (`v8_enable_webassembly`). Trap handler off on b1nix
   (`apply.sh` **Patch 20** → explicit in-code bounds checks). The startup abort
   (`AllowHeapAllocationInRelease::IsAllowed()` during startup-snapshot deserialize)

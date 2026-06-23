@@ -78,16 +78,37 @@ if ! grep -q 'b1nix has no mremap' "$F"; then
   echo "Patch 6 applied: platform-linux.cc (RemapShared stub)"
 else echo "Patch 6 already present"; fi
 
-# --- Patch 7: //build/config/rust.gni — give b1nix a rust_abi_target ----------
-# The `coverage` default-config imports rust.gni for EVERY target, tripping
-# `assert(rust_abi_target != "")`. Alias b1nix to the linux triple. No Rust is
-# actually built (enable_rust off, temporal off) — this only clears the assert.
+# --- Patch 7: //build/config/rust.gni — real b1nix rust_abi_target ------------
+# enable_rust + v8_enable_temporal_support are now ON (Temporal is Rust), so
+# b1nix must map to its OWN Rust target (x86_64-unknown-b1nix — the cross-rust
+# std sysroot built in build/rust-native/.../x86_64-unknown-linux-gnu/stage2),
+# NOT the linux triple. Give b1nix a dedicated branch before the is_linux map.
+# (This also clears the `assert(rust_abi_target != "")` the coverage config trips
+# for every target.)
 F="$BUILD/config/rust.gni"
-if ! grep -q 'current_os == "b1nix"' "$F"; then
-  perl -0777 -i -pe 's~(rust_abi_target = ""\nif \(is_linux \|\| is_chromeos)(\) \{)~${1} || current_os == "b1nix"${2}~' "$F"
-  grep -q 'current_os == "b1nix"' "$F" || die "Patch 7 anchor not found in $F"
-  echo "Patch 7 applied: rust.gni (b1nix rust_abi_target)"
+if ! grep -q '"x86_64-unknown-b1nix"' "$F"; then
+  perl -0777 -i -pe 's~rust_abi_target = ""\nif \(is_linux \|\| is_chromeos(?: \|\| current_os == "b1nix")?\) \{~rust_abi_target = ""\nif (current_os == "b1nix") {\n  rust_abi_target = "x86_64-unknown-b1nix"\n} else if (is_linux || is_chromeos) {~' "$F"
+  grep -q '"x86_64-unknown-b1nix"' "$F" || die "Patch 7 anchor not found in $F"
+  echo "Patch 7 applied: rust.gni (b1nix rust_abi_target = x86_64-unknown-b1nix)"
 else echo "Patch 7 already present"; fi
+
+# --- Patch 7b: register x86_64-unknown-b1nix as a known Rust target triple ----
+# rust.gni asserts the rust_abi_target appears in known-target-triples.txt.
+KT="$BUILD/rust/known-target-triples.txt"
+if [ -f "$KT" ] && ! grep -q "x86_64-unknown-b1nix" "$KT"; then
+  printf 'x86_64-unknown-b1nix\n' >> "$KT"
+  echo "Patch 7b applied: known-target-triples.txt (+x86_64-unknown-b1nix)"
+else echo "Patch 7b already present"; fi
+
+# --- Patch 7c: //build/rust/std — profiler_builtins is chromium-toolchain-only -
+# The b1nix cross std doesn't build profiler_builtins (coverage/PGO only); GN
+# otherwise tries to copy it into the assembled sysroot and fails. Expect it only
+# for the prebuilt chromium toolchain.
+F="$BUILD/rust/std/BUILD.gn"
+if grep -q '"profiler_builtins",' "$F"; then
+  perl -0777 -i -pe 's~  skip_stdlib_files = \[\n    "profiler_builtins",\n    "rustc_std_workspace_alloc",\n    "rustc_std_workspace_core",\n    "rustc_std_workspace_std",\n  \]~  skip_stdlib_files = [\n    "rustc_std_workspace_alloc",\n    "rustc_std_workspace_core",\n    "rustc_std_workspace_std",\n  ]\n\n  if (use_chromium_rust_toolchain) {\n    skip_stdlib_files += [ "profiler_builtins" ]\n  }~' "$F"
+  echo "Patch 7c applied: rust/std profiler_builtins gated on chromium toolchain"
+else echo "Patch 7c already present"; fi
 
 # --- Patch 8: //build/config/clang/BUILD.gn — clang_rt dir for b1nix ----------
 # clang_lib()'s platform dispatch runs at gen time (not guarded by is_clang) and
