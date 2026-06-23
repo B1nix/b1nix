@@ -15,6 +15,7 @@ extern "C" {
 #endif
 
 DIR *opendir(const char *name);
+DIR *fdopendir(int fd);
 struct dirent *readdir(DIR *dirp);
 int closedir(DIR *dirp);
 int dirfd(DIR *dirp);

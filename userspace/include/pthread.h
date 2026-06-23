@@ -192,6 +192,11 @@ int pthread_setname_np(pthread_t thread, const char *name);
 int pthread_getname_np(pthread_t thread, char *name, size_t len);
 int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id);
 
+/* Fork handlers — registered handlers run around fork() (see libc fork()).
+ * Defined in posix_compat.c. */
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+                   void (*child)(void));
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif

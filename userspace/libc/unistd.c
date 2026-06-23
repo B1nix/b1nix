@@ -851,7 +851,20 @@ int utime(const char *filename, const struct utimbuf *times) {
 }
 
 int fork(void) {
-  return _check_err(syscall(SYS_FORK));
+  /* Run pthread_atfork() handlers around the fork (registry in posix_compat.c).
+   * prepare runs before; child handlers run in the new child; parent handlers
+   * run in the parent on both success and failure (to release prepare's locks). */
+  extern void __atfork_prepare(void);
+  extern void __atfork_parent(void);
+  extern void __atfork_child(void);
+  __atfork_prepare();
+  long rc = syscall(SYS_FORK);
+  if (rc == 0) {
+    __atfork_child();
+    return 0;
+  }
+  __atfork_parent();
+  return _check_err(rc);
 }
 
 int pipe(int pipefd[2]) {

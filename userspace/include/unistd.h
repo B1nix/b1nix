@@ -160,9 +160,7 @@ static inline unsigned int umask(unsigned int mask) {
     return syscall(SYS_UMASK, mask);
 }
 
-static inline int chmod(const char *path, unsigned int mode) {
-    return syscall(SYS_CHMOD, path, mode);
-}
+int chmod(const char *path, unsigned int mode);
 
 int fchmod(int fd, unsigned int mode);
 int ftruncate(int fd, off_t length);
@@ -184,13 +182,21 @@ int fchdir(int fd);
 int lstat(const char *path, struct stat *st);
 int fstat(int fd, struct stat *st);
 
-static inline int getpid(void) {
-    return syscall(SYS_GETPID);
-}
+/* Real exported symbols (not static inline) so foreign-function callers — e.g.
+ * Rust std's `libc` FFI — resolve them at link time. Defined in posix_compat.c. */
+int getpid(void);
+int getppid(void);
 
-static inline int getppid(void) {
-    return syscall(SYS_GETPPID);
-}
+/* POSIX/Linux compat surface (implemented in posix_compat.c over b1nix
+ * syscalls). pipe2/accept4 honour O_CLOEXEC/O_NONBLOCK; daemon/pwrite/preadv/
+ * pwritev/fdatasync/linkat are real; sendfile/splice/sigwait report ENOSYS for
+ * paths b1nix's kernel does not provide (callers fall back). */
+int pipe2(int pipefd[2], int flags);
+int daemon(int nochdir, int noclose);
+int fdatasync(int fd);
+ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
+int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
+           int flags);
 
 int usleep(unsigned int usec);
 

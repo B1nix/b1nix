@@ -127,13 +127,18 @@ fi
 # TLS-heavy links (libLLVM.so etc.); lld handles b1nix shared objects correctly.
 # Keep the binutils ld as ld.bfd. Re-point on every run so a fresh binutils
 # install doesn't silently restore the GNU ld.
+# Make ld.lld available as a NAMED alias (ld.lld / <target>-ld.lld) so the rust
+# + LLVM build can opt in with `-fuse-ld=lld`, but keep the DEFAULT `ld` as
+# binutils ld.bfd. Pointing the default `ld` at lld broke the cross-gcc port
+# links (e.g. NetSurf nsfb: `R_X86_64_32 against longjmp` — lld is stricter than
+# bfd on absolute relocs in these non-PIC static EXEC links). lld is only needed
+# for the big shared/TLS LLVM .so links, which select it explicitly.
 LLD_BIN="$(command -v ld.lld || echo /usr/bin/ld.lld)"
 if [ -x "$LLD_BIN" ]; then
     for bindir in "$PREFIX/$TARGET/bin" "$PREFIX/bin"; do
         [ -d "$bindir" ] || continue
         if [ "$bindir" = "$PREFIX/$TARGET/bin" ]; then
             [ -e "$bindir/ld.bfd" ] || cp -P "$bindir/ld" "$bindir/ld.bfd" 2>/dev/null || true
-            ln -sf "$LLD_BIN" "$bindir/ld"
             ln -sf "$LLD_BIN" "$bindir/ld.lld"
         else
             ln -sf "$LLD_BIN" "$bindir/${TARGET}-ld.lld"
@@ -257,6 +262,34 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
         CXXFLAGS_FOR_TARGET="-g -O2 -fPIC" CFLAGS_FOR_TARGET="-g -O2 -fPIC"
     make install-target-libstdc++-v3 MAKEINFO=true
     cd ..
+fi
+
+# Alias the gcc unwinder as libunwind.a. Rust's `unwind` crate links `-lunwind`
+# (the LLVM libunwind name) on musl + crt-static targets; b1nix ships gcc's
+# unwinder (libgcc_eh.a) with the identical `_Unwind_*` ABI but a different name.
+# Without this alias the final rustc link fails on undefined `_Unwind_*`.
+_eh="$("$PREFIX/bin/${TARGET}-gcc" -print-file-name=libgcc_eh.a 2>/dev/null)"
+if [ -f "$_eh" ]; then
+    for _ud in "$SYSROOT/usr/lib" "$SYSROOT/lib" "$PREFIX/$TARGET/lib"; do
+        [ -d "$_ud" ] && cp -f "$_eh" "$_ud/libunwind.a"
+    done
+fi
+
+# Fold the EH unwinder objects (_Unwind_*) BACK INTO libgcc.a. Building GCC
+# --enable-shared (needed for the rust libLLVM.so) splits the unwinder out of
+# libgcc.a into libgcc_eh.a/libgcc_s.so. But b1nix's userspace C++ ports link
+# the static libgcc via `-print-libgcc-file-name` (= libgcc.a) and DON'T add
+# -lgcc_eh, so libstdc++'s __gxx_personality_v0 then has undefined `_Unwind_*`.
+# Merging libgcc_eh.a's objects into libgcc.a restores the self-contained
+# --disable-shared layout those links assume (EH members are only pulled when
+# referenced, so plain C links are unaffected).
+_libgcc="$("$PREFIX/bin/${TARGET}-gcc" -print-libgcc-file-name 2>/dev/null)"
+_ar="$PREFIX/bin/${TARGET}-ar"
+if [ -f "$_libgcc" ] && [ -f "$_eh" ] && [ -x "$_ar" ]; then
+    _tmp_eh="$(mktemp -d)"
+    ( cd "$_tmp_eh" && "$_ar" x "$_eh" )
+    "$_ar" rs "$_libgcc" "$_tmp_eh"/*.o 2>/dev/null || true
+    rm -rf "$_tmp_eh"
 fi
 
 echo ""

@@ -144,6 +144,7 @@ int pthread_sigmask(int how, const sigset_t *set, sigset_t *oldset);
 int sigaction(int signum, const struct sigaction *act, struct sigaction *oldact);
 int sigsuspend(const sigset_t *mask);
 int sigaltstack(const stack_t *ss, stack_t *old_ss);
+int sigwait(const sigset_t *set, int *sig);
 #ifdef __cplusplus
 }
 #endif

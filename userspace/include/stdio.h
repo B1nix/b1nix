@@ -107,14 +107,9 @@ static inline int fsetpos(FILE *stream, const fpos_t *pos) {
 #include <errno.h>
 int normalize_errno(long rc);
 
-static inline int rename(const char *oldpath, const char *newpath) {
-    int rc = (int)syscall(SYS_RENAME, oldpath, newpath);
-    if (rc < 0) {
-        errno = normalize_errno(rc);
-        return -1;
-    }
-    return 0;
-}
+/* Real exported symbol (not a static inline) so foreign-function callers — e.g.
+ * Rust std's `libc` FFI — can resolve it at link time. Defined in posix_compat.c. */
+int rename(const char *oldpath, const char *newpath);
 
 int scanf(const char *format, ...);
 int fscanf(FILE *stream, const char *format, ...);

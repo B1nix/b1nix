@@ -49,6 +49,21 @@ DIR *opendir(const char *name)
     return d;
 }
 
+/* Wrap an already-open directory fd as a DIR stream (takes ownership of fd:
+ * closedir() will close it). Mirrors opendir() minus the open(). */
+DIR *fdopendir(int fd)
+{
+    DIR *d = (DIR *)malloc(sizeof(struct __dirstream));
+    if (!d)
+        return (DIR *)0;
+    d->fd = fd;
+    d->count = 0;
+    d->index = 0;
+    d->eof = 0;
+    d->ino_seq = 0;
+    return d;
+}
+
 struct dirent *readdir(DIR *dirp)
 {
     if (!dirp)

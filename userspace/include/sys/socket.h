@@ -127,6 +127,12 @@ struct ucred {
 #define SOCK_RDM        4
 #define SOCK_SEQPACKET  5
 
+/* Type-flag bits OR'd into socket()/accept4() type. Values match Linux so a
+ * foreign caller (Rust std's libc FFI) that passes SOCK_CLOEXEC/SOCK_NONBLOCK
+ * is interpreted correctly by accept4(). */
+#define SOCK_CLOEXEC    02000000
+#define SOCK_NONBLOCK   00004000
+
 #define IPPROTO_IP      0
 #define IPPROTO_TCP     6
 #define IPPROTO_UDP     17
@@ -161,6 +167,7 @@ int bind(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int connect(int sockfd, const struct sockaddr *addr, socklen_t addrlen);
 int listen(int sockfd, int backlog);
 int accept(int sockfd, struct sockaddr *addr, socklen_t *addrlen);
+int accept4(int sockfd, struct sockaddr *addr, socklen_t *addrlen, int flags);
 ssize_t send(int sockfd, const void *buf, size_t len, int flags);
 ssize_t recv(int sockfd, void *buf, size_t len, int flags);
 int setsockopt(int sockfd, int level, int optname, const void *optval,
