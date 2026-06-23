@@ -902,38 +902,64 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       return -1;
     }
 
-    for (usize n = 0; n < objects[0].needed_count; n++) {
-      if (object_count >= DYN_MAX_OBJECTS || !objects[0].strtab) {
+    /* Breadth-first load of the whole DT_NEEDED graph. We walk the `needed`
+     * list of every object as it is added (not just the main executable's), so
+     * transitive dependencies are pulled in too — e.g. rustc needs
+     * librustc_driver.so + libLLVM.so, and libLLVM.so in turn needs libgcc_s.so.
+     * Each library is deduplicated by SONAME so a diamond dependency (both rustc
+     * and librustc_driver need libLLVM) loads the .so exactly once. The outer
+     * loop bound `object_count` grows as libraries are appended. */
+    char loaded_names[DYN_MAX_OBJECTS][96];
+    memset(loaded_names, 0, sizeof(loaded_names));
+    for (usize o = 0; o < object_count; o++) {
+      if (objects[o].needed_count && !objects[o].strtab) {
         kfree(file_data);
         return -1;
       }
-      /* Bound the DT_NEEDED name into a local buffer before strchr/strlen — the
-       * raw strtab pointer may run past its segment without a NUL (R4-8). */
-      char name[96];
-      if (!elf64_copy_str(image, objects[0].strtab + objects[0].needed[n], name,
-                          sizeof(name)) ||
-          strchr(name, '/')) {
-        kfree(file_data);
-        return -1;
+      for (usize n = 0; n < objects[o].needed_count; n++) {
+        /* Bound the DT_NEEDED name into a local buffer before strchr/strlen —
+         * the raw strtab pointer may run past its segment without a NUL (R4-8). */
+        char name[96];
+        if (!elf64_copy_str(image, objects[o].strtab + objects[o].needed[n], name,
+                            sizeof(name)) ||
+            strchr(name, '/')) {
+          kfree(file_data);
+          return -1;
+        }
+        /* Already loaded? (dedup by name across the libraries, indices 1..) */
+        int already = 0;
+        for (usize k = 1; k < object_count; k++) {
+          if (strcmp(loaded_names[k], name) == 0) {
+            already = 1;
+            break;
+          }
+        }
+        if (already)
+          continue;
+        if (object_count >= DYN_MAX_OBJECTS) {
+          kfree(file_data);
+          return -1;
+        }
+        char libpath[96] = "/lib/";
+        usize name_len = strlen(name);
+        if (name_len + 6 > sizeof(libpath)) {
+          kfree(file_data);
+          return -1;
+        }
+        memcpy(libpath + 5, name, name_len + 1);
+        u64 lib_base = 0x0000600000000000ULL +
+                       (u64)(object_count - 1) * 0x0000010000000000ULL;
+        if (elf64_load_shared_object(image, libpath, lib_base,
+                                     &objects[object_count]) != 0) {
+          console_write("ELF load: missing/invalid DT_NEEDED ");
+          console_write(libpath);
+          console_write("\n");
+          kfree(file_data);
+          return -1;
+        }
+        memcpy(loaded_names[object_count], name, name_len + 1);
+        object_count++;
       }
-      char libpath[96] = "/lib/";
-      usize name_len = strlen(name);
-      if (name_len + 6 > sizeof(libpath)) {
-        kfree(file_data);
-        return -1;
-      }
-      memcpy(libpath + 5, name, name_len + 1);
-      u64 lib_base = 0x0000600000000000ULL +
-                     (u64)(object_count - 1) * 0x0000010000000000ULL;
-      if (elf64_load_shared_object(image, libpath, lib_base,
-                                   &objects[object_count]) != 0) {
-        console_write("ELF load: missing/invalid DT_NEEDED ");
-        console_write(libpath);
-        console_write("\n");
-        kfree(file_data);
-        return -1;
-      }
-      object_count++;
     }
 
     for (usize o = 0; o < object_count; o++) {
