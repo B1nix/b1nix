@@ -25,7 +25,15 @@ JOBS="${NATIVE_CLANG_JOBS:-$(nproc)}"
 [ -f "$B1NIX_LLVM/lib/cmake/llvm/LLVMConfig.cmake" ] || { echo "no installed b1nix LLVM cmake at $B1NIX_LLVM/lib/cmake/llvm" >&2; exit 1; }
 [ -x "$CROSS/bin/x86_64-b1nix-gcc" ] || { echo "no cross gcc at $CROSS" >&2; exit 1; }
 
-CFLAGS_B1NIX="-ffunction-sections -fdata-sections -fPIC -m64 -D__linux__=1"
+# -isystem a private fixinclude dir holding the up-to-date b1nix errno.h ahead of
+# the cross sysroot: the sysroot is SHARED with parallel worktrees whose header
+# staging can overwrite errno.h (which would drop ENOTRECOVERABLE and break
+# libstdc++ std::errc::state_not_recoverable in clangInterpreter). This makes the
+# clang build immune to that clobber. Only errno.h is overridden; other headers
+# fall through to the sysroot.
+mkdir -p "$ROOT/build/native-clang/fixinclude"
+cp "$ROOT/userspace/include/errno.h" "$ROOT/build/native-clang/fixinclude/errno.h"
+CFLAGS_B1NIX="-isystem $ROOT/build/native-clang/fixinclude -ffunction-sections -fdata-sections -fPIC -m64 -D__linux__=1"
 
 # ── Stage A: host TableGen tools (built once, cached) ─────────────────────────
 if [ ! -x "$HOST_TBLGEN/bin/clang-tblgen" ] || [ ! -x "$HOST_TBLGEN/bin/llvm-tblgen" ]; then
