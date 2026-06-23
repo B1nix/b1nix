@@ -1,7 +1,14 @@
 .DEFAULT_GOAL := all
 ARCH ?= x86_64
 export B1NIX_ARCH := $(ARCH)
-BUILD_DIR := build/$(ARCH)
+# BUILD_ROOT isolates the per-task kernel/initramfs/ISO output. Override it to
+# build a second task (e.g. an M40 agent) without touching the main build:
+#   make BUILD_ROOT=build-m40 ARCH=x86_64 iso
+# The expensive, task-independent trees (build/toolchain_build, build/rust-native,
+# the port build dirs) keep their literal `build/...` paths below, so they stay
+# SHARED and read-only across isolated builds — never rebuilt per task.
+BUILD_ROOT ?= build
+BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
 # Host triplet for the ported userspace toolchain + programs. Their build trees
 # live under per-triplet directories (build/toolchain_build/<triplet>,
 # build/<prog>-{src,b1nix}/<triplet>) so x86 and x86_64 never share objects.
