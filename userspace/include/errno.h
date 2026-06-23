@@ -115,5 +115,12 @@ int normalize_errno(long rc);
 #define ENOMEDIUM       123     /* No medium found */
 #define ECANCELED       125     /* Operation canceled */
 #define ENOKEY          126     /* Required key not available */
+#define EKEYEXPIRED     127     /* Key has expired */
+#define EKEYREVOKED     128     /* Key has been revoked */
+#define EKEYREJECTED    129     /* Key was rejected by service */
+#define EOWNERDEAD      130     /* Owner died (robust mutex) */
+#define ENOTRECOVERABLE 131     /* State not recoverable (robust mutex) */
+#define ERFKILL         132     /* Operation not possible due to RF-kill */
+#define EHWPOISON       133     /* Memory page has hardware error */
 
 #endif
