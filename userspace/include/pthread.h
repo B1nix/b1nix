@@ -163,10 +163,6 @@ int pthread_attr_getstack(const pthread_attr_t *a, void **stackaddr, size_t *sta
 int pthread_attr_getdetachstate(const pthread_attr_t *a, int *detachstate);
 int pthread_getattr_np(pthread_t thread, pthread_attr_t *a);
 
-#ifdef __cplusplus
-}
-#endif
-
 
 /* Completion for gthr-posix / libstdc++ threading. Scheduling priority is a
  * no-op (b1nix has a flat scheduler); the symbols must exist so the weak gthr
@@ -195,5 +191,9 @@ int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param
 int pthread_setname_np(pthread_t thread, const char *name);
 int pthread_getname_np(pthread_t thread, char *name, size_t len);
 int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 
 #endif /* B1NIX_PTHREAD_H */

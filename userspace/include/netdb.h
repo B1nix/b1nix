@@ -37,6 +37,10 @@ struct addrinfo {
 #define AI_PASSIVE     0x0001
 #define AI_CANONNAME   0x0002
 #define AI_NUMERICHOST 0x0004
+#define AI_V4MAPPED    0x0008
+#define AI_ALL         0x0010
+#define AI_ADDRCONFIG  0x0020
+#define AI_NUMERICSERV 0x0400
 
 #define EAI_BADFLAGS  -1
 #define EAI_NONAME    -2

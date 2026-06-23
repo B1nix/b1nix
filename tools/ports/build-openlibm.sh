@@ -75,7 +75,7 @@ compile_dir() {
     base=$(basename "$src" .c)
     # Skip long-double (*l) routines: they pull ld80/ld128 arch headers
     # (invtrig.h, fpmath) and b1nix graphics libs only use double/float.
-    case "$base" in s_ceil) ;; *l) continue;; esac
+    case "$base" in s_ceil|s_creal) ;; *l) continue;; esac
     # Skip Bessel (j0/j1/jn/y0/y1) and gamma routines: they need signgam/j0
     # globals b1nix's math.h omits, and no graphics lib uses them.
     case "$base" in
@@ -88,7 +88,7 @@ compile_dir() {
     # cosh/sinh/__ldexp need) alongside the complex __ldexp_cexp — and they only
     # pull openlibm_complex.h, which works with GCC's built-in _Complex.
     case "$base" in
-      k_exp|k_expf) ;;
+      k_exp|k_expf|s_creal|s_cimag|s_conj) ;;
       *) if grep -q "complex.h" "$src"; then continue; fi;;
     esac
     obj="$OBJ_DIR/$1_$base.o"

@@ -67,7 +67,13 @@ static inline int isxdigit(int c) {
     return (c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') || (c >= 'A' && c <= 'F');
 }
 
+#ifdef __cplusplus
+extern "C" {
+#endif
 int isblank(int c);
+#ifdef __cplusplus
+}
+#endif
 
 static inline int isascii(int c) {
     return (c >= 0 && c <= 127);
