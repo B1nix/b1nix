@@ -1013,6 +1013,23 @@ Fixed by relocating libraries before the executable (only the non-PIE exe carrie
 COPY relocs). With this, the M69 loader is correct for the full C/C++ port set;
 **x86_64 smoke is fully green (833/0)**.
 
+**Closeout — remaining perf items deferred (profile-gated).** The headline cost
+(O(relocs × symbols) linear dynsym scan) is gone with DT_HASH; the loader is
+correct and fast enough that nothing in the suite or the port set is
+loader-bound. The three items below are real but each is either large/risky
+against a now-green exec path or a micro-opt below the noise floor, so they wait
+for a profiled bottleneck rather than speculative churn:
+- Share/cache `.so` across spawns — the genuine win for *repeated* big-binary
+  spawns (re-reading + re-relocating `libLLVM.so` ~184 MB per spawn), but a large
+  change (cross-process page sharing + COW writable segments + refcount/teardown +
+  invalidation). No current repeated-spawn hot loop justifies the regression risk.
+- Lazy PLT binding — helps single-startup of a huge-export library; needs a PLT
+  trampoline + on-first-call resolver. Deferred with the same gate.
+- Faster `elf64_stage_ptr` — YAGNI: a linear scan over the handful of
+  cache-resident segments is not the bottleneck (relocation time is dominated by
+  the per-segment `memcpy`), and a sorted/binary-search variant would add an
+  invariant to maintain across the during-load callers for sub-ms savings.
+
 ## M70: Interrupt-Driven I/O
 
 - [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,
