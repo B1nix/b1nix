@@ -418,6 +418,27 @@ else
 	echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
 fi
 
+# Stagger (parallel mode): run the SMP (-smp 4) instance FIRST, alone. It is the
+# heaviest (4 vCPUs) but the quickest to finish (SMOKE_FAST_SMP stops it at the
+# M24B-SMP work-stealing marker), so giving it the whole 8-core host briefly and
+# then reclaiming its 4 vCPUs keeps the long single-CPU instances that follow
+# from starving. Launching all five at once oversubscribes the host (4 + 4 vCPUs
+# + the GPU instance on 8 cores) and the core instance times out — its ~245
+# markers then read as "missing" (spurious failures, not real regressions).
+if [ "$SMOKE_PARALLEL" = "1" ]; then
+	(
+		B1NIX_ISO_NAME=b1nix-core.iso
+		EXTRA_QEMU_ARGS="-smp 4"
+		SMOKE_FAST_SMP=1
+		SMOKE_DONE_PATTERN="M24B-SMP: (ok|fail) work-stealing|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=smp
+		PROGRESS_PREFIX="[smp]  "
+		run_qemu "$SMP_LOG"
+	) &
+	pid_smp=$!
+	wait $pid_smp
+fi
+
 # Run Boot QEMU in the background
 (
 	SATA_IMG="$SATA_IMG_BOOT"
@@ -486,16 +507,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 		) &
 		pid_v8=$!
 	fi
-	(
-		B1NIX_ISO_NAME=b1nix-core.iso
-		EXTRA_QEMU_ARGS="-smp 4"
-		SMOKE_FAST_SMP=1
-		SMOKE_DONE_PATTERN="M24B-SMP: (ok|fail) work-stealing|KERNEL PANIC|\[PANIC\]"
-		SMOKE_PROGRESS_MODE=smp
-		PROGRESS_PREFIX="[smp]  "
-		run_qemu "$SMP_LOG"
-	) &
-	pid_smp=$!
+	# (the SMP instance already ran and finished in the stagger stage above)
 else
 	(
 		SATA_IMG="$SATA_IMG_SMP"
@@ -517,7 +529,7 @@ wait $pid_boot
 if [ "$SMOKE_PARALLEL" = "1" ]; then
 	wait $pid_user
 	wait $pid_shell
-	wait $pid_smp
+	# $pid_smp was already waited for in the stagger stage before boot launched.
 	[ -n "$pid_v8" ] && wait $pid_v8
 	cat "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" >"$LOG"
 else

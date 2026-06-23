@@ -509,27 +509,43 @@ static int test_tcp_client_server(void) {
     execve("/bin/m32-nettool", srv_argv, srv_envp);
     _exit(127);
   }
-  sleep(1);
-  curl_pid = fork();
-  if (curl_pid < 0) {
-    fail("curl-https-fork");
-    return -1;
-  }
-  if (curl_pid == 0) {
-    char *curl_tls_argv[] = {
-      "/bin/curl", "--cacert", "/etc/tls-test/ca.pem",
-      "--connect-timeout", "8", "-sS", "https://127.0.0.1:4443/", NULL
-    };
-    char *curl_tls_envp[] = {NULL};
-    int out = open("/tmp/curl.https", O_CREAT | O_TRUNC | O_WRONLY, 0644);
-    if (out >= 0) {
-      dup2(out, 1);
-      close(out);
+  /* Retry the connect: under host load (the parallel smoke) the server's
+   * fork+execve+bind can take longer than a fixed sleep, so a too-early
+   * connect() is refused. The tls-server is single-shot but binds+listens
+   * before its (slow) TLS init, so only the first SUCCESSFUL connect is served —
+   * earlier refused attempts don't consume it. */
+  curl_status = -1;
+  for (int attempt = 0; attempt < 12; attempt++) {
+    sleep(1);
+    curl_pid = fork();
+    if (curl_pid < 0) {
+      fail("curl-https-fork");
+      kill(tls_srv, SIGTERM);
+      { int s = 0; waitpid(tls_srv, &s, 0); }
+      return -1;
     }
-    execve("/bin/curl", curl_tls_argv, curl_tls_envp);
-    _exit(127);
+    if (curl_pid == 0) {
+      char *curl_tls_argv[] = {
+        "/bin/curl", "--cacert", "/etc/tls-test/ca.pem",
+        "--connect-timeout", "8", "-sS", "https://127.0.0.1:4443/", NULL
+      };
+      char *curl_tls_envp[] = {NULL};
+      int out = open("/tmp/curl.https", O_CREAT | O_TRUNC | O_WRONLY, 0644);
+      if (out >= 0) {
+        dup2(out, 1);
+        close(out);
+      }
+      execve("/bin/curl", curl_tls_argv, curl_tls_envp);
+      _exit(127);
+    }
+    waitpid(curl_pid, &curl_status, 0);
+    if (WIFEXITED(curl_status) && WEXITSTATUS(curl_status) == 0)
+      break;
   }
-  waitpid(curl_pid, &curl_status, 0);
+  /* Always terminate the server before reaping it: if every connect failed the
+   * single-shot server is still blocked in accept(), so a plain waitpid() would
+   * hang forever — the historical M32-NET smoke stall under parallel load. */
+  kill(tls_srv, SIGTERM);
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) != 0) {
     fail("curl-https-handshake");
@@ -583,6 +599,10 @@ static int test_tcp_client_server(void) {
     _exit(127);
   }
   waitpid(curl_pid, &curl_status, 0);
+  /* Same single-shot-server hang guard as the positive path: terminate before
+   * reaping so a refused connect (server not yet bound under load) can't leave
+   * us blocked in waitpid. */
+  kill(tls_srv, SIGTERM);
   { int srv_status = 0; waitpid(tls_srv, &srv_status, 0); }
   if (!WIFEXITED(curl_status) || WEXITSTATUS(curl_status) == 0) {
     fail("curl-https-selfsigned-reject");
