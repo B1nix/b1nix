@@ -982,6 +982,32 @@ ctor/dtor markers).
   (`b1nix.rustrun`, `tools/rust/rust-proof.sh`): `M68-RUST: ok rustc-load` then
   the real `rustc 1.98.0-nightly` banner printed from b1nix.
 
+## M69b: Dynamic-loader performance
+
+The M69 exec-time linker is correct but unoptimized. As the C/C++ port binaries
+move onto real dynamic linking (the `--enable-shared` cross GCC gives them
+`DT_NEEDED libgcc_s.so`; `/lib/libgcc_s.so` now ships in the initramfs and the
+kernel resolves it), the per-spawn linking cost matters. Eliminate the speed
+problems so "everything dynamic" carries no penalty:
+
+- [ ] `planned` **O(1) symbol resolution.** `elf64_resolve_symbol` does a linear
+  scan over each object's dynsym per symbolic relocation — O(relocs × symbols).
+  Use the `DT_HASH` / `DT_GNU_HASH` table for O(1) lookup (the count is already
+  read from `DT_HASH`; use it for lookup too).
+- [ ] `planned` **Share/cache loaded shared objects across processes.** The
+  loader re-reads + re-`kzalloc`s + re-relocates each `.so` (libgcc_s.so,
+  libc.so, ...) on every `spawn`. Load + relocate once and share the read-only
+  pages (copy-on-write the writable ones), like a real mmap-backed `.so`.
+- [ ] `planned` **Lazy PLT binding.** All `JUMP_SLOT` relocations are resolved
+  eagerly at load; bind on first call so unused imports cost nothing.
+- [ ] `planned` **Faster segment lookup.** `elf64_stage_ptr` is O(segments) per
+  call; binary-search / hash the vaddr ranges.
+
+Note: this is the *linker* cost only. The M53 NetSurf render slowness
+(~80 s/page) is Mesa **softpipe** CPU rasterisation, not dynamic linking — `nsfb`
+has only ~187 relocations, whose resolution is sub-millisecond. That, plus the
+parallel-smoke host-capacity limits, is tracked separately, not under M69b.
+
 ## M70: Interrupt-Driven I/O
 
 - [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,
