@@ -1052,7 +1052,12 @@ COPY relocs). With this, the M69 loader is correct for the full C/C++ port set;
 - [ ] `planned` Raise/make-dynamic hard caps: TCP conns (64), VFS pipes (128),
   core-dump size (1 MiB), `SHMMAX` (32 MiB).
 
-## M78: i686 Userspace SMP
+## M78: i686 Userspace SMP — FROZEN (x86 not maintained)
 
-- [ ] `planned` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
+The `ARCH=x86` (i686) port is **frozen / not actively maintained** — `ARCH=x86_64`
+is the sole maintained arch (all new work: Rust, V8, Chromium, dynamic linking).
+x86 last passed its smoke clean (804/0, 2026-06-23) but is no longer smoke-tested
+or ported to. The item below is parked for a future dedicated x86 maintainer.
+
+- [ ] `frozen` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
   runs userspace on APs (currently BSP-pinned).
