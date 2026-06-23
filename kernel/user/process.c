@@ -62,9 +62,11 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 /* M30 — x86-64 ELF64 relocation types (subset). */
 #define R_X86_64_NONE     0
 #define R_X86_64_64       1
+#define R_X86_64_COPY     5
 #define R_X86_64_GLOB_DAT 6
 #define R_X86_64_JUMP_SLOT 7
 #define R_X86_64_RELATIVE 8
+#define R_X86_64_TPOFF64  18
 
 struct elf64_rela {
   u64 r_offset;
@@ -106,6 +108,14 @@ struct elf64_dyn_object {
   u64 hash;
   u64 needed[DYN_MAX_NEEDED];
   usize needed_count;
+  /* PT_TLS template for this object (for static-TLS layout across the whole
+   * DT_NEEDED graph). tls_offset is the variant-II distance below the thread
+   * pointer at which this object's TLS block sits (0 = object has no TLS). */
+  u64 tls_memsz;
+  u64 tls_filesz;
+  u64 tls_align;
+  u64 tls_offset;
+  void *tls_data;
 };
 
 /* M30 — base address at which PIE/ET_DYN images get loaded. Picked well
@@ -330,6 +340,30 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
       memcpy(seg->data, data + ph->p_offset, ph->p_filesz);
     obj->segment_count++;
   }
+  /* Capture this library's PT_TLS template so the loader can place it in the
+   * process-wide static-TLS area and resolve the library's R_X86_64_TPOFF64
+   * relocations against the combined layout. */
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph =
+        (const struct elf64_phdr *)(data + ehdr->e_phoff +
+                                    (u64)i * ehdr->e_phentsize);
+    if (ph->p_type != PT_TLS)
+      continue;
+    if (ph->p_filesz > ph->p_memsz ||
+        ph->p_offset + ph->p_filesz < ph->p_offset ||
+        ph->p_offset + ph->p_filesz > size ||
+        ph->p_memsz > USER_IMAGE_MAX_SEGMENT)
+      break;
+    obj->tls_memsz = ph->p_memsz;
+    obj->tls_filesz = ph->p_filesz;
+    obj->tls_align = ph->p_align ? ph->p_align : 8;
+    if (ph->p_filesz) {
+      obj->tls_data = kmalloc(ph->p_filesz);
+      if (obj->tls_data)
+        memcpy(obj->tls_data, data + ph->p_offset, ph->p_filesz);
+    }
+    break;
+  }
   int rc = elf64_parse_dynamic(image, obj, ehdr, data, size);
   kfree(data);
   return rc;
@@ -346,12 +380,17 @@ static int elf64_symbol_count(struct user_loaded_image *image,
   return 0;
 }
 
+/* Resolve `name` to a defined symbol's load address, searching objects from
+ * index `start`. start=0 is the normal global scope (main executable first, so
+ * its definitions win — including a symbol the exe owns via an R_X86_64_COPY
+ * reloc). start=1 skips the executable, which is exactly what a COPY reloc needs
+ * to locate the *library's* original copy of the datum. */
 static int elf64_resolve_symbol(struct user_loaded_image *image,
                                 struct elf64_dyn_object *objects,
-                                usize object_count, const char *name,
-                                u64 *value)
+                                usize object_count, usize start,
+                                const char *name, u64 *value)
 {
-  for (usize o = 0; o < object_count; o++) {
+  for (usize o = start; o < object_count; o++) {
     u32 count = 0;
     if (!objects[o].symtab || !objects[o].strtab ||
         elf64_symbol_count(image, &objects[o], &count) != 0)
@@ -365,6 +404,35 @@ static int elf64_resolve_symbol(struct user_loaded_image *image,
        * before its segment ends (R4-8). */
       if (elf64_str_at_equals(image, objects[o].strtab + sym->st_name, name)) {
         *value = objects[o].base + sym->st_value;
+        return 0;
+      }
+    }
+  }
+  return -1;
+}
+
+/* Like elf64_resolve_symbol, but for thread-local symbols: returns the index of
+ * the defining object (whose static-TLS offset gives the thread-pointer-relative
+ * location) and the symbol's TLS-template-relative st_value. Used to fill
+ * R_X86_64_TPOFF64 relocations referencing a named __thread variable. */
+static int elf64_resolve_tls_symbol(struct user_loaded_image *image,
+                                    struct elf64_dyn_object *objects,
+                                    usize object_count, const char *name,
+                                    usize *out_obj, u64 *out_value)
+{
+  for (usize o = 0; o < object_count; o++) {
+    u32 count = 0;
+    if (!objects[o].symtab || !objects[o].strtab ||
+        elf64_symbol_count(image, &objects[o], &count) != 0)
+      continue;
+    for (u32 i = 1; i < count; i++) {
+      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+          image, objects[o].symtab + (u64)i * sizeof(*sym), sizeof(*sym));
+      if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_name >= objects[o].strsz)
+        continue;
+      if (elf64_str_at_equals(image, objects[o].strtab + sym->st_name, name)) {
+        *out_obj = o;
+        *out_value = sym->st_value;
         return 0;
       }
     }
@@ -407,19 +475,97 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
       /* Copy the undefined symbol's name into a bounded buffer before using it
        * as a lookup key — the raw strtab pointer may not be NUL-terminated
        * within its segment (R4-8). */
-      char name[256];
+      char name[2048]; /* Rust mangled names run long (~750+ chars) */
       u64 resolved = 0;
       if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
                           sizeof(name)) ||
-          elf64_resolve_symbol(image, objects, object_count, name, &resolved) != 0) {
+          elf64_resolve_symbol(image, objects, object_count, 0, name,
+                               &resolved) != 0) {
         if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
           resolved = 0;
-        else
+        else {
+          console_write("ELF load: unresolved symbol ");
+          console_write(name);
+          console_write("\n");
           return -1;
+        }
       }
       *target = resolved + (u64)rela->r_addend;
       continue;
     }
+    /* R_X86_64_COPY: a non-PIE executable importing a data object from a shared
+     * library gets the datum copied into its own .bss; the library's GLOB_DAT
+     * for the same name then resolves back to this copy (start=0 finds the
+     * executable's definition first). Resolve from index 1 to read the library's
+     * original bytes, not the just-allocated (zero) destination. */
+    if (type == R_X86_64_COPY) {
+      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+          image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
+          sizeof(*sym));
+      if (!sym || sym->st_name >= objects[owner].strsz)
+        return -1;
+      u64 sz = sym->st_size;
+      if (sz == 0)
+        continue;
+      if (sz > USER_IMAGE_MAX_SEGMENT)
+        return -1;
+      char name[2048]; /* Rust mangled names run long (~750+ chars) */
+      u64 src = 0;
+      if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
+                          sizeof(name)) ||
+          elf64_resolve_symbol(image, objects, object_count, 1, name,
+                               &src) != 0) {
+        if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+          continue;
+        return -1;
+      }
+      void *dstp = elf64_stage_ptr(image, objects[owner].base + rela->r_offset, sz);
+      void *srcp = elf64_stage_ptr(image, src, sz);
+      if (!dstp || !srcp)
+        return -1;
+      memcpy(dstp, srcp, (usize)sz);
+      continue;
+    }
+    /* R_X86_64_TPOFF64: thread-pointer-relative offset of a __thread variable
+     * for the initial-exec model. The variable lives in some object's static-TLS
+     * block at distance objects[d].tls_offset below the thread pointer, so the
+     * stored value is (st_value + addend - tls_offset). sym_index 0 is owner-
+     * relative (addend already carries the in-block offset). */
+    if (type == R_X86_64_TPOFF64) {
+      i64 tpoff;
+      if (sym_index == 0) {
+        tpoff = rela->r_addend - (i64)objects[owner].tls_offset;
+      } else {
+        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
+            sizeof(*sym));
+        if (!sym || sym->st_name >= objects[owner].strsz)
+          return -1;
+        if (sym->st_shndx != SHN_UNDEF) {
+          tpoff = (i64)sym->st_value + rela->r_addend -
+                  (i64)objects[owner].tls_offset;
+        } else {
+          char name[2048]; /* Rust mangled names run long (~750+ chars) */
+          usize d = 0;
+          u64 stv = 0;
+          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
+                              sizeof(name)))
+            return -1;
+          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
+                                       &stv) == 0)
+            tpoff = (i64)stv + rela->r_addend - (i64)objects[d].tls_offset;
+          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+            tpoff = rela->r_addend;
+          else
+            return -1;
+        }
+      }
+      *target = (u64)tpoff;
+      continue;
+    }
+    console_write("ELF load: unsupported relocation type ");
+    console_write_dec(type);
+    console_write("\n");
     return -1;
   }
   return 0;
@@ -887,10 +1033,24 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     break; /* at most one PT_TLS */
   }
 
-  /* Eager dynamic linking. The kernel loads each DT_NEEDED ET_DYN object into
-   * the process image, resolves symbols globally (main first, then libraries),
-   * and patches GOT/PLT before userspace starts. */
-  if (load_base != 0) {
+  /* Eager dynamic linking. The kernel loads each DT_NEEDED object into the
+   * process image, resolves symbols globally (main first, then libraries), and
+   * patches GOT/PLT before userspace starts. This must run for PIE/ET_DYN
+   * binaries (load_base != 0) AND for dynamically-linked ET_EXEC binaries
+   * (load_base == 0 but with a PT_DYNAMIC carrying DT_NEEDED) — e.g. the native
+   * rustc, which is ET_EXEC with no PT_INTERP and depends on librustc_driver.so
+   * + libLLVM.so. A statically-linked ET_EXEC has no PT_DYNAMIC and skips this. */
+  int has_dynamic = 0;
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *p =
+        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
+                                    ((u64)i * ehdr->e_phentsize));
+    if (p->p_type == PT_DYNAMIC) {
+      has_dynamic = 1;
+      break;
+    }
+  }
+  if (load_base != 0 || has_dynamic) {
     struct elf64_dyn_object objects[DYN_MAX_OBJECTS];
     memset(objects, 0, sizeof(objects));
     usize object_count = 1;
@@ -911,6 +1071,28 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * loop bound `object_count` grows as libraries are appended. */
     char loaded_names[DYN_MAX_OBJECTS][96];
     memset(loaded_names, 0, sizeof(loaded_names));
+
+    /* Derive "$ORIGIN/../lib/" from the executable path so a self-contained app
+     * image can carry its own libraries next to its binary (e.g.
+     * /mnt/rust/bin/rustc -> /mnt/rust/lib/<soname>) instead of installing them
+     * system-wide. Each DT_NEEDED soname is tried here first, then under /lib. */
+    char exe_libdir[128];
+    exe_libdir[0] = 0;
+    if (image->path) {
+      const char *ep = image->path;
+      usize L = strlen(ep);
+      while (L > 0 && ep[L - 1] != '/')
+        L--; /* strip the executable filename */
+      if (L > 0)
+        L--; /* drop the trailing '/' */
+      while (L > 0 && ep[L - 1] != '/')
+        L--; /* strip the parent directory component (e.g. "bin") */
+      if (L > 0 && L + 5 <= sizeof(exe_libdir)) {
+        memcpy(exe_libdir, ep, L);         /* e.g. "/mnt/rust/" */
+        memcpy(exe_libdir + L, "lib/", 5); /* -> "/mnt/rust/lib/" */
+      }
+    }
+
     for (usize o = 0; o < object_count; o++) {
       if (objects[o].needed_count && !objects[o].strtab) {
         kfree(file_data);
@@ -940,25 +1122,108 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
           kfree(file_data);
           return -1;
         }
-        char libpath[96] = "/lib/";
         usize name_len = strlen(name);
-        if (name_len + 6 > sizeof(libpath)) {
-          kfree(file_data);
-          return -1;
-        }
-        memcpy(libpath + 5, name, name_len + 1);
+        char libpath[160];
         u64 lib_base = 0x0000600000000000ULL +
                        (u64)(object_count - 1) * 0x0000010000000000ULL;
-        if (elf64_load_shared_object(image, libpath, lib_base,
-                                     &objects[object_count]) != 0) {
+        int loaded = -1;
+        /* 1) bundle-relative ($ORIGIN/../lib) */
+        if (exe_libdir[0]) {
+          usize dl = strlen(exe_libdir);
+          if (dl + name_len + 1 <= sizeof(libpath)) {
+            memcpy(libpath, exe_libdir, dl);
+            memcpy(libpath + dl, name, name_len + 1);
+            loaded = elf64_load_shared_object(image, libpath, lib_base,
+                                              &objects[object_count]);
+          }
+        }
+        /* 2) system /lib */
+        if (loaded != 0) {
+          if (name_len + 6 > sizeof(libpath)) {
+            kfree(file_data);
+            return -1;
+          }
+          memcpy(libpath, "/lib/", 5);
+          memcpy(libpath + 5, name, name_len + 1);
+          loaded = elf64_load_shared_object(image, libpath, lib_base,
+                                            &objects[object_count]);
+        }
+        if (loaded != 0) {
           console_write("ELF load: missing/invalid DT_NEEDED ");
-          console_write(libpath);
+          console_write(name);
           console_write("\n");
           kfree(file_data);
           return -1;
         }
         memcpy(loaded_names[object_count], name, name_len + 1);
         object_count++;
+      }
+    }
+
+    /* Build the process-wide static-TLS layout (x86-64 variant II) spanning the
+     * executable and every TLS-bearing library, so each object's
+     * R_X86_64_TPOFF64 relocations (applied just below) resolve to the correct
+     * thread-pointer-relative slot. objects[].tls_offset is the distance each
+     * block sits below the thread pointer. objects[0] (the executable) keeps the
+     * b1nix local-exec convention (unrounded memsz) and, when no library has
+     * TLS, the executable's own template is left untouched so single-TLS
+     * binaries remain byte-for-byte identical to before. */
+    objects[0].tls_memsz = image->tls_memsz;
+    objects[0].tls_filesz = image->tls_filesz;
+    objects[0].tls_align = image->tls_align;
+    objects[0].tls_data = image->tls_data;
+    image->tls_data = 0;
+
+    int lib_has_tls = 0;
+    for (usize o = 1; o < object_count; o++)
+      if (objects[o].tls_memsz)
+        lib_has_tls = 1;
+
+    if (lib_has_tls) {
+      u64 frontier = 0, max_align = 8;
+      for (usize o = 0; o < object_count; o++) {
+        if (objects[o].tls_memsz == 0) {
+          objects[o].tls_offset = 0;
+          continue;
+        }
+        u64 a = objects[o].tls_align < 8 ? 8 : objects[o].tls_align;
+        if (a > max_align)
+          max_align = a;
+        u64 off = (o == 0)
+                      ? objects[0].tls_memsz
+                      : ((frontier + objects[o].tls_memsz + a - 1) & ~(a - 1));
+        objects[o].tls_offset = off;
+        frontier = off;
+      }
+      u64 total_data = frontier;
+      void *combined = kzalloc(total_data ? total_data : 1);
+      if (!combined) {
+        for (usize o = 0; o < object_count; o++)
+          if (objects[o].tls_data)
+            kfree(objects[o].tls_data);
+        kfree(file_data);
+        return -1;
+      }
+      for (usize o = 0; o < object_count; o++) {
+        if (objects[o].tls_memsz == 0 || !objects[o].tls_data ||
+            !objects[o].tls_filesz)
+          continue;
+        u64 dst = total_data - objects[o].tls_offset;
+        memcpy((char *)combined + dst, objects[o].tls_data,
+               (usize)objects[o].tls_filesz);
+      }
+      image->tls_data = combined;
+      image->tls_memsz = total_data;
+      image->tls_filesz = total_data;
+      image->tls_align = max_align;
+    } else {
+      image->tls_data = objects[0].tls_data;
+      objects[0].tls_data = 0;
+    }
+    for (usize o = 0; o < object_count; o++) {
+      if (objects[o].tls_data) {
+        kfree(objects[o].tls_data);
+        objects[o].tls_data = 0;
       }
     }
 

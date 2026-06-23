@@ -609,6 +609,40 @@ void kernel_main(usize arg0, usize arg1)
 		}
 	}
 
+	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so + libLLVM.so +
+	 * libgcc_s.so + the std sysroot (~hundreds of MB) are far too big for the
+	 * xxd-embedded initramfs, so — like d8 above — they ship as a GRUB
+	 * Multiboot2 module (grub.cfg `module2 /boot/rust.img`) exposed as the ram0
+	 * ext4 block device. With b1nix.rustrun the kernel mounts it and launches
+	 * /bin/rustc. rustc has librustc_driver.so/libLLVM.so as DT_NEEDED (no
+	 * PT_INTERP), so just loading the binary exercises the M69 recursive
+	 * exec-time dynamic linker across the whole ~325MB .so graph. Running
+	 * `rustc --version` then proves the loaded compiler actually executes on
+	 * b1nix (it prints its real version string to serial). Gated by a cmdline
+	 * flag so it never fires in the ordinary smoke suite. */
+	if (bootinfo_has_flag("b1nix.rustrun")) {
+		vfs_mkdir("/mnt/rust", 0755);
+		int rust_mrc = vfs_mount("ram0", "/mnt/rust", "ext4", 0);
+		char rust_buf[96];
+		snprintf(rust_buf, sizeof(rust_buf), "rust: mount ram0 -> /mnt/rust: %d\n", rust_mrc);
+		console_write(rust_buf);
+		if (rust_mrc == 0) {
+			const char *rust_argv[] = {"rustc", "--version", 0};
+			int rust_pid = user_spawn("/mnt/rust/bin/rustc", 2, rust_argv);
+			snprintf(rust_buf, sizeof(rust_buf), "rust: rustc spawn result: %d\n", rust_pid);
+			console_write(rust_buf);
+			/* A valid pid means user_load_elf64 resolved and relocated the whole
+			 * rustc -> librustc_driver.so -> libLLVM.so -> libgcc_s.so graph
+			 * (~250MB) through the M69 exec-time dynamic linker. rustc then prints
+			 * its real version banner ("rustc 1.x ...") when it runs — that banner
+			 * is the execution proof the smoke runner checks for. */
+			if (rust_pid > 0)
+				console_write("M68-RUST: ok rustc-load\n");
+			else
+				console_write("M68-RUST: fail rustc-load\n");
+		}
+	}
+
 	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs
 	 * BKL-free and scheduler_yield no longer hands a lock across the context
 	 * switch, so the idle loop just yields and parks when there is no work. */

@@ -970,9 +970,17 @@ ctor/dtor markers).
   `DT_FINI_ARRAY`/`DT_FINI` and `munmap`s at zero, and `RTLD_DEFAULT` /
   `RTLD_NEXT` lookup scopes are implemented.
 - **Motivation:** unblocks rustc **proc-macros** and compiler **plugins** (both
-  loaded as `.so`) plus general shared-library support. **NOT** required for the
-  static native rustc (M68) — that statically links its LLVM backend; this only
-  removes the "no dynamic loading" ceiling.
+  loaded as `.so`) plus general shared-library support.
+- [x] `done` **Kernel exec-time dynamic linker runs the native rustc.** The M68
+  rustc came out *dynamic* (`rustc` → `librustc_driver.so` → `libLLVM.so` →
+  `libgcc_s.so`, no `PT_INTERP`), so the kernel ELF64 loader resolves the whole
+  ~250 MB `DT_NEEDED` graph at exec. Extensions to `kernel/user/process.c`:
+  dynamic `ET_EXEC` (not just PIE), `R_X86_64_COPY` (e.g. `environ`),
+  `R_X86_64_TPOFF64` with a process-wide variant-II static-TLS layout across all
+  objects, a 2 KB symbol-name buffer (Rust mangled names reach ~750 chars), and
+  `$ORIGIN/../lib` bundle-relative `DT_NEEDED` resolution. Proven in QEMU
+  (`b1nix.rustrun`, `tools/rust/rust-proof.sh`): `M68-RUST: ok rustc-load` then
+  the real `rustc 1.98.0-nightly` banner printed from b1nix.
 
 ## M70: Interrupt-Driven I/O
 
