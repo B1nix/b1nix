@@ -1264,12 +1264,22 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       }
     }
 
-    for (usize o = 0; o < object_count; o++) {
-      if (elf64_apply_rela_table(image, objects, object_count, o,
-                                 objects[o].rela, objects[o].rela_size) != 0 ||
-          elf64_apply_rela_table(image, objects, object_count, o,
-                                 objects[o].jmprel,
-                                 objects[o].jmprel_size) != 0) {
+    /* Relocate libraries (index 1+) BEFORE the executable (index 0). An
+     * R_X86_64_COPY reloc in the non-PIE executable copies the *initial value*
+     * of a symbol (e.g. the FILE* `stdout`, `stderr`, `stdin`, `errno`,
+     * `environ`) out of the defining library's data. That value is itself set
+     * by the library's own R_X86_64_RELATIVE reloc (e.g. `stdout = &_stdout` =
+     * lib_base + offset), so the library must be relocated first — otherwise
+     * the COPY grabs the un-relocated (link-time) pointer and the executable's
+     * `stdout` points to garbage, crashing the first fprintf(). Only the
+     * executable carries COPY relocs (libraries are PIC), so processing it last
+     * is always correct. */
+    for (usize oi = object_count; oi-- > 0;) {
+      if (elf64_apply_rela_table(image, objects, object_count, oi,
+                                 objects[oi].rela, objects[oi].rela_size) != 0 ||
+          elf64_apply_rela_table(image, objects, object_count, oi,
+                                 objects[oi].jmprel,
+                                 objects[oi].jmprel_size) != 0) {
         console_write("ELF load: unresolved/unsupported dynamic relocation\n");
         kfree(file_data);
         return -1;
