@@ -26,6 +26,10 @@ INITRAMFS_TESTFONT_INC := $(BUILD_DIR)/initramfs_testfont.inc
 # M40: a committed static Linux x86_64 ELF blob (tools/m40/linux_hello.bin)
 # embedded as /bin/m40-linux-hello to validate the Linux ABI compat layer.
 INITRAMFS_M40_LINUX_INC := $(BUILD_DIR)/initramfs_m40_linux.inc
+# M67: a prebuilt static Rust (x86_64-unknown-b1nix) ELF blob
+# (tools/m67/hello_b1nix.elf, regen via tools/m67/build-hello.sh) embedded as
+# /bin/m67-rust to validate the Rust std cross-toolchain at runtime. x86_64-only.
+INITRAMFS_M67_RUST_INC := $(BUILD_DIR)/initramfs_m67_rust.inc
 # M53: NetSurf framebuffer browser + resources + test page.
 INITRAMFS_NETSURF_INC := $(BUILD_DIR)/initramfs_netsurf_files.inc
 NSFB_ELF := build/netsurf-fb-b1nix/$(B1NIX_TRIPLET)/nsfb
@@ -138,6 +142,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_TESTWAV_INC) \
 	$(INITRAMFS_TESTFONT_INC) \
 	$(INITRAMFS_M40_LINUX_INC) \
+	$(INITRAMFS_M67_RUST_INC) \
 	$(INITRAMFS_NETSURF_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
@@ -868,6 +873,13 @@ $(INITRAMFS_TESTFONT_INC): userspace/share/fonts/B1nixMono-Regular.ttf
 $(INITRAMFS_M40_LINUX_INC): tools/m40/linux_hello.bin
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m40_linux_hello tools/m40/linux_hello.bin > $@
+
+# M67: embed the committed prebuilt static Rust ELF blob. Checked in (regenerated
+# by hand via tools/m67/build-hello.sh) so the kernel build needs no Rust
+# toolchain. Same pattern as the M40 Linux blob above.
+$(INITRAMFS_M67_RUST_INC): tools/m67/hello_b1nix.elf
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m67_rust_elf tools/m67/hello_b1nix.elf > $@
 
 # M53: the loopback HTTPS server links mbedTLS; depend on NSFB_ELF so curl ->
 # mbedTLS is built (its archives present) before this binary is embedded.

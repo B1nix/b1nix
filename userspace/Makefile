@@ -67,8 +67,9 @@ LIBC_OBJS := \
 	$(BUILD)/libc/statvfs.o \
 	$(BUILD)/libc/eventpoll.o \
 	$(BUILD)/libc/dlfcn.o \
+	$(BUILD)/libc/div64.o \
 	$(BUILD)/libc/posix_compat.o \
-	$(BUILD)/libc/div64.o
+	$(BUILD)/libc/rust_compat.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
 	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke

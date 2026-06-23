@@ -1,0 +1,45 @@
+# M68 bootstrap config — build a rustc whose HOST is x86_64-unknown-b1nix.
+# build host = linux (uses CI LLVM); the b1nix host LLVM is cross-built from
+# the bundled submodule with the b1nix cross g++.
+
+[build]
+build = "x86_64-unknown-linux-gnu"
+host  = ["x86_64-unknown-b1nix"]
+target = ["x86_64-unknown-b1nix"]
+docs = false
+extended = false
+tools = ["cargo"]
+submodules = true
+# build-stage tools (the linux stage0/stage1) keep using prebuilt CI LLVM.
+verbose = 1
+
+[rust]
+channel = "nightly"
+# panic=abort everywhere for the b1nix host (no unwinder).
+deny-warnings = false
+lld = false
+llvm-tools = false
+
+[llvm]
+download-ci-llvm = true
+# b1nix is Linux-ABI-aliased (cross gcc defines __b1nix__/__unix__, NOT __linux__),
+# but LLVM's platform detection (LLVM_ON_UNIX, <endian.h>, file_status::getSize)
+# keys on __linux__. Present b1nix as Linux to the LLVM cross-build only — its
+# libc supports the POSIX paths. (The build host uses prebuilt CI LLVM, so the
+# only LLVM compiled from source is the b1nix one, making these flags scoped.)
+# llvm.targets is incompatible with download-ci-llvm (CI LLVM ships all targets);
+# the b1nix host LLVM cross-build will inherit the default target set.
+
+[target.x86_64-unknown-linux-gnu]
+# build-host toolchain: native clang
+cc = "clang"
+cxx = "clang++"
+
+[target.x86_64-unknown-b1nix]
+cc  = "/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross/bin/x86_64-b1nix-gcc"
+cxx = "/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross/bin/x86_64-b1nix-g++"
+ar  = "/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross/bin/x86_64-b1nix-ar"
+ranlib = "/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross/bin/x86_64-b1nix-ranlib"
+linker = "/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross/bin/x86_64-b1nix-gcc"
+# cross-build LLVM for this host from source (no CI build exists for b1nix).
+crt-static = true

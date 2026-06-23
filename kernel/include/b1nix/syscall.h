@@ -190,6 +190,11 @@ enum {
 	SYS_MADVISE         = 159,
 	SYS_SIGALTSTACK     = 160,
 	SYS_GET_TLS_INFO    = 161,
+	/* Re-raise a signal to the calling process (Linux rt_tgsigqueueinfo
+	 * compatibility shim). b1nix cannot carry arbitrary siginfo on a
+	 * self-re-raise, so the payload is dropped — same limitation as raise(3),
+	 * which is the fallback LLVM/glibc use when this call is unsupported. */
+	SYS_RT_TGSIGQUEUEINFO = 162,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

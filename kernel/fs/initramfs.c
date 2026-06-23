@@ -58,6 +58,8 @@
 #ifdef __x86_64__
 /* M40: static Linux x86_64 ELF for the Linux ABI compat smoke. x86_64 only. */
 #include "initramfs_m40_linux.inc"
+/* M67: prebuilt static Rust ELF for the Rust cross-toolchain smoke. x86_64 only. */
+#include "initramfs_m67_rust.inc"
 #endif
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
@@ -1528,6 +1530,11 @@ static const struct initramfs_file files[] = {
      * ABI translation layer maps them to the native handlers. */
     {"/bin/m40-linux-hello", (const char *)vfs_m40_linux_hello,
      sizeof(vfs_m40_linux_hello), INITRAMFS_EXECUTABLE},
+    /* M67: a static Rust program (Vec/String/HashMap/thread) built for
+     * x86_64-unknown-b1nix with nightly rustc + build-std, linked against the
+     * b1nix libc via the cross gcc. Exercises the Rust std unix PAL at runtime. */
+    {"/bin/m67-rust", (const char *)vfs_m67_rust_elf,
+     sizeof(vfs_m67_rust_elf), INITRAMFS_EXECUTABLE},
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},

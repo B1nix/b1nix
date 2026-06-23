@@ -7,6 +7,11 @@ extern "C" {
 
 extern int errno;
 
+/* Linux/musl-style errno accessor. b1nix errno is a single global, so this
+ * returns &errno. Provided because the Rust standard library (and some ports)
+ * read errno exclusively through __errno_location(). */
+int *__errno_location(void);
+
 /* Normalize kernel error codes to valid POSIX errno values.
    Returns EIO for out-of-range codes. */
 int normalize_errno(long rc);

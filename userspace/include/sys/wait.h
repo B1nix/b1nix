@@ -4,6 +4,8 @@
 #include <sys/types.h>
 #include <signal.h>
 
+struct rusage;
+
 typedef enum {
   P_ALL = 0,
   P_PID = 1,
@@ -17,6 +19,8 @@ extern "C" {
 pid_t wait(int *wstatus);
 pid_t waitpid(pid_t pid, int *wstatus, int options);
 int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options);
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage);
+pid_t wait3(int *wstatus, int options, struct rusage *rusage);
 
 #ifdef __cplusplus
 }

@@ -3076,6 +3076,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* Signal delivery handled by the wrapper. */
     return kill_ret;
   }
+  case SYS_RT_TGSIGQUEUEINFO: {
+    /* rt_tgsigqueueinfo(tgid, tid, sig, siginfo): Linux lets a process send a
+     * signal to one of its own threads with attached siginfo. b1nix has no
+     * per-thread siginfo delivery, so we honor the common in-tree use (LLVM's
+     * crash handler re-raising a fault on itself) by re-raising the signal to
+     * the calling process. The siginfo payload (arg3) is intentionally dropped
+     * — exactly the semantics of raise(3), which callers fall back to. */
+    int rsig = (int)arg2;
+    if (rsig <= 0 || rsig >= 64)
+      return (u64)-EINVAL;
+    /* Re-raise to self; signal delivery is performed by the wrapper. */
+    return (u64)scheduler_kill((usize)scheduler_get_pid(), rsig);
+  }
   case SYS_SIGNAL: {
     int sig = (int)arg0;
     struct sigaction act;

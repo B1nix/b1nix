@@ -200,6 +200,10 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
 
 int usleep(unsigned int usec);
 
+/* Suspend the calling thread until a signal is delivered. Always returns -1
+ * with errno set to EINTR. */
+int pause(void);
+
 /* Index of the CPU currently executing this thread (0 = BSP, 1+ = AP). */
 static inline int getcpu(void) {
     return syscall(SYS_GETCPU);
@@ -220,7 +224,10 @@ int lchown(const char *path, uid_t owner, gid_t group);
 #define _SC_NPROCESSORS_ONLN 84
 #define _SC_PHYS_PAGES 85
 #define _SC_AVPHYS_PAGES 86
+#define _SC_GETPW_R_SIZE_MAX 70  /* suggested getpw*_r buffer size */
+#define _SC_ARG_MAX 0  /* max bytes of arg+env to exec */
 long sysconf(int name);
+int getpagesize(void);
 
 extern char *optarg;
 extern int optind, opterr, optopt;

@@ -2,6 +2,11 @@
 #define B1NIX_U_PWD_H
 
 #include <sys/types.h>
+#include <stddef.h>
+
+#ifdef __cplusplus
+extern "C" {
+#endif
 
 struct passwd {
     char  *pw_name;   /* user name */
@@ -15,5 +20,16 @@ struct passwd {
 
 struct passwd *getpwnam(const char *name);
 struct passwd *getpwuid(uid_t uid);
+
+/* Reentrant variants. b1nix has no shadow db; these fill *pwd from the same
+ * source as getpwnam/getpwuid, copying strings into buf. */
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result);
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result);
+
+#ifdef __cplusplus
+}
+#endif
 
 #endif
