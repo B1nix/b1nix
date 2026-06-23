@@ -990,10 +990,10 @@ move onto real dynamic linking (the `--enable-shared` cross GCC gives them
 kernel resolves it), the per-spawn linking cost matters. Eliminate the speed
 problems so "everything dynamic" carries no penalty:
 
-- [ ] `planned` **O(1) symbol resolution.** `elf64_resolve_symbol` does a linear
-  scan over each object's dynsym per symbolic relocation — O(relocs × symbols).
-  Use the `DT_HASH` / `DT_GNU_HASH` table for O(1) lookup (the count is already
-  read from `DT_HASH`; use it for lookup too).
+- [x] `done` **O(1) symbol resolution.** `elf64_resolve_symbol` /
+  `elf64_resolve_tls_symbol` now walk the SysV `DT_HASH` table
+  (`elf64_sysv_hash` + `elf64_hash_lookup`) instead of a linear dynsym scan —
+  O(relocs × symbols) → O(relocs). (v0.69.3)
 - [ ] `planned` **Share/cache loaded shared objects across processes.** The
   loader re-reads + re-`kzalloc`s + re-relocates each `.so` (libgcc_s.so,
   libc.so, ...) on every `spawn`. Load + relocate once and share the read-only
@@ -1003,10 +1003,15 @@ problems so "everything dynamic" carries no penalty:
 - [ ] `planned` **Faster segment lookup.** `elf64_stage_ptr` is O(segments) per
   call; binary-search / hash the vaddr ranges.
 
-Note: this is the *linker* cost only. The M53 NetSurf render slowness
-(~80 s/page) is Mesa **softpipe** CPU rasterisation, not dynamic linking — `nsfb`
-has only ~187 relocations, whose resolution is sub-millisecond. That, plus the
-parallel-smoke host-capacity limits, is tracked separately, not under M69b.
+**Loader correctness — `R_X86_64_COPY` relocation order (v0.69.6).** The eager
+linker relocated the executable before its libraries, so a non-PIE exe's COPY
+relocs (`stdout`/`stderr`/`stdin`/`errno`/`environ`, imported from libgcc_s.so)
+copied the source library's pointer *before* the library's own `R_X86_64_RELATIVE`
+reloc had fixed it — the exe's `stdout` got a garbage pointer and the first
+`fprintf()` crashed. Every NetSurf render (the whole M53 cluster) died this way.
+Fixed by relocating libraries before the executable (only the non-PIE exe carries
+COPY relocs). With this, the M69 loader is correct for the full C/C++ port set;
+**x86_64 smoke is fully green (833/0)**.
 
 ## M70: Interrupt-Driven I/O
 
