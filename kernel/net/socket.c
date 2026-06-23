@@ -635,7 +635,15 @@ void vfs_socket_init_handle(struct vfs_handle *h, void *socket_state) {
   h->kind = VFS_HANDLE_SOCKET;
 }
 
+/* Linux-style atomic socket-type flags OR'd into the `type` argument (match
+ * userspace <sys/socket.h>: SOCK_CLOEXEC=02000000, SOCK_NONBLOCK=00004000).
+ * curl, dropbear, NetSurf and Rust std all create sockets this way. */
+#define SOCK_TYPE_CLOEXEC  0x80000
+#define SOCK_TYPE_NONBLOCK 0x800
+
 int vfs_socket(int domain, int type, int protocol) {
+  int sock_flags = type & (SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
+  type &= ~(SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
   if (domain != B1NIX_AF_INET && domain != B1NIX_AF_INET6 &&
       domain != B1NIX_AF_UNIX && domain != B1NIX_AF_NETLINK)
     return -EAFNOSUPPORT;
@@ -669,6 +677,10 @@ int vfs_socket(int domain, int type, int protocol) {
     vfs_handle_release(h);
     return -EMFILE;
   }
+  if (sock_flags & SOCK_TYPE_NONBLOCK)
+    h->flags |= B1NIX_O_NONBLOCK;
+  if (sock_flags & SOCK_TYPE_CLOEXEC)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
   return fd;
 }
 
