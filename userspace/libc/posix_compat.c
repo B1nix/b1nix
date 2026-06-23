@@ -163,7 +163,11 @@ int sigwait(const sigset_t *set, int *sig) {
   return ENOSYS;
 }
 
-int daemon(int nochdir, int noclose) {
+/* Weak so a program that bundles its own daemon() (e.g. dropbear, whose cached
+ * autoconf was generated before b1nix libc had one, so its config.h leaves
+ * HAVE_DAEMON undefined and it compiles its own) wins the link instead of
+ * colliding with this definition. */
+__attribute__((weak)) int daemon(int nochdir, int noclose) {
   int r = fork();
   if (r < 0) return -1;
   if (r > 0) _exit(0);

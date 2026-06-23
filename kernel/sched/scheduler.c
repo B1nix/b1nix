@@ -1383,9 +1383,19 @@ static void clone_thread_kentry(void *arg) {
   u64 user_arg = cta->user_arg;
   kfree(cta);
 #ifdef __x86_64__
-  /* SysV AMD64: x86_user_jump drops its 3rd positional (user_arg) into %rdi,
-   * which is the first argument of pthread's start_routine(void*). */
-  x86_user_jump((usize)entry, (usize)stack, (usize)user_arg, 0);
+  /* SysV AMD64: a function entered via `call` sees %rsp ≡ 8 (mod 16) — the
+   * 8-byte return address sits just below a 16-byte-aligned call site, and the
+   * callee's prologue realigns to 16. The kernel transfers control directly
+   * (no call), so we must simulate that frame: 16-align the stack, then reserve
+   * a dummy return-address slot. Without the `-8`, the thread entry runs with
+   * %rsp ≡ 0 (mod 16), and the first `movaps %xmm,off(%rsp)` with a 16-aligned
+   * `off` #GPs — e.g. Rust std's stack_overflow::make_handler zeroes a stack
+   * struct that way (the M67 std::thread crash). The i386 branch below already
+   * builds this frame; x86_64 must too. x86_user_jump drops its 3rd positional
+   * (user_arg) into %rdi = start_routine's void* argument. */
+  u64 sp = ((u64)stack & ~0xFUL) - 8;
+  *(volatile u64 *)(usize)sp = 0; /* return address: threads exit via SYS_EXIT_THREAD, never ret */
+  x86_user_jump((usize)entry, (usize)sp, (usize)user_arg, 0);
 #else
   /* SysV i386 passes arguments on the stack, not in registers, and the 32-bit
    * x86_user_jump clears the GPRs — so the thread's start_routine(void*) would
