@@ -11,3 +11,6 @@
 #define SYS_gettid SYS_GETTID
 #define SYS_futex SYS_FUTEX
 #define SYS_getrandom SYS_GETRANDOM
+/* Linux self-re-raise used by LLVM's crash signal handler. b1nix re-raises the
+ * signal to the calling process (siginfo payload is not preserved). */
+#define SYS_rt_tgsigqueueinfo SYS_RT_TGSIGQUEUEINFO

@@ -1,0 +1,38 @@
+diff --git a/src/bootstrap/src/core/build_steps/llvm.rs b/src/bootstrap/src/core/build_steps/llvm.rs
+index 087a395a..09c6cc9e 100644
+--- a/src/bootstrap/src/core/build_steps/llvm.rs
++++ b/src/bootstrap/src/core/build_steps/llvm.rs
+@@ -695,6 +695,11 @@ fn configure_cmake(
+             cfg.define("CMAKE_SYSTEM_NAME", "Haiku");
+         } else if target.contains("solaris") || target.contains("illumos") {
+             cfg.define("CMAKE_SYSTEM_NAME", "SunOS");
++        } else if target.contains("b1nix") {
++            // b1nix is Linux-ABI-aliased; present it to LLVM's cmake as Linux so
++            // LLVM_ON_UNIX/<endian.h>/file_status::getSize and the POSIX code
++            // paths are enabled (b1nix's libc supports them). (M68)
++            cfg.define("CMAKE_SYSTEM_NAME", "Linux");
+         } else if target.contains("linux") {
+             cfg.define("CMAKE_SYSTEM_NAME", "Linux");
+         } else if target.contains("darwin") {
+@@ -815,6 +820,11 @@ fn configure_cmake(
+     if target.contains("ohos") {
+         cflags.push(" -D_LINUX_SYSINFO_H");
+     }
++    if target.contains("b1nix") {
++        // b1nix is Linux-ABI-aliased; define __linux__ so LLVM's source-level
++        // #if defined(__linux__) branches take the Linux/glibc path. (M68)
++        cflags.push(" -D__linux__=1");
++    }
+     if builder.config.llvm_clang_cl.is_some() {
+         cflags.push(format!(" --target={target}"));
+     }
+@@ -840,6 +850,9 @@ fn configure_cmake(
+     if target.contains("ohos") {
+         cxxflags.push(" -D_LINUX_SYSINFO_H");
+     }
++    if target.contains("b1nix") {
++        cxxflags.push(" -D__linux__=1");
++    }
+     if builder.config.llvm_clang_cl.is_some() {
+         cxxflags.push(format!(" --target={target}"));
+     }

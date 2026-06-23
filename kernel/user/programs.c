@@ -1302,6 +1302,29 @@ static int init_main(int argc, const char **argv) {
     }
     uwrite("M40-LINUX: done\n");
   }
+
+  /* M67: Rust cross-toolchain. Spawn a static Rust program built for
+   * x86_64-unknown-b1nix (nightly rustc + build-std, Rust std unix PAL on top
+   * of the b1nix libc). It uses Vec/String/HashMap and spawns a thread that
+   * joins (exercising the futex bridge), printing two lines and exit(0). The
+   * marker is emitted only when the program actually ran to a 0 exit, proving
+   * Rust std works end-to-end on b1nix. */
+  {
+    uwrite("M67-RUST: start\n");
+    u64 r_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m67-rust",
+                                 0, 0, 0, 0, 0);
+    if ((isize)r_pid < 0) {
+      uwrite("M67-RUST: spawn-fail\n");
+    } else {
+      int r_status = -1;
+      syscall_dispatch(SYS_WAIT, r_pid, (u64)(usize)&r_status, 0, 0, 0, 0);
+      if (r_status == 0)
+        uwrite("M67-RUST: ok run-std\n");
+      else
+        uwrite("M67-RUST: fail run-std\n");
+    }
+    uwrite("M67-RUST: done\n");
+  }
 #endif
   /* POSIX memory/signal primitives: madvise(MADV_DONTNEED) zeroes a refaulted
    * anonymous page, MAP_NORESERVE large lazy-commit mapping, and sigaltstack

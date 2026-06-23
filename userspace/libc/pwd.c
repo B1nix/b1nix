@@ -165,3 +165,53 @@ struct passwd *getpwuid(uid_t uid) {
         return &root_pw;
     return 0;
 }
+
+/* ── Reentrant variants (getpwnam_r / getpwuid_r) ─────────────────────────── *
+ * b1nix has no shadow database; these wrap the non-reentrant lookups, copying
+ * the string fields into the caller-provided buffer so *result points at the
+ * caller's struct. POSIX contract: return 0 and set *result=pwd on success;
+ * return 0 and set *result=NULL when the entry is not found; return an errno on
+ * error (ERANGE if buf is too small). */
+#include <errno.h>
+
+static int pw_copy_r(struct passwd *src, struct passwd *pwd, char *buf,
+                     size_t buflen, struct passwd **result) {
+    if (!src) { *result = 0; return 0; }
+    /* pack the seven strings into buf */
+    const char *fields[5];
+    fields[0] = src->pw_name   ? src->pw_name   : "";
+    fields[1] = src->pw_passwd ? src->pw_passwd : "";
+    fields[2] = src->pw_gecos  ? src->pw_gecos  : "";
+    fields[3] = src->pw_dir    ? src->pw_dir    : "";
+    fields[4] = src->pw_shell  ? src->pw_shell  : "";
+    size_t need = 0;
+    for (int i = 0; i < 5; i++) need += strlen(fields[i]) + 1;
+    if (need > buflen) { *result = 0; return ERANGE; }
+    char *p = buf;
+    char *dst[5];
+    for (int i = 0; i < 5; i++) {
+        size_t n = strlen(fields[i]) + 1;
+        memcpy(p, fields[i], n);
+        dst[i] = p;
+        p += n;
+    }
+    pwd->pw_name   = dst[0];
+    pwd->pw_passwd = dst[1];
+    pwd->pw_uid    = src->pw_uid;
+    pwd->pw_gid    = src->pw_gid;
+    pwd->pw_gecos  = dst[2];
+    pwd->pw_dir    = dst[3];
+    pwd->pw_shell  = dst[4];
+    *result = pwd;
+    return 0;
+}
+
+int getpwnam_r(const char *name, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result) {
+    return pw_copy_r(getpwnam(name), pwd, buf, buflen, result);
+}
+
+int getpwuid_r(uid_t uid, struct passwd *pwd, char *buf, size_t buflen,
+               struct passwd **result) {
+    return pw_copy_r(getpwuid(uid), pwd, buf, buflen, result);
+}

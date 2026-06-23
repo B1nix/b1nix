@@ -3,6 +3,10 @@
 
 #include <stddef.h>   /* NULL */
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 /*
  * dlfcn.h — B1NIX userspace
  *
@@ -47,5 +51,9 @@ typedef struct {
 } Dl_info;
 
 int dladdr(const void *addr, Dl_info *info);
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 
 #endif /* B1NIX_U_DLFCN_H */

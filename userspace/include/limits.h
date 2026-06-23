@@ -84,6 +84,9 @@
 #ifndef NAME_MAX
 #define NAME_MAX 255
 #endif
+#ifndef _POSIX_ARG_MAX
+#define _POSIX_ARG_MAX 4096
+#endif
 #ifndef ARG_MAX
 #define ARG_MAX 131072
 #endif

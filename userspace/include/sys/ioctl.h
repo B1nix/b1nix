@@ -61,6 +61,24 @@ int ioctl(int fd, unsigned long request, ...);
 #define SIOCDELMULTI        0x8932
 #define SIOCSIFHWBROADCAST  0x8937
 
+/* Window-size ioctl + struct (glibc exposes these via <sys/ioctl.h>). Guarded so
+ * including both <sys/ioctl.h> and <termios.h> is safe. */
+#ifndef TIOCGWINSZ
+#define TIOCGWINSZ 0x5413
+#endif
+#ifndef TIOCSWINSZ
+#define TIOCSWINSZ 0x5414
+#endif
+#ifndef _STRUCT_WINSIZE_DEFINED
+#define _STRUCT_WINSIZE_DEFINED 1
+struct winsize {
+  unsigned short ws_row;
+  unsigned short ws_col;
+  unsigned short ws_xpixel;
+  unsigned short ws_ypixel;
+};
+#endif
+
 #ifdef __cplusplus
 }
 #endif

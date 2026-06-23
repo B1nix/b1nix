@@ -2,6 +2,7 @@
 #define B1NIX_U_SYS_MMAN_H
 
 #include <stddef.h>
+#include <sys/types.h>
 
 #define PROT_NONE       0x00
 #define PROT_READ       0x01
@@ -45,10 +46,29 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t len, int prot);
 int madvise(void *addr, size_t length, int advice);
+int msync(void *addr, size_t length, int flags);
 int memfd_create(const char *name, unsigned int flags);
+
+/* POSIX named shared memory (glibc declares these in <sys/mman.h>). b1nix has
+ * no /dev/shm tmpfs namespace, so shm_open() is implemented on top of the
+ * existing anonymous-shared-memory primitive memfd_create(): it returns a real
+ * fd that backs ftruncate() + mmap(MAP_SHARED) exactly as POSIX requires. The
+ * `name` is therefore not a persistent namespace key — each shm_open() yields a
+ * fresh unnamed object — so shm_unlink() is a no-op success (the object is
+ * reclaimed when the last fd/mmap is dropped, like an O_TMPFILE/already-unlinked
+ * file). This is sufficient for the only in-tree caller (LLVM's Orc JIT
+ * shared-memory mapper), which creates, ftruncates, mmaps and closes the fd in
+ * one process. The O_EXCL/O_CREAT oflags and mode are honored only insofar as
+ * memfd permits; a name-collision cannot occur because there is no namespace. */
+int shm_open(const char *name, int oflag, mode_t mode);
+int shm_unlink(const char *name);
 
 /* b1nix has no mremap syscall; the wrapper fails (MAP_FAILED/ENOMEM) so callers
  * fall back to munmap+mmap. Declared for source compatibility (V8 perf-jit). */
+#define MS_ASYNC      1
+#define MS_INVALIDATE 2
+#define MS_SYNC       4
+
 #define MREMAP_MAYMOVE 1
 #define MREMAP_FIXED   2
 void *mremap(void *old_address, size_t old_size, size_t new_size, int flags, ...);

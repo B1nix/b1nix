@@ -143,12 +143,15 @@ struct termios {
 #define TIOCGPTN   0x80045430
 #define TIOCSPTLCK 0x40045431
 
+#ifndef _STRUCT_WINSIZE_DEFINED
+#define _STRUCT_WINSIZE_DEFINED 1
 struct winsize {
   unsigned short ws_row;
   unsigned short ws_col;
   unsigned short ws_xpixel;
   unsigned short ws_ypixel;
 };
+#endif
 
 typedef unsigned int speed_t;
 

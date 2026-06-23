@@ -26,6 +26,7 @@
 #include <sys/times.h>
 #include <sys/xattr.h>
 #include <sys/wait.h>
+#include <linux/futex.h>
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
@@ -519,6 +520,15 @@ int madvise(void *addr, size_t length, int advice) {
   return _check_err(syscall(SYS_MADVISE, addr, length, advice));
 }
 
+/* msync: b1nix has no MSYNC syscall and shared mmaps are write-through via the
+ * page cache, so flushing dirty pages back to the backing file is implicit.
+ * Treat msync as a successful no-op (callers like LLVM use it to ensure output
+ * is on disk, which b1nix's write-back already guarantees on munmap/close). */
+int msync(void *addr, size_t length, int flags) {
+  (void)addr; (void)length; (void)flags;
+  return 0;
+}
+
 /* M32: select() — fd-readiness multiplex. Converts tv to ms (with NULL ⇒
  * wait forever, matching the b1nix poll convention). */
 #include <sys/select.h>
@@ -670,6 +680,27 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
 
 int memfd_create(const char *name, unsigned int flags) {
   return _check_err(syscall(SYS_MEMFD_CREATE, name, flags));
+}
+
+/* POSIX named shared memory. b1nix has no /dev/shm namespace, so back this on
+ * the anonymous shared-memory object (memfd) — a real fd supporting
+ * ftruncate() + mmap(MAP_SHARED), which is all the standard contract (and the
+ * sole caller, LLVM's Orc shared-memory mapper) needs. The name is used only as
+ * a human-readable memfd label, not a lookup key; there is no namespace, so
+ * shm_unlink() succeeds as a no-op. oflag/mode are accepted for source
+ * compatibility (memfd ignores them — O_CREAT|O_EXCL can never collide here). */
+int shm_open(const char *name, int oflag, mode_t mode) {
+  (void)oflag;
+  (void)mode;
+  const char *label = name;
+  if (label && label[0] == '/')
+    label++; /* POSIX shm names start with '/'; strip it for the memfd label. */
+  return memfd_create(label && label[0] ? label : "shm", MFD_CLOEXEC);
+}
+
+int shm_unlink(const char *name) {
+  (void)name;
+  return 0; /* No persistent namespace: the object dies with its last ref. */
 }
 
 ssize_t sendto(int fd, const void *buf, size_t len, int flags,
@@ -900,6 +931,20 @@ pid_t waitpid(pid_t pid, int *wstatus, int options) {
 
 int waitid(idtype_t idtype, id_t id, siginfo_t *infop, int options) {
   return _check_err(syscall(SYS_WAITID, (long)idtype, (long)id, infop, options));
+}
+
+/* wait4/wait3: BSD wait variants. b1nix has no rusage accounting at wait time,
+ * so zero the rusage (if provided) and delegate to waitpid. */
+pid_t wait4(pid_t pid, int *wstatus, int options, struct rusage *rusage) {
+  if (rusage) {
+    char *p = (char *)rusage;
+    for (unsigned i = 0; i < sizeof(struct rusage); i++) p[i] = 0;
+  }
+  return waitpid(pid, wstatus, options);
+}
+
+pid_t wait3(int *wstatus, int options, struct rusage *rusage) {
+  return wait4((pid_t)-1, wstatus, options, rusage);
 }
 
 /* b1nix runs as root and has no login/passwd database; report "root" so tilde
@@ -1637,11 +1682,17 @@ long sysconf(int name) {
     }
     return -1;
   }
+  case _SC_ARG_MAX:
+    return 131072; /* matches ARG_MAX */
+  case _SC_GETPW_R_SIZE_MAX:
+    return 1024;
   default:
     errno = EINVAL;
     return -1;
   }
 }
+
+int getpagesize(void) { return (int)sysconf(_SC_PAGESIZE); }
 
 clock_t times(struct tms *buf) {
   long rc = syscall(SYS_TIMES, buf);
@@ -1904,6 +1955,61 @@ int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
  * Reads up to 6 args (extra args past what a given syscall uses are ignored by
  * the kernel, matching glibc's syscall()). */
 #undef syscall
+/* Linux x86_64 syscall numbers that the Rust standard library issues directly
+ * via libc::syscall() (the libc crate hard-codes Linux numbers). b1nix has its
+ * own SYS_* enum, so syscall() must recognize these Linux numbers and route
+ * them to the native b1nix syscall. This mirrors b1nix's existing M40 Linux-ABI
+ * layer (which already remaps Linux signal numbers, sigsets, etc.). */
+#define LINUX_SYS_futex 202
+
+/* Translate a Linux-style futex() call into b1nix's native SYS_FUTEX.
+ *
+ * Rust std (std::sys::pal::unix::futex) issues:
+ *   wait:  syscall(202, uaddr, FUTEX_WAIT_BITSET|FUTEX_PRIVATE_FLAG, val,
+ *                  *abs_timespec_or_null, NULL, FUTEX_BITSET_MATCH_ANY)
+ *   wake:  syscall(202, uaddr, FUTEX_WAKE|FUTEX_PRIVATE_FLAG, count)
+ * b1nix's native ABI is:
+ *   SYS_FUTEX(uaddr, op{0=WAIT,1=WAKE}, val, timeout_ms)
+ * The op gets its FUTEX_PRIVATE_FLAG masked off; the absolute CLOCK_MONOTONIC
+ * timespec is converted to a relative millisecond timeout. The return follows
+ * the libc convention (-1 + errno on error) so std's `errno`-based dispatch
+ * works. */
+static long _futex_bridge(long uaddr, long op_full, long val, long ts_ptr) {
+  int op = (int)(op_full & ~FUTEX_PRIVATE_FLAG);
+  long timeout_ms = 0;
+
+  if (op == FUTEX_WAIT_BITSET || op == FUTEX_WAIT) {
+    op = FUTEX_WAIT;
+    const struct timespec *abs = (const struct timespec *)ts_ptr;
+    if (abs) {
+      /* std passes an ABSOLUTE CLOCK_MONOTONIC deadline; b1nix wants a relative
+       * millisecond timeout. Compute (deadline - now), clamped to >= 1ms. */
+      struct timespec now;
+      if (clock_gettime(CLOCK_MONOTONIC, &now) != 0) {
+        now.tv_sec = 0;
+        now.tv_nsec = 0;
+      }
+      long long ms = (long long)(abs->tv_sec - now.tv_sec) * 1000 +
+                     ((long long)abs->tv_nsec - (long long)now.tv_nsec) / 1000000;
+      if (ms <= 0) ms = 1; /* already past: still take one short wait */
+      timeout_ms = (long)ms;
+    }
+  } else if (op == FUTEX_WAKE_BITSET || op == FUTEX_WAKE) {
+    op = FUTEX_WAKE;
+    timeout_ms = 0;
+  } else {
+    errno = ENOSYS;
+    return -1;
+  }
+
+  long rc = _syscall_raw(SYS_FUTEX, uaddr, op, val, timeout_ms, 0, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return rc;
+}
+
 long syscall(long number, ...) {
   va_list ap;
   va_start(ap, number);
@@ -1914,5 +2020,11 @@ long syscall(long number, ...) {
   long a4 = va_arg(ap, long);
   long a5 = va_arg(ap, long);
   va_end(ap);
+
+  /* Linux-ABI number remap for the few syscalls Rust std issues by raw number.
+   * SYS_FUTEX needs argument-shape translation, not just a number swap. */
+  if (number == LINUX_SYS_futex)
+    return _futex_bridge(a0, a1, a2, a3);
+
   return _syscall_raw(number, a0, a1, a2, a3, a4, a5);
 }
