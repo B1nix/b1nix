@@ -193,6 +193,7 @@ int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param
 
 #include <time.h>  /* clockid_t */
 int pthread_setname_np(pthread_t thread, const char *name);
+int pthread_getname_np(pthread_t thread, char *name, size_t len);
 int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id);
 
 #endif /* B1NIX_PTHREAD_H */

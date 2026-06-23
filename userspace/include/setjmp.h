@@ -1,6 +1,10 @@
 #ifndef B1NIX_U_SETJMP_H
 #define B1NIX_U_SETJMP_H
 
+#ifdef __cplusplus
+extern "C" {
+#endif
+
 typedef long jmp_buf[8];
 
 int setjmp(jmp_buf env);
@@ -27,5 +31,9 @@ void siglongjmp(sigjmp_buf env, int val) __attribute__((noreturn));
 
 #define sigsetjmp(env, savemask) \
 	(__sigsetjmp_save((env), (savemask)), setjmp((env)[0].__jb))
+
+#ifdef __cplusplus
+}  /* extern "C" */
+#endif
 
 #endif

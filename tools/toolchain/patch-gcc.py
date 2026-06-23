@@ -107,6 +107,21 @@ with open(b1nix_h_path, "w", encoding="utf-8") as f:
 #undef LIB_SPEC
 #define LIB_SPEC "%{!p:%{!pg:-lc}}%{p:-lc_p}%{pg:-lc_p}"
 
+/* Link the EH unwinder. The default *libgcc: spec is just "-lgcc" (static
+ * arithmetic libgcc, no _Unwind_*); a shared C++ object (libLLVM.so) needs the
+ * PIC unwinder from libgcc_s.so, a static exe needs libgcc_eh.a. */
+#undef LIBGCC_SPEC
+#define LIBGCC_SPEC \\
+  "%{static|static-libgcc:-lgcc -lgcc_eh;shared|shared-libgcc:-lgcc_s;:-lgcc --push-state --as-needed -lgcc_s --pop-state}"
+
+/* b1nix has no dynamic-TLS runtime (__tls_get_addr / DTV): TLS is a single
+ * loader-allocated block (variant II). Default to initial-exec so __thread uses
+ * %fs+GOT(TPOFF), not general-dynamic __tls_get_addr. -ftls-model=* overrides. */
+#undef CC1_SPEC
+#define CC1_SPEC "%(cc1_cpu) %{!ftls-model=*:-ftls-model=initial-exec}"
+#undef CC1PLUS_SPEC
+#define CC1PLUS_SPEC "%{!ftls-model=*:-ftls-model=initial-exec}"
+
 #endif
 """))
 

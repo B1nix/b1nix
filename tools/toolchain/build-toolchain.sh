@@ -152,6 +152,19 @@ if [ ! -f "$B1NIX_ROOTFS/include/pthread.h" ]; then
     make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
 fi
 
+# Mirror the b1nix libc headers into the cross-toolchain's own include dirs.
+# install-headers-libs only populates B1NIX_ROOTFS; the cross g++ resolves
+# <stdint.h>/<math.h> through its gcc-wrapper which #include_next's
+# $PREFIX/$TARGET/include and the sysroot. Without this sync those paths keep a
+# stale copy (e.g. an incomplete C99 <stdint.h>/<math.h>), so libstdc++'s C99
+# probes fail and disable <random>/std::isinf for every C++ port. Copy on every
+# run so header fixes always reach the compiler.
+for _incdst in "$PREFIX/$TARGET/include" "$SYSROOT/usr/include" "$SYSROOT/include"; do
+    [ -d "$_incdst" ] || mkdir -p "$_incdst" 2>/dev/null || continue
+    cp -f "$PROJECT_DIR/userspace/include/"*.h "$_incdst/" 2>/dev/null || true
+    cp -rf "$PROJECT_DIR/userspace/include/"*/ "$_incdst/" 2>/dev/null || true
+done
+
 # Empty stub archives for libs that b1nix folds into libc (pthread/rt/dl are all
 # in libc, musl-style). Software and GCC target libs link `-lpthread`/`-lrt`/
 # `-ldl`; provide empty archives so those links resolve instead of failing.

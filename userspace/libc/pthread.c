@@ -1066,6 +1066,12 @@ int pthread_setname_np(pthread_t thread, const char *name) {
   (void)name;
   return 0;
 }
+int pthread_getname_np(pthread_t thread, char *name, size_t len) {
+  (void)thread;
+  if (name && len > 0)
+    name[0] = '\0';
+  return 0;
+}
 int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id) {
   (void)thread;
   if (clock_id)

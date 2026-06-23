@@ -41,17 +41,23 @@
  * NOT be macros (std::isfinite(x) would expand to std::__builtin_isfinite(x))
  * and must NOT be redefined here either: libstdc++'s own <math.h>/<cmath>
  * wrappers provide both std::isfinite and a global ::isfinite (when
- * _GLIBCXX_USE_C99_MATH is enabled), so defining our own would conflict. */
-#ifndef __cplusplus
-#define isnan(x)        __builtin_isnan(x)
-#define isinf(x)        __builtin_isinf(x)
-#define isfinite(x)     __builtin_isfinite(x)
-#define signbit(x)      __builtin_signbit(x)
-#define isnormal(x)     __builtin_isnormal(x)
-#define isgreater(x,y)  __builtin_isgreater(x,y)
-#define isless(x,y)     __builtin_isless(x,y)
+ * These are the C99 classification macros. They must be visible in C++ too
+ * (glibc/musl define them unconditionally; libstdc++'s <cmath> #undef's them and
+ * supplies std:: overloads). Hiding them under #ifndef __cplusplus made the
+ * libstdc++ C99-math probe fail, which disabled _GLIBCXX11_USE_C99_MATH and left
+ * std::isinf/std::signbit undeclared for every C++ port (LLVM/rustc). */
+#define isnan(x)             __builtin_isnan(x)
+#define isinf(x)             __builtin_isinf(x)
+#define isfinite(x)          __builtin_isfinite(x)
+#define signbit(x)           __builtin_signbit(x)
+#define isnormal(x)          __builtin_isnormal(x)
+#define isgreater(x,y)       __builtin_isgreater(x,y)
+#define isgreaterequal(x,y)  __builtin_isgreaterequal(x,y)
+#define isless(x,y)          __builtin_isless(x,y)
+#define islessequal(x,y)     __builtin_islessequal(x,y)
+#define islessgreater(x,y)   __builtin_islessgreater(x,y)
+#define isunordered(x,y)     __builtin_isunordered(x,y)
 #define fpclassify(x)   __builtin_fpclassify(FP_NAN, FP_INFINITE, FP_NORMAL, FP_SUBNORMAL, FP_ZERO, x)
-#endif
 
 #ifdef __cplusplus
 extern "C" {

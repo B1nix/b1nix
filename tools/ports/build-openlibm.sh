@@ -83,8 +83,14 @@ compile_dir() {
     esac
     # Skip complex-number routines: they need <complex.h> which b1nix lacks,
     # and no graphics lib uses complex math. Detect by the include, so real
-    # routines (cos/ceil/cbrt/copysign) are not caught by name.
-    if grep -q "complex.h" "$src"; then continue; fi
+    # routines (cos/ceil/cbrt/copysign) are not caught by name. EXCEPT k_exp/
+    # k_expf: they define __ldexp_exp/__ldexp_expf (the real scaled exp that
+    # cosh/sinh/__ldexp need) alongside the complex __ldexp_cexp — and they only
+    # pull openlibm_complex.h, which works with GCC's built-in _Complex.
+    case "$base" in
+      k_exp|k_expf) ;;
+      *) if grep -q "complex.h" "$src"; then continue; fi;;
+    esac
     obj="$OBJ_DIR/$1_$base.o"
     clang $CFLAGS -c "$src" -o "$obj"
     OBJS="$OBJS $obj"
