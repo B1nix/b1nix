@@ -120,6 +120,11 @@ ifeq ($(ARCH),x86_64)
 EMBEDDED_USER_PROGRAMS += m30_dynamic m64_clang_smoke
 INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
 INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
+# The --enable-shared x86_64 cross GCC links libgcc dynamically (DT_NEEDED
+# libgcc_s.so, for the _Unwind_* exception symbols), so the C/C++ port binaries
+# (NetSurf, the m53 servers, ...) need /lib/libgcc_s.so at exec — the M69 kernel
+# linker resolves it. i686 GCC is static-libgcc, so this is x86_64-only.
+INITRAMFS_LIBGCC_S_INC := $(BUILD_DIR)/initramfs_libgcc_s.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -132,6 +137,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_M69_PLUGIN_INC) \
+	$(INITRAMFS_LIBGCC_S_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -931,6 +937,15 @@ $(INITRAMFS_M69_PLUGIN_INC): userspace/bin/m69_plugin.c $(USERSPACE_DEPS) usersp
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m69_plugin_elf userspace/build/$(ARCH)/bin/m69_plugin.so > $@
+
+# /lib/libgcc_s.so for the dynamically-linked C/C++ port binaries (see the
+# INITRAMFS_LIBGCC_S_INC comment above). Sourced from the cross GCC's own
+# libgcc_s.so.1 (a leaf ET_DYN — no further DT_NEEDED).
+$(INITRAMFS_LIBGCC_S_INC): $(CROSS_TOOLCHAIN_ROOT)/bin/$(B1NIX_TRIPLET)-gcc
+	@mkdir -p $(dir $@)
+	@LIB="$$($< -print-file-name=libgcc_s.so.1 2>/dev/null)"; \
+	[ -f "$$LIB" ] || { echo "libgcc_s.so.1 not found via $(B1NIX_TRIPLET)-gcc ($$LIB)"; exit 1; }; \
+	xxd -i -n vfs_libgcc_s_elf "$$LIB" > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)

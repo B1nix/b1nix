@@ -60,6 +60,9 @@
 #include "initramfs_m40_linux.inc"
 /* M67: prebuilt static Rust ELF for the Rust cross-toolchain smoke. x86_64 only. */
 #include "initramfs_m67_rust.inc"
+/* /lib/libgcc_s.so for the dynamically-linked C/C++ port binaries (the
+ * --enable-shared x86_64 cross GCC gives them DT_NEEDED libgcc_s.so). x86_64. */
+#include "initramfs_libgcc_s.inc"
 #endif
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
@@ -1535,6 +1538,11 @@ static const struct initramfs_file files[] = {
      * b1nix libc via the cross gcc. Exercises the Rust std unix PAL at runtime. */
     {"/bin/m67-rust", (const char *)vfs_m67_rust_elf,
      sizeof(vfs_m67_rust_elf), INITRAMFS_EXECUTABLE},
+    /* The cross GCC's libgcc_s.so.1, exposed at the soname /lib/libgcc_s.so that
+     * the dynamically-linked C/C++ port binaries (NetSurf, m53 servers, ...)
+     * carry as DT_NEEDED. The M69 exec-time linker resolves it. */
+    {"/lib/libgcc_s.so", (const char *)vfs_libgcc_s_elf,
+     sizeof(vfs_libgcc_s_elf), INITRAMFS_EXECUTABLE},
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},

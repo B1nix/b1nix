@@ -1039,7 +1039,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * binaries (load_base != 0) AND for dynamically-linked ET_EXEC binaries
    * (load_base == 0 but with a PT_DYNAMIC carrying DT_NEEDED) — e.g. the native
    * rustc, which is ET_EXEC with no PT_INTERP and depends on librustc_driver.so
-   * + libLLVM.so. A statically-linked ET_EXEC has no PT_DYNAMIC and skips this. */
+   * + libLLVM.so. A statically-linked ET_EXEC has no PT_DYNAMIC and skips this.
+   * The b1nix C/C++ port binaries (NetSurf, the m53 servers, ...) are ET_EXEC
+   * with a PT_INTERP=/lib/ld64.so.1 + DT_NEEDED libgcc_s.so (the --enable-shared
+   * cross GCC links libgcc dynamically for the _Unwind_* exception symbols); the
+   * kernel resolves that here against /lib/libgcc_s.so, shipped in the
+   * initramfs. The PT_INTERP is informational — b1nix links eagerly in-kernel. */
   int has_dynamic = 0;
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     const struct elf64_phdr *p =
