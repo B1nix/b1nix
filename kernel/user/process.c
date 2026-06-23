@@ -369,15 +369,57 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
   return rc;
 }
 
-static int elf64_symbol_count(struct user_loaded_image *image,
-                              const struct elf64_dyn_object *obj,
-                              u32 *out)
+/* Standard SysV ELF symbol hash (the DT_HASH bucket function). */
+static u32 elf64_sysv_hash(const char *name)
 {
-  u32 *hash = (u32 *)elf64_stage_ptr(image, obj->hash, 8);
-  if (!hash)
-    return -1;
-  *out = hash[1]; /* SysV hash nchain equals the dynamic symbol count. */
-  return 0;
+  u32 h = 0, g;
+  while (*name) {
+    h = (h << 4) + (u8)*name++;
+    g = h & 0xf0000000u;
+    if (g)
+      h ^= g >> 24;
+    h &= ~g;
+  }
+  return h;
+}
+
+/* O(1) symbol lookup via the SysV DT_HASH table: returns the dynsym index of
+ * the entry named `name` in `obj`, or SHN_UNDEF (0) if absent. Replaces the
+ * old linear O(symbols) scan — every dynamic object the b1nix linker emits
+ * carries DT_HASH (the eager-resolution path already depended on it). */
+static u32 elf64_hash_lookup(struct user_loaded_image *image,
+                             const struct elf64_dyn_object *obj,
+                             const char *name)
+{
+  if (!obj->hash || !obj->symtab || !obj->strtab)
+    return SHN_UNDEF;
+  u32 *hdr = (u32 *)elf64_stage_ptr(image, obj->hash, 8);
+  if (!hdr)
+    return SHN_UNDEF;
+  u32 nbucket = hdr[0];
+  u32 nchain = hdr[1]; /* nchain == dynamic symbol count */
+  if (nbucket == 0 || nchain == 0)
+    return SHN_UNDEF;
+  u32 *bucket = (u32 *)elf64_stage_ptr(image, obj->hash + 8,
+                                       (u64)nbucket * sizeof(u32));
+  u32 *chain = (u32 *)elf64_stage_ptr(
+      image, obj->hash + 8 + (u64)nbucket * sizeof(u32),
+      (u64)nchain * sizeof(u32));
+  if (!bucket || !chain)
+    return SHN_UNDEF;
+  u32 y = bucket[elf64_sysv_hash(name) % nbucket];
+  /* Walk the collision chain; cap at nchain so a malformed cyclic table can't
+   * spin the kernel. */
+  for (u32 guard = 0; y != SHN_UNDEF && y < nchain && guard < nchain;
+       y = chain[y], guard++) {
+    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+        image, obj->symtab + (u64)y * sizeof(*sym), sizeof(*sym));
+    if (!sym || sym->st_name >= obj->strsz)
+      break;
+    if (elf64_str_at_equals(image, obj->strtab + sym->st_name, name))
+      return y;
+  }
+  return SHN_UNDEF;
 }
 
 /* Resolve `name` to a defined symbol's load address, searching objects from
@@ -391,22 +433,17 @@ static int elf64_resolve_symbol(struct user_loaded_image *image,
                                 const char *name, u64 *value)
 {
   for (usize o = start; o < object_count; o++) {
-    u32 count = 0;
-    if (!objects[o].symtab || !objects[o].strtab ||
-        elf64_symbol_count(image, &objects[o], &count) != 0)
+    u32 idx = elf64_hash_lookup(image, &objects[o], name);
+    if (idx == SHN_UNDEF)
       continue;
-    for (u32 i = 1; i < count; i++) {
-      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-          image, objects[o].symtab + (u64)i * sizeof(*sym), sizeof(*sym));
-      if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_name >= objects[o].strsz)
-        continue;
-      /* Bounded compare — the strtab string is not guaranteed NUL-terminated
-       * before its segment ends (R4-8). */
-      if (elf64_str_at_equals(image, objects[o].strtab + sym->st_name, name)) {
-        *value = objects[o].base + sym->st_value;
-        return 0;
-      }
-    }
+    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+        image, objects[o].symtab + (u64)idx * sizeof(*sym), sizeof(*sym));
+    /* Present in this object's hash, but only a definition counts — an
+     * undefined entry means another object owns it; keep searching. */
+    if (!sym || sym->st_shndx == SHN_UNDEF)
+      continue;
+    *value = objects[o].base + sym->st_value;
+    return 0;
   }
   return -1;
 }
@@ -421,21 +458,16 @@ static int elf64_resolve_tls_symbol(struct user_loaded_image *image,
                                     usize *out_obj, u64 *out_value)
 {
   for (usize o = 0; o < object_count; o++) {
-    u32 count = 0;
-    if (!objects[o].symtab || !objects[o].strtab ||
-        elf64_symbol_count(image, &objects[o], &count) != 0)
+    u32 idx = elf64_hash_lookup(image, &objects[o], name);
+    if (idx == SHN_UNDEF)
       continue;
-    for (u32 i = 1; i < count; i++) {
-      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-          image, objects[o].symtab + (u64)i * sizeof(*sym), sizeof(*sym));
-      if (!sym || sym->st_shndx == SHN_UNDEF || sym->st_name >= objects[o].strsz)
-        continue;
-      if (elf64_str_at_equals(image, objects[o].strtab + sym->st_name, name)) {
-        *out_obj = o;
-        *out_value = sym->st_value;
-        return 0;
-      }
-    }
+    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+        image, objects[o].symtab + (u64)idx * sizeof(*sym), sizeof(*sym));
+    if (!sym || sym->st_shndx == SHN_UNDEF)
+      continue;
+    *out_obj = o;
+    *out_value = sym->st_value;
+    return 0;
   }
   return -1;
 }

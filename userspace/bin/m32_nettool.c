@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
 #include <stdio.h>
@@ -155,17 +156,27 @@ static int tls_server(int argc, char **argv) {
 
   /* Bind and listen FIRST so a client's connect() never races server init. */
   int lfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (lfd < 0) return 1;
+  if (lfd < 0) {
+    fprintf(stderr, "tls-server: socket() failed errno=%d\n", errno);
+    return 1;
+  }
   struct sockaddr_in addr;
   memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons((unsigned short)port);
   addr.sin_addr.s_addr = inet_addr("127.0.0.1");
-  if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-      listen(lfd, 1) < 0) {
+  if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    fprintf(stderr, "tls-server: bind(127.0.0.1:%d) failed errno=%d\n", port,
+            errno);
     close(lfd);
     return 1;
   }
+  if (listen(lfd, 1) < 0) {
+    fprintf(stderr, "tls-server: listen(:%d) failed errno=%d\n", port, errno);
+    close(lfd);
+    return 1;
+  }
+  fprintf(stderr, "tls-server: listening on 127.0.0.1:%d\n", port);
 
   unsigned char certbuf[4096], keybuf[2048];
   size_t certlen = 0, keylen = 0;
