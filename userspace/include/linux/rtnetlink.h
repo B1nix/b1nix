@@ -316,9 +316,17 @@ struct rtgenmsg {
 
 /* Multicast groups (legacy) */
 #define RTMGRP_LINK        1
+#define RTMGRP_NOTIFY      2
+#define RTMGRP_NEIGH       4
+#define RTMGRP_TC          8
 #define RTMGRP_IPV4_IFADDR 0x10
+#define RTMGRP_IPV4_MROUTE 0x20
 #define RTMGRP_IPV4_ROUTE  0x40
+#define RTMGRP_IPV4_RULE   0x80
 #define RTMGRP_IPV6_IFADDR 0x100
+#define RTMGRP_IPV6_MROUTE 0x200
 #define RTMGRP_IPV6_ROUTE  0x400
+#define RTMGRP_IPV6_IFINFO 0x800
+#define RTMGRP_IPV6_PREFIX 0x20000
 
 #endif

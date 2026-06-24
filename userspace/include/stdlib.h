@@ -6,6 +6,7 @@ extern "C" {
 #endif
 
 #include <stddef.h>
+#include <sys/cdefs.h>  /* __THROW (noexcept in C++) — glibc-compatible specs */
 
 #define EXIT_SUCCESS 0
 #define EXIT_FAILURE 1
@@ -40,13 +41,13 @@ typedef struct {
 void  abort(void) __attribute__((noreturn));
 void  exit(int status) __attribute__((noreturn));
 void  _Exit(int status) __attribute__((noreturn));
-void *malloc(size_t size);
-int posix_memalign(void **memptr, size_t alignment, size_t size);
-void *aligned_alloc(size_t alignment, size_t size);
-void *memalign(size_t alignment, size_t size);
-void  free(void *ptr);
-void *calloc(size_t nmemb, size_t size);
-void *realloc(void *ptr, size_t size);
+void *malloc(size_t size) __THROW;
+int posix_memalign(void **memptr, size_t alignment, size_t size) __THROW;
+void *aligned_alloc(size_t alignment, size_t size) __THROW;
+void *memalign(size_t alignment, size_t size) __THROW;
+void  free(void *ptr) __THROW;
+void *calloc(size_t nmemb, size_t size) __THROW;
+void *realloc(void *ptr, size_t size) __THROW;
 int   atoi(const char *s);
 long long atoll(const char *s);
 lldiv_t lldiv(long long numer, long long denom);
@@ -57,6 +58,36 @@ long long strtoll(const char *nptr, char **endptr, int base);
 unsigned long long strtoull(const char *nptr, char **endptr, int base);
 double strtod(const char *nptr, char **endptr);
 float strtof(const char *nptr, char **endptr);
+
+/* Per-locale string-to-number variants (added for the Chromium port, M60-62).
+ * b1nix is C-locale ONLY, so the locale handle is ignored and these delegate to
+ * the standard conversions (which already use the C locale). Correct, not faked.
+ * locale_t comes from <locale.h>. */
+#ifndef _LOCALE_T_DEFINED_FOR_STRTO_L
+#define _LOCALE_T_DEFINED_FOR_STRTO_L
+typedef void *locale_t;  /* matches <locale.h>; harmless duplicate typedef in C11/C++ */
+#endif
+static inline double strtod_l(const char *nptr, char **endptr, locale_t loc) {
+  (void)loc; return strtod(nptr, endptr);
+}
+static inline float strtof_l(const char *nptr, char **endptr, locale_t loc) {
+  (void)loc; return strtof(nptr, endptr);
+}
+static inline long double strtold_l(const char *nptr, char **endptr, locale_t loc) {
+  (void)loc; return strtold(nptr, endptr);
+}
+static inline long strtol_l(const char *nptr, char **endptr, int base, locale_t loc) {
+  (void)loc; return strtol(nptr, endptr, base);
+}
+static inline unsigned long strtoul_l(const char *nptr, char **endptr, int base, locale_t loc) {
+  (void)loc; return strtoul(nptr, endptr, base);
+}
+static inline long long strtoll_l(const char *nptr, char **endptr, int base, locale_t loc) {
+  (void)loc; return strtoll(nptr, endptr, base);
+}
+static inline unsigned long long strtoull_l(const char *nptr, char **endptr, int base, locale_t loc) {
+  (void)loc; return strtoull(nptr, endptr, base);
+}
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
 char *getenv(const char *name);
 int   putenv(char *string);
@@ -66,15 +97,10 @@ int   clearenv(void);
 char *realpath(const char *path, char *resolved_path);
 extern char **environ;
 
-/* POSIX semaphores, futex-backed (atomic count; parks in the kernel on wait). */
-struct timespec;
-int sem_init(int *sem, int pshared, unsigned int value);
-int sem_wait(int *sem);
-int sem_trywait(int *sem);
-int sem_timedwait(int *sem, const struct timespec *abs_timeout);
-int sem_post(int *sem);
-int sem_getvalue(int *sem, int *sval);
-int sem_destroy(int *sem);
+/* POSIX semaphores live in <semaphore.h> (sem_t-typed). They were previously
+ * declared here too with raw `int *` args, which clashes with <semaphore.h>'s
+ * sem_t* declarations under C++ (the Chromium port pulls both via abseil).
+ * Removed from <stdlib.h> — include <semaphore.h> for the semaphore API. */
 
 #if !defined(__cplusplus) && !defined(B1NIX_WCHAR_T_DEFINED)
 #define B1NIX_WCHAR_T_DEFINED

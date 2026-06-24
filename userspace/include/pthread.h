@@ -66,6 +66,9 @@ typedef struct {
 typedef struct {
   int unused;
 } pthread_condattr_t;
+#define PTHREAD_PRIO_NONE    0
+#define PTHREAD_PRIO_INHERIT 1
+#define PTHREAD_PRIO_PROTECT 2
 
 typedef struct {
   volatile int state; /* 0=not yet, 1=in progress, 2=done */
@@ -110,9 +113,14 @@ int pthread_mutexattr_init(pthread_mutexattr_t *a);
 int pthread_mutexattr_destroy(pthread_mutexattr_t *a);
 int pthread_mutexattr_settype(pthread_mutexattr_t *a, int type);
 int pthread_mutexattr_gettype(const pthread_mutexattr_t *a, int *type);
+static inline int pthread_mutexattr_setprotocol(pthread_mutexattr_t *a, int p) { (void)a; (void)p; return 0; }
+static inline int pthread_mutexattr_getprotocol(const pthread_mutexattr_t *a, int *p) { (void)a; if (p) *p = 0; return 0; }
 
 /* ── Condition variable ── */
 int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *attr);
+static inline int pthread_condattr_init(pthread_condattr_t *a) { (void)a; return 0; }
+static inline int pthread_condattr_destroy(pthread_condattr_t *a) { (void)a; return 0; }
+static inline int pthread_condattr_setclock(pthread_condattr_t *a, int clk) { (void)a; (void)clk; return 0; }
 int pthread_cond_destroy(pthread_cond_t *c);
 int pthread_cond_signal(pthread_cond_t *c);
 int pthread_cond_broadcast(pthread_cond_t *c);
@@ -190,6 +198,8 @@ int pthread_setschedparam(pthread_t thread, int policy, const struct sched_param
 #include <time.h>  /* clockid_t */
 int pthread_setname_np(pthread_t thread, const char *name);
 int pthread_getname_np(pthread_t thread, char *name, size_t len);
+int pthread_atfork(void (*prepare)(void), void (*parent)(void),
+                   void (*child)(void));
 int pthread_getcpuclockid(pthread_t thread, clockid_t *clock_id);
 
 /* Fork handlers — registered handlers run around fork() (see libc fork()).

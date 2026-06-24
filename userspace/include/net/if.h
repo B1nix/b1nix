@@ -24,6 +24,10 @@
 #define IFF_PORTSEL     0x2000
 #define IFF_AUTOMEDIA   0x4000
 #define IFF_DYNAMIC     0x8000
+/* Linux operstate flags (Chromium port M60-62: net address_tracker_linux). */
+#define IFF_LOWER_UP    0x10000
+#define IFF_DORMANT     0x20000
+#define IFF_ECHO        0x40000
 
 struct ifmap {
   unsigned long mem_start;
@@ -54,7 +58,7 @@ struct ifreq {
     struct ifmap ifru_map;
     char ifru_slave[IFNAMSIZ];
     char ifru_newname[IFNAMSIZ];
-    char *ifru_data;
+    void *ifru_data;  /* Linux UAPI uses void __user *; permits ioctl payloads */
   } ifr_ifru;
 };
 

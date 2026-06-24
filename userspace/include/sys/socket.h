@@ -149,6 +149,16 @@ struct ucred {
 #define SO_LINGER       13
 #define SO_REUSEPORT    15
 #define SO_ACCEPTCONN   30
+#define SO_PASSCRED     16
+#define SO_PEERCRED     17
+#define SO_RCVLOWAT     18
+#define SO_SNDLOWAT     19
+#define SO_RCVTIMEO     20
+#define SO_SNDTIMEO     21
+#define SO_DOMAIN       39
+#define SO_PROTOCOL     38
+
+#define SOMAXCONN       4096
 
 #define MSG_OOB         0x01
 #define MSG_CTRUNC      0x08

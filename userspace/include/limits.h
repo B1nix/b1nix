@@ -1,5 +1,8 @@
 #ifndef B1NIX_U_LIMITS_H
 #define B1NIX_U_LIMITS_H
+#ifndef NZERO
+#define NZERO 20  /* default nice value offset */
+#endif
 
 #ifndef CHAR_BIT
 #define CHAR_BIT 8

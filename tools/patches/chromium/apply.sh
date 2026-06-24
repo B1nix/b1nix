@@ -1,0 +1,422 @@
+#!/bin/sh
+# Apply the b1nix //build patches to a CHROMIUM checkout (M61).
+#
+#   sh tools/patches/chromium/apply.sh <path-to-chromium-src>
+#
+# Scope: only the shared //build module patches needed for `gn gen` to accept
+# target_os=b1nix and for base/ to detect b1nix as OS_LINUX/POSIX. These mirror
+# the //build group of tools/patches/v8/apply.sh (same anchors, same toolchain
+# file) but for the Chromium layout (//build = src/build). The v8-proper /
+# abseil / partition_alloc compile patches are applied as `ninja` hits them —
+# that error-chase is the M61 work, tracked in tools/patches/chromium/PORT-PLAN.md.
+#
+# Idempotent + grep-guarded; re-run after every `gclient sync` (sync re-pulls
+# //build at its DEPS-pinned revision).
+set -eu
+
+SRC="${1:?usage: apply.sh <path-to-chromium-src>}"
+V8PATCH="$(cd "$(dirname "$0")/../v8" && pwd)"   # reuse the toolchain/b1nix file
+[ -f "$SRC/v8/include/v8config.h" ] || { echo "not a chromium checkout: $SRC"; exit 1; }
+BUILD="$SRC/build"
+[ -d "$BUILD/config" ] || { echo "//build missing (run gclient sync first): $BUILD"; exit 1; }
+
+die() { echo "apply.sh: $1" >&2; exit 1; }
+
+# --- Patch 1: BUILDCONFIG.gn default-toolchain dispatch -----------------------
+F="$BUILD/config/BUILDCONFIG.gn"
+if ! grep -q '//build/toolchain/b1nix:' "$F"; then
+  perl -0777 -i -pe 's~(\} else if \(target_os == "zos"\) \{\n  _default_toolchain = "//build/toolchain/zos:\$target_cpu"\n)~${1}} else if (target_os == "b1nix") {\n  _default_toolchain = "//build/toolchain/b1nix:\$target_cpu"\n~' "$F"
+  grep -q '//build/toolchain/b1nix:' "$F" || die "Patch 1 anchor not found in $F"
+  echo "Patch 1 applied: BUILDCONFIG.gn"
+else echo "Patch 1 already present"; fi
+
+# --- Patch 2: //build/toolchain/b1nix/BUILD.gn (net-new) ---------------------
+mkdir -p "$BUILD/toolchain/b1nix"
+cp -f "$V8PATCH/toolchain/b1nix/BUILD.gn" "$BUILD/toolchain/b1nix/BUILD.gn"
+echo "Patch 2 applied: toolchain/b1nix/BUILD.gn"
+
+# --- Patch 7: rust.gni — real b1nix rust_abi_target --------------------------
+# enable_rust is ON for the Chromium-with-Rust build, so b1nix must map to its
+# OWN Rust target (x86_64-unknown-b1nix — the cross-rust std sysroot), NOT the
+# linux triple. Dedicated branch before the is_linux map. (Also clears the
+# assert(rust_abi_target != "") the coverage config trips for every target.)
+F="$BUILD/config/rust.gni"
+if ! grep -q '"x86_64-unknown-b1nix"' "$F"; then
+  perl -0777 -i -pe 's~rust_abi_target = ""\nif \(is_linux \|\| is_chromeos(?: \|\| current_os == "b1nix")?\) \{~rust_abi_target = ""\nif (current_os == "b1nix") {\n  rust_abi_target = "x86_64-unknown-b1nix"\n} else if (is_linux || is_chromeos) {~' "$F"
+  grep -q '"x86_64-unknown-b1nix"' "$F" || die "Patch 7 anchor not found in $F"
+  echo "Patch 7 applied: rust.gni (b1nix rust_abi_target = x86_64-unknown-b1nix)"
+else echo "Patch 7 already present"; fi
+
+# --- Patch 7b: register x86_64-unknown-b1nix as a known Rust target triple ----
+KT="$BUILD/rust/known-target-triples.txt"
+if [ -f "$KT" ] && ! grep -q "x86_64-unknown-b1nix" "$KT"; then
+  printf 'x86_64-unknown-b1nix\n' >> "$KT"
+  echo "Patch 7b applied: known-target-triples.txt (+x86_64-unknown-b1nix)"
+else echo "Patch 7b already present"; fi
+
+# --- Patch 7c: //build/rust/std — profiler_builtins is chromium-toolchain-only -
+# The b1nix cross std doesn't build profiler_builtins (coverage/PGO only); GN
+# otherwise tries to copy it into the assembled sysroot and fails.
+F="$BUILD/rust/std/BUILD.gn"
+if grep -q '"profiler_builtins",' "$F"; then
+  perl -0777 -i -pe 's~  skip_stdlib_files = \[\n    "profiler_builtins",\n    "rustc_std_workspace_alloc",\n    "rustc_std_workspace_core",\n    "rustc_std_workspace_std",\n  \]~  skip_stdlib_files = [\n    "rustc_std_workspace_alloc",\n    "rustc_std_workspace_core",\n    "rustc_std_workspace_std",\n  ]\n\n  if (use_chromium_rust_toolchain) {\n    skip_stdlib_files += [ "profiler_builtins" ]\n  }~' "$F"
+  echo "Patch 7c applied: rust/std profiler_builtins gated on chromium toolchain"
+else echo "Patch 7c already present"; fi
+
+# --- Patch 8: clang/BUILD.gn — clang_rt dir for b1nix ------------------------
+F="$BUILD/config/clang/BUILD.gn"
+if ! grep -q 'current_os == "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~(_dir = "darwin"\n      \} else if \(is_linux \|\| is_chromeos)(\) \{)~${1} || current_os == "b1nix"${2}~' "$F"
+  grep -q 'current_os == "b1nix"' "$F" || die "Patch 8 anchor not found in $F"
+  echo "Patch 8 applied: clang/BUILD.gn"
+else echo "Patch 8 already present"; fi
+
+# --- Patch 14: //build/build_config.h — b1nix is OS_LINUX/IS_POSIX -----------
+F="$BUILD/build_config.h"
+if ! grep -q 'defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~(#elif defined\(_WIN32\)\n#define OS_WIN 1)~#elif defined(__b1nix__)\n#define OS_LINUX 1\n${1}~' "$F"
+  grep -q 'defined(__b1nix__)' "$F" || die "Patch 14 anchor not found in $F"
+  echo "Patch 14 applied: build_config.h (OS_LINUX)"
+else echo "Patch 14 already present"; fi
+
+# --- Patch 16: compiler/BUILD.gn — -std=gnu++20 for GCC ----------------------
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'gnu++20' "$F"; then
+  perl -0777 -i -pe 's~    \} else \{\n      cflags_cc \+= \[ "-std=c\+\+20" \]\n    \}~    } else if (is_clang) {\n      cflags_cc += [ "-std=c++20" ]\n    } else {\n      cflags_cc += [ "-std=gnu++20" ]  # b1nix/GCC: keep GNU ,##__VA_ARGS__\n    }~' "$F"
+  grep -q 'gnu++20' "$F" || die "Patch 16 anchor not found in $F"
+  echo "Patch 16 applied: compiler/BUILD.gn (gnu++20)"
+else echo "Patch 16 already present"; fi
+
+# --- Patch C1: BUILDCONFIG.gn — b1nix counts as is_linux (GN level) ----------
+# At the GN level is_linux = (current_os=="linux"). For target_os=b1nix it would
+# be false everywhere, skipping thousands of is_linux-guarded sources/data/deps
+# (e.g. content/test's `data +=` on an uninitialized var). Aliasing b1nix to
+# is_linux inherits Chromium's whole desktop-linux GN logic — the high-leverage
+# inversion of the V8 own-OS approach. b1nix is already is_posix (=!win&&!fuchsia).
+F="$BUILD/config/BUILDCONFIG.gn"
+if ! grep -q 'current_os == "linux" || current_os == "b1nix"' "$F"; then
+  perl -i -pe 's~^is_linux = current_os == "linux"$~is_linux = current_os == "linux" || current_os == "b1nix"  # b1nix port (M61): inherit desktop-linux GN logic~' "$F"
+  grep -q 'current_os == "b1nix"' "$F" || die "Patch C1 anchor not found in $F"
+  echo "Patch C1 applied: BUILDCONFIG.gn (is_linux alias)"
+else echo "Patch C1 already present"; fi
+
+# --- Patch C2: //BUILD.gn — minimal gn_all for b1nix -------------------------
+# gn_all otherwise drags in the whole chrome + test universe. Scope b1nix's
+# gn_all to content_shell (the M62 target). NOTE: other top-level groups in
+# //BUILD.gn still evaluate chrome/test under is_linux — scoping those is the
+# next open step (see PORT-PLAN.md).
+F="$SRC/BUILD.gn"
+if ! grep -q 'target_os == "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~(group\("gn_all"\) \{\n  testonly = true\n\n)(  if \(is_cronet_build\) \{)~${1}  if (target_os == "b1nix") {\n    # b1nix port (M61): only content_shell + its deps, not the chrome/test universe.\n    deps = [ "//content/shell:content_shell" ]\n  } else if (is_cronet_build) {~' "$F"
+  grep -q 'target_os == "b1nix"' "$F" || die "Patch C2 anchor not found in $F"
+  echo "Patch C2 applied: //BUILD.gn (minimal gn_all)"
+else echo "Patch C2 already present"; fi
+
+# --- Patch C3: //BUILD.gn — scope ALL aggregate root groups for b1nix --------
+# gn gen evaluates EVERY top-level construct in //BUILD.gn (the `all` meta-target),
+# not just gn_all. With is_linux=true (C1) the post-gn_all groups/if-blocks
+# (all_rust, rust_build_tests, chromium_builder_perf, web-test + chrome if-blocks)
+# drag in //chrome and //chrome/test. Wrap that whole region (after gn_all, before
+# the final gn_logs bookkeeping) in `if (target_os != "b1nix")`.
+F="$SRC/BUILD.gn"
+if ! grep -q 'b1nix port: skip aggregate' "$F"; then
+  perl -0777 -i -pe 's~\n(# All Rust targets\. This is provided for convenience)~\nif (target_os != "b1nix") {  # b1nix port: skip aggregate/test/rust/chrome root groups\n\n${1}~' "$F"
+  perl -0777 -i -pe 's~\n(# GN evaluates each \.gn file once per toolchain)~\n}  # end b1nix root-scope guard\n\n${1}~' "$F"
+  { grep -q 'b1nix port: skip aggregate' "$F" && grep -q 'end b1nix root-scope guard' "$F"; } || die "Patch C3 anchors not found in $F"
+  echo "Patch C3 applied: //BUILD.gn (root-scope aggregate groups)"
+else echo "Patch C3 already present"; fi
+
+# --- Patch C4: content/shell — drop GTK/X11 linux_ui_factory for b1nix -------
+# content_shell's `if (is_linux)` pulls //ui/linux:linux_ui_factory (the GTK/X11
+# desktop-UI stack). b1nix is headless (ozone_platform_headless) and has no GTK,
+# so cut that edge. Correct on its own merits (headless build).
+F="$SRC/content/shell/BUILD.gn"
+if ! grep -q 'b1nix: headless, no GTK' "$F"; then
+  perl -0777 -i -pe 's~  if \(is_linux\) \{\n    deps \+= \[ "//ui/linux:linux_ui_factory" \]\n  \}~  if (is_linux \&\& target_os != "b1nix") {  # b1nix: headless, no GTK/X11 desktop UI\n    deps += [ "//ui/linux:linux_ui_factory" ]\n  }~' "$F"
+  grep -q 'b1nix: headless, no GTK' "$F" || die "Patch C4 anchor not found in $F"
+  echo "Patch C4 applied: content/shell (drop linux_ui_factory)"
+else echo "Patch C4 already present"; fi
+
+# --- Patch C5: content/shell — drop chrome_crashpad_handler for b1nix --------
+# content_shell's linux branch adds //components/crash/core/app:chrome_crashpad_handler
+# as a data_dep. That handler is the chrome-flavoured crashpad and is unnecessary
+# for the headless M62 bring-up (no crash reporting yet). Cut it for b1nix.
+F="$SRC/content/shell/BUILD.gn"
+if ! grep -q 'b1nix: no chrome crashpad' "$F"; then
+  perl -0777 -i -pe 's~  \} else if \(is_linux \|\| is_chromeos\) \{\n      data_deps \+= \[ "//components/crash/core/app:chrome_crashpad_handler" \]\n    \}~  } else if ((is_linux || is_chromeos) \&\& target_os != "b1nix") {  # b1nix: no chrome crashpad handler\n      data_deps += [ "//components/crash/core/app:chrome_crashpad_handler" ]\n    }~' "$F"
+  grep -q 'b1nix: no chrome crashpad' "$F" || die "Patch C5 anchor not found in $F"
+  echo "Patch C5 applied: content/shell (drop chrome_crashpad_handler)"
+else echo "Patch C5 already present"; fi
+
+# --- Patch C6: enable_webui_ntp — treat b1nix as a desktop platform ----------
+# THE gn-gen unblocker. `gn gen` evaluates every BUILD.gn in the repo (defining,
+# but not building, all targets). chrome/browser/ui/BUILD.gn fails its internal
+# `allow_circular_includes_from` validation when enable_webui_ntp is false,
+# because the NTP circular-include labels are added unconditionally while their
+# matching deps sit under `if (enable_webui_ntp)`. enable_webui_ntp is gated on a
+# LITERAL `target_os == "linux"` (not is_linux), so b1nix turned it off and broke
+# chrome's own BUILD.gn. b1nix is a desktop platform here — enable the WebUI NTP
+# like linux/mac/win so chrome's GN stays self-consistent. Nothing extra is
+# *compiled* for content_shell (chrome targets are defined, never built by the
+# `ninja content_shell` target). Real fix, not an assert bypass.
+F="$SRC/ui/webui/webui_features.gni"
+if ! grep -q 'b1nix port (M60-62): desktop platform' "$F"; then
+  perl -0777 -i -pe 's~(    enable_webui_ntp =\n        target_os == "win" \|\| target_os == "mac" \|\| target_os == "linux" \|\|\n        target_os == "chromeos" \|\| is_desktop_android)~$1 ||\n        target_os == "b1nix"  # b1nix port (M60-62): desktop platform, keep chrome BUILD.gn self-consistent~' "$F"
+  grep -q 'b1nix port (M60-62): desktop platform' "$F" || die "Patch C6 anchor not found in $F"
+  echo "Patch C6 applied: webui_features.gni (enable_webui_ntp for b1nix)"
+else echo "Patch C6 already present"; fi
+
+# --- Patch C7: ffmpeg os_config — reuse the linux x64 asm config for b1nix ----
+# third_party/ffmpeg picks a pre-generated per-OS asm config dir via
+# `os_config = current_os`; there is no `b1nix` dir. b1nix is x64 with the linux
+# ABI, so reuse chromium/config/$branding/linux/x64 (same as chromeos does).
+F="$SRC/third_party/ffmpeg/ffmpeg_options.gni"
+if ! grep -q 'b1nix port: reuse the linux x64 ffmpeg' "$F"; then
+  perl -0777 -i -pe 's~(os_config = current_os\n)(if \(\(is_linux \|\| is_chromeos\) \&\& is_msan\) \{)~${1}if (current_os == "b1nix") {\n  os_config = "linux"  # b1nix port: reuse the linux x64 ffmpeg asm config (same ABI)\n} else if ((is_linux || is_chromeos) \&\& is_msan) {~' "$F"
+  grep -q 'b1nix port: reuse the linux x64 ffmpeg' "$F" || die "Patch C7 anchor not found in $F"
+  echo "Patch C7 applied: ffmpeg_options.gni (os_config=linux for b1nix)"
+else echo "Patch C7 already present"; fi
+
+# --- Patch C8: BUILDCONFIG.gn — is_clang=false for b1nix (GCC cross build) ----
+# THE compile unblocker. b1nix's default toolchain wraps the x86_64-b1nix cross
+# GCC, but `is_clang`'s declare_args() default is `current_os != "linux" || ...`,
+# which is TRUE for b1nix → the whole build emits clang-only flags (-Xclang,
+# -mllvm, --target=, -Wgnu, -fcolor-diagnostics, ...) that GCC rejects. The
+# toolchain's own `toolchain_args { is_clang = false }` is IGNORED because b1nix
+# is the *default* toolchain (gn ignores toolchain_args for the default tc). So
+# the value must come from the global default: force is_clang=false for b1nix
+# here. linux/mac/win keep their original value; the host clang_x64 toolchain
+# sets is_clang in its own (non-default) toolchain_args, so the host stays clang.
+F="$BUILD/config/BUILDCONFIG.gn"
+if ! grep -q 'b1nix port: build with the GCC cross toolchain' "$F"; then
+  perl -0777 -i -pe 's~(  # Set to true when compiling with the Clang compiler\.\n)(  is_clang = current_os != "linux" \|\|\n             \(current_cpu != "mips" && current_cpu != "mips64"\))~${1}  is_clang = current_os != "b1nix" \&\&  # b1nix port: build with the GCC cross toolchain\n             (current_os != "linux" ||\n             (current_cpu != "mips" \&\& current_cpu != "mips64"))~' "$F"
+  grep -q 'b1nix port: build with the GCC cross toolchain' "$F" || die "Patch C8 anchor not found in $F"
+  echo "Patch C8 applied: BUILDCONFIG.gn (is_clang=false for b1nix)"
+else echo "Patch C8 already present"; fi
+
+# --- Patch C9: compiler/BUILD.gn — no -pthread cflag for b1nix ---------------
+# The b1nix cross GCC has no `-pthread` driver flag (pthread is folded into
+# libb1nix.a/libc.a, not a separate runtime/spec). Chromium adds `-pthread` to
+# cflags under `if (is_linux || is_chromeos)` (true for b1nix via C1), which the
+# cross GCC rejects ("unrecognized command-line option '-pthread'"). Skip it.
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'b1nix: pthread lives in libb1nix.a' "$F"; then
+  perl -0777 -i -pe 's~(  if \(is_linux \|\| is_chromeos\) \{\n)    cflags \+= \[ "-pthread" \]~${1}    if (target_os != "b1nix") {  # b1nix: pthread lives in libb1nix.a; GCC has no -pthread\n      cflags += [ "-pthread" ]\n    }~' "$F"
+  grep -q 'b1nix: pthread lives in libb1nix.a' "$F" || die "Patch C9 anchor not found in $F"
+  echo "Patch C9 applied: compiler/BUILD.gn (no -pthread for b1nix)"
+else echo "Patch C9 already present"; fi
+
+# --- Patch C10: //build/config:default_libs — empty for b1nix ----------------
+# The is_linux default_libs link dl/pthread/rt, none of which exist as standalone
+# libs in the b1nix sysroot (folded into libc.a/libb1nix.a, linked implicitly by
+# the driver). Give b1nix an empty default_libs. MUST precede the is_linux branch
+# (b1nix is is_linux via C1), so we insert the b1nix arm before it.
+F="$SRC/build/config/BUILD.gn"
+if ! grep -q 'b1nix: pthread/dl/rt are folded into' "$F"; then
+  perl -0777 -i -pe 's~(  \} else if \(is_linux \|\| is_chromeos\) \{\n)(    libs = \[\n      "dl",\n      "pthread",\n      "rt",\n    \])~  } else if (current_os == "b1nix") {\n    # b1nix: pthread/dl/rt are folded into libc.a/libb1nix.a (linked implicitly).\n    libs = []\n${1}${2}~' "$F"
+  grep -q 'b1nix: pthread/dl/rt are folded into' "$F" || die "Patch C10 anchor not found in $F"
+  echo "Patch C10 applied: build/config/BUILD.gn (empty default_libs for b1nix)"
+else echo "Patch C10 already present"; fi
+
+# --- Patch C11: compiler/BUILD.gn — define __linux__ for the b1nix target -----
+# b1nix is deliberately linux-ABI-shaped. Its cross GCC predefines __b1nix__ /
+# __unix__ but NOT __linux__, so the thousands of third_party `#if defined
+# (__linux__)` OS checks (perfetto, abseil, skia, ...) fall through to "unknown
+# OS" and fail to compile. Define __linux__ (and __linux) for the b1nix target
+# so those select the linux path — the preprocessor-level twin of the is_linux
+# GN alias (C1) and OS_LINUX (Patch 14). Conflict-free: the b1nix sysroot headers
+# do not key on __linux__, and -Wno-builtin-macro-redefined is already set.
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'b1nix is linux-ABI-shaped: define __linux__' "$F"; then
+  perl -0777 -i -pe 's~(  if \(is_linux \|\| is_chromeos\) \{\n    if \(target_os != "b1nix"\) \{  # b1nix: pthread lives in libb1nix.a; GCC has no -pthread\n      cflags \+= \[ "-pthread" \]\n    \})~${1}\n    if (target_os == "b1nix") {\n      # b1nix is linux-ABI-shaped: define __linux__ so the thousands of\n      # third_party `#if defined(__linux__)` OS checks select the linux path\n      # (mirrors the is_linux GN alias / OS_LINUX in build_config.h). The b1nix\n      # cross GCC does not predefine __linux__, and the b1nix sysroot headers do\n      # not key on it, so this is conflict-free. -Wno-builtin-macro-redefined is\n      # already set by the build.\n      defines += [\n        "__linux__=1",\n        "__linux=1",\n      ]\n    }~' "$F"
+  grep -q 'b1nix is linux-ABI-shaped: define __linux__' "$F" || die "Patch C11 anchor not found in $F"
+  echo "Patch C11 applied: compiler/BUILD.gn (__linux__ define for b1nix)"
+else echo "Patch C11 already present"; fi
+
+# --- Patch C12: treat_warnings_as_errors — GCC -Wno-error relaxations for b1nix
+# b1nix builds with GCC, stricter than the clang Chromium targets: it flags
+# warnings clang does not (sign-compare, unused-function/variable,
+# maybe-uninitialized, ...) in third_party code that are NOT real bugs. With
+# -Werror these become hard errors. Demote those GCC-only diagnostics to
+# warnings for the b1nix build so the GCC port compiles (they are still emitted).
+F="$BUILD/config/compiler/BUILD.gn"
+if ! grep -q 'b1nix builds with GCC, which is stricter' "$F"; then
+  perl -0777 -i -pe 's~(  \} else \{\n    cflags = \[ "-Werror" \]\n)~${1}\n    if (target_os == "b1nix" \&\& !is_clang) {\n      # b1nix builds with GCC, which is stricter than the clang Chromium targets\n      # and flags warnings clang does not (and which are not real bugs in this\n      # third_party code). Demote those GCC-only diagnostics from errors so the\n      # GCC port compiles; they are still emitted as warnings.\n      cflags += [\n        "-Wno-error=sign-compare",\n        "-Wno-error=unused-function",\n        "-Wno-error=unused-variable",\n        "-Wno-error=unused-but-set-variable",\n        "-Wno-error=maybe-uninitialized",\n        "-Wno-error=nonnull",\n        "-Wno-error=redundant-move",\n        "-Wno-error=deprecated-declarations",\n        "-Wno-error=tautological-compare",\n        "-Wno-error=attributes",\n        "-Wno-error=changes-meaning",\n        "-Wno-error=return-type",\n        "-Wno-error=unknown-pragmas",\n        "-Wno-error=dangling-else",\n        "-Wno-error=array-bounds",\n        "-Wno-error=range-loop-construct",\n        "-Wno-error=format-truncation",\n      ]\n    }\n~' "$F"
+  grep -q 'b1nix builds with GCC, which is stricter' "$F" || die "Patch C12 anchor not found in $F"
+  echo "Patch C12 applied: treat_warnings_as_errors (GCC -Wno-error for b1nix)"
+else echo "Patch C12 already present"; fi
+
+# --- Patch C13: filter_clang_args.py — drop GCC-only flags for bindgen --------
+# bindgen runs libclang to parse C++ headers and is handed the target's {{cflags}}
+# — but the b1nix target compiler is GCC, so those carry GCC-only warning options
+# (-Wno-maybe-uninitialized, -Wno-packed-not-aligned, -Wno-class-memaccess, the
+# C12 -Wno-error=* set, ...) that clang rejects with -Werror=unknown-warning
+# -option, failing every *_bindgen_generator. Filter them out in
+# filter_clang_args() (the existing libclang-arg sanitizer). They only affect
+# diagnostics, never the generated bindings.
+F="$SRC/build/rust/gni_impl/filter_clang_args.py"
+if [ -f "$F" ] && ! grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F"; then
+  perl -0777 -i -pe 's~(      elif args\[i\] == .-ftime-trace.:\n        pass\n)(      else:\n        yield args\[i\])~${1}      # b1nix port (M60-62): bindgen runs libclang to parse C++, but the b1nix\n      # target compiler is GCC, so {{cflags}} carry GCC-only warning options that\n      # clang rejects with -Werror=unknown-warning-option. Drop them here so\n      # bindgen can parse the headers (these only affect diagnostics, never the\n      # generated bindings).\n      elif args[i] in (\n          "-Wno-maybe-uninitialized",\n          "-Werror=maybe-uninitialized",\n          "-Wno-error=maybe-uninitialized",\n          "-Wno-packed-not-aligned",\n          "-Wno-class-memaccess",\n          "-Wno-error=sign-compare",\n          "-Wno-error=unused-function",\n          "-Wno-error=unused-variable",\n          "-Wno-error=unused-but-set-variable",\n          "-Wno-error=nonnull",\n          "-Wno-error=redundant-move",\n          "-Wno-redundant-move",\n          "-Wno-dangling-reference",\n          "-Wno-error=tautological-compare",\n          "-Wno-error=attributes",\n          "-Wno-error=changes-meaning",\n          "-Wno-error=return-type",\n          "-fno-math-errno",\n      ):\n        pass\n${2}~' "$F"
+  grep -q 'b1nix port (M60-62): bindgen runs libclang' "$F" || die "Patch C13 anchor not found in $F"
+  echo "Patch C13 applied: filter_clang_args.py (drop GCC-only flags for bindgen)"
+else echo "Patch C13 already present (or file missing)"; fi
+
+# --- Patch C14: abseil direct_mmap.h — b1nix uses the mmap() fallback ----------
+# abseil's DirectMmap issues a RAW mmap syscall on __linux__ (syscall(SYS_mmap)).
+# b1nix defines __linux__ (C11) but its syscall NUMBERS are not Linux's, so a raw
+# Linux mmap syscall would hit the wrong b1nix syscall. abseil already has a
+# regular-mmap() fallback for non-linux; route b1nix to it by excluding b1nix
+# from the __linux__ direct-syscall guard.
+F="$SRC/third_party/abseil-cpp/absl/base/internal/direct_mmap.h"
+if [ -f "$F" ] && ! grep -q 'b1nix port (M60-62): b1nix defines __linux__ but its raw syscall' "$F"; then
+  perl -0777 -i -pe 's~(#ifdef ABSL_HAVE_MMAP\n\n#include <sys/mman.h>\n\n)#ifdef __linux__~${1}// b1nix port (M60-62): b1nix defines __linux__ but its raw syscall NUMBERS are\n// not the Linux ones, so abseil DirectMmap must NOT issue a direct mmap syscall.\n// Route b1nix through the regular mmap()/munmap() fallback below.\n#if defined(__linux__) \&\& !defined(__b1nix__)~' "$F"
+  grep -q 'b1nix port (M60-62): b1nix defines __linux__ but its raw syscall' "$F" || die "Patch C14 anchor not found in $F"
+  echo "Patch C14 applied: abseil direct_mmap.h (mmap fallback for b1nix)"
+else echo "Patch C14 already present (or file missing)"; fi
+
+# --- Patch C15: partition_alloc.gni — disable PKEYS for b1nix -----------------
+# is_pkeys_available is (is_linux||is_chromeos) && x64, which is TRUE for b1nix,
+# so partition_alloc compiles its thread_isolation/pkey.cc which issues
+# syscall(SYS_pkey_alloc/free/pkey_mprotect). b1nix has NO memory-protection-keys
+# (MPK) support and no such syscalls. Disable the feature for b1nix (honest — the
+# hardware/OS feature is genuinely absent, so it must be off, not stubbed).
+F="$SRC/base/allocator/partition_allocator/partition_alloc.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no memory-protection-keys' "$F"; then
+  perl -0777 -i -pe 's~(is_pkeys_available =\n    \(is_linux \|\| is_chromeos\) && current_cpu == "x64" && !is_cronet_build)~is_pkeys_available =\n    (is_linux || is_chromeos) \&\& current_cpu == "x64" \&\& !is_cronet_build \&\&\n    target_os != "b1nix"  # b1nix has no memory-protection-keys (MPK) support~' "$F"
+  grep -q 'b1nix has no memory-protection-keys' "$F" || die "Patch C15 anchor not found in $F"
+  echo "Patch C15 applied: partition_alloc.gni (disable pkeys for b1nix)"
+else echo "Patch C15 already present (or file missing)"; fi
+
+# --- Patch C16: rust_bindgen.gni — allow newer-rustc deny-by-default lints ----
+# The Chromium-bundled rustc is newer than the bindgen that emitted the binding
+# .rs files, and denies-by-default lints that bindgen output trips (notably
+# unnecessary_transmutes in generated bitfield accessors). The generated code is
+# correct; allow the lint for bindgen crates rather than regenerate.
+F="$SRC/build/rust/rust_bindgen.gni"
+if [ -f "$F" ] && ! grep -q 'unnecessary_transmutes' "$F"; then
+  perl -0777 -i -pe 's~(      "-Anon_upper_case_globals",\n)(    \])~${1}\n      # Bundled rustc is newer than the bindgen that generated these bindings;\n      # allow the deny-by-default lints its output trips (correct code).\n      "-Aunnecessary_transmutes",\n${2}~' "$F"
+  grep -q 'unnecessary_transmutes' "$F" || die "Patch C16 anchor not found in $F"
+  echo "Patch C16 applied: rust_bindgen.gni (allow bindgen lints for b1nix)"
+else echo "Patch C16 already present (or file missing)"; fi
+
+# --- Patch C17: base/numerics CheckOnFailure::HandleFailure constexpr ---------
+# GCC 13's constexpr evaluator requires the never-taken failure branch of
+# checked_cast() to be a constexpr-callable function. CheckOnFailure::
+# HandleFailure (which just traps) was a plain static fn, so any constant
+# expression using checked_cast (e.g. base::ByteSize KiBU(1)) was rejected as
+# "not a constant expression". Marking it constexpr is correct (it still traps
+# when actually evaluated) and matches newer toolchains. (Partial: deeper
+# CheckedNumeric constexpr gaps remain on GCC 13; see PORT-PLAN.)
+F="$SRC/base/numerics/safe_conversions_impl.h"
+if [ -f "$F" ] && ! grep -q 'static constexpr T HandleFailure' "$F"; then
+  perl -0777 -i -pe 's~(  template <typename T>\n)(  static T HandleFailure\(\) \{)~${1}  static constexpr T HandleFailure() {~' "$F"
+  grep -q 'static constexpr T HandleFailure' "$F" || die "Patch C17 anchor not found in $F"
+  echo "Patch C17 applied: safe_conversions_impl.h (HandleFailure constexpr)"
+else echo "Patch C17 already present (or file missing)"; fi
+
+# --- Patch C18: content/shell drop rust test targets (need enable_rust) -------
+# content/shell/BUILD.gn defines testonly rust targets (rust_test_mojom with
+# generate_rust=true, rust_test_service[_ffi]) and lists them in
+# content_shell_lib deps. They require enable_rust, which is OFF for the b1nix
+# headless build (no rustc target), so `gn gen` asserts. content_shell proper
+# does not need these test targets: drop them from the lib deps and guard their
+# definitions behind if(enable_rust).
+F="$SRC/content/shell/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix: rust test targets' "$F"; then
+  perl -0777 -i -pe 's~    ":rust_test_mojom",\n    ":rust_test_mojom_js",\n    ":rust_test_service_ffi",\n(    ":shell_controller_mojom",)~${1}~' "$F"
+  perl -0777 -i -pe 's~(mojom\("rust_test_mojom"\) \{)~# b1nix: rust test targets need enable_rust (off); content_shell does not\n# use them. Guard so gn-gen does not assert(enable_rust).\nif (enable_rust) {\n${1}~' "$F"
+  # close the if(enable_rust) at EOF (the rust block runs to end of file)
+  printf '}\n' >> "$F"
+  grep -q 'b1nix: rust test targets' "$F" || die "Patch C18 anchor not found in $F"
+  echo "Patch C18 applied: content/shell drop rust test targets"
+else echo "Patch C18 already present (or file missing)"; fi
+
+# --- Patch C19: fontconfig clang discards-qualifiers relaxation ---------------
+# fontconfig's NLS-off path expands _(x)/dgettext(d,s) to (s) and assigns the
+# resulting const char* to char* fields; the bundled clang (host toolchain
+# fontconfig build) flags this with -Werror=incompatible-pointer-types-
+# discards-qualifiers. Upstream fontconfig code, not a real bug.
+F="$SRC/third_party/fontconfig/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'discards-qualifiers' "$F"; then
+  perl -0777 -i -pe 's~(        # Work around a pointer-to-bool conversion\.\n        "-Wno-pointer-bool-conversion",\n)(      \])~${1}\n        # fontconfig _(x)/dgettext assigns const char* to char* with NLS off;\n        # clang -Werror flags discarded qualifiers (upstream code, not a bug).\n        "-Wno-incompatible-pointer-types-discards-qualifiers",\n${2}~' "$F"
+  grep -q 'discards-qualifiers' "$F" || die "Patch C19 anchor not found in $F"
+  echo "Patch C19 applied: fontconfig discards-qualifiers"
+else echo "Patch C19 already present (or file missing)"; fi
+
+# --- Patch C20: base/byte_size.h consteval ctors -> constexpr ----------------
+# The signed-integer ByteSize/ByteSizeDelta constructors are `consteval` so that
+# out-of-range CONSTANTS fail at compile time. But the KiBU()/MiBU()/... helpers
+# are `constexpr` and call ByteSize(kib) with their PARAMETER; on a C++23
+# compiler P2564 escalates KiBU to an immediate function so this works. GCC 13
+# does NOT implement P2564, so it rejects "kib is not a constant expression"
+# and base/ fails to build (byte_size.cc + ~21 files force constexpr ByteSize).
+# Relax the two ctors to `constexpr`: the value is still range-checked by
+# checked_cast (now at runtime via CHECK instead of at compile time) — honest,
+# correctness-preserving. Drop this once the cross toolchain is GCC 14+ (which
+# implements P2564 and makes the original consteval work).
+F="$SRC/base/byte_size.h"
+if [ -f "$F" ] && grep -q 'consteval explicit ByteSize' "$F"; then
+  perl -i -pe 's/^  consteval explicit ByteSize\(T bytes\)/  constexpr explicit ByteSize(T bytes)/' "$F"
+  perl -i -pe 's/^  consteval explicit ByteSizeDelta\(T bytes\)/  constexpr explicit ByteSizeDelta(T bytes)/' "$F"
+  grep -q 'consteval explicit ByteSize' "$F" && die "Patch C20 failed in $F"
+  echo "Patch C20 applied: byte_size.h consteval ctors -> constexpr"
+else echo "Patch C20 already present (or file missing)"; fi
+
+# --- Patch C21: base/containers/flat_tree.h KeyT deducibility (GCC 13) -------
+# flat_tree's heterogeneous-lookup methods are declared as
+#   template <typename K = Key> iterator find(const KeyT<K>& key);
+# where upstream `KeyT<K> = ConditionalT<is_transparent, K, Key>`. `KeyT<K>` is
+# a dependent alias => a NON-deduced context, so calling find(string_view) on a
+# string-keyed transparent flat_map cannot deduce K from the argument; K falls
+# back to the default `Key` and the string_view->const string& conversion fails.
+# Clang accepts this; GCC 13 rejects it (no match for find(string_view&)), which
+# breaks base/feature_list and every transparent flat_map lookup. Make KeyT an
+# identity alias (`using KeyT = K;`) so K is deduced directly from the call
+# argument. For transparent comparators this is exactly upstream's K; for
+# non-transparent ones it requires callers to pass the key type (Chromium's
+# non-transparent flat_maps already do, and a mismatch is a compile error, not
+# silent breakage). Drop once the cross toolchain is GCC 14+.
+F="$SRC/base/containers/flat_tree.h"
+if [ -f "$F" ] && grep -q 'ConditionalT<requires { typename KeyCompare::is_transparent; }, K, Key>' "$F"; then
+  perl -0777 -i -pe 's/  template <typename K>\n  using KeyT =\n      ConditionalT<requires \{ typename KeyCompare::is_transparent; \}, K, Key>;/  template <typename K>\n  using KeyT = K;  \/\/ b1nix\/GCC-13 (C21): keep K deducible for hetero lookup/' "$F"
+  grep -q 'using KeyT = K;  // b1nix' "$F" || die "Patch C21 anchor not found in $F"
+  echo "Patch C21 applied: flat_tree.h KeyT identity (GCC-13 deducibility)"
+else echo "Patch C21 already present (or file missing)"; fi
+
+# --- Patch C23: third_party/expat/BUILD.gn — build bundled expat for b1nix ---
+# For is_linux (which b1nix matches) expat's BUILD.gn assumes a SYSTEM libexpat
+# (`config expat_config { libs = ["expat"] }`, no include dir), so skia's
+# SkXMLParser/SkFontMgr_android_parser can't find <expat.h>. b1nix has no system
+# expat; exclude it from that branch so it builds expat from the bundled source
+# (the `else` branch that exports the include dir + XML_STATIC).
+F="$SRC/third_party/expat/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix has no system libexpat' "$F"; then
+  perl -0777 -i -pe 's~if \(\(\(is_linux && !is_castos\) \|\| is_chromeos\) && !use_fuzzing_engine\) \{~if ((((is_linux && !is_castos) || is_chromeos) && !use_fuzzing_engine) &&\n    target_os != "b1nix") {  # b1nix has no system libexpat: build from bundled source~' "$F"
+  grep -q 'b1nix has no system libexpat' "$F" || die "Patch C23 anchor not found in $F"
+  echo "Patch C23 applied: expat/BUILD.gn (build bundled expat for b1nix)"
+else echo "Patch C23 already present (or file missing)"; fi
+
+# --- Patch C24: net/features.gni — use_kerberos=false for b1nix --------------
+# b1nix has no GSSAPI/Kerberos library, so <gssapi.h> is unavailable and
+# Negotiate auth is unsupported. Default use_kerberos off for b1nix (Chromium
+# supports building without it). This is the reproducible form of the args.gn
+# `use_kerberos = false` override.
+F="$SRC/net/features.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no GSSAPI' "$F"; then
+  perl -0777 -i -pe 's~(  use_kerberos = !is_ios && !is_fuchsia && !is_castos && !is_cast_android)~$1 &&\n      target_os != "b1nix"  # b1nix has no GSSAPI/Kerberos library~' "$F"
+  grep -q 'b1nix has no GSSAPI' "$F" || die "Patch C24 anchor not found in $F"
+  echo "Patch C24 applied: net/features.gni (use_kerberos=false for b1nix)"
+else echo "Patch C24 already present (or file missing)"; fi
+
+echo "b1nix //build patches applied to $SRC"
+
+# --- Patch C-LSS: don't use third_party/lss on b1nix --------------------------
+# lss issues raw syscalls with REAL Linux numbers (and #defines __NR_* to them),
+# but b1nix has its own syscall numbers. Exclude b1nix from the lss include in
+# rand_util_posix; b1nix then uses the libc syscall() + b1nix __NR_ aliases.
+for F in "$SRC/base/rand_util_posix.cc" "$SRC/base/allocator/partition_allocator/src/partition_alloc/partition_alloc_base/rand_util_posix.cc"; do
+  if [ -f "$F" ] && ! grep -q "!defined(__b1nix__)" "$F"; then
+    perl -0777 -i -pe 's~#if BUILDFLAG\(IS_LINUX\) \|\| BUILDFLAG\(IS_CHROMEOS\)\n(#include "third_party/lss/linux_syscall_support.h")~#if (BUILDFLAG(IS_LINUX) || BUILDFLAG(IS_CHROMEOS)) \&\& !defined(__b1nix__)\n${1}~' "$F"
+    echo "Patch C-LSS applied: $F"
+  fi
+done

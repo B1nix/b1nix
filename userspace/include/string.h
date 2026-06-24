@@ -40,11 +40,19 @@ int strerror_r(int errnum, char *buf, size_t buflen);
 char *strsignal(int sig);
 
 void *memchr(const void *s, int c, size_t n);
+void *memrchr(const void *s, int c, size_t n);
 char *strtok(char *str, const char *delim);
 char *strtok_r(char *str, const char *delim, char **saveptr);
 char *strsep(char **stringp, const char *delim);
 char *strcasestr(const char *haystack, const char *needle);
 size_t strxfrm(char *dest, const char *src, size_t n);
+/* C-locale-only xlocale (_l) variants for libc++ — ignore the locale. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+static inline int strcoll_l(const char *a, const char *b, locale_t l) { (void)l; return strcoll(a, b); }
+static inline size_t strxfrm_l(char *d, const char *s, size_t n, locale_t l) { (void)l; return strxfrm(d, s, n); }
 size_t strcspn(const char *s, const char *reject);
 size_t strspn(const char *s, const char *accept);
 

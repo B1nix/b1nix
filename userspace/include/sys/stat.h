@@ -53,6 +53,7 @@ extern "C" {
 
 int mknod(const char *pathname, mode_t mode, dev_t dev);
 int mkfifo(const char *pathname, mode_t mode);
+int fchmodat(int dirfd, const char *path, mode_t mode, int flags);
 int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags);
 
 struct timespec;

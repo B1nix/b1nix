@@ -16,8 +16,15 @@
 /* MAP_NORESERVE: lazy-commit (the only commit model b1nix has for anonymous
  * mappings). Accepted by the kernel, selects commit-on-touch. */
 #define MAP_NORESERVE   0x4000
+/* BSD alias used by Chromium base/ and others. */
+#define MAP_ANON        MAP_ANONYMOUS
 
 #define MAP_FAILED      ((void *)-1)
+
+/* msync() flags (Linux ABI numbers). */
+#define MS_ASYNC        1
+#define MS_INVALIDATE   2
+#define MS_SYNC         4
 
 #define MFD_CLOEXEC       0x0001U
 #define MFD_ALLOW_SEALING 0x0002U

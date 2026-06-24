@@ -279,6 +279,14 @@ void *memchr(const void *s, int c, size_t n) {
     return NULL;
 }
 
+void *memrchr(const void *s, int c, size_t n) {
+    const unsigned char *p = (const unsigned char *)s + n;
+    while (n--) {
+        if (*--p == (unsigned char)c) return (void *)p;
+    }
+    return NULL;
+}
+
 char *strtok(char *str, const char *delim) {
     static char *last;
     if (str) last = str;

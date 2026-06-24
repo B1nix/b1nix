@@ -823,10 +823,22 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
   space), so a user access there faulted as a present supervisor page. Fixed by
   relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
 - Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
-  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**. Only Temporal is
-  off (needs the Rust `temporal_rs` crate; b1nix has no Rust toolchain). d8 ships
-  **inside the ISO** as a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate
-  SATA disk. Run via `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
+  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**, **Temporal on**
+  (see below — now that b1nix has a Rust toolchain). d8 ships **inside the ISO** as
+  a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate SATA disk. Run via
+  `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
+- [x] `done` **Temporal — V8 with Rust (v0.69.8).** `v8_enable_temporal_support`
+  pulls in the Rust `temporal_capi`/`temporal_rs` (+ `icu_calendar`, `diplomat`,
+  ~33 crates) — the first Rust running *inside* V8 on b1nix. Built with the b1nix
+  cross-rust (`build/rust-native/.../x86_64-unknown-linux-gnu/stage2`, target
+  `x86_64-unknown-b1nix`). GN wiring: `apply.sh` Patches **7** (real b1nix
+  `rust_abi_target`), **7b** (known-target-triples), **7c** (profiler_builtins is
+  chromium-toolchain-only); `tools/v8/setup-rust-hoststd.sh` grafts a host std
+  (with `.rmeta`) for proc-macros/build-scripts; `tools/v8/v8-link-d8.sh` pulls the
+  rust rlibs + rust std into the d8 link (GN passes them outside `d8.rsp`). d8 needs
+  `--harmony-temporal` (added to the `kernel/main.c` argv — Temporal is an
+  in-progress harmony flag). Verified in QEMU: `M58-V8: ok temporal-plaindate`,
+  `ok temporal-duration`, `ok temporal-add` (calendar arithmetic runs in Rust).
 - [x] `done` **WebAssembly** (`v8_enable_webassembly`). Trap handler off on b1nix
   (`apply.sh` **Patch 20** → explicit in-code bounds checks). The startup abort
   (`AllowHeapAllocationInRelease::IsAllowed()` during startup-snapshot deserialize)
@@ -884,18 +896,26 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 ## M60: Ozone Platform
 
 - [ ] `planned` Add an Ozone platform backend (headless first, then a
-  displayd/Wayland-shaped one): window, surface, input, and vsync.
+  displayd/Wayland-shaped one): window, surface, input, and vsync. Plan in
+  `tools/patches/chromium/PORT-PLAN.md` (start from upstream `headless`).
 
 ## M61: Chromium Build Target
 
-- [ ] `planned` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
+- [ ] `partial` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
   `sandbox/` (stubbed), and Ozone, and integrate the cross-toolchain (a
-  multi-month, ~100 GB build that upstream does not support).
+  multi-month, ~100 GB build that upstream does not support). **Groundwork done
+  for free by the V8 port:** the shared `//build` module already has
+  `target_os == "b1nix"` + a `//build/toolchain/b1nix` cross-toolchain
+  (`tools/patches/v8/`), applied by `tools/patches/v8/apply.sh` to any checkout.
+  Remaining = the Chromium-only subsystems (`base/`/`net`/`sandbox` stubs/Ozone).
+  Fetch/build scaffolding: `tools/sync-chromium.sh`. **Gated on disk** (~150 GB;
+  current box has 43 GB free).
 
 ## M62: content_shell
 
 - [ ] `planned` Render a page to a bitmap with `content_shell --headless
-  --no-sandbox` and verify the pixels — the "Chromium runs" milestone.
+  --no-sandbox` and verify the pixels — the "Chromium runs" milestone. Reuses
+  V8 (M58) + EGL/OSMesa (M59). Blocked behind M60/M61 + the disk gate above.
 
 ## M63: Sandbox
 
@@ -1078,3 +1098,35 @@ or ported to. The item below is parked for a future dedicated x86 maintainer.
 
 - [ ] `frozen` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
   runs userspace on APs (currently BSP-pinned).
+## M66: Chromium Browser Frontend (planned)
+
+- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
+  M62 `content_shell` renders pages, build a windowed browser frontend (address
+  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
+  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
+  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
+  itself. **Gated on M62** (the engine must render first). Lighter alternative if
+  full Chromium UI is too heavy: drive `content_shell --window-size` output into
+  a libgui window.
+
+## M67: Rust Toolchain Port (for Chromium)
+
+- [ ] `planned` Port **Rust to b1nix** so Chromium's Rust components build (gates
+  M62 if the content_shell link needs them). Scope: a `x86_64-unknown-b1nix`
+  rustc target spec + a Rust **`std` platform layer** for b1nix. b1nix is already
+  `is_linux`/`__linux__` with a POSIX-ish libc (`libb1nix.a`), so the realistic
+  path is to **reuse Rust's `unix` PAL** (not write `std::sys` from scratch) via a
+  custom target + `-Zbuild-std`, linking the b1nix libc — then wire Chromium's
+  `custom_toolchain` Rust config (`rust.gni` `toolchain_has_rust`). Multi-week;
+  the single largest remaining port. Honest fallback if a clean disable is ever
+  preferred: gate the Rust touchpoints (mojo rust bindings, content/shell rust
+  demos) on `enable_rust=false` — not a one-liner but far cheaper.
+
+## M68: Native Rust Compiler (self-hosted, stretch)
+
+- [ ] `stretch` Build **rustc to run ON b1nix** (native, compiling Rust inside
+  the OS) — the Rust analog of M26 (native GCC/Binutils self-host). Gated on
+  **M67** (the Rust cross-toolchain must work first). Largest single undertaking:
+  rustc + its LLVM backend cross-compiled with `--host=x86_64-unknown-b1nix`,
+  linked against the b1nix Rust std + libc, plus cargo. Pursue only after the
+  cross Rust path proves out and there's a concrete need for in-VM Rust builds.

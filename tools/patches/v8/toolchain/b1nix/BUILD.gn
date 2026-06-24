@@ -5,7 +5,21 @@
 #
 # Models build/toolchain/linux/BUILD.gn:182 gcc_toolchain("x64"), but points
 # every tool at the existing x86_64-b1nix cross GCC (GCC 13.2, C++17/20 +
-# libstdc++ from M55). No clang/libc++ — V8 builds fine with GCC.
+# libstdc++ from M55).
+#
+# M64 Phase 2: optional Clang frontend for the b1nix TARGET only. When the gn
+# arg b1nix_use_clang=true, the b1nix objects are compiled with a host clang
+# (b1nix_clang_*) using the SAME GCC libstdc++ headers — flags computed and
+# passed in by tools/v8-gen-clang.sh (mirrors tools/b1nix-c++). The final d8 is
+# relinked by tools/v8-link-d8.sh against the GNU runtime regardless of
+# frontend, so only the .o compile path differs between the GCC and Clang
+# builds. GCC stays the default (b1nix_use_clang defaults false).
+#
+# NB: this is a SEPARATE arg from the global is_clang ON PURPOSE. The host /
+# snapshot toolchains (torque, mksnapshot) must stay on the system GCC — a
+# global is_clang=true flips them to a Chromium-clang config that wants a
+# bundled compiler-rt (libclang_rt.builtins.a) the system clang doesn't ship.
+# Only the b1nix toolchain's own toolchain_args.is_clang is flipped below.
 
 import("//build/toolchain/gcc_toolchain.gni")
 
@@ -17,11 +31,25 @@ import("//build/toolchain/gcc_toolchain.gni")
 declare_args() {
   b1nix_toolprefix = rebase_path(
           "//../../x86_64-b1nix/cross/bin/x86_64-b1nix-", root_build_dir)
+
+  # Clang frontend (M64 Phase 2). Only consulted when b1nix_use_clang=true. The
+  # cppflags carry --target + the -nostdinc/-isystem GCC-header search path that
+  # tools/b1nix-c++ uses; passed in by tools/v8-gen-clang.sh.
+  b1nix_use_clang = false
+  b1nix_clang_cc = "clang"
+  b1nix_clang_cxx = "clang++"
+  b1nix_clang_cppflags = ""
 }
 
 gcc_toolchain("x64") {
-  cc = "${b1nix_toolprefix}gcc"
-  cxx = "${b1nix_toolprefix}g++"
+  if (b1nix_use_clang) {
+    cc = b1nix_clang_cc
+    cxx = b1nix_clang_cxx
+    extra_cppflags = b1nix_clang_cppflags
+  } else {
+    cc = "${b1nix_toolprefix}gcc"
+    cxx = "${b1nix_toolprefix}g++"
+  }
 
   readelf = "${b1nix_toolprefix}readelf"
   nm = "${b1nix_toolprefix}nm"
@@ -35,6 +63,6 @@ gcc_toolchain("x64") {
     current_os = "b1nix"
 
     use_remoteexec = false
-    is_clang = false
+    is_clang = b1nix_use_clang
   }
 }

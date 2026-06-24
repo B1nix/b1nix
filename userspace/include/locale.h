@@ -28,6 +28,13 @@ struct lconv {
     char n_sep_by_space;
     char p_sign_posn;
     char n_sign_posn;
+    /* C99 international-monetary fields (libc++ reads them; C-locale = CHAR_MAX). */
+    char int_p_cs_precedes;
+    char int_p_sep_by_space;
+    char int_n_cs_precedes;
+    char int_n_sep_by_space;
+    char int_p_sign_posn;
+    char int_n_sign_posn;
 };
 
 #ifdef __cplusplus
@@ -36,6 +43,30 @@ extern "C" {
 
 char *setlocale(int category, const char *locale);
 struct lconv *localeconv(void);
+
+/* xlocale / per-call locale API (added for the Chromium port, M60-62). b1nix is
+ * C-locale ONLY, so locale_t is an opaque non-NULL handle and the *_l functions
+ * ignore the locale (they behave as the C locale, which is all b1nix has). This
+ * is correct b1nix behaviour, not a fake — there are no other locales. */
+#ifndef B1NIX_LOCALE_T_DEFINED
+#define B1NIX_LOCALE_T_DEFINED
+typedef void *locale_t;
+#endif
+
+/* newlocale category masks. */
+#define LC_CTYPE_MASK    (1 << LC_CTYPE)
+#define LC_NUMERIC_MASK  (1 << LC_NUMERIC)
+#define LC_TIME_MASK     (1 << LC_TIME)
+#define LC_COLLATE_MASK  (1 << LC_COLLATE)
+#define LC_MONETARY_MASK (1 << LC_MONETARY)
+#define LC_MESSAGES_MASK (1 << LC_MESSAGES)
+#define LC_ALL_MASK      (~0)
+#define LC_GLOBAL_LOCALE ((locale_t)-1)
+
+locale_t newlocale(int category_mask, const char *locale, locale_t base);
+locale_t duplocale(locale_t locobj);
+void     freelocale(locale_t locobj);
+locale_t uselocale(locale_t newloc);
 
 #ifdef __cplusplus
 }

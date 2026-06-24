@@ -89,6 +89,28 @@ char *nl_langinfo(nl_item item) {
   }
 }
 
+/* xlocale API (added for the Chromium port, M60-62). b1nix has ONLY the C
+ * locale, so a locale_t is an opaque non-NULL handle and these are trivial.
+ * Returning a fixed non-NULL handle is correct: every operation behaves as the
+ * C locale because that is the only locale b1nix implements. */
+static int __c_locale_object;  /* address used as the singleton C locale_t */
+
+locale_t newlocale(int category_mask, const char *locale, locale_t base) {
+  (void)category_mask; (void)locale; (void)base;
+  return (locale_t)&__c_locale_object;
+}
+locale_t duplocale(locale_t locobj) {
+  (void)locobj;
+  return (locale_t)&__c_locale_object;
+}
+void freelocale(locale_t locobj) {
+  (void)locobj;  /* the singleton is static; nothing to free */
+}
+locale_t uselocale(locale_t newloc) {
+  (void)newloc;  /* b1nix is always the C locale */
+  return (locale_t)&__c_locale_object;
+}
+
 struct lconv *localeconv(void) {
   static struct lconv lc = {
     .decimal_point = ".",

@@ -30,11 +30,15 @@ extern "C" {
 #define SIGUSR2 20
 #define SIGSYS  21
 #define SIGTRAP 22
+#define SIGURG  23
 #define SIGXCPU 24
 #define SIGXFSZ 25
 #define SIGVTALRM 26
 #define SIGPROF 27
 #define SIGWINCH 28
+#ifndef SI_KERNEL
+#define SI_KERNEL 0x80  /* siginfo si_code: sent by the kernel */
+#endif
 #define NSIG    31
 
 /* siginfo si_code values (POSIX). Used by crash reporters to describe faults. */

@@ -41,6 +41,7 @@ LINKER   := linker.ld
 
 LIBC_OBJS := \
 	$(BUILD)/libc/string.o \
+	$(BUILD)/libc/atomic.o \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
 	$(BUILD)/libc/unistd.o \
@@ -59,6 +60,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/udivti3.o \
 	$(BUILD)/libc/wctype.o \
 	$(BUILD)/libc/wchar.o \
+	$(BUILD)/libc/uchar.o \
 	$(BUILD)/libc/libgen.o \
 	$(BUILD)/libc/getopt.o \
 	$(BUILD)/libc/fnmatch.o \

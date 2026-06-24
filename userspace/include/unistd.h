@@ -40,6 +40,7 @@ extern char **environ;
 ssize_t write(int fd, const void *buf, size_t n);
 ssize_t read(int fd, void *buf, size_t n);
 ssize_t pread(int fd, void *buf, size_t n, off_t offset);
+ssize_t pwrite(int fd, const void *buf, size_t n, off_t offset);
 /* Real syscall() function (Linux-compat). Declared BEFORE the function-like
  * syscall() macro in <syscall.h> below: direct `syscall(nr, ...)` calls still
  * hit the fast macro, but using `syscall` as a bare name (e.g. passing it to a
@@ -70,6 +71,7 @@ int execv(const char *pathname, char *const argv[]);
 int fork(void);
 pid_t vfork(void);
 int pipe(int pipefd[2]);
+int pipe2(int pipefd[2], int flags);
 int dup2(int oldfd, int newfd);
 int mkdir(const char *path, unsigned int mode);
 int chdir(const char *path);
@@ -77,6 +79,7 @@ int fchdir(int fd);
 int chroot(const char *path);
 char *getcwd(char *buf, size_t size);
 int fsync(int fd);
+int fdatasync(int fd);  /* Chromium port: b1nix has no data-only sync; = fsync */
 void sync(void);
 unsigned int alarm(unsigned int seconds);
 
@@ -164,6 +167,8 @@ int chmod(const char *path, unsigned int mode);
 
 int fchmod(int fd, unsigned int mode);
 int ftruncate(int fd, off_t length);
+int truncate(const char *path, off_t length);
+#define ftruncate64 ftruncate
 
 #define F_OK 0
 #define X_OK 1

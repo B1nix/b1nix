@@ -1824,6 +1824,26 @@ int clock_nanosleep(int clk_id, int flags, const struct timespec *req,
 int sched_get_priority_max(int policy) { (void)policy; return 0; }
 int sched_get_priority_min(int policy) { (void)policy; return 0; }
 
+/* Chromium port: b1nix has nice-based scheduling only — no SCHED_FIFO/RR
+ * realtime classes. Report SCHED_OTHER honestly; accept setting SCHED_OTHER and
+ * reject the realtime policies with EINVAL (POSIX); getparam reports priority 0.
+ * (b1nix is single-policy, so pid is not validated against live tasks here.) */
+int sched_getscheduler(int pid) { (void)pid; return SCHED_OTHER; }
+
+int sched_setscheduler(int pid, int policy, const struct sched_param *param) {
+  (void)pid; (void)param;
+  if (policy == SCHED_OTHER) return 0;
+  errno = EINVAL;
+  return -1;
+}
+
+int sched_getparam(int pid, struct sched_param *param) {
+  (void)pid;
+  if (!param) { errno = EINVAL; return -1; }
+  param->sched_priority = 0;
+  return 0;
+}
+
 int sched_getcpu(void) { return getcpu(); }
 
 /* sched_getaffinity(2): fill `mask` with the set of CPUs the task may run on

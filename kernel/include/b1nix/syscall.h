@@ -195,6 +195,7 @@ enum {
 	 * self-re-raise, so the payload is dropped — same limitation as raise(3),
 	 * which is the fallback LLVM/glibc use when this call is unsupported. */
 	SYS_RT_TGSIGQUEUEINFO = 162,
+	SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

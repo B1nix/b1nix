@@ -46,6 +46,9 @@ struct rlimit {
 #define RLIMIT_CORE   4
 #define RLIMIT_NOFILE 7
 #define RLIMIT_AS     9
+#define RLIMIT_NICE   13
+#define RLIMIT_RTPRIO 14
+#define RLIMIT_RTTIME 15
 #define RLIM_INFINITY ((rlim_t)-1)
 
 #ifdef __cplusplus

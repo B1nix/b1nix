@@ -176,6 +176,9 @@ int vsprintf(char *str, const char *format, va_list ap);
 #define _IONBF 2
 
 #define L_tmpnam 20
+#define FILENAME_MAX 4096
+#define FOPEN_MAX 16
+#define TMP_MAX 238328
 
 FILE *tmpfile(void);
 

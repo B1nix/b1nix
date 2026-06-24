@@ -8,6 +8,7 @@
 extern "C" {
 #endif
 
+#define PR_SET_PDEATHSIG        1   /* Chromium port: prctl is a no-op success */
 #define PR_SET_NAME            15
 #define PR_GET_NAME            16
 #define PR_SET_VMA             0x53564d41
