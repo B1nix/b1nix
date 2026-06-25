@@ -142,7 +142,28 @@ static inline ldiv_t ldiv(long numer, long denom) {
 
 int atexit(void (*function)(void));
 int rand(void);
+int rand_r(unsigned int *seedp);
 void srand(unsigned int seed);
+
+/* BSD/POSIX random() family. A classic TYPE_3 additive-feedback generator
+ * (better quality than rand()'s LCG). random_r/initstate_r are the GNU
+ * reentrant forms (used by e.g. fontconfig). */
+#include <stdint.h>
+struct random_data {
+  int32_t x[31];   /* additive-feedback state (degree 31) */
+  int fptr, rptr;  /* feedback/return indices */
+  int valid;
+};
+long random(void);
+void srandom(unsigned int seed);
+/* BSD/glibc load-average query. b1nix tracks no load average; returns -1 so
+ * callers fall back to a zero/unknown load. */
+int getloadavg(double loadavg[], int nelem);
+int random_r(struct random_data *buf, int32_t *result);
+int srandom_r(unsigned int seed, struct random_data *buf);
+int initstate_r(unsigned int seed, char *statebuf, size_t statelen,
+                struct random_data *buf);
+
 int system(const char *command);
 
 static inline void *bsearch(const void *key, const void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *)) {
@@ -187,6 +208,7 @@ static inline char *mktemp(char *tmpl) {
 }
 
 int mkstemp(char *tmpl);
+int mkstemps(char *tmpl, int suffixlen);
 char *mkdtemp(char *tmpl);
 
 const char *getprogname(void);

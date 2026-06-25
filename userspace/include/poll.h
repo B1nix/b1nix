@@ -15,6 +15,7 @@
 #define POLLRDBAND  0x080
 #define POLLWRNORM  0x100
 #define POLLWRBAND  0x200
+#define POLLRDHUP   0x2000  /* peer half-close; matches EPOLLRDHUP */
 
 typedef unsigned int nfds_t;
 

@@ -96,6 +96,36 @@ static inline int CPU_COUNT_S(size_t __setsize, const cpu_set_t *__set) {
 
 int sched_getaffinity(int pid, size_t cpusetsize, cpu_set_t *mask);
 
+/* CLONE_* flags. glibc exposes these via <sched.h>; b1nix's canonical copies live
+ * in <syscall.h>, so guard each so including both headers never redefines. Only
+ * CLONE_VFORK was missing from the syscall.h set (needed by the sandbox namespace
+ * code, dead under --no-sandbox). Linux-canonical values. */
+#ifndef CLONE_VM
+#define CLONE_VM        0x00000100
+#endif
+#ifndef CLONE_FS
+#define CLONE_FS        0x00000200
+#endif
+#ifndef CLONE_FILES
+#define CLONE_FILES     0x00000400
+#endif
+#ifndef CLONE_SIGHAND
+#define CLONE_SIGHAND   0x00000800
+#endif
+#ifndef CLONE_VFORK
+#define CLONE_VFORK     0x00004000
+#endif
+#ifndef CLONE_THREAD
+#define CLONE_THREAD    0x00010000
+#endif
+
+/* glibc-style clone(): run fn(arg) on a new stack (highest address), returning
+ * the child TID to the parent. Variadic tail = pid_t *ptid, void *tls,
+ * pid_t *ctid (used per the CLONE_* flags). When fn returns the child exits with
+ * fn's return value. b1nix SYS_CLONE has no parent-tid slot, so ptid is emulated
+ * (written from the returned tid) when CLONE_PARENT_SETTID is set. */
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...);
+
 #ifdef __cplusplus
 }
 #endif

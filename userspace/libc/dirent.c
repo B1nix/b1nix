@@ -83,6 +83,15 @@ struct dirent *readdir(DIR *dirp)
 
     struct k_dirent *k = &dirp->batch[dirp->index++];
     dirp->ent.d_ino = ++dirp->ino_seq;
+    /* Map the kernel entry type (1=file, 2=device, 3=directory) to DT_*. */
+    if (k->is_dir || k->type == 3)
+        dirp->ent.d_type = DT_DIR;
+    else if (k->type == 2)
+        dirp->ent.d_type = DT_CHR;
+    else if (k->type == 1)
+        dirp->ent.d_type = DT_REG;
+    else
+        dirp->ent.d_type = DT_UNKNOWN;
 
     int i = 0;
     while (i < (int)sizeof(k->name) - 1 && k->name[i]) {

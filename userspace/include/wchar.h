@@ -70,6 +70,8 @@ wint_t btowc(int c);
 int wctob(wint_t c);
 int wcscmp(const wchar_t *a, const wchar_t *b);
 int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n);
+int wcscasecmp(const wchar_t *a, const wchar_t *b);
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n);
 int wcscoll(const wchar_t *a, const wchar_t *b);
 size_t wcsxfrm(wchar_t *dest, const wchar_t *src, size_t n);
 /* C-locale-only xlocale (_l) variants for libc++ — ignore the locale. */

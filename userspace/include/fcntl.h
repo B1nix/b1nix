@@ -9,6 +9,8 @@ extern "C" {
 #endif
 #define O_WRONLY    0x0001
 #define O_RDWR      0x0002
+#define O_ACCMODE   0x0003  /* mask for O_RDONLY/O_WRONLY/O_RDWR */
+#define O_TMPFILE   0x410000  /* __O_TMPFILE | O_DIRECTORY (unnamed temp file) */
 #define O_CREAT     0x0040
 #define O_EXCL      0x0080
 #define O_TRUNC     0x0200
@@ -21,6 +23,19 @@ extern "C" {
 #define O_NOCTTY    0x0100
 #define O_BINARY    0
 #define O_TEXT      0
+/* Extended open() flags. b1nix's VFS ignores bits it doesn't implement, so these
+ * are accepted-and-ignored today (real per-flag semantics tracked in the roadmap).
+ * Values use b1nix-free bits, NOT Linux's — several of Linux's collide with b1nix
+ * flags (e.g. Linux O_DIRECT 0x4000 == b1nix O_NONBLOCK). O_LARGEFILE is a no-op:
+ * b1nix off_t is always 64-bit. O_PATH opens a reference fd (degrades to O_RDONLY
+ * until path-only fds exist). */
+#define O_DIRECT    0x1000
+#define O_SYNC      0x2000
+#define O_DSYNC     0x8000
+#define O_NOATIME   0x40000
+#define O_ASYNC     0x80000
+#define O_PATH      0x200000
+#define O_LARGEFILE 0
 
 #define F_DUPFD 0
 #define F_GETFD 1
@@ -56,6 +71,7 @@ int fcntl(int fd, int cmd, ...);
  * port (M60-62). */
 int creat(const char *path, mode_t mode);
 int posix_fadvise(int fd, off_t offset, off_t len, int advice);
+int posix_fallocate(int fd, off_t offset, off_t len);
 int fallocate(int fd, int mode, off_t offset, off_t len);
 
 /* posix_fadvise advice values (Linux ABI). */

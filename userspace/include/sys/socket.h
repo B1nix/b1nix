@@ -35,8 +35,16 @@ struct sockaddr_in {
   unsigned char sin_zero[8];
 };
 
+/* glibc-compatible layout: a union of byte/word/dword views. Ported code
+ * initializes it with three brace levels ({{{...}}}, struct/union/array) and
+ * accesses .s6_addr (and occasionally .s6_addr16/.s6_addr32). Anonymous union so
+ * .s6_addr stays a direct member — no global s6_addr macro needed. 16 bytes. */
 struct in6_addr {
-  unsigned char s6_addr[16];
+  union {
+    unsigned char  s6_addr[16];
+    unsigned short s6_addr16[8];
+    unsigned int   s6_addr32[4];
+  };
 };
 
 struct sockaddr_in6 {
@@ -97,6 +105,7 @@ struct cmsghdr {
 
 #define SCM_RIGHTS 0x01
 #define SCM_CREDENTIALS 0x02
+#define SCM_TIMESTAMP   SO_TIMESTAMP  /* control-msg type for SO_TIMESTAMP */
 
 struct ucred {
   int pid;
@@ -157,6 +166,7 @@ struct ucred {
 #define SO_SNDTIMEO     21
 #define SO_DOMAIN       39
 #define SO_PROTOCOL     38
+#define SO_TIMESTAMP    29   /* per-datagram receive timestamp (SCM_TIMESTAMP) */
 
 #define SOMAXCONN       4096
 
@@ -165,7 +175,9 @@ struct ucred {
 #define MSG_PEEK        0x02
 #define MSG_TRUNC       0x20
 #define MSG_DONTWAIT    0x40
+#define MSG_CONFIRM     0x800
 #define MSG_NOSIGNAL    0x4000
+#define MSG_CMSG_CLOEXEC 0x40000000  /* recvmsg(): set O_CLOEXEC on fds received via SCM_RIGHTS (b1nix honors it in vfs_socket). */
 
 #define SHUT_RD         0
 #define SHUT_WR         1
@@ -192,6 +204,17 @@ ssize_t recvfrom(int sockfd, void *buf, size_t len, int flags,
                  struct sockaddr *src_addr, socklen_t *addrlen);
 ssize_t sendmsg(int sockfd, const struct msghdr *msg, int flags);
 ssize_t recvmsg(int sockfd, struct msghdr *msg, int flags);
+
+/* Batch send/receive (Linux sendmmsg/recvmmsg). b1nix has no batch syscall, so
+ * libc loops over sendmsg/recvmsg — semantically faithful, just not atomic. */
+struct mmsghdr {
+  struct msghdr msg_hdr;
+  unsigned int  msg_len;
+};
+struct timespec;
+int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags);
+int recvmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+             struct timespec *timeout);
 int shutdown(int sockfd, int how);
 
 #ifdef __cplusplus

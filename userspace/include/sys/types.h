@@ -11,6 +11,9 @@ typedef long off_t;
 #else
 typedef long long off_t;
 #endif
+/* b1nix off_t is always 64-bit, so off64_t is identical (LFS). */
+typedef off_t off64_t;
+typedef off_t loff_t;
 #ifndef B1NIX_TIME_T_DEFINED
 #define B1NIX_TIME_T_DEFINED
 typedef long long time_t;
@@ -22,6 +25,7 @@ typedef unsigned int gid_t;
 typedef unsigned int id_t;
 typedef unsigned long dev_t;
 typedef unsigned long ino_t;
+typedef ino_t ino64_t;
 typedef unsigned int nlink_t;
 typedef long blksize_t;
 typedef long blkcnt_t;

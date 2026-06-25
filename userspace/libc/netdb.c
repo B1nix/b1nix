@@ -3,6 +3,7 @@
 #include <netinet/in.h>
 #include <sys/socket.h>
 #include <stdlib.h>
+#include <errno.h>
 #include <string.h>
 #include <stdio.h>
 #include <fcntl.h>
@@ -489,10 +490,19 @@ struct servent *getservbyname(const char *name, const char *proto) {
  * reads the first "nameserver" line from /etc/resolv.conf. */
 struct __res_state _res;
 
-int res_init(void) {
-  memset(&_res, 0, sizeof(_res));
-  _res.options = RES_INIT;
-  _res.nscount = 0;
+/* Reentrant resolver init: parse /etc/resolv.conf nameserver lines into statp.
+ * res_init() is the legacy wrapper over the global _res. */
+int res_ninit(struct __res_state *statp) {
+  if (!statp) {
+    errno = EINVAL;
+    return -1;
+  }
+  memset(statp, 0, sizeof(*statp));
+  statp->options = RES_INIT | RES_RECURSE | RES_DEFNAMES | RES_DNSRCH;
+  statp->nscount = 0;
+  statp->ndots = 1;     /* glibc default */
+  statp->retrans = 5;
+  statp->retry = 2;
 
   int fd = open("/etc/resolv.conf", O_RDONLY);
   if (fd >= 0) {
@@ -502,7 +512,7 @@ int res_init(void) {
     if (n > 0) {
       buf[n] = '\0';
       char *line = buf;
-      while (line && *line && _res.nscount < MAXNS) {
+      while (line && *line && statp->nscount < MAXNS) {
         char *nl = strchr(line, '\n');
         if (nl)
           *nl = '\0';
@@ -512,11 +522,11 @@ int res_init(void) {
             p++;
           struct in_addr a;
           if (inet_aton(p, &a)) {
-            struct sockaddr_in *sin = &_res.nsaddr_list[_res.nscount];
+            struct sockaddr_in *sin = &statp->nsaddr_list[statp->nscount];
             sin->sin_family = AF_INET;
             sin->sin_port = htons(53);
             sin->sin_addr = a;
-            _res.nscount++;
+            statp->nscount++;
           }
         }
         line = nl ? nl + 1 : 0;
@@ -526,10 +536,26 @@ int res_init(void) {
   return 0;
 }
 
+int res_init(void) { return res_ninit(&_res); }
+
+/* b1nix keeps no persistent sockets in the resolver state. */
+void res_nclose(struct __res_state *statp) { (void)statp; }
+
 /* Single modelled interface: eth0 has index 1, "lo" index 1 too (b1nix has no
  * separate loopback ifindex); unknown names return 0. */
 unsigned int if_nametoindex(const char *ifname) {
   if (ifname && ifname[0])
     return 1;
+  return 0;
+}
+
+/* Reverse of if_nametoindex for the single modelled interface (index 1 = eth0).
+ * Used by ports for scoped-IPv6 zone display. Returns ifname or NULL/ENXIO. */
+char *if_indextoname(unsigned int ifindex, char *ifname) {
+  if (ifindex == 1 && ifname) {
+    strcpy(ifname, "eth0");
+    return ifname;
+  }
+  errno = ENXIO;
   return 0;
 }

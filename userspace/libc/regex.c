@@ -237,14 +237,13 @@ static struct rx_node *rx_parse_piece(struct rx_parser *ps) {
 
     if (is_interval) {
       const char *curr = start_ptr;
-      int m = 0, n = -1, has_comma = 0;
+      int m = 0, n = -1;
       if (curr[0] >= '0' && curr[0] <= '9') {
         while (curr[0] >= '0' && curr[0] <= '9') {
           m = m * 10 + (curr[0] - '0');
           curr++;
         }
         if (*curr == ',') {
-          has_comma = 1;
           curr++;
           if (curr[0] >= '0' && curr[0] <= '9') {
             n = 0;

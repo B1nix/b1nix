@@ -90,5 +90,6 @@ struct ifconf {
 #define ifc_req ifc_ifcu.ifcu_req
 
 unsigned int if_nametoindex(const char *ifname);
+char *if_indextoname(unsigned int ifindex, char *ifname);
 
 #endif

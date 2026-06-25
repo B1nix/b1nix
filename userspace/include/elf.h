@@ -277,6 +277,24 @@ typedef struct {
   Elf64_Word n_type;
 } Elf64_Nhdr;
 
+/* GNU note types (n_type in a "GNU"-named note). Chromium's elf_reader reads the
+ * build-id note; the rest are the standard glibc set. */
+#define NT_GNU_ABI_TAG          1
+#define NT_GNU_HWCAP            2
+#define NT_GNU_BUILD_ID         3
+/* Core-file note types (ptrace register sets, used by crashpad's ptracer). */
+#define NT_PRSTATUS    1
+#define NT_PRFPREG     2
+#define NT_PRPSINFO    3
+#define NT_TASKSTRUCT  4
+#define NT_AUXV        6
+#define NT_PRXFPREG    0x46e62b7f
+#define NT_X86_XSTATE  0x202
+#define NT_ARM_VFP     0x400
+#define NT_ARM_TLS     0x401
+#define NT_GNU_GOLD_VERSION     4
+#define NT_GNU_PROPERTY_TYPE_0  5
+
 /* Auxiliary vector (the kernel hands this to _start; also at /proc/self/auxv). */
 typedef struct {
   uint32_t a_type;

@@ -191,6 +191,7 @@ enum {
   SYS_GET_TLS_INFO    = 161,
   SYS_RT_TGSIGQUEUEINFO = 162,
   SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
+  SYS_MINCORE         = 164,  /* page residency bitmap (Chromium memory-dump) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the
@@ -802,16 +803,189 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 #define __NR_yield SYS_YIELD
 #endif
 
-/* Lowercase Linux SYS_* aliases used by ports that include <syscall.h> directly
- * and call syscall(SYS_<name>) (e.g. abseil raw_logging / address_is_readable).
- * Added for the Chromium port (M60-62). They map onto the matching b1nix
- * syscalls, so the raw syscall() hits the correct b1nix entry. */
-#define SYS_write SYS_WRITE
+/* Lowercase Linux SYS_<name> aliases (glibc <sys/syscall.h> style) for ports
+ * that call syscall(SYS_<name>) directly — Chromium, abseil, partition_alloc.
+ * One alias per b1nix enum entry; they map onto the matching b1nix syscall so
+ * the raw syscall() hits the correct entry. Kept complete so this whole error
+ * category never recurs — regenerate from the enum if you add a syscall. */
+#define SYS_accept SYS_ACCEPT
+#define SYS_access SYS_ACCESS
+#define SYS_alarm SYS_ALARM
+#define SYS_bind SYS_BIND
+#define SYS_brk SYS_BRK
+#define SYS_chdir SYS_CHDIR
+#define SYS_chmod SYS_CHMOD
+#define SYS_chown SYS_CHOWN
+#define SYS_clear SYS_CLEAR
+#define SYS_clock_gettime SYS_CLOCK_GETTIME
+#define SYS_clone SYS_CLONE
+#define SYS_close SYS_CLOSE
+#define SYS_connect SYS_CONNECT
+#define SYS_create SYS_CREATE
+#define SYS_dmesg SYS_DMESG
+#define SYS_dup SYS_DUP
+#define SYS_dup2 SYS_DUP2
+#define SYS_epoll_create1 SYS_EPOLL_CREATE1
+#define SYS_epoll_ctl SYS_EPOLL_CTL
+#define SYS_epoll_wait SYS_EPOLL_WAIT
+#define SYS_eventfd2 SYS_EVENTFD2
+#define SYS_exec SYS_EXEC
+#define SYS_execve SYS_EXECVE
+#define SYS_exit SYS_EXIT
+#define SYS_exit_thread SYS_EXIT_THREAD
+#define SYS_fchdir SYS_FCHDIR
+#define SYS_fchmod SYS_FCHMOD
+#define SYS_fchown SYS_FCHOWN
+#define SYS_fcntl SYS_FCNTL
+#define SYS_fork SYS_FORK
+#define SYS_fstat SYS_FSTAT
+#define SYS_fstatfs SYS_FSTATFS
+#define SYS_fsync SYS_FSYNC
+#define SYS_ftruncate SYS_FTRUNCATE
+#define SYS_futex SYS_FUTEX
+#define SYS_getcpu SYS_GETCPU
+#define SYS_getcwd SYS_GETCWD
+#define SYS_getdents SYS_GETDENTS
+#define SYS_getdents64 SYS_GETDENTS64
+#define SYS_mincore SYS_MINCORE
+#define SYS_getegid SYS_GETEGID
+#define SYS_geteuid SYS_GETEUID
+#define SYS_getgid SYS_GETGID
+#define SYS_getgroups SYS_GETGROUPS
+#define SYS_getpeername SYS_GETPEERNAME
+#define SYS_getpgid SYS_GETPGID
+#define SYS_getpgrp SYS_GETPGRP
+#define SYS_getpid SYS_GETPID
+#define SYS_getppid SYS_GETPPID
+#define SYS_getpriority SYS_GETPRIORITY
+#define SYS_getrandom SYS_GETRANDOM
+#define SYS_getrlimit SYS_GETRLIMIT
+#define SYS_getrusage SYS_GETRUSAGE
+#define SYS_getsid SYS_GETSID
+#define SYS_getsockname SYS_GETSOCKNAME
+#define SYS_getsockopt SYS_GETSOCKOPT
+#define SYS_gettid SYS_GETTID
+#define SYS_get_tls_info SYS_GET_TLS_INFO
+#define SYS_getuid SYS_GETUID
+#define SYS_getxattr SYS_GETXATTR
+#define SYS_ioctl SYS_IOCTL
+#define SYS_io_getevents SYS_IO_GETEVENTS
+#define SYS_io_setup SYS_IO_SETUP
+#define SYS_io_submit SYS_IO_SUBMIT
+#define SYS_kill SYS_KILL
+#define SYS_link SYS_LINK
+#define SYS_list SYS_LIST
+#define SYS_listen SYS_LISTEN
+#define SYS_listxattr SYS_LISTXATTR
+#define SYS_lseek SYS_LSEEK
+#define SYS_lstat SYS_LSTAT
+#define SYS_madvise SYS_MADVISE
+#define SYS_mem SYS_MEM
+#define SYS_memfd_create SYS_MEMFD_CREATE
+#define SYS_mkdir SYS_MKDIR
+#define SYS_mmap SYS_MMAP
+#define SYS_mount SYS_MOUNT
+#define SYS_mounts SYS_MOUNTS
+#define SYS_mprotect SYS_MPROTECT
+#define SYS_mq_close SYS_MQ_CLOSE
+#define SYS_mq_open SYS_MQ_OPEN
+#define SYS_mq_receive SYS_MQ_RECEIVE
+#define SYS_mq_send SYS_MQ_SEND
+#define SYS_mq_unlink SYS_MQ_UNLINK
+#define SYS_munmap SYS_MUNMAP
+#define SYS_net_dns SYS_NET_DNS
+#define SYS_net_info SYS_NET_INFO
+#define SYS_net_ping SYS_NET_PING
+#define SYS_open SYS_OPEN
+#define SYS_pipe SYS_PIPE
+#define SYS_poll SYS_POLL
+#define SYS_ps SYS_PS
 #define SYS_read SYS_READ
-#define SYS_rt_sigprocmask SYS_SIGPROCMASK
+#define SYS_readdir SYS_READDIR
+#define SYS_read_file SYS_READ_FILE
+#define SYS_read_kbd SYS_READ_KBD
+#define SYS_readlink SYS_READLINK
+#define SYS_reboot SYS_REBOOT
+#define SYS_recv SYS_RECV
+#define SYS_recvmsg SYS_RECVMSG
+#define SYS_removexattr SYS_REMOVEXATTR
+#define SYS_rename SYS_RENAME
+#define SYS_rmdir SYS_RMDIR
+#define SYS_rt_tgsigqueueinfo SYS_RT_TGSIGQUEUEINFO
+#define SYS_sched_getaffinity SYS_SCHED_GETAFFINITY
+#define SYS_select SYS_SELECT
+#define SYS_selfhost_status SYS_SELFHOST_STATUS
+#define SYS_send SYS_SEND
+#define SYS_sendmsg SYS_SENDMSG
+#define SYS_setegid SYS_SETEGID
+#define SYS_seteuid SYS_SETEUID
+#define SYS_setgid SYS_SETGID
+#define SYS_setgroups SYS_SETGROUPS
+#define SYS_setpgrp SYS_SETPGRP
+#define SYS_setpriority SYS_SETPRIORITY
+#define SYS_setregid SYS_SETREGID
+#define SYS_setresgid SYS_SETRESGID
+#define SYS_setresuid SYS_SETRESUID
+#define SYS_setreuid SYS_SETREUID
+#define SYS_setrlimit SYS_SETRLIMIT
+#define SYS_setsid SYS_SETSID
+#define SYS_setsockopt SYS_SETSOCKOPT
+#define SYS_set_stdout SYS_SET_STDOUT
+#define SYS_settimeofday SYS_SETTIMEOFDAY
+#define SYS_set_tls SYS_SET_TLS
+#define SYS_setuid SYS_SETUID
+#define SYS_setxattr SYS_SETXATTR
+#define SYS_shmat SYS_SHMAT
+#define SYS_shmctl SYS_SHMCTL
+#define SYS_shmdt SYS_SHMDT
+#define SYS_shmget SYS_SHMGET
+#define SYS_shutdown SYS_SHUTDOWN
+#define SYS_sigaltstack SYS_SIGALTSTACK
+#define SYS_signalfd4 SYS_SIGNALFD4
 #define SYS_sigprocmask SYS_SIGPROCMASK
-#define __NR_write SYS_WRITE
-#define __NR_read SYS_READ
-#define __NR_rt_sigprocmask SYS_SIGPROCMASK
+#define SYS_sigreturn SYS_SIGRETURN
+#define SYS_sigsuspend SYS_SIGSUSPEND
+#define SYS_sleep SYS_SLEEP
+#define SYS_socket SYS_SOCKET
+#define SYS_socketpair SYS_SOCKETPAIR
+#define SYS_spawn SYS_SPAWN
+#define SYS_stat SYS_STAT
+#define SYS_statfs SYS_STATFS
+#define SYS_symlink SYS_SYMLINK
+#define SYS_sync SYS_SYNC
+#define SYS_syncfs SYS_SYNCFS
+#define SYS_sysinfo SYS_SYSINFO
+#define SYS_termios_get SYS_TERMIOS_GET
+#define SYS_termios_set SYS_TERMIOS_SET
+#define SYS_time SYS_TIME
+#define SYS_timerfd_create SYS_TIMERFD_CREATE
+#define SYS_timerfd_settime SYS_TIMERFD_SETTIME
+#define SYS_times SYS_TIMES
+#define SYS_umask SYS_UMASK
+#define SYS_umount SYS_UMOUNT
+#define SYS_uname SYS_UNAME
+#define SYS_unlink SYS_UNLINK
+#define SYS_utime SYS_UTIME
+#define SYS_wait SYS_WAIT
+#define SYS_waitid SYS_WAITID
+#define SYS_waitpid SYS_WAITPID
+#define SYS_write SYS_WRITE
+#define SYS_yield SYS_YIELD
+
+/* Linux-only syscall names that b1nix lacks: map to the closest b1nix call, or
+ * to an out-of-range sentinel that the kernel rejects with -ENOSYS so the
+ * caller takes its fallback path. */
+#define SYS_rt_sigprocmask  SYS_SIGPROCMASK
+/* rt_sigaction: 3-arg sig/act/oact (b1nix ignores the 4th sigsetsize arg).
+ * NOTE: callers passing a Linux-layout struct (e.g. base/process/launch_posix's
+ * kernel_sigaction) differ from b1nix `struct sigaction` — the between-fork/exec
+ * handler reset is therefore best-effort, not bit-exact. */
+#define SYS_rt_sigaction    SYS_SIGNAL
+#define SYS_tgkill          SYS_KILL   /* drops tgid; b1nix tids are unique */
+#define SYS_exit_group      SYS_EXIT
+#define SYS_clock_nanosleep 1024  /* -ENOSYS -> caller falls back to nanosleep */
+#define SYS_pkey_mprotect   1025  /* b1nix has no protection keys -> -ENOSYS */
+#define SYS_pkey_alloc      1026
+#define SYS_pkey_free       1027
 
 #endif

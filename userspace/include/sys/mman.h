@@ -8,6 +8,8 @@
 #define PROT_READ       0x01
 #define PROT_WRITE      0x02
 #define PROT_EXEC       0x04
+#define PROT_GROWSDOWN  0x01000000  /* stack-growth hint (b1nix: accepted, ignored) */
+#define PROT_GROWSUP    0x02000000
 
 #define MAP_SHARED      0x01
 #define MAP_PRIVATE     0x02
@@ -16,6 +18,9 @@
 /* MAP_NORESERVE: lazy-commit (the only commit model b1nix has for anonymous
  * mappings). Accepted by the kernel, selects commit-on-touch. */
 #define MAP_NORESERVE   0x4000
+/* MAP_POPULATE: prefault the mapping. b1nix faults lazily; accepted-and-ignored
+ * (the mapping is still correct, just not pre-populated). */
+#define MAP_POPULATE    0x8000
 /* BSD alias used by Chromium base/ and others. */
 #define MAP_ANON        MAP_ANONYMOUS
 
@@ -36,6 +41,7 @@
 #define MADV_WILLNEED   3
 #define MADV_DONTNEED   4
 #define MADV_FREE       8
+#define MADV_REMOVE     9   /* hole-punch (Chromium discardable shm purge) */
 /* Advisory hints b1nix accepts but does not act on (legal POSIX no-op).
  * V8's platform-posix.cc tags allocations with DONTFORK/HUGEPAGE. */
 #define MADV_DONTFORK   10
@@ -53,6 +59,10 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t len, int prot);
 int madvise(void *addr, size_t length, int advice);
+int mincore(void *addr, size_t length, unsigned char *vec);
+/* b1nix doesn't swap, so locking pages into RAM is a no-op success. */
+int mlock(const void *addr, size_t len);
+int munlock(const void *addr, size_t len);
 int msync(void *addr, size_t length, int flags);
 int memfd_create(const char *name, unsigned int flags);
 

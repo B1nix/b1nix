@@ -38,6 +38,11 @@ pid_t wait3(int *wstatus, int options, struct rusage *rusage);
 #define WEXITED 4
 #define WCONTINUED 8
 #define WNOWAIT 0x01000000
+/* Linux-specific waitpid flags (b1nix has no separate clone-thread wait domain,
+ * so __WALL/__WCLONE are accepted but don't change behavior). */
+#define __WNOTHREAD 0x20000000
+#define __WALL      0x40000000
+#define __WCLONE    0x80000000
 
 #define WIFEXITED(status)   (((status) & 0x7f) == 0)
 #define WEXITSTATUS(status) (((status) >> 8) & 0xff)
