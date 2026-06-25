@@ -148,9 +148,15 @@ struct ucred {
 #define IPPROTO_IPV6    41
 
 #define SOL_SOCKET      1
+/* setsockopt levels for IP/IPv6 (Linux values). b1nix routes IP options through
+ * the protocol; these are mainly named by the seccomp network policy (dead). */
+#define SOL_IP          0
+#define SOL_IPV6        41
+#define SO_DEBUG        1
 #define SO_REUSEADDR    2
 #define SO_TYPE         3
 #define SO_ERROR        4
+#define SO_PEEK_OFF     42   /* named by the seccomp socket-opt policy (dead on b1nix) */
 #define SO_SNDBUF       7
 #define SO_RCVBUF       8
 #define SO_KEEPALIVE    9

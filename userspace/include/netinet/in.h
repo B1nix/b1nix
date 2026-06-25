@@ -85,6 +85,10 @@ extern const struct in6_addr in6addr_loopback;
 #define IP_ADD_MEMBERSHIP  35
 #define IP_DROP_MEMBERSHIP 36
 #define IP_DEFAULT_MULTICAST_TTL  1
+/* Error-queue recv options (Linux values). Named by the seccomp network policy
+ * (dead on b1nix); b1nix has no MSG_ERRQUEUE error queue. */
+#define IP_RECVERR    11
+#define IPV6_RECVERR  25
 #define IP_DEFAULT_MULTICAST_LOOP 1
 
 /* IPPROTO_IPV6-level options (Linux ABI). */

@@ -21,6 +21,17 @@
 /* MAP_POPULATE: prefault the mapping. b1nix faults lazily; accepted-and-ignored
  * (the mapping is still correct, just not pre-populated). */
 #define MAP_POPULATE    0x8000
+/* Accepted-and-ignored mmap flag bits (b1nix-free values). b1nix has no
+ * deny-write/locked/hugetlb/droppable/stack-marker semantics; these exist so
+ * code that *names* the flags (e.g. the seccomp mmap-arg policy, dead on b1nix)
+ * compiles. The mapping itself is unaffected. */
+#define MAP_GROWSDOWN   0x0100
+#define MAP_DENYWRITE   0x0800
+#define MAP_EXECUTABLE  0x1000
+#define MAP_LOCKED      0x2000
+#define MAP_STACK       0x20000
+#define MAP_HUGETLB     0x40000
+#define MAP_DROPPABLE   0x0008
 /* BSD alias used by Chromium base/ and others. */
 #define MAP_ANON        MAP_ANONYMOUS
 

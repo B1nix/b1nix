@@ -2,11 +2,22 @@
 #define _LINUX_USB_CH9_H
 
 /* Minimal <linux/usb/ch9.h> for b1nix: the USB 2.0 chapter-9 control-request
- * bmRequestType bitmask constants. b1nix has no USB device stack, so WebUSB
- * (services/device/usb/usb_device_handle_usbfs.cc) is dead here — but it must
- * compile + link (usb_device_linux.cc references UsbDeviceHandleUsbfs). Only the
- * direction/type/recipient constants are actually used; descriptor structs are
- * not, so they're omitted. Real USB = a future kernel subsystem. */
+ * bmRequestType bitmask constants + the SETUP packet. b1nix has no USB device
+ * stack, so WebUSB (services/device/usb/usb_device_handle_usbfs.cc) is dead here
+ * — but it must compile + link (usb_device_linux.cc references
+ * UsbDeviceHandleUsbfs). Full descriptor structs are omitted (unused). Real USB =
+ * a future kernel subsystem. */
+
+#include <stdint.h>
+
+/* The 8-byte control-transfer SETUP packet (USB 2.0 §9.3). */
+struct usb_ctrlrequest {
+    uint8_t  bRequestType;
+    uint8_t  bRequest;
+    uint16_t wValue;
+    uint16_t wIndex;
+    uint16_t wLength;
+} __attribute__((packed));
 
 #define USB_DIR_OUT          0      /* host-to-device */
 #define USB_DIR_IN           0x80   /* device-to-host */
