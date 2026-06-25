@@ -3155,6 +3155,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
   case SYS_MADVISE:
     return (u64)sys_madvise((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  case SYS_MINCORE: {
+    /* SYS_MINCORE(addr, length, vec): vec[i] bit0 = the page at
+     * addr + i*PAGE_SIZE is present in this address space (page-table walk).
+     * POSIX requires a page-aligned addr. */
+    u64 addr = arg0;
+    usize length = (usize)arg1;
+    u8 *uvec = (u8 *)(usize)arg2;
+    if (addr & (PAGE_SIZE - 1)) return (u64)-EINVAL;
+    if (!uvec) return (u64)-EFAULT;
+    usize pages = (length + PAGE_SIZE - 1) / PAGE_SIZE;
+    u8 batch[512];
+    usize done = 0;
+    while (done < pages) {
+      usize n = pages - done;
+      if (n > sizeof(batch)) n = sizeof(batch);
+      for (usize i = 0; i < n; i++) {
+        u64 va = addr + (u64)(done + i) * PAGE_SIZE;
+        batch[i] = (vmm_virt_to_phys((void *)(usize)va) != 0) ? 1 : 0;
+      }
+      if (syscall_copyout(uvec + done, batch, n) < 0) return (u64)-EFAULT;
+      done += n;
+    }
+    return 0;
+  }
   case SYS_SIGALTSTACK:
     return (u64)sys_sigaltstack((const void *)(usize)arg0,
                                 (void *)(usize)arg1);

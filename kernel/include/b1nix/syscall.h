@@ -196,6 +196,7 @@ enum {
 	 * which is the fallback LLVM/glibc use when this call is unsupported. */
 	SYS_RT_TGSIGQUEUEINFO = 162,
 	SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
+	SYS_MINCORE         = 164,  /* page residency bitmap (Chromium memory-dump) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
