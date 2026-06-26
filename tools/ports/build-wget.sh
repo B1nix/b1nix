@@ -145,6 +145,7 @@ fi
   "$SRC_DIR/configure" \
     --host="$HOST_TRIPLET" \
     --build="$BUILD_TRIPLET" \
+    --disable-maintainer-mode \
     --disable-shared --enable-static \
     --with-ssl=openssl \
     --with-zlib \
@@ -157,6 +158,8 @@ fi
     CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
     CPPFLAGS="-I$ZLIB_PREFIX/include" LDFLAGS="-L$ZLIB_PREFIX/lib" \
     gl_cv_func_getpass_good=yes \
+    gl_cv_func_working_mktime=yes \
+    ac_cv_func_timegm=yes \
     PCRE2_CFLAGS="-I$PCRE2_PREFIX/include" \
     PCRE2_LIBS="-L$PCRE2_PREFIX/lib -lpcre2-8" \
     OPENSSL_CFLAGS="-I$OPENSSL_PREFIX/include" \
@@ -174,5 +177,16 @@ fi
 # both implementations are correct — the same way build-bash.sh does.
 export B1NIX_LD_EXTRA="--allow-multiple-definition"
 
-make -C "$BUILD_DIR/lib" -j"${JOBS:-4}"
-make -C "$BUILD_DIR/src" -j"${JOBS:-4}" wget
+# wget bundles gnulib, whose generated Makefiles carry unconditional rebuild
+# rules for aclocal.m4/configure/Makefile.in (not gated by maintainer-mode).
+# When the extracted source tree's timestamps are skewed (e.g. a re-used tree or
+# applied patches), make tries to regenerate them with aclocal-1.16/automake,
+# which are not installed on the build host (-> "aclocal-1.16: command not
+# found", Error 127). The tarball already ships the generated files, so neutralise
+# those rules by pointing the autotools at `true`: the recipes become no-ops and
+# the prebuilt configure/Makefile machinery is used as-is.
+AUTOTOOLS_NOREGEN="ACLOCAL=true AUTOCONF=true AUTOHEADER=true AUTOMAKE=true MAKEINFO=true"
+# shellcheck disable=SC2086
+make -C "$BUILD_DIR/lib" -j"${JOBS:-4}" $AUTOTOOLS_NOREGEN
+# shellcheck disable=SC2086
+make -C "$BUILD_DIR/src" -j"${JOBS:-4}" $AUTOTOOLS_NOREGEN wget

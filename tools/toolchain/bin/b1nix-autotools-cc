@@ -30,9 +30,12 @@ LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 # symbols (COPY relocs for stdout/stderr/errno, JUMP_SLOTs for the functions),
 # while the port's own objects and any bundled static archives stay statically
 # linked at the fixed 0x2000000 base (non-PIE, so no -fPIC needed). Library
-# (compile-only / -c) invocations are unaffected — only the link step changes.
-# Default stays `static` so unconverted ports are byte-for-byte unchanged.
-B1NIX_LINK="${B1NIX_LINK:-static}"
+# (compile-only / -c) invocations are unaffected — only the executable link step
+# changes, so the .a-producing ports (mbedtls, pcre2, libidn2, ...) stay
+# byte-for-byte identical; only the four executable ports (bash, curl, dropbear,
+# wget) flip. Dynamic is the default (the whole default-ISO port set links against
+# the shared libc.so.1); set B1NIX_LINK=static to force the historical static link.
+B1NIX_LINK="${B1NIX_LINK:-dynamic}"
 
 if [ "$B1NIX_LINK" = "dynamic" ]; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
