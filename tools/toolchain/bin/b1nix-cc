@@ -22,6 +22,10 @@ LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
 CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
 LINKER="$USR/linker.ld"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+CLANG=clang
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+	CLANG="ccache clang"
+fi
 
 [ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$LIB" "$CRT0"; }
 
@@ -49,7 +53,8 @@ fi
 OBJS=""
 for src in $SOURCES; do
 	obj="${src%.c}.o"
-	clang --target="$TARGET" $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector \
+	# shellcheck disable=SC2086
+	$CLANG --target="$TARGET" $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector \
 		-nostdinc -isystem "$INCLUDE" -I "$INCLUDE" $RES_INC -Wall -O2 -msoft-float -mno-implicit-float -Db1nix $FLAGS -c "$src" -o "$obj"
 	OBJS="$OBJS $obj"
 done

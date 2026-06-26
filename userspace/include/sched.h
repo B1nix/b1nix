@@ -61,12 +61,14 @@ static inline int CPU_COUNT(const cpu_set_t *set) {
  * Added for the Chromium port (M60-62): base/system reads CPU affinity via the
  * dynamic interface. The size-parameterized macros operate on a flat array of
  * unsigned long words covering `setsize` bytes. */
+#ifndef inhibit_libc
 #include <stdlib.h>
 
 #define CPU_ALLOC_SIZE(count) \
   ((size_t)((((count) + __NCPUBITS - 1) / __NCPUBITS) * sizeof(unsigned long)))
 #define CPU_ALLOC(count)      ((cpu_set_t *)calloc(1, CPU_ALLOC_SIZE(count)))
 #define CPU_FREE(set)         free(set)
+#endif
 
 #define CPU_ZERO_S(setsize, set) \
   do { \

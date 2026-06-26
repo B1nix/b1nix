@@ -13,6 +13,10 @@
 # `set --` (a naive string accumulation would mangle quoted -D"..." defines).
 set -u
 real="${B1NIX_BUILD_REAL:-gcc}"
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+  set -- "$real" "$@"
+  real=ccache
+fi
 n=$#
 skip=0
 while [ "$n" -gt 0 ]; do

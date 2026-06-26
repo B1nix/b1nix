@@ -40,7 +40,7 @@ public:
   litehtml::uint_ptr create_font(const litehtml::font_description &descr,
                                  const litehtml::document *,
                                  litehtml::font_metrics *fm) override {
-    pixel_t sz = descr.size > 0 ? descr.size : 16;
+    pixel_t sz = (float)descr.size > 0.0f ? descr.size : pixel_t(16.0f);
     if (fm) {
       fm->font_size = sz;
       fm->height = sz * 1.2f;
@@ -50,15 +50,15 @@ public:
       fm->ch_width = sz * 0.5f;
       fm->draw_spaces = false;
     }
-    return (litehtml::uint_ptr)(long)(sz + 0.5f);
+    return (litehtml::uint_ptr)(long)(float)(sz + 0.5f);
   }
   void delete_font(litehtml::uint_ptr) override {}
   pixel_t text_width(const char *text, litehtml::uint_ptr hFont) override {
-    return (pixel_t)std::strlen(text) * ((pixel_t)hFont * 0.5f);
+    return pixel_t((float)std::strlen(text)) * (pixel_t((float)(long)hFont) * 0.5f);
   }
   void draw_text(litehtml::uint_ptr, const char *text, litehtml::uint_ptr hFont,
                  litehtml::web_color, const litehtml::position &pos) override {
-    drawn.push_back({std::string(text), (pixel_t)hFont, pos.y});
+    drawn.push_back({std::string(text), pixel_t((float)(long)hFont), pos.y});
   }
   pixel_t pt_to_px(float pt) const override { return pt * 4.0f / 3.0f; }
   pixel_t get_default_font_size() const override { return 16; }
@@ -107,15 +107,15 @@ public:
   void on_anchor_click(const char *, const litehtml::element::ptr &) override {}
   void on_mouse_event(const litehtml::element::ptr &, litehtml::mouse_event) override {}
   void set_cursor(const char *) override {}
-  void transform_text(litehtml::string &, litehtml::text_transform) override {}
-  void import_css(litehtml::string &, const litehtml::string &, litehtml::string &) override {}
+  void transform_text(std::string &, litehtml::text_transform) override {}
+  void import_css(std::string &, const std::string &, std::string &) override {}
   void set_clip(const litehtml::position &, const litehtml::border_radiuses &) override {}
   void del_clip() override {}
   litehtml::element::ptr create_element(const char *, const litehtml::string_map &,
                                         const std::shared_ptr<litehtml::document> &) override {
     return nullptr;
   }
-  void get_language(litehtml::string &language, litehtml::string &culture) const override {
+  void get_language(std::string &language, std::string &culture) const override {
     language = "en";
     culture = "";
   }
@@ -142,7 +142,7 @@ int main() {
   mark("M55-LITEHTML: ok parse\n");
 
   pixel_t height = doc->render(container.viewport_w);
-  if (!(height > 0)) {
+  if (!((float)height > 0.0f)) {
     mark("M55-LITEHTML: fail layout\n");
     return 1;
   }
@@ -165,9 +165,9 @@ int main() {
     return 1;
   }
   /* CSS cascade applied: h1 is 32px, p is 16px. */
-  if (!(title->font_size > para->font_size) ||
-      std::fabs(title->font_size - 32) > 1.0f ||
-      std::fabs(para->font_size - 16) > 1.0f) {
+  if (!((float)title->font_size > (float)para->font_size) ||
+      std::fabs((float)title->font_size - 32.0f) > 1.0f ||
+      std::fabs((float)para->font_size - 16.0f) > 1.0f) {
     mark("M55-LITEHTML: fail draw (cascade)\n");
     return 1;
   }

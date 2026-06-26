@@ -23,6 +23,7 @@ LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.l
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 HOST_CC  ?= cc
 B1NIX_CXX ?= ../tools/toolchain/bin/b1nix-c++
+LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
 # headers from the generated .d files. With -MMD, editing a header in
@@ -234,6 +235,9 @@ $(GUI_LIB): $(GUI_OBJS)
 # library exports the math funcs (log1p/cosh/tan/...) too. Dynamic consumers
 # (e.g. the rust libLLVM.so / librustc_driver.so built against the shared libc)
 # then import math from libc.so.1 instead of statically folding openlibm.
+$(LIBM_DIR)/lib/libm.a: ../tools/ports/build-openlibm.sh
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-openlibm.sh >/dev/null
+
 $(SHARED_LIBC): $(PIC_LIBC_OBJS) linker_shared.ld $(LIBM_DIR)/lib/libm.a
 	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=sysv -soname libc.so.1 \
 		-T linker_shared.ld -o $@ $(PIC_LIBC_OBJS) \
@@ -343,7 +347,6 @@ $(BUILD)/bin/js: bin/js.c $(BUILD)/duktape/duktape.o $(LIB) $(CRT0) $(LINKER)
 	  $(BESPOKE_LIBC)
 
 # M51: m51_smoke links the ported static libm (openlibm).
-LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install
 $(BUILD)/bin/m51_smoke: bin/m51_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(LIBM_DIR)/include -c $< -o $(BUILD)/bin/m51_smoke.o

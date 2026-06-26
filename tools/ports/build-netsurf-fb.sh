@@ -54,6 +54,8 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 if [ "$B1NIX_ARCH" = "x86" ]; then NSC_TARGET="i686-unknown-elf"; else NSC_TARGET="x86_64-unknown-elf"; fi
+CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
+AR="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
 mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$PKGDIR"
 
@@ -145,7 +147,7 @@ if [ -n "$OLM_SRC" ]; then
     -O2 -Db1nix -I$OLM_SRC -I${OLM_SRC}src -I${OLM_SRC}include -I${OLM_SRC}$OLM_ARCH -I${OLM_SRC}bsdsrc"
   for k in k_exp k_expf; do
     # shellcheck disable=SC2086
-    clang $OLM_CFLAGS -c "${OLM_SRC}src/$k.c" -o "$SYSROOT/lib/olm_$k.o"
+    $CC $OLM_CFLAGS -c "${OLM_SRC}src/$k.c" -o "$SYSROOT/lib/olm_$k.o"
   done
   "${AR:-llvm-ar}" r "$SYSROOT/lib/libm.a" "$SYSROOT/lib/olm_k_exp.o" "$SYSROOT/lib/olm_k_expf.o" 2>/dev/null
 fi
@@ -185,7 +187,7 @@ double cimag(double _Complex z) { return __imag__ z; }
 float crealf(float _Complex z) { return __real__ z; }
 float cimagf(float _Complex z) { return __imag__ z; }
 EOF
-clang --target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector \
+$CC --target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector \
   -nostdinc -isystem "$ROOT_DIR/userspace/include" -I"$ROOT_DIR/userspace/include" \
   -O2 -Db1nix -c "$COMPAT_C" -o "$SYSROOT/lib/nscompat.o"
 "${AR:-llvm-ar}" rcs "$SYSROOT/lib/libb1nixcompat.a" "$SYSROOT/lib/nscompat.o"
@@ -738,7 +740,11 @@ fi
 # source-full bundle into the sysroot and prepend $SYSROOT/bin to PATH.
 NSALL_DIR="$SRC_PARENT/netsurf-all-${NS_VERSION}"
 if [ ! -x "$SYSROOT/bin/nsgenbind" ] && [ -d "$NSALL_DIR/nsgenbind" ]; then
-  make -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
+  PATH_WITH_BISON="$PATH"
+  if [ -d "/opt/homebrew/opt/bison/bin" ]; then
+    PATH_WITH_BISON="/opt/homebrew/opt/bison/bin:$PATH_WITH_BISON"
+  fi
+  PATH="$PATH_WITH_BISON" make -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
     NSSHARED="$NSALL_DIR/buildsystem" install 1>&2
 fi
 export PATH="$SYSROOT/bin:$PATH"
@@ -754,12 +760,26 @@ export GCCSDK_INSTALL_CROSSBIN="$CROSSBIN"
 export PKG_CONFIG_LIBDIR="$PKGDIR"
 export PKG_CONFIG_PATH="$PKGDIR"
 
+HOST_LIBPNG_CFLAGS=""
+HOST_LIBPNG_LDFLAGS=""
+if [ "$(uname -s)" = "Darwin" ]; then
+  if PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --exists libpng; then
+    HOST_LIBPNG_CFLAGS="$(PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --cflags libpng)"
+    HOST_LIBPNG_LDFLAGS="$(PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --libs libpng)"
+  else
+    HOST_LIBPNG_CFLAGS="-I/opt/homebrew/opt/libpng/include"
+    HOST_LIBPNG_LDFLAGS="-L/opt/homebrew/opt/libpng/lib -lpng"
+  fi
+fi
+
 # HOST only names NetSurf's per-build OBJROOT (build/$(HOST)-$(TARGET)); the
 # actual target compiler comes from GCCSDK_INSTALL_CROSSBIN. Key it by arch so
 # the x86 and x86_64 builds don't share (and overwrite) each other's objects.
 make -C "$SRC_DIR" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \
+  BUILD_LIBPNG_CFLAGS="$HOST_LIBPNG_CFLAGS" \
+  BUILD_LIBPNG_LDFLAGS="$HOST_LIBPNG_LDFLAGS" \
   NETSURF_FB_FONTLIB=internal \
   NETSURF_USE_CURL="$([ "$HAVE_CURL" = yes ] && echo YES || echo NO)" \
   NETSURF_USE_OPENSSL=NO \

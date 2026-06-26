@@ -43,6 +43,12 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
+ccache_prefix() {
+    if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+        printf 'ccache '
+    fi
+}
+
 # ── Shared source tree + per-triplet build/output directories ───────────────
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
@@ -70,7 +76,7 @@ fi
 export PATH="$CROSS_PREFIX/bin:$PATH"
 export ac_cv_c_bigendian=no
 
-CC_VAL="${TARGET}-gcc"
+CC_VAL="$(ccache_prefix)${TARGET}-gcc"
 AR_VAL="${TARGET}-ar"
 RANLIB_VAL="${TARGET}-ranlib"
 # -fcommon: GNU Make 3.82 has tentative definitions (e.g. `stack_limit`) in

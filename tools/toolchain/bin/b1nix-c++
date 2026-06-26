@@ -33,6 +33,13 @@ LIBGCC="$("$GXX" -print-libgcc-file-name)"
 
 CXXFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix"
 CXX="$GXX"
+run_cxx() {
+  if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+    ccache "$CXX" "$@"
+  else
+    "$CXX" "$@"
+  fi
+}
 if [ "${B1NIX_CXX_FRONTEND:-gcc}" = clang ]; then
   CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++)}"
   VER="$($GXX -dumpversion)"
@@ -57,7 +64,9 @@ done
 
 # shellcheck disable=SC2086
 if [ "$compile_only" -eq 1 ]; then
-  exec "$CXX" $CXXFLAGS $passthru -c $inputs -o "$output"
+  # shellcheck disable=SC2086
+  run_cxx $CXXFLAGS $passthru -c $inputs -o "$output"
+  exit $?
 fi
 
 objs=""
@@ -65,7 +74,7 @@ tmp="${TMPDIR:-/tmp}/b1nix-cxx.$$"; mkdir -p "$tmp"
 for in in $inputs; do
   case "$in" in
     *.o|*.a) objs="$objs $in" ;;
-    *) o="$tmp/$(basename "$in").o"; "$CXX" $CXXFLAGS $passthru -c "$in" -o "$o"; objs="$objs $o" ;;
+    *) o="$tmp/$(basename "$in").o"; run_cxx $CXXFLAGS $passthru -c "$in" -o "$o"; objs="$objs $o" ;;
   esac
 done
 

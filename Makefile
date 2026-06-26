@@ -653,9 +653,15 @@ $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSP
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m55_iostream_elf userspace/build/$(ARCH)/bin/m55_iostream > $@
 
+# Serialize the Mesa build to prevent race conditions during parallel builds.
+$(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(USERSPACE_DEPS)
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
+	@touch $@
+
 # M52: real Mesa OSMesa (software OpenGL) demo. The shared demo builder builds
 # the whole Mesa stack (build-mesa.sh) and links the demo against it.
-$(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/build-m52-mesa-demo.sh tools/ports/build-mesa.sh $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa userspace/build/$(ARCH)/bin/m52_osmesa
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
@@ -663,14 +669,14 @@ $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/bu
 # M53 variant B: Mesa's gallium virgl driver renders on the host GPU through the
 # b1nix /dev/virtio-gpu winsys. tools/demos/build-m53-mesa-virgl.sh builds the Mesa
 # stack (with the virgl driver) and links the pipe-API render test against it.
-$(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/demos/build-m53-mesa-virgl.sh tools/ports/build-mesa.sh $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/demos/build-m53-mesa-virgl.sh $(BUILD_DIR)/.mesa-built $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_mesa_virgl_elf userspace/build/$(ARCH)/bin/m53_mesa_virgl > $@
 
 # M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
 # demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
-$(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-m52-mesa-demo.sh tools/ports/build-mesa.sh $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl userspace/build/$(ARCH)/bin/m52_glsl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
@@ -679,7 +685,7 @@ $(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-
 # the OSMesa-backed EGL implementation (userspace/libegl/b1egl_mesa.c) together
 # with the off-screen pbuffer smoke and links them against the same Mesa stack
 # as the M52 OSMesa demo. The smoke renders entirely off-screen (no displayd).
-$(BUILD_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/demos/build-m59-egl.sh tools/ports/build-mesa.sh $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/demos/build-m59-egl.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_ARCH=$(ARCH) tools/demos/build-m59-egl.sh userspace/build/$(ARCH)/bin/m59_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m59_smoke_elf userspace/build/$(ARCH)/bin/m59_smoke > $@

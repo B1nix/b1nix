@@ -25,6 +25,12 @@ else
     SED_INPLACE() { sed -i "$@"; }
 fi
 
+ccache_prefix() {
+    if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+        printf 'ccache '
+    fi
+}
+
 # ── Shared source tree + per-triplet build/output directories ────────────────
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 
@@ -52,8 +58,8 @@ export ac_cv_func_tmpnam=yes
 export ac_cv_header_fcntl_h=yes
 export ac_cv_header_sys_resource_h=yes
 
-CC_VAL="${TARGET}-gcc"
-CXX_VAL="${TARGET}-g++"
+CC_VAL="$(ccache_prefix)${TARGET}-gcc"
+CXX_VAL="$(ccache_prefix)${TARGET}-g++"
 AR_VAL="${TARGET}-ar"
 RANLIB_VAL="${TARGET}-ranlib"
 CFLAGS_VAL="--sysroot=$SYSROOT -isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000 -Wl,--allow-multiple-definition"

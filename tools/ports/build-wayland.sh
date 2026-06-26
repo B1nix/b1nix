@@ -8,6 +8,7 @@ WAYLAND_VERSION="${WAYLAND_VERSION:-1.25.0}"
 WAYLAND_TARBALL="wayland-${WAYLAND_VERSION}.tar.xz"
 WAYLAND_URL="https://gitlab.freedesktop.org/wayland/wayland/-/releases/${WAYLAND_VERSION}/downloads/${WAYLAND_TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 SRC_PARENT="$ROOT_DIR/build/wayland-src"
@@ -86,7 +87,7 @@ compile()
 {
   src="$1"
   obj="$2"
-  clang $CC_FLAGS -c "$src" -o "$obj"
+  $CC $CC_FLAGS -c "$src" -o "$obj"
 }
 
 compile "$SRC_DIR/src/wayland-client.c" "$BUILD_DIR/obj/wayland-client.o"
@@ -99,7 +100,7 @@ compile_server()
 {
   src="$1"
   obj="$2"
-  clang $SERVER_FLAGS -c "$src" -o "$obj"
+  $CC $SERVER_FLAGS -c "$src" -o "$obj"
 }
 
 compile_server "$SRC_DIR/src/wayland-server.c" "$BUILD_DIR/obj/wayland-server.o"

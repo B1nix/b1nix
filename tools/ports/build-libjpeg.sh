@@ -14,6 +14,7 @@ JPEG_VERSION="${JPEG_VERSION:-9f}"
 TARBALL="jpegsrc.v${JPEG_VERSION}.tar.gz"
 URL="https://www.ijg.org/files/jpegsrc.v${JPEG_VERSION}.tar.gz"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
@@ -72,7 +73,7 @@ OBJS=""
 for base in $LIB; do
   obj="$OBJ_DIR/$base.o"
   # shellcheck disable=SC2086
-  clang $CFLAGS -c "$SRC_DIR/$base.c" -o "$obj"
+  $CC $CFLAGS -c "$SRC_DIR/$base.c" -o "$obj"
   OBJS="$OBJS $obj"
 done
 

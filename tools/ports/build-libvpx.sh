@@ -15,6 +15,7 @@ VPX_VERSION="${VPX_VERSION:-1.14.1}"
 TARBALL="libvpx-${VPX_VERSION}.tar.gz"
 URL="https://github.com/webmproject/libvpx/archive/refs/tags/v${VPX_VERSION}.tar.gz"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
@@ -83,7 +84,7 @@ OBJS=""
 for rel in $SRCS; do
   obj="$OBJ_DIR/$(echo "$rel" | tr / _).o"
   # shellcheck disable=SC2086
-  clang $CFLAGS -c "$SRC_DIR/$rel.c" -o "$obj"
+  $CC $CFLAGS -c "$SRC_DIR/$rel.c" -o "$obj"
   OBJS="$OBJS $obj"
 done
 for rel in $GEN_SRCS; do
@@ -91,7 +92,7 @@ for rel in $GEN_SRCS; do
   src="$CFG_DIR/$rel.c"
   [ -f "$src" ] || src="$SRC_DIR/$rel.c"
   # shellcheck disable=SC2086
-  clang $CFLAGS -c "$src" -o "$obj"
+  $CC $CFLAGS -c "$src" -o "$obj"
   OBJS="$OBJS $obj"
 done
 

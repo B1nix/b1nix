@@ -23,17 +23,26 @@ GCC_URL="https://ftp.gnu.org/gnu/gcc/gcc-${GCC_VER}/gcc-${GCC_VER}.tar.xz"
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then
     NPROC=$(sysctl -n hw.ncpu)
-    BREW_PREFIX="$(brew --prefix 2>/dev/null || echo /opt/homebrew)"
-    GMP_FLAG="--with-gmp=$BREW_PREFIX"
-    MPFR_FLAG="--with-mpfr=$BREW_PREFIX"
-    MPC_FLAG="--with-mpc=$BREW_PREFIX"
     SED_INPLACE() { sed -i '' "$@"; }
 else
     NPROC=$(nproc)
-    GMP_FLAG=""
-    MPFR_FLAG=""
-    MPC_FLAG=""
     SED_INPLACE() { sed -i "$@"; }
+fi
+
+GMP_FLAG=""
+MPFR_FLAG=""
+MPC_FLAG=""
+ISL_FLAG="--with-isl"
+
+CCACHE_PREFIX=()
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+    CCACHE_PREFIX=(ccache)
+fi
+CC_FOR_BUILD_VAL="${CC_FOR_BUILD:-cc}"
+CXX_FOR_BUILD_VAL="${CXX_FOR_BUILD:-c++}"
+if [ "${#CCACHE_PREFIX[@]}" -gt 0 ]; then
+    CC_FOR_BUILD_VAL="ccache $CC_FOR_BUILD_VAL"
+    CXX_FOR_BUILD_VAL="ccache $CXX_FOR_BUILD_VAL"
 fi
 
 # ── Shared source tree + per-triplet build/output directories ────────────────
@@ -102,6 +111,12 @@ if [ ! -d "gcc-${GCC_VER}" ]; then
     cd ..
 fi
 
+# Download GCC prerequisites (GMP, MPFR, MPC, ISL) in-tree.
+if [ -d "gcc-${GCC_VER}" ] && [ ! -d "gcc-${GCC_VER}/gmp" ]; then
+    echo "Downloading GCC prerequisites (GMP, MPFR, MPC, ISL)..."
+    (cd "gcc-${GCC_VER}" && ./contrib/download_prerequisites)
+fi
+
 # ── 4. Build cross-binutils ───────────────────────────────────────────────────
 cd "$WORK_DIR"
 if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
@@ -110,6 +125,8 @@ if [ ! -f "$PREFIX/bin/${TARGET}-ld" ]; then
     mkdir -p build-binutils
     cd build-binutils
     "$SRC_DIR/binutils-${BINUTILS_VER}/configure" \
+        CC="$CC_FOR_BUILD_VAL" \
+        CXX="$CXX_FOR_BUILD_VAL" \
         --target="$TARGET" \
         --prefix="$PREFIX" \
         --with-sysroot="$SYSROOT" \
@@ -166,8 +183,14 @@ fi
 # run so header fixes always reach the compiler.
 for _incdst in "$PREFIX/$TARGET/include" "$SYSROOT/usr/include" "$SYSROOT/include"; do
     [ -d "$_incdst" ] || mkdir -p "$_incdst" 2>/dev/null || continue
-    cp -f "$PROJECT_DIR/userspace/include/"*.h "$_incdst/" 2>/dev/null || true
-    cp -rf "$PROJECT_DIR/userspace/include/"*/ "$_incdst/" 2>/dev/null || true
+    (
+        cd "$PROJECT_DIR/userspace/include"
+        find . -type f
+    ) | while IFS= read -r _hdr; do
+        _hdr=${_hdr#./}
+        mkdir -p "$_incdst/$(dirname "$_hdr")"
+        cp -f "$PROJECT_DIR/userspace/include/$_hdr" "$_incdst/$_hdr"
+    done
 done
 
 # Empty stub archives for libs that b1nix folds into libc (pthread/rt/dl are all
@@ -187,12 +210,15 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
     mkdir -p build-gcc
     cd build-gcc
     "$SRC_DIR/gcc-${GCC_VER}/configure" \
+        CC="$CC_FOR_BUILD_VAL" \
+        CXX="$CXX_FOR_BUILD_VAL" \
+        CC_FOR_BUILD="$CC_FOR_BUILD_VAL" \
+        CXX_FOR_BUILD="$CXX_FOR_BUILD_VAL" \
         --target="$TARGET" \
         --prefix="$PREFIX" \
         --with-sysroot="$SYSROOT" \
         --disable-nls \
         --enable-languages=c,c++ \
-        --without-headers \
         --enable-shared \
         --disable-multilib \
         --enable-threads=posix \
@@ -202,7 +228,7 @@ if [ ! -f "$PREFIX/bin/${TARGET}-gcc" ]; then
         --disable-libquadmath \
         --with-newlib \
         --with-system-zlib \
-        --with-isl \
+        ${ISL_FLAG:+"$ISL_FLAG"} \
         ${GMP_FLAG:+"$GMP_FLAG"} \
         ${MPFR_FLAG:+"$MPFR_FLAG"} \
         ${MPC_FLAG:+"$MPC_FLAG"} \
@@ -217,7 +243,8 @@ fi
 # strtold/_Exit), which breaks libstdc++ <cstdlib> (`using ::strtold;`) for any
 # C++ port (LLVM/rustc). b1nix headers are ours and complete — drop the bogus
 # shadow so the real header is used.
-rm -f "$PREFIX"/lib/gcc/"$TARGET"/*/include-fixed/stdlib.h 2>/dev/null || true
+rm -f "$PREFIX"/lib/gcc/"$TARGET"/*/include-fixed/stdlib.h \
+      "$WORK_DIR"/build-gcc/gcc/include-fixed/stdlib.h 2>/dev/null || true
 
 # ── 6. Build target C++ standard library ──────────────────────────────────────
 # The native GCC port (tools/toolchain/build-native-toolchain.sh) cross-compiles GCC's own
@@ -242,12 +269,15 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
         mkdir -p build-gcc
         cd build-gcc
         "$SRC_DIR/gcc-${GCC_VER}/configure" \
+            CC="$CC_FOR_BUILD_VAL" \
+            CXX="$CXX_FOR_BUILD_VAL" \
+            CC_FOR_BUILD="$CC_FOR_BUILD_VAL" \
+            CXX_FOR_BUILD="$CXX_FOR_BUILD_VAL" \
             --target="$TARGET" \
             --prefix="$PREFIX" \
             --with-sysroot="$SYSROOT" \
             --disable-nls \
             --enable-languages=c,c++ \
-            --without-headers \
             --enable-shared \
             --disable-multilib \
             --enable-threads=posix \
@@ -257,7 +287,7 @@ if [ ! -f "$PREFIX/$TARGET/lib/libstdc++.a" ]; then
             --disable-libquadmath \
             --with-newlib \
             --with-system-zlib \
-            --with-isl \
+            ${ISL_FLAG:+"$ISL_FLAG"} \
             ${GMP_FLAG:+"$GMP_FLAG"} \
             ${MPFR_FLAG:+"$MPFR_FLAG"} \
             ${MPC_FLAG:+"$MPC_FLAG"} \

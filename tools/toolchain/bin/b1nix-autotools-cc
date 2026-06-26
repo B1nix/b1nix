@@ -23,6 +23,10 @@ SHARED_LIBC="$USR/build/$B1NIX_ARCH/libc.so.1"
 DYNAMIC_CRT0="$USR/build/$B1NIX_ARCH/crt/crt0-dynamic.o"
 LINKER="$USR/linker.ld"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+CLANG=clang
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+	CLANG="ccache clang"
+fi
 
 # Link model. B1NIX_LINK=dynamic links the final executable DYNAMICALLY against
 # the shared libc.so.1 via the in-kernel loader (interpreter /lib/ld-b1nix.so):
@@ -100,18 +104,21 @@ while [ $# -gt 0 ]; do
 done
 
 if [ "$preprocess_only" -eq 1 ]; then
-  exec clang $COMMON_FLAGS $args $inputs ${output:+-o "$output"}
+  # shellcheck disable=SC2086
+  exec $CLANG $COMMON_FLAGS $args $inputs ${output:+-o "$output"}
 fi
 
 if [ "$compile_only" -eq 1 ]; then
-  exec clang $COMMON_FLAGS $args -c $inputs ${output:+-o "$output"}
+  # shellcheck disable=SC2086
+  exec $CLANG $COMMON_FLAGS $args -c $inputs ${output:+-o "$output"}
 fi
 
 # Version/info probes (e.g. `CC --version`, `-dumpmachine`) carry no input
 # files. Forward them straight to clang instead of trying to link crt0.o,
 # which would fail with "undefined symbol: main" and confuse configure.
 if [ -z "$inputs" ]; then
-  exec clang $COMMON_FLAGS $args ${output:+-o "$output"}
+  # shellcheck disable=SC2086
+  exec $CLANG $COMMON_FLAGS $args ${output:+-o "$output"}
 fi
 
 objs=""
@@ -126,7 +133,8 @@ for input in $inputs; do
       obj="$tmpdir/$(basename "$input").o"
       extra=""
       case "$input" in *.c) extra="$C_ONLY_FLAGS";; esac
-      clang $COMMON_FLAGS $extra $args -c "$input" -o "$obj"
+      # shellcheck disable=SC2086
+      $CLANG $COMMON_FLAGS $extra $args -c "$input" -o "$obj"
       objs="$objs $obj"
       ;;
   esac

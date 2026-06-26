@@ -170,21 +170,32 @@ fi
 ( cd "$MESON_BUILD" && ninja -k 0 1>&2 ) || true
 
 # Repack thin archives into relocatable thick archives in install/lib.
-rm -f "$INSTALL_DIR"/lib/*.a
+# Avoid unconditional rm -f to prevent race conditions when parallel demo builds
+# try to link against these archives while another instance is repacking them.
 ( cd "$MESON_BUILD"
   for a in $(find . -name "*.a"); do
     name="$(basename "$a")"
-    if [ "$(head -c 7 "$a")" = "!<thin>" ]; then
-      # shellcheck disable=SC2046
-      "$AR_BIN" crs "$INSTALL_DIR/lib/$name" $("$AR_BIN" t "$a")
-    else
-      cp "$a" "$INSTALL_DIR/lib/$name"
+    target="$INSTALL_DIR/lib/$name"
+    if [ ! -f "$target" ] || [ "$a" -nt "$target" ]; then
+      if [ "$(head -c 7 "$a")" = "!<thin>" ]; then
+        rm -f "$target"
+        # shellcheck disable=SC2046
+        "$AR_BIN" crs "$target" $("$AR_BIN" t "$a")
+      else
+        cp "$a" "$target"
+      fi
     fi
   done )
 
 # The osmesa target glue (osmesa_create_screen): only built as part of the .so.
-cp "$MESON_BUILD"/src/gallium/targets/osmesa/libOSMesa.so.*.p/target.c.o \
-  "$INSTALL_DIR/lib/osmesa_target.o"
+for src_obj in "$MESON_BUILD"/src/gallium/targets/osmesa/libOSMesa.so.*.p/target.c.o; do
+  if [ -f "$src_obj" ]; then
+    target_obj="$INSTALL_DIR/lib/osmesa_target.o"
+    if [ ! -f "$target_obj" ] || [ "$src_obj" -nt "$target_obj" ]; then
+      cp "$src_obj" "$target_obj"
+    fi
+  fi
+done
 
 cp -R "$SRC_DIR/include/GL" "$SRC_DIR/include/KHR" "$INSTALL_DIR/include/" 2>/dev/null || true
 
