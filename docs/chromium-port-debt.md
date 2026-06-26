@@ -208,26 +208,30 @@ currently blocked (Chromium compile occupies the machine; kernel/ISO build needs
   /etc/resolv.conf (no `search`/`options`); display/parse-only. b1nix resolves
   via `SYS_NET_DNS`, so this is enough.
 
-## Link phase (the current frontier)
+## Link phase (Option A IMPLEMENTED — exe WIP)
 
-- **b1nix gn toolchain can't link** 🔴 — `link`/`solink` (command bodies live in
-  the *shared* `build/toolchain/gcc_toolchain.gni`, driven by `ld = cxx` in
-  `build/toolchain/b1nix/BUILD.gn`) run `clang++` with no `--target`/sysroot →
-  host glibc → `errno` TLS-vs-non-TLS mismatch against `/usr/lib/libc.so.6`.
-  - *Unblock (crutch, in use):* `tools/v8/chromium-link.sh` relinks off gn's
-    `.rsp`s with the b1nix recipe (crt0 + linker-cxx.ld + lib group + whole-
-    archived libb1nix; `-shared`+libc.so.1 for `.so`s). A standalone post-build
-    step — proves the recipe end-to-end with zero gn-regen risk.
-  - *Proper close (post-Chromium debt sweep):* Option A — set `ld =` a small
-    b1nix linker-driver shim in `b1nix/BUILD.gn` (one line; touches only
-    link/solink, NOT `cxx`, so it does **not** recompile the 16k objects —
-    confirmed). Then `ninja content_shell` links natively and
-    **`chromium-link.sh` is deleted**. Do this only after the script proves the
-    recipe — integrating an unproven recipe into gn is harder to debug.
-- **b1nix-target `.so`s** 🔴 — SwiftShader Vulkan ICD + ANGLE EGL/GLESv2 are
-  loadable `.so`s; need real b1nix shared-object linking (PIE + ld-b1nix.so), or
-  static-ize/disable them. b1nix supports `.so` (M30 PIE, ld-b1nix.so) but no
-  `.so` has been built *by gn* before.
+- **gn link via b1nix-ELF shim** 🟡 — root cause was `ld = cxx` (host clang++ →
+  `/usr/lib/libc.so.6` → `errno` TLS-vs-non-TLS mismatch). **Closed by Option A,
+  not the crutch:** `tools/v8/b1nix-gn-link.sh` is now the gn linker (Patch C48
+  sets `ld =` it + `enable_linker_map=false`). It re-issues link/solink with the
+  cross `ld` + crt0 + b1nix linker scripts + whole-archived libb1nix. Touches only
+  link/solink (not `cxx`) so objects aren't recompiled.
+  - **✅ `.so` verified:** `ninja libEGL.so` → valid b1nix ELF64 DYN. `.so` recipe:
+    NOT whole-archive the non-PIC libb1nix (→ R_X86_64_32 in a shared object);
+    link PIC `libc.so.1` + `--allow-shlib-undefined` (libc/libgcc resolved at
+    dlopen into content_shell, which has all of libb1nix static).
+  - **⏳ exe link (content_shell) UNTESTED:** the shim's exe branch uses the proven
+    d8 recipe (crt0 + linker-cxx.ld + whole-archive libb1nix + rlibs + mathl), but
+    `content_shell.b1nix` hasn't been produced yet. Resume = run `ninja
+    content_shell`; first build re-triggers a ~13k recompile (host-tool timestamp
+    churn from targeted verify builds, one-time — NOT a shim issue).
+  - **`tools/v8/chromium-link.sh` is now redundant** (shim supersedes it; it was
+    also blocked — gn never writes `content_shell.rsp` because the link is gated on
+    the .so's). **Delete it once `content_shell.b1nix` links via the shim.**
+- **b1nix-target `.so`s** 🟡 — SwiftShader/ANGLE/Vulkan ICD `.so`s now LINK via the
+  shim (libEGL proven; 6 others use the same recipe). **Runtime is the open
+  unknown** (M66): whether the b1nix loader can `dlopen` these big `__thread`-heavy
+  `.so`s. Link ≠ load.
 
 ## Build-side debt
 

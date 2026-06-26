@@ -784,3 +784,19 @@ if [ -f "$F" ] && ! grep -q 'b1nix: rust_test codegen deps' "$F"; then
   grep -q 'b1nix: rust_test codegen deps' "$F" || die "Patch C47 anchor not found in $F"
   echo "Patch C47 applied: content_shell_lib rust_test deps under enable_rust"
 else echo "Patch C47 already present (or file missing)"; fi
+
+# --- Patch C48: link via the b1nix-ELF link shim (Option A) -------------------
+# gn's link/solink drive host clang++ (ld=cxx) → /usr/lib/libc.so.6 → errno TLS
+# mismatch. Point ld at tools/v8/b1nix-gn-link.sh, which re-issues the link with
+# the cross ld + crt0 + b1nix linker scripts + whole-archived libb1nix (exe) or
+# PIC libc.so.1 + --allow-shlib-undefined (.so). Compile (cc/cxx) is untouched, so
+# objects are not rebuilt. enable_linker_map=false: the shim drops -Wl,* so gn must
+# not expect a .map output. (.so verified on libEGL; content_shell exe link WIP.)
+F="$SRC/build/toolchain/b1nix/BUILD.gn"
+SHIM="$(cd "$SRC/../../.." && pwd)/tools/v8/b1nix-gn-link.sh"
+if [ -f "$F" ] && ! grep -q 'b1nix-gn-link.sh' "$F"; then
+  perl -0777 -i -pe "s~  ld = cxx\n~  ld = \"$SHIM\"\n~" "$F"
+  perl -0777 -i -pe 's~  enable_linker_map = true\n~  enable_linker_map = false\n~' "$F"
+  grep -q 'b1nix-gn-link.sh' "$F" || die "Patch C48 anchor not found in $F"
+  echo "Patch C48 applied: ld = b1nix-gn-link.sh + enable_linker_map=false"
+else echo "Patch C48 already present (or file missing)"; fi
