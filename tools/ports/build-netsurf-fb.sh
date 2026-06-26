@@ -116,6 +116,18 @@ stage build-libjxl.sh      # libjxl_dec.a (+cms/hwy/brotli) — JPEG-XL decode (
 # so do it here. Idempotent and cheap.
 make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs 1>&2
 
+# Dynamic libc for the GCCSDK raw-cross-gcc link (default): stage the shared
+# libc.so.1 into the cross-gcc's OWN sysroot lib as libc.so, so the implicit
+# `-lc` resolves to the shared library (dynamic) instead of the static
+# libb1nix.a — the same way gcc already picks up libgcc_s.so. The result is an
+# nsfb that imports libc from /lib/libc.so.1 via the in-kernel loader.
+# B1NIX_LINK=static leaves the historical static libc fold in place.
+if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libc.so.1" ]; then
+  CROSS_SYSROOT_LIB="$TOOLCHAIN_BUILD_HOME/cross/$B1NIX_TRIPLET/lib"
+  cp "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libc.so.1" "$CROSS_SYSROOT_LIB/libc.so.1"
+  ln -sf libc.so.1 "$CROSS_SYSROOT_LIB/libc.so"
+fi
+
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
 # client of the compositor. Build it and stage the archive into the sysroot.

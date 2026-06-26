@@ -1146,11 +1146,20 @@ PIE base (`0x500000000000`).
   dynamically (no absolute-reloc gap — unlike libpng) and run GPU-accelerated under the
   full smoke: `M52-GFX`, `M53-VIRGL: ok …`, `M53-GFX: ok gl-accelerated/gl-triangle`,
   `M59-SMOKE: ok egl-context/egl-render`. **x86_64 834/0.**
+- [x] `done` **NetSurf `nsfb` flipped to dynamic (v0.69.19).** nsfb links via the raw
+  cross-GCC (GCCSDK convention) and was already a dynamic executable (it imports
+  `libgcc_s.so`), but folded libc statically because gcc's implicit `-lc` resolved to
+  the static `libb1nix.a` in the cross-GCC's own sysroot — which had no `libc.so`.
+  `tools/ports/build-netsurf-fb.sh` now stages the shared `libc.so.1` into that
+  sysroot as `libc.so` (default; `B1NIX_LINK=static` skips it), so `-lc` resolves to
+  the shared library exactly like `libgcc_s.so`. nsfb now imports `libc.so.1` and
+  renders end-to-end under the full smoke: `M53-NS ok js/jxl`, `M53-FB ok
+  load/redraw/render/svg`, `M53-INPUT ok mouse/key`. **x86_64 834/0.**
 - **Still static (heavy tail):** `m53_libpng_smoke` (libpng `&longjmp` absolute reloc),
-  NetSurf (`nsfb`, GCCSDK cross-GCC link), native `rustc` (already a dynamic PIE
-  against `librustc_driver.so`/`libLLVM.so`; only the small libc is folded), and
-  Chromium (intentionally deferred — doesn't run yet). Rust proc-macros remain
-  deferred (need native rustc).
+  native `rustc` (already a dynamic PIE against `librustc_driver.so`/`libLLVM.so`; only
+  the small libc is folded — its build stages libc.a/libm.a-as-COMBINED into the cross
+  sysroot, so a clean dynamic-libc relink needs untangling that), and Chromium
+  (intentionally deferred — doesn't run yet). Rust proc-macros remain deferred.
 
 ## M70: Interrupt-Driven I/O
 
