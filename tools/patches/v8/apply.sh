@@ -230,7 +230,8 @@ else echo "Patch 17 already present/absent"; fi
 # libc++, so use_safe_libcxx is structurally false. We do NOT bypass the
 # hardening: the real libstdc++ equivalent (_GLIBCXX_ASSERTIONS, container/
 # iterator bounds checks) is enabled via the build's own `use_safe_libstdcxx`
-# arg — set use_safe_libstdcxx=true in v8-gen-jit.sh's gn args. This patch only
+# arg — set use_safe_libstdcxx=true in v8-build-run.sh's gn args (FRONTEND=gcc).
+# This patch only
 # relaxes the assert (which literally checks use_safe_libcxx, the libc++ flag)
 # for the b1nix target, since b1nix satisfies it through use_safe_libstdcxx.
 # ============================================================================

@@ -30,8 +30,9 @@ JIT pipeline (Sparkplug baseline + TurboFan optimizing). Prep + kickoff:
   the cross setup is fine for JIT too (confirmed: the JIT `ninja` builds
   `clang_x64/.../libc++` for the host mksnapshot).
 
-**Build:** `tools/v8/v8-gen-jit.sh` → a SEPARATE `out/b1nix-jit` (keeps the proven
-jitless `out/b1nix` as a fallback). Flips `v8_jitless=false` +
+**Build:** `FRONTEND=gcc tools/v8/v8-build-run.sh` (formerly the standalone
+`tools/v8/v8-gen-jit.sh`, now subsumed as the default FRONTEND profile) →
+`out/b1nix-jit-maglev`. Flips `v8_jitless=false` +
 `v8_enable_sparkplug=true v8_enable_turbofan=true` (TurboFan mandatory when not
 jitless), `v8_enable_maglev=false` + `v8_enable_webassembly=false` to keep the
 surface down. JIT compiles+links cleanly first try — the jitless port already

@@ -21,17 +21,76 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 SK="$ROOT_DIR/build/toolchain_build/v8-skeleton"
 GN="$SK/gn-src/out/gn"
 V8="$SK/v8"
-PROFILE="${PROFILE:-b1nix-jit-maglev}"
+# FRONTEND selects the compiler toolchain (and the matching default out dir).
+# These were three standalone gn-gen scripts; they are now profiles of this one
+# pipeline (the GN args produced per FRONTEND are byte-identical to what those
+# scripts produced — verify with PRINT_GN_ARGS=1):
+#   gcc          (default) b1nix cross GCC + its libstdc++ — the proven config
+#                (was tools/v8/v8-gen-jit.sh).
+#   clang        host clang frontend + GCC libstdc++, via tools/v8-clang-filter.sh
+#                (M64 clang toolchain; was tools/v8-gen-clang.sh).
+#   clang-libcxx host clang + Chromium's bundled libc++ + Temporal + cross-Rust
+#                (the Chromium-direction C++23 toolchain; was
+#                tools/v8/v8-gen-clang-libcxx.sh).
+FRONTEND="${FRONTEND:-gcc}"
+case "$FRONTEND" in
+	gcc)          DEFAULT_PROFILE="b1nix-jit-maglev" ;;
+	clang)        DEFAULT_PROFILE="b1nix-jit-clang" ;;
+	clang-libcxx) DEFAULT_PROFILE="b1nix-jit-clang-libcxx" ;;
+	*) echo "FRONTEND must be gcc|clang|clang-libcxx"; exit 1 ;;
+esac
+PROFILE="${PROFILE:-$DEFAULT_PROFILE}"
 TIER="${TIER:-turbofan}"
 OUT="$V8/out/$PROFILE"
 D8="$OUT/d8.b1nix"
 DISK="$ROOT_DIR/build/v8-out/v8-$PROFILE-ext4.img"
 SEED="$ROOT_DIR/build/v8-out/v8-jit-ext4.img"   # carries m58.js + a d8 to overwrite
 
-# Default config: the proven JIT base + Maglev (mid-tier) + external code space
-# (code cage) + the sandbox (TrustedSpace/sandboxed pointers; needs
-# use_safe_libstdcxx for the hardening assert — see tools/v8/v8-gen-jit.sh).
-GN_ARGS="${GN_ARGS:-target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true}"
+# Assemble the gn args for the selected FRONTEND. Override the whole string with
+# GN_ARGS=... . The proven base config in all three: JIT (Sparkplug + Maglev +
+# TurboFan) + external code space (code cage) + sandbox + WebAssembly + i18n;
+# pointer compression on; data embedded (icu_use_data_file=false). The sandbox's
+# libstdc++ hardening assert needs use_safe_libstdcxx (GCC/libstdc++ builds).
+v8_gn_args() {
+	case "$FRONTEND" in
+	gcc)
+		echo 'target_os="b1nix" target_cpu="x64" is_clang=false treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true'
+		;;
+	clang|clang-libcxx)
+		# clang frontend: stock host clang made to look like the b1nix cross GCC
+		# (same OS defines + codegen) so its objects relink against the same GNU
+		# runtime. The compile is routed through tools/v8-clang-filter.sh, which
+		# strips the bundled-clang-only flags //build emits.
+		CROSS="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross"
+		GXX="$CROSS/bin/x86_64-b1nix-g++"
+		CLANGXX="${B1NIX_CLANGXX:-$(command -v clang++)}"
+		CLANGCC="${B1NIX_CLANG:-$(command -v clang)}"
+		[ -x "$GXX" ] || { echo "cross g++ missing: $GXX" >&2; exit 1; }
+		[ -n "$CLANGXX" ] || { echo "clang++ not found in PATH" >&2; exit 1; }
+		RES="$("$CLANGXX" -print-resource-dir)"
+		FILTER="$ROOT_DIR/tools/v8-clang-filter.sh"
+		OSDEF="-D__b1nix__=1 -D__b1nix=1 -D__unix__=1 -D__unix=1"
+		MATCH="-mcx16 -fno-use-cxa-atexit"
+		if [ "$FRONTEND" = "clang" ]; then
+			VER="$("$GXX" -dumpversion)"
+			CXXROOT="$CROSS/x86_64-b1nix/include/c++/$VER"
+			GCCROOT="$CROSS/lib/gcc/x86_64-b1nix/$VER"
+			CPPFLAGS="--target=x86_64-b1nix $OSDEF $MATCH -nostdinc -isystem $RES/include -isystem $CXXROOT -isystem $CXXROOT/x86_64-b1nix -isystem $CXXROOT/backward -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed -isystem $CROSS/x86_64-b1nix/include"
+			echo "target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false clang_use_chrome_plugins=false b1nix_use_clang=true b1nix_clang_cc=\"$FILTER $CLANGCC\" b1nix_clang_cxx=\"$FILTER $CLANGXX\" b1nix_clang_cppflags=\"$CPPFLAGS\" treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=false use_safe_libstdcxx=true v8_enable_temporal_support=false v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true"
+		else
+			# libc++ (C++23) + Temporal + cross-Rust — the Chromium direction.
+			SYSROOT="$ROOT_DIR/build/rust-native/rust-src-full/build/x86_64-unknown-linux-gnu/stage2"
+			CPPFLAGS="--target=x86_64-b1nix $OSDEF $MATCH -D_LIBCPP_PROVIDES_DEFAULT_RUNE_TABLE -D_LIBCPP_HAS_CLOCK_GETTIME=1 -nostdinc -isystem $RES/include -isystem $CROSS/x86_64-b1nix/include"
+			echo "target_os=\"b1nix\" target_cpu=\"x64\" is_clang=false clang_use_chrome_plugins=false b1nix_use_clang=true b1nix_clang_cc=\"$FILTER $CLANGCC\" b1nix_clang_cxx=\"$FILTER $CLANGXX\" b1nix_clang_cppflags=\"$CPPFLAGS\" treat_warnings_as_errors=false v8_enable_i18n_support=true icu_use_data_file=false is_debug=false v8_jitless=false v8_use_external_startup_data=false symbol_level=0 use_custom_libcxx=true v8_enable_temporal_support=true v8_enable_sparkplug=true v8_enable_maglev=true v8_enable_turbofan=true v8_enable_webassembly=true v8_enable_sandbox=true v8_enable_pointer_compression=true v8_enable_external_code_space=true enable_rust=true rust_sysroot_absolute=\"$SYSROOT\" rustc_version=\"b1nix-rust-1.98.0-nightly-01dfd7924\""
+		fi
+		;;
+	esac
+}
+GN_ARGS="${GN_ARGS:-$(v8_gn_args)}"
+
+# PRINT_GN_ARGS=1: print the resolved gn args for the selected FRONTEND and exit.
+# Used to verify byte-identity against the retired standalone gen scripts.
+if [ "${PRINT_GN_ARGS:-0}" = "1" ]; then printf '%s\n' "$GN_ARGS"; exit 0; fi
 
 case "$TIER" in
 	jitless)   V8FLAGS="b1nix.v8run" ;;

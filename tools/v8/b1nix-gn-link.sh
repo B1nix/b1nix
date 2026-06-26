@@ -8,7 +8,8 @@
 # with the b1nix cross `ld` + the proven d8 recipe (crt0 + b1nix linker scripts +
 # libc++/libgcc/libm + whole-archived libb1nix, in one --start-group). This lets
 # `ninja content_shell` link the .so's AND the executable as b1nix ELFs natively,
-# and makes the standalone tools/v8/chromium-link.sh crutch unnecessary.
+# and makes the standalone chromium-link.sh crutch unnecessary (that script is
+# archived under archive/tools/v8/chromium-link.sh).
 #
 # Invoked by gn as the link driver, e.g.:
 #   solink: <shim> -shared -Wl,-soname="lib.so" <ldflags> -o "./lib.so" @"lib.so.rsp" <rlibs>
