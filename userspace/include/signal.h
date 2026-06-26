@@ -1,6 +1,11 @@
 #ifndef B1NIX_U_SIGNAL_H
 #define B1NIX_U_SIGNAL_H
 
+/* Expose ucontext_t/greg_t/REG_* here: SA_SIGINFO handlers reinterpret their
+ * third (void*) argument as ucontext_t, and glibc makes these visible via
+ * <signal.h> too (e.g. base/debug/stack_trace_posix.cc relies on it). */
+#include <sys/ucontext.h>
+
 #ifdef __cplusplus
 extern "C" {
 #endif
@@ -36,9 +41,19 @@ extern "C" {
 #define SIGVTALRM 26
 #define SIGPROF 27
 #define SIGWINCH 28
+#define SIGIO   29
+#define SIGPOLL SIGIO
 #ifndef SI_KERNEL
 #define SI_KERNEL 0x80  /* siginfo si_code: sent by the kernel */
 #endif
+/* siginfo si_code origin values (POSIX/glibc). */
+#define SI_USER     0
+#define SI_QUEUE   -1
+#define SI_TIMER   -2
+#define SI_MESGQ   -3
+#define SI_ASYNCIO -4
+#define SI_SIGIO   -5
+#define SI_TKILL   -6
 #define NSIG    31
 
 /* siginfo si_code values (POSIX). Used by crash reporters to describe faults. */

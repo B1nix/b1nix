@@ -25,4 +25,18 @@ done
 # that stock clang rejects under -Werror=unknown-warning-option. Injecting
 # -Wno-unknown-warning-option makes clang silently ignore any flag it doesn't
 # know, so we don't have to enumerate the whole GCC-only set.
-exec "$real" -Wno-unknown-warning-option "$@"
+#
+# Trailing flags (after "$@", so they win over Chromium's -Werror):
+#   -Wno-nullability-completeness: WebRTC headers include absl/base/nullability.h,
+#   which turns the completeness check on for the whole TU; WebRTC's own
+#   un-annotated pointers then error under -Werror. Can't annotate upstream
+#   headers, and it's a style check (not a correctness bug) — disable it.
+#   -Wno-nontrivial-memcall: newer clang flags memset/memcpy on non-trivially-
+#   copyable C++ types; ANGLE/Blink do this widely on POD-ish structs. Upstream
+#   pattern, not a b1nix bug — disable under -Werror.
+#   -Wno-error: the stock clang 22 here is newer than Chromium's bundled clang,
+#   so it raises extra -W warnings that Chromium's -Werror turns fatal (memcall,
+#   uninitialized-const-pointer, ...). These are compiler-version skew on vetted
+#   upstream code, NOT b1nix bugs — downgrade warnings to non-fatal. Real ERRORS
+#   (missing headers/symbols) are still hard errors and still fail the build.
+exec "$real" -Wno-unknown-warning-option "$@" -Wno-nullability-completeness -Wno-nontrivial-memcall -Wno-error

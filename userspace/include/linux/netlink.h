@@ -67,4 +67,8 @@ struct nlattr {
   __u16 nla_type;
 };
 
+#define NLA_ALIGNTO    4
+#define NLA_ALIGN(len) (((len) + NLA_ALIGNTO - 1) & ~(NLA_ALIGNTO - 1))
+#define NLA_HDRLEN     ((int)NLA_ALIGN(sizeof(struct nlattr)))
+
 #endif

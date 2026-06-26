@@ -420,3 +420,383 @@ for F in "$SRC/base/rand_util_posix.cc" "$SRC/base/allocator/partition_allocator
     echo "Patch C-LSS applied: $F"
   fi
 done
+
+# --- Patch C25: stack_copier_signal — pass the raw thread id to syscall -------
+# base::PlatformThreadId is a class with no implicit long conversion. glibc's
+# variadic syscall(long, ...) accepts it by passing the bytes through `...`;
+# b1nix's syscall macro casts each arg to (long), which a class without a
+# conversion operator can't satisfy. Extract the integer with .raw() (what every
+# other Chromium syscall/proc path already does).
+F="$SRC/base/profiler/stack_copier_signal.cc"
+if [ -f "$F" ] && ! grep -q 'GetThreadId().raw()' "$F"; then
+  perl -0777 -i -pe 's~syscall\(SYS_tgkill, getpid\(\), thread_delegate_->GetThreadId\(\),~syscall(SYS_tgkill, getpid(), thread_delegate_->GetThreadId().raw(),~' "$F"
+  grep -q 'GetThreadId().raw()' "$F" || die "Patch C25 anchor not found in $F"
+  echo "Patch C25 applied: stack_copier_signal.cc (raw thread id to tgkill)"
+else echo "Patch C25 already present (or file missing)"; fi
+
+# --- Patch C26: crypto/features.gni — use_nss_certs=false for b1nix -----------
+# b1nix has no system NSS library, and crypto/nss_util.cc pulls real NSS headers
+# whose PRInt64 (long) clashes with b1nix int64_t (long long). Use Chromium's
+# built-in cert verifier instead (the modern default on most platforms).
+F="$SRC/crypto/features.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no system NSS' "$F"; then
+  perl -0777 -i -pe 's~(use_nss_certs = is_linux \|\| is_chromeos)~use_nss_certs = (is_linux || is_chromeos) && target_os != "b1nix"  # b1nix has no system NSS; built-in cert verifier~' "$F"
+  grep -q 'b1nix has no system NSS' "$F" || die "Patch C26 anchor not found in $F"
+  echo "Patch C26 applied: crypto/features.gni (use_nss_certs=false for b1nix)"
+else echo "Patch C26 already present (or file missing)"; fi
+
+# --- Patch C27: crashpad lss -> b1nix libc shim ------------------------------
+# crashpad's client+util use linux-syscall-support (lss), which issues RAW
+# Linux-numbered syscalls — wrong on b1nix. Drop in a shim that forwards the
+# small sys_* subset crashpad uses to b1nix libc. (crashpad can't actually run
+# on b1nix; this only lets it compile+link.)
+CPATCH="$(cd "$(dirname "$0")/files" && pwd)"
+LSSDIR="$SRC/third_party/crashpad/crashpad/third_party/lss"
+if [ -d "$LSSDIR" ]; then
+  cp -f "$CPATCH/lss_b1nix.h" "$LSSDIR/lss_b1nix.h"
+  F="$LSSDIR/lss.h"
+  if ! grep -q '__b1nix__' "$F"; then
+    perl -0777 -i -pe 's~#if defined\(CRASHPAD_LSS_SOURCE_EXTERNAL\)~#if defined(__b1nix__)\n#include "lss_b1nix.h"\n#elif defined(CRASHPAD_LSS_SOURCE_EXTERNAL)~' "$F"
+    grep -q '__b1nix__' "$F" || die "Patch C27 anchor not found in $F"
+    echo "Patch C27 applied: crashpad lss.h (b1nix shim)"
+  else echo "Patch C27 already present"; fi
+fi
+
+# --- Patch C28: don't build the out-of-process crashpad handler on b1nix -----
+# The handler executable needs the full lss surface (ptrace/coredump/proc-task)
+# that b1nix lacks; skip it. crashpad_linux.cc still compiles (the in-process
+# client API), it just has no handler to spawn — fine, crash capture is a no-op.
+F="$SRC/components/crash/core/app/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix: no out-of-process handler' "$F"; then
+  perl -0777 -i -pe 's~(    sources \+= \[ "crashpad_linux\.cc" \]\n)    data_deps = \[ ":chrome_crashpad_handler" \]~${1}    if (target_os != "b1nix") {  # b1nix: no out-of-process handler\n      data_deps = [ ":chrome_crashpad_handler" ]\n    }~' "$F"
+  grep -q 'b1nix: no out-of-process handler' "$F" || die "Patch C28 anchor not found in $F"
+  echo "Patch C28 applied: components/crash app (no handler on b1nix)"
+else echo "Patch C28 already present (or file missing)"; fi
+
+# --- Patch C29: angle use_libpci=false for b1nix -----------------------------
+# ANGLE's GPU-info collector uses libpci on Linux+ozone; b1nix has no libpci (and
+# is headless/SwiftShader). Disable it so SystemInfo_libpci.cpp is dropped and
+# ANGLE uses its non-libpci GPU-detection fallback.
+F="$SRC/third_party/angle/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix has no libpci' "$F"; then
+  perl -0777 -i -pe 's~(use_libpci =\n      \(is_linux \|\| is_chromeos\) &&\n      \(angle_use_x11 \|\| angle_use_wayland \|\| use_ozone\) && angle_has_build)~${1} &&\n      target_os != "b1nix"  # b1nix has no libpci~' "$F"
+  grep -q 'b1nix has no libpci' "$F" || die "Patch C29 anchor not found in $F"
+  echo "Patch C29 applied: angle/BUILD.gn (use_libpci=false for b1nix)"
+else echo "Patch C29 already present (or file missing)"; fi
+
+# --- Patch C30: field_trial_config platform — map b1nix to linux -------------
+# fieldtrial_to_struct.py only accepts known platforms; b1nix isn't one. b1nix is
+# linux-like, so generate the variations testing config for the "linux" platform.
+F="$SRC/components/variations/field_trial_config/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix maps to the linux variations platform' "$F"; then
+  perl -0777 -i -pe 's~(  if \(current_os == "win"\) \{\n    platform = "windows"\n)  \} else \{~${1}  } else if (current_os == "b1nix") {\n    platform = "linux"  # b1nix maps to the linux variations platform\n  } else {~' "$F"
+  grep -q 'b1nix maps to the linux variations platform' "$F" || die "Patch C30 anchor not found in $F"
+  echo "Patch C30 applied: field_trial_config (b1nix->linux platform)"
+else echo "Patch C30 already present (or file missing)"; fi
+
+# --- Patch C31: media — no ALSA/PulseAudio on b1nix --------------------------
+# b1nix has no audio server; the POSIX branch in media_options.gni would set
+# use_alsa/use_pulseaudio=true (and pull <alsa/asoundlib.h>/<pulse/pulseaudio.h>).
+# Exclude b1nix so audio uses the dummy backend.
+F="$SRC/media/media_options.gni"
+if [ -f "$F" ] && ! grep -q 'target_os != "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~(if \(is_posix && !is_android && !is_apple &&)\n(      \(!is_castos)~${1} target_os != "b1nix" &&\n${2}~' "$F"
+  grep -q 'target_os != "b1nix"' "$F" || die "Patch C31 anchor not found in $F"
+  echo "Patch C31 applied: media_options.gni (no alsa/pulse on b1nix)"
+else echo "Patch C31 already present (or file missing)"; fi
+
+# --- Patch C32: use_udev=false for b1nix -------------------------------------
+# b1nix has no libudev; Chromium falls back to non-udev device enumeration.
+F="$SRC/build/config/features.gni"
+if [ -f "$F" ] && ! grep -q 'b1nix has no libudev' "$F"; then
+  perl -0777 -i -pe 's~use_udev = \(is_linux && !is_castos\) \|\| is_chromeos~use_udev = ((is_linux \&\& !is_castos) || is_chromeos) \&\& target_os != "b1nix"  # b1nix has no libudev~' "$F"
+  grep -q 'b1nix has no libudev' "$F" || die "Patch C32 anchor not found in $F"
+  echo "Patch C32 applied: features.gni (use_udev=false for b1nix)"
+else echo "Patch C32 already present (or file missing)"; fi
+
+# --- Patch C33: perfetto LegacyTraceId overloads for b1nix -------------------
+# perfetto adds size_t/intptr_t LegacyTraceId ctors only on Apple (and unsigned
+# long on Win), assuming elsewhere uint64_t==unsigned long. b1nix's uint64_t is
+# `unsigned long long` while size_t/long are `long`, so an `unsigned long`/`long`
+# arg is ambiguous between the uint64_t and int64_t ctors. b1nix has Apple-like
+# type distinctness — extend the Apple overload block to it.
+F="$SRC/third_party/perfetto/include/perfetto/tracing/internal/track_event_legacy.h"
+if [ -f "$F" ] && ! grep -q 'defined(__b1nix__)' "$F"; then
+  perl -0777 -i -pe 's~#if PERFETTO_BUILDFLAG\(PERFETTO_OS_APPLE\)\n(  explicit LegacyTraceId\(size_t raw_id\))~#if PERFETTO_BUILDFLAG(PERFETTO_OS_APPLE) || defined(__b1nix__)\n${1}~' "$F"
+  grep -q 'defined(__b1nix__)' "$F" || die "Patch C33 anchor not found in $F"
+  echo "Patch C33 applied: perfetto track_event_legacy.h (b1nix LegacyTraceId overloads)"
+else echo "Patch C33 already present (or file missing)"; fi
+
+# --- Patch C34: v8config V8_TARGET_OS_LINUX=1 for b1nix ----------------------
+# v8config auto-detects b1nix as Linux (via __linux__) and defines the *presence*
+# macro `#define V8_TARGET_OS_LINUX` (empty). But some bundled V8 wasm headers
+# (std-object-sizes.h, wasm-objects.cc, ...) use it as a VALUE in #if expressions,
+# so the empty token breaks them ("invalid token"/"expected value"). Give it a
+# real `1` value (UNCONDITIONAL — fixes BOTH the b1nix-target and the host
+# clang_x64 V8 builds, which both hit this auto-detect path; the host build is
+# even compiled with -DDEBUG so the DEBUG-gated std-object-sizes block is live).
+# `defined(V8_TARGET_OS_LINUX)` uses keep working.
+F="$SRC/v8/include/v8config.h"
+if [ -f "$F" ] && ! grep -q 'V8_TARGET_OS_LINUX 1' "$F"; then
+  perl -0777 -i -pe 's~#ifdef V8_OS_LINUX\n# define V8_TARGET_OS_LINUX\n#endif~#ifdef V8_OS_LINUX\n# define V8_TARGET_OS_LINUX 1\n#endif~' "$F"
+  grep -q 'V8_TARGET_OS_LINUX 1' "$F" || die "Patch C34 anchor not found in $F"
+  echo "Patch C34 applied: v8config.h (V8_TARGET_OS_LINUX=1, host+target)"
+else echo "Patch C34 already present"; fi
+
+# --- Patch C35: disable V4L2 video-capture backend for b1nix -----------------
+# media/capture/video/linux (V4L2 camera capture) needs <linux/videodev2.h> (150+
+# V4L2 symbols) — b1nix has no camera/V4L2 and headless content_shell needs none.
+# Drop the video/linux dep and make the platform factory return the fake one.
+F="$SRC/media/capture/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'target_os != "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~  if \(is_linux \|\| is_chromeos\) \{\n    deps \+= \[ "video/linux" \]~  if ((is_linux || is_chromeos) && target_os != "b1nix") {\n    deps += [ "video/linux" ]~' "$F"
+  grep -q 'target_os != "b1nix"' "$F" || die "Patch C35a anchor not found in $F"
+  echo "Patch C35a applied: media/capture/BUILD.gn (drop video/linux for b1nix)"
+else echo "Patch C35a already present"; fi
+F="$SRC/media/capture/video/create_video_capture_device_factory.cc"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  # (a) don't include the V4L2 linux factory header on b1nix
+  perl -0777 -i -pe 's~#if BUILDFLAG\(IS_LINUX\)\n#include "media/capture/video/linux/video_capture_device_factory_linux.h"~#if BUILDFLAG(IS_LINUX) && !defined(__b1nix__)\n#include "media/capture/video/linux/video_capture_device_factory_linux.h"~' "$F"
+  # (b) b1nix returns the fake factory (no V4L2)
+  perl -0777 -i -pe 's~#if BUILDFLAG\(IS_LINUX\)\n  return std::make_unique<VideoCaptureDeviceFactoryLinux>\(ui_task_runner\);~#if defined(__b1nix__)\n  return CreateFakeVideoCaptureDeviceFactory();  // b1nix: no V4L2/camera\n#elif BUILDFLAG(IS_LINUX)\n  return std::make_unique<VideoCaptureDeviceFactoryLinux>(ui_task_runner);~' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C35b anchor not found in $F"
+  echo "Patch C35b applied: create_video_capture_device_factory.cc (b1nix -> fake)"
+else echo "Patch C35b already present"; fi
+
+# --- Patch C36: wasm-memory-map-descriptor.cc include-before-config ----------
+# This file does `#if V8_TARGET_OS_LINUX` at the very top to guard <sys/mman.h>/
+# <sys/stat.h>, BEFORE any V8 header is included. For b1nix, target_os doesn't
+# match a GN branch, so V8_HAVE_TARGET_OS is unset and v8config.h only DERIVES
+# V8_TARGET_OS_LINUX=1 from the V8_OS_LINUX host-OS fallback — i.e. after it's
+# included. So the top guard sees it undefined (skips the includes) while the
+# body guard (after the v8 headers pull in v8config.h) sees it =1 and compiles
+# mmap/struct stat code with no headers -> "undeclared PROT_READ / incomplete
+# struct stat". Pull in v8config.h before the top guard so both agree. Fixes
+# host (clang_x64) and target identically; recompiles this one file only.
+F="$SRC/v8/src/wasm/wasm-memory-map-descriptor.cc"
+if [ -f "$F" ] && ! grep -q 'b1nix: resolve V8_TARGET_OS_LINUX before the guard' "$F"; then
+  perl -0777 -i -pe 's~(#if V8_TARGET_OS_LINUX\n#include <sys/mman.h>)~#include "include/v8config.h"  // b1nix: resolve V8_TARGET_OS_LINUX before the guard (host-OS fallback path)\n${1}~' "$F"
+  grep -q 'b1nix: resolve V8_TARGET_OS_LINUX before the guard' "$F" || die "Patch C36 anchor not found in $F"
+  echo "Patch C36 applied: wasm-memory-map-descriptor.cc (v8config before top guard)"
+else echo "Patch C36 already present (or file missing)"; fi
+
+# --- Patch C37: O_PATH for the xdg file-transfer portal ----------------------
+# components/dbus/xdg/file_transfer_portal.cc opens an fd with O_PATH to pass it
+# over D-Bus (SCM_RIGHTS). b1nix's <fcntl.h> has no O_PATH. The portal never runs
+# on headless b1nix (no xdg-desktop-portal service), so this is compile-only.
+# Define O_PATH to its real Linux value; b1nix's open() ignores the unknown bit
+# (access mode 0 == O_RDONLY), which is the correct degenerate behavior here.
+# ponytail: build stopgap for a keep-off feature; the durable fix (real O_PATH in
+# userspace/include/fcntl.h) is deferred to the tech-debt closeout's clean rebuild
+# so it doesn't dirty the widely-included fcntl.h mid-grind. Logged in debt doc.
+F="$SRC/components/dbus/xdg/file_transfer_portal.cc"
+if [ -f "$F" ] && ! grep -q 'O_PATH 0x200000' "$F"; then
+  perl -0777 -i -pe 's~(#include <fcntl.h>)\n(#include <sys/types.h>)~${1}\n#ifndef O_PATH\n#define O_PATH 0x200000  /* b1nix: no O_PATH; real Linux value, open() treats unknown bit as O_RDONLY ref. Portal is headless-dead here. */\n#endif\n${2}~' "$F"
+  grep -q 'O_PATH 0x200000' "$F" || die "Patch C37 anchor not found in $F"
+  echo "Patch C37 applied: file_transfer_portal.cc (O_PATH fallback)"
+else echo "Patch C37 already present (or file missing)"; fi
+
+# --- Patch C38: seccomp system-headers use canonical Linux __NR_* on b1nix ---
+# b1nix runs --no-sandbox, so the Linux sandbox (seccomp/namespaces) is DEAD code,
+# but it must still compile + link: content/SandboxLinux reference it and the API
+# even returns bpf_dsl::ResultExpr, so stubbing SandboxLinux out (the use_seccomp_
+# bpf=false path) is infeasible. Keep seccomp ON and make it compile. The blocker:
+# sandbox/linux/system_headers/linux_syscalls.h does `#include <sys/syscall.h>`
+# first, and b1nix's <syscall.h> aliases __NR_foo -> SYS_FOO (b1nix's own, NON-
+# Linux numbers). The per-arch seccomp header then skips its canonical Linux value
+# (`#if !defined(__NR_foo)`), so b1nix numbers leak into the bpf policy switches ->
+# duplicate-case collisions (SYS_FSYNC==18) + wrong/undeclared __NR_*. Skip that
+# include on b1nix so the seccomp headers define pure Linux __NR_*; dead here, so
+# the (Linux) numbers needn't match b1nix. Real seccomp wiring = M63.
+F="$SRC/sandbox/linux/system_headers/linux_syscalls.h"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  perl -0777 -i -pe 's~(#include <sys/syscall.h>)~#if !defined(__b1nix__)  // b1nix __NR_* alias to its own syscall numbers; let the seccomp headers define canonical Linux __NR_* (dead code, M63)\n${1}\n#endif~' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C38 anchor not found in $F"
+  echo "Patch C38 applied: linux_syscalls.h (canonical Linux __NR_* on b1nix)"
+else echo "Patch C38 already present (or file missing)"; fi
+
+# --- Patch C39: drop the seccomp signal-ABI static_asserts on b1nix ----------
+# linux_signal.h static-asserts LINUX_SIGHUP==SIGHUP (1==7) etc. against the host
+# libc. b1nix signal numbering differs from Linux by design, so these can't hold.
+# They are compile-time-only checks guarding seccomp's hardcoded Linux signal
+# numbers; the seccomp handler never runs on b1nix (--no-sandbox), so dropping the
+# asserts is safe (the seccomp code is dead). Real signal reconciliation = M63.
+F="$SRC/sandbox/linux/system_headers/linux_signal.h"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  perl -0777 -i -pe 's~(static_assert\(LINUX_SIGHUP == SIGHUP, "LINUX_SIGHUP == SIGHUP"\);)~#if !defined(__b1nix__)  // b1nix signal numbers != Linux; seccomp is dead code here (M63)\n${1}~' "$F"
+  perl -0777 -i -pe 's~(static_assert\(LINUX_SIG_DFL == SIG_DFL, "LINUX_SIG_DFL == SIG_DFL"\);)~${1}\n#endif  // !__b1nix__~' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C39 anchor not found in $F"
+  echo "Patch C39 applied: linux_signal.h (drop signal-ABI static_asserts on b1nix)"
+else echo "Patch C39 already present (or file missing)"; fi
+
+# --- Patch C40: use_cups=false for b1nix (no CUPS/printer) -------------------
+# b1nix has no CUPS. printing/backend gates printer_status.{h,cc} (which include
+# <cups/cups.h>) under use_cups, which is is_linux-true. Disable it; printing
+# falls back to the non-CUPS backend. Headless content_shell needs no printer.
+F="$SRC/printing/buildflags/buildflags.gni"
+if [ -f "$F" ] && ! grep -q 'target_os != "b1nix"' "$F"; then
+  perl -0777 -i -pe 's~(is_mac\) &&\n               !is_fuchsia)~${1} &&\n               target_os != "b1nix"  # b1nix has no CUPS/printer~' "$F"
+  grep -q 'target_os != "b1nix"' "$F" || die "Patch C40 anchor not found in $F"
+  echo "Patch C40 applied: buildflags.gni (use_cups=false for b1nix)"
+else echo "Patch C40 already present (or file missing)"; fi
+
+# --- Patch C41: trap.cc dead-code struct gaps on b1nix ----------------------
+# The seccomp SIGSYS trap handler is dead on b1nix (--no-sandbox). It touches two
+# struct members b1nix's headers don't have: ucontext::uc_sigmask and
+# siginfo_t::_sifields. Do NOT change b1nix's ucontext/siginfo_t layout (kernel +
+# libc must agree on them) — neutralize the dead accesses for b1nix. Real seccomp
+# trap handler = M63.
+F="$SRC/sandbox/linux/seccomp-bpf/trap.cc"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  perl -0777 -i -pe 's~(  return sigismember\(const_cast<sigset_t\*>\(&ctx->uc_sigmask\), LINUX_SIGBUS\);)~#if defined(__b1nix__)\n  (void)ctx;  // b1nix ucontext has no uc_sigmask; seccomp trap is dead code (M63)\n  return false;\n#else\n${1}\n#endif~' "$F"
+  perl -0777 -i -pe 's~(  memcpy\(&sigsys, &info->_sifields, sizeof\(sigsys\)\);)~#if defined(__b1nix__)\n  memset(&sigsys, 0, sizeof(sigsys));  // b1nix siginfo_t has no _sifields; dead code (M63)\n#else\n${1}\n#endif~' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C41 anchor not found in $F"
+  echo "Patch C41 applied: trap.cc (b1nix dead-code struct gaps)"
+else echo "Patch C41 already present (or file missing)"; fi
+
+# --- Patch C42: libc_interceptor gmtime fn-pointer on b1nix ------------------
+# `g_libc_localtime` (type struct tm*(*)(const time_t*)) = gmtime fails on b1nix:
+# <time.h> declares gmtime/localtime with a B1nixTimePtr wrapper param, so &gmtime
+# isn't that pointer type. Wrap in a captureless lambda (converts to the exact fn
+# pointer; gmtime(t) compiles via B1nixTimePtr's implicit ctor). This localtime
+# interceptor is dead on b1nix (sandbox off) but must compile.
+F="$SRC/sandbox/linux/services/libc_interceptor.cc"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  perl -0777 -i -pe 's~    g_libc_localtime = gmtime;~#if defined(__b1nix__)\n    g_libc_localtime = [](const time_t* t) { return gmtime(t); };  // b1nix gmtime takes B1nixTimePtr; wrap to a (const time_t*) fn ptr\n#else\n    g_libc_localtime = gmtime;\n#endif~' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C42 anchor not found in $F"
+  echo "Patch C42 applied: libc_interceptor.cc (b1nix gmtime fn-pointer)"
+else echo "Patch C42 already present (or file missing)"; fi
+
+# --- Patch C43: force canonical Linux __NR_* in the seccomp arch header ------
+# C38 stopped linux_syscalls.h from pulling <sys/syscall.h>, but it's not enough:
+# some seccomp consumers (die.cc, the bpf_*_policy switches) get b1nix's <syscall.h>
+# via OTHER include paths first, and b1nix aliases __NR_foo -> SYS_FOO (its own,
+# colliding numbers) under #ifndef guards. Those win the seccomp header's
+# `#if !defined(__NR_foo)` guards -> wrong/duplicate case values (SYS_FSYNC==18
+# dup-case) + undeclared __NR_*. Fix: on b1nix, make the seccomp arch header
+# UNCONDITIONALLY undef+redefine each __NR_* to its canonical Linux value, so it
+# always wins regardless of include order. Only seccomp (dead on b1nix) code
+# includes this header, so forcing Linux numbers here is safe. Real seccomp = M63.
+F="$SRC/sandbox/linux/system_headers/x86_64_linux_syscalls.h"
+if [ -f "$F" ] && ! grep -q '__b1nix__' "$F"; then
+  perl -0777 -i -pe 's~#if !defined\((__NR_\w+)\)\n#define (__NR_\w+) (\S+)\n#endif~#if defined(__b1nix__)\n#undef $1\n#define $2 $3\n#elif !defined($1)\n#define $2 $3\n#endif~g' "$F"
+  grep -q '__b1nix__' "$F" || die "Patch C43 anchor not found in $F"
+  echo "Patch C43 applied: x86_64_linux_syscalls.h (force Linux __NR_* on b1nix)"
+else echo "Patch C43 already present (or file missing)"; fi
+
+# --- Patch C44: die.cc needs the seccomp __NR_* map --------------------------
+# seccomp-bpf/die.cc uses __NR_exit_group / __NR_prctl but includes only
+# <sys/syscall.h> (b1nix's, which lacks the Linux-only __NR_exit_group). Pull in
+# the seccomp syscall map (with C43 forcing canonical Linux values). die.cc is
+# dead on b1nix (--no-sandbox); it only needs to compile.
+F="$SRC/sandbox/linux/seccomp-bpf/die.cc"
+if [ -f "$F" ] && ! grep -q 'system_headers/linux_syscalls.h' "$F"; then
+  perl -0777 -i -pe 's~(#include "sandbox/linux/services/syscall_wrappers.h")~${1}\n#include "sandbox/linux/system_headers/linux_syscalls.h"  // b1nix: __NR_exit_group/__NR_prctl (dead code, M63)~' "$F"
+  grep -q 'system_headers/linux_syscalls.h' "$F" || die "Patch C44 anchor not found in $F"
+  echo "Patch C44 applied: die.cc (include seccomp syscall map)"
+else echo "Patch C44 already present (or file missing)"; fi
+
+# --- Patch C45: generate_policy_source.py — conditional cloud-policy import ----
+# The generated cloud_policy.proto imports policy_common_definitions.proto for the
+# *PolicyProto field types, but content_shell defines no cloud policies, so
+# CloudPolicySettings is empty and the import goes unused → protoc warns "Import
+# ... is unused" → the build's --fatal_warnings makes it a hard error (cascades to
+# every TU that includes cloud_policy.pb.h). Fix the generator to emit the import
+# only when there is at least one field — correct upstream-compatible behaviour,
+# not a b1nix-specific hack. (Done via inline python: the replacement text mixes
+# ' and ", which a shell-quoted perl one-liner can't carry cleanly.)
+F="$SRC/components/policy/tools/generate_policy_source.py"
+if [ -f "$F" ]; then
+  python3 - "$F" <<'PYEOF' || die "Patch C45 failed"
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+marker = 'only referenced when CloudPolicySettings has at least one field'
+if marker in s:
+    print("Patch C45 already present")
+    sys.exit(0)
+# 1) drop the unconditional import from CLOUD_POLICY_PROTO_HEAD (the CHROME_SETTINGS
+#    head keeps its own commented import — disambiguated by the missing comment).
+old_head = ('option go_package="chromium/policy/enterprise_management_proto";\n'
+            '\nimport "policy_common_definitions.proto";\n\n\'\'\'')
+new_head = 'option go_package="chromium/policy/enterprise_management_proto";\n\n\'\'\''
+if s.count(old_head) != 1:
+    sys.exit("C45: CLOUD_POLICY_PROTO_HEAD anchor not unique/found")
+s = s.replace(old_head, new_head)
+# 2) emit the import only when CloudPolicySettings will have fields.
+anchor = '\n  sorted_chunk_numbers = sorted(fields.keys())'
+ins = ('\n  # policy_common_definitions.proto supplies the *PolicyProto field types,'
+       ' so it\n  # is only referenced when CloudPolicySettings has at least one'
+       ' field. Emitting\n  # the import for an empty policy set (e.g. content_shell)'
+       ' makes protoc warn\n  # "Import ... is unused", which --fatal_warnings turns'
+       ' into a hard error.\n  if fields:\n'
+       '    f.write(\'import "policy_common_definitions.proto";\\n\\n\')')
+if s.count(anchor) != 1:
+    sys.exit("C45: sorted_chunk_numbers anchor not unique/found")
+s = s.replace(anchor, ins + anchor, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("Patch C45 applied: generate_policy_source.py (conditional cloud-policy import)")
+PYEOF
+else echo "Patch C45 skipped (file missing)"; fi
+
+# --- Patch C46: generate_policy_source.py — recognise b1nix as a Linux platform
+# Policies are gated on build-config platform tokens (PLATFORM_STRINGS); b1nix has
+# no entry, so every policy is "unsupported" → the generated cloud_policy.proto and
+# policy_constants.cc come out EMPTY (zero-length arrays, missing key:: constants),
+# breaking ~19 policy consumers (policy_map, *_policy_handler, search_engines, ...).
+# b1nix is Linux-like (OS_LINUX in base/), so map it to 'linux' next to the existing
+# chromeos→chrome_os normalisation. This is the real root fix; C45 only handled the
+# now-unreachable empty-policy edge.
+F="$SRC/components/policy/tools/generate_policy_source.py"
+if [ -f "$F" ]; then
+  python3 - "$F" <<'PYEOF' || die "Patch C46 failed"
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if "elif target_platform == 'b1nix'" in s:
+    print("Patch C46 already present")
+    sys.exit(0)
+anchor = "  if target_platform == 'chromeos':\n    target_platform = 'chrome_os'\n"
+ins = ("\n  # b1nix is a Linux-like OS (detected as OS_LINUX in base/). Policies are\n"
+       "  # gated on build-config platform tokens (PLATFORM_STRINGS), which have no\n"
+       "  # b1nix entry, so without this every policy is \"unsupported\" and the\n"
+       "  # generated proto/constants come out empty. Treat b1nix as Linux.\n"
+       "  elif target_platform == 'b1nix':\n    target_platform = 'linux'\n")
+if s.count(anchor) != 1:
+    sys.exit("C46: chromeos-normalization anchor not unique/found")
+s = s.replace(anchor, anchor + ins, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("Patch C46 applied: generate_policy_source.py (map b1nix->linux for policy support)")
+PYEOF
+else echo "Patch C46 skipped (file missing)"; fi
+
+# --- Patch C47: restore content_shell_lib rust_test deps (enable_rust is ON) ---
+# C18 removed :rust_test_mojom/_js/:rust_test_service_ffi from content_shell_lib
+# deps back when enable_rust was OFF. It is ON now (Chromium-with-Rust), and
+# shell_content_browser_client.cc includes rust_test_service_ffi.rs.h +
+# rust_test.test-mojom.h and calls BindRustTestService UNCONDITIONALLY, so the C++
+# target must depend on the codegen or the generated headers are never built
+# ("fatal error: ...rs.h file not found"). Re-add them under if(enable_rust) so
+# gn-gen still works if rust is ever turned off (the target defs are guarded too).
+F="$SRC/content/shell/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix: rust_test codegen deps' "$F"; then
+  perl -0777 -i -pe 's~(  if \(use_ozone\) \{\n    deps \+= \[ "//ui/ozone" \]\n  \}\n)~$1\n  if (enable_rust) {  # b1nix: rust_test codegen deps (headers used unconditionally by shell_content_browser_client.cc)\n    deps += [\n      ":rust_test_mojom",\n      ":rust_test_mojom_js",\n      ":rust_test_service_ffi",\n    ]\n  }\n~' "$F"
+  grep -q 'b1nix: rust_test codegen deps' "$F" || die "Patch C47 anchor not found in $F"
+  echo "Patch C47 applied: content_shell_lib rust_test deps under enable_rust"
+else echo "Patch C47 already present (or file missing)"; fi
+
+# --- Patch C48: link via the b1nix-ELF link shim (Option A) -------------------
+# gn's link/solink drive host clang++ (ld=cxx) → /usr/lib/libc.so.6 → errno TLS
+# mismatch. Point ld at tools/v8/b1nix-gn-link.sh, which re-issues the link with
+# the cross ld + crt0 + b1nix linker scripts + whole-archived libb1nix (exe) or
+# PIC libc.so.1 + --allow-shlib-undefined (.so). Compile (cc/cxx) is untouched, so
+# objects are not rebuilt. enable_linker_map=false: the shim drops -Wl,* so gn must
+# not expect a .map output. (.so verified on libEGL; content_shell exe link WIP.)
+F="$SRC/build/toolchain/b1nix/BUILD.gn"
+SHIM="$(cd "$SRC/../../.." && pwd)/tools/v8/b1nix-gn-link.sh"
+if [ -f "$F" ] && ! grep -q 'b1nix-gn-link.sh' "$F"; then
+  perl -0777 -i -pe "s~  ld = cxx\n~  ld = \"$SHIM\"\n~" "$F"
+  perl -0777 -i -pe 's~  enable_linker_map = true\n~  enable_linker_map = false\n~' "$F"
+  grep -q 'b1nix-gn-link.sh' "$F" || die "Patch C48 anchor not found in $F"
+  echo "Patch C48 applied: ld = b1nix-gn-link.sh + enable_linker_map=false"
+else echo "Patch C48 already present (or file missing)"; fi

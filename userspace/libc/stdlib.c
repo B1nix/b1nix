@@ -1179,8 +1179,73 @@ int rand(void) {
 	return (int)(next_rand & RAND_MAX);
 }
 
+/* rand_r: reentrant rand over a caller-supplied seed (same LCG as rand). */
+int rand_r(unsigned int *seedp) {
+	unsigned long s = (unsigned long)*seedp * 1103515245UL + 12345UL;
+	*seedp = (unsigned int)s;
+	return (int)(s & RAND_MAX);
+}
+
 void srand(unsigned int seed) {
 	next_rand = seed;
+}
+
+/* random() family: classic BSD TYPE_3 additive-feedback generator (degree 31,
+ * separation 3), seeded with the minstd LCG like glibc. Produces 31-bit values.
+ * random_r/srandom_r/initstate_r are the GNU reentrant forms; random()/srandom()
+ * wrap a single global state. */
+int srandom_r(unsigned int seed, struct random_data *buf) {
+	if (!buf) { errno = EINVAL; return -1; }
+	if (seed == 0) seed = 1;
+	buf->x[0] = (int32_t)seed;
+	for (int i = 1; i < 31; i++) {
+		/* minstd via Schrage's method to avoid 32-bit overflow */
+		int32_t hi = buf->x[i - 1] / 127773;
+		int32_t lo = buf->x[i - 1] % 127773;
+		int32_t w = 16807 * lo - 2836 * hi;
+		if (w < 0) w += 2147483647;
+		buf->x[i] = w;
+	}
+	buf->fptr = 3;
+	buf->rptr = 0;
+	buf->valid = 1;
+	int32_t dummy;
+	for (int i = 0; i < 310; i++) random_r(buf, &dummy); /* warm up */
+	return 0;
+}
+
+int random_r(struct random_data *buf, int32_t *result) {
+	if (!buf || !result || !buf->valid) { errno = EINVAL; return -1; }
+	buf->x[buf->fptr] += buf->x[buf->rptr];
+	*result = (int32_t)((uint32_t)buf->x[buf->fptr] >> 1);
+	if (++buf->fptr >= 31) buf->fptr = 0;
+	if (++buf->rptr >= 31) buf->rptr = 0;
+	return 0;
+}
+
+int initstate_r(unsigned int seed, char *statebuf, size_t statelen,
+                struct random_data *buf) {
+	(void)statebuf; (void)statelen; /* state lives in buf; size is a quality hint */
+	return srandom_r(seed, buf);
+}
+
+static struct random_data g_random = { .valid = 0 };
+
+void srandom(unsigned int seed) { srandom_r(seed, &g_random); }
+
+/* b1nix keeps no system load average. Report "unavailable" (-1) so callers
+ * (e.g. google_benchmark's sysinfo) fall back to a zero/unknown load. */
+int getloadavg(double loadavg[], int nelem) {
+	(void)loadavg;
+	(void)nelem;
+	return -1;
+}
+
+long random(void) {
+	int32_t r;
+	if (!g_random.valid) srandom_r(1, &g_random);
+	random_r(&g_random, &r);
+	return (long)r;
 }
 
 int fork(void);
@@ -1351,6 +1416,37 @@ int mkstemp(char *tmpl) {
 			else if (c < 36) ch = 'a' + (c - 10);
 			else ch = 'A' + (c - 36);
 			tmpl[len - 6 + i] = ch;
+		}
+		int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
+		if (fd >= 0) return fd;
+		if (errno != EEXIST) return -1;
+	}
+	errno = EEXIST;
+	return -1;
+}
+
+/* mkstemps: like mkstemp but the template is "...XXXXXX<suffix>" where the last
+ * `suffixlen` chars are kept verbatim (ANGLE uses it for ".tmp"-suffixed files). */
+int mkstemps(char *tmpl, int suffixlen) {
+	int len = strlen(tmpl);
+	if (suffixlen < 0 || len < 6 + suffixlen ||
+	    strncmp(tmpl + len - 6 - suffixlen, "XXXXXX", 6) != 0) {
+		errno = EINVAL;
+		return -1;
+	}
+	int xpos = len - 6 - suffixlen;
+	static unsigned int seed = 0x9e3779b9;
+	for (int pass = 0; pass < 100; pass++) {
+		unsigned int val = seed;
+		seed = seed * 1103515245 + 12345;
+		for (int i = 0; i < 6; i++) {
+			int c = val % 62;
+			val /= 62;
+			char ch;
+			if (c < 10) ch = '0' + c;
+			else if (c < 36) ch = 'a' + (c - 10);
+			else ch = 'A' + (c - 36);
+			tmpl[xpos + i] = ch;
 		}
 		int fd = open(tmpl, O_RDWR | O_CREAT | O_EXCL, 0600);
 		if (fd >= 0) return fd;

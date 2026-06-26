@@ -895,32 +895,41 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 
 ## M60: Ozone Platform
 
-- [ ] `planned` Add an Ozone platform backend (headless first, then a
-  displayd/Wayland-shaped one): window, surface, input, and vsync. Plan in
-  `tools/patches/chromium/PORT-PLAN.md` (start from upstream `headless`).
+- [x] `done` **Headless Ozone backend** wired for the b1nix Chromium build
+  (`ozone_platform_headless=true`, `ozone_auto_platforms=false`; ANGLE/libpci
+  fallbacks patched in `tools/patches/chromium/apply.sh`).
+- [ ] `planned` A **displayd/Wayland-shaped** Ozone backend (window, surface,
+  input, vsync) for on-screen rendering — tracked under M66.
 
 ## M61: Chromium Build Target
 
-- [ ] `partial` Add b1nix to GN/Ninja `build/config`, `base/`, `//net`,
-  `sandbox/` (stubbed), and Ozone, and integrate the cross-toolchain (a
-  multi-month, ~100 GB build that upstream does not support). **Groundwork done
-  for free by the V8 port:** the shared `//build` module already has
-  `target_os == "b1nix"` + a `//build/toolchain/b1nix` cross-toolchain
-  (`tools/patches/v8/`), applied by `tools/patches/v8/apply.sh` to any checkout.
-  Remaining = the Chromium-only subsystems (`base/`/`net`/`sandbox` stubs/Ozone).
-  Fetch/build scaffolding: `tools/sync-chromium.sh`. **Gated on disk** (~150 GB;
-  current box has 43 GB free).
+- [x] `done` **b1nix is a working GN/Ninja target** — `gn gen out/b1nix`
+  (~68.5k edges) succeeds with the shared `//build` `target_os=="b1nix"` +
+  `//build/toolchain/b1nix` cross-toolchain (clang + bundled libc++, Rust on).
+- [x] `done` **Foundational + services layers compile** with the b1nix
+  toolchain: `base/`, `//net`, `crypto/`, `ui/`, `mojo/`, `services/`, most
+  `third_party` (webrtc/skia/dawn/angle/swiftshader). ~50 libc/header gaps filled
+  + GN disables for absent system libs (NSS/kerberos/libpci/alsa/pulse/udev). See
+  `docs/chromium-port-log.md`; deferred items in `docs/chromium-port-debt.md`.
+- [ ] `partial` **Compile the rest** (Blink renderer + `content/`) under
+  `ninja -k 0` so the `.so` link blocker doesn't halt the object grind.
 
 ## M62: content_shell
 
-- [ ] `planned` Render a page to a bitmap with `content_shell --headless
-  --no-sandbox` and verify the pixels — the "Chromium runs" milestone. Reuses
-  V8 (M58) + EGL/OSMesa (M59). Blocked behind M60/M61 + the disk gate above.
+- [ ] `in-progress` `content_shell` is the active ninja target; foundational +
+  services layers compile (M61). **Remaining: (1) compile Blink/content,
+  (2) the link phase** — hand-relink content_shell + the 4 graphics `.so`s as
+  b1nix ELFs via `tools/v8/chromium-link.sh` (extends `v8-link-d8.sh`; the
+  graphics `.so`s are runtime-dlopen'd so content_shell links independently).
+- [ ] `planned` Then render a page to a bitmap (`--headless --no-sandbox`) and
+  verify pixels — the "Chromium runs" milestone (reuses V8 M58 + EGL/OSMesa M59).
 
 ## M63: Sandbox
 
 - [ ] `deferred` Add the real sandbox (seccomp-bpf + user/PID/net namespaces +
   setuid sandbox); none exist today. Only if process isolation is required.
+- This is also what **Chromium's process sandbox** needs; the b1nix Chromium
+  build runs `--no-sandbox` until this lands (port debt, `chromium-port-debt.md`).
 
 ## M64: Optional Clang/LLVM Toolchain
 
@@ -939,9 +948,11 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
 - [ ] `planned` **Phase 3 — broaden optional coverage.** Move individual C++
   ports to Clang only after their existing smoke tests pass with both frontends.
-- [ ] `stretch` **Native self-host Clang.** Build and run LLVM/Clang inside b1nix
-  only if the cross-Clang path proves useful enough to justify LLVM's CMake/Ninja,
-  RAM, disk, and bootstrap cost. It is not required for the sandbox milestone.
+- [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh`
+  builds a native `clang`/`clang++` for b1nix (`build/native-clang/b1nix/bin/clang`)
+  reusing the existing b1nix `libLLVM.so` (no LLVM rebuild). In-QEMU run proof is
+  the remaining step. (`tools/stage-toolchains.sh` packages native llvm/clang/rust
+  for bpkg.)
 - A full GCC-to-Clang migration and a libc++/libc++abi/libunwind port are not
   goals. Add either only when a measured incompatibility makes the GNU path fail.
 
@@ -1109,24 +1120,113 @@ or ported to. The item below is parked for a future dedicated x86 maintainer.
   full Chromium UI is too heavy: drive `content_shell --window-size` output into
   a libgui window.
 
-## M67: Rust Toolchain Port (for Chromium)
+## M67: Rust Toolchain Port (for Chromium) — DONE
 
-- [ ] `planned` Port **Rust to b1nix** so Chromium's Rust components build (gates
-  M62 if the content_shell link needs them). Scope: a `x86_64-unknown-b1nix`
-  rustc target spec + a Rust **`std` platform layer** for b1nix. b1nix is already
-  `is_linux`/`__linux__` with a POSIX-ish libc (`libb1nix.a`), so the realistic
-  path is to **reuse Rust's `unix` PAL** (not write `std::sys` from scratch) via a
-  custom target + `-Zbuild-std`, linking the b1nix libc — then wire Chromium's
-  `custom_toolchain` Rust config (`rust.gni` `toolchain_has_rust`). Multi-week;
-  the single largest remaining port. Honest fallback if a clean disable is ever
-  preferred: gate the Rust touchpoints (mojo rust bindings, content/shell rust
-  demos) on `enable_rust=false` — not a one-liner but far cheaper.
+- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
+  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
+  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
+  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
 
-## M68: Native Rust Compiler (self-hosted, stretch)
+## M68: Native Rust Compiler (self-hosted) — DONE
 
-- [ ] `stretch` Build **rustc to run ON b1nix** (native, compiling Rust inside
-  the OS) — the Rust analog of M26 (native GCC/Binutils self-host). Gated on
-  **M67** (the Rust cross-toolchain must work first). Largest single undertaking:
-  rustc + its LLVM backend cross-compiled with `--host=x86_64-unknown-b1nix`,
-  linked against the b1nix Rust std + libc, plus cargo. Pursue only after the
-  cross Rust path proves out and there's a concrete need for in-VM Rust builds.
+- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
+  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
+  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
+  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
+  `rustc 1.98.0-nightly` banner). Merged (PR#23).
+
+<!-- Big items surfaced by the Chromium port (M60-62) that each need a whole new
+     subsystem, not a flag. Tracked here so they get closed deliberately; the
+     per-port detail lives in docs/chromium-port-debt.md. -->
+
+## M79: Audio Stack
+
+- [ ] `planned` Add a real **audio subsystem** — an HDA (or AC'97) driver + a
+  mixer + an ALSA-compatible userspace shim (or a native b1nix audio API) — so
+  Chromium/`media` and other ports get sound. b1nix has **no audio
+  hardware/driver path at all** today, so `use_alsa`/`use_pulseaudio` are off
+  (Chromium port C31). Large — a whole new device class.
+
+## M80: Kernel ptrace + Crash Capture
+
+- [ ] `planned` Implement **`ptrace(2)`** (returns ENOSYS now) + `/proc/<pid>/
+  task` + reading another process's registers/memory/coredump, so **crashpad**
+  can actually capture crashes and on-device gdb-style debugging works. Crashpad
+  is compile-only today via the lss→libc shim (Chromium port C27/C28). Large.
+
+## M81: Chromium GPU Acceleration
+
+- [ ] `planned` Link the b1nix-target graphics `.so`s (SwiftShader Vulkan ICD +
+  ANGLE `libEGL`/`libGLESv2`) as b1nix ELFs (`tools/v8/chromium-link.sh`) and wire
+  ANGLE→SwiftShader-Vulkan / virtio-gpu (reuse M52/VirGL, M75) so `content_shell`
+  renders **GPU-accelerated** instead of software/headless-only. Gated on M62
+  (content_shell links + runs).
+
+## M82: System NSS / Kerberos (optional, low priority)
+
+- [ ] `planned` Port system **NSS** (cert DB) and/or **MIT-krb5** (GSSAPI) ONLY
+  if a concrete need arises. Chromium's built-in cert verifier
+  (`use_nss_certs=false`) and no-Negotiate-auth are the correct defaults for
+  b1nix, so this is large-effort / low-value — listed for completeness, not
+  scheduled.
+
+---
+
+> **M83–M88 below: surfaced by the 2026-06-25 repo-wide tech-debt audit**
+> (kernel + userspace + ports). Genuinely-new items not already tracked above.
+
+## M83: Unicode-aware ctype / wctype
+
+- [ ] `planned` Replace the ASCII-only wide classification/case-fold in
+  `userspace/libc/wctype.c` (`iswalpha`/`towlower`/… cast `wint_t` into the byte
+  ctype table → every non-ASCII codepoint mis-classified, never folded) with real
+  Unicode property + case-mapping tables. The only **pervasive wrong-result**
+  class in libc; gates correct i18n in bash multibyte, NetSurf, etc.
+
+## M84: Real IP routing + TCP robustness
+
+- [ ] `planned` Kernel networking assumes a **single /24 subnet** — no routing
+  table (`net/ipv4.c:137` hardcodes the mask, drops off-net packets; `SIOCADDRT/
+  DELRT` are no-ops; `/proc/net/route` is fabricated). Add a real FIB shared by
+  ioctl + procfs + `ipv4_send`. TCP is **in-order-only** (`net/tcp.c:1160`, no
+  reassembly queue / window scaling / SACK; fixed 16 KB recv buf) → add an
+  out-of-order reassembly queue + window scaling. IPv6 is loopback-only for
+  non-link traffic.
+
+## M85: libc Tier-A correctness pass (musl-grade)
+
+- [ ] `planned` Fix the correctness-relevant libc gaps the audit flagged:
+  `strtoull`/`strtoll` just cast `strtol` (uint64 truncation, no ERANGE),
+  fully-unbuffered stdio + single-`read()` `fread` short reads, `realpath`=`strcpy`
+  (non-resolving), `perror` prints literal `"error"`, `strtod` not correctly
+  rounded / `strtof`/`strtold`→double, `abort()`=`exit(127)` (no SIGABRT),
+  `getaddrinfo` numeric-port/single-result. Mostly a focused musl-port pass.
+
+## M86: Per-thread CPU accounting + signal targeting
+
+- [ ] `planned` Add per-task CPU-time accounting in the scheduler so
+  `CLOCK_PROCESS/THREAD_CPUTIME_ID`, `clock()`, `getrusage` return real CPU time
+  (currently wall/uptime). Add a kernel `tkill`/`tgkill` so libc `pthread_kill`
+  targets one thread (today routes via `kill(tid)` — can hit the whole process);
+  make `pthread_exit(retval)` actually deliver `retval` to the joiner.
+
+## M87: Dynamic-loader maturation + Rust proc-macros
+
+- [ ] `planned` b1nix is static-by-default with `dlopen`/`dlsym` as no-ops, which
+  **blocks native rustc from building proc-macro crates** (serde-derive etc.,
+  loaded as dylibs) — caps self-host. Mature `ld-b1nix.so`/`libc.so.1` (extend the
+  reloc handler: TLS/IFUNC/COPY currently rejected) and add an opt-in
+  `LINK=dynamic` base-build mode (default stays static; keep the dynamic path
+  green via smoke) so the loader is exercised across all binaries. Also revisit
+  Rust `panic=abort` (no unwinding) once exceptions/unwind are wanted.
+
+## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
+
+- [ ] `planned` Two real kernel correctness/safety bugs from the audit:
+  **(1)** `fs/ext4.c:339` `ext4_get_block` returns 0 (hole) past the single-indirect
+  range on block-mapped (non-extent) inodes → silent zero-reads/corruption on
+  large files of a classic ext2/3 image; add double/triple-indirect traversal
+  (and indirect-block write allocation at `:345`). **(2)** `syscall.c:2134`
+  `mmap(PROT_NONE)` reservations skip PTE setup, so a wild access zero-fills via
+  the anonymous fault path instead of faulting — add a reserved/no-access VMA
+  class the #PF handler honors before zero-filling.

@@ -127,6 +127,11 @@ long lseek(int fd, long offset, int whence) {
   return rc;
 }
 
+/* off_t is 64-bit on b1nix, so lseek64 is just lseek. */
+long lseek64(int fd, long offset, int whence) {
+  return lseek(fd, offset, whence);
+}
+
 int execve(const char *pathname, char *const argv[], char *const envp[]) {
   return _check_err(syscall(SYS_EXECVE, pathname, argv, envp));
 }
@@ -520,6 +525,18 @@ int madvise(void *addr, size_t length, int advice) {
   return _check_err(syscall(SYS_MADVISE, addr, length, advice));
 }
 
+/* mincore: fill vec[i] bit0 with the residency of each page in [addr, addr+len).
+ * The kernel walks the current address space's page tables (present bit). */
+int mincore(void *addr, size_t length, unsigned char *vec) {
+  return _check_err(syscall(SYS_MINCORE, addr, length, vec));
+}
+
+/* mlock/munlock: b1nix has no swap, so pages are always resident — locking is a
+ * no-op success. (ponytail: wire to a real syscall if a swap-backed config needs
+ * guaranteed residency.) */
+int mlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
+int munlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
+
 /* msync: b1nix has no MSYNC syscall and shared mmaps are write-through via the
  * page cache, so flushing dirty pages back to the backing file is implicit.
  * Treat msync as a successful no-op (callers like LLVM use it to ensure output
@@ -676,6 +693,36 @@ ssize_t recvmsg(int fd, struct msghdr *msg, int flags) {
     return -1;
   }
   return (ssize_t)rc;
+}
+
+/* sendmmsg/recvmmsg: b1nix has no batch syscall, so loop over sendmsg/recvmsg.
+ * Each handled message gets its msg_len filled. Returns the number of messages
+ * processed; -1 (with errno) only if the FIRST message fails. recvmmsg drains
+ * the rest non-blocking after the first, matching the kernel's "return what's
+ * ready" behavior; the timeout argument is not honored across the batch. */
+int sendmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int flags) {
+  unsigned int i;
+  for (i = 0; i < vlen; i++) {
+    ssize_t n = sendmsg(fd, &msgvec[i].msg_hdr, flags);
+    if (n < 0) break;
+    msgvec[i].msg_len = (unsigned int)n;
+  }
+  if (i == 0 && vlen > 0) return -1; /* errno set by sendmsg */
+  return (int)i;
+}
+
+int recvmmsg(int fd, struct mmsghdr *msgvec, unsigned int vlen, int flags,
+             struct timespec *timeout) {
+  unsigned int i;
+  (void)timeout;
+  for (i = 0; i < vlen; i++) {
+    int f = (i == 0) ? flags : (flags | MSG_DONTWAIT);
+    ssize_t n = recvmsg(fd, &msgvec[i].msg_hdr, f);
+    if (n < 0) break; /* first failure -> error; later -> stop, return count */
+    msgvec[i].msg_len = (unsigned int)n;
+  }
+  if (i == 0 && vlen > 0) return -1; /* errno set by recvmsg (e.g. EAGAIN) */
+  return (int)i;
 }
 
 int memfd_create(const char *name, unsigned int flags) {
@@ -1515,6 +1562,22 @@ ssize_t readlink(const char *pathname, char *buf, size_t bufsiz) {
   return _check_err(syscall(SYS_READLINK, pathname, buf, bufsiz));
 }
 
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz) {
+  /* b1nix has no readlinkat(2) syscall. Same convention as the other *at
+   * emulations here: AT_FDCWD or an absolute path resolves directly; a real
+   * dirfd with a relative path is unsupported (ENOSYS). Callers that use it as
+   * an optimization (sandbox proc_util) tolerate the failure. */
+  if (dirfd != AT_FDCWD) {
+    if (pathname && pathname[0] == '/') {
+      /* absolute path */
+    } else {
+      errno = ENOSYS;
+      return -1;
+    }
+  }
+  return readlink(pathname, buf, bufsiz);
+}
+
 int lchown(const char *path, uid_t owner, gid_t group) {
   struct stat st;
   if (lstat(path, &st) < 0) {
@@ -1686,6 +1749,8 @@ long sysconf(int name) {
     return 131072; /* matches ARG_MAX */
   case _SC_GETPW_R_SIZE_MAX:
     return 1024;
+  case _SC_OPEN_MAX:
+    return 256; /* matches OPEN_MAX in <limits.h> */
   default:
     errno = EINVAL;
     return -1;
@@ -1693,6 +1758,9 @@ long sysconf(int name) {
 }
 
 int getpagesize(void) { return (int)sysconf(_SC_PAGESIZE); }
+
+/* BSD getdtablesize(): the fd-table size (== _SC_OPEN_MAX). */
+int getdtablesize(void) { return (int)sysconf(_SC_OPEN_MAX); }
 
 clock_t times(struct tms *buf) {
   long rc = syscall(SYS_TIMES, buf);
@@ -1947,6 +2015,26 @@ ssize_t pread(int fd, void *buf, size_t n, off_t offset) {
   ssize_t r = read(fd, buf, n);
   lseek(fd, cur, SEEK_SET);
   return r;
+}
+
+/* off_t is 64-bit on b1nix, so the LFS *64 variants are just aliases. */
+ssize_t pread64(int fd, void *buf, size_t n, off_t offset) {
+  return pread(fd, buf, n, offset);
+}
+ssize_t pwrite64(int fd, const void *buf, size_t n, off_t offset) {
+  return pwrite(fd, buf, n, offset);
+}
+
+/* posix_fallocate: b1nix has no fallocate syscall, so just grow the file to
+ * cover [offset, offset+len) via ftruncate (writes still extend it on demand).
+ * Returns 0 or an errno value directly — it does NOT set errno. */
+int posix_fallocate(int fd, off_t offset, off_t len) {
+  if (offset < 0 || len <= 0) return EINVAL;
+  off_t end = offset + len;
+  off_t cur = lseek(fd, 0, SEEK_END);
+  if (cur < 0) return errno;
+  if (cur < end && ftruncate(fd, end) < 0) return errno;
+  return 0;
 }
 
 /* b1nix has no mremap syscall; report failure so callers fall back to

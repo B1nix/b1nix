@@ -99,6 +99,7 @@ extern char *program_invocation_short_name;
 #define EILSEQ          84      /* Illegal byte sequence */
 #define EOVERFLOW       75      /* Value too large for defined data type */
 #define ENODATA         61      /* No data available (no such xattr) */
+#define ETIME           62      /* Timer expired */
 #ifndef ENOATTR
 #define ENOATTR         ENODATA /* No such attribute (BSD spelling) */
 #endif

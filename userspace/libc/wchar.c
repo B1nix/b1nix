@@ -358,6 +358,31 @@ int wcscmp(const wchar_t *a, const wchar_t *b) {
 	return (int)(*a - *b);
 }
 
+/* ponytail: ASCII case-fold only — the consumers (googletest test-name compares)
+ * are ASCII; full Unicode case folding can replace __wfold if a port needs it. */
+static wchar_t __wfold(wchar_t c) {
+	return (c >= L'A' && c <= L'Z') ? (wchar_t)(c + (L'a' - L'A')) : c;
+}
+
+int wcscasecmp(const wchar_t *a, const wchar_t *b) {
+	while (*a && __wfold(*a) == __wfold(*b)) {
+		a++;
+		b++;
+	}
+	return (int)(__wfold(*a) - __wfold(*b));
+}
+
+int wcsncasecmp(const wchar_t *a, const wchar_t *b, size_t n) {
+	for (size_t i = 0; i < n; i++) {
+		wchar_t ca = __wfold(a[i]), cb = __wfold(b[i]);
+		if (ca != cb)
+			return (int)(ca - cb);
+		if (!ca)
+			break;
+	}
+	return 0;
+}
+
 int wcsncmp(const wchar_t *a, const wchar_t *b, size_t n) {
 	for (size_t i = 0; i < n; i++) {
 		if (a[i] != b[i])

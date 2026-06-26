@@ -4,6 +4,10 @@
 #define NZERO 20  /* default nice value offset */
 #endif
 
+#ifndef HOST_NAME_MAX
+#define HOST_NAME_MAX 64  /* max gethostname() length (POSIX/Linux value) */
+#endif
+
 #ifndef CHAR_BIT
 #define CHAR_BIT 8
 #endif

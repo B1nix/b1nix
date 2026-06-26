@@ -74,6 +74,11 @@ int ioctl(int fd, unsigned long request, ...);
 #define FIOCLEX    0x5451
 #define FIONCLEX   0x5450
 #endif
+/* TCGETS: terminal get-attributes ioctl. glibc exposes it via <sys/ioctl.h>;
+ * b1nix's canonical copy is in <termios.h>, so guard to allow including both. */
+#ifndef TCGETS
+#define TCGETS     0x5401
+#endif
 #ifndef TIOCSWINSZ
 #define TIOCSWINSZ 0x5414
 #endif

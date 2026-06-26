@@ -41,6 +41,9 @@ ssize_t write(int fd, const void *buf, size_t n);
 ssize_t read(int fd, void *buf, size_t n);
 ssize_t pread(int fd, void *buf, size_t n, off_t offset);
 ssize_t pwrite(int fd, const void *buf, size_t n, off_t offset);
+/* off_t is already 64-bit on b1nix, so the LFS *64 variants are identical. */
+ssize_t pread64(int fd, void *buf, size_t n, off_t offset);
+ssize_t pwrite64(int fd, const void *buf, size_t n, off_t offset);
 /* Real syscall() function (Linux-compat). Declared BEFORE the function-like
  * syscall() macro in <syscall.h> below: direct `syscall(nr, ...)` calls still
  * hit the fast macro, but using `syscall` as a bare name (e.g. passing it to a
@@ -65,6 +68,7 @@ int unlinkat(int dirfd, const char *pathname, int flags);
 int link(const char *oldpath, const char *newpath);
 int rmdir(const char *pathname);
 long lseek(int fd, long offset, int whence);
+long lseek64(int fd, long offset, int whence);
 int execvp(const char *file, char *const argv[]);
 int execlp(const char *file, const char *arg, ...);
 int execv(const char *pathname, char *const argv[]);
@@ -220,6 +224,7 @@ char *getlogin(void);
 
 int symlink(const char *target, const char *linkpath);
 ssize_t readlink(const char *pathname, char *buf, size_t bufsiz);
+ssize_t readlinkat(int dirfd, const char *pathname, char *buf, size_t bufsiz);
 int lchown(const char *path, uid_t owner, gid_t group);
 
 #define _SC_CLK_TCK 2
@@ -231,8 +236,10 @@ int lchown(const char *path, uid_t owner, gid_t group);
 #define _SC_AVPHYS_PAGES 86
 #define _SC_GETPW_R_SIZE_MAX 70  /* suggested getpw*_r buffer size */
 #define _SC_ARG_MAX 0  /* max bytes of arg+env to exec */
+#define _SC_OPEN_MAX 4 /* max open fds (== OPEN_MAX) */
 long sysconf(int name);
 int getpagesize(void);
+int getdtablesize(void);
 
 extern char *optarg;
 extern int optind, opterr, optopt;

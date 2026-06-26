@@ -26,6 +26,7 @@ extern "C" {
 #define RTLD_GLOBAL     4   /* Symbols available to later dlopen()  */
 #define RTLD_LOCAL      0   /* Symbols not available (default)      */
 #define RTLD_NOLOAD     8   /* Don't load, just check               */
+#define RTLD_NODELETE   0x1000  /* Don't unload on dlclose (b1nix: accepted; ld-b1nix.so keeps the object mapped — matches "never unload" intent). */
 
 /* Pseudo-handles for dlsym() */
 #define RTLD_DEFAULT    ((void *)0)          /* Default symbol search */

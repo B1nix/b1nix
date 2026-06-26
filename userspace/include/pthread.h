@@ -121,6 +121,18 @@ int pthread_cond_init(pthread_cond_t *c, const pthread_condattr_t *attr);
 static inline int pthread_condattr_init(pthread_condattr_t *a) { (void)a; return 0; }
 static inline int pthread_condattr_destroy(pthread_condattr_t *a) { (void)a; return 0; }
 static inline int pthread_condattr_setclock(pthread_condattr_t *a, int clk) { (void)a; (void)clk; return 0; }
+/* process-shared sync objects: b1nix ignores pshared (single shared address
+ * space for threads); accept the attribute so ports compile. */
+#define PTHREAD_PROCESS_PRIVATE 0
+#define PTHREAD_PROCESS_SHARED  1
+static inline int pthread_condattr_setpshared(pthread_condattr_t *a, int p) { (void)a; (void)p; return 0; }
+static inline int pthread_condattr_getpshared(const pthread_condattr_t *a, int *p) { (void)a; if (p) *p = PTHREAD_PROCESS_PRIVATE; return 0; }
+static inline int pthread_mutexattr_setpshared(pthread_mutexattr_t *a, int p) { (void)a; (void)p; return 0; }
+static inline int pthread_mutexattr_getpshared(const pthread_mutexattr_t *a, int *p) { (void)a; if (p) *p = PTHREAD_PROCESS_PRIVATE; return 0; }
+/* Thread CPU affinity (GNU). b1nix doesn't pin userspace threads, so set is a
+ * no-op success and get reports the online-CPU set (sched_getaffinity). */
+static inline int pthread_setaffinity_np(pthread_t t, size_t sz, const cpu_set_t *s) { (void)t; (void)sz; (void)s; return 0; }
+static inline int pthread_getaffinity_np(pthread_t t, size_t sz, cpu_set_t *s) { (void)t; return sched_getaffinity(0, sz, s); }
 int pthread_cond_destroy(pthread_cond_t *c);
 int pthread_cond_signal(pthread_cond_t *c);
 int pthread_cond_broadcast(pthread_cond_t *c);

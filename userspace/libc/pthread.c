@@ -17,6 +17,7 @@
 
 #include "syscall.h"
 #include <errno.h>
+#include <stdarg.h>
 #include <fcntl.h>
 #include <pthread.h>
 #include <signal.h>
@@ -175,6 +176,57 @@ static int build_thread_tls(struct pthread_state *st) {
   st->tls_map = blk;
   st->tls_map_size = map_size;
   return 0;
+}
+
+/* --- glibc-style clone() ----------------------------------------------------
+ * b1nix SYS_CLONE jumps the child to entry(arg) on a fresh stack and a returning
+ * entry would `ret` to the kernel's zeroed return slot (= a fault), so we can't
+ * hand the user's fn straight to the kernel. Instead the child enters a
+ * trampoline that calls fn(arg) and then SYS_EXIT_THREADs with the result —
+ * matching the glibc contract (fn-return => exit). fn+arg are stashed in a
+ * 16-byte slot at the top of the child stack (above the kernel's rsp), reachable
+ * via shared (CLONE_VM) or COW-inherited (fork-like) memory. */
+struct __clone_args { int (*fn)(void *); void *arg; };
+
+__attribute__((noreturn))
+static void __clone_trampoline(void *p) {
+  struct __clone_args *a = (struct __clone_args *)p;
+  int (*fn)(void *) = a->fn;
+  void *arg = a->arg;
+  int r = fn(arg);
+  syscall(SYS_EXIT_THREAD, (long)r);
+  __builtin_unreachable();
+}
+
+int clone(int (*fn)(void *), void *stack, int flags, void *arg, ...) {
+  va_list ap;
+  va_start(ap, arg);
+  pid_t *ptid = va_arg(ap, pid_t *);
+  void *tls = va_arg(ap, void *);
+  pid_t *ctid = va_arg(ap, pid_t *);
+  va_end(ap);
+
+  if (!fn || !stack) { errno = EINVAL; return -1; }
+
+  /* Reserve the top 16 bytes (below the 16-aligned top) for {fn,arg}; the child
+   * runs with rsp = top-8 (kernel realigns), so this slot sits above it. */
+  unsigned long top = ((unsigned long)stack & ~15UL) - 16;
+  struct __clone_args *a = (struct __clone_args *)(unsigned long)top;
+  a->fn = fn;
+  a->arg = arg;
+
+  long tid = syscall(SYS_CLONE,
+                     (unsigned long)(unsigned int)flags,
+                     (unsigned long)__clone_trampoline,
+                     top,
+                     (unsigned long)a,
+                     (unsigned long)tls,
+                     (unsigned long)ctid);
+  if (tid < 0) { errno = (int)-tid; return -1; }
+
+  /* b1nix SYS_CLONE has no parent-tid slot; emulate CLONE_PARENT_SETTID. */
+  if (ptid && (flags & CLONE_PARENT_SETTID)) *ptid = (pid_t)tid;
+  return (int)tid;
 }
 
 static void pthread_bootstrap(void *raw) {
@@ -700,7 +752,7 @@ static struct {
   void (*dtor)(void *);
 } g_keys[PTHREAD_KEYS_MAX];
 
-static struct tsd_thread {
+struct tsd_thread {
   long tid;
   const void *vals[PTHREAD_KEYS_MAX];
   struct tsd_thread *next;

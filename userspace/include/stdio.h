@@ -65,6 +65,12 @@ int fseek(FILE *stream, long offset, int whence);
 long ftell(FILE *stream);
 int fseeko(FILE *stream, off_t offset, int whence);
 off_t ftello(FILE *stream);
+/* LFS *64 names: off_t is already 64-bit on b1nix, so these are plain aliases
+ * (zlib/minizip and other ports call fopen64/fseeko64/...). */
+static inline FILE *fopen64(const char *pathname, const char *mode) { return fopen(pathname, mode); }
+static inline FILE *freopen64(const char *pathname, const char *mode, FILE *stream) { return freopen(pathname, mode, stream); }
+static inline int fseeko64(FILE *stream, off_t offset, int whence) { return fseeko(stream, offset, whence); }
+static inline off_t ftello64(FILE *stream) { return ftello(stream); }
 int fflush(FILE *stream);
 int feof(FILE *stream);
 int ferror(FILE *stream);

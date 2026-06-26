@@ -33,8 +33,13 @@
 #define REG_ESP 7
 #endif
 
+/* glibc x86_64: greg_t is a 64-bit signed word; gregset_t is the gregs array.
+ * Chromium's stack_trace_posix declares fields of type greg_t. */
+typedef long greg_t;
+typedef greg_t gregset_t[23];
+
 typedef struct mcontext {
-    long gregs[23];
+    gregset_t gregs;
 } mcontext_t;
 
 typedef struct ucontext {
