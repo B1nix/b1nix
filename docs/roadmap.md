@@ -1086,43 +1086,43 @@ PIE base (`0x500000000000`).
   process), and **`R_X86_64_COPY`**. TLS-GD is smoke-verified (`M69-DL5: tls-gd
   ok`); IRELATIVE/COPY are implemented but not smoke-exercised (the b1nix clang
   target ignores `__attribute__((ifunc))` and normal `.so`s emit no COPY).
-- [x] `done` **Default-ISO ports flipped to dynamic (v0.69.14).** The shared
-  autotools port link recipe (`tools/toolchain/bin/b1nix-autotools-cc`) now
-  defaults `B1NIX_LINK=dynamic`: the executable ports it links — `curl`,
+- [x] `done` **Default-ISO ports flipped to dynamic (v0.69.14 / v0.69.15).** The
+  shared autotools port link recipe (`tools/toolchain/bin/b1nix-autotools-cc`) now
+  defaults `B1NIX_LINK=dynamic`: the executable ports it links — `bash`, `curl`,
   `dropbear`, `wget` — are dynamically-linked `ET_EXEC`s importing libc from the
   shared `libc.so.1` via `/lib/ld-b1nix.so` (the in-kernel M69 loader resolves the
-  COPY relocs for `stdout`/`stderr`/`errno` and the JUMP_SLOTs eagerly at spawn);
-  `B1NIX_LINK=static` restores the historical static link. `busybox` (cross-GCC,
-  v0.69.13) is likewise dynamic (`libc.so.1` + `libgcc_s.so`, interp
+  COPY relocs for `environ`/`stdout`/`stderr`/`errno` and the JUMP_SLOTs eagerly at
+  spawn); `B1NIX_LINK=static` restores the historical static link. `busybox`
+  (cross-GCC, v0.69.13) is likewise dynamic (`libc.so.1` + `libgcc_s.so`, interp
   `/lib/ld64.so.1` — the kernel reads `PT_INTERP` only for logging and links
   in-kernel, so both interpreter strings resolve identically). The compile-only
   library ports the recipe touches (mbedTLS, pcre2, libidn2, ...) are byte-for-byte
   unchanged — they remain static `.a` archives, statically folded into the now
-  dynamic `curl`/`dropbear`/`wget` executables, so "mbedTLS dynamic" is moot (it
-  ships no executable). `wget` x86_64 also needed two pre-existing build fixes to
-  rebuild at all (gnulib's unconditional aclocal/automake regen rules → neutralised
-  with `ACLOCAL=true` etc.; gnulib replacing `timegm`/`mktime` against b1nix's
+  dynamic executables, so "mbedTLS dynamic" is moot (it ships no executable).
+  `wget` x86_64 also needed two pre-existing build fixes to rebuild at all
+  (gnulib's unconditional aclocal/automake regen rules → neutralised with
+  `ACLOCAL=true` etc.; gnulib replacing `timegm`/`mktime` against b1nix's
   `static inline timegm` → `ac_cv_func_timegm=yes`/`gl_cv_func_working_mktime=yes`).
-  Verified by the full **x86_64 834/0** smoke (curl/wget/dropbear/busybox driving
-  every M22/M11/BB-W*/M32-NET/TLS marker as dynamic binaries).
-- **`bash` stays static (M69 loader `.bss`-COPY gap).** bash's own
-  getenv/setenv/putenv set manipulates `environ` directly, so a dynamic link emits
-  an `R_X86_64_COPY` for `environ` (+ `stdin`/`stdout`/`stderr`/`errno`) whose
-  destinations land in bash's `.bss` (beyond the RW segment's `p_filesz`), plus a
-  paired `R_X86_64_GLOB_DAT` for `environ`. The in-kernel M69 loader fails this
-  reloc set (every symbol resolves and every type is supported, yet
-  `apply_rela_table` returns -1 — a silent COPY/`.bss`-tail path) → bash fails to
-  spawn, cascading to `su` and the dropbear SSH session (both exec the login
-  shell). `B1NIX_LINK=static` in `build-bash.sh` keeps bash a static `ET_EXEC`.
-  Fixing the loader's `.bss`-COPY handling would re-enable bash dynamic and likely
-  unblock dynamic V8/rustc too — tracked as follow-up.
+  Verified by the full **x86_64 834/0** smoke with every M22/M11/BB-W*/M32-NET/TLS/
+  BASH-SMOKE marker driven by the dynamic binaries.
+- [x] `done` **M69 loader `.bss`-tail COPY fix (v0.69.15).** bash's own
+  getenv/setenv set manipulates `environ` directly, so its dynamic link emits an
+  `R_X86_64_COPY` for `environ` (+ `stdin`/`stdout`/`stderr`/`errno`) into bash's
+  `.bss` plus a paired `R_X86_64_GLOB_DAT` for `environ`. The 4-byte `errno` COPY
+  lands in the *final* bytes of the RW PT_LOAD (its `memsz` ends exactly 4 bytes
+  after `errno`). `elf64_apply_rela_table` pre-staged a fixed 8-byte `target` slot
+  for *every* reloc and failed (`va+8 > vaddr+memsz`) — but `R_X86_64_COPY` never
+  writes through `target` (it stages dst/src with the symbol's real size), so the
+  probe is now skipped for COPY. This re-enabled bash dynamic and unblocks any
+  binary whose COPY datum sits at a segment boundary (relevant for future dynamic
+  V8/rustc). The other dynamic ports COPY only into `.data` (within `filesz`).
 - **Still static (heavy tail):** the V8 `d8`, Chromium, native `rustc`, NetSurf
   (`nsfb`) and Mesa keep their own static-libc link recipes. `nsfb` (cross-GCC)
   links `libgcc_s.so` dynamically but still folds libc statically; Mesa ships only
   static `.a` libraries (its `libOSMesa.so` link is disabled by design — b1nix is
   static-only there), consumed by b1nix-internal demo executables. Relinking V8 /
-  Chromium / Rust dynamically is a multi-hour high-risk rebuild (and would hit the
-  same `.bss`-COPY loader gap); Rust proc-macros remain deferred (need native rustc).
+  Chromium / Rust dynamically is a multi-hour high-risk rebuild; Rust proc-macros
+  remain deferred (need native rustc).
 
 ## M70: Interrupt-Driven I/O
 

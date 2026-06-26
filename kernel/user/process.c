@@ -487,12 +487,20 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
       return -1;
     u32 type = (u32)rela->r_info;
     u32 sym_index = (u32)(rela->r_info >> 32);
-    u64 *target = (u64 *)elf64_stage_ptr(
-        image, objects[owner].base + rela->r_offset, sizeof(u64));
-    if (!target)
-      return -1;
     if (type == R_X86_64_NONE)
       continue;
+    /* `target` is the 8-byte GOT/data slot written by the RELATIVE / 64 /
+     * GLOB_DAT / JUMP_SLOT / TPOFF64 relocations. R_X86_64_COPY does NOT write
+     * through it — it stages its own dst/src below using the symbol's *actual*
+     * size — so a COPY datum occupying the final bytes of a PT_LOAD (e.g. a
+     * 4-byte `errno` whose RW segment ends exactly 4 bytes after it) must not be
+     * rejected by this fixed 8-byte probe, which would overrun the segment end
+     * (va + 8 > vaddr + memsz) and fail an otherwise valid COPY at a .bss
+     * boundary. The COPY path's own elf64_stage_ptr(.. sz) handles its bounds. */
+    u64 *target = (u64 *)elf64_stage_ptr(
+        image, objects[owner].base + rela->r_offset, sizeof(u64));
+    if (!target && type != R_X86_64_COPY)
+      return -1;
     if (type == R_X86_64_RELATIVE) {
       *target = objects[owner].base + (u64)rela->r_addend;
       continue;

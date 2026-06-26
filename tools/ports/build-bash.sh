@@ -193,17 +193,13 @@ LEGACY_CFLAGS="-g -O2 -fcommon -D_POSIX_VERSION=200809L -Wno-implicit-function-d
 # deliberately override libb1nix's; they appear first in the link line, so
 # --allow-multiple-definition makes the linker keep bash's set.
 export B1NIX_LD_EXTRA="--allow-multiple-definition"
-# bash links STATIC even though the shared port recipe now defaults to dynamic.
-# bash's own getenv/setenv/putenv set manipulates `environ` directly, so a
-# dynamic link emits an R_X86_64_COPY for `environ` (and stdin/stdout/stderr/
-# errno) that lands in bash's .bss *and* a paired GLOB_DAT for `environ`. Those
-# COPY targets sit beyond the RW segment's p_filesz (in the zero-fill .bss tail),
-# a layout the in-kernel M69 loader does not yet relocate correctly (the other
-# dynamic ports — curl/wget/dropbear/busybox — COPY only into .data, within
-# filesz, and load fine). Until the loader handles a COPY destination in the .bss
-# tail, bash stays a static ET_EXEC so it loads; otherwise it fails to spawn and
-# everything that execs the login shell (su, the dropbear SSH session) breaks.
-export B1NIX_LINK=static
+# bash links dynamically against libc.so.1 via the shared recipe's default
+# (B1NIX_LINK=dynamic). bash's own getenv/setenv/putenv set manipulates `environ`
+# directly, so the link emits an R_X86_64_COPY for `environ` (+ stdin/stdout/
+# stderr/errno) into bash's .bss plus a paired GLOB_DAT for `environ`; the 4-byte
+# `errno` COPY lands in the final bytes of the RW segment. The in-kernel M69
+# loader handles that COPY-at-.bss-tail layout (see kernel/user/process.c —
+# R_X86_64_COPY is exempt from the fixed 8-byte target probe).
 make -C "$SRC_DIR" -j"${JOBS:-4}" \
   CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
   CFLAGS="$LEGACY_CFLAGS" \
