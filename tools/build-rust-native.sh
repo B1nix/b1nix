@@ -39,12 +39,17 @@ echo ">> building b1nix userspace libc + crt0 (x86_64)"
 # into LLVM/rustc *shared* objects (libLLVM.so etc.), which require PIC — the
 # non-PIC libb1nix.a triggers `R_X86_64_32 ... recompile with -fPIC` in lld.
 make -C "$ROOT/userspace" -s B1NIX_ARCH=x86_64 \
-    build/x86_64/libb1nix.a build/x86_64/libc.so.1 build/x86_64/crt/crt0.o
+    build/x86_64/libb1nix.a build/x86_64/libc.so.1 \
+    build/x86_64/crt/crt0.o build/x86_64/crt/crt0-dynamic.o
 
 TC="$ROOT/build/toolchain_build/x86_64-b1nix"
 LIBA="$ROOT/userspace/build/x86_64/libb1nix.a"
 PICDIR="$ROOT/userspace/build/x86_64/libc-pic"
-CRT0="$ROOT/userspace/build/x86_64/crt/crt0.o"
+# Dynamic build: use the PIC crt0-dynamic.o. The static crt0.o carries a non-PIE
+# relocation (R_X86_64_PC32 against __register_frame_info) that ld rejects for the
+# now-PIE rustc binary; crt0-dynamic.o is -fPIC and skips libgcc eh-frame
+# registration (rust is panic=abort, so nothing needs it).
+CRT0="$ROOT/userspace/build/x86_64/crt/crt0-dynamic.o"
 LIBM="$ROOT/build/openlibm-b1nix/x86_64-b1nix/install/lib/libm.a"
 AR="$CROSS/x86_64-b1nix-ar"
 [ -f "$LIBM" ] || { echo "error: $LIBM missing — run tools/build-openlibm.sh (LLVM links round/sqrt/pow)"; exit 1; }
@@ -103,11 +108,18 @@ for libdir in "$TC/sysroot/lib" "$TC/cross/x86_64-b1nix/lib"; do
     # the `-L` test forces a real-file replacement.
     stage_file "$LIBA" "$libdir/libb1nix.a"
     stage_file "$COMBINED" "$libdir/libc.a"
-    # Stage the COMBINED archive (libc + libm) as BOTH libc.a AND libm.a.
-    # LLVM tools (e.g. llvm-tblgen) link with an explicit `-lm` but NO `-lc`;
-    # the cross g++ driver's implicit `-lc` can be dropped under
-    # `-Wl,--gc-sections` link ordering, so `-lm` must self-resolve the C
-    # mem*/str* funcs too. Plain openlibm libm.a lacks them — use COMBINED.
+    # Dynamic libc (default): stage the shared libc.so.1 as libc.so so the cross
+    # g++ driver's `-lc` resolves to the shared library (dynamic) rather than the
+    # static libc.a — the same mechanism nsfb uses. B1NIX_LINK=static skips it.
+    if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$ROOT/userspace/build/x86_64/libc.so.1" ]; then
+      stage_file "$ROOT/userspace/build/x86_64/libc.so.1" "$libdir/libc.so.1"
+      ln -sf libc.so.1 "$libdir/libc.so"
+    fi
+    # libm.a = the libc+libm COMBINED archive (musl-style: libm IS libc). When
+    # building dynamic, its C mem*/str* members are NOT pulled: the target spec
+    # forces the shared libc.so in early (--no-as-needed -lc), so those symbols
+    # resolve from it before this archive is reached; only the math members are
+    # pulled. This also keeps the libgcc/unwinder resolution that COMBINED needs.
     stage_file "$COMBINED" "$libdir/libm.a"
     stage_file "$CRT0" "$libdir/crt0.o"
     # Rust's `unwind` crate links `-lunwind` (LLVM libunwind name) on musl+crt-static

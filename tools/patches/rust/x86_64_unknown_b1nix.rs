@@ -44,6 +44,37 @@ pub(crate) fn target() -> Target {
     // (matches the cross-gcc default) so __thread uses %fs+GOT(TPOFF).
     base.tls_model = TlsModel::InitialExec;
     base.add_pre_link_args(LinkerFlavor::Gnu(Cc::Yes, Lld::No), &["-m64"]);
+    // Dynamic libc: the cross-gcc sysroot now ships libc.so (shared). Two parts:
+    //  * `-lc` here, EARLY, resolves to libc.so and provides the C mem*/str* funcs
+    //    dynamically before the libc+libm COMBINED archive (-lm, later) can pull
+    //    static copies. (libc has special driver search, so it is found this early;
+    //    a bare `-lgcc_s` here is NOT — its -L lands later, hence not added here.)
+    //  * `--no-as-needed` stays active for the rest of the line so the driver's own
+    //    (later, correctly -L'd) `-lgcc_s` — which provides the unwinder _Unwind_*,
+    //    __register_frame and __popcountdi2 that libLLVM.so imports — is kept as a
+    //    NEEDED shared lib instead of being dropped under --gc-sections/--as-needed
+    //    (the static libc.a chain that used to drag libgcc in is gone now).
+    base.add_pre_link_args(
+        LinkerFlavor::Gnu(Cc::Yes, Lld::No),
+        &["-Wl,--push-state", "-Wl,--no-as-needed", "-lc", "-Wl,--pop-state"],
+    );
+    // The unwinder (_Unwind_*, __register_frame) and the __popcountdi2 builtin that
+    // libLLVM.so imports must be provided AFTER it on the link line, and libgcc_s's
+    // -L is not set up early enough for a pre-link `-lgcc_s` (rust drives with
+    // -nodefaultlibs, so the gcc driver does not add libgcc_s itself either). Put it
+    // in late_link_args, which ld processes after the user libraries (incl.
+    // libLLVM.so) and after the toolchain -L paths — so it is both found and
+    // positioned to satisfy libLLVM.so's references. --no-as-needed (set above) is
+    // still active here, so it is kept as a NEEDED shared lib.
+    crate::spec::add_link_args(
+        &mut base.late_link_args,
+        LinkerFlavor::Gnu(Cc::Yes, Lld::No),
+        // --push-state/--pop-state isolates this from rust's own -Bstatic/-Bdynamic
+        // bookkeeping; -Bdynamic forces libgcc_s.so to link as a shared lib even
+        // inside the crt-static rustc binary link (where the default is -Bstatic,
+        // which would otherwise "attempt static link of dynamic object").
+        &["-Wl,--push-state", "-Wl,-Bdynamic", "-Wl,--no-as-needed", "-lgcc_s", "-Wl,--pop-state"],
+    );
 
     // panic=abort for now — the unwinder exists (libgcc_s), but unwinding across
     // the b1nix exec boundary is not yet exercised; see RUST-PORT-PLAN.md.

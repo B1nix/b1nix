@@ -26,11 +26,15 @@ LOG="${LOG:-$ROOT_DIR/smoke_run/rust-run.log}"
 TIMEOUT="${TIMEOUT:-300}"
 
 RUSTC="$ST/bin/rustc"
-DRV="$ST/lib/librustc_driver-b089cdab8985b1db.so"
-LLVM="$ST/lib/libLLVM.so.22.1-rust-1.98.0-nightly"
+# librustc_driver's hash varies with the build config; find it by glob. The
+# from-source-LLVM build (download-ci-llvm=false) folds LLVM into this .so as
+# static archives, so there is no separate libLLVM.so anymore. rustc is now
+# dynamic-libc (NEEDED libc.so.1), so the shared libc.so.1 ships in the chain too.
+DRV="$(ls "$ST"/lib/librustc_driver-*.so 2>/dev/null | head -1)"
+LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 LIBGCC="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/lib/libgcc_s.so.1"
 
-for f in "$RUSTC" "$DRV" "$LLVM" "$LIBGCC" "$KELF"; do
+for f in "$RUSTC" "$DRV" "$LIBC" "$LIBGCC" "$KELF"; do
 	[ -f "$f" ] || { echo "missing: $f"; exit 1; }
 done
 STRIP="${STRIP:-strip}"
@@ -44,8 +48,9 @@ rm -rf "$STAGE"; mkdir -p "$STAGE/bin" "$STAGE/lib"
 cp "$RUSTC" "$STAGE/bin/rustc"
 # strip --strip-unneeded keeps .dynsym/.dynstr/.rela.* (what the kernel loader
 # needs) and drops only .symtab/.debug_* — safe for DT_NEEDED loading.
-cp "$DRV"  "$STAGE/lib/librustc_driver-b089cdab8985b1db.so"; "$STRIP" --strip-unneeded "$STAGE/lib/librustc_driver-b089cdab8985b1db.so"
-cp "$LLVM" "$STAGE/lib/libLLVM.so.22.1-rust-1.98.0-nightly";  "$STRIP" --strip-unneeded "$STAGE/lib/libLLVM.so.22.1-rust-1.98.0-nightly"
+DRV_NAME="$(basename "$DRV")"
+cp "$DRV"  "$STAGE/lib/$DRV_NAME"; "$STRIP" --strip-unneeded "$STAGE/lib/$DRV_NAME"
+cp "$LIBC" "$STAGE/lib/libc.so.1"       # the shared libc rustc + driver now import
 cp "$LIBGCC" "$STAGE/lib/libgcc_s.so"   # tiny; leave symbols intact
 SZ=$(du -sm "$STAGE" | cut -f1)
 echo "  staged ${SZ}MB"
@@ -63,8 +68,8 @@ mkdir /lib
 cd /bin
 write $STAGE/bin/rustc rustc
 cd /lib
-write $STAGE/lib/librustc_driver-b089cdab8985b1db.so librustc_driver-b089cdab8985b1db.so
-write $STAGE/lib/libLLVM.so.22.1-rust-1.98.0-nightly libLLVM.so.22.1-rust-1.98.0-nightly
+write $STAGE/lib/$DRV_NAME $DRV_NAME
+write $STAGE/lib/libc.so.1 libc.so.1
 write $STAGE/lib/libgcc_s.so libgcc_s.so
 EOF
 echo "  rust.img = ${IMG_MB}MB"

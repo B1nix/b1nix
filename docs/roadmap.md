@@ -1155,11 +1155,29 @@ PIE base (`0x500000000000`).
   the shared library exactly like `libgcc_s.so`. nsfb now imports `libc.so.1` and
   renders end-to-end under the full smoke: `M53-NS ok js/jxl`, `M53-FB ok
   load/redraw/render/svg`, `M53-INPUT ok mouse/key`. **x86_64 834/0.**
-- **Still static (heavy tail):** `m53_libpng_smoke` (libpng `&longjmp` absolute reloc),
-  native `rustc` (already a dynamic PIE against `librustc_driver.so`/`libLLVM.so`; only
-  the small libc is folded — its build stages libc.a/libm.a-as-COMBINED into the cross
-  sysroot, so a clean dynamic-libc relink needs untangling that), and Chromium
-  (intentionally deferred — doesn't run yet). Rust proc-macros remain deferred.
+- [x] `done` **Native `rustc` flipped to dynamic libc (v0.69.20).** The whole rust
+  toolchain now imports libc from the shared `libc.so.1` and runs end-to-end on b1nix
+  (`M68-RUST: ok rustc-load` + the `rustc 1.98.0-nightly` banner). Six layers were
+  peeled, each a real wall the static-libc port design had baked in:
+  (1) `bootstrap.toml` `crt-static = false` so the rustc binary is a dynamic PIE (was
+  `+crt-static`); (2) `build-rust-native.sh` stages the PIC `crt0-dynamic.o` (the
+  static crt0 has a non-PIE `__register_frame_info` reloc); (3) the target spec pulls
+  the shared `libc.so` in early (`--push-state --no-as-needed -lc`) so the C funcs
+  resolve dynamically before the COMBINED `-lm` archive folds them, plus a late
+  `-lgcc_s` for the `_Unwind_*`/`__popcountdi2` the static-libc chain used to drag in;
+  (4) `download-ci-llvm = false` + `[llvm] ldflags`/`targets`/`ccache` builds the host
+  + b1nix LLVM from source as static `.a`s folded into `librustc_driver.so` (so there
+  is no separate static-libc `libLLVM.so` anymore — the 141 MB driver imports every
+  libc/math symbol UND from `libc.so.1`); (5) `libc.so.1` folds PIC openlibm
+  (musl-style: libm IS libc) so the shared libc exports `log1p/cosh/tan/…` too;
+  (6) `userspace/libc/openlibm_compat.c` adds the `crealf/cimagf/scalbnl` openlibm
+  references b1nix lacked. The only static residue is the rustc binary's
+  `compiler_builtins` `memcpy`/`memset` intrinsics, which Rust statically links into
+  every binary by design. Verified: full **x86_64 834/0** with the new openlibm-`libc.so.1`,
+  and the dynamic rustc runs in QEMU (`tools/rust/rust-proof.sh`, hash-agnostic).
+- **Still static (heavy tail):** `m53_libpng_smoke` (libpng `&longjmp` absolute reloc —
+  non-PIE physics, not fixable) and Chromium (intentionally deferred — doesn't run
+  yet). Rust proc-macros remain deferred (need the dynamic loader's dlopen path).
 
 ## M70: Interrupt-Driven I/O
 

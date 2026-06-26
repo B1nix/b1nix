@@ -109,7 +109,8 @@ LIBC_OBJS := \
 	$(BUILD)/libc/dlfcn.o \
 	$(BUILD)/libc/div64.o \
 	$(BUILD)/libc/posix_compat.o \
-	$(BUILD)/libc/rust_compat.o
+	$(BUILD)/libc/rust_compat.o \
+	$(BUILD)/libc/openlibm_compat.o
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
 	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke
@@ -229,9 +230,14 @@ $(GUI_LIB): $(GUI_OBJS)
 	@mkdir -p $(dir $@)
 	$(AR) rcs $@ $(GUI_OBJS)
 
-$(SHARED_LIBC): $(PIC_LIBC_OBJS) linker_shared.ld
+# libc.so.1 folds the PIC openlibm (musl-style: libm IS libc) so the shared
+# library exports the math funcs (log1p/cosh/tan/...) too. Dynamic consumers
+# (e.g. the rust libLLVM.so / librustc_driver.so built against the shared libc)
+# then import math from libc.so.1 instead of statically folding openlibm.
+$(SHARED_LIBC): $(PIC_LIBC_OBJS) linker_shared.ld $(LIBM_DIR)/lib/libm.a
 	$(LD) $(LDFLAGS) -shared -z norelro --hash-style=sysv -soname libc.so.1 \
-		-T linker_shared.ld -o $@ $(PIC_LIBC_OBJS)
+		-T linker_shared.ld -o $@ $(PIC_LIBC_OBJS) \
+		--whole-archive $(LIBM_DIR)/lib/libm.a --no-whole-archive
 
 build/libb1nix.a: $(LIB)
 	@mkdir -p build
