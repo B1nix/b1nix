@@ -26,6 +26,12 @@ CRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0.o"
 LINKER="$ROOT_DIR/userspace/linker-cxx.ld"
 LIBB1="$ROOT_DIR/userspace/build/x86_64/libb1nix.a"
 LIBM="$ROOT_DIR/build/openlibm-b1nix/x86_64-b1nix/install/lib/libm.a"
+# B1NIX_LINK=dynamic links d8 against the shared libc.so.1 via the in-kernel
+# loader (interpreter /lib/ld-b1nix.so) instead of whole-archiving libb1nix.a —
+# matches the default-ISO port flip. Default stays static for back-compat.
+DYNCRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0-dynamic.o"
+SHARED_LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
+B1NIX_LINK="${B1NIX_LINK:-dynamic}"
 LIBGCC="$("$GXX" -print-libgcc-file-name)"
 # C++ runtime: a clang+libc++ build (use_custom_libcxx) produces its own
 # libc++.a/libc++abi.a in the out dir — link those instead of GCC's libstdc++/
@@ -72,12 +78,25 @@ RUST_STD=""
 
 # One big --start-group so the C++<->rust<->rust-std<->libc<->libstdc++ circular
 # references all resolve (rust rlibs need rust std; rust std needs libb1nix libc).
-"$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
-  -o d8.b1nix \
-  "$CRT0" \
-  --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
-  "$MATHL_O" $CXXRT "$LIBGCC" "$LIBM" \
-  --whole-archive "$LIBB1" --no-whole-archive --end-group
+if [ "$B1NIX_LINK" = "dynamic" ]; then
+  echo "  link model: DYNAMIC (shared libc.so.1 via /lib/ld-b1nix.so)"
+  # libc is now a shared dependency outside the group; the C++/rust/rust-std
+  # archives still resolve their libc references as dynamic imports against it.
+  "$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
+    --dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv \
+    -o d8.b1nix \
+    "$DYNCRT0" \
+    --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
+    "$MATHL_O" $CXXRT "$LIBGCC" "$LIBM" --end-group \
+    "$SHARED_LIBC"
+else
+  "$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
+    -o d8.b1nix \
+    "$CRT0" \
+    --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
+    "$MATHL_O" $CXXRT "$LIBGCC" "$LIBM" \
+    --whole-archive "$LIBB1" --no-whole-archive --end-group
+fi
 
 echo "=== linked: $OUT/d8.b1nix ==="
 "$TC/x86_64-b1nix-readelf" -h d8.b1nix | grep -E 'Class|Machine|Type|Entry'

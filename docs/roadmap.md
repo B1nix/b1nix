@@ -1116,13 +1116,26 @@ PIE base (`0x500000000000`).
   probe is now skipped for COPY. This re-enabled bash dynamic and unblocks any
   binary whose COPY datum sits at a segment boundary (relevant for future dynamic
   V8/rustc). The other dynamic ports COPY only into `.data` (within `filesz`).
-- **Still static (heavy tail):** the V8 `d8`, Chromium, native `rustc`, NetSurf
-  (`nsfb`) and Mesa keep their own static-libc link recipes. `nsfb` (cross-GCC)
-  links `libgcc_s.so` dynamically but still folds libc statically; Mesa ships only
-  static `.a` libraries (its `libOSMesa.so` link is disabled by design — b1nix is
-  static-only there), consumed by b1nix-internal demo executables. Relinking V8 /
-  Chromium / Rust dynamically is a multi-hour high-risk rebuild; Rust proc-macros
-  remain deferred (need native rustc).
+- [x] `done` **V8 `d8` flipped to dynamic (v0.69.16).** `tools/v8/v8-link-d8.sh`
+  gained a `B1NIX_LINK=dynamic` path (now the default) that links the gn-compiled
+  d8 object set against the shared `libc.so.1` via `/lib/ld-b1nix.so` (crt0-dynamic,
+  `--hash-style=sysv -z norelro`) instead of whole-archiving `libb1nix.a`. This is a
+  *relink* of the existing objects — no multi-hour ninja rebuild. Verified by
+  re-running d8 in QEMU on two profiles: `b1nix-jit-maglev` (no-rust) and the
+  everything-on `b1nix-jit-temporal` (Rust + Temporal). The dynamic d8 loads via the
+  in-kernel loader (`PT_INTERP=/lib/ld-b1nix.so`, `NEEDED libc.so.1`, 145 UND syms
+  all satisfied by `libc.so.1`) and runs JavaScript **and Rust-backed Temporal**
+  (`M58-V8: ok hello/loop-sum/temporal-plaindate/temporal-duration/temporal-add →
+  done`) — identical markers to the static temporal d8. (The COPY-at-segment-boundary
+  loader fix above is what unblocked it.) `B1NIX_LINK=static` restores the historical
+  whole-archive link.
+- **Still static (heavy tail):** Chromium (intentionally deferred — doesn't run
+  yet), native `rustc`, NetSurf (`nsfb`) and Mesa keep their own static-libc link
+  recipes. `nsfb` (cross-GCC) links `libgcc_s.so` dynamically but still folds libc
+  statically (a rebuild on the now-dynamic recipe would likely pick it up); Mesa
+  ships only static `.a` libraries (its `libOSMesa.so` link is disabled by design),
+  consumed by b1nix-internal demo executables already dynamic at the exe level. Rust
+  proc-macros remain deferred (need native rustc).
 
 ## M70: Interrupt-Driven I/O
 
