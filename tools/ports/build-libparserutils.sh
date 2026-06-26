@@ -8,53 +8,17 @@
 #
 # M53 (NetSurf browser platform) — browser lib chain step 2. libhubbub and
 # libcss/libdom all parse their input through this.
-
+# Build logic lives in tools/ports/drivers/nslib.sh; this is the manifest.
 set -eu
-
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-PU_VERSION="${PU_VERSION:-0.2.5}"
-TARBALL="libparserutils-${PU_VERSION}-src.tar.gz"
-URL="https://download.netsurf-browser.org/libs/releases/${TARBALL}"
-AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
-PERL_BIN="${PERL:-$(command -v perl)}"
 
-. "$ROOT_DIR/tools/toolchain/env.sh"
-
-SRC_PARENT="$ROOT_DIR/build/netsurf-src"
-SRC_DIR="$SRC_PARENT/libparserutils-${PU_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/libparserutils-b1nix/$B1NIX_TRIPLET"
-OBJ_DIR="$BUILD_DIR/obj"
-INSTALL_DIR="$BUILD_DIR/install"
-
-mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
-
-if [ ! -d "$SRC_DIR" ]; then
-  tmp="$SRC_PARENT/$TARBALL"
-  [ -f "$tmp" ] || curl -L "$URL" -o "$tmp" 1>&2
-  tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
-fi
-
-# Charset-alias table: the upstream build generates src/charset/aliases.inc from
-# build/Aliases via a perl script. Run it once (it is host perl, arch-agnostic).
-if [ ! -f "$SRC_DIR/src/charset/aliases.inc" ]; then
-  ( cd "$SRC_DIR" && "$PERL_BIN" build/make-aliases.pl ) 1>&2
-fi
-
-if [ "$B1NIX_ARCH" = "x86" ]; then
-  TARGET="i686-unknown-elf"
-else
-  TARGET="x86_64-unknown-elf"
-fi
-
-# WITHOUT_ICONV_FILTER → use the bundled codecs, no <iconv.h>. -Isrc for the
-# internal "charset/..."/"utils/..." headers; quoted aliases.inc resolves next
-# to aliases.c automatically.
-CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-  -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix -DWITHOUT_ICONV_FILTER
-  -I$SRC_DIR/include -I$SRC_DIR/src -Wno-implicit-function-declaration"
-
-SOURCES="
+NSLIB_NAME=libparserutils
+NSLIB_VERSION="${PU_VERSION:-0.2.5}"
+NSLIB_ARCHIVE=libparserutils.a
+# WITHOUT_ICONV_FILTER → use the bundled codecs, no <iconv.h>.
+NSLIB_CFLAGS="-DWITHOUT_ICONV_FILTER -Wno-implicit-function-declaration"
+NSLIB_HEADERS="tree:include/parserutils"
+NSLIB_SOURCES="
   src/charset/aliases.c
   src/charset/codec.c
   src/charset/codecs/codec_8859.c
@@ -72,16 +36,13 @@ SOURCES="
   src/utils/vector.c
 "
 
-OBJS=""
-for rel in $SOURCES; do
-  obj="$OBJ_DIR/$(echo "$rel" | tr '/' '_').o"
-  # shellcheck disable=SC2086
-  clang $CFLAGS -c "$SRC_DIR/$rel" -o "$obj"
-  OBJS="$OBJS $obj"
-done
+# Charset-alias table: the upstream build generates src/charset/aliases.inc from
+# build/Aliases via a perl script. Run it once (host perl, arch-agnostic).
+port_pre_build() {
+  PERL_BIN="${PERL:-$(command -v perl)}"
+  if [ ! -f "$SRC_DIR/src/charset/aliases.inc" ]; then
+    ( cd "$SRC_DIR" && "$PERL_BIN" build/make-aliases.pl ) 1>&2
+  fi
+}
 
-# shellcheck disable=SC2086
-"$AR_BIN" rcs "$INSTALL_DIR/lib/libparserutils.a" $OBJS
-cp -R "$SRC_DIR/include/parserutils" "$INSTALL_DIR/include/"
-
-echo "$INSTALL_DIR"
+. "$ROOT_DIR/tools/ports/drivers/nslib.sh"
