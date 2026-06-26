@@ -769,3 +769,18 @@ open(p, 'w', encoding='utf-8').write(s)
 print("Patch C46 applied: generate_policy_source.py (map b1nix->linux for policy support)")
 PYEOF
 else echo "Patch C46 skipped (file missing)"; fi
+
+# --- Patch C47: restore content_shell_lib rust_test deps (enable_rust is ON) ---
+# C18 removed :rust_test_mojom/_js/:rust_test_service_ffi from content_shell_lib
+# deps back when enable_rust was OFF. It is ON now (Chromium-with-Rust), and
+# shell_content_browser_client.cc includes rust_test_service_ffi.rs.h +
+# rust_test.test-mojom.h and calls BindRustTestService UNCONDITIONALLY, so the C++
+# target must depend on the codegen or the generated headers are never built
+# ("fatal error: ...rs.h file not found"). Re-add them under if(enable_rust) so
+# gn-gen still works if rust is ever turned off (the target defs are guarded too).
+F="$SRC/content/shell/BUILD.gn"
+if [ -f "$F" ] && ! grep -q 'b1nix: rust_test codegen deps' "$F"; then
+  perl -0777 -i -pe 's~(  if \(use_ozone\) \{\n    deps \+= \[ "//ui/ozone" \]\n  \}\n)~$1\n  if (enable_rust) {  # b1nix: rust_test codegen deps (headers used unconditionally by shell_content_browser_client.cc)\n    deps += [\n      ":rust_test_mojom",\n      ":rust_test_mojom_js",\n      ":rust_test_service_ffi",\n    ]\n  }\n~' "$F"
+  grep -q 'b1nix: rust_test codegen deps' "$F" || die "Patch C47 anchor not found in $F"
+  echo "Patch C47 applied: content_shell_lib rust_test deps under enable_rust"
+else echo "Patch C47 already present (or file missing)"; fi
