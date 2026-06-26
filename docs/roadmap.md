@@ -1129,13 +1129,20 @@ PIE base (`0x500000000000`).
   done`) — identical markers to the static temporal d8. (The COPY-at-segment-boundary
   loader fix above is what unblocked it.) `B1NIX_LINK=static` restores the historical
   whole-archive link.
-- **Still static (heavy tail):** Chromium (intentionally deferred — doesn't run
-  yet), native `rustc`, NetSurf (`nsfb`) and Mesa keep their own static-libc link
-  recipes. `nsfb` (cross-GCC) links `libgcc_s.so` dynamically but still folds libc
-  statically (a rebuild on the now-dynamic recipe would likely pick it up); Mesa
-  ships only static `.a` libraries (its `libOSMesa.so` link is disabled by design),
-  consumed by b1nix-internal demo executables already dynamic at the exe level. Rust
-  proc-macros remain deferred (need native rustc).
+- [x] `done` **Graphics/GUI/browser smoke binaries flipped to dynamic (v0.69.17).**
+  A `BESPOKE_*` link mode in `userspace/Makefile` (non-PIE dynamic ET_EXEC: crt0-
+  dynamic + `--dynamic-linker /lib/ld-b1nix.so` + shared `libc.so.1`, with bundled
+  static archives still folded — the d8 model) converted **27 of 28** bespoke-static
+  binaries: GUI demos, libwayland, mbedTLS nettool/httpsd, the M51 desktop stack
+  (pixman/freetype/cairo/harfbuzz) and the M53 NetSurf codec/lib smokes. Verified by
+  the full **x86_64 834/0** smoke. `m53_libpng_smoke` stays static (residual debt):
+  libpng's setjmp/longjmp error path takes the absolute address of `longjmp`,
+  emitting R_X86_64_32 relocs a non-PIE link cannot form against an imported symbol.
+- **Still static (heavy tail):** the Mesa OSMesa/EGL demo executables (`m52_osmesa`,
+  `m52_glsl`, `m53_mesa_virgl`, `m59_smoke` — built by `tools/ports/build-mesa.sh` /
+  `tools/demos/build-m59-egl.sh`, not the userspace Makefile), `m53_libpng_smoke`,
+  NetSurf (`nsfb`, GCCSDK cross-GCC link), native `rustc`, and Chromium (intentionally
+  deferred — doesn't run yet). Rust proc-macros remain deferred (need native rustc).
 
 ## M70: Interrupt-Driven I/O
 
