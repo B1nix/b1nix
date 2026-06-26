@@ -695,3 +695,46 @@ if [ -f "$F" ] && ! grep -q 'system_headers/linux_syscalls.h' "$F"; then
   grep -q 'system_headers/linux_syscalls.h' "$F" || die "Patch C44 anchor not found in $F"
   echo "Patch C44 applied: die.cc (include seccomp syscall map)"
 else echo "Patch C44 already present (or file missing)"; fi
+
+# --- Patch C45: generate_policy_source.py — conditional cloud-policy import ----
+# The generated cloud_policy.proto imports policy_common_definitions.proto for the
+# *PolicyProto field types, but content_shell defines no cloud policies, so
+# CloudPolicySettings is empty and the import goes unused → protoc warns "Import
+# ... is unused" → the build's --fatal_warnings makes it a hard error (cascades to
+# every TU that includes cloud_policy.pb.h). Fix the generator to emit the import
+# only when there is at least one field — correct upstream-compatible behaviour,
+# not a b1nix-specific hack. (Done via inline python: the replacement text mixes
+# ' and ", which a shell-quoted perl one-liner can't carry cleanly.)
+F="$SRC/components/policy/tools/generate_policy_source.py"
+if [ -f "$F" ]; then
+  python3 - "$F" <<'PYEOF' || die "Patch C45 failed"
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+marker = 'only referenced when CloudPolicySettings has at least one field'
+if marker in s:
+    print("Patch C45 already present")
+    sys.exit(0)
+# 1) drop the unconditional import from CLOUD_POLICY_PROTO_HEAD (the CHROME_SETTINGS
+#    head keeps its own commented import — disambiguated by the missing comment).
+old_head = ('option go_package="chromium/policy/enterprise_management_proto";\n'
+            '\nimport "policy_common_definitions.proto";\n\n\'\'\'')
+new_head = 'option go_package="chromium/policy/enterprise_management_proto";\n\n\'\'\''
+if s.count(old_head) != 1:
+    sys.exit("C45: CLOUD_POLICY_PROTO_HEAD anchor not unique/found")
+s = s.replace(old_head, new_head)
+# 2) emit the import only when CloudPolicySettings will have fields.
+anchor = '\n  sorted_chunk_numbers = sorted(fields.keys())'
+ins = ('\n  # policy_common_definitions.proto supplies the *PolicyProto field types,'
+       ' so it\n  # is only referenced when CloudPolicySettings has at least one'
+       ' field. Emitting\n  # the import for an empty policy set (e.g. content_shell)'
+       ' makes protoc warn\n  # "Import ... is unused", which --fatal_warnings turns'
+       ' into a hard error.\n  if fields:\n'
+       '    f.write(\'import "policy_common_definitions.proto";\\n\\n\')')
+if s.count(anchor) != 1:
+    sys.exit("C45: sorted_chunk_numbers anchor not unique/found")
+s = s.replace(anchor, ins + anchor, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("Patch C45 applied: generate_policy_source.py (conditional cloud-policy import)")
+PYEOF
+else echo "Patch C45 skipped (file missing)"; fi
