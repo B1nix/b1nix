@@ -738,3 +738,34 @@ open(p, 'w', encoding='utf-8').write(s)
 print("Patch C45 applied: generate_policy_source.py (conditional cloud-policy import)")
 PYEOF
 else echo "Patch C45 skipped (file missing)"; fi
+
+# --- Patch C46: generate_policy_source.py — recognise b1nix as a Linux platform
+# Policies are gated on build-config platform tokens (PLATFORM_STRINGS); b1nix has
+# no entry, so every policy is "unsupported" → the generated cloud_policy.proto and
+# policy_constants.cc come out EMPTY (zero-length arrays, missing key:: constants),
+# breaking ~19 policy consumers (policy_map, *_policy_handler, search_engines, ...).
+# b1nix is Linux-like (OS_LINUX in base/), so map it to 'linux' next to the existing
+# chromeos→chrome_os normalisation. This is the real root fix; C45 only handled the
+# now-unreachable empty-policy edge.
+F="$SRC/components/policy/tools/generate_policy_source.py"
+if [ -f "$F" ]; then
+  python3 - "$F" <<'PYEOF' || die "Patch C46 failed"
+import sys
+p = sys.argv[1]
+s = open(p, encoding='utf-8').read()
+if "elif target_platform == 'b1nix'" in s:
+    print("Patch C46 already present")
+    sys.exit(0)
+anchor = "  if target_platform == 'chromeos':\n    target_platform = 'chrome_os'\n"
+ins = ("\n  # b1nix is a Linux-like OS (detected as OS_LINUX in base/). Policies are\n"
+       "  # gated on build-config platform tokens (PLATFORM_STRINGS), which have no\n"
+       "  # b1nix entry, so without this every policy is \"unsupported\" and the\n"
+       "  # generated proto/constants come out empty. Treat b1nix as Linux.\n"
+       "  elif target_platform == 'b1nix':\n    target_platform = 'linux'\n")
+if s.count(anchor) != 1:
+    sys.exit("C46: chromeos-normalization anchor not unique/found")
+s = s.replace(anchor, anchor + ins, 1)
+open(p, 'w', encoding='utf-8').write(s)
+print("Patch C46 applied: generate_policy_source.py (map b1nix->linux for policy support)")
+PYEOF
+else echo "Patch C46 skipped (file missing)"; fi
