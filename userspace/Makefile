@@ -170,7 +170,13 @@ endif
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
 BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js,$(BINARIES)))
-DEPS := $(LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d)
+# Include the PIC libc objects' .d files too: libc.so.1 is built from
+# $(PIC_LIBC_OBJS), and without their header dependencies a change to a shared
+# header (e.g. the struct dirent layout in include/dirent.h) rebuilds the static
+# libb1nix.a but leaves the shared libc.so.1 stale — so dynamically linked base
+# programs run against an out-of-date libc ABI (observed: readdir d_name offset
+# skew breaking every dynamic readdir consumer while the static ones were fine).
+DEPS := $(LIBC_OBJS:.o=.d) $(PIC_LIBC_OBJS:.o=.d) $(BIN_OBJS:.o=.d) $(CRT0:.o=.d) $(DYNAMIC_CRT0:.o=.d)
 
 .PHONY: all clean install install-headers-libs
 .SECONDARY:
