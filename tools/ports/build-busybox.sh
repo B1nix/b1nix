@@ -263,9 +263,20 @@ fi
 
 # ── 3. Build ────────────────────────────────────────────────────────────────
 echo "Building BusyBox..."
-# Link using userspace library and load at 0x2000000
+# Link DYNAMICALLY against the shared libc.so.1 via /lib/ld-b1nix.so (the in-kernel
+# M69 loader resolves it eagerly at spawn), instead of the historical fully-static
+# link. The cross-gcc driver prefers the sysroot's libc.so (-> libc.so.1) over
+# libc.a once -static is dropped, so the executable becomes a dynamically-linked
+# ET_EXEC importing libc from libc.so.1 (COPY relocs for stdout/stderr/errno,
+# JUMP_SLOTs for the functions). crt0's weak __register_frame_info reference goes
+# through the GOT (see crt0.S), so a C-only port that does not pull libgcc_s.so
+# leaves it resolved to 0 and skips eh-frame registration rather than trapping.
+# -L$SYSROOT/lib is required so ld finds the sysroot's libc.so (shared) before the
+# cross toolchain's own x86_64-b1nix/lib/libc.a (static): the gcc-internal lib dir
+# holds only libc.a, so without this -L the link silently falls back to static
+# libc even though -static was dropped.
 export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include"
-export EXTRA_LDFLAGS="-static -Wl,-Ttext-segment=0x2000000 --sysroot=$SYSROOT"
+export EXTRA_LDFLAGS="-Wl,-Ttext-segment=0x2000000 -L$SYSROOT/lib --sysroot=$SYSROOT"
 
 make -C "$BUILD_DIR" -j"$NPROC" CROSS_COMPILE="${TARGET}-"
 

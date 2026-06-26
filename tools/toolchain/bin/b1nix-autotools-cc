@@ -19,9 +19,25 @@ else
 fi
 LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
 CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
+SHARED_LIBC="$USR/build/$B1NIX_ARCH/libc.so.1"
+DYNAMIC_CRT0="$USR/build/$B1NIX_ARCH/crt/crt0-dynamic.o"
 LINKER="$USR/linker.ld"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 
+# Link model. B1NIX_LINK=dynamic links the final executable DYNAMICALLY against
+# the shared libc.so.1 via the in-kernel loader (interpreter /lib/ld-b1nix.so):
+# the result is a dynamically-linked ET_EXEC that imports libc as undefined
+# symbols (COPY relocs for stdout/stderr/errno, JUMP_SLOTs for the functions),
+# while the port's own objects and any bundled static archives stay statically
+# linked at the fixed 0x2000000 base (non-PIE, so no -fPIC needed). Library
+# (compile-only / -c) invocations are unaffected — only the link step changes.
+# Default stays `static` so unconverted ports are byte-for-byte unchanged.
+B1NIX_LINK="${B1NIX_LINK:-static}"
+
+if [ "$B1NIX_LINK" = "dynamic" ]; then
+  [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
+    make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$SHARED_LIBC" "$DYNAMIC_CRT0"
+fi
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$LIB" "$CRT0"
 
 CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
@@ -117,4 +133,14 @@ done
 # Optional extra linker flags (opt-in via env; empty by default so existing
 # ports are unaffected). bash, for instance, ships its own getenv/setenv set
 # that intentionally shadows libb1nix's, needing --allow-multiple-definition.
-"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+if [ "$B1NIX_LINK" = "dynamic" ]; then
+  # Dynamically-linked ET_EXEC against the shared libc.so.1. crt0-dynamic.o
+  # reaches `environ` through the GOT and skips libgcc eh-frame registration, so
+  # there is no canonical-PLT-to-0 trap. The port's bundled static archives
+  # ($objs / $ldargs) link normally; only libc becomes a shared dependency.
+  "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
+    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" $objs $ldargs \
+    ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
+else
+  "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+fi
