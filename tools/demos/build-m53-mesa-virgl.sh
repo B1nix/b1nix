@@ -39,11 +39,18 @@ GCC_INC="$("$GCC" -print-file-name=include)"
   -I "$MESA_SRC/src/mesa" -I "$MESA_SRC/src/gallium/winsys/virgl/b1nix" \
   -c "$ROOT_DIR/userspace/bin/m53_mesa_virgl.c" -o "$OBJ"
 
-# shellcheck disable=SC2046
+# Dynamic by default: libc from the shared libc.so.1 via /lib/ld-b1nix.so (d8
+# model); B1NIX_LINK=static restores the whole-archive static link.
+if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
+  DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC="--whole-archive $UB/libb1nix.a --no-whole-archive"
+else
+  DYN_CRT0="$UB/crt/crt0-dynamic.o"; DYN_FLAGS="--dynamic-linker /lib/ld-b1nix.so --hash-style=sysv"; DYN_LIBC="$UB/libc.so.1"
+fi
+# shellcheck disable=SC2046,SC2086
 "$LD" -m "$LDEMU" -T "$ROOT_DIR/userspace/linker-cxx.ld" --gc-sections \
-  -z norelro --allow-multiple-definition -o "$OUT" \
-  "$UB/crt/crt0.o" "$OBJ" \
-  --start-group $(ls "$MESA"/lib/*.a) "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" \
-  --whole-archive "$UB/libb1nix.a" --no-whole-archive --end-group
+  -z norelro --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
+  "$DYN_CRT0" "$OBJ" \
+  --start-group $(ls "$MESA"/lib/*.a) "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" --end-group \
+  $DYN_LIBC
 
 "$STRIP" "$OUT"

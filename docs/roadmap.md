@@ -1138,11 +1138,19 @@ PIE base (`0x500000000000`).
   the full **x86_64 834/0** smoke. `m53_libpng_smoke` stays static (residual debt):
   libpng's setjmp/longjmp error path takes the absolute address of `longjmp`,
   emitting R_X86_64_32 relocs a non-PIE link cannot form against an imported symbol.
-- **Still static (heavy tail):** the Mesa OSMesa/EGL demo executables (`m52_osmesa`,
-  `m52_glsl`, `m53_mesa_virgl`, `m59_smoke` — built by `tools/ports/build-mesa.sh` /
-  `tools/demos/build-m59-egl.sh`, not the userspace Makefile), `m53_libpng_smoke`,
-  NetSurf (`nsfb`, GCCSDK cross-GCC link), native `rustc`, and Chromium (intentionally
-  deferred — doesn't run yet). Rust proc-macros remain deferred (need native rustc).
+- [x] `done` **Mesa OSMesa/EGL demo executables flipped to dynamic (v0.69.18).** The
+  four real-Mesa demos (`m52_osmesa`, `m52_glsl`, `m53_mesa_virgl`, `m59_smoke`) are
+  linked by per-demo scripts (`tools/demos/build-m5{2,3,9}-*.sh`) that fold the OSMesa
+  softpipe `.a` + libstdc++/libsupc++/libgcc; each gained a `B1NIX_LINK=dynamic`
+  (default) path linking the shared `libc.so.1` via `/lib/ld-b1nix.so`. All four relink
+  dynamically (no absolute-reloc gap — unlike libpng) and run GPU-accelerated under the
+  full smoke: `M52-GFX`, `M53-VIRGL: ok …`, `M53-GFX: ok gl-accelerated/gl-triangle`,
+  `M59-SMOKE: ok egl-context/egl-render`. **x86_64 834/0.**
+- **Still static (heavy tail):** `m53_libpng_smoke` (libpng `&longjmp` absolute reloc),
+  NetSurf (`nsfb`, GCCSDK cross-GCC link), native `rustc` (already a dynamic PIE
+  against `librustc_driver.so`/`libLLVM.so`; only the small libc is folded), and
+  Chromium (intentionally deferred — doesn't run yet). Rust proc-macros remain
+  deferred (need native rustc).
 
 ## M70: Interrupt-Driven I/O
 

@@ -44,10 +44,18 @@ CFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix \
 "$GCC" $CFLAGS -c "$ROOT_DIR/userspace/libegl/b1egl_mesa.c" -o "$EGL_OBJ"
 
 # shellcheck disable=SC2046
+# Dynamic by default: links libc from the shared libc.so.1 via /lib/ld-b1nix.so
+# (the d8 model). B1NIX_LINK=static restores the whole-archive static link.
+if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
+  DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC='--whole-archive '"$UB"'/libb1nix.a --no-whole-archive'
+else
+  DYN_CRT0="$UB/crt/crt0-dynamic.o"; DYN_FLAGS="--dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv"; DYN_LIBC="$UB/libc.so.1"
+fi
+# shellcheck disable=SC2086
 "$LD" -m "$LDEMU" -T "$ROOT_DIR/userspace/linker-cxx.ld" --gc-sections \
-  --allow-multiple-definition -o "$OUT" \
-  "$UB/crt/crt0.o" "$SMOKE_OBJ" "$EGL_OBJ" "$MESA/lib/osmesa_target.o" \
+  --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
+  "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" "$MESA/lib/osmesa_target.o" \
   --start-group $(ls "$MESA"/lib/*.a) "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" "$LIBM" \
-  --whole-archive "$UB/libb1gui.a" "$UB/libb1nix.a" --no-whole-archive --end-group
+  --whole-archive "$UB/libb1gui.a" --no-whole-archive --end-group $DYN_LIBC
 
 "$STRIP" "$OUT"
