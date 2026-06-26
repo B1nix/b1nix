@@ -56,9 +56,18 @@ _start:
 	/* envp = argv + (argc + 1) * 8  (skip argc+1 pointers past argv terminator) */
 	leaq 8(%rsp, %rdi, 8), %rdx
 
-	/* Store envp in global environ variable */
+	/* Store envp in the global environ variable. In a statically linked
+	 * binary `environ` is a local definition, reachable with a PC-relative
+	 * store. In a dynamic binary it is imported from libc.so.1, so it must be
+	 * reached through the GOT: environ@GOTPCREL emits an R_X86_64_GLOB_DAT the
+	 * loader resolves to libc's own `environ`, and we store envp through that
+	 * pointer. A plain environ(%rip) would reference a nonexistent local copy,
+	 * leaving getenv()/environ broken for every dynamically linked program. */
 #ifndef B1NIX_DYNAMIC
 	movq %rdx, environ(%rip)
+#else
+	movq environ@GOTPCREL(%rip), %rax
+	movq %rdx, (%rax)
 #endif
 
 	/* Align for C call ABI while preserving decoded argc/argv/envp. */

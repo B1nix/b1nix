@@ -39,6 +39,29 @@ CRT0     := $(BUILD)/crt/crt0.o
 DYNAMIC_CRT0 := $(BUILD)/crt/crt0-dynamic.o
 LINKER   := linker.ld
 
+# ── Link model (dynamic by default) ───────────────────────────────────────
+# The base userspace links DYNAMICALLY against the shared libc.so.1 and is
+# loaded through the in-kernel M69 dynamic loader on every spawn. `LINK=static`
+# restores fully static ET_EXEC linking (the historical fallback). Only the
+# generic single-source binary rule honours this switch; ported-library and
+# C++/GUI binaries keep their bespoke static recipes (explicit residual debt).
+LINK ?= dynamic
+ifeq ($(LINK),static)
+GEN_PIC        :=
+GEN_CRT0       := $(CRT0)
+GEN_LINKER     := linker.ld
+GEN_LIBDEP     := $(LIB)
+GEN_LINK_EXTRA :=
+GEN_LINK_LIBS  := --whole-archive $(LIB) --no-whole-archive
+else
+GEN_PIC        := -fPIC
+GEN_CRT0       := $(DYNAMIC_CRT0)
+GEN_LINKER     := linker_pie.ld
+GEN_LIBDEP     := $(LIB) $(SHARED_LIBC)
+GEN_LINK_EXTRA := -pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-b1nix.so
+GEN_LINK_LIBS  := $(SHARED_LIBC)
+endif
+
 LIBC_OBJS := \
 	$(BUILD)/libc/string.o \
 	$(BUILD)/libc/atomic.o \
@@ -204,10 +227,13 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 
 
 # ── User programs ──
-$(BUILD)/bin/%: bin/%.c $(LIB) $(CRT0) $(LINKER)
+# Dynamic by default (links against libc.so.1 via /lib/ld-b1nix.so + the
+# in-kernel loader); LINK=static restores the historical static recipe. The
+# mode is selected by the GEN_* variables defined near the top of this file.
+$(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
-	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/$*.o --whole-archive $(LIB) --no-whole-archive
+	$(CC) $(CFLAGS) $(GEN_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -T $(GEN_LINKER) -o $@ $(GEN_CRT0) $(BUILD)/bin/$*.o $(GEN_LINK_LIBS)
 
 $(GUI_BINARIES): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
@@ -556,7 +582,7 @@ else
 endif
 
 # ── Install to rootfs ──
-install-headers-libs: $(LIB) $(GUI_LIB) $(CRT0)
+install-headers-libs: $(LIB) $(GUI_LIB) $(CRT0) $(SHARED_LIBC)
 	@echo "Installing userspace headers and libraries..."
 	@mkdir -p $(ROOTFS)/include
 	@mkdir -p $(ROOTFS)/lib
@@ -564,6 +590,8 @@ install-headers-libs: $(LIB) $(GUI_LIB) $(CRT0)
 	cp $(LIB) $(ROOTFS)/lib/
 	cp $(GUI_LIB) $(ROOTFS)/lib/
 	cp $(CRT0) $(ROOTFS)/lib/
+	cp $(SHARED_LIBC) $(ROOTFS)/lib/
+	ln -sf libc.so.1 $(ROOTFS)/lib/libc.so
 	ln -sf libb1nix.a $(ROOTFS)/lib/libc.a
 	ln -sf libb1nix.a $(ROOTFS)/lib/libm.a
 	@mkdir -p $(ROOTFS)/usr
