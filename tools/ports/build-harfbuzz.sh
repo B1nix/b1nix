@@ -22,6 +22,8 @@ BUILD_DIR="$ROOT_DIR/build/harfbuzz-b1nix/$B1NIX_TRIPLET"
 OBJ_DIR="$BUILD_DIR/obj"
 INSTALL_DIR="$BUILD_DIR/install"
 GXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/bin/$B1NIX_TRIPLET-g++"
+# Route the cross g++ through ccache when present (byte-identical object).
+CCACHE="$(command -v ccache 2>/dev/null || true)"
 
 mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$INSTALL_DIR/include/harfbuzz" \
   "$INSTALL_DIR/lib"
@@ -36,7 +38,7 @@ fi
 # sysroot now (idempotent; see the script). No per-build header hacks needed.
 "$ROOT_DIR/tools/toolchain/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" >/dev/null 2>&1 || true
 
-"$GXX" -c -O2 -DHB_TINY -DHB_NO_MT \
+$CCACHE "$GXX" -c -O2 -DHB_TINY -DHB_NO_MT \
   -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++14 \
   -I"$SRC_DIR/src" "$SRC_DIR/src/harfbuzz.cc" \
   -o "$OBJ_DIR/harfbuzz.o"

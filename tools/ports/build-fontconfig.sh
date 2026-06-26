@@ -14,6 +14,7 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 GPERF="${GPERF:-$(command -v /opt/homebrew/opt/gperf/bin/gperf 2>/dev/null || command -v gperf)}"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
+CCACHE="$(command -v ccache 2>/dev/null || true)"  # ccache: byte-identical objects
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/fontconfig-${FC_VERSION}"
@@ -111,7 +112,7 @@ for src in "$SRC_DIR/src"/fc*.c "$SRC_DIR/src/ftglue.c"; do
   base=$(basename "$src" .c)
   case "$base" in *test*) continue;; esac
   obj="$OBJ_DIR/$base.o"
-  clang $CFLAGS -c "$src" -o "$obj"
+  $CCACHE clang $CFLAGS -c "$src" -o "$obj"
   OBJS="$OBJS $obj"
 done
 

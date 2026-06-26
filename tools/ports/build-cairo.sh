@@ -13,6 +13,7 @@ URL="https://www.cairographics.org/releases/${TARBALL}"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
+CCACHE="$(command -v ccache 2>/dev/null || true)"  # ccache: byte-identical objects
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/cairo-${CAIRO_VERSION}"
@@ -80,7 +81,7 @@ SOURCES="cairo.c $(sed -n '137,245p' "$SRC_DIR/src/Makefile.sources" \
 OBJS=""
 for c in $SOURCES; do
   obj="$OBJ_DIR/$(basename "$c" .c).o"
-  clang $CFLAGS -c "$S/$c" -o "$obj"
+  $CCACHE clang $CFLAGS -c "$S/$c" -o "$obj"
   OBJS="$OBJS $obj"
 done
 

@@ -14,6 +14,7 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 BISON="${BISON:-$(command -v /opt/homebrew/opt/bison/bin/bison 2>/dev/null || command -v bison)}"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
+CCACHE="$(command -v ccache 2>/dev/null || true)"  # ccache: byte-identical objects
 
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/libxkbcommon-${XKB_VERSION}"
@@ -73,7 +74,7 @@ keywords rules scanner symbols types vmod xkbcomp"
 OBJS=""
 cc1() {
   obj="$OBJ_DIR/$(echo "$1" | tr / _).o"
-  clang $CFLAGS -c "$2" -o "$obj"
+  $CCACHE clang $CFLAGS -c "$2" -o "$obj"
   OBJS="$OBJS $obj"
 }
 for c in $CORE; do cc1 "$c" "$S/$c.c"; done

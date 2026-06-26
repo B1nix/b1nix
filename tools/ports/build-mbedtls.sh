@@ -34,60 +34,10 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xzf "$tmp" -C "$SRC_PARENT/$B1NIX_TRIPLET"
 fi
 
-CFG="$SRC_DIR/include/mbedtls/mbedtls_config.h"
-# Enable time/date support: b1nix libc provides time() (SYS_TIME) and gmtime_r,
-# and the wall clock is now settable (settimeofday / SYS_SETTIMEOFDAY), so
-# mbedTLS can validate certificate notBefore/notAfter windows. Re-enable the
-# config if a prior build had undef'd it (idempotent).
-if grep -q '^/\* #undef MBEDTLS_HAVE_TIME \*/$' "$CFG"; then
-  sed -i.bak 's@^/\* #undef MBEDTLS_HAVE_TIME \*/$@#define MBEDTLS_HAVE_TIME@' "$CFG"
-fi
-if grep -q '^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$' "$CFG"; then
-  sed -i.bak 's@^/\* #undef MBEDTLS_HAVE_TIME_DATE \*/$@#define MBEDTLS_HAVE_TIME_DATE@' "$CFG"
-fi
-# MBEDTLS_TIMING_C (M54): the timing layer (DTLS retransmit timers,
-# mbedtls_timing_get_timer) only needs gettimeofday in mbedTLS 3.x, which b1nix
-# libc provides. Keep it enabled (re-enable idempotently if a prior build
-# undef'd it). The portability #error gate in timing.c is taught about b1nix
-# below.
-if grep -q '^/\* #undef MBEDTLS_TIMING_C \*/$' "$CFG"; then
-  sed -i.bak 's@^/\* #undef MBEDTLS_TIMING_C \*/$@#define MBEDTLS_TIMING_C@' "$CFG"
-fi
-if grep -q '^#define MBEDTLS_NET_C$' "$CFG"; then
-  sed -i.bak 's/^#define MBEDTLS_NET_C$/\/\* #undef MBEDTLS_NET_C \*\//' "$CFG"
-fi
-# Recover from prior local edits where PSA core may have been commented out.
-if grep -q '^/\* #undef MBEDTLS_PSA_CRYPTO_C \*/$' "$CFG"; then
-  sed -i.bak 's@^/\* #undef MBEDTLS_PSA_CRYPTO_C \*/$@#define MBEDTLS_PSA_CRYPTO_C@' "$CFG"
-fi
-rm -f "$CFG.bak"
-
-# MBEDTLS_HAVE_TIME pulls in mbedtls_ms_time(), whose implementation is gated on
-# _POSIX_VERSION >= 199309L. b1nix does not advertise that macro, yet the body
-# only needs clock_gettime(CLOCK_MONOTONIC) and time() — both of which b1nix
-# libc provides — so the gate, not the code, is the problem. Teach the gate to
-# accept b1nix (the -Db1nix macro is always passed by the cross wrapper).
-PLATFORM_UTIL="$SRC_DIR/library/platform_util.c"
-if ! grep -q 'defined(b1nix)' "$PLATFORM_UTIL"; then
-  sed -i.bak 's@^#if (defined(_POSIX_VERSION) && _POSIX_VERSION >= 199309L) || defined(__HAIKU__)$@#if (defined(_POSIX_VERSION) \&\& _POSIX_VERSION >= 199309L) || defined(__HAIKU__) || defined(b1nix)@' "$PLATFORM_UTIL"
-  rm -f "$PLATFORM_UTIL.bak"
-fi
-
-# timing.c has a hard #error unless one of the known Unix/Windows macros is
-# defined; b1nix is Unix-like (the non-Windows path uses only gettimeofday).
-# Teach the gate about b1nix so MBEDTLS_TIMING_C compiles.
-TIMING_C="$SRC_DIR/library/timing.c"
-if ! grep -q 'defined(b1nix)' "$TIMING_C"; then
-  sed -i.bak 's@^    !defined(__APPLE__) && !defined(_WIN32) && !defined(__QNXNTO__) && \\$@    !defined(__APPLE__) \&\& !defined(_WIN32) \&\& !defined(__QNXNTO__) \&\& !defined(b1nix) \&\& \\@' "$TIMING_C"
-  rm -f "$TIMING_C.bak"
-fi
-
-# On b1nix, /dev/urandom is not guaranteed, but getrandom(2) is.
-# Inject a tiny platform hook so mbedTLS entropy poll uses getrandom directly.
-ENTROPY_POLL="$SRC_DIR/library/entropy_poll.c"
-if ! grep -q "B1NIX_GETRANDOM_SHIM" "$ENTROPY_POLL"; then
-  perl -0pi -e 's@#include <stdio\.h>\n@#include <stdio.h>\n\n#if defined(b1nix)\n#include <sys/random.h>\n#include <errno.h>\n#define HAVE_GETRANDOM\n#define B1NIX_GETRANDOM_SHIM\nstatic int getrandom_wrapper(void *buf, size_t buflen, unsigned int flags)\n{\n    return (int) getrandom(buf, buflen, flags);\n}\n#endif\n@' "$ENTROPY_POLL"
-fi
+# b1nix adaptation of the mbedTLS source tree (config toggles for time/timing/
+# PSA, the platform_util.c / timing.c #if gates, and the getrandom entropy
+# shim). Extracted to a separate, idempotent patch file (was 7 inline edits).
+sh "$ROOT_DIR/tools/patches/mbedtls/b1nix-config.sh" "$SRC_DIR"
 
 make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
 

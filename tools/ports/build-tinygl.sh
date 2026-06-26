@@ -32,9 +32,11 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 # Single-threaded smoke: disable the multithreaded raster paths (OpenMP pragmas)
-# so the port has no thread runtime dependency. Idempotent.
-sed -i.bak -E 's/(#define TGL_FEATURE_MULTITHREADED_[A-Z_]+)[[:space:]]+1/\1 0/' \
-  "$SRC_DIR/include/zfeatures.h"
+# so the port has no thread runtime dependency. Extracted, idempotent patch.
+sh "$ROOT_DIR/tools/patches/tinygl/no-multithread.sh" "$SRC_DIR"
+
+# Route the compiler through ccache when present (byte-identical objects).
+CC="clang"; command -v ccache >/dev/null 2>&1 && CC="ccache clang"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   TARGET="i686-unknown-elf"
@@ -51,7 +53,7 @@ CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
 OBJS=""
 for c in "$SRC_DIR"/src/*.c; do
   obj="$OBJ_DIR/$(basename "$c" .c).o"
-  clang $CFLAGS -c "$c" -o "$obj"
+  $CC $CFLAGS -c "$c" -o "$obj"
   OBJS="$OBJS $obj"
 done
 
@@ -60,7 +62,7 @@ done
 
 # b1nix EGL shim (userspace-owned glue) -> libEGL.a. Its public header lives in
 # userspace/include/EGL/egl.h (already on the -isystem path), like b1nix/gui.h.
-clang $CFLAGS -c "$ROOT_DIR/userspace/libegl/b1egl.c" -o "$OBJ_DIR/b1egl.o"
+$CC $CFLAGS -c "$ROOT_DIR/userspace/libegl/b1egl.c" -o "$OBJ_DIR/b1egl.o"
 "$AR_BIN" rcs "$INSTALL_DIR/lib/libEGL.a" "$OBJ_DIR/b1egl.o"
 
 cp "$SRC_DIR/include/GL/gl.h" "$INSTALL_DIR/include/GL/"
