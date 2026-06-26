@@ -23,6 +23,13 @@ int m69_plugin_ctor_ran = 0;
 
 int m69_plugin_add(int a, int b) { return a + b; }
 
+/* General-dynamic TLS → R_X86_64_DTPMOD64 / R_X86_64_DTPOFF64 + __tls_get_addr:
+ * a __thread counter reached only through these accessors, so each access in the
+ * dlopen'd object exercises the runtime loader's matured TLS path. */
+static __thread int g_tls_counter = 100;
+int m69_plugin_tls_bump(void) { return ++g_tls_counter; }
+int m69_plugin_tls_get(void) { return g_tls_counter; }
+
 __attribute__((constructor)) static void m69_plugin_init(void) {
   m69_plugin_ctor_ran = 1;
   write(1, g_ctor_msg, sizeof(g_ctor_text) - 1);

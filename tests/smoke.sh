@@ -1486,6 +1486,7 @@ if [ "$ARCH" = "x86_64" ]; then
   check_output "$LOG" "M69-DL: dlsym ok" "M69 P1: dlopen/dlsym resolves+calls a libc.so.1 symbol"
   check_output "$LOG" "M69-PLUGIN: ctor" "M69 P2: dlopen runs the new object's DT_INIT_ARRAY ctor"
   check_output "$LOG" "M69-DL2: dlopen-run ok" "M69 P2: runtime-loaded .so relocated, dlsym'd, and called"
+  check_output "$LOG" "M69-DL5: tls-gd ok" "M69 P4: general-dynamic TLS (DTPMOD64/DTPOFF64 + __tls_get_addr) in a dlopen'd object"
   check_output "$LOG" "M69-DL3: refcount-scope ok" "M69 P3: refcount + RTLD_DEFAULT scope work"
   check_output "$LOG" "M69-PLUGIN: dtor" "M69 P3: final dlclose runs DT_FINI_ARRAY dtor + unmaps"
 fi

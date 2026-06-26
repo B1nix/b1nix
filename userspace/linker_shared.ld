@@ -4,6 +4,7 @@ PHDRS
 	ro PT_LOAD FLAGS(4);
 	data PT_LOAD FLAGS(6);
 	dynamic PT_DYNAMIC FLAGS(6);
+	tls PT_TLS FLAGS(4);
 }
 
 SECTIONS
@@ -18,6 +19,13 @@ SECTIONS
 	.dynstr : { *(.dynstr) } :ro
 	.hash : { *(.hash) } :ro
 	.gnu.hash : { *(.gnu.hash) } :ro
+
+	/* Thread-local storage template. A dlopen'd object's __thread variables are
+	 * reached via general-dynamic TLS (__tls_get_addr); the loader copies this
+	 * PT_TLS template into a per-module block on first use. .tbss is NOBITS and
+	 * must follow .tdata so PT_TLS memsz spans both. */
+	.tdata ALIGN(8) : { *(.tdata .tdata.* .gnu.linkonce.td.*) } :data :tls
+	.tbss ALIGN(8) : { *(.tbss .tbss.* .gnu.linkonce.tb.*) *(.tcommon) } :data :tls
 
 	.data : ALIGN(0x1000) { *(.data .data.*) } :data
 	.init_array : ALIGN(8) {

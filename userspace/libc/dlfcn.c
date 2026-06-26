@@ -55,6 +55,17 @@ struct dl_object {
   void (*fini)(void);
   void (**fini_array)(void);
   size_t fini_arrayn;
+  /* PT_TLS of this object, for general-dynamic TLS in dlopen'd modules:
+   * DTPMOD64 fills a GOT slot with `tls_module`, DTPOFF64 fills the next with
+   * the variable's offset in the template, and __tls_get_addr(module,offset)
+   * returns tls_block+offset — lazily allocating the per-process block from the
+   * template on first use. (Single-thread/main-thread model; b1nix dlopen has
+   * no per-thread DTV yet, which is sufficient for every current consumer.) */
+  int tls_module;       /* >0 once this object carries a PT_TLS, else 0    */
+  const void *tls_image; /* template bytes in the mapped image (filesz)    */
+  size_t tls_memsz;
+  size_t tls_filesz;
+  void *tls_block;      /* lazily allocated block for __tls_get_addr        */
   char path[DL_PATH_MAX];
   struct dl_object *next;
 };
@@ -63,6 +74,30 @@ static struct dl_object *g_objects;  /* head of the loaded-object list */
 static struct dl_object g_base;      /* libc.so.1 base object storage  */
 static int g_base_tried;
 static const char *_dl_errmsg;
+static int g_next_tls_module = 1;    /* unique DTPMOD64 ids for dlopen'd TLS */
+
+/* General-dynamic TLS entry point. The compiler emits a call to this for every
+ * __thread access in a shared object (the default GD model): the argument is a
+ * GOT pair { module_id, offset } filled by R_X86_64_DTPMOD64 / R_X86_64_DTPOFF64.
+ * Return the address of that thread-local for the calling thread. b1nix dlopen
+ * has no per-thread DTV, so we allocate one block per module on first use and
+ * hand out block+offset — correct for the main thread (the only one that runs a
+ * dlopen'd module's TLS in current usage). */
+struct __tls_index { unsigned long ti_module; unsigned long ti_offset; };
+
+void *__tls_get_addr(struct __tls_index *ti) {
+  for (struct dl_object *o = g_objects; o; o = o->next) {
+    if (o->tls_module != (int)ti->ti_module || o->tls_module == 0)
+      continue;
+    if (!o->tls_block && o->tls_memsz) {
+      o->tls_block = calloc(1, o->tls_memsz);
+      if (o->tls_block && o->tls_image && o->tls_filesz)
+        memcpy(o->tls_block, o->tls_image, o->tls_filesz);
+    }
+    return (char *)o->tls_block + ti->ti_offset;
+  }
+  return NULL;
+}
 
 static int is_libc_name(const char *n) {
   return strcmp(n, "libc.so") == 0 || strcmp(n, "libc.so.1") == 0 ||
@@ -91,6 +126,20 @@ static void *obj_lookup(const struct dl_object *o, const char *name) {
 /* Global (RTLD_DEFAULT) scope: search every loaded object in list order. */
 static void *global_lookup(const char *name) {
   for (struct dl_object *o = g_objects; o; o = o->next) {
+    void *p = obj_lookup(o, name);
+    if (p)
+      return p;
+  }
+  return NULL;
+}
+
+/* Like global_lookup but skips `self` — an R_X86_64_COPY in the (rare) non-PIC
+ * dlopen'd object must find the *defining* library's copy, not its own. */
+static void *global_lookup_excluding(const struct dl_object *self,
+                                     const char *name) {
+  for (struct dl_object *o = g_objects; o; o = o->next) {
+    if (o == self)
+      continue;
     void *p = obj_lookup(o, name);
     if (p)
       return p;
@@ -180,6 +229,48 @@ static int apply_rela(struct dl_object *o, const Elf64_Rela *rela, size_t bytes)
       }
       uint64_t addend = (type == R_X86_64_64) ? (uint64_t)rela[i].r_addend : 0;
       *where = (uint64_t)val + addend;
+      break;
+    }
+    case R_X86_64_IRELATIVE: {
+      /* IFUNC: the addend is a resolver function (a load-base-relative offset);
+       * call it now — in this running process, ring 3 — and store the address
+       * it returns. The selected implementation thus reflects the real runtime
+       * CPU, exactly as glibc's ld.so does it. */
+      uint64_t (*resolver)(void) =
+          (uint64_t(*)(void))(o->base + rela[i].r_addend);
+      *where = resolver();
+      break;
+    }
+    case R_X86_64_COPY: {
+      /* Copy a data object out of the defining library into this object's own
+       * storage (only a non-PIC dlopen'd ET_DYN emits these — rare, but cheap
+       * and correct to support). */
+      const Elf64_Sym *s = &o->symtab[symi];
+      const char *name = o->strtab + s->st_name;
+      void *src = global_lookup_excluding(o, name);
+      if (src && s->st_size)
+        memcpy(where, src, s->st_size);
+      break;
+    }
+    case R_X86_64_DTPMOD64: {
+      /* GD TLS, first GOT word: the module id of the object that owns the
+       * thread-local. A local (symi==0) ref names this object; a named symbol is
+       * resolved to its defining object so cross-object __thread refs work too. */
+      int mod = o->tls_module;
+      if (symi) {
+        const Elf64_Sym *s = &o->symtab[symi];
+        const char *name = o->strtab + s->st_name;
+        for (struct dl_object *d = g_objects; d; d = d->next)
+          if (d->tls_module && obj_lookup(d, name)) { mod = d->tls_module; break; }
+      }
+      *where = (uint64_t)mod;
+      break;
+    }
+    case R_X86_64_DTPOFF64: {
+      /* GD TLS, second GOT word: the variable's offset inside its module's TLS
+       * block (template-relative st_value + addend). */
+      const Elf64_Sym *s = &o->symtab[symi];
+      *where = (uint64_t)s->st_value + (uint64_t)rela[i].r_addend;
       break;
     }
     default:
@@ -369,6 +460,19 @@ static void *load_object(const char *path, int flag) {
     }
   }
 
+  /* Capture a PT_TLS template (general-dynamic TLS for dlopen'd modules). The
+   * module gets a unique id; DTPMOD64/DTPOFF64 relocations and __tls_get_addr
+   * use it to materialise the block lazily. */
+  for (int i = 0; i < eh->e_phnum; i++) {
+    if (ph[i].p_type != PT_TLS)
+      continue;
+    o->tls_module = g_next_tls_module++;
+    o->tls_image = (const void *)(base + ph[i].p_vaddr);
+    o->tls_memsz = ph[i].p_memsz;
+    o->tls_filesz = ph[i].p_filesz;
+    break;
+  }
+
   /* Make this object visible (its own exports resolve self-references and
    * become available to later lookups) before relocating. */
   o->next = g_objects;
@@ -500,6 +604,8 @@ int dlclose(void *handle) {
     return 0;
   run_fini(o);
   unlink_object(o);
+  if (o->tls_block)
+    free(o->tls_block);
   munmap(o->map_addr, o->map_len);
   free(o);
   return 0;

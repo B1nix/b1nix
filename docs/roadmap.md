@@ -1061,6 +1061,37 @@ for a profiled bottleneck rather than speculative churn:
   the per-segment `memcpy`), and a sorted/binary-search variant would add an
   invariant to maintain across the during-load callers for sub-ms savings.
 
+## M69c: Dynamic linking by default + matured loader relocations
+
+The base system now links **dynamically by default** (relates to M71 PIE-by-default
+and the M69b loader): every base userspace program is a PIE that links against the
+shared `libc.so.1` through `/lib/ld-b1nix.so` + the in-kernel M69 loader, instead
+of a fully static ET_EXEC. `LINK=static` in `userspace/Makefile` restores the
+historical static link. **x86_64 smoke 834/0** with every base ELF loaded at the
+PIE base (`0x500000000000`).
+
+- [x] `done` **Dynamic-by-default base.** `userspace/Makefile` generic program
+  rule links `-pie` against `libc.so.1` with the dynamic crt0; `libc.so.1` ships in
+  every initramfs. The whole M12–M58 smoke suite runs as dynamic PIEs.
+- [x] `done` **`struct dirent` ABI fix (v0.69.11).** The Chromium-port grind had
+  inserted `d_type` *before* `d_name`, shifting `d_name` off the offset the
+  prebuilt cross-GCC libstdc++/Fontconfig/busybox/curl ecosystem reads it at;
+  under dynamic-by-default this broke `readdir` for dynamic consumers. `d_type`
+  moved after `d_name` (offset 8 restored), and `libc.so.1`'s PIC objects gained
+  the header-dependency tracking they were missing (stale shared-libc bug).
+- [x] `done` **Matured `dlfcn.c` relocations (v0.69.12).** The userspace runtime
+  loader now also handles **general-dynamic TLS** in a dlopen'd object
+  (`R_X86_64_DTPMOD64`/`DTPOFF64` + a real `__tls_get_addr` that materialises a
+  per-module TLS block), **IFUNC** (`R_X86_64_IRELATIVE`, resolver called in
+  process), and **`R_X86_64_COPY`**. TLS-GD is smoke-verified (`M69-DL5: tls-gd
+  ok`); IRELATIVE/COPY are implemented but not smoke-exercised (the b1nix clang
+  target ignores `__attribute__((ifunc))` and normal `.so`s emit no COPY).
+- **Still static (heavy tail):** the V8 `d8`, Chromium, native `rustc`, NetSurf,
+  Mesa and the autotools/meson C/C++ ports (busybox, bash, curl, dropbear,
+  mbedTLS) keep their own static-libc link recipes — relinking each dynamically is
+  per-port build-system work and, for V8/Chromium/Rust, a multi-hour high-risk
+  rebuild. Rust proc-macros remain deferred (need native rustc).
+
 ## M70: Interrupt-Driven I/O
 
 - [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,

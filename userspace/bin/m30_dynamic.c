@@ -53,6 +53,20 @@ int main(void) {
   void *missing = dlsym(RTLD_DEFAULT, "m69_no_such_symbol_zzz");
   if (global_add != (void *)add || missing != 0)
     return 1;
+
+  /* Phase 4 — matured relocations: general-dynamic TLS in a dlopen'd object
+   * (R_X86_64_DTPMOD64/DTPOFF64 filled by the loader, reached through
+   * __tls_get_addr). The plugin's __thread counter is private to this access. */
+  int (*tls_bump)(void) = (int (*)(void))dlsym(plugin, "m69_plugin_tls_bump");
+  int (*tls_get)(void) = (int (*)(void))dlsym(plugin, "m69_plugin_tls_get");
+  if (!tls_bump || !tls_get)
+    return 1;
+  if (tls_get() != 100 || tls_bump() != 101 || tls_bump() != 102 ||
+      tls_get() != 102)
+    return 1;
+  if (emit("M69-DL5: tls-gd ok\n"))
+    return 1;
+
   if (dlclose(plugin) != 0) /* refcount 1 -> 0, runs destructor + munmap */
     return 1;
   if (emit("M69-DL3: refcount-scope ok\n"))
