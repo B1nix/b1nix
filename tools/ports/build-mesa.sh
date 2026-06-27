@@ -20,6 +20,12 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
+# ccache for faster rebuilds (byte-identical objects)
+CCACHE=""
+if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
+  CCACHE="$(command -v ccache)"
+fi
+
 SRC_PARENT="$ROOT_DIR/build/ports-src"
 SRC_DIR="$SRC_PARENT/mesa-${MESA_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET"
@@ -154,6 +160,9 @@ perl -0pi -e 's/static void virgl_disk_cache_create\(struct virgl_screen \*scree
 perl -0pi -e 'unless (/#define MIN\(a,\s*b\)/) { s/(#include [^\n]*\n)/$1#ifndef MIN\n#define MIN(a, b) ((a) < (b) ? (a) : (b))\n#endif\n#ifndef MAX\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\n#endif\n/; }' "$SRC_DIR/src/gallium/drivers/virgl/virgl_video.c"
 
 if [ ! -f "$MESON_BUILD/build.ninja" ]; then
+  if [ -n "$CCACHE" ]; then
+    export CC_LD="$CCACHE"
+  fi
   ( cd "$SRC_DIR" && meson setup "$MESON_BUILD" --cross-file "$INI" \
       -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
       -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dopengl=true \
