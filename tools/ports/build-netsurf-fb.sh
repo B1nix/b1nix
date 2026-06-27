@@ -763,12 +763,26 @@ export PKG_CONFIG_PATH="$PKGDIR"
 HOST_LIBPNG_CFLAGS=""
 HOST_LIBPNG_LDFLAGS=""
 if [ "$(uname -s)" = "Darwin" ]; then
-  if PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --exists libpng; then
+  if PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --exists libpng 2>/dev/null; then
     HOST_LIBPNG_CFLAGS="$(PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --cflags libpng)"
     HOST_LIBPNG_LDFLAGS="$(PKG_CONFIG_LIBDIR="" PKG_CONFIG_PATH="" pkg-config --libs libpng)"
   else
     HOST_LIBPNG_CFLAGS="-I/opt/homebrew/opt/libpng/include"
     HOST_LIBPNG_LDFLAGS="-L/opt/homebrew/opt/libpng/lib -lpng"
+  fi
+else
+  # Linux/other: detect host libpng BEFORE PKG_CONFIG_LIBDIR is set to cross sysroot.
+  # NetSurf's tools/Makefile hardcodes -lpng which fails on Linux (libpng16).
+  # Also add -L/usr/lib to ensure the host libpng is found before the cross sysroot's
+  # static libpng16.a (which would cause TLS mismatches with the host libc).
+  if pkg-config --exists libpng 2>/dev/null; then
+    HOST_LIBPNG_CFLAGS="$(pkg-config --cflags libpng)"
+    HOST_LIBPNG_LDFLAGS="-L/usr/lib $(pkg-config --libs libpng)"
+  elif pkg-config --exists libpng16 2>/dev/null; then
+    HOST_LIBPNG_CFLAGS="$(pkg-config --cflags libpng16)"
+    HOST_LIBPNG_LDFLAGS="-L/usr/lib $(pkg-config --libs libpng16)"
+  else
+    HOST_LIBPNG_LDFLAGS="-L/usr/lib -lpng16 -lz"
   fi
 fi
 

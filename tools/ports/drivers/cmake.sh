@@ -73,12 +73,16 @@ fi
 if command -v port_pre_configure >/dev/null 2>&1; then port_pre_configure; fi
 
 # --- b1nix CMake toolchain file -------------------------------------------
+# cmake 4.3+ sometimes ignores CMAKE_CXX_COMPILER from toolchain files for
+# C++ projects, falling back to the host compiler. For C++ ports, set
+# CMAKE_SKIP_TOOLCHAIN=1 in the manifest to bypass the toolchain file and
+# use CC/CXX env vars + cmake args only (the reliable cmake 4 path).
 TC="$BUILD_DIR/b1nix-toolchain.cmake"
 {
   echo "set(CMAKE_SYSTEM_NAME $CMAKE_SYSTEM_NAME)"
   echo "set(CMAKE_SYSTEM_PROCESSOR $B1NIX_GCC_ARCH)"
   echo "set(CMAKE_C_COMPILER \"$GCC\")"
-  [ "${CMAKE_NEED_CXX:-0}" = "1" ] && echo "set(CMAKE_CXX_COMPILER \"$GXX\")"
+  echo "set(CMAKE_CXX_COMPILER \"$GXX\")"
   echo "set(CMAKE_SYSROOT \"$SYSROOT\")"
   echo "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)"
   echo "set(CMAKE_FIND_ROOT_PATH \"$SYSROOT${CMAKE_FIND_ROOT_EXTRA:+;$CMAKE_FIND_ROOT_EXTRA}\")"
@@ -94,10 +98,28 @@ if [ -n "$(port_ccache_prefix)" ]; then
   CCACHE_ARGS="-DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache"
 fi
 
+# Export CC/CXX — cmake 4 sometimes ignores CMAKE_CXX_COMPILER from the toolchain
+# file for C++ projects. Env vars are the reliable fallback.
+export CC="$GCC"
+export CXX="$GXX"
+
+# When CMAKE_SKIP_TOOLCHAIN=1, pass all cross-compile settings as cmake args
+# instead of using the toolchain file. Required for cmake 4 + C++ ports.
+TC_ARGS=""
+if [ "${CMAKE_SKIP_TOOLCHAIN:-0}" = "1" ]; then
+  TC_ARGS="-DCMAKE_SYSTEM_NAME=$CMAKE_SYSTEM_NAME \
+    -DCMAKE_SYSTEM_PROCESSOR=$B1NIX_GCC_ARCH \
+    -DCMAKE_CROSSCOMPILING=TRUE \
+    -DCMAKE_SYSROOT=$SYSROOT"
+  TC=""
+else
+  TC="-DCMAKE_TOOLCHAIN_FILE=$TC"
+fi
+
 cd "$BUILD_DIR/cmake"
 # shellcheck disable=SC2086
 cmake "$SRC_DIR" \
-  -DCMAKE_TOOLCHAIN_FILE="$TC" \
+  $TC \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
   $CCACHE_ARGS \

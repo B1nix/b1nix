@@ -16,6 +16,7 @@ CMAKE_SENTINEL="include/litehtml/document.h"
 CMAKE_TARBALL="litehtml-${VER}.tar.gz"
 CMAKE_URL="https://github.com/litehtml/litehtml/archive/refs/heads/${VER}.tar.gz"
 CMAKE_NEED_CXX=1
+CMAKE_SKIP_TOOLCHAIN=1
 CMAKE_ARGS="-DCMAKE_CXX_STANDARD=17 -DBUILD_SHARED_LIBS=OFF -DLITEHTML_BUILD_TESTING=OFF -DEXTERNAL_GUMBO=OFF"
 CMAKE_TARGETS="litehtml gumbo"
 
