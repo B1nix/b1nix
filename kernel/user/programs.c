@@ -1413,6 +1413,86 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  u64 r42_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/return_42", 0, 0, 0, 0, 0);
+  if ((isize)r42_pid < 0) {
+    uwrite("B1CC-R42-SMOKE: spawn-fail\n");
+  } else {
+    int r42_status = 0;
+    syscall_dispatch(SYS_WAIT, r42_pid, (u64)(usize)&r42_status, 0, 0, 0, 0);
+    if (r42_status == 42 || (r42_status >> 8) == 42) {
+      uwrite("B1CC-R42-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-R42-SMOKE: fail exit=");
+      uwrite_dec_value((u64)r42_status);
+      uwrite("\n");
+    }
+  }
+
+  // M5: b1cc hello smoke
+  u64 hello_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_hello", 0, 0, 0, 0, 0);
+  if ((isize)hello_pid < 0) {
+    uwrite("B1CC-HELLO-SMOKE: spawn-fail\n");
+  } else {
+    int hello_status = 0;
+    syscall_dispatch(SYS_WAIT, hello_pid, (u64)(usize)&hello_status, 0, 0, 0, 0);
+    if (hello_status == 0) {
+      uwrite("B1CC-HELLO-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-HELLO-SMOKE: fail exit=");
+      uwrite_dec_value((u64)hello_status);
+      uwrite("\n");
+    }
+  }
+
+  // M5: b1cc argv smoke
+  const char *b1cc_argv_args[] = {"/bin/b1cc_argv", "arg-prop", 0};
+  u64 argv_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_argv", 2, (u64)(usize)b1cc_argv_args, 0, 0, 0);
+  if ((isize)argv_pid < 0) {
+    uwrite("B1CC-ARGV-SMOKE: spawn-fail\n");
+  } else {
+    int argv_status = 0;
+    syscall_dispatch(SYS_WAIT, argv_pid, (u64)(usize)&argv_status, 0, 0, 0, 0);
+    if (argv_status == 0) {
+      uwrite("B1CC-ARGV-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-ARGV-SMOKE: fail exit=");
+      uwrite_dec_value((u64)argv_status);
+      uwrite("\n");
+    }
+  }
+
+  // M5: b1cc file write smoke
+  u64 file_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_file_write", 0, 0, 0, 0, 0);
+  if ((isize)file_pid < 0) {
+    uwrite("B1CC-FILE-SMOKE: spawn-fail\n");
+  } else {
+    int file_status = 0;
+    syscall_dispatch(SYS_WAIT, file_pid, (u64)(usize)&file_status, 0, 0, 0, 0);
+    if (file_status == 0) {
+      uwrite("B1CC-FILE-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-FILE-SMOKE: fail exit=");
+      uwrite_dec_value((u64)file_status);
+      uwrite("\n");
+    }
+  }
+
+  // M5: b1cc stderr exit smoke
+  u64 stderr_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_stderr_exit", 0, 0, 0, 0, 0);
+  if ((isize)stderr_pid < 0) {
+    uwrite("B1CC-STDERR-SMOKE: spawn-fail\n");
+  } else {
+    int stderr_status = 0;
+    syscall_dispatch(SYS_WAIT, stderr_pid, (u64)(usize)&stderr_status, 0, 0, 0, 0);
+    if (stderr_status == 37 || (stderr_status >> 8) == 37) {
+      uwrite("B1CC-STDERR-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-STDERR-SMOKE: fail exit=");
+      uwrite_dec_value((u64)stderr_status);
+      uwrite("\n");
+    }
+  }
+
   u64 m12_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m12-smoke", 0, 0, 0, 0, 0);
   if ((isize)m12_pid < 0) {
     uwrite("M12-SMOKE: spawn-fail\n");

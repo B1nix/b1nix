@@ -1,3 +1,5 @@
+#define MINIMAL_INITRAMFS 1
+
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/initramfs.h>
@@ -6,8 +8,13 @@
 #include <string.h>
 
 #include "initramfs_native_smoke.inc"
+#include "initramfs_return_42.inc"
+#include "initramfs_b1cc_hello.inc"
+#include "initramfs_b1cc_argv.inc"
+#include "initramfs_b1cc_file_write.inc"
+#include "initramfs_b1cc_stderr_exit.inc"
+#ifndef MINIMAL_INITRAMFS
 #include "initramfs_m12_smoke.inc"
-#include "initramfs_m13_smoke.inc"
 #include "initramfs_m13_job_control.inc"
 #include "initramfs_m8_aio_test.inc"
 #include "initramfs_m17_smoke.inc"
@@ -120,6 +127,7 @@
 #include "initramfs_halt.inc"
 #include "initramfs_setfattr.inc"
 #include "initramfs_busybox.inc"
+#endif
 
 
 
@@ -1400,6 +1408,27 @@ static const char posix_smoke_script[] =
 
 
 
+#ifdef MINIMAL_INITRAMFS
+static const struct initramfs_file files[] = {
+    {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
+     INITRAMFS_EXECUTABLE},
+    {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
+     sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/return_42", (const char *)vfs_return_42_elf,
+     sizeof(vfs_return_42_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_hello", (const char *)vfs_b1cc_hello_elf,
+     sizeof(vfs_b1cc_hello_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_argv", (const char *)vfs_b1cc_argv_elf,
+     sizeof(vfs_b1cc_argv_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_file_write", (const char *)vfs_b1cc_file_write_elf,
+     sizeof(vfs_b1cc_file_write_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_stderr_exit", (const char *)vfs_b1cc_stderr_exit_elf,
+     sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
+
+    {"/mnt/iso/.keep", "", 0, 0},
+    {"/mnt/root/.keep", "", 0, 0},
+};
+#else
 static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
      INITRAMFS_EXECUTABLE},
@@ -1696,6 +1725,7 @@ static const struct initramfs_file files[] = {
     TCC_INITRAMFS_FILES,
     NETSURF_INITRAMFS_FILES
 };
+#endif
 
 static int initramfs_vfs_statfs(struct vfs_node *node,
                                 struct b1nix_statfs *st) {

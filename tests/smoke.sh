@@ -567,6 +567,7 @@ echo "[RUN] Boot smoke checks..."
 check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
 check_output "$LOG" "kheap:" "kernel heap initializes"
+check_output "$LOG" "B1CC-R42-SMOKE: ok" "b1cc return_42 runs and exits with 42"
 
 # ── Test 2: No panic ──
 if grep -q "KERNEL PANIC" "$LOG" 2>/dev/null; then

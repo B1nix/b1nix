@@ -177,7 +177,11 @@ BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
 # Disk installer: copies the pre-baked b1nix-disk.img onto a target disk.
-BINARIES += $(BUILD)/bin/b1nix_install
+BINARIES += $(BUILD)/bin/return_42
+BINARIES += $(BUILD)/bin/b1cc_hello
+BINARIES += $(BUILD)/bin/b1cc_argv
+BINARIES += $(BUILD)/bin/b1cc_file_write
+BINARIES += $(BUILD)/bin/b1cc_stderr_exit
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -261,6 +265,11 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # Dynamic by default (links against libc.so.1 via /lib/ld-b1nix.so + the
 # in-kernel loader); LINK=static restores the historical static recipe. The
 # mode is selected by the GEN_* variables defined near the top of this file.
+$(BUILD)/bin/return_42 $(BUILD)/bin/b1cc_hello $(BUILD)/bin/b1cc_argv $(BUILD)/bin/b1cc_file_write $(BUILD)/bin/b1cc_stderr_exit: $(BUILD)/bin/%: bin/%.c
+	@mkdir -p $(dir $@)
+	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) /Users/dmytrom/Documents/GitHub/b1cc/build/b1cc --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
+
+
 $(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o

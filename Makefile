@@ -138,6 +138,15 @@ INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
 # Upstream BusyBox is always embedded (M42 full integration).
+ifeq ($(MINIMAL_INITRAMFS),1)
+INITRAMFS_INCS := \
+	$(INITRAMFS_NATIVE_SMOKE_INC) \
+	$(BUILD_DIR)/initramfs_return_42.inc \
+	$(BUILD_DIR)/initramfs_b1cc_hello.inc \
+	$(BUILD_DIR)/initramfs_b1cc_argv.inc \
+	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
+	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc
+else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
@@ -157,6 +166,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_M40_LINUX_INC) \
 	$(INITRAMFS_M67_RUST_INC) \
 	$(INITRAMFS_NETSURF_INC)
+endif
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget

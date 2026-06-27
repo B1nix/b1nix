@@ -70,10 +70,15 @@ if [ -n "${PATCHES:-}" ]; then
 fi
 
 # --- patch config.sub to accept b1nix ------------------------------------
-if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix\*' "$SRC_DIR/config.sub"; then
+if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
   tmp_sub="$SRC_DIR/config.sub.new"
-  sed 's/| fiwix\* /| fiwix* | b1nix* /' "$SRC_DIR/config.sub" > "$tmp_sub" \
-    || sed 's/| fiwix\\*/| fiwix* | b1nix*/' "$SRC_DIR/config.sub" > "$tmp_sub"
+  sed -e 's/| fiwix\* /| fiwix* | b1nix* /' \
+      -e 's/| -mint\*/| -mint* | -b1nix*/' \
+      -e 's/| -none\*/| -none* | -b1nix*/' \
+      -e 's/| -elf\*/| -elf* | -b1nix*/' \
+      -e 's/| -limine\*/| -limine* | -b1nix*/' \
+      -e 's/| -os2\*/| -os2* | -b1nix*/' \
+      "$SRC_DIR/config.sub" > "$tmp_sub"
   mv "$tmp_sub" "$SRC_DIR/config.sub"
 fi
 
