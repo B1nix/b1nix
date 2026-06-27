@@ -5,9 +5,9 @@ in C. It boots through Multiboot2, runs native ELF programs in ring 3, provides
 its own kernel, libc, shell, filesystems, network stack, drivers, and native
 development toolchain, and can rebuild its kernel from inside B1NIX.
 
-The primary target is `x86_64`. A separate 32-bit `i686` port is also actively
-built and tested. The old AArch64 experiment is archived and is not part of the
-current build.
+The active target is `x86_64`. The old 32-bit `i686` port is archived after its
+last green smoke run (`804/0`, 2026-06-23), and the old AArch64 experiment is
+also archived.
 
 > B1NIX is a research and hobby operating system, not a production system.
 > Interfaces, disk formats, security behavior, and build workflows may change.
@@ -15,10 +15,10 @@ current build.
 ## Current Capabilities
 
 - Multiboot2 boot through GRUB on BIOS and UEFI systems.
-- 64-bit and 32-bit x86 kernels selected with `ARCH=x86_64` or `ARCH=x86`.
+- 64-bit x86 kernel selected with `ARCH=x86_64`.
 - Preemptive SMP scheduling, per-CPU state, process groups, job control,
   signals, futexes, pthreads, and copy-on-write `fork()`.
-- Native ELF32/ELF64 userspace with isolated page tables, `mmap`, shared file
+- Native ELF64 userspace with isolated page tables, `mmap`, shared file
   mappings, PIE loading, core dumps, and a POSIX-oriented syscall ABI.
 - VFS with dynamic descriptor tables, pipes, PTYs, file locking, AIO,
   `/proc`, `/sys`, initramfs, a page cache, and persistent root filesystems.
@@ -123,15 +123,7 @@ list, update, and remove them normally with `bpkg`.
 The first complete build downloads and cross-builds several userspace
 components, so it is substantially slower than an incremental kernel build.
 
-For the 32-bit port:
-
-```sh
-make ARCH=x86 iso
-make ARCH=x86 run
-make ARCH=x86 run-graphics
-```
-
-Build output is architecture-qualified under `build/x86_64/` or `build/x86/`.
+Build output is architecture-qualified under `build/x86_64/`.
 
 ## Image Types
 
@@ -240,7 +232,6 @@ Other useful targets:
 
 ```sh
 make smoke-quick
-make ARCH=x86 smoke
 make graphics-smoke
 make memory-smoke
 make analyze
@@ -270,9 +261,8 @@ tools/toolchain/build-toolchain.sh
 tools/toolchain/build-native-toolchain.sh
 ```
 
-For i686, set `B1NIX_ARCH=x86` for both commands. The toolchain build is large
-and is cached under `build/toolchain_build/`; `make clean` preserves it, while
-`make distclean` removes it.
+The toolchain build is large and is cached under `build/toolchain_build/`;
+`make clean` preserves it, while `make distclean` removes it.
 
 The root-image workflow installs the matching native toolchain when available
 and stages the B1NIX source tree at:
@@ -325,8 +315,7 @@ smoke_run/          generated test logs, captures, and temporary images
 - The ext-family drivers cover the tested B1NIX workflows but are not complete
   replacements for Linux filesystem implementations. Generated development
   images use a conservative ext4 feature set; exFAT and NTFS are read-only.
-- The 32-bit port currently uses at most 1 GiB of RAM; x86_64 has been tested
-  with a 16 GiB QEMU memory map.
+- x86_64 has been tested with a 16 GiB QEMU memory map.
 - Audio, a configurable SysV-style mode for the native B1NIX init, multiple
   virtual consoles, Wi-Fi, and general USB device support are not implemented.
 - Security hardening has not reached production quality.

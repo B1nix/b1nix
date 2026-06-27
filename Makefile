@@ -9,15 +9,9 @@ export B1NIX_ARCH := $(ARCH)
 # SHARED and read-only across isolated builds — never rebuilt per task.
 BUILD_ROOT ?= build
 BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
-# Host triplet for the ported userspace toolchain + programs. Their build trees
-# live under per-triplet directories (build/toolchain_build/<triplet>,
-# build/<prog>-{src,b1nix}/<triplet>) so x86 and x86_64 never share objects.
+# Host triplet for the ported userspace toolchain + programs.
 # Keep this mapping in sync with tools/toolchain/env.sh.
-ifeq ($(ARCH),x86)
-B1NIX_TRIPLET := i686-b1nix
-else
 B1NIX_TRIPLET := x86_64-b1nix
-endif
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
@@ -270,19 +264,8 @@ ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
 ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c
-else ifeq ($(ARCH),x86)
-TARGET := i686-elf
-ifeq ($(TOOLCHAIN),gcc)
-ARCH_CFLAGS := -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
 else
-ARCH_CFLAGS := --target=$(TARGET) -m32 -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
-endif
-ARCH_LDFLAGS := -m elf_i386 -z max-page-size=0x1000
-LINKER_SCRIPT := kernel/arch/x86/linker.ld
-ASM_SOURCES := kernel/arch/x86/boot.S kernel/arch/x86/context_switch.S kernel/arch/x86/isr.S kernel/arch/x86/user_jump.S kernel/arch/x86/syscall_entry.S kernel/arch/x86/fpu.S
-ARCH_SOURCES := kernel/arch/x86/arch.c kernel/arch/x86/console.c kernel/arch/x86/fb_console.c kernel/arch/x86/interrupts.c kernel/arch/x86/io.c kernel/arch/x86/paging.c kernel/arch/x86/serial.c kernel/arch/x86/rtc.c kernel/arch/x86/signal.c kernel/arch/x86/lapic.c kernel/arch/x86/tlb.c kernel/arch/x86/coredump.c kernel/arch/x86/gdbstub.c
-else
-$(error Unsupported ARCH=$(ARCH). AArch64 is archived; use ARCH=x86_64 or ARCH=x86)
+$(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 only; i686 and AArch64 are archived)
 endif
 
 KERNEL_SOURCES := \
@@ -347,7 +330,7 @@ KERNEL_SOURCES := \
 	kernel/user/editor.c \
 	$(ARCH_SOURCES)
 
-ifneq ($(filter $(ARCH),x86_64 x86),)
+ifneq ($(filter $(ARCH),x86_64),)
 KERNEL_SOURCES += \
 	kernel/bootinfo/multiboot2.c \
 	kernel/dev/pci.c \
@@ -413,7 +396,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 .PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-live iso-test iso-full \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
-	run run-graphics run-x86_64 run-x86 run-root check-tools clean distclean \
+	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke
 
 all: $(KERNEL_ELF)
@@ -473,21 +456,6 @@ $(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
 	@printf '\n' >> $@
 	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "native") printf "  user_register_program(\"/bin/%s\", busybox_main);\n", $$1; }' $< >> $@
 
-# Arch guard for the SHARED userspace build dir.
-#
-# userspace/build/ is not arch-qualified — both ARCH=x86 and ARCH=x86_64 compile
-# into the same tree. Switching ARCH must invalidate every embedded binary, but
-# most binaries only rebuild because their per-arch prereqs ($(LIB)/$(CRT0)) get
-# rebuilt; native_smoke/tcc/m30_pie link neither, so a leftover binary from the
-# other arch survives an arch switch and gets xxd-bundled into the wrong-arch
-# initramfs. A 64-bit native_smoke embedded in the 32-bit kernel is accepted by
-# the ELF64 loader and SIGILLs the moment it runs in ring3 (the "0x2000000
-# collision" — it was never a PMM/layout bug, just a stale .inc).
-#
-# The stamp records the arch the shared tree was last built for. When ARCH
-# changes it wipes the tree so every output relinks for the new arch, then
-# rewrites itself; its mtime advances only on a real switch, so same-arch builds
-# don't churn. It is part of USERSPACE_DEPS so all *.inc re-bundle after a wipe.
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
@@ -1190,8 +1158,6 @@ run-graphics: iso
 		-vga virtio -device virtio-tablet-pci
 
 run-x86_64: run
-
-run-x86: run
 
 run-root: iso userspace-install root-image
 	@command -v $(QEMU_X86_64) >/dev/null || (echo "missing qemu-system-x86_64"; exit 1)
