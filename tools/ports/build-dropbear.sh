@@ -1,72 +1,30 @@
 #!/bin/sh
-# Build Dropbear SSH (and its bundled libtomcrypt/libtommath crypto) for the
-# b1nix userspace ABI.
+# Build Dropbear SSH for the b1nix userspace ABI.
+# Uses the autotools driver (tools/ports/drivers/autotools.sh).
 #
 # Two phases, selected by the first argument:
-#   crypto  — configure + build only the bundled crypto archives
-#             (libtomcrypt/libtomcrypt.a, libtommath/libtommath.a). Used by the
-#             M32b crypto-baseline item.
-#   all     — (default) build the full static dropbearmulti binary (server +
-#             dropbearkey + client). Used by the sshd service item.
-#
-# Modelled on tools/ports/build-openssl.sh / tools/ports/build-wget.sh.
-
+#   crypto  — build only bundled libtomcrypt/libtommath archives
+#   all     — (default) build full static dropbearmulti binary
 set -eu
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 PHASE="${1:-all}"
 
-ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-DB_VERSION="${DROPBEAR_VERSION:-2022.83}"
-DB_TARBALL="dropbear-${DB_VERSION}.tar.bz2"
-DB_URL="https://matt.ucc.asn.au/dropbear/releases/${DB_TARBALL}"
-WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
-AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
-RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+AUTOTOOLS_NAME=dropbear
+AUTOTOOLS_VERSION="${DROPBEAR_VERSION:-2022.83}"
+AUTOTOOLS_URL="https://matt.ucc.asn.au/dropbear/releases/dropbear-${AUTOTOOLS_VERSION}.tar.bz2"
+AUTOTOOLS_CONFIGURE="--enable-zlib --disable-pam --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden"
 
-# Per-architecture build identity (B1NIX_ARCH -> triplet).
-. "$ROOT_DIR/tools/toolchain/env.sh"
-HOST_TRIPLET="$B1NIX_TRIPLET"
-# Per-triplet source tree so x86 and x86_64 never share objects.
-SRC_PARENT="$ROOT_DIR/build/dropbear-src"
-SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/dropbear-${DB_VERSION}"
-
-mkdir -p "$SRC_PARENT/$HOST_TRIPLET"
-
-if [ ! -d "$SRC_DIR" ]; then
-  tmp="$SRC_PARENT/${DB_TARBALL}"
-  if [ ! -f "$tmp" ]; then
-    if command -v curl >/dev/null 2>&1; then
-      curl -L "$DB_URL" -o "$tmp"
-    elif command -v wget >/dev/null 2>&1; then
-      wget -O "$tmp" "$DB_URL"
-    else
-      echo "tools/ports/build-dropbear.sh: need host curl or wget to fetch $DB_URL" >&2
-      exit 1
-    fi
+port_pre_configure() {
+  # Stage zlib for compression
+  ZLIB_PREFIX="$("$ROOT_DIR/tools/ports/build-zlib.sh" 2>/dev/null | tail -n 1)"
+  if [ -z "$ZLIB_PREFIX" ] || [ ! -f "$ZLIB_PREFIX/lib/libz.a" ]; then
+    echo "tools/ports/build-dropbear.sh: zlib build failed" >&2
+    exit 1
   fi
-  tar -xjf "$tmp" -C "$SRC_PARENT/$HOST_TRIPLET"
-fi
-
-# Patch config.sub to accept the x86_64-b1nix host triplet. Modern config.sub
-# validate the OS against a big case list ending in "| fiwix* | mlibc* )".
-if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
-  tmp_sub="$SRC_DIR/config.sub.new"
-  sed 's/| fiwix\* | mlibc\* )/| fiwix* | mlibc* | b1nix* )/' \
-    "$SRC_DIR/config.sub" > "$tmp_sub"
-  mv "$tmp_sub" "$SRC_DIR/config.sub"
-fi
-
-# zlib for SSH traffic compression — b1nix has a working zlib port, so stage it
-# and enable the compression transport (was disabled for self-containedness).
-ZLIB_PREFIX="$("$ROOT_DIR/tools/ports/build-zlib.sh" 2>/dev/null | tail -n 1)"
-if [ -z "$ZLIB_PREFIX" ] || [ ! -f "$ZLIB_PREFIX/lib/libz.a" ]; then
-  echo "tools/ports/build-dropbear.sh: zlib build failed" >&2
-  exit 1
-fi
-
-# b1nix local options. PAM/utmp/wtmp/lastlog/syslog still need OS facilities we
-# lack, but zlib compression and DNS host lookup (getaddrinfo) now work.
-cat > "$SRC_DIR/localoptions.h" <<'EOF'
+  export AUTOTOOLS_CONFIGURE="$AUTOTOOLS_CONFIGURE CPPFLAGS=-I$ZLIB_PREFIX/include LDFLAGS=-L$ZLIB_PREFIX/lib LIBS=-lz"
+  # Write b1nix local options
+  cat > "$SRC_DIR/localoptions.h" <<'EOF'
 /* b1nix Dropbear build options (overrides default_options.h). */
 #define DROPBEAR_SMALL_CODE 1
 #define DO_HOST_LOOKUP 1
@@ -77,52 +35,54 @@ cat > "$SRC_DIR/localoptions.h" <<'EOF'
 #define DROPBEAR_SVR_PASSWORD_AUTH 1
 #define DROPBEAR_SVR_PUBKEY_AUTH 1
 EOF
+}
 
-# Time discipline so make never tries to re-run autoconf/automake.
-find "$SRC_DIR" -exec touch {} +
+port_configure() {
+  # Only configure once - config.h is stable
+  if [ ! -f "$SRC_DIR/config.h" ]; then
+    (
+      cd "$BUILD_DIR"
+      BUILD_TRIPLET="$("$SRC_DIR/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+      export cross_compiling=yes
+      "$SRC_DIR/configure" \
+        --host="$B1NIX_TRIPLET" \
+        --build="$BUILD_TRIPLET" \
+        $AUTOTOOLS_CONFIGURE \
+        CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+        1>&2
+    )
+  fi
+}
 
-make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+port_build() {
+  if [ "$PHASE" = "crypto" ]; then
+    make -C "$SRC_DIR" -j"${JOBS:-4}" \
+      CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+      libtomcrypt/libtomcrypt.a libtommath/libtommath.a 1>&2
+  else
+    make -C "$SRC_DIR" -j"${JOBS:-4}" \
+      CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+      PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
+      MULTI=1 dropbearmulti 1>&2
+  fi
+}
 
-# Configure only once: re-running configure regenerates config.h and has shown
-# non-deterministic getpass detection (HAVE_GETPASS flipping), which then leaves
-# stale objects referencing a non-existent rpl_getpass. Locking the first good
-# config.h makes incremental rebuilds reproducible.
-if [ ! -f "$SRC_DIR/config.h" ]; then
-(
-  cd "$SRC_DIR"
-  BUILD_TRIPLET="$("./config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
-  export cross_compiling=yes
-  ./configure \
-    --host="$HOST_TRIPLET" \
-    --build="$BUILD_TRIPLET" \
-    --enable-zlib \
-    --disable-pam \
-    --disable-syslog \
-    --disable-lastlog \
-    --disable-utmp --disable-utmpx \
-    --disable-wtmp --disable-wtmpx \
-    --disable-loginfunc \
-    --disable-pututline --disable-pututxline \
-    --disable-harden \
-    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-    CPPFLAGS="-I$ZLIB_PREFIX/include" LDFLAGS="-L$ZLIB_PREFIX/lib" LIBS="-lz" \
-    1>&2
-)
-fi
+port_install() {
+  if [ "$PHASE" = "crypto" ]; then
+    mkdir -p "$INSTALL_DIR/lib"
+    cp "$SRC_DIR/libtomcrypt/libtomcrypt.a" "$INSTALL_DIR/lib/"
+    cp "$SRC_DIR/libtommath/libtommath.a" "$INSTALL_DIR/lib/"
+  fi
+}
 
+# For crypto phase, driver should not print (manifest will print src dir)
 if [ "$PHASE" = "crypto" ]; then
-  make -C "$SRC_DIR" -j"${JOBS:-4}" \
-    CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-    libtomcrypt/libtomcrypt.a libtommath/libtommath.a 1>&2
-  echo "$SRC_DIR"
-  exit 0
+  AUTOTOOLS_ECHO=""
 fi
 
-# SSH daemon + key tools + client (dbclient), so the loopback handshake smoke
-# can drive the server from inside b1nix. scp is omitted (deferred).
-make -C "$SRC_DIR" -j"${JOBS:-4}" \
-  CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-  PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
-  MULTI=1 dropbearmulti 1>&2
+. "$ROOT_DIR/tools/ports/drivers/autotools.sh"
 
-echo "$SRC_DIR"
+# For crypto phase, print src dir instead of install dir
+if [ "$PHASE" = "crypto" ]; then
+  echo "$SRC_DIR"
+fi
