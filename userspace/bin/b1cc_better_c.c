@@ -22,7 +22,11 @@ int main(void) {
   
   int sum = b + s.x + s.y + arr[0] + arr[1] + arr[2];
   
-  if (sum == 860 && VAL_A == 10) {
+  int test_var = 5;
+  test_var++;
+  test_var += 4;
+  
+  if (sum == 860 && VAL_A == 10 && (10 & 6) == 2 && (2 << 3) == 16 && test_var == 10) {
     puts("B1CC-BETTER-C-SMOKE: ok");
     return 0;
   } else {
