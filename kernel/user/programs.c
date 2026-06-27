@@ -2666,7 +2666,13 @@ static int init_main(int argc, const char **argv) {
   }
 
   uwrite("B1NIX-TEST: done\n");
-  syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
+  /* The dedicated native-Clang self-host proof (b1nix.clangrun) runs the heavy
+   * compiler concurrently from kernel/main.c; `clang -c` does real codegen and
+   * needs longer than this test sequence. Skip the auto-reboot in that mode so
+   * clang isn't cut off mid-compile — the proof script (tools/clang/clang-proof.sh)
+   * owns QEMU's lifecycle and kills it on its marker/timeout. */
+  if (!bootinfo_has_flag("b1nix.clangrun"))
+    syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
   }
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);

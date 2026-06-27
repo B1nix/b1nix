@@ -1217,6 +1217,12 @@ smoke-quick:
 smoke-b1cc:
 	sh tests/smoke-b1cc.sh $(ARCH)
 
+# M64 native-Clang self-host proof: ship clang-22 in an ext4 GRUB module and run
+# it on b1nix (clang --version + clang -c hello.c). Needs build/native-clang/b1nix
+# (tools/build-native-clang.sh --b1nix-elf) and a kernel (make ARCH=x86_64 iso).
+clang-proof:
+	sh tools/clang/clang-proof.sh
+
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)
 

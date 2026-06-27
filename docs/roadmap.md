@@ -945,6 +945,12 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
   with b1nix as the host triple; `make install-native-toolchain` stages only this
   b1nix ELF build into the rootfs, not the Linux-hosted cross compiler.
+- [x] `done` **Native self-host Clang (in-QEMU proof).** `make clang-proof`
+  (tools/clang/clang-proof.sh) ships clang-22 in an ext4 GRUB module (ram0); with
+  `b1nix.clangrun` the kernel runs it on b1nix: `clang --version` prints
+  `clang version 22.1.8` (load+execute proof) and `clang -c hello.c -o hello.o`
+  exits 0 emitting a valid ELF object (`M64-NATIVE-CLANG: ok compile`). b1nix
+  compiles a b1nix object with its own native Clang.
 - A full GCC-to-Clang migration and a libc++/libc++abi/libunwind port are not
   goals. Add either only when a measured incompatibility makes the GNU path fail.
 

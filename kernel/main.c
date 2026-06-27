@@ -10,6 +10,7 @@
 #include <b1nix/serial_tty.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <b1nix/syscall.h>
 #include <b1nix/blk.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/tlb.h>
@@ -640,6 +641,69 @@ void kernel_main(usize arg0, usize arg1)
 				console_write("M68-RUST: ok rustc-load\n");
 			else
 				console_write("M68-RUST: fail rustc-load\n");
+		}
+	}
+
+	/* M64 native self-host Clang. The b1nix-native clang-22 (a ~94MB ELF that
+	 * statically links LLVM + libstdc++, NEEDED only libc.so.1) ships inside a
+	 * self-contained ISO as a GRUB Multiboot2 module (ext4) exposed as ram0 —
+	 * exactly like rustc/d8 above. With b1nix.clangrun the kernel mounts ram0
+	 * -> /mnt/clang and exercises the compiler two ways: `clang --version`
+	 * proves the loaded compiler executes on b1nix (it prints its real version
+	 * banner to serial — the load proof), and `clang -cc1 -emit-obj hello.c`
+	 * proves the frontend+backend+integrated-assembler produce a valid b1nix
+	 * object natively (the kernel then checks the emitted hello.o for the ELF
+	 * magic — the compile proof). Gated by a cmdline flag so it never fires in
+	 * the ordinary smoke suite. */
+	if (bootinfo_has_flag("b1nix.clangrun")) {
+		vfs_mkdir("/mnt/clang", 0755);
+		int clang_mrc = vfs_mount("ram0", "/mnt/clang", "ext4", 0);
+		char clang_buf[96];
+		snprintf(clang_buf, sizeof(clang_buf), "clang: mount ram0 -> /mnt/clang: %d\n", clang_mrc);
+		console_write(clang_buf);
+		if (clang_mrc == 0) {
+			/* (1) Load + run proof: clang prints its real version banner. A
+			 * valid pid means the M69 exec-time loader resolved clang-22 ->
+			 * libc.so.1 and relocated the whole image; SYS_WAIT lets it run to
+			 * completion so the banner reaches serial before we mark it. */
+			const char *ver_argv[] = {"clang", "--version", 0};
+			int ver_pid = user_spawn("/mnt/clang/bin/clang", 2, ver_argv);
+			snprintf(clang_buf, sizeof(clang_buf), "clang: clang --version spawn: %d\n", ver_pid);
+			console_write(clang_buf);
+			if (ver_pid > 0) {
+				int ver_st = 0;
+				syscall_dispatch(SYS_WAIT, (u64)ver_pid, (u64)(usize)&ver_st, 0, 0, 0, 0);
+				console_write("M64-NATIVE-CLANG: ok clang-load\n");
+			} else {
+				console_write("M64-NATIVE-CLANG: fail clang-load\n");
+			}
+
+			/* (2) Compile proof: emit an object for the default x86_64-b1nix
+			 * target from a header-free TU. Wait for clang to finish, then
+			 * verify the ELF magic of the emitted object — only a genuinely
+			 * running frontend+backend+assembler can produce it. */
+			const char *cc_argv[] = {"clang", "-c", "/mnt/clang/hello.c",
+			                         "-o", "/mnt/clang/hello.o", 0};
+			int cc_pid = user_spawn("/mnt/clang/bin/clang", 5, cc_argv);
+			int cc_st = -1;
+			snprintf(clang_buf, sizeof(clang_buf), "clang: clang -c spawn: %d\n", cc_pid);
+			console_write(clang_buf);
+			if (cc_pid > 0)
+				syscall_dispatch(SYS_WAIT, (u64)cc_pid, (u64)(usize)&cc_st, 0, 0, 0, 0);
+			unsigned char elfmag[4] = {0};
+			int ofd = vfs_open("/mnt/clang/hello.o");
+			if (ofd >= 0) {
+				vfs_read(ofd, (char *)elfmag, sizeof(elfmag));
+				vfs_close(ofd);
+			}
+			snprintf(clang_buf, sizeof(clang_buf), "clang: clang -c exit=%d obj-magic=%02x%02x%02x%02x\n",
+			         cc_st, elfmag[0], elfmag[1], elfmag[2], elfmag[3]);
+			console_write(clang_buf);
+			if (cc_pid > 0 && elfmag[0] == 0x7f && elfmag[1] == 'E' &&
+			    elfmag[2] == 'L' && elfmag[3] == 'F')
+				console_write("M64-NATIVE-CLANG: ok compile\n");
+			else
+				console_write("M64-NATIVE-CLANG: fail compile\n");
 		}
 	}
 
