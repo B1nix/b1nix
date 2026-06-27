@@ -116,18 +116,29 @@ else
   )
 fi
 
+# --- disable autotools maintainer-mode rebuild rules ----------------------
+# Release tarballs ship all generated files (configure, *.in, aclocal.m4) and
+# we never edit the .ac/.am sources, so any am--refresh / automake / autoconf
+# trigger is spurious — and those exact-version tools are absent on the host.
+# Export as environment variables so sub-makes and am--refresh recipes see them.
+export ACLOCAL=":" AUTOCONF=":" AUTOMAKE=":" AUTOHEADER=":" MAKEINFO=":"
+export am__maybe_remake_makefiles=""
+_AUTOTOOLS_NOREGEN="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=: MAKEINFO=: am__maybe_remake_makefiles="
+
 # --- build ----------------------------------------------------------------
 if command -v port_build >/dev/null 2>&1; then
   port_build
 else
-  make -C "$BUILD_DIR" -j"${JOBS:-4}" ${AUTOTOOLS_MAKE:-all} 1>&2
+  # shellcheck disable=SC2086
+  make -C "$BUILD_DIR" -j"${JOBS:-4}" $_AUTOTOOLS_NOREGEN ${AUTOTOOLS_MAKE:-all} 1>&2
 fi
 
 # --- install --------------------------------------------------------------
 if command -v port_install >/dev/null 2>&1; then
   port_install
 else
-  make -C "$BUILD_DIR" ${AUTOTOOLS_INSTALL:-install} 1>&2
+  # shellcheck disable=SC2086
+  make -C "$BUILD_DIR" $_AUTOTOOLS_NOREGEN ${AUTOTOOLS_INSTALL:-install} 1>&2
 fi
 
 # --- pkg-config .pc file --------------------------------------------------
