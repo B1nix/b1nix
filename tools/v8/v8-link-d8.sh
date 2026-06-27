@@ -19,6 +19,7 @@ TC="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/bin"
 OUT_NAME="${1:-b1nix}"
 OUT="$ROOT_DIR/build/toolchain_build/v8-skeleton/v8/out/$OUT_NAME"
 GXX="$TC/x86_64-b1nix-g++"
+CC_CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$TC/x86_64-b1nix-gcc")}"
 LD="$TC/x86_64-b1nix-ld"
 RANLIB="$TC/x86_64-b1nix-ranlib"
 
@@ -51,7 +52,8 @@ fi
 # into the freestanding userspace binaries, which don't link libm, so it must
 # stay self-contained. Here it resolves `pow` from libm, which d8 links.
 MATHL_O="$OUT/mathl-b1nix.o"
-"$GXX" -x c -c "$ROOT_DIR/userspace/libc/mathl.c" -o "$MATHL_O"
+"$CC_CLANG" --target=x86_64-unknown-elf -x c -ffreestanding -fno-builtin -fno-stack-protector \
+  -nostdinc -isystem "$ROOT_DIR/userspace/include" -c "$ROOT_DIR/userspace/libc/mathl.c" -o "$MATHL_O"
 
 [ -f "$OUT/d8.rsp" ] || { echo "missing $OUT/d8.rsp — run 'ninja -C out/b1nix d8' first"; exit 1; }
 [ -f "$CRT0" ] || { echo "missing crt0.o — build userspace (B1NIX_ARCH=x86_64)"; exit 1; }

@@ -34,6 +34,17 @@ INSTALL_DIR="$BUILD_DIR/install"
 CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
 GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
 
+# Resolve C++ frontend: clang++ (default) or g++ (legacy fallback)
+CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
+case "$CXX_FRONTEND" in
+  gcc)
+    REAL_CXX="$GXX"
+    ;;
+  clang|*)
+    REAL_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
+    ;;
+esac
+
 if [ "$B1NIX_ARCH" = "x86" ]; then
   LDEMU="elf_i386"; MCPU="x86"; MFAM="x86"
 else
@@ -64,23 +75,43 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xJf "$tmp" -C "$SRC_PARENT" 1>&2
 fi
 
-LIBSTDCXX="$("$GXX" -print-file-name=libstdc++.a)"
-LIBSUPCXX="$("$GXX" -print-file-name=libsupc++.a)"
-LIBGCC="$("$GXX" -print-libgcc-file-name)"
+# Resolve C++ stdlib and CRT runtime
+CXX_STDLIB="${B1NIX_CXX_STDLIB:-}"
+LIBCXX_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
+LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxxabi-install/lib/libc++abi.a"
+LLVM_CRT_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+LLVM_UNW_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libunwind.a"
+
+if [ -z "$CXX_STDLIB" ]; then
+  if [ -f "$LIBCXX_A" ] && [ -f "$LIBCXXABI_A" ]; then CXX_STDLIB="libc++"; else CXX_STDLIB="libstdc++"; fi
+fi
+case "$CXX_STDLIB" in
+  libc++)   STDLIB_A="$LIBCXX_A"; STDLIB_ABI_A="$LIBCXXABI_A" ;;
+  *)        STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"; STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)" ;;
+esac
+if [ -f "$LLVM_CRT_A" ] && [ -f "$LLVM_UNW_A" ]; then
+  CRT_A="$LLVM_CRT_A"; UNW_A="$LLVM_UNW_A"
+else
+  CRT_A="$("$GXX" -print-libgcc-file-name)"; UNW_A=""
+fi
+
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 
-# meson cross file. The compiler is wrapped (tools/toolchain/bin/b1nix-mesa-cc) to strip
-# -pthread, which the b1nix cross GCC has no spec for. PATH_MAX/LLONG_MAX are
-# defined because some generated/flex C++ files use them without including the
-# header that declares them. system='linux' + -D__linux__ make Mesa take its
-# generic POSIX path (b1nix masquerades as Linux for ports).
+# meson cross file link args: stdlib + CRT + libb1nix
+LINKARGS="'-nostdlib', '-T', '$ROOT_DIR/userspace/linker-cxx.ld', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$STDLIB_A', '$STDLIB_ABI_A'"
+if [ -n "$UNW_A" ]; then
+  LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"
+else
+  LINKARGS="$LINKARGS, '$CRT_A'"
+fi
+LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
+
 INI="$BUILD_DIR/cross.ini"
 DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL'"
-LINKARGS="'-nostdlib', '-T', '$ROOT_DIR/userspace/linker-cxx.ld', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$LIBSTDCXX', '$LIBSUPCXX', '$LIBGCC', '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
 cat > "$INI" <<EOF
 [binaries]
 c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
-cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-g++']
+cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CXX']
 ar = '$CROSS/bin/$B1NIX_TRIPLET-ar'
 strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
 pkg-config = 'false'

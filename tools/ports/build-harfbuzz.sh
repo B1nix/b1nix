@@ -13,8 +13,9 @@ CPORT_TARBALL="harfbuzz-${HB_VERSION:-8.3.0}.tar.xz"
 CPORT_HEADERS="flat:src/hb.h tree:src"
 
 port_pre_build() {
-  # HarfBuzz needs C++ compilation - set up cross g++ and ccache
-  GXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/bin/$B1NIX_TRIPLET-g++"
+  # HarfBuzz needs C++ compilation — clang++ frontend with GCC libstdc++ headers
+  . "$ROOT_DIR/tools/toolchain/env.sh"
+  resolve_cxx_cross
   CCACHE="$(command -v ccache 2>/dev/null || true)"
   # Ensure C++ toolchain sysroot is staged
   "$ROOT_DIR/tools/toolchain/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" >/dev/null 2>&1 || true
@@ -23,7 +24,8 @@ port_pre_build() {
 port_build() {
   _ccache=""
   [ -n "${CCACHE:-}" ] && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && _ccache="$CCACHE "
-  ${_ccache}"$GXX" -c -O2 -DHB_TINY -DHB_NO_MT \
+  # shellcheck disable=SC2086
+  ${_ccache}"$CXX_CROSS" $CXXFLAGS_CROSS -DHB_TINY -DHB_NO_MT \
     -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++14 \
     -I"$SRC_DIR/src" "$SRC_DIR/src/harfbuzz.cc" \
     -o "$OBJ_DIR/harfbuzz.o"

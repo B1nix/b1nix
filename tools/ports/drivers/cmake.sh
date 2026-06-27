@@ -61,6 +61,17 @@ GXX="$CROSS/$B1NIX_TRIPLET-g++"
 SYSROOT="$("$GCC" -print-sysroot 2>/dev/null)"
 [ -n "$SYSROOT" ] || SYSROOT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/$B1NIX_TRIPLET"
 
+# Resolve C++ frontend: clang++ (default) or g++ (legacy fallback)
+CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
+case "$CXX_FRONTEND" in
+  gcc)
+    USE_CXX="$GXX"
+    ;;
+  clang|*)
+    USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
+    ;;
+esac
+
 # Stage the b1nix libc/libstdc++ into the cross sysroot (idempotent). Skip with
 # CMAKE_STAGE_CXX=0 for the few ports that historically did not do this.
 if [ "${CMAKE_STAGE_CXX:-1}" = "1" ]; then
@@ -82,7 +93,7 @@ TC="$BUILD_DIR/b1nix-toolchain.cmake"
   echo "set(CMAKE_SYSTEM_NAME $CMAKE_SYSTEM_NAME)"
   echo "set(CMAKE_SYSTEM_PROCESSOR $B1NIX_GCC_ARCH)"
   echo "set(CMAKE_C_COMPILER \"$GCC\")"
-  echo "set(CMAKE_CXX_COMPILER \"$GXX\")"
+  echo "set(CMAKE_CXX_COMPILER \"$USE_CXX\")"
   echo "set(CMAKE_SYSROOT \"$SYSROOT\")"
   echo "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)"
   echo "set(CMAKE_FIND_ROOT_PATH \"$SYSROOT${CMAKE_FIND_ROOT_EXTRA:+;$CMAKE_FIND_ROOT_EXTRA}\")"
@@ -101,7 +112,7 @@ fi
 # Export CC/CXX — cmake 4 sometimes ignores CMAKE_CXX_COMPILER from the toolchain
 # file for C++ projects. Env vars are the reliable fallback.
 export CC="$GCC"
-export CXX="$GXX"
+export CXX="$USE_CXX"
 
 # When CMAKE_SKIP_TOOLCHAIN=1, pass all cross-compile settings as cmake args
 # instead of using the toolchain file. Required for cmake 4 + C++ ports.

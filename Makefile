@@ -1102,9 +1102,20 @@ userspace-install: userspace
 busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
+# Native toolchain for b1nix self-host: prefer Clang/LLVM, fallback to GCC.
+NATIVE_CLANG_ROOT := $(shell \
+	for p in build/native-clang/installed; do \
+		if [ -d "$$p/bin" ]; then echo "$$p"; break; fi; \
+	done)
 install-native-toolchain:
-	@if [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
-		echo "Installing native toolchain from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
+	@if [ -n "$(NATIVE_CLANG_ROOT)" ]; then \
+		echo "Installing native Clang toolchain from $(NATIVE_CLANG_ROOT) to rootfs..."; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/bin $(BUILD_DIR)/rootfs/usr/lib; \
+		cp -R $(NATIVE_CLANG_ROOT)/bin/. $(BUILD_DIR)/rootfs/usr/bin/ 2>/dev/null || true; \
+		cp -R $(NATIVE_CLANG_ROOT)/lib/. $(BUILD_DIR)/rootfs/usr/lib/ 2>/dev/null || true; \
+		echo "Native Clang toolchain installed to rootfs/usr/"; \
+	elif [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
+		echo "Installing native GCC toolchain (fallback) from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
 		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0; \
 		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
 		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" ]; then \
@@ -1116,8 +1127,8 @@ install-native-toolchain:
 			fi; \
 		done; \
 	else \
-		echo "Note: native toolchain not built (looked in build/toolchain_build/$(B1NIX_TRIPLET)/native_root and ~/b1nix-toolchain/$(B1NIX_TRIPLET)/native_root)."; \
-		echo "      Run tools/toolchain/build-toolchain.sh && tools/toolchain/build-native-toolchain.sh to enable self-host workflow."; \
+		echo "Note: native toolchain not built."; \
+		echo "      Run tools/build-native-clang.sh (preferred) or tools/toolchain/build-native-toolchain.sh (fallback)."; \
 	fi
 
 install-ports: userspace-install install-native-toolchain

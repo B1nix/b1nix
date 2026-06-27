@@ -1,12 +1,39 @@
 #!/bin/sh
-# Compiler shim for the Mesa cross build. The b1nix-targeted cross GCC has no
-# threading spec, so it rejects -pthread (pthread lives in libb1nix, no flag
-# needed). Strip flags the cross GCC doesn't understand and forward the rest,
-# preserving argument boundaries (Mesa passes -D"..." defines with spaces).
+# Compiler shim for the Mesa cross build. Strips flags the cross compiler
+# doesn't understand and adds Clang-specific flags when using the clang++ frontend.
 #
-# Invoked from the meson cross-file as: b1nix-mesa-cc <real-gcc-or-g++> <args...>
+# Invoked from the meson cross-file as: b1nix-mesa-cc <real-compiler> <args...>
+# The real compiler is either the cross g++ (legacy) or clang++ (Stage 1 migration).
 set -eu
 real="$1"; shift
+
+# Detect if we're using clang++ frontend
+USING_CLANG=0
+case "$(basename "$real")" in
+  *clang*) USING_CLANG=1 ;;
+esac
+
+# When using clang++, resolve the GCC cross toolchain for libstdc++ headers
+if [ "$USING_CLANG" -eq 1 ]; then
+  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+  PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+  . "$PROJECT_DIR/tools/toolchain/env.sh"
+  CROSS="$TOOLCHAIN_BUILD_HOME/cross"
+  GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
+  VER="$("$GXX" -dumpversion 2>/dev/null || echo 13.2.0)"
+  CXXROOT="$CROSS/$B1NIX_TRIPLET/include/c++/$VER"
+  GCCROOT="$CROSS/lib/gcc/$B1NIX_TRIPLET/$VER"
+  RES="$("$real" -print-resource-dir 2>/dev/null || true)"
+
+  EXTRA_FLAGS="--target=$B1NIX_TRIPLET"
+  [ -n "$RES" ] && EXTRA_FLAGS="$EXTRA_FLAGS -isystem $RES/include"
+  EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CXXROOT -isystem $CXXROOT/$B1NIX_TRIPLET -isystem $CXXROOT/backward"
+  EXTRA_FLAGS="$EXTRA_FLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
+  EXTRA_FLAGS="$EXTRA_FLAGS -isystem $CROSS/$B1NIX_TRIPLET/include"
+else
+  EXTRA_FLAGS=""
+fi
+
 n=$#
 while [ "$n" -gt 0 ]; do
   a="$1"; shift; n=$((n - 1))
@@ -21,4 +48,5 @@ done
 # the format warnings specifically, last. Keep -Wformat itself ON (disabling it
 # makes -Wformat-security complain "ignored without -Wformat"). This is a port,
 # not Mesa development; harmless on x86_64 (already builds clean).
-exec "$real" "$@" -Wno-error=format -Wno-error=format-security
+# shellcheck disable=SC2086
+exec "$real" $EXTRA_FLAGS "$@" -Wno-error=format -Wno-error=format-security

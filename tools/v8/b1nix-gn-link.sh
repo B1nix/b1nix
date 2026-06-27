@@ -23,6 +23,7 @@ TC="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/bin"
 LD="$TC/x86_64-b1nix-ld"
 RANLIB="$TC/x86_64-b1nix-ranlib"
 GXX="$TC/x86_64-b1nix-g++"
+CC_CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$TC/x86_64-b1nix-gcc")}"
 
 CRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0.o"
 LINKER_EXE="$ROOT_DIR/userspace/linker-cxx.ld"
@@ -64,7 +65,9 @@ fi
 # powl/long-double math the freestanding libb1nix can't carry (whole-archived into
 # binaries that don't link libm); compile the thin wrapper once for the executable.
 MATHL_O=".b1nix_mathl.o"
-[ -f "$MATHL_O" ] || "$GXX" -x c -c "$ROOT_DIR/userspace/libc/mathl.c" -o "$MATHL_O"
+[ -f "$MATHL_O" ] || "$CC_CLANG" --target=x86_64-unknown-elf -x c -ffreestanding -fno-builtin \
+  -fno-stack-protector -nostdinc -isystem "$ROOT_DIR/userspace/include" \
+  -c "$ROOT_DIR/userspace/libc/mathl.c" -o "$MATHL_O"
 
 # Strip clang-driver-only bits from the gn rsp so raw ld can consume it:
 #  - drop -Wl, prefixes (the rsp's --whole-archive/--no-whole-archive survive raw)

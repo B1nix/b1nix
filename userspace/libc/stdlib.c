@@ -13,6 +13,77 @@
 
 extern int normalize_errno(long rc);
 
+#define MAX_CXA_ATEXIT 64
+
+struct cxa_atexit_entry {
+	void (*dtor)(void *);
+	void *obj;
+	void *dso_handle;
+};
+
+static struct cxa_atexit_entry cxa_atexit_table[MAX_CXA_ATEXIT];
+static int cxa_atexit_count = 0;
+
+/* C++ ABI: register a destructor for static/global objects.
+ * dtor is called with obj when the shared object is unloaded or at exit. */
+int __cxa_atexit(void (*dtor)(void *), void *obj, void *dso_handle) {
+	(void)dso_handle;
+	if (cxa_atexit_count >= MAX_CXA_ATEXIT) return -1;
+	cxa_atexit_table[cxa_atexit_count].dtor = dtor;
+	cxa_atexit_table[cxa_atexit_count].obj = obj;
+	cxa_atexit_table[cxa_atexit_count].dso_handle = dso_handle;
+	cxa_atexit_count++;
+	return 0;
+}
+
+/* C++ ABI: unregister destructors for a specific DSO (or all if dso == NULL). */
+void __cxa_finalize(void *dso_handle) {
+	if (!dso_handle) {
+		/* Finalize all registered destructors in reverse order. */
+		for (int i = cxa_atexit_count - 1; i >= 0; i--) {
+			cxa_atexit_table[i].dtor(cxa_atexit_table[i].obj);
+		}
+		cxa_atexit_count = 0;
+		return;
+	}
+	/* Finalize only destructors matching the given DSO. */
+	for (int i = cxa_atexit_count - 1; i >= 0; i--) {
+		if (cxa_atexit_table[i].dso_handle == dso_handle) {
+			cxa_atexit_table[i].dtor(cxa_atexit_table[i].obj);
+			/* Shift remaining entries down. */
+			for (int j = i; j < cxa_atexit_count - 1; j++) {
+				cxa_atexit_table[j] = cxa_atexit_table[j + 1];
+			}
+			cxa_atexit_count--;
+		}
+	}
+}
+
+/* C++ ABI: get the once-used guard variable for thread-safe statics.
+ * Returns 0 on first call, nonzero otherwise. Uses kernel futex. */
+int __cxa_guard_acquire(int *guard) {
+	if (*guard) return 0;
+	return 1;
+}
+
+void __cxa_guard_release(int *guard) {
+	*guard = 1;
+}
+
+void __cxa_guard_abort(int *guard) {
+	*guard = 0;
+}
+
+/* C++ ABI: pure virtual function call handler. */
+void __cxa_pure_virtual(void) {
+	__builtin_trap();
+}
+
+/* C++ ABI: deleted virtual function call handler. */
+void __cxa_deleted_virtual(void) {
+	__builtin_trap();
+}
+
 static void (*atexit_funcs[32])(void);
 static int atexit_count = 0;
 

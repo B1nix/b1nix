@@ -1,5 +1,5 @@
 #!/bin/sh
-# C++ -> b1nix ELF using the cross GCC's hosted libstdc++.
+# C++ -> b1nix ELF using LLVM libc++ or GCC libstdc++.
 #
 # Prereq: run tools/toolchain/enable-cxx-toolchain.sh once (stages b1nix libc headers into
 # the toolchain sysroot + fixes libstdc++'s mbstate_t config). The b1nix libc
@@ -8,7 +8,13 @@
 # Usage:
 #   b1nix-c++ a.cpp b.cpp -o prog     # compile + link to a b1nix ELF
 #   b1nix-c++ -c a.cpp -o a.o         # compile only
-# Extra g++ flags pass through. B1NIX_ARCH=x86 selects the i686 toolchain.
+# Extra flags pass through.
+#
+# Environment:
+#   B1NIX_ARCH          x86_64 (default) or x86
+#   B1NIX_CXX_FRONTEND  clang (default) or gcc — compiler frontend
+#   B1NIX_CXX_STDLIB    libc++ or libstdc++ (default: auto-detect)
+#                        libc++ preferred when built (run build-libcxx.sh)
 
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -27,12 +33,87 @@ LIB="$USR/build/$ARCH/libb1nix.a"
 CRT0="$USR/build/$ARCH/crt/crt0.o"
 LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$LIB" "$CRT0"
-LIBSTDCXX="$("$GXX" -print-file-name=libstdc++.a)"
-LIBSUPCXX="$("$GXX" -print-file-name=libsupc++.a)"
-LIBGCC="$("$GXX" -print-libgcc-file-name)"
 
+# ── Resolve C++ standard library (libc++ vs libstdc++) ──────────────────────
+# B1NIX_CXX_STDLIB=libc++  → use LLVM libc++ (run build-libcxx.sh first)
+# B1NIX_CXX_STDLIB=libstdc++ → use GCC libstdc++ (default fallback)
+LIBCXX_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install"
+LIBCXXABI_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxxabi-install"
+LLVM_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/install/lib"
+
+CXX_STDLIB="${B1NIX_CXX_STDLIB:-}"
+if [ -z "$CXX_STDLIB" ]; then
+  # Auto-detect: prefer libc++ when built
+  if [ -f "$LIBCXX_RT/lib/libc++.a" ] && [ -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
+    CXX_STDLIB="libc++"
+  else
+    CXX_STDLIB="libstdc++"
+  fi
+fi
+
+case "$CXX_STDLIB" in
+  libc++)
+    if [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
+      echo "b1nix-c++: B1NIX_CXX_STDLIB=libc++ but libraries not built yet" >&2
+      echo "  Run: tools/toolchain/build-libcxx.sh" >&2
+      exit 1
+    fi
+    STDLIB_A="$LIBCXX_RT/lib/libc++.a"
+    STDLIB_ABI_A="$LIBCXXABI_RT/lib/libc++abi.a"
+    echo "  C++ stdlib: LLVM libc++" >&2
+    ;;
+  libstdc++|*)
+    STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"
+    STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)"
+    echo "  C++ stdlib: GCC libstdc++" >&2
+    ;;
+esac
+
+# ── Resolve compiler runtime (compiler-rt vs libgcc) ───────────────────────
+if [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$LLVM_RT/libunwind.a" ]; then
+  CRT_RUNTIME="$LLVM_RT/libcompiler_rt.a"
+  UNWIND_RUNTIME="$LLVM_RT/libunwind.a"
+  echo "  CRT runtime: LLVM (compiler-rt + libunwind)" >&2
+else
+  CRT_RUNTIME="$("$GXX" -print-libgcc-file-name)"
+  UNWIND_RUNTIME=""
+  echo "  CRT runtime: GCC (libgcc)" >&2
+fi
+
+# ── Resolve C++ frontend (clang++ vs g++) ──────────────────────────────────
 CXXFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix"
-CXX="$GXX"
+CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
+case "$CXX_FRONTEND" in
+  gcc)
+    CXX="$GXX"
+    ;;
+  clang|*)
+    CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
+    VER="$($GXX -dumpversion)"
+    RES="$($CXX -print-resource-dir 2>/dev/null || true)"
+
+    if [ "$CXX_STDLIB" = "libc++" ]; then
+      # libc++ mode: use libc++ headers from the LLVM runtimes build
+      LIBCXX_HDR="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/include/c++/v1"
+      GCCROOT="$CROSS/lib/gcc/$TRIPLET/$VER"
+      CXXFLAGS="--target=$TRIPLET -nostdinc -std=c++17"
+      [ -n "$RES" ] && CXXFLAGS="$CXXFLAGS -isystem $RES/include"
+      CXXFLAGS="$CXXFLAGS -isystem $LIBCXX_HDR"
+      CXXFLAGS="$CXXFLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
+      CXXFLAGS="$CXXFLAGS -isystem $CROSS/$TRIPLET/include"
+    else
+      # libstdc++ mode: use GCC's C++ headers
+      CXXROOT="$CROSS/$TRIPLET/include/c++/$VER"
+      GCCROOT="$CROSS/lib/gcc/$TRIPLET/$VER"
+      CXXFLAGS="--target=$TRIPLET -nostdinc"
+      [ -n "$RES" ] && CXXFLAGS="$CXXFLAGS -isystem $RES/include"
+      CXXFLAGS="$CXXFLAGS -isystem $CXXROOT -isystem $CXXROOT/$TRIPLET -isystem $CXXROOT/backward"
+      CXXFLAGS="$CXXFLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
+      CXXFLAGS="$CXXFLAGS -isystem $CROSS/$TRIPLET/include"
+    fi
+    ;;
+esac
+
 run_cxx() {
   if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
     ccache "$CXX" "$@"
@@ -40,14 +121,8 @@ run_cxx() {
     "$CXX" "$@"
   fi
 }
-if [ "${B1NIX_CXX_FRONTEND:-gcc}" = clang ]; then
-  CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++)}"
-  VER="$($GXX -dumpversion)"
-  CXXROOT="$CROSS/$TRIPLET/include/c++/$VER"
-  GCCROOT="$CROSS/lib/gcc/$TRIPLET/$VER"
-  RES="$($CXX -print-resource-dir)"
-  CXXFLAGS="--target=$TRIPLET -nostdinc -isystem $RES/include -isystem $CXXROOT -isystem $CXXROOT/$TRIPLET -isystem $CXXROOT/backward -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed -isystem $CROSS/$TRIPLET/include $CXXFLAGS"
-fi
+
+# ── Parse arguments ────────────────────────────────────────────────────────
 compile_only=0
 output="a.out"
 inputs=""
@@ -62,6 +137,7 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+# ── Compile ────────────────────────────────────────────────────────────────
 # shellcheck disable=SC2086
 if [ "$compile_only" -eq 1 ]; then
   # shellcheck disable=SC2086
@@ -78,11 +154,19 @@ for in in $inputs; do
   esac
 done
 
+# ── Link ───────────────────────────────────────────────────────────────────
 # Link recipe: crt0 + objects, then the C++ runtime group. --allow-multiple-
 # definition resolves the i686 __divdi3/__moddi3 clash (b1nix div64 vs libgcc).
 # shellcheck disable=SC2086
-"$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
-  "$CRT0" $objs \
-  --start-group "$LIBSTDCXX" "$LIBSUPCXX" "$LIBGCC" \
-  --whole-archive "$LIB" --no-whole-archive --end-group
+if [ -n "$UNWIND_RUNTIME" ]; then
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
+    "$CRT0" $objs \
+    --start-group "$STDLIB_A" "$STDLIB_ABI_A" "$CRT_RUNTIME" "$UNWIND_RUNTIME" \
+    --whole-archive "$LIB" --no-whole-archive --end-group
+else
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
+    "$CRT0" $objs \
+    --start-group "$STDLIB_A" "$STDLIB_ABI_A" "$CRT_RUNTIME" \
+    --whole-archive "$LIB" --no-whole-archive --end-group
+fi
 rm -rf "$tmp"
