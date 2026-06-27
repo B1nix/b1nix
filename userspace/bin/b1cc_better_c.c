@@ -9,6 +9,8 @@ struct TestStruct {
   int y;
 };
 
+int my_global_var = 123;
+
 int main(void) {
   my_int a = VAL_B;
   int b = (int)a;
@@ -26,7 +28,17 @@ int main(void) {
   test_var++;
   test_var += 4;
   
-  if (sum == 860 && VAL_A == 10 && (10 & 6) == 2 && (2 << 3) == 16 && test_var == 10) {
+  int switch_res = 0;
+  switch (test_var) {
+    case 10:
+      switch_res = 42;
+      break;
+    default:
+      switch_res = 0;
+      break;
+  }
+  
+  if (sum == 860 && VAL_A == 10 && (10 & 6) == 2 && (2 << 3) == 16 && test_var == 10 && switch_res == 42 && my_global_var == 123) {
     puts("B1CC-BETTER-C-SMOKE: ok");
     return 0;
   } else {
