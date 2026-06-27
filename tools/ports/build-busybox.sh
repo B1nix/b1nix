@@ -139,6 +139,11 @@ echo "Building BusyBox..."
 export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include"
 export EXTRA_LDFLAGS="-Wl,-Ttext-segment=0x2000000 -L$SYSROOT/lib --sysroot=$SYSROOT"
 
+# Wire ccache into the busybox build (byte-identical objects, faster rebuilds).
+if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
+  export CC="ccache ${TARGET}-gcc"
+fi
+
 make -C "$BUILD_DIR" -j"$NPROC" CROSS_COMPILE="${TARGET}-"
 
 # ── 4. Install ──────────────────────────────────────────────────────────────
