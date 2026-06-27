@@ -41,12 +41,11 @@ Supporting documents:
 
 - [x] Parse the Multiboot2 memory map and manage reusable physical frames.
 - [x] Implement x86_64 paging, higher-half mapping, and a direct-map window.
-- [x] Link **both kernels at a higher-half VA** (x86_64 at 0xFFFFFFFF80000000;
-  i686 into the direct map at 0x80000000), loaded at physical 1M. Kernel symbols
+- [x] Link the x86_64 kernel at a higher-half VA (0xFFFFFFFF80000000), loaded at
+  physical 1M. Kernel symbols
   no longer share the low address range with userspace (base 0x2000000), so a
   large kernel image (e.g. an embedded Mesa initramfs) can no longer overlap and
-  corrupt a userspace process's view of kernel data. Both arches boot, single +
-  `-smp 4`.
+  corrupt a userspace process's view of kernel data.
 - [x] Add the kernel heap, map/unmap helpers, and lazy page allocation.
 - [x] Add swap bookkeeping and page eviction.
 - [x] Add per-process page tables, protection checks, and copy-on-write fork.
@@ -448,8 +447,6 @@ syscall-number translation layer keyed off a per-image binary personality
 ## M41: Large Physical Memory
 
 - [x] Remove the old x86_64 64 GiB ceiling and verify a 16 GiB boot.
-- [ ] `partial` Raise the i686 direct-map limit from 1 GiB toward 1.5-1.75 GiB.
-- [ ] `planned` Add per-CPU high-memory mappings for up to 4 GiB on i686.
 - [ ] `planned` Verify full usable memory and defensive e820 handling on real
   hardware.
 
@@ -457,7 +454,7 @@ syscall-number translation layer keyed off a per-image binary personality
 
 - [x] Cross-build upstream BusyBox as an isolated static multicall binary.
 - [x] Port core file, text, archive, process, account, storage, and networking
-  applets in tested waves on x86_64 and i686.
+  applets in tested waves.
 - [x] Add required libc, `/proc`, `/sys`, raw socket, loop, and netlink support.
 - [x] Promote upstream `ash` to `/bin/sh`.
 - [x] Add an explicit applet-selection manifest.
@@ -512,8 +509,7 @@ syscall-number translation layer keyed off a per-image binary personality
   `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
   character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
   `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
-- Verified by `BASH-SMOKE` +
-  `M32B-SSH` markers on i686 and x86_64, single-CPU and `-smp 4`.
+- Verified by `BASH-SMOKE` + `M32B-SSH` markers, single-CPU and `-smp 4`.
 
 ## M46: VFS Integrity and POSIX Process Conformance
 
@@ -940,9 +936,6 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
   existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
   `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
-  x86_64-only: clang and the GCC-built libstdc++ disagree on `size_t` mangling
-  for `i686-b1nix` (`unsigned int` vs `unsigned long`), so the i686 clang link
-  fails — GCC stays the C++ compiler on the 32-bit port.
 - [ ] `planned` **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
   directory/config so the working GCC V8 build remains the fallback. Reuse the
   GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
@@ -963,8 +956,8 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   the host builds a bootable image, `b1nix_install` copies it to a target disk,
   and that disk boots GRUB → kernel → `rootfs: sata0p1 mounted at /` → userland.
 - [x] `done` **`tools/images/mk-disk-image.sh`** (host): builds a standalone-bootable
-  `b1nix-disk.img` — MBR + real pre-baked GRUB (BIOS i386-pc via loopback
-  `grub-install`) + an ext4 root staged with the full userland (busybox + bash +
+  `b1nix-disk.img` — MBR + real pre-baked BIOS GRUB via loopback
+  `grub-install` + an ext4 root staged with the full userland (busybox + bash +
   applet symlinks + `/etc`). **No in-guest ports** (no in-guest grub/mkfs).
   Excludes V8/Chromium by construction. `make disk-image`.
 - [x] `done` **`/bin/b1nix_install`** (in-guest): validated whole-disk copy of
@@ -1218,15 +1211,6 @@ PIE base (`0x500000000000`).
 - [ ] `planned` Raise/make-dynamic hard caps: TCP conns (64), VFS pipes (128),
   core-dump size (1 MiB), `SHMMAX` (32 MiB).
 
-## M78: i686 Userspace SMP — FROZEN (x86 not maintained)
-
-The `ARCH=x86` (i686) port is **frozen / not actively maintained** — `ARCH=x86_64`
-is the sole maintained arch (all new work: Rust, V8, Chromium, dynamic linking).
-x86 last passed its smoke clean (804/0, 2026-06-23) but is no longer smoke-tested
-or ported to. The item below is parked for a future dedicated x86 maintainer.
-
-- [ ] `frozen` Fix the ELF32 AP fork/waitpid BKL deadlock so the 32-bit port
-  runs userspace on APs (currently BSP-pinned).
 ## M66: Chromium Browser Frontend (planned)
 
 - [ ] `planned` A real **browser UI on top of the Chromium content layer** — once

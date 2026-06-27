@@ -34,30 +34,30 @@ After that:
 ```sh
 make check-tools
 make
-make run-x86
+make run
 ```
 
 Homebrew GRUB may expose `i686-elf-grub-mkrescue` instead of
 `grub-mkrescue`; the Makefile accepts either name.
 
-## Per-architecture toolchain & port layout
+## Toolchain & port layout
 
-b1nix builds for two targets, selected by `ARCH` / `B1NIX_ARCH`:
+b1nix actively builds for one target:
 
 | `ARCH`   | host triplet    | gcc arch |
 |----------|-----------------|----------|
 | `x86_64` | `x86_64-b1nix`  | `x86_64` |
-| `x86`    | `i686-b1nix`    | `i686`   |
 
-The single source of truth for this mapping is **`tools/toolchain/env.sh`**, a
-POSIX-sh helper sourced by every toolchain/port build script (it reads
+The old `i686-b1nix` target is archived; see
+[`x86-32bit-port.md`](x86-32bit-port.md). The source of truth for the active
+mapping is **`tools/toolchain/env.sh`**, a POSIX-sh helper sourced by every
+toolchain/port build script (it reads
 `B1NIX_ARCH`, default `x86_64`, and exports `B1NIX_TRIPLET`, `B1NIX_GCC_ARCH`,
 `B1NIX_ROOTFS`, `TOOLCHAIN_BUILD_HOME`, `TOOLCHAIN_DIST_DIR`,
-`TOOLCHAIN_SRC_DIR`). The Makefile keeps a matching `B1NIX_TRIPLET` mapping.
+`TOOLCHAIN_SRC_DIR`). The Makefile keeps a matching `B1NIX_TRIPLET`.
 
 The downloaded tarballs and the patched binutils/gcc source trees are shared.
-Everything that is target-specific lives under a **per-triplet** directory so
-the x86 and x86_64 trees never share objects:
+Everything that is target-specific lives under a triplet directory:
 
 ```
 build/
@@ -65,29 +65,19 @@ build/
     dist/                       # shared: binutils/gcc/make tarballs (downloaded once)
     src/                        # shared: patched binutils/gcc source trees
     x86_64-b1nix/{cross, native_root, native_build, build, sysroot}
-    i686-b1nix/  {cross, native_root, native_build, build, sysroot}
   <prog>-src/<triplet>/<prog>-X.Y/      # per-arch source tree (curl, wget, pcre2,
   <prog>-b1nix/<triplet>/[install]      # openssl, mbedtls, dropbear, libidn2, ...)
 ```
 
-Why the **cross compilers are per-triplet, not shared**: `x86_64-b1nix-gcc` and
-`i686-b1nix-gcc` are *different* compilers (different target backend; GCC is
-`--disable-multilib`), so the 64-bit cross cannot emit 32-bit `i686-b1nix` ELF.
-They must be built separately. The tarballs and patched source trees are
-shareable, so they are cached once under `dist/` / `src/` and compiled per
-triplet. (A single multilib cross is an alternative but is a larger GCC
-reconfiguration and is not used.)
-
-Build the cross + native toolchain for a given arch with:
+Build the cross + native toolchain with:
 
 ```sh
-B1NIX_ARCH=x86    tools/toolchain/build-toolchain.sh        # i686-b1nix cross
-B1NIX_ARCH=x86    tools/toolchain/build-native-toolchain.sh # i686-b1nix native (in-guest)
-# (omit B1NIX_ARCH or set =x86_64 for the 64-bit toolchain)
+tools/toolchain/build-toolchain.sh
+tools/toolchain/build-native-toolchain.sh
 ```
 
-`make install-native-toolchain ARCH=x86` copies the matching per-triplet
-`native_root` into `build/x86/rootfs`.
+`make install-native-toolchain` copies the matching native toolchain into
+`build/x86_64/rootfs`.
 
 ## M17 Target ABI
 
@@ -166,14 +156,14 @@ the initial open flags `O_CREAT`, `O_TRUNC`, `O_APPEND`, and `O_DIRECTORY`.
 Create a seeded ext2 root image for local testing with:
 
 ```sh
-make ARCH=x86 root-image
+make root-image
 ```
 
-This writes `build/x86/root.ext2` with `/bin`, `/etc`, `/dev`, `/home`, `/tmp`,
+This writes `build/x86_64/root.ext4` with `/bin`, `/etc`, `/dev`, `/home`, `/tmp`,
 and `/var`. Boot it as the root filesystem with:
 
 ```sh
-make ARCH=x86 run-root
+make run-root
 ```
 
 When the image is attached as `virtio-blk0`, ext2 mounts at `/` and overlays the

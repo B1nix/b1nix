@@ -1,15 +1,13 @@
 # B1NIX Userspace ELF ABI
 
-b1nix has two userspace ABIs, selected by `ARCH`. The bulk of this document
-describes **x86_64-b1nix** (`ARCH=x86_64`); the **i686-b1nix** (`ARCH=x86`)
-32-bit variant is summarized in its own section below and detailed in
-[`x86-32bit-port.md`](x86-32bit-port.md).
+b1nix's active userspace ABI is **x86_64-b1nix** (`ARCH=x86_64`). The old
+**i686-b1nix** (`ARCH=x86`) variant is archived; see
+[`x86-32bit-port.md`](x86-32bit-port.md) for its history.
 
 ## Target Triple
 
 ```
 x86_64-b1nix-elf   (ARCH=x86_64)
-i686-b1nix-elf     (ARCH=x86)
 ```
 
 ## Calling Convention
@@ -73,29 +71,10 @@ B1NIX supports two execution models:
 1. **Built-in programs**: Function pointers registered via `user_register_program()`
    in the kernel and dispatched directly — used for shell, busybox, and core utils.
 2. **VFS-loaded ELF**: Full ELF executables loaded from the filesystem through
-   `user_load_elf64()` / `user_load_elf32()` — used for externally compiled
-   programs.
+   `user_load_elf64()` — used for externally compiled programs.
 
-The kernel tries the ELF dispatch first (elf64, then elf32); if both reject the
-file, it falls back to built-in dispatch.
-
-## i686-b1nix (32-bit, `ARCH=x86`) variant
-
-Same ELF load base, stack layout, two-execution-models, and syscall *numbers* as
-above; the differences are the calling convention and syscall mechanism:
-
-- **Calling convention:** cdecl / SysV i386 — integer args passed on the stack;
-  return value in EAX; callee-saved EBX, ESI, EDI, EBP; `%esp & 0xF == 4` at
-  `_start` (i.e. 16-byte aligned *after* the implicit return-address push).
-- **Syscall ABI:** the `int $0x80` instruction (not `syscall`) — number in EAX;
-  args EBX, ECX, EDX, ESI, EDI, EBP. 64-bit values are passed as explicit lo/hi
-  register pairs. The libc `syscall()` wrapper uses an EBP trick (a constant-0
-  sixth argument) so the frame pointer stays usable.
-- **ELF:** Class ELF32, Machine EM_386 (0x03), Type ET_EXEC. User segment
-  selectors: CS=0x1B, SS=0x23, FS=0x38 (per-CPU), GS=0x33 (TLS).
-
-See [`x86-32bit-port.md`](x86-32bit-port.md) for the interrupt-frame offsets and
-the entry-assembly details.
+The kernel tries ELF64 dispatch first; if it rejects the file, it falls back to
+built-in dispatch.
 
 ## External Cross-Compilation
 

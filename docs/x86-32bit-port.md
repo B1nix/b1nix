@@ -1,5 +1,9 @@
 # x86 32-bit Architecture Port (`ARCH=x86`)
 
+**Status: archived.** The i686 port was removed from active builds after its
+last green smoke run (`804/0`, 2026-06-23). Source lives under
+`archive/kernel/arch/x86/`; this document is kept as the port history.
+
 This document describes all changes made to port b1nix from x86_64-only to also support genuine 32-bit x86 (`ARCH=x86`), including kernel, userspace, and boot infrastructure.
 
 > Porting b1nix to a *different* architecture? Start with the arch-agnostic
