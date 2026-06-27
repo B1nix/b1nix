@@ -3474,7 +3474,23 @@ isize vfs_readlink(const char *path, char *buffer, usize size) {
   }
 
   vfs_inode_lock_read(node->inode);
-  if (node->inode->type != VFS_SYMLINK || !node->inode->data) {
+  if (node->inode->type != VFS_SYMLINK) {
+    vfs_inode_unlock_read(node->inode);
+    vfs_node_put(node);
+    res = -EINVAL;
+    goto out;
+  }
+  /* Dynamic symlink target: a read_cb renders the target per-caller (e.g.
+   * procfs /proc/self/exe, which resolves to the calling task's exe path).
+   * Call it without the inode lock — the callback may take other locks. */
+  if (node->inode->read_cb) {
+    isize (*rcb)(struct vfs_node *, u64, char *, usize, int) = node->inode->read_cb;
+    vfs_inode_unlock_read(node->inode);
+    res = rcb(node, 0, buffer, size, 0);
+    vfs_node_put(node);
+    goto out;
+  }
+  if (!node->inode->data) {
     vfs_inode_unlock_read(node->inode);
     vfs_node_put(node);
     res = -EINVAL;

@@ -171,6 +171,121 @@ static struct block_device *find_root_device(const char *root_val) {
 	}
 }
 
+/* M26 native-Clang kernel self-host driver. Reads /mnt/build/srcs.txt (each line
+ * "src-relpath\tobj-abspath"), compiles every kernel TU with the b1nix-native
+ * clang, then links them with ld.lld via the staged response file — proving
+ * b1nix builds its own kernel with its own clang+lld toolchain. Driven shell-free
+ * from the kernel (no in-guest make/busybox needed). See
+ * tools/inguest/build-selfhost-module.sh. */
+static int selfhost_clang_one(const char *src_abs, const char *obj_abs)
+{
+	/* argv[0] MUST be the full path: b1nix has no /proc/self/exe, so clang finds
+	 * its own install dir (to re-exec -cc1 and locate the resource headers) from
+	 * argv[0]. A bare "clang" makes it fail to exec cc1 and to find stddef.h.
+	 * -resource-dir pins the builtin headers explicitly for good measure. */
+	const char *argv[] = {
+		"/mnt/build/bin/clang", "-B/mnt/build/bin",
+		"-resource-dir", "/mnt/build/lib/clang/22",
+		"-integrated-as", "-std=c11", "-ffreestanding", "-fno-builtin",
+		"-fno-stack-protector", "-fno-pic", "-mno-red-zone",
+		"-I/mnt/build/src/kernel/include", "-I/mnt/build/src/build/x86_64",
+		"-mcmodel=kernel",
+		"-mno-sse", "-mno-mmx", "-mno-sse2", "-mno-3dnow",
+		"-c", src_abs, "-o", obj_abs, 0,
+	};
+	int pid = user_spawn("/mnt/build/bin/clang", 22, argv);
+	if (pid <= 0)
+		return -1;
+	int st = 0;
+	syscall_dispatch(SYS_WAIT, (u64)pid, (u64)(usize)&st, 0, 0, 0, 0);
+	return st;
+}
+
+static void run_selfhost_build(void)
+{
+	char *data = 0;
+	int fd = vfs_open("/mnt/build/srcs.txt");
+	if (fd < 0) {
+		console_write("M26-SELFHOST: fail no-srcs\n");
+		return;
+	}
+	/* srcs.txt is small (~4KB for ~92 lines). */
+	data = kmalloc(65536);
+	if (!data) { vfs_close(fd); return; }
+	isize n = vfs_read(fd, data, 65535);
+	vfs_close(fd);
+	if (n <= 0) { kfree(data); console_write("M26-SELFHOST: fail read-srcs\n"); return; }
+	data[n] = 0;
+
+	int total = 0, failed = 0;
+	char src_abs[256];
+	char *p = data;
+	while (*p) {
+		char *eol = p;
+		while (*eol && *eol != '\n') eol++;
+		char saved = *eol;
+		*eol = 0;
+		/* split "src\tobj" */
+		char *tab = p;
+		while (*tab && *tab != '\t') tab++;
+		if (*tab == '\t') {
+			*tab = 0;
+			const char *src_rel = p;
+			const char *obj_abs = tab + 1;
+			if (*src_rel && *obj_abs) {
+				snprintf(src_abs, sizeof(src_abs), "/mnt/build/src/%s", src_rel);
+				int rc = selfhost_clang_one(src_abs, obj_abs);
+				total++;
+				if (rc != 0) {
+					failed++;
+					console_write("M26-SELFHOST: cc-fail ");
+					console_write(src_rel);
+					console_write("\n");
+				}
+				if ((total % 10) == 0) {
+					char b[64];
+					snprintf(b, sizeof(b), "M26-SELFHOST: progress %d compiled\n", total);
+					console_write(b);
+				}
+			}
+		}
+		*eol = saved;
+		p = (*eol) ? eol + 1 : eol;
+	}
+	kfree(data);
+
+	char sb[80];
+	snprintf(sb, sizeof(sb), "M26-SELFHOST: compiled %d/%d (failed=%d)\n",
+	         total - failed, total, failed);
+	console_write(sb);
+
+	if (failed == 0 && total > 0) {
+		console_write("M26-SELFHOST: ok compile\n");
+		/* Link with ld.lld via the staged response file. */
+		const char *largv[] = {
+			"/mnt/build/bin/ld.lld", "-m", "elf_x86_64", "-z", "max-page-size=0x1000",
+			"-T", "/mnt/build/src/kernel/arch/x86_64/linker.ld",
+			"-o", "/mnt/build/kernel.elf", "@/mnt/build/kernel.rsp", 0,
+		};
+		int lpid = user_spawn("/mnt/build/bin/ld.lld", 10, largv);
+		int lst = -1;
+		if (lpid > 0)
+			syscall_dispatch(SYS_WAIT, (u64)lpid, (u64)(usize)&lst, 0, 0, 0, 0);
+		unsigned char mag[4] = {0};
+		int ofd = vfs_open("/mnt/build/kernel.elf");
+		if (ofd >= 0) { vfs_read(ofd, (char *)mag, sizeof(mag)); vfs_close(ofd); }
+		snprintf(sb, sizeof(sb), "M26-SELFHOST: link exit=%d magic=%02x%02x%02x%02x\n",
+		         lst, mag[0], mag[1], mag[2], mag[3]);
+		console_write(sb);
+		if (lpid > 0 && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F')
+			console_write("M26-SELFHOST: ok kernel-elf\n");
+		else
+			console_write("M26-SELFHOST: fail link\n");
+	} else {
+		console_write("M26-SELFHOST: fail compile\n");
+	}
+}
+
 void kernel_main(usize arg0, usize arg1)
 {
 	serial_init();
@@ -705,6 +820,22 @@ void kernel_main(usize arg0, usize arg1)
 			else
 				console_write("M64-NATIVE-CLANG: fail compile\n");
 		}
+	}
+
+	/* M26 native-Clang KERNEL self-host. The self-host module (clang + ld.lld +
+	 * kernel source + the flat TU list) ships as the ram0 ext4 GRUB module. With
+	 * b1nix.selfhostbuild the kernel mounts it and compiles+links its own kernel
+	 * in-guest with its own clang+ld.lld (the same toolchain the host uses), the
+	 * real M26 self-host. Gated by a cmdline flag so it never fires in the
+	 * ordinary smoke suite. */
+	if (bootinfo_has_flag("b1nix.selfhostbuild")) {
+		vfs_mkdir("/mnt/build", 0755);
+		int sh_mrc = vfs_mount("ram0", "/mnt/build", "ext4", 0);
+		char sh_buf[80];
+		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount ram0 -> /mnt/build: %d\n", sh_mrc);
+		console_write(sh_buf);
+		if (sh_mrc == 0)
+			run_selfhost_build();
 	}
 
 	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs

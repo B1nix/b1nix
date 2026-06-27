@@ -1223,6 +1223,13 @@ smoke-b1cc:
 clang-proof:
 	sh tools/clang/clang-proof.sh
 
+# M26 native-Clang KERNEL self-host: b1nix compiles its own kernel's C TUs with
+# its native clang and links a complete kernel.elf with native ld.lld, in-guest.
+# Needs build/native-clang/b1nix (clang + ld.lld) and a host kernel build (make
+# ARCH=x86_64 iso) for the staged .S/kallsyms objects. Wants >=16GB guest RAM.
+selfhost-clang:
+	sh tools/inguest/selfhost-proof.sh
+
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)
 

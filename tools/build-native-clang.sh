@@ -112,7 +112,7 @@ EOF
         -DCMAKE_TOOLCHAIN_FILE="$TOOLCHAIN_FILE" \
         -DCMAKE_BUILD_TYPE=MinSizeRel \
         -DCMAKE_INSTALL_PREFIX="$B1NIX_DEST/usr" \
-        -DLLVM_ENABLE_PROJECTS="clang" \
+        -DLLVM_ENABLE_PROJECTS="clang;lld" \
         -DLLVM_TARGETS_TO_BUILD="X86" \
         -DLLVM_DEFAULT_TARGET_TRIPLE="$B1NIX_TRIPLET" \
         -DLLVM_HOST_TRIPLE="$B1NIX_TRIPLET" \
@@ -134,8 +134,8 @@ EOF
         -DCLANG_TABLEGEN="$HOST_TBLGEN/bin/clang-tblgen" \
         -DLLVM_NATIVE_TOOL_DIR="$HOST_TBLGEN/bin"
 
-    ninja -C "$B1NIX_BUILD" -j"$JOBS" clang clang-resource-headers
-    DESTDIR= ninja -C "$B1NIX_BUILD" install-clang install-clang-resource-headers
+    ninja -C "$B1NIX_BUILD" -j"$JOBS" clang clang-resource-headers lld
+    DESTDIR= ninja -C "$B1NIX_BUILD" install-clang install-clang-resource-headers install-lld
 
     echo ""
     echo "b1nix-native Clang installed: $B1NIX_DEST/usr/bin/"

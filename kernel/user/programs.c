@@ -2671,7 +2671,8 @@ static int init_main(int argc, const char **argv) {
    * needs longer than this test sequence. Skip the auto-reboot in that mode so
    * clang isn't cut off mid-compile — the proof script (tools/clang/clang-proof.sh)
    * owns QEMU's lifecycle and kills it on its marker/timeout. */
-  if (!bootinfo_has_flag("b1nix.clangrun"))
+  if (!bootinfo_has_flag("b1nix.clangrun") &&
+      !bootinfo_has_flag("b1nix.selfhostbuild"))
     syscall_dispatch(SYS_REBOOT, 0, 0, 0, 0, 0, 0);
   }
 

@@ -579,11 +579,51 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
   return vfs_readdir_children(dir, offset, buf, max_entries);
 }
 
+/* /proc/<pid>/exe — symlink to the task's executable path (task->name). Tools
+ * resolve their own install directory via readlink("/proc/self/exe"); a bare
+ * argv[0] is not enough for clang's .S two-step (cc1 preprocess + cc1as
+ * assemble), whose assembler re-exec otherwise fails to locate clang. The
+ * target is rendered per-caller via a read_cb: pid_from_parent() resolves the
+ * parent dir name ("self" -> the calling task, or a numeric pid) so a single
+ * static node serves both /proc/self/exe and /proc/<pid>/exe correctly. */
+static isize procfs_exe_readlink(struct vfs_node *node, u64 offset, char *buf,
+                                 usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  usize pid = pid_from_parent(node);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t || !t->name || !t->name[0])
+    return -EINVAL;
+  usize len = strlen(t->name);
+  if (len > size)
+    len = size;
+  memcpy(buf, t->name, len);
+  return (isize)len;
+}
+
+static void procfs_make_exe_symlink(struct vfs_node *dir, usize pid) {
+  (void)pid; /* resolved dynamically from dir name via pid_from_parent */
+  if (find_child(dir, "exe"))
+    return;
+  struct vfs_node *n = vfs_create_node(VFS_SYMLINK);
+  if (!n)
+    return;
+  memcpy(n->name, "exe", 4);
+  n->inode->read_cb = procfs_exe_readlink;
+  n->inode->size = 256;
+  n->inode->mode = 0777;
+  n->inode->nlink = 1;
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
+}
+
 static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
                                            const char *name, usize pid) {
   struct vfs_node *d = procfs_mkchild(parent, name, VFS_DIRECTORY, 0, 0);
   if (!d)
     return 0;
+  procfs_make_exe_symlink(d, pid);
   procfs_mkchild(d, "status", VFS_DEVICE, r_pid_status, pid);
   procfs_mkchild(d, "cmdline", VFS_DEVICE, r_pid_cmdline, pid);
   procfs_mkchild(d, "comm", VFS_DEVICE, r_pid_comm, pid);

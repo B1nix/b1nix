@@ -247,6 +247,14 @@ Supporting documents:
 - [x] Build larger programs and the kernel with the cross toolchain.
 - [x] Compile and link the full kernel inside B1NIX; boot the exact result.
 - [x] Provide an in-guest assembler/linker/make workflow.
+- [x] `done` **Self-host the kernel with the native Clang/LLVM toolchain.**
+  `make selfhost-clang` (tools/inguest/selfhost-proof.sh) ships clang-22 + ld.lld
+  in an ext4 ram0 module; with `b1nix.selfhostbuild` the kernel compiles all 107
+  kernel C TUs in-guest with its own clang and links a complete kernel.elf with
+  its own ld.lld — the same toolchain the host uses (`M26-SELFHOST: ok kernel-elf`).
+  The 6 hand-written `.S` stubs + generated `kallsyms.o` are pre-staged (clang's
+  in-guest `cc1as` re-exec can't resolve its own path on b1nix yet; tracked as a
+  follow-up). Needs >=16GB guest RAM (107 × ~94MB clang loads in one boot).
 - [x] Fix kernel-stack sizing and improve physical-frame allocation.
 - [x] Add heap splitting, coalescing, page return, and a large-allocation arena.
 - [x] Make swap reclaim work under pressure.
