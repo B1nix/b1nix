@@ -13,6 +13,7 @@
 #include "initramfs_b1cc_argv.inc"
 #include "initramfs_b1cc_file_write.inc"
 #include "initramfs_b1cc_stderr_exit.inc"
+#include "initramfs_b1cc_better_c.inc"
 #ifndef MINIMAL_INITRAMFS
 #include "initramfs_m12_smoke.inc"
 #include "initramfs_m13_job_control.inc"
@@ -1424,6 +1425,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_file_write_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_stderr_exit", (const char *)vfs_b1cc_stderr_exit_elf,
      sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
+     sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
 
     {"/mnt/iso/.keep", "", 0, 0},
     {"/mnt/root/.keep", "", 0, 0},

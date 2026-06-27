@@ -145,7 +145,8 @@ INITRAMFS_INCS := \
 	$(BUILD_DIR)/initramfs_b1cc_hello.inc \
 	$(BUILD_DIR)/initramfs_b1cc_argv.inc \
 	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
-	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc
+	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc \
+	$(BUILD_DIR)/initramfs_b1cc_better_c.inc
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \

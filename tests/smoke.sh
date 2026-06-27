@@ -142,7 +142,7 @@ report_progress_line() {
 		esac
 	else
 		case "$line" in
-			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|BPKG-SMOKE:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
+			b1nix\ kernel*|init\ spawn\ result:*|M[0-9]*:*|NATIVE-SMOKE:*|B1CC-*:*|POSIX-SMOKE:*|LOCK-SMOKE:*|EXT-STRESS:*|NET-SMOKE:*|UDP-SMOKE:*|POLL-SMOKE:*|TCP-SMOKE:*|DNS-SMOKE:*|BB-SMOKE:*|BB-W[0-9]*:*|BPKG-SMOKE:*|B1NIX-TEST:*|B1NIX-QUICK:*|*PANIC*) ;;
 			*) return ;;
 		esac
 	fi
@@ -568,6 +568,11 @@ check_output "$LOG" "b1nix kernel" "kernel banner appears"
 check_output "$LOG" "pmm:" "physical memory manager initializes"
 check_output "$LOG" "kheap:" "kernel heap initializes"
 check_output "$LOG" "B1CC-R42-SMOKE: ok" "b1cc return_42 runs and exits with 42"
+check_output "$LOG" "B1CC-HELLO-SMOKE: ok" "b1cc hello runs and exits with 0"
+check_output "$LOG" "B1CC-ARGV-SMOKE: ok" "b1cc argv propagation works"
+check_output "$LOG" "B1CC-FILE-SMOKE: ok" "b1cc file write works"
+check_output "$LOG" "B1CC-STDERR-SMOKE: ok" "b1cc stderr exit status propagates"
+check_output "$LOG" "B1CC-BETTER-C-SMOKE: ok" "b1cc better C features work (M7)"
 
 # ── Test 2: No panic ──
 if grep -q "KERNEL PANIC" "$LOG" 2>/dev/null; then
