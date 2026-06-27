@@ -18,11 +18,12 @@
 #   tools/build-native-clang.sh --full                  # force full LLVM build
 #   tools/build-native-clang.sh --reuse-rust-llvm       # force reuse Rust LLVM
 set -eu
-
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
+export PROJECT_DIR="$ROOT"
 . "$ROOT/tools/toolchain/env.sh" 2>/dev/null || true
 B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
 CROSS="$ROOT/build/toolchain_build/$B1NIX_TRIPLET/cross"
+SYSROOT="$ROOT/build/toolchain_build/$B1NIX_TRIPLET/sysroot"
 HOST_TBLGEN="$ROOT/build/native-clang/host-tblgen"
 CLANG_BUILD="$ROOT/build/native-clang/b1nix"
 NATIVE_DEST="$ROOT/build/native-clang/installed"
@@ -32,7 +33,7 @@ STRATEGY="${1:-auto}"
 # ── Detect LLVM source availability ──────────────────────────────────────────
 RUST_LLVM_SRC="$ROOT/build/rust-native/rust-src-full/src/llvm-project"
 RUST_B1NIX_LLVM="$ROOT/build/rust-native/rust-src-full/build/x86_64-unknown-b1nix/llvm"
-SELFHOST_LLVM_SRC="$ROOT/build/toolchain_build/llvm-runtimes-build/llvm-project-18.1.8.src"
+SELFHOST_LLVM_SRC="$ROOT/build/toolchain_build/llvm-runtimes-build/llvm-project-22.1.8.src"
 
 LLVM_SRC=""
 B1NIX_LLVM=""
@@ -53,8 +54,8 @@ case "$STRATEGY" in
       LLVM_SRC="$SELFHOST_LLVM_SRC"
       echo "[native-clang] auto: using downloaded LLVM sources"
     else
-      echo "[native-clang] no LLVM sources found — downloading LLVM 18.1.8..."
-      LLVM_VER="18.1.8"
+      echo "[native-clang] no LLVM sources found — downloading LLVM..."
+      LLVM_VER="${LLVM_VER:-22.1.8}"
       LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
       LLVM_DL="$ROOT/build/native-clang/llvm-${LLVM_VER}.src.tar.xz"
       mkdir -p "$(dirname "$LLVM_DL")"
@@ -72,12 +73,14 @@ esac
 # fixinclude: protect against sysroot header clobbering
 mkdir -p "$ROOT/build/native-clang/fixinclude"
 cp "$ROOT/userspace/include/errno.h" "$ROOT/build/native-clang/fixinclude/errno.h" 2>/dev/null || true
-CFLAGS_B1NIX="-isystem $ROOT/build/native-clang/fixinclude -ffunction-sections -fdata-sections -fPIC -m64 -D__linux__=1"
+CFLAGS_B1NIX="--sysroot=$SYSROOT -isystem $ROOT/build/native-clang/fixinclude -ffunction-sections -fdata-sections -fPIC -m64 -D__linux__=1"
 
 # ── Stage A: host TableGen tools (needed for cross-compiling clang) ──────────
 if [ ! -x "$HOST_TBLGEN/bin/clang-tblgen" ] || [ ! -x "$HOST_TBLGEN/bin/llvm-tblgen" ]; then
   echo "[native-clang] Stage A: host clang-tblgen + llvm-tblgen"
   cmake -G Ninja -S "$LLVM_SRC/llvm" -B "$HOST_TBLGEN" \
+    -DCMAKE_C_COMPILER=clang \
+    -DCMAKE_CXX_COMPILER=clang++ \
     -DCMAKE_BUILD_TYPE=Release \
     -DLLVM_ENABLE_PROJECTS="clang" \
     -DLLVM_TARGETS_TO_BUILD="X86" \
@@ -144,6 +147,11 @@ else
       -DLLVM_INCLUDE_TESTS=OFF \
       -DCMAKE_CROSSCOMPILING=True \
       -DCMAKE_SYSTEM_NAME=Linux \
+      -DCMAKE_FIND_ROOT_PATH="$SYSROOT" \
+      -DCMAKE_FIND_ROOT_PATH_MODE_PROGRAM=NEVER \
+      -DCMAKE_FIND_ROOT_PATH_MODE_LIBRARY=ONLY \
+      -DCMAKE_FIND_ROOT_PATH_MODE_INCLUDE=ONLY \
+      -DCMAKE_FIND_ROOT_PATH_MODE_PACKAGE=ONLY \
       -DCMAKE_C_COMPILER="$CROSS/bin/$B1NIX_TRIPLET-gcc" \
       -DCMAKE_CXX_COMPILER="$CROSS/bin/$B1NIX_TRIPLET-g++" \
       -DCMAKE_C_FLAGS="$CFLAGS_B1NIX" \

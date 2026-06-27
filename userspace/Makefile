@@ -428,7 +428,7 @@ HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install
 LIBGCC := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a
 $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(HB_DIR)/include/harfbuzz -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
+	$(CC) $(CFLAGS) -I $(HB_DIR)/include -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
 	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a \
 	  $(BESPOKE_LIBC) $(LIBGCC)
@@ -446,9 +446,11 @@ $(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(LIB) $(CRT0) $(L
 
 # M51: m51_xkb_smoke links the ported static xkbcommon.
 XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
+XKB_INC := $(wildcard $(XKB_DIR)/include/xkbcommon/xkbcommon.h)
+XKB_REAL := $(if $(XKB_INC),$(XKB_DIR)/include,$(XKB_DIR)/include/include)
 $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(XKB_DIR)/include -c $< -o $(BUILD)/bin/m51_xkb_smoke.o
+	$(CC) $(CFLAGS) -I $(XKB_REAL) -c $< -o $(BUILD)/bin/m51_xkb_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_xkb_smoke.o \
 	  $(XKB_DIR)/lib/libxkbcommon.a $(BESPOKE_LIBC)
 

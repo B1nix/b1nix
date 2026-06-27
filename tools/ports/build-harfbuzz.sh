@@ -27,7 +27,7 @@ port_build() {
   # shellcheck disable=SC2086
   ${_ccache}"$CXX_CROSS" $CXXFLAGS_CROSS -DHB_TINY -DHB_NO_MT \
     -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++14 \
-    -I"$SRC_DIR/src" "$SRC_DIR/src/harfbuzz.cc" \
+    -I"$SRC_DIR/src" -c "$SRC_DIR/src/harfbuzz.cc" \
     -o "$OBJ_DIR/harfbuzz.o"
   OBJS="$OBJ_DIR/harfbuzz.o"
 }
