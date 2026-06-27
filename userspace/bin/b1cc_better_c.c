@@ -22,7 +22,7 @@ int main(void) {
   
   int sum = b + s.x + s.y + arr[0] + arr[1] + arr[2];
   
-  if (sum == 860) {
+  if (sum == 860 && VAL_A == 10) {
     puts("B1CC-BETTER-C-SMOKE: ok");
     return 0;
   } else {
