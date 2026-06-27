@@ -1493,6 +1493,22 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  // M7: b1cc better C smoke (structs/enums/typedefs/casts/arrays)
+  u64 better_c_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_better_c", 0, 0, 0, 0, 0);
+  if ((isize)better_c_pid < 0) {
+    uwrite("B1CC-BETTER-C-SMOKE: spawn-fail\n");
+  } else {
+    int better_c_status = 0;
+    syscall_dispatch(SYS_WAIT, better_c_pid, (u64)(usize)&better_c_status, 0, 0, 0, 0);
+    if (better_c_status == 0) {
+      uwrite("B1CC-BETTER-C-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-BETTER-C-SMOKE: fail exit=");
+      uwrite_dec_value((u64)better_c_status);
+      uwrite("\n");
+    }
+  }
+
   u64 m12_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m12-smoke", 0, 0, 0, 0, 0);
   if ((isize)m12_pid < 0) {
     uwrite("M12-SMOKE: spawn-fail\n");

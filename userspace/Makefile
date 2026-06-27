@@ -182,6 +182,7 @@ BINARIES += $(BUILD)/bin/b1cc_hello
 BINARIES += $(BUILD)/bin/b1cc_argv
 BINARIES += $(BUILD)/bin/b1cc_file_write
 BINARIES += $(BUILD)/bin/b1cc_stderr_exit
+BINARIES += $(BUILD)/bin/b1cc_better_c
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -265,7 +266,7 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # Dynamic by default (links against libc.so.1 via /lib/ld-b1nix.so + the
 # in-kernel loader); LINK=static restores the historical static recipe. The
 # mode is selected by the GEN_* variables defined near the top of this file.
-$(BUILD)/bin/return_42 $(BUILD)/bin/b1cc_hello $(BUILD)/bin/b1cc_argv $(BUILD)/bin/b1cc_file_write $(BUILD)/bin/b1cc_stderr_exit: $(BUILD)/bin/%: bin/%.c
+$(BUILD)/bin/return_42 $(BUILD)/bin/b1cc_hello $(BUILD)/bin/b1cc_argv $(BUILD)/bin/b1cc_file_write $(BUILD)/bin/b1cc_stderr_exit $(BUILD)/bin/b1cc_better_c: $(BUILD)/bin/%: bin/%.c
 	@mkdir -p $(dir $@)
 	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) /Users/dmytrom/Documents/GitHub/b1cc/build/b1cc --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
 
