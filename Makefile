@@ -1152,15 +1152,9 @@ install-kernel-source:
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@for d in kernel userspace tools tests docs; do \
 		if [ -d "$$d" ]; then \
-			rsync -a --delete \
-				--exclude='build/' \
-				--exclude='*.o' \
-				--exclude='*.a' \
-				--exclude='*.elf' \
-				--exclude='*.bin' \
-				--exclude='*.iso' \
-				--exclude='.git/' \
-				"$$d" $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
+			tar -cf - --exclude='build/' --exclude='*.o' --exclude='*.a' \
+				--exclude='*.elf' --exclude='*.bin' --exclude='*.iso' --exclude='.git/' \
+				"$$d" | tar -xf - -C $(BUILD_DIR)/rootfs/usr/src/b1nix/ ; \
 		fi; \
 	done
 	@cp Makefile $(BUILD_DIR)/rootfs/usr/src/b1nix/
