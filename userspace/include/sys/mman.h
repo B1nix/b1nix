@@ -70,6 +70,7 @@ void *mmap(void *addr, size_t length, int prot, int flags, int fd, long offset);
 int munmap(void *addr, size_t length);
 int mprotect(void *addr, size_t len, int prot);
 int madvise(void *addr, size_t length, int advice);
+int posix_madvise(void *addr, size_t len, int advice);
 int mincore(void *addr, size_t length, unsigned char *vec);
 /* b1nix doesn't swap, so locking pages into RAM is a no-op success. */
 int mlock(const void *addr, size_t len);

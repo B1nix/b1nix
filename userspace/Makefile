@@ -83,6 +83,7 @@ LIBC_OBJS := \
 	$(BUILD)/libc/atomic.o \
 	$(BUILD)/libc/stdio.o \
 	$(BUILD)/libc/stdlib.o \
+	$(BUILD)/libc/cxa_guard.o \
 	$(BUILD)/libc/unistd.o \
 	$(BUILD)/libc/ctype.o \
 	$(BUILD)/libc/dirent.o \
@@ -176,13 +177,17 @@ BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
-# Disk installer: copies the pre-baked b1nix-disk.img onto a target disk.
-BINARIES += $(BUILD)/bin/return_42
-BINARIES += $(BUILD)/bin/b1cc_hello
-BINARIES += $(BUILD)/bin/b1cc_argv
-BINARIES += $(BUILD)/bin/b1cc_file_write
-BINARIES += $(BUILD)/bin/b1cc_stderr_exit
-BINARIES += $(BUILD)/bin/b1cc_better_c
+# b1cc: the standalone "better C" compiler (separate repo, not in this tree). It
+# compiles the M5/M7 self-host smoke programs below. Detect it; override with
+# B1CC=/path/to/b1cc. If absent (e.g. a host where the b1cc repo isn't checked
+# out), skip those targets rather than hard-fail the whole userspace build.
+B1CC ?= $(or $(wildcard $(HOME)/Documents/GitHub/b1cc/build/b1cc),$(shell command -v b1cc 2>/dev/null))
+B1CC_BINS := return_42 b1cc_hello b1cc_argv b1cc_file_write b1cc_stderr_exit b1cc_better_c
+ifneq ($(strip $(B1CC)),)
+BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS))
+else
+$(warning b1cc compiler not found - skipping M5/M7 b1cc smoke binaries ($(B1CC_BINS)). Set B1CC=/path/to/b1cc to include them.)
+endif
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -230,10 +235,12 @@ $(BUILD)/libgui/%.o: libgui/%.c
 # ── libb1nix.a ──
 $(LIB): $(LIBC_OBJS)
 	@mkdir -p $(dir $@)
+	rm -f $@
 	$(AR) rcs $@ $(LIBC_OBJS)
 
 $(GUI_LIB): $(GUI_OBJS)
 	@mkdir -p $(dir $@)
+	rm -f $@
 	$(AR) rcs $@ $(GUI_OBJS)
 
 # libc.so.1 folds the PIC openlibm (musl-style: libm IS libc) so the shared
@@ -266,9 +273,9 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # Dynamic by default (links against libc.so.1 via /lib/ld-b1nix.so + the
 # in-kernel loader); LINK=static restores the historical static recipe. The
 # mode is selected by the GEN_* variables defined near the top of this file.
-$(BUILD)/bin/return_42 $(BUILD)/bin/b1cc_hello $(BUILD)/bin/b1cc_argv $(BUILD)/bin/b1cc_file_write $(BUILD)/bin/b1cc_stderr_exit $(BUILD)/bin/b1cc_better_c: $(BUILD)/bin/%: bin/%.c
+$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/%.c
 	@mkdir -p $(dir $@)
-	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) /Users/dmytrom/Documents/GitHub/b1cc/build/b1cc --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
+	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) $(B1CC) --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
 
 
 $(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)

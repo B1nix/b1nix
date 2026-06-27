@@ -1,0 +1,155 @@
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/llvm/include/llvm/TargetParser/Triple.h	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/Triple.h.modified	2026-06-27 18:34:23.697794039 +0200
+@@ -250,6 +250,7 @@
+     ShaderModel, // DirectX ShaderModel
+     LiteOS,
+     Serenity,
++    B1nix,
+     Vulkan, // Vulkan SPIR-V
+     CheriotRTOS,
+     LastOSType = CheriotRTOS
+@@ -892,6 +893,8 @@
+ 
+   bool isOSManagarm() const { return getOS() == Triple::Managarm; }
+ 
++  bool isOSB1nix() const { return getOS() == Triple::B1nix; }
++
+   bool isShaderStageEnvironment() const {
+     EnvironmentType Env = getEnvironment();
+     return Env == Triple::Pixel || Env == Triple::Vertex ||
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/llvm/lib/TargetParser/Triple.cpp	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/Triple.cpp.modified	2026-06-27 18:34:23.698397841 +0200
+@@ -323,6 +323,7 @@
+   case RTEMS: return "rtems";
+   case Solaris: return "solaris";
+   case Serenity: return "serenity";
++  case B1nix: return "b1nix";
+   case TvOS: return "tvos";
+   case UEFI: return "uefi";
+   case WASI: return "wasi";
+@@ -752,6 +753,7 @@
+       .StartsWith("shadermodel", Triple::ShaderModel)
+       .StartsWith("liteos", Triple::LiteOS)
+       .StartsWith("serenity", Triple::Serenity)
++      .StartsWith("b1nix", Triple::B1nix)
+       .StartsWith("vulkan", Triple::Vulkan)
+       .StartsWith("cheriotrtos", Triple::CheriotRTOS)
+       .Default(Triple::UnknownOS);
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/clang/lib/Basic/Targets/OSTargets.h	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/OSTargets.h.modified	2026-06-27 18:34:23.698966329 +0200
+@@ -446,6 +446,25 @@
+   }
+ };
+ 
++// b1nix Target
++template <typename Target>
++class LLVM_LIBRARY_VISIBILITY B1nixTargetInfo : public OSTargetInfo<Target> {
++protected:
++  void getOSDefines(const LangOptions &Opts, const llvm::Triple &Triple,
++                    MacroBuilder &Builder) const override {
++    DefineStd(Builder, "unix", Opts);
++    Builder.defineMacro("__b1nix__");
++    if (Opts.POSIXThreads)
++      Builder.defineMacro("_REENTRANT");
++    if (Opts.CPlusPlus)
++      Builder.defineMacro("_GNU_SOURCE");
++  }
++
++public:
++  B1nixTargetInfo(const llvm::Triple &Triple, const TargetOptions &Opts)
++      : OSTargetInfo<Target>(Triple, Opts) {}
++};
++
+ // NetBSD Target
+ template <typename Target>
+ class LLVM_LIBRARY_VISIBILITY NetBSDTargetInfo : public OSTargetInfo<Target> {
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/clang/lib/Basic/Targets.cpp	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/Targets.cpp.modified	2026-06-27 18:34:23.699506511 +0200
+@@ -165,7 +165,10 @@
+       }
+     case llvm::Triple::Managarm:
+       return std::make_unique<ManagarmTargetInfo<AArch64leTargetInfo>>(Triple,
+-                                                                       Opts);
++                                                                        Opts);
++    case llvm::Triple::B1nix:
++      return std::make_unique<B1nixTargetInfo<AArch64leTargetInfo>>(Triple,
++                                                                     Opts);
+     case llvm::Triple::NetBSD:
+       return std::make_unique<NetBSDTargetInfo<AArch64leTargetInfo>>(Triple,
+                                                                      Opts);
+@@ -470,7 +473,10 @@
+       }
+     case llvm::Triple::Managarm:
+       return std::make_unique<ManagarmTargetInfo<RISCV64TargetInfo>>(Triple,
+-                                                                     Opts);
++                                                                      Opts);
++    case llvm::Triple::B1nix:
++      return std::make_unique<B1nixTargetInfo<RISCV64TargetInfo>>(Triple,
++                                                                   Opts);
+     case llvm::Triple::Hurd:
+       return std::make_unique<HurdTargetInfo<RISCV64TargetInfo>>(Triple, Opts);
+     default:
+@@ -659,7 +665,9 @@
+       return std::make_unique<HurdTargetInfo<X86_64TargetInfo>>(Triple, Opts);
+     case llvm::Triple::Managarm:
+       return std::make_unique<ManagarmTargetInfo<X86_64TargetInfo>>(Triple,
+-                                                                    Opts);
++                                                                     Opts);
++    case llvm::Triple::B1nix:
++      return std::make_unique<B1nixTargetInfo<X86_64TargetInfo>>(Triple, Opts);
+     default:
+       return std::make_unique<X86_64TargetInfo>(Triple, Opts);
+     }
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/clang/lib/Driver/Driver.cpp	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/Driver.cpp.modified	2026-06-27 18:34:23.700115716 +0200
+@@ -6883,6 +6883,12 @@
+     case llvm::Triple::Managarm:
+       TC = std::make_unique<toolchains::Managarm>(*this, Target, Args);
+       break;
++    case llvm::Triple::B1nix:
++      if (Target.isOSBinFormatELF())
++        TC = std::make_unique<toolchains::Generic_ELF>(*this, Target, Args);
++      else
++        TC = std::make_unique<toolchains::Generic_GCC>(*this, Target, Args);
++      break;
+     case llvm::Triple::Solaris:
+       TC = std::make_unique<toolchains::Solaris>(*this, Target, Args);
+       break;
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/llvm/cmake/modules/HandleLLVMOptions.cmake	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/HandleLLVMOptions.cmake.modified	2026-06-27 22:32:00.000000000 +0200
+@@ -236,6 +236,11 @@
+ elseif(FUCHSIA OR UNIX OR CYGWIN)
+   set(LLVM_ON_UNIX 1)
+   if(APPLE OR CYGWIN OR "${CMAKE_SYSTEM_NAME}" MATCHES "AIX")
+     set(LLVM_HAVE_LINK_VERSION_SCRIPT 0)
+   else()
+     set(LLVM_HAVE_LINK_VERSION_SCRIPT 1)
+   endif()
++elseif(CMAKE_SYSTEM_NAME STREQUAL "B1nix")
++  set(LLVM_ON_UNIX 1)
++  set(LLVM_HAVE_LINK_VERSION_SCRIPT 1)
+ elseif(CMAKE_SYSTEM_NAME STREQUAL "Generic")
+   set(LLVM_ON_UNIX 0)
+   set(LLVM_HAVE_LINK_VERSION_SCRIPT 0)
+--- /tmp/llvm-orig/llvm-project-22.1.8.src/llvm/lib/Support/Unix/Path.inc	2026-06-16 00:33:53.000000000 +0200
++++ /tmp/Path.inc.modified	2026-06-27 22:45:00.000000000 +0200
+@@ -110,7 +110,8 @@
+ #define STATVFS_F_FRSIZE(vfs) static_cast<uint64_t>(vfs.f_bsize)
+ #endif
+ 
+-#if defined(__NetBSD__) || defined(__DragonFly__) || defined(__GNU__) ||       \
++#if defined(__b1nix__) || defined(__NetBSD__) || defined(__DragonFly__) ||    \
++    defined(__GNU__) ||                                                       \
+     defined(__MVS__)
+ #define STATVFS_F_FLAG(vfs) (vfs).f_flag
+ #else
+@@ -564,6 +565,8 @@
+ #elif defined(__MVS__)
+   // The file system can have an arbitrary structure on z/OS; must go with the
+   // conservative answer.
+   return false;
++#elif defined(__b1nix__)
++  return true;
+ #else
+   return !!(STATVFS_F_FLAG(Vfs) & MNT_LOCAL);
+ #endif

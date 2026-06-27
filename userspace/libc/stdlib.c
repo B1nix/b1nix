@@ -1,4 +1,5 @@
 #include <stdlib.h>
+#include <malloc.h>
 #include <pthread.h>
 #include <string.h>
 #include <stdio.h>
@@ -36,6 +37,16 @@ int __cxa_atexit(void (*dtor)(void *), void *obj, void *dso_handle) {
 	return 0;
 }
 
+struct mallinfo mallinfo(void) {
+	struct mallinfo mi = {0};
+	return mi;
+}
+
+struct mallinfo2 mallinfo2(void) {
+	struct mallinfo2 mi = {0};
+	return mi;
+}
+
 /* C++ ABI: unregister destructors for a specific DSO (or all if dso == NULL). */
 void __cxa_finalize(void *dso_handle) {
 	if (!dso_handle) {
@@ -57,21 +68,6 @@ void __cxa_finalize(void *dso_handle) {
 			cxa_atexit_count--;
 		}
 	}
-}
-
-/* C++ ABI: get the once-used guard variable for thread-safe statics.
- * Returns 0 on first call, nonzero otherwise. Uses kernel futex. */
-int __cxa_guard_acquire(int *guard) {
-	if (*guard) return 0;
-	return 1;
-}
-
-void __cxa_guard_release(int *guard) {
-	*guard = 1;
-}
-
-void __cxa_guard_abort(int *guard) {
-	*guard = 0;
 }
 
 /* C++ ABI: pure virtual function call handler. */
@@ -835,7 +831,9 @@ double strtod(const char *nptr, char **endptr)
 #ifdef __x86_64__
 __asm__(
 ".global setjmp\n"
+".global _setjmp\n"
 "setjmp:\n"
+"_setjmp:\n"
 "    movq %rbx, 0(%rdi)\n"
 "    movq %rsp, 8(%rdi)\n"
 "    movq %rbp, 16(%rdi)\n"
@@ -871,7 +869,9 @@ __asm__(
 #else
 __asm__(
 ".global setjmp\n"
+".global _setjmp\n"
 "setjmp:\n"
+"_setjmp:\n"
 "    movl 4(%esp), %eax\n"
 "    movl %ebx, 0(%eax)\n"
 "    movl %esi, 4(%eax)\n"

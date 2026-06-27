@@ -243,7 +243,7 @@ Supporting documents:
 
 ## M26: Full Toolchain and Self-Hosting
 
-- [x] Port Binutils, GCC, libstdc++, and GNU Make.
+- [x] Port Binutils, Clang/GCC, libstdc++, and GNU Make.
 - [x] Build larger programs and the kernel with the cross toolchain.
 - [x] Compile and link the full kernel inside B1NIX; boot the exact result.
 - [x] Provide an in-guest assembler/linker/make workflow.
@@ -941,11 +941,10 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
 - [ ] `planned` **Phase 3 — broaden optional coverage.** Move individual C++
   ports to Clang only after their existing smoke tests pass with both frontends.
-- [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh`
-  builds a native `clang`/`clang++` for b1nix (`build/native-clang/b1nix/bin/clang`)
-  reusing the existing b1nix `libLLVM.so` (no LLVM rebuild). In-QEMU run proof is
-  the remaining step. (`tools/stage-toolchains.sh` packages native llvm/clang/rust
-  for bpkg.)
+- [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh --b1nix-elf`
+  cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
+  with b1nix as the host triple; `make install-native-toolchain` stages only this
+  b1nix ELF build into the rootfs, not the Linux-hosted cross compiler.
 - A full GCC-to-Clang migration and a libc++/libc++abi/libunwind port are not
   goals. Add either only when a measured incompatibility makes the GNU path fail.
 

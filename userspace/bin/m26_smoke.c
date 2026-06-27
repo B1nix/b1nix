@@ -34,7 +34,7 @@ int main(void) {
   }
   marker("M26-SMOKE: ok selfhost-status\n");
 
-  /* The cross+native toolchain (gcc/binutils/make) is genuinely ported. */
+  /* The cross+native toolchain (clang/binutils/make) is genuinely ported. */
   if (status.target_ready && status.binutils_ready && status.make_ready) {
     marker("M26-SMOKE: ok toolchain-ready\n");
   } else {

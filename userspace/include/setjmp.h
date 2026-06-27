@@ -8,6 +8,7 @@ extern "C" {
 typedef long jmp_buf[8];
 
 int setjmp(jmp_buf env);
+int _setjmp(jmp_buf env);
 void longjmp(jmp_buf env, int val) __attribute__((noreturn));
 
 /* sigsetjmp/siglongjmp — setjmp variants that optionally save and restore the

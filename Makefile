@@ -131,19 +131,27 @@ endif
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
-# Upstream BusyBox is always embedded (M42 full integration).
-ifeq ($(MINIMAL_INITRAMFS),1)
-INITRAMFS_INCS := \
-	$(INITRAMFS_NATIVE_SMOKE_INC) \
+# M5/M7 b1cc self-host smoke binaries. kernel/fs/initramfs.c #includes these
+# .inc files unconditionally, so they must be built in BOTH the minimal and the
+# full initramfs (the full build is what the smoke uses). Generated from the
+# b1cc-compiled binaries (see B1CC in userspace/Makefile).
+INITRAMFS_B1CC_INCS := \
 	$(BUILD_DIR)/initramfs_return_42.inc \
 	$(BUILD_DIR)/initramfs_b1cc_hello.inc \
 	$(BUILD_DIR)/initramfs_b1cc_argv.inc \
 	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
 	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc \
 	$(BUILD_DIR)/initramfs_b1cc_better_c.inc
+# Upstream BusyBox is always embedded (M42 full integration).
+ifeq ($(MINIMAL_INITRAMFS),1)
+INITRAMFS_INCS := \
+	$(INITRAMFS_NATIVE_SMOKE_INC) \
+	$(INITRAMFS_B1CC_INCS)
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
+	$(INITRAMFS_B1CC_INCS) \
+	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
@@ -1081,9 +1089,9 @@ userspace-install: userspace
 busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
-# Native toolchain for b1nix self-host: prefer Clang/LLVM, fallback to GCC.
+# Native toolchain for b1nix self-host: prefer b1nix-native Clang/LLVM, fallback to GCC.
 NATIVE_CLANG_ROOT := $(shell \
-	for p in build/native-clang/installed; do \
+	for p in build/native-clang/b1nix/usr; do \
 		if [ -d "$$p/bin" ]; then echo "$$p"; break; fi; \
 	done)
 install-native-toolchain:
@@ -1107,7 +1115,7 @@ install-native-toolchain:
 		done; \
 	else \
 		echo "Note: native toolchain not built."; \
-		echo "      Run tools/build-native-clang.sh (preferred) or tools/toolchain/build-native-toolchain.sh (fallback)."; \
+		echo "      Run tools/build-native-clang.sh --b1nix-elf (preferred) or tools/toolchain/build-native-toolchain.sh (fallback)."; \
 	fi
 
 install-ports: userspace-install install-native-toolchain
@@ -1202,6 +1210,12 @@ smoke:
 smoke-quick:
 	@echo "Running quick smoke tests for $(ARCH)..."
 	SMOKE_QUICK=1 sh tests/smoke.sh $(ARCH)
+
+# Fast, focused smoke for b1cc / native-compiler iteration: minimal initramfs
+# (~20s build, 3 MB kernel), a single QEMU, only the b1cc/native markers. Use
+# this on every compiler tweak instead of the heavy full suite.
+smoke-b1cc:
+	sh tests/smoke-b1cc.sh $(ARCH)
 
 graphics-smoke:
 	sh tests/graphics-smoke.sh $(ARCH)

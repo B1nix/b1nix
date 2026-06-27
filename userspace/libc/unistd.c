@@ -525,6 +525,10 @@ int madvise(void *addr, size_t length, int advice) {
   return _check_err(syscall(SYS_MADVISE, addr, length, advice));
 }
 
+int posix_madvise(void *addr, size_t length, int advice) {
+  return madvise(addr, length, advice);
+}
+
 /* mincore: fill vec[i] bit0 with the residency of each page in [addr, addr+len).
  * The kernel walks the current address space's page tables (present bit). */
 int mincore(void *addr, size_t length, unsigned char *vec) {
