@@ -343,6 +343,233 @@ static isize sys_write(int fd, const void *buf, usize count) {
   return total_written;
 }
 
+/* M73: shared fd→fd byte pump backing sendfile/copy_file_range/splice. Reads up
+ * to `count` bytes from in_fd and writes them to out_fd through a kernel bounce
+ * buffer. When *in_off / *out_off is provided the transfer starts there and the
+ * caller's offset variable is advanced, WITHOUT disturbing the fd's own file
+ * offset (POSIX sendfile/copy_file_range semantics: an explicit offset argument
+ * leaves the descriptor position untouched). A NULL offset pointer means "use
+ * and advance the fd's own offset". Returns bytes copied or -errno. */
+static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
+                             usize count) {
+  isize saved_in = -1, saved_out = -1;
+  if (in_off) {
+    saved_in = vfs_lseek(in_fd, 0, B1NIX_SEEK_CUR);
+    if (saved_in < 0)
+      return -ESPIPE; /* in_fd must be seekable when an offset is given */
+    if (vfs_lseek(in_fd, (isize)*in_off, B1NIX_SEEK_SET) < 0)
+      return -EINVAL;
+  }
+  if (out_off) {
+    saved_out = vfs_lseek(out_fd, 0, B1NIX_SEEK_CUR);
+    if (saved_out < 0) {
+      if (in_off)
+        vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
+      return -ESPIPE;
+    }
+    if (vfs_lseek(out_fd, (isize)*out_off, B1NIX_SEEK_SET) < 0) {
+      if (in_off)
+        vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
+      return -EINVAL;
+    }
+  }
+
+  char kbuf[4096];
+  isize total = 0;
+  isize err = 0;
+  while (count > 0) {
+    usize chunk = count > sizeof(kbuf) ? sizeof(kbuf) : count;
+    isize r = vfs_read(in_fd, kbuf, chunk);
+    if (r < 0) {
+      err = r;
+      break;
+    }
+    if (r == 0)
+      break; /* EOF on input */
+    isize w_done = 0;
+    while (w_done < r) {
+      isize w = vfs_write(out_fd, kbuf + w_done, (usize)(r - w_done));
+      if (w < 0) {
+        err = w;
+        break;
+      }
+      if (w == 0)
+        break;
+      w_done += w;
+    }
+    total += w_done;
+    count -= (usize)w_done;
+    if (err || w_done < r)
+      break; /* short/failed write — stop */
+    if (r < (isize)chunk)
+      break; /* short read = EOF */
+  }
+
+  /* Publish the new positions to the caller's offset vars and restore the fd
+   * offsets we were asked to preserve. */
+  if (in_off) {
+    isize cur = vfs_lseek(in_fd, 0, B1NIX_SEEK_CUR);
+    *in_off = (cur >= 0) ? (u64)cur : *in_off;
+    vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
+  }
+  if (out_off) {
+    isize cur = vfs_lseek(out_fd, 0, B1NIX_SEEK_CUR);
+    *out_off = (cur >= 0) ? (u64)cur : *out_off;
+    vfs_lseek(out_fd, saved_out, B1NIX_SEEK_SET);
+  }
+
+  if (total == 0 && err)
+    return err;
+  return total;
+}
+
+/* sendfile(out_fd, in_fd, off*, count). off (when non-NULL) names the in_fd
+ * start offset and receives the new position; the in_fd file offset is left
+ * unchanged in that case. out_fd always uses and advances its own offset. */
+static isize sys_sendfile(int out_fd, int in_fd, u64 *user_off, usize count) {
+  u64 off;
+  u64 *poff = 0;
+  if (user_off) {
+    if (syscall_copyin(&off, user_off, sizeof(off)) < 0)
+      return -EFAULT;
+    poff = &off;
+  }
+  isize ret = file_copy_range(in_fd, poff, out_fd, 0, count);
+  if (ret >= 0 && poff && syscall_copyout(user_off, &off, sizeof(off)) < 0)
+    return -EFAULT;
+  return ret;
+}
+
+/* copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags). Both offsets
+ * are independently optional; flags must be 0 (no Linux flags defined yet). */
+static isize sys_copy_file_range(int fd_in, u64 *user_off_in, int fd_out,
+                                 u64 *user_off_out, usize len,
+                                 unsigned int flags) {
+  if (flags != 0)
+    return -EINVAL;
+  u64 off_in, off_out;
+  u64 *pin = 0, *pout = 0;
+  if (user_off_in) {
+    if (syscall_copyin(&off_in, user_off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    pin = &off_in;
+  }
+  if (user_off_out) {
+    if (syscall_copyin(&off_out, user_off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+    pout = &off_out;
+  }
+  isize ret = file_copy_range(fd_in, pin, fd_out, pout, len);
+  if (ret >= 0) {
+    if (pin && syscall_copyout(user_off_in, &off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    if (pout && syscall_copyout(user_off_out, &off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+  }
+  return ret;
+}
+
+/* splice(fd_in, off_in*, fd_out, off_out*, len, flags). Linux requires the
+ * offset for a pipe end be NULL; we don't special-case pipes (the copy pump
+ * read/writes either kind) but honor the same offset semantics. */
+static isize sys_splice(int fd_in, u64 *user_off_in, int fd_out,
+                        u64 *user_off_out, usize len, unsigned int flags) {
+  (void)flags; /* SPLICE_F_* are advisory (MOVE/NONBLOCK/MORE/GIFT) */
+  u64 off_in, off_out;
+  u64 *pin = 0, *pout = 0;
+  if (user_off_in) {
+    if (syscall_copyin(&off_in, user_off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    pin = &off_in;
+  }
+  if (user_off_out) {
+    if (syscall_copyin(&off_out, user_off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+    pout = &off_out;
+  }
+  isize ret = file_copy_range(fd_in, pin, fd_out, pout, len);
+  if (ret >= 0) {
+    if (pin && syscall_copyout(user_off_in, &off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    if (pout && syscall_copyout(user_off_out, &off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+  }
+  return ret;
+}
+
+/* fallocate(fd, mode, offset, len). mode 0 (allocate) and FALLOC_FL_KEEP_SIZE
+ * are honored by extending the file to offset+len when it is shorter (b1nix
+ * filesystems allocate on write / have no preallocation primitive, so this is
+ * the meaningful guarantee: the bytes exist and are zero). Hole-punching and
+ * range collapse/insert/zero are not supported by the underlying drivers. */
+static int sys_fallocate(int fd, int mode, u64 offset, u64 len) {
+  if (len == 0)
+    return -EINVAL;
+  /* Only plain allocate (0) and KEEP_SIZE are representable; the rest need
+   * driver support b1nix lacks. */
+  if (mode & ~FALLOC_FL_KEEP_SIZE)
+    return -EOPNOTSUPP;
+  struct b1nix_stat st;
+  if (vfs_fstat(fd, &st) < 0)
+    return -EBADF;
+  u64 end = offset + len;
+  if (mode & FALLOC_FL_KEEP_SIZE)
+    return 0; /* reservation only — no real preallocation to perform */
+  if (end > st.st_size)
+    return vfs_ftruncate(fd, end);
+  return 0; /* already covered */
+}
+
+/* statx(dirfd, path, flags, mask, statxbuf). b1nix supports the common forms:
+ * an absolute/cwd-relative path (dirfd == AT_FDCWD) and AT_EMPTY_PATH on an fd.
+ * It maps the existing stat data into the Linux struct statx layout so glibc /
+ * port binaries that prefer statx get real values. */
+static int sys_statx(int dirfd, const char *user_path, int flags,
+                     unsigned int mask, struct statx *user_buf) {
+  struct b1nix_stat st;
+  int rc;
+  if ((flags & AT_EMPTY_PATH) && (!user_path || user_path[0] == '\0')) {
+    rc = vfs_fstat(dirfd, &st);
+  } else {
+    char kpath[VFS_MAX_PATH];
+    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+      return -EFAULT;
+    /* Only AT_FDCWD (or an absolute path) is resolvable — no per-fd dir base. */
+    if (dirfd != AT_FDCWD && kpath[0] != '/')
+      return -EBADF;
+    rc = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(kpath, &st)
+                                       : vfs_stat(kpath, &st);
+  }
+  if (rc < 0)
+    return rc;
+
+  struct statx sx;
+  memset(&sx, 0, sizeof(sx));
+  sx.stx_mask = mask & STATX_BASIC_STATS;
+  sx.stx_blksize = (u32)st.st_blksize;
+  sx.stx_nlink = st.st_nlink;
+  sx.stx_uid = st.st_uid;
+  sx.stx_gid = st.st_gid;
+  sx.stx_mode = (u16)st.st_mode;
+  sx.stx_ino = st.st_ino;
+  sx.stx_size = st.st_size;
+  sx.stx_blocks = st.st_blocks;
+  sx.stx_atime.tv_sec = (i64)st.st_atim.tv_sec;
+  sx.stx_atime.tv_nsec = (u32)st.st_atim.tv_nsec;
+  sx.stx_mtime.tv_sec = (i64)st.st_mtim.tv_sec;
+  sx.stx_mtime.tv_nsec = (u32)st.st_mtim.tv_nsec;
+  sx.stx_ctime.tv_sec = (i64)st.st_ctim.tv_sec;
+  sx.stx_ctime.tv_nsec = (u32)st.st_ctim.tv_nsec;
+  sx.stx_btime = sx.stx_ctime; /* no separate birth time — report ctime */
+  sx.stx_rdev_major = (u32)(st.st_rdev >> 8);
+  sx.stx_rdev_minor = (u32)(st.st_rdev & 0xff);
+  sx.stx_dev_major = (u32)(st.st_dev >> 8);
+  sx.stx_dev_minor = (u32)(st.st_dev & 0xff);
+  if (syscall_copyout(user_buf, &sx, sizeof(sx)) < 0)
+    return -EFAULT;
+  return 0;
+}
+
 static isize sys_list(const char *user_path) {
   char *kpath = kmalloc(VFS_MAX_PATH);
   if (!kpath)
@@ -3179,6 +3406,23 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SIGALTSTACK:
     return (u64)sys_sigaltstack((const void *)(usize)arg0,
                                 (void *)(usize)arg1);
+  /* --- M73: modern I/O & introspection --- */
+  case SYS_SENDFILE:
+    return (u64)sys_sendfile((int)arg0, (int)arg1, (u64 *)(usize)arg2,
+                             (usize)arg3);
+  case SYS_COPY_FILE_RANGE:
+    return (u64)sys_copy_file_range((int)arg0, (u64 *)(usize)arg1, (int)arg2,
+                                    (u64 *)(usize)arg3, (usize)arg4,
+                                    (unsigned int)arg5);
+  case SYS_SPLICE:
+    return (u64)sys_splice((int)arg0, (u64 *)(usize)arg1, (int)arg2,
+                           (u64 *)(usize)arg3, (usize)arg4,
+                           (unsigned int)arg5);
+  case SYS_FALLOCATE:
+    return (u64)sys_fallocate((int)arg0, (int)arg1, arg2, arg3);
+  case SYS_STATX:
+    return (u64)sys_statx((int)arg0, (const char *)(usize)arg1, (int)arg2,
+                          (unsigned int)arg3, (struct statx *)(usize)arg4);
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));

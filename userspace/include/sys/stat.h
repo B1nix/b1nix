@@ -60,6 +60,60 @@ struct timespec;
 int utimensat(int dirfd, const char *pathname, const struct timespec times[2], int flags);
 int futimens(int fd, const struct timespec times[2]);
 
+/* M73: statx (Linux struct statx layout). */
+#ifndef AT_EMPTY_PATH
+#define AT_EMPTY_PATH 0x1000
+#endif
+#ifndef AT_SYMLINK_NOFOLLOW
+#define AT_SYMLINK_NOFOLLOW 0x100
+#endif
+#define STATX_TYPE   0x0001U
+#define STATX_MODE   0x0002U
+#define STATX_NLINK  0x0004U
+#define STATX_UID    0x0008U
+#define STATX_GID    0x0010U
+#define STATX_ATIME  0x0020U
+#define STATX_MTIME  0x0040U
+#define STATX_CTIME  0x0080U
+#define STATX_INO    0x0100U
+#define STATX_SIZE   0x0200U
+#define STATX_BLOCKS 0x0400U
+#define STATX_BASIC_STATS 0x07ffU
+#define STATX_BTIME  0x0800U
+
+struct statx_timestamp {
+  long long tv_sec;
+  unsigned int tv_nsec;
+  int __reserved;
+};
+
+struct statx {
+  unsigned int stx_mask;
+  unsigned int stx_blksize;
+  unsigned long long stx_attributes;
+  unsigned int stx_nlink;
+  unsigned int stx_uid;
+  unsigned int stx_gid;
+  unsigned short stx_mode;
+  unsigned short __spare0[1];
+  unsigned long long stx_ino;
+  unsigned long long stx_size;
+  unsigned long long stx_blocks;
+  unsigned long long stx_attributes_mask;
+  struct statx_timestamp stx_atime;
+  struct statx_timestamp stx_btime;
+  struct statx_timestamp stx_ctime;
+  struct statx_timestamp stx_mtime;
+  unsigned int stx_rdev_major;
+  unsigned int stx_rdev_minor;
+  unsigned int stx_dev_major;
+  unsigned int stx_dev_minor;
+  unsigned long long __spare2[14];
+};
+
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask,
+          struct statx *statxbuf);
+
 #ifdef __cplusplus
 }
 #endif

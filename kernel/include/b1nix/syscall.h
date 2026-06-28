@@ -197,6 +197,15 @@ enum {
 	SYS_RT_TGSIGQUEUEINFO = 162,
 	SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
 	SYS_MINCORE         = 164,  /* page residency bitmap (Chromium memory-dump) */
+	/* --- M73: modern I/O & introspection syscalls --- */
+	SYS_SENDFILE         = 165, /* zero-copy-ish fd→fd transfer */
+	SYS_COPY_FILE_RANGE  = 166, /* fd→fd range copy with optional offsets */
+	SYS_SPLICE           = 167, /* move data to/from a pipe */
+	SYS_FALLOCATE        = 168, /* preallocate / extend file storage */
+	SYS_STATX            = 169, /* extended stat */
+	SYS_INOTIFY_INIT1    = 170, /* filesystem change notification */
+	SYS_INOTIFY_ADD_WATCH = 171,
+	SYS_INOTIFY_RM_WATCH = 172,
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

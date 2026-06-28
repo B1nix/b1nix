@@ -82,6 +82,7 @@
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
 #include "initramfs_m57_smoke.inc"
+#include "initramfs_m73_smoke.inc"
 #include "initramfs_m47_smoke.inc"
 #include "initramfs_m48_smoke.inc"
 #include "initramfs_m49_smoke.inc"
@@ -1615,6 +1616,8 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m46_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m57-smoke", (const char *)vfs_m57_smoke_elf,
      sizeof(vfs_m57_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m73-smoke", (const char *)vfs_m73_smoke_elf,
+     sizeof(vfs_m73_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m47-smoke", (const char *)vfs_m47_smoke_elf,
      sizeof(vfs_m47_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m48-smoke", (const char *)vfs_m48_smoke_elf,

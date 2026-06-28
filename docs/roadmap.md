@@ -1243,8 +1243,26 @@ PIE base (`0x500000000000`).
 
 ## M73: Modern I/O and Introspection Syscalls
 
-- [ ] `planned` Add `io_uring`, `sendfile`, `splice`, `copy_file_range`,
-  `inotify`, `ptrace`, `statx`, `clone3`, `fallocate`.
+- [x] `done` **File-movement + introspection syscalls.** `sendfile`,
+  `copy_file_range`, `splice`, `fallocate`, and `statx` are real kernel syscalls
+  (`SYS_SENDFILE`/`COPY_FILE_RANGE`/`SPLICE`/`FALLOCATE`/`STATX` = 165..169) with
+  libc wrappers. `sendfile`/`copy_file_range`/`splice` share one kernel fd→fd
+  pump (`file_copy_range`) that preserves the descriptor's own offset when an
+  explicit offset argument is supplied (POSIX semantics) and `splice` is no
+  longer the ENOSYS stub it was. `fallocate` mode 0 extends + zero-fills via the
+  existing on-demand allocation (KEEP_SIZE reserves without growing; hole-punch/
+  collapse/zero-range honestly report `EOPNOTSUPP` — the block drivers have no
+  preallocation primitive). `statx` maps `struct b1nix_stat` into the Linux
+  `struct statx` layout (path + `AT_EMPTY_PATH`). Verified by `userspace/bin/
+  m73_smoke.c` (`M73-SMOKE: ok statx/sendfile/copy-file-range/fallocate/splice`),
+  data/offset round-trips asserted, x86_64 **843/0**.
+- [ ] `deferred` `io_uring`, `ptrace`, `inotify`, `clone3`. Each is its own
+  subsystem rather than a syscall: `io_uring` is a shared-ring submission/
+  completion engine; `ptrace` needs the stop/continue + cross-process register/
+  memory machinery tracked under **M80** (crashpad); `inotify` needs VFS
+  modify/create/delete event hooks + a per-watch event queue; `clone3` is the
+  extended-args `clone` variant (the M29 `clone` flags already cover the thread/
+  fork models in use). Revisit when a port concretely needs one.
 
 ## M74: Real-Time Signals
 

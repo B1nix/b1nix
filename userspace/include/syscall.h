@@ -192,6 +192,15 @@ enum {
   SYS_RT_TGSIGQUEUEINFO = 162,
   SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
   SYS_MINCORE         = 164,  /* page residency bitmap (Chromium memory-dump) */
+  /* --- M73: modern I/O & introspection syscalls --- */
+  SYS_SENDFILE         = 165,
+  SYS_COPY_FILE_RANGE  = 166,
+  SYS_SPLICE           = 167,
+  SYS_FALLOCATE        = 168,
+  SYS_STATX            = 169,
+  SYS_INOTIFY_INIT1    = 170,
+  SYS_INOTIFY_ADD_WATCH = 171,
+  SYS_INOTIFY_RM_WATCH = 172,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

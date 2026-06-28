@@ -66,13 +66,20 @@ int fcntl(int fd, int cmd, ...);
 
 /* creat(2): equivalent to open(path, O_CREAT|O_WRONLY|O_TRUNC, mode).
  * posix_fadvise: file access-pattern hint (advisory; b1nix treats it as a
- * no-op and returns 0). fallocate: b1nix has no preallocation syscall, so it
- * returns -1/ENOSYS and callers fall back to ftruncate. Added for the Chromium
- * port (M60-62). */
+ * no-op and returns 0). M73: fallocate is now real (mode 0 extends the file
+ * via SYS_FALLOCATE; hole-punch/collapse report EOPNOTSUPP). splice moves data
+ * to/from a pipe over SYS_SPLICE. */
 int creat(const char *path, mode_t mode);
 int posix_fadvise(int fd, off_t offset, off_t len, int advice);
 int posix_fallocate(int fd, off_t offset, off_t len);
 int fallocate(int fd, int mode, off_t offset, off_t len);
+ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+               size_t len, unsigned int flags);
+/* splice flags (Linux ABI; advisory on b1nix). */
+#define SPLICE_F_MOVE     1
+#define SPLICE_F_NONBLOCK 2
+#define SPLICE_F_MORE     4
+#define SPLICE_F_GIFT     8
 
 /* posix_fadvise advice values (Linux ABI). */
 #define POSIX_FADV_NORMAL     0

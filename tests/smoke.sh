@@ -1440,6 +1440,13 @@ check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a l
 check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
 check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
 check_output "$LOG" "M57-SMOKE: done" "M57 broker-primitive suite completes"
+# ── M73: modern I/O & introspection syscalls ──
+check_output "$LOG" "M73-SMOKE: ok statx" "statx returns size/mode/nlink/ino matching fstat (path + AT_EMPTY_PATH)"
+check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances the explicit offset, leaves the src fd offset"
+check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a byte range using independent explicit offsets"
+check_output "$LOG" "M73-SMOKE: ok fallocate" "fallocate mode 0 grows + zero-fills; KEEP_SIZE does not grow"
+check_output "$LOG" "M73-SMOKE: ok splice" "splice moves data file->pipe->file intact"
+check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
 # ── bash: GNU bash 5.2 port (default shell) ──
 check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"
 check_output "$LOG" "BASH-SMOKE: ok arrays" "bash indexed arrays work"

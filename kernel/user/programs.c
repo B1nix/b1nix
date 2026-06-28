@@ -2046,6 +2046,20 @@ static int init_main(int argc, const char **argv) {
       syscall_dispatch(SYS_WAIT, m57_pid, (u64)(usize)&m57_status, 0, 0, 0, 0);
     }
   }
+
+  /* M73: modern I/O & introspection syscalls — sendfile, copy_file_range,
+   * splice, fallocate, statx. */
+  {
+    u64 m73_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m73-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m73_pid < 0) {
+      uwrite("M73-SMOKE: spawn-fail\n");
+    } else {
+      int m73_status = 0;
+      syscall_dispatch(SYS_WAIT, m73_pid, (u64)(usize)&m73_status, 0, 0, 0, 0);
+    }
+  }
   }
 
   if (smoke_graphics) {

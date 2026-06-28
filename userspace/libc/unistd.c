@@ -2029,15 +2029,20 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off_t offset) {
   return pwrite(fd, buf, n, offset);
 }
 
-/* posix_fallocate: b1nix has no fallocate syscall, so just grow the file to
- * cover [offset, offset+len) via ftruncate (writes still extend it on demand).
- * Returns 0 or an errno value directly — it does NOT set errno. */
+/* M73: fallocate over the kernel SYS_FALLOCATE. mode 0 extends the file to
+ * cover [offset, offset+len); FALLOC_FL_KEEP_SIZE reserves without growing.
+ * Hole-punch / collapse / zero-range report EOPNOTSUPP (no driver support).
+ * Sets errno and returns -1 on failure (unlike posix_fallocate). */
+int fallocate(int fd, int mode, off_t offset, off_t len) {
+  return _check_err(syscall(SYS_FALLOCATE, fd, mode, (long)offset, (long)len));
+}
+
+/* posix_fallocate: grow the file to cover [offset, offset+len). Routes through
+ * the real fallocate(2) (mode 0). Returns 0 or an errno value directly — it
+ * does NOT set errno (POSIX contract). */
 int posix_fallocate(int fd, off_t offset, off_t len) {
   if (offset < 0 || len <= 0) return EINVAL;
-  off_t end = offset + len;
-  off_t cur = lseek(fd, 0, SEEK_END);
-  if (cur < 0) return errno;
-  if (cur < end && ftruncate(fd, end) < 0) return errno;
+  if (fallocate(fd, 0, offset, len) < 0) return errno;
   return 0;
 }
 
