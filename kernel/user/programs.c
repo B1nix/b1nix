@@ -1213,6 +1213,23 @@ static int init_main(int argc, const char **argv) {
 
   syscall_dispatch(SYS_CLEAR, 0, 0, 0, 0, 0, 0);
 
+  /* Clean self-host mode (b1nix.selfhostonly): the in-guest kernel build is
+   * driven directly from kernel_main (run_selfhost_build). init must NOT bring
+   * up anything else — neither the heavy b1nix.test=1 smoke suite (Mesa/V8/
+   * NetSurf, which otherwise compete with the build for RAM) nor the production
+   * services (getty/login/dhcp/sshd). It just idles so the self-host build's
+   * true memory need can be measured in isolation. This is a properly-named
+   * intent, deliberately NOT an overload of test_mode. */
+  if (bootinfo_has_flag("b1nix.selfhostonly")) {
+    uwrite("M26-SELFHOST: init idle (selfhostonly)\n");
+    for (;;) {
+      /* Reap any orphan reparented to pid 1; sleep when there is nothing to
+       * reap so we never busy-spin against the concurrent build. */
+      if ((isize)syscall_dispatch(SYS_WAIT, (u64)(usize)-1, 0, 0, 0, 0, 0) < 0)
+        syscall_dispatch(SYS_SLEEP, 100, 0, 0, 0, 0, 0); /* 100 ticks = 1s */
+    }
+  }
+
   if (bootinfo_has_flag("b1nix.test=1")) {
   if (bootinfo_has_flag("b1nix.smoke=quick")) {
     uwrite("B1NIX-QUICK: start\n");

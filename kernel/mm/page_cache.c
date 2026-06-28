@@ -108,10 +108,49 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   return 0;
 }
 
+/* Re-entrancy guard for proactive eviction: page_cache_evict() writes dirty
+ * pages back through inode->write_cb (ext4), and that write path can itself read
+ * + cache blocks, re-entering page_cache_add_page. Without the guard the proactive
+ * evict below would recurse. Best-effort across CPUs — a race only costs one extra
+ * evict pass (page_cache_evict is internally locked), never corruption. */
+static int pc_proactive_evicting;
+
 int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   if (to_free_list) {
     page_cache_process_deferred_free();
   }
+
+  /* Proactive cap: the page cache holds reclaimable pmm frames, but reactive
+   * reclaim only fires on an allocation miss and tops free back up to just
+   * total/512 (~1 MB at 512 MB RAM). That razor-thin headroom let the cache grow
+   * to the brink, so a burst allocation — clang's ~57 MB .text staging during the
+   * in-guest self-host — outran reclaim and OOM'd at free=0. Here we keep a real
+   * headroom: when free drops below total/16, evict a batch of the oldest pages
+   * BEFORE adding a new one, bounding the cache to the live working set. On a roomy
+   * guest free stays far above the watermark so this never fires (no added cost);
+   * on a tight 256–512 MB guest it leaves room for the compiler's allocations. */
+  if (!pc_proactive_evicting) {
+    usize total_frames = (usize)(pmm_total_usable_memory() / PAGE_SIZE);
+    usize watermark = total_frames / 16;
+    if (watermark < 512)
+      watermark = 512; /* ~2 MB floor so tiny guests still get headroom */
+    usize free = pmm_free_frame_count();
+    if (free < watermark) {
+      /* Evict a SMALL bounded batch per call, not the whole deficit: add_page
+       * runs once per cached 4 KB block, so a large batch here would re-scan
+       * (and write back) thousands of pages on every block read — O(n) per add,
+       * which manifests as a multi-minute "hang" while loading the 94 MB clang.
+       * A small batch self-paces: every cached block trims a few old pages, so
+       * the cache converges to the live working set across many calls at low
+       * per-call cost while reactive pmm reclaim handles any burst deficit. */
+      usize deficit = watermark - free;
+      usize batch = deficit < 32 ? deficit : 32;
+      pc_proactive_evicting = 1;
+      page_cache_evict(batch);
+      pc_proactive_evicting = 0;
+    }
+  }
+
   u32 h = pc_hash(inode, offset);
   
   struct page_cache_entry *new_entry = kmalloc(sizeof(struct page_cache_entry));
@@ -371,6 +410,8 @@ usize page_cache_evict(usize target_pages) {
     console_write_dec(evicted);
     console_write(" dirty_skipped=");
     console_write_dec(dirty_skipped);
+    console_write(" dirty_written=");
+    console_write_dec(dirty_written);
     console_write(" free_frames=");
     console_write_dec(pmm_free_frame_count());
     m26_diag_task();

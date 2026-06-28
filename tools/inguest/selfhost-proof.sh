@@ -30,23 +30,29 @@ for f in "$KELF" "$IMG"; do
 	[ -f "$f" ] || { echo "missing: $f"; exit 1; }
 done
 
-# b1nix.test=1 keeps the kernel in test mode (initramfs as /, no normal
-# getty/login/sshd init competing with the build) — the original, working
-# self-host config. SELFHOST_DISK=1 sources the toolchain from a real SATA disk
-# (b1nix.selfhostdisk -> mount sata0) instead of the ram0 GRUB module. The module
-# is a ramdisk whose ~217 MB stay pinned in RAM the whole build; a disk leaves
-# that free and streams the toolchain off AHCI through the (read-ahead) block
-# cache, so the self-host fits in less RAM.
+# b1nix.selfhostonly keeps the initramfs as / (so the boot device isn't grabbed
+# as the real root) AND makes init idle — NO smoke suite (Mesa/V8/NetSurf) and NO
+# production getty/login/sshd competing with the build for RAM. This isolates the
+# self-host's true memory need, unlike the old b1nix.test=1 config which ran the
+# whole heavy smoke sequence alongside the build. Set SELFHOST_TESTMODE=1 to fall
+# back to the old b1nix.test=1 behaviour for comparison.
+# SELFHOST_DISK=1 sources the toolchain from a real SATA disk (b1nix.selfhostdisk
+# -> mount sata0) instead of the ram0 GRUB module. The module is a ramdisk whose
+# ~217 MB stay pinned in RAM the whole build; a disk leaves that free and streams
+# the toolchain off AHCI through the (read-ahead) block cache, so the self-host
+# fits in less RAM.
+MODE_FLAG="b1nix.selfhostonly"
+[ "${SELFHOST_TESTMODE:-0}" = "1" ] && MODE_FLAG="b1nix.test=1"
 DISK_IMG=""
 if [ "${SELFHOST_DISK:-0}" = "1" ]; then
-	CMDLINE="b1nix.test=1 b1nix.selfhostbuild b1nix.selfhostdisk"
+	CMDLINE="$MODE_FLAG b1nix.selfhostbuild b1nix.selfhostdisk"
 	MODULE_CMD=""
 	# Build writes .o/TMPDIR onto the toolchain fs — use a throwaway copy so the
 	# source image is never mutated.
 	DISK_IMG="$OUT/selfhost-disk.img"
 	cp "$IMG" "$DISK_IMG"
 else
-	CMDLINE="b1nix.test=1 b1nix.selfhostbuild"
+	CMDLINE="$MODE_FLAG b1nix.selfhostbuild"
 	MODULE_CMD="module2 /boot/selfhost.img selfhostimg"
 fi
 echo "=== [1] pack self-contained ISO (cmdline: $CMDLINE) ==="
