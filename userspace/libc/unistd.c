@@ -545,9 +545,10 @@ int munlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
  * page cache, so flushing dirty pages back to the backing file is implicit.
  * Treat msync as a successful no-op (callers like LLVM use it to ensure output
  * is on disk, which b1nix's write-back already guarantees on munmap/close). */
+/* M72: real msync over SYS_MSYNC — flush a file-backed MAP_SHARED range's dirty
+ * pages to the backing file (MS_SYNC) or schedule them (MS_ASYNC). */
 int msync(void *addr, size_t length, int flags) {
-  (void)addr; (void)length; (void)flags;
-  return 0;
+  return _check_err(syscall(SYS_MSYNC, addr, length, flags));
 }
 
 /* M32: select() — fd-readiness multiplex. Converts tv to ms (with NULL ⇒

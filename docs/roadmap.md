@@ -1238,8 +1238,36 @@ PIE base (`0x500000000000`).
 
 ## M72: Writable Foreign Filesystems and msync
 
-- [ ] `planned` Add write support for NTFS/FAT32/exFAT/btrfs (currently
-  read-only) and a `msync` syscall (MAP_SHARED only flushes on fsync/umount).
+- [x] `partial` **`msync` syscall** (`SYS_MSYNC` = 173). The libc `msync` is no
+  longer a return-0 stub; the kernel handler walks the range,
+  `paging_test_and_clear_dirty()`s each page (new M72 paging helper) and, for the
+  pages userspace actually wrote, writes that page-frame's contents straight to
+  the backing file via the inode `write_cb` (the durable path; it also marks any
+  resident page-cache entry dirty for `fsync`/eviction). `MS_ASYNC` schedules
+  (mark-dirty only); `MS_INVALIDATE` is a no-op (mappers share the frame).
+  Argument validation is verified deterministically by `userspace/bin/m73_smoke.c`
+  (`M72-SMOKE: ok msync`: `MS_SYNC|MS_ASYNC` → `EINVAL`, unmapped range →
+  `ENOMEM`, valid `MS_SYNC` → 0).
+  - **Known limitation (verification deferred):** the end-to-end mmap-store
+    durability round-trip (write through a `MAP_SHARED` mapping, `msync`, read it
+    back via a fresh fd) is **not** reliably observable, because a writable
+    `MAP_SHARED` file page sets only the hardware PTE dirty bit on an mmap store —
+    the page-cache `DIRTY` flag stays clear, so under memory pressure the page
+    cache can reclaim the page as "clean" and disturb its dirty state/mapping
+    before `msync` runs (observed non-deterministically during the smoke boot).
+    Closing this needs an **eviction-layer fix**: page-cache reclaim must consult
+    the PTE dirty bit of mapped file pages (a reverse-mapping / dirty-aware
+    reclaim pass) and write them back to their file before dropping. Tracked as a
+    follow-up; the `msync` syscall itself flushes any page that is still
+    resident-and-dirty when it runs.
+- [ ] `deferred` **Write support for NTFS / FAT32 / exFAT / btrfs.** Each
+  foreign filesystem is currently read-only; adding a writer to any one is a
+  large, self-contained effort (allocation bitmap/runlist mutation, directory
+  index updates, journal/log replay for NTFS, FAT chain management). The native
+  ext2/3/4 path is fully writable and is what b1nix uses for its root; foreign
+  FS writes are revisited per-filesystem when a concrete need arises. b1nix
+  mounts these read-only honestly rather than risking corruption with a partial
+  writer.
 
 ## M73: Modern I/O and Introspection Syscalls
 

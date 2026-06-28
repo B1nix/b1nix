@@ -201,6 +201,7 @@ enum {
   SYS_INOTIFY_INIT1    = 170,
   SYS_INOTIFY_ADD_WATCH = 171,
   SYS_INOTIFY_RM_WATCH = 172,
+  SYS_MSYNC            = 173,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

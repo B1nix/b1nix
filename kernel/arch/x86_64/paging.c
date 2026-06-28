@@ -1032,6 +1032,55 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   return 0;
 }
 
+/* M72: test-and-clear the hardware dirty bit of a 4 KiB user page. Used by
+ * msync to discover which MAP_SHARED pages userspace actually wrote (the CPU
+ * sets PTE.D on the store) so only those are written back to the file. Returns
+ * 1 if the page was dirty (and clears the bit), 0 otherwise. */
+int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return 0;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT)) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) return 0;
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT)) return 0;
+  if (pde & HUGE_PAGE_FLAG) return 0;
+
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+  if (!(pte & VMM_PRESENT)) return 0;
+
+  if (pte & VMM_DIRTY) {
+    pt[pt_index(vaddr)] = pte & ~VMM_DIRTY;
+    invalidate_page(vaddr);
+    return 1;
+  }
+  return 0;
+}
+
+/* M72: physical frame backing a user vaddr in the given address space (0 if not
+ * present). Used by msync to write an mmap'd page's frame straight to its file. */
+u64 paging_user_frame(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG)) return 0;
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG)) return 0;
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+  if (!(pte & VMM_PRESENT)) return 0;
+  return pte & 0x000FFFFFFFFFF000ULL;
+}
+
 void paging_dump_entries(u64 virtual_address) {
   u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];

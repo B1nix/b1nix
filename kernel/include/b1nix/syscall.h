@@ -206,6 +206,8 @@ enum {
 	SYS_INOTIFY_INIT1    = 170, /* filesystem change notification */
 	SYS_INOTIFY_ADD_WATCH = 171,
 	SYS_INOTIFY_RM_WATCH = 172,
+	/* --- M72: writable foreign FS + msync --- */
+	SYS_MSYNC            = 173, /* flush MAP_SHARED dirty pages to the backing file */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

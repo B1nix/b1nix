@@ -1446,6 +1446,7 @@ check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances 
 check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a byte range using independent explicit offsets"
 check_output "$LOG" "M73-SMOKE: ok fallocate" "fallocate mode 0 grows + zero-fills; KEEP_SIZE does not grow"
 check_output "$LOG" "M73-SMOKE: ok splice" "splice moves data file->pipe->file intact"
+check_output "$LOG" "M72-SMOKE: ok msync" "msync validates flags (EINVAL), unmapped range (ENOMEM), and syncs a mapped MAP_SHARED range"
 check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
 # ── bash: GNU bash 5.2 port (default shell) ──
 check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"

@@ -78,6 +78,11 @@ extern u64 g_direct_map_size;
 #define MAP_PRIVATE 0x02
 #define MAP_ANONYMOUS 0x20
 #define MAP_FIXED 0x10
+
+/* M72: msync flags (Linux ABI). */
+#define MS_ASYNC      1
+#define MS_INVALIDATE 2
+#define MS_SYNC       4
 /* MAP_NORESERVE: do not reserve swap/commit up front. b1nix anonymous mappings
  * already commit lazily on first touch (the page-fault handler zero-fills the
  * faulting page), so this flag selects exactly that existing behavior — we just

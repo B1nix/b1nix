@@ -9,6 +9,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/net.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/posix.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
@@ -2619,6 +2620,101 @@ static isize sys_madvise(void *addr, usize length, int advice) {
   return 0;
 }
 
+/* M72: msync(addr, length, flags). Write back the dirty pages of a file-backed
+ * MAP_SHARED mapping to its backing file. A store through such a mapping lands
+ * in the page-frame that backs the mapping and sets only the hardware PTE dirty
+ * bit — neither the page-cache DIRTY flag (so a clean page-cache entry can be
+ * dropped by eviction, losing the write) nor anything fsync(2) keys on. msync
+ * walks the range, test-and-clears each page's PTE dirty bit, and for the pages
+ * userspace actually wrote, writes the page-frame's contents straight back to
+ * the backing file via the inode write_cb (which goes through the block cache,
+ * coherent with the read path). Writing the frame directly — rather than via a
+ * page-cache lookup that may have been evicted — is what makes the data durable.
+ * MS_ASYNC schedules instead of waiting: it just marks the page-cache entry
+ * dirty (if still resident) so a later flush/eviction persists it. MS_INVALIDATE
+ * is a no-op (mappers share the frame, so views are already coherent). */
+static isize sys_msync(void *addr, usize length, int flags) {
+  extern int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr);
+  extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+  u64 start = (u64)(usize)addr;
+  if (start & (PAGE_SIZE - 1))
+    return -EINVAL; /* POSIX: addr must be page-aligned */
+  if (flags & ~(MS_ASYNC | MS_SYNC | MS_INVALIDATE))
+    return -EINVAL;
+  if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+    return -EINVAL;
+  if (length == 0)
+    return 0;
+  struct task *t = current_task;
+  if (!t)
+    return -ESRCH;
+  if (start >= USER_SPACE_LIMIT || length > (usize)(USER_SPACE_LIMIT - start))
+    return -ENOMEM;
+  u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  /* The range must be fully mapped (POSIX ENOMEM otherwise). */
+  for (u64 v = start; v < end; v += PAGE_SIZE) {
+    struct vm_area *vma = t->vma_list;
+    int covered = 0;
+    while (vma) {
+      if (v >= vma->start && v < vma->end) {
+        covered = 1;
+        break;
+      }
+      vma = vma->next;
+    }
+    if (!covered)
+      return -ENOMEM;
+  }
+
+  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (vma->end <= start || vma->start >= end)
+      continue;
+    if (!(vma->flags & MAP_SHARED))
+      continue; /* MAP_PRIVATE writes are not written back */
+    if (!vma->node || !vma->node->inode ||
+        vma->node->inode->type != VFS_FILE)
+      continue;
+    struct vfs_inode *inode = vma->node->inode;
+    if (!inode->write_cb)
+      continue;
+    u64 lo = vma->start > start ? vma->start : start;
+    u64 hi = vma->end < end ? vma->end : end;
+    for (u64 v = lo; v < hi; v += PAGE_SIZE) {
+      if (!paging_test_and_clear_dirty(t->pml4_phys, v))
+        continue;
+      u64 file_off = (u64)vma->offset + (v - vma->start);
+      u64 file_page = file_off & ~(PAGE_SIZE - 1);
+
+      /* Keep a resident page-cache entry coherent (and dirty for fsync/eviction). */
+      struct page_cache_entry *page = page_cache_get_page(inode, file_page);
+      if (page) {
+        page_cache_mark_dirty(page);
+        page_cache_put_page(page);
+      }
+
+      if (flags & MS_ASYNC)
+        continue; /* scheduled: leave the durable write to flush/eviction */
+
+      /* Synchronous: write the frame straight to the backing file. */
+      u64 frame = paging_user_frame(t->pml4_phys, v);
+      if (!frame)
+        continue;
+      void *frame_virt = (void *)(usize)(frame + vmm_direct_map_base());
+      usize wsize = PAGE_SIZE;
+      if (file_page + PAGE_SIZE > inode->size)
+        wsize = (file_page < inode->size) ? (usize)(inode->size - file_page) : 0;
+      if (wsize == 0)
+        continue;
+      struct vfs_node dummy;
+      memset(&dummy, 0, sizeof(dummy));
+      dummy.inode = inode;
+      inode->write_cb(&dummy, file_page, (const char *)frame_virt, wsize, 0);
+    }
+  }
+  return 0;
+}
+
 /* sigaltstack(ss, old_ss). Per-process alternate signal stack kept in a
  * scheduler side-table. The kernel honors SA_ONSTACK at signal delivery by
  * placing the signal frame at the top of this stack. */
@@ -3423,6 +3519,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_STATX:
     return (u64)sys_statx((int)arg0, (const char *)(usize)arg1, (int)arg2,
                           (unsigned int)arg3, (struct statx *)(usize)arg4);
+  case SYS_MSYNC:
+    return (u64)sys_msync((void *)(usize)arg0, (usize)arg1, (int)arg2);
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));
