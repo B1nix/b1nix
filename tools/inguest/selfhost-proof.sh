@@ -85,6 +85,20 @@ if [ -n "$DISK_IMG" ]; then
 	set -- "$@" -device ich9-ahci,id=ahci \
 		-drive file="$DISK_IMG",if=none,id=shdisk,format=raw \
 		-device ide-hd,drive=shdisk,bus=ahci.0
+	# SELFHOST_SWAP_MB>0 attaches a blank swap disk on the next AHCI port (sata1).
+	# swap_init() auto-detects "sata1" and activates swap, so when clang's per-TU
+	# compile heap exceeds the (small) RAM the kernel spills cold pages to swap
+	# instead of OOM-killing it — this is what lets the self-host link its kernel
+	# at 512 MiB and below (slower, but it completes). Default 2048 MiB of swap.
+	SWAP_MB="${SELFHOST_SWAP_MB:-2048}"
+	if [ "$SWAP_MB" -gt 0 ]; then
+		SWAP_IMG="$OUT/selfhost-swap.img"
+		truncate -s "${SWAP_MB}M" "$SWAP_IMG" 2>/dev/null || \
+			dd if=/dev/zero of="$SWAP_IMG" bs=1M count="$SWAP_MB" status=none
+		set -- "$@" \
+			-drive file="$SWAP_IMG",if=none,id=swapdisk,format=raw \
+			-device ide-hd,drive=swapdisk,bus=ahci.1
+	fi
 fi
 echo "[selfhost-run] $*"
 "$@" >"$LOG" 2>&1 &

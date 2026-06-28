@@ -44,12 +44,22 @@ enum user_personality {
 	PERSONALITY_LINUX = 1,
 };
 
+struct vfs_node;
+
 struct user_image_segment {
 	u64 vaddr;
 	u64 memsz;
 	u64 filesz;
 	u64 flags;
 	void *data;
+	/* Absolute byte offset of this segment in the backing ELF file (p_offset),
+	 * used by the demand-paged loader to map segment pages back to file pages. */
+	u64 file_offset;
+	/* 1 = demand-paging candidate: read-only, page-aligned, filesz == memsz, and
+	 * untouched by any in-kernel relocation. user_run_elf_image maps it
+	 * file-backed lazy instead of pinning private frames, so the resident set is
+	 * the touched working set and the rest stays reclaimable. */
+	u8 demand_ok;
 };
 
 struct user_address_space {
@@ -91,6 +101,11 @@ struct user_loaded_image {
 	/* M40: binary personality (see enum user_personality). Set by the ELF64
 	 * loader; PERSONALITY_LINUX activates Linux syscall-number translation. */
 	enum user_personality personality;
+	/* Demand-paged file backing (self-host RAM floor). exe_node is the ref-held
+	 * VFS node of a disk-backed (read_cb) executable whose read-only segments are
+	 * demand-paged from the page cache; 0 = fully eager (initramfs / ineligible). */
+	struct vfs_node *exe_node;
+	int demand_paged;
 };
 
 void userspace_init(void);

@@ -121,6 +121,9 @@ struct swap_slot {
 };
 
 void pmm_init(const struct boot_info *boot_info);
+/* Variant B — start the background reclaim (kswapd) kernel thread. Call once the
+ * scheduler and page cache are up. */
+void kswapd_init(void);
 u64 pmm_alloc_frame(void);
 u64 pmm_alloc_frames(usize count);
 void pmm_ref_frame(u64 frame);
@@ -163,10 +166,15 @@ void vmm_set_lazy(u64 virtual_address);
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code);
 void vmm_set_swap_device(struct block_device *dev);
 
-// Swap
+// Swap. Slot-bitmap design: swap_out writes a frame to a freshly allocated slot
+// and returns its index; the caller stores that index in the page's VMM_SWAPPED
+// PTE. swap_in reads the page at `slot` (decoded from the faulting PTE) and frees
+// the slot. No (pml4,vaddr) reverse-map table.
 int swap_init(void);
 int swap_active(void);
-int swap_out(u64 pml4_phys, u64 virtual_addr, u64 physical_frame);
-int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
+int swap_out(u64 physical_frame);
+int swap_in(u32 slot, u64 *out_physical_frame);
+void swap_free_slot_index(u32 slot);
+void swap_free_all_slots(u64 pml4_phys);
 
 #endif

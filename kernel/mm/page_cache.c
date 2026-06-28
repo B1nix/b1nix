@@ -10,9 +10,38 @@
 #define PC_HASH_SIZE 1024
 
 static struct page_cache_entry *hash_table[PC_HASH_SIZE];
-static struct page_cache_entry *lru_head;
+/* Variant E — two LRU lists. lru_head/lru_tail is the INACTIVE list (pages seen
+ * once); active_head/active_tail is the ACTIVE list (the protected working set:
+ * pages referenced again or refaulted). New pages land on inactive; a second
+ * reference (page_cache_get_page hit) promotes to active. Eviction drains
+ * inactive first and only demotes active->inactive when inactive is empty, so a
+ * one-shot scan (a source file read once) is reclaimed before clang's text that
+ * every TU touches. */
+static struct page_cache_entry *lru_head;       /* inactive (oldest at head) */
 static struct page_cache_entry *lru_tail;
+static struct page_cache_entry *active_head;     /* active (oldest at head) */
+static struct page_cache_entry *active_tail;
 static volatile int pc_lock = 0;
+
+/* Refault ring: keys (inode,offset) of pages evicted recently. If a page is
+ * re-added soon after eviction it was wrongly evicted (working set bigger than
+ * the inactive list), so seed it straight onto the active list. A small ring is
+ * enough to catch the hot set churning under pressure. */
+#define PC_REFAULT_N 256
+static struct { struct vfs_inode *inode; u64 offset; } pc_refault[PC_REFAULT_N];
+static u32 pc_refault_w;
+
+static void pc_refault_record(struct vfs_inode *inode, u64 offset) {
+  pc_refault[pc_refault_w].inode = inode;
+  pc_refault[pc_refault_w].offset = offset;
+  pc_refault_w = (pc_refault_w + 1) % PC_REFAULT_N;
+}
+static int pc_refault_hit(struct vfs_inode *inode, u64 offset) {
+  for (u32 i = 0; i < PC_REFAULT_N; i++)
+    if (pc_refault[i].inode == inode && pc_refault[i].offset == offset)
+      return 1;
+  return 0;
+}
 
 static struct page_cache_entry *to_free_list = 0;
 
@@ -61,17 +90,25 @@ static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
   return (u32)(val % PC_HASH_SIZE);
 }
 
+/* Unlink from whichever list (active or inactive) the page is currently on —
+ * the PAGE_CACHE_ACTIVE flag selects the head/tail pair. */
 static void lru_remove(struct page_cache_entry *page) {
+  struct page_cache_entry **head = (page->flags & PAGE_CACHE_ACTIVE)
+                                       ? &active_head : &lru_head;
+  struct page_cache_entry **tail = (page->flags & PAGE_CACHE_ACTIVE)
+                                       ? &active_tail : &lru_tail;
   if (page->lru_prev) page->lru_prev->lru_next = page->lru_next;
-  else if (lru_head == page) lru_head = page->lru_next;
+  else if (*head == page) *head = page->lru_next;
 
   if (page->lru_next) page->lru_next->lru_prev = page->lru_prev;
-  else if (lru_tail == page) lru_tail = page->lru_prev;
+  else if (*tail == page) *tail = page->lru_prev;
 
   page->lru_next = page->lru_prev = 0;
 }
 
+/* Append to the INACTIVE list tail (most-recently-added cold page). */
 static void lru_append(struct page_cache_entry *page) {
+  page->flags &= ~PAGE_CACHE_ACTIVE;
   page->lru_next = 0;
   page->lru_prev = lru_tail;
   if (lru_tail) lru_tail->lru_next = page;
@@ -79,9 +116,35 @@ static void lru_append(struct page_cache_entry *page) {
   lru_tail = page;
 }
 
+/* Append to the ACTIVE list tail (working set, MRU end). */
+static void active_append(struct page_cache_entry *page) {
+  page->flags |= PAGE_CACHE_ACTIVE;
+  page->lru_next = 0;
+  page->lru_prev = active_tail;
+  if (active_tail) active_tail->lru_next = page;
+  else active_head = page;
+  active_tail = page;
+}
+
+/* Demote up to `n` oldest active pages to the inactive list so eviction can
+ * reclaim them once the inactive list is drained. Returns how many moved. */
+static usize demote_active(usize n) {
+  usize moved = 0;
+  while (moved < n && active_head) {
+    struct page_cache_entry *p = active_head;
+    lru_remove(p);       /* unlinks from active (flag still set) */
+    lru_append(p);       /* clears ACTIVE, appends to inactive */
+    moved++;
+  }
+  return moved;
+}
+
 void page_cache_init(void) {
   memset(hash_table, 0, sizeof(hash_table));
   lru_head = lru_tail = 0;
+  active_head = active_tail = 0;
+  pc_refault_w = 0;
+  for (u32 i = 0; i < PC_REFAULT_N; i++) { pc_refault[i].inode = 0; pc_refault[i].offset = 0; }
   pc_lock = 0;
 }
 
@@ -96,9 +159,13 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   while (curr) {
     if (curr->inode == inode && curr->offset == offset) {
       curr->refcount++;
-      // Move to end of LRU (most recently used)
+      /* A second reference (a re-fault, or another process sharing this file
+       * page) promotes the page to the active working set; a page already
+       * active just moves to the MRU end. This is what keeps clang's text —
+       * touched by every TU — out of the eviction path while one-shot reads age
+       * off the inactive list. */
       lru_remove(curr);
-      lru_append(curr);
+      active_append(curr);
       unlock_pc();
       return curr;
     }
@@ -123,12 +190,17 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   /* Proactive cap: the page cache holds reclaimable pmm frames, but reactive
    * reclaim only fires on an allocation miss and tops free back up to just
    * total/512 (~1 MB at 512 MB RAM). That razor-thin headroom let the cache grow
-   * to the brink, so a burst allocation — clang's ~57 MB .text staging during the
-   * in-guest self-host — outran reclaim and OOM'd at free=0. Here we keep a real
-   * headroom: when free drops below total/16, evict a batch of the oldest pages
-   * BEFORE adding a new one, bounding the cache to the live working set. On a roomy
-   * guest free stays far above the watermark so this never fires (no added cost);
-   * on a tight 256–512 MB guest it leaves room for the compiler's allocations. */
+   * to the brink, so a burst allocation — clang's staging during the in-guest
+   * self-host — outran reclaim and OOM'd at free=0. When free drops below
+   * total/16 we trim a small batch of the oldest CLEAN pages before adding a new
+   * one, keeping real headroom. Crucially this is clean-ONLY
+   * (page_cache_evict_clean): it must never force synchronous dirty .o writeback
+   * here. A demand-paged clang faults its text through page_cache_add_page on
+   * every new page, and a dirty-writeback in that hot path would drive the slow
+   * polled AHCI on each fault and thrash (143 reclaim cycles, OOM). Expensive
+   * dirty writeback is deferred to reactive reclaim in pmm_alloc_frames, which
+   * only runs on a true allocation miss. On a roomy guest free stays far above
+   * the watermark so this never fires. */
   if (!pc_proactive_evicting) {
     usize total_frames = (usize)(pmm_total_usable_memory() / PAGE_SIZE);
     usize watermark = total_frames / 16;
@@ -136,17 +208,10 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
       watermark = 512; /* ~2 MB floor so tiny guests still get headroom */
     usize free = pmm_free_frame_count();
     if (free < watermark) {
-      /* Evict a SMALL bounded batch per call, not the whole deficit: add_page
-       * runs once per cached 4 KB block, so a large batch here would re-scan
-       * (and write back) thousands of pages on every block read — O(n) per add,
-       * which manifests as a multi-minute "hang" while loading the 94 MB clang.
-       * A small batch self-paces: every cached block trims a few old pages, so
-       * the cache converges to the live working set across many calls at low
-       * per-call cost while reactive pmm reclaim handles any burst deficit. */
       usize deficit = watermark - free;
       usize batch = deficit < 32 ? deficit : 32;
       pc_proactive_evicting = 1;
-      page_cache_evict(batch);
+      page_cache_evict_clean(batch);
       pc_proactive_evicting = 0;
     }
   }
@@ -176,10 +241,17 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   
   new_entry->hash_next = hash_table[h];
   hash_table[h] = new_entry;
-  
-  lru_append(new_entry);
+
+  /* Refault: this page was evicted recently and is already back — the working
+   * set is bigger than the inactive list, so seed it straight onto the active
+   * list instead of making it climb through inactive again (where it would just
+   * be re-evicted). Otherwise it starts cold on the inactive list. */
+  if (pc_refault_hit(inode, offset))
+    active_append(new_entry);
+  else
+    lru_append(new_entry);
   unlock_pc();
-  
+
   return 0;
 }
 
@@ -239,30 +311,35 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
 
   int invalidated = 0;
   lock_pc();
-  struct page_cache_entry *curr = lru_head;
-  while (curr) {
-    struct page_cache_entry *next = curr->lru_next;
-    if (curr->inode == inode && curr->refcount == 0) {
-      u32 h = pc_hash(curr->inode, curr->offset);
-      struct page_cache_entry **prev = &hash_table[h];
-      struct page_cache_entry *hcurr = *prev;
-      while (hcurr) {
-        if (hcurr == curr) {
-          *prev = hcurr->hash_next;
-          break;
+  /* Walk BOTH LRU lists (inactive then active) — pages of this inode can sit on
+   * either after Variant E's promotion. */
+  struct page_cache_entry *heads[2] = { lru_head, active_head };
+  for (int li = 0; li < 2; li++) {
+    struct page_cache_entry *curr = heads[li];
+    while (curr) {
+      struct page_cache_entry *next = curr->lru_next;
+      if (curr->inode == inode && curr->refcount == 0) {
+        u32 h = pc_hash(curr->inode, curr->offset);
+        struct page_cache_entry **prev = &hash_table[h];
+        struct page_cache_entry *hcurr = *prev;
+        while (hcurr) {
+          if (hcurr == curr) {
+            *prev = hcurr->hash_next;
+            break;
+          }
+          prev = &hcurr->hash_next;
+          hcurr = hcurr->hash_next;
         }
-        prev = &hcurr->hash_next;
-        hcurr = hcurr->hash_next;
-      }
 
-      lru_remove(curr);
-      pmm_free_frame(curr->frame);
-      curr->inode = 0;
-      curr->hash_next = to_free_list;
-      to_free_list = curr;
-      invalidated++;
+        lru_remove(curr);
+        pmm_free_frame(curr->frame);
+        curr->inode = 0;
+        curr->hash_next = to_free_list;
+        to_free_list = curr;
+        invalidated++;
+      }
+      curr = next;
     }
-    curr = next;
   }
   unlock_pc();
 
@@ -281,8 +358,11 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
     return;
 
   lock_pc();
-  struct page_cache_entry *curr = lru_head;
-  while (curr) {
+  /* Both LRU lists — a truncated inode's tail pages may be active. */
+  struct page_cache_entry *heads[2] = { lru_head, active_head };
+  for (int li = 0; li < 2; li++) {
+   struct page_cache_entry *curr = heads[li];
+   while (curr) {
     struct page_cache_entry *next = curr->lru_next;
     if (curr->inode == inode && curr->offset + PAGE_SIZE > new_size) {
       void *virt = (void *)(usize)(curr->frame + vmm_direct_map_base());
@@ -318,6 +398,7 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
       }
     }
     curr = next;
+   }
   }
   unlock_pc();
 }
@@ -328,6 +409,63 @@ void page_cache_put_page(struct page_cache_entry *page) {
     page->refcount--;
   }
   unlock_pc();
+}
+
+/* Evict up to target_pages CLEAN, unreferenced pages from the oldest end of the
+ * LRU — never writing anything back. This is the cheap reclaim used in hot paths
+ * (the proactive cap in page_cache_add_page, fired on every demand-fault that
+ * caches a page): it must NOT trigger synchronous dirty .o writeback over the
+ * slow polled AHCI, which otherwise thrashes once a demand-paged clang faults
+ * its text against a cache full of dirty build output. Expensive dirty
+ * writeback is left to reactive reclaim (page_cache_evict from
+ * pmm_alloc_frames), which only runs on a genuine allocation miss. Returns the
+ * number of pages actually freed (may be < target if the tail is all dirty or
+ * referenced). */
+usize page_cache_evict_clean(usize target_pages) {
+  if (target_pages == 0)
+    target_pages = 1;
+  lock_pc();
+  usize evicted = 0;
+  while (evicted < target_pages) {
+    struct page_cache_entry *victim = 0;
+    /* Inactive list only — the cold pages. */
+    for (struct page_cache_entry *curr = lru_head; curr; curr = curr->lru_next) {
+      if (curr->refcount != 0)
+        continue;
+      if (curr->flags & PAGE_CACHE_DIRTY)
+        continue; /* clean-only: never write back here */
+      victim = curr;
+      break;
+    }
+    if (!victim) {
+      /* Inactive is exhausted of clean victims: demote a batch of the oldest
+       * active (working-set) pages to inactive and try again. This is how the
+       * working set is eventually reclaimable under sustained pressure without
+       * being the FIRST thing evicted. If nothing can be demoted, give up. */
+      if (demote_active(target_pages - evicted) == 0)
+        break;
+      continue;
+    }
+    u32 h = pc_hash(victim->inode, victim->offset);
+    struct page_cache_entry **prev = &hash_table[h];
+    struct page_cache_entry *hcurr = *prev;
+    while (hcurr) {
+      if (hcurr == victim) {
+        *prev = hcurr->hash_next;
+        break;
+      }
+      prev = &hcurr->hash_next;
+      hcurr = hcurr->hash_next;
+    }
+    lru_remove(victim);
+    pc_refault_record(victim->inode, victim->offset);
+    pmm_free_frame(victim->frame);
+    victim->hash_next = to_free_list;
+    to_free_list = victim;
+    evicted++;
+  }
+  unlock_pc();
+  return evicted;
 }
 
 usize page_cache_evict(usize target_pages) {
@@ -376,8 +514,14 @@ usize page_cache_evict(usize target_pages) {
       dirty_written++;
       continue; /* rescan: the page is now clean and evictable */
     }
-    if (!victim)
-      break; /* nothing reclaimable (all referenced or unflushable-dirty) */
+    if (!victim) {
+      /* Inactive list has nothing reclaimable (all referenced / unflushable):
+       * demote a batch of the oldest active working-set pages to inactive and
+       * retry, so the working set is reclaimable last rather than never. */
+      if (demote_active(target_pages - evicted) == 0)
+        break;
+      continue;
+    }
 
     /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
      * and defer the entry's kfree. */
@@ -393,6 +537,7 @@ usize page_cache_evict(usize target_pages) {
       hcurr = hcurr->hash_next;
     }
     lru_remove(victim);
+    pc_refault_record(victim->inode, victim->offset);
     pmm_free_frame(victim->frame);
     victim->hash_next = to_free_list;
     to_free_list = victim;

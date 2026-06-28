@@ -7,6 +7,10 @@ struct vfs_inode;
 
 #define PAGE_CACHE_UPTODATE 1
 #define PAGE_CACHE_DIRTY    2
+/* Variant E — the entry is on the ACTIVE LRU list (referenced more than once /
+ * refaulted). Active pages are the protected working set: eviction drains the
+ * inactive list first and only demotes active pages when inactive is empty. */
+#define PAGE_CACHE_ACTIVE   4
 
 struct page_cache_entry {
   struct vfs_inode *inode;
@@ -45,7 +49,11 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size);
 // Decrease refcount. If 0, page is eligible for eviction (stays in cache).
 void page_cache_put_page(struct page_cache_entry *page);
 
-// Evicts up to target_pages unused clean pages.
+// Evicts up to target_pages unused pages, writing dirty ones back first.
 usize page_cache_evict(usize target_pages);
+
+// Evicts up to target_pages CLEAN unused pages only — never writes back. Cheap
+// reclaim for hot paths (the proactive cap) that must not drive AHCI writeback.
+usize page_cache_evict_clean(usize target_pages);
 
 #endif

@@ -34,6 +34,12 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define PT_NOTE    4
 #define PT_TLS     7
 
+/* ELF program-header p_flags bits. The demand-paged loader keys on PF_W: a
+ * read-only segment can be shared from the page cache, a writable one cannot. */
+#define PF_X 0x1
+#define PF_W 0x2
+#define PF_R 0x4
+
 /* M40 — Linux personality detection. EI_OSABI is e_ident byte 7; Linux/GNU
  * binaries set it to ELFOSABI_LINUX or carry a GNU NT_GNU_ABI_TAG note whose
  * first descriptor word (the OS) is GNU_ABI_OS_LINUX. b1nix's own freestanding
@@ -476,6 +482,20 @@ static int elf64_resolve_tls_symbol(struct user_loaded_image *image,
   return -1;
 }
 
+/* Clear demand_ok on whichever segment contains virtual address `va` — called
+ * for every relocation write target so a segment the in-kernel linker modifies
+ * is never demand-paged from the now-stale file. Relocation targets always land
+ * in the writable GOT/PLT/data segment, so this is a correctness safety net. */
+static void elf64_mark_seg_dirty(struct user_loaded_image *image, u64 va) {
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    if (va >= s->vaddr && va < s->vaddr + s->memsz) {
+      s->demand_ok = 0;
+      return;
+    }
+  }
+}
+
 static int elf64_apply_rela_table(struct user_loaded_image *image,
                                   struct elf64_dyn_object *objects,
                                   usize object_count, usize owner,
@@ -505,6 +525,8 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
         image, objects[owner].base + rela->r_offset, sizeof(u64));
     if (!target && type != R_X86_64_COPY)
       return -1;
+    if (type != R_X86_64_COPY)
+      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
     if (type == R_X86_64_RELATIVE) {
       *target = objects[owner].base + (u64)rela->r_addend;
       continue;
@@ -568,6 +590,7 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
       if (!dstp || !srcp)
         return -1;
       memcpy(dstp, srcp, (usize)sz);
+      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
       continue;
     }
     /* R_X86_64_TPOFF64: thread-pointer-relative offset of a __thread variable
@@ -1025,6 +1048,58 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     console_write(" (eager in-kernel dynamic linking)\n");
   }
 
+  /* Demand-paging eligibility (self-host RAM floor). An ET_EXEC (load_base == 0)
+   * backed by a real filesystem (its inode has a read_cb, so pages can be read
+   * back on a fault) has its read-only PT_LOAD segments faulted in lazily from
+   * the page cache instead of pinned in private frames — so the 94 MB self-host
+   * clang's resident set is its touched working set, not the whole binary. The
+   * dynamic linker still stages every segment (to read symtab/strtab + patch the
+   * GOT/PLT); user_run_elf_image then maps the read-only ones file-backed and
+   * frees their staging. PIE/ET_DYN (load_base != 0) is excluded — its read-only
+   * segments get relocated. initramfs (no read_cb) stays eager. Guards: every
+   * PT_LOAD page-congruent; no RO/RW page sharing; the reloc pass clears
+   * demand_ok for any segment it writes into. */
+  int has_dynamic = 0;
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    if (phdrs[i].p_type == PT_DYNAMIC) { has_dynamic = 1; break; }
+  }
+  int demand_page = (load_base == 0);
+  for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
+    struct elf64_phdr *a = &phdrs[i];
+    if (a->p_type != PT_LOAD)
+      continue;
+    if ((a->p_vaddr & (PAGE_SIZE - 1)) != (a->p_offset & (PAGE_SIZE - 1))) {
+      demand_page = 0;
+      break;
+    }
+    u64 a_lo = a->p_vaddr & ~(PAGE_SIZE - 1);
+    u64 a_hi = (a->p_vaddr + a->p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (u16 j = 0; j < ehdr->e_phnum; j++) {
+      struct elf64_phdr *b = &phdrs[j];
+      if (j == i || b->p_type != PT_LOAD)
+        continue;
+      if (((a->p_flags ^ b->p_flags) & PF_W) == 0)
+        continue;
+      u64 b_lo = b->p_vaddr & ~(PAGE_SIZE - 1);
+      u64 b_hi = (b->p_vaddr + b->p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+      if (a_lo < b_hi && b_lo < a_hi) {
+        demand_page = 0;
+        break;
+      }
+    }
+  }
+  if (demand_page) {
+    struct vfs_node *en = vfs_find_node(path);
+    if (!en || IS_ERR(en) || !en->inode || !en->inode->read_cb) {
+      if (en && !IS_ERR(en))
+        vfs_node_put(en);
+      demand_page = 0; /* initramfs / no backing -> eager */
+    } else {
+      image->exe_node = en;
+    }
+  }
+  image->demand_paged = demand_page;
+
   /* First pass: PT_LOAD segments. Vaddrs are offset by `load_base` for
    * PIE; this also offsets any later relocation targets we compute. */
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
@@ -1051,6 +1126,10 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     segment->memsz = phdr->p_memsz;
     segment->filesz = phdr->p_memsz;
     segment->flags = phdr->p_flags;
+    segment->file_offset = phdr->p_offset;
+    segment->demand_ok = (u8)(demand_page && !(phdr->p_flags & PF_W) &&
+                              phdr->p_filesz == phdr->p_memsz &&
+                              (phdr->p_vaddr & (PAGE_SIZE - 1)) == 0);
 
     /* Relocations may target .bss or the zero-filled tail of a PT_LOAD, so the
      * staging image must cover p_memsz, not only the bytes present on disk. */
@@ -1107,13 +1186,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * cross GCC links libgcc dynamically for the _Unwind_* exception symbols); the
    * kernel resolves that here against /lib/libgcc_s.so, shipped in the
    * initramfs. The PT_INTERP is informational — b1nix links eagerly in-kernel. */
-  int has_dynamic = 0;
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    if (phdrs[i].p_type == PT_DYNAMIC) {
-      has_dynamic = 1;
-      break;
-    }
-  }
+  /* has_dynamic was computed above for the demand-paging decision. */
   if (load_base != 0 || has_dynamic) {
     struct elf64_dyn_object objects[DYN_MAX_OBJECTS];
     memset(objects, 0, sizeof(objects));
@@ -1370,6 +1443,12 @@ void user_image_free(struct user_loaded_image *image) {
   if (image->tls_data) {
     kfree(image->tls_data);
   }
+
+  /* Drop the demand-paging backing-file reference held for the image lifetime.
+   * Each demand-paged segment VMA took its own vfs_node_get (released in
+   * user_address_space_cleanup); this is the loader's own reference. */
+  if (image->exe_node)
+    vfs_node_put(image->exe_node);
 
   kfree(image);
 }
@@ -1853,6 +1932,38 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
     u64 vaddr_end =
         (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Demand-paged read-only segment (survived the relocation pass): map it
+     * file-backed lazy instead of pinning private frames, then free the staging.
+     * The page-fault handler (Case 1) reads each touched page from the
+     * executable's page cache via inode->read_cb — shared read-only and
+     * refcounted across every mapper — so only the working set is resident and
+     * untouched pages stay reclaimable. vmm_set_lazy splits the low-4GB identity
+     * huge page covering the load base so the lazy PTE is installed correctly. */
+    if (image->demand_paged && segment->demand_ok && image->exe_node &&
+        segment->data) {
+      u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
+      for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
+        vmm_set_lazy(v);
+        /* RO + user: no VMM_WRITABLE, so the shared cache frame can't be written
+         * through this mapping; the fault handler honours the saved bits. */
+        paging_mprotect_page(v, VMM_USER);
+      }
+      struct vm_area *fvma = kzalloc(sizeof(struct vm_area));
+      if (fvma) {
+        fvma->start = vaddr_start;
+        fvma->end = vaddr_end;
+        fvma->prot = PROT_READ | ((segment->flags & PF_X) ? PROT_EXEC : 0);
+        fvma->flags = MAP_PRIVATE;
+        fvma->node = vfs_node_get(image->exe_node);
+        fvma->offset = (isize)seg_file_base;
+        fvma->next = current_task->vma_list;
+        current_task->vma_list = fvma;
+      }
+      kfree(segment->data);
+      segment->data = 0;
+      continue;
+    }
 
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {

@@ -765,6 +765,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * Processors too. */
 	g_ap_userspace_enabled = 1;
 
+	/* Variant B: start background reclaim now that the scheduler, page cache and
+	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
+	 * allocations rarely stall in synchronous reclaim. */
+	kswapd_init();
+
 	userspace_init();
 	int init_pid = user_spawn("/bin/init", 0, 0);
 	char init_spawn_buf[64];
