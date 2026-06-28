@@ -2210,6 +2210,19 @@ int user_spawn(const char *path, int argc, const char **argv) {
   return tid;
 }
 
+/* Full executable path of a task, for /proc/<pid>/exe. user_spawn stores only
+ * the comm basename in task->name (so ps/pidof/pkill match correctly), but the
+ * loaded image keeps the full path — which tools like clang's getMainExecutable
+ * (and thus its cc1as re-exec for .S files) need to locate themselves. */
+const char *user_task_exe_path(struct task *t) {
+  if (!t)
+    return 0;
+  struct user_loaded_image *img = t->user_image;
+  if (img && img->path && img->path[0])
+    return img->path;
+  return t->name; /* fallback: execve already stores the full path in name */
+}
+
 int user_execve_current(const char *path, const char **argv,
                         const char **envp) {
   int interp_level = 0;

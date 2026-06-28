@@ -25,6 +25,7 @@
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/user.h>
 #include <b1nix/vfs.h>
 #include <b1nix/net.h>
 #include <b1nix/netdev.h>
@@ -592,12 +593,13 @@ static isize procfs_exe_readlink(struct vfs_node *node, u64 offset, char *buf,
   (void)flags;
   usize pid = pid_from_parent(node);
   struct task *t = scheduler_task_by_pid(pid);
-  if (!t || !t->name || !t->name[0])
+  const char *path = user_task_exe_path(t);
+  if (!path || !path[0])
     return -EINVAL;
-  usize len = strlen(t->name);
+  usize len = strlen(path);
   if (len > size)
     len = size;
-  memcpy(buf, t->name, len);
+  memcpy(buf, path, len);
   return (isize)len;
 }
 

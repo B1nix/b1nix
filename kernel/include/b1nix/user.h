@@ -100,6 +100,9 @@ void user_register_builtin_programs(void);
 const struct user_program *user_find_program(const char *path);
 struct task;
 void user_address_space_cleanup(struct task *t);
+/* Full executable path of a task (the loaded image's path), for /proc/<pid>/exe.
+ * Falls back to task->name. */
+const char *user_task_exe_path(struct task *t);
 void user_image_free(struct user_loaded_image *image);
 
 #endif

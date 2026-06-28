@@ -614,8 +614,29 @@ int dlclose(void *handle) {
 /* dladdr: b1nix keeps no global address→symbol index; report "not found"
  * (the glibc convention of returning 0), which callers degrade gracefully on. */
 int dladdr(const void *addr, Dl_info *info) {
-  (void)addr;
-  if (info)
-    memset(info, 0, sizeof(*info));
-  return 0;
+  if (!info)
+    return 0;
+  memset(info, 0, sizeof(*info));
+  uintptr_t a = (uintptr_t)addr;
+  /* If the address falls inside a dlopen'd object's mapped image, report it. */
+  for (struct dl_object *o = g_objects; o; o = o->next) {
+    if (o->map_addr && o->map_len && a >= (uintptr_t)o->map_addr &&
+        a < (uintptr_t)o->map_addr + o->map_len) {
+      info->dli_fname = o->path;
+      info->dli_fbase = o->map_addr;
+      return 1; /* dli_sname/dli_saddr: nearest-symbol lookup is future work */
+    }
+  }
+  /* Otherwise the address is in the main executable (placed by the M69 in-kernel
+   * loader, which dlfcn does not map). Report the main exe path from
+   * /proc/self/exe — this is what llvm::sys::getMainExecutable's HAVE_DLOPEN
+   * branch (dladdr) needs to locate clang's own install dir; without it clang's
+   * InstalledDir is empty and the in-guest cc1as re-exec for .S files fails. */
+  static char exe[DL_PATH_MAX];
+  ssize_t n = readlink("/proc/self/exe", exe, sizeof(exe) - 1);
+  if (n <= 0)
+    return 0;
+  exe[n] = '\0';
+  info->dli_fname = exe;
+  return 1;
 }
