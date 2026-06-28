@@ -1776,9 +1776,28 @@ void user_address_space_cleanup(struct task *t) {
 }
 
 static int user_run_elf_image(struct user_loaded_image *image) {
-  /* FIX: Clear old VMAs if this is an execve image replacement */
+  /* execve image replacement: release the old image's VMA/shm/swap references,
+   * then install a FRESH address space and free the old one — rather than
+   * re-mapping the new image in place. A task that reached here via
+   * fork()+execve() is running on a COW clone of the parent's pml4; re-mapping
+   * a large dynamically-linked image (clang: the executable + each .so at the
+   * high 0xC0/0xC1 region + split huge-pages + TLS) over that surviving COW
+   * page-table tree wedges silently. A fresh pml4 — mirroring the spawn path's
+   * scheduler_set_user_image — removes the COW-residue interaction.
+   * paging_free_address_space is refcount-aware, so frames still COW-shared with
+   * the (blocked) parent survive. A fresh spawn (no VMAs yet;
+   * scheduler_set_user_image already built a clean pml4) skips the swap to avoid
+   * double-allocating. */
   if (current_task) {
+    int replacing = (current_task->vma_list != NULL);
     user_address_space_cleanup(current_task);
+    if (replacing) {
+      u64 old_pml4 = current_task->pml4_phys;
+      current_task->pml4_phys = paging_create_address_space();
+      paging_switch_address_space(current_task->pml4_phys);
+      if (old_pml4)
+        paging_free_address_space(old_pml4);
+    }
   }
 
   int compat_code = 0;

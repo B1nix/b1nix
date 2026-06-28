@@ -297,46 +297,69 @@ usize page_cache_evict(usize target_pages) {
     target_pages = 1;
   evict_calls++;
   lock_pc();
-  
-  struct page_cache_entry *curr = lru_head;
+
   usize evicted = 0;
   usize dirty_skipped = 0;
-  
-  while (curr && evicted < target_pages) {
-    struct page_cache_entry *next = curr->lru_next;
-    
-    if (curr->refcount == 0) {
-      if (curr->flags & PAGE_CACHE_DIRTY) {
-        dirty_skipped++;
-        curr = next;
+  usize dirty_written = 0;
+
+  /* Each pass walks the LRU from the oldest end and either evicts one clean,
+   * unreferenced page or writes back one dirty page so it becomes evictable.
+   * The pre-read-ahead behaviour skipped dirty pages outright, so a workload
+   * that dirties most of the cache (e.g. the in-guest self-host writing .o
+   * files to the ram0 module, on a machine with no swap device) could reclaim
+   * NOTHING under memory pressure and OOM/triple-fault — which is why the
+   * self-host needed ~16 GiB. Writing dirty pages back caps the cache at the
+   * real working set. writeback_page_locked transiently drops pc_lock, so a
+   * cursor saved across it could dangle; restart the walk from lru_head each
+   * pass instead. Bounded: every dirty page is flushed at most once (writeback
+   * clears DIRTY) and every clean page evicted at most once. */
+  while (evicted < target_pages) {
+    struct page_cache_entry *victim = 0;
+    struct page_cache_entry *flush = 0;
+    dirty_skipped = 0;
+    for (struct page_cache_entry *curr = lru_head; curr; curr = curr->lru_next) {
+      if (curr->refcount != 0)
         continue;
-      }
-      
-      // Remove from hash table
-      u32 h = pc_hash(curr->inode, curr->offset);
-      struct page_cache_entry **prev = &hash_table[h];
-      struct page_cache_entry *hcurr = *prev;
-      while (hcurr) {
-        if (hcurr == curr) {
-          *prev = hcurr->hash_next;
+      if (curr->flags & PAGE_CACHE_DIRTY) {
+        if (curr->inode && curr->inode->write_cb) {
+          flush = curr; /* oldest flushable dirty page */
           break;
         }
-        prev = &hcurr->hash_next;
-        hcurr = hcurr->hash_next;
+        dirty_skipped++; /* no write_cb — cannot reclaim, leave it in place */
+        continue;
       }
-      
-      lru_remove(curr);
-      
-      // Free frame and entry
-      pmm_free_frame(curr->frame);
-      curr->hash_next = to_free_list;
-      to_free_list = curr;
-      evicted++;
+      victim = curr; /* oldest clean, unreferenced page */
+      break;
     }
-    
-    curr = next;
+
+    if (flush) {
+      writeback_page_locked(flush); /* clears DIRTY (drops+retakes pc_lock) */
+      dirty_written++;
+      continue; /* rescan: the page is now clean and evictable */
+    }
+    if (!victim)
+      break; /* nothing reclaimable (all referenced or unflushable-dirty) */
+
+    /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
+     * and defer the entry's kfree. */
+    u32 h = pc_hash(victim->inode, victim->offset);
+    struct page_cache_entry **prev = &hash_table[h];
+    struct page_cache_entry *hcurr = *prev;
+    while (hcurr) {
+      if (hcurr == victim) {
+        *prev = hcurr->hash_next;
+        break;
+      }
+      prev = &hcurr->hash_next;
+      hcurr = hcurr->hash_next;
+    }
+    lru_remove(victim);
+    pmm_free_frame(victim->frame);
+    victim->hash_next = to_free_list;
+    to_free_list = victim;
+    evicted++;
   }
-  
+
   unlock_pc();
   if (bootinfo_has_flag("b1nix.debug.heap") && (evict_calls <= 16 || is_power_of_two_u64(evict_calls) ||
       dirty_skipped > 0 || evicted < target_pages)) {
