@@ -25,10 +25,12 @@
  * trip per sector — ~184k commands for a 94 MB binary, the dominant cost of a
  * disk-resident toolchain. Reading a contiguous run in a single command and
  * populating the neighbouring cache slots from the data already in hand turns
- * a sequential stream into ~1 command per RA sectors. 64 * 512 = 32 KiB per
- * command (ahci_build_prdt splits it across page frames; well under its 248
- * PRD-entry cap). */
-#define BCACHE_READAHEAD 256
+ * a sequential stream into ~1 command per RA sectors. Under KVM the per-command
+ * cost is the polled-completion VM-exits (roughly constant), so a bigger window
+ * means fewer commands and higher throughput. 512 * 512 = 256 KiB per command —
+ * a robust kmalloc size even under the low-RAM self-host, and well under
+ * ahci_build_prdt's 248 PRD-entry cap. */
+#define BCACHE_READAHEAD 512
 
 static struct block_device *blk_devices[MAX_BLK_DEVICES];
 static usize blk_device_count = 0;
@@ -729,6 +731,91 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
   return 0;
 }
 
+/* Variant D — dirty throttle + faster writeback. The in-guest build streams .o
+ * output to disk; each 512-byte block is marked BLK_CACHE_DIRTY and, before, was
+ * written back ONE block per device command (slow polled AHCI) only when its
+ * slot got recycled. Under memory pressure that bunched all the writeback at the
+ * worst moment and crawled. bcache_flush_some() instead proactively drains dirty
+ * blocks in CONTIGUOUS runs — one write_blocks() command per run, amortising the
+ * per-command cost — and blk_write_cached calls it every N dirty writes so dirty
+ * blocks never pile up unbounded (the writer is throttled by doing some of the
+ * writeback itself, like Linux balance_dirty_pages). */
+#define BCACHE_FLUSH_RUN     512  /* max sectors coalesced into one command (256 KiB) */
+#define BCACHE_DIRTY_THROTTLE 256 /* dirty writes between proactive drains */
+
+static volatile int bcache_flushing; /* re-entrancy guard (kmalloc may reclaim) */
+
+static usize bcache_flush_some(usize target) {
+  if (target == 0)
+    return 0;
+  if (__sync_lock_test_and_set(&bcache_flushing, 1))
+    return 0; /* another flush in progress — don't recurse/contend */
+
+  usize flushed = 0;
+  u64 flags = bcache_acquire();
+  while (flushed < target) {
+    /* Find a dirty, non-busy, writable block to anchor a run. */
+    int start = -1;
+    for (usize i = 0; i < block_cache_n; i++) {
+      struct block_buffer *e = &block_cache[i];
+      if ((e->flags & (BLK_CACHE_VALID | BLK_CACHE_DIRTY)) ==
+              (BLK_CACHE_VALID | BLK_CACHE_DIRTY) &&
+          !(e->flags & BLK_CACHE_BUSY) && e->bdev && e->bdev->write_blocks) {
+        start = (int)i;
+        break;
+      }
+    }
+    if (start < 0)
+      break; /* nothing dirty to flush */
+
+    struct block_device *wdev = block_cache[start].bdev;
+    u64 base = block_cache[start].block_no;
+    /* Extend a contiguous run [base, base+run) of dirty, non-busy blocks on the
+     * same device; claim each BUSY so a concurrent write to those LBAs waits. */
+    i32 idxs[BCACHE_FLUSH_RUN];
+    usize run = 0;
+    for (u64 l = base; run < BCACHE_FLUSH_RUN; l++) {
+      struct block_buffer *e = bcache_find(wdev, l);
+      if (!e || !(e->flags & BLK_CACHE_DIRTY) || (e->flags & BLK_CACHE_BUSY))
+        break;
+      e->flags |= BLK_CACHE_BUSY;
+      idxs[run++] = (i32)(e - block_cache);
+    }
+    if (run == 0)
+      break;
+
+    u8 *tmp = (u8 *)kmalloc(run * CACHE_BLOCK_SIZE);
+    if (!tmp) {
+      /* No memory to coalesce — unbusy and bail (eviction-time writeback still
+       * handles these later). */
+      for (usize k = 0; k < run; k++)
+        block_cache[idxs[k]].flags &= ~BLK_CACHE_BUSY;
+      break;
+    }
+    for (usize k = 0; k < run; k++)
+      memcpy(tmp + k * CACHE_BLOCK_SIZE, block_cache[idxs[k]].data,
+             CACHE_BLOCK_SIZE);
+
+    bcache_release(flags); /* write_blocks may yield — lock dropped, slots BUSY */
+    int wr = wdev->write_blocks(wdev, base, (u32)run, tmp);
+    kfree(tmp);
+    flags = bcache_acquire();
+
+    for (usize k = 0; k < run; k++) {
+      struct block_buffer *e = &block_cache[idxs[k]];
+      e->flags &= ~BLK_CACHE_BUSY;
+      if (wr == 0)
+        e->flags &= ~BLK_CACHE_DIRTY; /* persisted; keep DIRTY on failure (R3-13) */
+    }
+    if (wr != 0)
+      break; /* device error — stop, leave the rest dirty for a later retry */
+    flushed += run;
+  }
+  bcache_release(flags);
+  __sync_lock_release(&bcache_flushing);
+  return flushed;
+}
+
 int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
                      const void *buffer) {
   if (!dev || !dev->write_blocks)
@@ -794,6 +881,17 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
       bcache_release(flags);
       break;
     }
+  }
+  /* Variant D throttle: every BCACHE_DIRTY_THROTTLE dirtied blocks, proactively
+   * drain a larger batch in contiguous runs so dirty blocks never accumulate to
+   * fill the cache (which would force a slow per-block writeback on every later
+   * eviction). The writer pays some writeback cost here — that IS the throttle.
+   * Counter is a heuristic; an SMP race only shifts the drain cadence. */
+  static u32 dirty_writes;
+  dirty_writes += count;
+  if (dirty_writes >= BCACHE_DIRTY_THROTTLE) {
+    dirty_writes = 0;
+    bcache_flush_some(BCACHE_DIRTY_THROTTLE * 2);
   }
   return 0;
 }

@@ -194,14 +194,21 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
         u16 cq_head = dev->io_cq_head;
         
         struct nvme_cqe *cqe = &dev->io_cq[cq_head];
+        /* The CQ entry lives in host RAM (the controller DMAs the completion), so
+         * polling it is a plain memory read, not an MMIO VM-exit. Spin on it
+         * briefly before yielding: under KVM the command completes in
+         * microseconds, and yielding on the first not-done pays a full scheduler
+         * round-trip per command, capping throughput far below the device. */
+        for (int s = 0; s < 4096 && cqe->status == 0xFFFF; s++)
+            __asm__ volatile("pause");
         if (cqe->status != 0xFFFF) {
             u16 status = cqe->status;
             cqe->status = 0xFFFF; // Reset status on consume
-            
+
             cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
             dev->io_cq_head = cq_head;
             *cq_hdb = cq_head;
-            
+
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
                 console_write_hex32(status);
