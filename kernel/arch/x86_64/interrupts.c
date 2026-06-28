@@ -425,6 +425,7 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
  * (invlpg + atomic decrement + EOI) and runs with IRQs implicitly disabled at
  * the LAPIC level.
  */
+static int addr_is_kernel_text(u64 addr); /* defined below; used by the fault dump */
 void x86_irq_handler(struct interrupt_frame *frame) {
   if (frame->vector == 65) {
     tlb_shootdown_handler();
@@ -552,7 +553,28 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   console_write("\nr12=0x"); console_write_hex64(frame->r12);
   console_write(" r13=0x"); console_write_hex64(frame->r13);
   console_write(" r14=0x"); console_write_hex64(frame->r14);
+  console_write(" rsp=0x"); console_write_hex64(frame->rsp);
   console_write("\n");
+
+  /* Fault-stack scan: leaf functions like memcpy don't set up a frame pointer,
+   * so the rbp-based backtrace stops at the faulting rip. Scan the actual
+   * faulting stack (frame->rsp upward) for kernel-text values — the first one is
+   * the return address into the CALLER. Bounded, read-only, fault-tolerant. */
+  if (frame->cs == 0x08 && frame->rsp >= 0xffff800000000000ULL) {
+    console_write("fault-stack callers:");
+    u64 *sp = (u64 *)(usize)frame->rsp;
+    int shown = 0;
+    for (int i = 0; i < 48 && shown < 8; i++) {
+      u64 v = sp[i];
+      if (addr_is_kernel_text(v)) {
+        console_write(" 0x");
+        console_write_hex64(v);
+        ksym_print(v);
+        shown++;
+      }
+    }
+    console_write("\n");
+  }
 
   arch_backtrace(frame->rbp, frame->rip);
 
