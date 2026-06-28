@@ -555,18 +555,6 @@ findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
   (it round-trips via a side-table; mapping it onto the strict-priority
   `pick_next_task` scan starves tasks — see the audit doc).
 
-### Open hardening (second-round audit)
-
-All critical and high-severity bugs from Part 3 of the audit are fixed; details
-in [`vfs-process-audit.md`](vfs-process-audit.md). One known open item remains:
-the intermittent `#GP` under heavy graphics load (stale data-segment register on
-kernel→user return path). Lower-priority pending items: futex PROCESS_SHARED
-cross-mmap wakeups, journal crash-atomicity, and swap/eviction table locking
-(all inactive in the smoke suite).
-
-- [x] All critical and high-severity bugs from the audit fixed (file locks, unix-socket UAF, journal mutex, block-cache dedup, xattr locking, page-cache race, loop-device refcount, icache dangling pointer, orphaned-pgrp false-negative, shm leak+lock). See [`vfs-process-audit.md`](vfs-process-audit.md) for details.
-- [ ] `bug` Remaining lower-severity open items: futex PROCESS_SHARED wakeups, journal crash-atomicity, swap/eviction table locking, and an intermittent `#GP` under heavy graphics load. Details in [`vfs-process-audit.md`](vfs-process-audit.md).
-
 ## M47: Userspace Display Server
 
 Own compositor, initially validated with a temporary Wayland-shaped protocol
@@ -911,7 +899,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [ ] `planned` A **displayd/Wayland-shaped** Ozone backend (window, surface,
   input, vsync) for on-screen rendering — tracked under M66.
 
-## M61: Chromium Build Target
+## Frozen - M61: Chromium Build Target
 
 - [x] `done` **b1nix is a working GN/Ninja target** — `gn gen out/b1nix`
   (~68.5k edges) succeeds with the shared `//build` `target_os=="b1nix"` +
@@ -924,7 +912,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [ ] `partial` **Compile the rest** (Blink renderer + `content/`) under
   `ninja -k 0` so the `.so` link blocker doesn't halt the object grind.
 
-## M62: content_shell
+##  Frozen - M62: content_shell
 
 - [ ] `in-progress` `content_shell` is the active ninja target; foundational +
   services layers compile (M61). **Remaining: (1) compile Blink/content,
@@ -950,10 +938,10 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
   existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
   `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
-- [ ] `planned` **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
+- [x] **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
   directory/config so the working GCC V8 build remains the fallback. Reuse the
   GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
-- [ ] `planned` **Phase 3 — broaden optional coverage.** Move individual C++
+- [x]  **Phase 3 — broaden optional coverage.** Move individual C++
   ports to Clang only after their existing smoke tests pass with both frontends.
 - [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh --b1nix-elf`
   cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
@@ -989,6 +977,33 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `blkdev_node_read/write`; AHCI PRDT bounds check; cache-invalidate before raw
   writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
   path yet) — correct but not fast; interrupt-driven AHCI is future work.
+
+  ## Frozen - M66: Chromium Browser Frontend (planned)
+
+- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
+  M62 `content_shell` renders pages, build a windowed browser frontend (address
+  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
+  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
+  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
+  itself. **Gated on M62** (the engine must render first). Lighter alternative if
+  full Chromium UI is too heavy: drive `content_shell --window-size` output into
+  a libgui window.
+
+## M67: Rust Toolchain Port (for Chromium) — DONE
+
+- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
+  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
+  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
+  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
+
+## M68: Native Rust Compiler (self-hosted) — DONE
+
+- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
+  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
+  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
+  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
+  `rustc 1.98.0-nightly` banner). Merged (PR#23).
+
 
 ## M69: Dynamic Loading (ELF dynamic linker) — DONE
 
@@ -1191,10 +1206,30 @@ PIE base (`0x500000000000`).
   non-PIE physics, not fixable) and Chromium (intentionally deferred — doesn't run
   yet). Rust proc-macros remain deferred (need the dynamic loader's dlopen path).
 
-## M70: Interrupt-Driven I/O
+## M70: Interrupt-Driven I/O — DONE
 
-- [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,
-  ~100 Hz NIC poll; real AHCI ≈0.5 MB/s) with ISR→wakeup completion.
+- [x] `done` Replace busy-poll storage/NIC drivers with ISR→wakeup completion.
+  A generic device-IRQ registration layer (`kernel/include/b1nix/irq.h` +
+  `interrupts.c`: `irq_register_handler`/`irq_dispatch`/`irq_unmask`, shared-line
+  aware) replaces the hard-coded per-device vector dispatch. The three storage
+  drivers (`ahci.c`, `virtio_blk.c`, `nvme.c`) now block on a per-device wait
+  channel and are woken by the completion IRQ instead of busy-yielding on a
+  status register (AHCI previously polled `PxCI` over MMIO = a VM-exit per read).
+  The NIC RX path wakes `net_task` immediately on the device IRQ rather than
+  draining only on the ~100 Hz poll tick.
+- The wait uses `scheduler_wait_prepare_timeout()` (M70 scheduler addition): it
+  publishes BLOCKED with a full barrier and re-checks the completion predicate
+  *after* publishing — closing the check-then-block lost-wakeup window — while
+  arming a watchdog deadline so a genuinely-lost interrupt degrades to a re-poll
+  instead of a wedge. A brief no-MMIO CPU spin first catches the sub-µs KVM-fast
+  completion with no context switch, and `scheduler_can_block()` falls back to
+  the old cooperative yield-poll before the scheduler is live (boot-time root
+  mount / IDENTIFY) or from IRQs-off callers. NVMe masks its interrupt vector in
+  the ISR and unmasks on consume to avoid a level-triggered INTx storm; AHCI and
+  virtio-blk ack their own IS/ISR registers. PCI INTx-disable is cleared and the
+  lines unmasked at the IOAPIC only after each driver is configured.
+- Verified by the full **x86_64 837/0** smoke (root mount + M14 SATA/NVMe
+  mount/persistence/block-cache + swap + M32-NET all green, no regression).
 
 ## M71: ASLR and PIE-by-Default
 
@@ -1227,38 +1262,8 @@ PIE base (`0x500000000000`).
 
 ## M77: Raise Global Resource Caps
 
-- [ ] `planned` Raise/make-dynamic hard caps: TCP conns (64), VFS pipes (128),
-  core-dump size (1 MiB), `SHMMAX` (32 MiB).
-
-## M66: Chromium Browser Frontend (planned)
-
-- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
-  M62 `content_shell` renders pages, build a windowed browser frontend (address
-  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
-  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
-  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
-  itself. **Gated on M62** (the engine must render first). Lighter alternative if
-  full Chromium UI is too heavy: drive `content_shell --window-size` output into
-  a libgui window.
-
-## M67: Rust Toolchain Port (for Chromium) — DONE
-
-- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
-  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
-  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
-  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
-
-## M68: Native Rust Compiler (self-hosted) — DONE
-
-- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
-  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
-  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
-  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
-  `rustc 1.98.0-nightly` banner). Merged (PR#23).
-
-<!-- Big items surfaced by the Chromium port (M60-62) that each need a whole new
-     subsystem, not a flag. Tracked here so they get closed deliberately; the
-     per-port detail lives in docs/chromium-port-debt.md. -->
+- [ ] `planned` Make-dynamic hard caps: TCP conns (64), VFS pipes (128),
+  core-dump size (1 MiB), `SHMMAX` (32 MiB) and many other.
 
 ## M79: Audio Stack
 
@@ -1290,11 +1295,6 @@ PIE base (`0x500000000000`).
   (`use_nss_certs=false`) and no-Negotiate-auth are the correct defaults for
   b1nix, so this is large-effort / low-value — listed for completeness, not
   scheduled.
-
----
-
-> **M83–M88 below: surfaced by the 2026-06-25 repo-wide tech-debt audit**
-> (kernel + userspace + ports). Genuinely-new items not already tracked above.
 
 ## M83: Unicode-aware ctype / wctype
 

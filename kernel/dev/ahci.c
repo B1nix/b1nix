@@ -1,6 +1,7 @@
 #include <b1nix/ahci.h>
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
@@ -8,6 +9,11 @@
 
 #define AHCI_MAX_PORTS 32
 #define AHCI_COMMAND_SLOTS 32
+
+/* M70: watchdog deadline (10 ms scheduler ticks) for a blocked AHCI I/O wait.
+ * The completion IRQ wakes the waiter on the common path; this only bounds a
+ * lost interrupt to a re-poll. Never reached on a healthy controller. */
+#define AHCI_IO_WATCHDOG_TICKS 50
 
 static struct block_device ahci_devices[AHCI_MAX_PORTS];
 static int ahci_device_count = 0;
@@ -56,36 +62,86 @@ static void ahci_port_unlock(struct ahci_port_state *port) {
 
 static u64 ahci_pci_bar5 = 0;
 
-static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
+/* M70: AHCI completion interrupt handler. Runs in IRQ context. The HBA latches a
+ * per-port pending bit in the global IS register; for each port flagged, ack the
+ * port-level PxIS (RW1C) and wake the task blocked in ahci_wait_ci_clear() on
+ * that port's channel, then ack the global IS. The port_state pointer is the
+ * wait channel. Returns 1 if any port was pending (shared-line aware). */
+static int ahci_irq(void *ctx) {
+  volatile struct ahci_hba_mem *abar = (volatile struct ahci_hba_mem *)ctx;
+  u32 is = abar->is;
+  if (!is)
+    return 0; /* another device on a shared INTx line */
+  for (int i = 0; i < AHCI_MAX_PORTS; i++) {
+    if (is & (1u << i)) {
+      volatile struct ahci_port *p = &abar->ports[i];
+      p->is = p->is; /* RW1C: clear the port-level interrupt status */
+      if (ports[i].present)
+        scheduler_wake_all(&ports[i]);
+    }
+  }
+  abar->is = is; /* RW1C: clear the global pending bits we serviced */
+  return 1;
+}
+
+/* Wait for the command-issue bit(s) in slot_mask to clear. Once issued we must
+ * never return while the DMA may still target the caller's buffer, so this only
+ * ever returns when the slot is genuinely complete.
+ *
+ * Fast path: a brief no-MMIO CPU spin then a single ci read — KVM completes in
+ * microseconds, so this usually finishes without a VM-exit storm or a context
+ * switch. Slow path: block until ahci_irq() wakes us; scheduler_wait_prepare_
+ * timeout re-checks ci after publishing BLOCKED (so a completion racing the
+ * block is never lost) and the watchdog deadline re-polls if an interrupt is
+ * ever lost. Before the scheduler is live (boot-time identify) or from an
+ * IRQs-off caller, fall back to the original cooperative yield-poll. */
+static void ahci_wait_ci_clear(struct ahci_port_state *port,
+                               volatile struct ahci_port *p, u32 slot_mask,
                                const char *what, int port_num) {
+  /* Fast path: FINE-grained spin+check (a single huge spin overshoots the µs KVM
+   * completion — origin/main found a 20000-pause spin is ~1 ms and capped
+   * throughput ~200 MB/s). A handful of short spin+check rounds detect a
+   * just-completed command almost immediately with no context switch. */
+  for (int round = 0; round < 16; round++) {
+    for (int i = 0; i < 256; i++)
+      __asm__ volatile("pause");
+    if (!(p->ci & slot_mask))
+      return;
+  }
+
   u64 spins = 0;
   while (p->ci & slot_mask) {
-    /* Poll the completion register at FINE granularity. Under KVM a command
-     * finishes in microseconds, so the key is to detect that quickly rather than
-     * overshoot: a single 20000-`pause` spin is ~1 ms on a modern CPU (pause ≈
-     * 140 cycles) — far longer than the actual completion, which capped
-     * throughput near ~200 MB/s though the host device is RAM-fast. Do a handful
-     * of short spin+check rounds (each ~a few µs, one MMIO read = one VM-exit) so
-     * a just-completed command is seen almost immediately, and only fall back to
-     * a scheduler yield if it is still pending after the burst. */
-    int detected = 0;
-    for (int round = 0; round < 16 && !detected; round++) {
-      for (int i = 0; i < 256; i++)
-        __asm__ volatile("pause");
-      if (!(p->ci & slot_mask))
-        detected = 1;
+    if (!scheduler_can_block()) {
+      /* Early boot (no scheduler) / IRQs-off caller: same fine-grained poll,
+       * then a cooperative yield — never the interrupt-driven block. */
+      int detected = 0;
+      for (int round = 0; round < 16 && !detected; round++) {
+        for (int i = 0; i < 256; i++)
+          __asm__ volatile("pause");
+        if (!(p->ci & slot_mask))
+          detected = 1;
+      }
+      if (detected)
+        break;
+      if (spins == 10000000ULL) {
+        console_write("ahci: port ");
+        console_write_dec(port_num);
+        console_write(" ");
+        console_write(what);
+        console_write(" still pending after timeout; waiting to preserve DMA buffer lifetime\n");
+      }
+      scheduler_yield();
+      spins++;
+      continue;
     }
-    if (detected)
+    /* Normal path: block until ahci_irq() wakes us; the watchdog deadline
+     * re-checks ci so a lost interrupt degrades to a re-poll, never a wedge. */
+    scheduler_wait_prepare_timeout(port, AHCI_IO_WATCHDOG_TICKS);
+    if (!(p->ci & slot_mask)) {
+      scheduler_wait_cancel();
       break;
-    if (spins == 10000000ULL) {
-      console_write("ahci: port ");
-      console_write_dec(port_num);
-      console_write(" ");
-      console_write(what);
-      console_write(" still pending after timeout; waiting to preserve DMA buffer lifetime\n");
     }
-    scheduler_yield();
-    spins++;
+    scheduler_wait_commit();
   }
 }
 
@@ -203,7 +259,7 @@ static int ahci_port_read(struct ahci_port_state *port, u64 lba, u32 count,
 
   // Wait for completion. Once issued, never return while DMA may still target
   // the caller's buffer.
-  ahci_wait_ci_clear(p, 1, "read", port->port_num);
+  ahci_wait_ci_clear(port, p, 1, "read", port->port_num);
 
   // Check for errors
   u32 tfd = p->tfd;
@@ -275,7 +331,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   p->serr = p->serr;
   p->ci = (1 << 1); // Issue slot 1
 
-  ahci_wait_ci_clear(p, (1 << 1), "write", port->port_num);
+  ahci_wait_ci_clear(port, p, (1 << 1), "write", port->port_num);
 
   // Flush cache
   memset(cmd_table->cfis, 0, 64);
@@ -290,7 +346,7 @@ static int ahci_port_write(struct ahci_port_state *port, u64 lba, u32 count,
   memset(&cmd_table->prdt[0], 0, sizeof(struct ahci_prdt_entry));
 
   p->ci = (1 << 1);
-  ahci_wait_ci_clear(p, (1 << 1), "flush", port->port_num);
+  ahci_wait_ci_clear(port, p, (1 << 1), "flush", port->port_num);
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
@@ -387,6 +443,13 @@ static void ahci_port_init(struct ahci_port_state *port,
   p->cmd |= AHCI_PxCMD_FRE;
   p->cmd |= AHCI_PxCMD_ST;
 
+  /* M70: clear any stale port interrupt status (RW1C) and enable per-port
+   * interrupts so a command completion raises the controller's INTx line. The
+   * global GHC.IE bit and the IRQ handler registration are set up once in
+   * ahci_init() after all ports are configured. */
+  p->is = p->is;
+  p->ie = 0xFFFFFFFF;
+
   port->present = 1;
 
   console_write("ahci: port ");
@@ -436,7 +499,7 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   p->serr = p->serr;
   p->ci = 1;
 
-  ahci_wait_ci_clear(p, 1, "identify", port->port_num);
+  ahci_wait_ci_clear(port, p, 1, "identify", port->port_num);
 
   u32 tfd = p->tfd;
   if (tfd & 0x01) {
@@ -480,10 +543,15 @@ void ahci_init(void) {
   }
 
   // Get BAR5 (ABAR - AHCI Base Address Register)
-  // First, enable memory space and bus mastering
+  // First, enable memory space and bus mastering; clear the INTx Disable bit
+  // (bit 10) so the controller can raise legacy interrupts (M70).
   u16 command = pci_config_read16(pci.bus, pci.slot, pci.func, 0x04);
-  command |= 0x06; // Bus Master + Memory Space
+  command |= 0x06;     // Bus Master + Memory Space
+  command &= ~0x0400;  // clear Interrupt Disable
   pci_config_write16(pci.bus, pci.slot, pci.func, 0x04, command);
+
+  // Legacy interrupt line for the controller (M70: completion IRQ).
+  u8 ahci_irq_line = pci_config_read8(pci.bus, pci.slot, pci.func, 0x3C);
 
   u32 bar5_low = pci_config_read32(pci.bus, pci.slot, pci.func, 0x24);
   u32 bar5_high = pci_config_read32(pci.bus, pci.slot, pci.func, 0x28);
@@ -598,6 +666,18 @@ void ahci_init(void) {
         ahci_device_count++;
       }
     }
+  }
+
+  /* M70: enable interrupt-driven completion. Per-port PxIE was set in
+   * ahci_port_init; now clear the global interrupt status, enable GHC.IE, then
+   * register the handler and unmask the line. Doing this last means any stale
+   * IS bits from boot-time identify are acked by the first delivered IRQ rather
+   * than lost, and no IRQ reaches the CPU until the handler is in place. */
+  if (ahci_device_count > 0) {
+    ahci_bar->is = ahci_bar->is; /* RW1C: clear stale global pending bits */
+    ahci_bar->ghc |= AHCI_GHC_IE;
+    irq_register_handler(ahci_irq_line, ahci_irq, (void *)ahci_bar);
+    irq_unmask(ahci_irq_line);
   }
 
   console_write("ahci: initialized with ");

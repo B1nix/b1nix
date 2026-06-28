@@ -1,11 +1,18 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
 #include <b1nix/io.h>
+#include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/pci.h>
 #include <b1nix/sched.h>
 #include <b1nix/types.h>
 #include <b1nix/virtio.h>
+
+/* M70: watchdog deadline (in 10 ms scheduler ticks) for a blocked I/O wait. The
+ * completion IRQ wakes the waiter on the common path; this only bounds the stall
+ * if an interrupt is ever lost, degrading to a periodic re-poll instead of a
+ * wedge. Never reached on a healthy device. */
+#define VIRTIO_BLK_IO_WATCHDOG_TICKS 50
 
 #define VIRTIO_VENDOR_ID 0x1AF4
 #define VIRTIO_BLK_DEVICE_ID 0x1001
@@ -46,6 +53,19 @@ static void virtio_blk_lock(struct virtio_blk_instance *inst) {
 
 static void virtio_blk_unlock(struct virtio_blk_instance *inst) {
   __sync_lock_release(&inst->busy);
+}
+
+/* M70: completion interrupt handler. Runs in IRQ context — read the device ISR
+ * (which deasserts the level-triggered line), and if this device posted a used
+ * buffer, wake the task blocked in do_virtio_blk_req(). The instance pointer is
+ * the wait channel. Returns 1 if the interrupt was ours (shared-line aware). */
+static int virtio_blk_irq(void *ctx) {
+  struct virtio_blk_instance *inst = (struct virtio_blk_instance *)ctx;
+  u8 isr = virtio_read_isr(&inst->dev); /* read clears the ISR status */
+  if (!(isr & 0x1))
+    return 0; /* not a used-buffer notification from this device */
+  scheduler_wake_all(inst);
+  return 1;
 }
 
 /* Append one logical buffer region to the virtqueue descriptor chain, split at
@@ -132,17 +152,29 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
 
   virtq_kick(&inst->dev, &inst->vq);
 
-  /* The used ring lives in host RAM (the device DMAs completions into it), so
-   * polling it is a plain memory read, not an MMIO VM-exit. Spin on it briefly
-   * before yielding — under KVM the request completes in microseconds and
-   * yielding on the first not-done pays a full scheduler round-trip per
-   * request, capping throughput far below the device. */
-  while (inst->vq.used->idx == inst->vq.last_used_idx) {
-    for (int s = 0; s < 4096 && inst->vq.used->idx == inst->vq.last_used_idx; s++)
-      __asm__ volatile("pause");
+  /* Wait for the device to post the used buffer. Fast path: a brief in-RAM spin
+   * (used->idx is DMA'd into memory, no MMIO) catches the sub-µs KVM completion
+   * with no context switch. Slow path: block until virtio_blk_irq() wakes us;
+   * scheduler_wait_prepare_timeout re-checks the predicate after publishing
+   * BLOCKED so a completion racing the block is never lost, and the watchdog
+   * deadline bounds a genuinely-lost interrupt to a re-poll. Before the
+   * scheduler is live (early-boot root mount) we cooperatively yield-poll. */
+  for (int i = 0; i < 4000; i++) {
     if (inst->vq.used->idx != inst->vq.last_used_idx)
       break;
-    scheduler_yield();
+    __asm__ volatile("pause");
+  }
+  while (inst->vq.used->idx == inst->vq.last_used_idx) {
+    if (!scheduler_can_block()) {
+      scheduler_yield();
+      continue;
+    }
+    scheduler_wait_prepare_timeout(inst, VIRTIO_BLK_IO_WATCHDOG_TICKS);
+    if (inst->vq.used->idx != inst->vq.last_used_idx) {
+      scheduler_wait_cancel();
+      break;
+    }
+    scheduler_wait_commit();
   }
 
   __sync_synchronize();
@@ -246,7 +278,13 @@ void virtio_blk_init(void) {
       dev_idx++;
       continue;
     }
-    inst->vq.avail->flags = VRING_AVAIL_F_NO_INTERRUPT;
+    /* M70: leave the avail ring's interrupt enabled (no VRING_AVAIL_F_NO_INTERRUPT)
+     * so the device raises a completion IRQ instead of us busy-polling used->idx.
+     * Register the handler and unmask the line before DRIVER_OK so we never miss
+     * the first completion. */
+    inst->vq.avail->flags = 0;
+    irq_register_handler(inst->dev.irq, virtio_blk_irq, inst);
+    irq_unmask(inst->dev.irq);
 
     virtio_set_status(&inst->dev,
                       virtio_get_status(&inst->dev) | VIRTIO_STATUS_DRIVER_OK);

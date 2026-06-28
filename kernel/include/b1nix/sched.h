@@ -392,8 +392,12 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
 /* Monotonic scheduler tick counter (10 ms cadence). */
 u64 scheduler_get_ticks(void);
 void scheduler_wait_prepare(void *chan);
+void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks);
 void scheduler_wait_commit(void);
 void scheduler_wait_cancel(void);
+/* True when the current context may park on a wait channel (scheduler live, real
+ * task context, interrupts enabled). Drivers fall back to polling when false. */
+int scheduler_can_block(void);
 void scheduler_wake_task(usize task_id);
 void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);

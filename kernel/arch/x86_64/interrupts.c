@@ -5,6 +5,7 @@
 #include <b1nix/gdbstub.h>
 #include <b1nix/io.h>
 #include <b1nix/ioapic.h>
+#include <b1nix/irq.h>
 #include <b1nix/klog.h>
 
 /* M35: ELF core dump on fatal fault (kernel/arch/x86_64/coredump.c). */
@@ -255,6 +256,48 @@ void x86_pic_init(void) {
   outb(PIC2_DATA, 0xff);
 }
 
+/* ── Generic device-IRQ dispatch (M70) ──────────────────────────────────────
+ * A small table keyed by legacy IRQ line (0..15). Block/DMA drivers register a
+ * completion handler here instead of bolting a vector into the dispatcher. PCI
+ * lines are shared, so each line holds a few sharers and every registered
+ * handler is called; the handler reports whether its device raised the IRQ. */
+#define IRQ_LINES 16
+#define IRQ_SHARERS 4
+struct irq_action {
+  irq_handler_fn fn;
+  void *ctx;
+};
+static struct irq_action g_irq_actions[IRQ_LINES][IRQ_SHARERS];
+
+int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+  if (irq >= IRQ_LINES || fn == 0)
+    return -1;
+  for (int i = 0; i < IRQ_SHARERS; i++) {
+    if (g_irq_actions[irq][i].fn == 0) {
+      g_irq_actions[irq][i].ctx = ctx;
+      /* Publish ctx before fn so the dispatcher (possibly on another CPU)
+       * never sees a handler with a stale/NULL context. */
+      __atomic_store_n(&g_irq_actions[irq][i].fn, fn, __ATOMIC_RELEASE);
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int irq_dispatch(int irq) {
+  if (irq < 0 || irq >= IRQ_LINES)
+    return 0;
+  int handled = 0;
+  for (int i = 0; i < IRQ_SHARERS; i++) {
+    irq_handler_fn fn = __atomic_load_n(&g_irq_actions[irq][i].fn, __ATOMIC_ACQUIRE);
+    if (fn)
+      handled |= fn(g_irq_actions[irq][i].ctx);
+  }
+  return handled;
+}
+
+void irq_unmask(u8 irq) { x86_pic_unmask(irq); }
+
 void x86_pic_unmask(u8 irq) {
   /* IOAPIC mode: program a redirection entry instead of poking the (now
    * masked) 8259. Default to PCI semantics — level-triggered, active-low —
@@ -398,11 +441,20 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
   }
   if (frame->vector >= 32 && frame->vector <= 47) {
     int irq = frame->vector - 32;
+    int handled = 0;
     if (irq == net_get_irq()) {
       net_interrupt_handler();
-      irq_eoi(frame->vector);
-      return;
+      handled = 1;
     }
+    /* M70: registered block/DMA device handlers (AHCI, virtio-blk, NVMe).
+     * Lines are shared, so always consult the table even after net claimed it. */
+    handled |= irq_dispatch(irq);
+    irq_eoi(frame->vector);
+    /* A level-triggered PCI line that no driver claimed is a benign shared-IRQ
+     * artifact — stay silent rather than spam the console. Genuinely stray
+     * vectors outside the device range still get the diagnostic below. */
+    (void)handled;
+    return;
   }
 
   console_write("\nIRQ: unexpected vector 0x");

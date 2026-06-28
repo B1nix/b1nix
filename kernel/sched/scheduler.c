@@ -2093,13 +2093,48 @@ void scheduler_wait_prepare(void *chan) {
 
 void scheduler_wait_commit(void) {
   scheduler_yield();
+  /* Drop any unfired deadline armed by scheduler_wait_prepare_timeout: an
+   * explicit wake_all may have resumed us before it elapsed, and a stale
+   * wake_tick would otherwise leak into a later untimed block (scheduler_block_on
+   * never re-arms it). Mirrors scheduler_block_on_timeout's post-yield clear. */
+  current_task->wake_tick = 0;
   interrupts_enable();
 }
 
 void scheduler_wait_cancel(void) {
   current_task->wait_chan = 0;
+  current_task->wake_tick = 0;
   current_task->state = TASK_RUNNING;
   interrupts_enable();
+}
+
+/* Like scheduler_wait_prepare but also arms a timer deadline, so wake_sleepers()
+ * (run from the timer ISR) promotes the task back to READY even if the explicit
+ * wake never arrives. This combines the race-free check-then-block window of the
+ * prepare/commit pattern with the lost-wakeup safety net of a timeout — exactly
+ * what an interrupt-driven device-completion wait wants: the IRQ handler's
+ * scheduler_wake_all(chan) resumes us immediately on the common path, while the
+ * deadline guarantees forward progress if an interrupt is ever genuinely lost
+ * (or the controller never raises one). timeout_ticks == 0 means no deadline. */
+void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
+  interrupts_disable();
+  if (current_task == 0)
+    panic("scheduler_wait_prepare_timeout without running task");
+  current_task->wait_chan = chan;
+  if (timeout_ticks)
+    current_task->wake_tick = scheduler_ticks + timeout_ticks;
+  current_task->stack_released = 0;
+  __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* True when the current context can safely park on a wait channel: the scheduler
+ * is live, we are running inside a real task (not the early single-stack boot
+ * path before the first context switch), and interrupts are enabled so a device
+ * IRQ can actually wake us. Drivers that block on I/O completion fall back to a
+ * cooperative poll loop when this is false (early boot, IRQs-off callers). */
+int scheduler_can_block(void) {
+  return scheduler_started && current_task != 0 && interrupts_enabled();
 }
 
 void scheduler_wake_all(void *chan) {
