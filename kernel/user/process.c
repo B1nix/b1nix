@@ -34,6 +34,12 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define PT_NOTE    4
 #define PT_TLS     7
 
+/* ELF program-header p_flags bits. The demand-paged loader keys on PF_W: a
+ * read-only segment can be shared from the page cache, a writable one cannot. */
+#define PF_X 0x1
+#define PF_W 0x2
+#define PF_R 0x4
+
 /* M40 — Linux personality detection. EI_OSABI is e_ident byte 7; Linux/GNU
  * binaries set it to ELFOSABI_LINUX or carry a GNU NT_GNU_ABI_TAG note whose
  * first descriptor word (the OS) is GNU_ABI_OS_LINUX. b1nix's own freestanding
@@ -249,20 +255,20 @@ static int elf64_str_at_equals(struct user_loaded_image *image, u64 va,
 
 static int elf64_parse_dynamic(struct user_loaded_image *image,
                                struct elf64_dyn_object *obj,
-                               const struct elf64_ehdr *ehdr,
-                               const char *file_data, usize file_size)
+                               const struct elf64_phdr *phdrs, u16 phnum)
 {
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph =
-        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                                    (u64)i * ehdr->e_phentsize);
+  for (u16 i = 0; i < phnum; i++) {
+    const struct elf64_phdr *ph = &phdrs[i];
     if (ph->p_type != PT_DYNAMIC)
       continue;
-    if (ph->p_offset + ph->p_filesz < ph->p_offset ||
-        ph->p_offset + ph->p_filesz > file_size)
+    /* The PT_DYNAMIC contents live inside an already-staged PT_LOAD, so read the
+     * DT array out of the staging buffer by vaddr (obj->base + p_vaddr) rather
+     * than from a whole-file copy — the streaming loader no longer keeps one.
+     * elf64_stage_ptr bounds the p_filesz span against the staged segment. */
+    const struct elf64_dyn *dyn = (const struct elf64_dyn *)elf64_stage_ptr(
+        image, obj->base + ph->p_vaddr, ph->p_filesz);
+    if (!dyn)
       return -1;
-    const struct elf64_dyn *dyn =
-        (const struct elf64_dyn *)(file_data + ph->p_offset);
     usize count = ph->p_filesz / sizeof(*dyn);
     for (usize d = 0; d < count && dyn[d].d_tag != DT_NULL; d++) {
       switch (dyn[d].d_tag) {
@@ -283,7 +289,6 @@ static int elf64_parse_dynamic(struct user_loaded_image *image,
     }
     return 0;
   }
-  (void)image;
   return 0;
 }
 
@@ -364,7 +369,12 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     }
     break;
   }
-  int rc = elf64_parse_dynamic(image, obj, ehdr, data, size);
+  /* The .so's PT_LOAD segments are already staged above, so parse_dynamic reads
+   * its DT array from staging by vaddr; we only need to hand it the phdr table
+   * (validated phentsize == sizeof above). */
+  int rc = elf64_parse_dynamic(
+      image, obj, (const struct elf64_phdr *)(data + ehdr->e_phoff),
+      ehdr->e_phnum);
   kfree(data);
   return rc;
 }
@@ -472,6 +482,20 @@ static int elf64_resolve_tls_symbol(struct user_loaded_image *image,
   return -1;
 }
 
+/* Clear demand_ok on whichever segment contains virtual address `va` — called
+ * for every relocation write target so a segment the in-kernel linker modifies
+ * is never demand-paged from the now-stale file. Relocation targets always land
+ * in the writable GOT/PLT/data segment, so this is a correctness safety net. */
+static void elf64_mark_seg_dirty(struct user_loaded_image *image, u64 va) {
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *s = &image->segments[i];
+    if (va >= s->vaddr && va < s->vaddr + s->memsz) {
+      s->demand_ok = 0;
+      return;
+    }
+  }
+}
+
 static int elf64_apply_rela_table(struct user_loaded_image *image,
                                   struct elf64_dyn_object *objects,
                                   usize object_count, usize owner,
@@ -501,6 +525,8 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
         image, objects[owner].base + rela->r_offset, sizeof(u64));
     if (!target && type != R_X86_64_COPY)
       return -1;
+    if (type != R_X86_64_COPY)
+      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
     if (type == R_X86_64_RELATIVE) {
       *target = objects[owner].base + (u64)rela->r_addend;
       continue;
@@ -564,6 +590,7 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
       if (!dstp || !srcp)
         return -1;
       memcpy(dstp, srcp, (usize)sz);
+      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
       continue;
     }
     /* R_X86_64_TPOFF64: thread-pointer-relative offset of a __thread variable
@@ -816,49 +843,85 @@ static int user_image_read_vfs_file(const char *path, char **out_data,
   return 0;
 }
 
+/* Read exactly `n` bytes at absolute file offset `off` from an open fd into
+ * `buf`. The streaming ELF loader (user_load_elf64) uses this to copy each
+ * PT_LOAD segment straight from the file into its staging buffer WITHOUT ever
+ * holding a whole-file copy in the kernel heap. That halves the per-exec load
+ * transient — a 94 MB clang previously needed file_data (94 MB) + the staged
+ * segments (~94 MB) resident simultaneously (~188 MB), which is exactly what
+ * made the low-RAM self-host (e.g. 512 MB) thrash the page-cache evictor. Now
+ * only the ~94 MB of staging is live. Handles short reads and the non-blocking
+ * EAGAIN the VFS can return. Returns 0 on success, -1 otherwise. */
+static int user_read_at(int fd, u64 off, void *buf, usize n) {
+  if (n == 0)
+    return 0;
+  if (vfs_lseek(fd, (isize)off, 0 /* SEEK_SET */) < 0)
+    return -1;
+  usize done = 0;
+  char *p = (char *)buf;
+  while (done < n) {
+    isize got = vfs_read(fd, p + done, n - done);
+    if (got < 0) {
+      if (got == -EAGAIN || got == -EWOULDBLOCK) {
+        scheduler_yield();
+        continue;
+      }
+      return -1;
+    }
+    if (got == 0)
+      return -1; /* unexpected EOF inside a declared segment */
+    done += (usize)got;
+  }
+  return 0;
+}
+
 /* M40 — decide whether an ELF64 image is a Linux binary. Two independent
  * signals, either of which is conclusive:
  *   1. EI_OSABI (e_ident[7]) == ELFOSABI_LINUX.
  *   2. A PT_NOTE program header containing a GNU NT_GNU_ABI_TAG note whose first
  *      descriptor word (the OS) is GNU_ABI_OS_LINUX. This is what glibc-linked
  *      static Linux binaries carry; b1nix freestanding binaries never emit it.
- * Returns 1 for a Linux binary, 0 otherwise. All file accesses are bounds-checked
- * against file_size so a crafted note table cannot drive an OOB read. */
-static int elf64_is_linux_binary(const struct elf64_ehdr *ehdr,
-                                 const char *file_data, usize file_size) {
+ * Returns 1 for a Linux binary, 0 otherwise. The streaming loader passes the fd
+ * and the in-memory phdr table; each PT_NOTE segment is read from the file into
+ * a small bounded buffer, so a crafted note table cannot drive an OOB read. */
+static int elf64_is_linux_binary(int fd, const struct elf64_ehdr *ehdr,
+                                 const struct elf64_phdr *phdrs) {
   if (ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX)
     return 1;
 
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph =
-        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                                    (u64)i * ehdr->e_phentsize);
+    const struct elf64_phdr *ph = &phdrs[i];
     if (ph->p_type != PT_NOTE)
       continue;
-    if (ph->p_offset + ph->p_filesz < ph->p_offset ||
-        ph->p_offset + ph->p_filesz > file_size)
+    /* GNU ABI-tag notes are tiny; read a bounded prefix of the note segment
+     * into a stack buffer and walk it. A note past this prefix cannot be the
+     * leading ABI tag, and the OSABI check above is the primary signal. */
+    unsigned char nb[512];
+    u64 end = ph->p_filesz < sizeof(nb) ? ph->p_filesz : sizeof(nb);
+    if (end < 12)
+      continue;
+    if (user_read_at(fd, ph->p_offset, nb, (usize)end) != 0)
       continue;
     /* Walk the note records: [namesz(4)][descsz(4)][type(4)][name, 4-aligned]
-     * [desc, 4-aligned]. */
-    u64 off = ph->p_offset;
-    u64 end = ph->p_offset + ph->p_filesz;
+     * [desc, 4-aligned]. Offsets are relative to the buffer start. */
+    u64 off = 0;
     while (off + 12 <= end) {
-      u32 namesz = *(const u32 *)(file_data + off);
-      u32 descsz = *(const u32 *)(file_data + off + 4);
-      u32 type = *(const u32 *)(file_data + off + 8);
+      u32 namesz = *(const u32 *)(nb + off);
+      u32 descsz = *(const u32 *)(nb + off + 4);
+      u32 type = *(const u32 *)(nb + off + 8);
       u64 name_off = off + 12;
       u64 name_pad = ((u64)namesz + 3) & ~3ULL;
       u64 desc_off = name_off + name_pad;
       u64 desc_pad = ((u64)descsz + 3) & ~3ULL;
       u64 next = desc_off + desc_pad;
-      if (next < off || next > end) /* malformed / wrap */
+      if (next < off || next > end) /* malformed / wrap / past buffer */
         break;
       if (type == NT_GNU_ABI_TAG && namesz == 4 && descsz >= 4 &&
           name_off + 4 <= end &&
-          file_data[name_off] == 'G' && file_data[name_off + 1] == 'N' &&
-          file_data[name_off + 2] == 'U' && file_data[name_off + 3] == '\0' &&
+          nb[name_off] == 'G' && nb[name_off + 1] == 'N' &&
+          nb[name_off + 2] == 'U' && nb[name_off + 3] == '\0' &&
           desc_off + 4 <= end) {
-        u32 os = *(const u32 *)(file_data + desc_off);
+        u32 os = *(const u32 *)(nb + desc_off);
         if (os == GNU_ABI_OS_LINUX)
           return 1;
       }
@@ -869,34 +932,33 @@ static int elf64_is_linux_binary(const struct elf64_ehdr *ehdr,
 }
 
 static int user_load_elf64(struct user_loaded_image *image, const char *path) {
-  char *file_data = 0;
-  usize file_size = 0;
-  if (user_image_read_vfs_file(path, &file_data, &file_size) != 0)
+  int rc = -1;
+  struct elf64_phdr *phdrs = 0;
+  int fd = vfs_open(path);
+  if (fd < 0)
     return -1;
-  if (file_size < sizeof(struct elf64_ehdr)) {
-    kfree(file_data);
-    return -1;
-  }
 
-  struct elf64_ehdr *ehdr = (struct elf64_ehdr *)file_data;
+  /* Stream the image instead of slurping the whole file into the heap: read the
+   * ELF header, then the program-header table, then copy each PT_LOAD straight
+   * into its staging buffer via user_read_at(). A 94 MB clang therefore never
+   * holds file_data (94 MB) + staging (~94 MB) resident at once — only the
+   * staging — which is what kept the 512 MB self-host from OOMing on a single
+   * ~57 MB .text segment allocation. All error paths jump to `cleanup`. */
+  struct elf64_ehdr ehdr_storage;
+  struct elf64_ehdr *ehdr = &ehdr_storage;
+  if (user_read_at(fd, 0, ehdr, sizeof(*ehdr)) != 0)
+    goto cleanup;
+
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
-      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN) {
-    kfree(file_data);
-    return -1;
-  }
+      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3)
+    goto cleanup;
+  if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE)
+    goto cleanup;
+  if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN)
+    goto cleanup;
   if (ehdr->e_machine != ELF_MACHINE_X86_64 &&
-      ehdr->e_machine != ELF_MACHINE_AARCH64) {
-    kfree(file_data);
-    return -1;
-  }
+      ehdr->e_machine != ELF_MACHINE_AARCH64)
+    goto cleanup;
   /* Architecture match against the running kernel. A binary built for a
    * different CPU cannot execute; report the mismatch explicitly instead of
    * silently failing or — worse — attempting to run it. This is exactly the
@@ -909,39 +971,35 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     console_write(") on x86_64 kernel, refusing: ");
     console_write(path);
     console_write("\n");
-    kfree(file_data);
-    return -1;
+    goto cleanup;
   }
 #else
   console_write("ELF load: ARCH MISMATCH — 64-bit binary on 32-bit kernel, "
                 "refusing: ");
   console_write(path);
   console_write("\n");
-  kfree(file_data);
-  return -1;
+  goto cleanup;
 #endif
-  /* The primary entry point must validate e_phentsize like the shared-object
-   * loader already does: with a small/zero phentsize the phdr-walk casts would
-   * read sizeof(struct elf64_phdr) bytes per slot past the kmalloc(file_size)
-   * buffer. Use subtraction-form bounds so a huge e_phoff cannot wrap the sum
-   * below file_size and slip a wild pointer through the check (R4-4). */
-  if (ehdr->e_phentsize != sizeof(struct elf64_phdr)) {
-    kfree(file_data);
-    return -1;
-  }
-  if (ehdr->e_phoff > file_size ||
-      (u64)ehdr->e_phentsize * ehdr->e_phnum > file_size - ehdr->e_phoff) {
-    kfree(file_data);
-    return -1;
-  }
+  /* phentsize must match so phdr-table reads and `&phdrs[i]` indexing are
+   * well-formed; e_phnum must be non-zero for an executable. */
+  if (ehdr->e_phentsize != sizeof(struct elf64_phdr) || ehdr->e_phnum == 0)
+    goto cleanup;
+
+  /* Read the program-header table. A file truncated before the declared table
+   * makes user_read_at fail here — this replaces the old file_size bound. */
+  phdrs = kmalloc((usize)ehdr->e_phnum * sizeof(struct elf64_phdr));
+  if (!phdrs)
+    goto cleanup;
+  if (user_read_at(fd, ehdr->e_phoff, phdrs,
+                   (usize)ehdr->e_phnum * sizeof(struct elf64_phdr)) != 0)
+    goto cleanup;
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
 
-  /* M40: tag the binary personality (e_phoff/e_phentsize already validated
-   * above, so the note walk is in-bounds). A Linux binary gets its syscall
-   * numbers translated at dispatch time. */
-  if (elf64_is_linux_binary(ehdr, file_data, file_size)) {
+  /* M40: tag the binary personality. A Linux binary gets its syscall numbers
+   * translated at dispatch time. */
+  if (elf64_is_linux_binary(fd, ehdr, phdrs)) {
     image->personality = PERSONALITY_LINUX;
     console_write("ELF load: Linux personality detected: ");
     console_write(path);
@@ -977,53 +1035,90 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * loading, symbol resolution, and relocation eagerly before entering user
    * mode rather than handing control to a separate ld.so process. */
   for (u16 j = 0; j < ehdr->e_phnum; j++) {
-    struct elf64_phdr *p =
-        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)j * ehdr->e_phentsize));
+    struct elf64_phdr *p = &phdrs[j];
     if (p->p_type != PT_INTERP) continue;
-    if (p->p_offset + p->p_filesz < p->p_offset ||
-        p->p_offset + p->p_filesz > file_size) continue;
     char interp[64];
     usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
                                               : sizeof(interp) - 1;
-    memcpy(interp, file_data + p->p_offset, ilen);
+    if (user_read_at(fd, p->p_offset, interp, ilen) != 0)
+      continue;
     interp[ilen] = '\0';
     console_write("ELF load: PT_INTERP=");
     console_write(interp);
     console_write(" (eager in-kernel dynamic linking)\n");
   }
 
+  /* Demand-paging eligibility (self-host RAM floor). An ET_EXEC (load_base == 0)
+   * backed by a real filesystem (its inode has a read_cb, so pages can be read
+   * back on a fault) has its read-only PT_LOAD segments faulted in lazily from
+   * the page cache instead of pinned in private frames — so the 94 MB self-host
+   * clang's resident set is its touched working set, not the whole binary. The
+   * dynamic linker still stages every segment (to read symtab/strtab + patch the
+   * GOT/PLT); user_run_elf_image then maps the read-only ones file-backed and
+   * frees their staging. PIE/ET_DYN (load_base != 0) is excluded — its read-only
+   * segments get relocated. initramfs (no read_cb) stays eager. Guards: every
+   * PT_LOAD page-congruent; no RO/RW page sharing; the reloc pass clears
+   * demand_ok for any segment it writes into. */
+  int has_dynamic = 0;
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    if (phdrs[i].p_type == PT_DYNAMIC) { has_dynamic = 1; break; }
+  }
+  int demand_page = (load_base == 0);
+  for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
+    struct elf64_phdr *a = &phdrs[i];
+    if (a->p_type != PT_LOAD)
+      continue;
+    if ((a->p_vaddr & (PAGE_SIZE - 1)) != (a->p_offset & (PAGE_SIZE - 1))) {
+      demand_page = 0;
+      break;
+    }
+    u64 a_lo = a->p_vaddr & ~(PAGE_SIZE - 1);
+    u64 a_hi = (a->p_vaddr + a->p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+    for (u16 j = 0; j < ehdr->e_phnum; j++) {
+      struct elf64_phdr *b = &phdrs[j];
+      if (j == i || b->p_type != PT_LOAD)
+        continue;
+      if (((a->p_flags ^ b->p_flags) & PF_W) == 0)
+        continue;
+      u64 b_lo = b->p_vaddr & ~(PAGE_SIZE - 1);
+      u64 b_hi = (b->p_vaddr + b->p_memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+      if (a_lo < b_hi && b_lo < a_hi) {
+        demand_page = 0;
+        break;
+      }
+    }
+  }
+  if (demand_page) {
+    struct vfs_node *en = vfs_find_node(path);
+    if (!en || IS_ERR(en) || !en->inode || !en->inode->read_cb) {
+      if (en && !IS_ERR(en))
+        vfs_node_put(en);
+      demand_page = 0; /* initramfs / no backing -> eager */
+    } else {
+      image->exe_node = en;
+    }
+  }
+  image->demand_paged = demand_page;
+
   /* First pass: PT_LOAD segments. Vaddrs are offset by `load_base` for
    * PIE; this also offsets any later relocation targets we compute. */
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    struct elf64_phdr *phdr =
-        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)i * ehdr->e_phentsize));
+    struct elf64_phdr *phdr = &phdrs[i];
     if (phdr->p_type != PT_LOAD)
       continue;
-    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS) {
-      kfree(file_data);
-      return -1;
-    }
-    if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
-        phdr->p_offset + phdr->p_filesz > file_size ||
-        phdr->p_filesz > phdr->p_memsz) {
-      kfree(file_data);
-      return -1;
-    }
+    if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS)
+      goto cleanup;
+    if (phdr->p_filesz > phdr->p_memsz)
+      goto cleanup;
     u64 reloc_vaddr = phdr->p_vaddr + load_base;
     if (reloc_vaddr + phdr->p_memsz < reloc_vaddr ||
-        reloc_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL) {
-      kfree(file_data);
-      return -1;
-    }
+        reloc_vaddr + phdr->p_memsz > 0x00007FFFFFFFFFFFULL)
+      goto cleanup;
     /* Cap p_memsz before kzalloc: the project rule is OOM = panic, so a crafted
      * multi-GiB p_memsz (well under the vaddr ceiling above) would turn a merely
      * unloadable file into a kernel panic (R4-10). */
-    if (phdr->p_memsz > USER_IMAGE_MAX_SEGMENT) {
-      kfree(file_data);
-      return -1;
-    }
+    if (phdr->p_memsz > USER_IMAGE_MAX_SEGMENT)
+      goto cleanup;
 
     struct user_image_segment *segment =
         &image->segments[image->segment_count++];
@@ -1031,17 +1126,23 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     segment->memsz = phdr->p_memsz;
     segment->filesz = phdr->p_memsz;
     segment->flags = phdr->p_flags;
+    segment->file_offset = phdr->p_offset;
+    segment->demand_ok = (u8)(demand_page && !(phdr->p_flags & PF_W) &&
+                              phdr->p_filesz == phdr->p_memsz &&
+                              (phdr->p_vaddr & (PAGE_SIZE - 1)) == 0);
 
     /* Relocations may target .bss or the zero-filled tail of a PT_LOAD, so the
      * staging image must cover p_memsz, not only the bytes present on disk. */
     if (phdr->p_memsz > 0) {
       segment->data = kzalloc(phdr->p_memsz);
-      if (!segment->data) {
-        kfree(file_data);
-        return -1;
-      }
-      if (phdr->p_filesz)
-        memcpy(segment->data, file_data + phdr->p_offset, phdr->p_filesz);
+      if (!segment->data)
+        goto cleanup;
+      /* Copy the on-disk bytes straight from the file into staging; the tail
+       * (p_memsz - p_filesz) stays zero for .bss. A segment that claims more
+       * file bytes than exist makes user_read_at fail (short read / EOF). */
+      if (phdr->p_filesz &&
+          user_read_at(fd, phdr->p_offset, segment->data, phdr->p_filesz) != 0)
+        goto cleanup;
     } else {
       segment->data = 0;
     }
@@ -1052,14 +1153,10 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * std::call_once (e.g. Mesa via util_call_once_data_slow's `mov %fs:0,%rax`)
    * derefs a zero FS base and SIGSEGVs before main does any real work. */
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    struct elf64_phdr *phdr =
-        (struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                              ((u64)i * ehdr->e_phentsize));
+    struct elf64_phdr *phdr = &phdrs[i];
     if (phdr->p_type != PT_TLS)
       continue;
     if (phdr->p_filesz > phdr->p_memsz ||
-        phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
-        phdr->p_offset + phdr->p_filesz > file_size ||
         phdr->p_memsz > USER_IMAGE_MAX_SEGMENT)
       break; /* malformed — leave tls_memsz 0 (no TLS) */
     image->tls_memsz = phdr->p_memsz;
@@ -1067,8 +1164,12 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     image->tls_align = phdr->p_align ? phdr->p_align : 8;
     if (phdr->p_filesz) {
       image->tls_data = kmalloc(phdr->p_filesz);
-      if (image->tls_data)
-        memcpy(image->tls_data, file_data + phdr->p_offset, phdr->p_filesz);
+      if (image->tls_data &&
+          user_read_at(fd, phdr->p_offset, image->tls_data, phdr->p_filesz) !=
+              0) {
+        kfree(image->tls_data);
+        image->tls_data = 0;
+      }
     }
     break; /* at most one PT_TLS */
   }
@@ -1085,16 +1186,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * cross GCC links libgcc dynamically for the _Unwind_* exception symbols); the
    * kernel resolves that here against /lib/libgcc_s.so, shipped in the
    * initramfs. The PT_INTERP is informational — b1nix links eagerly in-kernel. */
-  int has_dynamic = 0;
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *p =
-        (const struct elf64_phdr *)(file_data + ehdr->e_phoff +
-                                    ((u64)i * ehdr->e_phentsize));
-    if (p->p_type == PT_DYNAMIC) {
-      has_dynamic = 1;
-      break;
-    }
-  }
+  /* has_dynamic was computed above for the demand-paging decision. */
   if (load_base != 0 || has_dynamic) {
     struct elf64_dyn_object objects[DYN_MAX_OBJECTS];
     memset(objects, 0, sizeof(objects));
@@ -1102,10 +1194,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     objects[0].base = load_base;
     objects[0].first_segment = 0;
     objects[0].segment_count = image->segment_count;
-    if (elf64_parse_dynamic(image, &objects[0], ehdr, file_data, file_size) != 0) {
-      kfree(file_data);
-      return -1;
-    }
+    if (elf64_parse_dynamic(image, &objects[0], phdrs, ehdr->e_phnum) != 0)
+      goto cleanup;
 
     /* Breadth-first load of the whole DT_NEEDED graph. We walk the `needed`
      * list of every object as it is added (not just the main executable's), so
@@ -1139,20 +1229,16 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     }
 
     for (usize o = 0; o < object_count; o++) {
-      if (objects[o].needed_count && !objects[o].strtab) {
-        kfree(file_data);
-        return -1;
-      }
+      if (objects[o].needed_count && !objects[o].strtab)
+        goto cleanup;
       for (usize n = 0; n < objects[o].needed_count; n++) {
         /* Bound the DT_NEEDED name into a local buffer before strchr/strlen —
          * the raw strtab pointer may run past its segment without a NUL (R4-8). */
         char name[96];
         if (!elf64_copy_str(image, objects[o].strtab + objects[o].needed[n], name,
                             sizeof(name)) ||
-            strchr(name, '/')) {
-          kfree(file_data);
-          return -1;
-        }
+            strchr(name, '/'))
+          goto cleanup;
         /* Already loaded? (dedup by name across the libraries, indices 1..) */
         int already = 0;
         for (usize k = 1; k < object_count; k++) {
@@ -1163,10 +1249,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         }
         if (already)
           continue;
-        if (object_count >= DYN_MAX_OBJECTS) {
-          kfree(file_data);
-          return -1;
-        }
+        if (object_count >= DYN_MAX_OBJECTS)
+          goto cleanup;
         usize name_len = strlen(name);
         char libpath[160];
         u64 lib_base = 0x0000600000000000ULL +
@@ -1184,10 +1268,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         }
         /* 2) system /lib */
         if (loaded != 0) {
-          if (name_len + 6 > sizeof(libpath)) {
-            kfree(file_data);
-            return -1;
-          }
+          if (name_len + 6 > sizeof(libpath))
+            goto cleanup;
           memcpy(libpath, "/lib/", 5);
           memcpy(libpath + 5, name, name_len + 1);
           loaded = elf64_load_shared_object(image, libpath, lib_base,
@@ -1197,8 +1279,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
           console_write("ELF load: missing/invalid DT_NEEDED ");
           console_write(name);
           console_write("\n");
-          kfree(file_data);
-          return -1;
+          goto cleanup;
         }
         memcpy(loaded_names[object_count], name, name_len + 1);
         object_count++;
@@ -1246,8 +1327,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         for (usize o = 0; o < object_count; o++)
           if (objects[o].tls_data)
             kfree(objects[o].tls_data);
-        kfree(file_data);
-        return -1;
+        goto cleanup;
       }
       for (usize o = 0; o < object_count; o++) {
         if (objects[o].tls_memsz == 0 || !objects[o].tls_data ||
@@ -1289,14 +1369,18 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
                                  objects[oi].jmprel,
                                  objects[oi].jmprel_size) != 0) {
         console_write("ELF load: unresolved/unsupported dynamic relocation\n");
-        kfree(file_data);
-        return -1;
+        goto cleanup;
       }
     }
   }
 
-  kfree(file_data);
-  return image->segment_count > 0 ? 0 : -1;
+  rc = image->segment_count > 0 ? 0 : -1;
+
+cleanup:
+  kfree(phdrs);
+  if (fd >= 0)
+    vfs_close(fd);
+  return rc;
 }
 
 /* Helper referenced by VADDR_TO_STAGE — kept out-of-line to keep the
@@ -1359,6 +1443,12 @@ void user_image_free(struct user_loaded_image *image) {
   if (image->tls_data) {
     kfree(image->tls_data);
   }
+
+  /* Drop the demand-paging backing-file reference held for the image lifetime.
+   * Each demand-paged segment VMA took its own vfs_node_get (released in
+   * user_address_space_cleanup); this is the loader's own reference. */
+  if (image->exe_node)
+    vfs_node_put(image->exe_node);
 
   kfree(image);
 }
@@ -1842,6 +1932,38 @@ static int user_run_elf_image(struct user_loaded_image *image) {
     u64 vaddr_start = segment->vaddr & ~(PAGE_SIZE - 1);
     u64 vaddr_end =
         (segment->vaddr + segment->memsz + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+    /* Demand-paged read-only segment (survived the relocation pass): map it
+     * file-backed lazy instead of pinning private frames, then free the staging.
+     * The page-fault handler (Case 1) reads each touched page from the
+     * executable's page cache via inode->read_cb — shared read-only and
+     * refcounted across every mapper — so only the working set is resident and
+     * untouched pages stay reclaimable. vmm_set_lazy splits the low-4GB identity
+     * huge page covering the load base so the lazy PTE is installed correctly. */
+    if (image->demand_paged && segment->demand_ok && image->exe_node &&
+        segment->data) {
+      u64 seg_file_base = segment->file_offset & ~(PAGE_SIZE - 1);
+      for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {
+        vmm_set_lazy(v);
+        /* RO + user: no VMM_WRITABLE, so the shared cache frame can't be written
+         * through this mapping; the fault handler honours the saved bits. */
+        paging_mprotect_page(v, VMM_USER);
+      }
+      struct vm_area *fvma = kzalloc(sizeof(struct vm_area));
+      if (fvma) {
+        fvma->start = vaddr_start;
+        fvma->end = vaddr_end;
+        fvma->prot = PROT_READ | ((segment->flags & PF_X) ? PROT_EXEC : 0);
+        fvma->flags = MAP_PRIVATE;
+        fvma->node = vfs_node_get(image->exe_node);
+        fvma->offset = (isize)seg_file_base;
+        fvma->next = current_task->vma_list;
+        current_task->vma_list = fvma;
+      }
+      kfree(segment->data);
+      segment->data = 0;
+      continue;
+    }
 
     u64 direct_base = vmm_direct_map_base();
     for (u64 v = vaddr_start; v < vaddr_end; v += PAGE_SIZE) {

@@ -254,7 +254,13 @@ Supporting documents:
   its own ld.lld — the same toolchain the host uses (`M26-SELFHOST: ok kernel-elf`).
   The 6 hand-written `.S` stubs + generated `kallsyms.o` are pre-staged (clang's
   in-guest `cc1as` re-exec can't resolve its own path on b1nix yet; tracked as a
-  follow-up). Needs >=16GB guest RAM (107 × ~94MB clang loads in one boot).
+  follow-up). RAM floor: a clean **`b1nix.selfhostonly`** boot mode (init idles —
+  no smoke suite, no production services competing for RAM) + the disk-sourced
+  toolchain (`b1nix.selfhostdisk`, sata0) completes the full 107-TU compile + link
+  down to **2 GiB** (`SELFHOST_DISK=1 SELFHOST_MEM_MB=2048`, verified at 2 GiB and
+  4 GiB). The old 16 GiB figure was the concurrent `b1nix.test=1` smoke sequence
+  (Mesa/V8/NetSurf) competing for RAM, not the loader; at 2 GiB the link grinds
+  slowly through page-cache eviction but still finishes.
 - [x] Fix kernel-stack sizing and improve physical-frame allocation.
 - [x] Add heap splitting, coalescing, page return, and a large-allocation arena.
 - [x] Make swap reclaim work under pressure.

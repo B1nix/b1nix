@@ -504,7 +504,14 @@ void kernel_main(usize arg0, usize arg1)
 	 * In test mode the smoke suite owns the drives, so keep initramfs as /. */
 	{
 		int rc = -1;
-		int test_mode = bootinfo_has_flag("b1nix.test=1");
+		/* b1nix.selfhostonly keeps the initramfs as / exactly like test mode: the
+		 * self-host build mounts its own toolchain fs at /mnt/build, and the boot
+		 * device (sata0 toolchain disk / ram0 module) must NOT be grabbed as the
+		 * real root here. Folding it into test_mode keeps every "drives are owned
+		 * elsewhere, stay on initramfs" branch below correct without duplicating
+		 * the whole rootfs decision tree. */
+		int test_mode = bootinfo_has_flag("b1nix.test=1") ||
+		                bootinfo_has_flag("b1nix.selfhostonly");
 		char root_val[64];
 		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
 			if (strcmp(root_val, "liveiso") == 0) {
@@ -757,6 +764,11 @@ void kernel_main(usize arg0, usize arg1)
 	 * under the Big Kernel Lock. From here, userspace runs on Application
 	 * Processors too. */
 	g_ap_userspace_enabled = 1;
+
+	/* Variant B: start background reclaim now that the scheduler, page cache and
+	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
+	 * allocations rarely stall in synchronous reclaim. */
+	kswapd_init();
 
 	userspace_init();
 	int init_pid = user_spawn("/bin/init", 0, 0);

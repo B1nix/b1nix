@@ -132,7 +132,16 @@ static int do_virtio_blk_req(struct virtio_blk_instance *inst, u64 lba,
 
   virtq_kick(&inst->dev, &inst->vq);
 
+  /* The used ring lives in host RAM (the device DMAs completions into it), so
+   * polling it is a plain memory read, not an MMIO VM-exit. Spin on it briefly
+   * before yielding — under KVM the request completes in microseconds and
+   * yielding on the first not-done pays a full scheduler round-trip per
+   * request, capping throughput far below the device. */
   while (inst->vq.used->idx == inst->vq.last_used_idx) {
+    for (int s = 0; s < 4096 && inst->vq.used->idx == inst->vq.last_used_idx; s++)
+      __asm__ volatile("pause");
+    if (inst->vq.used->idx != inst->vq.last_used_idx)
+      break;
     scheduler_yield();
   }
 

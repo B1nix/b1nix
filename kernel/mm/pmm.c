@@ -40,6 +40,78 @@ struct pmm_state {
 static struct pmm_state pmm;
 static spinlock_t pmm_lock = SPINLOCK_INIT;
 
+/* Variant C — reclaim re-entrancy guard. Page-cache eviction writes dirty pages
+ * back through write_cb (ext4), which kmallocs a block buffer and can grow the
+ * kheap -> vmm_map_page -> pmm_alloc. If that nested allocation also fails and
+ * tried to reclaim again, it would re-enter the dirty-writeback path while the
+ * outer kheap_grow still holds heap_lock — a lock-ordering deadlock (observed as
+ * a hard wedge when reclaim is driven hard). pmm_reclaim_depth is raised around
+ * the writeback eviction; while it is >0 a nested pmm_alloc does only CLEAN-only
+ * reclaim (no write_cb, no kmalloc) and otherwise fails gracefully, so the
+ * writeback path can always make forward progress or back off without deadlock.
+ * Counter precision under SMP isn't critical — it only steers a rare nested
+ * alloc onto the safe path. */
+static volatile int pmm_reclaim_depth;
+static void pmm_enter_reclaim(void) {
+  __atomic_add_fetch(&pmm_reclaim_depth, 1, __ATOMIC_RELAXED);
+}
+static void pmm_leave_reclaim(void) {
+  __atomic_sub_fetch(&pmm_reclaim_depth, 1, __ATOMIC_RELAXED);
+}
+static int pmm_in_reclaim(void) {
+  return __atomic_load_n(&pmm_reclaim_depth, __ATOMIC_RELAXED) > 0;
+}
+
+/* Variant B — background reclaim (kswapd). Reactive reclaim runs ON the
+ * allocation hot path: a task that hits free==0 stalls while it evicts pages
+ * synchronously. kswapd moves that work into a dedicated kernel thread that
+ * keeps a HIGH-watermark of free frames ready, so ordinary allocations almost
+ * always hit the fast path and a bursty allocator (clang's per-TU heap) finds
+ * headroom instead of cliff-diving into synchronous reclaim. kswapd runs in a
+ * top-level (no heap_lock/vmm_lock held) context, so it can safely write dirty
+ * pages back; it still raises pmm_reclaim_depth so its own eviction's nested
+ * allocs take the clean-only path. It blocks on kswapd_chan and is woken
+ * whenever an allocation has to fall into reactive reclaim (free crossed the
+ * low watermark), with a periodic timeout as a missed-wakeup safety net. */
+static char kswapd_chan;
+
+static usize kswapd_high_watermark(void) {
+  usize total = (usize)(pmm.total_usable / PAGE_SIZE);
+  usize high = total / 16;        /* ~6% of RAM kept free */
+  if (high < 512) high = 512;     /* 2 MiB floor on tiny guests */
+  if (high > 16384) high = 16384; /* 64 MiB cap so big guests don't over-reserve */
+  return high;
+}
+
+static void kswapd_thread(void *arg) {
+  (void)arg;
+  for (;;) {
+    usize high = kswapd_high_watermark();
+    /* Reclaim toward the high watermark in bounded batches, yielding between
+     * them so kswapd never monopolises a CPU. Stop when nothing more is
+     * reclaimable (all cache referenced / dirty-unflushable). */
+    while ((usize)pmm.free_frames < high) {
+      usize deficit = high - (usize)pmm.free_frames;
+      usize batch = deficit < 256 ? deficit : 256;
+      pmm_enter_reclaim();
+      usize ev = page_cache_evict(batch);
+      pmm_leave_reclaim();
+      if (ev == 0)
+        break;
+      scheduler_yield();
+    }
+    /* Sleep until an allocation wakes us on low free, or 500 ms elapses
+     * (TIMER_HZ=100 -> 50 ticks) so slow growth is still trimmed. */
+    scheduler_block_on_timeout(&kswapd_chan, 50);
+  }
+}
+
+static void kswapd_wake(void) { scheduler_wake_all(&kswapd_chan); }
+
+void kswapd_init(void) {
+  kthread_create("kswapd", kswapd_thread, 0);
+}
+
 #include <b1nix/lockdep.h>
 static inline void pmm_acquire(u64 *flags) {
   spin_lock_irqsave(&pmm_lock, flags);
@@ -840,6 +912,11 @@ u64 pmm_alloc_frames(usize count) {
     }
     /* This call needed reclaim — break any clean-streak. */
     pmm_clean_alloc_streak = 0;
+    /* Pressure: nudge kswapd to refill the free pool in the background for the
+     * following allocations. Cheap no-op if it is already running or not yet
+     * created; skipped when this is kswapd's own nested allocation. */
+    if (!pmm_in_reclaim())
+      kswapd_wake();
     pmm_total_reclaims++;
     enum { PMM_PRESSURE_WARN = 32 };
     if (pmm_total_reclaims == PMM_PRESSURE_WARN && !pmm_warned_pressure) {
@@ -850,7 +927,24 @@ u64 pmm_alloc_frames(usize count) {
     }
 
     usize reclaim_target = pmm_reclaim_target_frames(count, free_snapshot);
+    /* If this allocation is itself nested inside an eviction's writeback
+     * (pmm_in_reclaim — e.g. ext4 write_cb -> kmalloc -> kheap_grow -> here),
+     * only do CLEAN-only reclaim: re-entering the dirty-writeback path would
+     * kmalloc again and deadlock on the heap_lock the outer kheap_grow holds.
+     * If no clean page can be freed, fail gracefully (return 0) so the nested
+     * write backs off instead of wedging — the dirty page just stays cached for
+     * a later flush, no data loss. */
+    if (pmm_in_reclaim()) {
+      usize ce = page_cache_evict_clean(reclaim_target);
+      if (ce > 0)
+        continue;
+      return 0;
+    }
+    /* Top-level reclaim: full eviction (writes dirty pages back). Run it inside
+     * the reclaim context so a nested alloc takes the clean-only path above. */
+    pmm_enter_reclaim();
     usize pc_evicted = page_cache_evict(reclaim_target);
+    pmm_leave_reclaim();
     if (pc_evicted > 0) {
       continue;
     }
@@ -867,9 +961,11 @@ u64 pmm_alloc_frames(usize count) {
 
     // Then try evicting a process page to swap.
     extern int swap_active(void);
-    if (swap_active() && interrupts_enabled()) {
+    if (swap_active() && interrupts_enabled() && !pmm_in_reclaim()) {
       extern u64 swap_evict_page(void);
+      pmm_enter_reclaim();
       u64 evicted_frame = swap_evict_page();
+      pmm_leave_reclaim();
       if (evicted_frame != 0) {
         if (bootinfo_has_flag("b1nix.debug.heap")) {
           console_write("[M26DIAG] swap_evict frame=0x");

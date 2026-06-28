@@ -383,6 +383,13 @@ static void unmap_page_from_pml4(u64 *pml4, u64 virtual_address) {
         eviction_unregister_page(frame);
       }
     }
+  } else if (pte & VMM_SWAPPED) {
+    /* The page is swapped out — release its swap slot (the slot index is encoded
+     * in the PTE address field). Done here, incrementally per unmapped page, so
+     * address-space teardown (the VMA-unmap loop) and munmap of a swapped range
+     * both reclaim slots without any separate page-table walk. */
+    extern void swap_free_slot_index(u32 slot);
+    swap_free_slot_index((u32)((pte & PAGE_ENTRY_ADDRESS_MASK) >> 12));
   }
   pt[pt_index(virtual_address)] = 0;
   invalidate_page(virtual_address);
@@ -505,7 +512,21 @@ void vmm_set_lazy(u64 virtual_address) {
   pml4[pml4_index(virtual_address)] |= VMM_USER;
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
   pdpt[pdpt_index(virtual_address)] |= VMM_USER;
-  u64 *pt = ensure_child_table(pd, pd_index(virtual_address));
+
+  /* The low 4 GiB is identity-mapped with 2 MiB SUPERVISOR huge pages in every
+   * address space (cloned per-space). The userspace load base 0x2000000 lives
+   * inside that region, so a lazy mapping there must SPLIT the huge page into a
+   * 4 KiB page table first — exactly as vmm_map_page_in_table does for the eager
+   * path. Without this, ensure_child_table below would treat the huge page's
+   * physical base as a page-table pointer and scribble VMM_LAZY into arbitrary
+   * physical memory (the deterministic clang-entry corruption behind the
+   * demand-paged-loader SIGILL). */
+  u64 *pt;
+  if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
+    pt = split_huge_page(pd, pd_index(virtual_address));
+  } else {
+    pt = ensure_child_table(pd, pd_index(virtual_address));
+  }
   pd[pd_index(virtual_address)] |= VMM_USER;
 
   // Set a non-present entry with LAZY flag so we know it's a lazy page
@@ -695,7 +716,13 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
       if (shared_cache_frame) pmm_unref_frame(frame); else pmm_free_frame(frame);
       return (slot && (*slot & VMM_PRESENT)) ? 0 : -1;
     }
-    u64 flags = VMM_PRESENT | VMM_WRITABLE;
+    /* Honour the protection saved in the lazy PTE (paging_mprotect_page stored
+     * VMM_WRITABLE/USER at mmap/loader time) instead of forcing writable. A
+     * read-only file-backed mapping — e.g. a demand-paged executable's RO text,
+     * which shares one refcounted page-cache frame across every mapper — must
+     * fault in read-only so a stray write can't corrupt the shared cache page. */
+    u64 flags = VMM_PRESENT;
+    if (*slot & VMM_WRITABLE) flags |= VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
     if (vma_shared) flags |= VMM_SHARED;
     *slot = frame | flags;
@@ -709,11 +736,13 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     return 0;
   }
 
-  // Case 2: Swapped page (VMM_SWAPPED leaf, not present).
+  // Case 2: Swapped page (VMM_SWAPPED leaf, not present). The swap slot index is
+  // encoded in the PTE's address field — read it directly, no reverse-map scan.
   if (!(pte & VMM_PRESENT) && (pte & VMM_SWAPPED)) {
     // swap_in allocates a frame and does blocking disk I/O — outside the lock.
     u64 new_frame = 0;
-    if (swap_in(current_task->pml4_phys, page_aligned, &new_frame) < 0) {
+    u32 swslot = (u32)((pte & PAGE_ENTRY_ADDRESS_MASK) >> 12);
+    if (swap_in(swslot, &new_frame) < 0) {
       console_write("pf: swap in failed for 0x");
       console_write_hex64(page_aligned);
       console_write("\n");
@@ -936,7 +965,11 @@ u64 paging_clone_address_space(u64 src_pml4_phys) {
 }
 
 
-void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
+/* Mark vaddr's leaf PTE as swapped, storing the swap SLOT index in the PTE's
+ * (now-unused) address field. The page is non-present, so the address bits are
+ * free to carry the slot; the #PF handler reads it back to drive swap_in with no
+ * reverse-map table. */
+void paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot) {
   u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
   u64 pml4e = pml4[pml4_index(vaddr)];
   if (!(pml4e & VMM_PRESENT)) return;
@@ -958,9 +991,19 @@ void paging_mark_swapped(u64 pml4_phys, u64 vaddr) {
     u64 flags = pte & ~PAGE_ENTRY_ADDRESS_MASK;
     flags &= ~VMM_PRESENT;
     flags |= VMM_SWAPPED;
-    pt[pt_index(vaddr)] = flags;
+    pt[pt_index(vaddr)] = ((slot << 12) & PAGE_ENTRY_ADDRESS_MASK) | flags;
     invalidate_page(vaddr);
   }
+}
+
+/* Swap slots are now freed incrementally as their pages are unmapped
+ * (unmap_page_from_pml4) and as a teardown backstop in free_table — there is no
+ * separate per-exit page-table walk. A standalone full-tree walk on every exit
+ * (the first cut of this) regressed the heavy multi-threaded smoke instances;
+ * folding the slot-free into the existing unmap/teardown paths is both correct
+ * and free. Kept as a no-op so swap_free_all_slots has a stable callee. */
+void paging_free_swap_slots(u64 pml4_phys) {
+  (void)pml4_phys;
 }
 
 int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
@@ -1029,6 +1072,11 @@ static void free_table(u64 *table, int level) {
           pmm_free_frame(frame);
           freed_tables_count++;
         }
+      } else if (!(entry & VMM_PRESENT) && (entry & VMM_SWAPPED)) {
+        /* A swapped page that was never VMA-unmapped (e.g. brk frames past the
+         * heap VMA): release its swap slot during the exclusive teardown. */
+        extern void swap_free_slot_index(u32 slot);
+        swap_free_slot_index((u32)((entry & PAGE_ENTRY_ADDRESS_MASK) >> 12));
       }
     }
     return;
@@ -1078,8 +1126,9 @@ static void swap_in_recursive(u64 *table, int level, u64 base_addr, u64 pml4_phy
       if (!(entry & VMM_PRESENT) && (entry & VMM_SWAPPED)) {
         u64 vaddr = base_addr + (i * PAGE_SIZE);
         u64 new_frame = 0;
-        extern int swap_in(u64 pml4_phys, u64 virtual_addr, u64 *out_physical_frame);
-        if (swap_in(pml4_phys, vaddr, &new_frame) == 0) {
+        extern int swap_in(u32 slot, u64 *out_physical_frame);
+        u32 swslot = (u32)((entry & PAGE_ENTRY_ADDRESS_MASK) >> 12);
+        if (swap_in(swslot, &new_frame) == 0) {
           u64 flags = VMM_PRESENT | VMM_WRITABLE;
           if (entry & VMM_USER) flags |= VMM_USER;
           if (entry & VMM_NO_EXECUTE) flags |= VMM_NO_EXECUTE;

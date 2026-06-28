@@ -60,16 +60,22 @@ static void ahci_wait_ci_clear(volatile struct ahci_port *p, u32 slot_mask,
                                const char *what, int port_num) {
   u64 spins = 0;
   while (p->ci & slot_mask) {
-    /* Spin briefly on the CPU (plain `pause`, NO MMIO) before yielding. Each
-     * p->ci read is an MMIO access = a VM-exit under KVM (~µs); polling it in a
-     * tight loop costs more than the DMA itself. KVM completes the command in
-     * microseconds, so this short register-only spin usually lets it finish
-     * before the next MMIO check — avoiding both a flood of VM-exits AND a
-     * scheduler round-trip. Yield only if it's genuinely still pending, so we
-     * never hog the CPU or block the swap re-entrancy path. */
-    for (int i = 0; i < 20000; i++)
-      __asm__ volatile("pause");
-    if (!(p->ci & slot_mask))
+    /* Poll the completion register at FINE granularity. Under KVM a command
+     * finishes in microseconds, so the key is to detect that quickly rather than
+     * overshoot: a single 20000-`pause` spin is ~1 ms on a modern CPU (pause ≈
+     * 140 cycles) — far longer than the actual completion, which capped
+     * throughput near ~200 MB/s though the host device is RAM-fast. Do a handful
+     * of short spin+check rounds (each ~a few µs, one MMIO read = one VM-exit) so
+     * a just-completed command is seen almost immediately, and only fall back to
+     * a scheduler yield if it is still pending after the burst. */
+    int detected = 0;
+    for (int round = 0; round < 16 && !detected; round++) {
+      for (int i = 0; i < 256; i++)
+        __asm__ volatile("pause");
+      if (!(p->ci & slot_mask))
+        detected = 1;
+    }
+    if (detected)
       break;
     if (spins == 10000000ULL) {
       console_write("ahci: port ");

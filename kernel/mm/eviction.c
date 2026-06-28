@@ -117,10 +117,12 @@ u64 swap_evict_page(void) {
             continue; // Give second chance and move to next
         }
 
-        // Evict!
-        if (swap_out(t->pml4_phys, v, f) >= 0) {
-            extern void paging_mark_swapped(u64 pml4_phys, u64 vaddr);
-            paging_mark_swapped(t->pml4_phys, v);
+        // Evict! swap_out returns the slot index; we encode it into the PTE so
+        // the #PF handler can swap the page back in without any reverse map.
+        int swslot = swap_out(f);
+        if (swslot >= 0) {
+            extern void paging_mark_swapped(u64 pml4_phys, u64 vaddr, u64 slot);
+            paging_mark_swapped(t->pml4_phys, v, (u64)swslot);
 
             /* paging_mark_swapped only invlpg's the CURRENT CPU, but the evicted
              * page belongs to task t, which may be running (or have threads
