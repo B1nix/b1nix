@@ -12,8 +12,12 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 KELF="$ROOT_DIR/build/x86_64/kernel.elf"
-IMG="$ROOT_DIR/build/selfhost-out/selfhost.img"
-OUT="$ROOT_DIR/build/selfhost-out"
+# OUT/IMG are overridable so two runs (e.g. ram0 vs disk) can execute in parallel
+# without clobbering each other's ISO/iso dir. Point SELFHOST_IMG at an existing
+# module (+ SKIP_PACK=1) to share one toolchain image between both.
+IMG="${SELFHOST_IMG:-$ROOT_DIR/build/selfhost-out/selfhost.img}"
+OUT="${SELFHOST_OUT:-$ROOT_DIR/build/selfhost-out}"
+mkdir -p "$OUT"
 ISO="$OUT/b1nix-selfhost.iso"
 LOG="${LOG:-$ROOT_DIR/smoke_run/selfhost-run.log}"
 TIMEOUT="${TIMEOUT:-5400}"
@@ -26,16 +30,35 @@ for f in "$KELF" "$IMG"; do
 	[ -f "$f" ] || { echo "missing: $f"; exit 1; }
 done
 
-echo "=== [1] pack self-contained ISO (cmdline: b1nix.test=1 b1nix.selfhostbuild) ==="
+# b1nix.test=1 keeps the kernel in test mode (initramfs as /, no normal
+# getty/login/sshd init competing with the build) — the original, working
+# self-host config. SELFHOST_DISK=1 sources the toolchain from a real SATA disk
+# (b1nix.selfhostdisk -> mount sata0) instead of the ram0 GRUB module. The module
+# is a ramdisk whose ~217 MB stay pinned in RAM the whole build; a disk leaves
+# that free and streams the toolchain off AHCI through the (read-ahead) block
+# cache, so the self-host fits in less RAM.
+DISK_IMG=""
+if [ "${SELFHOST_DISK:-0}" = "1" ]; then
+	CMDLINE="b1nix.test=1 b1nix.selfhostbuild b1nix.selfhostdisk"
+	MODULE_CMD=""
+	# Build writes .o/TMPDIR onto the toolchain fs — use a throwaway copy so the
+	# source image is never mutated.
+	DISK_IMG="$OUT/selfhost-disk.img"
+	cp "$IMG" "$DISK_IMG"
+else
+	CMDLINE="b1nix.test=1 b1nix.selfhostbuild"
+	MODULE_CMD="module2 /boot/selfhost.img selfhostimg"
+fi
+echo "=== [1] pack self-contained ISO (cmdline: $CMDLINE) ==="
 MKRESCUE="$(command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)"
 [ -n "$MKRESCUE" ] || { echo "missing grub-mkrescue"; exit 1; }
 ISODIR="$OUT/iso"
 rm -rf "$ISODIR"; mkdir -p "$ISODIR/boot/grub"
 cp "$KELF" "$ISODIR/boot/kernel.elf"
-cp "$IMG" "$ISODIR/boot/selfhost.img"
+[ "${SELFHOST_DISK:-0}" = "1" ] || cp "$IMG" "$ISODIR/boot/selfhost.img"
 sed -e 's|@TIMEOUT@|0|g' -e 's|@ARCH@|x86_64|g' \
-    -e 's|@CMDLINE@|b1nix.test=1 b1nix.selfhostbuild|g' \
-    -e 's|@MODULE_CMD@|module2 /boot/selfhost.img selfhostimg|g' \
+    -e "s|@CMDLINE@|$CMDLINE|g" \
+    -e "s|@MODULE_CMD@|$MODULE_CMD|g" \
     "$ROOT_DIR/boot/grub/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
 "$MKRESCUE" -o "$ISO" "$ISODIR" 2>/dev/null
 
@@ -51,6 +74,12 @@ fi
 set -- qemu-system-x86_64 $accel -m "${SELFHOST_MEM_MB:-16384}" \
 	-cdrom "$ISO" -serial stdio -display none -monitor none -no-reboot \
 	-device isa-debug-exit,iobase=0xf4,iosize=0x04
+if [ -n "$DISK_IMG" ]; then
+	# Toolchain on a SATA/AHCI disk (sata0) — the kernel mounts it instead of ram0.
+	set -- "$@" -device ich9-ahci,id=ahci \
+		-drive file="$DISK_IMG",if=none,id=shdisk,format=raw \
+		-device ide-hd,drive=shdisk,bus=ahci.0
+fi
 echo "[selfhost-run] $*"
 "$@" >"$LOG" 2>&1 &
 pid=$!

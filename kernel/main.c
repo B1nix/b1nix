@@ -913,9 +913,17 @@ void kernel_main(usize arg0, usize arg1)
 	 * ordinary smoke suite. */
 	if (bootinfo_has_flag("b1nix.selfhostbuild")) {
 		vfs_mkdir("/mnt/build", 0755);
-		int sh_mrc = vfs_mount("ram0", "/mnt/build", "ext4", 0);
+		/* b1nix.selfhostdisk sources the toolchain from a real SATA disk (sata0)
+		 * instead of the ram0 GRUB module. The module is a ramdisk: its ~217 MB
+		 * stay pinned in RAM for the whole build. A disk leaves that 217 MB free
+		 * — the toolchain streams off AHCI through the (now read-ahead) block
+		 * cache — so the self-host fits in far less RAM. */
+		const char *sh_src =
+		    bootinfo_has_flag("b1nix.selfhostdisk") ? "sata0" : "ram0";
+		int sh_mrc = vfs_mount(sh_src, "/mnt/build", "ext4", 0);
 		char sh_buf[80];
-		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount ram0 -> /mnt/build: %d\n", sh_mrc);
+		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount %s -> /mnt/build: %d\n",
+		         sh_src, sh_mrc);
 		console_write(sh_buf);
 		if (sh_mrc == 0)
 			run_selfhost_build();
