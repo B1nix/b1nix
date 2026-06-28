@@ -193,7 +193,11 @@ static int selfhost_clang_one(const char *src_abs, const char *obj_abs)
 		"-mno-sse", "-mno-mmx", "-mno-sse2", "-mno-3dnow",
 		"-c", src_abs, "-o", obj_abs, 0,
 	};
-	int pid = user_spawn("/mnt/build/bin/clang", 22, argv);
+	/* TMPDIR points clang's intermediate files (the .S preprocess writes
+	 * /tmp/<name>.s) at the writable ext4 module — the boot root is a read-only
+	 * initramfs, so a default /tmp would fail. */
+	const char *env[] = {"PATH=/mnt/build/bin", "TMPDIR=/mnt/build/tmp", 0};
+	int pid = user_spawn_env("/mnt/build/bin/clang", 22, argv, env);
 	if (pid <= 0)
 		return -1;
 	int st = 0;

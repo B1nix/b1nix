@@ -2146,6 +2146,12 @@ void userspace_init(void) {
 }
 
 int user_spawn(const char *path, int argc, const char **argv) {
+  const char *default_env[] = {"PATH=/bin", 0};
+  return user_spawn_env(path, argc, argv, default_env);
+}
+
+int user_spawn_env(const char *path, int argc, const char **argv,
+                   const char **envp) {
   struct vfs_node *node = vfs_find_node(path);
   if (!node || IS_ERR(node)) {
     return -1;
@@ -2158,9 +2164,8 @@ int user_spawn(const char *path, int argc, const char **argv) {
   }
   vfs_node_put(node);
 
-  const char *empty_env[] = {"PATH=/bin", 0};
   struct user_loaded_image *image =
-      user_load_image(path, argc, argv, empty_env, 0, 0);
+      user_load_image(path, argc, argv, envp, 0, 0);
   if (!image) {
     return -1;
   }

@@ -95,6 +95,9 @@ struct user_loaded_image {
 
 void userspace_init(void);
 int user_spawn(const char *path, int argc, const char **argv);
+/* Like user_spawn but with an explicit environment (envp, NULL-terminated). */
+int user_spawn_env(const char *path, int argc, const char **argv,
+                   const char **envp);
 int user_execve_current(const char *path, const char **argv, const char **envp);
 void user_register_builtin_programs(void);
 const struct user_program *user_find_program(const char *path);

@@ -72,14 +72,17 @@ for hostobj in $(find "$ROOT_DIR/build/x86_64/kernel" -name '*.o' | sort); do
 		printf '%s\t%s\n' "$rel.c" "$obj" >> "$STAGE/srcs.txt"
 		printf '%s\n' "$obj" >> "$STAGE/kernel.rsp"
 	else
-		# .S stub or a generated object: pre-stage the host-built .o. (clang's
-		# in-guest cc1as re-exec can't resolve its own path on b1nix, so the .S
-		# stubs are host-assembled; the C TUs — all real codegen — compile in-guest.)
+		# .S stubs and generated objects (e.g. kallsyms) are pre-staged from the
+		# host build: clang assembles .S via a separate cc1as process whose
+		# re-exec can't resolve clang's own path on b1nix (empty InstalledDir;
+		# canonical-prefix/dladdr resolution fails, -no-canonical-prefixes hangs).
+		# The .c TUs — all real codegen — compile in-guest. TODO: assemble .S too.
 		mkdir -p "$STAGE/obj/$(dirname "$rel")"
 		cp "$hostobj" "$STAGE/obj/$rel.o" && printf '%s\n' "$obj" >> "$STAGE/kernel.rsp" \
 			|| echo "WARN could not stage host obj $rel.o"
 	fi
 done
+mkdir -p "$STAGE/tmp"   # writable TMPDIR for any in-guest clang intermediates
 # kallsyms.o: produced by the host 2-stage link (gen_kallsyms.sh). Pre-staged so
 # the in-guest single-stage ld.lld link resolves the kallsyms symbol table.
 if [ -f "$ROOT_DIR/build/x86_64/kallsyms.o" ]; then
