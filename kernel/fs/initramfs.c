@@ -1,4 +1,10 @@
-#define MINIMAL_INITRAMFS 1
+/* MINIMAL_INITRAMFS selects a tiny embedded file set (init + native/b1cc smoke
+ * binaries only) for the RAM-constrained in-guest self-host build. It is opt-in
+ * via the build system (`make MINIMAL_INITRAMFS=1` adds -DMINIMAL_INITRAMFS; the
+ * self-host module staging injects the same define into its standalone copy of
+ * this file). The default build embeds the FULL initramfs — do NOT hardcode the
+ * define here, or every normal/smoke build silently drops all but a handful of
+ * binaries (the entire suite then fails to spawn them). */
 
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
@@ -16,6 +22,7 @@
 #include "initramfs_b1cc_better_c.inc"
 #ifndef MINIMAL_INITRAMFS
 #include "initramfs_m12_smoke.inc"
+#include "initramfs_m13_smoke.inc"
 #include "initramfs_m13_job_control.inc"
 #include "initramfs_m8_aio_test.inc"
 #include "initramfs_m17_smoke.inc"

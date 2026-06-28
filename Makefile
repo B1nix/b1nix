@@ -144,6 +144,11 @@ INITRAMFS_B1CC_INCS := \
 	$(BUILD_DIR)/initramfs_b1cc_better_c.inc
 # Upstream BusyBox is always embedded (M42 full integration).
 ifeq ($(MINIMAL_INITRAMFS),1)
+# Select the minimal embedded file set in the C source too (kernel/fs/initramfs.c
+# picks files[] via #ifdef MINIMAL_INITRAMFS) so the registered files match the
+# trimmed .inc list below. Without this the C code would still register the full
+# table and reference .inc that were never built.
+CFLAGS_EXTRA += -DMINIMAL_INITRAMFS
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_B1CC_INCS)

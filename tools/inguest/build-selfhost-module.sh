@@ -43,6 +43,14 @@ cp -R "$RESDIR/include" "$STAGE/bin-lib/clang/$RESV/"   # -> /lib/clang/<v>/incl
 # Kernel source tree (+ generated .inc the kernel TUs #include from build/x86_64).
 tar -C "$ROOT_DIR" -cf - --exclude='*.o' --exclude='*.a' --exclude='.git' kernel | tar -C "$STAGE/src" -xf -
 mkdir -p "$STAGE/src/build/x86_64"
+# This in-guest build compiles standalone (no host Makefile CFLAGS), and only the
+# minimal .inc set is staged below. Force the staged initramfs.c into minimal
+# mode by prepending the define (the committed source no longer hardcodes it, so
+# normal host builds get the full initramfs).
+if ! head -1 "$STAGE/src/kernel/fs/initramfs.c" | grep -q "define MINIMAL_INITRAMFS"; then
+	printf '#define MINIMAL_INITRAMFS 1\n' | cat - "$STAGE/src/kernel/fs/initramfs.c" > "$STAGE/src/kernel/fs/initramfs.c.tmp"
+	mv "$STAGE/src/kernel/fs/initramfs.c.tmp" "$STAGE/src/kernel/fs/initramfs.c"
+fi
 # The staged kernel/fs/initramfs.c is in MINIMAL_INITRAMFS mode, so it only
 # #includes the minimal .inc set; lapic.c needs ap_trampoline.inc. Staging only
 # these (not all ~531MB of port-binary .inc) keeps the module small.
