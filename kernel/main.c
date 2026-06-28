@@ -59,6 +59,83 @@ extern void bootinfo_init_from_fdt(u64 dtb_address);
 extern void m35_diag_run(void);
 extern void m36_diag_run(void);
 
+/* b1nix.diskbench — boot-time block-device throughput benchmark. Reads a fixed
+ * span twice from the first non-RAM disk: once via raw single-sector commands
+ * (the pre-read-ahead per-sector cost) and once via the cached path (which now
+ * pulls a read-ahead run per miss). Reports MB/s for both so the read-ahead win
+ * is measurable. Gated by a cmdline flag so it never runs in the smoke suite. */
+static void disk_benchmark(void) {
+	struct block_device *dev = 0;
+	for (usize i = 0; i < blk_count(); i++) {
+		struct block_device *d = blk_at(i);
+		/* Skip RAM disks and partitions; want a real SATA/NVMe drive. */
+		if (d && d->name && d->read_blocks && d->block_size == 512 &&
+		    d->block_count > 0 && d->name[0] != 'r' /* ram0 */) {
+			dev = d;
+			break;
+		}
+	}
+	if (!dev) {
+		console_write("DISKBENCH: no disk device found\n");
+		return;
+	}
+
+	/* Read up to 16 MiB (or the whole disk if smaller). */
+	u64 total_sectors = 16ull * 1024 * 1024 / 512;
+	if (total_sectors > dev->block_count)
+		total_sectors = dev->block_count;
+
+	console_write("DISKBENCH: dev=");
+	console_write(dev->name);
+	console_write(" reading ");
+	console_write_dec(total_sectors * 512 / 1024);
+	console_write(" KiB\n");
+
+	u8 *buf = (u8 *)kmalloc(64 * 512); /* one read-ahead window */
+	if (!buf) {
+		console_write("DISKBENCH: kmalloc failed\n");
+		return;
+	}
+
+	/* Phase A — raw single-sector device commands (no cache, no read-ahead). */
+	u64 t0 = scheduler_get_ticks();
+	for (u64 lba = 0; lba < total_sectors; lba++) {
+		if (dev->read_blocks(dev, lba, 1, buf) < 0) {
+			console_write("DISKBENCH: raw read failed\n");
+			kfree(buf);
+			return;
+		}
+	}
+	u64 a_ticks = scheduler_get_ticks() - t0;
+
+	/* Phase B — cached path (read-ahead run per miss). Start cold. */
+	blk_cache_invalidate(dev);
+	u64 t1 = scheduler_get_ticks();
+	for (u64 lba = 0; lba < total_sectors; lba++) {
+		if (blk_read_cached(dev, lba, 1, buf) < 0) {
+			console_write("DISKBENCH: cached read failed\n");
+			kfree(buf);
+			return;
+		}
+	}
+	u64 b_ticks = scheduler_get_ticks() - t1;
+	kfree(buf);
+
+	/* ticks are 10 ms (TIMER_HZ=100), so seconds = ticks/100 and
+	 * KB/s = (sectors*512/1024) / (ticks/100) = sectors*50/ticks. */
+	console_write("DISKBENCH: raw-1sector ");
+	console_write_dec(a_ticks * 10);
+	console_write(" ms (");
+	console_write_dec(a_ticks ? (total_sectors * 50) / a_ticks : 0);
+	console_write(" KB/s)\n");
+	console_write("DISKBENCH: cached-readahead ");
+	console_write_dec(b_ticks * 10);
+	console_write(" ms (");
+	console_write_dec(b_ticks ? (total_sectors * 50) / b_ticks : 0);
+	console_write(" KB/s)\n");
+	console_write("DISKBENCH: done\n");
+}
+
 static int parse_hex_digit(char c) {
 	if (c >= '0' && c <= '9') return c - '0';
 	if (c >= 'a' && c <= 'f') return 10 + (c - 'a');
@@ -184,7 +261,7 @@ static int selfhost_clang_one(const char *src_abs, const char *obj_abs)
 	 * argv[0]. A bare "clang" makes it fail to exec cc1 and to find stddef.h.
 	 * -resource-dir pins the builtin headers explicitly for good measure. */
 	const char *argv[] = {
-		"/mnt/build/bin/clang", "-B/mnt/build/bin",
+		"/mnt/build/bin/clang", "-no-canonical-prefixes", "-B/mnt/build/bin",
 		"-resource-dir", "/mnt/build/lib/clang/22",
 		"-integrated-as", "-std=c11", "-ffreestanding", "-fno-builtin",
 		"-fno-stack-protector", "-fno-pic", "-mno-red-zone",
@@ -197,7 +274,7 @@ static int selfhost_clang_one(const char *src_abs, const char *obj_abs)
 	 * /tmp/<name>.s) at the writable ext4 module — the boot root is a read-only
 	 * initramfs, so a default /tmp would fail. */
 	const char *env[] = {"PATH=/mnt/build/bin", "TMPDIR=/mnt/build/tmp", 0};
-	int pid = user_spawn_env("/mnt/build/bin/clang", 22, argv, env);
+	int pid = user_spawn_env("/mnt/build/bin/clang", 23, argv, env);
 	if (pid <= 0)
 		return -1;
 	int st = 0;
@@ -418,6 +495,8 @@ void kernel_main(usize arg0, usize arg1)
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
+	if (bootinfo_has_flag("b1nix.diskbench"))
+		disk_benchmark();
 #endif
 #ifndef __aarch64__
 	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use
