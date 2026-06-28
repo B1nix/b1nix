@@ -254,7 +254,7 @@ run_qemu() {
 						done
 					reported_lines=$line_count
 				fi
-				if grep -q -E "$done_pattern" "$log" 2>/dev/null; then
+				if grep -qa -E "$done_pattern" "$log" 2>/dev/null; then
 					break
 				fi
 				if ! kill -0 "$pid" 2>/dev/null; then

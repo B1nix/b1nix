@@ -1475,6 +1475,22 @@ static const struct initramfs_file files[] = {
 #  include "initramfs_applet_symlinks.inc"
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
+    /* b1cc-compiled smoke binaries (M5/M7) — exercised by programs.c right after
+     * native-smoke. Their .inc are #included unconditionally above, so they must
+     * be registered in BOTH the minimal and the full table (a missing-from-full
+     * entry shows up as B1CC-*-SMOKE: spawn-fail in the full smoke). */
+    {"/bin/return_42", (const char *)vfs_return_42_elf,
+     sizeof(vfs_return_42_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_hello", (const char *)vfs_b1cc_hello_elf,
+     sizeof(vfs_b1cc_hello_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_argv", (const char *)vfs_b1cc_argv_elf,
+     sizeof(vfs_b1cc_argv_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_file_write", (const char *)vfs_b1cc_file_write_elf,
+     sizeof(vfs_b1cc_file_write_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_stderr_exit", (const char *)vfs_b1cc_stderr_exit_elf,
+     sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
+     sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
      sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m13-smoke", (const char *)vfs_m13_smoke_elf,
