@@ -483,6 +483,16 @@ struct sigaction *scheduler_rt_action_current(int sig);
 #define B1NIX_SI_USER 0
 #define B1NIX_SI_QUEUE (-1)
 #define B1NIX_SI_TIMER (-2)
+
+/* M74 POSIX per-process timers (timer_create/settime/gettime/delete). Times are
+ * in scheduler ticks (100 Hz). On expiry the timer queues `signo` (an RT signal
+ * carries `value` as si_value). */
+int scheduler_timer_create(int signo, union sigval value);
+int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
+                            u64 *old_remaining, u64 *old_interval);
+int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval);
+int scheduler_timer_delete(int id);
+void scheduler_timer_cleanup_task(usize task_id);
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
 /* M56 signalfd helpers. */

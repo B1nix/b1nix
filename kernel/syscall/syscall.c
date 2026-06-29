@@ -3436,6 +3436,78 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)scheduler_sigqueue((usize)arg0, sig, v, B1NIX_SI_QUEUE);
     return (u64)scheduler_kill((usize)arg0, sig);
   }
+  case SYS_TIMER_CREATE: {
+    /* timer_create(clockid, struct sigevent*, timer_t*). Only SIGEV_SIGNAL is
+     * supported; the clock id is accepted but the tick is the single time base. */
+    struct k_sigevent {
+      int sigev_notify;
+      int sigev_signo;
+      union sigval sigev_value;
+    } sev;
+    if (!arg1 || !arg2)
+      return (u64)-EINVAL;
+    if (syscall_copyin(&sev, (void *)(usize)arg1, sizeof(sev)) < 0)
+      return (u64)-EFAULT;
+    if (sev.sigev_notify != 0 /* SIGEV_SIGNAL */)
+      return (u64)-EINVAL;
+    int id = scheduler_timer_create(sev.sigev_signo, sev.sigev_value);
+    if (id < 0)
+      return (u64)id;
+    if (syscall_copyout((void *)(usize)arg2, &id, sizeof(int)) < 0) {
+      scheduler_timer_delete(id);
+      return (u64)-EFAULT;
+    }
+    return 0;
+  }
+  case SYS_TIMER_SETTIME: {
+    /* timer_settime(id, flags, const itimerspec*, itimerspec*). Times convert to
+     * 100 Hz ticks; it_value all-zero disarms. TIMER_ABSTIME (flags&1) is treated
+     * relative (the smoke uses relative arming). */
+    struct k_timespec { i64 tv_sec; i64 tv_nsec; };
+    struct k_itimerspec { struct k_timespec it_interval; struct k_timespec it_value; } its;
+    if (!arg2)
+      return (u64)-EINVAL;
+    if (syscall_copyin(&its, (void *)(usize)arg2, sizeof(its)) < 0)
+      return (u64)-EFAULT;
+    u64 first = (u64)its.it_value.tv_sec * 100 + (u64)its.it_value.tv_nsec / 10000000;
+    u64 interval = (u64)its.it_interval.tv_sec * 100 + (u64)its.it_interval.tv_nsec / 10000000;
+    /* A non-zero requested time shorter than one tick still arms (1 tick). */
+    if (first == 0 && (its.it_value.tv_sec || its.it_value.tv_nsec))
+      first = 1;
+    if (interval == 0 && (its.it_interval.tv_sec || its.it_interval.tv_nsec))
+      interval = 1;
+    u64 old_rem = 0, old_int = 0;
+    int rc = scheduler_timer_settime((int)arg0, first, interval, &old_rem, &old_int);
+    if (rc < 0)
+      return (u64)rc;
+    if (arg3) {
+      struct k_itimerspec old;
+      old.it_value.tv_sec = (i64)(old_rem / 100);
+      old.it_value.tv_nsec = (i64)((old_rem % 100) * 10000000);
+      old.it_interval.tv_sec = (i64)(old_int / 100);
+      old.it_interval.tv_nsec = (i64)((old_int % 100) * 10000000);
+      if (syscall_copyout((void *)(usize)arg3, &old, sizeof(old)) < 0)
+        return (u64)-EFAULT;
+    }
+    return 0;
+  }
+  case SYS_TIMER_GETTIME: {
+    struct k_timespec { i64 tv_sec; i64 tv_nsec; };
+    struct k_itimerspec { struct k_timespec it_interval; struct k_timespec it_value; } its;
+    u64 rem = 0, interval = 0;
+    int rc = scheduler_timer_gettime((int)arg0, &rem, &interval);
+    if (rc < 0)
+      return (u64)rc;
+    its.it_value.tv_sec = (i64)(rem / 100);
+    its.it_value.tv_nsec = (i64)((rem % 100) * 10000000);
+    its.it_interval.tv_sec = (i64)(interval / 100);
+    its.it_interval.tv_nsec = (i64)((interval % 100) * 10000000);
+    if (!arg1 || syscall_copyout((void *)(usize)arg1, &its, sizeof(its)) < 0)
+      return (u64)-EFAULT;
+    return 0;
+  }
+  case SYS_TIMER_DELETE:
+    return (u64)scheduler_timer_delete((int)arg0);
   case SYS_SIGPROCMASK: {
     int how = (int)arg0;
     u64 set_val = 0;

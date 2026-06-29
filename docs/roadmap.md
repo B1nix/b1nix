@@ -1377,26 +1377,28 @@ PIE base (`0x500000000000`).
 
 ## M74: Real-Time Signals
 
-- [ ] `deferred` Add `SIGRTMIN..SIGRTMAX` and `sigqueue` payload queuing.
-  **Designed, deferred deliberately (defer-over-hack).** The implementation is
-  scoped — the pending/blocked masks are already `u64` (room to bit 62) and the
-  M29 side-table pattern sidesteps the struct-task-growth paging landmine — but
-  it is an invasive change spread across the *fragile, heavily-tested* signal
-  delivery path: (1) raise `_NSIG` and route every variable-indexed
-  `task->sigactions[sig-1]` site (~12, several in `arch_check_and_deliver_
-  signals` / `scheduler_kill` / the EINTR-restart loop) through a
-  `task_sigaction(t, sig)` helper that returns a side-table slot for the RT
-  range; (2) a per-task RT payload queue (side-table FIFO of `(signo, sigval)`)
-  so RT signals **queue** instead of coalescing; (3) `sigqueue`/`rt_sigqueueinfo`
-  to enqueue; (4) FIFO-ordered delivery (lowest signo, oldest payload first)
-  dequeuing one entry per delivery and clearing the pending bit only when the
-  queue for that signo drains; (5) **native `SA_SIGINFO`** (today only the Linux
-  personality builds a `siginfo_t`) carrying `si_value`. The risk/reward is poor
-  *right now*: b1nix runs its own musl-style libc, so there is **no current RT-
-  signal consumer** (glibc's internal `SIGRTMIN` users don't run here) to
-  validate the edge cases a rushed change to the signal core would introduce.
-  Revisit when a real consumer (a ported glibc program, or POSIX timers/AIO
-  completion via RT signals) lands.
+- [x] `done` **`SIGRTMIN..SIGRTMAX`, `sigqueue` payload queuing, native
+  `SA_SIGINFO`, and POSIX timers** — implemented additively so the standard 1..31
+  signal path is byte-identical. RT signals 32..63 use the free upper bits of the
+  `u64` pending/blocked masks; their sigactions and a per-signo FIFO of queued
+  `(signo, code, value)` payloads live in a lazily-allocated per-task side-table
+  (struct task cannot grow — M29). Delivery (`arch_check_and_deliver_signals`)
+  scans 32..63 after the standard signals, dequeues one instance FIFO (lowest
+  signo, oldest first), and clears the pending bit only when that signo's queue
+  drains — so N sends yield N deliveries (no coalescing). `scheduler_sigqueue`
+  enqueues with a payload; `kill`/`raise` of an RT signal queue one SI_USER
+  instance. **Native `SA_SIGINFO`** now builds a native `siginfo_t`
+  (`struct b1nix_native_siginfo`, layout-matched to userspace) carrying
+  `si_value` — previously only the Linux personality got a siginfo. Syscalls:
+  `SYS_SIGQUEUE`=176. **POSIX timers** (`timer_create`/`settime`/`gettime`/
+  `delete` = 177..180) are the validating consumer: a global timer table, armed
+  in 100 Hz ticks, fired from the timer ISR via `scheduler_sigqueue(SI_TIMER)`
+  (the owner's RT state is pre-allocated at `settime` so the ISR never allocates),
+  freed on task exit. Verified by `M74-SMOKE: ok rt-queue` (3 blocked sends → 3
+  deliveries), `ok rt-sigqueue` (payloads 11/22/33 reach an SA_SIGINFO handler as
+  `si_value` in FIFO order), and `ok rt-timer` (a 20 ms periodic timer raises
+  SIGRTMIN+2 with `sigev_value` 99 repeatedly). Full x86_64 suite **864/0** with
+  every standard-signal test (job control, SIGCHLD, SIGSEGV) still green.
 
 ## M75: On-Device GPU Path
 

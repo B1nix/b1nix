@@ -1272,6 +1272,42 @@ int sigqueue(int pid, int sig, const union sigval value) {
   return 0;
 }
 
+/* M74 POSIX timers. timer_t is an int id (the kernel timer-table index). */
+int timer_create(clockid_t clk_id, struct sigevent *sevp, timer_t *timerid) {
+  int rc = (int)syscall(SYS_TIMER_CREATE, clk_id, (long)sevp, (long)timerid, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+                  struct itimerspec *old_value) {
+  int rc = (int)syscall(SYS_TIMER_SETTIME, timerid, flags, (long)new_value,
+                        (long)old_value);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value) {
+  int rc = (int)syscall(SYS_TIMER_GETTIME, timerid, (long)curr_value, 0, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_delete(timer_t timerid) {
+  int rc = (int)syscall(SYS_TIMER_DELETE, timerid, 0, 0, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+
 #ifdef __x86_64__
 __asm__(
 	".global __sig_restorer\n"

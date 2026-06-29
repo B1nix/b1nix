@@ -140,6 +140,19 @@ typedef struct {
 /* sigqueue(3): send signal `sig` to `pid` with the RT payload `value`. */
 int sigqueue(int pid, int sig, const union sigval value);
 
+/* sigevent notification methods (POSIX). b1nix implements SIGEV_SIGNAL. */
+#define SIGEV_SIGNAL 0
+#define SIGEV_NONE   1
+#define SIGEV_THREAD 2
+
+/* struct sigevent — how a POSIX timer notifies on expiry. Native b1nix layout
+ * (kept minimal: notify method, target signal, and the payload). */
+struct sigevent {
+    int sigev_notify;          /* SIGEV_SIGNAL / SIGEV_NONE */
+    int sigev_signo;           /* signal to raise */
+    union sigval sigev_value;  /* delivered as siginfo->si_value */
+};
+
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,
  * sigset_t is a u64 bitmask). `unsigned long` is 8 bytes on x86_64 but only 4 on
  * the 32-bit port, which shifted sa_restorer/sa_mask to the wrong offsets — the

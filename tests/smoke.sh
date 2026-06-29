@@ -737,6 +737,7 @@ check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enf
 # ── M74: RT signals (POSIX real-time signals queue, do not coalesce) ──
 check_output "$LOG" "M74-SMOKE: ok rt-queue" "M74: 3 blocked SIGRTMIN sends are all delivered after unblock (RT signals queue, not coalesce)"
 check_output "$LOG" "M74-SMOKE: ok rt-sigqueue" "M74: sigqueue payloads reach an SA_SIGINFO handler as si_value in FIFO order"
+check_output "$LOG" "M74-SMOKE: ok rt-timer" "M74: a POSIX interval timer (timer_create/settime) repeatedly raises an RT signal carrying its sigev_value"
 check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 

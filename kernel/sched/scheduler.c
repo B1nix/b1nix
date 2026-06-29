@@ -133,6 +133,23 @@ static struct rt_state *rt_state_get(usize i, int alloc) {
     g_rt_state[i] = kzalloc(sizeof(struct rt_state));
   return g_rt_state[i];
 }
+
+/* M74 POSIX per-process interval timers (timer_create). A small global table —
+ * timers are few system-wide — each owning a task. timer_t is the table index.
+ * The timer tick scans armed timers and queues an RT signal (SI_TIMER) on
+ * expiry, so this builds on the RT-signal machinery above. */
+#define MAX_POSIX_TIMERS 64
+struct posix_timer {
+  int used;
+  usize owner_id;       /* task id that created it */
+  int signo;            /* SIGEV_SIGNAL target signal */
+  union sigval value;   /* sigev_value, delivered as si_value */
+  u64 interval_ticks;   /* 0 = one-shot */
+  u64 next_ticks;       /* absolute fire tick; 0 = disarmed */
+};
+static struct posix_timer g_posix_timers[MAX_POSIX_TIMERS];
+static void posix_timers_tick(void); /* fire expired timers (defined below) */
+
 static u64  g_task_alarm_ticks[MAX_TASKS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
@@ -2295,6 +2312,8 @@ void scheduler_on_timer_tick(void) {
     }
   }
 
+  posix_timers_tick(); /* M74: fire expired POSIX interval timers */
+
   wake_sleepers();
 
   /* M56 timerfd: if any timerfd is armed, wake everyone blocked in
@@ -2489,6 +2508,7 @@ void scheduler_exit_current(int exit_code) {
    * FUTEX_WAIT and terminated before self-detaching) so a later wake on the
    * same key cannot target this slot once it is recycled. */
   scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
 
   /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
    * parent process. Skip the per-task fd/cred/mm teardown, let the reaper
@@ -3595,6 +3615,117 @@ struct sigaction *scheduler_rt_action_current(int sig) {
   return &rs->action[sig - SIGRTMIN];
 }
 
+/* ── M74 POSIX timers ── */
+
+int scheduler_timer_create(int signo, union sigval value) {
+  if (!current_task || signo < 1 || signo > NSIG_MAX)
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
+    if (!g_posix_timers[i].used) {
+      g_posix_timers[i].used = 1;
+      g_posix_timers[i].owner_id = current_task->id;
+      g_posix_timers[i].signo = signo;
+      g_posix_timers[i].value = value;
+      g_posix_timers[i].interval_ticks = 0;
+      g_posix_timers[i].next_ticks = 0;
+      interrupts_restore(flags);
+      return i;
+    }
+  }
+  interrupts_restore(flags);
+  return -EAGAIN;
+}
+
+/* Arm (first_ticks > 0) or disarm (0) timer `id`. interval_ticks == 0 makes it
+ * one-shot. Pre-touches the owner's RT state so the tick path never allocates in
+ * interrupt context. */
+int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
+                            u64 *old_remaining, u64 *old_interval) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    interrupts_restore(flags);
+    return -EINVAL;
+  }
+  if (old_interval)
+    *old_interval = t->interval_ticks;
+  if (old_remaining) {
+    u64 now = scheduler_ticks;
+    *old_remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
+  }
+  if (SIG_IS_RT(t->signo))
+    rt_state_get(task_index(current_task), 1); /* avoid alloc in the tick ISR */
+  t->interval_ticks = interval_ticks;
+  t->next_ticks = first_ticks ? scheduler_ticks + first_ticks : 0;
+  interrupts_restore(flags);
+  return 0;
+}
+
+int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    interrupts_restore(flags);
+    return -EINVAL;
+  }
+  u64 now = scheduler_ticks;
+  if (remaining)
+    *remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
+  if (interval)
+    *interval = t->interval_ticks;
+  interrupts_restore(flags);
+  return 0;
+}
+
+int scheduler_timer_delete(int id) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    interrupts_restore(flags);
+    return -EINVAL;
+  }
+  t->used = 0;
+  t->next_ticks = 0;
+  interrupts_restore(flags);
+  return 0;
+}
+
+/* Free all timers owned by a terminating task (called from the exit path). */
+void scheduler_timer_cleanup_task(usize task_id) {
+  u64 flags = interrupts_save();
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++)
+    if (g_posix_timers[i].used && g_posix_timers[i].owner_id == task_id) {
+      g_posix_timers[i].used = 0;
+      g_posix_timers[i].next_ticks = 0;
+    }
+  interrupts_restore(flags);
+}
+
+/* Called from the timer tick (interrupts already off): fire every armed timer
+ * whose deadline has passed, then re-arm periodic ones or disarm one-shots. */
+static void posix_timers_tick(void) {
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
+    struct posix_timer *t = &g_posix_timers[i];
+    if (!t->used || t->next_ticks == 0 || t->next_ticks > scheduler_ticks)
+      continue;
+    if (SIG_IS_RT(t->signo))
+      scheduler_sigqueue(t->owner_id, t->signo, t->value, B1NIX_SI_TIMER);
+    else
+      scheduler_kill(t->owner_id, t->signo);
+    if (t->interval_ticks)
+      t->next_ticks = scheduler_ticks + t->interval_ticks;
+    else
+      t->next_ticks = 0; /* one-shot: disarm */
+  }
+}
+
 int scheduler_kill_process_group(usize pgrp, int sig) {
   if (sig < 0 || sig >= NSIG)
     return -EINVAL;
@@ -4148,6 +4279,7 @@ void scheduler_deliver_pending_signals(void) {
        * scheduler_exit_current performs; the zombie reaper handles the rest. */
       reparent_children_and_signal_orphans(current_task);
       scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
@@ -4187,6 +4319,7 @@ void scheduler_deliver_pending_signals(void) {
          * above (M46-3). No yield-based teardown — we are inside the scheduler. */
         reparent_children_and_signal_orphans(current_task);
         scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;
