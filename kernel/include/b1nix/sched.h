@@ -403,6 +403,9 @@ void scheduler_wait_cancel(void);
 /* True when the current context may park on a wait channel (scheduler live, real
  * task context, interrupts enabled). Drivers fall back to polling when false. */
 int scheduler_can_block(void);
+/* Kernel CSPRNG-ish entropy source (rdrand, xorshift64* fallback). Shared by
+ * SYS_GETRANDOM and the M71 ASLR load-base randomizer. */
+u64 kernel_random_u64(void);
 void scheduler_wake_task(usize task_id);
 void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);

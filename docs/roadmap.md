@@ -1286,21 +1286,26 @@ PIE base (`0x500000000000`).
 
 ## M71: ASLR and PIE-by-Default
 
-- [ ] `deferred` Randomize the load base (fixed at `0x2000000`/`PIE_LOAD_BASE`,
-  no randomization) and accept `-fPIE -pie` hardened binaries. **Deferred — it
-  unwinds a load-bearing invariant.** A *large* amount of b1nix assumes the fixed
-  userspace base: the in-kernel ELF loader/relocator, the M69 dynamic loader, the
-  signal trampoline placement, the per-process TLS layout, and several ports
-  linked `-Wl,-Ttext-segment=0x2000000` (the native toolchain, V8, rustc). The
-  base is also load-bearing on the (frozen) 32-bit port, where `0x400000` lands
-  *inside* the kernel image. The M69c work already made the **base system PIE by
-  default** (every base program is an `ET_DYN` loaded at the PIE base
-  `0x500000000000`), so the PIE-acceptance half is effectively done; what remains
-  is **randomizing** that base per-exec and auditing every fixed-`0x2000000`
-  assumption out — a security hardening with no functional consumer demand yet,
-  and real regression risk against the green loader. Needs a kernel entropy
-  source for the base (present) plus a careful sweep of the loader/relocator/TLS/
-  trampoline/port-link assumptions. Revisit as a dedicated hardening pass.
+- [x] `done` **PIE-by-default + ASLR (opt-in via `b1nix.aslr`).** The
+  PIE-acceptance half was already shipped by M69c (every base program is an
+  `ET_DYN` loaded at the PIE base `0x500000000000`). The **randomization** half is
+  now implemented: with the `b1nix.aslr` kernel cmdline flag, the elf64 loader
+  shifts the PIE/ET_DYN load base by a 2 MiB-granular random offset (15 bits ×
+  2 MiB = up to ~64 GiB of jitter) drawn from the kernel entropy source
+  (`kernel_random_u64`, rdrand + xorshift64* fallback). The window is provably
+  isolated: the upward-growing mmap arena fills from 4 GiB (V8's ~1.4 TiB
+  reservations stay far below), the shared-library region sits 1 TiB above at
+  `0x600000000000`, and the stack tops out at `0x800000000000` — so a randomized
+  PIE base never collides. `aslr_pie_base()` (`kernel/user/process.c`) gates on
+  the flag; **ET_EXEC images (`load_base == 0` — the fixed-base toolchain/V8/rustc
+  links) are never randomized**, so the load-bearing fixed-`0x2000000`/`-Ttext-
+  segment` invariant is untouched, as is the frozen 32-bit elf32 path. Verified:
+  the **entire** x86_64 smoke suite (all PIE) runs under `b1nix.aslr` and stays
+  green, plus `M71-ASLR: ok randomized` — two execs of the same PIE binary land at
+  different bases (`userspace/bin/m71_aslr.c`). Default is **off** (conservative:
+  no functional consumer demand yet and the loader is a green path); flip the flag
+  on per-boot to harden. Making it default-on is a follow-up policy call once it
+  has soaked on bare metal.
 
 ## M72: Writable Foreign Filesystems and msync
 

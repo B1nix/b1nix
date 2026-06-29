@@ -1456,6 +1456,8 @@ check_output "$LOG" "M73-SMOKE: ok strtoull" "strtoull parses the full uint64 ra
 check_output "$LOG" "M73-SMOKE: ok sysconf-ncpu" "sysconf(_SC_NPROCESSORS_ONLN) reports the real online-CPU count (not a hardcoded 1)"
 check_output "$LOG" "M73-SMOKE: ok abort-sigabrt" "abort() raises SIGABRT (not exit(127))"
 check_output "$LOG" "M73-SMOKE: ok realpath" "realpath resolves ./.. and a symlink to the canonical path (was a strcpy stub)"
+# ── M71: ASLR (PIE load-base randomization, opt-in via b1nix.aslr) ──
+check_output "$LOG" "M71-ASLR: ok randomized" "two execs of the same PIE binary land at different load bases under b1nix.aslr"
 # ── M63: seccomp-bpf ──
 check_output "$LOG" "M63-SMOKE: ok seccomp-errno" "a seccomp filter denies a targeted syscall with ERRNO while others run"
 check_output "$LOG" "M63-SMOKE: ok seccomp-errno-zero" "SECCOMP_RET_ERRNO with errno 0 blocks the syscall and returns 0 (not run)"

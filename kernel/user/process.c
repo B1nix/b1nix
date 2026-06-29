@@ -1,4 +1,5 @@
 #include <b1nix/arch.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/linux_abi.h>
@@ -133,6 +134,25 @@ struct elf64_dyn_object {
 #else
 #define PIE_LOAD_BASE 0x40000000ULL
 #endif
+
+/* M71 ASLR: per-exec load base for PIE/ET_DYN images. Opt-in via the
+ * `b1nix.aslr` kernel cmdline flag (default off — conservative, the loader is a
+ * load-bearing green path). When on, the base is shifted by a 2 MiB-granular
+ * random offset (alignment-preserving; PIE_LOAD_BASE is 2 MiB-aligned) within a
+ * bounded window above PIE_LOAD_BASE. 15 bits of entropy × 2 MiB = up to ~64 GiB
+ * of jitter — isolated between the upward-growing mmap arena (fills from 4 GiB,
+ * V8's ~1.4 TiB reservations stay far below) and the shared-library region at
+ * 0x600000000000 (1 TiB above the base). ET_EXEC images (load_base 0 — the
+ * fixed-base toolchain/V8/rustc links) are never randomized. */
+static u64 aslr_pie_base(void) {
+#ifdef __x86_64__
+  if (bootinfo_has_flag("b1nix.aslr")) {
+    u64 slots = kernel_random_u64() & 0x7fff; /* 15 bits */
+    return PIE_LOAD_BASE + slots * 0x200000ULL;
+  }
+#endif
+  return PIE_LOAD_BASE;
+}
 
 /* Sanity ceiling on a single ELF segment's p_memsz. Any real b1nix binary is a
  * few MiB; a crafted multi-GiB p_memsz must be rejected before kzalloc (OOM =
@@ -1016,7 +1036,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * also walk PT_DYNAMIC and apply R_X86_64_RELATIVE relocations so
    * absolute pointers in the binary (e.g. into .rodata or function
    * tables) point at the relocated base. */
-  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? aslr_pie_base() : 0;
 
   image->entry = ehdr->e_entry + load_base;
   console_write("ELF load: ");

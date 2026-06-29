@@ -66,7 +66,7 @@ static int rdrand_supported(void) {
 }
 #endif
 
-static u64 sys_random_u64(void) {
+u64 kernel_random_u64(void) {
   u64 v = 0;
 #if defined(__x86_64__)
   if (rdrand_supported()) {
@@ -3102,7 +3102,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       usize chunk = len - done;
       if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
       for (usize i = 0; i < chunk; i += sizeof(u64)) {
-        u64 r = sys_random_u64();
+        u64 r = kernel_random_u64();
         usize left = chunk - i;
         usize n = left < sizeof(u64) ? left : sizeof(u64);
         memcpy(tmp + i, &r, n);

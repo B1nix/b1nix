@@ -174,6 +174,7 @@ BINARIES += $(BUILD)/bin/m49_libwayland_server
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
+BINARIES += $(BUILD)/bin/m71_aslr
 # M58: standalone JavaScript interpreter (embeds Duktape) + its smoke test.
 BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke

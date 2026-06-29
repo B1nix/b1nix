@@ -83,6 +83,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m57_smoke \
 	m73_smoke \
 	m63_smoke \
+	m71_aslr \
 	m47_smoke \
 	m48_smoke \
 	m49_smoke \
@@ -1007,7 +1008,7 @@ iso-core: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=core|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
@@ -1018,7 +1019,7 @@ iso-graphics: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=graphics|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
@@ -1029,7 +1030,7 @@ iso-shell: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=shell|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell

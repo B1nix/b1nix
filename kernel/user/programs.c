@@ -2061,6 +2061,20 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  /* M71: ASLR proof — only when randomization is enabled (b1nix.aslr). Two
+   * execs of the same PIE binary must land at different load bases. */
+  if (bootinfo_has_flag("b1nix.aslr")) {
+    u64 m71_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m71-aslr", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m71_pid < 0) {
+      uwrite("M71-ASLR: spawn-fail\n");
+    } else {
+      int m71_status = 0;
+      syscall_dispatch(SYS_WAIT, m71_pid, (u64)(usize)&m71_status, 0, 0, 0, 0);
+    }
+  }
+
   /* M63: seccomp-bpf — filter ERRNO/KILL verdicts, strict mode, inheritance. */
   {
     u64 m63_pid = syscall_dispatch(SYS_SPAWN,
