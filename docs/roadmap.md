@@ -1402,16 +1402,37 @@ PIE base (`0x500000000000`).
 
 ## M75: On-Device GPU Path
 
-- [ ] `deferred` Add EGL/GBM/DRI + LLVMpipe (GPU is virtio-gpu only today);
-  unblocks the Chromium GPU process and HW rendering on real hardware.
-  **Multi-week subsystem, deferred.** The long pole is **LLVMpipe**, which needs
-  a full **LLVM** port to the b1nix ABI (a shader/JIT codegen backend — LLVM is
-  V8/Chromium-scale on its own); on top of that a real DRI/GBM/EGL stack
-  (`gbm_bo` buffer objects, a DRM render-node path, EGLDevice/EGLStream or
-  surfaceless contexts) beyond today's OSMesa-softpipe-to-memory. The existing
-  software path (OSMesa softpipe + the VirGL host-GPU passthrough) already
-  renders; native on-device GPU acceleration is the gap. Revisit alongside any
-  LLVM port (it would also unblock Mesa JIT, M54's deferred LLVMpipe item).
+- [ ] `in-progress` Add LLVMpipe (and later EGL/GBM/DRI) — GPU is virtio-gpu only
+  today. **Correction (2026-06-29): LLVM is already ported to b1nix.** The earlier
+  "needs a full LLVM port from scratch" framing was wrong — the M64 native
+  `clang-22` (`build/native-clang/b1nix/usr/bin/`, ~94 MB) **statically links
+  LLVM 22.1.8 built for the b1nix triple** (X86 target) and executes on b1nix
+  (proven by `tools/clang/clang-proof.sh` / `b1nix.clangrun`). The LLVM→b1nix
+  cross-build works (`tools/build-native-clang.sh` + `tools/patches/llvm/
+  b1nix-triple.patch`, which adds `Triple::B1nix` and a `CMAKE_SYSTEM_NAME=="B1nix"
+  → LLVM_ON_UNIX=1` branch to `HandleLLVMOptions.cmake`).
+  - [x] **Dynamic `libLLVM.so` for b1nix — DONE** (72 MB, ELF `DYN`, `NEEDED:
+    libc.so.1, libgcc_s.so`, exports the ORC/MCJIT + X86 codegen symbols
+    llvmpipe JITs against). Fits the M69 .so loader and avoids the ~94 MB static
+    blow-up. Built from the `b1nix-dyn-build` tree (`DYLIB=ON`). Three real
+    walls solved, **no hacks**: (1) a stale build dir's `cmake -D` reconfigure
+    dropped `LLVM_ON_UNIX` (b1nix not reclassified Unix) → LLVM's own headers
+    failed (`file_status::getSize`, `EnvPathSeparator`); fixed by a **clean**
+    configure so the patched `HandleLLVMOptions.cmake` `B1nix` branch sets
+    `LLVM_ON_UNIX 1`. (2) `-shared` pulled the non-PIC static `libm.a`
+    (R_X86_64_32 in a .so); fixed by linking the **shared** libc — b1nix is
+    musl-style (math is in `libc.so.1`) so `libm.so` is a linker script
+    `INPUT(libc.so.1)`. (3) the cross sysroot's `libc.so.1` was **stale**
+    (pre-dated the `mallinfo2` export) → undefined `mallinfo2`; fixed by
+    refreshing it from the current build — `mallinfo2` was already implemented in
+    `userspace/libc/stdlib.c`, no stub added. Both sysroot fixes are made
+    reproducible by `tools/toolchain/stage-shared-libc.sh`.
+  - **Remaining after the libLLVM.so build:** (1) build Mesa with
+    `-Dgallium-drivers=swrast -Dllvm=enabled` against the b1nix `llvm-config`;
+    (2) wire `llvmpipe` into the existing OSMesa/EGL path (M52/M53) in place of
+    softpipe; (3) smoke-render via the runtime LLVM JIT on b1nix. Then the DRI/GBM/
+    EGL surfaceless stack. The existing OSMesa-softpipe + VirGL passthrough still
+    render in the meantime.
 
 ## M76: USB Host Stack
 
