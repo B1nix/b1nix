@@ -1441,11 +1441,18 @@ PIE base (`0x500000000000`).
     — ccache is not a linker — which newer meson hard-errors on.) The shared
     `libOSMesa.so` link still fails on the pre-existing non-PIC-`libb1nix.a`-in-a-
     .so wall, but b1nix links the static OSMesa path, which is complete.
-  - **Remaining:** (1) link a b1nix GL test ELF against the llvmpipe static libs +
-    `libLLVM.so`, select `llvmpipe` over softpipe; (2) run on b1nix so llvmpipe
-    JITs shaders through `libLLVM.so` (loaded + demand-paged by the M69 loader) and
-    smoke-render; (3) the DRI/GBM/EGL surfaceless stack. OSMesa-softpipe + VirGL
-    still render in the meantime.
+  - [x] **GL demo ELF links llvmpipe + libLLVM.so — DONE.** `MESA_LLVMPIPE=1
+    tools/demos/build-m52-mesa-demo.sh m52_glsl <out>` produces a 13 MB b1nix
+    `ET_EXEC` with `NEEDED: libLLVM-22.so, libc.so.1` — the llvmpipe archives'
+    undefined LLVM C-API symbols resolve cleanly from the shared libLLVM-22, no
+    unresolved symbols. So the whole build chain (b1nix LLVM → libLLVM.so → Mesa
+    llvmpipe static → GL ELF) closes.
+  - **Remaining (runtime):** (1) package the 72 MB `libLLVM-22.so` as
+    `/lib/libLLVM-22.so` on b1nix (a disk/ramdisk module, as d8 does — too big for
+    the initramfs); (2) run the demo with `GALLIUM_DRIVER=llvmpipe` so llvmpipe
+    JITs the GLSL shaders through `libLLVM.so` (loaded + demand-paged by the M69
+    loader — also the self-host-floor validation) and render-verify; (3) the
+    DRI/GBM/EGL surfaceless stack. OSMesa-softpipe + VirGL still render meanwhile.
 
 ## M76: USB Host Stack
 

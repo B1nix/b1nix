@@ -17,8 +17,15 @@ CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 STRIP="$(command -v llvm-strip 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-strip)"
 
-MESA="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-mesa.sh")"
+MESA="$(B1NIX_ARCH="$B1NIX_ARCH" MESA_LLVMPIPE="${MESA_LLVMPIPE:-0}" "$ROOT_DIR/tools/ports/build-mesa.sh")"
 LIBM="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-openlibm.sh")/lib/libm.a"
+
+# M75: with llvmpipe, the Mesa archives carry undefined LLVM C-API symbols that
+# resolve from the shared libLLVM-22 at link/runtime (static Mesa + dynamic LLVM).
+LLVM_LINK=""
+if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
+  LLVM_LINK="-L$ROOT_DIR/build/native-clang/b1nix/usr/lib -lLLVM-22"
+fi
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
@@ -54,6 +61,6 @@ fi
   "$DYN_CRT0" "$OBJ" "$MESA/lib/osmesa_target.o" \
   --start-group $(ls "$MESA"/lib/*.a) "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" \
   $CRT_LIBS "$LIBM" \
-  --whole-archive "$UB/libb1gui.a" --no-whole-archive --end-group $DYN_LIBC
+  --whole-archive "$UB/libb1gui.a" --no-whole-archive --end-group $LLVM_LINK $DYN_LIBC
 
 "$STRIP" "$OUT"
