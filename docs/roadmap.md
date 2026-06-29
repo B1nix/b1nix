@@ -924,10 +924,31 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 
 ## M63: Sandbox
 
-- [ ] `deferred` Add the real sandbox (seccomp-bpf + user/PID/net namespaces +
-  setuid sandbox); none exist today. Only if process isolation is required.
-- This is also what **Chromium's process sandbox** needs; the b1nix Chromium
-  build runs `--no-sandbox` until this lands (port debt, `chromium-port-debt.md`).
+- [x] `done` **seccomp-bpf syscall filtering.** A task installs an immutable
+  classic-BPF filter (`SYS_SECCOMP`/`prctl(PR_SET_SECCOMP)`) or enters strict
+  mode (`SECCOMP_MODE_STRICT`); `kernel/sched/seccomp.c` runs the filter chain
+  over a `struct seccomp_data` on every syscall (hooked at the top of
+  `syscall_dispatch_impl_inner`, gated on a single side-table load so only
+  filtered tasks pay anything) and enforces the verdict by Linux precedence
+  (`KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > TRACE > LOG > ALLOW`): ALLOW
+  proceeds, ERRNO short-circuits with `-errno`, KILL terminates the task with
+  SIGSYS, TRAP raises SIGSYS. A full classic-BPF interpreter (LD/LDX/ST/ALU/JMP/
+  RET/MISC, bounds-checked, fails closed) backs it. Filters are refcount-shared
+  on fork/clone, survive execve, and can only be added (a descendant is always
+  at least as restricted); `PR_SET_NO_NEW_PRIVS` round-trips. Verified by
+  `userspace/bin/m63_smoke.c` (`M63-SMOKE: ok seccomp-errno/kill/strict/inherit/
+  nnp`). Filter state lives in scheduler side-tables (struct task cannot grow —
+  M29 LAPIC-PT invariant).
+- [ ] `deferred` **user/PID/net namespaces + the setuid-sandbox helper.** Each
+  namespace type is its own subsystem (a cloneable, refcounted namespace object
+  threaded through the VFS mount table / PID allocator / netdev+socket layer with
+  `CLONE_NEW*` in `clone`), and the setuid helper needs a trusted broker binary.
+  Large, and only required for the **layered** Chromium sandbox (which is frozen)
+  — seccomp-bpf alone already gives real syscall-surface reduction. Revisit when
+  process/namespace isolation is concretely needed.
+- The seccomp-bpf layer is what **Chromium's syscall sandbox** uses; the b1nix
+  Chromium build still runs `--no-sandbox` until namespaces land too (port debt,
+  `chromium-port-debt.md`).
 
 ## M64: Optional Clang/LLVM Toolchain
 

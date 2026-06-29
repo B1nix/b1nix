@@ -208,6 +208,9 @@ enum {
 	SYS_INOTIFY_RM_WATCH = 172,
 	/* --- M72: writable foreign FS + msync --- */
 	SYS_MSYNC            = 173, /* flush MAP_SHARED dirty pages to the backing file */
+	/* --- M63: seccomp-bpf sandbox --- */
+	SYS_SECCOMP          = 174, /* install a syscall filter */
+	SYS_PRCTL            = 175, /* PR_SET_SECCOMP / PR_SET_NO_NEW_PRIVS */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

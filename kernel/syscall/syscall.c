@@ -11,6 +11,7 @@
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/posix.h>
+#include <b1nix/seccomp.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
@@ -2921,6 +2922,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
   }
 
+  /* M63: seccomp-bpf. A task that installed a filter has every syscall screened
+   * before it runs, using the raw ABI number the caller used (so a Linux-
+   * personality task's filter sees Linux numbers, matching Linux semantics).
+   * ALLOW returns 0 and the call proceeds; a denial returns the filter's -errno
+   * without running the syscall; a KILL verdict terminates the task inside
+   * seccomp_filter_syscall and never returns. Only filtered tasks pay any cost. */
+  if (frame && seccomp_active()) {
+    isize sv = seccomp_filter_syscall(number, arg0, arg1, arg2, arg3, arg4,
+                                      arg5, frame);
+    if (sv != 0)
+      return (u64)sv;
+  }
+
   /* M40 — Linux ABI translation. For a task whose image carries the Linux
    * personality, `number` is a Linux x86_64 syscall number; translate it to the
    * b1nix native number before routing. The CPU calling convention is identical,
@@ -3521,6 +3535,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                           (unsigned int)arg3, (struct statx *)(usize)arg4);
   case SYS_MSYNC:
     return (u64)sys_msync((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  /* --- M63: seccomp-bpf --- */
+  case SYS_SECCOMP: {
+    unsigned int op = (unsigned int)arg0;
+    if (op == SECCOMP_SET_MODE_FILTER)
+      return (u64)seccomp_set_mode_filter((u32)arg1, (const void *)(usize)arg2);
+    if (op == SECCOMP_SET_MODE_STRICT)
+      return (u64)seccomp_set_mode_strict();
+    return (u64)-EINVAL;
+  }
+  case SYS_PRCTL: {
+    int option = (int)arg0;
+    if (option == PR_SET_SECCOMP) {
+      if (arg1 == SECCOMP_MODE_STRICT)
+        return (u64)seccomp_set_mode_strict();
+      if (arg1 == SECCOMP_MODE_FILTER)
+        return (u64)seccomp_set_mode_filter(0, (const void *)(usize)arg2);
+      return (u64)-EINVAL;
+    }
+    if (option == PR_SET_NO_NEW_PRIVS)
+      return (u64)seccomp_set_no_new_privs();
+    if (option == PR_GET_NO_NEW_PRIVS)
+      return (u64)seccomp_get_no_new_privs();
+    return (u64)-EINVAL; /* other prctl options unsupported */
+  }
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));

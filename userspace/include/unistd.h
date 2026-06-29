@@ -210,6 +210,8 @@ int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
  * <fcntl.h>; sendfile in <sys/sendfile.h>. */
 ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
                         size_t len, unsigned int flags);
+/* M63: install a seccomp-bpf syscall filter (also declared in <linux/seccomp.h>). */
+int seccomp(unsigned int op, unsigned int flags, void *args);
 
 int usleep(unsigned int usec);
 

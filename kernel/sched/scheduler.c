@@ -120,6 +120,11 @@ static u64   g_task_cutime[MAX_TASKS];
 static u64   g_task_cstime[MAX_TASKS];
 static u64   g_task_pass[MAX_TASKS];
 static u64   g_min_pass = 0;
+/* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
+ * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
+ * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
+static void *g_task_seccomp[MAX_TASKS];
+static int   g_task_nnp[MAX_TASKS];
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -322,6 +327,13 @@ static struct task *find_unused_task(void) {
  * find_unused_task). The store also publishes any prior writes (e.g. the
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
+  /* M63: drop the task's seccomp filter chain (unref; frees at zero) BEFORE
+   * taking tasks_lock — filter_unref calls kfree and tasks_lock is a leaf lock
+   * that must not nest the heap lock. Idempotent: clears the side-table slot. */
+  {
+    extern void seccomp_release(struct task * t);
+    seccomp_release(t);
+  }
   u64 flags;
   tasks_lock(&flags);
   t->state = TASK_UNUSED;
@@ -972,6 +984,12 @@ int scheduler_fork_current(void) {
   g_task_alarm_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
+  /* M63: the child inherits the parent's seccomp filter chain (shared,
+   * refcounted) and no_new_privs — a fork can only ever be as restricted. */
+  {
+    extern void seccomp_inherit(struct task * parent, struct task * child);
+    seccomp_inherit(parent, child);
+  }
   g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
   g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++) {
@@ -1224,6 +1242,23 @@ u64 task_tls_base(const struct task *t) {
 void task_set_tls_base(struct task *t, u64 base) {
   if (!t) return;
   g_task_tls_base[task_index(t)] = base;
+}
+/* M63: seccomp filter chain + no_new_privs accessors (side-table backed). */
+void *task_seccomp_filter(const struct task *t) {
+  if (!t) return 0;
+  return g_task_seccomp[task_index(t)];
+}
+void task_set_seccomp_filter(struct task *t, void *f) {
+  if (!t) return;
+  g_task_seccomp[task_index(t)] = f;
+}
+int task_no_new_privs(const struct task *t) {
+  if (!t) return 0;
+  return g_task_nnp[task_index(t)];
+}
+void task_set_no_new_privs(struct task *t, int v) {
+  if (!t) return;
+  g_task_nnp[task_index(t)] = v;
 }
 u64 task_child_tid_clear(const struct task *t) {
   if (!t) return 0;
@@ -1627,6 +1662,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   task_set_tls_base(child, (flags & B1NIX_CLONE_SETTLS) ? tls : 0);
   task_set_child_tid_clear(child,
                             (flags & B1NIX_CLONE_CHILD_CLEARTID) ? ctid : 0);
+  /* M63: a cloned thread shares its creator's seccomp filter (same process). */
+  {
+    extern void seccomp_inherit(struct task * parent, struct task * child);
+    seccomp_inherit(parent, child);
+  }
 
   /* Parent linkage. Threads are joined via futex, not waitpid — point them
    * at the parent's parent so waitpid(-1, ...) skips them. */

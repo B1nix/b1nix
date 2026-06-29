@@ -287,6 +287,11 @@ u64  task_saved_sigmask(const struct task *t);
 int  task_has_saved_sigmask(const struct task *t);
 void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);
 void task_clear_saved_sigmask(struct task *t);
+/* M63: seccomp filter chain + no_new_privs (side-table backed, see seccomp.c). */
+void *task_seccomp_filter(const struct task *t);
+void  task_set_seccomp_filter(struct task *t, void *f);
+int   task_no_new_privs(const struct task *t);
+void  task_set_no_new_privs(struct task *t, int v);
 /* sigaltstack side-table (per-task, NOT a struct task field). */
 void task_get_altstack(const struct task *t, kstack_t *out);
 int  task_set_altstack(struct task *t, const kstack_t *ss);

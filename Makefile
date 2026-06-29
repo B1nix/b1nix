@@ -82,6 +82,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m46_smoke \
 	m57_smoke \
 	m73_smoke \
+	m63_smoke \
 	m47_smoke \
 	m48_smoke \
 	m49_smoke \
@@ -338,6 +339,7 @@ KERNEL_SOURCES := \
 	kernel/sched/m28_ctxbench.c \
 	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
+	kernel/sched/seccomp.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/tui_common.c \

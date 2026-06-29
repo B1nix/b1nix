@@ -2060,6 +2060,19 @@ static int init_main(int argc, const char **argv) {
       syscall_dispatch(SYS_WAIT, m73_pid, (u64)(usize)&m73_status, 0, 0, 0, 0);
     }
   }
+
+  /* M63: seccomp-bpf — filter ERRNO/KILL verdicts, strict mode, inheritance. */
+  {
+    u64 m63_pid = syscall_dispatch(SYS_SPAWN,
+                                   (u64)(usize) "/bin/m63-smoke", 0,
+                                   0, 0, 0, 0);
+    if ((isize)m63_pid < 0) {
+      uwrite("M63-SMOKE: spawn-fail\n");
+    } else {
+      int m63_status = 0;
+      syscall_dispatch(SYS_WAIT, m63_pid, (u64)(usize)&m63_status, 0, 0, 0, 0);
+    }
+  }
   }
 
   if (smoke_graphics) {

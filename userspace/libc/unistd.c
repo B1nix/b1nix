@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 #include <termios.h>
 #include <poll.h>
 #include <errno.h>
@@ -1947,9 +1948,27 @@ int flock(int fd, int operation) {
 int feclearexcept(int e) { (void)e; return 0; }
 int feraiseexcept(int e) { (void)e; return 0; }
 int fetestexcept(int e) { (void)e; return 0; }
-/* prctl: b1nix has no prctl syscall; the operations callers use (thread/VMA
- * naming) are cosmetic, so report success without doing anything. */
-int prctl(int option, ...) { (void)option; return 0; }
+/* prctl: the seccomp-relevant options (PR_SET_SECCOMP, PR_SET/GET_NO_NEW_PRIVS)
+ * route to the kernel (M63); the remaining options callers use are cosmetic
+ * (thread/VMA naming) and report success without doing anything. */
+int prctl(int option, ...) {
+  if (option == PR_SET_SECCOMP || option == PR_SET_NO_NEW_PRIVS ||
+      option == PR_GET_NO_NEW_PRIVS) {
+    va_list ap;
+    va_start(ap, option);
+    unsigned long a1 = va_arg(ap, unsigned long);
+    unsigned long a2 = va_arg(ap, unsigned long);
+    va_end(ap);
+    return _check_err(syscall(SYS_PRCTL, option, a1, a2));
+  }
+  (void)option;
+  return 0;
+}
+
+/* seccomp(2): install a syscall filter or enter strict mode (M63). */
+int seccomp(unsigned int op, unsigned int flags, void *args) {
+  return _check_err(syscall(SYS_SECCOMP, op, flags, args));
+}
 int fegetexceptflag(fexcept_t *flagp, int e) { (void)e; if (flagp) *flagp = 0; return 0; }
 int fesetexceptflag(const fexcept_t *flagp, int e) { (void)flagp; (void)e; return 0; }
 int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
