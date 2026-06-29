@@ -3425,6 +3425,17 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     return 0;
   }
+  case SYS_SIGQUEUE: {
+    /* sigqueue(pid, sig, sival). RT signals queue with the payload delivered to
+     * an SA_SIGINFO handler as si_value; a standard signal is posted via the
+     * normal coalescing path (no payload). */
+    int sig = (int)arg1;
+    union sigval v;
+    v.sival_ptr = (void *)(usize)arg2;
+    if (SIG_IS_RT(sig))
+      return (u64)scheduler_sigqueue((usize)arg0, sig, v, B1NIX_SI_QUEUE);
+    return (u64)scheduler_kill((usize)arg0, sig);
+  }
   case SYS_SIGPROCMASK: {
     int how = (int)arg0;
     u64 set_val = 0;

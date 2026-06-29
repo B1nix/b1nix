@@ -204,6 +204,11 @@ enum {
   SYS_MSYNC            = 173,
   SYS_SECCOMP          = 174,
   SYS_PRCTL            = 175,
+  SYS_SIGQUEUE         = 176,
+  SYS_TIMER_CREATE     = 177,
+  SYS_TIMER_SETTIME    = 178,
+  SYS_TIMER_GETTIME    = 179,
+  SYS_TIMER_DELETE     = 180,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

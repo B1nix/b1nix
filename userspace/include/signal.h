@@ -116,6 +116,14 @@ int raise(int sig);
 #define SIG_IGN ((void (*)(int))1)
 #define SIG_ERR ((void (*)(int))-1)
 
+/* M74: POSIX real-time signal payload, carried by sigqueue(3) and a
+ * SIGEV_SIGNAL timer's sigev_value, delivered to an SA_SIGINFO handler as
+ * siginfo->si_value. */
+union sigval {
+    int sival_int;
+    void *sival_ptr;
+};
+
 typedef struct {
     int si_signo;
     int si_code;
@@ -124,7 +132,13 @@ typedef struct {
     int si_uid;
     int si_status;
     void *si_addr;   /* faulting address for SIGSEGV/SIGBUS/SIGFPE/SIGILL */
+    /* si_value is appended last so existing field offsets are unchanged. RT
+     * signals (sigqueue / POSIX timers) deliver their payload here. */
+    union sigval si_value;
 } siginfo_t;
+
+/* sigqueue(3): send signal `sig` to `pid` with the RT payload `value`. */
+int sigqueue(int pid, int sig, const union sigval value);
 
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,
  * sigset_t is a u64 bitmask). `unsigned long` is 8 bytes on x86_64 but only 4 on

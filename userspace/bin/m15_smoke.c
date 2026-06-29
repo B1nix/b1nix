@@ -39,6 +39,17 @@ static void rt_handler(int sig) {
   g_rt_hits++;
 }
 
+/* M74: SA_SIGINFO RT handler — records the sigqueue payload (si_value) of each
+ * delivery to verify FIFO order and that the payload survives delivery. */
+static volatile int g_rt_vals[4];
+static volatile int g_rt_n;
+static void rt_si_handler(int sig, siginfo_t *si, void *uc) {
+  (void)sig;
+  (void)uc;
+  if (si && g_rt_n < 4)
+    g_rt_vals[g_rt_n++] = si->si_value.sival_int;
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -343,6 +354,48 @@ int main(int argc, char **argv) {
     } else {
       char b[64];
       snprintf(b, sizeof(b), "M74-SMOKE: fail rt-queue hits=%d\n", g_rt_hits);
+      marker(b);
+    }
+  }
+
+  /* M74: sigqueue payload via SA_SIGINFO. Queue three distinct payloads on a
+   * blocked RT signal; the handler must receive them in FIFO order with the
+   * correct si_value. */
+  {
+    struct sigaction sa;
+    struct sigaction old;
+    memset(&sa, 0, sizeof(sa));
+    memset(&old, 0, sizeof(old));
+    sa.sa_sigaction = rt_si_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_restorer = __sig_restorer;
+    int ok = 0;
+    if ((int)syscall(SYS_SIGNAL, SIGRTMIN + 1, &sa, &old) == 0) {
+      sigset_t s;
+      sigemptyset(&s);
+      sigaddset(&s, SIGRTMIN + 1);
+      int self = (int)syscall(SYS_GETPID);
+      sigprocmask(SIG_BLOCK, &s, NULL);
+      g_rt_n = 0;
+      union sigval v;
+      v.sival_int = 11;
+      sigqueue(self, SIGRTMIN + 1, v);
+      v.sival_int = 22;
+      sigqueue(self, SIGRTMIN + 1, v);
+      v.sival_int = 33;
+      sigqueue(self, SIGRTMIN + 1, v);
+      sigprocmask(SIG_UNBLOCK, &s, NULL);
+      for (int i = 0; i < 64 && g_rt_n < 3; i++)
+        syscall(SYS_YIELD);
+      ok = (g_rt_n == 3 && g_rt_vals[0] == 11 && g_rt_vals[1] == 22 &&
+            g_rt_vals[2] == 33);
+    }
+    if (ok) {
+      marker("M74-SMOKE: ok rt-sigqueue\n");
+    } else {
+      char b[96];
+      snprintf(b, sizeof(b), "M74-SMOKE: fail rt-sigqueue n=%d v=%d,%d,%d\n",
+               g_rt_n, g_rt_vals[0], g_rt_vals[1], g_rt_vals[2]);
       marker(b);
     }
   }

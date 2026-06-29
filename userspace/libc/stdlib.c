@@ -1261,6 +1261,17 @@ int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   return 0;
 }
 
+/* M74: sigqueue(3) — send `sig` to `pid` with an RT payload. RT signals queue
+ * and deliver the payload to an SA_SIGINFO handler as si_value. */
+int sigqueue(int pid, int sig, const union sigval value) {
+  int rc = (int)syscall(SYS_SIGQUEUE, pid, sig, (long)value.sival_ptr, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+
 #ifdef __x86_64__
 __asm__(
 	".global __sig_restorer\n"

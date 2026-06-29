@@ -211,6 +211,12 @@ enum {
 	/* --- M63: seccomp-bpf sandbox --- */
 	SYS_SECCOMP          = 174, /* install a syscall filter */
 	SYS_PRCTL            = 175, /* PR_SET_SECCOMP / PR_SET_NO_NEW_PRIVS */
+	/* --- M74: POSIX real-time signals + timers --- */
+	SYS_SIGQUEUE         = 176, /* sigqueue(pid, sig, sival_ptr) */
+	SYS_TIMER_CREATE     = 177, /* timer_create(clockid, sigev, timer_t*) */
+	SYS_TIMER_SETTIME    = 178, /* timer_settime(id, flags, new, old) */
+	SYS_TIMER_GETTIME    = 179, /* timer_gettime(id, curr) */
+	SYS_TIMER_DELETE     = 180, /* timer_delete(id) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
