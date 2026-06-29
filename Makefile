@@ -416,9 +416,18 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
-	smoke smoke-quick graphics-smoke memory-smoke
+	smoke smoke-quick graphics-smoke memory-smoke build-all
 
 all: $(KERNEL_ELF)
+
+# build-all — one orchestrator that builds the whole working system in dependency
+# order by reusing the existing build scripts (see tools/build-all.sh). Forwards
+# ARCH; pass extra flags via BUILD_ALL_ARGS, e.g.:
+#   make build-all                                  # OS + ISO (default)
+#   make build-all BUILD_ALL_ARGS=--all             # + every opt-in component
+#   make build-all BUILD_ALL_ARGS=--with-dynamic-clang
+build-all:
+	ARCH=$(ARCH) sh tools/build-all.sh $(BUILD_ALL_ARGS)
 
 objects: $(OBJECTS)
 
