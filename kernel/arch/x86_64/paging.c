@@ -593,6 +593,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   if (!(error_code & PF_PRESENT) && !has_deferred_leaf &&
       fault_addr >= 0x40000000 &&
       fault_addr < 0x00007FFFFFFFFFFF) {
+    /* M88: enforce PROT_NONE. A pure reservation (mmap PROT_NONE) records a VMA
+     * but installs no leaf PTE, so without this a wild user access would fall
+     * into the zero-fill below and silently succeed. If the faulting address
+     * lands in a no-access VMA, refuse to service it — the caller delivers
+     * SIGSEGV. The VMA list is sorted by start, so the walk early-exits past the
+     * address; this runs only on the anonymous not-present path (PROT_NONE
+     * regions never have present/lazy leaves), not on heap-growth faults that
+     * have no covering VMA. mprotect splits the VMA and updates ->prot, so a
+     * region later made accessible (e.g. V8 committing part of a reservation)
+     * has prot != PROT_NONE here and falls through to the normal zero-fill. */
+    if ((error_code & PF_USER) && current_task) {
+      for (struct vm_area *v = current_task->vma_list;
+           v && v->start <= page_aligned; v = v->next) {
+        if (page_aligned < v->end) {
+          if (v->prot == PROT_NONE)
+            return -1; /* no access -> SIGSEGV */
+          break;       /* covering VMA grants access; service normally */
+        }
+      }
+    }
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
     u64 frame = pmm_alloc_frame();
     if (!frame) {

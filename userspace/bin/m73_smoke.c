@@ -347,6 +347,46 @@ static void test_msync(void) {
   marker("M72-SMOKE: ok msync");
 }
 
+/* M88: a PROT_NONE reservation must fault on access, not silently zero-fill.
+ * A child reads a PROT_NONE page and must die with SIGSEGV; after mprotect to
+ * RW the same page is accessible. (Verifies the #PF handler honors a no-access
+ * VMA instead of routing the wild touch into the anonymous zero-fill path.) */
+static void test_prot_none(void) {
+  char *p = mmap(NULL, 4096, PROT_NONE, MAP_ANONYMOUS | MAP_PRIVATE, -1, 0);
+  if (p == MAP_FAILED) {
+    fail("prot-none-mmap", -1, 0);
+    return;
+  }
+  pid_t c = fork();
+  if (c == 0) {
+    volatile char sink = p[0]; /* must SIGSEGV — no access */
+    (void)sink;
+    _exit(0); /* reached only if PROT_NONE was not enforced */
+  }
+  int st = 0;
+  waitpid(c, &st, 0);
+  if (!(WIFSIGNALED(st) && WTERMSIG(st) == SIGSEGV)) {
+    fail("prot-none-segv", WIFSIGNALED(st) ? WTERMSIG(st) : -1, SIGSEGV);
+    munmap(p, 4096);
+    return;
+  }
+  /* After mprotect to RW the page becomes usable (proves the enforcement is
+   * scoped to the reservation, not a blanket block). */
+  if (mprotect(p, 4096, PROT_READ | PROT_WRITE) != 0) {
+    fail("prot-none-mprotect", -1, 0);
+    munmap(p, 4096);
+    return;
+  }
+  p[0] = 0x5a;
+  if (p[0] != 0x5a) {
+    fail("prot-none-rw", p[0], 0x5a);
+    munmap(p, 4096);
+    return;
+  }
+  munmap(p, 4096);
+  marker("M88-SMOKE: ok prot-none");
+}
+
 /* M85: a focused libc Tier-A correctness pass (Chromium-debt + audit overlap). */
 static void test_libc_correctness(void) {
   /* strtoull parses the full 64-bit unsigned range (the old cast-through-strtol
@@ -517,6 +557,7 @@ int main(void) {
   test_splice();
   test_msync();
   test_inotify();
+  test_prot_none();
   test_libc_correctness();
   marker(g_fail ? "M73-SMOKE: done (with failures)" : "M73-SMOKE: done");
   return g_fail ? 1 : 0;

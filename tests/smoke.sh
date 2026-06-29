@@ -1451,6 +1451,8 @@ check_output "$LOG" "M73-SMOKE: ok inotify-modify" "inotify reports IN_MODIFY on
 check_output "$LOG" "M73-SMOKE: ok inotify-dir" "inotify reports IN_CREATE/IN_DELETE (with entry name) for a watched directory"
 check_output "$LOG" "M73-SMOKE: ok inotify-rmwatch" "inotify_rm_watch removes a watch"
 check_output "$LOG" "M72-SMOKE: ok msync" "msync validates flags (EINVAL), unmapped range (ENOMEM), and syncs a mapped MAP_SHARED range"
+# ── M88: PROT_NONE is enforced (wild access faults, not zero-fills) ──
+check_output "$LOG" "M88-SMOKE: ok prot-none" "a PROT_NONE reservation SIGSEGVs on access; mprotect to RW then succeeds"
 # ── M85: libc Tier-A correctness (Chromium-debt overlap) ──
 check_output "$LOG" "M73-SMOKE: ok strtoull" "strtoull parses the full uint64 range + ERANGE; strtoll honors signed range/base16"
 check_output "$LOG" "M73-SMOKE: ok sysconf-ncpu" "sysconf(_SC_NPROCESSORS_ONLN) reports the real online-CPU count (not a hardcoded 1)"
