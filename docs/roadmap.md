@@ -896,8 +896,12 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [x] `done` **Headless Ozone backend** wired for the b1nix Chromium build
   (`ozone_platform_headless=true`, `ozone_auto_platforms=false`; ANGLE/libpci
   fallbacks patched in `tools/patches/chromium/apply.sh`).
-- [ ] `planned` A **displayd/Wayland-shaped** Ozone backend (window, surface,
-  input, vsync) for on-screen rendering — tracked under M66.
+- [ ] `deferred` A **displayd/Wayland-shaped** Ozone backend (window, surface,
+  input, vsync) for on-screen rendering — tracked under M66. **Gated on the
+  frozen M62**: an Ozone platform backend is only useful once `content_shell`
+  links and renders (M62), and M61/M62 are frozen. The display-server pieces it
+  would sit on (M47–M49 Wayland compositor + M52/M59 EGL/Mesa) already exist;
+  what's missing is the Chromium engine to drive. Revisit if Chromium is unfrozen.
 
 ## Frozen - M61: Chromium Build Target
 
@@ -959,11 +963,18 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
   existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
   `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
-- [x] **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
-  directory/config so the working GCC V8 build remains the fallback. Reuse the
-  GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
-- [x]  **Phase 3 — broaden optional coverage.** Move individual C++
-  ports to Clang only after their existing smoke tests pass with both frontends.
+- [ ] `deferred` **Phase 2 — V8 Sandbox Clang build.** Declined/deferred: the
+  GCC V8 build already ships with `v8_enable_sandbox` on and runs (M58), so the
+  "build V8 with Clang for the sandbox" rationale never materialized into a
+  concrete libc++-only requirement. Keeping a *second* full V8 GN output
+  directory/config building under Clang is a large, slow build with no functional
+  gain over the proven GCC path; revisit only if a sandbox feature concretely
+  requires libc++/Clang. (Phase 1 cross `clang++` and the native self-host Clang
+  are both done and exercised in smoke.)
+- [ ] `deferred` **Phase 3 — broaden optional coverage.** Move individual C++
+  ports to Clang only after their existing smoke tests pass with both frontends —
+  open-ended optional hardening with no current driver. Deferred until a port
+  concretely needs Clang; GCC remains the default and the M26 self-host path.
 - [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh --b1nix-elf`
   cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
   with b1nix as the host triple; `make install-native-toolchain` stages only this
@@ -1254,8 +1265,21 @@ PIE base (`0x500000000000`).
 
 ## M71: ASLR and PIE-by-Default
 
-- [ ] `planned` Randomize the load base (fixed at `0x2000000`/`PIE_LOAD_BASE`,
-  no randomization) and accept `-fPIE -pie` hardened binaries.
+- [ ] `deferred` Randomize the load base (fixed at `0x2000000`/`PIE_LOAD_BASE`,
+  no randomization) and accept `-fPIE -pie` hardened binaries. **Deferred — it
+  unwinds a load-bearing invariant.** A *large* amount of b1nix assumes the fixed
+  userspace base: the in-kernel ELF loader/relocator, the M69 dynamic loader, the
+  signal trampoline placement, the per-process TLS layout, and several ports
+  linked `-Wl,-Ttext-segment=0x2000000` (the native toolchain, V8, rustc). The
+  base is also load-bearing on the (frozen) 32-bit port, where `0x400000` lands
+  *inside* the kernel image. The M69c work already made the **base system PIE by
+  default** (every base program is an `ET_DYN` loaded at the PIE base
+  `0x500000000000`), so the PIE-acceptance half is effectively done; what remains
+  is **randomizing** that base per-exec and auditing every fixed-`0x2000000`
+  assumption out — a security hardening with no functional consumer demand yet,
+  and real regression risk against the green loader. Needs a kernel entropy
+  source for the base (present) plus a careful sweep of the loader/relocator/TLS/
+  trampoline/port-link assumptions. Revisit as a dedicated hardening pass.
 
 ## M72: Writable Foreign Filesystems and msync
 
@@ -1315,17 +1339,52 @@ PIE base (`0x500000000000`).
 
 ## M74: Real-Time Signals
 
-- [ ] `planned` Add `SIGRTMIN..SIGRTMAX` and `sigqueue` payload queuing.
+- [ ] `deferred` Add `SIGRTMIN..SIGRTMAX` and `sigqueue` payload queuing.
+  **Designed, deferred deliberately (defer-over-hack).** The implementation is
+  scoped — the pending/blocked masks are already `u64` (room to bit 62) and the
+  M29 side-table pattern sidesteps the struct-task-growth paging landmine — but
+  it is an invasive change spread across the *fragile, heavily-tested* signal
+  delivery path: (1) raise `_NSIG` and route every variable-indexed
+  `task->sigactions[sig-1]` site (~12, several in `arch_check_and_deliver_
+  signals` / `scheduler_kill` / the EINTR-restart loop) through a
+  `task_sigaction(t, sig)` helper that returns a side-table slot for the RT
+  range; (2) a per-task RT payload queue (side-table FIFO of `(signo, sigval)`)
+  so RT signals **queue** instead of coalescing; (3) `sigqueue`/`rt_sigqueueinfo`
+  to enqueue; (4) FIFO-ordered delivery (lowest signo, oldest payload first)
+  dequeuing one entry per delivery and clearing the pending bit only when the
+  queue for that signo drains; (5) **native `SA_SIGINFO`** (today only the Linux
+  personality builds a `siginfo_t`) carrying `si_value`. The risk/reward is poor
+  *right now*: b1nix runs its own musl-style libc, so there is **no current RT-
+  signal consumer** (glibc's internal `SIGRTMIN` users don't run here) to
+  validate the edge cases a rushed change to the signal core would introduce.
+  Revisit when a real consumer (a ported glibc program, or POSIX timers/AIO
+  completion via RT signals) lands.
 
 ## M75: On-Device GPU Path
 
-- [ ] `planned` Add EGL/GBM/DRI + LLVMpipe (GPU is virtio-gpu only today);
+- [ ] `deferred` Add EGL/GBM/DRI + LLVMpipe (GPU is virtio-gpu only today);
   unblocks the Chromium GPU process and HW rendering on real hardware.
+  **Multi-week subsystem, deferred.** The long pole is **LLVMpipe**, which needs
+  a full **LLVM** port to the b1nix ABI (a shader/JIT codegen backend — LLVM is
+  V8/Chromium-scale on its own); on top of that a real DRI/GBM/EGL stack
+  (`gbm_bo` buffer objects, a DRM render-node path, EGLDevice/EGLStream or
+  surfaceless contexts) beyond today's OSMesa-softpipe-to-memory. The existing
+  software path (OSMesa softpipe + the VirGL host-GPU passthrough) already
+  renders; native on-device GPU acceleration is the gap. Revisit alongside any
+  LLVM port (it would also unblock Mesa JIT, M54's deferred LLVMpipe item).
 
 ## M76: USB Host Stack
 
-- [ ] `planned` Add a general xHCI stack (HID + mass storage); input is PS/2 +
-  narrow xHCI keyboard only.
+- [ ] `deferred` Add a general xHCI stack (HID + mass storage); input is PS/2 +
+  narrow xHCI keyboard only. **Whole device class, deferred.** A general xHCI
+  controller driver (command/event/transfer rings, slot/endpoint context
+  management, port routing) plus the USB core (device enumeration, descriptor
+  parsing, configuration, the hub driver) and at least two class drivers (HID
+  boot+report protocol; USB Mass Storage = BBB/UASP over SCSI, which then plugs
+  into the existing block layer). Each layer is substantial and the current
+  narrow xHCI-keyboard path (M37) covers the only hard requirement (input on
+  real hardware). Revisit when USB mass storage or broader HID is concretely
+  needed on bare metal.
 
 ## M77: Raise Global Resource Caps
 
