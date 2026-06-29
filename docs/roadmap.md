@@ -1427,12 +1427,25 @@ PIE base (`0x500000000000`).
     refreshing it from the current build — `mallinfo2` was already implemented in
     `userspace/libc/stdlib.c`, no stub added. Both sysroot fixes are made
     reproducible by `tools/toolchain/stage-shared-libc.sh`.
-  - **Remaining after the libLLVM.so build:** (1) build Mesa with
-    `-Dgallium-drivers=swrast -Dllvm=enabled` against the b1nix `llvm-config`;
-    (2) wire `llvmpipe` into the existing OSMesa/EGL path (M52/M53) in place of
-    softpipe; (3) smoke-render via the runtime LLVM JIT on b1nix. Then the DRI/GBM/
-    EGL surfaceless stack. The existing OSMesa-softpipe + VirGL passthrough still
-    render in the meantime.
+  - [x] **Mesa llvmpipe built against the b1nix libLLVM.so — DONE.** Opt-in via
+    `MESA_LLVMPIPE=1 tools/ports/build-mesa.sh` (`-Dllvm=enabled
+    -Dshared-llvm=enabled -Dcpp_rtti=false`; softpipe path untouched by default).
+    The cross wall — meson runs `llvm-config` on the *host* but ours is a b1nix
+    binary — is solved by `tools/ports/b1nix-llvm-config`, a host wrapper that
+    reports the b1nix LLVM paths + `-lLLVM-22` + `--has-rtti NO`. meson finds
+    "LLVM ... found: YES 22.1.8" with all requested modules; the RTTI match holds
+    (LLVM is `-fno-rtti`, so Mesa is `cpp_rtti=false`). `libllvmpipe.a` /
+    `libgallium.a` / `libosmesa_st.a` build and carry **undefined LLVM C-API
+    symbols** (`LLVMBuildAnd`, …) that resolve from `libLLVM.so` at link/runtime —
+    i.e. static Mesa + dynamic LLVM. (Also fixed a real script bug: `CC_LD=ccache`
+    — ccache is not a linker — which newer meson hard-errors on.) The shared
+    `libOSMesa.so` link still fails on the pre-existing non-PIC-`libb1nix.a`-in-a-
+    .so wall, but b1nix links the static OSMesa path, which is complete.
+  - **Remaining:** (1) link a b1nix GL test ELF against the llvmpipe static libs +
+    `libLLVM.so`, select `llvmpipe` over softpipe; (2) run on b1nix so llvmpipe
+    JITs shaders through `libLLVM.so` (loaded + demand-paged by the M69 loader) and
+    smoke-render; (3) the DRI/GBM/EGL surfaceless stack. OSMesa-softpipe + VirGL
+    still render in the meantime.
 
 ## M76: USB Host Stack
 

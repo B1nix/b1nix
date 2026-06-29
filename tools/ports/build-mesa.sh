@@ -108,6 +108,17 @@ LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-ar
 
 INI="$BUILD_DIR/cross.ini"
 DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL'"
+# M75: opt-in llvmpipe (MESA_LLVMPIPE=1). meson runs llvm-config on the host, so
+# point it at the b1nix-LLVM wrapper; enable the shared libLLVM-22 and match its
+# -fno-rtti (cpp_rtti=false). Default (unset) keeps the proven softpipe build.
+LLVM_CONFIG_LINE=""
+MESON_LLVM_OPTS="-Dllvm=disabled"
+if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
+  LLVM_CONFIG_LINE="llvm-config = '$ROOT_DIR/tools/ports/b1nix-llvm-config'"
+  MESON_LLVM_OPTS="-Dllvm=enabled -Dshared-llvm=enabled -Dcpp_rtti=false"
+  # Separate meson dir so the llvmpipe config never collides with the softpipe one.
+  MESON_BUILD="$BUILD_DIR/meson-llvmpipe"
+fi
 cat > "$INI" <<EOF
 [binaries]
 c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
@@ -115,6 +126,7 @@ cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CXX']
 ar = '$CROSS/bin/$B1NIX_TRIPLET-ar'
 strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
 pkg-config = 'false'
+$LLVM_CONFIG_LINE
 [host_machine]
 system = 'linux'
 cpu_family = '$MFAM'
@@ -191,11 +203,11 @@ perl -0pi -e 's/static void virgl_disk_cache_create\(struct virgl_screen \*scree
 perl -0pi -e 'unless (/#define MIN\(a,\s*b\)/) { s/(#include [^\n]*\n)/$1#ifndef MIN\n#define MIN(a, b) ((a) < (b) ? (a) : (b))\n#endif\n#ifndef MAX\n#define MAX(a, b) ((a) > (b) ? (a) : (b))\n#endif\n/; }' "$SRC_DIR/src/gallium/drivers/virgl/virgl_video.c"
 
 if [ ! -f "$MESON_BUILD/build.ninja" ]; then
-  if [ -n "$CCACHE" ]; then
-    export CC_LD="$CCACHE"
-  fi
+  # NOTE: do NOT export CC_LD="$CCACHE" — CC_LD is meson's *linker*, and ccache
+  # is not a linker (newer meson hard-errors: "Unsupported linker ... ccache").
+  # ccache wrapping, if wanted, belongs on the compiler command in cross.ini.
   ( cd "$SRC_DIR" && meson setup "$MESON_BUILD" --cross-file "$INI" \
-      -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= -Dllvm=disabled -Dosmesa=true \
+      -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= $MESON_LLVM_OPTS -Dosmesa=true \
       -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dopengl=true \
       -Dgles1=disabled -Dgles2=disabled -Dshared-glapi=disabled \
       -Ddefault_library=static -Dzstd=disabled -Dlibunwind=disabled \

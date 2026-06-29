@@ -1,0 +1,37 @@
+#!/bin/sh
+# Host-runnable llvm-config wrapper for the b1nix-target LLVM (M75 llvmpipe).
+#
+# Mesa's meson runs `llvm-config` on the BUILD host to discover LLVM, but the
+# b1nix llvm-config is a target (b1nix) binary that cannot run here. This wrapper
+# answers meson's queries for our cross LLVM: it reports the b1nix install paths
+# and the single shared libLLVM-22 (built with LLVM_BUILD_LLVM_DYLIB=ON), and
+# RTTI=NO (our LLVM is -fno-rtti — Mesa must be configured -Dcpp_rtti=false to
+# match). The component/target lists are delegated to the host llvm-config, which
+# is the same LLVM major (22) and lists the core+X86 modules Mesa requests
+# (bitwriter/engine/mcjit/core/executionengine/scalaropts/transformutils/
+# instcombine); our X86-only build provides all of those.
+PREFIX="${B1NIX_LLVM_PREFIX:-$(cd "$(dirname "$0")/../.." && pwd)/build/native-clang/b1nix/usr}"
+HOST_LLVM_CONFIG="${HOST_LLVM_CONFIG:-/usr/bin/llvm-config}"
+DEFS="-D_GNU_SOURCE -D__STDC_CONSTANT_MACROS -D__STDC_FORMAT_MACROS -D__STDC_LIMIT_MACROS"
+
+has() { for a in "$@"; do case "$a" in "$NEED") return 0;; esac; done; return 1; }
+
+NEED=--version;      has "$@" && { echo "22.1.8"; exit 0; }
+NEED=--prefix;       has "$@" && { echo "$PREFIX"; exit 0; }
+NEED=--includedir;   has "$@" && { echo "$PREFIX/include"; exit 0; }
+NEED=--libdir;       has "$@" && { echo "$PREFIX/lib"; exit 0; }
+NEED=--has-rtti;     has "$@" && { echo "NO"; exit 0; }
+NEED=--shared-mode;  has "$@" && { echo "shared"; exit 0; }
+NEED=--targets-built; has "$@" && { echo "X86"; exit 0; }
+NEED=--host-target;  has "$@" && { echo "x86_64-b1nix"; exit 0; }
+NEED=--cppflags;     has "$@" && { echo "-I$PREFIX/include $DEFS"; exit 0; }
+NEED=--cflags;       has "$@" && { echo "-I$PREFIX/include $DEFS"; exit 0; }
+NEED=--cxxflags;     has "$@" && { echo "-I$PREFIX/include -std=c++17 -fno-exceptions -fno-rtti $DEFS"; exit 0; }
+NEED=--ldflags;      has "$@" && { echo "-L$PREFIX/lib"; exit 0; }
+NEED=--system-libs;  has "$@" && { echo ""; exit 0; }
+NEED=--libs;         has "$@" && { echo "-lLLVM-22"; exit 0; }
+NEED=--libfiles;     has "$@" && { echo "$PREFIX/lib/libLLVM-22.so"; exit 0; }
+NEED=--components;    has "$@" && { "$HOST_LLVM_CONFIG" --components; exit 0; }
+
+# Anything else: delegate to the host llvm-config (structural queries only).
+exec "$HOST_LLVM_CONFIG" "$@"
