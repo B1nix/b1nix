@@ -1447,6 +1447,10 @@ check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a by
 check_output "$LOG" "M73-SMOKE: ok fallocate" "fallocate mode 0 grows + zero-fills; KEEP_SIZE does not grow"
 check_output "$LOG" "M73-SMOKE: ok splice" "splice moves data file->pipe->file intact"
 check_output "$LOG" "M72-SMOKE: ok msync" "msync validates flags (EINVAL), unmapped range (ENOMEM), and syncs a mapped MAP_SHARED range"
+# ── M85: libc Tier-A correctness (Chromium-debt overlap) ──
+check_output "$LOG" "M73-SMOKE: ok strtoull" "strtoull parses the full uint64 range + ERANGE; strtoll honors signed range/base16"
+check_output "$LOG" "M73-SMOKE: ok sysconf-ncpu" "sysconf(_SC_NPROCESSORS_ONLN) reports the real online-CPU count (not a hardcoded 1)"
+check_output "$LOG" "M73-SMOKE: ok abort-sigabrt" "abort() raises SIGABRT (not exit(127))"
 # ── M63: seccomp-bpf ──
 check_output "$LOG" "M63-SMOKE: ok seccomp-errno" "a seccomp filter denies a targeted syscall with ERRNO while others run"
 check_output "$LOG" "M63-SMOKE: ok seccomp-kill" "a seccomp KILL_PROCESS verdict terminates the task with SIGSYS"

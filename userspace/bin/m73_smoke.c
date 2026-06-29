@@ -26,6 +26,8 @@
 #include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
+#include <sys/wait.h>
+#include <signal.h>
 #include <unistd.h>
 
 static int g_fail;
@@ -344,6 +346,52 @@ static void test_msync(void) {
   marker("M72-SMOKE: ok msync");
 }
 
+/* M85: a focused libc Tier-A correctness pass (Chromium-debt + audit overlap). */
+static void test_libc_correctness(void) {
+  /* strtoull parses the full 64-bit unsigned range (the old cast-through-strtol
+   * truncated it). */
+  errno = 0;
+  unsigned long long u = strtoull("18446744073709551615", NULL, 10);
+  if (u != 18446744073709551615ULL) {
+    fail("strtoull-max", (long)u, -1);
+    return;
+  }
+  /* overflow sets ERANGE and clamps to ULLONG_MAX. */
+  errno = 0;
+  u = strtoull("99999999999999999999999", NULL, 10);
+  if (u != 18446744073709551615ULL || errno != ERANGE) {
+    fail("strtoull-erange", (long)errno, ERANGE);
+    return;
+  }
+  /* strtoll honors the signed range + base 16. */
+  if (strtoll("-0x10", NULL, 16) != -16) {
+    fail("strtoll-hex", (long)strtoll("-0x10", NULL, 16), -16);
+    return;
+  }
+  ok("strtoull");
+
+  /* sysconf reports the real online-CPU count (was hardcoded 1). */
+  long ncpu = sysconf(_SC_NPROCESSORS_ONLN);
+  if (ncpu < 1) {
+    fail("sysconf-ncpu", ncpu, 1);
+    return;
+  }
+  ok("sysconf-ncpu");
+
+  /* abort() raises SIGABRT (was exit(127)). Check in a child. */
+  pid_t c = fork();
+  if (c == 0) {
+    abort();
+    _exit(0); /* unreachable */
+  }
+  int st = 0;
+  waitpid(c, &st, 0);
+  if (WIFSIGNALED(st) && WTERMSIG(st) == SIGABRT)
+    ok("abort-sigabrt");
+  else
+    fail("abort-sigabrt", WIFSIGNALED(st) ? WTERMSIG(st) : -1, SIGABRT);
+}
+
 int main(void) {
   marker("M73-SMOKE: start");
   test_statx();
@@ -352,6 +400,7 @@ int main(void) {
   test_fallocate();
   test_splice();
   test_msync();
+  test_libc_correctness();
   marker(g_fail ? "M73-SMOKE: done (with failures)" : "M73-SMOKE: done");
   return g_fail ? 1 : 0;
 }

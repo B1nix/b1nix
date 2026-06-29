@@ -6,6 +6,8 @@
 #include "syscall.h"
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
+#include <unistd.h>
 #include <sys/mman.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -107,7 +109,16 @@ void _Exit(int status)
 
 void abort(void)
 {
-	exit(127);
+	/* POSIX: abort() raises SIGABRT (so a handler / core dump runs), and if the
+	 * signal is caught and the handler returns, unblock SIGABRT and re-raise so
+	 * it cannot be ignored. Only if that still does not terminate do we _exit. */
+	raise(SIGABRT);
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGABRT);
+	sigprocmask(SIG_UNBLOCK, &set, 0);
+	raise(SIGABRT);
+	_exit(127);
 }
 
 /* ── Dynamic memory allocator ───────────────────────────────────────────────
@@ -565,14 +576,71 @@ unsigned long strtoul(const char *nptr, char **endptr, int base)
 	return (unsigned long)strtol(nptr, endptr, base);
 }
 
-long long strtoll(const char *nptr, char **endptr, int base)
-{
-	return (long long)strtol(nptr, endptr, base);
-}
-
+/* Real 64-bit unsigned parser (the old cast-through-strtol truncated the range
+ * and never set ERANGE). Honors base 0 (0x→16, 0→8, else 10) and 2..36, leading
+ * sign, and clamps overflow to ULLONG_MAX with errno=ERANGE. */
 unsigned long long strtoull(const char *nptr, char **endptr, int base)
 {
-	return (unsigned long long)strtol(nptr, endptr, base);
+	const char *s = nptr;
+	while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+	int neg = 0;
+	if (*s == '+' || *s == '-') neg = (*s++ == '-');
+	if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		s += 2;
+		base = 16;
+	} else if (base == 0 && s[0] == '0') {
+		base = 8;
+	} else if (base == 0) {
+		base = 10;
+	}
+	const unsigned long long umax = ~0ULL;
+	unsigned long long cutoff = umax / (unsigned)base;
+	int cutlim = (int)(umax % (unsigned)base);
+	unsigned long long acc = 0;
+	int any = 0, overflow = 0;
+	for (;; s++) {
+		int c = (unsigned char)*s, d;
+		if (c >= '0' && c <= '9') d = c - '0';
+		else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+		else break;
+		if (d >= base) break;
+		any = 1;
+		if (overflow || acc > cutoff || (acc == cutoff && d > cutlim))
+			overflow = 1;
+		else
+			acc = acc * (unsigned)base + (unsigned)d;
+	}
+	if (endptr) *endptr = (char *)(any ? s : nptr);
+	if (overflow) {
+		errno = ERANGE;
+		return umax;
+	}
+	return neg ? (0ULL - acc) : acc;
+}
+
+/* Real 64-bit signed parser: parse the magnitude as unsigned, then clamp to
+ * [LLONG_MIN, LLONG_MAX] with ERANGE. */
+long long strtoll(const char *nptr, char **endptr, int base)
+{
+	const char *s = nptr;
+	while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+	int neg = (*s == '-');
+	unsigned long long v = strtoull(nptr, endptr, base); /* sign already applied */
+	const unsigned long long llmax = 0x7fffffffffffffffULL;
+	if (neg) {
+		unsigned long long m = 0ULL - v; /* positive magnitude */
+		if (m > llmax + 1ULL) {
+			errno = ERANGE;
+			return (long long)0x8000000000000000ULL; /* LLONG_MIN */
+		}
+		return (long long)v; /* v is already the two's-complement negation */
+	}
+	if (v > llmax) {
+		errno = ERANGE;
+		return (long long)llmax;
+	}
+	return (long long)v;
 }
 
 static void swap(char *a, char *b, size_t size) {

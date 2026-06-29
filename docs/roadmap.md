@@ -1442,12 +1442,22 @@ PIE base (`0x500000000000`).
 
 ## M85: libc Tier-A correctness pass (musl-grade)
 
-- [ ] `planned` Fix the correctness-relevant libc gaps the audit flagged:
-  `strtoull`/`strtoll` just cast `strtol` (uint64 truncation, no ERANGE),
-  fully-unbuffered stdio + single-`read()` `fread` short reads, `realpath`=`strcpy`
-  (non-resolving), `perror` prints literal `"error"`, `strtod` not correctly
-  rounded / `strtof`/`strtold`→double, `abort()`=`exit(127)` (no SIGABRT),
-  `getaddrinfo` numeric-port/single-result. Mostly a focused musl-port pass.
+- [x] `partial` Fix the correctness-relevant libc gaps the audit flagged.
+  **Done this pass:** `strtoull`/`strtoll` are now real 64-bit parsers (full
+  unsigned range, base 0/2-36, overflow → `ERANGE`-clamped — no more
+  cast-through-`strtol` truncation); `abort()` raises `SIGABRT` (re-raises with
+  it unblocked, then `_exit(127)`) instead of a plain `exit(127)`; `perror`
+  writes `"<s>: <strerror(errno)>"` to stderr instead of a literal `"error"`;
+  `sysconf(_SC_NPROCESSORS_ONLN/CONF)` returns the **real** online-CPU count via
+  `sched_getaffinity`+`CPU_COUNT` (was a hardcoded 1 — a Chromium-port-debt item
+  that capped browser thread-pool sizing to one core). Verified by
+  `M73-SMOKE: ok strtoull/sysconf-ncpu/abort-sigabrt`.
+- [ ] `deferred` **Remaining audit items** (each its own focused musl-port):
+  `realpath` resolving (`.`/`..`/symlink walk — needs per-component lstat, not a
+  `strcpy`); fully-buffered stdio + multi-read `fread` (today's stdio is
+  unbuffered with single-`read()` semantics — correct results, lower throughput);
+  correctly-rounded `strtod` and real `strtof`/`strtold` (not double); richer
+  `getaddrinfo` (numeric-port/multi-result). Revisit as the second musl pass.
 
 ## M86: Per-thread CPU accounting + signal targeting
 

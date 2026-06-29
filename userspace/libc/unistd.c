@@ -1736,11 +1736,18 @@ long sysconf(int name) {
   case _SC_PAGESIZE:
     return 4096;
   case _SC_NPROCESSORS_CONF:
-  case _SC_NPROCESSORS_ONLN:
-    /* ponytail: report 1 — no userspace CPU-count primitive yet, and a single
-     * worker is plenty for a software renderer. Wire to /sys/.../cpu/online if
-     * a port ever needs real parallelism. */
+  case _SC_NPROCESSORS_ONLN: {
+    /* Real online-CPU count from the affinity mask (b1nix is SMP). Reporting 1
+     * made Chromium et al. size their thread pools for a single core (Chromium
+     * port debt). sched_getaffinity returns the online-CPU set. */
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      int n = CPU_COUNT(&set);
+      if (n > 0)
+        return n;
+    }
     return 1;
+  }
   case _SC_PHYS_PAGES:
   case _SC_AVPHYS_PAGES: {
     struct sysinfo si;
