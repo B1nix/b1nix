@@ -79,11 +79,14 @@ int seccomp_set_no_new_privs(void);
 int seccomp_get_no_new_privs(void);
 
 /* Run the calling task's filter (if any) over a syscall. Returns:
- *   0          -> allow (proceed with the syscall)
- *   negative   -> the syscall must return this value (-errno) without running
- * Kills the task directly (no return) on a KILL verdict. */
-isize seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
-                             u64 a4, u64 a5, struct interrupt_frame *frame);
+ *   0 -> allow (proceed with the syscall normally)
+ *   1 -> blocked: do NOT run the syscall; return *out_ret to userspace instead
+ *        (this can legitimately be 0 — SECCOMP_RET_ERRNO with errno 0 means
+ *        "deny but report success", so a 0/nonzero return convention would be
+ *        wrong). Kills the task directly (no return) on a KILL verdict. */
+int seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
+                           u64 a4, u64 a5, struct interrupt_frame *frame,
+                           isize *out_ret);
 
 /* True if the task has any seccomp restriction installed (fast gate so the
  * common no-filter path costs a single load). */

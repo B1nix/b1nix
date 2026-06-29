@@ -305,8 +305,9 @@ static int strict_allows(u64 nr) {
          nr == SYS_SIGRETURN;
 }
 
-isize seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
-                             u64 a4, u64 a5, struct interrupt_frame *frame) {
+int seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
+                           u64 a4, u64 a5, struct interrupt_frame *frame,
+                           isize *out_ret) {
   struct seccomp_filter *f =
       (struct seccomp_filter *)task_seccomp_filter(current_task);
   if (!f)
@@ -356,23 +357,30 @@ isize seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
     }
   }
 
+  /* Return 1 (blocked) with *out_ret set to the value the syscall must return —
+   * NOT a nonzero-return convention, because SECCOMP_RET_ERRNO(0) is a legitimate
+   * "deny but return 0" verdict (the syscall must NOT run yet returns success).
+   * 0 (allowed) means run the syscall normally. */
   switch (verdict & SECCOMP_RET_ACTION_FULL) {
   case SECCOMP_RET_ALLOW:
   case SECCOMP_RET_LOG:
-    return 0;
+    return 0; /* allow */
   case SECCOMP_RET_ERRNO: {
     u32 e = verdict & SECCOMP_RET_DATA;
     if (e > 4095)
       e = 4095; /* Linux clamps to MAX_ERRNO */
-    return -(isize)e;
+    *out_ret = -(isize)e; /* errno 0 → blocked, returns 0 to userspace */
+    return 1;
   }
   case SECCOMP_RET_TRAP:
     /* Deliver SIGSYS to the task; if it has no handler the default kills it. */
     scheduler_kill(current_task->id, SIGSYS);
-    return -(isize)EPERM; /* the syscall is denied regardless */
+    *out_ret = -(isize)EPERM; /* the syscall is denied regardless */
+    return 1;
   case SECCOMP_RET_TRACE:
     /* No tracer attached (ptrace is M80) — Linux treats "no tracer" as ENOSYS. */
-    return -(isize)ENOSYS;
+    *out_ret = -(isize)ENOSYS;
+    return 1;
   case SECCOMP_RET_KILL_THREAD:
   case SECCOMP_RET_KILL_PROCESS:
   default:
@@ -382,6 +390,7 @@ isize seccomp_filter_syscall(u64 number, u64 a0, u64 a1, u64 a2, u64 a3,
     console_write_dec(number);
     console_write(")\n");
     scheduler_exit_current(TASK_EXIT_SIGNALED | SIGSYS);
-    return -(isize)EPERM; /* unreachable */
+    *out_ret = -(isize)EPERM; /* unreachable */
+    return 1;
   }
 }

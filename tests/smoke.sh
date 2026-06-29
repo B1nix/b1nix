@@ -1453,6 +1453,7 @@ check_output "$LOG" "M73-SMOKE: ok sysconf-ncpu" "sysconf(_SC_NPROCESSORS_ONLN) 
 check_output "$LOG" "M73-SMOKE: ok abort-sigabrt" "abort() raises SIGABRT (not exit(127))"
 # ── M63: seccomp-bpf ──
 check_output "$LOG" "M63-SMOKE: ok seccomp-errno" "a seccomp filter denies a targeted syscall with ERRNO while others run"
+check_output "$LOG" "M63-SMOKE: ok seccomp-errno-zero" "SECCOMP_RET_ERRNO with errno 0 blocks the syscall and returns 0 (not run)"
 check_output "$LOG" "M63-SMOKE: ok seccomp-kill" "a seccomp KILL_PROCESS verdict terminates the task with SIGSYS"
 check_output "$LOG" "M63-SMOKE: ok seccomp-strict" "SECCOMP_MODE_STRICT kills on a syscall outside read/write/exit/sigreturn"
 check_output "$LOG" "M63-SMOKE: ok seccomp-inherit" "a forked child inherits the parent's seccomp filter"

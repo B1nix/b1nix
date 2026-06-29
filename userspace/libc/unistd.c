@@ -2069,8 +2069,14 @@ int fallocate(int fd, int mode, off_t offset, off_t len) {
  * does NOT set errno (POSIX contract). */
 int posix_fallocate(int fd, off_t offset, off_t len) {
   if (offset < 0 || len <= 0) return EINVAL;
-  if (fallocate(fd, 0, offset, len) < 0) return errno;
-  return 0;
+  /* POSIX: posix_fallocate MUST NOT modify the global errno; fallocate() (via
+   * _check_err) does set it on failure, so save and restore it around the call. */
+  int saved = errno;
+  int rc = 0;
+  if (fallocate(fd, 0, offset, len) < 0)
+    rc = errno;
+  errno = saved;
+  return rc;
 }
 
 /* b1nix has no mremap syscall; report failure so callers fall back to

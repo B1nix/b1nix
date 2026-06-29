@@ -206,6 +206,10 @@ int vfs_open(const char *path);
 int vfs_open_flags(const char *path, int flags);
 isize vfs_read(int handle, char *buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
+/* Positioned I/O: read/write at `offset` without touching the fd's own offset
+ * (thread-safe pread/pwrite; non-seekable handles return ESPIPE). */
+isize vfs_pread(int handle, char *buffer, usize size, u64 offset);
+isize vfs_pwrite(int handle, const char *buffer, usize size, u64 offset);
 int vfs_poll(int handle_idx, struct b1nix_pollfd *pfd);
 void vfs_close(int handle);
 /* Close a handle not (or no longer) reachable through an fd table. */

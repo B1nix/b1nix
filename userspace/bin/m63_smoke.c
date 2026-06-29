@@ -78,6 +78,25 @@ static void test_errno_allow(void) {
     fail("seccomp-errno");
 }
 
+/* SECCOMP_RET_ERRNO with errno 0: the syscall must be BLOCKED (not run) yet
+ * return 0 to userspace. getpid normally returns a real pid > 0, so a 0 result
+ * proves the call was intercepted with a 0 errno rather than executed. */
+static void test_errno_zero(void) {
+  pid_t c = fork();
+  if (c == 0) {
+    if (install_filter(SYS_GETPID, SECCOMP_RET_ERRNO | 0) != 0)
+      _exit(2);
+    long r = syscall(SYS_GETPID); /* blocked, returns 0 (did NOT run) */
+    _exit(r == 0 ? 0 : 1);
+  }
+  int st = 0;
+  waitpid(c, &st, 0);
+  if (WIFEXITED(st) && WEXITSTATUS(st) == 0)
+    ok("seccomp-errno-zero");
+  else
+    fail("seccomp-errno-zero");
+}
+
 static void test_kill(void) {
   pid_t c = fork();
   if (c == 0) {
@@ -147,6 +166,7 @@ static void test_nnp(void) {
 int main(void) {
   marker("M63-SMOKE: start");
   test_errno_allow();
+  test_errno_zero();
   test_kill();
   test_strict();
   test_inherit();

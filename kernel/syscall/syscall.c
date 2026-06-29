@@ -354,43 +354,32 @@ static isize sys_write(int fd, const void *buf, usize count) {
  * and advance the fd's own offset". Returns bytes copied or -errno. */
 static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
                              usize count) {
-  isize saved_in = -1, saved_out = -1;
-  if (in_off) {
-    saved_in = vfs_lseek(in_fd, 0, B1NIX_SEEK_CUR);
-    if (saved_in < 0)
-      return -ESPIPE; /* in_fd must be seekable when an offset is given */
-    if (vfs_lseek(in_fd, (isize)*in_off, B1NIX_SEEK_SET) < 0)
-      return -EINVAL;
-  }
-  if (out_off) {
-    saved_out = vfs_lseek(out_fd, 0, B1NIX_SEEK_CUR);
-    if (saved_out < 0) {
-      if (in_off)
-        vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
-      return -ESPIPE;
-    }
-    if (vfs_lseek(out_fd, (isize)*out_off, B1NIX_SEEK_SET) < 0) {
-      if (in_off)
-        vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
-      return -EINVAL;
-    }
-  }
-
+  /* Use positioned I/O (vfs_pread/pwrite) for the explicit-offset side so the
+   * shared descriptor's own file offset is never disturbed — thread-safe, unlike
+   * an lseek-save-restore that another thread sharing the fd could observe
+   * mid-transfer. A NULL offset uses and advances the fd's own offset. */
   char kbuf[4096];
   isize total = 0;
   isize err = 0;
+  u64 ipos = in_off ? *in_off : 0;
+  u64 opos = out_off ? *out_off : 0;
   while (count > 0) {
     usize chunk = count > sizeof(kbuf) ? sizeof(kbuf) : count;
-    isize r = vfs_read(in_fd, kbuf, chunk);
+    isize r = in_off ? vfs_pread(in_fd, kbuf, chunk, ipos)
+                     : vfs_read(in_fd, kbuf, chunk);
     if (r < 0) {
       err = r;
       break;
     }
     if (r == 0)
       break; /* EOF on input */
+    if (in_off)
+      ipos += (u64)r;
     isize w_done = 0;
     while (w_done < r) {
-      isize w = vfs_write(out_fd, kbuf + w_done, (usize)(r - w_done));
+      isize w = out_off
+                    ? vfs_pwrite(out_fd, kbuf + w_done, (usize)(r - w_done), opos)
+                    : vfs_write(out_fd, kbuf + w_done, (usize)(r - w_done));
       if (w < 0) {
         err = w;
         break;
@@ -398,6 +387,8 @@ static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
       if (w == 0)
         break;
       w_done += w;
+      if (out_off)
+        opos += (u64)w;
     }
     total += w_done;
     count -= (usize)w_done;
@@ -407,19 +398,10 @@ static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
       break; /* short read = EOF */
   }
 
-  /* Publish the new positions to the caller's offset vars and restore the fd
-   * offsets we were asked to preserve. */
-  if (in_off) {
-    isize cur = vfs_lseek(in_fd, 0, B1NIX_SEEK_CUR);
-    *in_off = (cur >= 0) ? (u64)cur : *in_off;
-    vfs_lseek(in_fd, saved_in, B1NIX_SEEK_SET);
-  }
-  if (out_off) {
-    isize cur = vfs_lseek(out_fd, 0, B1NIX_SEEK_CUR);
-    *out_off = (cur >= 0) ? (u64)cur : *out_off;
-    vfs_lseek(out_fd, saved_out, B1NIX_SEEK_SET);
-  }
-
+  if (in_off)
+    *in_off = ipos;
+  if (out_off)
+    *out_off = opos;
   if (total == 0 && err)
     return err;
   return total;
@@ -2929,10 +2911,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
    * without running the syscall; a KILL verdict terminates the task inside
    * seccomp_filter_syscall and never returns. Only filtered tasks pay any cost. */
   if (frame && seccomp_active()) {
-    isize sv = seccomp_filter_syscall(number, arg0, arg1, arg2, arg3, arg4,
-                                      arg5, frame);
-    if (sv != 0)
-      return (u64)sv;
+    isize sv = 0;
+    if (seccomp_filter_syscall(number, arg0, arg1, arg2, arg3, arg4, arg5,
+                               frame, &sv))
+      return (u64)sv; /* blocked — sv is the value to return (may be 0) */
   }
 
   /* M40 — Linux ABI translation. For a task whose image carries the Linux

@@ -15,6 +15,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/serial.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
+#include <b1nix/spinlock.h>
 #include <b1nix/serial_tty.h>
 #include <b1nix/net.h>
 #include <b1nix/tlb.h>
@@ -268,19 +269,50 @@ struct irq_action {
   void *ctx;
 };
 static struct irq_action g_irq_actions[IRQ_LINES][IRQ_SHARERS];
+/* Serialises register/unregister (writers) so two drivers claiming a slot on the
+ * same line cannot clobber each other. The dispatcher (reader) stays lock-free —
+ * it only does atomic ACQUIRE loads of the fn field — so it never contends with,
+ * or deadlocks against, a writer even when an IRQ fires mid-registration. */
+static spinlock_t g_irq_lock = SPINLOCK_INIT;
 
 int irq_register_handler(u8 irq, irq_handler_fn fn, void *ctx) {
   if (irq >= IRQ_LINES || fn == 0)
     return -1;
+  u64 flags;
+  spin_lock_irqsave(&g_irq_lock, &flags);
   for (int i = 0; i < IRQ_SHARERS; i++) {
     if (g_irq_actions[irq][i].fn == 0) {
       g_irq_actions[irq][i].ctx = ctx;
       /* Publish ctx before fn so the dispatcher (possibly on another CPU)
        * never sees a handler with a stale/NULL context. */
       __atomic_store_n(&g_irq_actions[irq][i].fn, fn, __ATOMIC_RELEASE);
+      spin_unlock_irqrestore(&g_irq_lock, flags);
       return 0;
     }
   }
+  spin_unlock_irqrestore(&g_irq_lock, flags);
+  return -1;
+}
+
+/* Remove a previously-registered (fn, ctx) handler from `irq`. Returns 0 if a
+ * matching slot was found and cleared, -1 otherwise. The fn is cleared with a
+ * RELEASE store so a concurrent dispatcher sees the old handler in full or sees
+ * it gone — never a torn entry. */
+int irq_unregister_handler(u8 irq, irq_handler_fn fn, void *ctx) {
+  if (irq >= IRQ_LINES || fn == 0)
+    return -1;
+  u64 flags;
+  spin_lock_irqsave(&g_irq_lock, &flags);
+  for (int i = 0; i < IRQ_SHARERS; i++) {
+    if (g_irq_actions[irq][i].fn == fn && g_irq_actions[irq][i].ctx == ctx) {
+      __atomic_store_n(&g_irq_actions[irq][i].fn, (irq_handler_fn)0,
+                       __ATOMIC_RELEASE);
+      g_irq_actions[irq][i].ctx = 0;
+      spin_unlock_irqrestore(&g_irq_lock, flags);
+      return 0;
+    }
+  }
+  spin_unlock_irqrestore(&g_irq_lock, flags);
   return -1;
 }
 

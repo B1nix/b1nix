@@ -1022,10 +1022,16 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
-  u64 pte = pt[pt_index(vaddr)];
+  if (!(pt[pt_index(vaddr)] & VMM_PRESENT)) return 0;
 
-  if (pte & VMM_ACCESSED) {
-    pt[pt_index(vaddr)] = pte & ~VMM_ACCESSED;
+  /* Atomic clear: the MMU sets the Accessed/Dirty bits in this PTE from other
+   * CPUs concurrently. A plain read-modify-write would clobber a hardware A/D
+   * update landing between the read and the store, losing it. `lock and` (via
+   * __atomic_fetch_and) clears our bit while preserving every other bit the
+   * hardware races to set, and returns the prior value so we can test it. */
+  u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_ACCESSED,
+                               __ATOMIC_SEQ_CST);
+  if (old & VMM_ACCESSED) {
     invalidate_page(vaddr);
     return 1;
   }
@@ -1052,11 +1058,13 @@ int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr) {
   if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
-  u64 pte = pt[pt_index(vaddr)];
-  if (!(pte & VMM_PRESENT)) return 0;
+  if (!(pt[pt_index(vaddr)] & VMM_PRESENT)) return 0;
 
-  if (pte & VMM_DIRTY) {
-    pt[pt_index(vaddr)] = pte & ~VMM_DIRTY;
+  /* Atomic clear (see paging_test_and_clear_accessed): `lock and` so a
+   * concurrent hardware Accessed/Dirty set on another CPU is not lost. */
+  u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_DIRTY,
+                               __ATOMIC_SEQ_CST);
+  if (old & VMM_DIRTY) {
     invalidate_page(vaddr);
     return 1;
   }
