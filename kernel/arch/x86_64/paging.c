@@ -695,11 +695,20 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
           u64 file_page = file_offset & ~(PAGE_SIZE - 1);
 
           if (vma->node->inode->type == VFS_FILE) {
+            /* M72: a writable MAP_SHARED file page is potentially-dirty the
+             * moment it is mapped — stores through the PTE won't fault again, so
+             * we cannot observe the write later. Mark the page-cache entry dirty
+             * now so reactive reclaim writes it back instead of dropping it as
+             * "clean", which used to lose mmap stores that raced ahead of msync.
+             * Read-only or MAP_PRIVATE mappings are untouched. */
+            int mark_dirty = vma_shared && (vma->prot & PROT_WRITE);
             struct page_cache_entry *page = page_cache_get_page(vma->node->inode, file_page);
             if (page) {
               pmm_free_frame(frame); // drop the freshly allocated frame
               frame = page->frame;
               pmm_ref_frame(frame);  // VMA references it
+              if (mark_dirty)
+                page_cache_mark_dirty(page);
               page_cache_put_page(page);
               shared_cache_frame = 1;
             } else if (vma->node->inode->read_cb) {
@@ -707,6 +716,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
               if (res >= 0) {
                 if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
                   pmm_ref_frame(frame); // cache ref + VMA ref
+                  if (mark_dirty) {
+                    struct page_cache_entry *pe =
+                        page_cache_get_page(vma->node->inode, file_page);
+                    if (pe) {
+                      page_cache_mark_dirty(pe);
+                      page_cache_put_page(pe);
+                    }
+                  }
                 }
               } else {
                 pmm_free_frame(frame);

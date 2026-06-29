@@ -293,11 +293,11 @@ out:
   close(pfd[1]);
 }
 
-/* M72: msync syscall contract — argument validation is deterministic and is
- * what we assert. (The end-to-end mmap-store durability round-trip is a
- * best-effort check only: under memory pressure a MAP_SHARED file page can be
- * reclaimed by the page cache before msync runs, losing its dirty state — a
- * known eviction-layer gap documented in the roadmap, not a msync-syscall bug.) */
+/* M72: msync syscall contract — argument validation (EINVAL/ENOMEM/0). The
+ * end-to-end mmap-store *durability* across page-cache reclaim is verified
+ * deterministically by M14 (`M14-SMOKE: ok mmap-durable`, on real ext4 with a
+ * forced drop_caches), now that writable MAP_SHARED pages are marked dirty on
+ * map-in so reclaim writes them back instead of dropping them clean. */
 static void test_msync(void) {
   const char *p = "/tmp/m72_msync";
   char init[4096];

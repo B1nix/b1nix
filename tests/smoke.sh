@@ -716,6 +716,7 @@ check_output "$LOG" "M14-SMOKE: ok invalid-fs" "mounting invalid filesystem type
 check_output "$LOG" "M14-SMOKE: ok stress-loop" "repeated create/write/read/delete loop completes successfully"
 check_output "$LOG" "M14-SMOKE: ok large-file" "large file bounds allocation and verification successful"
 check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization works on mounts"
+check_output "$LOG" "M14-SMOKE: ok mmap-durable" "M72: a writable MAP_SHARED mmap store survives forced page-cache reclaim (drop_caches) and is read back from disk"
 check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
 
 # ── M15 IPC, Security & Standard OS Features ──

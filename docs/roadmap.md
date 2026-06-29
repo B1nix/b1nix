@@ -1309,28 +1309,29 @@ PIE base (`0x500000000000`).
 
 ## M72: Writable Foreign Filesystems and msync
 
-- [x] `partial` **`msync` syscall** (`SYS_MSYNC` = 173). The libc `msync` is no
-  longer a return-0 stub; the kernel handler walks the range,
-  `paging_test_and_clear_dirty()`s each page (new M72 paging helper) and, for the
+- [x] `done` **`msync` syscall + mmap-store durability across reclaim**
+  (`SYS_MSYNC` = 173). The libc `msync` is no longer a return-0 stub; the kernel
+  handler walks the range, `paging_test_and_clear_dirty()`s each page and, for the
   pages userspace actually wrote, writes that page-frame's contents straight to
-  the backing file via the inode `write_cb` (the durable path; it also marks any
-  resident page-cache entry dirty for `fsync`/eviction). `MS_ASYNC` schedules
-  (mark-dirty only); `MS_INVALIDATE` is a no-op (mappers share the frame).
-  Argument validation is verified deterministically by `userspace/bin/m73_smoke.c`
-  (`M72-SMOKE: ok msync`: `MS_SYNC|MS_ASYNC` → `EINVAL`, unmapped range →
-  `ENOMEM`, valid `MS_SYNC` → 0).
-  - **Known limitation (verification deferred):** the end-to-end mmap-store
-    durability round-trip (write through a `MAP_SHARED` mapping, `msync`, read it
-    back via a fresh fd) is **not** reliably observable, because a writable
-    `MAP_SHARED` file page sets only the hardware PTE dirty bit on an mmap store —
-    the page-cache `DIRTY` flag stays clear, so under memory pressure the page
-    cache can reclaim the page as "clean" and disturb its dirty state/mapping
-    before `msync` runs (observed non-deterministically during the smoke boot).
-    Closing this needs an **eviction-layer fix**: page-cache reclaim must consult
-    the PTE dirty bit of mapped file pages (a reverse-mapping / dirty-aware
-    reclaim pass) and write them back to their file before dropping. Tracked as a
-    follow-up; the `msync` syscall itself flushes any page that is still
-    resident-and-dirty when it runs.
+  the backing file via the inode `write_cb`. `MS_ASYNC` schedules (mark-dirty
+  only); `MS_INVALIDATE` is a no-op (mappers share the frame). Argument validation
+  is verified by `M72-SMOKE: ok msync` (`MS_SYNC|MS_ASYNC` → `EINVAL`, unmapped →
+  `ENOMEM`, valid → 0).
+  - **Durability closed.** The previous gap — a writable `MAP_SHARED` store sets
+    only the hardware PTE dirty bit, so page-cache reclaim could drop the page
+    "clean" before `msync`, losing the write — is fixed by marking the page-cache
+    entry **dirty when a writable MAP_SHARED page is mapped in**
+    (`vmm_handle_page_fault`). Such a page is potentially-dirty by definition
+    (stores through the PTE never fault again), so this is the correct conservative
+    semantics, not over-eager accounting; reactive reclaim then writes it back
+    instead of dropping it. It is also genuinely isolated — compilers mmap sources
+    read-only and write output via `write()`, so the self-host path has ~no
+    writable shared *file* mappings. Verified **deterministically** by a new
+    `/sys/kernel/mm/drop_caches` knob (a real Linux-style reclaim trigger): M14
+    writes through a MAP_SHARED mapping on real ext4, forces a full reclaim, and
+    reads the store back from disk via a fresh fd (`M14-SMOKE: ok mmap-durable`).
+    The test distinguishes the fix — `munmap` does not write back, so without the
+    dirty mark the page is reclaimed clean and the marker is lost.
 - [ ] `deferred` **Write support for NTFS / FAT32 / exFAT / btrfs.** Each
   foreign filesystem is currently read-only; adding a writer to any one is a
   large, self-contained effort (allocation bitmap/runlist mutation, directory

@@ -263,6 +263,50 @@ int main(int argc, char **argv) {
     marker("M14-SMOKE: fail VFS-normalization open\n");
   }
 
+  /* 10. M72: mmap-store durability across page-cache reclaim. A writable
+   * MAP_SHARED page is marked dirty when mapped, so a store through it is
+   * written back on reclaim instead of being dropped "clean" (the store only
+   * sets the hardware PTE dirty bit, which reclaim used to ignore). We force the
+   * reclaim deterministically via /sys/kernel/mm/drop_caches:
+   *   write 'a'x4096 -> drop_caches (flush+evict so the page starts clean) ->
+   *   mmap RW SHARED -> store a marker -> munmap -> drop_caches (writes the page
+   *   back iff it is dirty) -> read back via a FRESH fd (re-reads from disk).
+   * Without the fix the store's page is reclaimed clean and the marker is lost. */
+  {
+    const char *dp = "/mnt/ext4/mmap_dur.txt";
+    int dfd = open(dp, O_CREAT | O_RDWR | O_TRUNC, 0666);
+    int ok = 0;
+    if (dfd >= 0) {
+      char init[4096];
+      memset(init, 'a', sizeof(init));
+      if (write(dfd, init, sizeof(init)) == 4096) {
+        syscall(SYS_FSYNC, dfd);
+        int sf0 = open("/sys/kernel/mm/drop_caches", O_WRONLY);
+        if (sf0 >= 0) { write(sf0, "1\n", 2); close(sf0); }
+        long m = (long)syscall(SYS_MMAP, 0, 4096, 3 /*RW*/, 1 /*MAP_SHARED*/,
+                               dfd, 0);
+        if (m > 0) {
+          memcpy((void *)m, "DURABLE-MMAP-DATA", 17);
+          syscall(SYS_MUNMAP, m, 4096);
+          int sf = open("/sys/kernel/mm/drop_caches", O_WRONLY);
+          if (sf >= 0) { write(sf, "1\n", 2); close(sf); }
+          int rfd = open(dp, O_RDONLY);
+          if (rfd >= 0) {
+            char rb[17];
+            if (read(rfd, rb, 17) == 17 &&
+                memcmp(rb, "DURABLE-MMAP-DATA", 17) == 0)
+              ok = 1;
+            close(rfd);
+          }
+        }
+      }
+      close(dfd);
+    }
+    marker(ok ? "M14-SMOKE: ok mmap-durable\n"
+              : "M14-SMOKE: fail mmap-durable\n");
+    syscall(SYS_UNLINK, dp);
+  }
+
   /* Clean up files and unmount filesystems */
   syscall(SYS_UNLINK, "/mnt/ext4/large_file.txt");
   syscall(SYS_UNLINK, "/mnt/ext4/persist.txt");
