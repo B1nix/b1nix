@@ -1530,3 +1530,23 @@ PIE base (`0x500000000000`).
   those reservations, so the latent "PROT_NONE is readable" bug doesn't manifest
   today. Both are real but the risk/reward says do them deliberately with a
   fault-injection / large-file harness, not as a closeout afterthought.
+- **Why (1) stays deferred — verifiability, confirmed 2026-06-29.** The fix
+  itself is straightforward (a recursive single/double/triple-indirect walk for
+  read, plus intermediate-indirect-block allocation for write, mirroring the
+  proven `fs/ext2.c` path), and was prototyped. It is **not reproducibly
+  verifiable in the smoke matrix**, which is the blocker: (a) `ext4_mount` hard-
+  refuses any image without the `EXTENTS` incompat feature (`-EOPNOTSUPP`,
+  `ext4.c:1241`), so a pure block-mapped `ext2/3` image never reaches `ext4.c` at
+  all — it is mounted by `ext2.c`, whose existing single+double-indirect already
+  covers files up to ~64 MiB (1 KiB blocks) / ~4 GiB (4 KiB blocks); (b) the only
+  way to exercise `ext4.c`'s block-mapped branch is a block-mapped *inode inside
+  an extent-feature image*, and the host toolchain available to the smoke harness
+  (`mke2fs`/`debugfs`, no root loopback mount) cannot construct one: `debugfs
+  write` always emits `EXTENTS_FL` inodes, and clearing the flag with `sif flags
+  0` leaves the extent-header bytes in `i_block[]` (a *corrupt* block map, garbage
+  pointers — verified empirically), not a valid block map. Shipping the
+  allocation-mutating write path **unverified** would be the unverified-kernel-
+  path tech debt the project forbids, so it stays deferred until a harness that
+  can mint a valid block-mapped inode (a root loopback `chattr -e`, or a small
+  image-builder tool) lands. Triple-indirect is additionally untestable without
+  multi-GiB files.
