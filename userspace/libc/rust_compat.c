@@ -63,6 +63,40 @@ unsigned long getauxval(unsigned long type) {
   return 0;
 }
 
+/* M75: run the shared libraries' C++ static constructors before main().
+ *
+ * b1nix links dynamic executables eagerly in-kernel (no userspace ld.so), and
+ * crt0 only walks the *executable's* own __init_array — so a shared library's
+ * DT_INIT_ARRAY constructors would never run. For a library like libLLVM.so that
+ * is fatal: its 458 constructors register the X86 target and seed the register
+ * allocator's cl::opt defaults, and without them clang's backend aborts ("Must
+ * use fast register allocator") or crashes in codegen.
+ *
+ * The kernel collects each library's init_array into a {init_array_va, count}
+ * descriptor table (deepest dependency first) and passes it via AT_B1NIX_DSO_INIT
+ * (terminated by a zero init_array_va). crt0 calls this once, before the
+ * executable's __init_array, so libraries initialize before the program. Each
+ * init_array entry is the SysV ABI's void(int, char**, char**). */
+#ifndef AT_B1NIX_DSO_INIT
+#define AT_B1NIX_DSO_INIT 0x1000
+#endif
+
+typedef void (*b1nix_init_fn)(int, char **, char **);
+
+void __b1nix_run_dso_init(int argc, char **argv, char **envp) {
+  unsigned long t = getauxval(AT_B1NIX_DSO_INIT);
+  if (!t)
+    return;
+  unsigned long *desc = (unsigned long *)t;
+  for (; desc[0]; desc += 2) {
+    b1nix_init_fn *arr = (b1nix_init_fn *)(void *)desc[0];
+    unsigned long count = desc[1];
+    for (unsigned long i = 0; i < count; i++)
+      if (arr[i])
+        arr[i](argc, argv, envp);
+  }
+}
+
 /* __xpg_strerror_r — the XSI-compliant strerror_r (returns int). b1nix's
  * strerror_r already has XSI semantics, so forward to it. (glibc exposes the
  * XSI variant under this internal name; std links it by that name.) */

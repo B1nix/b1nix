@@ -99,6 +99,19 @@ _start:
 3:
 #endif
 
+	/* M75: run shared-library constructors (their DT_INIT_ARRAY) before the
+	 * executable's own __init_array. The kernel links dynamic binaries eagerly
+	 * in-kernel and crt0 only walks the executable's __init_array, so a library's
+	 * constructors (e.g. libLLVM.so's 458: X86 target + regalloc cl::opt seeding)
+	 * would otherwise never run, aborting clang's backend. __b1nix_run_dso_init
+	 * reads the kernel's AT_B1NIX_DSO_INIT descriptor table and is a no-op when
+	 * absent (static binaries / no shared-lib ctors). argc/argv/envp stay live in
+	 * rbx/r12/r13 (callee-saved) across the call. */
+	movq %rbx, %rdi
+	movq %r12, %rsi
+	movq %r13, %rdx
+	call __b1nix_run_dso_init
+
 	/* Run ELF .init_array constructors before main(). C++ static
 	 * constructors and __attribute__((constructor)) functions live here;
 	 * skipping them leaves global state uninitialized (this is why the

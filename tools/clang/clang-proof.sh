@@ -107,8 +107,13 @@ ISODIR="$OUT/iso"
 rm -rf "$ISODIR"; mkdir -p "$ISODIR/boot/grub"
 cp "$KELF" "$ISODIR/boot/kernel.elf"
 cp "$IMG" "$ISODIR/boot/clang.img"
+# The clangrun block fires after the b1nix.test=1 smoke modules; CLANG_FOCUS=1
+# drops b1nix.test=1 so the (slow) compiler proof is reached promptly instead of
+# competing with the whole suite for the timeout budget.
+CMDLINE="${CLANG_CMDLINE:-b1nix.test=1 b1nix.clangrun}"
+[ "${CLANG_FOCUS:-0}" = "1" ] && CMDLINE="b1nix.clangrun"
 sed -e 's|@TIMEOUT@|0|g' -e 's|@ARCH@|x86_64|g' \
-    -e 's|@CMDLINE@|b1nix.test=1 b1nix.clangrun|g' \
+    -e "s|@CMDLINE@|$CMDLINE|g" \
     -e 's|@MODULE_CMD@|module2 /boot/clang.img clangimg|g' \
     "$ROOT_DIR/boot/grub/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
 "$MKRESCUE" -o "$ISO" "$ISODIR" 2>/dev/null

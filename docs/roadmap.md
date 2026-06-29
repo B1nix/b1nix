@@ -1447,6 +1447,27 @@ PIE base (`0x500000000000`).
     undefined LLVM C-API symbols resolve cleanly from the shared libLLVM-22, no
     unresolved symbols. So the whole build chain (b1nix LLVM → libLLVM.so → Mesa
     llvmpipe static → GL ELF) closes.
+  - [x] **Shared-library constructors now run — the dynamic toolchain WORKS on
+    b1nix.** Root cause of the dynamic clang's codegen failures (`-O0`: "Must use
+    fast register allocator"; `-O2`: SIGPIPE crash in codegen): the in-kernel
+    eager dynamic linker resolved relocations for every `DT_NEEDED` object but
+    never ran their `DT_INIT_ARRAY` constructors. crt0 only walks the
+    *executable's* `__init_array`, so `libLLVM.so`'s **458** constructors (X86
+    target registration, register-allocator `cl::opt` defaults, `ManagedStatic`)
+    never fired — the frontend ran (`--version`, parsing) but the backend was
+    uninitialized. Fix (no workaround): the loader collects each shared object's
+    `init_array` into a `{va,count}` descriptor table (deepest-dependency-first)
+    and hands it to userspace via a new `AT_B1NIX_DSO_INIT` auxv entry;
+    `__b1nix_run_dso_init` (libc) runs them in crt0 before the executable's own
+    constructors. Also fixed the previously-malformed auxv layout (AT_NULL landed
+    at the low end, so `getauxval` returned 0 for everything — masked because only
+    rust read auxv and tolerates 0). **Verified:** dynamic clang (44 MB) +
+    demand-paged 72 MB `libLLVM-22.so` compiles a valid b1nix object on b1nix at
+    **both `-O0` and `-O2`** (`M64-NATIVE-CLANG: ok compile` + `ok compile-O2`);
+    full smoke **864/0** (the auxv/crt0/loader change touches every binary's
+    startup — zero regressions). This also unblocks llvmpipe's JIT (same
+    `libLLVM.so` codegen) and shrinks the M26 self-host transient (the static
+    94 MB clang load-staging becomes a reclaimable demand-paged 72 MB `.so`).
   - **Remaining (runtime):** (1) package the 72 MB `libLLVM-22.so` as
     `/lib/libLLVM-22.so` on b1nix (a disk/ramdisk module, as d8 does — too big for
     the initramfs); (2) run the demo with `GALLIUM_DRIVER=llvmpipe` so llvmpipe

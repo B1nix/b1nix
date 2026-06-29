@@ -106,6 +106,16 @@ struct user_loaded_image {
 	 * demand-paged from the page cache; 0 = fully eager (initramfs / ineligible). */
 	struct vfs_node *exe_node;
 	int demand_paged;
+	/* M75: shared-library constructors (DT_INIT/DT_INIT_ARRAY) collected across
+	 * the DT_NEEDED graph during eager linking, in dependency order (deepest
+	 * dependency first). These are absolute user VAs of void(int,char**,char**)
+	 * functions; the kernel pushes them as a NULL-terminated array onto the
+	 * initial stack and exposes it via AT_B1NIX_DSO_INIT so crt0 runs them before
+	 * the executable's own __init_array. Without this, a library full of static
+	 * constructors (libLLVM.so: 458 of them — X86 target registration, cl::opt
+	 * defaults) leaves codegen uninitialized. 0/NULL = no shared-lib ctors. */
+	u64 *dso_init;
+	usize dso_init_count;
 };
 
 void userspace_init(void);

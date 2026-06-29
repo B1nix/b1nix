@@ -116,8 +116,12 @@ MESON_LLVM_OPTS="-Dllvm=disabled"
 if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
   LLVM_CONFIG_LINE="llvm-config = '$ROOT_DIR/tools/ports/b1nix-llvm-config'"
   MESON_LLVM_OPTS="-Dllvm=enabled -Dshared-llvm=enabled -Dcpp_rtti=false"
-  # Separate meson dir so the llvmpipe config never collides with the softpipe one.
+  # Separate meson AND install dirs so the llvmpipe variant never clobbers the
+  # softpipe install/lib (the default m52_osmesa demo links those archives, which
+  # must stay free of undefined LLVM C-API symbols).
   MESON_BUILD="$BUILD_DIR/meson-llvmpipe"
+  INSTALL_DIR="$BUILD_DIR/install-llvmpipe"
+  mkdir -p "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 fi
 cat > "$INI" <<EOF
 [binaries]

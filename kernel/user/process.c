@@ -63,6 +63,13 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define DT_RELAENT 9
 #define DT_STRSZ   10
 #define DT_SYMENT  11
+#define DT_INIT_ARRAY 25
+#define DT_INIT_ARRAYSZ 27
+
+/* b1nix-private auxv type carrying the shared-library constructor descriptor
+ * table (see user_build_initial_stack / crt0). Far above the standard auxv
+ * range (0..51) so it can never collide. Must match userspace/include/sys/auxv.h. */
+#define AT_B1NIX_DSO_INIT 0x1000
 #define DT_JMPREL  23
 #define DT_PLTREL  20
 
@@ -113,6 +120,14 @@ struct elf64_dyn_object {
   u64 strtab;
   u64 strsz;
   u64 hash;
+  /* DT_INIT / DT_INIT_ARRAY: this object's C++ static constructors. For a
+   * shared library these are NOT covered by the executable's crt0 (which only
+   * walks the EXE's own __init_array), so the kernel collects them across the
+   * whole DT_NEEDED graph and hands the list to userspace (via AT_B1NIX_DSO_INIT)
+   * to run before the executable's own constructors. init/init_array are
+   * base-relative absolute VAs once parsed. */
+  u64 init_array;
+  u64 init_arraysz;
   u64 needed[DYN_MAX_NEEDED];
   usize needed_count;
   /* PT_TLS template for this object (for static-TLS layout across the whole
@@ -304,6 +319,8 @@ static int elf64_parse_dynamic(struct user_loaded_image *image,
       case DT_RELASZ: obj->rela_size = dyn[d].d_val; break;
       case DT_JMPREL: obj->jmprel = dyn[d].d_val + obj->base; break;
       case DT_PLTRELSZ: obj->jmprel_size = dyn[d].d_val; break;
+      case DT_INIT_ARRAY: obj->init_array = dyn[d].d_val + obj->base; break;
+      case DT_INIT_ARRAYSZ: obj->init_arraysz = dyn[d].d_val; break;
       default: break;
       }
     }
@@ -766,12 +783,28 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (envp_ptrs[i] == 0) return -1;
   }
 
+  /* M75: place the shared-library constructor descriptor table on the stack and
+   * record its user VA for AT_B1NIX_DSO_INIT. Layout (read forwards from the VA):
+   * {init_array_va, count} pairs, terminated by a zero init_array_va. Pushed
+   * highest-address-first (terminator first, then descriptors in reverse) so the
+   * table reads forwards from the returned VA. The table is tiny (2 words per
+   * library), so it coexists with argv/envp/auxv on the single-page stack. */
+  usize dso_init_va = 0;
+  if (image->dso_init && image->dso_init_count) {
+    if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* terminator */
+    for (usize i = image->dso_init_count; i-- > 0;) {
+      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 1]) < 0) return -1; /* count */
+      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 0]) < 0) return -1; /* va */
+    }
+    dso_init_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
+  }
+
   sp &= ~(usize)0xf;
 
   /* Ensure the final stack pointer (which becomes ESP/RSP at _start) is
    * 16-byte aligned, as the SysV ABI requires. We are about to push exactly
    * total_slots pointer-sized words: argc(1), argv(argc), NULL(1), envp(envc),
-   * NULL(1), auxv(5). sp is 16-aligned right now, so after the pushes it stays
+   * NULL(1), auxv(6+). sp is 16-aligned right now, so after the pushes it stays
    * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
    * many zero words as needed to reach the next 16-byte boundary.
    *
@@ -779,8 +812,13 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * words per 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
    * pad words may be required — the old "push one if misaligned" left ESP 4- or
    * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
-   * the unaligned ring3 stack, so every ELF32 spawn failed. */
-  usize total_slots = 8 + (usize)image->argc + (usize)envc;
+   * the unaligned ring3 stack, so every ELF32 spawn failed.
+   *
+   * Auxv words below: AT_NULL(2) + AT_PHDR(2) + AT_ENTRY(2) = 6, plus 2 for the
+   * optional AT_B1NIX_DSO_INIT. The remaining +3 is the argv terminator, envp
+   * terminator, and argc word. */
+  usize total_slots = 9 + (usize)image->argc + (usize)envc +
+                      (dso_init_va ? 2 : 0);
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
@@ -788,11 +826,23 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   }
 
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL */
-  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1; /* AT_ENTRY */
-  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1; /* AT_PHDR */
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
+  /* Auxiliary vector. Pushed high-address-first as {a_val, a_type} pairs so that
+   * — read forwards from the low end, where getauxval() starts after the envp
+   * NULL — each entry appears in the ABI's {a_type, a_val} order and AT_NULL
+   * terminates the array at the high end. (The earlier layout pushed a_type
+   * before a_val and left AT_NULL at the low end, so getauxval saw AT_NULL first
+   * and returned 0 for every query; only rust relied on auxv and tolerates 0 as
+   * "absent", which masked the bug.) */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_val */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_type */
+  if (dso_init_va) {
+    if (user_stack_push_usize(stack, &sp, (usize)dso_init_va) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, AT_B1NIX_DSO_INIT) < 0) return -1;
+  }
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                   /* AT_PHDR  a_val */
+  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1;                   /* AT_PHDR  a_type */
+  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1; /* AT_ENTRY a_val */
+  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1;                   /* AT_ENTRY a_type */
 
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
@@ -1392,6 +1442,43 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         goto cleanup;
       }
     }
+
+    /* M75: collect shared-library constructors so crt0 can run them before the
+     * executable's own __init_array. Each entry is a {init_array_va, count}
+     * descriptor pointing at the library's .init_array, which already lives in
+     * that object's mapped user memory — no copying, so the descriptor table
+     * stays tiny (one entry per library, fits the single-page initial stack even
+     * when libLLVM.so contributes 458 constructors). The crt0 helper dereferences
+     * each init_array_va in userspace and calls the function pointers there.
+     *
+     * Order is deepest-dependency-first: the DT_NEEDED graph is loaded
+     * breadth-first from the executable (index 0), so a dependency is appended
+     * after its dependents — iterating the library objects (index 1+) in reverse
+     * runs the deepest dependencies' constructors first, matching the dynamic
+     * linker. objects[0] (the executable) is skipped: crt0 walks its own
+     * __init_array directly. Like the executable (b1nix has no crti.o/_init), the
+     * legacy DT_INIT entry point is not used — every real constructor lives in
+     * .init_array under this toolchain. */
+    usize ndesc = 0;
+    for (usize oi = 1; oi < object_count; oi++)
+      if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64))
+        ndesc++;
+    if (ndesc) {
+      /* 2 words per descriptor + 1 NULL terminator word. */
+      u64 *desc = kzalloc((ndesc * 2 + 1) * sizeof(u64));
+      if (!desc)
+        goto cleanup;
+      usize w = 0;
+      for (usize oi = object_count; oi-- > 1;) {
+        if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64)) {
+          desc[w++] = objects[oi].init_array;
+          desc[w++] = objects[oi].init_arraysz / sizeof(u64);
+        }
+      }
+      desc[w] = 0; /* terminator: a zero init_array_va ends the table */
+      image->dso_init = desc;
+      image->dso_init_count = ndesc;
+    }
   }
 
   rc = image->segment_count > 0 ? 0 : -1;
@@ -1434,6 +1521,9 @@ void user_image_free(struct user_loaded_image *image) {
 
   if (image->path)
     kfree((void *)image->path);
+
+  if (image->dso_init)
+    kfree(image->dso_init);
 
   if (image->argv) {
     for (int i = 0; i < image->argc; i++) {

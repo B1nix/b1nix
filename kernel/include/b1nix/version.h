@@ -1,6 +1,6 @@
 #ifndef B1NIX_VERSION_H
 #define B1NIX_VERSION_H
 
-#define B1NIX_VERSION_STR "0.74.1"
+#define B1NIX_VERSION_STR "0.75.0"
 
 #endif
