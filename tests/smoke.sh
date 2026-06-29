@@ -1446,6 +1446,10 @@ check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances 
 check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a byte range using independent explicit offsets"
 check_output "$LOG" "M73-SMOKE: ok fallocate" "fallocate mode 0 grows + zero-fills; KEEP_SIZE does not grow"
 check_output "$LOG" "M73-SMOKE: ok splice" "splice moves data file->pipe->file intact"
+# ── M73: inotify (real file-change notification, was an ENOSYS stub) ──
+check_output "$LOG" "M73-SMOKE: ok inotify-modify" "inotify reports IN_MODIFY on a write to a watched file"
+check_output "$LOG" "M73-SMOKE: ok inotify-dir" "inotify reports IN_CREATE/IN_DELETE (with entry name) for a watched directory"
+check_output "$LOG" "M73-SMOKE: ok inotify-rmwatch" "inotify_rm_watch removes a watch"
 check_output "$LOG" "M72-SMOKE: ok msync" "msync validates flags (EINVAL), unmapped range (ENOMEM), and syncs a mapped MAP_SHARED range"
 # ── M85: libc Tier-A correctness (Chromium-debt overlap) ──
 check_output "$LOG" "M73-SMOKE: ok strtoull" "strtoull parses the full uint64 range + ERANGE; strtoll honors signed range/base16"

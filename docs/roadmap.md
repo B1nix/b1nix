@@ -1350,13 +1350,24 @@ PIE base (`0x500000000000`).
   `struct statx` layout (path + `AT_EMPTY_PATH`). Verified by `userspace/bin/
   m73_smoke.c` (`M73-SMOKE: ok statx/sendfile/copy-file-range/fallocate/splice`),
   data/offset round-trips asserted, x86_64 **843/0**.
-- [ ] `deferred` `io_uring`, `ptrace`, `inotify`, `clone3`. Each is its own
-  subsystem rather than a syscall: `io_uring` is a shared-ring submission/
-  completion engine; `ptrace` needs the stop/continue + cross-process register/
-  memory machinery tracked under **M80** (crashpad); `inotify` needs VFS
-  modify/create/delete event hooks + a per-watch event queue; `clone3` is the
-  extended-args `clone` variant (the M29 `clone` flags already cover the thread/
-  fork models in use). Revisit when a port concretely needs one.
+- [x] `done` **inotify** — real file-change notification, no longer the ENOSYS
+  stub the Chromium port shipped. `inotify_init1`/`inotify_add_watch`/
+  `inotify_rm_watch` (`SYS_INOTIFY_INIT1`/`ADD_WATCH`/`RM_WATCH` = 170..172) back
+  a `VFS_HANDLE_INOTIFY` fd (`kernel/fs/inotify.c`): a small per-instance watch
+  table + event ring, registered in a global so VFS mutation sites can find
+  watchers. `vfs_inotify_notify()` is called after the inode lock is dropped from
+  the write path (`IN_MODIFY`), `vfs_create` (`IN_CREATE`) and `vfs_remove_node`
+  (`IN_DELETE`, with `IN_ISDIR` for directories) and from `rm_watch`
+  (`IN_IGNORED`); the common no-watch path is a single atomic load. The fd is
+  pollable and `read()` returns Linux `struct inotify_event` records (name padded
+  to 8). Verified by `m73_smoke.c` (`M73-SMOKE: ok inotify-modify/inotify-dir/
+  inotify-rmwatch`), event mask + entry name asserted.
+- [ ] `deferred` `io_uring`, `ptrace`, `clone3`. Each is its own subsystem rather
+  than a syscall: `io_uring` is a shared-ring submission/completion engine;
+  `ptrace` needs the stop/continue + cross-process register/memory machinery
+  tracked under **M80** (crashpad); `clone3` is the extended-args `clone` variant
+  (the M29 `clone` flags already cover the thread/fork models in use). Revisit
+  when a port concretely needs one.
 
 ## M74: Real-Time Signals
 

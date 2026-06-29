@@ -10,6 +10,7 @@
 #include <b1nix/mqueue.h>
 #include <b1nix/net.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/inotify.h>
 #include <b1nix/posix.h>
 #include <b1nix/seccomp.h>
 #include <b1nix/rtc.h>
@@ -4194,6 +4195,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SIGNALFD4:
     /* signalfd4(fd, mask, flags). mask is a 64-bit signal bitmask. */
     return (u64)vfs_signalfd((int)arg0, arg1, (int)arg2);
+
+  case SYS_INOTIFY_INIT1:
+    return (u64)vfs_inotify_init1((int)arg0);
+  case SYS_INOTIFY_ADD_WATCH:
+    return (u64)vfs_inotify_add_watch((int)arg0, (const char *)(usize)arg1,
+                                      (u32)arg2);
+  case SYS_INOTIFY_RM_WATCH:
+    return (u64)vfs_inotify_rm_watch((int)arg0, (int)arg1);
 
   default:
     console_write("syscall: unknown 0x");

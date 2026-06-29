@@ -23,6 +23,7 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <sys/inotify.h>
 #include <sys/mman.h>
 #include <sys/sendfile.h>
 #include <sys/stat.h>
@@ -409,6 +410,104 @@ static void test_libc_correctness(void) {
     fail("realpath", res ? 0 : -1, 0);
 }
 
+/* Scan a buffer of variable-length inotify_event records for one whose mask
+ * intersects want_mask (and, if want_name != NULL, whose name matches). */
+static int find_event(const char *buf, ssize_t n, uint32_t want_mask,
+                      const char *want_name) {
+  ssize_t off = 0;
+  while (off + (ssize_t)sizeof(struct inotify_event) <= n) {
+    const struct inotify_event *e = (const struct inotify_event *)(buf + off);
+    if ((e->mask & want_mask) &&
+        (!want_name || (e->len && strcmp(e->name, want_name) == 0)))
+      return 1;
+    off += (ssize_t)sizeof(struct inotify_event) + e->len;
+  }
+  return 0;
+}
+
+/* M73 inotify: a watch reports IN_MODIFY on a written file and IN_CREATE /
+ * IN_DELETE for entries added/removed in a watched directory. Each event is
+ * enqueued synchronously inside the mutating syscall, so a read right after
+ * returns it without blocking (the fd is opened IN_NONBLOCK as a hang guard). */
+static void test_inotify(void) {
+  int ifd = inotify_init1(IN_NONBLOCK);
+  if (ifd < 0) {
+    fail("inotify-init", ifd, 0);
+    return;
+  }
+  char buf[512];
+
+  /* --- IN_MODIFY on a watched file --- */
+  const char *p = "/tmp/m73_ino";
+  int fd = open(p, O_CREAT | O_TRUNC | O_RDWR, 0644);
+  if (fd < 0) {
+    fail("inotify-open", fd, 0);
+    close(ifd);
+    return;
+  }
+  int wd = inotify_add_watch(ifd, p, IN_MODIFY);
+  if (wd < 0) {
+    fail("inotify-add", wd, 0);
+    close(fd);
+    close(ifd);
+    return;
+  }
+  if (write(fd, "hello", 5) != 5) {
+    fail("inotify-write", -1, 5);
+    close(fd);
+    close(ifd);
+    return;
+  }
+  ssize_t n = read(ifd, buf, sizeof(buf));
+  if (n < (ssize_t)sizeof(struct inotify_event) ||
+      !find_event(buf, n, IN_MODIFY, NULL)) {
+    fail("inotify-modify", (long)n, IN_MODIFY);
+    close(fd);
+    close(ifd);
+    return;
+  }
+  ok("inotify-modify");
+  close(fd);
+
+  /* --- IN_CREATE / IN_DELETE on a watched directory --- */
+  const char *dir = "/tmp/m73_inodir";
+  mkdir(dir, 0755);
+  int dwd = inotify_add_watch(ifd, dir, IN_CREATE | IN_DELETE);
+  if (dwd < 0) {
+    fail("inotify-add-dir", dwd, 0);
+    close(ifd);
+    return;
+  }
+  int cfd = open("/tmp/m73_inodir/child", O_CREAT | O_RDWR, 0644);
+  if (cfd >= 0)
+    close(cfd);
+  n = read(ifd, buf, sizeof(buf));
+  if (n < (ssize_t)sizeof(struct inotify_event) ||
+      !find_event(buf, n, IN_CREATE, "child")) {
+    fail("inotify-create", (long)n, IN_CREATE);
+    close(ifd);
+    return;
+  }
+  unlink("/tmp/m73_inodir/child");
+  n = read(ifd, buf, sizeof(buf));
+  if (n < (ssize_t)sizeof(struct inotify_event) ||
+      !find_event(buf, n, IN_DELETE, "child")) {
+    fail("inotify-delete", (long)n, IN_DELETE);
+    close(ifd);
+    return;
+  }
+  ok("inotify-dir");
+
+  /* rm_watch then a further modify must produce no IN_MODIFY for that wd. */
+  if (inotify_rm_watch(ifd, dwd) != 0) {
+    fail("inotify-rmwatch", -1, 0);
+    close(ifd);
+    return;
+  }
+  ok("inotify-rmwatch");
+  close(ifd);
+}
+
 int main(void) {
   marker("M73-SMOKE: start");
   test_statx();
@@ -417,6 +516,7 @@ int main(void) {
   test_fallocate();
   test_splice();
   test_msync();
+  test_inotify();
   test_libc_correctness();
   marker(g_fail ? "M73-SMOKE: done (with failures)" : "M73-SMOKE: done");
   return g_fail ? 1 : 0;

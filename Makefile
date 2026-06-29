@@ -311,6 +311,7 @@ KERNEL_SOURCES := \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \
+	kernel/fs/inotify.c \
 	kernel/fs/fat32.c \
 	kernel/fs/isofs.c \
 	kernel/fs/exfat.c \

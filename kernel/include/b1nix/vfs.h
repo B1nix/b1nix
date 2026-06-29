@@ -339,7 +339,9 @@ enum vfs_handle_kind {
   VFS_HANDLE_EVENTFD,
   VFS_HANDLE_TIMERFD,
   VFS_HANDLE_SIGNALFD,
-  VFS_HANDLE_EPOLL
+  VFS_HANDLE_EPOLL,
+  /* M73: inotify filesystem-change notification. */
+  VFS_HANDLE_INOTIFY
 };
 
 struct vfs_file_ops {

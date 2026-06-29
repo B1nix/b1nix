@@ -9,6 +9,7 @@
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/input.h>
+#include <b1nix/inotify.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
@@ -2669,6 +2670,11 @@ static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
     res = (isize)size;
   }
   vfs_inode_unlock(node->inode);
+  /* M73 inotify: report a successful write as IN_MODIFY. Called after the inode
+   * lock is dropped so the notify path (its own leaf spinlocks) never nests
+   * under the inode lock. */
+  if (res > 0)
+    vfs_inotify_notify(node, IN_MODIFY, 0);
   vfs_node_put(node);
   return res;
 }
@@ -2897,6 +2903,9 @@ out_node_put:
   }
 out_unlock:
   vfs_inode_unlock(parent->inode);
+  /* M73 inotify: a new entry in `parent` is IN_CREATE on the directory. */
+  if (res == 0 && node)
+    vfs_inotify_notify(parent, IN_CREATE, name);
   vfs_node_put(parent);
   return res;
 }
@@ -3314,6 +3323,9 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
   vfs_inode_lock(parent->inode);
   int res = vfs_remove_child_locked(parent, r_path, name, is_rmdir);
   vfs_inode_unlock(parent->inode);
+  /* M73 inotify: a removed entry is IN_DELETE on the parent directory. */
+  if (res == 0)
+    vfs_inotify_notify(parent, IN_DELETE | (is_rmdir ? IN_ISDIR : 0), name);
   vfs_node_put(parent);
   return res;
 }
