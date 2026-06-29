@@ -262,13 +262,18 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
         union sigval val;
         val.sival_ptr = 0;
         if (sa && sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
-            scheduler_rt_dequeue_current(i, &code, &val, &more);
-            arch_build_signal_frame(frame, i, code, val);
-            if (!more)
-                __atomic_fetch_and(&current_task->pending_signals,
-                                   ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
-            interrupts_enable();
-            return; /* one signal per delivery check */
+            /* scheduler_rt_dequeue_current clears the pending bit itself (under
+             * g_rt_lock) when this signo's queue drains — see the signal-loss
+             * race note there. Only deliver if an instance was actually dequeued. */
+            if (scheduler_rt_dequeue_current(i, &code, &val, &more)) {
+                arch_build_signal_frame(frame, i, code, val);
+                interrupts_enable();
+                return; /* one signal per delivery check */
+            }
+            /* Bit set with no queued entry should not happen (enqueue sets the
+             * bit and adds the entry atomically); clear a stale bit defensively. */
+            __atomic_fetch_and(&current_task->pending_signals,
+                               ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         } else if (!sa || sa->sa_handler == SIG_DFL) {
             /* RT default action is terminate the process. */
             console_write("signal: process pid=");
@@ -278,11 +283,9 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
             console_write("\n");
             scheduler_exit_current(TASK_EXIT_SIGNALED | i);
         } else {
-            /* SIG_IGN: discard one queued instance; clear the bit when empty. */
+            /* SIG_IGN: discard one queued instance (the dequeue clears the bit
+             * when the queue drains). */
             scheduler_rt_dequeue_current(i, &code, &val, &more);
-            if (!more)
-                __atomic_fetch_and(&current_task->pending_signals,
-                                   ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         }
     }
 

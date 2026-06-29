@@ -31,7 +31,11 @@
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
-  if (e >= EPERM && e <= EINPROGRESS)
+  /* Accept the full defined errno range. The old ceiling of EINPROGRESS (115)
+   * masked every higher errno as EIO — e.g. ECANCELED (125, a cancelled async
+   * timer), EOWNERDEAD/ENOTRECOVERABLE (robust mutexes), EKEY* — hiding the real
+   * cause from callers. EHWPOISON (133) is the highest errno we define. */
+  if (e >= EPERM && e <= EHWPOISON)
     return e;
   return EIO;
 }

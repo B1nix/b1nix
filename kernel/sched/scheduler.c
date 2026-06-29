@@ -121,6 +121,16 @@ struct rt_state {
   int qcount; /* live entries */
 };
 static struct rt_state *g_rt_state[MAX_TASKS];
+/* SMP: with the BKL gone, two CPUs can sigqueue to the same task (or the timer
+ * ISR can fire) concurrently. interrupts_save() only masks the local CPU, so it
+ * does NOT serialise across cores. g_rt_lock guards every RT-queue / RT-sigaction
+ * / rt_state (de)allocation; g_timer_lock guards the POSIX timer table. Both are
+ * always taken with interrupts disabled (callers either run in the timer ISR or
+ * disable interrupts first), so a plain spin_lock cannot self-deadlock against
+ * the ISR on the same CPU. Lock order: g_timer_lock -> g_rt_lock (the tick),
+ * then -> the heap lock (lazy rt_state alloc) — never the reverse. */
+static spinlock_t g_rt_lock = SPINLOCK_INIT;
+static spinlock_t g_timer_lock = SPINLOCK_INIT;
 
 static void rt_state_free(usize i) {
   if (g_rt_state[i]) {
@@ -888,7 +898,14 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->stop_report_pending = 0;
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
-  rt_state_free(task_index(task)); /* M74: reset RT handlers + drop queued RT */
+  /* M74: reset RT handlers + drop queued RT, under g_rt_lock so it can't race a
+   * concurrent sigqueue from another CPU into the freed rt_state. */
+  {
+    u64 rtf;
+    spin_lock_irqsave(&g_rt_lock, &rtf);
+    rt_state_free(task_index(task));
+    spin_unlock_irqrestore(&g_rt_lock, rtf);
+  }
 
   g_task_tgid[task_index(task)] = task->id;
   if (!stealable)
@@ -3532,14 +3549,18 @@ int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) 
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->id == task_id && T(i)->state != TASK_UNUSED &&
         T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING) {
+      /* g_rt_lock serialises the RT queue + lazy rt_state alloc across CPUs and
+       * vs the timer ISR (interrupts are already off here). The enqueue and the
+       * pending-bit set are done together under the lock so they cannot
+       * interleave with the locked dequeue's "queue empty -> clear bit" — that
+       * is what closes the signal-loss race (a send between dequeue and a
+       * separate bit-clear used to drop the bit while an entry was queued). */
+      spin_lock(&g_rt_lock);
       struct rt_state *rs = rt_state_get(i, 1);
-      if (!rs) {
+      if (!rs || rs->qcount >= RT_QUEUE_MAX) {
+        spin_unlock(&g_rt_lock);
         interrupts_restore(flags);
-        return -EAGAIN;
-      }
-      if (rs->qcount >= RT_QUEUE_MAX) {
-        interrupts_restore(flags);
-        return -EAGAIN; /* RLIMIT_SIGPENDING analogue */
+        return -EAGAIN; /* OOM or RLIMIT_SIGPENDING analogue */
       }
       int slot = (rs->qhead + rs->qcount) % RT_QUEUE_MAX;
       rs->queue[slot].signo = sig;
@@ -3548,9 +3569,11 @@ int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) 
       rs->qcount++;
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
+      spin_unlock(&g_rt_lock);
       /* Wake a blocked/stopped target so it re-checks pending signals. Mirrors
        * scheduler_kill's CAS so a kill racing the target's exit cannot resurrect
-       * a DEAD/REAPING task. */
+       * a DEAD/REAPING task. Done outside g_rt_lock to avoid nesting it under the
+       * runqueue lock. */
       enum task_state expected = TASK_BLOCKED;
       if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
                                       __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
@@ -3572,9 +3595,13 @@ int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
                                  int *more) {
   if (!current_task)
     return 0;
+  int ret = 0;
+  spin_lock(&g_rt_lock); /* interrupts already off in the delivery path */
   struct rt_state *rs = g_rt_state[task_index(current_task)];
-  if (!rs || rs->qcount == 0)
+  if (!rs || rs->qcount == 0) {
+    spin_unlock(&g_rt_lock);
     return 0;
+  }
   for (int n = 0; n < rs->qcount; n++) {
     int idx = (rs->qhead + n) % RT_QUEUE_MAX;
     if (rs->queue[idx].signo == sig) {
@@ -3599,10 +3626,18 @@ int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
         }
       if (more)
         *more = rem;
-      return 1;
+      /* Clear the pending bit HERE, under the same lock that the enqueue's
+       * bit-set holds — so a concurrent sigqueue cannot slip an entry in between
+       * "queue drained" and "bit cleared" and have its bit wiped (signal loss). */
+      if (!rem)
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+      ret = 1;
+      break;
     }
   }
-  return 0;
+  spin_unlock(&g_rt_lock);
+  return ret;
 }
 
 /* The current task's RT handler for `sig`, or NULL if none registered. */
@@ -3620,7 +3655,8 @@ struct sigaction *scheduler_rt_action_current(int sig) {
 int scheduler_timer_create(int signo, union sigval value) {
   if (!current_task || signo < 1 || signo > NSIG_MAX)
     return -EINVAL;
-  u64 flags = interrupts_save();
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
     if (!g_posix_timers[i].used) {
       g_posix_timers[i].used = 1;
@@ -3629,11 +3665,11 @@ int scheduler_timer_create(int signo, union sigval value) {
       g_posix_timers[i].value = value;
       g_posix_timers[i].interval_ticks = 0;
       g_posix_timers[i].next_ticks = 0;
-      interrupts_restore(flags);
+      spin_unlock_irqrestore(&g_timer_lock, flags);
       return i;
     }
   }
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&g_timer_lock, flags);
   return -EAGAIN;
 }
 
@@ -3644,10 +3680,20 @@ int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
                             u64 *old_remaining, u64 *old_interval) {
   if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
     return -EINVAL;
-  u64 flags = interrupts_save();
+  /* Pre-allocate the owner's RT state HERE (under g_rt_lock, before g_timer_lock
+   * to avoid nesting the two) so the timer ISR never has to allocate while
+   * holding g_timer_lock. */
+  {
+    u64 rf;
+    spin_lock_irqsave(&g_rt_lock, &rf);
+    rt_state_get(task_index(current_task), 1);
+    spin_unlock_irqrestore(&g_rt_lock, rf);
+  }
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   struct posix_timer *t = &g_posix_timers[id];
   if (!t->used || t->owner_id != current_task->id) {
-    interrupts_restore(flags);
+    spin_unlock_irqrestore(&g_timer_lock, flags);
     return -EINVAL;
   }
   if (old_interval)
@@ -3656,21 +3702,20 @@ int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
     u64 now = scheduler_ticks;
     *old_remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
   }
-  if (SIG_IS_RT(t->signo))
-    rt_state_get(task_index(current_task), 1); /* avoid alloc in the tick ISR */
   t->interval_ticks = interval_ticks;
   t->next_ticks = first_ticks ? scheduler_ticks + first_ticks : 0;
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&g_timer_lock, flags);
   return 0;
 }
 
 int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval) {
   if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
     return -EINVAL;
-  u64 flags = interrupts_save();
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   struct posix_timer *t = &g_posix_timers[id];
   if (!t->used || t->owner_id != current_task->id) {
-    interrupts_restore(flags);
+    spin_unlock_irqrestore(&g_timer_lock, flags);
     return -EINVAL;
   }
   u64 now = scheduler_ticks;
@@ -3678,51 +3723,68 @@ int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval) {
     *remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
   if (interval)
     *interval = t->interval_ticks;
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&g_timer_lock, flags);
   return 0;
 }
 
 int scheduler_timer_delete(int id) {
   if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
     return -EINVAL;
-  u64 flags = interrupts_save();
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   struct posix_timer *t = &g_posix_timers[id];
   if (!t->used || t->owner_id != current_task->id) {
-    interrupts_restore(flags);
+    spin_unlock_irqrestore(&g_timer_lock, flags);
     return -EINVAL;
   }
   t->used = 0;
   t->next_ticks = 0;
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&g_timer_lock, flags);
   return 0;
 }
 
 /* Free all timers owned by a terminating task (called from the exit path). */
 void scheduler_timer_cleanup_task(usize task_id) {
-  u64 flags = interrupts_save();
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   for (int i = 0; i < MAX_POSIX_TIMERS; i++)
     if (g_posix_timers[i].used && g_posix_timers[i].owner_id == task_id) {
       g_posix_timers[i].used = 0;
       g_posix_timers[i].next_ticks = 0;
     }
-  interrupts_restore(flags);
+  spin_unlock_irqrestore(&g_timer_lock, flags);
 }
 
-/* Called from the timer tick (interrupts already off): fire every armed timer
- * whose deadline has passed, then re-arm periodic ones or disarm one-shots. */
+/* Called from the timer tick (interrupts already off): snapshot every armed
+ * timer whose deadline has passed (re-arming periodic ones / disarming one-shots
+ * in place) UNDER g_timer_lock, then fire the signals AFTER releasing the lock —
+ * so g_timer_lock is never held across scheduler_sigqueue (which takes g_rt_lock
+ * and the runqueue lock), keeping the lock-hold short and the ordering simple. */
 static void posix_timers_tick(void) {
+  struct { usize owner; int signo; union sigval value; } fire[MAX_POSIX_TIMERS];
+  int nfire = 0;
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
   for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
     struct posix_timer *t = &g_posix_timers[i];
     if (!t->used || t->next_ticks == 0 || t->next_ticks > scheduler_ticks)
       continue;
-    if (SIG_IS_RT(t->signo))
-      scheduler_sigqueue(t->owner_id, t->signo, t->value, B1NIX_SI_TIMER);
-    else
-      scheduler_kill(t->owner_id, t->signo);
+    fire[nfire].owner = t->owner_id;
+    fire[nfire].signo = t->signo;
+    fire[nfire].value = t->value;
+    nfire++;
     if (t->interval_ticks)
       t->next_ticks = scheduler_ticks + t->interval_ticks;
     else
       t->next_ticks = 0; /* one-shot: disarm */
+  }
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  for (int i = 0; i < nfire; i++) {
+    if (SIG_IS_RT(fire[i].signo))
+      scheduler_sigqueue(fire[i].owner, fire[i].signo, fire[i].value,
+                         B1NIX_SI_TIMER);
+    else
+      scheduler_kill(fire[i].owner, fire[i].signo);
   }
 }
 
@@ -3830,18 +3892,22 @@ int scheduler_sigaction(int sig, const struct sigaction *act,
   if (SIG_IS_RT(sig)) {
     usize idx = task_index(current_task);
     int slot = sig - SIGRTMIN;
-    interrupts_disable();
+    /* g_rt_lock guards the lazy rt_state alloc (two CPUs racing rt_state_get
+     * would otherwise leak one allocation) and the action read/write vs the
+     * delivery path / a concurrent sigqueue. */
+    u64 flags;
+    spin_lock_irqsave(&g_rt_lock, &flags);
     struct rt_state *rs = rt_state_get(idx, act != 0);
     if (old)
       *old = rs ? rs->action[slot] : (struct sigaction){0};
     if (act) {
       if (!rs) {
-        interrupts_enable();
+        spin_unlock_irqrestore(&g_rt_lock, flags);
         return -1; /* allocation failed */
       }
       rs->action[slot] = *act;
     }
-    interrupts_enable();
+    spin_unlock_irqrestore(&g_rt_lock, flags);
     return 0;
   }
   if (sig < 1 || sig >= NSIG)
