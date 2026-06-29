@@ -27,6 +27,20 @@ CLANG="$USR/bin/clang-22"
 RESDIR="$(ls -d "$USR"/lib/clang/* 2>/dev/null | head -1)"   # .../lib/clang/22
 LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 
+# M75/self-host: CLANG_DYNAMIC=1 proves the DYNAMIC clang (44MB, NEEDED
+# libLLVM-22.so) + the 72MB shared libLLVM-22.so load + run via the M69 loader —
+# i.e. the kernel demand-pages a 72MB .so. This is the runtime validation of the
+# dynamic toolchain (lower self-host floor) and the libLLVM.so path for llvmpipe.
+LIBLLVM=""
+if [ "${CLANG_DYNAMIC:-0}" = "1" ]; then
+	DI="$ROOT_DIR/build/native-clang/b1nix-dyn-install"
+	CLANG="$(find "$DI" -name clang-22 -type f 2>/dev/null | head -1)"
+	# RESDIR stays the static install's lib/clang/22 — same clang 22 resource
+	# headers (and the function-only compile proof needs none anyway).
+	LIBLLVM="$USR/lib/libLLVM.so"   # the real 72MB file (soname libLLVM-22.so)
+	[ -f "$LIBLLVM" ] || { echo "missing $LIBLLVM — run tools/build-native-clang-dynamic.sh"; exit 1; }
+fi
+
 for f in "$CLANG" "$LIBC" "$KELF"; do
 	[ -f "$f" ] || { echo "missing: $f (build it first: tools/build-native-clang.sh --b1nix-elf; make ARCH=x86_64 iso)"; exit 1; }
 done
@@ -44,6 +58,8 @@ cp "$CLANG" "$STAGE/bin/clang"
 # needs for DT_NEEDED loading) and drops only .symtab/.debug_*.
 "$STRIP" --strip-unneeded "$STAGE/bin/clang" 2>/dev/null || true
 cp "$LIBC" "$STAGE/lib/libc.so.1"
+# M75: ship the 72MB shared LLVM next to the dynamic clang (resolved by soname).
+[ -n "$LIBLLVM" ] && cp "$LIBLLVM" "$STAGE/lib/libLLVM-22.so"
 # Header-free TU: the compile proof needs only the backend + integrated
 # assembler, no sysroot and no clang resource headers (a function-only source
 # pulls in no builtin headers). Add CLANG_STAGE_RESOURCE=1 to ship them anyway.
@@ -69,6 +85,7 @@ cd /bin
 write $STAGE/bin/clang clang
 cd /lib
 write $STAGE/lib/libc.so.1 libc.so.1
+$([ -n "$LIBLLVM" ] && echo "write $STAGE/lib/libLLVM-22.so libLLVM-22.so")
 cd /
 write $STAGE/hello.c hello.c
 EOF

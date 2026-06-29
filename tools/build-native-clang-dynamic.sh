@@ -72,6 +72,19 @@ DESTDIR="$DYN_INSTALL" ninja -C "$DYN" \
     install-llvm-libraries install-llvm-headers install-llvm-config \
     install-clang install-clang-resource-headers install-lld
 
+# Give libLLVM.so a proper SONAME (libLLVM-22.so) so dependents record a
+# resolvable name, not the build-tree path. LLVM's dylib link does not set it in
+# this config, and clang ends up with NEEDED 'lib/libLLVM.so' (a relative path).
+# patchelf fixes both post-link without a rebuild.
+if command -v patchelf >/dev/null 2>&1; then
+    patchelf --set-soname libLLVM-22.so "$DEST/lib/libLLVM.so" 2>/dev/null || true
+    DYN_CLANG="$(find "$DYN_INSTALL" -name clang-22 -type f | head -1)"
+    [ -n "$DYN_CLANG" ] && patchelf --replace-needed lib/libLLVM.so libLLVM-22.so "$DYN_CLANG" 2>/dev/null || true
+    echo "[dyn-clang] set libLLVM.so SONAME=libLLVM-22.so + fixed clang NEEDED"
+else
+    echo "[dyn-clang] WARNING: patchelf not found — libLLVM.so has no SONAME, clang NEEDED stays 'lib/libLLVM.so'" >&2
+fi
+
 echo ""
 echo "[dyn-clang] done."
 echo "  libLLVM.so : $DYN/lib/libLLVM.so"
