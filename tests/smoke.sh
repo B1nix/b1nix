@@ -734,6 +734,8 @@ check_output "$LOG" "M15-SMOKE: ok semaphore" "cooperative semaphore baseline wo
 check_output "$LOG" "M15-SMOKE: ok clock-timer" "clock_gettime and nanosleep work"
 check_output "$LOG" "M15-SMOKE: ok permissions-chmod" "chmod changes mode bits"
 check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enforced for non-root uid"
+# ── M74: RT signals (POSIX real-time signals queue, do not coalesce) ──
+check_output "$LOG" "M74-SMOKE: ok rt-queue" "M74: 3 blocked SIGRTMIN sends are all delivered after unblock (RT signals queue, not coalesce)"
 check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 

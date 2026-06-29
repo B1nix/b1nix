@@ -31,6 +31,14 @@ static void sigusr1_handler(int sig) {
   g_sigusr1_hits++;
 }
 
+/* M74: RT-signal queueing. A standard signal coalesces (N sends while blocked =
+ * 1 delivery); an RT signal QUEUES (N sends = N deliveries). */
+static volatile int g_rt_hits;
+static void rt_handler(int sig) {
+  (void)sig;
+  g_rt_hits++;
+}
+
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
@@ -303,6 +311,40 @@ int main(int argc, char **argv) {
     }
   } else {
     marker("M15-SMOKE: fail permissions file setup\n");
+  }
+
+  /* M74: RT-signal queueing — block SIGRTMIN, raise it 3x, unblock, and the
+   * handler must run 3 times (a standard signal would coalesce to 1). */
+  {
+    struct sigaction rtact;
+    struct sigaction rtold;
+    memset(&rtact, 0, sizeof(rtact));
+    memset(&rtold, 0, sizeof(rtold));
+    rtact.sa_handler = rt_handler;
+    rtact.sa_restorer = __sig_restorer;
+    int rt_ok = 0;
+    if ((int)syscall(SYS_SIGNAL, SIGRTMIN, &rtact, &rtold) == 0) {
+      sigset_t rtset;
+      sigemptyset(&rtset);
+      sigaddset(&rtset, SIGRTMIN);
+      int self = (int)syscall(SYS_GETPID);
+      sigprocmask(SIG_BLOCK, &rtset, NULL);
+      g_rt_hits = 0;
+      syscall(SYS_KILL, self, SIGRTMIN);
+      syscall(SYS_KILL, self, SIGRTMIN);
+      syscall(SYS_KILL, self, SIGRTMIN);
+      sigprocmask(SIG_UNBLOCK, &rtset, NULL);
+      for (int i = 0; i < 64 && g_rt_hits < 3; i++)
+        syscall(SYS_YIELD);
+      rt_ok = (g_rt_hits == 3);
+    }
+    if (rt_ok) {
+      marker("M74-SMOKE: ok rt-queue\n");
+    } else {
+      char b[64];
+      snprintf(b, sizeof(b), "M74-SMOKE: fail rt-queue hits=%d\n", g_rt_hits);
+      marker(b);
+    }
   }
 
   marker("M15-SMOKE: done\n");

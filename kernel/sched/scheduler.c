@@ -102,6 +102,37 @@ static int  g_task_has_saved_sigmask[MAX_TASKS];
  * stack is registered. */
 static u64  g_task_altstack_sp[MAX_TASKS];
 static u64  g_task_altstack_size[MAX_TASKS];
+
+/* M74 RT signals (SIGRTMIN..SIGRTMAX). Per-task RT sigactions + a FIFO of queued
+ * (signo, code, value) payloads, lazily allocated (most tasks never use RT
+ * signals; a static 2D table over MAX_TASKS would waste megabytes of BSS and
+ * struct task cannot grow — the M29 invariant). Freed when the task slot is
+ * recycled and on execve (handlers reset to default). */
+#define RT_QUEUE_MAX 64
+struct rt_queued {
+  int signo;
+  int si_code;
+  union sigval value;
+};
+struct rt_state {
+  struct sigaction action[SIGRTMAX - SIGRTMIN + 1];
+  struct rt_queued queue[RT_QUEUE_MAX];
+  int qhead;  /* index of oldest entry */
+  int qcount; /* live entries */
+};
+static struct rt_state *g_rt_state[MAX_TASKS];
+
+static void rt_state_free(usize i) {
+  if (g_rt_state[i]) {
+    kfree(g_rt_state[i]);
+    g_rt_state[i] = 0;
+  }
+}
+static struct rt_state *rt_state_get(usize i, int alloc) {
+  if (!g_rt_state[i] && alloc)
+    g_rt_state[i] = kzalloc(sizeof(struct rt_state));
+  return g_rt_state[i];
+}
 static u64  g_task_alarm_ticks[MAX_TASKS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
@@ -264,6 +295,7 @@ static struct task *find_unused_task(void) {
       g_task_has_saved_sigmask[i] = 0;
       g_task_altstack_sp[i] = 0;
       g_task_altstack_size[i] = 0;
+      rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
       g_task_alarm_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
@@ -310,6 +342,7 @@ static struct task *find_unused_task(void) {
   g_task_has_saved_sigmask[i] = 0;
   g_task_altstack_sp[i] = 0;
   g_task_altstack_size[i] = 0;
+  rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
   g_task_alarm_ticks[i] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
@@ -838,6 +871,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->stop_report_pending = 0;
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
+  rt_state_free(task_index(task)); /* M74: reset RT handlers + drop queued RT */
 
   g_task_tgid[task_index(task)] = task->id;
   if (!stealable)
@@ -3395,8 +3429,15 @@ int scheduler_oom_kill_current(void) {
 }
 
 int scheduler_kill(usize task_id, int sig) {
-  if (sig < 0 || sig >= NSIG)
+  if (sig < 0 || sig > NSIG_MAX)
     return -EINVAL;
+  /* M74: kill(2)/raise(3) of an RT signal QUEUES one instance with a zero
+   * payload (si_code SI_USER == 0), rather than coalescing into a single bit. */
+  if (SIG_IS_RT(sig)) {
+    union sigval v;
+    v.sival_ptr = 0;
+    return scheduler_sigqueue(task_id, sig, v, 0 /* SI_USER */);
+  }
 
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -3459,6 +3500,99 @@ int scheduler_kill(usize task_id, int sig) {
   }
   interrupts_restore(flags);
   return -ESRCH;
+}
+
+/* M74: enqueue one RT-signal instance (with payload) to a task and wake it. The
+ * pending bit (signo-1) means "≥1 queued"; delivery dequeues one entry FIFO and
+ * clears the bit only when the queue for that signo drains. */
+int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) {
+  if (!SIG_IS_RT(sig))
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED &&
+        T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING) {
+      struct rt_state *rs = rt_state_get(i, 1);
+      if (!rs) {
+        interrupts_restore(flags);
+        return -EAGAIN;
+      }
+      if (rs->qcount >= RT_QUEUE_MAX) {
+        interrupts_restore(flags);
+        return -EAGAIN; /* RLIMIT_SIGPENDING analogue */
+      }
+      int slot = (rs->qhead + rs->qcount) % RT_QUEUE_MAX;
+      rs->queue[slot].signo = sig;
+      rs->queue[slot].si_code = si_code;
+      rs->queue[slot].value = value;
+      rs->qcount++;
+      __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
+                        __ATOMIC_RELEASE);
+      /* Wake a blocked/stopped target so it re-checks pending signals. Mirrors
+       * scheduler_kill's CAS so a kill racing the target's exit cannot resurrect
+       * a DEAD/REAPING task. */
+      enum task_state expected = TASK_BLOCKED;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        sched_rq_enqueue_current(T(i));
+      }
+      interrupts_restore(flags);
+      return 0;
+    }
+  }
+  interrupts_restore(flags);
+  return -ESRCH;
+}
+
+/* Dequeue the oldest queued entry for `sig` (SIGRTMIN..SIGRTMAX) on the current
+ * task, returning its si_code and payload. Returns 1 if one was dequeued (and,
+ * via *more, whether the queue for that signo still has entries), 0 if none.
+ * Called from the arch signal-delivery path with interrupts off. */
+int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
+                                 int *more) {
+  if (!current_task)
+    return 0;
+  struct rt_state *rs = g_rt_state[task_index(current_task)];
+  if (!rs || rs->qcount == 0)
+    return 0;
+  for (int n = 0; n < rs->qcount; n++) {
+    int idx = (rs->qhead + n) % RT_QUEUE_MAX;
+    if (rs->queue[idx].signo == sig) {
+      if (si_code)
+        *si_code = rs->queue[idx].si_code;
+      if (value)
+        *value = rs->queue[idx].value;
+      /* Shift the entries before idx forward by one to fill the gap, keeping
+       * FIFO order for the remaining signals. */
+      for (int k = n; k > 0; k--) {
+        int dst = (rs->qhead + k) % RT_QUEUE_MAX;
+        int src = (rs->qhead + k - 1) % RT_QUEUE_MAX;
+        rs->queue[dst] = rs->queue[src];
+      }
+      rs->qhead = (rs->qhead + 1) % RT_QUEUE_MAX;
+      rs->qcount--;
+      int rem = 0;
+      for (int m = 0; m < rs->qcount; m++)
+        if (rs->queue[(rs->qhead + m) % RT_QUEUE_MAX].signo == sig) {
+          rem = 1;
+          break;
+        }
+      if (more)
+        *more = rem;
+      return 1;
+    }
+  }
+  return 0;
+}
+
+/* The current task's RT handler for `sig`, or NULL if none registered. */
+struct sigaction *scheduler_rt_action_current(int sig) {
+  if (!current_task || !SIG_IS_RT(sig))
+    return 0;
+  struct rt_state *rs = g_rt_state[task_index(current_task)];
+  if (!rs)
+    return 0;
+  return &rs->action[sig - SIGRTMIN];
 }
 
 int scheduler_kill_process_group(usize pgrp, int sig) {
@@ -3558,12 +3692,31 @@ int scheduler_kill_all(int sig) {
 
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old) {
+  if (!current_task)
+    return -1;
+  /* M74: RT signals (SIGRTMIN..SIGRTMAX) keep their sigactions in the lazy
+   * side-table rather than the in-struct sigactions[31] array. */
+  if (SIG_IS_RT(sig)) {
+    usize idx = task_index(current_task);
+    int slot = sig - SIGRTMIN;
+    interrupts_disable();
+    struct rt_state *rs = rt_state_get(idx, act != 0);
+    if (old)
+      *old = rs ? rs->action[slot] : (struct sigaction){0};
+    if (act) {
+      if (!rs) {
+        interrupts_enable();
+        return -1; /* allocation failed */
+      }
+      rs->action[slot] = *act;
+    }
+    interrupts_enable();
+    return 0;
+  }
   if (sig < 1 || sig >= NSIG)
     return -1;
   /* SIGKILL and SIGSTOP cannot be caught/ignored */
   if (sig == SIGKILL || sig == SIGSTOP)
-    return -1;
-  if (!current_task)
     return -1;
 
   interrupts_disable();

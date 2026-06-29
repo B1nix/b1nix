@@ -97,6 +97,17 @@ struct cpu_context {
 #define SIGPWR 30
 
 #define NSIG 31
+
+/* M74 POSIX real-time signals. The standard signals above occupy 1..30 (the
+ * in-struct sigactions[31] array and pending/blocked bits 0..30). RT signals
+ * SIGRTMIN..SIGRTMAX use the still-free upper bits 31..62 of the u64 masks; their
+ * sigactions and a FIFO of queued (signo, sigval) payloads live in side-tables
+ * (struct task cannot grow — the M29 LAPIC page-table invariant), so the 1..31
+ * delivery path is left byte-identical and RT is handled additively. */
+#define SIGRTMIN 32
+#define SIGRTMAX 63
+#define NSIG_MAX 63
+#define SIG_IS_RT(s) ((s) >= SIGRTMIN && (s) <= SIGRTMAX)
 #define SCHED_MAX_FDS 64
 #define SCHED_MAX_FD_LIMIT 1024
 
@@ -156,6 +167,14 @@ struct sigaction {
   u64 sa_flags;
   void (*sa_restorer)(void);
   u64 sa_mask; /* signals to block during handler */
+};
+
+/* M74: RT-signal payload (POSIX union sigval), carried by sigqueue and by a
+ * SIGEV_SIGNAL timer's sigev_value and delivered to an SA_SIGINFO handler as
+ * siginfo->si_value. */
+union sigval {
+  int sival_int;
+  void *sival_ptr;
 };
 
 typedef unsigned long rlim_t;
@@ -449,6 +468,21 @@ int scheduler_kill_all(int sig);
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old);
 int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset);
+/* M74: queue an RT signal (SIGRTMIN..SIGRTMAX) with a payload to a task. Unlike
+ * scheduler_kill, repeated calls QUEUE (do not coalesce): each enqueues a
+ * (signo, value) entry delivered FIFO, lowest signo first. si_code is SI_QUEUE
+ * for sigqueue(3) or SI_TIMER for a POSIX timer. Returns 0, -EAGAIN if the
+ * per-task RT queue is full, -EINVAL/-ESRCH otherwise. */
+int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code);
+/* RT-signal delivery helpers, called from the arch signal path (interrupts off):
+ * dequeue the oldest queued instance of `sig` (FIFO) and look up its handler. */
+int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
+                                 int *more);
+struct sigaction *scheduler_rt_action_current(int sig);
+/* siginfo si_code origins (POSIX). */
+#define B1NIX_SI_USER 0
+#define B1NIX_SI_QUEUE (-1)
+#define B1NIX_SI_TIMER (-2)
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
 /* M56 signalfd helpers. */

@@ -19,7 +19,14 @@ static int is_valid_user_code_ptr(u64 ptr) {
 
 static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   struct task *t = current_task;
-  struct sigaction *sa = &t->sigactions[sig - 1];
+  /* M74: RT signals (SIGRTMIN..SIGRTMAX) keep their sigaction in the side-table,
+   * not the in-struct sigactions[31] array. */
+  struct sigaction *sa = SIG_IS_RT(sig) ? scheduler_rt_action_current(sig)
+                                        : &t->sigactions[sig - 1];
+  if (!sa) {
+    scheduler_exit_current(-SIGSEGV);
+    return;
+  }
 
   /* Preserve x86_64 SysV red zone (128 bytes below RSP). */
   u64 user_rsp = frame->rsp - 128;
@@ -213,6 +220,42 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                  * linger and get re-examined on every delivery check. */
                 __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
             }
+        }
+    }
+
+    /* M74: RT signals (SIGRTMIN..SIGRTMAX), delivered after the standard 1..NSIG
+     * signals. Each is QUEUED — one delivery dequeues one instance (FIFO, lowest
+     * signo first); the pending bit clears only when that signo's queue drains,
+     * so N sends yield N deliveries (no coalescing). */
+    for (int i = SIGRTMIN; i <= SIGRTMAX; i++) {
+        if (!(pending & (1ULL << (i - 1))))
+            continue;
+        struct sigaction *sa = scheduler_rt_action_current(i);
+        int more = 0, code = 0;
+        union sigval val;
+        val.sival_ptr = 0;
+        if (sa && sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
+            scheduler_rt_dequeue_current(i, &code, &val, &more);
+            arch_build_signal_frame(frame, i);
+            if (!more)
+                __atomic_fetch_and(&current_task->pending_signals,
+                                   ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+            interrupts_enable();
+            return; /* one signal per delivery check */
+        } else if (!sa || sa->sa_handler == SIG_DFL) {
+            /* RT default action is terminate the process. */
+            console_write("signal: process pid=");
+            console_write_dec(current_task->id);
+            console_write(" killed by RT signal ");
+            console_write_dec(i);
+            console_write("\n");
+            scheduler_exit_current(TASK_EXIT_SIGNALED | i);
+        } else {
+            /* SIG_IGN: discard one queued instance; clear the bit when empty. */
+            scheduler_rt_dequeue_current(i, &code, &val, &more);
+            if (!more)
+                __atomic_fetch_and(&current_task->pending_signals,
+                                   ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
         }
     }
 

@@ -56,6 +56,11 @@ extern "C" {
 #define SI_TKILL   -6
 #define NSIG    31
 
+/* M74 POSIX real-time signals: SIGRTMIN..SIGRTMAX (queued, payload-carrying).
+ * Must match the kernel (kernel/include/b1nix/sched.h). */
+#define SIGRTMIN 32
+#define SIGRTMAX 63
+
 /* siginfo si_code values (POSIX). Used by crash reporters to describe faults. */
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
