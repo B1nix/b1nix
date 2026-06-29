@@ -14,7 +14,13 @@
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-USR="$ROOT_DIR/build/native-clang/b1nix/usr"
+# Prefer the DYNAMIC native toolchain (44 MB clang + 5.5 MB lld, both backed by a
+# demand-paged libLLVM-22.so) over the static 94 MB clang — the whole reason for
+# the self-host module is to keep the resident footprint low. When the dynamic
+# prefix is present, libLLVM-22.so is staged to /lib so the M69 loader resolves it.
+USR="$ROOT_DIR/build/native-clang/b1nix-dyn/usr"
+[ -d "$USR/bin" ] || USR="$ROOT_DIR/build/native-clang/b1nix/usr"
+LIBLLVM="$USR/lib/libLLVM-22.so"   # present only for the dynamic toolchain
 LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 RSP_SRC="$ROOT_DIR/tools/inguest/kernel-make.rsp"
 OUT="$ROOT_DIR/build/selfhost-out"
@@ -30,12 +36,14 @@ done
 [ -d "$RESDIR/include" ] || { echo "missing clang resource headers"; exit 1; }
 STRIP="${STRIP:-strip}"
 
-echo "=== [1/4] stage toolchain + kernel source ==="
+echo "=== [1/4] stage toolchain + kernel source ($([ -f "$LIBLLVM" ] && echo dynamic || echo static)) ==="
 STAGE="$OUT/stage"
 rm -rf "$STAGE"; mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/src" "$STAGE/obj"
 cp "$CLANG" "$STAGE/bin/clang";  "$STRIP" --strip-unneeded "$STAGE/bin/clang" 2>/dev/null || true
 cp "$LLD"   "$STAGE/bin/ld.lld"; "$STRIP" --strip-unneeded "$STAGE/bin/ld.lld" 2>/dev/null || true
 cp "$LIBC"  "$STAGE/lib/libc.so.1"
+# Dynamic toolchain: ship the shared LLVM so clang/lld resolve it (soname) at /lib.
+[ -f "$LIBLLVM" ] && cp "$LIBLLVM" "$STAGE/lib/libLLVM-22.so"
 RESV="$(basename "$RESDIR")"
 mkdir -p "$STAGE/bin-lib/clang/$RESV"
 cp -R "$RESDIR/include" "$STAGE/bin-lib/clang/$RESV/"   # -> /lib/clang/<v>/include relative to /bin/clang

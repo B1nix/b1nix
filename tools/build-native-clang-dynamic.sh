@@ -72,22 +72,20 @@ DESTDIR="$DYN_INSTALL" ninja -C "$DYN" \
     install-llvm-libraries install-llvm-headers install-llvm-config \
     install-clang install-clang-resource-headers install-lld
 
-# Give libLLVM.so a proper SONAME (libLLVM-22.so) so dependents record a
-# resolvable name, not the build-tree path. LLVM's dylib link does not set it in
-# this config, and clang ends up with NEEDED 'lib/libLLVM.so' (a relative path).
-# patchelf fixes both post-link without a rebuild.
-if command -v patchelf >/dev/null 2>&1; then
+# libLLVM's dylib link in this config sets no SONAME, so dependents record the
+# relative build path 'lib/libLLVM.so'. Set the soname once on the real .so.
+command -v patchelf >/dev/null 2>&1 && \
     patchelf --set-soname libLLVM-22.so "$DEST/lib/libLLVM.so" 2>/dev/null || true
-    DYN_CLANG="$(find "$DYN_INSTALL" -name clang-22 -type f | head -1)"
-    [ -n "$DYN_CLANG" ] && patchelf --replace-needed lib/libLLVM.so libLLVM-22.so "$DYN_CLANG" 2>/dev/null || true
-    echo "[dyn-clang] set libLLVM.so SONAME=libLLVM-22.so + fixed clang NEEDED"
-else
-    echo "[dyn-clang] WARNING: patchelf not found — libLLVM.so has no SONAME, clang NEEDED stays 'lib/libLLVM.so'" >&2
-fi
+
+# Assemble the canonical DYNAMIC toolchain prefix (clang-22 + lld + libLLVM-22.so
+# + resource headers, with NEEDED fixups) — the standard native toolchain the
+# rest of the build consumes. Reused by install-native-toolchain, the self-host
+# module, and tools/build-all.sh.
+DYN_PREFIX="$(sh "$ROOT/tools/toolchain/stage-dynamic-clang.sh")"
 
 echo ""
 echo "[dyn-clang] done."
-echo "  libLLVM.so : $DYN/lib/libLLVM.so"
-echo "  clang      : $(find "$DYN_INSTALL" -name clang-22 -type f | head -1)"
-echo "Package libLLVM.so as /lib/libLLVM.so in the b1nix rootfs and ensure the"
-echo "clang NEEDED entry resolves before running it on b1nix (b1nix.clangrun)."
+echo "  libLLVM.so : $DEST/lib/libLLVM.so (soname libLLVM-22.so)"
+echo "  toolchain  : $DYN_PREFIX  (clang-22, lld, lib/libLLVM-22.so)"
+echo "This is now the standard native toolchain; install-native-toolchain and the"
+echo "self-host module prefer it and ship libLLVM-22.so to /lib automatically."

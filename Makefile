@@ -1109,16 +1109,22 @@ busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
 # Native toolchain for b1nix self-host: prefer b1nix-native Clang/LLVM, fallback to GCC.
+# Prefer the DYNAMIC native clang/lld (b1nix-dyn/usr: 44 MB clang + 5.5 MB lld +
+# demand-paged libLLVM-22.so) over the static 94 MB clang when it has been built.
 NATIVE_CLANG_ROOT := $(shell \
-	for p in build/native-clang/b1nix/usr; do \
+	for p in build/native-clang/b1nix-dyn/usr build/native-clang/b1nix/usr; do \
 		if [ -d "$$p/bin" ]; then echo "$$p"; break; fi; \
 	done)
 install-native-toolchain:
 	@if [ -n "$(NATIVE_CLANG_ROOT)" ]; then \
 		echo "Installing native Clang toolchain from $(NATIVE_CLANG_ROOT) to rootfs..."; \
-		mkdir -p $(BUILD_DIR)/rootfs/usr/bin $(BUILD_DIR)/rootfs/usr/lib; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/bin $(BUILD_DIR)/rootfs/usr/lib $(BUILD_DIR)/rootfs/lib; \
 		cp -R $(NATIVE_CLANG_ROOT)/bin/. $(BUILD_DIR)/rootfs/usr/bin/ 2>/dev/null || true; \
 		cp -R $(NATIVE_CLANG_ROOT)/lib/. $(BUILD_DIR)/rootfs/usr/lib/ 2>/dev/null || true; \
+		if [ -f $(NATIVE_CLANG_ROOT)/lib/libLLVM-22.so ]; then \
+			cp $(NATIVE_CLANG_ROOT)/lib/libLLVM-22.so $(BUILD_DIR)/rootfs/lib/; \
+			echo "  dynamic clang: libLLVM-22.so -> rootfs/lib/ (loader search path)"; \
+		fi; \
 		echo "Native Clang toolchain installed to rootfs/usr/"; \
 	elif [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
 		echo "Installing native GCC toolchain (fallback) from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
