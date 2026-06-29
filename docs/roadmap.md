@@ -1479,11 +1479,22 @@ PIE base (`0x500000000000`).
 
 ## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
 
-- [ ] `planned` Two real kernel correctness/safety bugs from the audit:
-  **(1)** `fs/ext4.c:339` `ext4_get_block` returns 0 (hole) past the single-indirect
+- [ ] `deferred` Two real kernel correctness/safety bugs from the audit:
+  **(1)** `fs/ext4.c` `ext4_get_block` returns 0 (hole) past the single-indirect
   range on block-mapped (non-extent) inodes → silent zero-reads/corruption on
   large files of a classic ext2/3 image; add double/triple-indirect traversal
-  (and indirect-block write allocation at `:345`). **(2)** `syscall.c:2134`
-  `mmap(PROT_NONE)` reservations skip PTE setup, so a wild access zero-fills via
-  the anonymous fault path instead of faulting — add a reserved/no-access VMA
-  class the #PF handler honors before zero-filling.
+  (and indirect-block write allocation). **(2)** `sys_mmap(PROT_NONE)`
+  reservations skip PTE setup, so a wild access zero-fills via the anonymous
+  fault path instead of faulting — add a reserved/no-access VMA class the #PF
+  handler honors before zero-filling. **Deferred — both touch hot, load-bearing
+  paths and need a dedicated test harness.** (1) only bites *block-mapped* (ext2/
+  legacy) inodes with files larger than the single-indirect range (~12 + 256
+  blocks); b1nix's own root and every modern image use ext4 **extents**, so it
+  needs a hand-built large block-mapped ext2 image to even exercise/verify, and
+  the fix mutates the read+write block-allocation path. (2) lands in exactly the
+  `sys_mmap` PROT_NONE + `#PF` machinery that the **working V8 sandbox** depends
+  on (its 256 × 4 GiB Smi-range + ~1.4 TiB cage PROT_NONE reservations — a wrong
+  guard-page change would regress a green, delicate path) — V8 never *touches*
+  those reservations, so the latent "PROT_NONE is readable" bug doesn't manifest
+  today. Both are real but the risk/reward says do them deliberately with a
+  fault-injection / large-file harness, not as a closeout afterthought.
