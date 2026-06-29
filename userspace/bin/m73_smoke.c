@@ -390,6 +390,23 @@ static void test_libc_correctness(void) {
     ok("abort-sigabrt");
   else
     fail("abort-sigabrt", WIFSIGNALED(st) ? WTERMSIG(st) : -1, SIGABRT);
+
+  /* realpath: resolve "." / ".." and a symlink to the canonical path (was a
+   * non-resolving strcpy). */
+  mkdir("/tmp/m85rp", 0755);
+  int wfd = open("/tmp/m85rp/file", O_CREAT | O_WRONLY, 0644);
+  if (wfd >= 0) {
+    write(wfd, "x", 1);
+    close(wfd);
+  }
+  unlink("/tmp/m85rp/lnk");
+  symlink("/tmp/m85rp/file", "/tmp/m85rp/lnk");
+  char rp[4096];
+  char *res = realpath("/tmp/m85rp/../m85rp/./lnk", rp);
+  if (res && strcmp(res, "/tmp/m85rp/file") == 0)
+    ok("realpath");
+  else
+    fail("realpath", res ? 0 : -1, 0);
 }
 
 int main(void) {

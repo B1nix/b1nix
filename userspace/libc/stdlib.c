@@ -8,6 +8,8 @@
 #include <math.h>
 #include <signal.h>
 #include <unistd.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -481,11 +483,88 @@ int clearenv(void)
 	return 0;
 }
 
+/* Real path canonicalisation (was a non-resolving strcpy): make the path
+ * absolute (via getcwd for a relative path), collapse "." and "..", and resolve
+ * every symlink component (re-injecting the link target into the unresolved
+ * remainder), ELOOP after 40 symlinks. All components must exist (POSIX). */
 char *realpath(const char *path, char *resolved_path)
 {
-	if (!resolved_path) return strdup(path);
-	strcpy(resolved_path, path);
-	return resolved_path;
+	if (!path) { errno = EINVAL; return NULL; }
+	if (!*path) { errno = ENOENT; return NULL; }
+
+	char *out = resolved_path ? resolved_path : malloc(PATH_MAX);
+	if (!out) { errno = ENOMEM; return NULL; }
+
+	char stack[PATH_MAX];
+	if (path[0] == '/') {
+		if (strlen(path) >= PATH_MAX) goto toolong;
+		strcpy(stack, path);
+	} else {
+		if (!getcwd(stack, PATH_MAX)) goto fail;
+		size_t cl = strlen(stack);
+		if (cl + 1 + strlen(path) >= PATH_MAX) goto toolong;
+		if (cl == 0 || stack[cl - 1] != '/') stack[cl++] = '/';
+		strcpy(stack + cl, path);
+	}
+
+	size_t outlen = 0; /* out holds the canonical prefix, no trailing slash */
+	out[0] = 0;
+	int symloops = 0;
+	size_t pos = 0;
+
+	while (stack[pos]) {
+		while (stack[pos] == '/') pos++;
+		if (!stack[pos]) break;
+		size_t start = pos;
+		while (stack[pos] && stack[pos] != '/') pos++;
+		size_t clen = pos - start;
+		if (clen == 1 && stack[start] == '.') continue;
+		if (clen == 2 && stack[start] == '.' && stack[start + 1] == '.') {
+			while (outlen && out[outlen - 1] != '/') outlen--;
+			if (outlen) outlen--;
+			out[outlen] = 0;
+			continue;
+		}
+		if (outlen + 1 + clen >= PATH_MAX) goto toolong;
+		out[outlen++] = '/';
+		memcpy(out + outlen, stack + start, clen);
+		outlen += clen;
+		out[outlen] = 0;
+
+		struct stat st;
+		if (lstat(out, &st) < 0) goto fail; /* component must exist */
+		if (S_ISLNK(st.st_mode)) {
+			if (++symloops > 40) { errno = ELOOP; goto fail; }
+			char link[PATH_MAX];
+			ssize_t ll = readlink(out, link, PATH_MAX - 1);
+			if (ll < 0) goto fail;
+			link[ll] = 0;
+			/* pop the symlink component from out */
+			while (outlen && out[outlen - 1] != '/') outlen--;
+			if (outlen) outlen--;
+			out[outlen] = 0;
+			/* rebuild stack = link + remaining; absolute link restarts out */
+			char rest[PATH_MAX];
+			if (strlen(stack + pos) >= PATH_MAX) goto toolong;
+			strcpy(rest, stack + pos);
+			if (link[0] == '/') { outlen = 0; out[0] = 0; }
+			if (strlen(link) + strlen(rest) >= PATH_MAX) goto toolong;
+			char rebuilt[PATH_MAX];
+			strcpy(rebuilt, link);
+			strcat(rebuilt, rest);
+			strcpy(stack, rebuilt);
+			pos = 0;
+		}
+	}
+
+	if (outlen == 0) { out[0] = '/'; out[1] = 0; } /* resolved to root */
+	return out;
+
+toolong:
+	errno = ENAMETOOLONG;
+fail:
+	if (!resolved_path) free(out);
+	return NULL;
 }
 
 static void *_realloc_unlocked(void *ptr, size_t size)
