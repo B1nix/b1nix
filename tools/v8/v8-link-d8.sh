@@ -34,17 +34,34 @@ DYNCRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0-dynamic.o"
 SHARED_LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 B1NIX_LINK="${B1NIX_LINK:-dynamic}"
 LIBGCC="$("$GXX" -print-libgcc-file-name)"
-# C++ runtime: a clang+libc++ build (use_custom_libcxx) produces its own
-# libc++.a/libc++abi.a in the out dir — link those instead of GCC's libstdc++/
-# libsupc++. libgcc still provides the _Unwind_* personality routines.
+# C++ runtime selection. SHARED_LIBGCC/STDCXX_SO are appended to the link below
+# and are empty for the static paths, so those links are unchanged:
+#  - clang+libc++ build (use_custom_libcxx): link the in-tree libc++.a/libc++abi.a
+#    statically (V8 vendors libc++; there is no shared libc++.so).
+#  - GCC libstdc++, dynamic link, shared .so present (DEFAULT): resolve libstdc++
+#    from the shared libstdc++.so.6 + the single shared unwinder libgcc_s.so (the
+#    cxx_smoke/litehtml model). Static libgcc.a stays in the group for the
+#    compiler builtins (__multi3 etc.) that libgcc_s.so does not export; -lgcc_s
+#    placed first makes the shared _Unwind_* win. Cross-DSO frames are registered
+#    by the kernel loader + __b1nix_run_dso_init. Set B1NIX_CXX=static to fold.
+#  - otherwise: fold GCC libstdc++.a/libsupc++.a statically.
 LIBCXX_A="$OUT/obj/buildtools/third_party/libc++/libc++.a"
 LIBCXXABI_A="$OUT/obj/buildtools/third_party/libc++abi/libc++abi.a"
+SHARED_LIBGCC=""; STDCXX_SO=""
 if [ -f "$LIBCXX_A" ]; then
   CXXRT="$LIBCXX_A $LIBCXXABI_A"
-  echo "  C++ runtime: libc++ (built in-tree)"
+  echo "  C++ runtime: libc++ (built in-tree, static)"
 else
-  CXXRT="$("$GXX" -print-file-name=libstdc++.a) $("$GXX" -print-file-name=libsupc++.a)"
-  echo "  C++ runtime: GCC libstdc++"
+  _scxxdir="$(dirname "$("$GXX" -print-file-name=libstdc++.a)")"
+  if [ "$B1NIX_LINK" = "dynamic" ] && [ "${B1NIX_CXX:-shared}" != "static" ] && [ -f "$_scxxdir/libstdc++.so.6" ]; then
+    CXXRT=""
+    STDCXX_SO="$_scxxdir/libstdc++.so.6"
+    SHARED_LIBGCC="-u __register_frame -L$_scxxdir -lgcc_s"
+    echo "  C++ runtime: GCC libstdc++.so.6 (shared) + libgcc_s.so (shared unwinder)"
+  else
+    CXXRT="$("$GXX" -print-file-name=libstdc++.a) $("$GXX" -print-file-name=libsupc++.a)"
+    echo "  C++ runtime: GCC libstdc++ (static)"
+  fi
 fi
 
 # powl: d8 needs the long-double pow (openlibm lacks it). Compile the thin
@@ -84,13 +101,15 @@ if [ "$B1NIX_LINK" = "dynamic" ]; then
   echo "  link model: DYNAMIC (shared libc.so.1 via /lib/ld-b1nix.so)"
   # libc is now a shared dependency outside the group; the C++/rust/rust-std
   # archives still resolve their libc references as dynamic imports against it.
+  # $SHARED_LIBGCC (-lgcc_s) precedes the group so the shared unwinder wins;
+  # $STDCXX_SO (libstdc++.so.6) follows it, before libc. Both empty in static-C++.
   "$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
-    --dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv \
+    --dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv --eh-frame-hdr \
     -o d8.b1nix \
-    "$DYNCRT0" \
+    "$DYNCRT0" $SHARED_LIBGCC \
     --start-group @d8.rsp $RUST_RLIBS $RUST_STD \
     "$MATHL_O" $CXXRT "$LIBGCC" "$LIBM" --end-group \
-    "$SHARED_LIBC"
+    $STDCXX_SO "$SHARED_LIBC"
 else
   "$LD" -m elf_x86_64 -T "$LINKER" --gc-sections --allow-multiple-definition \
     -o d8.b1nix \

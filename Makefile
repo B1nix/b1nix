@@ -129,6 +129,9 @@ INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
 # (NetSurf, the m53 servers, ...) need /lib/libgcc_s.so at exec — the M69 kernel
 # linker resolves it. i686 GCC is static-libgcc, so this is x86_64-only.
 INITRAMFS_LIBGCC_S_INC := $(BUILD_DIR)/initramfs_libgcc_s.inc
+# /lib/libstdc++.so.6 — shared GCC C++ stdlib (linked from the PIC libstdc++.a),
+# so dynamically-linked C++ binaries import std::/__cxa_* instead of folding it.
+INITRAMFS_LIBSTDCXX_INC := $(BUILD_DIR)/initramfs_libstdcxx.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -165,6 +168,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_M69_PLUGIN_INC) \
 	$(INITRAMFS_LIBGCC_S_INC) \
+	$(INITRAMFS_LIBSTDCXX_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -965,6 +969,14 @@ $(INITRAMFS_LIBGCC_S_INC): $(CROSS_TOOLCHAIN_ROOT)/bin/$(B1NIX_TRIPLET)-gcc
 	@LIB="$$($< -print-file-name=libgcc_s.so.1 2>/dev/null)"; \
 	[ -f "$$LIB" ] || { echo "libgcc_s.so.1 not found via $(B1NIX_TRIPLET)-gcc ($$LIB)"; exit 1; }; \
 	xxd -i -n vfs_libgcc_s_elf "$$LIB" > $@
+
+# /lib/libstdc++.so.6 — shared GCC C++ stdlib, linked from the PIC libstdc++.a by
+# build-libstdcxx-shared.sh (no GCC rebuild). Dynamically-linked C++ binaries
+# NEEDED it instead of folding ~15 MB; its init_array constructors run via M75.
+$(INITRAMFS_LIBSTDCXX_INC): tools/toolchain/build-libstdcxx-shared.sh $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.a $(INITRAMFS_SHARED_LIBC_INC)
+	@mkdir -p $(dir $@)
+	ARCH=$(ARCH) tools/toolchain/build-libstdcxx-shared.sh >/dev/null
+	xxd -i -n vfs_libstdcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.so.6 > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)

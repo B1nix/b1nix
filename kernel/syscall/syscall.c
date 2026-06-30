@@ -4078,6 +4078,37 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
     return 0;
   }
+  case SYS_DL_PHDR_INFO: {
+    /* SYS_DL_PHDR_INFO(buf, cap) — copy out the loaded-module table (the
+     * executable + every shared library) that backs dl_iterate_phdr. Each entry
+     * is {u64 base, u64 phdr_vaddr, u64 phnum, char name[96]} matching userspace's
+     * struct b1nix_dl_module. Up to `cap` entries are written to `buf`; the return
+     * value is the TOTAL module count so the caller can detect truncation. The
+     * libc dl_iterate_phdr uses this so the libgcc_s.so unwinder can locate each
+     * module's PT_GNU_EH_FRAME (cross-DSO C++ exception unwinding). */
+    struct task *t = current_task;
+    if (!t || !t->user_image) return 0;
+    struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+    usize total = img->dl_module_count;
+    if (arg0 && arg1) {
+      struct {
+        u64 base, phdr_vaddr, phnum, eh_frame_va;
+        char name[USER_DL_MODULE_NAME_MAX];
+      } e;
+      usize n = total < arg1 ? total : arg1;
+      for (usize i = 0; i < n; i++) {
+        e.base = img->dl_modules[i].base;
+        e.phdr_vaddr = img->dl_modules[i].phdr_vaddr;
+        e.phnum = img->dl_modules[i].phnum;
+        e.eh_frame_va = img->dl_modules[i].eh_frame_va;
+        memcpy(e.name, img->dl_modules[i].name, USER_DL_MODULE_NAME_MAX);
+        if (syscall_copyout((void *)(usize)(arg0 + i * sizeof(e)), &e,
+                            sizeof(e)) < 0)
+          return (u64)-EFAULT;
+      }
+    }
+    return (u64)total;
+  }
   case SYS_GETTID:
     return (u64)scheduler_get_pid();
   case SYS_EXIT_THREAD:

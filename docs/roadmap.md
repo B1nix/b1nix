@@ -1624,3 +1624,56 @@ PIE base (`0x500000000000`).
   can mint a valid block-mapped inode (a root loopback `chattr -e`, or a small
   image-builder tool) lands. Triple-indirect is additionally untestable without
   multi-GiB files.
+
+## M89: Migrate the C++ standard library to LLVM libc++ (shared)
+
+- [ ] `planned` **Replace GCC libstdc++ with LLVM libc++ across the C++
+  ecosystem, built as a shared library.** Today every C++ binary (d8, Mesa C++
+  glue, NetSurf/litehtml, the M51–M55 ports, `cxx_smoke`/`m55_*`) statically
+  folds GCC's `libstdc++.a`; there is no `libstdc++.so` because the b1nix GCC
+  target is classified newlib/elf and libstdc++'s configure forces
+  `enable_shared=no`. The cleaner long-term path is LLVM libc++, which has no such
+  gate and builds shared straightforwardly. M75 (shared-library `DT_INIT_ARRAY`
+  constructors now run) is the prerequisite that makes a shared C++ stdlib viable
+  at all — `std::ios_base::Init`, locale facets and other libc++ static
+  constructors live in the `.so`'s init_array.
+- **Scope (a real migration, not a flag flip):**
+  1. Build the LLVM runtimes from source for b1nix — `compiler-rt` + `libunwind`
+     (PIC), then `libc++abi` + `libc++` (`tools/toolchain/build-llvm-runtimes.sh`
+     + `build-libcxx.sh`), currently entirely unbuilt.
+  2. Turn those static builds into **shared** `libc++.so` / `libc++abi.so`
+     (`LIBCXX_ENABLE_SHARED=ON`, PIC unwinder/compiler-rt or reuse the existing
+     shared `libgcc_s.so` unwinder), with soname + symbol versioning, linking
+     against the shared `libc.so.1`.
+  3. Make libc++ the default in `tools/toolchain/bin/b1nix-c++` (it is already
+     "preferred when built") and ship `libc++.so`/`libc++abi.so` to `/lib`.
+  4. **Migrate the ecosystem off libstdc++** and re-verify each consumer: d8
+     (V8), Mesa, NetSurf/litehtml, the M51–M55 ports — these were built and tested
+     against libstdc++, so the ABI/header switch is the main risk and must be
+     smoke-verified per port.
+- **Interim shared libstdc++ (path A) — DONE (v0.75.2, this branch).** The
+  ecosystem stays on GCC libstdc++ but the stdlib itself is now **shared**:
+  `tools/toolchain/build-libstdcxx-shared.sh` links a `libstdc++.so.6` from the
+  -fPIC `libstdc++.a` (no GCC rebuild — bypasses the newlib `enable_shared=no`
+  gate), and the C++ smoke binaries (`cxx_smoke`, `m64_clang`, `m55_iostream`,
+  `m55_litehtml`) link it dynamically. **Full C++ runtime works over the .so —
+  ctors (via M75 `DT_INIT_ARRAY`), STL, std::iostream/filesystem, std::thread,
+  RTTI, and cross-DSO exceptions** (a throw inside `libstdc++.so.6` unwinds back
+  into the executable). Smoke 864/0. The hard part was cross-DSO DWARF unwinding:
+  the kernel registers every loaded `.so`'s `.eh_frame` with libgcc's classic
+  registry (found via the section header table; `__b1nix_run_dso_init` calls
+  `__register_frame`), including `libgcc_s.so` itself (its `frame_dummy` is dead —
+  this newlib target has no crti/crtn so the `.so` has no `DT_INIT`). M89 (libc++)
+  remains the longer-term direction but is no longer a prerequisite for dynamic C++.
+- **V8/d8 flipped to the shared libstdc++ — DONE.** `tools/v8/v8-link-d8.sh`
+  resolves d8's C++ runtime from `libstdc++.so.6` + the single shared unwinder
+  `libgcc_s.so` (static `libgcc.a` stays in the group only for the `__multi3`-class
+  builtins libgcc_s.so does not export). The relinked `d8.b1nix` NEEDs
+  `libstdc++.so.6`/`libgcc_s.so`/`libc.so.1` (no folded STL; `std::cout` is a
+  COPY-reloc), runs its own ctors via `DT_INIT_ARRAY`, and **runs `m58.js` to
+  completion (8/8 markers) on all three tiers — jitless, Sparkplug, TurboFan**
+  (`sh tools/v8/v8-build-run.sh`, `SKIP_BUILD=1` to reuse the link). Set
+  `B1NIX_CXX=static` to restore the folded link. The remaining static-libstdc++
+  consumers are the toolchain `clang-22` (its 78MB libLLVM.so is already shared)
+  and the unbuilt Mesa/NetSurf ports (predominantly C; the C++ piece, litehtml,
+  is already dynamic).

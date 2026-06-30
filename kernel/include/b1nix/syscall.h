@@ -217,6 +217,7 @@ enum {
 	SYS_TIMER_SETTIME    = 178, /* timer_settime(id, flags, new, old) */
 	SYS_TIMER_GETTIME    = 179, /* timer_gettime(id, curr) */
 	SYS_TIMER_DELETE     = 180, /* timer_delete(id) */
+	SYS_DL_PHDR_INFO     = 181, /* dl_iterate_phdr backing: copy out module table */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

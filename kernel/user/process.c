@@ -128,6 +128,17 @@ struct elf64_dyn_object {
    * base-relative absolute VAs once parsed. */
   u64 init_array;
   u64 init_arraysz;
+  /* dl_iterate_phdr: in-process address of this object's program header table
+   * (dlpi_phdr) and its entry count. The DWARF unwinder reads these to locate the
+   * object's PT_GNU_EH_FRAME (.eh_frame_hdr). 0 = not recorded. */
+  u64 phdr_vaddr;
+  u32 phnum;
+  /* In-process address of this object's .eh_frame section (found via the section
+   * header table). __b1nix_run_dso_init hands it to libgcc's __register_frame so
+   * the DWARF unwinder can unwind frames in this object — required even for
+   * libgcc_s.so itself (the unwinder unwinds its own _Unwind_RaiseException frame
+   * first). 0 = no .eh_frame. */
+  u64 eh_frame_va;
   u64 needed[DYN_MAX_NEEDED];
   usize needed_count;
   /* PT_TLS template for this object (for static-TLS layout across the whole
@@ -204,6 +215,19 @@ struct elf64_phdr {
   u64 p_filesz;
   u64 p_memsz;
   u64 p_align;
+} __attribute__((packed));
+
+struct elf64_shdr {
+  u32 sh_name;
+  u32 sh_type;
+  u64 sh_flags;
+  u64 sh_addr;
+  u64 sh_offset;
+  u64 sh_size;
+  u32 sh_link;
+  u32 sh_info;
+  u64 sh_addralign;
+  u64 sh_entsize;
 } __attribute__((packed));
 
 static struct user_program *programs = 0;
@@ -329,6 +353,53 @@ static int elf64_parse_dynamic(struct user_loaded_image *image,
   return 0;
 }
 
+/* dl_iterate_phdr: the in-process address of an ELF object's program header
+ * table. The phdrs live at file offset e_phoff; find the PT_LOAD segment that
+ * maps that offset and translate it to its loaded virtual address (base +
+ * p_vaddr + (e_phoff - p_offset)). Returns 0 if no PT_LOAD covers e_phoff (the
+ * phdrs are then not mapped, and the object can't participate in
+ * dl_iterate_phdr — harmless: the unwinder just won't find its FDEs that way). */
+static u64 elf64_phdr_vaddr(const struct elf64_ehdr *ehdr,
+                            const struct elf64_phdr *phdrs, u64 base)
+{
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph = &phdrs[i];
+    if (ph->p_type != PT_LOAD)
+      continue;
+    if (ehdr->e_phoff >= ph->p_offset &&
+        ehdr->e_phoff < ph->p_offset + ph->p_filesz)
+      return base + ph->p_vaddr + (ehdr->e_phoff - ph->p_offset);
+  }
+  return 0;
+}
+
+/* In-process address of an object's .eh_frame section, located via the section
+ * header table in the on-disk image `data`. Used to register the object's DWARF
+ * unwind tables with libgcc (__register_frame) — this is the only reliable way
+ * to find .eh_frame for a shared object built without --eh-frame-hdr (e.g. the
+ * cross toolchain's libgcc_s.so, which lacks a PT_GNU_EH_FRAME). Returns 0 if no
+ * .eh_frame section exists or the headers are out of range. */
+static u64 elf64_find_eh_frame(const u8 *data, usize size, u64 base)
+{
+  const struct elf64_ehdr *eh = (const struct elf64_ehdr *)data;
+  if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(struct elf64_shdr) ||
+      eh->e_shnum == 0 || eh->e_shstrndx >= eh->e_shnum ||
+      eh->e_shoff + (u64)eh->e_shnum * eh->e_shentsize > size)
+    return 0;
+  const struct elf64_shdr *sh = (const struct elf64_shdr *)(data + eh->e_shoff);
+  const struct elf64_shdr *strsh = &sh[eh->e_shstrndx];
+  if (strsh->sh_offset + strsh->sh_size > size)
+    return 0;
+  const char *shstr = (const char *)(data + strsh->sh_offset);
+  for (u16 i = 0; i < eh->e_shnum; i++) {
+    if (sh[i].sh_name >= strsh->sh_size)
+      continue;
+    if (strcmp(shstr + sh[i].sh_name, ".eh_frame") == 0)
+      return base + sh[i].sh_addr;
+  }
+  return 0;
+}
+
 static int elf64_load_shared_object(struct user_loaded_image *image,
                                     const char *path, u64 base,
                                     struct elf64_dyn_object *obj)
@@ -406,6 +477,12 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     }
     break;
   }
+  /* Record the .so's program header table address (dlpi_phdr) for
+   * dl_iterate_phdr, so the unwinder can find this object's PT_GNU_EH_FRAME. */
+  obj->phdr_vaddr = elf64_phdr_vaddr(
+      ehdr, (const struct elf64_phdr *)(data + ehdr->e_phoff), base);
+  obj->phnum = ehdr->e_phnum;
+  obj->eh_frame_va = elf64_find_eh_frame(data, size, base);
   /* The .so's PT_LOAD segments are already staged above, so parse_dynamic reads
    * its DT array from staging by vaddr; we only need to hand it the phdr table
    * (validated phentsize == sizeof above). */
@@ -1264,6 +1341,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     objects[0].base = load_base;
     objects[0].first_segment = 0;
     objects[0].segment_count = image->segment_count;
+    objects[0].phdr_vaddr = elf64_phdr_vaddr(ehdr, phdrs, load_base);
+    objects[0].phnum = ehdr->e_phnum;
     if (elf64_parse_dynamic(image, &objects[0], phdrs, ehdr->e_phnum) != 0)
       goto cleanup;
 
@@ -1478,6 +1557,36 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
       desc[w] = 0; /* terminator: a zero init_array_va ends the table */
       image->dso_init = desc;
       image->dso_init_count = ndesc;
+    }
+
+    /* Record the per-module program-header table for dl_iterate_phdr. The shared
+     * libgcc_s.so DWARF unwinder enumerates these to find each object's
+     * PT_GNU_EH_FRAME — without the .so's entry, an exception thrown inside
+     * libstdc++.so.6 has no FDE for its own throw frame and std::terminate fires.
+     * objects[0] is the executable; 1+ are the shared libraries (named via the
+     * dedup table). Objects whose phdr table isn't mapped (phdr_vaddr == 0) are
+     * skipped — they simply don't contribute FDEs through this path. */
+    image->dl_module_count = 0;
+    for (usize oi = 0; oi < object_count && oi < USER_MAX_DL_MODULES; oi++) {
+      /* The executable is always module 0 (the dl_iterate_phdr contract — and
+       * userspace relies on it to skip the program, whose own frames crt0 already
+       * registers). It is recorded even though its phdr table may be unmapped
+       * (phdr_vaddr == 0: linker-cxx.ld doesn't place the ELF header in a PT_LOAD).
+       * Shared libraries without a mapped phdr table can't be located by the
+       * unwinder, so they are dropped from the list. */
+      if (oi != 0 && (!objects[oi].phdr_vaddr || !objects[oi].phnum))
+        continue;
+      struct user_dl_module *m = &image->dl_modules[image->dl_module_count++];
+      m->base = objects[oi].base;
+      m->phdr_vaddr = objects[oi].phdr_vaddr;
+      m->phnum = objects[oi].phnum;
+      m->eh_frame_va = objects[oi].eh_frame_va;
+      const char *nm =
+          (oi == 0) ? (image->path ? image->path : "") : loaded_names[oi];
+      usize j = 0;
+      for (; nm && nm[j] && j < USER_DL_MODULE_NAME_MAX - 1; j++)
+        m->name[j] = nm[j];
+      m->name[j] = 0;
     }
   }
 

@@ -78,6 +78,10 @@
 /* /lib/libgcc_s.so for the dynamically-linked C/C++ port binaries (the
  * --enable-shared x86_64 cross GCC gives them DT_NEEDED libgcc_s.so). x86_64. */
 #include "initramfs_libgcc_s.inc"
+/* /lib/libstdc++.so.6 — shared GCC C++ stdlib so C++ binaries import std::/
+ * __cxa_* rather than folding ~15 MB statically. Its init_array constructors
+ * (std::ios_base::Init, locale facets) run via M75. x86_64. */
+#include "initramfs_libstdcxx.inc"
 #endif
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
@@ -1601,6 +1605,12 @@ static const struct initramfs_file files[] = {
      * carry as DT_NEEDED. The M69 exec-time linker resolves it. */
     {"/lib/libgcc_s.so", (const char *)vfs_libgcc_s_elf,
      sizeof(vfs_libgcc_s_elf), INITRAMFS_EXECUTABLE},
+    /* Shared GCC C++ standard library. C++ binaries carry DT_NEEDED
+     * libstdc++.so.6; the M69 exec-time linker resolves it (and its own
+     * DT_NEEDED libc.so.1 / libgcc_s.so). */
+    {"/lib/libstdc++.so.6", (const char *)vfs_libstdcxx_elf,
+     sizeof(vfs_libstdcxx_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libstdc++.so", "/lib/libstdc++.so.6", 20, INITRAMFS_SYMLINK},
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},

@@ -8,6 +8,11 @@ typedef int (*user_program_entry)(int argc, const char **argv);
 #define USER_MAX_ARGS 32
 #define USER_MAX_ENVS 32
 #define USER_MAX_IMAGE_SEGMENTS 32
+/* dl_iterate_phdr module table: the executable + its DT_NEEDED shared objects
+ * (the eager linker caps the object graph at DYN_MAX_OBJECTS = 8; 16 leaves
+ * headroom). USER_DL_MODULE_NAME_MAX bounds the copied soname/path. */
+#define USER_MAX_DL_MODULES 16
+#define USER_DL_MODULE_NAME_MAX 96
 #define USER_STACK_SIZE PAGE_SIZE
 #ifdef __x86_64__
 #define USER_SPACE_LIMIT 0x0000800000000000ULL
@@ -116,6 +121,22 @@ struct user_loaded_image {
 	 * defaults) leaves codegen uninitialized. 0/NULL = no shared-lib ctors. */
 	u64 *dso_init;
 	usize dso_init_count;
+	/* dl_iterate_phdr support: one descriptor per loaded module (the executable
+	 * plus every DT_NEEDED shared object), recorded during eager linking. The
+	 * shared libgcc_s.so DWARF unwinder finds each module's PT_GNU_EH_FRAME
+	 * (.eh_frame_hdr -> .eh_frame) via dl_iterate_phdr; this is what lets a C++
+	 * exception thrown inside libstdc++.so.6 unwind back across the .so/exe
+	 * boundary (otherwise the throw frame has no FDE -> std::terminate). base is the
+	 * load bias (dlpi_addr), phdr_vaddr the in-process address of the program
+	 * header table (dlpi_phdr), phnum its entry count. */
+	struct user_dl_module {
+		u64 base;
+		u64 phdr_vaddr;
+		u32 phnum;
+		u64 eh_frame_va;  /* in-process .eh_frame address, for __register_frame */
+		char name[USER_DL_MODULE_NAME_MAX];
+	} dl_modules[USER_MAX_DL_MODULES];
+	usize dl_module_count;
 };
 
 void userspace_init(void);

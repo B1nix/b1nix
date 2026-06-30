@@ -19,8 +19,31 @@ LITEHTML="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-litehtml.sh")"
 LIBM="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-openlibm.sh")/lib/libm.a"
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
+# Dynamic by default: link the shared libstdc++.so.6 + shared libc.so.1 +
+# shared libgcc_s.so (the cxx_smoke model). litehtml/gumbo stay statically folded
+# (they are non-PIC) but resolve the C++ runtime from the .so. Cross-DSO C++
+# exceptions work because every loaded module's .eh_frame is registered with
+# libgcc (kernel section-header lookup + __b1nix_run_dso_init); crt0 registers the
+# executable's frames via the real __register_frame (-u forces the import).
+# B1NIX_LINK=static restores the historical fully-folded whole-archive link.
+SHARED_LIBC="$UB/libc.so.1"
+STDCXX_SO=""; SHARED_LIBGCC=""
+if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
+  DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC="--whole-archive $UB/libb1nix.a --no-whole-archive"
+else
+  DYN_CRT0="$UB/crt/crt0-dynamic.o"
+  DYN_FLAGS="-z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so"
+  DYN_LIBC="$SHARED_LIBC"
+  _scxx="$(dirname "$STDLIB_CROSS_A")/libstdc++.so.6"
+  if [ -f "$_scxx" ]; then
+    STDCXX_SO="$_scxx"
+    SHARED_LIBGCC="-u __register_frame -L$(dirname "$_scxx") -lgcc_s"
+    STDLIB_CROSS_A=""; STDLIB_ABI_CROSS_A=""  # provided by the shared object
+  fi
+fi
 make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+  "build/$B1NIX_ARCH/libb1nix.a" "$([ "${B1NIX_LINK:-dynamic}" = static ] && echo build/$B1NIX_ARCH/crt/crt0.o || echo build/$B1NIX_ARCH/crt/crt0-dynamic.o)" \
+  "$([ "${B1NIX_LINK:-dynamic}" = static ] || echo build/$B1NIX_ARCH/libc.so.1)" 1>&2
 
 OBJ="$(dirname "$OUT")/m55_litehtml.o"
 mkdir -p "$(dirname "$OUT")"
@@ -38,11 +61,15 @@ fi
 
 # litehtml + gumbo + the C++ runtime + libm all go in one --start-group so the
 # cyclic static-archive references (litehtml<->gumbo<->libstdc++<->libm) resolve.
+# $STDLIB_CROSS_A / $STDLIB_ABI_CROSS_A are empty in dynamic mode (the shared
+# libstdc++.so.6 provides them) — left unquoted so they expand to nothing.
+# $SHARED_LIBGCC (-lgcc_s) goes before the static-libgcc group so the shared
+# unwinder wins; $STDCXX_SO (the shared libstdc++) goes after, before libc.
 "$LD" -m "$LDEMU" -T "$ROOT_DIR/userspace/linker-cxx.ld" --gc-sections \
-  --allow-multiple-definition -o "$OUT" \
-  "$UB/crt/crt0.o" "$OBJ" \
+  --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
+  "$DYN_CRT0" "$OBJ" $SHARED_LIBGCC \
   --start-group "$LITEHTML/lib/liblitehtml.a" "$LITEHTML/lib/libgumbo.a" \
-  "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" \
-  --whole-archive "$UB/libb1nix.a" --no-whole-archive --end-group
+  $STDLIB_CROSS_A $STDLIB_ABI_CROSS_A $CRT_LIBS "$LIBM" --end-group \
+  $STDCXX_SO $DYN_LIBC
 
 "$STRIP" "$OUT"

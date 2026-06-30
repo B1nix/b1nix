@@ -2099,9 +2099,31 @@ void *mremap(void *old_address, size_t old_size, size_t new_size, int flags,
  * (don't invoke the callback). Symbolizers/backtrace code degrade gracefully. */
 int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
                     void *data) {
-  (void)callback;
-  (void)data;
-  return 0;
+  /* Report every loaded module (executable + shared libraries) from the kernel's
+   * dl_iterate_phdr table (SYS_DL_PHDR_INFO). The DWARF unwinder in libgcc_s.so
+   * walks these to find each object's PT_GNU_EH_FRAME, which is what makes a C++
+   * exception thrown inside libstdc++.so.6 unwind back across the .so/exe
+   * boundary instead of hitting std::terminate. */
+  struct b1nix_dl_module mods[16];
+  long total = syscall(SYS_DL_PHDR_INFO, (long)(unsigned long)mods,
+                       (long)(sizeof(mods) / sizeof(mods[0])), 0, 0, 0);
+  if (total <= 0)
+    return 0;
+  long n = total < (long)(sizeof(mods) / sizeof(mods[0]))
+               ? total
+               : (long)(sizeof(mods) / sizeof(mods[0]));
+  int ret = 0;
+  for (long i = 0; i < n; i++) {
+    struct dl_phdr_info info;
+    info.dlpi_addr = (ElfW(Addr))mods[i].base;
+    info.dlpi_name = mods[i].name;
+    info.dlpi_phdr = (const ElfW(Phdr) *)(unsigned long)mods[i].phdr_vaddr;
+    info.dlpi_phnum = (ElfW(Half))mods[i].phnum;
+    ret = callback(&info, sizeof(info), data);
+    if (ret != 0)
+      break;
+  }
+  return ret;
 }
 
 /* Real syscall() function (Linux-compat). Defined last, after all the macro

@@ -34,6 +34,30 @@ CRT0="$USR/build/$ARCH/crt/crt0.o"
 LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$LIB" "$CRT0"
 
+# ── Static vs dynamic link (default dynamic, like the rest of userspace) ─────
+# B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libstdc++/libc++ and the
+# bundled archives stay statically folded (they are non-PIC), only libc becomes
+# the shared libc.so.1 loaded via /lib/ld-b1nix.so (the proven d8 / Mesa-port
+# model). B1NIX_LINK=static keeps the historical whole-archive static link.
+SHARED_LIBC="$USR/build/$ARCH/libc.so.1"
+DYN_CRT0="$USR/build/$ARCH/crt/crt0-dynamic.o"
+if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
+  DYN_EXTRA=""
+  # libb1nix.a stays INSIDE the runtime group (circular libstdc++<->libc resolution).
+  GROUP_LIBC="--whole-archive $LIB --no-whole-archive"
+  POST_GROUP=""
+else
+  [ -f "$DYN_CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$DYN_CRT0" "$SHARED_LIBC"
+  CRT0="$DYN_CRT0"
+  # --eh-frame-hdr emits PT_GNU_EH_FRAME so the executable's frames are
+  # discoverable via dl_iterate_phdr by the shared libgcc_s.so unwinder (the
+  # same path used for libstdc++.so.6), making cross-DSO C++ exceptions work.
+  DYN_EXTRA="-z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so"
+  # libc comes from the shared libc.so.1, after the static C++ runtime group.
+  GROUP_LIBC=""
+  POST_GROUP="$SHARED_LIBC"
+fi
+
 # ── Resolve C++ standard library (libc++ vs libstdc++) ──────────────────────
 # B1NIX_CXX_STDLIB=libc++  → use LLVM libc++ (run build-libcxx.sh first)
 # B1NIX_CXX_STDLIB=libstdc++ → use GCC libstdc++ (default fallback)
@@ -68,6 +92,43 @@ case "$CXX_STDLIB" in
     echo "  C++ stdlib: GCC libstdc++" >&2
     ;;
 esac
+
+# Shared libstdc++: in dynamic mode link the shared libstdc++.so.6 instead of
+# folding the ~15 MB static archive into every C++ binary. The .so bundles the
+# libsupc++ objects, so it covers STDLIB_ABI_A too. Built by
+# tools/toolchain/build-libstdcxx-shared.sh; its constructors run via M75.
+STDCXX_SO=""
+SHARED_LIBGCC=""
+if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ "$CXX_STDLIB" != "libc++" ]; then
+  _scxxdir="$(dirname "$STDLIB_A")"
+  _scxx="$_scxxdir/libstdc++.so.6"
+  if [ -f "$_scxx" ]; then
+    STDCXX_SO="$_scxx"
+    STDLIB_A=""        # provided by the shared object (space-free path; unquoted below)
+    STDLIB_ABI_A=""
+    echo "  C++ stdlib: shared libstdc++.so.6" >&2
+    # Single shared unwinder. libstdc++.so.6 imports _Unwind_*/__cxa_* from the
+    # shared libgcc_s.so, so the executable MUST use that same libgcc_s.so for its
+    # own exception frames — otherwise a throw runs the .so's libgcc_s unwinder
+    # while the executable's frames were registered with a *private* static-libgcc
+    # registry, the landing pad is never found, and std::terminate aborts. Linking
+    # -lgcc_s (before the static libgcc.a kept only for the integer/soft-float
+    # helpers) makes _Unwind_RaiseException, _Unwind_Resume and __register_frame_info
+    # resolve to the one libgcc_s.so the whole process shares; crt0's
+    # __register_frame_info call then populates that single shared FDE registry.
+    # -lgcc_s records the bare soname 'libgcc_s.so' (the name the initramfs serves).
+    if [ -f "$_scxxdir/libgcc_s.so" ] || [ -f "$_scxxdir/libgcc_s.so.1" ]; then
+      # -u __register_frame_info forces it to be a *dynamic* import bound to
+      # libgcc_s.so. crt0 references it only weakly ("no-op for clang binaries"),
+      # and with no static libgcc on the line the weak ref would otherwise resolve
+      # to 0 at link time and crt0 would skip frame registration entirely — so the
+      # executable's FDEs would never enter the shared registry and unwinding would
+      # still fail. Forcing the import makes crt0's `&__register_frame_info` non-NULL
+      # at runtime so it registers the program's .eh_frame with the shared unwinder.
+      SHARED_LIBGCC="-u __register_frame -L$_scxxdir -lgcc_s"
+    fi
+  fi
+fi
 
 # ── Resolve compiler runtime (compiler-rt vs libgcc) ───────────────────────
 if [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$LLVM_RT/libunwind.a" ]; then
@@ -158,15 +219,21 @@ done
 # Link recipe: crt0 + objects, then the C++ runtime group. --allow-multiple-
 # definition resolves the i686 __divdi3/__moddi3 clash (b1nix div64 vs libgcc).
 # shellcheck disable=SC2086
+# $STDLIB_A / $STDLIB_ABI_A are space-free toolchain paths, empty when the shared
+# libstdc++.so.6 is used; left unquoted so they expand to nothing in that case.
+# $STDCXX_SO (the shared libstdc++) goes after the group, before libc.
+# $SHARED_LIBGCC (-lgcc_s) is placed BEFORE the static libgcc.a so the shared
+# libgcc_s.so wins resolution of the unwinder/EH symbols (the static archive then
+# only contributes the integer/soft-float helpers it uniquely defines).
 if [ -n "$UNWIND_RUNTIME" ]; then
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
-    "$CRT0" $objs \
-    --start-group "$STDLIB_A" "$STDLIB_ABI_A" "$CRT_RUNTIME" "$UNWIND_RUNTIME" \
-    --whole-archive "$LIB" --no-whole-archive --end-group
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition $DYN_EXTRA -o "$output" \
+    "$CRT0" $objs $SHARED_LIBGCC \
+    --start-group $STDLIB_A $STDLIB_ABI_A "$CRT_RUNTIME" "$UNWIND_RUNTIME" $GROUP_LIBC --end-group \
+    $STDCXX_SO $POST_GROUP
 else
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition -o "$output" \
-    "$CRT0" $objs \
-    --start-group "$STDLIB_A" "$STDLIB_ABI_A" "$CRT_RUNTIME" \
-    --whole-archive "$LIB" --no-whole-archive --end-group
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition $DYN_EXTRA -o "$output" \
+    "$CRT0" $objs $SHARED_LIBGCC \
+    --start-group $STDLIB_A $STDLIB_ABI_A "$CRT_RUNTIME" $GROUP_LIBC --end-group \
+    $STDCXX_SO $POST_GROUP
 fi
 rm -rf "$tmp"
