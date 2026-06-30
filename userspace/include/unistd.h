@@ -198,14 +198,20 @@ int getppid(void);
 
 /* POSIX/Linux compat surface (implemented in posix_compat.c over b1nix
  * syscalls). pipe2/accept4 honour O_CLOEXEC/O_NONBLOCK; daemon/pwrite/preadv/
- * pwritev/fdatasync/linkat are real; sendfile/splice/sigwait report ENOSYS for
- * paths b1nix's kernel does not provide (callers fall back). */
+ * pwritev/fdatasync/linkat are real; M73 added real sendfile/splice/
+ * copy_file_range over the kernel; sigwait reports ENOSYS (no signal-wait). */
 int pipe2(int pipefd[2], int flags);
 int daemon(int nochdir, int noclose);
 int fdatasync(int fd);
 ssize_t pwrite(int fd, const void *buf, size_t count, off_t offset);
 int linkat(int olddirfd, const char *oldpath, int newdirfd, const char *newpath,
            int flags);
+/* M73: fd→fd range copy (over SYS_COPY_FILE_RANGE). splice is declared in
+ * <fcntl.h>; sendfile in <sys/sendfile.h>. */
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+                        size_t len, unsigned int flags);
+/* M63: install a seccomp-bpf syscall filter (also declared in <linux/seccomp.h>). */
+int seccomp(unsigned int op, unsigned int flags, void *args);
 
 int usleep(unsigned int usec);
 

@@ -172,6 +172,9 @@ BINARIES += $(BUILD)/bin/m48_smoke
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server
 BINARIES += $(BUILD)/bin/m57_smoke
+BINARIES += $(BUILD)/bin/m73_smoke
+BINARIES += $(BUILD)/bin/m63_smoke
+BINARIES += $(BUILD)/bin/m71_aslr
 # M58: standalone JavaScript interpreter (embeds Duktape) + its smoke test.
 BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
@@ -425,17 +428,19 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER
 
 # Hosted C++ smoke: built with the cross GCC's libstdc++ via tools/toolchain/bin/b1nix-c++
 # (NOT clang $(CC)). Requires the C++-enabled toolchain (enable-cxx-toolchain.sh).
-$(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(LINKER)
+# The b1nix-c++ wrapper + DYNAMIC_CRT0 + SHARED_LIBC are prerequisites so the
+# dynamic-vs-static link mode (and a wrapper change) re-triggers the link.
+$(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(DYNAMIC_CRT0) $(SHARED_LIBC) $(LINKER) ../tools/toolchain/bin/b1nix-c++
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
 
-$(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(LIB) $(CRT0) $(LINKER)
+$(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(LIB) $(CRT0) $(DYNAMIC_CRT0) $(SHARED_LIBC) $(LINKER) ../tools/toolchain/bin/b1nix-c++
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-clang++ $< -o $@
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
 # b1nix VFS, built against libstdc++ via tools/toolchain/bin/b1nix-c++.
-$(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(LINKER)
+$(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(DYNAMIC_CRT0) $(SHARED_LIBC) $(LINKER) ../tools/toolchain/bin/b1nix-c++
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
 

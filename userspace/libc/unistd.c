@@ -17,6 +17,7 @@
 #include <sys/ioctl.h>
 #include <sys/resource.h>
 #include <unistd.h>
+#include <sys/prctl.h>
 #include <termios.h>
 #include <poll.h>
 #include <errno.h>
@@ -30,7 +31,11 @@
 
 int normalize_errno(long rc) {
   int e = (int)(-rc);
-  if (e >= EPERM && e <= EINPROGRESS)
+  /* Accept the full defined errno range. The old ceiling of EINPROGRESS (115)
+   * masked every higher errno as EIO — e.g. ECANCELED (125, a cancelled async
+   * timer), EOWNERDEAD/ENOTRECOVERABLE (robust mutexes), EKEY* — hiding the real
+   * cause from callers. EHWPOISON (133) is the highest errno we define. */
+  if (e >= EPERM && e <= EHWPOISON)
     return e;
   return EIO;
 }
@@ -545,9 +550,10 @@ int munlock(const void *addr, size_t len) { (void)addr; (void)len; return 0; }
  * page cache, so flushing dirty pages back to the backing file is implicit.
  * Treat msync as a successful no-op (callers like LLVM use it to ensure output
  * is on disk, which b1nix's write-back already guarantees on munmap/close). */
+/* M72: real msync over SYS_MSYNC — flush a file-backed MAP_SHARED range's dirty
+ * pages to the backing file (MS_SYNC) or schedule them (MS_ASYNC). */
 int msync(void *addr, size_t length, int flags) {
-  (void)addr; (void)length; (void)flags;
-  return 0;
+  return _check_err(syscall(SYS_MSYNC, addr, length, flags));
 }
 
 /* M32: select() — fd-readiness multiplex. Converts tv to ms (with NULL ⇒
@@ -1734,11 +1740,18 @@ long sysconf(int name) {
   case _SC_PAGESIZE:
     return 4096;
   case _SC_NPROCESSORS_CONF:
-  case _SC_NPROCESSORS_ONLN:
-    /* ponytail: report 1 — no userspace CPU-count primitive yet, and a single
-     * worker is plenty for a software renderer. Wire to /sys/.../cpu/online if
-     * a port ever needs real parallelism. */
+  case _SC_NPROCESSORS_ONLN: {
+    /* Real online-CPU count from the affinity mask (b1nix is SMP). Reporting 1
+     * made Chromium et al. size their thread pools for a single core (Chromium
+     * port debt). sched_getaffinity returns the online-CPU set. */
+    cpu_set_t set;
+    if (sched_getaffinity(0, sizeof(set), &set) == 0) {
+      int n = CPU_COUNT(&set);
+      if (n > 0)
+        return n;
+    }
     return 1;
+  }
   case _SC_PHYS_PAGES:
   case _SC_AVPHYS_PAGES: {
     struct sysinfo si;
@@ -1946,9 +1959,27 @@ int flock(int fd, int operation) {
 int feclearexcept(int e) { (void)e; return 0; }
 int feraiseexcept(int e) { (void)e; return 0; }
 int fetestexcept(int e) { (void)e; return 0; }
-/* prctl: b1nix has no prctl syscall; the operations callers use (thread/VMA
- * naming) are cosmetic, so report success without doing anything. */
-int prctl(int option, ...) { (void)option; return 0; }
+/* prctl: the seccomp-relevant options (PR_SET_SECCOMP, PR_SET/GET_NO_NEW_PRIVS)
+ * route to the kernel (M63); the remaining options callers use are cosmetic
+ * (thread/VMA naming) and report success without doing anything. */
+int prctl(int option, ...) {
+  if (option == PR_SET_SECCOMP || option == PR_SET_NO_NEW_PRIVS ||
+      option == PR_GET_NO_NEW_PRIVS) {
+    va_list ap;
+    va_start(ap, option);
+    unsigned long a1 = va_arg(ap, unsigned long);
+    unsigned long a2 = va_arg(ap, unsigned long);
+    va_end(ap);
+    return _check_err(syscall(SYS_PRCTL, option, a1, a2));
+  }
+  (void)option;
+  return 0;
+}
+
+/* seccomp(2): install a syscall filter or enter strict mode (M63). */
+int seccomp(unsigned int op, unsigned int flags, void *args) {
+  return _check_err(syscall(SYS_SECCOMP, op, flags, args));
+}
 int fegetexceptflag(fexcept_t *flagp, int e) { (void)e; if (flagp) *flagp = 0; return 0; }
 int fesetexceptflag(const fexcept_t *flagp, int e) { (void)flagp; (void)e; return 0; }
 int fegetround(void) { return 0x000 /* FE_TONEAREST */; }
@@ -2029,16 +2060,27 @@ ssize_t pwrite64(int fd, const void *buf, size_t n, off_t offset) {
   return pwrite(fd, buf, n, offset);
 }
 
-/* posix_fallocate: b1nix has no fallocate syscall, so just grow the file to
- * cover [offset, offset+len) via ftruncate (writes still extend it on demand).
- * Returns 0 or an errno value directly — it does NOT set errno. */
+/* M73: fallocate over the kernel SYS_FALLOCATE. mode 0 extends the file to
+ * cover [offset, offset+len); FALLOC_FL_KEEP_SIZE reserves without growing.
+ * Hole-punch / collapse / zero-range report EOPNOTSUPP (no driver support).
+ * Sets errno and returns -1 on failure (unlike posix_fallocate). */
+int fallocate(int fd, int mode, off_t offset, off_t len) {
+  return _check_err(syscall(SYS_FALLOCATE, fd, mode, (long)offset, (long)len));
+}
+
+/* posix_fallocate: grow the file to cover [offset, offset+len). Routes through
+ * the real fallocate(2) (mode 0). Returns 0 or an errno value directly — it
+ * does NOT set errno (POSIX contract). */
 int posix_fallocate(int fd, off_t offset, off_t len) {
   if (offset < 0 || len <= 0) return EINVAL;
-  off_t end = offset + len;
-  off_t cur = lseek(fd, 0, SEEK_END);
-  if (cur < 0) return errno;
-  if (cur < end && ftruncate(fd, end) < 0) return errno;
-  return 0;
+  /* POSIX: posix_fallocate MUST NOT modify the global errno; fallocate() (via
+   * _check_err) does set it on failure, so save and restore it around the call. */
+  int saved = errno;
+  int rc = 0;
+  if (fallocate(fd, 0, offset, len) < 0)
+    rc = errno;
+  errno = saved;
+  return rc;
 }
 
 /* b1nix has no mremap syscall; report failure so callers fall back to
@@ -2057,9 +2099,31 @@ void *mremap(void *old_address, size_t old_size, size_t new_size, int flags,
  * (don't invoke the callback). Symbolizers/backtrace code degrade gracefully. */
 int dl_iterate_phdr(int (*callback)(struct dl_phdr_info *, size_t, void *),
                     void *data) {
-  (void)callback;
-  (void)data;
-  return 0;
+  /* Report every loaded module (executable + shared libraries) from the kernel's
+   * dl_iterate_phdr table (SYS_DL_PHDR_INFO). The DWARF unwinder in libgcc_s.so
+   * walks these to find each object's PT_GNU_EH_FRAME, which is what makes a C++
+   * exception thrown inside libstdc++.so.6 unwind back across the .so/exe
+   * boundary instead of hitting std::terminate. */
+  struct b1nix_dl_module mods[16];
+  long total = syscall(SYS_DL_PHDR_INFO, (long)(unsigned long)mods,
+                       (long)(sizeof(mods) / sizeof(mods[0])), 0, 0, 0);
+  if (total <= 0)
+    return 0;
+  long n = total < (long)(sizeof(mods) / sizeof(mods[0]))
+               ? total
+               : (long)(sizeof(mods) / sizeof(mods[0]));
+  int ret = 0;
+  for (long i = 0; i < n; i++) {
+    struct dl_phdr_info info;
+    info.dlpi_addr = (ElfW(Addr))mods[i].base;
+    info.dlpi_name = mods[i].name;
+    info.dlpi_phdr = (const ElfW(Phdr) *)(unsigned long)mods[i].phdr_vaddr;
+    info.dlpi_phnum = (ElfW(Half))mods[i].phnum;
+    ret = callback(&info, sizeof(info), data);
+    if (ret != 0)
+      break;
+  }
+  return ret;
 }
 
 /* Real syscall() function (Linux-compat). Defined last, after all the macro

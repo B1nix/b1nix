@@ -914,6 +914,32 @@ void kernel_main(usize arg0, usize arg1)
 				console_write("M64-NATIVE-CLANG: ok compile\n");
 			else
 				console_write("M64-NATIVE-CLANG: fail compile\n");
+
+			/* Diagnostic: also compile at -O2. The optimized path uses the
+			 * greedy allocator and has no "must use fast regalloc" check, so a
+			 * valid object here proves the dynamic libLLVM.so codegen+assembler
+			 * work end to end (and bounds any -O0 fast-regalloc defect to that
+			 * one path — the level llvmpipe never JITs at). */
+			const char *cc2_argv[] = {"clang", "-O2", "-c", "/mnt/clang/hello.c",
+			                          "-o", "/mnt/clang/hello2.o", 0};
+			int cc2_pid = user_spawn("/mnt/clang/bin/clang", 6, cc2_argv);
+			int cc2_st = -1;
+			if (cc2_pid > 0)
+				syscall_dispatch(SYS_WAIT, (u64)cc2_pid, (u64)(usize)&cc2_st, 0, 0, 0, 0);
+			unsigned char elfmag2[4] = {0};
+			int ofd2 = vfs_open("/mnt/clang/hello2.o");
+			if (ofd2 >= 0) {
+				vfs_read(ofd2, (char *)elfmag2, sizeof(elfmag2));
+				vfs_close(ofd2);
+			}
+			snprintf(clang_buf, sizeof(clang_buf), "clang: clang -O2 -c exit=%d obj-magic=%02x%02x%02x%02x\n",
+			         cc2_st, elfmag2[0], elfmag2[1], elfmag2[2], elfmag2[3]);
+			console_write(clang_buf);
+			if (cc2_pid > 0 && elfmag2[0] == 0x7f && elfmag2[1] == 'E' &&
+			    elfmag2[2] == 'L' && elfmag2[3] == 'F')
+				console_write("M64-NATIVE-CLANG: ok compile-O2\n");
+			else
+				console_write("M64-NATIVE-CLANG: fail compile-O2\n");
 		}
 	}
 

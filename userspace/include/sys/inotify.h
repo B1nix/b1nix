@@ -1,16 +1,14 @@
 #ifndef _SYS_INOTIFY_H
 #define _SYS_INOTIFY_H
 
-/* Minimal <sys/inotify.h> for the b1nix libc (added for the Chromium port,
- * M60-62). b1nix has NO inotify file-change notification mechanism, so the
- * functions are honest stubs that fail with ENOSYS. The struct/constants are
- * provided so callers (perfetto file watching, etc.) compile; callers that
- * check the inotify_init() return value fall back to their non-inotify path.
- * This is NOT a fake success — it reports the feature as unimplemented. */
+/* <sys/inotify.h> for the b1nix libc. M73: real inotify — file-change
+ * notification backed by SYS_INOTIFY_{INIT1,ADD_WATCH,RM_WATCH}. The kernel
+ * enqueues IN_MODIFY (write to a watched file), IN_CREATE / IN_DELETE (entry
+ * added/removed in a watched directory) and IN_IGNORED (watch removed); the fd
+ * is pollable and read() returns struct inotify_event records. */
 
 #include <stdint.h>
 #include <sys/types.h>
-#include <errno.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -54,14 +52,10 @@ struct inotify_event {
 #define IN_CLOEXEC  02000000
 #define IN_NONBLOCK 00004000
 
-static inline int inotify_init(void) { errno = ENOSYS; return -1; }
-static inline int inotify_init1(int flags) { (void)flags; errno = ENOSYS; return -1; }
-static inline int inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
-    (void)fd; (void)pathname; (void)mask; errno = ENOSYS; return -1;
-}
-static inline int inotify_rm_watch(int fd, int wd) {
-    (void)fd; (void)wd; errno = ENOSYS; return -1;
-}
+int inotify_init(void);
+int inotify_init1(int flags);
+int inotify_add_watch(int fd, const char *pathname, uint32_t mask);
+int inotify_rm_watch(int fd, int wd);
 
 #ifdef __cplusplus
 }

@@ -365,4 +365,60 @@ typedef struct {
   int si_status;
 } siginfo_t;
 
+/* M73: *at() resolution flags (Linux-compatible values). */
+#define AT_FDCWD -100
+#define AT_SYMLINK_NOFOLLOW 0x100
+#define AT_EMPTY_PATH 0x1000
+
+/* M73: fallocate mode (only KEEP_SIZE meaningfully handled). */
+#ifndef FALLOC_FL_KEEP_SIZE
+#define FALLOC_FL_KEEP_SIZE 0x01
+#endif
+
+/* M73: statx — Linux struct statx layout (so glibc/port binaries get real
+ * values). STATX_BASIC_STATS is the set b1nix can fill from struct b1nix_stat. */
+#define STATX_TYPE 0x0001U
+#define STATX_MODE 0x0002U
+#define STATX_NLINK 0x0004U
+#define STATX_UID 0x0008U
+#define STATX_GID 0x0010U
+#define STATX_ATIME 0x0020U
+#define STATX_MTIME 0x0040U
+#define STATX_CTIME 0x0080U
+#define STATX_INO 0x0100U
+#define STATX_SIZE 0x0200U
+#define STATX_BLOCKS 0x0400U
+#define STATX_BASIC_STATS 0x07ffU
+#define STATX_BTIME 0x0800U
+
+struct statx_timestamp {
+  i64 tv_sec;
+  u32 tv_nsec;
+  i32 __reserved;
+};
+
+struct statx {
+  u32 stx_mask;
+  u32 stx_blksize;
+  u64 stx_attributes;
+  u32 stx_nlink;
+  u32 stx_uid;
+  u32 stx_gid;
+  u16 stx_mode;
+  u16 __spare0[1];
+  u64 stx_ino;
+  u64 stx_size;
+  u64 stx_blocks;
+  u64 stx_attributes_mask;
+  struct statx_timestamp stx_atime;
+  struct statx_timestamp stx_btime;
+  struct statx_timestamp stx_ctime;
+  struct statx_timestamp stx_mtime;
+  u32 stx_rdev_major;
+  u32 stx_rdev_minor;
+  u32 stx_dev_major;
+  u32 stx_dev_minor;
+  u64 __spare2[14];
+};
+
 #endif

@@ -81,6 +81,9 @@ EMBEDDED_USER_PROGRAMS := \
 	m42_w5pre_smoke \
 	m46_smoke \
 	m57_smoke \
+	m73_smoke \
+	m63_smoke \
+	m71_aslr \
 	m47_smoke \
 	m48_smoke \
 	m49_smoke \
@@ -126,6 +129,9 @@ INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
 # (NetSurf, the m53 servers, ...) need /lib/libgcc_s.so at exec — the M69 kernel
 # linker resolves it. i686 GCC is static-libgcc, so this is x86_64-only.
 INITRAMFS_LIBGCC_S_INC := $(BUILD_DIR)/initramfs_libgcc_s.inc
+# /lib/libstdc++.so.6 — shared GCC C++ stdlib (linked from the PIC libstdc++.a),
+# so dynamically-linked C++ binaries import std::/__cxa_* instead of folding it.
+INITRAMFS_LIBSTDCXX_INC := $(BUILD_DIR)/initramfs_libstdcxx.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -162,6 +168,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_M69_PLUGIN_INC) \
 	$(INITRAMFS_LIBGCC_S_INC) \
+	$(INITRAMFS_LIBSTDCXX_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -309,6 +316,7 @@ KERNEL_SOURCES := \
 	kernel/fs/vfs_slab.c \
 	kernel/fs/pipe.c \
 	kernel/fs/eventpoll.c \
+	kernel/fs/inotify.c \
 	kernel/fs/fat32.c \
 	kernel/fs/isofs.c \
 	kernel/fs/exfat.c \
@@ -337,6 +345,7 @@ KERNEL_SOURCES := \
 	kernel/sched/m28_ctxbench.c \
 	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
+	kernel/sched/seccomp.c \
 	kernel/user/process.c \
 	kernel/user/programs.c \
 	kernel/user/tui_common.c \
@@ -411,9 +420,18 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
-	smoke smoke-quick graphics-smoke memory-smoke
+	smoke smoke-quick graphics-smoke memory-smoke build-all
 
 all: $(KERNEL_ELF)
+
+# build-all — one orchestrator that builds the whole working system in dependency
+# order by reusing the existing build scripts (see tools/build-all.sh). Forwards
+# ARCH; pass extra flags via BUILD_ALL_ARGS, e.g.:
+#   make build-all                                  # OS + ISO (default)
+#   make build-all BUILD_ALL_ARGS=--all             # + every opt-in component
+#   make build-all BUILD_ALL_ARGS=--with-dynamic-clang
+build-all:
+	ARCH=$(ARCH) sh tools/build-all.sh $(BUILD_ALL_ARGS)
 
 objects: $(OBJECTS)
 
@@ -951,6 +969,14 @@ $(INITRAMFS_LIBGCC_S_INC): $(CROSS_TOOLCHAIN_ROOT)/bin/$(B1NIX_TRIPLET)-gcc
 	@LIB="$$($< -print-file-name=libgcc_s.so.1 2>/dev/null)"; \
 	[ -f "$$LIB" ] || { echo "libgcc_s.so.1 not found via $(B1NIX_TRIPLET)-gcc ($$LIB)"; exit 1; }; \
 	xxd -i -n vfs_libgcc_s_elf "$$LIB" > $@
+
+# /lib/libstdc++.so.6 — shared GCC C++ stdlib, linked from the PIC libstdc++.a by
+# build-libstdcxx-shared.sh (no GCC rebuild). Dynamically-linked C++ binaries
+# NEEDED it instead of folding ~15 MB; its init_array constructors run via M75.
+$(INITRAMFS_LIBSTDCXX_INC): tools/toolchain/build-libstdcxx-shared.sh $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.a $(INITRAMFS_SHARED_LIBC_INC)
+	@mkdir -p $(dir $@)
+	ARCH=$(ARCH) tools/toolchain/build-libstdcxx-shared.sh >/dev/null
+	xxd -i -n vfs_libstdcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.so.6 > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
@@ -1003,7 +1029,7 @@ iso-core: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=core|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
@@ -1014,7 +1040,7 @@ iso-graphics: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=graphics|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
@@ -1025,7 +1051,7 @@ iso-shell: $(KERNEL_ELF)
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.smoke=shell|g' \
+	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
 	     -e 's|@MODULE_CMD@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
@@ -1095,16 +1121,22 @@ busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
 # Native toolchain for b1nix self-host: prefer b1nix-native Clang/LLVM, fallback to GCC.
+# Prefer the DYNAMIC native clang/lld (b1nix-dyn/usr: 44 MB clang + 5.5 MB lld +
+# demand-paged libLLVM-22.so) over the static 94 MB clang when it has been built.
 NATIVE_CLANG_ROOT := $(shell \
-	for p in build/native-clang/b1nix/usr; do \
+	for p in build/native-clang/b1nix-dyn/usr build/native-clang/b1nix/usr; do \
 		if [ -d "$$p/bin" ]; then echo "$$p"; break; fi; \
 	done)
 install-native-toolchain:
 	@if [ -n "$(NATIVE_CLANG_ROOT)" ]; then \
 		echo "Installing native Clang toolchain from $(NATIVE_CLANG_ROOT) to rootfs..."; \
-		mkdir -p $(BUILD_DIR)/rootfs/usr/bin $(BUILD_DIR)/rootfs/usr/lib; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/bin $(BUILD_DIR)/rootfs/usr/lib $(BUILD_DIR)/rootfs/lib; \
 		cp -R $(NATIVE_CLANG_ROOT)/bin/. $(BUILD_DIR)/rootfs/usr/bin/ 2>/dev/null || true; \
 		cp -R $(NATIVE_CLANG_ROOT)/lib/. $(BUILD_DIR)/rootfs/usr/lib/ 2>/dev/null || true; \
+		if [ -f $(NATIVE_CLANG_ROOT)/lib/libLLVM-22.so ]; then \
+			cp $(NATIVE_CLANG_ROOT)/lib/libLLVM-22.so $(BUILD_DIR)/rootfs/lib/; \
+			echo "  dynamic clang: libLLVM-22.so -> rootfs/lib/ (loader search path)"; \
+		fi; \
 		echo "Native Clang toolchain installed to rootfs/usr/"; \
 	elif [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
 		echo "Installing native GCC toolchain (fallback) from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \

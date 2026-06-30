@@ -593,6 +593,26 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
   if (!(error_code & PF_PRESENT) && !has_deferred_leaf &&
       fault_addr >= 0x40000000 &&
       fault_addr < 0x00007FFFFFFFFFFF) {
+    /* M88: enforce PROT_NONE. A pure reservation (mmap PROT_NONE) records a VMA
+     * but installs no leaf PTE, so without this a wild user access would fall
+     * into the zero-fill below and silently succeed. If the faulting address
+     * lands in a no-access VMA, refuse to service it — the caller delivers
+     * SIGSEGV. The VMA list is sorted by start, so the walk early-exits past the
+     * address; this runs only on the anonymous not-present path (PROT_NONE
+     * regions never have present/lazy leaves), not on heap-growth faults that
+     * have no covering VMA. mprotect splits the VMA and updates ->prot, so a
+     * region later made accessible (e.g. V8 committing part of a reservation)
+     * has prot != PROT_NONE here and falls through to the normal zero-fill. */
+    if ((error_code & PF_USER) && current_task) {
+      for (struct vm_area *v = current_task->vma_list;
+           v && v->start <= page_aligned; v = v->next) {
+        if (page_aligned < v->end) {
+          if (v->prot == PROT_NONE)
+            return -1; /* no access -> SIGSEGV */
+          break;       /* covering VMA grants access; service normally */
+        }
+      }
+    }
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
     u64 frame = pmm_alloc_frame();
     if (!frame) {
@@ -675,11 +695,20 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
           u64 file_page = file_offset & ~(PAGE_SIZE - 1);
 
           if (vma->node->inode->type == VFS_FILE) {
+            /* M72: a writable MAP_SHARED file page is potentially-dirty the
+             * moment it is mapped — stores through the PTE won't fault again, so
+             * we cannot observe the write later. Mark the page-cache entry dirty
+             * now so reactive reclaim writes it back instead of dropping it as
+             * "clean", which used to lose mmap stores that raced ahead of msync.
+             * Read-only or MAP_PRIVATE mappings are untouched. */
+            int mark_dirty = vma_shared && (vma->prot & PROT_WRITE);
             struct page_cache_entry *page = page_cache_get_page(vma->node->inode, file_page);
             if (page) {
               pmm_free_frame(frame); // drop the freshly allocated frame
               frame = page->frame;
               pmm_ref_frame(frame);  // VMA references it
+              if (mark_dirty)
+                page_cache_mark_dirty(page);
               page_cache_put_page(page);
               shared_cache_frame = 1;
             } else if (vma->node->inode->read_cb) {
@@ -687,6 +716,14 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
               if (res >= 0) {
                 if (page_cache_add_page(vma->node->inode, file_page, frame) == 0) {
                   pmm_ref_frame(frame); // cache ref + VMA ref
+                  if (mark_dirty) {
+                    struct page_cache_entry *pe =
+                        page_cache_get_page(vma->node->inode, file_page);
+                    if (pe) {
+                      page_cache_mark_dirty(pe);
+                      page_cache_put_page(pe);
+                    }
+                  }
                 }
               } else {
                 pmm_free_frame(frame);
@@ -1022,14 +1059,71 @@ int paging_test_and_clear_accessed(u64 pml4_phys, u64 vaddr) {
   if (pde & HUGE_PAGE_FLAG) return 0;
 
   u64 *pt = table_from_entry(pde);
-  u64 pte = pt[pt_index(vaddr)];
+  if (!(pt[pt_index(vaddr)] & VMM_PRESENT)) return 0;
 
-  if (pte & VMM_ACCESSED) {
-    pt[pt_index(vaddr)] = pte & ~VMM_ACCESSED;
+  /* Atomic clear: the MMU sets the Accessed/Dirty bits in this PTE from other
+   * CPUs concurrently. A plain read-modify-write would clobber a hardware A/D
+   * update landing between the read and the store, losing it. `lock and` (via
+   * __atomic_fetch_and) clears our bit while preserving every other bit the
+   * hardware races to set, and returns the prior value so we can test it. */
+  u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_ACCESSED,
+                               __ATOMIC_SEQ_CST);
+  if (old & VMM_ACCESSED) {
     invalidate_page(vaddr);
     return 1;
   }
   return 0;
+}
+
+/* M72: test-and-clear the hardware dirty bit of a 4 KiB user page. Used by
+ * msync to discover which MAP_SHARED pages userspace actually wrote (the CPU
+ * sets PTE.D on the store) so only those are written back to the file. Returns
+ * 1 if the page was dirty (and clears the bit), 0 otherwise. */
+int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return 0;
+
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT)) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) return 0;
+
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT)) return 0;
+  if (pde & HUGE_PAGE_FLAG) return 0;
+
+  u64 *pt = table_from_entry(pde);
+  if (!(pt[pt_index(vaddr)] & VMM_PRESENT)) return 0;
+
+  /* Atomic clear (see paging_test_and_clear_accessed): `lock and` so a
+   * concurrent hardware Accessed/Dirty set on another CPU is not lost. */
+  u64 old = __atomic_fetch_and((u64 *)&pt[pt_index(vaddr)], ~VMM_DIRTY,
+                               __ATOMIC_SEQ_CST);
+  if (old & VMM_DIRTY) {
+    invalidate_page(vaddr);
+    return 1;
+  }
+  return 0;
+}
+
+/* M72: physical frame backing a user vaddr in the given address space (0 if not
+ * present). Used by msync to write an mmap'd page's frame straight to its file. */
+u64 paging_user_frame(u64 pml4_phys, u64 vaddr) {
+  u64 *pml4 = (u64 *)(usize)(pml4_phys ? (pml4_phys + DIRECT_MAP_BASE) : (u64)(usize)kernel_pml4_virt);
+  u64 pml4e = pml4[pml4_index(vaddr)];
+  if (!(pml4e & VMM_PRESENT)) return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(vaddr)];
+  if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG)) return 0;
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(vaddr)];
+  if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG)) return 0;
+  u64 *pt = table_from_entry(pde);
+  u64 pte = pt[pt_index(vaddr)];
+  if (!(pte & VMM_PRESENT)) return 0;
+  return pte & 0x000FFFFFFFFFF000ULL;
 }
 
 void paging_dump_entries(u64 virtual_address) {

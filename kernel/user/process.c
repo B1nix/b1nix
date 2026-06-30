@@ -1,4 +1,5 @@
 #include <b1nix/arch.h>
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/linux_abi.h>
@@ -62,6 +63,13 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define DT_RELAENT 9
 #define DT_STRSZ   10
 #define DT_SYMENT  11
+#define DT_INIT_ARRAY 25
+#define DT_INIT_ARRAYSZ 27
+
+/* b1nix-private auxv type carrying the shared-library constructor descriptor
+ * table (see user_build_initial_stack / crt0). Far above the standard auxv
+ * range (0..51) so it can never collide. Must match userspace/include/sys/auxv.h. */
+#define AT_B1NIX_DSO_INIT 0x1000
 #define DT_JMPREL  23
 #define DT_PLTREL  20
 
@@ -112,6 +120,25 @@ struct elf64_dyn_object {
   u64 strtab;
   u64 strsz;
   u64 hash;
+  /* DT_INIT / DT_INIT_ARRAY: this object's C++ static constructors. For a
+   * shared library these are NOT covered by the executable's crt0 (which only
+   * walks the EXE's own __init_array), so the kernel collects them across the
+   * whole DT_NEEDED graph and hands the list to userspace (via AT_B1NIX_DSO_INIT)
+   * to run before the executable's own constructors. init/init_array are
+   * base-relative absolute VAs once parsed. */
+  u64 init_array;
+  u64 init_arraysz;
+  /* dl_iterate_phdr: in-process address of this object's program header table
+   * (dlpi_phdr) and its entry count. The DWARF unwinder reads these to locate the
+   * object's PT_GNU_EH_FRAME (.eh_frame_hdr). 0 = not recorded. */
+  u64 phdr_vaddr;
+  u32 phnum;
+  /* In-process address of this object's .eh_frame section (found via the section
+   * header table). __b1nix_run_dso_init hands it to libgcc's __register_frame so
+   * the DWARF unwinder can unwind frames in this object — required even for
+   * libgcc_s.so itself (the unwinder unwinds its own _Unwind_RaiseException frame
+   * first). 0 = no .eh_frame. */
+  u64 eh_frame_va;
   u64 needed[DYN_MAX_NEEDED];
   usize needed_count;
   /* PT_TLS template for this object (for static-TLS layout across the whole
@@ -133,6 +160,25 @@ struct elf64_dyn_object {
 #else
 #define PIE_LOAD_BASE 0x40000000ULL
 #endif
+
+/* M71 ASLR: per-exec load base for PIE/ET_DYN images. Opt-in via the
+ * `b1nix.aslr` kernel cmdline flag (default off — conservative, the loader is a
+ * load-bearing green path). When on, the base is shifted by a 2 MiB-granular
+ * random offset (alignment-preserving; PIE_LOAD_BASE is 2 MiB-aligned) within a
+ * bounded window above PIE_LOAD_BASE. 15 bits of entropy × 2 MiB = up to ~64 GiB
+ * of jitter — isolated between the upward-growing mmap arena (fills from 4 GiB,
+ * V8's ~1.4 TiB reservations stay far below) and the shared-library region at
+ * 0x600000000000 (1 TiB above the base). ET_EXEC images (load_base 0 — the
+ * fixed-base toolchain/V8/rustc links) are never randomized. */
+static u64 aslr_pie_base(void) {
+#ifdef __x86_64__
+  if (bootinfo_has_flag("b1nix.aslr")) {
+    u64 slots = kernel_random_u64() & 0x7fff; /* 15 bits */
+    return PIE_LOAD_BASE + slots * 0x200000ULL;
+  }
+#endif
+  return PIE_LOAD_BASE;
+}
 
 /* Sanity ceiling on a single ELF segment's p_memsz. Any real b1nix binary is a
  * few MiB; a crafted multi-GiB p_memsz must be rejected before kzalloc (OOM =
@@ -169,6 +215,19 @@ struct elf64_phdr {
   u64 p_filesz;
   u64 p_memsz;
   u64 p_align;
+} __attribute__((packed));
+
+struct elf64_shdr {
+  u32 sh_name;
+  u32 sh_type;
+  u64 sh_flags;
+  u64 sh_addr;
+  u64 sh_offset;
+  u64 sh_size;
+  u32 sh_link;
+  u32 sh_info;
+  u64 sh_addralign;
+  u64 sh_entsize;
 } __attribute__((packed));
 
 static struct user_program *programs = 0;
@@ -284,10 +343,59 @@ static int elf64_parse_dynamic(struct user_loaded_image *image,
       case DT_RELASZ: obj->rela_size = dyn[d].d_val; break;
       case DT_JMPREL: obj->jmprel = dyn[d].d_val + obj->base; break;
       case DT_PLTRELSZ: obj->jmprel_size = dyn[d].d_val; break;
+      case DT_INIT_ARRAY: obj->init_array = dyn[d].d_val + obj->base; break;
+      case DT_INIT_ARRAYSZ: obj->init_arraysz = dyn[d].d_val; break;
       default: break;
       }
     }
     return 0;
+  }
+  return 0;
+}
+
+/* dl_iterate_phdr: the in-process address of an ELF object's program header
+ * table. The phdrs live at file offset e_phoff; find the PT_LOAD segment that
+ * maps that offset and translate it to its loaded virtual address (base +
+ * p_vaddr + (e_phoff - p_offset)). Returns 0 if no PT_LOAD covers e_phoff (the
+ * phdrs are then not mapped, and the object can't participate in
+ * dl_iterate_phdr — harmless: the unwinder just won't find its FDEs that way). */
+static u64 elf64_phdr_vaddr(const struct elf64_ehdr *ehdr,
+                            const struct elf64_phdr *phdrs, u64 base)
+{
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph = &phdrs[i];
+    if (ph->p_type != PT_LOAD)
+      continue;
+    if (ehdr->e_phoff >= ph->p_offset &&
+        ehdr->e_phoff < ph->p_offset + ph->p_filesz)
+      return base + ph->p_vaddr + (ehdr->e_phoff - ph->p_offset);
+  }
+  return 0;
+}
+
+/* In-process address of an object's .eh_frame section, located via the section
+ * header table in the on-disk image `data`. Used to register the object's DWARF
+ * unwind tables with libgcc (__register_frame) — this is the only reliable way
+ * to find .eh_frame for a shared object built without --eh-frame-hdr (e.g. the
+ * cross toolchain's libgcc_s.so, which lacks a PT_GNU_EH_FRAME). Returns 0 if no
+ * .eh_frame section exists or the headers are out of range. */
+static u64 elf64_find_eh_frame(const u8 *data, usize size, u64 base)
+{
+  const struct elf64_ehdr *eh = (const struct elf64_ehdr *)data;
+  if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(struct elf64_shdr) ||
+      eh->e_shnum == 0 || eh->e_shstrndx >= eh->e_shnum ||
+      eh->e_shoff + (u64)eh->e_shnum * eh->e_shentsize > size)
+    return 0;
+  const struct elf64_shdr *sh = (const struct elf64_shdr *)(data + eh->e_shoff);
+  const struct elf64_shdr *strsh = &sh[eh->e_shstrndx];
+  if (strsh->sh_offset + strsh->sh_size > size)
+    return 0;
+  const char *shstr = (const char *)(data + strsh->sh_offset);
+  for (u16 i = 0; i < eh->e_shnum; i++) {
+    if (sh[i].sh_name >= strsh->sh_size)
+      continue;
+    if (strcmp(shstr + sh[i].sh_name, ".eh_frame") == 0)
+      return base + sh[i].sh_addr;
   }
   return 0;
 }
@@ -369,6 +477,12 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     }
     break;
   }
+  /* Record the .so's program header table address (dlpi_phdr) for
+   * dl_iterate_phdr, so the unwinder can find this object's PT_GNU_EH_FRAME. */
+  obj->phdr_vaddr = elf64_phdr_vaddr(
+      ehdr, (const struct elf64_phdr *)(data + ehdr->e_phoff), base);
+  obj->phnum = ehdr->e_phnum;
+  obj->eh_frame_va = elf64_find_eh_frame(data, size, base);
   /* The .so's PT_LOAD segments are already staged above, so parse_dynamic reads
    * its DT array from staging by vaddr; we only need to hand it the phdr table
    * (validated phentsize == sizeof above). */
@@ -746,12 +860,28 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (envp_ptrs[i] == 0) return -1;
   }
 
+  /* M75: place the shared-library constructor descriptor table on the stack and
+   * record its user VA for AT_B1NIX_DSO_INIT. Layout (read forwards from the VA):
+   * {init_array_va, count} pairs, terminated by a zero init_array_va. Pushed
+   * highest-address-first (terminator first, then descriptors in reverse) so the
+   * table reads forwards from the returned VA. The table is tiny (2 words per
+   * library), so it coexists with argv/envp/auxv on the single-page stack. */
+  usize dso_init_va = 0;
+  if (image->dso_init && image->dso_init_count) {
+    if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* terminator */
+    for (usize i = image->dso_init_count; i-- > 0;) {
+      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 1]) < 0) return -1; /* count */
+      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 0]) < 0) return -1; /* va */
+    }
+    dso_init_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
+  }
+
   sp &= ~(usize)0xf;
 
   /* Ensure the final stack pointer (which becomes ESP/RSP at _start) is
    * 16-byte aligned, as the SysV ABI requires. We are about to push exactly
    * total_slots pointer-sized words: argc(1), argv(argc), NULL(1), envp(envc),
-   * NULL(1), auxv(5). sp is 16-aligned right now, so after the pushes it stays
+   * NULL(1), auxv(6+). sp is 16-aligned right now, so after the pushes it stays
    * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
    * many zero words as needed to reach the next 16-byte boundary.
    *
@@ -759,8 +889,13 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * words per 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
    * pad words may be required — the old "push one if misaligned" left ESP 4- or
    * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
-   * the unaligned ring3 stack, so every ELF32 spawn failed. */
-  usize total_slots = 8 + (usize)image->argc + (usize)envc;
+   * the unaligned ring3 stack, so every ELF32 spawn failed.
+   *
+   * Auxv words below: AT_NULL(2) + AT_PHDR(2) + AT_ENTRY(2) = 6, plus 2 for the
+   * optional AT_B1NIX_DSO_INIT. The remaining +3 is the argv terminator, envp
+   * terminator, and argc word. */
+  usize total_slots = 9 + (usize)image->argc + (usize)envc +
+                      (dso_init_va ? 2 : 0);
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
@@ -768,11 +903,23 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   }
 
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL */
-  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1; /* AT_ENTRY */
-  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1;
-  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1; /* AT_PHDR */
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
+  /* Auxiliary vector. Pushed high-address-first as {a_val, a_type} pairs so that
+   * — read forwards from the low end, where getauxval() starts after the envp
+   * NULL — each entry appears in the ABI's {a_type, a_val} order and AT_NULL
+   * terminates the array at the high end. (The earlier layout pushed a_type
+   * before a_val and left AT_NULL at the low end, so getauxval saw AT_NULL first
+   * and returned 0 for every query; only rust relied on auxv and tolerates 0 as
+   * "absent", which masked the bug.) */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_val */
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_type */
+  if (dso_init_va) {
+    if (user_stack_push_usize(stack, &sp, (usize)dso_init_va) < 0) return -1;
+    if (user_stack_push_usize(stack, &sp, AT_B1NIX_DSO_INIT) < 0) return -1;
+  }
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                   /* AT_PHDR  a_val */
+  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1;                   /* AT_PHDR  a_type */
+  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1; /* AT_ENTRY a_val */
+  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1;                   /* AT_ENTRY a_type */
 
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
@@ -1016,7 +1163,7 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * also walk PT_DYNAMIC and apply R_X86_64_RELATIVE relocations so
    * absolute pointers in the binary (e.g. into .rodata or function
    * tables) point at the relocated base. */
-  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
+  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? aslr_pie_base() : 0;
 
   image->entry = ehdr->e_entry + load_base;
   console_write("ELF load: ");
@@ -1194,6 +1341,8 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     objects[0].base = load_base;
     objects[0].first_segment = 0;
     objects[0].segment_count = image->segment_count;
+    objects[0].phdr_vaddr = elf64_phdr_vaddr(ehdr, phdrs, load_base);
+    objects[0].phnum = ehdr->e_phnum;
     if (elf64_parse_dynamic(image, &objects[0], phdrs, ehdr->e_phnum) != 0)
       goto cleanup;
 
@@ -1372,6 +1521,73 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
         goto cleanup;
       }
     }
+
+    /* M75: collect shared-library constructors so crt0 can run them before the
+     * executable's own __init_array. Each entry is a {init_array_va, count}
+     * descriptor pointing at the library's .init_array, which already lives in
+     * that object's mapped user memory — no copying, so the descriptor table
+     * stays tiny (one entry per library, fits the single-page initial stack even
+     * when libLLVM.so contributes 458 constructors). The crt0 helper dereferences
+     * each init_array_va in userspace and calls the function pointers there.
+     *
+     * Order is deepest-dependency-first: the DT_NEEDED graph is loaded
+     * breadth-first from the executable (index 0), so a dependency is appended
+     * after its dependents — iterating the library objects (index 1+) in reverse
+     * runs the deepest dependencies' constructors first, matching the dynamic
+     * linker. objects[0] (the executable) is skipped: crt0 walks its own
+     * __init_array directly. Like the executable (b1nix has no crti.o/_init), the
+     * legacy DT_INIT entry point is not used — every real constructor lives in
+     * .init_array under this toolchain. */
+    usize ndesc = 0;
+    for (usize oi = 1; oi < object_count; oi++)
+      if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64))
+        ndesc++;
+    if (ndesc) {
+      /* 2 words per descriptor + 1 NULL terminator word. */
+      u64 *desc = kzalloc((ndesc * 2 + 1) * sizeof(u64));
+      if (!desc)
+        goto cleanup;
+      usize w = 0;
+      for (usize oi = object_count; oi-- > 1;) {
+        if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64)) {
+          desc[w++] = objects[oi].init_array;
+          desc[w++] = objects[oi].init_arraysz / sizeof(u64);
+        }
+      }
+      desc[w] = 0; /* terminator: a zero init_array_va ends the table */
+      image->dso_init = desc;
+      image->dso_init_count = ndesc;
+    }
+
+    /* Record the per-module program-header table for dl_iterate_phdr. The shared
+     * libgcc_s.so DWARF unwinder enumerates these to find each object's
+     * PT_GNU_EH_FRAME — without the .so's entry, an exception thrown inside
+     * libstdc++.so.6 has no FDE for its own throw frame and std::terminate fires.
+     * objects[0] is the executable; 1+ are the shared libraries (named via the
+     * dedup table). Objects whose phdr table isn't mapped (phdr_vaddr == 0) are
+     * skipped — they simply don't contribute FDEs through this path. */
+    image->dl_module_count = 0;
+    for (usize oi = 0; oi < object_count && oi < USER_MAX_DL_MODULES; oi++) {
+      /* The executable is always module 0 (the dl_iterate_phdr contract — and
+       * userspace relies on it to skip the program, whose own frames crt0 already
+       * registers). It is recorded even though its phdr table may be unmapped
+       * (phdr_vaddr == 0: linker-cxx.ld doesn't place the ELF header in a PT_LOAD).
+       * Shared libraries without a mapped phdr table can't be located by the
+       * unwinder, so they are dropped from the list. */
+      if (oi != 0 && (!objects[oi].phdr_vaddr || !objects[oi].phnum))
+        continue;
+      struct user_dl_module *m = &image->dl_modules[image->dl_module_count++];
+      m->base = objects[oi].base;
+      m->phdr_vaddr = objects[oi].phdr_vaddr;
+      m->phnum = objects[oi].phnum;
+      m->eh_frame_va = objects[oi].eh_frame_va;
+      const char *nm =
+          (oi == 0) ? (image->path ? image->path : "") : loaded_names[oi];
+      usize j = 0;
+      for (; nm && nm[j] && j < USER_DL_MODULE_NAME_MAX - 1; j++)
+        m->name[j] = nm[j];
+      m->name[j] = 0;
+    }
   }
 
   rc = image->segment_count > 0 ? 0 : -1;
@@ -1414,6 +1630,9 @@ void user_image_free(struct user_loaded_image *image) {
 
   if (image->path)
     kfree((void *)image->path);
+
+  if (image->dso_init)
+    kfree(image->dso_init);
 
   if (image->argv) {
     for (int i = 0; i < image->argc; i++) {

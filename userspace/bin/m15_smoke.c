@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <sys/mman.h>
+#include <sys/timerfd.h> /* struct itimerspec */
 #include <time.h>
 #include <unistd.h>
 
@@ -29,6 +30,25 @@ static void marker(const char *text) { write(1, text, strlen(text)); }
 static void sigusr1_handler(int sig) {
   (void)sig;
   g_sigusr1_hits++;
+}
+
+/* M74: RT-signal queueing. A standard signal coalesces (N sends while blocked =
+ * 1 delivery); an RT signal QUEUES (N sends = N deliveries). */
+static volatile int g_rt_hits;
+static void rt_handler(int sig) {
+  (void)sig;
+  g_rt_hits++;
+}
+
+/* M74: SA_SIGINFO RT handler — records the sigqueue payload (si_value) of each
+ * delivery to verify FIFO order and that the payload survives delivery. */
+static volatile int g_rt_vals[4];
+static volatile int g_rt_n;
+static void rt_si_handler(int sig, siginfo_t *si, void *uc) {
+  (void)sig;
+  (void)uc;
+  if (si && g_rt_n < 4)
+    g_rt_vals[g_rt_n++] = si->si_value.sival_int;
 }
 
 int main(int argc, char **argv) {
@@ -303,6 +323,128 @@ int main(int argc, char **argv) {
     }
   } else {
     marker("M15-SMOKE: fail permissions file setup\n");
+  }
+
+  /* M74: RT-signal queueing — block SIGRTMIN, raise it 3x, unblock, and the
+   * handler must run 3 times (a standard signal would coalesce to 1). */
+  {
+    struct sigaction rtact;
+    struct sigaction rtold;
+    memset(&rtact, 0, sizeof(rtact));
+    memset(&rtold, 0, sizeof(rtold));
+    rtact.sa_handler = rt_handler;
+    rtact.sa_restorer = __sig_restorer;
+    int rt_ok = 0;
+    if ((int)syscall(SYS_SIGNAL, SIGRTMIN, &rtact, &rtold) == 0) {
+      sigset_t rtset;
+      sigemptyset(&rtset);
+      sigaddset(&rtset, SIGRTMIN);
+      int self = (int)syscall(SYS_GETPID);
+      sigprocmask(SIG_BLOCK, &rtset, NULL);
+      g_rt_hits = 0;
+      syscall(SYS_KILL, self, SIGRTMIN);
+      syscall(SYS_KILL, self, SIGRTMIN);
+      syscall(SYS_KILL, self, SIGRTMIN);
+      sigprocmask(SIG_UNBLOCK, &rtset, NULL);
+      for (int i = 0; i < 64 && g_rt_hits < 3; i++)
+        syscall(SYS_YIELD);
+      rt_ok = (g_rt_hits == 3);
+    }
+    if (rt_ok) {
+      marker("M74-SMOKE: ok rt-queue\n");
+    } else {
+      char b[64];
+      snprintf(b, sizeof(b), "M74-SMOKE: fail rt-queue hits=%d\n", g_rt_hits);
+      marker(b);
+    }
+  }
+
+  /* M74: sigqueue payload via SA_SIGINFO. Queue three distinct payloads on a
+   * blocked RT signal; the handler must receive them in FIFO order with the
+   * correct si_value. */
+  {
+    struct sigaction sa;
+    struct sigaction old;
+    memset(&sa, 0, sizeof(sa));
+    memset(&old, 0, sizeof(old));
+    sa.sa_sigaction = rt_si_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_restorer = __sig_restorer;
+    int ok = 0;
+    if ((int)syscall(SYS_SIGNAL, SIGRTMIN + 1, &sa, &old) == 0) {
+      sigset_t s;
+      sigemptyset(&s);
+      sigaddset(&s, SIGRTMIN + 1);
+      int self = (int)syscall(SYS_GETPID);
+      sigprocmask(SIG_BLOCK, &s, NULL);
+      g_rt_n = 0;
+      union sigval v;
+      v.sival_int = 11;
+      sigqueue(self, SIGRTMIN + 1, v);
+      v.sival_int = 22;
+      sigqueue(self, SIGRTMIN + 1, v);
+      v.sival_int = 33;
+      sigqueue(self, SIGRTMIN + 1, v);
+      sigprocmask(SIG_UNBLOCK, &s, NULL);
+      for (int i = 0; i < 64 && g_rt_n < 3; i++)
+        syscall(SYS_YIELD);
+      ok = (g_rt_n == 3 && g_rt_vals[0] == 11 && g_rt_vals[1] == 22 &&
+            g_rt_vals[2] == 33);
+    }
+    if (ok) {
+      marker("M74-SMOKE: ok rt-sigqueue\n");
+    } else {
+      char b[96];
+      snprintf(b, sizeof(b), "M74-SMOKE: fail rt-sigqueue n=%d v=%d,%d,%d\n",
+               g_rt_n, g_rt_vals[0], g_rt_vals[1], g_rt_vals[2]);
+      marker(b);
+    }
+  }
+
+  /* M74: POSIX interval timer — the validating CONSUMER of RT signals. A 20 ms
+   * periodic timer raises SIGRTMIN+2 carrying sigev_value 99; the SA_SIGINFO
+   * handler must fire repeatedly with that payload. */
+  {
+    struct sigaction sa;
+    struct sigaction old;
+    memset(&sa, 0, sizeof(sa));
+    memset(&old, 0, sizeof(old));
+    sa.sa_sigaction = rt_si_handler;
+    sa.sa_flags = SA_SIGINFO;
+    sa.sa_restorer = __sig_restorer;
+    int ok = 0;
+    if ((int)syscall(SYS_SIGNAL, SIGRTMIN + 2, &sa, &old) == 0) {
+      struct sigevent sev;
+      memset(&sev, 0, sizeof(sev));
+      sev.sigev_notify = SIGEV_SIGNAL;
+      sev.sigev_signo = SIGRTMIN + 2;
+      sev.sigev_value.sival_int = 99;
+      timer_t tid;
+      if (timer_create(CLOCK_MONOTONIC, &sev, &tid) == 0) {
+        struct itimerspec its;
+        memset(&its, 0, sizeof(its));
+        its.it_value.tv_nsec = 20000000;    /* first fire in 20 ms */
+        its.it_interval.tv_nsec = 20000000; /* then every 20 ms */
+        g_rt_n = 0;
+        if (timer_settime(tid, 0, &its, NULL) == 0) {
+          for (int i = 0; i < 80 && g_rt_n < 3; i++) {
+            struct timespec ts = {0, 10000000}; /* 10 ms */
+            nanosleep(&ts, NULL);
+          }
+        }
+        timer_delete(tid);
+        ok = (g_rt_n >= 3 && g_rt_vals[0] == 99 && g_rt_vals[1] == 99 &&
+              g_rt_vals[2] == 99);
+      }
+    }
+    if (ok) {
+      marker("M74-SMOKE: ok rt-timer\n");
+    } else {
+      char b[96];
+      snprintf(b, sizeof(b), "M74-SMOKE: fail rt-timer n=%d v=%d\n", g_rt_n,
+               g_rt_vals[0]);
+      marker(b);
+    }
   }
 
   marker("M15-SMOKE: done\n");

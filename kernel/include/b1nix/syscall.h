@@ -197,6 +197,27 @@ enum {
 	SYS_RT_TGSIGQUEUEINFO = 162,
 	SYS_GETDENTS64      = 163,  /* Linux getdents64 byte layout (Chromium port) */
 	SYS_MINCORE         = 164,  /* page residency bitmap (Chromium memory-dump) */
+	/* --- M73: modern I/O & introspection syscalls --- */
+	SYS_SENDFILE         = 165, /* zero-copy-ish fd→fd transfer */
+	SYS_COPY_FILE_RANGE  = 166, /* fd→fd range copy with optional offsets */
+	SYS_SPLICE           = 167, /* move data to/from a pipe */
+	SYS_FALLOCATE        = 168, /* preallocate / extend file storage */
+	SYS_STATX            = 169, /* extended stat */
+	SYS_INOTIFY_INIT1    = 170, /* filesystem change notification */
+	SYS_INOTIFY_ADD_WATCH = 171,
+	SYS_INOTIFY_RM_WATCH = 172,
+	/* --- M72: writable foreign FS + msync --- */
+	SYS_MSYNC            = 173, /* flush MAP_SHARED dirty pages to the backing file */
+	/* --- M63: seccomp-bpf sandbox --- */
+	SYS_SECCOMP          = 174, /* install a syscall filter */
+	SYS_PRCTL            = 175, /* PR_SET_SECCOMP / PR_SET_NO_NEW_PRIVS */
+	/* --- M74: POSIX real-time signals + timers --- */
+	SYS_SIGQUEUE         = 176, /* sigqueue(pid, sig, sival_ptr) */
+	SYS_TIMER_CREATE     = 177, /* timer_create(clockid, sigev, timer_t*) */
+	SYS_TIMER_SETTIME    = 178, /* timer_settime(id, flags, new, old) */
+	SYS_TIMER_GETTIME    = 179, /* timer_gettime(id, curr) */
+	SYS_TIMER_DELETE     = 180, /* timer_delete(id) */
+	SYS_DL_PHDR_INFO     = 181, /* dl_iterate_phdr backing: copy out module table */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

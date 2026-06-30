@@ -9,6 +9,7 @@
 #include <b1nix/filelock.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/input.h>
+#include <b1nix/inotify.h>
 #include <b1nix/klog.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
@@ -2450,11 +2451,16 @@ out:
   return res;
 }
 
-static isize node_read(struct vfs_handle *h, char *buf, usize size) {
+/* Core read. posp == NULL: use and advance the handle's own offset (normal
+ * read()). posp != NULL: read at *posp and advance *posp, leaving the handle
+ * offset untouched — positioned I/O (pread/sendfile), safe when threads share
+ * the open-file description. */
+static isize node_read_impl(struct vfs_handle *h, char *buf, usize size,
+                            u64 *posp) {
   if (!h->node)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
-  u64 offset = h->offset;
+  u64 offset = posp ? *posp : h->offset;
   vfs_inode_lock(node->inode);
   vfs_update_times(node->inode, VFS_ATIME);
   isize res = 0;
@@ -2515,18 +2521,19 @@ static isize node_read(struct vfs_handle *h, char *buf, usize size) {
 
     if (total_read > 0) {
       res = total_read;
-      h->offset += total_read;
+      if (posp) *posp += total_read; else h->offset += total_read;
     }
   } else if (node->inode->read_cb) {
     res = node->inode->read_cb(node, offset, buf, size, h->flags);
-    if (res > 0)
-      h->offset += (usize)res;
+    if (res > 0) {
+      if (posp) *posp += (usize)res; else h->offset += (usize)res;
+    }
   } else if (node->inode->type == VFS_FILE) {
     usize rem = node->inode->size > offset ? node->inode->size - offset : 0;
     usize to_r = size < rem ? size : rem;
     if (to_r > 0) {
       memcpy(buf, (const char *)node->inode->data + offset, to_r);
-      h->offset += to_r;
+      if (posp) *posp += to_r; else h->offset += to_r;
     }
     res = (isize)to_r;
   }
@@ -2535,7 +2542,15 @@ static isize node_read(struct vfs_handle *h, char *buf, usize size) {
   return res;
 }
 
-static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
+/* file_ops .read — normal read using the handle's own offset. */
+static isize node_read(struct vfs_handle *h, char *buf, usize size) {
+  return node_read_impl(h, buf, size, 0);
+}
+
+/* Core write. posp semantics mirror node_read_impl. O_APPEND ignores an explicit
+ * position (POSIX: append always goes to EOF). */
+static isize node_write_impl(struct vfs_handle *h, const char *buf, usize size,
+                             u64 *posp) {
   if (!h->node)
     return -EBADF;
   struct vfs_node *node = vfs_node_get(h->node);
@@ -2547,10 +2562,12 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
   vfs_inode_lock(node->inode);
   /* O_APPEND: sample the size under the exclusive inode lock. Reading it
    * before the lock loses concurrent appends — a writer blocked on the lock
-   * would rewind to a stale EOF and overwrite what the lock holder appended. */
-  if (h->flags & B1NIX_O_APPEND)
+   * would rewind to a stale EOF and overwrite what the lock holder appended.
+   * A positioned write (posp != NULL) writes exactly at *posp and ignores
+   * O_APPEND. */
+  if (!posp && (h->flags & B1NIX_O_APPEND))
     h->offset = node->inode->size;
-  u64 offset = h->offset;
+  u64 offset = posp ? *posp : h->offset;
   isize res = 0;
   if (node->inode->type == VFS_FILE && node->inode->write_cb) {
     usize remaining = size;
@@ -2604,9 +2621,10 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
 
     if (total_written > 0) {
       res = total_written;
-      h->offset += total_written;
-      if (h->offset > node->inode->size) {
-        node->inode->size = h->offset;
+      u64 newpos = offset + total_written;
+      if (posp) *posp = newpos; else h->offset = newpos;
+      if (newpos > node->inode->size) {
+        node->inode->size = newpos;
       }
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
     }
@@ -2614,7 +2632,7 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
     res = node->inode->write_cb(node, offset, buf, size, h->flags);
     if (res > 0) {
       vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
-      h->offset += (usize)res;
+      if (posp) *posp += (usize)res; else h->offset += (usize)res;
     }
   } else if (node->inode->type == VFS_FILE) {
     if (offset + size > MAX_FILE_SIZE) {
@@ -2648,12 +2666,22 @@ static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
     vfs_update_times(node->inode, VFS_MTIME | VFS_CTIME);
     if (node->inode->setattr_cb)
       node->inode->setattr_cb(node);
-    h->offset += size;
+    if (posp) *posp += size; else h->offset += size;
     res = (isize)size;
   }
   vfs_inode_unlock(node->inode);
+  /* M73 inotify: report a successful write as IN_MODIFY. Called after the inode
+   * lock is dropped so the notify path (its own leaf spinlocks) never nests
+   * under the inode lock. */
+  if (res > 0)
+    vfs_inotify_notify(node, IN_MODIFY, 0);
   vfs_node_put(node);
   return res;
+}
+
+/* file_ops .write — normal write using the handle's own offset. */
+static isize node_write(struct vfs_handle *h, const char *buf, usize size) {
+  return node_write_impl(h, buf, size, 0);
 }
 
 static int node_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
@@ -2679,6 +2707,34 @@ isize vfs_read(int fd, char *buf, usize size) {
   if (!h || !h->ops || !h->ops->read)
     return -EBADF;
   return h->ops->read(h, buf, size);
+}
+
+/* Positioned read/write: read/write at `offset` WITHOUT touching the descriptor's
+ * own file offset (POSIX pread/pwrite; also backs sendfile/copy_file_range with
+ * explicit offsets). Only seekable regular-file handles qualify — a pipe/socket
+ * returns ESPIPE. Thread-safe when several threads share the open-file
+ * description, unlike an lseek-save-restore around a plain read/write. */
+isize vfs_pread(int fd, char *buf, usize size, u64 offset) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_NODE || !h->node)
+    return -ESPIPE;
+  u64 pos = offset;
+  return node_read_impl(h, buf, size, &pos);
+}
+
+isize vfs_pwrite(int fd, const char *buf, usize size, u64 offset) {
+  struct vfs_handle *h = get_handle(fd);
+  if (!h)
+    return -EBADF;
+  if (h->kind != VFS_HANDLE_NODE || !h->node)
+    return -ESPIPE;
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(h->node);
+  if (mnt && (mnt->flags & MS_RDONLY))
+    return -EROFS;
+  u64 pos = offset;
+  return node_write_impl(h, buf, size, &pos);
 }
 
 isize vfs_write(int fd, const char *buf, usize size) {
@@ -2847,6 +2903,9 @@ out_node_put:
   }
 out_unlock:
   vfs_inode_unlock(parent->inode);
+  /* M73 inotify: a new entry in `parent` is IN_CREATE on the directory. */
+  if (res == 0 && node)
+    vfs_inotify_notify(parent, IN_CREATE, name);
   vfs_node_put(parent);
   return res;
 }
@@ -3264,6 +3323,9 @@ static int vfs_remove_node(const char *path, int is_rmdir) {
   vfs_inode_lock(parent->inode);
   int res = vfs_remove_child_locked(parent, r_path, name, is_rmdir);
   vfs_inode_unlock(parent->inode);
+  /* M73 inotify: a removed entry is IN_DELETE on the parent directory. */
+  if (res == 0)
+    vfs_inotify_notify(parent, IN_DELETE | (is_rmdir ? IN_ISDIR : 0), name);
   vfs_node_put(parent);
   return res;
 }

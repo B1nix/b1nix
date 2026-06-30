@@ -102,6 +102,64 @@ static int  g_task_has_saved_sigmask[MAX_TASKS];
  * stack is registered. */
 static u64  g_task_altstack_sp[MAX_TASKS];
 static u64  g_task_altstack_size[MAX_TASKS];
+
+/* M74 RT signals (SIGRTMIN..SIGRTMAX). Per-task RT sigactions + a FIFO of queued
+ * (signo, code, value) payloads, lazily allocated (most tasks never use RT
+ * signals; a static 2D table over MAX_TASKS would waste megabytes of BSS and
+ * struct task cannot grow — the M29 invariant). Freed when the task slot is
+ * recycled and on execve (handlers reset to default). */
+#define RT_QUEUE_MAX 64
+struct rt_queued {
+  int signo;
+  int si_code;
+  union sigval value;
+};
+struct rt_state {
+  struct sigaction action[SIGRTMAX - SIGRTMIN + 1];
+  struct rt_queued queue[RT_QUEUE_MAX];
+  int qhead;  /* index of oldest entry */
+  int qcount; /* live entries */
+};
+static struct rt_state *g_rt_state[MAX_TASKS];
+/* SMP: with the BKL gone, two CPUs can sigqueue to the same task (or the timer
+ * ISR can fire) concurrently. interrupts_save() only masks the local CPU, so it
+ * does NOT serialise across cores. g_rt_lock guards every RT-queue / RT-sigaction
+ * / rt_state (de)allocation; g_timer_lock guards the POSIX timer table. Both are
+ * always taken with interrupts disabled (callers either run in the timer ISR or
+ * disable interrupts first), so a plain spin_lock cannot self-deadlock against
+ * the ISR on the same CPU. Lock order: g_timer_lock -> g_rt_lock (the tick),
+ * then -> the heap lock (lazy rt_state alloc) — never the reverse. */
+static spinlock_t g_rt_lock = SPINLOCK_INIT;
+static spinlock_t g_timer_lock = SPINLOCK_INIT;
+
+static void rt_state_free(usize i) {
+  if (g_rt_state[i]) {
+    kfree(g_rt_state[i]);
+    g_rt_state[i] = 0;
+  }
+}
+static struct rt_state *rt_state_get(usize i, int alloc) {
+  if (!g_rt_state[i] && alloc)
+    g_rt_state[i] = kzalloc(sizeof(struct rt_state));
+  return g_rt_state[i];
+}
+
+/* M74 POSIX per-process interval timers (timer_create). A small global table —
+ * timers are few system-wide — each owning a task. timer_t is the table index.
+ * The timer tick scans armed timers and queues an RT signal (SI_TIMER) on
+ * expiry, so this builds on the RT-signal machinery above. */
+#define MAX_POSIX_TIMERS 64
+struct posix_timer {
+  int used;
+  usize owner_id;       /* task id that created it */
+  int signo;            /* SIGEV_SIGNAL target signal */
+  union sigval value;   /* sigev_value, delivered as si_value */
+  u64 interval_ticks;   /* 0 = one-shot */
+  u64 next_ticks;       /* absolute fire tick; 0 = disarmed */
+};
+static struct posix_timer g_posix_timers[MAX_POSIX_TIMERS];
+static void posix_timers_tick(void); /* fire expired timers (defined below) */
+
 static u64  g_task_alarm_ticks[MAX_TASKS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
@@ -120,6 +178,11 @@ static u64   g_task_cutime[MAX_TASKS];
 static u64   g_task_cstime[MAX_TASKS];
 static u64   g_task_pass[MAX_TASKS];
 static u64   g_min_pass = 0;
+/* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
+ * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
+ * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
+static void *g_task_seccomp[MAX_TASKS];
+static int   g_task_nnp[MAX_TASKS];
 static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
@@ -259,6 +322,7 @@ static struct task *find_unused_task(void) {
       g_task_has_saved_sigmask[i] = 0;
       g_task_altstack_sp[i] = 0;
       g_task_altstack_size[i] = 0;
+      rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
       g_task_alarm_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
@@ -305,6 +369,7 @@ static struct task *find_unused_task(void) {
   g_task_has_saved_sigmask[i] = 0;
   g_task_altstack_sp[i] = 0;
   g_task_altstack_size[i] = 0;
+  rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
   g_task_alarm_ticks[i] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
@@ -322,6 +387,13 @@ static struct task *find_unused_task(void) {
  * find_unused_task). The store also publishes any prior writes (e.g. the
  * kfree of the task's resources) before the slot becomes claimable again. */
 static void free_task_slot(struct task *t) {
+  /* M63: drop the task's seccomp filter chain (unref; frees at zero) BEFORE
+   * taking tasks_lock — filter_unref calls kfree and tasks_lock is a leaf lock
+   * that must not nest the heap lock. Idempotent: clears the side-table slot. */
+  {
+    extern void seccomp_release(struct task * t);
+    seccomp_release(t);
+  }
   u64 flags;
   tasks_lock(&flags);
   t->state = TASK_UNUSED;
@@ -826,6 +898,14 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   task->stop_report_pending = 0;
   task->continued_report_pending = 0;
   memset(task->sigactions, 0, sizeof(task->sigactions));
+  /* M74: reset RT handlers + drop queued RT, under g_rt_lock so it can't race a
+   * concurrent sigqueue from another CPU into the freed rt_state. */
+  {
+    u64 rtf;
+    spin_lock_irqsave(&g_rt_lock, &rtf);
+    rt_state_free(task_index(task));
+    spin_unlock_irqrestore(&g_rt_lock, rtf);
+  }
 
   g_task_tgid[task_index(task)] = task->id;
   if (!stealable)
@@ -972,6 +1052,12 @@ int scheduler_fork_current(void) {
   g_task_alarm_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
+  /* M63: the child inherits the parent's seccomp filter chain (shared,
+   * refcounted) and no_new_privs — a fork can only ever be as restricted. */
+  {
+    extern void seccomp_inherit(struct task * parent, struct task * child);
+    seccomp_inherit(parent, child);
+  }
   g_task_ctty_type[c_idx] = g_task_ctty_type[p_idx];
   g_task_ctty_index[c_idx] = g_task_ctty_index[p_idx];
   for (int r = 0; r < 16; r++) {
@@ -1224,6 +1310,23 @@ u64 task_tls_base(const struct task *t) {
 void task_set_tls_base(struct task *t, u64 base) {
   if (!t) return;
   g_task_tls_base[task_index(t)] = base;
+}
+/* M63: seccomp filter chain + no_new_privs accessors (side-table backed). */
+void *task_seccomp_filter(const struct task *t) {
+  if (!t) return 0;
+  return g_task_seccomp[task_index(t)];
+}
+void task_set_seccomp_filter(struct task *t, void *f) {
+  if (!t) return;
+  g_task_seccomp[task_index(t)] = f;
+}
+int task_no_new_privs(const struct task *t) {
+  if (!t) return 0;
+  return g_task_nnp[task_index(t)];
+}
+void task_set_no_new_privs(struct task *t, int v) {
+  if (!t) return;
+  g_task_nnp[task_index(t)] = v;
 }
 u64 task_child_tid_clear(const struct task *t) {
   if (!t) return 0;
@@ -1627,6 +1730,11 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   task_set_tls_base(child, (flags & B1NIX_CLONE_SETTLS) ? tls : 0);
   task_set_child_tid_clear(child,
                             (flags & B1NIX_CLONE_CHILD_CLEARTID) ? ctid : 0);
+  /* M63: a cloned thread shares its creator's seccomp filter (same process). */
+  {
+    extern void seccomp_inherit(struct task * parent, struct task * child);
+    seccomp_inherit(parent, child);
+  }
 
   /* Parent linkage. Threads are joined via futex, not waitpid — point them
    * at the parent's parent so waitpid(-1, ...) skips them. */
@@ -2093,13 +2201,48 @@ void scheduler_wait_prepare(void *chan) {
 
 void scheduler_wait_commit(void) {
   scheduler_yield();
+  /* Drop any unfired deadline armed by scheduler_wait_prepare_timeout: an
+   * explicit wake_all may have resumed us before it elapsed, and a stale
+   * wake_tick would otherwise leak into a later untimed block (scheduler_block_on
+   * never re-arms it). Mirrors scheduler_block_on_timeout's post-yield clear. */
+  current_task->wake_tick = 0;
   interrupts_enable();
 }
 
 void scheduler_wait_cancel(void) {
   current_task->wait_chan = 0;
+  current_task->wake_tick = 0;
   current_task->state = TASK_RUNNING;
   interrupts_enable();
+}
+
+/* Like scheduler_wait_prepare but also arms a timer deadline, so wake_sleepers()
+ * (run from the timer ISR) promotes the task back to READY even if the explicit
+ * wake never arrives. This combines the race-free check-then-block window of the
+ * prepare/commit pattern with the lost-wakeup safety net of a timeout — exactly
+ * what an interrupt-driven device-completion wait wants: the IRQ handler's
+ * scheduler_wake_all(chan) resumes us immediately on the common path, while the
+ * deadline guarantees forward progress if an interrupt is ever genuinely lost
+ * (or the controller never raises one). timeout_ticks == 0 means no deadline. */
+void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
+  interrupts_disable();
+  if (current_task == 0)
+    panic("scheduler_wait_prepare_timeout without running task");
+  current_task->wait_chan = chan;
+  if (timeout_ticks)
+    current_task->wake_tick = scheduler_ticks + timeout_ticks;
+  current_task->stack_released = 0;
+  __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
+  __atomic_thread_fence(__ATOMIC_SEQ_CST);
+}
+
+/* True when the current context can safely park on a wait channel: the scheduler
+ * is live, we are running inside a real task (not the early single-stack boot
+ * path before the first context switch), and interrupts are enabled so a device
+ * IRQ can actually wake us. Drivers that block on I/O completion fall back to a
+ * cooperative poll loop when this is false (early boot, IRQs-off callers). */
+int scheduler_can_block(void) {
+  return scheduler_started && current_task != 0 && interrupts_enabled();
 }
 
 void scheduler_wake_all(void *chan) {
@@ -2185,6 +2328,8 @@ void scheduler_on_timer_tick(void) {
       scheduler_kill(T(i)->id, SIGALRM);
     }
   }
+
+  posix_timers_tick(); /* M74: fire expired POSIX interval timers */
 
   wake_sleepers();
 
@@ -2380,6 +2525,7 @@ void scheduler_exit_current(int exit_code) {
    * FUTEX_WAIT and terminated before self-detaching) so a later wake on the
    * same key cannot target this slot once it is recycled. */
   scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
 
   /* M29: a clone()d thread shares fd_table / pml4 / user_image with its
    * parent process. Skip the per-task fd/cred/mm teardown, let the reaper
@@ -3320,8 +3466,15 @@ int scheduler_oom_kill_current(void) {
 }
 
 int scheduler_kill(usize task_id, int sig) {
-  if (sig < 0 || sig >= NSIG)
+  if (sig < 0 || sig > NSIG_MAX)
     return -EINVAL;
+  /* M74: kill(2)/raise(3) of an RT signal QUEUES one instance with a zero
+   * payload (si_code SI_USER == 0), rather than coalescing into a single bit. */
+  if (SIG_IS_RT(sig)) {
+    union sigval v;
+    v.sival_ptr = 0;
+    return scheduler_sigqueue(task_id, sig, v, 0 /* SI_USER */);
+  }
 
   u64 flags = interrupts_save();
   for (usize i = 0; i < g_task_hwm; i++) {
@@ -3384,6 +3537,255 @@ int scheduler_kill(usize task_id, int sig) {
   }
   interrupts_restore(flags);
   return -ESRCH;
+}
+
+/* M74: enqueue one RT-signal instance (with payload) to a task and wake it. The
+ * pending bit (signo-1) means "≥1 queued"; delivery dequeues one entry FIFO and
+ * clears the bit only when the queue for that signo drains. */
+int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code) {
+  if (!SIG_IS_RT(sig))
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id == task_id && T(i)->state != TASK_UNUSED &&
+        T(i)->state != TASK_DEAD && T(i)->state != TASK_REAPING) {
+      /* g_rt_lock serialises the RT queue + lazy rt_state alloc across CPUs and
+       * vs the timer ISR (interrupts are already off here). The enqueue and the
+       * pending-bit set are done together under the lock so they cannot
+       * interleave with the locked dequeue's "queue empty -> clear bit" — that
+       * is what closes the signal-loss race (a send between dequeue and a
+       * separate bit-clear used to drop the bit while an entry was queued). */
+      spin_lock(&g_rt_lock);
+      struct rt_state *rs = rt_state_get(i, 1);
+      if (!rs || rs->qcount >= RT_QUEUE_MAX) {
+        spin_unlock(&g_rt_lock);
+        interrupts_restore(flags);
+        return -EAGAIN; /* OOM or RLIMIT_SIGPENDING analogue */
+      }
+      int slot = (rs->qhead + rs->qcount) % RT_QUEUE_MAX;
+      rs->queue[slot].signo = sig;
+      rs->queue[slot].si_code = si_code;
+      rs->queue[slot].value = value;
+      rs->qcount++;
+      __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
+                        __ATOMIC_RELEASE);
+      spin_unlock(&g_rt_lock);
+      /* Wake a blocked/stopped target so it re-checks pending signals. Mirrors
+       * scheduler_kill's CAS so a kill racing the target's exit cannot resurrect
+       * a DEAD/REAPING task. Done outside g_rt_lock to avoid nesting it under the
+       * runqueue lock. */
+      enum task_state expected = TASK_BLOCKED;
+      if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                      __ATOMIC_ACQUIRE, __ATOMIC_RELAXED)) {
+        sched_rq_enqueue_current(T(i));
+      }
+      interrupts_restore(flags);
+      return 0;
+    }
+  }
+  interrupts_restore(flags);
+  return -ESRCH;
+}
+
+/* Dequeue the oldest queued entry for `sig` (SIGRTMIN..SIGRTMAX) on the current
+ * task, returning its si_code and payload. Returns 1 if one was dequeued (and,
+ * via *more, whether the queue for that signo still has entries), 0 if none.
+ * Called from the arch signal-delivery path with interrupts off. */
+int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
+                                 int *more) {
+  if (!current_task)
+    return 0;
+  int ret = 0;
+  spin_lock(&g_rt_lock); /* interrupts already off in the delivery path */
+  struct rt_state *rs = g_rt_state[task_index(current_task)];
+  if (!rs || rs->qcount == 0) {
+    spin_unlock(&g_rt_lock);
+    return 0;
+  }
+  for (int n = 0; n < rs->qcount; n++) {
+    int idx = (rs->qhead + n) % RT_QUEUE_MAX;
+    if (rs->queue[idx].signo == sig) {
+      if (si_code)
+        *si_code = rs->queue[idx].si_code;
+      if (value)
+        *value = rs->queue[idx].value;
+      /* Shift the entries before idx forward by one to fill the gap, keeping
+       * FIFO order for the remaining signals. */
+      for (int k = n; k > 0; k--) {
+        int dst = (rs->qhead + k) % RT_QUEUE_MAX;
+        int src = (rs->qhead + k - 1) % RT_QUEUE_MAX;
+        rs->queue[dst] = rs->queue[src];
+      }
+      rs->qhead = (rs->qhead + 1) % RT_QUEUE_MAX;
+      rs->qcount--;
+      int rem = 0;
+      for (int m = 0; m < rs->qcount; m++)
+        if (rs->queue[(rs->qhead + m) % RT_QUEUE_MAX].signo == sig) {
+          rem = 1;
+          break;
+        }
+      if (more)
+        *more = rem;
+      /* Clear the pending bit HERE, under the same lock that the enqueue's
+       * bit-set holds — so a concurrent sigqueue cannot slip an entry in between
+       * "queue drained" and "bit cleared" and have its bit wiped (signal loss). */
+      if (!rem)
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+      ret = 1;
+      break;
+    }
+  }
+  spin_unlock(&g_rt_lock);
+  return ret;
+}
+
+/* The current task's RT handler for `sig`, or NULL if none registered. */
+struct sigaction *scheduler_rt_action_current(int sig) {
+  if (!current_task || !SIG_IS_RT(sig))
+    return 0;
+  struct rt_state *rs = g_rt_state[task_index(current_task)];
+  if (!rs)
+    return 0;
+  return &rs->action[sig - SIGRTMIN];
+}
+
+/* ── M74 POSIX timers ── */
+
+int scheduler_timer_create(int signo, union sigval value) {
+  if (!current_task || signo < 1 || signo > NSIG_MAX)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
+    if (!g_posix_timers[i].used) {
+      g_posix_timers[i].used = 1;
+      g_posix_timers[i].owner_id = current_task->id;
+      g_posix_timers[i].signo = signo;
+      g_posix_timers[i].value = value;
+      g_posix_timers[i].interval_ticks = 0;
+      g_posix_timers[i].next_ticks = 0;
+      spin_unlock_irqrestore(&g_timer_lock, flags);
+      return i;
+    }
+  }
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  return -EAGAIN;
+}
+
+/* Arm (first_ticks > 0) or disarm (0) timer `id`. interval_ticks == 0 makes it
+ * one-shot. Pre-touches the owner's RT state so the tick path never allocates in
+ * interrupt context. */
+int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
+                            u64 *old_remaining, u64 *old_interval) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  /* Pre-allocate the owner's RT state HERE (under g_rt_lock, before g_timer_lock
+   * to avoid nesting the two) so the timer ISR never has to allocate while
+   * holding g_timer_lock. */
+  {
+    u64 rf;
+    spin_lock_irqsave(&g_rt_lock, &rf);
+    rt_state_get(task_index(current_task), 1);
+    spin_unlock_irqrestore(&g_rt_lock, rf);
+  }
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    spin_unlock_irqrestore(&g_timer_lock, flags);
+    return -EINVAL;
+  }
+  if (old_interval)
+    *old_interval = t->interval_ticks;
+  if (old_remaining) {
+    u64 now = scheduler_ticks;
+    *old_remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
+  }
+  t->interval_ticks = interval_ticks;
+  t->next_ticks = first_ticks ? scheduler_ticks + first_ticks : 0;
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  return 0;
+}
+
+int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    spin_unlock_irqrestore(&g_timer_lock, flags);
+    return -EINVAL;
+  }
+  u64 now = scheduler_ticks;
+  if (remaining)
+    *remaining = (t->next_ticks > now) ? (t->next_ticks - now) : 0;
+  if (interval)
+    *interval = t->interval_ticks;
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  return 0;
+}
+
+int scheduler_timer_delete(int id) {
+  if (!current_task || id < 0 || id >= MAX_POSIX_TIMERS)
+    return -EINVAL;
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  struct posix_timer *t = &g_posix_timers[id];
+  if (!t->used || t->owner_id != current_task->id) {
+    spin_unlock_irqrestore(&g_timer_lock, flags);
+    return -EINVAL;
+  }
+  t->used = 0;
+  t->next_ticks = 0;
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  return 0;
+}
+
+/* Free all timers owned by a terminating task (called from the exit path). */
+void scheduler_timer_cleanup_task(usize task_id) {
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++)
+    if (g_posix_timers[i].used && g_posix_timers[i].owner_id == task_id) {
+      g_posix_timers[i].used = 0;
+      g_posix_timers[i].next_ticks = 0;
+    }
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+}
+
+/* Called from the timer tick (interrupts already off): snapshot every armed
+ * timer whose deadline has passed (re-arming periodic ones / disarming one-shots
+ * in place) UNDER g_timer_lock, then fire the signals AFTER releasing the lock —
+ * so g_timer_lock is never held across scheduler_sigqueue (which takes g_rt_lock
+ * and the runqueue lock), keeping the lock-hold short and the ordering simple. */
+static void posix_timers_tick(void) {
+  struct { usize owner; int signo; union sigval value; } fire[MAX_POSIX_TIMERS];
+  int nfire = 0;
+  u64 flags;
+  spin_lock_irqsave(&g_timer_lock, &flags);
+  for (int i = 0; i < MAX_POSIX_TIMERS; i++) {
+    struct posix_timer *t = &g_posix_timers[i];
+    if (!t->used || t->next_ticks == 0 || t->next_ticks > scheduler_ticks)
+      continue;
+    fire[nfire].owner = t->owner_id;
+    fire[nfire].signo = t->signo;
+    fire[nfire].value = t->value;
+    nfire++;
+    if (t->interval_ticks)
+      t->next_ticks = scheduler_ticks + t->interval_ticks;
+    else
+      t->next_ticks = 0; /* one-shot: disarm */
+  }
+  spin_unlock_irqrestore(&g_timer_lock, flags);
+  for (int i = 0; i < nfire; i++) {
+    if (SIG_IS_RT(fire[i].signo))
+      scheduler_sigqueue(fire[i].owner, fire[i].signo, fire[i].value,
+                         B1NIX_SI_TIMER);
+    else
+      scheduler_kill(fire[i].owner, fire[i].signo);
+  }
 }
 
 int scheduler_kill_process_group(usize pgrp, int sig) {
@@ -3483,12 +3885,35 @@ int scheduler_kill_all(int sig) {
 
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old) {
+  if (!current_task)
+    return -1;
+  /* M74: RT signals (SIGRTMIN..SIGRTMAX) keep their sigactions in the lazy
+   * side-table rather than the in-struct sigactions[31] array. */
+  if (SIG_IS_RT(sig)) {
+    usize idx = task_index(current_task);
+    int slot = sig - SIGRTMIN;
+    /* g_rt_lock guards the lazy rt_state alloc (two CPUs racing rt_state_get
+     * would otherwise leak one allocation) and the action read/write vs the
+     * delivery path / a concurrent sigqueue. */
+    u64 flags;
+    spin_lock_irqsave(&g_rt_lock, &flags);
+    struct rt_state *rs = rt_state_get(idx, act != 0);
+    if (old)
+      *old = rs ? rs->action[slot] : (struct sigaction){0};
+    if (act) {
+      if (!rs) {
+        spin_unlock_irqrestore(&g_rt_lock, flags);
+        return -1; /* allocation failed */
+      }
+      rs->action[slot] = *act;
+    }
+    spin_unlock_irqrestore(&g_rt_lock, flags);
+    return 0;
+  }
   if (sig < 1 || sig >= NSIG)
     return -1;
   /* SIGKILL and SIGSTOP cannot be caught/ignored */
   if (sig == SIGKILL || sig == SIGSTOP)
-    return -1;
-  if (!current_task)
     return -1;
 
   interrupts_disable();
@@ -3920,6 +4345,7 @@ void scheduler_deliver_pending_signals(void) {
        * scheduler_exit_current performs; the zombie reaper handles the rest. */
       reparent_children_and_signal_orphans(current_task);
       scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
       current_task->stack_released = 0;
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
@@ -3959,6 +4385,7 @@ void scheduler_deliver_pending_signals(void) {
          * above (M46-3). No yield-based teardown — we are inside the scheduler. */
         reparent_children_and_signal_orphans(current_task);
         scheduler_futex_cleanup_task(current_task->id);
+  scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
         current_task->stack_released = 0;
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;

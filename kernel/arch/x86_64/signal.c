@@ -17,9 +17,17 @@ static int is_valid_user_code_ptr(u64 ptr) {
   return ptr < 0x0000800000000000ULL;
 }
 
-static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
+static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
+                                    int si_code, union sigval si_val) {
   struct task *t = current_task;
-  struct sigaction *sa = &t->sigactions[sig - 1];
+  /* M74: RT signals (SIGRTMIN..SIGRTMAX) keep their sigaction in the side-table,
+   * not the in-struct sigactions[31] array. */
+  struct sigaction *sa = SIG_IS_RT(sig) ? scheduler_rt_action_current(sig)
+                                        : &t->sigactions[sig - 1];
+  if (!sa) {
+    scheduler_exit_current(-SIGSEGV);
+    return;
+  }
 
   /* Preserve x86_64 SysV red zone (128 bytes below RSP). */
   u64 user_rsp = frame->rsp - 128;
@@ -32,15 +40,22 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
       user_rsp = alt_top;
   }
   struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-  /* SA_SIGINFO (Linux personality only): the handler is the 3-arg form and
-   * needs a siginfo_t in RSI and a ucontext_t in RDX. Place both ABOVE the
-   * sigframe (higher addresses) so the handler's downward stack growth from
-   * restorer_slot never clobbers them. */
+  /* SA_SIGINFO: the handler is the 3-arg form and needs a siginfo_t in RSI and a
+   * ucontext_t in RDX. The Linux personality uses the Linux siginfo/ucontext
+   * layout; native b1nix programs (M74 — RT signals / sigqueue / POSIX timers)
+   * use the native siginfo_t (a null ucontext: the payload of interest is
+   * si_value, which handlers read from the siginfo). Both are placed ABOVE the
+   * sigframe so the handler's downward stack growth never clobbers them. */
   int is_siginfo = img && img->personality == PERSONALITY_LINUX &&
                    (sa->sa_flags & SA_SIGINFO);
+  int is_native_siginfo = img && img->personality != PERSONALITY_LINUX &&
+                          (sa->sa_flags & SA_SIGINFO);
   u64 si_addr = 0, uc_addr = 0;
   u64 top = user_rsp;
-  if (is_siginfo) {
+  if (is_native_siginfo) {
+    si_addr = (top - sizeof(struct b1nix_native_siginfo)) & ~0xFULL;
+    top = si_addr;
+  } else if (is_siginfo) {
     si_addr = (top - sizeof(struct linux_siginfo)) & ~0xFULL;
     uc_addr = (si_addr - sizeof(struct linux_ucontext)) & ~0xFULL;
     top = uc_addr;
@@ -122,6 +137,20 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
       scheduler_exit_current(-SIGSEGV);
       return;
     }
+  } else if (is_native_siginfo) {
+    /* Native SA_SIGINFO: hand the handler a native siginfo_t carrying the RT
+     * payload in si_value. ucontext (RDX) is null — the payload of interest is
+     * the value, not the saved register set. */
+    struct b1nix_native_siginfo si;
+    memset(&si, 0, sizeof(si));
+    si.si_signo = sig;
+    si.si_code = si_code;
+    si.si_value.sival_ptr = si_val.sival_ptr;
+    if (syscall_copyout((void *)(usize)si_addr, &si, sizeof(si)) < 0) {
+      console_write("signal: failed to build native siginfo\n");
+      scheduler_exit_current(-SIGSEGV);
+      return;
+    }
   }
 
   /* Block mask for handler execution. */
@@ -141,6 +170,9 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig) {
   if (is_siginfo) {
     frame->rsi = si_addr; /* siginfo_t * */
     frame->rdx = uc_addr; /* ucontext_t * */
+  } else if (is_native_siginfo) {
+    frame->rsi = si_addr; /* native siginfo_t * */
+    frame->rdx = 0;       /* ucontext_t * (not provided) */
   }
   frame->vector = 0; /* Force return via iretq to honor the modified rip */
   /* Note: do NOT update saved_user_rsp here — it already holds the original
@@ -167,8 +199,10 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
         if (pending & (1ULL << (i - 1))) {
             struct sigaction *sa = &current_task->sigactions[i - 1];
             if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
-                /* Deliver signal: build frame and redirect execution */
-                arch_build_signal_frame(frame, i);
+                /* Deliver signal: build frame and redirect execution. Standard
+                 * signals carry no RT payload (SI_USER, zero value). */
+                arch_build_signal_frame(frame, i, B1NIX_SI_USER,
+                                        (union sigval){.sival_ptr = 0});
 
                 /* Clear pending bit */
                 __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
@@ -213,6 +247,45 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                  * linger and get re-examined on every delivery check. */
                 __atomic_fetch_and(&current_task->pending_signals, ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
             }
+        }
+    }
+
+    /* M74: RT signals (SIGRTMIN..SIGRTMAX), delivered after the standard 1..NSIG
+     * signals. Each is QUEUED — one delivery dequeues one instance (FIFO, lowest
+     * signo first); the pending bit clears only when that signo's queue drains,
+     * so N sends yield N deliveries (no coalescing). */
+    for (int i = SIGRTMIN; i <= SIGRTMAX; i++) {
+        if (!(pending & (1ULL << (i - 1))))
+            continue;
+        struct sigaction *sa = scheduler_rt_action_current(i);
+        int more = 0, code = 0;
+        union sigval val;
+        val.sival_ptr = 0;
+        if (sa && sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
+            /* scheduler_rt_dequeue_current clears the pending bit itself (under
+             * g_rt_lock) when this signo's queue drains — see the signal-loss
+             * race note there. Only deliver if an instance was actually dequeued. */
+            if (scheduler_rt_dequeue_current(i, &code, &val, &more)) {
+                arch_build_signal_frame(frame, i, code, val);
+                interrupts_enable();
+                return; /* one signal per delivery check */
+            }
+            /* Bit set with no queued entry should not happen (enqueue sets the
+             * bit and adds the entry atomically); clear a stale bit defensively. */
+            __atomic_fetch_and(&current_task->pending_signals,
+                               ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+        } else if (!sa || sa->sa_handler == SIG_DFL) {
+            /* RT default action is terminate the process. */
+            console_write("signal: process pid=");
+            console_write_dec(current_task->id);
+            console_write(" killed by RT signal ");
+            console_write_dec(i);
+            console_write("\n");
+            scheduler_exit_current(TASK_EXIT_SIGNALED | i);
+        } else {
+            /* SIG_IGN: discard one queued instance (the dequeue clears the bit
+             * when the queue drains). */
+            scheduler_rt_dequeue_current(i, &code, &val, &more);
         }
     }
 

@@ -1,5 +1,6 @@
 #include <b1nix/blk.h>
 #include <b1nix/console.h>
+#include <b1nix/irq.h>
 #include <b1nix/mm.h>
 #include <b1nix/nvme.h>
 #include <b1nix/pci.h>
@@ -8,6 +9,11 @@
 
 #define NVME_MAX_QUEUE_SIZE 64
 #define NVME_PAGE_SIZE 4096
+
+/* M70: watchdog deadline (10 ms scheduler ticks) for a blocked NVMe I/O wait.
+ * The completion IRQ wakes the waiter on the common path; this only bounds a
+ * lost interrupt to a re-poll. Never reached on a healthy controller. */
+#define NVME_IO_WATCHDOG_TICKS 50
 
 // NVMe device state
 struct nvme_device {
@@ -61,6 +67,22 @@ static void nvme_io_lock(struct nvme_device *dev) {
 
 static void nvme_io_unlock(struct nvme_device *dev) {
     __sync_lock_release(&dev->io_busy);
+}
+
+/* M70: I/O completion interrupt handler. Runs in IRQ context. The controller's
+ * INTx line stays asserted until the host advances the CQ head doorbell, so a
+ * level-triggered handler that only woke the waiter would re-fire in a storm
+ * until the waiter ran. To avoid that, mask our interrupt vector here; the
+ * waiter unmasks it (intmc) after consuming the CQE and ringing the head
+ * doorbell. The io_cq pointer is the wait channel. Returns 1 if an I/O
+ * completion is pending for this device (shared-line aware). */
+static int nvme_irq(void *ctx) {
+    struct nvme_device *dev = (struct nvme_device *)ctx;
+    if (dev->io_cq[dev->io_cq_head].status == 0xFFFF)
+        return 0; /* no I/O completion posted — not ours, or admin-only */
+    dev->regs->intms = (1u << 0); /* mask vector 0 until the waiter consumes */
+    scheduler_wake_all(&dev->io_cq);
+    return 1;
 }
 
 static void nvme_wait_note(const char *queue_name)
@@ -153,9 +175,10 @@ static int nvme_create_io_cq(struct nvme_device *dev)
     
     // CDW10: QSIZE (bits 31:16) | QID (bits 15:0)
     sqe.cdw10 = ((NVME_MAX_QUEUE_SIZE - 1) << 16) | 1;
-    // CDW11: IEN (bit 1) | PC (bit 0)
-    sqe.cdw11 = (1 << 0); // PC = 1
-    
+    // CDW11: IV (bits 31:16, vector 0) | IEN (bit 1) | PC (bit 0)
+    // M70: IEN=1 so a completion on this CQ raises interrupt vector 0.
+    sqe.cdw11 = (1 << 1) | (1 << 0);
+
     return nvme_admin_submit(dev, &sqe);
 }
 
@@ -186,13 +209,20 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
     volatile u32 *sq_tdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 8); // SQ1
     *sq_tdb = tail;
     
-    // Wait for completion on CQ1. Returning on timeout would let the caller
-    // free or reuse PRP-list/data buffers while the device still owns them.
+    // Wait for completion on CQ1. Returning early would let the caller free or
+    // reuse PRP-list/data buffers while the device still owns them, so this only
+    // returns once the CQE is genuinely posted.
+    //
+    // M70: block until nvme_irq() wakes us instead of busy-yielding. The CQE
+    // lives in RAM (the controller DMAs it), so the predicate is a cheap memory
+    // read; a brief spin catches the sub-µs KVM completion, then we park on the
+    // io_cq channel with a watchdog deadline. nvme_irq() masks our vector to
+    // avoid a level-triggered storm; we unmask it (intmc) right after ringing
+    // the head doorbell on consume. Early boot / IRQs-off callers yield-poll.
+    volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 12); // CQ1
     u64 spins = 0;
     for (;;) {
-        volatile u32 *cq_hdb = (volatile u32 *)((u64)(usize)dev->regs + 0x1000 + 12); // CQ1
         u16 cq_head = dev->io_cq_head;
-        
         struct nvme_cqe *cqe = &dev->io_cq[cq_head];
         /* The CQ entry lives in host RAM (the controller DMAs the completion), so
          * polling it is a plain memory read, not an MMIO VM-exit. Spin on it
@@ -207,7 +237,8 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
 
             cq_head = (cq_head + 1) % NVME_MAX_QUEUE_SIZE;
             dev->io_cq_head = cq_head;
-            *cq_hdb = cq_head;
+            *cq_hdb = cq_head;           // deasserts the controller's INTx line
+            dev->regs->intmc = (1u << 0); // re-enable vector 0 for the next I/O
 
             if ((status & 0xFFFE) != 0) {
                 console_write("nvme: io cmd error status=0x");
@@ -217,11 +248,29 @@ static int nvme_io_submit(struct nvme_device *dev, struct nvme_sqe *sqe)
             }
             return 0;
         }
-        if (spins == 10000000ULL) {
-            nvme_wait_note("io");
+
+        // Fast path: brief in-RAM spin (no MMIO) to catch a quick completion.
+        for (int i = 0; i < 4000; i++) {
+            if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
+                break;
+            __asm__ volatile("pause");
         }
-        scheduler_yield();
-        spins++;
+        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF)
+            continue;
+
+        if (!scheduler_can_block()) {
+            if (spins == 10000000ULL)
+                nvme_wait_note("io");
+            scheduler_yield();
+            spins++;
+            continue;
+        }
+        scheduler_wait_prepare_timeout(&dev->io_cq, NVME_IO_WATCHDOG_TICKS);
+        if (dev->io_cq[dev->io_cq_head].status != 0xFFFF) {
+            scheduler_wait_cancel();
+            continue;
+        }
+        scheduler_wait_commit();
     }
 }
 
@@ -334,10 +383,15 @@ void nvme_init(void)
     console_write_hex32(pci_info.device_id);
     console_write("\n");
     
-    // Enable bus master and memory space
+    // Enable bus master and memory space; clear INTx Disable (bit 10) so the
+    // controller can raise legacy interrupts (M70).
     u16 command = pci_config_read16(pci_info.bus, pci_info.slot, pci_info.func, 0x04);
     command |= 0x06;
+    command &= ~0x0400;
     pci_config_write16(pci_info.bus, pci_info.slot, pci_info.func, 0x04, command);
+
+    // Legacy interrupt line for the controller (M70: completion IRQ).
+    u8 nvme_irq_line = pci_config_read8(pci_info.bus, pci_info.slot, pci_info.func, 0x3C);
     
     // Read BAR0 (64-bit MMIO base)
     u32 bar0_low = pci_config_read32(pci_info.bus, pci_info.slot, pci_info.func, 0x10);
@@ -490,7 +544,15 @@ void nvme_init(void)
         return;
     }
     console_write("nvme: IO SQ created\n");
-    
+
+    /* M70: enable interrupt-driven I/O completion. The IO CQ was created with
+     * IEN set (vector 0); unmask that vector (intmc) and register the handler,
+     * then unmask the controller's INTx line at the IOAPIC. Done after the IO
+     * queues exist so the first delivered completion is serviceable. */
+    nvme.regs->intmc = (1u << 0);
+    irq_register_handler(nvme_irq_line, nvme_irq, &nvme);
+    irq_unmask(nvme_irq_line);
+
     // Register block device
     nvme.blk_dev.name = "nvme0";
     nvme.blk_dev.block_size = 512; // Use 512-byte blocks for compatibility with blk cache

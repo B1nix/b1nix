@@ -193,8 +193,16 @@ void net_interrupt_handler(void)
 {
 	struct netdev *nd = netdev_active();
 	if (!nd || !nd->irq_ack) return;
-	if (nd->irq_ack(nd))
+	if (nd->irq_ack(nd)) {
 		net_irq_pending = 1;
+		/* M70: wake net_task immediately so RX is drained on packet arrival
+		 * instead of waiting up to a full ~100Hz poll tick. The daemon sleeps
+		 * between polls (see net_task) and scheduler_wake_task promotes it out
+		 * of SLEEPING; the 1-tick timeout still fires the TCP/DHCP/NDP timers on
+		 * cadence when no packet arrives. */
+		if (net_task_id >= 0)
+			scheduler_wake_task((usize)net_task_id);
+	}
 }
 
 /* ── PCI adapter inventory (for `ifconfig`/`net` listing) ───────────────── */

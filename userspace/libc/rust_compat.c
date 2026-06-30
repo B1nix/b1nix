@@ -63,6 +63,90 @@ unsigned long getauxval(unsigned long type) {
   return 0;
 }
 
+/* M75: run the shared libraries' C++ static constructors before main().
+ *
+ * b1nix links dynamic executables eagerly in-kernel (no userspace ld.so), and
+ * crt0 only walks the *executable's* own __init_array — so a shared library's
+ * DT_INIT_ARRAY constructors would never run. For a library like libLLVM.so that
+ * is fatal: its 458 constructors register the X86 target and seed the register
+ * allocator's cl::opt defaults, and without them clang's backend aborts ("Must
+ * use fast register allocator") or crashes in codegen.
+ *
+ * The kernel collects each library's init_array into a {init_array_va, count}
+ * descriptor table (deepest dependency first) and passes it via AT_B1NIX_DSO_INIT
+ * (terminated by a zero init_array_va). crt0 calls this once, before the
+ * executable's __init_array, so libraries initialize before the program. Each
+ * init_array entry is the SysV ABI's void(int, char**, char**). */
+#ifndef AT_B1NIX_DSO_INIT
+#define AT_B1NIX_DSO_INIT 0x1000
+#endif
+
+typedef void (*b1nix_init_fn)(int, char **, char **);
+
+/* Register each loaded shared object's .eh_frame with libgcc's classic FDE
+ * registry. The libgcc_s.so DWARF unwinder finds FDEs ONLY through that registry
+ * (it was built without the dl_iterate_phdr lookup path), and crt0 registers only
+ * the main executable — so without this a C++ exception thrown inside a shared
+ * library (e.g. libstdc++.so.6's __cxa_throw) has no FDE for its own throw frame
+ * and std::terminate aborts. We walk the kernel's module list via dl_iterate_phdr,
+ * skip module 0 (the executable, already registered by crt0), find each library's
+ * PT_GNU_EH_FRAME, decode the .eh_frame_hdr's eh_frame_ptr to the .eh_frame start
+ * and hand it to __register_frame (the .so carries a zero terminator so the scan
+ * stops cleanly). __register_frame is weak: a binary with no libgcc (pure clang C)
+ * simply skips this. */
+#include <link.h>
+#include "syscall.h"
+#ifndef PT_GNU_EH_FRAME
+#define PT_GNU_EH_FRAME 0x6474e550
+#endif
+
+extern void __register_frame(void *) __attribute__((weak));
+
+/* Register every shared object's .eh_frame with libgcc's DWARF unwinder.
+ *
+ * The kernel records each loaded module's in-process .eh_frame address (located
+ * via its section header table) in the dl_iterate_phdr table; we read it with
+ * SYS_DL_PHDR_INFO DIRECTLY rather than via dl_iterate_phdr (libgcc_s.so exports
+ * its own dl_iterate_phdr stub that returns 0 and, being resolved before
+ * libc.so.1, shadows the real one; the raw syscall is an inline instruction, not
+ * an interposable symbol, so it is immune). Every shared library past the
+ * executable (module 0, registered by crt0) is handed to __register_frame —
+ * INCLUDING libgcc_s.so itself, whose .eh_frame the unwinder needs to unwind its
+ * own _Unwind_RaiseException frame (libgcc_s.so's frame_dummy never runs: this
+ * newlib target has no crti/crtn, so the .so has no DT_INIT). Each .eh_frame ends
+ * in the standard zero terminator __register_frame scans to. __register_frame is
+ * weak: a pure-clang binary with no libgcc skips this. */
+static void b1nix_register_dso_frames(void) {
+  if (!(&__register_frame))
+    return; /* no libgcc in this process */
+  struct b1nix_dl_module mods[16];
+  long n = syscall(SYS_DL_PHDR_INFO, (long)(unsigned long)mods,
+                   (long)(sizeof(mods) / sizeof(mods[0])), 0, 0, 0);
+  if (n > (long)(sizeof(mods) / sizeof(mods[0])))
+    n = (long)(sizeof(mods) / sizeof(mods[0]));
+  for (long i = 1; i < n; i++) /* module 0 is the executable; crt0 did it */
+    if (mods[i].eh_frame_va)
+      __register_frame((void *)(uintptr_t)mods[i].eh_frame_va);
+}
+
+void __b1nix_run_dso_init(int argc, char **argv, char **envp) {
+  /* Register shared-library exception frames. Done before the executable's own
+   * __init_array (and before main), so any throw can unwind. */
+  b1nix_register_dso_frames();
+
+  unsigned long t = getauxval(AT_B1NIX_DSO_INIT);
+  if (!t)
+    return;
+  unsigned long *desc = (unsigned long *)t;
+  for (; desc[0]; desc += 2) {
+    b1nix_init_fn *arr = (b1nix_init_fn *)(void *)desc[0];
+    unsigned long count = desc[1];
+    for (unsigned long i = 0; i < count; i++)
+      if (arr[i])
+        arr[i](argc, argv, envp);
+  }
+}
+
 /* __xpg_strerror_r — the XSI-compliant strerror_r (returns int). b1nix's
  * strerror_r already has XSI semantics, so forward to it. (glibc exposes the
  * XSI variant under this internal name; std links it by that name.) */

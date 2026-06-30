@@ -10,6 +10,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/page_cache.h>
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
@@ -234,6 +235,21 @@ static int g_memtotal(char *b, usize c) {
 
 static struct vfs_fs sysfs_fs;
 
+/* Writable /sys/kernel/mm/drop_caches — mirrors Linux /proc/sys/vm/drop_caches.
+ * Any write forces a full page-cache eviction pass (dirty pages are written back
+ * via inode->write_cb, clean pages dropped). A real low-memory reclaim knob, and
+ * a deterministic way to force reclaim — e.g. to validate that a writable
+ * MAP_SHARED mmap store survives reclaim (it is now marked dirty on map-in). */
+static isize sysfs_drop_caches_write(struct vfs_node *node, u64 offset,
+                                     const char *buffer, usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)buffer;
+  (void)flags;
+  page_cache_evict((usize)-1); /* evict everything reclaimable */
+  return (isize)size;          /* consume the whole write */
+}
+
 static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
                                        void *data) {
   (void)source;
@@ -245,6 +261,13 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   root->inode->mode = 0555;
 
   struct vfs_node *kern = sysfs_mkchild(root, "kernel", VFS_DIRECTORY, 0);
+  /* /sys/kernel/mm/drop_caches — writable reclaim knob (see write_cb above). */
+  struct vfs_node *km = sysfs_mkchild(kern, "mm", VFS_DIRECTORY, 0);
+  struct vfs_node *dc = km ? sysfs_mkchild(km, "drop_caches", VFS_DEVICE, 0) : 0;
+  if (dc) {
+    dc->inode->mode = 0644;
+    dc->inode->write_cb = sysfs_drop_caches_write;
+  }
   sysfs_mkchild(kern, "ostype", VFS_DEVICE, g_ostype);
   sysfs_mkchild(kern, "osrelease", VFS_DEVICE, g_osrelease);
   sysfs_mkchild(kern, "hostname", VFS_DEVICE, g_hostname);

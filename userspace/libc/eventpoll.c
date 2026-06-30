@@ -5,6 +5,7 @@
 #include <sys/epoll.h>
 #include <sys/timerfd.h>
 #include <sys/signalfd.h>
+#include <sys/inotify.h>
 #include <syscall.h>
 #include <errno.h>
 #include <unistd.h>
@@ -83,4 +84,23 @@ int timerfd_settime(int fd, int flags, const struct itimerspec *new_value,
 int signalfd(int fd, const sigset_t *mask, int flags) {
     uint64_t m = mask ? (uint64_t)*mask : 0;
     return (int)setret(syscall(SYS_SIGNALFD4, (long)fd, (long)m, (long)flags));
+}
+
+/* ---- inotify (M73) ----------------------------------------------------- */
+
+int inotify_init1(int flags) {
+    return (int)setret(syscall(SYS_INOTIFY_INIT1, (long)flags));
+}
+
+int inotify_init(void) {
+    return inotify_init1(0);
+}
+
+int inotify_add_watch(int fd, const char *pathname, uint32_t mask) {
+    return (int)setret(
+        syscall(SYS_INOTIFY_ADD_WATCH, (long)fd, (long)pathname, (long)mask));
+}
+
+int inotify_rm_watch(int fd, int wd) {
+    return (int)setret(syscall(SYS_INOTIFY_RM_WATCH, (long)fd, (long)wd));
 }

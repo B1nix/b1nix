@@ -6,6 +6,10 @@
 #include "syscall.h"
 #include <errno.h>
 #include <math.h>
+#include <signal.h>
+#include <unistd.h>
+#include <sys/stat.h>
+#include <limits.h>
 #include <sys/mman.h>
 #include <setjmp.h>
 #include <signal.h>
@@ -107,7 +111,16 @@ void _Exit(int status)
 
 void abort(void)
 {
-	exit(127);
+	/* POSIX: abort() raises SIGABRT (so a handler / core dump runs), and if the
+	 * signal is caught and the handler returns, unblock SIGABRT and re-raise so
+	 * it cannot be ignored. Only if that still does not terminate do we _exit. */
+	raise(SIGABRT);
+	sigset_t set;
+	sigemptyset(&set);
+	sigaddset(&set, SIGABRT);
+	sigprocmask(SIG_UNBLOCK, &set, 0);
+	raise(SIGABRT);
+	_exit(127);
 }
 
 /* ── Dynamic memory allocator ───────────────────────────────────────────────
@@ -470,11 +483,88 @@ int clearenv(void)
 	return 0;
 }
 
+/* Real path canonicalisation (was a non-resolving strcpy): make the path
+ * absolute (via getcwd for a relative path), collapse "." and "..", and resolve
+ * every symlink component (re-injecting the link target into the unresolved
+ * remainder), ELOOP after 40 symlinks. All components must exist (POSIX). */
 char *realpath(const char *path, char *resolved_path)
 {
-	if (!resolved_path) return strdup(path);
-	strcpy(resolved_path, path);
-	return resolved_path;
+	if (!path) { errno = EINVAL; return NULL; }
+	if (!*path) { errno = ENOENT; return NULL; }
+
+	char *out = resolved_path ? resolved_path : malloc(PATH_MAX);
+	if (!out) { errno = ENOMEM; return NULL; }
+
+	char stack[PATH_MAX];
+	if (path[0] == '/') {
+		if (strlen(path) >= PATH_MAX) goto toolong;
+		strcpy(stack, path);
+	} else {
+		if (!getcwd(stack, PATH_MAX)) goto fail;
+		size_t cl = strlen(stack);
+		if (cl + 1 + strlen(path) >= PATH_MAX) goto toolong;
+		if (cl == 0 || stack[cl - 1] != '/') stack[cl++] = '/';
+		strcpy(stack + cl, path);
+	}
+
+	size_t outlen = 0; /* out holds the canonical prefix, no trailing slash */
+	out[0] = 0;
+	int symloops = 0;
+	size_t pos = 0;
+
+	while (stack[pos]) {
+		while (stack[pos] == '/') pos++;
+		if (!stack[pos]) break;
+		size_t start = pos;
+		while (stack[pos] && stack[pos] != '/') pos++;
+		size_t clen = pos - start;
+		if (clen == 1 && stack[start] == '.') continue;
+		if (clen == 2 && stack[start] == '.' && stack[start + 1] == '.') {
+			while (outlen && out[outlen - 1] != '/') outlen--;
+			if (outlen) outlen--;
+			out[outlen] = 0;
+			continue;
+		}
+		if (outlen + 1 + clen >= PATH_MAX) goto toolong;
+		out[outlen++] = '/';
+		memcpy(out + outlen, stack + start, clen);
+		outlen += clen;
+		out[outlen] = 0;
+
+		struct stat st;
+		if (lstat(out, &st) < 0) goto fail; /* component must exist */
+		if (S_ISLNK(st.st_mode)) {
+			if (++symloops > 40) { errno = ELOOP; goto fail; }
+			char link[PATH_MAX];
+			ssize_t ll = readlink(out, link, PATH_MAX - 1);
+			if (ll < 0) goto fail;
+			link[ll] = 0;
+			/* pop the symlink component from out */
+			while (outlen && out[outlen - 1] != '/') outlen--;
+			if (outlen) outlen--;
+			out[outlen] = 0;
+			/* rebuild stack = link + remaining; absolute link restarts out */
+			char rest[PATH_MAX];
+			if (strlen(stack + pos) >= PATH_MAX) goto toolong;
+			strcpy(rest, stack + pos);
+			if (link[0] == '/') { outlen = 0; out[0] = 0; }
+			if (strlen(link) + strlen(rest) >= PATH_MAX) goto toolong;
+			char rebuilt[PATH_MAX];
+			strcpy(rebuilt, link);
+			strcat(rebuilt, rest);
+			strcpy(stack, rebuilt);
+			pos = 0;
+		}
+	}
+
+	if (outlen == 0) { out[0] = '/'; out[1] = 0; } /* resolved to root */
+	return out;
+
+toolong:
+	errno = ENAMETOOLONG;
+fail:
+	if (!resolved_path) free(out);
+	return NULL;
 }
 
 static void *_realloc_unlocked(void *ptr, size_t size)
@@ -565,14 +655,71 @@ unsigned long strtoul(const char *nptr, char **endptr, int base)
 	return (unsigned long)strtol(nptr, endptr, base);
 }
 
-long long strtoll(const char *nptr, char **endptr, int base)
-{
-	return (long long)strtol(nptr, endptr, base);
-}
-
+/* Real 64-bit unsigned parser (the old cast-through-strtol truncated the range
+ * and never set ERANGE). Honors base 0 (0x→16, 0→8, else 10) and 2..36, leading
+ * sign, and clamps overflow to ULLONG_MAX with errno=ERANGE. */
 unsigned long long strtoull(const char *nptr, char **endptr, int base)
 {
-	return (unsigned long long)strtol(nptr, endptr, base);
+	const char *s = nptr;
+	while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+	int neg = 0;
+	if (*s == '+' || *s == '-') neg = (*s++ == '-');
+	if ((base == 0 || base == 16) && s[0] == '0' && (s[1] == 'x' || s[1] == 'X')) {
+		s += 2;
+		base = 16;
+	} else if (base == 0 && s[0] == '0') {
+		base = 8;
+	} else if (base == 0) {
+		base = 10;
+	}
+	const unsigned long long umax = ~0ULL;
+	unsigned long long cutoff = umax / (unsigned)base;
+	int cutlim = (int)(umax % (unsigned)base);
+	unsigned long long acc = 0;
+	int any = 0, overflow = 0;
+	for (;; s++) {
+		int c = (unsigned char)*s, d;
+		if (c >= '0' && c <= '9') d = c - '0';
+		else if (c >= 'a' && c <= 'z') d = c - 'a' + 10;
+		else if (c >= 'A' && c <= 'Z') d = c - 'A' + 10;
+		else break;
+		if (d >= base) break;
+		any = 1;
+		if (overflow || acc > cutoff || (acc == cutoff && d > cutlim))
+			overflow = 1;
+		else
+			acc = acc * (unsigned)base + (unsigned)d;
+	}
+	if (endptr) *endptr = (char *)(any ? s : nptr);
+	if (overflow) {
+		errno = ERANGE;
+		return umax;
+	}
+	return neg ? (0ULL - acc) : acc;
+}
+
+/* Real 64-bit signed parser: parse the magnitude as unsigned, then clamp to
+ * [LLONG_MIN, LLONG_MAX] with ERANGE. */
+long long strtoll(const char *nptr, char **endptr, int base)
+{
+	const char *s = nptr;
+	while (*s == ' ' || (*s >= '\t' && *s <= '\r')) s++;
+	int neg = (*s == '-');
+	unsigned long long v = strtoull(nptr, endptr, base); /* sign already applied */
+	const unsigned long long llmax = 0x7fffffffffffffffULL;
+	if (neg) {
+		unsigned long long m = 0ULL - v; /* positive magnitude */
+		if (m > llmax + 1ULL) {
+			errno = ERANGE;
+			return (long long)0x8000000000000000ULL; /* LLONG_MIN */
+		}
+		return (long long)v; /* v is already the two's-complement negation */
+	}
+	if (v > llmax) {
+		errno = ERANGE;
+		return (long long)llmax;
+	}
+	return (long long)v;
 }
 
 static void swap(char *a, char *b, size_t size) {
@@ -1107,6 +1254,53 @@ char *strsignal(int sig) {
 
 int sigprocmask(int how, const sigset_t *set, sigset_t *oldset) {
   int rc = (int)syscall(SYS_SIGPROCMASK, how, (long)set, (long)oldset, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+
+/* M74: sigqueue(3) — send `sig` to `pid` with an RT payload. RT signals queue
+ * and deliver the payload to an SA_SIGINFO handler as si_value. */
+int sigqueue(int pid, int sig, const union sigval value) {
+  int rc = (int)syscall(SYS_SIGQUEUE, pid, sig, (long)value.sival_ptr, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+
+/* M74 POSIX timers. timer_t is an int id (the kernel timer-table index). */
+int timer_create(clockid_t clk_id, struct sigevent *sevp, timer_t *timerid) {
+  int rc = (int)syscall(SYS_TIMER_CREATE, clk_id, (long)sevp, (long)timerid, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+                  struct itimerspec *old_value) {
+  int rc = (int)syscall(SYS_TIMER_SETTIME, timerid, flags, (long)new_value,
+                        (long)old_value);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value) {
+  int rc = (int)syscall(SYS_TIMER_GETTIME, timerid, (long)curr_value, 0, 0);
+  if (rc < 0) {
+    errno = normalize_errno(rc);
+    return -1;
+  }
+  return 0;
+}
+int timer_delete(timer_t timerid) {
+  int rc = (int)syscall(SYS_TIMER_DELETE, timerid, 0, 0, 0);
   if (rc < 0) {
     errno = normalize_errno(rc);
     return -1;

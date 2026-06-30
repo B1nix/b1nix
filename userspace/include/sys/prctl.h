@@ -20,8 +20,10 @@ extern "C" {
  * no-op-success for most of these; they exist so code that *names* them — chiefly
  * the seccomp prctl-arg policy, dead on b1nix (--no-sandbox) — compiles with
  * distinct switch-case values. */
+#define PR_SET_SECCOMP            22  /* M63: real — install a seccomp mode/filter */
 #define PR_CAPBSET_READ           23
 #define PR_SET_TIMERSLACK         29
+#define PR_SET_NO_NEW_PRIVS       38  /* M63: real — forbid privilege escalation */
 #define PR_GET_NO_NEW_PRIVS       39
 #define PR_SET_THP_DISABLE        41
 #define PR_MPX_ENABLE_MANAGEMENT  43

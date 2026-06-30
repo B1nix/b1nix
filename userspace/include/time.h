@@ -74,6 +74,17 @@ struct timespec {
 typedef int clockid_t;
 int clock_gettime(int clk_id, struct timespec *tp);
 int nanosleep(const struct timespec *req, struct timespec *rem);
+
+/* M74 POSIX per-process timers. timer_t is an opaque id. struct itimerspec is in
+ * <sys/timerfd.h>. struct sigevent is in <signal.h>. */
+typedef int timer_t;
+struct itimerspec;
+struct sigevent;
+int timer_create(clockid_t clk_id, struct sigevent *sevp, timer_t *timerid);
+int timer_settime(timer_t timerid, int flags, const struct itimerspec *new_value,
+                  struct itimerspec *old_value);
+int timer_gettime(timer_t timerid, struct itimerspec *curr_value);
+int timer_delete(timer_t timerid);
 int clock_nanosleep(int clk_id, int flags, const struct timespec *req, struct timespec *rem);
 
 struct tm *localtime_r(const time_t *timep, struct tm *result);

@@ -716,6 +716,7 @@ check_output "$LOG" "M14-SMOKE: ok invalid-fs" "mounting invalid filesystem type
 check_output "$LOG" "M14-SMOKE: ok stress-loop" "repeated create/write/read/delete loop completes successfully"
 check_output "$LOG" "M14-SMOKE: ok large-file" "large file bounds allocation and verification successful"
 check_output "$LOG" "M14-SMOKE: ok VFS-normalization" "VFS path normalization works on mounts"
+check_output "$LOG" "M14-SMOKE: ok mmap-durable" "M72: a writable MAP_SHARED mmap store survives forced page-cache reclaim (drop_caches) and is read back from disk"
 check_output "$LOG" "M14-SMOKE: done" "M14 smoke completes successfully"
 
 # ── M15 IPC, Security & Standard OS Features ──
@@ -733,6 +734,10 @@ check_output "$LOG" "M15-SMOKE: ok semaphore" "cooperative semaphore baseline wo
 check_output "$LOG" "M15-SMOKE: ok clock-timer" "clock_gettime and nanosleep work"
 check_output "$LOG" "M15-SMOKE: ok permissions-chmod" "chmod changes mode bits"
 check_output "$LOG" "M15-SMOKE: ok permissions-enforcement" "permissions are enforced for non-root uid"
+# ── M74: RT signals (POSIX real-time signals queue, do not coalesce) ──
+check_output "$LOG" "M74-SMOKE: ok rt-queue" "M74: 3 blocked SIGRTMIN sends are all delivered after unblock (RT signals queue, not coalesce)"
+check_output "$LOG" "M74-SMOKE: ok rt-sigqueue" "M74: sigqueue payloads reach an SA_SIGINFO handler as si_value in FIFO order"
+check_output "$LOG" "M74-SMOKE: ok rt-timer" "M74: a POSIX interval timer (timer_create/settime) repeatedly raises an RT signal carrying its sigev_value"
 check_output "$LOG" "M15-SMOKE: ok audit-logging" "audit marker appears after privileged syscall"
 check_output "$LOG" "M15-SMOKE: done" "M15 smoke completes"
 
@@ -1440,6 +1445,35 @@ check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a l
 check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
 check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
 check_output "$LOG" "M57-SMOKE: done" "M57 broker-primitive suite completes"
+# ── M73: modern I/O & introspection syscalls ──
+check_output "$LOG" "M73-SMOKE: ok statx" "statx returns size/mode/nlink/ino matching fstat (path + AT_EMPTY_PATH)"
+check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances the explicit offset, leaves the src fd offset"
+check_output "$LOG" "M73-SMOKE: ok copy-file-range" "copy_file_range copies a byte range using independent explicit offsets"
+check_output "$LOG" "M73-SMOKE: ok fallocate" "fallocate mode 0 grows + zero-fills; KEEP_SIZE does not grow"
+check_output "$LOG" "M73-SMOKE: ok splice" "splice moves data file->pipe->file intact"
+# ── M73: inotify (real file-change notification, was an ENOSYS stub) ──
+check_output "$LOG" "M73-SMOKE: ok inotify-modify" "inotify reports IN_MODIFY on a write to a watched file"
+check_output "$LOG" "M73-SMOKE: ok inotify-dir" "inotify reports IN_CREATE/IN_DELETE (with entry name) for a watched directory"
+check_output "$LOG" "M73-SMOKE: ok inotify-rmwatch" "inotify_rm_watch removes a watch"
+check_output "$LOG" "M72-SMOKE: ok msync" "msync validates flags (EINVAL), unmapped range (ENOMEM), and syncs a mapped MAP_SHARED range"
+# ── M88: PROT_NONE is enforced (wild access faults, not zero-fills) ──
+check_output "$LOG" "M88-SMOKE: ok prot-none" "a PROT_NONE reservation SIGSEGVs on access; mprotect to RW then succeeds"
+# ── M85: libc Tier-A correctness (Chromium-debt overlap) ──
+check_output "$LOG" "M73-SMOKE: ok strtoull" "strtoull parses the full uint64 range + ERANGE; strtoll honors signed range/base16"
+check_output "$LOG" "M73-SMOKE: ok sysconf-ncpu" "sysconf(_SC_NPROCESSORS_ONLN) reports the real online-CPU count (not a hardcoded 1)"
+check_output "$LOG" "M73-SMOKE: ok abort-sigabrt" "abort() raises SIGABRT (not exit(127))"
+check_output "$LOG" "M73-SMOKE: ok realpath" "realpath resolves ./.. and a symlink to the canonical path (was a strcpy stub)"
+# ── M71: ASLR (PIE load-base randomization, opt-in via b1nix.aslr) ──
+check_output "$LOG" "M71-ASLR: ok randomized" "two execs of the same PIE binary land at different load bases under b1nix.aslr"
+# ── M63: seccomp-bpf ──
+check_output "$LOG" "M63-SMOKE: ok seccomp-errno" "a seccomp filter denies a targeted syscall with ERRNO while others run"
+check_output "$LOG" "M63-SMOKE: ok seccomp-errno-zero" "SECCOMP_RET_ERRNO with errno 0 blocks the syscall and returns 0 (not run)"
+check_output "$LOG" "M63-SMOKE: ok seccomp-kill" "a seccomp KILL_PROCESS verdict terminates the task with SIGSYS"
+check_output "$LOG" "M63-SMOKE: ok seccomp-strict" "SECCOMP_MODE_STRICT kills on a syscall outside read/write/exit/sigreturn"
+check_output "$LOG" "M63-SMOKE: ok seccomp-inherit" "a forked child inherits the parent's seccomp filter"
+check_output "$LOG" "M63-SMOKE: ok seccomp-nnp" "PR_SET/GET_NO_NEW_PRIVS round-trips"
+check_output "$LOG" "M63-SMOKE: done" "M63 seccomp-bpf suite completes"
+check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
 # ── bash: GNU bash 5.2 port (default shell) ──
 check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"
 check_output "$LOG" "BASH-SMOKE: ok arrays" "bash indexed arrays work"

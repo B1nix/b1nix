@@ -28,11 +28,15 @@ int puts(const char *s) {
 }
 
 void perror(const char *s) {
-  if (s && *s) {
-    printf("%s: error\n", s);
-  } else {
-    printf("error\n");
-  }
+  /* POSIX: write "<s>: <strerror(errno)>" to stderr (not a literal "error"),
+   * preserving errno. */
+  int e = errno;
+  const char *msg = strerror(e);
+  if (s && *s)
+    fprintf(stderr, "%s: %s\n", s, msg);
+  else
+    fprintf(stderr, "%s\n", msg);
+  errno = e;
 }
 
 int snprintf(char *str, size_t size, const char *fmt, ...) {

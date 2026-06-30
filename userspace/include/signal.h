@@ -56,6 +56,11 @@ extern "C" {
 #define SI_TKILL   -6
 #define NSIG    31
 
+/* M74 POSIX real-time signals: SIGRTMIN..SIGRTMAX (queued, payload-carrying).
+ * Must match the kernel (kernel/include/b1nix/sched.h). */
+#define SIGRTMIN 32
+#define SIGRTMAX 63
+
 /* siginfo si_code values (POSIX). Used by crash reporters to describe faults. */
 #define FPE_INTDIV 1
 #define FPE_FLTDIV 2
@@ -111,6 +116,14 @@ int raise(int sig);
 #define SIG_IGN ((void (*)(int))1)
 #define SIG_ERR ((void (*)(int))-1)
 
+/* M74: POSIX real-time signal payload, carried by sigqueue(3) and a
+ * SIGEV_SIGNAL timer's sigev_value, delivered to an SA_SIGINFO handler as
+ * siginfo->si_value. */
+union sigval {
+    int sival_int;
+    void *sival_ptr;
+};
+
 typedef struct {
     int si_signo;
     int si_code;
@@ -119,7 +132,26 @@ typedef struct {
     int si_uid;
     int si_status;
     void *si_addr;   /* faulting address for SIGSEGV/SIGBUS/SIGFPE/SIGILL */
+    /* si_value is appended last so existing field offsets are unchanged. RT
+     * signals (sigqueue / POSIX timers) deliver their payload here. */
+    union sigval si_value;
 } siginfo_t;
+
+/* sigqueue(3): send signal `sig` to `pid` with the RT payload `value`. */
+int sigqueue(int pid, int sig, const union sigval value);
+
+/* sigevent notification methods (POSIX). b1nix implements SIGEV_SIGNAL. */
+#define SIGEV_SIGNAL 0
+#define SIGEV_NONE   1
+#define SIGEV_THREAD 2
+
+/* struct sigevent — how a POSIX timer notifies on expiry. Native b1nix layout
+ * (kept minimal: notify method, target signal, and the payload). */
+struct sigevent {
+    int sigev_notify;          /* SIGEV_SIGNAL / SIGEV_NONE */
+    int sigev_signo;           /* signal to raise */
+    union sigval sigev_value;  /* delivered as siginfo->si_value */
+};
 
 /* 64-bit to match the kernel ABI (struct sigaction uses u64 sa_flags/sa_mask,
  * sigset_t is a u64 bitmask). `unsigned long` is 8 bytes on x86_64 but only 4 on

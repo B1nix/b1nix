@@ -9,7 +9,10 @@
 #include <b1nix/mm.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/net.h>
+#include <b1nix/page_cache.h>
+#include <b1nix/inotify.h>
 #include <b1nix/posix.h>
+#include <b1nix/seccomp.h>
 #include <b1nix/rtc.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
@@ -63,7 +66,7 @@ static int rdrand_supported(void) {
 }
 #endif
 
-static u64 sys_random_u64(void) {
+u64 kernel_random_u64(void) {
   u64 v = 0;
 #if defined(__x86_64__)
   if (rdrand_supported()) {
@@ -341,6 +344,215 @@ static isize sys_write(int fd, const void *buf, usize count) {
       break;
   }
   return total_written;
+}
+
+/* M73: shared fd→fd byte pump backing sendfile/copy_file_range/splice. Reads up
+ * to `count` bytes from in_fd and writes them to out_fd through a kernel bounce
+ * buffer. When *in_off / *out_off is provided the transfer starts there and the
+ * caller's offset variable is advanced, WITHOUT disturbing the fd's own file
+ * offset (POSIX sendfile/copy_file_range semantics: an explicit offset argument
+ * leaves the descriptor position untouched). A NULL offset pointer means "use
+ * and advance the fd's own offset". Returns bytes copied or -errno. */
+static isize file_copy_range(int in_fd, u64 *in_off, int out_fd, u64 *out_off,
+                             usize count) {
+  /* Use positioned I/O (vfs_pread/pwrite) for the explicit-offset side so the
+   * shared descriptor's own file offset is never disturbed — thread-safe, unlike
+   * an lseek-save-restore that another thread sharing the fd could observe
+   * mid-transfer. A NULL offset uses and advances the fd's own offset. */
+  char kbuf[4096];
+  isize total = 0;
+  isize err = 0;
+  u64 ipos = in_off ? *in_off : 0;
+  u64 opos = out_off ? *out_off : 0;
+  while (count > 0) {
+    usize chunk = count > sizeof(kbuf) ? sizeof(kbuf) : count;
+    isize r = in_off ? vfs_pread(in_fd, kbuf, chunk, ipos)
+                     : vfs_read(in_fd, kbuf, chunk);
+    if (r < 0) {
+      err = r;
+      break;
+    }
+    if (r == 0)
+      break; /* EOF on input */
+    if (in_off)
+      ipos += (u64)r;
+    isize w_done = 0;
+    while (w_done < r) {
+      isize w = out_off
+                    ? vfs_pwrite(out_fd, kbuf + w_done, (usize)(r - w_done), opos)
+                    : vfs_write(out_fd, kbuf + w_done, (usize)(r - w_done));
+      if (w < 0) {
+        err = w;
+        break;
+      }
+      if (w == 0)
+        break;
+      w_done += w;
+      if (out_off)
+        opos += (u64)w;
+    }
+    total += w_done;
+    count -= (usize)w_done;
+    if (err || w_done < r)
+      break; /* short/failed write — stop */
+    if (r < (isize)chunk)
+      break; /* short read = EOF */
+  }
+
+  if (in_off)
+    *in_off = ipos;
+  if (out_off)
+    *out_off = opos;
+  if (total == 0 && err)
+    return err;
+  return total;
+}
+
+/* sendfile(out_fd, in_fd, off*, count). off (when non-NULL) names the in_fd
+ * start offset and receives the new position; the in_fd file offset is left
+ * unchanged in that case. out_fd always uses and advances its own offset. */
+static isize sys_sendfile(int out_fd, int in_fd, u64 *user_off, usize count) {
+  u64 off;
+  u64 *poff = 0;
+  if (user_off) {
+    if (syscall_copyin(&off, user_off, sizeof(off)) < 0)
+      return -EFAULT;
+    poff = &off;
+  }
+  isize ret = file_copy_range(in_fd, poff, out_fd, 0, count);
+  if (ret >= 0 && poff && syscall_copyout(user_off, &off, sizeof(off)) < 0)
+    return -EFAULT;
+  return ret;
+}
+
+/* copy_file_range(fd_in, off_in*, fd_out, off_out*, len, flags). Both offsets
+ * are independently optional; flags must be 0 (no Linux flags defined yet). */
+static isize sys_copy_file_range(int fd_in, u64 *user_off_in, int fd_out,
+                                 u64 *user_off_out, usize len,
+                                 unsigned int flags) {
+  if (flags != 0)
+    return -EINVAL;
+  u64 off_in, off_out;
+  u64 *pin = 0, *pout = 0;
+  if (user_off_in) {
+    if (syscall_copyin(&off_in, user_off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    pin = &off_in;
+  }
+  if (user_off_out) {
+    if (syscall_copyin(&off_out, user_off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+    pout = &off_out;
+  }
+  isize ret = file_copy_range(fd_in, pin, fd_out, pout, len);
+  if (ret >= 0) {
+    if (pin && syscall_copyout(user_off_in, &off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    if (pout && syscall_copyout(user_off_out, &off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+  }
+  return ret;
+}
+
+/* splice(fd_in, off_in*, fd_out, off_out*, len, flags). Linux requires the
+ * offset for a pipe end be NULL; we don't special-case pipes (the copy pump
+ * read/writes either kind) but honor the same offset semantics. */
+static isize sys_splice(int fd_in, u64 *user_off_in, int fd_out,
+                        u64 *user_off_out, usize len, unsigned int flags) {
+  (void)flags; /* SPLICE_F_* are advisory (MOVE/NONBLOCK/MORE/GIFT) */
+  u64 off_in, off_out;
+  u64 *pin = 0, *pout = 0;
+  if (user_off_in) {
+    if (syscall_copyin(&off_in, user_off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    pin = &off_in;
+  }
+  if (user_off_out) {
+    if (syscall_copyin(&off_out, user_off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+    pout = &off_out;
+  }
+  isize ret = file_copy_range(fd_in, pin, fd_out, pout, len);
+  if (ret >= 0) {
+    if (pin && syscall_copyout(user_off_in, &off_in, sizeof(off_in)) < 0)
+      return -EFAULT;
+    if (pout && syscall_copyout(user_off_out, &off_out, sizeof(off_out)) < 0)
+      return -EFAULT;
+  }
+  return ret;
+}
+
+/* fallocate(fd, mode, offset, len). mode 0 (allocate) and FALLOC_FL_KEEP_SIZE
+ * are honored by extending the file to offset+len when it is shorter (b1nix
+ * filesystems allocate on write / have no preallocation primitive, so this is
+ * the meaningful guarantee: the bytes exist and are zero). Hole-punching and
+ * range collapse/insert/zero are not supported by the underlying drivers. */
+static int sys_fallocate(int fd, int mode, u64 offset, u64 len) {
+  if (len == 0)
+    return -EINVAL;
+  /* Only plain allocate (0) and KEEP_SIZE are representable; the rest need
+   * driver support b1nix lacks. */
+  if (mode & ~FALLOC_FL_KEEP_SIZE)
+    return -EOPNOTSUPP;
+  struct b1nix_stat st;
+  if (vfs_fstat(fd, &st) < 0)
+    return -EBADF;
+  u64 end = offset + len;
+  if (mode & FALLOC_FL_KEEP_SIZE)
+    return 0; /* reservation only — no real preallocation to perform */
+  if (end > st.st_size)
+    return vfs_ftruncate(fd, end);
+  return 0; /* already covered */
+}
+
+/* statx(dirfd, path, flags, mask, statxbuf). b1nix supports the common forms:
+ * an absolute/cwd-relative path (dirfd == AT_FDCWD) and AT_EMPTY_PATH on an fd.
+ * It maps the existing stat data into the Linux struct statx layout so glibc /
+ * port binaries that prefer statx get real values. */
+static int sys_statx(int dirfd, const char *user_path, int flags,
+                     unsigned int mask, struct statx *user_buf) {
+  struct b1nix_stat st;
+  int rc;
+  if ((flags & AT_EMPTY_PATH) && (!user_path || user_path[0] == '\0')) {
+    rc = vfs_fstat(dirfd, &st);
+  } else {
+    char kpath[VFS_MAX_PATH];
+    if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+      return -EFAULT;
+    /* Only AT_FDCWD (or an absolute path) is resolvable — no per-fd dir base. */
+    if (dirfd != AT_FDCWD && kpath[0] != '/')
+      return -EBADF;
+    rc = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(kpath, &st)
+                                       : vfs_stat(kpath, &st);
+  }
+  if (rc < 0)
+    return rc;
+
+  struct statx sx;
+  memset(&sx, 0, sizeof(sx));
+  sx.stx_mask = mask & STATX_BASIC_STATS;
+  sx.stx_blksize = (u32)st.st_blksize;
+  sx.stx_nlink = st.st_nlink;
+  sx.stx_uid = st.st_uid;
+  sx.stx_gid = st.st_gid;
+  sx.stx_mode = (u16)st.st_mode;
+  sx.stx_ino = st.st_ino;
+  sx.stx_size = st.st_size;
+  sx.stx_blocks = st.st_blocks;
+  sx.stx_atime.tv_sec = (i64)st.st_atim.tv_sec;
+  sx.stx_atime.tv_nsec = (u32)st.st_atim.tv_nsec;
+  sx.stx_mtime.tv_sec = (i64)st.st_mtim.tv_sec;
+  sx.stx_mtime.tv_nsec = (u32)st.st_mtim.tv_nsec;
+  sx.stx_ctime.tv_sec = (i64)st.st_ctim.tv_sec;
+  sx.stx_ctime.tv_nsec = (u32)st.st_ctim.tv_nsec;
+  sx.stx_btime = sx.stx_ctime; /* no separate birth time — report ctime */
+  sx.stx_rdev_major = (u32)(st.st_rdev >> 8);
+  sx.stx_rdev_minor = (u32)(st.st_rdev & 0xff);
+  sx.stx_dev_major = (u32)(st.st_dev >> 8);
+  sx.stx_dev_minor = (u32)(st.st_dev & 0xff);
+  if (syscall_copyout(user_buf, &sx, sizeof(sx)) < 0)
+    return -EFAULT;
+  return 0;
 }
 
 static isize sys_list(const char *user_path) {
@@ -2392,6 +2604,101 @@ static isize sys_madvise(void *addr, usize length, int advice) {
   return 0;
 }
 
+/* M72: msync(addr, length, flags). Write back the dirty pages of a file-backed
+ * MAP_SHARED mapping to its backing file. A store through such a mapping lands
+ * in the page-frame that backs the mapping and sets only the hardware PTE dirty
+ * bit — neither the page-cache DIRTY flag (so a clean page-cache entry can be
+ * dropped by eviction, losing the write) nor anything fsync(2) keys on. msync
+ * walks the range, test-and-clears each page's PTE dirty bit, and for the pages
+ * userspace actually wrote, writes the page-frame's contents straight back to
+ * the backing file via the inode write_cb (which goes through the block cache,
+ * coherent with the read path). Writing the frame directly — rather than via a
+ * page-cache lookup that may have been evicted — is what makes the data durable.
+ * MS_ASYNC schedules instead of waiting: it just marks the page-cache entry
+ * dirty (if still resident) so a later flush/eviction persists it. MS_INVALIDATE
+ * is a no-op (mappers share the frame, so views are already coherent). */
+static isize sys_msync(void *addr, usize length, int flags) {
+  extern int paging_test_and_clear_dirty(u64 pml4_phys, u64 vaddr);
+  extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+  u64 start = (u64)(usize)addr;
+  if (start & (PAGE_SIZE - 1))
+    return -EINVAL; /* POSIX: addr must be page-aligned */
+  if (flags & ~(MS_ASYNC | MS_SYNC | MS_INVALIDATE))
+    return -EINVAL;
+  if ((flags & MS_ASYNC) && (flags & MS_SYNC))
+    return -EINVAL;
+  if (length == 0)
+    return 0;
+  struct task *t = current_task;
+  if (!t)
+    return -ESRCH;
+  if (start >= USER_SPACE_LIMIT || length > (usize)(USER_SPACE_LIMIT - start))
+    return -ENOMEM;
+  u64 end = (start + length + PAGE_SIZE - 1) & ~(PAGE_SIZE - 1);
+
+  /* The range must be fully mapped (POSIX ENOMEM otherwise). */
+  for (u64 v = start; v < end; v += PAGE_SIZE) {
+    struct vm_area *vma = t->vma_list;
+    int covered = 0;
+    while (vma) {
+      if (v >= vma->start && v < vma->end) {
+        covered = 1;
+        break;
+      }
+      vma = vma->next;
+    }
+    if (!covered)
+      return -ENOMEM;
+  }
+
+  for (struct vm_area *vma = t->vma_list; vma; vma = vma->next) {
+    if (vma->end <= start || vma->start >= end)
+      continue;
+    if (!(vma->flags & MAP_SHARED))
+      continue; /* MAP_PRIVATE writes are not written back */
+    if (!vma->node || !vma->node->inode ||
+        vma->node->inode->type != VFS_FILE)
+      continue;
+    struct vfs_inode *inode = vma->node->inode;
+    if (!inode->write_cb)
+      continue;
+    u64 lo = vma->start > start ? vma->start : start;
+    u64 hi = vma->end < end ? vma->end : end;
+    for (u64 v = lo; v < hi; v += PAGE_SIZE) {
+      if (!paging_test_and_clear_dirty(t->pml4_phys, v))
+        continue;
+      u64 file_off = (u64)vma->offset + (v - vma->start);
+      u64 file_page = file_off & ~(PAGE_SIZE - 1);
+
+      /* Keep a resident page-cache entry coherent (and dirty for fsync/eviction). */
+      struct page_cache_entry *page = page_cache_get_page(inode, file_page);
+      if (page) {
+        page_cache_mark_dirty(page);
+        page_cache_put_page(page);
+      }
+
+      if (flags & MS_ASYNC)
+        continue; /* scheduled: leave the durable write to flush/eviction */
+
+      /* Synchronous: write the frame straight to the backing file. */
+      u64 frame = paging_user_frame(t->pml4_phys, v);
+      if (!frame)
+        continue;
+      void *frame_virt = (void *)(usize)(frame + vmm_direct_map_base());
+      usize wsize = PAGE_SIZE;
+      if (file_page + PAGE_SIZE > inode->size)
+        wsize = (file_page < inode->size) ? (usize)(inode->size - file_page) : 0;
+      if (wsize == 0)
+        continue;
+      struct vfs_node dummy;
+      memset(&dummy, 0, sizeof(dummy));
+      dummy.inode = inode;
+      inode->write_cb(&dummy, file_page, (const char *)frame_virt, wsize, 0);
+    }
+  }
+  return 0;
+}
+
 /* sigaltstack(ss, old_ss). Per-process alternate signal stack kept in a
  * scheduler side-table. The kernel honors SA_ONSTACK at signal delivery by
  * placing the signal frame at the top of this stack. */
@@ -2598,6 +2905,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
   }
 
+  /* M63: seccomp-bpf. A task that installed a filter has every syscall screened
+   * before it runs, using the raw ABI number the caller used (so a Linux-
+   * personality task's filter sees Linux numbers, matching Linux semantics).
+   * ALLOW returns 0 and the call proceeds; a denial returns the filter's -errno
+   * without running the syscall; a KILL verdict terminates the task inside
+   * seccomp_filter_syscall and never returns. Only filtered tasks pay any cost. */
+  if (frame && seccomp_active()) {
+    isize sv = 0;
+    if (seccomp_filter_syscall(number, arg0, arg1, arg2, arg3, arg4, arg5,
+                               frame, &sv))
+      return (u64)sv; /* blocked — sv is the value to return (may be 0) */
+  }
+
   /* M40 — Linux ABI translation. For a task whose image carries the Linux
    * personality, `number` is a Linux x86_64 syscall number; translate it to the
    * b1nix native number before routing. The CPU calling convention is identical,
@@ -2782,7 +3102,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       usize chunk = len - done;
       if (chunk > sizeof(tmp)) chunk = sizeof(tmp);
       for (usize i = 0; i < chunk; i += sizeof(u64)) {
-        u64 r = sys_random_u64();
+        u64 r = kernel_random_u64();
         usize left = chunk - i;
         usize n = left < sizeof(u64) ? left : sizeof(u64);
         memcpy(tmp + i, &r, n);
@@ -3105,6 +3425,89 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     return 0;
   }
+  case SYS_SIGQUEUE: {
+    /* sigqueue(pid, sig, sival). RT signals queue with the payload delivered to
+     * an SA_SIGINFO handler as si_value; a standard signal is posted via the
+     * normal coalescing path (no payload). */
+    int sig = (int)arg1;
+    union sigval v;
+    v.sival_ptr = (void *)(usize)arg2;
+    if (SIG_IS_RT(sig))
+      return (u64)scheduler_sigqueue((usize)arg0, sig, v, B1NIX_SI_QUEUE);
+    return (u64)scheduler_kill((usize)arg0, sig);
+  }
+  case SYS_TIMER_CREATE: {
+    /* timer_create(clockid, struct sigevent*, timer_t*). Only SIGEV_SIGNAL is
+     * supported; the clock id is accepted but the tick is the single time base. */
+    struct k_sigevent {
+      int sigev_notify;
+      int sigev_signo;
+      union sigval sigev_value;
+    } sev;
+    if (!arg1 || !arg2)
+      return (u64)-EINVAL;
+    if (syscall_copyin(&sev, (void *)(usize)arg1, sizeof(sev)) < 0)
+      return (u64)-EFAULT;
+    if (sev.sigev_notify != 0 /* SIGEV_SIGNAL */)
+      return (u64)-EINVAL;
+    int id = scheduler_timer_create(sev.sigev_signo, sev.sigev_value);
+    if (id < 0)
+      return (u64)id;
+    if (syscall_copyout((void *)(usize)arg2, &id, sizeof(int)) < 0) {
+      scheduler_timer_delete(id);
+      return (u64)-EFAULT;
+    }
+    return 0;
+  }
+  case SYS_TIMER_SETTIME: {
+    /* timer_settime(id, flags, const itimerspec*, itimerspec*). Times convert to
+     * 100 Hz ticks; it_value all-zero disarms. TIMER_ABSTIME (flags&1) is treated
+     * relative (the smoke uses relative arming). */
+    struct k_timespec { i64 tv_sec; i64 tv_nsec; };
+    struct k_itimerspec { struct k_timespec it_interval; struct k_timespec it_value; } its;
+    if (!arg2)
+      return (u64)-EINVAL;
+    if (syscall_copyin(&its, (void *)(usize)arg2, sizeof(its)) < 0)
+      return (u64)-EFAULT;
+    u64 first = (u64)its.it_value.tv_sec * 100 + (u64)its.it_value.tv_nsec / 10000000;
+    u64 interval = (u64)its.it_interval.tv_sec * 100 + (u64)its.it_interval.tv_nsec / 10000000;
+    /* A non-zero requested time shorter than one tick still arms (1 tick). */
+    if (first == 0 && (its.it_value.tv_sec || its.it_value.tv_nsec))
+      first = 1;
+    if (interval == 0 && (its.it_interval.tv_sec || its.it_interval.tv_nsec))
+      interval = 1;
+    u64 old_rem = 0, old_int = 0;
+    int rc = scheduler_timer_settime((int)arg0, first, interval, &old_rem, &old_int);
+    if (rc < 0)
+      return (u64)rc;
+    if (arg3) {
+      struct k_itimerspec old;
+      old.it_value.tv_sec = (i64)(old_rem / 100);
+      old.it_value.tv_nsec = (i64)((old_rem % 100) * 10000000);
+      old.it_interval.tv_sec = (i64)(old_int / 100);
+      old.it_interval.tv_nsec = (i64)((old_int % 100) * 10000000);
+      if (syscall_copyout((void *)(usize)arg3, &old, sizeof(old)) < 0)
+        return (u64)-EFAULT;
+    }
+    return 0;
+  }
+  case SYS_TIMER_GETTIME: {
+    struct k_timespec { i64 tv_sec; i64 tv_nsec; };
+    struct k_itimerspec { struct k_timespec it_interval; struct k_timespec it_value; } its;
+    u64 rem = 0, interval = 0;
+    int rc = scheduler_timer_gettime((int)arg0, &rem, &interval);
+    if (rc < 0)
+      return (u64)rc;
+    its.it_value.tv_sec = (i64)(rem / 100);
+    its.it_value.tv_nsec = (i64)((rem % 100) * 10000000);
+    its.it_interval.tv_sec = (i64)(interval / 100);
+    its.it_interval.tv_nsec = (i64)((interval % 100) * 10000000);
+    if (!arg1 || syscall_copyout((void *)(usize)arg1, &its, sizeof(its)) < 0)
+      return (u64)-EFAULT;
+    return 0;
+  }
+  case SYS_TIMER_DELETE:
+    return (u64)scheduler_timer_delete((int)arg0);
   case SYS_SIGPROCMASK: {
     int how = (int)arg0;
     u64 set_val = 0;
@@ -3179,6 +3582,49 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SIGALTSTACK:
     return (u64)sys_sigaltstack((const void *)(usize)arg0,
                                 (void *)(usize)arg1);
+  /* --- M73: modern I/O & introspection --- */
+  case SYS_SENDFILE:
+    return (u64)sys_sendfile((int)arg0, (int)arg1, (u64 *)(usize)arg2,
+                             (usize)arg3);
+  case SYS_COPY_FILE_RANGE:
+    return (u64)sys_copy_file_range((int)arg0, (u64 *)(usize)arg1, (int)arg2,
+                                    (u64 *)(usize)arg3, (usize)arg4,
+                                    (unsigned int)arg5);
+  case SYS_SPLICE:
+    return (u64)sys_splice((int)arg0, (u64 *)(usize)arg1, (int)arg2,
+                           (u64 *)(usize)arg3, (usize)arg4,
+                           (unsigned int)arg5);
+  case SYS_FALLOCATE:
+    return (u64)sys_fallocate((int)arg0, (int)arg1, arg2, arg3);
+  case SYS_STATX:
+    return (u64)sys_statx((int)arg0, (const char *)(usize)arg1, (int)arg2,
+                          (unsigned int)arg3, (struct statx *)(usize)arg4);
+  case SYS_MSYNC:
+    return (u64)sys_msync((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  /* --- M63: seccomp-bpf --- */
+  case SYS_SECCOMP: {
+    unsigned int op = (unsigned int)arg0;
+    if (op == SECCOMP_SET_MODE_FILTER)
+      return (u64)seccomp_set_mode_filter((u32)arg1, (const void *)(usize)arg2);
+    if (op == SECCOMP_SET_MODE_STRICT)
+      return (u64)seccomp_set_mode_strict();
+    return (u64)-EINVAL;
+  }
+  case SYS_PRCTL: {
+    int option = (int)arg0;
+    if (option == PR_SET_SECCOMP) {
+      if (arg1 == SECCOMP_MODE_STRICT)
+        return (u64)seccomp_set_mode_strict();
+      if (arg1 == SECCOMP_MODE_FILTER)
+        return (u64)seccomp_set_mode_filter(0, (const void *)(usize)arg2);
+      return (u64)-EINVAL;
+    }
+    if (option == PR_SET_NO_NEW_PRIVS)
+      return (u64)seccomp_set_no_new_privs();
+    if (option == PR_GET_NO_NEW_PRIVS)
+      return (u64)seccomp_get_no_new_privs();
+    return (u64)-EINVAL; /* other prctl options unsupported */
+  }
   case SYS_MEM:
     console_write("Total usable memory: ");
     console_write_dec(pmm_total_usable_memory() / (1024ULL * 1024ULL));
@@ -3632,6 +4078,37 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
     return 0;
   }
+  case SYS_DL_PHDR_INFO: {
+    /* SYS_DL_PHDR_INFO(buf, cap) — copy out the loaded-module table (the
+     * executable + every shared library) that backs dl_iterate_phdr. Each entry
+     * is {u64 base, u64 phdr_vaddr, u64 phnum, char name[96]} matching userspace's
+     * struct b1nix_dl_module. Up to `cap` entries are written to `buf`; the return
+     * value is the TOTAL module count so the caller can detect truncation. The
+     * libc dl_iterate_phdr uses this so the libgcc_s.so unwinder can locate each
+     * module's PT_GNU_EH_FRAME (cross-DSO C++ exception unwinding). */
+    struct task *t = current_task;
+    if (!t || !t->user_image) return 0;
+    struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+    usize total = img->dl_module_count;
+    if (arg0 && arg1) {
+      struct {
+        u64 base, phdr_vaddr, phnum, eh_frame_va;
+        char name[USER_DL_MODULE_NAME_MAX];
+      } e;
+      usize n = total < arg1 ? total : arg1;
+      for (usize i = 0; i < n; i++) {
+        e.base = img->dl_modules[i].base;
+        e.phdr_vaddr = img->dl_modules[i].phdr_vaddr;
+        e.phnum = img->dl_modules[i].phnum;
+        e.eh_frame_va = img->dl_modules[i].eh_frame_va;
+        memcpy(e.name, img->dl_modules[i].name, USER_DL_MODULE_NAME_MAX);
+        if (syscall_copyout((void *)(usize)(arg0 + i * sizeof(e)), &e,
+                            sizeof(e)) < 0)
+          return (u64)-EFAULT;
+      }
+    }
+    return (u64)total;
+  }
   case SYS_GETTID:
     return (u64)scheduler_get_pid();
   case SYS_EXIT_THREAD:
@@ -3832,6 +4309,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SIGNALFD4:
     /* signalfd4(fd, mask, flags). mask is a 64-bit signal bitmask. */
     return (u64)vfs_signalfd((int)arg0, arg1, (int)arg2);
+
+  case SYS_INOTIFY_INIT1:
+    return (u64)vfs_inotify_init1((int)arg0);
+  case SYS_INOTIFY_ADD_WATCH:
+    return (u64)vfs_inotify_add_watch((int)arg0, (const char *)(usize)arg1,
+                                      (u32)arg2);
+  case SYS_INOTIFY_RM_WATCH:
+    return (u64)vfs_inotify_rm_watch((int)arg0, (int)arg1);
 
   default:
     console_write("syscall: unknown 0x");

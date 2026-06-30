@@ -14,12 +14,16 @@
  */
 
 #ifdef __x86_64__
-#ifndef B1NIX_DYNAMIC
 /* Weak references to libgcc's DWARF frame-registration entry points. They are
- * defined only when a program links libgcc (e.g. the GCC-built native
- * toolchain: cc1/gcc/as/ld). For clang-linked b1nix programs they resolve to 0
- * and the registration below is skipped. */
+ * defined when a program links libgcc — statically (the GCC-built native
+ * toolchain: cc1/gcc/as/ld) OR dynamically against the shared libgcc_s.so (the
+ * C++ binaries that link the shared libstdc++.so.6). For clang-linked b1nix
+ * programs with no libgcc at all they resolve to 0 and the registration below is
+ * skipped. This is NOT gated on B1NIX_DYNAMIC: a dynamic C++ binary must register
+ * its own .eh_frame with the SHARED libgcc_s.so unwinder, otherwise a throw runs
+ * that unwinder with an empty FDE registry and std::terminate aborts. */
 .weak __register_frame_info
+.weak __register_frame
 .weak __EH_FRAME_BEGIN__
 
 .section .bss
@@ -27,7 +31,6 @@
 .local __b1nix_eh_object
 __b1nix_eh_object:
 	.skip 48                        /* sizeof(struct object) in libgcc */
-#endif
 
 .section .text
 .globl _start
@@ -79,7 +82,6 @@ _start:
 	movq %rsi, %r12                 /* argv */
 	movq %rdx, %r13                 /* envp */
 
-#ifndef B1NIX_DYNAMIC
 	/* Register the program's .eh_frame with libgcc so its DWARF unwinder can
 	 * find FDEs. This is normally done by frame_dummy() called from _init,
 	 * but the x86_64-b1nix target has no crti.o/crtn.o (so no callable _init)
@@ -89,7 +91,34 @@ _start:
 	 * in uw_init_context_1 and executes ud2 (SIGILL). Replicate frame_dummy:
 	 *   if (&__register_frame_info)
 	 *     __register_frame_info(__EH_FRAME_BEGIN__, &__b1nix_eh_object);
-	 * The weak NULL check makes this a no-op for clang-linked programs. */
+	 * The weak NULL check makes this a no-op for clang-linked programs. Runs for
+	 * dynamic binaries too: their __register_frame_info resolves to the shared
+	 * libgcc_s.so, so this populates the one FDE registry that libgcc_s.so's
+	 * unwinder consults when a throw crosses into libstdc++.so.6. */
+#ifdef B1NIX_DYNAMIC
+	/* Dynamic ET_EXEC: reach the weak/imported symbols through the GOT. A direct
+	 * PC32 leaq against a weak-undefined symbol (e.g. __EH_FRAME_BEGIN__ in a
+	 * plain C binary linked with linker.ld, which never defines it) is rejected by
+	 * lld in -shared/-pie-style links; the GOT slot is simply 0 there and the NULL
+	 * check below skips the call.
+	 *
+	 * Use __register_frame (single arg, allocates its own bookkeeping object via
+	 * malloc) rather than __register_frame_info: libc.so.1 exports a *weak no-op*
+	 * __register_frame_info stub (for clang binaries that reference it without
+	 * libgcc), and the in-kernel loader can resolve crt0's import to that stub
+	 * instead of the real one — silently dropping frame registration. __register_frame
+	 * is NOT stubbed in libc, so it binds to the real unwinder: the executable's own
+	 * folded static libgcc (a libstdc++-static binary like the litehtml demo) OR the
+	 * shared libgcc_s.so (a binary linked against the shared libstdc++). The call is
+	 * DIRECT (not via a libc helper) so the reference resolves WITHIN this module —
+	 * a libc helper can't see a static-libgcc binary's hidden/local __register_frame. */
+	movq __register_frame@GOTPCREL(%rip), %rax
+	testq %rax, %rax
+	jz 3f
+	movq __EH_FRAME_BEGIN__@GOTPCREL(%rip), %rdi
+	call *%rax
+3:
+#else
 	leaq __register_frame_info(%rip), %rax
 	testq %rax, %rax
 	jz 3f
@@ -98,6 +127,19 @@ _start:
 	call *%rax
 3:
 #endif
+
+	/* M75: run shared-library constructors (their DT_INIT_ARRAY) before the
+	 * executable's own __init_array. The kernel links dynamic binaries eagerly
+	 * in-kernel and crt0 only walks the executable's __init_array, so a library's
+	 * constructors (e.g. libLLVM.so's 458: X86 target + regalloc cl::opt seeding)
+	 * would otherwise never run, aborting clang's backend. __b1nix_run_dso_init
+	 * reads the kernel's AT_B1NIX_DSO_INIT descriptor table and is a no-op when
+	 * absent (static binaries / no shared-lib ctors). argc/argv/envp stay live in
+	 * rbx/r12/r13 (callee-saved) across the call. */
+	movq %rbx, %rdi
+	movq %r12, %rsi
+	movq %r13, %rdx
+	call __b1nix_run_dso_init
 
 	/* Run ELF .init_array constructors before main(). C++ static
 	 * constructors and __attribute__((constructor)) functions live here;

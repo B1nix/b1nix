@@ -119,41 +119,39 @@ ssize_t pwritev(int fd, const struct iovec *iov, int iovcnt, off_t offset) {
   return r;
 }
 
-/* Real read/write copy loop (b1nix has no zero-copy sendfile syscall). */
+/* M73: sendfile over the kernel SYS_SENDFILE. The kernel reads/writes through a
+ * bounce buffer and, when `offset` is non-NULL, preserves in_fd's own file
+ * offset and writes the advanced position back. */
 ssize_t sendfile(int out_fd, int in_fd, off_t *offset, size_t count) {
-  char buf[16384];
-  size_t total = 0;
-  off_t off = offset ? *offset : 0;
-  while (count > 0) {
-    size_t want = count < sizeof(buf) ? count : sizeof(buf);
-    ssize_t r = offset ? pread(in_fd, buf, want, off) : read(in_fd, buf, want);
-    if (r < 0) return total ? (ssize_t)total : -1;
-    if (r == 0) break;
-    ssize_t w = 0;
-    while (w < r) {
-      ssize_t k = write(out_fd, buf + w, (size_t)(r - w));
-      if (k < 0) {
-        if (offset) *offset = off + w;
-        return (total + w) ? (ssize_t)(total + w) : -1;
-      }
-      w += k;
-    }
-    total += (size_t)w;
-    off += w;
-    count -= (size_t)w;
-    if (r < (ssize_t)want) break;
-  }
-  if (offset) *offset = off;
-  return (ssize_t)total;
+  long r = syscall(SYS_SENDFILE, out_fd, in_fd, offset, count);
+  if (r < 0) { errno = -r; return -1; }
+  return (ssize_t)r;
 }
 
-/* b1nix has no splice (pipe-coupled zero-copy) primitive; report ENOSYS so
- * callers (e.g. Rust std's io::copy) fall back to a userspace copy. */
+/* M73: splice over the kernel SYS_SPLICE (was ENOSYS). Linux requires the
+ * offset of a pipe end be NULL; the kernel honors the same offset semantics. */
 ssize_t splice(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
                size_t len, unsigned int flags) {
-  (void)fd_in; (void)off_in; (void)fd_out; (void)off_out; (void)len; (void)flags;
-  errno = ENOSYS;
-  return -1;
+  long r = syscall(SYS_SPLICE, fd_in, off_in, fd_out, off_out, len, flags);
+  if (r < 0) { errno = -r; return -1; }
+  return (ssize_t)r;
+}
+
+/* M73: copy_file_range over the kernel SYS_COPY_FILE_RANGE. */
+ssize_t copy_file_range(int fd_in, off_t *off_in, int fd_out, off_t *off_out,
+                        size_t len, unsigned int flags) {
+  long r = syscall(SYS_COPY_FILE_RANGE, fd_in, off_in, fd_out, off_out, len,
+                   flags);
+  if (r < 0) { errno = -r; return -1; }
+  return (ssize_t)r;
+}
+
+/* M73: statx over the kernel SYS_STATX. */
+int statx(int dirfd, const char *pathname, int flags, unsigned int mask,
+          struct statx *statxbuf) {
+  long r = syscall(SYS_STATX, dirfd, pathname, flags, mask, statxbuf);
+  if (r < 0) { errno = -r; return -1; }
+  return 0;
 }
 
 /* b1nix has no synchronous signal-wait primitive. Report ENOSYS (sigwait

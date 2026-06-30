@@ -97,6 +97,17 @@ struct cpu_context {
 #define SIGPWR 30
 
 #define NSIG 31
+
+/* M74 POSIX real-time signals. The standard signals above occupy 1..30 (the
+ * in-struct sigactions[31] array and pending/blocked bits 0..30). RT signals
+ * SIGRTMIN..SIGRTMAX use the still-free upper bits 31..62 of the u64 masks; their
+ * sigactions and a FIFO of queued (signo, sigval) payloads live in side-tables
+ * (struct task cannot grow — the M29 LAPIC page-table invariant), so the 1..31
+ * delivery path is left byte-identical and RT is handled additively. */
+#define SIGRTMIN 32
+#define SIGRTMAX 63
+#define NSIG_MAX 63
+#define SIG_IS_RT(s) ((s) >= SIGRTMIN && (s) <= SIGRTMAX)
 #define SCHED_MAX_FDS 64
 #define SCHED_MAX_FD_LIMIT 1024
 
@@ -156,6 +167,14 @@ struct sigaction {
   u64 sa_flags;
   void (*sa_restorer)(void);
   u64 sa_mask; /* signals to block during handler */
+};
+
+/* M74: RT-signal payload (POSIX union sigval), carried by sigqueue and by a
+ * SIGEV_SIGNAL timer's sigev_value and delivered to an SA_SIGINFO handler as
+ * siginfo->si_value. */
+union sigval {
+  int sival_int;
+  void *sival_ptr;
 };
 
 typedef unsigned long rlim_t;
@@ -287,6 +306,11 @@ u64  task_saved_sigmask(const struct task *t);
 int  task_has_saved_sigmask(const struct task *t);
 void task_set_saved_sigmask(struct task *t, u64 mask, int has_saved);
 void task_clear_saved_sigmask(struct task *t);
+/* M63: seccomp filter chain + no_new_privs (side-table backed, see seccomp.c). */
+void *task_seccomp_filter(const struct task *t);
+void  task_set_seccomp_filter(struct task *t, void *f);
+int   task_no_new_privs(const struct task *t);
+void  task_set_no_new_privs(struct task *t, int v);
 /* sigaltstack side-table (per-task, NOT a struct task field). */
 void task_get_altstack(const struct task *t, kstack_t *out);
 int  task_set_altstack(struct task *t, const kstack_t *ss);
@@ -392,8 +416,15 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks);
 /* Monotonic scheduler tick counter (10 ms cadence). */
 u64 scheduler_get_ticks(void);
 void scheduler_wait_prepare(void *chan);
+void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks);
 void scheduler_wait_commit(void);
 void scheduler_wait_cancel(void);
+/* True when the current context may park on a wait channel (scheduler live, real
+ * task context, interrupts enabled). Drivers fall back to polling when false. */
+int scheduler_can_block(void);
+/* Kernel CSPRNG-ish entropy source (rdrand, xorshift64* fallback). Shared by
+ * SYS_GETRANDOM and the M71 ASLR load-base randomizer. */
+u64 kernel_random_u64(void);
 void scheduler_wake_task(usize task_id);
 void scheduler_wake_all(void *chan);
 void scheduler_notify_wait_event(usize parent_id);
@@ -437,6 +468,31 @@ int scheduler_kill_all(int sig);
 int scheduler_sigaction(int sig, const struct sigaction *act,
                         struct sigaction *old);
 int scheduler_sigprocmask(int how, const u64 *set, u64 *oldset);
+/* M74: queue an RT signal (SIGRTMIN..SIGRTMAX) with a payload to a task. Unlike
+ * scheduler_kill, repeated calls QUEUE (do not coalesce): each enqueues a
+ * (signo, value) entry delivered FIFO, lowest signo first. si_code is SI_QUEUE
+ * for sigqueue(3) or SI_TIMER for a POSIX timer. Returns 0, -EAGAIN if the
+ * per-task RT queue is full, -EINVAL/-ESRCH otherwise. */
+int scheduler_sigqueue(usize task_id, int sig, union sigval value, int si_code);
+/* RT-signal delivery helpers, called from the arch signal path (interrupts off):
+ * dequeue the oldest queued instance of `sig` (FIFO) and look up its handler. */
+int scheduler_rt_dequeue_current(int sig, int *si_code, union sigval *value,
+                                 int *more);
+struct sigaction *scheduler_rt_action_current(int sig);
+/* siginfo si_code origins (POSIX). */
+#define B1NIX_SI_USER 0
+#define B1NIX_SI_QUEUE (-1)
+#define B1NIX_SI_TIMER (-2)
+
+/* M74 POSIX per-process timers (timer_create/settime/gettime/delete). Times are
+ * in scheduler ticks (100 Hz). On expiry the timer queues `signo` (an RT signal
+ * carries `value` as si_value). */
+int scheduler_timer_create(int signo, union sigval value);
+int scheduler_timer_settime(int id, u64 first_ticks, u64 interval_ticks,
+                            u64 *old_remaining, u64 *old_interval);
+int scheduler_timer_gettime(int id, u64 *remaining, u64 *interval);
+int scheduler_timer_delete(int id);
+void scheduler_timer_cleanup_task(usize task_id);
 void scheduler_deliver_pending_signals(void);
 int  scheduler_signal_pending(void);
 /* M56 signalfd helpers. */

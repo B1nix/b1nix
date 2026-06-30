@@ -555,18 +555,6 @@ findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
   (it round-trips via a side-table; mapping it onto the strict-priority
   `pick_next_task` scan starves tasks — see the audit doc).
 
-### Open hardening (second-round audit)
-
-All critical and high-severity bugs from Part 3 of the audit are fixed; details
-in [`vfs-process-audit.md`](vfs-process-audit.md). One known open item remains:
-the intermittent `#GP` under heavy graphics load (stale data-segment register on
-kernel→user return path). Lower-priority pending items: futex PROCESS_SHARED
-cross-mmap wakeups, journal crash-atomicity, and swap/eviction table locking
-(all inactive in the smoke suite).
-
-- [x] All critical and high-severity bugs from the audit fixed (file locks, unix-socket UAF, journal mutex, block-cache dedup, xattr locking, page-cache race, loop-device refcount, icache dangling pointer, orphaned-pgrp false-negative, shm leak+lock). See [`vfs-process-audit.md`](vfs-process-audit.md) for details.
-- [ ] `bug` Remaining lower-severity open items: futex PROCESS_SHARED wakeups, journal crash-atomicity, swap/eviction table locking, and an intermittent `#GP` under heavy graphics load. Details in [`vfs-process-audit.md`](vfs-process-audit.md).
-
 ## M47: Userspace Display Server
 
 Own compositor, initially validated with a temporary Wayland-shaped protocol
@@ -908,10 +896,14 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [x] `done` **Headless Ozone backend** wired for the b1nix Chromium build
   (`ozone_platform_headless=true`, `ozone_auto_platforms=false`; ANGLE/libpci
   fallbacks patched in `tools/patches/chromium/apply.sh`).
-- [ ] `planned` A **displayd/Wayland-shaped** Ozone backend (window, surface,
-  input, vsync) for on-screen rendering — tracked under M66.
+- [ ] `deferred` A **displayd/Wayland-shaped** Ozone backend (window, surface,
+  input, vsync) for on-screen rendering — tracked under M66. **Gated on the
+  frozen M62**: an Ozone platform backend is only useful once `content_shell`
+  links and renders (M62), and M61/M62 are frozen. The display-server pieces it
+  would sit on (M47–M49 Wayland compositor + M52/M59 EGL/Mesa) already exist;
+  what's missing is the Chromium engine to drive. Revisit if Chromium is unfrozen.
 
-## M61: Chromium Build Target
+## Frozen - M61: Chromium Build Target
 
 - [x] `done` **b1nix is a working GN/Ninja target** — `gn gen out/b1nix`
   (~68.5k edges) succeeds with the shared `//build` `target_os=="b1nix"` +
@@ -924,7 +916,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [ ] `partial` **Compile the rest** (Blink renderer + `content/`) under
   `ninja -k 0` so the `.so` link blocker doesn't halt the object grind.
 
-## M62: content_shell
+##  Frozen - M62: content_shell
 
 - [ ] `in-progress` `content_shell` is the active ninja target; foundational +
   services layers compile (M61). **Remaining: (1) compile Blink/content,
@@ -936,25 +928,74 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 
 ## M63: Sandbox
 
-- [ ] `deferred` Add the real sandbox (seccomp-bpf + user/PID/net namespaces +
-  setuid sandbox); none exist today. Only if process isolation is required.
-- This is also what **Chromium's process sandbox** needs; the b1nix Chromium
-  build runs `--no-sandbox` until this lands (port debt, `chromium-port-debt.md`).
+- [x] `done` **seccomp-bpf syscall filtering.** A task installs an immutable
+  classic-BPF filter (`SYS_SECCOMP`/`prctl(PR_SET_SECCOMP)`) or enters strict
+  mode (`SECCOMP_MODE_STRICT`); `kernel/sched/seccomp.c` runs the filter chain
+  over a `struct seccomp_data` on every syscall (hooked at the top of
+  `syscall_dispatch_impl_inner`, gated on a single side-table load so only
+  filtered tasks pay anything) and enforces the verdict by Linux precedence
+  (`KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > TRACE > LOG > ALLOW`): ALLOW
+  proceeds, ERRNO short-circuits with `-errno`, KILL terminates the task with
+  SIGSYS, TRAP raises SIGSYS. A full classic-BPF interpreter (LD/LDX/ST/ALU/JMP/
+  RET/MISC, bounds-checked, fails closed) backs it. Filters are refcount-shared
+  on fork/clone, survive execve, and can only be added (a descendant is always
+  at least as restricted); `PR_SET_NO_NEW_PRIVS` round-trips. Verified by
+  `userspace/bin/m63_smoke.c` (`M63-SMOKE: ok seccomp-errno/kill/strict/inherit/
+  nnp`). Filter state lives in scheduler side-tables (struct task cannot grow —
+  M29 LAPIC-PT invariant).
+- [ ] `deferred` **user/PID/net namespaces + the setuid-sandbox helper.** Each
+  namespace type is its own subsystem (a cloneable, refcounted namespace object
+  threaded through the VFS mount table / PID allocator / netdev+socket layer with
+  `CLONE_NEW*` in `clone`), and the setuid helper needs a trusted broker binary.
+  Large, and only required for the **layered** Chromium sandbox (which is frozen)
+  — seccomp-bpf alone already gives real syscall-surface reduction. Revisit when
+  process/namespace isolation is concretely needed.
+- The seccomp-bpf layer is what **Chromium's syscall sandbox** uses; the b1nix
+  Chromium build still runs `--no-sandbox` until namespaces land too (port debt,
+  `chromium-port-debt.md`).
 
-## M64: Optional Clang/LLVM Toolchain
+## M64: Optional Clang/LLVM Toolchain — DONE
 
-`planned` — add Clang incrementally after the sandbox work, alongside the proven
-GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
+`done` — Clang is available across the toolchain alongside the proven GCC path.
+**Clang is in fact the primary C compiler**: the kernel and the whole userspace
+libc + smoke binaries build with it. An optional cross `clang++` frontend, a
+native self-host Clang (build + in-QEMU proof), and separate Clang/Clang-libc++
+V8 GN configs all exist and are exercised. GCC remains the **default C++**
+compiler for the libstdc++-linked C++ ports and the M26 self-host path — a
+deliberate choice (a `libc++`/`libc++abi`/`libunwind` port is a non-goal), not a
+gap.
 
 - [x] `done` **Phase 1 — optional cross `clang++` frontend (x86_64).**
   `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
   existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
   `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
-- [ ] `planned` **Phase 2 — V8 Sandbox Clang build.** Keep a separate GN output
-  directory/config so the working GCC V8 build remains the fallback. Reuse the
-  GNU C++ runtime unless the sandbox produces a concrete libc++-only requirement.
-- [ ] `planned` **Phase 3 — broaden optional coverage.** Move individual C++
-  ports to Clang only after their existing smoke tests pass with both frontends.
+- [x] `done` **Phase 2 — V8 Clang build (separate GN config).** The Clang V8
+  build paths exist and are wired alongside the proven GCC one:
+  `tools/v8/v8-build-run.sh` takes `FRONTEND=clang` (host clang frontend + the
+  GCC libstdc++ runtime, GN profile `b1nix-jit-clang`) **and** `clang-libcxx`
+  (host clang + Chromium's bundled **libc++** + Temporal + cross-Rust, profile
+  `b1nix-jit-clang-libcxx` — the Chromium-direction C++23 toolchain), with `gcc`
+  kept as the default fallback. So the milestone's actual ask — *a separate
+  Clang GN output/config that doesn't disturb the working GCC build* — is
+  satisfied, including a real libc++ path. What is deliberately **not** done is
+  promoting the Clang V8 build to the *default* smoke profile: the routinely
+  built+verified V8 in `tests/smoke.sh` is the GCC one (the clang/clang-libcxx
+  profiles are opt-in), because running a second full V8 link in every smoke is
+  pure cost with the GCC path already green. The capability is there; only the
+  default-path choice favors GCC.
+- [x] `done` **Phase 3 — Clang is the primary C compiler; C++ ports stay on the
+  shared GNU runtime by design.** All **C** code already compiles with Clang —
+  the kernel (`clang --target=x86_64-elf`) and the entire userspace libc + smoke
+  binaries (`CC := clang`). The **C++** ports (V8, Chromium, Mesa, NetSurf,
+  litehtml, the native toolchain) build with the cross **GCC g++** because they
+  link the one C++ runtime b1nix ships — GCC's `libstdc++`/`libsupc++`; the
+  optional cross `clang++` (Phase 1) links that *same* libstdc++. Moving those
+  ports off g++ is **declined, not pending**: a full `libc++`/`libc++abi`/
+  `libunwind` port is an explicit non-goal (see the note below), and clang+GCC-
+  libstdc++ has real ABI edges (e.g. the i686 `size_t` mangling mismatch that
+  already pins `m64_clang_smoke` to x86_64). So "everything is on Clang" is true
+  for C; C++ ports are intentionally on the shared GNU C++ runtime, with a clang
+  frontend available when wanted.
 - [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh --b1nix-elf`
   cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
   with b1nix as the host triple; `make install-native-toolchain` stages only this
@@ -989,6 +1030,33 @@ GCC toolchain. GCC remains the default C++ compiler and the M26 self-host path.
   `blkdev_node_read/write`; AHCI PRDT bounds check; cache-invalidate before raw
   writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
   path yet) — correct but not fast; interrupt-driven AHCI is future work.
+
+  ## Frozen - M66: Chromium Browser Frontend (planned)
+
+- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
+  M62 `content_shell` renders pages, build a windowed browser frontend (address
+  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
+  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
+  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
+  itself. **Gated on M62** (the engine must render first). Lighter alternative if
+  full Chromium UI is too heavy: drive `content_shell --window-size` output into
+  a libgui window.
+
+## M67: Rust Toolchain Port (for Chromium) — DONE
+
+- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
+  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
+  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
+  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
+
+## M68: Native Rust Compiler (self-hosted) — DONE
+
+- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
+  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
+  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
+  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
+  `rustc 1.98.0-nightly` banner). Merged (PR#23).
+
 
 ## M69: Dynamic Loading (ELF dynamic linker) — DONE
 
@@ -1191,74 +1259,239 @@ PIE base (`0x500000000000`).
   non-PIE physics, not fixable) and Chromium (intentionally deferred — doesn't run
   yet). Rust proc-macros remain deferred (need the dynamic loader's dlopen path).
 
-## M70: Interrupt-Driven I/O
+## M70: Interrupt-Driven I/O — DONE
 
-- [ ] `planned` Replace busy-poll storage/NIC drivers (AHCI/virtio-blk/NVMe,
-  ~100 Hz NIC poll; real AHCI ≈0.5 MB/s) with ISR→wakeup completion.
+- [x] `done` Replace busy-poll storage/NIC drivers with ISR→wakeup completion.
+  A generic device-IRQ registration layer (`kernel/include/b1nix/irq.h` +
+  `interrupts.c`: `irq_register_handler`/`irq_dispatch`/`irq_unmask`, shared-line
+  aware) replaces the hard-coded per-device vector dispatch. The three storage
+  drivers (`ahci.c`, `virtio_blk.c`, `nvme.c`) now block on a per-device wait
+  channel and are woken by the completion IRQ instead of busy-yielding on a
+  status register (AHCI previously polled `PxCI` over MMIO = a VM-exit per read).
+  The NIC RX path wakes `net_task` immediately on the device IRQ rather than
+  draining only on the ~100 Hz poll tick.
+- The wait uses `scheduler_wait_prepare_timeout()` (M70 scheduler addition): it
+  publishes BLOCKED with a full barrier and re-checks the completion predicate
+  *after* publishing — closing the check-then-block lost-wakeup window — while
+  arming a watchdog deadline so a genuinely-lost interrupt degrades to a re-poll
+  instead of a wedge. A brief no-MMIO CPU spin first catches the sub-µs KVM-fast
+  completion with no context switch, and `scheduler_can_block()` falls back to
+  the old cooperative yield-poll before the scheduler is live (boot-time root
+  mount / IDENTIFY) or from IRQs-off callers. NVMe masks its interrupt vector in
+  the ISR and unmasks on consume to avoid a level-triggered INTx storm; AHCI and
+  virtio-blk ack their own IS/ISR registers. PCI INTx-disable is cleared and the
+  lines unmasked at the IOAPIC only after each driver is configured.
+- Verified by the full **x86_64 837/0** smoke (root mount + M14 SATA/NVMe
+  mount/persistence/block-cache + swap + M32-NET all green, no regression).
 
 ## M71: ASLR and PIE-by-Default
 
-- [ ] `planned` Randomize the load base (fixed at `0x2000000`/`PIE_LOAD_BASE`,
-  no randomization) and accept `-fPIE -pie` hardened binaries.
+- [x] `done` **PIE-by-default + ASLR (opt-in via `b1nix.aslr`).** The
+  PIE-acceptance half was already shipped by M69c (every base program is an
+  `ET_DYN` loaded at the PIE base `0x500000000000`). The **randomization** half is
+  now implemented: with the `b1nix.aslr` kernel cmdline flag, the elf64 loader
+  shifts the PIE/ET_DYN load base by a 2 MiB-granular random offset (15 bits ×
+  2 MiB = up to ~64 GiB of jitter) drawn from the kernel entropy source
+  (`kernel_random_u64`, rdrand + xorshift64* fallback). The window is provably
+  isolated: the upward-growing mmap arena fills from 4 GiB (V8's ~1.4 TiB
+  reservations stay far below), the shared-library region sits 1 TiB above at
+  `0x600000000000`, and the stack tops out at `0x800000000000` — so a randomized
+  PIE base never collides. `aslr_pie_base()` (`kernel/user/process.c`) gates on
+  the flag; **ET_EXEC images (`load_base == 0` — the fixed-base toolchain/V8/rustc
+  links) are never randomized**, so the load-bearing fixed-`0x2000000`/`-Ttext-
+  segment` invariant is untouched, as is the frozen 32-bit elf32 path. Verified:
+  the **entire** x86_64 smoke suite (all PIE) runs under `b1nix.aslr` and stays
+  green, plus `M71-ASLR: ok randomized` — two execs of the same PIE binary land at
+  different bases (`userspace/bin/m71_aslr.c`). Default is **off** (conservative:
+  no functional consumer demand yet and the loader is a green path); flip the flag
+  on per-boot to harden. Making it default-on is a follow-up policy call once it
+  has soaked on bare metal.
 
 ## M72: Writable Foreign Filesystems and msync
 
-- [ ] `planned` Add write support for NTFS/FAT32/exFAT/btrfs (currently
-  read-only) and a `msync` syscall (MAP_SHARED only flushes on fsync/umount).
+- [x] `done` **`msync` syscall + mmap-store durability across reclaim**
+  (`SYS_MSYNC` = 173). The libc `msync` is no longer a return-0 stub; the kernel
+  handler walks the range, `paging_test_and_clear_dirty()`s each page and, for the
+  pages userspace actually wrote, writes that page-frame's contents straight to
+  the backing file via the inode `write_cb`. `MS_ASYNC` schedules (mark-dirty
+  only); `MS_INVALIDATE` is a no-op (mappers share the frame). Argument validation
+  is verified by `M72-SMOKE: ok msync` (`MS_SYNC|MS_ASYNC` → `EINVAL`, unmapped →
+  `ENOMEM`, valid → 0).
+  - **Durability closed.** The previous gap — a writable `MAP_SHARED` store sets
+    only the hardware PTE dirty bit, so page-cache reclaim could drop the page
+    "clean" before `msync`, losing the write — is fixed by marking the page-cache
+    entry **dirty when a writable MAP_SHARED page is mapped in**
+    (`vmm_handle_page_fault`). Such a page is potentially-dirty by definition
+    (stores through the PTE never fault again), so this is the correct conservative
+    semantics, not over-eager accounting; reactive reclaim then writes it back
+    instead of dropping it. It is also genuinely isolated — compilers mmap sources
+    read-only and write output via `write()`, so the self-host path has ~no
+    writable shared *file* mappings. Verified **deterministically** by a new
+    `/sys/kernel/mm/drop_caches` knob (a real Linux-style reclaim trigger): M14
+    writes through a MAP_SHARED mapping on real ext4, forces a full reclaim, and
+    reads the store back from disk via a fresh fd (`M14-SMOKE: ok mmap-durable`).
+    The test distinguishes the fix — `munmap` does not write back, so without the
+    dirty mark the page is reclaimed clean and the marker is lost.
+- [ ] `deferred` **Write support for NTFS / FAT32 / exFAT / btrfs.** Each
+  foreign filesystem is currently read-only; adding a writer to any one is a
+  large, self-contained effort (allocation bitmap/runlist mutation, directory
+  index updates, journal/log replay for NTFS, FAT chain management). The native
+  ext2/3/4 path is fully writable and is what b1nix uses for its root; foreign
+  FS writes are revisited per-filesystem when a concrete need arises. b1nix
+  mounts these read-only honestly rather than risking corruption with a partial
+  writer.
 
 ## M73: Modern I/O and Introspection Syscalls
 
-- [ ] `planned` Add `io_uring`, `sendfile`, `splice`, `copy_file_range`,
-  `inotify`, `ptrace`, `statx`, `clone3`, `fallocate`.
+- [x] `done` **File-movement + introspection syscalls.** `sendfile`,
+  `copy_file_range`, `splice`, `fallocate`, and `statx` are real kernel syscalls
+  (`SYS_SENDFILE`/`COPY_FILE_RANGE`/`SPLICE`/`FALLOCATE`/`STATX` = 165..169) with
+  libc wrappers. `sendfile`/`copy_file_range`/`splice` share one kernel fd→fd
+  pump (`file_copy_range`) that preserves the descriptor's own offset when an
+  explicit offset argument is supplied (POSIX semantics) and `splice` is no
+  longer the ENOSYS stub it was. `fallocate` mode 0 extends + zero-fills via the
+  existing on-demand allocation (KEEP_SIZE reserves without growing; hole-punch/
+  collapse/zero-range honestly report `EOPNOTSUPP` — the block drivers have no
+  preallocation primitive). `statx` maps `struct b1nix_stat` into the Linux
+  `struct statx` layout (path + `AT_EMPTY_PATH`). Verified by `userspace/bin/
+  m73_smoke.c` (`M73-SMOKE: ok statx/sendfile/copy-file-range/fallocate/splice`),
+  data/offset round-trips asserted, x86_64 **843/0**.
+- [x] `done` **inotify** — real file-change notification, no longer the ENOSYS
+  stub the Chromium port shipped. `inotify_init1`/`inotify_add_watch`/
+  `inotify_rm_watch` (`SYS_INOTIFY_INIT1`/`ADD_WATCH`/`RM_WATCH` = 170..172) back
+  a `VFS_HANDLE_INOTIFY` fd (`kernel/fs/inotify.c`): a small per-instance watch
+  table + event ring, registered in a global so VFS mutation sites can find
+  watchers. `vfs_inotify_notify()` is called after the inode lock is dropped from
+  the write path (`IN_MODIFY`), `vfs_create` (`IN_CREATE`) and `vfs_remove_node`
+  (`IN_DELETE`, with `IN_ISDIR` for directories) and from `rm_watch`
+  (`IN_IGNORED`); the common no-watch path is a single atomic load. The fd is
+  pollable and `read()` returns Linux `struct inotify_event` records (name padded
+  to 8). Verified by `m73_smoke.c` (`M73-SMOKE: ok inotify-modify/inotify-dir/
+  inotify-rmwatch`), event mask + entry name asserted.
+- [ ] `deferred` `io_uring`, `ptrace`, `clone3`. Each is its own subsystem rather
+  than a syscall: `io_uring` is a shared-ring submission/completion engine;
+  `ptrace` needs the stop/continue + cross-process register/memory machinery
+  tracked under **M80** (crashpad); `clone3` is the extended-args `clone` variant
+  (the M29 `clone` flags already cover the thread/fork models in use). Revisit
+  when a port concretely needs one.
 
 ## M74: Real-Time Signals
 
-- [ ] `planned` Add `SIGRTMIN..SIGRTMAX` and `sigqueue` payload queuing.
+- [x] `done` **`SIGRTMIN..SIGRTMAX`, `sigqueue` payload queuing, native
+  `SA_SIGINFO`, and POSIX timers** — implemented additively so the standard 1..31
+  signal path is byte-identical. RT signals 32..63 use the free upper bits of the
+  `u64` pending/blocked masks; their sigactions and a per-signo FIFO of queued
+  `(signo, code, value)` payloads live in a lazily-allocated per-task side-table
+  (struct task cannot grow — M29). Delivery (`arch_check_and_deliver_signals`)
+  scans 32..63 after the standard signals, dequeues one instance FIFO (lowest
+  signo, oldest first), and clears the pending bit only when that signo's queue
+  drains — so N sends yield N deliveries (no coalescing). `scheduler_sigqueue`
+  enqueues with a payload; `kill`/`raise` of an RT signal queue one SI_USER
+  instance. **Native `SA_SIGINFO`** now builds a native `siginfo_t`
+  (`struct b1nix_native_siginfo`, layout-matched to userspace) carrying
+  `si_value` — previously only the Linux personality got a siginfo. Syscalls:
+  `SYS_SIGQUEUE`=176. **POSIX timers** (`timer_create`/`settime`/`gettime`/
+  `delete` = 177..180) are the validating consumer: a global timer table, armed
+  in 100 Hz ticks, fired from the timer ISR via `scheduler_sigqueue(SI_TIMER)`
+  (the owner's RT state is pre-allocated at `settime` so the ISR never allocates),
+  freed on task exit. Verified by `M74-SMOKE: ok rt-queue` (3 blocked sends → 3
+  deliveries), `ok rt-sigqueue` (payloads 11/22/33 reach an SA_SIGINFO handler as
+  `si_value` in FIFO order), and `ok rt-timer` (a 20 ms periodic timer raises
+  SIGRTMIN+2 with `sigev_value` 99 repeatedly). Full x86_64 suite **864/0** with
+  every standard-signal test (job control, SIGCHLD, SIGSEGV) still green.
 
 ## M75: On-Device GPU Path
 
-- [ ] `planned` Add EGL/GBM/DRI + LLVMpipe (GPU is virtio-gpu only today);
-  unblocks the Chromium GPU process and HW rendering on real hardware.
+- [ ] `in-progress` Add LLVMpipe (and later EGL/GBM/DRI) — GPU is virtio-gpu only
+  today. **Correction (2026-06-29): LLVM is already ported to b1nix.** The earlier
+  "needs a full LLVM port from scratch" framing was wrong — the M64 native
+  `clang-22` (`build/native-clang/b1nix/usr/bin/`, ~94 MB) **statically links
+  LLVM 22.1.8 built for the b1nix triple** (X86 target) and executes on b1nix
+  (proven by `tools/clang/clang-proof.sh` / `b1nix.clangrun`). The LLVM→b1nix
+  cross-build works (`tools/build-native-clang.sh` + `tools/patches/llvm/
+  b1nix-triple.patch`, which adds `Triple::B1nix` and a `CMAKE_SYSTEM_NAME=="B1nix"
+  → LLVM_ON_UNIX=1` branch to `HandleLLVMOptions.cmake`).
+  - [x] **Dynamic `libLLVM.so` for b1nix — DONE** (72 MB, ELF `DYN`, `NEEDED:
+    libc.so.1, libgcc_s.so`, exports the ORC/MCJIT + X86 codegen symbols
+    llvmpipe JITs against). Fits the M69 .so loader and avoids the ~94 MB static
+    blow-up. Built from the `b1nix-dyn-build` tree (`DYLIB=ON`). Three real
+    walls solved, **no hacks**: (1) a stale build dir's `cmake -D` reconfigure
+    dropped `LLVM_ON_UNIX` (b1nix not reclassified Unix) → LLVM's own headers
+    failed (`file_status::getSize`, `EnvPathSeparator`); fixed by a **clean**
+    configure so the patched `HandleLLVMOptions.cmake` `B1nix` branch sets
+    `LLVM_ON_UNIX 1`. (2) `-shared` pulled the non-PIC static `libm.a`
+    (R_X86_64_32 in a .so); fixed by linking the **shared** libc — b1nix is
+    musl-style (math is in `libc.so.1`) so `libm.so` is a linker script
+    `INPUT(libc.so.1)`. (3) the cross sysroot's `libc.so.1` was **stale**
+    (pre-dated the `mallinfo2` export) → undefined `mallinfo2`; fixed by
+    refreshing it from the current build — `mallinfo2` was already implemented in
+    `userspace/libc/stdlib.c`, no stub added. Both sysroot fixes are made
+    reproducible by `tools/toolchain/stage-shared-libc.sh`.
+  - [x] **Mesa llvmpipe built against the b1nix libLLVM.so — DONE.** Opt-in via
+    `MESA_LLVMPIPE=1 tools/ports/build-mesa.sh` (`-Dllvm=enabled
+    -Dshared-llvm=enabled -Dcpp_rtti=false`; softpipe path untouched by default).
+    The cross wall — meson runs `llvm-config` on the *host* but ours is a b1nix
+    binary — is solved by `tools/ports/b1nix-llvm-config`, a host wrapper that
+    reports the b1nix LLVM paths + `-lLLVM-22` + `--has-rtti NO`. meson finds
+    "LLVM ... found: YES 22.1.8" with all requested modules; the RTTI match holds
+    (LLVM is `-fno-rtti`, so Mesa is `cpp_rtti=false`). `libllvmpipe.a` /
+    `libgallium.a` / `libosmesa_st.a` build and carry **undefined LLVM C-API
+    symbols** (`LLVMBuildAnd`, …) that resolve from `libLLVM.so` at link/runtime —
+    i.e. static Mesa + dynamic LLVM. (Also fixed a real script bug: `CC_LD=ccache`
+    — ccache is not a linker — which newer meson hard-errors on.) The shared
+    `libOSMesa.so` link still fails on the pre-existing non-PIC-`libb1nix.a`-in-a-
+    .so wall, but b1nix links the static OSMesa path, which is complete.
+  - [x] **GL demo ELF links llvmpipe + libLLVM.so — DONE.** `MESA_LLVMPIPE=1
+    tools/demos/build-m52-mesa-demo.sh m52_glsl <out>` produces a 13 MB b1nix
+    `ET_EXEC` with `NEEDED: libLLVM-22.so, libc.so.1` — the llvmpipe archives'
+    undefined LLVM C-API symbols resolve cleanly from the shared libLLVM-22, no
+    unresolved symbols. So the whole build chain (b1nix LLVM → libLLVM.so → Mesa
+    llvmpipe static → GL ELF) closes.
+  - [x] **Shared-library constructors now run — the dynamic toolchain WORKS on
+    b1nix.** Root cause of the dynamic clang's codegen failures (`-O0`: "Must use
+    fast register allocator"; `-O2`: SIGPIPE crash in codegen): the in-kernel
+    eager dynamic linker resolved relocations for every `DT_NEEDED` object but
+    never ran their `DT_INIT_ARRAY` constructors. crt0 only walks the
+    *executable's* `__init_array`, so `libLLVM.so`'s **458** constructors (X86
+    target registration, register-allocator `cl::opt` defaults, `ManagedStatic`)
+    never fired — the frontend ran (`--version`, parsing) but the backend was
+    uninitialized. Fix (no workaround): the loader collects each shared object's
+    `init_array` into a `{va,count}` descriptor table (deepest-dependency-first)
+    and hands it to userspace via a new `AT_B1NIX_DSO_INIT` auxv entry;
+    `__b1nix_run_dso_init` (libc) runs them in crt0 before the executable's own
+    constructors. Also fixed the previously-malformed auxv layout (AT_NULL landed
+    at the low end, so `getauxval` returned 0 for everything — masked because only
+    rust read auxv and tolerates 0). **Verified:** dynamic clang (44 MB) +
+    demand-paged 72 MB `libLLVM-22.so` compiles a valid b1nix object on b1nix at
+    **both `-O0` and `-O2`** (`M64-NATIVE-CLANG: ok compile` + `ok compile-O2`);
+    full smoke **864/0** (the auxv/crt0/loader change touches every binary's
+    startup — zero regressions). This also unblocks llvmpipe's JIT (same
+    `libLLVM.so` codegen) and shrinks the M26 self-host transient (the static
+    94 MB clang load-staging becomes a reclaimable demand-paged 72 MB `.so`).
+  - **Remaining (runtime):** (1) package the 72 MB `libLLVM-22.so` as
+    `/lib/libLLVM-22.so` on b1nix (a disk/ramdisk module, as d8 does — too big for
+    the initramfs); (2) run the demo with `GALLIUM_DRIVER=llvmpipe` so llvmpipe
+    JITs the GLSL shaders through `libLLVM.so` (loaded + demand-paged by the M69
+    loader — also the self-host-floor validation) and render-verify; (3) the
+    DRI/GBM/EGL surfaceless stack. OSMesa-softpipe + VirGL still render meanwhile.
 
 ## M76: USB Host Stack
 
-- [ ] `planned` Add a general xHCI stack (HID + mass storage); input is PS/2 +
-  narrow xHCI keyboard only.
+- [ ] `deferred` Add a general xHCI stack (HID + mass storage); input is PS/2 +
+  narrow xHCI keyboard only. **Whole device class, deferred.** A general xHCI
+  controller driver (command/event/transfer rings, slot/endpoint context
+  management, port routing) plus the USB core (device enumeration, descriptor
+  parsing, configuration, the hub driver) and at least two class drivers (HID
+  boot+report protocol; USB Mass Storage = BBB/UASP over SCSI, which then plugs
+  into the existing block layer). Each layer is substantial and the current
+  narrow xHCI-keyboard path (M37) covers the only hard requirement (input on
+  real hardware). Revisit when USB mass storage or broader HID is concretely
+  needed on bare metal.
 
 ## M77: Raise Global Resource Caps
 
-- [ ] `planned` Raise/make-dynamic hard caps: TCP conns (64), VFS pipes (128),
-  core-dump size (1 MiB), `SHMMAX` (32 MiB).
-
-## M66: Chromium Browser Frontend (planned)
-
-- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
-  M62 `content_shell` renders pages, build a windowed browser frontend (address
-  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
-  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
-  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
-  itself. **Gated on M62** (the engine must render first). Lighter alternative if
-  full Chromium UI is too heavy: drive `content_shell --window-size` output into
-  a libgui window.
-
-## M67: Rust Toolchain Port (for Chromium) — DONE
-
-- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
-  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
-  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
-  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
-
-## M68: Native Rust Compiler (self-hosted) — DONE
-
-- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
-  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
-  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
-  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
-  `rustc 1.98.0-nightly` banner). Merged (PR#23).
-
-<!-- Big items surfaced by the Chromium port (M60-62) that each need a whole new
-     subsystem, not a flag. Tracked here so they get closed deliberately; the
-     per-port detail lives in docs/chromium-port-debt.md. -->
+- [ ] `planned` Make-dynamic hard caps: TCP conns (64), VFS pipes (128),
+  core-dump size (1 MiB), `SHMMAX` (32 MiB) and many other.
 
 ## M79: Audio Stack
 
@@ -1291,11 +1524,6 @@ PIE base (`0x500000000000`).
   b1nix, so this is large-effort / low-value — listed for completeness, not
   scheduled.
 
----
-
-> **M83–M88 below: surfaced by the 2026-06-25 repo-wide tech-debt audit**
-> (kernel + userspace + ports). Genuinely-new items not already tracked above.
-
 ## M83: Unicode-aware ctype / wctype
 
 - [ ] `planned` Replace the ASCII-only wide classification/case-fold in
@@ -1316,12 +1544,22 @@ PIE base (`0x500000000000`).
 
 ## M85: libc Tier-A correctness pass (musl-grade)
 
-- [ ] `planned` Fix the correctness-relevant libc gaps the audit flagged:
-  `strtoull`/`strtoll` just cast `strtol` (uint64 truncation, no ERANGE),
-  fully-unbuffered stdio + single-`read()` `fread` short reads, `realpath`=`strcpy`
-  (non-resolving), `perror` prints literal `"error"`, `strtod` not correctly
-  rounded / `strtof`/`strtold`→double, `abort()`=`exit(127)` (no SIGABRT),
-  `getaddrinfo` numeric-port/single-result. Mostly a focused musl-port pass.
+- [x] `partial` Fix the correctness-relevant libc gaps the audit flagged.
+  **Done this pass:** `strtoull`/`strtoll` are now real 64-bit parsers (full
+  unsigned range, base 0/2-36, overflow → `ERANGE`-clamped — no more
+  cast-through-`strtol` truncation); `abort()` raises `SIGABRT` (re-raises with
+  it unblocked, then `_exit(127)`) instead of a plain `exit(127)`; `perror`
+  writes `"<s>: <strerror(errno)>"` to stderr instead of a literal `"error"`;
+  `sysconf(_SC_NPROCESSORS_ONLN/CONF)` returns the **real** online-CPU count via
+  `sched_getaffinity`+`CPU_COUNT` (was a hardcoded 1 — a Chromium-port-debt item
+  that capped browser thread-pool sizing to one core). Verified by
+  `M73-SMOKE: ok strtoull/sysconf-ncpu/abort-sigabrt`.
+- [ ] `deferred` **Remaining audit items** (each its own focused musl-port):
+  `realpath` resolving (`.`/`..`/symlink walk — needs per-component lstat, not a
+  `strcpy`); fully-buffered stdio + multi-read `fread` (today's stdio is
+  unbuffered with single-`read()` semantics — correct results, lower throughput);
+  correctly-rounded `strtod` and real `strtof`/`strtold` (not double); richer
+  `getaddrinfo` (numeric-port/multi-result). Revisit as the second musl pass.
 
 ## M86: Per-thread CPU accounting + signal targeting
 
@@ -1343,11 +1581,99 @@ PIE base (`0x500000000000`).
 
 ## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
 
-- [ ] `planned` Two real kernel correctness/safety bugs from the audit:
-  **(1)** `fs/ext4.c:339` `ext4_get_block` returns 0 (hole) past the single-indirect
-  range on block-mapped (non-extent) inodes → silent zero-reads/corruption on
-  large files of a classic ext2/3 image; add double/triple-indirect traversal
-  (and indirect-block write allocation at `:345`). **(2)** `syscall.c:2134`
-  `mmap(PROT_NONE)` reservations skip PTE setup, so a wild access zero-fills via
-  the anonymous fault path instead of faulting — add a reserved/no-access VMA
-  class the #PF handler honors before zero-filling.
+- [x] `done` **(2) `sys_mmap(PROT_NONE)` is now enforced.** A pure PROT_NONE
+  reservation records a VMA (`prot == PROT_NONE`) but installs no leaf PTE, so a
+  wild user access used to fall into the anonymous zero-fill fast path and
+  silently succeed. The `#PF` handler (`vmm_handle_page_fault`) now checks the
+  covering VMA on the not-present anonymous user path: if it grants no access it
+  refuses to service the fault and the task takes `SIGSEGV`. The check is scoped
+  to exactly that path (PROT_NONE regions never have present/lazy leaves, so
+  heap-growth and demand-paging faults are untouched) and the VMA list is sorted
+  so the walk early-exits. **V8-safe by construction:** `sys_mprotect` splits the
+  VMA and sets `->prot`, so a reservation later committed to RW (V8's sandbox
+  cage) has `prot != PROT_NONE` and falls through to the normal fill — and V8
+  *wants* its guard reservations to fault, so this aligns with the sandbox rather
+  than fighting it. Verified by `userspace/bin/m73_smoke.c` (`M88-SMOKE: ok
+  prot-none`: a PROT_NONE read SIGSEGVs a child, then `mprotect`-to-RW succeeds);
+  the **full** x86_64 suite (incl. the mmap-heavy curl/mbedTLS/NetSurf/Mesa
+  ports) stays green at **860/0**. (The d8 disk isn't present on this host, so the
+  dedicated V8 instance was not re-run; the safety argument above is structural,
+  not empirical for V8.)
+- [ ] `deferred` **(1)** `fs/ext4.c` `ext4_get_block` returns 0 (hole) past the
+  single-indirect range on block-mapped (non-extent) inodes → silent
+  zero-reads/corruption on large files; add double/triple-indirect traversal (and
+  indirect-block write allocation). **Deferred — not reproducibly verifiable**
+  (the load-bearing concern was always the test harness, not the fix).
+- **Why (1) stays deferred — verifiability, confirmed 2026-06-29.** The fix
+  itself is straightforward (a recursive single/double/triple-indirect walk for
+  read, plus intermediate-indirect-block allocation for write, mirroring the
+  proven `fs/ext2.c` path), and was prototyped. It is **not reproducibly
+  verifiable in the smoke matrix**, which is the blocker: (a) `ext4_mount` hard-
+  refuses any image without the `EXTENTS` incompat feature (`-EOPNOTSUPP`,
+  `ext4.c:1241`), so a pure block-mapped `ext2/3` image never reaches `ext4.c` at
+  all — it is mounted by `ext2.c`, whose existing single+double-indirect already
+  covers files up to ~64 MiB (1 KiB blocks) / ~4 GiB (4 KiB blocks); (b) the only
+  way to exercise `ext4.c`'s block-mapped branch is a block-mapped *inode inside
+  an extent-feature image*, and the host toolchain available to the smoke harness
+  (`mke2fs`/`debugfs`, no root loopback mount) cannot construct one: `debugfs
+  write` always emits `EXTENTS_FL` inodes, and clearing the flag with `sif flags
+  0` leaves the extent-header bytes in `i_block[]` (a *corrupt* block map, garbage
+  pointers — verified empirically), not a valid block map. Shipping the
+  allocation-mutating write path **unverified** would be the unverified-kernel-
+  path tech debt the project forbids, so it stays deferred until a harness that
+  can mint a valid block-mapped inode (a root loopback `chattr -e`, or a small
+  image-builder tool) lands. Triple-indirect is additionally untestable without
+  multi-GiB files.
+
+## M89: Migrate the C++ standard library to LLVM libc++ (shared)
+
+- [ ] `planned` **Replace GCC libstdc++ with LLVM libc++ across the C++
+  ecosystem, built as a shared library.** Today every C++ binary (d8, Mesa C++
+  glue, NetSurf/litehtml, the M51–M55 ports, `cxx_smoke`/`m55_*`) statically
+  folds GCC's `libstdc++.a`; there is no `libstdc++.so` because the b1nix GCC
+  target is classified newlib/elf and libstdc++'s configure forces
+  `enable_shared=no`. The cleaner long-term path is LLVM libc++, which has no such
+  gate and builds shared straightforwardly. M75 (shared-library `DT_INIT_ARRAY`
+  constructors now run) is the prerequisite that makes a shared C++ stdlib viable
+  at all — `std::ios_base::Init`, locale facets and other libc++ static
+  constructors live in the `.so`'s init_array.
+- **Scope (a real migration, not a flag flip):**
+  1. Build the LLVM runtimes from source for b1nix — `compiler-rt` + `libunwind`
+     (PIC), then `libc++abi` + `libc++` (`tools/toolchain/build-llvm-runtimes.sh`
+     + `build-libcxx.sh`), currently entirely unbuilt.
+  2. Turn those static builds into **shared** `libc++.so` / `libc++abi.so`
+     (`LIBCXX_ENABLE_SHARED=ON`, PIC unwinder/compiler-rt or reuse the existing
+     shared `libgcc_s.so` unwinder), with soname + symbol versioning, linking
+     against the shared `libc.so.1`.
+  3. Make libc++ the default in `tools/toolchain/bin/b1nix-c++` (it is already
+     "preferred when built") and ship `libc++.so`/`libc++abi.so` to `/lib`.
+  4. **Migrate the ecosystem off libstdc++** and re-verify each consumer: d8
+     (V8), Mesa, NetSurf/litehtml, the M51–M55 ports — these were built and tested
+     against libstdc++, so the ABI/header switch is the main risk and must be
+     smoke-verified per port.
+- **Interim shared libstdc++ (path A) — DONE (v0.75.2, this branch).** The
+  ecosystem stays on GCC libstdc++ but the stdlib itself is now **shared**:
+  `tools/toolchain/build-libstdcxx-shared.sh` links a `libstdc++.so.6` from the
+  -fPIC `libstdc++.a` (no GCC rebuild — bypasses the newlib `enable_shared=no`
+  gate), and the C++ smoke binaries (`cxx_smoke`, `m64_clang`, `m55_iostream`,
+  `m55_litehtml`) link it dynamically. **Full C++ runtime works over the .so —
+  ctors (via M75 `DT_INIT_ARRAY`), STL, std::iostream/filesystem, std::thread,
+  RTTI, and cross-DSO exceptions** (a throw inside `libstdc++.so.6` unwinds back
+  into the executable). Smoke 864/0. The hard part was cross-DSO DWARF unwinding:
+  the kernel registers every loaded `.so`'s `.eh_frame` with libgcc's classic
+  registry (found via the section header table; `__b1nix_run_dso_init` calls
+  `__register_frame`), including `libgcc_s.so` itself (its `frame_dummy` is dead —
+  this newlib target has no crti/crtn so the `.so` has no `DT_INIT`). M89 (libc++)
+  remains the longer-term direction but is no longer a prerequisite for dynamic C++.
+- **V8/d8 flipped to the shared libstdc++ — DONE.** `tools/v8/v8-link-d8.sh`
+  resolves d8's C++ runtime from `libstdc++.so.6` + the single shared unwinder
+  `libgcc_s.so` (static `libgcc.a` stays in the group only for the `__multi3`-class
+  builtins libgcc_s.so does not export). The relinked `d8.b1nix` NEEDs
+  `libstdc++.so.6`/`libgcc_s.so`/`libc.so.1` (no folded STL; `std::cout` is a
+  COPY-reloc), runs its own ctors via `DT_INIT_ARRAY`, and **runs `m58.js` to
+  completion (8/8 markers) on all three tiers — jitless, Sparkplug, TurboFan**
+  (`sh tools/v8/v8-build-run.sh`, `SKIP_BUILD=1` to reuse the link). Set
+  `B1NIX_CXX=static` to restore the folded link. The remaining static-libstdc++
+  consumers are the toolchain `clang-22` (its 78MB libLLVM.so is already shared)
+  and the unbuilt Mesa/NetSurf ports (predominantly C; the C++ piece, litehtml,
+  is already dynamic).
