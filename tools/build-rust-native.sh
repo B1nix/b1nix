@@ -122,12 +122,15 @@ for libdir in "$TC/sysroot/lib" "$TC/cross/x86_64-b1nix/lib"; do
     # pulled. This also keeps the libgcc/unwinder resolution that COMBINED needs.
     stage_file "$COMBINED" "$libdir/libm.a"
     stage_file "$CRT0" "$libdir/crt0.o"
-    # Rust's `unwind` crate links `-lunwind` (LLVM libunwind name) on musl+crt-static
-    # targets, but b1nix ships gcc's unwinder as libgcc_eh.a (same `_Unwind_*` ABI).
-    # The toolchain otherwise has only an EMPTY stub libunwind.a, so the unwinder
-    # symbols go unresolved at the final rustc link. Alias the real gcc unwinder.
-    _eh="$("$CROSS/x86_64-b1nix-gcc" -print-file-name=libgcc_eh.a)"
-    [ -f "$_eh" ] && cp -f "$_eh" "$libdir/libunwind.a"
+    # Rust's `unwind` crate links `-lunwind` (LLVM libunwind name) on musl+crt-static.
+    # Copy the real LLVM libunwind.a from the sysroot.
+    _unw="$TC/sysroot/usr/lib/libunwind.a"
+    if [ -f "$_unw" ]; then
+        cp -f "$_unw" "$libdir/libunwind.a"
+    else
+        _eh="$("$CROSS/x86_64-b1nix-gcc" -print-file-name=libunwind.a 2>/dev/null || echo)"
+        [ -f "$_eh" ] && cp -f "$_eh" "$libdir/libunwind.a"
+    fi
 done
 
 # Verify the staging actually landed in EVERY search path. The shared

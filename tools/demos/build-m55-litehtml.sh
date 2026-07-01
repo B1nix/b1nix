@@ -1,13 +1,17 @@
 #!/bin/sh
 # Build the M55 litehtml demo ELF: compile userspace/bin/m55_litehtml.cpp
 # against the litehtml/gumbo headers and link it with the ported litehtml +
-# gumbo static libs, the cross GCC's libstdc++/libsupc++/libgcc, libm and
-# libb1nix. This is the M55 acceptance binary (real C++ HTML/CSS engine running
-# on b1nix). Arg 1 = output path. B1NIX_ARCH selects the toolchain/arch.
+# gumbo static libs, the LLVM C++ runtime (libc++/libc++abi + compiler-rt), libm
+# and libb1nix. This is the M55 acceptance binary (real C++ HTML/CSS engine
+# running on b1nix). Arg 1 = output path. B1NIX_ARCH selects the toolchain/arch.
+#
+# M90: the default C++ runtime is GCC-free LLVM libc++. Set B1NIX_CXX_STDLIB=libstdc++
+# to opt into the legacy GCC libstdc++ path.
 
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:?usage: build-m55-litehtml.sh <output-elf>}"
+B1NIX_CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"; export B1NIX_CXX_STDLIB
 . "$ROOT_DIR/tools/toolchain/env.sh"
 resolve_cxx_cross
 

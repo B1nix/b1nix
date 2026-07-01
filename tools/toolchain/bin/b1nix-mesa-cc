@@ -19,19 +19,19 @@ if [ "$USING_CLANG" -eq 1 ]; then
   PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
   . "$PROJECT_DIR/tools/toolchain/env.sh"
   CROSS="$TOOLCHAIN_BUILD_HOME/cross"
-  GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
-  VER="$("$GXX" -dumpversion 2>/dev/null || echo 13.2.0)"
-  CXXROOT="$CROSS/$B1NIX_TRIPLET/include/c++/$VER"
-  GCCROOT="$CROSS/lib/gcc/$B1NIX_TRIPLET/$VER"
-  RES="$("$real" -print-resource-dir 2>/dev/null || true)"
 
-  if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+  if [ "${B1NIX_CXX_STDLIB:-libc++}" = "libc++" ]; then
     # libc++: -nostdinc++ + the libc++ headers, letting clang resolve its own
     # builtin C headers + the b1nix libc headers through --sysroot. (A blanket
     # -nostdinc breaks clang's stddef.h #include_next chain, dropping ::nullptr_t.)
     LIBCXX_HDR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
     EXTRA_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$TOOLCHAIN_BUILD_HOME/sysroot -nostdinc++ -isystem $LIBCXX_HDR"
   else
+    GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
+    VER="$("$GXX" -dumpversion 2>/dev/null || echo 13.2.0)"
+    CXXROOT="$CROSS/$B1NIX_TRIPLET/include/c++/$VER"
+    GCCROOT="$CROSS/lib/gcc/$B1NIX_TRIPLET/$VER"
+    RES="$("$real" -print-resource-dir 2>/dev/null || true)"
     EXTRA_FLAGS="--target=$B1NIX_TRIPLET"
     [ -n "$RES" ] && EXTRA_FLAGS="$EXTRA_FLAGS -isystem $RES/include"
     EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CXXROOT -isystem $CXXROOT/$B1NIX_TRIPLET -isystem $CXXROOT/backward"

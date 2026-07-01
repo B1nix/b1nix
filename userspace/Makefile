@@ -52,7 +52,9 @@ GEN_PIC        :=
 GEN_CRT0       := $(CRT0)
 GEN_LINKER     := linker.ld
 GEN_LIBDEP     := $(LIB)
-GEN_LINK_EXTRA :=
+# -z norelro: b1nix static ELFs are not RELRO-mprotected, and lld (>=15) rejects
+# the static linker.ld's non-contiguous .init_array under the default -z relro.
+GEN_LINK_EXTRA := -z norelro
 GEN_LINK_LIBS  := --whole-archive $(LIB) --no-whole-archive
 else
 GEN_PIC        := -fPIC
@@ -70,7 +72,7 @@ endif
 # shared dependency. LINK=static restores the historical whole-archive static link.
 ifeq ($(LINK),static)
 BESPOKE_CRT0  := $(CRT0)
-BESPOKE_EXTRA :=
+BESPOKE_EXTRA := -z norelro
 BESPOKE_LIBC  := --whole-archive $(LIB) --no-whole-archive
 else
 BESPOKE_CRT0  := $(DYNAMIC_CRT0)
@@ -500,7 +502,10 @@ $(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(LIB) $(CRT0) $(LINKER)
 	# Stays STATIC (residual debt): libpng's setjmp/longjmp error path takes the
 	# absolute address of `longjmp`, emitting R_X86_64_32 relocs a non-PIE dynamic
 	# link cannot form against an imported (libc.so.1) symbol.
-	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libpng_smoke.o \
+	# -z norelro: b1nix static ELFs are not RELRO-mprotected by the kernel loader,
+	# and lld (>=15) rejects the static linker.ld's non-contiguous .init_array under
+	# the default -z relro ("section .init_array is not contiguous with other relro").
+	$(LD) $(LDFLAGS) -z norelro -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libpng_smoke.o \
 	  $(LIBPNG_DIR)/lib/libpng16.a $(ZLIB_DIR)/lib/libz.a $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(LIB) --no-whole-archive
 

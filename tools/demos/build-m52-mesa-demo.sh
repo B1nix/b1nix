@@ -1,14 +1,18 @@
 #!/bin/sh
 # Build an M52 Mesa demo ELF against the
 # Mesa OSMesa headers and link it with the ported Mesa static libraries, the
-# b1gui client, libstdc++/libsupc++/libgcc, libm and libb1nix. --gc-sections +
-# strip keep the (still large) binary as small as Mesa allows. Arg 1 = output
-# path. Arg 1 is the source stem, arg 2 is the output path.
+# b1gui client, the LLVM C++ runtime (libc++/libc++abi + compiler-rt), libm and
+# libb1nix. --gc-sections + strip keep the (still large) binary as small as Mesa
+# allows. Arg 1 is the source stem, arg 2 is the output path.
+#
+# M90: default C++ runtime is GCC-free LLVM libc++ (matches Mesa, now libc++).
+# Set B1NIX_CXX_STDLIB=libstdc++ to opt into the legacy GCC path.
 
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 DEMO="${1:?usage: build-m52-mesa-demo.sh <source-stem> <output-elf>}"
 OUT="${2:?usage: build-m52-mesa-demo.sh <source-stem> <output-elf>}"
+B1NIX_CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"; export B1NIX_CXX_STDLIB
 . "$ROOT_DIR/tools/toolchain/env.sh"
 resolve_cxx_cross
 

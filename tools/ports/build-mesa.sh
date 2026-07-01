@@ -79,38 +79,18 @@ fi
 # libc++.a and libc++abi.a under libcxx-install/lib. Default to libstdc++ (the
 # verified runtime); use libc++ only when requested (B1NIX_CXX_STDLIB=libc++) —
 # folding the PIC static libc++/libc++abi into Mesa's C++ output.
-CXX_STDLIB="${B1NIX_CXX_STDLIB:-libstdc++}"
+CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"
 LIBCXX_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
 LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
 LLVM_CRT_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
-LLVM_UNW_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libunwind.a"
+LLVM_UNW_A=""
 
-CXX_LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
-# ccache discriminator for the C++ stdlib: b1nix-mesa-cc injects the libc++ vs
-# libstdc++ -isystem/-nostdinc++ flags INTERNALLY (after ccache wraps it), so
-# ccache's argument hash is identical for both stdlibs and it would hand back a
-# stale libstdc++ object for a libc++ build (the cause of the FF-render bug: the
-# GLSL compiler, libglsl.a, came back libstdc++ while everything else was libc++,
-# an ABI mix that corrupted fixed-function shader/constant generation). Adding a
-# stdlib-specific define to cpp_args makes ccache see distinct keys per stdlib.
-CXX_CACHE_DISCRIM=""
-case "$CXX_STDLIB" in
-  libc++)
-    [ -f "$LIBCXX_A" ] && [ -f "$LIBCXXABI_A" ] || { echo "build-mesa: B1NIX_CXX_STDLIB=libc++ but libc++ not built (run build-libcxx.sh)" >&2; exit 1; }
-    STDLIB_A="$LIBCXX_A"; STDLIB_ABI_A="$LIBCXXABI_A"
-    # libc++abi.a already contains the libunwind unwinder, so do NOT also add the
-    # standalone libunwind.a (duplicate _Unwind_*). compiler-rt stays for builtins.
-    LLVM_UNW_A=""
-    CXX_LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
-    CXX_CACHE_DISCRIM=", '-D__B1NIX_MESA_LIBCXX__=1'"
-    ;;
-  *)        STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"; STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)" ;;
-esac
-if [ -f "$LLVM_CRT_A" ] && [ -f "$LLVM_UNW_A" ]; then
-  CRT_A="$LLVM_CRT_A"; UNW_A="$LLVM_UNW_A"
-else
-  CRT_A="$("$GXX" -print-libgcc-file-name)"; UNW_A=""
-fi
+STDLIB_A="$LIBCXX_A"
+STDLIB_ABI_A="$LIBCXXABI_A"
+CRT_A="$LLVM_CRT_A"
+UNW_A=""
+CXX_LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
+CXX_CACHE_DISCRIM=", '-D__B1NIX_MESA_LIBCXX__=1'"
 
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 

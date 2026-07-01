@@ -73,6 +73,7 @@ struct timespec {
 
 typedef int clockid_t;
 int clock_gettime(int clk_id, struct timespec *tp);
+int clock_getres(int clk_id, struct timespec *res);
 int nanosleep(const struct timespec *req, struct timespec *rem);
 
 /* M74 POSIX per-process timers. timer_t is an opaque id. struct itimerspec is in

@@ -843,6 +843,32 @@ int clock_gettime(int clk_id, struct timespec *tp) {
   return _check_err(syscall(SYS_CLOCK_GETTIME, clk_id, tp));
 }
 
+/* clock_getres: report the resolution of the b1nix clocks. The kernel drives
+ * every clock off the 100 Hz scheduler tick (SYS_CLOCK_GETTIME advances in
+ * 10 ms steps), so the honest resolution is 10 ms for the monotonic and
+ * realtime families alike. No kernel syscall is needed — the value is fixed by
+ * the tick rate (_SC_CLK_TCK == 100). */
+int clock_getres(int clk_id, struct timespec *res) {
+  switch (clk_id) {
+  case 0: /* CLOCK_REALTIME */
+  case 1: /* CLOCK_MONOTONIC */
+  case 2: /* CLOCK_PROCESS_CPUTIME_ID */
+  case 3: /* CLOCK_THREAD_CPUTIME_ID */
+  case 4: /* CLOCK_MONOTONIC_RAW */
+  case 5: /* CLOCK_REALTIME_COARSE */
+  case 6: /* CLOCK_MONOTONIC_COARSE */
+  case 7: /* CLOCK_BOOTTIME */
+    if (res) {
+      res->tv_sec = 0;
+      res->tv_nsec = 10000000; /* 10 ms == one 100 Hz tick */
+    }
+    return 0;
+  default:
+    errno = EINVAL;
+    return -1;
+  }
+}
+
 int nanosleep(const struct timespec *req, struct timespec *rem) {
   if (!req) return -1;
   unsigned long ticks = req->tv_sec * 100 + req->tv_nsec / 10000000;
@@ -1794,6 +1820,10 @@ long sysconf(int name) {
     return 1024;
   case _SC_OPEN_MAX:
     return 256; /* matches OPEN_MAX in <limits.h> */
+  case _SC_MONOTONIC_CLOCK:
+    /* b1nix has clock_gettime(CLOCK_MONOTONIC); advertise the option as
+     * supported (a positive value, as POSIX requires). */
+    return _POSIX_MONOTONIC_CLOCK;
   default:
     errno = EINVAL;
     return -1;

@@ -73,7 +73,7 @@ fi
 # extend CPORT_CFLAGS inside port_pre_build once gen dirs / dep dirs are known).
 CFLAGS_BASE="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix"
+  -O2 -fno-strict-aliasing -fPIC -Db1nix"
 
 if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
 
