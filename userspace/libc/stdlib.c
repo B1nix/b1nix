@@ -93,8 +93,15 @@ int atexit(void (*function)(void)) {
 	return 0;
 }
 
+/* Run the main thread's C++11 thread_local destructors at process exit (the main
+ * thread leaves through exit(), not pthread_exit()). Provided by pthread.c; weakly
+ * referenced so a libc without the pthread object still links. */
+void __cxa_thread_run_dtors(void) __attribute__((weak));
+
 void exit(int status)
 {
+	if (__cxa_thread_run_dtors)
+		__cxa_thread_run_dtors();
 	while (atexit_count > 0) {
 		atexit_funcs[--atexit_count]();
 	}

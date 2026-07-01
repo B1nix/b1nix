@@ -75,18 +75,35 @@ if [ ! -d "$SRC_DIR" ]; then
   tar -xJf "$tmp" -C "$SRC_PARENT" 1>&2
 fi
 
-# Resolve C++ stdlib and CRT runtime
-CXX_STDLIB="${B1NIX_CXX_STDLIB:-}"
+# Resolve C++ stdlib and CRT runtime. The unified runtimes build installs both
+# libc++.a and libc++abi.a under libcxx-install/lib. Default to libstdc++ (the
+# verified runtime); use libc++ only when requested (B1NIX_CXX_STDLIB=libc++) —
+# folding the PIC static libc++/libc++abi into Mesa's C++ output.
+CXX_STDLIB="${B1NIX_CXX_STDLIB:-libstdc++}"
 LIBCXX_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
-LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxxabi-install/lib/libc++abi.a"
+LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
 LLVM_CRT_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 LLVM_UNW_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libunwind.a"
 
-if [ -z "$CXX_STDLIB" ]; then
-  if [ -f "$LIBCXX_A" ] && [ -f "$LIBCXXABI_A" ]; then CXX_STDLIB="libc++"; else CXX_STDLIB="libstdc++"; fi
-fi
+CXX_LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
+# ccache discriminator for the C++ stdlib: b1nix-mesa-cc injects the libc++ vs
+# libstdc++ -isystem/-nostdinc++ flags INTERNALLY (after ccache wraps it), so
+# ccache's argument hash is identical for both stdlibs and it would hand back a
+# stale libstdc++ object for a libc++ build (the cause of the FF-render bug: the
+# GLSL compiler, libglsl.a, came back libstdc++ while everything else was libc++,
+# an ABI mix that corrupted fixed-function shader/constant generation). Adding a
+# stdlib-specific define to cpp_args makes ccache see distinct keys per stdlib.
+CXX_CACHE_DISCRIM=""
 case "$CXX_STDLIB" in
-  libc++)   STDLIB_A="$LIBCXX_A"; STDLIB_ABI_A="$LIBCXXABI_A" ;;
+  libc++)
+    [ -f "$LIBCXX_A" ] && [ -f "$LIBCXXABI_A" ] || { echo "build-mesa: B1NIX_CXX_STDLIB=libc++ but libc++ not built (run build-libcxx.sh)" >&2; exit 1; }
+    STDLIB_A="$LIBCXX_A"; STDLIB_ABI_A="$LIBCXXABI_A"
+    # libc++abi.a already contains the libunwind unwinder, so do NOT also add the
+    # standalone libunwind.a (duplicate _Unwind_*). compiler-rt stays for builtins.
+    LLVM_UNW_A=""
+    CXX_LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
+    CXX_CACHE_DISCRIM=", '-D__B1NIX_MESA_LIBCXX__=1'"
+    ;;
   *)        STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"; STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)" ;;
 esac
 if [ -f "$LLVM_CRT_A" ] && [ -f "$LLVM_UNW_A" ]; then
@@ -97,14 +114,27 @@ fi
 
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 
-# meson cross file link args: stdlib + CRT + libb1nix
-LINKARGS="'-nostdlib', '-T', '$ROOT_DIR/userspace/linker-cxx.ld', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$STDLIB_A', '$STDLIB_ABI_A'"
-if [ -n "$UNW_A" ]; then
-  LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"
+# meson cross file link args: stdlib + CRT + libb1nix.
+# The libstdc++ path is byte-for-byte the historical one (host GNU ld, inner
+# --start-group/--end-group). The libc++ path forces -fuse-ld=lld and drops the
+# inner group (meson already wraps the link line in one --start-group, and lld
+# rejects a NESTED group). NOTE: rebuilding Mesa's shared libOSMesa.so currently
+# fails in BOTH modes for a reason unrelated to libc++ — the .so folds the non-PIC
+# b1nix archives (crt0.o/libb1nix.a) via a fixed-base linker script, which the
+# current host GNU ld rejects ("failed to set dynamic section sizes") and lld
+# rejects (R_X86_64_32 against a -shared/PIC output). The shipped ISO uses the
+# Mesa objects built in a prior toolchain environment; fixing the rebuild is
+# separate Mesa-build-infra work (make libb1nix PIC, or link the cross binutils ld
+# directly), tracked as the remaining M89 Mesa item.
+if [ "$CXX_STDLIB" = "libc++" ]; then
+  LINKARGS="'-fuse-ld=lld', '-nostdlib', '-T', '$CXX_LINKER_LD', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '$STDLIB_A', '$STDLIB_ABI_A'"
+  if [ -n "$UNW_A" ]; then LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"; else LINKARGS="$LINKARGS, '$CRT_A'"; fi
+  LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive'"
 else
-  LINKARGS="$LINKARGS, '$CRT_A'"
+  LINKARGS="'-nostdlib', '-T', '$CXX_LINKER_LD', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$STDLIB_A', '$STDLIB_ABI_A'"
+  if [ -n "$UNW_A" ]; then LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"; else LINKARGS="$LINKARGS, '$CRT_A'"; fi
+  LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
 fi
-LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
 
 INI="$BUILD_DIR/cross.ini"
 DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL'"
@@ -140,7 +170,7 @@ endian = 'little'
 needs_exe_wrapper = true
 [built-in options]
 c_args = [$DEFS]
-cpp_args = [$DEFS]
+cpp_args = [$DEFS$CXX_CACHE_DISCRIM]
 c_link_args = [$LINKARGS]
 cpp_link_args = [$LINKARGS]
 EOF
@@ -218,12 +248,35 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
       -Dvalgrind=disabled -Dbuild-tests=false -Dshader-cache=disabled 1>&2 )
 fi
 
-# Build the static libraries. The final libOSMesa.so link fails on purpose
-# (static-only b1nix). Some driver archives (e.g. libvirgl.a) are scheduled
-# AFTER that .so in ninja order, so a plain `ninja` would abort on the expected
-# .so failure and never build them. `-k 0` keeps going past the failure and
-# builds every reachable target; the `|| true` swallows the final nonzero exit.
+# Build ONLY what the demos consume: the static archives (the demos link
+# $(ls install/lib/*.a)) plus the osmesa target glue object (target.c.o). b1nix
+# is static-only here, so the shared libOSMesa.so is never used — and linking it
+# fails by nature (it folds the non-PIC b1nix archives via a fixed-base linker
+# script, which neither the host GNU ld nor ld.lld accept for a -shared output).
+# Rather than build it and swallow the failure (-k 0 || true), build the static
+# .a targets + the target.c.o object explicitly so ninja never attempts the .so
+# link — a clean build with no spurious error.
+# Build every reachable target with -k 0 (build ALL the static libs + their
+# generated-source deps + the osmesa target.c.o). The final libOSMesa.so link
+# fails by nature (it folds the non-PIC b1nix archives via a fixed-base linker
+# script — neither host ld nor lld can make a -shared output of that), and a few
+# internal archives (liblibvdrm.a, no xf86drm.h) don't compile; -k 0 keeps going
+# past both and the demos only consume the static .a + target.c.o anyway. We build
+# the full reachable set (not a hand-picked .a list) so no generated source a
+# rendering path depends on is silently skipped.
 ( cd "$MESON_BUILD" && ninja -k 0 1>&2 ) || true
+
+# libglsl_standalone.a is the scaffolding archive for Mesa's *standalone GLSL
+# compiler* tool (glsl_compiler), not for rendering. standalone_scaffolding.cpp
+# provides STUB definitions of real Mesa entry points — e.g. _mesa_program_state_flags
+# is compiled there as `return 0;`. b1nix does not build/ship that tool, and every
+# symbol it defines also exists (with the real implementation) in libmesa.a. If it
+# lands in install/lib the demos glob it via `ls *.a`; because it sorts before
+# libmesa.a and the demo links with --allow-multiple-definition, the linker silently
+# binds the STUB, so state-parameter StateFlags come out 0 and the fixed-function mvp
+# matrix is never uploaded (blank/degenerate geometry). Never install it. Drop any
+# stale copy left by earlier runs so consumers can't pick it up.
+rm -f "$INSTALL_DIR/lib/libglsl_standalone.a"
 
 # Repack thin archives into relocatable thick archives in install/lib.
 # Avoid unconditional rm -f to prevent race conditions when parallel demo builds
@@ -231,6 +284,9 @@ fi
 ( cd "$MESON_BUILD"
   for a in $(find . -name "*.a"); do
     name="$(basename "$a")"
+    case "$name" in
+      libglsl_standalone.a) continue ;;  # stub scaffolding — see note above
+    esac
     target="$INSTALL_DIR/lib/$name"
     if [ ! -f "$target" ] || [ "$a" -nt "$target" ]; then
       if [ "$(head -c 7 "$a")" = "!<thin>" ]; then

@@ -7,6 +7,7 @@
 #include <GL/osmesa.h>
 #include <b1nix/gui.h>
 #include <stdint.h>
+#include <stdlib.h>
 #include <string.h>
 #include <unistd.h>
 
@@ -37,7 +38,8 @@ int main(void) {
   /* Render top-down so row 0 is the top of the window (GL is bottom-up). */
   OSMesaPixelStore(OSMESA_Y_UP, 0);
 
-  if (!glGetString(GL_VERSION))
+  const char *ver = (const char *)glGetString(GL_VERSION);
+  if (!ver)
     return fail("M52-GFX: fail mesa (version)\n");
 
   glViewport(0, 0, win.width, win.height);
@@ -69,6 +71,7 @@ int main(void) {
     else if (r > 0xc0 && g < 0x40 && b < 0x40)
       red++;
   }
+
   if (blue < 100)
     return fail("M52-GFX: fail mesa (no-clear)\n");
   if (red < 100)

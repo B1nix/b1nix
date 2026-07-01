@@ -25,11 +25,19 @@ if [ "$USING_CLANG" -eq 1 ]; then
   GCCROOT="$CROSS/lib/gcc/$B1NIX_TRIPLET/$VER"
   RES="$("$real" -print-resource-dir 2>/dev/null || true)"
 
-  EXTRA_FLAGS="--target=$B1NIX_TRIPLET"
-  [ -n "$RES" ] && EXTRA_FLAGS="$EXTRA_FLAGS -isystem $RES/include"
-  EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CXXROOT -isystem $CXXROOT/$B1NIX_TRIPLET -isystem $CXXROOT/backward"
-  EXTRA_FLAGS="$EXTRA_FLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
-  EXTRA_FLAGS="$EXTRA_FLAGS -isystem $CROSS/$B1NIX_TRIPLET/include"
+  if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+    # libc++: -nostdinc++ + the libc++ headers, letting clang resolve its own
+    # builtin C headers + the b1nix libc headers through --sysroot. (A blanket
+    # -nostdinc breaks clang's stddef.h #include_next chain, dropping ::nullptr_t.)
+    LIBCXX_HDR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
+    EXTRA_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$TOOLCHAIN_BUILD_HOME/sysroot -nostdinc++ -isystem $LIBCXX_HDR"
+  else
+    EXTRA_FLAGS="--target=$B1NIX_TRIPLET"
+    [ -n "$RES" ] && EXTRA_FLAGS="$EXTRA_FLAGS -isystem $RES/include"
+    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CXXROOT -isystem $CXXROOT/$B1NIX_TRIPLET -isystem $CXXROOT/backward"
+    EXTRA_FLAGS="$EXTRA_FLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
+    EXTRA_FLAGS="$EXTRA_FLAGS -isystem $CROSS/$B1NIX_TRIPLET/include"
+  fi
 else
   EXTRA_FLAGS=""
 fi

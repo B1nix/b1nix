@@ -836,11 +836,107 @@ void *pthread_getspecific(pthread_key_t key) {
   return v;
 }
 
+/* ── C++11 thread_local destructors (__cxa_thread_atexit_impl) ────────────────
+ * The C++ runtime (libc++abi / libstdc++) registers a destructor for every
+ * thread_local object with a non-trivial destructor via __cxa_thread_atexit_impl,
+ * which the Itanium C++ ABI expects the C library to provide. Each destructor
+ * runs when its owning thread terminates — and at process exit for the main
+ * thread, which leaves via exit() rather than pthread_exit(). We keep a per-thread
+ * LIFO list keyed by tid and run it from __cxa_thread_run_dtors(), called from the
+ * worker thread-exit path (__pthread_tsd_run_dtors, below) and from exit(). */
+struct thread_atexit_entry {
+  void (*func)(void *);
+  void *obj;
+  struct thread_atexit_entry *next;
+};
+struct thread_atexit_list {
+  long tid;
+  struct thread_atexit_entry *head; /* LIFO */
+  struct thread_atexit_list *next;
+};
+static struct thread_atexit_list *g_thread_atexit = NULL; /* guarded by g_tsd_lock */
+
+static struct thread_atexit_list *thread_atexit_find(long tid, int create) {
+  struct thread_atexit_list *c = g_thread_atexit;
+  while (c) {
+    if (c->tid == tid)
+      return c;
+    c = c->next;
+  }
+  if (!create)
+    return NULL;
+  struct thread_atexit_list *n =
+      (struct thread_atexit_list *)malloc(sizeof(*n));
+  if (!n)
+    return NULL;
+  n->tid = tid;
+  n->head = NULL;
+  n->next = g_thread_atexit;
+  g_thread_atexit = n;
+  return n;
+}
+
+int __cxa_thread_atexit_impl(void (*func)(void *), void *obj,
+                             void *dso_handle) {
+  (void)dso_handle; /* b1nix unloads no DSOs before exit, so dso_handle is moot */
+  struct thread_atexit_entry *e =
+      (struct thread_atexit_entry *)malloc(sizeof(*e));
+  if (!e)
+    return -1;
+  e->func = func;
+  e->obj = obj;
+  long tid = (long)pthread_self();
+  pthread_mutex_lock(&g_tsd_lock);
+  struct thread_atexit_list *l = thread_atexit_find(tid, 1);
+  if (!l) {
+    pthread_mutex_unlock(&g_tsd_lock);
+    free(e);
+    return -1;
+  }
+  e->next = l->head; /* LIFO: last registered runs first */
+  l->head = e;
+  pthread_mutex_unlock(&g_tsd_lock);
+  return 0;
+}
+
+/* Run (and free) the calling thread's thread_local destructors, LIFO. Drops the
+ * lock around each destructor — a destructor may itself register more or re-enter
+ * pthread_*. Safe to call when the thread registered none. */
+void __cxa_thread_run_dtors(void) {
+  long tid = (long)pthread_self();
+  for (;;) {
+    pthread_mutex_lock(&g_tsd_lock);
+    struct thread_atexit_list *l = thread_atexit_find(tid, 0);
+    if (!l || !l->head) {
+      if (l) { /* unlink the now-empty per-thread node */
+        struct thread_atexit_list **pp = &g_thread_atexit;
+        while (*pp) {
+          if (*pp == l) {
+            *pp = l->next;
+            free(l);
+            break;
+          }
+          pp = &(*pp)->next;
+        }
+      }
+      pthread_mutex_unlock(&g_tsd_lock);
+      return;
+    }
+    struct thread_atexit_entry *e = l->head;
+    l->head = e->next;
+    pthread_mutex_unlock(&g_tsd_lock);
+    e->func(e->obj);
+    free(e);
+  }
+}
+
 /* Run the calling thread's TSD destructors and free its slot. Called from
  * pthread_exit(). POSIX iterates destructors a bounded number of times because
  * a destructor may set new values. */
 void __pthread_tsd_run_dtors(void) {
   long tid = (long)pthread_self();
+  /* C++ thread_local destructors run before POSIX TSD (pthread_key) ones. */
+  __cxa_thread_run_dtors();
   for (int iter = 0; iter < PTHREAD_DESTRUCTOR_ITERATIONS; iter++) {
     int ran = 0;
     pthread_mutex_lock(&g_tsd_lock);

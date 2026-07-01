@@ -27,18 +27,35 @@ UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 # executable's frames via the real __register_frame (-u forces the import).
 # B1NIX_LINK=static restores the historical fully-folded whole-archive link.
 SHARED_LIBC="$UB/libc.so.1"
-STDCXX_SO=""; SHARED_LIBGCC=""
+STDCXX_SO=""; SHARED_LIBGCC=""; CXXLIB_SO=""
+# linker-cxx.ld (GCC/libgcc model) vs linker-libcxx.ld (libc++/libunwind: maps the
+# program headers + keeps .eh_frame_hdr so libunwind unwinds via dl_iterate_phdr).
+LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
+[ "${B1NIX_CXX_STDLIB:-}" = "libc++" ] && LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
 if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
   DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC="--whole-archive $UB/libb1nix.a --no-whole-archive"
 else
   DYN_CRT0="$UB/crt/crt0-dynamic.o"
   DYN_FLAGS="-z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so"
   DYN_LIBC="$SHARED_LIBC"
-  _scxx="$(dirname "$STDLIB_CROSS_A")/libstdc++.so.6"
-  if [ -f "$_scxx" ]; then
-    STDCXX_SO="$_scxx"
-    SHARED_LIBGCC="-u __register_frame -L$(dirname "$_scxx") -lgcc_s"
-    STDLIB_CROSS_A=""; STDLIB_ABI_CROSS_A=""  # provided by the shared object
+  if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+    # Shared LLVM libc++ runtime: libc++.so.1 -> libc++abi.so.1 (folds libunwind).
+    # No -lgcc_s / __register_frame (that is the libgcc model); the static
+    # libunwind is dropped too (LLVM_UNW_CROSS) so the unwinder is single-instance
+    # in libc++abi.so.1. compiler-rt builtins stay static.
+    _cxxsodir="$TOOLCHAIN_BUILD_HOME/cross/$B1NIX_TRIPLET/lib"
+    if [ -f "$_cxxsodir/libc++.so.1" ] && [ -f "$_cxxsodir/libc++abi.so.1" ]; then
+      CXXLIB_SO="$_cxxsodir/libc++.so.1 $_cxxsodir/libc++abi.so.1"
+      STDLIB_CROSS_A=""; STDLIB_ABI_CROSS_A=""
+      LLVM_UNW_CROSS=""
+    fi
+  else
+    _scxx="$(dirname "$STDLIB_CROSS_A")/libstdc++.so.6"
+    if [ -f "$_scxx" ]; then
+      STDCXX_SO="$_scxx"
+      SHARED_LIBGCC="-u __register_frame -L$(dirname "$_scxx") -lgcc_s"
+      STDLIB_CROSS_A=""; STDLIB_ABI_CROSS_A=""  # provided by the shared object
+    fi
   fi
 fi
 make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
@@ -65,11 +82,11 @@ fi
 # libstdc++.so.6 provides them) — left unquoted so they expand to nothing.
 # $SHARED_LIBGCC (-lgcc_s) goes before the static-libgcc group so the shared
 # unwinder wins; $STDCXX_SO (the shared libstdc++) goes after, before libc.
-"$LD" -m "$LDEMU" -T "$ROOT_DIR/userspace/linker-cxx.ld" --gc-sections \
+"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$OBJ" $SHARED_LIBGCC \
   --start-group "$LITEHTML/lib/liblitehtml.a" "$LITEHTML/lib/libgumbo.a" \
   $STDLIB_CROSS_A $STDLIB_ABI_CROSS_A $CRT_LIBS "$LIBM" --end-group \
-  $STDCXX_SO $DYN_LIBC
+  $STDCXX_SO $CXXLIB_SO $DYN_LIBC
 
 "$STRIP" "$OUT"

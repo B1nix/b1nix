@@ -50,15 +50,28 @@ if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
 else
   DYN_CRT0="$UB/crt/crt0-dynamic.o"; DYN_FLAGS="--dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv"; DYN_LIBC="$UB/libc.so.1"
 fi
-# Use LLVM runtimes when available, else fall back to libgcc
+# Linker script: linker-cxx.ld (GCC/libgcc) vs linker-libcxx.ld (libc++/libunwind:
+# maps the program headers + keeps .eh_frame_hdr for dl_iterate_phdr unwinding).
+LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
+if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+  LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
+  DYN_FLAGS="$DYN_FLAGS --eh-frame-hdr"
+fi
+# Use LLVM runtimes when available, else fall back to libgcc. With libc++ the
+# unwinder is already folded into libc++abi.a (STDLIB_ABI_CROSS_A), so do NOT add
+# the standalone libunwind.a too (duplicate _Unwind_*).
 if [ -n "${LLVM_CRT_CROSS:-}" ]; then
-  CRT_LIBS="$LLVM_CRT_CROSS $LLVM_UNW_CROSS"
+  if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+    CRT_LIBS="$LLVM_CRT_CROSS"
+  else
+    CRT_LIBS="$LLVM_CRT_CROSS $LLVM_UNW_CROSS"
+  fi
 else
   CRT_LIBS="$LIBGCC_CROSS"
 fi
 
 # shellcheck disable=SC2086
-"$LD" -m "$LDEMU" -T "$ROOT_DIR/userspace/linker-cxx.ld" --gc-sections \
+"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" "$MESA/lib/osmesa_target.o" \
   --start-group $(ls "$MESA"/lib/*.a) "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" \

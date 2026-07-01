@@ -23,9 +23,15 @@ set -eu
 
 ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 NC="$ROOT/build/native-clang"
-DYN="$NC/b1nix-dyn-build"
-SO="$NC/b1nix/usr/lib/libLLVM.so"
-PREFIX="$NC/b1nix-dyn/usr"
+# Source build dir + libLLVM.so are overridable so the GCC-free libc++ toolchain
+# (tools/build-native-clang-libcxx.sh -> b1nix-libcxx-build) can be staged as the
+# canonical toolchain. Defaults = the historical libstdc++ dynamic build.
+DYN="${NATIVE_CLANG_DYN_BUILD:-$NC/b1nix-dyn-build}"
+SO="${NATIVE_CLANG_SO:-$NC/b1nix/usr/lib/libLLVM.so}"
+PREFIX="${NATIVE_CLANG_PREFIX:-$NC/b1nix-dyn/usr}"
+# The NEEDED name clang/lld record for the dylib (libc++ build: 'libLLVM.so';
+# the older libstdc++ build: 'lib/libLLVM.so').
+LIBLLVM_NEEDED="${NATIVE_CLANG_LIBLLVM_NEEDED:-lib/libLLVM.so}"
 
 CLANG="$DYN/bin/clang-22"
 LLD="$DYN/bin/lld"
@@ -52,8 +58,8 @@ cp -R "$RESDIR/include" "$PREFIX/lib/clang/$RESV/"
 # relative path lld/clang record by default in this LLVM config.
 if command -v patchelf >/dev/null 2>&1; then
     patchelf --set-soname libLLVM-22.so "$PREFIX/lib/libLLVM-22.so" 2>/dev/null || true
-    patchelf --replace-needed lib/libLLVM.so libLLVM-22.so "$PREFIX/bin/clang-22" 2>/dev/null || true
-    patchelf --replace-needed lib/libLLVM.so libLLVM-22.so "$PREFIX/bin/lld" 2>/dev/null || true
+    patchelf --replace-needed "$LIBLLVM_NEEDED" libLLVM-22.so "$PREFIX/bin/clang-22" 2>/dev/null || true
+    patchelf --replace-needed "$LIBLLVM_NEEDED" libLLVM-22.so "$PREFIX/bin/lld" 2>/dev/null || true
 else
     echo "stage-dynamic-clang: WARNING patchelf not found — clang/lld NEEDED stays 'lib/libLLVM.so'" >&2
 fi

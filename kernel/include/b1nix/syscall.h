@@ -218,6 +218,7 @@ enum {
 	SYS_TIMER_GETTIME    = 179, /* timer_gettime(id, curr) */
 	SYS_TIMER_DELETE     = 180, /* timer_delete(id) */
 	SYS_DL_PHDR_INFO     = 181, /* dl_iterate_phdr backing: copy out module table */
+	SYS_FD_PATH          = 182, /* absolute path of an open fd (for *at emulation) */
 };
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */

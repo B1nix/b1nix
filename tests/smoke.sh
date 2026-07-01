@@ -245,6 +245,15 @@ run_qemu() {
 			set +e
 			start_ts=$(date +%s)
 			reported_lines=0
+			# Stall detector: a healthy b1nix boot streams markers continuously, so a
+			# long gap with NO new serial output means the instance wedged (a hung
+			# test, a host suspend, or KVM starvation under load) — far more common
+			# here than a clean run that legitimately runs to the full TIMEOUT. Kill
+			# it after STALL_TIMEOUT of silence instead of blocking the whole TIMEOUT
+			# (which with a large TIMEOUT meant 8-25 min hangs). Generous default so a
+			# slow-but-alive module (V8 GC, a big mmap) is not killed mid-work.
+			last_progress_ts=$start_ts
+			stall_after=${STALL_TIMEOUT:-200}
 			while :; do
 				line_count=$(wc -l <"$log" | tr -d ' ')
 				if [ "$line_count" -gt "$reported_lines" ]; then
@@ -253,6 +262,7 @@ run_qemu() {
 							report_progress_line "$line"
 						done
 					reported_lines=$line_count
+					last_progress_ts=$(date +%s)
 				fi
 				if grep -qa -E "$done_pattern" "$log" 2>/dev/null; then
 					break
@@ -273,6 +283,10 @@ run_qemu() {
 				now_ts=$(date +%s)
 				if [ $((now_ts - start_ts)) -ge "$TIMEOUT" ]; then
 					command echo "[smoke] run_qemu timeout after ${TIMEOUT}s" >>"$log"
+					break
+				fi
+				if [ $((now_ts - last_progress_ts)) -ge "$stall_after" ]; then
+					command echo "[smoke] run_qemu STALLED — no serial output for ${stall_after}s (hung test / host suspend / KVM starvation); killing instance" >>"$log"
 					break
 				fi
 				sleep 1

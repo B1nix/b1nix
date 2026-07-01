@@ -27,6 +27,7 @@ struct event {
 
 static uint8_t inbuf[1024];
 static unsigned inlen;
+static uint32_t seat_caps;
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
 
@@ -91,6 +92,9 @@ static int next_event(int fd, struct event *ev) {
 				memcpy(ev->args, inbuf + sizeof(h), ev->nargs * 4);
 				memmove(inbuf, inbuf + h.size, inlen - h.size);
 				inlen -= h.size;
+				if (ev->object == 20 && ev->opcode == 0 && ev->nargs >= 1) {
+					seat_caps = ev->args[0];
+				}
 				if (ev->object == 6 && ev->opcode == 0) {
 					/* xdg_wm_base.ping → pong (object 6 bound above). */
 					request(fd, 6, 3, ev->args, 1);
@@ -349,7 +353,6 @@ int main(void) {
 
 	/* wl_touch: bind it off the seat (capabilities now include touch=4) and
 	 * confirm the seat advertises the capability + get_touch is accepted. */
-	uint32_t seat_caps = 0;
 	/* the seat capabilities event was sent right after bind (object 20, op 0);
 	 * it may already be buffered. Drain a few events looking for it. */
 	int cap_tries = 0;

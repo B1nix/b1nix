@@ -210,6 +210,7 @@ enum {
   SYS_TIMER_GETTIME    = 179,
   SYS_TIMER_DELETE     = 180,
   SYS_DL_PHDR_INFO     = 181,
+  SYS_FD_PATH          = 182,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

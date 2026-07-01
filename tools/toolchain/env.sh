@@ -82,15 +82,15 @@ resolve_cxx_cross() {
     local cxx_frontend="${B1NIX_CXX_FRONTEND:-clang}"
     local cxx_stdlib="${B1NIX_CXX_STDLIB:-}"
 
-    # Auto-detect C++ stdlib
+    # Auto-detect C++ stdlib. The unified runtimes build (build-libcxx.sh) installs
+    # BOTH libc++.a and libc++abi.a under libcxx-install/lib. Default to libstdc++
+    # so the existing ports keep their verified runtime unless libc++ is requested
+    # explicitly (B1NIX_CXX_STDLIB=libc++) — migrating a port is a deliberate,
+    # per-port reverify, not something to flip on automatically.
     local libcxx_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++.a"
-    local libcxxabi_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxxabi-install/lib/libc++abi.a"
+    local libcxxabi_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
     if [ -z "$cxx_stdlib" ]; then
-        if [ -f "$libcxx_a" ] && [ -f "$libcxxabi_a" ]; then
-            cxx_stdlib="libc++"
-        else
-            cxx_stdlib="libstdc++"
-        fi
+        cxx_stdlib="libstdc++"
     fi
 
     # Resolve C++ stdlib archives
@@ -115,20 +115,26 @@ resolve_cxx_cross() {
             local ver
             ver="$("$gxx" -dumpversion 2>/dev/null || echo 13.2.0)"
             local gccroot="$cross/lib/gcc/$B1NIX_TRIPLET/$ver"
-            local res
-            res="$("$CXX_CROSS" -print-resource-dir 2>/dev/null || true)"
-            CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET -O2 -ffunction-sections -fdata-sections -Db1nix -nostdinc"
-            [ -n "$res" ] && CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $res/include"
-
             if [ "$cxx_stdlib" = "libc++" ]; then
+                # libc++: -nostdinc++ (drop only the C++ stdlib search) + the libc++
+                # headers, letting clang resolve its own builtin C headers and the
+                # b1nix libc headers through --sysroot. A blanket -nostdinc breaks
+                # clang's stddef.h #include_next chain (::nullptr_t goes undefined),
+                # so mirror exactly how libc++ itself + b1nix-c++ are built.
                 local libcxx_hdr="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
-                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $libcxx_hdr"
+                local sysroot="$TOOLCHAIN_BUILD_HOME/sysroot"
+                CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET --sysroot=$sysroot -nostdinc++ -isystem $libcxx_hdr"
+                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -O2 -ffunction-sections -fdata-sections -Db1nix"
             else
+                local res
+                res="$("$CXX_CROSS" -print-resource-dir 2>/dev/null || true)"
+                CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET -O2 -ffunction-sections -fdata-sections -Db1nix -nostdinc"
+                [ -n "$res" ] && CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $res/include"
                 local cxxroot="$cross/$B1NIX_TRIPLET/include/c++/$ver"
                 CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $cxxroot -isystem $cxxroot/$B1NIX_TRIPLET -isystem $cxxroot/backward"
+                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $gccroot/include -isystem $gccroot/include-fixed"
+                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $cross/$B1NIX_TRIPLET/include"
             fi
-            CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $gccroot/include -isystem $gccroot/include-fixed"
-            CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $cross/$B1NIX_TRIPLET/include"
             ;;
     esac
 

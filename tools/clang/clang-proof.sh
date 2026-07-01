@@ -32,7 +32,21 @@ LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 # i.e. the kernel demand-pages a 72MB .so. This is the runtime validation of the
 # dynamic toolchain (lower self-host floor) and the libLLVM.so path for llvmpipe.
 LIBLLVM=""
-if [ "${CLANG_DYNAMIC:-0}" = "1" ]; then
+EXTRA_SOS=""
+if [ "${CLANG_LIBCXX:-0}" = "1" ]; then
+	# GCC-free libc++ dynamic clang (tools/build-native-clang-libcxx.sh, staged by
+	# stage-dynamic-clang.sh into b1nix-dyn/usr). NEEDED libLLVM-22.so + libc++.so.1
+	# + libc++abi.so.1 + libc.so.1 — ship the shared libc++ runtime alongside.
+	PFX="$ROOT_DIR/build/native-clang/b1nix-dyn/usr"
+	CLANG="$PFX/bin/clang-22"
+	RESDIR="$(ls -d "$PFX"/lib/clang/* 2>/dev/null | head -1)"
+	LIBLLVM="$PFX/lib/libLLVM-22.so"
+	CXXSO_DIR="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/lib"
+	EXTRA_SOS="$CXXSO_DIR/libc++.so.1 $CXXSO_DIR/libc++abi.so.1"
+	for f in "$LIBLLVM" $EXTRA_SOS; do
+		[ -f "$f" ] || { echo "missing $f — run tools/build-native-clang-libcxx.sh + stage-dynamic-clang.sh"; exit 1; }
+	done
+elif [ "${CLANG_DYNAMIC:-0}" = "1" ]; then
 	DI="$ROOT_DIR/build/native-clang/b1nix-dyn-install"
 	CLANG="$(find "$DI" -name clang-22 -type f 2>/dev/null | head -1)"
 	# RESDIR stays the static install's lib/clang/22 — same clang 22 resource
@@ -60,6 +74,8 @@ cp "$CLANG" "$STAGE/bin/clang"
 cp "$LIBC" "$STAGE/lib/libc.so.1"
 # M75: ship the 72MB shared LLVM next to the dynamic clang (resolved by soname).
 [ -n "$LIBLLVM" ] && cp "$LIBLLVM" "$STAGE/lib/libLLVM-22.so"
+# libc++ clang (CLANG_LIBCXX=1): also ship the shared libc++ runtime.
+for so in $EXTRA_SOS; do cp "$so" "$STAGE/lib/$(basename "$so")"; done
 # Header-free TU: the compile proof needs only the backend + integrated
 # assembler, no sysroot and no clang resource headers (a function-only source
 # pulls in no builtin headers). Add CLANG_STAGE_RESOURCE=1 to ship them anyway.
@@ -86,6 +102,7 @@ write $STAGE/bin/clang clang
 cd /lib
 write $STAGE/lib/libc.so.1 libc.so.1
 $([ -n "$LIBLLVM" ] && echo "write $STAGE/lib/libLLVM-22.so libLLVM-22.so")
+$(for so in $EXTRA_SOS; do echo "write $STAGE/lib/$(basename "$so") $(basename "$so")"; done)
 cd /
 write $STAGE/hello.c hello.c
 EOF

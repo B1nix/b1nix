@@ -1627,53 +1627,37 @@ PIE base (`0x500000000000`).
 
 ## M89: Migrate the C++ standard library to LLVM libc++ (shared)
 
-- [ ] `planned` **Replace GCC libstdc++ with LLVM libc++ across the C++
-  ecosystem, built as a shared library.** Today every C++ binary (d8, Mesa C++
-  glue, NetSurf/litehtml, the M51–M55 ports, `cxx_smoke`/`m55_*`) statically
-  folds GCC's `libstdc++.a`; there is no `libstdc++.so` because the b1nix GCC
-  target is classified newlib/elf and libstdc++'s configure forces
-  `enable_shared=no`. The cleaner long-term path is LLVM libc++, which has no such
-  gate and builds shared straightforwardly. M75 (shared-library `DT_INIT_ARRAY`
-  constructors now run) is the prerequisite that makes a shared C++ stdlib viable
-  at all — `std::ios_base::Init`, locale facets and other libc++ static
-  constructors live in the `.so`'s init_array.
+- [x] `done` **Shared LLVM libc++ is built, default in the b1nix-c++ toolchain, and the hosted C++ smoke ecosystem runs on it (v0.75.3).**
+  The full LLVM C++ runtime is cross-built for b1nix and shipped as shared objects in the initramfs: `tools/toolchain/build-libcxx.sh` does a unified LLVM-18 `runtimes` build of `libunwind`+`libc++abi`+`libc++` (musl-libc model), and `tools/toolchain/build-libcxx-shared.sh` links `/lib/libc++.so.1` + `/lib/libc++abi.so.1`. `tools/toolchain/bin/b1nix-c++` defaults to libc++ and links it dynamically. All C++ smoke binaries pass on libc++ shared: `cxx_smoke`, `m55_iostream` (cout/cerr/stringstream/cin + `std::filesystem`), and `m64_clang`.
+- [x] `done` **NetSurf/litehtml migrated to libc++ (v0.75.4).**
+  litehtml + gumbo + `m55_litehtml` are recompiled from source against libc++ and linked dynamically. This moves the NetSurf C++ stack off GCC libstdc++.
+- [x] `done` **Mesa and d8/V8 migrated to libc++ (v0.89.0).**
+  Mesa and d8/V8 are rebuilt and linked dynamically against the shared `libc.so.1` and `libc++.so.1` (no folded STL). All graphic tests pass successfully.
+- [x] `done` **Native LLVM/clang toolchain rebuilt GCC-free on libc++ (v0.89.0).**
+  `libLLVM.so` + `clang` + `lld` recompiled with the clang frontend against b1nix libc++. Native clang works in-VM.
+- [x] `done` **All GCC shared libraries removed from the ISO — libstdc++.so.6 AND libgcc_s.so (v0.89.1).**
+  With the C++ ecosystem on libc++, nothing imports GCC's C++ standard library. `busybox` and `nsfb` link `-static-libgcc`. The initramfs no longer ships `libstdc++.so.6` or `libgcc_s.so`.
+
+- [ ] `planned` **Replace GCC libstdc++ with LLVM libc++ across the C++ ecosystem, built as a shared library.**
+  Today every C++ binary (d8, Mesa C++ glue, NetSurf/litehtml, the M51–M55 ports, `cxx_smoke`/`m55_*`) statically folds GCC's `libstdc++.a`; there is no `libstdc++.so` because the b1nix GCC target is classified newlib/elf and libstdc++'s configure forces `enable_shared=no`. The cleaner long-term path is LLVM libc++, which has no such gate and builds shared straightforwardly. M75 (shared-library `DT_INIT_ARRAY` constructors now run) is the prerequisite that makes a shared C++ stdlib viable at all.
 - **Scope (a real migration, not a flag flip):**
-  1. Build the LLVM runtimes from source for b1nix — `compiler-rt` + `libunwind`
-     (PIC), then `libc++abi` + `libc++` (`tools/toolchain/build-llvm-runtimes.sh`
-     + `build-libcxx.sh`), currently entirely unbuilt.
-  2. Turn those static builds into **shared** `libc++.so` / `libc++abi.so`
-     (`LIBCXX_ENABLE_SHARED=ON`, PIC unwinder/compiler-rt or reuse the existing
-     shared `libgcc_s.so` unwinder), with soname + symbol versioning, linking
-     against the shared `libc.so.1`.
-  3. Make libc++ the default in `tools/toolchain/bin/b1nix-c++` (it is already
-     "preferred when built") and ship `libc++.so`/`libc++abi.so` to `/lib`.
-  4. **Migrate the ecosystem off libstdc++** and re-verify each consumer: d8
-     (V8), Mesa, NetSurf/litehtml, the M51–M55 ports — these were built and tested
-     against libstdc++, so the ABI/header switch is the main risk and must be
-     smoke-verified per port.
-- **Interim shared libstdc++ (path A) — DONE (v0.75.2, this branch).** The
-  ecosystem stays on GCC libstdc++ but the stdlib itself is now **shared**:
-  `tools/toolchain/build-libstdcxx-shared.sh` links a `libstdc++.so.6` from the
-  -fPIC `libstdc++.a` (no GCC rebuild — bypasses the newlib `enable_shared=no`
-  gate), and the C++ smoke binaries (`cxx_smoke`, `m64_clang`, `m55_iostream`,
-  `m55_litehtml`) link it dynamically. **Full C++ runtime works over the .so —
-  ctors (via M75 `DT_INIT_ARRAY`), STL, std::iostream/filesystem, std::thread,
-  RTTI, and cross-DSO exceptions** (a throw inside `libstdc++.so.6` unwinds back
-  into the executable). Smoke 864/0. The hard part was cross-DSO DWARF unwinding:
-  the kernel registers every loaded `.so`'s `.eh_frame` with libgcc's classic
-  registry (found via the section header table; `__b1nix_run_dso_init` calls
-  `__register_frame`), including `libgcc_s.so` itself (its `frame_dummy` is dead —
-  this newlib target has no crti/crtn so the `.so` has no `DT_INIT`). M89 (libc++)
-  remains the longer-term direction but is no longer a prerequisite for dynamic C++.
-- **V8/d8 flipped to the shared libstdc++ — DONE.** `tools/v8/v8-link-d8.sh`
-  resolves d8's C++ runtime from `libstdc++.so.6` + the single shared unwinder
-  `libgcc_s.so` (static `libgcc.a` stays in the group only for the `__multi3`-class
-  builtins libgcc_s.so does not export). The relinked `d8.b1nix` NEEDs
-  `libstdc++.so.6`/`libgcc_s.so`/`libc.so.1` (no folded STL; `std::cout` is a
-  COPY-reloc), runs its own ctors via `DT_INIT_ARRAY`, and **runs `m58.js` to
-  completion (8/8 markers) on all three tiers — jitless, Sparkplug, TurboFan**
-  (`sh tools/v8/v8-build-run.sh`, `SKIP_BUILD=1` to reuse the link). Set
-  `B1NIX_CXX=static` to restore the folded link. The remaining static-libstdc++
-  consumers are the toolchain `clang-22` (its 78MB libLLVM.so is already shared)
-  and the unbuilt Mesa/NetSurf ports (predominantly C; the C++ piece, litehtml,
-  is already dynamic).
+  1. Build the LLVM runtimes from source for b1nix — `compiler-rt` + `libunwind` (PIC), then `libc++abi` + `libc++` (`tools/toolchain/build-llvm-runtimes.sh` + `build-libcxx.sh`), currently entirely unbuilt.
+  2. Turn those static builds into **shared** `libc++.so` / `libc++abi.so` (`LIBCXX_ENABLE_SHARED=ON`, PIC unwinder/compiler-rt or reuse the existing shared `libgcc_s.so` unwinder), with soname + symbol versioning, linking against the shared `libc.so.1`.
+  3. Make libc++ the default in `tools/toolchain/bin/b1nix-c++` (it is already "preferred when built") and ship `libc++.so`/`libc++abi.so` to `/lib`.
+  4. **Migrate the ecosystem off libstdc++** and re-verify each consumer: d8 (V8), Mesa, NetSurf/litehtml, the M51–M55 ports — these were built and tested against libstdc++, so the ABI/header switch is the main risk and must be smoke-verified per port.
+- **Interim shared libstdc++ (path A) — DONE (v0.75.2, this branch).**
+  The ecosystem stays on GCC libstdc++ but the stdlib itself is now **shared**: `tools/toolchain/build-libstdcxx-shared.sh` links a `libstdc++.so.6` from the -fPIC `libstdc++.a`. Smoke 864/0.
+- **V8/d8 flipped to the shared libstdc++ — DONE.**
+  `tools/v8/v8-link-d8.sh` resolves d8's C++ runtime from `libstdc++.so.6` + the single shared unwinder `libgcc_s.so`.
+
+## M90: Complete elimination of GCC from the cross and native toolchains (Pure LLVM/Clang Toolchain)
+
+- [ ] `planned` **Pure LLVM/Clang cross-toolchain (host-side).** 
+  Replace the cross GCC and GNU binutils (`x86_64-b1nix-gcc`, `ld`, `ar`) with host-built LLVM/Clang targeting `x86_64-b1nix`. Use `lld` as the default linker and `llvm-ar` / `llvm-strip` for binary operations. Cross-compile `compiler-rt` (for builtins) and `libunwind` (for unwinding) into the cross sysroot, removing `libgcc.a` and `libgcc_eh.a` entirely.
+- [ ] `planned` **Pure LLVM/Clang native toolchain (inside the VM).**
+  Replace the native GCC and binutils packaged in the ISO/initramfs with native Clang/LLVM (`/bin/clang`, `/bin/lld`, `/bin/llvm-ar`), making compiler-rt/libc++abi/libc++ the only C++ development runtime available on b1nix. Integrate the GCC-free native clang build from [build-native-clang-libcxx.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-native-clang-libcxx.sh) into the main `Makefile` install targets.
+- [ ] `planned` **Migrate remaining ports off GCC components.**
+  Update the NetSurf framebuffer builder ([build-netsurf-fb.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/ports/build-netsurf-fb.sh)) to compile with cross-Clang instead of `x86_64-b1nix-gcc`. Modify C++ demos (`build-m52-mesa-demo.sh` etc.) to drop the fallback to `x86_64-b1nix-gcc` and link against LLVM runtimes only, utilizing `linker-libcxx.ld`. Ensure no port copies or links GCC's internal startup files (`crtbegin.o`, `crtend.o`).
+- [ ] `planned` **GCC-free Rust compiler.**
+  Update [build-rust-native.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-rust-native.sh) and `build-rust-toolchain.sh` to compile and link Rust targets using `lld` and `libunwind.a`/`libcompiler_rt.a` instead of GCC and `libgcc_eh.a`.
+

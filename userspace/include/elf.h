@@ -327,9 +327,17 @@ typedef struct {
 #define PT_DYNAMIC 2
 #define PT_INTERP 3
 #define PT_NOTE 4
+#define PT_SHLIB 5
 #define PT_PHDR 6
 #define PT_TLS 7
-#define PT_GNU_STACK 0x6474e551
+#define PT_LOOS 0x60000000
+#define PT_GNU_EH_FRAME 0x6474e550 /* GCC .eh_frame_hdr segment */
+#define PT_GNU_STACK 0x6474e551    /* stack executability */
+#define PT_GNU_RELRO 0x6474e552    /* read-only after relocation */
+#define PT_GNU_PROPERTY 0x6474e553 /* GNU property notes */
+#define PT_HIOS 0x6fffffff
+#define PT_LOPROC 0x70000000
+#define PT_HIPROC 0x7fffffff
 
 /* d_tag — dynamic-section entry tags (added for the Chromium port, M60-62; values
  * are the standard System V / GNU ELF ABI ones, needed by abseil's ELF/VDSO

@@ -16,6 +16,13 @@
  * unlike the broad _POSIX_VERSION above) so monotonic-clock code paths compile. */
 #define _POSIX_MONOTONIC_CLOCK 200809L
 
+/* b1nix provides clock_gettime plus the POSIX per-process timer API
+ * (timer_create/timer_settime/timer_gettime — M74), so advertise the Timers
+ * option. LLVM libc++'s <chrono> gates steady_clock on _POSIX_TIMERS > 0 to pick
+ * the clock_gettime(CLOCK_MONOTONIC) backend; without it the build errors with
+ * "Monotonic clock not implemented on this platform". */
+#define _POSIX_TIMERS 200809L
+
 #define _PC_NAME_MAX 3
 #define _PC_PATH_MAX 4
 static inline long pathconf(const char *path, int name) {

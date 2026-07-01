@@ -1671,19 +1671,50 @@ int fstatat(int dirfd, const char *pathname, struct stat *statbuf, int flags) {
   return stat(pathname, statbuf);
 }
 
-int unlinkat(int dirfd, const char *pathname, int flags) {
-  if (dirfd != AT_FDCWD) {
-    if (pathname && pathname[0] == '/') {
-      /* absolute path */
-    } else {
-      errno = ENOSYS;
+/* Resolve an *at() (dirfd, path) pair into a path that the plain (non-*at) libc
+ * calls can use. AT_FDCWD or an absolute path pass through unchanged; a relative
+ * path against a real directory fd is joined onto that directory's absolute path,
+ * obtained from the kernel via SYS_FD_PATH (b1nix has no per-fd-base resolver in
+ * the kernel path walker, so this is how the *at family is emulated). Returns 0
+ * on success (writing the effective path into out) or -1 with errno set.
+ *
+ * This is what makes LLVM libc++'s std::filesystem::remove_all work: its
+ * openat()-family implementation opens the parent directory and then issues
+ * openat()/unlinkat(parent_fd, <relative entry>, …) with a real dirfd. */
+static int resolve_at_path(int dirfd, const char *path, char *out, size_t outsz) {
+  if (!path) {
+    errno = EFAULT;
+    return -1;
+  }
+  if (dirfd == AT_FDCWD || path[0] == '/') {
+    if (strlen(path) >= outsz) {
+      errno = ENAMETOOLONG;
       return -1;
     }
+    strcpy(out, path);
+    return 0;
   }
-  if (flags & AT_REMOVEDIR) {
-    return rmdir(pathname);
+  char dirpath[4096];
+  long len = syscall(SYS_FD_PATH, (long)dirfd, (long)(size_t)dirpath,
+                     (long)sizeof(dirpath), 0, 0);
+  if (len < 0) {
+    errno = (len == -ENAMETOOLONG) ? ENAMETOOLONG : EBADF;
+    return -1;
   }
-  return unlink(pathname);
+  if ((size_t)snprintf(out, outsz, "%s/%s", dirpath, path) >= outsz) {
+    errno = ENAMETOOLONG;
+    return -1;
+  }
+  return 0;
+}
+
+int unlinkat(int dirfd, const char *pathname, int flags) {
+  char full[4096];
+  if (resolve_at_path(dirfd, pathname, full, sizeof(full)) != 0)
+    return -1;
+  if (flags & AT_REMOVEDIR)
+    return rmdir(full);
+  return unlink(full);
 }
 
 int openat(int dirfd, const char *path, int flags, ...) {
@@ -1694,15 +1725,10 @@ int openat(int dirfd, const char *path, int flags, ...) {
     mode = va_arg(ap, unsigned int);
     va_end(ap);
   }
-  if (dirfd != AT_FDCWD) {
-    if (path && path[0] == '/') {
-      /* absolute path */
-    } else {
-      errno = ENOSYS;
-      return -1;
-    }
-  }
-  return open(path, flags, mode);
+  char full[4096];
+  if (resolve_at_path(dirfd, path, full, sizeof(full)) != 0)
+    return -1;
+  return open(full, flags, mode);
 }
 
 int futimens(int fd, const struct timespec times[2]) {

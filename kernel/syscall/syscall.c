@@ -4109,6 +4109,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     }
     return (u64)total;
   }
+  case SYS_FD_PATH: {
+    /* SYS_FD_PATH(fd, buf, size) — write the absolute path of an open fd into
+     * buf (NUL-terminated), returning the path length. Backs libc's *at()
+     * emulation: openat/unlinkat with a real dirfd resolve the dirfd to its path
+     * here, then join the relative component (b1nix has no per-fd-base path
+     * resolver in the kernel path walker). */
+    int fd = (int)arg0;
+    char kbuf[VFS_MAX_PATH];
+    usize cap = (usize)arg2;
+    if (cap == 0)
+      return (u64)-EINVAL;
+    if (cap > sizeof(kbuf))
+      cap = sizeof(kbuf);
+    int rc = vfs_fd_abspath(fd, kbuf, cap);
+    if (rc < 0)
+      return (u64)rc;
+    if (syscall_copyout((void *)(usize)arg1, kbuf, (usize)rc + 1) < 0)
+      return (u64)-EFAULT;
+    return (u64)rc;
+  }
   case SYS_GETTID:
     return (u64)scheduler_get_pid();
   case SYS_EXIT_THREAD:

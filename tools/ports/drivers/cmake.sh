@@ -61,16 +61,34 @@ GXX="$CROSS/$B1NIX_TRIPLET-g++"
 SYSROOT="$("$GCC" -print-sysroot 2>/dev/null)"
 [ -n "$SYSROOT" ] || SYSROOT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/$B1NIX_TRIPLET"
 
-# Resolve C++ frontend: clang++ (default) or g++ (legacy fallback)
-CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
-case "$CXX_FRONTEND" in
-  gcc)
-    USE_CXX="$GXX"
-    ;;
-  clang|*)
-    USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
-    ;;
-esac
+# Resolve C++ frontend / stdlib. With B1NIX_CXX_STDLIB=libc++ the port's C++ is
+# compiled against LLVM libc++ (ABI-incompatible with libstdc++, so the whole port
+# must recompile) using the shared resolve_cxx_cross flags — clang + libc++ headers
+# via --sysroot/-nostdinc++. Otherwise the legacy clang/g++ + libstdc++ path.
+CXX_LIBCXX_FLAGS=""
+CC_LIBCXX_FLAGS=""
+USE_CC="$GCC"
+if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+  resolve_cxx_cross
+  USE_CXX="$CXX_CROSS"
+  CXX_LIBCXX_FLAGS="$CXXFLAGS_CROSS"
+  # Mixed C/C++ ports (e.g. libjxl) require one compiler family for C and C++.
+  # In libc++ mode C++ is clang, so compile the C sources with clang too, targeting
+  # b1nix. C needs no libc++ — just the target + sysroot (clang adds its own C
+  # headers); this keeps CMake's "GNU vs Clang" identity check happy.
+  USE_CC="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$GCC")}"
+  CC_LIBCXX_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$SYSROOT -O2 -ffunction-sections -fdata-sections -Db1nix"
+else
+  CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
+  case "$CXX_FRONTEND" in
+    gcc)
+      USE_CXX="$GXX"
+      ;;
+    clang|*)
+      USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
+      ;;
+  esac
+fi
 
 # Stage the b1nix libc/libstdc++ into the cross sysroot (idempotent). Skip with
 # CMAKE_STAGE_CXX=0 for the few ports that historically did not do this.
@@ -92,7 +110,7 @@ TC="$BUILD_DIR/b1nix-toolchain.cmake"
 {
   echo "set(CMAKE_SYSTEM_NAME $CMAKE_SYSTEM_NAME)"
   echo "set(CMAKE_SYSTEM_PROCESSOR $B1NIX_GCC_ARCH)"
-  echo "set(CMAKE_C_COMPILER \"$GCC\")"
+  echo "set(CMAKE_C_COMPILER \"$USE_CC\")"
   echo "set(CMAKE_CXX_COMPILER \"$USE_CXX\")"
   echo "set(CMAKE_SYSROOT \"$SYSROOT\")"
   echo "set(CMAKE_TRY_COMPILE_TARGET_TYPE STATIC_LIBRARY)"
@@ -111,7 +129,7 @@ fi
 
 # Export CC/CXX — cmake 4 sometimes ignores CMAKE_CXX_COMPILER from the toolchain
 # file for C++ projects. Env vars are the reliable fallback.
-export CC="$GCC"
+export CC="$USE_CC"
 export CXX="$USE_CXX"
 
 # When CMAKE_SKIP_TOOLCHAIN=1, pass all cross-compile settings as cmake args
@@ -129,6 +147,12 @@ fi
 
 cd "$BUILD_DIR/cmake"
 # shellcheck disable=SC2086
+# libc++ compile flags reach the C++ compiler via the CXXFLAGS env (cmake folds
+# it into CMAKE_CXX_FLAGS at first configure) — passing them as a -DCMAKE_CXX_FLAGS
+# arg would word-split in the unquoted expansion below and cmake would reject the
+# individual flags.
+[ -n "$CXX_LIBCXX_FLAGS" ] && export CXXFLAGS="$CXX_LIBCXX_FLAGS${CXXFLAGS:+ $CXXFLAGS}"
+[ -n "$CC_LIBCXX_FLAGS" ]  && export CFLAGS="$CC_LIBCXX_FLAGS${CFLAGS:+ $CFLAGS}"
 cmake "$SRC_DIR" \
   $TC \
   -DCMAKE_BUILD_TYPE=Release \

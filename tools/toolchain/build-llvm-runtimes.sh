@@ -69,6 +69,12 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_RANLIB="$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)"
     -DCMAKE_C_COMPILER_TARGET="$B1NIX_TRIPLET"
     -DCMAKE_CXX_COMPILER_TARGET="$B1NIX_TRIPLET"
+    # Enable the assembler too: libunwind's register save/restore lives in .S
+    # files (UnwindRegisters{Save,Restore}.S). Without an ASM compiler set for the
+    # cross target, CMake silently drops them and the archive ends up missing
+    # __unw_getcontext / __libunwind_Registers_*_jumpto, breaking any C++ link.
+    -DCMAKE_ASM_COMPILER="$CLANG_BIN"
+    -DCMAKE_ASM_COMPILER_TARGET="$B1NIX_TRIPLET"
     -DCMAKE_SYSROOT="$SYSROOT"
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
     -DCMAKE_BUILD_TYPE=Release
@@ -95,8 +101,11 @@ if [ ! -f "$INSTALL_DIR/lib/libcompiler_rt.a" ]; then
         2>&1 | tail -5
     make -j"$NPROC" 2>&1 | tail -5
 
-    # Find the produced .a file
-    CRT_A=$(find . -name "libclang_rt.builtins-*.a" -o -name "libcompiler_rt.builtins.a" | head -1)
+    # Find the produced .a file. compiler-rt's builtins build can emit BOTH a
+    # primary (x86_64) and a secondary 32-bit (i386) archive; pick the one that
+    # matches our target arch, never let `head -1` grab the wrong width.
+    CRT_A=$(find . -name "libclang_rt.builtins-${B1NIX_GCC_ARCH}.a" | head -1)
+    [ -n "$CRT_A" ] || CRT_A=$(find . -name "libclang_rt.builtins-*.a" -o -name "libcompiler_rt.builtins.a" | head -1)
     if [ -n "$CRT_A" ]; then
         cp "$CRT_A" "$INSTALL_DIR/lib/libcompiler_rt.a"
         ln -sf libcompiler_rt.a "$INSTALL_DIR/lib/libclang_rt.builtins-${B1NIX_GCC_ARCH}.a"
@@ -152,6 +161,16 @@ if [ ! -f "$INSTALL_DIR/lib/libunwind.a" ]; then
 fi
 
 cd "$PROJECT_DIR"
+
+# Strip the LLVM_DEPENDENT_LIBRARIES (.deplibs) section. compiler-rt/libunwind
+# record "dl"/"pthread" there as autolink hints, but b1nix folds dl/pthread/rt into
+# libc (no standalone libdl.a/libpthread.a), so a static consumer linked with
+# ld.lld would otherwise fail: "unable to find library from dependent library
+# specifier: dl". Removing it makes these archives link cleanly everywhere.
+OBJCOPY_BIN="$(command -v llvm-objcopy 2>/dev/null || echo llvm-objcopy)"
+for f in "$INSTALL_DIR"/lib/*.a; do
+    [ -f "$f" ] && "$OBJCOPY_BIN" --remove-section=.deplibs "$f" 2>/dev/null || true
+done
 
 # ── 4. Install into cross sysroot ─────────────────────────────────────────────
 echo ""

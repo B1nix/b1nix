@@ -137,7 +137,11 @@ echo "Building BusyBox..."
 # holds only libc.a, so without this -L the link silently falls back to static
 # libc even though -static was dropped.
 export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include"
-export EXTRA_LDFLAGS="-Wl,-Ttext-segment=0x2000000 -L$SYSROOT/lib --sysroot=$SYSROOT"
+# -static-libgcc folds the handful of libgcc integer builtins (__udivdi3 etc.)
+# statically instead of importing the shared libgcc_s.so, so busybox — a pure-C
+# port — carries NO DT_NEEDED GCC runtime. This lets the ISO drop libgcc_s.so
+# once no other shipped binary needs it (part of the M89 GCC-free goal).
+export EXTRA_LDFLAGS="-Wl,-Ttext-segment=0x2000000 -static-libgcc -L$SYSROOT/lib --sysroot=$SYSROOT"
 
 # Wire ccache into the busybox build (byte-identical objects, faster rebuilds).
 if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then

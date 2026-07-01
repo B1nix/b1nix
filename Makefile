@@ -132,6 +132,12 @@ INITRAMFS_LIBGCC_S_INC := $(BUILD_DIR)/initramfs_libgcc_s.inc
 # /lib/libstdc++.so.6 — shared GCC C++ stdlib (linked from the PIC libstdc++.a),
 # so dynamically-linked C++ binaries import std::/__cxa_* instead of folding it.
 INITRAMFS_LIBSTDCXX_INC := $(BUILD_DIR)/initramfs_libstdcxx.inc
+# /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89), linked
+# from the PIC libc++.a/libc++abi.a by build-libcxx-shared.sh. The hosted C++
+# smoke binaries (cxx_smoke/m55_iostream/m55_litehtml/m64_clang) link these via
+# the libc++-default b1nix-c++; libc++abi.so.1 folds the libunwind DWARF unwinder.
+INITRAMFS_LIBCXX_INC := $(BUILD_DIR)/initramfs_libcxx.inc
+INITRAMFS_LIBCXXABI_INC := $(BUILD_DIR)/initramfs_libcxxabi.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -167,8 +173,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_M69_PLUGIN_INC) \
-	$(INITRAMFS_LIBGCC_S_INC) \
-	$(INITRAMFS_LIBSTDCXX_INC) \
+	$(INITRAMFS_LIBCXX_INC) \
+	$(INITRAMFS_LIBCXXABI_INC) \
 	$(INITRAMFS_CURL_INC) \
 	$(INITRAMFS_WGET_INC) \
 	$(INITRAMFS_CACERT_INC) \
@@ -664,15 +670,17 @@ $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSP
 	xxd -i -n vfs_m55_iostream_elf userspace/build/$(ARCH)/bin/m55_iostream > $@
 
 # Serialize the Mesa build to prevent race conditions during parallel builds.
+# M89: Mesa C++ is built against the shared LLVM libc++ (the static Mesa archives
+# fold libc++/libc++abi; the demos link them — see build-m52-mesa-demo.sh).
 $(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
 	@touch $@
 
 # M52: real Mesa OSMesa (software OpenGL) demo. The shared demo builder builds
 # the whole Mesa stack (build-mesa.sh) and links the demo against it.
 $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa userspace/build/$(ARCH)/bin/m52_osmesa
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa userspace/build/$(ARCH)/bin/m52_osmesa
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_osmesa_elf userspace/build/$(ARCH)/bin/m52_osmesa > $@
 
@@ -680,14 +688,14 @@ $(BUILD_DIR)/initramfs_m52_osmesa.inc: userspace/bin/m52_osmesa.c tools/demos/bu
 # b1nix /dev/virtio-gpu winsys. tools/demos/build-m53-mesa-virgl.sh builds the Mesa
 # stack (with the virgl driver) and links the pipe-API render test against it.
 $(BUILD_DIR)/initramfs_m53_mesa_virgl.inc: userspace/bin/m53_mesa_virgl.c tools/demos/build-m53-mesa-virgl.sh $(BUILD_DIR)/.mesa-built $(wildcard tools/patches/mesa/files/src/gallium/winsys/virgl/b1nix/*) $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh userspace/build/$(ARCH)/bin/m53_mesa_virgl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m53_mesa_virgl_elf userspace/build/$(ARCH)/bin/m53_mesa_virgl > $@
 
 # M52: programmable GLSL shader demo, sharing the same Mesa build as the OSMesa
 # demo. Exercises the GL 2.x programmable pipeline (shaders, VBOs, varyings).
 $(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-m52-mesa-demo.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl userspace/build/$(ARCH)/bin/m52_glsl
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl userspace/build/$(ARCH)/bin/m52_glsl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_glsl_elf userspace/build/$(ARCH)/bin/m52_glsl > $@
 
@@ -696,15 +704,17 @@ $(BUILD_DIR)/initramfs_m52_glsl.inc: userspace/bin/m52_glsl.c tools/demos/build-
 # with the off-screen pbuffer smoke and links them against the same Mesa stack
 # as the M52 OSMesa demo. The smoke renders entirely off-screen (no displayd).
 $(BUILD_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl/b1egl_mesa.c userspace/include/EGL/egl.h tools/demos/build-m59-egl.sh $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/demos/build-m59-egl.sh userspace/build/$(ARCH)/bin/m59_smoke
+	B1NIX_ARCH=$(ARCH) B1NIX_CXX_STDLIB=libc++ tools/demos/build-m59-egl.sh userspace/build/$(ARCH)/bin/m59_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m59_smoke_elf userspace/build/$(ARCH)/bin/m59_smoke > $@
 
 # M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
 # tools/demos/build-m55-litehtml.sh builds litehtml+gumbo (build-litehtml.sh) and
-# links the parse/layout/draw acceptance test against them + libstdc++/libm.
+# links the parse/layout/draw acceptance test against them. M89: litehtml is built
+# against the shared LLVM libc++ (B1NIX_CXX_STDLIB=libc++) — NetSurf's only C++
+# component, so this also moves the NetSurf C++ stack off GCC libstdc++.
 $(BUILD_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/demos/build-m55-litehtml.sh tools/ports/build-litehtml.sh $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh userspace/build/$(ARCH)/bin/m55_litehtml
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh userspace/build/$(ARCH)/bin/m55_litehtml
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m55_litehtml_elf userspace/build/$(ARCH)/bin/m55_litehtml > $@
 
@@ -977,6 +987,18 @@ $(INITRAMFS_LIBSTDCXX_INC): tools/toolchain/build-libstdcxx-shared.sh $(CROSS_TO
 	@mkdir -p $(dir $@)
 	ARCH=$(ARCH) tools/toolchain/build-libstdcxx-shared.sh >/dev/null
 	xxd -i -n vfs_libstdcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.so.6 > $@
+
+# /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). One
+# build-libcxx-shared.sh run links BOTH .so from the PIC libc++.a/libc++abi.a; the
+# abi .inc rule depends on the libc++ .inc so the script runs exactly once.
+$(INITRAMFS_LIBCXX_INC): tools/toolchain/build-libcxx-shared.sh $(dir $(CROSS_TOOLCHAIN_ROOT))llvm-runtimes-build/libcxx-install/lib/libc++.a $(INITRAMFS_SHARED_LIBC_INC)
+	@mkdir -p $(dir $@)
+	ARCH=$(ARCH) tools/toolchain/build-libcxx-shared.sh >/dev/null
+	xxd -i -n vfs_libcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++.so.1 > $@
+
+$(INITRAMFS_LIBCXXABI_INC): $(INITRAMFS_LIBCXX_INC)
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_libcxxabi_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)

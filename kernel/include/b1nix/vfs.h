@@ -230,6 +230,7 @@ isize vfs_readlink(const char *path, char *buffer, usize size);
 int vfs_rename(const char *old_path, const char *new_path);
 int vfs_rmdir(const char *path);
 int vfs_fstat(int fd, struct b1nix_stat *st);
+int vfs_fd_abspath(int fd, char *buf, usize size);
 int vfs_fsync(int fd);
 int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);

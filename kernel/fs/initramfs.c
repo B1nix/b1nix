@@ -75,13 +75,20 @@
 #include "initramfs_m40_linux.inc"
 /* M67: prebuilt static Rust ELF for the Rust cross-toolchain smoke. x86_64 only. */
 #include "initramfs_m67_rust.inc"
-/* /lib/libgcc_s.so for the dynamically-linked C/C++ port binaries (the
- * --enable-shared x86_64 cross GCC gives them DT_NEEDED libgcc_s.so). x86_64. */
-#include "initramfs_libgcc_s.inc"
-/* /lib/libstdc++.so.6 — shared GCC C++ stdlib so C++ binaries import std::/
- * __cxa_* rather than folding ~15 MB statically. Its init_array constructors
- * (std::ios_base::Init, locale facets) run via M75. x86_64. */
-#include "initramfs_libstdcxx.inc"
+/* M89: GCC libgcc_s.so is no longer shipped — busybox and nsfb now fold the
+ * libgcc builtins statically (-static-libgcc) and the C++ stack is on libc++,
+ * so no default binary carries DT_NEEDED libgcc_s.so. (The on-demand rust proof
+ * bundles its own libgcc_s.so in its ram0 module.) */
+/* M89: GCC libstdc++.so.6 is no longer shipped — the whole C++ ecosystem
+ * (smoke binaries, Mesa, V8/d8, litehtml, the native clang/libLLVM) is migrated
+ * to LLVM libc++, so nothing imports it anymore. */
+/* /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). The
+ * hosted C++ smoke binaries link these via the libc++-default b1nix-c++.
+ * libc++abi.so.1 folds the libunwind DWARF unwinder; cross-DSO C++ exceptions
+ * work via dl_iterate_phdr + each object's PT_GNU_EH_FRAME (no __register_frame).
+ * Their init_array constructors run via M75. x86_64. */
+#include "initramfs_libcxx.inc"
+#include "initramfs_libcxxabi.inc"
 #endif
 #include "initramfs_m42_w5pre_smoke.inc"
 #include "initramfs_m46_smoke.inc"
@@ -1600,17 +1607,18 @@ static const struct initramfs_file files[] = {
      * b1nix libc via the cross gcc. Exercises the Rust std unix PAL at runtime. */
     {"/bin/m67-rust", (const char *)vfs_m67_rust_elf,
      sizeof(vfs_m67_rust_elf), INITRAMFS_EXECUTABLE},
-    /* The cross GCC's libgcc_s.so.1, exposed at the soname /lib/libgcc_s.so that
-     * the dynamically-linked C/C++ port binaries (NetSurf, m53 servers, ...)
-     * carry as DT_NEEDED. The M69 exec-time linker resolves it. */
-    {"/lib/libgcc_s.so", (const char *)vfs_libgcc_s_elf,
-     sizeof(vfs_libgcc_s_elf), INITRAMFS_EXECUTABLE},
-    /* Shared GCC C++ standard library. C++ binaries carry DT_NEEDED
-     * libstdc++.so.6; the M69 exec-time linker resolves it (and its own
-     * DT_NEEDED libc.so.1 / libgcc_s.so). */
-    {"/lib/libstdc++.so.6", (const char *)vfs_libstdcxx_elf,
-     sizeof(vfs_libstdcxx_elf), INITRAMFS_EXECUTABLE},
-    {"/lib/libstdc++.so", "/lib/libstdc++.so.6", 20, INITRAMFS_SYMLINK},
+    /* M89: /lib/libgcc_s.so removed — busybox/nsfb fold libgcc statically and the
+     * C++ stack is on libc++, so nothing carries DT_NEEDED libgcc_s.so. */
+    /* M89: /lib/libstdc++.so.6 removed — the C++ ecosystem is on libc++ now. */
+    /* Shared LLVM C++ standard library (M89). libc++-linked binaries carry
+     * DT_NEEDED libc++.so.1 -> libc++abi.so.1 -> libc.so.1; the M69 exec-time
+     * linker resolves the chain. libc++abi.so.1 folds the libunwind unwinder. */
+    {"/lib/libc++.so.1", (const char *)vfs_libcxx_elf,
+     sizeof(vfs_libcxx_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc++.so", "/lib/libc++.so.1", 17, INITRAMFS_SYMLINK},
+    {"/lib/libc++abi.so.1", (const char *)vfs_libcxxabi_elf,
+     sizeof(vfs_libcxxabi_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc++abi.so", "/lib/libc++abi.so.1", 20, INITRAMFS_SYMLINK},
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},

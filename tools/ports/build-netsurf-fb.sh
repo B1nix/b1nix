@@ -104,7 +104,17 @@ stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + 
 stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain scoping)
 stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
 stage build-libutf8proc.sh # libutf8proc.a — Unicode/IDNA (utils/idna.c)
-stage build-libjxl.sh      # libjxl_dec.a (+cms/hwy/brotli) — JPEG-XL decode (C++)
+# libjxl (JPEG-XL, C++) is built against LLVM libc++ (not GCC libstdc++) so nsfb
+# carries no GCC C++ code. Its bundled skcms uses raw AVX/F16C *GCC* intrinsics
+# (__builtin_ia32_vcvtph2ps256) that clang neither compiles nor — as baseline
+# instructions — runs on the plain QEMU CPU (SIGILL). -DSKCMS_PORTABLE forces skcms
+# to its scalar path (N=1): compiles cleanly under clang and runs on any CPU. Highway
+# (the image codec SIMD) is clang-native and does its own runtime ISA dispatch, so it
+# needs no baseline flags.
+JXL_INST="$(CFLAGS='-DSKCMS_PORTABLE' CXXFLAGS='-DSKCMS_PORTABLE' \
+  B1NIX_ARCH="$B1NIX_ARCH" B1NIX_CXX_STDLIB=libc++ "$ROOT_DIR/tools/ports/build-libjxl.sh")"
+cp -R "$JXL_INST/include/." "$SYSROOT/include/" 2>/dev/null || true
+cp -R "$JXL_INST/lib/." "$SYSROOT/lib/" 2>/dev/null || true
 # NOTE: libharu (PDF export) is ported as a standalone library
 # (tools/ports/build-libharu.sh builds libhpdf.a), but NetSurf 3.11's PDF glue is
 # upstream bit-rot — desktop/font_haru.c needs the removed desktop/font.h and a
@@ -261,9 +271,14 @@ emit_pc libsvgtiny      "-lsvgtiny -lexpat" "libdom libwapcaplet"
 emit_pc libnspsl        "-lnspsl"         ""
 emit_pc librosprite     "-lrosprite"      ""
 emit_pc libutf8proc     "-lutf8proc"      ""
-# libjxl is C++ (STL/libstdc++) with circular static deps between jxl_dec/jxl_cms
-# /hwy — group them and pull the C++ runtime so the C-linked nsfb resolves them.
-emit_pc libjxl  "-Wl,--start-group -ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotlicommon -Wl,--end-group -lstdc++ -lsupc++" ""
+# libjxl is C++ (built against LLVM libc++, see the libc++ build above) with circular
+# static deps between jxl_dec/jxl_cms/hwy — group them and fold the LLVM C++ runtime
+# statically (libc++.a + libc++abi.a + libunwind.a) so the C-linked nsfb resolves the
+# std::__1 symbols with NO GCC libstdc++ code. libc++abi folds the libunwind DWARF
+# unwinder for libjxl's C++ exceptions.
+NS_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+NS_LLVMRT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib"
+emit_pc libjxl  "-Wl,--start-group -ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotlicommon -Wl,--end-group -Wl,-Bstatic $NS_LIBCXX/libc++.a $NS_LIBCXX/libc++abi.a $NS_LLVMRT/libunwind.a -Wl,-Bdynamic" ""
 # libnsfb is always linked by the framebuffer frontend. NetSurf already adds its
 # own -lm (after -lpng16), so only the compat shims go here — and they must come
 # last so libm's fenv/scalbnl/creal references resolve against them.
@@ -789,6 +804,17 @@ fi
 # HOST only names NetSurf's per-build OBJROOT (build/$(HOST)-$(TARGET)); the
 # actual target compiler comes from GCCSDK_INSTALL_CROSSBIN. Key it by arch so
 # the x86 and x86_64 builds don't share (and overwrite) each other's objects.
+# -static-libgcc: fold the libgcc integer/soft-float builtins (__udivmodti4 etc.)
+# statically so nsfb carries NO DT_NEEDED libgcc_s.so. This is only safe because
+# libjxl's C++ runtime is now forced STATIC (-Wl,-Bstatic -lstdc++, see emit_pc
+# libjxl below) — with a shared libstdc++.so DSO in the link, ld rejected the
+# hidden static __udivmodti4 it referenced. With both the C++ stdlib and libgcc
+# folded, nsfb's only DT_NEEDED is libc.so.1, letting the ISO drop libgcc_s.so.
+# --defsym __dso_handle=0: the clang-built libc++ libjxl references __dso_handle
+# (the __cxa_atexit DSO token for static-object destructors), which b1nix's cross-gcc
+# crtbegin does not provide on this newlib target for a C-driver link. 0 = "the main
+# program", the correct token for a non-PIE executable.
+export LDFLAGS="${LDFLAGS:-} -static-libgcc -Wl,--defsym=__dso_handle=0"
 make -C "$SRC_DIR" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \

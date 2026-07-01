@@ -3770,6 +3770,49 @@ int vfs_fstat(int fd, struct b1nix_stat *st) {
   return vfs_stat_node(node, st);
 }
 
+/* Absolute path of an open fd, written NUL-terminated into buf. Backs the libc
+ * *at() emulation (openat/unlinkat with a real dirfd + relative name): b1nix has
+ * no per-fd-base path resolver, so libc resolves the dirfd to its path here and
+ * joins the relative component. Built by walking node->parent under the VFS tree
+ * read lock (a concurrent rmdir could otherwise free an ancestor mid-walk).
+ * Returns the path length on success, or a negative errno. */
+int vfs_fd_abspath(int fd, char *buf, usize size) {
+  if (!buf || size < 2)
+    return -EINVAL;
+  struct vfs_node *node = vfs_find_node_by_fd(fd);
+  if (IS_ERR(node))
+    return (int)PTR_ERR(node);
+
+  /* Collect the basename of each ancestor (deepest first), stopping at the root
+   * (parent == NULL), then emit them root-first as "/a/b/c". */
+  const char *parts[64];
+  int n = 0;
+  u64 flags;
+  vfs_tree_read_acquire(&flags);
+  for (struct vfs_node *c = node; c && c->parent && n < 64; c = c->parent)
+    parts[n++] = c->name;
+
+  usize pos = 0;
+  if (n == 0) {
+    buf[pos++] = '/'; /* the fd refers to the root itself */
+  } else {
+    for (int i = n - 1; i >= 0; i--) {
+      const char *name = parts[i];
+      usize pl = name ? strlen(name) : 0;
+      if (pos + 1 + pl + 1 > size) {
+        vfs_tree_read_release(flags);
+        return -ENAMETOOLONG;
+      }
+      buf[pos++] = '/';
+      memcpy(buf + pos, name, pl);
+      pos += pl;
+    }
+  }
+  buf[pos] = '\0';
+  vfs_tree_read_release(flags);
+  return (int)pos;
+}
+
 int vfs_fsync(int fd) {
   struct vfs_handle *h = scheduler_fd_get(fd);
   if (!h || h->kind != VFS_HANDLE_NODE)
