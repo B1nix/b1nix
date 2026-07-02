@@ -119,18 +119,25 @@ for libdir in "$TC/sysroot/lib" "$TC/cross/x86_64-b1nix/lib"; do
     # building dynamic, its C mem*/str* members are NOT pulled: the target spec
     # forces the shared libc.so in early (--no-as-needed -lc), so those symbols
     # resolve from it before this archive is reached; only the math members are
-    # pulled. This also keeps the libgcc/unwinder resolution that COMBINED needs.
+    # pulled. The unwinder/builtins come from the LLVM runtimes staged below.
     stage_file "$COMBINED" "$libdir/libm.a"
     stage_file "$CRT0" "$libdir/crt0.o"
-    # Rust's `unwind` crate links `-lunwind` (LLVM libunwind name) on musl+crt-static.
-    # Copy the real LLVM libunwind.a from the sysroot.
-    _unw="$TC/sysroot/usr/lib/libunwind.a"
-    if [ -f "$_unw" ]; then
-        cp -f "$_unw" "$libdir/libunwind.a"
-    else
-        _eh="$("$CROSS/x86_64-b1nix-gcc" -print-file-name=libunwind.a 2>/dev/null || echo)"
-        [ -f "$_eh" ] && cp -f "$_eh" "$libdir/libunwind.a"
-    fi
+    # M90 GCC-free: the b1nix target spec links the LLVM runtimes for the unwinder
+    # and compiler builtins instead of libgcc_s — `-lunwind` (whole-archived into
+    # the rustc exe) provides _Unwind_*/__register_frame, `-lcompiler_rt` provides
+    # the 128-bit / popcount builtins. Rust's `unwind` crate also links `-lunwind`
+    # on musl+crt-static. Stage both archives into every cross lib dir.
+    for _rt in libunwind.a libcompiler_rt.a; do
+        _src="$TC/sysroot/usr/lib/$_rt"
+        [ -f "$_src" ] || _src="$TC/llvm-runtimes-build/install/lib/$_rt"
+        [ -f "$_src" ] || _src="$TC/cross/x86_64-b1nix/lib/$_rt"
+        if [ -f "$_src" ]; then
+            cp -f "$_src" "$libdir/$_rt"
+        else
+            _pf="$("$CROSS/x86_64-b1nix-gcc" -print-file-name="$_rt" 2>/dev/null || echo)"
+            [ -f "$_pf" ] && cp -f "$_pf" "$libdir/$_rt"
+        fi
+    done
 done
 
 # Verify the staging actually landed in EVERY search path. The shared

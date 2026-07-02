@@ -820,8 +820,8 @@ void kernel_main(usize arg0, usize arg1)
 		}
 	}
 
-	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so + libLLVM.so +
-	 * libgcc_s.so + the std sysroot (~hundreds of MB) are far too big for the
+	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so (LLVM folded in) +
+	 * the std sysroot (~hundreds of MB) are far too big for the
 	 * xxd-embedded initramfs, so — like d8 above — they ship as a GRUB
 	 * Multiboot2 module (grub.cfg `module2 /boot/rust.img`) exposed as the ram0
 	 * ext4 block device. With b1nix.rustrun the kernel mounts it and launches
@@ -843,7 +843,7 @@ void kernel_main(usize arg0, usize arg1)
 			snprintf(rust_buf, sizeof(rust_buf), "rust: rustc spawn result: %d\n", rust_pid);
 			console_write(rust_buf);
 			/* A valid pid means user_load_elf64 resolved and relocated the whole
-			 * rustc -> librustc_driver.so -> libLLVM.so -> libgcc_s.so graph
+			 * rustc -> librustc_driver.so (LLVM folded) -> libc.so.1 graph
 			 * (~250MB) through the M69 exec-time dynamic linker. rustc then prints
 			 * its real version banner ("rustc 1.x ...") when it runs — that banner
 			 * is the execution proof the smoke runner checks for. */

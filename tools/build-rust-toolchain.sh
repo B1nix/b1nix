@@ -27,6 +27,12 @@ export CARGO_HOME="$RUST/cargo"
 export PATH="$CROSS_BIN:$RUST/cargo/bin:$PATH"
 
 [ -x "$CROSS_BIN/x86_64-b1nix-gcc" ] || { echo "error: cross gcc missing; run tools/build-toolchain.sh"; exit 1; }
+# The JSON target spec lives (gitignored) in build/rust/targets; stage the tracked
+# canonical copy from tools/patches/rust on a fresh checkout so M67 is reproducible.
+if [ ! -f "$TARGET_JSON" ] && [ -f "$ROOT/tools/patches/rust/x86_64-unknown-b1nix.json" ]; then
+    mkdir -p "$(dirname "$TARGET_JSON")"
+    cp "$ROOT/tools/patches/rust/x86_64-unknown-b1nix.json" "$TARGET_JSON"
+fi
 [ -f "$TARGET_JSON" ]               || { echo "error: target spec $TARGET_JSON missing"; exit 1; }
 
 # ── 1. Build the b1nix userspace libc + crt0 and stage them into the sysroot ──
@@ -40,6 +46,26 @@ cp "$ROOT/userspace/build/x86_64/crt/crt0.o"  "$SYSROOT/lib/crt0.o"
 cp "$ROOT/userspace/build/x86_64/libb1nix.a"  "$SYSROOT/lib/libb1nix.a"
 cp "$ROOT/userspace/build/x86_64/libb1nix.a"  "$SYSROOT/lib/libc.a"
 cp -r "$ROOT/userspace/include/." "$SYSROOT/include/"
+
+# M90 GCC-free: the target spec links the LLVM runtimes for the unwinder and
+# compiler builtins instead of libgcc_s/libgcc_eh. The `llvm-libunwind: "system"`
+# target option makes Rust's `unwind` crate emit `-lunwind` (LLVM libunwind)
+# rather than `-lgcc_s`, and the spec's late-link-args add `-lunwind`/`-lcompiler_rt`.
+# Stage both archives into the sysroot the cross linker searches.
+_TC="$ROOT/build/toolchain_build/x86_64-b1nix"
+for _rt in libunwind.a libcompiler_rt.a; do
+    _src="$_TC/sysroot/usr/lib/$_rt"
+    [ -f "$_src" ] || _src="$_TC/llvm-runtimes-build/install/lib/$_rt"
+    [ -f "$_src" ] || _src="$_TC/cross/x86_64-b1nix/lib/$_rt"
+    if [ -f "$_src" ]; then
+        if ! [ "$_src" -ef "$SYSROOT/lib/$_rt" ]; then
+            cp -f "$_src" "$SYSROOT/lib/$_rt"
+        fi
+    else
+        echo "error: LLVM runtime $_rt not found (run tools/toolchain/build-toolchain.sh)" >&2
+        exit 1
+    fi
+done
 
 # ── 2. Build the Rust program (-Zbuild-std builds core/alloc/std from source) ─
 PROJ="${1:-$RUST/hello-b1nix}"

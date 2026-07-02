@@ -89,6 +89,15 @@ for _a in "$@"; do
 done
 
 B1NIX_LINK="${B1NIX_LINK:-dynamic}"
+# Honor a caller-requested static link (e.g. Rust's static ET_EXEC targets pass
+# `-static -no-pie`). Pre-M90 x86_64-b1nix-gcc was real GCC and honored -static;
+# the wrapper must too, otherwise a `-static` link silently produces a dynamic
+# ELF (with --dynamic-linker + shared libc.so.1) that the caller never expects.
+for _a in "$@"; do
+  case "$_a" in
+  -static) B1NIX_LINK=static ;;
+  esac
+done
 
 if [ "$B1NIX_LINK" = "dynamic" ]; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
@@ -154,7 +163,10 @@ while [ $# -gt 0 ]; do
     *.c|*.S|*.s)
       sources+=("$1")
       ;;
-    *.o|*.a)
+    *.o|*.a|*.rlib|*.so|*.so.[0-9]*)
+      # .rlib: Rust compilation units (Rust passes each rlib as a plain file arg,
+      # like GCC did). .so/.so.N: shared objects passed positionally. All are
+      # ordinary link inputs and must go on the link line in order.
       linkline+=("$1")
       ;;
     -lpthread|-lc|-lm|-lrt|-ldl|-lutil|-lcrypt|-lresolv|-lnsl)
@@ -199,10 +211,19 @@ for input in "${sources[@]}"; do
 done
 
 [ -n "$output" ] || output="a.out"
+# Default library search paths so plain `-l` names (e.g. the LLVM runtimes
+# -lunwind / -lcompiler_rt the Rust target spec links) resolve without the
+# caller having to pass an absolute -L: the cross sysroot lib dir and the
+# per-target cross lib dir. Caller -L entries in linkline[] still take priority.
+SYSROOT_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/sysroot/lib"
+CROSS_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+libdirs=()
+[ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
+[ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
 if [ "$B1NIX_LINK" = "dynamic" ]; then
   exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
-    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${linkline[@]}" \
+    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
     ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
 else
-  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
 fi
