@@ -1,9 +1,8 @@
 #!/bin/sh
-# C++ -> b1nix ELF using LLVM libc++ or GCC libstdc++.
+# C++ -> b1nix ELF using LLVM libc++.
 #
-# Prereq: run tools/toolchain/enable-cxx-toolchain.sh once (stages b1nix libc headers into
-# the toolchain sysroot + fixes libstdc++'s mbstate_t config). The b1nix libc
-# also needs vsprintf as a real symbol (libstdc++ locale links it).
+# Prereq: run tools/toolchain/enable-cxx-toolchain.sh once (stages b1nix libc
+# headers + libc++ headers into the toolchain sysroot).
 #
 # Usage:
 #   b1nix-c++ a.cpp b.cpp -o prog     # compile + link to a b1nix ELF
@@ -12,9 +11,7 @@
 #
 # Environment:
 #   B1NIX_ARCH          x86_64 (default) or x86
-#   B1NIX_CXX_FRONTEND  clang (default) or gcc — compiler frontend
-#   B1NIX_CXX_STDLIB    libc++ or libstdc++ (default: auto-detect)
-#                        libc++ preferred when built (run build-libcxx.sh)
+#   B1NIX_CXX_FRONTEND  clang (default) — compiler frontend
 
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
@@ -45,7 +42,7 @@ for arg in "$@"; do
     exit 0
   fi
 done
-GXX="$ROOT/build/toolchain_build/$TRIPLET/cross/bin/$TRIPLET-g++"
+GXX=""  # unused — GCC fallback removed; kept to avoid unbound-var in stale callers
 CROSS="$ROOT/build/toolchain_build/$TRIPLET/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 USR="$ROOT/userspace"
@@ -61,7 +58,7 @@ REL_DYN_CRT0="build/$ARCH/crt/crt0-dynamic.o"
 [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
 
 # ── Static vs dynamic link (default dynamic, like the rest of userspace) ─────
-# B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libstdc++/libc++ and the
+# B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libc++ and the
 # bundled archives stay statically folded (they are non-PIC), only libc becomes
 # the shared libc.so.1 loaded via /lib/ld-b1nix.so (the proven d8 / Mesa-port
 # model). B1NIX_LINK=static keeps the historical whole-archive static link.
@@ -69,24 +66,22 @@ SHARED_LIBC="$USR/build/$ARCH/libc.so.1"
 DYN_CRT0="$USR/build/$ARCH/crt/crt0-dynamic.o"
 if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
   DYN_EXTRA=""
-  # libb1nix.a stays INSIDE the runtime group (circular libstdc++<->libc resolution).
+  # libb1nix.a stays INSIDE the runtime group (circular libc++<->libc resolution).
   GROUP_LIBC="--whole-archive $LIB --no-whole-archive"
   POST_GROUP=""
 else
   [ -f "$DYN_CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_DYN_CRT0" "$REL_SHARED_LIBC"
   CRT0="$DYN_CRT0"
   # --eh-frame-hdr emits PT_GNU_EH_FRAME so the executable's frames are
-  # discoverable via dl_iterate_phdr by the shared libgcc_s.so unwinder (the
-  # same path used for libstdc++.so.6), making cross-DSO C++ exceptions work.
+  # discoverable via dl_iterate_phdr by the shared libc++abi.so.1 unwinder,
+  # making cross-DSO C++ exceptions work.
   DYN_EXTRA="-z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so"
   # libc comes from the shared libc.so.1, after the static C++ runtime group.
   GROUP_LIBC=""
   POST_GROUP="$SHARED_LIBC"
 fi
 
-# ── Resolve C++ standard library (libc++ vs libstdc++) ──────────────────────
-# B1NIX_CXX_STDLIB=libc++  → use LLVM libc++ (run build-libcxx.sh first)
-# B1NIX_CXX_STDLIB=libstdc++ → use GCC libstdc++ (default fallback)
+# ── Resolve C++ standard library (LLVM libc++) ───────────────────────────
 # The unified runtimes build (build-libcxx.sh) installs libc++.a, libc++abi.a and
 # libunwind.a together under libcxx-install/lib.
 LIBCXX_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install"
@@ -96,71 +91,21 @@ LLVM_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/install/lib"
 # (the latter folds libunwind). Linked dynamically in the default dynamic mode.
 CXXSO_DIR="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
 
-CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"
+CXX_STDLIB="libc++"
 
-case "$CXX_STDLIB" in
-  libc++)
-    if [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
-      echo "b1nix-c++: B1NIX_CXX_STDLIB=libc++ but libraries not built yet" >&2
-      echo "  Run: tools/toolchain/build-libcxx.sh" >&2
-      exit 1
-    fi
-    STDLIB_A="$LIBCXX_RT/lib/libc++.a"
-    STDLIB_ABI_A="$LIBCXXABI_RT/lib/libc++abi.a"
-    # libc++ unwinds via libunwind + dl_iterate_phdr + PT_GNU_EH_FRAME, so it needs
-    # the linker script that MAPS the program headers and KEEPs .eh_frame_hdr (the
-    # default linker-cxx.ld is the libgcc/__register_frame variant and does neither,
-    # which segfaults libunwind::findUnwindSectionsByPhdr on the first throw).
-    LINKER="$USR/linker-libcxx.ld"
-    echo "  C++ stdlib: LLVM libc++" >&2
-    ;;
-  libstdc++|*)
-    if [ ! -x "$GXX" ]; then
-      echo "b1nix-c++: libstdc++ chosen but cross-g++ is missing ($GXX)" >&2
-      exit 1
-    fi
-    STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"
-    STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)"
-    echo "  C++ stdlib: GCC libstdc++" >&2
-    ;;
-esac
-
-# Shared libstdc++: in dynamic mode link the shared libstdc++.so.6 instead of
-# folding the ~15 MB static archive into every C++ binary. The .so bundles the
-# libsupc++ objects, so it covers STDLIB_ABI_A too. Built by
-# tools/toolchain/build-libstdcxx-shared.sh; its constructors run via M75.
-STDCXX_SO=""
-SHARED_LIBGCC=""
-if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ "$CXX_STDLIB" != "libc++" ]; then
-  _scxxdir="$(dirname "$STDLIB_A")"
-  _scxx="$_scxxdir/libstdc++.so.6"
-  if [ -f "$_scxx" ]; then
-    STDCXX_SO="$_scxx"
-    STDLIB_A=""        # provided by the shared object (space-free path; unquoted below)
-    STDLIB_ABI_A=""
-    echo "  C++ stdlib: shared libstdc++.so.6" >&2
-    # Single shared unwinder. libstdc++.so.6 imports _Unwind_*/__cxa_* from the
-    # shared libgcc_s.so, so the executable MUST use that same libgcc_s.so for its
-    # own exception frames — otherwise a throw runs the .so's libgcc_s unwinder
-    # while the executable's frames were registered with a *private* static-libgcc
-    # registry, the landing pad is never found, and std::terminate aborts. Linking
-    # -lgcc_s (before the static libgcc.a kept only for the integer/soft-float
-    # helpers) makes _Unwind_RaiseException, _Unwind_Resume and __register_frame_info
-    # resolve to the one libgcc_s.so the whole process shares; crt0's
-    # __register_frame_info call then populates that single shared FDE registry.
-    # -lgcc_s records the bare soname 'libgcc_s.so' (the name the initramfs serves).
-    if [ -f "$_scxxdir/libgcc_s.so" ] || [ -f "$_scxxdir/libgcc_s.so.1" ]; then
-      # -u __register_frame_info forces it to be a *dynamic* import bound to
-      # libgcc_s.so. crt0 references it only weakly ("no-op for clang binaries"),
-      # and with no static libgcc on the line the weak ref would otherwise resolve
-      # to 0 at link time and crt0 would skip frame registration entirely — so the
-      # executable's FDEs would never enter the shared registry and unwinding would
-      # still fail. Forcing the import makes crt0's `&__register_frame_info` non-NULL
-      # at runtime so it registers the program's .eh_frame with the shared unwinder.
-      SHARED_LIBGCC="-u __register_frame -L$_scxxdir -lgcc_s"
-    fi
-  fi
+if [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
+  echo "b1nix-c++: libc++ libraries not built yet" >&2
+  echo "  Run: tools/toolchain/build-libcxx.sh" >&2
+  exit 1
 fi
+STDLIB_A="$LIBCXX_RT/lib/libc++.a"
+STDLIB_ABI_A="$LIBCXXABI_RT/lib/libc++abi.a"
+# libc++ unwinds via libunwind + dl_iterate_phdr + PT_GNU_EH_FRAME, so it needs
+# the linker script that MAPS the program headers and KEEPs .eh_frame_hdr (the
+# default linker-cxx.ld is the libgcc/__register_frame variant and does neither,
+# which segfaults libunwind::findUnwindSectionsByPhdr on the first throw).
+LINKER="$USR/linker-libcxx.ld"
+echo "  C++ stdlib: LLVM libc++" >&2
 
 # Shared libc++: in dynamic mode link libc++.so.1 + libc++abi.so.1 (built by
 # tools/toolchain/build-libcxx-shared.sh) instead of folding the static archives.
@@ -183,13 +128,9 @@ if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ "$CXX_STDLIB" = "libc++" ]; the
   fi
 fi
 
-# ── Resolve compiler runtime (compiler-rt vs libgcc) ───────────────────────
-# Keep the runtime paired with the C++ stdlib choice: libc++ goes with LLVM
-# compiler-rt + libunwind; libstdc++ stays on GCC libgcc / libgcc_s (the verified
-# path — mixing libunwind with libgcc_s would give a libstdc++ binary two
-# unwinders and break exceptions). So only switch to the LLVM runtime in libc++
-# mode, even though the LLVM archives are now present for everyone.
-if [ "$CXX_STDLIB" = "libc++" ] && [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$LLVM_RT/libunwind.a" ]; then
+# ── Resolve compiler runtime (LLVM compiler-rt) ──────────────────────────
+# Use LLVM compiler-rt builtins + libunwind (the only runtime since M89 GCC-free).
+if [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$LLVM_RT/libunwind.a" ]; then
   CRT_RUNTIME="$LLVM_RT/libcompiler_rt.a"
   # When linking the shared libc++ runtime, the unwinder lives in libc++abi.so.1;
   # do NOT also pull the static libunwind.a (a second unwinder instance would
@@ -202,50 +143,25 @@ if [ "$CXX_STDLIB" = "libc++" ] && [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$
   fi
   echo "  CRT runtime: LLVM (compiler-rt$( [ -n "$UNWIND_RUNTIME" ] && echo ' + libunwind'))" >&2
 else
-  if [ -x "$GXX" ]; then
-    CRT_RUNTIME="$("$GXX" -print-libgcc-file-name)"
-  else
-    CRT_RUNTIME=""
-  fi
-  UNWIND_RUNTIME=""
-  echo "  CRT runtime: GCC (libgcc)" >&2
+  echo "b1nix-c++: LLVM compiler-rt not found in $LLVM_RT" >&2
+  echo "  Run: tools/toolchain/build-libcxx.sh" >&2
+  exit 1
 fi
 
-# ── Resolve C++ frontend (clang++ vs g++) ──────────────────────────────────
+# ── Resolve C++ frontend (clang++) ───────────────────────────────────────
 CXXFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix"
-CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
-case "$CXX_FRONTEND" in
-  gcc)
-    CXX="$GXX"
-    ;;
-  clang|*)
-    CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "clang++")}"
-    if [ "$CXX_STDLIB" = "libc++" ]; then
-      # libc++ mode: -nostdinc++ (drop only the C++ stdlib search) + the libc++
-      # headers via -isystem, and let clang resolve its own builtin C headers
-      # (<stddef.h>, providing ::nullptr_t which libc++'s <cstddef> re-exports)
-      # plus the b1nix libc headers through --sysroot. Using a blanket -nostdinc
-      # with hand-rolled -isystem paths breaks clang's stddef.h #include_next
-      # chain, so ::nullptr_t goes undefined and every libc++ header that names
-      # nullptr_t fails to compile. This mirrors how libc++ itself was built.
-      LIBCXX_HDR="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/include/c++/v1"
-      SYSROOT="$ROOT/build/toolchain_build/$TRIPLET/sysroot"
-      CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
-      CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
-    else
-      VER="$($GXX -dumpversion)"
-      RES="$($CXX -print-resource-dir 2>/dev/null || true)"
-      # libstdc++ mode: use GCC's C++ headers
-      CXXROOT="$CROSS/$TRIPLET/include/c++/$VER"
-      GCCROOT="$CROSS/lib/gcc/$TRIPLET/$VER"
-      CXXFLAGS="--target=$TRIPLET -nostdinc"
-      [ -n "$RES" ] && CXXFLAGS="$CXXFLAGS -isystem $RES/include"
-      CXXFLAGS="$CXXFLAGS -isystem $CXXROOT -isystem $CXXROOT/$TRIPLET -isystem $CXXROOT/backward"
-      CXXFLAGS="$CXXFLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
-      CXXFLAGS="$CXXFLAGS -isystem $CROSS/$TRIPLET/include"
-    fi
-    ;;
-esac
+CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "clang++")}"
+# libc++ mode: -nostdinc++ (drop only the C++ stdlib search) + the libc++
+# headers via -isystem, and let clang resolve its own builtin C headers
+# (<stddef.h>, providing ::nullptr_t which libc++'s <cstddef> re-exports)
+# plus the b1nix libc headers through --sysroot. Using a blanket -nostdinc
+# with hand-rolled -isystem paths breaks clang's stddef.h #include_next
+# chain, so ::nullptr_t goes undefined and every libc++ header that names
+# nullptr_t fails to compile. This mirrors how libc++ itself was built.
+LIBCXX_HDR="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/include/c++/v1"
+SYSROOT="$ROOT/build/toolchain_build/$TRIPLET/sysroot"
+CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
+CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
 
 run_cxx() {
   if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
@@ -352,22 +268,14 @@ for in_file in "${inputs[@]}"; do
 done
 
 # ── Link ───────────────────────────────────────────────────────────────────
-# Link recipe: crt0 + objects, then the C++ runtime group. --allow-multiple-
-# definition resolves the i686 __divdi3/__moddi3 clash (b1nix div64 vs libgcc).
+# Link recipe: crt0 + objects, then the C++ runtime group.
 # shellcheck disable=SC2086
-# $STDLIB_A / $STDLIB_ABI_A are space-free toolchain paths, empty when the shared
-# libstdc++.so.6 is used; left unquoted so they expand to nothing in that case.
-# $STDCXX_SO (shared libstdc++) / $CXXLIB_SO (shared libc++ + libc++abi) go after
-# the group, before libc — exactly one of them is non-empty per stdlib choice.
-# $SHARED_LIBGCC (-lgcc_s) is placed BEFORE the static libgcc.a so the shared
-# libgcc_s.so wins resolution of the unwinder/EH symbols (the static archive then
-# only contributes the integer/soft-float helpers it uniquely defines).
+# $STDLIB_A / $STDLIB_ABI_A are space-free toolchain paths, left unquoted so
+# they expand to nothing when empty (shared libc++ mode).
+# $CXXLIB_SO (shared libc++ + libc++abi) goes after the group, before libc.
 
 dyn_extra_args=()
 for f in $DYN_EXTRA; do dyn_extra_args+=("$f"); done
-
-shared_libgcc_args=()
-for f in $SHARED_LIBGCC; do shared_libgcc_args+=("$f"); done
 
 stdlib_a_args=()
 for f in $STDLIB_A; do stdlib_a_args+=("$f"); done
@@ -378,9 +286,6 @@ for f in $STDLIB_ABI_A; do stdlib_abi_a_args+=("$f"); done
 group_libc_args=()
 for f in $GROUP_LIBC; do group_libc_args+=("$f"); done
 
-stdcxx_so_args=()
-for f in $STDCXX_SO; do stdcxx_so_args+=("$f"); done
-
 cxxlib_so_args=()
 for f in $CXXLIB_SO; do cxxlib_so_args+=("$f"); done
 
@@ -388,14 +293,14 @@ post_group_args=()
 for f in $POST_GROUP; do post_group_args+=("$f"); done
 
 if [ -n "$UNWIND_RUNTIME" ]; then
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition "${dyn_extra_args[@]}" -o "$output" \
-    "$CRT0" "${objs[@]}" "${shared_libgcc_args[@]}" \
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
+    "$CRT0" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]}" --end-group \
-    "${stdcxx_so_args[@]}" "${cxxlib_so_args[@]}" "${post_group_args[@]}"
+    "${cxxlib_so_args[@]}" "${post_group_args[@]}"
 else
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition "${dyn_extra_args[@]}" -o "$output" \
-    "$CRT0" "${objs[@]}" "${shared_libgcc_args[@]}" \
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
+    "$CRT0" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "${group_libc_args[@]}" --end-group \
-    "${stdcxx_so_args[@]}" "${cxxlib_so_args[@]}" "${post_group_args[@]}"
+    "${cxxlib_so_args[@]}" "${post_group_args[@]}"
 fi
 rm -rf "$tmp"
