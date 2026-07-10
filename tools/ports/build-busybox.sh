@@ -151,7 +151,10 @@ export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include -incl
 # statically instead of importing the shared libgcc_s.so, so busybox — a pure-C
 # port — carries NO DT_NEEDED GCC runtime. This lets the ISO drop libgcc_s.so
 # once no other shipped binary needs it (part of the M89 GCC-free goal).
-export EXTRA_LDFLAGS="-Wl,-Ttext-segment=0x2000000 -static-libgcc -L$SYSROOT/lib --sysroot=$SYSROOT"
+# ld.lld >= ~17 removed -Ttext-segment (it errors and points to --image-base).
+# --image-base sets the load address of the first PT_LOAD (headers + text) to the
+# same B1NIX userspace base, which is what we need here.
+export EXTRA_LDFLAGS="-Wl,--image-base=0x2000000 -static-libgcc -L$SYSROOT/lib --sysroot=$SYSROOT"
 
 # Wire ccache into the busybox build (byte-identical objects, faster rebuilds).
 if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then

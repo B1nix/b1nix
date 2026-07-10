@@ -146,6 +146,16 @@ INITRAMFS_B1CC_INCS := \
 	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
 	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc \
 	$(BUILD_DIR)/initramfs_b1cc_better_c.inc
+# M32/M33: on-device self-host proof. Ships /bin/b1cc (b1cc built by b1nix-cc),
+# its link inputs (/lib/b1cc/crt0.o + libb1nix.a), and the /bin/b1cc-selfsmoke
+# driver. x86_64 only (the internal linker + b1cc_selfsmoke target x86_64-b1nix).
+ifeq ($(ARCH),x86_64)
+INITRAMFS_B1CC_SELFHOST_INC := $(BUILD_DIR)/initramfs_b1cc_selfhost.inc
+INITRAMFS_B1CC_INCS += \
+	$(INITRAMFS_B1CC_SELFHOST_INC) \
+	$(BUILD_DIR)/initramfs_b1cc_selfsmoke.inc
+CFLAGS_EXTRA += -DB1CC_SELFHOST
+endif
 # Upstream BusyBox is always embedded (M42 full integration).
 ifeq ($(MINIMAL_INITRAMFS),1)
 # Select the minimal embedded file set in the C source too (kernel/fs/initramfs.c
@@ -153,9 +163,13 @@ ifeq ($(MINIMAL_INITRAMFS),1)
 # trimmed .inc list below. Without this the C code would still register the full
 # table and reference .inc that were never built.
 CFLAGS_EXTRA += -DMINIMAL_INITRAMFS
+# The shared libc.so.1 is included in the minimal set too: M33's on-device PIE
+# self-smoke links a program against it (DT_NEEDED libc.so.1) and the kernel's
+# eager in-kernel dynamic linker must find it at runtime.
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
-	$(INITRAMFS_B1CC_INCS)
+	$(INITRAMFS_B1CC_INCS) \
+	$(INITRAMFS_SHARED_LIBC_INC)
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
@@ -515,6 +529,22 @@ $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_$*_elf userspace/build/$(ARCH)/bin/$* > $@
+
+# M32/M33: bundle the on-device b1cc + its static-link inputs into one .inc.
+# b1cc is a multi-source binary built from the separate b1cc repo via b1nix-cc
+# (see userspace/Makefile /bin/b1cc rule); crt0.o and libb1nix.a are the same
+# artifacts b1cc's internal linker consumes, shipped to /lib/b1cc on device.
+# Depend on the b1cc *sources* (same glob as userspace/Makefile's B1CC_SRCDIR) so
+# editing b1cc re-embeds it — otherwise the .inc looks up-to-date vs
+# USERSPACE_DEPS and the stale compiler binary gets shipped.
+B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),$(HOME)/Documents/GitHub/b1cc/src)/*.c)
+$(BUILD_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc build/$(ARCH)/libb1nix.a build/$(ARCH)/crt/crt0.o build/$(ARCH)/crt/crt0-dynamic.o
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_b1cc_elf userspace/build/$(ARCH)/bin/b1cc > $@
+	xxd -i -n vfs_b1cc_crt0 userspace/build/$(ARCH)/crt/crt0.o >> $@
+	xxd -i -n vfs_b1cc_libc userspace/build/$(ARCH)/libb1nix.a >> $@
+	xxd -i -n vfs_b1cc_crt0dyn userspace/build/$(ARCH)/crt/crt0-dynamic.o >> $@
 
 # Depends on $(CURL_ELF): building curl (with B1NIX_TLS=mbedtls) produces the
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl

@@ -30,7 +30,10 @@ B1CC-HELLO-SMOKE: ok
 B1CC-ARGV-SMOKE: ok
 B1CC-FILE-SMOKE: ok
 B1CC-STDERR-SMOKE: ok
-B1CC-BETTER-C-SMOKE: ok"
+B1CC-BETTER-C-SMOKE: ok
+B1CC-SELF-COMPILE-SMOKE: ok
+B1CC-PIE-SMOKE: ok
+B1CC-SO-SMOKE: ok"
 
 echo "[b1cc] === b1cc / native-compiler smoke ($ARCH) ==="
 

@@ -194,6 +194,19 @@ else
 $(warning b1cc compiler not found - skipping M5/M7 b1cc smoke binaries ($(B1CC_BINS)). Set B1CC=/path/to/b1cc to include them.)
 endif
 
+# M32 on-device self-host: /bin/b1cc is b1cc itself, built as a B1NIX ELF by
+# b1nix-cc (not the host b1cc binary above — that only cross-compiles the smoke
+# programs). Needs the b1cc *source* tree; override B1CC_SRCDIR if it lives
+# elsewhere. b1cc is C23, so -std=gnu2x is required (b1nix-cc's clang default
+# rejects `nullptr`). Skipped when the source tree is absent.
+B1CC_SRCDIR ?= $(HOME)/Documents/GitHub/b1cc/src
+B1CC_SELF_SRCS := $(filter-out %/b1cc_token_lexer.c,$(wildcard $(B1CC_SRCDIR)/*.c))
+ifneq ($(strip $(B1CC_SELF_SRCS)),)
+BINARIES += $(BUILD)/bin/b1cc
+else
+$(warning b1cc sources not found at $(B1CC_SRCDIR) - skipping on-device /bin/b1cc (M32). Set B1CC_SRCDIR=/path/to/b1cc/src to include it.)
+endif
+
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
 DYNAMIC_TARGETS := $(SHARED_LIBC)
@@ -201,7 +214,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc,$(BINARIES)))
 # Include the PIC libc objects' .d files too: libc.so.1 is built from
 # $(PIC_LIBC_OBJS), and without their header dependencies a change to a shared
 # header (e.g. the struct dirent layout in include/dirent.h) rebuilds the static
@@ -281,6 +294,22 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/%.c
 	@mkdir -p $(dir $@)
 	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) $(B1CC) --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
+
+# M32: /bin/b1cc — b1cc compiled to a B1NIX ELF by b1nix-cc. Custom multi-source
+# rule (all of b1cc/src except the token-lexer variant); C23 needs -std=gnu2x.
+$(BUILD)/bin/b1cc: $(B1CC_SELF_SRCS)
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-cc -std=gnu2x $(B1CC_SELF_SRCS) -o $@
+
+# M32: /bin/b1cc-selfsmoke — the on-device self-host driver. Must be STATIC: the
+# minimal initramfs (tests/smoke-b1cc.sh) ships no libc.so.1, so link it against
+# the static crt0 + libb1nix.a explicitly, independent of the LINK=static/dynamic
+# mode (the default BESPOKE_* recipe is dynamic).
+$(BUILD)/bin/b1cc_selfsmoke: bin/b1cc_selfsmoke.c $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/b1cc_selfsmoke.o
+	$(LD) $(LDFLAGS) -z norelro -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/b1cc_selfsmoke.o \
+	  --whole-archive $(LIB) --no-whole-archive
 
 
 $(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)

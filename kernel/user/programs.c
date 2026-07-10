@@ -1526,6 +1526,27 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+#ifdef B1CC_SELFHOST
+  /* M32/M33: on-device self-host — /bin/b1cc compiles+links a program with its
+   * OWN internal linker (no host ld.lld) and the output runs. The driver
+   * (/bin/b1cc-selfsmoke) emits B1CC-SELF-COMPILE-SMOKE: ok on success. */
+  {
+    u64 selfhost_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc-selfsmoke", 0, 0, 0, 0, 0);
+    if ((isize)selfhost_pid < 0) {
+      uwrite("B1CC-SELF-COMPILE-SMOKE: spawn-fail\n");
+    } else {
+      int selfhost_status = 0;
+      syscall_dispatch(SYS_WAIT, selfhost_pid, (u64)(usize)&selfhost_status, 0, 0, 0, 0);
+      /* the driver prints its own ok/fail marker; note a nonzero wait status */
+      if (selfhost_status != 0) {
+        uwrite("B1CC-SELF-COMPILE-SMOKE: driver-exit=");
+        uwrite_dec_value((u64)selfhost_status);
+        uwrite("\n");
+      }
+    }
+  }
+#endif
+
   u64 m12_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m12-smoke", 0, 0, 0, 0, 0);
   if ((isize)m12_pid < 0) {
     uwrite("M12-SMOKE: spawn-fail\n");

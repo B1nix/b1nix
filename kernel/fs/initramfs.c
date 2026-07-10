@@ -20,6 +20,17 @@
 #include "initramfs_b1cc_file_write.inc"
 #include "initramfs_b1cc_stderr_exit.inc"
 #include "initramfs_b1cc_better_c.inc"
+#ifdef B1CC_SELFHOST
+/* M32/M33: /bin/b1cc + /lib/b1cc/{crt0.o,libb1nix.a,crt0-dynamic.o} + b1cc-selfsmoke. */
+#include "initramfs_b1cc_selfhost.inc"
+#include "initramfs_b1cc_selfsmoke.inc"
+/* M33 on-device PIE self-smoke DT_NEEDEDs libc.so.1, so the minimal initramfs
+ * must carry the shared libc blob. The full build already pulls it in via the
+ * x86_64 include block below, so only add it here for the minimal build. */
+#ifdef MINIMAL_INITRAMFS
+#include "initramfs_shared_libc.inc"
+#endif
+#endif
 #ifndef MINIMAL_INITRAMFS
 #include "initramfs_m12_smoke.inc"
 #include "initramfs_m13_smoke.inc"
@@ -1448,6 +1459,22 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
      sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
+#ifdef B1CC_SELFHOST
+    {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
+     INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc-selfsmoke", (const char *)vfs_b1cc_selfsmoke_elf,
+     sizeof(vfs_b1cc_selfsmoke_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/b1cc/crt0.o", (const char *)vfs_b1cc_crt0, sizeof(vfs_b1cc_crt0), 0},
+    {"/lib/b1cc/libb1nix.a", (const char *)vfs_b1cc_libc, sizeof(vfs_b1cc_libc), 0},
+    /* M33 dynamic path: crt0-dynamic.o is b1cc's internal PIE linker input;
+     * libc.so.1 is the runtime shared object the produced PIE DT_NEEDEDs and the
+     * kernel's eager in-kernel linker resolves against. */
+    {"/lib/b1cc/crt0-dynamic.o", (const char *)vfs_b1cc_crt0dyn,
+     sizeof(vfs_b1cc_crt0dyn), 0},
+    {"/lib/libc.so.1", (const char *)vfs_shared_libc_elf,
+     sizeof(vfs_shared_libc_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc.so", "/lib/libc.so.1", 15, INITRAMFS_SYMLINK},
+#endif
 
     {"/mnt/iso/.keep", "", 0, 0},
     {"/mnt/root/.keep", "", 0, 0},
@@ -1505,6 +1532,17 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
      sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
+#ifdef B1CC_SELFHOST
+    {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
+     INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc-selfsmoke", (const char *)vfs_b1cc_selfsmoke_elf,
+     sizeof(vfs_b1cc_selfsmoke_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/b1cc/crt0.o", (const char *)vfs_b1cc_crt0, sizeof(vfs_b1cc_crt0), 0},
+    {"/lib/b1cc/libb1nix.a", (const char *)vfs_b1cc_libc, sizeof(vfs_b1cc_libc), 0},
+    /* M33 dynamic path: PIE linker input (libc.so.1 already registered below). */
+    {"/lib/b1cc/crt0-dynamic.o", (const char *)vfs_b1cc_crt0dyn,
+     sizeof(vfs_b1cc_crt0dyn), 0},
+#endif
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
      sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m13-smoke", (const char *)vfs_m13_smoke_elf,

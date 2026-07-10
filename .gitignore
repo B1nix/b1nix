@@ -88,3 +88,4 @@ userspace/tcc/tests/hello
 userspace/tcc/tests/tests2/fred.txt
 userspace/tcc/libtcc.dylib
 AGENTS.md
+/.mimocode
