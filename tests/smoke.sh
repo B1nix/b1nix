@@ -30,20 +30,23 @@ printf() {
 	shift
 	command printf "[$ARCH_LABEL]$fmt" "$@"
 }
-# Seconds to let each test run (override via env). x86_64 emulates notably slower
-# than i386 under TCG (no KVM on macOS) and the single-CPU suite lands right at
-# ~110-120s, so give 64-bit more headroom to avoid false timeouts.
-if [ "$ARCH" = "x86_64" ]; then
-	DEFAULT_TIMEOUT=480
-else
-	DEFAULT_TIMEOUT=120
+# Seconds to let each test run (override via env). Detect hardware acceleration
+# (KVM on Linux, HVF on macOS) — TCG pure-emulation is ~10-20x slower and needs
+# a much larger budget to avoid false timeouts.
+_HAVE_ACCEL=0
+if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
+	if [ -w /dev/kvm ] 2>/dev/null && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw kvm; then
+		_HAVE_ACCEL=1
+	elif [ "$(uname)" = "Darwin" ] && qemu-system-x86_64 -accel help 2>/dev/null | grep -qw hvf; then
+		_HAVE_ACCEL=1
+	fi
 fi
-# The upstream-BusyBox smoke spawns ~60 extra ELF loads (waves 5-7: account
-# applets, xattr/lsblk round-trips, ...); under TCG that overruns the tight
-# default budgets, and the -smp 4 full-suite pass is the slowest of all, so give
-# both arches generous headroom.
 if [ "$ARCH" = "x86_64" ]; then
-	DEFAULT_TIMEOUT=600
+	if [ "$_HAVE_ACCEL" = "1" ]; then
+		DEFAULT_TIMEOUT=600
+	else
+		DEFAULT_TIMEOUT=1800
+	fi
 else
 	DEFAULT_TIMEOUT=480
 fi
