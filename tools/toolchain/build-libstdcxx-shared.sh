@@ -83,16 +83,8 @@ if command -v patchelf >/dev/null 2>&1; then
 fi
 
 # Provide the linker-name symlink libstdc++.so -> libstdc++.so.6 so `-lstdc++`
-# resolves to the shared object.
+# resolves to the shared object (in the cross sysroot, for the cross toolchain).
 ln -sf libstdc++.so.6 "$LIBDIR/libstdc++.so"
-
-# Stage to the rootfs /lib (the loader's system search path) and the rootfs-as-
-# sysroot lib dir used by ported builds.
-for d in "$ROOT/build/$ARCH/rootfs/lib" "$ROOT/build/$ARCH/rootfs/usr/lib"; do
-    [ -d "$d" ] || mkdir -p "$d"
-    cp -f "$OUT" "$d/libstdc++.so.6"
-    ln -sf libstdc++.so.6 "$d/libstdc++.so"
-done
 
 echo "[libstdc++-shared] done: $OUT ($(du -m "$OUT" | cut -f1) MB)"
 echo "  soname  : $(patchelf --print-soname "$OUT" 2>/dev/null || echo libstdc++.so.6)"

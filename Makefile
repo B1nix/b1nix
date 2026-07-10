@@ -118,20 +118,12 @@ EMBEDDED_USER_PROGRAMS := \
 	su passwd groups useradd userdel groupadd halt setfattr telinit
 
 ifeq ($(ARCH),x86_64)
-# m64_clang_smoke is x86_64-only: the clang frontend links the GCC-built
-# libstdc++, but clang and that libstdc++ disagree on size_t mangling for
-# i686-b1nix (unsigned int vs unsigned long), so the i686 clang link fails.
+# m64_clang_smoke is x86_64-only: the clang frontend links against LLVM libc++,
+# but libc++ and i686-b1nix disagree on size_t mangling (unsigned int vs
+# unsigned long), so the i686 clang link fails.
 EMBEDDED_USER_PROGRAMS += m30_dynamic m64_clang_smoke
 INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
 INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
-# The --enable-shared x86_64 cross GCC links libgcc dynamically (DT_NEEDED
-# libgcc_s.so, for the _Unwind_* exception symbols), so the C/C++ port binaries
-# (NetSurf, the m53 servers, ...) need /lib/libgcc_s.so at exec — the M69 kernel
-# linker resolves it. i686 GCC is static-libgcc, so this is x86_64-only.
-INITRAMFS_LIBGCC_S_INC := $(BUILD_DIR)/initramfs_libgcc_s.inc
-# /lib/libstdc++.so.6 — shared GCC C++ stdlib (linked from the PIC libstdc++.a),
-# so dynamically-linked C++ binaries import std::/__cxa_* instead of folding it.
-INITRAMFS_LIBSTDCXX_INC := $(BUILD_DIR)/initramfs_libstdcxx.inc
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89), linked
 # from the PIC libc++.a/libc++abi.a by build-libcxx-shared.sh. The hosted C++
 # smoke binaries (cxx_smoke/m55_iostream/m55_litehtml/m64_clang) link these via
@@ -647,9 +639,9 @@ $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPAC
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
 
-# Hosted C++ runtime smoke. Enable libstdc++ against the b1nix libc first
+# Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
 # (idempotent: stages headers + fixes mbstate_t config), then build via the
-# cross GCC C++ wrapper.
+# cross clang C++ wrapper.
 $(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
@@ -662,7 +654,7 @@ $(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
-# M55: std::iostream + std::filesystem acceptance test (hosted libstdc++).
+# M55: std::iostream + std::filesystem acceptance test (hosted libc++).
 $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
@@ -970,23 +962,6 @@ $(INITRAMFS_M69_PLUGIN_INC): userspace/bin/m69_plugin.c $(USERSPACE_DEPS) usersp
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m69_plugin_elf userspace/build/$(ARCH)/bin/m69_plugin.so > $@
-
-# /lib/libgcc_s.so for the dynamically-linked C/C++ port binaries (see the
-# INITRAMFS_LIBGCC_S_INC comment above). Sourced from the cross GCC's own
-# libgcc_s.so.1 (a leaf ET_DYN — no further DT_NEEDED).
-$(INITRAMFS_LIBGCC_S_INC): $(CROSS_TOOLCHAIN_ROOT)/bin/$(B1NIX_TRIPLET)-gcc
-	@mkdir -p $(dir $@)
-	@LIB="$$($< -print-file-name=libgcc_s.so.1 2>/dev/null)"; \
-	[ -f "$$LIB" ] || { echo "libgcc_s.so.1 not found via $(B1NIX_TRIPLET)-gcc ($$LIB)"; exit 1; }; \
-	xxd -i -n vfs_libgcc_s_elf "$$LIB" > $@
-
-# /lib/libstdc++.so.6 — shared GCC C++ stdlib, linked from the PIC libstdc++.a by
-# build-libstdcxx-shared.sh (no GCC rebuild). Dynamically-linked C++ binaries
-# NEEDED it instead of folding ~15 MB; its init_array constructors run via M75.
-$(INITRAMFS_LIBSTDCXX_INC): tools/toolchain/build-libstdcxx-shared.sh $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.a $(INITRAMFS_SHARED_LIBC_INC)
-	@mkdir -p $(dir $@)
-	ARCH=$(ARCH) tools/toolchain/build-libstdcxx-shared.sh >/dev/null
-	xxd -i -n vfs_libstdcxx_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libstdc++.so.6 > $@
 
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). One
 # build-libcxx-shared.sh run links BOTH .so from the PIC libc++.a/libc++abi.a; the
