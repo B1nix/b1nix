@@ -97,6 +97,7 @@ static inline int CPU_COUNT_S(size_t __setsize, const cpu_set_t *__set) {
 }
 
 int sched_getaffinity(int pid, size_t cpusetsize, cpu_set_t *mask);
+int sched_setaffinity(int pid, size_t cpusetsize, const cpu_set_t *mask);
 
 /* CLONE_* flags. glibc exposes these via <sched.h>; b1nix's canonical copies live
  * in <syscall.h>, so guard each so including both headers never redefines. Only

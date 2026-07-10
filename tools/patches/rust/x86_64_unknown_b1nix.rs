@@ -11,8 +11,8 @@
 // librustc_driver.so; the kernel loader resolves their DT_NEEDED at exec.
 
 use crate::spec::{
-    Arch, Cc, LinkSelfContainedDefault, LinkerFlavor, Lld, PanicStrategy, RelocModel, RelroLevel,
-    StackProbeType, Target,
+    Arch, Cc, LinkSelfContainedDefault, LinkerFlavor, Lld, LlvmLibunwind, PanicStrategy, RelocModel,
+    RelroLevel, StackProbeType, Target,
     TargetMetadata, TlsModel, base,
 };
 
@@ -22,6 +22,13 @@ pub(crate) fn target() -> Target {
     base.plt_by_default = false;
     base.max_atomic_width = Some(64);
     base.stack_probes = StackProbeType::Inline;
+
+    // M90 GCC-free: make Rust's `unwind` crate link the LLVM libunwind (`-lunwind`)
+    // instead of GCC's `libgcc_s` (its musl-not-crt-static default). build-rust-native.sh
+    // stages a shared `libunwind.so.1` (whole-archive of the PIC libunwind.a, NEEDED
+    // libc.so.1) into the cross sysroot so the dynamic `-lunwind` resolves at link and
+    // load — no libgcc_s.so anywhere in the rustc DT_NEEDED graph.
+    base.llvm_libunwind = LlvmLibunwind::System;
 
     // The b1nix cross cc (M90: a clang/lld wrapper) drives the link (it knows the
     // crt startfiles and the b1nix libc sysroot). The unwinder + compiler builtins

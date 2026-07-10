@@ -256,6 +256,13 @@ run_cxx() {
 }
 
 # ── Parse arguments ────────────────────────────────────────────────────────
+# Keep an untouched copy of the original argv. The -shared (shared-library) path
+# relinks CMake's command verbatim: splitting args into inputs/passthru below
+# loses the interleaving between --whole-archive/--no-whole-archive windows and
+# the .a files inside them, and LLVM's libLLVM.so link lists each component
+# archive twice (once whole-archived, once as a plain dep) — flattening that into
+# a single whole-archive window duplicates every symbol.
+orig_args=("$@")
 compile_only=0
 output="a.out"
 inputs=()
@@ -264,7 +271,21 @@ while [ $# -gt 0 ]; do
   case "$1" in
     -c) compile_only=1 ;;
     -o) shift; output="$1" ;;
-    *.cpp|*.cc|*.cxx|*.C|*.o|*.a) inputs+=("$1") ;;
+    # Flags that take a separate value argument: consume BOTH into passthru so the
+    # value is never misclassified as an input. CMake/Ninja's C++ rule emits
+    # `-MT <out>.o -MF <out>.o.d`, whose values end in .o/.d and would otherwise be
+    # grabbed as input object files below → clang gets a non-existent input.
+    -MT|-MF|-MQ|-include|-isystem|-iquote|-idirafter|-imacros|-I|-D|-U|-x|-Xclang|-Xlinker)
+      passthru+=("$1" "$2"); shift ;;
+    # Any remaining dash-flag → passthru. MUST precede the input glob below so a
+    # flag that happens to contain ".so" (e.g. -Wl,-soname,libc++.so.1) is never
+    # misclassified as a shared-library input.
+    -*) passthru+=("$1") ;;
+    # Link inputs. Shared libraries are passed by PATH (CMake's LINK_LLVM_DYLIB
+    # gives tool exes `lib/libLLVM.so.NN` directly); classify them as inputs so
+    # the exe-link path below actually puts them on the ld line instead of
+    # dropping them into passthru → undefined llvm:: symbols.
+    *.cpp|*.cc|*.cxx|*.C|*.o|*.a|*.so|*.so.*) inputs+=("$1") ;;
     *) passthru+=("$1") ;;
   esac
   shift
@@ -281,11 +302,47 @@ if [ "$compile_only" -eq 1 ]; then
   exit $?
 fi
 
+# -shared: building a shared library (.so) — do NOT inject crt0/libc/the b1nix
+# link recipe; pass through to clang++ which links the .so natively with its
+# own CRT and the caller's flags (LLVM cmake builds libLTO.so / libLLVM.so
+# etc. this way). Use -fuse-ld=lld so ld.lld is used instead of collect2.
+# Add -lc++ -lc++abi so the C++ runtime symbols (std::__1::*) resolve.
+# Point -L at the cross lib dir so the linker finds the b1nix libc++.
+is_shared=0
+for f in "${passthru[@]}"; do [ "$f" = "-shared" ] && is_shared=1; done
+if [ "$is_shared" -eq 1 ]; then
+  shared_target="x86_64-unknown-elf"
+  if [ "$ARCH" = "x86" ]; then shared_target="i686-unknown-elf"; fi
+  cross_lib="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+  # Relink CMake's shared-library command with the ORIGINAL argument order
+  # preserved, so every --whole-archive/--no-whole-archive window keeps wrapping
+  # exactly the .a files CMake placed inside it. (LLVM's libLLVM.so link lists
+  # each component archive twice — once whole-archived, once as a plain dep; the
+  # second, plain occurrence resolves nothing new and is skipped by lld, so no
+  # duplicate symbols. Flattening the order re-whole-archives the second copy and
+  # breaks the link.) We only drop -z,defs (forces all symbols defined, which
+  # breaks whole-archive shared links) and our own -o (re-added at the end).
+  ordered=()
+  skip_next=0
+  for f in "${orig_args[@]}"; do
+    if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+    case "$f" in
+      -Wl,-z,defs|-Wl,-znodefs) continue ;;   # drop -z,defs variants
+      -z) skip_next=1; continue ;;              # drop "-z defs" (two-word)
+      defs) continue ;;                         # second half of "-z defs"
+      -o) skip_next=1; continue ;;              # drop "-o <out>" (re-added below)
+    esac
+    ordered+=("$f")
+  done
+  run_cxx --target="$shared_target" -fuse-ld=lld -stdlib=libc++ -nostdinc++ -isystem "$LIBCXX_HDR" -L "$cross_lib" "${cxx_flags[@]}" "${ordered[@]}" -lc++ -lc++abi -o "$output"
+  exit $?
+fi
+
 objs=()
 tmp="${TMPDIR:-/tmp}/b1nix-cxx.$$"; mkdir -p "$tmp"
 for in_file in "${inputs[@]}"; do
   case "$in_file" in
-    *.o|*.a) objs+=("$in_file") ;;
+    *.o|*.a|*.so|*.so.*) objs+=("$in_file") ;;   # .so: shared-lib dep, link as-is
     *)
       o="$tmp/$(basename "$in_file").o"
       run_cxx "${cxx_flags[@]}" "${passthru[@]}" -c "$in_file" -o "$o"

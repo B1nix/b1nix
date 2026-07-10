@@ -99,6 +99,17 @@ for _a in "$@"; do
   esac
 done
 
+# Building a shared object (.so)? Rust emits `-shared -Wl,-soname=...` for every
+# dylib crate-type (libstd.so, librustc_driver.so under -Cprefer-dynamic). A .so
+# is position-independent, has NO _start/crt0, and must NOT use the executable
+# linker script (fixed load base 0x2000000) — so it takes a dedicated ld path.
+is_shared=0
+for _a in "$@"; do
+  case "$_a" in
+  -shared) is_shared=1 ;;
+  esac
+done
+
 if [ "$B1NIX_LINK" = "dynamic" ]; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
     make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_SHARED_LIBC" "$REL_DYNAMIC_CRT0"
@@ -156,6 +167,16 @@ while [ $# -gt 0 ]; do
       args+=("$1" "$2")
       shift
       ;;
+    -Wl,*)
+      # Translate the GCC-driver -Wl,a,b,c form into ld args a b c, appended in
+      # place so grouping directives stay attached to their libraries. MUST be
+      # handled BEFORE the file-name globs below: a -Wl option whose VALUE ends
+      # in .so (e.g. -Wl,-soname=libstd-XXXX.so, emitted for every Rust dylib)
+      # would otherwise match the `*.so` input glob and reach ld.lld verbatim as
+      # an unknown `-Wl,-soname=...` argument.
+      IFS=',' read -ra _wlparts <<<"${1#-Wl,}"
+      linkline+=("${_wlparts[@]}")
+      ;;
     -L)
       linkline+=("-L" "$2")
       shift
@@ -171,14 +192,15 @@ while [ $# -gt 0 ]; do
       ;;
     -lpthread|-lc|-lm|-lrt|-ldl|-lutil|-lcrypt|-lresolv|-lnsl)
       ;;
+    -lstdc++)
+      # GCC-free redirect: Rust's rustc_llvm crate hard-links -lstdc++ for the
+      # LLVM C++ wrapper. b1nix ships NO GCC libstdc++.so.6 (M89 → all C++ is
+      # LLVM libc++), so route it to libc++/libc++abi — librustc_driver.so then
+      # records DT_NEEDED libc++.so.1 / libc++abi.so.1 instead of libstdc++.so.6.
+      linkline+=("-lc++" "-lc++abi")
+      ;;
     -l*|-L*)
       linkline+=("$1")
-      ;;
-    -Wl,*)
-      # Translate the GCC-driver -Wl,a,b,c form into ld args a b c, appended in
-      # place so grouping directives stay attached to their libraries.
-      IFS=',' read -ra _wlparts <<<"${1#-Wl,}"
-      linkline+=("${_wlparts[@]}")
       ;;
     *)
       args+=("$1")
@@ -220,7 +242,26 @@ CROSS_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
 libdirs=()
 [ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
 [ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
-if [ "$B1NIX_LINK" = "dynamic" ]; then
+if [ "$is_shared" -eq 1 ]; then
+  # Shared object: PIC, no crt0, no executable linker script, no --whole-archive
+  # libb1nix. -soname/--version-script/--export-dynamic etc. already arrived via
+  # the translated linkline[]. libc symbols resolve from the shared libc.so.1
+  # (records DT_NEEDED libc.so.1); the LLVM libunwind that -lgcc_s routes to (see
+  # the sysroot libgcc_s.so linker script) supplies the _Unwind_* ABI.
+  #
+  # A rust dylib that folds C++ code (librustc_driver.so pulls libLLVM's C++
+  # wrapper objects → std::__1::* libc++ refs) must record DT_NEEDED libc++.so.1
+  # / libc++abi.so.1, otherwise the downstream rustc EXE link (which passes
+  # --no-allow-shlib-undefined) cannot satisfy the .so's undefined libc++
+  # symbols. Link them --as-needed so a pure-Rust .so (libstd.so, no C++) does
+  # NOT gain a spurious libc++ dependency.
+  cxx_shared=()
+  if [ -f "$SYSROOT_LIB/libc++.so.1" ] && [ -f "$SYSROOT_LIB/libc++abi.so.1" ]; then
+    cxx_shared=(--push-state --as-needed "$SYSROOT_LIB/libc++.so.1" "$SYSROOT_LIB/libc++abi.so.1" --pop-state)
+  fi
+  exec "$LD" -m "$LD_EMULATION" -shared --hash-style=sysv -o "$output" \
+    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
+elif [ "$B1NIX_LINK" = "dynamic" ]; then
   exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
     -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
     ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"

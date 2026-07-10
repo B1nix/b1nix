@@ -1998,6 +1998,31 @@ int sched_getaffinity(int pid, size_t cpusetsize, cpu_set_t *mask) {
   return 0;
 }
 
+/* sched_setaffinity(2): b1nix's scheduler does not pin userspace threads to a
+ * CPU subset (the counterpart to sched_getaffinity's port debt), so this
+ * validates the request and accepts it without actually restricting placement.
+ * An absent or empty CPU mask is rejected with EINVAL, matching Linux. */
+int sched_setaffinity(int pid, size_t cpusetsize, const cpu_set_t *mask) {
+  (void)pid;
+  if (mask == NULL || cpusetsize == 0) {
+    errno = EINVAL;
+    return -1;
+  }
+  const unsigned char *p = (const unsigned char *)mask;
+  int any = 0;
+  for (size_t i = 0; i < cpusetsize; i++) {
+    if (p[i]) {
+      any = 1;
+      break;
+    }
+  }
+  if (!any) {
+    errno = EINVAL;
+    return -1;
+  }
+  return 0;
+}
+
 /* flock(2) whole-file advisory lock, backed by fcntl record locking. */
 int flock(int fd, int operation) {
   struct flock fl;

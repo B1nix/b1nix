@@ -35,8 +35,20 @@ RUSTC="$ST/bin/rustc"
 # dynamic-libc (NEEDED libc.so.1), so the shared libc.so.1 ships in the chain too.
 DRV="$(ls "$ST"/lib/librustc_driver-*.so 2>/dev/null | head -1)"
 LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
+# GCC-free unwinder: rustc + driver NEED the shared LLVM libunwind.so.1 (built by
+# build-rust-native.sh), which replaces GCC's libgcc_s.so in the .so chain.
+LIBUNWIND="$ROOT_DIR/build/rust-native/libunwind.so.1"
+# M90 GCC-free: librustc_driver.so is now built against the SHARED LLVM libc++
+# (rustc_llvm's -lstdc++ is redirected to libc++/libc++abi by the cross linker),
+# so the .so chain gains libc++.so.1 + libc++abi.so.1 (the latter folds libunwind
+# → provides the _Unwind_* ABI). DT_NEEDED chain: rustc -> librustc_driver.so ->
+# {libc++.so.1, libc++abi.so.1, libc.so.1}; libc++.so.1 -> {libc++abi.so.1,
+# libc.so.1}; libc++abi.so.1 -> libc.so.1. No libgcc_s, no libstdc++.
+CXXDIR="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/sysroot/lib"
+LIBCXX="$CXXDIR/libc++.so.1"
+LIBCXXABI="$CXXDIR/libc++abi.so.1"
 
-for f in "$RUSTC" "$DRV" "$LIBC" "$KELF"; do
+for f in "$RUSTC" "$DRV" "$LIBC" "$LIBUNWIND" "$LIBCXX" "$LIBCXXABI" "$KELF"; do
 	[ -f "$f" ] || { echo "missing: $f"; exit 1; }
 done
 STRIP="${STRIP:-strip}"
@@ -53,6 +65,10 @@ cp "$RUSTC" "$STAGE/bin/rustc"
 DRV_NAME="$(basename "$DRV")"
 cp "$DRV"  "$STAGE/lib/$DRV_NAME"; "$STRIP" --strip-unneeded "$STAGE/lib/$DRV_NAME"
 cp "$LIBC" "$STAGE/lib/libc.so.1"       # the shared libc rustc + driver now import
+cp "$LIBUNWIND" "$STAGE/lib/libunwind.so.1"  # GCC-free unwinder (replaces libgcc_s.so)
+cp "$LIBCXX" "$STAGE/lib/libc++.so.1"        # shared LLVM libc++ (driver DT_NEEDED)
+cp "$LIBCXXABI" "$STAGE/lib/libc++abi.so.1"  # libc++abi (folds libunwind; driver DT_NEEDED)
+"$STRIP" --strip-unneeded "$STAGE/lib/libc++.so.1" "$STAGE/lib/libc++abi.so.1"
 SZ=$(du -sm "$STAGE" | cut -f1)
 echo "  staged ${SZ}MB"
 
@@ -71,6 +87,9 @@ write $STAGE/bin/rustc rustc
 cd /lib
 write $STAGE/lib/$DRV_NAME $DRV_NAME
 write $STAGE/lib/libc.so.1 libc.so.1
+write $STAGE/lib/libunwind.so.1 libunwind.so.1
+write $STAGE/lib/libc++.so.1 libc++.so.1
+write $STAGE/lib/libc++abi.so.1 libc++abi.so.1
 EOF
 echo "  rust.img = ${IMG_MB}MB"
 fi
