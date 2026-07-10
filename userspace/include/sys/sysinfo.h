@@ -1,6 +1,11 @@
 #ifndef B1NIX_U_SYS_SYSINFO_H
 #define B1NIX_U_SYS_SYSINFO_H
 
+/* C-only: some builds force-include this header globally (e.g. the busybox port,
+ * whose procps applets need struct sysinfo but whose libbb.h refuses to pull it
+ * in). A -include that also reaches .S files must be a no-op for the assembler. */
+#ifndef __ASSEMBLER__
+
 /* Linux struct sysinfo ABI (see sysinfo(2)). The kernel SYS_SYSINFO handler
  * copies a byte-identical layout out, so the field widths here MUST mirror the
  * kernel's: both sides use native `unsigned long`, which is 32-bit on i686 and
@@ -24,5 +29,7 @@ struct sysinfo {
 };
 
 int sysinfo(struct sysinfo *info);
+
+#endif /* !__ASSEMBLER__ */
 
 #endif

@@ -136,7 +136,17 @@ echo "Building BusyBox..."
 # cross toolchain's own x86_64-b1nix/lib/libc.a (static): the gcc-internal lib dir
 # holds only libc.a, so without this -L the link silently falls back to static
 # libc even though -static was dropped.
-export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include"
+# -include sys/sysinfo.h: busybox's libbb.h deliberately does NOT pull in
+# <sys/sysinfo.h> (upstream avoids a conflicting struct sysinfo from linux/
+# headers on some toolchains). free.c/etc. then rely on it being provided by the
+# toolchain's default include chain — which the old cross-GCC did but clang does
+# not, so `struct sysinfo` is an incomplete type. b1nix ships exactly one
+# sys/sysinfo.h (Linux ABI, guarded), so force-including it globally is safe.
+# -Wno-error=implicit-function-declaration / -incompatible-pointer-types /
+# -int-conversion: clang (>=15) promotes these to hard errors; the GCC baseline
+# busybox targets treats them as warnings. Match that leniency for the port (real
+# type bugs in b1nix-authored applets are fixed at the source, e.g. tree.c).
+export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include -include sys/sysinfo.h -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
 # -static-libgcc folds the handful of libgcc integer builtins (__udivdi3 etc.)
 # statically instead of importing the shared libgcc_s.so, so busybox — a pure-C
 # port — carries NO DT_NEEDED GCC runtime. This lets the ISO drop libgcc_s.so

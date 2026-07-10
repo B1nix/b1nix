@@ -693,6 +693,7 @@ implementation notes in [`browser-platform.md`](browser-platform.md).
 - [x] `done` Web access: HTTP via libcurl (`M53-WEB`), HTTPS via mbedTLS (`M53-HTTPS`), public-internet HTTPS (`M53-EXT-HTTPS`).
 - [x] `done` On-screen `/dev/fb0` frontend, Wayland windowed frontend, interactive keyboard/mouse input (`M53-FB`, `M53-WL`, `M53-INPUT`). Seven render/interaction paths green both arches.
 - [x] `done` TCP zero-window stall fixed; heavy-page OOM robustness (OOM-killer, TLB shootdown, freelist validation).
+- [x] `done` (v0.90.1) **NetSurf HTTPS regression fixed** — the ports-driver refactor had rebuilt libcurl with `--without-ssl`, so every NetSurf `https://` fetch returned no content (`M53-HTTPS: has-content=0`, deterministic, mis-labelled a "flake"). `build-curl.sh` now builds libcurl `--with-mbedtls` again (`USE_MBEDTLS 1`); `M53-HTTPS: has-content=1 / ok render` green.
 - [x] `done` SVG (libsvgtiny), JavaScript (Duktape), public-suffix list (libnspsl), JPEG-XL (libjxl), RISC-OS sprites (librosprite), utf8proc — all enabled features verified.
 - [ ] `stubbed` Chromium assessment: blocked on sandbox/namespaces, GPU EGL/GBM/Vulkan, full C++ runtime. Details in [`chromium-assessment.md`](chromium-assessment.md).
 
@@ -1652,12 +1653,14 @@ PIE base (`0x500000000000`).
 
 ## M90: Complete elimination of GCC from the cross and native toolchains (Pure LLVM/Clang Toolchain)
 
-- [ ] `planned` **Pure LLVM/Clang cross-toolchain (host-side).** 
-  Replace the cross GCC and GNU binutils (`x86_64-b1nix-gcc`, `ld`, `ar`) with host-built LLVM/Clang targeting `x86_64-b1nix`. Use `lld` as the default linker and `llvm-ar` / `llvm-strip` for binary operations. Cross-compile `compiler-rt` (for builtins) and `libunwind` (for unwinding) into the cross sysroot, removing `libgcc.a` and `libgcc_eh.a` entirely.
-- [ ] `planned` **Pure LLVM/Clang native toolchain (inside the VM).**
-  Replace the native GCC and binutils packaged in the ISO/initramfs with native Clang/LLVM (`/bin/clang`, `/bin/lld`, `/bin/llvm-ar`), making compiler-rt/libc++abi/libc++ the only C++ development runtime available on b1nix. Integrate the GCC-free native clang build from [build-native-clang-libcxx.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-native-clang-libcxx.sh) into the main `Makefile` install targets.
-- [ ] `planned` **Migrate remaining ports off GCC components.**
-  Update the NetSurf framebuffer builder ([build-netsurf-fb.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/ports/build-netsurf-fb.sh)) to compile with cross-Clang instead of `x86_64-b1nix-gcc`. Modify C++ demos (`build-m52-mesa-demo.sh` etc.) to drop the fallback to `x86_64-b1nix-gcc` and link against LLVM runtimes only, utilizing `linker-libcxx.ld`. Ensure no port copies or links GCC's internal startup files (`crtbegin.o`, `crtend.o`).
-- [ ] `planned` **GCC-free Rust compiler.**
-  Update [build-rust-native.sh](file:///home/dmytrom/Documents/GitHub/b1nix/tools/build-rust-native.sh) and `build-rust-toolchain.sh` to compile and link Rust targets using `lld` and `libunwind.a`/`libcompiler_rt.a` instead of GCC and `libgcc_eh.a`.
+- [x] `done` **Pure LLVM/Clang cross-toolchain (host-side) (v0.90.0).**
+  `tools/toolchain/build-toolchain.sh` no longer builds GCC/binutils — it **symlinks** the host LLVM/Clang tools + the clang wrappers as `x86_64-b1nix-{gcc,g++,ar,ld,...}`, with `lld` the default linker and `llvm-ar`/`llvm-strip`/`llvm-nm`. `compiler-rt` (builtins) + `libunwind` (unwinding) are built into the cross sysroot; `libgcc.a`/`libgcc_eh.a` are gone (`env.sh` `LIBGCC_CROSS=""`).
+- [x] `done` **Pure LLVM/Clang native toolchain (inside the VM) (v0.89.0).**
+  Native Clang/LLVM (`libLLVM.so` + clang frontend) is rebuilt on libc++ (GCC-free) and shipped in the ISO; compiler-rt/libc++abi/libc++ are the only C++ development runtime on b1nix. See M89 above.
+- [x] `done` **Migrate remaining ports off GCC components (v0.90.0).**
+  NetSurf, the Mesa/EGL/litehtml demos and the C++ demos all build with cross-Clang against the LLVM runtimes (`linker-libcxx.ld`); no port copies GCC startup files. **Key clang-vs-GCC fix this milestone:** the clang cross-wrapper `b1nix-autotools-cc` must predefine `__b1nix__`/`__unix__` (old GCC did automatically) — without them NetSurf's `utils/config.h` left `HAVE_MMAP` defined, so the `file://` fetcher used `mmap()` (which returns a zero page for an initramfs-backed file on b1nix) and every locally-fetched HTML page parsed as all-zeros → no `<img>`/SVG/JS/JXL rendered. Restoring the predefines fixes it (`M53-NS/WL: ok svg/js/jxl`).
+- [x] `done` (v0.90.3) **GCC-free Rust.**
+  Rust now links the LLVM runtimes (`libunwind.a`/`libcompiler_rt.a`) instead of GCC/`libgcc_s`:
+  - **M67 cross rust — done & smoke-verified.** The JSON target spec (`build/rust/targets/x86_64-unknown-b1nix.json`, static `crt-static` ET_EXEC) drops `-lgcc_s`; Rust's own `unwind` crate now links the LLVM libunwind static bundle, and `build-rust-toolchain.sh` stages `libunwind.a`/`libcompiler_rt.a` into the cross sysroot. `tools/m67/hello_b1nix.elf` rebuilt GCC-free (linked `-lunwind`, no `-lgcc_s`); `M67-RUST: ok run-std` green in the full suite.
+  - **M68 native rustc — done & proof-verified.** From-source rustc + LLVM built dynamic (`LLVM_BUILD_LLVM_DYLIB=ON`): `librustc_driver.so` folds LLVM static, DT_NEEDED = {libc++.so.1, libc++abi.so.1, libc.so.1} — **no libgcc_s, no libstdc++**. `M68-RUST: ok rustc-load` + `rustc 1.98.0-nightly` printed on b1nix. Key fixes: (a) `b1nix-c++` wrapper relinks shared libraries preserving CMake's `--whole-archive`/`--no-whole-archive` interleaving (was flattening → duplicate symbols); (b) `b1nix-autotools-cc` handles `-shared` for dylib links + routes `-lstdc++`→libc++/libc++abi (GCC-free); (c) kernel eager loader gained R_X86_64_DTPMOD64/DTPOFF64 (general-dynamic TLS) + libc `__tls_get_addr` static-TLS fast path.
 

@@ -80,7 +80,19 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define R_X86_64_GLOB_DAT 6
 #define R_X86_64_JUMP_SLOT 7
 #define R_X86_64_RELATIVE 8
+#define R_X86_64_DTPMOD64 16
+#define R_X86_64_DTPOFF64 17
 #define R_X86_64_TPOFF64  18
+
+/* General/local-dynamic TLS for STATIC (load-time, kernel-eager-linked) modules.
+ * The GD/LD model routes __thread access through __tls_get_addr({module,offset}).
+ * Rather than teach libc's __tls_get_addr a per-thread DTV for these modules, the
+ * eager loader encodes the module's static-TLS distance-below-TP directly into
+ * the DTPMOD64 GOT slot, flagged with bit 63; libc's __tls_get_addr then returns
+ * (thread_pointer - dist + offset). Small tls_offset values never set bit 63, and
+ * dlopen module ids (1,2,3…) never do either, so the flag cleanly distinguishes
+ * the two paths. MUST match TLS_STATIC_MODULE_FLAG in userspace/libc/dlfcn.c. */
+#define TLS_STATIC_MODULE_FLAG (1ULL << 63)
 
 struct elf64_rela {
   u64 r_offset;
@@ -742,6 +754,74 @@ static int elf64_apply_rela_table(struct user_loaded_image *image,
         }
       }
       *target = (u64)tpoff;
+      continue;
+    }
+    /* R_X86_64_DTPMOD64: module-id half of a general/local-dynamic TLS GOT pair.
+     * Encode the defining module's static-TLS distance-below-TP (| flag) so libc's
+     * __tls_get_addr can return (TP - dist + offset) without a per-thread DTV. */
+    if (type == R_X86_64_DTPMOD64) {
+      u64 dist;
+      if (sym_index == 0) {
+        dist = (u64)objects[owner].tls_offset;
+      } else {
+        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
+            sizeof(*sym));
+        if (!sym || sym->st_name >= objects[owner].strsz)
+          return -1;
+        if (sym->st_shndx != SHN_UNDEF) {
+          dist = (u64)objects[owner].tls_offset;
+        } else {
+          char name[2048];
+          usize d = 0;
+          u64 stv = 0;
+          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
+                              sizeof(name)))
+            return -1;
+          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
+                                       &stv) == 0)
+            dist = (u64)objects[d].tls_offset;
+          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+            dist = 0;
+          else
+            return -1;
+        }
+      }
+      *target = TLS_STATIC_MODULE_FLAG | dist;
+      continue;
+    }
+    /* R_X86_64_DTPOFF64: offset-within-module half of a GD TLS GOT pair. This is
+     * the variable's offset inside its module's TLS block (NOT TP-relative — the
+     * TP bias is applied by __tls_get_addr via the DTPMOD64 distance above). */
+    if (type == R_X86_64_DTPOFF64) {
+      i64 off;
+      if (sym_index == 0) {
+        off = rela->r_addend;
+      } else {
+        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
+            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
+            sizeof(*sym));
+        if (!sym || sym->st_name >= objects[owner].strsz)
+          return -1;
+        if (sym->st_shndx != SHN_UNDEF) {
+          off = (i64)sym->st_value + rela->r_addend;
+        } else {
+          char name[2048];
+          usize d = 0;
+          u64 stv = 0;
+          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
+                              sizeof(name)))
+            return -1;
+          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
+                                       &stv) == 0)
+            off = (i64)stv + rela->r_addend;
+          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
+            off = rela->r_addend;
+          else
+            return -1;
+        }
+      }
+      *target = (u64)off;
       continue;
     }
     console_write("ELF load: unsupported relocation type ");

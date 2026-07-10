@@ -52,7 +52,9 @@ GEN_PIC        :=
 GEN_CRT0       := $(CRT0)
 GEN_LINKER     := linker.ld
 GEN_LIBDEP     := $(LIB)
-GEN_LINK_EXTRA :=
+# -z norelro: b1nix static ELFs are not RELRO-mprotected, and lld (>=15) rejects
+# the static linker.ld's non-contiguous .init_array under the default -z relro.
+GEN_LINK_EXTRA := -z norelro
 GEN_LINK_LIBS  := --whole-archive $(LIB) --no-whole-archive
 else
 GEN_PIC        := -fPIC
@@ -70,7 +72,7 @@ endif
 # shared dependency. LINK=static restores the historical whole-archive static link.
 ifeq ($(LINK),static)
 BESPOKE_CRT0  := $(CRT0)
-BESPOKE_EXTRA :=
+BESPOKE_EXTRA := -z norelro
 BESPOKE_LIBC  := --whole-archive $(LIB) --no-whole-archive
 else
 BESPOKE_CRT0  := $(DYNAMIC_CRT0)
@@ -492,17 +494,20 @@ $(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(LIB) $(CRT0) $(LINKER)
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_zlib_smoke.o \
 	  $(ZLIB_DIR)/lib/libz.a $(BESPOKE_LIBC)
 
-# m53_libpng_smoke links the ported static libpng over zlib (M53 image codec).
+# m53_libpng_smoke links the ported libpng over zlib (M53 image codec).
 LIBPNG_DIR := ../build/libpng-b1nix/$(B1NIX_TRIPLET)/install
-$(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(LIB) $(CRT0) $(LINKER)
+$(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
-	# Stays STATIC (residual debt): libpng's setjmp/longjmp error path takes the
-	# absolute address of `longjmp`, emitting R_X86_64_32 relocs a non-PIE dynamic
-	# link cannot form against an imported (libc.so.1) symbol.
-	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(CRT0) $(BUILD)/bin/m53_libpng_smoke.o \
+	$(CC) $(CFLAGS) $(GEN_PIC) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
+	# Dynamic PIE (default) like its m53 siblings. The old "must stay static"
+	# note (libpng's setjmp/longjmp error path takes the absolute address of
+	# `longjmp` → R_X86_64_32 a non-PIE dynamic link can't form against the
+	# imported libc.so.1 symbol) no longer applies: the port archives are all
+	# -fPIC (GOTPCREL/PLT32, zero R_X86_64_32) so a -pie link resolves the
+	# imported longjmp through the GOT. setjmp/longjmp are exported by libc.so.1.
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -T $(GEN_LINKER) -o $@ $(GEN_CRT0) $(BUILD)/bin/m53_libpng_smoke.o \
 	  $(LIBPNG_DIR)/lib/libpng16.a $(ZLIB_DIR)/lib/libz.a $(LIBM_DIR)/lib/libm.a \
-	  --whole-archive $(LIB) --no-whole-archive
+	  $(GEN_LINK_LIBS)
 
 # m53_libjpeg_smoke links the ported static IJG libjpeg (M53 image codec).
 LIBJPEG_DIR := ../build/libjpeg-b1nix/$(B1NIX_TRIPLET)/install

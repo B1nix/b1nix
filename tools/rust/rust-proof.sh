@@ -2,16 +2,19 @@
 # M68 native-Rust proof for b1nix.
 #
 # The native rustc ELF plus its shared-object chain (librustc_driver.so ~89MB
-# stripped, libLLVM.so ~160MB stripped, libgcc_s.so) are far too big for the
-# xxd-embedded initramfs, so — exactly like d8 in tools/v8/ — they ship inside a
-# single self-contained ISO as a GRUB Multiboot2 module (ext4), which b1nix
-# exposes as the ram0 block device. With b1nix.rustrun (handled in
-# kernel/main.c) the kernel mounts ram0 -> /mnt/rust and launches /bin/rustc.
+# stripped, LLVM folded in) are far too big for the xxd-embedded initramfs, so —
+# exactly like d8 in tools/v8/ — they ship inside a single self-contained ISO as
+# a GRUB Multiboot2 module (ext4), which b1nix exposes as the ram0 block device.
+# With b1nix.rustrun (handled in kernel/main.c) the kernel mounts ram0 ->
+# /mnt/rust and launches /bin/rustc.
 #
-# rustc has librustc_driver.so + libLLVM.so as DT_NEEDED and NO PT_INTERP, so
-# merely loading it drives the M69 recursive exec-time dynamic linker across the
-# whole ~250MB .so graph (rustc -> librustc_driver.so -> libLLVM.so ->
-# libgcc_s.so). `rustc --version` then proves the loaded compiler executes on
+# M90 (GCC-free): the unwinder (_Unwind_*/__register_frame) and compiler builtins
+# come from the LLVM runtimes (libunwind.a + libcompiler_rt.a) whole-archived into
+# the rustc executable and re-exported via --export-dynamic — there is NO
+# libgcc_s.so in the chain anymore. rustc has librustc_driver.so + libc.so.1 as
+# DT_NEEDED and NO PT_INTERP, so merely loading it drives the M69 recursive
+# exec-time dynamic linker across the whole ~250MB .so graph (rustc ->
+# librustc_driver.so -> libc.so.1). `rustc --version` then proves the loaded compiler executes on
 # b1nix by printing its real version string to serial — that string is the
 # pass marker (no fake: only the genuinely-loaded compiler can emit it).
 set -eu
@@ -32,9 +35,20 @@ RUSTC="$ST/bin/rustc"
 # dynamic-libc (NEEDED libc.so.1), so the shared libc.so.1 ships in the chain too.
 DRV="$(ls "$ST"/lib/librustc_driver-*.so 2>/dev/null | head -1)"
 LIBC="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
-LIBGCC="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/lib/libgcc_s.so.1"
+# GCC-free unwinder: rustc + driver NEED the shared LLVM libunwind.so.1 (built by
+# build-rust-native.sh), which replaces GCC's libgcc_s.so in the .so chain.
+LIBUNWIND="$ROOT_DIR/build/rust-native/libunwind.so.1"
+# M90 GCC-free: librustc_driver.so is now built against the SHARED LLVM libc++
+# (rustc_llvm's -lstdc++ is redirected to libc++/libc++abi by the cross linker),
+# so the .so chain gains libc++.so.1 + libc++abi.so.1 (the latter folds libunwind
+# → provides the _Unwind_* ABI). DT_NEEDED chain: rustc -> librustc_driver.so ->
+# {libc++.so.1, libc++abi.so.1, libc.so.1}; libc++.so.1 -> {libc++abi.so.1,
+# libc.so.1}; libc++abi.so.1 -> libc.so.1. No libgcc_s, no libstdc++.
+CXXDIR="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/sysroot/lib"
+LIBCXX="$CXXDIR/libc++.so.1"
+LIBCXXABI="$CXXDIR/libc++abi.so.1"
 
-for f in "$RUSTC" "$DRV" "$LIBC" "$LIBGCC" "$KELF"; do
+for f in "$RUSTC" "$DRV" "$LIBC" "$LIBUNWIND" "$LIBCXX" "$LIBCXXABI" "$KELF"; do
 	[ -f "$f" ] || { echo "missing: $f"; exit 1; }
 done
 STRIP="${STRIP:-strip}"
@@ -51,7 +65,10 @@ cp "$RUSTC" "$STAGE/bin/rustc"
 DRV_NAME="$(basename "$DRV")"
 cp "$DRV"  "$STAGE/lib/$DRV_NAME"; "$STRIP" --strip-unneeded "$STAGE/lib/$DRV_NAME"
 cp "$LIBC" "$STAGE/lib/libc.so.1"       # the shared libc rustc + driver now import
-cp "$LIBGCC" "$STAGE/lib/libgcc_s.so"   # tiny; leave symbols intact
+cp "$LIBUNWIND" "$STAGE/lib/libunwind.so.1"  # GCC-free unwinder (replaces libgcc_s.so)
+cp "$LIBCXX" "$STAGE/lib/libc++.so.1"        # shared LLVM libc++ (driver DT_NEEDED)
+cp "$LIBCXXABI" "$STAGE/lib/libc++abi.so.1"  # libc++abi (folds libunwind; driver DT_NEEDED)
+"$STRIP" --strip-unneeded "$STAGE/lib/libc++.so.1" "$STAGE/lib/libc++abi.so.1"
 SZ=$(du -sm "$STAGE" | cut -f1)
 echo "  staged ${SZ}MB"
 
@@ -70,7 +87,9 @@ write $STAGE/bin/rustc rustc
 cd /lib
 write $STAGE/lib/$DRV_NAME $DRV_NAME
 write $STAGE/lib/libc.so.1 libc.so.1
-write $STAGE/lib/libgcc_s.so libgcc_s.so
+write $STAGE/lib/libunwind.so.1 libunwind.so.1
+write $STAGE/lib/libc++.so.1 libc++.so.1
+write $STAGE/lib/libc++abi.so.1 libc++abi.so.1
 EOF
 echo "  rust.img = ${IMG_MB}MB"
 fi

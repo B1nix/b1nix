@@ -83,14 +83,12 @@ resolve_cxx_cross() {
     local cxx_stdlib="${B1NIX_CXX_STDLIB:-}"
 
     # Auto-detect C++ stdlib. The unified runtimes build (build-libcxx.sh) installs
-    # BOTH libc++.a and libc++abi.a under libcxx-install/lib. Default to libstdc++
-    # so the existing ports keep their verified runtime unless libc++ is requested
-    # explicitly (B1NIX_CXX_STDLIB=libc++) — migrating a port is a deliberate,
-    # per-port reverify, not something to flip on automatically.
+    # BOTH libc++.a and libc++abi.a under libcxx-install/lib. Default to libc++
+    # so we run GCC-free.
     local libcxx_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++.a"
     local libcxxabi_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
     if [ -z "$cxx_stdlib" ]; then
-        cxx_stdlib="libstdc++"
+        cxx_stdlib="libc++"
     fi
 
     # Resolve C++ stdlib archives
@@ -111,10 +109,7 @@ resolve_cxx_cross() {
             CXXFLAGS_CROSS="-O2 -ffunction-sections -fdata-sections -Db1nix"
             ;;
         clang|*)
-            CXX_CROSS="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$gxx")}"
-            local ver
-            ver="$("$gxx" -dumpversion 2>/dev/null || echo 13.2.0)"
-            local gccroot="$cross/lib/gcc/$B1NIX_TRIPLET/$ver"
+            CXX_CROSS="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "clang++")}"
             if [ "$cxx_stdlib" = "libc++" ]; then
                 # libc++: -nostdinc++ (drop only the C++ stdlib search) + the libc++
                 # headers, letting clang resolve its own builtin C headers and the
@@ -126,6 +121,9 @@ resolve_cxx_cross() {
                 CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET --sysroot=$sysroot -nostdinc++ -isystem $libcxx_hdr"
                 CXXFLAGS_CROSS="$CXXFLAGS_CROSS -O2 -ffunction-sections -fdata-sections -Db1nix"
             else
+                local ver
+                ver="$("$gxx" -dumpversion 2>/dev/null || echo 13.2.0)"
+                local gccroot="$cross/lib/gcc/$B1NIX_TRIPLET/$ver"
                 local res
                 res="$("$CXX_CROSS" -print-resource-dir 2>/dev/null || true)"
                 CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET -O2 -ffunction-sections -fdata-sections -Db1nix -nostdinc"
@@ -138,7 +136,11 @@ resolve_cxx_cross() {
             ;;
     esac
 
-    LIBGCC_CROSS="$("$gxx" -print-libgcc-file-name 2>/dev/null)"
+    if [ "$cxx_stdlib" = "libc++" ]; then
+        LIBGCC_CROSS=""
+    else
+        LIBGCC_CROSS="$("$gxx" -print-libgcc-file-name 2>/dev/null)"
+    fi
 
     # LLVM runtimes: prefer compiler-rt + libunwind over libgcc when available.
     local llvm_rt="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib"

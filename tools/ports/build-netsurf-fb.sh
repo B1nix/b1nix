@@ -285,7 +285,13 @@ emit_pc libjxl  "-Wl,--start-group -ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotl
 # --allow-multiple-definition: on i686 the b1nix libc and libgcc both provide the
 # 64-bit division helpers (__udivdi3/__divdi3); they're identical, so let the
 # first win instead of erroring. (No such overlap on x86_64.)
-emit_pc libnsfb         "-Wl,--allow-multiple-definition -lnsfb -lb1gui -lb1nixcompat" ""
+# --whole-archive libnsfb: the surface backends (ram/b1nixfb/displayd) self-register
+# ONLY via __attribute__((constructor)); nothing references their symbols, so plain
+# archive semantics leave them out entirely — nsfb then knows zero surfaces
+# ("Unknown surface `ram`"). Whole-archiving libnsfb pulls every surface object so
+# its constructor lands in .init_array (which b1nix crt0 runs). -lb1gui/-lb1nixcompat
+# stay outside the whole-archive (they ARE referenced, by the displayd surface).
+emit_pc libnsfb         "-Wl,--allow-multiple-definition -Wl,--whole-archive -lnsfb -Wl,--no-whole-archive -lb1gui -lb1nixcompat" ""
 
 # ── 1a0. Toolchain fix: this cross-gcc's limits.h does not chain to the sysroot
 # system limits.h (it lacks the _GCC_NEXT_LIMITS_H re-include block), so POSIX
@@ -814,7 +820,16 @@ fi
 # (the __cxa_atexit DSO token for static-object destructors), which b1nix's cross-gcc
 # crtbegin does not provide on this newlib target for a C-driver link. 0 = "the main
 # program", the correct token for a non-PIE executable.
-export LDFLAGS="${LDFLAGS:-} -static-libgcc -Wl,--defsym=__dso_handle=0"
+export CFLAGS="${CFLAGS:-} -fPIC"
+export CXXFLAGS="${CXXFLAGS:-} -fPIC"
+export LDFLAGS="${LDFLAGS:-} -static-libgcc -Wl,--defsym=__dso_handle=0 -Wl,-z,notext"
+# nsfb folds libc++/libjxl and depends on C++ exceptions (libjxl decode throws on
+# its slow paths). The cross driver's default linker.ld drops .eh_frame /
+# .eh_frame_hdr / .gcc_except_table, so unwinding is dead and JXL/SVG/JS decode
+# silently yields nothing. Link with linker-libcxx.ld (KEEPs the unwind sections
+# + the .ctors.* static-init glob) and emit PT_GNU_EH_FRAME via --eh-frame-hdr.
+export B1NIX_LINKER="$ROOT_DIR/userspace/linker-libcxx.ld"
+export B1NIX_LD_EXTRA="--eh-frame-hdr"
 make -C "$SRC_DIR" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \

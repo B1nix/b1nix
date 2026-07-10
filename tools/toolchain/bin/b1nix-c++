@@ -18,13 +18,33 @@
 
 set -eu
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-ROOT="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+ROOT=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    ROOT="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+if [ -z "$ROOT" ]; then
+  echo "b1nix-c++: cannot find project root" >&2
+  exit 1
+fi
 ARCH="${B1NIX_ARCH:-x86_64}"
 if [ "$ARCH" = "x86" ]; then
   TRIPLET="i686-b1nix"; LDEMU="elf_i386"
 else
   TRIPLET="x86_64-b1nix"; LDEMU="elf_x86_64"
 fi
+
+# Intercept GCC-specific query flags
+for arg in "$@"; do
+  if [ "$arg" = "-print-sysroot" ]; then
+    echo "$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET"
+    exit 0
+  fi
+done
 GXX="$ROOT/build/toolchain_build/$TRIPLET/cross/bin/$TRIPLET-g++"
 CROSS="$ROOT/build/toolchain_build/$TRIPLET/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
@@ -32,7 +52,13 @@ USR="$ROOT/userspace"
 LIB="$USR/build/$ARCH/libb1nix.a"
 CRT0="$USR/build/$ARCH/crt/crt0.o"
 LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
-[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$LIB" "$CRT0"
+# Relative target paths for `make -C "$USR"`: the userspace Makefile's rules are
+# relative to build/$(B1NIX_ARCH)/..., so an absolute path matches no rule.
+REL_LIB="build/$ARCH/libb1nix.a"
+REL_CRT0="build/$ARCH/crt/crt0.o"
+REL_SHARED_LIBC="build/$ARCH/libc.so.1"
+REL_DYN_CRT0="build/$ARCH/crt/crt0-dynamic.o"
+[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
 
 # ── Static vs dynamic link (default dynamic, like the rest of userspace) ─────
 # B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libstdc++/libc++ and the
@@ -47,7 +73,7 @@ if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
   GROUP_LIBC="--whole-archive $LIB --no-whole-archive"
   POST_GROUP=""
 else
-  [ -f "$DYN_CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$DYN_CRT0" "$SHARED_LIBC"
+  [ -f "$DYN_CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_DYN_CRT0" "$REL_SHARED_LIBC"
   CRT0="$DYN_CRT0"
   # --eh-frame-hdr emits PT_GNU_EH_FRAME so the executable's frames are
   # discoverable via dl_iterate_phdr by the shared libgcc_s.so unwinder (the
@@ -70,15 +96,7 @@ LLVM_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/install/lib"
 # (the latter folds libunwind). Linked dynamically in the default dynamic mode.
 CXXSO_DIR="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
 
-CXX_STDLIB="${B1NIX_CXX_STDLIB:-}"
-if [ -z "$CXX_STDLIB" ]; then
-  # Auto-detect: prefer libc++ when built
-  if [ -f "$LIBCXX_RT/lib/libc++.a" ] && [ -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
-    CXX_STDLIB="libc++"
-  else
-    CXX_STDLIB="libstdc++"
-  fi
-fi
+CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"
 
 case "$CXX_STDLIB" in
   libc++)
@@ -97,6 +115,10 @@ case "$CXX_STDLIB" in
     echo "  C++ stdlib: LLVM libc++" >&2
     ;;
   libstdc++|*)
+    if [ ! -x "$GXX" ]; then
+      echo "b1nix-c++: libstdc++ chosen but cross-g++ is missing ($GXX)" >&2
+      exit 1
+    fi
     STDLIB_A="$("$GXX" -print-file-name=libstdc++.a)"
     STDLIB_ABI_A="$("$GXX" -print-file-name=libsupc++.a)"
     echo "  C++ stdlib: GCC libstdc++" >&2
@@ -180,7 +202,11 @@ if [ "$CXX_STDLIB" = "libc++" ] && [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$
   fi
   echo "  CRT runtime: LLVM (compiler-rt$( [ -n "$UNWIND_RUNTIME" ] && echo ' + libunwind'))" >&2
 else
-  CRT_RUNTIME="$("$GXX" -print-libgcc-file-name)"
+  if [ -x "$GXX" ]; then
+    CRT_RUNTIME="$("$GXX" -print-libgcc-file-name)"
+  else
+    CRT_RUNTIME=""
+  fi
   UNWIND_RUNTIME=""
   echo "  CRT runtime: GCC (libgcc)" >&2
 fi
@@ -193,10 +219,7 @@ case "$CXX_FRONTEND" in
     CXX="$GXX"
     ;;
   clang|*)
-    CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
-    VER="$($GXX -dumpversion)"
-    RES="$($CXX -print-resource-dir 2>/dev/null || true)"
-
+    CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "clang++")}"
     if [ "$CXX_STDLIB" = "libc++" ]; then
       # libc++ mode: -nostdinc++ (drop only the C++ stdlib search) + the libc++
       # headers via -isystem, and let clang resolve its own builtin C headers
@@ -210,6 +233,8 @@ case "$CXX_FRONTEND" in
       CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
       CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
     else
+      VER="$($GXX -dumpversion)"
+      RES="$($CXX -print-resource-dir 2>/dev/null || true)"
       # libstdc++ mode: use GCC's C++ headers
       CXXROOT="$CROSS/$TRIPLET/include/c++/$VER"
       GCCROOT="$CROSS/lib/gcc/$TRIPLET/$VER"
@@ -231,34 +256,98 @@ run_cxx() {
 }
 
 # ── Parse arguments ────────────────────────────────────────────────────────
+# Keep an untouched copy of the original argv. The -shared (shared-library) path
+# relinks CMake's command verbatim: splitting args into inputs/passthru below
+# loses the interleaving between --whole-archive/--no-whole-archive windows and
+# the .a files inside them, and LLVM's libLLVM.so link lists each component
+# archive twice (once whole-archived, once as a plain dep) — flattening that into
+# a single whole-archive window duplicates every symbol.
+orig_args=("$@")
 compile_only=0
 output="a.out"
-inputs=""
-passthru=""
+inputs=()
+passthru=()
 while [ $# -gt 0 ]; do
   case "$1" in
     -c) compile_only=1 ;;
     -o) shift; output="$1" ;;
-    *.cpp|*.cc|*.cxx|*.C|*.o|*.a) inputs="$inputs $1" ;;
-    *) passthru="$passthru $1" ;;
+    # Flags that take a separate value argument: consume BOTH into passthru so the
+    # value is never misclassified as an input. CMake/Ninja's C++ rule emits
+    # `-MT <out>.o -MF <out>.o.d`, whose values end in .o/.d and would otherwise be
+    # grabbed as input object files below → clang gets a non-existent input.
+    -MT|-MF|-MQ|-include|-isystem|-iquote|-idirafter|-imacros|-I|-D|-U|-x|-Xclang|-Xlinker)
+      passthru+=("$1" "$2"); shift ;;
+    # Any remaining dash-flag → passthru. MUST precede the input glob below so a
+    # flag that happens to contain ".so" (e.g. -Wl,-soname,libc++.so.1) is never
+    # misclassified as a shared-library input.
+    -*) passthru+=("$1") ;;
+    # Link inputs. Shared libraries are passed by PATH (CMake's LINK_LLVM_DYLIB
+    # gives tool exes `lib/libLLVM.so.NN` directly); classify them as inputs so
+    # the exe-link path below actually puts them on the ld line instead of
+    # dropping them into passthru → undefined llvm:: symbols.
+    *.cpp|*.cc|*.cxx|*.C|*.o|*.a|*.so|*.so.*) inputs+=("$1") ;;
+    *) passthru+=("$1") ;;
   esac
   shift
 done
 
 # ── Compile ────────────────────────────────────────────────────────────────
-# shellcheck disable=SC2086
+cxx_flags=()
+for f in $CXXFLAGS; do
+  cxx_flags+=("$f")
+done
+
 if [ "$compile_only" -eq 1 ]; then
-  # shellcheck disable=SC2086
-  run_cxx $CXXFLAGS $passthru -c $inputs -o "$output"
+  run_cxx "${cxx_flags[@]}" "${passthru[@]}" -c "${inputs[@]}" -o "$output"
   exit $?
 fi
 
-objs=""
+# -shared: building a shared library (.so) — do NOT inject crt0/libc/the b1nix
+# link recipe; pass through to clang++ which links the .so natively with its
+# own CRT and the caller's flags (LLVM cmake builds libLTO.so / libLLVM.so
+# etc. this way). Use -fuse-ld=lld so ld.lld is used instead of collect2.
+# Add -lc++ -lc++abi so the C++ runtime symbols (std::__1::*) resolve.
+# Point -L at the cross lib dir so the linker finds the b1nix libc++.
+is_shared=0
+for f in "${passthru[@]}"; do [ "$f" = "-shared" ] && is_shared=1; done
+if [ "$is_shared" -eq 1 ]; then
+  shared_target="x86_64-unknown-elf"
+  if [ "$ARCH" = "x86" ]; then shared_target="i686-unknown-elf"; fi
+  cross_lib="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+  # Relink CMake's shared-library command with the ORIGINAL argument order
+  # preserved, so every --whole-archive/--no-whole-archive window keeps wrapping
+  # exactly the .a files CMake placed inside it. (LLVM's libLLVM.so link lists
+  # each component archive twice — once whole-archived, once as a plain dep; the
+  # second, plain occurrence resolves nothing new and is skipped by lld, so no
+  # duplicate symbols. Flattening the order re-whole-archives the second copy and
+  # breaks the link.) We only drop -z,defs (forces all symbols defined, which
+  # breaks whole-archive shared links) and our own -o (re-added at the end).
+  ordered=()
+  skip_next=0
+  for f in "${orig_args[@]}"; do
+    if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+    case "$f" in
+      -Wl,-z,defs|-Wl,-znodefs) continue ;;   # drop -z,defs variants
+      -z) skip_next=1; continue ;;              # drop "-z defs" (two-word)
+      defs) continue ;;                         # second half of "-z defs"
+      -o) skip_next=1; continue ;;              # drop "-o <out>" (re-added below)
+    esac
+    ordered+=("$f")
+  done
+  run_cxx --target="$shared_target" -fuse-ld=lld -stdlib=libc++ -nostdinc++ -isystem "$LIBCXX_HDR" -L "$cross_lib" "${cxx_flags[@]}" "${ordered[@]}" -lc++ -lc++abi -o "$output"
+  exit $?
+fi
+
+objs=()
 tmp="${TMPDIR:-/tmp}/b1nix-cxx.$$"; mkdir -p "$tmp"
-for in in $inputs; do
-  case "$in" in
-    *.o|*.a) objs="$objs $in" ;;
-    *) o="$tmp/$(basename "$in").o"; run_cxx $CXXFLAGS $passthru -c "$in" -o "$o"; objs="$objs $o" ;;
+for in_file in "${inputs[@]}"; do
+  case "$in_file" in
+    *.o|*.a|*.so|*.so.*) objs+=("$in_file") ;;   # .so: shared-lib dep, link as-is
+    *)
+      o="$tmp/$(basename "$in_file").o"
+      run_cxx "${cxx_flags[@]}" "${passthru[@]}" -c "$in_file" -o "$o"
+      objs+=("$o")
+      ;;
   esac
 done
 
@@ -273,15 +362,40 @@ done
 # $SHARED_LIBGCC (-lgcc_s) is placed BEFORE the static libgcc.a so the shared
 # libgcc_s.so wins resolution of the unwinder/EH symbols (the static archive then
 # only contributes the integer/soft-float helpers it uniquely defines).
+
+dyn_extra_args=()
+for f in $DYN_EXTRA; do dyn_extra_args+=("$f"); done
+
+shared_libgcc_args=()
+for f in $SHARED_LIBGCC; do shared_libgcc_args+=("$f"); done
+
+stdlib_a_args=()
+for f in $STDLIB_A; do stdlib_a_args+=("$f"); done
+
+stdlib_abi_a_args=()
+for f in $STDLIB_ABI_A; do stdlib_abi_a_args+=("$f"); done
+
+group_libc_args=()
+for f in $GROUP_LIBC; do group_libc_args+=("$f"); done
+
+stdcxx_so_args=()
+for f in $STDCXX_SO; do stdcxx_so_args+=("$f"); done
+
+cxxlib_so_args=()
+for f in $CXXLIB_SO; do cxxlib_so_args+=("$f"); done
+
+post_group_args=()
+for f in $POST_GROUP; do post_group_args+=("$f"); done
+
 if [ -n "$UNWIND_RUNTIME" ]; then
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition $DYN_EXTRA -o "$output" \
-    "$CRT0" $objs $SHARED_LIBGCC \
-    --start-group $STDLIB_A $STDLIB_ABI_A "$CRT_RUNTIME" "$UNWIND_RUNTIME" $GROUP_LIBC --end-group \
-    $STDCXX_SO $CXXLIB_SO $POST_GROUP
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition "${dyn_extra_args[@]}" -o "$output" \
+    "$CRT0" "${objs[@]}" "${shared_libgcc_args[@]}" \
+    --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]}" --end-group \
+    "${stdcxx_so_args[@]}" "${cxxlib_so_args[@]}" "${post_group_args[@]}"
 else
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition $DYN_EXTRA -o "$output" \
-    "$CRT0" $objs $SHARED_LIBGCC \
-    --start-group $STDLIB_A $STDLIB_ABI_A "$CRT_RUNTIME" $GROUP_LIBC --end-group \
-    $STDCXX_SO $CXXLIB_SO $POST_GROUP
+  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections --allow-multiple-definition "${dyn_extra_args[@]}" -o "$output" \
+    "$CRT0" "${objs[@]}" "${shared_libgcc_args[@]}" \
+    --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "${group_libc_args[@]}" --end-group \
+    "${stdcxx_so_args[@]}" "${cxxlib_so_args[@]}" "${post_group_args[@]}"
 fi
 rm -rf "$tmp"

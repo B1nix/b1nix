@@ -250,6 +250,7 @@ int lchown(const char *path, uid_t owner, gid_t group);
 #define _SC_GETPW_R_SIZE_MAX 70  /* suggested getpw*_r buffer size */
 #define _SC_ARG_MAX 0  /* max bytes of arg+env to exec */
 #define _SC_OPEN_MAX 4 /* max open fds (== OPEN_MAX) */
+#define _SC_MONOTONIC_CLOCK 149 /* monotonic clock supported (glibc value) */
 long sysconf(int name);
 int getpagesize(void);
 int getdtablesize(void);

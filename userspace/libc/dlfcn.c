@@ -85,7 +85,20 @@ static int g_next_tls_module = 1;    /* unique DTPMOD64 ids for dlopen'd TLS */
  * dlopen'd module's TLS in current usage). */
 struct __tls_index { unsigned long ti_module; unsigned long ti_offset; };
 
+/* Bit-63 flag the kernel eager loader sets in a DTPMOD64 GOT slot for a STATIC
+ * (load-time) module: the low bits then hold that module's static-TLS distance
+ * below the thread pointer, so the thread-local address is (TP - dist + offset)
+ * with no per-thread DTV needed. MUST match TLS_STATIC_MODULE_FLAG in
+ * kernel/user/process.c. */
+#define TLS_STATIC_MODULE_FLAG (1UL << 63)
+
 void *__tls_get_addr(struct __tls_index *ti) {
+  if (ti->ti_module & TLS_STATIC_MODULE_FLAG) {
+    unsigned long dist = ti->ti_module & ~TLS_STATIC_MODULE_FLAG;
+    unsigned long tp;
+    __asm__ __volatile__("movq %%fs:0, %0" : "=r"(tp)); /* variant-II TP self-ptr */
+    return (void *)(tp - dist + ti->ti_offset);
+  }
   for (struct dl_object *o = g_objects; o; o = o->next) {
     if (o->tls_module != (int)ti->ti_module || o->tls_module == 0)
       continue;

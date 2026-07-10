@@ -101,7 +101,35 @@ for inc in "$TC/sysroot/include" "$TC/sysroot/usr/include" "$TC/cross/x86_64-b1n
         rel="${rel#./}"; mkdir -p "$inc/$(dirname "$rel")"
         stage_file "$ROOT/userspace/include/$rel" "$inc/$rel"
     done
+    # rustc's bundled LLVM builds with LLVM_ENABLE_ZLIB=ON (unconditional for
+    # non-MSVC in bootstrap llvm.rs), so the b1nix target compile needs zlib.h /
+    # zconf.h in its sysroot. Stage the ported (PIC) zlib headers; libz.a is
+    # staged into the lib dirs below so the final -lz resolves.
+    _zinc="$ROOT/build/zlib-b1nix/x86_64-b1nix/install/include"
+    if [ -f "$_zinc/zlib.h" ]; then
+        stage_file "$_zinc/zlib.h" "$inc/zlib.h"
+        [ -f "$_zinc/zconf.h" ] && stage_file "$_zinc/zconf.h" "$inc/zconf.h"
+    fi
 done
+# M90 GCC-free: build a shared libunwind.so.1 (whole-archive of the PIC libunwind.a,
+# NEEDED libc.so.1) so the target spec's llvm_libunwind=System dynamic `-lunwind`
+# has a real shared object to resolve against — replacing GCC's libgcc_s.so in the
+# rustc / librustc_driver.so DT_NEEDED graph.
+UNWIND_A="$TC/sysroot/usr/lib/libunwind.a"
+[ -f "$UNWIND_A" ] || UNWIND_A="$TC/llvm-runtimes-build/install/lib/libunwind.a"
+[ -f "$UNWIND_A" ] || UNWIND_A="$TC/cross/x86_64-b1nix/lib/libunwind.a"
+UNWIND_SO="$ROOT/build/rust-native/libunwind.so.1"
+LDLLD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
+if [ -f "$UNWIND_A" ] && [ -f "$ROOT/userspace/build/x86_64/libc.so.1" ]; then
+    "$LDLLD" -shared -soname libunwind.so.1 -o "$UNWIND_SO" \
+        --whole-archive "$UNWIND_A" --no-whole-archive \
+        "$ROOT/userspace/build/x86_64/libc.so.1"
+    [ -f "$UNWIND_SO" ] || { echo "error: failed to build libunwind.so.1"; exit 1; }
+else
+    echo "error: need libunwind.a ($UNWIND_A) + libc.so.1 to build shared libunwind.so.1" >&2
+    exit 1
+fi
+
 for libdir in "$TC/sysroot/lib" "$TC/cross/x86_64-b1nix/lib"; do
     mkdir -p "$libdir"
     # stage_file also handles the pre-existing-SYMLINK case (libc.a -> libb1nix.a):
@@ -119,15 +147,33 @@ for libdir in "$TC/sysroot/lib" "$TC/cross/x86_64-b1nix/lib"; do
     # building dynamic, its C mem*/str* members are NOT pulled: the target spec
     # forces the shared libc.so in early (--no-as-needed -lc), so those symbols
     # resolve from it before this archive is reached; only the math members are
-    # pulled. This also keeps the libgcc/unwinder resolution that COMBINED needs.
+    # pulled. The unwinder/builtins come from the LLVM runtimes staged below.
     stage_file "$COMBINED" "$libdir/libm.a"
     stage_file "$CRT0" "$libdir/crt0.o"
-    # Rust's `unwind` crate links `-lunwind` (LLVM libunwind name) on musl+crt-static
-    # targets, but b1nix ships gcc's unwinder as libgcc_eh.a (same `_Unwind_*` ABI).
-    # The toolchain otherwise has only an EMPTY stub libunwind.a, so the unwinder
-    # symbols go unresolved at the final rustc link. Alias the real gcc unwinder.
-    _eh="$("$CROSS/x86_64-b1nix-gcc" -print-file-name=libgcc_eh.a)"
-    [ -f "$_eh" ] && cp -f "$_eh" "$libdir/libunwind.a"
+    # M90 GCC-free: the b1nix target spec links the LLVM runtimes for the unwinder
+    # and compiler builtins instead of libgcc_s — `-lunwind` (whole-archived into
+    # the rustc exe) provides _Unwind_*/__register_frame, `-lcompiler_rt` provides
+    # the 128-bit / popcount builtins. Rust's `unwind` crate also links `-lunwind`
+    # on musl+crt-static. Stage both archives into every cross lib dir.
+    for _rt in libunwind.a libcompiler_rt.a; do
+        _src="$TC/sysroot/usr/lib/$_rt"
+        [ -f "$_src" ] || _src="$TC/llvm-runtimes-build/install/lib/$_rt"
+        [ -f "$_src" ] || _src="$TC/cross/x86_64-b1nix/lib/$_rt"
+        if [ -f "$_src" ]; then
+            [ "$_src" -ef "$libdir/$_rt" ] || cp -f "$_src" "$libdir/$_rt"
+        else
+            _pf="$("$CROSS/x86_64-b1nix-gcc" -print-file-name="$_rt" 2>/dev/null || echo)"
+            [ -f "$_pf" ] && cp -f "$_pf" "$libdir/$_rt"
+        fi
+    done
+    # Shared libunwind for the dynamic `-lunwind` (llvm_libunwind=System). Stage the
+    # real .so.1 + a libunwind.so symlink so the cross linker's `-lunwind` resolves
+    # to the shared object.
+    cp -f "$UNWIND_SO" "$libdir/libunwind.so.1"
+    ln -sf libunwind.so.1 "$libdir/libunwind.so"
+    # libz.a for LLVM's LLVM_ENABLE_ZLIB=ON (final -lz on the rustc/libLLVM link).
+    _zlib="$ROOT/build/zlib-b1nix/x86_64-b1nix/install/lib/libz.a"
+    [ -f "$_zlib" ] && cp -f "$_zlib" "$libdir/libz.a"
 done
 
 # Verify the staging actually landed in EVERY search path. The shared
@@ -171,6 +217,13 @@ ln -sfn llvm "$SRC/build/x86_64-unknown-b1nix/ci-llvm"
 # freshly built stage1 rustc_target does), so its --print target-list sanity
 # check would reject it. The target IS built-in from stage1 on; skip the check.
 export BOOTSTRAP_SKIP_TARGET_SANITY=1
+# NOTE (GCC-free): rustc_llvm/build.rs hard-links the LLVM C++ wrapper against
+# `-lstdc++` for our target. We do NOT set LLVM_USE_LIBCXX (it is global and would
+# also force the HOST stage1 rustc_driver onto -lc++, which the Arch build host
+# lacks / whose libLLVM is libstdc++ → host link fails). Instead the b1nix cross
+# linker (b1nix-autotools-cc) redirects target -lstdc++ → libc++/libc++abi, so
+# librustc_driver.so records DT_NEEDED libc++.so.1 (no GCC libstdc++.so.6, absent
+# from the ISO since M89) while the host build keeps its system libstdc++.
 # also expose the JSON spec for any tool that resolves the triple via a path.
 export RUST_TARGET_PATH="$ROOT/build/rust/targets"
 # Build the COMPILER (rustc + its std sysroot) only — not the full default set

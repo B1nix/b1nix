@@ -18,7 +18,9 @@
 
 static void tree_print(unsigned count[2], const char *directory_name, char *prefix_pos) {
     DIR *d;
-    struct dirent **sorted = NULL;
+    /* sorted[] holds xstrdup'd d_name strings, so it is char**, not
+     * struct dirent** (clang errors on the mismatch; GCC only warned). */
+    char **sorted = NULL;
     int n = 0, cap = 0, i;
     const char *bar = "|   ";
     const char *mid = "|-- ";

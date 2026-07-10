@@ -2,14 +2,18 @@
 # Build the M59 EGL smoke ELF: compile userspace/bin/m59_smoke.c together with
 # the OSMesa-backed EGL implementation (userspace/libegl/b1egl_mesa.c) against
 # the Mesa OSMesa headers, and link it with the ported Mesa static libraries,
-# the b1gui client, libstdc++/libsupc++/libgcc, libm and libb1nix. This is the
-# same link shape as the M52 OSMesa demo (Mesa is a C++ codebase), but the GL is
-# now reached through the standard egl* API instead of the OSMesa* API directly.
-# Arg 1 = output path. B1NIX_ARCH selects the toolchain/arch.
+# the b1gui client, the LLVM C++ runtime (libc++/libc++abi + compiler-rt), libm
+# and libb1nix. This is the same link shape as the M52 OSMesa demo (Mesa is a C++
+# codebase), but the GL is now reached through the standard egl* API instead of
+# the OSMesa* API directly. Arg 1 = output path. B1NIX_ARCH selects the arch.
+#
+# M90: default C++ runtime is GCC-free LLVM libc++ (matches Mesa, now libc++).
+# Set B1NIX_CXX_STDLIB=libstdc++ to opt into the legacy GCC path.
 
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 OUT="${1:?usage: build-m59-egl.sh <output-elf>}"
+B1NIX_CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"; export B1NIX_CXX_STDLIB
 . "$ROOT_DIR/tools/toolchain/env.sh"
 resolve_cxx_cross
 

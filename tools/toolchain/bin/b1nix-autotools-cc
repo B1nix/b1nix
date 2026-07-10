@@ -1,10 +1,21 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Cross-compiler wrapper for autotools-style userspace ports.
-
 set -e
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+PROJECT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    PROJECT_DIR="$cur"
+    break
+  fi
+  cur="$(dirname "$cur")"
+done
+if [ -z "$PROJECT_DIR" ]; then
+  echo "b1nix-autotools-cc: cannot find project root" >&2
+  exit 1
+fi
 USR="$PROJECT_DIR/userspace"
 INCLUDE="$USR/include"
 B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
@@ -17,35 +28,93 @@ else
 	LD_EMULATION="elf_x86_64"
 	ARCH_FLAGS=""
 fi
+
+if [ "$B1NIX_ARCH" = "x86" ]; then
+	TRIPLET="i686-b1nix"
+else
+	TRIPLET="x86_64-b1nix"
+fi
+
+# Intercept GCC-specific query flags
+for arg in "$@"; do
+  if [ "$arg" = "-print-sysroot" ]; then
+    echo "$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET"
+    exit 0
+  fi
+done
+
 LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
 CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
 SHARED_LIBC="$USR/build/$B1NIX_ARCH/libc.so.1"
 DYNAMIC_CRT0="$USR/build/$B1NIX_ARCH/crt/crt0-dynamic.o"
-LINKER="$USR/linker.ld"
+# Relative target paths for the on-demand `make -C "$USR"` calls below: the
+# userspace Makefile defines its rules relative to build/$(B1NIX_ARCH)/... , so
+# `make` must be handed the RELATIVE target, not the absolute path (an absolute
+# path matches no rule → "No rule to make target"). Triggered on a clean build
+# when a port's configure runs the compiler before libc.so.1 has been built.
+REL_LIB="build/$B1NIX_ARCH/libb1nix.a"
+REL_CRT0="build/$B1NIX_ARCH/crt/crt0.o"
+REL_SHARED_LIBC="build/$B1NIX_ARCH/libc.so.1"
+REL_DYNAMIC_CRT0="build/$B1NIX_ARCH/crt/crt0-dynamic.o"
+# Default linker script is the plain C one. C++ ports that fold libc++/libjxl and
+# rely on exceptions must set B1NIX_LINKER to userspace/linker-libcxx.ld (which
+# KEEPs .eh_frame/.eh_frame_hdr/.gcc_except_table + the .ctors.* static-init glob)
+# and pass --eh-frame-hdr via B1NIX_LD_EXTRA — otherwise C++ unwinding is dead
+# (e.g. NetSurf's libjxl decode silently fails). See tools/ports/build-netsurf-fb.sh.
+LINKER="${B1NIX_LINKER:-$USR/linker.ld}"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 CLANG=clang
 if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
 	CLANG="ccache clang"
 fi
 
-# Link model. B1NIX_LINK=dynamic links the final executable DYNAMICALLY against
-# the shared libc.so.1 via the in-kernel loader (interpreter /lib/ld-b1nix.so):
-# the result is a dynamically-linked ET_EXEC that imports libc as undefined
-# symbols (COPY relocs for stdout/stderr/errno, JUMP_SLOTs for the functions),
-# while the port's own objects and any bundled static archives stay statically
-# linked at the fixed 0x2000000 base (non-PIE, so no -fPIC needed). Library
-# (compile-only / -c) invocations are unaffected — only the executable link step
-# changes, so the .a-producing ports (mbedtls, pcre2, libidn2, ...) stay
-# byte-for-byte identical; only the four executable ports (bash, curl, dropbear,
-# wget) flip. Dynamic is the default (the whole default-ISO port set links against
-# the shared libc.so.1); set B1NIX_LINK=static to force the historical static link.
+# Passthrough cases: the caller controls the entire link, so injecting b1nix's own
+# crt0/libc/-T would be wrong (a second _start, or crt0's _start pulling `main`
+# into an object that has none). Pass the command straight through to clang,
+# preserving the caller's EXACT argument order. --target keeps the ELF arch
+# correct. Cases:
+#   -nostdlib         Mesa's meson build supplies its own crt0.o/libc++/libb1nix.a/-T.
+#   -r / --relocatable / -Wl,-r
+#                     Partial (relocatable) link, e.g. busybox's applets/built-in.o
+#                     — no startup files and no `main` expected.
+# (Before M90, x86_64-b1nix-gcc was real GCC, which never injected startup files
+# for these, so this passthrough restores the historical behaviour.)
+for _a in "$@"; do
+	case "$_a" in
+	-nostdlib|-r|--relocatable|-Wl,-r|-Wl,--relocatable)
+		# shellcheck disable=SC2086
+		exec $CLANG --target="$TARGET" $ARCH_FLAGS "$@"
+		;;
+	esac
+done
+
 B1NIX_LINK="${B1NIX_LINK:-dynamic}"
+# Honor a caller-requested static link (e.g. Rust's static ET_EXEC targets pass
+# `-static -no-pie`). Pre-M90 x86_64-b1nix-gcc was real GCC and honored -static;
+# the wrapper must too, otherwise a `-static` link silently produces a dynamic
+# ELF (with --dynamic-linker + shared libc.so.1) that the caller never expects.
+for _a in "$@"; do
+  case "$_a" in
+  -static) B1NIX_LINK=static ;;
+  esac
+done
+
+# Building a shared object (.so)? Rust emits `-shared -Wl,-soname=...` for every
+# dylib crate-type (libstd.so, librustc_driver.so under -Cprefer-dynamic). A .so
+# is position-independent, has NO _start/crt0, and must NOT use the executable
+# linker script (fixed load base 0x2000000) — so it takes a dedicated ld path.
+is_shared=0
+for _a in "$@"; do
+  case "$_a" in
+  -shared) is_shared=1 ;;
+  esac
+done
 
 if [ "$B1NIX_LINK" = "dynamic" ]; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
-    make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$SHARED_LIBC" "$DYNAMIC_CRT0"
+    make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_SHARED_LIBC" "$REL_DYNAMIC_CRT0"
 fi
-[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$LIB" "$CRT0"
+[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
 
 CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
 if [ -n "$CLANG_RES_DIR" ]; then
@@ -54,18 +123,32 @@ else
 	RES_INC=""
 fi
 
-COMMON_FLAGS="--target=$TARGET $ARCH_FLAGS -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem $INCLUDE -I $INCLUDE $RES_INC -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -D__STDC_NO_ATOMICS__"
-# Ported code (libffi, libidn2, etc.) often uses memcpy/memset without
-# including <string.h>. Provide it automatically for C files only — not for
-# assembly (.S), which b1nix's string.h (containing inline asm) would confuse.
-C_ONLY_FLAGS="-include string.h"
+cflags=("--target=$TARGET")
+if [ -n "$ARCH_FLAGS" ]; then
+  cflags+=("$ARCH_FLAGS")
+fi
+cflags+=("-ffreestanding" "-fno-builtin" "-fno-stack-protector" "-nostdinc" "-isystem" "$INCLUDE" "-I" "$INCLUDE")
+if [ -n "$RES_INC" ]; then
+  cflags+=($RES_INC)
+fi
+cflags+=("-Wall" "-Wextra" "-O2" "-msoft-float" "-mno-implicit-float" "-Db1nix" "-D__b1nix__" "-D__unix__" "-D__STDC_NO_ATOMICS__")
+
+C_ONLY_FLAGS=("-include" "string.h")
 
 compile_only=0
 preprocess_only=0
 output=""
-args=""
-inputs=""
-ldargs=""
+# sources[]  — .c/.s/.S files this wrapper must compile.
+# linkline[] — every link token (.o/.a, -l, -L, and -Wl,-translated) IN ORDER.
+#   Ordering is preserved on purpose: --whole-archive / --start-group / -Bstatic
+#   must wrap exactly the libraries they precede. Real GCC (the pre-M90
+#   x86_64-b1nix-gcc) forwarded -Wl,* to ld in place; the wrapper must do the same
+#   or complex links silently lose them — e.g. NetSurf loses its libnsfb surface
+#   backends (empty .init_array → "Unknown surface") and its folded static libc++.
+# args[]     — compile-only flags (includes/defines), never passed to the linker.
+sources=()
+args=()
+linkline=()
 
 while [ $# -gt 0 ]; do
   case "$1" in
@@ -74,84 +157,114 @@ while [ $# -gt 0 ]; do
       ;;
     -E)
       preprocess_only=1
-      args="$args -E"
+      args+=("-E")
       ;;
     -o)
       shift
       output="$1"
       ;;
-    -MT|-MF|-MQ|-isystem|-I|-L|-D|-U|-x)
-      args="$args $1 $2"
+    -MT|-MF|-MQ|-isystem|-I|-D|-U|-x)
+      args+=("$1" "$2")
       shift
       ;;
-    *.c|*.S|*.s|*.o|*.a)
-      inputs="$inputs $1"
+    -Wl,*)
+      # Translate the GCC-driver -Wl,a,b,c form into ld args a b c, appended in
+      # place so grouping directives stay attached to their libraries. MUST be
+      # handled BEFORE the file-name globs below: a -Wl option whose VALUE ends
+      # in .so (e.g. -Wl,-soname=libstd-XXXX.so, emitted for every Rust dylib)
+      # would otherwise match the `*.so` input glob and reach ld.lld verbatim as
+      # an unknown `-Wl,-soname=...` argument.
+      IFS=',' read -ra _wlparts <<<"${1#-Wl,}"
+      linkline+=("${_wlparts[@]}")
+      ;;
+    -L)
+      linkline+=("-L" "$2")
+      shift
+      ;;
+    *.c|*.S|*.s)
+      sources+=("$1")
+      ;;
+    *.o|*.a|*.rlib|*.so|*.so.[0-9]*)
+      # .rlib: Rust compilation units (Rust passes each rlib as a plain file arg,
+      # like GCC did). .so/.so.N: shared objects passed positionally. All are
+      # ordinary link inputs and must go on the link line in order.
+      linkline+=("$1")
       ;;
     -lpthread|-lc|-lm|-lrt|-ldl|-lutil|-lcrypt|-lresolv|-lnsl)
-      # These are all provided by libb1nix.a (always whole-archived below), so
-      # there is no standalone lib<name>.a to find. Drop them — otherwise a port
-      # configured with --enable-threads (gnulib emits -lpthread) or that links
-      # -lrt/-ldl fails at ld with "unable to find -lX".
+      ;;
+    -lstdc++)
+      # GCC-free redirect: Rust's rustc_llvm crate hard-links -lstdc++ for the
+      # LLVM C++ wrapper. b1nix ships NO GCC libstdc++.so.6 (M89 → all C++ is
+      # LLVM libc++), so route it to libc++/libc++abi — librustc_driver.so then
+      # records DT_NEEDED libc++.so.1 / libc++abi.so.1 instead of libstdc++.so.6.
+      linkline+=("-lc++" "-lc++abi")
       ;;
     -l*|-L*)
-      ldargs="$ldargs $1"
+      linkline+=("$1")
       ;;
     *)
-      args="$args $1"
+      args+=("$1")
       ;;
   esac
   shift
 done
 
 if [ "$preprocess_only" -eq 1 ]; then
-  # shellcheck disable=SC2086
-  exec $CLANG $COMMON_FLAGS $args $inputs ${output:+-o "$output"}
+  exec $CLANG "${cflags[@]}" "${args[@]}" "${sources[@]}" ${output:+-o "$output"}
 fi
 
 if [ "$compile_only" -eq 1 ]; then
-  # shellcheck disable=SC2086
-  exec $CLANG $COMMON_FLAGS $args -c $inputs ${output:+-o "$output"}
+  exec $CLANG "${cflags[@]}" "${args[@]}" -c "${sources[@]}" ${output:+-o "$output"}
 fi
 
-# Version/info probes (e.g. `CC --version`, `-dumpmachine`) carry no input
-# files. Forward them straight to clang instead of trying to link crt0.o,
-# which would fail with "undefined symbol: main" and confuse configure.
-if [ -z "$inputs" ]; then
-  # shellcheck disable=SC2086
-  exec $CLANG $COMMON_FLAGS $args ${output:+-o "$output"}
+if [ ${#sources[@]} -eq 0 ] && [ ${#linkline[@]} -eq 0 ]; then
+  exec $CLANG "${cflags[@]}" "${args[@]}" ${output:+-o "$output"}
 fi
 
-objs=""
+objs=()
 tmpdir="${TMPDIR:-/tmp}/b1nix-autotools-cc.$$"
 mkdir -p "$tmpdir"
-for input in $inputs; do
-  case "$input" in
-    *.o|*.a)
-      objs="$objs $input"
-      ;;
-    *)
-      obj="$tmpdir/$(basename "$input").o"
-      extra=""
-      case "$input" in *.c) extra="$C_ONLY_FLAGS";; esac
-      # shellcheck disable=SC2086
-      $CLANG $COMMON_FLAGS $extra $args -c "$input" -o "$obj"
-      objs="$objs $obj"
-      ;;
-  esac
+for input in "${sources[@]}"; do
+  obj="$tmpdir/$(basename "$input").o"
+  extra=()
+  case "$input" in *.c) extra=("${C_ONLY_FLAGS[@]}");; esac
+  $CLANG "${cflags[@]}" "${extra[@]}" "${args[@]}" -c "$input" -o "$obj"
+  objs+=("$obj")
 done
 
 [ -n "$output" ] || output="a.out"
-# Optional extra linker flags (opt-in via env; empty by default so existing
-# ports are unaffected). bash, for instance, ships its own getenv/setenv set
-# that intentionally shadows libb1nix's, needing --allow-multiple-definition.
-if [ "$B1NIX_LINK" = "dynamic" ]; then
-  # Dynamically-linked ET_EXEC against the shared libc.so.1. crt0-dynamic.o
-  # reaches `environ` through the GOT and skips libgcc eh-frame registration, so
-  # there is no canonical-PLT-to-0 trap. The port's bundled static archives
-  # ($objs / $ldargs) link normally; only libc becomes a shared dependency.
-  "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
-    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" $objs $ldargs \
+# Default library search paths so plain `-l` names (e.g. the LLVM runtimes
+# -lunwind / -lcompiler_rt the Rust target spec links) resolve without the
+# caller having to pass an absolute -L: the cross sysroot lib dir and the
+# per-target cross lib dir. Caller -L entries in linkline[] still take priority.
+SYSROOT_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/sysroot/lib"
+CROSS_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+libdirs=()
+[ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
+[ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
+if [ "$is_shared" -eq 1 ]; then
+  # Shared object: PIC, no crt0, no executable linker script, no --whole-archive
+  # libb1nix. -soname/--version-script/--export-dynamic etc. already arrived via
+  # the translated linkline[]. libc symbols resolve from the shared libc.so.1
+  # (records DT_NEEDED libc.so.1); the LLVM libunwind that -lgcc_s routes to (see
+  # the sysroot libgcc_s.so linker script) supplies the _Unwind_* ABI.
+  #
+  # A rust dylib that folds C++ code (librustc_driver.so pulls libLLVM's C++
+  # wrapper objects → std::__1::* libc++ refs) must record DT_NEEDED libc++.so.1
+  # / libc++abi.so.1, otherwise the downstream rustc EXE link (which passes
+  # --no-allow-shlib-undefined) cannot satisfy the .so's undefined libc++
+  # symbols. Link them --as-needed so a pure-Rust .so (libstd.so, no C++) does
+  # NOT gain a spurious libc++ dependency.
+  cxx_shared=()
+  if [ -f "$SYSROOT_LIB/libc++.so.1" ] && [ -f "$SYSROOT_LIB/libc++abi.so.1" ]; then
+    cxx_shared=(--push-state --as-needed "$SYSROOT_LIB/libc++.so.1" "$SYSROOT_LIB/libc++abi.so.1" --pop-state)
+  fi
+  exec "$LD" -m "$LD_EMULATION" -shared --hash-style=sysv -o "$output" \
+    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
+elif [ "$B1NIX_LINK" = "dynamic" ]; then
+  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
+    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
     ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
 else
-  "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" $objs $ldargs ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
 fi

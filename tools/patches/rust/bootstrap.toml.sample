@@ -25,6 +25,16 @@ llvm-tools = false
 download-ci-llvm = false
 targets = "X86"
 ldflags = "-Wl,--push-state -Wl,--no-as-needed -lc -Wl,--pop-state"
+# The b1nix-host LLVM only needs the LIBRARY (libLLVM, folded into
+# librustc_driver.so). rustc_llvm reads the *host* llvm-config, so no b1nix
+# target LLVM tool/util/test is ever used — and several of them (llvm-exegesis's
+# shm/subprocess/perf code, etc.) hit POSIX gaps in b1nix's Linux-aliased libc.
+# Disable the standalone tools (llvm-exegesis etc.), tests, examples and
+# benchmarks so only the libraries build (utils like tblgen/FileCheck stay on —
+# the cross-build's native tblgen comes from the host anyway).
+# NOTE: the per-tool disable var is LLVM_TOOL_<UPPER(dirname)>_BUILD — the dir is
+# llvm-exegesis, so the var is LLVM_TOOL_LLVM_EXEGESIS_BUILD (NOT ..._EXEGESIS_).
+build-config = { LLVM_BUILD_TOOLS = "OFF", LLVM_INCLUDE_TESTS = "OFF", LLVM_INCLUDE_EXAMPLES = "OFF", LLVM_INCLUDE_BENCHMARKS = "OFF", LLVM_TOOL_LLVM_EXEGESIS_BUILD = "OFF", LLVM_ENABLE_ZLIB = "OFF", LLVM_BUILD_LLVM_DYLIB = "ON", LLVM_LINK_LLVM_DYLIB = "ON", CMAKE_SKIP_RPATH = "ON" }
 # b1nix is Linux-ABI-aliased (cross gcc defines __b1nix__/__unix__, NOT __linux__),
 # but LLVM's platform detection (LLVM_ON_UNIX, <endian.h>, file_status::getSize)
 # keys on __linux__. Present b1nix as Linux to the LLVM cross-build only — its
