@@ -1,4 +1,4 @@
-#!/bin/sh
+#!/usr/bin/env bash
 # Compiler shim for the Mesa cross build. Strips flags the cross compiler
 # doesn't understand and adds Clang-specific flags when using the clang++ frontend.
 #
@@ -20,6 +20,49 @@ for arg in "$@"; do
     *.cc|*.cpp|*.cxx|*.C) USING_CXX=1 ;;
   esac
 done
+
+# Homebrew clang++ on macOS delegates unknown-OS ELF links to the host g++
+# driver, which injects Darwin/ld64 flags. Compile through clang++, but perform
+# target links with ld.lld directly after translating the driver's -Wl options.
+if [ "$USING_CXX" -eq 1 ]; then
+  compile_only=0
+  for arg in "$@"; do
+    case "$arg" in -c|-E) compile_only=1 ;; esac
+  done
+  if [ "$compile_only" -eq 0 ]; then
+    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+    PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+    . "$PROJECT_DIR/tools/toolchain/env.sh"
+    LD_BIN="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
+    LD_ARGS=(-m elf_x86_64)
+    skip_next=0
+    for arg in "$@"; do
+      if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
+      case "$arg" in
+        -o|-install_name|-compatibility_version|-current_version)
+          case "$arg" in -o) LD_ARGS+=("$arg") ;; esac
+          skip_next=1 ;;
+        -Wl,*)
+          IFS=',' read -ra wl_parts <<< "${arg#-Wl,}"
+          LD_ARGS+=("${wl_parts[@]}") ;;
+        -Xlinker)
+          skip_next=1 ;;
+        -shared|-r|-nostdlib|-nostartfiles|-nodefaultlibs|-fPIC|-fpic)
+          [ "$arg" = "-fPIC" ] || [ "$arg" = "-fpic" ] || LD_ARGS+=("$arg") ;;
+        -fuse-ld=*|-stdlib=*|-rtlib=*|-unwindlib=*|--target=*|--sysroot=*|-isystem|-I|-D|-U|-pthread)
+          case "$arg" in -isystem|-I|-D|-U) skip_next=1 ;; esac ;;
+        -install_name|-compatibility_version|-current_version)
+          skip_next=1 ;;
+        -*)
+          case "$arg" in -L*|-l*|-Wl,*|-T*|--start-group|--end-group|--whole-archive|--no-whole-archive|--gc-sections|--version-script*) LD_ARGS+=("$arg") ;; esac ;;
+        *) LD_ARGS+=("$arg") ;;
+      esac
+    done
+    CRT="$TOOLCHAIN_BUILD_HOME/cross/$B1NIX_TRIPLET/lib/libcompiler_rt.a"
+    [ -f "$CRT" ] && LD_ARGS+=("$CRT")
+    exec "$LD_BIN" "${LD_ARGS[@]}"
+  fi
+fi
 
 # When using clang++, resolve the GCC cross toolchain for libstdc++ headers
 if [ "$USING_CLANG" -eq 1 ] && [ "$USING_CXX" -eq 1 ]; then
