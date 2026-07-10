@@ -154,14 +154,26 @@ export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include -incl
 # ld.lld >= ~17 removed -Ttext-segment (it errors and points to --image-base).
 # --image-base sets the load address of the first PT_LOAD (headers + text) to the
 # same B1NIX userspace base, which is what we need here.
-export EXTRA_LDFLAGS="-Wl,--image-base=0x2000000 -static-libgcc -L$SYSROOT/lib --sysroot=$SYSROOT"
+export EXTRA_LDFLAGS="-Wl,--image-base=0x2000000 -rtlib=compiler-rt -unwindlib=libunwind -L$SYSROOT/lib --sysroot=$SYSROOT"
+
+# BusyBox builds small host-side generators (applets/usage, applet_tables) in
+# the same make invocation as the target binary. Pin those tools to the host
+# Clang toolchain so target linker flags never leak into a Darwin host link.
+HOST_CC="${B1NIX_HOST_CC:-$(command -v clang)}"
+HOST_CXX="${B1NIX_HOST_CXX:-$(command -v clang++)}"
+HOST_LD="${B1NIX_HOST_LD:-$(command -v ld)}"
+TARGET_AR="${B1NIX_AR:-$(command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar)}"
+TARGET_RANLIB="${B1NIX_RANLIB:-$(command -v llvm-ranlib 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
+TARGET_STRIP="${B1NIX_STRIP:-$(command -v llvm-strip 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-strip)}"
 
 # Wire ccache into the busybox build (byte-identical objects, faster rebuilds).
 if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
   export CC="ccache ${TARGET}-gcc"
 fi
 
-make -C "$BUILD_DIR" -j"$NPROC" CROSS_COMPILE="${TARGET}-"
+make -C "$BUILD_DIR" -j"$NPROC" CROSS_COMPILE="${TARGET}-" \
+    HOSTCC="$HOST_CC" HOSTCXX="$HOST_CXX" HOSTLD="$HOST_LD" \
+    AR="$TARGET_AR" RANLIB="$TARGET_RANLIB" STRIP="$TARGET_STRIP"
 
 # ── 4. Install ──────────────────────────────────────────────────────────────
 echo "Installing standalone BusyBox package..."

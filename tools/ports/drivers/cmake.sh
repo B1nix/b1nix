@@ -4,7 +4,7 @@
 # Generic driver for the CMake cross-compiled ports (brotli, litehtml, libharu,
 # libjxl): fetch the source, stage the b1nix libc into the cross sysroot, write a
 # b1nix CMake toolchain file, configure + build the requested targets with the
-# b1nix cross gcc/g++, then copy headers and static archives. ccache is wired in
+# b1nix cross clang/clang++, then copy headers and static archives. ccache is wired in
 # through CMAKE_<LANG>_COMPILER_LAUNCHER (byte-identical output, faster rebuilds).
 # Prints the install dir as its only stdout line.
 #
@@ -58,13 +58,15 @@ fi
 CROSS="$(dirname "$(command -v "$B1NIX_TRIPLET-gcc" 2>/dev/null || echo "$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/bin/$B1NIX_TRIPLET-gcc")")"
 GCC="$CROSS/$B1NIX_TRIPLET-gcc"
 GXX="$CROSS/$B1NIX_TRIPLET-g++"
-SYSROOT="$("$GCC" -print-sysroot 2>/dev/null)"
-[ -n "$SYSROOT" ] || SYSROOT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/$B1NIX_TRIPLET"
+# The triplet compiler is a clang wrapper. Its compatibility `-print-sysroot`
+# answer points at the target runtime directory, not a complete C sysroot.
+# Always use the canonical staged userspace rootfs (string.h, stdint.h, etc.).
+SYSROOT="$TOOLCHAIN_BUILD_HOME/sysroot"
 
 # Resolve C++ frontend / stdlib. With B1NIX_CXX_STDLIB=libc++ the port's C++ is
 # compiled against LLVM libc++ (ABI-incompatible with libstdc++, so the whole port
 # must recompile) using the shared resolve_cxx_cross flags — clang + libc++ headers
-# via --sysroot/-nostdinc++. Otherwise the legacy clang/g++ + libstdc++ path.
+# via --sysroot/-nostdinc++.
 CXX_LIBCXX_FLAGS=""
 CC_LIBCXX_FLAGS=""
 USE_CC="$GCC"
@@ -79,21 +81,14 @@ if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
   USE_CC="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$GCC")}"
   CC_LIBCXX_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$SYSROOT -O2 -ffunction-sections -fdata-sections -Db1nix"
 else
-  CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
-  case "$CXX_FRONTEND" in
-    gcc)
-      USE_CXX="$GXX"
-      ;;
-    clang|*)
-      USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
-      ;;
-  esac
+  USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
+  [ -n "$USE_CXX" ] || { echo "cmake port: clang++ not found" >&2; exit 1; }
 fi
 
-# Stage the b1nix libc/libstdc++ into the cross sysroot (idempotent). Skip with
-# CMAKE_STAGE_CXX=0 for the few ports that historically did not do this.
+# Stage the b1nix libc into the cross sysroot (idempotent). C++ headers/runtime
+# come from LLVM libc++ and are passed through CXXFLAGS below.
 if [ "${CMAKE_STAGE_CXX:-1}" = "1" ]; then
-  "$ROOT_DIR/tools/toolchain/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" 1>&2 || true
+  make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs 1>&2
 fi
 
 # port_pre_configure runs before the toolchain file is written so it can resolve
@@ -139,6 +134,7 @@ if [ "${CMAKE_SKIP_TOOLCHAIN:-0}" = "1" ]; then
   TC_ARGS="-DCMAKE_SYSTEM_NAME=$CMAKE_SYSTEM_NAME \
     -DCMAKE_SYSTEM_PROCESSOR=$B1NIX_GCC_ARCH \
     -DCMAKE_CROSSCOMPILING=TRUE \
+    -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
     -DCMAKE_SYSROOT=$SYSROOT"
   TC=""
 else
@@ -155,6 +151,7 @@ cd "$BUILD_DIR/cmake"
 [ -n "$CC_LIBCXX_FLAGS" ]  && export CFLAGS="$CC_LIBCXX_FLAGS${CFLAGS:+ $CFLAGS}"
 cmake "$SRC_DIR" \
   $TC \
+  ${TC_ARGS:-} \
   -DCMAKE_BUILD_TYPE=Release \
   -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
   $CCACHE_ARGS \

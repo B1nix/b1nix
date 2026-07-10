@@ -78,6 +78,7 @@ if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
       -e 's/| -elf\*/| -elf* | -b1nix*/' \
       -e 's/| -limine\*/| -limine* | -b1nix*/' \
       -e 's/| -os2\*/| -os2* | -b1nix*/' \
+      -e 's/| os2\*/| os2* | b1nix*/' \
       "$SRC_DIR/config.sub" > "$tmp_sub"
   mv "$tmp_sub" "$SRC_DIR/config.sub"
 fi

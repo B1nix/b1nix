@@ -59,8 +59,8 @@ mkdir -p "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 
 CLANG_BIN="$(command -v clang 2>/dev/null || echo clang)"
 CLANGXX_BIN="$(command -v clang++ 2>/dev/null || echo clang++)"
-AR_BIN="$(command -v llvm-ar 2>/dev/null || echo llvm-ar)"
-RANLIB_BIN="$(command -v llvm-ranlib 2>/dev/null || echo llvm-ranlib)"
+AR_BIN="$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)"
+RANLIB_BIN="$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)"
 
 # b1nix-specific defines needed by libc++/libc++abi/libunwind:
 #   _POSIX_THREADS / _POSIX_C_SOURCE — POSIX pthread + .1-2008 APIs
@@ -82,6 +82,8 @@ if [ ! -f "$INSTALL_DIR/lib/libc++.a" ] || [ "${REBUILD:-0}" = "1" ]; then
         -DCMAKE_RANLIB="$RANLIB_BIN" \
         -DCMAKE_C_COMPILER_TARGET="$B1NIX_TRIPLET" \
         -DCMAKE_CXX_COMPILER_TARGET="$B1NIX_TRIPLET" \
+        -DCMAKE_ASM_COMPILER="$CLANG_BIN" \
+        -DCMAKE_ASM_COMPILER_TARGET="$B1NIX_TRIPLET" \
         -DCMAKE_SYSROOT="$SYSROOT" \
         -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
         -DCMAKE_BUILD_TYPE=Release \
@@ -152,7 +154,7 @@ done
 # into libc (there are no standalone libdl.a/libpthread.a), so any static consumer
 # linked with ld.lld would fail with "unable to find library from dependent library
 # specifier: dl". Removing the section makes these archives link cleanly everywhere.
-OBJCOPY_BIN="$(command -v llvm-objcopy 2>/dev/null || echo llvm-objcopy)"
+OBJCOPY_BIN="$(command -v llvm-objcopy 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)"
 for name in libc++.a libc++abi.a libunwind.a; do
     "$OBJCOPY_BIN" --remove-section=.deplibs "$INSTALL_DIR/lib/$name" 2>/dev/null || true
 done
@@ -165,12 +167,12 @@ done
 # The unwinder must live in exactly ONE place: libc++abi (which libc++ NEEDs). So
 # drop the libunwind objects from libc++.a; its _Unwind_*/__unw_* references then
 # resolve to libc++abi.so.1 at load time.
-AR_BIN_DEL="$(command -v llvm-ar 2>/dev/null || echo llvm-ar)"
+AR_BIN_DEL="$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)"
 "$AR_BIN_DEL" d "$INSTALL_DIR/lib/libc++.a" \
     libunwind.cpp.o Unwind-EHABI.cpp.o Unwind-seh.cpp.o UnwindLevel1.c.o \
     UnwindLevel1-gcc-ext.c.o Unwind-sjlj.c.o Unwind-wasm.c.o \
     UnwindRegistersRestore.S.o UnwindRegistersSave.S.o 2>/dev/null || true
-"$(command -v llvm-ranlib 2>/dev/null || echo llvm-ranlib)" "$INSTALL_DIR/lib/libc++.a" 2>/dev/null || true
+"$RANLIB_BIN" "$INSTALL_DIR/lib/libc++.a" 2>/dev/null || true
 
 # The libc++ headers carry a generated __config_site; the runtimes build may
 # install them under include/c++/v1 directly or include/<triplet>/c++/v1.

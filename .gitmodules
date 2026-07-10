@@ -1,0 +1,4 @@
+[submodule "userspace/b1cc"]
+	path = userspace/b1cc
+	url = https://github.com/B1nix/b1cc.git
+	branch = main

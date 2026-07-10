@@ -11,7 +11,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 AUTOTOOLS_NAME=libpsl
 AUTOTOOLS_VERSION="${LIBPSL_VERSION:-0.21.5}"
-AUTOTOOLS_URL="https://github.com/rockdaboot/libpsl/releases/download/${AUTOTOOLS_VERSION}/libpsl-${AUTOTOOLS_VERSION}.tar.gz"
+AUTOTOOLS_URL="https://distfiles.gentoo.org/distfiles/d1/libpsl-${AUTOTOOLS_VERSION}.tar.gz"
 AUTOTOOLS_CONFIGURE="--disable-shared --enable-static --disable-runtime --enable-builtin --disable-nls --disable-man --without-psl-distfile"
 PATCHES="libpsl/b1nix-config-sub.sh"
 

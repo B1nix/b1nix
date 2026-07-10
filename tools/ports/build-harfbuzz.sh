@@ -1,7 +1,7 @@
 #!/bin/sh
 # Build HarfBuzz (HB_TINY, no FreeType/glib/icu) as a static libharfbuzz.a for
 # the b1nix userspace ABI. Uses the cport driver (tools/ports/drivers/cport.sh).
-# Unified build via src/harfbuzz.cc, compiled with the cross g++.
+# Unified build via src/harfbuzz.cc, compiled with cross clang++/libc++.
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
@@ -13,12 +13,10 @@ CPORT_TARBALL="harfbuzz-${HB_VERSION:-8.3.0}.tar.xz"
 CPORT_HEADERS="flat:src/hb.h tree:src"
 
 port_pre_build() {
-  # HarfBuzz needs C++ compilation — clang++ frontend with GCC libstdc++ headers
+  # HarfBuzz needs C++ compilation — use the LLVM libc++ cross configuration.
   . "$ROOT_DIR/tools/toolchain/env.sh"
   resolve_cxx_cross
   CCACHE="$(command -v ccache 2>/dev/null || true)"
-  # Ensure C++ toolchain sysroot is staged
-  "$ROOT_DIR/tools/toolchain/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" >/dev/null 2>&1 || true
 }
 
 port_build() {

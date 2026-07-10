@@ -7,14 +7,22 @@
 set -eu
 real="$1"; shift
 
-# Detect if we're using clang++ frontend
-USING_CLANG=0
+# All b1nix triplet compiler names are clang-backed compatibility wrappers in
+# the GCC-free toolchain. Detecting only '*clang*' misclassifies
+# x86_64-b1nix-gcc and sends passthrough links to the host Apple ld64.
+USING_CLANG=1
+USING_CXX=0
 case "$(basename "$real")" in
-  *clang*) USING_CLANG=1 ;;
+  *clang++*) USING_CXX=1 ;;
 esac
+for arg in "$@"; do
+  case "$arg" in
+    *.cc|*.cpp|*.cxx|*.C) USING_CXX=1 ;;
+  esac
+done
 
 # When using clang++, resolve the GCC cross toolchain for libstdc++ headers
-if [ "$USING_CLANG" -eq 1 ]; then
+if [ "$USING_CLANG" -eq 1 ] && [ "$USING_CXX" -eq 1 ]; then
   SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
   PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
   . "$PROJECT_DIR/tools/toolchain/env.sh"

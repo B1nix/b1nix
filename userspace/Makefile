@@ -182,11 +182,11 @@ BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
 # POSIX memory/signal primitives: madvise, MAP_NORESERVE, sigaltstack
 BINARIES += $(BUILD)/bin/m_posixmm_smoke
-# b1cc: the standalone "better C" compiler (separate repo, not in this tree). It
-# compiles the M5/M7 self-host smoke programs below. Detect it; override with
-# B1CC=/path/to/b1cc. If absent (e.g. a host where the b1cc repo isn't checked
-# out), skip those targets rather than hard-fail the whole userspace build.
-B1CC ?= $(or $(wildcard $(HOME)/Documents/GitHub/b1cc/build/b1cc),$(shell command -v b1cc 2>/dev/null))
+# b1cc: the standalone "better C" compiler, tracked as a submodule so a fresh
+# checkout uses the exact compiler sources used by the smoke suite. B1CC may
+# still be overridden by callers that intentionally use another build.
+B1CC_DIR := $(CURDIR)/b1cc
+B1CC ?= $(B1CC_DIR)/build/b1cc
 B1CC_BINS := return_42 b1cc_hello b1cc_argv b1cc_file_write b1cc_stderr_exit b1cc_better_c
 ifneq ($(strip $(B1CC)),)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS))
@@ -199,7 +199,7 @@ endif
 # programs). Needs the b1cc *source* tree; override B1CC_SRCDIR if it lives
 # elsewhere. b1cc is C23, so -std=gnu2x is required (b1nix-cc's clang default
 # rejects `nullptr`). Skipped when the source tree is absent.
-B1CC_SRCDIR ?= $(HOME)/Documents/GitHub/b1cc/src
+B1CC_SRCDIR ?= $(B1CC_DIR)/src
 B1CC_SELF_SRCS := $(filter-out %/b1cc_token_lexer.c,$(wildcard $(B1CC_SRCDIR)/*.c))
 ifneq ($(strip $(B1CC_SELF_SRCS)),)
 BINARIES += $(BUILD)/bin/b1cc
@@ -291,6 +291,10 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # Dynamic by default (links against libc.so.1 via /lib/ld-b1nix.so + the
 # in-kernel loader); LINK=static restores the historical static recipe. The
 # mode is selected by the GEN_* variables defined near the top of this file.
+$(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
+	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)"
+
+$(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(B1CC)
 $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/%.c
 	@mkdir -p $(dir $@)
 	B1NIX_CC=$(realpath ../tools/toolchain/bin/b1nix-cc) $(B1CC) --target=$(B1NIX_ARCH)-b1nix bin/$*.c -o $@
@@ -457,8 +461,9 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER
 	  $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
 
-# Hosted C++ smoke: built with the cross GCC's libstdc++ via tools/toolchain/bin/b1nix-c++
-# (NOT clang $(CC)). Requires the C++-enabled toolchain (enable-cxx-toolchain.sh).
+# Hosted C++ smoke: built with the cross Clang's LLVM libc++ via
+# tools/toolchain/bin/b1nix-c++. The triplet-named compiler is a compatibility
+# shim; GCC/libstdc++ are not part of the active toolchain.
 # The b1nix-c++ wrapper + DYNAMIC_CRT0 + SHARED_LIBC are prerequisites so the
 # dynamic-vs-static link mode (and a wrapper change) re-triggers the link.
 $(BUILD)/bin/cxx_smoke: bin/cxx_smoke.cpp $(LIB) $(CRT0) $(DYNAMIC_CRT0) $(SHARED_LIBC) $(LINKER) ../tools/toolchain/bin/b1nix-c++
@@ -470,21 +475,22 @@ $(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(LIB) $(CRT0) $(DYNAMIC_C
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/toolchain/bin/b1nix-clang++ $< -o $@
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
-# b1nix VFS, built against libstdc++ via tools/toolchain/bin/b1nix-c++.
+# b1nix VFS, built against LLVM libc++ via tools/toolchain/bin/b1nix-c++.
 $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(LIB) $(CRT0) $(DYNAMIC_CRT0) $(SHARED_LIBC) $(LINKER) ../tools/toolchain/bin/b1nix-c++
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(B1NIX_CXX) $< -o $@
 
-# M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +libgcc for
-# __popcountdi2). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off libstdc++.
+# M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +compiler-rt
+# for integer builtins). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off
+# libc++.
 HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install
-LIBGCC := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a
+LLVM_RT := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a
 $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(HB_DIR)/include -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m51_harfbuzz_smoke.o \
 	  $(HB_DIR)/lib/libharfbuzz.a $(LIBM_DIR)/lib/libm.a \
-	  $(BESPOKE_LIBC) $(LIBGCC)
+	  $(BESPOKE_LIBC) $(LLVM_RT)
 
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
 FC_DIR := ../build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install

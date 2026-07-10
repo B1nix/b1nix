@@ -198,7 +198,7 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) 
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
 WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
 DROPBEAR_VERSION := 2022.83
-DROPBEAR_ELF := build/dropbear-src/$(B1NIX_TRIPLET)/dropbear-$(DROPBEAR_VERSION)/dropbearmulti
+DROPBEAR_ELF := build/dropbear-b1nix/$(B1NIX_TRIPLET)/dropbearmulti
 BASH_VERSION_NUM := 5.2.37
 BASH_ELF := build/bash-src/$(B1NIX_TRIPLET)/bash-$(BASH_VERSION_NUM)/bash
 B1NIX_TLS ?= mbedtls
@@ -434,7 +434,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke build-all
 
-all: $(KERNEL_ELF)
+all: check-b1cc-sync $(KERNEL_ELF)
 
 # build-all — one orchestrator that builds the whole working system in dependency
 # order by reusing the existing build scripts (see tools/build-all.sh). Forwards
@@ -537,7 +537,7 @@ $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
 # Depend on the b1cc *sources* (same glob as userspace/Makefile's B1CC_SRCDIR) so
 # editing b1cc re-embeds it — otherwise the .inc looks up-to-date vs
 # USERSPACE_DEPS and the stale compiler binary gets shipped.
-B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),$(HOME)/Documents/GitHub/b1cc/src)/*.c)
+B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c)
 $(BUILD_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc build/$(ARCH)/libb1nix.a build/$(ARCH)/crt/crt0.o build/$(ARCH)/crt/crt0-dynamic.o
 	@mkdir -p $(dir $@)
@@ -1039,7 +1039,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: $(KERNEL_ELF)
+iso: check-b1cc-sync $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
@@ -1140,6 +1140,10 @@ iso-test: root-image $(KERNEL_ELF)
 
 userspace:
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
+
+.PHONY: check-b1cc-sync
+check-b1cc-sync:
+	@tools/check-b1cc-sync.sh
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install

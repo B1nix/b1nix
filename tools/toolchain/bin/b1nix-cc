@@ -27,7 +27,13 @@ if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
 	CLANG="ccache clang"
 fi
 
-[ -f "$LIB" ] && [ -f "$CRT0" ] || { echo "b1nix-cc: building libc..." >&2; make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$LIB" "$CRT0"; }
+[ -f "$LIB" ] && [ -f "$CRT0" ] || {
+	echo "b1nix-cc: building libc..." >&2
+	# Make targets are relative to userspace/Makefile. Passing the absolute
+	# paths above made a clean build fail with "No rule to make target".
+	make -C "$USR" B1NIX_ARCH="$B1NIX_ARCH" -s \
+		"build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o"
+}
 
 # Parse: find sources, output, and keep other flags
 OUTPUT="a.out"

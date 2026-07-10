@@ -214,7 +214,7 @@ for f in $CXXFLAGS; do
 done
 
 if [ "$compile_only" -eq 1 ]; then
-  run_cxx "${cxx_flags[@]}" "${passthru[@]}" -c "${inputs[@]}" -o "$output"
+  run_cxx "${cxx_flags[@]}" "${passthru[@]+${passthru[@]}}" -c "${inputs[@]}" -o "$output"
   exit $?
 fi
 
@@ -225,7 +225,7 @@ fi
 # Add -lc++ -lc++abi so the C++ runtime symbols (std::__1::*) resolve.
 # Point -L at the cross lib dir so the linker finds the b1nix libc++.
 is_shared=0
-for f in "${passthru[@]}"; do [ "$f" = "-shared" ] && is_shared=1; done
+for f in "${passthru[@]+${passthru[@]}}"; do [ "$f" = "-shared" ] && is_shared=1; done
 if [ "$is_shared" -eq 1 ]; then
   shared_target="x86_64-unknown-elf"
   if [ "$ARCH" = "x86" ]; then shared_target="i686-unknown-elf"; fi
@@ -261,7 +261,7 @@ for in_file in "${inputs[@]}"; do
     *.o|*.a|*.so|*.so.*) objs+=("$in_file") ;;   # .so: shared-lib dep, link as-is
     *)
       o="$tmp/$(basename "$in_file").o"
-      run_cxx "${cxx_flags[@]}" "${passthru[@]}" -c "$in_file" -o "$o"
+      run_cxx "${cxx_flags[@]}" "${passthru[@]+${passthru[@]}}" -c "$in_file" -o "$o"
       objs+=("$o")
       ;;
   esac
@@ -295,12 +295,12 @@ for f in $POST_GROUP; do post_group_args+=("$f"); done
 if [ -n "$UNWIND_RUNTIME" ]; then
   "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
     "$CRT0" "${objs[@]}" \
-    --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]}" --end-group \
-    "${cxxlib_so_args[@]}" "${post_group_args[@]}"
+    --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
+    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"
 else
   "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
     "$CRT0" "${objs[@]}" \
-    --start-group "${stdlib_a_args[@]}" "${stdlib_abi_a_args[@]}" "$CRT_RUNTIME" "${group_libc_args[@]}" --end-group \
-    "${cxxlib_so_args[@]}" "${post_group_args[@]}"
+    --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
+    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"
 fi
 rm -rf "$tmp"

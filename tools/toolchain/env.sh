@@ -67,19 +67,18 @@ TOOLCHAIN_SRC_DIR="$TOOLCHAIN_BUILD_ROOT/src"
 export B1NIX_ARCH B1NIX_TRIPLET B1NIX_GCC_ARCH B1NIX_ROOTFS
 export TOOLCHAIN_BUILD_ROOT TOOLCHAIN_BUILD_HOME TOOLCHAIN_DIST_DIR TOOLCHAIN_SRC_DIR
 
-# ── C++ cross-compiler resolution (Clang frontend + GCC libstdc++ headers/libs) ──
+# ── C++ cross-compiler resolution (Clang frontend + LLVM libc++) ─────────────
 # Source this after env.sh. Sets:
-#   CXX_CROSS          clang++ (or g++ with B1NIX_CXX_FRONTEND=gcc)
+#   CXX_CROSS          clang++
 #   CXXFLAGS_CROSS     compile flags (--target, -nostdinc, C++ stdlib includes)
 #   STDLIB_CROSS_A     path to the C++ standard library (.a)
 #   STDLIB_ABI_CROSS_A path to the C++ ABI library (.a)
-#   LIBGCC_CROSS       path to libgcc.a (from cross GCC, fallback CRT)
-#   LLVM_CRT_CROSS     path to libcompiler_rt.a (LLVM builtins, or empty)
-#   LLVM_UNW_CROSS     path to libunwind.a (LLVM unwinder, or empty)
+#   LIBGCC_CROSS       always empty (GCC is not part of the toolchain)
+#   LLVM_CRT_CROSS     path to libcompiler_rt.a
+#   LLVM_UNW_CROSS     path to libunwind.a
 resolve_cxx_cross() {
     local cross="$TOOLCHAIN_BUILD_HOME/cross"
-    local gxx="$cross/bin/$B1NIX_TRIPLET-g++"
-    local cxx_frontend="${B1NIX_CXX_FRONTEND:-clang}"
+    local cxx_frontend="clang"
     local cxx_stdlib="${B1NIX_CXX_STDLIB:-}"
 
     # Auto-detect C++ stdlib. The unified runtimes build (build-libcxx.sh) installs
@@ -97,18 +96,14 @@ resolve_cxx_cross() {
             STDLIB_CROSS_A="$libcxx_a"
             STDLIB_ABI_CROSS_A="$libcxxabi_a"
             ;;
-        libstdc++|*)
-            STDLIB_CROSS_A="$("$gxx" -print-file-name=libstdc++.a 2>/dev/null)"
-            STDLIB_ABI_CROSS_A="$("$gxx" -print-file-name=libsupc++.a 2>/dev/null)"
+        *)
+            echo "resolve_cxx_cross: only LLVM libc++ is supported; got '$cxx_stdlib'" >&2
+            return 1
             ;;
     esac
 
     case "$cxx_frontend" in
-        gcc)
-            CXX_CROSS="$gxx"
-            CXXFLAGS_CROSS="-O2 -ffunction-sections -fdata-sections -Db1nix"
-            ;;
-        clang|*)
+        clang)
             CXX_CROSS="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "clang++")}"
             if [ "$cxx_stdlib" = "libc++" ]; then
                 # libc++: -nostdinc++ (drop only the C++ stdlib search) + the libc++
@@ -120,27 +115,11 @@ resolve_cxx_cross() {
                 local sysroot="$TOOLCHAIN_BUILD_HOME/sysroot"
                 CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET --sysroot=$sysroot -nostdinc++ -isystem $libcxx_hdr"
                 CXXFLAGS_CROSS="$CXXFLAGS_CROSS -O2 -ffunction-sections -fdata-sections -Db1nix"
-            else
-                local ver
-                ver="$("$gxx" -dumpversion 2>/dev/null || echo 13.2.0)"
-                local gccroot="$cross/lib/gcc/$B1NIX_TRIPLET/$ver"
-                local res
-                res="$("$CXX_CROSS" -print-resource-dir 2>/dev/null || true)"
-                CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET -O2 -ffunction-sections -fdata-sections -Db1nix -nostdinc"
-                [ -n "$res" ] && CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $res/include"
-                local cxxroot="$cross/$B1NIX_TRIPLET/include/c++/$ver"
-                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $cxxroot -isystem $cxxroot/$B1NIX_TRIPLET -isystem $cxxroot/backward"
-                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $gccroot/include -isystem $gccroot/include-fixed"
-                CXXFLAGS_CROSS="$CXXFLAGS_CROSS -isystem $cross/$B1NIX_TRIPLET/include"
             fi
             ;;
     esac
 
-    if [ "$cxx_stdlib" = "libc++" ]; then
-        LIBGCC_CROSS=""
-    else
-        LIBGCC_CROSS="$("$gxx" -print-libgcc-file-name 2>/dev/null)"
-    fi
+    LIBGCC_CROSS=""
 
     # LLVM runtimes: prefer compiler-rt + libunwind over libgcc when available.
     local llvm_rt="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib"

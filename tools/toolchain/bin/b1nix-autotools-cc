@@ -63,7 +63,7 @@ REL_DYNAMIC_CRT0="build/$B1NIX_ARCH/crt/crt0-dynamic.o"
 # (e.g. NetSurf's libjxl decode silently fails). See tools/ports/build-netsurf-fb.sh.
 LINKER="${B1NIX_LINKER:-$USR/linker.ld}"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
-CLANG=clang
+CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang)}"
 if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
 	CLANG="ccache clang"
 fi
@@ -81,9 +81,19 @@ fi
 # for these, so this passthrough restores the historical behaviour.)
 for _a in "$@"; do
 	case "$_a" in
-	-nostdlib|-r|--relocatable|-Wl,-r|-Wl,--relocatable)
-		# shellcheck disable=SC2086
-		exec $CLANG --target="$TARGET" $ARCH_FLAGS "$@"
+	-r|--relocatable|-Wl,-r|-Wl,--relocatable)
+		# Clang on macOS delegates unknown-OS ELF links to the host gcc driver,
+		# which injects Darwin flags (-arch/-platform_version). A relocatable
+		# link needs no compiler driver at all, so invoke target ld.lld directly.
+		# Remove only compiler-driver runtime switches; they have no ld meaning.
+		r_args=()
+		for _rarg in "$@"; do
+			case "$_rarg" in
+			-rtlib=*|-unwindlib=*|-static-libgcc) continue ;;
+			esac
+			r_args+=("$_rarg")
+		done
+		exec "$LD" -m "$LD_EMULATION" "${r_args[@]}"
 		;;
 	esac
 done
@@ -137,6 +147,7 @@ C_ONLY_FLAGS=("-include" "string.h")
 
 compile_only=0
 preprocess_only=0
+passthrough_link=0
 output=""
 # sources[]  — .c/.s/.S files this wrapper must compile.
 # linkline[] — every link token (.o/.a, -l, -L, and -Wl,-translated) IN ORDER.
@@ -158,6 +169,11 @@ while [ $# -gt 0 ]; do
     -E)
       preprocess_only=1
       args+=("-E")
+      ;;
+    -nostdlib)
+      # The caller supplies crt0, libraries and linker script. Keep the
+      # wrapper's direct ld.lld path, but do not inject another startup/libc.
+      passthrough_link=1
       ;;
     -o)
       shift
@@ -242,6 +258,18 @@ CROSS_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
 libdirs=()
 [ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
 [ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
+runtime_libs=()
+# This wrapper invokes ld.lld directly, so clang cannot inject its normal
+# compiler-rt runtime automatically. Add the LLVM builtins explicitly; without
+# this, configure probes for 64-bit atomics fail even though clang emitted the
+# correct atomic instructions/calls.
+[ -f "$CROSS_LIB/libcompiler_rt.a" ] && runtime_libs+=("$CROSS_LIB/libcompiler_rt.a")
+
+if [ "$passthrough_link" -eq 1 ]; then
+  exec "$LD" -m "$LD_EMULATION" -o "$output" \
+    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" \
+    ${B1NIX_LD_EXTRA:-}
+fi
 if [ "$is_shared" -eq 1 ]; then
   # Shared object: PIC, no crt0, no executable linker script, no --whole-archive
   # libb1nix. -soname/--version-script/--export-dynamic etc. already arrived via
@@ -260,11 +288,11 @@ if [ "$is_shared" -eq 1 ]; then
     cxx_shared=(--push-state --as-needed "$SYSROOT_LIB/libc++.so.1" "$SYSROOT_LIB/libc++abi.so.1" --pop-state)
   fi
   exec "$LD" -m "$LD_EMULATION" -shared --hash-style=sysv -o "$output" \
-    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
+    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
 elif [ "$B1NIX_LINK" = "dynamic" ]; then
   exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
     -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
-    ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
+    "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
 else
-  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
 fi

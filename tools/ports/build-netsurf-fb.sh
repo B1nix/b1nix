@@ -822,7 +822,7 @@ fi
 # program", the correct token for a non-PIE executable.
 export CFLAGS="${CFLAGS:-} -fPIC"
 export CXXFLAGS="${CXXFLAGS:-} -fPIC"
-export LDFLAGS="${LDFLAGS:-} -static-libgcc -Wl,--defsym=__dso_handle=0 -Wl,-z,notext"
+export LDFLAGS="${LDFLAGS:-} -rtlib=compiler-rt -unwindlib=libunwind -Wl,--defsym=__dso_handle=0 -Wl,-z,notext"
 # nsfb folds libc++/libjxl and depends on C++ exceptions (libjxl decode throws on
 # its slow paths). The cross driver's default linker.ld drops .eh_frame /
 # .eh_frame_hdr / .gcc_except_table, so unwinding is dead and JXL/SVG/JS decode

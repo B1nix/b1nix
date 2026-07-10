@@ -56,11 +56,11 @@ port_configure() {
 
 port_build() {
   if [ "$PHASE" = "crypto" ]; then
-    make -C "$SRC_DIR" -j"${JOBS:-4}" \
+    make -C "$BUILD_DIR" -j"${JOBS:-4}" \
       CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
       libtomcrypt/libtomcrypt.a libtommath/libtommath.a 1>&2
   else
-    make -C "$SRC_DIR" -j"${JOBS:-4}" \
+    make -C "$BUILD_DIR" -j"${JOBS:-4}" \
       CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
       PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
       MULTI=1 dropbearmulti 1>&2
@@ -75,14 +75,17 @@ port_install() {
   fi
 }
 
-# For crypto phase, driver should not print (manifest will print src dir)
-if [ "$PHASE" = "crypto" ]; then
-  AUTOTOOLS_ECHO=""
-fi
+# The caller needs the out-of-tree build directory (not the install prefix),
+# so suppress the generic driver's default path and print the correct one below.
+AUTOTOOLS_ECHO=""
 
 . "$ROOT_DIR/tools/ports/drivers/autotools.sh"
 
 # For crypto phase, print src dir instead of install dir
 if [ "$PHASE" = "crypto" ]; then
   echo "$SRC_DIR"
+else
+  # The generic driver configures/builds out-of-tree; expose the actual build
+  # directory so callers can consume dropbearmulti without guessing its path.
+  echo "$BUILD_DIR"
 fi

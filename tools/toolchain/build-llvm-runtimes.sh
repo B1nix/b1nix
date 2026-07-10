@@ -25,15 +25,8 @@ LLVM_SHA256="${LLVM_SHA256:-}"
 
 CROSS="$TOOLCHAIN_BUILD_HOME/cross"
 SYSROOT="$TOOLCHAIN_BUILD_HOME/sysroot"
-GCC_INC="$CROSS/lib/gcc/$B1NIX_TRIPLET"
-
-# Find the GCC version directory (e.g. 13.2.0) for include-fixed and libgcc paths
-GCC_VER_DIR=$(ls "$GCC_INC" 2>/dev/null | head -1 || true)
-if [ -z "$GCC_VER_DIR" ]; then
-    echo "build-llvm-runtimes: no GCC version dir found in $GCC_INC — build cross toolchain first" >&2
-    exit 1
-fi
-GCC_FIXED="$GCC_INC/$GCC_VER_DIR/include-fixed"
+# M90 is intentionally GCC-free.  LLVM runtimes only need the b1nix sysroot
+# and are installed into the unversioned target lib directories below.
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
@@ -56,6 +49,7 @@ fi
 
 CLANG_BIN="$(command -v clang 2>/dev/null || echo clang)"
 CLANGXX_BIN="$(command -v clang++ 2>/dev/null || echo clang++)"
+AR_BIN="$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)"
 CMAKE_GENERATOR="Unix Makefiles"
 
 # Common CMake flags for cross-compiling to b1nix
@@ -65,7 +59,7 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_SYSTEM_PROCESSOR="$B1NIX_GCC_ARCH"
     -DCMAKE_C_COMPILER="$CLANG_BIN"
     -DCMAKE_CXX_COMPILER="$CLANGXX_BIN"
-    -DCMAKE_AR="$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)"
+    -DCMAKE_AR="$AR_BIN"
     -DCMAKE_RANLIB="$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)"
     -DCMAKE_C_COMPILER_TARGET="$B1NIX_TRIPLET"
     -DCMAKE_CXX_COMPILER_TARGET="$B1NIX_TRIPLET"
@@ -111,22 +105,25 @@ if [ ! -f "$INSTALL_DIR/lib/libcompiler_rt.a" ]; then
         ln -sf libcompiler_rt.a "$INSTALL_DIR/lib/libclang_rt.builtins-${B1NIX_GCC_ARCH}.a"
         echo "  compiler-rt builtins: $CRT_A → $INSTALL_DIR/lib/libcompiler_rt.a"
     else
-        # Fallback: build individual builtin objects and archive them
+        # Build individual builtin objects when compiler-rt's CMake target does
+        # not emit the archive. This is still LLVM compiler-rt; there is no GCC
+        # or libgcc fallback by design.
         echo "  compiler-rt: cmake build didn't produce expected .a — trying individual build"
         CFLAGS_BUILTINS="--target=$B1NIX_TRIPLET -O2 -ffreestanding -fno-builtin -fPIC"
         OBJS=""
-        for src in "$SRC_DIR/compiler-rt/lib/builtins"/{udivdi3,moddi3,udivmoddi4,mulodi3,muldi3,divdi3,divti3,modti3,udivti3,umodti3,udivmodti4,fixdfdi,fixunsdfdi,fixsfdi,fixunssfdi,fixtfdi,fixunstfdi, floatdidf,undf2df,df2unidf,adddf3,subdf3,muldf3,divdf3,negdf2,eqdf2,gedf2,ledf2,cmpled,cmpord,cmp*}.c; do
+        for src in "$SRC_DIR/compiler-rt/lib/builtins"/{udivdi3,moddi3,udivmoddi4,mulodi3,muldi3,divdi3,divti3,modti3,udivti3,umodti3,udivmodti4,fixdfdi,fixunsdfdi,fixsfdi,fixunssfdi,fixtfdi,fixunstfdi,floatdidf,undf2df,df2unidf,adddf3,subdf3,muldf3,divdf3,negdf2,eqdf2,gedf2,ledf2,cmpled,cmpord,cmp*,popcount*,clz*,ctz*}.c; do
             [ -f "$src" ] || continue
             obj="$CRT_BUILD/$(basename "$src" .c).o"
             "$CLANG_BIN" $CFLAGS_BUILTINS -c "$src" -o "$obj" 2>/dev/null || true
             [ -f "$obj" ] && OBJS="$OBJS $obj"
         done
         if [ -n "$OBJS" ]; then
-            llvm-ar rcs "$INSTALL_DIR/lib/libcompiler_rt.a" $OBJS
+            "$AR_BIN" rcs "$INSTALL_DIR/lib/libcompiler_rt.a" $OBJS
             ln -sf libcompiler_rt.a "$INSTALL_DIR/lib/libclang_rt.builtins-${B1NIX_GCC_ARCH}.a"
             echo "  compiler-rt builtins: manually archived $(echo $OBJS | wc -w) objects"
         else
-            echo "  WARNING: compiler-rt builtins build failed — falling back to libgcc" >&2
+            echo "  ERROR: LLVM compiler-rt builtins build failed" >&2
+            exit 1
         fi
     fi
 fi
@@ -167,7 +164,7 @@ cd "$PROJECT_DIR"
 # libc (no standalone libdl.a/libpthread.a), so a static consumer linked with
 # ld.lld would otherwise fail: "unable to find library from dependent library
 # specifier: dl". Removing it makes these archives link cleanly everywhere.
-OBJCOPY_BIN="$(command -v llvm-objcopy 2>/dev/null || echo llvm-objcopy)"
+OBJCOPY_BIN="$(command -v llvm-objcopy 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-objcopy)"
 for f in "$INSTALL_DIR"/lib/*.a; do
     [ -f "$f" ] && "$OBJCOPY_BIN" --remove-section=.deplibs "$f" 2>/dev/null || true
 done
@@ -180,7 +177,6 @@ for f in "$INSTALL_DIR"/lib/*.a; do
     name="$(basename "$f")"
     cp -f "$f" "$SYSROOT/usr/lib/$name" 2>/dev/null || true
     cp -f "$f" "$CROSS/$B1NIX_TRIPLET/lib/$name" 2>/dev/null || true
-    cp -f "$f" "$CROSS/lib/gcc/$B1NIX_TRIPLET/$GCC_VER_DIR/$name" 2>/dev/null || true
     echo "  installed: $name"
 done
 # Install headers (unwind.h, etc.)
@@ -196,6 +192,4 @@ echo "LLVM runtimes build complete!"
 echo "  compiler-rt: $INSTALL_DIR/lib/libcompiler_rt.a"
 echo "  libunwind:   $INSTALL_DIR/lib/libunwind.a"
 echo ""
-echo "To use instead of libgcc:"
-echo "  Replace -lgcc with -lcompiler_rt -lunwind"
-echo "  Or keep -lgcc as fallback and add -lunwind for exception support"
+echo "LLVM compiler-rt and libunwind are the only cross runtime."

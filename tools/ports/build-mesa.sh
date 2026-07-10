@@ -1,8 +1,8 @@
 #!/bin/sh
 # Build Mesa (OSMesa + Gallium swrast/softpipe, software OpenGL, no LLVM) as a
 # set of static libraries for the b1nix userspace ABI. Cross-built with meson +
-# the b1nix GCC/libstdc++ toolchain (needs tools/toolchain/enable-cxx-toolchain.sh, run
-# here). Prints the install dir; install/lib/*.a + the osmesa target object are
+# the b1nix LLVM/Clang toolchain. Prints the install dir; install/lib/*.a + the
+# osmesa target object are
 # linked by the M52 OSMesa demo.
 #
 # Mesa is built static; its own meson archives are thin (reference .o by path),
@@ -34,16 +34,10 @@ INSTALL_DIR="$BUILD_DIR/install"
 CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
 GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
 
-# Resolve C++ frontend: clang++ (default) or g++ (legacy fallback)
-CXX_FRONTEND="${B1NIX_CXX_FRONTEND:-clang}"
-case "$CXX_FRONTEND" in
-  gcc)
-    REAL_CXX="$GXX"
-    ;;
-  clang|*)
-    REAL_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo "$GXX")}"
-    ;;
-esac
+# Clang is the only supported C++ frontend; the triplet g++ name is merely a
+# compatibility shim created by build-toolchain.sh.
+REAL_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
+[ -n "$REAL_CXX" ] || { echo "build-mesa: clang++ not found" >&2; exit 1; }
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   LDEMU="elf_i386"; MCPU="x86"; MFAM="x86"
@@ -67,7 +61,6 @@ trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 # Toolchain prerequisites: b1nix libc/crt + C++-enabled cross toolchain.
 make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
   "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
-"$ROOT_DIR/tools/toolchain/enable-cxx-toolchain.sh" "$B1NIX_TRIPLET" 1>&2
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
@@ -76,10 +69,8 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 # Resolve C++ stdlib and CRT runtime. The unified runtimes build installs both
-# libc++.a and libc++abi.a under libcxx-install/lib. Default to libstdc++ (the
-# verified runtime); use libc++ only when requested (B1NIX_CXX_STDLIB=libc++) —
-# folding the PIC static libc++/libc++abi into Mesa's C++ output.
-CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"
+# libc++.a and libc++abi.a under libcxx-install/lib; these are always used.
+CXX_STDLIB=libc++
 LIBCXX_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
 LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
 LLVM_CRT_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
@@ -137,7 +128,7 @@ cat > "$INI" <<EOF
 [binaries]
 c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
 cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CXX']
-ar = '$CROSS/bin/$B1NIX_TRIPLET-ar'
+ar = '$AR_BIN'
 strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
 pkg-config = 'false'
 $LLVM_CONFIG_LINE

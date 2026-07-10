@@ -1,6 +1,6 @@
 #!/bin/sh
 # Build libjxl (JPEG-XL decoder) as static libs for the b1nix userspace ABI, via
-# CMake cross-compile with the b1nix cross g++/libstdc++ toolchain. Decode only;
+# CMake cross-compile with the b1nix cross clang++/libc++ toolchain. Decode only;
 # every optional component (tools, tests, benchmark, examples, jpegli,
 # transcode-jpeg, plugins, fuzzers, devtools, docs, sjpeg) is disabled. highway
 # and brotli are built from third_party/. Prints the install dir.
@@ -16,7 +16,8 @@ CMAKE_SRCNAME="libjxl-${VER}"
 CMAKE_SENTINEL="lib/jxl/decode.cc"
 CMAKE_NEED_CXX=1
 # b1nix is unix-like (pthreads in libb1nix); the bundled libc++ detection wants
-# threads, but the cross gcc has no -pthread spec, so wire threads in by hand.
+# threads, but the clang cross driver has no hosted pthread spec, so wire threads
+# in by hand.
 CMAKE_TC_EXTRA='set(THREADS_PREFER_PTHREAD_FLAG OFF)
 set(CMAKE_THREAD_LIBS_INIT "")
 set(CMAKE_HAVE_THREADS_LIBRARY ON)
