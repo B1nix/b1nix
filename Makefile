@@ -15,6 +15,7 @@ B1NIX_TRIPLET := x86_64-b1nix
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
+INITRAMFS_B1CC_M34_INC := $(BUILD_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(BUILD_DIR)/initramfs_curl.inc
 INITRAMFS_WGET_INC := $(BUILD_DIR)/initramfs_wget.inc
 INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
@@ -145,7 +146,8 @@ INITRAMFS_B1CC_INCS := \
 	$(BUILD_DIR)/initramfs_b1cc_argv.inc \
 	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
 	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc \
-	$(BUILD_DIR)/initramfs_b1cc_better_c.inc
+	$(BUILD_DIR)/initramfs_b1cc_better_c.inc \
+	$(BUILD_DIR)/initramfs_b1cc_m34.inc
 # M32/M33: on-device self-host proof. Ships /bin/b1cc (b1cc built by b1nix-cc),
 # its link inputs (/lib/b1cc/crt0.o + libb1nix.a), and the /bin/b1cc-selfsmoke
 # driver. x86_64 only (the internal linker + b1cc_selfsmoke target x86_64-b1nix).
@@ -169,12 +171,14 @@ CFLAGS_EXTRA += -DMINIMAL_INITRAMFS
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_B1CC_INCS) \
+	$(INITRAMFS_B1CC_M34_INC) \
 	$(INITRAMFS_SHARED_LIBC_INC)
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_B1CC_INCS) \
 	$(INITRAMFS_TCC_FILES_INC) \
+	$(INITRAMFS_B1CC_M34_INC) \
 	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
@@ -224,7 +228,7 @@ GRUB_TIMEOUT ?= 0
 
 # Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
 # source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
-ROOT_IMAGE_SIZE ?= 512
+ROOT_IMAGE_SIZE ?= 1024
 
 # Locate the native toolchain that tools/toolchain/build-native-toolchain.sh produced.
 # Per-triplet: build/toolchain_build/<triplet>/native_root by default, or
@@ -524,6 +528,11 @@ $(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh 
 	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
 	@mkdir -p $(dir $@)
 	sh tools/images/gen_tcc_initramfs.sh $@
+
+$(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc_m34 build/$(ARCH)/bin/b1cc_m34_corpus
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
 $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
@@ -1191,12 +1200,17 @@ install-native-toolchain:
 
 install-ports: userspace-install install-native-toolchain
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
+	@# The published dev package may carry older libc headers than this checkout.
+	@# Restore the current userspace ABI after package extraction so cross C++
+	@# ports (notably libc++/Mesa) see the same wchar/locale surface as the build.
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 
 # Stage kernel + userspace + build harness source into the rootfs so the
 # in-guest toolchain can rebuild b1nix from inside b1nix (M26 self-host).
 # Excludes generated artifacts (build/, *.o, *.a, *.elf, .git).
 install-kernel-source:
 	@echo "Staging b1nix source tree into $(BUILD_DIR)/rootfs/usr/src/b1nix..."
+	@rm -rf $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix
 	@for d in kernel userspace tools tests docs; do \
 		if [ -d "$$d" ]; then \

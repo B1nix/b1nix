@@ -2428,7 +2428,7 @@ static int user_run_elf_image(struct user_loaded_image *image) {
      * assert mis-reads -> snapshot deserialize aborts). For align-aligned memsz
      * (the common case) region+memsz == region+round_up, so this is a no-op
      * there. tls_size (rounded) is still used for block/region sizing. */
-    u64 tp = region + image->tls_memsz;
+    u64 tp = region + tls_size;
     u64 db = vmm_direct_map_base();
 
     for (u64 v = region; v < region + block_size; v += PAGE_SIZE) {

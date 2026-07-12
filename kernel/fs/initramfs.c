@@ -20,6 +20,7 @@
 #include "initramfs_b1cc_file_write.inc"
 #include "initramfs_b1cc_stderr_exit.inc"
 #include "initramfs_b1cc_better_c.inc"
+#include "initramfs_b1cc_m34.inc"
 #ifdef B1CC_SELFHOST
 /* M32/M33: /bin/b1cc + /lib/b1cc/{crt0.o,libb1nix.a,crt0-dynamic.o} + b1cc-selfsmoke. */
 #include "initramfs_b1cc_selfhost.inc"
@@ -1459,6 +1460,9 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
      sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_m34", (const char *)vfs_b1cc_m34_elf,
+     sizeof(vfs_b1cc_m34_elf), INITRAMFS_EXECUTABLE},
+    B1CC_M34_INITRAMFS_FILES
 #ifdef B1CC_SELFHOST
     {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
      INITRAMFS_EXECUTABLE},
@@ -1532,6 +1536,11 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_stderr_exit_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_better_c", (const char *)vfs_b1cc_better_c_elf,
      sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/b1cc_m34", (const char *)vfs_b1cc_m34_elf,
+     sizeof(vfs_b1cc_m34_elf), INITRAMFS_EXECUTABLE},
+#ifndef MINIMAL_INITRAMFS
+    B1CC_M34_INITRAMFS_FILES
+#endif
 #ifdef B1CC_SELFHOST
     {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
      INITRAMFS_EXECUTABLE},

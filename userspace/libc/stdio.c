@@ -24,7 +24,7 @@ int putchar(int c) {
 int puts(const char *s) {
   write(stdout->fd, s, strlen(s));
   putchar('\n');
-  return 0;
+  return '\n';
 }
 
 void perror(const char *s) {

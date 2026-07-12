@@ -39,10 +39,12 @@ fi
 OUTPUT="a.out"
 SOURCES=""
 FLAGS=""
+LINK_FLAGS=""
 while [ $# -gt 0 ]; do
 	case "$1" in
 		-o) shift; OUTPUT="$1" ;;
 		-c) ;;  # skip -c
+		-lm) LINK_FLAGS="$LINK_FLAGS $PROJECT_DIR/build/openlibm-b1nix/${B1NIX_ARCH}-b1nix/install/lib/libm.a" ;;
 		-*) FLAGS="$FLAGS $1" ;;
 		*) SOURCES="$SOURCES $1" ;;
 	esac
@@ -65,5 +67,6 @@ for src in $SOURCES; do
 	OBJS="$OBJS $obj"
 done
 
-"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$OUTPUT" "$CRT0" $OBJS --whole-archive "$LIB" --no-whole-archive
+# shellcheck disable=SC2086
+"$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$OUTPUT" "$CRT0" $OBJS --whole-archive "$LIB" --no-whole-archive $LINK_FLAGS
 echo "b1nix-cc: $OUTPUT ready" >&2

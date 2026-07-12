@@ -187,7 +187,8 @@ BINARIES += $(BUILD)/bin/m_posixmm_smoke
 # still be overridden by callers that intentionally use another build.
 B1CC_DIR := $(CURDIR)/b1cc
 B1CC ?= $(B1CC_DIR)/build/b1cc
-B1CC_BINS := return_42 b1cc_hello b1cc_argv b1cc_file_write b1cc_stderr_exit b1cc_better_c
+B1CC_BINS := return_42 b1cc_hello b1cc_argv b1cc_file_write b1cc_stderr_exit b1cc_better_c b1cc_m34
+B1CC_BINS += b1cc_m34_corpus
 ifneq ($(strip $(B1CC)),)
 BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS))
 else

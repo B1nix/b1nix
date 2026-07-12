@@ -1526,6 +1526,40 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+  // M34 feature coverage compiled by b1cc for x86_64-b1nix, run on target.
+  u64 c99_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_m34", 0, 0, 0, 0, 0);
+  if ((isize)c99_pid < 0) {
+    uwrite("B1CC-M34-SMOKE: spawn-fail\n");
+  } else {
+    int c99_status = 0;
+    syscall_dispatch(SYS_WAIT, c99_pid, (u64)(usize)&c99_status, 0, 0, 0, 0);
+  if (c99_status == 0) {
+    uwrite("B1CC-M34-SMOKE: ok\n");
+    } else {
+      uwrite("B1CC-M34-SMOKE: fail exit=");
+      uwrite_dec_value((u64)c99_status);
+      uwrite("\n");
+    }
+  }
+
+  /* M34: compile and execute the complete b1cc differential corpus one
+   * program at a time inside B1NIX.  The runner invokes the on-device b1cc
+   * against source files embedded in the initramfs and validates each exit. */
+  u64 m34_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/b1cc_m34_corpus", 0, 0, 0, 0, 0);
+  if ((isize)m34_pid < 0) {
+    uwrite("B1CC-M34-TARGET: spawn-fail\n");
+  } else {
+    int m34_status = 0;
+    syscall_dispatch(SYS_WAIT, m34_pid, (u64)(usize)&m34_status, 0, 0, 0, 0);
+    if (m34_status == 0) {
+      uwrite("B1CC-M34-TARGET: all ok\n");
+    } else {
+      uwrite("B1CC-M34-TARGET: fail exit=");
+      uwrite_dec_value((u64)m34_status);
+      uwrite("\n");
+    }
+  }
+
 #ifdef B1CC_SELFHOST
   /* M32/M33: on-device self-host — /bin/b1cc compiles+links a program with its
    * OWN internal linker (no host ld.lld) and the output runs. The driver

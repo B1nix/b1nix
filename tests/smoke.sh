@@ -590,6 +590,8 @@ check_output "$LOG" "B1CC-ARGV-SMOKE: ok" "b1cc argv propagation works"
 check_output "$LOG" "B1CC-FILE-SMOKE: ok" "b1cc file write works"
 check_output "$LOG" "B1CC-STDERR-SMOKE: ok" "b1cc stderr exit status propagates"
 check_output "$LOG" "B1CC-BETTER-C-SMOKE: ok" "b1cc better C features work (M7)"
+check_output "$LOG" "B1CC-M34-SMOKE: ok" "b1cc M34 features run on x86_64-b1nix (wide strings, K&R, VLA, designated/partial init, _Complex)"
+check_output "$LOG" "B1CC-M34-TARGET: all ok" "b1cc M34 target corpus passes on-device"
 
 # ── Test 2: No panic ──
 if grep -q "KERNEL PANIC" "$LOG" 2>/dev/null; then
