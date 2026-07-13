@@ -534,6 +534,13 @@ $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
+# displayd is multi-source (userspace/displayd/*.c), not a single bin/*.c
+DISPLAYD_SRCS := $(wildcard userspace/displayd/*.c) $(wildcard userspace/displayd/*.h)
+$(BUILD_DIR)/initramfs_displayd.inc: $(DISPLAYD_SRCS) $(USERSPACE_DEPS)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/displayd
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_displayd_elf userspace/build/$(ARCH)/bin/displayd > $@
+
 $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/$*
 	@mkdir -p $(dir $@)

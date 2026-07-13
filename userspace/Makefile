@@ -322,7 +322,24 @@ $(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -T $(GEN_LINKER) -o $@ $(GEN_CRT0) $(BUILD)/bin/$*.o $(GEN_LINK_LIBS)
 
-$(GUI_BINARIES): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
+DISPLAYD_DIR := displayd
+DISPLAYD_SRCS := $(DISPLAYD_DIR)/displayd_main.c $(DISPLAYD_DIR)/displayd_protocol.c \
+	$(DISPLAYD_DIR)/displayd_window.c $(DISPLAYD_DIR)/displayd_render.c \
+	$(DISPLAYD_DIR)/displayd_menu.c $(DISPLAYD_DIR)/displayd_input.c \
+	$(DISPLAYD_DIR)/displayd_dispatch.c
+DISPLAYD_HDRS := $(DISPLAYD_DIR)/displayd.h $(DISPLAYD_DIR)/font8x8.h $(DISPLAYD_DIR)/xkb_keymap_us.h
+DISPLAYD_OBJS := $(patsubst $(DISPLAYD_DIR)/%.c,$(BUILD)/displayd/%.o,$(DISPLAYD_SRCS))
+
+$(BUILD)/displayd/%.o: $(DISPLAYD_DIR)/%.c $(DISPLAYD_HDRS)
+	@mkdir -p $(BUILD)/displayd
+	$(CC) $(CFLAGS) -I$(DISPLAYD_DIR) -I ../kernel/arch/x86_64 -c $< -o $@
+
+$(BUILD)/bin/displayd: $(DISPLAYD_OBJS) $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
+	@mkdir -p $(dir $@)
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(DISPLAYD_OBJS) \
+		--whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
+
+$(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: bin/%.c $(GUI_LIB) $(LIB) $(CRT0) $(LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I ../kernel/arch/x86_64 -c $< -o $(BUILD)/bin/$*.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) -T $(LINKER) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/$*.o \

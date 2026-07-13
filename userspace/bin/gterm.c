@@ -229,7 +229,14 @@ int main(void) {
 	if (b1gui_connect(&win) ||
 	    b1gui_create_window(&win, COLS * CELL_W, ROWS * CELL_H, "Terminal"))
 		return 1;
-	(void)b1gui_checksum(&win); /* ensure objects exist before any fork */
+	(void)b1gui_checksum(&win);
+	struct b1gui_menu_item items[] = {
+	    {1, 0, "New Tab", "Ctrl+T"},
+	    {0, B1GUI_MENU_SEPARATOR, "", ""},
+	    {2, 0, "Copy",  "Ctrl+C"},
+	    {3, 0, "Paste", "Ctrl+V"},
+	};
+	b1gui_register_menu(&win, items, 4); /* ensure objects exist before any fork */
 
 	int shift = 0;
 	int running = 1;
@@ -283,6 +290,11 @@ int main(void) {
 			if (rc == 1 && event.type == B1GUI_EV_CLOSE) {
 				running = 0;
 				break;
+			}
+			if (rc == 1 && event.type == B1GUI_EV_MENU_ITEM) {
+				/* Menu actions — for now just ignore (Copy/Paste are
+				 * handled by Ctrl+C/V keyboard forwarding already). */
+				continue;
 			}
 			if (rc == 1 && event.type == B1GUI_EV_KEY && event.nargs >= 2) {
 				unsigned scan = event.args[0];
