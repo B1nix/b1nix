@@ -22,6 +22,10 @@ int main(void) {
 	struct b1gui_window win;
 	if (b1gui_connect(&win) || b1gui_create_window(&win, 170, 72, "Clock"))
 		return 1;
+	struct b1gui_menu_item items[] = {
+	    {1, 0, "Toggle 24h", ""},
+	};
+	b1gui_register_menu(&win, items, 1);
 	for (;;) {
 		for (unsigned i = 0; i < win.width * win.height; i++)
 			win.pixels[i] = 0x00121B2Au;

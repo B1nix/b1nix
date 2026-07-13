@@ -3,15 +3,36 @@
 
 #include <stdint.h>
 
-#define B1GUI_EV_CLOSE 1
-#define B1GUI_EV_POINTER_ENTER 2
-#define B1GUI_EV_POINTER_LEAVE 3
+/* ── standard events ── */
+#define B1GUI_EV_CLOSE          1
+#define B1GUI_EV_POINTER_ENTER  2
+#define B1GUI_EV_POINTER_LEAVE  3
 #define B1GUI_EV_POINTER_MOTION 4
 #define B1GUI_EV_POINTER_BUTTON 5
-#define B1GUI_EV_KEY 6
-#define B1GUI_EV_FOCUS_ENTER 7
-#define B1GUI_EV_FOCUS_LEAVE 8
-#define B1GUI_EV_FRAME 9
+#define B1GUI_EV_KEY            6
+#define B1GUI_EV_FOCUS_ENTER    7
+#define B1GUI_EV_FOCUS_LEAVE    8
+#define B1GUI_EV_FRAME          9
+
+/* ── extended events (displayd → app) ── */
+#define B1GUI_EV_MENU_ITEM     20  /* args[0] = item_id from register_menu */
+#define B1GUI_EV_DOCK_RESTORE  21  /* dock icon clicked while minimized */
+
+/* ── menu item flags ── */
+#define B1GUI_MENU_ENABLED   0x00
+#define B1GUI_MENU_DISABLED  0x01
+#define B1GUI_MENU_SEPARATOR 0x02
+#define B1GUI_MENU_CHECKED   0x04
+
+/* Maximum menu items per app */
+#define B1GUI_MAX_MENU_ITEMS 16
+
+struct b1gui_menu_item {
+	uint16_t id;       /* returned in B1GUI_EV_MENU_ITEM.args[0] */
+	uint16_t flags;    /* B1GUI_MENU_* */
+	char     label[32]; /* visible label, e.g. "New File" */
+	char     accel[12]; /* keyboard shortcut text, e.g. "Ctrl+N" (display only) */
+};
 
 struct b1gui_event {
 	uint16_t type;
@@ -42,6 +63,7 @@ struct b1gui_window {
 	unsigned inlen;
 };
 
+/* ── core API ── */
 int b1gui_connect(struct b1gui_window *win);
 int b1gui_create_window(struct b1gui_window *win, uint32_t width,
                         uint32_t height, const char *title);
@@ -51,5 +73,9 @@ int b1gui_next_event(struct b1gui_window *win, struct b1gui_event *event,
                      int timeout_ms);
 uint32_t b1gui_checksum(struct b1gui_window *win);
 void b1gui_destroy(struct b1gui_window *win);
+
+/* ── app menu registration (macOS-style: items appear in top bar) ── */
+int b1gui_register_menu(struct b1gui_window *win,
+                        const struct b1gui_menu_item *items, int count);
 
 #endif

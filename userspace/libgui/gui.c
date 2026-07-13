@@ -237,7 +237,13 @@ int b1gui_next_event(struct b1gui_window *win, struct b1gui_event *event,
 		}
 		if (h.object == win->toplevel_id && h.opcode == 1)
 			event->type = B1GUI_EV_CLOSE;
-		else if (h.object == win->pointer_id && h.opcode <= 3) {
+		else if (h.object == win->toplevel_id && h.opcode == 20) {
+			event->type = B1GUI_EV_MENU_ITEM;
+			event->args[0] = args[0];
+			event->nargs = 1;
+		} else if (h.object == win->toplevel_id && h.opcode == 21) {
+			event->type = B1GUI_EV_DOCK_RESTORE;
+		} else if (h.object == win->pointer_id && h.opcode <= 3) {
 			if (h.opcode == 0) {
 				event->type = B1GUI_EV_POINTER_ENTER;
 				event->args[0] = args[2] >> 8;
@@ -285,6 +291,38 @@ uint32_t b1gui_checksum(struct b1gui_window *win) {
 		    h.object == sync && h.opcode == 0)
 			return 1;
 	return 0;
+}
+
+int b1gui_register_menu(struct b1gui_window *win,
+                        const struct b1gui_menu_item *items, int count) {
+	if (!win || win->fd < 0 || !items || count <= 0 ||
+	    count > B1GUI_MAX_MENU_ITEMS)
+		return -1;
+	/* Custom extension: opcode 20 on toplevel.
+	 * Wire format: count(u32), then per item: id(u16)|flags(u16), label(str),
+	 * accel(str). Pack into a uint32 buffer. */
+	uint32_t args[128];
+	unsigned n = 0;
+	args[n++] = (uint32_t)count;
+	for (int i = 0; i < count; i++) {
+		args[n++] = ((uint32_t)items[i].id << 16) | (uint32_t)items[i].flags;
+		/* label as wl_string: length then padded chars */
+		unsigned llen = (unsigned)strlen(items[i].label) + 1;
+		unsigned lwords = (llen + 3) / 4;
+		args[n++] = llen;
+		memset(&args[n], 0, lwords * 4);
+		memcpy(&args[n], items[i].label, llen);
+		n += lwords;
+		/* accel as wl_string */
+		unsigned alen = (unsigned)strlen(items[i].accel) + 1;
+		unsigned awords = (alen + 3) / 4;
+		args[n++] = alen;
+		memset(&args[n], 0, awords * 4);
+		memcpy(&args[n], items[i].accel, alen);
+		n += awords;
+	}
+	if (n > 128) return -1;
+	return request(win->fd, win->toplevel_id, 20, args, n);
 }
 
 void b1gui_destroy(struct b1gui_window *win) {
