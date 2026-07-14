@@ -433,3 +433,41 @@ int fchmodat(int dirfd, const char *path, mode_t mode, int flags) {
  * and report success (timestamps are cosmetic for content_shell's use). */
 struct timeval;
 int futimes(int fd, const struct timeval tv[2]) { (void)fd; (void)tv; return 0; }
+
+/* timespec_get / c23_timespec_get: C11/C23 wall-clock retrieval.
+ * Mesa 24+ emits calls to c23_timespec_get (the C23-renamed version).
+ * b1nix provides CLOCK_REALTIME via clock_gettime; base TIME_UTC is the
+ * only defined base. */
+#ifndef TIME_UTC
+#define TIME_UTC 1
+#endif
+
+int timespec_get(struct timespec *ts, int base) {
+    if (base != TIME_UTC) return 0;
+    if (clock_gettime(CLOCK_REALTIME, ts) != 0) return 0;
+    return base;
+}
+
+/* C23 renamed timespec_get → c23_timespec_get; clang 22+ emits this
+ * symbol when compiling C23 code that calls timespec_get. */
+int c23_timespec_get(struct timespec *ts, int base)
+    __attribute__((weak, alias("timespec_get")));
+
+/* qsort_s: C11 Annex K / POSIX sorting with context. Mesa 24 uses it.
+ * Linux/glibc signature: qsort_s(base, nmemb, size, compar, arg)
+ * where compar(ctx, a, b) — context is the LAST arg to qsort_s but FIRST to compar. */
+struct _qsort_s_ctx { int (*compar)(const void*, const void*, void*); void *arg; };
+static int _qsort_s_trampoline(const void *a, const void *b) {
+    /* We can't recover the context from the bare qsort comparator.
+     * Use a thread-local instead. */
+    extern __thread struct _qsort_s_ctx _qsort_s_tls;
+    return _qsort_s_tls.compar(a, b, _qsort_s_tls.arg);
+}
+__thread struct _qsort_s_ctx _qsort_s_tls;
+void qsort_s(void *base, size_t nmemb, size_t size,
+             int (*compar)(const void*, const void*, void*), void *arg) {
+    _qsort_s_tls.compar = compar;
+    _qsort_s_tls.arg = arg;
+    qsort(base, nmemb, size, _qsort_s_trampoline);
+}
+char *secure_getenv(const char *name) __attribute__((weak)) { return getenv(name); }

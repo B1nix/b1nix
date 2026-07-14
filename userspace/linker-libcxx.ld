@@ -14,9 +14,11 @@
  *      Starting `.` at base + SIZEOF_HEADERS leaves the ELF header + phdrs at the
  *      load base inside the first PT_LOAD, so they are mapped and lld emits PT_PHDR.
  *
- *   2. .eh_frame_hdr must be KEPT (linker-cxx.ld discards it) so that, together
- *      with the driver's --eh-frame-hdr, lld emits the PT_GNU_EH_FRAME segment
- *      libunwind reads.
+ *   2. .eh_frame_hdr must NOT be explicitly defined in the linker script:
+ *      the driver's --eh-frame-hdr tells ld.lld to auto-generate it from the
+ *      .eh_frame contents. An explicit section definition with *(.eh_frame_hdr)
+ *      that has no input content gets emptied and --gc-sections drops it,
+ *      leaving the binary without PT_GNU_EH_FRAME.
  *
  * Crucially this script does NOT use an explicit PHDRS command: lld then
  * auto-generates the full set of program headers (PT_PHDR, PT_INTERP, PT_LOAD,
@@ -46,11 +48,10 @@ SECTIONS
 		*(.rodata .rodata.*)
 	}
 
-	/* KEEP .eh_frame_hdr (requirement 2): with --eh-frame-hdr lld turns it into
-	 * the PT_GNU_EH_FRAME segment libunwind consults via dl_iterate_phdr. */
-	.eh_frame_hdr ALIGN(4) : {
-		*(.eh_frame_hdr)
-	}
+	/* DO NOT explicitly define .eh_frame_hdr here — the b1nix-c++ driver's
+	 * --eh-frame-hdr flag tells ld.lld to auto-generate it from .eh_frame.
+	 * An explicit *(.eh_frame_hdr) with no input content gets emptied and
+	 * --gc-sections drops it, leaving the binary without PT_GNU_EH_FRAME. */
 
 	.eh_frame ALIGN(8) : {
 		__EH_FRAME_BEGIN__ = .;

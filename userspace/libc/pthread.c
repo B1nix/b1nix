@@ -29,6 +29,11 @@
 #include <time.h>
 #include <unistd.h>
 
+/* glibc compatibility: indicates whether process is single-threaded.
+ * 1 = single-threaded (fast path), 0 = multi-threaded.
+ * Used by Skia and other libraries for lock-free optimizations. */
+int __libc_single_threaded = 1;
+
 #define DEFAULT_STACK_SIZE (256 * 1024)
 #define STACK_GUARD_HI     0xDEADC0DEDEADBEEFULL
 

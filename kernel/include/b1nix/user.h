@@ -7,10 +7,13 @@ typedef int (*user_program_entry)(int argc, const char **argv);
 
 #define USER_MAX_ARGS 32
 #define USER_MAX_ENVS 32
-#define USER_MAX_IMAGE_SEGMENTS 32
+/* Total PT_LOAD segments across the executable and every DT_NEEDED object in the
+ * eager-linked graph. Deep C++ chains reach many objects × ~4 segments each
+ * (the Skia demo: 11 objects × 4 = 44), so 32 is too small — 64 leaves room. */
+#define USER_MAX_IMAGE_SEGMENTS 64
 /* dl_iterate_phdr module table: the executable + its DT_NEEDED shared objects
- * (the eager linker caps the object graph at DYN_MAX_OBJECTS = 8; 16 leaves
- * headroom). USER_DL_MODULE_NAME_MAX bounds the copied soname/path. */
+ * (the eager linker caps the object graph at DYN_MAX_OBJECTS = 16).
+ * USER_DL_MODULE_NAME_MAX bounds the copied soname/path. */
 #define USER_MAX_DL_MODULES 16
 #define USER_DL_MODULE_NAME_MAX 96
 #define USER_STACK_SIZE PAGE_SIZE

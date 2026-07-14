@@ -245,7 +245,8 @@ ones worth flagging:
   reference arch.
 - The port has its own `docs/<arch>-port.md` (memory map, frame offsets, ABI
   selectors, the bug fixes with commit hashes) and the roadmap line is updated.
-- Run `/graphify --update` and commit the refreshed graph as part of closeout.
+- Re-index with codebase-memory (`index_repository(mode="full")`) as part of
+  closeout so the knowledge graph stays in sync (local index, nothing to commit).
 
 The x86 port reached all of these (369/369, single + `-smp 4`). Use it as the
 reference for what "done" looks like.

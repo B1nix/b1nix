@@ -77,7 +77,7 @@ port_pre_build() {
 #endif
 EOF
 
-  CPORT_CFLAGS="-DHAVE_CONFIG_H -I$GEN_DIR -I$SRC_DIR -I$SRC_DIR/src -I$INSTALL_DIR/include \
+  CPORT_CFLAGS="-fPIC -DHAVE_CONFIG_H -I$GEN_DIR -I$SRC_DIR -I$SRC_DIR/src -I$INSTALL_DIR/include \
     -I$EXPAT_DIR/include -I$FT_DIR/include \
     -DHAVE_EXPAT=1 -DFcPublic= -Wno-implicit-function-declaration -Wno-incompatible-pointer-types \
     -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"

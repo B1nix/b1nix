@@ -375,6 +375,20 @@ EGLint eglGetError(void) {
   return e;
 }
 
+EGLDisplay eglGetCurrentDisplay(void) {
+  if (!g_current_ctx) return EGL_NO_DISPLAY;
+  return kDisplay;
+}
+
+EGLSurface eglGetCurrentSurface(EGLint readdraw) {
+  (void)readdraw;
+  return (EGLSurface)g_current_surf;
+}
+
+EGLContext eglGetCurrentContext(void) {
+  return (EGLContext)g_current_ctx;
+}
+
 int eglB1nixAccelerated(EGLDisplay dpy) {
   (void)dpy;
   return 0; /* OSMesa softpipe is software; virgl backend would override. */

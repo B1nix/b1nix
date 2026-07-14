@@ -293,12 +293,12 @@ post_group_args=()
 for f in $POST_GROUP; do post_group_args+=("$f"); done
 
 if [ -n "$UNWIND_RUNTIME" ]; then
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
+  "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "$CRT0" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"
 else
-  "$LD" -m "$LDEMU" -T "$LINKER" --gc-sections -o "$output" \
+  "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "$CRT0" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"

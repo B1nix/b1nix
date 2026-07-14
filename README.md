@@ -298,7 +298,6 @@ tools/              build, porting, packaging, and self-hosting tools
 tests/              QEMU smoke and persistence tests
 docs/               roadmap, ABI, porting notes, and subsystem documentation
 archive/            inactive architecture experiments
-graphify-out/       generated project knowledge graph
 build/              generated artifacts and downloaded upstream sources
 smoke_run/          generated test logs, captures, and temporary images
 ```

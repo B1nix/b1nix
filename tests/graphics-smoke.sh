@@ -25,7 +25,8 @@ fi
 
 "$QEMU" \
   -cdrom "$PROJECT_DIR/build/$ARCH/b1nix.iso" \
-  -serial stdio -display none -monitor none -no-reboot \
+  -m 2048 \
+  -serial stdio -display gtk -monitor none -no-reboot \
   -device virtio-gpu-pci \
   -device isa-debug-exit,iobase=0xf4,iosize=0x04 \
   >"$LOG" 2>&1 &
@@ -73,5 +74,14 @@ grep -q "M51-GFX: ok harfbuzz" "$LOG"
 grep -q "M51-GFX: ok fontconfig" "$LOG"
 grep -q "M51-GFX: ok wl-output" "$LOG"
 grep -q "M51-GFX: ok clipboard" "$LOG"
+grep -q "M91-SKIA: ok core-init" "$LOG"
+grep -q "M91-SKIA: ok raster-surface" "$LOG"
+grep -q "M91-SKIA: ok raster-draw" "$LOG"
+grep -q "M91-SKIA: ok path-draw" "$LOG"
+# text-draw is optional (needs fonts in initramfs)
+grep -q "M91-SKIA: ok text-draw" "$LOG" 2>/dev/null || true
+grep -q "M91-SKIA: ok gpu-init" "$LOG"
+grep -q "M91-SKIA: ok gpu-draw" "$LOG"
+grep -q "M91-SKIA: ok skottie" "$LOG"
 ! grep -q "KERNEL PANIC" "$LOG"
 echo "graphics smoke ($ARCH): ok"

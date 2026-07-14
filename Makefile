@@ -105,6 +105,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m52_osmesa \
 	m52_glsl \
 	m59_smoke \
+	m91_skia_smoke \
 	cxx_smoke \
 	m55_iostream \
 	m55_litehtml \
@@ -131,6 +132,10 @@ INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
 # the libc++-default b1nix-c++; libc++abi.so.1 folds the libunwind DWARF unwinder.
 INITRAMFS_LIBCXX_INC := $(BUILD_DIR)/initramfs_libcxx.inc
 INITRAMFS_LIBCXXABI_INC := $(BUILD_DIR)/initramfs_libcxxabi.inc
+# M91: Mesa shared libraries are stored in rootfs.img (GRUB module), not in
+# the kernel initramfs (too large for clang source location limit).
+# See root-image target which copies .so files into $(BUILD_DIR)/rootfs/lib/.
+INITRAMFS_M91_SO_INCS :=
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -196,7 +201,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_TESTFONT_INC) \
 	$(INITRAMFS_M40_LINUX_INC) \
 	$(INITRAMFS_M67_RUST_INC) \
-	$(INITRAMFS_NETSURF_INC)
+	$(INITRAMFS_NETSURF_INC) \
+	$(INITRAMFS_M91_SO_INCS)
 endif
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
@@ -228,7 +234,7 @@ GRUB_TIMEOUT ?= 0
 
 # Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
 # source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
-ROOT_IMAGE_SIZE ?= 1024
+ROOT_IMAGE_SIZE ?= 256
 
 # Locate the native toolchain that tools/toolchain/build-native-toolchain.sh produced.
 # Per-triplet: build/toolchain_build/<triplet>/native_root by default, or
@@ -746,6 +752,50 @@ $(BUILD_DIR)/initramfs_m59_smoke.inc: userspace/bin/m59_smoke.c userspace/libegl
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m59_smoke_elf userspace/build/$(ARCH)/bin/m59_smoke > $@
 
+# M91: Skia 2D graphics library (standalone build with Ganesh GPU backend).
+$(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
+	@mkdir -p $(dir $@)
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
+	@touch $@
+
+$(BUILD_DIR)/initramfs_m91_skia_smoke.inc: userspace/bin/m91_skia_smoke.cpp tools/demos/build-m91-skia-demo.sh $(BUILD_DIR)/.skia-built $(USERSPACE_DEPS)
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke userspace/build/$(ARCH)/bin/m91_skia_smoke
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_m91_skia_smoke_elf userspace/build/$(ARCH)/bin/m91_skia_smoke > $@
+
+# M91: shared-library deps for Skia (libskia.so, libraw_ptr.so, libfontconfig.so,
+# libb1gui.so, libGLESv2.so, libEGL.so). build-skia-shared-deps.sh builds all .so
+# from the port trees; xxd converts each to an initramfs .inc.
+
+# M91: Skia dm testing tool — too large for initramfs (400MB+).
+# Ships in rootfs.img as /bin/skia-dm via root-image target.
+# initramfs gets a 1-byte placeholder.
+$(BUILD_DIR)/initramfs_m91_skia_dm.inc: $(BUILD_DIR)/.skia-built
+	@mkdir -p $(dir $@)
+	@echo '/* dm not built — ships in rootfs.img */' > $@
+	@echo 'static const unsigned char vfs_m91_skia_dm_elf[1] = {0};' >> $@
+	@echo 'static const unsigned int vfs_m91_skia_dm_elf_len = 0;' >> $@
+M91_SHARED_DEPS_STAMP := $(BUILD_DIR)/.m91-shared-deps-stamp
+$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built
+	@mkdir -p $(dir $@)
+	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
+	@# Replace sysroot stubs with real .so so cross-cc link step finds them
+	@SYSROOT_LIB=build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib; \
+	for so in libEGL.so libGLESv2.so libfontconfig.so; do \
+		if [ -f userspace/build/$(ARCH)/$$so ]; then \
+			cp -f userspace/build/$(ARCH)/$$so "$$SYSROOT_LIB/$$so"; \
+		fi; \
+	done
+	@touch $@
+
+# Generic .so -> .inc rule for M91 shared libs. The pattern matches
+# userspace/build/$(ARCH)/lib<name>.so -> $(BUILD_DIR)/initramfs_lib<name>.inc.
+# The initramfs_lib<name>.inc target must match one of the $(INITRAMFS_M91_SO_INCS)
+# entries so the dependency chain from kernel/fs/initramfs.o pulls it in.
+$(BUILD_DIR)/initramfs_lib%.inc: userspace/build/$(ARCH)/lib%.so $(M91_SHARED_DEPS_STAMP)
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_lib$*_so $< > $@
+
 # M55: validate the C++ runtime with litehtml (real HTML/CSS layout engine).
 # tools/demos/build-m55-litehtml.sh builds litehtml+gumbo (build-litehtml.sh) and
 # links the parse/layout/draw acceptance test against them. M89: litehtml is built
@@ -1019,7 +1069,7 @@ $(INITRAMFS_LIBCXX_INC): tools/toolchain/build-libcxx-shared.sh $(dir $(CROSS_TO
 
 $(INITRAMFS_LIBCXXABI_INC): $(INITRAMFS_LIBCXX_INC)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_libcxxabi_elf $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
+	xxd -i -n vfs_libcxxabi_so1 $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
@@ -1055,47 +1105,51 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: check-b1cc-sync $(KERNEL_ELF)
+iso: check-b1cc-sync root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
-	     -e 's|@MODULE_CMD@||g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 
-iso-core: $(KERNEL_ELF)
+iso-core: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-core/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-core/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
-	     -e 's|@MODULE_CMD@||g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
 
-iso-graphics: $(KERNEL_ELF)
+iso-graphics: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-graphics/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-graphics/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
-	     -e 's|@MODULE_CMD@||g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
 
-iso-shell: $(KERNEL_ELF)
+iso-shell: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-shell/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-shell/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
-	     -e 's|@MODULE_CMD@||g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
 
@@ -1232,8 +1286,14 @@ install-kernel-source:
 	@# which #include generated artifacts from build/$(ARCH) (ap_trampoline.inc and
 	@# the initramfs_*.inc byte arrays). build/ is rsync-excluded above as it is
 	@# host output, so stage just these generated *.inc inputs the compile needs.
+	@# Exclude large Mesa/Skia/NetSurf .inc files (not needed for self-host).
 	@mkdir -p $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)
-	@cp $(BUILD_DIR)/*.inc $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)/ 2>/dev/null || true
+	@for f in $(BUILD_DIR)/*.inc; do \
+		case "$$(basename "$$f")" in \
+			initramfs_m52_*|initramfs_m53_*|initramfs_m59_*|initramfs_m91_*|initramfs_lib*) continue ;; \
+		esac; \
+		cp "$$f" $(BUILD_DIR)/rootfs/usr/src/b1nix/build/$(ARCH)/; \
+	done 2>/dev/null || true
 	@du -sh $(BUILD_DIR)/rootfs/usr/src/b1nix | sed 's/^/source tree size: /'
 
 # A full ISO must carry the staged rootfs. The old dependency on plain `iso`
@@ -1266,12 +1326,68 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: install-ports install-kernel-source
+root-image: install-ports $(M91_SHARED_DEPS_STAMP)
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
 	@ln -sfn . $(BUILD_DIR)/rootfs/persist
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
+	@# M91: Stage Mesa/Skia shared libraries into rootfs/lib/ for the dynamic linker
+	@mkdir -p $(BUILD_DIR)/rootfs/lib
+	@# Mesa install dir (softpipe/virgl build) — copy .so files and create
+	@# SONAME copies (not symlinks: b1nix ext4 driver may not follow them).
+	@MESA_LIB_DIR=build/mesa-b1nix/$(B1NIX_TRIPLET)/install/lib; \
+	for so in "$$MESA_LIB_DIR"/libOSMesa.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.0.0.0; do \
+		if [ -f "$$so" ]; then \
+			base=$$(basename "$$so"); soname=$$(llvm-readelf -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//' ); \
+			cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+			if [ -n "$$soname" ] && [ "$$soname" != "$$base" ]; then \
+				cp -f "$$so" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
+			fi; \
+		fi; \
+	done
+	@# Copy any other Mesa install .so files (libEGL, libGLESv2, etc.)
+	@for so in build/mesa-b1nix/$(B1NIX_TRIPLET)/install/lib/lib*.so.*; do \
+		[ -f "$$so" ] && ! [ -L "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+	done
+	@# Also stage from userspace build dir
+	@for so in userspace/build/$(ARCH)/lib*.so userspace/build/$(ARCH)/lib*.so.*; do \
+		[ -f "$$so" ] && ! [ -L "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+	done
+	@# Stage sysroot C++ runtime .so (real, not stubs — EGL/GLESv2/fontconfig
+	@# come from userspace/build/ via build-skia-shared-deps.sh above)
+	@SYSROOT_LIB=build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib; \
+	for so in "$$SYSROOT_LIB"/libc++.so.1 \
+	          "$$SYSROOT_LIB"/libc++abi.so.1 "$$SYSROOT_LIB"/libunwind.so.1; do \
+		[ -f "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+	done
+	@# Create SONAME hard copies for any .so.N.M files in rootfs/lib
+	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
+		[ -f "$$f" ] || continue; \
+		soname=$$(llvm-readelf -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
+		if [ -n "$$soname" ] && ! [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
+			cp -f "$$f" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
+		fi; \
+	done
+	@# M91: Skia dm binary (too large for initramfs, ships in rootfs.img)
+	@if [ -f build/ports-src/skia/out/b1nix/dm ]; then \
+		llvm-strip --strip-debug build/ports-src/skia/out/b1nix/dm -o $(BUILD_DIR)/rootfs/bin/skia-dm 2>/dev/null || \
+		cp build/ports-src/skia/out/b1nix/dm $(BUILD_DIR)/rootfs/bin/skia-dm; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
+	fi
+	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
+	@# are only needed for self-hosting, not for smoke.  Keep Mesa .so files.
+	@rm -f $(BUILD_DIR)/rootfs/lib/libLLVM*.a $(BUILD_DIR)/rootfs/lib/libLLVM.so
+	@# Remove .so.N.M files whose SONAME copy already exists (avoid duplicates)
+	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
+		[ -f "$$f" ] || continue; \
+		soname=$$(llvm-readelf -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
+		if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$f)" ] && [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
+			rm -f "$$f"; \
+		fi; \
+	done
+	@# Remove .so symlinks (kernel doesn't follow them)
+	@find $(BUILD_DIR)/rootfs/lib -type l -name '*.so' -delete 2>/dev/null || true
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
 	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
 	 $(MKE2FS) -t ext4 -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4

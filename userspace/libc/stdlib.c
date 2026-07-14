@@ -74,13 +74,15 @@ void __cxa_finalize(void *dso_handle) {
 	}
 }
 
-/* C++ ABI: pure virtual function call handler. */
-void __cxa_pure_virtual(void) {
+/* C++ ABI: pure virtual function call handler.
+ * Weak so libc++abi can provide the real implementation. */
+void __attribute__((weak)) __cxa_pure_virtual(void) {
 	__builtin_trap();
 }
 
-/* C++ ABI: deleted virtual function call handler. */
-void __cxa_deleted_virtual(void) {
+/* C++ ABI: deleted virtual function call handler.
+ * Weak so libc++abi can provide the real implementation. */
+void __attribute__((weak)) __cxa_deleted_virtual(void) {
 	__builtin_trap();
 }
 
@@ -1159,6 +1161,19 @@ double frexp(double x, int *exp)
 	return x < 0 ? -ax : ax;
 }
 
+long double frexpl(long double x, int *exp)
+{
+	if (exp) *exp = 0;
+	if (x == 0.0L || x != x || (x - x) != 0.0L)
+		return x;
+	int e = 0;
+	long double ax = x < 0 ? -x : x;
+	while (ax >= 1.0L) { ax *= 0.5L; e++; }
+	while (ax < 0.5L)  { ax *= 2.0L; e--; }
+	if (exp) *exp = e;
+	return x < 0 ? -ax : ax;
+}
+
 float strtof(const char *nptr, char **endptr)
 {
 	return (float)strtod(nptr, endptr);
@@ -1797,4 +1812,20 @@ void *aligned_alloc(size_t alignment, size_t size) {
  * its config detects _GLIBCXX_HAVE_MEMALIGN). */
 void *memalign(size_t alignment, size_t size) {
   return ma_aligned(alignment, size);
+}
+
+/* arc4random / arc4random_buf: BSD cryptographic random. b1nix uses getrandom
+ * syscall (unlimited, blocking until entropy available). */
+void arc4random_buf(void *buf, size_t nbytes) {
+  unsigned char *p = (unsigned char *)buf;
+  while (nbytes > 0) {
+    long n = syscall(SYS_GETRANDOM, (long)p, (long)nbytes, 0);
+    if (n > 0) { p += n; nbytes -= n; }
+  }
+}
+
+uint32_t arc4random(void) {
+  uint32_t v;
+  arc4random_buf(&v, sizeof(v));
+  return v;
 }

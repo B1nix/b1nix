@@ -1,16 +1,10 @@
 #!/usr/bin/env bash
-# Compiler shim for the Mesa cross build. Strips flags the cross compiler
-# doesn't understand and adds Clang-specific flags when using the clang++ frontend.
-#
-# Invoked from the meson cross-file as: b1nix-mesa-cc <real-compiler> <args...>
-# The real compiler is either the cross g++ (legacy) or clang++ (Stage 1 migration).
+# Compiler shim for the Mesa cross build.
+# No --sysroot (breaks clang's stddef.h). Use -isystem for b1nix headers.
+# libc++ headers MUST come before b1nix headers (for stddef.h wrapper).
 set -eu
 real="$1"; shift
 
-# Meson probes a compiler with --version/-dumpversion before it tries a real
-# compile or link.  Those probes must reach the frontend; treating them as a
-# link command produces an empty ld.lld invocation and Meson reports an
-# unknown compiler.
 for arg in "$@"; do
   case "$arg" in
     --version|-dumpversion|-dumpmachine)
@@ -18,105 +12,34 @@ for arg in "$@"; do
   esac
 done
 
-# All b1nix triplet compiler names are clang-backed compatibility wrappers in
-# the GCC-free toolchain. Detecting only '*clang*' misclassifies
-# x86_64-b1nix-gcc and sends passthrough links to the host Apple ld64.
-USING_CLANG=1
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
+. "$PROJECT_DIR/tools/toolchain/env.sh"
+CROSS="$TOOLCHAIN_BUILD_HOME/cross"
+
 USING_CXX=0
-case "$(basename "$real")" in
-  *clang++*) USING_CXX=1 ;;
-esac
+IS_LINK=1
 for arg in "$@"; do
   case "$arg" in
     *.cc|*.cpp|*.cxx|*.C) USING_CXX=1 ;;
+    -c|-E) IS_LINK=0 ;;
   esac
 done
 
-# Homebrew clang++ on macOS delegates unknown-OS ELF links to the host g++
-# driver, which injects Darwin/ld64 flags. Compile through clang++, but perform
-# target links with ld.lld directly after translating the driver's -Wl options.
+B1NIX_INC="$CROSS/$B1NIX_TRIPLET/include"
+EXTRA_FLAGS=""
+
 if [ "$USING_CXX" -eq 1 ]; then
-  compile_only=0
-  for arg in "$@"; do
-    case "$arg" in -c|-E) compile_only=1 ;; esac
-  done
-  if [ "$compile_only" -eq 0 ]; then
-    SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-    PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-    . "$PROJECT_DIR/tools/toolchain/env.sh"
-    LD_BIN="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
-    LD_ARGS=(-m elf_x86_64)
-    skip_next=0
-    for arg in "$@"; do
-      if [ "$skip_next" -eq 1 ]; then skip_next=0; continue; fi
-      case "$arg" in
-        -o|-install_name|-compatibility_version|-current_version)
-          case "$arg" in -o) LD_ARGS+=("$arg") ;; esac
-          skip_next=1 ;;
-        -Wl,*)
-          IFS=',' read -ra wl_parts <<< "${arg#-Wl,}"
-          LD_ARGS+=("${wl_parts[@]}") ;;
-        -Xlinker)
-          skip_next=1 ;;
-        -shared|-r|-nostdlib|-nostartfiles|-nodefaultlibs|-fPIC|-fpic)
-          [ "$arg" = "-fPIC" ] || [ "$arg" = "-fpic" ] || LD_ARGS+=("$arg") ;;
-        -fuse-ld=*|-stdlib=*|-rtlib=*|-unwindlib=*|--target=*|--sysroot=*|-isystem|-I|-D|-U|-pthread)
-          case "$arg" in -isystem|-I|-D|-U) skip_next=1 ;; esac ;;
-        -install_name|-compatibility_version|-current_version)
-          skip_next=1 ;;
-        -*)
-          case "$arg" in -L*|-l*|-Wl,*|-T*|--start-group|--end-group|--whole-archive|--no-whole-archive|--gc-sections|--version-script*) LD_ARGS+=("$arg") ;; esac ;;
-        *) LD_ARGS+=("$arg") ;;
-      esac
-    done
-    CRT="$TOOLCHAIN_BUILD_HOME/cross/$B1NIX_TRIPLET/lib/libcompiler_rt.a"
-    [ -f "$CRT" ] && LD_ARGS+=("$CRT")
-    exec "$LD_BIN" "${LD_ARGS[@]}"
-  fi
-fi
-
-# When using clang++, resolve the GCC cross toolchain for libstdc++ headers
-if [ "$USING_CLANG" -eq 1 ] && [ "$USING_CXX" -eq 1 ]; then
-  SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
-  PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
-  . "$PROJECT_DIR/tools/toolchain/env.sh"
-  CROSS="$TOOLCHAIN_BUILD_HOME/cross"
-
-  if [ "${B1NIX_CXX_STDLIB:-libc++}" = "libc++" ]; then
-    # libc++: -nostdinc++ + the libc++ headers, letting clang resolve its own
-    # builtin C headers + the b1nix libc headers through --sysroot. (A blanket
-    # -nostdinc breaks clang's stddef.h #include_next chain, dropping ::nullptr_t.)
-    LIBCXX_HDR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
-    EXTRA_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$TOOLCHAIN_BUILD_HOME/sysroot -nostdinc++ -isystem $LIBCXX_HDR"
-  else
-    GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
-    VER="$("$GXX" -dumpversion 2>/dev/null || echo 13.2.0)"
-    CXXROOT="$CROSS/$B1NIX_TRIPLET/include/c++/$VER"
-    GCCROOT="$CROSS/lib/gcc/$B1NIX_TRIPLET/$VER"
-    RES="$("$real" -print-resource-dir 2>/dev/null || true)"
-    EXTRA_FLAGS="--target=$B1NIX_TRIPLET"
-    [ -n "$RES" ] && EXTRA_FLAGS="$EXTRA_FLAGS -isystem $RES/include"
-    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CXXROOT -isystem $CXXROOT/$B1NIX_TRIPLET -isystem $CXXROOT/backward"
-    EXTRA_FLAGS="$EXTRA_FLAGS -isystem $GCCROOT/include -isystem $GCCROOT/include-fixed"
-    EXTRA_FLAGS="$EXTRA_FLAGS -isystem $CROSS/$B1NIX_TRIPLET/include"
-  fi
+  LIBCXX_HDR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
+  # libc++ headers FIRST (for stddef.h wrapper), then b1nix headers
+  EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $B1NIX_INC"
 else
-  EXTRA_FLAGS=""
+  EXTRA_FLAGS="-isystem $B1NIX_INC"
 fi
 
-n=$#
-while [ "$n" -gt 0 ]; do
-  a="$1"; shift; n=$((n - 1))
-  case "$a" in
-    -pthread) ;;                 # unsupported; pthread is in libb1nix
-    *) set -- "$@" "$a" ;;       # keep, preserving the exact argument
-  esac
-done
-# Mesa hard-codes -Werror=format in meson.build; on the 32-bit (i686) build the
-# printf width checks trip (e.g. %x vs GLuint which is `long` there — draw.c).
-# A general -Wno-error does NOT override a specific -Werror=format, so un-promote
-# the format warnings specifically, last. Keep -Wformat itself ON (disabling it
-# makes -Wformat-security complain "ignored without -Wformat"). This is a port,
-# not Mesa development; harmless on x86_64 (already builds clean).
+if [ "$IS_LINK" -eq 1 ]; then
+  EXTRA_FLAGS="$EXTRA_FLAGS -fuse-ld=lld -Wl,--sysroot=$CROSS"
+fi
+
 # shellcheck disable=SC2086
-exec "$real" $EXTRA_FLAGS "$@" -Wno-error=format -Wno-error=format-security
+exec "$real" $EXTRA_FLAGS "$@"

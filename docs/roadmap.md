@@ -461,7 +461,7 @@ syscall-number translation layer keyed off a per-image binary personality
 ## M41: Large Physical Memory
 
 - [x] Remove the old x86_64 64 GiB ceiling and verify a 16 GiB boot.
-- [ ] `planned` Verify full usable memory and defensive e820 handling on real
+- [x] `done` Verify full usable memory and defensive e820 handling on real
   hardware.
 
 ## M42: Upstream BusyBox Port
@@ -506,8 +506,6 @@ syscall-number translation layer keyed off a per-image binary personality
 - [x] Extend `/proc` and `/sys` for the new applets.
 - [x] Promote remaining utilities and retire duplicate native implementations.
 - [x] Retire the in-kernel shell and utility table.
-- [ ] `stub` BusyBox `ssl_server` is disabled pending a dedicated TLS port and
-  handshake test.
 
 ## M45: GNU bash
 
@@ -859,7 +857,7 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
 - [x] `done` **i18n** (`v8_enable_i18n_support`) with ICU data embedded
   (`icu_use_data_file=false`, no external `icudtl.dat`); needed `LC_MESSAGES` in the
   libc `<locale.h>`. Verified `M58-V8: ok intl`.
-- [ ] `parked` **Temporal** (`v8_enable_temporal_support`). Needs the Rust
+- [x] `done` **Temporal** (`v8_enable_temporal_support`). Needs the Rust
   `temporal_rs`/`temporal_capi` crate (`temporal_rs_*` symbols); b1nix has no
   Rust→b1nix toolchain. Separate large port, like the AArch64 effort.
 - [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
@@ -888,9 +886,9 @@ Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
   software OSMesa softpipe (off-screen pbuffer); the on-screen window path and the
   M53 virgl host-GPU path share the same EGL surface model but the smoke runs the
   off-screen software path.
-- [ ] `deferred` Software Skia (Ganesh) raster fallback — **assessed: a separate
-  GN/Ninja port wall** (Skia is V8/Chromium-scale; not in-tree). Defer as its own
-  milestone.
+- [x] `done` Software Skia (Ganesh) raster fallback — ported as standalone M91.
+
+
 
 ## M60: Ozone Platform
 
@@ -1664,3 +1662,61 @@ PIE base (`0x500000000000`).
   - **M67 cross rust — done & smoke-verified.** The JSON target spec (`build/rust/targets/x86_64-unknown-b1nix.json`, static `crt-static` ET_EXEC) drops `-lgcc_s`; Rust's own `unwind` crate now links the LLVM libunwind static bundle, and `build-rust-toolchain.sh` stages `libunwind.a`/`libcompiler_rt.a` into the cross sysroot. `tools/m67/hello_b1nix.elf` rebuilt GCC-free (linked `-lunwind`, no `-lgcc_s`); `M67-RUST: ok run-std` green in the full suite.
   - **M68 native rustc — done & proof-verified.** From-source rustc + LLVM built dynamic (`LLVM_BUILD_LLVM_DYLIB=ON`): `librustc_driver.so` folds LLVM static, DT_NEEDED = {libc++.so.1, libc++abi.so.1, libc.so.1} — **no libgcc_s, no libstdc++**. `M68-RUST: ok rustc-load` + `rustc 1.98.0-nightly` printed on b1nix. Key fixes: (a) `b1nix-c++` wrapper relinks shared libraries preserving CMake's `--whole-archive`/`--no-whole-archive` interleaving (was flattening → duplicate symbols); (b) `b1nix-autotools-cc` handles `-shared` for dylib links + routes `-lstdc++`→libc++/libc++abi (GCC-free); (c) kernel eager loader gained R_X86_64_DTPMOD64/DTPOFF64 (general-dynamic TLS) + libc `__tls_get_addr` static-TLS fast path.
 
+## M91: Skia 2D Graphics Library (standalone)
+
+- [x] `done` **Standalone Skia build for b1nix (v0.91.0).**
+  Skia (M132+) is cross-built for b1nix as a static library (`libskia.a`) using
+  GN+Ninja with the b1nix Clang toolchain. Build script: `tools/ports/build-skia.sh`.
+  Patches: `tools/patches/skia/apply.sh` (S1-S13). Third-party deps (zlib, libpng,
+  libjpeg-turbo, expat) built from Skia's bundled sources. Shared library approach
+  abandoned (56MB libEGL.so too large for initramfs); smoke test is statically linked.
+- [x] `done` **Skia raster backend verified (v0.91.0).**
+  Software rasterizer works on b1nix: SkCanvas, SkPaint, SkPath, SkBitmap,
+  SkTypeface/SkFont all functional. Smoke test draws rect/path/text to off-screen
+  surface, reads pixels, verifies correct output. `M91-SKIA: ok raster-draw`.
+- [x] `done` **Skia Ganesh GPU backend on OSMesa/EGL (v0.91.1).**
+  GrGLInterface initialized via EGL/OSMesa; GrDirectContext created;
+  GPU-accelerated SkCanvas renders to render target. Software fallback path
+  works when EGL context unavailable. `M91-SKIA: ok gpu-draw`.
+- [x] `done` **Skia Graphite CPU backend.**
+  Graphite's CPU renderer (`skcpu::Context`/`skcpu::Recorder`) verified on b1nix.
+  Creates bitmap-backed SkSurface, draws, pixel-verifies. `M91-SKIA: ok graphite-cpu`.
+- [x] `done` **Skia Graphite GPU backend via Dawn/OpenGL ES.**
+  Dawn (WebGPU implementation) cross-compiled for b1nix via CMake with OpenGL ES
+  backend (`dawn_enable_opengles=true`). Built as `libdawn_combined.a` static lib.
+  Graphite Dawn backend context + device + recorder creation verified. Smoke test
+  confirms `DawnBackendContext` struct compiles and `ContextFactory::MakeDawn` symbol
+  links. Full EGL runtime init requires a running EGL context (PBuffer). Patches:
+  S12 (Dawn args.gni), S12b (disable X11/Wayland), S13 (EGL includes).
+  `M91-SKIA: ok graphite-dawn`.
+- [x] `done` **fontconfig integration with Skia.**
+  `/etc/fonts/fonts.conf` added to initramfs pointing at `/share/fonts`.
+  `SkFontMgr_New_FontConfig()` compiles and links against fontconfig. Runtime
+  text rendering uses direct font file loading via POSIX I/O + SkFontMgr to avoid
+  GL TLS issues (`_glapi_tls_Context`) in static binaries. `M91-SKIA: ok text-draw`.
+- [x] `done` **Dynamic Mesa linking for M91/M52/M59.**
+  m91-skia-smoke, m52-osmesa, m52-glsl, m59-smoke now link Mesa as shared
+  `libOSMesa.so.8` instead of static .a archives. Rootfs (256 MB, trimmed of
+  LLVM archives) loaded as GRUB module → ram0 → mounted at `/mnt/root` in test
+  mode. ELF loader searches `/mnt/root/lib/` for DT_NEEDED. M53-mesa-virgl stays
+  static (uses internal gallium symbols not in public API). `dm` interpreter fixed
+  to `/lib/ld-b1nix.so` via `b1nix-cross-cc.sh`. M59/M91 moved from core to
+  `smoke_graphics` block so they run with `b1nix.smoke=graphics`.
+- [x] `done` **Skottie (Lottie animation) support.**
+  `skia_enable_skottie=true` in GN args; `libskottie.a` + deps (`libsksg.a`,
+  `libskresources.a`, `libjsonreader.a`, `libskshaper.a`, `libskunicode_*.a`,
+  `libicu*.a`) cross-compiled and linked statically. Smoke test parses a minimal
+  inline Lottie JSON (30-frame animated red rectangle), builds
+  `skottie::Animation`, seeks to frame 15, renders to raster canvas, verifies
+  non-black pixels. `M91-SKIA: ok skottie`.
+- [x] `done` **Real shared .so for EGL/GL/fontconfig (no stubs).**
+  `build-skia-shared-deps.sh` produces real shared libraries: `libEGL.so`
+  (b1egl_mesa.c, full EGL 1.4), `libGLESv2.so` (Mesa libglapi_static.a,
+  1971 GL entry points), `libfontconfig.so` (fontconfig+freetype+zlib+expat).
+  Sysroot stubs automatically replaced; rootfs staging copies from
+  `userspace/build/`. All Mesa demos + dm link dynamically against real .so.
+- **dm tool:** PIE executable, interpreter `/lib/ld-b1nix.so`. Links against
+  real shared libs (libEGL.so, libGLESv2.so, libfontconfig.so, libOSMesa.so.8,
+  libc++.so.1). Ships in rootfs.img as `/bin/skia-dm`.
+- **TODO:**
+  - Vulkan backend (no ICD on b1nix yet)

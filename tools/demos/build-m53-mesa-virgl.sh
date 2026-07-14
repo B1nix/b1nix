@@ -63,11 +63,25 @@ else
   CRT_LIBS="$LIBGCC_CROSS"
 fi
 
-# shellcheck disable=SC2046,SC2086
+# M53 virgl uses internal Mesa symbols (util_make_*_shader) not in libOSMesa.so,
+# so link statically against the .a archives.
+MESA_BUILD="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/meson"
+MESA_A_LIST=""
+for a in $(find "$MESA_BUILD" -name "*.a" ! -name "libglsl_standalone.a" ! -name "libgtest.a" 2>/dev/null | sort); do
+  MESA_A_LIST="$MESA_A_LIST $a"
+done
+OSMESA_TARGET="$MESA_BUILD/src/gallium/targets/osmesa/libOSMesa.so.8.0.0.p/target.c.o"
+ZLIB_A="$ROOT_DIR/build/zlib-b1nix/$B1NIX_TRIPLET/install/lib/libz.a"
+[ ! -f "$ZLIB_A" ] && ZLIB_A="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib/libz.a"
+# shellcheck disable=SC2086
 "$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
   -z norelro --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$OBJ" \
-  --start-group $(ls "$MESA"/lib/*.a) "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" --end-group \
+  --start-group $MESA_A_LIST \
+  ${OSMESA_TARGET:+"$OSMESA_TARGET"} \
+  ${ZLIB_A:+"$ZLIB_A"} \
+  "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" \
+  --end-group \
   $DYN_LIBC
 
 "$STRIP" "$OUT"

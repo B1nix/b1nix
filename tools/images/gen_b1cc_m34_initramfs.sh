@@ -31,10 +31,14 @@ done
 # Package real libm.a
 xxd -i -n vfs_b1cc_libm "$ROOT/build/openlibm-b1nix/$ARCH-b1nix/install/lib/libm.a" >> "$OUT"
 
-echo '#define B1CC_M34_INITRAMFS_FILES \\' >> "$OUT"
+# Generate B1CC_M34_INITRAMFS_FILES macro.
+# NOTE: Use printf for backslash-newline — echo ' \\' writes literal \\ (two
+# backslashes) which is NOT a C line continuation.  printf '\\\n' writes one \.
+printf '%s\n' '#define B1CC_M34_INITRAMFS_FILES \' >> "$OUT"
 printf '    {"/bin/b1cc_m34_corpus", (const char *)vfs_b1cc_m34_runner, sizeof(vfs_b1cc_m34_runner), INITRAMFS_EXECUTABLE},' >> "$OUT"
-echo ' \\' >> "$OUT"
+printf '\\\n' >> "$OUT"
 printf '    {"/lib/b1cc/libm.a", (const char *)vfs_b1cc_libm, sizeof(vfs_b1cc_libm), 0},' >> "$OUT"
+printf '\\\n' >> "$OUT"
 
 for src in \
   return_42 precedence local if_else while for function string_pointer \
@@ -43,14 +47,14 @@ for src in \
   m34_vla_loop m34_hideset_recursion m34_va_copy m34_weak_symbol m34_headers \
   m34_runtime puts m10_switch m11_globals m18_aggregates; do
     var="vfs_b1cc_m34_${src}"
-    echo ' \\' >> "$OUT"
+    printf '\\\n' >> "$OUT"
     printf '    {"/tests/m34/%s.c", (const char *)%s, sizeof(%s), 0},' "$src" "$var" "$var" >> "$OUT"
 done
 
 for h in $HEADERS; do
     rel_path=${h#$ROOT/userspace/include/}
     var_name="vfs_b1cc_hdr_$(echo "$rel_path" | tr '/.-' '___')"
-    echo ' \\' >> "$OUT"
+    printf '\\\n' >> "$OUT"
     printf '    {"/include/%s", (const char *)%s, sizeof(%s), 0},' "$rel_path" "$var_name" "$var_name" >> "$OUT"
 done
 echo >> "$OUT"

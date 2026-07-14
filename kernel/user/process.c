@@ -117,7 +117,11 @@ struct elf64_sym {
 #define ELF64_ST_BIND(info) ((info) >> 4)
 #define STB_WEAK 2
 #define SHN_UNDEF 0
-#define DYN_MAX_OBJECTS 8
+/* Deep dependency graphs (e.g. the Skia demo: exe + libskia + libraw_ptr +
+ * libfontconfig + libb1gui + libc++ + libc++abi + libc + libGLESv2 + libEGL +
+ * libgcc_s = 11 objects) need headroom above the old rustc-era limit of 8.
+ * objects[] lives on the 64 KiB kernel stack, so 16 is comfortably safe. */
+#define DYN_MAX_OBJECTS 16
 #define DYN_MAX_NEEDED 8
 
 struct elf64_dyn_object {
@@ -1501,6 +1505,15 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
             goto cleanup;
           memcpy(libpath, "/lib/", 5);
           memcpy(libpath + 5, name, name_len + 1);
+          loaded = elf64_load_shared_object(image, libpath, lib_base,
+                                            &objects[object_count]);
+        }
+        /* 3) rootfs at /mnt/root/lib (test-mode ram0 mount) */
+        if (loaded != 0) {
+          if (name_len + 15 > sizeof(libpath))
+            goto cleanup;
+          memcpy(libpath, "/mnt/root/lib/", 14);
+          memcpy(libpath + 14, name, name_len + 1);
           loaded = elf64_load_shared_object(image, libpath, lib_base,
                                             &objects[object_count]);
         }

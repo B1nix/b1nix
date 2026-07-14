@@ -702,10 +702,14 @@ void kernel_main(usize arg0, usize arg1)
 					}
 				}
 				if (rc != 0) {
-					if (!test_mode)
-						rc = vfs_mount("ram0", "/", "ext4", 0);
+					const char *ram0_target = test_mode ? "/mnt/root" : "/";
+					rc = vfs_mount("ram0", ram0_target, "ext4", 0);
 					if (rc == 0) {
-						console_write("rootfs: ram0 mounted at / (Live CD)\n");
+						if (test_mode) {
+							console_write("rootfs: ram0 mounted at /mnt/root (test mode)\n");
+						} else {
+							console_write("rootfs: ram0 mounted at / (Live CD)\n");
+						}
 						vfs_repopulate_after_root_mount();
 					} else {
 						char mount_err_buf[64];

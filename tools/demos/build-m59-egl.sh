@@ -74,11 +74,16 @@ else
   CRT_LIBS="$LIBGCC_CROSS"
 fi
 
+# Link Mesa as shared library (-lOSMesa).
+MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
 # shellcheck disable=SC2086
 "$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
-  "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" "$MESA/lib/osmesa_target.o" \
-  --start-group $(ls "$MESA"/lib/*.a) "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" \
-  --whole-archive "$UB/libb1gui.a" --no-whole-archive --end-group $DYN_LIBC
+  "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" \
+  -L "$MESA_LIB" \
+  --start-group \
+  "$STDLIB_CROSS_A" "$STDLIB_ABI_CROSS_A" $CRT_LIBS "$LIBM" \
+  --whole-archive "$UB/libb1gui.a" --no-whole-archive \
+  --end-group -lOSMesa $DYN_LIBC
 
 "$STRIP" "$OUT"

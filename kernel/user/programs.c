@@ -1659,20 +1659,6 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
-  /* M59: a real EGL app over the Mesa OSMesa softpipe renders a triangle into
-   * an off-screen pbuffer through the standard egl* API and verifies the
-   * read-back pixels. Off-screen, so no displayd needed — runs in core. */
-  {
-    u64 m59_pid =
-        syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m59-smoke", 0, 0, 0, 0, 0);
-    if ((isize)m59_pid < 0) {
-      uwrite("M59-SMOKE: spawn-fail\n");
-    } else {
-      int m59_status = 0;
-      syscall_dispatch(SYS_WAIT, m59_pid, (u64)(usize)&m59_status, 0, 0, 0, 0);
-    }
-  }
-
   /* M32: select() / network multiplexing. */
   {
     u64 m32_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m32-smoke", 0,
@@ -2309,6 +2295,32 @@ static int init_main(int argc, const char **argv) {
     } else {
       int fc_status = 0;
       syscall_dispatch(SYS_WAIT, fc_pid, (u64)(usize)&fc_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M59: a real EGL app over the Mesa OSMesa softpipe renders a triangle into
+   * an off-screen pbuffer through the standard egl* API and verifies the
+   * read-back pixels. Off-screen, so no displayd needed. */
+  {
+    u64 m59_pid =
+        syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m59-smoke", 0, 0, 0, 0, 0);
+    if ((isize)m59_pid < 0) {
+      uwrite("M59-SMOKE: spawn-fail\n");
+    } else {
+      int m59_status = 0;
+      syscall_dispatch(SYS_WAIT, m59_pid, (u64)(usize)&m59_status, 0, 0, 0, 0);
+    }
+  }
+
+  /* M91: Skia 2D graphics library smoke test. Off-screen, no displayd needed. */
+  {
+    u64 m91_pid =
+        syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m91-skia-smoke", 0, 0, 0, 0, 0);
+    if ((isize)m91_pid < 0) {
+      uwrite("M91-SKIA: spawn-fail\n");
+    } else {
+      int m91_status = 0;
+      syscall_dispatch(SYS_WAIT, m91_pid, (u64)(usize)&m91_status, 0, 0, 0, 0);
     }
   }
 

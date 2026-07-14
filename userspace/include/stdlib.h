@@ -99,6 +99,10 @@ static inline unsigned long long strtoull_l(const char *nptr, char **endptr, int
 }
 #endif
 void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, const void *));
+/* C11 Annex K: qsort_s — sorting with context parameter.
+ * Linux/glibc signature: context arg is last to qsort_s, first to comparator. */
+void qsort_s(void *base, size_t nmemb, size_t size,
+             int (*compar)(const void *, const void *, void *), void *arg);
 char *getenv(const char *name);
 int   putenv(char *string);
 int   setenv(const char *name, const char *value, int overwrite);
@@ -228,3 +232,6 @@ const char *getprogname(void);
 #endif
 
 #endif
+#include <stdint.h>
+uint32_t arc4random(void);
+void arc4random_buf(void *buf, size_t nbytes);

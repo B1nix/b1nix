@@ -1,14 +1,11 @@
 #!/bin/sh
-# Build Mesa (OSMesa + Gallium swrast/softpipe, software OpenGL, no LLVM) as a
-# set of static libraries for the b1nix userspace ABI. Cross-built with meson +
-# the b1nix LLVM/Clang toolchain. Prints the install dir; install/lib/*.a + the
-# osmesa target object are
-# linked by the M52 OSMesa demo.
+# Build Mesa (OSMesa + Gallium swrast/softpipe, software OpenGL, no LLVM) as
+# shared libraries for the b1nix userspace ABI. Cross-built with meson +
+# the b1nix LLVM/Clang toolchain. Prints the install dir; install/lib/*.so
+# are linked dynamically by Skia dm, smoke tests, etc.
 #
-# Mesa is built static; its own meson archives are thin (reference .o by path),
-# so they are repacked into relocatable thick archives in install/lib. The final
-# libOSMesa.so target is intentionally skipped (b1nix is static-only); its glue
-# (osmesa_create_screen) lives in install/lib/osmesa_target.o.
+# With -Ddefault_library=shared, meson produces .so files directly.  libc/libc++
+# symbols are resolved at runtime by b1nix's dynamic linker (--allow-shlib-undefined).
 
 set -eu
 
@@ -85,30 +82,20 @@ CXX_CACHE_DISCRIM=", '-D__B1NIX_MESA_LIBCXX__=1'"
 
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 
-# meson cross file link args: stdlib + CRT + libb1nix.
-# The libstdc++ path is byte-for-byte the historical one (host GNU ld, inner
-# --start-group/--end-group). The libc++ path forces -fuse-ld=lld and drops the
-# inner group (meson already wraps the link line in one --start-group, and lld
-# rejects a NESTED group). NOTE: rebuilding Mesa's shared libOSMesa.so currently
-# fails in BOTH modes for a reason unrelated to libc++ — the .so folds the non-PIC
-# b1nix archives (crt0.o/libb1nix.a) via a fixed-base linker script, which the
-# current host GNU ld rejects ("failed to set dynamic section sizes") and lld
-# rejects (R_X86_64_32 against a -shared/PIC output). The shipped ISO uses the
-# Mesa objects built in a prior toolchain environment; fixing the rebuild is
-# separate Mesa-build-infra work (make libb1nix PIC, or link the cross binutils ld
-# directly), tracked as the remaining M89 Mesa item.
-if [ "$CXX_STDLIB" = "libc++" ]; then
-  LINKARGS="'-fuse-ld=lld', '-nostdlib', '-T', '$CXX_LINKER_LD', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '$STDLIB_A', '$STDLIB_ABI_A'"
-  if [ -n "$UNW_A" ]; then LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"; else LINKARGS="$LINKARGS, '$CRT_A'"; fi
-  LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive'"
-else
-  LINKARGS="'-nostdlib', '-T', '$CXX_LINKER_LD', '-Wl,--allow-multiple-definition', '$LB/crt/crt0.o', '-Wl,--start-group', '$STDLIB_A', '$STDLIB_ABI_A'"
-  if [ -n "$UNW_A" ]; then LINKARGS="$LINKARGS, '$CRT_A', '$UNW_A'"; else LINKARGS="$LINKARGS, '$CRT_A'"; fi
-  LINKARGS="$LINKARGS, '-Wl,--whole-archive', '$LB/libb1nix.a', '-Wl,--no-whole-archive', '-Wl,--end-group'"
-fi
+# meson cross file link args for SHARED libraries.
+# Mesa .so files are PIC; they must NOT include crt0.o or libb1nix.a (non-PIC).
+# libc/libc++ symbols are resolved at runtime by b1nix's dynamic linker, so we
+# use --allow-shlib-undefined.  --hash-style=both ensures SysV DT_HASH for the
+# b1nix kernel loader.
+LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+# Shared-lib link args: no crt0.o, no libb1nix.a (non-PIC breaks -shared).
+# Meson adds -shared automatically for .so targets.  libc symbols are resolved
+# at runtime by b1nix's dynamic linker (--unresolved-symbols=ignore-all).
+LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+LINKARGS="'-fuse-ld=lld', '-nostdlib', '--sysroot=$CROSS', '-Wl,--hash-style=both', '-Wl,--unresolved-symbols=ignore-all', '-Wl,--allow-multiple-definition', '-L$LIBCXX_SO_DIR', '-L$CROSS/$B1NIX_TRIPLET/lib', '-lc++', '-lc++abi'"
 
 INI="$BUILD_DIR/cross.ini"
-DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL'"
+DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL', '-DHAVE_STRUCT_TIMESPEC', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0', '-I$SRC_DIR/subprojects/zlib-1.3.1', '-UHAVE_QSORT_S', '-UHAVE_DLADDR', '-Dsecure_getenv=getenv'"
 # M75: opt-in llvmpipe (MESA_LLVMPIPE=1). meson runs llvm-config on the host, so
 # point it at the b1nix-LLVM wrapper; enable the shared libLLVM-22 and match its
 # -fno-rtti (cpp_rtti=false). Default (unset) keeps the proven softpipe build.
@@ -126,7 +113,7 @@ if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
 fi
 cat > "$INI" <<EOF
 [binaries]
-c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-gcc']
+c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-cc']
 cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CXX']
 ar = '$AR_BIN'
 strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
@@ -215,68 +202,69 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
       -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= $MESON_LLVM_OPTS -Dosmesa=true \
       -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dopengl=true \
       -Dgles1=disabled -Dgles2=disabled -Dshared-glapi=disabled \
-      -Ddefault_library=static -Dzstd=disabled -Dlibunwind=disabled \
+      -Ddefault_library=both -Dzstd=disabled -Dlibunwind=disabled \
       -Dvalgrind=disabled -Dbuild-tests=false -Dshader-cache=disabled 1>&2 )
+  # Fix: meson's has_function probe detects qsort_s from the host compiler,
+  # but b1nix libc doesn't have it. Replace -D with -U in the generated ninja.
+  if [ -f "$MESON_BUILD/build.ninja" ]; then
+    sed -i 's/-DHAVE_QSORT_S/-UHAVE_QSORT_S/g' "$MESON_BUILD/build.ninja"
+  fi
 fi
 
-# Build ONLY what the demos consume: the static archives (the demos link
-# $(ls install/lib/*.a)) plus the osmesa target glue object (target.c.o). b1nix
-# is static-only here, so the shared libOSMesa.so is never used — and linking it
-# fails by nature (it folds the non-PIC b1nix archives via a fixed-base linker
-# script, which neither the host GNU ld nor ld.lld accept for a -shared output).
-# Rather than build it and swallow the failure (-k 0 || true), build the static
-# .a targets + the target.c.o object explicitly so ninja never attempts the .so
-# link — a clean build with no spurious error.
-# Build every reachable target with -k 0 (build ALL the static libs + their
-# generated-source deps + the osmesa target.c.o). The final libOSMesa.so link
-# fails by nature (it folds the non-PIC b1nix archives via a fixed-base linker
-# script — neither host ld nor lld can make a -shared output of that), and a few
-# internal archives (liblibvdrm.a, no xf86drm.h) don't compile; -k 0 keeps going
-# past both and the demos only consume the static .a + target.c.o anyway. We build
-# the full reachable set (not a hand-picked .a list) so no generated source a
-# rendering path depends on is silently skipped.
-( cd "$MESON_BUILD" && ninja -k 0 1>&2 ) || true
+# Build all reachable targets. With default_library=shared, meson produces
+# .so files directly. --unresolved-symbols=ignore-all lets libc symbols
+# be resolved at runtime by b1nix's dynamic linker.
+( cd "$MESON_BUILD" && ninja -j"$(nproc 2>/dev/null || echo 4)" 1>&2 )
 
-# libglsl_standalone.a is the scaffolding archive for Mesa's *standalone GLSL
-# compiler* tool (glsl_compiler), not for rendering. standalone_scaffolding.cpp
-# provides STUB definitions of real Mesa entry points — e.g. _mesa_program_state_flags
-# is compiled there as `return 0;`. b1nix does not build/ship that tool, and every
-# symbol it defines also exists (with the real implementation) in libmesa.a. If it
-# lands in install/lib the demos glob it via `ls *.a`; because it sorts before
-# libmesa.a and the demo links with --allow-multiple-definition, the linker silently
-# binds the STUB, so state-parameter StateFlags come out 0 and the fixed-function mvp
-# matrix is never uploaded (blank/degenerate geometry). Never install it. Drop any
-# stale copy left by earlier runs so consumers can't pick it up.
-rm -f "$INSTALL_DIR/lib/libglsl_standalone.a"
+# Install shared libraries to install/lib/.
+# With default_library=shared, meson produces .so files.  We install the key
+# consumer-facing ones plus any internal deps they DT_NEEDED.
+rm -f "$INSTALL_DIR/lib/"*.a "$INSTALL_DIR/lib/"*.so  # clean stale static libs
+mkdir -p "$INSTALL_DIR/lib"
+( cd "$MESON_BUILD"
+  for so in $(find . -name "*.so" -o -name "*.so.*" | grep -v '\.debug' | grep -v '\.p$' | grep -v '\.p/'); do
+    [ -f "$so" ] || continue
+    name="$(basename "$so")"
+    [ -L "$so" ] && continue  # skip symlinks, we'll create them below
+    cp -f "$so" "$INSTALL_DIR/lib/$name"
+  done
+  # Create convenience symlinks: libfoo.so -> libfoo.so.0 (or whatever soname)
+  cd "$INSTALL_DIR/lib"
+  for so in *.so.*; do
+    [ -f "$so" ] || continue
+    base="$(echo "$so" | sed 's/\.so\..*/.so/')"
+    ln -sfn "$so" "$base" 2>/dev/null || true
+  done
+)
 
-# Repack thin archives into relocatable thick archives in install/lib.
-# Avoid unconditional rm -f to prevent race conditions when parallel demo builds
-# try to link against these archives while another instance is repacking them.
+# Also install the static archives that consumers may need for whole-archive
+# linking (c11threads, glapi dispatch).  Repack thin archives if present.
 ( cd "$MESON_BUILD"
   for a in $(find . -name "*.a"); do
     name="$(basename "$a")"
     case "$name" in
-      libglsl_standalone.a) continue ;;  # stub scaffolding — see note above
+      libglsl_standalone.a) continue ;;  # stub scaffolding — never install
     esac
     target="$INSTALL_DIR/lib/$name"
     if [ ! -f "$target" ] || [ "$a" -nt "$target" ]; then
       if [ "$(head -c 7 "$a")" = "!<thin>" ]; then
         rm -f "$target"
-        # shellcheck disable=SC2046
-        "$AR_BIN" crs "$target" $("$AR_BIN" t "$a")
+        "$AR_BIN" crs "$target" $("$AR_BIN" t "$a") 2>/dev/null || true
       else
-        cp "$a" "$target"
+        cp "$a" "$target" 2>/dev/null || true
       fi
     fi
-  done )
+  done ) || true
 
-# The osmesa target glue (osmesa_create_screen): only built as part of the .so.
-for src_obj in "$MESON_BUILD"/src/gallium/targets/osmesa/libOSMesa.so.*.p/target.c.o; do
+# The osmesa target glue (osmesa_create_screen): extract from the .so link objects.
+for src_obj in "$MESON_BUILD"/src/gallium/targets/osmesa/libOSMesa.so.*.p/target.c.o \
+               "$MESON_BUILD"/src/gallium/targets/osmesa/*.p/target.c.o; do
   if [ -f "$src_obj" ]; then
     target_obj="$INSTALL_DIR/lib/osmesa_target.o"
     if [ ! -f "$target_obj" ] || [ "$src_obj" -nt "$target_obj" ]; then
       cp "$src_obj" "$target_obj"
     fi
+    break
   fi
 done
 

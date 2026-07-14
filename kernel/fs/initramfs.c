@@ -125,6 +125,18 @@
 #include "initramfs_m53_mesa_virgl.inc"
 #include "initramfs_m52_glsl.inc"
 #include "initramfs_m59_smoke.inc"
+#include "initramfs_m91_skia_smoke.inc"
+#include "initramfs_m91_skia_dm.inc"
+/* M91 Skia shared-library graph — x86_64 full build only (the registration
+ * table below is under the same #ifdef __x86_64__, and these .inc are large). */
+#if defined(__x86_64__) && !defined(MINIMAL_INITRAMFS)
+#include "initramfs_libskia.inc"
+#include "initramfs_libraw_ptr.inc"
+#include "initramfs_libfontconfig.inc"
+#include "initramfs_libGLESv2.inc"
+#include "initramfs_libEGL.inc"
+#include "initramfs_libb1gui.inc"
+#endif
 #ifdef __x86_64__
 #include "initramfs_m64_clang_smoke.inc"
 #endif
@@ -823,6 +835,18 @@ static const char initramfs_inittab[] =
     "desktop:5:respawn:/bin/gdesktop\n"
     "ca::ctrlaltdel:/bin/reboot\n"
     "sd::shutdown:/etc/rc.shutdown\n";
+
+/* Fontconfig system configuration. Skia's SkFontMgr_New_FontConfig() calls
+ * FcInitLoadConfigAndFonts() which reads /etc/fonts/fonts.conf. Without this
+ * file, fontconfig falls back to compiled-in defaults with empty FC_FONTPATH,
+ * causing FcFontList() to return patterns with invalid FC_FILE pointers →
+ * SIGSEGV in SkFontMgr_fontconfig::FontAccessible(). */
+static const char initramfs_etc_fonts_conf[] =
+    "<?xml version=\"1.0\"?>\n"
+    "<fontconfig>\n"
+    "  <dir>/share/fonts</dir>\n"
+    "  <cachedir>/tmp/fontcache</cachedir>\n"
+    "</fontconfig>\n";
 
 /* Resolver configuration. The kernel DNS client parses the first
  * "nameserver" line lazily (kernel/net/dns.c); 10.0.2.3 is the QEMU
@@ -1663,9 +1687,24 @@ static const struct initramfs_file files[] = {
     {"/lib/libc++.so.1", (const char *)vfs_libcxx_elf,
      sizeof(vfs_libcxx_elf), INITRAMFS_EXECUTABLE},
     {"/lib/libc++.so", "/lib/libc++.so.1", 17, INITRAMFS_SYMLINK},
-    {"/lib/libc++abi.so.1", (const char *)vfs_libcxxabi_elf,
-     sizeof(vfs_libcxxabi_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc++abi.so.1", (const char *)vfs_libcxxabi_so1,
+     sizeof(vfs_libcxxabi_so1), INITRAMFS_EXECUTABLE},
     {"/lib/libc++abi.so", "/lib/libc++abi.so.1", 20, INITRAMFS_SYMLINK},
+    {"/lib/libskia.so", (const char *)vfs_libskia_so,
+     sizeof(vfs_libskia_so), INITRAMFS_EXECUTABLE},
+    {"/lib/libraw_ptr.so", (const char *)vfs_libraw_ptr_so,
+     sizeof(vfs_libraw_ptr_so), INITRAMFS_EXECUTABLE},
+    {"/lib/libfontconfig.so", (const char *)vfs_libfontconfig_so,
+     sizeof(vfs_libfontconfig_so), INITRAMFS_EXECUTABLE},
+    /* Skia's Ganesh GL backend DT_NEEDEDs libGLESv2.so/libEGL.so; these are
+     * thin b1nix stubs (the real GL/EGL entrypoints are folded into the Skia
+     * demo executable over Mesa OSMesa and exported via --export-dynamic). */
+    {"/lib/libGLESv2.so", (const char *)vfs_libGLESv2_so,
+     sizeof(vfs_libGLESv2_so), INITRAMFS_EXECUTABLE},
+    {"/lib/libEGL.so", (const char *)vfs_libEGL_so,
+     sizeof(vfs_libEGL_so), INITRAMFS_EXECUTABLE},
+    {"/lib/libb1gui.so", (const char *)vfs_libb1gui_so,
+     sizeof(vfs_libb1gui_so), INITRAMFS_EXECUTABLE},
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -1724,6 +1763,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m52_glsl_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m59-smoke", (const char *)vfs_m59_smoke_elf,
      sizeof(vfs_m59_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m91-skia-smoke", (const char *)vfs_m91_skia_smoke_elf,
+     sizeof(vfs_m91_skia_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/skia-dm", (const char *)vfs_m91_skia_dm_elf,
+     sizeof(vfs_m91_skia_dm_elf), INITRAMFS_EXECUTABLE},
 #ifdef __x86_64__
     {"/bin/m64-clang-smoke", (const char *)vfs_m64_clang_smoke_elf,
      sizeof(vfs_m64_clang_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -1778,6 +1821,8 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     {"/etc/init.d/sshd", initramfs_sshd_service, sizeof(initramfs_sshd_service) - 1, INITRAMFS_EXECUTABLE},
     {"/etc/fstab", initramfs_fstab, sizeof(initramfs_fstab) - 1, 0},
+    {"/etc/fonts/fonts.conf", initramfs_etc_fonts_conf,
+     sizeof(initramfs_etc_fonts_conf) - 1, 0},
     {"/etc/resolv.conf", initramfs_resolv_conf,
      sizeof(initramfs_resolv_conf) - 1, 0},
     {"/etc/ssl/certs/ca-certificates.crt", (const char *)vfs_cacert_pem,

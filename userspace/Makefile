@@ -241,7 +241,7 @@ $(DYNAMIC_CRT0): crt/crt0.S
 # ── libc objects ──
 $(BUILD)/libc/%.o: libc/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 $(BUILD)/libc-pic/%.o: libc/%.c
 	@mkdir -p $(dir $@)
@@ -249,7 +249,7 @@ $(BUILD)/libc-pic/%.o: libc/%.c
 
 $(BUILD)/libgui/%.o: libgui/%.c
 	@mkdir -p $(dir $@)
-	$(CC) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS) -fPIC -c $< -o $@
 
 # ── libb1nix.a ──
 $(LIB): $(LIBC_OBJS)

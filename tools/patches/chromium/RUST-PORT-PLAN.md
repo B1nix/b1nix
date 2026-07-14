@@ -125,7 +125,8 @@ what surfaces the pre-existing toolchain bug.
      `//build/config/rust.gni` `rust_abi_target` must match this triple.
    - Provide the cross linker (`x86_64-b1nix-gcc`) to Rust via `[target.<triple>]
      linker` in a cargo/config or the gn `rust_*` linker var.
-4. **Update graphify** after the branch closes (`/graphify --update`).
+4. **Re-index the knowledge graph** after the branch closes
+   (`index_repository(mode="full")` via the codebase-memory MCP).
 
 ## Open items / known limits
 
