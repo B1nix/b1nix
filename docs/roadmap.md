@@ -1720,3 +1720,52 @@ PIE base (`0x500000000000`).
   libc++.so.1). Ships in rootfs.img as `/bin/skia-dm`.
 - **TODO:**
   - Vulkan backend (no ICD on b1nix yet)
+
+## M92: musl libc Port
+
+- `planned` **Linux ABI expansion: ~30 missing syscall mappings for musl.**
+  musl on x86_64 defaults to modern Linux syscall variants (*at() family, pipe2,
+  dup3, ppoll, pselect6, accept4, clock_nanosleep) instead of legacy calls. The
+  existing Linux ABI layer (`linux_abi.c`) maps ~76 numbers; musl needs ~30 more.
+  All *at() calls can map to existing b1nix handlers with AT_FDCWD dirfd pass-
+  through. pipe2/dup3/accept4 are thin wrappers around pipe/dup2/accept + fcntl.
+  Full list: openat(257), newfstatat(262), unlinkat(263), mkdirat(258),
+  renameat2(316), linkat(265), symlinkat(266), readlinkat(267), fchmodat(268),
+  fchownat(260), faccessat(269), pipe2(293), dup3(292), ppoll(271),
+  pselect6(270), accept4(288), clock_nanosleep(230), set_tid_address(435),
+  prlimit64(434), set_robust_list(300), get_robust_list(301).
+  See [`musl-port.md`](musl-port.md) §1 for the full mapping table.
+
+- `planned` **Futex expansion: WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE.**
+  Current futex (`kernel/sched/futex.c`) supports only WAIT/WAKE. musl pthread
+  condvar needs WAIT_BITSET(9) + WAKE_BITSET(10) for clock-aware waits, and
+  REQUEUE(4)/CMP_REQUEUE(8) for efficient broadcast. FUTEX_PRIVATE_FLAG(0x80)
+  accepted as no-op (all b1nix futexes are already private). See `musl-port.md` §5.
+
+- `planned` **clone: add CLONE_PARENT_SETTID + CLONE_CHILD_SETTID.**
+  musl pthread_create writes the child TID to parent and child locations via
+  these flags. Without them pthread_join may hang. Add handlers in
+  `scheduler_clone_thread()`. See `musl-port.md` §4.
+
+- `planned` **ELF auxv: populate 12+ missing entries.**
+  Loader populates only AT_NULL, AT_PHDR(=0!), AT_ENTRY, AT_B1NIX_DSO_INIT.
+  Without AT_RANDOM the stack canary is uninitialized (printf crashes). Add
+  AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_CLKTCK, AT_UID/EUID/GID/EGID,
+  AT_RANDOM, AT_HWCAP, AT_SECURE, AT_EXECFN. Fix AT_PHDR (currently hardcoded
+  to 0). See `musl-port.md` §3.
+
+- `planned` **Linux ABI struct translations: sigaction + termios.**
+  musl expects Linux x86_64 struct layouts. struct sigaction b1nix=32B vs
+  Linux=152B (sa_mask 8B vs 128B). struct termios b1nix=48B vs Linux=44B
+  (missing c_line, c_ispeed, c_ospeed; c_cc[32] vs c_cc[19]). Add translation
+  in the Linux ABI layer for both. See `musl-port.md` §2.
+
+- `planned` **Cross-compile musl as static libc and build integration.**
+  musl cross-builds via `configure --host=x86_64-b1nix` with the existing clang
+  toolchain. Produces `lib/libc.a`. Stage headers, add `b1nix-musl-cc` wrapper,
+  embed in initramfs. Static linking only (no dynamic linker yet).
+
+- `planned` **Musl smoke test: Hello world through pthread.**
+  Compile test programs against musl, verify in QEMU: (1) hello world (openat,
+  write, exit), (2) malloc/free (brk/mmap), (3) printf formatting (stdio),
+  (4) fork+exec, (5) pthread_create+join (futex, clone, TLS), (6) socket.
