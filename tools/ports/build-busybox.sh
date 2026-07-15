@@ -38,8 +38,12 @@ fi
 export PATH="$CROSS_PREFIX/bin:$PATH"
 
 # ── 0. Build & install userspace libc and headers to sysroot ──
-echo "Installing/updating userspace libc and headers in sysroot..."
-make -C "$PROJECT_DIR/userspace" install-headers-libs
+if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
+  (
+    flock -x 9
+    make -C "$PROJECT_DIR/userspace" install-headers-libs
+  ) 9>/tmp/b1nix-userspace-headers.lock
+fi
 
 # Workaround for spaces in path (e.g. "Documents/GitHub"): build tools like
 # BusyBox's make / autotools split EXTRA_*FLAGS on whitespace and don't

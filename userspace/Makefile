@@ -30,7 +30,7 @@ LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install
 # userspace/include/ would NOT trigger a recompile (observed: a struct-size
 # change to <unistd.h> left a stale statvfs.o, crashing BusyBox df on i686).
 # -MD records every header so header edits rebuild the affected objects.
-CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -MD -MP
+CFLAGS   := --target=$(TARGET) -ffreestanding -fno-builtin -fno-stack-protector -nostdinc -isystem include -I include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix -fno-pic -fno-pie -fdirect-access-external-data -MD -MP
 BUILD    := build/$(B1NIX_ARCH)
 ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 LIB      := $(BUILD)/libb1nix.a
@@ -209,13 +209,13 @@ $(warning b1cc sources not found at $(B1CC_SRCDIR) - skipping on-device /bin/b1c
 endif
 
 ifeq ($(B1NIX_ARCH),x86_64)
-BINARIES += $(BUILD)/bin/m30_dynamic
+BINARIES += $(BUILD)/bin/m30_dynamic $(BUILD)/bin/b1cc_selfsmoke
 DYNAMIC_TARGETS := $(SHARED_LIBC)
 endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke,$(BINARIES)))
 # Include the PIC libc objects' .d files too: libc.so.1 is built from
 # $(PIC_LIBC_OBJS), and without their header dependencies a change to a shared
 # header (e.g. the struct dirent layout in include/dirent.h) rebuilds the static

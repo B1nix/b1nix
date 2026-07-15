@@ -24,9 +24,8 @@ port_pre_configure() {
     echo "build-libpsl.sh: need host python3 (or set PYTHON=/path/to/python)" >&2
     exit 1
   fi
-  # Recreate build dir to avoid stale state
-  rm -rf "$BUILD_DIR"
-  mkdir -p "$BUILD_DIR"
+  # Recreate build dir contents to avoid stale state
+  rm -rf "$BUILD_DIR"/*
 }
 
 port_build() {

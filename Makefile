@@ -1,6 +1,7 @@
 .DEFAULT_GOAL := all
 ARCH ?= x86_64
 export B1NIX_ARCH := $(ARCH)
+export B1NIX_HEADERS_INSTALLED := 1
 # BUILD_ROOT isolates the per-task kernel/initramfs/ISO output. Override it to
 # build a second task (e.g. an M40 agent) without touching the main build:
 #   make BUILD_ROOT=build-m40 ARCH=x86_64 iso
@@ -9,9 +10,58 @@ export B1NIX_ARCH := $(ARCH)
 # SHARED and read-only across isolated builds — never rebuilt per task.
 BUILD_ROOT ?= build
 BUILD_DIR := $(BUILD_ROOT)/$(ARCH)
+USERSPACE_HDR_DEPS := $(BUILD_DIR)/.userspace-headers-installed
+USERSPACE_DEPS := $(BUILD_DIR)/.userspace-bins-built
 # Host triplet for the ported userspace toolchain + programs.
 # Keep this mapping in sync with tools/toolchain/env.sh.
 B1NIX_TRIPLET := x86_64-b1nix
+
+# Port library targets. Defined here at the top so they can be referenced in
+# dependency lists of targets further down (e.g. .userspace-bins-built).
+PCRE2_LIB := build/pcre2-b1nix/$(B1NIX_TRIPLET)/install/lib/libpcre2-8.a
+LIBM_LIB := build/openlibm-b1nix/$(B1NIX_TRIPLET)/install/lib/libm.a
+PIXMAN_LIB := build/pixman-b1nix/$(B1NIX_TRIPLET)/install/lib/libpixman-1.a
+FREETYPE_LIB := build/freetype-b1nix/$(B1NIX_TRIPLET)/install/lib/libfreetype.a
+CAIRO_LIB := build/cairo-b1nix/$(B1NIX_TRIPLET)/install/lib/libcairo.a
+XKB_LIB := build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install/lib/libxkbcommon.a
+WAYLAND_CLIENT_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-client.a
+WAYLAND_SERVER_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-server.a
+HB_LIB := build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install/lib/libharfbuzz.a
+EXPAT_LIB := build/expat-b1nix/$(B1NIX_TRIPLET)/install/lib/libexpat.a
+FONTCONFIG_LIB := build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install/lib/libfontconfig.a
+TINYGL_LIB := build/tinygl-b1nix/$(B1NIX_TRIPLET)/install/lib/libEGL.a
+ZLIB_LIB := build/zlib-b1nix/$(B1NIX_TRIPLET)/install/lib/libz.a
+LIBPNG_LIB := build/libpng-b1nix/$(B1NIX_TRIPLET)/install/lib/libpng16.a
+LIBJPEG_LIB := build/libjpeg-b1nix/$(B1NIX_TRIPLET)/install/lib/libjpeg.a
+LIBWEBP_LIB := build/libwebp-b1nix/$(B1NIX_TRIPLET)/install/lib/libwebp.a
+LIBVPX_LIB := build/libvpx-b1nix/$(B1NIX_TRIPLET)/install/lib/libvpx.a
+LWC_LIB := build/libwapcaplet-b1nix/$(B1NIX_TRIPLET)/install/lib/liblwc.a
+PU_LIB := build/libparserutils-b1nix/$(B1NIX_TRIPLET)/install/lib/libparserutils.a
+HUBBUB_LIB := build/libhubbub-b1nix/$(B1NIX_TRIPLET)/install/lib/libhubbub.a
+LIBCSS_LIB := build/libcss-b1nix/$(B1NIX_TRIPLET)/install/lib/libcss.a
+LIBDOM_LIB := build/libdom-b1nix/$(B1NIX_TRIPLET)/install/lib/libdom.a
+NSUTILS_LIB := build/libnsutils-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsutils.a
+NSGIF_LIB := build/libnsgif-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsgif.a
+NSBMP_LIB := build/libnsbmp-b1nix/$(B1NIX_TRIPLET)/install/lib/libnsbmp.a
+NSLOG_LIB := build/libnslog-b1nix/$(B1NIX_TRIPLET)/install/lib/libnslog.a
+OPENSSL_LIB := build/openssl-b1nix/$(B1NIX_TRIPLET)/install/lib/libssl.a
+LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
+LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
+LIBFFI_LIB := build/libffi-b1nix/$(B1NIX_TRIPLET)/install/lib/libffi.a
+LITEHTML_LIB := build/litehtml-b1nix/$(B1NIX_TRIPLET)/install/lib/liblitehtml.a
+MBEDTLS_LIB := build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install/lib/libmbedtls.a
+LIBUNISTRING_LIB := build/libunistring-b1nix/$(B1NIX_TRIPLET)/install/lib/libunistring.a
+
+# Ensure all port libraries depend on headers stamp so that they are compiled
+# only after libc.so.1 and headers are fully built and installed.
+$(LIBM_LIB) $(PCRE2_LIB) $(PIXMAN_LIB) $(FREETYPE_LIB) $(CAIRO_LIB) $(XKB_LIB) \
+$(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FONTCONFIG_LIB) $(TINYGL_LIB) \
+$(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(LIBWEBP_LIB) $(LIBVPX_LIB) \
+$(LWC_LIB) $(PU_LIB) $(HUBBUB_LIB) $(LIBCSS_LIB) $(LIBDOM_LIB) \
+$(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) $(LIBIDN2_LIB) \
+$(OPENSSL_LIB) $(LIBPSL_LIB) $(LIBFFI_LIB) \
+$(LITEHTML_LIB) $(MBEDTLS_LIB) $(LIBUNISTRING_LIB): $(USERSPACE_HDR_DEPS)
+
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
@@ -135,7 +185,14 @@ INITRAMFS_LIBCXXABI_INC := $(BUILD_DIR)/initramfs_libcxxabi.inc
 # M91: Mesa shared libraries are stored in rootfs.img (GRUB module), not in
 # the kernel initramfs (too large for clang source location limit).
 # See root-image target which copies .so files into $(BUILD_DIR)/rootfs/lib/.
-INITRAMFS_M91_SO_INCS :=
+INITRAMFS_M91_SO_INCS := \
+	$(BUILD_DIR)/initramfs_m91_skia_dm.inc \
+	$(BUILD_DIR)/initramfs_libskia.inc \
+	$(BUILD_DIR)/initramfs_libraw_ptr.inc \
+	$(BUILD_DIR)/initramfs_libfontconfig.inc \
+	$(BUILD_DIR)/initramfs_libGLESv2.inc \
+	$(BUILD_DIR)/initramfs_libEGL.inc \
+	$(BUILD_DIR)/initramfs_libb1gui.inc
 endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
@@ -513,7 +570,7 @@ $(APPLET_REGISTRATION_INC): $(APPLET_MANIFEST)
 # Anything in userspace libc/includes/crt that affects every embedded ELF.
 # Listed as prereqs of each *.inc so changes to libc force an xxd re-bundle —
 # otherwise initramfs ships with stale userspace and the kernel sees old libc.
-USERSPACE_DEPS := \
+$(BUILD_DIR)/.userspace-headers-installed: \
 	$(wildcard userspace/libc/*.c) \
 	$(wildcard userspace/libgui/*.c) \
 	$(wildcard userspace/include/*.h) \
@@ -524,6 +581,62 @@ USERSPACE_DEPS := \
 	$(wildcard userspace/crt/*.S) \
 	userspace/Makefile \
 	userspace/linker.ld
+	# Build libs + headers into sysroot in one serialized pass, then mark done.
+	# Port scripts check B1NIX_HEADERS_INSTALLED=1 and skip their own sub-makes.
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install-headers-libs
+	@touch $@
+
+# Second stamp: build ALL userspace binaries after libraries are ready.
+# .inc rules depend on this so they can safely xxd pre-built outputs without
+# spawning competing $(MAKE) -C userspace processes in parallel.
+#
+# IMPORTANT: This stamp MUST list every port library that userspace/Makefile
+# rules link against. Without these deps, the root-level parallel build can
+# invoke port build scripts at the same time as $(MAKE) -C userspace does
+# (which triggers the same port scripts internally) → corrupt concurrent builds.
+# After all ports are listed here, $(MAKE) -C userspace just compiles ELF
+# binaries and finds all libraries already present — no port script is invoked.
+#
+# Port libraries that are only ever referenced by .inc rules that already have
+# them as explicit dependencies (and NOT used directly by userspace/Makefile
+# targets) do NOT need to be listed here. Only list libs that userspace/Makefile
+# pulls in transitively (openlibm, wayland, libffi, pcre2, zlib, pixman,
+# freetype, cairo, xkbcommon, harfbuzz, fontconfig, expat, libjpeg, libpng,
+# libwebp, libvpx, all NetSurf platform libs, tinygl, libidn2).
+$(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
+	$(wildcard userspace/bin/*.c) $(wildcard userspace/bin/*.S) \
+	$(wildcard userspace/b1cc/src/*.c) \
+	$(wildcard userspace/displayd/*.c) \
+	$(wildcard userspace/tcc/*.c) \
+	$(wildcard userspace/duktape/duktape.c) \
+	$(LIBM_LIB) \
+	$(PCRE2_LIB) \
+	$(PIXMAN_LIB) \
+	$(FREETYPE_LIB) \
+	$(CAIRO_LIB) \
+	$(XKB_LIB) \
+	$(WAYLAND_CLIENT_LIB) \
+	$(HB_LIB) \
+	$(EXPAT_LIB) \
+	$(FONTCONFIG_LIB) \
+	$(TINYGL_LIB) \
+	$(ZLIB_LIB) \
+	$(LIBPNG_LIB) \
+	$(LIBJPEG_LIB) \
+	$(LIBWEBP_LIB) \
+	$(LIBVPX_LIB) \
+	$(LWC_LIB) \
+	$(PU_LIB) \
+	$(HUBBUB_LIB) \
+	$(LIBCSS_LIB) \
+	$(LIBDOM_LIB) \
+	$(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) \
+	$(LIBIDN2_LIB)
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
+	@touch $@
+
+
+
 
 $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
@@ -531,12 +644,10 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
 
 $(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/include/*.h)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
 	@mkdir -p $(dir $@)
 	sh tools/images/gen_tcc_initramfs.sh $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc_m34 build/$(ARCH)/bin/b1cc_m34_corpus
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
@@ -561,7 +672,7 @@ $(BUILD_DIR)/initramfs_%.inc: userspace/bin/%.c $(USERSPACE_DEPS)
 # USERSPACE_DEPS and the stale compiler binary gets shipped.
 B1CC_SELFHOST_SRCS := $(wildcard $(or $(B1CC_SRCDIR),userspace/b1cc/src)/*.c)
 $(BUILD_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc build/$(ARCH)/libb1nix.a build/$(ARCH)/crt/crt0.o build/$(ARCH)/crt/crt0-dynamic.o
+	@$(MAKE) -C userspace build/$(ARCH)/bin/b1cc
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_b1cc_elf userspace/build/$(ARCH)/bin/b1cc > $@
 	xxd -i -n vfs_b1cc_crt0 userspace/build/$(ARCH)/crt/crt0.o >> $@
@@ -572,7 +683,6 @@ $(BUILD_DIR)/initramfs_b1cc_selfhost.inc: $(USERSPACE_DEPS) $(B1CC_SELFHOST_SRCS
 # static mbedTLS archives that m32_nettool's tls-server links against, so curl
 # must build first to guarantee the libs exist.
 $(BUILD_DIR)/initramfs_m32_nettool.inc: userspace/bin/m32_nettool.c $(USERSPACE_DEPS) $(CURL_ELF)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_nettool
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m32_nettool_elf userspace/build/$(ARCH)/bin/m32_nettool > $@
 
@@ -592,13 +702,13 @@ $(LIBM_LIB): tools/ports/build-openlibm.sh
 $(BUILD_DIR)/initramfs_js.inc: userspace/bin/js.c userspace/duktape/duktape.c \
 		userspace/duktape/duktape.h userspace/duktape/duk_config.h \
 		$(USERSPACE_DEPS) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/js
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/js
 	xxd -i -n vfs_js_elf userspace/build/$(ARCH)/bin/js > $@
 
 $(BUILD_DIR)/initramfs_m51_smoke.inc: userspace/bin/m51_smoke.c $(USERSPACE_DEPS) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_smoke
 	xxd -i -n vfs_m51_smoke_elf userspace/build/$(ARCH)/bin/m51_smoke > $@
 
 # M51: pixman (generic C), cross-built static, linked into m51_pixman_smoke.
@@ -607,8 +717,8 @@ $(PIXMAN_LIB): tools/ports/build-pixman.sh tools/ports/build-openlibm.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-pixman.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_pixman_smoke.inc: userspace/bin/m51_pixman_smoke.c $(USERSPACE_DEPS) $(PIXMAN_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_pixman_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_pixman_smoke
 	xxd -i -n vfs_m51_pixman_smoke_elf userspace/build/$(ARCH)/bin/m51_pixman_smoke > $@
 
 # M51: FreeType (TrueType + smooth rasterizer), cross-built static.
@@ -617,23 +727,23 @@ $(FREETYPE_LIB): tools/ports/build-freetype.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-freetype.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_freetype_smoke.inc: userspace/bin/m51_freetype_smoke.c $(USERSPACE_DEPS) $(FREETYPE_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_freetype_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_freetype_smoke
 	xxd -i -n vfs_m51_freetype_smoke_elf userspace/build/$(ARCH)/bin/m51_freetype_smoke > $@
 
 # M51: Cairo (image surface + FreeType backend), cross-built static.
 CAIRO_LIB := build/cairo-b1nix/$(B1NIX_TRIPLET)/install/lib/libcairo.a
-$(CAIRO_LIB): tools/ports/build-cairo.sh tools/ports/build-pixman.sh tools/ports/build-freetype.sh
+$(CAIRO_LIB): tools/ports/build-cairo.sh $(PIXMAN_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-cairo.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_cairo_smoke.inc: userspace/bin/m51_cairo_smoke.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_smoke
 	xxd -i -n vfs_m51_cairo_smoke_elf userspace/build/$(ARCH)/bin/m51_cairo_smoke > $@
 
 $(BUILD_DIR)/initramfs_m51_cairo_wayland.inc: userspace/bin/m51_cairo_wayland.c $(USERSPACE_DEPS) $(CAIRO_LIB) $(FREETYPE_LIB) $(PIXMAN_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_wayland
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_cairo_wayland
 	xxd -i -n vfs_m51_cairo_wayland_elf userspace/build/$(ARCH)/bin/m51_cairo_wayland > $@
 
 # M51: xkbcommon (keymap compile + keysym translation), cross-built static.
@@ -642,8 +752,8 @@ $(XKB_LIB): tools/ports/build-xkbcommon.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-xkbcommon.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSPACE_DEPS) $(XKB_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_xkb_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_xkb_smoke
 	xxd -i -n vfs_m51_xkb_smoke_elf userspace/build/$(ARCH)/bin/m51_xkb_smoke > $@
 
 # M49: libwayland-client/server share one generated source/build tree. Build it
@@ -651,7 +761,7 @@ $(BUILD_DIR)/initramfs_m51_xkb_smoke.inc: userspace/bin/m51_xkb_smoke.c $(USERSP
 # userspace make invocations through tools/ports/build-wayland.sh.
 WAYLAND_CLIENT_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-client.a
 WAYLAND_SERVER_LIB := build/wayland-b1nix/$(B1NIX_TRIPLET)/install/lib/libwayland-server.a
-$(WAYLAND_CLIENT_LIB): tools/ports/build-wayland.sh tools/ports/build-libffi.sh
+$(WAYLAND_CLIENT_LIB): tools/ports/build-wayland.sh $(LIBFFI_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-wayland.sh >/dev/null
 $(WAYLAND_SERVER_LIB): $(WAYLAND_CLIENT_LIB)
 
@@ -664,8 +774,8 @@ $(HB_LIB): tools/ports/build-harfbuzz.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-harfbuzz.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_harfbuzz_smoke.inc: userspace/bin/m51_harfbuzz_smoke.c $(USERSPACE_DEPS) $(HB_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_harfbuzz_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_harfbuzz_smoke
 	xxd -i -n vfs_m51_harfbuzz_smoke_elf userspace/build/$(ARCH)/bin/m51_harfbuzz_smoke > $@
 
 # M51: expat (XML) + Fontconfig (font discovery), cross-built static.
@@ -673,12 +783,12 @@ EXPAT_LIB := build/expat-b1nix/$(B1NIX_TRIPLET)/install/lib/libexpat.a
 $(EXPAT_LIB): tools/ports/build-expat.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-expat.sh >/dev/null
 FONTCONFIG_LIB := build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install/lib/libfontconfig.a
-$(FONTCONFIG_LIB): tools/ports/build-fontconfig.sh tools/ports/build-expat.sh tools/ports/build-freetype.sh
+$(FONTCONFIG_LIB): tools/ports/build-fontconfig.sh $(EXPAT_LIB) $(FREETYPE_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-fontconfig.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m51_fontconfig_smoke.inc: userspace/bin/m51_fontconfig_smoke.c $(USERSPACE_DEPS) $(FONTCONFIG_LIB) $(EXPAT_LIB) $(FREETYPE_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_fontconfig_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m51_fontconfig_smoke
 	xxd -i -n vfs_m51_fontconfig_smoke_elf userspace/build/$(ARCH)/bin/m51_fontconfig_smoke > $@
 
 # M52: TinyGL (software OpenGL) + b1nix EGL shim, cross-built static.
@@ -687,8 +797,8 @@ $(TINYGL_LIB): tools/ports/build-tinygl.sh userspace/libegl/b1egl.c userspace/in
 	B1NIX_ARCH=$(ARCH) tools/ports/build-tinygl.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPACE_DEPS) $(TINYGL_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
 	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
 
 # Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
@@ -696,21 +806,21 @@ $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPAC
 # cross clang C++ wrapper.
 $(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
-	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
 
 $(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
 	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
 # M55: std::iostream + std::filesystem acceptance test (hosted libc++).
 $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
 	xxd -i -n vfs_m55_iostream_elf userspace/build/$(ARCH)/bin/m55_iostream > $@
 
 # Serialize the Mesa build to prevent race conditions during parallel builds.
@@ -758,7 +868,7 @@ $(BUILD_DIR)/.skia-built: tools/ports/build-skia.sh $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-skia.sh >/dev/null
 	@touch $@
 
-$(BUILD_DIR)/initramfs_m91_skia_smoke.inc: userspace/bin/m91_skia_smoke.cpp tools/demos/build-m91-skia-demo.sh $(BUILD_DIR)/.skia-built $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m91_skia_smoke.inc: userspace/bin/m91_skia_smoke.cpp tools/demos/build-m91-skia-demo.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke userspace/build/$(ARCH)/bin/m91_skia_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m91_skia_smoke_elf userspace/build/$(ARCH)/bin/m91_skia_smoke > $@
@@ -776,7 +886,7 @@ $(BUILD_DIR)/initramfs_m91_skia_dm.inc: $(BUILD_DIR)/.skia-built
 	@echo 'static const unsigned char vfs_m91_skia_dm_elf[1] = {0};' >> $@
 	@echo 'static const unsigned int vfs_m91_skia_dm_elf_len = 0;' >> $@
 M91_SHARED_DEPS_STAMP := $(BUILD_DIR)/.m91-shared-deps-stamp
-$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built
+$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
 	@# Replace sysroot stubs with real .so so cross-cc link step finds them
@@ -801,14 +911,14 @@ $(BUILD_DIR)/initramfs_lib%.inc: userspace/build/$(ARCH)/lib%.so $(M91_SHARED_DE
 # links the parse/layout/draw acceptance test against them. M89: litehtml is built
 # against the shared LLVM libc++ (B1NIX_CXX_STDLIB=libc++) — NetSurf's only C++
 # component, so this also moves the NetSurf C++ stack off GCC libstdc++.
-$(BUILD_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/demos/build-m55-litehtml.sh tools/ports/build-litehtml.sh $(USERSPACE_DEPS)
+$(BUILD_DIR)/initramfs_m55_litehtml.inc: userspace/bin/m55_litehtml.cpp tools/demos/build-m55-litehtml.sh $(LITEHTML_LIB) $(LIBM_LIB) $(USERSPACE_DEPS)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh userspace/build/$(ARCH)/bin/m55_litehtml
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_m55_litehtml_elf userspace/build/$(ARCH)/bin/m55_litehtml > $@
 
 $(BUILD_DIR)/initramfs_m32_pcre2_smoke.inc: userspace/bin/m32_pcre2_smoke.c $(USERSPACE_DEPS) $(PCRE2_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m32_pcre2_smoke
 	xxd -i -n vfs_m32_pcre2_smoke_elf userspace/build/$(ARCH)/bin/m32_pcre2_smoke > $@
 
 # M53: zlib (image-codec dependency for the NetSurf browser platform).
@@ -817,18 +927,18 @@ $(ZLIB_LIB): tools/ports/build-zlib.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-zlib.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_zlib_smoke.inc: userspace/bin/m53_zlib_smoke.c $(USERSPACE_DEPS) $(ZLIB_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_zlib_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_zlib_smoke
 	xxd -i -n vfs_m53_zlib_smoke_elf userspace/build/$(ARCH)/bin/m53_zlib_smoke > $@
 
 # M53: libpng (over zlib + libm) — NetSurf image-codec dependency.
 LIBPNG_LIB := build/libpng-b1nix/$(B1NIX_TRIPLET)/install/lib/libpng16.a
-$(LIBPNG_LIB): tools/ports/build-libpng.sh tools/ports/build-zlib.sh
+$(LIBPNG_LIB): tools/ports/build-libpng.sh $(ZLIB_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libpng.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libpng_smoke.inc: userspace/bin/m53_libpng_smoke.c $(USERSPACE_DEPS) $(LIBPNG_LIB) $(ZLIB_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libpng_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libpng_smoke
 	xxd -i -n vfs_m53_libpng_smoke_elf userspace/build/$(ARCH)/bin/m53_libpng_smoke > $@
 
 # M53: libjpeg (IJG) — NetSurf image-codec dependency.
@@ -837,8 +947,8 @@ $(LIBJPEG_LIB): tools/ports/build-libjpeg.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libjpeg.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libjpeg_smoke.inc: userspace/bin/m53_libjpeg_smoke.c $(USERSPACE_DEPS) $(LIBJPEG_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libjpeg_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libjpeg_smoke
 	xxd -i -n vfs_m53_libjpeg_smoke_elf userspace/build/$(ARCH)/bin/m53_libjpeg_smoke > $@
 
 # M53: libwebp (image + VP8 video-keyframe codec) — NetSurf codec dependency.
@@ -847,8 +957,8 @@ $(LIBWEBP_LIB): tools/ports/build-libwebp.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libwebp.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libwebp_smoke.inc: userspace/bin/m53_libwebp_smoke.c $(USERSPACE_DEPS) $(LIBWEBP_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libwebp_smoke
 	xxd -i -n vfs_m53_libwebp_smoke_elf userspace/build/$(ARCH)/bin/m53_libwebp_smoke > $@
 
 # M53: libvpx (VP8 full-motion video decode) — NetSurf/WebM video codec.
@@ -857,8 +967,8 @@ $(LIBVPX_LIB): tools/ports/build-libvpx.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libvpx.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libvpx_smoke.inc: userspace/bin/m53_libvpx_smoke.c $(USERSPACE_DEPS) $(LIBVPX_LIB) $(LIBWEBP_LIB) $(LIBM_LIB)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libvpx_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_libvpx_smoke
 	xxd -i -n vfs_m53_libvpx_smoke_elf userspace/build/$(ARCH)/bin/m53_libvpx_smoke > $@
 
 # M53: libwapcaplet (string internment) — first NetSurf browser-library dep.
@@ -881,7 +991,7 @@ $(BUILD_DIR)/initramfs_m53_parserutils_smoke.inc: userspace/bin/m53_parserutils_
 
 # M53: libhubbub (HTML5 tokeniser + tree builder) over libparserutils — NetSurf.
 HUBBUB_LIB := build/libhubbub-b1nix/$(B1NIX_TRIPLET)/install/lib/libhubbub.a
-$(HUBBUB_LIB): tools/ports/build-libhubbub.sh tools/ports/build-libparserutils.sh
+$(HUBBUB_LIB): tools/ports/build-libhubbub.sh $(PU_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libhubbub.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_hubbub_smoke.inc: userspace/bin/m53_hubbub_smoke.c $(USERSPACE_DEPS) $(HUBBUB_LIB) $(PU_LIB)
@@ -890,7 +1000,7 @@ $(BUILD_DIR)/initramfs_m53_hubbub_smoke.inc: userspace/bin/m53_hubbub_smoke.c $(
 
 # M53: libcss (CSS parser + selection) over libwapcaplet + libparserutils.
 LIBCSS_LIB := build/libcss-b1nix/$(B1NIX_TRIPLET)/install/lib/libcss.a
-$(LIBCSS_LIB): tools/ports/build-libcss.sh tools/ports/build-libwapcaplet.sh tools/ports/build-libparserutils.sh
+$(LIBCSS_LIB): tools/ports/build-libcss.sh $(LWC_LIB) $(PU_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libcss.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libcss_smoke.inc: userspace/bin/m53_libcss_smoke.c $(USERSPACE_DEPS) $(LIBCSS_LIB) $(LWC_LIB) $(PU_LIB)
@@ -899,7 +1009,7 @@ $(BUILD_DIR)/initramfs_m53_libcss_smoke.inc: userspace/bin/m53_libcss_smoke.c $(
 
 # M53: libdom (DOM) + hubbub binding over libhubbub + libparserutils + lwc.
 LIBDOM_LIB := build/libdom-b1nix/$(B1NIX_TRIPLET)/install/lib/libdom.a
-$(LIBDOM_LIB): tools/ports/build-libdom.sh tools/ports/build-libhubbub.sh
+$(LIBDOM_LIB): tools/ports/build-libdom.sh $(HUBBUB_LIB)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libdom.sh >/dev/null
 
 $(BUILD_DIR)/initramfs_m53_libdom_smoke.inc: userspace/bin/m53_libdom_smoke.c $(USERSPACE_DEPS) $(LIBDOM_LIB) $(HUBBUB_LIB) $(PU_LIB) $(LWC_LIB)
@@ -926,11 +1036,11 @@ $(BUILD_DIR)/initramfs_m53_nslibs_smoke.inc: userspace/bin/m53_nslibs_smoke.c $(
 
 # M53: userspace VirGL smoke — drives /dev/virtio-gpu (host-GPU-accelerated 3D).
 $(BUILD_DIR)/initramfs_m53_virgl_smoke.inc: userspace/bin/m53_virgl_smoke.c $(USERSPACE_DEPS)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m53_virgl_smoke
 	xxd -i -n vfs_m53_virgl_smoke_elf userspace/build/$(ARCH)/bin/m53_virgl_smoke > $@
 
-$(CURL_ELF): tools/ports/build-curl.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
+$(CURL_ELF): tools/ports/build-curl.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS) $(MBEDTLS_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-curl.sh
 
 $(INITRAMFS_CURL_INC): $(CURL_ELF)
@@ -961,12 +1071,24 @@ $(OPENSSL_LIB): tools/ports/build-openssl.sh tools/toolchain/bin/b1nix-autotools
 	tools/ports/build-openssl.sh >/dev/null
 
 LIBIDN2_LIB := build/libidn2-b1nix/$(B1NIX_TRIPLET)/install/lib/libidn2.a
-$(LIBIDN2_LIB): tools/ports/build-libidn2.sh tools/ports/build-libunistring.sh tools/toolchain/bin/b1nix-autotools-cc
+$(LIBIDN2_LIB): tools/ports/build-libidn2.sh $(LIBUNISTRING_LIB) tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-libidn2.sh >/dev/null
 
 LIBPSL_LIB := build/libpsl-b1nix/$(B1NIX_TRIPLET)/install/lib/libpsl.a
 $(LIBPSL_LIB): tools/ports/build-libpsl.sh tools/toolchain/bin/b1nix-autotools-cc
 	tools/ports/build-libpsl.sh >/dev/null
+
+$(LIBFFI_LIB): tools/ports/build-libffi.sh
+	B1NIX_ARCH=$(ARCH) tools/ports/build-libffi.sh >/dev/null
+
+$(LITEHTML_LIB): tools/ports/build-litehtml.sh
+	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-litehtml.sh >/dev/null
+
+$(MBEDTLS_LIB): tools/ports/build-mbedtls.sh
+	B1NIX_ARCH=$(ARCH) tools/ports/build-mbedtls.sh >/dev/null
+
+$(LIBUNISTRING_LIB): tools/ports/build-libunistring.sh
+	B1NIX_ARCH=$(ARCH) tools/ports/build-libunistring.sh >/dev/null
 
 $(WGET_ELF): tools/ports/build-wget.sh tools/toolchain/bin/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
 	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-wget.sh
@@ -1016,7 +1138,7 @@ $(BUILD_DIR)/initramfs_m53_httpsd.inc: userspace/bin/m53_httpsd.c $(USERSPACE_DE
 
 # M53: build the NetSurf framebuffer browser (the real nsfb binary) and package
 # it + its runtime resources + a test page into the initramfs.
-$(NSFB_ELF): tools/ports/build-netsurf-fb.sh tools/ports/build-libnsfb.sh
+$(NSFB_ELF): tools/ports/build-netsurf-fb.sh tools/ports/build-libnsfb.sh $(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(FREETYPE_LIB) $(CURL_ELF)
 	B1NIX_ARCH=$(ARCH) tools/ports/build-netsurf-fb.sh >/dev/null
 
 $(INITRAMFS_NETSURF_INC): $(NSFB_ELF) tools/images/gen_netsurf_initramfs.sh tools/netsurf-assets/test.html tools/netsurf-assets/test.png tools/netsurf-assets/test.svg tools/netsurf-assets/test.jxl
@@ -1038,25 +1160,24 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
 $(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_pie
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_pie
 	xxd -i -n vfs_m30_pie_elf userspace/build/$(ARCH)/bin/m30_pie > $@
 
 $(BUILD_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS) userspace/linker_pie.ld userspace/linker_shared.ld
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_dynamic
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_dynamic
 	xxd -i -n vfs_m30_dynamic_elf userspace/build/$(ARCH)/bin/m30_dynamic > $@
 
 ifeq ($(ARCH),x86_64)
 $(INITRAMFS_SHARED_LIBC_INC): $(USERSPACE_DEPS) userspace/linker_shared.ld
-	@$(MAKE) -C userspace build/$(ARCH)/libc.so.1
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_shared_libc_elf userspace/build/$(ARCH)/libc.so.1 > $@
 
 # M69: a shared object the m30-dynamic smoke dlopen's at runtime.
 $(INITRAMFS_M69_PLUGIN_INC): userspace/bin/m69_plugin.c $(USERSPACE_DEPS) userspace/linker_shared.ld
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
 	@mkdir -p $(dir $@)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
 	xxd -i -n vfs_m69_plugin_elf userspace/build/$(ARCH)/bin/m69_plugin.so > $@
 
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). One
@@ -1208,8 +1329,7 @@ iso-test: root-image $(KERNEL_ELF)
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
-userspace:
-	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
+userspace: $(USERSPACE_DEPS)
 
 .PHONY: check-b1cc-sync
 check-b1cc-sync:
@@ -1259,7 +1379,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf (preferred) or tools/toolchain/build-native-toolchain.sh (fallback)."; \
 	fi
 
-install-ports: userspace-install install-native-toolchain
+install-ports: userspace-install install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(WGET_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1326,7 +1446,7 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: install-ports $(M91_SHARED_DEPS_STAMP)
+root-image: $(KERNEL_ELF) install-ports $(M91_SHARED_DEPS_STAMP)
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
@@ -1403,7 +1523,7 @@ clean:
 	@# Preserve build/toolchain_build — cross + native GCC/Binutils take an hour
 	@# to rebuild. Use `make distclean` to wipe everything including the toolchain.
 	@if [ -d build ]; then \
-		find build -mindepth 1 -maxdepth 1 ! -name toolchain_build -exec rm -rf {} +; \
+		find -L build -mindepth 1 -maxdepth 1 ! -name toolchain_build -exec rm -rf {} +; \
 	fi
 	@$(MAKE) -C userspace clean
 

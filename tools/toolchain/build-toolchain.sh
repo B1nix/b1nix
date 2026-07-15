@@ -23,7 +23,10 @@ ln -sfn "$B1NIX_ROOTFS" "$SYSROOT" 2>/dev/null || true
 
 # 2. Build userspace libc headers/libs and install to rootfs
 echo "Building userspace libc and staging headers/libs..."
-make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
+(
+  flock -x 9
+  make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
+) 9>/tmp/b1nix-userspace-headers.lock
 
 # Refresh dynamic libc inside the sysroot/triplet lib dirs
 ARCH="$B1NIX_ARCH" sh "$PROJECT_DIR/tools/toolchain/stage-shared-libc.sh"

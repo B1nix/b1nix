@@ -17,9 +17,18 @@ BUILD="$SKIA/build"
 
 die() { echo "apply.sh: $1" >&2; exit 1; }
 
+# Helper to run grep -q safely under set -e without triggering premature exits on non-matches
+not_grep() {
+  if grep -q "$@"; then
+    return 1
+  else
+    return 0
+  fi
+}
+
 # --- Patch S1: //build/config/BUILDCONFIG.gn default-toolchain dispatch --------
 F="$BUILD/config/BUILDCONFIG.gn"
-if ! grep -q '//build/toolchain/b1nix:' "$F"; then
+if not_grep '//build/toolchain/b1nix:' "$F"; then
   # Insert b1nix branch after the zos branch
   perl -0777 -i -pe 's~(\} else if \(target_os == "zos"\) \{\n  _default_toolchain = "//build/toolchain/zos:\$target_cpu"\n)~${1}} else if (target_os == "b1nix") {\n  _default_toolchain = "//build/toolchain/b1nix:\$target_cpu"\n~' "$F"
   grep -q '//build/toolchain/b1nix:' "$F" || die "Patch S1 anchor not found in $F"
@@ -41,7 +50,7 @@ else echo "Patch S3 skipped: file not found"; fi
 
 # --- Patch S4: BUILD.gn — force-disable unavailable backends -------------------
 F="$SKIA/BUILD.gn"
-if [ -f "$F" ] && ! grep -q 'b1nix_skia_disable_vulkan' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix_skia_disable_vulkan' "$F"; then
   # Append a b1nix-specific block at the end of the file to override defaults
   cat >> "$F" << 'GNBLOCK'
 
@@ -73,7 +82,7 @@ else echo "Patch S4 already present or file not found"; fi
 # --- Patch S5: src/gpu/ganesh/gl/GrGLMakeNativeInterface.cpp ------------------
 # Route GL proc resolution to the b1nix EGL/OSMesa path
 F="$SKIA/src/gpu/ganesh/gl/GrGLMakeNativeInterface.cpp"
-if [ -f "$F" ] && ! grep -q 'b1nix' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix' "$F"; then
   # Add b1nix as a recognized platform that uses EGL
   perl -0777 -i -pe 's~(GrGLMakeNativeInterface\(\) \{)~#if defined(__b1nix__)\n#include <EGL/egl.h>\nstatic GrGLFuncPtr b1nix_get_gl_proc(const char* name) {\n  return (GrGLFuncPtr)eglGetProcAddress(name);\n}\n#endif\n\nGrGLMakeNativeInterface\(\) \{\n#if defined(__b1nix__)\n  return GrGLInterfaces::MakeFunctionLoader(b1nix_get_gl_proc);\n#else~' "$F"
   perl -0777 -i -pe 's~(return nullptr;\n)\}$~${1}#endif\n}~' "$F"
@@ -101,7 +110,7 @@ else echo "Patch S6a already present or ports dir not found"; fi
 # --- Patch S7: third_party/zlib — fix build for b1nix -------------------------
 # Skia's bundled zlib may reference <sys/auxv.h> or other Linux-only headers
 F="$SKIA/third_party/zlib/zconf.h"
-if [ -f "$F" ] && ! grep -q 'b1nix' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix' "$F"; then
   # Ensure ZLIB_COMPAT is defined for Skia's expected API
   echo "/* b1nix: ensure compat mode */" >> "$F"
   echo "Patch S7a applied: zlib compat" 
@@ -109,7 +118,7 @@ else echo "Patch S7a already present or not needed"; fi
 
 # --- Patch S8: gn/skia/BUILD.gn — enable dm tools for b1nix ------------------
 F="$SKIA/gn/skia/BUILD.gn"
-if [ -f "$F" ] && ! grep -q 'target_os == "b1nix"' "$F"; then
+if [ -f "$F" ] && not_grep 'target_os == "b1nix"' "$F"; then
   # Enable dm tool (runs headless via EGL PBuffer), disable skottie
   cat >> "$F" << 'GNBLOCK2'
 
@@ -126,7 +135,7 @@ else echo "Patch S8 already present or file not found"; fi
 # dm unconditionally depends on modules/skottie, but we disable skottie on b1nix.
 # Remove skottie from dm's deps list and add conditional below.
 F="$SKIA/BUILD.gn"
-if [ -f "$F" ] && ! grep -q 'b1nix_dm_skottie' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix_dm_skottie' "$F"; then
   # Remove skottie lines from dm deps list
   perl -0777 -i -pe 's~"modules/skottie",\s*"modules/skottie:utils",\s*~~g' "$F"
   # Add conditional skottie dep after dm's deps block
@@ -136,7 +145,7 @@ else echo "Patch S8b already present or file not found"; fi
 
 # --- Patch S9: third_party/externals/piex — add missing <cstring> include ------
 F="$SKIA/third_party/externals/piex/src/image_type_recognition/image_type_recognition_lite.cc"
-if [ -f "$F" ] && ! grep -q '#include <cstring>' "$F"; then
+if [ -f "$F" ] && not_grep '#include <cstring>' "$F"; then
   sed -i '26a #include <cstring>' "$F"
   echo "Patch S9 applied: piex cstring include"
 else echo "Patch S9 already present or file not found"; fi
@@ -145,7 +154,7 @@ else echo "Patch S9 already present or file not found"; fi
 # b1nix defines int64_t as long long, but __builtin_smull_overflow expects long*.
 # Force the long long path on b1nix by patching both #if guards.
 F="$SKIA/third_party/externals/dng_sdk/source/dng_safe_arithmetic.h"
-if [ -f "$F" ] && ! grep -q 'b1nix' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix' "$F"; then
   sed -i 's/#if __has_builtin(__builtin_smull_overflow)/#if __has_builtin(__builtin_smull_overflow) \&\& !defined(__b1nix__)/g' "$F"
   sed -i 's/#if (LONG_MAX == INT64_MAX) && !defined(__APPLE__)/#if (LONG_MAX == INT64_MAX) \&\& !defined(__APPLE__) \&\& !defined(__b1nix__)/g' "$F"
   grep -q 'b1nix' "$F" 2>/dev/null && echo "Patch S10 applied: dng_sdk int64_t fix" || echo "Patch S10 skipped: pattern not found"
@@ -157,7 +166,7 @@ else echo "Patch S10 already present or file not found"; fi
 # predates it and omits the source. Without it libpiex.so has undefined Cr3*
 # symbols and the dynamic Skia link fails under --no-allow-shlib-undefined.
 F="$SKIA/third_party/piex/BUILD.gn"
-if [ -f "$F" ] && ! grep -q 'piex_cr3.cc' "$F"; then
+if [ -f "$F" ] && not_grep 'piex_cr3.cc' "$F"; then
   sed -i 's~\( *\)"../externals/piex/src/piex.cc",~&\n\1"../externals/piex/src/piex_cr3.cc",~' "$F"
   grep -q 'piex_cr3.cc' "$F" || die "Patch S11 write failed"
   echo "Patch S11 applied: piex BUILD.gn (compile piex_cr3.cc)"
@@ -165,7 +174,7 @@ else echo "Patch S11 already present or file not found"; fi
 
 # --- Patch S12: Dawn args.gni — enable OpenGL ES, disable Vulkan for b1nix ---
 F="$SKIA/third_party/dawn/args.gni"
-if [ -f "$F" ] && ! grep -q 'b1nix' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix' "$F"; then
   # On b1nix: use OpenGL ES via EGL (OSMesa), no Vulkan/D3D/Metal
   cat >> "$F" << 'DAWNBLOCK'
 
@@ -185,11 +194,11 @@ else echo "Patch S12 already present or file not found"; fi
 # --- Patch S12b: Dawn CMakeLists.txt — disable X11/Wayland, enable EGL-only ---
 # b1nix uses headless EGL (PBuffer via OSMesa), no X11/Wayland display server.
 F="$SKIA/third_party/externals/dawn/CMakeLists.txt"
-if [ -f "$F" ] && ! grep -q 'b1nix_no_x11' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix_no_x11' "$F"; then
   # Force X11 and Wayland OFF for b1nix (headless EGL only)
   perl -0777 -i -pe 's~(elseif\(UNIX\)\s*\n\s*set\(USE_WAYLAND \$\{WAYLAND_FOUND\}\))~# b1nix: headless EGL, no display server\n  set(USE_WAYLAND OFF)\n  set(USE_X11 OFF)  # b1nix_no_x11\n  return()\n${1}~' "$F" 2>/dev/null || true
   # Simpler approach: just set defaults before the UNIX block
-  if ! grep -q 'b1nix_no_x11' "$F"; then
+  if not_grep 'b1nix_no_x11' "$F"; then
     perl -0777 -i -pe 's~(option\(DAWN_USE_WAYLAND.*)~# b1nix: force headless EGL (no X11/Wayland)\nset(USE_WAYLAND OFF)\nset(USE_X11 OFF)  # b1nix_no_x11\n\n${1}~' "$F"
   fi
   echo "Patch S12b applied: Dawn CMakeLists.txt (disable X11/Wayland)"
@@ -199,12 +208,65 @@ else echo "Patch S12b already present or file not found"; fi
 # Dawn's OpenGL ES backend needs EGL/GL headers. When cross-compiling for b1nix,
 # these come from Skia's third_party/externals/{egl-registry,opengl-registry}.
 F="$SKIA/third_party/externals/dawn/CMakeLists.txt"
-if [ -f "$F" ] && ! grep -q 'b1nix_egl_includes' "$F"; then
+if [ -f "$F" ] && not_grep 'b1nix_egl_includes' "$F"; then
   # After the DAWN_ENABLE_OPENGLES definition, add b1nix EGL include paths
   perl -0777 -i -pe 's~(if \(DAWN_ENABLE_OPENGLES\)\s*\n\s*target_compile_definitions\(dawn_internal_config INTERFACE "DAWN_ENABLE_BACKEND_OPENGLES"\))~${1}\n    # b1nix: add EGL/GL headers from Skia third_party for cross-compilation\n    if (CMAKE_CROSSCOMPILING)\n      target_include_directories(dawn_internal_config SYSTEM INTERFACE\n        "${CMAKE_CURRENT_SOURCE_DIR}/../egl-registry/api"\n        "${CMAKE_CURRENT_SOURCE_DIR}/../opengl-registry/api"\n      )\n    endif()~' "$F"
   grep -q 'b1nix_egl_includes\|b1nix.*EGL' "$F" || echo "Patch S13: pattern not matched, Dawn may find EGL from sysroot"
   echo "Patch S13 applied: Dawn CMakeLists.txt (EGL includes for cross-compile)"
 else echo "Patch S13 already present or file not found"; fi
+
+# --- Patch S14: Dawn build_dawn.py — add CMake policy minimum for CMake 4 ---
+F="$SKIA/third_party/dawn/build_dawn.py"
+if [ -f "$F" ]; then
+  if grep -q 'CMAKE_POLICY_VERSION_MINIMUM' "$F"; then
+    echo "Patch S14 already present"
+  else
+    # Insert -DCMAKE_POLICY_VERSION_MINIMUM=3.5 into configure_cmd list
+    perl -0777 -i -pe 's~(configure_cmd = \[(\s*)cmake_exe,)~$1\n$2"-DCMAKE_POLICY_VERSION_MINIMUM=3.5",~' "$F"
+    grep -q 'CMAKE_POLICY_VERSION_MINIMUM' "$F" || die "Patch S14 write failed"
+    echo "Patch S14 applied: Dawn build_dawn.py (CMake policy minimum)"
+  fi
+else
+  echo "Patch S14 skipped: file not found"
+fi
+
+# --- Patch S15: Dawn build_dawn.py — disable C++20 modules scanning to avoid clang-scan-deps errors ---
+F="$SKIA/third_party/dawn/build_dawn.py"
+if [ -f "$F" ]; then
+  if grep -q 'CMAKE_CXX_SCAN_FOR_MODULES' "$F"; then
+    echo "Patch S15 already present"
+  else
+    # Insert -DCMAKE_CXX_SCAN_FOR_MODULES=OFF into configure_cmd list
+    perl -0777 -i -pe 's~("-DCMAKE_CXX_STANDARD=20",)~$1\n      "-DCMAKE_CXX_SCAN_FOR_MODULES=OFF",~' "$F"
+    grep -q 'CMAKE_CXX_SCAN_FOR_MODULES' "$F" || die "Patch S15 write failed"
+    echo "Patch S15 applied: Dawn build_dawn.py (disable C++20 modules scanning)"
+  fi
+else
+  echo "Patch S15 skipped: file not found"
+fi
+
+# --- Patch S16: Dawn compiler checks — disable C++20 modules support ---
+F="$SKIA/third_party/externals/dawn/src/cmake/DawnCompilerChecks.cmake"
+if [ -f "$F" ] && not_grep 'b1nix_force_no_modules' "$F"; then
+  # Force DAWN_SUPPORTS_CXX_MODULES to False at the very end of the file
+  printf '\n# b1nix_force_no_modules\nset(DAWN_SUPPORTS_CXX_MODULES False)\n' >> "$F"
+  echo "Patch S16 applied: DawnCompilerChecks.cmake (force disable C++20 modules)"
+else echo "Patch S16 already present or file not found"; fi
+
+# --- Patch S17: Dawn build_dawn.py — disable X11 ---
+F="$SKIA/third_party/dawn/build_dawn.py"
+if [ -f "$F" ]; then
+  if grep -q 'DAWN_USE_X11=OFF' "$F"; then
+    echo "Patch S17 already present"
+  else
+    # Replace DAWN_USE_X11=ON with DAWN_USE_X11=OFF
+    perl -pi -e 's/DAWN_USE_X11=ON/DAWN_USE_X11=OFF/g' "$F"
+    grep -q 'DAWN_USE_X11=OFF' "$F" || die "Patch S17 write failed"
+    echo "Patch S17 applied: Dawn build_dawn.py (disable X11)"
+  fi
+else
+  echo "Patch S17 skipped: file not found"
+fi
 
 echo ""
 echo "All Skia patches applied successfully."

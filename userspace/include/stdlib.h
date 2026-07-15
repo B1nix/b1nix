@@ -104,6 +104,7 @@ void qsort(void *base, size_t nmemb, size_t size, int (*compar)(const void *, co
 void qsort_s(void *base, size_t nmemb, size_t size,
              int (*compar)(const void *, const void *, void *), void *arg);
 char *getenv(const char *name);
+char *secure_getenv(const char *name);
 int   putenv(char *string);
 int   setenv(const char *name, const char *value, int overwrite);
 int   unsetenv(const char *name);

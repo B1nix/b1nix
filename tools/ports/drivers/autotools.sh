@@ -94,7 +94,9 @@ if [ -f "$SRC_DIR/configure" ] && [ "$(stat -c %Y "$SRC_DIR/configure" 2>/dev/nu
 fi
 
 # --- ensure userspace libc is built --------------------------------------
-make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
+  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+fi
 
 # --- pre-configure hook ---------------------------------------------------
 if command -v port_pre_configure >/dev/null 2>&1; then
@@ -129,37 +131,134 @@ fi
 # Export as environment variables so sub-makes and am--refresh recipes see them.
 export ACLOCAL=":" AUTOCONF=":" AUTOMAKE=":" AUTOHEADER=":" MAKEINFO=":"
 export am__maybe_remake_makefiles=""
-_AUTOTOOLS_NOREGEN="ACLOCAL=: AUTOCONF=: AUTOMAKE=: AUTOHEADER=: MAKEINFO=: am__maybe_remake_makefiles="
+LOCKFILE="$ROOT_DIR/build/$AUTOTOOLS_NAME-$B1NIX_TRIPLET.lock"
+mkdir -p "$(dirname "$LOCKFILE")"
 
-# --- build ----------------------------------------------------------------
-if command -v port_build >/dev/null 2>&1; then
-  port_build
-else
-  # shellcheck disable=SC2086
-  make -C "$BUILD_DIR" -j"${JOBS:-4}" $_AUTOTOOLS_NOREGEN ${AUTOTOOLS_MAKE:-all} 1>&2
-fi
+(
+  flock -x 9
+  if { [ -d "$INSTALL_DIR/lib" ] && [ -n "$(ls -A "$INSTALL_DIR/lib" 2>/dev/null)" ]; } || \
+     { [ -d "$INSTALL_DIR/bin" ] && [ -n "$(ls -A "$INSTALL_DIR/bin" 2>/dev/null)" ]; }; then
+    if [ -z "${AUTOTOOLS_ECHO+x}" ]; then
+      echo "$INSTALL_DIR"
+    fi
+    exit 0
+  fi
 
-# --- install --------------------------------------------------------------
-if command -v port_install >/dev/null 2>&1; then
-  port_install
-else
-  # shellcheck disable=SC2086
-  make -C "$BUILD_DIR" $_AUTOTOOLS_NOREGEN ${AUTOTOOLS_INSTALL:-install} 1>&2
-fi
+  mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR" "$INSTALL_DIR"
 
-# --- pkg-config .pc file --------------------------------------------------
-if [ -n "${AUTOTOOLS_PC:-}" ]; then
-  _pc_dir="$INSTALL_DIR/lib/pkgconfig"
-  mkdir -p "$_pc_dir"
-  printf '%s\n' "$AUTOTOOLS_PC" > "$_pc_dir/${AUTOTOOLS_NAME}.pc"
-fi
+  # --- fetch + extract ------------------------------------------------------
+  if [ ! -d "$SRC_DIR" ]; then
+    tmp="$SRC_PARENT/$AUTOTOOLS_TARBALL"
+    if [ ! -f "$tmp" ]; then
+      port_fetch_tarball "$AUTOTOOLS_URL" "$tmp" "$SRC_PARENT/$B1NIX_TRIPLET" \
+        "${AUTOTOOLS_SENTINEL:-$SRC_DIR}"
+    fi
+    # Handle case where tarball extracts to a different name than expected
+    if [ ! -d "$SRC_DIR" ]; then
+      for d in "$SRC_PARENT/$B1NIX_TRIPLET"/*; do
+        if [ -d "$d" ] && [ -f "$d/configure" -o -f "$d/configure.ac" ]; then
+          mv "$d" "$SRC_DIR"
+          break
+        fi
+      done
+    fi
+  fi
 
-# --- post-install hook ----------------------------------------------------
-if command -v port_post_install >/dev/null 2>&1; then
-  port_post_install
-fi
+  # --- patches --------------------------------------------------------------
+  if [ -n "${PATCHES:-}" ]; then
+    # shellcheck disable=SC2086
+    port_apply_patches "$SRC_DIR" $PATCHES
+  fi
 
-# Driver prints install dir unless manifest has already printed (e.g. crypto phase)
-if [ -z "${AUTOTOOLS_ECHO+x}" ]; then
-  echo "$INSTALL_DIR"
-fi
+  # --- patch config.sub to accept b1nix ------------------------------------
+  if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
+    tmp_sub="$SRC_DIR/config.sub.new"
+    sed -e 's/| fiwix\* /| fiwix* | b1nix* /' \
+        -e 's/| openbsd\* /| openbsd* | b1nix* /' \
+        "$SRC_DIR/config.sub" > "$tmp_sub"
+    chmod +x "$tmp_sub"
+    mv "$tmp_sub" "$SRC_DIR/config.sub"
+  fi
+
+  # config.sub under subdirectories (e.g. libffi)
+  for sub_sub in "$SRC_DIR"/*/config.sub; do
+    if [ -f "$sub_sub" ] && ! grep -q 'b1nix' "$sub_sub"; then
+      tmp_sub="${sub_sub}.new"
+      sed -e 's/| fiwix\* /| fiwix* | b1nix* /' \
+          -e 's/| openbsd\* /| openbsd* | b1nix* /' \
+          "$sub_sub" > "$tmp_sub"
+      chmod +x "$tmp_sub"
+      mv "$tmp_sub" "$sub_sub"
+    fi
+  done
+
+  # --- configure ------------------------------------------------------------
+  cd "$BUILD_DIR"
+
+  # Setup standard toolchain variables for configure
+  export CC="$AUTOTOOLS_CC"
+  export AR="$AR_BIN"
+  export RANLIB="$RANLIB_BIN"
+
+  # Optional pre-configure hook (e.g. build dependencies)
+  if command -v port_pre_configure >/dev/null 2>&1; then
+    port_pre_configure
+    cd "$BUILD_DIR"
+  fi
+
+  # Run configure if Makefile doesn't exist
+  if [ ! -f Makefile ]; then
+    _AUTOTOOLS_NOREGEN="AM_UPDATE_INFO_DIR=no"
+    _args="--host=$B1NIX_TRIPLET --prefix=$INSTALL_DIR --disable-shared --enable-static"
+    if [ -n "${AUTOTOOLS_CONFIGURE:-}" ]; then
+      _args="$_args $AUTOTOOLS_CONFIGURE"
+    fi
+    # Use config.cache to speed up re-configures
+    _args="$_args --cache-file=config.cache"
+
+    if command -v port_configure >/dev/null 2>&1; then
+      # shellcheck disable=SC2086
+      port_configure $_args
+    else
+      # shellcheck disable=SC2086
+      "$SRC_DIR/configure" $_args 1>&2
+    fi
+  else
+    # Makefile exists, configure skipped. Force no-regen so make won't try to
+    # run aclocal/automake/autoconf (which would fail on the host).
+    _AUTOTOOLS_NOREGEN="AM_UPDATE_INFO_DIR=no AUTOCONF=true AUTOMAKE=true AUTOHEADER=true ACCLOCAL=true"
+  fi
+
+  # --- build ----------------------------------------------------------------
+  if command -v port_build >/dev/null 2>&1; then
+    port_build
+  else
+    # shellcheck disable=SC2086
+    make -C "$BUILD_DIR" $_AUTOTOOLS_NOREGEN -j"${JOBS:-4}" ${AUTOTOOLS_MAKE:-all} 1>&2
+  fi
+
+  # --- install --------------------------------------------------------------
+  if command -v port_install >/dev/null 2>&1; then
+    port_install
+  else
+    # shellcheck disable=SC2086
+    make -C "$BUILD_DIR" $_AUTOTOOLS_NOREGEN ${AUTOTOOLS_INSTALL:-install} 1>&2
+  fi
+
+  # --- pkg-config .pc file --------------------------------------------------
+  if [ -n "${AUTOTOOLS_PC:-}" ]; then
+    _pc_dir="$INSTALL_DIR/lib/pkgconfig"
+    mkdir -p "$_pc_dir"
+    printf '%s\n' "$AUTOTOOLS_PC" > "$_pc_dir/${AUTOTOOLS_NAME}.pc"
+  fi
+
+  # --- post-install hook ----------------------------------------------------
+  if command -v port_post_install >/dev/null 2>&1; then
+    port_post_install
+  fi
+
+  # Driver prints install dir unless manifest has already printed (e.g. crypto phase)
+  if [ -z "${AUTOTOOLS_ECHO+x}" ]; then
+    echo "$INSTALL_DIR"
+  fi
+) 9>"$LOCKFILE"

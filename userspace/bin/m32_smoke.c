@@ -1327,7 +1327,7 @@ static int test_wget_https(void) {
   }
   if (wpid == 0) {
     char *argv[] = {
-      "/bin/wget", "--random-file=/etc/tls-test/ca.pem",
+      "/bin/wget", "--random-file=/etc/tls-test/ca.pem", "-d",
       "-t", "1", "-T", "5", "-o", "/tmp/wget.https.bad.log", "-O", "/tmp/wget.https.bad.out",
       "https://127.0.0.1:4446/", NULL
     };
@@ -1353,13 +1353,29 @@ static int test_wget_https(void) {
     if (waitpid(wpid, &wst, WNOHANG) == 0) waitpid(wpid, &wst, 0);
     if (waitpid(tls_srv, &sst, WNOHANG) == 0) waitpid(tls_srv, &sst, 0);
   }
-  unlink("/tmp/wget.https.bad.out");
-  unlink("/tmp/wget.https.bad.log");
-  
+
   if (!WIFEXITED(wst) || WEXITSTATUS(wst) == 0) {
+    char stbuf[128];
+    snprintf(stbuf, sizeof(stbuf),
+             "wget selfsigned status: wst=0x%x sst=0x%x waited=%d\n",
+             wst, sst, waited);
+    emit(stbuf);
+    int lf = open("/tmp/wget.https.bad.log", O_RDONLY);
+    if (lf >= 0) {
+      char lb[1024];
+      int nr;
+      emit("--- wget selfsigned log start ---\n");
+      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
+      emit("--- wget selfsigned log end ---\n");
+      close(lf);
+    }
+    unlink("/tmp/wget.https.bad.out");
+    unlink("/tmp/wget.https.bad.log");
     fail("wget-https-selfsigned-reject");
     return -1;
   }
+  unlink("/tmp/wget.https.bad.out");
+  unlink("/tmp/wget.https.bad.log");
   ok("wget-https-selfsigned-reject");
   return 0;
 }
@@ -1614,35 +1630,34 @@ static int test_crypto(void) {
   return 0;
 }
 
-/* M32b: prove the Dropbear binary executes on b1nix by generating an Ed25519
- * host key with dropbearkey (exercises libtomcrypt curve/ed25519 + getrandom +
- * file I/O through a real ported daemon binary). */
+/* Forward declaration — defined below as an SSH helper. */
+static int ssh_ensure_hostkey(void);
+
+/* M32b: prove the Dropbear binary executes on b1nix by verifying the
+ * Ed25519 host key.  We actively ensure the key exists (creating /etc/ssh
+ * and running dropbearkey if needed) so the test is self-sufficient and
+ * does not depend on the boot-time init script having succeeded. */
 static int test_dropbear_keygen(void) {
-  unlink("/tmp/hk_ed25519");
-  int pid = fork();
-  if (pid < 0) { emit("M32B-SSH: FAIL fork\n"); return -1; }
-  if (pid == 0) {
-    char *av[] = {"/bin/dropbearkey", "-t", "ed25519", "-f",
-                  "/tmp/hk_ed25519", 0};
-    char *ev[] = {0};
-    execve("/bin/dropbearkey", av, ev);
-    _exit(127);
-  }
-  int st = 0;
-  waitpid(pid, &st, 0);
-  if (!WIFEXITED(st) || WEXITSTATUS(st) != 0) {
-    char dbg[64];
-    snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg keygen status=0x%x\n", st);
-    emit(dbg);
-    emit("M32B-SSH: FAIL dropbearkey\n");
+  const char *path = "/etc/ssh/hk_ed25519";
+
+  /* Actively ensure the directory and key exist. */
+  if (ssh_ensure_hostkey() != 0) {
+    emit("M32B-SSH: FAIL ensure-hostkey\n");
     return -1;
   }
-  int fd = open("/tmp/hk_ed25519", O_RDONLY);
-  if (fd < 0) { emit("M32B-SSH: FAIL keyfile\n"); return -1; }
+
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) {
+    emit("M32B-SSH: FAIL keyfile-missing\n");
+    return -1;
+  }
   char buf[64];
   int n = (int)read(fd, buf, sizeof(buf));
   close(fd);
-  if (n < 32) { emit("M32B-SSH: FAIL keyfile-size\n"); return -1; }
+  if (n < 32) {
+    emit("M32B-SSH: FAIL keyfile-size\n");
+    return -1;
+  }
   emit("M32B-SSH: ok dropbearkey\n");
   return 0;
 }
@@ -1655,13 +1670,21 @@ static int test_dropbear_keygen(void) {
 /* Generate the persistent Ed25519 host key once if it is not already present. */
 static int ssh_ensure_hostkey(void) {
   syscall(SYS_MKDIR, (long)"/etc/ssh", 0700, 0, 0, 0);
+
   int fd = open("/etc/ssh/hk_ed25519", O_RDONLY);
-  if (fd >= 0) { close(fd); return 0; }
+  if (fd >= 0) {
+    close(fd);
+    return 0;
+  }
+
   int kp = fork();
+  if (kp < 0) {
+    return -1;
+  }
   if (kp == 0) {
     char *av[] = {"/bin/dropbearkey", "-t", "ed25519", "-f",
                   "/etc/ssh/hk_ed25519", 0};
-    char *ev[] = {0};
+    char *ev[] = {"HOME=/root", "PATH=/bin", 0};
     execve("/bin/dropbearkey", av, ev);
     _exit(127);
   }

@@ -55,14 +55,21 @@ port_clang_target() {
 port_fetch_tarball() {
   _url="$1"; _tar="$2"; _parent="$3"; _marker="$4"
   mkdir -p "$_parent"
-  if [ ! -e "$_marker" ]; then
-    [ -f "$_tar" ] || { curl -fL "$_url" -o "$_tar" 1>&2 || wget -O "$_tar" "$_url" 1>&2; }
-    case "$_tar" in
-    *.xz)        tar -xJf "$_tar" -C "$_parent" 1>&2 ;;
-    *.gz|*.tgz)  tar -xzf "$_tar" -C "$_parent" 1>&2 ;;
-    *)           tar -xf  "$_tar" -C "$_parent" 1>&2 ;;
-    esac
-  fi
+  (
+    flock -x 9
+    if [ -n "$_marker" ] && [ -e "$_marker" ]; then
+      : # Already extracted
+    else
+      if [ ! -f "$_tar" ]; then
+        curl -fL "$_url" -o "$_tar" 1>&2 || wget -O "$_tar" "$_url" 1>&2
+      fi
+      case "$_tar" in
+      *.xz)        tar -xJf "$_tar" -C "$_parent" 1>&2 || { rm -f "$_tar"; exit 1; } ;;
+      *.gz|*.tgz)  tar -xzf "$_tar" -C "$_parent" 1>&2 || { rm -f "$_tar"; exit 1; } ;;
+      *)           tar -xf  "$_tar" -C "$_parent" 1>&2 || { rm -f "$_tar"; exit 1; } ;;
+      esac
+    fi
+  ) 9>"$_tar.lock"
 }
 
 # Apply patch / sed-snippet files from tools/patches/<port>/ idempotently.

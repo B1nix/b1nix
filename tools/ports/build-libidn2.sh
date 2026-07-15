@@ -16,9 +16,8 @@ port_pre_configure() {
   if [ ! -f "$UNISTR_PREFIX/lib/libunistring.a" ]; then
     "$ROOT_DIR/tools/ports/build-libunistring.sh" >/dev/null
   fi
-  # Recreate build dir to avoid stale state from interrupted builds
-  rm -rf "$BUILD_DIR"
-  mkdir -p "$BUILD_DIR"
+  # Recreate build dir contents to avoid stale state from interrupted builds
+  rm -rf "$BUILD_DIR"/*
   # Extend configure flags with libunistring paths and cache overrides
   # shellcheck disable=SC2016
   AUTOTOOLS_CONFIGURE="$AUTOTOOLS_CONFIGURE \

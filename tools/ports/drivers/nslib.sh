@@ -55,112 +55,114 @@ SRC_PARENT="$ROOT_DIR/build/netsurf-src"
 BUILD_DIR="$ROOT_DIR/build/$NSLIB_NAME-b1nix/$B1NIX_TRIPLET"
 OBJ_DIR="$BUILD_DIR/obj"
 INSTALL_DIR="$BUILD_DIR/install"
-mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
+LOCKFILE="$ROOT_DIR/build/$NSLIB_NAME-$B1NIX_TRIPLET.lock"
+mkdir -p "$(dirname "$LOCKFILE")"
 
-# --- locate / fetch the source tree ---------------------------------------
-if [ "$NSLIB_SOURCE" = "bundle" ]; then
-  : "${NSLIB_BUNDLE_SUBDIR:?bundle manifest must set NSLIB_BUNDLE_SUBDIR}"
-  SRC_DIR="$(ls -d "$SRC_PARENT"/netsurf-all-*/"$NSLIB_BUNDLE_SUBDIR" 2>/dev/null | head -1)"
-  if [ -z "$SRC_DIR" ] || { [ -n "${NSLIB_SENTINEL:-}" ] && [ ! -f "$SRC_DIR/$NSLIB_SENTINEL" ]; }; then
-    echo "build-$NSLIB_NAME.sh: source not found (run build-netsurf-fb.sh first)" >&2
-    exit 1
+(
+  flock -x 9
+  if [ -f "$INSTALL_DIR/lib/$NSLIB_ARCHIVE" ]; then
+    echo "$INSTALL_DIR"
+    exit 0
   fi
-else
-  : "${NSLIB_VERSION:?tarball manifest must set NSLIB_VERSION}"
-  NSLIB_TARBALL="${NSLIB_TARBALL:-${NSLIB_NAME}-${NSLIB_VERSION}-src.tar.gz}"
-  NSLIB_URL="${NSLIB_URL:-https://download.netsurf-browser.org/libs/releases/${NSLIB_TARBALL}}"
-  NSLIB_SRCNAME="${NSLIB_SRCNAME:-${NSLIB_NAME}-${NSLIB_VERSION}}"
-  SRC_DIR="$SRC_PARENT/$NSLIB_SRCNAME"
-  port_fetch_tarball "$NSLIB_URL" "$SRC_PARENT/$NSLIB_TARBALL" "$SRC_PARENT" "$SRC_DIR"
-fi
+  mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
 
-# --- patches (idempotent) + codegen hook ----------------------------------
-if [ -n "${PATCHES:-}" ]; then
-  # shellcheck disable=SC2086
-  port_apply_patches "$SRC_DIR" $PATCHES
-fi
-if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
-
-# --- compose CFLAGS -------------------------------------------------------
-CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-  -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix"
-for _d in $NSLIB_INC_DIRS; do CFLAGS="$CFLAGS -I$SRC_DIR/$_d"; done
-for _dep in ${NSLIB_DEPS:-}; do
-  _inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/$_dep" | tail -1)"
-  CFLAGS="$CFLAGS -I$_inst/include"
-done
-CFLAGS="$CFLAGS ${NSLIB_CFLAGS:-}"
-
-# --- compile helper (hooks may call it for extra/bespoke objects) ---------
-OBJS=""
-nslib_cc() {  # $1 source path, $2.. extra flags
-  _src="$1"; shift
-  case "$_src" in
-  "$SRC_DIR"/*) _rel="${_src#"$SRC_DIR"/}" ;;
-  *)           _rel="$(basename "$_src")" ;;
-  esac
-  _obj="$OBJ_DIR/$(echo "$_rel" | tr '/' '_').o"
-  # shellcheck disable=SC2086
-  $CC $CFLAGS "$@" -c "$_src" -o "$_obj"
-  OBJS="$OBJS $_obj"
-}
-
-# --- assemble the source list ---------------------------------------------
-SOURCES="${NSLIB_SOURCES:-}"
-if [ -z "$SOURCES" ] && [ -n "${NSLIB_FIND_DIR:-}" ]; then
-  if [ -n "${NSLIB_FIND_EXCLUDE:-}" ]; then
-    SOURCES="$(find "$SRC_DIR/$NSLIB_FIND_DIR" -name '*.c' ! -name "$NSLIB_FIND_EXCLUDE" | sort)"
+  # --- locate / fetch the source tree ---------------------------------------
+  if [ "$NSLIB_SOURCE" = "bundle" ]; then
+    : "${NSLIB_BUNDLE_SUBDIR:?bundle manifest must set NSLIB_BUNDLE_SUBDIR}"
+    SRC_DIR="$(ls -d "$SRC_PARENT"/netsurf-all-*/"$NSLIB_BUNDLE_SUBDIR" 2>/dev/null | head -1)"
+    if [ -z "$SRC_DIR" ] || { [ -n "${NSLIB_SENTINEL:-}" ] && [ ! -f "$SRC_DIR/$NSLIB_SENTINEL" ]; }; then
+      echo "build-$NSLIB_NAME.sh: source not found (run build-netsurf-fb.sh first)" >&2
+      exit 1
+    fi
   else
-    SOURCES="$(find "$SRC_DIR/$NSLIB_FIND_DIR" -name '*.c' | sort)"
+    : "${NSLIB_VERSION:?tarball manifest must set NSLIB_VERSION}"
+    NSLIB_TARBALL="${NSLIB_TARBALL:-${NSLIB_NAME}-${NSLIB_VERSION}-src.tar.gz}"
+    NSLIB_URL="${NSLIB_URL:-https://download.netsurf-browser.org/libs/releases/${NSLIB_TARBALL}}"
+    NSLIB_SRCNAME="${NSLIB_SRCNAME:-${NSLIB_NAME}-${NSLIB_VERSION}}"
+    SRC_DIR="$SRC_PARENT/$NSLIB_SRCNAME"
+    port_fetch_tarball "$NSLIB_URL" "$SRC_PARENT/$NSLIB_TARBALL" "$SRC_PARENT" "$SRC_DIR"
   fi
-fi
 
-for _s in $SOURCES; do
-  case "$_s" in
-  /*) nslib_cc "$_s" ;;               # absolute (from find)
-  *)  nslib_cc "$SRC_DIR/$_s" ;;      # relative to SRC_DIR (explicit list)
-  esac
-done
-for _s in ${NSLIB_EXTRA_SOURCES:-}; do
-  case "$_s" in /*) nslib_cc "$_s" ;; *) nslib_cc "$SRC_DIR/$_s" ;; esac
-done
-if command -v port_compile_extra >/dev/null 2>&1; then port_compile_extra; fi
+  # --- patches (idempotent) + codegen hook ----------------------------------
+  if [ -n "${PATCHES:-}" ]; then
+    # shellcheck disable=SC2086
+    port_apply_patches "$SRC_DIR" $PATCHES
+  fi
+  if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
 
-# --- archive --------------------------------------------------------------
-# Rebuild from scratch so a renamed object never leaves a stale member behind
-# (ar 'r' replaces by member name; the driver's object names are uniform and may
-# differ from a port's previous hand-rolled naming).
-rm -f "$INSTALL_DIR/lib/$NSLIB_ARCHIVE"
-# shellcheck disable=SC2086
-"$AR_BIN" rcs "$INSTALL_DIR/lib/$NSLIB_ARCHIVE" $OBJS
+  # --- compose CFLAGS -------------------------------------------------------
+  CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
+    -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
+    -O2 -fno-strict-aliasing -Db1nix"
+  for _d in $NSLIB_INC_DIRS; do CFLAGS="$CFLAGS -I$SRC_DIR/$_d"; done
+  for _dep in ${NSLIB_DEPS:-}; do
+    _inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/$_dep" | tail -1)"
+    CFLAGS="$CFLAGS -I$_inst/include"
+  done
+  CFLAGS="$CFLAGS ${NSLIB_CFLAGS:-}"
 
-# --- headers --------------------------------------------------------------
-nslib_install_headers() {
-  # NSLIB_HEADERS tokens, each "MODE:ARG[:ARG]":
-  #   flat:<relfile>           cp $SRC_DIR/<relfile> -> install/include/
-  #   tree:<reldir>            cp -R $SRC_DIR/<reldir> -> install/include/
-  #   glob:<reldir>            cp $SRC_DIR/<reldir>/*.h -> install/include/
-  #   sub:<subdir>:<relfile>   mkdir install/include/<subdir>; cp file there
-  for _t in $NSLIB_HEADERS; do
-    _mode="${_t%%:*}"; _rest="${_t#*:}"
-    case "$_mode" in
-    flat) cp "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
-    tree) cp -R "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
-    glob) cp "$SRC_DIR/$_rest"/*.h "$INSTALL_DIR/include/" ;;
-    sub)  _sub="${_rest%%:*}"; _file="${_rest#*:}"
-          mkdir -p "$INSTALL_DIR/include/$_sub"
-          cp "$SRC_DIR/$_file" "$INSTALL_DIR/include/$_sub/" ;;
-    *) echo "build-$NSLIB_NAME.sh: bad header token: $_t" >&2; exit 1 ;;
+  # --- compile helper (hooks may call it for extra/bespoke objects) ---------
+  OBJS=""
+  nslib_cc() {  # $1 source path, $2.. extra flags
+    _src="$1"; shift
+    case "$_src" in
+    "$SRC_DIR"/*) _rel="${_src#"$SRC_DIR"/}" ;;
+    *)           _rel="$(basename "$_src")" ;;
+    esac
+    _obj="$OBJ_DIR/$(echo "$_rel" | tr '/' '_').o"
+    # shellcheck disable=SC2086
+    $CC $CFLAGS "$@" -c "$_src" -o "$_obj"
+    OBJS="$OBJS $_obj"
+  }
+
+  # --- assemble the source list ---------------------------------------------
+  SOURCES="${NSLIB_SOURCES:-}"
+  if [ -z "$SOURCES" ] && [ -n "${NSLIB_FIND_DIR:-}" ]; then
+    if [ -n "${NSLIB_FIND_EXCLUDE:-}" ]; then
+      SOURCES="$(find "$SRC_DIR/$NSLIB_FIND_DIR" -name '*.c' ! -name "$NSLIB_FIND_EXCLUDE" | sort)"
+    else
+      SOURCES="$(find "$SRC_DIR/$NSLIB_FIND_DIR" -name '*.c' | sort)"
+    fi
+  fi
+
+  for _s in $SOURCES; do
+    case "$_s" in
+    /*) nslib_cc "$_s" ;;               # absolute (from find)
+    *)  nslib_cc "$SRC_DIR/$_s" ;;      # relative to SRC_DIR (explicit list)
     esac
   done
-}
-if command -v port_install_headers >/dev/null 2>&1; then
-  port_install_headers
-elif [ -n "${NSLIB_HEADERS:-}" ]; then
-  nslib_install_headers
-fi
+  for _s in ${NSLIB_EXTRA_SOURCES:-}; do
+    case "$_s" in /*) nslib_cc "$_s" ;; *) nslib_cc "$SRC_DIR/$_s" ;; esac
+  done
+  if command -v port_compile_extra >/dev/null 2>&1; then port_compile_extra; fi
 
-if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
+  # --- archive --------------------------------------------------------------
+  rm -f "$INSTALL_DIR/lib/$NSLIB_ARCHIVE"
+  # shellcheck disable=SC2086
+  "$AR_BIN" rcs "$INSTALL_DIR/lib/$NSLIB_ARCHIVE" $OBJS
 
-echo "$INSTALL_DIR"
+  # --- headers --------------------------------------------------------------
+  nslib_install_headers() {
+    for _t in $NSLIB_HEADERS; do
+      _mode="${_t%%:*}"; _rest="${_t#*:}"
+      case "$_mode" in
+      flat) cp "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
+      tree) cp -R "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
+      glob) cp "$SRC_DIR/$_rest"/*.h "$INSTALL_DIR/include/" ;;
+      sub)  _sub="${_rest%%:*}"; _file="${_rest#*:}"
+            mkdir -p "$INSTALL_DIR/include/$_sub"
+            cp "$SRC_DIR/$_file" "$INSTALL_DIR/include/$_sub/" ;;
+      *) echo "build-$NSLIB_NAME.sh: bad header token: $_t" >&2; exit 1 ;;
+      esac
+    done
+  }
+  if command -v port_install_headers >/dev/null 2>&1; then
+    port_install_headers
+  elif [ -n "${NSLIB_HEADERS:-}" ]; then
+    nslib_install_headers
+  fi
+
+  if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
+
+  echo "$INSTALL_DIR"
+) 9>"$LOCKFILE"

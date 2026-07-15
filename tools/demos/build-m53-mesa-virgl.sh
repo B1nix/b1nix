@@ -30,7 +30,7 @@ CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 # shellcheck disable=SC2086
 "$CC_CROSS" --target="$B1NIX_TRIPLET" -O2 -ffunction-sections -fdata-sections -Db1nix \
   -DUTIL_ARCH_LITTLE_ENDIAN=1 -DUTIL_ARCH_BIG_ENDIAN=0 \
-  -DHAVE_FUNC_ATTRIBUTE_PACKED=1 \
+  -DHAVE_FUNC_ATTRIBUTE_PACKED=1 -DHAVE_SECURE_GETENV=1 \
   -nostdinc ${CC_RES:+-isystem "$CC_RES/include"} -isystem "$ROOT_DIR/userspace/include" \
   -I "$MESA_SRC/include" -I "$MESA_SRC/src" -I "$MESA_SRC/src/gallium/include" \
   -I "$MESA_SRC/src/gallium/auxiliary" -I "$MESA_SRC/src/mapi" \

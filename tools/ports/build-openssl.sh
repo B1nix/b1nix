@@ -39,7 +39,9 @@ fi
 # Time discipline/touching to avoid autotools/make rebuild dependencies
 find "$SRC_DIR" -exec touch {} +
 
-make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
+  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+fi
 
 (
   cd "$SRC_DIR"

@@ -125,8 +125,12 @@ cp -R "$JXL_INST/lib/." "$SYSROOT/lib/" 2>/dev/null || true
 # NetSurf links via the raw cross-gcc (GCCSDK convention), which finds crt0.o only
 # in its sysroot lib — unlike other ports that pass crt0 explicitly via b1nix-cc.
 # A prior `make clean` wipes rootfs and the kernel/iso build never repopulates it,
-# so do it here. Idempotent and cheap.
-make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs 1>&2
+if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
+  (
+    flock -x 9
+    make -C "$ROOT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs 1>&2
+  ) 9>/tmp/b1nix-userspace-headers.lock
+fi
 
 # Dynamic libc for the GCCSDK raw-cross-gcc link (default): stage the shared
 # libc.so.1 into the cross-gcc's OWN sysroot lib as libc.so, so the implicit
@@ -765,7 +769,7 @@ if [ ! -x "$SYSROOT/bin/nsgenbind" ] && [ -d "$NSALL_DIR/nsgenbind" ]; then
   if [ -d "/opt/homebrew/opt/bison/bin" ]; then
     PATH_WITH_BISON="/opt/homebrew/opt/bison/bin:$PATH_WITH_BISON"
   fi
-  PATH="$PATH_WITH_BISON" make -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
+  PATH="$PATH_WITH_BISON" make -j1 MAKEFLAGS= -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
     NSSHARED="$NSALL_DIR/buildsystem" install 1>&2
 fi
 export PATH="$SYSROOT/bin:$PATH"

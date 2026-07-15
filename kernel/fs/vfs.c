@@ -2849,6 +2849,7 @@ static int vfs_create_at_internal(const char *resolved_path, u32 mode) {
   }
 
   node->inode->blk_dev = parent->inode->blk_dev;
+  node->inode->fs_id   = parent->inode->fs_id;
   copy_path(node->name, 64, name);
   node->inode->type = VFS_FILE;
   node->parent = parent;
@@ -2980,6 +2981,7 @@ static int vfs_mkdir_at_internal(const char *resolved_path, u32 mode) {
   }
 
   node->inode->blk_dev = parent->inode->blk_dev;
+  node->inode->fs_id   = parent->inode->fs_id;
   copy_path(node->name, 64, name);
   node->inode->type = VFS_DIRECTORY;
   node->parent = parent;

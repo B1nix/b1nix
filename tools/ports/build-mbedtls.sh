@@ -41,7 +41,9 @@ fi
 # shim). Extracted to a separate, idempotent patch file (was 7 inline edits).
 sh "$ROOT_DIR/tools/patches/mbedtls/b1nix-config.sh" "$SRC_DIR"
 
-make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
+  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+fi
 
 # mbedTLS PSA wrapper generation depends on python jsonschema.
 # Keep this hermetic by provisioning a local venv under build/.

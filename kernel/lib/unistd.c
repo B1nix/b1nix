@@ -42,8 +42,7 @@ int execve(const char *path, char *const argv[], char *const envp[])
 
 int waitpid(int pid, int *status, int options)
 {
-	(void)options;
-	return (int)syscall_dispatch(SYS_WAITPID, (u64)pid, (u64)(usize)status, 0, 0, 0, 0);
+	return (int)syscall_dispatch(SYS_WAITPID, (u64)pid, (u64)(usize)status, (u64)options, 0, 0, 0);
 }
 
 int stat(const char *path, struct b1nix_stat *st)

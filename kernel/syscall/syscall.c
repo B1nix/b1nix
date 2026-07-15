@@ -23,6 +23,7 @@
 #include <b1nix/filelock.h>
 #include <b1nix/aio.h>
 #include <string.h>
+#include <stdio.h>
 #include <b1nix/version.h>
 
 
@@ -3130,14 +3131,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_execve((const char *)(usize)arg0,
                            (const char **)(usize)arg1,
                            (const char **)(usize)arg2);
-  case SYS_WAIT:
-    /* In-kernel callers (the shell, the smoke launcher) invoke this as
-     * syscall_dispatch(SYS_WAIT, pid, &status): arg0 = pid, arg1 = status.
-     * The userspace libc does NOT use SYS_WAIT — its wait() maps to
-     * SYS_WAITPID(-1, status, 0). */
-    return (u64)scheduler_wait((usize)arg0, (int *)(usize)arg1);
+  case SYS_WAIT: {
+    int kstatus = 0;
+    u64 wr = (u64)scheduler_wait((usize)arg0, &kstatus);
+    if ((isize)wr >= 0 && arg1 && syscall_copyout((void *)(usize)arg1, &kstatus, sizeof(kstatus)) != 0) {
+      return (u64)-EFAULT;
+    }
+    char lbuf[256];
+    snprintf(lbuf, sizeof(lbuf), "SYS_WAIT by %s (pid %d): arg0=%lu, ret=%ld, status=0x%x", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, arg0, (isize)wr, kstatus);
+    klog_warn(lbuf);
+    return wr;
+  }
   case SYS_WAITPID: {
-    u64 wr = (u64)scheduler_waitpid((usize)arg0, (int *)(usize)arg1, (int)arg2);
+    int kstatus = 0;
+    u64 wr = (u64)scheduler_waitpid((usize)arg0, &kstatus, (int)arg2);
+    if ((isize)wr >= 0 && arg1 && syscall_copyout((void *)(usize)arg1, &kstatus, sizeof(kstatus)) != 0) {
+      return (u64)-EFAULT;
+    }
+    char lbuf[256];
+    snprintf(lbuf, sizeof(lbuf), "SYS_WAITPID by %s (pid %d): pid=%ld, options=%d, ret=%ld, status=0x%x", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, (isize)arg0, (int)arg2, (isize)wr, kstatus);
+    klog_warn(lbuf);
     /* ERESTARTSYS conversion and signal delivery handled by the wrapper. */
     return wr;
   }
@@ -3272,7 +3285,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                : (u64)-EPERM;
   }
   case SYS_WAITID: {
-    return (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1, (siginfo_t *)(usize)arg2, (int)arg3);
+    u64 wr = (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1, (siginfo_t *)(usize)arg2, (int)arg3);
+    char lbuf[256];
+    snprintf(lbuf, sizeof(lbuf), "SYS_WAITID by %s (pid %d): idtype=%d, id=%lu, options=%d, ret=%ld", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, (int)arg0, arg1, (int)arg3, (isize)wr);
+    klog_warn(lbuf);
+    return wr;
   }
   case SYS_TIMES: {
     struct tms *user_tms = (struct tms *)(usize)arg0;

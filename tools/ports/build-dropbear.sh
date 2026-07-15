@@ -13,6 +13,7 @@ PHASE="${1:-all}"
 AUTOTOOLS_NAME=dropbear
 AUTOTOOLS_VERSION="${DROPBEAR_VERSION:-2022.83}"
 AUTOTOOLS_URL="https://matt.ucc.asn.au/dropbear/releases/dropbear-${AUTOTOOLS_VERSION}.tar.bz2"
+AUTOTOOLS_TARBALL="dropbear-${AUTOTOOLS_VERSION}.tar.bz2"
 AUTOTOOLS_CONFIGURE="--enable-zlib --disable-pam --disable-syslog --disable-lastlog --disable-utmp --disable-utmpx --disable-wtmp --disable-wtmpx --disable-loginfunc --disable-pututline --disable-pututxline --disable-harden"
 
 port_pre_configure() {

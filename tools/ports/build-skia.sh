@@ -14,7 +14,10 @@ SKIA_DIR="$ROOT_DIR/build/ports-src/skia"
 BUILD_DIR="$ROOT_DIR/build/skia-b1nix"
 INSTALL_DIR="$BUILD_DIR/install"
 
-GN_BIN="${GN_BIN:-$(command -v gn 2>/dev/null || echo "/tmp/gn-bin/gn")}"
+GN_BIN="${GN_BIN:-$(command -v gn 2>/dev/null || \
+  { [ -x "$ROOT_DIR/build/toolchain_build/chromium/src/buildtools/linux64/gn" ] && echo "$ROOT_DIR/build/toolchain_build/chromium/src/buildtools/linux64/gn"; } || \
+  { [ -x "$ROOT_DIR/build/toolchain_build/v8-skeleton/gn-src/out/gn" ] && echo "$ROOT_DIR/build/toolchain_build/v8-skeleton/gn-src/out/gn"; } || \
+  echo "/tmp/gn-bin/gn")}"
 NINJA_BIN="${NINJA_BIN:-$(command -v ninja 2>/dev/null || echo "")}"
 CROSS_CC="$ROOT_DIR/tools/ports/b1nix-cross-cc.sh"
 
@@ -35,11 +38,11 @@ fi
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
 # Serialize concurrent invocations
+mkdir -p "$BUILD_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 LOCK="$BUILD_DIR/.build-lock"
 while ! mkdir "$LOCK" 2>/dev/null; do sleep 1; done
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
-mkdir -p "$BUILD_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 
 # --- Step 1: Fetch Skia source -----------------------------------------------
 if [ ! -d "$SKIA_DIR" ]; then
@@ -68,16 +71,29 @@ deps_file = open('$SKIA_DIR/DEPS').read()
 ext_dir = '$EXT'
 os.makedirs(ext_dir, exist_ok=True)
 
-# Handle both single and double quoted DEPS format
-for m in re.finditer(r'["\x27](third_party/externals/(\w+))["\x27]\s*:\s*["\x27](https://[^"\x27]+)@([0-9a-f]+)["\x27]', deps_file):
+for m in re.finditer(r'["\x27](third_party/externals/([\w-]+))["\x27]\s*:\s*["\x27](https://[^"\x27]+)@([0-9a-f]+)["\x27]', deps_file):
     name = m.group(2)
     url = m.group(3)
+    commithash = m.group(4)
     target = f'{ext_dir}/{name}'
     if not os.path.exists(target):
+        if name in ['v8', 'swiftshader', 'angle2']:
+            print(f'  Fetching {name} (shallow, no checkout)...', flush=True)
+            try:
+                subprocess.run(['git', 'clone', '--depth', '1', url, target],
+                              capture_output=True, timeout=120)
+            except Exception as e:
+                print(f'  WARNING: failed to fetch {name}: {e}')
+            continue
+
         print(f'  Fetching {name}...', flush=True)
         try:
             subprocess.run(['git', 'clone', '--depth', '1', url, target],
                           capture_output=True, timeout=120)
+            res = subprocess.run(['git', 'checkout', '--quiet', commithash], cwd=target, capture_output=True)
+            if res.returncode != 0:
+                subprocess.run(['git', 'fetch', '--unshallow', '--quiet'], cwd=target, capture_output=True)
+                subprocess.run(['git', 'checkout', '--quiet', commithash], cwd=target, capture_output=True)
         except Exception as e:
             print(f'  WARNING: failed to fetch {name}: {e}')
 PYEOF
@@ -139,9 +155,9 @@ cd "$SKIA_DIR"
 # --- Step 6: Build libskia.a (static) + Dawn static lib -----------------------
 # With is_component_build=false, GN produces libskia.a (static archive).
 # The smoke test links statically — no shared libs in initramfs.
-echo "Building libskia.a (cross-compilation, static)..." >&2
+echo "Building libskia.a and modules (cross-compilation, static)..." >&2
 "$NINJA_BIN" -C "$SKIA_OUT" -j"$(nproc 2>/dev/null || echo 4)" \
-  libskia.a 2>&1
+  libskia.a skottie sksg skresources jsonreader skshaper skunicode_core skunicode_icu icu icu_bidi 2>&1
 
 # Build Dawn separately if patches exist (CMake → libdawn_combined.a)
 if [ -d "$SKIA_DIR/third_party/externals/dawn" ]; then

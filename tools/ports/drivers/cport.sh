@@ -49,81 +49,92 @@ BUILD_DIR="$ROOT_DIR/build/$CPORT_NAME-b1nix/$B1NIX_TRIPLET"
 OBJ_DIR="$BUILD_DIR/obj"
 GEN_DIR="$BUILD_DIR/gen"
 INSTALL_DIR="$BUILD_DIR/install"
-mkdir -p "$CPORT_SRC_PARENT" "$OBJ_DIR" "$GEN_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
+LOCKFILE="$ROOT_DIR/build/$CPORT_NAME-$B1NIX_TRIPLET.lock"
+mkdir -p "$(dirname "$LOCKFILE")"
 
-# --- fetch ----------------------------------------------------------------
-if command -v port_fetch >/dev/null 2>&1; then
-  port_fetch
-else
-  : "${CPORT_URL:?manifest must set CPORT_URL or define port_fetch}"
-  : "${CPORT_TARBALL:?manifest must set CPORT_TARBALL or define port_fetch}"
-  port_fetch_tarball "$CPORT_URL" "$CPORT_SRC_PARENT/$CPORT_TARBALL" "$CPORT_SRC_PARENT" \
-    "${CPORT_SENTINEL:+$SRC_DIR/$CPORT_SENTINEL}"
-  [ -n "${CPORT_SENTINEL:-}" ] || port_fetch_tarball "$CPORT_URL" \
-    "$CPORT_SRC_PARENT/$CPORT_TARBALL" "$CPORT_SRC_PARENT" "$SRC_DIR"
-fi
+(
+  flock -x 9
+  if [ -f "$INSTALL_DIR/lib/$CPORT_ARCHIVE" ]; then
+    echo "$INSTALL_DIR"
+    exit 0
+  fi
+  mkdir -p "$CPORT_SRC_PARENT" "$OBJ_DIR" "$GEN_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
 
-# --- patches + codegen/deps hook ------------------------------------------
-if [ -n "${PATCHES:-}" ]; then
-  # shellcheck disable=SC2086
-  port_apply_patches "$SRC_DIR" $PATCHES
-fi
+  # --- fetch ----------------------------------------------------------------
+  if command -v port_fetch >/dev/null 2>&1; then
+    port_fetch
+  else
+    : "${CPORT_URL:?manifest must set CPORT_URL or define port_fetch}"
+    : "${CPORT_TARBALL:?manifest must set CPORT_TARBALL or define port_fetch}"
+    if [ -n "${CPORT_SENTINEL:-}" ]; then
+      port_fetch_tarball "$CPORT_URL" "$CPORT_SRC_PARENT/$CPORT_TARBALL" "$CPORT_SRC_PARENT" "$SRC_DIR/$CPORT_SENTINEL"
+    else
+      port_fetch_tarball "$CPORT_URL" "$CPORT_SRC_PARENT/$CPORT_TARBALL" "$CPORT_SRC_PARENT" "$SRC_DIR"
+    fi
+  fi
 
-# Base freestanding CFLAGS (the port appends its -D/-I via CPORT_CFLAGS, and may
-# extend CPORT_CFLAGS inside port_pre_build once gen dirs / dep dirs are known).
-CFLAGS_BASE="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-  -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -fPIC -Db1nix"
+  # --- patches + codegen/deps hook ------------------------------------------
+  if [ -n "${PATCHES:-}" ]; then
+    # shellcheck disable=SC2086
+    port_apply_patches "$SRC_DIR" $PATCHES
+  fi
 
-if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
+  # Base freestanding CFLAGS (the port appends its -D/-I via CPORT_CFLAGS, and may
+  # extend CPORT_CFLAGS inside port_pre_build once gen dirs / dep dirs are known).
+  CFLAGS_BASE="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
+    -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
+    -O2 -fno-strict-aliasing -fPIC -Db1nix"
 
-CFLAGS="$CFLAGS_BASE ${CPORT_CFLAGS:-}"
+  if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
 
-# --- compile --------------------------------------------------------------
-OBJS=""
-cport_cc() {  # $1 source path, $2.. extra flags; object name = unique per source
-  _src="$1"; shift
-  case "$_src" in
-  "$SRC_DIR"/*) _rel="${_src#"$SRC_DIR"/}" ;;
-  *)            _rel="$(basename "$_src")" ;;
-  esac
-  _obj="$OBJ_DIR/$(echo "$_rel" | tr '/' '_').o"
-  # shellcheck disable=SC2086
-  $CC $CFLAGS "$@" -c "$_src" -o "$_obj"
-  OBJS="$OBJS $_obj"
-}
+  CFLAGS="$CFLAGS_BASE ${CPORT_CFLAGS:-}"
 
-if command -v port_build >/dev/null 2>&1; then
-  port_build
-else
-  for _s in ${CPORT_SOURCES:?manifest must set CPORT_SOURCES or define port_build}; do
-    case "$_s" in /*) cport_cc "$_s" ;; *) cport_cc "$SRC_DIR/$_s" ;; esac
-  done
-fi
-
-# --- archive (clean rebuild) ----------------------------------------------
-rm -f "$INSTALL_DIR/lib/$CPORT_ARCHIVE"
-# shellcheck disable=SC2086
-"$AR_BIN" rcs "$INSTALL_DIR/lib/$CPORT_ARCHIVE" $OBJS
-
-# --- headers --------------------------------------------------------------
-if command -v port_install_headers >/dev/null 2>&1; then
-  port_install_headers
-elif [ -n "${CPORT_HEADERS:-}" ]; then
-  for _t in $CPORT_HEADERS; do
-    _mode="${_t%%:*}"; _rest="${_t#*:}"
-    case "$_mode" in
-    flat) cp "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
-    gen)  cp "$GEN_DIR/$_rest" "$INSTALL_DIR/include/" ;;
-    tree) cp -R "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
-    glob) cp "$SRC_DIR/$_rest"/*.h "$INSTALL_DIR/include/" ;;
-    sub)  _sub="${_rest%%:*}"; _file="${_rest#*:}"
-          mkdir -p "$INSTALL_DIR/include/$_sub"; cp "$SRC_DIR/$_file" "$INSTALL_DIR/include/$_sub/" ;;
-    *) echo "build-$CPORT_NAME.sh: bad header token: $_t" >&2; exit 1 ;;
+  # --- compile --------------------------------------------------------------
+  OBJS=""
+  cport_cc() {  # $1 source path, $2.. extra flags; object name = unique per source
+    _src="$1"; shift
+    case "$_src" in
+    "$SRC_DIR"/*) _rel="${_src#"$SRC_DIR"/}" ;;
+    *)            _rel="$(basename "$_src")" ;;
     esac
-  done
-fi
+    _obj="$OBJ_DIR/$(echo "$_rel" | tr '/' '_').o"
+    # shellcheck disable=SC2086
+    $CC $CFLAGS "$@" -c "$_src" -o "$_obj"
+    OBJS="$OBJS $_obj"
+  }
 
-if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
+  if command -v port_build >/dev/null 2>&1; then
+    port_build
+  else
+    for _s in ${CPORT_SOURCES:?manifest must set CPORT_SOURCES or define port_build}; do
+      case "$_s" in /*) cport_cc "$_s" ;; *) cport_cc "$SRC_DIR/$_s" ;; esac
+    done
+  fi
 
-echo "$INSTALL_DIR"
+  # --- archive (clean rebuild) ----------------------------------------------
+  rm -f "$INSTALL_DIR/lib/$CPORT_ARCHIVE"
+  # shellcheck disable=SC2086
+  "$AR_BIN" rcs "$INSTALL_DIR/lib/$CPORT_ARCHIVE" $OBJS
+
+  # --- headers --------------------------------------------------------------
+  if command -v port_install_headers >/dev/null 2>&1; then
+    port_install_headers
+  elif [ -n "${CPORT_HEADERS:-}" ]; then
+    for _t in $CPORT_HEADERS; do
+      _mode="${_t%%:*}"; _rest="${_t#*:}"
+      case "$_mode" in
+      flat) cp "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
+      gen)  cp "$GEN_DIR/$_rest" "$INSTALL_DIR/include/" ;;
+      tree) cp -R "$SRC_DIR/$_rest" "$INSTALL_DIR/include/" ;;
+      glob) cp "$SRC_DIR/$_rest"/*.h "$INSTALL_DIR/include/" ;;
+      sub)  _sub="${_rest%%:*}"; _file="${_rest#*:}"
+            mkdir -p "$INSTALL_DIR/include/$_sub"; cp "$SRC_DIR/$_file" "$INSTALL_DIR/include/$_sub/" ;;
+      *) echo "build-$CPORT_NAME.sh: bad header token: $_t" >&2; exit 1 ;;
+      esac
+    done
+  fi
+
+  if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
+
+  echo "$INSTALL_DIR"
+) 9>"$LOCKFILE"
