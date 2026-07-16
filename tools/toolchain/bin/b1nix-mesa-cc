@@ -28,13 +28,26 @@ done
 
 B1NIX_INC="$CROSS/$B1NIX_TRIPLET/include"
 EXTRA_FLAGS=""
+MUSL_INC="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+CLANG_INC="$(clang -print-resource-dir 2>/dev/null)/include"
 
 if [ "$USING_CXX" -eq 1 ]; then
   LIBCXX_HDR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
-  # libc++ headers FIRST (for stddef.h wrapper), then b1nix headers
-  EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $B1NIX_INC"
+  # libc++ headers FIRST (for stddef.h wrapper), then musl libc headers when
+  # present (b1nix headers only as a fallback: their errno.h declares
+  # `extern int errno`, a data symbol musl's libc.so does not export --
+  # objects built against them fail to relocate at runtime).
+  if [ -d "$MUSL_INC" ]; then
+    EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $MUSL_INC -idirafter $B1NIX_INC"
+  else
+    EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $B1NIX_INC"
+  fi
 else
-  EXTRA_FLAGS="-isystem $B1NIX_INC"
+  if [ -d "$MUSL_INC" ]; then
+    EXTRA_FLAGS="-nostdinc -isystem $CLANG_INC -isystem $MUSL_INC -idirafter $B1NIX_INC"
+  else
+    EXTRA_FLAGS="-nostdinc -isystem $CLANG_INC -isystem $B1NIX_INC"
+  fi
 fi
 
 if [ "$IS_LINK" -eq 1 ]; then

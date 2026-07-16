@@ -43,6 +43,10 @@ getdents64(217), arch_prctl(158), tkill(200), tgkill(234).
 
 ### Missing syscalls musl requires (~30)
 
+**M92: partial.** All ~30 missing syscalls are implemented in the Linux ABI
+layer (`kernel/syscall/syscall.c`) with entries in `linux_abi.c`. Compiled but
+not verified without a musl-compiled binary.
+
 #### Critical (musl won't compile/link/run without these)
 
 | Linux NR | Name | Implementation strategy |
@@ -92,6 +96,9 @@ getdents64(217), arch_prctl(158), tkill(200), tgkill(234).
 
 ## 2. Struct Layout Compatibility
 
+**M92: partial.** Both struct translations are implemented in the Linux ABI
+layer. Compiled but not fully verified without musl.
+
 ### Already translated in Linux ABI layer
 
 | Struct | b1nix size | Linux size | Translation |
@@ -125,6 +132,15 @@ Current b1nix ELF loader populates only 4 entries:
 - AT_ENTRY(9) — entry point address
 - AT_B1NIX_DSO_INIT(0x1000) — custom DSO init table
 
+**M92: FIXED.** The loader now populates 15 standard auxv entries:
+- AT_NULL(0), AT_PHDR(3), AT_PHENT(4), AT_PHNUM(5), AT_ENTRY(9),
+  AT_PAGESZ(6), AT_BASE(7), AT_CLKTCK(17), AT_UID(11), AT_EUID(12),
+  AT_GID(13), AT_EGID(14), AT_RANDOM(25), AT_HWCAP(16), AT_SECURE(23),
+  AT_EXECFN(31), plus the custom AT_B1NIX_DSO_INIT(0x1000).
+
+AT_PHDR is now correct (was hardcoded to 0). AT_RANDOM provides 16 bytes of
+kernel entropy (rdrand + xorshift64* fallback) for stack canary initialization.
+
 musl requires (minimum):
 
 | Entry | Value | Purpose in musl |
@@ -151,7 +167,10 @@ uninitialized → first printf with format args crashes on stack_chk_fail.
 
 ## 4. clone() Flag Gaps
 
-b1nix supports 7 CLONE flags. musl pthread_create requires:
+**M92: partial.** The Linux ABI clone dispatcher translates the Linux argument
+layout and adds CLONE_PARENT_SETTID/CLONE_CHILD_SETTID flags when
+parent_tid/child_tid pointers are provided. Compiled but not verified without
+musl pthread.
 
 | Flag | Value | Status | Impact |
 |------|-------|--------|--------|
@@ -173,9 +192,9 @@ the thread knows its own TID. Without these, pthread_join may deadlock.
 
 ## 5. Futex Operation Gaps
 
-Current b1nix futex supports only FUTEX_WAIT(0) and FUTEX_WAKE(1).
-
-musl pthread implementations require:
+**M92: partial.** All futex operations musl requires are implemented as
+special-case handlers in the Linux ABI dispatcher. Compiled but not verified
+without musl pthread.
 
 | Op | Name | Purpose |
 |----|------|---------|
@@ -224,38 +243,156 @@ musl's `config.sub` recognizes `b1nix*` targets (already patched via
 
 ---
 
-## 7. Effort Estimate
+## 7. Effort Estimate (actual)
 
-| Task | Days | Priority |
-|------|------|----------|
-| Linux ABI: 11 *at() syscall mappings | 1-1.5 | P0 |
-| Linux ABI: pipe2/dup3/ppoll/pselect6/accept4 | 0.5 | P0 |
-| Linux ABI: clock_nanosleep/set_tid_address/prlimit64 | 0.5 | P0 |
-| Linux ABI: set_robust_list/get_robust_list stubs | 0.25 | P1 |
-| Futex expansion (WAIT_BITSET/WAKE_BITSET/REQUEUE) | 1 | P0 |
-| clone: PARENT_SETTID + CHILD_SETTID | 0.5 | P0 |
-| ELF auxv: populate 12+ missing entries | 0.5 | P0 |
-| struct sigaction Linux ABI translation | 0.5 | P1 |
-| struct termios Linux ABI translation | 0.25 | P1 |
-| musl cross-compile + build integration | 1 | P0 |
-| Smoke test + debugging | 1-2 | P0 |
-| **Total (MVP: Hello world + malloc + printf)** | **~3-4** | |
-| **Total (full pthread)** | **~5-8** | |
+| Task | Estimated | Actual | Priority |
+|------|-----------|--------|----------|
+| Linux ABI: *at() syscall mappings | 1-1.5d | ✅ done (Phase 1) | P0 |
+| Linux ABI: pipe2/dup3/ppoll/pselect6/accept4 | 0.5d | ✅ done (Phase 1) | P0 |
+| Linux ABI: clock_nanosleep/set_tid_address/prlimit64 | 0.5d | ✅ done (Phase 1) | P0 |
+| Linux ABI: set_robust_list/get_robust_list stubs | 0.25d | ✅ done (Phase 1) | P1 |
+| Futex expansion (WAIT_BITSET/WAKE_BITSET/REQUEUE) | 1d | ✅ done (Phase 1) | P0 |
+| clone: PARENT_SETTID + CHILD_SETTID | 0.5d | ✅ done (Phase 1) | P0 |
+| ELF auxv: populate 12+ missing entries | 0.5d | ✅ done (pre-existing) | P0 |
+| struct sigaction Linux ABI translation | 0.5d | ✅ done (Phase 1) | P1 |
+| struct termios Linux ABI translation | 0.25d | ✅ done (Phase 1) | P1 |
+| musl cross-compile + build integration | 1d | ✅ done (Phase 2) | P0 |
+| Kernel bugfixes (AT_PHDR, vm_find_free_area, fork TLS, set_thread_area) | — | ✅ done (Phase 2) | P0 |
+| Smoke test: write/malloc/fork/signal/pipe/open/clock/env | 1-2d | ✅ done (Phase 2) | P0 |
+| **Phase 1+2 total** | **~3-4d** | **done** | |
+| pthread_create+join | — | ❌ remaining | P0 |
+| Socket smoke test | — | ❌ remaining | P1 |
+| Dynamic musl (libc.so.1) | — | planned (Phase 3) | P0 |
 
-### MVP scope (2-3 days)
+### Phase 1 (done): Linux ABI
 
-Get musl's printf, malloc, and basic I/O working:
-- All *at() mappings + pipe2/dup3 + auxv entries + ELF loader fix
-- struct termios translation (needed for stdio)
+All syscall mappings, struct translations, futex expansion, clone flags.
 
-### Full scope (5-8 days)
+### Phase 2 (done): musl smoke test
 
-pthread, condition variables, robust mutexes:
-- clone flags + futex expansion + set_tid_address + struct sigaction
+musl cross-compile, b1nix-musl-cc wrapper, 4 kernel bugfixes, 8/9 tests pass.
+
+### Phase 2 remainder: pthread
+
+pthread_create+join crashes in CLONE_VM child thread. Needs investigation of
+thread trampoline, TLS setup, and mmap address space in clone.
+
+### Phase 3 (working): real userspace ld.so
+
+Replaces the in-kernel eager linker with a genuine userspace dynamic linker
+for musl binaries, per `docs/ldso-migration-and-unix-parity-plan.md`. **A
+binary now boots end-to-end through a real userspace ld.so, with zero
+in-kernel dynamic-linking involvement — `M92-LDSO: done (ok=4 fail=0)`.**
+
+**Kernel (`kernel/user/process.c`):** a binary whose `PT_INTERP` names
+`/lib/ld-musl-x86_64.so.1` gets a real interpreter load. The kernel loads
+only the interpreter's own `PT_LOAD` segments (unrelocated — it
+self-relocates via its own `R_X86_64_RELATIVE` entries, exactly like on
+Linux), sets `AT_BASE`/`AT_ENTRY` correctly, and jumps to the interpreter's
+entry point instead of running the in-kernel eager linker for that binary.
+Every other `PT_INTERP` value keeps the existing eager-linker path unchanged
+— confirmed with a full smoke run (864/5, all 5 failures pre-existing and
+unrelated: 1 b1cc corpus test + 4 M55 iostream tests, neither exercising the
+musl interpreter path at all).
+
+**`tools/b1nix-musl-cc -ldso`:** new link mode. Produces a PIE with a real
+`-Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1`. One post-link fixup is
+required and applied here (not in musl, not a test hack — see root cause
+below): the `DT_NEEDED` string for musl's own `libc.so` is rewritten from its
+embedded `DT_SONAME` (`ld-musl-x86_64.so.1`) to the canonical `libc.so`,
+byte-for-byte in place in `.dynstr` (verified NUL-delimited so it can never
+touch the unrelated `.interp` string), restoring the exact self-reference
+name real musl-gcc toolchains produce.
+
+**Root cause of the crash chased down (not a musl bug):** `ld.so`'s
+`load_library()` recognizes a self-referential `DT_NEEDED` two ways — a
+short hardcoded prefix list (`libc.`, `libpthread.`, ...) or an exact string
+match against `ldso.name` (which gets overwritten to the app's own
+`PT_INTERP` path, e.g. `/lib/ld-musl-x86_64.so.1`, once a real interpreter is
+in play). Our `-ldso` binaries were linked directly against the `.so` file,
+so lld recorded `DT_NEEDED` from its embedded `DT_SONAME`
+(`ld-musl-x86_64.so.1`) — which matches *neither* check (not `lib*`-prefixed,
+and not textually equal to `/lib/ld-musl-x86_64.so.1`). So `ld.so` fell
+through to genuinely re-open and re-map itself as a "new" dependency, where
+it then crashed inside `find_sym`/`sysv_lookup` deduping against itself. Real
+musl-gcc never hits this because it links via `-lc`, producing
+`DT_NEEDED=libc.so` — which matches the hardcoded prefix list immediately, no
+reopen. The `.dynstr` post-link fixup above reproduces that exact upstream
+convention.
+
+**`userspace/bin/m92_musl_ldso_test.c`** + `tests/musl-smoke.sh`: builds and
+embeds an `M92-LDSO` smoke binary (write, malloc, fork+waitpid, getenv — all
+resolved through the real ld.so, zero kernel involvement) alongside the
+existing eager-linker one.
+
+**Known pre-existing, unrelated regression:** `M92-MUSL-DYN` (the *old*
+eager-in-kernel-linker dynamic smoke test) currently SIGSEGVs with the
+current `libc.so` build — this predates and is untouched by the ld.so work
+above (that binary has no `PT_INTERP` at all, so it takes the exact same code
+path as before this session). Not investigated further here; superseded in
+intent by the real-ld.so path.
+
+**Not yet touched:** step 1.3 of the plan (deleting the in-kernel eager
+linker) — correctly deferred until more of the shipped ports (NetSurf, Mesa,
+V8, rustc, ...) are migrated to real interpreters too; they all still depend
+on the eager linker today.
 
 ---
 
-## 8. Risks and Mitigations
+## 8. Kernel Bugs Found During M92 Port
+
+These were discovered while getting musl to run on b1nix. All are fixed.
+
+### 8a. AT_PHDR for ET_EXEC binaries (`process.c`)
+
+**Bug:** `phdr_vaddr = load_base + e_phoff` computed 0x40 for ET_EXEC (file
+offset), but the actual VA is `first_segment_vaddr + (e_phoff - segment_offset)`.
+For a binary loaded at 0x400000, the program headers are at 0x400040, not 0x40.
+
+**Impact:** musl's `__init_tls` iterates program headers via `AT_PHDR`. Reading
+from address 0x40 (unmapped) causes SIGSEGV.
+
+**Fix:** Walk LOAD segments to find the one containing `e_phoff`, compute the
+correct VA. Both `user_load_elf64` and `user_load_elf32` paths updated.
+
+### 8b. `vm_find_free_area` unsorted VMA list (`scheduler.c`)
+
+**Bug:** The VMA list is in reverse-insertion order (newest first), but
+`vm_find_free_area` assumed sorted order. When it encountered a VMA below the
+search start (0x100000000), it set `current_addr = vma->end` (a low address),
+eventually returning an address within the program's .text section.
+
+**Impact:** mmap returned addresses overlapping program code. mallocng's metadata
+stored at page boundaries was corrupted, causing `get_meta` assertion failures
+in `free()`.
+
+**Fix:** Skip VMAs whose `end <= current_addr` (they are below the search start).
+
+### 8c. Fork TLS inheritance (`scheduler.c`)
+
+**Bug:** `scheduler_fork_current` copied `g_task_altstack_sp`, `g_task_nice`,
+`g_task_tgid`, `g_task_ctty_type/index`, `g_task_rlimits` from parent to child,
+but forgot `g_task_tls_base`. Child started with FS base = 0.
+
+**Impact:** Any TLS access in the child (musl's `_Fork` cleanup reads `%fs:0x0`)
+crashes with SIGSEGV.
+
+**Fix:** Added `g_task_tls_base[c_idx] = g_task_tls_base[p_idx]`.
+
+### 8d. `set_thread_area` (NR 205) unmapped (`syscall.c`)
+
+**Bug:** musl's `__set_thread_area` calls `SYS_set_thread_area` (Linux NR 205)
+during `__init_tls`. b1nix doesn't map this syscall, so it returns -ENOSYS.
+musl's `__init_tp` checks the return and calls `a_crash()`.
+
+**Impact:** musl binaries crash during TLS initialization before `main()`.
+
+**Fix:** Added no-op handler that returns 0 (b1nix uses `arch_prctl(ARCH_SET_FS)`
+instead; the GDT-based TLS is not needed on x86_64).
+
+---
+
+## 9. Risks and Mitigations
 
 | Risk | Likelihood | Mitigation |
 |------|-----------|-----------|
@@ -264,3 +401,4 @@ pthread, condition variables, robust mutexes:
 | futex timeout granularity (b1nix uses 10ms ticks) | Low | musl tolerates imprecise sleeps; add a comment |
 | struct sigaction sa_mask size mismatch | Medium | Translation layer handles 8B→128B zero-extension |
 | stack layout assumptions (red zone, alignment) | Low | musl assumes 16-byte aligned stack, b1nix provides this |
+| pthread_create CLONE_VM child thread crash | High | musl's thread trampoline at high mmap address; needs TLS/stack investigation |

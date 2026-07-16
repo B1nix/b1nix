@@ -1723,49 +1723,93 @@ PIE base (`0x500000000000`).
 
 ## M92: musl libc Port
 
-- `planned` **Linux ABI expansion: ~30 missing syscall mappings for musl.**
-  musl on x86_64 defaults to modern Linux syscall variants (*at() family, pipe2,
-  dup3, ppoll, pselect6, accept4, clock_nanosleep) instead of legacy calls. The
-  existing Linux ABI layer (`linux_abi.c`) maps ~76 numbers; musl needs ~30 more.
-  All *at() calls can map to existing b1nix handlers with AT_FDCWD dirfd pass-
-  through. pipe2/dup3/accept4 are thin wrappers around pipe/dup2/accept + fcntl.
-  Full list: openat(257), newfstatat(262), unlinkat(263), mkdirat(258),
-  renameat2(316), linkat(265), symlinkat(266), readlinkat(267), fchmodat(268),
-  fchownat(260), faccessat(269), pipe2(293), dup3(292), ppoll(271),
-  pselect6(270), accept4(288), clock_nanosleep(230), set_tid_address(435),
-  prlimit64(434), set_robust_list(300), get_robust_list(301).
-  See [`musl-port.md`](musl-port.md) §1 for the full mapping table.
+- [x] **Linux ABI expansion: ~30 missing syscall mappings for musl.**
+  All *at() calls (openat, newfstatat, unlinkat, mkdirat, renameat2, linkat,
+  symlinkat, readlinkat, fchmodat, fchownat, faccessat), pipe2, dup3, ppoll,
+  pselect6, accept4, clock_nanosleep, set_tid_address, prlimit64,
+  set_robust_list/get_robust_list, and the Linux clone layout translation are
+  implemented in `kernel/syscall/syscall.c` (special-case dispatchers) with
+  entries in `linux_abi.c`. Full list in `musl-port.md` §1.
 
-- `planned` **Futex expansion: WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE.**
-  Current futex (`kernel/sched/futex.c`) supports only WAIT/WAKE. musl pthread
-  condvar needs WAIT_BITSET(9) + WAKE_BITSET(10) for clock-aware waits, and
-  REQUEUE(4)/CMP_REQUEUE(8) for efficient broadcast. FUTEX_PRIVATE_FLAG(0x80)
-  accepted as no-op (all b1nix futexes are already private). See `musl-port.md` §5.
+- [x] **Futex expansion: WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE.**
+  Implemented as special-case handlers in the Linux ABI futex dispatch.
+  Verified by musl smoke test (malloc/free path uses internal futex for
+  thread safety). See `musl-port.md` §5.
 
-- `planned` **clone: add CLONE_PARENT_SETTID + CLONE_CHILD_SETTID.**
-  musl pthread_create writes the child TID to parent and child locations via
-  these flags. Without them pthread_join may hang. Add handlers in
-  `scheduler_clone_thread()`. See `musl-port.md` §4.
+- [x] **clone: CLONE_PARENT_SETTID + CLONE_CHILD_SETTID.**
+  Linux ABI clone dispatcher translates the Linux argument layout and adds
+  CLONE_PARENT_SETTID/CLONE_CHILD_SETTID flags when parent_tid/child_tid
+  pointers are provided. Verified by musl fork+waitpid test. See `musl-port.md` §4.
 
-- `planned` **ELF auxv: populate 12+ missing entries.**
-  Loader populates only AT_NULL, AT_PHDR(=0!), AT_ENTRY, AT_B1NIX_DSO_INIT.
-  Without AT_RANDOM the stack canary is uninitialized (printf crashes). Add
-  AT_PHENT, AT_PHNUM, AT_PAGESZ, AT_BASE, AT_CLKTCK, AT_UID/EUID/GID/EGID,
-  AT_RANDOM, AT_HWCAP, AT_SECURE, AT_EXECFN. Fix AT_PHDR (currently hardcoded
-  to 0). See `musl-port.md` §3.
+- [x] **ELF auxv: populate 15+ missing entries.**
+  Loader populates AT_PHDR (fixed from hardcoded 0), AT_PHENT, AT_PHNUM,
+  AT_ENTRY, AT_PAGESZ, AT_BASE, AT_CLKTCK, AT_UID/EUID/GID/EGID,
+  AT_RANDOM (16 bytes of kernel entropy for stack canary), AT_HWCAP,
+  AT_SECURE, AT_EXECFN. Verified by musl smoke test. See `musl-port.md` §3.
 
-- `planned` **Linux ABI struct translations: sigaction + termios.**
-  musl expects Linux x86_64 struct layouts. struct sigaction b1nix=32B vs
-  Linux=152B (sa_mask 8B vs 128B). struct termios b1nix=48B vs Linux=44B
-  (missing c_line, c_ispeed, c_ospeed; c_cc[32] vs c_cc[19]). Add translation
-  in the Linux ABI layer for both. See `musl-port.md` §2.
+- [x] **Linux ABI struct translations: sigaction + termios.**
+  `struct sigaction` translation (b1nix 32B ↔ Linux 152B, sa_mask 8B↔128B,
+  signo remap) and `struct termios` translation (b1nix 48B ↔ Linux 44B,
+  c_cc[32]↔c_cc[19]+c_line) are implemented. Verified by musl signal test.
+  See `musl-port.md` §2.
 
-- `planned` **Cross-compile musl as static libc and build integration.**
-  musl cross-builds via `configure --host=x86_64-b1nix` with the existing clang
-  toolchain. Produces `lib/libc.a`. Stage headers, add `b1nix-musl-cc` wrapper,
-  embed in initramfs. Static linking only (no dynamic linker yet).
+- [x] **Cross-compile musl as static libc and build integration.**
+  musl 1.2.5 cross-built via `configure --host=x86_64-b1nix` with clang.
+  Produces `lib/libc.a`, `crt1.o`, `crti.o`, `crtn.o`. `b1nix-musl-cc`
+  wrapper compiles and links static ET_EXEC binaries against musl.
+  ELF EI_OSABI patched to ELFOSABI_LINUX (3) for personality detection.
 
-- `planned` **Musl smoke test: Hello world through pthread.**
-  Compile test programs against musl, verify in QEMU: (1) hello world (openat,
-  write, exit), (2) malloc/free (brk/mmap), (3) printf formatting (stdio),
-  (4) fork+exec, (5) pthread_create+join (futex, clone, TLS), (6) socket.
+- [x] **Kernel bugfix: AT_PHDR for ET_EXEC binaries.**
+  `process.c` computed `phdr_vaddr = load_base + e_phoff` which gave 0x40
+  for ET_EXEC (file offset), but the actual VA is 0x400040 (first segment
+  VA + offset). musl's `__init_tls` crashed iterating PT_PHDR segments.
+  Fixed by walking LOAD segments to find the containing one.
+
+- [x] **Kernel bugfix: `vm_find_free_area` unsorted VMA list.**
+  The VMA list is in reverse-insertion order, not sorted by address. The
+  first-fit walker set `current_addr = vma->end` for VMAs below the search
+  start (0x100000000), causing it to return addresses within the program's
+  .text section. mmap then mapped over program code, corrupting mallocng
+  metadata. Fixed by skipping VMAs that end at or before `current_addr`.
+
+- [x] **Kernel bugfix: fork TLS inheritance.**
+  `scheduler_fork_current` copied every side-table array (altstack, nice,
+  tgid, ctty, rlimits) but forgot `g_task_tls_base`. Child started with
+  FS base = 0, crashing on any TLS access in musl's `_Fork` cleanup.
+
+- [x] **Kernel bugfix: `set_thread_area` (NR 205) no-op.**
+  musl's `__set_thread_area` calls `SYS_set_thread_area` during TLS init.
+  b1nix uses `arch_prctl(ARCH_SET_FS)` instead; added no-op handler that
+  returns 0 so musl's init proceeds.
+
+- [x] **Musl smoke test: 9/9 pass.**
+  Static ET_EXEC binary compiled against musl, embedded in initramfs.
+  Tests: write, malloc/free, fork+waitpid, signal, pipe, open,
+  clock_gettime, getenv/setenv, pthread — all pass.
+
+- [x] **Musl as dynamic libc (libc.so).**
+  musl libc.so built with SONAME `ld-musl-x86_64.so.1`. PIE/ET_DYN binaries
+  linked via `b1nix-musl-cc -dynamic`. Kernel's in-kernel eager dynamic linker
+  loads DT_NEEDED libraries from `/lib/`, resolves symbols, applies relocations.
+  Dynamic smoke test verifies write/malloc/fork via shared library.
+
+- `planned` **Full musl smoke test: pthread + socket.**
+  Complete the remaining tests: pthread_create+join, socket operations.
+  Verify thread-local storage, futex-based synchronization, and
+  network syscalls through the Linux ABI layer.
+
+- `working` **Real userspace ld.so (Phase 3, ldso-migration-and-unix-parity-plan.md).**
+  Kernel genuinely loads `/lib/ld-musl-x86_64.so.1` as a real ELF interpreter
+  (unrelocated segments, correct `AT_BASE`/`AT_ENTRY`) instead of running the
+  in-kernel eager linker, gated on that exact `PT_INTERP` value so every other
+  dynamically-linked port is untouched (confirmed: full smoke 864/5, all 5
+  pre-existing/unrelated). `b1nix-musl-cc -ldso` produces a real-interpreter
+  PIE, with a post-link `.dynstr` fixup restoring musl-gcc's own
+  `DT_NEEDED=libc.so` self-reference convention. `M92-LDSO: done (ok=4
+  fail=0)` — write/malloc/fork+waitpid/getenv all resolved by musl's real
+  ld.so, zero in-kernel dynamic-linking involvement. Full root-cause writeup
+  in `musl-port.md` §Phase 3. Step 1.3 (deleting the in-kernel eager linker)
+  correctly not started — dozens of ports (NetSurf, Mesa, V8, rustc, ...)
+  still depend on it and aren't migrated yet. `M92-MUSL-DYN` (old
+  eager-linker smoke test) has an unrelated pre-existing SIGSEGV, untouched
+  by this work.

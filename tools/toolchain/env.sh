@@ -83,9 +83,15 @@ resolve_cxx_cross() {
 
     # Auto-detect C++ stdlib. The unified runtimes build (build-libcxx.sh) installs
     # BOTH libc++.a and libc++abi.a under libcxx-install/lib. Default to libc++
-    # so we run GCC-free.
-    local libcxx_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++.a"
-    local libcxxabi_a="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
+    # so we run GCC-free. Prefer the musl-built runtimes when present: the
+    # legacy llvm-runtimes-build archives were compiled against the old b1nix
+    # libc headers and reference `errno` as a data symbol musl does not export.
+    local runtimes_home="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build"
+    if [ -f "$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build-musl/libcxx-install/lib/libc++.a" ]; then
+        runtimes_home="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build-musl"
+    fi
+    local libcxx_a="$runtimes_home/libcxx-install/lib/libc++.a"
+    local libcxxabi_a="$runtimes_home/libcxx-install/lib/libc++abi.a"
     if [ -z "$cxx_stdlib" ]; then
         cxx_stdlib="libc++"
     fi
@@ -111,7 +117,7 @@ resolve_cxx_cross() {
                 # b1nix libc headers through --sysroot. A blanket -nostdinc breaks
                 # clang's stddef.h #include_next chain (::nullptr_t goes undefined),
                 # so mirror exactly how libc++ itself + b1nix-c++ are built.
-                local libcxx_hdr="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/libcxx-install/include/c++/v1"
+                local libcxx_hdr="$runtimes_home/libcxx-install/include/c++/v1"
                 local sysroot="$TOOLCHAIN_BUILD_HOME/sysroot"
                 CXXFLAGS_CROSS="--target=$B1NIX_TRIPLET --sysroot=$sysroot -nostdinc++ -isystem $libcxx_hdr"
                 CXXFLAGS_CROSS="$CXXFLAGS_CROSS -O2 -ffunction-sections -fdata-sections -Db1nix"

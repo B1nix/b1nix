@@ -65,7 +65,11 @@ $(LITEHTML_LIB) $(MBEDTLS_LIB) $(LIBUNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(BUILD_DIR)/initramfs_native_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(BUILD_DIR)/initramfs_tcc_files.inc
-INITRAMFS_B1CC_M34_INC := $(BUILD_DIR)/initramfs_b1cc_m34.inc
+# b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus) is temporarily cut
+# from the build; restored as a separate change. B1NIX_NO_B1CC gates the kernel
+# initramfs table (kernel/fs/initramfs.c) and the smoke checks.
+CFLAGS_EXTRA += -DB1NIX_NO_B1CC
+INITRAMFS_B1CC_M34_INC :=
 INITRAMFS_CURL_INC := $(BUILD_DIR)/initramfs_curl.inc
 INITRAMFS_WGET_INC := $(BUILD_DIR)/initramfs_wget.inc
 INITRAMFS_CACERT_INC := $(BUILD_DIR)/initramfs_cacert.inc
@@ -174,7 +178,52 @@ ifeq ($(ARCH),x86_64)
 # but libc++ and i686-b1nix disagree on size_t mangling (unsigned int vs
 # unsigned long), so the i686 clang link fails.
 EMBEDDED_USER_PROGRAMS += m30_dynamic m64_clang_smoke
+# Under musl (musl libc.so installed), drop all C++ binaries and raw-b1nix
+# programs (they use b1nix syscalls/headers, not POSIX, so can't compile
+# with musl headers). Re-enabled once libc++ and the POSIX rewrites land.
+# ── Userspace C library ──
+# LIBC_FLAVOR selects which implementation supplies the userspace runtime. Each
+# flavor defines the same four things and nothing else: where its tree lives,
+# the runtime blob, the loader name its binaries name in PT_INTERP, and the
+# symbol its initramfs blob is emitted under. Consumers below read only those
+# variables, so adding an implementation stays a self-contained block here.
+LIBC_FLAVOR ?= musl
+ifeq ($(LIBC_FLAVOR),musl)
+LIBC_ROOT := build/musl-b1nix/$(B1NIX_TRIPLET)/install/usr
+# musl's libc.so is one file that is BOTH the C library and the dynamic loader
+# (entry _dlstart). It also carries math, threads, timers, dlopen, crypt and the
+# resolver, so -lm/-lpthread/-lrt/-ldl resolve against empty archives at link
+# time and bind here at run time — one blob on the image, not one per facility.
+LIBC_SO := $(wildcard $(LIBC_ROOT)/lib/libc.so)
+LIBC_LDSO_NAME := ld-musl-x86_64.so.1
+LIBC_INC_SYM := vfs_ld_musl_x86_64_so_1
+LIBC_INC_NAME := initramfs_ld_musl_x86_64_so_1.inc
+endif
+
+ifeq ($(LIBC_FLAVOR),musl)
+CXX_RUNTIME_LIB := $(LIBC_ROOT)/lib
+else
+CXX_RUNTIME_LIB := build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib
+endif
+
+MUSL_INSTALLED := $(LIBC_SO)
+ifdef MUSL_INSTALLED
+ifneq ($(MUSL_INSTALLED),)
+CXX_RUNTIME_READY := $(BUILD_DIR)/.libcxx-musl-built
+MUSL_LIBCXX_STAMP := $(BUILD_DIR)/.libcxx-musl-built
+CFLAGS_EXTRA += -DB1NIX_MUSL
+endif
+endif
+ifdef LIBC_SO
+# The selected libc replaces the retired b1nix shared libc: /lib/$(LIBC_LDSO_NAME)
+# is the blob and /lib/libc.so is a symlink onto it (see kernel/fs/initramfs.c).
+INITRAMFS_SHARED_LIBC_INC :=
+INITRAMFS_LD_MUSL_INC := $(BUILD_DIR)/$(LIBC_INC_NAME)
+else
 INITRAMFS_SHARED_LIBC_INC := $(BUILD_DIR)/initramfs_shared_libc.inc
+INITRAMFS_LD_MUSL_INC :=
+endif
+ifndef MUSL_INSTALLED
 INITRAMFS_M69_PLUGIN_INC := $(BUILD_DIR)/initramfs_m69_plugin.inc
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89), linked
 # from the PIC libc++.a/libc++abi.a by build-libcxx-shared.sh. The hosted C++
@@ -194,31 +243,24 @@ INITRAMFS_M91_SO_INCS := \
 	$(BUILD_DIR)/initramfs_libEGL.inc \
 	$(BUILD_DIR)/initramfs_libb1gui.inc
 endif
+endif
 
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(BUILD_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(BUILD_DIR)/ap_trampoline.inc
-# M5/M7 b1cc self-host smoke binaries. kernel/fs/initramfs.c #includes these
-# .inc files unconditionally, so they must be built in BOTH the minimal and the
-# full initramfs (the full build is what the smoke uses). Generated from the
-# b1cc-compiled binaries (see B1CC in userspace/Makefile).
-INITRAMFS_B1CC_INCS := \
-	$(BUILD_DIR)/initramfs_return_42.inc \
-	$(BUILD_DIR)/initramfs_b1cc_hello.inc \
-	$(BUILD_DIR)/initramfs_b1cc_argv.inc \
-	$(BUILD_DIR)/initramfs_b1cc_file_write.inc \
-	$(BUILD_DIR)/initramfs_b1cc_stderr_exit.inc \
-	$(BUILD_DIR)/initramfs_b1cc_better_c.inc \
-	$(BUILD_DIR)/initramfs_b1cc_m34.inc
-# M32/M33: on-device self-host proof. Ships /bin/b1cc (b1cc built by b1nix-cc),
-# its link inputs (/lib/b1cc/crt0.o + libb1nix.a), and the /bin/b1cc-selfsmoke
-# driver. x86_64 only (the internal linker + b1cc_selfsmoke target x86_64-b1nix).
-ifeq ($(ARCH),x86_64)
-INITRAMFS_B1CC_SELFHOST_INC := $(BUILD_DIR)/initramfs_b1cc_selfhost.inc
-INITRAMFS_B1CC_INCS += \
-	$(INITRAMFS_B1CC_SELFHOST_INC) \
-	$(BUILD_DIR)/initramfs_b1cc_selfsmoke.inc
-CFLAGS_EXTRA += -DB1CC_SELFHOST
+# b1cc smoke corpus temporarily cut (B1NIX_NO_B1CC above): embed nothing, and
+# never define B1CC_SELFHOST (the on-device self-host bundle needed the removed
+# old-libc crt0.o/libb1nix.a).
+INITRAMFS_B1CC_INCS :=
+INITRAMFS_B1CC_SELFHOST_INC :=
+
+ifdef MUSL_INSTALLED
+# Under musl the M69 dlopen plugin and the old b1nix-sysroot libc++ are replaced
+# by the musl-linked shared objects in $(LIBC_ROOT)/lib/ (built by
+# tools/ports/build-libcxx-musl.sh). Point the .inc rules at those.
+INITRAMFS_M69_PLUGIN_INC :=
+INITRAMFS_LIBCXX_INC := $(BUILD_DIR)/initramfs_libcxx.inc
+INITRAMFS_LIBCXXABI_INC := $(BUILD_DIR)/initramfs_libcxxabi.inc
 endif
 # Upstream BusyBox is always embedded (M42 full integration).
 ifeq ($(MINIMAL_INITRAMFS),1)
@@ -234,7 +276,8 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_B1CC_INCS) \
 	$(INITRAMFS_B1CC_M34_INC) \
-	$(INITRAMFS_SHARED_LIBC_INC)
+	$(INITRAMFS_SHARED_LIBC_INC) \
+	$(INITRAMFS_LD_MUSL_INC)
 else
 INITRAMFS_INCS := \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
@@ -244,6 +287,7 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_TCC_FILES_INC) \
 	$(INITRAMFS_USER_PROGRAM_INCS) \
 	$(INITRAMFS_SHARED_LIBC_INC) \
+	$(INITRAMFS_LD_MUSL_INC) \
 	$(INITRAMFS_M69_PLUGIN_INC) \
 	$(INITRAMFS_LIBCXX_INC) \
 	$(INITRAMFS_LIBCXXABI_INC) \
@@ -259,11 +303,17 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_M40_LINUX_INC) \
 	$(INITRAMFS_M67_RUST_INC) \
 	$(INITRAMFS_NETSURF_INC) \
-	$(INITRAMFS_M91_SO_INCS)
+	$(INITRAMFS_M91_SO_INCS) \
+	$(BUILD_DIR)/initramfs_m92_musl_dyn_smoke.inc \
+	$(BUILD_DIR)/initramfs_m92_musl_ldso_smoke.inc \
+	$(BUILD_DIR)/initramfs_musl_posix_smoke.inc \
+	$(BUILD_DIR)/initramfs_m92_musl_hello.inc \
+	$(BUILD_DIR)/initramfs_m92_musl_step2.inc \
+	$(BUILD_DIR)/initramfs_m92_musl_raw_diag.inc
 endif
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
-CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/src/curl
-WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/src/wget
+CURL_ELF := build/curl-b1nix/$(B1NIX_TRIPLET)/install/bin/curl
+WGET_ELF := build/wget-b1nix/$(B1NIX_TRIPLET)/install/bin/wget
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/dropbear-b1nix/$(B1NIX_TRIPLET)/dropbearmulti
 BASH_VERSION_NUM := 5.2.37
@@ -501,7 +551,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke build-all
 
-all: check-b1cc-sync $(KERNEL_ELF)
+all: check-b1cc-sync check-tcc-sync $(KERNEL_ELF)
 
 # build-all — one orchestrator that builds the whole working system in dependency
 # order by reusing the existing build scripts (see tools/build-all.sh). Forwards
@@ -643,9 +693,11 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
 
-$(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/include/*.h)
+$(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/*.h) $(wildcard userspace/tcc/include/*.h) $(wildcard userspace/tcc/lib/*.c) $(wildcard userspace/tcc/lib/*.S)
+	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
+	@$(MAKE) -C userspace build/$(ARCH)/tcc/libtcc1.a
 	@mkdir -p $(dir $@)
-	sh tools/images/gen_tcc_initramfs.sh $@
+	B1NIX_ARCH=$(ARCH) sh tools/images/gen_tcc_initramfs.sh $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -796,28 +848,30 @@ TINYGL_LIB := build/tinygl-b1nix/$(B1NIX_TRIPLET)/install/lib/libEGL.a
 $(TINYGL_LIB): tools/ports/build-tinygl.sh userspace/libegl/b1egl.c userspace/include/EGL/egl.h
 	B1NIX_ARCH=$(ARCH) tools/ports/build-tinygl.sh >/dev/null
 
+# ── C++ / Mesa / Skia / Mesa-VirGL .inc rules ──
+# Skipped under musl: these need libc++/libstdc++ which has not been built
+# against musl yet. Placeholder .inc files are pre-created in the build dir.
 $(BUILD_DIR)/initramfs_m52_gl_smoke.inc: userspace/bin/m52_gl_smoke.c $(USERSPACE_DEPS) $(TINYGL_LIB) $(LIBM_LIB)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m52_gl_smoke
 	xxd -i -n vfs_m52_gl_smoke_elf userspace/build/$(ARCH)/bin/m52_gl_smoke > $@
-
 # Hosted C++ runtime smoke. Enable LLVM libc++ against the b1nix libc first
 # (idempotent: stages headers + fixes mbstate_t config), then build via the
 # cross clang C++ wrapper.
-$(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(BUILD_DIR)/initramfs_cxx_smoke.inc: userspace/bin/cxx_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/cxx_smoke
 	xxd -i -n vfs_cxx_smoke_elf userspace/build/$(ARCH)/bin/cxx_smoke > $@
 
-$(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
+$(BUILD_DIR)/initramfs_m64_clang_smoke.inc: userspace/bin/m64_clang_smoke.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-clang++ tools/toolchain/bin/b1nix-c++
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m64_clang_smoke
 	xxd -i -n vfs_m64_clang_smoke_elf userspace/build/$(ARCH)/bin/m64_clang_smoke > $@
 
 # M55: std::iostream + std::filesystem acceptance test (hosted libc++).
-$(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
+$(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSPACE_DEPS) $(CXX_RUNTIME_READY) tools/toolchain/bin/b1nix-c++ tools/toolchain/enable-cxx-toolchain.sh
 	@tools/toolchain/enable-cxx-toolchain.sh $(B1NIX_TRIPLET) >/dev/null 2>&1 || true
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m55_iostream
@@ -826,7 +880,11 @@ $(BUILD_DIR)/initramfs_m55_iostream.inc: userspace/bin/m55_iostream.cpp $(USERSP
 # Serialize the Mesa build to prevent race conditions during parallel builds.
 # M89: Mesa C++ is built against the shared LLVM libc++ (the static Mesa archives
 # fold libc++/libc++abi; the demos link them — see build-m52-mesa-demo.sh).
-$(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(USERSPACE_DEPS)
+# Mesa links against musl + the shared libc++ (toolchain), needing only the musl
+# headers — NOT the userspace binaries. Depending on $(USERSPACE_DEPS) re-ran the
+# whole Mesa build on every userspace-bin change and raced the demos' `-lOSMesa`
+# link against a momentarily-absent libOSMesa.so. Depend on the headers stamp.
+$(BUILD_DIR)/.mesa-built: tools/ports/build-mesa.sh $(BUILD_DIR)/.userspace-headers-installed
 	@mkdir -p $(dir $@)
 	B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/ports/build-mesa.sh >/dev/null
 	@touch $@
@@ -890,7 +948,7 @@ $(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.sk
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
 	@# Replace sysroot stubs with real .so so cross-cc link step finds them
-	@SYSROOT_LIB=build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib; \
+	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
 	for so in libEGL.so libGLESv2.so libfontconfig.so; do \
 		if [ -f userspace/build/$(ARCH)/$$so ]; then \
 			cp -f userspace/build/$(ARCH)/$$so "$$SYSROOT_LIB/$$so"; \
@@ -1159,30 +1217,60 @@ $(INITRAMFS_TLSTEST_INC): $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem
 	xxd -i -n vfs_tls_server_cert_pem $(TLS_TEST_DIR)/server-cert.pem >> $@
 	xxd -i -n vfs_tls_server_key_pem $(TLS_TEST_DIR)/server-key.pem >> $@
 
-$(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS) userspace/linker_pie.ld
+$(BUILD_DIR)/initramfs_m30_pie.inc: userspace/bin/m30_pie.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_pie
 	xxd -i -n vfs_m30_pie_elf userspace/build/$(ARCH)/bin/m30_pie > $@
 
-$(BUILD_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS) userspace/linker_pie.ld userspace/linker_shared.ld
+$(BUILD_DIR)/initramfs_m30_dynamic.inc: userspace/bin/m30_dynamic.c $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/m30_dynamic
 	xxd -i -n vfs_m30_dynamic_elf userspace/build/$(ARCH)/bin/m30_dynamic > $@
 
 ifeq ($(ARCH),x86_64)
-$(INITRAMFS_SHARED_LIBC_INC): $(USERSPACE_DEPS) userspace/linker_shared.ld
+ifdef LIBC_SO
+# /lib/$(LIBC_LDSO_NAME) — the runtime blob, embedded straight from the libc
+# install tree. It is both the C library and the dynamic loader, and it is the
+# only libc blob on the image.
+$(INITRAMFS_LD_MUSL_INC): $(LIBC_SO)
 	@mkdir -p $(dir $@)
-	xxd -i -n vfs_shared_libc_elf userspace/build/$(ARCH)/libc.so.1 > $@
+	xxd -i -n $(LIBC_INC_SYM) $(LIBC_SO) > $@
+endif
 
-# M69: a shared object the m30-dynamic smoke dlopen's at runtime.
-$(INITRAMFS_M69_PLUGIN_INC): userspace/bin/m69_plugin.c $(USERSPACE_DEPS) userspace/linker_shared.ld
+$(BUILD_DIR)/initramfs_m92_musl_dyn_smoke.inc: userspace/bin/m92_musl_dyn_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
 	@mkdir -p $(dir $@)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so
-	xxd -i -n vfs_m69_plugin_elf userspace/build/$(ARCH)/bin/m69_plugin.so > $@
+	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-dyn-smoke
+	xxd -i -n vfs_m92_musl_dyn_smoke_elf $(BUILD_DIR)/m92-musl-dyn-smoke > $@
+
+$(BUILD_DIR)/initramfs_m92_musl_ldso_smoke.inc: userspace/bin/m92_musl_ldso_test.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+	@mkdir -p $(dir $@)
+	tools/b1nix-musl-cc -ldso $< -o $(BUILD_DIR)/m92-musl-ldso-smoke
+	xxd -i -n vfs_m92_musl_ldso_smoke_elf $(BUILD_DIR)/m92-musl-ldso-smoke > $@
+
+$(BUILD_DIR)/initramfs_musl_posix_smoke.inc: userspace/bin/musl_posix_smoke.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+	@mkdir -p $(dir $@)
+	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/musl-posix-smoke
+	xxd -i -n vfs_musl_posix_smoke_elf $(BUILD_DIR)/musl-posix-smoke > $@
+
+$(BUILD_DIR)/initramfs_m92_musl_hello.inc: userspace/bin/m92_musl_hello.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+	@mkdir -p $(dir $@)
+	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-hello
+	xxd -i -n vfs_m92_musl_hello_elf $(BUILD_DIR)/m92-musl-hello > $@
+
+$(BUILD_DIR)/initramfs_m92_musl_step2.inc: userspace/bin/m92_musl_step2.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+	@mkdir -p $(dir $@)
+	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-step2
+	xxd -i -n vfs_m92_musl_step2_elf $(BUILD_DIR)/m92-musl-step2 > $@
+
+$(BUILD_DIR)/initramfs_m92_musl_raw_diag.inc: userspace/bin/m92_musl_raw_diag.c $(USERSPACE_DEPS) $(MUSL_INSTALLED)
+	@mkdir -p $(dir $@)
+	tools/b1nix-musl-cc -dynamic $< -o $(BUILD_DIR)/m92-musl-raw-diag
+	xxd -i -n vfs_m92_musl_raw_diag_elf $(BUILD_DIR)/m92-musl-raw-diag > $@
 
 # /lib/libc++.so.1 + /lib/libc++abi.so.1 — shared LLVM C++ stdlib (M89). One
 # build-libcxx-shared.sh run links BOTH .so from the PIC libc++.a/libc++abi.a; the
 # abi .inc rule depends on the libc++ .inc so the script runs exactly once.
+ifndef MUSL_INSTALLED
 $(INITRAMFS_LIBCXX_INC): tools/toolchain/build-libcxx-shared.sh $(dir $(CROSS_TOOLCHAIN_ROOT))llvm-runtimes-build/libcxx-install/lib/libc++.a $(INITRAMFS_SHARED_LIBC_INC)
 	@mkdir -p $(dir $@)
 	ARCH=$(ARCH) tools/toolchain/build-libcxx-shared.sh >/dev/null
@@ -1191,6 +1279,30 @@ $(INITRAMFS_LIBCXX_INC): tools/toolchain/build-libcxx-shared.sh $(dir $(CROSS_TO
 $(INITRAMFS_LIBCXXABI_INC): $(INITRAMFS_LIBCXX_INC)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_libcxxabi_so1 $(CROSS_TOOLCHAIN_ROOT)/$(B1NIX_TRIPLET)/lib/libc++abi.so.1 > $@
+endif # !MUSL_INSTALLED
+ifdef MUSL_INSTALLED
+# Under musl the C++ shared runtime is the version built against musl libc.
+# The .so files live in $(LIBC_ROOT)/lib/ (same tree as musl libc.so) and are
+# already linked correctly: libc++.so.1 NEEDS libc++abi.so.1 + libc.so, and
+# libc++abi.so.1 NEEDS libc.so — both resolve to ld-musl-x86_64.so.1 via the
+# /lib/libc.so symlink that initramfs.c registers in B1NIX_MUSL mode.
+MUSL_LIBCXX_COMPILER_RT := build/toolchain_build/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a
+
+$(MUSL_LIBCXX_STAMP): tools/ports/build-libcxx-musl.sh $(LIBC_ROOT)/lib/libc.so $(MUSL_LIBCXX_COMPILER_RT)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-libcxx-musl.sh
+	@mkdir -p $(dir $@)
+	@touch $@
+
+$(LIBC_ROOT)/lib/libc++.so.1 $(LIBC_ROOT)/lib/libc++abi.so.1: $(MUSL_LIBCXX_STAMP)
+
+$(INITRAMFS_LIBCXX_INC): $(LIBC_ROOT)/lib/libc++.so.1
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_libcxx_elf $< > $@
+
+$(INITRAMFS_LIBCXXABI_INC): $(LIBC_ROOT)/lib/libc++abi.so.1
+	@mkdir -p $(dir $@)
+	xxd -i -n vfs_libcxxabi_so1 $< > $@
+endif # MUSL_INSTALLED
 endif
 
 $(INITRAMFS_BUSYBOX_INC): tools/ports/build-busybox.sh tools/configs/busybox-1.38.0.config $(USERSPACE_DEPS)
@@ -1226,7 +1338,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: check-b1cc-sync root-image $(KERNEL_ELF)
+iso: check-b1cc-sync check-tcc-sync root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
@@ -1331,9 +1443,12 @@ iso-test: root-image $(KERNEL_ELF)
 
 userspace: $(USERSPACE_DEPS)
 
-.PHONY: check-b1cc-sync
+.PHONY: check-b1cc-sync check-tcc-sync
 check-b1cc-sync:
 	@tools/check-b1cc-sync.sh
+
+check-tcc-sync:
+	@tools/check-tcc-sync.sh
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
@@ -1341,7 +1456,7 @@ userspace-install: userspace
 busybox-package:
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
-# Native toolchain for b1nix self-host: prefer b1nix-native Clang/LLVM, fallback to GCC.
+# Native toolchain for b1nix self-host: b1nix-native Clang/LLVM only (GCC retired).
 # Prefer the DYNAMIC native clang/lld (b1nix-dyn/usr: 44 MB clang + 5.5 MB lld +
 # demand-paged libLLVM-22.so) over the static 94 MB clang when it has been built.
 NATIVE_CLANG_ROOT := $(shell \
@@ -1362,21 +1477,9 @@ install-native-toolchain:
 			echo "  dynamic clang: libLLVM-22.so -> rootfs/lib/ (loader search path)"; \
 		fi; \
 		echo "Native Clang toolchain installed to rootfs/usr/"; \
-	elif [ -n "$(NATIVE_TOOLCHAIN_ROOT)" ]; then \
-		echo "Installing native GCC toolchain (fallback) from $(NATIVE_TOOLCHAIN_ROOT) to rootfs..."; \
-		mkdir -p $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0; \
-		cp -R $(NATIVE_TOOLCHAIN_ROOT)/. $(BUILD_DIR)/rootfs/; \
-		if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" ]; then \
-			cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/libgcc.a" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
-		fi; \
-		for o in crtbegin.o crtend.o crtbeginT.o crtbeginS.o crtendS.o; do \
-			if [ -f "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/$$o" ]; then \
-				cp "$(CROSS_TOOLCHAIN_ROOT)/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/$$o" $(BUILD_DIR)/rootfs/lib/gcc/$(B1NIX_TRIPLET)/13.2.0/; \
-			fi; \
-		done; \
 	else \
-		echo "Note: native toolchain not built."; \
-		echo "      Run tools/build-native-clang.sh --b1nix-elf (preferred) or tools/toolchain/build-native-toolchain.sh (fallback)."; \
+		echo "Note: native Clang toolchain not built."; \
+		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
 install-ports: userspace-install install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(WGET_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
@@ -1467,20 +1570,53 @@ root-image: $(KERNEL_ELF) install-ports $(M91_SHARED_DEPS_STAMP)
 		fi; \
 	done
 	@# Copy any other Mesa install .so files (libEGL, libGLESv2, etc.)
+	@# An unmatched glob expands to itself, so skip non-files rather than
+	@# letting the final [ -f ] decide the loop's (and the recipe's) status.
 	@for so in build/mesa-b1nix/$(B1NIX_TRIPLET)/install/lib/lib*.so.*; do \
-		[ -f "$$so" ] && ! [ -L "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+		if [ -f "$$so" ] && ! [ -L "$$so" ]; then cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
 	done
 	@# Also stage from userspace build dir
 	@for so in userspace/build/$(ARCH)/lib*.so userspace/build/$(ARCH)/lib*.so.*; do \
-		[ -f "$$so" ] && ! [ -L "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+		if [ -f "$$so" ] && ! [ -L "$$so" ]; then cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
 	done
+	@# M69: the runtime-dlopen plugin. Under musl it is served from the ext4
+	@# rootfs (not the initramfs, which only embeds it in the non-musl build), so
+	@# the M30/M69 dlopen smoke can dlopen("/lib/m69_plugin.so") at runtime. Build
+	@# it (it lives in bin/ with a non-lib* name, so the generic glob above misses
+	@# it) and stage it into rootfs/lib.
+	@$(MAKE) -C userspace build/$(ARCH)/bin/m69_plugin.so >/dev/null 2>&1 || true
+	@if [ -f userspace/build/$(ARCH)/bin/m69_plugin.so ]; then \
+		cp -f userspace/build/$(ARCH)/bin/m69_plugin.so $(BUILD_DIR)/rootfs/lib/m69_plugin.so; \
+	fi
 	@# Stage sysroot C++ runtime .so (real, not stubs — EGL/GLESv2/fontconfig
 	@# come from userspace/build/ via build-skia-shared-deps.sh above)
-	@SYSROOT_LIB=build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib; \
+	@SYSROOT_LIB=$(CXX_RUNTIME_LIB); \
 	for so in "$$SYSROOT_LIB"/libc++.so.1 \
 	          "$$SYSROOT_LIB"/libc++abi.so.1 "$$SYSROOT_LIB"/libunwind.so.1; do \
-		[ -f "$$so" ] && cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
+		if [ -f "$$so" ]; then cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; fi; \
 	done
+ifdef LIBC_SO
+	@# The libc blob doubles as the dynamic loader: rootfs binaries request it by
+	@# PT_INTERP (/lib/$(LIBC_LDSO_NAME)) and by DT_NEEDED (libc.so), and reach
+	@# math/threads/timers/dlopen through the same file. Clear any name a previous
+	@# libc left behind first — copying onto a dangling or symlinked name writes
+	@# through it and leaves the tree describing a layout that no longer exists.
+	@rm -f $(BUILD_DIR)/rootfs/lib/libc.so $(BUILD_DIR)/rootfs/lib/libc.so.1 \
+	       $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME) \
+	       $(BUILD_DIR)/rootfs/lib/libm.so $(BUILD_DIR)/rootfs/lib/libm.so.1 \
+	       $(BUILD_DIR)/rootfs/lib/libpthread.so $(BUILD_DIR)/rootfs/lib/librt.so \
+	       $(BUILD_DIR)/rootfs/lib/libdl.so $(BUILD_DIR)/rootfs/lib/libcrypt.so \
+	       $(BUILD_DIR)/rootfs/lib/libutil.so $(BUILD_DIR)/rootfs/lib/libresolv.so
+	@cp -f $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME)
+	@# The ext4 driver may not follow symlinks, so give every name a real
+	@# directory entry. Hard links share one inode: the image carries the bytes
+	@# once no matter how many names point at them.
+	@for name in libc.so libm.so libm.so.1 libpthread.so librt.so libdl.so \
+	             libcrypt.so libutil.so libresolv.so; do \
+		ln -f $(BUILD_DIR)/rootfs/lib/$(LIBC_LDSO_NAME) $(BUILD_DIR)/rootfs/lib/$$name 2>/dev/null || \
+			cp -f $(LIBC_SO) $(BUILD_DIR)/rootfs/lib/$$name; \
+	done
+endif
 	@# Create SONAME hard copies for any .so.N.M files in rootfs/lib
 	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
@@ -1522,8 +1658,13 @@ check-tools:
 clean:
 	@# Preserve build/toolchain_build — cross + native GCC/Binutils take an hour
 	@# to rebuild. Use `make distclean` to wipe everything including the toolchain.
+	@# Also preserve build/musl-b1nix: musl is the sole libc and MUSL_INSTALLED is
+	@# a parse-time $(wildcard libc.so) probe. Wiping musl here made every clean
+	@# rebuild parse with MUSL_INSTALLED empty → the retired non-musl path (old
+	@# crt0.o/libb1nix.a, wrong libc++). musl 1.2.5 is a fixed vendored version;
+	@# `make distclean` still wipes it.
 	@if [ -d build ]; then \
-		find -L build -mindepth 1 -maxdepth 1 ! -name toolchain_build -exec rm -rf {} +; \
+		find -L build -mindepth 1 -maxdepth 1 ! -name toolchain_build ! -name musl-b1nix -exec rm -rf {} +; \
 	fi
 	@$(MAKE) -C userspace clean
 

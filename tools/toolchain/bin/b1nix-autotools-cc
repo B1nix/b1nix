@@ -34,9 +34,15 @@ if [ "$B1NIX_ARCH" = "x86" ]; then
 else
 	TRIPLET="x86_64-b1nix"
 fi
+MUSL_INCLUDE="$PROJECT_DIR/build/musl-b1nix/$TRIPLET/install/usr/include"
 
 # Intercept GCC-specific query flags
 for arg in "$@"; do
+  case "$arg" in
+    --version|-dumpversion|-dumpmachine)
+      exec clang --target="$TARGET" "$@"
+      ;;
+  esac
   if [ "$arg" = "-print-sysroot" ]; then
     echo "$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET"
     exit 0
@@ -99,6 +105,15 @@ for _a in "$@"; do
 done
 
 B1NIX_LINK="${B1NIX_LINK:-dynamic}"
+# Compiler and preprocessor probes do not need b1nix startup objects or a
+# libc link target.  In particular, Meson invokes the wrapper with -E -dM
+# before the musl userspace runtime has been installed.
+B1NIX_NO_RUNTIME=0
+for _a in "$@"; do
+  case "$_a" in
+  -c|-E|-nostdlib) B1NIX_NO_RUNTIME=1 ;;
+  esac
+done
 # Honor a caller-requested static link (e.g. Rust's static ET_EXEC targets pass
 # `-static -no-pie`). Pre-M90 x86_64-b1nix-gcc was real GCC and honored -static;
 # the wrapper must too, otherwise a `-static` link silently produces a dynamic
@@ -120,11 +135,13 @@ for _a in "$@"; do
   esac
 done
 
-if [ "$B1NIX_LINK" = "dynamic" ]; then
+if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" = "dynamic" ]; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
     make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_SHARED_LIBC" "$REL_DYNAMIC_CRT0"
 fi
-[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
+if [ "$B1NIX_NO_RUNTIME" -eq 0 ]; then
+  [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
+fi
 
 CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
 if [ -n "$CLANG_RES_DIR" ]; then
@@ -137,7 +154,12 @@ cflags=("--target=$TARGET")
 if [ -n "$ARCH_FLAGS" ]; then
   cflags+=("$ARCH_FLAGS")
 fi
-cflags+=("-ffreestanding" "-fno-builtin" "-fno-stack-protector" "-nostdinc" "-isystem" "$INCLUDE" "-I" "$INCLUDE")
+cflags+=("-ffreestanding" "-fno-builtin" "-fno-stack-protector" "-nostdinc")
+if [ -d "$MUSL_INCLUDE" ]; then
+  cflags+=("-isystem" "$MUSL_INCLUDE" "-idirafter" "$INCLUDE")
+else
+  cflags+=("-isystem" "$INCLUDE" "-I" "$INCLUDE")
+fi
 if [ -n "$RES_INC" ]; then
   cflags+=($RES_INC)
 fi
