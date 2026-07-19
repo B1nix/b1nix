@@ -9,7 +9,7 @@ MBEDTLS_TARBALL="mbedtls-${MBEDTLS_VERSION}.tar.gz"
 MBEDTLS_URL="https://github.com/Mbed-TLS/mbedtls/archive/refs/tags/v${MBEDTLS_VERSION}.tar.gz"
 CCACHE=""
 command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CCACHE="ccache "
-WRAP="${CCACHE}$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
+WRAP="${CCACHE}$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 # Per-architecture build identity + per-triplet source/build dirs.
@@ -40,10 +40,6 @@ fi
 # PSA, the platform_util.c / timing.c #if gates, and the getrandom entropy
 # shim). Extracted to a separate, idempotent patch file (was 7 inline edits).
 sh "$ROOT_DIR/tools/patches/mbedtls/b1nix-config.sh" "$SRC_DIR"
-
-if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
-  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
-fi
 
 # mbedTLS PSA wrapper generation depends on python jsonschema.
 # Keep this hermetic by provisioning a local venv under build/.

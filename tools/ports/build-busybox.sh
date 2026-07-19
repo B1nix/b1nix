@@ -29,6 +29,11 @@ SYSROOT="$B1NIX_ROOTFS"
 CONFIG_FRAGMENT="$PROJECT_DIR/tools/configs/busybox-${BUSYBOX_VER}.config"
 INSTALL_DIR="${BUSYBOX_INSTALL_DIR:-$SYSROOT/opt/busybox/bin}"
 
+# ── musl paths ──
+MUSL_INSTALL="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_INCLUDE="$MUSL_INSTALL/include"
+MUSL_LIB="$MUSL_INSTALL/lib"
+
 if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
     echo "Error: cross-compiler not found at $CROSS_PREFIX/bin/${TARGET}-gcc"
     echo "Run tools/toolchain/build-toolchain.sh first."
@@ -37,11 +42,16 @@ fi
 
 export PATH="$CROSS_PREFIX/bin:$PATH"
 
-# ── 0. Build & install userspace libc and headers to sysroot ──
+# ── 0. Install musl headers into sysroot ──
+# With musl we don't build the b1nix native libc — just stage musl headers.
+MUSL_INSTALL_HDR="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
 if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
   (
     flock -x 9
-    make -C "$PROJECT_DIR/userspace" install-headers-libs
+    mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$SYSROOT/usr"
+    cp -r "$MUSL_INSTALL_HDR/include/"* "$SYSROOT/include/" 2>/dev/null || true
+    ln -sfn ../include "$SYSROOT/usr/include"
+    ln -sfn ../lib "$SYSROOT/usr/lib"
   ) 9>/tmp/b1nix-userspace-headers.lock
 fi
 
@@ -91,7 +101,7 @@ sh "$PROJECT_DIR/tools/patches/busybox/b1nix-config.sh" "$SRC_DIR"
 mkdir -p "$BUILD_DIR"
 
 echo "Generating BusyBox configuration from $CONFIG_FRAGMENT..."
-make -C "$SRC_DIR" O="$BUILD_DIR" CROSS_COMPILE="${TARGET}-" allnoconfig < /dev/null
+make -C "$SRC_DIR" O="$BUILD_DIR" allnoconfig < /dev/null
 while IFS= read -r setting; do
     case "$setting" in
         CONFIG_*=*)
@@ -111,7 +121,7 @@ while IFS= read -r setting; do
             ;;
     esac
 done < "$CONFIG_FRAGMENT"
-make -C "$SRC_DIR" O="$BUILD_DIR" CROSS_COMPILE="${TARGET}-" oldconfig < /dev/null
+make -C "$SRC_DIR" O="$BUILD_DIR" oldconfig < /dev/null
 
 # Force a clean rebuild when the b1nix sysroot changed since the last BusyBox
 # build. BusyBox's make does not track the sysroot headers / libb1nix.a as
@@ -120,49 +130,33 @@ make -C "$SRC_DIR" O="$BUILD_DIR" CROSS_COMPILE="${TARGET}-" oldconfig < /dev/nu
 # layout — and link them with no warning. Keeping the .config (only the objects
 # are removed) lets the configure step above stand.
 if [ -f "$BUILD_DIR/busybox" ] &&
-   [ "$SYSROOT/lib/libb1nix.a" -nt "$BUILD_DIR/busybox" ]; then
-    echo "b1nix sysroot changed since last BusyBox build; cleaning objects..."
-    make -C "$BUILD_DIR" CROSS_COMPILE="${TARGET}-" clean < /dev/null ||
+   [ "$MUSL_LIB/libc.so" -nt "$BUILD_DIR/busybox" ]; then
+    echo "musl libc changed since last BusyBox build; cleaning objects..."
+    make -C "$BUILD_DIR" clean < /dev/null ||
         rm -f "$BUILD_DIR/busybox"
 fi
 
 # ── 3. Build ────────────────────────────────────────────────────────────────
-echo "Building BusyBox..."
-# Link DYNAMICALLY against the shared libc.so.1 via /lib/ld-b1nix.so (the in-kernel
-# M69 loader resolves it eagerly at spawn), instead of the historical fully-static
-# link. The cross-gcc driver prefers the sysroot's libc.so (-> libc.so.1) over
-# libc.a once -static is dropped, so the executable becomes a dynamically-linked
-# ET_EXEC importing libc from libc.so.1 (COPY relocs for stdout/stderr/errno,
-# JUMP_SLOTs for the functions). crt0's weak __register_frame_info reference goes
-# through the GOT (see crt0.S), so a C-only port that does not pull libgcc_s.so
-# leaves it resolved to 0 and skips eh-frame registration rather than trapping.
-# -L$SYSROOT/lib is required so ld finds the sysroot's libc.so (shared) before the
-# cross toolchain's own x86_64-b1nix/lib/libc.a (static): the gcc-internal lib dir
-# holds only libc.a, so without this -L the link silently falls back to static
-# libc even though -static was dropped.
-# -include sys/sysinfo.h: busybox's libbb.h deliberately does NOT pull in
-# <sys/sysinfo.h> (upstream avoids a conflicting struct sysinfo from linux/
-# headers on some toolchains). free.c/etc. then rely on it being provided by the
-# toolchain's default include chain — which the old cross-GCC did but clang does
-# not, so `struct sysinfo` is an incomplete type. b1nix ships exactly one
-# sys/sysinfo.h (Linux ABI, guarded), so force-including it globally is safe.
-# -Wno-error=implicit-function-declaration / -incompatible-pointer-types /
-# -int-conversion: clang (>=15) promotes these to hard errors; the GCC baseline
-# busybox targets treats them as warnings. Match that leniency for the port (real
-# type bugs in b1nix-authored applets are fixed at the source, e.g. tree.c).
-export EXTRA_CFLAGS="-fcommon --sysroot=$SYSROOT -isystem $SYSROOT/include -include sys/sysinfo.h -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion"
-# -static-libgcc folds the handful of libgcc integer builtins (__udivdi3 etc.)
-# statically instead of importing the shared libgcc_s.so, so busybox — a pure-C
-# port — carries NO DT_NEEDED GCC runtime. This lets the ISO drop libgcc_s.so
-# once no other shipped binary needs it (part of the M89 GCC-free goal).
-# ld.lld >= ~17 removed -Ttext-segment (it errors and points to --image-base).
-# --image-base sets the load address of the first PT_LOAD (headers + text) to the
-# same B1NIX userspace base, which is what we need here.
-export EXTRA_LDFLAGS="-Wl,--image-base=0x2000000 -rtlib=compiler-rt -unwindlib=libunwind -L$SYSROOT/lib --sysroot=$SYSROOT"
+echo "Building BusyBox (musl)..."
+# Link via musl's libc.so through /lib/ld-musl-x86_64.so.1.
+# Use clang with -fuse-ld=lld so the linker goes through ld.lld directly
+# (no gcc/collect2 fallback). The musl wrapper supplies -isystem musl/include,
+# -L musl/lib, -lc, and -Wl,-dynamic-linker.
+# -include sys/sysinfo.h: busybox's libbb.h needs struct sysinfo.
+# -Wno-error flags: match GCC baseline leniency for upstream code.
+MUSL_CC="$PROJECT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
+export EXTRA_CFLAGS="-fcommon -isystem $MUSL_INCLUDE -isystem $SYSROOT/include -Wno-error=implicit-function-declaration -Wno-error=incompatible-pointer-types -Wno-error=int-conversion -D_GNU_SOURCE"
+export EXTRA_LDFLAGS="-rtlib=compiler-rt -unwindlib=libunwind -L$MUSL_LIB -fuse-ld=lld -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 -lc"
+# Build BusyBox as a musl PIE (ET_DYN), exactly like every other ported musl
+# binary (js, id, displayd, ...). The kernel relocates a PIE to the high ASLR
+# base (aslr_pie_base, ~0x500000000000), which the userspace ld.so relocates
+# cleanly. The previous workaround forced a non-PIE ET_EXEC at 0x2000000 in the
+# belief that the "large ET_DYN relocation path" was broken; in fact the opposite
+# is true — PIE ET_DYN loads run, while a *dynamic* ET_EXEC main at 0x2000000 is
+# the one ld.so cannot relocate (its PLT slots stay 0 -> the shell jumps to null
+# at rip=0 before any code runs). PT_INTERP and DT_NEEDED are unchanged.
 
-# BusyBox builds small host-side generators (applets/usage, applet_tables) in
-# the same make invocation as the target binary. Pin those tools to the host
-# Clang toolchain so target linker flags never leak into a Darwin host link.
+# BusyBox builds small host-side generators in the same make invocation.
 HOST_CC="${B1NIX_HOST_CC:-$(command -v clang)}"
 HOST_CXX="${B1NIX_HOST_CXX:-$(command -v clang++)}"
 HOST_LD="${B1NIX_HOST_LD:-$(command -v ld)}"
@@ -170,14 +164,19 @@ TARGET_AR="${B1NIX_AR:-$(command -v llvm-ar 2>/dev/null || command -v /opt/homeb
 TARGET_RANLIB="${B1NIX_RANLIB:-$(command -v llvm-ranlib 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 TARGET_STRIP="${B1NIX_STRIP:-$(command -v llvm-strip 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-strip)}"
 
-# Wire ccache into the busybox build (byte-identical objects, faster rebuilds).
-if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
-  export CC="ccache ${TARGET}-gcc"
-fi
+# Use the musl clang wrapper as CC (links against musl libc.so, PIE + ld.so).
+CCACHE=""
+[ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1 && CCACHE="ccache"
+export CC="$CCACHE $MUSL_CC"
 
-make -C "$BUILD_DIR" -j"$NPROC" CROSS_COMPILE="${TARGET}-" \
+# b1nix's musl loader now correctly adds the linker's symbols to the global
+# lookup (unconditional add_syms(&ldso) in dynlink.c), so lazy PLT resolution
+# works for all interfaces including weak signal functions.  -z now is no
+# longer required and was actually harmful for large binaries.
+
+make -C "$BUILD_DIR" -j"$NPROC" \
     HOSTCC="$HOST_CC" HOSTCXX="$HOST_CXX" HOSTLD="$HOST_LD" \
-    AR="$TARGET_AR" RANLIB="$TARGET_RANLIB" STRIP="$TARGET_STRIP"
+    CC="$CC" AR="$TARGET_AR" RANLIB="$TARGET_RANLIB" STRIP="$TARGET_STRIP"
 
 # ── 4. Install ──────────────────────────────────────────────────────────────
 echo "Installing standalone BusyBox package..."

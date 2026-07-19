@@ -5,7 +5,6 @@
 # uses ld.lld with b1nix sysroot instead of host linker.
 
 CROSS="/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross"
-LIBCXX_HDR="$CROSS/x86_64-b1nix/include/c++/v1"
 CLANG="${B1NIX_CLANG:-clang}"
 CLANGXX="${B1NIX_CLANGXX:-clang++}"
 LLD="${B1NIX_LLD:-$(command -v ld.lld 2>/dev/null || echo /usr/bin/ld.lld)}"
@@ -81,6 +80,13 @@ fi
 
 # Fontconfig + freetype + expat
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+MUSL_INC="$ROOT_DIR/build/musl-b1nix/x86_64-b1nix/install/usr/include"
+MUSL_RUNTIME="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/llvm-runtimes-build-musl"
+if [ -d "$MUSL_RUNTIME/libcxx-install/include/c++/v1" ]; then
+  LIBCXX_HDR="$MUSL_RUNTIME/libcxx-install/include/c++/v1"
+else
+  LIBCXX_HDR="$CROSS/x86_64-b1nix/include/c++/v1"
+fi
 FONTCONFIG_INC="$ROOT_DIR/build/fontconfig-b1nix/x86_64-b1nix/install/include"
 FREETYPE_INC="$SKIA_DIR/third_party/externals/freetype/include"
 EXPAT_INC="$SKIA_DIR/third_party/externals/expat/lib"
@@ -151,8 +157,12 @@ if [ "$IS_LINK" = "1" ]; then
     $MESA_L \
     -D__b1nix__ -D__linux__ -Db1nix \
     -nostdinc++ \
+    -nostdinc \
     -isystem "$LIBCXX_HDR" \
     -isystem "$LIBCXX_HDR/x86_64-unknown-linux-gnu" \
+    -isystem "$(clang -print-resource-dir)/include" \
+    -isystem "$MUSL_INC" \
+    -idirafter "$CROSS/x86_64-b1nix/include" \
     $GL_FLAGS \
     "${ARGS[@]}" \
     -Wl,--start-group \
@@ -169,7 +179,11 @@ else
     -D__b1nix__ -D__linux__ -Db1nix \
     $GL_FLAGS \
     -nostdinc++ \
+    -nostdinc \
     -isystem "$LIBCXX_HDR" \
     -isystem "$LIBCXX_HDR/x86_64-unknown-linux-gnu" \
+    -isystem "$(clang -print-resource-dir)/include" \
+    -isystem "$MUSL_INC" \
+    -idirafter "$CROSS/x86_64-b1nix/include" \
     "$@"
 fi

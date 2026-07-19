@@ -33,7 +33,7 @@ port_build() {
       [ -e "$src" ] || continue
       base=$(basename "$src" .c)
       # Skip long-double (*l) routines: they pull ld80/ld128 arch headers.
-      case "$base" in s_ceil|s_creal) ;; *l) continue;; esac
+      case "$base" in s_ceil|s_creal|s_isnormal) ;; *l) continue;; esac
       # Skip Bessel (j0/j1/jn/y0/y1) and gamma routines: need signgam/j0 globals.
       case "$base" in
         *gamma*|e_j0|e_j1|e_jn|e_y0|e_y1|w_j0|w_j1|w_jn|w_y0|w_y1) continue;;

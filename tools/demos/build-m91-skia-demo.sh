@@ -27,17 +27,30 @@ mkdir -p "$(dirname "$OUTPUT")"
 OUTPUT_ABS="$(cd "$(dirname "$OUTPUT")" 2>/dev/null && pwd)/$(basename "$OUTPUT")"
 mkdir -p "$(dirname "$OUTPUT_ABS")"
 
-# Dawn headers (for graphite-dawn compile check only)
+# Skia itself is an application library, but the executable uses the real
+# dynamic musl runtime like the other C++ smoke binaries.
+make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+  "build/$B1NIX_ARCH/libb1gui.a" 1>&2
+
+# Dawn headers (for graphite-dawn compile check only). Dawn is optional: the
+# CMake build may fail (WARNING in build-skia.sh) — only define HAVE_DAWN when
+# the generated webgpu headers AND the combined static lib actually exist.
 DAWN_DIR="$SKIA/third_party/externals/dawn"
 DAWN_GEN_DIR="$SKIA_OUT/gen/third_party/dawn"
+DAWN_FLAGS=""
+DAWN_LIB=""
+if [ -f "$DAWN_GEN_DIR/include/dawn/webgpu_cpp.h" ] && [ -f "$SKIA_OUT/libdawn_combined.a" ]; then
+  DAWN_FLAGS="-DHAVE_DAWN -I $DAWN_DIR/include -I $DAWN_GEN_DIR/include"
+  DAWN_LIB="$SKIA_OUT/libdawn_combined.a"
+fi
 
 # Compile
 echo "Compiling $NAME (b1nix cross)..." >&2
+# shellcheck disable=SC2086
 "$WRAPPER" -std=c++20 -O2 -ffunction-sections -fdata-sections \
   -I "$SKIA" \
   -I "$MESA/include" \
-  -I "$DAWN_DIR/include" \
-  -I "$DAWN_GEN_DIR/include" \
+  $DAWN_FLAGS \
   -c "$SRC" -o "${OUTPUT_ABS}.o"
 
 # Link — Skia static, Mesa shared via -lOSMesa.
@@ -45,7 +58,8 @@ echo "Linking $NAME (b1nix cross, dynamic Mesa)..." >&2
 
 LLD="${B1NIX_LLD:-$(command -v ld.lld 2>/dev/null || echo /usr/bin/ld.lld)}"
 CROSS_DIR="$CROSS"
-LIBCXX_RT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+LIBCXX_RT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+[ -d "$LIBCXX_RT" ] || LIBCXX_RT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
 LD_M="elf_x86_64"
 
 # Skia static libs: core libskia.a + Skottie module + deps
@@ -64,30 +78,34 @@ done
 # Mesa shared libs — libOSMesa.so is the only consumer-facing lib;
 # shared-glapi=disabled means glapi is folded into libOSMesa.so.
 MESA_LIB="$MESA/lib"
+MUSL_LIB="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
 
 "$LLD" \
   --sysroot="$CROSS_DIR" \
   -m "$LD_M" \
   --hash-style=both \
-  -T "$ROOT_DIR/userspace/linker.ld" \
+  -pie \
+  --dynamic-linker /lib/ld-musl-x86_64.so.1 \
+  --allow-shlib-undefined \
   -z norelro \
-  "$ROOT_DIR/userspace/build/$B1NIX_ARCH/crt/crt0.o" \
-  -L "$SYSROOT_LIB" \
+  "$MUSL_LIB/Scrt1.o" "$MUSL_LIB/crti.o" \
+  -L "$MUSL_LIB" \
   -L "$LIBCXX_RT" \
+  -L "$SYSROOT_LIB" \
   -L "$MESA_LIB" \
-  -L "$ROOT_DIR/userspace/build/$B1NIX_ARCH" \
   "${OUTPUT_ABS}.o" \
   --start-group \
   "$SKIA_A" \
   $SKOTTIE_LIBS \
+  $DAWN_LIB \
   "$SYSROOT_LIB/libEGL_b1nix.a" \
   --whole-archive -lb1nix_c11threads --no-whole-archive \
   "$SYSROOT_LIB/libfontconfig.a" "$SYSROOT_LIB/libfreetype.a" \
   "$SYSROOT_LIB/libz.a" "$SYSROOT_LIB/libexpat.a" \
-  "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libb1nix.a" \
   "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libb1gui.a" \
   -lOSMesa \
-  -Bstatic -lc++ -lc++abi -lunwind -lcompiler_rt -Bdynamic -lpthread -ldl -lm \
+  -Bstatic -lc++ -lc++abi -lunwind -lcompiler_rt -Bdynamic \
+  -L "$MUSL_LIB" -lc -lpthread -ldl "$MUSL_LIB/crtn.o" \
   --end-group \
   --export-dynamic \
   --gc-sections \

@@ -59,6 +59,18 @@ AR="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/ll
 
 mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$PKGDIR"
 
+# ── musl toolchain shim ──
+# NetSurf's framebuffer Makefile.tools derives its compiler from
+# `$(wildcard $(GCCSDK_INSTALL_CROSSBIN)/*gcc)`. Point it at a shim dir whose
+# only *gcc is the musl wrapper, so the whole browser compiles + links against
+# musl via ld.lld (PIE, PT_INTERP=/lib/ld-musl-x86_64.so.1) — no b1nix libc,
+# no host gcc. The wrapper both compiles (-c) and links.
+MUSL_WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
+CROSSBIN="$SYSROOT/toolchain-bin"
+mkdir -p "$CROSSBIN"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-gcc"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-g++"
+
 # ── 1. Build every dependency lib and copy its install tree into the sysroot ──
 # pkgname:builder:libfile:requires
 emit_pc() {
@@ -100,21 +112,26 @@ stage build-libnsfb.sh
 stage build-libjpeg.sh   # libjpeg.a — JPEG image decoding
 stage build-libwebp.sh   # libwebp.a — WebP image decoding
 stage build-openlibm.sh   # libm.a (NetSurf + libpng need cos/sin/floor/pow/modf)
-stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + math)
+stage build-expat.sh    # libexpat.a — XML parsing (SVG/Fontconfig dependency)
+stage build-libsvgtiny.sh # libsvgtiny.a — SVG image decoding (needs libdom + expat + math)
 stage build-libnspsl.sh   # libnspsl.a — public suffix list (cookie/domain scoping)
 stage build-librosprite.sh # librosprite.a — RISC-OS sprite image decoding
 stage build-libutf8proc.sh # libutf8proc.a — Unicode/IDNA (utils/idna.c)
-# libjxl (JPEG-XL, C++) is built against LLVM libc++ (not GCC libstdc++) so nsfb
-# carries no GCC C++ code. Its bundled skcms uses raw AVX/F16C *GCC* intrinsics
-# (__builtin_ia32_vcvtph2ps256) that clang neither compiles nor — as baseline
-# instructions — runs on the plain QEMU CPU (SIGILL). -DSKCMS_PORTABLE forces skcms
-# to its scalar path (N=1): compiles cleanly under clang and runs on any CPU. Highway
-# (the image codec SIMD) is clang-native and does its own runtime ISA dispatch, so it
-# needs no baseline flags.
-JXL_INST="$(CFLAGS='-DSKCMS_PORTABLE' CXXFLAGS='-DSKCMS_PORTABLE' \
-  B1NIX_ARCH="$B1NIX_ARCH" B1NIX_CXX_STDLIB=libc++ "$ROOT_DIR/tools/ports/build-libjxl.sh")"
-cp -R "$JXL_INST/include/." "$SYSROOT/include/" 2>/dev/null || true
-cp -R "$JXL_INST/lib/." "$SYSROOT/lib/" 2>/dev/null || true
+stage build-libjxl.sh    # libjxl_dec/cms + libhwy + libbrotli — JPEG-XL (C++/libc++)
+# libjxl is C++ (built against LLVM libc++). NetSurf itself is C and links via the
+# cross-gcc, so stage the musl-built libc++/libc++abi into the sysroot: the final
+# link pulls the C++ runtime + libc++abi's DWARF unwinder to resolve libjxl's
+# std:: symbols and exception machinery. (libc++abi.a is now musl-clean — same
+# archives Mesa links; see build-mesa.sh's libcxx errno note.)
+# Link libc++/libc++abi dynamically (the musl-built .so.1, resolved at runtime by
+# ld-musl) exactly as Mesa's libOSMesa does. libc++abi.so.1 carries an undefined
+# __cxa_thread_atexit_impl (a glibc primitive musl omits by design); it is only
+# reached if a thread_local with a non-trivial destructor is constructed, which
+# libjxl's decode path does not do, so --allow-shlib-undefined tolerates it at
+# link time — the same lenient shlib linking Mesa relies on.
+cp "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/"libc++.so* \
+   "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/"libc++abi.so* \
+   "$SYSROOT/lib/" 2>/dev/null || true
 # NOTE: libharu (PDF export) is ported as a standalone library
 # (tools/ports/build-libharu.sh builds libhpdf.a), but NetSurf 3.11's PDF glue is
 # upstream bit-rot — desktop/font_haru.c needs the removed desktop/font.h and a
@@ -132,17 +149,8 @@ if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
   ) 9>/tmp/b1nix-userspace-headers.lock
 fi
 
-# Dynamic libc for the GCCSDK raw-cross-gcc link (default): stage the shared
-# libc.so.1 into the cross-gcc's OWN sysroot lib as libc.so, so the implicit
-# `-lc` resolves to the shared library (dynamic) instead of the static
-# libb1nix.a — the same way gcc already picks up libgcc_s.so. The result is an
-# nsfb that imports libc from /lib/libc.so.1 via the in-kernel loader.
-# B1NIX_LINK=static leaves the historical static libc fold in place.
-if [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libc.so.1" ]; then
-  CROSS_SYSROOT_LIB="$TOOLCHAIN_BUILD_HOME/cross/$B1NIX_TRIPLET/lib"
-  cp "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libc.so.1" "$CROSS_SYSROOT_LIB/libc.so.1"
-  ln -sf libc.so.1 "$CROSS_SYSROOT_LIB/libc.so"
-fi
+# libc comes from musl via the wrapper (musl Scrt1.o + -l:libc.so, DT_NEEDED
+# libc.so, PT_INTERP /lib/ld-musl-x86_64.so.1) — no b1nix libc staging needed.
 
 # libb1gui: the b1nix display-server (displayd / b1display) client library, used
 # by libnsfb's "displayd" surface so NetSurf can run as a windowed, interactive
@@ -156,9 +164,12 @@ cp "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libb1gui.a" "$SYSROOT/lib/"
 OLM_SRC="$(ls -d "$ROOT_DIR"/build/openlibm-src/openlibm-*/ 2>/dev/null | head -1)"
 if [ -n "$OLM_SRC" ]; then
   if [ "$B1NIX_ARCH" = "x86" ]; then OLM_ARCH=i387; else OLM_ARCH=amd64; fi
+  _MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+  _CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
   OLM_CFLAGS="--target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector
-    -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-    -O2 -Db1nix -I$OLM_SRC -I${OLM_SRC}src -I${OLM_SRC}include -I${OLM_SRC}$OLM_ARCH -I${OLM_SRC}bsdsrc"
+    -nostdinc -isystem $_MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include}
+    -idirafter $ROOT_DIR/userspace/include
+    -O2 -Db1nix -D__linux__ -I$OLM_SRC -I${OLM_SRC}src -I${OLM_SRC}include -I${OLM_SRC}$OLM_ARCH -I${OLM_SRC}bsdsrc"
   for k in k_exp k_expf; do
     # shellcheck disable=SC2086
     $CC $OLM_CFLAGS -c "${OLM_SRC}src/$k.c" -o "$SYSROOT/lib/olm_$k.o"
@@ -166,45 +177,10 @@ if [ -n "$OLM_SRC" ]; then
   "${AR:-llvm-ar}" r "$SYSROOT/lib/libm.a" "$SYSROOT/lib/olm_k_exp.o" "$SYSROOT/lib/olm_k_expf.o" 2>/dev/null
 fi
 
-# ── 1a. POSIX compat shims NetSurf references that the b1nix libc lacks ──
-# scandir/fstatat/unlinkat (dir + *at file ops, used by the file fetcher and the
-# filename cache), isascii, fenv stubs and scalbnl (openlibm leaves these to the
-# platform, which b1nix doesn't provide). Built into libb1nixcompat.a on top of
-# what b1nix DOES provide (opendir/readdir, stat/lstat, unlink/rmdir, scalbn).
-COMPAT_C="$ROOT_DIR/build/netsurf-sysroot/nscompat.c"
-cat >"$COMPAT_C" <<'EOF'
-/* b1nix POSIX compat shims for the NetSurf port. */
-#include <dirent.h>
-#include <stdlib.h>
-#include <string.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#include <fcntl.h>
-#include <fenv.h>
-#include <math.h>
-
-/* openlibm's exp/pow routines mask FP exceptions via fenv; b1nix has no FP
- * exception state to manage, so these are correctness-preserving no-ops. */
-int fegetenv(fenv_t *e) { (void)e; return 0; }
-int fesetenv(const fenv_t *e) { (void)e; return 0; }
-int feholdexcept(fenv_t *e) { (void)e; return 0; }
-int feupdateenv(const fenv_t *e) { (void)e; return 0; }
-
-/* Long-double scalbn: b1nix graphics/browser code only needs double precision,
- * so route through the double implementation. */
-long double scalbnl(long double x, int n) { return (long double)scalbn((double)x, n); }
-
-/* Complex accessors: openlibm's k_exp.c also defines the (unused) complex
- * __ldexp_cexp helper, which references these. Trivial real/imag extraction. */
-double creal(double _Complex z) { return __real__ z; }
-double cimag(double _Complex z) { return __imag__ z; }
-float crealf(float _Complex z) { return __real__ z; }
-float cimagf(float _Complex z) { return __imag__ z; }
-EOF
-$CC --target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector \
-  -nostdinc -isystem "$ROOT_DIR/userspace/include" -I"$ROOT_DIR/userspace/include" \
-  -O2 -Db1nix -c "$COMPAT_C" -o "$SYSROOT/lib/nscompat.o"
-"${AR:-llvm-ar}" rcs "$SYSROOT/lib/libb1nixcompat.a" "$SYSROOT/lib/nscompat.o"
+# ── 1a. No POSIX compat shims needed under musl ──
+# musl's libc/libm already provide everything the earlier b1nix libc lacked
+# (scandir/fstatat/unlinkat/isascii, the fenv API, scalbnl, creal/cimag), so the
+# libb1nixcompat.a shim archive is gone. -lb1nixcompat is dropped from libnsfb.pc.
 
 # ── Stage libcurl + mbedTLS so NetSurf's HTTP(S) fetcher can be enabled. The
 #    b1nix curl port is built static against mbedTLS; we expose libcurl.a, the
@@ -275,27 +251,22 @@ emit_pc libsvgtiny      "-lsvgtiny -lexpat" "libdom libwapcaplet"
 emit_pc libnspsl        "-lnspsl"         ""
 emit_pc librosprite     "-lrosprite"      ""
 emit_pc libutf8proc     "-lutf8proc"      ""
-# libjxl is C++ (built against LLVM libc++, see the libc++ build above) with circular
-# static deps between jxl_dec/jxl_cms/hwy — group them and fold the LLVM C++ runtime
-# statically (libc++.a + libc++abi.a + libunwind.a) so the C-linked nsfb resolves the
-# std::__1 symbols with NO GCC libstdc++ code. libc++abi folds the libunwind DWARF
-# unwinder for libjxl's C++ exceptions.
-NS_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-NS_LLVMRT="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib"
-emit_pc libjxl  "-Wl,--start-group -ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotlicommon -Wl,--end-group -Wl,-Bstatic $NS_LIBCXX/libc++.a $NS_LIBCXX/libc++abi.a $NS_LLVMRT/libunwind.a -Wl,-Bdynamic" ""
+# JPEG-XL: libjxl_dec is the decoder; jxl_cms the colour management; libhwy the
+# SIMD runtime; brotli the entropy backend (all static). The C++ runtime is the
+# musl-built libc++.so.1 / libc++abi.so.1, linked dynamically and resolved at
+# runtime by ld-musl (exact -l:soname, no dev symlink needed). --allow-shlib-
+# undefined tolerates libc++abi's UND __cxa_thread_atexit_impl (never reached by
+# the decode path). Static consumers before their C++ .so deps.
+emit_pc libjxl "-ljxl_dec -ljxl_cms -lhwy -lbrotlidec -lbrotlicommon -Wl,--allow-shlib-undefined -l:libc++.so.1 -l:libc++abi.so.1" ""
 # libnsfb is always linked by the framebuffer frontend. NetSurf already adds its
-# own -lm (after -lpng16), so only the compat shims go here — and they must come
-# last so libm's fenv/scalbnl/creal references resolve against them.
-# --allow-multiple-definition: on i686 the b1nix libc and libgcc both provide the
-# 64-bit division helpers (__udivdi3/__divdi3); they're identical, so let the
-# first win instead of erroring. (No such overlap on x86_64.)
+# own -lm (after -lpng16).
 # --whole-archive libnsfb: the surface backends (ram/b1nixfb/displayd) self-register
 # ONLY via __attribute__((constructor)); nothing references their symbols, so plain
 # archive semantics leave them out entirely — nsfb then knows zero surfaces
 # ("Unknown surface `ram`"). Whole-archiving libnsfb pulls every surface object so
-# its constructor lands in .init_array (which b1nix crt0 runs). -lb1gui/-lb1nixcompat
-# stay outside the whole-archive (they ARE referenced, by the displayd surface).
-emit_pc libnsfb         "-Wl,--allow-multiple-definition -Wl,--whole-archive -lnsfb -Wl,--no-whole-archive -lb1gui -lb1nixcompat" ""
+# its constructor lands in .init_array (which musl's Scrt1 startup runs). -lb1gui
+# stays outside the whole-archive (it IS referenced, by the displayd surface).
+emit_pc libnsfb         "-Wl,--allow-multiple-definition -Wl,--whole-archive -lnsfb -Wl,--no-whole-archive -lb1gui" ""
 
 # ── 1a0. Toolchain fix: this cross-gcc's limits.h does not chain to the sysroot
 # system limits.h (it lacks the _GCC_NEXT_LIMITS_H re-include block), so POSIX
@@ -812,28 +783,11 @@ else
 fi
 
 # HOST only names NetSurf's per-build OBJROOT (build/$(HOST)-$(TARGET)); the
-# actual target compiler comes from GCCSDK_INSTALL_CROSSBIN. Key it by arch so
-# the x86 and x86_64 builds don't share (and overwrite) each other's objects.
-# -static-libgcc: fold the libgcc integer/soft-float builtins (__udivmodti4 etc.)
-# statically so nsfb carries NO DT_NEEDED libgcc_s.so. This is only safe because
-# libjxl's C++ runtime is now forced STATIC (-Wl,-Bstatic -lstdc++, see emit_pc
-# libjxl below) — with a shared libstdc++.so DSO in the link, ld rejected the
-# hidden static __udivmodti4 it referenced. With both the C++ stdlib and libgcc
-# folded, nsfb's only DT_NEEDED is libc.so.1, letting the ISO drop libgcc_s.so.
-# --defsym __dso_handle=0: the clang-built libc++ libjxl references __dso_handle
-# (the __cxa_atexit DSO token for static-object destructors), which b1nix's cross-gcc
-# crtbegin does not provide on this newlib target for a C-driver link. 0 = "the main
-# program", the correct token for a non-PIE executable.
+# actual target compiler comes from GCCSDK_INSTALL_CROSSBIN (the musl wrapper
+# shim). Key it by arch so the x86 and x86_64 builds don't share objects.
+# The musl wrapper handles crt/libc/PIE/linker-script itself, so no libgcc,
+# libc++, dso_handle or custom linker script is needed here (JPEG-XL/C++ off).
 export CFLAGS="${CFLAGS:-} -fPIC"
-export CXXFLAGS="${CXXFLAGS:-} -fPIC"
-export LDFLAGS="${LDFLAGS:-} -rtlib=compiler-rt -unwindlib=libunwind -Wl,--defsym=__dso_handle=0 -Wl,-z,notext"
-# nsfb folds libc++/libjxl and depends on C++ exceptions (libjxl decode throws on
-# its slow paths). The cross driver's default linker.ld drops .eh_frame /
-# .eh_frame_hdr / .gcc_except_table, so unwinding is dead and JXL/SVG/JS decode
-# silently yields nothing. Link with linker-libcxx.ld (KEEPs the unwind sections
-# + the .ctors.* static-init glob) and emit PT_GNU_EH_FRAME via --eh-frame-hdr.
-export B1NIX_LINKER="$ROOT_DIR/userspace/linker-libcxx.ld"
-export B1NIX_LD_EXTRA="--eh-frame-hdr"
 make -C "$SRC_DIR" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \

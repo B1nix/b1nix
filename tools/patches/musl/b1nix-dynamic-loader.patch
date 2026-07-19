@@ -1,0 +1,18 @@
+--- a/src/signal/sigaction.c
++++ b/src/signal/sigaction.c
+@@ -115,4 +115,8 @@
+ 	return r;
+ }
+ 
+-weak_alias(__sigaction, sigaction);
++int sigaction(int sig, const struct sigaction *restrict sa,
++              struct sigaction *restrict old)
++{
++	return __sigaction(sig, sa, old);
++}
+--- a/ldso/dynlink.c
++++ b/ldso/dynlink.c
+@@ -1969,2 +1969,3 @@
+ 	load_deps(&app);
++	add_syms(&ldso);
+ 	for (struct dso *p=head; p; p=p->next)

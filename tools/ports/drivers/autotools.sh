@@ -35,7 +35,7 @@
 
 AUTOTOOLS_TARBALL="${AUTOTOOLS_TARBALL:-${AUTOTOOLS_NAME}-${AUTOTOOLS_VERSION}.tar.gz}"
 AUTOTOOLS_SRCNAME="${AUTOTOOLS_SRCNAME:-${AUTOTOOLS_NAME}-${AUTOTOOLS_VERSION}}"
-AUTOTOOLS_CC="${AUTOTOOLS_CC:-$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc}"
+AUTOTOOLS_CC="${AUTOTOOLS_CC:-$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc}"
 AR_BIN="$(port_ar)"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
@@ -93,9 +93,10 @@ if [ -f "$SRC_DIR/configure" ] && [ "$(stat -c %Y "$SRC_DIR/configure" 2>/dev/nu
     -exec touch -t 202001010000 {} + 1>&2
 fi
 
-# --- ensure userspace libc is built --------------------------------------
-if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
-  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+# --- ensure musl libc is built -------------------------------------------
+# Ports link against musl's libc.so + Scrt1.o (the b1nix native libc is retired).
+if [ ! -f "$(port_musl_lib)/libc.so" ]; then
+  B1NIX_ARCH="$B1NIX_ARCH" sh "$ROOT_DIR/tools/ports/build-musl.sh" 1>&2
 fi
 
 # --- pre-configure hook ---------------------------------------------------

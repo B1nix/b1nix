@@ -32,35 +32,28 @@ if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
 fi
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/libb1gui.a" \
-  "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+  "build/$B1NIX_ARCH/libb1gui.a" 1>&2
 
 OBJ="$(dirname "$OUT")/$DEMO.o"
 mkdir -p "$(dirname "$OUT")"
 CC_CROSS="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-gcc")}"
 CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 # shellcheck disable=SC2086
-"$CC_CROSS" --target="$B1NIX_TRIPLET" -O2 -ffunction-sections -fdata-sections -Db1nix \
-  -nostdinc ${CC_RES:+-isystem "$CC_RES/include"} -isystem "$ROOT_DIR/userspace/include" -I "$MESA/include" \
+"$CC_CROSS" --target="$B1NIX_TRIPLET" -O2 -fPIC -ffunction-sections -fdata-sections -Db1nix \
+  -nostdinc ${CC_RES:+-isystem "$CC_RES/include"} -isystem "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include" -idirafter "$ROOT_DIR/userspace/include" -I "$MESA/include" \
   -c "$ROOT_DIR/userspace/bin/$DEMO.c" -o "$OBJ"
 
-# Dynamic by default: libc from the shared libc.so.1 via /lib/ld-b1nix.so (d8
-# model); B1NIX_LINK=static restores the whole-archive static link.
-if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
-  DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC="--whole-archive $UB/libb1nix.a --no-whole-archive"
-else
-  DYN_CRT0="$UB/crt/crt0-dynamic.o"; DYN_FLAGS="--dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv"; DYN_LIBC="$UB/libc.so.1"
-fi
+# Link the executable against the real musl dynamic loader and libc.
+MUSL_LIB="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+BUILTINS_LIB="$(clang -print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64.a"
+DYN_CRT0="$MUSL_LIB/Scrt1.o"
+DYN_FLAGS="-pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LIB"
+DYN_LIBC="$MUSL_LIB/crti.o -lc $MUSL_LIB/crtn.o $BUILTINS_LIB"
 # Linker script: linker-cxx.ld (GCC/libgcc) vs linker-libcxx.ld (libc++/libunwind:
 # maps the program headers + keeps .eh_frame_hdr so libunwind unwinds via
 # dl_iterate_phdr — required even for the statically-folded libc++ in this exe).
-LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
-if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
-  LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
-  # libunwind finds FDEs via PT_GNU_EH_FRAME (.eh_frame_hdr); emit it.
-  DYN_FLAGS="$DYN_FLAGS --eh-frame-hdr"
-fi
+LINKER_ARGS=""
 # Use LLVM runtimes when available, else fall back to libgcc. With libc++ the
 # unwinder is already inside the folded libc++abi.a (STDLIB_ABI_CROSS_A), so do NOT
 # add the standalone libunwind.a too (duplicate _Unwind_*).
@@ -78,7 +71,13 @@ fi
 # /mnt/root in test mode so the dynamic linker finds libOSMesa.so.8 at runtime.
 MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
 # shellcheck disable=SC2046,SC2086
-"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
+# libOSMesa.so carries a few undefined symbols (e.g. `errno` referenced by Mesa's
+# flex-generated GLSL lexer) that b1nix's dynamic linker resolves/ignores at
+# runtime — mirroring the -Wl,--unresolved-symbols=ignore-all the Mesa shared
+# libs are built with. ld.lld defaults to --no-allow-shlib-undefined when linking
+# an executable, which would reject those; allow them so the demo links as it did
+# before (the same libOSMesa.so already passes the M52 runtime tests).
+"$LD" -m "$LDEMU" $LINKER_ARGS --gc-sections --allow-shlib-undefined \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$OBJ" \
   -L "$MESA_LIB" \

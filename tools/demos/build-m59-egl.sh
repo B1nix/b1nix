@@ -26,9 +26,15 @@ MESA="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-mesa.sh")"
 LIBM="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-openlibm.sh")/lib/libm.a"
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/libb1gui.a" \
-  "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+MUSL_USR="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+if [ -f "$MUSL_USR/lib/libc.so" ]; then
+  make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+    "build/$B1NIX_ARCH/libb1gui.a" 1>&2
+else
+  make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
+    "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/libb1gui.a" \
+    "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+fi
 
 OUTDIR="$(dirname "$OUT")"
 mkdir -p "$OUTDIR"
@@ -38,15 +44,41 @@ EGL_OBJ="$OUTDIR/b1egl_mesa.o"
 CC_CROSS="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-gcc")}"
 CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 
-CFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix \
-  --target=$B1NIX_TRIPLET -nostdinc ${CC_RES:+-isystem $CC_RES/include} -isystem $ROOT_DIR/userspace/include -I $MESA/include"
+if [ -f "$MUSL_USR/lib/libc.so" ]; then
+  CFLAGS="-O2 -fPIC -fPIE -ffunction-sections -fdata-sections -Db1nix \
+    --target=x86_64-unknown-elf -ffreestanding -fno-builtin -nostdinc \
+    ${CC_RES:+-isystem $CC_RES/include} -isystem $MUSL_USR/include \
+    -isystem $ROOT_DIR/userspace/include -I $MESA/include"
+else
+  CFLAGS="-O2 -ffunction-sections -fdata-sections -Db1nix \
+    --target=$B1NIX_TRIPLET -nostdinc ${CC_RES:+-isystem $CC_RES/include} -isystem $ROOT_DIR/userspace/include -I $MESA/include"
+fi
 
 # shellcheck disable=SC2086
 "$CC_CROSS" $CFLAGS -c "$ROOT_DIR/userspace/bin/m59_smoke.c" -o "$SMOKE_OBJ"
 # shellcheck disable=SC2086
 "$CC_CROSS" $CFLAGS -c "$ROOT_DIR/userspace/libegl/b1egl_mesa.c" -o "$EGL_OBJ"
 
+MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
+
 # shellcheck disable=SC2046
+if [ -f "$MUSL_USR/lib/libc.so" ]; then
+  MUSL_LIB="$MUSL_USR/lib"
+  make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+    "build/$B1NIX_ARCH/libcxx_compat.o" 1>&2
+  # Use lld's default PIE layout: it maps the ELF and program-header tables
+  # in the first PT_LOAD, which is required by musl's AT_PHDR startup path.
+  "$LD" -m "$LDEMU" -pie \
+    -z norelro -z now --hash-style=sysv --allow-shlib-undefined \
+    --dynamic-linker /lib/ld-musl-x86_64.so.1 -o "$OUT" \
+    "$MUSL_LIB/Scrt1.o" "$MUSL_LIB/crti.o" "$SMOKE_OBJ" "$EGL_OBJ" \
+    --start-group "$UB/libb1gui.a" "$LIBM" \
+    --end-group -L "$MUSL_LIB" -l:libc.so -L "$MESA_LIB" -lOSMesa \
+    "$MUSL_LIB/crtn.o"
+  "$STRIP" "$OUT"
+  exit 0
+fi
+
 # Dynamic by default: links libc from the shared libc.so.1 via /lib/ld-b1nix.so
 # (the d8 model). B1NIX_LINK=static restores the whole-archive static link.
 if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
@@ -75,9 +107,8 @@ else
 fi
 
 # Link Mesa as shared library (-lOSMesa).
-MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
 # shellcheck disable=SC2086
-"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
+"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections --allow-shlib-undefined \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" \
   -L "$MESA_LIB" \

@@ -27,7 +27,8 @@ CC_CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/nu
 
 CRT0="$ROOT_DIR/userspace/build/x86_64/crt/crt0.o"
 LINKER_EXE="$ROOT_DIR/userspace/linker-cxx.ld"
-LINKER_SO="$ROOT_DIR/userspace/linker_shared_cxx.ld"
+# V8 is WIP (link path pending rework); its shared-object script lives in archive.
+LINKER_SO="$ROOT_DIR/archive/userspace/linker_shared_cxx.ld"
 LIBB1="$ROOT_DIR/userspace/build/x86_64/libb1nix.a"
 LIBC_SO="$ROOT_DIR/userspace/build/x86_64/libc.so.1"
 LIBM="$ROOT_DIR/build/openlibm-b1nix/x86_64-b1nix/install/lib/libm.a"

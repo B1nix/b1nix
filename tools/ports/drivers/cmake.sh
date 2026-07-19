@@ -67,13 +67,19 @@ mkdir -p "$(dirname "$LOCKFILE")"
   fi
 
   # --- cross toolchain ------------------------------------------------------
-  CROSS="$(dirname "$(command -v "$B1NIX_TRIPLET-gcc" 2>/dev/null || echo "$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross/bin/$B1NIX_TRIPLET-gcc")")"
-  GCC="$CROSS/$B1NIX_TRIPLET-gcc"
-  GXX="$CROSS/$B1NIX_TRIPLET-g++"
-  # The triplet compiler is a clang wrapper. Its compatibility `-print-sysroot`
-  # answer points at the target runtime directory, not a complete C sysroot.
-  # Always use the canonical staged userspace rootfs (string.h, stdint.h, etc.).
-  SYSROOT="$TOOLCHAIN_BUILD_HOME/sysroot"
+  # C goes through the hermetic musl wrapper, which drives ld.lld directly.
+  # The libc is a hard requirement: without it there is nothing to link ports
+  # against, and quietly picking a different compiler would produce objects for
+  # the wrong runtime rather than a build failure.
+  MUSL_WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
+  SYSROOT="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+  if [ ! -f "$SYSROOT/lib/libc.so" ]; then
+    echo "cmake.sh: libc not built for $B1NIX_TRIPLET ($SYSROOT/lib/libc.so)." >&2
+    echo "cmake.sh: run tools/ports/build-musl.sh first." >&2
+    exit 1
+  fi
+  GCC="$MUSL_WRAP"
+  GXX="${B1NIX_CLANGXX:-$(command -v clang++ 2>/dev/null)}"
 
   # Resolve C++ frontend / stdlib. With B1NIX_CXX_STDLIB=libc++ the port's C++ is
   # compiled against LLVM libc++ (ABI-incompatible with libstdc++, so the whole port
@@ -85,16 +91,26 @@ mkdir -p "$(dirname "$LOCKFILE")"
   if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
     resolve_cxx_cross
     USE_CXX="$CXX_CROSS"
-    CXX_LIBCXX_FLAGS="$CXXFLAGS_CROSS"
+    CXX_LIBCXX_FLAGS="$CXXFLAGS_CROSS -fPIC"
     # Mixed C/C++ ports (e.g. libjxl) require one compiler family for C and C++.
     # In libc++ mode C++ is clang, so compile the C sources with clang too, targeting
     # b1nix. C needs no libc++ — just the target + sysroot (clang adds its own C
     # headers); this keeps CMake's "GNU vs Clang" identity check happy.
     USE_CC="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$GCC")}"
-    CC_LIBCXX_FLAGS="--target=$B1NIX_TRIPLET --sysroot=$SYSROOT -O2 -ffunction-sections -fdata-sections -Db1nix"
+    CC_LIBCXX_FLAGS="--target=$B1NIX_TRIPLET -nostdinc -isystem $SYSROOT/include"
+    CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -isystem $(clang -print-resource-dir)/include"
+    CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -idirafter $ROOT_DIR/userspace/include"
+    CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -O2 -ffunction-sections -fdata-sections -fPIC -Db1nix"
   else
     USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
     [ -n "$USE_CXX" ] || { echo "cmake port: clang++ not found" >&2; exit 1; }
+    # When using the musl wrapper for C, give C++ the same musl headers + clang
+    # resource-dir so it can find stdatomic.h etc. under -nostdinc.
+    if [ -f "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/libc.so" ]; then
+      _MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+      _CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
+      CXXFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector -msoft-float -mno-implicit-float -isystem $_MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include} -idirafter $ROOT_DIR/userspace/include -D__linux__ -D__b1nix__ -O2 ${CXXFLAGS:-}"
+    fi
   fi
 
   # Stage the b1nix libc into the cross sysroot (idempotent). C++ headers/runtime
@@ -169,6 +185,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
     ${TC_ARGS:-} \
     -DCMAKE_BUILD_TYPE=Release \
     -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+    -DCMAKE_C_FLAGS="$CC_LIBCXX_FLAGS" \
+    -DCMAKE_CXX_FLAGS="$CXX_LIBCXX_FLAGS" \
     $CCACHE_ARGS \
     ${CMAKE_ARGS:-} 1>&2
 

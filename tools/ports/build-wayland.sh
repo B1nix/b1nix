@@ -11,6 +11,7 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
+. "$ROOT_DIR/tools/ports/drivers/common.sh"
 SRC_PARENT="$ROOT_DIR/build/wayland-src"
 SRC_DIR="$SRC_PARENT/wayland-${WAYLAND_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/wayland-b1nix/$B1NIX_TRIPLET"
@@ -77,11 +78,11 @@ else
 fi
 
 CC_FLAGS="--target=$TARGET $ARCH_FLAGS -ffreestanding -fno-builtin
-  -fno-stack-protector -nostdinc -isystem $ROOT_DIR/userspace/include
-  -I$ROOT_DIR/userspace/include -I$SRC_DIR -I$SRC_DIR/src -I$GEN_DIR -I$HOST_DIR
+  -fno-stack-protector -nostdinc $(port_musl_include_flags)
+  -I$SRC_DIR -I$SRC_DIR/src -I$GEN_DIR -I$HOST_DIR
   -I$LIBFFI_DIR/include -D__STDC_NO_ATOMICS__
   -include $ROOT_DIR/tools/wayland/compat.h
-  -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix"
+  -Wall -Wextra -O2 -msoft-float -mno-implicit-float -fPIC -Db1nix"
 
 compile()
 {
