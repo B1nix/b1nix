@@ -3,6 +3,25 @@
  */
 #include "displayd.h"
 
+static int send_all(int fd, const void *data, size_t len) {
+	const uint8_t *p = (const uint8_t *)data;
+	size_t off = 0;
+	while (off < len) {
+		ssize_t n = send(fd, p + off, len - off, 0);
+		if (n > 0) {
+			off += (size_t)n;
+			continue;
+		}
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+			struct pollfd waitfd = {fd, POLLOUT, 0};
+			if (poll(&waitfd, 1, 1000) > 0)
+				continue;
+		}
+		return -1;
+	}
+	return 0;
+}
+
 /* ── wire helpers ── */
 void send_msg(int client, uint32_t obj, uint16_t opcode,
               const uint32_t *words, unsigned nwords) {
@@ -14,8 +33,9 @@ void send_msg(int client, uint32_t obj, uint16_t opcode,
 	h.opcode = opcode;
 	h.size = (uint16_t)(sizeof(h) + nwords * 4);
 	memcpy(msg, &h, sizeof(h));
-	memcpy(msg + sizeof(h), words, nwords * 4);
-	send(clients[client].fd, msg, h.size, 0);
+	if (nwords)
+		memcpy(msg + sizeof(h), words, nwords * 4);
+	(void)send_all(clients[client].fd, msg, h.size);
 }
 
 void send_msg_fd(int client, uint32_t obj, uint16_t opcode,
@@ -99,11 +119,13 @@ void wl_send_string(int client, uint32_t obj, uint16_t opcode,
 	unsigned len = (unsigned)strlen(text) + 1;
 	unsigned ntext = (len + 3) / 4;
 	if (nprefix + 1 + ntext + nsuffix > 32) return;
-	memcpy(words, prefix, nprefix * 4);
+	if (nprefix)
+		memcpy(words, prefix, nprefix * 4);
 	words[nprefix] = len;
 	memset(&words[nprefix + 1], 0, ntext * 4);
 	memcpy(&words[nprefix + 1], text, len);
-	memcpy(&words[nprefix + 1 + ntext], suffix, nsuffix * 4);
+	if (nsuffix)
+		memcpy(&words[nprefix + 1 + ntext], suffix, nsuffix * 4);
 	send_msg(client, obj, opcode, words, nprefix + 1 + ntext + nsuffix);
 }
 
@@ -250,6 +272,7 @@ void accept_client(int fd) {
 	if (cfd < 0) return;
 	for (int i = 0; i < MAX_CLIENTS; i++)
 		if (!clients[i].used) {
+			fcntl(cfd, F_SETFL, O_NONBLOCK);
 			clients[i].used = 1;
 			clients[i].fd = cfd;
 			clients[i].inlen = 0;
@@ -271,14 +294,18 @@ void client_data(int ci) {
 	mh.msg_control = control;
 	mh.msg_controllen = sizeof(control);
 	ssize_t n = recvmsg(c->fd, &mh, 0);
-	if (n <= 0) { client_disconnect(ci); return; }
-	for (struct cmsghdr *cm = CMSG_FIRSTHDR(&mh); cm;
-	     cm = CMSG_NXTHDR(&mh, cm))
-		if (cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
-		    cm->cmsg_len >= CMSG_LEN(sizeof(int))) {
-			if (c->pending_fd >= 0) close(c->pending_fd);
-			memcpy(&c->pending_fd, CMSG_DATA(cm), sizeof(int));
-		}
+	if (n <= 0) {
+		if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+			return;
+		client_disconnect(ci);
+		return;
+	}
+	struct cmsghdr *cm = CMSG_FIRSTHDR(&mh);
+	if (cm && cm->cmsg_level == SOL_SOCKET && cm->cmsg_type == SCM_RIGHTS &&
+	    cm->cmsg_len >= CMSG_LEN(sizeof(int))) {
+		if (c->pending_fd >= 0) close(c->pending_fd);
+		memcpy(&c->pending_fd, CMSG_DATA(cm), sizeof(int));
+	}
 	c->inlen += (unsigned)n;
 	for (;;) {
 		if (c->inlen < sizeof(struct wl_hdr)) break;

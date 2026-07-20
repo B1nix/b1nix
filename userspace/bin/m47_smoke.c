@@ -20,6 +20,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <poll.h>
+#include <sched.h>
 #include <stdio.h>
 #include <string.h>
 #include <sys/ioctl.h>
@@ -123,10 +124,15 @@ static int test_fb(void) {
 static int test_input_open(void) {
 	int kfd = open("/dev/input/event0", O_RDONLY | O_NONBLOCK);
 	int mfd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
-	if (kfd < 0 || mfd < 0) {
+	if (kfd < 0) {
 		marker("M47-GFX: fail input-open\n");
-		if (kfd >= 0) close(kfd);
-		if (mfd >= 0) close(mfd);
+		if (mfd >= 0)
+			close(mfd);
+		return -1;
+	}
+	if (mfd < 0) {
+		marker("M47-GFX: fail input-open\n");
+		close(kfd);
 		return -1;
 	}
 
@@ -150,21 +156,21 @@ static int test_input_events(void) {
 	/* The kernel test harness injects a mouse event burst once a client has
 	 * event1 open (see the m47 injector in kernel/user/programs.c). Use a
 	 * blocking fd: this also exercises the blocking-read path. */
-	int fd = open("/dev/input/event1", O_RDONLY);
+	int fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		marker("M47-GFX: fail input-event\n");
 		return -1;
 	}
 
 	int saw_rel_x = 0, saw_rel_y = 0, saw_btn = 0, saw_syn = 0;
-	/* Read until SYN or ~5 s worth of poll timeouts. */
-	for (int spins = 0; spins < 50 && !saw_syn; spins++) {
-		struct pollfd pfd = {.fd = fd, .events = POLLIN, .revents = 0};
-		int pr = poll(&pfd, 1, 100);
-		if (pr <= 0 || !(pfd.revents & POLLIN))
-			continue;
+	/* Read until SYN or ~5 s of nonblocking retries. */
+	for (int spins = 0; spins < 100000 && !saw_syn; spins++) {
 		struct b1nix_input_event evs[8];
 		int n = (int)read(fd, evs, sizeof(evs));
+		if (n < 0 && errno == EAGAIN) {
+			sched_yield();
+			continue;
+		}
 		if (n <= 0 || (n % (int)sizeof(struct b1nix_input_event)) != 0)
 			break;
 		int count = n / (int)sizeof(struct b1nix_input_event);

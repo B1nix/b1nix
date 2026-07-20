@@ -1,6 +1,7 @@
 #include <stdio.h>
 #include <string.h>
-#include <syscall.h>
+#include <sys/reboot.h>
+#include <unistd.h>
 
 int main(int argc, char **argv) {
   const char *name = "halt";
@@ -9,15 +10,15 @@ int main(int argc, char **argv) {
     name = slash ? slash + 1 : argv[0];
   }
 
-  long cmd;
+  int cmd;
   if (strcmp(name, "reboot") == 0)
-    cmd = B1NIX_REBOOT_RESTART;
+    cmd = RB_AUTOBOOT;
   else if (strcmp(name, "poweroff") == 0 || strcmp(name, "shutdown") == 0)
-    cmd = B1NIX_REBOOT_POWEROFF;
+    cmd = RB_POWER_OFF;
   else
-    cmd = B1NIX_REBOOT_HALT;
+    cmd = RB_HALT_SYSTEM;
 
-  syscall(SYS_REBOOT, cmd);
+  reboot(cmd);
   printf("%s: failed\n", name);
   return 1;
 }

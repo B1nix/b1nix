@@ -25,7 +25,8 @@ static int request(int fd, uint32_t object, uint16_t opcode,
 	if (h.size > sizeof(msg))
 		return -1;
 	memcpy(msg, &h, sizeof(h));
-	memcpy(msg + sizeof(h), args, nargs * 4);
+	if (nargs)
+		memcpy(msg + sizeof(h), args, nargs * 4);
 	return send(fd, msg, h.size, 0) == h.size ? 0 : -1;
 }
 
@@ -38,11 +39,13 @@ static int request_string(int fd, uint32_t object, uint16_t opcode,
 	unsigned ntext = (len + 3) / 4;
 	if (nprefix + 1 + ntext + nsuffix > 32)
 		return -1;
-	memcpy(args, prefix, nprefix * 4);
+	if (nprefix)
+		memcpy(args, prefix, nprefix * 4);
 	args[nprefix] = len;
 	memset(&args[nprefix + 1], 0, ntext * 4);
 	memcpy(&args[nprefix + 1], text, len);
-	memcpy(&args[nprefix + 1 + ntext], suffix, nsuffix * 4);
+	if (nsuffix)
+		memcpy(&args[nprefix + 1 + ntext], suffix, nsuffix * 4);
 	return request(fd, object, opcode, args, nprefix + 1 + ntext + nsuffix);
 }
 

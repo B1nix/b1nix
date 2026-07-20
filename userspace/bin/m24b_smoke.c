@@ -6,12 +6,12 @@
  * is the kernel's per-CPU syscall mask (sched_user_cpu_mask), which getcpu()
  * here exercises from ring 3 on whatever core runs this process. */
 
+#include <sched.h>
+#include <stdint.h>
 #include <unistd.h>
-#include "types.h"
-#include "syscall.h"
 
 static void uwrite(const char *s) {
-  usize n = 0;
+  size_t n = 0;
   while (s[n])
     n++;
   write(1, s, n);
@@ -23,21 +23,17 @@ int main(int argc, char **argv) {
 
   int max_cpu = 0;
 
-  /* Spin long enough that multiple instances overlap in time (so idle APs pick
-   * some up), calling getcpu() each outer iteration to sample the executing
-   * core. The compute keeps the process on its CPU between samples. */
-  volatile u64 acc = 0;
+  volatile uint64_t acc = 0;
   for (int outer = 0; outer < 400; outer++) {
     for (volatile int inner = 0; inner < 40000; inner++)
-      acc += (u64)inner ^ (u64)outer;
+      acc += (uint64_t)inner ^ (uint64_t)outer;
 
-    int cpu = getcpu();
+    int cpu = sched_getcpu();
     if (cpu > max_cpu)
       max_cpu = cpu;
   }
   (void)acc;
 
-  /* Single-character cpu id is enough (MAX_CPUS is small). */
   char buf[32];
   const char *p = "M24B-BKL: instance cpu=";
   int i = 0;

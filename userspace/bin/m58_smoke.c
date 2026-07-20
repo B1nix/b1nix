@@ -18,7 +18,6 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/wait.h>
-#include "syscall.h"
 
 static void marker(const char *text) {
 	write(1, text, strlen(text));
@@ -27,7 +26,7 @@ static void marker(const char *text) {
 /* Spawn `/bin/js -e CODE` with stdout redirected to out_path. Returns the
  * child's exit code, or -1 on spawn/wait failure. */
 static int run_js(const char *code, const char *out_path) {
-	int pid = syscall(SYS_FORK);
+	int pid = fork();
 	if (pid == 0) {
 		int fd = open(out_path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
 		if (fd < 0)
@@ -41,7 +40,7 @@ static int run_js(const char *code, const char *out_path) {
 		_exit(127);
 	} else if (pid > 0) {
 		int status = 0;
-		if (syscall(SYS_WAITPID, pid, &status, 0) == pid && WIFEXITED(status))
+		if (waitpid(pid, &status, 0) == pid && WIFEXITED(status))
 			return WEXITSTATUS(status);
 	}
 	return -1;

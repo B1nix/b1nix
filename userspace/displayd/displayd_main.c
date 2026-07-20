@@ -4,6 +4,7 @@
 #include "displayd.h"
 #include "font8x8.h"
 #include "xkb_keymap_us.h"
+#include <sched.h>
 
 /* ── globals ── */
 struct dclient clients[MAX_CLIENTS];
@@ -158,9 +159,17 @@ void ping_clients(void) {
 		if (!wm)
 			continue;
 		if (clients[i].ping_pending) {
-			client_disconnect(i);
+			/* A client that is alive but busy — e.g. running a long
+			 * synchronous software-GL (OSMesa/softpipe) render — cannot pump
+			 * its event queue to answer a ping. Disconnecting on the first
+			 * missed pong (a ~5s window) kills such clients mid-render and
+			 * makes their next request fail with EPIPE. Allow a few missed
+			 * pings (~15s total) before treating the client as hung. */
+			if (++clients[i].ping_misses >= 3)
+				client_disconnect(i);
 			continue;
 		}
+		clients[i].ping_misses = 0;
 		clients[i].ping_serial = ++frame_serial;
 		clients[i].ping_pending = 1;
 		send_msg(i, wm->id, 0, &clients[i].ping_serial, 1);
@@ -170,8 +179,6 @@ void ping_clients(void) {
 int main(int argc, char **argv) {
 	(void)argc;
 	(void)argv;
-
-	signal(SIGCHLD, SIG_IGN);
 
 	fb_fd = open("/dev/fb0", O_RDWR);
 	if (fb_fd < 0) {
@@ -196,6 +203,19 @@ int main(int argc, char **argv) {
 	ev_fds[1] = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
 	ev_fds[2] = open("/dev/input/event2", O_RDONLY | O_NONBLOCK);
 
+	px = (int)scr_w / 2;
+	py = (int)scr_h / 2;
+	long last_ping = (long)time(0);
+	update_clock();
+	composite_rect(0, 0, (int)scr_w, (int)scr_h);
+
+	out("displayd: ready ");
+	out_dec(scr_w);
+	out("x");
+	out_dec(scr_h);
+	out("\n");
+
+	/* Publish the socket only after framebuffer and compositor state are ready. */
 	unlink(WAYLAND_SOCKET_PATH);
 	listen_fd = socket(AF_UNIX, SOCK_STREAM, 0);
 	if (listen_fd < 0) {
@@ -211,20 +231,15 @@ int main(int argc, char **argv) {
 		out("displayd: bind/listen failed\n");
 		return 1;
 	}
-
-	px = (int)scr_w / 2;
-	py = (int)scr_h / 2;
-	long last_ping = (long)time(0);
-	update_clock();
-	composite_rect(0, 0, (int)scr_w, (int)scr_h);
-
-	out("displayd: ready ");
-	out_dec(scr_w);
-	out("x");
-	out_dec(scr_h);
-	out("\n");
+	fcntl(listen_fd, F_SETFL, O_NONBLOCK);
 
 	while (running) {
+		/* Drain a queued connector before sleeping so AF_UNIX connect() cannot
+		 * wait behind a poll readiness race during compositor startup. */
+		accept_client(listen_fd);
+		for (int i = 0; i < MAX_CLIENTS; i++)
+			if (clients[i].used)
+				client_data(i);
 		struct pollfd pfds[4 + MAX_CLIENTS];
 		pfds[0].fd = listen_fd;
 		pfds[0].events = POLLIN;

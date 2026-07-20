@@ -10,7 +10,7 @@ struct Base {
 };
 struct Derived : Base {};
 
-int main() {
+extern "C" int main() {
   std::vector<std::string> values{"clang", "libstdc++"};
   Base *value = new Derived;
   int ok = values.size() == 2 && dynamic_cast<Derived *>(value);

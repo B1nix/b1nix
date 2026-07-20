@@ -1,4 +1,4 @@
-#include <aio.h>
+#include <b1nix/aio.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <stdio.h>
@@ -6,11 +6,17 @@
 #include <syscall.h>
 #include <unistd.h>
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#define SYS_IO_SETUP __NR_io_setup
+#define SYS_IO_SUBMIT __NR_io_submit
+#define SYS_IO_GETEVENTS __NR_io_getevents
+#endif
+
+/* musl's syscall() already returns -1 with errno set — don't overwrite errno
+ * with -rc (that clobbered every real error to EPERM in the FAIL output). */
 static long ksys(long n, long a0, long a1, long a2, long a3, long a4) {
-  long rc = syscall(n, a0, a1, a2, a3, a4);
-  if (rc < 0)
-    errno = (int)-rc;
-  return rc;
+  return syscall(n, a0, a1, a2, a3, a4);
 }
 
 int main(void) {

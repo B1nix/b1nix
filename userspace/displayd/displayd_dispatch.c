@@ -353,8 +353,9 @@ void handle_wayland_msg(int ci, const struct wl_hdr *h,
 		if (h->opcode == 0 && n >= 1)
 			wobject_add(ci, a[0], WOBJ_POINTER, 0);
 		else if (h->opcode == 1 && n >= 1) {
-			if (wobject_add(ci, a[0], WOBJ_KEYBOARD, 0))
+			if (wobject_add(ci, a[0], WOBJ_KEYBOARD, 0)) {
 				keyboard_init(ci, a[0]);
+			}
 		}
 		else if (h->opcode == 2 && n >= 1)
 			wobject_add(ci, a[0], WOBJ_TOUCH, 0);

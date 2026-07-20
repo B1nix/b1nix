@@ -211,6 +211,13 @@ enum {
   SYS_TIMER_DELETE     = 180,
   SYS_DL_PHDR_INFO     = 181,
   SYS_FD_PATH          = 182,
+  /* --- M92: thread/process exit separation --- */
+  SYS_EXIT_GROUP       = 231, /* exit_group: terminate all threads (Linux 231) */
+  SYS_SET_TID_ADDRESS  = 232,
+  SYS_READV             = 233,
+  SYS_WRITEV            = 234,
+  SYS_NANOSLEEP         = 235,
+  SYS_EXECVEAT          = 236,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the
@@ -406,6 +413,9 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 #endif
 #ifndef __NR_exit_thread
 #define __NR_exit_thread SYS_EXIT_THREAD
+#endif
+#ifndef __NR_exit_group
+#define __NR_exit_group SYS_EXIT_GROUP
 #endif
 #ifndef __NR_fchdir
 #define __NR_fchdir SYS_FCHDIR
@@ -965,6 +975,7 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
 #define SYS_sigreturn SYS_SIGRETURN
 #define SYS_sigsuspend SYS_SIGSUSPEND
 #define SYS_sleep SYS_SLEEP
+#define SYS_nanosleep SYS_NANOSLEEP
 #define SYS_socket SYS_SOCKET
 #define SYS_socketpair SYS_SOCKETPAIR
 #define SYS_spawn SYS_SPAWN
@@ -1001,7 +1012,7 @@ static inline long _syscall_raw(long num, long a0, long a1, long a2, long a3, lo
  * handler reset is therefore best-effort, not bit-exact. */
 #define SYS_rt_sigaction    SYS_SIGNAL
 #define SYS_tgkill          SYS_KILL   /* drops tgid; b1nix tids are unique */
-#define SYS_exit_group      SYS_EXIT
+#define SYS_exit_group      SYS_EXIT_GROUP
 #define SYS_clock_nanosleep 1024  /* -ENOSYS -> caller falls back to nanosleep */
 #define SYS_pkey_mprotect   1025  /* b1nix has no protection keys -> -ENOSYS */
 #define SYS_pkey_alloc      1026

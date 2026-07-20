@@ -56,7 +56,7 @@ static OnceCounter &local_static() {
   return c;
 }
 
-int main() {
+extern "C" int main() {
   if (g_global.v != 0x1234)
     return (mark("CXX-SMOKE: fail ctor\n"), 1);
 
