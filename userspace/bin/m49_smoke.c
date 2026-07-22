@@ -47,11 +47,13 @@ static int request_string(int fd, uint32_t object, uint16_t opcode,
 	uint32_t args[32];
 	unsigned len = (unsigned)strlen(text) + 1;
 	unsigned ntext = (len + 3) / 4;
-	memcpy(args, prefix, nprefix * 4);
+	if (nprefix)
+		memcpy(args, prefix, nprefix * 4);
 	args[nprefix] = len;
 	memset(&args[nprefix + 1], 0, ntext * 4);
 	memcpy(&args[nprefix + 1], text, len);
-	memcpy(&args[nprefix + 1 + ntext], suffix, nsuffix * 4);
+	if (nsuffix)
+		memcpy(&args[nprefix + 1 + ntext], suffix, nsuffix * 4);
 	return request(fd, object, opcode, args, nprefix + 1 + ntext + nsuffix);
 }
 
@@ -132,7 +134,6 @@ int main(void) {
 		marker("M49-WL: fail connect\n");
 		return 1;
 	}
-
 	uint32_t id = 2;
 	request(fd, 1, 1, &id, 1); /* wl_display.get_registry */
 	id = 3;
@@ -275,6 +276,7 @@ int main(void) {
 	#define ROUNDTRIP() do { \
 		uint32_t _s = sync_id_next++; \
 		request(fd, 1, 0, &_s, 1); \
+		usleep(1000); \
 		rt_ok = 0; int _t = 0; \
 		while (!rt_ok && _t++ < 64 && next_event(fd, &ev) == 1) \
 			if (ev.object == _s && ev.opcode == 0) rt_ok = 1; \
@@ -390,10 +392,20 @@ int main(void) {
 	marker(rt_ok ? "M49-WL: ok dnd-start\n" : "M49-WL: fail dnd-start\n");
 	#undef ROUNDTRIP
 
+	/* The raw-protocol connection is done; close it BEFORE the libb1gui pass.
+	 * Leaving it open kept a client displayd still routes input/dnd events to
+	 * (the boot injector streams them constantly in test mode) while nobody
+	 * reads them — displayd spent its loop shoveling events into a full
+	 * socket and the fresh libb1gui connect starved. */
+	close(fd);
+	fd = -1;
+
 	if (framed) {
 		struct b1gui_window gui;
-		if (b1gui_connect(&gui) ||
-		    b1gui_create_window(&gui, 96, 64, "libb1gui"))
+		int gui_rc = b1gui_connect(&gui);
+		if (!gui_rc)
+			gui_rc = b1gui_create_window(&gui, 96, 64, "libb1gui");
+		if (gui_rc)
 			framed = 0;
 		else {
 			for (unsigned i = 0; i < gui.width * gui.height; i++)
@@ -404,6 +416,5 @@ int main(void) {
 		}
 		marker(framed ? "M49-WL: ok libb1gui\n" : "M49-WL: fail libb1gui\n");
 	}
-	close(fd);
 	return framed ? 0 : 1;
 }

@@ -27,8 +27,10 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <sched.h>
+#include <sys/stat.h>
 #include <arpa/inet.h>
-#include "syscall.h"
+#include <utmp.h>
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
 
@@ -55,7 +57,7 @@ static void fail(const char *name) {
 /* select() with no ready fds and a zero timeout → 0. */
 static int test_select_timeout_zero(void) {
   int pipefd[2];
-  if (syscall(SYS_PIPE, pipefd) < 0) { fail("select-timeout-pipe"); return -1; }
+  if (pipe(pipefd) < 0) { fail("select-timeout-pipe"); return -1; }
   fd_set rs; FD_ZERO(&rs); FD_SET(pipefd[0], &rs);
   struct timeval tv = { .tv_sec = 0, .tv_usec = 0 };
   int rc = select(pipefd[0] + 1, &rs, 0, 0, &tv);
@@ -68,7 +70,7 @@ static int test_select_timeout_zero(void) {
 /* select() with data in the pipe → reports the read end as ready. */
 static int test_select_pipe_ready(void) {
   int pipefd[2];
-  if (syscall(SYS_PIPE, pipefd) < 0) { fail("select-ready-pipe"); return -1; }
+  if (pipe(pipefd) < 0) { fail("select-ready-pipe"); return -1; }
   const char *msg = "hi";
   write(pipefd[1], msg, 2);
   fd_set rs; FD_ZERO(&rs); FD_SET(pipefd[0], &rs);
@@ -85,7 +87,7 @@ static int test_select_pipe_ready(void) {
  * end of the pipe is always writable, so we expect it set in writefds. */
 static int test_select_multi_fd(void) {
   int p1[2], p2[2];
-  if (syscall(SYS_PIPE, p1) < 0 || syscall(SYS_PIPE, p2) < 0) {
+  if (pipe(p1) < 0 || pipe(p2) < 0) {
     fail("select-multi-pipe"); return -1;
   }
   write(p1[1], "x", 1);
@@ -182,7 +184,7 @@ static int recv_with_retry(int fd, char *buf, int max) {
   for (int tries = 0; tries < 100; tries++) {
     int n = (int)recv(fd, buf, (size_t)max, 0);
     if (n > 0) return n;
-    syscall(SYS_YIELD);
+    sched_yield();
   }
   return 0;
 }
@@ -196,7 +198,7 @@ static int connect_loopback(unsigned short port) {
     if (connect(fd, (struct sockaddr *)&addr, sizeof(addr)) == 0)
       return fd;
     close(fd);
-    syscall(SYS_YIELD);
+    sched_yield();
   }
   return -1;
 }
@@ -709,7 +711,7 @@ static int test_tcp6_loopback(void) {
       break;
     close(fd);
     fd = -1;
-    syscall(SYS_YIELD);
+    sched_yield();
   }
   if (fd < 0) {
     fail("tcp6-connect");
@@ -1669,7 +1671,7 @@ static int test_dropbear_keygen(void) {
 
 /* Generate the persistent Ed25519 host key once if it is not already present. */
 static int ssh_ensure_hostkey(void) {
-  syscall(SYS_MKDIR, (long)"/etc/ssh", 0700, 0, 0, 0);
+  mkdir("/etc/ssh", 0700);
 
   int fd = open("/etc/ssh/hk_ed25519", O_RDONLY);
   if (fd >= 0) {
@@ -1713,25 +1715,25 @@ static int ssh_start_server(const char *portspec) {
  * Returns 1 if the client exited on its own, 0 if it had to be killed. */
 static int ssh_reap_client(int cli, int *status) {
   for (int i = 0; i < 20; i++) {
-    int r = (int)syscall(SYS_WAITPID, cli, (long)status, WNOHANG, 0, 0);
+    int r = (int)waitpid(cli, status, WNOHANG);
     if (r == cli) return 1;
     if (r < 0) return 0;
     sleep(1);
   }
-  syscall(SYS_KILL, cli, SIGKILL, 0, 0, 0);
+  kill(cli, SIGKILL);
   return 0;
 }
 
 /* Bounded teardown: SIGTERM+SIGKILL then WNOHANG-reap so a listener parked in a
  * blocking accept() can never hang the suite (worst case leaks one task). */
 static void ssh_kill_server(int srv) {
-  syscall(SYS_KILL, srv, SIGTERM, 0, 0, 0);
-  syscall(SYS_KILL, srv, SIGKILL, 0, 0, 0);
+  kill(srv, SIGTERM);
+  kill(srv, SIGKILL);
   for (int i = 0; i < 200; i++) {
-    int r = (int)syscall(SYS_WAITPID, srv, 0, WNOHANG, 0, 0);
+    int r = (int)waitpid(srv, NULL, WNOHANG);
     if (r == srv || r < 0)
       break;
-    syscall(SYS_YIELD, 0, 0, 0, 0, 0);
+    sched_yield();
   }
 }
 
@@ -2061,3 +2063,7 @@ int main(int argc, char **argv) {
   emit("M32-NET: done\n");
   return 0;
 }
+
+#ifdef __linux__
+#include "../../archive/userspace/libc/crypt.c"
+#endif

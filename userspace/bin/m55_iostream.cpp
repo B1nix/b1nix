@@ -32,7 +32,7 @@
 
 namespace fs = std::filesystem;
 
-int main() {
+extern "C" int main() {
   /* ---- std::cout / std::cerr: formatted output to real fds. ---- */
   std::cout << "M55-IOSTREAM: cout " << 42 << " " << std::hex << 255 << std::dec
             << " " << std::boolalpha << true << "\n";

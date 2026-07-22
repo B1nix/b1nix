@@ -82,8 +82,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
   # Base freestanding CFLAGS (the port appends its -D/-I via CPORT_CFLAGS, and may
   # extend CPORT_CFLAGS inside port_pre_build once gen dirs / dep dirs are known).
   CFLAGS_BASE="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-    -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-    -O2 -fno-strict-aliasing -fPIC -Db1nix"
+    -nostdinc $(port_musl_include_flags)
+    -O2 -fno-strict-aliasing -fPIC -Db1nix -D__linux__ -D__b1nix__ -D_GNU_SOURCE"
 
   if command -v port_pre_build >/dev/null 2>&1; then port_pre_build; fi
 

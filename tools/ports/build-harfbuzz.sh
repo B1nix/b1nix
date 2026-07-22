@@ -23,7 +23,7 @@ port_build() {
   _ccache=""
   [ -n "${CCACHE:-}" ] && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && _ccache="$CCACHE "
   # shellcheck disable=SC2086
-  ${_ccache}"$CXX_CROSS" $CXXFLAGS_CROSS -DHB_TINY -DHB_NO_MT \
+  ${_ccache}"$CXX_CROSS" $CXXFLAGS_CROSS -fPIC -DHB_TINY -DHB_NO_MT \
     -fno-exceptions -fno-rtti -fno-threadsafe-statics -std=c++14 \
     -I"$SRC_DIR/src" -c "$SRC_DIR/src/harfbuzz.cc" \
     -o "$OBJ_DIR/harfbuzz.o"

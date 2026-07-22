@@ -64,7 +64,7 @@ port_post_install() {
   NM_BIN="${NM:-$(command -v llvm-nm 2>/dev/null || echo llvm-nm)}"
   if "$NM_BIN" "$LIBA" 2>/dev/null | grep -q 'U rpl_strverscmp' &&
      ! "$NM_BIN" "$LIBA" 2>/dev/null | grep -qiE ' [tw] rpl_strverscmp'; then
-    AUTOTOOLS_CC="${AUTOTOOLS_CC:-$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc}"
+    AUTOTOOLS_CC="${AUTOTOOLS_CC:-$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc}"
     "$AUTOTOOLS_CC" -O2 -c "$ROOT_DIR/tools/patches/libidn2/rpl_strverscmp.c" \
       -o "$BUILD_DIR/.rpl_strverscmp.o"
     "$AR_BIN" r "$LIBA" "$BUILD_DIR/.rpl_strverscmp.o"

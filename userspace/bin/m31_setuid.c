@@ -5,13 +5,12 @@
 
 #include <stdio.h>
 #include <unistd.h>
-#include "syscall.h"
 
 int main(int argc, char **argv) {
   (void)argc;
   (void)argv;
-  long uid = syscall(SYS_GETUID);
-  long euid = syscall(SYS_GETEUID);
+  uid_t uid = getuid();
+  uid_t euid = geteuid();
   /* Output is consumed via stdout; the parent uses a pipe (or writes to
    * a file). Format is deterministic: "M31-SETUID: uid=N euid=N\n". */
   char buf[64];

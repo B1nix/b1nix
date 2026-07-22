@@ -118,6 +118,13 @@ struct vfs_inode {
                    int flags);
   isize (*readdir_cb)(struct vfs_node *node, usize offset, struct dirent *buf,
                       usize max_entries);
+  /* On-demand child materialisation for synthetic dirs (procfs/sysfs) whose
+   * children exist lazily. The path resolver calls this when find_child misses,
+   * so a DIRECT lookup (e.g. musl ttyname's readlink("/proc/self/fd/N"), which
+   * never runs readdir first) can still resolve. NULL on all real filesystems,
+   * so their lookup path is unchanged. Must materialise `name` as a physical
+   * child of `dir` (idempotent) and return 0 on success, <0 if no such child. */
+  int (*lookup_cb)(struct vfs_node *dir, const char *name);
   isize (*write_cb)(struct vfs_node *node, u64 offset, const char *buffer,
                     usize size, int flags);
   int (*create_cb)(struct vfs_node *dir, const char *name,
@@ -298,6 +305,8 @@ void pty_init(void);
 int pty_open_master(int flags);    /* opening /dev/ptmx */
 int pty_open_slave(int index, int flags); /* opening /dev/pts/N */
 usize pty_fg_pgrp(int idx);
+int pty_index_of(struct vfs_handle *h);
+int pty_allocated(int idx);
 
 extern void *vfs_poll_chan;
 
@@ -385,6 +394,10 @@ struct vfs_socket_state {
   int bound;
   int connected;
   int listening;
+  /* AF_UNIX SOCK_DGRAM connected to /dev/log: musl syslog() connect()s + send()s
+   * here. There is no userspace syslogd, so the kernel is the sink — datagrams
+   * are forwarded to the serial console (see unix_connect / unix_send_control). */
+  int syslog_sink;
   /* M32b socket options + shutdown state (SHUT_RD/WR half-close flags). */
   int so_reuseaddr;
   int so_keepalive;

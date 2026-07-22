@@ -55,9 +55,16 @@ LOCK="$BUILD_DIR/.build-lock"
 while ! mkdir "$LOCK" 2>/dev/null; do sleep 1; done
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
-# Toolchain prerequisites: b1nix libc/crt + C++-enabled cross toolchain.
-make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
-  "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+# Toolchain prerequisites: musl supplies libc/crt; the legacy b1nix archive is
+# needed only by the retired non-musl link path. Mesa shared objects use the
+# GUI archive only and must not pull non-PIC libc objects into -shared links.
+if [ -f "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/libc.so" ]; then
+  make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+    "build/$B1NIX_ARCH/libb1gui.a" 1>&2
+else
+  make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
+    "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+fi
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
@@ -92,10 +99,20 @@ LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-buil
 # Meson adds -shared automatically for .so targets.  libc symbols are resolved
 # at runtime by b1nix's dynamic linker (--unresolved-symbols=ignore-all).
 LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-LINKARGS="'-fuse-ld=lld', '-nostdlib', '--sysroot=$CROSS', '-Wl,--hash-style=both', '-Wl,--unresolved-symbols=ignore-all', '-Wl,--allow-multiple-definition', '-L$LIBCXX_SO_DIR', '-L$CROSS/$B1NIX_TRIPLET/lib', '-lc++', '-lc++abi'"
+MUSL_LIB="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+# Prefer musl-built runtime libs: the musl sysroot carries libc++/libc++abi
+# compiled against musl headers, and the ports zlib is musl-clean. The legacy
+# llvm-runtimes libc++.a and the cross-sysroot libz.a reference `errno` as a
+# data symbol (old b1nix libc headers) — linking them into libOSMesa.so left
+# an unresolvable UND errno that killed every Mesa consumer at load time.
+ZLIB_PORT_LIB="$ROOT_DIR/build/zlib-b1nix/$B1NIX_TRIPLET/install/lib"
+if [ -f "$MUSL_LIB/libc++.a" ]; then
+  LIBCXX_SO_DIR="$MUSL_LIB"
+fi
+LINKARGS="'-fuse-ld=lld', '-nostdlib', '--sysroot=$CROSS', '-Wl,--hash-style=both', '-Wl,--unresolved-symbols=ignore-all', '-Wl,--allow-multiple-definition', '-L$LIBCXX_SO_DIR', '-L$ZLIB_PORT_LIB', '-L$MUSL_LIB', '-L$CROSS/$B1NIX_TRIPLET/lib', '-lc++', '-lc++abi'"
 
 INI="$BUILD_DIR/cross.ini"
-DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL', '-DHAVE_STRUCT_TIMESPEC', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0', '-I$SRC_DIR/subprojects/zlib-1.3.1', '-UHAVE_QSORT_S', '-UHAVE_DLADDR', '-Dsecure_getenv=getenv'"
+DEFS="'-Db1nix', '-D__b1nix__', '-D__linux__', '-DPATH_MAX=4096', '-DLLONG_MAX=9223372036854775807LL', '-DLLONG_MIN=(-LLONG_MAX-1LL)', '-DULLONG_MAX=18446744073709551615ULL', '-DHAVE_STRUCT_TIMESPEC', '-DUTIL_ARCH_LITTLE_ENDIAN=1', '-DUTIL_ARCH_BIG_ENDIAN=0', '-I$SRC_DIR/subprojects/zlib-1.3.1', '-UHAVE_QSORT_S', '-UHAVE_DLADDR', '-UHAVE_ARC4RANDOM_BUF', '-UHAVE_ARC4RANDOM', '-Dsecure_getenv=getenv'"
 # M75: opt-in llvmpipe (MESA_LLVMPIPE=1). meson runs llvm-config on the host, so
 # point it at the b1nix-LLVM wrapper; enable the shared libLLVM-22 and match its
 # -fno-rtti (cpp_rtti=false). Default (unset) keeps the proven softpipe build.
@@ -139,11 +156,20 @@ EOF
 # which the static-glapi (shared-glapi=disabled) build does not provide -> link
 # error. Mesa 24 has no -Dasm option, so neutralise that x86-only block in
 # meson.build; the portable C dispatch is fine for a software port. Idempotent.
+if sed --version >/dev/null 2>&1; then SEDI() { sed -i "$@"; }
+else SEDI() { sed -i '' "$@"; } fi
 if [ "$B1NIX_ARCH" = "x86" ]; then
-  if sed --version >/dev/null 2>&1; then SEDI() { sed -i "$@"; }
-  else SEDI() { sed -i '' "$@"; } fi
   SEDI "s/    with_asm_arch = 'x86'/    with_asm_arch = '' # b1nix: no i386 asm dispatch/" "$SRC_DIR/meson.build"
   SEDI "/    pre_args += \['-DUSE_X86_ASM'\]/d" "$SRC_DIR/meson.build"
+fi
+# x86_64: the generated glapi x86-64 asm dispatch (glapi_x86-64.S) accesses
+# _glapi_tls_Dispatch via @GOTTPOFF — an initial-exec TLS reloc (R_X86_64_TPOFF64)
+# that b1nix's musl ld.so cannot satisfy for the dynamically-loaded libOSMesa.so
+# (load fails, m52-osmesa exits 127 before main). Neutralise the x86_64 asm so
+# glapi uses portable C dispatch (general-dynamic TLS) — fine for a software port.
+if [ "$B1NIX_ARCH" = "x86_64" ]; then
+  SEDI "s/    with_asm_arch = 'x86_64'/    with_asm_arch = '' # b1nix: no x86_64 asm dispatch (IE-TLS)/" "$SRC_DIR/meson.build"
+  SEDI "/    pre_args += \['-DUSE_X86_64_ASM'\]/d" "$SRC_DIR/meson.build"
 fi
 
 # b1nix Mesa source changes (e.g. the VirGL winsys for /dev/virtio-gpu, M53
@@ -209,6 +235,43 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
   if [ -f "$MESON_BUILD/build.ninja" ]; then
     sed -i 's/-DHAVE_QSORT_S/-UHAVE_QSORT_S/g' "$MESON_BUILD/build.ninja"
   fi
+fi
+
+# expat (Mesa's vendored XML subproject): meson's has_function probe false-
+# positively defines HAVE_ARC4RANDOM / HAVE_ARC4RANDOM_BUF in the generated
+# expat_config.h (the host toolchain resolves the symbol even though the musl
+# target libc has no arc4random at all). xmlparse.c then calls the undeclared
+# arc4random_buf and clang errors on the implicit declaration. Editing the
+# generated header does not stick — ninja auto-reconfigures and meson rewrites
+# it with the bad defines. Instead #undef both right after the expat_config.h
+# include in the (stable, unpacked) subproject source so expat takes its
+# getrandom path (HAVE_GETRANDOM is set; musl provides getrandom). Idempotent:
+# skip if the marker is already present.
+EXPAT_XMLPARSE="$SRC_DIR/subprojects/expat-2.5.0/lib/xmlparse.c"
+if [ -f "$EXPAT_XMLPARSE" ]; then
+  perl -0pi -e 'unless (/b1nix: musl has no arc4random/) {
+    s/(#include <expat_config\.h>\n)/$1\n\/* b1nix: musl has no arc4random; use the getrandom fallback. *\/\n#undef HAVE_ARC4RANDOM_BUF\n#undef HAVE_ARC4RANDOM\n/;
+  }' "$EXPAT_XMLPARSE"
+fi
+
+# libc++ runtime errno fix: meson's C++ compiler probe records the *legacy*
+# (old-b1nix-libc) libc++ under toolchain_build/.../llvm-runtimes-build/libcxx-
+# install/lib as a link input for every C++ target. Those legacy libc++.a/
+# libc++abi.a reference `errno` as a DATA symbol (built against the old b1nix
+# errno.h `extern int errno`), which musl's libc.so does not export — so
+# libOSMesa.so ends up with an unresolvable UND errno and every Mesa consumer
+# dies at load ("Error relocating libOSMesa.so.8: errno: symbol not found").
+# The path is baked into build.ninja by meson and regenerated on every ninja
+# auto-reconfigure, so patching build.ninja does not stick. Instead overwrite the
+# legacy archives in place with the musl-built ones (same target, compiled against
+# musl headers → errno is the __errno_location macro, no data symbol). The legacy
+# non-musl libc++ is dead under the musl migration; env.sh already routes every
+# other consumer to llvm-runtimes-build-musl. Idempotent.
+LEGACY_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+MUSL_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+if [ -f "$MUSL_LIBCXX/libc++.a" ] && [ -d "$LEGACY_LIBCXX" ]; then
+  cp -f "$MUSL_LIBCXX/libc++.a"    "$LEGACY_LIBCXX/libc++.a"
+  cp -f "$MUSL_LIBCXX/libc++abi.a" "$LEGACY_LIBCXX/libc++abi.a"
 fi
 
 # Build all reachable targets. With default_library=shared, meson produces

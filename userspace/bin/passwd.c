@@ -5,6 +5,7 @@
 #include <pwd.h>
 #include <crypt.h>
 #include <fcntl.h>
+#include <sys/stat.h>
 
 int get_shadow_hash(const char *username, char *hash_out, size_t max_len) {
     FILE *f = fopen("/etc/shadow", "r");

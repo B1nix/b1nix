@@ -10,6 +10,12 @@
 set -eu
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
+# libjxl is C++ and must be built against LLVM libc++ (ABI-incompatible with
+# libstdc++). Default the stdlib so `stage build-libjxl.sh` (which calls this with
+# no env) selects the libc++ cross toolchain, not the host libstdc++ headers.
+: "${B1NIX_CXX_STDLIB:=libc++}"
+export B1NIX_CXX_STDLIB
+
 CMAKE_NAME=libjxl
 VER="${LIBJXL_VERSION:-0.11.1}"
 CMAKE_SRCNAME="libjxl-${VER}"
@@ -34,6 +40,19 @@ CMAKE_ARGS="-DBUILD_SHARED_LIBS=OFF -DBUILD_TESTING=OFF -DJPEGXL_STATIC=ON \
 # build "all" — the brotli CLI exe needs log2 from a libm we don't link here.
 CMAKE_TARGETS="jxl_dec jxl_cms"
 PATCHES="libjxl/no-mt19937.sh"
+port_pre_configure() {
+  # skcms (bundled Skia CMS) compiles an AVX2+F16C variant via a per-function
+  # `#pragma clang attribute target("avx2,f16c")`. b1nix userspace is built
+  # -msoft-float, which disables the x86 float unit, so clang cannot enable f16c
+  # even under the target pragma and __builtin_ia32_vcvtph2ps256 is undeclared.
+  # Force skcms's portable (scalar) code path — correct for the soft-float ABI.
+  # (The cmake driver sets CMAKE_CXX_FLAGS explicitly, so a -D in CXXFLAGS does
+  # not reach the compile; define it in the source instead. Idempotent.)
+  skcms="$SRC_DIR/third_party/skcms/skcms.cc"
+  if [ -f "$skcms" ] && ! head -1 "$skcms" | grep -q "SKCMS_PORTABLE"; then
+    printf '#define SKCMS_PORTABLE 1\n%s' "$(cat "$skcms")" > "$skcms.tmp" && mv "$skcms.tmp" "$skcms"
+  fi
+}
 
 # Pinned submodule commits (libjxl's GitHub source tarball excludes submodules;
 # deps.sh fetches these — do the equivalent so the build is self-contained).

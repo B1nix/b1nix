@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <syscall.h>
+#include <sys/xattr.h>
 #include <unistd.h>
 #include <errno.h>
 
@@ -21,18 +21,17 @@ int main(int argc, char **argv) {
     fprintf(stderr, "setfattr: missing file operand\n");
     return 1;
   }
-  long rc;
+  int rc;
   if (xname) {
-    rc = syscall(SYS_REMOVEXATTR, (long)file, (long)xname);
+    rc = removexattr(file, xname);
   } else if (name) {
-    rc = syscall(SYS_SETXATTR, (long)file, (long)name,
-                 (long)value, (long)strlen(value));
+    rc = setxattr(file, name, value, strlen(value), 0);
   } else {
     fprintf(stderr, "setfattr: need -n <name> or -x <name>\n");
     return 1;
   }
   if (rc < 0) {
-    fprintf(stderr, "setfattr: %s: %s\n", file, strerror((int)-rc));
+    fprintf(stderr, "setfattr: %s: %s\n", file, strerror(errno));
     return 1;
   }
   return 0;

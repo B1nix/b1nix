@@ -9,7 +9,7 @@ OPENSSL_TARBALL="openssl-${OPENSSL_VERSION}.tar.gz"
 OPENSSL_URL="https://github.com/openssl/openssl/releases/download/OpenSSL_1_1_1w/${OPENSSL_TARBALL}"
 CCACHE=""
 command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CCACHE="ccache "
-WRAP="${CCACHE}$ROOT_DIR/tools/toolchain/bin/b1nix-autotools-cc"
+WRAP="${CCACHE}$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 # Per-architecture build identity + per-triplet source/build dirs.
@@ -38,10 +38,6 @@ fi
 
 # Time discipline/touching to avoid autotools/make rebuild dependencies
 find "$SRC_DIR" -exec touch {} +
-
-if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
-  make -C "$ROOT_DIR/userspace" -s "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
-fi
 
 (
   cd "$SRC_DIR"

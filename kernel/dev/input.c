@@ -122,7 +122,9 @@ static isize input_read(struct vfs_handle *h, char *buf, usize size) {
     }
     spin_unlock_irqrestore(&input_lock, flags);
 
-    if (h->flags & B1NIX_O_NONBLOCK)
+    /* musl's b1nix compatibility headers may retain its O_NONBLOCK bit
+     * (0x8000) on raw device opens; accept it alongside the native VFS bit. */
+    if (h->flags & (B1NIX_O_NONBLOCK | 0x8000))
       return -EAGAIN;
     if (scheduler_signal_pending())
       return -ERESTARTSYS;
@@ -194,6 +196,7 @@ int input_path_index(const char *resolved_path) {
 int input_dev_open(int idx, int flags) {
   if (idx < 0 || idx >= INPUT_NDEVS || !devs[idx].registered)
     return -ENXIO;
+
 
   struct input_client *c = (struct input_client *)kzalloc(sizeof(*c));
   if (!c)

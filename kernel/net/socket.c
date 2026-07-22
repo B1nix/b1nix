@@ -861,7 +861,7 @@ int vfs_accept(int fd, void *addr, usize *addrlen) {
   int res = 0;
   if (s->domain == B1NIX_AF_UNIX) {
     unix_init_state(new_s);
-    res = unix_accept(s, new_s);
+    res = unix_accept(s, new_s, (h->flags & B1NIX_O_NONBLOCK) != 0);
     if (res == 0 && addr && addrlen && *addrlen >= sizeof(struct b1nix_sockaddr_un)) {
       memcpy(addr, &new_s->peer.un, sizeof(struct b1nix_sockaddr_un));
       *addrlen = sizeof(struct b1nix_sockaddr_un);
@@ -1090,9 +1090,16 @@ isize vfs_socket_recvmsg(int fd, void *buf, usize len, int flags,
 
   struct vfs_handle *handles[VFS_SCM_MAX_FDS] = {0};
   usize nhandles = 0;
-  isize rc = unix_recv_control(s, buf, len, flags, handles, &nhandles, cred,
+  /* Honor the fd's O_NONBLOCK: unix_recv_control only blocks unless
+   * MSG_DONTWAIT is set, so fold the handle's non-blocking flag in. Without
+   * this a recvmsg(flags=0) on an O_NONBLOCK unix socket blocks on an idle
+   * peer — e.g. displayd's per-client drain wedges when one client goes quiet. */
+  int recv_flags = flags;
+  if (h->flags & B1NIX_O_NONBLOCK)
+    recv_flags |= B1NIX_MSG_DONTWAIT;
+  isize rc = unix_recv_control(s, buf, len, recv_flags, handles, &nhandles, cred,
                                has_cred);
-  if (rc < 0 || (flags & B1NIX_MSG_PEEK))
+  if (rc < 0 || (recv_flags & B1NIX_MSG_PEEK))
     return rc;
 
   usize installed = 0;

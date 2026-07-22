@@ -144,6 +144,16 @@ void console_bust_lock(void)
 	console_lock = 0;
 }
 
+void console_lock_acquire_irqsave(u64 *flags)
+{
+	spin_lock_irqsave(&console_lock, flags);
+}
+
+void console_lock_release_irqrestore(u64 flags)
+{
+	spin_unlock_irqrestore(&console_lock, flags);
+}
+
 void console_write_hex32(u32 value)
 {
 	const char *digits = "0123456789abcdef";

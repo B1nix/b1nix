@@ -195,7 +195,8 @@ void unix_link_pair(struct vfs_socket_state *a, struct vfs_socket_state *b);
 int unix_bind(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
 int unix_listen(struct vfs_socket_state *s, int backlog);
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr);
-int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s);
+int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
+                int nonblock);
 isize unix_send(struct vfs_socket_state *s, const void *buf, usize len,
                 int nonblock);
 isize unix_recv(struct vfs_socket_state *s, void *buf, usize len);

@@ -219,7 +219,24 @@ enum {
 	SYS_TIMER_DELETE     = 180, /* timer_delete(id) */
 	SYS_DL_PHDR_INFO     = 181, /* dl_iterate_phdr backing: copy out module table */
 	SYS_FD_PATH          = 182, /* absolute path of an open fd (for *at emulation) */
+	/* --- M92: thread/process exit separation --- */
+	SYS_EXIT_GROUP       = 231, /* exit_group: terminate all threads (Linux 231) */
+	/* --- musl Linux-ABI compatibility aliases --- */
+	SYS_SET_TID_ADDRESS  = 232, /* store clear_child_tid ptr, return tid */
+	/* --- vectored I/O (musl libc needs these) --- */
+	SYS_READV            = 233, /* readv(fd, iov, iovcnt) */
+	SYS_WRITEV           = 234, /* writev(fd, iov, iovcnt) */
+	SYS_NANOSLEEP        = 235, /* nanosleep(timespec*, rem*) */
+	/* --- exec via fd (musl fexecve → Linux execveat, nr 322) --- */
+	SYS_EXECVEAT         = 236, /* execveat(dirfd, path, argv, envp, flags) */
 };
+
+/* Aliases: linux_abi.c references these generic names; map to the versioned ones. */
+#define SYS_EVENTFD      SYS_EVENTFD2
+#define SYS_EPOLL_CREATE SYS_EPOLL_CREATE1
+#define SYS_SIGNALFD     SYS_SIGNALFD4
+/* timerfd_gettime is not separately numbered in b1nix — fall back to create */
+#define SYS_TIMERFD_GETTIME SYS_TIMERFD_CREATE
 
 /* Linux-compatible CLONE_* flag bits (subset honored by b1nix). */
 #define B1NIX_CLONE_VM       0x00000100
@@ -229,6 +246,8 @@ enum {
 #define B1NIX_CLONE_THREAD   0x00010000
 #define B1NIX_CLONE_SETTLS   0x00080000
 #define B1NIX_CLONE_CHILD_CLEARTID 0x00200000
+#define B1NIX_CLONE_PARENT_SETTID  0x00100000
+#define B1NIX_CLONE_CHILD_SETTID   0x01000000
 
 /* Linux-compatible FUTEX_* op codes (subset). */
 #define B1NIX_FUTEX_WAIT 0

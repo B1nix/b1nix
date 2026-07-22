@@ -17,6 +17,8 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+#include <fcntl.h>
+#include <unistd.h>
 
 #include <EGL/egl.h>
 #include <GL/osmesa.h>
@@ -61,12 +63,15 @@
 #include "include/core/SkCPUContext.h"
 #include "include/core/SkCPURecorder.h"
 
-/* Graphite GPU (Dawn) backend headers */
+/* Graphite GPU (Dawn) backend headers — only when Dawn was actually built
+ * (generated webgpu headers + libdawn_combined.a present). */
+#ifdef HAVE_DAWN
 #include "include/gpu/graphite/Context.h"
 #include "include/gpu/graphite/ContextOptions.h"
 #include "include/gpu/graphite/Recorder.h"
 #include "include/gpu/graphite/Surface.h"
 #include "include/gpu/graphite/dawn/DawnBackendContext.h"
+#endif
 
 #define W 128
 #define H 128
@@ -461,6 +466,7 @@ static int test_graphite_cpu(void) {
 
 /* --- Graphite GPU (Dawn/OpenGL ES) backend test ---------------------------- */
 
+#ifdef HAVE_DAWN
 static int test_graphite_dawn(void) {
     /* Verify that Dawn/Graphite GPU backend is available.
      * We can't fully initialize Dawn here (requires EGL context + full
@@ -494,6 +500,7 @@ static int test_graphite_dawn(void) {
     printf("M91-SKIA: ok graphite-dawn\n");
     return 1;
 }
+#endif /* HAVE_DAWN */
 
 /* --- Skottie (Lottie animation) test ---------------------------------------- */
 
@@ -586,8 +593,12 @@ int main(void) {
     /* Graphite CPU backend test */
     if (test_graphite_cpu()) pass++; else fail++;
 
-    /* Graphite GPU (Dawn/OpenGL ES) backend test */
+    /* Graphite GPU (Dawn/OpenGL ES) backend test — only when Dawn was built */
+#ifdef HAVE_DAWN
     if (test_graphite_dawn()) pass++; else fail++;
+#else
+    printf("M91-SKIA: skip graphite-dawn (dawn not built)\n");
+#endif
 
     /* Skottie (Lottie animation) test */
     if (test_skottie()) pass++; else fail++;

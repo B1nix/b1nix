@@ -1,6 +1,7 @@
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
+#include <b1nix/user.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/io.h>
@@ -683,6 +684,68 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
       }
     }
     console_write("\n");
+  }
+
+  /* RIP=0 crash diagnostic: dump first 16 stack qwords + GOT entries. */
+  if ((frame->cs == 0x1B || frame->cs == 0x23) && frame->rip == 0) {
+    extern int syscall_copyin(void *dst, const void *user_src, unsigned long size);
+    console_write("\nrip0-stk:");
+    for (int i = 0; i < 16; i++) {
+      u64 v = 0;
+      if (syscall_copyin(&v, (void *)(frame->rsp + i * 8), 8) != 0) break;
+      console_write(" "); console_write_hex64(v);
+    }
+    console_write("\n");
+
+    /* Dump .got.plt entries to see if PLT resolver filled them.
+     * Find the DYNAMIC segment, read DT_PLTGOT, then dump 8 GOT qwords. */
+    if (current_task && current_task->user_image) {
+      struct user_loaded_image *img = (struct user_loaded_image *)current_task->user_image;
+      console_write("\nrip0-segs:");
+      for (usize s = 0; s < img->segment_count && s < 8; s++) {
+        console_write(" s"); console_write_dec(s);
+        console_write(":v="); console_write_hex64(img->segments[s].vaddr);
+        console_write(",m="); console_write_hex64(img->segments[s].memsz);
+        console_write(",f="); console_write_hex64(img->segments[s].flags);
+      }
+      console_write("\n");
+      /* Scan ALL RW segments for DT_PLTGOT (tag=3) in the DYNAMIC section.
+       * Both ld-musl and app segments are RW; ld-musl's DYNAMIC won't have
+       * a PLTGOT that points into app address space. */
+      for (usize s = 0; s < img->segment_count && s < 8; s++) {
+        u64 flags = img->segments[s].flags;
+        if ((flags & 6) != 6) continue;
+        u64 vaddr = img->segments[s].vaddr;
+        u64 memsz = img->segments[s].memsz;
+        for (u64 off = 0; off < 0x2000 && off + 16 <= memsz; off += 8) {
+          u64 tag = 0, val = 0;
+          if (syscall_copyin(&tag, (void *)(vaddr + off), 8) != 0) break;
+          if (tag == 3) {
+            if (syscall_copyin(&val, (void *)(vaddr + off + 8), 8) != 0) break;
+            /* The in-memory DYNAMIC d_un values are file-relative for a PIE
+             * (ld.so does not relocate its own view we read here). Rebase
+             * low values using the containing segment's 2MB-aligned base.
+             * Only dump the app's GOT (segments above the ld.so window are
+             * skipped via the 0x7000...  interp base check). */
+            if (vaddr >= 0x0000700000000000ULL) break; /* ld.so's own DYNAMIC */
+            u64 got = val;
+            if (got < 0x40000000ULL)
+              got += vaddr & ~((u64)0x1FFFFF);
+            console_write("\ngot-plt @0x");
+            console_write_hex64(got);
+            console_write(":");
+            for (int g = 0; g < 64; g++) {
+              u64 gv = 0;
+              if (syscall_copyin(&gv, (void *)(got + g * 8), 8) != 0) break;
+              console_write(" "); console_write_hex64(gv);
+            }
+            console_write("\n");
+            goto got_done;
+          }
+        }
+      }
+      got_done: (void)0;
+    }
   }
 
   /* Diagnostic dump done (it's the only fault-prone part) — clear the guard so

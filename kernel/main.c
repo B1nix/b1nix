@@ -498,6 +498,83 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.diskbench"))
 		disk_benchmark();
 #endif
+
+	/* M92 musl smoke test: must run BEFORE rootfs mount because the binary
+	 * lives in the initramfs which gets hidden when ram0 ext4 is mounted at /.
+	 * userspace_init() just registers builtins — safe to call early. */
+	if (bootinfo_has_flag("b1nix.muslrun")) {
+		userspace_init();
+		char musl_buf[64];
+		/* Run raw diagnostic first, then hello, then full smoke test. */
+		const char *raw_argv[] = {"m92-musl-raw-diag", 0};
+		int raw_pid = user_spawn("/bin/m92-musl-raw-diag", 1, raw_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn m92-musl-raw-diag: %d\n", raw_pid);
+		console_write(musl_buf);
+		if (raw_pid > 0) {
+			int musl_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)raw_pid, (u64)(usize)&musl_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-raw-diag exit=%d\n", musl_st);
+			console_write(musl_buf);
+		}
+		const char *hello_argv[] = {"m92-musl-hello", 0};
+		int hello_pid = user_spawn("/bin/m92-musl-hello", 1, hello_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn m92-musl-hello: %d\n", hello_pid);
+		console_write(musl_buf);
+		if (hello_pid > 0) {
+			int musl_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)hello_pid, (u64)(usize)&musl_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-hello exit=%d\n", musl_st);
+			console_write(musl_buf);
+		}
+		const char *step2_argv[] = {"m92-musl-step2", 0};
+		int step2_pid = user_spawn("/bin/m92-musl-step2", 1, step2_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn m92-musl-step2: %d\n", step2_pid);
+		console_write(musl_buf);
+		if (step2_pid > 0) {
+			int musl_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)step2_pid, (u64)(usize)&musl_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-step2 exit=%d\n", musl_st);
+			console_write(musl_buf);
+		}
+		/* M92 dynamic musl test — PIE/ET_DYN linked against ld-musl-x86_64.so.1 */
+		const char *musl_dyn_argv[] = {"m92-musl-dyn-smoke", 0};
+		int musl_dyn_pid = user_spawn("/bin/m92-musl-dyn-smoke", 1, musl_dyn_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn m92-musl-dyn-smoke: %d\n", musl_dyn_pid);
+		console_write(musl_buf);
+		if (musl_dyn_pid > 0) {
+			int musl_dyn_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)musl_dyn_pid, (u64)(usize)&musl_dyn_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-dyn-smoke exit=%d\n", musl_dyn_st);
+			console_write(musl_buf);
+		}
+		/* M92-LDSO (ldso-migration-and-unix-parity-plan.md): PT_INTERP =
+		 * /lib/ld-musl-x86_64.so.1. The kernel loads only the interpreter's own
+		 * segments and jumps into it; musl's real ld.so links this binary
+		 * itself — no in-kernel eager linker involved. */
+		const char *musl_ldso_argv[] = {"m92-musl-ldso-smoke", 0};
+		int musl_ldso_pid = user_spawn("/bin/m92-musl-ldso-smoke", 1, musl_ldso_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn m92-musl-ldso-smoke: %d\n", musl_ldso_pid);
+		console_write(musl_buf);
+		if (musl_ldso_pid > 0) {
+			int musl_ldso_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)musl_ldso_pid, (u64)(usize)&musl_ldso_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-ldso-smoke exit=%d\n", musl_ldso_st);
+			console_write(musl_buf);
+		}
+		/* M92-POSIX: musl POSIX smoke test — compiled with LINK=musl against
+		 * musl's libc.so via /lib/ld-musl-x86_64.so.1 real interpreter. */
+		const char *musl_posix_argv[] = {"musl-posix-smoke", 0};
+		int musl_posix_pid = user_spawn("/bin/musl-posix-smoke", 1, musl_posix_argv);
+		snprintf(musl_buf, sizeof(musl_buf), "musl: spawn musl-posix-smoke: %d\n", musl_posix_pid);
+		console_write(musl_buf);
+		if (musl_posix_pid > 0) {
+			int musl_posix_st = 0;
+			syscall_dispatch(SYS_WAIT, (u64)musl_posix_pid, (u64)(usize)&musl_posix_st, 0, 0, 0, 0);
+			snprintf(musl_buf, sizeof(musl_buf), "musl: musl-posix-smoke exit=%d\n", musl_posix_st);
+			console_write(musl_buf);
+		}
+	}
+
 #ifndef __aarch64__
 	/* Prefer a real ext4 root over the bootstrap initramfs.  Native runs use
 	 * virtio-blk0; Live CD boots use the multiboot ramdisk block device ram0.
@@ -775,6 +852,7 @@ void kernel_main(usize arg0, usize arg1)
 	kswapd_init();
 
 	userspace_init();
+
 	int init_pid = user_spawn("/bin/init", 0, 0);
 	char init_spawn_buf[64];
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);

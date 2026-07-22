@@ -9,6 +9,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
+#include <stdio.h>
 #include <string.h>
 
 extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
@@ -70,6 +71,32 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
  * table (see user_build_initial_stack / crt0). Far above the standard auxv
  * range (0..51) so it can never collide. Must match userspace/include/sys/auxv.h. */
 #define AT_B1NIX_DSO_INIT 0x1000
+
+/* Userspace ld.so support: fixed load base for a real ELF interpreter (musl's
+ * ld-musl-x86_64.so.1). Placed above the eager-linker's DT_NEEDED range
+ * (0x600000000000 .. 0x600000000000 + DYN_MAX_OBJECTS*0x10000000000) so the
+ * two loading paths can never collide, though they are mutually exclusive
+ * per-image in practice. */
+#define USER_LDSO_LOAD_BASE 0x0000700000000000ULL
+
+/* M92: ELF auxiliary vector types (from <elf.h>). Defined here so the kernel
+ * loader can populate the initial stack without depending on userspace headers. */
+#define AT_NULL     0
+#define AT_PHDR     3
+#define AT_PHENT    4
+#define AT_PHNUM    5
+#define AT_PAGESZ   6
+#define AT_BASE     7
+#define AT_ENTRY    9
+#define AT_CLKTCK  17
+#define AT_UID     11
+#define AT_EUID    12
+#define AT_GID     13
+#define AT_EGID    14
+#define AT_HWCAP   16
+#define AT_SECURE  23
+#define AT_RANDOM  25
+#define AT_EXECFN  31
 #define DT_JMPREL  23
 #define DT_PLTREL  20
 
@@ -84,88 +111,14 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 #define R_X86_64_DTPOFF64 17
 #define R_X86_64_TPOFF64  18
 
-/* General/local-dynamic TLS for STATIC (load-time, kernel-eager-linked) modules.
- * The GD/LD model routes __thread access through __tls_get_addr({module,offset}).
- * Rather than teach libc's __tls_get_addr a per-thread DTV for these modules, the
- * eager loader encodes the module's static-TLS distance-below-TP directly into
- * the DTPMOD64 GOT slot, flagged with bit 63; libc's __tls_get_addr then returns
- * (thread_pointer - dist + offset). Small tls_offset values never set bit 63, and
- * dlopen module ids (1,2,3…) never do either, so the flag cleanly distinguishes
- * the two paths. MUST match TLS_STATIC_MODULE_FLAG in userspace/libc/dlfcn.c. */
-#define TLS_STATIC_MODULE_FLAG (1ULL << 63)
+/* ELF64 dynamic-section entry and RELA relocation record. Used by the in-kernel
+ * RELATIVE-relocation pass for no-interp PIE binaries (see user_load_elf64). */
+struct elf64_dyn { i64 d_tag; u64 d_val; };
+struct elf64_rela { u64 r_offset; u64 r_info; i64 r_addend; };
 
-struct elf64_rela {
-  u64 r_offset;
-  u64 r_info;
-  i64 r_addend;
-} __attribute__((packed));
-
-struct elf64_dyn {
-  i64 d_tag;
-  u64 d_val;
-} __attribute__((packed));
-
-struct elf64_sym {
-  u32 st_name;
-  u8 st_info;
-  u8 st_other;
-  u16 st_shndx;
-  u64 st_value;
-  u64 st_size;
-} __attribute__((packed));
-
-#define ELF64_ST_BIND(info) ((info) >> 4)
-#define STB_WEAK 2
-#define SHN_UNDEF 0
-/* Deep dependency graphs (e.g. the Skia demo: exe + libskia + libraw_ptr +
- * libfontconfig + libb1gui + libc++ + libc++abi + libc + libGLESv2 + libEGL +
- * libgcc_s = 11 objects) need headroom above the old rustc-era limit of 8.
- * objects[] lives on the 64 KiB kernel stack, so 16 is comfortably safe. */
-#define DYN_MAX_OBJECTS 16
-#define DYN_MAX_NEEDED 8
-
-struct elf64_dyn_object {
-  u64 base;
-  usize first_segment;
-  usize segment_count;
-  u64 rela;
-  u64 rela_size;
-  u64 jmprel;
-  u64 jmprel_size;
-  u64 symtab;
-  u64 strtab;
-  u64 strsz;
-  u64 hash;
-  /* DT_INIT / DT_INIT_ARRAY: this object's C++ static constructors. For a
-   * shared library these are NOT covered by the executable's crt0 (which only
-   * walks the EXE's own __init_array), so the kernel collects them across the
-   * whole DT_NEEDED graph and hands the list to userspace (via AT_B1NIX_DSO_INIT)
-   * to run before the executable's own constructors. init/init_array are
-   * base-relative absolute VAs once parsed. */
-  u64 init_array;
-  u64 init_arraysz;
-  /* dl_iterate_phdr: in-process address of this object's program header table
-   * (dlpi_phdr) and its entry count. The DWARF unwinder reads these to locate the
-   * object's PT_GNU_EH_FRAME (.eh_frame_hdr). 0 = not recorded. */
-  u64 phdr_vaddr;
-  u32 phnum;
-  /* In-process address of this object's .eh_frame section (found via the section
-   * header table). __b1nix_run_dso_init hands it to libgcc's __register_frame so
-   * the DWARF unwinder can unwind frames in this object — required even for
-   * libgcc_s.so itself (the unwinder unwinds its own _Unwind_RaiseException frame
-   * first). 0 = no .eh_frame. */
-  u64 eh_frame_va;
-  u64 needed[DYN_MAX_NEEDED];
-  usize needed_count;
-  /* PT_TLS template for this object (for static-TLS layout across the whole
-   * DT_NEEDED graph). tls_offset is the variant-II distance below the thread
-   * pointer at which this object's TLS block sits (0 = object has no TLS). */
-  u64 tls_memsz;
-  u64 tls_filesz;
-  u64 tls_align;
-  u64 tls_offset;
-  void *tls_data;
-};
+/* Defined out-of-line below user_load_elf64; forward-declared so the loader's
+ * RELATIVE pass can resolve a runtime vaddr to its staging-buffer address. */
+static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n);
 
 /* M30 — base address at which PIE/ET_DYN images get loaded. Picked well
  * above the standard 0x400000 ET_EXEC load base and below the user
@@ -266,159 +219,17 @@ static struct user_address_space user_address_space_create(void) {
   return address_space;
 }
 
-static u8 *elf64_stage_ptr(struct user_loaded_image *image, u64 va, usize n)
-{
-  if (va + n < va)
-    return 0;
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *s = &image->segments[i];
-    if (va >= s->vaddr && va + n <= s->vaddr + s->memsz)
-      return (u8 *)s->data + (va - s->vaddr);
-  }
-  return 0;
-}
-
-/* Copy the NUL-terminated string at `va` into `out` (always NUL-terminated),
- * bounded by both `out_size` and the containing segment's end (R4-8). Returns 1
- * on success, 0 if `va` is not inside any segment. */
-static int elf64_copy_str(struct user_loaded_image *image, u64 va, char *out,
-                          usize out_size)
-{
-  if (out_size == 0)
-    return 0;
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *s = &image->segments[i];
-    if (va < s->vaddr || va >= s->vaddr + s->memsz)
-      continue;
-    const char *str = (const char *)s->data + (va - s->vaddr);
-    usize avail = (usize)(s->vaddr + s->memsz - va);
-    usize limit = avail < out_size - 1 ? avail : out_size - 1;
-    usize k = 0;
-    for (; k < limit && str[k]; k++)
-      out[k] = str[k];
-    out[k] = '\0';
-    return 1;
-  }
-  return 0;
-}
-
-/* Compare a NUL-terminated string that lives at `va` inside the staged image
- * against `name`, but never scan past the containing segment's end — a crafted
- * strtab string with no NUL before the segment boundary would otherwise drive
- * an OOB read out of the kmalloc'd segment (R4-8). Returns 1 on equal. */
-static int elf64_str_at_equals(struct user_loaded_image *image, u64 va,
-                               const char *name)
-{
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *s = &image->segments[i];
-    if (va < s->vaddr || va >= s->vaddr + s->memsz)
-      continue;
-    const char *str = (const char *)s->data + (va - s->vaddr);
-    usize avail = (usize)(s->vaddr + s->memsz - va);
-    usize k = 0;
-    for (; k < avail; k++) {
-      if (str[k] != name[k])
-        return 0;
-      if (name[k] == '\0') /* both reached NUL at the same position */
-        return 1;
-    }
-    /* Ran off the segment with no NUL — not a valid/equal string. */
-    return 0;
-  }
-  return 0;
-}
-
-static int elf64_parse_dynamic(struct user_loaded_image *image,
-                               struct elf64_dyn_object *obj,
-                               const struct elf64_phdr *phdrs, u16 phnum)
-{
-  for (u16 i = 0; i < phnum; i++) {
-    const struct elf64_phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_DYNAMIC)
-      continue;
-    /* The PT_DYNAMIC contents live inside an already-staged PT_LOAD, so read the
-     * DT array out of the staging buffer by vaddr (obj->base + p_vaddr) rather
-     * than from a whole-file copy — the streaming loader no longer keeps one.
-     * elf64_stage_ptr bounds the p_filesz span against the staged segment. */
-    const struct elf64_dyn *dyn = (const struct elf64_dyn *)elf64_stage_ptr(
-        image, obj->base + ph->p_vaddr, ph->p_filesz);
-    if (!dyn)
-      return -1;
-    usize count = ph->p_filesz / sizeof(*dyn);
-    for (usize d = 0; d < count && dyn[d].d_tag != DT_NULL; d++) {
-      switch (dyn[d].d_tag) {
-      case DT_NEEDED:
-        if (obj->needed_count < DYN_MAX_NEEDED)
-          obj->needed[obj->needed_count++] = dyn[d].d_val;
-        break;
-      case DT_HASH: obj->hash = dyn[d].d_val + obj->base; break;
-      case DT_STRTAB: obj->strtab = dyn[d].d_val + obj->base; break;
-      case DT_SYMTAB: obj->symtab = dyn[d].d_val + obj->base; break;
-      case DT_STRSZ: obj->strsz = dyn[d].d_val; break;
-      case DT_RELA: obj->rela = dyn[d].d_val + obj->base; break;
-      case DT_RELASZ: obj->rela_size = dyn[d].d_val; break;
-      case DT_JMPREL: obj->jmprel = dyn[d].d_val + obj->base; break;
-      case DT_PLTRELSZ: obj->jmprel_size = dyn[d].d_val; break;
-      case DT_INIT_ARRAY: obj->init_array = dyn[d].d_val + obj->base; break;
-      case DT_INIT_ARRAYSZ: obj->init_arraysz = dyn[d].d_val; break;
-      default: break;
-      }
-    }
-    return 0;
-  }
-  return 0;
-}
-
-/* dl_iterate_phdr: the in-process address of an ELF object's program header
- * table. The phdrs live at file offset e_phoff; find the PT_LOAD segment that
- * maps that offset and translate it to its loaded virtual address (base +
- * p_vaddr + (e_phoff - p_offset)). Returns 0 if no PT_LOAD covers e_phoff (the
- * phdrs are then not mapped, and the object can't participate in
- * dl_iterate_phdr — harmless: the unwinder just won't find its FDEs that way). */
-static u64 elf64_phdr_vaddr(const struct elf64_ehdr *ehdr,
-                            const struct elf64_phdr *phdrs, u64 base)
-{
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph = &phdrs[i];
-    if (ph->p_type != PT_LOAD)
-      continue;
-    if (ehdr->e_phoff >= ph->p_offset &&
-        ehdr->e_phoff < ph->p_offset + ph->p_filesz)
-      return base + ph->p_vaddr + (ehdr->e_phoff - ph->p_offset);
-  }
-  return 0;
-}
-
-/* In-process address of an object's .eh_frame section, located via the section
- * header table in the on-disk image `data`. Used to register the object's DWARF
- * unwind tables with libgcc (__register_frame) — this is the only reliable way
- * to find .eh_frame for a shared object built without --eh-frame-hdr (e.g. the
- * cross toolchain's libgcc_s.so, which lacks a PT_GNU_EH_FRAME). Returns 0 if no
- * .eh_frame section exists or the headers are out of range. */
-static u64 elf64_find_eh_frame(const u8 *data, usize size, u64 base)
-{
-  const struct elf64_ehdr *eh = (const struct elf64_ehdr *)data;
-  if (eh->e_shoff == 0 || eh->e_shentsize != sizeof(struct elf64_shdr) ||
-      eh->e_shnum == 0 || eh->e_shstrndx >= eh->e_shnum ||
-      eh->e_shoff + (u64)eh->e_shnum * eh->e_shentsize > size)
-    return 0;
-  const struct elf64_shdr *sh = (const struct elf64_shdr *)(data + eh->e_shoff);
-  const struct elf64_shdr *strsh = &sh[eh->e_shstrndx];
-  if (strsh->sh_offset + strsh->sh_size > size)
-    return 0;
-  const char *shstr = (const char *)(data + strsh->sh_offset);
-  for (u16 i = 0; i < eh->e_shnum; i++) {
-    if (sh[i].sh_name >= strsh->sh_size)
-      continue;
-    if (strcmp(shstr + sh[i].sh_name, ".eh_frame") == 0)
-      return base + sh[i].sh_addr;
-  }
-  return 0;
-}
-
-static int elf64_load_shared_object(struct user_loaded_image *image,
-                                    const char *path, u64 base,
-                                    struct elf64_dyn_object *obj)
+/* Userspace ld.so support (ldso-migration-and-unix-parity-plan.md, part 1).
+ * Loads a real ELF interpreter's (musl's ld-musl-x86_64.so.1) own PT_LOAD
+ * segments verbatim at `base`, WITHOUT eager symbol resolution/relocation:
+ * the interpreter is a standard ET_DYN that self-relocates (applies its own
+ * R_X86_64_RELATIVE entries) as the very first thing it does at its entry
+ * point, exactly as on Linux. Returns the interpreter's absolute entry VA in
+ * *out_entry. Unlike elf64_load_shared_object, this does NOT call
+ * elf64_parse_dynamic — the in-kernel eager linker plays no further part once
+ * control transfers to a real interpreter. */
+static int elf64_load_interpreter(struct user_loaded_image *image,
+                                  const char *path, u64 base, u64 *out_entry)
 {
   char *data = 0;
   usize size = 0;
@@ -438,10 +249,6 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     kfree(data);
     return -1;
   }
-
-  memset(obj, 0, sizeof(*obj));
-  obj->base = base;
-  obj->first_segment = image->segment_count;
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     const struct elf64_phdr *ph =
         (const struct elf64_phdr *)(data + ehdr->e_phoff +
@@ -449,8 +256,7 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     if (ph->p_type != PT_LOAD)
       continue;
     if (image->segment_count >= USER_MAX_IMAGE_SEGMENTS ||
-        ph->p_filesz > ph->p_memsz ||
-        ph->p_offset + ph->p_filesz > size) {
+        ph->p_filesz > ph->p_memsz || ph->p_offset + ph->p_filesz > size) {
       kfree(data);
       return -1;
     }
@@ -458,8 +264,10 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
         &image->segments[image->segment_count++];
     seg->vaddr = base + ph->p_vaddr;
     seg->memsz = ph->p_memsz;
-    seg->filesz = ph->p_memsz;
+    seg->filesz = ph->p_filesz;
     seg->flags = ph->p_flags;
+    seg->file_offset = ph->p_offset;
+    seg->demand_ok = 0;
     seg->data = kzalloc(ph->p_memsz ? ph->p_memsz : 1);
     if (!seg->data) {
       kfree(data);
@@ -467,372 +275,9 @@ static int elf64_load_shared_object(struct user_loaded_image *image,
     }
     if (ph->p_filesz)
       memcpy(seg->data, data + ph->p_offset, ph->p_filesz);
-    obj->segment_count++;
   }
-  /* Capture this library's PT_TLS template so the loader can place it in the
-   * process-wide static-TLS area and resolve the library's R_X86_64_TPOFF64
-   * relocations against the combined layout. */
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    const struct elf64_phdr *ph =
-        (const struct elf64_phdr *)(data + ehdr->e_phoff +
-                                    (u64)i * ehdr->e_phentsize);
-    if (ph->p_type != PT_TLS)
-      continue;
-    if (ph->p_filesz > ph->p_memsz ||
-        ph->p_offset + ph->p_filesz < ph->p_offset ||
-        ph->p_offset + ph->p_filesz > size ||
-        ph->p_memsz > USER_IMAGE_MAX_SEGMENT)
-      break;
-    obj->tls_memsz = ph->p_memsz;
-    obj->tls_filesz = ph->p_filesz;
-    obj->tls_align = ph->p_align ? ph->p_align : 8;
-    if (ph->p_filesz) {
-      obj->tls_data = kmalloc(ph->p_filesz);
-      if (obj->tls_data)
-        memcpy(obj->tls_data, data + ph->p_offset, ph->p_filesz);
-    }
-    break;
-  }
-  /* Record the .so's program header table address (dlpi_phdr) for
-   * dl_iterate_phdr, so the unwinder can find this object's PT_GNU_EH_FRAME. */
-  obj->phdr_vaddr = elf64_phdr_vaddr(
-      ehdr, (const struct elf64_phdr *)(data + ehdr->e_phoff), base);
-  obj->phnum = ehdr->e_phnum;
-  obj->eh_frame_va = elf64_find_eh_frame(data, size, base);
-  /* The .so's PT_LOAD segments are already staged above, so parse_dynamic reads
-   * its DT array from staging by vaddr; we only need to hand it the phdr table
-   * (validated phentsize == sizeof above). */
-  int rc = elf64_parse_dynamic(
-      image, obj, (const struct elf64_phdr *)(data + ehdr->e_phoff),
-      ehdr->e_phnum);
+  *out_entry = base + ehdr->e_entry;
   kfree(data);
-  return rc;
-}
-
-/* Standard SysV ELF symbol hash (the DT_HASH bucket function). */
-static u32 elf64_sysv_hash(const char *name)
-{
-  u32 h = 0, g;
-  while (*name) {
-    h = (h << 4) + (u8)*name++;
-    g = h & 0xf0000000u;
-    if (g)
-      h ^= g >> 24;
-    h &= ~g;
-  }
-  return h;
-}
-
-/* O(1) symbol lookup via the SysV DT_HASH table: returns the dynsym index of
- * the entry named `name` in `obj`, or SHN_UNDEF (0) if absent. Replaces the
- * old linear O(symbols) scan — every dynamic object the b1nix linker emits
- * carries DT_HASH (the eager-resolution path already depended on it). */
-static u32 elf64_hash_lookup(struct user_loaded_image *image,
-                             const struct elf64_dyn_object *obj,
-                             const char *name)
-{
-  if (!obj->hash || !obj->symtab || !obj->strtab)
-    return SHN_UNDEF;
-  u32 *hdr = (u32 *)elf64_stage_ptr(image, obj->hash, 8);
-  if (!hdr)
-    return SHN_UNDEF;
-  u32 nbucket = hdr[0];
-  u32 nchain = hdr[1]; /* nchain == dynamic symbol count */
-  if (nbucket == 0 || nchain == 0)
-    return SHN_UNDEF;
-  u32 *bucket = (u32 *)elf64_stage_ptr(image, obj->hash + 8,
-                                       (u64)nbucket * sizeof(u32));
-  u32 *chain = (u32 *)elf64_stage_ptr(
-      image, obj->hash + 8 + (u64)nbucket * sizeof(u32),
-      (u64)nchain * sizeof(u32));
-  if (!bucket || !chain)
-    return SHN_UNDEF;
-  u32 y = bucket[elf64_sysv_hash(name) % nbucket];
-  /* Walk the collision chain; cap at nchain so a malformed cyclic table can't
-   * spin the kernel. */
-  for (u32 guard = 0; y != SHN_UNDEF && y < nchain && guard < nchain;
-       y = chain[y], guard++) {
-    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-        image, obj->symtab + (u64)y * sizeof(*sym), sizeof(*sym));
-    if (!sym || sym->st_name >= obj->strsz)
-      break;
-    if (elf64_str_at_equals(image, obj->strtab + sym->st_name, name))
-      return y;
-  }
-  return SHN_UNDEF;
-}
-
-/* Resolve `name` to a defined symbol's load address, searching objects from
- * index `start`. start=0 is the normal global scope (main executable first, so
- * its definitions win — including a symbol the exe owns via an R_X86_64_COPY
- * reloc). start=1 skips the executable, which is exactly what a COPY reloc needs
- * to locate the *library's* original copy of the datum. */
-static int elf64_resolve_symbol(struct user_loaded_image *image,
-                                struct elf64_dyn_object *objects,
-                                usize object_count, usize start,
-                                const char *name, u64 *value)
-{
-  for (usize o = start; o < object_count; o++) {
-    u32 idx = elf64_hash_lookup(image, &objects[o], name);
-    if (idx == SHN_UNDEF)
-      continue;
-    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-        image, objects[o].symtab + (u64)idx * sizeof(*sym), sizeof(*sym));
-    /* Present in this object's hash, but only a definition counts — an
-     * undefined entry means another object owns it; keep searching. */
-    if (!sym || sym->st_shndx == SHN_UNDEF)
-      continue;
-    *value = objects[o].base + sym->st_value;
-    return 0;
-  }
-  return -1;
-}
-
-/* Like elf64_resolve_symbol, but for thread-local symbols: returns the index of
- * the defining object (whose static-TLS offset gives the thread-pointer-relative
- * location) and the symbol's TLS-template-relative st_value. Used to fill
- * R_X86_64_TPOFF64 relocations referencing a named __thread variable. */
-static int elf64_resolve_tls_symbol(struct user_loaded_image *image,
-                                    struct elf64_dyn_object *objects,
-                                    usize object_count, const char *name,
-                                    usize *out_obj, u64 *out_value)
-{
-  for (usize o = 0; o < object_count; o++) {
-    u32 idx = elf64_hash_lookup(image, &objects[o], name);
-    if (idx == SHN_UNDEF)
-      continue;
-    struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-        image, objects[o].symtab + (u64)idx * sizeof(*sym), sizeof(*sym));
-    if (!sym || sym->st_shndx == SHN_UNDEF)
-      continue;
-    *out_obj = o;
-    *out_value = sym->st_value;
-    return 0;
-  }
-  return -1;
-}
-
-/* Clear demand_ok on whichever segment contains virtual address `va` — called
- * for every relocation write target so a segment the in-kernel linker modifies
- * is never demand-paged from the now-stale file. Relocation targets always land
- * in the writable GOT/PLT/data segment, so this is a correctness safety net. */
-static void elf64_mark_seg_dirty(struct user_loaded_image *image, u64 va) {
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *s = &image->segments[i];
-    if (va >= s->vaddr && va < s->vaddr + s->memsz) {
-      s->demand_ok = 0;
-      return;
-    }
-  }
-}
-
-static int elf64_apply_rela_table(struct user_loaded_image *image,
-                                  struct elf64_dyn_object *objects,
-                                  usize object_count, usize owner,
-                                  u64 table, u64 table_size)
-{
-  if (!table || !table_size)
-    return 0;
-  usize count = table_size / sizeof(struct elf64_rela);
-  for (usize i = 0; i < count; i++) {
-    struct elf64_rela *rela = (struct elf64_rela *)elf64_stage_ptr(
-        image, table + i * sizeof(*rela), sizeof(*rela));
-    if (!rela)
-      return -1;
-    u32 type = (u32)rela->r_info;
-    u32 sym_index = (u32)(rela->r_info >> 32);
-    if (type == R_X86_64_NONE)
-      continue;
-    /* `target` is the 8-byte GOT/data slot written by the RELATIVE / 64 /
-     * GLOB_DAT / JUMP_SLOT / TPOFF64 relocations. R_X86_64_COPY does NOT write
-     * through it — it stages its own dst/src below using the symbol's *actual*
-     * size — so a COPY datum occupying the final bytes of a PT_LOAD (e.g. a
-     * 4-byte `errno` whose RW segment ends exactly 4 bytes after it) must not be
-     * rejected by this fixed 8-byte probe, which would overrun the segment end
-     * (va + 8 > vaddr + memsz) and fail an otherwise valid COPY at a .bss
-     * boundary. The COPY path's own elf64_stage_ptr(.. sz) handles its bounds. */
-    u64 *target = (u64 *)elf64_stage_ptr(
-        image, objects[owner].base + rela->r_offset, sizeof(u64));
-    if (!target && type != R_X86_64_COPY)
-      return -1;
-    if (type != R_X86_64_COPY)
-      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
-    if (type == R_X86_64_RELATIVE) {
-      *target = objects[owner].base + (u64)rela->r_addend;
-      continue;
-    }
-    if (type == R_X86_64_64 || type == R_X86_64_GLOB_DAT ||
-        type == R_X86_64_JUMP_SLOT) {
-      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-          image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
-          sizeof(*sym));
-      if (!sym || sym->st_name >= objects[owner].strsz)
-        return -1;
-      /* Copy the undefined symbol's name into a bounded buffer before using it
-       * as a lookup key — the raw strtab pointer may not be NUL-terminated
-       * within its segment (R4-8). */
-      char name[2048]; /* Rust mangled names run long (~750+ chars) */
-      u64 resolved = 0;
-      if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
-                          sizeof(name)) ||
-          elf64_resolve_symbol(image, objects, object_count, 0, name,
-                               &resolved) != 0) {
-        if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
-          resolved = 0;
-        else {
-          console_write("ELF load: unresolved symbol ");
-          console_write(name);
-          console_write("\n");
-          return -1;
-        }
-      }
-      *target = resolved + (u64)rela->r_addend;
-      continue;
-    }
-    /* R_X86_64_COPY: a non-PIE executable importing a data object from a shared
-     * library gets the datum copied into its own .bss; the library's GLOB_DAT
-     * for the same name then resolves back to this copy (start=0 finds the
-     * executable's definition first). Resolve from index 1 to read the library's
-     * original bytes, not the just-allocated (zero) destination. */
-    if (type == R_X86_64_COPY) {
-      struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-          image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
-          sizeof(*sym));
-      if (!sym || sym->st_name >= objects[owner].strsz)
-        return -1;
-      u64 sz = sym->st_size;
-      if (sz == 0)
-        continue;
-      if (sz > USER_IMAGE_MAX_SEGMENT)
-        return -1;
-      char name[2048]; /* Rust mangled names run long (~750+ chars) */
-      u64 src = 0;
-      if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
-                          sizeof(name)) ||
-          elf64_resolve_symbol(image, objects, object_count, 1, name,
-                               &src) != 0) {
-        if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
-          continue;
-        return -1;
-      }
-      void *dstp = elf64_stage_ptr(image, objects[owner].base + rela->r_offset, sz);
-      void *srcp = elf64_stage_ptr(image, src, sz);
-      if (!dstp || !srcp)
-        return -1;
-      memcpy(dstp, srcp, (usize)sz);
-      elf64_mark_seg_dirty(image, objects[owner].base + rela->r_offset);
-      continue;
-    }
-    /* R_X86_64_TPOFF64: thread-pointer-relative offset of a __thread variable
-     * for the initial-exec model. The variable lives in some object's static-TLS
-     * block at distance objects[d].tls_offset below the thread pointer, so the
-     * stored value is (st_value + addend - tls_offset). sym_index 0 is owner-
-     * relative (addend already carries the in-block offset). */
-    if (type == R_X86_64_TPOFF64) {
-      i64 tpoff;
-      if (sym_index == 0) {
-        tpoff = rela->r_addend - (i64)objects[owner].tls_offset;
-      } else {
-        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
-            sizeof(*sym));
-        if (!sym || sym->st_name >= objects[owner].strsz)
-          return -1;
-        if (sym->st_shndx != SHN_UNDEF) {
-          tpoff = (i64)sym->st_value + rela->r_addend -
-                  (i64)objects[owner].tls_offset;
-        } else {
-          char name[2048]; /* Rust mangled names run long (~750+ chars) */
-          usize d = 0;
-          u64 stv = 0;
-          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
-                              sizeof(name)))
-            return -1;
-          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
-                                       &stv) == 0)
-            tpoff = (i64)stv + rela->r_addend - (i64)objects[d].tls_offset;
-          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
-            tpoff = rela->r_addend;
-          else
-            return -1;
-        }
-      }
-      *target = (u64)tpoff;
-      continue;
-    }
-    /* R_X86_64_DTPMOD64: module-id half of a general/local-dynamic TLS GOT pair.
-     * Encode the defining module's static-TLS distance-below-TP (| flag) so libc's
-     * __tls_get_addr can return (TP - dist + offset) without a per-thread DTV. */
-    if (type == R_X86_64_DTPMOD64) {
-      u64 dist;
-      if (sym_index == 0) {
-        dist = (u64)objects[owner].tls_offset;
-      } else {
-        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
-            sizeof(*sym));
-        if (!sym || sym->st_name >= objects[owner].strsz)
-          return -1;
-        if (sym->st_shndx != SHN_UNDEF) {
-          dist = (u64)objects[owner].tls_offset;
-        } else {
-          char name[2048];
-          usize d = 0;
-          u64 stv = 0;
-          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
-                              sizeof(name)))
-            return -1;
-          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
-                                       &stv) == 0)
-            dist = (u64)objects[d].tls_offset;
-          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
-            dist = 0;
-          else
-            return -1;
-        }
-      }
-      *target = TLS_STATIC_MODULE_FLAG | dist;
-      continue;
-    }
-    /* R_X86_64_DTPOFF64: offset-within-module half of a GD TLS GOT pair. This is
-     * the variable's offset inside its module's TLS block (NOT TP-relative — the
-     * TP bias is applied by __tls_get_addr via the DTPMOD64 distance above). */
-    if (type == R_X86_64_DTPOFF64) {
-      i64 off;
-      if (sym_index == 0) {
-        off = rela->r_addend;
-      } else {
-        struct elf64_sym *sym = (struct elf64_sym *)elf64_stage_ptr(
-            image, objects[owner].symtab + (u64)sym_index * sizeof(*sym),
-            sizeof(*sym));
-        if (!sym || sym->st_name >= objects[owner].strsz)
-          return -1;
-        if (sym->st_shndx != SHN_UNDEF) {
-          off = (i64)sym->st_value + rela->r_addend;
-        } else {
-          char name[2048];
-          usize d = 0;
-          u64 stv = 0;
-          if (!elf64_copy_str(image, objects[owner].strtab + sym->st_name, name,
-                              sizeof(name)))
-            return -1;
-          if (elf64_resolve_tls_symbol(image, objects, object_count, name, &d,
-                                       &stv) == 0)
-            off = (i64)stv + rela->r_addend;
-          else if (ELF64_ST_BIND(sym->st_info) == STB_WEAK)
-            off = rela->r_addend;
-          else
-            return -1;
-        }
-      }
-      *target = (u64)off;
-      continue;
-    }
-    console_write("ELF load: unsupported relocation type ");
-    console_write_dec(type);
-    console_write("\n");
-    return -1;
-  }
   return 0;
 }
 
@@ -960,6 +405,15 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     dso_init_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
   }
 
+  /* M92: Push the AT_EXECFN string data BEFORE the 16-byte alignment so its
+   * variable-length payload doesn't break the alignment for the auxv pairs.
+   * Record its user VA; the auxv entry pushes only the pointer and type. */
+  usize execfn_va = 0;
+  if (image->path) {
+    execfn_va = user_stack_push_string(stack, &sp, image->path);
+    if (execfn_va == 0) return -1;
+  }
+
   sp &= ~(usize)0xf;
 
   /* Ensure the final stack pointer (which becomes ESP/RSP at _start) is
@@ -969,22 +423,37 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
    * many zero words as needed to reach the next 16-byte boundary.
    *
-   * On x86_64 sizeof(usize)==8, so a single pad word always sufficed (16/8==2
-   * words per 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
+   * The actual auxv below contains 32 words (16 type/value pairs), and the
+   * argc/argv/envp area contains 2*argc + envc + 3 words. On x86_64
+   * sizeof(usize)==8, so a single pad word always suffices (16/8==2 words per
+   * 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
    * pad words may be required — the old "push one if misaligned" left ESP 4- or
    * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
    * the unaligned ring3 stack, so every ELF32 spawn failed.
    *
-   * Auxv words below: AT_NULL(2) + AT_PHDR(2) + AT_ENTRY(2) = 6, plus 2 for the
-   * optional AT_B1NIX_DSO_INIT. The remaining +3 is the argv terminator, envp
+   * Auxv words below: AT_NULL(2) + AT_PHDR(2) + AT_PHENT(2) + AT_PHNUM(2) +
+   * AT_ENTRY(2) + AT_PAGESZ(2) + AT_BASE(2) + AT_CLKTCK(2) + AT_UID(2) +
+   * AT_EUID(2) + AT_GID(2) + AT_EGID(2) + AT_RANDOM(2) + AT_RANDOM_DATA(2) +
+   * AT_HWCAP(2) + AT_SECURE(2) + AT_EXECFN(2) = 32, plus 2 for the optional
+   * AT_B1NIX_DSO_INIT. The remaining +3 is the argv terminator, envp
    * terminator, and argc word. */
-  usize total_slots = 9 + (usize)image->argc + (usize)envc +
+  usize total_slots = 35 + (usize)image->argc + (usize)envc +
                       (dso_init_va ? 2 : 0);
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
-  for (usize p = 0; p < pad; p++) {
-    if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
+  if (sp < pad * sizeof(usize)) return -1;
+  sp -= pad * sizeof(usize);
+
+  usize rand_va = 0;
+  {
+    u64 rand_bytes[2];
+    rand_bytes[0] = kernel_random_u64();
+    rand_bytes[1] = kernel_random_u64();
+    if (sp < sizeof(rand_bytes)) return -1;
+    sp -= sizeof(rand_bytes);
+    memcpy(stack + sp, rand_bytes, sizeof(rand_bytes));
+    rand_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
   }
 
   /* Auxiliary vector. Pushed high-address-first as {a_val, a_type} pairs so that
@@ -1000,10 +469,49 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (user_stack_push_usize(stack, &sp, (usize)dso_init_va) < 0) return -1;
     if (user_stack_push_usize(stack, &sp, AT_B1NIX_DSO_INIT) < 0) return -1;
   }
-  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                   /* AT_PHDR  a_val */
-  if (user_stack_push_usize(stack, &sp, 3) < 0) return -1;                   /* AT_PHDR  a_type */
-  if (user_stack_push_usize(stack, &sp, (usize)image->entry) < 0) return -1; /* AT_ENTRY a_val */
-  if (user_stack_push_usize(stack, &sp, 9) < 0) return -1;                   /* AT_ENTRY a_type */
+  if (user_stack_push_usize(stack, &sp, (usize)image->phdr_vaddr) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_PHDR) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 56) < 0) return -1;                    /* AT_PHENT = sizeof(Elf64_Phdr) */
+  if (user_stack_push_usize(stack, &sp, AT_PHENT) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)image->phnum) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_PHNUM) < 0) return -1;
+  /* AT_ENTRY is always the EXECUTABLE's own entry point (what a real ld.so
+   * jumps to once it's done linking), not the interpreter's — image->entry
+   * only becomes the interpreter's entry (see PT_INTERP handling) as the
+   * process's initial IP, which is separate from this auxv value. */
+  if (user_stack_push_usize(
+          stack, &sp,
+          (usize)(image->interp_base ? image->app_entry : image->entry)) < 0)
+    return -1;
+  if (user_stack_push_usize(stack, &sp, AT_ENTRY) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, PAGE_SIZE) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_PAGESZ) < 0) return -1;
+  /* AT_BASE: the interpreter's own load bias, so its self-relocation and
+   * dl_iterate_phdr math agree with where the kernel actually placed it.
+   * 0 for images with no real userspace interpreter (unchanged behaviour). */
+  if (user_stack_push_usize(stack, &sp, (usize)image->interp_base) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_BASE) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 100) < 0) return -1;                   /* AT_CLKTCK = 100 Hz tick */
+  if (user_stack_push_usize(stack, &sp, AT_CLKTCK) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->uid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_UID) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->euid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_EUID) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->gid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_GID) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, (usize)current_task->cred->egid) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_EGID) < 0) return -1;
+  /* AT_RANDOM points to the payload reserved above the auxv. */
+  if (user_stack_push_usize(stack, &sp, rand_va) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_RANDOM) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                     /* AT_HWCAP = 0 */
+  if (user_stack_push_usize(stack, &sp, AT_HWCAP) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;                     /* AT_SECURE = 0 */
+  if (user_stack_push_usize(stack, &sp, AT_SECURE) < 0) return -1;
+  /* AT_EXECFN: program filename for /proc/self/exe. String data was pushed
+   * earlier (before alignment); just push the pointer and type here. */
+  if (user_stack_push_usize(stack, &sp, execfn_va) < 0) return -1;
+  if (user_stack_push_usize(stack, &sp, AT_EXECFN) < 0) return -1;
 
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1;
   for (int i = envc - 1; i >= 0; i--) {
@@ -1120,6 +628,27 @@ static int elf64_is_linux_binary(int fd, const struct elf64_ehdr *ehdr,
   if (ehdr->e_ident[EI_OSABI] == ELFOSABI_LINUX)
     return 1;
 
+  /* b1nix's userspace is musl, and this musl port uses the Linux x86_64 syscall
+   * numbers (arch_prctl=158, clone=56, exit=60, ...). Any binary that requests
+   * the musl program interpreter therefore speaks the Linux ABI and must run
+   * with PERSONALITY_LINUX so those numbers are translated — regardless of its
+   * EI_OSABI byte, which b1nix's own clang/lld toolchain leaves at SYSV(0) with
+   * no GNU ABI-tag note. Without this, ld.so's __init_tp() gets -ENOSYS from an
+   * untranslated arch_prctl(ARCH_SET_FS) and deliberately executes `hlt`, which
+   * #GPs in ring 3. */
+  for (u16 i = 0; i < ehdr->e_phnum; i++) {
+    const struct elf64_phdr *ph = &phdrs[i];
+    if (ph->p_type != PT_INTERP)
+      continue;
+    char interp[64];
+    u64 ilen = ph->p_filesz < sizeof(interp) ? ph->p_filesz : sizeof(interp);
+    if (ilen == 0 || user_read_at(fd, ph->p_offset, interp, (usize)ilen) != 0)
+      continue;
+    interp[ilen - 1] = '\0'; /* the on-disk string is NUL-terminated */
+    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0)
+      return 1;
+  }
+
   for (u16 i = 0; i < ehdr->e_phnum; i++) {
     const struct elf64_phdr *ph = &phdrs[i];
     if (ph->p_type != PT_NOTE)
@@ -1232,9 +761,13 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * translated at dispatch time. */
   if (elf64_is_linux_binary(fd, ehdr, phdrs)) {
     image->personality = PERSONALITY_LINUX;
-    console_write("ELF load: Linux personality detected: ");
-    console_write(path);
-    console_write("\n");
+    /* Compose the whole line before writing: console_write() locks/unlocks
+     * per call, so multiple calls here would let another CPU's log line
+     * interleave mid-sentence (observed corrupting BusyBox test markers
+     * under SMP exec churn). */
+    char line[VFS_MAX_PATH + 64];
+    snprintf(line, sizeof(line), "ELF load: Linux personality detected: %s\n", path);
+    console_write(line);
   } else {
     image->personality = PERSONALITY_B1NIX;
   }
@@ -1250,33 +783,101 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
   u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? aslr_pie_base() : 0;
 
   image->entry = ehdr->e_entry + load_base;
-  console_write("ELF load: ");
-  console_write(path);
-  console_write(" entry=0x");
-  console_write_hex64(image->entry);
-  if (load_base) {
-    console_write(" (PIE base=0x");
-    console_write_hex64(load_base);
-    console_write(")");
+  /* M92: record program header location for AT_PHDR / AT_PHNUM auxv.
+   * For ET_DYN (PIE), segments are 0-based so load_base + e_phoff is correct.
+   * For ET_EXEC, e_phoff is a file offset — find the LOAD segment that maps it
+   * and compute the actual VA: segment_p_vaddr + (e_phoff - segment_p_offset). */
+  /* Default assumes a 0-based PIE (first LOAD maps file offset 0 at vaddr 0),
+   * but that is NOT universally true: b1nix's own PIE binaries are linked at a
+   * fixed non-zero base (0x2000000, see userspace/linker.ld), so e_phoff (a file
+   * offset) does not equal the phdrs' virtual-address offset. Resolve the real
+   * VA by locating the PT_LOAD that contains e_phoff and mapping through it —
+   * for BOTH ET_EXEC and ET_DYN. For a genuine 0-based PIE the first LOAD has
+   * p_offset==0 && p_vaddr==0, so this reduces to load_base + e_phoff. If AT_PHDR
+   * is wrong, a real ld.so (musl) never finds PT_DYNAMIC in the app's phdrs, so
+   * app.dynv stays NULL and decode_dyn() faults reading *(NULL). */
+  image->phdr_vaddr = load_base + ehdr->e_phoff;
+  for (u16 j = 0; j < ehdr->e_phnum; j++) {
+    struct elf64_phdr *seg = &phdrs[j];
+    if (seg->p_type != PT_LOAD) continue;
+    if (ehdr->e_phoff >= seg->p_offset &&
+        ehdr->e_phoff < seg->p_offset + seg->p_filesz) {
+      image->phdr_vaddr = load_base + seg->p_vaddr + (ehdr->e_phoff - seg->p_offset);
+      break;
+    }
   }
-  console_write("\n");
+  image->phnum = ehdr->e_phnum;
+  {
+    char line[VFS_MAX_PATH + 64];
+    if (load_base)
+      snprintf(line, sizeof(line), "ELF load: %s entry=0x%lx (PIE base=0x%lx)\n",
+               path, (unsigned long)image->entry, (unsigned long)load_base);
+    else
+      snprintf(line, sizeof(line), "ELF load: %s entry=0x%lx\n", path,
+               (unsigned long)image->entry);
+    console_write(line);
+  }
   image->address_space = user_address_space_create();
 
-  /* PT_INTERP is informational: the ELF64 loader performs startup dependency
-   * loading, symbol resolution, and relocation eagerly before entering user
-   * mode rather than handing control to a separate ld.so process. */
+  /* PT_INTERP: load a real userspace dynamic linker for binaries that name
+   * /lib/ld-musl-x86_64.so.1. This file IS the ld.so — musl's libc.so
+   * doubles as the dynamic linker (entry _dlstart). The kernel loads its
+   * segments unrelocated, jumps to _dlstart, which self-relocates and then
+   * loads/links the executable via syscalls.
+   *
+   * All other PT_INTERP values (the old /lib/ld-b1nix.so used by legacy
+   * PIE binaries that were linked against the in-kernel eager linker) are
+   * handled by falling through to the eager linking path below — so the
+   * dozens of existing ports keep working while we migrate them to musl. */
   for (u16 j = 0; j < ehdr->e_phnum; j++) {
     struct elf64_phdr *p = &phdrs[j];
     if (p->p_type != PT_INTERP) continue;
     char interp[64];
     usize ilen = p->p_filesz < sizeof(interp) ? p->p_filesz
-                                              : sizeof(interp) - 1;
+                                               : sizeof(interp) - 1;
     if (user_read_at(fd, p->p_offset, interp, ilen) != 0)
       continue;
     interp[ilen] = '\0';
-    console_write("ELF load: PT_INTERP=");
-    console_write(interp);
-    console_write(" (eager in-kernel dynamic linking)\n");
+    /* Compose each outcome into one buffer and issue a single console_write:
+     * building "ELF load: PT_INTERP=..." across several calls left a window
+     * where another CPU's log line could interleave mid-sentence (this exact
+     * line was observed corrupting the concurrent "M53-HTTPD: ready" marker
+     * under SMP exec churn). */
+    char line[128 + sizeof(interp)];
+    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0) {
+      u64 interp_entry = 0;
+      usize seg_count_before = image->segment_count;
+      /* Try the absolute path first (real / mount), then /mnt/root (test-mode
+       * ram0 mount — matches how initramfs-era boot stages find rootfs libs). */
+      int interp_rc = elf64_load_interpreter(image, interp, USER_LDSO_LOAD_BASE,
+                                             &interp_entry);
+      if (interp_rc != 0) {
+        image->segment_count = seg_count_before; /* undo partial segments */
+        char alt[80];
+        usize ilen2 = strlen(interp);
+        if (ilen2 + 10 <= sizeof(alt)) {
+          memcpy(alt, "/mnt/root", 9);
+          memcpy(alt + 9, interp, ilen2 + 1);
+          interp_rc = elf64_load_interpreter(image, alt, USER_LDSO_LOAD_BASE,
+                                             &interp_entry);
+        }
+      }
+      if (interp_rc != 0) {
+        snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (failed to load interpreter)\n", interp);
+        console_write(line);
+        goto cleanup;
+      }
+      image->app_entry = image->entry;
+      image->interp_base = USER_LDSO_LOAD_BASE;
+      image->entry = interp_entry;
+      snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (userspace ld.so, base=0x%lx)\n",
+               interp, (unsigned long)USER_LDSO_LOAD_BASE);
+      console_write(line);
+    } else {
+      snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (eager in-kernel dynamic linking)\n", interp);
+      console_write(line);
+    }
+    break; /* at most one PT_INTERP */
   }
 
   /* Demand-paging eligibility (self-host RAM floor). An ET_EXEC (load_base == 0)
@@ -1290,10 +891,6 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * segments get relocated. initramfs (no read_cb) stays eager. Guards: every
    * PT_LOAD page-congruent; no RO/RW page sharing; the reloc pass clears
    * demand_ok for any segment it writes into. */
-  int has_dynamic = 0;
-  for (u16 i = 0; i < ehdr->e_phnum; i++) {
-    if (phdrs[i].p_type == PT_DYNAMIC) { has_dynamic = 1; break; }
-  }
   int demand_page = (load_base == 0);
   for (u16 i = 0; demand_page && i < ehdr->e_phnum; i++) {
     struct elf64_phdr *a = &phdrs[i];
@@ -1405,281 +1002,52 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     break; /* at most one PT_TLS */
   }
 
-  /* Eager dynamic linking. The kernel loads each DT_NEEDED object into the
-   * process image, resolves symbols globally (main first, then libraries), and
-   * patches GOT/PLT before userspace starts. This must run for PIE/ET_DYN
-   * binaries (load_base != 0) AND for dynamically-linked ET_EXEC binaries
-   * (load_base == 0 but with a PT_DYNAMIC carrying DT_NEEDED) — e.g. the native
-   * rustc, which is ET_EXEC with no PT_INTERP and depends on librustc_driver.so
-   * + libLLVM.so. A statically-linked ET_EXEC has no PT_DYNAMIC and skips this.
-   * The b1nix C/C++ port binaries (NetSurf, the m53 servers, ...) are ET_EXEC
-   * with a PT_INTERP=/lib/ld64.so.1 + DT_NEEDED libgcc_s.so (the --enable-shared
-   * cross GCC links libgcc dynamically for the _Unwind_* exception symbols); the
-   * kernel resolves that here against /lib/libgcc_s.so, shipped in the
-   * initramfs. The PT_INTERP is informational — b1nix links eagerly in-kernel. */
-  /* has_dynamic was computed above for the demand-paging decision. */
-  if (load_base != 0 || has_dynamic) {
-    struct elf64_dyn_object objects[DYN_MAX_OBJECTS];
-    memset(objects, 0, sizeof(objects));
-    usize object_count = 1;
-    objects[0].base = load_base;
-    objects[0].first_segment = 0;
-    objects[0].segment_count = image->segment_count;
-    objects[0].phdr_vaddr = elf64_phdr_vaddr(ehdr, phdrs, load_base);
-    objects[0].phnum = ehdr->e_phnum;
-    if (elf64_parse_dynamic(image, &objects[0], phdrs, ehdr->e_phnum) != 0)
-      goto cleanup;
-
-    /* Breadth-first load of the whole DT_NEEDED graph. We walk the `needed`
-     * list of every object as it is added (not just the main executable's), so
-     * transitive dependencies are pulled in too — e.g. rustc needs
-     * librustc_driver.so + libLLVM.so, and libLLVM.so in turn needs libgcc_s.so.
-     * Each library is deduplicated by SONAME so a diamond dependency (both rustc
-     * and librustc_driver need libLLVM) loads the .so exactly once. The outer
-     * loop bound `object_count` grows as libraries are appended. */
-    char loaded_names[DYN_MAX_OBJECTS][96];
-    memset(loaded_names, 0, sizeof(loaded_names));
-
-    /* Derive "$ORIGIN/../lib/" from the executable path so a self-contained app
-     * image can carry its own libraries next to its binary (e.g.
-     * /mnt/rust/bin/rustc -> /mnt/rust/lib/<soname>) instead of installing them
-     * system-wide. Each DT_NEEDED soname is tried here first, then under /lib. */
-    char exe_libdir[128];
-    exe_libdir[0] = 0;
-    if (image->path) {
-      const char *ep = image->path;
-      usize L = strlen(ep);
-      while (L > 0 && ep[L - 1] != '/')
-        L--; /* strip the executable filename */
-      if (L > 0)
-        L--; /* drop the trailing '/' */
-      while (L > 0 && ep[L - 1] != '/')
-        L--; /* strip the parent directory component (e.g. "bin") */
-      if (L > 0 && L + 5 <= sizeof(exe_libdir)) {
-        memcpy(exe_libdir, ep, L);         /* e.g. "/mnt/rust/" */
-        memcpy(exe_libdir + L, "lib/", 5); /* -> "/mnt/rust/lib/" */
-      }
-    }
-
-    for (usize o = 0; o < object_count; o++) {
-      if (objects[o].needed_count && !objects[o].strtab)
-        goto cleanup;
-      for (usize n = 0; n < objects[o].needed_count; n++) {
-        /* Bound the DT_NEEDED name into a local buffer before strchr/strlen —
-         * the raw strtab pointer may run past its segment without a NUL (R4-8). */
-        char name[96];
-        if (!elf64_copy_str(image, objects[o].strtab + objects[o].needed[n], name,
-                            sizeof(name)) ||
-            strchr(name, '/'))
-          goto cleanup;
-        /* Already loaded? (dedup by name across the libraries, indices 1..) */
-        int already = 0;
-        for (usize k = 1; k < object_count; k++) {
-          if (strcmp(loaded_names[k], name) == 0) {
-            already = 1;
-            break;
-          }
-        }
-        if (already)
-          continue;
-        if (object_count >= DYN_MAX_OBJECTS)
-          goto cleanup;
-        usize name_len = strlen(name);
-        char libpath[160];
-        u64 lib_base = 0x0000600000000000ULL +
-                       (u64)(object_count - 1) * 0x0000010000000000ULL;
-        int loaded = -1;
-        /* 1) bundle-relative ($ORIGIN/../lib) */
-        if (exe_libdir[0]) {
-          usize dl = strlen(exe_libdir);
-          if (dl + name_len + 1 <= sizeof(libpath)) {
-            memcpy(libpath, exe_libdir, dl);
-            memcpy(libpath + dl, name, name_len + 1);
-            loaded = elf64_load_shared_object(image, libpath, lib_base,
-                                              &objects[object_count]);
-          }
-        }
-        /* 2) system /lib */
-        if (loaded != 0) {
-          if (name_len + 6 > sizeof(libpath))
-            goto cleanup;
-          memcpy(libpath, "/lib/", 5);
-          memcpy(libpath + 5, name, name_len + 1);
-          loaded = elf64_load_shared_object(image, libpath, lib_base,
-                                            &objects[object_count]);
-        }
-        /* 3) rootfs at /mnt/root/lib (test-mode ram0 mount) */
-        if (loaded != 0) {
-          if (name_len + 15 > sizeof(libpath))
-            goto cleanup;
-          memcpy(libpath, "/mnt/root/lib/", 14);
-          memcpy(libpath + 14, name, name_len + 1);
-          loaded = elf64_load_shared_object(image, libpath, lib_base,
-                                            &objects[object_count]);
-        }
-        if (loaded != 0) {
-          console_write("ELF load: missing/invalid DT_NEEDED ");
-          console_write(name);
-          console_write("\n");
-          goto cleanup;
-        }
-        memcpy(loaded_names[object_count], name, name_len + 1);
-        object_count++;
-      }
-    }
-
-    /* Build the process-wide static-TLS layout (x86-64 variant II) spanning the
-     * executable and every TLS-bearing library, so each object's
-     * R_X86_64_TPOFF64 relocations (applied just below) resolve to the correct
-     * thread-pointer-relative slot. objects[].tls_offset is the distance each
-     * block sits below the thread pointer. objects[0] (the executable) keeps the
-     * b1nix local-exec convention (unrounded memsz) and, when no library has
-     * TLS, the executable's own template is left untouched so single-TLS
-     * binaries remain byte-for-byte identical to before. */
-    objects[0].tls_memsz = image->tls_memsz;
-    objects[0].tls_filesz = image->tls_filesz;
-    objects[0].tls_align = image->tls_align;
-    objects[0].tls_data = image->tls_data;
-    image->tls_data = 0;
-
-    int lib_has_tls = 0;
-    for (usize o = 1; o < object_count; o++)
-      if (objects[o].tls_memsz)
-        lib_has_tls = 1;
-
-    if (lib_has_tls) {
-      u64 frontier = 0, max_align = 8;
-      for (usize o = 0; o < object_count; o++) {
-        if (objects[o].tls_memsz == 0) {
-          objects[o].tls_offset = 0;
-          continue;
-        }
-        u64 a = objects[o].tls_align < 8 ? 8 : objects[o].tls_align;
-        if (a > max_align)
-          max_align = a;
-        u64 off = (o == 0)
-                      ? objects[0].tls_memsz
-                      : ((frontier + objects[o].tls_memsz + a - 1) & ~(a - 1));
-        objects[o].tls_offset = off;
-        frontier = off;
-      }
-      u64 total_data = frontier;
-      void *combined = kzalloc(total_data ? total_data : 1);
-      if (!combined) {
-        for (usize o = 0; o < object_count; o++)
-          if (objects[o].tls_data)
-            kfree(objects[o].tls_data);
-        goto cleanup;
-      }
-      for (usize o = 0; o < object_count; o++) {
-        if (objects[o].tls_memsz == 0 || !objects[o].tls_data ||
-            !objects[o].tls_filesz)
-          continue;
-        u64 dst = total_data - objects[o].tls_offset;
-        memcpy((char *)combined + dst, objects[o].tls_data,
-               (usize)objects[o].tls_filesz);
-      }
-      image->tls_data = combined;
-      image->tls_memsz = total_data;
-      image->tls_filesz = total_data;
-      image->tls_align = max_align;
-    } else {
-      image->tls_data = objects[0].tls_data;
-      objects[0].tls_data = 0;
-    }
-    for (usize o = 0; o < object_count; o++) {
-      if (objects[o].tls_data) {
-        kfree(objects[o].tls_data);
-        objects[o].tls_data = 0;
-      }
-    }
-
-    /* Relocate libraries (index 1+) BEFORE the executable (index 0). An
-     * R_X86_64_COPY reloc in the non-PIE executable copies the *initial value*
-     * of a symbol (e.g. the FILE* `stdout`, `stderr`, `stdin`, `errno`,
-     * `environ`) out of the defining library's data. That value is itself set
-     * by the library's own R_X86_64_RELATIVE reloc (e.g. `stdout = &_stdout` =
-     * lib_base + offset), so the library must be relocated first — otherwise
-     * the COPY grabs the un-relocated (link-time) pointer and the executable's
-     * `stdout` points to garbage, crashing the first fprintf(). Only the
-     * executable carries COPY relocs (libraries are PIC), so processing it last
-     * is always correct. */
-    for (usize oi = object_count; oi-- > 0;) {
-      if (elf64_apply_rela_table(image, objects, object_count, oi,
-                                 objects[oi].rela, objects[oi].rela_size) != 0 ||
-          elf64_apply_rela_table(image, objects, object_count, oi,
-                                 objects[oi].jmprel,
-                                 objects[oi].jmprel_size) != 0) {
-        console_write("ELF load: unresolved/unsupported dynamic relocation\n");
-        goto cleanup;
-      }
-    }
-
-    /* M75: collect shared-library constructors so crt0 can run them before the
-     * executable's own __init_array. Each entry is a {init_array_va, count}
-     * descriptor pointing at the library's .init_array, which already lives in
-     * that object's mapped user memory — no copying, so the descriptor table
-     * stays tiny (one entry per library, fits the single-page initial stack even
-     * when libLLVM.so contributes 458 constructors). The crt0 helper dereferences
-     * each init_array_va in userspace and calls the function pointers there.
-     *
-     * Order is deepest-dependency-first: the DT_NEEDED graph is loaded
-     * breadth-first from the executable (index 0), so a dependency is appended
-     * after its dependents — iterating the library objects (index 1+) in reverse
-     * runs the deepest dependencies' constructors first, matching the dynamic
-     * linker. objects[0] (the executable) is skipped: crt0 walks its own
-     * __init_array directly. Like the executable (b1nix has no crti.o/_init), the
-     * legacy DT_INIT entry point is not used — every real constructor lives in
-     * .init_array under this toolchain. */
-    usize ndesc = 0;
-    for (usize oi = 1; oi < object_count; oi++)
-      if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64))
-        ndesc++;
-    if (ndesc) {
-      /* 2 words per descriptor + 1 NULL terminator word. */
-      u64 *desc = kzalloc((ndesc * 2 + 1) * sizeof(u64));
-      if (!desc)
-        goto cleanup;
-      usize w = 0;
-      for (usize oi = object_count; oi-- > 1;) {
-        if (objects[oi].init_array && objects[oi].init_arraysz >= sizeof(u64)) {
-          desc[w++] = objects[oi].init_array;
-          desc[w++] = objects[oi].init_arraysz / sizeof(u64);
-        }
-      }
-      desc[w] = 0; /* terminator: a zero init_array_va ends the table */
-      image->dso_init = desc;
-      image->dso_init_count = ndesc;
-    }
-
-    /* Record the per-module program-header table for dl_iterate_phdr. The shared
-     * libgcc_s.so DWARF unwinder enumerates these to find each object's
-     * PT_GNU_EH_FRAME — without the .so's entry, an exception thrown inside
-     * libstdc++.so.6 has no FDE for its own throw frame and std::terminate fires.
-     * objects[0] is the executable; 1+ are the shared libraries (named via the
-     * dedup table). Objects whose phdr table isn't mapped (phdr_vaddr == 0) are
-     * skipped — they simply don't contribute FDEs through this path. */
-    image->dl_module_count = 0;
-    for (usize oi = 0; oi < object_count && oi < USER_MAX_DL_MODULES; oi++) {
-      /* The executable is always module 0 (the dl_iterate_phdr contract — and
-       * userspace relies on it to skip the program, whose own frames crt0 already
-       * registers). It is recorded even though its phdr table may be unmapped
-       * (phdr_vaddr == 0: linker-cxx.ld doesn't place the ELF header in a PT_LOAD).
-       * Shared libraries without a mapped phdr table can't be located by the
-       * unwinder, so they are dropped from the list. */
-      if (oi != 0 && (!objects[oi].phdr_vaddr || !objects[oi].phnum))
+  /* RELATIVE-relocation pass for a no-interp PIE (ET_DYN with no recognized
+   * PT_INTERP, so no ld.so runs — image->interp_base stays 0). Such a binary is
+   * self-contained (raw syscalls, no GOT/PLT symbol refs) but its PT_LOAD is
+   * position-independent, so every absolute pointer in .data carries an
+   * R_X86_64_RELATIVE relocation whose value is `load_base + addend`. Nothing
+   * else applies these (the symbol-resolving eager linker was removed), so the
+   * kernel walks PT_DYNAMIC's DT_RELA here and patches them in the staging
+   * buffers — mirroring the elf32 loader's DT_REL/R_386_RELATIVE pass. Gated on
+   * interp_base == 0 so a musl-interp image is never double-relocated (its ld.so
+   * owns relocation). Symbol relocs (GLOB_DAT/JUMP_SLOT) are intentionally NOT
+   * resolved: a no-interp binary that needs them still faults, exactly as before. */
+  if (load_base != 0 && image->interp_base == 0) {
+    for (u16 i = 0; i < ehdr->e_phnum; i++) {
+      struct elf64_phdr *phdr = &phdrs[i];
+      if (phdr->p_type != PT_DYNAMIC)
         continue;
-      struct user_dl_module *m = &image->dl_modules[image->dl_module_count++];
-      m->base = objects[oi].base;
-      m->phdr_vaddr = objects[oi].phdr_vaddr;
-      m->phnum = objects[oi].phnum;
-      m->eh_frame_va = objects[oi].eh_frame_va;
-      const char *nm =
-          (oi == 0) ? (image->path ? image->path : "") : loaded_names[oi];
-      usize j = 0;
-      for (; nm && nm[j] && j < USER_DL_MODULE_NAME_MAX - 1; j++)
-        m->name[j] = nm[j];
-      m->name[j] = 0;
+      struct elf64_dyn *dyn = (struct elf64_dyn *)_vaddr_to_stage(
+          image, phdr->p_vaddr + load_base, phdr->p_filesz);
+      if (!dyn)
+        break;
+      u64 rela_off = 0, rela_sz = 0, rela_ent = sizeof(struct elf64_rela);
+      usize ndyn = phdr->p_filesz / sizeof(struct elf64_dyn);
+      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
+        switch (dyn[d].d_tag) {
+          case DT_RELA:    rela_off = dyn[d].d_val; break;
+          case DT_RELASZ:  rela_sz = dyn[d].d_val; break;
+          case DT_RELAENT: rela_ent = dyn[d].d_val; break;
+        }
+      }
+      if (rela_off && rela_sz && rela_ent) {
+        usize nrela = rela_sz / rela_ent;
+        for (usize r = 0; r < nrela; r++) {
+          struct elf64_rela *rela = (struct elf64_rela *)_vaddr_to_stage(
+              image, rela_off + load_base + r * rela_ent,
+              sizeof(struct elf64_rela));
+          if (!rela)
+            break;
+          if ((rela->r_info & 0xffffffffULL) != R_X86_64_RELATIVE)
+            continue;
+          u64 *target = (u64 *)_vaddr_to_stage(
+              image, rela->r_offset + load_base, sizeof(u64));
+          if (target)
+            *target = load_base + (u64)rela->r_addend;
+        }
+      }
+      break; /* at most one PT_DYNAMIC */
     }
   }
 
@@ -1865,16 +1233,19 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
   u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? PIE_LOAD_BASE : 0;
 
   image->entry = ehdr->e_entry + load_base;
-  console_write("ELF32 load: ");
-  console_write(path);
-  console_write(" entry=0x");
-  console_write_hex64(image->entry);
-  if (load_base) {
-    console_write(" (PIE base=0x");
-    console_write_hex64(load_base);
-    console_write(")");
+  /* M92: record program header location for AT_PHDR / AT_PHNUM auxv. */
+  image->phdr_vaddr = load_base + ehdr->e_phoff;
+  image->phnum = ehdr->e_phnum;
+  {
+    char line[VFS_MAX_PATH + 64];
+    if (load_base)
+      snprintf(line, sizeof(line), "ELF32 load: %s entry=0x%lx (PIE base=0x%lx)\n",
+               path, (unsigned long)image->entry, (unsigned long)load_base);
+    else
+      snprintf(line, sizeof(line), "ELF32 load: %s entry=0x%lx\n", path,
+               (unsigned long)image->entry);
+    console_write(line);
   }
-  console_write("\n");
   image->address_space = user_address_space_create();
 
   /* PT_INTERP */
@@ -1890,9 +1261,11 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
                                               : sizeof(interp) - 1;
     memcpy(interp, file_data + p->p_offset, ilen);
     interp[ilen] = '\0';
-    console_write("ELF32 load: PT_INTERP=");
-    console_write(interp);
-    console_write(" (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n");
+    char line[64 + sizeof(interp)];
+    snprintf(line, sizeof(line),
+             "ELF32 load: PT_INTERP=%s (b1nix applies RELATIVE relocs in-kernel — no separate ld.so handoff)\n",
+             interp);
+    console_write(line);
   }
 
   /* First pass: PT_LOAD segments */
@@ -2482,6 +1855,43 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       extern void arch_set_fs_base(u64 base);
       arch_set_fs_base(tp);
     }
+  } else {
+    /* Minimal TLS/TCB for binaries without PT_TLS.  PIE/ET_DYN programs linked
+     * against musl's libc.so have no PT_TLS but musl's __init_ssp reads %fs:0
+     * (the thread-pointer self-pointer) for stack canary setup.  Allocate a
+     * 64-byte TCB so fs:0x0 is valid.  The TP sits at the TCB and TCB[0] = TP. */
+    u64 tcb_size = 64;
+    u64 region = (image->address_space.stack_top - USER_STACK_MAX_SIZE -
+                  tcb_size - PAGE_SIZE) &
+                 ~(PAGE_SIZE - 1);
+    low_reserved = region;
+    u64 tp = region; /* TCB starts at region, TP == region (no tdata) */
+    u64 db = vmm_direct_map_base();
+
+    u64 frame = pmm_alloc_frame();
+    if (frame) {
+      vmm_map_page(region, frame, VMM_USER | VMM_WRITABLE);
+      u64 direct_v = db + frame;
+      memset((void *)(usize)direct_v, 0, PAGE_SIZE);
+      /* Self pointer: TCB[0] = TP */
+      *(u64 *)(usize)(direct_v) = tp;
+    }
+
+    struct vm_area *tls_vma = kzalloc(sizeof(struct vm_area));
+    if (tls_vma) {
+      tls_vma->start = region;
+      tls_vma->end = region + tcb_size;
+      tls_vma->prot = PROT_READ | PROT_WRITE;
+      tls_vma->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+      tls_vma->next = current_task->vma_list;
+      current_task->vma_list = tls_vma;
+    }
+
+    task_set_tls_base(current_task, tp);
+    {
+      extern void arch_set_fs_base(u64 base);
+      arch_set_fs_base(tp);
+    }
   }
 #endif
 
@@ -2559,6 +1969,11 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       current_task->fpu_initialized = 1;
     }
   }
+
+  /* User mappings may replace inherited low-4GB huge pages. Invalidate those
+   * translations on every CPU before a freshly loaded image can migrate. */
+  extern void tlb_shootdown_all(void);
+  tlb_shootdown_all();
 
   x86_user_jump((usize)image->entry, (usize)image->address_space.stack_base,
                 (usize)image->argc,

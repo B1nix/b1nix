@@ -57,7 +57,7 @@ fi
 # may not define a compiler-specific inline keyword for clang.
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix -I$CFG_DIR -I$SRC_DIR
+  -O2 -fno-strict-aliasing -fPIC -Db1nix -I$CFG_DIR -I$SRC_DIR
   -Wno-implicit-function-declaration -Wno-unused"
 
 # The VP8-decode source set (the .c.o files libvpx's generic-gnu build produced).

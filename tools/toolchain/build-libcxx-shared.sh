@@ -34,7 +34,15 @@ ROOT="$(cd "$(dirname "$0")/../.." && pwd)"
 
 LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
 
+# Prefer the musl-built runtimes: the legacy llvm-runtimes-build archives were
+# compiled against the old b1nix libc headers and reference `errno` as a DATA
+# symbol that musl's libc.so does not export, so a libc++.so.1 folded from them
+# fails to relocate at load time ("Error relocating: errno: symbol not found").
 RT_INSTALL="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+RT_MUSL="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+if [ -f "$RT_MUSL/libc++.a" ]; then
+    RT_INSTALL="$RT_MUSL"
+fi
 CXXABI_A="$RT_INSTALL/libc++abi.a"
 UNWIND_A="$RT_INSTALL/libunwind.a"
 CXX_A="$RT_INSTALL/libc++.a"
@@ -83,12 +91,42 @@ cat > "$VSCRIPT" <<'EOF'
     __deregister_frame;
 };
 EOF
+# __cxa_thread_atexit_impl shim: musl has no such symbol (it is glibc-internal),
+# but libc++abi.a references it, so fold a correct TSD-based implementation into
+# libc++abi.so.1 or the .so fails to relocate at load time. Compiled with the
+# same cross clang used for the runtimes.
+# __cxa_thread_atexit_impl shim, compiled directly against the musl headers
+# (freestanding, -nostdinc + musl include dir — NOT the legacy b1nix-cc/libb1nix
+# path). -c only: malloc / pthread_* resolve at load time against libc.so.
+SHIM_C="$ROOT/tools/toolchain/cxa_thread_atexit_shim.c"
+SHIM_O="$(mktemp).o"
+MUSL_INC="$ROOT/build/musl-b1nix/$TRIPLET/install/usr/include"
+CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
+# The shim is MANDATORY: without __cxa_thread_atexit_impl defined here, every
+# libc++/Mesa consumer fails to relocate at load ("symbol not found", exit 127).
+# Fail loudly if it does not compile rather than silently shipping a broken .so.
+if [ ! -f "$SHIM_C" ]; then
+    echo "build-libcxx-shared: FATAL: shim source missing: $SHIM_C" >&2; exit 1
+fi
+if [ ! -d "$MUSL_INC" ]; then
+    echo "build-libcxx-shared: FATAL: musl headers missing: $MUSL_INC (build musl first)" >&2; exit 1
+fi
+if ! clang --target="$TRIPLET" -ffreestanding -nostdinc -fno-builtin \
+         -fno-stack-protector -fPIC -O2 -I"$MUSL_INC" \
+         ${CLANG_RES:+-isystem "$CLANG_RES/include"} \
+         -D__linux__ -D__b1nix__ -c "$SHIM_C" -o "$SHIM_O"; then
+    echo "build-libcxx-shared: FATAL: __cxa_thread_atexit_impl shim failed to compile" >&2
+    exit 1
+fi
+
 echo "[libc++-shared] linking $ABI_SO from libc++abi.a (libunwind folded in)"
 "$LD" -shared -soname libc++abi.so.1 --eh-frame-hdr -o "$ABI_SO" \
     --whole-archive "$CXXABI_A" --no-whole-archive \
+    ${SHIM_O:+"$SHIM_O"} \
     -L"$CROSSLIB" "$LIBC_SO" "$CRT_A" \
     --version-script "$VSCRIPT" \
     --allow-shlib-undefined
+[ -n "$SHIM_O" ] && rm -f "$SHIM_O"
 rm -f "$VSCRIPT"
 ln -sf libc++abi.so.1 "$CROSSLIB/libc++abi.so"
 
@@ -114,7 +152,13 @@ if command -v patchelf >/dev/null 2>&1; then
 fi
 
 # ── 3. Stage to rootfs /lib (loader search path) + rootfs-as-sysroot lib ──────
-for d in "$ROOT/build/$ARCH/rootfs/lib" "$ROOT/build/$ARCH/rootfs/usr/lib"; do
+# Also refresh the musl sysroot (LIBC_ROOT) copies: `make root-image` restages
+# libc++{,abi}.so.1 from there and the initramfs .inc is generated from it, so a
+# stale sysroot copy (without the __cxa_thread_atexit_impl shim) would overwrite
+# the freshly-linked .so in the ISO.
+MUSL_USR_LIB="$ROOT/build/musl-b1nix/$TRIPLET/install/usr/lib"
+for d in "$ROOT/build/$ARCH/rootfs/lib" "$ROOT/build/$ARCH/rootfs/usr/lib" \
+         "$MUSL_USR_LIB"; do
     [ -d "$d" ] || mkdir -p "$d"
     cp -f "$ABI_SO" "$d/libc++abi.so.1"; ln -sf libc++abi.so.1 "$d/libc++abi.so"
     cp -f "$CXX_SO"  "$d/libc++.so.1";   ln -sf libc++.so.1    "$d/libc++.so"

@@ -1,27 +1,27 @@
 #include <fcntl.h>
+#include <math.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <unistd.h>
-#include <math.h>
+#include <sys/stat.h>
+#include <sys/types.h>
+#include <sys/wait.h>
+#include <time.h>
 #include <utime.h>
-#include "syscall.h"
-
-#define WIFEXITED(status) (((status) & 0x7f) == 0)
-#define WEXITSTATUS(status) (((status) >> 8) & 0xff)
+#include <unistd.h>
 
 static void marker(const char *text) {
   write(1, text, strlen(text));
 }
 
 static int run_cmd(const char *path, char *const argv[]) {
-  int pid = syscall(SYS_FORK);
+  pid_t pid = fork();
   if (pid == 0) {
     execvp(path, argv);
     _exit(127);
   } else if (pid > 0) {
     int status = 0;
-    int wr = syscall(SYS_WAITPID, pid, &status, 0);
+    pid_t wr = waitpid(pid, &status, 0);
     if (wr == pid) {
       if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
@@ -34,7 +34,7 @@ static int run_cmd(const char *path, char *const argv[]) {
 
 static int run_cmd_stderr_to_file(const char *path, char *const argv[],
                                   const char *stderr_path) {
-  int pid = syscall(SYS_FORK);
+  pid_t pid = fork();
   if (pid == 0) {
     close(2);
     int err_fd = open(stderr_path, O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -45,7 +45,7 @@ static int run_cmd_stderr_to_file(const char *path, char *const argv[],
     _exit(127);
   } else if (pid > 0) {
     int status = 0;
-    int wr = syscall(SYS_WAITPID, pid, &status, 0);
+    pid_t wr = waitpid(pid, &status, 0);
     if (wr == pid) {
       if (WIFEXITED(status)) {
         return WEXITSTATUS(status);
@@ -403,19 +403,19 @@ int main(void) {
       "  val = ldexp(1.25, 4);\n"
       "  if (val != 20.0) return 4;\n"
       "  sigset_t set;\n"
-      "  if (sigemptyset(&set) != 0 || set != 0) return 5;\n"
-      "  if (sigaddset(&set, SIGINT) != 0 || set != (1UL << (SIGINT - 1))) return 6;\n"
+      "  if (sigemptyset(&set) != 0 || sigismember(&set, SIGINT) != 0) return 5;\n"
+      "  if (sigaddset(&set, SIGINT) != 0 || sigismember(&set, SIGINT) != 1) return 6;\n"
       "  if (sigismember(&set, SIGINT) != 1) return 7;\n"
       "  if (sigismember(&set, SIGSEGV) != 0) return 8;\n"
-      "  if (sigfillset(&set) != 0 || set != ~0UL) return 9;\n"
+      "  if (sigfillset(&set) != 0 || sigismember(&set, SIGSEGV) != 1) return 9;\n"
       "  if (sigdelset(&set, SIGINT) != 0 || sigismember(&set, SIGINT) != 0) return 10;\n"
       "  if (sigismember(&set, SIGSEGV) != 1) return 11;\n"
       "  errno = 0;\n"
       "  if (sigaddset(&set, -1) != -1 || errno != EINVAL) return 12;\n"
       "  errno = 0;\n"
-      "  if (sigaddset(&set, 64) != -1 || errno != EINVAL) return 13;\n"
+      "  if (sigaddset(&set, 128) != -1 || errno != EINVAL) return 13;\n"
       "  errno = 0;\n"
-      "  if (sigismember(&set, 0) != -1 || errno != EINVAL) return 14;\n"
+      "  if (sigismember(&set, 0) != 0) return 14;\n"
       "  printf(\"M25-FLOAT: all float tests passed\\n\");\n"
       "  return 0;\n"
       "}\n";

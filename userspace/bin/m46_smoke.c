@@ -14,7 +14,7 @@
 #include <sys/times.h>
 #include <pthread.h>
 #include <stdlib.h>
-#include <syscall.h>
+#include <sched.h>
 #include <unistd.h>
 
 static int g_fail;
@@ -61,7 +61,7 @@ static void test_exit_status(void) {
   if (pid == 0) {
     kill(getpid(), SIGKILL);
     for (;;)
-      (void)syscall(SYS_YIELD);
+      (void)sched_yield();
   }
   st = 0;
   if (waitpid(pid, &st, 0) != pid || !WIFSIGNALED(st) ||
@@ -88,7 +88,7 @@ static void test_kill_zero(void) {
     return;
   }
   for (int i = 0; i < 100 && !got_usr1; i++)
-    (void)syscall(SYS_YIELD);
+    (void)sched_yield();
   if (got_usr1)
     ok("kill-zero-pgrp");
   else
@@ -201,7 +201,7 @@ static void append_worker(const char *path, char tag) {
     if (write(fd, rec, sizeof(rec)) != (ssize_t)sizeof(rec))
       _exit(1);
     if ((i & 7) == 0)
-      (void)syscall(SYS_YIELD);
+      (void)sched_yield();
   }
   close(fd);
   _exit(0);
@@ -309,7 +309,7 @@ static void test_shebang(void) {
 static void *exit_group_thread(void *arg) {
   (void)arg;
   for (;;) {
-    (void)syscall(SYS_YIELD);
+    (void)sched_yield();
   }
   return 0;
 }
@@ -320,7 +320,7 @@ static void test_exit_group(void) {
     pthread_t th;
     pthread_create(&th, 0, exit_group_thread, 0);
     for (int i = 0; i < 10; i++) {
-      (void)syscall(SYS_YIELD);
+      (void)sched_yield();
     }
     _exit(42);
   }
@@ -419,7 +419,7 @@ static void test_orphaned_pgrp(void) {
     if (grandchild == 0) {
       kill(getpid(), SIGSTOP);
       for (int i = 0; i < 1000 && !got_sighup; i++) {
-        (void)syscall(SYS_YIELD);
+        (void)sched_yield();
       }
       if (got_sighup) {
         int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
@@ -437,7 +437,7 @@ static void test_orphaned_pgrp(void) {
   int st = 0;
   waitpid(p_pid, &st, 0);
   for (int i = 0; i < 50; i++) {
-    (void)syscall(SYS_YIELD);
+    (void)sched_yield();
   }
   int fd = open(path, O_RDONLY);
   char buf[32];
@@ -466,6 +466,13 @@ static void nice_worker(const char *path, int nice_val, int start_fd) {
   gettimeofday(&start, NULL);
   while (1) {
     count++;
+    /* Cooperatively yield each iteration: this is the "cooperative stride
+     * scheduling" test, and b1nix only preempts on the BSP (APs run the
+     * cooperative model — a pure busy-spin on an AP is never time-sliced, so it
+     * would monopolise that core and swamp the nice bias). Yielding at the
+     * scheduler each pass lets the stride scheduler apply the nice weighting on
+     * every CPU, exactly as a well-behaved cooperative workload would. */
+    sched_yield();
     gettimeofday(&now, NULL);
     long ms = (now.tv_sec - start.tv_sec) * 1000 + (now.tv_usec - start.tv_usec) / 1000;
     if (ms >= 150) {

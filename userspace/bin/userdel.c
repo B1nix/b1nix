@@ -3,6 +3,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
+#include <sys/stat.h>
 
 int delete_from_passwd(const char *username) {
     FILE *fin = fopen("/etc/passwd", "r");

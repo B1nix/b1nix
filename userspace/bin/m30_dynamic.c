@@ -16,7 +16,11 @@ int main(void) {
     return 1;
 
   /* Phase 1 — resolve and call a symbol from the startup-loaded libc.so.1. */
+#ifdef __linux__
+  void *libc = dlopen("libc.so", RTLD_NOW);
+#else
   void *libc = dlopen("libc.so.1", RTLD_NOW);
+#endif
   size_t (*loaded_strlen)(const char *) =
       (size_t (*)(const char *))dlsym(libc, "strlen");
   if (!libc || !loaded_strlen || loaded_strlen("M69") != 3 || dlclose(libc))
@@ -27,10 +31,21 @@ int main(void) {
   /* Phase 2 — load a brand-new shared object at runtime, resolve an exported
    * function, and call it. The plugin's constructor prints "M69-PLUGIN: ctor"
    * (proving DT_INIT_ARRAY ran) and its write() call proves a JUMP_SLOT
-   * relocation against libc.so.1 was applied. */
-  void *plugin = dlopen("/lib/m69_plugin.so", RTLD_NOW);
-  if (!plugin)
+   * relocation against libc.so.1 was applied.
+   *
+   * RTLD_GLOBAL is required for Phase 3's dlsym(RTLD_DEFAULT, ...) probe: a
+   * default (RTLD_LOCAL) dlopen keeps the plugin's symbols out of the global
+   * scope, so RTLD_DEFAULT — which searches only the global scope — would not
+   * find m69_plugin_add on any conforming loader (glibc or musl). Load it global
+   * so the export is visible there, matching this test's stated intent. */
+  void *plugin = dlopen("/lib/m69_plugin.so", RTLD_NOW | RTLD_GLOBAL);
+  if (!plugin) {
+    const char *err = dlerror();
+    emit("M69-DLERR: ");
+    emit(err ? err : "(null)");
+    emit("\n");
     return 1;
+  }
   int (*add)(int, int) = (int (*)(int, int))dlsym(plugin, "m69_plugin_add");
   int *ctor_ran = (int *)dlsym(plugin, "m69_plugin_ctor_ran");
   if (!add || !ctor_ran || *ctor_ran != 1 || add(40, 2) != 42)

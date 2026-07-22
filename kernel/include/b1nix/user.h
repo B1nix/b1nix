@@ -16,7 +16,9 @@ typedef int (*user_program_entry)(int argc, const char **argv);
  * USER_DL_MODULE_NAME_MAX bounds the copied soname/path. */
 #define USER_MAX_DL_MODULES 16
 #define USER_DL_MODULE_NAME_MAX 96
-#define USER_STACK_SIZE PAGE_SIZE
+/* Keep enough eagerly mapped stack for the musl loader's dependency graph and
+ * relocation work; the larger stack window below still grows lazily. */
+#define USER_STACK_SIZE (64 * PAGE_SIZE)
 #ifdef __x86_64__
 #define USER_SPACE_LIMIT 0x0000800000000000ULL
 #define USER_STACK_TOP 0x0000800000000000ULL
@@ -124,6 +126,13 @@ struct user_loaded_image {
 	 * defaults) leaves codegen uninitialized. 0/NULL = no shared-lib ctors. */
 	u64 *dso_init;
 	usize dso_init_count;
+	/* M92: executable's program header table info for AT_PHDR/AT_PHNUM auxv.
+	 * phdr_vaddr is the in-process VA where the ELF program headers are mapped;
+	 * phnum is e_phnum. Set by the ELF loaders; used by user_build_initial_stack.
+	 * For ET_EXEC (load_base=0) this is just e_phoff; for ET_DYN (PIE) it is
+	 * load_base + e_phoff. 0 = not yet populated. */
+	u64 phdr_vaddr;
+	u16 phnum;
 	/* dl_iterate_phdr support: one descriptor per loaded module (the executable
 	 * plus every DT_NEEDED shared object), recorded during eager linking. The
 	 * shared libgcc_s.so DWARF unwinder finds each module's PT_GNU_EH_FRAME
@@ -140,6 +149,16 @@ struct user_loaded_image {
 		char name[USER_DL_MODULE_NAME_MAX];
 	} dl_modules[USER_MAX_DL_MODULES];
 	usize dl_module_count;
+	/* Userspace ld.so support (ldso-migration plan). When a PT_INTERP names a
+	 * real userspace dynamic linker (currently only musl's
+	 * "/lib/ld-musl-x86_64.so.1"), the kernel loads the interpreter's own
+	 * PT_LOAD segments unrelocated (it self-relocates via its own embedded
+	 * R_X86_64_RELATIVE entries, exactly like Linux) and hands control to its
+	 * entry point instead of running the in-kernel eager linker. interp_base
+	 * != 0 marks this path; entry becomes the interpreter's entry, and
+	 * app_entry preserves the executable's own entry point for AT_ENTRY. */
+	u64 app_entry;
+	u64 interp_base;
 };
 
 void userspace_init(void);

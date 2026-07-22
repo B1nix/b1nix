@@ -1,0 +1,191 @@
+#!/usr/bin/env bash
+# Cross-compiler wrapper for autotools-style ports — musl-linked variant.
+#
+# Compiles against musl headers with clang, and LINKS by invoking ld.lld
+# DIRECTLY. It never lets clang drive the link, because for --target=*-b1nix
+# clang delegates ELF linking to the host `/usr/bin/gcc` driver, which injects
+# the host's glibc Scrt1.o/crt*.o and libc — corrupting the output (duplicate
+# _start, host libc symbols). Driving ld.lld ourselves keeps the link fully
+# hermetic against musl. Produces PIE binaries with
+# PT_INTERP=/lib/ld-musl-x86_64.so.1 and DT_NEEDED=libc.so.
+set -e
+
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+PROJECT_DIR=""
+cur="$SCRIPT_DIR"
+while [ "$cur" != "/" ]; do
+  if [ -f "$cur/Makefile" ] && [ -d "$cur/kernel" ]; then
+    PROJECT_DIR="$cur"; break
+  fi
+  cur="$(dirname "$cur")"
+done
+if [ -z "$PROJECT_DIR" ]; then
+  echo "b1nix-musl-autotools-cc: cannot find project root" >&2; exit 1
+fi
+
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
+if [ "$B1NIX_ARCH" = "x86" ]; then
+  TARGET="i686-b1nix";   B1NIX_TRIPLET="${B1NIX_TRIPLET:-i686-b1nix}"
+  LD_EMULATION="elf_i386"
+else
+  TARGET="x86_64-b1nix"; B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
+  LD_EMULATION="elf_x86_64"
+fi
+
+MUSL_INSTALL="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_INCLUDE="$MUSL_INSTALL/include"
+MUSL_LIB="$MUSL_INSTALL/lib"
+# The real, fully-populated libc.so lives in the musl source build tree; the
+# installed usr/lib/libc.so is a small stub. Link the real one by path — with
+# no DT_SONAME it records DT_NEEDED=libc.so, exactly what musl's ld.so expects.
+MUSL_LIBSO="$PROJECT_DIR/build/musl-src/$B1NIX_TRIPLET/musl-1.2.5/lib/libc.so"
+MUSL_LIBSO_DIR="$(dirname "$MUSL_LIBSO")"
+DYN_LINKER="/lib/ld-musl-x86_64.so.1"
+
+CCACHE=""
+[ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1 && CCACHE="ccache"
+CLANG="$CCACHE clang"
+LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
+
+# Clang's own resource-dir headers (stdatomic.h, stdint.h, ...) — -nostdinc
+# drops them; also the compiler-rt builtins archive for 64-bit atomics etc.
+CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
+RES_INC=""
+[ -n "$CLANG_RES_DIR" ] && RES_INC="-isystem $CLANG_RES_DIR/include"
+if [ "$B1NIX_ARCH" = "x86" ]; then _RT_ARCH="i386"; else _RT_ARCH="x86_64"; fi
+BUILTINS=""
+if [ -n "$CLANG_RES_DIR" ]; then
+  for _b in \
+    "$CLANG_RES_DIR"/lib/*/libclang_rt.builtins-$_RT_ARCH.a \
+    "$CLANG_RES_DIR"/lib/libclang_rt.builtins-$_RT_ARCH.a; do
+    [ -f "$_b" ] && { BUILTINS="$_b"; break; }
+  done
+fi
+
+CFLAGS_BASE="--target=$TARGET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector
+  -msoft-float -mno-implicit-float -isystem $MUSL_INCLUDE $RES_INC
+  -idirafter $PROJECT_DIR/userspace/include
+  -D__linux__ -D__b1nix__ -Db1nix -fPIC"
+
+# --- configure-probe short-circuits ----------------------------------------
+for arg in "$@"; do
+  case "$arg" in
+    -print-sysroot)          echo "$MUSL_INSTALL"; exit 0 ;;
+    -print-libgcc-file-name) echo ""; exit 0 ;;
+    -dumpmachine)            echo "$TARGET"; exit 0 ;;
+  esac
+done
+
+# --- relocatable (-r) partial link: ld.lld directly ------------------------
+for arg in "$@"; do
+  case "$arg" in
+    -r|--relocatable|-Wl,-r|-Wl,--relocatable)
+      r_args=()
+      for _rarg in "$@"; do
+        case "$_rarg" in
+        -fuse-ld=*|-Wl,*|-rtlib=*|-unwindlib=*|-static-libgcc) continue ;;
+        esac
+        r_args+=("$_rarg")
+      done
+      exec $LD -m "$LD_EMULATION" "${r_args[@]}"
+      ;;
+  esac
+done
+
+# --- parse args: split compile flags / sources / link inputs ---------------
+compile_only=0
+is_shared=0
+output=""
+cflags_extra=()   # compile-time flags (-D/-I/-O/-W/-f/...) — never sent to ld
+sources=()        # .c/.S/.s/.cc/.cpp
+linkline=()       # .o/.a/.so, -l, -L, translated -Wl,  (order preserved)
+
+while [ $# -gt 0 ]; do
+  case "$1" in
+    -c) compile_only=1 ;;
+    -shared) is_shared=1 ;;
+    -o) output="$2"; shift ;;
+    -o*) output="${1#-o}" ;;
+    -fuse-ld=*|-rtlib=*|-unwindlib=*|-static-libgcc|-static-libstdc++|-pie|-no-pie|-pthread) : ;;
+    -Wl,*)
+      _wl="${1#-Wl,}"; _IFS_SAVE=$IFS; IFS=','
+      for _p in $_wl; do linkline+=("$_p"); done
+      IFS=$_IFS_SAVE ;;
+    -L) linkline+=("-L$2"); shift ;;
+    -L*) linkline+=("$1") ;;
+    -l) linkline+=("-l$2"); shift ;;
+    -l*) linkline+=("$1") ;;
+    *.o|*.a|*.so|*.so.*|*.lo) linkline+=("$1") ;;
+    *.c|*.cc|*.cpp|*.cxx|*.C|*.s|*.S) sources+=("$1") ;;
+    # compile-affecting flags that take a separate argument
+    -I|-D|-U|-include|-isystem|-idirafter|-iquote|-x|-MT|-MF|-MQ)
+      cflags_extra+=("$1" "$2"); shift ;;
+    *) cflags_extra+=("$1") ;;
+  esac
+  shift
+done
+
+# --- compile-only ----------------------------------------------------------
+if [ "$compile_only" -eq 1 ]; then
+  # shellcheck disable=SC2086
+  exec $CLANG $CFLAGS_BASE "${cflags_extra[@]}" -c "${sources[@]}" ${output:+-o "$output"}
+fi
+
+# --- no link inputs at all (pure compile/probe) ----------------------------
+if [ ${#sources[@]} -eq 0 ] && [ ${#linkline[@]} -eq 0 ]; then
+  # shellcheck disable=SC2086
+  exec $CLANG $CFLAGS_BASE "${cflags_extra[@]}" ${output:+-o "$output"}
+fi
+
+# --- link: compile any sources to temp objects, then ld.lld directly -------
+tmpdir="${TMPDIR:-/tmp}/b1nix-musl-cc.$$"
+mkdir -p "$tmpdir"
+trap 'rm -rf "$tmpdir"' EXIT
+objs=()
+for src in "${sources[@]}"; do
+  obj="$tmpdir/$(basename "$src").o"
+  # shellcheck disable=SC2086
+  $CLANG $CFLAGS_BASE "${cflags_extra[@]}" -c "$src" -o "$obj"
+  objs+=("$obj")
+done
+
+[ -n "$output" ] || output="a.out"
+
+musl_fixup() {  # rewrite DT_NEEDED soname -> libc.so, set EI_OSABI=Linux(3)
+  python3 -c "\
+import sys; f=sys.argv[1]; d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" "$1" 2>/dev/null || true
+}
+
+if [ "$is_shared" -eq 1 ]; then
+  # shellcheck disable=SC2086
+  $LD -m "$LD_EMULATION" -shared -z norelro --hash-style=sysv \
+    -o "$output" "${objs[@]}" -L"$MUSL_LIBSO_DIR" -L"$MUSL_LIB" "${linkline[@]}" -l:libc.so $BUILTINS
+  musl_fixup "$output"
+  exit 0
+fi
+
+# PIE executable against musl. Startup/crt order mirrors userspace/Makefile:
+#   Scrt1.o  <objs>  crti.o  -lc  crtn.o
+#
+# No custom linker script here. The layout a real ld.so needs is the linker's
+# default: the ELF header and program headers live inside the first PT_LOAD, so
+# the AT_PHDR the kernel passes (load_base + e_phoff) points at real program
+# headers, and PT_PHDR is emitted. A ". = 0" script with no SIZEOF_HEADERS
+# reservation would leave the program headers outside every PT_LOAD and the
+# entry at 0 — the interpreter then scans code bytes for PT_DYNAMIC and dies in
+# decode_dyn.
+# shellcheck disable=SC2086
+if [ "${B1NIX_MUSL_NO_PIE:-0}" = "1" ]; then
+  PIE_FLAGS=""
+else
+  PIE_FLAGS="-pie"
+fi
+$LD -m "$LD_EMULATION" $PIE_FLAGS -z norelro --hash-style=sysv \
+  --dynamic-linker "$DYN_LINKER" \
+  -o "$output" \
+  "$MUSL_LIB/Scrt1.o" "$MUSL_LIB/crti.o" "${objs[@]}" -L"$MUSL_LIBSO_DIR" -L"$MUSL_LIB" "${linkline[@]}" \
+  -L"$MUSL_LIBSO_DIR" -l:libc.so $BUILTINS "$MUSL_LIB/crtn.o"
+musl_fixup "$output"

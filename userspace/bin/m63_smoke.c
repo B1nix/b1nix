@@ -28,6 +28,13 @@
 #include <linux/filter.h>
 #include <linux/seccomp.h>
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#define SYS_GETPID __NR_getpid
+#define SYS_GETPPID __NR_getppid
+#define seccomp(op, flags, args) syscall(__NR_seccomp, (op), (flags), (args))
+#endif
+
 static int g_fail;
 
 static void marker(const char *s) {
@@ -66,9 +73,13 @@ static void test_errno_allow(void) {
   if (c == 0) {
     if (install_filter(SYS_GETPID, SECCOMP_RET_ERRNO | EACCES) != 0)
       _exit(2);
-    long denied = syscall(SYS_GETPID);  /* -> -EACCES */
+    /* musl's syscall() applies the error convention: a kernel -EACCES surfaces
+     * as a -1 return with errno==EACCES, not a raw -13. */
+    errno = 0;
+    long denied = syscall(SYS_GETPID);
+    int denied_errno = errno;
     long allowed = syscall(SYS_GETPPID); /* -> a real pid */
-    _exit((denied == -EACCES && allowed > 0) ? 0 : 1);
+    _exit((denied == -1 && denied_errno == EACCES && allowed > 0) ? 0 : 1);
   }
   int st = 0;
   waitpid(c, &st, 0);

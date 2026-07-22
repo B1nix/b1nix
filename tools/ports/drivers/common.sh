@@ -48,6 +48,28 @@ port_clang_target() {
   if [ "$B1NIX_ARCH" = "x86" ]; then printf 'i686-unknown-elf'; else printf 'x86_64-unknown-elf'; fi
 }
 
+# musl sysroot include dir for the active arch (headers installed by build-musl.sh).
+port_musl_include() {
+  printf '%s' "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+}
+
+# musl sysroot lib dir (libc.so, Scrt1.o, crti.o, crtn.o).
+port_musl_lib() {
+  printf '%s' "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+}
+
+# Include flags for musl-linked ports: musl headers first, then clang's own
+# freestanding resource headers (stdatomic.h, stdint.h, stddef.h, immintrin.h)
+# which -nostdinc otherwise drops. Emitted as a single space-separated string.
+port_musl_include_flags() {
+  _res="$(clang -print-resource-dir 2>/dev/null || true)"
+  printf -- '-isystem %s' "$(port_musl_include)"
+  [ -n "$_res" ] && printf -- ' -isystem %s/include' "$_res"
+  # b1nix-specific headers (<b1nix/fb.h>, <b1nix/ioctl.h>, ...) that musl has no
+  # equivalent for. -idirafter = lowest priority, so musl's <stdio.h> etc. win.
+  printf -- ' -idirafter %s' "$ROOT_DIR/userspace/include"
+}
+
 # Download + extract a source tarball once. Idempotent: skips when $4 (a marker
 # path: the expected src dir, or a sentinel file inside it) already exists.
 # Picks the tar decompressor from the tarball extension (.gz/.tgz vs .xz).

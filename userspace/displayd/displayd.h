@@ -172,6 +172,7 @@ struct dclient {
 	unsigned inlen;
 	int pending_fd;
 	int ping_pending;
+	int ping_misses;
 	uint32_t ping_serial;
 };
 

@@ -11,6 +11,13 @@
 
 #include "syscall.h"
 
+#ifdef __linux__
+#undef SYS_WRITE
+#undef SYS_EXIT
+#define SYS_WRITE 1
+#define SYS_EXIT 60
+#endif
+
 /* Hand-rolled syscall (no libc): RAX=number, args in RDI/RSI/RDX, return
  * in RAX. Matches the b1nix x86_64 ABI documented in docs/abi.md. */
 #ifdef __x86_64__

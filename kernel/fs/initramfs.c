@@ -14,6 +14,9 @@
 #include <string.h>
 
 #include "initramfs_native_smoke.inc"
+/* b1cc (the in-tree C compiler and its M5/M32-M34 smoke corpus) is temporarily
+ * cut from the build — define B1NIX_NO_B1CC. Restored as a separate change. */
+#ifndef B1NIX_NO_B1CC
 #include "initramfs_return_42.inc"
 #include "initramfs_b1cc_hello.inc"
 #include "initramfs_b1cc_argv.inc"
@@ -21,14 +24,21 @@
 #include "initramfs_b1cc_stderr_exit.inc"
 #include "initramfs_b1cc_better_c.inc"
 #include "initramfs_b1cc_m34.inc"
+#endif
 #ifdef B1CC_SELFHOST
 /* M32/M33: /bin/b1cc + /lib/b1cc/{crt0.o,libb1nix.a,crt0-dynamic.o} + b1cc-selfsmoke. */
+#ifndef B1NIX_MUSL
 #include "initramfs_b1cc_selfhost.inc"
+#endif
+#ifndef B1NIX_MUSL
 #include "initramfs_b1cc_selfsmoke.inc"
+#endif
 /* M33 on-device PIE self-smoke DT_NEEDEDs libc.so.1, so the minimal initramfs
  * must carry the shared libc blob. The full build already pulls it in via the
- * x86_64 include block below, so only add it here for the minimal build. */
-#ifdef MINIMAL_INITRAMFS
+ * x86_64 include block below, so only add it here for the minimal build.
+ * Under musl the loader blob (initramfs_ld_musl_x86_64_so_1.inc) serves this
+ * role instead and is included unconditionally further down. */
+#if defined(MINIMAL_INITRAMFS) && !defined(B1NIX_MUSL)
 #include "initramfs_shared_libc.inc"
 #endif
 #endif
@@ -74,8 +84,7 @@
 #include "initramfs_m30_pie.inc"
 #ifdef __x86_64__
 #include "initramfs_m30_dynamic.inc"
-#include "initramfs_shared_libc.inc"
-#include "initramfs_m69_plugin.inc"
+#endif
 #endif
 #include "initramfs_m34_smoke.inc"
 #include "initramfs_m35_smoke.inc"
@@ -99,6 +108,11 @@
  * libc++abi.so.1 folds the libunwind DWARF unwinder; cross-DSO C++ exceptions
  * work via dl_iterate_phdr + each object's PT_GNU_EH_FRAME (no __register_frame).
  * Their init_array constructors run via M75. x86_64. */
+/* /lib/libc++.so.1 + /lib/libc++abi.so.1 are included unconditionally: under
+ * the legacy b1nix libc the .so pair is linked against the b1nix sysroot libc;
+ * under musl (B1NIX_MUSL) the pair is the musl-linked version built by
+ * tools/toolchain/build-libcxx.sh with LIBC_FLAVOR=musl. Both flavours use
+ * the same symbol names (vfs_libcxx_elf / vfs_libcxxabi_so1). */
 #include "initramfs_libcxx.inc"
 #include "initramfs_libcxxabi.inc"
 #endif
@@ -126,10 +140,22 @@
 #include "initramfs_m52_glsl.inc"
 #include "initramfs_m59_smoke.inc"
 #include "initramfs_m91_skia_smoke.inc"
+#ifndef B1NIX_MUSL
 #include "initramfs_m91_skia_dm.inc"
+#endif
+/* M92: musl libc smoke test — compiled against musl, exercises Linux ABI layer */
+#ifdef B1NIX_MUSL
+#include "initramfs_ld_musl_x86_64_so_1.inc"
+#include "initramfs_m92_musl_dyn_smoke.inc"
+#include "initramfs_m92_musl_ldso_smoke.inc"
+#include "initramfs_musl_posix_smoke.inc"
+#include "initramfs_m92_musl_hello.inc"
+#include "initramfs_m92_musl_step2.inc"
+#include "initramfs_m92_musl_raw_diag.inc"
+#endif
 /* M91 Skia shared-library graph — x86_64 full build only (the registration
  * table below is under the same #ifdef __x86_64__, and these .inc are large). */
-#if defined(__x86_64__) && !defined(MINIMAL_INITRAMFS)
+#if defined(__x86_64__) && !defined(MINIMAL_INITRAMFS) && !defined(B1NIX_MUSL)
 #include "initramfs_libskia.inc"
 #include "initramfs_libraw_ptr.inc"
 #include "initramfs_libfontconfig.inc"
@@ -173,10 +199,6 @@
 #include "initramfs_halt.inc"
 #include "initramfs_setfattr.inc"
 #include "initramfs_busybox.inc"
-#endif
-
-
-
 static const unsigned char vfs_init_elf[] = {
     0x7f, 0x45, 0x4c, 0x46, 0x02, 0x01, 0x01, 0x00, 0x00, 0x00, 0x00, 0x00,
     0x00, 0x00, 0x00, 0x00, 0x02, 0x00, 0x3e, 0x00, 0x01, 0x00, 0x00, 0x00,
@@ -237,12 +259,15 @@ static const char initramfs_shells[] =
     "/opt/busybox/bin/busybox\n";
 
 /* M31: shadow database. Format: name:hash:lastchange:min:max:warn:inactive:expire:reserved
- * Empty fields after the hash are POSIX-compliant placeholders. The hash
- * is b1nix's $b1$<salt>$<base64> format (kernel/lib/crypt.c). Passwords
- * here are 'root' and 'user' — change via /bin/passwd. */
+ * Empty fields after the hash are POSIX-compliant placeholders. The hashes are
+ * standard $6$ (SHA-512 crypt) so musl's crypt(3) verifies them — the same path
+ * dropbear's svr-authpasswd.c takes. (The old $b1$ format from the in-house libc
+ * is gone with the musl migration; musl crypt() returns NULL on it, which would
+ * reject EVERY password and break SSH login.) Passwords are 'root' and 'user'
+ * — change via /bin/passwd, which also writes $6$. */
 static const char initramfs_shadow[] =
-    "root:$b1$rootsalt$YLR0bb6kf/9n3oGVFfPVbAVfAqs.k/9jnNVshpAFNbj6hBY2OZmMg6Jav8muEuSt8vkIU8mahAr9KwerDzvv6Q:0:0:99999:7:::\n"
-    "user:$b1$usersalt$BaxHIimflG4IPjGvD7HDPKcnI1nRIILqEKYNIyHy6iDPeyxWpyqT4p5Hir8Iauy.ZiTCnjIUPj1KKlgdLNBHXQ:0:0:99999:7:::\n";
+    "root:$6$rootsalt$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\n"
+    "user:$6$usersalt$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n";
 
 static const char initramfs_group[] =
     "root:x:0:\n"
@@ -1356,9 +1381,11 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox rm -f /mnt/w4/m43_create.txt; /opt/busybox/bin/busybox rmdir /mnt/w4/m43_dir\n"
     "/opt/busybox/bin/busybox umount /mnt/w4\n"
     "/opt/busybox/bin/busybox mount | /opt/busybox/bin/busybox grep -q \"/mnt/w4\" || echo \"BB-W4: ok umount\"\n"
-    /* nslookup on a numeric address: getaddrinfo numeric fast path, no live DNS
-     * query, so deterministic offline. */
-    "/opt/busybox/bin/busybox nslookup 10.0.2.2 | /opt/busybox/bin/busybox grep -q \"10.0.2.2\" && echo \"BB-W4: ok nslookup\"\n"
+    /* nslookup on a numeric address prints the numeric answer, but busybox also
+     * probes the configured nameserver (10.0.2.3), which does not answer under
+     * the restricted QEMU net — bound with `timeout` so a slow/blocked DNS probe
+     * cannot wedge the whole busybox smoke script. */
+    "/opt/busybox/bin/busybox timeout 8 /opt/busybox/bin/busybox nslookup 10.0.2.2 2>/dev/null | /opt/busybox/bin/busybox grep -q \"10.0.2.2\" && echo \"BB-W4: ok nslookup\"\n"
     /* lsof reads /proc/<pid>/fd/ symlinks; every process has open files. */
     "/opt/busybox/bin/busybox lsof 2>/dev/null | /opt/busybox/bin/busybox grep -q \"/\" && echo \"BB-W4: ok lsof\"\n"
     /* netstat reads /proc/net/tcp; the dropbear SSH daemon listens on :22. */
@@ -1374,8 +1401,13 @@ static const char posix_smoke_script[] =
     "/opt/busybox/bin/busybox blkid /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -qi \"ext\" && echo \"BB-W4: ok blkid\"\n"
     /* fdisk -l reads the /dev/sata0 geometry via the BLK* ioctls. */
     "/opt/busybox/bin/busybox fdisk -l /dev/sata0 2>/dev/null | /opt/busybox/bin/busybox grep -q \"Disk /dev/sata0\" && echo \"BB-W4: ok fdisk\"\n"
-    /* ping uses a raw ICMP socket; the gateway 10.0.2.2 answers echo. */
-    "/opt/busybox/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /opt/busybox/bin/busybox grep -q \"bytes from 10.0.2.2\" && echo \"BB-W4B: ok ping\"\n"
+    /* ping uses a raw ICMP socket; the gateway 10.0.2.2 answers echo. Match on
+     * the packet-loss summary, not "bytes from 10.0.2.2": QEMU slirp's virtual
+     * gateway answers its own echo with source address 0.0.0.0 (seq/ttl/time
+     * are all genuine — only the embedded IP source is a slirp quirk), so the
+     * literal address never appears in busybox's per-reply line. "0% packet
+     * loss" is unaffected by that and still proves the raw-ICMP round trip. */
+    "/opt/busybox/bin/busybox ping -c 1 -W 3 10.0.2.2 2>&1 | /opt/busybox/bin/busybox grep -q \"0% packet loss\" && echo \"BB-W4B: ok ping\"\n"
     /* losetup -f returns the first free loop device via /dev/loop-control. */
     "/opt/busybox/bin/busybox losetup -f 2>/dev/null | /opt/busybox/bin/busybox grep -q \"/dev/loop\" && echo \"BB-W4B: ok losetup\"\n"
     /* ip uses rtnetlink (AF_NETLINK); RTM_GETLINK lists the eth0 interface. */
@@ -1482,6 +1514,7 @@ static const struct initramfs_file files[] = {
      INITRAMFS_EXECUTABLE},
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
+#ifndef B1NIX_NO_B1CC
     {"/bin/return_42", (const char *)vfs_return_42_elf,
      sizeof(vfs_return_42_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_hello", (const char *)vfs_b1cc_hello_elf,
@@ -1496,12 +1529,19 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_b1cc_better_c_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_m34", (const char *)vfs_b1cc_m34_elf,
      sizeof(vfs_b1cc_m34_elf), INITRAMFS_EXECUTABLE},
+#ifndef B1NIX_MUSL
     B1CC_M34_INITRAMFS_FILES
+#endif
+#endif /* B1NIX_NO_B1CC */
 #ifdef B1CC_SELFHOST
+#ifndef B1NIX_MUSL
     {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
      INITRAMFS_EXECUTABLE},
+#endif
+#ifndef B1NIX_MUSL
     {"/bin/b1cc-selfsmoke", (const char *)vfs_b1cc_selfsmoke_elf,
      sizeof(vfs_b1cc_selfsmoke_elf), INITRAMFS_EXECUTABLE},
+#endif
     {"/lib/b1cc/crt0.o", (const char *)vfs_b1cc_crt0, sizeof(vfs_b1cc_crt0), 0},
     {"/lib/b1cc/libb1nix.a", (const char *)vfs_b1cc_libc, sizeof(vfs_b1cc_libc), 0},
     /* M33 dynamic path: crt0-dynamic.o is b1cc's internal PIE linker input;
@@ -1509,9 +1549,6 @@ static const struct initramfs_file files[] = {
      * kernel's eager in-kernel linker resolves against. */
     {"/lib/b1cc/crt0-dynamic.o", (const char *)vfs_b1cc_crt0dyn,
      sizeof(vfs_b1cc_crt0dyn), 0},
-    {"/lib/libc.so.1", (const char *)vfs_shared_libc_elf,
-     sizeof(vfs_shared_libc_elf), INITRAMFS_EXECUTABLE},
-    {"/lib/libc.so", "/lib/libc.so.1", 15, INITRAMFS_SYMLINK},
 #endif
 
     {"/mnt/iso/.keep", "", 0, 0},
@@ -1522,8 +1559,10 @@ static const struct initramfs_file files[] = {
     {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
      INITRAMFS_EXECUTABLE},
     {"/bin/sh", "/opt/busybox/bin/busybox", 24, INITRAMFS_SYMLINK},
+#ifndef B1NIX_MUSL
     {"/bin/hello", (const char *)vfs_hello_elf, sizeof(vfs_hello_elf),
      INITRAMFS_EXECUTABLE},
+#endif
     {"/opt/busybox/bin/busybox", (const char *)vfs_upstream_busybox_elf,
      sizeof(vfs_upstream_busybox_elf), INITRAMFS_EXECUTABLE},
     {"/etc/bb-w2b/hello.xz", (const char *)initramfs_bb_w2b_xz,
@@ -1558,6 +1597,7 @@ static const struct initramfs_file files[] = {
      * native-smoke. Their .inc are #included unconditionally above, so they must
      * be registered in BOTH the minimal and the full table (a missing-from-full
      * entry shows up as B1CC-*-SMOKE: spawn-fail in the full smoke). */
+#ifndef B1NIX_NO_B1CC
     {"/bin/return_42", (const char *)vfs_return_42_elf,
      sizeof(vfs_return_42_elf), INITRAMFS_EXECUTABLE},
     {"/bin/b1cc_hello", (const char *)vfs_b1cc_hello_elf,
@@ -1573,18 +1613,27 @@ static const struct initramfs_file files[] = {
     {"/bin/b1cc_m34", (const char *)vfs_b1cc_m34_elf,
      sizeof(vfs_b1cc_m34_elf), INITRAMFS_EXECUTABLE},
 #ifndef MINIMAL_INITRAMFS
+#ifndef B1NIX_MUSL
     B1CC_M34_INITRAMFS_FILES
 #endif
+#endif
+#endif /* B1NIX_NO_B1CC */
 #ifdef B1CC_SELFHOST
+#ifndef B1NIX_MUSL
     {"/bin/b1cc", (const char *)vfs_b1cc_elf, sizeof(vfs_b1cc_elf),
      INITRAMFS_EXECUTABLE},
+#endif
+#ifndef B1NIX_MUSL
     {"/bin/b1cc-selfsmoke", (const char *)vfs_b1cc_selfsmoke_elf,
      sizeof(vfs_b1cc_selfsmoke_elf), INITRAMFS_EXECUTABLE},
+#endif
+#ifndef B1NIX_MUSL
     {"/lib/b1cc/crt0.o", (const char *)vfs_b1cc_crt0, sizeof(vfs_b1cc_crt0), 0},
     {"/lib/b1cc/libb1nix.a", (const char *)vfs_b1cc_libc, sizeof(vfs_b1cc_libc), 0},
     /* M33 dynamic path: PIE linker input (libc.so.1 already registered below). */
     {"/lib/b1cc/crt0-dynamic.o", (const char *)vfs_b1cc_crt0dyn,
      sizeof(vfs_b1cc_crt0dyn), 0},
+#endif
 #endif
     {"/bin/m12-smoke", (const char *)vfs_m12_smoke_elf,
      sizeof(vfs_m12_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -1674,11 +1723,7 @@ static const struct initramfs_file files[] = {
 #ifdef __x86_64__
     {"/bin/m30-dynamic", (const char *)vfs_m30_dynamic_elf,
      sizeof(vfs_m30_dynamic_elf), INITRAMFS_EXECUTABLE},
-    {"/lib/libc.so.1", (const char *)vfs_shared_libc_elf,
-     sizeof(vfs_shared_libc_elf), INITRAMFS_EXECUTABLE},
-    {"/lib/libc.so", "/lib/libc.so.1", 15, INITRAMFS_SYMLINK},
-    {"/lib/m69_plugin.so", (const char *)vfs_m69_plugin_elf,
-     sizeof(vfs_m69_plugin_elf), INITRAMFS_EXECUTABLE},
+#endif
     /* M40: a static Linux x86_64 ELF that uses Linux syscall numbers; the Linux
      * ABI translation layer maps them to the native handlers. */
     {"/bin/m40-linux-hello", (const char *)vfs_m40_linux_hello,
@@ -1691,6 +1736,7 @@ static const struct initramfs_file files[] = {
     /* M89: /lib/libgcc_s.so removed — busybox/nsfb fold libgcc statically and the
      * C++ stack is on libc++, so nothing carries DT_NEEDED libgcc_s.so. */
     /* M89: /lib/libstdc++.so.6 removed — the C++ ecosystem is on libc++ now. */
+#ifndef B1NIX_MUSL
     /* Shared LLVM C++ standard library (M89). libc++-linked binaries carry
      * DT_NEEDED libc++.so.1 -> libc++abi.so.1 -> libc.so.1; the M69 exec-time
      * linker resolves the chain. libc++abi.so.1 folds the libunwind unwinder. */
@@ -1715,6 +1761,19 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_libEGL_so), INITRAMFS_EXECUTABLE},
     {"/lib/libb1gui.so", (const char *)vfs_libb1gui_so,
      sizeof(vfs_libb1gui_so), INITRAMFS_EXECUTABLE},
+#endif
+#ifdef B1NIX_MUSL
+    /* Shared LLVM C++ standard library for musl (M89 musl port). The musl-linked
+     * libc++.so.1 and libc++abi.so.1 live in $(LIBC_ROOT)/lib/ and carry
+     * DT_NEEDED libc.so (not libc.so.1) which the ld-musl-x86_64.so.1 blob
+     * satisfies via the /lib/libc.so symlink already registered above. */
+    {"/lib/libc++.so.1", (const char *)vfs_libcxx_elf,
+     sizeof(vfs_libcxx_elf), INITRAMFS_EXECUTABLE},
+    {"/lib/libc++.so", "/lib/libc++.so.1", 17, INITRAMFS_SYMLINK},
+    {"/lib/libc++abi.so.1", (const char *)vfs_libcxxabi_so1,
+     sizeof(vfs_libcxxabi_so1), INITRAMFS_EXECUTABLE},
+    {"/lib/libc++abi.so", "/lib/libc++abi.so.1", 20, INITRAMFS_SYMLINK},
+#endif
 #endif
     {"/bin/m34-smoke", (const char *)vfs_m34_smoke_elf,
      sizeof(vfs_m34_smoke_elf), INITRAMFS_EXECUTABLE},
@@ -1775,9 +1834,59 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_m59_smoke_elf), INITRAMFS_EXECUTABLE},
     {"/bin/m91-skia-smoke", (const char *)vfs_m91_skia_smoke_elf,
      sizeof(vfs_m91_skia_smoke_elf), INITRAMFS_EXECUTABLE},
+#ifndef B1NIX_MUSL
     {"/bin/skia-dm", (const char *)vfs_m91_skia_dm_elf,
      sizeof(vfs_m91_skia_dm_elf), INITRAMFS_EXECUTABLE},
+#endif
 #ifdef __x86_64__
+    {"/lib/ld-musl-x86_64.so.1", (const char *)vfs_ld_musl_x86_64_so_1,
+     sizeof(vfs_ld_musl_x86_64_so_1), INITRAMFS_EXECUTABLE},
+#ifdef B1NIX_MUSL
+    /* The loader blob above IS the C library: PT_INTERP resolves the path
+     * directly, DT_NEEDED "libc.so" resolves through this symlink. One blob,
+     * many names.
+     *
+     * Math, threads, timers, dlopen, crypt and the resolver all live in that
+     * same blob. Anything linked through this tree resolves -lm/-lpthread/...
+     * against empty archives and needs libc.so alone, but a shared object built
+     * elsewhere may still name a per-facility library; these aliases point such
+     * a DT_NEEDED at the one blob instead of failing to resolve. Symlinks cost
+     * no image space. */
+    {"/lib/libc.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libm.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libm.so.1", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libpthread.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/librt.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libdl.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libcrypt.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libutil.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    {"/lib/libresolv.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
+    /* M59's Mesa OSMesa image is staged in rootfs.img because it is too large
+     * for an initramfs blob. Resolve its normal ld.so search path through the
+     * test-mode rootfs mount without duplicating the shared object. */
+    {"/lib/libOSMesa.so.8", "/mnt/root/lib/libOSMesa.so.8", 29,
+     INITRAMFS_SYMLINK},
+    /* M69's runtime-dlopen plugin lives in rootfs.img (staged into rootfs/lib by
+     * the root-image target), not the initramfs — under musl the plugin, like
+     * libc.so.1, is served from the ext4 rootfs. Bridge the ld.so search path so
+     * dlopen("/lib/m69_plugin.so") resolves through the test-mode /mnt/root mount. */
+    {"/lib/m69_plugin.so", "/mnt/root/lib/m69_plugin.so", 28,
+     INITRAMFS_SYMLINK},
+#endif
+#ifdef B1NIX_MUSL
+    {"/bin/m92-musl-dyn-smoke", (const char *)vfs_m92_musl_dyn_smoke_elf,
+     sizeof(vfs_m92_musl_dyn_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m92-musl-ldso-smoke", (const char *)vfs_m92_musl_ldso_smoke_elf,
+     sizeof(vfs_m92_musl_ldso_smoke_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m92-musl-hello", (const char *)vfs_m92_musl_hello_elf,
+     sizeof(vfs_m92_musl_hello_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m92-musl-step2", (const char *)vfs_m92_musl_step2_elf,
+     sizeof(vfs_m92_musl_step2_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/m92-musl-raw-diag", (const char *)vfs_m92_musl_raw_diag_elf,
+     sizeof(vfs_m92_musl_raw_diag_elf), INITRAMFS_EXECUTABLE},
+    {"/bin/musl-posix-smoke", (const char *)vfs_musl_posix_smoke_elf,
+     sizeof(vfs_musl_posix_smoke_elf), INITRAMFS_EXECUTABLE},
+#endif
     {"/bin/m64-clang-smoke", (const char *)vfs_m64_clang_smoke_elf,
      sizeof(vfs_m64_clang_smoke_elf), INITRAMFS_EXECUTABLE},
 #endif
@@ -1813,8 +1922,10 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_gabout_elf), INITRAMFS_EXECUTABLE},
     /* M30: compatibility interpreter path. Startup dependency loading,
      * symbol lookup, and relocation are performed eagerly by the kernel. */
+#ifndef B1NIX_MUSL
     {"/lib/ld-b1nix.so", (const char *)vfs_m30_pie_elf,
      sizeof(vfs_m30_pie_elf), INITRAMFS_EXECUTABLE},
+#endif
     {"/etc/motd", "welcome to b1nix m4\n", 23, 0},
     {"/etc/passwd", initramfs_passwd, sizeof(initramfs_passwd) - 1, 0},
     {"/etc/shells", initramfs_shells, sizeof(initramfs_shells) - 1, 0},
@@ -1880,7 +1991,6 @@ static const struct initramfs_file files[] = {
     TCC_INITRAMFS_FILES,
     NETSURF_INITRAMFS_FILES
 };
-#endif
 
 static int initramfs_vfs_statfs(struct vfs_node *node,
                                 struct b1nix_statfs *st) {
@@ -1939,6 +2049,9 @@ static struct vfs_fs initramfs_fs = {
 };
 
 void initramfs_init(void) {
+#ifdef B1NIX_MUSL
+  (void)vfs_hello_elf;
+#endif
   vfs_register_fs(&initramfs_fs);
   console_write("initramfs: files 0x");
   console_write_hex64(initramfs_count());

@@ -216,6 +216,7 @@ void tlb_shootdown_page(u64 vaddr) {
 }
 
 void tlb_shootdown_all(void) {
+    cr3_reload();
     if (g_max_cpus <= 1) return;
     if (!__atomic_load_n(&g_tlb_enabled, __ATOMIC_ACQUIRE)) return;
     u64 flags;

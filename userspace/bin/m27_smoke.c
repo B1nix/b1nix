@@ -2,7 +2,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <pwd.h>
-#include <syscall.h>
+#include <sys/types.h>
 #include <sys/wait.h>
 
 static void marker(const char *s) { write(1, s, strlen(s)); }
@@ -46,8 +46,8 @@ int main(void) {
   int pid = fork();
   if (pid == 0) {
     int ok = setgid(1000) == 0 && setuid(1000) == 0 &&
-             syscall(SYS_GETUID) == 1000 && syscall(SYS_GETGID) == 1000;
-    syscall(SYS_EXIT, ok ? 0 : 1);
+             getuid() == 1000 && getgid() == 1000;
+    _exit(ok ? 0 : 1);
   } else if (pid > 0) {
     int st = 0;
     waitpid(pid, &st, 0);

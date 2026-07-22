@@ -6,6 +6,8 @@
 #include <b1nix/vfs.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/panic.h>
+#include <b1nix/klog.h>
+#include <stdio.h>
 #include <string.h>
 
 /* F2 (M28 #7 prep): rwlock serialising page-table mutations across CPUs.
@@ -202,6 +204,23 @@ static u64 *split_huge_page(u64 *pd, usize index) {
 void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {
   u64 *pdpt = ensure_child_table(pml4, pml4_index(virtual_address));
   u64 *pd = ensure_child_table(pdpt, pdpt_index(virtual_address));
+
+  /* DIAG: first time we map into the low-4GB on a user address space, dump
+   * the PD entry to see if it's a 2MB identity-map huge page or already split. */
+  {
+    static int diag_done = 0;
+    if (!diag_done && virtual_address >= 0x2000000ULL && virtual_address < 0x2100000ULL) {
+      u64 pde_val = pd[pd_index(virtual_address)];
+      console_write("MAP_IN_TABLE va=0x"); console_write_hex64(virtual_address);
+      console_write(" pd["); console_write_dec((u32)pd_index(virtual_address));
+      console_write("]=0x"); console_write_hex64(pde_val);
+      console_write(pde_val & HUGE_PAGE_FLAG ? " HUGE" : " 4k");
+      console_write(" flags=0x"); console_write_hex64(flags);
+      console_write(" pml4="); console_write_hex64((u64)pml4);
+      console_write("\n");
+      diag_done = 1;
+    }
+  }
 
   u64 *pt;
   if ((pd[pd_index(virtual_address)] & HUGE_PAGE_FLAG) != 0) {
@@ -452,8 +471,21 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
   u64 pte = pt[pt_index(virtual_address)];
 
   if (pte & VMM_PRESENT) {
+    u64 nf = flags;
+    /* Never let mprotect(PROT_WRITE) flip a COW page (fork-shared anon, or a
+     * MAP_PRIVATE view of a page-cache frame) to directly-writable — that
+     * would let stores corrupt the shared frame. Keep the COW marker and
+     * leave the page read-only; the next store faults into the COW copy
+     * path, which duplicates the frame and grants write access. */
+    if ((pte & VMM_COW) && (nf & VMM_WRITABLE)) {
+      nf &= ~VMM_WRITABLE;
+      nf |= VMM_COW; /* write still faults into the COW copy path. A downgrade
+                        to read-only (e.g. relro) intentionally drops the COW
+                        marker: a later write is then a clean protection fault
+                        (VMA prot tracking is too coarse to consult here). */
+    }
     pt[pt_index(virtual_address)] =
-        (pte & PAGE_ENTRY_ADDRESS_MASK) | flags | VMM_PRESENT;
+        (pte & PAGE_ENTRY_ADDRESS_MASK) | nf | VMM_PRESENT;
   } else if (pte & (VMM_LAZY | VMM_SWAPPED)) {
     // For non-present pages, update the saved flags
     pt[pt_index(virtual_address)] =
@@ -461,6 +493,29 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
   }
 
   invalidate_page(virtual_address);
+}
+
+/* Diagnostic: return the raw leaf PTE for a user VA in the current address
+ * space, plus the covering PDE and whether that PDE is a 2 MiB huge page.
+ * Returns 0 if any level is absent. Read-only, no allocation. */
+u64 paging_debug_leaf_pte(u64 va, u64 *out_pde, int *out_huge) {
+  if (out_pde) *out_pde = 0;
+  if (out_huge) *out_huge = 0;
+  u64 *pml4 = get_current_pml4();
+  if (!pml4) return 0;
+  u64 pml4e = pml4[pml4_index(va)];
+  if ((pml4e & VMM_PRESENT) == 0) return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(va)];
+  if ((pdpte & VMM_PRESENT) == 0) return 0;
+  if (pdpte & HUGE_PAGE_FLAG) { if (out_huge) *out_huge = 1; if (out_pde) *out_pde = pdpte; return pdpte; }
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(va)];
+  if (out_pde) *out_pde = pde;
+  if ((pde & VMM_PRESENT) == 0) return 0;
+  if (pde & HUGE_PAGE_FLAG) { if (out_huge) *out_huge = 1; return pde; }
+  u64 *pt = table_from_entry(pde);
+  return pt[pt_index(va)];
 }
 
 void vmm_remap_page(u64 virtual_address, u64 physical_address, u64 flags) {
@@ -729,6 +784,18 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
                 pmm_free_frame(frame);
                 return -1;
               }
+            } else if (vma->node->inode->data) {
+              /* Initramfs files are resident in inode->data and deliberately
+               * have no read callback. Populate mmap pages from that backing
+               * store instead of leaving the lazy frame zero-filled. */
+              if (file_page < vma->node->inode->size) {
+                usize copy_size = vma->node->inode->size - file_page;
+                if (copy_size > PAGE_SIZE)
+                  copy_size = PAGE_SIZE;
+                memcpy(new_frame_virt,
+                       (const char *)vma->node->inode->data + file_page,
+                       copy_size);
+              }
             }
           } else if (vma->node->inode->read_cb) {
             isize res = vma->node->inode->read_cb(vma->node, file_offset, (char *)new_frame_virt, PAGE_SIZE, 0);
@@ -762,6 +829,18 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     if (*slot & VMM_WRITABLE) flags |= VMM_WRITABLE;
     if (*slot & VMM_USER) flags |= VMM_USER;
     if (vma_shared) flags |= VMM_SHARED;
+    /* A writable MAP_PRIVATE file page must NOT map the shared page-cache
+     * frame writable: the first store (e.g. ld.so applying relocations to a
+     * library's data segment) would be written INTO the cache and served to
+     * every later mapper of the file — the next process's ld.so then reads
+     * pre-relocated garbage (observed: libOSMesa's DYNAMIC page carrying
+     * another process's relocated pointers → decode_dyn found no DT_HASH →
+     * find_sym crash). Map it read-only + COW so the first write copies the
+     * page out of the cache, exactly like a forked private page. */
+    if (shared_cache_frame && !vma_shared && (flags & VMM_WRITABLE)) {
+      flags &= ~VMM_WRITABLE;
+      flags |= VMM_COW;
+    }
     *slot = frame | flags;
     invalidate_page(page_aligned);
     vmm_write_release(cflags);

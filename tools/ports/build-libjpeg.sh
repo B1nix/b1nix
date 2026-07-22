@@ -56,9 +56,12 @@ else
   TARGET="x86_64-unknown-elf"
 fi
 
+MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+_CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-  -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-  -O2 -fno-strict-aliasing -Db1nix -I$GEN_DIR -I$SRC_DIR
+  -nostdinc -isystem $MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include}
+  -idirafter $ROOT_DIR/userspace/include
+  -O2 -fno-strict-aliasing -fPIC -Db1nix -D__linux__ -I$GEN_DIR -I$SRC_DIR
   -Wno-implicit-function-declaration -Wno-shift-negative-value"
 
 # IJG library sources (the LIBSOURCES set from makefile.ansi) — no application

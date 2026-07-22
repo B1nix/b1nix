@@ -321,6 +321,8 @@ u64  task_altstack_top(const struct task *t);
 int  task_on_altstack(const struct task *t, u64 sp);
 u64  task_alarm_ticks(const struct task *t);
 void task_set_alarm_ticks(struct task *t, u64 ticks);
+u64  task_alarm_interval_ticks(const struct task *t);
+void task_set_alarm_interval_ticks(struct task *t, u64 ticks);
 usize task_tgid(const struct task *t);
 u64  task_utime(const struct task *t);
 u64  task_stime(const struct task *t);
@@ -382,7 +384,9 @@ int scheduler_fork_current(void);
  *   CLONE_CHILD_CLEARTID — store `ctid` and write 0 + futex_wake on exit.
  */
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
-                           u64 tls, u64 ctid);
+                           u64 tls, u64 ctid,
+                           u64 parent_tid_addr, u64 child_tid_addr,
+                           u64 start_func);
 
 /* M29: futex. op is B1NIX_FUTEX_WAIT or B1NIX_FUTEX_WAKE. Returns 0 on success,
  * -errno otherwise. WAIT blocks if *uaddr == val; WAKE wakes up to val

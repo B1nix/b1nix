@@ -1254,6 +1254,19 @@ restart_traversal:
     }
 
     struct vfs_node *child = find_child(current, part);
+    if (!child && current->inode->lookup_cb) {
+      /* Synthetic dir (procfs/sysfs) with lazily-materialised children: give it
+       * a chance to create `part` on demand, then retry. This is what lets a
+       * DIRECT lookup of e.g. /proc/self/fd/N succeed without a prior readdir
+       * (musl ttyname()/readlink take exactly that path). Release the inode read
+       * lock first — lookup_cb inserts a child under this inode's WRITE lock, and
+       * a read→write upgrade on the same inode would deadlock. `current` is
+       * refcounted, so it stays valid across the brief unlock. */
+      vfs_inode_unlock_read(current->inode);
+      current->inode->lookup_cb(current, part);
+      vfs_inode_lock_read(current->inode);
+      child = find_child(current, part);
+    }
     if (!child) {
       vfs_inode_unlock_read(current->inode);
       vfs_node_put(current);
@@ -1862,11 +1875,21 @@ static isize tty_write(struct vfs_node *node, u64 offset, const char *buffer,
     }
   }
 
+  /* Hold console_lock across the whole buffer: console_putc() is the
+   * unlocked per-char primitive normally only called from inside
+   * console_write()'s own locked loop. Without this, a concurrent
+   * console_write() (kernel log) or another tty's write() could land a byte
+   * mid-buffer here and vice versa — this is the boot-era merged VGA+serial
+   * console (/dev/tty, /dev/console), a separate write path from
+   * serial_tty.c's per-instance ttys, and had the same unlocked-UART bug. */
+  u64 lock_flags;
+  console_lock_acquire_irqsave(&lock_flags);
   for (usize i = 0; i < size; i++) {
     if ((console.termios.c_oflag & B1NIX_OPOST) && buffer[i] == '\n')
       console_putc('\r');
     console_putc(buffer[i]);
   }
+  console_lock_release_irqrestore(lock_flags);
   return (isize)size;
 }
 
@@ -1914,9 +1937,9 @@ static isize log_write(struct vfs_node *node, u64 offset, const char *buffer,
   while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
     n--;
   line[n] = '\0';
-  serial_write("/dev/log: ");
-  serial_write(line);
-  serial_write("\n");
+  char out[sizeof(line) + 16];
+  snprintf(out, sizeof(out), "/dev/log: %s\n", line);
+  console_write(out);
   return (isize)size;
 }
 
@@ -1970,6 +1993,59 @@ static void tty_init_node(void) {
  * variants) */
 static int vfs_rename_internal(const char *old_path, const char *new_path);
 
+/* A private, stable st_dev for /dev/pts, plus st_ino == pty index + 1. musl's
+ * ttyname_r() compares stat("/dev/pts/N").{dev,ino} against fstat(slave).{dev,ino}
+ * — so both MUST agree. We anchor them on the pts INDEX, not on two independent
+ * inode objects, so the /dev/pts/N node (materialised on demand) and the open
+ * slave handle report the identical pair. */
+#define DEVPTS_FSID 0x70747300u /* "pts\0" — unique, never a real mount fs_id */
+static inline u64 devpts_ino(int idx) { return (u64)idx + 1; }
+
+/* On-demand /dev/pts/<N>: /dev/pts opens are string-intercepted in
+ * vfs_open_flags, so the slave nodes never physically exist — which means a
+ * plain stat()/readlink of /dev/pts/<N> misses. musl's ttyname() readlinks
+ * /proc/self/fd/<fd> to "/dev/pts/<N>" and then stat()s it, so that path must
+ * resolve. Materialise a char-device node for any live pty slot when the
+ * resolver asks; stale nodes for closed ptys are harmless (they just re-open
+ * via the interception). */
+static int devpts_lookup(struct vfs_node *dir, const char *name) {
+  if (!name[0])
+    return -1;
+  int idx = 0;
+  for (const char *q = name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -1;
+    idx = idx * 10 + (*q - '0');
+  }
+  if (!pty_allocated(idx))
+    return -1;
+  struct vfs_node *existing = find_child(dir, name);
+  if (existing) {
+    vfs_node_put(existing);
+    return 0;
+  }
+  struct vfs_node *n = vfs_create_node(VFS_DEVICE);
+  if (!n)
+    return -1;
+  usize nl = strlen(name);
+  if (nl > 63)
+    nl = 63;
+  memcpy(n->name, name, nl);
+  n->name[nl] = '\0';
+  n->inode->type = VFS_DEVICE;
+  n->inode->mode = 0620;
+  n->inode->nlink = 1;
+  n->inode->uid = ROOT_UID;
+  n->inode->gid = 5; /* tty */
+  n->inode->fs_id = DEVPTS_FSID;
+  n->inode->ino = devpts_ino(idx);
+  n->inode->data = (void *)(usize)(((u64)136 << 8) | (u64)idx); /* pts rdev */
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
+  return 0;
+}
+
 static void vfs_init_stdio(void) {
   scheduler_fd_table_init_current();
   int tty = vfs_open_flags("/dev/tty", B1NIX_O_RDWR);
@@ -2018,7 +2094,9 @@ void vfs_init(void) {
    * ptsname() paths resolve. */
   pty_init();
   add_node("/dev/ptmx", VFS_DEVICE, 0, 0, 0);
-  add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  struct vfs_node *ptsdir = add_node("/dev/pts", VFS_DIRECTORY, 0, 0, 0);
+  if (ptsdir)
+    ptsdir->inode->lookup_cb = devpts_lookup;
   serial_tty_register_nodes();
   vfs_create("/tmp/hello", 0644);
   vfs_mount("initramfs", "/", "initramfs", 0);
@@ -2075,6 +2153,7 @@ void vfs_repopulate_after_root_mount(void) {
     node->inode->mode = 0755;
     node->inode->uid = 0;
     node->inode->gid = 0;
+    node->inode->lookup_cb = devpts_lookup;
     vfs_node_put(node);
   }
 
@@ -3760,6 +3839,26 @@ int vfs_rmdir(const char *path) {
 }
 
 int vfs_fstat(int fd, struct b1nix_stat *st) {
+  /* Pseudo-terminal slave/master fds have no backing vfs_node, but fstat() must
+   * still work on them — musl's ttyname_r() fstat()s the slave and matches its
+   * {dev,ino} against stat("/dev/pts/N"). Report the same pts-index identity as
+   * devpts_lookup so the two agree. */
+  struct vfs_handle *ph = get_handle(fd);
+  if (ph && (ph->kind == VFS_HANDLE_PTY_SLAVE ||
+             ph->kind == VFS_HANDLE_PTY_MASTER)) {
+    int idx = pty_index_of(ph);
+    if (idx < 0)
+      return -EBADF;
+    memset(st, 0, sizeof(*st));
+    st->st_dev = DEVPTS_FSID;
+    st->st_ino = devpts_ino(idx);
+    st->st_mode = B1NIX_S_IFCHR | 0620;
+    st->st_nlink = 1;
+    st->st_gid = 5; /* tty */
+    st->st_rdev = ((u64)136 << 8) | (u64)idx;
+    st->st_blksize = 512;
+    return 0;
+  }
   struct vfs_node *node = vfs_find_node_by_fd(fd);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
@@ -4494,7 +4593,9 @@ int vfs_ioctl(int fd, u64 request, void *arg) {
       return -EFAULT;
     return 0;
   }
-  if (request == B1NIX_TCSETS) {
+  if (request == B1NIX_TCSETS || request == B1NIX_TCSETSW ||
+      request == B1NIX_TCSETSF) {
+    /* TCSADRAIN/TCSAFLUSH (TCSETSW/TCSETSF): no output buffering, so apply as TCSETS. */
     if (!arg || syscall_copyin(&console.termios, arg, sizeof(struct b1nix_termios)) < 0)
       return -EFAULT;
     return 0;

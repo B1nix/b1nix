@@ -33,6 +33,28 @@
 #define LINUX_NR_KILL        62
 #define LINUX_NR_TKILL       200
 #define LINUX_NR_TGKILL      234
+/* reboot(magic1, magic2, cmd, arg): Linux passes its command in arg2 as a magic
+ * constant, b1nix's SYS_REBOOT takes its own command in arg0. */
+#define LINUX_NR_REBOOT      169
+/* The xattr calls: b1nix's handlers carry a trailing `nofollow` argument that
+ * selects the follow-symlink (setxattr) or don't-follow (lsetxattr) variant,
+ * which Linux encodes in the syscall number instead. The caller never supplies
+ * that argument, so it must be set from the number rather than read off a
+ * register that holds nothing in particular. */
+#define LINUX_NR_SETXATTR     188
+#define LINUX_NR_LSETXATTR    189
+#define LINUX_NR_GETXATTR     191
+#define LINUX_NR_LGETXATTR    192
+#define LINUX_NR_LISTXATTR    194
+#define LINUX_NR_LLISTXATTR   195
+#define LINUX_NR_REMOVEXATTR  197
+#define LINUX_NR_LREMOVEXATTR    198
+#define LINUX_NR_SIGNALFD4       289
+
+/* reboot(2) command constants (linux/reboot.h). */
+#define LINUX_REBOOT_CMD_RESTART   0x01234567u
+#define LINUX_REBOOT_CMD_HALT      0xcdef0123u
+#define LINUX_REBOOT_CMD_POWER_OFF 0x4321fedcu
 
 /* Linux<->b1nix signal-number remap (b1nix uses different signo values, e.g.
  * Linux SIGUSR1=10 vs b1nix 19). Returns 0 if there is no equivalent. */
@@ -52,7 +74,10 @@ struct linux_siginfo {
   int _pad0;    /* 12 */
   int si_pid;   /* 16 (SI_USER) */
   int si_uid;   /* 20 */
-  unsigned char _pad[104]; /* -> 128 */
+  /* For SI_QUEUE/SI_TIMER the _sigfields._rt union places si_value here, so an
+   * SA_SIGINFO handler reads info->si_value.sival_int/ptr at this offset. */
+  long si_value; /* 24 (union sigval, 8 bytes) */
+  unsigned char _pad[96]; /* -> 128 */
 };
 
 /* Linux x86_64 ucontext_t. uc_mcontext.gregs starts at offset 40 and holds the

@@ -532,6 +532,42 @@ static void procfs_fd_symlink(struct vfs_node *dir, int fd, const char *target) 
   vfs_attach_child(dir, n);
 }
 
+/* Render the readlink target for one open fd. Called with the owner's fd_lock
+ * held, so it must not sleep/allocate — pty_index_of() only reads a plain int,
+ * which is safe. PTY targets use the pts INDEX (a real /dev/pts/<N> the devpts
+ * lookup_cb can stat), NOT the fd number: musl's ttyname() readlinks this and
+ * then stat()s the result, so it has to be a genuine path. */
+static void procfs_fd_fill_target(struct vfs_handle *h, int fd, char *tg,
+                                  usize sz) {
+  switch (h->kind) {
+  case VFS_HANDLE_PIPE_READ:
+  case VFS_HANDLE_PIPE_WRITE:
+    snprintf(tg, sz, "pipe:[%d]", fd);
+    break;
+  case VFS_HANDLE_SOCKET:
+    snprintf(tg, sz, "socket:[%d]", fd);
+    break;
+  case VFS_HANDLE_PTY_MASTER:
+  case VFS_HANDLE_PTY_SLAVE: {
+    int idx = pty_index_of(h);
+    if (idx >= 0)
+      snprintf(tg, sz, "/dev/pts/%d", idx);
+    else
+      snprintf(tg, sz, "anon_inode:[pts]");
+    break;
+  }
+  case VFS_HANDLE_NODE:
+    if (h->node && h->node->name[0])
+      snprintf(tg, sz, "/%s", h->node->name);
+    else
+      snprintf(tg, sz, "anon_inode:[unknown]");
+    break;
+  default:
+    snprintf(tg, sz, "anon_inode:[unknown]");
+    break;
+  }
+}
+
 static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
                                struct dirent *buf, usize max_entries) {
   usize pid = pid_from_parent(dir); /* dir->parent is the /proc/<pid> dir */
@@ -547,30 +583,8 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
       if (!h || !h->used)
         continue;
       snap[nsnap].fd = (int)i;
-      const char *kind = "anon_inode:[unknown]";
-      char *tg = snap[nsnap].target;
-      switch (h->kind) {
-      case VFS_HANDLE_PIPE_READ:
-      case VFS_HANDLE_PIPE_WRITE:
-        snprintf(tg, sizeof(snap[nsnap].target), "pipe:[%d]", (int)i);
-        break;
-      case VFS_HANDLE_SOCKET:
-        snprintf(tg, sizeof(snap[nsnap].target), "socket:[%d]", (int)i);
-        break;
-      case VFS_HANDLE_PTY_MASTER:
-      case VFS_HANDLE_PTY_SLAVE:
-        snprintf(tg, sizeof(snap[nsnap].target), "/dev/pts/%d", (int)i);
-        break;
-      case VFS_HANDLE_NODE:
-        if (h->node && h->node->name[0])
-          snprintf(tg, sizeof(snap[nsnap].target), "/%s", h->node->name);
-        else
-          snprintf(tg, sizeof(snap[nsnap].target), "%s", kind);
-        break;
-      default:
-        snprintf(tg, sizeof(snap[nsnap].target), "%s", kind);
-        break;
-      }
+      procfs_fd_fill_target(h, (int)i, snap[nsnap].target,
+                            sizeof(snap[nsnap].target));
       nsnap++;
     }
     spin_unlock_irqrestore(&t->fd_lock, flags);
@@ -578,6 +592,37 @@ static isize procfs_fd_readdir(struct vfs_node *dir, usize offset,
       procfs_fd_symlink(dir, snap[i].fd, snap[i].target);
   }
   return vfs_readdir_children(dir, offset, buf, max_entries);
+}
+
+/* On-demand resolution of a single /proc/<pid>/fd/<N> — the resolver invokes
+ * this when a direct lookup misses (readdir was never run). Without it,
+ * readlink("/proc/self/fd/N") — the core of musl's ttyname() — fails. */
+static int procfs_fd_lookup(struct vfs_node *dir, const char *name) {
+  int fd = 0;
+  for (const char *q = name; *q; q++) {
+    if (*q < '0' || *q > '9')
+      return -1;
+    fd = fd * 10 + (*q - '0');
+  }
+  usize pid = pid_from_parent(dir);
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t)
+    return -1;
+  char target[80];
+  int ok = 0;
+  u64 flags;
+  spin_lock_irqsave(&t->fd_lock, &flags);
+  struct vfs_handle *h =
+      (t->fd_table && (usize)fd < t->fd_capacity) ? t->fd_table[fd] : 0;
+  if (h && h->used) {
+    procfs_fd_fill_target(h, fd, target, sizeof(target));
+    ok = 1;
+  }
+  spin_unlock_irqrestore(&t->fd_lock, flags);
+  if (!ok)
+    return -1;
+  procfs_fd_symlink(dir, fd, target); /* idempotent (find_child guard) */
+  return 0;
 }
 
 /* /proc/<pid>/exe — symlink to the task's executable path (task->name). Tools
@@ -633,8 +678,10 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
   procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
-  if (fddir)
+  if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;
+    fddir->inode->lookup_cb = procfs_fd_lookup;
+  }
   return d;
 }
 

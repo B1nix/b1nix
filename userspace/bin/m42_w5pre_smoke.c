@@ -16,6 +16,7 @@
 #include <errno.h>
 #include <signal.h>
 #include <sys/resource.h>
+#include <sys/stat.h>
 #include <sys/wait.h>
 #include <fnmatch.h>
 #include <regex.h>
@@ -332,7 +333,10 @@ int main(void) {
     sigset_t current_mask;
     sigprocmask(0, NULL, &current_mask);
     char mask_buf[256];
-    snprintf(mask_buf, sizeof(mask_buf), "sigchld-on-exit: mask=%llu\n", (unsigned long long)current_mask);
+    /* sigset_t is opaque, so report the bit this test actually cares about
+     * rather than the raw word. */
+    snprintf(mask_buf, sizeof(mask_buf), "sigchld-on-exit: sigchld-blocked=%d\n",
+             sigismember(&current_mask, SIGCHLD));
     emit(mask_buf);
 
     g_sigchld_count = 0;
@@ -350,7 +354,9 @@ int main(void) {
     if (g_sigchld_count != 1) {
         char err_buf[256];
         sigprocmask(0, NULL, &current_mask);
-        snprintf(err_buf, sizeof(err_buf), "sigchld-on-exit: count=%d post_mask=%llu\n", g_sigchld_count, (unsigned long long)current_mask);
+        snprintf(err_buf, sizeof(err_buf),
+                 "sigchld-on-exit: count=%d post-sigchld-blocked=%d\n",
+                 g_sigchld_count, sigismember(&current_mask, SIGCHLD));
         emit(err_buf);
         fail("sigchld-on-exit");
         return 1;

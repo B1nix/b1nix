@@ -161,6 +161,8 @@ static struct posix_timer g_posix_timers[MAX_POSIX_TIMERS];
 static void posix_timers_tick(void); /* fire expired timers (defined below) */
 
 static u64  g_task_alarm_ticks[MAX_TASKS];
+/* setitimer(ITIMER_REAL) repeat period; 0 = one-shot (plain alarm(2)). */
+static u64  g_task_alarm_interval_ticks[MAX_TASKS];
 /* Set once the task has successfully execve()d. POSIX setpgid: changing a
  * CHILD's process group after it exec'd is EACCES. Deliberately NOT copied
  * by fork — the fresh child has not exec'd yet. */
@@ -170,6 +172,13 @@ static int  g_task_execed[MAX_TASKS];
 static int  g_task_nice[MAX_TASKS];
 static struct rlimit g_task_rlimits[MAX_TASKS][16];
 static usize g_task_tgid[MAX_TASKS];
+/* Set once a task has committed to scheduler_exit_current() with a chosen exit
+ * code. A sibling that processes its own SIGKILL re-posts SIGKILL to the whole
+ * thread group (terminate_group_siblings); without this guard the already-exiting
+ * leader would process that pending SIGKILL in scheduler_deliver_pending_signals
+ * and overwrite its exit_group(0) code with SIGNALED|SIGKILL, so waitpid reports
+ * a spurious signalled death (M29 stress-exit-code). */
+static u8    g_task_exiting[MAX_TASKS];
 static int   g_task_ctty_type[MAX_TASKS];
 static int   g_task_ctty_index[MAX_TASKS];
 static u64   g_task_utime[MAX_TASKS];
@@ -324,9 +333,11 @@ static struct task *find_unused_task(void) {
       g_task_altstack_size[i] = 0;
       rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
       g_task_alarm_ticks[i] = 0;
+      g_task_alarm_interval_ticks[i] = 0;
       g_task_execed[i] = 0;
       g_task_nice[i] = 0;
       g_task_fdlock_owner[i] = 0;
+      g_task_exiting[i] = 0;
       g_task_tgid[i] = 0;
       g_task_ctty_type[i] = 0;
       g_task_ctty_index[i] = 0;
@@ -371,6 +382,7 @@ static struct task *find_unused_task(void) {
   g_task_altstack_size[i] = 0;
   rt_state_free(i); /* M74: drop any RT-signal state from the prior occupant */
   g_task_alarm_ticks[i] = 0;
+      g_task_alarm_interval_ticks[i] = 0;
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
     g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -706,6 +718,7 @@ void scheduler_init(void) {
   g_task_altstack_sp[0] = 0;
   g_task_altstack_size[0] = 0;
   g_task_alarm_ticks[0] = 0;
+      g_task_alarm_interval_ticks[0] = 0;
   g_task_tgid[0] = boot->id;
   g_task_ctty_type[0] = 1; /* 1 = console */
   g_task_ctty_index[0] = 0;
@@ -908,6 +921,7 @@ static int kthread_create_impl(const char *name, kernel_thread_entry entry,
   }
 
   g_task_tgid[task_index(task)] = task->id;
+  g_task_exiting[task_index(task)] = 0;
   if (!stealable)
     task_init_cred(task);
 
@@ -1050,6 +1064,7 @@ int scheduler_fork_current(void) {
   g_task_altstack_sp[c_idx] = g_task_altstack_sp[p_idx];
   g_task_altstack_size[c_idx] = g_task_altstack_size[p_idx];
   g_task_alarm_ticks[c_idx] = 0;
+      g_task_alarm_interval_ticks[c_idx] = 0;
   g_task_nice[c_idx] = g_task_nice[p_idx]; /* POSIX: nice survives fork */
   g_task_tgid[c_idx] = child->id;          /* child is its own thread group leader */
   /* M63: the child inherits the parent's seccomp filter chain (shared,
@@ -1063,6 +1078,10 @@ int scheduler_fork_current(void) {
   for (int r = 0; r < 16; r++) {
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
   }
+  /* M92: inherit the parent's TLS (FS segment) base so the child can access
+   * thread-local storage immediately after fork. Without this, the child's
+   * FS base is 0 and any TLS access (e.g. musl's _Fork cleanup) crashes. */
+  g_task_tls_base[c_idx] = g_task_tls_base[p_idx];
 
   // Copy parent's kernel stack
   void *parent_stack = parent->stack;
@@ -1409,6 +1428,14 @@ u64 task_alarm_ticks(const struct task *t) {
   if (!t) return 0;
   return g_task_alarm_ticks[task_index(t)];
 }
+u64 task_alarm_interval_ticks(const struct task *t) {
+  if (!t) return 0;
+  return g_task_alarm_interval_ticks[task_index(t)];
+}
+void task_set_alarm_interval_ticks(struct task *t, u64 ticks) {
+  if (!t) return;
+  g_task_alarm_interval_ticks[task_index(t)] = ticks;
+}
 void task_set_alarm_ticks(struct task *t, u64 ticks) {
   if (!t) return;
   g_task_alarm_ticks[task_index(t)] = ticks;
@@ -1475,6 +1502,7 @@ struct clone_thread_args {
   u64 user_entry;
   u64 user_stack;
   u64 user_arg;
+  u64 start_func;  /* musl pthread: start_routine pointer for r9 */
 };
 
 extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
@@ -1484,7 +1512,17 @@ static void clone_thread_kentry(void *arg) {
   u64 entry = cta->user_entry;
   u64 stack = cta->user_stack;
   u64 user_arg = cta->user_arg;
+  u64 start_func = cta->start_func;
   kfree(cta);
+  if (start_func) {
+    /* M92 musl pthread: child continues at parent's RIP (after syscall in
+     * musl __clone), with the new user stack and r9 = start_routine. The
+     * x86_clone_thread_jump sets rax=0 (clone return value) and r9 =
+     * start_func, then iretqs to ring 3 at the parent's RIP. musl's child
+     * code then pops the arg from the stack and calls *r9. */
+    extern void x86_clone_thread_jump(u64 entry, u64 stack, u64 start_func);
+    x86_clone_thread_jump(entry, stack, start_func);
+  }
 #ifdef __x86_64__
   /* SysV AMD64: a function entered via `call` sees %rsp ≡ 8 (mod 16) — the
    * 8-byte return address sits just below a 16-byte-aligned call site, and the
@@ -1587,7 +1625,9 @@ static struct vfs_handle **fdtable_release(struct task *t, int **flags_out,
 int g_has_any_thread = 0;
 
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
-                           u64 tls, u64 ctid) {
+                           u64 tls, u64 ctid,
+                           u64 parent_tid_addr, u64 child_tid_addr,
+                           u64 start_func) {
   g_has_any_thread = 1;
   struct task *parent = current_task;
   if (!parent) return -EINVAL;
@@ -1603,6 +1643,7 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   cta->user_entry = entry;
   cta->user_stack = user_stack;
   cta->user_arg = arg;
+  cta->start_func = start_func;
 
   void *kstack = kmalloc(KERNEL_STACK_SIZE);
   if (!kstack) { kfree(cta); return -ENOMEM; }
@@ -1727,7 +1768,10 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
 
   /* M29 thread flags. */
   task_set_is_thread(child, 1);
-  task_set_tls_base(child, (flags & B1NIX_CLONE_SETTLS) ? tls : 0);
+  /* For fork (no CLONE_SETTLS), inherit the parent's TLS base so the child
+   * can access thread-local data (FS segment). Only set an explicit TLS base
+   * when CLONE_SETTLS is provided (pthread_create path). */
+  task_set_tls_base(child, (flags & B1NIX_CLONE_SETTLS) ? tls : task_tls_base(current_task));
   task_set_child_tid_clear(child,
                             (flags & B1NIX_CLONE_CHILD_CLEARTID) ? ctid : 0);
   /* M63: a cloned thread shares its creator's seccomp filter (same process). */
@@ -1764,6 +1808,18 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->state = TASK_READY;
   sched_rq_enqueue_current(child);
   interrupts_enable();
+
+  /* M92: CLONE_PARENT_SETTID — write child TID to parent's location.
+   * CLONE_CHILD_SETTID — write child TID to child's location (in its address
+   * space). Both are needed by musl pthread_create for pthread_join. */
+  if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr) {
+    /* parent_tid_addr is in the parent's address space (same mm for threads). */
+    syscall_copyout((void *)(usize)parent_tid_addr, &child->id, sizeof(u32));
+  }
+  if ((flags & B1NIX_CLONE_CHILD_SETTID) && child_tid_addr) {
+    /* child_tid_addr is in the child's address space (same mm for threads). */
+    syscall_copyout((void *)(usize)child_tid_addr, &child->id, sizeof(u32));
+  }
 
   return (int)child->id;
 }
@@ -2324,7 +2380,11 @@ void scheduler_on_timer_tick(void) {
 
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED && g_task_alarm_ticks[i] != 0 && g_task_alarm_ticks[i] <= scheduler_ticks) {
-      g_task_alarm_ticks[i] = 0;
+      /* Interval timer (setitimer ITIMER_REAL) re-arms itself; a plain
+       * alarm(2) is one-shot. */
+      g_task_alarm_ticks[i] = g_task_alarm_interval_ticks[i]
+                                  ? scheduler_ticks + g_task_alarm_interval_ticks[i]
+                                  : 0;
       scheduler_kill(T(i)->id, SIGALRM);
     }
   }
@@ -2418,6 +2478,12 @@ static void terminate_group_siblings(struct task *t) {
   for (usize i = 0; i < g_task_hwm; i++) {
     struct task *sibling = T(i);
     if (sibling->state != TASK_UNUSED && sibling != t && g_task_tgid[i] == tgid) {
+      /* Skip a sibling that has already committed to exiting with its own code
+       * (scheduler_exit_group/exit_current). Re-posting SIGKILL to it would let
+       * its own signal-delivery pass overwrite that code with SIGNALED|SIGKILL,
+       * so waitpid reports a spurious signalled death (M29 stress-exit-code). */
+      if (g_task_exiting[i])
+        continue;
       /* Post SIGKILL to sibling */
       __atomic_fetch_or(&sibling->pending_signals, (1ULL << (SIGKILL - 1)), __ATOMIC_RELEASE);
       /* Wake them if they are blocked/sleeping/stopped. Use a per-state CAS,
@@ -2479,6 +2545,12 @@ void scheduler_exit_group(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_group without current task");
   }
+  /* Mark exiting BEFORE killing siblings: a sibling that processes its SIGKILL
+   * calls terminate_group_siblings() and would otherwise re-post SIGKILL back to
+   * this (already-exiting) leader, clobbering our exit_group() code with a
+   * spurious SIGNALED status (M29 stress-exit-code). terminate_group_siblings
+   * skips tasks whose g_task_exiting flag is set. */
+  g_task_exiting[task_index(current_task)] = 1;
   u64 flags = interrupts_save();
   terminate_group_siblings(current_task);
   interrupts_restore(flags);
@@ -2489,6 +2561,11 @@ void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
   }
+
+  /* Commit to exiting with this code: block scheduler_deliver_pending_signals
+   * from later re-routing us through the SIGKILL path and clobbering exit_code
+   * (M29 stress-exit-code — a sibling's SIGKILL-back races our exit_group(0)). */
+  g_task_exiting[task_index(current_task)] = 1;
 
   /* If process leader exits, or crash/signal exit, terminate siblings first */
   if (g_task_tgid[task_index(current_task)] == current_task->id ||
@@ -4023,11 +4100,17 @@ u64 vm_find_free_area(struct task *t, usize length) {
   u64 end = 0x80000000ULL;
 #endif
 
-  // Simple first-fit hole finding
+  // Simple first-fit hole finding.
+  // The VMA list is in reverse-insertion order (not sorted by address),
+  // so skip any VMA that ends at or before current_addr.
   u64 current_addr = start;
   struct vm_area *vma = t->vma_list;
 
   while (vma) {
+    if (vma->end <= current_addr) {
+      vma = vma->next;
+      continue;
+    }
     if (vma->start >= current_addr + length) {
       return current_addr;
     }

@@ -12,7 +12,7 @@ CPORT_ARCHIVE=libfreetype.a
 VER="${FT_VERSION:-2.13.2}"
 CPORT_SRCNAME="freetype-${VER}"
 CPORT_TARBALL="freetype-${VER}.tar.gz"
-CPORT_URL="https://download.savannah.gnu.org/releases/freetype/freetype-${VER}.tar.gz"
+CPORT_URL="https://download-mirror.savannah.gnu.org/releases/freetype/freetype-${VER}.tar.gz"
 # The smooth rasterizer's SSE2 fast path needs <emmintrin.h>; force generic.
 PATCHES="freetype/no-sse2.sh"
 

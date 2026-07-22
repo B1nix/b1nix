@@ -347,6 +347,84 @@ static isize sys_write(int fd, const void *buf, usize count) {
   return total_written;
 }
 
+/* writev(fd, iov, iovcnt) — scatter write. iov is a userspace array of
+ * {void *iov_base, size_t iov_len} pairs. */
+struct b1nix_iovec { void *iov_base; usize iov_len; };
+#define UIO_MAXIOV 1024
+
+static isize sys_writev(int fd, const struct b1nix_iovec *uiov, int iovcnt) {
+  if (iovcnt < 0 || iovcnt > UIO_MAXIOV)
+    return -EINVAL;
+  if (iovcnt == 0)
+    return 0;
+
+  isize total = 0;
+  char kbuf[4096];
+  for (int i = 0; i < iovcnt; i++) {
+    struct b1nix_iovec iov;
+    if (copy_from_user(&iov, uiov + i, sizeof(iov)) < 0)
+      return total > 0 ? total : -EFAULT;
+    const char *base = (const char *)iov.iov_base;
+    usize len = iov.iov_len;
+    if (len == 0)
+      continue;
+
+    while (len > 0) {
+      usize chunk = len > sizeof(kbuf) ? sizeof(kbuf) : len;
+      if (copy_from_user(kbuf, base, chunk) < 0)
+        return total > 0 ? total : -EFAULT;
+      isize res = vfs_write(fd, kbuf, chunk);
+      if (res < 0)
+        return total > 0 ? total : res;
+      if (res == 0)
+        return total;
+      total += res;
+      base += res;
+      len -= (usize)res;
+      if (res < (isize)chunk)
+        return total;
+    }
+  }
+  return total;
+}
+
+/* readv(fd, iov, iovcnt) — scatter read. Mirrors writev logic. */
+static isize sys_readv(int fd, const struct b1nix_iovec *uiov, int iovcnt) {
+  if (iovcnt < 0 || iovcnt > UIO_MAXIOV)
+    return -EINVAL;
+  if (iovcnt == 0)
+    return 0;
+
+  isize total = 0;
+  char kbuf[4096];
+  for (int i = 0; i < iovcnt; i++) {
+    struct b1nix_iovec iov;
+    if (copy_from_user(&iov, uiov + i, sizeof(iov)) < 0)
+      return total > 0 ? total : -EFAULT;
+    char *base = (char *)iov.iov_base;
+    usize len = iov.iov_len;
+    if (len == 0)
+      continue;
+
+    while (len > 0) {
+      usize chunk = len > sizeof(kbuf) ? sizeof(kbuf) : len;
+      isize res = vfs_read(fd, kbuf, chunk);
+      if (res < 0)
+        return total > 0 ? total : res;
+      if (res == 0)
+        return total;
+      if (copy_to_user(base, kbuf, (usize)res) < 0)
+        return total > 0 ? total : -EFAULT;
+      total += res;
+      base += res;
+      len -= (usize)res;
+      if (res < (isize)chunk)
+        return total;
+    }
+  }
+  return total;
+}
+
 /* M73: shared fd→fd byte pump backing sendfile/copy_file_range/splice. Reads up
  * to `count` bytes from in_fd and writes them to out_fd through a kernel bounce
  * buffer. When *in_off / *out_off is provided the transfer starts there and the
@@ -753,6 +831,64 @@ static u64 sys_execve(const char *user_path, const char **user_argv,
   return res;
 }
 
+/* execveat(dirfd, path, argv, envp, flags) — Linux nr 322. b1nix needs this for
+ * musl fexecve(): musl first tries execveat(fd, "", ..., AT_EMPTY_PATH) and only
+ * falls back to execing /proc/self/fd/N if that returns ENOSYS. Dropbear re-execs
+ * itself per connection via fexecve; without a working execveat the re-exec fails
+ * (EBADF) and the SSH session command never runs. */
+static u64 sys_execveat(int dirfd, const char *user_path, const char **user_argv,
+                        const char **user_envp, int flags) {
+  char resolved[VFS_MAX_PATH];
+
+  if (flags & AT_EMPTY_PATH) {
+    /* The program to run IS the file already open at dirfd; user_path is empty.
+     * Recover its path from the fd and exec that. */
+    struct vfs_handle *h = scheduler_fd_get(dirfd);
+    if (!h || !h->used || h->kind != VFS_HANDLE_NODE || !h->node)
+      return (u64)-EBADF;
+    if (vfs_get_node_path(h->node, resolved, VFS_MAX_PATH) < 0)
+      return (u64)-EBADF;
+  } else {
+    char kpath[VFS_MAX_PATH];
+    if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0)
+      return (u64)-EFAULT;
+    kpath[VFS_MAX_PATH - 1] = '\0';
+    if (kpath[0] == '\0')
+      return (u64)-ENOENT;
+    if (kpath[0] != '/' && dirfd != AT_FDCWD) {
+      /* dirfd-relative: join the directory fd's path with the relative path. */
+      struct vfs_handle *h = scheduler_fd_get(dirfd);
+      if (!h || !h->used || h->kind != VFS_HANDLE_NODE || !h->node)
+        return (u64)-EBADF;
+      char dir[VFS_MAX_PATH];
+      if (vfs_get_node_path(h->node, dir, VFS_MAX_PATH) < 0)
+        return (u64)-EBADF;
+      char joined[VFS_MAX_PATH];
+      snprintf(joined, sizeof(joined), "%s/%s", dir, kpath);
+      vfs_resolve_path(joined, resolved);
+    } else {
+      vfs_resolve_path(kpath, resolved);
+    }
+    if (resolved[0] == '\0')
+      return (u64)-ENOENT;
+  }
+
+  char **kargv = copy_user_array(user_argv);
+  if (IS_ERR(kargv))
+    return (u64)PTR_ERR(kargv);
+  char **kenvp = copy_user_array(user_envp);
+  if (IS_ERR(kenvp)) {
+    free_kernel_array(kargv);
+    return (u64)PTR_ERR(kenvp);
+  }
+
+  u64 res = (u64)user_execve_current(resolved, (const char **)kargv,
+                                     (const char **)kenvp);
+  free_kernel_array(kargv);
+  free_kernel_array(kenvp);
+  return res;
+}
+
 static u64 sys_ioctl(int fd, u64 request, void *arg) {
   return (u64)vfs_ioctl(fd, request, arg);
 }
@@ -976,6 +1112,51 @@ static isize sys_utime(const char *user_path, u64 atime, u64 mtime) {
   vfs_resolve_path(kpath, resolved);
   kfree(kpath);
 
+  return vfs_utime(resolved, atime, mtime);
+}
+
+/* Linux utimes(2) / utimensat(2) → vfs_utime. utimes passes struct timeval[2]
+ * (sec/usec), utimensat struct timespec[2] (sec/nsec) with the UTIME_NOW /
+ * UTIME_OMIT nsec sentinels. Only AT_FDCWD (or an absolute path) is resolvable
+ * — same restriction as sys_statx above. */
+#define LX_UTIME_NOW 0x3fffffffL
+#define LX_UTIME_OMIT 0x3ffffffeL
+static isize sys_linux_utimensat(int dirfd, const char *user_path,
+                                 u64 times_ptr, int is_nsec) {
+  char kpath[VFS_MAX_PATH];
+  if (!user_path)
+    return -EINVAL; /* futimens (path-less) form not supported */
+  if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+    return -EFAULT;
+  if (dirfd != AT_FDCWD && kpath[0] != '/')
+    return -EBADF;
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+
+  u64 now = vfs_get_unix_time();
+  u64 atime = now, mtime = now;
+  if (times_ptr) {
+    u64 tv[4]; /* [0]=a.sec [1]=a.frac [2]=m.sec [3]=m.frac */
+    if (syscall_copyin(tv, (void *)(usize)times_ptr, sizeof(tv)) < 0)
+      return -EFAULT;
+    atime = tv[0];
+    mtime = tv[2];
+    if (is_nsec) {
+      if (tv[1] == LX_UTIME_NOW)
+        atime = now;
+      if (tv[3] == LX_UTIME_NOW)
+        mtime = now;
+      if (tv[1] == LX_UTIME_OMIT || tv[3] == LX_UTIME_OMIT) {
+        struct b1nix_stat st;
+        if (vfs_stat(resolved, &st) == 0) {
+          if (tv[1] == LX_UTIME_OMIT)
+            atime = st.st_atim.tv_sec;
+          if (tv[3] == LX_UTIME_OMIT)
+            mtime = st.st_mtim.tv_sec;
+        }
+      }
+    }
+  }
   return vfs_utime(resolved, atime, mtime);
 }
 
@@ -1758,9 +1939,12 @@ static int select_poll_signal_pending(void) {
 }
 
 static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
-  struct b1nix_pollfd fds[16];
-  if (nfds > 16)
-    nfds = 16;
+  /* 64: displayd alone polls 4 + MAX_CLIENTS(32) = 36 fds; the old cap of 16
+   * silently dropped the tail of the array (those fds were never polled and
+   * their revents never written back). */
+  struct b1nix_pollfd fds[64];
+  if (nfds > 64)
+    nfds = 64;
   if (syscall_copyin(fds, user_fds, nfds * sizeof(struct b1nix_pollfd)) < 0)
     return -EFAULT;
 
@@ -2149,6 +2333,24 @@ static u64 sys_listen(int fd, int backlog) {
 /* M57: socketpair(domain, type, protocol, int sv[2]). Allocates the two fds in
  * the kernel, then copies them out; on copyout failure both are closed so no
  * descriptor leaks into a process that never learns its number. */
+/* Remap the b1nix signal number embedded in a wait status word to the Linux
+ * numbering for a Linux-personality waiter. Termination: signal in bits 0-6;
+ * stopped: ((sig<<8)|0x7f). 0xffff (continued) and plain exit statuses pass
+ * through unchanged. Without the stopped-case remap, musl's WSTOPSIG saw
+ * b1nix SIGTTIN (17) where it expected Linux SIGTTIN (21). */
+static int wait_status_to_linux(int kstatus) {
+  if ((kstatus & 0xff) == 0x7f && kstatus != 0xffff) {
+    int linux_sig = b1nix_signo_to_linux((kstatus >> 8) & 0xff);
+    if (linux_sig > 0)
+      return (linux_sig << 8) | 0x7f;
+  } else if ((kstatus & 0x7f) != 0 && kstatus != 0xffff) {
+    int linux_sig = b1nix_signo_to_linux(kstatus & 0x7f);
+    if (linux_sig > 0)
+      return (kstatus & ~0x7f) | linux_sig;
+  }
+  return kstatus;
+}
+
 static u64 sys_socketpair(int domain, int type, int protocol, int *user_sv) {
   if (!user_sv)
     return (u64)-EFAULT;
@@ -2164,21 +2366,52 @@ static u64 sys_socketpair(int domain, int type, int protocol, int *user_sv) {
   return 0;
 }
 
+/* socklen_t width differs by personality: Linux/musl socklen_t is 4 bytes,
+ * b1nix's native libc used a pointer-sized usize. Copying 8 bytes for a Linux
+ * binary reads 4 bytes of garbage into the length AND — far worse — the
+ * write-back stomps the 4 bytes NEXT TO the caller's socklen_t (libcurl kept a
+ * struct pointer there: nsfb crashed with a non-canonical hash pointer in
+ * Curl_multi_will_close after getpeername mangled it). */
+static int socklen_is_u32(void) {
+  struct task *t = current_task;
+  return t && t->user_image &&
+         ((struct user_loaded_image *)t->user_image)->personality ==
+             PERSONALITY_LINUX;
+}
+static int socklen_copyin(usize *klen, const void *user) {
+  if (socklen_is_u32()) {
+    u32 v = 0;
+    if (syscall_copyin(&v, user, sizeof(v)) < 0)
+      return -1;
+    *klen = v;
+    return 0;
+  }
+  return syscall_copyin(klen, user, sizeof(usize)) < 0 ? -1 : 0;
+}
+static int socklen_copyout(void *user, usize klen) {
+  if (socklen_is_u32()) {
+    u32 v = (u32)klen;
+    return syscall_copyout(user, &v, sizeof(v)) < 0 ? -1 : 0;
+  }
+  return syscall_copyout(user, &klen, sizeof(usize)) < 0 ? -1 : 0;
+}
+
 static u64 sys_accept(int fd, void *addr, usize *addrlen) {
   /*addrlen is both in and out */
   usize k_addrlen = 0;
   if (addrlen) {
-    if (syscall_copyin(&k_addrlen, addrlen, sizeof(usize)) != 0) return (u64)-EFAULT;
+    if (socklen_copyin(&k_addrlen, addrlen) != 0) return (u64)-EFAULT;
   }
 
   char k_addr[128]; /* enough for sockaddr_un */
   int res = vfs_accept(fd, k_addr, &k_addrlen);
   if (res >= 0) {
     if (addr && k_addrlen > 0) {
+      if (k_addrlen > sizeof(k_addr)) k_addrlen = sizeof(k_addr);
       if (syscall_copyout(addr, k_addr, k_addrlen) != 0) return (u64)-EFAULT;
     }
     if (addrlen) {
-      if (syscall_copyout(addrlen, &k_addrlen, sizeof(usize)) != 0) return (u64)-EFAULT;
+      if (socklen_copyout(addrlen, k_addrlen) != 0) return (u64)-EFAULT;
     }
   }
   return (u64)res;
@@ -2199,7 +2432,7 @@ static u64 sys_getsockopt(int fd, int level, int optname, void *user_optval,
   usize klen = 0;
   if (!user_optlen)
     return (u64)-EINVAL;
-  if (syscall_copyin(&klen, user_optlen, sizeof(usize)) < 0)
+  if (socklen_copyin(&klen, user_optlen) != 0)
     return (u64)-EFAULT;
   u8 kopt[64];
   if (klen == 0 || klen > sizeof(kopt))
@@ -2209,7 +2442,7 @@ static u64 sys_getsockopt(int fd, int level, int optname, void *user_optval,
     return (u64)rc;
   if (user_optval && klen > 0 && syscall_copyout(user_optval, kopt, klen) < 0)
     return (u64)-EFAULT;
-  if (syscall_copyout(user_optlen, &klen, sizeof(usize)) < 0)
+  if (socklen_copyout(user_optlen, klen) != 0)
     return (u64)-EFAULT;
   return 0;
 }
@@ -2219,7 +2452,7 @@ static u64 sys_getsockaddr(int fd, void *user_addr, usize *user_addrlen,
   usize klen = 0;
   if (!user_addrlen)
     return (u64)-EINVAL;
-  if (syscall_copyin(&klen, user_addrlen, sizeof(usize)) < 0)
+  if (socklen_copyin(&klen, user_addrlen) != 0)
     return (u64)-EFAULT;
   char kaddr[128];
   if (klen > sizeof(kaddr))
@@ -2231,7 +2464,7 @@ static u64 sys_getsockaddr(int fd, void *user_addr, usize *user_addrlen,
   usize out = klen < sizeof(kaddr) ? klen : sizeof(kaddr);
   if (user_addr && out > 0 && syscall_copyout(user_addr, kaddr, out) < 0)
     return (u64)-EFAULT;
-  if (syscall_copyout(user_addrlen, &klen, sizeof(usize)) < 0)
+  if (socklen_copyout(user_addrlen, klen) != 0)
     return (u64)-EFAULT;
   return 0;
 }
@@ -2471,6 +2704,27 @@ static isize sys_munmap(void *addr, usize length) {
   vma_delete_range(t, start, end);
 
   return 0;
+}
+
+/* Serialize the address-space mutators (mmap / munmap / mprotect) across all
+ * threads of every process. The VMA list is a raw singly-linked list shared by
+ * every CLONE_VM thread (child->vma_list = parent->vma_list), and none of the
+ * mutators locked it: two threads mutating it at once — classically a musl
+ * detached thread freeing its own stack (munmap) while the parent starts the
+ * next pthread_create (mmap of a fresh stack) — corrupted the next-pointers and
+ * hung the following list walk (vm_find_free_area) forever. This is a coarse
+ * sleeping mutex (a busy-flag with scheduler_yield, so a mutator may still block
+ * on frame reclaim / writeback while holding it): mmap is not a hot path, and
+ * correctness beats the lost parallelism. The page-fault handler intentionally
+ * does NOT take it — it only reads the list, the pre-existing read/write race is
+ * unchanged, and taking a yielding lock in the fault path is unsafe. */
+static volatile int g_vma_mutex;
+static void vma_mutator_lock(void) {
+  while (__sync_lock_test_and_set(&g_vma_mutex, 1))
+    scheduler_yield();
+}
+static void vma_mutator_unlock(void) {
+  __sync_lock_release(&g_vma_mutex);
 }
 
 static isize sys_mprotect(void *addr, usize length, int prot) {
@@ -2854,6 +3108,20 @@ u64 syscall_dispatch_impl(u64 number, u64 arg0, u64 arg1, u64 arg2, u64 arg3,
   u64 ret = syscall_dispatch_impl_inner(number, arg0, arg1, arg2, arg3, arg4, arg5, frame);
 
   if (frame) {
+    if (klog_debug_enabled("signal") && current_task &&
+        current_task->user_image &&
+        ((struct user_loaded_image *)current_task->user_image)->personality ==
+            PERSONALITY_LINUX &&
+        (number == 39 || number == LINUX_NR_RT_SIGACTION)) {
+      char sigbuf[160];
+      snprintf(sigbuf, sizeof(sigbuf),
+               "return task=%s pid=%u nr=%llu rip=%p rsp=%p ret=%p",
+               current_task->name ? current_task->name : "?",
+               (unsigned)current_task->id, (unsigned long long)number,
+               (void *)(usize)frame->rip, (void *)(usize)frame->rsp,
+               (void *)(usize)ret);
+      klog_debug_category("signal", sigbuf);
+    }
     if (ret == (u64)-ERESTARTSYS) {
       u64 pending = __atomic_load_n(&current_task->pending_signals,
                                     __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
@@ -2944,6 +3212,121 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)sys_linux_arch_prctl(arg0, arg1);
       if (number == LINUX_NR_RT_SIGPROCMASK)
         return (u64)sys_linux_rt_sigprocmask((int)arg0, arg1, arg2);
+      /* rt_sigsuspend(130): the wait mask uses Linux signal numbering. Translate
+       * it to b1nix numbering, repack into the caller's own buffer (sys_sigsuspend
+       * copies the mask back in from user space), then run the native suspend. */
+      if (number == 130) {
+        if (!arg0)
+          return (u64)-EFAULT;
+        u64 lx_mask = 0;
+        if (syscall_copyin(&lx_mask, (void *)(usize)arg0, sizeof(lx_mask)) < 0)
+          return (u64)-EFAULT;
+        u64 b_mask = linux_sigset_to_b1nix(lx_mask);
+        if (syscall_copyout((void *)(usize)arg0, &b_mask, sizeof(b_mask)) < 0)
+          return (u64)-EFAULT;
+        return sys_sigsuspend((const u64 *)(usize)arg0);
+      }
+      /* select(23)/pselect6(270): Linux passes a `struct timeval *` (select)
+       * or `struct timespec *` (pselect6) as the timeout, but SYS_SELECT wants
+       * an integer millisecond count (NULL => wait forever == (u64)-1). The
+       * fd-set/nfds args already line up, so convert the timeout in place and
+       * fall through to the table remap -> SYS_SELECT. pselect6's sigmask
+       * (arg5) is not yet honored. */
+      if (number == 23 || number == 270) {
+        if (arg4 == 0) {
+          arg4 = (u64)-1;
+        } else {
+          long tv[2] = {0, 0};
+          if (syscall_copyin(tv, (void *)(usize)arg4, sizeof(tv)) < 0)
+            return (u64)-EFAULT;
+          arg4 = (number == 23)
+                     ? (u64)tv[0] * 1000 + (u64)tv[1] / 1000    /* usec */
+                     : (u64)tv[0] * 1000 + (u64)tv[1] / 1000000; /* nsec */
+        }
+      }
+      /* fcntl(72) F_GETFL/F_SETFL: the status-flag VALUES differ between the
+       * ABIs (Linux O_NONBLOCK=0x800 collides with b1nix O_CLOEXEC=0x800;
+       * b1nix O_NONBLOCK=0x4000). Without this, musl code doing
+       * fcntl(fd, F_SETFL, O_NONBLOCK) silently set CLOEXEC and left the fd
+       * BLOCKING — displayd's client sockets stayed blocking and one silent
+       * client froze the whole compositor in recvmsg. */
+      if (number == 72 &&
+          ((int)arg1 == B1NIX_F_SETFL || (int)arg1 == B1NIX_F_GETFL)) {
+        if ((int)arg1 == B1NIX_F_SETFL) {
+          u64 b = 0;
+          if (arg2 & 0x400) b |= B1NIX_O_APPEND;
+          if (arg2 & 0x800) b |= B1NIX_O_NONBLOCK;
+          return (u64)sys_fcntl((int)arg0, B1NIX_F_SETFL, b);
+        }
+        u64 b = (u64)sys_fcntl((int)arg0, B1NIX_F_GETFL, 0);
+        if ((isize)b < 0)
+          return b;
+        u64 lx = b & 3; /* access mode */
+        if (b & B1NIX_O_APPEND) lx |= 0x400;
+        if (b & B1NIX_O_NONBLOCK) lx |= 0x800;
+        return lx;
+      }
+      /* setitimer(38) / getitimer(36), ITIMER_REAL only — backed by the task
+       * alarm (100 Hz ticks) plus a repeat interval so periodic SIGALRM works
+       * (busybox ping's send loop). ITIMER_VIRTUAL/PROF are not implemented. */
+      if (number == 38 || number == 36) {
+        struct lx_itimerval {
+          u64 int_sec, int_usec, val_sec, val_usec;
+        } itv;
+        if ((int)arg0 != 0) /* ITIMER_REAL */
+          return (u64)-EINVAL;
+        u64 now = scheduler_get_uptime_ticks();
+        if (number == 36) { /* getitimer(which, curr) */
+          memset(&itv, 0, sizeof(itv));
+          u64 dl = task_alarm_ticks(current_task);
+          if (dl > now) {
+            itv.val_sec = (dl - now) / 100;
+            itv.val_usec = ((dl - now) % 100) * 10000;
+          }
+          u64 iv = task_alarm_interval_ticks(current_task);
+          itv.int_sec = iv / 100;
+          itv.int_usec = (iv % 100) * 10000;
+          if (arg1 &&
+              syscall_copyout((void *)(usize)arg1, &itv, sizeof(itv)) < 0)
+            return (u64)-EFAULT;
+          return 0;
+        }
+        /* setitimer(which, new, old) */
+        struct lx_itimerval old;
+        memset(&old, 0, sizeof(old));
+        u64 odl = task_alarm_ticks(current_task);
+        if (odl > now) {
+          old.val_sec = (odl - now) / 100;
+          old.val_usec = ((odl - now) % 100) * 10000;
+        }
+        u64 oiv = task_alarm_interval_ticks(current_task);
+        old.int_sec = oiv / 100;
+        old.int_usec = (oiv % 100) * 10000;
+        if (!arg1)
+          return (u64)-EFAULT;
+        if (syscall_copyin(&itv, (void *)(usize)arg1, sizeof(itv)) < 0)
+          return (u64)-EFAULT;
+        u64 val_ticks = itv.val_sec * 100 + itv.val_usec / 10000;
+        u64 int_ticks = itv.int_sec * 100 + itv.int_usec / 10000;
+        if ((itv.val_sec || itv.val_usec) && val_ticks == 0)
+          val_ticks = 1; /* round a sub-tick value up, not to "disarmed" */
+        if ((itv.int_sec || itv.int_usec) && int_ticks == 0)
+          int_ticks = 1;
+        task_set_alarm_interval_ticks(current_task, val_ticks ? int_ticks : 0);
+        task_set_alarm_ticks(current_task, val_ticks ? now + val_ticks : 0);
+        if (arg2 &&
+            syscall_copyout((void *)(usize)arg2, &old, sizeof(old)) < 0)
+          return (u64)-EFAULT;
+        return 0;
+      }
+      /* utimes(235): (path, struct timeval[2]); utimensat(280): (dirfd, path,
+       * struct timespec[2], flags). */
+      if (number == 235)
+        return (u64)sys_linux_utimensat(AT_FDCWD, (const char *)(usize)arg0,
+                                        arg1, 0);
+      if (number == 280)
+        return (u64)sys_linux_utimensat((int)arg0, (const char *)(usize)arg1,
+                                        arg2, 1);
       /* tkill(tid, sig) / tgkill(tgid, tid, sig): b1nix has no thread-kill, but
        * its tids are task ids, so target the tid directly via scheduler_kill
        * (for a single-threaded process tid == pid). Remap the signo. */
@@ -2953,16 +3336,923 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == LINUX_NR_TGKILL)
         return (u64)scheduler_kill((usize)arg1,
                                    linux_signo_to_b1nix((int)arg2));
+      /* waitid(247): idtype/id/options values match b1nix, but the siginfo
+       * layouts differ (b1nix packs 6 ints; Linux is a 128-byte struct with
+       * si_errno/si_code swapped and the CLD fields at offset 16). Let
+       * scheduler_waitid write its b1nix siginfo into the user's (larger)
+       * buffer, read it back, and rewrite it in the Linux layout. */
+      if (number == 247) {
+        int wr = scheduler_waitid((idtype_t)arg0, (usize)arg1,
+                                  (siginfo_t *)(usize)arg2, (int)arg3);
+        if (wr < 0)
+          return (u64)wr;
+        if (arg2) {
+          siginfo_t ki;
+          if (syscall_copyin(&ki, (void *)(usize)arg2, sizeof(ki)) < 0)
+            return (u64)-EFAULT;
+          u8 lx[128];
+          memset(lx, 0, sizeof(lx));
+          *(i32 *)&lx[0] = b1nix_signo_to_linux(ki.si_signo);
+          *(i32 *)&lx[4] = ki.si_errno;
+          *(i32 *)&lx[8] = ki.si_code;
+          *(i32 *)&lx[16] = ki.si_pid;
+          *(i32 *)&lx[20] = ki.si_uid;
+          *(i32 *)&lx[24] = ki.si_status;
+          if (syscall_copyout((void *)(usize)arg2, lx, sizeof(lx)) < 0)
+            return (u64)-EFAULT;
+        }
+        return (u64)wr;
+      }
+      /* prlimit64(302): (pid, resource, new, old) — self only. RLIMIT_*
+       * numbers and struct rlimit {u64 cur, max} match Linux. musl routes
+       * both getrlimit and setrlimit through here. */
+      if (number == 302) {
+        if (arg0 != 0 && arg0 != (u64)scheduler_get_pid())
+          return (u64)-EPERM;
+        if (arg3) {
+          isize gr = sys_getrlimit((int)arg1, (struct rlimit *)(usize)arg3);
+          if (gr < 0)
+            return (u64)gr;
+        }
+        if (arg2)
+          return (u64)sys_setrlimit((int)arg1,
+                                    (const struct rlimit *)(usize)arg2);
+        return 0;
+      }
+      /* SysV shm (shmget 29 / shmat 30 / shmctl 31 / shmdt 67): argument
+       * layouts and IPC_RMID/SET/STAT values match; only shmget's create
+       * flag BITS differ (Linux IPC_CREAT=0x200, IPC_EXCL=0x400 vs b1nix
+       * 0x1000/0x2000). */
+      if (number == 29) {
+        u64 f = arg2 & 0777;
+        if (arg2 & 0x200) f |= IPC_CREAT;
+        if (arg2 & 0x400) f |= IPC_EXCL;
+        return (u64)shmget((u32)arg0, (usize)arg1, (int)f);
+      }
+      /* POSIX mq (musl): mq_open(240), mq_unlink(241), mq_timedsend(242),
+       * mq_timedreceive(243). b1nix mqds are small table indices that would
+       * collide with real fds once musl close()es the mqd, so hand userspace
+       * mqd+LXMQ_BASE and strip it on the way back in. */
+#define LXMQ_BASE 0x100000
+      if (number == 240 || number == 241) {
+        char mqname[64];
+        if (syscall_copyinstr(mqname, sizeof(mqname),
+                              (const char *)(usize)arg0) < 0)
+          return (u64)-EFAULT;
+        if (number == 241)
+          return (u64)mqueue_unlink(mqname);
+        int mqd = mqueue_create(mqname);
+        return mqd < 0 ? (u64)mqd : (u64)(mqd + LXMQ_BASE);
+      }
+      if (number == 242 || number == 243) {
+        int mqd = (int)arg0 - LXMQ_BASE;
+        if (mqd < 0 || mqd >= MQ_MAX_QUEUES)
+          return (u64)-EBADF;
+        char kbuf[MQ_MAX_MSG_SIZE];
+        if (number == 242) { /* mq_timedsend(mqd, ptr, len, prio, abstime) */
+          if (arg2 > MQ_MAX_MSG_SIZE)
+            return (u64)-EMSGSIZE;
+          if (syscall_copyin(kbuf, (const void *)(usize)arg1, (usize)arg2) < 0)
+            return (u64)-EFAULT;
+          return (u64)mqueue_send(mqd, kbuf, (u32)arg2);
+        }
+        u32 klen = 0; /* mq_timedreceive(mqd, ptr, maxlen, prio*, abstime) */
+        int mrc = mqueue_receive(mqd, kbuf, &klen);
+        if (mrc < 0)
+          return (u64)mrc;
+        if (klen > arg2)
+          return (u64)-EMSGSIZE;
+        if (syscall_copyout((void *)(usize)arg1, kbuf, klen) < 0)
+          return (u64)-EFAULT;
+        /* Report the message priority (b1nix mqueues are FIFO, so 0). musl's
+         * mq_receive passes msg_prio through as arg3 and expects it filled. */
+        if (arg3) {
+          u32 prio = 0;
+          if (syscall_copyout((void *)(usize)arg3, &prio, sizeof(prio)) < 0)
+            return (u64)-EFAULT;
+        }
+        return (u64)klen;
+      }
+      if (number == 3 && arg0 >= LXMQ_BASE &&
+          arg0 < LXMQ_BASE + MQ_MAX_QUEUES) {
+        mqueue_close((int)(arg0 - LXMQ_BASE));
+        return 0;
+      }
+      /* getpriority(140)/setpriority(141): Linux prepends a `which` argument
+       * (PRIO_PROCESS=0 only here) and getpriority returns 20-nice so the
+       * result is never negative; musl converts it back with 20-ret. */
+      if (number == 141) {
+        if ((int)arg0 != 0)
+          return (u64)-EINVAL;
+        usize pid = arg1 ? (usize)arg1 : scheduler_get_pid();
+        return (u64)scheduler_set_priority(pid, (int)arg2);
+      }
+      if (number == 140) {
+        if ((int)arg0 != 0)
+          return (u64)-EINVAL;
+        usize pid = arg1 ? (usize)arg1 : scheduler_get_pid();
+        /* scheduler_get_priority already returns the Linux 20-nice encoding
+         * (1..40, or a negative errno); musl converts it back with 20-ret.
+         * Do NOT apply a second 20- here — that double conversion made
+         * getpriority report 20 for a nice-0 task. */
+        return (u64)(isize)scheduler_get_priority(pid);
+      }
+      /* M74 rt_sigqueueinfo(129)(pid, sig, siginfo*): musl sigqueue(3). The
+       * payload sits in the Linux siginfo at si_value (offset 24 on x86_64).
+       * Extract it, translate the signal, and queue it with the payload so an
+       * SA_SIGINFO handler observes si_value. */
+      if (number == 129) {
+        int b = linux_signo_to_b1nix((int)arg1);
+        if (b <= 0)
+          return (u64)-EINVAL;
+        union sigval v;
+        v.sival_ptr = 0;
+        if (arg2) {
+          u64 sv = 0;
+          if (syscall_copyin(&sv, (void *)(usize)(arg2 + 24), sizeof(sv)) < 0)
+            return (u64)-EFAULT;
+          v.sival_ptr = (void *)(usize)sv;
+        }
+        if (b >= SIGRTMIN && b <= SIGRTMAX)
+          return (u64)scheduler_sigqueue((usize)arg0, b, v, B1NIX_SI_QUEUE);
+        return (u64)scheduler_kill((usize)arg0, b);
+      }
+      /* M74 timer_create(222)(clockid, sigevent*, timer_t*): the Linux sigevent
+       * layout is { union sigval value; int signo; int notify; ... } — different
+       * field order from b1nix. Translate the signal to b1nix numbering, then
+       * drive the native timer path. Only SIGEV_SIGNAL(0) is supported. */
+      if (number == 222) {
+        if (!arg1 || !arg2)
+          return (u64)-EINVAL;
+        struct lx_sigevent {
+          union sigval value;
+          int signo;
+          int notify;
+        } lsev;
+        if (syscall_copyin(&lsev, (void *)(usize)arg1, sizeof(lsev)) < 0)
+          return (u64)-EFAULT;
+        if (lsev.notify != 0 /* SIGEV_SIGNAL */)
+          return (u64)-EINVAL;
+        int b = linux_signo_to_b1nix(lsev.signo);
+        if (b <= 0)
+          return (u64)-EINVAL;
+        int id = scheduler_timer_create(b, lsev.value);
+        if (id < 0)
+          return (u64)(isize)id;
+        if (syscall_copyout((void *)(usize)arg2, &id, sizeof(int)) < 0) {
+          scheduler_timer_delete(id);
+          return (u64)-EFAULT;
+        }
+        return 0;
+      }
+      /* klogctl(103)(type, bufp, len): busybox dmesg. Map the READ actions onto
+       * klog_read (the native SYS_DMESG path), report the ring capacity for
+       * SIZE_BUFFER, and accept the console-control actions as no-ops. */
+      if (number == 103) {
+        int type = (int)arg0;
+        if (type == 10) /* SYSLOG_ACTION_SIZE_BUFFER */
+          return (u64)KLOG_BUF_SIZE;
+        if (type == 2 || type == 3 || type == 4) { /* READ / READ_ALL / READ_CLEAR */
+          u64 buf = arg1, len = arg2;
+          if (!buf || len == 0)
+            return (u64)-EINVAL;
+          if (len > KLOG_BUF_SIZE)
+            len = KLOG_BUF_SIZE;
+          if (!is_user_range_valid((const void *)(usize)buf, len, 1))
+            return (u64)-EFAULT;
+          static char klogctl_tmp[KLOG_BUF_SIZE];
+          usize copied = klog_read(klogctl_tmp, (usize)len);
+          if (syscall_copyout((void *)(usize)buf, klogctl_tmp, copied) != 0)
+            return (u64)-EFAULT;
+          return (u64)copied;
+        }
+        return 0; /* open(1)/close(0)/console-level actions: accept */
+      }
+
+      /* --- M92: *at() syscall emulation for musl ---
+       * musl uses *at() variants (openat, newfstatat, etc.) exclusively. These
+       * resolve dirfd + relative path to an absolute path, then delegate to the
+       * existing b1nix handler. AT_FDCWD (-100) means "use cwd". */
+
+#define LX_openat          257
+#define LX_newfstatat      262
+#define LX_unlinkat        263
+#define LX_mkdirat         258
+#define LX_linkat          265
+#define LX_symlinkat       266
+#define LX_readlinkat      267
+#define LX_fchmodat        268
+#define LX_fchownat        260
+#define LX_faccessat       269
+#define LX_renameat2       316
+#define LX_pipe2           293
+#define LX_dup3            292
+#define LX_ppoll           271
+#define LX_pselect6        270
+#define LX_accept4         288
+#define LX_clock_nanosleep 230
+#define LX_set_tid_address 218
+#define LX_prlimit64       302
+#define LX_set_robust_list 273
+#define LX_get_robust_list 274
+#define LX_FUTEX           202
+#define LX_ioctl           16
+#define LX_nanosleep       35
+
+      /* Resolve a dirfd + user path to an absolute kernel path.
+       * dirfd == AT_FDCWD (-100) or an absolute path → resolve normally.
+       * Otherwise, get the absolute path of dirfd and join with the relative path.
+       * Returns 0 on success, -errno on failure. kbuf must be VFS_MAX_PATH. */
+      if (number == LX_openat || number == LX_newfstatat ||
+          number == LX_unlinkat || number == LX_mkdirat ||
+          number == LX_fchmodat || number == LX_fchownat ||
+          number == LX_faccessat || number == LX_readlinkat ||
+          number == LX_symlinkat || number == LX_renameat2 ||
+          number == LX_linkat) {
+        int dirfd = (int)arg0;
+        const char *user_path = (const char *)(usize)arg1;
+        char kpath[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+          return (u64)-EFAULT;
+        /* If path is absolute or dirfd is AT_FDCWD, use as-is. */
+        if (kpath[0] != '/' && dirfd != AT_FDCWD) {
+          char dirbuf[VFS_MAX_PATH];
+          int rc = vfs_fd_abspath(dirfd, dirbuf, sizeof(dirbuf));
+          if (rc < 0)
+            return (u64)rc;
+          /* Join dir path + "/" + relative path. */
+          char joined[VFS_MAX_PATH];
+          usize dlen = (usize)rc;
+          if (dlen + 1 + strlen(kpath) >= sizeof(joined))
+            return (u64)-ENAMETOOLONG;
+          memcpy(joined, dirbuf, dlen);
+          joined[dlen] = '/';
+          strcpy(joined + dlen + 1, kpath);
+          memcpy(kpath, joined, sizeof(kpath));
+        }
+        char resolved[VFS_MAX_PATH];
+        vfs_resolve_path(kpath, resolved);
+
+        switch (number) {
+        case LX_openat: {
+          /* arg0=dirfd, arg1=path, arg2=flags, arg3=mode.
+           * Translate Linux O_* flags to b1nix flags via an explicit whitelist.
+           * Several bits DIVERGE and even COLLIDE between the two ABIs, so a
+           * pass-through with per-bit patching is unsafe:
+           *   - Linux O_NONBLOCK (04000 = 0x800) == b1nix O_CLOEXEC (0x800)
+           *   - Linux O_CLOEXEC  (02000000 = 0x80000) != b1nix O_CLOEXEC
+           *   - Linux O_DIRECT   (040000 = 0x4000) == b1nix O_NONBLOCK (0x4000)
+           * Build the b1nix flag set from recognized Linux bits only; unknown
+           * Linux bits (O_NOCTTY/O_SYNC/O_DIRECT/O_NOFOLLOW/...) are dropped so
+           * they can't accidentally set an unrelated b1nix flag. The low two
+           * bits (O_RDONLY/O_WRONLY/O_RDWR) are identical in both ABIs. */
+          int lf = (int)arg2;
+          int flags = lf & 0x3; /* access mode (shared) */
+          if (lf & 0100)     flags |= B1NIX_O_CREAT;     /* Linux 0x40  */
+          if (lf & 0200)     flags |= B1NIX_O_EXCL;      /* Linux 0x80  */
+          if (lf & 01000)    flags |= B1NIX_O_TRUNC;     /* Linux 0x200 */
+          if (lf & 02000)    flags |= B1NIX_O_APPEND;    /* Linux 0x400 */
+          if (lf & (04000 | 040000 | 0100000))
+            flags |= B1NIX_O_NONBLOCK;  /* Linux, native, or musl O_NONBLOCK */
+          if (lf & 0200000)  flags |= B1NIX_O_DIRECTORY; /* Linux 0x10000 (shared) */
+          if (lf & 02000000) flags |= B1NIX_O_CLOEXEC;   /* Linux 0x80000 -> 0x800 */
+          return (u64)vfs_open_flags(resolved, flags);
+        }
+        case LX_newfstatat: {
+          /* arg0=dirfd, arg1=path, arg2=statbuf, arg3=flags.
+           * AT_SYMLINK_NOFOLLOW = 0x100. */
+          int flags = (int)arg3;
+          struct b1nix_stat st;
+          int rc;
+          if (flags & 0x100) /* AT_SYMLINK_NOFOLLOW */
+            rc = vfs_lstat(resolved, &st);
+          else
+            rc = vfs_stat(resolved, &st);
+          if (rc < 0)
+            return (u64)rc;
+          /* Translate to Linux struct stat layout. */
+          struct linux_stat lst;
+          linux_stat_from_b1nix(&lst, &st);
+          if (syscall_copyout((void *)(usize)arg2, &lst, sizeof(lst)) < 0)
+            return (u64)-EFAULT;
+          return 0;
+        }
+        case LX_unlinkat: {
+          /* arg0=dirfd, arg1=path, arg2=flags.
+           * AT_REMOVEDIR = 0x200. */
+          int flags = (int)arg2;
+          if (flags & 0x200) /* AT_REMOVEDIR → rmdir */
+            return (u64)vfs_rmdir(resolved);
+          return (u64)vfs_unlink(resolved);
+        }
+        case LX_mkdirat:
+          return (u64)vfs_mkdir(resolved, (int)arg2);
+        case LX_linkat: {
+          /* arg0=olddirfd, arg1=oldpath, arg2=newdirfd, arg3=newpath, arg4=flags.
+           * resolved = oldpath. Need to resolve newpath from (arg2, arg3). */
+          char new_kpath[VFS_MAX_PATH];
+          if (syscall_copyinstr(new_kpath, sizeof(new_kpath),
+                                (const char *)(usize)arg3) < 0)
+            return (u64)-EFAULT;
+          if (new_kpath[0] != '/' && (int)arg2 != AT_FDCWD) {
+            char new_dirbuf[VFS_MAX_PATH];
+            int nrc = vfs_fd_abspath((int)arg2, new_dirbuf, sizeof(new_dirbuf));
+            if (nrc < 0)
+              return (u64)nrc;
+            char new_joined[VFS_MAX_PATH];
+            usize ndlen = (usize)nrc;
+            if (ndlen + 1 + strlen(new_kpath) >= sizeof(new_joined))
+              return (u64)-ENAMETOOLONG;
+            memcpy(new_joined, new_dirbuf, ndlen);
+            new_joined[ndlen] = '/';
+            strcpy(new_joined + ndlen + 1, new_kpath);
+            memcpy(new_kpath, new_joined, sizeof(new_kpath));
+          }
+          char new_resolved[VFS_MAX_PATH];
+          vfs_resolve_path(new_kpath, new_resolved);
+          return (u64)vfs_link(resolved, new_resolved);
+        }
+        case LX_symlinkat: {
+          /* Linux symlinkat(target, newdirfd, linkpath):
+           *   arg0 = target (the CONTENT of the symlink)
+           *   arg1 = newdirfd
+           *   arg2 = linkpath (where to create the symlink)
+           * The outer code resolves (arg0=dirfd, arg1=path) which is WRONG for
+           * symlinkat — arg0 is the target, not a dirfd. Re-resolve properly. */
+          char target[VFS_MAX_PATH];
+          if (syscall_copyinstr(target, sizeof(target),
+                                (const char *)(usize)arg0) < 0)
+            return (u64)-EFAULT;
+          /* Resolve linkpath from (arg1=newdirfd, arg2=linkpath). */
+          char lk_kpath[VFS_MAX_PATH];
+          if (syscall_copyinstr(lk_kpath, sizeof(lk_kpath),
+                                (const char *)(usize)arg2) < 0)
+            return (u64)-EFAULT;
+          if (lk_kpath[0] != '/' && (int)arg1 != AT_FDCWD) {
+            char lk_dirbuf[VFS_MAX_PATH];
+            int lrc = vfs_fd_abspath((int)arg1, lk_dirbuf, sizeof(lk_dirbuf));
+            if (lrc < 0)
+              return (u64)lrc;
+            char lk_joined[VFS_MAX_PATH];
+            usize ldlen = (usize)lrc;
+            if (ldlen + 1 + strlen(lk_kpath) >= sizeof(lk_joined))
+              return (u64)-ENAMETOOLONG;
+            memcpy(lk_joined, lk_dirbuf, ldlen);
+            lk_joined[ldlen] = '/';
+            strcpy(lk_joined + ldlen + 1, lk_kpath);
+            memcpy(lk_kpath, lk_joined, sizeof(lk_kpath));
+          }
+          char lk_resolved[VFS_MAX_PATH];
+          vfs_resolve_path(lk_kpath, lk_resolved);
+          return (u64)vfs_symlink(target, lk_resolved);
+        }
+        case LX_readlinkat: {
+          /* arg0=dirfd, arg1=path, arg2=buf, arg3=bufsize. */
+          char linkbuf[VFS_MAX_PATH];
+          int rc = vfs_readlink(resolved, linkbuf, sizeof(linkbuf));
+          if (rc < 0)
+            return (u64)rc;
+          usize len = (usize)rc;
+          usize bufsize = (usize)arg3;
+          if (len >= bufsize)
+            len = bufsize - 1;
+          if (syscall_copyout((void *)(usize)arg2, linkbuf, len) < 0)
+            return (u64)-EFAULT;
+          /* NUL-terminate if space allows. */
+          if (len < bufsize) {
+            char nul = '\0';
+            syscall_copyout((void *)(usize)(arg2 + len), &nul, 1);
+          }
+          return (u64)len;
+        }
+        case LX_fchmodat:
+          return (u64)vfs_chmod(resolved, (u16)arg2);
+        case LX_fchownat:
+          return (u64)vfs_chown(resolved, (u16)arg2, (u16)arg3);
+        case LX_faccessat: {
+          /* arg0=dirfd, arg1=path, arg2=mode, arg3=flags.
+           * Linux faccessat uses the real mode (R_OK=4, W_OK=2, X_OK=1, F_OK=0).
+           * b1nix SYS_ACCESS takes (path, mode) too. Ignore flags (AT_EACCESS). */
+          (void)arg3;
+          return (u64)sys_access(resolved, (int)arg2);
+        }
+        case LX_renameat2: {
+          /* arg0=olddirfd, arg1=oldpath, arg2=newdirfd, arg3=newpath, arg4=flags.
+           * resolved = oldpath. Need to resolve newpath from (arg2, arg3). */
+          char new_kpath[VFS_MAX_PATH];
+          if (syscall_copyinstr(new_kpath, sizeof(new_kpath),
+                                (const char *)(usize)arg3) < 0)
+            return (u64)-EFAULT;
+          if (new_kpath[0] != '/' && (int)arg2 != AT_FDCWD) {
+            char new_dirbuf[VFS_MAX_PATH];
+            int nrc = vfs_fd_abspath((int)arg2, new_dirbuf, sizeof(new_dirbuf));
+            if (nrc < 0)
+              return (u64)nrc;
+            char new_joined[VFS_MAX_PATH];
+            usize ndlen = (usize)nrc;
+            if (ndlen + 1 + strlen(new_kpath) >= sizeof(new_joined))
+              return (u64)-ENAMETOOLONG;
+            memcpy(new_joined, new_dirbuf, ndlen);
+            new_joined[ndlen] = '/';
+            strcpy(new_joined + ndlen + 1, new_kpath);
+            memcpy(new_kpath, new_joined, sizeof(new_kpath));
+          }
+          char new_resolved[VFS_MAX_PATH];
+          vfs_resolve_path(new_kpath, new_resolved);
+          /* arg4=flags: RENAME_NOREPLACE(1), RENAME_EXCHANGE(2).
+           * b1nix doesn't support these — silently ignore for now. */
+          return (u64)vfs_rename(resolved, new_resolved);
+        }
+        default:
+          break;
+        }
+#undef LX_openat
+#undef LX_newfstatat
+#undef LX_unlinkat
+#undef LX_mkdirat
+#undef LX_linkat
+#undef LX_symlinkat
+#undef LX_readlinkat
+#undef LX_fchmodat
+#undef LX_fchownat
+#undef LX_faccessat
+#undef LX_renameat2
+      }
+
+      /* --- M92: wrapper syscalls (thin shims over existing b1nix handlers) --- */
+      if (number == LX_pipe2) {
+        /* pipe2(fds, flags): call pipe, then set FD_CLOEXEC if requested. */
+        int kfds[2];
+        int rc = (int)vfs_pipe(kfds);
+        if (rc < 0)
+          return (u64)rc;
+        if (arg1 & 02000000) { /* O_CLOEXEC */
+          sys_fcntl(kfds[0], B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
+          sys_fcntl(kfds[1], B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
+        }
+        if (syscall_copyout((void *)(usize)arg0, kfds, sizeof(kfds)) < 0)
+          return (u64)-EFAULT;
+        return 0;
+      }
+      if (number == LX_dup3) {
+        /* dup3(oldfd, newfd, flags): dup2 + set FD_CLOEXEC if flags has it. */
+        if ((int)arg0 == (int)arg1)
+          return (u64)-EINVAL;
+        int rc = (int)vfs_dup2((int)arg0, (int)arg1);
+        if (rc < 0)
+          return (u64)rc;
+        if (arg2 & 02000000) /* O_CLOEXEC */
+          sys_fcntl((int)arg1, B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
+        return (u64)rc;
+      }
+      if (number == LX_ppoll) {
+        /* ppoll(fds, nfds, timeout_ts, sigmask, sigsetsize).
+         * Ignore sigmask — just call poll. timeout_ts is a pointer to
+         * struct timespec (seconds + nanoseconds), convert to ms. */
+        int nfds = (int)arg1;
+        u64 timeout_ms = (u64)-1; /* infinite */
+        if (arg2) {
+          /* struct timespec: tv_sec (8 bytes), tv_nsec (8 bytes). */
+          u64 tv_sec = 0, tv_nsec = 0;
+          syscall_copyin(&tv_sec, (void *)(usize)arg2, sizeof(tv_sec));
+          syscall_copyin(&tv_nsec, (void *)(usize)(arg2 + 8), sizeof(tv_nsec));
+          timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+        }
+        return (u64)sys_poll((void *)(usize)arg0, nfds, (int)timeout_ms);
+      }
+      if (number == LX_pselect6) {
+        /* pselect6(nfds, readfds, writefds, exceptfds, timeout_ts, sigmask).
+         * Ignore sigmask — convert fd_sets to pollfds and use the poll loop.
+         * timeout_ts is a pointer to struct timespec, convert to ms. */
+        int nfds = (int)arg0;
+        if (nfds < 0 || nfds > 1024)
+          return (u64)-EINVAL;
+        u64 timeout_ms = (u64)-1;
+        if (arg4) {
+          u64 tv_sec = 0, tv_nsec = 0;
+          syscall_copyin(&tv_sec, (void *)(usize)arg4, sizeof(tv_sec));
+          syscall_copyin(&tv_nsec, (void *)(usize)(arg4 + 8), sizeof(tv_nsec));
+          timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+        }
+        u8 r_kset[128] = {0}, w_kset[128] = {0}, e_kset[128] = {0};
+        if (arg1 && syscall_copyin(r_kset, (void *)(usize)arg1, 128) < 0)
+          return (u64)-EFAULT;
+        if (arg2 && syscall_copyin(w_kset, (void *)(usize)arg2, 128) < 0)
+          return (u64)-EFAULT;
+        if (arg3 && syscall_copyin(e_kset, (void *)(usize)arg3, 128) < 0)
+          return (u64)-EFAULT;
+        struct b1nix_pollfd pfds[64];
+        int np = 0;
+        for (int fd = 0; fd < nfds && np < 64; fd++) {
+          int r = (r_kset[fd / 8] >> (fd & 7)) & 1;
+          int w = (w_kset[fd / 8] >> (fd & 7)) & 1;
+          int e = (e_kset[fd / 8] >> (fd & 7)) & 1;
+          if (!r && !w && !e) continue;
+          pfds[np].fd = fd;
+          pfds[np].events = 0;
+          if (r) pfds[np].events |= B1NIX_POLLIN;
+          if (w) pfds[np].events |= B1NIX_POLLOUT;
+          pfds[np].revents = 0;
+          np++;
+        }
+        /* Use the same inline poll loop as SYS_SELECT. */
+        u64 start_ticks = scheduler_get_uptime_ticks();
+        u64 timeout_ticks = timeout_ms == (u64)-1 ? (u64)-1 : timeout_ms / 10;
+        if (timeout_ms != (u64)-1 && timeout_ms != 0) {
+          u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+          current_task->wake_tick = start_ticks + ticks;
+        }
+        extern void *vfs_poll_chan;
+        int ready_count = 0;
+        while (1) {
+          scheduler_wait_prepare(vfs_poll_chan);
+          ready_count = 0;
+          for (int i = 0; i < np; i++) {
+            if (pfds[i].fd < 0) { pfds[i].revents = 0; continue; }
+            struct vfs_handle *h = scheduler_fd_get(pfds[i].fd);
+            if (!h) { pfds[i].revents = B1NIX_POLLNVAL; ready_count++; continue; }
+            pfds[i].revents = 0;
+            vfs_poll(pfds[i].fd, &pfds[i]);
+            if (pfds[i].revents) ready_count++;
+          }
+          int timed_out = 0;
+          if (ready_count == 0 && timeout_ms != 0 && timeout_ms != (u64)-1) {
+            u64 now = scheduler_get_uptime_ticks();
+            if (now - start_ticks >= timeout_ticks) timed_out = 1;
+          }
+          if (ready_count > 0 || timeout_ms == 0 || timed_out) {
+            scheduler_wait_cancel();
+            break;
+          }
+          if (select_poll_signal_pending()) {
+            scheduler_wait_cancel();
+            return (u64)-EINTR;
+          }
+          scheduler_block_on(vfs_poll_chan);
+        }
+        /* Write back fd_sets with revents. */
+        memset(r_kset, 0, sizeof(r_kset));
+        memset(w_kset, 0, sizeof(w_kset));
+        memset(e_kset, 0, sizeof(e_kset));
+        for (int i = 0; i < np; i++) {
+          if (pfds[i].revents && pfds[i].fd >= 0) {
+            int fd = pfds[i].fd;
+            if (pfds[i].revents & (B1NIX_POLLIN | B1NIX_POLLHUP | B1NIX_POLLERR))
+              r_kset[fd / 8] |= (1 << (fd & 7));
+            if (pfds[i].revents & (B1NIX_POLLOUT | B1NIX_POLLERR))
+              w_kset[fd / 8] |= (1 << (fd & 7));
+            if (pfds[i].revents & B1NIX_POLLERR)
+              e_kset[fd / 8] |= (1 << (fd & 7));
+          }
+        }
+        if (arg1 && syscall_copyout((void *)(usize)arg1, r_kset, 128) < 0)
+          return (u64)-EFAULT;
+        if (arg2 && syscall_copyout((void *)(usize)arg2, w_kset, 128) < 0)
+          return (u64)-EFAULT;
+        if (arg3 && syscall_copyout((void *)(usize)arg3, e_kset, 128) < 0)
+          return (u64)-EFAULT;
+        return (u64)ready_count;
+      }
+      if (number == LX_accept4) {
+        /* accept4(sockfd, addr, addrlen, flags): accept + set FD_CLOEXEC
+         * and O_NONBLOCK from flags. */
+        int rc = (int)vfs_accept((int)arg0, (void *)(usize)arg1,
+                                  (usize *)(usize)arg2);
+        if (rc < 0)
+          return (u64)rc;
+        if (arg3 & 02000000) /* O_CLOEXEC */
+          sys_fcntl(rc, B1NIX_F_SETFD, B1NIX_FD_CLOEXEC);
+        if (arg3 & 04000) /* O_NONBLOCK */
+          sys_fcntl(rc, B1NIX_F_SETFL, B1NIX_O_NONBLOCK);
+        return (u64)rc;
+      }
+      if (number == LX_clock_nanosleep) {
+        /* clock_nanosleep(clock_id, flags, request, remain).
+         * flags=0 → relative sleep. Convert the timespec to ticks and sleep. */
+        (void)arg0; /* clock_id — ignore, use relative */
+        (void)arg3; /* remain — not implemented */
+        struct timespec ts;
+        if (syscall_copyin(&ts, (const void *)(usize)arg2, sizeof(ts)) != 0)
+          return (u64)-EFAULT;
+        u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
+        if (ticks == 0) ticks = 1;
+        scheduler_sleep_ticks(ticks);
+        return 0;
+      }
+      if (number == LX_nanosleep) {
+        /* Linux nanosleep uses the same timespec ABI as native nanosleep.
+         * Handle it here and return: merely rewriting `number` to the native
+         * value (235) used to fall through into the Linux→b1nix table lookup
+         * below, which does not know 235 as a *Linux* number → every Linux
+         * nanosleep returned -ENOSYS. */
+        struct timespec ts;
+        if (syscall_copyin(&ts, (const void *)(usize)arg0, sizeof(ts)) != 0)
+          return (u64)-EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+          return (u64)-EINVAL;
+        u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
+        if (ticks == 0) ticks = 1;
+        scheduler_sleep_ticks(ticks);
+        if (arg1) {
+          struct timespec rem = {0, 0};
+          if (syscall_copyout((void *)(usize)arg1, &rem, sizeof(rem)) != 0)
+            return (u64)-EFAULT;
+        }
+        return 0;
+      }
+      if (number == LX_set_tid_address) {
+        /* set_tid_address(tidptr): store the clear_child_tid pointer, return
+         * the current TID. musl uses this for pthread thread management. */
+        task_set_child_tid_clear(current_task, (u64)arg0);
+        return (u64)scheduler_get_pid();
+      }
+      /* M92: set_thread_area (Linux NR 205) — legacy GDT-based TLS for x86.
+       * musl's __set_thread_area calls this during __init_tls on x86_64.
+       * b1nix uses arch_prctl(ARCH_SET_FS) for TLS instead, so this is a
+       * no-op that returns success. */
+      if (number == 205)
+        return 0;
+      /* membarrier(324): no-op on b1nix (no cross-CPU lazy-TLB tricks in
+       * userspace); CMD_QUERY returns 0 = "no commands supported", others
+       * succeed trivially on this single-address-space-coherent kernel. */
+      if (number == 324)
+        return 0;
+      if (number == LX_prlimit64) {
+        /* prlimit64(pid, resource, new_limit, old_limit).
+         * Simplified: only support getrlimit (new_limit=0). */
+        if (arg2)
+          return (u64)-ENOSYS; /* set not implemented yet */
+        return (u64)sys_getrlimit((int)arg1, (void *)(usize)arg3);
+      }
+      if (number == LX_set_robust_list) {
+        /* set_robust_list(head, len): store the robust futex list head.
+         * Stub — return 0 (b1nix doesn't use robust futexes yet). */
+        return 0;
+      }
+      if (number == LX_get_robust_list) {
+        /* get_robust_list(pid, head_ptr, len_ptr): not implemented. */
+        return (u64)-ENOSYS;
+      }
+      /* Linux clone(2) has a different argument layout than b1nix SYS_CLONE:
+       *   Linux: clone(flags, user_stack, parent_tidptr, child_tidptr, tls)
+       *   b1nix: SYS_CLONE(flags, entry, user_stack, arg, tls, ctid)
+       * musl's pthread_create calls clone with Linux layout. Translate. */
+      if (number == 56) { /* LX_clone */
+        u64 flags = arg0;
+        u64 user_stack = arg1;
+        u64 parent_tid = arg2;
+        u64 child_tid = arg3;
+        u64 tls_val = arg4;
+        /* For musl pthread: CLONE_VM|CLONE_FS|CLONE_FILES|CLONE_SIGHAND|
+         * CLONE_THREAD|CLONE_SETTLS|CLONE_PARENT_SETTID|CLONE_CHILD_SETTID|
+         * CLONE_CHILD_CLEARTID.
+         * The "entry" is the user_stack itself (musl sets up the stack to
+         * return to pthread_start), arg is 0 (already on the stack). */
+        u64 b1nix_flags = flags;
+        /* Add CLONE_PARENT_SETTID and CLONE_CHILD_SETTID if not already set. */
+        if (parent_tid)
+          b1nix_flags |= 0x100000; /* CLONE_PARENT_SETTID */
+        if (child_tid)
+          b1nix_flags |= 0x1000000; /* CLONE_CHILD_SETTID */
+        /* M92: musl's __clone stores the start_routine pointer in r9 before
+         * calling syscall. The child expects to resume at the parent's RIP
+         * (right after the syscall instruction in musl __clone), with rax=0
+         * and r9 = start_routine. arg5 is the saved r9 from the interrupt
+         * frame. We pass frame->rip as the entry so the child thread
+         * continues at the correct instruction. */
+        u64 start_func = arg5; /* musl puts fn in r9 before syscall */
+        u64 child_entry = frame ? frame->rip : user_stack;
+        return (u64)scheduler_clone_thread(b1nix_flags, child_entry,
+                                           user_stack, 0, tls_val, child_tid,
+                                           parent_tid, child_tid, start_func);
+      }
+      /* Futex with extended ops for musl (WAIT_BITSET, WAKE_BITSET, REQUEUE,
+       * CMP_REQUEUE, PRIVATE_FLAG). The dispatcher routes futex through
+       * SYS_FUTEX after the table lookup, but the extended ops need special
+       * handling here because the table entry uses the same native number. */
+      if (number == LX_FUTEX) {
+        int op = (int)arg1;
+        int base_op = op & 0x7F; /* strip PRIVATE_FLAG (0x80) */
+        /* FUTEX_WAIT_BITSET(9) → treat as WAIT, ignoring val3 (signal mask). */
+        if (base_op == 9)
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)arg2, arg3);
+        /* FUTEX_WAKE_BITSET(10) → treat as WAKE. */
+        if (base_op == 10)
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
+        /* FUTEX_REQUEUE(4): wake val waiters on uaddr, requeue val2 to uaddr2. */
+        if (base_op == 4) {
+          int woken = (int)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
+          if (woken < 0)
+            return (u64)woken;
+          /* Requeue remaining from arg2 count: wake min(val2, remaining) on
+           * uaddr2. For now, do a simple wake on uaddr2. */
+          int extra = (int)arg3 > woken ? (int)arg3 - woken : 0;
+          if (extra > 0) {
+            int rq = (int)scheduler_futex(arg4, B1NIX_FUTEX_WAKE, extra, 0);
+            if (rq > 0)
+              woken += rq;
+          }
+          return (u64)woken;
+        }
+        /* FUTEX_CMP_REQUEUE(8): same as REQUEUE but check *uaddr == val3 first. */
+        if (base_op == 8) {
+          int cur = 0;
+          if (syscall_copyin(&cur, (void *)(usize)arg0, sizeof(int)) < 0)
+            return (u64)-EFAULT;
+          if (cur != (int)arg5)
+            return (u64)-EAGAIN;
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
+        }
+        /* Default: pass through to native futex handler. */
+        return (u64)scheduler_futex(arg0, op, (int)arg2, arg3);
+      }
 
       /* Signal-number remap: b1nix signo values differ from Linux. rt_sigaction
        * takes the signo in arg0; kill takes it in arg1. Remap in place, then let
        * the table route to SYS_SIGNAL / SYS_KILL. Signo 0 (kill existence check)
        * maps to 0 and is left intact. */
-      if (number == LINUX_NR_RT_SIGACTION)
-        arg0 = (u64)linux_signo_to_b1nix((int)arg0);
-      else if (number == LINUX_NR_KILL && arg1 != 0)
+      if (number == LINUX_NR_RT_SIGACTION) {
+        /* Linux struct sigaction (152B) → b1nix struct sigaction (32B).
+         * Field order matches but sa_mask size differs: Linux 128B vs b1nix 8B.
+         * Also need to remap the signo in sa_mask bits. */
+        int lx_sig = (int)arg0;
+        int b_sig = linux_signo_to_b1nix(lx_sig);
+        if (b_sig == 0 && lx_sig != 0)
+          return (u64)-EINVAL;
+        struct linux_sigaction {
+          u64 sa_handler;
+          u64 sa_flags;
+          u64 sa_restorer;
+          u8 sa_mask[128]; /* Linux __sigset_t (up to 128 bytes) */
+        } lx_act, lx_old;
+        /* rt_sigaction(sig, act, oldact, sigsetsize): the user structs are
+         * 24 bytes of header + sigsetsize bytes of mask — musl/glibc pass
+         * sigsetsize == 8, so the whole struct is 32 bytes. Copying a fixed
+         * 152 bytes out for oldact overruns the caller's 32-byte stack buffer
+         * by 120 bytes and wipes its saved return addresses (ash crashed at
+         * rip=0 right after setsignal for exactly this reason). */
+        u64 lx_setsz = arg3 ? arg3 : 8;
+        if (lx_setsz > sizeof(lx_act.sa_mask))
+          return (u64)-EINVAL;
+        usize lx_size = 3 * sizeof(u64) + (usize)lx_setsz;
+        struct sigaction b_act, b_old;
+        memset(&lx_act, 0, sizeof(lx_act));
+        memset(&lx_old, 0, sizeof(lx_old));
+        memset(&b_act, 0, sizeof(b_act));
+        memset(&b_old, 0, sizeof(b_old));
+        if (arg1) {
+          if (syscall_copyin(&lx_act, (void *)(usize)arg1, lx_size) < 0)
+            return (u64)-EFAULT;
+          b_act.sa_handler = (sighandler_t)(usize)lx_act.sa_handler;
+          b_act.sa_flags = lx_act.sa_flags;
+          b_act.sa_restorer = (void (*)(void))(usize)lx_act.sa_restorer;
+          /* Convert Linux 128-byte sigset to b1nix u64 sigset. */
+          u64 lx_sigset = 0;
+          memcpy(&lx_sigset, lx_act.sa_mask, sizeof(lx_sigset));
+          b_act.sa_mask = linux_sigset_to_b1nix(lx_sigset);
+        }
+        {
+          char sigbuf[192];
+          snprintf(sigbuf, sizeof(sigbuf),
+                   "rt_sigaction task=%s lx=%d b=%d set=%p handler=%p restorer=%p old=%p",
+                   current_task ? current_task->name : "?",
+                   lx_sig, b_sig, (void *)(usize)arg1,
+                   (void *)(usize)lx_act.sa_handler,
+                   (void *)(usize)lx_act.sa_restorer,
+                   (void *)(usize)arg2);
+          klog_debug_category("signal", sigbuf);
+        }
+        if (scheduler_sigaction(b_sig, arg1 ? &b_act : 0, &b_old) < 0)
+          return (u64)-EINVAL;
+        if (arg2) {
+          lx_old.sa_handler = (u64)(usize)b_old.sa_handler;
+          lx_old.sa_flags = b_old.sa_flags;
+          lx_old.sa_restorer = (u64)(usize)b_old.sa_restorer;
+          u64 b_sigset = b_old.sa_mask;
+          u64 lx_sigset = b1nix_sigset_to_linux(b_sigset);
+          memset(lx_old.sa_mask, 0, sizeof(lx_old.sa_mask));
+          memcpy(lx_old.sa_mask, &lx_sigset, sizeof(lx_sigset));
+          klog_debug_category("signal", "rt_sigaction before old copyout");
+          if (syscall_copyout((void *)(usize)arg2, &lx_old, lx_size) < 0)
+            return (u64)-EFAULT;
+          klog_debug_category("signal", "rt_sigaction after old copyout");
+        }
+        klog_debug_category("signal", "rt_sigaction return");
+        return 0;
+      } else if (number == LINUX_NR_KILL && arg1 != 0)
         arg1 = (u64)linux_signo_to_b1nix((int)arg1);
 
+      /* signalfd4: translate the Linux sigset_t mask to b1nix signal numbers
+       * in-place so the SYS_SIGNALFD4 handler sees a b1nix-compatible mask. */
+      if (number == LINUX_NR_SIGNALFD4 && arg1 != 0) {
+        u64 lx_mask = 0;
+        if (syscall_copyin(&lx_mask, (void *)(usize)arg1, sizeof(lx_mask)) == 0) {
+          u64 b_mask = linux_sigset_to_b1nix(lx_mask);
+          if (syscall_copyout((void *)(usize)arg1, &b_mask, sizeof(b_mask)) < 0)
+            return (u64)-EFAULT;
+        }
+        /* Linux signalfd4 has (fd, mask, sigsetsize, flags), while the
+         * native handler consumes (fd, mask, flags). */
+        /* musl passes sizeof(sigset_t), which is 128 bytes even though the
+         * b1nix signal set currently uses the low 64 bits. */
+        if (arg2 != sizeof(u64) && arg2 != 128)
+          return (u64)-EINVAL;
+        arg2 = arg3;
+      }
+
+      /* M92: termios struct translation for Linux tasks.
+       * Linux struct termios (44B): c_iflag(4), c_oflag(4), c_cflag(4),
+       * c_lflag(4), c_line(1), c_cc[19](19). Total 44.
+       * b1nix struct b1nix_termios (48B): c_iflag(4), c_oflag(4), c_cflag(4),
+       * c_lflag(4), c_cc[32](32). Total 48.
+       * Field order differs after c_lflag. Translate on TCGETS/TCSETS. */
+      if (number == LX_ioctl) {
+        int fd = (int)arg0;
+        u64 request = arg1;
+        /* Linux TCGETS=0x5401, TCSETS=0x5402 — same as b1nix. */
+        struct linux_termios {
+          u32 c_iflag;
+          u32 c_oflag;
+          u32 c_cflag;
+          u32 c_lflag;
+          u8 c_line;
+          u8 c_cc[19];
+        };
+        /* NOTE: device ioctl handlers (pty, serial tty) read/write their
+         * termios argument with syscall_copyin/copyout, which reject kernel
+         * pointers. So we cannot hand them a kernel-stack scratch struct —
+         * we repack through the caller's own (user) buffer and dispatch with
+         * the user pointer. arg2 points at musl's struct termios (>=48B), so
+         * a 48-byte b1nix_termios fits. */
+        if (request == B1NIX_TCGETS) {
+          /* Device fills the user buffer with b1nix layout, then we convert
+           * it to Linux layout in place. */
+          int rc = (int)vfs_ioctl(fd, B1NIX_TCGETS, (void *)(usize)arg2);
+          if (rc < 0)
+            return (u64)rc;
+          struct b1nix_termios bt;
+          if (syscall_copyin(&bt, (void *)(usize)arg2, sizeof(bt)) < 0)
+            return (u64)-EFAULT;
+          struct linux_termios lt;
+          lt.c_iflag = bt.c_iflag;
+          lt.c_oflag = bt.c_oflag;
+          lt.c_cflag = bt.c_cflag;
+          lt.c_lflag = bt.c_lflag;
+          lt.c_line = 0;
+          memset(lt.c_cc, 0, sizeof(lt.c_cc));
+          usize copy = sizeof(lt.c_cc) < sizeof(bt.c_cc)
+                           ? sizeof(lt.c_cc)
+                           : sizeof(bt.c_cc);
+          memcpy(lt.c_cc, bt.c_cc, copy);
+          if (syscall_copyout((void *)(usize)arg2, &lt, sizeof(lt)) < 0)
+            return (u64)-EFAULT;
+          return 0;
+        }
+        if (request == B1NIX_TCSETS || request == B1NIX_TCSETSW ||
+            request == B1NIX_TCSETSF) {
+          struct linux_termios lt;
+          if (syscall_copyin(&lt, (void *)(usize)arg2, sizeof(lt)) < 0)
+            return (u64)-EFAULT;
+          struct b1nix_termios bt;
+          memset(&bt, 0, sizeof(bt));
+          bt.c_iflag = lt.c_iflag;
+          bt.c_oflag = lt.c_oflag;
+          bt.c_cflag = lt.c_cflag;
+          bt.c_lflag = lt.c_lflag;
+          memcpy(bt.c_cc, lt.c_cc, sizeof(lt.c_cc));
+          /* Repack the b1nix layout back into the user buffer so the device's
+           * user-validated copyin succeeds, then dispatch with the user ptr.
+           * TCSADRAIN/TCSAFLUSH map to TCSETS (no output buffering). */
+          if (syscall_copyout((void *)(usize)arg2, &bt, sizeof(bt)) < 0)
+            return (u64)-EFAULT;
+          return (u64)vfs_ioctl(fd, B1NIX_TCSETS, (void *)(usize)arg2);
+        }
+      }
+      /* reboot(magic1, magic2, cmd, arg): the command Linux passes in arg2 is a
+       * magic constant; SYS_REBOOT reads its own command from arg0. An
+       * unrecognised command is EINVAL rather than a silent restart. */
+      if (number == LINUX_NR_REBOOT) {
+        switch ((u32)arg2) {
+        case LINUX_REBOOT_CMD_POWER_OFF: arg0 = B1NIX_REBOOT_POWEROFF; break;
+        case LINUX_REBOOT_CMD_HALT:      arg0 = B1NIX_REBOOT_HALT;     break;
+        case LINUX_REBOOT_CMD_RESTART:   arg0 = B1NIX_REBOOT_RESTART;  break;
+        default: return (u64)-EINVAL;
+        }
+      }
+      /* xattr: Linux picks follow/don't-follow by syscall number, b1nix by a
+       * trailing `nofollow` argument the caller never passes. Supply it here so
+       * the handler does not read an argument register the caller never set. */
+      switch (number) {
+      case LINUX_NR_SETXATTR:     arg5 = 0; break;
+      case LINUX_NR_LSETXATTR:    arg5 = 1; break;
+      case LINUX_NR_GETXATTR:     arg4 = 0; break;
+      case LINUX_NR_LGETXATTR:    arg4 = 1; break;
+      case LINUX_NR_LISTXATTR:    arg3 = 0; break;
+      case LINUX_NR_LLISTXATTR:   arg3 = 1; break;
+      case LINUX_NR_REMOVEXATTR:  arg2 = 0; break;
+      case LINUX_NR_LREMOVEXATTR: arg2 = 1; break;
+      default: break;
+      }
       u32 native = linux_syscall_to_b1nix(number);
       if (native == LINUX_SYS_UNMAPPED) {
         console_write("linux-abi: unmapped syscall ");
@@ -2981,7 +4271,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     ret = (u64)sys_write((int)arg0, (const void *)(usize)arg1, (usize)arg2);
     break;
   case SYS_EXIT:
-    scheduler_exit_group((int)arg0);
+    scheduler_exit_current((int)arg0);
     ret = 0;
     break;
   case SYS_SPAWN: {
@@ -3029,7 +4319,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_lstat((const char *)(usize)arg0,
                           (struct b1nix_stat *)(usize)arg1);
   case SYS_IOCTL:
-    return (u64)vfs_ioctl((int)arg0, arg1, (void *)(usize)arg2);
+    /* ioctl request codes are 32-bit; _IOR codes with the top bit set (e.g.
+     * TIOCGPTN=0x80045430) arrive sign-extended through musl's `int request`.
+     * Truncate so handlers' `case 0x80045430:` labels match. */
+    return (u64)vfs_ioctl((int)arg0, (u32)arg1, (void *)(usize)arg2);
   case SYS_FCNTL:
     return (u64)sys_fcntl((int)arg0, (int)arg1, arg2);
   case SYS_DUP2:
@@ -3131,26 +4424,30 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_execve((const char *)(usize)arg0,
                            (const char **)(usize)arg1,
                            (const char **)(usize)arg2);
+  case SYS_EXECVEAT:
+    return sys_execveat((int)arg0, (const char *)(usize)arg1,
+                        (const char **)(usize)arg2,
+                        (const char **)(usize)arg3, (int)arg4);
   case SYS_WAIT: {
     int kstatus = 0;
     u64 wr = (u64)scheduler_wait((usize)arg0, &kstatus);
+    if ((isize)wr >= 0 && current_task && current_task->user_image &&
+        ((struct user_loaded_image *)current_task->user_image)->personality == PERSONALITY_LINUX)
+      kstatus = wait_status_to_linux(kstatus);
     if ((isize)wr >= 0 && arg1 && syscall_copyout((void *)(usize)arg1, &kstatus, sizeof(kstatus)) != 0) {
       return (u64)-EFAULT;
     }
-    char lbuf[256];
-    snprintf(lbuf, sizeof(lbuf), "SYS_WAIT by %s (pid %d): arg0=%lu, ret=%ld, status=0x%x", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, arg0, (isize)wr, kstatus);
-    klog_warn(lbuf);
     return wr;
   }
   case SYS_WAITPID: {
     int kstatus = 0;
     u64 wr = (u64)scheduler_waitpid((usize)arg0, &kstatus, (int)arg2);
+    if ((isize)wr >= 0 && current_task && current_task->user_image &&
+        ((struct user_loaded_image *)current_task->user_image)->personality == PERSONALITY_LINUX)
+      kstatus = wait_status_to_linux(kstatus);
     if ((isize)wr >= 0 && arg1 && syscall_copyout((void *)(usize)arg1, &kstatus, sizeof(kstatus)) != 0) {
       return (u64)-EFAULT;
     }
-    char lbuf[256];
-    snprintf(lbuf, sizeof(lbuf), "SYS_WAITPID by %s (pid %d): pid=%ld, options=%d, ret=%ld, status=0x%x", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, (isize)arg0, (int)arg2, (isize)wr, kstatus);
-    klog_warn(lbuf);
     /* ERESTARTSYS conversion and signal delivery handled by the wrapper. */
     return wr;
   }
@@ -3284,13 +4581,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                ? 0
                : (u64)-EPERM;
   }
-  case SYS_WAITID: {
-    u64 wr = (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1, (siginfo_t *)(usize)arg2, (int)arg3);
-    char lbuf[256];
-    snprintf(lbuf, sizeof(lbuf), "SYS_WAITID by %s (pid %d): idtype=%d, id=%lu, options=%d, ret=%ld", current_task ? current_task->name : "?", current_task ? (int)current_task->id : -1, (int)arg0, arg1, (int)arg3, (isize)wr);
-    klog_warn(lbuf);
-    return wr;
-  }
+  case SYS_WAITID:
+    return (u64)scheduler_waitid((idtype_t)arg0, (usize)arg1,
+                                 (siginfo_t *)(usize)arg2, (int)arg3);
   case SYS_TIMES: {
     struct tms *user_tms = (struct tms *)(usize)arg0;
     if (user_tms) {
@@ -3395,6 +4688,22 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SLEEP:
     scheduler_sleep_ticks(arg0);
     return 0;
+  case SYS_NANOSLEEP: {
+    struct timespec ts;
+    if (syscall_copyin(&ts, (const void *)(usize)arg0, sizeof(ts)) != 0)
+      return (u64)-EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000L)
+      return (u64)-EINVAL;
+    u64 ticks = (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
+    if (ticks == 0) ticks = 1;
+    scheduler_sleep_ticks(ticks);
+    if (arg1) {
+      struct timespec rem = {0, 0};
+      if (syscall_copyout((void *)(usize)arg1, &rem, sizeof(rem)) != 0)
+        return (u64)-EFAULT;
+    }
+    return 0;
+  }
   case SYS_KILL: {
     /* POSIX kill(2) pid decoding: 0 = caller's process group, -1 = every
      * process the caller may signal, < -1 = process group |pid|, > 0 = that
@@ -3554,22 +4863,45 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SETPGRP:
     return (u64)scheduler_setpgrp((usize)arg0, (usize)arg1);
   case SYS_SETPRIORITY: {
-    usize pid = arg0 == 0 ? scheduler_get_pid() : (usize)arg0;
-    return (u64)scheduler_set_priority(pid, (int)arg1);
+    /* Linux setpriority(int which, id_t who, int prio): args are
+     * arg0=which, arg1=who, arg2=prio. Only PRIO_PROCESS is supported; who==0
+     * means the calling process. The old code read arg0 as the pid and arg1 as
+     * the value, so it stored `who` (0) as the nice value and ignored the real
+     * prio in arg2 — every nice()/setpriority() collapsed to nice 0, breaking
+     * nice biasing (M46 nice-biasing). */
+    usize who = (usize)arg1;
+    int prio = (int)arg2;
+    usize pid = who == 0 ? scheduler_get_pid() : who;
+    return (u64)scheduler_set_priority(pid, prio);
   }
   case SYS_GETPRIORITY: {
-    usize pid = arg0 == 0 ? scheduler_get_pid() : (usize)arg0;
-    return (u64)scheduler_get_priority(pid);
+    /* Linux getpriority(int which, id_t who): arg0=which, arg1=who. */
+    usize who = (usize)arg1;
+    usize pid = who == 0 ? scheduler_get_pid() : who;
+    /* scheduler_get_priority already returns the Linux 20-nice encoding. */
+    return (u64)(isize)scheduler_get_priority(pid);
   }
   case SYS_BRK:
     return sys_brk(arg0);
-  case SYS_MMAP:
-    return sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
-                    (int)arg4, (isize)arg5);
-  case SYS_MUNMAP:
-    return (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
-  case SYS_MPROTECT:
-    return (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
+  case SYS_MMAP: {
+    vma_mutator_lock();
+    u64 r = sys_mmap((void *)(usize)arg0, (usize)arg1, (int)arg2, (int)arg3,
+                     (int)arg4, (isize)arg5);
+    vma_mutator_unlock();
+    return r;
+  }
+  case SYS_MUNMAP: {
+    vma_mutator_lock();
+    u64 r = (u64)sys_munmap((void *)(usize)arg0, (usize)arg1);
+    vma_mutator_unlock();
+    return r;
+  }
+  case SYS_MPROTECT: {
+    vma_mutator_lock();
+    u64 r = (u64)sys_mprotect((void *)(usize)arg0, (usize)arg1, (int)arg2);
+    vma_mutator_unlock();
+    return r;
+  }
   case SYS_MADVISE:
     return (u64)sys_madvise((void *)(usize)arg0, (usize)arg1, (int)arg2);
   case SYS_MINCORE: {
@@ -4054,7 +5386,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     /* SYS_CLONE(flags, entry, user_stack, arg, tls, ctid) — see
      * kernel/include/b1nix/syscall.h for the B1NIX_CLONE_* flag bits.
      * Returns the new TID on success or -errno on failure. */
-    return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5);
+    return (u64)scheduler_clone_thread(arg0, arg1, arg2, arg3, arg4, arg5, 0, 0, 0);
   case SYS_FUTEX:
     /* SYS_FUTEX(uaddr, op, val, timeout_ms) — WAIT/WAKE. timeout_ms>0 arms a
      * relative deadline on WAIT (returns -ETIMEDOUT on expiry); 0 = forever. */
@@ -4343,9 +5675,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       return (u64)-EFAULT;
     return 0;
   }
-  case SYS_SIGNALFD4:
-    /* signalfd4(fd, mask, flags). mask is a 64-bit signal bitmask. */
-    return (u64)vfs_signalfd((int)arg0, arg1, (int)arg2);
+  case SYS_SIGNALFD4: {
+    /* signalfd4(fd, sigmask_ptr, flags). mask is a pointer to a 64-bit
+     * signal bitmask (Linux/musl convention). Copy it from userspace. */
+    u64 mask_val = 0;
+    if (syscall_copyin(&mask_val, (void *)(usize)arg1, sizeof(mask_val)) < 0)
+      return (u64)-EFAULT;
+    return (u64)vfs_signalfd((int)arg0, mask_val, (int)arg2);
+  }
 
   case SYS_INOTIFY_INIT1:
     return (u64)vfs_inotify_init1((int)arg0);
@@ -4354,6 +5691,25 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                                       (u32)arg2);
   case SYS_INOTIFY_RM_WATCH:
     return (u64)vfs_inotify_rm_watch((int)arg0, (int)arg1);
+
+  case SYS_EXIT_GROUP:
+    scheduler_exit_group((int)arg0);
+    ret = 0;
+    break;
+
+  case SYS_SET_TID_ADDRESS:
+    /* set_tid_address(tidptr): store the clear-child-tid pointer and return
+     * the calling thread's TID.  musl calls this during __init_tls. */
+    task_set_child_tid_clear(current_task, (u64)arg0);
+    ret = (u64)scheduler_get_pid();
+    break;
+
+  case SYS_WRITEV:
+    return (u64)sys_writev((int)arg0, (const struct b1nix_iovec *)(usize)arg1,
+                           (int)arg2);
+  case SYS_READV:
+    return (u64)sys_readv((int)arg0, (const struct b1nix_iovec *)(usize)arg1,
+                          (int)arg2);
 
   default:
     console_write("syscall: unknown 0x");

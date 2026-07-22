@@ -4,6 +4,11 @@
 #include <dirent.h>
 #include <syscall.h>
 
+#ifdef __linux__
+#include <sys/syscall.h>
+#define SYS_SELFHOST_STATUS 511
+#endif
+
 struct b1nix_selfhost_status {
   unsigned int abi_version;
   unsigned int target_ready;

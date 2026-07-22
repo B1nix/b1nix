@@ -92,8 +92,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
 
   # --- compose CFLAGS -------------------------------------------------------
   CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-    -nostdinc -isystem $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
-    -O2 -fno-strict-aliasing -Db1nix"
+    -nostdinc $(port_musl_include_flags) -fPIC
+    -O2 -fno-strict-aliasing -Db1nix -D__linux__ -D__b1nix__ -D_GNU_SOURCE"
   for _d in $NSLIB_INC_DIRS; do CFLAGS="$CFLAGS -I$SRC_DIR/$_d"; done
   for _dep in ${NSLIB_DEPS:-}; do
     _inst="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/$_dep" | tail -1)"
