@@ -2,6 +2,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
+#include <b1nix/serial.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -161,6 +162,15 @@ int unix_listen(struct vfs_socket_state *s, int backlog) {
 }
 
 int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *addr) {
+  /* /dev/log: the kernel is the syslog sink (no userspace syslogd). musl's
+   * syslog() connect()s a SOCK_DGRAM here; accept it and forward later sends to
+   * the serial console instead of requiring a bound peer socket. */
+  if (addr->sun_path[0] &&
+      strcmp(addr->sun_path, "/dev/log") == 0) {
+    s->syslog_sink = 1;
+    s->connected = 1;
+    return 0;
+  }
   struct vfs_node *peer_node = vfs_find_node(addr->sun_path);
   if (IS_ERR(peer_node)) return -ECONNREFUSED;
   if (peer_node->inode->type != VFS_SOCKET) { vfs_node_put(peer_node); return -ENOTSOCK; }
@@ -219,12 +229,20 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
   return 0;
 }
 
-int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
+int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
+                int nonblock) {
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   struct unix_socket_data *new_u = (struct unix_socket_data *)new_s->unix_data;
-  
+
   while (1) {
     unix_lock(u);
+    if (u->backlog_count == 0 && nonblock) {
+      /* O_NONBLOCK listener with an empty backlog: report EAGAIN instead of
+       * blocking. displayd's pre-poll accept drain froze the compositor for
+       * seconds at a time without this. */
+      unix_unlock(u);
+      return -EAGAIN;
+    }
     if (u->backlog_count > 0) {
       struct unix_socket_data *client_u = u->backlog[0];
       for (int i = 0; i < u->backlog_count - 1; i++) u->backlog[i] = u->backlog[i+1];
@@ -266,6 +284,21 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s) {
 isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
                         struct vfs_handle **handles, usize nhandles,
                         const struct b1nix_ucred *cred, int nonblock) {
+  /* /dev/log syslog sink: forward the datagram to the serial console prefixed
+   * with "/dev/log: " (matches the M54-LOG smoke expectation). No peer/ring. */
+  if (s->syslog_sink) {
+    char line[512];
+    usize n = (buf && len < sizeof(line) - 1) ? len : (buf ? sizeof(line) - 1 : 0);
+    if (n)
+      memcpy(line, buf, n);
+    while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
+      n--;
+    line[n] = '\0';
+    serial_write("/dev/log: ");
+    serial_write(line);
+    serial_write("\n");
+    return (isize)len;
+  }
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   if ((nhandles || cred) && len == 0)
     return -EINVAL;

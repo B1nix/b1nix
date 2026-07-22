@@ -468,3 +468,21 @@ usize pty_fg_pgrp(int idx) {
     return 0;
   return ptys[idx].fg_pgrp;
 }
+
+/* Pts index behind an open pty master/slave handle (for /proc/<pid>/fd names),
+ * or -1 if `h` isn't a pty. */
+int pty_index_of(struct vfs_handle *h) {
+  if (!h ||
+      (h->kind != VFS_HANDLE_PTY_SLAVE && h->kind != VFS_HANDLE_PTY_MASTER))
+    return -1;
+  struct pty *p = (struct pty *)h->private_data;
+  return p ? p->index : -1;
+}
+
+/* Is pty slot `idx` currently allocated? Used by the /dev/pts lookup_cb to
+ * materialise a stat()-able /dev/pts/<idx> node only for live slaves. */
+int pty_allocated(int idx) {
+  if (idx < 0 || idx >= PTY_MAX)
+    return 0;
+  return ptys[idx].used;
+}

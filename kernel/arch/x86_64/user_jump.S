@@ -72,3 +72,66 @@ x86_user_jump:
     xorq %r15, %r15
     
     iretq
+
+/* void x86_clone_thread_jump(u64 entry, u64 stack, u64 start_func);
+ * M92 musl pthread: drop to ring 3 at the parent's instruction pointer
+ * (after the syscall in musl __clone), with rax=0 (clone return value)
+ * and r9=start_func (start_routine pointer). musl's child code then pops
+ * the arg from the user stack and calls *r9. */
+.global x86_clone_thread_jump
+.type x86_clone_thread_jump, @function
+x86_clone_thread_jump:
+    /* %rdi = entry (parent's RIP), %rsi = stack (user stack), %rdx = start_func */
+    /* Save start_func before FS reload clobbers r11 */
+    movq %rdx, %r11        /* r11 = start_func */
+
+    /* Reload FS base (same as x86_user_jump) — loading a segment selector
+     * zeroes the FS base, so snapshot+restore around the selector reload. */
+    movq %rcx, %r10        /* stash rcx (clobbered by rdmsr/wrmsr) */
+    movl $0xC0000100, %ecx
+    rdmsr
+    movl %eax, %r8d
+    movl %edx, %r9d
+    mov $0x1B, %ax
+    mov %ax, %ds
+    mov %ax, %es
+    mov %ax, %fs
+    movl %r8d, %eax
+    movl %r9d, %edx
+    movl $0xC0000100, %ecx
+    wrmsr
+    movq %r10, %rcx
+
+    /* Build iretq frame: SS, RSP, RFLAGS, CS, RIP */
+    pushq $0x1B        /* SS (user data) */
+    pushq %rsi         /* RSP (user stack) */
+    pushfq
+    popq %rax
+    orq $0x200, %rax   /* enable interrupts */
+    pushq %rax         /* RFLAGS */
+    pushq $0x23        /* CS (user code) */
+    pushq %rdi         /* RIP (parent's instruction pointer) */
+
+    /* Set registers for musl child thread:
+     * rax = 0  (clone() return value — child)
+     * r9  = start_func  (musl's __clone stores fn in r9 for the child)
+     * rsp = user stack  (set via iretq above)
+     * rip = parent's RIP  (set via iretq above)
+     * All other GPRs zeroed. rdi will be overwritten by musl's pop %rdi. */
+    xorq %rax, %rax
+    xorq %rbx, %rbx
+    xorq %rcx, %rcx
+    xorq %rdx, %rdx
+    xorq %rbp, %rbp
+    xorq %r8, %r8
+    xorq %r10, %r10
+    xorq %r12, %r12
+    xorq %r13, %r13
+    xorq %r14, %r14
+    xorq %r15, %r15
+    xorq %rdi, %rdi
+    xorq %rsi, %rsi
+    movq %r11, %r9     /* r9 = start_func (start_routine) */
+    xorq %r11, %r11
+
+    iretq

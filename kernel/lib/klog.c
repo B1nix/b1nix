@@ -3,6 +3,7 @@
 #include <b1nix/console.h>
 #include <b1nix/serial.h>
 #include <b1nix/klog.h>
+#include <b1nix/bootinfo.h>
 
 /* Kernel log ring buffer — KLOG_BUF_SIZE comes from <b1nix/klog.h> (64 KiB) so
  * the whole boot (PCI/driver/dhcp output, fed in via klog_putc from
@@ -137,14 +138,14 @@ void klog_putc(char ch)
 }
 
 /* ── Core log function ── */
-static void klog_write(int level, const char *message)
+static void klog_write_internal(int level, const char *message, int show_debug)
 {
     const char *prefix = klog_level_names[level];
     usize prefix_len = strlen(prefix);
     usize msg_len = strlen(message);
 
     /* Write to console and serial */
-    if (level >= KLOG_WARN) {
+    if (level >= KLOG_WARN || (level == KLOG_DEBUG && show_debug)) {
         console_write("[");
         console_write(prefix);
         console_write("] ");
@@ -169,6 +170,69 @@ static void klog_write(int level, const char *message)
     }
     klog_ring_put('\n');
 }
+static void klog_write(int level, const char *message)
+{
+    klog_write_internal(level, message, 0);
+}
+
+static int debug_value_matches(const char *value, const char *category)
+{
+    if (!value || !category || !category[0])
+        return 0;
+    if (strcmp(value, "1") == 0 || strcmp(value, "all") == 0)
+        return 1;
+
+    usize category_len = strlen(category);
+    for (usize i = 0; value[i];) {
+        while (value[i] == ',' || value[i] == ' ')
+            i++;
+        usize start = i;
+        while (value[i] && value[i] != ',' && value[i] != ' ')
+            i++;
+        if (i - start == category_len &&
+            memcmp(value + start, category, category_len) == 0)
+            return 1;
+    }
+    return 0;
+}
+
+int klog_debug_enabled(const char *category)
+{
+    char value[96];
+    if (bootinfo_get_kv("b1nix.debug", value, sizeof(value)) &&
+        debug_value_matches(value, category))
+        return 1;
+
+    char flag[64];
+    const char prefix[] = "b1nix.debug.";
+    usize prefix_len = sizeof(prefix) - 1;
+    usize category_len = category ? strlen(category) : 0;
+    if (category_len == 0 || prefix_len + category_len + 1 > sizeof(flag))
+        return 0;
+    memcpy(flag, prefix, prefix_len);
+    memcpy(flag + prefix_len, category, category_len);
+    flag[prefix_len + category_len] = '\0';
+    return bootinfo_has_flag(flag);
+}
+
+void klog_debug_category(const char *category, const char *msg)
+{
+    if (!klog_debug_enabled(category) || !msg)
+        return;
+
+    char line[256];
+    usize category_len = category ? strlen(category) : 0;
+    usize msg_len = strlen(msg);
+    if (category_len + msg_len + 3 > sizeof(line))
+        msg_len = sizeof(line) - category_len - 3;
+    memcpy(line, category, category_len);
+    line[category_len] = ':';
+    line[category_len + 1] = ' ';
+    memcpy(line + category_len + 2, msg, msg_len);
+    line[category_len + 2 + msg_len] = '\0';
+    klog_write_internal(KLOG_DEBUG, line, 1);
+}
+
 void klog_debug(const char *msg) { klog_write(KLOG_DEBUG, msg); }
 void klog_info(const char *msg)  { klog_write(KLOG_INFO, msg); }
 void klog_warn(const char *msg)  { klog_write(KLOG_WARN, msg); }

@@ -14,6 +14,9 @@
 
 /* Core logging functions */
 void klog_debug(const char *msg);
+/* Runtime-filtered diagnostics, enabled with b1nix.debug=all or a category. */
+int klog_debug_enabled(const char *category);
+void klog_debug_category(const char *category, const char *msg);
 void klog_info(const char *msg);
 void klog_warn(const char *msg);
 void klog_error(const char *msg);

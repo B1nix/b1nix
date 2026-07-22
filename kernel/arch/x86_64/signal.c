@@ -8,6 +8,7 @@
 #include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
+#include <stdio.h>
 #include <string.h>
 
 
@@ -104,7 +105,10 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
     si.si_signo = b1nix_signo_to_linux(sig);
     if (!si.si_signo)
       si.si_signo = sig;
-    si.si_code = 0; /* SI_USER */
+    si.si_code = si_code; /* SI_USER(0) / SI_QUEUE(-1) / SI_TIMER(-2) */
+    /* Carry the queued payload so an SA_SIGINFO handler reads si_value —
+     * required by sigqueue(3) and SIGEV_SIGNAL POSIX timers (M74). */
+    si.si_value = (long)(usize)si_val.sival_ptr;
 
     struct linux_ucontext uc;
     memset(&uc, 0, sizeof(uc));
@@ -190,14 +194,34 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
      * fetch_or. blocked_signals is task-local. */
     u64 pending = __atomic_load_n(&current_task->pending_signals,
                                   __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
+
     if (pending == 0) {
         interrupts_enable();
         return;
     }
 
+    if (klog_debug_enabled("signal")) {
+      char sigbuf[192];
+      snprintf(sigbuf, sizeof(sigbuf),
+               "pending task=%s pid=%u mask=%p rip=%p rsp=%p",
+               current_task->name ? current_task->name : "?",
+               (unsigned)current_task->id, (void *)(usize)pending,
+               (void *)(usize)frame->rip, (void *)(usize)frame->rsp);
+      klog_debug_category("signal", sigbuf);
+    }
+
     for (int i = 1; i <= NSIG; i++) {
         if (pending & (1ULL << (i - 1))) {
             struct sigaction *sa = &current_task->sigactions[i - 1];
+            if (klog_debug_enabled("signal")) {
+              char sigbuf[160];
+              snprintf(sigbuf, sizeof(sigbuf),
+                       "action task=%s pid=%u sig=%d handler=%p flags=%p pending=%p",
+                       current_task->name ? current_task->name : "?",
+                       (unsigned)current_task->id, i, (void *)(usize)sa->sa_handler,
+                       (void *)(usize)sa->sa_flags, (void *)(usize)pending);
+              klog_debug_category("signal", sigbuf);
+            }
             if (sa->sa_handler != SIG_IGN && sa->sa_handler != SIG_DFL) {
                 /* Deliver signal: build frame and redirect execution. Standard
                  * signals carry no RT payload (SI_USER, zero value). */
@@ -231,13 +255,21 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     scheduler_yield();
                     return;
                 } else {
-                    console_write("signal: process pid=");
-                    console_write_dec(current_task->id);
-                    console_write(" killed by signal ");
-                    console_write_dec(i);
-                    console_write(" rip=");
-                    console_write_hex64(frame->rip);
-                    console_write("\n");
+                    /* Only log genuine fault signals (crashes worth
+                     * diagnosing). Intentional kills — SIGKILL/SIGTERM/etc,
+                     * e.g. the sibling threads exit_group() terminates — are
+                     * expected termination; logging them just races userspace
+                     * serial output and corrupts adjacent test markers. */
+                    if (i == SIGSEGV || i == SIGILL || i == SIGBUS ||
+                        i == SIGFPE || i == SIGABRT) {
+                        console_write("signal: process pid=");
+                        console_write_dec(current_task->id);
+                        console_write(" killed by signal ");
+                        console_write_dec(i);
+                        console_write(" rip=");
+                        console_write_hex64(frame->rip);
+                        console_write("\n");
+                    }
                     /* Encode "killed by signal i" as 128+i so waitpid reports
                      * WIFSIGNALED with WTERMSIG == i (see scheduler_waitpid). */
                     scheduler_exit_current(128 + i);

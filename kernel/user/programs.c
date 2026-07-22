@@ -38,15 +38,15 @@ int shell_smoke_main(int argc, const char **argv);
  * and the 16-byte record ABI are all exercised for real; only the i8042
  * decode step is bypassed). Gives up after ~30 s if no client ever appears. */
 static void m47_input_injector_thread(void *arg) {
-  (void)arg;
+  int mouse_only = arg != 0;
   for (int spins = 0; spins < 600; spins++) {
-    if (input_dev_has_clients(INPUT_DEV_MOUSE)) {
+    if (spins >= 0 && input_dev_has_clients(INPUT_DEV_MOUSE)) {
       input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 7);
       input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -3);
       input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, 1);
       input_event_sync(INPUT_DEV_MOUSE);
     }
-    if (spins >= 5 && (spins % 10) == 5 &&
+    if (!mouse_only && spins >= 5 && (spins % 10) == 5 &&
         input_dev_has_clients(INPUT_DEV_KBD)) {
       input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x38, 1);
       input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x0f, 1);
@@ -54,13 +54,51 @@ static void m47_input_injector_thread(void *arg) {
       input_event_push(INPUT_DEV_KBD, B1NIX_EV_KEY, 0x38, 0);
       input_event_sync(INPUT_DEV_KBD);
     }
-    scheduler_sleep_ticks(50);
+    scheduler_sleep_ticks(1);
   }
 }
 
 static void uwrite(const char *text) {
   syscall_dispatch(SYS_WRITE, 1, (u64)(usize)text, strlen(text), 0, 0, 0);
 }
+
+/* Smoke children must not be able to hide every later suite behind a broken
+ * port or a userspace deadlock.  Polling keeps the parent runnable, and the
+ * timeout path kills and reaps only the child that failed to make progress.
+ * A timeout is diagnostic; it never emits a suite's success marker. */
+static int smoke_wait_child(u64 pid, int *status, const char *label,
+                            u64 timeout_ticks) {
+  u64 deadline = scheduler_get_uptime_ticks() + timeout_ticks;
+  for (;;) {
+    isize waited = (isize)syscall_dispatch(
+        SYS_WAITPID, pid, (u64)(usize)status, B1NIX_WNOHANG, 0, 0, 0);
+    if (waited == (isize)pid)
+      return 0;
+    if (waited < 0)
+      return -1;
+    if (scheduler_get_uptime_ticks() >= deadline) {
+      syscall_dispatch(SYS_KILL, pid, SIGKILL, 0, 0, 0, 0);
+      /* Reap without blocking. A broken child must never turn the watchdog
+       * into the next hang; SIGKILL normally makes the first poll reap it. */
+      for (u64 reap_deadline = scheduler_get_uptime_ticks() + 100;
+           scheduler_get_uptime_ticks() < reap_deadline;) {
+        isize reaped = (isize)syscall_dispatch(
+            SYS_WAITPID, pid, (u64)(usize)status, B1NIX_WNOHANG, 0, 0, 0);
+        if (reaped == (isize)pid || reaped < 0)
+          break;
+        syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+      }
+      uwrite("SMOKE-WATCHDOG: timeout ");
+      uwrite(label);
+      uwrite("\n");
+      return -2;
+    }
+    syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
+  }
+}
+
+#define SMOKE_TIMEOUT_NORMAL (30ULL * 100ULL)
+#define SMOKE_TIMEOUT_HEAVY (120ULL * 100ULL)
 
 /* ... (uwrite_dec_value, uwrite_ipv4, b1fetch_cpu_name remain unchanged) ... */
 
@@ -1237,7 +1275,7 @@ static int init_main(int argc, const char **argv) {
                                0, 0, 0, 0, 0);
     int status = 1;
     if ((isize)pid >= 0)
-      syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+      smoke_wait_child(pid, &status, "/bin/native-smoke", SMOKE_TIMEOUT_NORMAL);
     uwrite(status == 0 ? "B1NIX-QUICK: ok native\n"
                        : "B1NIX-QUICK: fail native\n");
     uwrite("B1NIX-QUICK: done\n");
@@ -1280,7 +1318,7 @@ static int init_main(int argc, const char **argv) {
                                   (u64)(usize)rc_argv, 0, 0, 0);
     if ((isize)rc_pid >= 0) {
       int rc_status = 0;
-      syscall_dispatch(SYS_WAIT, rc_pid, (u64)(usize)&rc_status, 0, 0, 0, 0);
+      smoke_wait_child(rc_pid, &rc_status, "/etc/rc", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1291,7 +1329,7 @@ static int init_main(int argc, const char **argv) {
                                  0, 0, 0);
     if ((isize)u_pid >= 0) {
       int u_status = 0;
-      syscall_dispatch(SYS_WAIT, u_pid, (u64)(usize)&u_status, 0, 0, 0, 0);
+      smoke_wait_child(u_pid, &u_status, "/bin/m27-smoke", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1311,7 +1349,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M40-LINUX: spawn-fail\n");
     } else {
       int lx_status = -1;
-      syscall_dispatch(SYS_WAIT, lx_pid, (u64)(usize)&lx_status, 0, 0, 0, 0);
+      smoke_wait_child(lx_pid, &lx_status, "/bin/m40-linux-hello", SMOKE_TIMEOUT_NORMAL);
       if (lx_status == 0)
         uwrite("M40-LINUX: ok run-static\n");
       else
@@ -1334,7 +1372,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M67-RUST: spawn-fail\n");
     } else {
       int r_status = -1;
-      syscall_dispatch(SYS_WAIT, r_pid, (u64)(usize)&r_status, 0, 0, 0, 0);
+      smoke_wait_child(r_pid, &r_status, "/bin/m67-rust", SMOKE_TIMEOUT_HEAVY);
       if (r_status == 0)
         uwrite("M67-RUST: ok run-std\n");
       else
@@ -1354,7 +1392,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("MM-SMOKE: spawn-fail\n");
     } else {
       int mm_status = 0;
-      syscall_dispatch(SYS_WAIT, mm_pid, (u64)(usize)&mm_status, 0, 0, 0, 0);
+      smoke_wait_child(mm_pid, &mm_status, "/bin/m-posixmm-smoke", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1370,7 +1408,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M55-LITEHTML: spawn-fail\n");
     } else {
       int lh_status = 0;
-      syscall_dispatch(SYS_WAIT, lh_pid, (u64)(usize)&lh_status, 0, 0, 0, 0);
+      smoke_wait_child(lh_pid, &lh_status, "/bin/m55-litehtml", SMOKE_TIMEOUT_HEAVY);
     }
   }
 
@@ -1384,7 +1422,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M55-IOSTREAM: spawn-fail\n");
     } else {
       int io_status = 0;
-      syscall_dispatch(SYS_WAIT, io_pid, (u64)(usize)&io_status, 0, 0, 0, 0);
+      smoke_wait_child(io_pid, &io_status, "/bin/m55-iostream", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1397,7 +1435,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M56-SMOKE: spawn-fail\n");
     } else {
       int m56_status = 0;
-      syscall_dispatch(SYS_WAIT, m56_pid, (u64)(usize)&m56_status, 0, 0, 0, 0);
+      smoke_wait_child(m56_pid, &m56_status, "/bin/m56-smoke", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1412,7 +1450,7 @@ static int init_main(int argc, const char **argv) {
       uwrite("M58-SMOKE: spawn-fail\n");
     } else {
       int js_status = 0;
-      syscall_dispatch(SYS_WAIT, js_pid, (u64)(usize)&js_status, 0, 0, 0, 0);
+      smoke_wait_child(js_pid, &js_status, "/bin/m58-smoke", SMOKE_TIMEOUT_NORMAL);
     }
   }
 
@@ -1422,7 +1460,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("NATIVE-SMOKE: spawn-fail\n");
   } else {
     int native_status = 0;
-    syscall_dispatch(SYS_WAIT, n_pid, (u64)(usize)&native_status, 0, 0, 0, 0);
+    smoke_wait_child(n_pid, &native_status, "/bin/native-smoke", SMOKE_TIMEOUT_NORMAL);
     if (native_status == 0) {
       uwrite("NATIVE-SMOKE: done\n");
     } else {
@@ -1430,12 +1468,13 @@ static int init_main(int argc, const char **argv) {
     }
   }
 
+#ifndef B1NIX_NO_B1CC
   u64 r42_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/return_42", 0, 0, 0, 0, 0);
   if ((isize)r42_pid < 0) {
     uwrite("B1CC-R42-SMOKE: spawn-fail\n");
   } else {
     int r42_status = 0;
-    syscall_dispatch(SYS_WAIT, r42_pid, (u64)(usize)&r42_status, 0, 0, 0, 0);
+    smoke_wait_child(r42_pid, &r42_status, "/bin/return_42", SMOKE_TIMEOUT_NORMAL);
     if (r42_status == 42 || (r42_status >> 8) == 42) {
       uwrite("B1CC-R42-SMOKE: ok\n");
     } else {
@@ -1451,7 +1490,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-HELLO-SMOKE: spawn-fail\n");
   } else {
     int hello_status = 0;
-    syscall_dispatch(SYS_WAIT, hello_pid, (u64)(usize)&hello_status, 0, 0, 0, 0);
+    smoke_wait_child(hello_pid, &hello_status, "/bin/b1cc_hello", SMOKE_TIMEOUT_NORMAL);
     if (hello_status == 0) {
       uwrite("B1CC-HELLO-SMOKE: ok\n");
     } else {
@@ -1468,7 +1507,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-ARGV-SMOKE: spawn-fail\n");
   } else {
     int argv_status = 0;
-    syscall_dispatch(SYS_WAIT, argv_pid, (u64)(usize)&argv_status, 0, 0, 0, 0);
+    smoke_wait_child(argv_pid, &argv_status, "/bin/b1cc_argv", SMOKE_TIMEOUT_NORMAL);
     if (argv_status == 0) {
       uwrite("B1CC-ARGV-SMOKE: ok\n");
     } else {
@@ -1484,7 +1523,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-FILE-SMOKE: spawn-fail\n");
   } else {
     int file_status = 0;
-    syscall_dispatch(SYS_WAIT, file_pid, (u64)(usize)&file_status, 0, 0, 0, 0);
+    smoke_wait_child(file_pid, &file_status, "/bin/b1cc_file_write", SMOKE_TIMEOUT_NORMAL);
     if (file_status == 0) {
       uwrite("B1CC-FILE-SMOKE: ok\n");
     } else {
@@ -1500,7 +1539,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-STDERR-SMOKE: spawn-fail\n");
   } else {
     int stderr_status = 0;
-    syscall_dispatch(SYS_WAIT, stderr_pid, (u64)(usize)&stderr_status, 0, 0, 0, 0);
+    smoke_wait_child(stderr_pid, &stderr_status, "/bin/b1cc_stderr_exit", SMOKE_TIMEOUT_NORMAL);
     if (stderr_status == 37 || (stderr_status >> 8) == 37) {
       uwrite("B1CC-STDERR-SMOKE: ok\n");
     } else {
@@ -1516,7 +1555,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-BETTER-C-SMOKE: spawn-fail\n");
   } else {
     int better_c_status = 0;
-    syscall_dispatch(SYS_WAIT, better_c_pid, (u64)(usize)&better_c_status, 0, 0, 0, 0);
+    smoke_wait_child(better_c_pid, &better_c_status, "/bin/b1cc_better_c", SMOKE_TIMEOUT_NORMAL);
     if (better_c_status == 0) {
       uwrite("B1CC-BETTER-C-SMOKE: ok\n");
     } else {
@@ -1532,7 +1571,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-M34-SMOKE: spawn-fail\n");
   } else {
     int c99_status = 0;
-    syscall_dispatch(SYS_WAIT, c99_pid, (u64)(usize)&c99_status, 0, 0, 0, 0);
+    smoke_wait_child(c99_pid, &c99_status, "/bin/b1cc_m34", SMOKE_TIMEOUT_NORMAL);
   if (c99_status == 0) {
     uwrite("B1CC-M34-SMOKE: ok\n");
     } else {
@@ -1550,7 +1589,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("B1CC-M34-TARGET: spawn-fail\n");
   } else {
     int m34_status = 0;
-    syscall_dispatch(SYS_WAIT, m34_pid, (u64)(usize)&m34_status, 0, 0, 0, 0);
+    smoke_wait_child(m34_pid, &m34_status, "/bin/b1cc_m34_corpus", SMOKE_TIMEOUT_HEAVY);
     if (m34_status == 0) {
       uwrite("B1CC-M34-TARGET: all ok\n");
     } else {
@@ -1580,13 +1619,14 @@ static int init_main(int argc, const char **argv) {
     }
   }
 #endif
+#endif /* B1NIX_NO_B1CC */
 
   u64 m12_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m12-smoke", 0, 0, 0, 0, 0);
   if ((isize)m12_pid < 0) {
     uwrite("M12-SMOKE: spawn-fail\n");
   } else {
     int m12_status = 0;
-    syscall_dispatch(SYS_WAIT, m12_pid, (u64)(usize)&m12_status, 0, 0, 0, 0);
+    smoke_wait_child(m12_pid, &m12_status, "/bin/m12-smoke", SMOKE_TIMEOUT_NORMAL);
   }
 
   u64 m13_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m13-smoke", 0, 0, 0, 0, 0);
@@ -1594,7 +1634,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("M13-SMOKE: spawn-fail\n");
   } else {
     int m13_status = 0;
-    syscall_dispatch(SYS_WAIT, m13_pid, (u64)(usize)&m13_status, 0, 0, 0, 0);
+    smoke_wait_child(m13_pid, &m13_status, "/bin/m13-smoke", SMOKE_TIMEOUT_NORMAL);
   }
 
   u64 m14_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m14-smoke", 0, 0, 0, 0, 0);
@@ -1602,7 +1642,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("M14-SMOKE: spawn-fail\n");
   } else {
     int m14_status = 0;
-    syscall_dispatch(SYS_WAIT, m14_pid, (u64)(usize)&m14_status, 0, 0, 0, 0);
+    smoke_wait_child(m14_pid, &m14_status, "/bin/m14-smoke", SMOKE_TIMEOUT_HEAVY);
   }
 
   u64 m15_pid = syscall_dispatch(SYS_SPAWN, (u64)(usize) "/bin/m15-smoke", 0, 0, 0, 0, 0);
@@ -1610,7 +1650,7 @@ static int init_main(int argc, const char **argv) {
     uwrite("M15-SMOKE: spawn-fail\n");
   } else {
     int m15_status = 0;
-    syscall_dispatch(SYS_WAIT, m15_pid, (u64)(usize)&m15_status, 0, 0, 0, 0);
+    smoke_wait_child(m15_pid, &m15_status, "/bin/m15-smoke", SMOKE_TIMEOUT_HEAVY);
   }
 
   if (bootinfo_has_flag("b1nix.skip-m25")) {
@@ -2149,7 +2189,7 @@ static int init_main(int argc, const char **argv) {
    * queues. The injector thread feeds the mouse-event burst the test binary
    * expects (no real input source exists in a headless smoke run). */
   {
-    (void)kthread_create("m47-inject", m47_input_injector_thread, 0);
+    (void)kthread_create("m47-inject", m47_input_injector_thread, (void *)1);
     u64 m47_pid = syscall_dispatch(SYS_SPAWN,
                                    (u64)(usize) "/bin/m47-smoke", 0,
                                    0, 0, 0, 0);
@@ -2937,7 +2977,7 @@ static int m22_run(const char *label, const char *path, int argc,
     return 1;
   }
   int status = 0;
-  syscall_dispatch(SYS_WAIT, pid, (u64)(usize)&status, 0, 0, 0, 0);
+  smoke_wait_child(pid, &status, path, SMOKE_TIMEOUT_NORMAL);
   if (status != 0) {
     uwrite("M22-SMOKE: fail ");
     uwrite(label);
@@ -3229,17 +3269,14 @@ static int m24_stress_main(int argc, const char **argv) {
       failures++;
       continue;
     }
+    /* /bin/true is a musl PIE (busybox applet): its ld.so relocation and applet
+     * dispatch make startup far longer than a tiny static binary, and under SMP
+     * load the child is not always runnable within a tight fixed spin budget.
+     * Use the same bounded blocking reap the other spawn sites use so a slow
+     * (but correct) child exit is not mistaken for a leaked task slot. */
     int status = 0;
-    int reaped = 0;
-    for (int spins = 0; spins < 200; spins++) {
-      u64 wr = syscall_dispatch(SYS_WAITPID, pid, (u64)(usize)&status, 1 /*WNOHANG*/, 0, 0, 0);
-      if (wr == pid) {
-        reaped = 1;
-        break;
-      }
-      syscall_dispatch(SYS_YIELD, 0, 0, 0, 0, 0, 0);
-    }
-    if (!reaped || status != 0)
+    if (smoke_wait_child(pid, &status, "/bin/true", SMOKE_TIMEOUT_NORMAL) != 0 ||
+        status != 0)
       failures++;
   }
 
@@ -3523,7 +3560,12 @@ int shell_smoke_main(int argc, const char **argv) {
                                    (u64)(usize)smoke_argv, 0, 0, 0);
   if ((isize)smoke_pid >= 0) {
     int smoke_status = 0;
-    syscall_dispatch(SYS_WAIT, smoke_pid, (u64)(usize)&smoke_status, 0, 0, 0, 0);
+    /* posix-smoke.sh drives every BusyBox wave (W3-W9) plus the standalone
+     * applet/account tests — 100+ short-lived processes. Under musl each spawn
+     * dynamically links (ld.so maps + relocates libc.so), so the whole script
+     * runs well past the 30s NORMAL budget; give it the HEAVY watchdog. */
+    smoke_wait_child(smoke_pid, &smoke_status, "/etc/posix-smoke.sh",
+                     SMOKE_TIMEOUT_HEAVY);
   }
   uwrite("M11-SMOKE: done\n");
   return 0;

@@ -17,6 +17,7 @@
  * Linux console=ttyS0 system running a getty on the same port.
  */
 #include <b1nix/vfs.h>
+#include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
@@ -75,10 +76,13 @@ static int rb_put(struct serial_tty *t, u8 c) {
 /* ── line discipline (producer context: BSP timer ISR or test inject) ── */
 
 static void stty_echo(struct serial_tty *t, u8 c) {
+  u64 flags;
+  console_lock_acquire_irqsave(&flags);
   if ((t->termios.c_oflag & B1NIX_OPOST) &&
       (t->termios.c_oflag & B1NIX_ONLCR) && c == '\n')
     serial_port_putc(t->com, '\r');
   serial_port_putc(t->com, (char)c);
+  console_lock_release_irqrestore(flags);
 }
 
 static void stty_commit_line(struct serial_tty *t) {
@@ -229,12 +233,21 @@ static isize stty_write(struct vfs_handle *h, const char *buf, usize size) {
     }
   }
 
+  /* Hold the same lock kernel console_write() uses for the whole buffer:
+   * serial_port_putc() is a raw, unlocked UART register write, so without
+   * this a concurrent console_write() (or another tty's write()) could land
+   * a byte in the middle of this buffer and vice versa — observed corrupting
+   * test markers under SMP exec churn (busybox stdout vs. kernel exec log,
+   * both landing on COM1). */
+  u64 flags;
+  console_lock_acquire_irqsave(&flags);
   for (usize i = 0; i < size; i++) {
     if ((t->termios.c_oflag & B1NIX_OPOST) &&
         (t->termios.c_oflag & B1NIX_ONLCR) && buf[i] == '\n')
       serial_port_putc(t->com, '\r');
     serial_port_putc(t->com, buf[i]);
   }
+  console_lock_release_irqrestore(flags);
   return (isize)size;
 }
 
@@ -257,6 +270,8 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
       return -EFAULT;
     return 0;
   case B1NIX_TCSETS:
+  case B1NIX_TCSETSW: /* TCSADRAIN — no output buffering, so same as TCSETS */
+  case B1NIX_TCSETSF: /* TCSAFLUSH — no input queue to flush here either */
     if (!arg || syscall_copyin(&t->termios, arg, sizeof(t->termios)) < 0)
       return -EFAULT;
     return 0;

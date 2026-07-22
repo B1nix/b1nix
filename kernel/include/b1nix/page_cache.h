@@ -11,9 +11,16 @@ struct vfs_inode;
  * refaulted). Active pages are the protected working set: eviction drains the
  * inactive list first and only demotes active pages when inactive is empty. */
 #define PAGE_CACHE_ACTIVE   4
+/* Entry's inode was destroyed while a reader still held a reference. The entry
+ * is already unlinked from the hash and LRU; the last page_cache_put_page frees
+ * its frame and defers the entry itself. */
+#define PAGE_CACHE_ORPHAN   8
 
 struct page_cache_entry {
   struct vfs_inode *inode;
+  u64 key_ino; // Cache key: vfs inode->ino (unique, never recycled — unlike the
+               // inode POINTER, which the slab pool reuses; keying by pointer
+               // let a recycled inode inherit a previous file's cached pages)
   u64 offset; // Page-aligned offset
   u64 frame;  // Physical frame
   u32 flags;

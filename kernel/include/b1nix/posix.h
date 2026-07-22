@@ -78,6 +78,11 @@
 
 #define B1NIX_TCGETS 0x5401
 #define B1NIX_TCSETS 0x5402
+/* tcsetattr(fd, act, ...) issues ioctl(fd, TCSETS+act): TCSADRAIN -> TCSETSW,
+ * TCSAFLUSH -> TCSETSF. b1nix ttys have no output buffering, so the drain/flush
+ * variants apply the termios identically to TCSETS. */
+#define B1NIX_TCSETSW 0x5403
+#define B1NIX_TCSETSF 0x5404
 #define B1NIX_TIOCSCTTY 0x540E
 #define B1NIX_TIOCGPGRP 0x540F
 #define B1NIX_TIOCSPGRP 0x5410

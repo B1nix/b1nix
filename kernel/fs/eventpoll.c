@@ -21,6 +21,8 @@
 #include <b1nix/arch.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/posix.h>
+#include <b1nix/linux_abi.h>
+#include <b1nix/user.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -381,6 +383,11 @@ static isize signalfd_read(struct vfs_handle *h, char *buf, usize len) {
                                             produced * sizeof(*si));
       memset(si, 0, sizeof(*si));
       si->ssi_signo = (u32)sig;
+      if (current_task && current_task->user_image &&
+          ((struct user_loaded_image *)current_task->user_image)->personality ==
+              PERSONALITY_LINUX) {
+        si->ssi_signo = (u32)b1nix_signo_to_linux(sig);
+      }
       si->ssi_pid = (u32)scheduler_get_pid();
       produced++;
     }
