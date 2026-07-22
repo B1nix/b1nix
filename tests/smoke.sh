@@ -215,14 +215,9 @@ run_qemu() {
 			-device isa-debug-exit,iobase=0xf4,iosize=0x04
 
 		if [ "${SMOKE_V8_MODE:-0}" = "1" ]; then
-			# V8/d8 instance: attach ONLY the d8 ext4 disk as sata0. d8 streams a
-			# 13 MB binary off it at boot; if swap/nvme are also present the rc's
-			# M14 storage test hammers the shared AHCI controller and corrupts/stalls
-			# that load. No GPU/net needed — d8 just runs JavaScript.
+			# V8/d8 instance: the d8 binary is now embedded in the ISO as
+			# GRUB module2 (ram0), no separate sata0 disk needed.
 			set -- "$@" -nic none -vga none \
-				-device ich9-ahci,id=ahci \
-				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
-				-device ide-hd,drive=satadrive,bus=ahci.0 \
 				${EXTRA_QEMU_ARGS:-}
 		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
 			# restrict=off by default: the NET-SMOKE ping-gateway and BusyBox
@@ -431,9 +426,8 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SHELL" 2>/dev/null
 fi
 if [ "$SMOKE_V8" = "1" ]; then
-	# sata0 = a writable copy of the prebuilt d8 disk (so journal recovery never
-	# mutates the source artifact). The v8 instance attaches no swap/nvme.
-	cp "$V8_DISK_SRC" "$SATA_IMG_V8"
+	# v8-ext4.img is embedded in the V8 ISO as GRUB module2 (ram0), no disk copy needed.
+	:
 fi
 
 # Define logs

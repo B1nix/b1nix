@@ -1361,6 +1361,7 @@ iso: check-b1cc-sync check-tcc-sync root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 	@echo "============================================================"
@@ -1381,6 +1382,7 @@ iso-core: root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
 
@@ -1393,6 +1395,7 @@ iso-graphics: root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
 
@@ -1405,6 +1408,7 @@ iso-shell: root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
 
@@ -1415,14 +1419,17 @@ iso-shell: root-image $(KERNEL_ELF)
 # drops to an interactive getty/bash that starves d8 on a single CPU.) Reuses the
 # shared kernel.elf — no recompile, just a different grub cmdline. The d8 binary +
 # m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
-iso-v8: $(KERNEL_ELF)
+iso-v8: $(KERNEL_ELF) root-image
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-v8/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-v8/boot/kernel.elf
+	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-v8/boot/rootfs.img
+	cp $(BUILD_ROOT)/v8-out/v8-ext4.img $(BUILD_DIR)/iso-v8/boot/v8.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.v8run b1nix.smoke=v8|g' \
-	     -e 's|@MODULE_CMD@||g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@|module2 /boot/v8.img v8.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-v8/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-v8.iso $(BUILD_DIR)/iso-v8
 # NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
@@ -1438,6 +1445,7 @@ iso-live: root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
@@ -1460,6 +1468,7 @@ iso-test: root-image $(KERNEL_ELF)
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g'
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
