@@ -30,7 +30,7 @@ xxd -i -n vfs_tcc_elf "$USERSPACE_BUILD/bin/tcc" >> "$OUT"
 # path was retired with the musl migration). tcc's b1nix branch links a single
 # "crt0.o", so hand it musl's crt1.o under that name; -lc resolves via the
 # /lib/libc.so -> ld-musl symlink already in the initramfs.
-MUSL_ROOT="build/musl-b1nix/$B1NIX_ARCH-b1nix/install/usr"
+MUSL_ROOT="build/$B1NIX_ARCH/ports/musl/install"
 
 echo "Packing /lib/crt0.o (musl crt1.o)..." >&2
 xxd -i -n vfs_crt0_o "$MUSL_ROOT/lib/crt1.o" >> "$OUT"

@@ -4,7 +4,8 @@
 # Handles compilation AND linking: when -shared or -o linking is detected,
 # uses ld.lld with b1nix sysroot instead of host linker.
 
-CROSS="/home/dmytrom/Documents/GitHub/b1nix/build/toolchain_build/x86_64-b1nix/cross"
+ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
+CROSS="$ROOT_DIR/build/${B1NIX_ARCH:-x86_64}/toolchain/llvm/cross"
 CLANG="${B1NIX_CLANG:-clang}"
 CLANGXX="${B1NIX_CLANGXX:-clang++}"
 LLD="${B1NIX_LLD:-$(command -v ld.lld 2>/dev/null || echo /usr/bin/ld.lld)}"
@@ -53,7 +54,7 @@ else
 fi
 
 # GL/EGL headers
-SKIA_DIR="/home/dmytrom/Documents/GitHub/b1nix/build/ports-src/skia"
+SKIA_DIR="$ROOT_DIR/build/src/skia"
 GL_FLAGS=""
 if [ -d "$SKIA_DIR/third_party/externals/opengl-registry/api" ]; then
   GL_FLAGS="-isystem $SKIA_DIR/third_party/externals/opengl-registry/api"
@@ -80,14 +81,16 @@ fi
 
 # Fontconfig + freetype + expat
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-MUSL_INC="$ROOT_DIR/build/musl-b1nix/x86_64-b1nix/install/usr/include"
-MUSL_RUNTIME="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/llvm-runtimes-build-musl"
+ARCH_DIR="$ROOT_DIR/build/${B1NIX_ARCH:-x86_64}"
+MUSL_SYSROOT="$ARCH_DIR/ports/musl/install"
+MUSL_INC="$MUSL_SYSROOT/include"
+MUSL_RUNTIME="$ARCH_DIR/toolchain/llvm-runtimes-build-musl"
 if [ -d "$MUSL_RUNTIME/libcxx-install/include/c++/v1" ]; then
   LIBCXX_HDR="$MUSL_RUNTIME/libcxx-install/include/c++/v1"
 else
-  LIBCXX_HDR="$CROSS/x86_64-b1nix/include/c++/v1"
+  LIBCXX_HDR="$MUSL_SYSROOT/include/c++/v1"
 fi
-FONTCONFIG_INC="$ROOT_DIR/build/fontconfig-b1nix/x86_64-b1nix/install/include"
+FONTCONFIG_INC="$ARCH_DIR/ports/fontconfig/install/include"
 FREETYPE_INC="$SKIA_DIR/third_party/externals/freetype/include"
 EXPAT_INC="$SKIA_DIR/third_party/externals/expat/lib"
 if [ -d "$FONTCONFIG_INC" ]; then GL_FLAGS="$GL_FLAGS -isystem $FONTCONFIG_INC"; fi
@@ -108,53 +111,31 @@ if [ "$IS_LINK" = "1" ]; then
     ARGS+=("$arg")
   done
   # libc++ runtime (for Dawn/Harfbuzz std::mutex etc.)
-  LIBCXX_RT="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/llvm-runtimes-build/libcxx-install/lib"
+  LIBCXX_RT="$MUSL_SYSROOT/lib"
   LIBCXX_L=""
   [ -d "$LIBCXX_RT" ] && LIBCXX_L="-L $LIBCXX_RT"
 
   # Mesa GL/EGL shared libs (OSMesa softpipe backend for b1nix).
-  # libOSMesa.so is the main consumer-facing lib; it DT_NEEDS libgallium.so,
-  # libglapi.so, etc. which the dynamic linker resolves at runtime.
-  MESA_LIB_DIR="$ROOT_DIR/build/mesa-b1nix/x86_64-b1nix/install/lib"
-  MESA_L=""
-  MESA_LIBS=""
-  if [ -d "$MESA_LIB_DIR" ]; then
-    MESA_L="-L $MESA_LIB_DIR"
-    MESA_LIBS="-lOSMesa"
-  fi
+  MESA_LIB_DIR="$ARCH_DIR/ports/mesa/install/lib"
+  FONTCONFIG_LIB_DIR="$ARCH_DIR/ports/fontconfig/install/lib"
+  FREETYPE_LIB_DIR="$ARCH_DIR/ports/freetype/install/lib"
+  EXPAT_LIB_DIR="$ARCH_DIR/ports/expat/install/lib"
+  ZLIB_LIB_DIR="$ARCH_DIR/ports/zlib/install/lib"
 
-  # b1nix platform libs: crt0 (startup), EGL, c11threads, b1nix libc, b1nix GUI
-  SYSROOT_LIB="$CROSS/x86_64-b1nix/lib"
-  PLATFORM_LIBS=""
-  # b1nix CRT startup (replaces host's crt1/Scrt1.o)
-  [ -f "$SYSROOT_LIB/crt0.o" ] && \
-    PLATFORM_LIBS="$PLATFORM_LIBS $SYSROOT_LIB/crt0.o"
-  # EGL implementation (wraps OSMesa, provides eglCreateContext etc.)
-  [ -f "$SYSROOT_LIB/libEGL_b1nix.a" ] && \
-    PLATFORM_LIBS="$PLATFORM_LIBS $SYSROOT_LIB/libEGL_b1nix.a"
-  [ -f "$SYSROOT_LIB/libb1nix_c11threads.a" ] && \
-    PLATFORM_LIBS="$PLATFORM_LIBS -Wl,--whole-archive $SYSROOT_LIB/libb1nix_c11threads.a -Wl,--no-whole-archive"
-  [ -f "$ROOT_DIR/userspace/build/x86_64/libb1nix.a" ] && \
-    PLATFORM_LIBS="$PLATFORM_LIBS $ROOT_DIR/userspace/build/x86_64/libb1nix.a"
-  [ -f "$ROOT_DIR/userspace/build/x86_64/libb1gui.a" ] && \
-    PLATFORM_LIBS="$PLATFORM_LIBS $ROOT_DIR/userspace/build/x86_64/libb1gui.a"
-
-  # b1nix's in-kernel eager dynamic linker resolves symbols through the SysV
-  # DT_HASH table only; lld defaults to .gnu.hash for linux targets, so force
-  # both so libskia.so/libraw_ptr.so carry the SysV hash the loader needs.
   exec "$REAL" \
-    --target=x86_64-unknown-linux-gnu \
-    --sysroot="$CROSS" \
+    --target=${B1NIX_TRIPLET:-x86_64-b1nix} \
+    --sysroot="$MUSL_SYSROOT" \
     -fuse-ld=lld \
     -Wl,--hash-style=both \
-    -Wl,-dynamic-linker=/lib/ld-b1nix.so \
     -nostartfiles \
-    -rtlib=compiler-rt -unwindlib=none -static-libgcc \
-    -L "$CROSS/x86_64-b1nix/lib" \
-    -L "$CROSS/lib" \
-    -L "$ROOT_DIR/userspace/build/x86_64" \
+    -L "$MUSL_SYSROOT/lib" \
+    -L "$FONTCONFIG_LIB_DIR" \
+    -L "$FREETYPE_LIB_DIR" \
+    -L "$EXPAT_LIB_DIR" \
+    -L "$ZLIB_LIB_DIR" \
+    -L "$MESA_LIB_DIR" \
+    -L "$ROOT_DIR/userspace/build/${B1NIX_ARCH:-x86_64}" \
     $LIBCXX_L \
-    $MESA_L \
     -D__b1nix__ -D__linux__ -Db1nix \
     -nostdinc++ \
     -nostdinc \

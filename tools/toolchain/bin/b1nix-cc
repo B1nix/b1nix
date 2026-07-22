@@ -44,7 +44,7 @@ while [ $# -gt 0 ]; do
 	case "$1" in
 		-o) shift; OUTPUT="$1" ;;
 		-c) ;;  # skip -c
-		-lm) LINK_FLAGS="$LINK_FLAGS $PROJECT_DIR/build/openlibm-b1nix/${B1NIX_ARCH}-b1nix/install/lib/libm.a" ;;
+		-lm) LINK_FLAGS="$LINK_FLAGS $PROJECT_DIR/build/${B1NIX_ARCH}/ports/openlibm/install/lib/libm.a" ;;
 		-*) FLAGS="$FLAGS $1" ;;
 		*) SOURCES="$SOURCES $1" ;;
 	esac

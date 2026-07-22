@@ -24,9 +24,10 @@ if [ "$B1NIX_ARCH" != "x86_64" ]; then
 fi
 
 TRIPLET="$B1NIX_TRIPLET"
-SKIA_OUT="$ROOT_DIR/build/ports-src/skia/out/b1nix"
+SKIA_OUT="$(ls -d "$ROOT_DIR/build/$B1NIX_ARCH/ports/skia/build/out/b1nix" "$ROOT_DIR/build/src/skia/out/b1nix" 2>/dev/null | head -1)"
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-CROSSL="$ROOT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+CROSSL="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
+[ -d "$CROSSL" ] || CROSSL="$TOOLCHAIN_BUILD_HOME/cross/lib"
 LLD="${B1NIX_LLD:-$(command -v ld.lld 2>/dev/null || echo /usr/bin/ld.lld)}"
 STRIP="$(command -v llvm-strip 2>/dev/null || command -v strip 2>/dev/null || echo strip)"
 
@@ -52,10 +53,10 @@ fi
 # Skia links -lfontconfig for its Fc* symbols. We fold the b1nix fontconfig
 # port plus its freetype/zlib/expat dependencies into one .so exporting Fc*.
 # The b1nix freetype has no libpng/Chromium-zlib deps, so the graph stays clean.
-FC_A="$ROOT_DIR/build/fontconfig-b1nix/$TRIPLET/install/lib/libfontconfig.a"
-FT_A="$ROOT_DIR/build/freetype-b1nix/$TRIPLET/install/lib/libfreetype.a"
-Z_A="$ROOT_DIR/build/zlib-b1nix/$TRIPLET/install/lib/libz.a"
-EX_A="$ROOT_DIR/build/expat-b1nix/$TRIPLET/install/lib/libexpat.a"
+FC_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/fontconfig/install/lib/libfontconfig.a"
+FT_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/freetype/install/lib/libfreetype.a"
+Z_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/zlib/install/lib/libz.a"
+EX_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/expat/install/lib/libexpat.a"
 for a in "$FC_A" "$FT_A" "$Z_A" "$EX_A"; do
   [ -f "$a" ] || { echo "build-skia-shared-deps: missing archive $a" >&2; exit 1; }
 done
@@ -78,7 +79,7 @@ B1GUI_A="$UB/libb1gui.a"
 # --- 4) libGLESv2.so — real Mesa GL entry points (for Dawn dlopen) -----------
 # Dawn's OpenGL ES backend loads libGLESv2.so via dlopen at runtime.
 # We fold Mesa's libglapi_static.a (1971 GL entry points) into a shared lib.
-MESA_DIR="$ROOT_DIR/build/mesa-b1nix/$TRIPLET/install/lib"
+MESA_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/lib"
 GLAPI_A="$MESA_DIR/libglapi_static.a"
 [ -f "$GLAPI_A" ] || { echo "build-skia-shared-deps: missing $GLAPI_A (run build-mesa.sh)" >&2; exit 1; }
 "$LLD" -shared -m elf_x86_64 --hash-style=both -soname libGLESv2.so \
@@ -98,7 +99,7 @@ EGL_RESOLVER_C="$ROOT_DIR/userspace/libegl/egl_proc_resolver.c"
 WRAPPER="$ROOT_DIR/tools/ports/b1nix-cross-cc.sh"
 EGL_OBJ="/tmp/b1egl_mesa_$$.o"
 EGL_RES_OBJ="/tmp/b1egl_resolver_$$.o"
-MESA_INC="$ROOT_DIR/build/mesa-b1nix/$TRIPLET/install/include"
+MESA_INC="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/include"
 B1GUI_INC="$ROOT_DIR/userspace/include"
 
 "$WRAPPER" -O2 -I "$MESA_INC" -I "$B1GUI_INC" -c "$EGL_MESA_C" -o "$EGL_OBJ"

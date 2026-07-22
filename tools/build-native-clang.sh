@@ -22,7 +22,7 @@ ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 export PROJECT_DIR="$ROOT"
 . "$ROOT/tools/toolchain/env.sh" 2>/dev/null || true
 B1NIX_TRIPLET="${B1NIX_TRIPLET:-x86_64-b1nix}"
-CROSS="${TOOLCHAIN_BUILD_HOME:-$ROOT/build/toolchain_build/$B1NIX_TRIPLET}/cross"
+CROSS="${TOOLCHAIN_BUILD_HOME:-$ROOT/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET}/cross"
 SYSROOT="${B1NIX_ROOTFS:-$ROOT/build/x86_64/rootfs}"
 HOST_TBLGEN="$ROOT/build/native-clang/host-tblgen"
 CLANG_BUILD="$ROOT/build/native-clang/full-build"
@@ -73,8 +73,8 @@ build_b1nix_native() {
     ensure_sources
     ensure_host_tblgen
 
-    CC_CROSS="$CROSS/bin/$B1NIX_TRIPLET-gcc"
-    CXX_CROSS="$CROSS/bin/$B1NIX_TRIPLET-g++"
+    CC_CROSS="$(ls "$CROSS/bin/$B1NIX_TRIPLET-cc" "$CROSS/bin/$B1NIX_TRIPLET-clang" 2>/dev/null | head -1)"
+    CXX_CROSS="$(ls "$CROSS/bin/$B1NIX_TRIPLET-c++" "$CROSS/bin/$B1NIX_TRIPLET-clang++" 2>/dev/null | head -1)"
     if [ ! -x "$CC_CROSS" ] || [ ! -x "$CXX_CROSS" ]; then
         echo "[native-clang] Missing b1nix C/C++ cross compiler:" >&2
         echo "  $CC_CROSS" >&2

@@ -17,21 +17,30 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$PROJECT_DIR/tools/toolchain/env.sh"
 
-LLVM_VER="${LLVM_VER:-18.1.8}"
+LLVM_VER="${LLVM_VER:-22.1.8}"
 # Build in a separate folder to avoid colliding with regular build
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build-musl"
 SRC_DIR="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/llvm-project-${LLVM_VER}.src"
 INSTALL_DIR="$BUILD_HOME/libcxx-install"
 RT_BUILD="$BUILD_HOME/build-runtimes"
 
-MUSL_SYSROOT="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install"
+MUSL_SYSROOT="$PROJECT_DIR/build/x86_64/ports/musl/install"
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
 
 # Verify prerequisites
 [ -d "$SRC_DIR" ] || { echo "LLVM sources not found at $SRC_DIR — run build-llvm-runtimes.sh first" >&2; exit 1; }
-[ -f "$PROJECT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a" ] || { echo "compiler-rt not found — run build-llvm-runtimes.sh first" >&2; exit 1; }
+[ -f "$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib/libcompiler_rt.a" ] || { echo "compiler-rt not found — run build-llvm-runtimes.sh first" >&2; exit 1; }
+
+# build-musl.sh installs musl flat (install/lib, install/include — same layout
+# as every other port). CMAKE_SYSROOT/clang expect the Linux-sysroot
+# convention (usr/lib, usr/include), so bridge the two with symlinks rather
+# than duplicating the flat install under usr/.
+mkdir -p "$MUSL_SYSROOT/usr"
+ln -sfn ../lib "$MUSL_SYSROOT/usr/lib"
+ln -sfn ../include "$MUSL_SYSROOT/usr/include"
+
 [ -f "$MUSL_SYSROOT/usr/lib/libc.a" ] || { echo "musl libc not built — run build-musl.sh first" >&2; exit 1; }
 
 mkdir -p "$BUILD_HOME" "$INSTALL_DIR"
@@ -154,7 +163,7 @@ cp -R "$LIBCXX_HDR_DIR/"* "$MUSL_SYSROOT/usr/include/c++/v1/"
 
 # ── Link shared libraries ──
 LD_BIN="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
-CRT_A="$PROJECT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+CRT_A="$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 LIBC_SO="$MUSL_SYSROOT/usr/lib/libc.so"
 ABI_SO="$MUSL_SYSROOT/usr/lib/libc++abi.so.1"
 CXX_SO="$MUSL_SYSROOT/usr/lib/libc++.so.1"

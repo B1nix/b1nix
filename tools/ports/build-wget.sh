@@ -18,29 +18,29 @@ port_pre_configure() {
   HOST_TRIPLET="$B1NIX_TRIPLET"
 
   # Stage dependencies
-  PCRE2_PREFIX="$ROOT_DIR/build/pcre2-b1nix/$HOST_TRIPLET/install"
+  PCRE2_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/pcre2/install"
   if [ ! -f "$PCRE2_PREFIX/lib/libpcre2-8.a" ]; then
     if ! "$ROOT_DIR/tools/ports/build-pcre2.sh" >/dev/null; then
       echo "build-wget.sh: PCRE2 build failed" >&2; exit 1
     fi
   fi
 
-  OPENSSL_PREFIX="$ROOT_DIR/build/openssl-b1nix/$HOST_TRIPLET/install"
+  OPENSSL_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/openssl/install"
   if [ ! -f "$OPENSSL_PREFIX/lib/libssl.a" ]; then
     if ! "$ROOT_DIR/tools/ports/build-openssl.sh" >/dev/null; then
       echo "build-wget.sh: OpenSSL build failed" >&2; exit 1
     fi
   fi
 
-  LIBIDN2_PREFIX="$ROOT_DIR/build/libidn2-b1nix/$HOST_TRIPLET/install"
-  LIBUNISTRING_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$HOST_TRIPLET/install"
+  LIBIDN2_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/libidn2/install"
+  LIBUNISTRING_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/libunistring/install"
   if [ ! -f "$LIBIDN2_PREFIX/lib/libidn2.a" ]; then
     if ! "$ROOT_DIR/tools/ports/build-libidn2.sh" >/dev/null; then
       echo "build-wget.sh: libidn2 build failed" >&2; exit 1
     fi
   fi
 
-  LIBPSL_PREFIX="$ROOT_DIR/build/libpsl-b1nix/$HOST_TRIPLET/install"
+  LIBPSL_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/libpsl/install"
   if [ ! -f "$LIBPSL_PREFIX/lib/libpsl.a" ]; then
     if ! "$ROOT_DIR/tools/ports/build-libpsl.sh" >/dev/null; then
       echo "build-wget.sh: libpsl build failed" >&2; exit 1

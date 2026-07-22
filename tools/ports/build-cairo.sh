@@ -11,12 +11,11 @@ CPORT_SRCNAME="cairo-${CAIRO_VERSION:-1.16.0}"
 CPORT_URL="https://www.cairographics.org/releases/cairo-${CAIRO_VERSION:-1.16.0}.tar.xz"
 CPORT_TARBALL="cairo-${CAIRO_VERSION:-1.16.0}.tar.xz"
 CPORT_HEADERS="flat:cairo.h flat:cairo-ft.h flat:cairo-deprecated.h flat:cairo-version.h gen:cairo-features.h"
+PORT_DEPS="openlibm pixman freetype"
 
 port_pre_build() {
   S="$SRC_DIR/src"
-  LIBM_DIR="$($ROOT_DIR/tools/ports/build-openlibm.sh)"
-  PIXMAN_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-pixman.sh")"
-  FT_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-freetype.sh")"
+  port_resolve_deps
 
   mkdir -p "$INSTALL_DIR/include/cairo"
 
@@ -45,8 +44,8 @@ EOF
 #define CAIRO_NO_MUTEX 1
 EOF
 
-  CPORT_CFLAGS="-DHAVE_CONFIG_H -I$GEN_DIR -I$S -I$LIBM_DIR/include \
-    -I$PIXMAN_DIR/include/pixman-1 -I$FT_DIR/include \
+  CPORT_CFLAGS="-DHAVE_CONFIG_H -I$GEN_DIR -I$S -I$OPENLIBM_DIR/include \
+    -I$PIXMAN_DIR/include/pixman-1 -I$FREETYPE_DIR/include \
     -Wno-implicit-function-declaration -Wno-incompatible-pointer-types \
     -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 }

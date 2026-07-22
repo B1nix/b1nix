@@ -14,9 +14,9 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 # Per-architecture build identity + per-triplet source/build dirs.
 . "$ROOT_DIR/tools/toolchain/env.sh"
-SRC_PARENT="$ROOT_DIR/build/openssl-src"
+SRC_PARENT="$ROOT_DIR/build/src/openssl"
 SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/openssl-${OPENSSL_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/openssl-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/openssl"
 INSTALL_DIR="$BUILD_DIR/install"
 
 mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR"

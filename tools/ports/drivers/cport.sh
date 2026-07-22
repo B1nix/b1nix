@@ -25,7 +25,7 @@
 # Manifest variables -------------------------------------------------------
 #   CPORT_NAME      port id; build dir = build/$CPORT_NAME-b1nix/$TRIPLET
 #   CPORT_ARCHIVE   output archive filename (libz.a, libpng16.a, libm.a, ...)
-#   CPORT_SRC_PARENT  source-cache parent (default build/ports-src)
+#   CPORT_SRC_PARENT  source-cache parent (default build/src)
 #   CPORT_SRCNAME   extracted source dir name under CPORT_SRC_PARENT
 #   CPORT_URL/CPORT_TARBALL/CPORT_SENTINEL  default fetch inputs (or port_fetch)
 #   CPORT_CFLAGS    port-specific compile flags (-D / -I); base freestanding
@@ -38,18 +38,18 @@
 
 : "${CPORT_NAME:?manifest must set CPORT_NAME}"
 : "${CPORT_ARCHIVE:?manifest must set CPORT_ARCHIVE}"
-CPORT_SRC_PARENT="${CPORT_SRC_PARENT:-$ROOT_DIR/build/ports-src}"
+CPORT_SRC_PARENT="${CPORT_SRC_PARENT:-$ROOT_DIR/build/src}"
 
 AR_BIN="$(port_ar)"
 CC="$(port_ccache_prefix)clang"
 TARGET="$(port_clang_target)"
 
 SRC_DIR="$CPORT_SRC_PARENT/${CPORT_SRCNAME:-$CPORT_NAME}"
-BUILD_DIR="$ROOT_DIR/build/$CPORT_NAME-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/$CPORT_NAME"
 OBJ_DIR="$BUILD_DIR/obj"
 GEN_DIR="$BUILD_DIR/gen"
 INSTALL_DIR="$BUILD_DIR/install"
-LOCKFILE="$ROOT_DIR/build/$CPORT_NAME-$B1NIX_TRIPLET.lock"
+LOCKFILE="$BUILD_DIR/locks/build.lock"
 mkdir -p "$(dirname "$LOCKFILE")"
 
 (
@@ -59,6 +59,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
     exit 0
   fi
   mkdir -p "$CPORT_SRC_PARENT" "$OBJ_DIR" "$GEN_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
+  : > "$BUILD_DIR/build.log"
+  exec 2>>"$BUILD_DIR/build.log"
 
   # --- fetch ----------------------------------------------------------------
   if command -v port_fetch >/dev/null 2>&1; then
@@ -136,5 +138,13 @@ mkdir -p "$(dirname "$LOCKFILE")"
 
   if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
 
+  find "$INSTALL_DIR" -type f | sed "s|^$INSTALL_DIR/||" > "$BUILD_DIR/pkg.manifest"
+  touch "$BUILD_DIR/build.stamp"
   echo "$INSTALL_DIR"
 ) 9>"$LOCKFILE"
+_cport_status=$?
+if [ "$_cport_status" != 0 ]; then
+  echo "build-$CPORT_NAME: FAILED — tail of $BUILD_DIR/build.log:" >&2
+  tail -30 "$BUILD_DIR/build.log" 2>/dev/null >&2
+fi
+exit "$_cport_status"

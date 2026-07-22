@@ -11,7 +11,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CPORT_NAME=zlib
 CPORT_ARCHIVE=libz.a
-CPORT_SRC_PARENT="$ROOT_DIR/build/zlib-src"
+CPORT_SRC_PARENT="$ROOT_DIR/build/src/zlib"
 VER="${ZLIB_VERSION:-1.3.1}"
 CPORT_SRCNAME="zlib-${VER}"
 CPORT_TARBALL="zlib-${VER}.tar.gz"

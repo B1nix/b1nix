@@ -9,15 +9,17 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CPORT_NAME=pixman
 CPORT_ARCHIVE=libpixman-1.a
-CPORT_SRC_PARENT="$ROOT_DIR/build/pixman-src"
+CPORT_SRC_PARENT="$ROOT_DIR/build/src/pixman"
 VER="${PIXMAN_VERSION:-0.42.2}"
 CPORT_SRCNAME="pixman-pixman-${VER}"
 CPORT_TARBALL="pixman-${VER}.tar.gz"
 CPORT_URL="https://gitlab.freedesktop.org/pixman/pixman/-/archive/pixman-${VER}/pixman-pixman-${VER}.tar.gz"
 
+PORT_DEPS="openlibm"
+
 port_pre_build() {
   P="$SRC_DIR/pixman"
-  LIBM_DIR="$("$ROOT_DIR/tools/ports/build-openlibm.sh")"
+  port_resolve_deps
   MAJOR=$(echo "$VER" | cut -d. -f1); MINOR=$(echo "$VER" | cut -d. -f2); MICRO=$(echo "$VER" | cut -d. -f3)
   sed -e "s/@PIXMAN_VERSION_MAJOR@/$MAJOR/g" \
       -e "s/@PIXMAN_VERSION_MINOR@/$MINOR/g" \
@@ -29,7 +31,7 @@ port_pre_build() {
 #define PACKAGE_VERSION "$VER"
 #define PACKAGE_BUGREPORT ""
 EOF
-  CPORT_CFLAGS="-I$LIBM_DIR/include -DHAVE_CONFIG_H -I$GEN_DIR -I$P \
+  CPORT_CFLAGS="-I$OPENLIBM_DIR/include -DHAVE_CONFIG_H -I$GEN_DIR -I$P \
 -Wno-implicit-function-declaration -DPIXMAN_NO_TLS"
 }
 

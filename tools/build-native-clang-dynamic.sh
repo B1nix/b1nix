@@ -44,8 +44,8 @@ DYN_INSTALL="$NC/b1nix-dyn-install"
 [ -d "$SRC" ] || { echo "missing LLVM source $SRC — run tools/build-native-clang.sh first" >&2; exit 1; }
 [ -x "$TBL/llvm-tblgen" ] || { echo "missing host tblgen — run tools/build-native-clang.sh first" >&2; exit 1; }
 
-# Refresh the cross sysroot's shared libc + libm.so alias (walls 2 & 3).
-ARCH="$ARCH" sh "$ROOT/tools/toolchain/stage-shared-libc.sh"
+# Refresh the musl libc sysroot (walls 2 & 3).
+B1NIX_ARCH="$ARCH" sh "$ROOT/tools/ports/build-musl.sh"
 
 # Wall 1: a CLEAN configure (fresh dir) so LLVM_ON_UNIX is set for B1nix.
 echo "[dyn-clang] clean configure ($DYN)"

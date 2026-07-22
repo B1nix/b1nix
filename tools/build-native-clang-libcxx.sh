@@ -31,8 +31,8 @@ TC="$NC/b1nix-libcxx-toolchain.cmake"
 [ -d "$SRC" ] || { echo "missing LLVM source $SRC — run tools/build-native-clang.sh first" >&2; exit 1; }
 [ -x "$TBL/llvm-tblgen" ] || { echo "missing host tblgen — run tools/build-native-clang.sh first" >&2; exit 1; }
 
-# Refresh the cross sysroot's shared libc + libm.so alias.
-ARCH="$ARCH" sh "$ROOT/tools/toolchain/stage-shared-libc.sh"
+# Refresh the musl libc sysroot.
+B1NIX_ARCH="$ARCH" sh "$ROOT/tools/ports/build-musl.sh"
 
 # Generate the clang + shared-libc++ CMake toolchain file.
 sh "$ROOT/tools/toolchain/gen-libcxx-native-cmake.sh" "$TC" >/dev/null

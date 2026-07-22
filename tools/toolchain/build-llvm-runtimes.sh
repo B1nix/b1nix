@@ -19,7 +19,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$PROJECT_DIR/tools/toolchain/env.sh"
 
-LLVM_VER="${LLVM_VER:-18.1.8}"
+LLVM_VER="${LLVM_VER:-22.1.8}"
 LLVM_URL="https://github.com/llvm/llvm-project/releases/download/llvmorg-${LLVM_VER}/llvm-project-${LLVM_VER}.src.tar.xz"
 LLVM_SHA256="${LLVM_SHA256:-}"
 
@@ -27,6 +27,22 @@ CROSS="$TOOLCHAIN_BUILD_HOME/cross"
 SYSROOT="$TOOLCHAIN_BUILD_HOME/sysroot"
 # M90 is intentionally GCC-free.  LLVM runtimes only need the b1nix sysroot
 # and are installed into the unversioned target lib directories below.
+
+MUSL_USR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
+if [ ! -f "$MUSL_USR/include/stdlib.h" ]; then
+    echo "build-llvm-runtimes.sh: building musl headers first..."
+    "$PROJECT_DIR/tools/ports/build-musl.sh" >/dev/null
+fi
+
+mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib" "$SYSROOT/include" "$SYSROOT/lib"
+if [ -d "$MUSL_USR/include" ]; then
+    cp -Rf "$MUSL_USR/include/"* "$SYSROOT/include/" 2>/dev/null || true
+    cp -Rf "$MUSL_USR/include/"* "$SYSROOT/usr/include/" 2>/dev/null || true
+fi
+if [ -d "$MUSL_USR/lib" ]; then
+    cp -Rf "$MUSL_USR/lib/"* "$SYSROOT/lib/" 2>/dev/null || true
+    cp -Rf "$MUSL_USR/lib/"* "$SYSROOT/usr/lib/" 2>/dev/null || true
+fi
 
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
@@ -70,10 +86,19 @@ COMMON_CMAKE_ARGS=(
     -DCMAKE_ASM_COMPILER="$CLANG_BIN"
     -DCMAKE_ASM_COMPILER_TARGET="$B1NIX_TRIPLET"
     -DCMAKE_SYSROOT="$SYSROOT"
+    -DCMAKE_C_FLAGS="-D_GNU_SOURCE=1"
+    -DCMAKE_CXX_FLAGS="-D_GNU_SOURCE=1"
     -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY
     -DCMAKE_BUILD_TYPE=Release
     -DLLVM_ENABLE_ASSERTIONS=OFF
 )
+
+if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
+    COMMON_CMAKE_ARGS+=(
+        -DCMAKE_C_COMPILER_LAUNCHER=ccache
+        -DCMAKE_CXX_COMPILER_LAUNCHER=ccache
+    )
+fi
 
 # ── 2. Build compiler-rt builtins ─────────────────────────────────────────────
 CRT_BUILD="$BUILD_HOME/build-compiler-rt"
@@ -172,10 +197,12 @@ done
 # ── 4. Install into cross sysroot ─────────────────────────────────────────────
 echo ""
 echo "Installing LLVM runtimes into cross sysroot..."
+mkdir -p "$SYSROOT/usr/lib" "$SYSROOT/usr/include" "$CROSS/$B1NIX_TRIPLET/lib" "$CROSS/$B1NIX_TRIPLET/include"
 for f in "$INSTALL_DIR"/lib/*.a; do
     [ -f "$f" ] || continue
     name="$(basename "$f")"
     cp -f "$f" "$SYSROOT/usr/lib/$name" 2>/dev/null || true
+    cp -f "$f" "$MUSL_USR/lib/$name" 2>/dev/null || true
     cp -f "$f" "$CROSS/$B1NIX_TRIPLET/lib/$name" 2>/dev/null || true
     echo "  installed: $name"
 done

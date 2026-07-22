@@ -36,7 +36,7 @@ SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PROJECT_DIR="$(cd "$SCRIPT_DIR/../.." && pwd)"
 . "$PROJECT_DIR/tools/toolchain/env.sh"
 
-LLVM_VER="${LLVM_VER:-18.1.8}"
+LLVM_VER="${LLVM_VER:-22.1.8}"
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build"
 SRC_DIR="$BUILD_HOME/llvm-project-${LLVM_VER}.src"
 INSTALL_DIR="$BUILD_HOME/libcxx-install"

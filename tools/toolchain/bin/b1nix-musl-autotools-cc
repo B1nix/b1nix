@@ -32,13 +32,13 @@ else
   LD_EMULATION="elf_x86_64"
 fi
 
-MUSL_INSTALL="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_INSTALL="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 MUSL_INCLUDE="$MUSL_INSTALL/include"
 MUSL_LIB="$MUSL_INSTALL/lib"
 # The real, fully-populated libc.so lives in the musl source build tree; the
 # installed usr/lib/libc.so is a small stub. Link the real one by path — with
 # no DT_SONAME it records DT_NEEDED=libc.so, exactly what musl's ld.so expects.
-MUSL_LIBSO="$PROJECT_DIR/build/musl-src/$B1NIX_TRIPLET/musl-1.2.5/lib/libc.so"
+MUSL_LIBSO="$PROJECT_DIR/build/src/musl/$B1NIX_TRIPLET/musl-1.2.5/lib/libc.so"
 MUSL_LIBSO_DIR="$(dirname "$MUSL_LIBSO")"
 DYN_LINKER="/lib/ld-musl-x86_64.so.1"
 

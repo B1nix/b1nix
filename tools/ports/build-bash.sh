@@ -34,7 +34,7 @@ esac
 export B1NIX_ARCH
 
 # Per-triplet source tree so x86 and x86_64 never share objects.
-SRC_PARENT="$ROOT_DIR/build/bash-src"
+SRC_PARENT="$ROOT_DIR/build/src/bash"
 SRC_DIR="$SRC_PARENT/$HOST_TRIPLET/bash-${BASH_VERSION_NUM}"
 
 mkdir -p "$SRC_PARENT/$HOST_TRIPLET"
@@ -194,7 +194,7 @@ LEGACY_CFLAGS="-g -O2 -fcommon -D_POSIX_VERSION=200809L -Wno-implicit-function-d
 # bash provides its own getenv/setenv/putenv/unsetenv (lib/sh/getenv.c) that
 # deliberately override libb1nix's; they appear first in the link line, so
 # --allow-multiple-definition makes the linker keep bash's set.
-export B1NIX_LD_EXTRA="--allow-multiple-definition -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 -L$ROOT_DIR/build/musl-b1nix/x86_64-b1nix/install/usr/lib -lc"
+export B1NIX_LD_EXTRA="--allow-multiple-definition -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 -L$ROOT_DIR/build/x86_64/ports/musl/install/lib -lc"
 # bash links dynamically against libc.so.1 via the shared recipe's default
 # (B1NIX_LINK=dynamic). bash's own getenv/setenv/putenv set manipulates `environ`
 # directly, so the link emits an R_X86_64_COPY for `environ` (+ stdin/stdout/

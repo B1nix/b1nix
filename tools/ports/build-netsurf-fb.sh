@@ -18,9 +18,10 @@ PROJECT_DIR="$ROOT_DIR"
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
 NS_VERSION="${NS_VERSION:-3.11}"
-SRC_PARENT="$ROOT_DIR/build/netsurf-src"
+SRC_PARENT="$ROOT_DIR/build/src/netsurf"
+mkdir -p "$SRC_PARENT"
 SRC_DIR="$SRC_PARENT/netsurf-${NS_VERSION}"
-SYSROOT="$ROOT_DIR/build/netsurf-sysroot/$B1NIX_TRIPLET"
+SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/netsurf-fb/sysroot"
 PKGDIR="$SYSROOT/lib/pkgconfig"
 CROSSBIN="$TOOLCHAIN_BUILD_HOME/cross/bin"
 
@@ -54,7 +55,7 @@ if [ ! -d "$SRC_DIR" ]; then
 fi
 
 if [ "$B1NIX_ARCH" = "x86" ]; then NSC_TARGET="i686-unknown-elf"; else NSC_TARGET="x86_64-unknown-elf"; fi
-CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && CC="ccache clang"
+CC="clang"
 AR="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 
 mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$PKGDIR"
@@ -68,8 +69,13 @@ mkdir -p "$SYSROOT/include" "$SYSROOT/lib" "$PKGDIR"
 MUSL_WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
 CROSSBIN="$SYSROOT/toolchain-bin"
 mkdir -p "$CROSSBIN"
-ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-gcc"
-ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-g++"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-cc"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-c++"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-clang"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-musl-clang++"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/gcc"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/cc"
+ln -sf "$MUSL_WRAP" "$CROSSBIN/$B1NIX_TRIPLET-gcc"
 
 # ── 1. Build every dependency lib and copy its install tree into the sysroot ──
 # pkgname:builder:libfile:requires
@@ -129,8 +135,8 @@ stage build-libjxl.sh    # libjxl_dec/cms + libhwy + libbrotli — JPEG-XL (C++/
 # reached if a thread_local with a non-trivial destructor is constructed, which
 # libjxl's decode path does not do, so --allow-shlib-undefined tolerates it at
 # link time — the same lenient shlib linking Mesa relies on.
-cp "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/"libc++.so* \
-   "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/"libc++abi.so* \
+cp "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib/"libc++.so* \
+   "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib/"libc++abi.so* \
    "$SYSROOT/lib/" 2>/dev/null || true
 # NOTE: libharu (PDF export) is ported as a standalone library
 # (tools/ports/build-libharu.sh builds libhpdf.a), but NetSurf 3.11's PDF glue is
@@ -164,7 +170,7 @@ cp "$ROOT_DIR/userspace/build/$B1NIX_ARCH/libb1gui.a" "$SYSROOT/lib/"
 OLM_SRC="$(ls -d "$ROOT_DIR"/build/openlibm-src/openlibm-*/ 2>/dev/null | head -1)"
 if [ -n "$OLM_SRC" ]; then
   if [ "$B1NIX_ARCH" = "x86" ]; then OLM_ARCH=i387; else OLM_ARCH=amd64; fi
-  _MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+  _MUSL_INC="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
   _CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
   OLM_CFLAGS="--target=$NSC_TARGET -ffreestanding -fno-builtin -fno-stack-protector
     -nostdinc -isystem $_MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include}
@@ -185,18 +191,18 @@ fi
 # ── Stage libcurl + mbedTLS so NetSurf's HTTP(S) fetcher can be enabled. The
 #    b1nix curl port is built static against mbedTLS; we expose libcurl.a, the
 #    curl headers and the mbedTLS archives through a libcurl.pc. ──
-CURL_SRC="$(ls -d "$ROOT_DIR"/build/curl-src/$B1NIX_TRIPLET/curl-*/ 2>/dev/null | head -1)"
-CURL_A="$ROOT_DIR/build/curl-b1nix/$B1NIX_TRIPLET/lib/.libs/libcurl.a"
-MBED_DIR="$ROOT_DIR/build/mbedtls-b1nix/$B1NIX_TRIPLET/install"
+CURL_SRC="$(ls -d "$ROOT_DIR"/build/src/curl/curl-*/ "$ROOT_DIR"/build/curl-src/$B1NIX_TRIPLET/curl-*/ 2>/dev/null | head -1)"
+CURL_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/curl/lib/.libs/libcurl.a"
+MBED_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mbedtls/install"
 # The b1nix curl port enables libpsl (Public Suffix List) and libidn2 (IDN),
 # which in turn pulls libunistring. libcurl.a therefore references psl_*/idn2_*
 # /u8_*/u32_* symbols. Stage those archives and list them in libcurl.pc in
 # dependency order (psl → idn2 → unistring), otherwise the static nsfb link
 # fails with undefined references on a clean rebuild. All optional: only wired
 # in when the archives are present.
-PSL_A="$ROOT_DIR/build/libpsl-b1nix/$B1NIX_TRIPLET/install/lib/libpsl.a"
-IDN2_A="$ROOT_DIR/build/libidn2-b1nix/$B1NIX_TRIPLET/install/lib/libidn2.a"
-UNISTRING_A="$ROOT_DIR/build/libunistring-b1nix/$B1NIX_TRIPLET/install/lib/libunistring.a"
+PSL_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libpsl/install/lib/libpsl.a"
+IDN2_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libidn2/install/lib/libidn2.a"
+UNISTRING_A="$ROOT_DIR/build/$B1NIX_ARCH/ports/libunistring/install/lib/libunistring.a"
 CURL_EXTRA_LIBS=""
 HAVE_CURL=no
 if [ -f "$CURL_A" ] && [ -n "$CURL_SRC" ] && [ -d "$MBED_DIR/lib" ]; then
@@ -740,7 +746,7 @@ if [ ! -x "$SYSROOT/bin/nsgenbind" ] && [ -d "$NSALL_DIR/nsgenbind" ]; then
   if [ -d "/opt/homebrew/opt/bison/bin" ]; then
     PATH_WITH_BISON="/opt/homebrew/opt/bison/bin:$PATH_WITH_BISON"
   fi
-  PATH="$PATH_WITH_BISON" make -j1 MAKEFLAGS= -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
+  PATH="$PATH_WITH_BISON" make -j1 MAKEFLAGS= CCACHE="" -C "$NSALL_DIR/nsgenbind" PREFIX="$SYSROOT" \
     NSSHARED="$NSALL_DIR/buildsystem" install 1>&2
 fi
 export PATH="$SYSROOT/bin:$PATH"
@@ -773,12 +779,12 @@ else
   # static libpng16.a (which would cause TLS mismatches with the host libc).
   if pkg-config --exists libpng 2>/dev/null; then
     HOST_LIBPNG_CFLAGS="$(pkg-config --cflags libpng)"
-    HOST_LIBPNG_LDFLAGS="-L/usr/lib $(pkg-config --libs libpng)"
+    HOST_LIBPNG_LDFLAGS="$(pkg-config --libs libpng) -lm"
   elif pkg-config --exists libpng16 2>/dev/null; then
     HOST_LIBPNG_CFLAGS="$(pkg-config --cflags libpng16)"
-    HOST_LIBPNG_LDFLAGS="-L/usr/lib $(pkg-config --libs libpng16)"
+    HOST_LIBPNG_LDFLAGS="$(pkg-config --libs libpng16) -lm"
   else
-    HOST_LIBPNG_LDFLAGS="-L/usr/lib -lpng16 -lz"
+    HOST_LIBPNG_LDFLAGS="-lpng16 -lz -lm"
   fi
 fi
 
@@ -788,7 +794,11 @@ fi
 # The musl wrapper handles crt/libc/PIE/linker-script itself, so no libgcc,
 # libc++, dso_handle or custom linker script is needed here (JPEG-XL/C++ off).
 export CFLAGS="${CFLAGS:-} -fPIC"
-make -C "$SRC_DIR" \
+make -j1 -C "$SRC_DIR" \
+  CC="$CROSSBIN/$B1NIX_TRIPLET-musl-cc" \
+  V=1 \
+  BUILD_CC="clang" \
+  CCACHE="" \
   TARGET=framebuffer \
   HOST="$B1NIX_GCC_ARCH" \
   BUILD_LIBPNG_CFLAGS="$HOST_LIBPNG_CFLAGS" \
@@ -814,11 +824,11 @@ make -C "$SRC_DIR" \
   "$@"
 
 # Save the per-arch binary (NetSurf always writes ./nsfb in the source tree).
-OUT_DIR="$ROOT_DIR/build/netsurf-fb-b1nix/$B1NIX_TRIPLET"
+OUT_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/netsurf-fb/install/bin"
 mkdir -p "$OUT_DIR"
 cp "$SRC_DIR/nsfb" "$OUT_DIR/nsfb"
 # Strip debug info (5.6MB -> ~2MB) so the binary is reasonable to embed.
-STRIP_BIN="$CROSSBIN/$B1NIX_TRIPLET-strip"
+STRIP_BIN="$(command -v llvm-strip 2>/dev/null || echo "$CROSSBIN/$B1NIX_TRIPLET-strip")"
 [ -x "$STRIP_BIN" ] && "$STRIP_BIN" "$OUT_DIR/nsfb" 2>/dev/null || true
 echo "netsurf framebuffer browser built for $B1NIX_TRIPLET → $OUT_DIR/nsfb" 1>&2
 echo "$OUT_DIR/nsfb"

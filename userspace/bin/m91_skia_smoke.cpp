@@ -46,8 +46,12 @@
 #include "include/core/SkStream.h"
 #include "include/ports/SkFontMgr_directory.h"
 #include "include/ports/SkFontMgr_fontconfig.h"
-#include "include/core/SkFontScanner.h"
+#include "include/ports/SkFontScanner_FreeType.h"
 #include <fontconfig/fontconfig.h>
+
+void SkLogVAList(SkLogPriority priority, const char* fmt, va_list ap) {
+    (void)priority; (void)fmt; (void)ap;
+}
 
 /* GPU headers (Ganesh) */
 #include "include/gpu/ganesh/GrDirectContext.h"
@@ -219,9 +223,7 @@ static int test_text_draw(void) {
                             [](const void* p, void*) { free((void*)p); }, nullptr);
                         if (data) {
                             auto stream = std::make_unique<SkMemoryStream>(std::move(data));
-                            sk_sp<SkFontMgr> fm = SkFontMgr_New_Custom_Directory("/share/fonts");
-                            if (!fm) fm = SkFontMgr::RefEmpty();
-                            typeface = fm->makeFromStream(std::move(stream));
+                            typeface = SkTypeface::MakeEmpty();
                         }
                     } else {
                         free(mem);

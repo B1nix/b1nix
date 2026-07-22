@@ -21,15 +21,15 @@ mkdir -p "$BUILD_HOME" "$PREFIX" "$PREFIX/bin" "$PREFIX/$B1NIX_TRIPLET/bin" "$PR
 mkdir -p "$B1NIX_ROOTFS/lib" "$B1NIX_ROOTFS/usr/lib"
 ln -sfn "$B1NIX_ROOTFS" "$SYSROOT" 2>/dev/null || true
 
-# 2. Build userspace libc headers/libs and install to rootfs
-echo "Building userspace libc and staging headers/libs..."
-(
-  flock -x 9
-  make -C "$PROJECT_DIR/userspace" B1NIX_ARCH="$B1NIX_ARCH" install-headers-libs
-) 9>/tmp/b1nix-userspace-headers.lock
-
-# Refresh dynamic libc inside the sysroot/triplet lib dirs
-ARCH="$B1NIX_ARCH" sh "$PROJECT_DIR/tools/toolchain/stage-shared-libc.sh"
+# 2. Build musl libc headers/libs and stage into sysroot
+echo "Building musl libc and staging headers/libs..."
+B1NIX_ARCH="$B1NIX_ARCH" sh "$PROJECT_DIR/tools/ports/build-musl.sh" 1>&2
+MUSL_USR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install"
+if [ -d "$MUSL_USR" ]; then
+    mkdir -p "$SYSROOT/usr/include" "$SYSROOT/usr/lib" "$SYSROOT/include" "$SYSROOT/lib"
+    cp -Rf "$MUSL_USR/include/"* "$SYSROOT/include/" 2>/dev/null || true
+    cp -Rf "$MUSL_USR/lib/"* "$SYSROOT/lib/" 2>/dev/null || true
+fi
 
 # 3. Create the LLVM/Clang compiler wrappers and tool symlinks in PREFIX/bin
 echo "Creating compiler shims and tool symlinks..."
@@ -39,8 +39,6 @@ echo "Creating compiler shims and tool symlinks..."
 # script — copying left a stale x86_64-b1nix-gcc that missed wrapper fixes. The
 # wrappers locate the project root by walking up from their own path (Makefile +
 # kernel/), which resolves correctly through the symlink.
-ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-autotools-cc" "$PREFIX/bin/${B1NIX_TRIPLET}-gcc"
-ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-c++" "$PREFIX/bin/${B1NIX_TRIPLET}-g++"
 ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-autotools-cc" "$PREFIX/bin/${B1NIX_TRIPLET}-cc"
 ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-c++" "$PREFIX/bin/${B1NIX_TRIPLET}-c++"
 ln -sf "$PROJECT_DIR/tools/toolchain/bin/b1nix-autotools-cc" "$PREFIX/bin/${B1NIX_TRIPLET}-clang"
@@ -68,8 +66,10 @@ ln -sf "$HOST_LLVM_READELF" "$PREFIX/bin/${B1NIX_TRIPLET}-readelf"
 # Now setup the inner bin dir (for meson/autotools cross file resolution)
 (
     cd "$PREFIX/$B1NIX_TRIPLET/bin"
-    ln -sf "../../bin/${B1NIX_TRIPLET}-gcc" gcc
-    ln -sf "../../bin/${B1NIX_TRIPLET}-g++" g++
+    ln -sf "../../bin/${B1NIX_TRIPLET}-cc" cc
+    ln -sf "../../bin/${B1NIX_TRIPLET}-c++" c++
+    ln -sf "../../bin/${B1NIX_TRIPLET}-clang" clang
+    ln -sf "../../bin/${B1NIX_TRIPLET}-clang++" clang++
     ln -sf "../../bin/${B1NIX_TRIPLET}-ar" ar
     ln -sf "../../bin/${B1NIX_TRIPLET}-ranlib" ranlib
     ln -sf "../../bin/${B1NIX_TRIPLET}-strip" strip

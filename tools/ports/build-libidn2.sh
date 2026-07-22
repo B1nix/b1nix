@@ -12,7 +12,7 @@ AUTOTOOLS_SENTINEL="configure"
 PATCHES="libidn2/b1nix-config.sh"
 
 port_pre_configure() {
-  UNISTR_PREFIX="$ROOT_DIR/build/libunistring-b1nix/$B1NIX_TRIPLET/install"
+  UNISTR_PREFIX="$ROOT_DIR/build/$B1NIX_ARCH/ports/libunistring/install"
   if [ ! -f "$UNISTR_PREFIX/lib/libunistring.a" ]; then
     "$ROOT_DIR/tools/ports/build-libunistring.sh" >/dev/null
   fi

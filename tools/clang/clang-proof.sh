@@ -41,7 +41,7 @@ if [ "${CLANG_LIBCXX:-0}" = "1" ]; then
 	CLANG="$PFX/bin/clang-22"
 	RESDIR="$(ls -d "$PFX"/lib/clang/* 2>/dev/null | head -1)"
 	LIBLLVM="$PFX/lib/libLLVM-22.so"
-	CXXSO_DIR="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross/x86_64-b1nix/lib"
+	CXXSO_DIR="$ROOT_DIR/build/x86_64/toolchain/x86_64-b1nix/cross/x86_64-b1nix/lib"
 	EXTRA_SOS="$CXXSO_DIR/libc++.so.1 $CXXSO_DIR/libc++abi.so.1"
 	for f in "$LIBLLVM" $EXTRA_SOS; do
 		[ -f "$f" ] || { echo "missing $f — run tools/build-native-clang-libcxx.sh + stage-dynamic-clang.sh"; exit 1; }

@@ -26,7 +26,7 @@
 #               NSLIB_TARBALL  (default ${NSLIB_NAME}-${NSLIB_VERSION}-src.tar.gz)
 #               NSLIB_URL      (default netsurf releases URL for the tarball)
 #               NSLIB_SRCNAME  (default ${NSLIB_NAME}-${NSLIB_VERSION})
-#     bundle:   NSLIB_BUNDLE_SUBDIR  subdir under build/netsurf-src/netsurf-all-*/
+#     bundle:   NSLIB_BUNDLE_SUBDIR  subdir under build/src/netsurf/netsurf-all-*/
 #               NSLIB_SENTINEL       a file under that subdir used to validate it
 #   NSLIB_SOURCES         explicit space/newline list of *.c rel to $SRC_DIR
 #   NSLIB_FIND_DIR        if NSLIB_SOURCES empty: find *.c under $SRC_DIR/<dir>
@@ -51,11 +51,11 @@ AR_BIN="$(port_ar)"
 CC="$(port_ccache_prefix)clang"
 TARGET="$(port_clang_target)"
 
-SRC_PARENT="$ROOT_DIR/build/netsurf-src"
-BUILD_DIR="$ROOT_DIR/build/$NSLIB_NAME-b1nix/$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/src/netsurf"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/$NSLIB_NAME"
 OBJ_DIR="$BUILD_DIR/obj"
 INSTALL_DIR="$BUILD_DIR/install"
-LOCKFILE="$ROOT_DIR/build/$NSLIB_NAME-$B1NIX_TRIPLET.lock"
+LOCKFILE="$BUILD_DIR/locks/build.lock"
 mkdir -p "$(dirname "$LOCKFILE")"
 
 (
@@ -65,6 +65,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
     exit 0
   fi
   mkdir -p "$SRC_PARENT" "$OBJ_DIR" "$INSTALL_DIR/include" "$INSTALL_DIR/lib"
+  : > "$BUILD_DIR/build.log"
+  exec 2>>"$BUILD_DIR/build.log"
 
   # --- locate / fetch the source tree ---------------------------------------
   if [ "$NSLIB_SOURCE" = "bundle" ]; then
@@ -164,5 +166,13 @@ mkdir -p "$(dirname "$LOCKFILE")"
 
   if command -v port_post_install >/dev/null 2>&1; then port_post_install; fi
 
+  find "$INSTALL_DIR" -type f | sed "s|^$INSTALL_DIR/||" > "$BUILD_DIR/pkg.manifest"
+  touch "$BUILD_DIR/build.stamp"
   echo "$INSTALL_DIR"
 ) 9>"$LOCKFILE"
+_nslib_status=$?
+if [ "$_nslib_status" != 0 ]; then
+  echo "build-$NSLIB_NAME: FAILED — tail of $BUILD_DIR/build.log:" >&2
+  tail -30 "$BUILD_DIR/build.log" 2>/dev/null >&2
+fi
+exit "$_nslib_status"

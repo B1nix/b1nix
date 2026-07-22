@@ -20,7 +20,7 @@ case "${1:-}" in
   --run-only)   RUN_ONLY=1 ;;
 esac
 
-MUSL_BUILD="build/musl-b1nix/x86_64-b1nix"
+MUSL_BUILD="build/x86_64/ports/musl"
 MUSL_INSTALL="$MUSL_BUILD/install/usr"
 SMOKE_DYN_BIN="build/m92-musl-dyn-smoke"
 SMOKE_DYN_INC="build/x86_64/initramfs_m92_musl_dyn_smoke.inc"

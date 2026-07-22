@@ -29,8 +29,11 @@ import("//build/toolchain/gcc_toolchain.gni")
 # Source root `//` is build/toolchain_build/v8-skeleton/v8; the cross toolchain
 # lives at build/toolchain_build/x86_64-b1nix/cross — two levels up from `//`.
 declare_args() {
+  # `//` is build/x86_64/toolchain/v8-skeleton/v8; the flat cross toolchain
+  # (env.sh's TOOLCHAIN_BUILD_HOME/cross, no per-triplet subdir) is two levels
+  # up, in its sibling build/x86_64/toolchain/cross/bin/.
   b1nix_toolprefix = rebase_path(
-          "//../../x86_64-b1nix/cross/bin/x86_64-b1nix-", root_build_dir)
+          "//../../cross/bin/x86_64-b1nix-", root_build_dir)
 
   # Clang frontend (M64 Phase 2). Only consulted when b1nix_use_clang=true. The
   # cppflags carry --target + the -nostdinc/-isystem GCC-header search path that
@@ -42,13 +45,17 @@ declare_args() {
 }
 
 gcc_toolchain("x64") {
+  # b1nix is GCC-free (M90): the cross toolchain is a clang wrapper (x86_64-b1nix-cc/-c++),
+  # there is no x86_64-b1nix-gcc/-g++. Always use it — b1nix_use_clang / the
+  # b1nix_clang_* args only matter if a caller wants a *different* clang
+  # invocation (e.g. tools/v8-gen-clang.sh's flag set) than the standard wrapper.
   if (b1nix_use_clang) {
     cc = b1nix_clang_cc
     cxx = b1nix_clang_cxx
     extra_cppflags = b1nix_clang_cppflags
   } else {
-    cc = "${b1nix_toolprefix}gcc"
-    cxx = "${b1nix_toolprefix}g++"
+    cc = "${b1nix_toolprefix}cc"
+    cxx = "${b1nix_toolprefix}c++"
   }
 
   readelf = "${b1nix_toolprefix}readelf"

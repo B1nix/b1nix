@@ -18,7 +18,7 @@ B1NIX_CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"; export B1NIX_CXX_STDLIB
 resolve_cxx_cross
 
 if [ "$B1NIX_ARCH" = "x86" ]; then LDEMU="elf_i386"; else LDEMU="elf_x86_64"; fi
-CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
+CROSS="$TOOLCHAIN_BUILD_HOME/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 STRIP="$(command -v llvm-strip 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-strip)"
 
@@ -26,7 +26,7 @@ MESA="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-mesa.sh")"
 LIBM="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-openlibm.sh")/lib/libm.a"
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-MUSL_USR="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_USR="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 if [ -f "$MUSL_USR/lib/libc.so" ]; then
   make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
     "build/$B1NIX_ARCH/libb1gui.a" 1>&2
@@ -41,7 +41,7 @@ mkdir -p "$OUTDIR"
 SMOKE_OBJ="$OUTDIR/m59_smoke.o"
 EGL_OBJ="$OUTDIR/b1egl_mesa.o"
 
-CC_CROSS="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-gcc")}"
+CC_CROSS="${B1NIX_CC:-$(command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-cc")}"
 CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 
 if [ -f "$MUSL_USR/lib/libc.so" ]; then
@@ -59,7 +59,7 @@ fi
 # shellcheck disable=SC2086
 "$CC_CROSS" $CFLAGS -c "$ROOT_DIR/userspace/libegl/b1egl_mesa.c" -o "$EGL_OBJ"
 
-MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
+MESA_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/lib"
 
 # shellcheck disable=SC2046
 if [ -f "$MUSL_USR/lib/libc.so" ]; then

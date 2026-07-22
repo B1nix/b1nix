@@ -14,9 +14,10 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
-SRC_PARENT="$ROOT_DIR/build/ports-src"
-SRC_DIR="$SRC_PARENT/tinygl"
-BUILD_DIR="$ROOT_DIR/build/tinygl-b1nix/$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/src/tinygl"
+mkdir -p "$SRC_PARENT"
+SRC_DIR="$SRC_PARENT/tinygl-${TGL_BRANCH}"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/tinygl"
 OBJ_DIR="$BUILD_DIR/obj"
 INSTALL_DIR="$BUILD_DIR/install"
 LIBM_DIR="$($ROOT_DIR/tools/ports/build-openlibm.sh)"
@@ -28,7 +29,6 @@ if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/tinygl.tar.gz"
   [ -f "$tmp" ] || curl -L "$URL" -o "$tmp" 1>&2
   tar -xzf "$tmp" -C "$SRC_PARENT" 1>&2
-  mv "$SRC_PARENT/tinygl-${TGL_BRANCH}" "$SRC_DIR"
 fi
 
 # Single-threaded smoke: disable the multithreaded raster paths (OpenMP pragmas)
@@ -45,7 +45,7 @@ else
 fi
 
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
-  -nostdinc -isystem $ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include
+  -nostdinc -isystem $ROOT_DIR/build/x86_64/ports/musl/install/include
   -idirafter $ROOT_DIR/userspace/include -I$ROOT_DIR/userspace/include
   -O2 -fPIC -fno-strict-aliasing -Db1nix
   -I$SRC_DIR/include -I$SRC_DIR/src -I$LIBM_DIR/include

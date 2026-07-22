@@ -23,18 +23,18 @@ if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
   CCACHE="$(command -v ccache)"
 fi
 
-SRC_PARENT="$ROOT_DIR/build/ports-src"
+SRC_PARENT="$ROOT_DIR/build/src/mesa"
+mkdir -p "$SRC_PARENT"
 SRC_DIR="$SRC_PARENT/mesa-${MESA_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa"
 MESON_BUILD="$BUILD_DIR/meson"
 INSTALL_DIR="$BUILD_DIR/install"
-CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
-GXX="$CROSS/bin/$B1NIX_TRIPLET-g++"
+CROSS="$(ls -d "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/llvm/cross" "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/cross" 2>/dev/null | head -1)"
+CLANGXX_BIN="${B1NIX_CLANGXX:-$(command -v clang++ 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/clang++)}"
 
-# Clang is the only supported C++ frontend; the triplet g++ name is merely a
-# compatibility shim created by build-toolchain.sh.
-REAL_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
-[ -n "$REAL_CXX" ] || { echo "build-mesa: clang++ not found" >&2; exit 1; }
+REAL_CC="${B1NIX_CC:-$(command -v clang 2>/dev/null || echo clang)}"
+REAL_CXX="$CLANGXX_BIN"
+STRIP_BIN="$(command -v llvm-strip 2>/dev/null || command -v strip 2>/dev/null || echo strip)"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   LDEMU="elf_i386"; MCPU="x86"; MFAM="x86"
@@ -55,16 +55,14 @@ LOCK="$BUILD_DIR/.build-lock"
 while ! mkdir "$LOCK" 2>/dev/null; do sleep 1; done
 trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
-# Toolchain prerequisites: musl supplies libc/crt; the legacy b1nix archive is
-# needed only by the retired non-musl link path. Mesa shared objects use the
-# GUI archive only and must not pull non-PIC libc objects into -shared links.
-if [ -f "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/libc.so" ]; then
-  make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
-    "build/$B1NIX_ARCH/libb1gui.a" 1>&2
-else
-  make B1NIX_ARCH="$B1NIX_ARCH" -C "$ROOT_DIR/userspace" -s \
-    "build/$B1NIX_ARCH/libb1nix.a" "build/$B1NIX_ARCH/crt/crt0.o" 1>&2
+# Toolchain prerequisites: musl supplies libc/crt. The legacy b1nix archive
+# (libb1nix.a/crt0.o) is retired — Mesa must link against musl.
+if [ ! -f "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib/libc.so" ]; then
+  echo "build-mesa: musl not built — run tools/ports/build-musl.sh first" >&2
+  exit 1
 fi
+make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
+  "build/$B1NIX_ARCH/libb1gui.a" 1>&2
 
 if [ ! -d "$SRC_DIR" ]; then
   tmp="$SRC_PARENT/$TARBALL"
@@ -75,9 +73,9 @@ fi
 # Resolve C++ stdlib and CRT runtime. The unified runtimes build installs both
 # libc++.a and libc++abi.a under libcxx-install/lib; these are always used.
 CXX_STDLIB=libc++
-LIBCXX_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
-LIBCXXABI_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
-LLVM_CRT_A="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+LIBCXX_A="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++.a"
+LIBCXXABI_A="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib/libc++abi.a"
+LLVM_CRT_A="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 LLVM_UNW_A=""
 
 STDLIB_A="$LIBCXX_A"
@@ -94,18 +92,18 @@ LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
 # libc/libc++ symbols are resolved at runtime by b1nix's dynamic linker, so we
 # use --allow-shlib-undefined.  --hash-style=both ensures SysV DT_HASH for the
 # b1nix kernel loader.
-LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+LIBCXX_SO_DIR="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
 # Shared-lib link args: no crt0.o, no libb1nix.a (non-PIC breaks -shared).
 # Meson adds -shared automatically for .so targets.  libc symbols are resolved
 # at runtime by b1nix's dynamic linker (--unresolved-symbols=ignore-all).
-LIBCXX_SO_DIR="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-MUSL_LIB="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+LIBCXX_SO_DIR="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+MUSL_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
 # Prefer musl-built runtime libs: the musl sysroot carries libc++/libc++abi
 # compiled against musl headers, and the ports zlib is musl-clean. The legacy
 # llvm-runtimes libc++.a and the cross-sysroot libz.a reference `errno` as a
 # data symbol (old b1nix libc headers) — linking them into libOSMesa.so left
 # an unresolvable UND errno that killed every Mesa consumer at load time.
-ZLIB_PORT_LIB="$ROOT_DIR/build/zlib-b1nix/$B1NIX_TRIPLET/install/lib"
+ZLIB_PORT_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/zlib/install/lib"
 if [ -f "$MUSL_LIB/libc++.a" ]; then
   LIBCXX_SO_DIR="$MUSL_LIB"
 fi
@@ -130,10 +128,10 @@ if [ "${MESA_LLVMPIPE:-0}" = "1" ]; then
 fi
 cat > "$INI" <<EOF
 [binaries]
-c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$CROSS/bin/$B1NIX_TRIPLET-cc']
+c = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CC']
 cpp = ['$ROOT_DIR/tools/toolchain/bin/b1nix-mesa-cc', '$REAL_CXX']
 ar = '$AR_BIN'
-strip = '$CROSS/bin/$B1NIX_TRIPLET-strip'
+strip = '$STRIP_BIN'
 pkg-config = 'false'
 $LLVM_CONFIG_LINE
 [host_machine]
@@ -228,7 +226,7 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
       -Dgallium-drivers=swrast,virgl -Dvulkan-drivers= $MESON_LLVM_OPTS -Dosmesa=true \
       -Dglx=disabled -Degl=disabled -Dgbm=disabled -Dplatforms= -Dopengl=true \
       -Dgles1=disabled -Dgles2=disabled -Dshared-glapi=disabled \
-      -Ddefault_library=both -Dzstd=disabled -Dlibunwind=disabled \
+      -Ddefault_library=both -Dzstd=disabled -Dlibunwind=disabled -Dlmsensors=disabled \
       -Dvalgrind=disabled -Dbuild-tests=false -Dshader-cache=disabled 1>&2 )
   # Fix: meson's has_function probe detects qsort_s from the host compiler,
   # but b1nix libc doesn't have it. Replace -D with -U in the generated ninja.
@@ -267,8 +265,8 @@ fi
 # musl headers → errno is the __errno_location macro, no data symbol). The legacy
 # non-musl libc++ is dead under the musl migration; env.sh already routes every
 # other consumer to llvm-runtimes-build-musl. Idempotent.
-LEGACY_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-MUSL_LIBCXX="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+LEGACY_LIBCXX="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+MUSL_LIBCXX="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
 if [ -f "$MUSL_LIBCXX/libc++.a" ] && [ -d "$LEGACY_LIBCXX" ]; then
   cp -f "$MUSL_LIBCXX/libc++.a"    "$LEGACY_LIBCXX/libc++.a"
   cp -f "$MUSL_LIBCXX/libc++abi.a" "$LEGACY_LIBCXX/libc++abi.a"

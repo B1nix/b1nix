@@ -62,21 +62,16 @@ NATIVE_DEST="$BUILD_HOME/native_root"
 SYSROOT="$B1NIX_ROOTFS"
 
 # ── Sanity checks ───────────────────────────────────────────────────────────
-if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
-    echo "Error: cross-compiler not found at $CROSS_PREFIX/bin/${TARGET}-gcc"
+CC="${CC:-$PROJECT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc}"
+if ! command -v "$CC" >/dev/null 2>&1 && [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
+    echo "Error: cross-compiler not found at $CC or $CROSS_PREFIX/bin/${TARGET}-gcc"
     echo "Run tools/toolchain/build-toolchain.sh first."
     exit 1
 fi
-if [ ! -f "$SYSROOT/lib/libb1nix.a" ] && [ ! -f "$SYSROOT/usr/lib/libb1nix.a" ]; then
-    echo "Warning: libb1nix.a not found under $SYSROOT/{lib,usr/lib}."
-    echo "Run 'make -C userspace install' (and 'make install' at the top level)"
-    echo "so the sysroot has the current libc (incl. opendir/readdir + limits.h)."
-fi
-
 export PATH="$CROSS_PREFIX/bin:$PATH"
 export ac_cv_c_bigendian=no
 
-CC_VAL="$(ccache_prefix)${TARGET}-gcc"
+CC_VAL="$(ccache_prefix)${TARGET}-cc"
 AR_VAL="${TARGET}-ar"
 RANLIB_VAL="${TARGET}-ranlib"
 # -fcommon: GNU Make 3.82 has tentative definitions (e.g. `stack_limit`) in
@@ -85,7 +80,7 @@ RANLIB_VAL="${TARGET}-ranlib"
 CFLAGS_VAL="-fcommon -isystem $SYSROOT/include -Wl,-Ttext-segment=0x2000000"
 CPPFLAGS_VAL="-isystem $SYSROOT/include"
 LDFLAGS_VAL="-Wl,-Ttext-segment=0x2000000"
-LIBS_VAL="-lb1nix -lgcc"
+LIBS_VAL="-lc"
 
 mkdir -p "$SRC_DIR" "$WORK_DIR" "$NATIVE_DEST"
 

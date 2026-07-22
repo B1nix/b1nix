@@ -14,7 +14,16 @@
 #   B1NIX_CXX_FRONTEND  clang (default) — compiler frontend
 
 set -eu
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the symlink itself (not just dirname-of-invocation-path) before
+# walking up. `build/` is a symlink to another mount (e.g. /mnt/sda1/...);
+# when this wrapper is invoked via a RELATIVE path (as ninja/GN do) the
+# process's physical cwd is already resolved onto that other mount, so a
+# naive `cd "$(dirname "$0")" && pwd` walk-up never reaches the project root
+# — it walks up the physical mount tree instead. Following the symlink chain
+# of $0 itself lands on the real tools/toolchain/bin/b1nix-c++ under the
+# project root regardless of how/where the wrapper was invoked from.
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 ROOT=""
 cur="$SCRIPT_DIR"
 while [ "$cur" != "/" ]; do
@@ -38,16 +47,34 @@ fi
 # Intercept GCC-specific query flags
 for arg in "$@"; do
   if [ "$arg" = "-print-sysroot" ]; then
-    echo "$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET"
+    echo "$ROOT/build/x86_64/toolchain/cross/$TRIPLET"
     exit 0
   fi
 done
+# Detect -c (compile-only) up front: a pure compile needs only the C++ header
+# search path, never crt0/libb1nix.a/libc++ archives/compiler-rt, which are
+# link-only concerns. Gating on this lets `-c` invocations (the vast majority
+# of calls in any real build, e.g. V8's few-thousand-object ninja build) skip
+# retired on-demand make targets and hard existence checks entirely.
+IS_COMPILE_ONLY=0
+for _a in "$@"; do [ "$_a" = "-c" ] && IS_COMPILE_ONLY=1; done
+
 GXX=""  # unused — GCC fallback removed; kept to avoid unbound-var in stale callers
-CROSS="$ROOT/build/toolchain_build/$TRIPLET/cross"
+CROSS="$ROOT/build/x86_64/toolchain/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 USR="$ROOT/userspace"
 LIB="$USR/build/$ARCH/libb1nix.a"
 CRT0="$USR/build/$ARCH/crt/crt0.o"
+# musl static-link objects (M92): the retired in-house libb1nix.a/crt0.o have
+# no Makefile rule anymore ("No rule to make target 'build/x86_64/libb1nix.a'"
+# — every V8/d8 link hit this). musl's own crt1/crti/crtn + libc.a replace
+# them; unlike old crt0.o (one all-in-one object) musl splits start/end crt
+# objects, so the final LD invocation wraps objects with PRE_CRT/POST_CRT.
+MUSL_LIB_DIR="$ROOT/build/$ARCH/ports/musl/install/lib"
+MUSL_CRT1="$MUSL_LIB_DIR/crt1.o"
+MUSL_CRTI="$MUSL_LIB_DIR/crti.o"
+MUSL_CRTN="$MUSL_LIB_DIR/crtn.o"
+MUSL_LIBA="$MUSL_LIB_DIR/libc.a"
 LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
 # Relative target paths for `make -C "$USR"`: the userspace Makefile's rules are
 # relative to build/$(B1NIX_ARCH)/..., so an absolute path matches no rule.
@@ -55,7 +82,9 @@ REL_LIB="build/$ARCH/libb1nix.a"
 REL_CRT0="build/$ARCH/crt/crt0.o"
 REL_SHARED_LIBC="build/$ARCH/libc.so.1"
 REL_DYN_CRT0="build/$ARCH/crt/crt0-dynamic.o"
-[ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
+if [ "$IS_COMPILE_ONLY" -eq 0 ] && { [ ! -f "$MUSL_CRT1" ] || [ ! -f "$MUSL_LIBA" ]; }; then
+  [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
+fi
 
 # ── Static vs dynamic link (default dynamic, like the rest of userspace) ─────
 # B1NIX_LINK=dynamic links as a NON-PIE dynamic ET_EXEC: libc++ and the
@@ -64,7 +93,43 @@ REL_DYN_CRT0="build/$ARCH/crt/crt0-dynamic.o"
 # model). B1NIX_LINK=static keeps the historical whole-archive static link.
 SHARED_LIBC="$USR/build/$ARCH/libc.so.1"
 DYN_CRT0="$USR/build/$ARCH/crt/crt0-dynamic.o"
-if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
+# PRE_CRT/POST_CRT: musl splits crt into crt1+crti (before objects) and crtn
+# (after the runtime group) — unlike the old all-in-one crt0.o, which is a
+# single object placed only before objects (POST_CRT stays empty for it).
+PRE_CRT="$CRT0"
+POST_CRT=""
+MUSL_SO="$MUSL_LIB_DIR/libc.so"
+IS_MUSL_LINK=0
+if [ "$IS_COMPILE_ONLY" -eq 1 ]; then
+  DYN_EXTRA=""
+  GROUP_LIBC=""
+  POST_GROUP=""
+elif [ "${B1NIX_LINK:-dynamic}" != "static" ] && [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_SO" ]; then
+  IS_MUSL_LINK=1
+  # musl dynamic (M92, default/preferred): non-PIE ET_EXEC + PT_INTERP against
+  # musl's own shared libc.so, replacing the retired b1nix libc.so.1/ld-b1nix.so
+  # pair — same non-PIE-executable-links-a-shared-libc model, just musl's ABI.
+  # DT_NEEDED must read "ld-musl-x86_64.so.1" (the name the kernel searches
+  # for in /lib), so record it via a same-named symlink rather than the raw
+  # install path (which would embed a build-tree-relative NEEDED entry).
+  MUSL_LINK_DIR="${TMPDIR:-/tmp}/b1nix-cxx-musl-link.$$"
+  mkdir -p "$MUSL_LINK_DIR"
+  ln -sf "$MUSL_SO" "$MUSL_LINK_DIR/ld-musl-x86_64.so.1"
+  PRE_CRT="$MUSL_CRT1 $MUSL_CRTI"
+  POST_CRT="$MUSL_CRTN"
+  DYN_EXTRA="--dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LINK_DIR --eh-frame-hdr"
+  GROUP_LIBC=""
+  POST_GROUP="-l:ld-musl-x86_64.so.1"
+elif [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_LIBA" ] && [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
+  IS_MUSL_LINK=1
+  DYN_EXTRA=""
+  PRE_CRT="$MUSL_CRT1 $MUSL_CRTI"
+  POST_CRT="$MUSL_CRTN"
+  # musl's libc.a stays INSIDE the runtime group (circular libc++<->libc
+  # resolution), same role libb1nix.a played for the retired in-house libc.
+  GROUP_LIBC="$MUSL_LIBA"
+  POST_GROUP=""
+elif [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
   DYN_EXTRA=""
   # libb1nix.a stays INSIDE the runtime group (circular libc++<->libc resolution).
   GROUP_LIBC="--whole-archive $LIB --no-whole-archive"
@@ -72,6 +137,7 @@ if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
 else
   [ -f "$DYN_CRT0" ] || make B1NIX_ARCH="$ARCH" -C "$USR" -s "$REL_DYN_CRT0" "$REL_SHARED_LIBC"
   CRT0="$DYN_CRT0"
+  PRE_CRT="$CRT0"
   # --eh-frame-hdr emits PT_GNU_EH_FRAME so the executable's frames are
   # discoverable via dl_iterate_phdr by the shared libc++abi.so.1 unwinder,
   # making cross-DSO C++ exceptions work.
@@ -84,16 +150,16 @@ fi
 # ── Resolve C++ standard library (LLVM libc++) ───────────────────────────
 # The unified runtimes build (build-libcxx.sh) installs libc++.a, libc++abi.a and
 # libunwind.a together under libcxx-install/lib.
-LIBCXX_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install"
+LIBCXX_RT="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/libcxx-install"
 LIBCXXABI_RT="$LIBCXX_RT"
-LLVM_RT="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/install/lib"
+LLVM_RT="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/install/lib"
 # Shared LLVM C++ runtime (build-libcxx-shared.sh): libc++.so.1 + libc++abi.so.1
 # (the latter folds libunwind). Linked dynamically in the default dynamic mode.
-CXXSO_DIR="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+CXXSO_DIR="$ROOT/build/x86_64/toolchain/cross/$TRIPLET/lib"
 
 CXX_STDLIB="libc++"
 
-if [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; then
+if [ "$IS_COMPILE_ONLY" -eq 0 ] && { [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -f "$LIBCXXABI_RT/lib/libc++abi.a" ]; }; then
   echo "b1nix-c++: libc++ libraries not built yet" >&2
   echo "  Run: tools/toolchain/build-libcxx.sh" >&2
   exit 1
@@ -142,10 +208,13 @@ if [ -f "$LLVM_RT/libcompiler_rt.a" ] && [ -f "$LLVM_RT/libunwind.a" ]; then
     UNWIND_RUNTIME="$LLVM_RT/libunwind.a"
   fi
   echo "  CRT runtime: LLVM (compiler-rt$( [ -n "$UNWIND_RUNTIME" ] && echo ' + libunwind'))" >&2
-else
+elif [ "$IS_COMPILE_ONLY" -eq 0 ]; then
   echo "b1nix-c++: LLVM compiler-rt not found in $LLVM_RT" >&2
   echo "  Run: tools/toolchain/build-libcxx.sh" >&2
   exit 1
+else
+  CRT_RUNTIME=""
+  UNWIND_RUNTIME=""
 fi
 
 # ── Resolve C++ frontend (clang++) ───────────────────────────────────────
@@ -158,8 +227,8 @@ CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/nul
 # with hand-rolled -isystem paths breaks clang's stddef.h #include_next
 # chain, so ::nullptr_t goes undefined and every libc++ header that names
 # nullptr_t fails to compile. This mirrors how libc++ itself was built.
-LIBCXX_HDR="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/include/c++/v1"
-SYSROOT="$ROOT/build/toolchain_build/$TRIPLET/sysroot"
+LIBCXX_HDR="$ROOT/build/x86_64/toolchain/llvm-runtimes-build/libcxx-install/include/c++/v1"
+SYSROOT="$ROOT/build/x86_64/toolchain/sysroot"
 CXXFLAGS="--target=$TRIPLET --sysroot=$SYSROOT -nostdinc++ -isystem $LIBCXX_HDR"
 CXXFLAGS="$CXXFLAGS -std=c++17 -O2 -ffunction-sections -fdata-sections -Db1nix"
 
@@ -202,6 +271,12 @@ while [ $# -gt 0 ]; do
     # the exe-link path below actually puts them on the ld line instead of
     # dropping them into passthru → undefined llvm:: symbols.
     *.cpp|*.cc|*.cxx|*.C|*.o|*.a|*.so|*.so.*) inputs+=("$1") ;;
+    # @file: a linker response file (GN/ninja avoids command-line length limits
+    # this way, e.g. `-Wl,--start-group @./d8.rsp -Wl,--end-group`). ld.lld
+    # expands these natively — treat as a link input so it reaches the LD
+    # invocation verbatim instead of being dropped into passthru (silently
+    # losing the entire object list → "undefined symbol: main").
+    @*) inputs+=("$1") ;;
     *) passthru+=("$1") ;;
   esac
   shift
@@ -229,7 +304,7 @@ for f in "${passthru[@]+${passthru[@]}}"; do [ "$f" = "-shared" ] && is_shared=1
 if [ "$is_shared" -eq 1 ]; then
   shared_target="x86_64-unknown-elf"
   if [ "$ARCH" = "x86" ]; then shared_target="i686-unknown-elf"; fi
-  cross_lib="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+  cross_lib="$ROOT/build/x86_64/toolchain/cross/$TRIPLET/lib"
   # Relink CMake's shared-library command with the ORIGINAL argument order
   # preserved, so every --whole-archive/--no-whole-archive window keeps wrapping
   # exactly the .a files CMake placed inside it. (LLVM's libLLVM.so link lists
@@ -258,7 +333,7 @@ objs=()
 tmp="${TMPDIR:-/tmp}/b1nix-cxx.$$"; mkdir -p "$tmp"
 for in_file in "${inputs[@]}"; do
   case "$in_file" in
-    *.o|*.a|*.so|*.so.*) objs+=("$in_file") ;;   # .so: shared-lib dep, link as-is
+    *.o|*.a|*.so|*.so.*|@*) objs+=("$in_file") ;;   # .so: shared-lib dep; @file: linker response file — both link as-is
     *)
       o="$tmp/$(basename "$in_file").o"
       run_cxx "${cxx_flags[@]}" "${passthru[@]+${passthru[@]}}" -c "$in_file" -o "$o"
@@ -292,15 +367,34 @@ for f in $CXXLIB_SO; do cxxlib_so_args+=("$f"); done
 post_group_args=()
 for f in $POST_GROUP; do post_group_args+=("$f"); done
 
+pre_crt_args=()
+for f in $PRE_CRT; do pre_crt_args+=("$f"); done
+post_crt_args=()
+for f in $POST_CRT; do post_crt_args+=("$f"); done
+
 if [ -n "$UNWIND_RUNTIME" ]; then
   "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
-    "$CRT0" "${objs[@]}" \
+    "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
-    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"
+    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"
 else
   "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
-    "$CRT0" "${objs[@]}" \
+    "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
-    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}"
+    "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"
 fi
 rm -rf "$tmp"
+[ -n "${MUSL_LINK_DIR:-}" ] && rm -rf "$MUSL_LINK_DIR"
+
+if [ "$IS_MUSL_LINK" -eq 1 ] && [ -f "$output" ]; then
+  # Mark ELFOSABI_LINUX (3) so the kernel routes this musl-linked binary's
+  # syscalls through the Linux-ABI translation layer, matching every other
+  # musl-linked b1nix binary (b1nix-musl-cc, b1nix-autotools-cc).
+  python3 -c "
+import sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)
+    fh.write(bytes([3]))
+" "$output" 2>/dev/null || true
+fi

@@ -19,10 +19,10 @@ CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
-SRC_PARENT="$ROOT_DIR/build/libvpx-src"
+SRC_PARENT="$ROOT_DIR/build/src/libvpx"
 SRC_DIR="$SRC_PARENT/libvpx-${VPX_VERSION}"
 CFG_DIR="$SRC_PARENT/cfg"            # host configure output (generated headers)
-BUILD_DIR="$ROOT_DIR/build/libvpx-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/libvpx"
 OBJ_DIR="$BUILD_DIR/obj"
 INSTALL_DIR="$BUILD_DIR/install"
 

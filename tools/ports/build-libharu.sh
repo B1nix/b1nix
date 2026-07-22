@@ -24,7 +24,7 @@ CMAKE_TARGETS=hpdf
 
 # zlib + libpng (+ headers) live in the netsurf sysroot from build-netsurf-fb.sh.
 port_pre_configure() {
-  NSROOT="$ROOT_DIR/build/netsurf-sysroot/$B1NIX_TRIPLET"
+  NSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/netsurf-fb/sysroot"
   CMAKE_FIND_ROOT_EXTRA="$NSROOT"
   CMAKE_TC_EXTRA="set(CMAKE_C_FLAGS \"-I$NSROOT/include\")"
   CMAKE_ARGS="-DLIBHPDF_SHARED=OFF -DLIBHPDF_STATIC=ON -DLIBHPDF_EXAMPLES=OFF \

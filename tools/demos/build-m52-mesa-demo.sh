@@ -17,7 +17,7 @@ B1NIX_CXX_STDLIB="${B1NIX_CXX_STDLIB:-libc++}"; export B1NIX_CXX_STDLIB
 resolve_cxx_cross
 
 if [ "$B1NIX_ARCH" = "x86" ]; then LDEMU="elf_i386"; else LDEMU="elf_x86_64"; fi
-CROSS="$ROOT_DIR/build/toolchain_build/$B1NIX_TRIPLET/cross"
+CROSS="$TOOLCHAIN_BUILD_HOME/cross"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 STRIP="$(command -v llvm-strip 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-strip)"
 
@@ -37,15 +37,15 @@ make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
 
 OBJ="$(dirname "$OUT")/$DEMO.o"
 mkdir -p "$(dirname "$OUT")"
-CC_CROSS="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-gcc")}"
+CC_CROSS="${B1NIX_CC:-$(command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-cc")}"
 CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 # shellcheck disable=SC2086
 "$CC_CROSS" --target="$B1NIX_TRIPLET" -O2 -fPIC -ffunction-sections -fdata-sections -Db1nix \
-  -nostdinc ${CC_RES:+-isystem "$CC_RES/include"} -isystem "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include" -idirafter "$ROOT_DIR/userspace/include" -I "$MESA/include" \
+  -nostdinc ${CC_RES:+-isystem "$CC_RES/include"} -isystem "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/include" -idirafter "$ROOT_DIR/userspace/include" -I "$MESA/include" \
   -c "$ROOT_DIR/userspace/bin/$DEMO.c" -o "$OBJ"
 
 # Link the executable against the real musl dynamic loader and libc.
-MUSL_LIB="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+MUSL_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
 BUILTINS_LIB="$(clang -print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64.a"
 DYN_CRT0="$MUSL_LIB/Scrt1.o"
 DYN_FLAGS="-pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LIB"
@@ -69,7 +69,7 @@ fi
 
 # Link Mesa as shared library (-lOSMesa) — the kernel mounts rootfs.img at
 # /mnt/root in test mode so the dynamic linker finds libOSMesa.so.8 at runtime.
-MESA_LIB="$ROOT_DIR/build/mesa-b1nix/$B1NIX_TRIPLET/install/lib"
+MESA_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa/install/lib"
 # shellcheck disable=SC2046,SC2086
 # libOSMesa.so carries a few undefined symbols (e.g. `errno` referenced by Mesa's
 # flex-generated GLSL lexer) that b1nix's dynamic linker resolves/ignores at

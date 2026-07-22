@@ -34,11 +34,11 @@
 CMAKE_SYSTEM_NAME="${CMAKE_SYSTEM_NAME:-Linux}"
 CMAKE_JOBS="${CMAKE_JOBS:-${JOBS:-4}}"
 
-SRC_PARENT="$ROOT_DIR/build/ports-src"
+SRC_PARENT="$ROOT_DIR/build/src"
 SRC_DIR="$SRC_PARENT/${CMAKE_SRCNAME:-$CMAKE_NAME}"
-BUILD_DIR="$ROOT_DIR/build/$CMAKE_NAME-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/$CMAKE_NAME"
 INSTALL_DIR="$BUILD_DIR/install"
-LOCKFILE="$ROOT_DIR/build/$CMAKE_NAME-$B1NIX_TRIPLET.lock"
+LOCKFILE="$BUILD_DIR/locks/build.lock"
 mkdir -p "$(dirname "$LOCKFILE")"
 
 (
@@ -48,6 +48,8 @@ mkdir -p "$(dirname "$LOCKFILE")"
     exit 0
   fi
   mkdir -p "$SRC_PARENT" "$BUILD_DIR/cmake" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
+  : > "$BUILD_DIR/build.log"
+  exec 2>>"$BUILD_DIR/build.log"
 
   # --- fetch ----------------------------------------------------------------
   if command -v port_fetch >/dev/null 2>&1; then
@@ -72,7 +74,7 @@ mkdir -p "$(dirname "$LOCKFILE")"
   # against, and quietly picking a different compiler would produce objects for
   # the wrong runtime rather than a build failure.
   MUSL_WRAP="$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc"
-  SYSROOT="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+  SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
   if [ ! -f "$SYSROOT/lib/libc.so" ]; then
     echo "cmake.sh: libc not built for $B1NIX_TRIPLET ($SYSROOT/lib/libc.so)." >&2
     echo "cmake.sh: run tools/ports/build-musl.sh first." >&2
@@ -88,10 +90,10 @@ mkdir -p "$(dirname "$LOCKFILE")"
   CXX_LIBCXX_FLAGS=""
   CC_LIBCXX_FLAGS=""
   USE_CC="$GCC"
-  if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
+  if [ "${B1NIX_CXX_STDLIB:-libc++}" = "libc++" ]; then
     resolve_cxx_cross
     USE_CXX="$CXX_CROSS"
-    CXX_LIBCXX_FLAGS="$CXXFLAGS_CROSS -fPIC"
+    CXX_LIBCXX_FLAGS="$CXXFLAGS_CROSS -fPIC -D_GNU_SOURCE=1"
     # Mixed C/C++ ports (e.g. libjxl) require one compiler family for C and C++.
     # In libc++ mode C++ is clang, so compile the C sources with clang too, targeting
     # b1nix. C needs no libc++ — just the target + sysroot (clang adds its own C
@@ -100,14 +102,14 @@ mkdir -p "$(dirname "$LOCKFILE")"
     CC_LIBCXX_FLAGS="--target=$B1NIX_TRIPLET -nostdinc -isystem $SYSROOT/include"
     CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -isystem $(clang -print-resource-dir)/include"
     CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -idirafter $ROOT_DIR/userspace/include"
-    CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -O2 -ffunction-sections -fdata-sections -fPIC -Db1nix"
+    CC_LIBCXX_FLAGS="$CC_LIBCXX_FLAGS -O2 -ffunction-sections -fdata-sections -fPIC -Db1nix -D_GNU_SOURCE=1"
   else
     USE_CXX="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null)}"
     [ -n "$USE_CXX" ] || { echo "cmake port: clang++ not found" >&2; exit 1; }
     # When using the musl wrapper for C, give C++ the same musl headers + clang
     # resource-dir so it can find stdatomic.h etc. under -nostdinc.
-    if [ -f "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib/libc.so" ]; then
-      _MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+    if [ -f "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib/libc.so" ]; then
+      _MUSL_INC="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
       _CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
       CXXFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-stack-protector -msoft-float -mno-implicit-float -isystem $_MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include} -idirafter $ROOT_DIR/userspace/include -D__linux__ -D__b1nix__ -O2 ${CXXFLAGS:-}"
     fi
@@ -212,5 +214,13 @@ mkdir -p "$(dirname "$LOCKFILE")"
     for _a in ${CMAKE_ARCHIVES:-}; do cmake_copy_archive "$_a"; done
   fi
 
+  find "$INSTALL_DIR" -type f | sed "s|^$INSTALL_DIR/||" > "$BUILD_DIR/pkg.manifest"
+  touch "$BUILD_DIR/build.stamp"
   echo "$INSTALL_DIR"
 ) 9>"$LOCKFILE"
+_cmake_status=$?
+if [ "$_cmake_status" != 0 ]; then
+  echo "build-$CMAKE_NAME: FAILED — tail of $BUILD_DIR/build.log:" >&2
+  tail -30 "$BUILD_DIR/build.log" 2>/dev/null >&2
+fi
+exit "$_cmake_status"

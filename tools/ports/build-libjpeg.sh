@@ -18,9 +18,9 @@ CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
-SRC_PARENT="$ROOT_DIR/build/libjpeg-src"
+SRC_PARENT="$ROOT_DIR/build/src/libjpeg"
 SRC_DIR="$SRC_PARENT/jpeg-${JPEG_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/libjpeg-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/libjpeg"
 OBJ_DIR="$BUILD_DIR/obj"
 GEN_DIR="$BUILD_DIR/gen"
 INSTALL_DIR="$BUILD_DIR/install"
@@ -56,7 +56,7 @@ else
   TARGET="x86_64-unknown-elf"
 fi
 
-MUSL_INC="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+MUSL_INC="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
 _CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
 CFLAGS="--target=$TARGET -ffreestanding -fno-builtin -fno-stack-protector
   -nostdinc -isystem $MUSL_INC ${_CLANG_RES:+-isystem $_CLANG_RES/include}

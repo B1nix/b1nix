@@ -15,7 +15,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 . "$ROOT_DIR/tools/toolchain/env.sh"
 
 # Find musl install directory
-MUSL_BUILD="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET"
+MUSL_BUILD="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl"
 MUSL_INSTALL="$MUSL_BUILD/install/usr"
 
 if [ ! -d "$MUSL_INSTALL" ]; then
@@ -27,9 +27,10 @@ MUSL_INCLUDE="$MUSL_INSTALL/include"
 MUSL_LIB="$MUSL_INSTALL/lib"
 MUSL_LIBA="$MUSL_LIB/libc.a"
 
-# musl .so is in the source build dir, not install dir
-MUSL_SRC_BUILD="$ROOT_DIR/build/musl-src/$B1NIX_TRIPLET/musl-1.2.5"
-MUSL_LIBSO="$MUSL_SRC_BUILD/lib/libc.so"
+# musl .so is in the install dir or source build dir
+MUSL_SRC_BUILD="$ROOT_DIR/build/src/musl/$B1NIX_TRIPLET/musl-1.2.5"
+MUSL_LIBSO="$MUSL_LIB/libc.so"
+[ -f "$MUSL_LIBSO" ] || MUSL_LIBSO="$MUSL_SRC_BUILD/lib/libc.so"
 
 # musl crt files (from musl build) — use musl's own startup, not b1nix's crt0
 MUSL_CRT1="$MUSL_LIB/crt1.o"
@@ -54,7 +55,13 @@ INPUT_FILES=""
 EXTRA_CFLAGS=""
 EXTRA_LDFLAGS=""
 
+SKIP_NEXT=0
 for arg in "$@"; do
+  if [ "$SKIP_NEXT" = "1" ]; then
+    OUTPUT="$arg"
+    SKIP_NEXT=0
+    continue
+  fi
   case "$arg" in
     -c)
       LINK_MODE="compile-only"
@@ -72,8 +79,7 @@ for arg in "$@"; do
       LINK_MODE="static"
       ;;
     -o)
-      # Next arg is output — handled below
-      OUTPUT_SET=1
+      SKIP_NEXT=1
       ;;
     -O*|-g|-Wall|-W*|-f*|-m*|-D*|-U*|-I*|-std=*|-pedantic|-Werror)
       EXTRA_CFLAGS="$EXTRA_CFLAGS $arg"
@@ -88,12 +94,7 @@ for arg in "$@"; do
       INPUT_FILES="$INPUT_FILES $arg"
       ;;
     *)
-      if [ "${OUTPUT_SET:-}" = "1" ]; then
-        OUTPUT="$arg"
-        OUTPUT_SET=0
-      else
-        EXTRA_CFLAGS="$EXTRA_CFLAGS $arg"
-      fi
+      EXTRA_CFLAGS="$EXTRA_CFLAGS $arg"
       ;;
   esac
 done

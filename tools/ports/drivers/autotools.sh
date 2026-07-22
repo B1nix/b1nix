@@ -39,101 +39,12 @@ AUTOTOOLS_CC="${AUTOTOOLS_CC:-$ROOT_DIR/tools/toolchain/bin/b1nix-musl-autotools
 AR_BIN="$(port_ar)"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
-SRC_PARENT="$ROOT_DIR/build/${AUTOTOOLS_NAME}-src"
-SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/$AUTOTOOLS_SRCNAME"
-BUILD_DIR="$ROOT_DIR/build/${AUTOTOOLS_NAME}-b1nix/$B1NIX_TRIPLET"
+SRC_PARENT="$ROOT_DIR/build/src/${AUTOTOOLS_NAME}"
+SRC_DIR="$SRC_PARENT/$AUTOTOOLS_SRCNAME"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/${AUTOTOOLS_NAME}"
 INSTALL_DIR="${AUTOTOOLS_PREFIX:-$BUILD_DIR/install}"
-mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR" "$INSTALL_DIR"
-
-# --- fetch + extract ------------------------------------------------------
-if [ ! -d "$SRC_DIR" ]; then
-  tmp="$SRC_PARENT/$AUTOTOOLS_TARBALL"
-  if [ ! -f "$tmp" ]; then
-    port_fetch_tarball "$AUTOTOOLS_URL" "$tmp" "$SRC_PARENT/$B1NIX_TRIPLET" \
-      "${AUTOTOOLS_SENTINEL:-$SRC_DIR}"
-  fi
-  # Handle case where tarball extracts to a different name than expected
-  if [ ! -d "$SRC_DIR" ]; then
-    for d in "$SRC_PARENT/$B1NIX_TRIPLET"/*; do
-      if [ -d "$d" ] && [ -f "$d/configure" -o -f "$d/configure.ac" ]; then
-        mv "$d" "$SRC_DIR"
-        break
-      fi
-    done
-  fi
-fi
-
-# --- patches --------------------------------------------------------------
-if [ -n "${PATCHES:-}" ]; then
-  # shellcheck disable=SC2086
-  port_apply_patches "$SRC_DIR" $PATCHES
-fi
-
-# --- patch config.sub to accept b1nix ------------------------------------
-if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
-  tmp_sub="$SRC_DIR/config.sub.new"
-  sed -e 's/| fiwix\* /| fiwix* | b1nix* /' \
-      -e 's/| -mint\*/| -mint* | -b1nix*/' \
-      -e 's/| -none\*/| -none* | -b1nix*/' \
-      -e 's/| -elf\*/| -elf* | -b1nix*/' \
-      -e 's/| -limine\*/| -limine* | -b1nix*/' \
-      -e 's/| -os2\*/| -os2* | -b1nix*/' \
-      -e 's/| os2\*/| os2* | b1nix*/' \
-      "$SRC_DIR/config.sub" > "$tmp_sub"
-  mv "$tmp_sub" "$SRC_DIR/config.sub"
-fi
-
-# --- touch autotools outputs to avoid re-running autoconf/automake ---------
-# Only touch if configure is newer than the current time (to avoid touching
-# files that already have correct timestamps from a previous build).
-if [ -f "$SRC_DIR/configure" ] && [ "$(stat -c %Y "$SRC_DIR/configure" 2>/dev/null || echo 0)" -gt "$(date +%s)" ]; then
-  find "$SRC_DIR" \( -name 'configure.ac' -o -name '*.am' -o -name '*.m4' \) \
-    -exec touch -t 200001010000 {} + 1>&2
-  find "$SRC_DIR" \( -name 'configure' -o -name '*.in' \) \
-    -exec touch -t 202001010000 {} + 1>&2
-fi
-
-# --- ensure musl libc is built -------------------------------------------
-# Ports link against musl's libc.so + Scrt1.o (the b1nix native libc is retired).
-if [ ! -f "$(port_musl_lib)/libc.so" ]; then
-  B1NIX_ARCH="$B1NIX_ARCH" sh "$ROOT_DIR/tools/ports/build-musl.sh" 1>&2
-fi
-
-# --- pre-configure hook ---------------------------------------------------
-if command -v port_pre_configure >/dev/null 2>&1; then
-  # Port hooks may need these variables
-  export B1NIX_ARCH
-  port_pre_configure
-fi
-
-# --- configure ------------------------------------------------------------
-if command -v port_configure >/dev/null 2>&1; then
-  port_configure
-else
-  CONFIGURE_FLAGS="${AUTOTOOLS_CONFIGURE:---disable-shared --enable-static}"
-  (
-    cd "$BUILD_DIR"
-    BUILD_TRIPLET="$("$SRC_DIR/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
-    export cross_compiling=yes
-    "$SRC_DIR/configure" \
-      --host="$B1NIX_TRIPLET" \
-      --build="$BUILD_TRIPLET" \
-      --prefix="$INSTALL_DIR" \
-      $CONFIGURE_FLAGS \
-      CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-      1>&2
-  )
-fi
-
-# --- disable autotools maintainer-mode rebuild rules ----------------------
-# Release tarballs ship all generated files (configure, *.in, aclocal.m4) and
-# we never edit the .ac/.am sources, so any am--refresh / automake / autoconf
-# trigger is spurious — and those exact-version tools are absent on the host.
-# Export as environment variables so sub-makes and am--refresh recipes see them.
-export ACLOCAL=":" AUTOCONF=":" AUTOMAKE=":" AUTOHEADER=":" MAKEINFO=":"
-export am__maybe_remake_makefiles=""
-LOCKFILE="$ROOT_DIR/build/$AUTOTOOLS_NAME-$B1NIX_TRIPLET.lock"
-mkdir -p "$(dirname "$LOCKFILE")"
+LOCKFILE="$BUILD_DIR/locks/build.lock"
+mkdir -p "$SRC_PARENT" "$BUILD_DIR" "$INSTALL_DIR" "$(dirname "$LOCKFILE")"
 
 (
   flock -x 9
@@ -145,18 +56,103 @@ mkdir -p "$(dirname "$LOCKFILE")"
     exit 0
   fi
 
-  mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR" "$INSTALL_DIR"
+  : > "$BUILD_DIR/build.log"
+  exec 2>>"$BUILD_DIR/build.log"
 
   # --- fetch + extract ------------------------------------------------------
   if [ ! -d "$SRC_DIR" ]; then
     tmp="$SRC_PARENT/$AUTOTOOLS_TARBALL"
     if [ ! -f "$tmp" ]; then
-      port_fetch_tarball "$AUTOTOOLS_URL" "$tmp" "$SRC_PARENT/$B1NIX_TRIPLET" \
+      port_fetch_tarball "$AUTOTOOLS_URL" "$tmp" "$SRC_PARENT" \
         "${AUTOTOOLS_SENTINEL:-$SRC_DIR}"
     fi
     # Handle case where tarball extracts to a different name than expected
     if [ ! -d "$SRC_DIR" ]; then
-      for d in "$SRC_PARENT/$B1NIX_TRIPLET"/*; do
+      for d in "$SRC_PARENT"/*; do
+        if [ -d "$d" ] && [ -f "$d/configure" -o -f "$d/configure.ac" ]; then
+          mv "$d" "$SRC_DIR"
+          break
+        fi
+      done
+    fi
+  fi
+
+  # --- patches --------------------------------------------------------------
+  if [ -n "${PATCHES:-}" ]; then
+    # shellcheck disable=SC2086
+    port_apply_patches "$SRC_DIR" $PATCHES
+  fi
+
+  # --- patch config.sub to accept b1nix ------------------------------------
+  if [ -f "$SRC_DIR/config.sub" ] && ! grep -q 'b1nix' "$SRC_DIR/config.sub"; then
+    tmp_sub="$SRC_DIR/config.sub.new"
+    sed -e 's/| fiwix\* /| fiwix* | b1nix* /' \
+        -e 's/| -mint\*/| -mint* | -b1nix*/' \
+        -e 's/| -none\*/| -none* | -b1nix*/' \
+        -e 's/| -elf\*/| -elf* | -b1nix*/' \
+        -e 's/| -limine\*/| -limine* | -b1nix*/' \
+        -e 's/| -os2\*/| -os2* | -b1nix*/' \
+        -e 's/| os2\*/| os2* | b1nix*/' \
+        "$SRC_DIR/config.sub" > "$tmp_sub"
+    mv "$tmp_sub" "$SRC_DIR/config.sub"
+  fi
+
+  # --- touch autotools outputs to avoid re-running autoconf/automake ---------
+  # Only touch if configure is newer than the current time (to avoid touching
+  # files that already have correct timestamps from a previous build).
+  if [ -f "$SRC_DIR/configure" ] && [ "$(stat -c %Y "$SRC_DIR/configure" 2>/dev/null || echo 0)" -gt "$(date +%s)" ]; then
+    find "$SRC_DIR" \( -name 'configure.ac' -o -name '*.am' -o -name '*.m4' \) \
+      -exec touch -t 200001010000 {} + 1>&2
+    find "$SRC_DIR" \( -name 'configure' -o -name '*.in' \) \
+      -exec touch -t 202001010000 {} + 1>&2
+  fi
+
+  # --- ensure musl libc is built -------------------------------------------
+  # Ports link against musl's libc.so + Scrt1.o (the b1nix native libc is retired).
+  if [ ! -f "$(port_musl_lib)/libc.so" ]; then
+    B1NIX_ARCH="$B1NIX_ARCH" sh "$ROOT_DIR/tools/ports/build-musl.sh" 1>&2
+  fi
+
+  # --- pre-configure hook ---------------------------------------------------
+  if command -v port_pre_configure >/dev/null 2>&1; then
+    # Port hooks may need these variables
+    export B1NIX_ARCH
+    port_pre_configure
+  fi
+
+  # --- configure ------------------------------------------------------------
+  if command -v port_configure >/dev/null 2>&1; then
+    port_configure
+  else
+    CONFIGURE_FLAGS="${AUTOTOOLS_CONFIGURE:---disable-shared --enable-static}"
+    (
+      cd "$BUILD_DIR"
+      BUILD_TRIPLET="$("$SRC_DIR/config.guess" 2>/dev/null || echo "$(uname -m)-pc-linux-gnu")"
+      export cross_compiling=yes
+      "$SRC_DIR/configure" \
+        --host="$B1NIX_TRIPLET" \
+        --build="$BUILD_TRIPLET" \
+        --prefix="$INSTALL_DIR" \
+        $CONFIGURE_FLAGS \
+        CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+        1>&2
+    )
+  fi
+
+  # --- disable autotools maintainer-mode rebuild rules ----------------------
+  export ACLOCAL=":" AUTOCONF=":" AUTOMAKE=":" AUTOHEADER=":" MAKEINFO=":"
+  export am__maybe_remake_makefiles=""
+
+  # --- fetch + extract ------------------------------------------------------
+  if [ ! -d "$SRC_DIR" ]; then
+    tmp="$SRC_PARENT/$AUTOTOOLS_TARBALL"
+    if [ ! -f "$tmp" ]; then
+      port_fetch_tarball "$AUTOTOOLS_URL" "$tmp" "$SRC_PARENT" \
+        "${AUTOTOOLS_SENTINEL:-$SRC_DIR}"
+    fi
+    # Handle case where tarball extracts to a different name than expected
+    if [ ! -d "$SRC_DIR" ]; then
+      for d in "$SRC_PARENT"/*; do
         if [ -d "$d" ] && [ -f "$d/configure" -o -f "$d/configure.ac" ]; then
           mv "$d" "$SRC_DIR"
           break
@@ -258,8 +254,17 @@ mkdir -p "$(dirname "$LOCKFILE")"
     port_post_install
   fi
 
+  find "$INSTALL_DIR" -type f 2>/dev/null | sed "s|^$INSTALL_DIR/||" > "$BUILD_DIR/pkg.manifest"
+  touch "$BUILD_DIR/build.stamp"
+
   # Driver prints install dir unless manifest has already printed (e.g. crypto phase)
   if [ -z "${AUTOTOOLS_ECHO+x}" ]; then
     echo "$INSTALL_DIR"
   fi
 ) 9>"$LOCKFILE"
+_autotools_status=$?
+if [ "$_autotools_status" != 0 ]; then
+  echo "build-$AUTOTOOLS_NAME: FAILED — tail of $BUILD_DIR/build.log:" >&2
+  tail -30 "$BUILD_DIR/build.log" 2>/dev/null >&2
+fi
+exit "$_autotools_status"

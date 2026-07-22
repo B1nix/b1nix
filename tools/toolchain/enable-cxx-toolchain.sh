@@ -21,7 +21,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 enable_one() {
   triplet="$1"
-  cross="$ROOT_DIR/build/toolchain_build/$triplet/cross"
+  cross="$ROOT_DIR/build/x86_64/toolchain/$triplet/cross"
   gxx="$cross/bin/$triplet-g++"
   [ -x "$gxx" ] || { echo "enable-cxx: $triplet: no cross g++, skipping" >&2; return 0; }
 

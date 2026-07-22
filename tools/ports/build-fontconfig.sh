@@ -15,10 +15,10 @@ CPORT_TARBALL="fontconfig-${FC_VERSION:-2.14.2}.tar.xz"
 CPORT_HEADERS="tree:fontconfig"
 
 GPERF="${GPERF:-$(command -v /opt/homebrew/opt/gperf/bin/gperf 2>/dev/null || command -v gperf)}"
+PORT_DEPS="expat freetype"
 
 port_pre_build() {
-  EXPAT_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-expat.sh")"
-  FT_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-freetype.sh")"
+  port_resolve_deps
   mkdir -p "$INSTALL_DIR/include/fontconfig"
 
   # --- code generation (host python3 + cpp + gperf) ---
@@ -78,7 +78,7 @@ port_pre_build() {
 EOF
 
   CPORT_CFLAGS="-fPIC -DHAVE_CONFIG_H -I$GEN_DIR -I$SRC_DIR -I$SRC_DIR/src -I$INSTALL_DIR/include \
-    -I$EXPAT_DIR/include -I$FT_DIR/include \
+    -I$EXPAT_DIR/include -I$FREETYPE_DIR/include \
     -DHAVE_EXPAT=1 -DFcPublic= -Wno-implicit-function-declaration -Wno-incompatible-pointer-types \
     -Wno-int-conversion -Wno-implicit-int -Wno-incompatible-function-pointer-types"
 }

@@ -12,14 +12,15 @@ CC="clang"; command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
 . "$ROOT_DIR/tools/ports/drivers/common.sh"
-SRC_PARENT="$ROOT_DIR/build/wayland-src"
+SRC_PARENT="$ROOT_DIR/build/src/wayland"
 SRC_DIR="$SRC_PARENT/wayland-${WAYLAND_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/wayland-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/wayland"
 INSTALL_DIR="$BUILD_DIR/install"
-HOST_DIR="$ROOT_DIR/build/wayland-host/$WAYLAND_VERSION/$B1NIX_TRIPLET"
+HOST_DIR="$BUILD_DIR/host"
 GEN_DIR="$BUILD_DIR/generated"
 COMPAT_DIR="$BUILD_DIR/compat"
-LIBFFI_DIR="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-libffi.sh")"
+PORT_DEPS="libffi"
+port_resolve_deps
 
 mkdir -p "$SRC_PARENT" "$BUILD_DIR/obj" "$INSTALL_DIR/include" \
   "$INSTALL_DIR/lib" "$HOST_DIR" "$GEN_DIR" "$COMPAT_DIR/sys"

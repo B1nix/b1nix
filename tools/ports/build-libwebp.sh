@@ -12,7 +12,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CPORT_NAME=libwebp
 CPORT_ARCHIVE=libwebp.a
-CPORT_SRC_PARENT="$ROOT_DIR/build/libwebp-src"
+CPORT_SRC_PARENT="$ROOT_DIR/build/src/libwebp"
 VER="${WEBP_VERSION:-1.4.0}"
 CPORT_SRCNAME="libwebp-${VER}"
 CPORT_TARBALL="libwebp-${VER}.tar.gz"

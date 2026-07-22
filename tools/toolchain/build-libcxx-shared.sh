@@ -38,8 +38,8 @@ LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
 # compiled against the old b1nix libc headers and reference `errno` as a DATA
 # symbol that musl's libc.so does not export, so a libc++.so.1 folded from them
 # fails to relocate at load time ("Error relocating: errno: symbol not found").
-RT_INSTALL="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-RT_MUSL="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+RT_INSTALL="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build/libcxx-install/lib"
+RT_MUSL="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
 if [ -f "$RT_MUSL/libc++.a" ]; then
     RT_INSTALL="$RT_MUSL"
 fi
@@ -49,15 +49,15 @@ CXX_A="$RT_INSTALL/libc++.a"
 # compiler-rt builtins (__divti3, __multi3, …): libc++.so / libc++abi.so reference
 # a few of these, so resolve them into the .so (NOT whole-archive — only the
 # referenced builtins are pulled) to keep each .so self-contained at load time.
-CRT_A="$ROOT/build/toolchain_build/$TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+CRT_A="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 for f in "$CXXABI_A" "$UNWIND_A" "$CXX_A" "$CRT_A"; do
     [ -f "$f" ] || { echo "missing $f — run tools/toolchain/build-libcxx.sh first" >&2; exit 1; }
 done
 
-CROSSLIB="$ROOT/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
-LIBC_SO="$CROSSLIB/libc.so.1"
-[ -f "$LIBC_SO" ] || ARCH="$ARCH" sh "$ROOT/tools/toolchain/stage-shared-libc.sh" >/dev/null 2>&1 || true
-[ -f "$LIBC_SO" ] || { echo "missing libc.so.1 in $CROSSLIB — run stage-shared-libc.sh first" >&2; exit 1; }
+CROSSLIB="$(ls -d "$ROOT/build/x86_64/ports/musl/install/lib" "$ROOT/build/x86_64/toolchain/$TRIPLET/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
+LIBC_SO="$CROSSLIB/libc.so"
+[ -f "$LIBC_SO" ] || B1NIX_ARCH="$ARCH" sh "$ROOT/tools/ports/build-musl.sh" >/dev/null 2>&1 || true
+[ -f "$LIBC_SO" ] || { echo "missing libc.so in $CROSSLIB — run tools/ports/build-musl.sh first" >&2; exit 1; }
 
 ABI_SO="$CROSSLIB/libc++abi.so.1"
 CXX_SO="$CROSSLIB/libc++.so.1"
@@ -100,7 +100,7 @@ EOF
 # path). -c only: malloc / pthread_* resolve at load time against libc.so.
 SHIM_C="$ROOT/tools/toolchain/cxa_thread_atexit_shim.c"
 SHIM_O="$(mktemp).o"
-MUSL_INC="$ROOT/build/musl-b1nix/$TRIPLET/install/usr/include"
+MUSL_INC="$ROOT/build/x86_64/ports/musl/install/include"
 CLANG_RES="$(clang -print-resource-dir 2>/dev/null || true)"
 # The shim is MANDATORY: without __cxa_thread_atexit_impl defined here, every
 # libc++/Mesa consumer fails to relocate at load ("symbol not found", exit 127).
@@ -156,12 +156,16 @@ fi
 # libc++{,abi}.so.1 from there and the initramfs .inc is generated from it, so a
 # stale sysroot copy (without the __cxa_thread_atexit_impl shim) would overwrite
 # the freshly-linked .so in the ISO.
-MUSL_USR_LIB="$ROOT/build/musl-b1nix/$TRIPLET/install/usr/lib"
+MUSL_USR_LIB="$ROOT/build/x86_64/ports/musl/install/lib"
 for d in "$ROOT/build/$ARCH/rootfs/lib" "$ROOT/build/$ARCH/rootfs/usr/lib" \
          "$MUSL_USR_LIB"; do
     [ -d "$d" ] || mkdir -p "$d"
-    cp -f "$ABI_SO" "$d/libc++abi.so.1"; ln -sf libc++abi.so.1 "$d/libc++abi.so"
-    cp -f "$CXX_SO"  "$d/libc++.so.1";   ln -sf libc++.so.1    "$d/libc++.so"
+    # CROSSLIB can resolve to the same dir as one of these targets (e.g. both
+    # point at the musl install lib/); cp -f X X errors "same file" under set -e.
+    [ "$ABI_SO" -ef "$d/libc++abi.so.1" ] || cp -f "$ABI_SO" "$d/libc++abi.so.1"
+    ln -sf libc++abi.so.1 "$d/libc++abi.so"
+    [ "$CXX_SO" -ef "$d/libc++.so.1" ] || cp -f "$CXX_SO" "$d/libc++.so.1"
+    ln -sf libc++.so.1 "$d/libc++.so"
 done
 
 echo "[libc++-shared] done:"

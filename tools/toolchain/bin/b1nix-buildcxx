@@ -1,3 +1,0 @@
-#!/bin/sh
-export B1NIX_BUILD_REAL=g++
-exec "$(dirname "$0")/b1nix-buildcc" "$@"

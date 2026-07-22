@@ -27,7 +27,7 @@ RANLIB="$(command -v llvm-ranlib || command -v ranlib)"
 NM="$(command -v llvm-nm || command -v nm)"
 RES="$("$CLANG" -print-resource-dir)"
 
-TB="$ROOT/build/toolchain_build/$TRIPLET"
+TB="$ROOT/build/x86_64/toolchain/$TRIPLET"
 V1="$TB/llvm-runtimes-build/libcxx-install/include/c++/v1"
 # STATIC libc++/libc++abi archives — folded (whole-archive) into libLLVM.so so the
 # dylib's DT_NEEDED graph stays SHALLOW (just libc.so.1), matching the proven-

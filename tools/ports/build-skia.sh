@@ -1,41 +1,50 @@
 #!/bin/sh
 # Build Skia (static libraries) for b1nix via cross-compilation.
 #
-# Produces: build/skia-b1nix/install/lib/libskia.a + dependencies
-#           build/skia-b1nix/install/include/ (Skia public headers)
+# Produces: build/x86_64/ports/skia/install/lib/libskia.a + dependencies
+#           build/x86_64/ports/skia/install/include/ (Skia public headers)
 #
 # Skia uses its own GN (gn/BUILDCONFIG.gn). We cross-compile using
 # host clang++ with --target + --sysroot via the b1nix-cross-cc wrapper.
 
 set -eu
 
+B1NIX_ARCH="${B1NIX_ARCH:-x86_64}"
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
-SKIA_DIR="$ROOT_DIR/build/ports-src/skia"
-BUILD_DIR="$ROOT_DIR/build/skia-b1nix"
+SKIA_DIR="$ROOT_DIR/build/src/skia"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/skia"
 INSTALL_DIR="$BUILD_DIR/install"
 
 GN_BIN="${GN_BIN:-$(command -v gn 2>/dev/null || \
-  { [ -x "$ROOT_DIR/build/toolchain_build/chromium/src/buildtools/linux64/gn" ] && echo "$ROOT_DIR/build/toolchain_build/chromium/src/buildtools/linux64/gn"; } || \
-  { [ -x "$ROOT_DIR/build/toolchain_build/v8-skeleton/gn-src/out/gn" ] && echo "$ROOT_DIR/build/toolchain_build/v8-skeleton/gn-src/out/gn"; } || \
-  echo "/tmp/gn-bin/gn")}"
+  { [ -x "$ROOT_DIR/build/x86_64/toolchain/chromium/src/buildtools/linux64/gn" ] && echo "$ROOT_DIR/build/x86_64/toolchain/chromium/src/buildtools/linux64/gn"; } || \
+  { [ -x "$ROOT_DIR/build/x86_64/toolchain/v8-skeleton/gn-src/out/gn" ] && echo "$ROOT_DIR/build/x86_64/toolchain/v8-skeleton/gn-src/out/gn"; } || \
+  { [ -x "$ROOT_DIR/build/src/gn-src/out/gn" ] && echo "$ROOT_DIR/build/src/gn-src/out/gn"; } || \
+  echo "")}"
 NINJA_BIN="${NINJA_BIN:-$(command -v ninja 2>/dev/null || echo "")}"
 CROSS_CC="$ROOT_DIR/tools/ports/b1nix-cross-cc.sh"
 
 # Ensure GN binary exists
-if [ ! -x "$GN_BIN" ]; then
-  echo "ERROR: GN not found. Install gn or set GN_BIN." >&2
-  echo "  Download: https://chrome-infra-packages.appspot.com/dl/gn/gn/linux-amd64/+/latest" >&2
-  exit 1
-fi
-
-# Ensure cross sysroot has usr/include symlink
-CROSS="$ROOT_DIR/build/toolchain_build/x86_64-b1nix/cross"
-if [ ! -d "$CROSS/usr/include" ]; then
-  mkdir -p "$CROSS/usr"
-  ln -sfn "$CROSS/x86_64-b1nix/include" "$CROSS/usr/include"
+if [ -z "$GN_BIN" ] || [ ! -x "$GN_BIN" ]; then
+  echo "GN not found. Auto-building GN..." >&2
+  GN_SRC="$ROOT_DIR/build/src/gn-src"
+  mkdir -p "$ROOT_DIR/build/src"
+  if [ ! -d "$GN_SRC" ]; then
+    git clone https://gn.googlesource.com/gn "$GN_SRC" >&2
+  fi
+  ( cd "$GN_SRC" && python3 build/gen.py && ninja -C out gn ) >&2
+  GN_BIN="$GN_SRC/out/gn"
 fi
 
 . "$ROOT_DIR/tools/toolchain/env.sh"
+
+# Ensure cross sysroot has usr/include symlink
+CROSS="$TOOLCHAIN_BUILD_HOME/cross"
+AR_BIN="${AR_BIN:-$(command -v llvm-ar 2>/dev/null || echo "$CROSS/bin/llvm-ar")}"
+SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
+if [ ! -d "$CROSS/usr/include" ]; then
+  mkdir -p "$CROSS/usr"
+  ln -sfn "$SYSROOT/include" "$CROSS/usr/include" 2>/dev/null || true
+fi
 
 # Serialize concurrent invocations
 mkdir -p "$BUILD_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
@@ -110,18 +119,25 @@ sh "$ROOT_DIR/tools/patches/skia/apply.sh" "$SKIA_DIR"
 #   (b) Shared libskia.so created from the static archive
 # Skia disables tools when is_component_build=true, so static-first is required.
 SKIA_OUT="$SKIA_DIR/out/b1nix"
-MESA_LIB_DIR="$ROOT_DIR/build/mesa-b1nix/x86_64-b1nix/install/lib"
+MESA_LIB_DIR="$ROOT_DIR/build/x86_64/ports/mesa/install/lib"
 mkdir -p "$SKIA_OUT"
 
-cat > "$SKIA_OUT/args.gn" << EOF
-target_os = "linux"
+CC_WRAPPER=""
+if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
+  CC_WRAPPER='cc_wrapper = "ccache"'
+fi
+
+cat > "$SKIA_OUT/args.gn" <<EOF
+target_os = "b1nix"
 target_cpu = "x64"
+is_clang = true
+$CC_WRAPPER
 is_debug = false
 is_official_build = false
 is_component_build = false
 cc = "$CROSS_CC"
 cxx = "$CROSS_CC"
-ar = "$CROSS/bin/x86_64-b1nix-ar"
+ar = "$AR_BIN"
 skia_use_gl = true
 skia_use_egl = true
 skia_use_piex = false
@@ -135,13 +151,6 @@ skia_enable_graphite = true
 # Dawn is built separately as libdawn_combined.a (CMake) and linked into
 # smoke binaries statically. Not included in the shared libskia.so (too large).
 skia_use_dawn = false
-skia_use_system_zlib = false
-skia_use_system_libpng = false
-skia_use_system_libjpeg_turbo = false
-skia_use_system_expat = false
-skia_use_system_harfbuzz = false
-skia_use_system_icu = false
-skia_use_system_freetype2 = false
 skia_use_partition_alloc = false
 skia_enable_tools = true
 skia_enable_skottie = true

@@ -50,12 +50,12 @@ port_clang_target() {
 
 # musl sysroot include dir for the active arch (headers installed by build-musl.sh).
 port_musl_include() {
-  printf '%s' "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/include"
+  printf '%s' "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
 }
 
 # musl sysroot lib dir (libc.so, Scrt1.o, crti.o, crtn.o).
 port_musl_lib() {
-  printf '%s' "$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr/lib"
+  printf '%s' "$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
 }
 
 # Include flags for musl-linked ports: musl headers first, then clang's own
@@ -92,6 +92,25 @@ port_fetch_tarball() {
       esac
     fi
   ) 9>"$_tar.lock"
+}
+
+# ---------------------------------------------------------------------------
+# PORT_DEPS
+#
+# Manifests declare `PORT_DEPS="openlibm pixman freetype"` and call
+# port_resolve_deps in their pre-build/pre-configure hook. Each dep name maps
+# to a sibling tools/ports/build-<dep>.sh (already self-memoizing via its own
+# lockfile + install-dir check, so calling it here is cheap once built) and
+# the resolved install dir is exported as <DEP_NAME_UPPERCASED>_DIR (hyphens
+# become underscores: libwapcaplet -> LIBWAPCAPLET_DIR).
+# ---------------------------------------------------------------------------
+port_resolve_deps() {
+  for _pd_dep in ${PORT_DEPS:-}; do
+    _pd_dir="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-$_pd_dep.sh")"
+    _pd_var="$(printf '%s' "$_pd_dep" | tr 'a-z-' 'A-Z_')_DIR"
+    eval "$_pd_var=\"\$_pd_dir\""
+    eval "export $_pd_var"
+  done
 }
 
 # Apply patch / sed-snippet files from tools/patches/<port>/ idempotently.

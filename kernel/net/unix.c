@@ -24,6 +24,11 @@ struct unix_socket_data {
   struct unix_socket_data *backlog[16];
   int backlog_count;
   int backlog_max;
+  /* Set while this socket sits, not-yet-accepted, in a listener's backlog[]
+   * (unix_connect). Lets unix_free_state splice a closing connector out of the
+   * listener's backlog instead of leaving a dangling entry that a later
+   * accept() hands out (UAF the moment anyone touches it, e.g. unix_lock). */
+  struct unix_socket_data *pending_listener;
   
   char *rb_buffer;
   usize rb_head;
@@ -137,6 +142,31 @@ void unix_free_state(struct vfs_socket_state *s) {
   for (int i = 0; i < npending; i++)
     unix_data_put(pending[i]); /* backlog slot references */
 
+  /* If we are ourselves a still-pending connector (unix_connect enqueued us
+   * into a listener's backlog and nobody has accept()ed us yet), splice
+   * ourselves out of that backlog. Without this, closing a connecting socket
+   * before accept() leaves a dangling pointer in the listener's backlog[]
+   * that a later accept() hands out — accept() then writes through it and
+   * any subsequent unix_lock() on it faults on freed memory. */
+  struct unix_socket_data *listener = u->pending_listener;
+  u->pending_listener = 0;
+  if (listener) {
+    unix_lock(listener);
+    int spliced = 0;
+    for (int i = 0; i < listener->backlog_count; i++) {
+      if (listener->backlog[i] == u) {
+        for (int j = i; j < listener->backlog_count - 1; j++)
+          listener->backlog[j] = listener->backlog[j + 1];
+        listener->backlog_count--;
+        spliced = 1;
+        break;
+      }
+    }
+    unix_unlock(listener);
+    if (spliced) unix_data_put(u); /* drop the backlog slot's reference on us */
+    unix_data_put(listener);       /* drop the pending_listener backref */
+  }
+
   unix_data_put(u);        /* drop the owning socket's reference */
 }
 
@@ -189,6 +219,10 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
     }
     unix_data_get(u); /* the backlog slot holds a reference on us */
     peer_u->backlog[peer_u->backlog_count++] = u;
+    unix_data_get(peer_u); /* pending_listener back-reference: lets a close()
+                             * while still pending splice us out instead of
+                             * leaving a dangling backlog entry */
+    u->pending_listener = peer_u;
     unix_unlock(peer_u);
 
     /* Wake up peer for accept() */
@@ -207,6 +241,8 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
               peer_u->backlog[j] = peer_u->backlog[j + 1];
             peer_u->backlog_count--;
             unix_data_put(u); /* drop the backlog slot's reference */
+            u->pending_listener = 0;
+            unix_data_put(peer_u); /* drop the pending_listener backref (self-spliced) */
             break;
           }
         }
@@ -258,6 +294,13 @@ int unix_accept(struct vfs_socket_state *s, struct vfs_socket_state *new_s,
       new_s->connected = 1;
       if (client_u->socket)
         client_u->socket->connected = 1;
+
+      /* Accepted: drop the pending_listener backref (client_u is no longer
+       * sitting in our backlog, so a close() racing in now takes the normal
+       * peer-detach path in unix_free_state instead of the backlog-splice
+       * one). */
+      client_u->pending_listener = 0;
+      unix_data_put(u);
 
       return 0;
     }

@@ -2,9 +2,9 @@
 # Build musl as a static + shared libc for the b1nix userspace ABI.
 #
 # Produces:
-#   - build/musl-b1nix/<triplet>/usr/lib/libc.a   (static musl)
-#   - build/musl-b1nix/<triplet>/usr/lib/libc.so   (shared musl / ld.so)
-#   - build/musl-b1nix/<triplet>/usr/include/      (musl headers)
+#   - build/<arch>/ports/musl/usr/lib/libc.a   (static musl)
+#   - build/<arch>/ports/musl/usr/lib/libc.so   (shared musl / ld.so)
+#   - build/<arch>/ports/musl/usr/include/      (musl headers)
 #
 # Usage:
 #   tools/ports/build-musl.sh              # build musl
@@ -22,10 +22,13 @@ MUSL_URL="https://musl.libc.org/releases/musl-${MUSL_VERSION}.tar.gz"
 MUSL_TARBALL="musl-${MUSL_VERSION}.tar.gz"
 MUSL_SRCNAME="musl-${MUSL_VERSION}"
 
-SRC_PARENT="$ROOT_DIR/build/musl-src"
+SRC_PARENT="$ROOT_DIR/build/src/musl"
 SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/$MUSL_SRCNAME"
-BUILD_DIR="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET"
+# Primary install: flat layout matching all other ports (no usr/ subdir)
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl"
 INSTALL_DIR="$BUILD_DIR/install"
+# Dedicated top-level alias: build/<arch>/libc/ — same tree, symlinked
+LIBC_DIR="$ROOT_DIR/build/$B1NIX_ARCH/libc"
 mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR" "$INSTALL_DIR"
 
 # --- clean -------------------------------------------------------------------
@@ -36,12 +39,22 @@ if [ "${1:-}" = "--clean" ]; then
   exit 0
 fi
 
-# --- fetch + extract ----------------------------------------------------------
-if [ ! -d "$SRC_DIR" ]; then
-  echo "build-musl.sh: fetching musl $MUSL_VERSION" >&2
-  port_fetch_tarball "$MUSL_URL" "$SRC_PARENT/$MUSL_TARBALL" \
-    "$SRC_PARENT/$B1NIX_TRIPLET" "$SRC_DIR"
-fi
+LOCKFILE="$BUILD_DIR/locks/build.lock"
+mkdir -p "$(dirname "$LOCKFILE")"
+
+(
+  flock -x 9
+  if [ -f "$INSTALL_DIR/lib/libc.a" ] && [ -f "$INSTALL_DIR/lib/libc.so" ]; then
+    echo "$INSTALL_DIR"
+    exit 0
+  fi
+
+  # --- fetch + extract ----------------------------------------------------------
+  if [ ! -d "$SRC_DIR" ]; then
+    echo "build-musl.sh: fetching musl $MUSL_VERSION" >&2
+    port_fetch_tarball "$MUSL_URL" "$SRC_PARENT/$MUSL_TARBALL" \
+      "$SRC_PARENT/$B1NIX_TRIPLET" "$SRC_DIR"
+  fi
 
 # --- provide __cxa_thread_atexit_impl ----------------------------------------
 # musl 1.2.5 deliberately omits __cxa_thread_atexit_impl (a glibc-ABI primitive),
@@ -154,7 +167,7 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
 
   # Apply the b1nix-specific dynamic-loader fixes to the clean musl source.
   # Keeping them as a repository patch makes rebuilds reproducible and avoids
-  # leaving edits in the generated build/musl-src tree as the source of truth.
+  # leaving edits in the generated build/src/musl tree as the source of truth.
   # --forward skips already-applied hunks but then exits non-zero, which under
   # `set -e` would abort an incremental rebuild of an already-patched tree — so
   # tolerate that (idempotent re-apply).
@@ -196,75 +209,179 @@ echo "build-musl.sh: building musl (static + shared)" >&2
 make -C "$SRC_DIR" -j"$(nproc 2>/dev/null || echo 4)" 2>&1 | tail -5
 
 # --- install (manual, reliable) -----------------------------------------------
+# Flat layout: install/lib/ + install/include/ — same as every other port.
 echo "build-musl.sh: installing musl to $INSTALL_DIR" >&2
-mkdir -p "$INSTALL_DIR/usr/lib" "$INSTALL_DIR/usr/include"
+mkdir -p "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 
-cp "$SRC_DIR/lib/libc.a" "$INSTALL_DIR/usr/lib/libc.a"
-cp "$SRC_DIR/lib/libc.so" "$INSTALL_DIR/usr/lib/libc.so"
+cp "$SRC_DIR/lib/libc.a"  "$INSTALL_DIR/lib/libc.a"
+cp "$SRC_DIR/lib/libc.so" "$INSTALL_DIR/lib/libc.so"
 
 # libc.so carries the whole implementation — math, threads, timers, dlopen,
-# crypt, resolver. The per-facility archives the build emits are deliberately
-# empty: they exist so that `-lm`, `-lpthread`, `-lrt`, `-ldl` … keep resolving
-# at link time while every symbol comes from libc.so at run time. Installing
-# them is what keeps a single libc blob on the image instead of one shared
-# object per facility.
+# crypt, resolver. The per-facility archives are deliberately empty: they exist
+# so that -lm/-lpthread/-lrt/-ldl keep resolving at link time while every symbol
+# comes from libc.so at run time.
 for compat in libm.a libpthread.a librt.a libdl.a libcrypt.a \
               libutil.a libresolv.a libxnet.a; do
-  if [ -f "$SRC_DIR/lib/$compat" ]; then
-    cp "$SRC_DIR/lib/$compat" "$INSTALL_DIR/usr/lib/$compat"
-  fi
+  [ -f "$SRC_DIR/lib/$compat" ] && cp "$SRC_DIR/lib/$compat" "$INSTALL_DIR/lib/$compat"
 done
 
-# Any per-facility shared object in the install tree would pull a second copy of
-# code that already lives in libc.so, and would add a DT_NEEDED that resolves to
-# nothing at run time. Drop them.
-rm -f "$INSTALL_DIR/usr/lib"/libm.so* "$INSTALL_DIR/usr/lib"/libpthread.so* \
-      "$INSTALL_DIR/usr/lib"/librt.so* "$INSTALL_DIR/usr/lib"/libdl.so* \
-      "$INSTALL_DIR/usr/lib"/libcrypt.so* "$INSTALL_DIR/usr/lib"/libutil.so* \
-      "$INSTALL_DIR/usr/lib"/libresolv.so* "$INSTALL_DIR/usr/lib"/libxnet.so*
+# Drop per-facility .so — they would duplicate code already in libc.so.
+rm -f "$INSTALL_DIR/lib"/libm.so* "$INSTALL_DIR/lib"/libpthread.so* \
+      "$INSTALL_DIR/lib"/librt.so* "$INSTALL_DIR/lib"/libdl.so* \
+      "$INSTALL_DIR/lib"/libcrypt.so* "$INSTALL_DIR/lib"/libutil.so* \
+      "$INSTALL_DIR/lib"/libresolv.so* "$INSTALL_DIR/lib"/libxnet.so*
 
 for crt in crt1.o crti.o crtn.o Scrt1.o rcrt1.o; do
-  [ -f "$SRC_DIR/lib/$crt" ] && cp "$SRC_DIR/lib/$crt" "$INSTALL_DIR/usr/lib/$crt"
+  [ -f "$SRC_DIR/lib/$crt" ] && cp "$SRC_DIR/lib/$crt" "$INSTALL_DIR/lib/$crt"
 done
 
-# Install headers via musl's own make (handles arch bits symlink + generated files)
-make -C "$SRC_DIR" install-headers DESTDIR="$INSTALL_DIR" 2>&1 || true
-# Fallback: manual copy if install-headers target doesn't exist
-if [ ! -f "$INSTALL_DIR/usr/include/stdlib.h" ]; then
-  cp -r "$SRC_DIR"/include/* "$INSTALL_DIR/usr/include/"
+# Headers — use musl's own target, fall back to manual copy.
+make -C "$SRC_DIR" install-headers DESTDIR="$INSTALL_DIR" prefix= 2>&1 || true
+if [ ! -f "$INSTALL_DIR/include/stdlib.h" ]; then
+  cp -r "$SRC_DIR"/include/* "$INSTALL_DIR/include/"
 fi
-# musl's arch-specific "bits" headers — ensure generated alltypes.h is present
+# Generated bits/alltypes.h
 if [ -f "$SRC_DIR/obj/include/bits/alltypes.h" ]; then
-  mkdir -p "$INSTALL_DIR/usr/include/bits"
-  cp "$SRC_DIR/obj/include/bits/alltypes.h" "$INSTALL_DIR/usr/include/bits/alltypes.h"
+  mkdir -p "$INSTALL_DIR/include/bits"
+  cp "$SRC_DIR/obj/include/bits/alltypes.h" "$INSTALL_DIR/include/bits/alltypes.h"
 fi
 if [ -d "$SRC_DIR/arch/x86_64/bits" ]; then
-  mkdir -p "$INSTALL_DIR/usr/include/bits"
-  cp -r "$SRC_DIR"/arch/x86_64/bits/* "$INSTALL_DIR/usr/include/bits/"
+  mkdir -p "$INSTALL_DIR/include/bits"
+  cp -r "$SRC_DIR"/arch/x86_64/bits/* "$INSTALL_DIR/include/bits/"
 fi
 if [ -d "$SRC_DIR/arch/generic/bits" ]; then
-  mkdir -p "$INSTALL_DIR/usr/include/bits"
+  mkdir -p "$INSTALL_DIR/include/bits"
   for f in "$SRC_DIR"/arch/generic/bits/*; do
-    [ -f "$INSTALL_DIR/usr/include/bits/$(basename "$f")" ] || cp "$f" "$INSTALL_DIR/usr/include/bits/"
+    [ -f "$INSTALL_DIR/include/bits/$(basename "$f")" ] || cp "$f" "$INSTALL_DIR/include/bits/"
   done
 fi
 
+# linux/futex.h: musl deliberately ships no kernel-uapi headers (it never
+# needs the FUTEX_* op constants as macros — its own futex calls are internal
+# and hardcode the numbers), but plenty of ported software (e.g. Chromium's
+# PartitionAlloc SpinningMutex, in the V8 port) #includes it directly for
+# those constants. b1nix's own futex(2) (kernel/sched/futex.c) implements the
+# same numeric ops via the Linux-ABI syscall layer, so only the header is
+# missing, not the kernel feature — provide the standard uapi values.
+mkdir -p "$INSTALL_DIR/include/linux"
+if [ ! -f "$INSTALL_DIR/include/linux/futex.h" ]; then
+  cat > "$INSTALL_DIR/include/linux/futex.h" <<'EOF'
+/* b1nix compat: standard Linux uapi/linux/futex.h FUTEX_* constants.
+ * musl does not ship this header; b1nix's futex(2) implements the same
+ * numeric ops, so only the constants (not the syscall) were missing. */
+#ifndef _LINUX_FUTEX_H
+#define _LINUX_FUTEX_H
+
+#define FUTEX_WAIT              0
+#define FUTEX_WAKE              1
+#define FUTEX_FD                2
+#define FUTEX_REQUEUE           3
+#define FUTEX_CMP_REQUEUE       4
+#define FUTEX_WAKE_OP           5
+#define FUTEX_LOCK_PI           6
+#define FUTEX_UNLOCK_PI         7
+#define FUTEX_TRYLOCK_PI        8
+#define FUTEX_WAIT_BITSET       9
+#define FUTEX_WAKE_BITSET       10
+#define FUTEX_WAIT_REQUEUE_PI   11
+#define FUTEX_CMP_REQUEUE_PI    12
+#define FUTEX_LOCK_PI2          13
+
+#define FUTEX_PRIVATE_FLAG      128
+#define FUTEX_CLOCK_REALTIME    256
+#define FUTEX_CMD_MASK          (~(FUTEX_PRIVATE_FLAG | FUTEX_CLOCK_REALTIME))
+#define FUTEX_BITSET_MATCH_ANY  0xffffffff
+
+#define FUTEX_WAIT_PRIVATE      (FUTEX_WAIT | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAKE_PRIVATE      (FUTEX_WAKE | FUTEX_PRIVATE_FLAG)
+#define FUTEX_REQUEUE_PRIVATE   (FUTEX_REQUEUE | FUTEX_PRIVATE_FLAG)
+#define FUTEX_CMP_REQUEUE_PRIVATE (FUTEX_CMP_REQUEUE | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAKE_OP_PRIVATE   (FUTEX_WAKE_OP | FUTEX_PRIVATE_FLAG)
+#define FUTEX_LOCK_PI_PRIVATE   (FUTEX_LOCK_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_LOCK_PI2_PRIVATE  (FUTEX_LOCK_PI2 | FUTEX_PRIVATE_FLAG)
+#define FUTEX_UNLOCK_PI_PRIVATE (FUTEX_UNLOCK_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_TRYLOCK_PI_PRIVATE (FUTEX_TRYLOCK_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAIT_BITSET_PRIVATE (FUTEX_WAIT_BITSET | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAKE_BITSET_PRIVATE (FUTEX_WAKE_BITSET | FUTEX_PRIVATE_FLAG)
+#define FUTEX_WAIT_REQUEUE_PI_PRIVATE (FUTEX_WAIT_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+#define FUTEX_CMP_REQUEUE_PI_PRIVATE (FUTEX_CMP_REQUEUE_PI | FUTEX_PRIVATE_FLAG)
+
+struct futex_waitv {
+	unsigned int val;
+	unsigned int flags;
+	unsigned int __reserved;
+	unsigned long long uaddr;
+};
+
+#endif /* _LINUX_FUTEX_H */
+EOF
+fi
+
+# linux/auxvec.h: same story as futex.h above — ported software (V8's
+# src/base/cpu.cc reads AT_HWCAP) expects the kernel-uapi AT_* constants that
+# musl does not ship as a public header.
+if [ ! -f "$INSTALL_DIR/include/linux/auxvec.h" ]; then
+  cat > "$INSTALL_DIR/include/linux/auxvec.h" <<'EOF'
+#ifndef _LINUX_AUXVEC_H
+#define _LINUX_AUXVEC_H
+
+#define AT_NULL   0
+#define AT_IGNORE 1
+#define AT_EXECFD 2
+#define AT_PHDR   3
+#define AT_PHENT  4
+#define AT_PHNUM  5
+#define AT_BASE   6
+#define AT_FLAGS  7
+#define AT_ENTRY  9
+#define AT_NOTELF 10
+#define AT_UID    11
+#define AT_EUID   12
+#define AT_GID    13
+#define AT_EGID   14
+#define AT_PLATFORM 15
+#define AT_HWCAP  16
+#define AT_CLKTCK 17
+#define AT_SECURE 23
+#define AT_BASE_PLATFORM 24
+#define AT_RANDOM 25
+#define AT_HWCAP2 26
+#define AT_EXECFN 31
+
+#endif /* _LINUX_AUXVEC_H */
+EOF
+fi
+
+# linux/unistd.h: ported software (e.g. abseil's direct_mmap.h) includes this
+# for __NR_mmap/__NR_mmap2 as an old-kernel fallback, always behind
+# `#if defined(__NR_mmap)` — so an empty header is a correct, complete answer
+# (musl's own sys/syscall.h already provides SYS_mmap unconditionally).
+if [ ! -f "$INSTALL_DIR/include/linux/unistd.h" ]; then
+  echo "/* b1nix compat: empty — musl provides SYS_* via sys/syscall.h; callers guard with #if defined(__NR_*) */" \
+    > "$INSTALL_DIR/include/linux/unistd.h"
+fi
+
+# Expose as build/<arch>/libc/ — dedicated top-level alias for the system libc
+ln -sfn "$INSTALL_DIR" "$LIBC_DIR"
+
 # Verify
-if [ ! -f "$INSTALL_DIR/usr/lib/libc.a" ]; then
+if [ ! -f "$INSTALL_DIR/lib/libc.a" ]; then
   echo "build-musl.sh: ERROR — lib/libc.a not found" >&2
   exit 1
 fi
-if [ ! -f "$INSTALL_DIR/usr/lib/libc.so" ]; then
+if [ ! -f "$INSTALL_DIR/lib/libc.so" ]; then
   echo "build-musl.sh: ERROR — lib/libc.so not found" >&2
   exit 1
 fi
 
-readelf -h "$INSTALL_DIR/usr/lib/libc.so" 2>/dev/null | grep -q "Entry" \
+readelf -h "$INSTALL_DIR/lib/libc.so" 2>/dev/null | grep -q "Entry" \
   && echo "build-musl.sh: libc.so entry point OK" >&2
 
 echo "build-musl.sh: musl built successfully" >&2
-echo "  static: $INSTALL_DIR/usr/lib/libc.a" >&2
-echo "  shared: $INSTALL_DIR/usr/lib/libc.so" >&2
-echo "  include: $INSTALL_DIR/usr/include/" >&2
+echo "  static:  $INSTALL_DIR/lib/libc.a" >&2
+echo "  shared:  $INSTALL_DIR/lib/libc.so" >&2
+echo "  include: $INSTALL_DIR/include/" >&2
+echo "  alias:   $LIBC_DIR" >&2
 
-echo "$INSTALL_DIR/usr"
+echo "$INSTALL_DIR"
+) 9>"$LOCKFILE"

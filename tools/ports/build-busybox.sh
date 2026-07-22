@@ -23,19 +23,20 @@ fi
 
 BUILD_HOME="$TOOLCHAIN_BUILD_HOME"
 SRC_DIR="$TOOLCHAIN_SRC_DIR/busybox-${BUSYBOX_VER}"
-BUILD_DIR="$PROJECT_DIR/build/busybox-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/busybox"
 CROSS_PREFIX="$BUILD_HOME/cross"
 SYSROOT="$B1NIX_ROOTFS"
 CONFIG_FRAGMENT="$PROJECT_DIR/tools/configs/busybox-${BUSYBOX_VER}.config"
 INSTALL_DIR="${BUSYBOX_INSTALL_DIR:-$SYSROOT/opt/busybox/bin}"
 
 # ── musl paths ──
-MUSL_INSTALL="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_INSTALL="$PROJECT_DIR/build/x86_64/ports/musl/install"
 MUSL_INCLUDE="$MUSL_INSTALL/include"
 MUSL_LIB="$MUSL_INSTALL/lib"
 
-if [ ! -f "$CROSS_PREFIX/bin/${TARGET}-gcc" ]; then
-    echo "Error: cross-compiler not found at $CROSS_PREFIX/bin/${TARGET}-gcc"
+CC="${CC:-$PROJECT_DIR/tools/toolchain/bin/b1nix-musl-autotools-cc}"
+if ! command -v "$CC" >/dev/null 2>&1 && [ ! -f "$CROSS_PREFIX/bin/${TARGET}-cc" ] && [ ! -f "$CROSS_PREFIX/bin/${TARGET}-clang" ]; then
+    echo "Error: cross-compiler not found at $CC or $CROSS_PREFIX/bin/${TARGET}-cc"
     echo "Run tools/toolchain/build-toolchain.sh first."
     exit 1
 fi
@@ -44,7 +45,7 @@ export PATH="$CROSS_PREFIX/bin:$PATH"
 
 # ── 0. Install musl headers into sysroot ──
 # With musl we don't build the b1nix native libc — just stage musl headers.
-MUSL_INSTALL_HDR="$PROJECT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_INSTALL_HDR="$PROJECT_DIR/build/x86_64/ports/musl/install"
 if [ "${B1NIX_HEADERS_INSTALLED:-0}" != "1" ]; then
   (
     flock -x 9

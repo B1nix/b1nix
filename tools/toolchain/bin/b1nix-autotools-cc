@@ -2,7 +2,15 @@
 # Cross-compiler wrapper for autotools-style userspace ports.
 set -e
 
-SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+# Resolve the symlink itself (not just dirname-of-invocation-path) before
+# walking up. `build/` is a symlink to another mount; when this wrapper is
+# invoked via a RELATIVE path (as ninja/GN do) the process's physical cwd is
+# already resolved onto that other mount, so a naive dirname-of-$0 walk-up
+# never reaches the project root. Following the symlink chain of $0 lands on
+# the real tools/toolchain/bin/b1nix-autotools-cc under the project root
+# regardless of how/where the wrapper was invoked from.
+SELF="$(readlink -f "$0" 2>/dev/null || readlink "$0" 2>/dev/null || echo "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$SELF")" && pwd)"
 PROJECT_DIR=""
 cur="$SCRIPT_DIR"
 while [ "$cur" != "/" ]; do
@@ -34,7 +42,7 @@ if [ "$B1NIX_ARCH" = "x86" ]; then
 else
 	TRIPLET="x86_64-b1nix"
 fi
-MUSL_INCLUDE="$PROJECT_DIR/build/musl-b1nix/$TRIPLET/install/usr/include"
+MUSL_INCLUDE="$PROJECT_DIR/build/x86_64/ports/musl/install/include"
 
 # Intercept GCC-specific query flags
 for arg in "$@"; do
@@ -44,7 +52,7 @@ for arg in "$@"; do
       ;;
   esac
   if [ "$arg" = "-print-sysroot" ]; then
-    echo "$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET"
+    echo "$PROJECT_DIR/build/x86_64/toolchain/$TRIPLET/cross/$TRIPLET"
     exit 0
   fi
 done
@@ -53,6 +61,17 @@ LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
 CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
 SHARED_LIBC="$USR/build/$B1NIX_ARCH/libc.so.1"
 DYNAMIC_CRT0="$USR/build/$B1NIX_ARCH/crt/crt0-dynamic.o"
+# musl static-link objects (M92): a caller-requested -static link (Rust's ET_EXEC
+# targets, crt-static-default) must use musl's own crt1/crti/crtn + libc.a, not
+# the retired in-house libb1nix.a/crt0.o — those Makefile targets no longer
+# exist post-musl-migration ("No rule to make target 'build/x86_64/libb1nix.a'").
+MUSL_LIB_DIR="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
+MUSL_CRT1="$MUSL_LIB_DIR/crt1.o"
+MUSL_CRTI="$MUSL_LIB_DIR/crti.o"
+MUSL_CRTN="$MUSL_LIB_DIR/crtn.o"
+MUSL_LIBA="$MUSL_LIB_DIR/libc.a"
+MUSL_SCRT1="$MUSL_LIB_DIR/Scrt1.o"
+MUSL_SO="$MUSL_LIB_DIR/libc.so"
 # Relative target paths for the on-demand `make -C "$USR"` calls below: the
 # userspace Makefile defines its rules relative to build/$(B1NIX_ARCH)/... , so
 # `make` must be handed the RELATIVE target, not the absolute path (an absolute
@@ -71,7 +90,7 @@ LINKER="${B1NIX_LINKER:-$USR/linker.ld}"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang)}"
 if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
-	CLANG="ccache clang"
+	CLANG="ccache $CLANG"
 fi
 
 # Passthrough cases: the caller controls the entire link, so injecting b1nix's own
@@ -135,11 +154,21 @@ for _a in "$@"; do
   esac
 done
 
-if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" = "dynamic" ]; then
+# The retired b1nix shared libc.so.1/crt0-dynamic.o have no Makefile rule
+# post-musl-migration; only attempt the on-demand build when musl's own PIE
+# dynamic objects (Scrt1.o/libc.so, from build-musl.sh) are not already there.
+if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" = "dynamic" ] &&
+   { [ ! -f "$MUSL_SCRT1" ] || [ ! -f "$MUSL_SO" ]; }; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
     make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_SHARED_LIBC" "$REL_DYNAMIC_CRT0"
 fi
-if [ "$B1NIX_NO_RUNTIME" -eq 0 ]; then
+# Only the legacy libb1nix.a static path needs building on demand. A dynamic
+# link doesn't touch $LIB/$CRT0 at all, and a musl static link (crt1.o/libc.a
+# already present from build-musl.sh) supersedes it — that Makefile target no
+# longer exists post-musl-migration, so attempting it unconditionally here
+# hard-fails every static-musl link with "No rule to make target ...libb1nix.a".
+if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" != "dynamic" ] &&
+   { [ ! -f "$MUSL_CRT1" ] || [ ! -f "$MUSL_LIBA" ]; }; then
   [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
 fi
 
@@ -275,8 +304,15 @@ done
 # -lunwind / -lcompiler_rt the Rust target spec links) resolve without the
 # caller having to pass an absolute -L: the cross sysroot lib dir and the
 # per-target cross lib dir. Caller -L entries in linkline[] still take priority.
-SYSROOT_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/sysroot/lib"
-CROSS_LIB="$PROJECT_DIR/build/toolchain_build/$TRIPLET/cross/$TRIPLET/lib"
+# Prefer the flat per-arch layout (build/x86_64/toolchain/{sysroot,cross/...})
+# that env.sh/build-toolchain.sh actually populate; fall back to the older
+# triplet-nested tree for any build that still has one.
+# sysroot/usr/lib (not the bare sysroot/lib, which build-llvm-runtimes.sh's
+# standalone libunwind build leaves incomplete — missing the register
+# save/restore assembly) is where build-libcxx.sh installs the AUTHORITATIVE
+# libunwind.a. See its "Install into cross sysroot" step.
+SYSROOT_LIB="$(ls -d "$PROJECT_DIR/build/x86_64/toolchain/sysroot/usr/lib" "$PROJECT_DIR/build/x86_64/toolchain/$TRIPLET/sysroot/usr/lib" 2>/dev/null | head -1)"
+CROSS_LIB="$(ls -d "$PROJECT_DIR/build/x86_64/toolchain/cross/$TRIPLET/lib" "$PROJECT_DIR/build/x86_64/toolchain/$TRIPLET/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
 libdirs=()
 [ -d "$SYSROOT_LIB" ] && libdirs+=("-L" "$SYSROOT_LIB")
 [ -d "$CROSS_LIB" ] && libdirs+=("-L" "$CROSS_LIB")
@@ -311,10 +347,53 @@ if [ "$is_shared" -eq 1 ]; then
   fi
   exec "$LD" -m "$LD_EMULATION" -shared --hash-style=sysv -o "$output" \
     "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "${cxx_shared[@]}" "$SHARED_LIBC"
+elif [ "$B1NIX_LINK" = "dynamic" ] && [ -f "$MUSL_SCRT1" ] && [ -f "$MUSL_SO" ]; then
+  # musl PIE/ET_DYN dynamic link (M92): the retired b1nix shared libc.so.1 +
+  # crt0-dynamic.o have no Makefile rule anymore, so route through musl's own
+  # Scrt1.o/libc.so instead — same DT_NEEDED-by-basename trick b1nix-musl-cc
+  # uses (a same-named symlink so the recorded NEEDED entry is the bare
+  # "ld-musl-x86_64.so.1" the kernel actually searches for in /lib).
+  musl_link_dir="${TMPDIR:-/tmp}/b1nix-autotools-musl-link.$$"
+  mkdir -p "$musl_link_dir"
+  ln -sf "$MUSL_SO" "$musl_link_dir/ld-musl-x86_64.so.1"
+  "$LD" -m "$LD_EMULATION" -pie --dynamic-linker /lib/ld-musl-x86_64.so.1 \
+    --hash-style=sysv -o "$output" "$MUSL_SCRT1" "$MUSL_CRTI" \
+    "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" \
+    ${B1NIX_LD_EXTRA:-} -L"$musl_link_dir" -l:ld-musl-x86_64.so.1 "$MUSL_CRTN"
+  ld_status=$?
+  rm -rf "$musl_link_dir"
+  if [ "$ld_status" -eq 0 ]; then
+    # Mark ELFOSABI_LINUX (3) so the kernel routes syscalls through the Linux
+    # ABI translation layer, matching every other musl-linked b1nix binary.
+    python3 -c "
+import sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)
+    fh.write(bytes([3]))
+" "$output" 2>/dev/null || true
+  fi
+  exit "$ld_status"
 elif [ "$B1NIX_LINK" = "dynamic" ]; then
   exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
     -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
     "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
+elif [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_LIBA" ]; then
+  # musl static ET_EXEC (Rust's crt-static-default target, or any other caller
+  # that passes -static): crt1+crti / objs / libc.a / crtn, same fixed load
+  # base as every other b1nix static binary via $LINKER.
+  "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" \
+    "$MUSL_CRT1" "$MUSL_CRTI" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
+    "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "$MUSL_LIBA" "$MUSL_CRTN"
+  # Mark ELFOSABI_LINUX (3) so the kernel routes this binary's syscalls through
+  # the Linux-ABI translation layer, matching b1nix-musl-cc's static path.
+  python3 -c "
+import sys
+f = sys.argv[1]
+with open(f, 'r+b') as fh:
+    fh.seek(7)
+    fh.write(bytes([3]))
+" "$output" 2>/dev/null || true
 else
   exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
 fi

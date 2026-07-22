@@ -82,16 +82,23 @@ download_ports() {
 local_ports() {
 	export B1NIX_ARCH="$ARCH"
 	echo "BUILD bash curl wget dropbear netsurf [$PKG_ARCH]"
-	bash_src="$("$ROOT_DIR/tools/ports/build-bash.sh")"
-	B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-curl.sh"
-	B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-wget.sh"
+	curl_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-curl.sh")"
+	wget_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-wget.sh")"
 	dropbear_src="$("$ROOT_DIR/tools/ports/build-dropbear.sh" all)"
 	netsurf_bin="$("$ROOT_DIR/tools/ports/build-netsurf-fb.sh")"
 
 	mkdir -p "$ROOTFS/bin"
 	cp "$bash_src/bash" "$ROOTFS/bin/bash"
-	cp "$ROOT_DIR/build/curl-b1nix/$TRIPLET/src/curl" "$ROOTFS/bin/curl"
-	cp "$ROOT_DIR/build/wget-b1nix/$TRIPLET/src/wget" "$ROOTFS/bin/wget"
+	if [ -f "$curl_dir/bin/curl" ]; then
+		cp "$curl_dir/bin/curl" "$ROOTFS/bin/curl"
+	else
+		cp "$ROOT_DIR/build/$ARCH/ports/curl/src/curl" "$ROOTFS/bin/curl"
+	fi
+	if [ -f "$wget_dir/bin/wget" ]; then
+		cp "$wget_dir/bin/wget" "$ROOTFS/bin/wget"
+	else
+		cp "$ROOT_DIR/build/$ARCH/ports/wget/src/wget" "$ROOTFS/bin/wget"
+	fi
 	cp "$dropbear_src/dropbearmulti" "$ROOTFS/bin/dropbearmulti"
 	for name in dropbear dbclient dropbearkey; do ln -sfn dropbearmulti "$ROOTFS/bin/$name"; done
 	cp "$netsurf_bin" "$ROOTFS/bin/netsurf-fb"

@@ -28,9 +28,10 @@ B1NIX_CXX ?= ../tools/toolchain/bin/b1nix-c++
 # libc + its static b1nix-cc/crt0.o path were removed in the M92 migration).
 TCC_CC := ../tools/b1nix-musl-cc
 B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
-LIBM_DIR := ../build/openlibm-b1nix/$(B1NIX_TRIPLET)/install
+LIBM_DIR := ../build/$(B1NIX_ARCH)/ports/openlibm/install
+LIBS_DIR := ../build/$(B1NIX_ARCH)/libs
 # ── musl paths (must be before CFLAGS so $(MUSL_INCLUDE) expands) ───────
-MUSL_INSTALL := ../build/musl-b1nix/$(B1NIX_TRIPLET)/install/usr
+MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install/usr
 MUSL_INCLUDE := $(MUSL_INSTALL)/include
 MUSL_LIB     := $(MUSL_INSTALL)/lib
 # The blob that -lc below actually resolves against, so the dependency edge and
@@ -39,7 +40,7 @@ MUSL_LIBSO   := $(MUSL_LIB)/libc.so
 MUSL_CRT1    := $(MUSL_LIB)/Scrt1.o
 MUSL_CRTI    := $(MUSL_LIB)/crti.o
 MUSL_CRTN    := $(MUSL_LIB)/crtn.o
-LIBCXX_INCLUDE := ../build/toolchain_build/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1
+LIBCXX_INCLUDE := ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1
 # compiler-rt builtins: the helpers the compiler emits calls to but no library
 # defines (128-bit division __udivti3 and friends). Linking through ld.lld
 # directly means nothing supplies them implicitly, so name the archive. Asking
@@ -79,7 +80,7 @@ LINKER   := linker.ld
 # freestanding ABI tests).
 
 # ── musl paths (shared across musl/dynamic link models) ──────────────────
-MUSL_INSTALL := ../build/musl-b1nix/$(B1NIX_TRIPLET)/install/usr
+MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install/usr
 MUSL_INCLUDE := $(MUSL_INSTALL)/include
 MUSL_LIB     := $(MUSL_INSTALL)/lib
 # The blob that -lc below actually resolves against, so the dependency edge and
@@ -230,6 +231,8 @@ $(GUI_LIB): $(GUI_OBJS)
 	@mkdir -p $(dir $@)
 	rm -f $@
 	$(AR) rcs $@ $(GUI_OBJS)
+	@mkdir -p ../build/$(B1NIX_ARCH)/libs
+	cp -f $@ ../build/$(B1NIX_ARCH)/libs/libb1gui.a
 
 build/bin/%: build/$(B1NIX_ARCH)/bin/%
 	@mkdir -p build/bin
@@ -323,7 +326,7 @@ $(filter-out $(BUILD)/bin/displayd,$(GUI_BINARIES)): $(BUILD)/bin/%: bin/%.c $(G
 	)
 
 # M49: upstream libwayland-client, with libffi for protocol dispatch.
-WAYLAND_DIR := ../build/wayland-b1nix/$(B1NIX_TRIPLET)/install
+WAYLAND_DIR := ../build/$(B1NIX_ARCH)/ports/wayland/install
 $(WAYLAND_DIR)/lib/libwayland-client.a: ../tools/ports/build-wayland.sh ../tools/ports/build-libffi.sh \
 		../tools/wayland/os.c ../tools/wayland/compat.c ../tools/wayland/compat.h
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-wayland.sh >/dev/null
@@ -369,7 +372,7 @@ $(BUILD)/bin/native_smoke: bin/native_smoke.S
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
 # Without them it builds HTTP-only so a `B1NIX_TLS=none` build still works.
-MBEDTLS_DIR := ../build/mbedtls-b1nix/$(B1NIX_TRIPLET)/install
+MBEDTLS_DIR := ../build/$(B1NIX_ARCH)/ports/mbedtls/install
 $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
 	@mkdir -p $(dir $@)
 	@if [ -f $(MBEDTLS_DIR)/lib/libmbedtls.a ]; then \
@@ -444,7 +447,7 @@ $(BUILD)/bin/m51_smoke: bin/m51_smoke.c $(BESPOKE_LIBDEP)
 	  $(LIBM_DIR)/lib/libm.a $(BESPOKE_LIBC)
 
 # M51: m51_pixman_smoke links the ported static pixman (+libm).
-PIXMAN_DIR := ../build/pixman-b1nix/$(B1NIX_TRIPLET)/install
+PIXMAN_DIR := ../build/$(B1NIX_ARCH)/ports/pixman/install
 $(BUILD)/bin/m51_pixman_smoke: bin/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PIXMAN_DIR)/include/pixman-1 -c $< -o $(BUILD)/bin/m51_pixman_smoke.o
@@ -453,7 +456,7 @@ $(BUILD)/bin/m51_pixman_smoke: bin/m51_pixman_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC)
 
 # M51: m51_freetype_smoke links the ported static FreeType (+libm).
-FT_DIR := ../build/freetype-b1nix/$(B1NIX_TRIPLET)/install
+FT_DIR := ../build/$(B1NIX_ARCH)/ports/freetype/install
 $(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FT_DIR)/include -c $< -o $(BUILD)/bin/m51_freetype_smoke.o
@@ -462,7 +465,7 @@ $(BUILD)/bin/m51_freetype_smoke: bin/m51_freetype_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC)
 
 # M51: m51_cairo_smoke links the full stack (Cairo + FreeType + pixman + libm).
-CAIRO_DIR := ../build/cairo-b1nix/$(B1NIX_TRIPLET)/install
+CAIRO_DIR := ../build/$(B1NIX_ARCH)/ports/cairo/install
 $(BUILD)/bin/m51_cairo_smoke: bin/m51_cairo_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(CAIRO_DIR)/include/cairo -I $(FT_DIR)/include \
@@ -483,7 +486,7 @@ $(BUILD)/bin/m51_cairo_wayland: bin/m51_cairo_wayland.c $(GUI_LIB) $(BESPOKE_LIB
 	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
 
 # M52 end-to-end: EGL + TinyGL (software GL) + libb1gui (Wayland client) -> displayd.
-TINYGL_DIR := ../build/tinygl-b1nix/$(B1NIX_TRIPLET)/install
+TINYGL_DIR := ../build/$(B1NIX_ARCH)/ports/tinygl/install
 $(TINYGL_DIR)/lib/libEGL.a: ../tools/ports/build-tinygl.sh libegl/b1egl.c \
 		include/EGL/egl.h
 	B1NIX_ARCH=$(B1NIX_ARCH) ../tools/ports/build-tinygl.sh >/dev/null
@@ -550,8 +553,8 @@ $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBC
 # M51: m51_harfbuzz_smoke links the ported static HarfBuzz (+libm +compiler-rt
 # for integer builtins). HarfBuzz is C++ but -fno-exceptions/-rtti keep it off
 # libc++.
-HB_DIR := ../build/harfbuzz-b1nix/$(B1NIX_TRIPLET)/install
-LLVM_RT := ../build/toolchain_build/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a
+HB_DIR := ../build/$(B1NIX_ARCH)/ports/harfbuzz/install
+LLVM_RT := $(firstword $(wildcard ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/sysroot/usr/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
 $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HB_DIR)/include -c $< -o $(BUILD)/bin/m51_harfbuzz_smoke.o
@@ -560,8 +563,8 @@ $(BUILD)/bin/m51_harfbuzz_smoke: bin/m51_harfbuzz_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC) $(LLVM_RT)
 
 # M51: m51_fontconfig_smoke links Fontconfig + expat + FreeType + libm.
-FC_DIR := ../build/fontconfig-b1nix/$(B1NIX_TRIPLET)/install
-EXPAT_DIR := ../build/expat-b1nix/$(B1NIX_TRIPLET)/install
+FC_DIR := ../build/$(B1NIX_ARCH)/ports/fontconfig/install
+EXPAT_DIR := ../build/$(B1NIX_ARCH)/ports/expat/install
 $(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(FC_DIR)/include -c $< -o $(BUILD)/bin/m51_fontconfig_smoke.o
@@ -571,7 +574,7 @@ $(BUILD)/bin/m51_fontconfig_smoke: bin/m51_fontconfig_smoke.c $(BESPOKE_LIBDEP)
 	  $(BESPOKE_LIBC)
 
 # M51: m51_xkb_smoke links the ported static xkbcommon.
-XKB_DIR := ../build/xkbcommon-b1nix/$(B1NIX_TRIPLET)/install
+XKB_DIR := ../build/$(B1NIX_ARCH)/ports/xkbcommon/install
 XKB_INC := $(wildcard $(XKB_DIR)/include/xkbcommon/xkbcommon.h)
 XKB_REAL := $(if $(XKB_INC),$(XKB_DIR)/include,$(XKB_DIR)/include/include)
 $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
@@ -581,7 +584,7 @@ $(BUILD)/bin/m51_xkb_smoke: bin/m51_xkb_smoke.c $(BESPOKE_LIBDEP)
 	  $(XKB_DIR)/lib/libxkbcommon.a $(BESPOKE_LIBC)
 
 # m32_pcre2_smoke links the ported static PCRE2 (8-bit) library.
-PCRE2_DIR := ../build/pcre2-b1nix/$(B1NIX_TRIPLET)/install
+PCRE2_DIR := ../build/$(B1NIX_ARCH)/ports/pcre2/install
 $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -DPCRE2_STATIC -I $(PCRE2_DIR)/include -c $< -o $(BUILD)/bin/m32_pcre2_smoke.o
@@ -597,7 +600,7 @@ $(BUILD)/bin/m32_pcre2_smoke: bin/m32_pcre2_smoke.c $(BESPOKE_LIBDEP) $(if $(BES
 	)
 
 # m53_zlib_smoke links the ported static zlib (image-codec dependency, M53).
-ZLIB_DIR := ../build/zlib-b1nix/$(B1NIX_TRIPLET)/install
+ZLIB_DIR := ../build/$(B1NIX_ARCH)/ports/zlib/install
 $(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_zlib_smoke.o
@@ -613,7 +616,7 @@ $(BUILD)/bin/m53_zlib_smoke: bin/m53_zlib_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPO
 	)
 
 # m53_libpng_smoke links the ported libpng over zlib (M53 image codec).
-LIBPNG_DIR := ../build/libpng-b1nix/$(B1NIX_TRIPLET)/install
+LIBPNG_DIR := ../build/$(B1NIX_ARCH)/ports/libpng/install
 $(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER)
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -I $(LIBPNG_DIR)/include -I $(ZLIB_DIR)/include -c $< -o $(BUILD)/bin/m53_libpng_smoke.o
@@ -628,7 +631,7 @@ $(BUILD)/bin/m53_libpng_smoke: bin/m53_libpng_smoke.c $(GEN_LIBDEP) $(GEN_LINKER
 	  $(GEN_LINK_LIBS)
 
 # m53_libjpeg_smoke links the ported static IJG libjpeg (M53 image codec).
-LIBJPEG_DIR := ../build/libjpeg-b1nix/$(B1NIX_TRIPLET)/install
+LIBJPEG_DIR := ../build/$(B1NIX_ARCH)/ports/libjpeg/install
 $(BUILD)/bin/m53_libjpeg_smoke: bin/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBJPEG_DIR)/include -c $< -o $(BUILD)/bin/m53_libjpeg_smoke.o
@@ -644,7 +647,7 @@ $(BUILD)/bin/m53_libjpeg_smoke: bin/m53_libjpeg_smoke.c $(BESPOKE_LIBDEP) $(if $
 	)
 
 # m53_libwebp_smoke links the ported static libwebp (M53 image/video codec).
-LIBWEBP_DIR := ../build/libwebp-b1nix/$(B1NIX_TRIPLET)/install
+LIBWEBP_DIR := ../build/$(B1NIX_ARCH)/ports/libwebp/install
 $(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libwebp_smoke.o
@@ -662,7 +665,7 @@ $(BUILD)/bin/m53_libwebp_smoke: bin/m53_libwebp_smoke.c $(BESPOKE_LIBDEP) $(if $
 
 # m53_libvpx_smoke links the ported libvpx (VP8 decode) + libwebp (VP8 keyframe
 # source) + libm. M53 full-motion video codec.
-LIBVPX_DIR := ../build/libvpx-b1nix/$(B1NIX_TRIPLET)/install
+LIBVPX_DIR := ../build/$(B1NIX_ARCH)/ports/libvpx/install
 $(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBVPX_DIR)/include -I $(LIBWEBP_DIR)/include -c $< -o $(BUILD)/bin/m53_libvpx_smoke.o
@@ -680,7 +683,7 @@ $(BUILD)/bin/m53_libvpx_smoke: bin/m53_libvpx_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 
 # m53_wapcaplet_smoke links the ported NetSurf libwapcaplet (string internment)
 # — the lowest layer of the NetSurf browser library chain (M53).
-LWC_DIR := ../build/libwapcaplet-b1nix/$(B1NIX_TRIPLET)/install
+LWC_DIR := ../build/$(B1NIX_ARCH)/ports/libwapcaplet/install
 $(BUILD)/bin/m53_wapcaplet_smoke: bin/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_wapcaplet_smoke.o
@@ -697,7 +700,7 @@ $(BUILD)/bin/m53_wapcaplet_smoke: bin/m53_wapcaplet_smoke.c $(BESPOKE_LIBDEP) $(
 
 # m53_parserutils_smoke links the ported NetSurf libparserutils (input streams +
 # bundled charset codecs) — browser lib chain step 2 (M53).
-PU_DIR := ../build/libparserutils-b1nix/$(B1NIX_TRIPLET)/install
+PU_DIR := ../build/$(B1NIX_ARCH)/ports/libparserutils/install
 $(BUILD)/bin/m53_parserutils_smoke: bin/m53_parserutils_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_parserutils_smoke.o
@@ -714,7 +717,7 @@ $(BUILD)/bin/m53_parserutils_smoke: bin/m53_parserutils_smoke.c $(BESPOKE_LIBDEP
 
 # m53_hubbub_smoke links the ported NetSurf libhubbub (HTML5 tokeniser) over
 # libparserutils — browser lib chain step 3 (M53).
-HUBBUB_DIR := ../build/libhubbub-b1nix/$(B1NIX_TRIPLET)/install
+HUBBUB_DIR := ../build/$(B1NIX_ARCH)/ports/libhubbub/install
 $(BUILD)/bin/m53_hubbub_smoke: bin/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_hubbub_smoke.o
@@ -732,7 +735,7 @@ $(BUILD)/bin/m53_hubbub_smoke: bin/m53_hubbub_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 
 # m53_libcss_smoke links the ported NetSurf libcss (CSS parser + selection) over
 # libwapcaplet + libparserutils — browser lib chain step 4 (M53).
-LIBCSS_DIR := ../build/libcss-b1nix/$(B1NIX_TRIPLET)/install
+LIBCSS_DIR := ../build/$(B1NIX_ARCH)/ports/libcss/install
 $(BUILD)/bin/m53_libcss_smoke: bin/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBCSS_DIR)/include -I $(LWC_DIR)/include -I $(PU_DIR)/include -c $< -o $(BUILD)/bin/m53_libcss_smoke.o
@@ -750,7 +753,7 @@ $(BUILD)/bin/m53_libcss_smoke: bin/m53_libcss_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 
 # m53_libdom_smoke links the ported NetSurf libdom (DOM) + its hubbub binding
 # over libhubbub + libparserutils + libwapcaplet — browser lib chain step 5.
-LIBDOM_DIR := ../build/libdom-b1nix/$(B1NIX_TRIPLET)/install
+LIBDOM_DIR := ../build/$(B1NIX_ARCH)/ports/libdom/install
 $(BUILD)/bin/m53_libdom_smoke: bin/m53_libdom_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(LIBDOM_DIR)/include -I $(HUBBUB_DIR)/include -I $(PU_DIR)/include -I $(LWC_DIR)/include -c $< -o $(BUILD)/bin/m53_libdom_smoke.o
@@ -769,10 +772,10 @@ $(BUILD)/bin/m53_libdom_smoke: bin/m53_libdom_smoke.c $(BESPOKE_LIBDEP) $(if $(B
 
 # m53_nslibs_smoke links the ported NetSurf helper/decoder libraries: libnsutils
 # + libnsgif + libnsbmp + libnslog — browser lib chain helpers (step 6, M53).
-NSUTILS_DIR := ../build/libnsutils-b1nix/$(B1NIX_TRIPLET)/install
-NSGIF_DIR := ../build/libnsgif-b1nix/$(B1NIX_TRIPLET)/install
-NSBMP_DIR := ../build/libnsbmp-b1nix/$(B1NIX_TRIPLET)/install
-NSLOG_DIR := ../build/libnslog-b1nix/$(B1NIX_TRIPLET)/install
+NSUTILS_DIR := ../build/$(B1NIX_ARCH)/ports/libnsutils/install
+NSGIF_DIR := ../build/$(B1NIX_ARCH)/ports/libnsgif/install
+NSBMP_DIR := ../build/$(B1NIX_ARCH)/ports/libnsbmp/install
+NSLOG_DIR := ../build/$(B1NIX_ARCH)/ports/libnslog/install
 $(BUILD)/bin/m53_nslibs_smoke: bin/m53_nslibs_smoke.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER))
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(NSUTILS_DIR)/include -I $(NSGIF_DIR)/include -I $(NSBMP_DIR)/include -I $(NSLOG_DIR)/include -c $< -o $(BUILD)/bin/m53_nslibs_smoke.o

@@ -64,7 +64,7 @@ export ARCH
 export B1NIX_ARCH="$ARCH"
 KERNEL_CMDLINE="${KERNEL_CMDLINE:-b1nix.test=1}"
 ISO_TARGET="${ISO_TARGET:-iso}"
-CROSS_GCC="$ROOT_DIR/build/toolchain_build/${ARCH}-b1nix/cross/bin/${ARCH}-b1nix-gcc"
+CROSS_CC="$(ls "$ROOT_DIR/build/${ARCH}/toolchain/llvm/cross/bin/${ARCH}-b1nix-cc" "$ROOT_DIR/build/${ARCH}/toolchain/${ARCH}-b1nix/cross/bin/${ARCH}-b1nix-cc" 2>/dev/null | head -1)"
 
 # ── Flags (CLI flag OR WITH_* env var) ───────────────────────────────────────
 FORCE_CROSS="${WITH_CROSS:-0}"
@@ -138,8 +138,8 @@ stage_rust() {
 }
 
 stage_v8() {
-	if [ ! -d "$ROOT_DIR/build/toolchain_build/v8-skeleton/v8" ]; then
-		echo "  V8 source tree missing (build/toolchain_build/v8-skeleton/v8)." >&2
+	if [ ! -d "$ROOT_DIR/build/x86_64/toolchain/v8-skeleton/v8" ]; then
+		echo "  V8 source tree missing (build/x86_64/toolchain/v8-skeleton/v8)." >&2
 		echo "  Run tools/v8/sync-v8.sh first (multi-GB checkout)." >&2
 		return 1
 	fi
@@ -167,16 +167,23 @@ add() { LABELS+=("$1"); SCRIPTS+=("$2"); FUNCS+=("$3"); }
 
 add "cross toolchain"      "tools/toolchain/build-toolchain.sh"          stage_cross
 add "userspace"            "make ARCH=$ARCH userspace"                   stage_userspace
-[ "$WITH_NATIVE_TOOLCHAIN" = "1" ] && add "native GCC toolchain" "tools/toolchain/build-native-toolchain.sh" stage_native_toolchain
 [ "$WITH_NATIVE_CLANG" = "1" ]     && add "native Clang"         "tools/build-native-clang.sh --b1nix-elf"   stage_native_clang
 [ "$WITH_DYNAMIC_CLANG" = "1" ]    && add "dynamic Clang"        "tools/build-native-clang-dynamic.sh"       stage_dynamic_clang
-[ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/build-rust-toolchain.sh"             stage_rust
-[ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/v8/v8-build-run.sh"                  stage_v8
+[ "$WITH_RUST" = "1" ]             && add "rust cross"           "tools/rust/build-rust.sh --toolchain"      stage_rust
+[ "$WITH_V8" = "1" ]               && add "V8 (d8)"              "tools/v8/build-v8.sh --build"              stage_v8
 [ "$WITH_MESA_LLVMPIPE" = "1" ]    && add "Mesa llvmpipe"        "MESA_LLVMPIPE=1 tools/ports/build-mesa.sh" stage_mesa_llvmpipe
 [ "$WITH_PORTS" = "1" ]            && add "userspace ports"      "make ARCH=$ARCH install-ports"             stage_ports
 add "kernel + ISO"         "make ARCH=$ARCH KERNEL_CMDLINE='$KERNEL_CMDLINE' $ISO_TARGET" stage_kernel_iso
 
 TOTAL=${#FUNCS[@]}
+
+# ── ccache stats: zero the counters so the summary below reflects only this run.
+HAVE_CCACHE=0
+if command -v ccache >/dev/null 2>&1 && [ "${B1NIX_NO_CCACHE:-0}" != "1" ]; then
+	HAVE_CCACHE=1
+	ccache -z >/dev/null 2>&1 || true
+fi
+BUILD_START=$(date +%s 2>/dev/null || echo 0)
 
 echo "============================================================"
 echo " b1nix build-all — ARCH=$ARCH, $TOTAL stage(s)"
@@ -191,8 +198,16 @@ for idx in "${!FUNCS[@]}"; do
 	"${FUNCS[$idx]}"
 done
 
+BUILD_END=$(date +%s 2>/dev/null || echo 0)
+ELAPSED=$((BUILD_END - BUILD_START))
+
 echo
 echo "============================================================"
 echo " build-all: all $TOTAL stage(s) completed for ARCH=$ARCH"
 echo " ISO: build/$ARCH/b1nix.iso"
+printf ' elapsed: %dm%02ds\n' "$((ELAPSED / 60))" "$((ELAPSED % 60))"
+if [ "$HAVE_CCACHE" = "1" ]; then
+	echo " ccache stats for this run:"
+	ccache -s 2>/dev/null | sed 's/^/   /'
+fi
 echo "============================================================"

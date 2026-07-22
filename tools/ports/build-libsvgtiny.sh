@@ -32,7 +32,7 @@ port_pre_build() {
   fi
   # libsvgtiny + libdom both ship inside the netsurf-all bundle; use that copy of
   # libdom for the XML binding source.
-  SVG_LIBDOM_DIR="$(ls -d "$ROOT_DIR"/build/netsurf-src/netsurf-all-*/libdom 2>/dev/null | head -1)"
+  SVG_LIBDOM_DIR="$(ls -d "$ROOT_DIR"/build/src/netsurf/netsurf-all-*/libdom 2>/dev/null | head -1)"
   if [ -z "$SVG_LIBDOM_DIR" ] || [ ! -f "$SVG_LIBDOM_DIR/bindings/xml/expat_xmlparser.c" ]; then
     echo "build-libsvgtiny.sh: libdom XML binding source not found" >&2
     exit 1
@@ -40,7 +40,7 @@ port_pre_build() {
   # expat (M51 port) — XML parser backing libdom's XML binding.
   SVG_EXPAT_INST="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-expat.sh" | tail -1)"
   # Sysroot from build-netsurf-fb.sh holds libdom/libwapcaplet headers + openlibm.
-  SVG_SYSROOT="$ROOT_DIR/build/netsurf-sysroot/$B1NIX_TRIPLET"
+  SVG_SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/netsurf-fb/sysroot"
   # Stage the libdom XML binding public headers under the install <dom/...>
   # layout (libdom's own install does this; the curated libdom build skips it).
   SVG_GENINC="$BUILD_DIR/geninc"

@@ -23,7 +23,7 @@ LITEHTML="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-litehtml.sh")"
 LIBM="$(B1NIX_ARCH="$B1NIX_ARCH" "$ROOT_DIR/tools/ports/build-openlibm.sh")/lib/libm.a"
 
 UB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"
-MUSL_USR="$ROOT_DIR/build/musl-b1nix/$B1NIX_TRIPLET/install/usr"
+MUSL_USR="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 # Dynamic by default: link the shared libstdc++.so.6 + shared libc.so.1 +
 # shared libgcc_s.so (the cxx_smoke model). litehtml/gumbo stay statically folded
 # (they are non-PIC) but resolve the C++ runtime from the .so. Cross-DSO C++

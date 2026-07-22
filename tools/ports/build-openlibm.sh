@@ -10,7 +10,7 @@ ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"
 
 CPORT_NAME=openlibm
 CPORT_ARCHIVE=libm.a
-CPORT_SRC_PARENT="$ROOT_DIR/build/openlibm-src"
+CPORT_SRC_PARENT="$ROOT_DIR/build/src/openlibm"
 VER="${OPENLIBM_VERSION:-0.8.1}"
 CPORT_SRCNAME="openlibm-${VER}"
 CPORT_TARBALL="openlibm-${VER}.tar.gz"

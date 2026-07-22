@@ -55,14 +55,14 @@ case "$ARCH" in
   x86) TRIPLET=i686-b1nix ;;
   *)   TRIPLET=x86_64-b1nix ;;
 esac
-BUSYBOX="$ROOT_DIR/build/busybox-b1nix/$TRIPLET/busybox"
-[ -f "$BUSYBOX" ] || { echo "missing busybox ELF: $BUSYBOX"; exit 1; }
+BUSYBOX="$(ls "$ROOT_DIR/build/$ARCH/ports/busybox/install/bin/busybox" "$ROOT_DIR/build/$ARCH/ports/busybox/build/busybox" "$ROOT_DIR/build/busybox-b1nix/$TRIPLET/busybox" 2>/dev/null | head -1)"
+[ -n "$BUSYBOX" ] && [ -f "$BUSYBOX" ] || { echo "missing busybox ELF for $ARCH"; exit 1; }
 echo "staging userland (busybox + bash + applet symlinks)..."
 mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin" "$ROOTFS/opt/busybox/bin" "$ROOTFS/etc" "$ROOTFS/root" "$ROOTFS/home/user"
 cp -f "$BUSYBOX" "$ROOTFS/opt/busybox/bin/busybox"
 if [ ! -f "$ROOTFS/bin/bash" ]; then
-  BASH_BIN="$(ls "$ROOT_DIR"/build/bash-src/$TRIPLET/bash-*/bash 2>/dev/null | head -1)"
-  [ -f "$BASH_BIN" ] || { echo "missing packaged or locally built bash"; exit 1; }
+  BASH_BIN="$(ls "$ROOT_DIR/build/$ARCH/ports/bash/install/bin/bash" "$ROOT_DIR/build/$ARCH/ports/bash/build/bash" "$ROOT_DIR"/build/bash-src/$TRIPLET/bash-*/bash 2>/dev/null | head -1)"
+  [ -n "$BASH_BIN" ] && [ -f "$BASH_BIN" ] || { echo "missing packaged or locally built bash"; exit 1; }
   cp -f "$BASH_BIN" "$ROOTFS/bin/bash"
 fi
 # Core symlinks (mirror kernel/fs/initramfs.c) + every upstream applet.

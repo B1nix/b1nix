@@ -14,9 +14,9 @@ AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bi
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 # Per-architecture build identity + per-triplet source/build dirs.
 . "$ROOT_DIR/tools/toolchain/env.sh"
-SRC_PARENT="$ROOT_DIR/build/mbedtls-src"
+SRC_PARENT="$ROOT_DIR/build/src/mbedtls"
 SRC_DIR="$SRC_PARENT/$B1NIX_TRIPLET/mbedtls-${MBEDTLS_VERSION}"
-BUILD_DIR="$ROOT_DIR/build/mbedtls-b1nix/$B1NIX_TRIPLET"
+BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mbedtls"
 INSTALL_DIR="$BUILD_DIR/install"
 
 mkdir -p "$SRC_PARENT/$B1NIX_TRIPLET" "$BUILD_DIR"
@@ -42,8 +42,8 @@ fi
 sh "$ROOT_DIR/tools/patches/mbedtls/b1nix-config.sh" "$SRC_DIR"
 
 # mbedTLS PSA wrapper generation depends on python jsonschema.
-# Keep this hermetic by provisioning a local venv under build/.
-PY_VENV="$ROOT_DIR/build/py-mbedtls-tools"
+# Keep this hermetic by provisioning a local venv under build/$ARCH/ports/mbedtls.
+PY_VENV="$BUILD_DIR/py-venv"
 if [ ! -x "$PY_VENV/bin/python3" ]; then
   python3 -m venv "$PY_VENV"
 fi
@@ -55,7 +55,7 @@ make -C "$SRC_DIR/library" clean >/dev/null 2>&1 || true
 # (build-curl.sh captures this script's stdout to derive -I/-L flags).
 PATH="$PY_VENV/bin:$PATH" make -C "$SRC_DIR/library" -j"${JOBS:-4}" \
   CC="$WRAP" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
-  CFLAGS="-O2 -fno-builtin -D__unix__" 1>&2
+  CFLAGS="-O2 -fno-builtin -D__unix__ -Wno-unterminated-string-initialization" 1>&2
 
 mkdir -p "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 cp "$SRC_DIR"/library/libmbed*.a "$INSTALL_DIR/lib/"
