@@ -32,6 +32,10 @@ void print_group(const char *label, gid_t gid) {
 }
 
 int main(int argc, char **argv) {
+    if (argc > 1 && strcmp(argv[1], "-u") == 0) {
+        printf("%u\n", (unsigned int)getuid());
+        return 0;
+    }
     if (argc > 1) {
         const char *username = argv[1];
         struct passwd *pw = getpwnam(username);

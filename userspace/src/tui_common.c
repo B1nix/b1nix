@@ -1,26 +1,59 @@
 #include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <b1nix/posix.h>
-#include <b1nix/syscall.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <termios.h>
+#include <sys/ioctl.h>
 #include <tui.h>
 
 /* ── Terminal manipulation ── */
 
 static void t_write(const char *s)
 {
-	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)strlen(s), 0, 0, 0);
+	write(1, s, strlen(s));
 }
 
 static void t_write_n(const char *s, int n)
 {
-	syscall_dispatch(SYS_WRITE, 0, (u64)(usize)s, (u64)n, 0, 0, 0);
+	write(1, s, n);
+}
+
+/* fd 1 saved across tui_screen_mute()/tui_screen_unmute(); -1 = not muted. */
+static int tui_saved_stdout = -1;
+
+void tui_screen_mute(void)
+{
+	if (tui_saved_stdout >= 0)
+		return;
+	int devnull = open("/dev/null", O_WRONLY);
+	if (devnull < 0)
+		return;
+	int saved = dup(1);
+	if (saved < 0) {
+		close(devnull);
+		return;
+	}
+	fflush(stdout);
+	dup2(devnull, 1);
+	close(devnull);
+	tui_saved_stdout = saved;
+}
+
+void tui_screen_unmute(void)
+{
+	if (tui_saved_stdout < 0)
+		return;
+	fflush(stdout);
+	dup2(tui_saved_stdout, 1);
+	close(tui_saved_stdout);
+	tui_saved_stdout = -1;
 }
 
 static int tui_stdio_ready = 0;
 static int tui_raw_depth = 0;
 static int tui_raw_active = 0;
-static struct b1nix_termios tui_saved_termios;
+static struct termios tui_saved_termios;
 
 static void tui_ensure_stdio(void)
 {
@@ -28,17 +61,16 @@ static void tui_ensure_stdio(void)
 		return;
 	}
 
-	u64 tty = syscall_dispatch(SYS_OPEN, (u64)(usize)"/dev/tty",
-	                          (u64)B1NIX_O_RDWR, 0, 0, 0, 0);
-	if ((isize)tty < 0) {
+	int tty = open("/dev/tty", O_RDWR);
+	if (tty < 0) {
 		return;
 	}
 
-	syscall_dispatch(SYS_DUP2, tty, 0, 0, 0, 0, 0);
-	syscall_dispatch(SYS_DUP2, tty, 1, 0, 0, 0, 0);
-	syscall_dispatch(SYS_DUP2, tty, 2, 0, 0, 0, 0);
+	dup2(tty, 0);
+	dup2(tty, 1);
+	dup2(tty, 2);
 	if (tty > 2) {
-		syscall_dispatch(SYS_CLOSE, tty, 0, 0, 0, 0, 0);
+		close(tty);
 	}
 	tui_stdio_ready = 1;
 }
@@ -95,13 +127,11 @@ void tui_cursor_show(void)
 
 void tui_set_color(int fg, int bg)
 {
-	/* Simplified: set fg and bg using ANSI */
 	char buf[32];
 	int pos = 0;
 	buf[pos++] = '\033';
 	buf[pos++] = '[';
 	
-	/* Foreground: 30-37 for standard, 90-97 for bright */
 	if (fg < 8) {
 		buf[pos++] = '3';
 		buf[pos++] = '0' + fg;
@@ -112,7 +142,6 @@ void tui_set_color(int fg, int bg)
 	
 	buf[pos++] = ';';
 	
-	/* Background: 40-47 */
 	if (bg < 8) {
 		buf[pos++] = '4';
 		buf[pos++] = '0' + bg;
@@ -149,7 +178,6 @@ void tui_draw_hline(int row, int col, int len, char ch, int fg, int bg)
 	tui_cursor_goto(row, col);
 	tui_set_color(fg, bg);
 	
-	/* Draw line using repeated character */
 	char buf[256];
 	int max = len < 255 ? len : 255;
 	memset(buf, ch, max);
@@ -204,7 +232,6 @@ void tui_write_at(int row, int col, const char *text, int max_len, int fg, int b
 	
 	t_write_n(text, len);
 	
-	/* Clear to end of line if needed */
 	if (max_len > 0 && len < max_len) {
 		char spaces[256];
 		int space_count = max_len - len;
@@ -245,16 +272,14 @@ int tui_terminal_begin(void)
 		return 0;
 	}
 
-	if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCGETS,
-	                            (u64)(usize)&tui_saved_termios, 0, 0, 0) < 0) {
+	if (tcgetattr(0, &tui_saved_termios) < 0) {
 		tui_raw_depth = 0;
 		return -1;
 	}
 
-	struct b1nix_termios raw = tui_saved_termios;
-	raw.c_lflag &= ~(B1NIX_ICANON | B1NIX_ECHO | B1NIX_ISIG);
-	if ((isize)syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS,
-	                            (u64)(usize)&raw, 0, 0, 0) < 0) {
+	struct termios raw = tui_saved_termios;
+	raw.c_lflag &= ~(ICANON | ECHO | ISIG);
+	if (tcsetattr(0, TCSANOW, &raw) < 0) {
 		tui_raw_depth = 0;
 		return -1;
 	}
@@ -274,8 +299,7 @@ void tui_terminal_end(void)
 		return;
 	}
 
-	syscall_dispatch(SYS_IOCTL, 0, B1NIX_TCSETS,
-	                 (u64)(usize)&tui_saved_termios, 0, 0, 0);
+	tcsetattr(0, TCSANOW, &tui_saved_termios);
 	tui_raw_active = 0;
 }
 
@@ -405,63 +429,34 @@ int tui_decode_key_sequence(const char *seq, usize len)
 	return (int)c;
 }
 
-/* ── Input reading ── */
-
-/* Read a single key, return extended key code */
 int tui_get_key(void)
 {
-	int c = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
+	char ch = 0;
+	if (read(0, &ch, 1) <= 0) return KEY_ESC;
 
-	if (c == 0x1B) {
+	if (ch == 0x1B) {
 		char seq[6];
 		int len = 0;
-		seq[len++] = (char)c;
+		seq[len++] = ch;
 
-		int seq1 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-		if (seq1 == 0) {
-			return KEY_ESC;
-		}
-		seq[len++] = (char)seq1;
-
-		if (seq1 == '[') {
-			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-			if (seq2 == 0) {
-				return KEY_ESC;
-			}
-			seq[len++] = (char)seq2;
-
-			if (seq2 == 'M') {
-				int seq3 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-				if (seq3 == 0) {
-					return KEY_ESC;
-				}
-				seq[len++] = (char)seq3;
-			} else if (seq2 >= '0' && seq2 <= '9') {
-				int seq3 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-				if (seq3 == 0) {
-					return KEY_ESC;
-				}
-				seq[len++] = (char)seq3;
-
-				if ((seq2 == '1' || seq2 == '2') && seq3 >= '0' && seq3 <= '9') {
-					int seq4 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-					if (seq4 == 0) {
-						return KEY_ESC;
+		char seq1 = 0;
+		if (read(0, &seq1, 1) > 0) {
+			seq[len++] = seq1;
+			if (seq1 == '[') {
+				char seq2 = 0;
+				if (read(0, &seq2, 1) > 0) {
+					seq[len++] = seq2;
+					if (seq2 >= '0' && seq2 <= '9') {
+						char seq3 = 0;
+						if (read(0, &seq3, 1) > 0) {
+							seq[len++] = seq3;
+						}
 					}
-					seq[len++] = (char)seq4;
 				}
 			}
-		} else if (seq1 == 'O') {
-			int seq2 = (int)syscall_dispatch(SYS_READ_KBD, 0, 0, 0, 0, 0, 0);
-			if (seq2 == 0) {
-				return KEY_ESC;
-			}
-			seq[len++] = (char)seq2;
 		}
-
 		return tui_decode_key_sequence(seq, (usize)len);
 	}
 
-	char ch = (char)c;
 	return tui_decode_key_sequence(&ch, 1);
 }

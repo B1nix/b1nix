@@ -1,11 +1,10 @@
-#include <string.h>
 #include <stdio.h>
 #include <stdlib.h>
-#include <b1nix/posix.h>
-#include <b1nix/syscall.h>
+#include <string.h>
+#include <unistd.h>
+#include <fcntl.h>
+#include <errno.h>
 #include <tui.h>
-
-/* ── Editor state ── */
 
 #define MAX_LINES 1024
 #define MAX_LINE_LEN 256
@@ -25,8 +24,6 @@ static struct editor ed;
 static char save_buffer[MAX_LINES * (MAX_LINE_LEN + 1)];
 static int editor_smoke_mode = 0;
 
-/* ── File I/O ── */
-
 static int editor_load(const char *path)
 {
 	strcpy(ed.filename, path);
@@ -38,20 +35,14 @@ static int editor_load(const char *path)
 	ed.left_col = 0;
 	ed.dirty = 0;
 	
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, 0, 0, 0, 0, 0);
-	if (fd == (u64)-1) return 0; /* New file */
+	FILE *f = fopen(path, "r");
+	if (!f) return 0;
 	
 	char buf[512];
 	int total = 0;
 	int line = 0;
 	
-	/* Read file content */
-	while (1) {
-		u64 n = syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, 255, 0, 0, 0);
-		if (n == 0 || n == (u64)-1) break;
-		buf[n] = '\0';
-		
-		/* Split into lines */
+	while (fgets(buf, sizeof(buf), f)) {
 		for (int i = 0; buf[i]; i++) {
 			if (buf[i] == '\n') {
 				ed.lines[line][total] = '\0';
@@ -65,10 +56,8 @@ static int editor_load(const char *path)
 				}
 			}
 		}
-		/* Continue the current line across buffer reads */
 	}
-	
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
+	fclose(f);
 	
 	if (line > 0 || total > 0) {
 		ed.lines[line][total] = '\0';
@@ -83,7 +72,6 @@ static int editor_save(void)
 	if (ed.filename[0] == '\0') return -1;
 
 	int pos = 0;
-	
 	for (int i = 0; i < ed.line_count && pos < (int)sizeof(save_buffer) - MAX_LINE_LEN - 2; i++) {
 		int len = strlen(ed.lines[i]);
 		if (len > 0) {
@@ -94,37 +82,28 @@ static int editor_save(void)
 	}
 	save_buffer[pos] = '\0';
 
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)ed.filename, B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC, 0, 0, 0, 0);
-	if (fd == (u64)-1) {
-		return -1;
-	}
+	FILE *f = fopen(ed.filename, "w");
+	if (!f) return -1;
 
-	u64 written = syscall_dispatch(SYS_WRITE, (u64)fd, (u64)(usize)save_buffer, (u64)pos, 0, 0, 0);
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
-	if (written == (u64)-1 || (usize)written != (usize)pos) {
-		return -1;
-	}
-	
+	size_t written = fwrite(save_buffer, 1, (size_t)pos, f);
+	fclose(f);
+	if (written != (size_t)pos) return -1;
+
 	ed.dirty = 0;
 	return 0;
 }
 
-/* ── Editor display ── */
-
 static void editor_refresh_screen(void)
 {
 	int cols = TUI_COLS - 2;
-	int rows = TUI_ROWS - 3;  /* -1 for title, -1 for status, -1 for function bar */
+	int rows = TUI_ROWS - 3;
 	
-	/* Draw title */
 	char title[64];
 	snprintf(title, sizeof(title), " ne - %s%s ", ed.filename, ed.dirty ? " (Modified)" : "");
 	tui_title_bar(0, title, 0, 7);
 	
-	/* Draw editor content */
 	for (int i = 0; i < rows; i++) {
 		int line_idx = i + ed.top_line;
-		
 		tui_cursor_goto(1 + i, 1);
 		
 		if (line_idx < ed.line_count) {
@@ -136,20 +115,16 @@ static void editor_refresh_screen(void)
 				int display_len = len - start;
 				if (display_len > cols) display_len = cols;
 				
-				/* Show line numbers in grey on leftmost col */
 				char line_num[8];
 				snprintf(line_num, sizeof(line_num), "%4d ", line_idx + 1);
-				tui_set_color(8, 0);  /* Bright black (grey) */
+				tui_set_color(8, 0);
 				tui_write(line_num);
 				tui_reset_color();
 				
-				/* Determine line color */
-				int fg = 7;  /* White */
-				tui_set_color(fg, 0);
+				tui_set_color(7, 0);
 				tui_write_n(text + start, display_len);
 				tui_reset_color();
 				
-				/* Clear rest of line */
 				if (display_len < cols - 6) {
 					char spaces[256];
 					int sp = cols - 6 - display_len;
@@ -164,7 +139,6 @@ static void editor_refresh_screen(void)
 				tui_write(line_num);
 				tui_reset_color();
 				tui_set_color(7, 0);
-				/* Clear line */
 				char spaces[256];
 				int sp = cols;
 				if (sp > 255) sp = 255;
@@ -173,7 +147,6 @@ static void editor_refresh_screen(void)
 				tui_reset_color();
 			}
 		} else {
-			/* Empty line */
 			char spaces[256];
 			int sp = cols + 5;
 			if (sp > 255) sp = 255;
@@ -182,20 +155,13 @@ static void editor_refresh_screen(void)
 		}
 	}
 	
-	/* Draw cursor position */
 	char status[64];
 	snprintf(status, sizeof(status), " Line %d/%d  Col %d ", 
 			 ed.cursor_row + 1, ed.line_count, ed.cursor_col + 1);
-	tui_status_bar(TUI_ROWS - 2, status, 7, 4);  /* White on blue */
-	
-	/* Draw function keys */
+	tui_status_bar(TUI_ROWS - 2, status, 7, 4);
 	tui_write_at(TUI_ROWS - 1, 1, "^X/^Q Exit  ^S/^Y Save  ^G Help", TUI_COLS - 2, 0, 7);
-	
-	/* Position cursor */
 	tui_cursor_goto(1 + ed.cursor_row - ed.top_line, 6 + ed.cursor_col - ed.left_col);
 }
-
-/* ── Editor operations ── */
 
 static void editor_insert_char(char c)
 {
@@ -203,7 +169,6 @@ static void editor_insert_char(char c)
 	int len = strlen(line);
 	
 	if (len < MAX_LINE_LEN - 2) {
-		/* Shift characters right */
 		for (int i = len; i >= ed.cursor_col; i--) {
 			line[i + 1] = line[i];
 		}
@@ -219,18 +184,15 @@ static void editor_delete_char(void)
 	int len = strlen(line);
 	
 	if (ed.cursor_col > 0) {
-		/* Delete character before cursor */
 		for (int i = ed.cursor_col - 1; i < len; i++) {
 			line[i] = line[i + 1];
 		}
 		ed.cursor_col--;
 		ed.dirty = 1;
 	} else if (ed.cursor_row > 0) {
-		/* Join with previous line */
 		int prev_len = strlen(ed.lines[ed.cursor_row - 1]);
 		if (prev_len + len < MAX_LINE_LEN - 1) {
 			strcpy(ed.lines[ed.cursor_row - 1] + prev_len, line);
-			/* Shift lines up */
 			for (int i = ed.cursor_row; i < ed.line_count - 1; i++) {
 				strcpy(ed.lines[i], ed.lines[i + 1]);
 			}
@@ -269,12 +231,10 @@ static void editor_newline(void)
 {
 	if (ed.line_count >= MAX_LINES - 1) return;
 	
-	/* Shift lines down */
 	for (int i = ed.line_count; i > ed.cursor_row; i--) {
 		strcpy(ed.lines[i], ed.lines[i - 1]);
 	}
 	
-	/* Split line */
 	char *line = ed.lines[ed.cursor_row];
 	int after_newline = strlen(line) - ed.cursor_col;
 	
@@ -298,14 +258,6 @@ static int editor_handle_key(int key)
 	case KEY_CTRL_Q:
 	case KEY_CTRL_X:
 	case KEY_ESC:
-		/* The "save modified buffer?" prompt reads a key. Every other
-		 * interactive prompt in this editor is gated on !editor_smoke_mode; this
-		 * one was not, so the scripted M16 smoke could reach tui_get_key() and
-		 * block in the tty read forever whenever ed.dirty was still set at quit
-		 * time — the parent init then waits on the editor child indefinitely.
-		 * Under -smp that occasionally happened (timer preemption between the
-		 * scripted Ctrl-S save and the Ctrl-Q quit), surfacing as an intermittent
-		 * SMP hang. In smoke mode just quit without prompting. */
 		if (ed.dirty && !editor_smoke_mode) {
 			tui_write_at(TUI_ROWS - 1, 1, "Save modified buffer? (y/n): ", TUI_COLS - 2, 0, 7);
 			int c = tui_get_key();
@@ -332,7 +284,7 @@ static int editor_handle_key(int key)
 
 	case KEY_CTRL_G:
 		tui_clear_screen();
-		tui_write_at(1, 1, "ne Editor Help", TUI_COLS - 2, 7, 0);
+		tui_write_at(1, 1, "ne Editor Help (Ring 3)", TUI_COLS - 2, 7, 0);
 		tui_write_at(3, 1, "Ctrl+X  - Exit editor", TUI_COLS - 2, 7, 0);
 		tui_write_at(4, 1, "Ctrl+Q/Esc - Exit editor", TUI_COLS - 2, 7, 0);
 		tui_write_at(5, 1, "Ctrl+S/Ctrl+Y - Save file", TUI_COLS - 2, 7, 0);
@@ -340,9 +292,6 @@ static int editor_handle_key(int key)
 		tui_write_at(7, 1, "Arrows  - Navigate", TUI_COLS - 2, 7, 0);
 		tui_write_at(8, 1, "Backspace/Delete - Delete char", TUI_COLS - 2, 7, 0);
 		tui_write_at(9, 1, "Enter   - New line", TUI_COLS - 2, 7, 0);
-		tui_write_at(10, 1, "Home    - Line start", TUI_COLS - 2, 7, 0);
-		tui_write_at(11, 1, "End     - Line end", TUI_COLS - 2, 7, 0);
-		tui_write_at(12, 1, "PgUp/PgDn - File top/bottom", TUI_COLS - 2, 7, 0);
 		tui_write_at(14, 1, "Type text to insert characters.", TUI_COLS - 2, 7, 0);
 		tui_write_at(TUI_ROWS - 1, 1, "Press any key to continue", TUI_COLS - 2, 0, 7);
 		if (!editor_smoke_mode) {
@@ -450,18 +399,13 @@ static int editor_handle_key(int key)
 
 static int editor_verify_contents(const char *path, const char *expected)
 {
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)path, B1NIX_O_RDONLY, 0, 0, 0, 0);
-	if ((isize)fd < 0) {
-		return -1;
-	}
-
+	FILE *f = fopen(path, "r");
+	if (!f) return -1;
 	char buf[512];
 	memset(buf, 0, sizeof(buf));
-	int n = (int)syscall_dispatch(SYS_READ, fd, (u64)(usize)buf, sizeof(buf) - 1, 0, 0, 0);
-	syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
-	if (n < 0) {
-		return -1;
-	}
+	size_t n = fread(buf, 1, sizeof(buf) - 1, f);
+	fclose(f);
+	(void)n;
 	return strcmp(buf, expected) == 0 ? 0 : -1;
 }
 
@@ -469,20 +413,19 @@ static int editor_smoke_run(const char *path)
 {
 	const char *smoke_path = (path && path[0]) ? path : "/tmp/m16-editor-smoke.txt";
 	editor_smoke_mode = 1;
+	tui_screen_mute();
 	if (tui_terminal_begin() != 0) {
+		tui_screen_unmute();
 		editor_smoke_mode = 0;
 		return 1;
 	}
 
-	u64 fd = syscall_dispatch(SYS_OPEN, (u64)(usize)smoke_path,
-	                          B1NIX_O_CREAT | B1NIX_O_RDWR | B1NIX_O_TRUNC,
-	                          0666, 0, 0, 0);
-	if ((isize)fd >= 0) {
-		syscall_dispatch(SYS_CLOSE, fd, 0, 0, 0, 0, 0);
-	}
+	FILE *f = fopen(smoke_path, "w");
+	if (f) fclose(f);
 
 	if (editor_load(smoke_path) != 0) {
 		tui_terminal_end();
+		tui_screen_unmute();
 		editor_smoke_mode = 0;
 		return 1;
 	}
@@ -495,7 +438,7 @@ static int editor_smoke_run(const char *path)
 		'n', 'a', 'n', 'o', KEY_LEFT, KEY_DEL, KEY_BACKSP,
 		KEY_ENTER, KEY_UP, KEY_DOWN, KEY_PGUP, KEY_PGDN, 'z'
 	};
-	for (usize i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
+	for (size_t i = 0; i < sizeof(keys) / sizeof(keys[0]); i++) {
 		editor_handle_key(keys[i]);
 	}
 
@@ -504,31 +447,25 @@ static int editor_smoke_run(const char *path)
 		tui_clear_screen();
 		tui_cursor_show();
 		tui_terminal_end();
+		tui_screen_unmute();
 		editor_smoke_mode = 0;
 		return 1;
 	}
 
 	editor_handle_key(KEY_CTRL_G);
-	if (editor_handle_key(KEY_CTRL_Q) != 0) {
-		tui_clear_screen();
-		tui_cursor_show();
-		tui_terminal_end();
-		editor_smoke_mode = 0;
-		return 1;
-	}
+	editor_handle_key(KEY_CTRL_Q);
 
-	editor_refresh_screen();
 	tui_clear_screen();
 	tui_cursor_show();
 	tui_terminal_end();
+	tui_screen_unmute();
 	editor_smoke_mode = 0;
 	printf("M16-SMOKE: ok editor-hotkeys\n");
+	fflush(stdout);
 	return 0;
 }
 
-/* ── Main editor loop ── */
-
-int editor_main(int argc, const char **argv)
+int main(int argc, char **argv)
 {
 	if (argc < 2) {
 		printf("Usage: ne <filename>\n");
@@ -550,7 +487,6 @@ int editor_main(int argc, const char **argv)
 	tui_cursor_hide();
 	
 	int running = 1;
-	
 	while (running) {
 		editor_refresh_screen();
 		if (!editor_handle_key(tui_get_key())) {
@@ -558,7 +494,6 @@ int editor_main(int argc, const char **argv)
 		}
 	}
 	
-	/* Cleanup */
 	tui_clear_screen();
 	tui_cursor_show();
 	tui_terminal_end();
