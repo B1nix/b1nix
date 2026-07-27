@@ -140,22 +140,28 @@ void vfs_pipe_init_handle(struct vfs_handle *h, struct vfs_pipe *pipe, int is_wr
   h->kind = is_write ? VFS_HANDLE_PIPE_WRITE : VFS_HANDLE_PIPE_READ;
 }
 
-int vfs_pipe(int pipefd[2]) {
-  if (!pipefd) return -EINVAL;
+/* Atomically find a free pipes[] slot and CLAIM it before releasing the pool
+ * lock, so no other CPU can pick the same slot. The caller does the full
+ * memset() after the unlock — once `used = 1` is published, the slot is ours to
+ * fill in. Returns NULL when the pool is exhausted. */
+static struct vfs_pipe *pipe_pool_claim(void) {
   struct vfs_pipe *pipe = 0;
-  /* Atomically find a free slot and CLAIM it before releasing the pool lock,
-   * so no other CPU can pick the same slot. The full memset() happens after
-   * the unlock — once `used = 1` is published, the slot is ours to fill in. */
   u64 flags;
   spin_lock_irqsave(&pipe_pool_lock, &flags);
   for (usize i = 0; i < MAX_VFS_PIPES; i++) {
     if (!pipes[i].used) {
       pipe = &pipes[i];
-      pipe->used = 1;  /* claim atomically under the pool lock */
+      pipe->used = 1; /* claim atomically under the pool lock */
       break;
     }
   }
   spin_unlock_irqrestore(&pipe_pool_lock, flags);
+  return pipe;
+}
+
+int vfs_pipe(int pipefd[2]) {
+  if (!pipefd) return -EINVAL;
+  struct vfs_pipe *pipe = pipe_pool_claim();
   if (!pipe) return -ENFILE;
 
   struct vfs_handle *rh = alloc_raw_handle(VFS_HANDLE_PIPE_READ);
@@ -183,4 +189,155 @@ int vfs_pipe(int pipefd[2]) {
     return -EMFILE;
   }
   return 0;
+}
+
+/* ── Named pipes (FIFOs) ──────────────────────────────────────────────────────
+ * A FIFO is a VFS_FIFO node whose inode carries a struct vfs_pipe while it has
+ * openers. The data path is the anonymous-pipe one — same buffer, same blocking
+ * read/write/poll — so only the lifetime and the open-time rendezvous are new.
+ *
+ * Locking: a FIFO's readers/writers counts are mutated only under
+ * fifo_attach_lock (open and release), never under pipe->lock, so attaching or
+ * dropping inode->fifo is atomic with respect to the counts that decide it.
+ * pipe_read/pipe_write only *read* those counts, exactly as they do for an
+ * anonymous pipe. */
+static spinlock_t fifo_attach_lock = SPINLOCK_INIT;
+
+/* Drop this opener's reference to the FIFO. When the last reader and writer are
+ * gone the buffer is detached from the inode and returned to the pool, so the
+ * next open() starts with an empty FIFO (POSIX: no data survives a FIFO with no
+ * openers). */
+static void fifo_detach(struct vfs_inode *inode, struct vfs_pipe *fifo,
+                        int was_reader, int was_writer) {
+  u64 irq;
+  spin_lock_irqsave(&fifo_attach_lock, &irq);
+  if (was_reader && fifo->readers > 0)
+    fifo->readers--;
+  if (was_writer && fifo->writers > 0)
+    fifo->writers--;
+  if (fifo->readers <= 0 && fifo->writers <= 0) {
+    if (inode && inode->fifo == fifo)
+      inode->fifo = 0;
+    fifo->used = 0;
+  }
+  spin_unlock_irqrestore(&fifo_attach_lock, irq);
+
+  /* A peer blocked in read()/write() must observe the closed end: a reader sees
+   * writers == 0 and returns EOF, a writer sees readers == 0 and gets EPIPE. */
+  scheduler_wake_all(fifo);
+  scheduler_wake_all(vfs_poll_chan);
+}
+
+static void fifo_release(struct vfs_handle *h) {
+  struct vfs_pipe *fifo = (struct vfs_pipe *)h->private_data;
+  struct vfs_node *node = h->node;
+  if (fifo) {
+    int acc = h->flags & 3;
+    int was_reader = (acc == B1NIX_O_RDONLY) || (acc == B1NIX_O_RDWR);
+    int was_writer = (acc == B1NIX_O_WRONLY) || (acc == B1NIX_O_RDWR);
+    fifo_detach(node ? node->inode : 0, fifo, was_reader, was_writer);
+  }
+  if (node)
+    vfs_node_put(node);
+}
+
+static const struct vfs_file_ops fifo_read_ops = {
+    .read = pipe_read, .poll = pipe_poll, .release = fifo_release};
+static const struct vfs_file_ops fifo_write_ops = {
+    .write = pipe_write, .poll = pipe_poll, .release = fifo_release};
+/* O_RDWR on a FIFO is legal on Linux and never blocks — the opener is its own
+ * peer, so both directions are wired up on one handle. */
+static const struct vfs_file_ops fifo_rdwr_ops = {
+    .read = pipe_read, .write = pipe_write, .poll = pipe_poll,
+    .release = fifo_release};
+
+int vfs_fifo_open(struct vfs_node *node, int flags) {
+  if (!node || !node->inode)
+    return -EINVAL;
+  int acc = flags & 3;
+  int want_read = (acc == B1NIX_O_RDONLY) || (acc == B1NIX_O_RDWR);
+  int want_write = (acc == B1NIX_O_WRONLY) || (acc == B1NIX_O_RDWR);
+  if (!want_read && !want_write)
+    return -EINVAL;
+
+  /* Claim a pool slot up front: pipe_pool_claim takes pipe_pool_lock, which
+   * must not nest inside fifo_attach_lock. The spare is released again if this
+   * inode already has a buffer. */
+  struct vfs_pipe *spare = pipe_pool_claim();
+  if (!spare)
+    return -ENFILE;
+
+  u64 irq;
+  spin_lock_irqsave(&fifo_attach_lock, &irq);
+  struct vfs_pipe *fifo = node->inode->fifo;
+  if (!fifo) {
+    memset(spare, 0, sizeof(*spare));
+    spare->used = 1;
+    fifo = spare;
+    node->inode->fifo = fifo;
+    spare = 0;
+  }
+  /* POSIX: O_WRONLY | O_NONBLOCK with no reader fails outright, and must not
+   * register a writer (that would fake a peer for a later reader). */
+  if (want_write && !want_read && (flags & B1NIX_O_NONBLOCK) &&
+      fifo->readers == 0) {
+    int empty = (fifo->readers <= 0 && fifo->writers <= 0);
+    if (empty) {
+      node->inode->fifo = 0;
+      fifo->used = 0;
+    }
+    spin_unlock_irqrestore(&fifo_attach_lock, irq);
+    if (spare)
+      spare->used = 0;
+    return -ENXIO;
+  }
+  if (want_read)
+    fifo->readers++;
+  if (want_write)
+    fifo->writers++;
+  spin_unlock_irqrestore(&fifo_attach_lock, irq);
+  if (spare)
+    spare->used = 0;
+
+  /* Publish this end to a peer already blocked in its own open(). */
+  scheduler_wake_all(fifo);
+
+  /* Rendezvous: a blocking open waits for the opposite end. O_RDWR is its own
+   * peer and never waits. */
+  if (!(flags & B1NIX_O_NONBLOCK) && acc != B1NIX_O_RDWR) {
+    while (want_read ? fifo->writers == 0 : fifo->readers == 0) {
+      if (scheduler_signal_pending()) {
+        fifo_detach(node->inode, fifo, want_read, want_write);
+        return -ERESTARTSYS;
+      }
+      interrupts_disable();
+      current_task->wait_chan = fifo;
+      scheduler_lease_clear_here(__func__);
+      current_task->state = TASK_BLOCKED;
+      scheduler_yield();
+      interrupts_enable();
+    }
+  }
+
+  struct vfs_handle *h = alloc_raw_handle(
+      want_read ? VFS_HANDLE_PIPE_READ : VFS_HANDLE_PIPE_WRITE);
+  if (!h) {
+    fifo_detach(node->inode, fifo, want_read, want_write);
+    return -ENFILE;
+  }
+  h->node = vfs_node_get(node);
+  h->private_data = fifo;
+  h->flags = flags;
+  h->ops = (acc == B1NIX_O_RDWR)  ? &fifo_rdwr_ops
+           : want_write           ? &fifo_write_ops
+                                  : &fifo_read_ops;
+
+  int fd = scheduler_fd_alloc(h);
+  if (fd < 0) {
+    vfs_handle_release(h); /* runs fifo_release: detach + node put */
+    return -EMFILE;
+  }
+  if (flags & B1NIX_O_CLOEXEC)
+    scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  return fd;
 }

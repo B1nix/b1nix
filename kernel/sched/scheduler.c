@@ -205,7 +205,26 @@ static inline struct task *T(usize i) {
   return &g_task_chunks[i >> 6][i & 63];
 }
 /* current_task is per-CPU now (a macro -> get_percpu()->cur_task, see sched.h). */
-static usize next_task_id = 1;
+/* PID numbering follows the Unix model: the boot/idle task is PID 0 (Linux's
+ * "swapper"), PID 1 is reserved for the userspace init process, and everything
+ * else is numbered from 2 up. Reserving 1 matters because real init systems
+ * (OpenRC's openrc-init, sysvinit, ...) do `if (getpid() != 1) return 1;` and
+ * exit immediately otherwise. See scheduler_reserve_init_pid(). */
+static usize next_task_id = 2;
+
+static int g_task_vfork_pending[MAX_TASKS];
+static usize g_task_vfork_id[MAX_TASKS];
+
+static int g_reserve_init_pid = 0;
+
+/* Claim the next task id. Caller must hold g_tasks_lock. */
+static usize claim_task_id(void) {
+  if (g_reserve_init_pid) {
+    g_reserve_init_pid = 0;
+    return 1;
+  }
+  return next_task_id++;
+}
 
 /* SMP: the global runqueue holds READY *non-stealable* tasks — ordinary
  * userspace processes and kernel threads. Any CPU (BSP or AP) dequeues from it
@@ -272,6 +291,16 @@ static inline void tasks_lock(u64 *flags) {
 static inline void tasks_unlock(u64 flags) {
   LOCKDEP_RELEASE(LOCKDEP_LVL_TASKS);
   spin_unlock_irqrestore(&g_tasks_lock, flags);
+}
+
+/* Arm the PID-1 reservation: the next task created gets id 1. kernel_main calls
+ * this immediately before spawning the init binary, at a point where no other
+ * task creation is in flight. */
+void scheduler_reserve_init_pid(void) {
+  u64 flags;
+  tasks_lock(&flags);
+  g_reserve_init_pid = 1;
+  tasks_unlock(flags);
 }
 
 /* fd_lock helpers — wraps spin_lock/unlock on the fd table owner's fd_lock
@@ -424,6 +453,7 @@ static struct task *find_unused_task(void) {
       g_task_cutime[i] = 0;
       g_task_cstime[i] = 0;
       g_task_pass[i] = g_min_pass;
+      g_task_vfork_pending[i] = 0;
       for (int r = 0; r < 16; r++) {
         g_task_rlimits[i][r].rlim_cur = RLIM_INFINITY;
         g_task_rlimits[i][r].rlim_max = RLIM_INFINITY;
@@ -431,7 +461,7 @@ static struct task *find_unused_task(void) {
       g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
       g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
       T(i)->state = TASK_BLOCKED;
-      T(i)->id = next_task_id++;
+      T(i)->id = claim_task_id();
       tasks_unlock(flags);
       return T(i);
     }
@@ -468,7 +498,7 @@ static struct task *find_unused_task(void) {
   g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
   g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
   T(i)->state = TASK_BLOCKED;
-  T(i)->id = next_task_id++;
+  T(i)->id = claim_task_id();
   tasks_unlock(flags);
   return T(i);
 }
@@ -813,7 +843,7 @@ void scheduler_init(void) {
   g_task_hwm = 1;  /* boot task occupies slot 0 */
 
   struct task *boot = T(0);
-  boot->id = next_task_id++;
+  boot->id = 0; /* PID 0: the boot/idle task (Linux calls it swapper) */
   boot->name = "boot";
   boot->state = TASK_RUNNING;
   boot->stdout_fd = -1;
@@ -878,8 +908,8 @@ void scheduler_init(void) {
 }
 
 static void task_init_cred(struct task *task) {
-  if (task->id == 1) {
-    /* Boot task gets root credentials */
+  if (task->id == 0) {
+    /* Boot task (PID 0) gets root credentials */
     task->cred = cred_create_default();
   } else {
     /* Inherit credentials from parent */
@@ -1742,6 +1772,25 @@ static struct vfs_handle **fdtable_release(struct task *t, int **flags_out,
 
 int g_has_any_thread = 0;
 
+/* CLONE_VFORK: the parent must not run until the child has execve()d or
+ * exited. musl's posix_spawn (and therefore popen/system) relies on this — its
+ * child runs on a buffer that lives on the PARENT's stack, so a parent that
+ * returns early reuses that memory underneath the running child. Indexed by the
+ * child's task slot; the id is stored alongside so a recycled slot cannot
+ * satisfy a stale wait. */
+/* Called by the child at the two points that end a vfork: a successful execve
+ * (it has its own address space and stack now) and task exit. */
+void scheduler_vfork_release(void) {
+  struct task *t = current_task;
+  if (!t)
+    return;
+  usize idx = task_index(t);
+  if (!g_task_vfork_pending[idx] || g_task_vfork_id[idx] != t->id)
+    return;
+  g_task_vfork_pending[idx] = 0;
+  scheduler_wake_all(&g_task_vfork_pending[idx]);
+}
+
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
@@ -1819,7 +1868,57 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     g_task_rlimits[c_idx][r] = g_task_rlimits[p_idx][r];
 
   /* Address-space inheritance. */
-  if (flags & B1NIX_CLONE_VM) {
+  if ((flags & B1NIX_CLONE_VM) && !(flags & B1NIX_CLONE_THREAD)) {
+    /* vfork / posix_spawn: a process of its own that Linux would run in the
+     * parent's mm until execve. b1nix gives it a COW copy instead. musl's spawn
+     * child only reads the shared data and reports failures through a pipe, so
+     * it does not need writes to be visible to the parent — and a private mm
+     * removes the whole class of hazards where the child's COW fault or its
+     * execve teardown rewrites page-table entries the parent is still using.
+     * CLONE_VFORK still suspends the parent until exec/exit, so the ordering
+     * userspace relies on is preserved. */
+    extern u64 paging_clone_address_space(u64 pml4_phys);
+    extern void paging_switch_address_space(u64 pml4_phys);
+    child->pml4_phys = paging_clone_address_space(parent->pml4_phys);
+    /* The clone flipped the parent's writable user pages to COW in place; the
+     * parent keeps running on the same CR3, so reload it to drop the stale
+     * writable TLB entries (see the identical note in scheduler_fork_current). */
+    if (parent == current_task)
+      paging_switch_address_space(parent->pml4_phys);
+
+    child->vma_list = 0;
+    struct vm_area *src_vma = parent->vma_list;
+    struct vm_area **dst_prev = &child->vma_list;
+    while (src_vma) {
+      struct vm_area *new_vma = kmalloc(sizeof(struct vm_area));
+      if (new_vma) {
+        memcpy(new_vma, src_vma, sizeof(struct vm_area));
+        new_vma->next = 0;
+        if (new_vma->node) {
+          vfs_node_get(new_vma->node);
+          if (new_vma->node->inode && new_vma->node->inode->mmap_open_cb)
+            new_vma->node->inode->mmap_open_cb(new_vma->node);
+          if (new_vma->node->inode && new_vma->node->inode->mmap_range_open_cb)
+            new_vma->node->inode->mmap_range_open_cb(
+                new_vma->node, (u64)new_vma->offset,
+                (usize)(new_vma->end - new_vma->start));
+        }
+        *dst_prev = new_vma;
+        dst_prev = &new_vma->next;
+      }
+      src_vma = src_vma->next;
+    }
+    {
+      extern void shm_fork_inherit(usize parent_pid, usize child_pid);
+      shm_fork_inherit(parent->id, child->id);
+    }
+    child->user_brk = parent->user_brk;
+    child->heap_start = parent->heap_start;
+    child->user_image = parent->user_image;
+    if (child->user_image) {
+      __atomic_fetch_add(&((struct user_loaded_image *)child->user_image)->refcount, 1, __ATOMIC_RELAXED);
+    }
+  } else if (flags & B1NIX_CLONE_VM) {
     child->pml4_phys = parent->pml4_phys;
     child->vma_list  = parent->vma_list;
     child->user_brk  = parent->user_brk;
@@ -1884,8 +1983,13 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   child->process_group_id = parent->process_group_id;
   child->session_id = parent->session_id;
 
-  /* M29 thread flags. */
-  task_set_is_thread(child, 1);
+  /* M29 thread flags. A CLONE_THREAD child is a thread of the caller's process
+   * (joined via futex, invisible to waitpid, no SIGCHLD). A CLONE_VM child
+   * WITHOUT CLONE_THREAD is the vfork/posix_spawn shape: a real child process
+   * that merely borrows the address space until it execs, so it must be
+   * waitpid-able and must raise SIGCHLD — marking it a thread left openrc-run
+   * polling forever for a child exit it never heard about. */
+  task_set_is_thread(child, (flags & B1NIX_CLONE_THREAD) ? 1 : 0);
   /* For fork (no CLONE_SETTLS), inherit the parent's TLS base so the child
    * can access thread-local data (FS segment). Only set an explicit TLS base
    * when CLONE_SETTLS is provided (pthread_create path). */
@@ -1937,6 +2041,26 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   if ((flags & B1NIX_CLONE_CHILD_SETTID) && child_tid_addr) {
     /* child_tid_addr is in the child's address space (same mm for threads). */
     syscall_copyout((void *)(usize)child_tid_addr, &child->id, sizeof(u32));
+  }
+
+  /* CLONE_VFORK: suspend here until the child execs or exits. */
+  if (flags & B1NIX_CLONE_VFORK) {
+    usize c_slot = task_index(child);
+    usize c_id = child->id;
+    g_task_vfork_id[c_slot] = c_id;
+    g_task_vfork_pending[c_slot] = 1;
+    while (g_task_vfork_pending[c_slot] && g_task_vfork_id[c_slot] == c_id) {
+      interrupts_disable();
+      if (!g_task_vfork_pending[c_slot] || g_task_vfork_id[c_slot] != c_id) {
+        interrupts_enable();
+        break;
+      }
+      current_task->wait_chan = &g_task_vfork_pending[c_slot];
+      scheduler_lease_clear_here(__func__);
+      current_task->state = TASK_BLOCKED;
+      scheduler_yield();
+      interrupts_enable();
+    }
   }
 
   return (int)child->id;
@@ -2753,6 +2877,8 @@ void scheduler_set_init_pid(usize pid) { g_init_pid = pid; }
 usize scheduler_get_init_pid(void) { return g_init_pid; }
 
 void scheduler_exit_current(int exit_code) {
+  /* A vfork parent waiting on this task must be released before teardown. */
+  scheduler_vfork_release();
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
   }

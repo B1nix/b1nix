@@ -220,6 +220,10 @@ enum {
   SYS_EXECVEAT          = 236,
   SYS_SENDTO            = 237,
   SYS_RECVFROM          = 238,
+  SYS_MKNOD             = 239, /* mknod(path, mode, dev) — mkfifo's backing call */
+  SYS_FLOCK             = 240, /* flock(fd, operation) */
+  SYS_CLOCK_GETRES      = 241, /* clock_getres(clk_id, res) */
+  SYS_SIGTIMEDWAIT      = 242, /* sigtimedwait(set, info, timeout) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

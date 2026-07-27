@@ -283,6 +283,7 @@ void kernel_main(usize arg0, usize arg1)
 	isofs_init();
 	exfat_init();
 	ntfs_init();
+	tmpfs_init();
 	procfs_init();
 	sysfs_init();
 	filelock_init();
@@ -645,9 +646,9 @@ void kernel_main(usize arg0, usize arg1)
 		ipv6_loopback_smoke();
 		ipv6_realink_smoke();
 
-		/* M94 T1: init-path parsing self-test. Verify bootinfo_get_kv
-		 * correctly extracts the `init=` parameter (or falls back).
-		 * Also verify b1nix.openrc and b1nix.single flag detection. */
+		/* M94: init-path parsing self-test. Verify bootinfo_get_kv
+		 * correctly extracts the `init=` parameter (or falls back to
+		 * /sbin/openrc-init). */
 		{
 			char m94_path[128];
 			int m94_got = bootinfo_get_kv("init", m94_path,
@@ -657,17 +658,14 @@ void kernel_main(usize arg0, usize arg1)
 				console_write(m94_path);
 				console_write("\n");
 			} else {
-				console_write("M94-INIT: ok fallback /bin/init\n");
+				console_write("M94-INIT: ok default /sbin/openrc-init\n");
 			}
 			/* Verify flag detection (flags are absent in normal test boot). */
-			int m94_openrc = bootinfo_has_flag("b1nix.openrc");
 			int m94_single = bootinfo_has_flag("b1nix.single");
-			if (!m94_openrc && !m94_single) {
-				console_write("M94-INIT: ok no-override-flags\n");
-			} else if (m94_openrc) {
-				console_write("M94-INIT: ok openrc-flag\n");
-			} else {
+			if (m94_single) {
 				console_write("M94-INIT: ok single-flag\n");
+			} else {
+				console_write("M94-INIT: ok no-override-flags\n");
 			}
 		}
 	}
@@ -685,22 +683,24 @@ void kernel_main(usize arg0, usize arg1)
 
 	userspace_init();
 
-	/* M94 T1: Generic init path — honour `init=/path` from kernel cmdline,
-	 * fall back to `/bin/init` for stock b1nix and standard Linux boots.
+	/* M94: Generic init path — honour `init=/path` from kernel cmdline.
+	 * Default PID 1 is now /sbin/openrc-init (OpenRC init system).
 	 * `b1nix.single` maps to `init=/bin/sh` (standard single-user mode).
-	 * `b1nix.openrc` maps to `init=/sbin/openrc-init` (OpenRC init system). */
+	 * The old test orchestrator `/bin/init` can be selected via `init=/bin/init`. */
 	char init_path_buf[128];
-	const char *init_path = "/bin/init";
+	const char *init_path = "/sbin/openrc-init";
 	if (bootinfo_get_kv("init", init_path_buf, sizeof(init_path_buf)) &&
 	    init_path_buf[0] != '\0') {
 		init_path = init_path_buf;
-	} else if (bootinfo_has_flag("b1nix.openrc")) {
-		init_path = "/sbin/openrc-init";
 	} else if (bootinfo_has_flag("b1nix.single")) {
 		init_path = "/bin/sh";
 	}
 
 	char init_log[160];
+	/* init must be PID 1: real init systems (openrc-init, sysvinit) bail out
+	 * with `if (getpid() != 1) return 1;`. The boot task is PID 0 and ids from
+	 * 2 up went to the kernel threads started above, so 1 is still free. */
+	scheduler_reserve_init_pid();
 	int init_pid = user_spawn(init_path, 0, 0);
 	if (init_pid > 0)
 		scheduler_set_init_pid((usize)init_pid);

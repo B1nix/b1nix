@@ -72,6 +72,13 @@
 #define LX_getcwd          79
 #define LX_chdir           80
 #define LX_rename          82
+#define LX_sysinfo         99
+#define LX_times           100
+#define LX_flock           73
+#define LX_mknod           133
+#define LX_sched_getaffinity 204
+#define LX_clock_getres    229
+#define LX_statx           332
 #define LX_mkdir           83
 #define LX_rmdir           84
 #define LX_unlink          87
@@ -262,6 +269,13 @@ static const struct lx_map lx_table[] = {
 	{LX_chdir,          SYS_CHDIR,         "chdir"},
 	{LX_rename,         SYS_RENAME,        "rename"},
 	{LX_mkdir,          SYS_MKDIR,         "mkdir"},
+	{LX_mknod,          SYS_MKNOD,         "mknod"},
+	{LX_flock,          SYS_FLOCK,         "flock"},
+	{LX_sysinfo,        SYS_SYSINFO,       "sysinfo"},
+	{LX_times,          SYS_TIMES,         "times"},
+	{LX_sched_getaffinity, SYS_SCHED_GETAFFINITY, "sched_getaffinity"},
+	{LX_clock_getres,   SYS_CLOCK_GETRES,  "clock_getres"},
+	{LX_statx,          SYS_STATX,         "statx"},
 	{LX_rmdir,          SYS_RMDIR,         "rmdir"},
 	{LX_unlink,         SYS_UNLINK,        "unlink"},
 	{LX_symlink,        SYS_SYMLINK,       "symlink"},

@@ -665,7 +665,9 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
                 if (entry_idx >= offset) {
                     usize name_len = e->name_len > 63 ? 63 : e->name_len;
                     memcpy(buf[count].name, e->name, name_len); buf[count].name[name_len] = '\0';
-                    buf[count].type = (u32)VFS_FILE; if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
+                    buf[count].type = (u32)VFS_FILE;
+                    if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
+                    else if (e->file_type == EXT2_FT_FIFO) buf[count].type = (u32)VFS_FIFO;
                     buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
                     buf[count].size = 0; count++;
                 }
@@ -699,6 +701,41 @@ static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *f
     return -EIO;
   }
   if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, new_ino, name, EXT2_FT_REG_FILE, h) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (h) journal_commit_transaction(h);
+  struct vfs_node *n = find_child(dir, name);
+  if (n) {
+    ext4_setup_node(n, fs, new_ino, inode.i_mode);
+    vfs_node_put(n);
+  }
+  return 0;
+}
+
+/* mknod: a FIFO is an ordinary ext4 inode whose i_mode carries S_IFIFO and
+ * which owns no data blocks — the pipe buffer lives in RAM and only the name,
+ * mode and ownership are persistent. Only S_IFIFO is accepted; character and
+ * block devices would need a device number the VFS has no mapping for. */
+static int ext4_vfs_mknod(struct vfs_node *dir, const char *name, u32 mode) {
+  struct ext4_inode_info *dir_info = (struct ext4_inode_info *)dir->inode->data;
+  struct ext4_fs *fs = dir_info->fs;
+  struct journal_handle *h = fs->jdev ? journal_start_transaction(fs->jdev) : 0;
+  u32 new_ino = ext4_alloc_inode_tx(fs, h);
+  if (!new_ino) {
+    if (h) journal_abort_transaction(h);
+    return -ENOSPC;
+  }
+  struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
+  inode.i_mode = EXT2_S_IFIFO | (mode & 07777); inode.i_links_count = 1;
+  inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
+
+  if (ext4_write_inode_tx(fs, h, new_ino, &inode) < 0) {
+    if (h) journal_abort_transaction(h);
+    return -EIO;
+  }
+  if (ext4_add_dir_entry_tx(fs, dir_info->inode_num, new_ino, name,
+                            EXT2_FT_FIFO, h) < 0) {
     if (h) journal_abort_transaction(h);
     return -EIO;
   }
@@ -1060,6 +1097,7 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
   n->inode->fsync_cb = ext4_vfs_fsync;
   if ((mode & EXT2_S_IFMT) == EXT2_S_IFDIR) {
     n->inode->create_cb = ext4_vfs_create; n->inode->mkdir_cb = ext4_vfs_mkdir;
+    n->inode->mknod_cb = ext4_vfs_mknod;
     n->inode->readdir_cb = ext4_vfs_readdir; n->inode->rmdir_cb = ext4_vfs_rmdir;
     n->inode->rename_cb = ext4_vfs_rename; n->inode->symlink_cb = ext4_vfs_symlink;
     n->inode->link_cb = ext4_vfs_link;
@@ -1115,7 +1153,10 @@ static void ext4_populate_vfs(struct ext4_fs *fs, u32 ino, const char *base_path
                         kfree(tgt);
                     }
                 } else {
-                    struct vfs_node *n = vfs_add_node(full, (fmt == EXT2_S_IFDIR) ? VFS_DIRECTORY : VFS_FILE, 0, ci.i_size, 0);
+                    enum vfs_node_type ntype = VFS_FILE;
+                    if (fmt == EXT2_S_IFDIR) ntype = VFS_DIRECTORY;
+                    else if (fmt == EXT2_S_IFIFO) ntype = VFS_FIFO;
+                    struct vfs_node *n = vfs_add_node(full, ntype, 0, ci.i_size, 0);
                     if (n) {
                         ext4_setup_node(n, fs, e->inode, ci.i_mode);
                         n->inode->mode = ci.i_mode & 07777;

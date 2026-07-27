@@ -233,6 +233,11 @@ enum {
 	 * address per message; SYS_SEND/SYS_RECV keep the 4-arg legacy shape) --- */
 	SYS_SENDTO           = 237, /* sendto(fd, buf, len, flags, addr, addrlen) */
 	SYS_RECVFROM         = 238, /* recvfrom(fd, buf, len, flags, addr, addrlen*) */
+	/* --- named pipes (mkfifo → mknod with S_IFIFO) --- */
+	SYS_MKNOD            = 239, /* mknod(path, mode, dev) */
+	SYS_FLOCK            = 240, /* flock(fd, operation) — whole-file advisory lock */
+	SYS_CLOCK_GETRES     = 241, /* clock_getres(clk_id, res) */
+	SYS_SIGTIMEDWAIT     = 242, /* sigtimedwait(set, info, timeout) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */
@@ -247,6 +252,7 @@ enum {
 #define B1NIX_CLONE_FS       0x00000200
 #define B1NIX_CLONE_FILES    0x00000400
 #define B1NIX_CLONE_SIGHAND  0x00000800
+#define B1NIX_CLONE_VFORK    0x00004000
 #define B1NIX_CLONE_THREAD   0x00010000
 #define B1NIX_CLONE_SETTLS   0x00080000
 #define B1NIX_CLONE_CHILD_CLEARTID 0x00200000

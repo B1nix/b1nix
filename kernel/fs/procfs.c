@@ -922,4 +922,14 @@ static struct vfs_fs procfs_fs = {
     .mount = procfs_mount_cb,
 };
 
-void procfs_init(void) { vfs_register_fs(&procfs_fs); }
+/* Linux calls this filesystem "proc"; `mount -t proc proc /proc` from an init
+ * script or busybox must work as well as b1nix's own "procfs" name. */
+static struct vfs_fs procfs_linux_alias;
+
+void procfs_init(void) {
+  vfs_register_fs(&procfs_fs);
+  procfs_linux_alias = procfs_fs;
+  procfs_linux_alias.name = "proc";
+  procfs_linux_alias.next = 0;
+  vfs_register_fs(&procfs_linux_alias);
+}

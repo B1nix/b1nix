@@ -332,7 +332,10 @@ int filelock_flock(int fd, int operation) {
   memset(&fl, 0, sizeof(fl));
   fl.l_pid = my_pid;
 
-  switch (operation & 0x0F) {
+  /* LOCK_NB (4) is a modifier, not a lock type: masking it in with 0x0F made
+   * every real call — flock(fd, LOCK_EX | LOCK_NB) is 6 — fall through to the
+   * default and return EINVAL. Strip it before decoding the type. */
+  switch (operation & ~LOCK_NB) {
   case LOCK_SH:
     fl.l_type = F_RDLCK;
     fl.l_start = 0;

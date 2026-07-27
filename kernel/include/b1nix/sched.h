@@ -383,6 +383,10 @@ int scheduler_fork_current(void);
  *   CLONE_SETTLS   — initialize tls_base from `tls`.
  *   CLONE_CHILD_CLEARTID — store `ctid` and write 0 + futex_wake on exit.
  */
+/* CLONE_VFORK handshake: the child calls this once it has execve()d (or on
+ * exit) to let a vfork parent continue. */
+void scheduler_vfork_release(void);
+
 int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
                            u64 tls, u64 ctid,
                            u64 parent_tid_addr, u64 child_tid_addr,
@@ -510,6 +514,10 @@ u64  scheduler_peek_pending_signals(u64 mask);
 int  scheduler_consume_pending_signal(int sig);
 sighandler_t scheduler_get_sighandler(int sig);
 usize scheduler_get_pid(void);
+
+/* Reserve PID 1 for the next task created (the userspace init process). The
+ * boot/idle task is PID 0, so 1 is otherwise never handed out. */
+void scheduler_reserve_init_pid(void);
 void scheduler_set_user_image(void *image);
 struct cred *scheduler_get_current_cred(void);
 const char *scheduler_get_cwd(void);

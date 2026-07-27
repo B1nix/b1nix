@@ -55,6 +55,12 @@
 #define LINUX_REBOOT_CMD_RESTART   0x01234567u
 #define LINUX_REBOOT_CMD_HALT      0xcdef0123u
 #define LINUX_REBOOT_CMD_POWER_OFF 0x4321fedcu
+/* Ctrl-Alt-Del handling. On Linux these only flip a flag — the machine keeps
+ * running — and PID 1 calls DISABLE_CAD at startup (runit, openrc-init,
+ * sysvinit all do). b1nix has no CAD path at all, so both are accepted no-ops;
+ * rejecting them made every init see EINVAL from its first syscall. */
+#define LINUX_REBOOT_CMD_CAD_OFF   0x00000000u
+#define LINUX_REBOOT_CMD_CAD_ON    0x89abcdefu
 
 /* Linux<->b1nix signal-number remap (b1nix uses different signo values, e.g.
  * Linux SIGUSR1=10 vs b1nix 19). Returns 0 if there is no equivalent. */

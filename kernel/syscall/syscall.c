@@ -580,6 +580,33 @@ static int sys_fallocate(int fd, int mode, u64 offset, u64 len) {
  * an absolute/cwd-relative path (dirfd == AT_FDCWD) and AT_EMPTY_PATH on an fd.
  * It maps the existing stat data into the Linux struct statx layout so glibc /
  * port binaries that prefer statx get real values. */
+/* Resolve a dirfd-relative path the way the *at() syscalls define it: an
+ * absolute path or AT_FDCWD is used as-is, anything else is joined onto the
+ * directory the fd names. b1nix has no per-fd resolution in the VFS, so the
+ * join happens here on top of vfs_fd_abspath(). Returns 0 or -errno. */
+static int syscall_resolve_at(int dirfd, const char *kpath, char *out,
+                              usize outsz) {
+  if (!kpath || !out || outsz == 0)
+    return -EINVAL;
+  if (kpath[0] == '/' || dirfd == AT_FDCWD) {
+    if (strlen(kpath) >= outsz)
+      return -ENAMETOOLONG;
+    strcpy(out, kpath);
+    return 0;
+  }
+  char dirbuf[VFS_MAX_PATH];
+  int rc = vfs_fd_abspath(dirfd, dirbuf, sizeof(dirbuf));
+  if (rc < 0)
+    return rc;
+  usize dlen = (usize)rc;
+  if (dlen + 1 + strlen(kpath) >= outsz)
+    return -ENAMETOOLONG;
+  memcpy(out, dirbuf, dlen);
+  out[dlen] = '/';
+  strcpy(out + dlen + 1, kpath);
+  return 0;
+}
+
 static int sys_statx(int dirfd, const char *user_path, int flags,
                      unsigned int mask, struct statx *user_buf) {
   struct b1nix_stat st;
@@ -590,11 +617,12 @@ static int sys_statx(int dirfd, const char *user_path, int flags,
     char kpath[VFS_MAX_PATH];
     if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
       return -EFAULT;
-    /* Only AT_FDCWD (or an absolute path) is resolvable — no per-fd dir base. */
-    if (dirfd != AT_FDCWD && kpath[0] != '/')
-      return -EBADF;
-    rc = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(kpath, &st)
-                                       : vfs_stat(kpath, &st);
+    char resolved[VFS_MAX_PATH];
+    int arc = syscall_resolve_at(dirfd, kpath, resolved, sizeof(resolved));
+    if (arc < 0)
+      return arc;
+    rc = (flags & AT_SYMLINK_NOFOLLOW) ? vfs_lstat(resolved, &st)
+                                       : vfs_stat(resolved, &st);
   }
   if (rc < 0)
     return rc;
@@ -924,6 +952,55 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   copy_cstr(status->linker, sizeof(status->linker), "b1nix-ld-abi");
   copy_cstr(status->make, sizeof(status->make), "gnu-make-port");
   return 0;
+}
+
+/* Translate Linux O_* open flags to b1nix flags via an explicit whitelist.
+ * Several bits DIVERGE and even COLLIDE between the two ABIs, so a pass-through
+ * with per-bit patching is unsafe:
+ *   - Linux O_NONBLOCK (04000 = 0x800) == b1nix O_CLOEXEC (0x800)
+ *   - Linux O_CLOEXEC  (02000000 = 0x80000) != b1nix O_CLOEXEC
+ *   - Linux O_DIRECT   (040000 = 0x4000) == b1nix O_NONBLOCK (0x4000)
+ * Build the b1nix flag set from recognized Linux bits only; unknown Linux bits
+ * (O_NOCTTY/O_SYNC/O_DIRECT/O_NOFOLLOW/...) are dropped so they cannot set an
+ * unrelated b1nix flag. The low two bits (O_RDONLY/O_WRONLY/O_RDWR) are
+ * identical in both ABIs. */
+static int linux_open_flags_to_b1nix(int lf) {
+  int flags = lf & 0x3; /* access mode (shared) */
+  if (lf & 0100)     flags |= B1NIX_O_CREAT;     /* Linux 0x40  */
+  if (lf & 0200)     flags |= B1NIX_O_EXCL;      /* Linux 0x80  */
+  if (lf & 01000)    flags |= B1NIX_O_TRUNC;     /* Linux 0x200 */
+  if (lf & 02000)    flags |= B1NIX_O_APPEND;    /* Linux 0x400 */
+  /* Linux O_NONBLOCK (04000), plus 040000 for callers that pass b1nix-native
+   * flags (b1nix O_NONBLOCK == 0x4000 == 040000) through the Linux path.
+   * 0100000 is NOT included: that is Linux O_LARGEFILE, which musl ORs into
+   * EVERY open() (see __sys_open_cp in musl's src/internal/syscall.h). Mapping
+   * it to O_NONBLOCK made every musl open non-blocking — harmless on regular
+   * files, but it turned a FIFO's blocking open into an instant ENXIO. On
+   * 64-bit O_LARGEFILE is a no-op, so it is simply dropped. */
+  if (lf & (04000 | 040000))
+    flags |= B1NIX_O_NONBLOCK;
+  if (lf & 0200000)  flags |= B1NIX_O_DIRECTORY; /* Linux 0x10000 (shared) */
+  if (lf & 02000000) flags |= B1NIX_O_CLOEXEC;   /* Linux 0x80000 -> 0x800 */
+  return flags;
+}
+
+/* mknod(2): the kernel side of mkfifo(3). Only S_IFIFO and S_IFREG are
+ * creatable — see vfs_mknod for why. */
+static isize sys_mknod(const char *user_path, u32 mode, u64 dev) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+
+  char resolved[VFS_MAX_PATH];
+  vfs_resolve_path(kpath, resolved);
+  kfree(kpath);
+
+  return vfs_mknod(resolved, mode, dev);
 }
 
 static isize sys_mkdir(const char *user_path, u32 mode) {
@@ -1274,22 +1351,16 @@ static isize sys_chdir(const char *user_path) {
   return res;
 }
 
-static isize sys_access(const char *user_path, int mode) {
+/* access(2) on a path already in kernel memory. The *at() shim resolves
+ * dirfd-relative paths into a kernel buffer, so it needs this entry point —
+ * handing that buffer to the user-pointer variant made every faccessat() call
+ * fail with EFAULT. */
+static isize sys_access_kpath(const char *kpath, int mode) {
   if ((mode & ~(R_OK | W_OK | X_OK)) != 0)
     return -EINVAL;
 
-  char *kpath = kmalloc(VFS_MAX_PATH);
-  if (!kpath)
-    return -ENOMEM;
-  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
-    kfree(kpath);
-    return -EFAULT;
-  }
-  kpath[VFS_MAX_PATH - 1] = '\0';
-
   char resolved[VFS_MAX_PATH];
   vfs_resolve_path(kpath, resolved);
-  kfree(kpath);
 
   struct vfs_node *node = vfs_find_node(resolved);
   if (IS_ERR(node))
@@ -1326,6 +1397,20 @@ static isize sys_access(const char *user_path, int mode) {
 
   vfs_node_put(node);
   return 0;
+}
+
+static isize sys_access(const char *user_path, int mode) {
+  char *kpath = kmalloc(VFS_MAX_PATH);
+  if (!kpath)
+    return -ENOMEM;
+  if (strncpy_from_user(kpath, user_path, VFS_MAX_PATH) < 0) {
+    kfree(kpath);
+    return -EFAULT;
+  }
+  kpath[VFS_MAX_PATH - 1] = '\0';
+  isize rc = sys_access_kpath(kpath, mode);
+  kfree(kpath);
+  return rc;
 }
 
 static isize sys_fchdir(int fd) {
@@ -1367,6 +1452,87 @@ static u64 sys_alarm(unsigned int seconds) {
   }
 
   return remaining;
+}
+
+/* clock_getres(2). b1nix drives every clock off the 100 Hz scheduler tick (see
+ * SYS_CLOCK_GETTIME), so the honest resolution is 10 ms for all of them —
+ * reporting Linux's 1 ns would be a lie a caller can act on (poll loops sized
+ * from the resolution). */
+static isize sys_clock_getres(int clk_id, struct timespec *user_res) {
+  if (clk_id < 0 || clk_id > 7)
+    return -EINVAL;
+  if (!user_res)
+    return 0; /* Linux allows a NULL res: the call then only validates clk_id */
+  struct timespec res;
+  res.tv_sec = 0;
+  res.tv_nsec = 10000000; /* 1 tick at 100 Hz */
+  if (syscall_copyout(user_res, &res, sizeof(res)) != 0)
+    return -EFAULT;
+  return 0;
+}
+
+/* sigtimedwait(2): wait for one of the signals in `set` to become pending,
+ * consume it WITHOUT running its handler, and return its number. This is how a
+ * program that manages signals synchronously (openrc-init's shutdown path, any
+ * signalfd-less daemon) reads them. Polls on the scheduler tick: signal
+ * delivery already wakes a blocked task, and a tick-granular wait matches the
+ * clock resolution the rest of the timing syscalls report.
+ *
+ * Returns the b1nix signal number, -EAGAIN on timeout, or -EINTR when a signal
+ * OUTSIDE the set becomes deliverable (POSIX). */
+static isize sys_sigtimedwait_kernel(u64 set, const struct timespec *user_ts) {
+  if (!current_task)
+    return -EFAULT;
+  /* SIGKILL/SIGSTOP can never be waited for, exactly as they cannot be caught. */
+  set &= ~((1ULL << (SIGKILL - 1)) | (1ULL << (SIGSTOP - 1)));
+  if (!set)
+    return -EINVAL;
+
+  int has_timeout = 0;
+  u64 deadline = 0;
+  if (user_ts) {
+    struct timespec ts;
+    if (syscall_copyin(&ts, user_ts, sizeof(ts)) < 0)
+      return -EFAULT;
+    if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+      return -EINVAL;
+    has_timeout = 1;
+    deadline = scheduler_get_ticks() +
+               (u64)ts.tv_sec * 100 + (u64)ts.tv_nsec / 10000000;
+  }
+
+  for (;;) {
+    u64 pending =
+        __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE);
+    u64 wanted = pending & set;
+    if (wanted) {
+      for (int sig = 1; sig <= NSIG; sig++) {
+        if (!(wanted & (1ULL << (sig - 1))))
+          continue;
+        __atomic_fetch_and(&current_task->pending_signals,
+                           ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+        return sig;
+      }
+    }
+    /* A deliverable signal that is NOT in the set aborts the wait so its
+     * handler can run. */
+    if (pending & ~current_task->blocked_signals & ~set)
+      return -EINTR;
+    if (has_timeout && scheduler_get_ticks() >= deadline)
+      return -EAGAIN;
+    scheduler_block_on_timeout(&current_task->pending_signals, 1);
+  }
+}
+
+/* Native entry point: the set comes from userspace in b1nix numbering. */
+static isize sys_sigtimedwait(const u64 *user_set,
+                              const struct timespec *user_ts) {
+  if (!user_set)
+    return -EFAULT;
+  u64 set;
+  if (syscall_copyin(&set, user_set, sizeof(u64)) < 0)
+    return -EFAULT;
+  return sys_sigtimedwait_kernel(set, user_ts);
 }
 
 static u64 sys_sigsuspend(const u64 *user_mask) {
@@ -3300,8 +3466,49 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)sys_linux_getdents64((int)arg0, arg1, (usize)arg2);
       if (number == LINUX_NR_ARCH_PRCTL)
         return (u64)sys_linux_arch_prctl(arg0, arg1);
+      /* open(2) (Linux nr 2) carries Linux O_* bits, which collide with the
+       * b1nix ones — Linux O_NONBLOCK is b1nix O_CLOEXEC and Linux O_DIRECT is
+       * b1nix O_NONBLOCK. The plain number map would pass them through
+       * unchanged, so a musl open(path, O_WRONLY|O_NONBLOCK) silently became a
+       * blocking open with FD_CLOEXEC. Route it through the same whitelist the
+       * openat shim uses. */
+      if (number == 2)
+        return (u64)sys_open((const char *)(usize)arg0,
+                             linux_open_flags_to_b1nix((int)arg1));
       if (number == LINUX_NR_RT_SIGPROCMASK)
         return (u64)sys_linux_rt_sigprocmask((int)arg0, arg1, arg2);
+      /* rt_sigtimedwait(128): the set uses Linux signal numbering, and the
+       * caller gets a Linux siginfo_t back. Translate both ends around the
+       * native wait. */
+      if (number == 128) {
+        if (!arg0)
+          return (u64)-EFAULT;
+        u64 lx_mask = 0;
+        if (syscall_copyin(&lx_mask, (const void *)(usize)arg0,
+                           sizeof(lx_mask)) < 0)
+          return (u64)-EFAULT;
+        u64 b_mask = 0;
+        for (int l = 1; l <= 64; l++) {
+          if (!(lx_mask & (1ULL << (l - 1))))
+            continue;
+          int b = linux_signo_to_b1nix(l);
+          if (b > 0 && b <= NSIG)
+            b_mask |= (1ULL << (b - 1));
+        }
+        isize wr = sys_sigtimedwait_kernel(b_mask,
+                                           (const struct timespec *)(usize)arg2);
+        if (wr < 0)
+          return (u64)wr;
+        int lx_sig = b1nix_signo_to_linux((int)wr);
+        if (arg1) {
+          /* Minimal Linux siginfo_t: si_signo, si_errno, si_code. */
+          i32 si[4] = {lx_sig, 0, 0, 0};
+          if (syscall_copyout((void *)(usize)arg1, si, sizeof(si)) != 0)
+            return (u64)-EFAULT;
+        }
+        return (u64)lx_sig;
+      }
+
       /* rt_sigsuspend(130): the wait mask uses Linux signal numbering. Translate
        * it to b1nix numbering, repack into the caller's own buffer (sys_sigsuspend
        * copies the mask back in from user space), then run the native suspend. */
@@ -3628,12 +3835,14 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_newfstatat      262
 #define LX_unlinkat        263
 #define LX_mkdirat         258
+#define LX_mknodat         259
 #define LX_linkat          265
 #define LX_symlinkat       266
 #define LX_readlinkat      267
 #define LX_fchmodat        268
 #define LX_fchownat        260
 #define LX_faccessat       269
+#define LX_faccessat2      439
 #define LX_renameat2       316
 #define LX_pipe2           293
 #define LX_dup3            292
@@ -3655,8 +3864,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * Returns 0 on success, -errno on failure. kbuf must be VFS_MAX_PATH. */
       if (number == LX_openat || number == LX_newfstatat ||
           number == LX_unlinkat || number == LX_mkdirat ||
+          number == LX_mknodat ||
           number == LX_fchmodat || number == LX_fchownat ||
-          number == LX_faccessat || number == LX_readlinkat ||
+          number == LX_faccessat || number == LX_faccessat2 ||
+          number == LX_readlinkat ||
           number == LX_symlinkat || number == LX_renameat2 ||
           number == LX_linkat) {
         int dirfd = (int)arg0;
@@ -3685,28 +3896,9 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 
         switch (number) {
         case LX_openat: {
-          /* arg0=dirfd, arg1=path, arg2=flags, arg3=mode.
-           * Translate Linux O_* flags to b1nix flags via an explicit whitelist.
-           * Several bits DIVERGE and even COLLIDE between the two ABIs, so a
-           * pass-through with per-bit patching is unsafe:
-           *   - Linux O_NONBLOCK (04000 = 0x800) == b1nix O_CLOEXEC (0x800)
-           *   - Linux O_CLOEXEC  (02000000 = 0x80000) != b1nix O_CLOEXEC
-           *   - Linux O_DIRECT   (040000 = 0x4000) == b1nix O_NONBLOCK (0x4000)
-           * Build the b1nix flag set from recognized Linux bits only; unknown
-           * Linux bits (O_NOCTTY/O_SYNC/O_DIRECT/O_NOFOLLOW/...) are dropped so
-           * they can't accidentally set an unrelated b1nix flag. The low two
-           * bits (O_RDONLY/O_WRONLY/O_RDWR) are identical in both ABIs. */
-          int lf = (int)arg2;
-          int flags = lf & 0x3; /* access mode (shared) */
-          if (lf & 0100)     flags |= B1NIX_O_CREAT;     /* Linux 0x40  */
-          if (lf & 0200)     flags |= B1NIX_O_EXCL;      /* Linux 0x80  */
-          if (lf & 01000)    flags |= B1NIX_O_TRUNC;     /* Linux 0x200 */
-          if (lf & 02000)    flags |= B1NIX_O_APPEND;    /* Linux 0x400 */
-          if (lf & (04000 | 040000 | 0100000))
-            flags |= B1NIX_O_NONBLOCK;  /* Linux, native, or musl O_NONBLOCK */
-          if (lf & 0200000)  flags |= B1NIX_O_DIRECTORY; /* Linux 0x10000 (shared) */
-          if (lf & 02000000) flags |= B1NIX_O_CLOEXEC;   /* Linux 0x80000 -> 0x800 */
-          return (u64)vfs_open_flags(resolved, flags);
+          /* arg0=dirfd, arg1=path, arg2=flags, arg3=mode. */
+          return (u64)vfs_open_flags(resolved,
+                                     linux_open_flags_to_b1nix((int)arg2));
         }
         case LX_newfstatat: {
           /* arg0=dirfd, arg1=path, arg2=statbuf, arg3=flags.
@@ -3737,6 +3929,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
         case LX_mkdirat:
           return (u64)vfs_mkdir(resolved, (int)arg2);
+        case LX_mknodat:
+          /* arg0=dirfd, arg1=path, arg2=mode, arg3=dev. musl's mkfifo() reaches
+           * here on builds without a plain SYS_mknod. */
+          return (u64)vfs_mknod(resolved, (u32)arg2, arg3);
         case LX_linkat: {
           /* arg0=olddirfd, arg1=oldpath, arg2=newdirfd, arg3=newpath, arg4=flags.
            * resolved = oldpath. Need to resolve newpath from (arg2, arg3). */
@@ -3819,12 +4015,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)vfs_chmod(resolved, (u16)arg2);
         case LX_fchownat:
           return (u64)vfs_chown(resolved, (u16)arg2, (u16)arg3);
+        case LX_faccessat2: /* same shape, flags are just advisory here */
         case LX_faccessat: {
           /* arg0=dirfd, arg1=path, arg2=mode, arg3=flags.
            * Linux faccessat uses the real mode (R_OK=4, W_OK=2, X_OK=1, F_OK=0).
            * b1nix SYS_ACCESS takes (path, mode) too. Ignore flags (AT_EACCESS). */
           (void)arg3;
-          return (u64)sys_access(resolved, (int)arg2);
+          return (u64)sys_access_kpath(resolved, (int)arg2);
         }
         case LX_renameat2: {
           /* arg0=olddirfd, arg1=oldpath, arg2=newdirfd, arg3=newpath, arg4=flags.
@@ -4347,6 +4544,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         case LINUX_REBOOT_CMD_POWER_OFF: arg0 = B1NIX_REBOOT_POWEROFF; break;
         case LINUX_REBOOT_CMD_HALT:      arg0 = B1NIX_REBOOT_HALT;     break;
         case LINUX_REBOOT_CMD_RESTART:   arg0 = B1NIX_REBOOT_RESTART;  break;
+        /* CAD_OFF/CAD_ON only toggle the ctrl-alt-del action on Linux; b1nix
+         * has none, so report success rather than failing PID 1's first call. */
+        case LINUX_REBOOT_CMD_CAD_OFF:
+        case LINUX_REBOOT_CMD_CAD_ON:    return 0;
         default: return (u64)-EINVAL;
         }
       }
@@ -4448,6 +4649,17 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return (u64)sys_unlink((const char *)(usize)arg0);
   case SYS_MKDIR:
     return (u64)sys_mkdir((const char *)(usize)arg0, (u32)arg1);
+  case SYS_MKNOD:
+    return (u64)sys_mknod((const char *)(usize)arg0, (u32)arg1, arg2);
+  case SYS_CLOCK_GETRES:
+    return (u64)sys_clock_getres((int)arg0, (struct timespec *)(usize)arg1);
+  case SYS_SIGTIMEDWAIT:
+    return (u64)sys_sigtimedwait((const u64 *)(usize)arg0,
+                                 (const struct timespec *)(usize)arg2);
+  case SYS_FLOCK:
+    /* Whole-file advisory lock. OpenRC's openrc-run takes one per service
+     * before it runs any of its actions, so without this no service starts. */
+    return (u64)filelock_flock((int)arg0, (int)arg1);
   case SYS_RMDIR:
     return (u64)sys_rmdir((const char *)(usize)arg0);
   case SYS_RENAME:

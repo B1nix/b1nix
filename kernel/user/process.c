@@ -1421,6 +1421,9 @@ static int user_run_elf_image(struct user_loaded_image *image) {
       if (old_pml4)
         paging_free_address_space(old_pml4);
     }
+    /* A vfork parent is suspended until this point — release it now that the
+     * child is running its own image. */
+    scheduler_vfork_release();
   }
 
   /* Map segments into the address space. PIE/ET_DYN binaries can have

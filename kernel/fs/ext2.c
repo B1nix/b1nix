@@ -865,6 +865,42 @@ static int ext2_remove_dir_entry(struct ext2_fs *fs, u32 dir_inode_num, const ch
   return -ENOENT;
 }
 
+/* mknod: a FIFO is an ordinary ext2 inode with S_IFIFO in i_mode and no data
+ * blocks — the pipe buffer is in RAM, only the name, mode and ownership are
+ * persistent. Only S_IFIFO is accepted (see ext4_vfs_mknod). */
+static int ext2_vfs_mknod(struct vfs_node *dir, const char *name, u32 mode) {
+  u32 dir_inode_num = get_ino(dir);
+  struct ext2_fs *fs = get_fs(dir);
+
+  u32 new_inode_num = ext2_alloc_inode(fs);
+  if (!new_inode_num)
+    return -ENOSPC;
+
+  struct ext2_inode new_inode;
+  memset(&new_inode, 0, sizeof(new_inode));
+  new_inode.i_mode = EXT2_S_IFIFO | (mode & 07777);
+  new_inode.i_links_count = 1;
+  ext2_write_inode(fs, new_inode_num, &new_inode);
+
+  if (ext2_add_dir_entry(fs, dir_inode_num, new_inode_num, name,
+                         EXT2_FT_FIFO) < 0)
+    return -EIO;
+
+  struct vfs_node *node = find_child(dir, name);
+  if (node) {
+    node->inode->blk_dev = dir->inode->blk_dev;
+    node->inode->setattr_cb = ext2_vfs_setattr;
+    struct ext2_inode_info *info = kmalloc(sizeof(struct ext2_inode_info));
+    if (info) {
+      info->fs = fs;
+      info->inode_num = new_inode_num;
+      node->inode->data = info;
+    }
+    vfs_node_put(node);
+  }
+  return 0;
+}
+
 static int ext2_vfs_create(struct vfs_node *dir, const char *name,
                            const char *full_path, u32 mode) {
 	(void)full_path; /* part of the vfs create-op signature; this impl uses name+dir */
@@ -1262,6 +1298,7 @@ static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
         }
         node->inode->blk_dev = dir->inode->blk_dev;
         node->inode->create_cb = ext2_vfs_create;
+        node->inode->mknod_cb = ext2_vfs_mknod;
         node->inode->mkdir_cb = ext2_vfs_mkdir;
         node->inode->unlink_cb = ext2_vfs_unlink;
         node->inode->rmdir_cb = ext2_vfs_rmdir;
@@ -1338,6 +1375,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               dir_node->inode->nlink = child_inode.i_links_count;
               dir_node->inode->fs_id = dir_node->parent->inode->fs_id;
               dir_node->inode->create_cb = ext2_vfs_create;
+              dir_node->inode->mknod_cb = ext2_vfs_mknod;
               dir_node->inode->mkdir_cb = ext2_vfs_mkdir;
               dir_node->inode->unlink_cb = ext2_vfs_unlink;
               dir_node->inode->rmdir_cb = ext2_vfs_rmdir;
@@ -1353,8 +1391,12 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
             }
 						ext2_populate_vfs(fs, entry->inode, full_path);
 					} else {
+            enum vfs_node_type ntype =
+                ((child_inode.i_mode & EXT2_S_IFMT) == EXT2_S_IFIFO)
+                    ? VFS_FIFO
+                    : VFS_FILE;
             struct vfs_node *node =
-                vfs_add_node(full_path, VFS_FILE, 0,
+                vfs_add_node(full_path, ntype, 0,
                              child_inode.i_size, 0);
 						if (node) {
               struct ext2_inode_info *info = kmalloc(sizeof(struct ext2_inode_info));
@@ -1427,6 +1469,7 @@ static struct vfs_node *ext2_vfs_mount_cb(const char *source, u64 flags, void *d
   root->inode->data = info;
   root->inode->blk_dev = dev;
   root->inode->create_cb = ext2_vfs_create;
+  root->inode->mknod_cb = ext2_vfs_mknod;
   root->inode->mkdir_cb = ext2_vfs_mkdir;
   root->inode->unlink_cb = ext2_vfs_unlink;
   root->inode->rmdir_cb = ext2_vfs_rmdir;

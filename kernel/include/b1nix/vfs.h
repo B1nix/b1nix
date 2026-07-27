@@ -36,6 +36,7 @@ enum vfs_node_type {
   VFS_DIRECTORY = 3,
   VFS_SYMLINK = 4,
   VFS_SOCKET = 5,
+  VFS_FIFO = 6,
 };
 
 /* inode->flags: the VFS owns inode->data and must kfree() it on release. */
@@ -103,6 +104,12 @@ struct vfs_inode {
   u64 mtime;
   u64 ctime;
 
+  /* Named pipe (FIFO) backing buffer, non-NULL only while a VFS_FIFO node has
+   * at least one opener. Allocated on first open and dropped when the last
+   * reader and writer close, so a FIFO that nobody holds keeps no data — the
+   * same lifetime an anonymous pipe has. */
+  struct vfs_pipe *fifo;
+
   struct block_device *blk_dev;
   u32 fs_id; /* Unique ID for this filesystem instance */
 
@@ -130,6 +137,12 @@ struct vfs_inode {
   int (*create_cb)(struct vfs_node *dir, const char *name,
                    const char *full_path, u32 mode);
   int (*mkdir_cb)(struct vfs_node *dir, const char *name, u32 mode);
+  /* mknod: create a special file (only S_IFIFO is used today) as a real on-disk
+   * inode. Filesystems that cannot represent one leave this NULL and vfs_mknod
+   * reports -EOPNOTSUPP. The child VFS node is already linked into `dir` when
+   * this runs, so the implementation can find_child(dir, name) to attach its
+   * per-inode state, exactly as create_cb does. */
+  int (*mknod_cb)(struct vfs_node *dir, const char *name, u32 mode);
   int (*unlink_cb)(struct vfs_node *dir, const char *name);
   int (*rmdir_cb)(struct vfs_node *dir, const char *name);
   int (*rename_cb)(struct vfs_node *old_dir, const char *old_name,
@@ -189,6 +202,8 @@ struct vfs_fs {
 
 u64 vfs_get_unix_time(void);
 void vfs_init(void);
+/* tmpfs/ramfs/devtmpfs: RAM-backed mounts (see kernel/fs/tmpfs.c). */
+void tmpfs_init(void);
 /* Sleeping mutex for filesystem-wide metadata (allocator bitmaps, superblock
  * counters). Legal to hold across block I/O — never a spinlock. */
 void vfs_meta_lock_acquire(int *lock);
@@ -248,6 +263,17 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);
+
+/* mknod(2): only S_IFIFO (named pipes) and S_IFREG are creatable; character and
+ * block special files have no userspace-creatable backing in b1nix and return
+ * -EPERM, as they do for an unprivileged Linux process. */
+int vfs_mknod(const char *path, u32 mode, u64 dev);
+
+/* Open a VFS_FIFO node: allocates the shared buffer on first opener and applies
+ * POSIX rendezvous semantics (a blocking O_RDONLY waits for a writer and vice
+ * versa; O_NONBLOCK O_WRONLY without a reader fails with -ENXIO). Returns an fd
+ * or -errno; the caller keeps its own reference to `node`. */
+int vfs_fifo_open(struct vfs_node *node, int flags);
 int vfs_dup(int oldfd);
 int vfs_dup2(int oldfd, int newfd);
 int vfs_ftruncate(int fd, u64 length);

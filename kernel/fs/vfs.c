@@ -145,6 +145,26 @@ out:
   return res;
 }
 
+/* A mount root's ->parent is NULL: the names above it live on the node it was
+ * mounted over. Anything that walks the parent chain to build a path must step
+ * across that seam, or it silently produces the path *inside* the mount — e.g.
+ * "/cptest" for a directory that is really /run/cptest, which turns an
+ * openat(dirfd, "cptest") into a create at the root. Returns the mount point
+ * for a mount root, or NULL when `node` is not one.
+ *
+ * mounts[] is read without vfs_mount_lock here, matching the downward crossing
+ * in vfs_find_node_internal: entries are published root_node-last and callers
+ * already hold a reference to the node being walked. */
+static struct vfs_node *vfs_mount_point_of(const struct vfs_node *node) {
+  if (!node)
+    return 0;
+  for (int i = 0; i < MAX_MOUNTS; i++) {
+    if (mounts[i].used && mounts[i].root_node == node)
+      return mounts[i].mount_point;
+  }
+  return 0;
+}
+
 void vfs_register_fs(struct vfs_fs *fs) {
   fs->next = filesystems;
   filesystems = fs;
@@ -2070,6 +2090,11 @@ void vfs_init(void) {
   add_node("/dev", VFS_DIRECTORY, 0, 0, 0);
   add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
+  /* /run is the volatile runtime directory an init system expects (tmpfs on
+   * Linux). It is a plain in-memory VFS directory here, which is exactly what
+   * FIFOs need — /run/openrc/init.ctl and friends live in RAM and vanish on
+   * reboot, as they should. */
+  add_node("/run", VFS_DIRECTORY, 0, 0, 0);
   add_node("/var", VFS_DIRECTORY, 0, 0, 0);
   add_node("/mnt", VFS_DIRECTORY, 0, 0, 0);
   add_node("/proc", VFS_DIRECTORY, 0, 0, 0);
@@ -2198,6 +2223,14 @@ void vfs_repopulate_after_root_mount(void) {
   node = add_node("/tmp", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) {
     node->inode->mode = 01777; // Sticky bit + rwxrwxrwx
+    node->inode->uid = 0;
+    node->inode->gid = 0;
+    vfs_node_put(node);
+  }
+
+  node = add_node("/run", VFS_DIRECTORY, 0, 0, 0);
+  if (node && !IS_ERR(node)) {
+    node->inode->mode = 0755;
     node->inode->uid = 0;
     node->inode->gid = 0;
     vfs_node_put(node);
@@ -2480,6 +2513,16 @@ int vfs_open_flags(const char *path, int flags) {
   res = vfs_check_access(node, access_mask);
   if (res != 0) {
     vfs_node_put(node);
+    goto out;
+  }
+
+  /* A FIFO open binds to the shared pipe buffer instead of the node's data —
+   * including the POSIX rendezvous, so this must happen after the permission
+   * check but before any O_TRUNC handling (truncating a FIFO is a no-op). */
+  if (node->inode->type == VFS_FIFO) {
+    res = vfs_fifo_open(node, flags);
+    vfs_node_put(node);
+    node = NULL;
     goto out;
   }
 
@@ -3011,6 +3054,135 @@ int vfs_create(const char *path, u32 mode) {
   return res;
 }
 
+/* mknod(2). FIFOs on a VFS-owned directory (/dev, /run, /tmp) are plain
+ * in-memory nodes; on a real filesystem the driver's mknod_cb creates a genuine
+ * on-disk FIFO inode, so the node survives a remount. A filesystem without a
+ * mknod_cb reports -EOPNOTSUPP rather than silently creating a regular file.
+ * Character and block special files are not creatable at all (-EPERM, as for an
+ * unprivileged Linux process); S_IFREG is forwarded to the ordinary create
+ * path. */
+int vfs_mknod(const char *path, u32 mode, u64 dev) {
+  (void)dev;
+  if (!path)
+    return -EINVAL;
+  u32 fmt = mode & B1NIX_S_IFMT;
+  if (fmt == 0 || fmt == B1NIX_S_IFREG)
+    return vfs_create(path, mode & 07777);
+  if (fmt != B1NIX_S_IFIFO)
+    return -EPERM;
+
+  char *resolved = kmalloc(VFS_MAX_PATH);
+  if (!resolved)
+    return -ENOMEM;
+  vfs_resolve_path(path, resolved);
+
+  char *p_path = kmalloc(VFS_MAX_PATH);
+  char name[64];
+  if (!p_path) {
+    kfree(resolved);
+    return -ENOMEM;
+  }
+  if (split_parent_path(resolved, p_path, name) < 0) {
+    kfree(p_path);
+    kfree(resolved);
+    return -EINVAL;
+  }
+  struct vfs_node *parent = vfs_find_node_internal(p_path, 1, 0);
+  kfree(p_path);
+  kfree(resolved);
+  if (IS_ERR(parent))
+    return (int)PTR_ERR(parent);
+
+  int res = 0;
+  struct vfs_node *node = 0;
+  vfs_inode_lock(parent->inode);
+  if (parent->inode->type != VFS_DIRECTORY) {
+    res = -ENOTDIR;
+    goto out_unlock;
+  }
+  struct vfs_mount_entry *mnt = vfs_get_mount_for_node(parent);
+  if (mnt && (mnt->flags & MS_RDONLY)) {
+    res = -EROFS;
+    goto out_unlock;
+  }
+  struct vfs_node *existing = find_child(parent, name);
+  if (existing) {
+    vfs_node_put(existing);
+    res = -EEXIST;
+    goto out_unlock;
+  }
+  const struct cred *cred = get_current_cred();
+  if (cred && !vfs_get_node_perm(parent, cred, 2)) {
+    res = -EACCES;
+    goto out_unlock;
+  }
+  if (parent->inode->create_cb && !parent->inode->mknod_cb) {
+    res = -EOPNOTSUPP;
+    goto out_unlock;
+  }
+
+  node = alloc_node();
+  if (!node) {
+    res = -ENOMEM;
+    goto out_unlock;
+  }
+  node->inode = alloc_inode();
+  if (!node->inode) {
+    memset(node, 0, sizeof(*node));
+    node->deleted = 1;
+    __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
+    vfs_node_put(node);
+    node = 0;
+    res = -ENOMEM;
+    goto out_unlock;
+  }
+  copy_path(node->name, 64, name);
+  node->inode->type = VFS_FIFO;
+  node->inode->fs_id = parent->inode->fs_id;
+  node->parent = parent;
+  node->inode->mode = (mode & 07777) & ~scheduler_get_current_umask();
+  node->inode->uid = cred ? cred->euid : ROOT_UID;
+  node->inode->gid = cred ? cred->egid : ROOT_GID;
+  node->inode->nlink = 1;
+  node->inode->atime = node->inode->mtime = node->inode->ctime =
+      vfs_get_unix_time();
+  node->inode->blk_dev = parent->inode->blk_dev;
+  {
+    u64 _tlflags;
+    vfs_tree_write_acquire(&_tlflags);
+    node->next_sibling = parent->first_child;
+    parent->first_child = node;
+    vfs_tree_write_release(_tlflags);
+  }
+
+  if (parent->inode->mknod_cb) {
+    int err = parent->inode->mknod_cb(parent, name, node->inode->mode);
+    if (err < 0) {
+      u64 _tlflags;
+      vfs_tree_write_acquire(&_tlflags);
+      parent->first_child = node->next_sibling;
+      vfs_tree_write_release(_tlflags);
+      node->deleted = 1;
+      __atomic_store_n(&node->refcount, 1, __ATOMIC_RELAXED);
+      vfs_node_put(node);
+      node = 0;
+      res = err;
+      goto out_unlock;
+    }
+    /* The driver attached its per-inode state and unlink/setattr hooks; the
+     * node type stays VFS_FIFO so opens go to the pipe path, not to the
+     * filesystem's read/write callbacks. */
+    node->inode->type = VFS_FIFO;
+  }
+
+out_unlock:
+  vfs_inode_unlock(parent->inode);
+  if (res == 0 && node)
+    vfs_inotify_notify(parent, IN_CREATE, name);
+  vfs_node_put(parent);
+  return res;
+}
+
 struct vfs_node *vfs_find_node_by_fd(int fd) {
   struct vfs_handle *h = get_handle(fd);
   if (!h || h->kind != VFS_HANDLE_NODE)
@@ -3188,6 +3360,10 @@ static u32 vfs_node_type_mode(const struct vfs_node *node) {
     return B1NIX_S_IFCHR;
   if (node->inode->type == VFS_SYMLINK)
     return B1NIX_S_IFLNK;
+  if (node->inode->type == VFS_FIFO)
+    return B1NIX_S_IFIFO;
+  if (node->inode->type == VFS_SOCKET)
+    return B1NIX_S_IFSOCK;
   return B1NIX_S_IFREG;
 }
 static int vfs_stat_node(struct vfs_node *node, struct b1nix_stat *st) {
@@ -3901,8 +4077,20 @@ int vfs_fd_abspath(int fd, char *buf, usize size) {
   int n = 0;
   u64 flags;
   vfs_tree_read_acquire(&flags);
-  for (struct vfs_node *c = node; c && c->parent && n < 64; c = c->parent)
+  int steps = 0;
+  for (struct vfs_node *c = node; c && n < 64 && steps < 256; steps++) {
+    /* Crossing a mount seam upwards: the mount root contributes no name of its
+     * own — the mount point's name is the one on the path. */
+    struct vfs_node *mp = vfs_mount_point_of(c);
+    if (mp) {
+      c = mp;
+      continue;
+    }
+    if (!c->parent)
+      break;
     parts[n++] = c->name;
+    c = c->parent;
+  }
 
   usize pos = 0;
   if (n == 0) {
@@ -4281,7 +4469,16 @@ int vfs_get_node_path(struct vfs_node *node, char *buf, usize buf_len) {
   struct vfs_node *path_nodes[128];
   int count = 0;
   struct vfs_node *curr = node;
-  while (curr && count < 128) {
+  int steps = 0;
+  while (curr && count < 128 && steps < 256) {
+    steps++;
+    /* Same mount seam as in vfs_fd_abspath: step from a mount root to the node
+     * it covers instead of stopping at its NULL parent. */
+    struct vfs_node *mp = vfs_mount_point_of(curr);
+    if (mp) {
+      curr = mp;
+      continue;
+    }
     path_nodes[count++] = curr;
     if (curr->parent == curr || curr->parent == NULL) {
       break;
@@ -4514,7 +4711,12 @@ int vfs_memfd_create(const char *name, u32 flags) {
 int vfs_fcntl(int fd, int cmd, u64 arg) {
   struct vfs_handle *h = get_handle(fd);
   if (!h)
-    return -1;
+    return -EBADF; /* POSIX: a closed fd is EBADF, not the bare -1 that
+                    * userspace decodes as EPERM. BusyBox ash saves any open
+                    * fd 3 with fcntl(3, F_DUPFD, 10) before a redirection and
+                    * treats EBADF as "nothing to save"; EPERM aborted the
+                    * redirection instead, which broke `exec 3>&1` in every
+                    * OpenRC init script. */
   switch (cmd) {
   case B1NIX_F_DUPFD:
     return vfs_dup_min(fd, (int)arg);
@@ -4548,7 +4750,7 @@ int vfs_fcntl(int fd, int cmd, u64 arg) {
       return -EBADF;
     return filelock_set_lock(fd, cmd, (struct flock *)(usize)arg);
   default:
-    return -1;
+    return -EINVAL;
   }
 }
 
