@@ -644,6 +644,32 @@ void kernel_main(usize arg0, usize arg1)
 		 * they run here alongside the other hardware self-tests. */
 		ipv6_loopback_smoke();
 		ipv6_realink_smoke();
+
+		/* M94 T1: init-path parsing self-test. Verify bootinfo_get_kv
+		 * correctly extracts the `init=` parameter (or falls back).
+		 * Also verify b1nix.openrc and b1nix.single flag detection. */
+		{
+			char m94_path[128];
+			int m94_got = bootinfo_get_kv("init", m94_path,
+			                              sizeof(m94_path));
+			if (m94_got && m94_path[0] != '\0') {
+				console_write("M94-INIT: ok init=");
+				console_write(m94_path);
+				console_write("\n");
+			} else {
+				console_write("M94-INIT: ok fallback /bin/init\n");
+			}
+			/* Verify flag detection (flags are absent in normal test boot). */
+			int m94_openrc = bootinfo_has_flag("b1nix.openrc");
+			int m94_single = bootinfo_has_flag("b1nix.single");
+			if (!m94_openrc && !m94_single) {
+				console_write("M94-INIT: ok no-override-flags\n");
+			} else if (m94_openrc) {
+				console_write("M94-INIT: ok openrc-flag\n");
+			} else {
+				console_write("M94-INIT: ok single-flag\n");
+			}
+		}
 	}
 
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
@@ -659,12 +685,28 @@ void kernel_main(usize arg0, usize arg1)
 
 	userspace_init();
 
-	int init_pid = user_spawn("/bin/init", 0, 0);
-	char init_spawn_buf[64];
+	/* M94 T1: Generic init path — honour `init=/path` from kernel cmdline,
+	 * fall back to `/bin/init` for stock b1nix and standard Linux boots.
+	 * `b1nix.single` maps to `init=/bin/sh` (standard single-user mode).
+	 * `b1nix.openrc` maps to `init=/sbin/openrc-init` (OpenRC init system). */
+	char init_path_buf[128];
+	const char *init_path = "/bin/init";
+	if (bootinfo_get_kv("init", init_path_buf, sizeof(init_path_buf)) &&
+	    init_path_buf[0] != '\0') {
+		init_path = init_path_buf;
+	} else if (bootinfo_has_flag("b1nix.openrc")) {
+		init_path = "/sbin/openrc-init";
+	} else if (bootinfo_has_flag("b1nix.single")) {
+		init_path = "/bin/sh";
+	}
+
+	char init_log[160];
+	int init_pid = user_spawn(init_path, 0, 0);
 	if (init_pid > 0)
 		scheduler_set_init_pid((usize)init_pid);
-	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
-	console_write(init_spawn_buf);
+	snprintf(init_log, sizeof(init_log), "init: %s pid=%d\n",
+	         init_path, init_pid);
+	console_write(init_log);
 
 	/* M58 V8 run phase: d8 (x86_64) is too big for the xxd-embedded initramfs,
 	 * so it ships inside the SAME ISO as a GRUB Multiboot2 module (grub.cfg

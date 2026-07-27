@@ -28,6 +28,9 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_ld_musl_x86_64_so_1), INITRAMFS_EXECUTABLE},
     {"/lib/libc.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
 #endif
+    {"/sbin/.keep", "", 0, 0},
+    {"/etc/init.d/.keep", "", 0, 0},
+    {"/etc/conf.d/.keep", "", 0, 0},
     {"/mnt/iso/.keep", "", 0, 0},
     {"/mnt/root/.keep", "", 0, 0},
 };

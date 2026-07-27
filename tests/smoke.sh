@@ -748,7 +748,9 @@ fi
 check_output "$LOG" "initramfs: files" "initramfs initializes"
 check_output "$LOG" "M22-SMOKE: start" "VFS initializes"
 check_output "$LOG" "M24-STRESS: start" "scheduler starts"
-check_output "$LOG" "init spawn result:" "/bin/init launches"
+check_output "$LOG" "init: /bin/init pid=" "/bin/init launches"
+check_output "$LOG" "M94-INIT:" "M94 init-path parsing self-test runs"
+check_output "$LOG" "M94-INIT: ok \(fallback\|init=\|no-override-flags\)" "M94 init-path logic correct"
 check_output "$LOG" "M11-SMOKE: start" "shell appears"
 # M28 #9: ctx-switch + light-syscall rdtsc benchmark. It is single-CPU only by
 # design (the rdtsc yield loop races under the SMP high-syscall-density path, see

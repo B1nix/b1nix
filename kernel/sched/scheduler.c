@@ -2762,7 +2762,7 @@ void scheduler_exit_current(int exit_code) {
    * otherwise silent (arch signal delivery logs only fault signals), which made
    * this look like a hang rather than a kill. Always announce it. */
   if (g_init_pid && current_task->id == g_init_pid) {
-    console_write("INIT-EXIT: /bin/init exited, pid=");
+    console_write("INIT-EXIT: init exited, pid=");
     console_write_dec(current_task->id);
     console_write(" code=0x");
     console_write_hex64((u64)(unsigned)exit_code);

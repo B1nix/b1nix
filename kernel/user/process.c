@@ -1848,7 +1848,7 @@ void userspace_init(void) {
 }
 
 int user_spawn(const char *path, int argc, const char **argv) {
-  const char *default_env[] = {"PATH=/bin", 0};
+  const char *default_env[] = {"PATH=/bin:/sbin:/usr/bin:/usr/sbin", 0};
   return user_spawn_env(path, argc, argv, default_env);
 }
 
