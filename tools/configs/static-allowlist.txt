@@ -1,0 +1,17 @@
+# Executables allowed to be statically linked in the rootfs.
+#
+# Everything in b1nix links dynamically against /lib/libc.so — see
+# tools/check-dynamic.sh, which fails the build for anything not listed here.
+# One path per line, relative to the rootfs root, followed by '#' and the reason
+# the binary cannot be dynamic. An entry with no reason is an error: static
+# linking has to be an argued, reviewed decision, not a quiet `-static` in a
+# port script.
+#
+# Adding a line here is the expensive path on purpose. Try the shared libc
+# first; the loader handles PIE, TLS and dlopen, and a dynamic binary is what
+# every mainstream distribution ships.
+
+/bin/m40-linux-hello  # M40: a stock static Linux binary is the subject of the test — linking it dynamically would test our own loader instead of the Linux ABI
+/bin/native_smoke     # M26: built inside the guest by the native toolchain, whose default output is what is being proven
+/bin/m67-rust         # M67: committed prebuilt blob (tools/m67/hello_b1nix.elf); rustc's x86_64-unknown-b1nix target spec is crt-static, so converting it means changing the target JSON and rebuilding with the Rust toolchain present
+/bin/make             # TRANSITIONAL — GNU Make is slated for replacement; do not spend effort converting it. Cross-built by tools/toolchain/build-make.sh with -Wl,-Ttext-segment=0x2000000, the fixed-address non-PIE model the cross-cc wrapper still uses. Drop this line when make goes away.

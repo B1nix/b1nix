@@ -81,9 +81,8 @@ download_ports() {
 
 local_ports() {
 	export B1NIX_ARCH="$ARCH"
-	echo "BUILD bash curl wget dropbear netsurf [$PKG_ARCH]"
+	echo "BUILD bash curl dropbear netsurf [$PKG_ARCH]"
 	curl_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-curl.sh")"
-	wget_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-wget.sh")"
 	dropbear_src="$("$ROOT_DIR/tools/ports/build-dropbear.sh" all)"
 	netsurf_bin="$("$ROOT_DIR/tools/ports/build-netsurf-fb.sh")"
 
@@ -93,11 +92,6 @@ local_ports() {
 		cp "$curl_dir/bin/curl" "$ROOTFS/bin/curl"
 	else
 		cp "$ROOT_DIR/build/$ARCH/ports/curl/src/curl" "$ROOTFS/bin/curl"
-	fi
-	if [ -f "$wget_dir/bin/wget" ]; then
-		cp "$wget_dir/bin/wget" "$ROOTFS/bin/wget"
-	else
-		cp "$ROOT_DIR/build/$ARCH/ports/wget/src/wget" "$ROOTFS/bin/wget"
 	fi
 	cp "$dropbear_src/dropbearmulti" "$ROOTFS/bin/dropbearmulti"
 	for name in dropbear dbclient dropbearkey; do ln -sfn dropbearmulti "$ROOTFS/bin/$name"; done
@@ -160,9 +154,6 @@ overlay_local_ports() {
 
 	local_curl="$ROOT_DIR/build/$ARCH/ports/curl/install/bin/curl"
 	[ -f "$local_curl" ] && { cp "$local_curl" "$ROOTFS/bin/curl"; echo "OVERLAY curl (locally built) [$PKG_ARCH]"; }
-
-	local_wget="$ROOT_DIR/build/$ARCH/ports/wget/install/bin/wget"
-	[ -f "$local_wget" ] && { cp "$local_wget" "$ROOTFS/bin/wget"; echo "OVERLAY wget (locally built) [$PKG_ARCH]"; }
 
 	local_bash="$(ls "$ROOT_DIR"/build/src/bash/"$TRIPLET"/bash-*/bash 2>/dev/null | head -1)"
 	[ -n "${local_bash:-}" ] && { cp "$local_bash" "$ROOTFS/bin/bash"; echo "OVERLAY bash (locally built) [$PKG_ARCH]"; }

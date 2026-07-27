@@ -50,9 +50,6 @@ BUILTINS_LIB="$(clang -print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64
 DYN_CRT0="$MUSL_LIB/Scrt1.o"
 DYN_FLAGS="-pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LIB"
 DYN_LIBC="$MUSL_LIB/crti.o -lc $MUSL_LIB/crtn.o $BUILTINS_LIB"
-# Linker script: linker-cxx.ld (GCC/libgcc) vs linker-libcxx.ld (libc++/libunwind:
-# maps the program headers + keeps .eh_frame_hdr so libunwind unwinds via
-# dl_iterate_phdr — required even for the statically-folded libc++ in this exe).
 LINKER_ARGS=""
 # Use LLVM runtimes when available, else fall back to libgcc. With libc++ the
 # unwinder is already inside the folded libc++abi.a (STDLIB_ABI_CROSS_A), so do NOT

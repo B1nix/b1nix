@@ -73,7 +73,6 @@ INITRAMFS_TCC_FILES_INC := $(INC_DIR)/initramfs_tcc_files.inc
 CFLAGS_EXTRA += -DB1NIX_NO_B1CC
 INITRAMFS_B1CC_M34_INC :=
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
-INITRAMFS_WGET_INC := $(INC_DIR)/initramfs_wget.inc
 INITRAMFS_CACERT_INC := $(INC_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(INC_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(INC_DIR)/initramfs_dropbear.inc
@@ -283,7 +282,6 @@ INITRAMFS_INCS := \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
-WGET_ELF := build/$(ARCH)/ports/wget/install/bin/wget
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/$(ARCH)/ports/dropbear/dropbearmulti
 BASH_VERSION_NUM := 5.2.37
@@ -425,6 +423,7 @@ KERNEL_SOURCES := \
 	kernel/fs/ext4.c \
 	kernel/fs/btrfs.c \
 	kernel/fs/procfs.c \
+	kernel/fs/tmpfs.c \
 	kernel/fs/sysfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
@@ -510,7 +509,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-live iso-test iso-full \
+.PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-openrc iso-live iso-test iso-full check-dynamic \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
@@ -595,8 +594,7 @@ $(BUILD_DIR)/.userspace-headers-installed: \
 	$(wildcard userspace/include/netinet/*.h) \
 	$(wildcard userspace/include/sys/*.h) \
 	$(wildcard userspace/crt/*.S) \
-	userspace/Makefile \
-	userspace/linker.ld
+	userspace/Makefile
 	# Build libs + headers into sysroot in one serialized pass, then mark done.
 	# Port scripts check B1NIX_HEADERS_INSTALLED=1 and skip their own sub-makes.
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install-headers-libs
@@ -1115,12 +1113,6 @@ $(MBEDTLS_LIB): tools/ports/build-mbedtls.sh
 $(LIBUNISTRING_LIB): tools/ports/build-libunistring.sh
 	B1NIX_ARCH=$(ARCH) tools/ports/build-libunistring.sh >/dev/null
 
-$(WGET_ELF): tools/ports/build-wget.sh tools/toolchain/bin/b1nix-autotools-cc $(OPENSSL_LIB) $(LIBIDN2_LIB) $(LIBPSL_LIB)
-	B1NIX_TLS="$(B1NIX_TLS)" tools/ports/build-wget.sh
-
-$(INITRAMFS_WGET_INC): $(WGET_ELF)
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_wget_elf $(WGET_ELF) > $@
 
 CACERT_PEM := build/cacert.pem
 $(CACERT_PEM): tools/images/fetch-cacert.sh
@@ -1309,7 +1301,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: check-b1cc-sync check-tcc-sync root-image $(KERNEL_ELF)
+iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
@@ -1330,40 +1322,57 @@ iso: check-b1cc-sync check-tcc-sync root-image $(KERNEL_ELF)
 	fi
 	@echo "============================================================"
 
-iso-core: root-image $(KERNEL_ELF)
+iso-core: root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-core/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
 	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-core/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
+	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
 
-iso-graphics: root-image $(KERNEL_ELF)
+iso-graphics: root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-graphics/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
 	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-graphics/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
+	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
 
-iso-shell: root-image $(KERNEL_ELF)
+# OpenRC instance: boots the real init system as PID 1 (no test orchestrator) and
+# lets it drive sysinit/boot/default, then a local.d hook asks PID 1 to power the
+# machine off through /run/openrc/init.ctl — the control-FIFO path openrc-shutdown
+# and telinit use. A clean poweroff is the proof that the channel works.
+iso-openrc: root-image check-dynamic $(KERNEL_ELF)
+	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
+	@mkdir -p $(BUILD_DIR)/iso-openrc/boot/grub
+	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-openrc/boot/kernel.elf
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-openrc/boot/rootfs.img
+	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
+	     -e 's|@ARCH@|$(ARCH)|g' \
+	     -e 's|@CMDLINE@|init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest|g' \
+	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
+	     -e 's|@MODULE_CMD2@||g' \
+	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-openrc/boot/grub/grub.cfg
+	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-openrc.iso $(BUILD_DIR)/iso-openrc
+
+iso-shell: root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-shell/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
 	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-shell/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
+	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
@@ -1384,7 +1393,7 @@ iso-v8: $(KERNEL_ELF) root-image
 	cp $(BUILD_ROOT)/v8-out/v8-ext4.img $(BUILD_DIR)/iso-v8/boot/v8.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.v8run b1nix.smoke=v8|g' \
+	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.v8run b1nix.smoke=v8|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     -e 's|@MODULE_CMD2@|module2 /boot/v8.img v8.img|g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-v8/boot/grub/grub.cfg
@@ -1393,7 +1402,7 @@ iso-v8: $(KERNEL_ELF) root-image
 # config and matches the jitless d8 on v8-ext4.img. The JIT d8 is exercised
 # manually (build the default ISO with b1nix.v8jit + the v8-jit-ext4.img disk).
 
-iso-live: root-image $(KERNEL_ELF)
+iso-live: root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-live/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live/boot/kernel.elf
@@ -1416,14 +1425,14 @@ disk-iso: disk-image iso-live
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-installer.iso $(BUILD_DIR)/iso-live
 	@printf 'created %s\n  boot it, then run:  b1nix_install /dev/<target-disk>\n' "$(BUILD_DIR)/b1nix-installer.iso"
 
-iso-test: root-image $(KERNEL_ELF)
+iso-test: root-image check-dynamic $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-test/boot/kernel.elf
 	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
+	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) init=/bin/init b1nix.test=1|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
 	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
@@ -1480,7 +1489,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(WGET_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
+install-ports: userspace-install busybox-package install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1699,6 +1708,13 @@ endif
 	@debugfs -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@debugfs -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
+
+# Everything in the rootfs links dynamically against /lib/libc.so. This gate
+# fails the build on a statically linked executable that is not listed (with a
+# reason) in tools/configs/static-allowlist.txt — so a `-static` slipped into a
+# port script breaks the ISO instead of quietly shipping a second copy of libc.
+check-dynamic:
+	@sh tools/check-dynamic.sh $(BUILD_DIR)/rootfs
 
 check-ports:
 	@leaked=0; \

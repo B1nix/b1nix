@@ -73,7 +73,11 @@ ROOTFS   := ../build/$(B1NIX_ARCH)/rootfs
 # Strong utmp/utmpx overrides for musl's weak no-op stubs (real login accounting).
 UTMP_OBJ := $(BUILD)/compat/utmp.o
 GUI_LIB  := $(BUILD)/libb1gui.a
-LINKER   := linker.ld
+# No link script for the smoke binaries: they are musl PIEs, so the loader picks
+# the base (randomized under b1nix.aslr) instead of a fixed address baked into a
+# script — GEN_LINKER/BESPOKE_LINKER stay empty, see the -T guards below.
+# linker.ld itself is still used by the tools/toolchain/bin/b1nix-*cc wrappers
+# for legacy static links.
 
 # ── Link model ────────────────────────────────────────────────────────────
 # LINK=musl (default): real userspace ld.so — links against musl's libc.so
@@ -1020,7 +1024,7 @@ endif
 	@mkdir -p $(ROOTFS)/etc
 	@printf "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n" > $(ROOTFS)/etc/passwd
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
-	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
 	@printf "/bin/sh\n/bin/bash\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
 	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/bash/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C

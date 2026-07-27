@@ -34,10 +34,6 @@ MUSL_USR="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 SHARED_LIBC="$UB/libc.so.1"
 STDCXX_SO=""; SHARED_LIBGCC=""; CXXLIB_SO=""
 CXX_COMPAT=""
-# linker-cxx.ld (GCC/libgcc model) vs linker-libcxx.ld (libc++/libunwind: maps the
-# program headers + keeps .eh_frame_hdr so libunwind unwinds via dl_iterate_phdr).
-LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
-[ "${B1NIX_CXX_STDLIB:-}" = "libc++" ] && LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
 if [ "${B1NIX_LINK:-dynamic}" = "static" ] || [ ! -f "$SHARED_LIBC" ]; then
   DYN_CRT0="$UB/crt/crt0.o"; DYN_FLAGS=""; DYN_LIBC="--whole-archive $UB/libb1nix.a --no-whole-archive"
 else
@@ -101,7 +97,7 @@ fi
 # libstdc++.so.6 provides them) — left unquoted so they expand to nothing.
 # $SHARED_LIBGCC (-lgcc_s) goes before the static-libgcc group so the shared
 # unwinder wins; $STDCXX_SO (the shared libstdc++) goes after, before libc.
-"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections \
+"$LD" -m "$LDEMU" --gc-sections \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$OBJ" "$CXX_COMPAT" $SHARED_LIBGCC \
   --start-group "$LITEHTML/lib/liblitehtml.a" "$LITEHTML/lib/libgumbo.a" \

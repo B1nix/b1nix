@@ -75,7 +75,11 @@ MUSL_CRT1="$MUSL_LIB_DIR/crt1.o"
 MUSL_CRTI="$MUSL_LIB_DIR/crti.o"
 MUSL_CRTN="$MUSL_LIB_DIR/crtn.o"
 MUSL_LIBA="$MUSL_LIB_DIR/libc.a"
-LINKER="$USR/linker-cxx.ld"  # keeps .eh_frame/.gcc_except_table for exceptions
+# No linker script: lld's default layout already emits PT_GNU_EH_FRAME and keeps
+# .eh_frame/.gcc_except_table (the link passes --eh-frame-hdr explicitly), which
+# is all libunwind needs to find each object's FDEs through dl_iterate_phdr. The
+# scripts existed to undo the DISCARDs of the old userspace/linker.ld, which is
+# gone.
 # Relative target paths for `make -C "$USR"`: the userspace Makefile's rules are
 # relative to build/$(B1NIX_ARCH)/..., so an absolute path matches no rule.
 REL_LIB="build/$ARCH/libb1nix.a"
@@ -166,11 +170,6 @@ if [ "$IS_COMPILE_ONLY" -eq 0 ] && { [ ! -f "$LIBCXX_RT/lib/libc++.a" ] || [ ! -
 fi
 STDLIB_A="$LIBCXX_RT/lib/libc++.a"
 STDLIB_ABI_A="$LIBCXXABI_RT/lib/libc++abi.a"
-# libc++ unwinds via libunwind + dl_iterate_phdr + PT_GNU_EH_FRAME, so it needs
-# the linker script that MAPS the program headers and KEEPs .eh_frame_hdr (the
-# default linker-cxx.ld is the libgcc/__register_frame variant and does neither,
-# which segfaults libunwind::findUnwindSectionsByPhdr on the first throw).
-LINKER="$USR/linker-libcxx.ld"
 echo "  C++ stdlib: LLVM libc++" >&2
 
 # Shared libc++: in dynamic mode link libc++.so.1 + libc++abi.so.1 (built by
@@ -373,12 +372,12 @@ post_crt_args=()
 for f in $POST_CRT; do post_crt_args+=("$f"); done
 
 if [ -n "$UNWIND_RUNTIME" ]; then
-  "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
+  "$LD" -m "$LDEMU" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "$UNWIND_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"
 else
-  "$LD" -m "$LDEMU" -T "$LINKER" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
+  "$LD" -m "$LDEMU" "${dyn_extra_args[@]+${dyn_extra_args[@]}}" --gc-sections -o "$output" \
     "${pre_crt_args[@]+${pre_crt_args[@]}}" "${objs[@]}" \
     --start-group "${stdlib_a_args[@]+${stdlib_a_args[@]}}" "${stdlib_abi_a_args[@]+${stdlib_abi_a_args[@]}}" "$CRT_RUNTIME" "${group_libc_args[@]+${group_libc_args[@]}}" --end-group \
     "${cxxlib_so_args[@]+${cxxlib_so_args[@]}}" "${post_group_args[@]+${post_group_args[@]}}" "${post_crt_args[@]+${post_crt_args[@]}}"

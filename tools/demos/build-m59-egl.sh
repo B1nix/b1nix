@@ -86,11 +86,7 @@ if [ "${B1NIX_LINK:-dynamic}" = "static" ]; then
 else
   DYN_CRT0="$UB/crt/crt0-dynamic.o"; DYN_FLAGS="--dynamic-linker /lib/ld-b1nix.so -z norelro --hash-style=sysv"; DYN_LIBC="$UB/libc.so.1"
 fi
-# Linker script: linker-cxx.ld (GCC/libgcc) vs linker-libcxx.ld (libc++/libunwind:
-# maps the program headers + keeps .eh_frame_hdr for dl_iterate_phdr unwinding).
-LINKER_LD="$ROOT_DIR/userspace/linker-cxx.ld"
 if [ "${B1NIX_CXX_STDLIB:-}" = "libc++" ]; then
-  LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
   DYN_FLAGS="$DYN_FLAGS --eh-frame-hdr"
 fi
 # Use LLVM runtimes when available, else fall back to libgcc. With libc++ the
@@ -108,7 +104,7 @@ fi
 
 # Link Mesa as shared library (-lOSMesa).
 # shellcheck disable=SC2086
-"$LD" -m "$LDEMU" -T "$LINKER_LD" --gc-sections --allow-shlib-undefined \
+"$LD" -m "$LDEMU" --gc-sections --allow-shlib-undefined \
   --allow-multiple-definition $DYN_FLAGS -o "$OUT" \
   "$DYN_CRT0" "$SMOKE_OBJ" "$EGL_OBJ" \
   -L "$MESA_LIB" \

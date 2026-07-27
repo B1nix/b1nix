@@ -7,7 +7,8 @@
 # clang has no b1nix driver, so linking through `clang --target=x86_64-b1nix`
 # delegates to gcc and fails. Instead we override CMAKE_<LANG>_LINK_EXECUTABLE and
 # CMAKE_CXX_CREATE_SHARED_LIBRARY to call ld.lld directly with the b1nix recipe:
-#   - executables: crt0-dynamic.o + fixed base via linker-libcxx.ld + /lib/ld-b1nix.so
+#   - executables: crt0-dynamic.o + /lib/ld-b1nix.so (legacy: this generator still
+#     targets the retired b1nix dynamic linker and needs its own musl pass)
 #   - shared libs: -shared, base 0 (PIC), NEEDED libc++.so.1/libc++abi.so.1/libc.so.1
 # Both fold static compiler-rt for builtins (no libgcc) and resolve the C++ runtime
 # from the shared libc++.so.1 (no libstdc++).
@@ -45,7 +46,6 @@ COMPILER_RT="$TB/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 LIBUNWIND_A="$TB/llvm-runtimes-build/install/lib/libunwind.a"
 CRT0="$ROOT/userspace/build/$ARCH/crt/crt0-dynamic.o"
 LIBC_SO="$ROOT/userspace/build/$ARCH/libc.so.1"
-LDSCRIPT="$ROOT/userspace/linker-libcxx.ld"
 UINC="$ROOT/userspace/include"
 SYSROOT="$ROOT/build/x86_64/rootfs"
 
@@ -78,7 +78,6 @@ set -e
 mode="\$1"; shift
 LD="$LD"
 CRT0="$CRT0"
-LDSCRIPT="$LDSCRIPT"
 LIBCXX_A="$LIBCXX_A"
 LIBCXXABI_A="$LIBCXXABI_A"
 LIBUNWIND_A="$LIBUNWIND_A"
@@ -103,7 +102,7 @@ else
   # exe: libLLVM.so (in \$args via LINK_LIBRARIES) exports libc++; the static
   # group only fills symbols it does not export. crt0 first, fixed base.
   # shellcheck disable=SC2086
-  exec "\$LD" -m elf_x86_64 -T "\$LDSCRIPT" --gc-sections --allow-multiple-definition -z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so "\$CRT0" \$args \
+  exec "\$LD" -m elf_x86_64 --gc-sections --allow-multiple-definition -z norelro --hash-style=sysv --eh-frame-hdr --dynamic-linker /lib/ld-b1nix.so "\$CRT0" \$args \
     --start-group "\$LIBCXX_A" "\$LIBCXXABI_A" "\$LIBUNWIND_A" "\$COMPILER_RT" --end-group "\$LIBC"
 fi
 EOF
@@ -145,7 +144,7 @@ set(CMAKE_C_RESPONSE_FILE_LINK_FLAG "@")
 set(CMAKE_CXX_RESPONSE_FILE_LINK_FLAG "@")
 
 # Link through the b1nix ld.lld driver (translates -Wl,/-lrt/-ldl, adds recipe).
-# Executable: dynamic, fixed base 0x2000000 via linker-libcxx.ld, crt0 first.
+# Executable: dynamic, lld default layout, crt0 first.
 set(CMAKE_C_LINK_EXECUTABLE
     "$DRIVER exe <LINK_FLAGS> <OBJECTS> -o <TARGET> <LINK_LIBRARIES>")
 set(CMAKE_CXX_LINK_EXECUTABLE

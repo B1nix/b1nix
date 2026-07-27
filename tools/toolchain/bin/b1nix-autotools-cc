@@ -57,10 +57,7 @@ for arg in "$@"; do
   fi
 done
 
-LIB="$USR/build/$B1NIX_ARCH/libb1nix.a"
-CRT0="$USR/build/$B1NIX_ARCH/crt/crt0.o"
 SHARED_LIBC="$USR/build/$B1NIX_ARCH/libc.so.1"
-DYNAMIC_CRT0="$USR/build/$B1NIX_ARCH/crt/crt0-dynamic.o"
 # musl static-link objects (M92): a caller-requested -static link (Rust's ET_EXEC
 # targets, crt-static-default) must use musl's own crt1/crti/crtn + libc.a, not
 # the retired in-house libb1nix.a/crt0.o — those Makefile targets no longer
@@ -77,16 +74,12 @@ MUSL_SO="$MUSL_LIB_DIR/libc.so"
 # `make` must be handed the RELATIVE target, not the absolute path (an absolute
 # path matches no rule → "No rule to make target"). Triggered on a clean build
 # when a port's configure runs the compiler before libc.so.1 has been built.
-REL_LIB="build/$B1NIX_ARCH/libb1nix.a"
-REL_CRT0="build/$B1NIX_ARCH/crt/crt0.o"
 REL_SHARED_LIBC="build/$B1NIX_ARCH/libc.so.1"
 REL_DYNAMIC_CRT0="build/$B1NIX_ARCH/crt/crt0-dynamic.o"
 # Default linker script is the plain C one. C++ ports that fold libc++/libjxl and
-# rely on exceptions must set B1NIX_LINKER to userspace/linker-libcxx.ld (which
 # KEEPs .eh_frame/.eh_frame_hdr/.gcc_except_table + the .ctors.* static-init glob)
 # and pass --eh-frame-hdr via B1NIX_LD_EXTRA — otherwise C++ unwinding is dead
 # (e.g. NetSurf's libjxl decode silently fails). See tools/ports/build-netsurf-fb.sh.
-LINKER="${B1NIX_LINKER:-$USR/linker.ld}"
 LD="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)"
 CLANG="${B1NIX_CLANG:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang)}"
 if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
@@ -161,15 +154,6 @@ if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" = "dynamic" ] &&
    { [ ! -f "$MUSL_SCRT1" ] || [ ! -f "$MUSL_SO" ]; }; then
   [ -f "$SHARED_LIBC" ] && [ -f "$DYNAMIC_CRT0" ] ||
     make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_SHARED_LIBC" "$REL_DYNAMIC_CRT0"
-fi
-# Only the legacy libb1nix.a static path needs building on demand. A dynamic
-# link doesn't touch $LIB/$CRT0 at all, and a musl static link (crt1.o/libc.a
-# already present from build-musl.sh) supersedes it — that Makefile target no
-# longer exists post-musl-migration, so attempting it unconditionally here
-# hard-fails every static-musl link with "No rule to make target ...libb1nix.a".
-if [ "$B1NIX_NO_RUNTIME" -eq 0 ] && [ "$B1NIX_LINK" != "dynamic" ] &&
-   { [ ! -f "$MUSL_CRT1" ] || [ ! -f "$MUSL_LIBA" ]; }; then
-  [ -f "$LIB" ] && [ -f "$CRT0" ] || make B1NIX_ARCH="$B1NIX_ARCH" -C "$USR" -s "$REL_LIB" "$REL_CRT0"
 fi
 
 CLANG_RES_DIR="$(clang -print-resource-dir 2>/dev/null || true)"
@@ -374,26 +358,19 @@ with open(f, 'r+b') as fh:
 " "$output" 2>/dev/null || true
   fi
   exit "$ld_status"
-elif [ "$B1NIX_LINK" = "dynamic" ]; then
-  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" --dynamic-linker /lib/ld-b1nix.so \
-    -z norelro --hash-style=sysv -o "$output" "$DYNAMIC_CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
-    "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "$SHARED_LIBC"
-elif [ -f "$MUSL_CRT1" ] && [ -f "$MUSL_LIBA" ]; then
-  # musl static ET_EXEC (Rust's crt-static-default target, or any other caller
-  # that passes -static): crt1+crti / objs / libc.a / crtn, same fixed load
-  # base as every other b1nix static binary via $LINKER.
-  "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" \
-    "$MUSL_CRT1" "$MUSL_CRTI" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" \
-    "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} "$MUSL_LIBA" "$MUSL_CRTN"
-  # Mark ELFOSABI_LINUX (3) so the kernel routes this binary's syscalls through
-  # the Linux-ABI translation layer, matching b1nix-musl-cc's static path.
-  python3 -c "
-import sys
-f = sys.argv[1]
-with open(f, 'r+b') as fh:
-    fh.seek(7)
-    fh.write(bytes([3]))
-" "$output" 2>/dev/null || true
 else
-  exec "$LD" -m "$LD_EMULATION" -T "$LINKER" -o "$output" "$CRT0" "${objs[@]}" "${libdirs[@]}" "${linkline[@]}" "${runtime_libs[@]}" ${B1NIX_LD_EXTRA:-} --whole-archive "$LIB" --no-whole-archive
+  # Everything else used to fall back to a fixed-address static link (the old
+  # b1nix libc.a/crt0.o, or musl's libc.a through userspace/linker.ld). Those
+  # paths are gone: b1nix ships dynamic PIEs only, and tools/check-dynamic.sh
+  # rejects a static executable in the rootfs anyway. Failing here is the point
+  # — a caller that cannot link dynamically has a problem to fix, not a flag to
+  # switch.
+  echo "b1nix-autotools-cc: refusing to link '$output' statically." >&2
+  echo "  b1nix links dynamically against /lib/libc.so; see the port scripts" >&2
+  echo "  under tools/ports/ for the flags, and tools/configs/static-allowlist.txt" >&2
+  echo "  for the (reasoned) exceptions." >&2
+  if [ ! -f "$MUSL_SCRT1" ] || [ ! -f "$MUSL_SO" ]; then
+    echo "  musl's Scrt1.o/libc.so are missing — run tools/ports/build-musl.sh." >&2
+  fi
+  exit 1
 fi
