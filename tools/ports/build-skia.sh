@@ -49,8 +49,30 @@ fi
 # Serialize concurrent invocations
 mkdir -p "$BUILD_DIR" "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 LOCK="$BUILD_DIR/.build-lock"
-while ! mkdir "$LOCK" 2>/dev/null; do sleep 1; done
-trap 'rmdir "$LOCK" 2>/dev/null || true' EXIT INT TERM
+acquire_lock() {
+  WAIT_COUNT=0
+  while ! mkdir "$LOCK" 2>/dev/null; do
+    WAIT_COUNT=$((WAIT_COUNT + 1))
+    if [ -f "$LOCK/pid" ]; then
+      LOCK_PID="$(cat "$LOCK/pid" 2>/dev/null || echo "")"
+      if [ -n "$LOCK_PID" ] && ! kill -0 "$LOCK_PID" 2>/dev/null; then
+        echo "Removing stale build lock held by dead PID $LOCK_PID..." >&2
+        rm -rf "$LOCK" 2>/dev/null || true
+        continue
+      fi
+    elif [ -d "$LOCK" ]; then
+      if [ "$WAIT_COUNT" -ge 3 ]; then
+        echo "Removing lock directory missing PID file..." >&2
+        rm -rf "$LOCK" 2>/dev/null || true
+        continue
+      fi
+    fi
+    sleep 1
+  done
+  echo "$$" > "$LOCK/pid" 2>/dev/null || true
+}
+acquire_lock
+trap 'rm -rf "$LOCK" 2>/dev/null || true' EXIT INT TERM
 
 
 # --- Step 1: Fetch Skia source -----------------------------------------------

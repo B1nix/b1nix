@@ -4,10 +4,11 @@
 #
 # Ships the self-host module (tools/inguest/build-selfhost-module.sh) as the ram0
 # ext4 GRUB module and boots with b1nix.selfhostbuild, which makes the kernel
-# (kernel/main.c run_selfhost_build) compile every kernel TU with clang and link
-# them with ld.lld, then verify the produced kernel.elf. Mirrors the rustc/clang
-# proofs. Slow: ~92 clang invocations, each loading the 94MB clang via the M69
-# loader — give it a long timeout.
+# spawn /mnt/build/bin/selfhost-build (userspace ELF) that reads srcs.txt,
+# compiles every kernel TU with clang, and links them with ld.lld, then verifies
+# the produced kernel.elf. Mirrors the rustc/clang proofs. Slow: ~92 clang
+# invocations, each loading the 94MB clang via the M69 loader — give it a long
+# timeout.
 set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/../.." && pwd)"

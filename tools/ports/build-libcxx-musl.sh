@@ -29,9 +29,11 @@ MUSL_SYSROOT="$PROJECT_DIR/build/x86_64/ports/musl/install"
 OS="$(uname -s)"
 if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); fi
 
-# Verify prerequisites
-[ -d "$SRC_DIR" ] || { echo "LLVM sources not found at $SRC_DIR — run build-llvm-runtimes.sh first" >&2; exit 1; }
-[ -f "$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib/libcompiler_rt.a" ] || { echo "compiler-rt not found — run build-llvm-runtimes.sh first" >&2; exit 1; }
+CRT_A="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+if [ ! -f "$CRT_A" ]; then
+    CRT_A="$(clang -print-resource-dir 2>/dev/null)/lib/linux/libclang_rt.builtins-x86_64.a"
+fi
+[ -f "$CRT_A" ] || { echo "compiler-rt not found — run build-llvm-runtimes.sh first" >&2; exit 1; }
 
 # build-musl.sh installs musl flat (install/lib, install/include — same layout
 # as every other port). CMAKE_SYSROOT/clang expect the Linux-sysroot
@@ -163,7 +165,9 @@ cp -R "$LIBCXX_HDR_DIR/"* "$MUSL_SYSROOT/usr/include/c++/v1/"
 
 # ── Link shared libraries ──
 LD_BIN="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
-CRT_A="$PROJECT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+if [ ! -f "$CRT_A" ]; then
+    CRT_A="$(clang -print-resource-dir 2>/dev/null)/lib/linux/libclang_rt.builtins-x86_64.a"
+fi
 LIBC_SO="$MUSL_SYSROOT/usr/lib/libc.so"
 ABI_SO="$MUSL_SYSROOT/usr/lib/libc++abi.so.1"
 CXX_SO="$MUSL_SYSROOT/usr/lib/libc++.so.1"
@@ -182,7 +186,7 @@ EOF
 echo "Linking shared libc++abi.so.1..."
 "$LD_BIN" -shared --hash-style=sysv -soname libc++abi.so.1 --eh-frame-hdr -o "$ABI_SO" \
     --whole-archive "$MUSL_SYSROOT/usr/lib/libc++abi.a" --no-whole-archive \
-    -L"$MUSL_SYSROOT/usr/lib" "$LIBC_SO" "$CRT_A" \
+    -L"$MUSL_SYSROOT/usr/lib" -l:libc.so "$CRT_A" \
     --version-script "$VSCRIPT" \
     --allow-shlib-undefined
 rm -f "$VSCRIPT"
@@ -191,21 +195,55 @@ ln -sf libc++abi.so.1 "$MUSL_SYSROOT/usr/lib/libc++abi.so"
 echo "Linking shared libc++.so.1..."
 "$LD_BIN" -shared --hash-style=sysv -soname libc++.so.1 --eh-frame-hdr -o "$CXX_SO" \
     --whole-archive "$MUSL_SYSROOT/usr/lib/libc++.a" --no-whole-archive \
-    -L"$MUSL_SYSROOT/usr/lib" "$ABI_SO" "$LIBC_SO" "$CRT_A" \
+    -L"$MUSL_SYSROOT/usr/lib" -l:libc++abi.so.1 -l:libc.so "$CRT_A" \
     --allow-shlib-undefined
 ln -sf libc++.so.1 "$MUSL_SYSROOT/usr/lib/libc++.so"
 
-# patchelf sonames
-if command -v patchelf >/dev/null 2>&1; then
-    for so in "$ABI_SO" "$CXX_SO"; do
-        for n in $(patchelf --print-needed "$so" 2>/dev/null); do
-            case "$n" in
-                */libc.so) patchelf --replace-needed "$n" libc.so "$so" 2>/dev/null || true ;;
-                */libc++abi.so.1) patchelf --replace-needed "$n" libc++abi.so.1 "$so" 2>/dev/null || true ;;
-            esac
-        done
+# Rewrite absolute-path DT_NEEDED entries to bare basenames.
+# ld.lld with `-l:libc.so` (full filename) records the *resolved input path*
+# — i.e. the absolute host build path — as DT_NEEDED when the input lacks a
+# DT_SONAME. musl's libc.so historically had no soname, so DT_NEEDED came out
+# as "/home/.../build/x86_64/ports/musl/install/lib/libc.so", which musl's
+# ld.so then tries to open verbatim at load time → ENOENT (every C++ binary
+# loaded by the dynamic linker silently lost its C++ runtime). Rewrite to the
+# bare basename so musl's ld.so resolves it via its default /lib search path.
+rewrite_needed() {
+    so="$1"; from="$2"; to="$3"
+    if command -v patchelf >/dev/null 2>&1; then
+        patchelf --replace-needed "$from" "$to" "$so"
+    else
+        # No patchelf: lld records the path verbatim — re-link with a DT_NEEDED
+        # filter. As a last-resort in-place fix, this is not available without
+        # patchelf; warn loudly.
+        echo "build-libcxx-musl.sh: WARNING — patchelf not found; cannot rewrite DT_NEEDED '$from' in $so" >&2
+        return 1
+    fi
+}
+
+for so in "$ABI_SO" "$CXX_SO"; do
+    # Collect current DT_NEEDED entries that look like absolute paths.
+    needed_list=$(readelf -d "$so" 2>/dev/null | sed -n 's/.*NEEDED.*\[\(.*\)\].*/\1/p')
+    for n in $needed_list; do
+        case "$n" in
+            */libc.so)
+                rewrite_needed "$so" "$n" libc.so || true ;;
+            */libc++abi.so.1)
+                rewrite_needed "$so" "$n" libc++abi.so.1 || true ;;
+            */libc++.so.1)
+                rewrite_needed "$so" "$n" libc++.so.1 || true ;;
+        esac
     done
-fi
+done
+
+# Verify: no absolute-path DT_NEEDED survived (a silent miss here breaks every
+# dynamically-linked C++ binary at load time — better to fail the build).
+for so in "$ABI_SO" "$CXX_SO"; do
+    if readelf -d "$so" 2>/dev/null | grep -q 'NEEDED.*\[/'; then
+        echo "build-libcxx-musl.sh: ERROR — absolute-path DT_NEEDED remains in $so:" >&2
+        readelf -d "$so" 2>/dev/null | grep 'NEEDED.*\[/' >&2
+        exit 1
+    fi
+done
 
 # stage to rootfs
 for d in "$PROJECT_DIR/build/$B1NIX_ARCH/rootfs/lib"; do

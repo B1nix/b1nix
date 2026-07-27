@@ -31,7 +31,7 @@ B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
 LIBM_DIR := ../build/$(B1NIX_ARCH)/ports/openlibm/install
 LIBS_DIR := ../build/$(B1NIX_ARCH)/libs
 # ── musl paths (must be before CFLAGS so $(MUSL_INCLUDE) expands) ───────
-MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install/usr
+MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install
 MUSL_INCLUDE := $(MUSL_INSTALL)/include
 MUSL_LIB     := $(MUSL_INSTALL)/lib
 # The blob that -lc below actually resolves against, so the dependency edge and
@@ -40,7 +40,10 @@ MUSL_LIBSO   := $(MUSL_LIB)/libc.so
 MUSL_CRT1    := $(MUSL_LIB)/Scrt1.o
 MUSL_CRTI    := $(MUSL_LIB)/crti.o
 MUSL_CRTN    := $(MUSL_LIB)/crtn.o
-LIBCXX_INCLUDE := ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1
+LIBCXX_INCLUDE := $(firstword $(wildcard \
+  ../build/$(B1NIX_ARCH)/ports/musl/install/include/c++/v1 \
+  ../build/$(B1NIX_ARCH)/toolchain/llvm-runtimes-build-musl/libcxx-install/include/c++/v1 \
+  ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1))
 # compiler-rt builtins: the helpers the compiler emits calls to but no library
 # defines (128-bit division __udivti3 and friends). Linking through ld.lld
 # directly means nothing supplies them implicitly, so name the archive. Asking
@@ -80,7 +83,7 @@ LINKER   := linker.ld
 # freestanding ABI tests).
 
 # ── musl paths (shared across musl/dynamic link models) ──────────────────
-MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install/usr
+MUSL_INSTALL := ../build/$(B1NIX_ARCH)/ports/musl/install
 MUSL_INCLUDE := $(MUSL_INSTALL)/include
 MUSL_LIB     := $(MUSL_INSTALL)/lib
 # The blob that -lc below actually resolves against, so the dependency edge and
@@ -126,10 +129,12 @@ CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
 
 GUI_OBJS := $(BUILD)/libgui/gui.o
 GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
-	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke
+	$(BUILD)/bin/gdesktop $(BUILD)/bin/gabout $(BUILD)/bin/m49_smoke \
+	$(BUILD)/bin/displayd
 
 
 BINARIES := \
+	$(BUILD)/bin/init \
 	$(BUILD)/bin/hello \
 	$(BUILD)/bin/native_smoke \
 	$(BUILD)/bin/m12_smoke \
@@ -137,12 +142,14 @@ BINARIES := \
 	$(BUILD)/bin/m13_job_control \
 	$(BUILD)/bin/m14_smoke \
 	$(BUILD)/bin/m15_smoke \
+	$(BUILD)/bin/m17_smoke \
 	$(BUILD)/bin/m56_smoke \
 	$(BUILD)/bin/m8_aio_test \
 	$(BUILD)/bin/tcc \
 	$(BUILD)/bin/test_sync \
 	$(BUILD)/bin/m25_smoke \
 	$(BUILD)/bin/m26_smoke \
+	$(BUILD)/bin/selfhost_build \
 	$(BUILD)/bin/m24b_smoke \
 	$(BUILD)/bin/m27_smoke \
 	$(BUILD)/bin/m29_smoke \
@@ -165,6 +172,8 @@ BINARIES := \
 	$(BUILD)/bin/m53_virgl_smoke \
 	$(BUILD)/bin/m34_smoke \
 	$(BUILD)/bin/m35_smoke \
+	$(BUILD)/bin/m36_smoke \
+	$(BUILD)/bin/diskbench \
 	$(BUILD)/bin/su \
 	$(BUILD)/bin/passwd \
 	$(BUILD)/bin/id \
@@ -177,14 +186,56 @@ BINARIES := \
 	$(BUILD)/bin/chmod \
 	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
-	$(BUILD)/bin/m38_sound
+	$(BUILD)/bin/m38_sound \
+	$(BUILD)/bin/m39_smoke
+BINARIES += $(BUILD)/bin/m47_smoke
 BINARIES += $(BUILD)/bin/m48_smoke
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server
+BINARIES += $(BUILD)/bin/m50_smoke
+BINARIES += $(BUILD)/bin/m51_smoke
+# M51 ported-library smokes. These used to reach the guest only through the
+# xxd/.inc initramfs path, which became bootstrap-only after the ext4-root
+# migration — install them like every other binary so /bin/init's discovery
+# loop finds them in the rootfs.
+BINARIES += $(BUILD)/bin/m51_pixman_smoke
+BINARIES += $(BUILD)/bin/m51_freetype_smoke
+BINARIES += $(BUILD)/bin/m51_cairo_smoke
+BINARIES += $(BUILD)/bin/m51_cairo_wayland
+BINARIES += $(BUILD)/bin/m51_xkb_smoke
+BINARIES += $(BUILD)/bin/m51_harfbuzz_smoke
+BINARIES += $(BUILD)/bin/m51_fontconfig_smoke
+BINARIES += $(BUILD)/bin/m52_gl_smoke
+BINARIES += $(BUILD)/bin/cxx_smoke
+BINARIES += $(BUILD)/bin/m55_iostream
+BINARIES += $(BUILD)/bin/m64_clang_smoke
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m71_aslr
+BINARIES += $(BUILD)/bin/m42_w5pre_smoke
+BINARIES += $(BUILD)/bin/m46_smoke
+BINARIES += $(BUILD)/bin/lock_smoke
+BINARIES += $(BUILD)/bin/ext_stress
+BINARIES += $(BUILD)/bin/m24_stress
+BINARIES += $(BUILD)/bin/m27_cmdline
+BINARIES += $(BUILD)/bin/m11_pipe_smoke
+BINARIES += $(BUILD)/bin/m22_smoke
+BINARIES += $(BUILD)/bin/net_smoke
+BINARIES += $(BUILD)/bin/m51_clipboard_smoke
+BINARIES += $(BUILD)/bin/m53_httpd
+# M53 loopback HTTPS server + the driver that runs the NetSurf render tests.
+BINARIES += $(BUILD)/bin/m53_httpsd
+BINARIES += $(BUILD)/bin/m53_smoke
+BINARIES += $(BUILD)/bin/halt
+BINARIES += $(BUILD)/bin/setfattr
+BINARIES += $(BUILD)/bin/b1fetch
+BINARIES += $(BUILD)/bin/gpuinfo
+BINARIES += $(BUILD)/bin/meminfo
+BINARIES += $(BUILD)/bin/mc
+BINARIES += $(BUILD)/bin/ne
+# M16 driver: runs mc/ne out-of-process and covers the rest of the TUI surface.
+BINARIES += $(BUILD)/bin/m16_smoke
 # M58: standalone JavaScript interpreter (embeds Duktape) + its smoke test.
 BINARIES += $(BUILD)/bin/js
 BINARIES += $(BUILD)/bin/m58_smoke
@@ -205,7 +256,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -271,6 +322,50 @@ $(BUILD)/bin/b1cc_selfsmoke: bin/b1cc_selfsmoke.c $(MUSL_LIB)/libc.a $(MUSL_CRT1
 	python3 -c " \
 	import sys; f=sys.argv[1]; \
 	fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+
+$(BUILD)/src/tui_common.o: src/tui_common.c include/tui.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
+
+$(BUILD)/bin/mc: bin/mc.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/mc.c -o $(BUILD)/bin/mc.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/mc.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	python3 -c "\
+import sys; f=sys.argv[1]; \
+d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+endif
+
+$(BUILD)/bin/ne: bin/ne.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/ne.c -o $(BUILD)/bin/ne.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/ne.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	python3 -c "\
+import sys; f=sys.argv[1]; \
+d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+endif
+
+# M16 driver links tui_common.o for the shared key-sequence decoder it checks.
+$(BUILD)/bin/m16_smoke: bin/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) $(GEN_CRT0)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m16_smoke.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	python3 -c "\
+import sys; f=sys.argv[1]; \
+d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+endif
 
 
 $(BUILD)/bin/%: bin/%.c $(GEN_LIBDEP) $(GEN_CRT0) $(GEN_LINKER)
@@ -394,6 +489,7 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LIN
 	  open(f,'wb').write(d); \
 	  fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true \
 	)
+	ln -sf m32_nettool $(BUILD)/bin/m32-nettool
 
 # m53_httpsd: loopback HTTPS server (mbedTLS) for the M53 NetSurf web-access smoke.
 $(BUILD)/bin/m53_httpsd: bin/m53_httpsd.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKER),$(BESPOKE_LINKER)) $(wildcard $(MBEDTLS_DIR)/lib/libmbed*.a)
@@ -879,21 +975,73 @@ install-headers-libs:
 	@mkdir -p $(ROOTFS)/include
 	@mkdir -p $(ROOTFS)/lib
 	cp -r include/* $(ROOTFS)/include/
+	@# musl owns every libc header in the image: in-guest compilers (tcc, b1cc,
+	@# native clang) must see the same declarations the binaries were built
+	@# against. The b1nix-only extras copied above (EGL/, b1nix/, tui.h, ...)
+	@# stay; anything musl also ships is overwritten by musl's version. Skip
+	@# c++/v1 (16 MB of libc++ headers) — the C toolchains don't need it.
+	@for d in $$(cd $(MUSL_INCLUDE) && find . -type d -not -path './c++*'); do \
+		mkdir -p $(ROOTFS)/include/$$d; \
+	done
+	@cd $(MUSL_INCLUDE) && find . -type f -name '*.h' -not -path './c++/*' \
+		-exec cp {} $(abspath $(ROOTFS))/include/{} \;
 	@mkdir -p $(ROOTFS)/usr
 	ln -sfn ../include $(ROOTFS)/usr/include
 	ln -sfn ../lib $(ROOTFS)/usr/lib
 
-install: all install-headers-libs
+install: all $(TCC_LIBTCC1) install-headers-libs
 	@echo "Installing userspace binaries..."
 	@mkdir -p $(ROOTFS)/bin
 	cp $(BINARIES) $(ROOTFS)/bin/
 ifneq ($(GUI_BINARIES),)
 	cp $(GUI_BINARIES) $(ROOTFS)/bin/
 endif
+	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
+	@chmod 4755 $(ROOTFS)/bin/su 2>/dev/null || true
+	@chmod 4755 $(ROOTFS)/bin/passwd 2>/dev/null || true
+	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke; do \
+		src=$${b%%:*}; dst=$${b##*:}; \
+		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
+	done
 	@mkdir -p $(ROOTFS)/home
 	cp hello_native.c $(ROOTFS)/home/
 	@mkdir -p $(ROOTFS)/lib/tcc/include
 	cp tcc/include/*.h $(ROOTFS)/lib/tcc/include/
+	cp $(TCC_LIBTCC1) $(ROOTFS)/lib/libtcc1.a
+	cp $(TCC_LIBTCC1) $(ROOTFS)/lib/tcc/libtcc1.a
+	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o ]; then \
+		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt0.o ; \
+		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o $(ROOTFS)/lib/crt1.o ; \
+	fi
+	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a ]; then \
+		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libc.a ; \
+		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libb1nix.a ; \
+	fi
+	@mkdir -p $(ROOTFS)/etc
+	@printf "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n" > $(ROOTFS)/etc/passwd
+	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
+	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
+	@printf "/bin/sh\n/bin/bash\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
+	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/bash/bpkg-smoke.sh,
+	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
+	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
+	@# structure and creates /etc, /bin, /pkgs subdirs as needed.
+	@cp -R rootfs-overlay/. $(ROOTFS)/
+	@# BusyBox applet symlinks: every command in applet-manifest.conf (M42) is
+	@# "upstream" (native in-kernel dispatch was retired with the Ring 3 init
+	@# rewrite), so they become /bin/<cmd> -> /opt/busybox/bin/busybox — except
+	@# id/whoami/chown/chmod, which BINARIES already installs as dedicated real
+	@# ELFs; symlinking those too would race cp (dangling-symlink refusal) or,
+	@# worse, have cp write a real binary's bytes through the symlink into the
+	@# busybox ELF itself. 'sh'/'ash' aren't in the manifest (it only covers
+	@# coreutils) but every script here execve()s /bin/sh directly, so add them
+	@# explicitly.
+	@mkdir -p $(ROOTFS)/bin
+	@awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$1); gsub(/^[[:space:]]+|[[:space:]]+$$/, "", $$2); if ($$2 == "upstream") print $$1; }' ../tools/configs/applet-manifest.conf | \
+		grep -vE '^(id|whoami|chown|chmod)$$' | \
+		while read -r cmd; do ln -sfn /opt/busybox/bin/busybox "$(ROOTFS)/bin/$$cmd"; done
+	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/sh
+	@ln -sfn /opt/busybox/bin/busybox $(ROOTFS)/bin/ash
 
 
 clean:

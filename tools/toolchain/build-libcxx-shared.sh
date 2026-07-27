@@ -38,8 +38,10 @@ LD="$(command -v ld.lld 2>/dev/null || echo ld.lld)"
 # compiled against the old b1nix libc headers and reference `errno` as a DATA
 # symbol that musl's libc.so does not export, so a libc++.so.1 folded from them
 # fails to relocate at load time ("Error relocating: errno: symbol not found").
-RT_INSTALL="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build/libcxx-install/lib"
-RT_MUSL="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build-musl/libcxx-install/lib"
+# Use TOOLCHAIN_BUILD_HOME (set by env.sh) which points to build/<arch>/toolchain/.
+TBH="${TOOLCHAIN_BUILD_HOME:-$ROOT/build/x86_64/toolchain}"
+RT_INSTALL="$TBH/llvm-runtimes-build/libcxx-install/lib"
+RT_MUSL="$TBH/llvm-runtimes-build-musl/libcxx-install/lib"
 if [ -f "$RT_MUSL/libc++.a" ]; then
     RT_INSTALL="$RT_MUSL"
 fi
@@ -49,12 +51,12 @@ CXX_A="$RT_INSTALL/libc++.a"
 # compiler-rt builtins (__divti3, __multi3, …): libc++.so / libc++abi.so reference
 # a few of these, so resolve them into the .so (NOT whole-archive — only the
 # referenced builtins are pulled) to keep each .so self-contained at load time.
-CRT_A="$ROOT/build/x86_64/toolchain/$TRIPLET/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+CRT_A="$TBH/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 for f in "$CXXABI_A" "$UNWIND_A" "$CXX_A" "$CRT_A"; do
     [ -f "$f" ] || { echo "missing $f — run tools/toolchain/build-libcxx.sh first" >&2; exit 1; }
 done
 
-CROSSLIB="$(ls -d "$ROOT/build/x86_64/ports/musl/install/lib" "$ROOT/build/x86_64/toolchain/$TRIPLET/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
+CROSSLIB="$(ls -d "$ROOT/build/x86_64/ports/musl/install/lib" "$TBH/cross/$TRIPLET/lib" 2>/dev/null | head -1)"
 LIBC_SO="$CROSSLIB/libc.so"
 [ -f "$LIBC_SO" ] || B1NIX_ARCH="$ARCH" sh "$ROOT/tools/ports/build-musl.sh" >/dev/null 2>&1 || true
 [ -f "$LIBC_SO" ] || { echo "missing libc.so in $CROSSLIB — run tools/ports/build-musl.sh first" >&2; exit 1; }

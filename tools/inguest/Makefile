@@ -130,9 +130,7 @@ SRCS := \
   kernel/fs/procfs.c \
   kernel/fs/sysfs.c \
   kernel/lib/ftrace.c \
-  kernel/lib/ftrace_demo.c \
-  kernel/lib/m35_diag.c \
-  kernel/lib/m36_diag.c
+  kernel/lib/ftrace_demo.c
 
 # Objects mirror the source tree under $(OBJDIR) (parallel directories), so the
 # two pattern rules below map each .o back to its .c/.S source unambiguously.

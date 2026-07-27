@@ -104,9 +104,76 @@ local_ports() {
 	cp "$netsurf_bin" "$ROOTFS/bin/netsurf-fb"
 }
 
+# NetSurf runtime resources + the M53 test page. The browser resolves its
+# stylesheets/Messages through RESPATH (/usr/local/share/netsurf), and the M53
+# smoke loads file:///netsurf/test.html — both used to ride in the kernel
+# initramfs and now have to land in the ext4 rootfs alongside the binary, or
+# every render test starts with an unstyled/missing document. Runs for both
+# install modes: the published netsurf package ships only the ELF.
+stage_netsurf_assets() {
+	[ -x "$ROOTFS/bin/netsurf-fb" ] || return 0
+	res_dir="$(ls -d "$ROOT_DIR/build/$ARCH/ports/netsurf-fb/build/frontends/framebuffer/res" \
+		"$ROOT_DIR"/build/src/netsurf/netsurf-*/frontends/framebuffer/res 2>/dev/null | head -1)"
+	if [ -n "${res_dir:-}" ]; then
+		mkdir -p "$ROOTFS/usr/local/share/netsurf"
+		for f in default.css quirks.css internal.css adblock.css Messages; do
+			[ -f "$res_dir/$f" ] && cp "$res_dir/$f" "$ROOTFS/usr/local/share/netsurf/$f"
+		done
+	fi
+	mkdir -p "$ROOTFS/netsurf"
+	for f in test.html test.png test.svg test.jxl; do
+		[ -f "$ROOT_DIR/tools/netsurf-assets/$f" ] &&
+			cp "$ROOT_DIR/tools/netsurf-assets/$f" "$ROOTFS/netsurf/$f"
+	done
+	return 0
+}
+
+# The published dropbear package predates shadow-password support: it was built
+# without HAVE_SHADOW_H, so it never calls getspnam(3) and falls back to the
+# /etc/passwd "x" placeholder. crypt("x") then returns NULL and the daemon
+# rejects every password login with "User account 'root' is locked" — the
+# M32B-SSH handshake/pty failures. The Makefile builds dropbearmulti locally as
+# a dependency of install-ports either way, so prefer that fresher binary over
+# the packaged one instead of shipping a knowingly broken SSH server.
+overlay_local_dropbear() {
+	local_db="$ROOT_DIR/build/$ARCH/ports/dropbear/dropbearmulti"
+	[ -f "$local_db" ] || return 0
+	mkdir -p "$ROOTFS/bin"
+	cp "$local_db" "$ROOTFS/bin/dropbearmulti"
+	for name in dropbear dbclient dropbearkey; do
+		ln -sfn dropbearmulti "$ROOTFS/bin/$name"
+	done
+	echo "OVERLAY dropbear (locally built) [$PKG_ARCH]"
+}
+
+# The rest of the published set predates the musl migration: those packages are
+# ET_EXEC binaries linked against the retired b1nix libc, while everything else
+# in the image is musl PIE. NetSurf is the visible casualty — the stale ELF
+# renders file:// pages but every network fetch comes back empty (M53-WEB /
+# M53-HTTPS has-content=0) — and the packaged curl/wget were built without a
+# working TLS backend. The Makefile builds all of them locally as install-ports
+# prerequisites, so prefer the fresh binary whenever one exists; a machine
+# without local build output still gets the packaged one.
+overlay_local_ports() {
+	nsfb="$ROOT_DIR/build/$ARCH/ports/netsurf-fb/install/bin/nsfb"
+	[ -f "$nsfb" ] && { cp "$nsfb" "$ROOTFS/bin/netsurf-fb"; echo "OVERLAY netsurf (locally built) [$PKG_ARCH]"; }
+
+	local_curl="$ROOT_DIR/build/$ARCH/ports/curl/install/bin/curl"
+	[ -f "$local_curl" ] && { cp "$local_curl" "$ROOTFS/bin/curl"; echo "OVERLAY curl (locally built) [$PKG_ARCH]"; }
+
+	local_wget="$ROOT_DIR/build/$ARCH/ports/wget/install/bin/wget"
+	[ -f "$local_wget" ] && { cp "$local_wget" "$ROOTFS/bin/wget"; echo "OVERLAY wget (locally built) [$PKG_ARCH]"; }
+
+	local_bash="$(ls "$ROOT_DIR"/build/src/bash/"$TRIPLET"/bash-*/bash 2>/dev/null | head -1)"
+	[ -n "${local_bash:-}" ] && { cp "$local_bash" "$ROOTFS/bin/bash"; echo "OVERLAY bash (locally built) [$PKG_ARCH]"; }
+	return 0
+}
+
 mkdir -p "$ROOTFS"
 case "$MODE" in
-	download) download_ports ;;
+	download) download_ports; overlay_local_dropbear; overlay_local_ports ;;
 	local) local_ports ;;
 	*) echo "install-ports: mode must be 'download' or 'local'" >&2; exit 2 ;;
 esac
+
+stage_netsurf_assets

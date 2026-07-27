@@ -194,9 +194,14 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     #    musl Makefile: $(CC) $(CFLAGS_ALL) $(LDFLAGS_ALL) -nostdlib -shared ...
     #    -fuse-ld=lld must be in LDFLAGS_ALL so it reaches the link step.
     #    clang + lld auto-links compiler-rt for __mulxc3/__muldc3/__mulsc3.
-    sed -i 's/^LDFLAGS_AUTO = /LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=lld /' "$SRC_DIR/config.mak"
+    #    Also set a DT_SONAME on libc.so: without it, consumers (libc++abi.so.1,
+    #    libc++.so.1) linked with `-l:libc.so` record the *absolute* install path
+    #    as their DT_NEEDED, which breaks load-time resolution under b1nix's
+    #    musl ld.so (it tries the host path verbatim → ENOENT). A soname makes
+    #    lld emit the bare basename instead.
+    sed -i 's/^LDFLAGS_AUTO = /LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=lld -Wl,-soname,libc.so /' "$SRC_DIR/config.mak"
 
-    echo "build-musl.sh: patched config.mak (LIBCC cleared, noexecstack removed, lld linker, eager PLT)" >&2
+    echo "build-musl.sh: patched config.mak (LIBCC cleared, noexecstack removed, lld linker, eager PLT, libc.so soname)" >&2
   fi
 fi
 

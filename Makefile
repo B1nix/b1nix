@@ -31,17 +31,17 @@ WAYLAND_CLIENT_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-client.
 WAYLAND_SERVER_LIB := build/$(ARCH)/ports/wayland/install/lib/libwayland-server.a
 HB_LIB := build/$(ARCH)/ports/harfbuzz/install/lib/libharfbuzz.a
 EXPAT_LIB := build/$(ARCH)/ports/expat/install/lib/libexpat.a
-FC_LIB := build/$(ARCH)/ports/fontconfig/install/lib/libfontconfig.a
+FONTCONFIG_LIB := build/$(ARCH)/ports/fontconfig/install/lib/libfontconfig.a
 TINYGL_LIB := build/$(ARCH)/ports/tinygl/install/lib/libEGL.a
 ZLIB_LIB := build/$(ARCH)/ports/zlib/install/lib/libz.a
-PNG_LIB := build/$(ARCH)/ports/libpng/install/lib/libpng.a
+LIBPNG_LIB := build/$(ARCH)/ports/libpng/install/lib/libpng16.a
 LIBJPEG_LIB := build/$(ARCH)/ports/libjpeg/install/lib/libjpeg.a
-WEBP_LIB := build/$(ARCH)/ports/libwebp/install/lib/libwebp.a
+LIBWEBP_LIB := build/$(ARCH)/ports/libwebp/install/lib/libwebp.a
 LIBVPX_LIB := build/$(ARCH)/ports/libvpx/install/lib/libvpx.a
-WAPCAPLET_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libwapcaplet.a
+LWC_LIB := build/$(ARCH)/ports/libwapcaplet/install/lib/liblwc.a
 PU_LIB := build/$(ARCH)/ports/libparserutils/install/lib/libparserutils.a
 HUBBUB_LIB := build/$(ARCH)/ports/libhubbub/install/lib/libhubbub.a
-CSS_LIB := build/$(ARCH)/ports/libcss/install/lib/libcss.a
+LIBCSS_LIB := build/$(ARCH)/ports/libcss/install/lib/libcss.a
 LIBDOM_LIB := build/$(ARCH)/ports/libdom/install/lib/libdom.a
 NSUTILS_LIB := build/$(ARCH)/ports/libnsutils/install/lib/libnsutils.a
 NSGIF_LIB := build/$(ARCH)/ports/libnsgif/install/lib/libnsgif.a
@@ -57,9 +57,9 @@ UNISTRING_LIB := build/$(ARCH)/ports/libunistring/install/lib/libunistring.a
 # Ensure all port libraries depend on headers stamp so that they are compiled
 # only after libc.so.1 and headers are fully built and installed.
 $(LIBM_LIB) $(PCRE2_LIB) $(PIXMAN_LIB) $(FREETYPE_LIB) $(CAIRO_LIB) $(XKB_LIB) \
-$(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FC_LIB) $(TINYGL_LIB) \
-$(ZLIB_LIB) $(PNG_LIB) $(LIBJPEG_LIB) $(WEBP_LIB) $(LIBVPX_LIB) \
-$(WAPCAPLET_LIB) $(PU_LIB) $(HUBBUB_LIB) $(CSS_LIB) $(LIBDOM_LIB) \
+$(WAYLAND_CLIENT_LIB) $(HB_LIB) $(EXPAT_LIB) $(FONTCONFIG_LIB) $(TINYGL_LIB) \
+$(ZLIB_LIB) $(LIBPNG_LIB) $(LIBJPEG_LIB) $(LIBWEBP_LIB) $(LIBVPX_LIB) \
+$(LWC_LIB) $(PU_LIB) $(HUBBUB_LIB) $(LIBCSS_LIB) $(LIBDOM_LIB) \
 $(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) $(IDN2_LIB) \
 $(OPENSSL_LIB) $(LIBPSL_LIB) $(FFI_LIB) \
 $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
@@ -104,6 +104,8 @@ APPLET_SYMLINKS_INC := $(INC_DIR)/initramfs_applet_symlinks.inc
 APPLET_REGISTRATION_INC := $(INC_DIR)/initramfs_applet_registration.inc
 
 EMBEDDED_USER_PROGRAMS := \
+	init \
+	hello \
 	m8_aio_test \
 	m12_smoke \
 	m13_smoke \
@@ -140,7 +142,10 @@ EMBEDDED_USER_PROGRAMS := \
 	m53_mesa_virgl \
 	m34_smoke \
 	m35_smoke \
+	m36_smoke \
+	diskbench \
 	m38_sound \
+	m39_smoke \
 	m42_w5pre_smoke \
 	m46_smoke \
 	m57_smoke \
@@ -170,11 +175,11 @@ EMBEDDED_USER_PROGRAMS := \
 	m91_skia_smoke \
 	cxx_smoke \
 	m55_iostream \
-	m55_litehtml \
-	js \
-	m58_smoke \
-	displayd \
-	gclock \
+ 	m55_litehtml \
+ 	js \
+ 	m58_smoke \
+ 	displayd \
+ 	gclock \
 	gterm \
 	gpaint \
 	gdesktop \
@@ -270,55 +275,12 @@ INITRAMFS_M69_PLUGIN_INC :=
 INITRAMFS_LIBCXX_INC := $(INC_DIR)/initramfs_libcxx.inc
 INITRAMFS_LIBCXXABI_INC := $(INC_DIR)/initramfs_libcxxabi.inc
 endif
-# Upstream BusyBox is always embedded (M42 full integration).
-ifeq ($(MINIMAL_INITRAMFS),1)
-# Select the minimal embedded file set in the C source too (kernel/fs/initramfs.c
-# picks files[] via #ifdef MINIMAL_INITRAMFS) so the registered files match the
-# trimmed .inc list below. Without this the C code would still register the full
-# table and reference .inc that were never built.
-CFLAGS_EXTRA += -DMINIMAL_INITRAMFS
-# The shared libc.so.1 is included in the minimal set too: M33's on-device PIE
-# self-smoke links a program against it (DT_NEEDED libc.so.1) and the kernel's
-# eager in-kernel dynamic linker must find it at runtime.
+# Bootstrap initramfs: init, sh, and essential boot loader binaries
+# are embedded; all other apps, libraries, and tests live on the ext4 rootfs.
 INITRAMFS_INCS := \
+	$(INC_DIR)/initramfs_init.inc \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
-	$(INITRAMFS_B1CC_INCS) \
-	$(INITRAMFS_B1CC_M34_INC) \
-	$(INITRAMFS_SHARED_LIBC_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
-else
-INITRAMFS_INCS := \
-	$(INITRAMFS_NATIVE_SMOKE_INC) \
-	$(INITRAMFS_B1CC_INCS) \
-	$(INITRAMFS_TCC_FILES_INC) \
-	$(INITRAMFS_B1CC_M34_INC) \
-	$(INITRAMFS_TCC_FILES_INC) \
-	$(INITRAMFS_USER_PROGRAM_INCS) \
-	$(INITRAMFS_SHARED_LIBC_INC) \
-	$(INITRAMFS_LD_MUSL_INC) \
-	$(INITRAMFS_M69_PLUGIN_INC) \
-	$(INITRAMFS_LIBCXX_INC) \
-	$(INITRAMFS_LIBCXXABI_INC) \
-	$(INITRAMFS_CURL_INC) \
-	$(INITRAMFS_WGET_INC) \
-	$(INITRAMFS_CACERT_INC) \
-	$(INITRAMFS_TLSTEST_INC) \
-	$(INITRAMFS_DROPBEAR_INC) \
-	$(INITRAMFS_BUSYBOX_INC) \
-	$(INITRAMFS_BASH_INC) \
-	$(INITRAMFS_TESTWAV_INC) \
-	$(INITRAMFS_TESTFONT_INC) \
-	$(INITRAMFS_M40_LINUX_INC) \
-	$(INITRAMFS_M67_RUST_INC) \
-	$(INITRAMFS_NETSURF_INC) \
-	$(INITRAMFS_M91_SO_INCS) \
-	$(INC_DIR)/initramfs_m92_musl_dyn_smoke.inc \
-	$(INC_DIR)/initramfs_m92_musl_ldso_smoke.inc \
-	$(INC_DIR)/initramfs_musl_posix_smoke.inc \
-	$(INC_DIR)/initramfs_m92_musl_hello.inc \
-	$(INC_DIR)/initramfs_m92_musl_step2.inc \
-	$(INC_DIR)/initramfs_m92_musl_raw_diag.inc
-endif
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
 WGET_ELF := build/$(ARCH)/ports/wget/install/bin/wget
@@ -432,8 +394,6 @@ KERNEL_SOURCES := \
 	kernel/lib/string.c \
 	kernel/lib/klog.c \
 	kernel/lib/stdio.c \
-	kernel/lib/m35_diag.c \
-	kernel/lib/m36_diag.c \
 	kernel/lib/ftrace.c \
 	kernel/lib/ftrace_demo.c \
 	kernel/lib/stdlib.c \
@@ -468,6 +428,7 @@ KERNEL_SOURCES := \
 	kernel/fs/sysfs.c \
 	kernel/fs/journal.c \
 	kernel/fs/filelock.c \
+	kernel/fs/fuse.c \
 	kernel/dev/acpi.c \
 	kernel/dev/ioapic.c \
 	kernel/dev/blk.c \
@@ -485,10 +446,6 @@ KERNEL_SOURCES := \
 	kernel/sched/futex.c \
 	kernel/sched/seccomp.c \
 	kernel/user/process.c \
-	kernel/user/programs.c \
-	kernel/user/tui_common.c \
-	kernel/user/mc.c \
-	kernel/user/editor.c \
 	$(ARCH_SOURCES)
 
 ifneq ($(filter $(ARCH),x86_64),)
@@ -507,24 +464,23 @@ KERNEL_SOURCES += \
 	kernel/dev/usb_xhci.c \
 	kernel/dev/hda.c \
 	kernel/dev/pty.c \
-	kernel/dev/serial_tty.c \
-	kernel/dev/compositor.c \
-	kernel/dev/virtio_gpu.c \
-	kernel/dev/virtio_input.c \
+ 	kernel/dev/serial_tty.c \
+ 	kernel/dev/virtio_gpu.c \
+ 	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
 	kernel/dev/fb.c \
 	kernel/dev/input.c \
 	kernel/net/net.c \
 	kernel/net/socket.c \
 	kernel/net/unix.c \
-	kernel/net/ethernet.c \
 	kernel/net/arp.c \
+	kernel/net/ethernet.c \
 	kernel/net/ipv4.c \
 	kernel/net/ipv6.c \
-	kernel/net/ndp.c \
 	kernel/net/icmp.c \
-	kernel/net/udp.c \
+	kernel/net/ndp.c \
 	kernel/net/tcp.c \
+	kernel/net/udp.c \
 	kernel/net/dhcp.c \
 	kernel/net/dns.c \
 	kernel/net/ntp.c
@@ -691,8 +647,9 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(LIBCSS_LIB) \
 	$(LIBDOM_LIB) \
 	$(NSUTILS_LIB) $(NSGIF_LIB) $(NSBMP_LIB) $(NSLOG_LIB) \
-	$(LIBIDN2_LIB)
-	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH)
+	$(LIBIDN2_LIB) \
+	$(MBEDTLS_LIB)
+	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 	@touch $@
 
 
@@ -713,7 +670,7 @@ $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/images/gen_b1cc_m34_initramfs.sh $@
 
-# displayd is multi-source (userspace/displayd/*.c), not a single bin/*.c
+# displayd is multi-source, not a single bin/*.c
 DISPLAYD_SRCS := $(wildcard userspace/displayd/*.c) $(wildcard userspace/displayd/*.h)
 $(INC_DIR)/initramfs_displayd.inc: $(DISPLAYD_SRCS) $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/displayd
@@ -954,7 +911,7 @@ $(INC_DIR)/initramfs_m91_skia_dm.inc: $(BUILD_DIR)/.skia-built
 	@echo 'static const unsigned char vfs_m91_skia_dm_elf[1] = {0};' >> $@
 	@echo 'static const unsigned int vfs_m91_skia_dm_elf_len = 0;' >> $@
 M91_SHARED_DEPS_STAMP := $(BUILD_DIR)/.m91-shared-deps-stamp
-$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built
+$(M91_SHARED_DEPS_STAMP): tools/ports/build-skia-shared-deps.sh $(BUILD_DIR)/.skia-built $(BUILD_DIR)/.mesa-built $(FONTCONFIG_LIB)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(ARCH) sh tools/ports/build-skia-shared-deps.sh
 	@# Replace sysroot stubs with real .so so cross-cc link step finds them
@@ -1296,7 +1253,7 @@ ifdef MUSL_INSTALLED
 # already linked correctly: libc++.so.1 NEEDS libc++abi.so.1 + libc.so, and
 # libc++abi.so.1 NEEDS libc.so — both resolve to ld-musl-x86_64.so.1 via the
 # /lib/libc.so symlink that initramfs.c registers in B1NIX_MUSL mode.
-MUSL_LIBCXX_COMPILER_RT := $(firstword $(wildcard build/$(ARCH)/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a build/$(ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build/install/lib/libcompiler_rt.a))
+MUSL_LIBCXX_COMPILER_RT := build/$(ARCH)/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a
 
 $(MUSL_LIBCXX_COMPILER_RT): $(LIBC_SO)
 	@mkdir -p $(dir $@)
@@ -1356,12 +1313,12 @@ iso: check-b1cc-sync check-tcc-sync root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
 	@echo "============================================================"
@@ -1377,12 +1334,12 @@ iso-core: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-core/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-core/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-core/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
 
@@ -1390,12 +1347,12 @@ iso-graphics: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-graphics/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-graphics/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-graphics/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
 
@@ -1403,12 +1360,12 @@ iso-shell: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-shell/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-shell/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-shell/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
 
@@ -1423,7 +1380,7 @@ iso-v8: $(KERNEL_ELF) root-image
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-v8/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-v8/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-v8/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-v8/boot/rootfs.img
 	cp $(BUILD_ROOT)/v8-out/v8-ext4.img $(BUILD_DIR)/iso-v8/boot/v8.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
@@ -1440,12 +1397,12 @@ iso-live: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-live/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
 
@@ -1463,12 +1420,12 @@ iso-test: root-image $(KERNEL_ELF)
 	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
 	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
 	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-test/boot/kernel.elf
-	cp $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
+	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
 	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
 	     -e 's|@ARCH@|$(ARCH)|g' \
 	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) b1nix.test=1|g' \
 	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g'
+	     -e 's|@MODULE_CMD2@||g' \
 	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
 	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
 
@@ -1484,7 +1441,17 @@ check-tcc-sync:
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
 
-busybox-package:
+# Cross-toolchain (LLVM/Clang + musl sysroot). Required by busybox and all
+# native-compiled ports. Preserved across `make clean` (lives under build/<arch>/toolchain/).
+toolchain:
+	@if [ ! -d "$(CROSS_TOOLCHAIN_ROOT)/bin" ]; then \
+		echo "[TOOLCHAIN] Building cross-toolchain for $(ARCH)..."; \
+		B1NIX_ARCH=$(ARCH) sh tools/toolchain/build-toolchain.sh; \
+	else \
+		echo "[TOOLCHAIN] Cross-toolchain already present at $(CROSS_TOOLCHAIN_ROOT)"; \
+	fi
+
+busybox-package: toolchain
 	B1NIX_ARCH=$(ARCH) tools/ports/build-busybox.sh
 
 # Native toolchain for b1nix self-host: b1nix-native Clang/LLVM only (GCC retired).
@@ -1513,7 +1480,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(WGET_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
+install-ports: userspace-install busybox-package install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(WGET_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1586,6 +1553,19 @@ root-image: $(KERNEL_ELF) install-ports $(M91_SHARED_DEPS_STAMP)
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
 	@ln -sfn . $(BUILD_DIR)/rootfs/persist
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
+	@# M51 test font. The FreeType/HarfBuzz/Cairo/Fontconfig smokes open
+	@# /share/fonts/B1nixMono-Regular.ttf; it used to arrive via the xxd
+	@# initramfs (bootstrap-only since the ext4-root migration), so stage it
+	@# into the rootfs the tests actually run against.
+	@mkdir -p $(BUILD_DIR)/rootfs/share/fonts
+	@cp -f userspace/share/fonts/B1nixMono-Regular.ttf $(BUILD_DIR)/rootfs/share/fonts/
+	@# Self-contained TLS test PKI. The loopback HTTPS smokes (M32 curl, M53
+	@# NetSurf-over-TLS) verify the server cert against this CA, so the PEMs
+	@# have to exist in the rootfs the tests actually run against.
+	@$(MAKE) --no-print-directory $(TLS_TEST_DIR)/ca.pem
+	@mkdir -p $(BUILD_DIR)/rootfs/etc/tls-test
+	@cp -f $(TLS_TEST_DIR)/ca.pem $(TLS_TEST_DIR)/server-cert.pem \
+	       $(TLS_TEST_DIR)/server-key.pem $(BUILD_DIR)/rootfs/etc/tls-test/
 	@# M91: Stage Mesa/Skia shared libraries into rootfs/lib/ for the dynamic linker
 	@mkdir -p $(BUILD_DIR)/rootfs/lib
 	@# Mesa install dir (softpipe/virgl build) — copy .so files and create
@@ -1662,6 +1642,38 @@ endif
 		cp "$$SKIA_DM" $(BUILD_DIR)/rootfs/bin/skia-dm; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
 	fi
+	@# M40/M67: committed static ELF blobs (Linux ABI compat + Rust std smoke).
+	@# Only ever wired into the legacy xxd/.inc initramfs path (kernel/fs/
+	@# initramfs.c never gained a #include for them after the ext4-root
+	@# migration made that path bootstrap-only) — stage them into rootfs/bin
+	@# directly, same as skia-dm above, so /bin/init's discovery loop picks
+	@# them up.
+	@if [ -f tools/m40/linux_hello.bin ]; then \
+		cp -f tools/m40/linux_hello.bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
+	fi
+	@if [ -f tools/m67/hello_b1nix.elf ]; then \
+		cp -f tools/m67/hello_b1nix.elf $(BUILD_DIR)/rootfs/bin/m67-rust; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/m67-rust; \
+	fi
+	@# M52/M53/M55/M59/M91 Mesa/Skia/litehtml demo smoke ELFs: built via their own
+	@# tools/demos/build-*.sh scripts (against the ported Mesa/Skia/litehtml
+	@# static libs), NOT the plain userspace/Makefile BINARIES pattern — so
+	@# userspace-install never copies them. Build (if missing) then stage into
+	@# rootfs/bin here, same as skia-dm above.
+	@UD=userspace/build/$(ARCH)/bin; \
+	[ -f "$$UD/m52_osmesa" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_osmesa "$$UD/m52_osmesa" || true; \
+	[ -f "$$UD/m52_glsl" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m52-mesa-demo.sh m52_glsl "$$UD/m52_glsl" || true; \
+	[ -f "$$UD/m53_mesa_virgl" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m53-mesa-virgl.sh "$$UD/m53_mesa_virgl" || true; \
+	[ -f "$$UD/m59_smoke" ] || B1NIX_ARCH=$(ARCH) B1NIX_CXX_STDLIB=libc++ tools/demos/build-m59-egl.sh "$$UD/m59_smoke" || true; \
+	[ -f "$$UD/m91_skia_smoke" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m91-skia-demo.sh m91_skia_smoke "$$UD/m91_skia_smoke" || true; \
+	[ -f "$$UD/m55_litehtml" ] || B1NIX_CXX_STDLIB=libc++ B1NIX_ARCH=$(ARCH) tools/demos/build-m55-litehtml.sh "$$UD/m55_litehtml" || true; \
+	for b in m52_osmesa m52_glsl m53_mesa_virgl m59_smoke m91_skia_smoke m55_litehtml; do \
+		if [ -f "$$UD/$$b" ]; then \
+			cp -f "$$UD/$$b" $(BUILD_DIR)/rootfs/bin/$$b; \
+			chmod +x $(BUILD_DIR)/rootfs/bin/$$b; \
+		fi; \
+	done
 	@# Trim rootfs: remove LLVM static archives and shared lib (200+ MB) that
 	@# are only needed for self-hosting, not for smoke.  Keep Mesa .so files.
 	@rm -f $(BUILD_DIR)/rootfs/lib/libLLVM*.a $(BUILD_DIR)/rootfs/lib/libLLVM.so
@@ -1678,6 +1690,14 @@ endif
 	@dd if=/dev/zero of=$(BUILD_DIR)/root.ext4 bs=1048576 count=$(ROOT_IMAGE_SIZE) 2>/dev/null
 	@$(MKE2FS) -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4 2>/dev/null || \
 	 $(MKE2FS) -t ext4 -q -L b1nix-root -d $(BUILD_DIR)/rootfs $(BUILD_DIR)/root.ext4
+	@debugfs -w -R "sif /bin/m31_setuid uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /bin/m31_setuid mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /bin/su uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /bin/su mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /bin/passwd uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /bin/passwd mode 0104755" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /etc/shadow uid 0" $(BUILD_DIR)/root.ext4 2>/dev/null || true
+	@debugfs -w -R "sif /etc/shadow mode 0100400" $(BUILD_DIR)/root.ext4 2>/dev/null || true
 	@printf 'created %s (%s)\n' "$(BUILD_DIR)/root.ext4" "$$(du -sh $(BUILD_DIR)/root.ext4 | cut -f1)"
 
 check-ports:
@@ -1707,7 +1727,11 @@ clean:
 	@# Preserve build/src/ (source cache) and build/$(ARCH)/toolchain/ (cross/native
 	@# compiler trees). Use `make distclean` to wipe everything including sources.
 	@if [ -d build ]; then \
+		TC_SAVE=$$(mktemp -d); \
+		[ -d $(BUILD_DIR)/toolchain ] && cp -a $(BUILD_DIR)/toolchain "$$TC_SAVE/" 2>/dev/null || true; \
 		find -L build -mindepth 1 -maxdepth 1 ! -name src -exec rm -rf {} +; \
+		[ -d "$$TC_SAVE/toolchain" ] && mv "$$TC_SAVE/toolchain" $(BUILD_DIR)/toolchain 2>/dev/null || true; \
+		rm -rf "$$TC_SAVE"; \
 	fi
 	@$(MAKE) -C userspace clean
 

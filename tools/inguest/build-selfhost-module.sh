@@ -42,6 +42,12 @@ rm -rf "$STAGE"; mkdir -p "$STAGE/bin" "$STAGE/lib" "$STAGE/src" "$STAGE/obj"
 cp "$CLANG" "$STAGE/bin/clang";  "$STRIP" --strip-unneeded "$STAGE/bin/clang" 2>/dev/null || true
 cp "$LLD"   "$STAGE/bin/ld.lld"; "$STRIP" --strip-unneeded "$STAGE/bin/ld.lld" 2>/dev/null || true
 cp "$LIBC"  "$STAGE/lib/libc.so.1"
+# M93: userspace self-host builder (replaces in-kernel run_selfhost_build).
+SELFBUILD="$ROOT_DIR/userspace/build/x86_64/bin/selfhost_build"
+if [ -f "$SELFBUILD" ]; then
+	cp "$SELFBUILD" "$STAGE/bin/selfhost-build"
+	"$STRIP" --strip-unneeded "$STAGE/bin/selfhost-build" 2>/dev/null || true
+fi
 # Dynamic toolchain: ship the shared LLVM so clang/lld resolve it (soname) at /lib.
 [ -f "$LIBLLVM" ] && cp "$LIBLLVM" "$STAGE/lib/libLLVM-22.so"
 RESV="$(basename "$RESDIR")"

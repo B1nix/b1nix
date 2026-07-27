@@ -89,5 +89,3 @@
 /tmp/kbuild/kernel/fs/sysfs.o
 /tmp/kbuild/kernel/lib/ftrace.o
 /tmp/kbuild/kernel/lib/ftrace_demo.o
-/tmp/kbuild/kernel/lib/m35_diag.o
-/tmp/kbuild/kernel/lib/m36_diag.o

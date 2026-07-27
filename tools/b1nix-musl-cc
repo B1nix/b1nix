@@ -215,7 +215,7 @@ with open(f, 'r+b') as fh:
     echo "b1nix-musl-cc: linked (dynamic) $OUTPUT" >&2
     ;;
   ldso)
-    # Real userspace ld.so mode (ldso-migration-and-unix-parity-plan.md).
+    # Real userspace ld.so mode (musl-port.md).
     # Produces a PIE with a genuine PT_INTERP pointing at musl's own
     # ld-musl-x86_64.so.1 (its libc.so doubles as its dynamic linker, same as
     # upstream musl on Linux). The kernel loads the interpreter's segments
