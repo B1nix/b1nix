@@ -153,9 +153,8 @@ static int test_input_open(void) {
 }
 
 static int test_input_events(void) {
-	/* The kernel test harness injects a mouse event burst once a client has
-	 * event1 open (see the m47 injector in kernel/user/programs.c). Use a
-	 * blocking fd: this also exercises the blocking-read path. */
+	/* In test mode the kernel injects a mouse event burst once a client has
+	 * event1 open (input_m47_inject_start, kernel/dev/input.c). */
 	int fd = open("/dev/input/event1", O_RDONLY | O_NONBLOCK);
 	if (fd < 0) {
 		marker("M47-GFX: fail input-event\n");

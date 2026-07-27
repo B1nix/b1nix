@@ -18,6 +18,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
 
 static void emit(const char *s) { write(1, s, strlen(s)); }
 
@@ -59,6 +60,30 @@ static int slurp(const char *path, char *buf, int cap) {
   close(fd);
   buf[total] = '\0';
   return total;
+}
+
+/* Runs one tool to completion; returns 0 when it exited successfully. */
+static int run_tool(char *const argv[]) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return -1;
+  if (pid == 0) {
+    char *envp[] = {(char *)"PATH=/bin", NULL};
+    /* Tool output is noise for the smoke log, and top's screen repaint is
+     * large enough to matter on a serial console — keep the exit status,
+     * drop the bytes. */
+    int devnull = open("/dev/null", O_WRONLY);
+    if (devnull >= 0) {
+      dup2(devnull, 1);
+      close(devnull);
+    }
+    execve(argv[0], argv, envp);
+    _exit(127);
+  }
+  int status = 0;
+  if (waitpid(pid, &status, 0) != pid)
+    return -1;
+  return (WIFEXITED(status) && WEXITSTATUS(status) == 0) ? 0 : -1;
 }
 
 int main(void) {
@@ -152,6 +177,19 @@ int main(void) {
     return 1;
   }
   ok("sysfs-cpu");
+
+  /* The procfs/sysfs-backed monitoring tools must actually run and read back
+   * kernel state (they open /proc and /sys under the hood). Driven from here
+   * because the Ring 3 test runner only ever execs a binary with no arguments,
+   * and these need theirs. */
+  if (run_tool((char *[]){(char *)"/bin/free", NULL}) == 0 &&
+      run_tool((char *[]){(char *)"/bin/sysctl", (char *)"kernel.osrelease",
+                          NULL}) == 0 &&
+      run_tool((char *[]){(char *)"/bin/top", (char *)"-b", (char *)"-n",
+                          (char *)"1", NULL}) == 0)
+    ok("tools");
+  else
+    fail("tools");
 
   emit("M34-PROC: done\n");
   return 0;

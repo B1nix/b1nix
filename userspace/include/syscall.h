@@ -218,6 +218,8 @@ enum {
   SYS_WRITEV            = 234,
   SYS_NANOSLEEP         = 235,
   SYS_EXECVEAT          = 236,
+  SYS_SENDTO            = 237,
+  SYS_RECVFROM          = 238,
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

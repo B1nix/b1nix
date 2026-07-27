@@ -254,8 +254,13 @@ static void test_truncate_zeros(void) {
       return;
     }
   }
-  if (ftruncate(fd, 100) < 0 || ftruncate(fd, 8192) < 0) {
-    fail("truncate-zeros-ftruncate", errno, 0);
+  if (ftruncate(fd, 100) < 0) {
+    fail("truncate-zeros-ftruncate100", errno, 0);
+    close(fd);
+    return;
+  }
+  if (ftruncate(fd, 8192) < 0) {
+    fail("truncate-zeros-ftruncate8192", errno, 0);
     close(fd);
     return;
   }
@@ -461,6 +466,9 @@ static void nice_worker(const char *path, int nice_val, int start_fd) {
   }
   close(start_fd);
   nice(nice_val);
+  /* Report the nice value the kernel actually stored, so a failure can tell
+   * "nice() never took effect" apart from "the scheduler ignores nice". */
+  int applied = getpriority(PRIO_PROCESS, 0);
   volatile unsigned long count = 0;
   struct timeval start, now;
   gettimeofday(&start, NULL);
@@ -482,7 +490,7 @@ static void nice_worker(const char *path, int nice_val, int start_fd) {
   int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0644);
   if (fd >= 0) {
     char buf[64];
-    snprintf(buf, sizeof(buf), "%lu\n", count);
+    snprintf(buf, sizeof(buf), "%lu %d\n", count, applied);
     write(fd, buf, strlen(buf));
     close(fd);
   }
@@ -525,6 +533,7 @@ static void test_nice_biasing(void) {
     waitpid(pids[i], &st, 0);
   }
 
+  int nice_high = 999, nice_low = 999;
   for (int i = 0; i < NICE_WORKERS * 2; i++) {
     snprintf(path, sizeof(path), "/tmp/m46nice_%c%d",
              i < NICE_WORKERS ? 'h' : 'l', i % NICE_WORKERS);
@@ -533,10 +542,15 @@ static void test_nice_biasing(void) {
       char buf[64];
       memset(buf, 0, sizeof(buf));
       read(fd, buf, sizeof(buf) - 1);
+      char *end = NULL;
+      unsigned long c = strtoul(buf, &end, 10);
+      int applied = end ? (int)strtol(end, NULL, 10) : 999;
       if (i < NICE_WORKERS) {
-        count_high += strtoul(buf, NULL, 10);
+        count_high += c;
+        nice_high = applied;
       } else {
-        count_low += strtoul(buf, NULL, 10);
+        count_low += c;
+        nice_low = applied;
       }
       close(fd);
     }
@@ -547,7 +561,9 @@ static void test_nice_biasing(void) {
     ok("nice-biasing");
   } else {
     char dbg[128];
-    snprintf(dbg, sizeof(dbg), "nice-biasing: high=%lu low=%lu", count_high, count_low);
+    snprintf(dbg, sizeof(dbg),
+             "nice-biasing: high=%lu low=%lu applied_nice high=%d low=%d",
+             count_high, count_low, nice_high, nice_low);
     marker(dbg);
     fail("nice-biasing", count_high, count_low);
   }

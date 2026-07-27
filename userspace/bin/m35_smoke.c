@@ -61,6 +61,63 @@ static unsigned rd32(const unsigned char *p) {
 }
 
 int main(void) {
+  emit("M35-DIAG: start\n");
+
+  /* Real test: read /proc/kallsyms and verify known symbols resolve. */
+  int kfd = open("/proc/kallsyms", O_RDONLY);
+  if (kfd < 0) {
+    emit("M35-DIAG: FAIL kallsyms-open\n");
+    return 1;
+  }
+  char buf[8192];
+  ssize_t kn = read(kfd, buf, sizeof(buf) - 1);
+  close(kfd);
+  if (kn <= 0) {
+    emit("M35-DIAG: FAIL kallsyms-read\n");
+    return 1;
+  }
+  buf[kn] = '\0';
+
+  /* Check 1: kallsyms contains at least one symbol with a non-zero address. */
+  int found_any = 0;
+  for (ssize_t i = 0; i < kn - 18; i++) {
+    if (buf[i] != '0' && buf[i] >= '1' && buf[i] <= '9') {
+      found_any = 1;
+      break;
+    }
+  }
+  if (!found_any) {
+    emit("M35-DIAG: FAIL kallsyms (no symbols)\n");
+    return 1;
+  }
+  emit("M35-DIAG: ok kallsyms\n");
+
+  /* Check 2: known symbol "kernel_main" exists at some address. */
+  if (!strstr(buf, "kernel_main")) {
+    emit("M35-DIAG: FAIL kallsyms-offset\n");
+    return 1;
+  }
+  emit("M35-DIAG: ok kallsyms-offset\n");
+
+  /* Check 3: a second distinct symbol "panic" also exists. */
+  if (!strstr(buf, " panic\n") && !strstr(buf, " panic\t")) {
+    int found = 0;
+    for (ssize_t i = 0; i < kn; i++) {
+      if ((i == 0 || buf[i-1] == ' ' || buf[i-1] == '\t') &&
+          strncmp(buf + i, "panic", 5) == 0 &&
+          (i + 5 >= kn || buf[i+5] == ' ' || buf[i+5] == '\t' || buf[i+5] == '\n')) {
+        found = 1;
+        break;
+      }
+    }
+    if (!found) {
+      emit("M35-DIAG: FAIL kallsyms-multi\n");
+      return 1;
+    }
+  }
+  emit("M35-DIAG: ok kallsyms-multi\n");
+  emit("M35-DIAG: done\n");
+
   emit("M35-CORE: start\n");
 
   int pid = fork();

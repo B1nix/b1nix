@@ -25,6 +25,7 @@
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <netdb.h>
+#include <poll.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sched.h>
@@ -180,13 +181,29 @@ static int make_loopback_addr(unsigned short port, struct sockaddr_in *addr) {
   return 0;
 }
 
+/* Bounded receive: wait for readability with a deadline, then recv() once.
+ * A plain blocking recv() is POSIX-correct, but every test in this instance
+ * runs sequentially under one init — so a single lost loopback datagram or a
+ * peer that never answers stalls the WHOLE instance until the host watchdog
+ * kills QEMU 120s later, losing every marker that would have come after.
+ * Returning 0 on timeout makes such a case a FAIL of this one check instead.
+ * Returns the byte count, 0 on timeout/EOF, -1 on error. */
+static int recv_deadline(int fd, char *buf, int max, int timeout_ms) {
+  struct pollfd p;
+  p.fd = fd;
+  p.events = POLLIN;
+  p.revents = 0;
+  int rc = poll(&p, 1, timeout_ms);
+  if (rc < 0) return -1;
+  if (rc == 0) return 0;
+  return (int)recv(fd, buf, (size_t)max, 0);
+}
+
+#define RECV_TIMEOUT_MS 15000
+
 static int recv_with_retry(int fd, char *buf, int max) {
-  for (int tries = 0; tries < 100; tries++) {
-    int n = (int)recv(fd, buf, (size_t)max, 0);
-    if (n > 0) return n;
-    sched_yield();
-  }
-  return 0;
+  int n = recv_deadline(fd, buf, max, RECV_TIMEOUT_MS);
+  return n > 0 ? n : 0;
 }
 
 static int connect_loopback(unsigned short port) {
@@ -203,6 +220,19 @@ static int connect_loopback(unsigned short port) {
   return -1;
 }
 
+/* Bounded accept: same rationale as recv_deadline — a server child stuck in
+ * an unbounded accept() keeps the parent's final waitpid() from ever
+ * returning, wedging the instance. Returns -1 on timeout. */
+static int accept_deadline(int lfd, int timeout_ms) {
+  struct pollfd p;
+  p.fd = lfd;
+  p.events = POLLIN;
+  p.revents = 0;
+  if (poll(&p, 1, timeout_ms) <= 0)
+    return -1;
+  return accept(lfd, 0, 0);
+}
+
 static int run_server(unsigned short port) {
   int lfd = socket(AF_INET, SOCK_STREAM, 0);
   if (lfd < 0) return 2;
@@ -215,7 +245,7 @@ static int run_server(unsigned short port) {
     return 3;
   }
 
-  int cfd = accept(lfd, 0, 0);
+  int cfd = accept_deadline(lfd, RECV_TIMEOUT_MS);
   if (cfd < 0) {
     close(lfd);
     return 4;
@@ -230,7 +260,7 @@ static int run_server(unsigned short port) {
   send(cfd, "m32-echo-ok", 11, 0);
   close(cfd);
 
-  cfd = accept(lfd, 0, 0);
+  cfd = accept_deadline(lfd, RECV_TIMEOUT_MS);
   if (cfd < 0) {
     close(lfd);
     return 6;
@@ -251,7 +281,7 @@ static int run_server(unsigned short port) {
   send(cfd, resp, strlen(resp), 0);
   close(cfd);
 
-  cfd = accept(lfd, 0, 0);
+  cfd = accept_deadline(lfd, RECV_TIMEOUT_MS);
   if (cfd < 0) {
     close(lfd);
     return 9;
@@ -506,9 +536,9 @@ static int test_tcp_client_server(void) {
     return -1;
   }
   if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4443", NULL};
+    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4443", NULL};
     char *srv_envp[] = {NULL};
-    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    execve("/bin/m32_nettool", srv_argv, srv_envp);
     _exit(127);
   }
   /* Retry the connect: under host load (the parallel smoke) the server's
@@ -517,7 +547,7 @@ static int test_tcp_client_server(void) {
    * before its (slow) TLS init, so only the first SUCCESSFUL connect is served —
    * earlier refused attempts don't consume it. */
   curl_status = -1;
-  for (int attempt = 0; attempt < 12; attempt++) {
+  for (int attempt = 0; attempt < 4; attempt++) {
     sleep(1);
     curl_pid = fork();
     if (curl_pid < 0) {
@@ -529,7 +559,7 @@ static int test_tcp_client_server(void) {
     if (curl_pid == 0) {
       char *curl_tls_argv[] = {
         "/bin/curl", "--cacert", "/etc/tls-test/ca.pem",
-        "--connect-timeout", "8", "-sS", "https://127.0.0.1:4443/", NULL
+        "--connect-timeout", "2", "-sS", "https://127.0.0.1:4443/", NULL
       };
       char *curl_tls_envp[] = {NULL};
       int out = open("/tmp/curl.https", O_CREAT | O_TRUNC | O_WRONLY, 0644);
@@ -580,9 +610,9 @@ static int test_tcp_client_server(void) {
     return -1;
   }
   if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4444", NULL};
+    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4444", NULL};
     char *srv_envp[] = {NULL};
-    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    execve("/bin/m32_nettool", srv_argv, srv_envp);
     _exit(127);
   }
   sleep(1);
@@ -593,7 +623,7 @@ static int test_tcp_client_server(void) {
   }
   if (curl_pid == 0) {
     char *curl_bad_argv[] = {
-      "/bin/curl", "--connect-timeout", "8", "-sS",
+      "/bin/curl", "--connect-timeout", "2", "-sS",
       "https://127.0.0.1:4444/", NULL
     };
     char *curl_bad_envp[] = {NULL};
@@ -653,7 +683,7 @@ static int test_udp6_loopback(void) {
   if (send(tx, "v6-dgram", 8, 0) != 8) { fail("udp6-send"); return -1; }
 
   char buf[32];
-  int n = (int)recv(rx, buf, sizeof(buf), 0);
+  int n = recv_deadline(rx, buf, sizeof(buf), RECV_TIMEOUT_MS);
   close(tx);
   close(rx);
   if (n != 8 || memcmp(buf, "v6-dgram", 8) != 0) {
@@ -714,6 +744,9 @@ static int test_tcp6_loopback(void) {
     sched_yield();
   }
   if (fd < 0) {
+    kill(pid, 9);
+    int st = 0;
+    waitpid(pid, &st, 0);
     fail("tcp6-connect");
     return -1;
   }
@@ -738,13 +771,15 @@ static int curl_fetch(const char *url, const char *family) {
   int pid = fork();
   if (pid < 0) return -1;
   if (pid == 0) {
-    char *argv[8];
+    char *argv[10];
     int a = 0;
     argv[a++] = "/bin/curl";
     argv[a++] = "-sS";
     if (family) argv[a++] = (char *)family;
     argv[a++] = "--connect-timeout";
-    argv[a++] = "12";
+    argv[a++] = "2";
+    argv[a++] = "--max-time";
+    argv[a++] = "3";
     argv[a++] = (char *)url;
     argv[a] = NULL;
     char *envp[] = {NULL};
@@ -871,7 +906,7 @@ static int test_v4mapped_udp(void) {
   }
   if (send(tx, "v4map", 5, 0) != 5) { fail("v4mapped-send"); return -1; }
   char buf[16];
-  int n = (int)recv(rx, buf, sizeof(buf), 0);
+  int n = recv_deadline(rx, buf, sizeof(buf), RECV_TIMEOUT_MS);
   close(tx);
   close(rx);
   if (n != 5 || memcmp(buf, "v4map", 5) != 0) {
@@ -950,7 +985,7 @@ static int run_regex_server(unsigned short port) {
     int cfd = accept(lfd, 0, 0);
     if (cfd < 0) break;
     char req[512];
-    int n = (int)recv(cfd, req, sizeof(req) - 1, 0);
+    int n = recv_deadline(cfd, req, sizeof(req) - 1, RECV_TIMEOUT_MS);
     if (n <= 0) { close(cfd); continue; }
     req[n] = '\0';
     if (strstr(req, "GET /yes-1")) {
@@ -1228,9 +1263,9 @@ static int test_wget_https(void) {
     return -1;
   }
   if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4445", NULL};
+    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4445", NULL};
     char *srv_envp[] = {NULL};
-    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    execve("/bin/m32_nettool", srv_argv, srv_envp);
     _exit(127);
   }
   sleep(1);
@@ -1316,9 +1351,9 @@ static int test_wget_https(void) {
     return -1;
   }
   if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32-nettool", "tls-server", "4446", NULL};
+    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4446", NULL};
     char *srv_envp[] = {NULL};
-    execve("/bin/m32-nettool", srv_argv, srv_envp);
+    execve("/bin/m32_nettool", srv_argv, srv_envp);
     _exit(127);
   }
   sleep(1);
@@ -1718,6 +1753,12 @@ static int ssh_reap_client(int cli, int *status) {
     int r = (int)waitpid(cli, status, WNOHANG);
     if (r == cli) return 1;
     if (r < 0) return 0;
+    /* Progress trace: the whole suite has been killed here by the init
+     * watchdog before (sleep never returning), and without a per-poll line the
+     * log cannot tell "client still running" from "parent stuck in sleep". */
+    char dbg[64];
+    snprintf(dbg, sizeof(dbg), "M32B-SSH: dbg reap poll=%d\n", i);
+    emit(dbg);
     sleep(1);
   }
   kill(cli, SIGKILL);
@@ -2019,11 +2060,86 @@ static int test_ssh_handshake(void) {
     return -1;
   }
   int srv = ssh_start_server("127.0.0.1:2222");
+  /* Stage markers: when one sub-test wedges the whole suite is killed by the
+   * init watchdog, and the last stage line is the only thing that names which
+   * step never returned. */
+  emit("M32B-SSH: stage login\n");
   ssh_test_login();
+  emit("M32B-SSH: stage negauth\n");
   ssh_test_negauth();
+  emit("M32B-SSH: stage pty\n");
   ssh_test_pty();
+  emit("M32B-SSH: stage teardown\n");
   ssh_kill_server(srv);
+  emit("M32B-SSH: stage done\n");
   return 0;
+}
+
+static int test_tcp_window_throttle(void) {
+  int srv = socket(AF_INET, SOCK_STREAM, 0);
+  if (srv < 0) return 1;
+
+  int opt = 1;
+  setsockopt(srv, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
+
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
+  addr.sin_family = AF_INET;
+  addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+  addr.sin_port = htons(39999);
+
+  if (bind(srv, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+    close(srv);
+    return 1;
+  }
+  if (listen(srv, 1) < 0) {
+    close(srv);
+    return 1;
+  }
+
+  int cli = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, 0);
+  if (cli < 0) {
+    close(srv);
+    return 1;
+  }
+  connect(cli, (struct sockaddr *)&addr, sizeof(addr));
+
+  struct sockaddr_in peer;
+  socklen_t peerlen = sizeof(peer);
+  int acc = accept(srv, (struct sockaddr *)&peer, &peerlen);
+  if (acc < 0) {
+    close(cli);
+    close(srv);
+    return 1;
+  }
+  fcntl(acc, F_SETFL, fcntl(acc, F_GETFL, 0) | O_NONBLOCK);
+
+  int small_rcv = 4096;
+  setsockopt(acc, SOL_SOCKET, SO_RCVBUF, &small_rcv, sizeof(small_rcv));
+
+  usleep(50000);
+
+  char buf[1024];
+  memset(buf, 'A', sizeof(buf));
+  int stalled = 0;
+  for (int i = 0; i < 500; i++) {
+    ssize_t n = send(cli, buf, sizeof(buf), MSG_DONTWAIT);
+    if (n < 0 && errno == EAGAIN) {
+      stalled = 1;
+      break;
+    }
+    if (n < 0) break;
+  }
+
+  close(acc);
+  close(cli);
+  close(srv);
+
+  if (stalled)
+    emit("M32-TCP: ok window-throttle\n");
+  else
+    emit("M32-TCP: FAIL window-throttle\n");
+  return stalled ? 0 : 1;
 }
 
 int main(int argc, char **argv) {
@@ -2049,6 +2165,7 @@ int main(int argc, char **argv) {
   if (test_dns_libc() != 0)            return 1;
   if (test_udp6_loopback() != 0)       return 1;
   if (test_tcp6_loopback() != 0)       return 1;
+  if (test_tcp_window_throttle() != 0) return 1;
   if (test_tcp_client_server() != 0)   return 1;
   if (test_wget_pcre2_regex() != 0)    return 1;
   if (test_wget_ipv6() != 0)           return 1;

@@ -1,5 +1,5 @@
 /*
- * M92-LDSO: userspace ld.so smoke test (ldso-migration-and-unix-parity-plan.md).
+ * M92-LDSO: userspace ld.so smoke test (musl-port.md).
  *
  * This binary is linked as PIE/ET_DYN with a genuine PT_INTERP =
  * /lib/ld-musl-x86_64.so.1. The kernel loads only the interpreter's own

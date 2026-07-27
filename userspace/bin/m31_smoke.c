@@ -10,6 +10,8 @@
 #include <sys/wait.h>
 #include <sys/stat.h>
 #include <grp.h>
+#include <shadow.h>
+#include <errno.h>
 
 static void emit(const char *s) {
   write(1, s, strlen(s));
@@ -126,6 +128,41 @@ static int test_uid_syscalls(void) {
   uid_t euid = geteuid();
   if (uid != euid) { fail("uid-eq-euid-at-start"); return -1; }
   ok("uid-syscalls");
+  return 0;
+}
+
+/* The shadow-database ACCESSOR, not just the file: Dropbear authenticates with
+ * getspnam(3) and falls back to the /etc/passwd "x" placeholder when it returns
+ * NULL — crypt("x") then yields NULL and the daemon reports "User account
+ * 'root' is locked", failing every password login even though /etc/shadow is
+ * perfectly well-formed. Covering the file alone (test_shadow_readable) missed
+ * exactly that. musl probes /etc/tcb/<user>/shadow first and only falls back to
+ * /etc/shadow when that open() fails with ENOENT/ENOTDIR — so this also pins
+ * the kernel's errno for a lookup through a missing directory component. */
+static int test_getspnam(void) {
+  int fd = open("/etc/tcb/root/shadow", O_RDONLY);
+  if (fd >= 0) {
+    close(fd);
+  } else if (errno != ENOENT && errno != ENOTDIR) {
+    char b[96];
+    snprintf(b, sizeof(b), "M31-SEC: dbg tcb-probe errno=%d\n", errno);
+    emit(b);
+    fail("getspnam-tcb-errno");
+    return -1;
+  }
+  struct spwd *sp = getspnam("root");
+  if (!sp) {
+    char b[96];
+    snprintf(b, sizeof(b), "M31-SEC: dbg getspnam errno=%d\n", errno);
+    emit(b);
+    fail("getspnam-root");
+    return -1;
+  }
+  if (!sp->sp_pwdp || strncmp(sp->sp_pwdp, "$6$", 3) != 0) {
+    fail("getspnam-hash");
+    return -1;
+  }
+  ok("getspnam-root");
   return 0;
 }
 
@@ -291,6 +328,7 @@ int main(void) {
   if (test_seteuid_setegid() != 0)       return 1;
   if (test_groups_syscalls() != 0)       return 1;
   if (test_shadow_readable() != 0)       return 1;
+  if (test_getspnam() != 0)              return 1;
   if (test_shadow_denied_for_user() != 0)return 1;
   if (test_setuid_elevate() != 0)        return 1;
   if (test_setuid_denied() != 0)         return 1;

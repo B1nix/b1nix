@@ -229,14 +229,18 @@ int main(int argc, char **argv, char **envp) {
 
   if (!(argc >= 1 && argv && argv[0] &&
         (strcmp(argv[0], "/bin/m13-smoke") == 0 ||
-         strcmp(argv[0], "m13-smoke") == 0)))
+         strcmp(argv[0], "m13-smoke") == 0 ||
+         strcmp(argv[0], "/bin/m13_smoke") == 0 ||
+         strcmp(argv[0], "m13_smoke") == 0)))
     return 1;
 
   marker("M13-SMOKE: start\n");
 
   if (argc >= 1 && argv && argv[0] &&
       (strcmp(argv[0], "/bin/m13-smoke") == 0 ||
-       strcmp(argv[0], "m13-smoke") == 0)) {
+       strcmp(argv[0], "m13-smoke") == 0 ||
+       strcmp(argv[0], "/bin/m13_smoke") == 0 ||
+       strcmp(argv[0], "m13_smoke") == 0)) {
     marker("M13-SMOKE: ok argc-argv0\n");
   } else {
     marker("M13-SMOKE: fail argc-argv0\n");
@@ -532,6 +536,33 @@ int main(int argc, char **argv, char **envp) {
     }
   }
 
+  /* /bin/native_smoke is a bare-asm, raw-syscall ELF (no libc, no crt): it
+   * prints its own "NATIVE-SMOKE: ok" line, but "done" means it also *exited
+   * cleanly*, which only its parent can observe. The discovery loop can't
+   * report that, so exec it here and report the status. */
+  {
+    pid_t np = fork();
+    if (np == 0) {
+      char *av[] = {(char *)"/bin/native_smoke", NULL};
+      char *ev[] = {(char *)"PATH=/bin", NULL};
+      execve(av[0], av, ev);
+      _exit(127);
+    }
+    if (np > 0) {
+      int st = 0;
+      if (waitpid(np, &st, 0) == np && WIFEXITED(st) && WEXITSTATUS(st) == 0)
+        marker("NATIVE-SMOKE: done\n");
+      else
+        marker("NATIVE-SMOKE: fail\n");
+    }
+  }
+
   marker("M13-SMOKE: done\n");
+
+  /* M24 errno matrix. It used to be driven by the in-kernel dispatcher passing
+   * "--m24"; nothing does that since the Ring 3 init took over test discovery
+   * (which runs every /bin binary with no arguments), so run it inline here as
+   * well. The explicit "--m24" entry point above stays for manual runs. */
+  test_m24_errno();
   return 0;
 }

@@ -2,8 +2,10 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
+#include <poll.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <time.h>
 #include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
@@ -14,7 +16,9 @@
 #include <mbedtls/error.h>
 #include <mbedtls/pk.h>
 #include <mbedtls/ssl.h>
+#include <mbedtls/debug.h>
 #include <mbedtls/x509_crt.h>
+#include <psa/crypto.h>
 #endif
 
 static int connect_tcp(const char *host, const char *port) {
@@ -129,19 +133,53 @@ static int read_pem(const char *path, unsigned char *buf, size_t cap,
   return 0;
 }
 
+/* EAGAIN/EINTR are "no progress right now", not failures: mbedTLS expects
+ * WANT_READ/WANT_WRITE for those and drives the handshake loop again. Mapping
+ * them to INTERNAL_ERROR aborted the handshake the first time the socket had
+ * nothing queued yet ("tls-server: handshake failed -0x6c00"), and the client
+ * then saw a bare EOF. Genuine errors still report errno so the log names the
+ * failing syscall condition. */
+/* Last BIO outcome, reported when a handshake fails: mbedTLS collapses every
+ * transport problem into one error code, so without this the log cannot tell
+ * "peer closed" from "recv() failed" from "no data yet". */
+static int bio_last_r, bio_last_errno, bio_last_was_recv;
+
 static int ssl_bio_send(void *ctx, const unsigned char *b, size_t l) {
   int fd = *(int *)ctx;
   int r = (int)send(fd, b, l, 0);
+  bio_last_r = r; bio_last_errno = errno; bio_last_was_recv = 0;
   if (r == 0) return MBEDTLS_ERR_SSL_WANT_WRITE; /* window full: retry later */
-  if (r < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  if (r < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+      return MBEDTLS_ERR_SSL_WANT_WRITE;
+    fprintf(stderr, "tls-bio: send failed errno=%d\n", errno);
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  }
   return r;
 }
 
 static int ssl_bio_recv(void *ctx, unsigned char *b, size_t l) {
   int fd = *(int *)ctx;
   int r = (int)recv(fd, b, l, 0);
-  if (r < 0) return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  bio_last_r = r; bio_last_errno = errno; bio_last_was_recv = 1;
+  if (r == 0)
+    return MBEDTLS_ERR_SSL_CONN_EOF; /* orderly close, not an internal error */
+  if (r < 0) {
+    if (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR)
+      return MBEDTLS_ERR_SSL_WANT_READ;
+    fprintf(stderr, "tls-bio: recv failed errno=%d\n", errno);
+    return MBEDTLS_ERR_SSL_INTERNAL_ERROR;
+  }
   return r;
+}
+
+/* mbedTLS reports the failing internal step only through its debug callback;
+ * level 1 is errors only, so this stays quiet unless a handshake breaks. */
+static void tls_dbg(void *ctx, int level, const char *file, int line,
+                    const char *str) {
+  (void)ctx;
+  (void)level;
+  fprintf(stderr, "tls-dbg: %s:%d %s", file, line, str);
 }
 
 /* Minimal single-shot loopback HTTPS server: bind+listen on 127.0.0.1:PORT,
@@ -204,6 +242,17 @@ static int tls_server(int argc, char **argv) {
 
   const char *pers = "b1nix-tls-server";
   int rc;
+  /* mbedTLS 3.6 routes parts of the TLS stack through PSA (MBEDTLS_PSA_CRYPTO_C
+   * + TLS 1.3 are both compiled in): without psa_crypto_init() the handshake
+   * aborts with MBEDTLS_ERR_SSL_INTERNAL_ERROR (-0x6c00). */
+  {
+    psa_status_t ps = psa_crypto_init();
+    if (ps != PSA_SUCCESS) {
+      fprintf(stderr, "tls-server: psa_crypto_init failed %d\n", (int)ps);
+      close(lfd);
+      return 1;
+    }
+  }
   if ((rc = mbedtls_ctr_drbg_seed(&ctr_drbg, mbedtls_entropy_func, &entropy,
                                   (const unsigned char *)pers,
                                   strlen(pers))) != 0) {
@@ -234,6 +283,8 @@ static int tls_server(int argc, char **argv) {
   mbedtls_ssl_conf_min_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
   mbedtls_ssl_conf_max_tls_version(&conf, MBEDTLS_SSL_VERSION_TLS1_2);
   mbedtls_ssl_conf_rng(&conf, mbedtls_ctr_drbg_random, &ctr_drbg);
+  mbedtls_debug_set_threshold(1);
+  mbedtls_ssl_conf_dbg(&conf, tls_dbg, NULL);
   if ((rc = mbedtls_ssl_conf_own_cert(&conf, &srvcert, &pkey)) != 0) {
     fprintf(stderr, "tls-server: own cert failed -0x%x\n", -rc);
     close(lfd);
@@ -252,9 +303,31 @@ static int tls_server(int argc, char **argv) {
   }
   mbedtls_ssl_set_bio(&ssl, &cfd, ssl_bio_send, ssl_bio_recv, NULL);
 
+  /* WANT_READ/WANT_WRITE means "no progress yet": wait for the socket to
+   * become ready instead of re-entering the handshake immediately, and give
+   * up after a deadline. A bare retry loop here spins a whole CPU and starves
+   * the rest of the test instance when the peer goes away mid-handshake. */
+  time_t hs_deadline = time(NULL) + 15;
   while ((rc = mbedtls_ssl_handshake(&ssl)) != 0) {
-    if (rc != MBEDTLS_ERR_SSL_WANT_READ && rc != MBEDTLS_ERR_SSL_WANT_WRITE) {
-      fprintf(stderr, "tls-server: handshake failed -0x%x\n", -rc);
+    if (rc == MBEDTLS_ERR_SSL_WANT_READ || rc == MBEDTLS_ERR_SSL_WANT_WRITE) {
+      struct pollfd pfd;
+      pfd.fd = cfd;
+      pfd.events = (rc == MBEDTLS_ERR_SSL_WANT_WRITE) ? POLLOUT : POLLIN;
+      pfd.revents = 0;
+      poll(&pfd, 1, 200);
+      if (time(NULL) > hs_deadline) {
+        fprintf(stderr, "tls-server: handshake timed out\n");
+        close(cfd);
+        close(lfd);
+        return 1;
+      }
+      continue;
+    }
+    {
+      fprintf(stderr,
+              "tls-server: handshake failed -0x%x (last bio %s r=%d errno=%d)\n",
+              -rc, bio_last_was_recv ? "recv" : "send", bio_last_r,
+              bio_last_errno);
       close(cfd);
       close(lfd);
       return 1;

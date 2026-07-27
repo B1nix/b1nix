@@ -22,7 +22,7 @@ static int wait_for_status(int pid, int options, int *status_out, int tries) {
         *status_out = st;
       return 0;
     }
-    sched_yield();
+    usleep(1000);
   }
   return -1;
 }

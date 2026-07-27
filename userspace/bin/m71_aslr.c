@@ -34,8 +34,8 @@ static unsigned long run_child(char **envp) {
     close(p[0]);
     dup2(p[1], 1);
     close(p[1]);
-    char *av[] = {"/bin/m71-aslr", "child", 0};
-    execve("/bin/m71-aslr", av, envp);
+    char *av[] = {"/bin/m71_aslr", "child", 0};
+    execve("/bin/m71_aslr", av, envp);
     _exit(127);
   }
   close(p[1]);
