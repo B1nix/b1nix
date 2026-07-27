@@ -104,7 +104,6 @@ STDLIB_A="$LIBCXX_A"
 STDLIB_ABI_A="$LIBCXXABI_A"
 CRT_A="$LLVM_CRT_A"
 UNW_A=""
-CXX_LINKER_LD="$ROOT_DIR/userspace/linker-libcxx.ld"
 CXX_CACHE_DISCRIM=", '-D__B1NIX_MESA_LIBCXX__=1'"
 
 LB="$ROOT_DIR/userspace/build/$B1NIX_ARCH"

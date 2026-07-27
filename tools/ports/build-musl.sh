@@ -366,6 +366,47 @@ if [ ! -f "$INSTALL_DIR/include/linux/unistd.h" ]; then
     > "$INSTALL_DIR/include/linux/unistd.h"
 fi
 
+# linux/vt.h: BusyBox's init applet includes it unconditionally on Linux for the
+# virtual-console ioctls. b1nix has one console and no VT switching, so the
+# struct and the ioctl numbers are enough to compile; the ioctls themselves
+# return ENOTTY at runtime, which is what init already handles ("not a VT").
+if [ ! -f "$INSTALL_DIR/include/linux/vt.h" ]; then
+  cat > "$INSTALL_DIR/include/linux/vt.h" <<'EOF'
+/* b1nix compat: minimal uapi <linux/vt.h>. b1nix has no virtual terminals; the
+ * numbers match Linux so a caller's ioctl() is a well-formed request that the
+ * kernel simply rejects. */
+#ifndef _B1NIX_LINUX_VT_H
+#define _B1NIX_LINUX_VT_H
+
+#define MIN_NR_CONSOLES 1
+#define MAX_NR_CONSOLES 63
+
+#define VT_OPENQRY   0x5600 /* find an available VT */
+#define VT_GETMODE   0x5601
+#define VT_SETMODE   0x5602
+#define VT_GETSTATE  0x5603
+#define VT_ACTIVATE  0x5606
+#define VT_WAITACTIVE 0x5607
+#define VT_DISALLOCATE 0x5608
+
+struct vt_mode {
+	char mode;
+	char waitv;
+	short relsig;
+	short acqsig;
+	short frsig;
+};
+
+struct vt_stat {
+	unsigned short v_active;  /* active vt */
+	unsigned short v_signal;  /* signal to send */
+	unsigned short v_state;   /* vt bitmask */
+};
+
+#endif /* _B1NIX_LINUX_VT_H */
+EOF
+fi
+
 # Expose as build/<arch>/libc/ — dedicated top-level alias for the system libc
 ln -sfn "$INSTALL_DIR" "$LIBC_DIR"
 
