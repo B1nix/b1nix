@@ -1,0 +1,9 @@
+#!/bin/sh
+# b1nix boot rc script - runs once at startup, before the login shell.
+echo "M27-INIT: rc-script start"
+[ -f /etc/motd ] && cat /etc/motd
+mkdir -p /root /home/user /tmp
+[ ! -f /.b1nix-setup ] && mkdir -p /root /home/user /tmp && echo ready > /.b1nix-setup && echo "M27-INIT: first-boot rootfs initialised"
+# Start SSH daemon service
+[ -f /etc/init.d/sshd ] && /bin/sh /etc/init.d/sshd start
+echo "M27-INIT: ok rc-script"

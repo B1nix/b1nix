@@ -1,0 +1,65 @@
+#!/bin/sh
+# System-wide SSH daemon service control script
+# NOTE: the in-kernel shell does NOT support $(...) command
+# substitution.  Use 'read var < file' to load a value from a
+# file into a shell variable.  Pipelines (pidof | head) also
+# hang, so avoid them entirely.
+
+export PATH="/bin"
+export PIDFILE="/var/run/sshd.pid"
+export LOGFILE="/var/log/sshd.log"
+export PIDOF=/opt/busybox/bin/busybox
+
+case $1 in
+  start)
+    [ -f $PIDFILE ] && read pid < $PIDFILE && kill -0 $pid 2>/dev/null && echo "sshd is already running (PID: $pid)" && exit 0
+    rm -f $PIDFILE
+
+    export HOSTKEY=/etc/ssh/hk_ed25519
+    mkdir -p /etc/ssh
+    [ -f $HOSTKEY ] || echo "sshd: generating host key..."
+    [ -f $HOSTKEY ] || /bin/dropbearkey -t ed25519 -f $HOSTKEY
+
+    mkdir -p /var/run /var/log
+
+    export BIND_ADDR="127.0.0.1:"
+    [ -f /proc/cmdline ] && grep -q "b1nix.ssh-external" /proc/cmdline && export BIND_ADDR=""
+    [ -f /proc/cmdline ] && grep -q "b1nix.ssh-loopback" /proc/cmdline && export BIND_ADDR="127.0.0.1:"
+
+    export HARDEN="-I 300 -K 60 -T 6"
+    [ -f /proc/cmdline ] && grep -q "b1nix.ssh-no-root" /proc/cmdline && export HARDEN="$HARDEN -w"
+    [ -f /proc/cmdline ] && grep -q "b1nix.ssh-pubkey-only" /proc/cmdline && export HARDEN="$HARDEN -s"
+
+    echo "sshd: starting daemon (bind: ${BIND_ADDR}22)..."
+    /bin/dropbear -r $HOSTKEY -p ${BIND_ADDR}22 $HARDEN -F >$LOGFILE 2>&1 &
+    sleep 1
+    $PIDOF pidof dropbear > $PIDFILE
+    read pid < $PIDFILE
+    echo "sshd: started (PID: $pid)"
+    ;;
+  stop)
+    [ -f $PIDFILE ] || { echo "sshd is not running"; exit 0; }
+    read pid < $PIDFILE
+    echo "sshd: stopping daemon (PID: $pid)..."
+    kill $pid 2>/dev/null
+    sleep 1
+    kill -0 $pid 2>/dev/null && sleep 1
+    kill -0 $pid 2>/dev/null && kill -9 $pid 2>/dev/null
+    rm -f $PIDFILE
+    echo "sshd: stopped"
+    ;;
+  restart)
+    /bin/sh $0 stop
+    sleep 1
+    /bin/sh $0 start
+    ;;
+  status)
+    [ -f $PIDFILE ] && read pid < $PIDFILE && kill -0 $pid 2>/dev/null && echo "sshd is running (PID: $pid)" && exit 0
+    echo "sshd: stopped"
+    exit 1
+    ;;
+  *)
+    echo "Usage: $0 {start|stop|restart|status}"
+    exit 1
+    ;;
+esac
