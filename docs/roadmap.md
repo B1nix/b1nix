@@ -417,16 +417,18 @@ syscall-number translation layer keyed off a per-image binary personality
 (`/bin/m40-linux-hello`, `M40-LINUX: ok run-static`, x86_64 only).
 
 - [ ] `partial` Translate Linux x86_64 syscall numbers and semantics.
-  Number-translation table (`kernel/syscall/linux_abi.c`, ~85 calls incl.
-  gettid/link/fchmod/fchown/ftruncate/alarm/sync/fchdir/setpriority) maps the
-  Linux x86_64 ABI to the existing native handlers for Linux-personality tasks;
-  unmapped calls return `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and
-  `getdents64` additionally get a semantic translation to the Linux x86_64
-  `struct stat` / `struct utsname` / `struct linux_dirent64` layouts
-  (`linux_stat_from_b1nix`, `linux_utsname_from_b1nix`, `sys_linux_getdents64`;
-  verified by `M40-LINUX: ok fstat` / `ok uname` / `ok getdents64`). Remaining
-  struct/flag differences (signal-frame layout, ioctl/termios) are not yet
-  translated.
+  Number-translation table (`kernel/syscall/linux_abi.c`) has grown to 165
+  mapped calls (incl. epoll/timerfd/signalfd/inotify/mount/rlimit families,
+  not just the original core set) mapping the Linux x86_64 ABI to the
+  existing native handlers for Linux-personality tasks; unmapped calls return
+  `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and `getdents64` additionally get
+  a semantic translation to the Linux x86_64 `struct stat` / `struct utsname`
+  / `struct linux_dirent64` layouts (`linux_stat_from_b1nix`,
+  `linux_utsname_from_b1nix`, `sys_linux_getdents64`; verified by
+  `M40-LINUX: ok fstat` / `ok uname` / `ok getdents64`). `ioctl` TCGETS/TCSETS
+  now also translate the Linux `struct termios` layout (M92,
+  `kernel/syscall/syscall.c`). Remaining gap: fault-signal `siginfo_t` still
+  doesn't populate `si_addr`/full `si_code` for the interrupted-frame case.
   Linux binaries also reuse the matching native calls verified end to end:
   anonymous `mmap`/`munmap` (flags/prot already match) and
   `clock_gettime` (timespec matches), via `M40-LINUX: ok mmap` / `ok clock`.
@@ -1798,11 +1800,12 @@ PIE base (`0x500000000000`).
   Verify thread-local storage, futex-based synchronization, and
   network syscalls through the Linux ABI layer.
 
-- `working` **Real userspace ld.so (Phase 3, ldso-migration-and-unix-parity-plan.md).**
+- `done` **Real userspace ld.so (Phase 3, musl-port.md).**
   Kernel genuinely loads `/lib/ld-musl-x86_64.so.1` as a real ELF interpreter
-  (unrelocated segments, correct `AT_BASE`/`AT_ENTRY`) instead of running the
-  in-kernel eager linker, gated on that exact `PT_INTERP` value so every other
-  dynamically-linked port is untouched (confirmed: full smoke 864/5, all 5
+  (unrelocated segments, correct `AT_BASE`/`AT_ENTRY`). The old in-kernel
+  eager linker is gone from `kernel/user/process.c`; every rootfs binary is
+  musl-linked now, so there is no other `PT_INTERP` case left to gate on
+  (confirmed: full smoke 864/5, all 5
   pre-existing/unrelated). `b1nix-musl-cc -ldso` produces a real-interpreter
   PIE, with a post-link `.dynstr` fixup restoring musl-gcc's own
   `DT_NEEDED=libc.so` self-reference convention. `M92-LDSO: done (ok=4
@@ -1813,3 +1816,44 @@ PIE base (`0x500000000000`).
   still depend on it and aren't migrated yet. `M92-MUSL-DYN` (old
   eager-linker smoke test) has an unrelated pre-existing SIGSEGV, untouched
   by this work.
+
+- [x] **Ring 0 to Ring 3 Migration**: Migrated PID 1 `/bin/init` and PID 5 `/bin/netd` from kernel Ring 0 code into standalone Ring 3 userspace ELFs (`userspace/bin/init.c`).
+- [x] **Full Initramfs Purge**: Removed all legacy `#include "initramfs_mXX.inc"` headers and the legacy `files[]` table from `kernel/fs/initramfs.c`, reducing initramfs to a 15-line minimal bootstrap.
+- [x] **Ext4 Primary Root Filesystem**: `ext4` on `ram0`/`virtio-blk0` (`root.ext4`) made the standard primary root filesystem (`/`) across all boot modes.
+- [x] **VFS Disk Node Fixes**: Fixed VFS `add_node()` lookup & data overwrite bug for ext4 disk nodes.
+## M93: Ring 0 Cleanup
+
+- [x] `done` **In-Kernel Dynamic Linker Purge.**
+  Retired the eager in-kernel dynamic relocation pass from `kernel/user/process.c`. Relocations and dynamic linking are fully delegated to userspace `ld-musl`. Standard Unix approach (Linux, FreeBSD, all do this).
+- [x] `planned` **Kernel Build Automation Migration.**
+  Replace in-kernel build orchestrator (`run_selfhost_build` in `kernel/main.c`) with userspace shell build scripts. No Unix OS runs compilation from kernel context.
+
+## M94: Foreign Userspace Independence & Kernel Decoupling
+
+Goal: Completely decouple the b1nix kernel from its custom userspace, allowing any standard Linux rootfs (Alpine, Debian, BusyBox) to boot natively without kernel modifications or proprietary daemons.
+
+- [ ] `planned` **Generic Boot & Init System Orchestration.**
+  Remove hardcoded `/bin/init` spawn sequences from `kernel/main.c`. Support standard Linux boot cmdline parameters (`init=/bin/sh`, `init=/sbin/init`) allowing boot of standard OpenRC, Systemd, or BusyBox init.
+- [ ] `planned` **Standardized Virtual Memory Address Space Layout.**
+  Fully detach loader from hardcoded load address `0x02000000`. Support arbitrary standard Linux ELF load bases and PIE randomization without memory collisions with kernel mappings.
+- [ ] `planned` **100% Transparent Linux ABI Conformance.**
+  Complete missing Linux syscall translations, auxiliary vector descriptors (`AT_SYSINFO_EHDR`, `AT_BASE`), and struct alignments so unpatched glibc and musl binaries run without b1nix-specific headers.
+
+## M95: Linux x86_64 ABI Compatibility
+
+Goal: Make b1nix's kernel ABI Linux x86_64 compatible — signal numbers, struct layouts, and syscall conventions all match Linux x86_64 — so stock musl (and eventually glibc) binaries compiled for Linux run without a translation layer. Note: POSIX defines the API (which fields exist) but NOT the ABI (exact byte layout); different Unix systems have different struct layouts. Our target is specifically Linux x86_64 because musl/glibc target Linux.
+
+Detailed plan: [`docs/m95-posix-abi-port-plan.md`](docs/m95-posix-abi-port-plan.md)
+
+- [ ] `planned` **POSIX Signal Number Migration.**
+  Replace b1nix's non-standard signal numbering (SIGABRT=1, SIGUSR1=19) with POSIX numbers (SIGHUP=1..SIGSYS=31, SIGRTMIN=32..SIGRTMAX=63). Change `_NSIG` from 31 to 65, expand `sigactions[31]` → `sigactions[65]` in `struct task`. Verify sigset_t bit positions and RT signal side-table allocation (M74) remain correct. Files: `kernel/include/b1nix/sched.h`, `userspace/include/signal.h`.
+- [ ] `planned` **Linux-Compatible Struct Layouts.**
+  Add `struct posix_stat` matching Linux x86_64 `struct stat` field order (st_dev, st_ino, st_nlink, st_mode, st_uid, st_gid, st_rdev, __pad1, st_size, st_blksize, st_blocks, st_atim, st_mtim, st_ctim, st_ino). Widen `struct b1nix_utsname` fields from `[32]` to `[65]`. Update `struct b1nix_termios` to include `c_line` and shrink `c_cc` from `[32]` to `[19]`. Add native `sys_stat`/`sys_fstat`/`sys_lstat` handlers that return Linux-compatible layouts. Files: `kernel/include/b1nix/posix.h`, `kernel/syscall/syscall.c`.
+- [ ] `planned` **musl Syscall Table Rewrite.**
+  Rewrite `build/src/musl/.../bits/syscall.h.in` to use b1nix syscall numbers instead of Linux x86_64 numbers. Remove `-D__linux__` from `tools/ports/build-musl.sh` so musl uses b1nix's own bits headers. Keep `tools/b1nix-musl-cc` EI_OSABI patch for ELF compatibility. Files: `build/src/musl/x86_64-b1nix/musl-1.2.5/arch/x86_64/bits/syscall.h.in`, `tools/ports/build-musl.sh`.
+- [ ] `planned` **New Syscall Handlers (Critical musl Dependencies).**
+  Implement `SYS_set_tid_address` and `SYS_set_robust_list` in `kernel/syscall/syscall.c` — musl pthreads require these for thread cleanup and robust futex lists. Stub remaining ~71 Linux-specific syscalls (io_uring, cgroups, perf events, etc.) with `-ENOSYS`. Verify existing `sys_futex` is sufficient for musl pthreads.
+- [ ] `planned` **linux_abi.c Translation Layer Removal.**
+  After musl and all smoke tests pass with the native POSIX ABI, remove `kernel/syscall/linux_abi.c` (translation table), `kernel/include/b1nix/linux_abi.h`, and personality detection in `kernel/user/process.c`. All binaries will use the native b1nix ABI directly. Files: `kernel/syscall/linux_abi.c`, `kernel/include/b1nix/linux_abi.h`, `kernel/user/process.c`.
+
+
