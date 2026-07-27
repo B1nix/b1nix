@@ -26,9 +26,11 @@ SECTIONS
 	. += KERNEL_VMA;
 	__kernel_start = .;
 
+	__kernel_text_start = .;
 	.text ALIGN(4K) : AT(ADDR(.text) - KERNEL_VMA) {
 		*(.text .text.*)
 	}
+	__kernel_text_end = .;
 	. = ALIGN(512K);  /* Pad .text to 512K boundary — stabilises layout for TCC */
 
 	.rodata ALIGN(4K) : AT(ADDR(.rodata) - KERNEL_VMA) {

@@ -3,6 +3,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
+#include <b1nix/syscall.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -105,6 +106,22 @@ void unix_free_state(struct vfs_socket_state *s) {
   if (!u) return;
   s->unix_data = 0;
 
+  /* A bound socket left its vfs node's inode->data pointing at this state
+   * (unix_bind). The file itself persists after close (Linux semantics), but
+   * the pointer must be severed NOW: a later connect() dereferences
+   * inode->data, and after the kfree(s) below that's a UAF → GP fault (seen
+   * as clients connecting to a crashed displayd's stale socket). Cleared
+   * only if it still points at us — a new socket may have rebound the path. */
+  if (s->bound && s->local.un.sun_path[0]) {
+    struct vfs_node *bn = vfs_find_node(s->local.un.sun_path);
+    if (!IS_ERR(bn)) {
+      if (bn->inode && bn->inode->type == VFS_SOCKET &&
+          bn->inode->data == (void *)s)
+        bn->inode->data = 0;
+      vfs_node_put(bn);
+    }
+  }
+
   /* Detach from a connected peer: clear OUR forward pointer and the peer's
    * back pointer, mark the peer disconnected, and wake it so its blocked
    * recv/send/poll observes the hangup. Each direction was a counted ref. */
@@ -206,9 +223,13 @@ int unix_connect(struct vfs_socket_state *s, const struct b1nix_sockaddr_un *add
   if (peer_node->inode->type != VFS_SOCKET) { vfs_node_put(peer_node); return -ENOTSOCK; }
   
   struct vfs_socket_state *peer_s = (struct vfs_socket_state *)peer_node->inode->data;
+  /* The socket file outlives its socket: after the owner closes (or crashes),
+   * teardown clears inode->data. Linux semantics: ECONNREFUSED, not a deref. */
+  if (!peer_s) { vfs_node_put(peer_node); return -ECONNREFUSED; }
   struct unix_socket_data *u = (struct unix_socket_data *)s->unix_data;
   struct unix_socket_data *peer_u = (struct unix_socket_data *)peer_s->unix_data;
-  
+  if (!peer_u) { vfs_node_put(peer_node); return -ECONNREFUSED; }
+
   if (s->type == B1NIX_SOCK_STREAM) {
     if (!peer_s->listening) { vfs_node_put(peer_node); return -ECONNREFUSED; }
     unix_lock(peer_u);
@@ -332,8 +353,10 @@ isize unix_send_control(struct vfs_socket_state *s, const void *buf, usize len,
   if (s->syslog_sink) {
     char line[512];
     usize n = (buf && len < sizeof(line) - 1) ? len : (buf ? sizeof(line) - 1 : 0);
-    if (n)
-      memcpy(line, buf, n);
+    if (n) {
+      if (syscall_copyin(line, buf, n) < 0)
+        return -EFAULT;
+    }
     while (n && (line[n - 1] == '\n' || line[n - 1] == '\r'))
       n--;
     line[n] = '\0';

@@ -278,6 +278,10 @@ int vfs_accept(int fd, void *addr, usize *addrlen);
 int vfs_connect(int fd, const void *addr, usize addrlen);
 isize vfs_socket_send(int fd, const void *buf, usize len, int flags);
 isize vfs_socket_recv(int fd, void *buf, usize len, int flags);
+isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
+                        const void *addr, usize addrlen);
+isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
+                          usize *addrlen);
 struct b1nix_ucred {
   int pid;
   u32 uid;

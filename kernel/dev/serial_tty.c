@@ -175,12 +175,10 @@ static isize stty_read(struct vfs_handle *h, char *buf, usize size) {
   /* Job control: a background pgrp reading from its controlling tty gets
    * SIGTTIN (mirrors the boot-console rules in vfs.c tty_read). */
   if (current_task && t->fg_pgrp > 0 &&
-      current_task->session_id == t->session_id) {
+      (t->session_id == 0 || current_task->session_id == t->session_id)) {
     if (current_task->process_group_id != t->fg_pgrp) {
       if ((current_task->blocked_signals & (1ULL << (SIGTTIN - 1))) ||
           current_task->sigactions[SIGTTIN - 1].sa_handler == SIG_IGN)
-        return -EIO;
-      if (current_task->parent_id == 0 || current_task->parent_id == 1)
         return -EIO;
       scheduler_kill_process_group(current_task->process_group_id, SIGTTIN);
       return -ERESTARTSYS;
@@ -312,6 +310,16 @@ static int stty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     return 0;
   case B1NIX_TIOCNOTTY:
     return 0;
+  case B1NIX_TIOCSTI: {
+    /* Linux TIOCSTI: inject one byte into the input queue as if typed —
+     * travels the full line discipline (canon/ISIG/VEOF) like UART input. */
+    char c;
+    if (!arg || syscall_copyin(&c, arg, 1) < 0)
+      return -EFAULT;
+    stty_input_char(t, (u8)c);
+    scheduler_wake_all(vfs_poll_chan);
+    return 0;
+  }
   default:
     return -ENOTTY;
   }

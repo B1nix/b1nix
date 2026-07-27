@@ -9,6 +9,9 @@
 #include <b1nix/lapic.h>
 #include <b1nix/lockdep.h>
 #include <b1nix/panic.h>
+#include <b1nix/klog.h>
+#include <b1nix/sched.h>
+#include <b1nix/types.h>
 
 #ifdef KERNEL_LOCKDEP
 
@@ -180,3 +183,33 @@ void lockdep_dump_all(void) {
 }
 
 #endif  /* KERNEL_LOCKDEP */
+
+/* ── Spin-lock lockup detector ──
+ *
+ * A CPU that spins forever on a spinlock (holder descheduled while holding it,
+ * missing unlock on an error path, or an IRQ-unsafe lock re-entered from an
+ * ISR) is invisible: the machine simply goes silent with no panic and no last
+ * marker. spin_lock() calls this once its spin count crosses the threshold so
+ * the failure names the lock, the CPU, the current task, and the caller.
+ */
+void spin_lock_stuck(volatile int *lock, u64 caller) {
+    console_bust_lock();
+    console_write("\nSPINLOCK LOCKUP on cpu ");
+    console_write_dec((u64)percpu_read(cpu_id));
+    console_write(": lock=0x");
+    console_write_hex64((u64)(usize)lock);
+    console_write(" value=");
+    console_write_dec((u64)(unsigned)*lock);
+    console_write("\n  caller: 0x");
+    console_write_hex64(caller);
+    ksym_print(caller);
+    if (current_task) {
+        console_write("\n  task: pid=");
+        console_write_dec((u64)current_task->id);
+        console_write(" name=");
+        console_write(current_task->name ? current_task->name : "(none)");
+    }
+    console_write("\n");
+    scheduler_dump_tasks();
+    panic("spinlock lockup");
+}

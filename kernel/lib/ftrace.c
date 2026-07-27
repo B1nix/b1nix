@@ -6,6 +6,7 @@
 #include <b1nix/console.h>
 #include <b1nix/ftrace.h>
 #include <b1nix/klog.h>
+#include <string.h>
 
 #define FTRACE_CAP 256
 
@@ -68,4 +69,61 @@ __attribute__((no_instrument_function)) void
 __cyg_profile_func_exit(void *this_fn, void *call_site) {
   (void)call_site;
   ftrace_record((u64)(usize)this_fn, FTRACE_EXIT);
+}
+
+/* ── in-memory self-test (M36 smoke, called from main.c in test mode) ── */
+
+extern int ftrace_demo_work(int x);
+
+void m36_ftrace_selftest(void) {
+  console_write("M36-FTRACE: start\n");
+
+  ftrace_reset();
+  ftrace_enable();
+
+  volatile int result = ftrace_demo_work(42);
+  (void)result;
+
+  ftrace_disable();
+
+  usize count = ftrace_count();
+  if (count < 4) {
+    console_write("M36-FTRACE: FAIL capture (count=");
+    char buf[16];
+    int n = 0;
+    usize v = count;
+    if (v == 0) buf[n++] = '0';
+    else {
+      char tmp[16];
+      int t = 0;
+      while (v) { tmp[t++] = '0' + (v % 10); v /= 10; }
+      while (t) buf[n++] = tmp[--t];
+    }
+    buf[n] = '\0';
+    console_write(buf);
+    console_write(")\n");
+    return;
+  }
+  console_write("M36-FTRACE: ok capture\n");
+
+  int found_work = 0, found_leaf = 0;
+  for (usize i = 0; i < count; i++) {
+    const struct ftrace_event *ev = ftrace_get(i);
+    if (!ev) continue;
+    u64 off = 0;
+    const char *name = ksym_lookup(ev->addr, &off);
+    if (!name) continue;
+    if (strncmp(name, "ftrace_demo_work", 16) == 0 &&
+        (name[16] == '\0' || name[16] == '+'))
+      found_work = 1;
+    if (strncmp(name, "ftrace_demo_leaf", 16) == 0 &&
+        (name[16] == '\0' || name[16] == '+'))
+      found_leaf = 1;
+  }
+  if (found_work || found_leaf)
+    console_write("M36-FTRACE: ok symbolize\n");
+  else
+    console_write("M36-FTRACE: FAIL symbolize\n");
+
+  console_write("M36-FTRACE: done\n");
 }

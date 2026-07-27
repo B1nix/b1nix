@@ -64,13 +64,11 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
   u64 frame_base = (top - sizeof(struct b1nix_sigframe)) & ~0xFULL;
   u64 restorer_slot = frame_base - sizeof(u64);
 
-  /* Prefer the kernel-owned signal-return trampoline (mapped RO+exec at exec);
-   * fall back to a userspace-supplied sa_restorer only if it was not mapped
-   * (e.g. OOM at exec). The trampoline is tamper-proof — userspace cannot
-   * redirect the return path, which matters for setuid programs. */
-  u64 restorer = (img && img->sigreturn_trampoline)
-                     ? img->sigreturn_trampoline
-                     : (u64)(usize)sa->sa_restorer;
+  /* Prefer the userspace-supplied sa_restorer (provided by musl/libc.so in Ring 3);
+   * fall back to the kernel-owned trampoline if sa_restorer is NULL. */
+  u64 restorer = (sa && sa->sa_restorer)
+                     ? (u64)(usize)sa->sa_restorer
+                     : (img ? img->sigreturn_trampoline : 0);
   if (!is_valid_user_code_ptr((u64)(usize)sa->sa_handler) ||
       !is_valid_user_code_ptr(restorer)) {
     scheduler_exit_current(-SIGSEGV);
@@ -254,6 +252,12 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
                     interrupts_enable();
                     scheduler_yield();
                     return;
+                } else if (scheduler_get_init_pid() &&
+                           current_task->id == scheduler_get_init_pid()) {
+                    /* PID 1 ignores signals it has no handler for — see the
+                     * matching guard in scheduler_deliver_pending_signals. */
+                    __atomic_fetch_and(&current_task->pending_signals,
+                                       ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
                 } else {
                     /* Only log genuine fault signals (crashes worth
                      * diagnosing). Intentional kills — SIGKILL/SIGTERM/etc,

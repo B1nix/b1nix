@@ -99,7 +99,19 @@ int lapic_timer_start_periodic_ms(u32 ms) {
 
 int lapic_timer_periodic_active(void) { return g_lapic_timer_periodic_active; }
 
+/* Waits for the local ICR to go idle (delivery status clear) before issuing a
+ * new IPI. Drains pending TLB shootdowns while spinning: this CPU may be
+ * running with interrupts disabled, so the shootdown IPI it owes another CPU
+ * can only be serviced by polling. */
+static void lapic_icr_wait_idle(void) {
+    while (lapic_read(LAPIC_ICR_LOW) & (1 << 12)) {
+        __asm__ volatile("pause");
+        tlb_shootdown_poll();
+    }
+}
+
 void lapic_send_ipi(u32 apic_id, u32 icr_low) {
+    lapic_icr_wait_idle();
     /* xAPIC (MMIO) mode: the destination APIC ID lives in ICR_HIGH bits
      * [31:24]. The old `(u64)apic_id << 32` is the x2APIC (MSR) layout; written
      * through the u32 lapic_write it truncated to 0, so every IPI targeted APIC
@@ -108,15 +120,31 @@ void lapic_send_ipi(u32 apic_id, u32 icr_low) {
     /* Write command to ICR low */
     lapic_write(LAPIC_ICR_LOW, icr_low);
     /* Wait for delivery to complete */
-    while (lapic_read(LAPIC_ICR_LOW) & (1 << 12))
-        __asm__ volatile("pause");
+    lapic_icr_wait_idle();
 }
 
 void lapic_send_ipi_allbutself(u32 icr_low) {
+    lapic_icr_wait_idle();
     lapic_write(LAPIC_ICR_HIGH, 0);
     lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
-    while (lapic_read(LAPIC_ICR_LOW) & (1 << 12))
-        __asm__ volatile("pause");
+    lapic_icr_wait_idle();
+}
+
+/* Fire-and-forget all-but-self IPI: never waits for delivery.
+ *
+ * A fixed IPI is only accepted by a target whose IRR bit for that vector is
+ * clear; while the target has interrupts disabled the bit stays set, so a
+ * second IPI on the same vector leaves delivery status pending indefinitely.
+ * Two CPUs doing that to each other — both spinning on delivery status with
+ * IRQs off — deadlock permanently (observed with the reschedule vector: both
+ * CPUs wedged in scheduler_wake_all -> ipi_reschedule_all). For a kick-style
+ * IPI with no payload, a delivery already pending on the target does the job
+ * just as well as a fresh one, so skip the send instead of waiting. */
+void lapic_send_ipi_allbutself_nowait(u32 icr_low) {
+    if (lapic_read(LAPIC_ICR_LOW) & (1 << 12))
+        return; /* previous IPI not accepted yet — this one is redundant */
+    lapic_write(LAPIC_ICR_HIGH, 0);
+    lapic_write(LAPIC_ICR_LOW, icr_low | LAPIC_ICR_DEST_OTHERS);
 }
 
 void lapic_init_local(void) {

@@ -142,6 +142,9 @@ usize pmm_free_frame_count(void);
 
 void kheap_init(void);
 void kheap_use_direct_map(void);
+/* Fault-dump helper: print which general-heap block (if any) an address falls
+ * in, and whether that block is live or freed. */
+void kheap_describe(u64 addr, const char *label);
 void *kmalloc(usize size);
 void *kzalloc(usize size);
 void kfree(void *ptr);

@@ -34,14 +34,28 @@ static inline int spin_xchg(volatile int *lock, int val) {
  * lock is actually contended). Always linked (tlb.c is in every kernel). */
 void tlb_shootdown_poll(void);
 
+/* Reports a spinlock that never became available (see kernel/sched/lockdep.c).
+ * Does not return. */
+void spin_lock_stuck(volatile int *lock, u64 caller) __attribute__((noreturn));
+
+/* Iterations before a contended acquire is declared a lockup. Generous enough
+ * that a legitimately busy lock (block-cache, runqueue under -smp) never trips
+ * it, small enough that a real deadlock reports within a second or so. */
+#define SPIN_LOCK_STUCK_LIMIT 400000000ULL
+
 static inline void spin_lock(spinlock_t *lock) {
     /* Spin until we successfully exchange 1 (locked) with the old value.
      * xchg is implicitly locked on x86 when used with a memory operand. */
+    u64 spins = 0;
     while (spin_xchg(lock, 1) != 0) {
         /* Pause to hint to the CPU that we're in a spin-wait loop.
          * Improves performance and power consumption on SMP. */
         __asm__ volatile("pause");
         tlb_shootdown_poll();
+        /* A spin that never ends is a deadlock, not contention: turn the silent
+         * hang into a named panic (which lock, which CPU, which task). */
+        if (++spins > SPIN_LOCK_STUCK_LIMIT)
+            spin_lock_stuck(lock, (u64)(usize)__builtin_return_address(0));
     }
 }
 

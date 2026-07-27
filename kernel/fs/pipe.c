@@ -31,7 +31,7 @@ static isize pipe_read(struct vfs_handle *h, char *buf, usize size) {
       if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
-      current_task->stack_released = 0;
+      scheduler_lease_clear_here(__func__);
       current_task->state = TASK_BLOCKED;
       __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
       scheduler_yield();
@@ -73,7 +73,7 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
       if (scheduler_signal_pending()) { __atomic_clear(&pipe->lock, __ATOMIC_RELEASE); return -ERESTARTSYS; }
       interrupts_disable();
       current_task->wait_chan = pipe;
-      current_task->stack_released = 0;
+      scheduler_lease_clear_here(__func__);
       current_task->state = TASK_BLOCKED;
       __atomic_clear(&pipe->lock, __ATOMIC_RELEASE);
       scheduler_yield();

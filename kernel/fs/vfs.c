@@ -1447,6 +1447,10 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
     }
 
     struct vfs_node *child = find_child(current, part);
+    if (!child && current->inode && current->inode->lookup_cb) {
+      current->inode->lookup_cb(current, part);
+      child = find_child(current, part);
+    }
     int child_was_found = (child != NULL);
     if (child) {
       for (int i = 0; i < MAX_MOUNTS; i++) {
@@ -1517,23 +1521,14 @@ static struct vfs_node *add_node(const char *path, enum vfs_node_type type,
 
         child->inode->atime = child->inode->mtime = child->inode->ctime =
             vfs_get_unix_time();
-      } else if (data != 0 || size != 0 || flags != 0 ||
-                 type == VFS_DIRECTORY) {
+      } else if (data != 0 || size != 0 || flags != 0) {
         child->inode->type = type;
-        child->inode->data = data;
-        child->inode->size = size;
+        if (data != 0)
+          child->inode->data = data;
+        if (size != 0)
+          child->inode->size = size;
         child->inode->flags = flags;
         child->inode->mtime = child->inode->ctime = vfs_get_unix_time();
-      } else {
-        if (child_was_found) {
-          vfs_node_put(child);
-        }
-        struct vfs_node *ret = child;
-        vfs_node_put(current);
-        return ret;
-      }
-      if (child_was_found) {
-        vfs_node_put(child);
       }
       struct vfs_node *ret = child;
       vfs_node_put(current);
@@ -2126,6 +2121,11 @@ void vfs_init(void) {
       "vfs: full featured initialized (POSIX+, Refcounting, Mount Crossing)\n");
 }
 
+extern void fb_dev_init(void);
+extern void input_init(void);
+extern void drm_dev_init(void);
+extern void virtio_gpu_dev_init(void);
+
 void vfs_repopulate_after_root_mount(void) {
   struct vfs_node *node;
 
@@ -2180,6 +2180,17 @@ void vfs_repopulate_after_root_mount(void) {
 
   tty_init_node();
   serial_tty_register_nodes();
+
+  /* GPU/input device nodes registered during early boot (fb_init, virtio_gpu_init,
+   * etc.) land on the initramfs root, which becomes unreachable once "/" redirects
+   * to the mounted ext4 root above — same reason /dev/console, /dev/null, ttys
+   * and the block-device nodes above all get re-added here. These four are pure
+   * VFS-node (re)registration using state already probed at early boot; safe to
+   * call again (virtio_gpu_dev_init guards its one-time ctx/buffer allocation). */
+  fb_dev_init();
+  input_init();
+  drm_dev_init();
+  virtio_gpu_dev_init();
 
   node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) vfs_node_put(node);
@@ -4366,11 +4377,15 @@ int vfs_ftruncate(int fd, u64 length) {
         if (written < 0) {
           kfree(zeroes);
           vfs_inode_unlock(inode);
+          char b[80];
+          snprintf(b, sizeof(b), "vfs_ftruncate: write_cb returned %ld\n", (long)written);
+          console_write(b);
           return (int)written;
         }
         if (written == 0) {
           kfree(zeroes);
           vfs_inode_unlock(inode);
+          console_write("vfs_ftruncate: write_cb returned 0 -> -EIO\n");
           return -EIO;
         }
         off += (u64)written;
@@ -4381,6 +4396,11 @@ int vfs_ftruncate(int fd, u64 length) {
     if (inode->truncate_cb) {
       int res = inode->truncate_cb(node, length);
       vfs_inode_unlock(inode);
+      if (res < 0) {
+        char b[80];
+        snprintf(b, sizeof(b), "vfs_ftruncate: truncate_cb returned %d\n", res);
+        console_write(b);
+      }
       return res;
     }
 
@@ -4388,6 +4408,11 @@ int vfs_ftruncate(int fd, u64 length) {
     vfs_update_times(inode, VFS_MTIME | VFS_CTIME);
     int res = inode->setattr_cb(node);
     vfs_inode_unlock(inode);
+    if (res < 0) {
+      char b[80];
+      snprintf(b, sizeof(b), "vfs_ftruncate: setattr_cb returned %d\n", res);
+      console_write(b);
+    }
     return res;
   }
 

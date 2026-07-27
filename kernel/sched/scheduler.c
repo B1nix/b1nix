@@ -1,3 +1,4 @@
+#include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/ipi.h>
@@ -32,6 +33,14 @@ _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
                "cur_task must be at offset 0x10 (see syscall_entry.S)");
 _Static_assert(__builtin_offsetof(struct percpu, syscall_scratch_rax) == 0x60,
                "syscall_scratch_rax must be at offset 0x60 (see syscall_entry.S)");
+/* x86_syscall_entry hardcodes these two offsets: it stores the user RSP at
+ * 112(%rax) and loads the kernel RSP from 104(%rax). Adding or reordering a
+ * field above them silently makes every syscall save/restore the WRONG words
+ * of struct task — the task then "returns" onto a bogus stack. Pin them. */
+_Static_assert(__builtin_offsetof(struct task, kernel_stack_ptr) == 104,
+               "kernel_stack_ptr must be at offset 104 (see syscall_entry.S)");
+_Static_assert(__builtin_offsetof(struct task, saved_user_rsp) == 112,
+               "saved_user_rsp must be at offset 112 (see syscall_entry.S)");
 #else
 _Static_assert(__builtin_offsetof(struct percpu, cur_task) == 0x10,
                "cur_task must be at offset 0x10");
@@ -278,17 +287,86 @@ static inline void tasks_unlock(u64 flags) {
  * to harmless lock sharing with whatever reuses the slot, not a dangling ref. */
 static usize task_index(const struct task *task);
 static struct task *g_task_fdlock_owner[MAX_TASKS];
+/* Where each task last cleared its kernel-stack lease (stack_released = 0).
+ * A task found READY with the lease still cleared and running on no CPU is
+ * unschedulable forever; this names the code path that stranded it. */
+static const char *g_task_lease_site[MAX_TASKS];
+static usize task_index(const struct task *task);
+static inline void task_lease_clear(struct task *t, const char *site) {
+  g_task_lease_site[task_index(t)] = site;
+  t->stack_released = 0;
+}
 static inline struct task *fd_lock_task(void) {
   struct task *owner = g_task_fdlock_owner[task_index(current_task)];
   return owner ? owner : current_task;
 }
-static inline void fd_lock_acquire(void) {
-  spin_lock(&fd_lock_task()->fd_lock);
+/* Who holds each task's fd_lock, and from which function. A lockup on fd_lock
+ * names only the SPINNER in the panic dump; without this the holder (possibly
+ * a CLONE_FILES sibling or a task blocked mid-critical-section) is invisible. */
+static usize g_task_fdlock_holder[MAX_TASKS];
+static const char *g_task_fdlock_site[MAX_TASKS];
+/* Observed failure this hardens against: a task span-locked on an fd_lock that
+ * the dump attributed to ITSELF (holder id == spinner id, acquired in
+ * scheduler_fd_get) — i.e. some earlier critical section released a different
+ * lock than it took and left this one held. Two changes make that impossible:
+ *
+ *  - release unlocks the object recorded at acquire time, instead of
+ *    re-resolving fd_lock_task() (which reads g_task_fdlock_owner[] and can
+ *    therefore answer differently than it did at acquire);
+ *  - the section runs with IRQs off, removing the window where a timer tick
+ *    preempts or migrates a task mid-section and every other CPU spins on an
+ *    fd_lock whose holder is not currently running.
+ *
+ * The sections are a handful of array accesses (plus one kzalloc on table
+ * growth), so the IRQ-off cost is negligible. */
+static struct task *g_task_fdlock_on[MAX_TASKS];
+static u64 g_task_fdlock_flags[MAX_TASKS];
+static inline void fd_lock_acquire_at(const char *site) {
+  struct task *owner = fd_lock_task();
+  u64 flags = interrupts_save();
+  /* Self-deadlock guard: spinning on a lock this task already holds can only
+   * end in the 30-second lockup detector, by which point the holder's identity
+   * is guesswork. Fail immediately, naming both critical sections. */
+  {
+    usize self_idx = task_index(current_task);
+    if (g_task_fdlock_on[self_idx]) {
+      console_write("fd_lock: recursive acquire in ");
+      console_write(site);
+      console_write(", already held since ");
+      console_write(g_task_fdlock_site[task_index(g_task_fdlock_on[self_idx])]
+                        ? g_task_fdlock_site[task_index(g_task_fdlock_on[self_idx])]
+                        : "?");
+      console_write("\n");
+      panic("fd_lock recursive acquire");
+    }
+  }
+  spin_lock(&owner->fd_lock);
   LOCKDEP_ACQUIRE(LOCKDEP_LVL_FD);
+  usize self = task_index(current_task);
+  g_task_fdlock_on[self] = owner;
+  g_task_fdlock_flags[self] = flags;
+  usize oi = task_index(owner);
+  g_task_fdlock_holder[oi] = current_task->id;
+  g_task_fdlock_site[oi] = site;
 }
+#define fd_lock_acquire() fd_lock_acquire_at(__func__)
 static inline void fd_lock_release(void) {
+  usize self = task_index(current_task);
+  struct task *owner = g_task_fdlock_on[self];
+  u64 flags = g_task_fdlock_flags[self];
+  if (!owner) {
+    /* Never observed in a balanced path; keep the old behaviour rather than
+     * dereferencing NULL if some future caller releases without acquiring. */
+    owner = fd_lock_task();
+    flags = interrupts_save();
+  }
+  usize oi = task_index(owner);
+  g_task_fdlock_holder[oi] = 0;
+  g_task_fdlock_site[oi] = 0;
+  g_task_fdlock_on[self] = 0;
   LOCKDEP_RELEASE(LOCKDEP_LVL_FD);
-  spin_unlock(&fd_lock_task()->fd_lock);
+  spin_unlock(&owner->fd_lock);
+  interrupts_restore(flags);
 }
 
 #include <b1nix/arch.h>
@@ -444,6 +522,39 @@ static int task_running_somewhere(struct task *t) {
   return 0;
 }
 
+
+/* Spins to wait for a task to publish its kernel-stack lease before the lease
+ * is treated as STALE rather than in-flight. The genuine hand-off is a handful
+ * of instructions inside arch_context_switch, so anything past this bound is
+ * not a switch in progress.
+ *
+ * A stale lease is a real, reachable state: a waker CASes a task
+ * BLOCKED -> READY inside its prepare/commit window, the task never reaches
+ * arch_context_switch, and stack_released stays 0 while the task is no longer
+ * current on any CPU. Both pick paths then refuse to claim it FOREVER — the
+ * task is lost, and anything it holds (its fd_lock, in the case caught here)
+ * wedges every other CPU spinning for that lock with interrupts off, i.e. a
+ * silent whole-machine hang. A task that is not current anywhere is provably
+ * not mid-save, so once the grace period expires its saved context is safe to
+ * load: publish the lease ourselves and schedule it. */
+#define SCHED_HANDOFF_GRACE_SPINS 5000000ULL
+
+static void sched_handoff_recover(struct task *t, const char *where) {
+  static int reported;
+  if (!reported) {
+    reported = 1;
+    console_write("sched: stale kernel-stack lease (");
+    console_write(where);
+    console_write(") on pid ");
+    console_write_dec(t ? (u64)t->id : 0);
+    console_write(" name=");
+    console_write(t && t->name ? t->name : "(none)");
+    console_write(" — claiming it\n");
+  }
+  if (t)
+    __atomic_store_n(&t->stack_released, 1, __ATOMIC_RELEASE);
+}
+
 static struct task *pick_next_task(void) {
   if (current_task == 0) {
     return 0;
@@ -491,12 +602,20 @@ static struct task *pick_next_task(void) {
        * the m27-smoke wedge). Bailing when state!=READY drops the now-stale rq
        * entry: the CAS below fails and the next real wake re-enqueues the task
        * once it has genuinely switched out. */
+      u64 handoff_spins = 0;
       while (t != current_task &&
              __atomic_load_n(&t->state, __ATOMIC_ACQUIRE) == TASK_READY &&
              !__atomic_load_n(&t->stack_released, __ATOMIC_ACQUIRE) &&
              !task_running_somewhere(t)) {
         __asm__ volatile("pause");
         tlb_shootdown_poll();
+        /* A hand-off that never completes is a deadlock, not contention: name
+         * the task instead of spinning here with IRQs off forever (a silent,
+         * markerless hang). */
+        if (++handoff_spins > SCHED_HANDOFF_GRACE_SPINS) {
+          sched_handoff_recover(t, "global-rq");
+          break;
+        }
       }
       /* If the wait bailed with stack_released still 0 (the task is running on
        * another CPU as its live cur_task, or it re-blocked), its saved context
@@ -566,12 +685,17 @@ static struct task *pick_next_task(void) {
     /* Same READY guard as the global-rq path above — bail if the task
      * re-blocked or was claimed elsewhere so we never spin forever on a
      * stack_released that a never-context-switched task won't publish. */
+    u64 handoff_spins = 0;
     while (best_task != current_task &&
            __atomic_load_n(&best_task->state, __ATOMIC_ACQUIRE) == TASK_READY &&
            !__atomic_load_n(&best_task->stack_released, __ATOMIC_ACQUIRE) &&
            !task_running_somewhere(best_task)) {
       __asm__ volatile("pause");
       tlb_shootdown_poll();
+      if (++handoff_spins > SCHED_HANDOFF_GRACE_SPINS) {
+        sched_handoff_recover(best_task, "scan");
+        break;
+      }
     }
     /* If the wait bailed with stack_released still 0 (task running on another
      * CPU or re-blocked), do not claim it — its context isn't safe to load.
@@ -982,16 +1106,10 @@ int scheduler_fork_current(void) {
   if (!parent) {
     return -1;
   }
-  /* "User" forks resume the child by iret'ing through the interrupt_frame the
-   * int $0x80 entry pushed onto the parent's kernel stack. A *builtin* (kind ==
-   * USER_IMAGE_BUILTIN) runs entirely in ring 0 and calls scheduler_fork_current
-   * directly via syscall_dispatch, so there is NO such frame at the stack top —
-   * treating it as a user fork made the child iret through stack garbage (a
-   * #GP with a bogus CS). Builtins fork through the kernel trampoline instead,
-   * resuming the C code right after fork() returns 0. Only real ELF processes
-   * (ELF32/ELF64) take the iret path. */
+  /* "User" forks resume the child by iret'ing through the interrupt_frame.
+   * All user tasks are real ELF processes (ELF32/ELF64) in Ring 3. */
   struct user_loaded_image *parent_img = parent->user_image;
-  int is_user = (parent_img != NULL && parent_img->kind != USER_IMAGE_BUILTIN);
+  int is_user = (parent_img != NULL);
 
   /* If no swap device is attached, no PT entry can ever carry VMM_SWAPPED,
    * so walking the full user page-table tree on every fork is pure overhead.
@@ -2058,15 +2176,40 @@ int scheduler_yield(void) {
      * stack_released==1 (published by arch_context_switch after the RSP
      * swap) before claiming; x86 TSO orders the 0 store ahead of the READY
      * store, so other CPUs observe "READY but not yet released" and skip. */
-    old_task->stack_released = 0;
+    task_lease_clear(old_task, __func__);
     old_task->state = TASK_READY;
+  }
+
+  /* Catch a corrupted kernel-stack pointer AT the switch instead of letting
+   * arch_context_switch `ret` off a bogus stack (which surfaces as a kernel
+   * fault at a wild rip with no usable backtrace). Both the saved RSP and the
+   * syscall-entry stack top must lie inside the task's own kernel stack. */
+  if (new_task->stack) {
+    u64 lo = (u64)(usize)new_task->stack;
+    u64 hi = lo + KERNEL_STACK_SIZE;
+    u64 ksp = new_task->kernel_stack_ptr;
+    u64 crsp = new_task->context.rsp;
+    if (ksp < lo || ksp > hi || (crsp != 0 && (crsp < lo || crsp > hi))) {
+      console_write("sched: corrupt kernel stack pointer for pid ");
+      console_write_dec((u64)new_task->id);
+      console_write(" name=");
+      console_write(new_task->name ? new_task->name : "(none)");
+      console_write("\n  stack=0x");
+      console_write_hex64(lo);
+      console_write(" kernel_stack_ptr=0x");
+      console_write_hex64(ksp);
+      console_write(" context.rsp=0x");
+      console_write_hex64(crsp);
+      console_write("\n");
+      panic("corrupt task kernel stack pointer");
+    }
   }
 
   new_task->state = TASK_RUNNING;
   current_task = new_task;
 
-  paging_switch_address_space(new_task->pml4_phys);
   arch_set_kernel_stack(new_task->kernel_stack_ptr);
+  paging_switch_address_space(new_task->pml4_phys);
 
   /* M29: reload userspace FS base for TLS on every context switch. Writing 0
    * matters just as much as writing a nonzero TLS base: IA32_FS_BASE is per-CPU
@@ -2123,7 +2266,7 @@ void scheduler_block_current(void) {
    * CPU is still mid-arch_context_switch on this very stack. yield's
    * RUNNING->READY arm only clears it when state==RUNNING, which is already
    * false here, so we must do it ourselves. */
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
   interrupts_enable();
@@ -2171,10 +2314,13 @@ void scheduler_block_on(void *chan) {
     panic("scheduler_block_on without running task");
   }
 
-  /* Same pre-existing-bug recovery as scheduler_sleep_ticks: if scheduler_yield
-   * previously returned 0 (no other task ready), we resumed with the old
-   * state — TASK_BLOCKED here — even though we're conceptually RUNNING again
-   * (the kernel kept us on-CPU). Allow the re-entry. */
+  if (current_task->state == TASK_READY) {
+    current_task->state = TASK_RUNNING;
+    current_task->wait_chan = 0;
+    interrupts_enable();
+    return;
+  }
+
   if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
     current_task->state = TASK_RUNNING;
   } else if (current_task->state != TASK_RUNNING) {
@@ -2184,7 +2330,7 @@ void scheduler_block_on(void *chan) {
   current_task->wait_chan = chan;
   /* M28 T4: claim the stack lease before publishing BLOCKED — see
    * scheduler_block_current for the full race. */
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
   interrupts_enable();
@@ -2207,6 +2353,14 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
     panic("scheduler_block_on_timeout without running task");
   }
 
+  if (current_task->state == TASK_READY) {
+    current_task->state = TASK_RUNNING;
+    current_task->wait_chan = 0;
+    current_task->wake_tick = 0;
+    interrupts_enable();
+    return;
+  }
+
   if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
     current_task->state = TASK_RUNNING;
   } else if (current_task->state != TASK_RUNNING) {
@@ -2218,7 +2372,7 @@ void scheduler_block_on_timeout(void *chan, u64 timeout_ticks) {
     current_task->wake_tick = scheduler_ticks + timeout_ticks;
   /* M28 T4: claim the stack lease before publishing BLOCKED — see
    * scheduler_block_current for the full race. */
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   current_task->state = TASK_BLOCKED;
   scheduler_yield();
   /* Drop any unfired deadline: an explicit wake may have resumed us early. */
@@ -2250,7 +2404,7 @@ void scheduler_wait_prepare(void *chan) {
   if (current_task == 0)
     panic("scheduler_wait_prepare without running task");
   current_task->wait_chan = chan;
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -2287,7 +2441,7 @@ void scheduler_wait_prepare_timeout(void *chan, u64 timeout_ticks) {
   current_task->wait_chan = chan;
   if (timeout_ticks)
     current_task->wake_tick = scheduler_ticks + timeout_ticks;
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
   __atomic_thread_fence(__ATOMIC_SEQ_CST);
 }
@@ -2365,10 +2519,43 @@ void scheduler_sleep_ticks(u64 ticks) {
   /* M28 T4: claim the stack lease before publishing SLEEPING — a timer-tick
    * wake_sleepers on another CPU can CAS us SLEEPING->READY and resume us; see
    * scheduler_block_current for the full race. */
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   current_task->state = TASK_SLEEPING;
   scheduler_yield();
   interrupts_enable();
+}
+
+/* Silence watchdog (test mode only). A wedged instance prints nothing, so the
+ * host harness can only report "stalled" and every later marker in that run
+ * reads as missing. Dump the task table from inside the guest instead: state,
+ * wait channel, fd-lock holder and lease site for every task is usually enough
+ * to name the deadlock without a second, instrumented run. Dumps at most three
+ * times so the host's own stall timer still gets to kill a hopeless instance. */
+#define SILENCE_WATCHDOG_TICKS (60 * 100) /* 60s at the 100 Hz timer tick */
+#define SILENCE_WATCHDOG_MAX_DUMPS 3
+extern volatile u64 g_console_write_seq;
+static void serial_silence_watchdog(void) {
+  static u64 last_seq;
+  static u64 last_change_tick;
+  static int dumps;
+  static int test_mode = -1;
+  if (test_mode < 0)
+    test_mode = bootinfo_has_flag("b1nix.test=1") ? 1 : 0;
+  if (!test_mode || dumps >= SILENCE_WATCHDOG_MAX_DUMPS)
+    return;
+  u64 seq = g_console_write_seq;
+  if (seq != last_seq) {
+    last_seq = seq;
+    last_change_tick = scheduler_ticks;
+    return;
+  }
+  if (scheduler_ticks - last_change_tick < SILENCE_WATCHDOG_TICKS)
+    return;
+  last_change_tick = scheduler_ticks;
+  dumps++;
+  console_write("\nSMOKE-GUEST-WATCHDOG: no console output for 60s — task dump:\n");
+  scheduler_dump_tasks();
+  last_seq = g_console_write_seq;
 }
 
 void scheduler_on_timer_tick(void) {
@@ -2388,6 +2575,8 @@ void scheduler_on_timer_tick(void) {
       scheduler_kill(T(i)->id, SIGALRM);
     }
   }
+
+  serial_silence_watchdog();
 
   posix_timers_tick(); /* M74: fire expired POSIX interval timers */
 
@@ -2557,9 +2746,27 @@ void scheduler_exit_group(int exit_code) {
   scheduler_exit_current(exit_code);
 }
 
+static usize g_init_pid;
+
+void scheduler_set_init_pid(usize pid) { g_init_pid = pid; }
+
+usize scheduler_get_init_pid(void) { return g_init_pid; }
+
 void scheduler_exit_current(int exit_code) {
   if (current_task == 0) {
     panic("scheduler_exit_current without current task");
+  }
+
+  /* /bin/init dying takes the whole run with it: nothing else spawns the
+   * remaining tests, so the log simply stops. A default-action signal death is
+   * otherwise silent (arch signal delivery logs only fault signals), which made
+   * this look like a hang rather than a kill. Always announce it. */
+  if (g_init_pid && current_task->id == g_init_pid) {
+    console_write("INIT-EXIT: /bin/init exited, pid=");
+    console_write_dec(current_task->id);
+    console_write(" code=0x");
+    console_write_hex64((u64)(unsigned)exit_code);
+    console_write("\n");
   }
 
   /* Commit to exiting with this code: block scheduler_deliver_pending_signals
@@ -2592,7 +2799,12 @@ void scheduler_exit_current(int exit_code) {
       fg = pty_fg_pgrp(ctty_idx);
     }
 
-    if (fg > 0) {
+    /* fg <= 1 is the boot/kernel group, which the console carries as its
+     * placeholder foreground group (console.fg_pgrp starts at 1) rather than as
+     * a real session's group. Hanging it up would signal system tasks that never
+     * joined the session — /bin/init among them, which dies silently on SIGHUP
+     * and takes the rest of the run with it. */
+    if (fg > 1) {
       scheduler_kill_process_group(fg, SIGHUP);
       scheduler_kill_process_group(fg, SIGCONT);
     }
@@ -2626,7 +2838,7 @@ void scheduler_exit_current(int exit_code) {
     }
     interrupts_disable();
     current_task->exit_code = exit_code;
-    current_task->stack_released = 0;
+    task_lease_clear(current_task, __func__);
     current_task->state = TASK_DEAD;
     scheduler_yield();
     panic("dead thread resumed");
@@ -2669,7 +2881,7 @@ void scheduler_exit_current(int exit_code) {
    * observes stack_released == 0 — its waitpid path will spin on the
    * stack_released flag until arch_context_switch publishes 1 after the
    * RSP swap below. See struct task::stack_released in sched.h. */
-  current_task->stack_released = 0;
+  task_lease_clear(current_task, __func__);
   current_task->state = TASK_DEAD;
   g_have_proc_zombies = 1; /* arm the orphan sweep in scheduler_yield */
 
@@ -2752,7 +2964,7 @@ int scheduler_waitpid(usize pid, int *status, int options) {
        * still-alive — the wakeup is lost and the parent sleeps forever (the
        * -smp pipeline / waitpid wedge). The fence pairs with the full barrier in
        * scheduler_wake_blocked_parent's CAS. */
-      current_task->stack_released = 0;
+      task_lease_clear(current_task, __func__);
       __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
@@ -2954,7 +3166,7 @@ int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options) {
       if (current_task->state == TASK_BLOCKED || current_task->state == TASK_SLEEPING) {
         current_task->state = TASK_RUNNING;
       }
-      current_task->stack_released = 0;
+      task_lease_clear(current_task, __func__);
       __atomic_store_n(&current_task->state, TASK_BLOCKED, __ATOMIC_SEQ_CST);
       __atomic_thread_fence(__ATOMIC_SEQ_CST);
     }
@@ -3200,8 +3412,17 @@ const char *scheduler_state_name(int state) {
   }
 }
 
+/* Out-of-file lease clear (pipe/futex block loops): same bookkeeping as the
+ * in-file task_lease_clear so the dump can name their sites too. */
+void scheduler_lease_clear_here(const char *site) {
+  if (current_task)
+    task_lease_clear(current_task, site);
+}
+
 void scheduler_dump_tasks(void) {
-  console_write("ID\tSTATE\tNAME\n");
+  console_write("tick=");
+  console_write_dec(scheduler_ticks);
+  console_write("\nID\tSTATE\tNAME\n");
   for (usize i = 0; i < g_task_hwm; i++) {
     if (T(i)->state != TASK_UNUSED) {
       console_write_hex64(T(i)->id);
@@ -3245,6 +3466,29 @@ void scheduler_dump_tasks(void) {
       console_write_dec(T(i)->ap_runnable);
       console_write(" steal=");
       console_write_dec(T(i)->stealable);
+      /* Saved kernel RSP + fd_lock state: a task stuck holding its fd_lock
+       * (the lock every other CPU then spins on) is only identifiable here. */
+      console_write(" rsp=0x");
+      console_write_hex64(T(i)->context.rsp);
+      console_write(" kstack=0x");
+      console_write_hex64((u64)(usize)T(i)->stack);
+      console_write(" fdlock=");
+      console_write_dec((u64)(unsigned)T(i)->fd_lock);
+      /* A SLEEPING task that never wakes is only explicable with its wake
+       * deadline next to the current tick; nice/pass name a stride-scheduling
+       * imbalance the same way. */
+      console_write(" wake_tick=");
+      console_write_dec(T(i)->wake_tick);
+      console_write(" nice=");
+      console_write_dec((u64)(u32)g_task_nice[i]);
+      console_write(" pass=");
+      console_write_dec(g_task_pass[i]);
+      console_write(" fdheld_by=");
+      console_write_dec(g_task_fdlock_holder[i]);
+      console_write("@");
+      console_write(g_task_fdlock_site[i] ? g_task_fdlock_site[i] : "-");
+      console_write(" lease_site=");
+      console_write(g_task_lease_site[i] ? g_task_lease_site[i] : "-");
       console_write("\t");
       console_write(T(i)->name);
       console_write("\n");
@@ -3949,6 +4193,8 @@ int scheduler_kill_all(int sig) {
       continue;
     if (t->id == 1)
       continue;
+    if (t->name && strcmp(t->name, "displayd") == 0)
+      continue;
     if (t->pml4_phys == 0)
       continue; /* kernel thread */
     if (task_is_thread(t))
@@ -4419,6 +4665,17 @@ void scheduler_deliver_pending_signals(void) {
 
     sighandler_t handler = current_task->sigactions[sig - 1].sa_handler;
 
+    /* PID 1 only receives signals it installed a handler for (Linux semantics).
+     * Otherwise any stray group signal — a session's SIGHUP, a test's SIGTERM
+     * to its group — silently terminates /bin/init and the whole run stops with
+     * no output. init is the one process whose death nothing can recover from. */
+    if (g_init_pid && current_task->id == g_init_pid &&
+        (handler == SIG_DFL || sig == SIGKILL)) {
+      __atomic_fetch_and(&current_task->pending_signals,
+                         ~(1ULL << (sig - 1)), __ATOMIC_RELAXED);
+      continue;
+    }
+
     if (sig == SIGKILL) {
       current_task->exit_code = TASK_EXIT_SIGNALED | SIGKILL;
       terminate_group_siblings(current_task);
@@ -4429,7 +4686,7 @@ void scheduler_deliver_pending_signals(void) {
       reparent_children_and_signal_orphans(current_task);
       scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
-      current_task->stack_released = 0;
+      task_lease_clear(current_task, __func__);
       current_task->state = TASK_DEAD;
       g_have_proc_zombies = 1;
       post_sigchld_to_parent(current_task->parent_id, 0);
@@ -4469,7 +4726,7 @@ void scheduler_deliver_pending_signals(void) {
         reparent_children_and_signal_orphans(current_task);
         scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
-        current_task->stack_released = 0;
+        task_lease_clear(current_task, __func__);
         current_task->state = TASK_DEAD;
         g_have_proc_zombies = 1;
         post_sigchld_to_parent(current_task->parent_id, 0);

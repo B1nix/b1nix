@@ -467,6 +467,52 @@ static void kheap_dump(void) {
 }
 #endif /* KHEAP_VALIDATE */
 
+/* Diagnostic: identify the general-heap block containing `addr` (base, payload
+ * size, live/freed) and print one line. Used by the fatal-fault dump to tell a
+ * wild kernel rip/cr2 inside the heap apart from a legitimate pointer — a
+ * 64 KiB live block is a task kernel stack, a freed block means a use-after-
+ * free. Read-only, bounded walk; safe to call from the exception path. */
+void kheap_describe(u64 addr, const char *label) {
+  console_write(label);
+  console_write(" 0x");
+  console_write_hex64(addr);
+  if (heap.base == 0 || addr < heap.base || addr >= heap.current) {
+    console_write(" not-in-general-heap\n");
+    return;
+  }
+  u64 cur = heap.base;
+  int idx = 0;
+  while (cur < heap.current) {
+    struct kheap_block *block = (struct kheap_block *)(usize)cur;
+    if (block->size == 0 || block->size > 512u * 1024u * 1024u) {
+      console_write(" walk-aborted-at 0x");
+      console_write_hex64(cur);
+      console_write("\n");
+      return;
+    }
+    u64 payload = cur + KHEAP_HEADER_SIZE;
+    u64 next = payload + block->size;
+    if (addr >= cur && addr < next) {
+      console_write(" heap block #");
+      console_write_dec(idx);
+      console_write(" base=0x");
+      console_write_hex64(payload);
+      console_write(" size=");
+      console_write_dec(block->size);
+      console_write(" off=+0x");
+      console_write_hex64(addr - payload);
+      console_write(block->magic == KHEAP_MAGIC     ? " LIVE"
+                    : block->magic == KHEAP_FREED_MAGIC ? " FREED"
+                                                        : " BAD-MAGIC");
+      console_write("\n");
+      return;
+    }
+    cur = next;
+    idx++;
+  }
+  console_write(" past-heap-walk\n");
+}
+
 void kheap_validate(const char *func) {
 #if KHEAP_VALIDATE
   if (heap.base == 0) return;

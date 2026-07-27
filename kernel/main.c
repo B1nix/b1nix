@@ -1,9 +1,12 @@
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
 #include <b1nix/console.h>
+#include <b1nix/ftrace.h>
+#include <b1nix/gdbstub.h>
 #include <b1nix/initramfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/netdev.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
 #include <b1nix/serial.h>
@@ -22,6 +25,7 @@
 #include <b1nix/ext3.h>
 #include <b1nix/ext4.h>
 #include <b1nix/btrfs.h>
+#include <b1nix/fuse.h>
 #include <b1nix/procfs.h>
 #include <b1nix/ahci.h>
 #include <b1nix/nvme.h>
@@ -41,10 +45,10 @@
 #include <string.h>
 #include <stdio.h>
 
+extern void usb_selftest(void);
 extern void ps2_kbd_init(void);
 extern void ps2_mouse_init(void);
 extern int xhci_probe(void);
-extern void compositor_init(void);
 extern void virtio_gpu_init(void);
 extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
@@ -52,89 +56,11 @@ extern void fb_console_init(void);
 extern void hda_init(void);
 extern void input_init(void);
 extern void input_gfxtest_start(void);
+extern void input_m47_inject_start(void);
 extern void fb_dev_init(void);
 extern void drm_dev_init(void);
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
-extern void m35_diag_run(void);
-extern void m36_diag_run(void);
-
-/* b1nix.diskbench — boot-time block-device throughput benchmark. Reads a fixed
- * span twice from the first non-RAM disk: once via raw single-sector commands
- * (the pre-read-ahead per-sector cost) and once via the cached path (which now
- * pulls a read-ahead run per miss). Reports MB/s for both so the read-ahead win
- * is measurable. Gated by a cmdline flag so it never runs in the smoke suite. */
-static void disk_benchmark(void) {
-	struct block_device *dev = 0;
-	for (usize i = 0; i < blk_count(); i++) {
-		struct block_device *d = blk_at(i);
-		/* Skip RAM disks and partitions; want a real SATA/NVMe drive. */
-		if (d && d->name && d->read_blocks && d->block_size == 512 &&
-		    d->block_count > 0 && d->name[0] != 'r' /* ram0 */) {
-			dev = d;
-			break;
-		}
-	}
-	if (!dev) {
-		console_write("DISKBENCH: no disk device found\n");
-		return;
-	}
-
-	/* Read up to 16 MiB (or the whole disk if smaller). */
-	u64 total_sectors = 16ull * 1024 * 1024 / 512;
-	if (total_sectors > dev->block_count)
-		total_sectors = dev->block_count;
-
-	console_write("DISKBENCH: dev=");
-	console_write(dev->name);
-	console_write(" reading ");
-	console_write_dec(total_sectors * 512 / 1024);
-	console_write(" KiB\n");
-
-	u8 *buf = (u8 *)kmalloc(64 * 512); /* one read-ahead window */
-	if (!buf) {
-		console_write("DISKBENCH: kmalloc failed\n");
-		return;
-	}
-
-	/* Phase A — raw single-sector device commands (no cache, no read-ahead). */
-	u64 t0 = scheduler_get_ticks();
-	for (u64 lba = 0; lba < total_sectors; lba++) {
-		if (dev->read_blocks(dev, lba, 1, buf) < 0) {
-			console_write("DISKBENCH: raw read failed\n");
-			kfree(buf);
-			return;
-		}
-	}
-	u64 a_ticks = scheduler_get_ticks() - t0;
-
-	/* Phase B — cached path (read-ahead run per miss). Start cold. */
-	blk_cache_invalidate(dev);
-	u64 t1 = scheduler_get_ticks();
-	for (u64 lba = 0; lba < total_sectors; lba++) {
-		if (blk_read_cached(dev, lba, 1, buf) < 0) {
-			console_write("DISKBENCH: cached read failed\n");
-			kfree(buf);
-			return;
-		}
-	}
-	u64 b_ticks = scheduler_get_ticks() - t1;
-	kfree(buf);
-
-	/* ticks are 10 ms (TIMER_HZ=100), so seconds = ticks/100 and
-	 * KB/s = (sectors*512/1024) / (ticks/100) = sectors*50/ticks. */
-	console_write("DISKBENCH: raw-1sector ");
-	console_write_dec(a_ticks * 10);
-	console_write(" ms (");
-	console_write_dec(a_ticks ? (total_sectors * 50) / a_ticks : 0);
-	console_write(" KB/s)\n");
-	console_write("DISKBENCH: cached-readahead ");
-	console_write_dec(b_ticks * 10);
-	console_write(" ms (");
-	console_write_dec(b_ticks ? (total_sectors * 50) / b_ticks : 0);
-	console_write(" KB/s)\n");
-	console_write("DISKBENCH: done\n");
-}
 
 static int parse_hex_digit(char c) {
 	if (c >= '0' && c <= '9') return c - '0';
@@ -248,124 +174,9 @@ static struct block_device *find_root_device(const char *root_val) {
 	}
 }
 
-/* M26 native-Clang kernel self-host driver. Reads /mnt/build/srcs.txt (each line
- * "src-relpath\tobj-abspath"), compiles every kernel TU with the b1nix-native
- * clang, then links them with ld.lld via the staged response file — proving
- * b1nix builds its own kernel with its own clang+lld toolchain. Driven shell-free
- * from the kernel (no in-guest make/busybox needed). See
- * tools/inguest/build-selfhost-module.sh. */
-static int selfhost_clang_one(const char *src_abs, const char *obj_abs)
-{
-	/* argv[0] MUST be the full path: b1nix has no /proc/self/exe, so clang finds
-	 * its own install dir (to re-exec -cc1 and locate the resource headers) from
-	 * argv[0]. A bare "clang" makes it fail to exec cc1 and to find stddef.h.
-	 * -resource-dir pins the builtin headers explicitly for good measure. */
-	const char *argv[] = {
-		"/mnt/build/bin/clang", "-no-canonical-prefixes", "-B/mnt/build/bin",
-		"-resource-dir", "/mnt/build/lib/clang/22",
-		"-integrated-as", "-std=c11", "-ffreestanding", "-fno-builtin",
-		"-fno-stack-protector", "-fno-pic", "-mno-red-zone",
-		"-I/mnt/build/src/kernel/include", "-I/mnt/build/src/build/x86_64",
-		"-mcmodel=kernel",
-		"-mno-sse", "-mno-mmx", "-mno-sse2", "-mno-3dnow",
-		"-c", src_abs, "-o", obj_abs, 0,
-	};
-	/* TMPDIR points clang's intermediate files (the .S preprocess writes
-	 * /tmp/<name>.s) at the writable ext4 module — the boot root is a read-only
-	 * initramfs, so a default /tmp would fail. */
-	const char *env[] = {"PATH=/mnt/build/bin", "TMPDIR=/mnt/build/tmp", 0};
-	int pid = user_spawn_env("/mnt/build/bin/clang", 23, argv, env);
-	if (pid <= 0)
-		return -1;
-	int st = 0;
-	syscall_dispatch(SYS_WAIT, (u64)pid, (u64)(usize)&st, 0, 0, 0, 0);
-	return st;
-}
-
-static void run_selfhost_build(void)
-{
-	char *data = 0;
-	int fd = vfs_open("/mnt/build/srcs.txt");
-	if (fd < 0) {
-		console_write("M26-SELFHOST: fail no-srcs\n");
-		return;
-	}
-	/* srcs.txt is small (~4KB for ~92 lines). */
-	data = kmalloc(65536);
-	if (!data) { vfs_close(fd); return; }
-	isize n = vfs_read(fd, data, 65535);
-	vfs_close(fd);
-	if (n <= 0) { kfree(data); console_write("M26-SELFHOST: fail read-srcs\n"); return; }
-	data[n] = 0;
-
-	int total = 0, failed = 0;
-	char src_abs[256];
-	char *p = data;
-	while (*p) {
-		char *eol = p;
-		while (*eol && *eol != '\n') eol++;
-		char saved = *eol;
-		*eol = 0;
-		/* split "src\tobj" */
-		char *tab = p;
-		while (*tab && *tab != '\t') tab++;
-		if (*tab == '\t') {
-			*tab = 0;
-			const char *src_rel = p;
-			const char *obj_abs = tab + 1;
-			if (*src_rel && *obj_abs) {
-				snprintf(src_abs, sizeof(src_abs), "/mnt/build/src/%s", src_rel);
-				int rc = selfhost_clang_one(src_abs, obj_abs);
-				total++;
-				if (rc != 0) {
-					failed++;
-					console_write("M26-SELFHOST: cc-fail ");
-					console_write(src_rel);
-					console_write("\n");
-				}
-				if ((total % 10) == 0) {
-					char b[64];
-					snprintf(b, sizeof(b), "M26-SELFHOST: progress %d compiled\n", total);
-					console_write(b);
-				}
-			}
-		}
-		*eol = saved;
-		p = (*eol) ? eol + 1 : eol;
-	}
-	kfree(data);
-
-	char sb[80];
-	snprintf(sb, sizeof(sb), "M26-SELFHOST: compiled %d/%d (failed=%d)\n",
-	         total - failed, total, failed);
-	console_write(sb);
-
-	if (failed == 0 && total > 0) {
-		console_write("M26-SELFHOST: ok compile\n");
-		/* Link with ld.lld via the staged response file. */
-		const char *largv[] = {
-			"/mnt/build/bin/ld.lld", "-m", "elf_x86_64", "-z", "max-page-size=0x1000",
-			"-T", "/mnt/build/src/kernel/arch/x86_64/linker.ld",
-			"-o", "/mnt/build/kernel.elf", "@/mnt/build/kernel.rsp", 0,
-		};
-		int lpid = user_spawn("/mnt/build/bin/ld.lld", 10, largv);
-		int lst = -1;
-		if (lpid > 0)
-			syscall_dispatch(SYS_WAIT, (u64)lpid, (u64)(usize)&lst, 0, 0, 0, 0);
-		unsigned char mag[4] = {0};
-		int ofd = vfs_open("/mnt/build/kernel.elf");
-		if (ofd >= 0) { vfs_read(ofd, (char *)mag, sizeof(mag)); vfs_close(ofd); }
-		snprintf(sb, sizeof(sb), "M26-SELFHOST: link exit=%d magic=%02x%02x%02x%02x\n",
-		         lst, mag[0], mag[1], mag[2], mag[3]);
-		console_write(sb);
-		if (lpid > 0 && mag[0] == 0x7f && mag[1] == 'E' && mag[2] == 'L' && mag[3] == 'F')
-			console_write("M26-SELFHOST: ok kernel-elf\n");
-		else
-			console_write("M26-SELFHOST: fail link\n");
-	} else {
-		console_write("M26-SELFHOST: fail compile\n");
-	}
-}
+/* M26 native-Clang kernel self-host: orchestration moved to userspace
+ * (/bin/selfhost-build). The kernel just mounts the toolchain ext4 and
+ * spawns the userspace builder. See userspace/bin/selfhost_build.c. */
 
 void kernel_main(usize arg0, usize arg1)
 {
@@ -455,7 +266,8 @@ void kernel_main(usize arg0, usize arg1)
 	blk_cache_init();
 
 	initramfs_init();
-	console_write("Step 10: Initramfs initialized\n");
+	fuse_init();
+	console_write("Step 10: Initramfs & FUSE initialized\n");
 
 #ifndef __aarch64__
 	vfs_init();
@@ -483,10 +295,11 @@ void kernel_main(usize arg0, usize arg1)
 	input_init(); /* M47: /dev/input/event* (PS/2 kbd + mouse event streams) */
 	if (bootinfo_has_flag("b1nix.gfxtest=1"))
 		input_gfxtest_start(); /* diagnostic: headless window-drag injector */
+	if (bootinfo_has_flag("b1nix.test=1"))
+		input_m47_inject_start(); /* M47 smoke: mouse event burst for readers */
 	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
 	hda_init();   /* M38: Intel HDA sound controller (/dev/dsp) */
 	video_init();
-	compositor_init();
 	virtio_gpu_init();
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
 	fb_dev_init(); /* M47: /dev/fb0 mmap-able framebuffer (needs fb_console) */
@@ -495,8 +308,10 @@ void kernel_main(usize arg0, usize arg1)
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
-	if (bootinfo_has_flag("b1nix.diskbench"))
-		disk_benchmark();
+	if (bootinfo_has_flag("b1nix.diskbench")) {
+		const char *db_argv[] = {"diskbench", 0};
+		user_spawn("/bin/diskbench", 1, db_argv);
+	}
 #endif
 
 	/* M92 musl smoke test: must run BEFORE rootfs mount because the binary
@@ -547,7 +362,7 @@ void kernel_main(usize arg0, usize arg1)
 			snprintf(musl_buf, sizeof(musl_buf), "musl: m92-musl-dyn-smoke exit=%d\n", musl_dyn_st);
 			console_write(musl_buf);
 		}
-		/* M92-LDSO (ldso-migration-and-unix-parity-plan.md): PT_INTERP =
+		/* M92-LDSO (musl-port.md): PT_INTERP =
 		 * /lib/ld-musl-x86_64.so.1. The kernel loads only the interpreter's own
 		 * segments and jumps into it; musl's real ld.so links this binary
 		 * itself — no in-kernel eager linker involved. */
@@ -581,14 +396,6 @@ void kernel_main(usize arg0, usize arg1)
 	 * In test mode the smoke suite owns the drives, so keep initramfs as /. */
 	{
 		int rc = -1;
-		/* b1nix.selfhostonly keeps the initramfs as / exactly like test mode: the
-		 * self-host build mounts its own toolchain fs at /mnt/build, and the boot
-		 * device (sata0 toolchain disk / ram0 module) must NOT be grabbed as the
-		 * real root here. Folding it into test_mode keeps every "drives are owned
-		 * elsewhere, stay on initramfs" branch below correct without duplicating
-		 * the whole rootfs decision tree. */
-		int test_mode = bootinfo_has_flag("b1nix.test=1") ||
-		                bootinfo_has_flag("b1nix.selfhostonly");
 		char root_val[64];
 		if (bootinfo_get_kv("root", root_val, sizeof(root_val))) {
 			if (strcmp(root_val, "liveiso") == 0) {
@@ -670,14 +477,10 @@ void kernel_main(usize arg0, usize arg1)
 						 * to keep the bootstrap initramfs as active root.
 						 * Otherwise (on real hardware or normal boots), we mount
 						 * loop0 as the primary rootfs at /. */
-						const char *target = test_mode ? "/mnt/root" : "/";
-						rc = vfs_mount("loop0", target, "ext4", 0);
+						rc = vfs_mount("loop0", "/", "ext4", 0);
 						if (rc == 0) {
-							if (test_mode) {
-								console_write("rootfs: loop0 mounted at /mnt/root as ext4\n");
-							} else {
-								console_write("rootfs: loop0 mounted at / as ext4\n");
-								vfs_repopulate_after_root_mount();
+							console_write("rootfs: loop0 mounted at / as ext4\n");
+							vfs_repopulate_after_root_mount();
 								if (mounted_iso_name[0] != '\0') {
 									int remount_rc = vfs_mount(mounted_iso_name, "/mnt/iso", is_exfat ? "exfat" : "iso9660", 0);
 									if (remount_rc == 0) {
@@ -692,7 +495,6 @@ void kernel_main(usize arg0, usize arg1)
 										console_write(err_buf);
 									}
 								}
-							}
 							if (is_exfat) {
 								console_write("M37-LIVEFILE: ok exfat-loop-root\n");
 							} else {
@@ -754,39 +556,30 @@ void kernel_main(usize arg0, usize arg1)
 				}
 			}
 		} else {
-			if (!test_mode) {
-				rc = vfs_mount("virtio-blk0", "/", "ext4", 0);
-			}
+			rc = vfs_mount("virtio-blk0", "/", "ext4", 0);
 			if (rc == 0) {
 				console_write("rootfs: virtio-blk0 mounted at /\n");
 				vfs_repopulate_after_root_mount();
 			} else {
-				if (!test_mode) {
-					/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
-					struct block_device *root_dev = find_device_by_label("b1nix-root");
-					if (root_dev) {
-						const char *fs_types[] = {"ext4", "ext3", "ext2"};
-						for (int i = 0; i < 3; i++) {
-							rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
-							if (rc == 0) {
-								char mounted_buf[96];
-								snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, fs_types[i]);
-								console_write(mounted_buf);
-								vfs_repopulate_after_root_mount();
-								break;
-							}
+				/* Try finding a block device by default label 'b1nix-root' (e.g. USB flash drive) */
+				struct block_device *root_dev = find_device_by_label("b1nix-root");
+				if (root_dev) {
+					const char *fs_types[] = {"ext4", "ext3", "ext2"};
+					for (int i = 0; i < 3; i++) {
+						rc = vfs_mount(root_dev->name, "/", fs_types[i], 0);
+						if (rc == 0) {
+							char mounted_buf[96];
+							snprintf(mounted_buf, sizeof(mounted_buf), "rootfs: %s (label b1nix-root) mounted at / as %s\n", root_dev->name, fs_types[i]);
+							console_write(mounted_buf);
+							vfs_repopulate_after_root_mount();
+							break;
 						}
 					}
 				}
 				if (rc != 0) {
-					const char *ram0_target = test_mode ? "/mnt/root" : "/";
-					rc = vfs_mount("ram0", ram0_target, "ext4", 0);
+					rc = vfs_mount("ram0", "/", "ext4", 0);
 					if (rc == 0) {
-						if (test_mode) {
-							console_write("rootfs: ram0 mounted at /mnt/root (test mode)\n");
-						} else {
-							console_write("rootfs: ram0 mounted at / (Live CD)\n");
-						}
+						console_write("rootfs: ram0 mounted at / as ext4\n");
 						vfs_repopulate_after_root_mount();
 					} else {
 						char mount_err_buf[64];
@@ -823,22 +616,35 @@ void kernel_main(usize arg0, usize arg1)
 	 * because all APs have come up and have functional LAPICs to ACK IPIs. */
 	tlb_shootdown_set_enabled(1);
 
-	/* M24b: verify cross-CPU work-stealing (no-op outside test mode / single CPU) */
+	/* In-kernel SMP self-tests. These run BEFORE g_ap_userspace_enabled: they
+	 * need the APs still parked in the work-stealing-only loop (that loop is
+	 * the only path that knows how to execute a stealable worker). The init.c
+	 * rewrite dropped these three calls, which silently removed the
+	 * M24B-SMP/M28-BENCH markers — the SMP instance then had no done-pattern
+	 * to match and ran the whole suite until the host stall watchdog shot it.
+	 * All three are no-ops outside b1nix.test=1 / on single-CPU systems. */
 	smp_selftest_run();
-
-	/* M28 #4: measure heap_lock contention across cores (decides whether a
-	 * per-CPU kmalloc magazine is worth its fragmentation cost). Same
-	 * stealable-worker window as the self-test; no-op outside test mode / single CPU. */
 	m28_heapbench_run();
-
-	/* M28 #9: ctx-switch + light-syscall rdtsc baseline (single-CPU, test mode). */
 	m28_ctxbench_run();
 
-	/* M35: verify kallsyms symbolication resolves kernel addresses. */
-	m35_diag_run();
-
-	/* M36: verify the GDB serial-stub protocol engine and ftrace tracer. */
-	m36_diag_run();
+	/* M37 device self-tests. Their only caller used to be the in-kernel test
+	 * driver in kernel/user/programs.c, deleted with the ring-3 migration —
+	 * which silently dropped the whole M37-E1000 marker set and the USB
+	 * HID-translate check (the xHCI markers that do appear come from the
+	 * driver's own probe, not from this test). Both are no-ops outside
+	 * b1nix.test=1 / without the hardware. */
+	if (bootinfo_has_flag("b1nix.test=1")) {
+		e1000_selftest();
+		usb_selftest();
+		m36_gdb_selftest();
+		m36_ftrace_selftest();
+		/* M32 IPv6 self-tests: loopback (::1) ICMPv6 + MLD, and real-link
+		 * SLAAC + ping over QEMU usernet.  Both were in kernel/user/
+		 * programs.c before the ring-3 migration; with that file gone
+		 * they run here alongside the other hardware self-tests. */
+		ipv6_loopback_smoke();
+		ipv6_realink_smoke();
+	}
 
 	/* The work-stealing self-test is done; let APs leave the work-stealing-only
 	 * loop and run the full cooperative scheduler (ordinary userspace processes)
@@ -855,6 +661,8 @@ void kernel_main(usize arg0, usize arg1)
 
 	int init_pid = user_spawn("/bin/init", 0, 0);
 	char init_spawn_buf[64];
+	if (init_pid > 0)
+		scheduler_set_init_pid((usize)init_pid);
 	snprintf(init_spawn_buf, sizeof(init_spawn_buf), "init spawn result: %d\n", init_pid);
 	console_write(init_spawn_buf);
 
@@ -1045,8 +853,24 @@ void kernel_main(usize arg0, usize arg1)
 		snprintf(sh_buf, sizeof(sh_buf), "selfhost: mount %s -> /mnt/build: %d\n",
 		         sh_src, sh_mrc);
 		console_write(sh_buf);
-		if (sh_mrc == 0)
-			run_selfhost_build();
+		if (sh_mrc == 0) {
+			/* M93: self-host build orchestration moved to userspace.
+			 * Spawn /bin/selfhost-build which reads srcs.txt, compiles
+			 * each TU with clang, and links with ld.lld. */
+			const char *sh_argv[] = {"/mnt/build/bin/selfhost-build", 0};
+			int sh_pid = user_spawn("/mnt/build/bin/selfhost-build", 1, sh_argv);
+			if (sh_pid > 0) {
+				int sh_st = 0;
+				syscall_dispatch(SYS_WAIT, (u64)sh_pid,
+				                 (u64)(usize)&sh_st, 0, 0, 0, 0);
+				char sh_res[80];
+				snprintf(sh_res, sizeof(sh_res),
+				         "selfhost: selfhost-build exit=%d\n", sh_st);
+				console_write(sh_res);
+			} else {
+				console_write("selfhost: fail spawn selfhost-build\n");
+			}
+		}
 	}
 
 	/* BSP idle loop. The BKL is fully retired (M28 #7): kernel entry runs

@@ -44,6 +44,7 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
 // IPv4
 void ipv4_receive(const void *data, usize size);
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size);
+int ipv4_is_loopback(struct ipv4_addr ip);
 
 // IPv6 datapath (loopback + real-link via NDP)
 void ipv6_receive(const void *data, usize size);

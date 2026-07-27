@@ -118,8 +118,15 @@ void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, cons
 	memcpy(buffer + sizeof(struct udp_header), payload, size);
 	hdr->checksum = bswap16(udp_checksum(net_get_ip(), dst, buffer, total_size));
 
+	int is_loopback = ipv4_is_loopback(dst);
 	ipv4_send(dst, 17 /* UDP */, buffer, total_size);
 	kfree(buffer);
+	/* For loopback the packet was enqueued (not delivered synchronously) to
+	 * avoid re-entering TCP state machines.  UDP is stateless, so we can
+	 * drain the loopback queue immediately: this lets recv() see the packet
+	 * right away (required for sendto-self + recv ordering tests). */
+	if (is_loopback)
+		net_loopback_drain();
 }
 
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size)

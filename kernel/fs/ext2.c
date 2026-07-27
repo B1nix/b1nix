@@ -1245,6 +1245,37 @@ static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
     ext2_add_dir_entry(fs, new_inode_num, new_inode_num, ".", EXT2_FT_DIR);
     ext2_add_dir_entry(fs, new_inode_num, dir_inode_num, "..", EXT2_FT_DIR);
 
+    /* Wire the freshly-linked VFS node to its on-disk inode, exactly like
+     * ext2_vfs_create does for files. Without this the node had NO
+     * ext2_inode_info (get_ino() garbage) and NO readdir_cb: every child
+     * created inside a runtime-mkdir'd directory went to a bogus on-disk
+     * inode (memory-only in practice), readdir through a re-looked-up node
+     * showed the dir empty, and rm -rf then failed ENOTEMPTY against the
+     * in-memory child it could never enumerate (the M22 cp -r regression). */
+    struct vfs_node *node = find_child(dir, name);
+    if (node) {
+        struct ext2_inode_info *info = kmalloc(sizeof(struct ext2_inode_info));
+        if (info) {
+            info->fs = fs;
+            info->inode_num = new_inode_num;
+            node->inode->data = info;
+        }
+        node->inode->blk_dev = dir->inode->blk_dev;
+        node->inode->create_cb = ext2_vfs_create;
+        node->inode->mkdir_cb = ext2_vfs_mkdir;
+        node->inode->unlink_cb = ext2_vfs_unlink;
+        node->inode->rmdir_cb = ext2_vfs_rmdir;
+        node->inode->rename_cb = ext2_vfs_rename;
+        node->inode->symlink_cb = ext2_vfs_symlink;
+        node->inode->link_cb = ext2_vfs_link;
+        node->inode->release_cb = ext2_vfs_release;
+        node->inode->setattr_cb = ext2_vfs_setattr;
+        node->inode->statfs_cb = ext2_vfs_statfs;
+        node->inode->readdir_cb = ext2_vfs_readdir;
+        node->inode->fsync_cb = ext2_vfs_fsync;
+        vfs_node_put(node);
+    }
+
     return 0;
 }
 

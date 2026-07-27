@@ -87,6 +87,18 @@ void input_kbd_scancode(u8 scancode, int extended) {
   input_event_sync(INPUT_DEV_KBD);
 }
 
+/* Bumped by every successful open(). Consumers that must react once per open
+ * (the M47 burst injector) watch this instead of the client count: a reader
+ * that closes and immediately reopens never presents an observable zero-client
+ * window, so has_clients() edge detection misses the second open. */
+static u32 dev_open_seq[INPUT_NDEVS];
+
+static u32 input_dev_open_seq(int dev) {
+  if (dev < 0 || dev >= INPUT_NDEVS)
+    return 0;
+  return __atomic_load_n(&dev_open_seq[dev], __ATOMIC_ACQUIRE);
+}
+
 int input_dev_has_clients(int dev) {
   if (dev < 0 || dev >= INPUT_NDEVS)
     return 0;
@@ -132,11 +144,27 @@ static isize input_read(struct vfs_handle *h, char *buf, usize size) {
   }
 }
 
+/* Event injection, same shape as Linux evdev: writing whole
+ * struct b1nix_input_event records to /dev/input/eventN feeds them into that
+ * device's stream, so every client reading it (a compositor, a browser's fbtk
+ * loop) sees them as ordinary input. The node is 0600, so only root can do
+ * this. This is what lets a userspace test drive an interactive app — the
+ * kernel-side injector threads only ever produced one hard-coded burst. */
 static isize input_write(struct vfs_handle *h, const char *buf, usize len) {
-  (void)h;
-  (void)buf;
-  (void)len;
-  return -EINVAL;
+  struct input_client *c = (struct input_client *)h->private_data;
+  if (!c)
+    return -EINVAL;
+  if (len == 0 || (len % sizeof(struct b1nix_input_event)) != 0)
+    return -EINVAL;
+  usize count = len / sizeof(struct b1nix_input_event);
+  for (usize i = 0; i < count; i++) {
+    struct b1nix_input_event ev;
+    memcpy(&ev, buf + i * sizeof(ev), sizeof(ev));
+    /* Timestamps are the kernel's to assign (input_event_push stamps them),
+     * so only type/code/value are taken from the caller. */
+    input_event_push(c->dev, ev.type, ev.code, ev.value);
+  }
+  return (isize)len;
 }
 
 static int input_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
@@ -240,6 +268,7 @@ int input_dev_open(int idx, int flags) {
   }
   if (flags & B1NIX_O_CLOEXEC)
     scheduler_fd_flags_set(fd, B1NIX_FD_CLOEXEC);
+  __atomic_add_fetch(&dev_open_seq[idx], 1, __ATOMIC_RELEASE);
   return fd;
 }
 
@@ -297,6 +326,39 @@ static void gfxtest_thread(void *arg) {
     /* gclock title (placement 1, top-right). */
     inj_drag(860, 46, -18, 10, 12);
   }
+}
+
+/* ── M47 smoke: mouse event burst ─────────────────────────────────────────
+ * /bin/m47_smoke opens /dev/input/event1 and waits for a known burst
+ * (REL_X=+7, REL_Y=-3, BTN_LEFT press, SYN) to prove the event stream, the
+ * blocking read path and the SYN framing all work. Nothing else in a headless
+ * run moves the mouse, so the kernel produces it in test mode once a reader
+ * has the device open. (Lived in the old kernel/user/programs.c dispatcher;
+ * re-homed here when the built-in programs moved to userspace.) */
+static void m47_inject_thread(void *arg) {
+  (void)arg;
+  u32 served = input_dev_open_seq(INPUT_DEV_MOUSE);
+  for (;;) {
+    /* One burst per open(), keyed on the open counter rather than on the
+     * client count: m47_smoke opens event1 twice back to back (input-open then
+     * input-event) and the close/reopen gap is shorter than this poll period,
+     * so a has_clients() edge would be missed and the second open would wait
+     * forever. */
+    u32 seq = input_dev_open_seq(INPUT_DEV_MOUSE);
+    if (seq == served || !input_dev_has_clients(INPUT_DEV_MOUSE)) {
+      scheduler_sleep_ticks(2);
+      continue;
+    }
+    served = seq;
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_X, 7);
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_REL, B1NIX_REL_Y, -3);
+    input_event_push(INPUT_DEV_MOUSE, B1NIX_EV_KEY, B1NIX_BTN_LEFT, 1);
+    input_event_sync(INPUT_DEV_MOUSE);
+  }
+}
+
+void input_m47_inject_start(void) {
+  (void)kthread_create("m47-input-inject", m47_inject_thread, 0);
 }
 
 void input_gfxtest_start(void) {

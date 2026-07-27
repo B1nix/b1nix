@@ -44,11 +44,7 @@ static int syscall_allows_kernel_pointers(void) {
   struct task *t = current_task;
   if (!t || !t->user_image)
     return 1;
-  if (t->in_kernel_syscall)
-    return 1;
-
-  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-  return img->kind == USER_IMAGE_BUILTIN;
+  return t->in_kernel_syscall;
 }
 
 #if defined(__x86_64__)
@@ -254,12 +250,8 @@ static int is_user_range_valid(const void *src, usize size, int write) {
   u64 end = start + size;
 
   struct task *t = current_task;
-  /* Allow kernel pointers during early boot or for builtin programs */
+  /* Allow kernel pointers during early boot */
   if (!t || !t->user_image) return 1;
-  if (t->user_image) {
-    struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
-    if (img->kind == USER_IMAGE_BUILTIN) return 1;
-  }
 
   if (end < start) return 0; // Overflow
   if (end > USER_SPACE_LIMIT) return 0; // Not in userspace
@@ -1953,11 +1945,6 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
 
   extern void *vfs_poll_chan;
 
-  if (timeout != (u64)-1 && timeout != 0) {
-    u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
-    current_task->wake_tick = start_ticks + ticks;
-  }
-
   while (1) {
     /* Publish BLOCKED on vfs_poll_chan BEFORE scanning the fds. Under -smp a
      * wake_all(vfs_poll_chan) from another CPU (data arriving on a socket/pipe)
@@ -2007,6 +1994,18 @@ static u64 sys_poll(struct b1nix_pollfd *user_fds, u64 nfds, u64 timeout) {
       scheduler_wait_cancel();
       current_task->wake_tick = 0;
       return (u64)-ERESTARTSYS;
+    }
+
+    /* Re-arm the timer deadline EVERY iteration, after wait_prepare: an
+     * explicit wake_all(vfs_poll_chan) (any fs/socket activity — the chan is
+     * global) clears wake_tick when it promotes this task, so arming it only
+     * once before the loop meant a spurious wake stripped the timeout and the
+     * next sleep was unbounded — a poll(10ms) could then sleep tens of
+     * seconds until unrelated traffic kicked the chan (netd's reactor wedge,
+     * every socket() timing out with ETIMEDOUT meanwhile). */
+    if (timeout != (u64)-1 && timeout != 0) {
+      u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+      current_task->wake_tick = start_ticks + ticks;
     }
 
     scheduler_wait_commit();
@@ -2074,6 +2073,82 @@ static u64 sys_recv(int fd, void *user_buf, usize len, int flags) {
     return (u64)-EFAULT;
   }
   kfree(kbuf);
+  return (u64)rc;
+}
+
+/* sendto(fd, buf, len, flags, dest_addr, addrlen). dest_addr may be NULL, in
+ * which case this is exactly send(). */
+static u64 sys_sendto(int fd, const void *user_buf, usize len, int flags,
+                      const void *user_addr, usize addrlen) {
+  enum { SOCKET_IO_MAX = 64 * 1024 };
+  u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+  usize kaddrlen = 0;
+  if (user_addr && addrlen) {
+    if (addrlen > sizeof(kaddr))
+      return (u64)-EINVAL;
+    memset(kaddr, 0, sizeof(kaddr));
+    if (syscall_copyin(kaddr, user_addr, addrlen) < 0)
+      return (u64)-EFAULT;
+    kaddrlen = addrlen;
+  }
+  if (len == 0)
+    return 0;
+  if (len > SOCKET_IO_MAX)
+    len = SOCKET_IO_MAX;
+  if (!user_buf)
+    return (u64)-EFAULT;
+  void *kbuf = kmalloc(len);
+  if (!kbuf)
+    return (u64)-ENOMEM;
+  if (syscall_copyin(kbuf, user_buf, len) < 0) {
+    kfree(kbuf);
+    return (u64)-EFAULT;
+  }
+  isize rc = vfs_socket_sendto(fd, kbuf, len, flags,
+                               kaddrlen ? (const void *)kaddr : 0, kaddrlen);
+  kfree(kbuf);
+  return (u64)rc;
+}
+
+/* recvfrom(fd, buf, len, flags, src_addr, addrlen*). src_addr/addrlen may be
+ * NULL, in which case this is exactly recv(). */
+static u64 sys_recvfrom(int fd, void *user_buf, usize len, int flags,
+                        void *user_addr, u32 *user_addrlen) {
+  enum { SOCKET_IO_MAX = 64 * 1024 };
+  u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+  usize kaddrlen = 0;
+  u32 uaddrlen = 0;
+  if (user_addr && user_addrlen) {
+    if (syscall_copyin(&uaddrlen, user_addrlen, sizeof(uaddrlen)) < 0)
+      return (u64)-EFAULT;
+    kaddrlen = uaddrlen > sizeof(kaddr) ? sizeof(kaddr) : uaddrlen;
+    memset(kaddr, 0, sizeof(kaddr));
+  }
+  if (len == 0)
+    return 0;
+  if (len > SOCKET_IO_MAX)
+    len = SOCKET_IO_MAX;
+  if (!user_buf)
+    return (u64)-EFAULT;
+  void *kbuf = kmalloc(len);
+  if (!kbuf)
+    return (u64)-ENOMEM;
+  usize got = kaddrlen;
+  isize rc = vfs_socket_recvfrom(fd, kbuf, len, flags,
+                                 kaddrlen ? (void *)kaddr : 0,
+                                 kaddrlen ? &got : 0);
+  if (rc > 0 && syscall_copyout(user_buf, kbuf, (usize)rc) < 0) {
+    kfree(kbuf);
+    return (u64)-EFAULT;
+  }
+  kfree(kbuf);
+  if (rc >= 0 && kaddrlen) {
+    u32 out = (u32)(got < kaddrlen ? got : kaddrlen);
+    if (out && syscall_copyout(user_addr, kaddr, out) < 0)
+      return (u64)-EFAULT;
+    if (syscall_copyout(user_addrlen, &out, sizeof(out)) < 0)
+      return (u64)-EFAULT;
+  }
   return (u64)rc;
 }
 
@@ -2215,8 +2290,23 @@ static u64 sys_sendmsg(int fd, const struct syscall_msghdr *user_msg,
     cred.gid = current_cred ? current_cred->egid : 0;
     cred_ptr = &cred;
   }
-  isize rc = vfs_socket_sendmsg(fd, payload, payload_len, flags, handles,
-                                nhandles, cred_ptr);
+  isize rc;
+  if (!nhandles && !cred_ptr && msg.msg_name && msg.msg_namelen) {
+    /* sendmsg() with msg_name is sendto() with the address in the header —
+     * the destination applies per message, no connect() required. */
+    u8 kaddr[sizeof(struct b1nix_sockaddr_un)];
+    usize alen = msg.msg_namelen > sizeof(kaddr) ? sizeof(kaddr)
+                                                 : msg.msg_namelen;
+    memset(kaddr, 0, sizeof(kaddr));
+    if (syscall_copyin(kaddr, msg.msg_name, alen) < 0) {
+      err = -EFAULT;
+      goto sendmsg_fail;
+    }
+    rc = vfs_socket_sendto(fd, payload, payload_len, flags, kaddr, alen);
+  } else {
+    rc = vfs_socket_sendmsg(fd, payload, payload_len, flags, handles, nhandles,
+                            cred_ptr);
+  }
   if (rc >= 0) {
     kfree(payload);
     return (u64)rc;
@@ -3888,6 +3978,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             scheduler_wait_cancel();
             return (u64)-EINTR;
           }
+          /* Re-arm every iteration — an explicit wake clears wake_tick (see
+           * sys_poll for the full unbounded-sleep failure this prevents). */
+          if (timeout_ms != (u64)-1 && timeout_ms != 0) {
+            u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+            current_task->wake_tick = start_ticks + ticks;
+          }
           scheduler_block_on(vfs_poll_chan);
         }
         /* Write back fd_sets with revents. */
@@ -4222,10 +4318,25 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           memcpy(bt.c_cc, lt.c_cc, sizeof(lt.c_cc));
           /* Repack the b1nix layout back into the user buffer so the device's
            * user-validated copyin succeeds, then dispatch with the user ptr.
-           * TCSADRAIN/TCSAFLUSH map to TCSETS (no output buffering). */
+           * TCSADRAIN/TCSAFLUSH map to TCSETS (no output buffering).
+           *
+           * tcsetattr(3) takes a `const struct termios *`, so the caller's
+           * buffer must come back unchanged: save the original bytes and
+           * restore them afterwards. Leaving the b1nix layout behind shifted
+           * the caller's copy by one byte (c_cc[0] became c_cc[1], i.e. VINTR
+           * read back as VQUIT), so a second tcsetattr with the same struct
+           * installed the wrong control characters. */
+          u8 user_saved[sizeof(struct b1nix_termios)];
+          if (syscall_copyin(user_saved, (void *)(usize)arg2,
+                             sizeof(user_saved)) < 0)
+            return (u64)-EFAULT;
           if (syscall_copyout((void *)(usize)arg2, &bt, sizeof(bt)) < 0)
             return (u64)-EFAULT;
-          return (u64)vfs_ioctl(fd, B1NIX_TCSETS, (void *)(usize)arg2);
+          int src = vfs_ioctl(fd, B1NIX_TCSETS, (void *)(usize)arg2);
+          if (syscall_copyout((void *)(usize)arg2, user_saved,
+                              sizeof(user_saved)) < 0)
+            return (u64)-EFAULT;
+          return (u64)src;
         }
       }
       /* reboot(magic1, magic2, cmd, arg): the command Linux passes in arg2 is a
@@ -5056,6 +5167,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                     (int)arg3);
   case SYS_RECV:
     return sys_recv((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3);
+  case SYS_SENDTO:
+    return sys_sendto((int)arg0, (const void *)(usize)arg1, (usize)arg2,
+                      (int)arg3, (const void *)(usize)arg4, (usize)arg5);
+  case SYS_RECVFROM:
+    return sys_recvfrom((int)arg0, (void *)(usize)arg1, (usize)arg2, (int)arg3,
+                        (void *)(usize)arg4, (u32 *)(usize)arg5);
   case SYS_SENDMSG:
     return sys_sendmsg((int)arg0,
                        (const struct syscall_msghdr *)(usize)arg1, (int)arg2);
@@ -5096,37 +5213,31 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     if (syscall_copyinstr(ip_text, sizeof(ip_text), (const char *)(usize)arg0) != 0)
       return (u64)-EFAULT;
     if (parse_ipv4_literal(ip_text, &dest) != 0) {
-      /* Not a dotted-quad — try resolving it as a hostname via DNS. */
       if (dns_resolve_sync(ip_text, dest.bytes) != 0)
         return (u64)-EINVAL;
     }
 
     u32 before = icmp_echo_reply_count();
+    u8 echo[8] = {8, 0, 0, 0, 0, 0, 0, 0};
+    u16 seq = (u16)(scheduler_get_uptime_ticks() & 0xffff);
+    echo[6] = (u8)(seq >> 8);
+    echo[7] = (u8)(seq & 0xff);
+    u16 csum = 0;
+    for (int j = 0; j < 8; j += 2)
+      csum = (u16)(csum + (u16)((echo[j] << 8) | echo[j + 1]));
+    csum = (u16)~csum;
+    echo[2] = (u8)(csum >> 8);
+    echo[3] = (u8)(csum & 0xff);
+    ipv4_send(dest, 1, echo, sizeof(echo));
+    console_write("ping: sent request seq=");
+    console_write_dec(seq);
+    console_write("\n");
 
-    for (int attempt = 0; attempt < 4; attempt++) {
-      u16 seq = (u16)((scheduler_get_uptime_ticks() + attempt) & 0xffff);
-      u8 echo[8] = {8, 0, 0, 0, 0, 0, 0, 0};
-      echo[6] = (u8)(seq >> 8);
-      echo[7] = (u8)(seq & 0xff);
-      u16 csum = 0;
-      for (int j = 0; j < 8; j += 2)
-        csum = (u16)(csum + (u16)((echo[j] << 8) | echo[j + 1]));
-      csum = (u16)~csum;
-      echo[2] = (u8)(csum >> 8);
-      echo[3] = (u8)(csum & 0xff);
-
-      ipv4_send(dest, 1, echo, sizeof(echo));
-      console_write("ping: sent request seq=");
-      console_write_dec(seq);
-      console_write("\n");
-
-      for (int wait = 0; wait < 25; wait++) {
-        net_poll();
-        if (icmp_echo_reply_count() > before) {
-          return 0;
-        }
-        scheduler_sleep_ticks(2);
+    for (int wait = 0; wait < 50; wait++) {
+      if (icmp_echo_reply_count() > before) {
+        return 0;
       }
+      scheduler_sleep_ticks(2);
     }
     console_write("ping: timeout waiting reply\n");
     return (u64)-ETIMEDOUT;
@@ -5137,17 +5248,15 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         isize ret = syscall_copyinstr(host, sizeof(host), (const char *)(usize)arg0);
         if (ret < 0)
             return (u64)ret;
-        /* arg1 != 0: synchronous resolve, copy the 4-byte A record out.
-         * arg1 == 0: legacy fire-and-forget query (prints to console). */
         if (arg1) {
             u8 ip[4];
             if (dns_resolve_sync(host, ip) != 0)
                 return (u64)-EHOSTUNREACH;
             if (syscall_copyout((void *)(usize)arg1, ip, 4) != 0)
                 return (u64)-EFAULT;
-            return 0;
+        } else {
+            dns_resolve(host);
         }
-        dns_resolve(host);
         return 0;
     }
   case SYS_READ_KBD:
@@ -5572,6 +5681,12 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         scheduler_wait_cancel();
         select_eintr = 1;
         break;
+      }
+      /* Re-arm every iteration — an explicit wake clears wake_tick (see
+       * sys_poll for the full unbounded-sleep failure this prevents). */
+      if (timeout_ms != (u64)-1 && timeout_ms != 0) {
+        u64 ticks = timeout_ticks > 0 ? timeout_ticks : 1;
+        current_task->wake_tick = start_ticks + ticks;
       }
       scheduler_wait_commit();
     }

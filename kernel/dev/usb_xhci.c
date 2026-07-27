@@ -1609,15 +1609,8 @@ int xhci_probe(void)
 	console_write("M37-USB: ok xhci-init\n");
 
 	if (xhci_run_requested) {
-		console_write("xhci: waiting 1000ms for ports to settle...\n");
-		for (int i = 0; i < 1000; i++) {
-			if (bootinfo_has_flag("b1nix.xhci.debug") && i % 100 == 0) {
-				console_write("xhci: waiting ");
-				console_write_dec(1000 - i);
-				console_write(" ms...\n");
-			}
-			udelay(1000);
-		}
+		console_write("xhci: waiting for ports to settle...\n");
+		scheduler_sleep_ticks(5);
 		console_write("xhci: enumerating ports...\n");
 		usb_enumerate_ports();
 	}

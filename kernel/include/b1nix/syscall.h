@@ -229,6 +229,10 @@ enum {
 	SYS_NANOSLEEP        = 235, /* nanosleep(timespec*, rem*) */
 	/* --- exec via fd (musl fexecve → Linux execveat, nr 322) --- */
 	SYS_EXECVEAT         = 236, /* execveat(dirfd, path, argv, envp, flags) */
+	/* --- unconnected datagram I/O (Linux sendto/recvfrom carry the peer
+	 * address per message; SYS_SEND/SYS_RECV keep the 4-arg legacy shape) --- */
+	SYS_SENDTO           = 237, /* sendto(fd, buf, len, flags, addr, addrlen) */
+	SYS_RECVFROM         = 238, /* recvfrom(fd, buf, len, flags, addr, addrlen*) */
 };
 
 /* Aliases: linux_abi.c references these generic names; map to the versioned ones. */

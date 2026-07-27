@@ -93,6 +93,20 @@ static void pty_commit_line(struct pty *p) {
   p->line_len = 0;
 }
 
+/* Job-control signals for this pty's foreground group.
+ *
+ * pgrp 1 is the boot/kernel group that every directly kernel-spawned task
+ * (netd, displayd, and historically /bin/init) starts in. Signalling it from a
+ * pty would take out unrelated system tasks — a session ending on the pty
+ * (master closed => SIGHUP) once killed /bin/init itself, silently, ending the
+ * whole test run mid-suite. /bin/init now runs in its own session, and this
+ * guard keeps any other boot-group task out of a pty's blast radius. */
+static void pty_signal_fg(struct pty *p, int sig) {
+  if (p->fg_pgrp <= 1)
+    return;
+  scheduler_kill_process_group(p->fg_pgrp, sig);
+}
+
 /* Process one byte arriving from the master (the "keyboard" side). */
 static void pty_input_char(struct pty *p, u8 c) {
   struct b1nix_termios *t = &p->termios;
@@ -102,18 +116,15 @@ static void pty_input_char(struct pty *p, u8 c) {
 
   if (t->c_lflag & B1NIX_ISIG) {
     if (c == t->c_cc[B1NIX_VINTR]) {
-      if (p->fg_pgrp)
-        scheduler_kill_process_group(p->fg_pgrp, SIGINT);
+      pty_signal_fg(p, SIGINT);
       return;
     }
     if (c == t->c_cc[B1NIX_VQUIT]) {
-      if (p->fg_pgrp)
-        scheduler_kill_process_group(p->fg_pgrp, SIGQUIT);
+      pty_signal_fg(p, SIGQUIT);
       return;
     }
     if (c == t->c_cc[B1NIX_VSUSP]) {
-      if (p->fg_pgrp)
-        scheduler_kill_process_group(p->fg_pgrp, SIGTSTP);
+      pty_signal_fg(p, SIGTSTP);
       return;
     }
   }
@@ -195,8 +206,7 @@ static void pty_master_release(struct vfs_handle *h) {
   p->master_open = 0;
   /* Hangup: signal the foreground group, then wake blocked slave readers so
    * they observe EOF. */
-  if (p->fg_pgrp)
-    scheduler_kill_process_group(p->fg_pgrp, SIGHUP);
+  pty_signal_fg(p, SIGHUP);
   scheduler_wake_all(&p->in_count);
   scheduler_wake_all(vfs_poll_chan);
   if (!p->slave_open) {
@@ -297,8 +307,7 @@ static int pty_ioctl(struct vfs_handle *h, u64 request, void *arg) {
     if (!arg || syscall_copyin(&p->winsize, arg, sizeof(p->winsize)) < 0)
       return -EFAULT;
     /* A window-size change notifies the foreground group. */
-    if (p->fg_pgrp)
-      scheduler_kill_process_group(p->fg_pgrp, SIGWINCH);
+    pty_signal_fg(p, SIGWINCH);
     return 0;
   case B1NIX_TIOCGPTN: {
     u32 n = (u32)p->index;

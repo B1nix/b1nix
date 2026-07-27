@@ -180,6 +180,7 @@
 #define LX_setrlimit       160
 #define LX_mount           165
 #define LX_umount2         166
+#define LX_getcpu          309
 
 /* The f* xattr variants take a descriptor and have no native handler, so they
  * stay unmapped (-ENOSYS). The follow/don't-follow argument these numbers imply
@@ -233,8 +234,8 @@ static const struct lx_map lx_table[] = {
 	{LX_socket,         SYS_SOCKET,        "socket"},
 	{LX_connect,        SYS_CONNECT,       "connect"},
 	{LX_accept,         SYS_ACCEPT,        "accept"},
-	{LX_sendto,         SYS_SEND,          "sendto"},
-	{LX_recvfrom,       SYS_RECV,          "recvfrom"},
+	{LX_sendto,         SYS_SENDTO,        "sendto"},
+	{LX_recvfrom,       SYS_RECVFROM,      "recvfrom"},
 	{LX_sendmsg,        SYS_SENDMSG,       "sendmsg"},
 	{LX_recvmsg,        SYS_RECVMSG,       "recvmsg"},
 	{LX_shutdown,       SYS_SHUTDOWN,      "shutdown"},
@@ -338,6 +339,7 @@ static const struct lx_map lx_table[] = {
 	{LX_selfhost_status, SYS_SELFHOST_STATUS, "selfhost_status"},
 	/* musl set_tid_address: store clear_child_tid ptr, return tid */
 	{LX_set_tid_address, SYS_SET_TID_ADDRESS, "set_tid_address"},
+	{LX_getcpu,          SYS_GETCPU,       "getcpu"},
 	/* musl event-loop syscalls */
 	{LX_eventfd2,        SYS_EVENTFD,      "eventfd2"},
 	{LX_eventfd,         SYS_EVENTFD,      "eventfd"},

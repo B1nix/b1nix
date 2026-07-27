@@ -46,9 +46,19 @@ static int ipv4_is_broadcast(struct ipv4_addr ip)
 	       ip.bytes[2] == 255 && ip.bytes[3] == 255;
 }
 
-static int ipv4_is_loopback(struct ipv4_addr ip)
+int ipv4_is_loopback(struct ipv4_addr ip)
 {
-	return ip.bytes[0] == 127;
+	if (ip.bytes[0] == 127)
+		return 1;
+	/* INADDR_ANY (0.0.0.0) means "any local address" — send to self. */
+	if (ip.bytes[0] == 0 && ip.bytes[1] == 0 &&
+	    ip.bytes[2] == 0 && ip.bytes[3] == 0)
+		return 1;
+	/* Sending to our own IP is also a local delivery (loopback). */
+	struct ipv4_addr my_ip = net_get_ip();
+	if (memcmp(ip.bytes, my_ip.bytes, 4) == 0)
+		return 1;
+	return 0;
 }
 
 void ipv4_receive(const void *data, usize size)

@@ -124,9 +124,15 @@ void console_putc(char ch)
 	}
 }
 
+/* Bumped on every console write. The scheduler's silence watchdog samples it:
+ * a test instance that stops printing has either wedged or deadlocked, and
+ * without an in-guest dump the only evidence is a truncated log. */
+volatile u64 g_console_write_seq;
+
 void console_write(const char *text)
 {
 	u64 flags;
+	g_console_write_seq++;
 	spin_lock_irqsave(&console_lock, &flags);
 	for (usize i = 0; text[i] != '\0'; i++) {
 		console_putc(text[i]);

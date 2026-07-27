@@ -436,12 +436,18 @@ void scheduler_sleep_ticks(u64 ticks);
 void scheduler_on_timer_tick(void);
 void scheduler_charge_tick(int is_user);
 void scheduler_exit_current(int exit_code) __attribute__((noreturn));
+/* Tell the scheduler which pid is /bin/init, so its death is reported loudly
+ * instead of ending the run in silence (see scheduler_exit_current). */
+void scheduler_set_init_pid(usize pid);
+/* Non-zero once /bin/init has been spawned; 0 before that. */
+usize scheduler_get_init_pid(void);
 void scheduler_exit_group(int exit_code) __attribute__((noreturn));
 int scheduler_wait(usize pid, int *status);
 int scheduler_waitpid(usize pid, int *status, int options);
 int scheduler_waitid(idtype_t idtype, usize id, siginfo_t *infop, int options);
 usize scheduler_task_count(void);
 void scheduler_dump_tasks(void);
+void scheduler_lease_clear_here(const char *site);
 /* M34: read-only task-table introspection for procfs / ps / top. */
 usize scheduler_task_slots(void);
 struct task *scheduler_task_slot(usize index);

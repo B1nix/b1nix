@@ -4,15 +4,12 @@
  * (32bpp, pitch = width*4). Userspace mmaps it (MAP_SHARED; sys_mmap maps
  * the frames directly via mmap_phys_cb with VMM_SHARED + a pmm ref per
  * mapping, the SysV-shm pattern) and pushes dirty rectangles with
- * B1NIX_FBIOFLUSH. The flush path mirrors the kernel compositor: prefer the
- * virtio-gpu transfer+flush, fall back to a row copy into the boot
- * framebuffer.
+ * B1NIX_FBIOFLUSH. The flush path prefers the virtio-gpu transfer+flush,
+ * falling back to a row copy into the boot framebuffer.
  *
  * The shadow buffer remains kernel-owned, while mmap_open/mmap_close hooks
- * count live userspace VMAs. The first mapping claims scanout from the kernel
- * compositor; the last unmap or process exit returns it and requests a full
- * kernel redraw. */
-#include <b1nix/compositor.h>
+ * count live userspace VMAs. The first mapping claims scanout; the last
+ * unmap or process exit returns it and requests a full kernel redraw. */
 #include <b1nix/console.h>
 #include <b1nix/errno.h>
 #include <b1nix/fb.h>
@@ -89,10 +86,8 @@ void fb_dev_mapping_close(struct vfs_node *node) {
     released = fb_mapping_count == 0;
   }
   spin_unlock_irqrestore(&fb_lock, flags);
-  if (released) {
+  if (released)
     console_write("fb0: released to kernel console\n");
-    compositor_reclaim_display();
-  }
 }
 
 static int fb_flush_rect(struct b1nix_fb_rect *r) {
@@ -134,6 +129,12 @@ static int fb_ioctl(struct vfs_node *node, u64 request, void *arg) {
     info.pitch = fb_console_width() * 4u;
     info.bpp = 32;
     if (!arg || syscall_copyout(arg, &info, sizeof(info)) < 0)
+      return -EFAULT;
+    return 0;
+  }
+  case B1NIX_FBIOGET_CLAIM: {
+    int claimed = fb_dev_claimed();
+    if (!arg || syscall_copyout(arg, &claimed, sizeof(claimed)) < 0)
       return -EFAULT;
     return 0;
   }

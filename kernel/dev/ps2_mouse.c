@@ -1,6 +1,5 @@
 #include <b1nix/arch.h>
 #include <b1nix/bootinfo.h>
-#include <b1nix/compositor.h>
 #include <b1nix/console.h>
 #include <b1nix/input.h>
 #include <b1nix/io.h>
@@ -100,9 +99,7 @@ static void ps2_mouse_event_worker(void *arg)
          * BKL-free) sets this; consume it atomically so a set racing with our
          * clear is never lost. mouse_state itself is only a cursor coordinate —
          * a torn read there is cosmetic, so it is left unlocked. */
-        if (__atomic_exchange_n(&mouse_event_pending, 0, __ATOMIC_ACQUIRE)) {
-            compositor_wake();
-        }
+        __atomic_exchange_n(&mouse_event_pending, 0, __ATOMIC_ACQUIRE);
         scheduler_sleep_ticks(1);
     }
 }

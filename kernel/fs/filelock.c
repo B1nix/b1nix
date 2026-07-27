@@ -183,11 +183,13 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   }
 
   if (fl->l_type != F_UNLCK) {
-    while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
+    if (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (cmd == F_SETLK) {
         spin_unlock(&filelock_lock);
         return -EAGAIN;
       }
+    }
+    while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (scheduler_signal_pending()) {
         spin_unlock(&filelock_lock);
         return -ERESTARTSYS;

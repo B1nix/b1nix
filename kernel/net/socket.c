@@ -402,6 +402,88 @@ static isize socket_write(struct vfs_handle *h, const char *buf, usize size) {
   return vfs_socket_send_h(h, buf, size, 0);
 }
 
+/* sendto()/recvfrom() wrappers: temporarily override the peer address for
+ * unconnected DGRAM, then call the common vfs_socket_send_h/recv_h path.
+ * This is the in-kernel equivalent of the netd_proxy_sendto/recvfrom that
+ * existed during the (reverted) ring-3 netd experiment. */
+isize vfs_socket_sendto(int fd, const void *buf, usize len, int flags,
+                        const void *addr, usize addrlen) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!addr || !addrlen)
+    return vfs_socket_send_h(h, buf, len, flags);
+  if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6)
+    return vfs_socket_send_h(h, buf, len, flags);
+  /* A connected stream socket ignores the address (Linux allows it). */
+  if (s->type == B1NIX_SOCK_STREAM)
+    return vfs_socket_send_h(h, buf, len, flags);
+  if (s->shut_wr)
+    return -EPIPE;
+
+  /* Save and override the peer address with the explicit sendto() target. */
+  unsigned char saved_peer[sizeof(s->peer)];
+  memcpy(saved_peer, &s->peer, sizeof(s->peer));
+  if (s->domain == B1NIX_AF_INET && addrlen >= sizeof(struct b1nix_sockaddr_in)) {
+    memcpy(&s->peer.in, addr, sizeof(struct b1nix_sockaddr_in));
+  } else if (s->domain == B1NIX_AF_INET6 && addrlen >= sizeof(struct b1nix_sockaddr_in6)) {
+    memcpy(&s->peer.in6, addr, sizeof(struct b1nix_sockaddr_in6));
+  } else {
+    return -EINVAL;
+  }
+  isize rc = vfs_socket_send_h(h, buf, len, flags);
+  memcpy(&s->peer, saved_peer, sizeof(s->peer));
+  return rc;
+}
+
+isize vfs_socket_recvfrom(int fd, void *buf, usize len, int flags, void *addr,
+                          usize *addrlen) {
+  struct vfs_handle *h = scheduler_fd_get(fd);
+  if (!h) return -EBADF;
+  if (h->kind != VFS_HANDLE_SOCKET) return -ENOTSOCK;
+  struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
+  if (!addr || !addrlen)
+    return vfs_socket_recv_h(h, buf, len, flags);
+
+  /* SOCK_RAW/AF_NETLINK served from the in-kernel queue; source is the ip hdr */
+  if (s->domain != B1NIX_AF_INET && s->domain != B1NIX_AF_INET6) {
+    *addrlen = 0;
+    return vfs_socket_recv_h(h, buf, len, flags);
+  }
+  if (s->type == B1NIX_SOCK_RAW) {
+    isize rc = vfs_socket_recv_h(h, buf, len, flags);
+    if (rc >= 20 && *addrlen >= sizeof(struct b1nix_sockaddr_in)) {
+      const u8 *ip = (const u8 *)buf;
+      struct b1nix_sockaddr_in sin;
+      memset(&sin, 0, sizeof(sin));
+      sin.sin_family = B1NIX_AF_INET;
+      memcpy(&sin.sin_addr, ip + 12, 4);
+      memcpy(addr, &sin, sizeof(sin));
+      *addrlen = sizeof(sin);
+    } else {
+      *addrlen = 0;
+    }
+    return rc;
+  }
+  if (s->type == B1NIX_SOCK_STREAM) {
+    isize rc = vfs_socket_recv_h(h, buf, len, flags);
+    usize n = *addrlen < sizeof(s->peer) ? *addrlen : sizeof(s->peer);
+    memcpy(addr, &s->peer, n);
+    *addrlen = n;
+    return rc;
+  }
+  if (s->shut_rd) {
+    *addrlen = 0;
+    return 0;
+  }
+  isize rc = vfs_socket_recv_h(h, buf, len, flags);
+  usize n = *addrlen < sizeof(s->peer) ? *addrlen : sizeof(s->peer);
+  memcpy(addr, &s->peer, n);
+  *addrlen = n;
+  return rc;
+}
+
 static int socket_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   if (s->domain == B1NIX_AF_UNIX) {

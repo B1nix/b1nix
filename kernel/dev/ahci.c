@@ -480,14 +480,16 @@ static int ahci_port_identify(struct ahci_port_state *port, u16 *identify_buf) {
   cmd_hdr->ctbau = ctbau;
   cmd_hdr->cfis_len = sizeof(struct fis_reg_h2d) / 4;
   cmd_hdr->write = 0;
-  cmd_hdr->prdtl = 1;
 
-  struct ahci_prdt_entry *prdt = &cmd_table->prdt[0];
-  memset(prdt, 0, sizeof(struct ahci_prdt_entry));
-  u64 phys_buf = vmm_virt_to_phys(identify_buf);
-  prdt->dba = (u32)(phys_buf & 0xFFFFFFFF);
-  prdt->dbau = (u32)((phys_buf >> 32) & 0xFFFFFFFF);
-  prdt->dbc = (512 - 1) | (1ULL << 31);
+  /* identify_buf is a kzalloc(512) heap buffer, not guaranteed page-aligned —
+   * a single raw PRD entry (translating only its starting address) silently
+   * corrupts whatever physical frame follows the buffer's page whenever the
+   * 512 bytes straddle a page boundary (see ahci_build_prdt's comment: this
+   * exact bug previously corrupted unrelated frames via the block-I/O path). */
+  int prdt_n = ahci_build_prdt(cmd_table, identify_buf, 512);
+  if (prdt_n < 0)
+    return -1;
+  cmd_hdr->prdtl = (u16)prdt_n;
 
   memset(cmd_table->cfis, 0, 64);
   struct fis_reg_h2d *fis = (struct fis_reg_h2d *)cmd_table->cfis;

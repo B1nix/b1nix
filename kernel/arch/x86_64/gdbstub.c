@@ -20,6 +20,7 @@
  */
 
 #include <b1nix/arch_x86_64.h>
+#include <b1nix/console.h>
 #include <b1nix/gdbstub.h>
 #include <b1nix/serial.h>
 #include <string.h>
@@ -333,6 +334,97 @@ int gdb_recv_packet(struct gdb_transport *t, char *buf, usize cap) {
   }
   t->putc(t->ctx, '-');
   return (int)n;
+}
+
+/* ── in-memory self-test (M36 smoke, called from main.c in test mode) ── */
+
+struct mem_transport {
+  char buf[2048];
+  usize pos;
+  usize read_pos;
+};
+
+static int mem_getc(void *ctx) {
+  struct mem_transport *m = ctx;
+  if (m->read_pos >= m->pos) return -1;
+  return (unsigned char)m->buf[m->read_pos++];
+}
+
+static void mem_putc(void *ctx, char c) {
+  struct mem_transport *m = ctx;
+  if (m->pos < sizeof(m->buf))
+    m->buf[m->pos++] = c;
+}
+
+static void mem_reset(struct mem_transport *m) {
+  m->pos = 0;
+  m->read_pos = 0;
+}
+
+void m36_gdb_selftest(void) {
+  console_write("M36-GDB: start\n");
+
+  struct interrupt_frame f;
+  memset(&f, 0, sizeof(f));
+  f.rax = 0x1111111111111111ULL;
+  f.rbx = 0x2222222222222222ULL;
+  f.rcx = 0x3333333333333333ULL;
+  f.rdx = 0x4444444444444444ULL;
+  f.rsi = 0x5555555555555555ULL;
+  f.rdi = 0x6666666666666666ULL;
+  f.rbp = 0x7777777777777777ULL;
+  f.rsp = 0x8888888888888888ULL;
+  f.rip = 0xFFFFFFFF80100000ULL;
+  f.rflags = 0x202;
+
+  char out[1200];
+  int resume;
+
+  /* Test 1: stop-reply — '?' should return "S05" (SIGTRAP). */
+  int len = gdb_handle_packet("?", out, sizeof(out), &f, &resume);
+  if (len >= 3 && out[0] == 'S' && out[1] == '0' && out[2] == '5')
+    console_write("M36-GDB: ok stop-reply\n");
+  else
+    console_write("M36-GDB: FAIL stop-reply\n");
+
+  /* Test 2: read-regs — 'g' should return a hex string starting with rax. */
+  len = gdb_handle_packet("g", out, sizeof(out), &f, &resume);
+  if (len > 16 && strncmp(out, "1111111111111111", 16) == 0)
+    console_write("M36-GDB: ok read-regs\n");
+  else
+    console_write("M36-GDB: FAIL read-regs\n");
+
+  /* Test 3: read-mem — 'm' of a kernel address should return hex bytes. */
+  char m_pkt[64];
+  usize addr = (usize)f.rip;
+  int plen = 0;
+  m_pkt[plen++] = 'm';
+  for (int i = 60; i >= 0; i -= 4)
+    m_pkt[plen++] = hex_digit((int)((addr >> i) & 0xf));
+  m_pkt[plen++] = ',';
+  m_pkt[plen++] = '1';
+  m_pkt[plen++] = '0';
+  m_pkt[plen] = '\0';
+
+  len = gdb_handle_packet(m_pkt, out, sizeof(out), &f, &resume);
+  if (len == 32 && out[0] != 'E')
+    console_write("M36-GDB: ok read-mem\n");
+  else
+    console_write("M36-GDB: FAIL read-mem\n");
+
+  /* Test 4: framing — send_packet + recv_packet round-trip over in-memory. */
+  struct mem_transport mt;
+  mem_reset(&mt);
+  struct gdb_transport t = {mem_getc, mem_putc, &mt};
+  gdb_send_packet(&t, "hello");
+  char pkt_buf[128];
+  int rlen = gdb_recv_packet(&t, pkt_buf, sizeof(pkt_buf));
+  if (rlen == 5 && strcmp(pkt_buf, "hello") == 0)
+    console_write("M36-GDB: ok framing\n");
+  else
+    console_write("M36-GDB: FAIL framing\n");
+
+  console_write("M36-GDB: done\n");
 }
 
 /* ── serial transport (production) ── */

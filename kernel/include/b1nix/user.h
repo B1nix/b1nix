@@ -3,8 +3,6 @@
 
 #include <b1nix/types.h>
 
-typedef int (*user_program_entry)(int argc, const char **argv);
-
 #define USER_MAX_ARGS 32
 #define USER_MAX_ENVS 32
 /* Total PT_LOAD segments across the executable and every DT_NEEDED object in the
@@ -38,7 +36,6 @@ typedef int (*user_program_entry)(int argc, const char **argv);
 #endif
 
 enum user_image_kind {
-	USER_IMAGE_BUILTIN = 1,
 	USER_IMAGE_ELF64 = 2,
 	USER_IMAGE_ELF32 = 3,
 };
@@ -81,10 +78,7 @@ struct user_address_space {
 	usize stack_image_size;
 };
 
-struct user_program {
-	const char *path;
-	user_program_entry entry;
-};
+struct task;
 
 struct user_loaded_image {
 	enum user_image_kind kind;
@@ -116,16 +110,6 @@ struct user_loaded_image {
 	 * demand-paged from the page cache; 0 = fully eager (initramfs / ineligible). */
 	struct vfs_node *exe_node;
 	int demand_paged;
-	/* M75: shared-library constructors (DT_INIT/DT_INIT_ARRAY) collected across
-	 * the DT_NEEDED graph during eager linking, in dependency order (deepest
-	 * dependency first). These are absolute user VAs of void(int,char**,char**)
-	 * functions; the kernel pushes them as a NULL-terminated array onto the
-	 * initial stack and exposes it via AT_B1NIX_DSO_INIT so crt0 runs them before
-	 * the executable's own __init_array. Without this, a library full of static
-	 * constructors (libLLVM.so: 458 of them — X86 target registration, cl::opt
-	 * defaults) leaves codegen uninitialized. 0/NULL = no shared-lib ctors. */
-	u64 *dso_init;
-	usize dso_init_count;
 	/* M92: executable's program header table info for AT_PHDR/AT_PHNUM auxv.
 	 * phdr_vaddr is the in-process VA where the ELF program headers are mapped;
 	 * phnum is e_phnum. Set by the ELF loaders; used by user_build_initial_stack.
@@ -167,8 +151,6 @@ int user_spawn(const char *path, int argc, const char **argv);
 int user_spawn_env(const char *path, int argc, const char **argv,
                    const char **envp);
 int user_execve_current(const char *path, const char **argv, const char **envp);
-void user_register_builtin_programs(void);
-const struct user_program *user_find_program(const char *path);
 struct task;
 void user_address_space_cleanup(struct task *t);
 /* Full executable path of a task (the loaded image's path), for /proc/<pid>/exe.

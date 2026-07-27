@@ -1395,14 +1395,21 @@ void virtio_gpu_dev_init(void)
 {
     if (!gpu_ready || !gpu_virgl_ok)
         return;
-    if (vgpu_ctx_create(VGPU_UDEV_CTX) < 0) {
-        console_write("virtio-gpu: userspace VirGL ctx create failed\n");
-        return;
+    /* Called again from vfs_repopulate_after_root_mount() to re-add the VFS
+     * node onto the post-root-switch tree (the initramfs node it registered
+     * onto during early boot becomes unreachable once "/" redirects to the
+     * mounted ext4 root). The VirGL ctx + submit buffer are one-time hardware
+     * state — only (re)create them the first time. */
+    if (!vgpu_udev_ready) {
+        if (vgpu_ctx_create(VGPU_UDEV_CTX) < 0) {
+            console_write("virtio-gpu: userspace VirGL ctx create failed\n");
+            return;
+        }
+        u64 buf_phys = pmm_alloc_frames(VGPU_SUBMIT_BUF_BYTES / PAGE_SIZE);
+        if (!buf_phys)
+            return;
+        vgpu_udev_submit_buf = (u8 *)(usize)(buf_phys + vmm_direct_map_base());
     }
-    u64 buf_phys = pmm_alloc_frames(VGPU_SUBMIT_BUF_BYTES / PAGE_SIZE);
-    if (!buf_phys)
-        return;
-    vgpu_udev_submit_buf = (u8 *)(usize)(buf_phys + vmm_direct_map_base());
 
     struct vfs_node *node = vfs_add_node("/dev/virtio-gpu", VFS_DEVICE, 0, 0, 0);
     if (!node || IS_ERR(node)) {

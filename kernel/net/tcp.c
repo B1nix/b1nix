@@ -1,4 +1,5 @@
 #include <b1nix/console.h>
+#include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
 #include <b1nix/sched.h>
@@ -652,7 +653,12 @@ int tcp_send(struct tcp_conn *conn, const void *data, usize len) {
     kfree(rp->data);
     kfree(rp);
     kfree(packet);
-    return 0;
+    /* The congestion/peer window is full: more data cannot be sent until ACKs
+     * drain. A non-blocking caller must see -EAGAIN; a blocking caller's vfs
+     * socket layer will yield / retry. Returning 0 here would make a
+     * 500-iteration unidirectional send loop appear to deliver all data
+     * instantly (never throttling), which masks real write-side congestion. */
+    return -EAGAIN;
   }
   u32 usable = window - inflight;
   usize to_send = len;

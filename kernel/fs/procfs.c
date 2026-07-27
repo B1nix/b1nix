@@ -22,6 +22,7 @@
 
 #include <b1nix/bootinfo.h>
 #include <b1nix/errno.h>
+#include <b1nix/klog.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/sched.h>
@@ -369,6 +370,24 @@ static int r_cmdline(usize pid, struct sbuf *s) {
   if (cmd) {
     sb_puts(s, cmd);
     sb_puts(s, "\n");
+  }
+  return 0;
+}
+
+static int r_kallsyms(usize pid, struct sbuf *s) {
+  (void)pid;
+  extern const unsigned char __kallsyms_start[];
+  extern const unsigned char __kallsyms_end[];
+  const unsigned char *p = __kallsyms_start;
+  const unsigned char *end = __kallsyms_end;
+  while (p + 8 < end) {
+    u64 a;
+    memcpy(&a, p, 8);
+    p += 8;
+    const char *name = (const char *)p;
+    while (p < end && *p) p++;
+    p++;
+    sb_addf(s, "%016lx t %s\n", (unsigned long)a, name);
   }
   return 0;
 }
@@ -780,6 +799,15 @@ static int r_net_udp(usize pid, struct sbuf *s) {
   return 0;
 }
 
+static int r_net_udp6(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "  sl  local_address                         "
+             "remote_address                        st tx_queue rx_queue tr "
+             "tm->when retrnsmt   uid  timeout inode\n");
+  net_render_inet(s, 6, 1);
+  return 0;
+}
+
 static int r_net_unix(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "Num       RefCount Protocol Flags    Type St Inode Path\n");
@@ -869,6 +897,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "filesystems", VFS_DEVICE, r_filesystems, 0);
   procfs_mkchild(root, "mounts", VFS_DEVICE, r_mounts, 0);
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
+  procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
 
   struct vfs_node *netd = procfs_mkchild(root, "net", VFS_DIRECTORY, 0, 0);
@@ -876,6 +905,7 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
     procfs_mkchild(netd, "tcp", VFS_DEVICE, r_net_tcp, 0);
     procfs_mkchild(netd, "tcp6", VFS_DEVICE, r_net_tcp6, 0);
     procfs_mkchild(netd, "udp", VFS_DEVICE, r_net_udp, 0);
+    procfs_mkchild(netd, "udp6", VFS_DEVICE, r_net_udp6, 0);
     procfs_mkchild(netd, "unix", VFS_DEVICE, r_net_unix, 0);
     procfs_mkchild(netd, "route", VFS_DEVICE, r_net_route, 0);
     procfs_mkchild(netd, "dev", VFS_DEVICE, r_net_dev, 0);

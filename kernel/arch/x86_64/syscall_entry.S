@@ -124,6 +124,15 @@ x86_syscall_return:
     popq %rcx   /* RIP */
     addq $8, %rsp /* Skip CS */
     popq %r11   /* RFLAGS */
+
+    /* Between restoring the user RSP and SYSRETQ the CPU is still at CPL 0.
+     * An interrupt taken there does NOT reload RSP0 from the TSS, so it would
+     * be delivered onto the *user* stack and the handler would run in ring 0
+     * on user memory — the moment it reaches a context switch into a kernel
+     * task, CR3 flips to the kernel PML4, the user stack vanishes and the
+     * return sequence double-faults. Mask interrupts across the window;
+     * SYSRETQ restores RFLAGS from R11, which still carries the user's IF. */
+    cli
     popq %rsp   /* RSP */
     /* Skip SS */
 

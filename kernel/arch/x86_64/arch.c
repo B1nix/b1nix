@@ -1,6 +1,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
+#include <b1nix/mm.h>
 #include <b1nix/types.h>
 
 #define X86_TSS_SELECTOR 0x28
@@ -28,6 +29,12 @@ struct x86_tss {
  * every context switch (arch_set_kernel_stack), so each CPU needs its own TSS
  * to run userspace independently. */
 static struct x86_tss x86_tss_arr[MAX_CPUS] __attribute__((aligned(16)));
+
+/* Emergency stack for #DF (IST1). The BSP's is static because its TSS is set
+ * up before the heap is usable; APs allocate theirs from the heap. See the
+ * idt[8].ist comment in interrupts.c for why this exists. */
+#define X86_DF_STACK_SIZE 8192
+static u8 x86_df_stack_bsp[X86_DF_STACK_SIZE] __attribute__((aligned(16)));
 
 void x86_idt_init(void);
 void x86_idt_load(void); /* interrupts.c — load the shared IDT on this CPU */
@@ -57,6 +64,12 @@ static void x86_tss_init_cpu(int cpu) {
 
   if (cpu == 0)
     t->rsp0 = (u64)x86_syscall_stack_top; /* boot value; updated per switch */
+
+  if (t->ist1 == 0) {
+    u8 *df = (cpu == 0) ? x86_df_stack_bsp : (u8 *)kzalloc(X86_DF_STACK_SIZE);
+    if (df)
+      t->ist1 = (u64)(df + X86_DF_STACK_SIZE);
+  }
   t->iomap_base = sizeof(*t);
 
   gdt64_tss[cpu * 2 + 0] =

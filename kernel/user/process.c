@@ -15,11 +15,9 @@
 extern void x86_user_jump(usize entry, usize stack, usize argc, usize argv);
 extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 
-/* Built-in program registry (C2 audit): grows on demand from the kheap
- * starting at PROGRAMS_INITIAL slots and doubling each time. There is no
- * hard ceiling — the only limit is kheap exhaustion, signalled by
- * user_register_program emitting the existing warning. */
-#define PROGRAMS_INITIAL 16
+/* All user programs are Ring 3 ELFs loaded from VFS. The legacy C-level
+ * built-in program registry (user_register_program / user_program_entry)
+ * has been retired. */
 #define ELF_MAGIC0 0x7f
 #define ELF_MAGIC1 'E'
 #define ELF_MAGIC2 'L'
@@ -116,9 +114,17 @@ extern void arch_fpu_init_current(void); /* reset FPU/MXCSR to ABI default */
 struct elf64_dyn { i64 d_tag; u64 d_val; };
 struct elf64_rela { u64 r_offset; u64 r_info; i64 r_addend; };
 
-/* Defined out-of-line below user_load_elf64; forward-declared so the loader's
- * RELATIVE pass can resolve a runtime vaddr to its staging-buffer address. */
-static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n);
+static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n) {
+  if (!image) return 0;
+  for (usize i = 0; i < image->segment_count; i++) {
+    struct user_image_segment *seg = &image->segments[i];
+    if (!seg->data) continue;
+    if (va >= seg->vaddr && (va + n) <= (seg->vaddr + seg->memsz) && va + n >= va) {
+      return (u8 *)seg->data + (va - seg->vaddr);
+    }
+  }
+  return 0;
+}
 
 /* M30 — base address at which PIE/ET_DYN images get loaded. Picked well
  * above the standard 0x400000 ET_EXEC load base and below the user
@@ -199,9 +205,6 @@ struct elf64_shdr {
   u64 sh_entsize;
 } __attribute__((packed));
 
-static struct user_program *programs = 0;
-static usize program_count = 0;
-static usize programs_capacity = 0;
 static const u64 USER_STACK_MAX_SIZE = 8ULL * 1024ULL * 1024ULL;
 static int user_image_read_vfs_file(const char *path, char **out_data,
                                     usize *out_size);
@@ -219,7 +222,7 @@ static struct user_address_space user_address_space_create(void) {
   return address_space;
 }
 
-/* Userspace ld.so support (ldso-migration-and-unix-parity-plan.md, part 1).
+/* Userspace ld.so support (musl-port.md, part 1).
  * Loads a real ELF interpreter's (musl's ld-musl-x86_64.so.1) own PT_LOAD
  * segments verbatim at `base`, WITHOUT eager symbol resolution/relocation:
  * the interpreter is a standard ET_DYN that self-relocates (applies its own
@@ -389,22 +392,6 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
     if (envp_ptrs[i] == 0) return -1;
   }
 
-  /* M75: place the shared-library constructor descriptor table on the stack and
-   * record its user VA for AT_B1NIX_DSO_INIT. Layout (read forwards from the VA):
-   * {init_array_va, count} pairs, terminated by a zero init_array_va. Pushed
-   * highest-address-first (terminator first, then descriptors in reverse) so the
-   * table reads forwards from the returned VA. The table is tiny (2 words per
-   * library), so it coexists with argv/envp/auxv on the single-page stack. */
-  usize dso_init_va = 0;
-  if (image->dso_init && image->dso_init_count) {
-    if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* terminator */
-    for (usize i = image->dso_init_count; i-- > 0;) {
-      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 1]) < 0) return -1; /* count */
-      if (user_stack_push_usize(stack, &sp, image->dso_init[i * 2 + 0]) < 0) return -1; /* va */
-    }
-    dso_init_va = USER_STACK_TOP - USER_STACK_SIZE + sp;
-  }
-
   /* M92: Push the AT_EXECFN string data BEFORE the 16-byte alignment so its
    * variable-length payload doesn't break the alignment for the auxv pairs.
    * Record its user VA; the auxv entry pushes only the pointer and type. */
@@ -421,24 +408,8 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
    * total_slots pointer-sized words: argc(1), argv(argc), NULL(1), envp(envc),
    * NULL(1), auxv(6+). sp is 16-aligned right now, so after the pushes it stays
    * 16-aligned iff total_slots*sizeof(usize) is a multiple of 16. Pad with as
-   * many zero words as needed to reach the next 16-byte boundary.
-   *
-   * The actual auxv below contains 32 words (16 type/value pairs), and the
-   * argc/argv/envp area contains 2*argc + envc + 3 words. On x86_64
-   * sizeof(usize)==8, so a single pad word always suffices (16/8==2 words per
-   * 16 bytes). On the 32-bit port sizeof(usize)==4, so up to THREE
-   * pad words may be required — the old "push one if misaligned" left ESP 4- or
-   * 8-byte aligned for many argc/envc counts, and user_run_elf_image rejected
-   * the unaligned ring3 stack, so every ELF32 spawn failed.
-   *
-   * Auxv words below: AT_NULL(2) + AT_PHDR(2) + AT_PHENT(2) + AT_PHNUM(2) +
-   * AT_ENTRY(2) + AT_PAGESZ(2) + AT_BASE(2) + AT_CLKTCK(2) + AT_UID(2) +
-   * AT_EUID(2) + AT_GID(2) + AT_EGID(2) + AT_RANDOM(2) + AT_RANDOM_DATA(2) +
-   * AT_HWCAP(2) + AT_SECURE(2) + AT_EXECFN(2) = 32, plus 2 for the optional
-   * AT_B1NIX_DSO_INIT. The remaining +3 is the argv terminator, envp
-   * terminator, and argc word. */
-  usize total_slots = 35 + (usize)image->argc + (usize)envc +
-                      (dso_init_va ? 2 : 0);
+   * many zero words as needed to reach the next 16-byte boundary. */
+  usize total_slots = 35 + (usize)image->argc + (usize)envc;
   usize words_per_16 = 16 / sizeof(usize);
   usize rem = total_slots % words_per_16;
   usize pad = rem ? (words_per_16 - rem) : 0;
@@ -459,16 +430,9 @@ static int user_build_initial_stack(struct user_loaded_image *image) {
   /* Auxiliary vector. Pushed high-address-first as {a_val, a_type} pairs so that
    * — read forwards from the low end, where getauxval() starts after the envp
    * NULL — each entry appears in the ABI's {a_type, a_val} order and AT_NULL
-   * terminates the array at the high end. (The earlier layout pushed a_type
-   * before a_val and left AT_NULL at the low end, so getauxval saw AT_NULL first
-   * and returned 0 for every query; only rust relied on auxv and tolerates 0 as
-   * "absent", which masked the bug.) */
+   * terminates the array at the high end. */
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_val */
   if (user_stack_push_usize(stack, &sp, 0) < 0) return -1; /* AT_NULL  a_type */
-  if (dso_init_va) {
-    if (user_stack_push_usize(stack, &sp, (usize)dso_init_va) < 0) return -1;
-    if (user_stack_push_usize(stack, &sp, AT_B1NIX_DSO_INIT) < 0) return -1;
-  }
   if (user_stack_push_usize(stack, &sp, (usize)image->phdr_vaddr) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, AT_PHDR) < 0) return -1;
   if (user_stack_push_usize(stack, &sp, 56) < 0) return -1;                    /* AT_PHENT = sizeof(Elf64_Phdr) */
@@ -780,7 +744,14 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * also walk PT_DYNAMIC and apply R_X86_64_RELATIVE relocations so
    * absolute pointers in the binary (e.g. into .rodata or function
    * tables) point at the relocated base. */
-  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN) ? aslr_pie_base() : 0;
+  u64 first_load_vaddr = 0;
+  for (u16 j = 0; j < ehdr->e_phnum; j++) {
+    if (phdrs[j].p_type == PT_LOAD) {
+      first_load_vaddr = phdrs[j].p_vaddr;
+      break;
+    }
+  }
+  u64 load_base = (ehdr->e_type == ELF_TYPE_DYN && first_load_vaddr == 0) ? aslr_pie_base() : 0;
 
   image->entry = ehdr->e_entry + load_base;
   /* M92: record program header location for AT_PHDR / AT_PHNUM auxv.
@@ -825,10 +796,9 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * segments unrelocated, jumps to _dlstart, which self-relocates and then
    * loads/links the executable via syscalls.
    *
-   * All other PT_INTERP values (the old /lib/ld-b1nix.so used by legacy
-   * PIE binaries that were linked against the in-kernel eager linker) are
-   * handled by falling through to the eager linking path below — so the
-   * dozens of existing ports keep working while we migrate them to musl. */
+   * The old in-kernel eager linker (used for the legacy /lib/ld-b1nix.so
+   * PT_INTERP) is gone — every rootfs binary is musl-linked now. Any other
+   * PT_INTERP value just fails to load below ("failed to load interpreter"). */
   for (u16 j = 0; j < ehdr->e_phnum; j++) {
     struct elf64_phdr *p = &phdrs[j];
     if (p->p_type != PT_INTERP) continue;
@@ -844,39 +814,34 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
      * line was observed corrupting the concurrent "M53-HTTPD: ready" marker
      * under SMP exec churn). */
     char line[128 + sizeof(interp)];
-    if (strcmp(interp, "/lib/ld-musl-x86_64.so.1") == 0) {
-      u64 interp_entry = 0;
-      usize seg_count_before = image->segment_count;
-      /* Try the absolute path first (real / mount), then /mnt/root (test-mode
-       * ram0 mount — matches how initramfs-era boot stages find rootfs libs). */
-      int interp_rc = elf64_load_interpreter(image, interp, USER_LDSO_LOAD_BASE,
-                                             &interp_entry);
-      if (interp_rc != 0) {
-        image->segment_count = seg_count_before; /* undo partial segments */
-        char alt[80];
-        usize ilen2 = strlen(interp);
-        if (ilen2 + 10 <= sizeof(alt)) {
-          memcpy(alt, "/mnt/root", 9);
-          memcpy(alt + 9, interp, ilen2 + 1);
-          interp_rc = elf64_load_interpreter(image, alt, USER_LDSO_LOAD_BASE,
-                                             &interp_entry);
-        }
+    u64 interp_entry = 0;
+    usize seg_count_before = image->segment_count;
+    /* Try the absolute path first (real / mount), then /mnt/root (test-mode
+     * ram0 mount — matches how initramfs-era boot stages find rootfs libs). */
+    int interp_rc = elf64_load_interpreter(image, interp, USER_LDSO_LOAD_BASE,
+                                           &interp_entry);
+    if (interp_rc != 0) {
+      image->segment_count = seg_count_before; /* undo partial segments */
+      char alt[80];
+      usize ilen2 = strlen(interp);
+      if (ilen2 + 10 <= sizeof(alt)) {
+        memcpy(alt, "/mnt/root", 9);
+        memcpy(alt + 9, interp, ilen2 + 1);
+        interp_rc = elf64_load_interpreter(image, alt, USER_LDSO_LOAD_BASE,
+                                           &interp_entry);
       }
-      if (interp_rc != 0) {
-        snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (failed to load interpreter)\n", interp);
-        console_write(line);
-        goto cleanup;
-      }
-      image->app_entry = image->entry;
-      image->interp_base = USER_LDSO_LOAD_BASE;
-      image->entry = interp_entry;
-      snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (userspace ld.so, base=0x%lx)\n",
-               interp, (unsigned long)USER_LDSO_LOAD_BASE);
-      console_write(line);
-    } else {
-      snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (eager in-kernel dynamic linking)\n", interp);
-      console_write(line);
     }
+    if (interp_rc != 0) {
+      snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (failed to load interpreter)\n", interp);
+      console_write(line);
+      goto cleanup;
+    }
+    image->app_entry = image->entry;
+    image->interp_base = USER_LDSO_LOAD_BASE;
+    image->entry = interp_entry;
+    snprintf(line, sizeof(line), "ELF load: PT_INTERP=%s (userspace ld.so, base=0x%lx)\n",
+             interp, (unsigned long)USER_LDSO_LOAD_BASE);
+    console_write(line);
     break; /* at most one PT_INTERP */
   }
 
@@ -1002,50 +967,48 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
     break; /* at most one PT_TLS */
   }
 
-  /* RELATIVE-relocation pass for a no-interp PIE (ET_DYN with no recognized
-   * PT_INTERP, so no ld.so runs — image->interp_base stays 0). Such a binary is
-   * self-contained (raw syscalls, no GOT/PLT symbol refs) but its PT_LOAD is
-   * position-independent, so every absolute pointer in .data carries an
-   * R_X86_64_RELATIVE relocation whose value is `load_base + addend`. Nothing
-   * else applies these (the symbol-resolving eager linker was removed), so the
-   * kernel walks PT_DYNAMIC's DT_RELA here and patches them in the staging
-   * buffers — mirroring the elf32 loader's DT_REL/R_386_RELATIVE pass. Gated on
-   * interp_base == 0 so a musl-interp image is never double-relocated (its ld.so
-   * owns relocation). Symbol relocs (GLOB_DAT/JUMP_SLOT) are intentionally NOT
-   * resolved: a no-interp binary that needs them still faults, exactly as before. */
+  /* Dynamic relocations are handled in userspace (ld-musl) for every binary
+   * that names a PT_INTERP. A no-interp PIE (ET_DYN with no interpreter — the
+   * M30 pie smoke, and any freestanding -pie binary) has nobody else to do it:
+   * its .data pointer tables still hold link-time (0-based) addresses, so the
+   * first dereference faults. Apply the one relocation type such a binary can
+   * emit, R_X86_64_RELATIVE (*target = load_base + addend), into the staged
+   * segments before they are mapped. */
   if (load_base != 0 && image->interp_base == 0) {
     for (u16 i = 0; i < ehdr->e_phnum; i++) {
       struct elf64_phdr *phdr = &phdrs[i];
       if (phdr->p_type != PT_DYNAMIC)
         continue;
+      usize dyn_count = phdr->p_filesz / sizeof(struct elf64_dyn);
       struct elf64_dyn *dyn = (struct elf64_dyn *)_vaddr_to_stage(
           image, phdr->p_vaddr + load_base, phdr->p_filesz);
       if (!dyn)
         break;
-      u64 rela_off = 0, rela_sz = 0, rela_ent = sizeof(struct elf64_rela);
-      usize ndyn = phdr->p_filesz / sizeof(struct elf64_dyn);
-      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
-        switch (dyn[d].d_tag) {
-          case DT_RELA:    rela_off = dyn[d].d_val; break;
-          case DT_RELASZ:  rela_sz = dyn[d].d_val; break;
-          case DT_RELAENT: rela_ent = dyn[d].d_val; break;
-        }
+      u64 rela_vaddr = 0, rela_size = 0, rela_ent = sizeof(struct elf64_rela);
+      for (usize d = 0; d < dyn_count && dyn[d].d_tag != DT_NULL; d++) {
+        if (dyn[d].d_tag == DT_RELA)
+          rela_vaddr = dyn[d].d_val;
+        else if (dyn[d].d_tag == DT_RELASZ)
+          rela_size = dyn[d].d_val;
+        else if (dyn[d].d_tag == DT_RELAENT && dyn[d].d_val)
+          rela_ent = dyn[d].d_val;
       }
-      if (rela_off && rela_sz && rela_ent) {
-        usize nrela = rela_sz / rela_ent;
-        for (usize r = 0; r < nrela; r++) {
-          struct elf64_rela *rela = (struct elf64_rela *)_vaddr_to_stage(
-              image, rela_off + load_base + r * rela_ent,
-              sizeof(struct elf64_rela));
-          if (!rela)
-            break;
-          if ((rela->r_info & 0xffffffffULL) != R_X86_64_RELATIVE)
-            continue;
-          u64 *target = (u64 *)_vaddr_to_stage(
-              image, rela->r_offset + load_base, sizeof(u64));
-          if (target)
-            *target = load_base + (u64)rela->r_addend;
-        }
+      if (!rela_vaddr || rela_size < rela_ent ||
+          rela_ent < sizeof(struct elf64_rela))
+        break;
+      u8 *rela = _vaddr_to_stage(image, rela_vaddr + load_base, rela_size);
+      if (!rela)
+        break;
+      for (u64 off = 0; off + sizeof(struct elf64_rela) <= rela_size;
+           off += rela_ent) {
+        struct elf64_rela *r = (struct elf64_rela *)(rela + off);
+        if ((r->r_info & 0xFFFFFFFFULL) != R_X86_64_RELATIVE)
+          continue;
+        u64 *target =
+            (u64 *)_vaddr_to_stage(image, r->r_offset + load_base, sizeof(u64));
+        if (!target)
+          continue;
+        *target = load_base + (u64)r->r_addend;
       }
       break; /* at most one PT_DYNAMIC */
     }
@@ -1058,22 +1021,6 @@ cleanup:
   if (fd >= 0)
     vfs_close(fd);
   return rc;
-}
-
-/* Helper referenced by VADDR_TO_STAGE — kept out-of-line to keep the
- * loader body readable. (Currently unused after the inlined searches
- * above, but retained for the next iteration when relocations become
- * symbol-aware.) */
-__attribute__((unused))
-static u8 *_vaddr_to_stage(struct user_loaded_image *image, u64 va, usize n) {
-  for (usize s = 0; s < image->segment_count; s++) {
-    u64 sv = image->segments[s].vaddr;
-    u64 sf = image->segments[s].filesz;
-    if (va >= sv && va + n <= sv + sf) {
-      return (u8 *)image->segments[s].data + (va - sv);
-    }
-  }
-  return 0;
 }
 
 void user_image_free(struct user_loaded_image *image) {
@@ -1091,9 +1038,6 @@ void user_image_free(struct user_loaded_image *image) {
 
   if (image->path)
     kfree((void *)image->path);
-
-  if (image->dso_init)
-    kfree(image->dso_init);
 
   if (image->argv) {
     for (int i = 0; i < image->argc; i++) {
@@ -1341,50 +1285,7 @@ static int user_load_elf32(struct user_loaded_image *image, const char *path) {
     break;
   }
 
-  /* Second pass: apply relocations */
-  if (load_base != 0) {
-    u64 rel_off = 0, rel_sz = 0;
-    for (u16 i = 0; i < ehdr->e_phnum; i++) {
-      struct elf32_phdr *phdr =
-          (struct elf32_phdr *)(file_data + ehdr->e_phoff +
-                                ((u64)i * ehdr->e_phentsize));
-      if (phdr->p_type != PT_DYNAMIC) continue;
-      if (phdr->p_offset + phdr->p_filesz < phdr->p_offset ||
-          phdr->p_offset + phdr->p_filesz > file_size) continue;
-      struct elf32_dyn *dyn =
-          (struct elf32_dyn *)(file_data + phdr->p_offset);
-      usize ndyn = phdr->p_filesz / sizeof(struct elf32_dyn);
-      for (usize d = 0; d < ndyn && dyn[d].d_tag != DT_NULL; d++) {
-        switch (dyn[d].d_tag) {
-          case DT_REL:    rel_off = dyn[d].d_val; break;
-          case DT_RELSZ:  rel_sz = dyn[d].d_val; break;
-        }
-      }
-      break;
-    }
-
-    if (rel_off && rel_sz) {
-      usize nrel = rel_sz / sizeof(struct elf32_rel);
-      u8 *rel_stage = _vaddr_to_stage(image, rel_off + load_base, rel_sz);
-      if (!rel_stage) {
-        kfree(file_data);
-        return -1;
-      }
-      struct elf32_rel *rel = (struct elf32_rel *)rel_stage;
-      for (usize r = 0; r < nrel; r++) {
-        u32 r_type = rel[r].r_info & 0xff;
-        if (r_type == R_386_RELATIVE) {
-          u8 *target = _vaddr_to_stage(image, rel[r].r_offset + load_base, 4);
-          if (!target) {
-            kfree(file_data);
-            return -1;
-          }
-          u32 addend = *(u32 *)target;
-          *(u32 *)target = addend + (u32)load_base;
-        }
-      }
-    }
-  }
+  /* In-kernel dynamic relocation pass removed: dynamic relocations are handled in userspace (ld-musl). */
 
   kfree(file_data);
   return 0;
@@ -1440,61 +1341,8 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     return image;
   }
 
-  const struct user_program *program = user_find_program(path);
-  if (program) {
-    image->kind = USER_IMAGE_BUILTIN;
-    image->path = kernel_strdup(path);
-    image->entry = (u64)(usize)program->entry;
-    image->address_space = user_address_space_create();
-    if (user_build_initial_stack(image) != 0) {
-      console_write("user_load_image: user_build_initial_stack BUILTIN failed\n");
-      user_image_free(image);
-      return 0;
-    }
-    return image;
-  }
-
   console_write("user_load_image: failed to load\n");
   user_image_free(image);
-  return 0;
-}
-
-static int user_try_run_b1nxexec_image(struct user_loaded_image *image,
-                                       int *code) {
-  for (usize i = 0; i < image->segment_count; i++) {
-    struct user_image_segment *segment = &image->segments[i];
-    const char *payload = segment->data;
-    if (segment->filesz < 10 || !payload || memcmp(payload, "B1NXEXEC", 9) != 0)
-      continue;
-
-    const char *op = payload + 9;
-    if (strcmp(op, "echo") == 0) {
-      const char *message = op + strlen(op) + 1;
-      syscall_dispatch(SYS_WRITE, 1, (u64)(usize)message, (u64)strlen(message),
-                       0, 0, 0);
-      *code = 0;
-      return 1;
-    }
-    if (strcmp(op, "init") == 0) {
-      const char *child = op + strlen(op) + 1;
-      while (*child) {
-        const char *child_argv[] = {child, 0};
-        int pid = user_spawn(child, 1, child_argv);
-        if (pid >= 0) {
-          int status = 0;
-          scheduler_wait((usize)pid, &status);
-        }
-        child += strlen(child) + 1;
-      }
-      while (1) {
-        int status = 0;
-        /* -1 = reap ANY child. pid 0 now means "my process group" (POSIX),
-         * which would skip orphans reparented here from other groups. */
-        scheduler_wait((usize)-1, &status);
-        scheduler_yield();
-      }
-    }
-  }
   return 0;
 }
 
@@ -1574,10 +1422,6 @@ static int user_run_elf_image(struct user_loaded_image *image) {
         paging_free_address_space(old_pml4);
     }
   }
-
-  int compat_code = 0;
-  if (user_try_run_b1nxexec_image(image, &compat_code))
-    return compat_code;
 
   /* Map segments into the address space. PIE/ET_DYN binaries can have
    * multiple PT_LOAD segments share the same 4 KB page (e.g. .data +
@@ -1990,14 +1834,8 @@ static void user_process_thread(void *arg) {
   kfree(start);
 
   int code = 0;
-  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
-    /* Real ELF (both 64- and 32-bit) enters ring 3 via x86_user_jump; its
-     * entry is a userspace virtual address, NOT a kernel function pointer. */
-    code = user_run_elf_image(image);
-  } else {
-    user_program_entry entry = (user_program_entry)(usize)image->entry;
-    code = entry(image->argc, image->argv);
-  }
+  /* All user programs are Ring 3 ELFs — no built-in fallback path remains. */
+  code = user_run_elf_image(image);
   syscall_dispatch(SYS_EXIT, (u64)code, 0, 0, 0, 0, 0);
 
   while (1) {
@@ -2006,11 +1844,7 @@ static void user_process_thread(void *arg) {
 }
 
 void userspace_init(void) {
-  program_count = 0;
-  user_register_builtin_programs();
-  console_write("userspace: builtin programs 0x");
-  console_write_hex64(program_count);
-  console_write("\n");
+  console_write("userspace: builtin programs retired (all binaries run as Ring 3 ELFs)\n");
 }
 
 int user_spawn(const char *path, int argc, const char **argv) {
@@ -2229,54 +2063,6 @@ resolve:
     arch_set_fs_base(0);
   }
 
-  int code = 0;
-  if (image->kind == USER_IMAGE_ELF64 || image->kind == USER_IMAGE_ELF32) {
-    code = user_run_elf_image(image);
-  } else {
-    user_program_entry entry = (user_program_entry)(usize)image->entry;
-    code = entry(image->argc, image->argv);
-  }
+  int code = user_run_elf_image(image);
   scheduler_exit_current(code);
-}
-
-void user_register_program(const char *path, user_program_entry entry) {
-  /* Grow the registry on demand: start at PROGRAMS_INITIAL, double each
-   * time we fill up. Existing entries stay in place (memcpy to the new
-   * buffer), so any pointer returned by a prior user_find_program() is
-   * invalidated — callers never cache such pointers across registration,
-   * so this is safe. */
-  if (program_count >= programs_capacity) {
-    usize new_cap = programs_capacity ? programs_capacity * 2 : PROGRAMS_INITIAL;
-    struct user_program *grown = kzalloc(new_cap * sizeof(struct user_program));
-    if (!grown) {
-      klog_warn("too many builtin user programs, skipping registration");
-      return;
-    }
-    if (programs && program_count) {
-      memcpy(grown, programs, program_count * sizeof(struct user_program));
-    }
-    if (programs) kfree(programs);
-    programs = grown;
-    programs_capacity = new_cap;
-  }
-
-  programs[program_count].path = path;
-  programs[program_count].entry = entry;
-  program_count++;
-
-  /* Ensure the program exists in the VFS so vfs_find_node/vfs_get_node_perm
-   * works */
-  if (vfs_create(path, 0755) == 0) {
-    /* File created with 0755 mode */
-  }
-}
-
-const struct user_program *user_find_program(const char *path) {
-  for (usize i = 0; i < program_count; i++) {
-    if (strcmp(programs[i].path, path) == 0) {
-      return &programs[i];
-    }
-  }
-
-  return 0;
 }

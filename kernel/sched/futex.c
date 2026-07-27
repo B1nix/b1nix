@@ -107,6 +107,9 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
     w->wait_chan = (void *)w;
     w->next = b->head;
     b->head = w;
+    current_task->wait_chan = (void *)w;
+    scheduler_lease_clear_here(__func__);
+    current_task->state = TASK_BLOCKED;
     spin_unlock_irqrestore(&b->lock, flags);
 
     /* Optional relative timeout: convert ms → scheduler ticks (round up so a

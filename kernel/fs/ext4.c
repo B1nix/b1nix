@@ -387,14 +387,22 @@ static isize ext4_vfs_write(struct vfs_node *node, u64 offset, const char *buffe
     (void)flags; struct ext4_inode_info *info = (struct ext4_inode_info *)node->inode->data;
     struct ext4_fs *fs = info->fs; struct ext2_inode inode;
     if (ext4_read_inode(fs, info->inode_num, &inode) < 0) return -1;
-    u64 new_size = offset + size; u32 old_blks = (inode.i_size + fs->block_size - 1) / fs->block_size;
-    u32 new_blks = (new_size + fs->block_size - 1) / fs->block_size;
-    if (new_size > inode.i_size) {
-        for (u32 b = old_blks; b < new_blks; b++) {
-            u32 pblk = ext4_alloc_block(fs); if (!pblk || !ext4_set_block(&inode, b, pblk)) return -1;
+    u64 new_size = offset + size;
+    u32 start_b = (u32)(offset / fs->block_size);
+    u32 end_b = (u32)((new_size + fs->block_size - 1) / fs->block_size);
+    for (u32 b = start_b; b < end_b; b++) {
+        if (!ext4_get_block(fs, &inode, b)) {
+            u32 pblk = ext4_alloc_block(fs);
+            if (!pblk || !ext4_set_block(&inode, b, pblk)) return -1;
             inode.i_blocks += fs->block_size / 512;
         }
-        inode.i_size = (u32)new_size; ext4_write_inode(fs, info->inode_num, &inode);
+    }
+    if (new_size > inode.i_size) {
+        inode.i_size = (u32)new_size;
+        if (fs->features_ro_compat & EXT4_FEATURE_RO_COMPAT_HUGE_FILE) {
+            inode.i_dir_acl = (u32)(new_size >> 32);
+        }
+        ext4_write_inode(fs, info->inode_num, &inode);
         u64 cur_sz = ext4_get_inode_size(fs, &inode);
         if (cur_sz > node->inode->size) {
             node->inode->size = (usize)cur_sz;

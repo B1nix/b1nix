@@ -29,4 +29,7 @@ int gdb_recv_packet(struct gdb_transport *t, char *buf, usize cap);
 /* Interactive serial stub entry (only when booted with b1nix.gdb). */
 void gdb_stub_enter(struct interrupt_frame *f);
 
+/* In-kernel self-test (M36 smoke). Called from main.c in test mode. */
+void m36_gdb_selftest(void);
+
 #endif

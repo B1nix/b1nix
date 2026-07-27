@@ -185,6 +185,14 @@ void x86_idt_init(void) {
   for (u8 i = 0; i < 32; i++) {
     idt_set_gate(i, handlers[i]);
   }
+  /* #DF runs on IST1, a per-CPU stack the TSS points at (x86_tss_init_cpu).
+   * Without it, a fault that hit BECAUSE the kernel stack was unusable (stack
+   * overflow, corrupted RSP) re-faults while pushing the #DF frame onto that
+   * same broken stack — a triple fault, which the CPU answers by resetting.
+   * QEMU with -no-reboot then just exits, so the failure looked like a silent
+   * hang: no panic, no backtrace, the serial log simply stops. On IST1 the
+   * handler gets a known-good stack and can print the exception + registers. */
+  idt[8].ist = 1;
   idt_set_gate(32, isr32);
   idt_set_gate(33, isr33);
   idt_set_gate(34, isr34);
@@ -641,6 +649,50 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   console_write(" rsp=0x"); console_write_hex64(frame->rsp);
   console_write("\n");
 
+  /* Who faulted, and what does a wild kernel address actually point at? A rip
+   * outside kernel text means we jumped through corrupted memory; naming the
+   * containing heap block (live 64 KiB block = a task kernel stack, freed block
+   * = use-after-free) is what turns that into an actionable report. */
+  {
+    struct task *ft = current_task;
+    console_write("faulting task: pid=");
+    console_write_dec(ft ? (u64)ft->id : 0);
+    console_write(" name=");
+    console_write(ft && ft->name ? ft->name : "(none)");
+    console_write(" kstack=0x");
+    console_write_hex64(ft ? (u64)(usize)ft->stack : 0);
+    console_write("\n");
+    kheap_describe(frame->rip, "rip  ->");
+    if (frame->vector == 14)
+      kheap_describe(read_cr2(), "cr2  ->");
+    kheap_describe(frame->rsp, "rsp  ->");
+    /* Raw bytes at the faulting rip: identifies WHAT the "code" we jumped into
+     * really is (a struct's fields, a string, a stale pointer table). */
+    if (frame->rip >= 0xffff800000000000ULL) {
+      const u64 *w = (const u64 *)(usize)(frame->rip & ~7ULL);
+      console_write("bytes@rip:");
+      for (int i = -2; i < 6; i++) {
+        console_write(" 0x");
+        console_write_hex64(w[i]);
+      }
+      console_write("\n");
+    }
+    /* Raw kernel stack around rsp: shows what overwrote a return address. */
+    if (frame->cs == 0x08 && frame->rsp >= 0xffff800000000000ULL) {
+      const u64 *sp = (const u64 *)(usize)frame->rsp;
+      for (int i = 0; i < 24; i += 4) {
+        console_write("stack +0x");
+        console_write_hex64((u64)(i * 8));
+        console_write(":");
+        for (int j = 0; j < 4; j++) {
+          console_write(" 0x");
+          console_write_hex64(sp[i + j]);
+        }
+        console_write("\n");
+      }
+    }
+  }
+
   /* Fault-stack scan: leaf functions like memcpy don't set up a frame pointer,
    * so the rbp-based backtrace stops at the faulting rip. Scan the actual
    * faulting stack (frame->rsp upward) for kernel-text values — the first one is
@@ -869,12 +921,22 @@ void x86_exception_handler(struct interrupt_frame *frame) {
 /* ── Stack Backtrace ──────────────────────────────────────────── */
 #define MAX_BACKTRACE_FRAMES 32
 
+extern char __kernel_text_start[];
+extern char __kernel_text_end[];
+
 static int addr_is_kernel_text(u64 addr) {
-  /* Kernel .text is identity-mapped in the 0x100000-0x200000 range.
-     Also accept userspace addresses (0x2000000-0x3000000) for backtrace mapping. */
+  /* The kernel is linked higher-half (KERNEL_VMA), so its .text lives at
+   * 0xffffffff801xxxxx — the old hard-coded 0x100000-0x200000 window only ever
+   * matched the pre-relocation .boot stub, which is why every supervisor-mode
+   * fault printed an EMPTY "fault-stack callers:" line and resolved every
+   * address to long_mode_low. Use the linker-provided bounds instead.
+   * The low window is kept for the .boot stub, and the 0x2000000-0x3000000
+   * userspace window for backtracing non-PIE user binaries. */
+  if ((u64)(usize)__kernel_text_start && addr >= (u64)(usize)__kernel_text_start &&
+      addr < (u64)(usize)__kernel_text_end)
+    return 1;
   return (addr >= 0x100000ULL && addr <= 0x200000ULL) ||
-         (addr >= 0x2000000ULL && addr <= 0x3000000ULL) ||
-         (addr >= 0xffff800000000000ULL && addr <= 0xffff800100000000ULL);
+         (addr >= 0x2000000ULL && addr <= 0x3000000ULL);
 }
 
 /* A frame pointer is safe to dereference only if it is canonical and lands in a

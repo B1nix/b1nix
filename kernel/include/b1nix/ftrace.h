@@ -27,4 +27,7 @@ usize ftrace_count(void);
 const struct ftrace_event *ftrace_get(usize i);
 void ftrace_dump(void); /* symbolised dump to console */
 
+/* In-kernel self-test (M36 smoke). Called from main.c in test mode. */
+void m36_ftrace_selftest(void);
+
 #endif

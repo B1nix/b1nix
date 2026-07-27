@@ -212,6 +212,9 @@ void lapic_write(u32 reg, u32 val);
 u32 lapic_id(void);
 void lapic_send_ipi(u32 apic_id, u32 icr_low);
 void lapic_send_ipi_allbutself(u32 icr_low);
+/* Kick-style IPI that never waits for delivery — see lapic.c for why waiting
+ * on a payload-free vector deadlocks two CPUs that kick each other. */
+void lapic_send_ipi_allbutself_nowait(u32 icr_low);
 
 /* LAPIC-timer frequency (ticks per millisecond at divide=16), calibrated
  * against the PIT at lapic_init. 0 until calibration runs. */

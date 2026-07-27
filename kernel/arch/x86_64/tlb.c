@@ -226,8 +226,13 @@ void tlb_shootdown_all(void) {
 }
 
 /* M28 #6: reschedule IPI sender. No state to publish — the handler is just
- * lapic_eoi (see x86_irq_handler vector-66 branch). Fire-and-forget. */
+ * lapic_eoi (see x86_irq_handler vector-66 branch). Genuinely fire-and-forget:
+ * callers reach here with interrupts disabled (scheduler_wake_all runs under
+ * interrupts_save), so waiting on delivery status would deadlock two CPUs that
+ * wake each other's channels at the same time — neither can accept the other's
+ * vector-66 IPI while it spins. A reschedule already pending on the target is
+ * as good as a new one. */
 void ipi_reschedule_all(void) {
     if (g_max_cpus <= 1) return;
-    lapic_send_ipi_allbutself(RESCHEDULE_VECTOR | LAPIC_ICR_FIXED);
+    lapic_send_ipi_allbutself_nowait(RESCHEDULE_VECTOR | LAPIC_ICR_FIXED);
 }

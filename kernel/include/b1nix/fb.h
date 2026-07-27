@@ -30,6 +30,10 @@ struct b1nix_fb_rect {
 
 #define B1NIX_FBIOGET_INFO 0xFB01 /* arg: struct b1nix_fb_info * */
 #define B1NIX_FBIOFLUSH 0xFB02    /* arg: struct b1nix_fb_rect * */
+/* arg: int * — number of live userspace mappings (0 == kernel console owns
+ * scanout again). Lets a supervisor observe the claim hand-off that the
+ * kernel-internal fb_dev_claimed() reports. */
+#define B1NIX_FBIOGET_CLAIM 0xFB03
 
 void fb_dev_init(void);
 
