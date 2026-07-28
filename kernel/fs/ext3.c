@@ -590,7 +590,8 @@ static isize ext3_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
           memcpy(buf[count].name, e->name, name_len); buf[count].name[name_len] = '\0';
           buf[count].type = (u32)VFS_FILE; if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
           buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
-          buf[count].size = 0; count++;
+          buf[count].size = 0;
+                    buf[count].ino = e->inode; count++;
         }
         entry_idx++;
       }
@@ -834,6 +835,9 @@ static void ext3_vfs_release(struct vfs_node *node) {
 static void ext3_setup_node(struct vfs_node *n, struct ext3_fs *fs, u32 ino, u32 mode) {
   struct ext3_inode_info *ni = kmalloc(sizeof(struct ext3_inode_info));
   ni->fs = fs; ni->inode_num = ino;
+  /* st_ino is the on-disk inode number, matching what readdir reports as
+   * d_ino (see ext4_setup_node). */
+  n->inode->ino = ino;
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext3_vfs_read; n->inode->write_cb = ext3_vfs_write;
   n->inode->truncate_cb = ext3_vfs_truncate;

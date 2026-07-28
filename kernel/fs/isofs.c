@@ -119,6 +119,9 @@ static isize isofs_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent
             char *name_ptr = (char *)(sector_buf + p + 33);
             u8 flags = sector_buf[p + 25];
             u32 size = *(u32 *)(sector_buf + p + 10);
+            /* ISO 9660 has no inodes: the extent LBA (offset 2) uniquely and
+             * stably identifies a file on the disc, which is what d_ino wants. */
+            u32 entry_lba = *(u32 *)(sector_buf + p + 2);
             if (name_len > len - 33) {
                 break;
             }
@@ -136,6 +139,7 @@ static isize isofs_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent
                 buf[count].type = (flags & 0x02) ? VFS_DIRECTORY : VFS_FILE;
                 buf[count].is_dir = ((flags & 0x02) != 0);
                 buf[count].size = size;
+                buf[count].ino = entry_lba;
                 count++;
             }
             entry_idx++;

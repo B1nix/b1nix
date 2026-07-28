@@ -2023,8 +2023,11 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
     char rec[19 + sizeof(kbuf[0].name) + 2 + 7];
     for (usize z = 0; z < reclen; z++)
       rec[z] = 0;
+    /* d_ino: the filesystem's inode number when it has one, otherwise the
+     * entry's index — never 0, which some tools read as "deleted". */
+    u64 d_ino = kbuf[i].ino ? kbuf[i].ino : (u64)(start + i + 1);
     if (legacy) {
-      *(u64 *)&rec[0] = (u64)(start + i + 1);  /* d_ino  */
+      *(u64 *)&rec[0] = d_ino;                 /* d_ino  */
       *(i64 *)&rec[8] = (i64)(start + i + 1);  /* d_off  */
       *(u16 *)&rec[16] = (u16)reclen;          /* d_reclen */
       for (usize z = 0; z < namelen; z++)
@@ -2033,7 +2036,7 @@ static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
       rec[reclen - 1] = (char)lx_dirent_type(&kbuf[i]);
     } else {
       struct linux_dirent64 *de = (struct linux_dirent64 *)rec;
-      de->d_ino = (u64)(start + i + 1); /* b1nix dirent has no inode; synthesize */
+      de->d_ino = d_ino;
       de->d_off = (i64)(start + i + 1); /* opaque cookie: index of the next entry */
       de->d_reclen = (u16)reclen;
       de->d_type = lx_dirent_type(&kbuf[i]);

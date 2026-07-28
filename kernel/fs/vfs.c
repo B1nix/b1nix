@@ -1651,6 +1651,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
     buf[count].size = 0;
+    buf[count].ino = dir->inode ? dir->inode->ino : 0;
     count++;
   }
   idx++;
@@ -1660,6 +1661,8 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
     buf[count].is_dir = 1;
     buf[count].is_exec = 1;
     buf[count].size = 0;
+    buf[count].ino = (dir->parent && dir->parent->inode) ? dir->parent->inode->ino
+                     : (dir->inode ? dir->inode->ino : 0);
     count++;
   }
   idx++;
@@ -1676,6 +1679,7 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
       buf[count].is_dir = (child->inode->type == VFS_DIRECTORY);
       buf[count].is_exec = 0;
       buf[count].size = child->inode->size;
+      buf[count].ino = child->inode->ino;
       count++;
     }
     idx++;

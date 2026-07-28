@@ -168,6 +168,9 @@ static isize exfat_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent
                             buf[count].type = (file_entry->file_attributes & 0x10) ? VFS_DIRECTORY : VFS_FILE;
                             buf[count].is_dir = ((file_entry->file_attributes & 0x10) != 0);
                             buf[count].size = stream_entry->data_length;
+                            /* exFAT has no inodes either — the stream extension's
+                             * first cluster is the file's stable identity. */
+                            buf[count].ino = stream_entry->first_cluster;
                             count++;
                         }
                         entry_idx++;

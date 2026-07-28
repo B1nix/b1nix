@@ -524,6 +524,67 @@ static void test_getdents_legacy(void) {
   check("getdents-legacy", sane && entries > 0 && off == n, (long)entries);
 }
 
+/* getdents64's d_ino must be the filesystem's real inode number: it has to
+ * match what stat(2) reports for the same file, and two entries must not share
+ * one (both are true of a synthesized index only by accident). */
+static void test_getdents_ino(void) {
+  long fd = sys3(SYS_open, "/etc", O_RDONLY, 0);
+  if (fd < 0) {
+    fail("getdents-ino", fd);
+    return;
+  }
+  char buf[2048];
+  long n = sys3(217 /* getdents64 */, fd, buf, sizeof(buf));
+  sys1(SYS_close, fd);
+  if (n <= 0) {
+    fail("getdents-ino", n);
+    return;
+  }
+  /* struct linux_dirent64 { u64 d_ino; i64 d_off; u16 d_reclen; u8 d_type;
+   *                        char d_name[]; } */
+  int checked = 0, distinct = 1, matched = 0;
+  unsigned long seen[16];
+  int nseen = 0;
+  long off = 0;
+  while (off < n) {
+    unsigned long ino = *(unsigned long *)&buf[off];
+    unsigned short reclen = *(unsigned short *)&buf[off + 16];
+    const char *name = &buf[off + 19];
+    if (reclen < 20 || off + reclen > n)
+      break;
+    if (ino == 0)
+      distinct = 0;
+    for (int i = 0; i < nseen; i++)
+      if (seen[i] == ino)
+        distinct = 0;
+    if (nseen < 16)
+      seen[nseen++] = ino;
+    checked++;
+
+    /* Compare against stat() for a regular entry. */
+    if (!matched && name[0] != '.') {
+      char path[128];
+      int p = 0;
+      const char *pre = "/etc/";
+      while (pre[p]) {
+        path[p] = pre[p];
+        p++;
+      }
+      int q = 0;
+      while (name[q] && p < 120)
+        path[p++] = name[q++];
+      path[p] = '\0';
+      struct lx_stat st;
+      if (sys4(262 /* newfstatat */, AT_FDCWD, path, &st, 0) == 0 &&
+          st.st_ino == ino)
+        matched = 1;
+    }
+    off += reclen;
+  }
+  check("getdents-ino", checked > 2 && distinct && matched,
+        (long)(checked * 100 + distinct * 10 + matched));
+}
+
 static void test_pipe_tee_vmsplice(void) {
   int a[2], b[2];
   long r1 = sys2(SYS_pipe2, a, 0);
@@ -667,6 +728,50 @@ struct lx_rseq {
 
 static struct lx_rseq g_rseq_area;
 
+/* struct rseq_cs: {version, flags, start_ip, post_commit_offset, abort_ip},
+ * 32-byte aligned, published through rseq->rseq_cs while the sequence runs. */
+struct lx_rseq_cs {
+  unsigned version;
+  unsigned flags;
+  unsigned long start_ip;
+  unsigned long post_commit_offset;
+  unsigned long abort_ip;
+} __attribute__((aligned(32)));
+
+static struct lx_rseq_cs g_rseq_cs;
+
+/* Run a critical section long enough to be preempted, and report how it
+ * ended: 1 = ran to the commit instruction, 2 = the kernel restarted it at the
+ * abort handler. The four bytes before the abort label are the signature the
+ * kernel checks before it will ever redirect execution there. */
+static long rseq_run_section(void) {
+  long ret = 0;
+  __asm__ volatile(
+      "leaq 1f(%%rip), %%rax\n\t"
+      "movq %%rax, 8(%1)\n\t"          /* cs.start_ip           */
+      "leaq 2f(%%rip), %%rdx\n\t"
+      "subq %%rax, %%rdx\n\t"
+      "movq %%rdx, 16(%1)\n\t"         /* cs.post_commit_offset */
+      "leaq 4f(%%rip), %%rax\n\t"
+      "movq %%rax, 24(%1)\n\t"         /* cs.abort_ip           */
+      "movq %1, 8(%2)\n\t"             /* rseq->rseq_cs = &cs   */
+      "1:\n\t"
+      "movq $600000000, %%rcx\n\t"
+      "3: decq %%rcx\n\t"
+      "jnz 3b\n\t"
+      "movq $1, %0\n\t"                /* reached the commit    */
+      "2:\n\t"
+      "jmp 5f\n\t"
+      ".long 0x53053053\n\t"           /* abort signature       */
+      "4:\n\t"
+      "movq $2, %0\n\t"                /* restarted by the kernel */
+      "5:\n\t"
+      : "=&r"(ret)
+      : "r"(&g_rseq_cs), "r"(&g_rseq_area)
+      : "rax", "rcx", "rdx", "memory");
+  return ret;
+}
+
 static void test_rseq(void) {
   g_rseq_area.cpu_id = 0xffffffffu;
   g_rseq_area.cpu_id_start = 0xffffffffu;
@@ -675,10 +780,19 @@ static void test_rseq(void) {
   /* Any syscall is a return to userspace, so the cpu ids must be live now. */
   sys0(SYS_getpid);
   unsigned cpu = g_rseq_area.cpu_id;
+  /* The other half of rseq: a critical section that gets preempted must resume
+   * at its abort handler, not in the middle. The section below runs for far
+   * longer than a scheduler tick, so it is always interrupted at least once. */
+  long how = rseq_run_section();
+  unsigned long cs_after = g_rseq_area.rseq_cs;
+
   long unreg = sys4(SYS_rseq, &g_rseq_area, sizeof(struct lx_rseq),
                     1 /* RSEQ_FLAG_UNREGISTER */, 0x53053053);
   check("rseq", reg == 0 && cpu != 0xffffffffu && cpu < 64 && unreg == 0,
         reg ? reg : (long)cpu);
+  /* The kernel also consumes the descriptor, so a later interruption cannot
+   * abort against a stale section. */
+  check("rseq-abort", how == 2 && cs_after == 0, how);
 }
 
 static void test_swap_cycle(void) {
@@ -965,6 +1079,7 @@ void abi_main(void) {
   test_procfs_sysfs();
   test_epoll();
   test_getdents_legacy();
+  test_getdents_ino();
   test_pipe_tee_vmsplice();
   test_ioprio();
   test_sysv_sem();

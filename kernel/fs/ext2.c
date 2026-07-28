@@ -894,6 +894,7 @@ static int ext2_vfs_mknod(struct vfs_node *dir, const char *name, u32 mode) {
     if (info) {
       info->fs = fs;
       info->inode_num = new_inode_num;
+      node->inode->ino = new_inode_num; /* st_ino == d_ino */
       node->inode->data = info;
     }
     vfs_node_put(node);
@@ -934,6 +935,7 @@ static int ext2_vfs_create(struct vfs_node *dir, const char *name,
     struct ext2_inode_info *info = kmalloc(sizeof(struct ext2_inode_info));
     info->fs = fs;
     info->inode_num = new_inode_num;
+    node->inode->ino = new_inode_num; /* st_ino == d_ino */
     node->inode->data = info;
     vfs_node_put(node);
 	}
@@ -1249,6 +1251,7 @@ static isize ext2_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
                     if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
                     buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
                     buf[count].size = 0; // We don't easily know child size here
+                    buf[count].ino = e->inode;
                     count++;
                 }
                 entry_idx++;
@@ -1296,6 +1299,7 @@ static int ext2_vfs_mkdir(struct vfs_node *dir, const char *name, u32 mode) {
             info->inode_num = new_inode_num;
             node->inode->data = info;
         }
+        node->inode->ino = new_inode_num; /* st_ino == d_ino */
         node->inode->blk_dev = dir->inode->blk_dev;
         node->inode->create_cb = ext2_vfs_create;
         node->inode->mknod_cb = ext2_vfs_mknod;
@@ -1365,6 +1369,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               info->fs = fs;
               info->inode_num = entry->inode;
               dir_node->inode->data = info;
+              dir_node->inode->ino = entry->inode; /* st_ino == d_ino */
               dir_node->inode->blk_dev = fs->bdev;
               dir_node->inode->mode = child_inode.i_mode & 0xFFFF;
               dir_node->inode->uid = child_inode.i_uid;
@@ -1403,6 +1408,7 @@ static void ext2_populate_vfs(struct ext2_fs *fs, u32 inode_num, const char *bas
               info->fs = fs;
               info->inode_num = entry->inode;
               node->inode->data = info;
+              node->inode->ino = entry->inode; /* st_ino == d_ino */
 							node->inode->blk_dev = fs->bdev;
 							node->inode->read_cb = ext2_vfs_read;
 							node->inode->write_cb = ext2_vfs_write;

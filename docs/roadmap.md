@@ -363,6 +363,7 @@ Status:
 - [x] Linux process startup: full auxv (AT_PHDR/BASE/ENTRY/RANDOM/EXECFN/UID…), `arch_prctl`, signal delivery with signo remap, and `rt_sigreturn`.
 - [x] Linux-compatible `/proc` and `/sys`: `/proc/<pid>/{environ,statm,limits,cwd,root,mounts}`, `/proc/{swaps,modules,sys/kernel/*,sys/fs/*}`, `/sys/class/net/<if>/*`.
 - [x] Detect Linux ELFs through personality (`EI_OSABI` and `NT_GNU_ABI_TAG`).
+- [x] `d_ino` is the filesystem's real inode number (ext2/3/4) or the file's stable on-disk identity (FAT/exFAT/ISO first cluster / extent LBA), and `st_ino` reports the same value — readdir and stat now name the same file.
 - [x] The privilege and placement calls behave as they claim: capabilities are a real per-task set (a dropped one stays dropped, and root loses the operation it guarded), `setfsuid`/`setfsgid` move the id the VFS checks against (clearing the file-related capabilities as Linux does), `sched_setaffinity` really pins a task, and a `ptrace` tracer that is not the tracee's parent can attach and drive it. `open(2)`'s `O_CREAT` mode is applied (masked by umask) instead of being ignored.
 - [x] The rest of the surface, implemented rather than stubbed: `ptrace` (TRACEME/ATTACH/GETREGS/SETREGS/PEEK/POKE/CONT/SINGLESTEP/DETACH/KILL), SysV semaphores (with SEM_UNDO) and message queues (type-selective receive), `chroot` with a real per-task root, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, `name_to_handle_at`/`open_by_handle_at`, `rseq` (live `cpu_id` plus critical-section abort), and legacy `getdents`.
 

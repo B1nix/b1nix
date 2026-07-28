@@ -190,6 +190,12 @@ static isize fat32_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent
                 buf[count].type = (entries[i].attr & FAT_ATTR_DIRECTORY) ? VFS_DIRECTORY : VFS_FILE;
                 buf[count].is_dir = (entries[i].attr & FAT_ATTR_DIRECTORY);
                 buf[count].size = entries[i].size;
+                /* FAT has no inodes: the first cluster is the closest thing to
+                 * a stable per-file identity, which is what d_ino needs to be
+                 * (an empty file has cluster 0, so fall back to the directory
+                 * index the syscall layer supplies). */
+                buf[count].ino = ((u64)entries[i].cluster_high << 16) |
+                                 entries[i].cluster_low;
                 count++;
             }
             entry_idx++;

@@ -669,7 +669,8 @@ static isize ext4_vfs_readdir(struct vfs_node *dir, usize offset, struct dirent 
                     if (e->file_type == EXT2_FT_DIR) buf[count].type = (u32)VFS_DIRECTORY;
                     else if (e->file_type == EXT2_FT_FIFO) buf[count].type = (u32)VFS_FIFO;
                     buf[count].is_dir = (e->file_type == EXT2_FT_DIR);
-                    buf[count].size = 0; count++;
+                    buf[count].size = 0;
+                    buf[count].ino = e->inode; count++;
                 }
                 entry_idx++;
             }
@@ -1089,6 +1090,11 @@ static void ext4_vfs_release(struct vfs_node *node) {
 static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32 mode) {
   struct ext4_inode_info *ni = kmalloc(sizeof(struct ext4_inode_info));
   ni->fs = fs; ni->inode_num = ino;
+  /* st_ino must be the FILESYSTEM's inode number, not the VFS's allocation
+   * counter: getdents reports the on-disk number as d_ino, and the two have to
+   * name the same file for anything that pairs readdir with stat (hardlink
+   * detection in du/tar/rsync, `find -inum`, samefile checks). */
+  n->inode->ino = ino;
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext4_vfs_read; n->inode->write_cb = ext4_vfs_write;
   n->inode->truncate_cb = ext4_vfs_truncate;

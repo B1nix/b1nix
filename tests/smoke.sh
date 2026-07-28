@@ -1039,6 +1039,8 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M40-ABI: ok chroot-keeps-cwd" "chroot(2) keeps a working directory inside the new root, rewritten root-relative"
 	check_output "$LOG" "M40-ABI: ok enosys-unmapped" "an unassigned syscall number reports ENOSYS instead of being silently accepted"
 	check_output "$LOG" "M40-ABI: ok getdents-legacy" "Linux getdents(2) emits the pre-64-bit record layout (d_type in the last byte)"
+	check_output "$LOG" "M40-ABI: ok getdents-ino" "getdents64's d_ino is the filesystem's real inode number (distinct per entry, matching stat)"
+	check_output "$LOG" "M40-ABI: ok rseq-abort" "an rseq critical section interrupted by the scheduler resumes at its abort handler, and the descriptor is consumed"
 	check_output "$LOG" "M40-ABI: ok vmsplice" "Linux vmsplice(2) moves user memory into a pipe"
 	check_output "$LOG" "M40-ABI: ok tee" "Linux tee(2) duplicates pipe data without consuming the source"
 	check_output "$LOG" "M40-ABI: ok ioprio" "Linux ioprio_set/ioprio_get round-trip the task's I/O class and level"
