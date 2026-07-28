@@ -1,11 +1,12 @@
 #!/usr/bin/env python3
-"""Fast in-guest check that the ported GNU Make actually runs inside b1nix.
+"""Fast in-guest check that the ported bmake actually runs inside b1nix.
 
 Boots the interactive ISO with build/x86_64/root.ext4 as virtio-blk (mounts
 /persist), waits for the shell, then runs:
-  - /persist/bin/make --version  (proves the b1nix make ELF loads + runs)
+  - /persist/bin/make -f /dev/null -V MAKE_VERSION  (proves the ELF loads + runs)
   - /persist/bin/make -C <maketest>  (drives a real Makefile: variables,
-    automatic vars $</$@, prerequisite chaining, recipe spawn via /bin/sh)
+    automatic vars ${.ALLSRC}/${.TARGET}, prerequisite chaining, recipe spawn
+    via /bin/sh)
 
 The Makefile fixture (tools/inguest/maketest/) is staged into the source tree
 at /persist/usr/src/b1nix by `make root-image` (install-kernel-source).
@@ -25,11 +26,11 @@ LOG = os.path.join(ROOT, "smoke_run", "inguest-make-test.log")
 os.makedirs(os.path.dirname(LOG), exist_ok=True)
 SENTINEL = "MK-HARNESS-DONE"
 MAKETEST = "/persist/usr/src/b1nix/tools/inguest/maketest"
-CMD = ("/persist/bin/make --version; "
+CMD = ("/persist/bin/make -f /dev/null -V MAKE_VERSION; "
        f"/persist/bin/make -C {MAKETEST}; "
        f"echo {SENTINEL}\n")
 
-WANT = ["GNU Make 3.82", "MK-AUTOVAR dep from in.txt", "MK-VARS hello world"]
+WANT = ["MK-AUTOVAR dep from in.txt", "MK-VARS hello world"]
 # Narrow: boot prints benign "device not found" lines, so only hard faults here.
 FAULTS = ("KERNEL PANIC", "[PANIC]", "EXCEPTION:", "Segmentation fault")
 
