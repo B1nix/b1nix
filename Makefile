@@ -74,7 +74,6 @@ INITRAMFS_CACERT_INC := $(INC_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(INC_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(INC_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(INC_DIR)/initramfs_busybox.inc
-INITRAMFS_BASH_INC := $(INC_DIR)/initramfs_bash.inc
 INITRAMFS_TESTWAV_INC := $(INC_DIR)/initramfs_testwav.inc
 INITRAMFS_TESTFONT_INC := $(INC_DIR)/initramfs_testfont.inc
 # M40: a committed static Linux x86_64 ELF blob (tools/m40/linux_hello.bin)
@@ -278,8 +277,7 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) 
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/$(ARCH)/ports/dropbear/dropbearmulti
-BASH_VERSION_NUM := 5.2.37
-BASH_ELF := build/src/bash/$(B1NIX_TRIPLET)/bash-$(BASH_VERSION_NUM)/bash
+ZSH_ELF := build/$(ARCH)/ports/zsh/install/bin/zsh
 BMAKE_ELF := build/$(ARCH)/ports/bmake/install/bin/bmake
 SAMU_ELF := build/$(ARCH)/ports/samurai/install/bin/samu
 B1NIX_TLS ?= mbedtls
@@ -1084,15 +1082,11 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
-# GNU bash 5.2 — the default interactive shell (and /bin/sh). Built static
-# against the b1nix userspace libc by tools/ports/build-bash.sh (autotools cross
-# build with a preseeded config.cache).
-$(BASH_ELF): tools/ports/build-bash.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-bash.sh >/dev/null
-
-$(INITRAMFS_BASH_INC): $(BASH_ELF)
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_bash_elf $(BASH_ELF) > $@
+# zsh — the default interactive shell and login shell (M98). It replaced GNU
+# bash, whose GPLv3 licence was the last one in the shipped userland. Needs the
+# netbsd-curses port for terminal handling, which build-zsh.sh resolves itself.
+$(ZSH_ELF): tools/ports/build-zsh.sh tools/ports/build-netbsd-curses.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-zsh.sh >/dev/null
 
 # In-guest build tools, both GNU-free (M98): bmake (BSD 3-clause NetBSD make)
 # ships as /bin/make and samurai (0BSD Ninja reimplementation) as /bin/samu with
@@ -1360,7 +1354,7 @@ iso-shell: root-image check-dynamic $(KERNEL_ELF)
 # and runs d8 on m58.js. It boots in test mode (b1nix.test=1) on purpose: the hook
 # loads d8 off the disk early — before the rc's M14 test touches sata0 — and the
 # active rc keeps the scheduler busy so d8's thread runs. (Without test mode, init
-# drops to an interactive getty/bash that starves d8 on a single CPU.) Reuses the
+# drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
 # shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
 # m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
 iso-v8: $(KERNEL_ELF) root-image
@@ -1447,7 +1441,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF) $(BMAKE_ELF) $(SAMU_ELF)
+install-ports: userspace-install busybox-package install-native-toolchain $(ZSH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF) $(BMAKE_ELF) $(SAMU_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1609,6 +1603,16 @@ endif
 		llvm-strip --strip-debug "$$SKIA_DM" -o $(BUILD_DIR)/rootfs/bin/skia-dm 2>/dev/null || \
 		cp "$$SKIA_DM" $(BUILD_DIR)/rootfs/bin/skia-dm; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
+	fi
+	@# M98: zsh is the interactive/login shell in place of GNU bash. Its shell
+	@# functions (completion, prompts) are read from $$fpath at runtime, so they
+	@# ship alongside the binary.
+	@if [ -f $(ZSH_ELF) ]; then \
+		cp -f $(ZSH_ELF) $(BUILD_DIR)/rootfs/bin/zsh; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/zsh; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/share/zsh; \
+		cp -R build/$(ARCH)/ports/zsh/install/share/zsh/. \
+			$(BUILD_DIR)/rootfs/usr/share/zsh/ 2>/dev/null || true; \
 	fi
 	@# M98: the GNU-free in-guest build tools. bmake is /bin/make (nothing on the
 	@# target should have to know it is not GNU Make) and samurai is /bin/samu

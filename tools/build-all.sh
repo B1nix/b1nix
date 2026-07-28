@@ -17,7 +17,7 @@
 #     1. Cross toolchain  — tools/toolchain/build-toolchain.sh  (only if missing)
 #     2. Userspace        — make ARCH=x86_64 userspace  (libc, crt0, ELF binaries)
 #     3. Kernel + ISO     — make ARCH=x86_64 KERNEL_CMDLINE=... iso
-#        (the default iso already embeds the shipping ports: curl, bash,
+#        (the default iso already embeds the shipping ports: curl, zsh,
 #         dropbear, busybox, netsurf, the M40 Linux + M67 rust artifacts, etc.)
 #
 # OPT-IN heavy/optional components (each just calls its existing script):

@@ -56,20 +56,20 @@ sed -e "s|@ARCH@|$ARCH|g" -e "s|@TIMEOUT@|5|g" \
 # 1b. Stage the core userland so the disk is a COMPLETE writable root (the shell
 # + coreutils otherwise live only in the kernel's initramfs). /bin/init is a
 # kernel built-in (resolves regardless of rootfs); native applets are built-ins
-# too. We add busybox + bash + the upstream applet symlinks + a minimal /etc.
+# too. We add busybox + zsh + the upstream applet symlinks + a minimal /etc.
 case "$ARCH" in
   x86) TRIPLET=i686-b1nix ;;
   *)   TRIPLET=x86_64-b1nix ;;
 esac
 BUSYBOX="$(ls "$ROOT_DIR/build/$ARCH/ports/busybox/install/bin/busybox" "$ROOT_DIR/build/$ARCH/ports/busybox/build/busybox" "$ROOT_DIR/build/busybox-b1nix/$TRIPLET/busybox" 2>/dev/null | head -1)"
 [ -n "$BUSYBOX" ] && [ -f "$BUSYBOX" ] || { echo "missing busybox ELF for $ARCH"; exit 1; }
-echo "staging userland (busybox + bash + applet symlinks)..."
+echo "staging userland (busybox + zsh + applet symlinks)..."
 mkdir -p "$ROOTFS/bin" "$ROOTFS/sbin" "$ROOTFS/opt/busybox/bin" "$ROOTFS/etc" "$ROOTFS/root" "$ROOTFS/home/user"
 cp -f "$BUSYBOX" "$ROOTFS/opt/busybox/bin/busybox"
-if [ ! -f "$ROOTFS/bin/bash" ]; then
-  BASH_BIN="$(ls "$ROOT_DIR/build/$ARCH/ports/bash/install/bin/bash" "$ROOT_DIR/build/$ARCH/ports/bash/build/bash" "$ROOT_DIR"/build/bash-src/$TRIPLET/bash-*/bash 2>/dev/null | head -1)"
-  [ -n "$BASH_BIN" ] && [ -f "$BASH_BIN" ] || { echo "missing packaged or locally built bash"; exit 1; }
-  cp -f "$BASH_BIN" "$ROOTFS/bin/bash"
+if [ ! -f "$ROOTFS/bin/zsh" ]; then
+  ZSH_BIN="$ROOT_DIR/build/$ARCH/ports/zsh/install/bin/zsh"
+  [ -f "$ZSH_BIN" ] || { echo "missing zsh — run: make ARCH=$ARCH root-image"; exit 1; }
+  cp -f "$ZSH_BIN" "$ROOTFS/bin/zsh"
 fi
 # Core symlinks (mirror kernel/fs/initramfs.c) + every upstream applet.
 for s in sh busybox getty "["; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$s"; done
@@ -77,9 +77,9 @@ ln -sf /opt/busybox/bin/busybox "$ROOTFS/sbin/getty"
 awk -F'=' '/^[[:space:]]*[^#]/ { gsub(/[[:space:]]/,"",$1); gsub(/[[:space:]]/,"",$2);
   if ($2=="upstream" && $1!="[") print $1 }' "$ROOT_DIR/tools/configs/applet-manifest.conf" \
   | while read -r cmd; do ln -sf /opt/busybox/bin/busybox "$ROOTFS/bin/$cmd"; done
-# Minimal /etc so login + a bash console work (built-in init falls back to bash).
-[ -f "$ROOTFS/etc/passwd" ] || printf 'root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n' > "$ROOTFS/etc/passwd"
-[ -f "$ROOTFS/etc/shells" ] || printf '/bin/sh\n/bin/bash\n/opt/busybox/bin/busybox\n' > "$ROOTFS/etc/shells"
+# Minimal /etc so login + a shell console work (built-in init falls back to a shell).
+[ -f "$ROOTFS/etc/passwd" ] || printf 'root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\n' > "$ROOTFS/etc/passwd"
+[ -f "$ROOTFS/etc/shells" ] || printf '/bin/sh\n/bin/zsh\n/opt/busybox/bin/busybox\n' > "$ROOTFS/etc/shells"
 [ -f "$ROOTFS/etc/motd" ] || echo "b1nix (installed on disk)" > "$ROOTFS/etc/motd"
 
 # 2. Build the ext4 partition image from the rootfs (no root; -d populates it).

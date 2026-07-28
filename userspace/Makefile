@@ -1033,11 +1033,11 @@ endif
 		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libb1nix.a ; \
 	fi
 	@mkdir -p $(ROOTFS)/etc
-	@printf "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n" > $(ROOTFS)/etc/passwd
+	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\n" > $(ROOTFS)/etc/passwd
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
 	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
-	@printf "/bin/sh\n/bin/bash\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
-	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/bash/bpkg-smoke.sh,
+	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
+	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
 	@# structure and creates /etc, /bin, /pkgs subdirs as needed.

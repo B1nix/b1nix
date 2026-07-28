@@ -18,7 +18,7 @@ int main(void) {
   pw = getpwnam("root");
   if (pw && pw->pw_uid == 0 && pw->pw_gid == 0 &&
       strcmp(pw->pw_name, "root") == 0 &&
-      strcmp(pw->pw_shell, "/bin/bash") == 0)
+      strcmp(pw->pw_shell, "/bin/zsh") == 0)
     marker("M27-USER: ok getpwnam-root\n");
   else
     marker("M27-USER: fail getpwnam-root\n");

@@ -1,7 +1,7 @@
 /* M39 — serial tty devices (/dev/ttyS0, /dev/ttyS1).
  *
  * Each UART line gets an independent tty: its own input ring, canonical line
- * assembly, termios, and foreground-pgrp/session state, so a getty/login/bash
+ * assembly, termios, and foreground-pgrp/session state, so a getty/login/shell
  * session on a serial port is fully separate from the merged VGA+COM1 boot
  * console. Modeled on the pty slave side (kernel/dev/pty.c): opens are
  * intercepted in vfs_open_flags and return raw handles with custom file ops,

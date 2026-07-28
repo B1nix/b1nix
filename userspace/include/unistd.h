@@ -8,9 +8,9 @@
 
 /* NB: _POSIX_VERSION is intentionally NOT defined globally. Advertising it here
  * flips feature paths in already-ported software (e.g. OpenSSL's secure-memory
- * code starts calling mlock/madvise we do not provide). bash needs it (to pick
- * `int` over BSD `union wait` for process status), so it is defined per-build
- * via CFLAGS in tools/ports/build-bash.sh instead of for every port. */
+ * code starts calling mlock/madvise we do not provide). A port that needs it
+ * (bash did, to pick `int` over BSD `union wait` for process status) defines it
+ * per-build via its own CFLAGS rather than for every port. */
 
 /* b1nix has clock_gettime(CLOCK_MONOTONIC); advertise just that feature (narrow,
  * unlike the broad _POSIX_VERSION above) so monotonic-clock code paths compile. */

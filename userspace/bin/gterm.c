@@ -254,7 +254,7 @@ int main(void) {
 		int master = -1;
 		pid_t child = forkpty(&master, 0, 0, 0);
 		if (child == 0) {
-			execlp("/bin/bash", "bash", (char *)0);
+			execlp("/bin/zsh", "zsh", (char *)0);
 			_exit(127);
 		}
 		if (master < 0)
