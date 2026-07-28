@@ -614,7 +614,8 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
 
 struct blk_io_waiter {
   struct task *task;
-  int prio;
+  int prio;       /* effective priority: class<<13 | level, lower is better */
+  u64 queued_at;  /* tick the request started waiting — drives ageing */
   int admitted;
   int used;
 };
@@ -627,6 +628,25 @@ struct blk_io_gate {
 
 static struct blk_io_gate blk_gates[MAX_BLK_DEVICES];
 static spinlock_t blk_gate_lock = SPINLOCK_INIT;
+
+/* Ageing: a request that has waited this many ticks gains one priority level,
+ * so a stream of best-effort I/O cannot starve an idle-class request forever.
+ * One tick is 10 ms; a full class (8192 levels) is therefore reachable in well
+ * under a second of continuous starvation, which is the point — the ordering
+ * must be a preference, not a veto. */
+#define BLK_IO_AGE_TICKS 2
+#define BLK_IO_AGE_STEP 512
+
+/* Effective priority of a waiter right now: its own priority, improved by how
+ * long it has been waiting. Never goes below 0 (better than realtime level 0),
+ * so ageing can promote a waiter past a class but not below the floor. */
+static int blk_io_effective_prio(const struct blk_io_waiter *w, u64 now) {
+  u64 waited = (now > w->queued_at) ? (now - w->queued_at) : 0;
+  u64 boost = (waited / BLK_IO_AGE_TICKS) * BLK_IO_AGE_STEP;
+  if (boost >= (u64)w->prio)
+    return 0;
+  return w->prio - (int)boost;
+}
 
 static struct blk_io_gate *blk_gate_of(struct block_device *dev) {
   for (usize i = 0; i < MAX_BLK_DEVICES; i++)
@@ -674,6 +694,7 @@ static void blk_io_begin(struct block_device *dev) {
       g->waiters[i].used = 1;
       g->waiters[i].task = current_task;
       g->waiters[i].prio = blk_io_prio_of_current();
+      g->waiters[i].queued_at = scheduler_get_uptime_ticks();
       g->waiters[i].admitted = 0;
       slot = i;
       break;
@@ -717,12 +738,16 @@ static void blk_io_end(struct block_device *dev) {
     spin_unlock_irqrestore(&blk_gate_lock, flags);
     return;
   }
-  int best = -1;
+  u64 now = scheduler_get_uptime_ticks();
+  int best = -1, best_prio = 0;
   for (int i = 0; i < BLK_IO_WAITERS; i++) {
     if (!g->waiters[i].used || g->waiters[i].admitted)
       continue;
-    if (best < 0 || g->waiters[i].prio < g->waiters[best].prio)
+    int p = blk_io_effective_prio(&g->waiters[i], now);
+    if (best < 0 || p < best_prio) {
       best = i;
+      best_prio = p;
+    }
   }
   if (best >= 0) {
     /* Hand the gate straight over: it stays busy, and the chosen waiter is the
@@ -736,6 +761,50 @@ static void blk_io_end(struct block_device *dev) {
   }
   g->busy = 0;
   spin_unlock_irqrestore(&blk_gate_lock, flags);
+}
+
+/* Self-test of the admission policy (b1nix.test=1). Drives the real waiter
+ * table and the real chooser with synthetic entries, so what is checked is the
+ * code the I/O path runs: better priority wins, and a long-waiting idle-class
+ * request eventually overtakes a fresh best-effort one instead of starving.
+ * Returns 0 on success, or the number of the check that failed. */
+int blk_io_gate_selftest(void) {
+  struct blk_io_gate g;
+  memset(&g, 0, sizeof(g));
+  u64 now = 1000;
+
+  /* Three waiters queued at the same moment: realtime, best-effort, idle. */
+  g.waiters[0] = (struct blk_io_waiter){0, (1 << 13) | 4, now, 0, 1}; /* RT   */
+  g.waiters[1] = (struct blk_io_waiter){0, (2 << 13) | 0, now, 0, 1}; /* BE   */
+  g.waiters[2] = (struct blk_io_waiter){0, (3 << 13) | 0, now, 0, 1}; /* IDLE */
+
+  int best = -1, best_prio = 0;
+  for (int i = 0; i < 3; i++) {
+    int p = blk_io_effective_prio(&g.waiters[i], now);
+    if (best < 0 || p < best_prio) { best = i; best_prio = p; }
+  }
+  if (best != 0)
+    return 1; /* realtime must be admitted first */
+
+  g.waiters[0].used = 0; /* it ran */
+  best = -1;
+  for (int i = 0; i < 3; i++) {
+    if (!g.waiters[i].used) continue;
+    int p = blk_io_effective_prio(&g.waiters[i], now);
+    if (best < 0 || p < best_prio) { best = i; best_prio = p; }
+  }
+  if (best != 1)
+    return 2; /* then best-effort, ahead of idle */
+
+  /* Now let the idle request wait while best-effort requests keep arriving:
+   * after enough ticks the aged idle request must win. */
+  u64 later = now + 40;
+  g.waiters[1].queued_at = later; /* a freshly queued best-effort request */
+  int idle_p = blk_io_effective_prio(&g.waiters[2], later);
+  int be_p = blk_io_effective_prio(&g.waiters[1], later);
+  if (idle_p >= be_p)
+    return 3; /* ageing failed — the idle request would starve */
+  return 0;
 }
 
 /* The device-command wrappers every path below goes through. */

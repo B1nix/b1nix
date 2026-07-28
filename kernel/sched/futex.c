@@ -32,6 +32,15 @@ struct futex_waiter {
   u64 key_uaddr;
   usize task_id;
   void *wait_chan;
+  /* Set by FUTEX_WAKE (under the bucket lock) before it unblocks the task.
+   * The waiter re-reads it AFTER publishing TASK_BLOCKED, which is what makes
+   * the wake impossible to miss: a waker that runs before the publication is
+   * seen through this flag, and one that runs after finds a task already
+   * BLOCKED for its state CAS to flip. Without it a wake landing in the brief
+   * window where the waiter is momentarily RUNNING inside the block helper was
+   * simply lost, and the thread slept forever (the M29 stress-smp wedge). */
+  volatile int woken;
+  int expect; /* the value the waiter was told to sleep on (diagnostics) */
   struct futex_waiter *next;
 };
 
@@ -105,11 +114,10 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
      * value that scheduler_wake_all can match on. We park on `w` itself —
      * the wake path will mark this waiter dequeued and wake by task_id. */
     w->wait_chan = (void *)w;
+    w->woken = 0;
+    w->expect = val;
     w->next = b->head;
     b->head = w;
-    current_task->wait_chan = (void *)w;
-    scheduler_lease_clear_here(__func__);
-    current_task->state = TASK_BLOCKED;
     spin_unlock_irqrestore(&b->lock, flags);
 
     /* Optional relative timeout: convert ms → scheduler ticks (round up so a
@@ -122,18 +130,23 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
       deadline = scheduler_get_ticks() + timeout_ticks;
     }
 
-    /* Block until woken. scheduler_block_on[_timeout] yields with state=BLOCKED
-     * and wait_chan=w; the wake path uses scheduler_wake_task by id
-     * because the wait_chan pointer is private to this waiter struct. */
+    /* Park with the prepare/commit pattern: publish TASK_BLOCKED, then re-test
+     * the wake flag, and only sleep if it is still clear. A wake that arrives
+     * before the publication is caught by the flag; one that arrives after it
+     * finds the task BLOCKED and flips it READY. */
     if (timeout_ticks)
-      scheduler_block_on_timeout(w, timeout_ticks);
+      scheduler_wait_prepare_timeout(w, timeout_ticks);
     else
-      scheduler_block_on(w);
+      scheduler_wait_prepare(w);
+    if (__atomic_load_n(&w->woken, __ATOMIC_ACQUIRE))
+      scheduler_wait_cancel();
+    else
+      scheduler_wait_commit();
 
     /* After wake: detach our waiter from the bucket if it's still there. A
-     * FUTEX_WAKE always unlinks the waiter BEFORE waking it, so finding our
-     * node still linked means no wake reached us — either the timer deadline
-     * fired or this was a spurious resume. */
+     * FUTEX_WAKE unlinks the waiter BEFORE waking it, so finding our node
+     * still linked means no wake reached us — either the timer deadline fired
+     * or this was a spurious resume. */
     int still_queued = 0;
     spin_lock_irqsave(&b->lock, &flags);
     struct futex_waiter **pp = &b->head;
@@ -168,8 +181,14 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
       struct futex_waiter *w = *pp;
       if (w->key_pml4 == key_pml4 && w->key_uaddr == uaddr) {
         *pp = w->next;
+        /* Publish the wake and take the task id BEFORE dropping the lock: the
+         * waiter frees `w` as soon as it runs, so touching it afterwards is a
+         * use-after-free, and the flag has to be visible to a waiter that is
+         * about to check it. */
+        __atomic_store_n(&w->woken, 1, __ATOMIC_RELEASE);
+        usize wake_id = w->task_id;
         spin_unlock_irqrestore(&b->lock, flags);
-        scheduler_wake_task(w->task_id);
+        scheduler_wake_task(wake_id);
         woken++;
         spin_lock_irqsave(&b->lock, &flags);
         /* Continue from head — the list may have changed; this is O(N)
@@ -192,6 +211,51 @@ int scheduler_futex(u64 uaddr, int op, int val, u64 timeout_ms) {
  * still has its mm mapped. */
 void scheduler_futex_wake_addr(u64 uaddr, int val) {
   (void)scheduler_futex(uaddr, B1NIX_FUTEX_WAKE, val, 0);
+}
+
+/* Diagnostic: print every parked futex waiter (called from the watchdog's task
+ * dump). A wedged thread pool is almost always either "waiter still queued and
+ * the word already changed" (a wake that never came) or "waiter gone but the
+ * task still blocked" (a wake that was lost), and the two need different
+ * fixes — this tells them apart without a rebuild. */
+void futex_dump_waiters(void) {
+  console_write("futex waiters:\n");
+  for (unsigned h = 0; h < FUTEX_BUCKETS; h++) {
+    struct futex_bucket *b = &g_futex[h];
+    u64 flags;
+    spin_lock_irqsave(&b->lock, &flags);
+    for (struct futex_waiter *w = b->head; w; w = w->next) {
+      console_write("  uaddr=");
+      console_write_hex64(w->key_uaddr);
+      console_write(" pml4=");
+      console_write_hex64(w->key_pml4);
+      console_write(" task=");
+      console_write_dec(w->task_id);
+      console_write(" woken=");
+      console_write_dec((u64)w->woken);
+      console_write(" expect=");
+      console_write_dec((u64)(u32)w->expect);
+      /* Read the word the waiter is parked on through its own address space,
+       * so a "the value already changed but no wake arrived" wedge is visible
+       * directly in the dump. */
+      {
+        extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+        extern u64 vmm_direct_map_base(void);
+        u64 frame = paging_user_frame(w->key_pml4,
+                                      w->key_uaddr & ~(u64)(PAGE_SIZE - 1));
+        if (frame) {
+          u32 cur = *(volatile u32 *)(usize)(frame + vmm_direct_map_base() +
+                                             (w->key_uaddr & (PAGE_SIZE - 1)));
+          console_write(" cur=");
+          console_write_dec((u64)cur);
+        } else {
+          console_write(" cur=<unmapped>");
+        }
+      }
+      console_write("\n");
+    }
+    spin_unlock_irqrestore(&b->lock, flags);
+  }
 }
 
 /* Remove every waiter owned by an exiting task from all buckets. A task killed

@@ -1660,11 +1660,10 @@ int scheduler_post_signal(usize pid, int sig) {
 }
 
 /* ── ioprio(2) ───────────────────────────────────────────────────────────────
- * Per-task I/O scheduling class + level. b1nix issues block requests
- * synchronously (kernel/dev/blk.c has no reordering elevator), so the value is
- * carried and reported but does not reorder I/O — the same observable
- * behaviour Linux has when the queue's scheduler is `none`. Kept per task so
- * an elevator can consult it without another ABI change. */
+ * Per-task I/O scheduling class + level. b1nix issues one device command at a
+ * time, and the block layer's admission gate (kernel/dev/blk.c) hands a busy
+ * device to the waiting request with the best priority — so this value really
+ * does decide who goes first, with ageing so nothing starves. */
 static u16 g_task_ioprio[MAX_TASKS];
 
 int scheduler_set_ioprio(usize pid, int ioprio) {
@@ -2232,18 +2231,16 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
   /* Userspace ELF tasks may run on Application Processors. */
   child->ap_runnable = parent->ap_runnable;
 
-  interrupts_disable();
-  /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
-   * up synchronously without going through arch_context_switch, so publish
-   * stack_released=1 explicitly before the first pick sees it. */
-  child->stack_released = 1;
-  child->state = TASK_READY;
-  sched_rq_enqueue_current(child);
-  interrupts_enable();
-
   /* M92: CLONE_PARENT_SETTID — write child TID to parent's location.
    * CLONE_CHILD_SETTID — write child TID to child's location (in its address
-   * space). Both are needed by musl pthread_create for pthread_join. */
+   * space). Both are needed by musl pthread_create for pthread_join.
+   *
+   * These MUST land before the child is made runnable. A thread that starts,
+   * finishes and exits promptly has its CLONE_CHILD_CLEARTID word zeroed by
+   * the kernel — and if this write ran afterwards it put the dead thread's tid
+   * back, leaving pthread_join parked forever on a thread that no longer
+   * exists (the M29 stress wedge on -smp 2). Linux writes the tids in
+   * copy_process for the same reason, before wake_up_new_task. */
   if ((flags & B1NIX_CLONE_PARENT_SETTID) && parent_tid_addr) {
     /* parent_tid_addr is in the parent's address space (same mm for threads). */
     syscall_copyout((void *)(usize)parent_tid_addr, &child->id, sizeof(u32));
@@ -2252,6 +2249,15 @@ int scheduler_clone_thread(u64 flags, u64 entry, u64 user_stack, u64 arg,
     /* child_tid_addr is in the child's address space (same mm for threads). */
     syscall_copyout((void *)(usize)child_tid_addr, &child->id, sizeof(u32));
   }
+
+  interrupts_disable();
+  /* M28 T4: see fork/kthread_create_impl — fresh task's kernel stack is set
+   * up synchronously without going through arch_context_switch, so publish
+   * stack_released=1 explicitly before the first pick sees it. */
+  child->stack_released = 1;
+  child->state = TASK_READY;
+  sched_rq_enqueue_current(child);
+  interrupts_enable();
 
   /* CLONE_VFORK: suspend here until the child execs or exits. */
   if (flags & B1NIX_CLONE_VFORK) {
@@ -3086,6 +3092,95 @@ void scheduler_set_init_pid(usize pid) { g_init_pid = pid; }
 
 usize scheduler_get_init_pid(void) { return g_init_pid; }
 
+/* Ring of the last thread deaths, dumped by scheduler_dump_tasks when the
+ * watchdog fires: (tid, ctid) tells at a glance whether a joined-on thread ever
+ * reached the tid-clearing path. */
+#define THREAD_EXIT_TRACE 16
+static struct {
+  usize tid;
+  u64 ctid;
+  u64 frame;   /* physical frame the clearing write landed in */
+  u32 readback;/* value read back right after the write */
+} g_thread_exit_trace[THREAD_EXIT_TRACE];
+static u32 g_thread_exit_trace_idx;
+
+static void thread_exit_trace(usize tid, u64 ctid, u64 frame, u32 readback) {
+  u32 i = __atomic_fetch_add(&g_thread_exit_trace_idx, 1, __ATOMIC_RELAXED) %
+          THREAD_EXIT_TRACE;
+  g_thread_exit_trace[i].tid = tid;
+  g_thread_exit_trace[i].ctid = ctid;
+  g_thread_exit_trace[i].frame = frame;
+  g_thread_exit_trace[i].readback = readback;
+}
+
+void scheduler_dump_thread_exits(void) {
+  console_write("thread exits (tid:ctid):");
+  for (u32 i = 0; i < THREAD_EXIT_TRACE; i++) {
+    if (!g_thread_exit_trace[i].tid)
+      continue;
+    console_write(" ");
+    console_write_dec(g_thread_exit_trace[i].tid);
+    console_write(":");
+    console_write_hex64(g_thread_exit_trace[i].ctid);
+    console_write("@");
+    console_write_hex64(g_thread_exit_trace[i].frame);
+    console_write("=");
+    console_write_dec((u64)g_thread_exit_trace[i].readback);
+  }
+  console_write("\n");
+}
+
+/* CLONE_CHILD_CLEARTID: a dying thread must zero the tid word its joiner is
+ * parked on and wake that futex. It has to happen on EVERY path a thread can
+ * die on — a thread killed by a signal inside the scheduler used to skip it,
+ * and pthread_join then slept forever on a word that stayed at the dead
+ * thread's tid (the M29 stress wedge). Idempotent: the address is cleared as it
+ * is consumed, so a second call does nothing. */
+static void thread_release_ctid(struct task *t) {
+  if (!t || !task_is_thread(t))
+    return;
+  u64 ctid = task_child_tid_clear(t);
+  /* Trace every thread death into a ring the watchdog dumps. Printing here
+   * instead would change the timing enough to hide the very race this is
+   * meant to catch (a few stores do not). */
+  if (!ctid) {
+    thread_exit_trace(t->id, 0, 0, 0);
+    return;
+  }
+  task_set_child_tid_clear(t, 0);
+  /* The write goes into the dying thread's own address space, which is still
+   * the live one (threads share the process mm).
+   *
+   * It MUST land. musl hands this word to the kernel precisely because it is
+   * its thread-list lock: the dying thread holds that lock across its final
+   * unmap and exit, and this clear is what releases it. A write that silently
+   * fails — the page was reclaimed or swapped out while the thread was on its
+   * way out — leaves the lock owned by a thread that no longer exists, and
+   * every other thread then waits on it forever. So: write, verify, and if the
+   * page was not there, fault it in and write through the physical mapping. */
+  extern u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+  extern u64 vmm_direct_map_base(void);
+  int zero = 0;
+  (void)syscall_copyout((void *)(usize)ctid, &zero, sizeof(int));
+  u64 page = ctid & ~(u64)(PAGE_SIZE - 1);
+  u64 fr = paging_user_frame(t->pml4_phys, page);
+  if (!fr) {
+    (void)vmm_handle_page_fault(ctid, PF_USER | PF_WRITE);
+    fr = paging_user_frame(t->pml4_phys, page);
+  }
+  if (fr) {
+    volatile u32 *word =
+        (volatile u32 *)(usize)(fr + vmm_direct_map_base() +
+                                (ctid & (PAGE_SIZE - 1)));
+    if (*word != 0)
+      *word = 0;
+    thread_exit_trace(t->id, ctid, fr, *word);
+  } else {
+    thread_exit_trace(t->id, ctid, 0, 0xffffffffu);
+  }
+  scheduler_futex_wake_addr(ctid, 1);
+}
+
 void scheduler_exit_current(int exit_code) {
   /* A vfork parent waiting on this task must be released before teardown. */
   scheduler_vfork_release();
@@ -3158,12 +3253,7 @@ void scheduler_exit_current(int exit_code) {
    * (kernel stack + slot). CLONE_CHILD_CLEARTID also writes 0 + futex_wakes
    * so a pthread_join sleeper unblocks. */
   if (task_is_thread(current_task)) {
-    u64 ctid = task_child_tid_clear(current_task);
-    if (ctid) {
-      int zero = 0;
-      (void)syscall_copyout((void *)(usize)ctid, &zero, sizeof(int));
-      scheduler_futex_wake_addr(ctid, 1);
-    }
+    thread_release_ctid(current_task);
     if (current_task->user_image) {
       user_image_free(current_task->user_image);
       current_task->user_image = 0;
@@ -3770,6 +3860,9 @@ void scheduler_lease_clear_here(const char *site) {
 }
 
 void scheduler_dump_tasks(void) {
+  extern void futex_dump_waiters(void);
+  futex_dump_waiters();
+  scheduler_dump_thread_exits();
   console_write("tick=");
   console_write_dec(scheduler_ticks);
   console_write("\nID\tSTATE\tNAME\n");
@@ -5034,6 +5127,7 @@ void scheduler_deliver_pending_signals(void) {
        * inside the scheduler so it must NOT do the yield-based fd teardown that
        * scheduler_exit_current performs; the zombie reaper handles the rest. */
       reparent_children_and_signal_orphans(current_task);
+      thread_release_ctid(current_task);
       scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
       task_lease_clear(current_task, __func__);
@@ -5074,6 +5168,7 @@ void scheduler_deliver_pending_signals(void) {
         /* Reparent + orphan-pgrp signalling + futex cleanup, as for SIGKILL
          * above (M46-3). No yield-based teardown — we are inside the scheduler. */
         reparent_children_and_signal_orphans(current_task);
+        thread_release_ctid(current_task);
         scheduler_futex_cleanup_task(current_task->id);
   scheduler_timer_cleanup_task(current_task->id); /* M74: free POSIX timers */
         task_lease_clear(current_task, __func__);

@@ -1047,6 +1047,8 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M40-ABI: ok sysv-sem" "SysV semaphores: SETVAL/GETVAL, an atomic down/up pair, and IPC_NOWAIT reporting EAGAIN"
 	check_output "$LOG" "M40-ABI: ok sysv-msg" "SysV message queues: type-selective msgrcv picks the requested type, IPC_NOWAIT reports ENOMSG"
 	check_output "$LOG" "M40-ABI: ok file-handle" "name_to_handle_at + open_by_handle_at reopen a file through an opaque handle"
+	check_output "$LOG" "M40-ABI: ok file-handle-stale" "a handle whose file was replaced reports ESTALE instead of opening the impostor"
+	check_output "$LOG" "M40-IOPRIO: ok elevator-order" "the block layer admits the best-priority waiter first, and ages a starving idle-class request past fresh best-effort ones"
 	check_output "$LOG" "M40-ABI: ok rseq" "rseq(2) registration publishes a live cpu_id into the task's own memory"
 	check_output "$LOG" "M40-ABI: ok swapon-swapoff" "swapoff(2) pages everything back in and detaches; swapon(2) re-attaches the device"
 	check_output "$LOG" "M40-ABI: ok chroot" "chroot(2) confines a child: the jailed path resolves, an outside path and a \"..\" escape do not"

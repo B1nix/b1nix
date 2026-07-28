@@ -12,10 +12,10 @@
  *    (paging_user_frame), so POKETEXT can patch a read-only text page — a
  *    breakpoint would be impossible otherwise.
  *
- * The tracer must be the tracee's parent. b1nix's waitpid reports a stopped
- * child to its parent only, and a tracer that cannot wait for its tracee's
- * stops has no way to drive it, so anything else is refused rather than
- * half-working.
+ * The tracer need not be the tracee's parent: waitpid matches a task's tracer
+ * as well as its parent (kernel/sched/scheduler.c), so an attached tracer sees
+ * the stops it has to drive. Attaching still requires the right to signal the
+ * target, exactly as Linux's ptrace_may_access does.
  */
 
 #include <b1nix/arch.h>

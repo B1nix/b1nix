@@ -18,6 +18,10 @@ static int filelock_initialized = 0;
  * (scheduler_wait_prepare/commit/cancel) owns interrupt state across the sleep,
  * which is why irqsave would be wrong here (cancel/commit force interrupts on,
  * clobbering saved flags). */
+/* Taken with IRQs disabled: this lock is reached both from syscalls and from
+ * the task-teardown path the scheduler runs, so a holder that gets preempted
+ * on its own CPU and re-enters through the tick would spin on itself forever.
+ * The F_SETLKW sleep still drops it before yielding. */
 static spinlock_t filelock_lock = SPINLOCK_INIT;
 
 /* POSIX file locks are owned by the PROCESS, not the thread. Key ownership by
@@ -155,7 +159,8 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
   }
   u64 end = fl->l_len ? start + fl->l_len - 1 : (u64)-1;
 
-  spin_lock(&filelock_lock);
+  u64 fl_flags;
+  spin_lock_irqsave(&filelock_lock, &fl_flags);
 
   if (cmd == F_GETLK) {
     struct file_lock *conflicting = NULL;
@@ -178,20 +183,20 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
     } else {
       fl->l_type = F_UNLCK;
     }
-    spin_unlock(&filelock_lock);
+    spin_unlock_irqrestore(&filelock_lock, fl_flags);
     return 0;
   }
 
   if (fl->l_type != F_UNLCK) {
     if (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (cmd == F_SETLK) {
-        spin_unlock(&filelock_lock);
+        spin_unlock_irqrestore(&filelock_lock, fl_flags);
         return -EAGAIN;
       }
     }
     while (filelock_conflict_exists(inode, my_pid, start, fl->l_len, fl->l_type)) {
       if (scheduler_signal_pending()) {
-        spin_unlock(&filelock_lock);
+        spin_unlock_irqrestore(&filelock_lock, fl_flags);
         return -ERESTARTSYS;
       }
       /* SMP-safe blocking acquire (F_SETLKW). Publish BLOCKED, re-test the
@@ -206,9 +211,9 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
         scheduler_wait_cancel();
         continue;
       }
-      spin_unlock(&filelock_lock);
+      spin_unlock_irqrestore(&filelock_lock, fl_flags);
       scheduler_wait_commit();
-      spin_lock(&filelock_lock);
+      spin_lock_irqsave(&filelock_lock, &fl_flags);
     }
   }
 
@@ -228,10 +233,10 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
     }
   }
   if (fl->l_type == F_UNLCK) {
-    if (needs_split && free_slots < 1) { spin_unlock(&filelock_lock); return -ENOMEM; }
+    if (needs_split && free_slots < 1) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; }
   } else {
-    if (needs_split && free_slots < 2) { spin_unlock(&filelock_lock); return -ENOMEM; }
-    if (!needs_split && free_slots < 1) { spin_unlock(&filelock_lock); return -ENOMEM; }
+    if (needs_split && free_slots < 2) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; }
+    if (!needs_split && free_slots < 1) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; }
   }
 
   // Apply split/shrink/delete for our own locks in this range
@@ -243,7 +248,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
 
         if (L_start < start && L_end > end) {
           struct file_lock *L2 = alloc_lock();
-          if (!L2) { spin_unlock(&filelock_lock); return -ENOMEM; } /* pre-check reserved this; defensive */
+          if (!L2) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; } /* pre-check reserved this; defensive */
           L2->inode = inode;
           L2->pid = my_pid;
           L2->lock_type = file_locks[i].lock_type;
@@ -265,7 +270,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
 
   if (fl->l_type != F_UNLCK) {
     struct file_lock *lock = alloc_lock();
-    if (!lock) { spin_unlock(&filelock_lock); return -ENOMEM; } /* pre-check reserved this; defensive */
+    if (!lock) { spin_unlock_irqrestore(&filelock_lock, fl_flags); return -ENOMEM; } /* pre-check reserved this; defensive */
     lock->inode = inode;
     lock->pid = my_pid;
     lock->lock_type = fl->l_type;
@@ -275,7 +280,7 @@ int filelock_set_lock(int fd, int cmd, struct flock *fl) {
     merge_adjacent_locks(inode, my_pid);
   }
 
-  spin_unlock(&filelock_lock);
+  spin_unlock_irqrestore(&filelock_lock, fl_flags);
   scheduler_wake_all(inode);
   return 0;
 }
@@ -305,7 +310,8 @@ int filelock_check_lock(int fd, int lock_type, u64 start, u64 len,
   int my_pid = filelock_owner();
 
   int found = 0;
-  spin_lock(&filelock_lock);
+  u64 fl_flags;
+  spin_lock_irqsave(&filelock_lock, &fl_flags);
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
     if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid != my_pid) {
       if (lock_overlaps(file_locks[i].start, file_locks[i].len, start, len)) {
@@ -318,7 +324,7 @@ int filelock_check_lock(int fd, int lock_type, u64 start, u64 len,
       }
     }
   }
-  spin_unlock(&filelock_lock);
+  spin_unlock_irqrestore(&filelock_lock, fl_flags);
   return found;
 }
 
@@ -364,14 +370,15 @@ void filelock_release_all_by_pid_inode(int pid, struct vfs_inode *inode) {
     return;
 
   int woke_any = 0;
-  spin_lock(&filelock_lock);
+  u64 fl_flags;
+  spin_lock_irqsave(&filelock_lock, &fl_flags);
   for (int i = 0; i < MAX_FILE_LOCKS; i++) {
     if (file_locks[i].active && file_locks[i].inode == inode && file_locks[i].pid == pid) {
       free_lock(&file_locks[i]);
       woke_any = 1;
     }
   }
-  spin_unlock(&filelock_lock);
+  spin_unlock_irqrestore(&filelock_lock, fl_flags);
   if (woke_any) {
     scheduler_wake_all(inode);
   }

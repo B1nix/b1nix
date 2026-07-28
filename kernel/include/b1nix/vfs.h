@@ -77,6 +77,12 @@ struct vfs_xattr {
 
 struct vfs_inode {
   u64 ino;
+  /* Inode generation: bumped every time the filesystem hands this inode number
+   * to a NEW file. A stored file handle carries it, so reusing the number for a
+   * different file makes the old handle report ESTALE instead of opening the
+   * impostor (this is what Linux's i_generation is for). 0 = the filesystem
+   * does not track one. */
+  u32 generation;
   enum vfs_node_type type;
   u32 flags;
   volatile int rw_lock; /* >0: readers, -1: writer, 0: free */
@@ -174,6 +180,9 @@ struct vfs_inode {
   void (*mmap_range_open_cb)(struct vfs_node *node, u64 offset, usize length);
   void (*mmap_range_close_cb)(struct vfs_node *node, u64 offset, usize length);
 };
+
+/* Give an inode a fresh generation (a create reusing an existing node). */
+void vfs_inode_new_generation(struct vfs_inode *inode);
 
 /* Inode cache API */
 void icache_init(void);

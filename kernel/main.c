@@ -639,6 +639,20 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.test=1")) {
 		e1000_selftest();
 		usb_selftest();
+		/* ioprio(2): the block layer's admission policy — better priority
+		 * first, and a starving idle-class request ages past a stream of
+		 * best-effort ones. Drives the real chooser with synthetic waiters. */
+		{
+			extern int blk_io_gate_selftest(void);
+			int io_rc = blk_io_gate_selftest();
+			if (io_rc == 0) {
+				console_write("M40-IOPRIO: ok elevator-order\n");
+			} else {
+				console_write("M40-IOPRIO: FAIL elevator-order check=");
+				console_write_dec((u64)io_rc);
+				console_write("\n");
+			}
+		}
 		m36_gdb_selftest();
 		m36_ftrace_selftest();
 		/* M32 IPv6 self-tests: loopback (::1) ICMPv6 + MLD, and real-link

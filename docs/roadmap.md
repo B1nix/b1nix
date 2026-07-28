@@ -367,6 +367,12 @@ Status:
 - [x] The privilege and placement calls behave as they claim: capabilities are a real per-task set (a dropped one stays dropped, and root loses the operation it guarded), `setfsuid`/`setfsgid` move the id the VFS checks against (clearing the file-related capabilities as Linux does), `sched_setaffinity` really pins a task, and a `ptrace` tracer that is not the tracee's parent can attach and drive it. `open(2)`'s `O_CREAT` mode is applied (masked by umask) instead of being ignored.
 - [x] The rest of the surface, implemented rather than stubbed: `ptrace` (TRACEME/ATTACH/GETREGS/SETREGS/PEEK/POKE/CONT/SINGLESTEP/DETACH/KILL), SysV semaphores (with SEM_UNDO) and message queues (type-selective receive), `chroot` with a real per-task root, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, `name_to_handle_at`/`open_by_handle_at`, `rseq` (live `cpu_id` plus critical-section abort), and legacy `getdents`.
 
+## M29 follow-up: the pthread SMP wedge
+
+- [x] Fixed the long-standing `M29 stress-smp` hang at `-smp 2` (three real races, not one): a futex wake landing while the waiter was momentarily RUNNING was lost; `CLONE_*_SETTID` wrote the child's tid *after* the child could already have exited and had it cleared; and the `CLONE_CHILD_CLEARTID` write — which is what releases musl's thread-list lock — could silently fail, leaving the lock owned by a dead thread.
+- [x] `filelock_lock` is taken with interrupts disabled; a preempted holder used to deadlock against its own CPU (observed as `SPINLOCK LOCKUP on cpu 0`).
+- [x] The watchdog task dump now prints the futex wait queues (key, owner, expected vs current value) and the last thread deaths, which is what made these diagnosable.
+
 ## M41: Large Physical Memory
 
 - [x] Remove 64 GiB ceiling and verify 16 GiB boot.

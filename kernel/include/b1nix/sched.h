@@ -336,7 +336,8 @@ int  scheduler_getrlimit_task(const struct task *t, int resource,
 usize scheduler_max_tasks(void);
 /* Post a pending signal without scheduler_kill's stop/continue side effects. */
 int scheduler_post_signal(usize pid, int sig);
-/* ioprio(2): per-task I/O class+level (carried, not yet an elevator input). */
+/* ioprio(2): per-task I/O class+level, consumed by the block layer's admission
+ * gate (kernel/dev/blk.c). */
 int scheduler_set_ioprio(usize pid, int ioprio);
 int scheduler_get_ioprio(usize pid);
 /* chroot(2): the calling task's filesystem root (NULL = the real root) and the

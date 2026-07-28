@@ -58,11 +58,27 @@ void vfs_free_node(struct vfs_node *node) {
 }
 
 static u64 next_ino = 1;
+/* Every freshly allocated inode gets a distinct generation, so a file handle
+ * stored for one file cannot match a later file that ends up on the same inode
+ * number (filesystems with an on-disk generation overwrite this with theirs). */
+static u32 next_generation = 1;
 
 struct vfs_inode *vfs_alloc_inode(void) {
     struct vfs_inode *inode = pool_alloc(&inode_pool);
-    if (inode) inode->ino = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);
+    if (inode) {
+        inode->ino = __atomic_fetch_add(&next_ino, 1, __ATOMIC_RELAXED);
+        inode->generation =
+            __atomic_fetch_add(&next_generation, 1, __ATOMIC_RELAXED);
+    }
     return inode;
+}
+
+/* Give an inode a new identity because the file that lived on it is gone and
+ * something else is taking its place (a create that reuses a node). */
+void vfs_inode_new_generation(struct vfs_inode *inode) {
+    if (inode)
+        inode->generation =
+            __atomic_fetch_add(&next_generation, 1, __ATOMIC_RELAXED);
 }
 
 void vfs_free_inode(struct vfs_inode *inode) {

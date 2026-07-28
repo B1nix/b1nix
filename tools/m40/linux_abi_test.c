@@ -715,6 +715,32 @@ static void test_file_handles(void) {
   if (fd >= 0)
     sys1(SYS_close, fd);
   check("file-handle", fd >= 0 && n == 2 && c[0] == '#', fd < 0 ? fd : n);
+
+  /* A handle names a file, not a path: replace the file behind the path and
+   * the handle must report ESTALE rather than open the impostor. */
+  struct {
+    unsigned handle_bytes;
+    int handle_type;
+    unsigned payload;
+  } fh2 = {sizeof(unsigned), 0, 0};
+  long w = sys3(SYS_open, "/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (w >= 0) {
+    sys3(SYS_write, w, "a", 1);
+    sys1(SYS_close, w);
+  }
+  long r2 = sys5(SYS_name_to_handle_at, AT_FDCWD, "/tmp/m40handle", &fh2,
+                 &mount_id, 0);
+  sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40handle", 0);
+  w = sys3(SYS_open, "/tmp/m40handle", O_WRONLY | O_CREAT | O_TRUNC, 0644);
+  if (w >= 0) {
+    sys3(SYS_write, w, "b", 1);
+    sys1(SYS_close, w);
+  }
+  long stale = sys3(SYS_open_by_handle_at, AT_FDCWD, &fh2, O_RDONLY);
+  if (stale >= 0)
+    sys1(SYS_close, stale);
+  sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40handle", 0);
+  check("file-handle-stale", r2 == 0 && stale == -116 /* ESTALE */, stale);
 }
 
 /* struct rseq is 32 bytes and must be 32-byte aligned. */

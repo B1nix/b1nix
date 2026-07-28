@@ -216,7 +216,15 @@ static u32 ext4_alloc_inode_tx(struct ext4_fs *fs, struct journal_handle *h) {
         kfree(bitmap); bgd.bg_free_inodes_count_lo--; ext4_write_bgd_tx(fs, g, &bgd, h);
         fs->sb.s_free_inodes_count--; ext4_write_superblock(fs);
         u32 inode_num = g * fs->inodes_per_group + i + 1;
-        struct ext2_inode ni; memset(&ni, 0, sizeof(ni)); ext4_write_inode_tx(fs, h, inode_num, &ni);
+        /* Reusing an inode number gives the new file a NEW generation, so a
+         * file handle stored for the file that used to live here reports
+         * ESTALE instead of opening the newcomer. */
+        struct ext2_inode prev;
+        u32 prev_gen =
+            (ext4_read_inode(fs, inode_num, &prev) == 0) ? prev.i_generation : 0;
+        struct ext2_inode ni; memset(&ni, 0, sizeof(ni));
+        ni.i_generation = prev_gen + 1;
+        ext4_write_inode_tx(fs, h, inode_num, &ni);
         vfs_meta_lock_release(&fs->alloc_lock);
         return inode_num;
       }
@@ -690,7 +698,15 @@ static int ext4_vfs_create(struct vfs_node *dir, const char *name, const char *f
     if (h) journal_abort_transaction(h);
     return -ENOSPC;
   }
-  struct ext2_inode inode; memset(&inode, 0, sizeof(inode));
+  struct ext2_inode inode;
+  {
+    /* Keep the generation the allocator assigned — it is what tells this file
+     * apart from the one that previously used this inode number. */
+    struct ext2_inode fresh;
+    u32 gen = (ext4_read_inode(fs, new_ino, &fresh) == 0) ? fresh.i_generation : 0;
+    memset(&inode, 0, sizeof(inode));
+    inode.i_generation = gen;
+  }
   inode.i_mode = EXT2_S_IFREG | (mode & 07777); inode.i_links_count = 1;
   inode.i_atime = inode.i_mtime = inode.i_ctime = vfs_get_unix_time();
   struct ext4_extent_header *eh = (struct ext4_extent_header *)inode.i_block;
@@ -1095,6 +1111,13 @@ static void ext4_setup_node(struct vfs_node *n, struct ext4_fs *fs, u32 ino, u32
    * name the same file for anything that pairs readdir with stat (hardlink
    * detection in du/tar/rsync, `find -inum`, samefile checks). */
   n->inode->ino = ino;
+  {
+    /* Carry the on-disk generation so a stored file handle can tell this file
+     * apart from a later one that reuses the inode number. */
+    struct ext2_inode gi;
+    if (ext4_read_inode(fs, ino, &gi) == 0)
+      n->inode->generation = gi.i_generation;
+  }
   n->inode->data = ni; n->inode->blk_dev = fs->bdev;
   n->inode->read_cb = ext4_vfs_read; n->inode->write_cb = ext4_vfs_write;
   n->inode->truncate_cb = ext4_vfs_truncate;

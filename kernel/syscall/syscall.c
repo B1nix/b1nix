@@ -2067,17 +2067,20 @@ static int c_euid_not_root(void) {
 
 /* ── name_to_handle_at(2) / open_by_handle_at(2) ─────────────────────────────
  * A file handle is an opaque token a program can store and later re-open
- * without keeping a descriptor. b1nix filesystems have no persistent
- * inode-to-path map, so the kernel keeps the resolved path in a table and puts
- * that table's index in the handle. The handle therefore stays valid for the
- * lifetime of the boot; Linux only promises validity while the filesystem
- * stays mounted, so nothing portable depends on more than that. */
+ * without keeping a descriptor. b1nix filesystems have no inode-to-path map,
+ * so the kernel remembers the resolved path AND the inode it named, and puts
+ * the table index in the handle. The inode is what makes the handle honest: if
+ * the path now names a different file — it was replaced, or the slot was
+ * reused — open_by_handle_at reports ESTALE instead of quietly opening the
+ * wrong file. Handles are valid for the lifetime of the boot; Linux only
+ * promises validity while the filesystem stays mounted. */
 #define FILE_HANDLE_MAX 128
 #define FILE_HANDLE_TYPE 0x62316e78 /* 'b1nx' */
 
 struct file_handle_slot {
   char path[VFS_MAX_PATH];
   u64 ino;
+  u32 generation;
   int used;
 };
 
@@ -2127,11 +2130,23 @@ static isize sys_linux_name_to_handle_at(int dirfd, const char *user_path,
     return -EOVERFLOW;
   }
 
+  /* The generation distinguishes this file from a later one that reuses the
+   * inode number — vfs_stat has no field for it, so read it off the node. */
+  u32 generation = 0;
+  {
+    struct vfs_node *gn = vfs_find_node(resolved);
+    if (gn && !IS_ERR(gn)) {
+      generation = gn->inode->generation;
+      vfs_node_put(gn);
+    }
+  }
+
   u64 flags_irq;
   spin_lock_irqsave(&g_file_handle_lock, &flags_irq);
   int slot = -1;
   for (int i = 0; i < FILE_HANDLE_MAX; i++) {
     if (g_file_handles[i].used && g_file_handles[i].ino == st.st_ino &&
+        g_file_handles[i].generation == generation &&
         strcmp(g_file_handles[i].path, resolved) == 0) {
       slot = i; /* same file: hand back the same handle */
       break;
@@ -2144,6 +2159,7 @@ static isize sys_linux_name_to_handle_at(int dirfd, const char *user_path,
       strncpy(g_file_handles[i].path, resolved, VFS_MAX_PATH - 1);
       g_file_handles[i].path[VFS_MAX_PATH - 1] = '\0';
       g_file_handles[i].ino = st.st_ino;
+      g_file_handles[i].generation = generation;
       g_file_handles[i].used = 1;
       slot = i;
       break;
@@ -2185,6 +2201,8 @@ static isize sys_linux_open_by_handle_at(int mount_fd, u64 user_handle,
     return -ESTALE;
 
   char path[VFS_MAX_PATH];
+  u64 want_ino;
+  u32 want_gen;
   u64 flags_irq;
   spin_lock_irqsave(&g_file_handle_lock, &flags_irq);
   if (in.payload >= FILE_HANDLE_MAX || !g_file_handles[in.payload].used) {
@@ -2193,7 +2211,28 @@ static isize sys_linux_open_by_handle_at(int mount_fd, u64 user_handle,
   }
   strncpy(path, g_file_handles[in.payload].path, VFS_MAX_PATH - 1);
   path[VFS_MAX_PATH - 1] = '\0';
+  want_ino = g_file_handles[in.payload].ino;
+  want_gen = g_file_handles[in.payload].generation;
   spin_unlock_irqrestore(&g_file_handle_lock, flags_irq);
+
+  /* The handle names a FILE, not a path: if the path now resolves to a
+   * different inode the file the caller asked for is gone. */
+  struct b1nix_stat st;
+  if (vfs_stat(path, &st) < 0)
+    return -ESTALE;
+  if (want_ino && st.st_ino != want_ino)
+    return -ESTALE;
+  {
+    /* Same number, different file: the generation catches inode reuse. */
+    struct vfs_node *gn = vfs_find_node(path);
+    u32 gen = 0;
+    if (gn && !IS_ERR(gn)) {
+      gen = gn->inode->generation;
+      vfs_node_put(gn);
+    }
+    if (gen != want_gen)
+      return -ESTALE;
+  }
 
   return vfs_open_flags(path, linux_open_flags_to_b1nix(flags));
 }
