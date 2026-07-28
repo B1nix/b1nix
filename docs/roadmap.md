@@ -358,11 +358,12 @@ Status:
 
 ## M40: Linux ABI Compatibility
 
-- [ ] `partial` Translate Linux x86_64 syscall numbers and semantics (165 mapped calls, stat/uname/getdents64/termios translated).
-- [ ] `partial` Load static Linux binaries; glibc PT_INTERP / ld.so planned.
-- [ ] `partial` Add Linux process startup, auxv, arch_prctl, signals, and sigreturn.
-- [ ] `planned` Fill Linux-compatible `/proc` and `/sys` entries.
+- [x] Translate Linux x86_64 syscall numbers and semantics (~230 calls: stat/statfs/uname/getdents64/termios layouts, positional I/O, the time calls, sched/credential/capability calls, real `mlock`, `sethostname`, the xattr fd forms).
+- [x] Load Linux binaries: static ET_EXEC at its own base, and dynamic ones through their own `PT_INTERP` (a stock Alpine rootfs boots on musl's `ld-musl` — see M94).
+- [x] Linux process startup: full auxv (AT_PHDR/BASE/ENTRY/RANDOM/EXECFN/UID…), `arch_prctl`, signal delivery with signo remap, and `rt_sigreturn`.
+- [x] Linux-compatible `/proc` and `/sys`: `/proc/<pid>/{environ,statm,limits,cwd,root,mounts}`, `/proc/{swaps,modules,sys/kernel/*,sys/fs/*}`, `/sys/class/net/<if>/*`.
 - [x] Detect Linux ELFs through personality (`EI_OSABI` and `NT_GNU_ABI_TAG`).
+- Deliberately unimplemented (each returns `-ENOSYS`, listed in `kernel/syscall/syscall.c`): `ptrace`, SysV semaphores/message queues, `chroot`, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, file handles, `rseq`.
 
 ## M41: Large Physical Memory
 

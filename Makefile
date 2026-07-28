@@ -1661,6 +1661,10 @@ endif
 		cp -f tools/m40/linux_hello.bin $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-hello; \
 	fi
+	@if [ -f tools/m40/linux_abi_test.bin ]; then \
+		cp -f tools/m40/linux_abi_test.bin $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/m40-linux-abi; \
+	fi
 	@if [ -f tools/m67/hello_b1nix.elf ]; then \
 		cp -f tools/m67/hello_b1nix.elf $(BUILD_DIR)/rootfs/bin/m67-rust; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/m67-rust; \
