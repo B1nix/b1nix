@@ -452,11 +452,17 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       scheduler_on_timer_tick();
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
     }
-    /* rseq(2): the tick may have preempted (and the task may have come back on
-     * another CPU), so refresh the registered cpu ids and restart a critical
-     * section we would otherwise resume in the middle of. */
-    if (frame->cs == 0x1B || frame->cs == 0x23)
+    if (frame->cs == 0x1B || frame->cs == 0x23) {
+      /* rseq(2): the tick may have preempted (and the task may have come back
+       * on another CPU), so refresh the registered cpu ids and restart a
+       * critical section we would otherwise resume in the middle of. */
       rseq_on_return_to_user(frame);
+      /* A pending signal is delivered here too. Without it a task that never
+       * makes a syscall — a compute loop, or a ptrace tracee spinning between
+       * breakpoints — could only be signalled by forcing its state from
+       * another CPU, which races with its own context save. */
+      arch_check_and_deliver_signals(frame);
+    }
     return;
   }
 

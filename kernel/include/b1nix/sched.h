@@ -334,6 +334,8 @@ int  scheduler_getrlimit_task(const struct task *t, int resource,
 /* Upper bound on concurrent tasks (the pid ceiling reported by
  * /proc/sys/kernel/pid_max). */
 usize scheduler_max_tasks(void);
+/* Post a pending signal without scheduler_kill's stop/continue side effects. */
+int scheduler_post_signal(usize pid, int sig);
 /* ioprio(2): per-task I/O class+level (carried, not yet an elevator input). */
 int scheduler_set_ioprio(usize pid, int ioprio);
 int scheduler_get_ioprio(usize pid);
@@ -343,6 +345,10 @@ int scheduler_get_ioprio(usize pid);
 struct vfs_node *scheduler_get_root_node(void);
 const char *scheduler_get_root_path(void);
 int scheduler_set_root(struct vfs_node *node, const char *path);
+/* sched_setaffinity(2): per-task CPU mask (0 = any online CPU). */
+int sched_task_allowed_on_cpu(const struct task *t, int cpu);
+int scheduler_set_affinity(usize pid, u64 mask);
+u64 scheduler_get_affinity(usize pid);
 /* swapoff(2): page every address space's swapped pages back in. */
 usize scheduler_swapin_all_tasks(void);
 int  scheduler_setrlimit(int resource, const struct rlimit *rlim);

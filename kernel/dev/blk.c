@@ -45,6 +45,10 @@ static struct partition_device partitions[MAX_BLK_PARTITIONS];
 static usize partition_count;
 
 static void blk_scan_partitions(struct block_device *dev);
+/* Priority-gated device commands — see the I/O priority gate below. */
+static int blk_dev_read(struct block_device *dev, u64 lba, u32 count, void *buf);
+static int blk_dev_write(struct block_device *dev, u64 lba, u32 count,
+                         const void *buf);
 
 /* ── Block Cache Structures ── */
 
@@ -580,7 +584,7 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
      * pressure — a documented limitation. The sync/fsync path in
      * blk_flush_buffer keeps DIRTY on failure so explicit syncs don't lose
      * data silently (R3-13). */
-    wb_dev->write_blocks(wb_dev, wb_lba, 1, entry->data);
+    blk_dev_write(wb_dev, wb_lba, 1, entry->data);
     *flags_inout = bcache_acquire();         /* REACQUIRE before returning */
     entry->flags &= ~(BLK_CACHE_DIRTY | BLK_CACHE_BUSY);
   }
@@ -589,6 +593,166 @@ static struct block_buffer *bcache_evict(u64 *flags_inout) {
   bcache_hash_remove((i32)oldest_idx);
   entry->flags &= ~BLK_CACHE_VALID;
   return entry;
+}
+
+
+/* ── I/O priority gate (ioprio_set(2)) ───────────────────────────────────────
+ * b1nix issues one device command at a time per device: the drivers serialise
+ * internally and the block cache marks an in-flight sector BUSY. That
+ * serialisation point is the only place where request order is decided, so it
+ * is where ioprio has to act. A request takes the gate before touching the
+ * device; if the device is busy the task parks, and when the holder leaves it
+ * hands the gate to the WAITING TASK WITH THE BEST I/O PRIORITY rather than to
+ * whoever wakes first. With no contention this is two atomic operations and no
+ * ordering decision at all, so the fast path is unchanged.
+ *
+ * Priority follows the Linux encoding: class in bits 13..15 (1 = realtime,
+ * 2 = best-effort, 3 = idle) and level in bits 0..12, lower is better. A task
+ * that never called ioprio_set has value 0, which sorts as best-effort level 0
+ * — exactly how Linux treats an unset priority. */
+#define BLK_IO_WAITERS 16
+
+struct blk_io_waiter {
+  struct task *task;
+  int prio;
+  int admitted;
+  int used;
+};
+
+struct blk_io_gate {
+  struct block_device *dev;
+  int busy;
+  struct blk_io_waiter waiters[BLK_IO_WAITERS];
+};
+
+static struct blk_io_gate blk_gates[MAX_BLK_DEVICES];
+static spinlock_t blk_gate_lock = SPINLOCK_INIT;
+
+static struct blk_io_gate *blk_gate_of(struct block_device *dev) {
+  for (usize i = 0; i < MAX_BLK_DEVICES; i++)
+    if (blk_gates[i].dev == dev)
+      return &blk_gates[i];
+  for (usize i = 0; i < MAX_BLK_DEVICES; i++)
+    if (!blk_gates[i].dev) {
+      blk_gates[i].dev = dev;
+      return &blk_gates[i];
+    }
+  return 0;
+}
+
+/* Effective priority: class first, then level. Class 0 (unset) is treated as
+ * best-effort, matching Linux. */
+static int blk_io_prio_of_current(void) {
+  int raw = scheduler_get_ioprio(0);
+  if (raw < 0)
+    raw = 0;
+  int class = (raw >> 13) & 0x7;
+  int level = raw & 0x1fff;
+  if (class == 0)
+    class = 2; /* IOPRIO_CLASS_BE */
+  return (class << 13) | level;
+}
+
+static void blk_io_begin(struct block_device *dev) {
+  if (!dev || !current_task)
+    return;
+  u64 flags;
+  spin_lock_irqsave(&blk_gate_lock, &flags);
+  struct blk_io_gate *g = blk_gate_of(dev);
+  if (!g) {
+    spin_unlock_irqrestore(&blk_gate_lock, flags);
+    return;
+  }
+  if (!g->busy) {
+    g->busy = 1;
+    spin_unlock_irqrestore(&blk_gate_lock, flags);
+    return;
+  }
+  int slot = -1;
+  for (int i = 0; i < BLK_IO_WAITERS; i++) {
+    if (!g->waiters[i].used) {
+      g->waiters[i].used = 1;
+      g->waiters[i].task = current_task;
+      g->waiters[i].prio = blk_io_prio_of_current();
+      g->waiters[i].admitted = 0;
+      slot = i;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&blk_gate_lock, flags);
+  if (slot < 0) {
+    /* More concurrent requests than the wait table holds: fall back to
+     * spinning on the gate rather than losing the ordering guarantee. */
+    while (1) {
+      spin_lock_irqsave(&blk_gate_lock, &flags);
+      if (!g->busy) {
+        g->busy = 1;
+        spin_unlock_irqrestore(&blk_gate_lock, flags);
+        return;
+      }
+      spin_unlock_irqrestore(&blk_gate_lock, flags);
+      scheduler_yield();
+    }
+  }
+  while (1) {
+    spin_lock_irqsave(&blk_gate_lock, &flags);
+    if (g->waiters[slot].admitted) {
+      g->waiters[slot].used = 0;
+      g->waiters[slot].admitted = 0;
+      spin_unlock_irqrestore(&blk_gate_lock, flags);
+      return; /* the gate was handed to us, still held */
+    }
+    spin_unlock_irqrestore(&blk_gate_lock, flags);
+    scheduler_yield();
+  }
+}
+
+static void blk_io_end(struct block_device *dev) {
+  if (!dev || !current_task)
+    return;
+  u64 flags;
+  spin_lock_irqsave(&blk_gate_lock, &flags);
+  struct blk_io_gate *g = blk_gate_of(dev);
+  if (!g) {
+    spin_unlock_irqrestore(&blk_gate_lock, flags);
+    return;
+  }
+  int best = -1;
+  for (int i = 0; i < BLK_IO_WAITERS; i++) {
+    if (!g->waiters[i].used || g->waiters[i].admitted)
+      continue;
+    if (best < 0 || g->waiters[i].prio < g->waiters[best].prio)
+      best = i;
+  }
+  if (best >= 0) {
+    /* Hand the gate straight over: it stays busy, and the chosen waiter is the
+     * highest-priority one rather than the first to be scheduled. */
+    g->waiters[best].admitted = 1;
+    struct task *next = g->waiters[best].task;
+    spin_unlock_irqrestore(&blk_gate_lock, flags);
+    if (next)
+      scheduler_wake_all(next);
+    return;
+  }
+  g->busy = 0;
+  spin_unlock_irqrestore(&blk_gate_lock, flags);
+}
+
+/* The device-command wrappers every path below goes through. */
+static int blk_dev_read(struct block_device *dev, u64 lba, u32 count,
+                        void *buf) {
+  blk_io_begin(dev);
+  int rc = dev->read_blocks(dev, lba, count, buf);
+  blk_io_end(dev);
+  return rc;
+}
+
+static int blk_dev_write(struct block_device *dev, u64 lba, u32 count,
+                         const void *buf) {
+  blk_io_begin(dev);
+  int rc = dev->write_blocks(dev, lba, count, buf);
+  blk_io_end(dev);
+  return rc;
 }
 
 int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
@@ -607,7 +771,7 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
     return -1;
   }
   if (dev->block_size != CACHE_BLOCK_SIZE) {
-    return dev->read_blocks(dev, lba, count, buffer);
+    return blk_dev_read(dev, lba, count, buffer);
   }
 
   u8 *buf8 = (u8 *)buffer;
@@ -669,12 +833,12 @@ int blk_read_cached(struct block_device *dev, u64 lba, u32 count,
       u8 *ra = (run > 1) ? (u8 *)kmalloc((usize)run * CACHE_BLOCK_SIZE) : 0;
       int rc;
       if (ra) {
-        rc = dev->read_blocks(dev, current_lba, run, ra);
+        rc = blk_dev_read(dev, current_lba, run, ra);
         if (rc >= 0)
           memcpy(entry->data, ra, CACHE_BLOCK_SIZE);
       } else {
         run = 1;
-        rc = dev->read_blocks(dev, current_lba, 1, entry->data);
+        rc = blk_dev_read(dev, current_lba, 1, entry->data);
       }
       if (rc < 0) {
         if (ra)
@@ -797,7 +961,7 @@ static usize bcache_flush_some(usize target) {
              CACHE_BLOCK_SIZE);
 
     bcache_release(flags); /* write_blocks may yield — lock dropped, slots BUSY */
-    int wr = wdev->write_blocks(wdev, base, (u32)run, tmp);
+    int wr = blk_dev_write(wdev, base, (u32)run, tmp);
     kfree(tmp);
     flags = bcache_acquire();
 
@@ -824,7 +988,7 @@ int blk_write_cached(struct block_device *dev, u64 lba, u32 count,
     return -1;
   }
   if (dev->block_size != CACHE_BLOCK_SIZE) {
-    return dev->write_blocks(dev, lba, count, buffer);
+    return blk_dev_write(dev, lba, count, buffer);
   }
 
   const u8 *buf8 = (const u8 *)buffer;
@@ -1010,7 +1174,7 @@ static isize blkdev_node_read(struct vfs_node *node, u64 offset, char *buffer,
         u32 chunk = nblk - done;
         if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
         /* read_blocks returns the sector count (>=0) on success, <0 on error. */
-        if (dev->read_blocks(dev, first + done, chunk,
+        if (blk_dev_read(dev, first + done, chunk,
                              bulk + (usize)done * bs) < 0) { ok = 0; break; }
         done += chunk;
       }
@@ -1068,7 +1232,7 @@ static isize blkdev_node_write(struct vfs_node *node, u64 offset,
         u32 chunk = nblk - done;
         if (chunk > BLK_BULK_MAX_BLOCKS) chunk = BLK_BULK_MAX_BLOCKS;
         /* write_blocks returns the sector count (>=0) on success, <0 on error. */
-        if (dev->write_blocks(dev, first + done, chunk,
+        if (blk_dev_write(dev, first + done, chunk,
                               bulk + (usize)done * bs) < 0) { ok = 0; break; }
         done += chunk;
       }

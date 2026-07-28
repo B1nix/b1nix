@@ -226,6 +226,8 @@ isize vfs_readdir_children(struct vfs_node *dir, usize offset,
 /* Permission-aware operations */
 int vfs_open(const char *path);
 int vfs_open_flags(const char *path, int flags);
+/* open(2) with O_CREAT: `mode` is the requested permission, masked by umask. */
+int vfs_open_flags_mode(const char *path, int flags, u16 mode);
 isize vfs_read(int handle, char *buffer, usize size);
 isize vfs_write(int handle, const char *buffer, usize size);
 /* Positioned I/O: read/write at `offset` without touching the fd's own offset

@@ -36,7 +36,39 @@ struct cred {
     u16  groups[MAX_GROUPS]; /* Supplementary groups */
     int  ngroups;
     u16  umask;
+    /* Filesystem IDs. POSIX checks file access against these rather than the
+     * effective IDs; they track euid/egid unless setfsuid(2)/setfsgid(2) moves
+     * them, which is how a server drops filesystem privilege for one operation
+     * while keeping the effective ID it needs for signals. */
+    u16  fsuid;
+    u16  fsgid;
+    /* Capability sets. A root task starts with everything; a task can drop
+     * capabilities it holds (capset), and dropping one is irreversible without
+     * CAP_SETPCAP. Bit N corresponds to CAP_* value N. */
+    u64  cap_effective;
+    u64  cap_permitted;
+    u64  cap_inheritable;
+    /* Bounding set: the ceiling a task can ever hold. capset(2) lowers it and
+     * nothing raises it, so a dropped capability stays dropped even across a
+     * return to euid 0 (which otherwise re-grants the full set). */
+    u64  cap_bounding;
 };
+
+/* Every capability b1nix defines (CAP_CHOWN..CAP_AUDIT_CONTROL and the few
+ * above them) — the set a root task holds. */
+#define CAP_LAST 36
+#define CAP_FULL_SET ((CAP_LAST >= 63) ? ~0ULL : ((1ULL << (CAP_LAST + 1)) - 1))
+
+/* Recompute the capability sets after a UID change: a root task holds
+ * everything within its bounding set, a non-root task holds nothing. */
+void cred_refresh_caps(struct cred *cred);
+/* Keep fsuid/fsgid in step with euid/egid (the default POSIX behaviour). */
+void cred_sync_fsids(struct cred *cred);
+/* setfsuid(2)/setfsgid(2): return the PREVIOUS value, changed or not. */
+u16 cred_set_fsuid(struct cred *cred, u16 fsuid);
+u16 cred_set_fsgid(struct cred *cred, u16 fsgid);
+/* capset(2): install the three sets, bounded by what the task already holds. */
+int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh);
 
 /* ── Ring / Privilege level ── */
 enum ring_level {

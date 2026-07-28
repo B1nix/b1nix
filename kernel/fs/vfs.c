@@ -856,7 +856,9 @@ int vfs_get_node_perm(const struct vfs_node *node, const struct cred *cred,
   if (!node || !node->inode || !cred)
     return 0;
   struct vfs_inode *inode = node->inode;
-  if (cred->euid == ROOT_UID)
+  /* Filesystem access is judged by fsuid, which mirrors euid unless
+   * setfsuid(2) moved it. */
+  if (cred->fsuid == ROOT_UID)
     return 1;
   if (cred_has_cap(cred, CAP_DAC_OVERRIDE))
     return 1;
@@ -2313,6 +2315,11 @@ void vfs_repopulate_after_root_mount(void) {
 int vfs_open(const char *path) { return vfs_open_flags(path, B1NIX_O_RDONLY); }
 
 int vfs_open_flags(const char *path, int flags) {
+  /* No mode given: the historical 0666 default, still masked by the umask. */
+  return vfs_open_flags_mode(path, flags, 0666);
+}
+
+int vfs_open_flags_mode(const char *path, int flags, u16 mode) {
   int res = 0;
   if (!path)
     return -EINVAL;
@@ -2467,7 +2474,14 @@ int vfs_open_flags(const char *path, int flags) {
   if (IS_ERR(node)) {
     if (PTR_ERR(node) == -ENOENT && (flags & B1NIX_O_CREAT)) {
       /* Use internal version to avoid redundant resolution/logging */
-      int err = vfs_create_at_internal(resolved, 0666);
+      /* open(2) with O_CREAT: the file is created with the caller's mode,
+       * masked by its umask — ignoring the mode left every new file
+       * world-readable (and made setfsuid/permission tests meaningless). */
+      const struct cred *ocred = get_current_cred();
+      u16 create_mode = (u16)(mode & 07777);
+      if (ocred)
+        create_mode &= (u16)~ocred->umask;
+      int err = vfs_create_at_internal(resolved, create_mode);
       if (err != 0) {
         res = err;
         goto out;
@@ -4979,7 +4993,7 @@ static int vfs_chown_common(const char *path, u16 uid, u16 gid, int nofollow) {
   }
 
   /* Only root can change owner */
-  if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_CHOWN)) {
+  if (!cred_has_cap(cred, CAP_CHOWN)) {
     res = -EPERM;
     goto out;
   }
@@ -5255,7 +5269,7 @@ int vfs_fchown(int fd, u16 uid, u16 gid) {
   if (!cred)
     return -EACCES;
 
-  if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_CHOWN))
+  if (!cred_has_cap(cred, CAP_CHOWN))
     return -EPERM;
 
   if (uid != (u16)-1)

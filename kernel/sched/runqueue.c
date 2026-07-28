@@ -145,6 +145,12 @@ struct task *sched_steal_task(void) {
         if (!t)
             continue;
 
+        struct percpu *self_pcpu = get_percpu();
+        if (self_pcpu && !sched_task_allowed_on_cpu(t, self_pcpu->cpu_id)) {
+          /* Pinned away from this CPU by sched_setaffinity — put it back. */
+          rq_enqueue(&victim->runqueue, t);
+          continue;
+        }
         if (t->state == TASK_READY && t->stealable) {
             /* Successfully stolen — caller will run it on this CPU */
             return t;

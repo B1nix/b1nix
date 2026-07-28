@@ -138,6 +138,12 @@ struct cred *cred_create_default(void)
     c->sgid = ROOT_GID;
     c->ngroups = 0;
     c->umask = 0022;
+    c->fsuid = ROOT_UID;
+    c->fsgid = ROOT_GID;
+    c->cap_bounding = CAP_FULL_SET;
+    c->cap_effective = CAP_FULL_SET;
+    c->cap_permitted = CAP_FULL_SET;
+    c->cap_inheritable = 0;
 
     return c;
 }
@@ -172,18 +178,22 @@ int cred_set_uid(struct cred *cred, u16 uid)
         cred->euid = uid;
         cred->suid = uid;
     }
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
 int cred_set_euid(struct cred *cred, u16 euid)
 {
     if (!cred) return -1;
-    if (cred->euid != ROOT_UID && !cred_has_cap(cred, CAP_SETUID)) {
+    if (!cred_has_cap(cred, CAP_SETUID)) {
         if (euid != cred->uid && euid != cred->suid && euid != cred->euid) {
             return -1;
         }
     }
     cred->euid = euid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -201,6 +211,8 @@ int cred_set_gid(struct cred *cred, u16 gid)
         cred->egid = gid;
         cred->sgid = gid;
     }
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -224,6 +236,8 @@ int cred_setreuid(struct cred *cred, int ruid, int euid)
     if (euid != -1) cred->euid = (u16)euid;
     if (ruid != -1 || (euid != -1 && (u16)euid != old_uid))
         cred->suid = cred->euid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -244,6 +258,8 @@ int cred_setregid(struct cred *cred, int rgid, int egid)
     if (egid != -1) cred->egid = (u16)egid;
     if (rgid != -1 || (egid != -1 && (u16)egid != old_gid))
         cred->sgid = cred->egid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -262,6 +278,8 @@ int cred_setresuid(struct cred *cred, int ruid, int euid, int suid)
     if (ruid != -1) cred->uid = (u16)ruid;
     if (euid != -1) cred->euid = (u16)euid;
     if (suid != -1) cred->suid = (u16)suid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -280,6 +298,8 @@ int cred_setresgid(struct cred *cred, int rgid, int egid, int sgid)
     if (rgid != -1) cred->gid = (u16)rgid;
     if (egid != -1) cred->egid = (u16)egid;
     if (sgid != -1) cred->sgid = (u16)sgid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -293,6 +313,8 @@ int cred_set_egid(struct cred *cred, u16 egid)
         }
     }
     cred->egid = egid;
+    cred_refresh_caps(cred);
+    cred_sync_fsids(cred);
     return 0;
 }
 
@@ -302,16 +324,17 @@ int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 fil
 {
     if (!cred) return 0;
 
-    /* Root can access everything */
-    if (cred->euid == ROOT_UID) return 1;
+    /* Filesystem access is checked against fsuid/fsgid, which normally mirror
+     * euid/egid (see cred_sync_fsids). */
+    if (cred->fsuid == ROOT_UID) return 1;
 
     u16 perms = 0;
     /* Check owner permissions */
-    if (cred->euid == file_uid) {
+    if (cred->fsuid == file_uid) {
         perms = (file_mode >> 6) & 7;
     }
     /* Check group permissions */
-    else if (cred->egid == file_gid) {
+    else if (cred->fsgid == file_gid) {
         perms = (file_mode >> 3) & 7;
     }
     /* Check supplementary groups */
@@ -334,21 +357,96 @@ int cred_can_access(const struct cred *cred, u16 file_uid, u16 file_gid, u16 fil
     return (perms & access_mask) == access_mask;
 }
 
+
+void cred_refresh_caps(struct cred *cred)
+{
+    if (!cred) return;
+    u64 want = (cred->euid == ROOT_UID) ? CAP_FULL_SET : 0;
+    cred->cap_permitted = want & cred->cap_bounding;
+    cred->cap_effective = cred->cap_permitted;
+    cred->cap_inheritable &= cred->cap_bounding;
+}
+
+void cred_sync_fsids(struct cred *cred)
+{
+    if (!cred) return;
+    cred->fsuid = cred->euid;
+    cred->fsgid = cred->egid;
+}
+
+/* Capabilities that only matter for file access. Linux clears these when fsuid
+ * moves away from 0 and restores them when it comes back, so a server that
+ * lowers fsuid for one operation really loses the ability to override file
+ * permissions during it. */
+#define CAP_FS_MASK ((1ULL << CAP_CHOWN) | (1ULL << CAP_DAC_OVERRIDE) | \
+                     (1ULL << CAP_DAC_READ_SEARCH) | (1ULL << CAP_FOWNER) | \
+                     (1ULL << CAP_FSETID) | (1ULL << CAP_MKNOD))
+
+u16 cred_set_fsuid(struct cred *cred, u16 fsuid)
+{
+    if (!cred) return 0;
+    u16 prev = cred->fsuid;
+    /* A task may set fsuid to any of its own UIDs, or to anything at all with
+     * CAP_SETUID. An unpermitted value leaves fsuid unchanged — and, as Linux
+     * documents, is reported only by the returned previous value. */
+    if (fsuid == cred->uid || fsuid == cred->euid || fsuid == cred->suid ||
+        fsuid == cred->fsuid || cred_has_cap(cred, CAP_SETUID))
+        cred->fsuid = fsuid;
+    if (prev == ROOT_UID && cred->fsuid != ROOT_UID) {
+        cred->cap_effective &= ~CAP_FS_MASK;
+        cred->cap_permitted &= ~CAP_FS_MASK;
+    } else if (prev != ROOT_UID && cred->fsuid == ROOT_UID) {
+        u64 restore = CAP_FS_MASK & cred->cap_bounding &
+                      ((cred->euid == ROOT_UID) ? CAP_FULL_SET : 0);
+        cred->cap_permitted |= restore;
+        cred->cap_effective |= restore;
+    }
+    return prev;
+}
+
+u16 cred_set_fsgid(struct cred *cred, u16 fsgid)
+{
+    if (!cred) return 0;
+    u16 prev = cred->fsgid;
+    if (fsgid == cred->gid || fsgid == cred->egid || fsgid == cred->sgid ||
+        fsgid == cred->fsgid || cred_has_cap(cred, CAP_SETGID))
+        cred->fsgid = fsgid;
+    return prev;
+}
+
+int cred_capset(struct cred *cred, u64 eff, u64 perm, u64 inh)
+{
+    if (!cred) return -1;
+    /* Capabilities can only be given up: the new permitted set must be a
+     * subset of the old one, and effective a subset of permitted. */
+    if (perm & ~cred->cap_permitted) return -1;
+    if (eff & ~perm) return -1;
+    if (inh & ~(cred->cap_inheritable | cred->cap_permitted)) return -1;
+    cred->cap_permitted = perm;
+    cred->cap_effective = eff;
+    cred->cap_inheritable = inh;
+    /* Lowering the bounding set is what makes the drop stick across a later
+     * return to euid 0. */
+    cred->cap_bounding &= perm;
+    return 0;
+}
+
 /* ── Capabilities ── */
 
+/* A capability is held when it is in the PERMITTED set. Root's cred starts
+ * with the full set, so the historical "euid == 0 means everything" behaviour
+ * still holds — but a task can now drop capabilities and the kernel honours
+ * the reduced set, which is what makes capset(2) meaningful. */
 int cred_has_cap(const struct cred *cred, int cap)
 {
-    (void)cap;
     if (!cred) return 0;
-    /* Root (euid == 0) implicitly has all capabilities */
-    if (cred->euid == ROOT_UID) return 1;
-    return 0;
+    if (cap < 0 || cap > CAP_LAST) return 0;
+    return (cred->cap_permitted & (1ULL << cap)) != 0;
 }
 
 int cred_has_cap_effective(const struct cred *cred, int cap)
 {
-    (void)cap;
     if (!cred) return 0;
-    if (cred->euid == ROOT_UID) return 1;
-    return 0;
+    if (cap < 0 || cap > CAP_LAST) return 0;
+    return (cred->cap_effective & (1ULL << cap)) != 0;
 }

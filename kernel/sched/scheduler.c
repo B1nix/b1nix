@@ -609,6 +609,10 @@ static struct task *pick_next_task(void) {
         break;
       if (t->stealable)
         continue;
+      /* sched_setaffinity: this CPU may not be allowed to run the task. Drop
+       * the rq entry; the scan below (on a permitted CPU) still finds it. */
+      if (pcpu && !sched_task_allowed_on_cpu(t, pcpu->cpu_id))
+        continue;
       /* M28 T4: spin until the outgoing CPU's arch_context_switch publishes
        * stack_released==1. Without this, we could load a saved RSP that is
        * still being written to as a callee-save spill area by the other
@@ -698,6 +702,8 @@ static struct task *pick_next_task(void) {
       continue;
     if (on_ap && !T(index)->ap_runnable)
       continue; /* APs run only userspace ELF processes */
+    if (pcpu && !sched_task_allowed_on_cpu(T(index), pcpu->cpu_id))
+      continue; /* pinned elsewhere by sched_setaffinity */
 
     int priority = T(index)->priority;
     u64 pass = g_task_pass[index];
@@ -1136,6 +1142,8 @@ extern void x86_fork_child_trampoline(void);
 
 static void scheduler_root_inherit(struct task *child, struct task *parent);
 static void scheduler_root_clear(struct task *t);
+/* Defined with the other sched_setaffinity state below; fork needs it here. */
+static u64 g_task_affinity[MAX_TASKS];
 
 int scheduler_fork_current(void) {
   struct task *parent = current_task;
@@ -1204,6 +1212,8 @@ int scheduler_fork_current(void) {
   rseq_fork_clear(child);
   /* A chroot IS inherited — the child stays inside the parent's root. */
   scheduler_root_inherit(child, parent);
+  /* So is the CPU affinity mask (Linux inherits it across fork and exec). */
+  g_task_affinity[task_index(child)] = g_task_affinity[task_index(parent)];
   child->pending_signals = 0;
   child->blocked_signals = parent->blocked_signals;
   child->last_stop_signal = 0;
@@ -1620,6 +1630,35 @@ u64 task_cstime(const struct task *t) {
 }
 usize scheduler_max_tasks(void) { return MAX_TASKS; }
 
+/* Post a signal WITHOUT the stop/continue side effects scheduler_kill applies.
+ * ptrace uses this for SIGSTOP: forcing TASK_STOPPED on a task that is running
+ * on another CPU parks it before its context has been saved, and the next
+ * picker then resumes from a half-written frame. Leaving the signal pending
+ * lets the tracee stop itself on its next return to ring 3, which is where its
+ * registers are complete — the same thing Linux does. */
+int scheduler_post_signal(usize pid, int sig) {
+  if (sig <= 0 || sig > NSIG)
+    return -EINVAL;
+  u64 flags = interrupts_save();
+  for (usize i = 0; i < g_task_hwm; i++) {
+    if (T(i)->id != pid || T(i)->state == TASK_UNUSED ||
+        T(i)->state == TASK_DEAD || T(i)->state == TASK_REAPING)
+      continue;
+    __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
+                      __ATOMIC_RELEASE);
+    /* A blocked task must run to notice it; a running one will see it on its
+     * next return to userspace. */
+    enum task_state expected = TASK_BLOCKED;
+    if (__atomic_compare_exchange_n(&T(i)->state, &expected, TASK_READY, 0,
+                                    __ATOMIC_ACQUIRE, __ATOMIC_RELAXED))
+      sched_rq_enqueue_current(T(i));
+    interrupts_restore(flags);
+    return 0;
+  }
+  interrupts_restore(flags);
+  return -ESRCH;
+}
+
 /* ── ioprio(2) ───────────────────────────────────────────────────────────────
  * Per-task I/O scheduling class + level. b1nix issues block requests
  * synchronously (kernel/dev/blk.c has no reordering elevator), so the value is
@@ -1641,6 +1680,47 @@ int scheduler_get_ioprio(usize pid) {
   if (!t)
     return -ESRCH;
   return (int)g_task_ioprio[task_index(t)];
+}
+
+/* ── sched_setaffinity(2) ────────────────────────────────────────────────────
+ * A per-task CPU mask, honoured by every path that can put a task on a CPU:
+ * the global-runqueue pick, the O(n) scan, and work stealing. 0 means "no
+ * restriction", which is the default and costs a single compare. */
+int sched_task_allowed_on_cpu(const struct task *t, int cpu) {
+  if (!t || cpu < 0 || cpu > 63)
+    return 1;
+  u64 mask = g_task_affinity[task_index(t)];
+  return mask == 0 || (mask & (1ULL << cpu)) != 0;
+}
+
+int scheduler_set_affinity(usize pid, u64 mask) {
+  struct task *t = pid ? scheduler_task_by_pid(pid) : current_task;
+  if (!t)
+    return -ESRCH;
+  extern int get_online_cpu_count(void);
+  int online = get_online_cpu_count();
+  if (online < 1)
+    online = 1;
+  u64 online_mask = (online >= 64) ? ~0ULL : ((1ULL << online) - 1);
+  /* A mask that permits no online CPU would make the task unschedulable. */
+  if ((mask & online_mask) == 0)
+    return -EINVAL;
+  g_task_affinity[task_index(t)] = mask & online_mask;
+  return 0;
+}
+
+u64 scheduler_get_affinity(usize pid) {
+  struct task *t = pid ? scheduler_task_by_pid(pid) : current_task;
+  if (!t)
+    return 0;
+  u64 mask = g_task_affinity[task_index(t)];
+  if (mask)
+    return mask;
+  extern int get_online_cpu_count(void);
+  int online = get_online_cpu_count();
+  if (online < 1)
+    online = 1;
+  return (online >= 64) ? ~0ULL : ((1ULL << online) - 1);
 }
 
 /* ── chroot(2) ───────────────────────────────────────────────────────────────
@@ -3135,6 +3215,7 @@ void scheduler_exit_current(int exit_code) {
    * process that dies holding a semaphore does not wedge the set forever. */
   sysv_sem_task_cleanup(current_task->id);
   ptrace_task_cleanup(current_task); /* drop tracer/tracee links */
+  g_task_affinity[task_index(current_task)] = 0;
   scheduler_root_clear(current_task); /* release a chroot's root reference */
 
   current_task->exit_code = exit_code;
@@ -3233,8 +3314,14 @@ int scheduler_waitpid(usize pid, int *status, int options) {
 
     int has_children = 0;
     for (usize i = 0; i < g_task_hwm; i++) {
-      if (T(i)->state != TASK_UNUSED &&
-          T(i)->parent_id == current_task->id) {
+      /* ptrace(2): a tracer waits for its tracee's stops even when it is not
+       * the tracee's parent — without that it could attach but never drive it.
+       * Exit status still belongs to the real parent (see the reap path
+       * below), so a tracer only ever consumes stop reports. */
+      int is_child = (T(i)->parent_id == current_task->id);
+      int is_tracee = !is_child &&
+                      ptrace_tracer_pid(T(i)) == current_task->id;
+      if (T(i)->state != TASK_UNUSED && (is_child || is_tracee)) {
         int match;
         if (wait_any)
           match = 1;
@@ -3255,7 +3342,8 @@ int scheduler_waitpid(usize pid, int *status, int options) {
            * only written by fork (publication before the child runs) and is
            * never overwritten thereafter, so a torn read here is impossible. */
           enum task_state _expected = TASK_DEAD;
-          if (__atomic_compare_exchange_n(&T(i)->state, &_expected,
+          if (is_child &&
+              __atomic_compare_exchange_n(&T(i)->state, &_expected,
                                           TASK_REAPING, 0,
                                           __ATOMIC_ACQUIRE,
                                           __ATOMIC_RELAXED)) {
@@ -4075,7 +4163,7 @@ int scheduler_kill(usize task_id, int sig) {
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
 
-      if (T(i) != current_task &&
+      if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
           (sig == SIGSTOP || sig == SIGTSTP ||
            sig == SIGTTIN || sig == SIGTTOU)) {
         __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
@@ -4391,7 +4479,7 @@ int scheduler_kill_process_group(usize pgrp, int sig) {
       __atomic_fetch_or(&T(i)->pending_signals, (1ULL << (sig - 1)),
                         __ATOMIC_RELEASE);
 
-      if (T(i) != current_task &&
+      if (T(i) != current_task && !ptrace_is_traced(T(i)) &&
           (sig == SIGSTOP || sig == SIGTSTP ||
            sig == SIGTTIN || sig == SIGTTOU)) {
         __atomic_fetch_and(&T(i)->pending_signals, ~(1ULL << (sig - 1)),
@@ -5007,6 +5095,13 @@ void scheduler_deliver_pending_signals(void) {
       case SIGTSTP:
       case SIGTTIN:
       case SIGTTOU:
+        /* A traced task must stop through ptrace instead, on its next return
+         * to ring 3 — that is the only point where its register frame exists
+         * for the tracer to read, and stopping it here (possibly mid-exit,
+         * with no frame) leaves it parked in a state nothing resumes. Leave
+         * the signal pending; the return-to-user path picks it up. */
+        if (ptrace_is_traced(current_task))
+          continue;
         current_task->state = TASK_STOPPED;
         current_task->last_stop_signal = sig;
         current_task->stop_report_pending = 1;

@@ -3708,9 +3708,15 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * unchanged, so a musl open(path, O_WRONLY|O_NONBLOCK) silently became a
        * blocking open with FD_CLOEXEC. Route it through the same whitelist the
        * openat shim uses. */
-      if (number == 2)
-        return (u64)sys_open((const char *)(usize)arg0,
-                             linux_open_flags_to_b1nix((int)arg1));
+      if (number == 2) {
+        char kp[VFS_MAX_PATH], rp[VFS_MAX_PATH];
+        int cs = syscall_copyinstr(kp, sizeof(kp), (const char *)(usize)arg0);
+        if (cs < 0)
+          return (u64)(isize)cs; /* keep ENAMETOOLONG distinct from EFAULT */
+        vfs_resolve_path(kp, rp);
+        return (u64)vfs_open_flags_mode(rp, linux_open_flags_to_b1nix((int)arg1),
+                                        (u16)arg2);
+      }
       if (number == LINUX_NR_RT_SIGPROCMASK)
         return (u64)sys_linux_rt_sigprocmask((int)arg0, arg1, arg2);
       /* rt_sigtimedwait(128): the set uses Linux signal numbering, and the
@@ -4135,8 +4141,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         switch (number) {
         case LX_openat: {
           /* arg0=dirfd, arg1=path, arg2=flags, arg3=mode. */
-          return (u64)vfs_open_flags(resolved,
-                                     linux_open_flags_to_b1nix((int)arg2));
+          return (u64)vfs_open_flags_mode(
+              resolved, linux_open_flags_to_b1nix((int)arg2), (u16)arg3);
         }
         case LX_newfstatat: {
           /* arg0=dirfd, arg1=path, arg2=statbuf, arg3=flags.
@@ -4818,9 +4824,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * O_WRONLY also runs the write-permission check truncate(2) requires. */
       if (number == 76) {
         char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
-        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
-            0)
-          return (u64)-EFAULT;
+        int cs = syscall_copyinstr(kpath, sizeof(kpath),
+                                   (const char *)(usize)arg0);
+        if (cs < 0)
+          return (u64)(isize)cs; /* ENAMETOOLONG must not become EFAULT */
         vfs_resolve_path(kpath, resolved);
         int fd = vfs_open_flags(resolved, B1NIX_O_WRONLY);
         if (fd < 0)
@@ -4830,24 +4837,26 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return (u64)rc;
       }
 
-      /* creat(85) == open(path, O_CREAT|O_WRONLY|O_TRUNC). The mode argument
-       * follows the b1nix create default (umask applied by the VFS). */
+      /* creat(85) == open(path, O_CREAT|O_WRONLY|O_TRUNC, mode). */
       if (number == 85) {
         char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
-        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
-            0)
-          return (u64)-EFAULT;
+        int cs = syscall_copyinstr(kpath, sizeof(kpath),
+                                   (const char *)(usize)arg0);
+        if (cs < 0)
+          return (u64)(isize)cs; /* ENAMETOOLONG must not become EFAULT */
         vfs_resolve_path(kpath, resolved);
-        return (u64)vfs_open_flags(
-            resolved, B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC);
+        return (u64)vfs_open_flags_mode(
+            resolved, B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC,
+            (u16)arg1);
       }
 
       /* lchown(94): change a symlink's own ownership. */
       if (number == 94) {
         char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
-        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
-            0)
-          return (u64)-EFAULT;
+        int cs = syscall_copyinstr(kpath, sizeof(kpath),
+                                   (const char *)(usize)arg0);
+        if (cs < 0)
+          return (u64)(isize)cs; /* ENAMETOOLONG must not become EFAULT */
         vfs_resolve_path(kpath, resolved);
         return (u64)vfs_lchown(resolved, (u16)arg1, (u16)arg2);
       }
@@ -4902,7 +4911,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if ((int)arg0 != 0)
           return (u64)-EINVAL;
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_TIME)))
+        if (!c || (!cred_has_cap(c, CAP_SYS_TIME)))
           return (u64)-EPERM;
         struct timespec ts;
         if (!arg1 ||
@@ -4964,22 +4973,22 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         return 0;
       }
 
-      /* setfsuid(122)/setfsgid(123): b1nix checks filesystem access against the
-       * EFFECTIVE id and has no separate fsuid, so the only value that can be
-       * installed is the current one. Linux returns the PREVIOUS fsuid whether
-       * or not the change took, so a caller that re-reads the result (the
-       * documented way to detect failure) sees the truth. */
+      /* setfsuid(122)/setfsgid(123): the filesystem ids the VFS checks against
+       * (kernel/sched/uidgid.c cred_can_access). Both return the PREVIOUS
+       * value whether or not the change was permitted, which is the documented
+       * way for a caller to find out. */
       if (number == 122 || number == 123) {
         struct cred *c = scheduler_get_current_cred();
         if (!c)
           return (u64)-EINVAL;
-        return (u64)(number == 122 ? c->euid : c->egid);
+        return (u64)(number == 122 ? cred_set_fsuid(c, (u16)arg0)
+                                   : cred_set_fsgid(c, (u16)arg0));
       }
 
-      /* capget(125)/capset(126): b1nix derives every capability from euid == 0
-       * (kernel/sched/uidgid.c), so report the full set for root and the empty
-       * set otherwise, and accept only a capset that asks for exactly that
-       * rather than silently dropping a request to gain privilege. */
+      /* capget(125)/capset(126): the task's real capability sets. A root task
+       * starts with everything; capset can only give capabilities up, and a
+       * dropped one stays dropped (it leaves the bounding set) even if the
+       * task later returns to euid 0. */
       if (number == 125 || number == 126) {
         struct cred *c = scheduler_get_current_cred();
         if (!c)
@@ -4995,11 +5004,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
             (hdr.version == 0x19980330u) ? 3 : 6; /* 3 u32 per data struct */
         if (hdr.pid != 0 && (usize)hdr.pid != scheduler_get_pid())
           return (u64)-EPERM;
-        u32 all = (c->euid == ROOT_UID) ? 0xffffffffu : 0u;
+        /* struct __user_cap_data_struct is {effective, permitted, inheritable}
+         * of 32 bits each; the v3 header carries two of them, holding the low
+         * and high halves of the 64-bit sets. */
         if (number == 125) {
           if (!arg1)
             return 0; /* version probe: the header is all the caller wanted */
-          u32 data[6] = {all, all, all, all, all, all};
+          u32 data[6];
+          data[0] = (u32)c->cap_effective;
+          data[1] = (u32)c->cap_permitted;
+          data[2] = (u32)c->cap_inheritable;
+          data[3] = (u32)(c->cap_effective >> 32);
+          data[4] = (u32)(c->cap_permitted >> 32);
+          data[5] = (u32)(c->cap_inheritable >> 32);
           return syscall_copyout((void *)(usize)arg1, data,
                                  nwords * sizeof(u32)) == 0
                      ? 0
@@ -5011,16 +5028,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         if (syscall_copyin(want, (const void *)(usize)arg1,
                            nwords * sizeof(u32)) != 0)
           return (u64)-EFAULT;
-        for (usize i = 0; i < nwords; i++)
-          if (want[i] & ~all)
-            return (u64)-EPERM;
-        return 0;
+        u64 eff = want[0], perm = want[1], inh = want[2];
+        if (nwords == 6) {
+          eff |= (u64)want[3] << 32;
+          perm |= (u64)want[4] << 32;
+          inh |= (u64)want[5] << 32;
+        }
+        return cred_capset(c, eff, perm, inh) == 0 ? 0 : (u64)-EPERM;
       }
 
       /* sethostname(170) / setdomainname(171). */
       if (number == 170 || number == 171) {
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN)))
+        if (!c || (!cred_has_cap(c, CAP_SYS_ADMIN)))
           return (u64)-EPERM;
         if (!arg0)
           return (u64)-EFAULT;
@@ -5120,12 +5140,11 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
                    ? 0
                    : (u64)-EFAULT;
       }
-      /* sched_setaffinity(203): the scheduler does not pin userspace tasks, so
-       * accept a mask that permits every online CPU and reject one that would
-       * genuinely constrain placement — reporting success for a constraint we
-       * do not enforce would be a lie the caller cannot detect. */
+      /* sched_setaffinity(203)(pid, cpusetsize, mask): a real restriction. The
+       * mask is stored per task and every path that can place a task on a CPU
+       * — the global-runqueue pick, the scan, and work stealing — honours it
+       * (kernel/sched/scheduler.c, runqueue.c). */
       if (number == 203) {
-        extern int get_online_cpu_count(void);
         usize sz = (usize)arg1;
         if (!arg2 || sz == 0)
           return (u64)-EINVAL;
@@ -5134,13 +5153,10 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         memset(kmask, 0, sizeof(kmask));
         if (syscall_copyin(kmask, (const void *)(usize)arg2, n) != 0)
           return (u64)-EFAULT;
-        int online = get_online_cpu_count();
-        if (online < 1)
-          online = 1;
-        for (int cpu = 0; cpu < online; cpu++)
-          if ((usize)(cpu / 8) >= n || !(kmask[cpu / 8] & (1u << (cpu % 8))))
-            return (u64)-EINVAL;
-        return 0;
+        u64 mask = 0;
+        for (usize b = 0; b < n && b < 8; b++)
+          mask |= (u64)kmask[b] << (b * 8);
+        return (u64)(isize)scheduler_set_affinity((usize)arg0, mask);
       }
 
       /* fsetxattr(190)/fgetxattr(193)/flistxattr(196)/fremovexattr(199): the
@@ -5271,12 +5287,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * reference for as long as a task (or a fork child) names it. */
       if (number == 161) {
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_CHROOT)))
+        if (!c || (!cred_has_cap(c, CAP_SYS_CHROOT)))
           return (u64)-EPERM;
         char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
-        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
-            0)
-          return (u64)-EFAULT;
+        int cs = syscall_copyinstr(kpath, sizeof(kpath),
+                                   (const char *)(usize)arg0);
+        if (cs < 0)
+          return (u64)(isize)cs; /* ENAMETOOLONG must not become EFAULT */
         vfs_resolve_path(kpath, resolved);
         struct vfs_node *n = vfs_find_node(resolved);
         if (!n || IS_ERR(n))
@@ -5285,13 +5302,35 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           vfs_node_put(n);
           return (u64)-ENOTDIR;
         }
+        /* The working directory is kept when it lies inside the new root —
+         * rewritten to the root-relative form, because every later lookup
+         * resolves from the new root. A cwd outside the new root can no longer
+         * be named at all, so it moves to "/" (POSIX leaves that case
+         * unspecified; silently resolving the old string under the new root
+         * would point at a different directory). */
+        const char *cwd = scheduler_get_cwd();
+        char newcwd[VFS_MAX_PATH];
+        usize rlen = strlen(resolved);
+        if (rlen == 1 && resolved[0] == '/') {
+          strncpy(newcwd, cwd, sizeof(newcwd) - 1);
+          newcwd[sizeof(newcwd) - 1] = '\0';
+        } else if (strncmp(cwd, resolved, rlen) == 0 &&
+                   (cwd[rlen] == '/' || cwd[rlen] == '\0')) {
+          if (cwd[rlen] == '\0') {
+            newcwd[0] = '/';
+            newcwd[1] = '\0';
+          } else {
+            strncpy(newcwd, cwd + rlen, sizeof(newcwd) - 1);
+            newcwd[sizeof(newcwd) - 1] = '\0';
+          }
+        } else {
+          newcwd[0] = '/';
+          newcwd[1] = '\0';
+        }
         /* The stored root path is relative to the PREVIOUS root, which is what
-         * a nested chroot needs; the cwd moves to the new root because a cwd
-         * outside it could no longer be named (POSIX leaves this unspecified,
-         * and silently resolving the old cwd string under the new root would
-         * be worse than moving it). */
+         * a nested chroot needs. */
         scheduler_set_root(n, resolved); /* takes the reference */
-        scheduler_set_cwd("/");
+        scheduler_set_cwd(newcwd);
         return 0;
       }
 
@@ -5301,7 +5340,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
        * first and refuses (EBUSY) if anything is still out there. */
       if (number == 167 || number == 168) {
         struct cred *c = scheduler_get_current_cred();
-        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN)))
+        if (!c || (!cred_has_cap(c, CAP_SYS_ADMIN)))
           return (u64)-EPERM;
         char kpath[VFS_MAX_PATH];
         if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
@@ -6048,7 +6087,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     klog_info("audit: setgroups called");
     struct cred *c = scheduler_get_current_cred();
     if (!c) return (u64)-EACCES;
-    if (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SETGID)) {
+    if (!cred_has_cap(c, CAP_SETGID)) {
       return (u64)-EPERM;
     }
     usize size = (usize)arg0;
@@ -6726,7 +6765,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
      * root may step the clock (POSIX EPERM otherwise). Backed by the RTC time
      * offset so every subsequent time read reflects the new value. */
     struct cred *c = scheduler_get_current_cred();
-    if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_TIME)))
+    if (!c || (!cred_has_cap(c, CAP_SYS_TIME)))
       return (u64)-EPERM;
     if (!arg0) return (u64)-EFAULT;
     struct timeval tv;
@@ -6738,21 +6777,19 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
     return 0;
   }
   case SYS_SCHED_GETAFFINITY: {
-    /* sched_getaffinity(pid, cpusetsize, mask). b1nix does not pin userspace
-     * tasks to CPUs, so every task may run on any online CPU — report the set
-     * of online CPUs (bits 0..online-1). Returns the number of bytes written,
-     * matching the Linux raw-syscall convention. */
-    extern int get_online_cpu_count(void);
+    /* sched_getaffinity(pid, cpusetsize, mask): the task's actual mask — the
+     * set sched_setaffinity installed, or every online CPU when it never did.
+     * Returns the number of bytes written, matching the raw-syscall
+     * convention. */
     usize cpusetsize = (usize)arg1;
     void *umask = (void *)(usize)arg2;
     if (!umask || cpusetsize == 0) return (u64)-EINVAL;
-    int online = get_online_cpu_count();
-    if (online < 1) online = 1;
+    u64 mask = scheduler_get_affinity((usize)arg0);
     u8 kmask[128];
     usize n = cpusetsize < sizeof(kmask) ? cpusetsize : sizeof(kmask);
     memset(kmask, 0, n);
-    for (int c = 0; c < online && (usize)(c / 8) < n; c++)
-      kmask[c / 8] |= (u8)(1u << (c % 8));
+    for (usize b = 0; b < n && b < 8; b++)
+      kmask[b] = (u8)(mask >> (b * 8));
     if (syscall_copyout(umask, kmask, n) != 0) return (u64)-EFAULT;
     return (u64)n;
   }

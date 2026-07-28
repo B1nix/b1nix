@@ -23,6 +23,7 @@
 #include <b1nix/mm.h>
 #include <b1nix/ptrace.h>
 #include <b1nix/sched.h>
+#include <b1nix/uidgid.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/syscall.h>
 #include <string.h>
@@ -63,6 +64,17 @@ static struct ptrace_link *link_alloc(struct task *t, usize tracer_pid) {
     return &g_links[i];
   }
   return 0;
+}
+
+usize ptrace_tracer_pid(struct task *t) {
+  if (!t)
+    return 0;
+  u64 flags;
+  spin_lock_irqsave(&g_ptrace_lock, &flags);
+  struct ptrace_link *l = link_of(t);
+  usize pid = l ? l->tracer_pid : 0;
+  spin_unlock_irqrestore(&g_ptrace_lock, flags);
+  return pid;
 }
 
 int ptrace_is_traced(struct task *t) {
@@ -156,18 +168,35 @@ static void ptrace_do_stop(struct task *t, struct ptrace_link *l, int signo,
   t->last_stop_signal = signo;
   t->stop_report_pending = 1;
   t->state = TASK_STOPPED;
+  /* Wake BOTH waiters: the real parent, and the tracer when it is somebody
+   * else — the tracer is the one that has to see this stop, and it is
+   * sleeping in waitpid on its own wait event. */
   scheduler_notify_wait_event(t->parent_id);
+  if (l->tracer_pid && l->tracer_pid != t->parent_id)
+    scheduler_notify_wait_event(l->tracer_pid);
 
   while (1) {
-    scheduler_yield();
     spin_lock_irqsave(&g_ptrace_lock, &flags);
     int still = l->used && l->stopped;
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
     if (!still)
       break;
-    if (t->state != TASK_STOPPED)
-      t->state = TASK_STOPPED; /* a stray wake must not resume a tracee */
+    /* A SIGKILL outranks the stop — re-parking a task the kernel is killing
+     * would leave it STOPPED forever (and queued on a runqueue it can never be
+     * picked from). */
+    if (__atomic_load_n(&t->pending_signals, __ATOMIC_ACQUIRE) &
+        (1ULL << (SIGKILL - 1)))
+      break;
+    t->state = TASK_STOPPED;
+    scheduler_yield();
   }
+
+  /* However the stop ended — the tracer continued us, detached, or a SIGKILL
+   * outran it — this task is executing again, so it must not be left marked
+   * STOPPED (nothing would ever pick it, and a task wedged mid-exit never
+   * reaps). */
+  t->state = TASK_RUNNING;
+  t->stop_report_pending = 0;
 
   /* Resuming: adopt whatever the tracer left behind. */
   spin_lock_irqsave(&g_ptrace_lock, &flags);
@@ -201,6 +230,11 @@ int ptrace_signal_stop(struct task *t, int signo,
   /* SIGKILL is never interceptable, and SIGCONT is how a stop is lifted — a
    * tracee must not re-stop on the signal that just resumed it. */
   if (!t || !frame || signo == SIGKILL || signo == SIGCONT)
+    return 0;
+  /* Only ever park on a return to ring 3: a kernel-mode frame may live on a
+   * per-CPU/IST stack that another task reuses while this one sleeps, and
+   * resuming from it would jump into whatever overwrote it. */
+  if (frame->cs != 0x1B && frame->cs != 0x23)
     return 0;
   u64 flags;
   spin_lock_irqsave(&g_ptrace_lock, &flags);
@@ -264,9 +298,16 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     return -ESRCH;
 
   if (request == PTRACE_ATTACH) {
-    /* b1nix reports a stop only to the stopped task's parent, so a tracer that
-     * is not the parent could never wait for its tracee. */
-    if (t->parent_id != scheduler_get_pid())
+    /* Any task may attach to another it is allowed to signal; waitpid reports
+     * a tracee's stops to its tracer as well as to its parent
+     * (scheduler_waitpid). Attaching to yourself, or to an already-traced
+     * task, is refused. */
+    if (t == current_task)
+      return -EPERM;
+    const struct cred *c = scheduler_get_current_cred();
+    const struct cred *tc = t->cred;
+    if (c && tc && c->euid != ROOT_UID && c->euid != tc->uid &&
+        !cred_has_cap(c, CAP_SYS_PTRACE))
       return -EPERM;
     spin_lock_irqsave(&g_ptrace_lock, &flags);
     if (link_of(t)) {
@@ -277,7 +318,10 @@ isize ptrace_request(long request, usize pid, u64 addr, u64 data,
     spin_unlock_irqrestore(&g_ptrace_lock, flags);
     if (!l)
       return -ENOMEM;
-    scheduler_kill(pid, SIGSTOP);
+    /* Leave SIGSTOP pending instead of forcing the state: the tracee stops
+     * itself at its next return to ring 3, where its register frame is
+     * complete and safe to snapshot. */
+    scheduler_post_signal(pid, SIGSTOP);
     return 0;
   }
 

@@ -44,6 +44,9 @@ int ptrace_signal_stop(struct task *t, int signo, struct interrupt_frame *frame)
 int ptrace_handle_debug_trap(struct interrupt_frame *frame);
 
 int ptrace_is_traced(struct task *t);
+/* pid of the task tracing `t`, or 0 — waitpid uses it to report a tracee's
+ * stops to a tracer that is not the tracee's parent. */
+usize ptrace_tracer_pid(struct task *t);
 void ptrace_task_cleanup(struct task *t);
 
 #endif
