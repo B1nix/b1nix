@@ -428,4 +428,11 @@ struct statx {
   u64 __spare2[14];
 };
 
+/* System node/domain name, owned by the syscall layer (sethostname(2) /
+ * setdomainname(2)) and read by uname(2), procfs and sysfs. */
+void kernel_hostname_get(char *buf, usize len);
+void kernel_domainname_get(char *buf, usize len);
+int kernel_hostname_set(const char *name);
+int kernel_domainname_set(const char *name);
+
 #endif

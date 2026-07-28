@@ -345,6 +345,8 @@ int vfs_chmod(const char *path, u16 mode);
 int vfs_fchmod(int fd, u16 mode);
 int vfs_utime(const char *path, u64 atime, u64 mtime);
 int vfs_chown(const char *path, u16 uid, u16 gid);
+/* lchown(2): the symlink itself is the target, not what it points at. */
+int vfs_lchown(const char *path, u16 uid, u16 gid);
 int vfs_fchown(int fd, u16 uid, u16 gid);
 int vfs_fstatfs(int fd, struct b1nix_statfs *st);
 int vfs_syncfs(int fd);

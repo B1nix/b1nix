@@ -23,6 +23,96 @@ static usize g_user_pages = 0;
 static usize clock_hand = 0;
 static usize page_count = 0;
 
+/* ── mlock(2) support ──────────────────────────────────────────────────────
+ * A locked range is memory the owning task asked to keep resident. The CLOCK
+ * scan below skips any page that falls inside one, so mlock/mlockall are a
+ * real guarantee (the page is never handed to swap_out) rather than a
+ * success-returning no-op. Ranges live in a small side table keyed by task —
+ * struct task must not grow (per-task fields there fault the LAPIC page
+ * tables), and a handful of ranges covers every real caller (a daemon locking
+ * its whole address space, or one or two buffers). */
+#define EVICTION_MAX_LOCKED 32
+
+struct locked_range {
+    struct task *task;
+    u64 start; /* inclusive, page-aligned */
+    u64 end;   /* exclusive, page-aligned */
+    int used;
+};
+
+static struct locked_range locked_ranges[EVICTION_MAX_LOCKED];
+
+/* Is `vaddr` inside a range `task` locked? */
+static int page_is_locked(struct task *task, u64 vaddr) {
+    for (usize i = 0; i < EVICTION_MAX_LOCKED; i++) {
+        if (!locked_ranges[i].used || locked_ranges[i].task != task)
+            continue;
+        if (vaddr >= locked_ranges[i].start && vaddr < locked_ranges[i].end)
+            return 1;
+    }
+    return 0;
+}
+
+int eviction_lock_range(struct task *task, u64 start, u64 end) {
+    if (!task || end <= start) return -1;
+    start &= ~(u64)(PAGE_SIZE - 1);
+    end = (end + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+
+    /* Extend an adjacent/overlapping range of the same task instead of burning
+     * a slot per call (musl's mlock loop over a heap arena would otherwise
+     * exhaust the table). */
+    for (usize i = 0; i < EVICTION_MAX_LOCKED; i++) {
+        if (!locked_ranges[i].used || locked_ranges[i].task != task)
+            continue;
+        if (start <= locked_ranges[i].end && end >= locked_ranges[i].start) {
+            if (start < locked_ranges[i].start) locked_ranges[i].start = start;
+            if (end > locked_ranges[i].end) locked_ranges[i].end = end;
+            return 0;
+        }
+    }
+    for (usize i = 0; i < EVICTION_MAX_LOCKED; i++) {
+        if (locked_ranges[i].used) continue;
+        locked_ranges[i].task = task;
+        locked_ranges[i].start = start;
+        locked_ranges[i].end = end;
+        locked_ranges[i].used = 1;
+        return 0;
+    }
+    return -1; /* table full -> caller reports ENOMEM, as Linux does */
+}
+
+void eviction_unlock_range(struct task *task, u64 start, u64 end) {
+    if (!task || end <= start) return;
+    start &= ~(u64)(PAGE_SIZE - 1);
+    end = (end + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+    for (usize i = 0; i < EVICTION_MAX_LOCKED; i++) {
+        if (!locked_ranges[i].used || locked_ranges[i].task != task)
+            continue;
+        struct locked_range *r = &locked_ranges[i];
+        if (end <= r->start || start >= r->end)
+            continue; /* disjoint */
+        if (start <= r->start && end >= r->end) {
+            r->used = 0; /* fully unlocked */
+        } else if (start <= r->start) {
+            r->start = end; /* trim the front */
+        } else if (end >= r->end) {
+            r->end = start; /* trim the back */
+        } else {
+            /* Punching a hole: keep the head here and record the tail. */
+            u64 tail_start = end, tail_end = r->end;
+            r->end = start;
+            eviction_lock_range(task, tail_start, tail_end);
+        }
+    }
+}
+
+void eviction_unlock_all(struct task *task) {
+    if (!task) return;
+    for (usize i = 0; i < EVICTION_MAX_LOCKED; i++)
+        if (locked_ranges[i].used && locked_ranges[i].task == task)
+            locked_ranges[i].used = 0;
+}
+
 /* Initialised lazily on the first eviction_register_page call so we can size
  * the ring once the pmm knows the total usable RAM. */
 static void eviction_lazy_init(void) {
@@ -112,6 +202,11 @@ u64 swap_evict_page(void) {
         u64 v = page_ring[idx].vaddr;
         u64 f = page_ring[idx].frame;
 
+        /* mlock(2): the owner asked for this page to stay resident. */
+        if (page_is_locked(t, v)) {
+            continue;
+        }
+
         // Second Chance check
         if (is_page_accessed(t, v)) {
             continue; // Give second chance and move to next
@@ -155,6 +250,7 @@ void eviction_evict_page(void) {
 
 void eviction_unregister_all_pages(struct task *task) {
     if (!task) return;
+    eviction_unlock_all(task);    /* mlock ranges die with the task */
     if (!page_ring) return;       /* ring never allocated (no swap) */
     for (usize i = 0; i < g_user_pages; i++) {
         if (page_ring[i].used && page_ring[i].task == task) {

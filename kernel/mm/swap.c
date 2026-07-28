@@ -178,6 +178,16 @@ int swap_active(void)
     return swap_dev && swap_dev->write_blocks;
 }
 
+/* Slot accounting for /proc/swaps and sysinfo(2). One slot is one page. */
+int swap_stats(u64 *out_total_slots, u64 *out_used_slots)
+{
+    if (!swap_active())
+        return -1;
+    if (out_total_slots) *out_total_slots = (u64)swap_slot_count;
+    if (out_used_slots) *out_used_slots = (u64)swap_used;
+    return 0;
+}
+
 /* Write a frame to a freshly allocated swap slot and return its index, or -1.
  * The slot index is the ONLY identity the caller needs — it stores it directly
  * in the page's (non-present) PTE, so no (pml4,vaddr) reverse map is kept. The

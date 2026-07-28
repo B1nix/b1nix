@@ -4954,8 +4954,11 @@ int vfs_fchmod(int fd, u16 mode) {
   return 0;
 }
 
-int vfs_chown(const char *path, u16 uid, u16 gid) {
-  struct vfs_node *node = vfs_find_node(path);
+/* Shared body of chown/lchown: `nofollow` selects whether a trailing symlink is
+ * resolved (chown) or is itself the target (lchown). */
+static int vfs_chown_common(const char *path, u16 uid, u16 gid, int nofollow) {
+  struct vfs_node *node =
+      nofollow ? vfs_find_node_no_follow(path) : vfs_find_node(path);
   if (IS_ERR(node))
     return (int)PTR_ERR(node);
 
@@ -4985,6 +4988,15 @@ int vfs_chown(const char *path, u16 uid, u16 gid) {
 out:
   vfs_node_put(node);
   return res;
+}
+
+int vfs_chown(const char *path, u16 uid, u16 gid) {
+  return vfs_chown_common(path, uid, gid, 0);
+}
+
+/* lchown(2): change the ownership of a symlink itself. */
+int vfs_lchown(const char *path, u16 uid, u16 gid) {
+  return vfs_chown_common(path, uid, gid, 1);
 }
 
 int vfs_set_acl(struct vfs_node *node, const struct acl_entry *acl) {

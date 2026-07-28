@@ -169,6 +169,11 @@ u64 paging_clone_address_space(u64 src_pml4_phys);
 void paging_free_address_space(u64 pml4_phys);
 void paging_switch_address_space(u64 pml4_phys);
 
+/* Physical frame backing `vaddr` in the address space rooted at `pml4_phys`,
+ * or 0 if the page is not present. Used to measure a task's real resident set
+ * (/proc/<pid>/statm) without touching the current address space. */
+u64 paging_user_frame(u64 pml4_phys, u64 vaddr);
+
 // Demand Paging / Swap
 void vmm_set_lazy(u64 virtual_address);
 int vmm_handle_page_fault(u64 fault_addr, u64 error_code);
@@ -180,9 +185,20 @@ void vmm_set_swap_device(struct block_device *dev);
 // the slot. No (pml4,vaddr) reverse-map table.
 int swap_init(void);
 int swap_active(void);
+/* Slot accounting (one slot == one page): 0 on success, -1 if swap is off. */
+int swap_stats(u64 *out_total_slots, u64 *out_used_slots);
 int swap_out(u64 physical_frame);
 int swap_in(u32 slot, u64 *out_physical_frame);
 void swap_free_slot_index(u32 slot);
 void swap_free_all_slots(u64 pml4_phys);
+
+/* mlock(2) backing: a locked range is skipped by the CLOCK eviction scan, so
+ * its pages are never swapped out while the owning task lives. Returns -1 when
+ * the (small) range table is full — mlock reports ENOMEM, exactly as Linux does
+ * when it cannot honour the lock. */
+struct task;
+int eviction_lock_range(struct task *task, u64 start, u64 end);
+void eviction_unlock_range(struct task *task, u64 start, u64 end);
+void eviction_unlock_all(struct task *task);
 
 #endif

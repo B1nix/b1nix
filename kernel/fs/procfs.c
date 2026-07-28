@@ -61,6 +61,15 @@ static void sb_puts(struct sbuf *s, const char *str) {
   s->p[s->len] = '\0';
 }
 
+/* Append one raw byte, including '\0' — /proc/<pid>/environ and cmdline are
+ * NUL-separated, which sb_puts (string-terminated) cannot express. */
+static void sb_putc(struct sbuf *s, char c) {
+  if (s->len + 1 >= s->cap)
+    return;
+  s->p[s->len++] = c;
+  s->p[s->len] = '\0';
+}
+
 /* Render content built into `buf` (len bytes) into the caller's [offset,size). */
 __attribute__((format(printf, 2, 3))) static void sb_addf(struct sbuf *s,
                                                           const char *fmt,
@@ -305,6 +314,75 @@ static int r_vmstat(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/swaps — the Linux swap-area table. b1nix attaches at most one swap
+ * device, at boot (kernel/mm/swap.c), so the table has one row or none. */
+static int r_swaps(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "Filename\t\t\t\tType\t\tSize\t\tUsed\t\tPriority\n");
+  u64 total = 0, used = 0;
+  if (swap_active() && swap_stats(&total, &used) == 0)
+    sb_addf(s, "/dev/swap0                              partition\t%lu\t%lu\t-2\n",
+            (unsigned long)(total * 4), (unsigned long)(used * 4)); /* KiB */
+  return 0;
+}
+
+/* /proc/modules — b1nix is a monolithic kernel with no loadable modules, so
+ * the list is genuinely empty (Linux prints nothing in that case too). */
+static int r_modules(usize pid, struct sbuf *s) {
+  (void)pid;
+  (void)s;
+  return 0;
+}
+
+/* ── /proc/sys — the sysctl tree, read-only (b1nix has no procfs write path;
+ * the writable knobs Linux exposes here have their own syscalls, e.g.
+ * sethostname(2)). ── */
+static int r_sys_hostname(usize pid, struct sbuf *s) {
+  (void)pid;
+  char h[65];
+  kernel_hostname_get(h, sizeof(h));
+  sb_addf(s, "%s\n", h);
+  return 0;
+}
+
+static int r_sys_domainname(usize pid, struct sbuf *s) {
+  (void)pid;
+  char d[65];
+  kernel_domainname_get(d, sizeof(d));
+  sb_addf(s, "%s\n", d);
+  return 0;
+}
+
+static int r_sys_ostype(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_puts(s, "B1NIX\n");
+  return 0;
+}
+
+static int r_sys_osrelease(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%s\n", B1NIX_VERSION_STR);
+  return 0;
+}
+
+static int r_sys_pid_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)scheduler_max_tasks());
+  return 0;
+}
+
+static int r_sys_file_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  /* The per-task descriptor ceiling is RLIMIT_NOFILE; the kernel imposes no
+   * separate system-wide table, so report the hard limit. */
+  struct rlimit rl;
+  unsigned long v = 1024;
+  if (scheduler_getrlimit(RLIMIT_NOFILE, &rl) == 0)
+    v = (unsigned long)rl.rlim_max;
+  sb_addf(s, "%lu\n", v);
+  return 0;
+}
+
 static int r_filesystems(usize pid, struct sbuf *s) {
   (void)pid;
   sb_puts(s, "nodev\tprocfs\n");
@@ -491,6 +569,86 @@ static int r_pid_stat(usize pid, struct sbuf *s) {
   return 0;
 }
 
+/* /proc/<pid>/environ — the NUL-separated environment the image was execve'd
+ * with (the same array the auxv/stack builder copied in). */
+static int r_pid_environ(usize pid, struct sbuf *s) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t || !t->user_image)
+    return 0;
+  struct user_loaded_image *img = (struct user_loaded_image *)t->user_image;
+  if (!img->envp)
+    return 0;
+  for (int i = 0; img->envp[i]; i++) {
+    sb_puts(s, img->envp[i]);
+    sb_putc(s, '\0');
+  }
+  return 0;
+}
+
+/* /proc/<pid>/statm — page counts: size resident shared text lib data dt.
+ * Resident is measured for real by walking the task's page tables, so the
+ * number reflects what is actually mapped (not the VMA span). */
+static int r_pid_statm(usize pid, struct sbuf *s) {
+  struct task *t = scheduler_task_by_pid(pid);
+  if (!t) {
+    sb_puts(s, "0 0 0 0 0 0 0\n");
+    return 0;
+  }
+  unsigned long size = 0, resident = 0, shared = 0, text = 0, data = 0;
+  for (struct vm_area *v = t->vma_list; v; v = v->next) {
+    unsigned long pages = (unsigned long)((v->end - v->start) / PAGE_SIZE);
+    size += pages;
+    if (v->flags & 0x1) /* MAP_SHARED */
+      shared += pages;
+    if (v->prot & 0x4) /* PROT_EXEC */
+      text += pages;
+    else if (v->prot & 0x2) /* PROT_WRITE */
+      data += pages;
+    if (t->pml4_phys) {
+      for (u64 va = v->start; va < v->end; va += PAGE_SIZE)
+        if (paging_user_frame(t->pml4_phys, va))
+          resident++;
+    }
+  }
+  sb_addf(s, "%lu %lu %lu %lu 0 %lu 0\n", size, resident, shared, text, data);
+  return 0;
+}
+
+/* /proc/<pid>/limits — the task's own rlimits, in the Linux column layout. */
+static int r_pid_limits(usize pid, struct sbuf *s) {
+  static const struct {
+    int res;
+    const char *name;
+    const char *unit;
+  } tbl[] = {
+      {0, "Max cpu time", "seconds"},    {1, "Max file size", "bytes"},
+      {2, "Max data size", "bytes"},     {3, "Max stack size", "bytes"},
+      {4, "Max core file size", "bytes"},{5, "Max resident set", "bytes"},
+      {6, "Max processes", "processes"}, {7, "Max open files", "files"},
+      {8, "Max locked memory", "bytes"}, {9, "Max address space", "bytes"},
+  };
+  struct task *t = scheduler_task_by_pid(pid);
+  sb_puts(s, "Limit                     Soft Limit           Hard Limit"
+             "           Units\n");
+  for (usize i = 0; i < sizeof(tbl) / sizeof(tbl[0]); i++) {
+    struct rlimit rl = {0, 0};
+    if (!t || scheduler_getrlimit_task(t, tbl[i].res, &rl) != 0)
+      continue;
+    char soft[24], hard[24];
+    if (rl.rlim_cur == (u64)-1)
+      snprintf(soft, sizeof(soft), "unlimited");
+    else
+      snprintf(soft, sizeof(soft), "%lu", (unsigned long)rl.rlim_cur);
+    if (rl.rlim_max == (u64)-1)
+      snprintf(hard, sizeof(hard), "unlimited");
+    else
+      snprintf(hard, sizeof(hard), "%lu", (unsigned long)rl.rlim_max);
+    sb_addf(s, "%-25s %-20s %-20s %s\n", tbl[i].name, soft, hard,
+            tbl[i].unit);
+  }
+  return 0;
+}
+
 static int r_pid_maps(usize pid, struct sbuf *s) {
   struct task *t = scheduler_task_by_pid(pid);
   if (!t)
@@ -667,6 +825,56 @@ static isize procfs_exe_readlink(struct vfs_node *node, u64 offset, char *buf,
   return (isize)len;
 }
 
+/* /proc/<pid>/cwd and /proc/<pid>/root — symlinks to the task's working
+ * directory and its filesystem root. b1nix has no per-process root (no
+ * chroot), so root always resolves to "/", which is the truth for every task. */
+static isize procfs_cwd_readlink(struct vfs_node *node, u64 offset, char *buf,
+                                 usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  usize pid = pid_from_parent(node);
+  struct task *t = scheduler_task_by_pid(pid);
+  const char *path = (t && t->cwd[0]) ? t->cwd : "/";
+  usize len = strlen(path);
+  if (len > size)
+    len = size;
+  memcpy(buf, path, len);
+  return (isize)len;
+}
+
+static isize procfs_root_readlink(struct vfs_node *node, u64 offset, char *buf,
+                                  usize size, int flags) {
+  (void)node;
+  (void)offset;
+  (void)flags;
+  if (size < 1)
+    return 0;
+  buf[0] = '/';
+  return 1;
+}
+
+static void procfs_make_symlink(struct vfs_node *dir, const char *name,
+                                isize (*readlink_cb)(struct vfs_node *, u64,
+                                                     char *, usize, int)) {
+  if (find_child(dir, name))
+    return;
+  struct vfs_node *n = vfs_create_node(VFS_SYMLINK);
+  if (!n)
+    return;
+  usize nl = strlen(name);
+  if (nl > 63)
+    nl = 63;
+  memcpy(n->name, name, nl);
+  n->name[nl] = '\0';
+  n->inode->read_cb = readlink_cb;
+  n->inode->size = 256;
+  n->inode->mode = 0777;
+  n->inode->nlink = 1;
+  n->parent = dir;
+  n->refcount++;
+  vfs_attach_child(dir, n);
+}
+
 static void procfs_make_exe_symlink(struct vfs_node *dir, usize pid) {
   (void)pid; /* resolved dynamically from dir name via pid_from_parent */
   if (find_child(dir, "exe"))
@@ -696,6 +904,12 @@ static struct vfs_node *procfs_make_piddir(struct vfs_node *parent,
   procfs_mkchild(d, "stat", VFS_DEVICE, r_pid_stat, pid);
   procfs_mkchild(d, "maps", VFS_DEVICE, r_pid_maps, pid);
   procfs_mkchild(d, "mountinfo", VFS_DEVICE, r_mountinfo, pid);
+  procfs_mkchild(d, "mounts", VFS_DEVICE, r_mounts, pid);
+  procfs_mkchild(d, "environ", VFS_DEVICE, r_pid_environ, pid);
+  procfs_mkchild(d, "statm", VFS_DEVICE, r_pid_statm, pid);
+  procfs_mkchild(d, "limits", VFS_DEVICE, r_pid_limits, pid);
+  procfs_make_symlink(d, "cwd", procfs_cwd_readlink);
+  procfs_make_symlink(d, "root", procfs_root_readlink);
   struct vfs_node *fddir = procfs_mkchild(d, "fd", VFS_DIRECTORY, 0, 0);
   if (fddir) {
     fddir->inode->readdir_cb = procfs_fd_readdir;
@@ -899,6 +1113,26 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
   procfs_mkchild(root, "cmdline", VFS_DEVICE, r_cmdline, 0);
   procfs_mkchild(root, "kallsyms", VFS_DEVICE, r_kallsyms, 0);
   procfs_mkchild(root, "partitions", VFS_DEVICE, r_partitions, 0);
+  procfs_mkchild(root, "swaps", VFS_DEVICE, r_swaps, 0);
+  procfs_mkchild(root, "modules", VFS_DEVICE, r_modules, 0);
+
+  /* /proc/sys — the sysctl tree Linux tools read directly (busybox sysctl,
+   * hostname(1), OpenRC's sysctl service). */
+  struct vfs_node *sysd = procfs_mkchild(root, "sys", VFS_DIRECTORY, 0, 0);
+  if (sysd) {
+    struct vfs_node *kern = procfs_mkchild(sysd, "kernel", VFS_DIRECTORY, 0, 0);
+    if (kern) {
+      procfs_mkchild(kern, "hostname", VFS_DEVICE, r_sys_hostname, 0);
+      procfs_mkchild(kern, "domainname", VFS_DEVICE, r_sys_domainname, 0);
+      procfs_mkchild(kern, "ostype", VFS_DEVICE, r_sys_ostype, 0);
+      procfs_mkchild(kern, "osrelease", VFS_DEVICE, r_sys_osrelease, 0);
+      procfs_mkchild(kern, "version", VFS_DEVICE, r_version, 0);
+      procfs_mkchild(kern, "pid_max", VFS_DEVICE, r_sys_pid_max, 0);
+    }
+    struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
+    if (fsd)
+      procfs_mkchild(fsd, "file-max", VFS_DEVICE, r_sys_file_max, 0);
+  }
 
   struct vfs_node *netd = procfs_mkchild(root, "net", VFS_DIRECTORY, 0, 0);
   if (netd) {

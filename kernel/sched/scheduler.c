@@ -1608,6 +1608,17 @@ u64 task_cstime(const struct task *t) {
   if (!t) return 0;
   return g_task_cstime[task_index(t)];
 }
+usize scheduler_max_tasks(void) { return MAX_TASKS; }
+
+/* Per-task variant of scheduler_getrlimit, for /proc/<pid>/limits. */
+int scheduler_getrlimit_task(const struct task *t, int resource,
+                             struct rlimit *rlim) {
+  if (resource < 0 || resource >= 16 || !rlim || !t)
+    return -EINVAL;
+  *rlim = g_task_rlimits[task_index(t)][resource];
+  return 0;
+}
+
 int scheduler_getrlimit(int resource, struct rlimit *rlim) {
   if (resource < 0 || resource >= 16 || !rlim || !current_task)
     return -EINVAL;

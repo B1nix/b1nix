@@ -329,6 +329,11 @@ u64  task_stime(const struct task *t);
 u64  task_cutime(const struct task *t);
 u64  task_cstime(const struct task *t);
 int  scheduler_getrlimit(int resource, struct rlimit *rlim);
+int  scheduler_getrlimit_task(const struct task *t, int resource,
+                              struct rlimit *rlim);
+/* Upper bound on concurrent tasks (the pid ceiling reported by
+ * /proc/sys/kernel/pid_max). */
+usize scheduler_max_tasks(void);
 int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
 
 /* Per-CPU current task. `current_task` is the task running on THIS CPU; each

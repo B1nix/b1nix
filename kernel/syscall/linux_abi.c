@@ -188,6 +188,14 @@
 #define LX_mount           165
 #define LX_umount2         166
 #define LX_getcpu          309
+/* Calls whose Linux argument layout already matches the native handler. */
+#define LX_mincore         27
+#define LX_fdatasync       75
+#define LX_statfs          137
+#define LX_fstatfs         138
+#define LX_settimeofday    164
+#define LX_syncfs          306
+#define LX_rt_tgsigqueueinfo 297
 
 /* The f* xattr variants take a descriptor and have no native handler, so they
  * stay unmapped (-ENOSYS). The follow/don't-follow argument these numbers imply
@@ -396,6 +404,22 @@ static const struct lx_map lx_table[] = {
 	 * umount2's flags argument is ignored by sys_umount. */
 	{LX_mount,           SYS_MOUNT,         "mount"},
 	{LX_umount2,         SYS_UMOUNT,        "umount2"},
+	/* M40 closeout: same argument layout on both ABIs.
+	 * - statfs/fstatfs: struct b1nix_statfs is field-for-field the Linux
+	 *   x86_64 struct statfs (eleven 8-byte fields + f_spare[4]).
+	 * - fdatasync: b1nix has no separate metadata-only writeback, so the
+	 *   data+metadata flush is a valid superset.
+	 * - settimeofday: (struct timeval *, struct timezone *) — the native
+	 *   handler reads the timeval and ignores the (UTC-only) timezone.
+	 * - rt_tgsigqueueinfo: the signal number is remapped by the dispatcher
+	 *   just above the table lookup. */
+	{LX_mincore,         SYS_MINCORE,       "mincore"},
+	{LX_fdatasync,       SYS_FSYNC,         "fdatasync"},
+	{LX_statfs,          SYS_STATFS,        "statfs"},
+	{LX_fstatfs,         SYS_FSTATFS,       "fstatfs"},
+	{LX_settimeofday,    SYS_SETTIMEOFDAY,  "settimeofday"},
+	{LX_syncfs,          SYS_SYNCFS,        "syncfs"},
+	{LX_rt_tgsigqueueinfo, SYS_RT_TGSIGQUEUEINFO, "rt_tgsigqueueinfo"},
 };
 
 #define LX_TABLE_LEN (sizeof(lx_table) / sizeof(lx_table[0]))

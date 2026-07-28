@@ -1535,16 +1535,13 @@ static isize sys_sigtimedwait(const u64 *user_set,
   return sys_sigtimedwait_kernel(set, user_ts);
 }
 
-static u64 sys_sigsuspend(const u64 *user_mask) {
+/* Suspend until a deliverable signal arrives, running with `mask` blocked.
+ * Split out of sys_sigsuspend so callers that already hold the mask in kernel
+ * memory (Linux pause(2), which suspends with the CURRENT mask and has no user
+ * buffer to read one from) can use it directly. */
+static u64 sigsuspend_with_mask(u64 mask) {
   if (!current_task)
     return (u64)-EINVAL;
-  if (!user_mask)
-    return (u64)-EFAULT;
-
-  u64 mask;
-  if (syscall_copyin(&mask, user_mask, sizeof(u64)) < 0) {
-    return (u64)-EFAULT;
-  }
 
   task_set_saved_sigmask(current_task, current_task->blocked_signals, 1);
 
@@ -1594,6 +1591,41 @@ static u64 sys_sigsuspend(const u64 *user_mask) {
   }
 
   return (u64)-EINTR;
+}
+
+/* Fault in every page of [start, end) in the calling task's address space and
+ * confirm it is present afterwards. Used by mlock/mlockall so the call only
+ * succeeds once the memory really is resident — a lock record on a page that
+ * was never populated would be a promise the kernel could not keep. Returns 0
+ * when the whole range is resident, -1 if any page could not be populated
+ * (unmapped hole, PROT_NONE reservation, or out of memory). */
+static int mlock_populate(u64 start, u64 end) {
+  if (!current_task || !current_task->pml4_phys)
+    return -1;
+  for (u64 va = start; va < end; va += PAGE_SIZE) {
+    if (paging_user_frame(current_task->pml4_phys, va))
+      continue;
+    /* Not-present, user-mode read fault — the demand pager's own entry point
+     * (anonymous zero-fill, file-backed page-in, or swap-in). */
+    if (vmm_handle_page_fault(va, PF_USER) != 0)
+      return -1;
+    if (!paging_user_frame(current_task->pml4_phys, va))
+      return -1;
+  }
+  return 0;
+}
+
+static u64 sys_sigsuspend(const u64 *user_mask) {
+  if (!current_task)
+    return (u64)-EINVAL;
+  if (!user_mask)
+    return (u64)-EFAULT;
+
+  u64 mask;
+  if (syscall_copyin(&mask, user_mask, sizeof(u64)) < 0)
+    return (u64)-EFAULT;
+
+  return sigsuspend_with_mask(mask);
 }
 
 static isize sys_getrlimit(int resource, struct rlimit *user_rlim) {
@@ -1869,10 +1901,43 @@ static isize sys_linux_stat_family(u64 lnr, u64 arg0, u64 arg1) {
 
 /* Fill the b1nix uname result. Single source of truth shared by the native
  * SYS_UNAME path and the M40 Linux uname translation. */
+/* System node/domain name. sethostname(2)/setdomainname(2) update these, and
+ * uname(2), /proc/sys/kernel/{hostname,domainname} and /sys/kernel/hostname all
+ * read them, so a hostname set at boot (OpenRC's `hostname` service) is visible
+ * everywhere a Linux program looks for it. */
+static char g_kernel_hostname[65] = "b1nix";
+static char g_kernel_domainname[65] = "(none)";
+
+void kernel_hostname_get(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  copy_cstr(buf, len, g_kernel_hostname);
+}
+
+void kernel_domainname_get(char *buf, usize len) {
+  if (!buf || len == 0)
+    return;
+  copy_cstr(buf, len, g_kernel_domainname);
+}
+
+int kernel_hostname_set(const char *name) {
+  if (!name)
+    return -EFAULT;
+  copy_cstr(g_kernel_hostname, sizeof(g_kernel_hostname), name);
+  return 0;
+}
+
+int kernel_domainname_set(const char *name) {
+  if (!name)
+    return -EFAULT;
+  copy_cstr(g_kernel_domainname, sizeof(g_kernel_domainname), name);
+  return 0;
+}
+
 static void fill_b1nix_utsname(struct b1nix_utsname *uts) {
   memset(uts, 0, sizeof(*uts));
   copy_cstr(uts->sysname, sizeof(uts->sysname), "B1NIX");
-  copy_cstr(uts->nodename, sizeof(uts->nodename), "b1nix");
+  copy_cstr(uts->nodename, sizeof(uts->nodename), g_kernel_hostname);
   copy_cstr(uts->release, sizeof(uts->release), B1NIX_VERSION_STR);
   copy_cstr(uts->version, sizeof(uts->version), "#1 SMP");
 #if defined(__aarch64__)
@@ -1891,6 +1956,7 @@ static isize sys_linux_uname(u64 arg0) {
   fill_b1nix_utsname(&uts);
   struct linux_utsname lx;
   linux_utsname_from_b1nix(&lx, &uts);
+  kernel_domainname_get(lx.domainname, sizeof(lx.domainname));
   if (copy_to_user((void *)(usize)arg0, &lx, sizeof(lx)) < 0)
     return -EFAULT;
   return 0;
@@ -3844,6 +3910,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #define LX_faccessat       269
 #define LX_faccessat2      439
 #define LX_renameat2       316
+#define LX_renameat        264
 #define LX_pipe2           293
 #define LX_dup3            292
 #define LX_ppoll           271
@@ -3869,6 +3936,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           number == LX_faccessat || number == LX_faccessat2 ||
           number == LX_readlinkat ||
           number == LX_symlinkat || number == LX_renameat2 ||
+          number == LX_renameat ||
           number == LX_linkat) {
         int dirfd = (int)arg0;
         const char *user_path = (const char *)(usize)arg1;
@@ -4023,6 +4091,8 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           (void)arg3;
           return (u64)sys_access_kpath(resolved, (int)arg2);
         }
+        /* renameat(264) is renameat2 without the flags argument. */
+        case LX_renameat:
         case LX_renameat2: {
           /* arg0=olddirfd, arg1=oldpath, arg2=newdirfd, arg3=newpath, arg4=flags.
            * resolved = oldpath. Need to resolve newpath from (arg2, arg3). */
@@ -4064,6 +4134,7 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
 #undef LX_fchownat
 #undef LX_faccessat
 #undef LX_renameat2
+#undef LX_renameat
       }
 
       /* --- M92: wrapper syscalls (thin shims over existing b1nix handlers) --- */
@@ -4536,6 +4607,516 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
           return (u64)src;
         }
       }
+      /* ── M40 completion: the rest of the Linux syscall surface ────────────
+       * Every call below needs an argument-shape or semantic translation, so it
+       * cannot be a plain number-table entry. Grouped by area. */
+
+      /* pread64(17)/pwrite64(18)/preadv(295)/pwritev(296)/preadv2(327)/
+       * pwritev2(328): positional I/O. A b1nix fd carries a single shared
+       * offset, so seek → transfer → seek back gives the "does not change the
+       * file offset" guarantee callers depend on. */
+      if (number == 17 || number == 18 || number == 295 || number == 296 ||
+          number == 327 || number == 328) {
+        int fd = (int)arg0;
+        /* pread/pwrite carry the offset in arg3; the *v forms split it into
+         * (pos_l, pos_h) — pos_h is 0 for a 64-bit caller. */
+        i64 off = (number == 17 || number == 18)
+                      ? (i64)arg3
+                      : (i64)(arg3 | (arg4 << 32));
+        if (off < 0)
+          return (u64)-EINVAL;
+        isize saved = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
+        if (saved < 0)
+          return (u64)saved;
+        isize sk = vfs_lseek(fd, (isize)off, B1NIX_SEEK_SET);
+        if (sk < 0)
+          return (u64)sk;
+        isize r;
+        if (number == 17)
+          r = sys_read(fd, (void *)(usize)arg1, (usize)arg2);
+        else if (number == 18)
+          r = sys_write(fd, (const void *)(usize)arg1, (usize)arg2);
+        else if (number == 295 || number == 327)
+          r = sys_readv(fd, (const struct b1nix_iovec *)(usize)arg1, (int)arg2);
+        else
+          r = sys_writev(fd, (const struct b1nix_iovec *)(usize)arg1, (int)arg2);
+        vfs_lseek(fd, saved, B1NIX_SEEK_SET);
+        return (u64)r;
+      }
+
+      /* truncate(76): b1nix truncates by descriptor, so open the path first.
+       * O_WRONLY also runs the write-permission check truncate(2) requires. */
+      if (number == 76) {
+        char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
+            0)
+          return (u64)-EFAULT;
+        vfs_resolve_path(kpath, resolved);
+        int fd = vfs_open_flags(resolved, B1NIX_O_WRONLY);
+        if (fd < 0)
+          return (u64)fd;
+        int rc = vfs_ftruncate(fd, arg1);
+        vfs_close(fd);
+        return (u64)rc;
+      }
+
+      /* creat(85) == open(path, O_CREAT|O_WRONLY|O_TRUNC). The mode argument
+       * follows the b1nix create default (umask applied by the VFS). */
+      if (number == 85) {
+        char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
+            0)
+          return (u64)-EFAULT;
+        vfs_resolve_path(kpath, resolved);
+        return (u64)vfs_open_flags(
+            resolved, B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC);
+      }
+
+      /* lchown(94): change a symlink's own ownership. */
+      if (number == 94) {
+        char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
+            0)
+          return (u64)-EFAULT;
+        vfs_resolve_path(kpath, resolved);
+        return (u64)vfs_lchown(resolved, (u16)arg1, (u16)arg2);
+      }
+
+      /* pause(34): suspend with the CURRENT signal mask until a handler runs. */
+      if (number == 34)
+        return sigsuspend_with_mask(current_task->blocked_signals);
+
+      /* rt_sigpending(127): the pending set, in Linux signal numbering. */
+      if (number == 127) {
+        if (!arg0)
+          return (u64)-EFAULT;
+        u64 pend = __atomic_load_n(&current_task->pending_signals,
+                                   __ATOMIC_ACQUIRE);
+        u64 lx = b1nix_sigset_to_linux(pend);
+        return syscall_copyout((void *)(usize)arg0, &lx, sizeof(lx)) == 0
+                   ? 0
+                   : (u64)-EFAULT;
+      }
+
+      /* gettimeofday(96)(tv, tz) and time(201)(t*). The wall clock is the RTC
+       * snapshot plus uptime; sub-second resolution is the 100 Hz tick. */
+      if (number == 96 || number == 201) {
+        u64 secs = vfs_get_unix_time();
+        u64 ticks = scheduler_get_uptime_ticks();
+        if (number == 201) {
+          if (arg0 &&
+              syscall_copyout((void *)(usize)arg0, &secs, sizeof(secs)) != 0)
+            return (u64)-EFAULT;
+          return secs;
+        }
+        if (arg0) {
+          struct timeval tv;
+          tv.tv_sec = (i64)secs;
+          tv.tv_usec = (i64)((ticks % 100) * 10000);
+          if (syscall_copyout((void *)(usize)arg0, &tv, sizeof(tv)) != 0)
+            return (u64)-EFAULT;
+        }
+        if (arg1) {
+          /* struct timezone: b1nix keeps the clock in UTC and does no DST
+           * bookkeeping, which is exactly {0, 0}. */
+          i32 tz[2] = {0, 0};
+          if (syscall_copyout((void *)(usize)arg1, tz, sizeof(tz)) != 0)
+            return (u64)-EFAULT;
+        }
+        return 0;
+      }
+
+      /* clock_settime(227)(clockid, timespec) — CLOCK_REALTIME only; the
+       * monotonic clocks are uptime and cannot be stepped. */
+      if (number == 227) {
+        if ((int)arg0 != 0)
+          return (u64)-EINVAL;
+        struct cred *c = scheduler_get_current_cred();
+        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_TIME)))
+          return (u64)-EPERM;
+        struct timespec ts;
+        if (!arg1 ||
+            syscall_copyin(&ts, (const void *)(usize)arg1, sizeof(ts)) != 0)
+          return (u64)-EFAULT;
+        if (ts.tv_sec < 0 || ts.tv_nsec < 0 || ts.tv_nsec >= 1000000000)
+          return (u64)-EINVAL;
+        rtc_set_unix_time((u64)ts.tv_sec);
+        return 0;
+      }
+
+      /* epoll_create(213)(size): the size hint has been ignored since 2.6.8. */
+      if (number == 213)
+        return (u64)vfs_epoll_create(0);
+
+      /* sync_file_range(277)(fd, offset, nbytes, flags): b1nix writeback is
+       * whole-file, so the honest superset is fsync. */
+      if (number == 277)
+        return (u64)vfs_fsync((int)arg0);
+
+      /* readahead(187) / fadvise64(221): advisory only. The block layer already
+       * reads ahead (kernel/dev/blk.c) and both calls are defined to be
+       * droppable, so accepting them changes nothing a caller can observe. */
+      if (number == 187 || number == 221)
+        return 0;
+
+      /* restart_syscall(219): b1nix restarts an interrupted call by rewinding
+       * RIP in syscall_dispatch_impl, never by handing userspace a restart
+       * block, so reaching this from ring 3 means the call was spurious. */
+      if (number == 219)
+        return (u64)-EINTR;
+
+      /* personality(135): the ABI is a property of the image, fixed by the ELF
+       * loader. Report PER_LINUX (0) and refuse to change it. */
+      if (number == 135)
+        return (arg0 == 0 || arg0 == 0xffffffffULL) ? 0 : (u64)-EINVAL;
+
+      /* unshare(272): no namespaces — an empty flag set is a valid no-op. */
+      if (number == 272)
+        return arg0 == 0 ? 0 : (u64)-EINVAL;
+
+      /* getresuid(118) / getresgid(120). */
+      if (number == 118 || number == 120) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c)
+          return (u64)-EINVAL;
+        if (!arg0 || !arg1 || !arg2)
+          return (u64)-EFAULT;
+        u32 v[3];
+        if (number == 118) {
+          v[0] = c->uid; v[1] = c->euid; v[2] = c->suid;
+        } else {
+          v[0] = c->gid; v[1] = c->egid; v[2] = c->sgid;
+        }
+        if (syscall_copyout((void *)(usize)arg0, &v[0], sizeof(u32)) != 0 ||
+            syscall_copyout((void *)(usize)arg1, &v[1], sizeof(u32)) != 0 ||
+            syscall_copyout((void *)(usize)arg2, &v[2], sizeof(u32)) != 0)
+          return (u64)-EFAULT;
+        return 0;
+      }
+
+      /* setfsuid(122)/setfsgid(123): b1nix checks filesystem access against the
+       * EFFECTIVE id and has no separate fsuid, so the only value that can be
+       * installed is the current one. Linux returns the PREVIOUS fsuid whether
+       * or not the change took, so a caller that re-reads the result (the
+       * documented way to detect failure) sees the truth. */
+      if (number == 122 || number == 123) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c)
+          return (u64)-EINVAL;
+        return (u64)(number == 122 ? c->euid : c->egid);
+      }
+
+      /* capget(125)/capset(126): b1nix derives every capability from euid == 0
+       * (kernel/sched/uidgid.c), so report the full set for root and the empty
+       * set otherwise, and accept only a capset that asks for exactly that
+       * rather than silently dropping a request to gain privilege. */
+      if (number == 125 || number == 126) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c)
+          return (u64)-EINVAL;
+        struct lx_cap_header { u32 version; int pid; } hdr;
+        if (!arg0 ||
+            syscall_copyin(&hdr, (const void *)(usize)arg0, sizeof(hdr)) != 0)
+          return (u64)-EFAULT;
+        /* _LINUX_CAPABILITY_VERSION_1 carries one data struct, _2/_3 carry two
+         * (the 64-bit capability set). Writing the wrong count would run off
+         * the caller's buffer. */
+        usize nwords =
+            (hdr.version == 0x19980330u) ? 3 : 6; /* 3 u32 per data struct */
+        if (hdr.pid != 0 && (usize)hdr.pid != scheduler_get_pid())
+          return (u64)-EPERM;
+        u32 all = (c->euid == ROOT_UID) ? 0xffffffffu : 0u;
+        if (number == 125) {
+          if (!arg1)
+            return 0; /* version probe: the header is all the caller wanted */
+          u32 data[6] = {all, all, all, all, all, all};
+          return syscall_copyout((void *)(usize)arg1, data,
+                                 nwords * sizeof(u32)) == 0
+                     ? 0
+                     : (u64)-EFAULT;
+        }
+        if (!arg1)
+          return (u64)-EFAULT;
+        u32 want[6] = {0};
+        if (syscall_copyin(want, (const void *)(usize)arg1,
+                           nwords * sizeof(u32)) != 0)
+          return (u64)-EFAULT;
+        for (usize i = 0; i < nwords; i++)
+          if (want[i] & ~all)
+            return (u64)-EPERM;
+        return 0;
+      }
+
+      /* sethostname(170) / setdomainname(171). */
+      if (number == 170 || number == 171) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN)))
+          return (u64)-EPERM;
+        if (!arg0)
+          return (u64)-EFAULT;
+        if (arg1 > 64)
+          return (u64)-EINVAL;
+        char name[65];
+        usize n = (usize)arg1;
+        if (n && syscall_copyin(name, (const void *)(usize)arg0, n) != 0)
+          return (u64)-EFAULT;
+        name[n] = '\0';
+        return (u64)(number == 170 ? kernel_hostname_set(name)
+                                   : kernel_domainname_set(name));
+      }
+
+      /* mlock(149)/mlock2(325)/munlock(150)/mlockall(151)/munlockall(152).
+       * Two halves make this a real guarantee rather than a success return:
+       *  1. the range is POPULATED here — every page is faulted in through the
+       *     demand pager and verified present, so mlock returns only once the
+       *     memory is actually resident (Linux semantics: no later major fault);
+       *  2. the range is RECORDED in the eviction lock table, and the CLOCK swap
+       *     scan (kernel/mm/eviction.c) skips locked pages, so nothing can push
+       *     them back out. A mapped page's frame also carries a VMA reference
+       *     (paging.c pmm_ref_frame), so page-cache reclaim cannot free it
+       *     either — swap eviction was the only remaining way out.
+       * A page that cannot be made resident fails the call with ENOMEM instead
+       * of leaving the caller with an unenforced promise. */
+      if (number == 149 || number == 150 || number == 325) {
+        u64 start = arg0 & ~(u64)(PAGE_SIZE - 1);
+        u64 end = arg0 + arg1;
+        if (arg1 == 0)
+          return 0;
+        if (end < arg0)
+          return (u64)-EINVAL;
+        end = (end + PAGE_SIZE - 1) & ~(u64)(PAGE_SIZE - 1);
+        if (number == 150) {
+          eviction_unlock_range(current_task, start, end);
+          return 0;
+        }
+        if (eviction_lock_range(current_task, start, end) != 0)
+          return (u64)-ENOMEM;
+        if (mlock_populate(start, end) != 0) {
+          eviction_unlock_range(current_task, start, end);
+          return (u64)-ENOMEM;
+        }
+        return 0;
+      }
+      if (number == 151) { /* mlockall(flags): MCL_CURRENT(1)|MCL_FUTURE(2) */
+        if ((arg0 & 3) == 0)
+          return (u64)-EINVAL;
+        /* One lock record spans the whole user range, so MCL_FUTURE is covered
+         * too: anything mapped later lands inside it and is never evicted. */
+        if (eviction_lock_range(current_task, PAGE_SIZE, USER_STACK_TOP) != 0)
+          return (u64)-ENOMEM;
+        if (arg0 & 1) { /* MCL_CURRENT: populate what is mapped right now */
+          for (struct vm_area *v = current_task->vma_list; v; v = v->next) {
+            if (mlock_populate(v->start, v->end) != 0) {
+              eviction_unlock_all(current_task);
+              return (u64)-ENOMEM;
+            }
+          }
+        }
+        return 0;
+      }
+      if (number == 152) {
+        eviction_unlock_all(current_task);
+        return 0;
+      }
+
+      /* sched_*: b1nix runs one policy — SCHED_OTHER, stride scheduling with
+       * nice weighting — so the policy calls report it truthfully and refuse to
+       * switch to a policy that does not exist. Nice lives in get/setpriority. */
+      if (number == 144) /* sched_setscheduler(pid, policy, param) */
+        return (int)arg1 == 0 ? 0 : (u64)-EINVAL;
+      if (number == 145) /* sched_getscheduler → SCHED_OTHER */
+        return 0;
+      if (number == 142 || number == 143) {
+        /* sched_setparam / sched_getparam: struct sched_param {int priority;},
+         * always 0 under SCHED_OTHER. */
+        int prio = 0;
+        if (!arg1)
+          return (u64)-EINVAL;
+        if (number == 143)
+          return syscall_copyout((void *)(usize)arg1, &prio, sizeof(prio)) == 0
+                     ? 0
+                     : (u64)-EFAULT;
+        if (syscall_copyin(&prio, (const void *)(usize)arg1, sizeof(prio)) != 0)
+          return (u64)-EFAULT;
+        return prio == 0 ? 0 : (u64)-EINVAL;
+      }
+      if (number == 146 || number == 147) /* sched_get_priority_max/min */
+        return (int)arg0 == 0 ? 0 : (u64)-EINVAL;
+      if (number == 148) { /* sched_rr_get_interval(pid, timespec) */
+        if (!arg1)
+          return (u64)-EFAULT;
+        struct timespec ts = {0, 10000000}; /* one 100 Hz tick */
+        return syscall_copyout((void *)(usize)arg1, &ts, sizeof(ts)) == 0
+                   ? 0
+                   : (u64)-EFAULT;
+      }
+      /* sched_setaffinity(203): the scheduler does not pin userspace tasks, so
+       * accept a mask that permits every online CPU and reject one that would
+       * genuinely constrain placement — reporting success for a constraint we
+       * do not enforce would be a lie the caller cannot detect. */
+      if (number == 203) {
+        extern int get_online_cpu_count(void);
+        usize sz = (usize)arg1;
+        if (!arg2 || sz == 0)
+          return (u64)-EINVAL;
+        u8 kmask[128];
+        usize n = sz < sizeof(kmask) ? sz : sizeof(kmask);
+        memset(kmask, 0, sizeof(kmask));
+        if (syscall_copyin(kmask, (const void *)(usize)arg2, n) != 0)
+          return (u64)-EFAULT;
+        int online = get_online_cpu_count();
+        if (online < 1)
+          online = 1;
+        for (int cpu = 0; cpu < online; cpu++)
+          if ((usize)(cpu / 8) >= n || !(kmask[cpu / 8] & (1u << (cpu % 8))))
+            return (u64)-EINVAL;
+        return 0;
+      }
+
+      /* fsetxattr(190)/fgetxattr(193)/flistxattr(196)/fremovexattr(199): the
+       * fd-relative xattr forms. Resolve the descriptor's path and use the same
+       * VFS helpers the path forms do. */
+      if (number == 190 || number == 193 || number == 196 || number == 199) {
+        char fdpath[VFS_MAX_PATH];
+        int rc = vfs_fd_abspath((int)arg0, fdpath, sizeof(fdpath));
+        if (rc < 0)
+          return (u64)rc;
+        if (number == 196) { /* flistxattr(fd, list, size) */
+          char list[XATTR_VALUE_MAX];
+          usize size = (usize)arg2;
+          isize lr = vfs_listxattr(fdpath, list, sizeof(list), 0);
+          if (lr < 0)
+            return (u64)lr;
+          if (size == 0)
+            return (u64)lr; /* size query */
+          if ((usize)lr > size)
+            return (u64)-ERANGE;
+          return syscall_copyout((void *)(usize)arg1, list, (usize)lr) == 0
+                     ? (u64)lr
+                     : (u64)-EFAULT;
+        }
+        char name[XATTR_NAME_MAX + 1];
+        if (syscall_copyinstr(name, sizeof(name), (const char *)(usize)arg1) < 0)
+          return (u64)-EFAULT;
+        if (number == 199)
+          return (u64)vfs_removexattr(fdpath, name, 0);
+        if (number == 190) { /* fsetxattr(fd, name, value, size, flags) */
+          usize size = (usize)arg3;
+          if (size > XATTR_VALUE_MAX)
+            return (u64)-E2BIG;
+          static char value[XATTR_VALUE_MAX];
+          if (size &&
+              syscall_copyin(value, (const void *)(usize)arg2, size) != 0)
+            return (u64)-EFAULT;
+          return (u64)vfs_setxattr(fdpath, name, value, size, (int)arg4, 0);
+        }
+        /* fgetxattr(fd, name, value, size) */
+        usize size = (usize)arg3;
+        static char value[XATTR_VALUE_MAX];
+        isize gr = vfs_getxattr(fdpath, name, value, sizeof(value), 0);
+        if (gr < 0)
+          return (u64)gr;
+        if (size == 0)
+          return (u64)gr; /* size query */
+        if ((usize)gr > size)
+          return (u64)-ERANGE;
+        return syscall_copyout((void *)(usize)arg2, value, (usize)gr) == 0
+                   ? (u64)gr
+                   : (u64)-EFAULT;
+      }
+
+      /* utime(132)(path, struct utimbuf{actime, modtime}); a NULL buffer means
+       * "now". The native handler takes the two stamps as arguments. */
+      if (number == 132) {
+        u64 times[2];
+        if (arg1) {
+          if (syscall_copyin(times, (const void *)(usize)arg1,
+                             sizeof(times)) != 0)
+            return (u64)-EFAULT;
+        } else {
+          times[0] = times[1] = vfs_get_unix_time();
+        }
+        return (u64)sys_utime((const char *)(usize)arg0, times[0], times[1]);
+      }
+
+      /* futimesat(261)(dirfd, path, struct timeval[2]). */
+      if (number == 261)
+        return (u64)sys_linux_utimensat((int)arg0, (const char *)(usize)arg1,
+                                        arg2, 0);
+
+      /* io_destroy(207)/io_cancel(210): b1nix keeps one AIO context per task and
+       * its worker completes a submitted request without an intermediate
+       * cancellable state, which is exactly the case Linux documents io_cancel
+       * as returning EINVAL for. */
+      if (number == 207) {
+        aio_task_cleanup(current_task);
+        return 0;
+      }
+      if (number == 210)
+        return (u64)-EINVAL;
+
+      /* recvmmsg(299)/sendmmsg(307): iterate the mmsghdr array over the
+       * single-message handlers — b1nix has no batched socket path. struct
+       * mmsghdr is { struct msghdr (56 bytes); unsigned msg_len; } padded to a
+       * 64-byte stride on x86_64. */
+      if (number == 299 || number == 307) {
+        int fd = (int)arg0;
+        u32 vlen = (u32)arg2;
+        int flags = (int)arg3;
+        u32 done = 0;
+        for (u32 i = 0; i < vlen; i++) {
+          u64 hdr = arg1 + (u64)i * 64;
+          isize r = (number == 307)
+                        ? sys_sendmsg(fd, (const struct syscall_msghdr *)(usize)hdr,
+                                      flags)
+                        : sys_recvmsg(fd, (struct syscall_msghdr *)(usize)hdr,
+                                      flags);
+          if (r < 0)
+            return done ? (u64)done : (u64)r;
+          u32 len32 = (u32)r;
+          if (syscall_copyout((void *)(usize)(hdr + 56), &len32,
+                              sizeof(len32)) != 0)
+            return (u64)-EFAULT;
+          done++;
+        }
+        return done;
+      }
+
+      /* rt_tgsigqueueinfo(297)(tgid, tid, sig, siginfo): only the signal number
+       * needs remapping before the native handler. */
+      if (number == 297) {
+        int b = linux_signo_to_b1nix((int)arg2);
+        if (b <= 0)
+          return (u64)-EINVAL;
+        arg2 = (u64)b;
+      }
+
+      /* Calls b1nix knowingly does not implement. Each one names a subsystem
+       * b1nix does not have; returning -ENOSYS is the documented Linux answer
+       * for an unimplemented call and every libc has a fallback path. Listing
+       * them here (instead of letting them fall through) keeps the boot log
+       * free of "unmapped syscall" noise for calls that are not gaps to close. */
+      switch (number) {
+      case 78:  /* getdents — pre-2.4 record layout; every libc uses getdents64 */
+      case 101: /* ptrace — no debugger interface (the GDB stub debugs the
+                 * kernel, not a task) */
+      case 64: case 65: case 66: case 220: /* SysV semaphores — b1nix ships
+                                            * POSIX mqueues, futexes and shm */
+      case 68: case 69: case 70: case 71:  /* SysV message queues — ditto */
+      case 161: /* chroot — no per-process filesystem root */
+      case 167: case 168: /* swapon/swapoff — the swap device is attached at
+                           * boot (kernel/mm/swap.c), not at runtime */
+      case 251: case 252: /* ioprio_get/set — the block layer has no I/O
+                           * priority classes */
+      case 276: case 278: /* tee/vmsplice — pipes have no shared page buffers */
+      case 303: case 304: /* name_to_handle_at/open_by_handle_at — no
+                           * persistent file handles */
+      case 334: /* rseq — no restartable sequences; libcs fall back cleanly */
+        return (u64)-ENOSYS;
+      default:
+        break;
+      }
+
       /* reboot(magic1, magic2, cmd, arg): the command Linux passes in arg2 is a
        * magic constant; SYS_REBOOT reads its own command from arg0. An
        * unrecognised command is EINVAL rather than a silent restart. */

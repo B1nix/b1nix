@@ -11,6 +11,8 @@
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
 #include <b1nix/page_cache.h>
+#include <b1nix/netdev.h>
+#include <b1nix/posix.h>
 #include <b1nix/procfs.h>
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
@@ -216,7 +218,42 @@ static void sysfs_build_block(struct vfs_node *root) {
 /* ── content generators ── */
 static int g_ostype(char *b, usize c) { return snprintf(b, c, "B1NIX\n"); }
 static int g_osrelease(char *b, usize c) { return snprintf(b, c, "%s\n", B1NIX_VERSION_STR); }
-static int g_hostname(char *b, usize c) { return snprintf(b, c, "b1nix\n"); }
+static int g_hostname(char *b, usize c) {
+  char h[65];
+  kernel_hostname_get(h, sizeof(h));
+  return snprintf(b, c, "%s\n", h);
+}
+static int g_domainname(char *b, usize c) {
+  char d[65];
+  kernel_domainname_get(d, sizeof(d));
+  return snprintf(b, c, "%s\n", d);
+}
+/* /sys/class/net/<if> attributes. The MAC comes from the registered driver;
+ * operstate/carrier come from its link_up callback, so both reflect the real
+ * device rather than a constant. */
+static int g_net_mac(char *b, usize c) {
+  struct netdev *nd = netdev_active();
+  if (!nd)
+    return snprintf(b, c, "00:00:00:00:00:00\n");
+  return snprintf(b, c, "%02x:%02x:%02x:%02x:%02x:%02x\n", nd->mac.bytes[0],
+                  nd->mac.bytes[1], nd->mac.bytes[2], nd->mac.bytes[3],
+                  nd->mac.bytes[4], nd->mac.bytes[5]);
+}
+static int g_net_operstate(char *b, usize c) {
+  struct netdev *nd = netdev_active();
+  int up = (nd && nd->link_up) ? nd->link_up(nd) : (nd != 0);
+  return snprintf(b, c, "%s\n", up ? "up" : "down");
+}
+static int g_net_carrier(char *b, usize c) {
+  struct netdev *nd = netdev_active();
+  int up = (nd && nd->link_up) ? nd->link_up(nd) : (nd != 0);
+  return snprintf(b, c, "%d\n", up ? 1 : 0);
+}
+static int g_lo_mac(char *b, usize c) {
+  return snprintf(b, c, "00:00:00:00:00:00\n");
+}
+static int g_lo_operstate(char *b, usize c) { return snprintf(b, c, "unknown\n"); }
+static int g_lo_carrier(char *b, usize c) { return snprintf(b, c, "1\n"); }
 static int g_kversion(char *b, usize c) {
   return snprintf(b, c, "#1 SMP b1nix\n");
 }
@@ -231,6 +268,53 @@ static int g_cpu_range(char *b, usize c) {
 static int g_memtotal(char *b, usize c) {
   u64 kb = pmm_total_usable_memory() / 1024;
   return snprintf(b, c, "%lu\n", (unsigned long)kb);
+}
+
+/* /sys/class/net — one directory per interface, with the attributes Linux
+ * network tools read (ip, ifconfig, busybox ifup). b1nix has the loopback
+ * device plus at most one registered NIC (kernel/net), named eth0 to match
+ * /proc/net/dev. */
+static void sysfs_build_net(struct vfs_node *root) {
+  /* sysfs_build_block already created /sys/class; reuse it rather than
+   * attaching a second directory with the same name. */
+  struct vfs_node *classp = 0;
+  for (struct vfs_node *c = root->first_child; c; c = c->next_sibling) {
+    if (strcmp(c->name, "class") == 0) {
+      classp = c;
+      break;
+    }
+  }
+  if (!classp)
+    classp = sysfs_mkchild(root, "class", VFS_DIRECTORY, 0);
+  if (!classp)
+    return;
+  struct vfs_node *netd = sysfs_mkchild(classp, "net", VFS_DIRECTORY, 0);
+  if (!netd)
+    return;
+
+  struct vfs_node *lo = sysfs_mkchild(netd, "lo", VFS_DIRECTORY, 0);
+  if (lo) {
+    sysfs_mkchild(lo, "address", VFS_DEVICE, g_lo_mac);
+    sysfs_mkchild(lo, "operstate", VFS_DEVICE, g_lo_operstate);
+    sysfs_mkchild(lo, "carrier", VFS_DEVICE, g_lo_carrier);
+    sysfs_mkstr(lo, "mtu", "65536\n");
+    sysfs_mkstr(lo, "ifindex", "1\n");
+    sysfs_mkstr(lo, "type", "772\n"); /* ARPHRD_LOOPBACK */
+    sysfs_mkstr(lo, "flags", "0x9\n"); /* IFF_UP|IFF_LOOPBACK */
+  }
+
+  if (!netdev_active())
+    return;
+  struct vfs_node *eth = sysfs_mkchild(netd, "eth0", VFS_DIRECTORY, 0);
+  if (!eth)
+    return;
+  sysfs_mkchild(eth, "address", VFS_DEVICE, g_net_mac);
+  sysfs_mkchild(eth, "operstate", VFS_DEVICE, g_net_operstate);
+  sysfs_mkchild(eth, "carrier", VFS_DEVICE, g_net_carrier);
+  sysfs_mkstr(eth, "mtu", "1500\n");
+  sysfs_mkstr(eth, "ifindex", "2\n");
+  sysfs_mkstr(eth, "type", "1\n");    /* ARPHRD_ETHER */
+  sysfs_mkstr(eth, "flags", "0x1003\n"); /* IFF_UP|IFF_BROADCAST|IFF_MULTICAST */
 }
 
 static struct vfs_fs sysfs_fs;
@@ -272,6 +356,7 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_mkchild(kern, "osrelease", VFS_DEVICE, g_osrelease);
   sysfs_mkchild(kern, "hostname", VFS_DEVICE, g_hostname);
   sysfs_mkchild(kern, "version", VFS_DEVICE, g_kversion);
+  sysfs_mkchild(kern, "domainname", VFS_DEVICE, g_domainname);
 
   struct vfs_node *dev = sysfs_mkchild(root, "devices", VFS_DIRECTORY, 0);
   struct vfs_node *sys = sysfs_mkchild(dev, "system", VFS_DIRECTORY, 0);
@@ -284,6 +369,7 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
   sysfs_mkchild(mem, "total_kb", VFS_DEVICE, g_memtotal);
 
   sysfs_build_block(root);
+  sysfs_build_net(root);
   return root;
 }
 
