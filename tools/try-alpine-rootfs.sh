@@ -10,7 +10,7 @@
 # to run and the machine powers itself off at the end.
 #
 # Needs network on the host (one download, cached under build/dist/) plus
-# mke2fs, grub-mkrescue and qemu-system-x86_64. Not part of `make iso` or the
+# mke2fs, limine/xorriso and qemu-system-x86_64. Not part of `make iso` or the
 # smoke suite: those must stay offline and deterministic.
 #
 # Usage: sh tools/try-alpine-rootfs.sh [alpine-version]
@@ -87,16 +87,9 @@ dd if=/dev/zero of="$IMG" bs=1M count=96 status=none
 	-L b1nix-root -d "$ROOT" -q "$IMG"
 
 rm -rf "$ISO_DIR"
-mkdir -p "$ISO_DIR/boot/grub"
-cp "$KERNEL" "$ISO_DIR/boot/kernel.elf"
-cp "$IMG" "$ISO_DIR/boot/rootfs.img"
-sed -e 's|@TIMEOUT@|0|g' -e "s|@ARCH@|$ARCH|g" \
-    -e 's|@CMDLINE@|init=/sbin/init|g' \
-    -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-    -e 's|@MODULE_CMD2@||g' \
-    "$PROJECT_DIR/boot/grub/grub.cfg" > "$ISO_DIR/boot/grub/grub.cfg"
-GRUB_MKRESCUE="$(command -v grub-mkrescue || command -v i686-elf-grub-mkrescue)"
-"$GRUB_MKRESCUE" -o "$ISO" "$ISO_DIR" >/dev/null 2>&1
+"$PROJECT_DIR/tools/mkiso.sh" --stage "$ISO_DIR" --out "$ISO" --arch "$ARCH" \
+    --kernel "$KERNEL" --timeout 0 --cmdline "init=/sbin/init" \
+    --module "$IMG:rootfs.img" >/dev/null
 
 # ── 4. Boot it ─────────────────────────────────────────────────────────────
 echo "[alpine] booting (log: $LOG)"

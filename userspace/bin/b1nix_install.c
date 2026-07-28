@@ -1,8 +1,8 @@
 /* b1nix-install — install b1nix onto a disk (RPi/cloud-image model).
  *
- * Copies a pre-baked, standalone-bootable disk image (MBR + real GRUB + ext4
+ * Copies a pre-baked, standalone-bootable disk image (MBR + Limine + ext4
  * root, built on the host by tools/images/mk-disk-image.sh, V8/Chromium excluded) onto
- * a target block device. No mkfs/grub/partitioning in-guest — the image already
+ * a target block device. No mkfs/bootloader/partitioning in-guest — the image already
  * has it all. After this, the target disk boots b1nix on its own.
  *
  *   b1nix-install [-y] [--no-packages] [<source-image>] <target-disk>

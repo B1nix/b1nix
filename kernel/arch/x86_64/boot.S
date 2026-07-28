@@ -54,7 +54,7 @@ stack_top:
 
 /* ---------------------------------------------------------------------------
  * Early boot. Linked LOW (.boot is at physical 1M, identity), 32-bit, paging
- * off. GRUB enters here (e_entry = _start, a low address reachable in 32-bit
+ * off. The bootloader enters here (e_entry = _start, a low address reachable in 32-bit
  * protected mode). Sets up page tables that map BOTH the low identity window
  * (for this code + physical access) AND the kernel's high window
  * (0xFFFFFFFF80000000), enables long mode, then trampolines up to the high VA.

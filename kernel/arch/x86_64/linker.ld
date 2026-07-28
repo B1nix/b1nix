@@ -11,7 +11,7 @@ KERNEL_VMA = 0xFFFFFFFF80000000;
 
 SECTIONS
 {
-	/* .boot runs at LOW physical (identity) — GRUB hands off in 32-bit
+	/* .boot runs at LOW physical (identity) — the loader hands off in 32-bit
 	 * protected mode with paging off, so the entry code, the multiboot header,
 	 * and the early page-table setup must be reachable below 4GB. */
 	. = 1M;

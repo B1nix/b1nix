@@ -81,13 +81,15 @@ download_ports() {
 
 local_ports() {
 	export B1NIX_ARCH="$ARCH"
-	echo "BUILD bash curl dropbear netsurf [$PKG_ARCH]"
+	echo "BUILD zsh curl dropbear netsurf [$PKG_ARCH]"
 	curl_dir="$(B1NIX_TLS="${B1NIX_TLS:-mbedtls}" "$ROOT_DIR/tools/ports/build-curl.sh")"
 	dropbear_src="$("$ROOT_DIR/tools/ports/build-dropbear.sh" all)"
 	netsurf_bin="$("$ROOT_DIR/tools/ports/build-netsurf-fb.sh")"
 
+	zsh_dir="$("$ROOT_DIR/tools/ports/build-zsh.sh")"
+
 	mkdir -p "$ROOTFS/bin"
-	cp "$bash_src/bash" "$ROOTFS/bin/bash"
+	cp "$zsh_dir/bin/zsh" "$ROOTFS/bin/zsh"
 	if [ -f "$curl_dir/bin/curl" ]; then
 		cp "$curl_dir/bin/curl" "$ROOTFS/bin/curl"
 	else
@@ -155,8 +157,23 @@ overlay_local_ports() {
 	local_curl="$ROOT_DIR/build/$ARCH/ports/curl/install/bin/curl"
 	[ -f "$local_curl" ] && { cp "$local_curl" "$ROOTFS/bin/curl"; echo "OVERLAY curl (locally built) [$PKG_ARCH]"; }
 
-	local_bash="$(ls "$ROOT_DIR"/build/src/bash/"$TRIPLET"/bash-*/bash 2>/dev/null | head -1)"
-	[ -n "${local_bash:-}" ] && { cp "$local_bash" "$ROOTFS/bin/bash"; echo "OVERLAY bash (locally built) [$PKG_ARCH]"; }
+	local_zsh="$ROOT_DIR/build/$ARCH/ports/zsh/install/bin/zsh"
+	[ -f "$local_zsh" ] && { cp "$local_zsh" "$ROOTFS/bin/zsh"; echo "OVERLAY zsh (locally built) [$PKG_ARCH]"; }
+	return 0
+}
+
+# The published package index still carries GNU bash, and download mode installs
+# every arch-matching entry it finds. bash was retired in M98 (zsh is the
+# interactive/login shell), so drop it after extraction rather than shipping a
+# GPLv3 shell nothing references — the index lives in a separate repo and cannot
+# be fixed from here. Also clears the rootfs staging dir of a bash left behind
+# by an earlier build, since that directory is populated incrementally.
+purge_retired_bash() {
+	if [ -e "$ROOTFS/bin/bash" ]; then
+		rm -f "$ROOTFS/bin/bash"
+		echo "PURGE bash (retired in M98; /bin/zsh is the shell) [$PKG_ARCH]"
+	fi
+	rm -f "$ROOTFS/etc/bash-smoke.sh"
 	return 0
 }
 
@@ -167,4 +184,5 @@ case "$MODE" in
 	*) echo "install-ports: mode must be 'download' or 'local'" >&2; exit 2 ;;
 esac
 
+purge_retired_bash
 stage_netsurf_assets

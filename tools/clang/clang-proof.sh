@@ -4,7 +4,7 @@
 # The b1nix-native clang-22 (~94MB; statically links LLVM + libstdc++, so its
 # only DT_NEEDED is libc.so.1) is far too big for the xxd-embedded initramfs, so
 # — exactly like rustc (tools/rust/rust-proof.sh) and d8 — it ships inside a
-# single self-contained ISO as a GRUB Multiboot2 module (ext4), which b1nix
+# single self-contained ISO as a Multiboot2 module (ext4), which b1nix
 # exposes as the ram0 block device. With b1nix.clangrun (handled in
 # kernel/main.c) the kernel mounts ram0 -> /mnt/clang and:
 #   (1) runs `clang --version` — the real version banner on serial proves the
@@ -118,22 +118,16 @@ echo "  clang.img = ${IMG_MB}MB"
 fi
 
 echo "=== [3/4] pack self-contained ISO (cmdline: b1nix.test=1 b1nix.clangrun) ==="
-MKRESCUE="$(command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)"
-[ -n "$MKRESCUE" ] || { echo "missing grub-mkrescue"; exit 1; }
 ISODIR="$OUT/iso"
-rm -rf "$ISODIR"; mkdir -p "$ISODIR/boot/grub"
-cp "$KELF" "$ISODIR/boot/kernel.elf"
-cp "$IMG" "$ISODIR/boot/clang.img"
+rm -rf "$ISODIR"
 # The clangrun block fires after the b1nix.test=1 smoke modules; CLANG_FOCUS=1
 # drops b1nix.test=1 so the (slow) compiler proof is reached promptly instead of
 # competing with the whole suite for the timeout budget.
 CMDLINE="${CLANG_CMDLINE:-b1nix.test=1 b1nix.clangrun}"
 [ "${CLANG_FOCUS:-0}" = "1" ] && CMDLINE="b1nix.clangrun"
-sed -e 's|@TIMEOUT@|0|g' -e 's|@ARCH@|x86_64|g' \
-    -e "s|@CMDLINE@|$CMDLINE|g" \
-    -e 's|@MODULE_CMD@|module2 /boot/clang.img clangimg|g' \
-    "$ROOT_DIR/boot/grub/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
-"$MKRESCUE" -o "$ISO" "$ISODIR" 2>/dev/null
+"$ROOT_DIR/tools/mkiso.sh" --stage "$ISODIR" --out "$ISO" --arch x86_64 \
+    --kernel "$KELF" --timeout 0 --cmdline "$CMDLINE" \
+    --module "$IMG:clangimg" >/dev/null
 
 echo "=== [4/4] run in QEMU ==="
 mkdir -p "$ROOT_DIR/smoke_run"

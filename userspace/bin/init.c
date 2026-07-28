@@ -45,7 +45,7 @@ static inline void b1nix_reboot(unsigned cmd) {
  * utilities, GUI apps, and the package/toolchain helpers. Run explicitly
  * elsewhere (or not at all in test mode) rather than via the discovery loop. */
 static const char *const excluded[] = {
-    "bash", "csh", "sh", "busybox",
+    "zsh", "csh", "sh", "busybox",
     "init", "telinit", "getty",
     "displayd", "netd",
     "dropbear", "dropbearconvert", "dropbearkey", "dbclient", "ssh",
@@ -388,15 +388,15 @@ static void run_and_wait(const char *path) {
 /* Scripts (the ELF loader itself has no shebang support, so run_script()
  * below parses #! and dispatches to the right shell). /etc/rc mirrors the
  * old inittab "si::sysinit:/etc/rc" entry: sets
- * up dirs and starts sshd. The *-smoke.sh scripts are the REAL busybox/bash
- * coverage (BB-SMOKE/POSIX-SMOKE/BASH-SMOKE) — busybox itself is excluded
+ * up dirs and starts sshd. The *-smoke.sh scripts are the REAL busybox/zsh
+ * coverage (BB-SMOKE/POSIX-SMOKE/ZSH-SMOKE) — busybox itself is excluded
  * from the discovery loop below because running the bare applet dispatcher
  * with no args does nothing; these scripts exercise its applets properly. */
 static const char *const scripts[] = {
     "/etc/rc",
     "/etc/posix-smoke.sh",
     "/etc/initctl-smoke.sh",
-    "/etc/bash-smoke.sh",
+    "/etc/zsh-smoke.sh",
     "/etc/bpkg-smoke.sh",
     "/etc/m40-smoke.sh",
     "/etc/m67-smoke.sh",
@@ -404,7 +404,7 @@ static const char *const scripts[] = {
 };
 
 /* Loader doesn't parse #!, so read the shebang ourselves and pick the
- * interpreter: bash-smoke.sh needs real bash arrays/[[ ]]/(( )) that
+ * interpreter: zsh-smoke.sh needs real zsh arrays/[[ ]]/(( )) that
  * /bin/sh (busybox ash) doesn't support. Defaults to /bin/sh when no
  * shebang names a specific interpreter. */
 static const char *shebang_interp(const char *path) {
@@ -419,8 +419,8 @@ static const char *shebang_interp(const char *path) {
   buf[n] = '\0';
   if (strncmp(buf, "#!", 2) != 0)
     return "/bin/sh";
-  if (strstr(buf, "/bin/bash") != NULL)
-    return "/bin/bash";
+  if (strstr(buf, "/bin/zsh") != NULL)
+    return "/bin/zsh";
   return "/bin/sh";
 }
 
@@ -570,7 +570,7 @@ static void m39_init_test(void) {
       "# comment line\n"
       "id:4:initdefault:\n"
       "si::sysinit:/etc/rc\n"
-      "co:2345:respawn:/bin/bash\n"
+      "co:2345:respawn:/bin/zsh\n"
       "tt:23:respawn:/bin/getty ttyS0\n"
       "lo:5:wait:/bin/true\n";
   int count = init_parse_inittab(test_tab, (int)sizeof(test_tab) - 1);

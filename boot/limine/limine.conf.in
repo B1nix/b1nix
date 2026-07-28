@@ -1,0 +1,52 @@
+# Limine config template for the b1nix live/test ISOs (BSD-2-Clause bootloader;
+# replaces the GPLv3 GNU GRUB configuration this repo used to carry). Expanded
+# by tools/mkiso.sh, which substitutes four placeholders: the boot-menu timeout
+# in seconds (0 boots entry 1 immediately), the build architecture used in the
+# menu titles, the kernel command line, and a whole-line MODULES placeholder
+# that becomes the module_path/module_string pair of every --module argument
+# (and disappears entirely when there are none). The placeholder names are
+# spelled out in tools/mkiso.sh rather than here, so this comment survives the
+# substitution intact.
+#
+# `resolution` asks Limine for the mode the kernel's Multiboot2 framebuffer tag
+# requests (1280x800x32, which also matches the virtio-gpu native scanout). It
+# applies on BIOS VBE and UEFI GOP alike, so b1nix gets a real linear
+# framebuffer on the metal instead of dropping back to VGA text.
+
+timeout: @TIMEOUT@
+default_entry: 1
+serial: yes
+
+/b1nix (@ARCH@)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@
+    resolution: 1280x800x32
+@MODULES@
+
+/b1nix (@ARCH@, single-user / emergency shell)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ b1nix.single
+    resolution: 1280x800x32
+@MODULES@
+
+/b1nix (@ARCH@, test orchestrator)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ init=/bin/init
+    resolution: 1280x800x32
+@MODULES@
+
+/b1nix (@ARCH@, text mode, no graphics)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ b1nix.nographics
+    textmode: yes
+@MODULES@
+
+/b1nix (@ARCH@, mount root from USB flash drive)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ root=LABEL=b1nix-root b1nix.xhci.run
+    resolution: 1280x800x32

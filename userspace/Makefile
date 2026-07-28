@@ -219,6 +219,8 @@ BINARIES += $(BUILD)/bin/m55_iostream
 BINARIES += $(BUILD)/bin/m64_clang_smoke
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
+# M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
+BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m71_aslr
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
@@ -300,8 +302,15 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # ── User programs ──
 # Base programs are PIE ELFs linked against musl through /lib/ld-musl-x86_64.so.1
 # (the GEN_* variables near the top of this file).
+# b1cc's own CFLAGS select -std=c23, which is strict ISO C: it hides the
+# POSIX/BSD declarations src/common.c uses (mkstemps, mkdtemp), and recent clang
+# rejects the resulting implicit declarations outright. Add _DEFAULT_SOURCE from
+# this side — b1cc is a submodule, so overriding its (`?=`-assigned) CFLAGS on
+# the sub-make command line keeps that checkout clean for check-b1cc-sync.
+B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native
+
 $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
-	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)"
+	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
 # The host b1cc links through the external musl driver (b1nix-musl-cc → musl
 # crt1.o + libc). B1CC_INTERNAL_LD must be UNSET to select the external linker:
@@ -1024,11 +1033,11 @@ endif
 		cp ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/libc.a $(ROOTFS)/lib/libb1nix.a ; \
 	fi
 	@mkdir -p $(ROOTFS)/etc
-	@printf "root:x:0:0:root:/root:/bin/bash\nuser:x:1000:1000:b1nix user:/home/user:/bin/bash\n" > $(ROOTFS)/etc/passwd
+	@printf "root:x:0:0:root:/root:/bin/zsh\nuser:x:1000:1000:b1nix user:/home/user:/bin/zsh\n" > $(ROOTFS)/etc/passwd
 	@printf 'root:$$6$$rootsalt$$DMaW/SWhAWN4kO5JlNx8ozBbTvstA7SEpK23VKJsNNwPfGKtVkA28Khht9Dlhody/oJANee.ewEebcJXbvL.T1:0:0:99999:7:::\nuser:$$6$$usersalt$$Yj4u6k0ECzcsaZL01tgtZmlWMRHoHrJR8mVBtKmTUJb5zwclLqVeQi6QTcE9t/R7ZtGHS74rVqEELrrKpsaNj0:0:0:99999:7:::\n' > $(ROOTFS)/etc/shadow
 	@printf "root:x:0:\ndaemon:x:1:\ntty:x:5:\ndisk:x:6:\nnet:x:7:\nwheel:x:10:root\nuucp:x:14:\nusers:x:1000:user\n" > $(ROOTFS)/etc/group
-	@printf "/bin/sh\n/bin/bash\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
-	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/bash/bpkg-smoke.sh,
+	@printf "/bin/sh\n/bin/zsh\n/bin/ash\n/opt/busybox/bin/busybox\n" > $(ROOTFS)/etc/shells
+	@# rootfs-overlay: /etc/rc, bpkg (script+fixtures), posix/zsh/bpkg-smoke.sh,
 	@# sshd init.d, bb-w6/bb-w2b fixtures — real files (not embedded kernel C
 	@# strings) copied verbatim onto the ext4 root. cp -R preserves the tree
 	@# structure and creates /etc, /bin, /pkgs subdirs as needed.

@@ -281,7 +281,7 @@ run_qemu() {
 
 		if [ "${SMOKE_V8_MODE:-0}" = "1" ]; then
 			# V8/d8 instance: the d8 binary is now embedded in the ISO as
-			# GRUB module2 (ram0), no separate sata0 disk needed.
+			# Multiboot2 module (ram0), no separate sata0 disk needed.
 			set -- "$@" -nic none -vga none \
 				${EXTRA_QEMU_ARGS:-}
 		elif [ "${SMOKE_FAST_SMP:-0}" != "1" ]; then
@@ -507,7 +507,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_OPENRC" 2>/dev/null
 fi
 if [ "$SMOKE_V8" = "1" ]; then
-	# v8-ext4.img is embedded in the V8 ISO as GRUB module2 (ram0), no disk copy needed.
+	# v8-ext4.img is embedded in the V8 ISO as a Multiboot2 module (ram0), no disk copy needed.
 	:
 fi
 
@@ -1784,19 +1784,29 @@ check_output "$LOG" "M63-SMOKE: ok seccomp-inherit" "a forked child inherits the
 check_output "$LOG" "M63-SMOKE: ok seccomp-nnp" "PR_SET/GET_NO_NEW_PRIVS round-trips"
 check_output "$LOG" "M63-SMOKE: done" "M63 seccomp-bpf suite completes"
 check_output "$LOG" "M73-SMOKE: done" "M73 modern-I/O suite completes"
-# ── bash: GNU bash 5.2 port (default shell) ──
-check_output "$LOG" "BASH-SMOKE: ok version" "GNU bash 5.2 reports BASH_VERSION"
-check_output "$LOG" "BASH-SMOKE: ok arrays" "bash indexed arrays work"
-check_output "$LOG" "BASH-SMOKE: ok dbracket-glob" "bash [[ ]] glob matching works"
-check_output "$LOG" "BASH-SMOKE: ok regex-match" "bash [[ =~ ]] regex matching works"
-check_output "$LOG" "BASH-SMOKE: ok arithmetic" "bash \$(( )) arithmetic works"
-check_output "$LOG" "BASH-SMOKE: ok brace-range" "bash {a..b} brace ranges work"
-check_output "$LOG" "BASH-SMOKE: ok cstyle-for" "bash C-style for loops work"
-check_output "$LOG" "BASH-SMOKE: ok pattern-subst" "bash \${var//x/y} substitution works"
-check_output "$LOG" "BASH-SMOKE: ok local-vars" "bash function local variables work"
-check_output "$LOG" "BASH-SMOKE: ok utf8-length" "bash counts UTF-8 characters, not bytes (HANDLE_MULTIBYTE)"
-check_output "$LOG" "BASH-SMOKE: ok utf8-substr" "bash substring extraction is UTF-8 character-aware"
-check_output "$LOG" "BASH-SMOKE: done" "bash feature smoke completes"
+# ── M98: GNU-free in-guest build tools (bmake + samurai replaced GNU Make) ──
+check_output "$LOG" "M98-SMOKE: ok make-is-bmake" "/bin/make answers bmake's -V (GNU Make rejects it), so it is the BSD make"
+check_output "$LOG" "M98-SMOKE: ok make-not-gnu" "/bin/make identifies as something other than GNU Make"
+check_output "$LOG" "M98-SMOKE: ok make-build" "bmake parses a Makefile, expands a variable and runs the recipe that creates the target"
+check_output "$LOG" "M98-SMOKE: ok make-uptodate" "a second bmake run does not re-run the recipe (target newer than its prerequisites)"
+check_output "$LOG" "M98-SMOKE: ok samu-version" "/bin/samu reports the Ninja file-format version it implements"
+check_output "$LOG" "M98-SMOKE: ok ninja-alias" "/bin/ninja is the samurai binary and runs"
+check_output "$LOG" "M98-SMOKE: ok samu-build" "samurai executes a build.ninja edge and produces the declared output"
+check_output "$LOG" "M98-SMOKE: ok samu-uptodate" "re-running a satisfied build graph is a no-op"
+check_output "$LOG" "M98-SMOKE: done" "M98 GNU-free build-tool suite completes"
+# ── zsh: the interactive/login shell (replaced GNU bash in M98) ──
+check_output "$LOG" "ZSH-SMOKE: ok version" "zsh reports ZSH_VERSION"
+check_output "$LOG" "ZSH-SMOKE: ok arrays" "zsh indexed arrays work (1-based, no KSH_ARRAYS)"
+check_output "$LOG" "ZSH-SMOKE: ok dbracket-glob" "zsh [[ ]] glob matching works"
+check_output "$LOG" "ZSH-SMOKE: ok regex-match" "zsh [[ =~ ]] regex matching works (zsh/regex linked in)"
+check_output "$LOG" "ZSH-SMOKE: ok arithmetic" "zsh \$(( )) arithmetic works"
+check_output "$LOG" "ZSH-SMOKE: ok brace-range" "zsh {a..b} brace ranges work"
+check_output "$LOG" "ZSH-SMOKE: ok cstyle-for" "zsh C-style for loops work"
+check_output "$LOG" "ZSH-SMOKE: ok pattern-subst" "zsh \${var//x/y} substitution works"
+check_output "$LOG" "ZSH-SMOKE: ok local-vars" "zsh function local variables work"
+check_output "$LOG" "ZSH-SMOKE: ok utf8-length" "zsh counts UTF-8 characters, not bytes"
+check_output "$LOG" "ZSH-SMOKE: ok utf8-substr" "zsh string subscripting is UTF-8 character-aware"
+check_output "$LOG" "ZSH-SMOKE: done" "zsh feature smoke completes"
 # ── M39: configurable init system ──
 check_output "$LOG" "M39-INIT: start" "M39 configurable-init self-test starts"
 check_output "$LOG" "M39-INIT: ok parse-inittab" "init parses /etc/inittab entries"

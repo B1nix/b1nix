@@ -3,7 +3,7 @@
 # in-guest, with its own clang + ld.lld.
 #
 # Ships the self-host module (tools/inguest/build-selfhost-module.sh) as the ram0
-# ext4 GRUB module and boots with b1nix.selfhostbuild, which makes the kernel
+# ext4 Multiboot2 module and boots with b1nix.selfhostbuild, which makes the kernel
 # spawn /mnt/build/bin/selfhost-build (userspace ELF) that reads srcs.txt,
 # compiles every kernel TU with clang, and links them with ld.lld, then verifies
 # the produced kernel.elf. Mirrors the rustc/clang proofs. Slow: ~92 clang
@@ -38,7 +38,7 @@ done
 # whole heavy smoke sequence alongside the build. Set SELFHOST_TESTMODE=1 to fall
 # back to the old b1nix.test=1 behaviour for comparison.
 # SELFHOST_DISK=1 sources the toolchain from a real SATA disk (b1nix.selfhostdisk
-# -> mount sata0) instead of the ram0 GRUB module. The module is a ramdisk whose
+# -> mount sata0) instead of the ram0 Multiboot2 module. The module is a ramdisk whose
 # ~217 MB stay pinned in RAM the whole build; a disk leaves that free and streams
 # the toolchain off AHCI through the (read-ahead) block cache, so the self-host
 # fits in less RAM.
@@ -47,27 +47,20 @@ MODE_FLAG="b1nix.selfhostonly"
 DISK_IMG=""
 if [ "${SELFHOST_DISK:-0}" = "1" ]; then
 	CMDLINE="$MODE_FLAG b1nix.selfhostbuild b1nix.selfhostdisk"
-	MODULE_CMD=""
 	# Build writes .o/TMPDIR onto the toolchain fs — use a throwaway copy so the
 	# source image is never mutated.
 	DISK_IMG="$OUT/selfhost-disk.img"
 	cp "$IMG" "$DISK_IMG"
 else
 	CMDLINE="$MODE_FLAG b1nix.selfhostbuild"
-	MODULE_CMD="module2 /boot/selfhost.img selfhostimg"
 fi
 echo "=== [1] pack self-contained ISO (cmdline: $CMDLINE) ==="
-MKRESCUE="$(command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null)"
-[ -n "$MKRESCUE" ] || { echo "missing grub-mkrescue"; exit 1; }
 ISODIR="$OUT/iso"
-rm -rf "$ISODIR"; mkdir -p "$ISODIR/boot/grub"
-cp "$KELF" "$ISODIR/boot/kernel.elf"
-[ "${SELFHOST_DISK:-0}" = "1" ] || cp "$IMG" "$ISODIR/boot/selfhost.img"
-sed -e 's|@TIMEOUT@|0|g' -e 's|@ARCH@|x86_64|g' \
-    -e "s|@CMDLINE@|$CMDLINE|g" \
-    -e "s|@MODULE_CMD@|$MODULE_CMD|g" \
-    "$ROOT_DIR/boot/grub/grub.cfg" > "$ISODIR/boot/grub/grub.cfg"
-"$MKRESCUE" -o "$ISO" "$ISODIR" 2>/dev/null
+rm -rf "$ISODIR"
+set -- --stage "$ISODIR" --out "$ISO" --arch x86_64 --kernel "$KELF" \
+       --timeout 0 --cmdline "$CMDLINE"
+[ "${SELFHOST_DISK:-0}" = "1" ] || set -- "$@" --module "$IMG:selfhostimg"
+"$ROOT_DIR/tools/mkiso.sh" "$@" >/dev/null
 
 echo "=== [2] run in QEMU ==="
 mkdir -p "$ROOT_DIR/smoke_run"

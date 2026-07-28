@@ -17,7 +17,7 @@
 #     1. Cross toolchain  — tools/toolchain/build-toolchain.sh  (only if missing)
 #     2. Userspace        — make ARCH=x86_64 userspace  (libc, crt0, ELF binaries)
 #     3. Kernel + ISO     — make ARCH=x86_64 KERNEL_CMDLINE=... iso
-#        (the default iso already embeds the shipping ports: curl, bash,
+#        (the default iso already embeds the shipping ports: curl, zsh,
 #         dropbear, busybox, netsurf, the M40 Linux + M67 rust artifacts, etc.)
 #
 # OPT-IN heavy/optional components (each just calls its existing script):
@@ -44,7 +44,7 @@
 # Each flag has an env equivalent (WITH_NATIVE_CLANG=1, WITH_V8=1, ...).
 # Other passthrough env:
 #     ARCH=x86_64             target arch (do not change; x86 is frozen)
-#     KERNEL_CMDLINE          grub cmdline for the final ISO (default b1nix.test=1)
+#     KERNEL_CMDLINE          kernel cmdline for the final ISO (default b1nix.test=1)
 #     ISO_TARGET              make iso target (default: iso)
 #
 # The cross toolchain and the kernel/ISO are the only mandatory stages; the cross

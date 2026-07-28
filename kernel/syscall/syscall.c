@@ -954,7 +954,8 @@ static u64 sys_selfhost_status(struct b1nix_selfhost_status *status) {
   copy_cstr(status->compiler, sizeof(status->compiler), "clang-native");
   copy_cstr(status->assembler, sizeof(status->assembler), "b1nix-as-abi");
   copy_cstr(status->linker, sizeof(status->linker), "b1nix-ld-abi");
-  copy_cstr(status->make, sizeof(status->make), "gnu-make-port");
+  /* M98: the GNU Make port is retired; /bin/make is bmake (NetBSD make). */
+  copy_cstr(status->make, sizeof(status->make), "bmake-port");
   return 0;
 }
 

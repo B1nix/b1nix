@@ -1,0 +1,31 @@
+# Limine config template for a b1nix system installed on a disk (the whole-disk
+# image built by tools/images/mk-disk-image.sh, which /bin/b1nix_install copies
+# onto a target disk). Unlike the live ISO config there is no rootfs.img module:
+# the root filesystem IS this partition, mounted by the kernel via root=
+# (kernel/main.c find_root_device). @CMDLINE@ carries root=LABEL=b1nix-root.
+#
+# Placeholders are the same ones tools/mkiso.sh substitutes for the ISO config;
+# mk-disk-image.sh expands @TIMEOUT@/@ARCH@/@CMDLINE@ itself and never has
+# modules to insert.
+
+timeout: @TIMEOUT@
+default_entry: 1
+serial: yes
+
+/b1nix (@ARCH@)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@
+    resolution: 1280x800x32
+
+/b1nix (@ARCH@, text mode, no graphics)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ b1nix.nographics
+    textmode: yes
+
+/b1nix (@ARCH@, single-user / emergency shell)
+    protocol: multiboot2
+    path: boot():/boot/kernel.elf
+    cmdline: @CMDLINE@ b1nix.single
+    resolution: 1280x800x32

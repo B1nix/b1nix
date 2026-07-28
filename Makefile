@@ -74,7 +74,6 @@ INITRAMFS_CACERT_INC := $(INC_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(INC_DIR)/initramfs_tlstest.inc
 INITRAMFS_DROPBEAR_INC := $(INC_DIR)/initramfs_dropbear.inc
 INITRAMFS_BUSYBOX_INC := $(INC_DIR)/initramfs_busybox.inc
-INITRAMFS_BASH_INC := $(INC_DIR)/initramfs_bash.inc
 INITRAMFS_TESTWAV_INC := $(INC_DIR)/initramfs_testwav.inc
 INITRAMFS_TESTFONT_INC := $(INC_DIR)/initramfs_testfont.inc
 # M40: a committed static Linux x86_64 ELF blob (tools/m40/linux_hello.bin)
@@ -240,7 +239,7 @@ INITRAMFS_M69_PLUGIN_INC := $(INC_DIR)/initramfs_m69_plugin.inc
 # the libc++-default b1nix-c++; libc++abi.so.1 folds the libunwind DWARF unwinder.
 INITRAMFS_LIBCXX_INC := $(INC_DIR)/initramfs_libcxx.inc
 INITRAMFS_LIBCXXABI_INC := $(INC_DIR)/initramfs_libcxxabi.inc
-# M91: Mesa shared libraries are stored in rootfs.img (GRUB module), not in
+# M91: Mesa shared libraries are stored in rootfs.img (Multiboot2 module), not in
 # the kernel initramfs (too large for clang source location limit).
 # See root-image target which copies .so files into $(BUILD_DIR)/rootfs/lib/.
 INITRAMFS_M91_SO_INCS := \
@@ -278,8 +277,9 @@ GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) 
 CURL_ELF := build/$(ARCH)/ports/curl/install/bin/curl
 DROPBEAR_VERSION := 2022.83
 DROPBEAR_ELF := build/$(ARCH)/ports/dropbear/dropbearmulti
-BASH_VERSION_NUM := 5.2.37
-BASH_ELF := build/src/bash/$(B1NIX_TRIPLET)/bash-$(BASH_VERSION_NUM)/bash
+ZSH_ELF := build/$(ARCH)/ports/zsh/install/bin/zsh
+BMAKE_ELF := build/$(ARCH)/ports/bmake/install/bin/bmake
+SAMU_ELF := build/$(ARCH)/ports/samurai/install/bin/samu
 B1NIX_TLS ?= mbedtls
 PORTS_SOURCE ?= download
 PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/index
@@ -289,17 +289,22 @@ PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/inde
 # self-host). CC/LD are assigned below, after CROSS_TOOLCHAIN_ROOT is known.
 TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
-GRUB_MKRESCUE := $(shell command -v grub-mkrescue 2>/dev/null || command -v grub2-mkrescue 2>/dev/null || command -v i686-elf-grub-mkrescue 2>/dev/null || echo /opt/homebrew/bin/i686-elf-grub-mkrescue)
+# ISO builder. Limine (BSD-2-Clause) + xorriso replaced GRUB's grub-mkrescue
+# (GPLv3) — see tools/mkiso.sh and boot/limine/limine.conf.in.
+MKISO := tools/mkiso.sh
+LIMINE := $(shell command -v limine 2>/dev/null)
 QEMU_X86_64 := qemu-system-x86_64
 # Default RAM for `make run`. QEMU's own default is only 128 MB, which OOMs on
 # heavy pages (a real browser tab with JavaScript needs far more). Override with
 # `make run RUN_MEM=2048`.
 RUN_MEM ?= 1024
 KERNEL_CMDLINE ?=
-# GRUB menu timeout in seconds. 0 = boot the default entry immediately (used by
-# the smoke harness so QEMU never stalls). Set e.g. GRUB_TIMEOUT=5 for an
-# interactive build where you want to see/select the boot menu.
+# Boot-menu timeout in seconds. 0 = boot the default entry immediately (used by
+# the smoke harness so QEMU never stalls). Set e.g. BOOT_TIMEOUT=5 for an
+# interactive build where you want to see/select the boot menu. GRUB_TIMEOUT is
+# kept as an alias for scripts written before the Limine migration.
 GRUB_TIMEOUT ?= 0
+BOOT_TIMEOUT ?= $(GRUB_TIMEOUT)
 
 # Persistent root image size in MB. 512MB fits native gcc + binutils + kernel
 # source for self-host (M26). Override with: make ROOT_IMAGE_SIZE=256 root-image
@@ -1077,15 +1082,20 @@ $(INITRAMFS_DROPBEAR_INC): $(DROPBEAR_ELF)
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_dropbear_elf $(DROPBEAR_ELF) > $@
 
-# GNU bash 5.2 — the default interactive shell (and /bin/sh). Built static
-# against the b1nix userspace libc by tools/ports/build-bash.sh (autotools cross
-# build with a preseeded config.cache).
-$(BASH_ELF): tools/ports/build-bash.sh tools/toolchain/bin/b1nix-autotools-cc $(USERSPACE_DEPS)
-	B1NIX_ARCH=$(ARCH) tools/ports/build-bash.sh >/dev/null
+# zsh — the default interactive shell and login shell (M98). It replaced GNU
+# bash, whose GPLv3 licence was the last one in the shipped userland. Needs the
+# netbsd-curses port for terminal handling, which build-zsh.sh resolves itself.
+$(ZSH_ELF): tools/ports/build-zsh.sh tools/ports/build-netbsd-curses.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-zsh.sh >/dev/null
 
-$(INITRAMFS_BASH_INC): $(BASH_ELF)
-	@mkdir -p $(dir $@)
-	xxd -i -n vfs_bash_elf $(BASH_ELF) > $@
+# In-guest build tools, both GNU-free (M98): bmake (BSD 3-clause NetBSD make)
+# ships as /bin/make and samurai (0BSD Ninja reimplementation) as /bin/samu with
+# a /bin/ninja alias. Together they replace the retired GNU Make port.
+$(BMAKE_ELF): tools/ports/build-bmake.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-bmake.sh >/dev/null
+
+$(SAMU_ELF): tools/ports/build-samurai.sh tools/toolchain/bin/b1nix-musl-autotools-cc $(USERSPACE_DEPS)
+	B1NIX_ARCH=$(ARCH) tools/ports/build-samurai.sh >/dev/null
 
 OPENSSL_LIB := build/$(ARCH)/ports/openssl/install/lib/libssl.a
 $(OPENSSL_LIB): tools/ports/build-openssl.sh tools/toolchain/bin/b1nix-autotools-cc
@@ -1300,17 +1310,9 @@ $(BUILD_DIR)/%.o: %.S
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
 iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix.iso $(BUILD_DIR)/iso
+	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
 	@echo "============================================================"
 	@echo " b1nix build summary ($(ARCH))"
 	@echo " ISO: $(BUILD_DIR)/b1nix.iso"
@@ -1321,120 +1323,72 @@ iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
 	@echo "============================================================"
 
 iso-core: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-core/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-core/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-core/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-core/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-core.iso $(BUILD_DIR)/iso-core
+	@$(MKISO) --stage $(BUILD_DIR)/iso-core --out $(BUILD_DIR)/b1nix-core.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 iso-graphics: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-graphics/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-graphics/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-graphics/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-graphics/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-graphics.iso $(BUILD_DIR)/iso-graphics
+	@$(MKISO) --stage $(BUILD_DIR)/iso-graphics --out $(BUILD_DIR)/b1nix-graphics.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 # OpenRC instance: boots the real init system as PID 1 (no test orchestrator) and
 # lets it drive sysinit/boot/default, then a local.d hook asks PID 1 to power the
 # machine off through /run/openrc/init.ctl — the control-FIFO path openrc-shutdown
 # and telinit use. A clean poweroff is the proof that the channel works.
 iso-openrc: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-openrc/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-openrc/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-openrc/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-openrc/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-openrc.iso $(BUILD_DIR)/iso-openrc
+	@$(MKISO) --stage $(BUILD_DIR)/iso-openrc --out $(BUILD_DIR)/b1nix-openrc.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 iso-shell: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-shell/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-shell/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-shell/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-shell/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-shell.iso $(BUILD_DIR)/iso-shell
+	@$(MKISO) --stage $(BUILD_DIR)/iso-shell --out $(BUILD_DIR)/b1nix-shell.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 # V8 run instance: the kernel hook (gated by b1nix.v8run) mounts sata0 -> /mnt/v8
 # and runs d8 on m58.js. It boots in test mode (b1nix.test=1) on purpose: the hook
 # loads d8 off the disk early — before the rc's M14 test touches sata0 — and the
 # active rc keeps the scheduler busy so d8's thread runs. (Without test mode, init
-# drops to an interactive getty/bash that starves d8 on a single CPU.) Reuses the
-# shared kernel.elf — no recompile, just a different grub cmdline. The d8 binary +
+# drops to an interactive getty/shell that starves d8 on a single CPU.) Reuses the
+# shared kernel.elf — no recompile, just a different boot cmdline. The d8 binary +
 # m58.js ride on build/v8-out/v8-ext4.img, attached as sata0 by tests/smoke.sh.
 iso-v8: $(KERNEL_ELF) root-image
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-v8/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-v8/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-v8/boot/rootfs.img
-	cp $(BUILD_ROOT)/v8-out/v8-ext4.img $(BUILD_DIR)/iso-v8/boot/v8.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|init=/bin/init b1nix.test=1 b1nix.v8run b1nix.smoke=v8|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@|module2 /boot/v8.img v8.img|g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-v8/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-v8.iso $(BUILD_DIR)/iso-v8
+	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "init=/bin/init b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img \
+	    --module $(BUILD_ROOT)/v8-out/v8-ext4.img:v8.img
 # NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
 # config and matches the jitless d8 on v8-ext4.img. The JIT d8 is exercised
 # manually (build the default ISO with b1nix.v8jit + the v8-jit-ext4.img disk).
 
 iso-live: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-live/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-live/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-live/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE)|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-live/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-live.iso $(BUILD_DIR)/iso-live
+	@$(MKISO) --stage $(BUILD_DIR)/iso-live --out $(BUILD_DIR)/b1nix-live.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 # Installer ISO: a live ISO that ALSO carries b1nix-disk.img so that, after
 # booting it, `b1nix_install /dev/<disk>` installs b1nix to that disk (the
-# installer auto-finds /mnt/iso/boot/b1nix-disk.img). Needs disk-image (root for
-# losetup/grub-install — passwordless sudo or run as root). Bigger ISO since it
-# ships both the live rootfs.img and the disk image.
+# installer auto-finds /mnt/iso/boot/b1nix-disk.img). Bigger ISO since it ships
+# both the live rootfs.img and the disk image. b1nix-disk.img just rides along
+# in the ISO root — it is a payload file, not a Multiboot2 module.
 disk-iso: disk-image iso-live
 	cp $(BUILD_DIR)/b1nix-disk.img $(BUILD_DIR)/iso-live/boot/b1nix-disk.img
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-installer.iso $(BUILD_DIR)/iso-live
-	@printf 'created %s\n  boot it, then run:  b1nix_install /dev/<target-disk>\n' "$(BUILD_DIR)/b1nix-installer.iso"
+	@$(MKISO) --stage $(BUILD_DIR)/iso-live --out $(BUILD_DIR)/b1nix-installer.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
+	@printf 'boot it, then run:  b1nix_install /dev/<target-disk>\n'
 
 iso-test: root-image check-dynamic $(KERNEL_ELF)
-	@test -n "$(GRUB_MKRESCUE)" || (echo "missing grub-mkrescue or i686-elf-grub-mkrescue"; exit 1)
-	@mkdir -p $(BUILD_DIR)/iso-test/boot/grub
-	cp $(KERNEL_ELF) $(BUILD_DIR)/iso-test/boot/kernel.elf
-	cp --reflink=auto $(BUILD_DIR)/root.ext4 $(BUILD_DIR)/iso-test/boot/rootfs.img
-	@sed -e 's|@TIMEOUT@|$(GRUB_TIMEOUT)|g' \
-	     -e 's|@ARCH@|$(ARCH)|g' \
-	     -e 's|@CMDLINE@|$(KERNEL_CMDLINE) init=/bin/init b1nix.test=1|g' \
-	     -e 's|@MODULE_CMD@|module2 /boot/rootfs.img rootfs.img|g' \
-	     -e 's|@MODULE_CMD2@||g' \
-	     boot/grub/grub.cfg > $(BUILD_DIR)/iso-test/boot/grub/grub.cfg
-	$(GRUB_MKRESCUE) -o $(BUILD_DIR)/b1nix-test.iso $(BUILD_DIR)/iso-test
+	@$(MKISO) --stage $(BUILD_DIR)/iso-test --out $(BUILD_DIR)/b1nix-test.iso \
+	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
+	    --cmdline "$(KERNEL_CMDLINE) init=/bin/init b1nix.test=1" \
+	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 userspace: $(USERSPACE_DEPS)
 
@@ -1487,7 +1441,7 @@ install-native-toolchain:
 		echo "      Run tools/build-native-clang.sh --b1nix-elf."; \
 	fi
 
-install-ports: userspace-install busybox-package install-native-toolchain $(BASH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF)
+install-ports: userspace-install busybox-package install-native-toolchain $(ZSH_ELF) $(CURL_ELF) $(DROPBEAR_ELF) $(NSFB_ELF) $(BMAKE_ELF) $(SAMU_ELF)
 	tools/packages/install-ports.sh $(BUILD_DIR)/rootfs $(ARCH) $(PORTS_SOURCE) $(PACKAGE_INDEX_URL)
 	@# The published dev package may carry older libc headers than this checkout.
 	@# Restore the current userspace ABI after package extraction so cross C++
@@ -1528,9 +1482,10 @@ install-kernel-source:
 # built the toolchain and then omitted it from the resulting image.
 iso-full: iso-live
 
-# Standalone-bootable disk image (MBR + real GRUB + ext4 root), excluding
+# Standalone-bootable disk image (MBR + Limine + ext4 root), excluding
 # V8/Chromium. The in-guest installer (/bin/b1nix_install) copies this onto a
-# target disk. Needs root for losetup/grub-install (the script re-execs sudo).
+# target disk. Runs entirely unprivileged: `limine bios-install` writes the boot
+# stages straight into the image file, so no losetup/mount/root is involved.
 disk-image: root-image $(KERNEL_ELF)
 	sh tools/images/mk-disk-image.sh $(ARCH) $(BUILD_DIR)/b1nix-disk.img
 
@@ -1649,6 +1604,33 @@ endif
 		cp "$$SKIA_DM" $(BUILD_DIR)/rootfs/bin/skia-dm; \
 		chmod +x $(BUILD_DIR)/rootfs/bin/skia-dm; \
 	fi
+	@# M98: zsh is the interactive/login shell in place of GNU bash. Its shell
+	@# functions (completion, prompts) are read from $$fpath at runtime, so they
+	@# ship alongside the binary.
+	@if [ -f $(ZSH_ELF) ]; then \
+		cp -f $(ZSH_ELF) $(BUILD_DIR)/rootfs/bin/zsh; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/zsh; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/share/zsh; \
+		cp -R build/$(ARCH)/ports/zsh/install/share/zsh/. \
+			$(BUILD_DIR)/rootfs/usr/share/zsh/ 2>/dev/null || true; \
+	fi
+	@# M98: the GNU-free in-guest build tools. bmake is /bin/make (nothing on the
+	@# target should have to know it is not GNU Make) and samurai is /bin/samu
+	@# plus a /bin/ninja alias. Real copies, not symlinks — the ext4 driver does
+	@# not follow them. bmake reads its system makefiles from /usr/share/mk.
+	@if [ -f $(BMAKE_ELF) ]; then \
+		cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/make; \
+		cp -f $(BMAKE_ELF) $(BUILD_DIR)/rootfs/bin/bmake; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/make $(BUILD_DIR)/rootfs/bin/bmake; \
+		mkdir -p $(BUILD_DIR)/rootfs/usr/share/mk; \
+		cp -f build/$(ARCH)/ports/bmake/install/share/mk/*.mk \
+			$(BUILD_DIR)/rootfs/usr/share/mk/ 2>/dev/null || true; \
+	fi
+	@if [ -f $(SAMU_ELF) ]; then \
+		cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/samu; \
+		cp -f $(SAMU_ELF) $(BUILD_DIR)/rootfs/bin/ninja; \
+		chmod +x $(BUILD_DIR)/rootfs/bin/samu $(BUILD_DIR)/rootfs/bin/ninja; \
+	fi
 	@# M40/M67: committed static ELF blobs (Linux ABI compat + Rust std smoke).
 	@# Only ever wired into the legacy xxd/.inc initramfs path (kernel/fs/
 	@# initramfs.c never gained a #include for them after the ext4-root
@@ -1738,7 +1720,8 @@ check-ports:
 check-tools:
 	@command -v $(CC) >/dev/null || (echo "missing $(CC)"; exit 1)
 	@command -v $(LD) >/dev/null || (echo "missing $(LD)"; exit 1)
-	@test -n "$(GRUB_MKRESCUE)" || echo "optional: missing grub-mkrescue/i686-elf-grub-mkrescue for ISO creation"
+	@test -n "$(LIMINE)" || echo "optional: missing limine for ISO creation"
+	@command -v xorriso >/dev/null || echo "optional: missing xorriso for ISO creation"
 	@command -v $(QEMU_X86_64) >/dev/null || echo "optional: missing qemu-system-x86_64 for running"
 
 clean:
@@ -1780,7 +1763,7 @@ test-b1cc:
 	@echo "Running b1cc host tests..."
 	$(MAKE) -C userspace/b1cc test
 
-# M64 native-Clang self-host proof: ship clang-22 in an ext4 GRUB module and run
+# M64 native-Clang self-host proof: ship clang-22 in an ext4 Multiboot2 module and run
 # it on b1nix (clang --version + clang -c hello.c). Needs build/native-clang/b1nix
 # (tools/build-native-clang.sh --b1nix-elf) and a kernel (make ARCH=x86_64 iso).
 clang-proof:
