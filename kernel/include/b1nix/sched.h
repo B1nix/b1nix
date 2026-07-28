@@ -334,6 +334,17 @@ int  scheduler_getrlimit_task(const struct task *t, int resource,
 /* Upper bound on concurrent tasks (the pid ceiling reported by
  * /proc/sys/kernel/pid_max). */
 usize scheduler_max_tasks(void);
+/* ioprio(2): per-task I/O class+level (carried, not yet an elevator input). */
+int scheduler_set_ioprio(usize pid, int ioprio);
+int scheduler_get_ioprio(usize pid);
+/* chroot(2): the calling task's filesystem root (NULL = the real root) and the
+ * absolute path it was set from. scheduler_set_root takes ownership of one
+ * reference on `node`. */
+struct vfs_node *scheduler_get_root_node(void);
+const char *scheduler_get_root_path(void);
+int scheduler_set_root(struct vfs_node *node, const char *path);
+/* swapoff(2): page every address space's swapped pages back in. */
+usize scheduler_swapin_all_tasks(void);
 int  scheduler_setrlimit(int resource, const struct rlimit *rlim);
 
 /* Per-CPU current task. `current_task` is the task running on THIS CPU; each

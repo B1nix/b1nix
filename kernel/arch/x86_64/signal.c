@@ -1,5 +1,7 @@
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/linux_abi.h>
+#include <b1nix/ptrace.h>
+#include <b1nix/rseq.h>
 #include <b1nix/sched.h>
 #include <b1nix/signal.h>
 #include <b1nix/syscall.h>
@@ -183,7 +185,13 @@ static void arch_build_signal_frame(struct interrupt_frame *frame, int sig,
 }
 
 void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
-    if (!current_task) return;
+  /* rseq(2): this is a return to ring 3 after something that could have
+   * preempted or migrated the task, which is exactly when the registered
+   * cpu_id must be refreshed and an interrupted critical section aborted. */
+  if (frame && (frame->cs == 0x1B || frame->cs == 0x23))
+    rseq_on_return_to_user(frame);
+
+  if (!current_task) return;
 
     /* Block signals during delivery check to prevent reentrancy issues */
     interrupts_disable();
@@ -210,6 +218,18 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
 
     for (int i = 1; i <= NSIG; i++) {
         if (pending & (1ULL << (i - 1))) {
+            /* ptrace(2): a traced task stops here instead of acting on the
+             * signal, and its tracer decides whether the signal is delivered,
+             * replaced or swallowed. */
+            if (ptrace_is_traced(current_task)) {
+                __atomic_fetch_and(&current_task->pending_signals,
+                                   ~(1ULL << (i - 1)), __ATOMIC_RELAXED);
+                interrupts_enable();
+                int consumed = ptrace_signal_stop(current_task, i, frame);
+                if (consumed)
+                    return;
+                interrupts_disable();
+            }
             struct sigaction *sa = &current_task->sigactions[i - 1];
             if (klog_debug_enabled("signal")) {
               char sigbuf[160];

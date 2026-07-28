@@ -15,6 +15,8 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/mm.h>
 #include <b1nix/serial.h>
 #include <b1nix/panic.h>
+#include <b1nix/ptrace.h>
+#include <b1nix/rseq.h>
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/serial_tty.h>
@@ -450,6 +452,11 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       scheduler_on_timer_tick();
       usb_kbd_poll(); /* M37: drain the USB HID keyboard's interrupt endpoint */
     }
+    /* rseq(2): the tick may have preempted (and the task may have come back on
+     * another CPU), so refresh the registered cpu ids and restart a critical
+     * section we would otherwise resume in the middle of. */
+    if (frame->cs == 0x1B || frame->cs == 0x23)
+      rseq_on_return_to_user(frame);
     return;
   }
 
@@ -557,6 +564,12 @@ static void x86_exception_handler_inner(struct interrupt_frame *frame) {
   /* M36: route #BP (int3, vector 3) and #DB (single-step, vector 1) to the
    * GDB serial stub when the kernel was booted with b1nix.gdb. Off by default
    * so an ordinary/test boot never blocks waiting on a host debugger. */
+  /* #DB from a PTRACE_SINGLESTEP: the tracee stops and its tracer sees the
+   * SIGTRAP, before the kernel-debugging stub gets a look at the vector. */
+  if (frame->vector == 1 && (frame->cs == 0x1B || frame->cs == 0x23) &&
+      ptrace_handle_debug_trap(frame))
+    return;
+
   if ((frame->vector == 3 || frame->vector == 1) &&
       bootinfo_has_flag("b1nix.gdb")) {
     gdb_stub_enter(frame);

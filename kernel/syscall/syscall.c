@@ -14,8 +14,12 @@
 #include <b1nix/posix.h>
 #include <b1nix/seccomp.h>
 #include <b1nix/rtc.h>
+#include <b1nix/ptrace.h>
+#include <b1nix/rseq.h>
 #include <b1nix/sched.h>
+#include <b1nix/blk.h>
 #include <b1nix/shm.h>
+#include <b1nix/sysv_ipc.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
@@ -1980,7 +1984,20 @@ static u8 lx_dirent_type(const struct dirent *d) {
  * dirent array; Linux expects variable-length linux_dirent64 records and a
  * byte count. Read a batch, repack as many as fit into the user buffer, then
  * rewind the directory index by the unemitted count so nothing is lost. */
+/* getdents(2) (Linux nr 78) — the pre-64-bit record:
+ *   { u64 d_ino; i64 d_off; u16 d_reclen; char d_name[]; '\0'; u8 d_type; }
+ * with d_type living in the LAST byte of the record rather than in a header
+ * field. Same directory walk as getdents64, different packing; `legacy`
+ * selects it. */
+static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
+                                       int legacy);
+
 static isize sys_linux_getdents64(int fd, u64 user_buf, usize count) {
+  return sys_linux_getdents_common(fd, user_buf, count, 0);
+}
+
+static isize sys_linux_getdents_common(int fd, u64 user_buf, usize count,
+                                       int legacy) {
   isize start = vfs_lseek(fd, 0, B1NIX_SEEK_CUR);
   if (start < 0)
     return start;
@@ -1995,22 +2012,35 @@ static isize sys_linux_getdents64(int fd, u64 user_buf, usize count) {
     usize namelen = 0;
     while (namelen < sizeof(kbuf[i].name) && kbuf[i].name[namelen])
       namelen++;
-    /* d_name starts at byte 19; record is padded to an 8-byte multiple. */
-    usize reclen = (19 + namelen + 1 + 7) & ~(usize)7;
+    /* getdents64: d_name starts at byte 19. getdents: d_name starts at byte
+     * 18 and the type byte is appended after the name's NUL. Both records are
+     * padded to an 8-byte multiple. */
+    usize reclen = legacy ? ((18 + namelen + 2 + 7) & ~(usize)7)
+                          : ((19 + namelen + 1 + 7) & ~(usize)7);
     if (written + reclen > count)
       break; /* no room; leave this and the rest for the next call */
 
-    char rec[19 + sizeof(kbuf[0].name) + 1 + 7];
+    char rec[19 + sizeof(kbuf[0].name) + 2 + 7];
     for (usize z = 0; z < reclen; z++)
       rec[z] = 0;
-    struct linux_dirent64 *de = (struct linux_dirent64 *)rec;
-    de->d_ino = (u64)(start + i + 1); /* b1nix dirent has no inode; synthesize */
-    de->d_off = (i64)(start + i + 1); /* opaque cookie: index of the next entry */
-    de->d_reclen = (u16)reclen;
-    de->d_type = lx_dirent_type(&kbuf[i]);
-    for (usize z = 0; z < namelen; z++)
-      de->d_name[z] = kbuf[i].name[z];
-    de->d_name[namelen] = '\0';
+    if (legacy) {
+      *(u64 *)&rec[0] = (u64)(start + i + 1);  /* d_ino  */
+      *(i64 *)&rec[8] = (i64)(start + i + 1);  /* d_off  */
+      *(u16 *)&rec[16] = (u16)reclen;          /* d_reclen */
+      for (usize z = 0; z < namelen; z++)
+        rec[18 + z] = kbuf[i].name[z];
+      rec[18 + namelen] = '\0';
+      rec[reclen - 1] = (char)lx_dirent_type(&kbuf[i]);
+    } else {
+      struct linux_dirent64 *de = (struct linux_dirent64 *)rec;
+      de->d_ino = (u64)(start + i + 1); /* b1nix dirent has no inode; synthesize */
+      de->d_off = (i64)(start + i + 1); /* opaque cookie: index of the next entry */
+      de->d_reclen = (u16)reclen;
+      de->d_type = lx_dirent_type(&kbuf[i]);
+      for (usize z = 0; z < namelen; z++)
+        de->d_name[z] = kbuf[i].name[z];
+      de->d_name[namelen] = '\0';
+    }
 
     if (copy_to_user((void *)(usize)(user_buf + written), rec, reclen) < 0)
       return -EFAULT;
@@ -2023,6 +2053,146 @@ static isize sys_linux_getdents64(int fd, u64 user_buf, usize count) {
   if (emitted == 0)
     return -EINVAL; /* buffer too small for even one entry */
   return (isize)written;
+}
+
+/* True when the caller is not privileged — small helper for the calls that
+ * gate one option on root rather than the whole syscall. */
+static int c_euid_not_root(void) {
+  struct cred *c = scheduler_get_current_cred();
+  return !(c && (c->euid == ROOT_UID || cred_has_cap(c, CAP_SYS_ADMIN)));
+}
+
+/* ── name_to_handle_at(2) / open_by_handle_at(2) ─────────────────────────────
+ * A file handle is an opaque token a program can store and later re-open
+ * without keeping a descriptor. b1nix filesystems have no persistent
+ * inode-to-path map, so the kernel keeps the resolved path in a table and puts
+ * that table's index in the handle. The handle therefore stays valid for the
+ * lifetime of the boot; Linux only promises validity while the filesystem
+ * stays mounted, so nothing portable depends on more than that. */
+#define FILE_HANDLE_MAX 128
+#define FILE_HANDLE_TYPE 0x62316e78 /* 'b1nx' */
+
+struct file_handle_slot {
+  char path[VFS_MAX_PATH];
+  u64 ino;
+  int used;
+};
+
+static struct file_handle_slot g_file_handles[FILE_HANDLE_MAX];
+static spinlock_t g_file_handle_lock = SPINLOCK_INIT;
+
+/* struct file_handle { u32 handle_bytes; int handle_type; u8 f_handle[]; } */
+static isize sys_linux_name_to_handle_at(int dirfd, const char *user_path,
+                                         u64 user_handle, u64 user_mount_id,
+                                         int flags) {
+  if (!user_handle)
+    return -EFAULT;
+  char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+  if (syscall_copyinstr(kpath, sizeof(kpath), user_path) < 0)
+    return -EFAULT;
+  if (kpath[0] != '/' && dirfd != AT_FDCWD) {
+    char dirbuf[VFS_MAX_PATH], joined[VFS_MAX_PATH];
+    int rc = vfs_fd_abspath(dirfd, dirbuf, sizeof(dirbuf));
+    if (rc < 0)
+      return rc;
+    usize dlen = (usize)rc;
+    if (dlen + 1 + strlen(kpath) >= sizeof(joined))
+      return -ENAMETOOLONG;
+    memcpy(joined, dirbuf, dlen);
+    joined[dlen] = '/';
+    strcpy(joined + dlen + 1, kpath);
+    memcpy(kpath, joined, sizeof(kpath));
+  }
+  vfs_resolve_path(kpath, resolved);
+
+  struct b1nix_stat st;
+  int sr = (flags & 0x400 /* AT_SYMLINK_FOLLOW */) ? vfs_stat(resolved, &st)
+                                                   : vfs_lstat(resolved, &st);
+  if (sr < 0)
+    return sr;
+
+  u32 handle_bytes = 0;
+  if (syscall_copyin(&handle_bytes, (const void *)(usize)user_handle,
+                     sizeof(handle_bytes)) < 0)
+    return -EFAULT;
+  /* The payload is one 32-bit table index. Linux's contract: too small a
+   * buffer reports EOVERFLOW after writing the required size. */
+  if (handle_bytes < sizeof(u32)) {
+    u32 need = sizeof(u32);
+    if (syscall_copyout((void *)(usize)user_handle, &need, sizeof(need)) < 0)
+      return -EFAULT;
+    return -EOVERFLOW;
+  }
+
+  u64 flags_irq;
+  spin_lock_irqsave(&g_file_handle_lock, &flags_irq);
+  int slot = -1;
+  for (int i = 0; i < FILE_HANDLE_MAX; i++) {
+    if (g_file_handles[i].used && g_file_handles[i].ino == st.st_ino &&
+        strcmp(g_file_handles[i].path, resolved) == 0) {
+      slot = i; /* same file: hand back the same handle */
+      break;
+    }
+  }
+  if (slot < 0) {
+    for (int i = 0; i < FILE_HANDLE_MAX; i++) {
+      if (g_file_handles[i].used)
+        continue;
+      strncpy(g_file_handles[i].path, resolved, VFS_MAX_PATH - 1);
+      g_file_handles[i].path[VFS_MAX_PATH - 1] = '\0';
+      g_file_handles[i].ino = st.st_ino;
+      g_file_handles[i].used = 1;
+      slot = i;
+      break;
+    }
+  }
+  spin_unlock_irqrestore(&g_file_handle_lock, flags_irq);
+  if (slot < 0)
+    return -ENOSPC;
+
+  struct {
+    u32 handle_bytes;
+    i32 handle_type;
+    u32 payload;
+  } out = {sizeof(u32), FILE_HANDLE_TYPE, (u32)slot};
+  if (syscall_copyout((void *)(usize)user_handle, &out, sizeof(out)) < 0)
+    return -EFAULT;
+  if (user_mount_id) {
+    i32 mount_id = 0; /* one namespace, one mount id */
+    if (syscall_copyout((void *)(usize)user_mount_id, &mount_id,
+                        sizeof(mount_id)) < 0)
+      return -EFAULT;
+  }
+  return 0;
+}
+
+static isize sys_linux_open_by_handle_at(int mount_fd, u64 user_handle,
+                                         int flags) {
+  (void)mount_fd; /* single mount namespace: any descriptor identifies it */
+  if (!user_handle)
+    return -EFAULT;
+  struct {
+    u32 handle_bytes;
+    i32 handle_type;
+    u32 payload;
+  } in;
+  if (syscall_copyin(&in, (const void *)(usize)user_handle, sizeof(in)) < 0)
+    return -EFAULT;
+  if (in.handle_type != FILE_HANDLE_TYPE || in.handle_bytes < sizeof(u32))
+    return -ESTALE;
+
+  char path[VFS_MAX_PATH];
+  u64 flags_irq;
+  spin_lock_irqsave(&g_file_handle_lock, &flags_irq);
+  if (in.payload >= FILE_HANDLE_MAX || !g_file_handles[in.payload].used) {
+    spin_unlock_irqrestore(&g_file_handle_lock, flags_irq);
+    return -ESTALE;
+  }
+  strncpy(path, g_file_handles[in.payload].path, VFS_MAX_PATH - 1);
+  path[VFS_MAX_PATH - 1] = '\0';
+  spin_unlock_irqrestore(&g_file_handle_lock, flags_irq);
+
+  return vfs_open_flags(path, linux_open_flags_to_b1nix(flags));
 }
 
 /* M40 — Linux arch_prctl. glibc and TLS-using Linux binaries set the FS base
@@ -5091,30 +5261,340 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         arg2 = (u64)b;
       }
 
+      /* getdents(78): the pre-64-bit record layout. */
+      if (number == 78)
+        return (u64)sys_linux_getdents_common((int)arg0, arg1, (usize)arg2, 1);
+
+      /* chroot(161): the calling task's filesystem root. Path resolution
+       * starts at this node and ".." clamps there (kernel/fs/vfs.c), so a
+       * chrooted task cannot name anything outside it. The node keeps a
+       * reference for as long as a task (or a fork child) names it. */
+      if (number == 161) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_CHROOT)))
+          return (u64)-EPERM;
+        char kpath[VFS_MAX_PATH], resolved[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
+            0)
+          return (u64)-EFAULT;
+        vfs_resolve_path(kpath, resolved);
+        struct vfs_node *n = vfs_find_node(resolved);
+        if (!n || IS_ERR(n))
+          return (u64)(n ? PTR_ERR(n) : -ENOENT);
+        if (n->inode->type != VFS_DIRECTORY) {
+          vfs_node_put(n);
+          return (u64)-ENOTDIR;
+        }
+        /* The stored root path is relative to the PREVIOUS root, which is what
+         * a nested chroot needs; the cwd moves to the new root because a cwd
+         * outside it could no longer be named (POSIX leaves this unspecified,
+         * and silently resolving the old cwd string under the new root would
+         * be worse than moving it). */
+        scheduler_set_root(n, resolved); /* takes the reference */
+        scheduler_set_cwd("/");
+        return 0;
+      }
+
+      /* swapon(167)(path, flags) / swapoff(168)(path): attach or detach the
+       * swap device at runtime. b1nix swaps to a whole block device, so the
+       * path names one under /dev. swapoff pages every swapped page back in
+       * first and refuses (EBUSY) if anything is still out there. */
+      if (number == 167 || number == 168) {
+        struct cred *c = scheduler_get_current_cred();
+        if (!c || (c->euid != ROOT_UID && !cred_has_cap(c, CAP_SYS_ADMIN)))
+          return (u64)-EPERM;
+        char kpath[VFS_MAX_PATH];
+        if (syscall_copyinstr(kpath, sizeof(kpath), (const char *)(usize)arg0) <
+            0)
+          return (u64)-EFAULT;
+        const char *devname = kpath;
+        for (const char *p = kpath; *p; p++)
+          if (*p == '/')
+            devname = p + 1;
+        struct block_device *dev = blk_get(devname);
+        if (!dev)
+          return (u64)-ENODEV;
+        if (number == 167) {
+          if (swap_active())
+            return (u64)-EBUSY;
+          vmm_set_swap_device(dev);
+          return swap_active() ? 0 : (u64)-EINVAL;
+        }
+        if (!swap_active())
+          return (u64)-EINVAL;
+        scheduler_swapin_all_tasks();
+        int dr = swap_detach();
+        if (dr == -2)
+          return (u64)-EBUSY;
+        return dr == 0 ? 0 : (u64)-EINVAL;
+      }
+
+      /* tee(276)(fd_in, fd_out, len, flags): duplicate pipe data without
+       * consuming it. vmsplice(278)(fd, iov, nr, flags): move user memory
+       * to/from a pipe — b1nix pipes copy, so this is readv/writev on the
+       * pipe end the descriptor names (SPLICE_F_GIFT only promises the kernel
+       * MAY take the pages, so copying satisfies it). */
+      if (number == 276) {
+        struct vfs_handle *hin = scheduler_fd_get((int)arg0);
+        struct vfs_handle *hout = scheduler_fd_get((int)arg1);
+        if (!hin || !hout)
+          return (u64)-EBADF;
+        return (u64)vfs_pipe_tee(hin, hout, (usize)arg2);
+      }
+      if (number == 278) {
+        struct vfs_handle *h = scheduler_fd_get((int)arg0);
+        if (!h)
+          return (u64)-EBADF;
+        if (h->kind == VFS_HANDLE_PIPE_WRITE)
+          return (u64)sys_writev((int)arg0,
+                                 (const struct b1nix_iovec *)(usize)arg1,
+                                 (int)arg2);
+        if (h->kind == VFS_HANDLE_PIPE_READ)
+          return (u64)sys_readv((int)arg0,
+                                (const struct b1nix_iovec *)(usize)arg1,
+                                (int)arg2);
+        return (u64)-EBADF;
+      }
+
+      /* ioprio_set(251)/ioprio_get(252): per-task I/O class and level. b1nix
+       * issues block requests synchronously (no reordering elevator), so the
+       * value is stored and reported but does not reorder I/O — the same
+       * observable behaviour Linux has with the `none` scheduler. */
+      if (number == 251 || number == 252) {
+        int which = (int)arg0;
+        if (which != 1 /* IOPRIO_WHO_PROCESS */)
+          return (u64)-EINVAL;
+        usize who = (usize)arg1;
+        if (number == 252)
+          return (u64)(isize)scheduler_get_ioprio(who);
+        int prio = (int)arg2;
+        int class = (prio >> 13) & 0x7;
+        if (class > 3) /* NONE/RT/BE/IDLE */
+          return (u64)-EINVAL;
+        if (class == 1 /* IOPRIO_CLASS_RT */ && c_euid_not_root())
+          return (u64)-EPERM;
+        return (u64)(isize)scheduler_set_ioprio(who, prio);
+      }
+
+      /* name_to_handle_at(303) / open_by_handle_at(304): opaque file handles.
+       * The handle carries the resolved path in a kernel-side table, so a
+       * handle stays valid for the lifetime of the boot (Linux only promises
+       * validity while the filesystem is mounted). */
+      if (number == 303)
+        return (u64)sys_linux_name_to_handle_at((int)arg0,
+                                                (const char *)(usize)arg1, arg2,
+                                                arg3, (int)arg4);
+      if (number == 304)
+        return (u64)sys_linux_open_by_handle_at((int)arg0, arg1, (int)arg2);
+
+      /* rseq(334)(rseq, len, flags, sig): restartable sequences. */
+      if (number == 334)
+        return (u64)rseq_register(current_task, arg0, (u32)arg1,
+                                  (u32)arg3,
+                                  ((u32)arg2 & 1) != 0 /* RSEQ_FLAG_UNREGISTER */);
+
+      /* ── System V semaphores (64 semget / 65 semop / 66 semctl /
+       *    220 semtimedop) and message queues (68 msgget / 69 msgsnd /
+       *    70 msgrcv / 71 msgctl). The IPC_CREAT/IPC_EXCL bits differ between
+       *    the ABIs exactly as they do for shmget, so they are remapped here;
+       *    everything else is copied in/out around the kernel implementations
+       *    in kernel/ipc/sysv_{sem,msg}.c. ── */
+      if (number == 64 || number == 68) { /* semget / msgget */
+        int lxflg = (int)((number == 64) ? arg2 : arg1);
+        int f = lxflg & 0777;
+        if (lxflg & 0x200) f |= IPC_CREAT;
+        if (lxflg & 0x400) f |= IPC_EXCL;
+        if (number == 64)
+          return (u64)(isize)sysv_semget((u32)arg0, (int)arg1, f);
+        return (u64)(isize)sysv_msgget((u32)arg0, f);
+      }
+      if (number == 65 || number == 220) { /* semop / semtimedop */
+        usize nops = (usize)arg2;
+        if (nops == 0 || nops > SEMMSL)
+          return (u64)-EINVAL;
+        struct sysv_sembuf ops[SEMMSL];
+        if (syscall_copyin(ops, (const void *)(usize)arg1,
+                           nops * sizeof(ops[0])) < 0)
+          return (u64)-EFAULT;
+        i64 timeout_ms = -1;
+        if (number == 220 && arg3) {
+          struct timespec ts;
+          if (syscall_copyin(&ts, (const void *)(usize)arg3, sizeof(ts)) < 0)
+            return (u64)-EFAULT;
+          timeout_ms = ts.tv_sec * 1000 + ts.tv_nsec / 1000000;
+          if (timeout_ms < 0)
+            return (u64)-EINVAL;
+        }
+        return (u64)(isize)sysv_semop((int)arg0, ops, nops, timeout_ms);
+      }
+      if (number == 66) { /* semctl(semid, semnum, cmd, arg) */
+        int semid = (int)arg0, semnum = (int)arg1, cmd = (int)arg2;
+        switch (cmd) {
+        case GETVAL:
+          return (u64)(isize)sysv_semctl_getval(semid, semnum);
+        case SETVAL:
+          return (u64)(isize)sysv_semctl_setval(semid, semnum, (int)arg3);
+        case GETPID:
+          return (u64)(isize)sysv_semctl_getpid(semid, semnum);
+        case GETNCNT:
+          return (u64)(isize)sysv_semctl_getcnt(semid, semnum, 0);
+        case GETZCNT:
+          return (u64)(isize)sysv_semctl_getcnt(semid, semnum, 1);
+        case IPC_RMID:
+          return (u64)(isize)sysv_semctl_rmid(semid);
+        case GETALL: {
+          u16 vals[SEMMSL];
+          int n = sysv_semctl_getall(semid, vals, SEMMSL);
+          if (n < 0)
+            return (u64)(isize)n;
+          if (syscall_copyout((void *)(usize)arg3, vals,
+                              (usize)n * sizeof(u16)) < 0)
+            return (u64)-EFAULT;
+          return 0;
+        }
+        case SETALL: {
+          struct sysv_semid_info info;
+          int rc = sysv_semctl_stat(semid, &info);
+          if (rc < 0)
+            return (u64)(isize)rc;
+          u16 vals[SEMMSL];
+          if (syscall_copyin(vals, (const void *)(usize)arg3,
+                             (usize)info.sem_nsems * sizeof(u16)) < 0)
+            return (u64)-EFAULT;
+          return (u64)(isize)sysv_semctl_setall(semid, vals, SEMMSL);
+        }
+        case IPC_STAT:
+        case IPC_SET: {
+          /* Linux struct semid_ds: struct ipc_perm (key,uid,gid,cuid,cgid,
+           * mode, __pad, seq at 4-byte granularity, 48 bytes total on x86_64)
+           * then sem_otime, sem_ctime, sem_nsems. Build it field by field so
+           * the b1nix ipc_perm layout stays private to the kernel. */
+          struct lx_semid_ds {
+            i32 key; u32 uid, gid, cuid, cgid; u16 mode, __pad1;
+            u16 seq, __pad2; u64 __unused1, __unused2;
+            i64 sem_otime; i64 sem_ctime; u64 sem_nsems;
+            u64 __unused3, __unused4;
+          } lds;
+          if (cmd == IPC_STAT) {
+            struct sysv_semid_info info;
+            int rc = sysv_semctl_stat(semid, &info);
+            if (rc < 0)
+              return (u64)(isize)rc;
+            memset(&lds, 0, sizeof(lds));
+            lds.key = (i32)info.sem_perm.key;
+            lds.uid = info.sem_perm.uid;
+            lds.gid = info.sem_perm.gid;
+            lds.cuid = info.sem_perm.cuid;
+            lds.cgid = info.sem_perm.cgid;
+            lds.mode = info.sem_perm.mode;
+            lds.seq = info.sem_perm.seq;
+            lds.sem_otime = (i64)info.sem_otime;
+            lds.sem_ctime = (i64)info.sem_ctime;
+            lds.sem_nsems = info.sem_nsems;
+            if (syscall_copyout((void *)(usize)arg3, &lds, sizeof(lds)) < 0)
+              return (u64)-EFAULT;
+            return 0;
+          }
+          if (syscall_copyin(&lds, (const void *)(usize)arg3, sizeof(lds)) < 0)
+            return (u64)-EFAULT;
+          return (u64)(isize)sysv_semctl_set(semid, (u16)lds.uid, (u16)lds.gid,
+                                             lds.mode);
+        }
+        default:
+          return (u64)-EINVAL;
+        }
+      }
+      if (number == 69 || number == 70) { /* msgsnd / msgrcv */
+        /* struct msgbuf { long mtype; char mtext[]; } */
+        usize size = (usize)arg2;
+        if (size > MSGMAX)
+          return (u64)-EINVAL;
+        static char msgtmp[MSGMAX];
+        if (number == 69) {
+          i64 mtype = 0;
+          if (syscall_copyin(&mtype, (const void *)(usize)arg1,
+                             sizeof(mtype)) < 0)
+            return (u64)-EFAULT;
+          if (size &&
+              syscall_copyin(msgtmp, (const void *)(usize)(arg1 + 8), size) < 0)
+            return (u64)-EFAULT;
+          return (u64)sysv_msgsnd((int)arg0, mtype, msgtmp, size, (int)arg3);
+        }
+        i64 got_type = 0;
+        isize n = sysv_msgrcv((int)arg0, (i64)arg3, msgtmp, size, (int)arg4,
+                              &got_type);
+        if (n < 0)
+          return (u64)n;
+        if (syscall_copyout((void *)(usize)arg1, &got_type,
+                            sizeof(got_type)) < 0)
+          return (u64)-EFAULT;
+        if (n && syscall_copyout((void *)(usize)(arg1 + 8), msgtmp, (usize)n) < 0)
+          return (u64)-EFAULT;
+        return (u64)n;
+      }
+      if (number == 71) { /* msgctl(msqid, cmd, buf) */
+        int msqid = (int)arg0, cmd = (int)arg1;
+        struct lx_msqid_ds {
+          i32 key; u32 uid, gid, cuid, cgid; u16 mode, __pad1;
+          u16 seq, __pad2; u64 __unused1, __unused2;
+          i64 msg_stime, msg_rtime, msg_ctime;
+          u64 msg_cbytes, msg_qnum, msg_qbytes;
+          i32 msg_lspid, msg_lrpid; u64 __unused3, __unused4;
+        } lds;
+        if (cmd == IPC_RMID)
+          return (u64)(isize)sysv_msgctl_rmid(msqid);
+        if (cmd == IPC_STAT) {
+          struct sysv_msqid_info info;
+          int rc = sysv_msgctl_stat(msqid, &info);
+          if (rc < 0)
+            return (u64)(isize)rc;
+          memset(&lds, 0, sizeof(lds));
+          lds.key = (i32)info.msg_perm.key;
+          lds.uid = info.msg_perm.uid;
+          lds.gid = info.msg_perm.gid;
+          lds.cuid = info.msg_perm.cuid;
+          lds.cgid = info.msg_perm.cgid;
+          lds.mode = info.msg_perm.mode;
+          lds.seq = info.msg_perm.seq;
+          lds.msg_stime = (i64)info.msg_stime;
+          lds.msg_rtime = (i64)info.msg_rtime;
+          lds.msg_ctime = (i64)info.msg_ctime;
+          lds.msg_qnum = info.msg_qnum;
+          lds.msg_qbytes = info.msg_qbytes;
+          if (syscall_copyout((void *)(usize)arg2, &lds, sizeof(lds)) < 0)
+            return (u64)-EFAULT;
+          return 0;
+        }
+        if (cmd == IPC_SET) {
+          if (syscall_copyin(&lds, (const void *)(usize)arg2, sizeof(lds)) < 0)
+            return (u64)-EFAULT;
+          return (u64)(isize)sysv_msgctl_set(msqid, (u16)lds.uid, (u16)lds.gid,
+                                             lds.mode, lds.msg_qbytes);
+        }
+        return (u64)-EINVAL;
+      }
+
       /* Calls b1nix knowingly does not implement. Each one names a subsystem
        * b1nix does not have; returning -ENOSYS is the documented Linux answer
        * for an unimplemented call and every libc has a fallback path. Listing
        * them here (instead of letting them fall through) keeps the boot log
        * free of "unmapped syscall" noise for calls that are not gaps to close. */
-      switch (number) {
-      case 78:  /* getdents — pre-2.4 record layout; every libc uses getdents64 */
-      case 101: /* ptrace — no debugger interface (the GDB stub debugs the
-                 * kernel, not a task) */
-      case 64: case 65: case 66: case 220: /* SysV semaphores — b1nix ships
-                                            * POSIX mqueues, futexes and shm */
-      case 68: case 69: case 70: case 71:  /* SysV message queues — ditto */
-      case 161: /* chroot — no per-process filesystem root */
-      case 167: case 168: /* swapon/swapoff — the swap device is attached at
-                           * boot (kernel/mm/swap.c), not at runtime */
-      case 251: case 252: /* ioprio_get/set — the block layer has no I/O
-                           * priority classes */
-      case 276: case 278: /* tee/vmsplice — pipes have no shared page buffers */
-      case 303: case 304: /* name_to_handle_at/open_by_handle_at — no
-                           * persistent file handles */
-      case 334: /* rseq — no restartable sequences; libcs fall back cleanly */
-        return (u64)-ENOSYS;
-      default:
-        break;
+      /* ptrace(101)(request, pid, addr, data). A PEEK returns the word itself,
+       * so it comes back through a separate out-parameter — the value is
+       * indistinguishable from an error code otherwise. */
+      if (number == 101) {
+        u64 word = 0;
+        isize rc = ptrace_request((long)arg0, (usize)arg1, arg2, arg3, &word);
+        if (rc < 0)
+          return (u64)rc;
+        if ((long)arg0 == PTRACE_PEEKTEXT || (long)arg0 == PTRACE_PEEKDATA) {
+          /* glibc/musl ptrace(2) wrappers pass a buffer in `data` for the PEEK
+           * requests; the raw syscall returns the word in rax. Do both. */
+          if (arg3)
+            syscall_copyout((void *)(usize)arg3, &word, sizeof(word));
+          return word;
+        }
+        return 0;
       }
 
       /* reboot(magic1, magic2, cmd, arg): the command Linux passes in arg2 is a

@@ -1193,9 +1193,15 @@ vfs_find_node_internal(const char *path, int follow_final, int symlink_depth) {
   parent_path[0] = '/';
   parent_path[1] = '\0';
 
-  vfs_node_get(root_node);
-  struct vfs_node *current = root_node;
-  current = vfs_cross_root_mount(current);
+  /* chroot(2): a chrooted task resolves absolute paths from its own root, not
+   * the real one. The node is ref-held by the task (kernel/sched/scheduler.c),
+   * so it cannot disappear under the walk. */
+  struct vfs_node *task_root = scheduler_get_root_node();
+  struct vfs_node *start = task_root ? task_root : root_node;
+  vfs_node_get(start);
+  struct vfs_node *current = start;
+  if (!task_root)
+    current = vfs_cross_root_mount(current);
   vfs_inode_lock_read(current->inode);
 
   char part[64];
@@ -1244,7 +1250,10 @@ restart_traversal:
       }
       __atomic_clear(&vfs_mount_lock, __ATOMIC_RELEASE);
 
-      struct vfs_node *parent = current->parent;
+      /* ".." must not escape a chroot: at the task's root it resolves to
+       * itself, exactly as it does at the real filesystem root. */
+      struct vfs_node *parent =
+          (task_root && current == task_root) ? 0 : current->parent;
       if (parent) {
         vfs_node_get(parent);
         vfs_inode_unlock_read(current->inode);

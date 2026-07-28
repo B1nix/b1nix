@@ -99,6 +99,69 @@ static isize pipe_write(struct vfs_handle *h, const char *buf, usize size) {
   return (isize)to_w;
 }
 
+/* tee(2): duplicate up to `len` bytes from one pipe to another WITHOUT
+ * consuming the source. Both descriptors must name pipes, and they must be
+ * different pipes (Linux returns EINVAL for a self-tee). Both pipe locks are
+ * taken in address order so two concurrent tees in opposite directions cannot
+ * deadlock. Copies at most what the source holds and the destination can take,
+ * which is exactly tee's contract (a short return is normal). */
+isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len) {
+  if (!in || !out || in->kind != VFS_HANDLE_PIPE_READ ||
+      out->kind != VFS_HANDLE_PIPE_WRITE)
+    return -EINVAL;
+  struct vfs_pipe *src = (struct vfs_pipe *)in->private_data;
+  struct vfs_pipe *dst = (struct vfs_pipe *)out->private_data;
+  if (!src || !dst || !src->used || !dst->used)
+    return -EIO;
+  if (src == dst)
+    return -EINVAL;
+
+  struct vfs_pipe *first = src < dst ? src : dst;
+  struct vfs_pipe *second = src < dst ? dst : src;
+  while (__atomic_test_and_set(&first->lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+  while (__atomic_test_and_set(&second->lock, __ATOMIC_ACQUIRE))
+    scheduler_yield();
+
+  isize res;
+  if (dst->readers == 0) {
+    res = -EPIPE;
+    goto out_unlock;
+  }
+  usize avail = src->size;
+  usize space = PIPE_BUFFER_SIZE - dst->size;
+  usize n = len;
+  if (n > avail)
+    n = avail;
+  if (n > space)
+    n = space;
+  if (n == 0) {
+    /* Nothing to copy: a writer-less empty source is EOF, otherwise the
+     * caller should retry (or block, which tee never does here). */
+    res = (avail == 0 && src->writers == 0) ? 0
+          : (avail == 0)                    ? -EAGAIN
+                                            : -EAGAIN;
+    goto out_unlock;
+  }
+  usize rp = src->read_pos;
+  for (usize i = 0; i < n; i++) {
+    dst->buffer[dst->write_pos] = src->buffer[rp];
+    dst->write_pos = (dst->write_pos + 1) % PIPE_BUFFER_SIZE;
+    rp = (rp + 1) % PIPE_BUFFER_SIZE;
+  }
+  dst->size += n; /* src->size deliberately untouched — tee does not consume */
+  res = (isize)n;
+
+out_unlock:
+  __atomic_clear(&second->lock, __ATOMIC_RELEASE);
+  __atomic_clear(&first->lock, __ATOMIC_RELEASE);
+  if (res > 0) {
+    scheduler_wake_all(dst);
+    scheduler_wake_all(vfs_poll_chan);
+  }
+  return res;
+}
+
 static int pipe_poll(struct vfs_handle *h, struct b1nix_pollfd *pfd) {
   struct vfs_pipe *pipe = (struct vfs_pipe *)h->private_data;
   if (!pipe || !pipe->used) { pfd->revents = B1NIX_POLLHUP; return 0; }

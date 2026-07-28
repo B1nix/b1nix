@@ -178,6 +178,30 @@ int swap_active(void)
     return swap_dev && swap_dev->write_blocks;
 }
 
+/* swapoff(2): detach the swap device. The caller must have paged every
+ * swapped-out page back in first (paging_swap_in_all_swapped per address
+ * space) — if any slot is still allocated the device is still in use and we
+ * refuse, exactly as Linux does when swapoff cannot free the area. Frees the
+ * allocation bitmap so a later swapon re-sizes it for its own device. */
+int swap_detach(void)
+{
+    if (!swap_dev)
+        return -1;
+    if (swap_used != 0)
+        return -2; /* pages still live in swap -> caller reports EBUSY */
+    if (swap_bitmap) {
+        kfree(swap_bitmap);
+        swap_bitmap = 0;
+    }
+    swap_dev = 0;
+    swap_start_lba = 0;
+    swap_sector_count = 0;
+    swap_slot_count = 0;
+    swap_next_slot = 0;
+    console_write("swap: device detached\n");
+    return 0;
+}
+
 /* Slot accounting for /proc/swaps and sysinfo(2). One slot is one page. */
 int swap_stats(u64 *out_total_slots, u64 *out_used_slots)
 {

@@ -7,6 +7,9 @@
 #include <b1nix/panic.h>
 #include <b1nix/posix.h>
 #include <b1nix/runqueue.h>
+#include <b1nix/ptrace.h>
+#include <b1nix/rseq.h>
+#include <b1nix/sysv_ipc.h>
 #include <b1nix/sched.h>
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
@@ -1131,6 +1134,9 @@ void sched_ap_reap_worker(struct task *t) {
 
 extern void x86_fork_child_trampoline(void);
 
+static void scheduler_root_inherit(struct task *child, struct task *parent);
+static void scheduler_root_clear(struct task *t);
+
 int scheduler_fork_current(void) {
   struct task *parent = current_task;
   if (!parent) {
@@ -1194,6 +1200,10 @@ int scheduler_fork_current(void) {
   // Clear inherited pending signals and sleep/block states.
   // POSIX fork: the child starts with an EMPTY pending set but INHERITS the
   // parent's blocked-signal mask.
+  /* rseq(2) areas are per-thread and are not inherited across fork. */
+  rseq_fork_clear(child);
+  /* A chroot IS inherited — the child stays inside the parent's root. */
+  scheduler_root_inherit(child, parent);
   child->pending_signals = 0;
   child->blocked_signals = parent->blocked_signals;
   child->last_stop_signal = 0;
@@ -1609,6 +1619,115 @@ u64 task_cstime(const struct task *t) {
   return g_task_cstime[task_index(t)];
 }
 usize scheduler_max_tasks(void) { return MAX_TASKS; }
+
+/* ── ioprio(2) ───────────────────────────────────────────────────────────────
+ * Per-task I/O scheduling class + level. b1nix issues block requests
+ * synchronously (kernel/dev/blk.c has no reordering elevator), so the value is
+ * carried and reported but does not reorder I/O — the same observable
+ * behaviour Linux has when the queue's scheduler is `none`. Kept per task so
+ * an elevator can consult it without another ABI change. */
+static u16 g_task_ioprio[MAX_TASKS];
+
+int scheduler_set_ioprio(usize pid, int ioprio) {
+  struct task *t = pid ? scheduler_task_by_pid(pid) : current_task;
+  if (!t)
+    return -ESRCH;
+  g_task_ioprio[task_index(t)] = (u16)ioprio;
+  return 0;
+}
+
+int scheduler_get_ioprio(usize pid) {
+  struct task *t = pid ? scheduler_task_by_pid(pid) : current_task;
+  if (!t)
+    return -ESRCH;
+  return (int)g_task_ioprio[task_index(t)];
+}
+
+/* ── chroot(2) ───────────────────────────────────────────────────────────────
+ * A task's filesystem root. NULL means the real root, so the common case costs
+ * nothing. The node is ref-held for as long as a task names it (inherited by
+ * fork, released at exit), which is what keeps the directory alive under the
+ * chrooted task even if it is unlinked from the parent tree. Path resolution
+ * starts here and clamps ".." at it — see vfs_find_node_internal. */
+static struct vfs_node *g_task_root_node[MAX_TASKS];
+static char g_task_root_path[MAX_TASKS][VFS_MAX_PATH];
+
+struct vfs_node *scheduler_get_root_node(void) {
+  if (!current_task)
+    return 0;
+  return g_task_root_node[task_index(current_task)];
+}
+
+const char *scheduler_get_root_path(void) {
+  if (!current_task)
+    return "/";
+  const char *p = g_task_root_path[task_index(current_task)];
+  return p[0] ? p : "/";
+}
+
+int scheduler_set_root(struct vfs_node *node, const char *path) {
+  if (!current_task)
+    return -EINVAL;
+  usize idx = task_index(current_task);
+  struct vfs_node *old = g_task_root_node[idx];
+  g_task_root_node[idx] = node; /* caller passes an already-referenced node */
+  if (path) {
+    strncpy(g_task_root_path[idx], path, VFS_MAX_PATH - 1);
+    g_task_root_path[idx][VFS_MAX_PATH - 1] = '\0';
+  } else {
+    g_task_root_path[idx][0] = '\0';
+  }
+  if (old)
+    vfs_node_put(old);
+  return 0;
+}
+
+static void scheduler_root_clear(struct task *t) {
+  if (!t)
+    return;
+  usize idx = task_index(t);
+  if (g_task_root_node[idx]) {
+    vfs_node_put(g_task_root_node[idx]);
+    g_task_root_node[idx] = 0;
+  }
+  g_task_root_path[idx][0] = '\0';
+}
+
+static void scheduler_root_inherit(struct task *child, struct task *parent) {
+  if (!child || !parent)
+    return;
+  usize ci = task_index(child), pi = task_index(parent);
+  g_task_root_node[ci] = g_task_root_node[pi];
+  if (g_task_root_node[ci])
+    vfs_node_get(g_task_root_node[ci]);
+  memcpy(g_task_root_path[ci], g_task_root_path[pi], VFS_MAX_PATH);
+}
+
+/* swapoff(2): page every swapped-out page of every live address space back
+ * into RAM, so no slot on the device is still referenced by a page table.
+ * Address spaces are shared by threads, so each distinct pml4 is walked once.
+ * Returns the number of address spaces processed. */
+usize scheduler_swapin_all_tasks(void) {
+  usize done = 0;
+  for (usize i = 0; i < g_task_hwm; i++) {
+    struct task *t = T(i);
+    if (t->state == TASK_UNUSED || t->state == TASK_REAPING || !t->pml4_phys)
+      continue;
+    int seen = 0;
+    for (usize j = 0; j < i; j++) {
+      struct task *p = T(j);
+      if (p->state != TASK_UNUSED && p->pml4_phys == t->pml4_phys) {
+        seen = 1;
+        break;
+      }
+    }
+    if (seen)
+      continue;
+    paging_swap_in_all_swapped(t->pml4_phys);
+    done++;
+  }
+  return done;
+}
 
 /* Per-task variant of scheduler_getrlimit, for /proc/<pid>/limits. */
 int scheduler_getrlimit_task(const struct task *t, int resource,
@@ -3011,6 +3130,12 @@ void scheduler_exit_current(int exit_code) {
   }
 
   aio_task_cleanup(current_task);
+  rseq_task_cleanup(current_task); /* rseq(2) area dies with the task */
+  /* SysV SEM_UNDO: give back every adjustment this task still owes, so a
+   * process that dies holding a semaphore does not wedge the set forever. */
+  sysv_sem_task_cleanup(current_task->id);
+  ptrace_task_cleanup(current_task); /* drop tracer/tracee links */
+  scheduler_root_clear(current_task); /* release a chroot's root reference */
 
   current_task->exit_code = exit_code;
   /* F-tier T4 prerequisite: claim stack_released BEFORE publishing DEAD.

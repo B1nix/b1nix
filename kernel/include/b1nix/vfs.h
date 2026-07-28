@@ -263,6 +263,8 @@ isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);
 isize vfs_getdents(int handle, struct dirent *buf, usize max_entries);
 int vfs_pipe(int pipefd[2]);
+/* tee(2): copy bytes between two pipes without consuming the source. */
+isize vfs_pipe_tee(struct vfs_handle *in, struct vfs_handle *out, usize len);
 
 /* mknod(2): only S_IFIFO (named pipes) and S_IFREG are creatable; character and
  * block special files have no userspace-creatable backing in b1nix and return

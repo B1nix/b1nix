@@ -35,6 +35,7 @@
 #include <b1nix/loop.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/shm.h>
+#include <b1nix/sysv_ipc.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/lapic.h>
 #include <b1nix/video.h>
@@ -289,6 +290,7 @@ void kernel_main(usize arg0, usize arg1)
 	filelock_init();
 	mqueue_init();
 	shm_init();
+	sysv_ipc_init(); /* SysV semaphores + message queues */
 	swap_init();
 	net_init();
 	ps2_kbd_init();

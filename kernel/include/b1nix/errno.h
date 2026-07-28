@@ -39,6 +39,10 @@
 #define ERANGE          34  /* Math result not representable */
 #define ENAMETOOLONG    36  /* File name too long */
 #define ENOSYS          38  /* Function not implemented */
+#define ENOMSG          42  /* No message of desired type */
+#define EIDRM           43  /* Identifier removed */
+#define EOVERFLOW       75  /* Value too large for defined data type */
+#define ESTALE         116  /* Stale file handle */
 #define ENOTEMPTY       39  /* Directory not empty */
 #define ELOOP           40  /* Too many symbolic links */
 #define ENOTSOCK        88  /* Socket operation on non-socket */

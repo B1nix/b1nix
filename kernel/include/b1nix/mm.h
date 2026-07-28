@@ -187,6 +187,11 @@ int swap_init(void);
 int swap_active(void);
 /* Slot accounting (one slot == one page): 0 on success, -1 if swap is off. */
 int swap_stats(u64 *out_total_slots, u64 *out_used_slots);
+/* swapoff(2) backing: 0 on success, -1 if no device, -2 if slots are still in
+ * use (the caller must page them back in first). */
+int swap_detach(void);
+/* Page every swapped-out page of an address space back into RAM. */
+void paging_swap_in_all_swapped(u64 pml4_phys);
 int swap_out(u64 physical_frame);
 int swap_in(u32 slot, u64 *out_physical_frame);
 void swap_free_slot_index(u32 slot);

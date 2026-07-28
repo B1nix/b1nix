@@ -436,6 +436,8 @@ KERNEL_SOURCES := \
 	kernel/dev/video.c \
 	kernel/ipc/mqueue.c \
 	kernel/ipc/shm.c \
+	kernel/ipc/sysv_sem.c \
+	kernel/ipc/sysv_msg.c \
 	kernel/sched/uidgid.c \
 	kernel/sched/runqueue.c \
 	kernel/sched/lockdep.c \
@@ -443,6 +445,8 @@ KERNEL_SOURCES := \
 	kernel/sched/m28_ctxbench.c \
 	kernel/sched/m28_heapbench.c \
 	kernel/sched/futex.c \
+	kernel/sched/rseq.c \
+	kernel/sched/ptrace.c \
 	kernel/sched/seccomp.c \
 	kernel/user/process.c \
 	$(ARCH_SOURCES)
