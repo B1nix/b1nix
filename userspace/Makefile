@@ -219,6 +219,8 @@ BINARIES += $(BUILD)/bin/m55_iostream
 BINARIES += $(BUILD)/bin/m64_clang_smoke
 BINARIES += $(BUILD)/bin/m57_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
+# M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
+BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
 BINARIES += $(BUILD)/bin/m71_aslr
 BINARIES += $(BUILD)/bin/m42_w5pre_smoke
@@ -300,8 +302,15 @@ build/bin/%: build/$(B1NIX_ARCH)/bin/%
 # ── User programs ──
 # Base programs are PIE ELFs linked against musl through /lib/ld-musl-x86_64.so.1
 # (the GEN_* variables near the top of this file).
+# b1cc's own CFLAGS select -std=c23, which is strict ISO C: it hides the
+# POSIX/BSD declarations src/common.c uses (mkstemps, mkdtemp), and recent clang
+# rejects the resulting implicit declarations outright. Add _DEFAULT_SOURCE from
+# this side — b1cc is a submodule, so overriding its (`?=`-assigned) CFLAGS on
+# the sub-make command line keeps that checkout clean for check-b1cc-sync.
+B1CC_HOST_CFLAGS ?= -std=c23 -D_DEFAULT_SOURCE -Wall -Wextra -O3 -flto -march=native
+
 $(B1CC): $(B1CC_DIR)/Makefile $(wildcard $(B1CC_DIR)/src/*.c)
-	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)"
+	$(MAKE) -C $(B1CC_DIR) CC="$(HOST_CC)" CFLAGS="$(B1CC_HOST_CFLAGS)"
 
 # The host b1cc links through the external musl driver (b1nix-musl-cc → musl
 # crt1.o + libc). B1CC_INTERNAL_LD must be UNSET to select the external linker:
