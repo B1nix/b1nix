@@ -66,6 +66,12 @@ typedef int i32;
 #define SYS_preadv          295
 #define SYS_getdents        78
 #define SYS_getpid          39
+#define SYS_sched_getaffinity 204
+#define SYS_capset          126
+#define SYS_setfsuid        122
+#define SYS_setfsgid        123
+#define SYS_getcwd          79
+#define SYS_chdir           80
 #define SYS_semget          64
 #define SYS_semop           65
 #define SYS_semctl          66
@@ -781,6 +787,171 @@ static void test_ptrace(void) {
   check("ptrace-cont", cont == 0 && exited, cont);
 }
 
+/* Affinity is a real restriction: pin to CPU 0, confirm the mask reads back,
+ * and confirm the task keeps running (a pinned task must still be scheduled). */
+static void test_affinity(void) {
+  unsigned long saved = 0;
+  sys3(SYS_sched_getaffinity, 0, sizeof(saved), &saved);
+
+  unsigned long only0 = 1;
+  long sr = sys3(SYS_sched_setaffinity, 0, sizeof(only0), &only0);
+  unsigned long got = 0;
+  long gr = sys3(SYS_sched_getaffinity, 0, sizeof(got), &got);
+  /* Still alive and scheduled after pinning: any syscall proves it. */
+  long alive = sys0(SYS_getpid);
+
+  unsigned long empty = 0;
+  long bad = sys3(SYS_sched_setaffinity, 0, sizeof(empty), &empty);
+
+  check("sched-affinity-pin",
+        sr == 0 && gr > 0 && got == 1 && alive > 0 && bad < 0, (long)got);
+
+  if (saved)
+    sys3(SYS_sched_setaffinity, 0, sizeof(saved), &saved);
+}
+
+/* capset(2) really drops a capability: after dropping CAP_SYS_TIME the
+ * privileged operation it guards must start failing, even though we are root. */
+static void test_capdrop(void) {
+  long pid = sys0(SYS_fork);
+  if (pid == 0) {
+    unsigned hdr[2] = {0x20080522u, 0}; /* _LINUX_CAPABILITY_VERSION_3 */
+    unsigned caps[6] = {0, 0, 0, 0, 0, 0};
+    long before = sys2(SYS_capget, hdr, caps);
+    /* CAP_SYS_TIME is bit 24 of the low word. Drop just that one. */
+    unsigned keep_eff = caps[0] & ~(1u << 24);
+    unsigned keep_perm = caps[1] & ~(1u << 24);
+    unsigned set[6] = {keep_eff, keep_perm, caps[2],
+                       caps[3],  caps[4],   caps[5]};
+    long cs = sys2(SYS_capset, hdr, set);
+
+    /* settimeofday needs CAP_SYS_TIME; with it dropped it must report EPERM
+     * even for uid 0. */
+    struct lx_timeval tv = {1700000000, 0};
+    long st = sys2(164 /* settimeofday */, &tv, 0);
+
+    /* And the drop must be visible through capget. */
+    unsigned after[6] = {0, 0, 0, 0, 0, 0};
+    long ag = sys2(SYS_capget, hdr, after);
+    int dropped = (ag == 0 && !(after[1] & (1u << 24)));
+
+    int rc = (before == 0 && cs == 0 && st == -1 /* EPERM */ && dropped) ? 0 : 1;
+    sys1(SYS_exit_group, rc);
+    for (;;)
+      ;
+  }
+  int status = -1;
+  long w = sys4(SYS_wait4, pid, &status, 0, 0);
+  check("capset-drop", pid > 0 && w == pid && (status & 0xff00) == 0,
+        pid > 0 ? (long)status : pid);
+}
+
+/* setfsuid(2) changes the id the filesystem checks against, without touching
+ * the effective uid. Run it in a child: a root-only file must become
+ * unreadable once fsuid is a plain user. */
+static void test_setfsuid(void) {
+  long fd = sys3(SYS_open, "/tmp/m40fsuid", O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd >= 0) {
+    sys3(SYS_write, fd, "x", 1);
+    sys1(SYS_close, fd);
+  }
+  long pid = sys0(SYS_fork);
+  if (pid == 0) {
+    long prev = sys1(SYS_setfsuid, 1000);
+    long now = sys1(SYS_setfsuid, 1000); /* returns the previous = 1000 */
+    long f = sys3(SYS_open, "/tmp/m40fsuid", O_RDONLY, 0);
+    if (f >= 0)
+      sys1(SYS_close, f);
+    /* Back to root, and the file is readable again. */
+    sys1(SYS_setfsuid, 0);
+    long f2 = sys3(SYS_open, "/tmp/m40fsuid", O_RDONLY, 0);
+    if (f2 >= 0)
+      sys1(SYS_close, f2);
+    int rc = (prev == 0 && now == 1000 && f < 0 && f2 >= 0) ? 0 : 1;
+    sys1(SYS_exit_group, rc);
+    for (;;)
+      ;
+  }
+  int status = -1;
+  long w = sys4(SYS_wait4, pid, &status, 0, 0);
+  check("setfsuid", pid > 0 && w == pid && (status & 0xff00) == 0,
+        pid > 0 ? (long)status : pid);
+  sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40fsuid", 0);
+}
+
+/* A tracer that is NOT the tracee's parent must still see its stops. The
+ * grandchild is traced by its uncle... concretely: child A forks B, then A
+ * attaches to B — A is B's parent, so instead we have the MAIN process attach
+ * to a grandchild, whose parent is the intermediate child. */
+static void test_ptrace_nonparent(void) {
+  int pipefd[2];
+  if (sys2(SYS_pipe2, pipefd, 0) < 0) {
+    fail("ptrace-nonparent", -1);
+    return;
+  }
+  long child = sys0(SYS_fork);
+  if (child == 0) {
+    long grand = sys0(SYS_fork);
+    if (grand == 0) {
+      /* Grandchild: spin until someone stops us, then exit. */
+      for (long i = 0; i < 200000000L; i++)
+        __asm__ volatile("pause");
+      sys1(SYS_exit_group, 0);
+      for (;;)
+        ;
+    }
+    /* Intermediate: tell the main process the grandchild's pid, then wait. */
+    sys3(SYS_write, pipefd[1], &grand, sizeof(grand));
+    int st = 0;
+    sys4(SYS_wait4, grand, &st, 0, 0);
+    sys1(SYS_exit_group, 0);
+    for (;;)
+      ;
+  }
+  long grandpid = 0;
+  long n = sys3(SYS_read, pipefd[0], &grandpid, sizeof(grandpid));
+
+  /* Attach to a task that is NOT our child and drive it. */
+  long att = sys4(SYS_ptrace, 16 /* PTRACE_ATTACH */, grandpid, 0, 0);
+  int status = 0;
+  long w = att == 0 ? sys4(SYS_wait4, grandpid, &status, 2 /* WUNTRACED */, 0)
+                    : -1;
+  int stopped = (w == grandpid) && ((status & 0xff) == 0x7f);
+  long kill_rc = sys4(SYS_ptrace, 8 /* PTRACE_KILL */, grandpid, 0, 0);
+
+  int cst = 0;
+  sys4(SYS_wait4, child, &cst, 0, 0);
+  sys1(SYS_close, pipefd[0]);
+  sys1(SYS_close, pipefd[1]);
+  check("ptrace-nonparent",
+        n == (long)sizeof(grandpid) && att == 0 && stopped && kill_rc == 0,
+        att);
+}
+
+/* chroot keeps a working directory that lies inside the new root, rewritten to
+ * the root-relative form. */
+static void test_chroot_cwd(void) {
+  sys2(SYS_mkdir, "/tmp/m40jail2", 0755);
+  sys2(SYS_mkdir, "/tmp/m40jail2/sub", 0755);
+  long pid = sys0(SYS_fork);
+  if (pid == 0) {
+    long cd = sys1(SYS_chdir, "/tmp/m40jail2/sub");
+    long cr = sys1(SYS_chroot, "/tmp/m40jail2");
+    char cwd[128];
+    long g = sys2(SYS_getcwd, cwd, sizeof(cwd));
+    int rc = (cd == 0 && cr == 0 && g >= 0 && seq(cwd, "/sub")) ? 0 : 1;
+    sys1(SYS_exit_group, rc);
+    for (;;)
+      ;
+  }
+  int status = -1;
+  long w = sys4(SYS_wait4, pid, &status, 0, 0);
+  check("chroot-keeps-cwd", pid > 0 && w == pid && (status & 0xff00) == 0,
+        pid > 0 ? (long)status : pid);
+  sys1(SYS_rmdir, "/tmp/m40jail2/sub");
+  sys1(SYS_rmdir, "/tmp/m40jail2");
+}
+
 void abi_main(void) {
   out("M40-ABI: start\n");
 
@@ -803,6 +974,11 @@ void abi_main(void) {
   test_swap_cycle();
   test_chroot();
   test_ptrace();
+  test_ptrace_nonparent();
+  test_affinity();
+  test_capdrop();
+  test_setfsuid();
+  test_chroot_cwd();
   test_documented_gaps();
 
   /* "done" is emitted ONLY when every check passed — the harness greps for it
