@@ -67,11 +67,8 @@ $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
 INITRAMFS_TCC_FILES_INC := $(INC_DIR)/initramfs_tcc_files.inc
-# b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus) is temporarily cut
-# from the build; restored as a separate change. B1NIX_NO_B1CC gates the kernel
-# initramfs table (kernel/fs/initramfs.c) and the smoke checks.
-CFLAGS_EXTRA += -DB1NIX_NO_B1CC
-INITRAMFS_B1CC_M34_INC :=
+# b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus)
+INITRAMFS_B1CC_M34_INC := $(INC_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
 INITRAMFS_CACERT_INC := $(INC_DIR)/initramfs_cacert.inc
 INITRAMFS_TLSTEST_INC := $(INC_DIR)/initramfs_tlstest.inc
@@ -260,11 +257,8 @@ endif
 INITRAMFS_USER_PROGRAM_INCS := \
 	$(addprefix $(INC_DIR)/initramfs_,$(addsuffix .inc,$(EMBEDDED_USER_PROGRAMS)))
 AP_TRAMPOLINE_INC := $(INC_DIR)/ap_trampoline.inc
-# b1cc smoke corpus temporarily cut (B1NIX_NO_B1CC above): embed nothing, and
-# never define B1CC_SELFHOST (the on-device self-host bundle needed the removed
-# old-libc crt0.o/libb1nix.a).
-INITRAMFS_B1CC_INCS :=
-INITRAMFS_B1CC_SELFHOST_INC :=
+INITRAMFS_B1CC_INCS := $(INITRAMFS_B1CC_M34_INC)
+INITRAMFS_B1CC_SELFHOST_INC := $(INC_DIR)/initramfs_b1cc_selfhost.inc
 
 ifdef MUSL_INSTALLED
 # Under musl the M69 dlopen plugin and the old b1nix-sysroot libc++ are replaced
@@ -518,7 +512,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
-	smoke smoke-quick graphics-smoke memory-smoke build-all
+	smoke smoke-quick graphics-smoke memory-smoke build-all test-b1cc
 
 all: check-b1cc-sync check-tcc-sync $(KERNEL_ELF)
 
@@ -1779,6 +1773,12 @@ smoke-quick:
 # this on every compiler tweak instead of the heavy full suite.
 smoke-b1cc:
 	sh tests/smoke-b1cc.sh $(ARCH)
+
+# Host-only b1cc test suite: builds b1cc natively and runs test.sh directly on
+# the developer machine without starting QEMU or building kernel ISO.
+test-b1cc:
+	@echo "Running b1cc host tests..."
+	$(MAKE) -C userspace/b1cc test
 
 # M64 native-Clang self-host proof: ship clang-22 in an ext4 GRUB module and run
 # it on b1nix (clang --version + clang -c hello.c). Needs build/native-clang/b1nix

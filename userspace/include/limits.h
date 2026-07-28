@@ -49,7 +49,7 @@
 #define UINT_MAX 4294967295U
 #endif
 
-#if defined(__x86_64__) || defined(__LP64__)
+#if defined(__x86_64__) || defined(__LP64__) || defined(__aarch64__) || defined(__arm64__)
 #ifndef LONG_MIN
 #define LONG_MIN (-9223372036854775807L - 1)
 #endif

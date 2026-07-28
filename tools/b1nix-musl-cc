@@ -48,6 +48,9 @@ MUSL_CFLAGS="--target=$B1NIX_TRIPLET -ffreestanding -nostdinc -fno-builtin -fno-
 AR_BIN="${AR:-$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)}"
 RANLIB_BIN="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}"
 
+LD_BIN="${LD:-$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)}"
+BUILTINS_LIB="$(find "$CLANG_RES_DIR/lib" -name "libclang_rt.builtins-x86_64.a" 2>/dev/null | head -1 || true)"
+
 # Parse arguments
 OUTPUT=""
 LINK_MODE="dynamic"  # static, dynamic, compile-only
@@ -109,15 +112,9 @@ if [ "${B1NIX_NO_CCACHE:-0}" != "1" ] && command -v ccache >/dev/null 2>&1; then
   CCACHE="ccache"
 fi
 
-# If no output specified, derive from first input
-if [ -z "$OUTPUT" ]; then
-  FIRST_INPUT=$(echo "$INPUT_FILES" | awk '{print $1}')
-  OUTPUT=$(echo "$FIRST_INPUT" | sed 's/\.[cSs]$//')
-fi
-
 case "$LINK_MODE" in
-  compile-only)
-    if [ -n "$OUTPUT" ]; then
+  compile)
+    if [ -n "$OUTPUT" ] && [ "$OUTPUT" != "a.out" ]; then
       exec $CCACHE clang $MUSL_CFLAGS $EXTRA_CFLAGS -c $INPUT_FILES -o "$OUTPUT"
     fi
     exec $CCACHE clang $MUSL_CFLAGS $EXTRA_CFLAGS -c $INPUT_FILES
@@ -132,7 +129,7 @@ case "$LINK_MODE" in
     done
 
     # Link statically: musl crt1 + crti + musl libc.a + crtn
-    $CCACHE clang --target=$B1NIX_TRIPLET -nostdlib -static \
+    $LD_BIN -m elf_x86_64 -static \
       $EXTRA_LDFLAGS \
       $MUSL_CRT1 $MUSL_CRTI \
       $TMPOBJS \
@@ -156,11 +153,6 @@ with open(f, 'r+b') as fh:
   dynamic)
     # Dynamic linking: produce a PIE/ET_DYN that imports from musl's libc.so
     # via the kernel's in-kernel eager dynamic linker.
-    #
-    # The kernel loads DT_NEEDED libraries by searching $ORIGIN/../lib/<name>,
-    # /lib/<name>, and /mnt/root/lib/<name>. We install musl's libc.so as
-    # /lib/ld-musl-x86_64.so.1 in the rootfs, and pass the .so file directly
-    # to the linker so DT_NEEDED uses just the filename (no path prefix).
     MUSL_LDSONAME="ld-musl-x86_64.so.1"
     MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
 
@@ -190,13 +182,14 @@ with open(f, 'r+b') as fh:
     # Link as PIE/ET_DYN against musl's shared library.
     # -pie produces ET_DYN (required for b1nix's in-kernel dynamic linker).
     # The .so is passed directly (not via -l) so DT_NEEDED = "ld-musl-x86_64.so.1".
-    $CCACHE clang --target=$B1NIX_TRIPLET -nostdlib -pie \
-      -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
       $EXTRA_LDFLAGS \
       $MUSL_SCRT1 $MUSL_CRTI \
       $TMPOBJS \
       -L"$MUSL_LINK_DIR" -l:ld-musl-x86_64.so.1 \
       $MUSL_CRTN \
+      ${BUILTINS_LIB:+"$BUILTINS_LIB"} \
       -o "$OUTPUT"
 
     # Patch ELF header: set EI_OSABI to ELFOSABI_LINUX (3) so b1nix
@@ -216,12 +209,6 @@ with open(f, 'r+b') as fh:
     ;;
   ldso)
     # Real userspace ld.so mode (musl-port.md).
-    # Produces a PIE with a genuine PT_INTERP pointing at musl's own
-    # ld-musl-x86_64.so.1 (its libc.so doubles as its dynamic linker, same as
-    # upstream musl on Linux). The kernel loads the interpreter's segments
-    # unrelocated and hands it control; musl's ld.so then loads/links this
-    # binary's own DT_NEEDED graph itself via ordinary syscalls — no
-    # in-kernel eager linking involved for this binary at all.
     MUSL_LDSONAME="ld-musl-x86_64.so.1"
     MUSL_SCRT1="$MUSL_LIB/Scrt1.o"
 
@@ -237,14 +224,15 @@ with open(f, 'r+b') as fh:
       TMPOBJS="$TMPOBJS $OBJ"
     done
 
-    $CCACHE clang --target=$B1NIX_TRIPLET -nostdlib -pie \
-      -Wl,-dynamic-linker,/lib/ld-musl-x86_64.so.1 \
+    $LD_BIN -m elf_x86_64 -pie --allow-shlib-undefined \
+      -dynamic-linker /lib/ld-musl-x86_64.so.1 \
       -L"$MUSL_SRC_BUILD/lib" \
       $EXTRA_LDFLAGS \
       $MUSL_SCRT1 $MUSL_CRTI \
       $TMPOBJS \
       -lc \
       $MUSL_CRTN \
+      ${BUILTINS_LIB:+"$BUILTINS_LIB"} \
       -o "$OUTPUT"
 
     python3 -c "

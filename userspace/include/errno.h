@@ -5,12 +5,17 @@
 extern "C" {
 #endif
 
-extern int errno;
-
-/* Linux/musl-style errno accessor. b1nix errno is a single global, so this
- * returns &errno. Provided because the Rust standard library (and some ports)
- * read errno exclusively through __errno_location(). */
+#ifdef __APPLE__
+extern int *__error(void);
+#ifndef errno
+#define errno (*__error())
+#endif
+#else
 int *__errno_location(void);
+#ifndef errno
+#define errno (*__errno_location())
+#endif
+#endif
 
 /* Normalize kernel error codes to valid POSIX errno values.
    Returns EIO for out-of-range codes. */

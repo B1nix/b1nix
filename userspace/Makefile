@@ -28,6 +28,10 @@ B1NIX_CXX ?= ../tools/toolchain/bin/b1nix-c++
 # libc + its static b1nix-cc/crt0.o path were removed in the M92 migration).
 TCC_CC := ../tools/b1nix-musl-cc
 B1CC_BINS_CC := $(realpath ../tools/b1nix-musl-cc)
+B1CC_DIR := b1cc
+B1CC := $(B1CC_DIR)/build/b1cc
+B1CC_SELF_SRCS := $(filter-out b1cc/src/b1cc_token_lexer.c, $(wildcard b1cc/src/*.c))
+B1CC_BINS := b1cc_argv b1cc_better_c b1cc_file_write b1cc_hello b1cc_m34 b1cc_m34_corpus b1cc_stderr_exit
 LIBM_DIR := ../build/$(B1NIX_ARCH)/ports/openlibm/install
 LIBS_DIR := ../build/$(B1NIX_ARCH)/libs
 # ── musl paths (must be before CFLAGS so $(MUSL_INCLUDE) expands) ───────
@@ -249,10 +253,8 @@ BINARIES += $(BUILD)/bin/m_posixmm_smoke
 BINARIES += $(BUILD)/bin/m92_abi_smoke
 # M92: musl POSIX smoke test (built with LINK=musl)
 BINARIES += $(BUILD)/bin/musl_posix_smoke
-# b1cc (standalone "better C" compiler + its M5/M7/M32-M34 smoke binaries) is
-# temporarily cut from the build; restored as a separate change. None of the
-# b1cc host-compiled smokes, the on-device /bin/b1cc, or b1cc_selfsmoke are
-# added to BINARIES.
+# b1cc (standalone "better C" compiler + its M5/M7/M32-M34 smoke binaries)
+BINARIES += $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke
 
 ifeq ($(B1NIX_ARCH),x86_64)
 BINARIES += $(BUILD)/bin/m30_dynamic
@@ -260,7 +262,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/tcc $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -941,13 +943,13 @@ tcc/config.h:
 	@printf '%s\n' '#define GCC_MINOR 0' >> $@
 	@printf '%s\n' '#define CONFIG_TCC_PREDEFS 1' >> $@
 
-$(BUILD)/bin/tcc: tcc/tcc.c $(BESPOKE_LIBDEP) $(GEN_LIBDEP) $(BUILD)/host/c2str tcc/config.h
+$(BUILD)/bin/tcc: tcc/tcc.c $(BESPOKE_LIBDEP) $(GEN_LIBDEP) $(BUILD)/host/c2str tcc/config.h $(B1CC)
 	@mkdir -p $(dir $@)
 	$(BUILD)/host/c2str tcc/include/tccdefs.h tcc/tccdefs_.h
 ifeq ($(B1NIX_ARCH),x86)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(TCC_CC) tcc/tcc.c -o $@ -DTCC_TARGET_I386 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\""
 else
-	B1NIX_ARCH=$(B1NIX_ARCH) $(TCC_CC) tcc/tcc.c -o $@ -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\"" -DCONFIG_TCC_ELFINTERP="\"/lib/ld-musl-x86_64.so.1\""
+	B1NIX_CC=$(B1CC_BINS_CC) $(B1CC) --target=$(B1NIX_ARCH)-b1nix tcc/tcc.c -o $@ -Itcc -Itcc/include -DTCC_TARGET_X86_64 -DCONFIG_TCCDIR="\"/lib/tcc\"" -DCONFIG_TCC_SYSINCLUDEPATHS="\"/include:/lib/tcc/include\"" -DCONFIG_TCC_LIBPATHS="\"/lib\"" -DCONFIG_TCC_CRTPREFIX="\"/lib\"" -DCONFIG_TCC_ELFINTERP="\"/lib/ld-musl-x86_64.so.1\""
 endif
 
 # libtcc1.a — TCC's compiler runtime (alloca, __va_start, atomics, integer
