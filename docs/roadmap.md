@@ -738,3 +738,13 @@ Status:
 - [ ] `planned` `request_module` kernel call and shell `modprobe` alias naming.
 - [ ] `planned` Module Dependencies parsing (`depends=`) and `modules.dep`.
 - [ ] `planned` M97 Smoke Test for network protocol modules and params.
+
+## M98: GNU-Free ISO (Limine bootloader + BSD build tools)
+
+See [`docs/gnu-less-plan.md`](gnu-less-plan.md) for the full inventory.
+
+- [x] Bootloader GNU GRUB -> **Limine** (BSD-2-Clause): `tools/mkiso.sh` (Limine + xorriso) replaced `grub-mkrescue` for all nine ISO targets and both in-guest proof harnesses; `boot/limine/limine.conf.in` replaced `boot/grub/grub.cfg`. The disk image gained a side benefit — `limine bios-install` writes the boot stages into the image file, so `mk-disk-image.sh` no longer needs root/losetup/mount.
+- [x] Build automation GNU Make -> **bmake** (BSD 3-clause, `/bin/make`) + **samurai** (0BSD Ninja, `/bin/samu`, `/bin/ninja`). `tools/toolchain/build-make.sh` is deleted, `/bin/make` left the static allowlist, and `tools/inguest/Makefile` is now portable BSD make. Verified in-guest by `M98-SMOKE`.
+- [x] GNU Wget -> curl / BusyBox wget (done earlier; `/bin/wget` is the BusyBox applet).
+- [ ] `planned` Shell GNU bash -> zsh + BusyBox ash. Deferred on purpose: bash is still the login shell and `/bin/sh`.
+- [ ] `planned` Gnulib leaves the tree automatically once bash goes (it is only bundled inside bash).

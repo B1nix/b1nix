@@ -22,14 +22,16 @@ This document outlines the remaining steps required to eliminate all residual GN
 
 ## Replacement Strategy & Architecture
 
-### 1. Bootloader: GNU GRUB → Limine
+### 1. Bootloader: GNU GRUB → Limine — **DONE**
 
 * **Replacement**: [Limine Bootloader](https://limine-bootloader.org/) (BSD 2-Clause License).
 * **Rationale**: Limine is modern, ultra-lightweight, actively maintained, and natively supports Multiboot2, x86_64, BIOS, and UEFI out of the box.
-* **Implementation Plan**:
-  * Replace `grub-mkrescue` invocation in `Makefile` with `xorriso` + `limine-deploy`.
-  * Create `limine.conf` to replace `boot/grub/grub.cfg`.
-  * Update QEMU and bare-metal test runners.
+* **Status**: GRUB is gone. `tools/mkiso.sh` stages the Limine boot files, expands
+  `boot/limine/limine.conf.in` and builds a hybrid BIOS+UEFI ISO with `xorriso`
+  + `limine bios-install`; all nine `iso*` targets, `disk-iso`, the alpine
+  harness and both in-guest proof scripts call it. `boot/grub/` is deleted.
+  `mk-disk-image.sh` now installs Limine straight into the image file, which
+  removed its losetup/mount/`sudo` steps (and `tools/images/sudoers.d-b1nix-diskimage`).
 
 ### 2. Shell: GNU bash → zsh & BusyBox ash
 
@@ -60,7 +62,7 @@ This document outlines the remaining steps required to eliminate all residual GN
   * Remove `INITRAMFS_WGET_INC` and `wget` build recipe from `Makefile`.
   * Direct all system network fetches through `curl` or `busybox wget`.
 
-### 4. Build Automation: GNU Make → Ninja / samurai / bmake
+### 4. Build Automation: GNU Make → samurai + bmake — **DONE**
 
 * **Replacement Options**:
   * **Ninja** (Apache 2.0 License) or **`samurai`** (0BSD/ISC C-reimplementation of Ninja).
@@ -69,9 +71,14 @@ This document outlines the remaining steps required to eliminate all residual GN
   * **Ninja** is lightning fast and already used in b1nix to build V8, Skia, Chromium, and Mesa.
   * **`samurai`** is a C-based Ninja replacement under ~30 KB with zero C++ dependencies.
   * `bmake` provides traditional POSIX Make syntax when a Makefile runner is explicitly needed.
-* **Implementation Plan**:
-  * Cross-compile `ninja` (C++ / libc++) or `samurai` (C / musl) and ship as `/bin/ninja`.
-  * Optionally ship `bmake` as `/bin/make` for legacy Makefile compatibility.
+* **Status**: both shipped as dynamic musl PIEs. `tools/ports/build-samurai.sh`
+  produces `/bin/samu` (aliased to `/bin/ninja`) and `tools/ports/build-bmake.sh`
+  produces `/bin/make` (also `/bin/bmake`) plus the `/usr/share/mk` system
+  makefiles. `tools/toolchain/build-make.sh` is deleted and `/bin/make` no longer
+  needs a static-allowlist exemption. `tools/inguest/Makefile` and its test
+  fixture were rewritten in portable BSD make syntax; `M98-SMOKE` proves both
+  tools parse a build description, run its recipe and report an up-to-date
+  target on the second run.
 
 ### 5. Gnulib → Automatic Removal
 
@@ -85,15 +92,15 @@ This document outlines the remaining steps required to eliminate all residual GN
 - [ ] **Phase 1: Shell & Downloader**
   - [ ] Port `zsh` to b1nix as the primary interactive shell (`/bin/zsh`).
   - [ ] Remove `bash` from build pipeline; default `/bin/sh` to BusyBox `ash`.
-  - [ ] Remove `wget` from build pipeline; default to `curl` / `busybox wget`.
+  - [x] Remove `wget` from build pipeline; default to `curl` / `busybox wget`.
   - [ ] Verify smoke test suite passes with `zsh` and `ash`.
 
-- [ ] **Phase 2: Build Tools**
-  - [ ] Port `ninja` / `samurai` to b1nix for fast build graph execution.
-  - [ ] (Optional) Port `bmake` (NetBSD Make) for legacy Makefile compatibility.
-  - [ ] Replace GNU Make in `rootfs.img`.
+- [x] **Phase 2: Build Tools**
+  - [x] Port `samurai` to b1nix for fast build graph execution (`/bin/samu`, `/bin/ninja`).
+  - [x] Port `bmake` (NetBSD Make) for Makefile compatibility (`/bin/make`).
+  - [x] Replace GNU Make in `rootfs.img`.
 
-- [ ] **Phase 3: Bootloader**
-  - [ ] Add `limine` configuration (`limine.conf`).
-  - [ ] Update `Makefile` ISO targets (`iso`, `iso-live`, `disk-iso`) to use `limine` + `xorriso`.
-  - [ ] Verify QEMU boot and test suite execution with Limine.
+- [x] **Phase 3: Bootloader**
+  - [x] Add `limine` configuration (`boot/limine/limine.conf.in`, `limine-disk.conf.in`).
+  - [x] Update `Makefile` ISO targets (`iso`, `iso-live`, `disk-iso`, ...) to use `limine` + `xorriso`.
+  - [x] Verify QEMU boot and test suite execution with Limine.
