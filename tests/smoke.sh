@@ -101,6 +101,9 @@ SWAP_IMG_USER="$PROJECT_DIR/smoke_run/swap-smoke-user-$$.img"
 SATA_IMG_SHELL="$PROJECT_DIR/smoke_run/sata-smoke-shell-$$.img"
 NVME_IMG_SHELL="$PROJECT_DIR/smoke_run/nvme-smoke-shell-$$.img"
 SWAP_IMG_SHELL="$PROJECT_DIR/smoke_run/swap-smoke-shell-$$.img"
+SATA_IMG_OPENRC="$PROJECT_DIR/smoke_run/sata-smoke-openrc-$$.img"
+NVME_IMG_OPENRC="$PROJECT_DIR/smoke_run/nvme-smoke-openrc-$$.img"
+SWAP_IMG_OPENRC="$PROJECT_DIR/smoke_run/swap-smoke-openrc-$$.img"
 # v8 instance: sata0 carries a writable COPY of the d8 ext4 disk (so the source
 # artifact is never mutated by journal recovery). No swap/nvme — d8 needs the AHCI
 # controller uncontended to stream its 13 MB binary off the disk at boot.
@@ -443,12 +446,12 @@ else
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		V8_ISO_TARGET=""
 		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell iso-openrc $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
 	else
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -468,6 +471,9 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	dd if=/dev/zero of="$SATA_IMG_SHELL" bs=1M count=4 2>/dev/null
 	dd if=/dev/zero of="$NVME_IMG_SHELL" bs=1M count=4 2>/dev/null
 	dd if=/dev/zero of="$SWAP_IMG_SHELL" bs=1M count=2 2>/dev/null
+	dd if=/dev/zero of="$SATA_IMG_OPENRC" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$NVME_IMG_OPENRC" bs=1M count=4 2>/dev/null
+	dd if=/dev/zero of="$SWAP_IMG_OPENRC" bs=1M count=2 2>/dev/null
 fi
 
 MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
@@ -497,6 +503,8 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_USER" 2>/dev/null
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SHELL" 2>/dev/null
 	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SHELL" 2>/dev/null
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_OPENRC" 2>/dev/null
+	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_OPENRC" 2>/dev/null
 fi
 if [ "$SMOKE_V8" = "1" ]; then
 	# v8-ext4.img is embedded in the V8 ISO as GRUB module2 (ram0), no disk copy needed.
@@ -509,6 +517,7 @@ SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
 CORE_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-core-$ARCH.log"
 USER_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-graphics-$ARCH.log"
 SHELL_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-shell-$ARCH.log"
+OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
@@ -612,6 +621,23 @@ launch_shell() {
 	pid_shell=$!
 }
 
+# OpenRC as PID 1: no test orchestrator, the real init system drives the boot and
+# then powers the machine off through its control FIFO (see iso-openrc). The
+# instance ends by itself — "reboot: powering off" IS the pass condition.
+launch_openrc() {
+	(
+		SATA_IMG="$SATA_IMG_OPENRC"
+		NVME_IMG="$NVME_IMG_OPENRC"
+		SWAP_IMG="$SWAP_IMG_OPENRC"
+		B1NIX_ISO_NAME=b1nix-openrc.iso
+		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[openrc]"
+		run_qemu "$OPENRC_LOG"
+	) &
+	pid_openrc=$!
+}
+
 launch_v8() {
 	(
 		SATA_IMG="$SATA_IMG_V8"
@@ -684,7 +710,7 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	fi
 	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time (nproc=$NPROC)"
 	# Graphics first — heaviest (GPU + Mesa) and slowest to finish.
-	_inst_list="gfx boot shell"
+	_inst_list="gfx boot shell openrc"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
 	run_instance_pool "$_inst_list"
 	cat "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" >"$LOG"
@@ -750,7 +776,28 @@ check_output "$LOG" "M22-SMOKE: start" "VFS initializes"
 check_output "$LOG" "M24-STRESS: start" "scheduler starts"
 check_output "$LOG" "init: /bin/init pid=" "/bin/init launches"
 check_output "$LOG" "M94-INIT:" "M94 init-path parsing self-test runs"
-check_output "$LOG" "M94-INIT: ok \(fallback\|init=\|no-override-flags\)" "M94 init-path logic correct"
+check_output "$LOG" "M94-INIT: ok \(default\|init=\|no-override-flags\)" "M94 init-path logic correct"
+# Linking policy: the rootfs must not carry a statically linked executable that
+# is not in tools/configs/static-allowlist.txt with a reason. Run the same gate
+# the build uses, so a regression shows up as a failed check and not only as a
+# build error someone might bypass.
+if sh "$PROJECT_DIR/tools/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" >/dev/null 2>&1; then
+	pass "rootfs has no unexpected statically linked executables"
+else
+	fail "rootfs has no unexpected statically linked executables" "$(sh "$PROJECT_DIR/tools/check-dynamic.sh" "$PROJECT_DIR/build/$ARCH/rootfs" 2>&1 | head -3 | tr '\n' ' ')"
+fi
+check_output "$LOG" "M94-CTL: ok tmpfs-mount" "tmpfs mounts on a VFS directory (the /run an init system expects)"
+check_output "$LOG" "M94-CTL: ok tmpfs-state" "state written through a dirfd inside the tmpfs is visible afterwards"
+check_output "$LOG" "M94-CTL: ok fifo-on-tmpfs" "mkfifo works on a tmpfs mount"
+check_output "$LOG" "M94-CTL: ok fifo-command" "a command written by another process is read back from the control FIFO"
+# OpenRC instance: the real init system as PID 1, driving its own runlevels and
+# shutting the machine down through /run/openrc/init.ctl.
+check_output "$OPENRC_LOG" "init: /sbin/openrc-init pid=1" "openrc-init runs as PID 1"
+check_output "$OPENRC_LOG" "Caching service dependencies" "OpenRC builds its dependency cache (popen/posix_spawn work)"
+check_output "$OPENRC_LOG" "/etc/init.d/local start" "OpenRC reaches the default runlevel and starts services"
+check_output "$OPENRC_LOG" "M94-OPENRC: ok init-fifo-present" "openrc-init creates its control FIFO once the boot finishes"
+check_output "$OPENRC_LOG" "/etc/init.d/killprocs start" "the shutdown runlevel runs when PID 1 gets the command"
+check_output "$OPENRC_LOG" "reboot: powering off" "openrc-shutdown powers the machine off through the control FIFO"
 check_output "$LOG" "M11-SMOKE: start" "shell appears"
 # M28 #9: ctx-switch + light-syscall rdtsc benchmark. It is single-CPU only by
 # design (the rdtsc yield loop races under the SMP high-syscall-density path, see
@@ -877,6 +924,7 @@ check_output "$LOG" "M14-SMOKE: ok swap-smoke" "swap page swap-out and swap-in v
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-sata" "mount sata0 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok mount-ext4-nvme" "mount nvme0 as ext4 successful"
 check_output "$LOG" "M14-SMOKE: ok ext4-persistence" "ext4 read, write, and remount persistence verified"
+check_output "$LOG" "M14-SMOKE: ok ext4-fifo-persistence" "a FIFO created with mkfifo is a real ext4 inode and survives umount/mount"
 check_output "$LOG" "M14-SMOKE: ok block-cache" "cached read and dirty write verified"
 check_output "$LOG" "M14-SMOKE: ok persistence" "persistence through sync, umount, and remount verified"
 check_output "$LOG" "M14-SMOKE: ok invalid-device" "mounting invalid device fails gracefully"
@@ -959,6 +1007,28 @@ if [ "$ARCH" = "x86_64" ]; then
 fi
 
 # ── M25 Native Toolchain ──
+section "M94 Linux ABI conformance (through musl)"
+# Each of these reached the kernel as "unmapped syscall -> -ENOSYS" before the
+# translation table gained them, so a regression shows up here rather than as a
+# port that mysteriously degrades.
+check_output "$LOG" "MUSL-POSIX: ok clock-getres" "clock_getres reports the real 10 ms tick resolution (Linux nr 229)"
+check_output "$LOG" "MUSL-POSIX: ok times" "times() returns process CPU accounting (Linux nr 100)"
+check_output "$LOG" "MUSL-POSIX: ok sysinfo" "sysinfo() reports total RAM (Linux nr 99)"
+check_output "$LOG" "MUSL-POSIX: ok sched-getaffinity" "sched_getaffinity returns a non-empty CPU mask (Linux nr 204)"
+check_output "$LOG" "MUSL-POSIX: ok statx-dirfd" "statx resolves a relative path against a real dirfd (Linux nr 332)"
+check_output "$LOG" "MUSL-POSIX: ok faccessat2" "faccessat2 resolves against a real dirfd (Linux nr 439)"
+check_output "$LOG" "MUSL-POSIX: ok sigtimedwait" "sigtimedwait consumes a pending signal without running its handler (Linux nr 128)"
+check_output "$LOG" "MUSL-POSIX: ok sigtimedwait-timeout" "sigtimedwait times out with EAGAIN instead of blocking forever"
+check_output "$LOG" "MUSL-POSIX: done" "the musl POSIX smoke completes"
+
+# Address-space layout: the loader is not tied to one load base. Three distinct
+# layouts run in the same boot — a stock Linux ET_EXEC at its own vaddr
+# (0x200000), b1nix ET_EXEC images at 0x2000000, and musl PIEs the loader places
+# itself (randomized under b1nix.aslr, see the M71 check) — none of which can
+# collide with the kernel, which lives in the higher half.
+check_output "$LOG" "M40-LINUX: hello from a static linux x86_64 binary" "a stock Linux ET_EXEC runs at its own load base (0x200000), not at a b1nix-fixed address"
+check_output "$LOG" "PIE base=" "musl PIE images are placed by the loader, not by a fixed link address"
+
 section "M25 Native C Toolchain"
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
 check_output "$LOG" "M25-SMOKE: ok tcc-launch" "tcc launches"
@@ -982,7 +1052,7 @@ check_output "$LOG" "M25-SMOKE: done" "M25 smoke completes"
 section "M26 Native C Toolchain & Self-Host"
 check_output "$LOG" "M26-SMOKE: start" "M26 smoke starts"
 check_output "$LOG" "M26-SMOKE: ok selfhost-status" "selfhost status syscall works"
-check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (gcc/binutils/make) is ported"
+check_output "$LOG" "M26-SMOKE: ok toolchain-ready" "native toolchain (clang/binutils/make) is ported"
 check_output "$LOG" "M26-SMOKE: ok readdir" "libc opendir/readdir over SYS_GETDENTS works"
 # NOTE: in-guest full kernel self-build is not yet verified, so the marker is
 # "pending can-build-kernel" (not "ok"). Flip the kernel flag + this check to
@@ -1191,6 +1261,10 @@ check_output "$LOG" "M11-SMOKE: start" "M11 shell smoke starts"
 check_output "$LOG" "M11-SMOKE: ok pipe-eof" "pipe EOF when all writers close"
 check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-read" "pipe nonblocking read returns EAGAIN"
 check_output "$LOG" "M11-SMOKE: ok pipe-nonblock-write" "pipe nonblocking write returns EAGAIN"
+check_output "$LOG" "M11-SMOKE: ok fifo-mkfifo" "mkfifo creates a FIFO node in /run that stat() reports as S_IFIFO"
+check_output "$LOG" "M11-SMOKE: ok fifo-nonblock-enxio" "FIFO O_WRONLY|O_NONBLOCK with no reader fails with ENXIO"
+check_output "$LOG" "M11-SMOKE: ok fifo-rendezvous" "FIFO blocking open waits for the peer, then transfers data across a fork"
+check_output "$LOG" "M11-SMOKE: ok fifo-eof" "FIFO reader sees EOF once the writer closes"
 check_output "$LOG" "M11-SMOKE: done" "M11 shell smoke completes"
 
 # ── M33 Shell compliance: POSIX sh features under BusyBox ash ──
@@ -1390,13 +1464,8 @@ check_output "$LOG" "M32-NET: ok udp6-loopback" "UDP over IPv6 (::1) round-trips
 check_output "$LOG" "M32-NET: ok tcp6-loopback" "TCP over IPv6 (::1) echo round-trips through AF_INET6 sockets"
 check_output "$LOG" "M32-NET: ok tcp-echo" "TCP loopback client/server echo works through sockets"
 check_output "$LOG" "M32-NET: ok http-get" "HTTP-style client/server exchange works over TCP"
-check_output "$LOG" "M32-NET: ok wget-loopback" "Wget HTTP client download works over TCP loopback"
-check_output "$LOG" "M32-NET: ok wget-pcre2-regex" "Wget --regex-type pcre filters a recursive fetch (PCRE2 \\d matcher: keeps yes-1, drops no-2)"
-check_output "$LOG" "M32-NET: ok wget-ipv6" "Wget HTTP client download works over IPv6 loopback (::1)"
-check_output "$LOG" "M32-NET: ok wget-ntlm-enabled" "Wget binary exposes NTLM auth support"
-check_output "$LOG" "M32-NET: ok wget-idn-punycode" "Wget IRI/IDN path converts an internationalized hostname to punycode"
-check_output "$LOG" "M32-NET: ok wget-https-handshake" "Wget performs a real HTTPS request (TLS handshake path)"
-check_output "$LOG" "M32-NET: ok wget-https-selfsigned-reject" "Wget rejects an invalid self-signed chain without --ca-certificate"
+check_output "$LOG" "M32-NET: ok curl-loopback" "the HTTP client downloads over TCP loopback (connect + request + response parsing + file write)"
+check_output "$LOG" "M32-NET: ok curl-ipv6" "the HTTP client downloads over IPv6 loopback (::1)"
 if grep -q "M32-NET: unsupported curl-tls-suite" "$LOG" 2>/dev/null; then
 	pass "Curl TLS suite skipped (curl unavailable or built without HTTPS)"
 else
@@ -1951,6 +2020,7 @@ rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
 rm -f "$SATA_IMG_USER" "$NVME_IMG_USER" "$SWAP_IMG_USER"
 rm -f "$SATA_IMG_V8"
 rm -f "$SATA_IMG_SHELL" "$NVME_IMG_SHELL" "$SWAP_IMG_SHELL"
+rm -f "$SATA_IMG_OPENRC" "$NVME_IMG_OPENRC" "$SWAP_IMG_OPENRC"
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images

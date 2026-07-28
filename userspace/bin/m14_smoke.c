@@ -86,6 +86,34 @@ int main(int argc, char **argv) {
     } else {
       marker("M14-SMOKE: fail ext4nvme open\n");
     }
+
+    /* 4b. A FIFO is a real on-disk inode (S_IFIFO, no data blocks), so it must
+     * survive umount/mount like any other name — that is what lets an init
+     * system keep its control FIFO on the root filesystem instead of a
+     * RAM-only directory. */
+    {
+      const char *fifo = "/mnt/ext4nvme/ctl.fifo";
+      unlink(fifo);
+      struct stat before, after;
+      int mk = mkfifo(fifo, 0600);
+      int st1 = stat(fifo, &before);
+      sync();
+      int um_ok = (umount("/mnt/ext4nvme") == 0);
+      int m_ok = (mount("nvme0", "/mnt/ext4nvme", "ext4", 0, NULL) == 0);
+      int st2 = stat(fifo, &after);
+      if (mk == 0 && st1 == 0 && S_ISFIFO(before.st_mode) && um_ok && m_ok &&
+          st2 == 0 && S_ISFIFO(after.st_mode)) {
+        marker("M14-SMOKE: ok ext4-fifo-persistence\n");
+      } else {
+        char dbg[128];
+        snprintf(dbg, sizeof(dbg),
+                 "M14-SMOKE: fail ext4-fifo-persistence mk=%d st1=%d um=%d "
+                 "m=%d st2=%d mode=%o\n",
+                 mk, st1, um_ok, m_ok, st2, (unsigned)after.st_mode);
+        marker(dbg);
+      }
+      unlink(fifo);
+    }
   } else {
     char err[64];
     snprintf(err, sizeof(err), "M14-SMOKE: fail mount-ext4-nvme (rc=%d)\n",

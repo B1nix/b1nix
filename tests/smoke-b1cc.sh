@@ -38,7 +38,7 @@ B1CC-SO-SMOKE: ok"
 echo "[b1cc] === b1cc / native-compiler smoke ($ARCH) ==="
 
 echo "[b1cc] [BUILD] minimal ISO (MINIMAL_INITRAMFS=1)..."
-if ! make ARCH="$ARCH" MINIMAL_INITRAMFS=1 KERNEL_CMDLINE="b1nix.test=1" iso >"$BUILD_LOG" 2>&1; then
+if ! make ARCH="$ARCH" MINIMAL_INITRAMFS=1 KERNEL_CMDLINE="init=/bin/init b1nix.test=1" iso >"$BUILD_LOG" 2>&1; then
 	echo "[b1cc]   BUILD FAILED — tail of $BUILD_LOG:"
 	tail -20 "$BUILD_LOG"
 	exit 1

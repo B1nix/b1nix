@@ -52,7 +52,7 @@ static const char *const excluded[] = {
     "gclock", "gterm", "gpaint", "gdesktop", "gabout",
     "su", "passwd", "useradd", "userdel", "groupadd", "groups",
     "halt", "reboot", "poweroff", "shutdown", "setfattr",
-    "bpkg", "curl", "wget",
+    "bpkg", "curl",
     "mc", "ne", "b1fetch", "gpuinfo", "meminfo",
     "js", "tcc",
     "m40-linux-hello", "m67-rust", /* driven by their *-smoke.sh wrappers below */
@@ -395,6 +395,7 @@ static void run_and_wait(const char *path) {
 static const char *const scripts[] = {
     "/etc/rc",
     "/etc/posix-smoke.sh",
+    "/etc/initctl-smoke.sh",
     "/etc/bash-smoke.sh",
     "/etc/bpkg-smoke.sh",
     "/etc/m40-smoke.sh",

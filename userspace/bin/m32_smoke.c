@@ -293,13 +293,13 @@ static int run_server(unsigned short port) {
     return 10;
   }
   buf[n] = '\0';
-  if (!strstr(buf, "GET /wget-test")) {
+  if (!strstr(buf, "GET /curl-test")) {
     close(cfd);
     close(lfd);
     return 11;
   }
-  const char *wget_resp = "HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\nwget-ok";
-  send(cfd, wget_resp, strlen(wget_resp), 0);
+  const char *client_resp = "HTTP/1.0 200 OK\r\nContent-Length: 7\r\n\r\ncurl-ok";
+  send(cfd, client_resp, strlen(client_resp), 0);
   close(cfd);
 
   close(lfd);
@@ -352,53 +352,43 @@ static int test_tcp_client_server(void) {
   }
   ok("http-get");
 
-  int wget_pid = fork();
-  if (wget_pid < 0) {
-    fail("wget-fork");
+  /* Same GET, this time through the real HTTP client: proves the loopback
+   * datapath end to end for a full-size program (connect, request, response
+   * parsing, file write) rather than the raw socket calls above. */
+  int dl_pid = fork();
+  if (dl_pid < 0) {
+    fail("curl-fork");
     return -1;
   }
-  if (wget_pid == 0) {
-    char *wget_argv[] = {"/bin/wget", "-t", "1", "-o", "/tmp/wget.log", "-O", "/tmp/wget.out", "http://127.0.0.1:3232/wget-test", NULL};
-    char *wget_envp[] = {NULL};
-    execve("/bin/wget", wget_argv, wget_envp);
+  if (dl_pid == 0) {
+    char *dl_argv[] = {"/bin/curl", "-s", "-S", "-o", "/tmp/curl.out",
+                         "http://127.0.0.1:3232/curl-test", NULL};
+    char *dl_envp[] = {NULL};
+    execve("/bin/curl", dl_argv, dl_envp);
     _exit(127);
   }
-  int wget_status = 0;
-  waitpid(wget_pid, &wget_status, 0);
+  int dl_status = 0;
+  waitpid(dl_pid, &dl_status, 0);
 
-  int log_fd = open("/tmp/wget.log", O_RDONLY);
-  if (log_fd >= 0) {
-    char log_buf[1024];
-    int nr;
-    emit("--- wget log start ---\n");
-    while ((nr = read(log_fd, log_buf, sizeof(log_buf) - 1)) > 0) {
-      log_buf[nr] = '\0';
-      emit(log_buf);
-    }
-    emit("--- wget log end ---\n");
-    close(log_fd);
-    unlink("/tmp/wget.log");
-  }
-
-  if (!WIFEXITED(wget_status) || WEXITSTATUS(wget_status) != 0) {
-    fail("wget-exec");
+  if (!WIFEXITED(dl_status) || WEXITSTATUS(dl_status) != 0) {
+    fail("curl-exec");
     return -1;
   }
 
-  int wget_fd = open("/tmp/wget.out", O_RDONLY);
-  if (wget_fd < 0) {
-    fail("wget-file-open");
+  int dl_fd = open("/tmp/curl.out", O_RDONLY);
+  if (dl_fd < 0) {
+    fail("curl-file-open");
     return -1;
   }
-  char wget_buf[32];
-  int wget_read = read(wget_fd, wget_buf, sizeof(wget_buf) - 1);
-  close(wget_fd);
-  unlink("/tmp/wget.out");
-  if (wget_read != 7 || memcmp(wget_buf, "wget-ok", 7) != 0) {
-    fail("wget-content");
+  char dl_buf[32];
+  int dl_read = read(dl_fd, dl_buf, sizeof(dl_buf) - 1);
+  close(dl_fd);
+  unlink("/tmp/curl.out");
+  if (dl_read != 7 || memcmp(dl_buf, "curl-ok", 7) != 0) {
+    fail("curl-content");
     return -1;
   }
-  ok("wget-loopback");
+  ok("curl-loopback");
 
   int curl_pid = fork();
   if (curl_pid < 0) {
@@ -946,134 +936,6 @@ static int test_ipv6_v6only(void) {
   return 0;
 }
 
-/* PCRE2-backed regex filtering for wget. A recursive fetch is driven with an
- * --accept-regex that only a real PCRE2 matcher honours ("yes-\d+": POSIX would
- * treat \d as a literal 'd' and reject "yes-1"), and --regex-type pcre, which
- * wget only accepts when built with HAVE_LIBPCRE2. The loopback server serves
- * an index linking to /no-2 (must be filtered out) and /yes-1 (must be kept);
- * we then verify on disk that /yes-1 was downloaded with the right body and
- * /no-2 was not, proving both that PCRE2 is linked and that its matcher ran.
- * Self-contained on 127.0.0.1 — no external network. */
-static void regex_send(int cfd, const char *ctype, const char *body) {
-  char hdr[160];
-  int hl = snprintf(hdr, sizeof(hdr),
-                    "HTTP/1.0 200 OK\r\nContent-Type: %s\r\nConnection: close\r\n\r\n",
-                    ctype);
-  send(cfd, hdr, (size_t)hl, 0);
-  if (body && *body) send(cfd, body, strlen(body), 0);
-}
-
-/* The server bounds each accept with a 3s select() timeout so it returns
- * cleanly even when wget rejects --regex-type pcre (built without PCRE2) and
- * never connects, or when the filter correctly skips /no-2. */
-static int run_regex_server(unsigned short port) {
-  int lfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (lfd < 0) return 1;
-  struct sockaddr_in addr;
-  make_loopback_addr(port, &addr);
-  if (bind(lfd, (struct sockaddr *)&addr, sizeof(addr)) < 0 ||
-      listen(lfd, 4) < 0) {
-    close(lfd);
-    return 2;
-  }
-  for (int i = 0; i < 6; i++) {
-    fd_set rs;
-    FD_ZERO(&rs);
-    FD_SET(lfd, &rs);
-    struct timeval tv = { .tv_sec = 3, .tv_usec = 0 };
-    if (select(lfd + 1, &rs, 0, 0, &tv) <= 0) break;
-    int cfd = accept(lfd, 0, 0);
-    if (cfd < 0) break;
-    char req[512];
-    int n = recv_deadline(cfd, req, sizeof(req) - 1, RECV_TIMEOUT_MS);
-    if (n <= 0) { close(cfd); continue; }
-    req[n] = '\0';
-    if (strstr(req, "GET /yes-1")) {
-      regex_send(cfd, "text/plain", "regex-ok");
-    } else if (strstr(req, "GET /no-2")) {
-      regex_send(cfd, "text/plain", "should-be-filtered");
-    } else if (strstr(req, "GET / ") || strstr(req, "GET /index")) {
-      regex_send(cfd, "text/html",
-                 "<html><body>"
-                 "<a href=\"/no-2\">n</a> <a href=\"/yes-1\">y</a>"
-                 "</body></html>");
-    } else {
-      /* An unexpected request (e.g. /robots.txt) — answer 404 so wget moves on. */
-      const char *nf = "HTTP/1.0 404 Not Found\r\nConnection: close\r\n\r\n";
-      send(cfd, nf, strlen(nf), 0);
-    }
-    close(cfd);
-  }
-  close(lfd);
-  return 0;
-}
-
-static int test_wget_pcre2_regex(void) {
-  unsigned short port = 3290;
-  mkdir("/tmp/wgr", 0755);
-  unlink("/tmp/wgr/yes-1");
-  unlink("/tmp/wgr/no-2");
-  unlink("/tmp/wgr/index.html");
-
-  int spid = fork();
-  if (spid < 0) { fail("wget-pcre2-regex"); return -1; }
-  if (spid == 0) _exit(run_regex_server(port));
-
-  sleep(1);
-  int wpid = fork();
-  if (wpid < 0) { fail("wget-pcre2-regex"); return -1; }
-  if (wpid == 0) {
-    char *argv[] = {"/bin/wget", "-e", "robots=off", "-r", "-l", "1",
-                    "-nd", "-nH", "-P", "/tmp/wgr",
-                    "--regex-type", "pcre", "--accept-regex", "yes-\\d+",
-                    "-t", "1", "-o", "/tmp/wgr.log",
-                    "http://127.0.0.1:3290/", NULL};
-    char *envp[] = {NULL};
-    execve("/bin/wget", argv, envp);
-    _exit(127);
-  }
-  int wst = 0;
-  waitpid(wpid, &wst, 0);
-  int sst = 0;
-  waitpid(spid, &sst, 0);
-
-  /* The accepted child must have been downloaded with the right content. */
-  int ok_yes = 0;
-  int fd = open("/tmp/wgr/yes-1", O_RDONLY);
-  if (fd >= 0) {
-    char b[32];
-    int r = (int)read(fd, b, sizeof(b) - 1);
-    close(fd);
-    if (r == 8 && memcmp(b, "regex-ok", 8) == 0) ok_yes = 1;
-  }
-  /* The rejected child must NOT have been fetched. */
-  int no_present = 0;
-  fd = open("/tmp/wgr/no-2", O_RDONLY);
-  if (fd >= 0) { no_present = 1; close(fd); }
-
-  unlink("/tmp/wgr/yes-1");
-  unlink("/tmp/wgr/no-2");
-  unlink("/tmp/wgr/index.html");
-
-  if (!ok_yes || no_present) {
-    /* Dump the wget log to serial for diagnosis, mirroring wget-loopback. */
-    int lf = open("/tmp/wgr.log", O_RDONLY);
-    if (lf >= 0) {
-      char lb[1024];
-      int nr;
-      emit("--- wget pcre2 log start ---\n");
-      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
-      emit("--- wget pcre2 log end ---\n");
-      close(lf);
-    }
-    unlink("/tmp/wgr.log");
-    fail("wget-pcre2-regex");
-    return -1;
-  }
-  unlink("/tmp/wgr.log");
-  ok("wget-pcre2-regex");
-  return 0;
-}
 
 static int run_server6_http(unsigned short port) {
   int lfd = socket(AF_INET6, SOCK_STREAM, 0);
@@ -1100,322 +962,69 @@ static int run_server6_http(unsigned short port) {
     return 4;
   }
   buf[n] = '\0';
-  if (!strstr(buf, "GET /wget-v6-test")) {
+  if (!strstr(buf, "GET /curl-v6-test")) {
     close(cfd);
     close(lfd);
     return 5;
   }
-  const char *resp = "HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\nwget6-ok";
+  const char *resp = "HTTP/1.0 200 OK\r\nContent-Length: 8\r\n\r\ncurl6-ok";
   send(cfd, resp, strlen(resp), 0);
   close(cfd);
   close(lfd);
   return 0;
 }
 
-static int test_wget_ipv6(void) {
+static int test_curl_ipv6(void) {
   unsigned short port = 3267;
   int pid = fork();
-  if (pid < 0) { fail("wget-ipv6"); return -1; }
+  if (pid < 0) { fail("curl-ipv6"); return -1; }
   if (pid == 0) _exit(run_server6_http(port));
 
   sleep(1);
-  int wpid = fork();
-  if (wpid < 0) { fail("wget-ipv6"); return -1; }
-  if (wpid == 0) {
-    char *argv[] = {"/bin/wget", "-t", "1", "-o", "/tmp/wget6.log", "-O", "/tmp/wget6.out", "http://[::1]:3267/wget-v6-test", NULL};
+  int cpid = fork();
+  if (cpid < 0) { fail("curl-ipv6"); return -1; }
+  if (cpid == 0) {
+    char *argv[] = {"/bin/curl", "-s", "-S", "-6", "-o", "/tmp/curl6.out",
+                    "http://[::1]:3267/curl-v6-test", NULL};
     char *envp[] = {NULL};
-    execve("/bin/wget", argv, envp);
+    execve("/bin/curl", argv, envp);
     _exit(127);
   }
-  int wst = 0;
-  waitpid(wpid, &wst, 0);
+  int cst = 0;
+  waitpid(cpid, &cst, 0);
 
-  /* If wget failed to connect, the server is still blocked in accept() with no
-   * timeout — force it out with SIGTERM so the waitpid below cannot hang the
-   * whole suite until the QEMU watchdog. Harmless if it already exited. */
+  /* If the client failed to connect, the server is still blocked in accept()
+   * with no timeout — force it out with SIGTERM so the waitpid below cannot
+   * hang the whole suite until the QEMU watchdog. Harmless if it already
+   * exited. */
   kill(pid, SIGTERM);
   int sst = 0;
   waitpid(pid, &sst, 0);
 
-  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
-    int lf = open("/tmp/wget6.log", O_RDONLY);
-    if (lf >= 0) {
-      char lb[1024];
-      int nr;
-      emit("--- wget ipv6 log start ---\n");
-      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
-      emit("--- wget ipv6 log end ---\n");
-      close(lf);
-    }
-    unlink("/tmp/wget6.log");
-    fail("wget-ipv6");
+  if (!WIFEXITED(cst) || WEXITSTATUS(cst) != 0) {
+    fail("curl-ipv6");
     return -1;
   }
 
-  int fd = open("/tmp/wget6.out", O_RDONLY);
+  int fd = open("/tmp/curl6.out", O_RDONLY);
   if (fd < 0) {
-    fail("wget-ipv6");
+    fail("curl-ipv6");
     return -1;
   }
   char buf[32];
   int r = read(fd, buf, sizeof(buf) - 1);
   close(fd);
-  unlink("/tmp/wget6.out");
-  unlink("/tmp/wget6.log");
-  if (r != 8 || memcmp(buf, "wget6-ok", 8) != 0) {
-    fail("wget-ipv6");
+  unlink("/tmp/curl6.out");
+  if (r != 8 || memcmp(buf, "curl6-ok", 8) != 0) {
+    fail("curl-ipv6");
     return -1;
   }
-  ok("wget-ipv6");
+  ok("curl-ipv6");
   return 0;
 }
 
-static int test_wget_idn_punycode(void) {
-  int wpid = fork();
-  if (wpid < 0) { fail("wget-idn-punycode"); return -1; }
-  if (wpid == 0) {
-    char *argv[] = {
-      "/bin/wget", "--local-encoding=UTF-8", "-t", "1", "-T", "5",
-      "-o", "/tmp/wget.idn.log", "-O", "/tmp/wget.idn.out",
-      "http://b\303\274cher.example/", NULL
-    };
-    char *envp[] = {NULL};
-    execve("/bin/wget", argv, envp);
-    _exit(127);
-  }
-  int wst = 0;
-  waitpid(wpid, &wst, 0);
 
-  int lf = open("/tmp/wget.idn.log", O_RDONLY);
-  if (lf < 0) {
-    fail("wget-idn-punycode");
-    return -1;
-  }
-  char lb[2048];
-  int nr = read(lf, lb, sizeof(lb) - 1);
-  close(lf);
-  unlink("/tmp/wget.idn.log");
-  unlink("/tmp/wget.idn.out");
-  if (nr <= 0) {
-    fail("wget-idn-punycode");
-    return -1;
-  }
-  lb[nr] = '\0';
-  if (!strstr(lb, "xn--bcher-kva.example")) {
-    fail("wget-idn-punycode");
-    return -1;
-  }
-  ok("wget-idn-punycode");
-  return 0;
-}
 
-static int test_wget_ntlm_enabled(void) {
-  int wpid = fork();
-  if (wpid < 0) { fail("wget-ntlm-enabled"); return -1; }
-  if (wpid == 0) {
-    char *argv[] = {
-      "/bin/wget", "--version",
-      NULL
-    };
-    char *envp[] = {NULL};
-    int fd = open("/tmp/wget.ntlm.help", O_WRONLY | O_CREAT | O_TRUNC, 0644);
-    if (fd >= 0) {
-      dup2(fd, 1);
-      dup2(fd, 2);
-      close(fd);
-    }
-    execve("/bin/wget", argv, envp);
-    _exit(127);
-  }
-  int wst = 0;
-  waitpid(wpid, &wst, 0);
-  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
-    fail("wget-ntlm-enabled");
-    return -1;
-  }
-  int fd = open("/tmp/wget.ntlm.help", O_RDONLY);
-  if (fd < 0) {
-    fail("wget-ntlm-enabled");
-    return -1;
-  }
-  char buf[8192];
-  int n = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-  unlink("/tmp/wget.ntlm.help");
-  if (n <= 0) {
-    fail("wget-ntlm-enabled");
-    return -1;
-  }
-  buf[n] = '\0';
-  if (!strstr(buf, "+ntlm")) {
-    fail("wget-ntlm-enabled");
-    return -1;
-  }
-  ok("wget-ntlm-enabled");
-  return 0;
-}
-
-static int test_wget_https(void) {
-  const int max_wait_sec = 20;
-  int tls_srv = fork();
-  if (tls_srv < 0) {
-    fail("wget-https-handshake");
-    return -1;
-  }
-  if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4445", NULL};
-    char *srv_envp[] = {NULL};
-    execve("/bin/m32_nettool", srv_argv, srv_envp);
-    _exit(127);
-  }
-  sleep(1);
-  int wpid = fork();
-  if (wpid < 0) {
-    fail("wget-https-handshake");
-    return -1;
-  }
-  if (wpid == 0) {
-    char *argv[] = {
-      "/bin/wget", "--ca-certificate=/etc/tls-test/ca.pem",
-      "--random-file=/etc/tls-test/ca.pem",
-      "-t", "1", "-T", "5", "-o", "/tmp/wget.https.log", "-O", "/tmp/wget.https.out",
-      "https://127.0.0.1:4445/", NULL
-    };
-    char *envp[] = {NULL};
-    execve("/bin/wget", argv, envp);
-    _exit(127);
-  }
-  int wst = 0, sst = 0;
-  int waited = 0;
-  while (waited < max_wait_sec) {
-    int wr = waitpid(wpid, &wst, WNOHANG);
-    int sr = waitpid(tls_srv, &sst, WNOHANG);
-    if (wr == wpid && sr == tls_srv) break;
-    sleep(1);
-    waited++;
-  }
-  if (waited >= max_wait_sec) {
-    emit("--- wget https timeout ---\n");
-    kill(wpid, SIGTERM);
-    kill(tls_srv, SIGTERM);
-    waitpid(wpid, &wst, 0);
-    waitpid(tls_srv, &sst, 0);
-  } else {
-    if (waitpid(wpid, &wst, WNOHANG) == 0) waitpid(wpid, &wst, 0);
-    if (waitpid(tls_srv, &sst, WNOHANG) == 0) waitpid(tls_srv, &sst, 0);
-  }
-  
-  if (!WIFEXITED(wst) || WEXITSTATUS(wst) != 0) {
-    char stbuf[128];
-    snprintf(stbuf, sizeof(stbuf),
-             "wget https status: wst=0x%x sst=0x%x waited=%d\n",
-             wst, sst, waited);
-    emit(stbuf);
-    int lf = open("/tmp/wget.https.log", O_RDONLY);
-    if (lf >= 0) {
-      char lb[1024];
-      int nr;
-      emit("--- wget https log start ---\n");
-      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
-      emit("--- wget https log end ---\n");
-      close(lf);
-    }
-    unlink("/tmp/wget.https.log");
-    fail("wget-https-handshake");
-    return -1;
-  }
-  int fd = open("/tmp/wget.https.out", O_RDONLY);
-  if (fd < 0) {
-    fail("wget-https-handshake");
-    return -1;
-  }
-  char buf[64];
-  int n = read(fd, buf, sizeof(buf) - 1);
-  close(fd);
-  unlink("/tmp/wget.https.out");
-  unlink("/tmp/wget.https.log");
-  if (n <= 0) {
-    fail("wget-https-handshake");
-    return -1;
-  }
-  buf[n] = '\0';
-  if (!strstr(buf, "tls-loopback-ok")) {
-    fail("wget-https-handshake");
-    return -1;
-  }
-  ok("wget-https-handshake");
-
-  tls_srv = fork();
-  if (tls_srv < 0) {
-    fail("wget-https-selfsigned-reject");
-    return -1;
-  }
-  if (tls_srv == 0) {
-    char *srv_argv[] = {"/bin/m32_nettool", "tls-server", "4446", NULL};
-    char *srv_envp[] = {NULL};
-    execve("/bin/m32_nettool", srv_argv, srv_envp);
-    _exit(127);
-  }
-  sleep(1);
-  wpid = fork();
-  if (wpid < 0) {
-    fail("wget-https-selfsigned-reject");
-    return -1;
-  }
-  if (wpid == 0) {
-    char *argv[] = {
-      "/bin/wget", "--random-file=/etc/tls-test/ca.pem", "-d",
-      "-t", "1", "-T", "5", "-o", "/tmp/wget.https.bad.log", "-O", "/tmp/wget.https.bad.out",
-      "https://127.0.0.1:4446/", NULL
-    };
-    char *envp[] = {NULL};
-    execve("/bin/wget", argv, envp);
-    _exit(127);
-  }
-  waited = 0;
-  while (waited < max_wait_sec) {
-    int wr = waitpid(wpid, &wst, WNOHANG);
-    int sr = waitpid(tls_srv, &sst, WNOHANG);
-    if (wr == wpid && sr == tls_srv) break;
-    sleep(1);
-    waited++;
-  }
-  if (waited >= max_wait_sec) {
-    emit("--- wget https selfsigned timeout ---\n");
-    kill(wpid, SIGTERM);
-    kill(tls_srv, SIGTERM);
-    waitpid(wpid, &wst, 0);
-    waitpid(tls_srv, &sst, 0);
-  } else {
-    if (waitpid(wpid, &wst, WNOHANG) == 0) waitpid(wpid, &wst, 0);
-    if (waitpid(tls_srv, &sst, WNOHANG) == 0) waitpid(tls_srv, &sst, 0);
-  }
-
-  if (!WIFEXITED(wst) || WEXITSTATUS(wst) == 0) {
-    char stbuf[128];
-    snprintf(stbuf, sizeof(stbuf),
-             "wget selfsigned status: wst=0x%x sst=0x%x waited=%d\n",
-             wst, sst, waited);
-    emit(stbuf);
-    int lf = open("/tmp/wget.https.bad.log", O_RDONLY);
-    if (lf >= 0) {
-      char lb[1024];
-      int nr;
-      emit("--- wget selfsigned log start ---\n");
-      while ((nr = read(lf, lb, sizeof(lb) - 1)) > 0) { lb[nr] = '\0'; emit(lb); }
-      emit("--- wget selfsigned log end ---\n");
-      close(lf);
-    }
-    unlink("/tmp/wget.https.bad.out");
-    unlink("/tmp/wget.https.bad.log");
-    fail("wget-https-selfsigned-reject");
-    return -1;
-  }
-  unlink("/tmp/wget.https.bad.out");
-  unlink("/tmp/wget.https.bad.log");
-  ok("wget-https-selfsigned-reject");
-  return 0;
-}
 
 /* M32b: socket option / address / shutdown API hardening. */
 static int test_socket_options(void) {
@@ -2167,11 +1776,7 @@ int main(int argc, char **argv) {
   if (test_tcp6_loopback() != 0)       return 1;
   if (test_tcp_window_throttle() != 0) return 1;
   if (test_tcp_client_server() != 0)   return 1;
-  if (test_wget_pcre2_regex() != 0)    return 1;
-  if (test_wget_ipv6() != 0)           return 1;
-  if (test_wget_ntlm_enabled() != 0)   return 1;
-  if (test_wget_idn_punycode() != 0)   return 1;
-  if (test_wget_https() != 0)          return 1;
+  if (test_curl_ipv6() != 0)           return 1;
   /* Non-fatal (like test_external_net): the end-to-end SSH login exercises the
    * whole daemon and must not mask the rest of the suite if it regresses. It
    * emits its own M32B-SSH ok/FAIL marker. Run last so its long handshake does
