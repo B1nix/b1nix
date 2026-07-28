@@ -33,7 +33,7 @@ This document outlines the remaining steps required to eliminate all residual GN
   `mk-disk-image.sh` now installs Limine straight into the image file, which
   removed its losetup/mount/`sudo` steps (and `tools/images/sudoers.d-b1nix-diskimage`).
 
-### 2. Shell: GNU bash → zsh & BusyBox ash
+### 2. Shell: GNU bash → zsh & BusyBox ash — **DONE**
 
 * **Replacement Options**:
   * **zsh (Z Shell)** (Custom MIT/BSD-style Permissive License) for interactive use (`/bin/zsh`).
@@ -42,10 +42,20 @@ This document outlines the remaining steps required to eliminate all residual GN
   * `zsh` provides an extremely powerful interactive environment (advanced tab-completion, globbing, theme support, line editing) without GPL restrictions.
   * b1nix already supports all POSIX/termios APIs required by `zsh`.
   * Pairing `zsh` as default interactive shell with `ash` as `/bin/sh` yields the optimal balance of interactive power and boot speed.
-* **Implementation Plan**:
-  * Cross-compile `zsh` against musl libc and package as `/bin/zsh`.
-  * Remove `bash` from the build configuration.
-  * Set `/bin/zsh` as default user/login shell in `/etc/passwd`.
+* **Status**: `/bin/zsh` is the login shell for root and user, `/bin/sh` is the
+  BusyBox `ash` symlink, and bash is gone — its port script is deleted, and
+  because the published package index still carries a bash package,
+  `install-ports.sh` purges it from the rootfs after extraction.
+  `tools/ports/build-zsh.sh` cross-builds zsh 5.9 as a dynamic musl PIE.
+  It needed one prerequisite: zsh refuses to configure without a terminal
+  library and b1nix had none (bash used its own bundled termcap), so
+  `tools/ports/build-netbsd-curses.sh` ports the BSD-licensed netbsd-curses —
+  chosen over GNU ncurses, which is permissively licensed but still a GNU
+  package. `--disable-dynamic` makes configure mark every optional module
+  `link=no`, which silently drops shell features, so the port relinks
+  `zsh/regex` (without it `[[ =~ ]]` is a parse error) plus mathfunc/stat/
+  system/files/zselect into the binary. `ZSH-SMOKE` re-covers every feature
+  `BASH-SMOKE` asserted.
 
 ### 3. Downloader: GNU Wget → curl / BusyBox wget — **DONE**
 
@@ -80,7 +90,7 @@ This document outlines the remaining steps required to eliminate all residual GN
   tools parse a build description, run its recipe and report an up-to-date
   target on the second run.
 
-### 5. Gnulib → Automatic Removal
+### 5. Gnulib → Automatic Removal — **DONE**
 
 * **Replacement**: None required.
 * **Rationale**: Gnulib is present only as bundled source code within `bash` and `wget`. Removing `bash` and `wget` automatically eliminates Gnulib from the codebase entirely.
@@ -89,11 +99,11 @@ This document outlines the remaining steps required to eliminate all residual GN
 
 ## Action Items Checklist
 
-- [ ] **Phase 1: Shell & Downloader**
-  - [ ] Port `zsh` to b1nix as the primary interactive shell (`/bin/zsh`).
-  - [ ] Remove `bash` from build pipeline; default `/bin/sh` to BusyBox `ash`.
+- [x] **Phase 1: Shell & Downloader**
+  - [x] Port `zsh` to b1nix as the primary interactive shell (`/bin/zsh`).
+  - [x] Remove `bash` from build pipeline; default `/bin/sh` to BusyBox `ash`.
   - [x] Remove `wget` from build pipeline; default to `curl` / `busybox wget`.
-  - [ ] Verify smoke test suite passes with `zsh` and `ash`.
+  - [x] Verify smoke test suite passes with `zsh` and `ash`.
 
 - [x] **Phase 2: Build Tools**
   - [x] Port `samurai` to b1nix for fast build graph execution (`/bin/samu`, `/bin/ninja`).

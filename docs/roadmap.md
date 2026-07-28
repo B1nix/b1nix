@@ -746,5 +746,7 @@ See [`docs/gnu-less-plan.md`](gnu-less-plan.md) for the full inventory.
 - [x] Bootloader GNU GRUB -> **Limine** (BSD-2-Clause): `tools/mkiso.sh` (Limine + xorriso) replaced `grub-mkrescue` for all nine ISO targets and both in-guest proof harnesses; `boot/limine/limine.conf.in` replaced `boot/grub/grub.cfg`. The disk image gained a side benefit — `limine bios-install` writes the boot stages into the image file, so `mk-disk-image.sh` no longer needs root/losetup/mount.
 - [x] Build automation GNU Make -> **bmake** (BSD 3-clause, `/bin/make`) + **samurai** (0BSD Ninja, `/bin/samu`, `/bin/ninja`). `tools/toolchain/build-make.sh` is deleted, `/bin/make` left the static allowlist, and `tools/inguest/Makefile` is now portable BSD make. Verified in-guest by `M98-SMOKE`.
 - [x] GNU Wget -> curl / BusyBox wget (done earlier; `/bin/wget` is the BusyBox applet).
-- [ ] `planned` Shell GNU bash -> zsh + BusyBox ash. Deferred on purpose: bash is still the login shell and `/bin/sh`.
-- [ ] `planned` Gnulib leaves the tree automatically once bash goes (it is only bundled inside bash).
+- [x] Shell GNU bash -> **zsh** (MIT-like) as `/bin/zsh`, the login shell in `/etc/passwd`, with BusyBox `ash` as `/bin/sh`. zsh needs a terminal library, which b1nix never had (bash carried its own bundled termcap), so **netbsd-curses** (BSD) was ported alongside it. `tools/ports/build-bash.sh` is deleted and the packaged bash is purged from the rootfs by `install-ports.sh`. Verified by `ZSH-SMOKE` (12 checks, the same feature surface `BASH-SMOKE` covered).
+- [x] Gnulib left the tree with bash — it was only ever bundled inside it.
+
+**The shipped ISO is now GNU-free**: bootloader, shell, build tools, downloader, libc, C++ runtime and toolchain all carry BSD/MIT/Apache/0BSD licences.
