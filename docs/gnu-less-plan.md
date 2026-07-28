@@ -45,9 +45,16 @@ This document outlines the remaining steps required to eliminate all residual GN
   * Remove `bash` from the build configuration.
   * Set `/bin/zsh` as default user/login shell in `/etc/passwd`.
 
-### 3. Downloader: GNU Wget → curl / BusyBox wget
+### 3. Downloader: GNU Wget → curl / BusyBox wget — **DONE**
 
 * **Replacement**: **curl** (MIT / curl License) & **BusyBox `wget`**.
+* **Status**: GNU Wget is gone — its port script, `Makefile` recipe and rootfs
+  binary are removed. `/bin/wget` is now the BusyBox applet, and the M32 network
+  smoke drives `curl` for the loopback and IPv6 downloads
+  (`M32-NET: ok curl-loopback` / `ok curl-ipv6`). The wget-only checks
+  (`--regex-type pcre`, IRI/punycode, NTLM) were assertions about wget's own
+  build options and went with it; the HTTPS pair was already covered by the
+  curl TLS tests.
 * **Rationale**: `curl` with mbedTLS support is already fully ported and integrated (Milestones M32a, M54).
 * **Implementation Plan**:
   * Remove `INITRAMFS_WGET_INC` and `wget` build recipe from `Makefile`.

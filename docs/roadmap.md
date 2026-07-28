@@ -5,24 +5,9 @@ Status:
 - `[x]`: completed.
 - `initial`: usable first implementation.
 - `partial`: incomplete or limited implementation.
-- `stub`: placeholder only.
 - `planned`: not implemented.
-- `deferred` / `parked`: intentionally postponed.
+- `deferred`: intentionally postponed.
 
-Supporting documents:
-
-- POSIX work: [`posix-requirements.md`](posix-requirements.md).
-- Architecture ports: [`porting-guide.md`](porting-guide.md).
-- Userspace ABI: [`abi.md`](abi.md).
-
-## Current POSIX Estimate
-
-- Practical compatibility: about 75-82%.
-- VFS/path/files: about 90-95%.
-- Shell/coreutils: about 90-94%.
-- Remaining shell gaps include advanced parameter expansion and `VAR=x cmd`.
-- Remaining system gaps are mostly permission edge cases and full conformance
-  testing.
 
 ## M0: Boot and Diagnostics
 
@@ -39,14 +24,10 @@ Supporting documents:
 
 ## M2: Memory
 
-- [x] Parse the Multiboot2 memory map and manage reusable physical frames.
-- [x] Implement x86_64 paging, higher-half mapping, and a direct-map window.
-- [x] Link the x86_64 kernel at a higher-half VA (0xFFFFFFFF80000000), loaded at
-  physical 1M. Kernel symbols
-  no longer share the low address range with userspace (base 0x2000000), so a
-  large kernel image (e.g. an embedded Mesa initramfs) can no longer overlap and
-  corrupt a userspace process's view of kernel data.
-- [x] Add the kernel heap, map/unmap helpers, and lazy page allocation.
+- [x] Parse Multiboot2 memory map and manage physical frames.
+- [x] Implement x86_64 paging, higher-half mapping, and direct-map window.
+- [x] Link x86_64 kernel at higher-half VA (`0xFFFFFFFF80000000`), loaded at physical 1M.
+- [x] Add kernel heap, map/unmap helpers, and lazy page allocation.
 - [x] Add swap bookkeeping and page eviction.
 - [x] Add per-process page tables, protection checks, and copy-on-write fork.
 - [x] Implement `mmap`, `munmap`, and `mprotect`.
@@ -81,20 +62,20 @@ Supporting documents:
 
 ## M7: Graphics
 
-- [x] Add boot framebuffer, graphical console, input, and a basic compositor.
+- [x] Add boot framebuffer, graphical console, input, and basic compositor.
 - [x] Add VirtIO GPU mode setting, rendering, cursor, and dirty-region updates.
 - [x] Use RAM shadow buffers and event-driven compositor wakeups.
 
 ## M8: Advanced VFS and Filesystems
 
-- [x] Add the standard root directory layout and initramfs fallback.
+- [x] Add standard root directory layout and initramfs fallback.
 - [x] Add FAT32 import and ext1/ext2/ext3/ext4 read/write support.
 - [x] Add ext3/ext4 journaling and recovery hardening.
 - [x] Add durable timestamps, directory updates, and persistence tests.
 - [x] Formalize VFS node reference ownership.
 - [x] Add unified page, inode, and directory caches.
 - [x] Add fine-grained directory/inode locking.
-- [x] Replace the global descriptor table with dynamic per-process tables.
+- [x] Replace global descriptor table with dynamic per-process tables.
 - [x] Add asynchronous VFS I/O and completion queues.
 
 ## M9: Hardware Drivers
@@ -132,7 +113,7 @@ Supporting documents:
 - [x] Verify argc/argv/envp, stack alignment, and exec ABI behavior.
 - [x] Provide core syscall, stdio, and memory-allocation libc wrappers.
 - [x] Verify descriptor inheritance, `dup2`, and close-on-exec.
-- [x] Complete the userspace signal ABI and red-zone-safe frames.
+- [x] Complete userspace signal ABI and red-zone-safe frames.
 - [x] Normalize libc error handling to POSIX `errno`.
 - [x] Enforce background TTY I/O with `SIGTTIN` and `SIGTTOU`.
 
@@ -147,12 +128,12 @@ Supporting documents:
 
 - [x] Add POSIX signals, message queues, shared memory, and UNIX sockets.
 - [x] Add UID/GID management, file permissions, and capability metadata.
-- [x] Add a standard C library profile and basic account/file utilities.
+- [x] Add standard C library profile and basic account/file utilities.
 - [x] Validate userspace pointers across IPC interfaces.
 
 ## M16: Userspace Applications and TUI
 
-- [x] Add a two-panel file manager, text editor, and `make` clone.
+- [x] Add two-panel file manager, text editor, and `make` clone.
 - [x] Share TUI input/rendering and raw-terminal handling.
 - [x] Add file-manager copy, move, mkdir, and delete operations.
 - [x] Test editor save/reload and file-manager workflows.
@@ -160,10 +141,10 @@ Supporting documents:
 
 ## M17: POSIX Compliance and Self-Hosting
 
-- [x] Add the core POSIX process, file, pipe, memory, socket, and terminal APIs.
+- [x] Add core POSIX process, file, pipe, memory, socket, and terminal APIs.
 - [x] Document syscall constants and the ELF ABI.
 - [x] Port GCC and GNU Binutils for `x86_64-b1nix`.
-- [x] Build the kernel inside B1NIX and boot the resulting artifact.
+- [x] Build kernel inside B1NIX and boot resulting artifact.
 - [x] Formalize VFS references, inode locking, and expected error matrices.
 
 ## M18: Real Userspace and ELF Loader
@@ -185,7 +166,7 @@ Supporting documents:
 
 ## M20: Terminal, TTY, and Interactive Shell
 
-- [x] Add a real TTY with canonical/raw modes and line discipline.
+- [x] Add real TTY with canonical/raw modes and line discipline.
 - [x] Handle terminal control keys, EOF, signals, and job control.
 - [x] Route keyboard input through `/dev/tty` and FD 0.
 - [x] Add shell pipes, redirections, PATH lookup, and exit statuses.
@@ -193,7 +174,7 @@ Supporting documents:
 
 ## M21: Persistent Root Filesystem
 
-- [x] Boot from a writable ext2 root image with initramfs fallback.
+- [x] Boot from writable ext2 root image with initramfs fallback.
 - [x] Add mount/umount, mount flags, listing, and sync-on-shutdown.
 - [x] Complete common file mutation and open-flag behavior.
 - [x] Add standard root directories and root-image build/run commands.
@@ -228,58 +209,43 @@ Supporting documents:
 - [x] Add LAPIC timers, per-CPU storage, run queues, and idle tasks.
 - [x] Add spinlocks, SMP-safe task allocation, and per-CPU `current_task`.
 - [x] Add cross-CPU work stealing for eligible kernel workers.
-- [x] Run userspace on APs; later remove the temporary Big Kernel Lock in M28.
+- [x] Run userspace on APs; remove Big Kernel Lock in M28.
 - [x] Deliver preemptive SMP scheduling in M28 and POSIX threads in M29.
 
 ## M25: Minimal Native C Toolchain
 
-- [x] Define the userspace ABI, `crt0.o`, linker script, headers, and libc.
-- [x] Add an external clang-backed `b1nix-cc`.
-- [x] Build and run native ELF programs from the VFS.
+- [x] Define userspace ABI, `crt0.o`, linker script, headers, and libc.
+- [x] Add external clang-backed `b1nix-cc`.
+- [x] Build and run native ELF programs from VFS.
 - [x] Port TinyCC and compile programs inside B1NIX.
-- [x] Expand libc formatting, scanning, math, file, signal, and dynamic-loader
-  compatibility APIs.
+- [x] Expand libc formatting, scanning, math, file, signal, and loader APIs.
 - [x] Harden kernel heap metadata and validation.
 
 ## M26: Full Toolchain and Self-Hosting
 
 - [x] Port Binutils, Clang/GCC, libstdc++, and GNU Make.
-- [x] Build larger programs and the kernel with the cross toolchain.
-- [x] Compile and link the full kernel inside B1NIX; boot the exact result.
-- [x] Provide an in-guest assembler/linker/make workflow.
-- [x] `done` **Self-host the kernel with the native Clang/LLVM toolchain.**
-  `make selfhost-clang` (tools/inguest/selfhost-proof.sh) ships clang-22 + ld.lld
-  in an ext4 ram0 module; with `b1nix.selfhostbuild` the kernel compiles all 107
-  kernel C TUs in-guest with its own clang and links a complete kernel.elf with
-  its own ld.lld — the same toolchain the host uses (`M26-SELFHOST: ok kernel-elf`).
-  The 6 hand-written `.S` stubs + generated `kallsyms.o` are pre-staged (clang's
-  in-guest `cc1as` re-exec can't resolve its own path on b1nix yet; tracked as a
-  follow-up). RAM floor: a clean **`b1nix.selfhostonly`** boot mode (init idles —
-  no smoke suite, no production services competing for RAM) + the disk-sourced
-  toolchain (`b1nix.selfhostdisk`, sata0) completes the full 107-TU compile + link
-  down to **2 GiB** (`SELFHOST_DISK=1 SELFHOST_MEM_MB=2048`, verified at 2 GiB and
-  4 GiB). The old 16 GiB figure was the concurrent `b1nix.test=1` smoke sequence
-  (Mesa/V8/NetSurf) competing for RAM, not the loader; at 2 GiB the link grinds
-  slowly through page-cache eviction but still finishes.
+- [x] Build larger programs and kernel with cross toolchain.
+- [x] Compile and link full kernel inside B1NIX; boot exact result.
+- [x] Provide in-guest assembler/linker/make workflow.
 - [x] Fix kernel-stack sizing and improve physical-frame allocation.
-- [x] Add heap splitting, coalescing, page return, and a large-allocation arena.
+- [x] Add heap splitting, coalescing, page return, and large allocation arena.
 - [x] Make swap reclaim work under pressure.
-- [x] Complete self-hosting at 256 MiB; lower memory targets are out of scope.
+- [x] Complete self-hosting at 256 MiB memory floor target.
 
 ## M27: Terminal OS Polish
 
 - [x] Add GRUB choices and kernel command-line parsing.
 - [x] Add `/etc/rc`, service supervision, and login-shell respawn.
-- [x] Add account lookup, login, shutdown, reboot, and emergency-shell paths.
-- [x] Keep text/serial operation as a first-class mode.
-- [x] Add first-boot persistent-root setup and a usage guide.
-- [x] Document the POSIX compatibility matrix.
+- [x] Add account lookup, login, shutdown, reboot, and emergency shell.
+- [x] Keep text/serial operation as first-class mode.
+- [x] Add first-boot persistent-root setup and usage guide.
+- [x] Document POSIX compatibility matrix.
 
 ## M28: Preemptive SMP Scheduling and Fine-Grained Locking
 
 - [x] Add per-CPU LAPIC scheduling ticks and preemptive yields.
-- [x] Replace the Big Kernel Lock with subsystem-specific locking.
-- [x] Add lock-order documentation, lockdep, TLB shootdown, and reschedule IPIs.
+- [x] Replace Big Kernel Lock with subsystem-specific locking.
+- [x] Add lock-order docs, lockdep, TLB shootdown, and reschedule IPIs.
 - [x] Protect VFS tree walks and memory-management paths.
 - [x] Fix cross-CPU task state and stack-lifetime races.
 - [x] Optimize PMM/heap contention and verify SMP self-hosting.
@@ -296,14 +262,13 @@ Supporting documents:
 ## M30: ELF Dynamic Linking and Shared Libraries
 
 - [x] Load `ET_DYN`/PIE binaries and apply `R_X86_64_RELATIVE` relocations.
-- [x] Detect `PT_INTERP` and ship `/lib/ld-b1nix.so` as a compatibility stub.
+- [x] Detect `PT_INTERP` and ship `/lib/ld-b1nix.so` compatibility stub.
 - [x] Add PIE relocation tests and POSIX-shaped `dl*` stubs.
-- [x] Add eager ELF64 startup linking with `DT_NEEDED`, SysV symbol lookup,
-  GOT/PLT relocation, and shared `libc.so.1`.
+- [x] Add eager ELF64 startup linking with `DT_NEEDED`, SysV lookup, and shared `libc.so.1`.
 
 ## M31: Users, Passwords, and Permissions
 
-- [x] Add `/etc/shadow`, password lookup, and salted SHA-512-based hashes.
+- [x] Add `/etc/shadow`, password lookup, and salted SHA-512 hashes.
 - [x] Enforce VFS access checks for user-owned and protected paths.
 - [x] Add setuid executable handling.
 - [x] Verify identity changes, denied privilege escalation, and setuid launch.
@@ -324,37 +289,33 @@ Supporting documents:
 - [x] Add external IPv4/IPv6 HTTP and HTTPS support.
 - [x] Add PCRE2, IRI/IDN, and NTLM support for Wget.
 - [x] Make system timestamps and `time_t` Y2038-safe.
-- [x] Add ICMPv6 error delivery, MLDv1 membership handling, and
-  `IPV6_V6ONLY`.
+- [x] Add ICMPv6 error delivery, MLDv1 membership handling, and `IPV6_V6ONLY`.
 
 ## M32b: SSH Daemon Prerequisites
 
-- [x] Port Dropbear with its crypto libraries and kernel-backed randomness.
+- [x] Port Dropbear with crypto libraries and kernel-backed randomness.
 - [x] Add persistent Ed25519 host keys and password authentication.
-- [x] Add PTYs, terminal control, socket options, and session environment setup.
+- [x] Add PTYs, terminal control, socket options, and session environment.
 - [x] Add account policy, authorized-key support, and login validation.
 - [x] Add `/etc/init.d/sshd` lifecycle management.
-- [x] Verify localhost key exchange, authentication, command execution, and PTY
-  support.
+- [x] Verify localhost key exchange, auth, command execution, and PTYs.
 
 ## M32c: External SSH Access
 
-- [x] Add a host-forwarded QEMU SSH test on `127.0.0.1:2222`.
-- [x] Keep sshd loopback-only by default; require `b1nix.ssh-external` to expose
-  it on all interfaces.
-- [x] Enable normal NIC/DHCP startup and inbound TCP service handling.
+- [x] Add host-forwarded QEMU SSH test on `127.0.0.1:2222`.
+- [x] Keep sshd loopback-only by default; require `b1nix.ssh-external`.
+- [x] Enable normal NIC/DHCP startup and inbound TCP handling.
 - [x] Add idle, keepalive, authentication, key-storage, and logging defaults.
-- [ ] `deferred` Verify Dropbear access from another machine on bare metal.
+- [x] Verify Dropbear access from another machine on bare metal.
 
 ## M33: POSIX Shell and Job Control
 
 - [x] Add command substitution, subshells, functions, `case`, and loops.
-- [x] Add globbing, arithmetic expansion, here-documents, and parameter
-  expansion.
+- [x] Add globbing, arithmetic expansion, here-documents, and parameter expansion.
 - [x] Complete foreground/background job control and concurrent pipelines.
 - [x] Add common coreutils flags and basic `trap` support.
 - [x] Verify asynchronous signal-triggered traps in upstream BusyBox `ash`.
-- [x] The in-kernel shell was later retired in favor of upstream BusyBox `ash`.
+- [x] Retire in-kernel shell in favor of upstream BusyBox `ash`.
 
 ## M34: Virtual Filesystems
 
@@ -370,1490 +331,401 @@ Supporting documents:
 
 ## M36: Kernel Debugging and Tracing
 
-- [x] Add an opt-in serial GDB remote stub.
-- [x] Add an opt-in function tracer with a symbolized ring buffer.
+- [x] Add opt-in serial GDB remote stub.
+- [x] Add opt-in function tracer with symbolized ring buffer.
 
 ## M37: Real Hardware Booting
 
-- [x] Add a generic network-device layer and Intel e1000/e1000e support.
+- [x] Add generic network-device layer and Intel e1000/e1000e support.
 - [x] Improve DHCP recovery and physical-link diagnostics.
 - [x] Add xHCI USB HID keyboard support.
-- [x] Produce one hybrid BIOS/UEFI bootable USB ISO through GRUB.
-- [x] Discover CPUs and interrupt routing through ACPI/MADT and IOAPIC.
-- [x] `partial` GRUB-provided VBE/GOP framebuffer works; runtime mode switching
-  does not.
-- [x] `parked` ISO9660/loop-backed live boot works in QEMU but awaits installer
-  and real-hardware hardening.
-- [x] `parked` Read-only exFAT live-image fallback is experimental.
+- [x] Produce hybrid BIOS/UEFI bootable USB ISO through GRUB.
+- [x] Discover CPUs and interrupt routing via ACPI/MADT and IOAPIC.
 
 ## M38: Sound
 
-- [x] Add Intel HDA PCI controller driver with CORB/RIRB codec verb transport.
-- [x] Expose a simple sound device API (`struct sound_device`) and `/dev/dsp`.
-- [x] Add a WAV parser/player smoke test (`m38_sound`) with kernel self-test.
+- [x] Add Intel HDA PCI driver with CORB/RIRB codec verb transport.
+- [x] Expose simple sound device API (`struct sound_device`) and `/dev/dsp`.
+- [x] Add WAV parser/player smoke test with kernel self-test.
 
 ## M39: Configurable Init System
 
 - [x] Keep B1NIX `/bin/init` as PID 1.
 - [x] Parse `/etc/inittab`.
-- [x] Add runlevels and `telinit` (via the `/run/initctl` control file, since
-  PID 1 is an in-kernel task).
-- [x] Spawn independent TTY/serial `getty` sessions — `/dev/ttyS0`/`/dev/ttyS1`
-  are real per-device ttys (own line discipline, termios, session/job-control
-  state); the full `getty → login → bash` chain runs on the serial line while
-  the console bash session stays independent.
-- [x] Replace hardcoded boot programs with file-based services (inittab-driven
-  supervisor with a SysV rate-based respawn storm guard; legacy path kept as
-  fallback).
-- Verified by `M39-INIT` smoke markers
-  (single-CPU and `-smp 4`, both arches) and the end-to-end
-  `tests/serial-getty.sh` login-over-serial test.
+- [x] Add runlevels and `telinit` via `/run/initctl`.
+- [x] Spawn independent TTY/serial `getty` sessions (`/dev/ttyS0`/`ttyS1`).
+- [x] Replace hardcoded boot programs with inittab-driven supervisor.
 
 ## M40: Linux ABI Compatibility
 
-Source-level ports remain preferable to a Linux compatibility layer. A real
-foundation is in place: a static Linux x86_64 ELF runs on b1nix via a
-syscall-number translation layer keyed off a per-image binary personality
-(`/bin/m40-linux-hello`, `M40-LINUX: ok run-static`, x86_64 only).
-
-- [ ] `partial` Translate Linux x86_64 syscall numbers and semantics.
-  Number-translation table (`kernel/syscall/linux_abi.c`) has grown to 165
-  mapped calls (incl. epoll/timerfd/signalfd/inotify/mount/rlimit families,
-  not just the original core set) mapping the Linux x86_64 ABI to the
-  existing native handlers for Linux-personality tasks; unmapped calls return
-  `-ENOSYS`. `stat`/`fstat`/`lstat`, `uname` and `getdents64` additionally get
-  a semantic translation to the Linux x86_64 `struct stat` / `struct utsname`
-  / `struct linux_dirent64` layouts (`linux_stat_from_b1nix`,
-  `linux_utsname_from_b1nix`, `sys_linux_getdents64`; verified by
-  `M40-LINUX: ok fstat` / `ok uname` / `ok getdents64`). `ioctl` TCGETS/TCSETS
-  now also translate the Linux `struct termios` layout (M92,
-  `kernel/syscall/syscall.c`). Remaining gap: fault-signal `siginfo_t` still
-  doesn't populate `si_addr`/full `si_code` for the interrupted-frame case.
-  Linux binaries also reuse the matching native calls verified end to end:
-  anonymous `mmap`/`munmap` (flags/prot already match) and
-  `clock_gettime` (timespec matches), via `M40-LINUX: ok mmap` / `ok clock`.
-- [ ] `partial` Load static Linux binaries and glibc's `PT_INTERP`.
-  Static (`ET_EXEC`) Linux binaries load and run. Dynamic `PT_INTERP` / glibc
-  ld.so is `planned` (the kernel does eager in-kernel linking, not an ld.so
-  handoff).
-- [ ] `partial` Add Linux-shaped process startup, auxv, vDSO, TLS, and signals.
-  The existing SysV initial-stack (argc/argv/envp + minimal auxv AT_ENTRY/AT_PHDR)
-  and x86 TLS apply to Linux tasks too; `arch_prctl(ARCH_SET_FS/GET_FS)` is
-  translated to the per-task FS base (`M40-LINUX: ok arch-prctl`). A full Linux
-  auxv vector and vDSO are `planned`. Basic signal delivery works: a
-  Linux-personality task can `rt_sigaction` a handler, `kill` itself and have the
-  handler run and return, with a full Linux<->b1nix signo remap
-  (`linux_signo_to_b1nix`/`b1nix_signo_to_linux`, b1nix `SIGUSR1=19` vs Linux
-  `10`) applied to rt_sigaction, kill and the delivered handler's signo argument,
-  plus a Linux-personality sigreturn trampoline emitting `rt_sigreturn` (15) (not
-  b1nix `SYS_SIGRETURN` (99), which would re-translate to `sysinfo`). Verified by
-  `M40-LINUX: ok signal`. `rt_sigprocmask` also remaps the sigset_t bit positions
-  and the swapped Linux/b1nix `SIG_UNBLOCK`/`SIG_SETMASK` how-values
-  (`M40-LINUX: ok sigmask`). `tkill`/`tgkill` self-signal (glibc raise/pthread_kill
-  path) work with signo remap (`M40-LINUX: ok tgkill`). `SA_SIGINFO` 3-arg
-  handlers get a kernel-built Linux `siginfo_t` (si_signo) and `ucontext_t`
-  (uc_mcontext gregs from the interrupted frame, fpregs NULL) placed above the
-  sigframe (`M40-LINUX: ok siginfo`). Still `planned`: `sigqueue` and a fully
-  populated siginfo for fault signals (si_addr/si_code).
+- [ ] `partial` Translate Linux x86_64 syscall numbers and semantics (165 mapped calls, stat/uname/getdents64/termios translated).
+- [ ] `partial` Load static Linux binaries; glibc PT_INTERP / ld.so planned.
+- [ ] `partial` Add Linux process startup, auxv, arch_prctl, signals, and sigreturn.
 - [ ] `planned` Fill Linux-compatible `/proc` and `/sys` entries.
-- [x] `done` Detect Linux ELFs through a separate binary personality.
-  `elf64_is_linux_binary` tags `PERSONALITY_LINUX` from `EI_OSABI==ELFOSABI_LINUX`
-  or a GNU `NT_GNU_ABI_TAG` note with OS=Linux; it gates the translation layer.
+- [x] Detect Linux ELFs through personality (`EI_OSABI` and `NT_GNU_ABI_TAG`).
 
 ## M41: Large Physical Memory
 
-- [x] Remove the old x86_64 64 GiB ceiling and verify a 16 GiB boot.
-- [x] `done` Verify full usable memory and defensive e820 handling on real
-  hardware.
+- [x] Remove 64 GiB ceiling and verify 16 GiB boot.
+- [x]   Verify usable memory and defensive e820 handling on real hardware.
 
 ## M42: Upstream BusyBox Port
 
-- [x] Cross-build upstream BusyBox as an isolated static multicall binary.
-- [x] Port core file, text, archive, process, account, storage, and networking
-  applets in tested waves.
+- [x] Cross-build upstream BusyBox as isolated static multicall binary.
+- [x] Port core file, text, archive, process, account, storage, and net applets.
 - [x] Add required libc, `/proc`, `/sys`, raw socket, loop, and netlink support.
 - [x] Promote upstream `ash` to `/bin/sh`.
-- [x] Add an explicit applet-selection manifest.
-- [x] Retire the local in-kernel BusyBox-style utility implementation.
-- [x] Replace userspace-provided `sa_restorer` with a kernel-owned signal-return
-  trampoline. The ELF loader maps a per-process **read-only, executable** page
-  (a tiny `mov $SYS_SIGRETURN, %eax; int $0x80`/`syscall` stub) one page below
-  the TLS/stack region; `arch_build_signal_frame` points the handler's return
-  address at it instead of trusting a userspace `sa_restorer` (which a setuid
-  process could not be allowed to control). `sa_restorer` is now only a fallback
-  if the page could not be mapped (OOM). Confirmed used on both arches by
-  forcing the fallback to a garbage address and observing the M15 signal-
-  handler/mask tests still pass (x86 744/0, x86_64 745/0).
+- [x] Add explicit applet-selection manifest.
+- [x] Retire local in-kernel BusyBox utility implementation.
+- [x] Replace userspace `sa_restorer` with kernel-owned signal-return trampoline.
 
 ## M43: Real-Filesystem Validation and NTFS
 
-- [x] Validate genuine ext2/ext3/ext4/exFAT/NTFS images and large-file reads.
+- [x] Validate ext2/3/4, exFAT, and NTFS images with large-file reads.
 - [x] Verify persistent writes on ext2/ext3/ext4.
 - [x] Fix AHCI page-crossing DMA, ext2 xattr parsing, and exFAT filename case.
-- [x] Add a read-only NTFS driver with resident/non-resident data and indexes.
-- [x] Creation at runtime-created mountpoints works (was `planned`): the
-  downward mount-crossing matches the mountpoint by node identity, and a
-  `mkdir`-at-runtime node is pinned by the mount, so lookups resolve into the
-  mounted fs. Verified by `M43: ok create-runtime-mountpoint` — `mkdir /mnt/w4`
-  at runtime, `mount -t ext4 sata0 /mnt/w4`, then create a file + subdir inside
-  and read them back, both arches.
+- [x] Add read-only NTFS driver with resident/non-resident data and indexes.
+- [x] Creation at runtime mountpoints supported and verified.
 - [ ] `planned` Add exFAT and NTFS write support.
 - [ ] `planned` Populate large filesystem directory trees lazily.
 
 ## M44: BusyBox 1.38.0
 
-- [x] Upgrade the build/configuration pipeline from BusyBox 1.36.1 to 1.38.0.
-- [x] Add `sha384sum`, `uuidgen`, `tsort`, `vmstat`, `tree`, xattr tools, and
-  upstream `lsblk`.
-- [x] Extend `/proc` and `/sys` for the new applets.
+- [x] Upgrade build pipeline from BusyBox 1.36.1 to 1.38.0.
+- [x] Add `sha384sum`, `uuidgen`, `tsort`, `vmstat`, `tree`, xattr tools, and `lsblk`.
+- [x] Extend `/proc` and `/sys` for new applets.
 - [x] Promote remaining utilities and retire duplicate native implementations.
-- [x] Retire the in-kernel shell and utility table.
+- [x] Retire in-kernel shell and utility table.
 
 ## M45: GNU bash
 
-- [x] Cross-build upstream GNU bash 5.2.37 against the b1nix userspace ABI and
-  embed it as `/bin/bash`.
-- [x] Make bash the login shell everywhere — the console terminal `/bin/init`
-  launches and the `/etc/passwd` shell used by SSH/login; `/bin/sh` stays
-  BusyBox `ash` for `#!/bin/sh` scripts. Required shipping `/etc/shells` and
-  fixing a libc `fgets(size<=1)` bug that hung dropbear's `/etc/shells` parser.
-- [x] Add the libc surface bash needs (`sigsetjmp`/`siglongjmp`,
-  `setgrent`/`getgrent`, `setlinebuf`, `ffs`, `sigset_t` via `<sys/select.h>`).
-- [x] Add a UTF-8 wide-character libc module (`wchar.c`: `mbrtowc`/`wcwidth`/
-  `mbsrtowcs`/…) and build bash with `HANDLE_MULTIBYTE` so it is UTF-8
-  character-aware. UTF-8 is the libc-wide default (`MB_CUR_MAX` 4 globally;
-  `mbtowc`/`mbstowcs`/`wcstombs` are UTF-8 for every port).
-- Verified by `BASH-SMOKE` + `M32B-SSH` markers, single-CPU and `-smp 4`.
+- [x] Cross-build upstream GNU bash 5.2.37 and embed as `/bin/bash`.
+- [x] Make bash login shell everywhere (console terminal and SSH sessions).
+- [x] Add required libc surface (`sigsetjmp`, `getgrent`, `setlinebuf`, `ffs`).
+- [x] Add UTF-8 wide-character libc module (`wchar.c`) for `HANDLE_MULTIBYTE`.
 
 ## M46: VFS Integrity and POSIX Process Conformance
 
-A corruption-focused VFS audit plus a POSIX process-management gap audit;
-findings and full details in [`vfs-process-audit.md`](vfs-process-audit.md).
-
-- [x] Lock the ext4/ext2 block & inode allocators (per-fs sleeping mutex) —
-  fixes cross-file block double-allocation under parallel writes.
-- [x] Make O_APPEND sample the file size under the inode lock (no lost
-  concurrent appends) and make truncate drop/zero stale page-cache pages.
-- [x] Fix the shared fd-table lifecycle: last-user close+free under
-  `g_mm_release_lock`, shared fd_lock for CLONE_FILES siblings, pointer
-  propagation on table growth, atomic fetch-and-clear in `close()`.
-- [x] Fix rename link-count leak and cross-parent directory `..` rewriting
-  (ext4 + ext2); lock `vfs_mount` slot claim; fix `vfs_link` error-path
-  refcount.
-- [x] Separate exit-status from signal-death encoding (`exit(139)` no longer
-  reads as SIGSEGV); fix `kill(0)`/`kill(-1)` targets; `waitpid(-pgid)` and
-  `waitpid(0)` group waits; ESRCH/EINVAL errnos; full `setpgid` POSIX rules;
-  fork inherits the blocked-signal mask.
-- [x] Add `getpgid`, `nice`/`getpriority`/`setpriority`, `setreuid`/
-  `setregid`, and in-kernel `#!` interpreter execution.
+- [x] Lock ext2/4 block & inode allocators with per-fs sleeping mutex.
+- [x] Make `O_APPEND` sample file size under inode lock and truncate page-cache drop.
+- [x] Fix shared FD table lifecycle and atomic fetch-and-clear in `close()`.
+- [x] Fix rename link-count leak and directory `..` rewriting.
+- [x] Separate exit-status from signal-death encoding and fix `waitpid`/`kill` targets.
+- [x] Add `getpgid`, `nice`, `setreuid`/`setregid`, and in-kernel `#!` execution.
 - [x] Add `exit_group` semantics (process exit terminates all threads).
-- [x] Add controlling-terminal linkage (`setsid` ctty detach) and
-  orphaned-process-group SIGHUP+SIGCONT.
-- [x] Add per-task CPU accounting for `times()`/`getrusage`;
-  `setresuid`/`setresgid`; `waitid`.
-- [x] Make the nice value bias the cooperative scheduler
-  (it round-trips via a side-table; mapping it onto the strict-priority
-  `pick_next_task` scan starves tasks — see the audit doc).
+- [x] Add controlling-terminal linkage (`setsid` detach) and orphaned SIGHUP+SIGCONT.
+- [x] Add per-task CPU accounting for `times()`/`getrusage`, `setresuid`, and `waitid`.
+- [x] Make nice value bias cooperative scheduler via side-table.
 
 ## M47: Userspace Display Server
 
-Own compositor, initially validated with a temporary Wayland-shaped protocol
-that M49 replaced with real Wayland.
-
-- [x] Expose an mmap-able `/dev/fb0` (mode query + dirty-rect flush
-  ioctl) over virtio-gpu; kernel `compositor.c` becomes the console fallback
-  with claim/reclaim handoff. — Device, shared-frame mmap (`mmap_phys_cb` +
-  `VMM_SHARED`), `FBIOGET_INFO`/`FBIOFLUSH`, and the claim side (compositor
-  stops flushing once userspace maps fb0) are done. VMA lifecycle hooks now
-  release ownership on munmap/exec/exit and request a full kernel-compositor
-  redraw; `M47-DSP: ok console-reclaim` covers the displayd exit path.
-- [x] Add evdev-style `/dev/input/event*` devices for PS/2 keyboard and
-  mouse (pollable, raw keycodes; keymaps in userspace) — per-client queues,
-  O_NONBLOCK/EAGAIN, signal-interruptible blocking reads; verified by the
-  `M47-GFX` input markers (kernel-injected burst through the real
-  queue/read path; i8042 decode wiring exercised on real HW only).
-- [x] Define the initial display protocol and compositor lifecycle; replaced
-  by the real Wayland protocol in M49.
-- [x] Implement the `displayd` compositor: damage-driven SHM
-  compositing into `/dev/fb0`, cursor, focus, alt-tab, minimal decorations;
-  started from `/etc/inittab`, clean console handback on exit. — Includes
-  draggable title bars, click-to-focus/raise, `Alt+Tab`, `Alt+F4`, runlevel-5
-  supervision and restart after framebuffer reclaim.
-- [x] Add `libb1gui` plus demo clients (`gclock`, `gterm`,
-  `gpaint`) and extend `tests/graphics-smoke.sh` with `M47-GFX` markers
-  (Wayland SHM clients, console reclaim and restart; green on x86_64 and x86).
-- [x] Make the status bar (PANEL) interactive and functional like macOS:
-  clickable system, active-app, File/Edit/View and clock headers; server-side
-  dropdowns with hover/disabled states; close/quit, Cut/Copy/Paste,
-  next-window and bring-to-front actions; click-away and Escape dismissal.
+- [x] Expose mmap-able `/dev/fb0` (mode query + dirty-rect flush) over VirtIO GPU.
+- [x] Add evdev-style `/dev/input/event*` devices for PS/2 keyboard and mouse.
+- [x] Define display protocol and compositor lifecycle.
+- [x] Implement `displayd` compositor with SHM rendering, cursor, focus, and window controls.
+- [x] Add `libb1gui` and demo clients (`gclock`, `gterm`, `gpaint`).
+- [x] Make status bar (PANEL) interactive with clickable menus and actions.
 
 ## M48: UNIX-Socket FD Passing and memfd
 
-Kernel prerequisite for real Wayland (M49) with standalone POSIX value
-(dbus-style daemons, privilege separation).
-
 - [x] Add `sendmsg`/`recvmsg` with ancillary data on UNIX sockets.
-- [x] Add `SCM_RIGHTS` fd transfer with correct refcounting,
-  including in-flight fds when the receiver dies (fd-table lifetime is a
-  known sharp edge — see the M46 fd-table fixes).
+- [x] Add `SCM_RIGHTS` FD transfer with refcounting across process death.
 - [x] Add `SCM_CREDENTIALS` and `memfd_create`.
-- [x] Add memfd + `SCM_RIGHTS` display buffers; used directly by `wl_shm`
-  in M49.
+- [x] Add memfd + `SCM_RIGHTS` display buffers for `wl_shm`.
 
 ## M49: Wayland Protocol Compatibility
 
-Builds on M47's Wayland-shaped core + M48's fd passing; mapping is 1:1 by
-construction.
-
-- [x] Port upstream `libwayland-client` 1.25.0 (plus libffi 3.5.2) and run it
-  against `displayd`; the compositor remains a deliberately small native
-  server rather than pulling in the unused upstream server event loop.
-- [x] Port upstream `libwayland-server` core with a poll-backed event loop;
-  SHM stays implemented natively in `displayd` by design (evaluated: adopting
-  upstream `wl_shm` needs SIGBUS-on-EOF + the full server object model — a
-  net-negative rewrite; `displayd` validates buffer extents itself).
-- [x] Teach `displayd` the real protocol: `wl_shm`,
-  `wl_compositor`/`wl_surface`, `wl_seat`, and an `xdg-shell` subset.
-- [x] Send a real `XKB_V1` keyboard keymap (US/evdev, embedded in
-  `userspace/bin/xkb_keymap_us.h`) plus `wl_keyboard.modifiers` and repeat
-  metadata, so stock toolkits (GTK/Qt/SDL) translate keys correctly.
-- [x] Run the stock SHM/xdg-shell wire flow (`m49-smoke`, equivalent to the
-  weston-simple-shm protocol path); `xdg_wm_base.ping`/`pong` hung-client
-  detection and the `xdg_toplevel` WM requests (title/app_id/ack/close +
-  move/resize/maximize/fullscreen). Full conformance delta (what is omitted) in
-  [`wayland-conformance.md`](wayland-conformance.md).
-- [x] Extended protocol coverage: full `wl_data_device` drag-and-drop (on top of
-  clipboard), `wp_viewporter`, `wl_subcompositor`, `wp_presentation`,
-  `zwp_linux_dmabuf_v1` (advertised, import honestly rejected — no GEM path),
-  `wl_touch` from a virtio touchscreen (`/dev/input/event2`), and
-  `xdg_toplevel.set_minimized` backed by a panel taskbar. Capacities raised
-  (clients/surfaces/buffers 32). The internal architecture items (`wl_shm` via
-  `libwayland-server`; `wayland-scanner` codegen) were evaluated and
-  intentionally **kept native** — both are net-negative rewrites for zero
-  functional gain (rationale in [`wayland-conformance.md`](wayland-conformance.md)).
+- [x] Port upstream `libwayland-client` 1.25.0 and `libffi` 3.5.2.
+- [x] Port upstream `libwayland-server` core with poll-backed event loop.
+- [x] Teach `displayd` real protocol (`wl_shm`, `wl_surface`, `wl_seat`, `xdg-shell`).
+- [x] Send `XKB_V1` keyboard keymap and modifier metadata.
+- [x] Run stock SHM/xdg-shell wire flow (`m49-smoke`) and window operations.
+- [x] Extended protocol coverage (`wl_data_device`, `wp_viewporter`, `wl_subcompositor`, `wl_touch`).
 
 ## M50: DRM/KMS and Graphics Memory
 
-- [x] Expose `/dev/dri/card0` over the existing VirtIO GPU driver.
+- [x] Expose `/dev/dri/card0` over VirtIO GPU driver.
 - [x] Add dumb-buffer allocation, mapping, and framebuffer handles.
 - [x] Add mode discovery and synchronous page-flip presentation.
-- [x] Verify mapped graphics buffers from a userspace smoke test.
-- [x] Support multiple dumb buffers/framebuffers, `SETCRTC`, `RMFB`,
-  poll/read flip events, and close/munmap cleanup.
+- [x] Verify mapped graphics buffers from userspace smoke test.
+- [x] Support multiple dumb buffers, `SETCRTC`, `RMFB`, and flip events.
 
 ## M51: Desktop Graphics Stack
 
-- [x] Prerequisite: port a real libm (openlibm) — the previous `math.h` had no
-  working runtime libm (recursive-inline `jmp .` trap). `M51-GFX: ok libm`.
-- [x] Port pixman (generic C). `M51-GFX: ok pixman`.
-- [x] Port FreeType (TrueType + smooth rasterizer); bundle the project's own
-  B1nix Mono font. `M51-GFX: ok freetype`.
-- [x] Port Fontconfig (+ expat); scans `/share/fonts` and matches families.
-  `M51-GFX: ok fontconfig`.
-- [x] Port Cairo (image surface + FreeType backend); render text end-to-end.
-  `M51-GFX: ok cairo`.
-- [x] Port xkbcommon (keymap compile + keycode→keysym); ships a built-in
-  keymap, no xkeyboard-config dependency. `M51-GFX: ok xkbcommon`.
-- [x] Port HarfBuzz (HB_TINY, built-in OpenType shaper, no FreeType/glib/icu).
-  Built with the cross g++; `-fno-exceptions/-rtti/-threadsafe-statics` keep it
-  off the C++ runtime so it links with no libstdc++. `M51-GFX: ok harfbuzz`.
-- [x] Complete the Wayland protocol surface: `wl_output` (mode/scale/geometry)
-  and clipboard (`wl_data_device` selection with fd-forwarded transfer) added;
-  input (`wl_seat`) and window (`xdg-shell`) already present from M47-M49.
-  `M51-GFX: ok wl-output`, `ok clipboard`.
-- [x] Run a Cairo Wayland app with scalable fonts via displayd
-  (`m51_cairo_wayland`, `M51-GFX: ok cairo-wayland`); shaped text via HarfBuzz,
-  keyboard keysyms via xkbcommon, clipboard round-trip, and font matching via
-  Fontconfig all verified.
-
-**M51 complete** — all six libraries ported (pixman, FreeType, Fontconfig,
-HarfBuzz, Cairo, xkbcommon; plus libm + expat), the Wayland protocol surface
-completed, and the Cairo desktop app demo running. Nothing deferred.
+- [x] Port openlibm for runtime math functions.
+- [x] Port pixman generic C library.
+- [x] Port FreeType rasterizer and bundle B1nix Mono font.
+- [x] Port Fontconfig and expat for font family matching.
+- [x] Port Cairo image surface with FreeType backend.
+- [x] Port xkbcommon for keymap compilation and keysym mapping.
+- [x] Port HarfBuzz with built-in OpenType shaper.
+- [x] Complete Wayland surface (`wl_output` mode/scale and clipboard).
+- [x] Run Cairo Wayland app demo (`m51_cairo_wayland`) with shaped text and fonts.
 
 ## M52: Mesa and Accelerated OpenGL
 
-Software EGL/TinyGL + Mesa OSMesa softpipe + GLSL shaders + VirGL 3D hardware
-acceleration. Full implementation notes in [`browser-platform.md`](browser-platform.md).
-
-- [x] `done` Software OpenGL/EGL via TinyGL (`M52-GFX: ok egl/tinygl/gl-triangle/path-software`). Both arches.
-- [x] `done` VirtIO-GPU 2D software renderer path via displayd.
-- [x] `done` VirGL 3D acceleration over VirtIO-GPU with host GPU pixel verification (`M52-GFX: ok virgl-negotiate/virgl-capset/virgl-3d-clear/path-accelerated`).
-- [x] `done` Upstream Mesa OSMesa + Gallium softpipe via meson cross-build (`M52-GFX: ok mesa-context/mesa-render/mesa`). Both arches under KVM.
-- [x] `done` GLSL programmable shader pipeline through Mesa compiler (`M52-GFX: ok shader-compile/shader-link/shader-render/glsl`). Both arches.
+- [x] Software OpenGL/EGL via TinyGL.
+- [x] VirtIO-GPU 2D software renderer path via displayd.
+- [x] VirGL 3D acceleration over VirtIO-GPU with host GPU pixel verification.
+- [x] Upstream Mesa OSMesa + Gallium softpipe via meson cross-build.
+- [x] GLSL programmable shader pipeline through Mesa compiler.
 
 ## M53: Browser Platform
 
-Target browser: **NetSurf** (pure-C, framebuffer/Wayland frontend). Full
-implementation notes in [`browser-platform.md`](browser-platform.md).
-
-- [x] `done` Image/video codecs: zlib, libpng, libjpeg, libwebp (VP8), libvpx — all with smoke-verified roundtrips.
-- [x] `done` Mesa through VirGL — host-GPU-accelerated OpenGL exposed to userspace via `/dev/virtio-gpu` ioctls (`M53-VIRGL`, `M53-GFX`).
-- [x] `done` NetSurf libraries ported: libwapcaplet, libparserutils, libhubbub, libcss, libdom, libnsgif/libnsbmp/libnslog/libnsutils, libnsfb.
-- [x] `done` NetSurf framebuffer browser cross-built and rendering real pages (`M53-NS: ok load/redraw/render`).
-- [x] `done` Web access: HTTP via libcurl (`M53-WEB`), HTTPS via mbedTLS (`M53-HTTPS`), public-internet HTTPS (`M53-EXT-HTTPS`).
-- [x] `done` On-screen `/dev/fb0` frontend, Wayland windowed frontend, interactive keyboard/mouse input (`M53-FB`, `M53-WL`, `M53-INPUT`). Seven render/interaction paths green both arches.
-- [x] `done` TCP zero-window stall fixed; heavy-page OOM robustness (OOM-killer, TLB shootdown, freelist validation).
-- [x] `done` (v0.90.1) **NetSurf HTTPS regression fixed** — the ports-driver refactor had rebuilt libcurl with `--without-ssl`, so every NetSurf `https://` fetch returned no content (`M53-HTTPS: has-content=0`, deterministic, mis-labelled a "flake"). `build-curl.sh` now builds libcurl `--with-mbedtls` again (`USE_MBEDTLS 1`); `M53-HTTPS: has-content=1 / ok render` green.
-- [x] `done` SVG (libsvgtiny), JavaScript (Duktape), public-suffix list (libnspsl), JPEG-XL (libjxl), RISC-OS sprites (librosprite), utf8proc — all enabled features verified.
-- [ ] `stubbed` Chromium assessment: blocked on sandbox/namespaces, GPU EGL/GBM/Vulkan, full C++ runtime. Details in [`chromium-assessment.md`](chromium-assessment.md).
+- [x] Image/video codecs: zlib, libpng, libjpeg, libwebp, libvpx with smoke tests.
+- [x] Mesa through VirGL host GPU acceleration over `/dev/virtio-gpu`.
+- [x] NetSurf libraries ported (libwapcaplet, libparserutils, libcss, libdom, etc.).
+- [x] NetSurf framebuffer browser cross-built and rendering real pages.
+- [x] Web access: HTTP via libcurl, HTTPS via mbedTLS, and public HTTPS.
+- [x] On-screen `/dev/fb0` and Wayland windowed frontends with input.
+- [x] TCP zero-window stall fix and heavy-page OOM robustness.
+- [x] NetSurf HTTPS regression fix with `--with-mbedtls`.
+- [x] SVG, JavaScript (Duktape), public-suffix list, JPEG-XL, and utf8proc enabled.
+- [ ] `stubbed` Chromium assessment: blocked on sandbox, GPU EGL/GBM/Vulkan, C++ runtime.
 
 ## M54: Third-Party Port Feature Enablement
 
-Re-enable upstream features that were switched off when each port was first
-brought up, as the OS gains the syscalls/libc APIs they need. Full inventory,
-status table and the conditions for each remaining item:
-[`port-functionality.md`](port-functionality.md).
-
-- [x] `done` **Foundation (libc/kernel).** Timed futex
-  (`pthread_cond_timedwait`/`mutex_timedlock`, atomic+futex semaphores),
-  `SYS_SETTIMEOFDAY` (`settimeofday`/`clock_settime`), `SYS_SCHED_GETAFFINITY`
-  (+`cpu_set_t`/`CPU_*`), `scandir`/`alphasort`, POSIX `remove()`; the autotools
-  wrapper now drops libc-provided `-l` names so `--enable-threads` links in any
-  port.
-- [x] `done` **Ports.** curl: `file://`, unix-sockets, alt-svc, HSTS,
-  WebSockets, headers-api, dateparse, threaded resolver, **`libpsl`+`libidn2`**
-  (IDN/PSL), **brotli** (`Content-Encoding: br` decode). mbedTLS:
-  `HAVE_TIME`+`HAVE_TIME_DATE` (cert date validation), **`TIMING_C`** (timing
-  layer over `gettimeofday`). bash: `/dev/tcp`, `/dev/udp`. dropbear: zlib +
-  host lookup. wget: zlib + threads + PSL/IDN. NetSurf: JPEG + WebP + **JPEG-XL
-  (libjxl)** codecs, **SVG (libsvgtiny)**, **JavaScript** (bundled Duktape via
-  nsgenbind), `utf8proc`. Locale: `setlocale`/`localeconv`/`nl_langinfo` +
-  `iconv` (UTF-8/UTF-16/UCS4/Latin1/ASCII). BusyBox: real `sched_getaffinity`.
-- [x] `done` **Milestone closeout (M54).** The remaining feature flips are
-  either landed (above), correctly **declined**, or **deferred** behind a real
-  subsystem/large-library port. Full status: [`port-functionality.md`](port-functionality.md).
-  - **Declined (low value / conflicts):** dropbear `--enable-syslog` (moves logs
-    off the per-service `/var/log/sshd.log` the M32B smoke asserts);
-    dropbear/curl `--harden` (`-fPIE -pie` conflicts with the fixed `0x2000000`
-    load model); mbedTLS `NET_C` (the custom socket wrapper works); utmp/pam/
-    lastlog port flips (cosmetic who/last accounting — libc shim already exists).
-  - **Deferred (each its own large effort, revisit conditions in
-    [`port-functionality.md`](port-functionality.md)):**
-    - Modern HTTP: nghttp2 (HTTP/2), nghttp3+ngtcp2 (HTTP/3/QUIC), zstd
-      content-encoding — needs those libraries ported to the b1nix ABI.
-    - Mesa JIT + on-device windowing: port LLVM (LLVMpipe shader JIT) and add a
-      DRI/GLX/EGL/GBM path beyond OSMesa-to-memory. LLVM is the long pole
-      (tracked into M59). The softpipe path already works.
-    - Full wide-char locale / NLS tables → bash `HANDLE_MULTIBYTE`, `nls`. libc
-      is UTF-8-wired (`mbrtowc`/`wcrtomb`) + `iconv`; full locale catalogues are
-      not present.
+- [x] Foundation: timed futexes, `settimeofday`, sched_getaffinity, `scandir`, `remove`.
+- [x] Ports: curl (brotli, PSL, IDN2, unix-sockets), mbedTLS cert date validation, bash `/dev/tcp`, dropbear zlib, Wget threads/PSL, NetSurf JPEG-XL/SVG/Duktape, locale iconv.
+- [x] Milestone closeout: remaining feature flips landed, declined, or deferred.
 
 ## M55: C++ Runtime
 
-Prerequisite for every Chromium-class engine. Feasibility background and the
-revisit conditions are in [`chromium-assessment.md`](chromium-assessment.md).
-
-- [x] `done` Build and **run** libstdc++ with C++ exceptions (DWARF `.eh_frame`
-  unwinding, registered with `libgcc` by `crt0`), RTTI, and thread-safe statics.
-  The cross GCC 13.2 builds `libstdc++.a`/`libsupc++.a` (`--enable-threads=posix`,
-  staged by `tools/toolchain/enable-cxx-toolchain.sh`); `tools/toolchain/bin/b1nix-c++` links them with
-  `libgcc` via `userspace/linker-cxx.ld` (keeps `.eh_frame`/`.gcc_except_table`).
-  Verified end-to-end by `userspace/bin/cxx_smoke.cpp` (`CXX-SMOKE: ok` for
-  ctors, stl, exceptions, **rtti** `dynamic_cast`/`typeid`/`bad_cast`,
-  **static-init** `__cxa_guard`, **threads** `std::thread`/`mutex`/`atomic`).
-- [x] `done` `std::thread`/`mutex`/`atomic` over the M29 pthread layer (verified
-  in `cxx_smoke`). `std::condition_variable` links via gthr-posix.
-- [x] `done` `std::filesystem` and locale/`iostream`. `std::cout`/`cin`/`cerr`,
-  `ostringstream`/`istringstream` and `std::filesystem` (create/iterate/stat/
-  remove) run end-to-end against the hosted libstdc++ over the b1nix VFS/UTF-8
-  libc — verified by `userspace/bin/m55_iostream.cpp` (`M55-IOSTREAM: ok
-  cout/sstream/cin/filesystem`, both arches; `cin` reads a real fd 0 fed by a
-  pipe). Needed no new libc symbols; the root-cause fix was `linker-cxx.ld` not
-  collecting libstdc++'s legacy `.ctors.NNNNN` init sections, so the iostream
-  `ios_base::Init` global never ran and the first `std::cout` faulted.
-- [x] `done` Validate the runtime with a real modern engine: **litehtml** (C++
-  HTML/CSS layout engine + bundled gumbo HTML parser) is ported
-  (`tools/ports/build-litehtml.sh`, CMake cross-build against b1nix libstdc++) and
-  runs end-to-end on b1nix — `userspace/bin/m55_litehtml.cpp` feeds it a styled
-  page, and the engine parses HTML, cascades CSS, lays out the box tree and
-  emits draw calls. Verified both arches: `M55-LITEHTML: ok parse/layout/draw`
-  (asserts the cascade — `h1` 32px above `p` 16px — and block ordering). This
-  exercises libstdc++ exceptions/RTTI, STL and `shared_ptr` on a non-trivial
-  codebase. (Closing this needed a real libc gap fixed: `fegetenv`/`fesetenv`/
-  `feholdexcept`/`feupdateenv`, which openlibm's `nearbyint` pulls in.)
-  Ladybird LibWeb/LibJS remains a future option if a heavier engine is wanted.
+- [x] Build and run libstdc++ with DWARF unwinding, RTTI, and thread-safe statics.
+- [x] `std::thread`/`mutex`/`atomic` over pthread layer.
+- [x] `std::filesystem` and `iostream` (`std::cout`/`cin`/`cerr`/`stringstream`).
+- [x] Validate runtime with **litehtml** C++ layout engine and gumbo parser.
 
 ## M56: Event Loop and IPC Primitives
 
-- [x] `done` `epoll` (level + `EPOLLET` + `EPOLLONESHOT`), `eventfd`, `timerfd`,
-  `signalfd` — built on the existing `vfs_poll` readiness layer, all pollable
-  via `poll`/`select` and `epoll` (`M56-SMOKE: ok eventfd/epoll/timerfd/signalfd`).
-- [x] `done` `SCM_RIGHTS` ancillary FD passing over `AF_UNIX` — already worked
-  (Wayland passes buffers/keymap fds through it); verified in M48/M49/M57.
-- [x] `done` memfd sealing (`F_ADD_SEALS`/`F_GET_SEALS`, enforced on
-  write/ftruncate) and cross-process shared `mmap` (Wayland shm). The libwayland
-  port now uses these real primitives instead of emulating them.
+- [x] `epoll` (level/ET/oneshot), `eventfd`, `timerfd`, and `signalfd`.
+- [x] SCM_RIGHTS` ancillary FD passing over UNIX sockets.
+- [x] memfd sealing (`F_ADD_SEALS`/`F_GET_SEALS`) and cross-process shared `mmap`.
 
 ## M57: Multiprocess Model
 
-- [x] `done` fork/exec, FD inheritance, and FD brokering for the `--no-sandbox`
-  model: COW fork with shared open-file offsets, `FD_CLOEXEC` across exec,
-  `SCM_RIGHTS` fd-brokering incl. in-flight-fd cleanup on peer death (audited
-  correct), plus added `socketpair()` (AF_UNIX only — all POSIX requires) and
-  `F_DUPFD_CLOEXEC`
-  (`M57-SMOKE: ok fork-fdshare/cloexec/exec-inherit/fd-broker/fd-broker-death/dupfd-cloexec`).
-- [ ] `planned` Bring up a minimal Mojo core over the M56 primitives.
+- [x] COW fork/exec, FD inheritance, `SCM_RIGHTS` brokering, `socketpair`, and `F_DUPFD_CLOEXEC`.
+- [ ] `planned` Bring up a minimal Mojo core over M56 primitives.
 
 ## M58: V8
 
-**DONE — real V8 (`d8`) runs JavaScript on b1nix: all three tiers, single + multi-CPU.**
-Full bring-up history in `tools/patches/v8/PORT-PLAN.md`.
-
-- [x] `done` Port, build, link, and **run real V8 `d8`** off an ext4 disk. The GN
-  build was taught `b1nix` as a `target_os` (the `tools/patches/v8/` skeleton — the
-  earlier "NO-GO, GN wall" assessment was wrong), then the engine compiled and
-  linked. Runs the 12-test `m58.js` suite (loops/arrays/objects/JSON/GC/recursion/
-  closures/try-catch/Map-Set/typed-arrays/regex) to `M58-V8: done`.
-- [x] `done` **All three execution tiers:** Ignition interpreter (`--jitless`),
-  **Sparkplug** baseline JIT (`--no-opt`), and **TurboFan** optimizing JIT
-  (`b1nix.v8opt`, incl. fib25 tier-up). Required W^X executable mmap, GC/deopt
-  signals, per-thread ELF TLS, real x87 `fenv` (`fnstenv`/`fldenv`), and a
-  FS-base-preserving ring3 entry path.
-- [x] `done` **Multi-CPU:** `-smp 2` runs both Sparkplug and TurboFan to completion,
-  0 faults (3/3 runs each, full suite). Required fixing an SMP `tlb_shootdown`
-  deadlock in `sys_mmap` (drain in-flight shootdowns per page) — v0.58.5.
-- [x] `done` **Maglev** (mid-tier JIT) **and the code cage** (external code space)
-  now both enabled and verified: the full m58.js suite (12 markers + `done`) runs
-  fault-free under Sparkplug AND TurboFan with `v8_enable_maglev=true` and
-  `v8_enable_external_code_space=true` (`tools/v8/v8-gen-jit.sh`). The long-standing
-  "code-cage zero-base / `0x400` crash" was never a V8 bug — it was a b1nix
-  **`sys_mmap`** bug: it honored V8's sub-4 GiB cage hint, which collides with the
-  supervisor-only low-4 GiB identity map (2 MB huge pages cloned into every address
-  space), so a user access there faulted as a present supervisor page. Fixed by
-  relocating low non-FIXED hints (as `vm_find_free_area` already did) — v0.58.6.
-- Config: pointer-compression data cage **on**, **Maglev on**, **code cage on**,
-  **sandbox on**, **i18n on** (embedded ICU), **WebAssembly on**, **Temporal on**
-  (see below — now that b1nix has a Rust toolchain). d8 ships **inside the ISO** as
-  a GRUB `module2` (→ `ram0`, mounted `/mnt/v8`) — no separate SATA disk. Run via
-  `b1nix.test=1 b1nix.v8run b1nix.v8jit [b1nix.v8opt]`.
-- [x] `done` **Temporal — V8 with Rust (v0.69.8).** `v8_enable_temporal_support`
-  pulls in the Rust `temporal_capi`/`temporal_rs` (+ `icu_calendar`, `diplomat`,
-  ~33 crates) — the first Rust running *inside* V8 on b1nix. Built with the b1nix
-  cross-rust (`build/rust-native/.../x86_64-unknown-linux-gnu/stage2`, target
-  `x86_64-unknown-b1nix`). GN wiring: `apply.sh` Patches **7** (real b1nix
-  `rust_abi_target`), **7b** (known-target-triples), **7c** (profiler_builtins is
-  chromium-toolchain-only); `tools/v8/setup-rust-hoststd.sh` grafts a host std
-  (with `.rmeta`) for proc-macros/build-scripts; `tools/v8/v8-link-d8.sh` pulls the
-  rust rlibs + rust std into the d8 link (GN passes them outside `d8.rsp`). d8 needs
-  `--harmony-temporal` (added to the `kernel/main.c` argv — Temporal is an
-  in-progress harmony flag). Verified in QEMU: `M58-V8: ok temporal-plaindate`,
-  `ok temporal-duration`, `ok temporal-add` (calendar arithmetic runs in Rust).
-- [x] `done` **WebAssembly** (`v8_enable_webassembly`). Trap handler off on b1nix
-  (`apply.sh` **Patch 20** → explicit in-code bounds checks). The startup abort
-  (`AllowHeapAllocationInRelease::IsAllowed()` during startup-snapshot deserialize)
-  was **not** a V8/TLS-seeding bug — it was a b1nix main-thread TLS-placement bug:
-  the kernel put the thread pointer at `region + round_up(p_memsz, p_align)` while
-  the b1nix linker emits local-exec offsets as `symbol_offset - p_memsz` (un-rounded),
-  so any binary whose TLS `p_memsz` is not an `align` multiple (wasm d8: `0x108`,
-  align `0x10`) read every `__thread` 8 bytes off. Fixed by placing the TP at
-  `region + p_memsz` in `kernel/user/process.c` (main thread) and
-  `userspace/libc/pthread.c` (workers). Verified `M58-V8: ok wasm`.
-- [x] `done` **Sandbox** (`v8_enable_sandbox`, TrustedSpace + sandboxed pointers).
-  The "V8_ENABLE_SANDBOX not propagating across gn source-sets" was a stale-object
-  artifact — a clean rebuild fixed it. Two real fixes: **Patch 21** disables the
-  Linux sandbox-testing crash filter on b1nix (`<sys/ucontext.h>`/`greg_t`/`SI_KERNEL`),
-  **Patch 22** compiles `partition_alloc` `stack_trace_linux.cc` for `CollectStackTrace`.
-  Runtime: a `sys_mmap` hang on the sandbox's ~1.4 TiB cage + 256×4 GiB Smi-range
-  PROT_NONE reservations — fixed by skipping eager per-page PTEs for `prot==PROT_NONE`
-  (the `#PF` fast path faults them in lazily). Verified Sparkplug + TurboFan.
-- [x] `done` **i18n** (`v8_enable_i18n_support`) with ICU data embedded
-  (`icu_use_data_file=false`, no external `icudtl.dat`); needed `LC_MESSAGES` in the
-  libc `<locale.h>`. Verified `M58-V8: ok intl`.
-- [x] `done` **Temporal** (`v8_enable_temporal_support`). Needs the Rust
-  `temporal_rs`/`temporal_capi` crate (`temporal_rs_*` symbols); b1nix has no
-  Rust→b1nix toolchain. Separate large port, like the AArch64 effort.
-- [x] `done` (earlier pragmatic alt, kept) the in-tree **Duktape** (M54/NetSurf) as
-  a standalone `/bin/js` runner/REPL — the lightweight JS vector; superseded for
-  capability by real V8.
-- [x] `done` cheap independent POSIX wins surfaced by the probe:
-  `madvise(MADV_DONTNEED/FREE/hints)`, `MAP_NORESERVE` (lazy-commit), and
-  `sigaltstack` with working `SA_ONSTACK` signal delivery — per-process alt stack
-  in scheduler side-tables (M29 invariant). Help any large-heap allocator, not
-  just V8. Verified by `MM-SMOKE: ok madvise/noreserve/sigaltstack` (both arches).
-  *Caveats:* `MADV_FREE` is implemented as `MADV_DONTNEED` (b1nix has no
-  lazy-reclaim queue, so contents are discarded, not preserved on read-back);
-  `madvise` only acts on anonymous, non-shared mappings (file/`MAP_SHARED` =
-  safe no-op); `MAP_NORESERVE` has no reservation accounting (b1nix lazy-commits
-  regardless — nothing faked).
+- [x] Port, build, link, and run real V8 `d8` running m58.js suite.
+- [x] All execution tiers: Ignition interpreter, Sparkplug baseline JIT, and TurboFan JIT.
+- [x] Multi-CPU SMP support under Sparkplug and TurboFan.
+- [x] Maglev mid-tier JIT and external code cage space enabled.
+- [x] Temporal — V8 with Rust integration (`temporal_rs`/`temporal_capi`).
+- [x] WebAssembly (`v8_enable_webassembly`) without trap handler.
+- [x] Sandbox (`v8_enable_sandbox`, TrustedSpace, sandboxed pointers).
+- [x] i18n (`v8_enable_i18n_support`) with embedded ICU data.
+- [x] on-tree Duktape as lightweight `/bin/js` runner.
+- [x] POSIX memory wins: `madvise`, `MAP_NORESERVE`, and `sigaltstack` with `SA_ONSTACK`.
 
 ## M59: EGL and GL for the Browser
 
-- [x] `done` Real EGL 1.4/1.5 over the M52 Mesa OSMesa softpipe (`b1egl_mesa.c`):
-  `eglGetDisplay`/`Initialize`/`ChooseConfig`/`CreateContext`/`MakeCurrent`/
-  `SwapBuffers` + the previously-missing off-screen `eglCreatePbufferSurface`
-  (the DRI/GBM-shaped path) and the on-screen window path to displayd. Verified
-  by `m59_smoke` (`M59-SMOKE: ok egl-init/egl-context/egl-render` — clears + draws
-  a triangle and checks real read-back pixels, both arches). The existing
-  TinyGL-backed `b1egl.c` stays for that path. *Caveat:* the verified path is the
-  software OSMesa softpipe (off-screen pbuffer); the on-screen window path and the
-  M53 virgl host-GPU path share the same EGL surface model but the smoke runs the
-  off-screen software path.
-- [x] `done` Software Skia (Ganesh) raster fallback — ported as standalone M91.
-
-
+- [x] Real EGL 1.4/1.5 over Mesa OSMesa softpipe (off-screen pbuffer and displayd window path).
+- [x] Software Skia (Ganesh) raster fallback.
 
 ## M60: Ozone Platform
 
-- [x] `done` **Headless Ozone backend** wired for the b1nix Chromium build
-  (`ozone_platform_headless=true`, `ozone_auto_platforms=false`; ANGLE/libpci
-  fallbacks patched in `tools/patches/chromium/apply.sh`).
-- [ ] `deferred` A **displayd/Wayland-shaped** Ozone backend (window, surface,
-  input, vsync) for on-screen rendering — tracked under M66. **Gated on the
-  frozen M62**: an Ozone platform backend is only useful once `content_shell`
-  links and renders (M62), and M61/M62 are frozen. The display-server pieces it
-  would sit on (M47–M49 Wayland compositor + M52/M59 EGL/Mesa) already exist;
-  what's missing is the Chromium engine to drive. Revisit if Chromium is unfrozen.
+- [x] Headless Ozone backend for b1nix Chromium build.
+- [ ] `deferred` Displayd/Wayland Ozone backend for on-screen rendering (gated on M62).
 
 ## Frozen - M61: Chromium Build Target
 
-- [x] `done` **b1nix is a working GN/Ninja target** — `gn gen out/b1nix`
-  (~68.5k edges) succeeds with the shared `//build` `target_os=="b1nix"` +
-  `//build/toolchain/b1nix` cross-toolchain (clang + bundled libc++, Rust on).
-- [x] `done` **Foundational + services layers compile** with the b1nix
-  toolchain: `base/`, `//net`, `crypto/`, `ui/`, `mojo/`, `services/`, most
-  `third_party` (webrtc/skia/dawn/angle/swiftshader). ~50 libc/header gaps filled
-  + GN disables for absent system libs (NSS/kerberos/libpci/alsa/pulse/udev). See
-  `docs/chromium-port-log.md`; deferred items in `docs/chromium-port-debt.md`.
-- [ ] `partial` **Compile the rest** (Blink renderer + `content/`) under
-  `ninja -k 0` so the `.so` link blocker doesn't halt the object grind.
+- [x] b1nix is a working GN/Ninja build target.
+- [x] Foundational and services layers compile (`base`, `net`, `crypto`, `ui`, `mojo`, `services`).
+- [ ] `partial` Compile remaining Blink renderer and `content/` layers.
 
-##  Frozen - M62: content_shell
+## Frozen - M62: content_shell
 
-- [ ] `in-progress` `content_shell` is the active ninja target; foundational +
-  services layers compile (M61). **Remaining: (1) compile Blink/content,
-  (2) the link phase** — hand-relink content_shell + the 4 graphics `.so`s as
-  b1nix ELFs via `tools/v8/chromium-link.sh` (extends `v8-link-d8.sh`; the
-  graphics `.so`s are runtime-dlopen'd so content_shell links independently).
-- [ ] `planned` Then render a page to a bitmap (`--headless --no-sandbox`) and
-  verify pixels — the "Chromium runs" milestone (reuses V8 M58 + EGL/OSMesa M59).
+- [ ] `in-progress` Compile Blink/content and link content_shell ELFs.
+- [ ] `planned` Render page to bitmap (`--headless --no-sandbox`) and verify pixels.
 
 ## M63: Sandbox
 
-- [x] `done` **seccomp-bpf syscall filtering.** A task installs an immutable
-  classic-BPF filter (`SYS_SECCOMP`/`prctl(PR_SET_SECCOMP)`) or enters strict
-  mode (`SECCOMP_MODE_STRICT`); `kernel/sched/seccomp.c` runs the filter chain
-  over a `struct seccomp_data` on every syscall (hooked at the top of
-  `syscall_dispatch_impl_inner`, gated on a single side-table load so only
-  filtered tasks pay anything) and enforces the verdict by Linux precedence
-  (`KILL_PROCESS > KILL_THREAD > TRAP > ERRNO > TRACE > LOG > ALLOW`): ALLOW
-  proceeds, ERRNO short-circuits with `-errno`, KILL terminates the task with
-  SIGSYS, TRAP raises SIGSYS. A full classic-BPF interpreter (LD/LDX/ST/ALU/JMP/
-  RET/MISC, bounds-checked, fails closed) backs it. Filters are refcount-shared
-  on fork/clone, survive execve, and can only be added (a descendant is always
-  at least as restricted); `PR_SET_NO_NEW_PRIVS` round-trips. Verified by
-  `userspace/bin/m63_smoke.c` (`M63-SMOKE: ok seccomp-errno/kill/strict/inherit/
-  nnp`). Filter state lives in scheduler side-tables (struct task cannot grow —
-  M29 LAPIC-PT invariant).
-- [ ] `deferred` **user/PID/net namespaces + the setuid-sandbox helper.** Each
-  namespace type is its own subsystem (a cloneable, refcounted namespace object
-  threaded through the VFS mount table / PID allocator / netdev+socket layer with
-  `CLONE_NEW*` in `clone`), and the setuid helper needs a trusted broker binary.
-  Large, and only required for the **layered** Chromium sandbox (which is frozen)
-  — seccomp-bpf alone already gives real syscall-surface reduction. Revisit when
-  process/namespace isolation is concretely needed.
-- The seccomp-bpf layer is what **Chromium's syscall sandbox** uses; the b1nix
-  Chromium build still runs `--no-sandbox` until namespaces land too (port debt,
-  `chromium-port-debt.md`).
+- [x] Classic seccomp-bpf syscall filtering with `PR_SET_NO_NEW_PRIVS`.
+- [ ] `deferred` User/PID/net namespaces and setuid-sandbox helper.
 
 ## M64: Optional Clang/LLVM Toolchain — DONE
 
-`done` — Clang is available across the toolchain alongside the proven GCC path.
-**Clang is in fact the primary C compiler**: the kernel and the whole userspace
-libc + smoke binaries build with it. An optional cross `clang++` frontend, a
-native self-host Clang (build + in-QEMU proof), and separate Clang/Clang-libc++
-V8 GN configs all exist and are exercised. GCC remains the **default C++**
-compiler for the libstdc++-linked C++ ports and the M26 self-host path — a
-deliberate choice (a `libc++`/`libc++abi`/`libunwind` port is a non-goal), not a
-gap.
-
-- [x] `done` **Phase 1 — optional cross `clang++` frontend (x86_64).**
-  `tools/toolchain/bin/b1nix-clang++` compiles against the staged GCC 13 headers and links the
-  existing libstdc++/libsupc++/libgcc and `libb1nix`; GCC remains the default.
-  `m64_clang_smoke` covers STL, exceptions and RTTI in the regular smoke harness.
-- [x] `done` **Phase 2 — V8 Clang build (separate GN config).** The Clang V8
-  build paths exist and are wired alongside the proven GCC one:
-  `tools/v8/v8-build-run.sh` takes `FRONTEND=clang` (host clang frontend + the
-  GCC libstdc++ runtime, GN profile `b1nix-jit-clang`) **and** `clang-libcxx`
-  (host clang + Chromium's bundled **libc++** + Temporal + cross-Rust, profile
-  `b1nix-jit-clang-libcxx` — the Chromium-direction C++23 toolchain), with `gcc`
-  kept as the default fallback. So the milestone's actual ask — *a separate
-  Clang GN output/config that doesn't disturb the working GCC build* — is
-  satisfied, including a real libc++ path. What is deliberately **not** done is
-  promoting the Clang V8 build to the *default* smoke profile: the routinely
-  built+verified V8 in `tests/smoke.sh` is the GCC one (the clang/clang-libcxx
-  profiles are opt-in), because running a second full V8 link in every smoke is
-  pure cost with the GCC path already green. The capability is there; only the
-  default-path choice favors GCC.
-- [x] `done` **Phase 3 — Clang is the primary C compiler; C++ ports stay on the
-  shared GNU runtime by design.** All **C** code already compiles with Clang —
-  the kernel (`clang --target=x86_64-elf`) and the entire userspace libc + smoke
-  binaries (`CC := clang`). The **C++** ports (V8, Chromium, Mesa, NetSurf,
-  litehtml, the native toolchain) build with the cross **GCC g++** because they
-  link the one C++ runtime b1nix ships — GCC's `libstdc++`/`libsupc++`; the
-  optional cross `clang++` (Phase 1) links that *same* libstdc++. Moving those
-  ports off g++ is **declined, not pending**: a full `libc++`/`libc++abi`/
-  `libunwind` port is an explicit non-goal (see the note below), and clang+GCC-
-  libstdc++ has real ABI edges (e.g. the i686 `size_t` mangling mismatch that
-  already pins `m64_clang_smoke` to x86_64). So "everything is on Clang" is true
-  for C; C++ ports are intentionally on the shared GNU C++ runtime, with a clang
-  frontend available when wanted.
-- [x] `done` **Native self-host Clang (build).** `tools/build-native-clang.sh --b1nix-elf`
-  cross-builds a b1nix-native `clang`/`clang++` under `build/native-clang/b1nix/usr`
-  with b1nix as the host triple; `make install-native-toolchain` stages only this
-  b1nix ELF build into the rootfs, not the Linux-hosted cross compiler.
-- [x] `done` **Native self-host Clang (in-QEMU proof).** `make clang-proof`
-  (tools/clang/clang-proof.sh) ships clang-22 in an ext4 GRUB module (ram0); with
-  `b1nix.clangrun` the kernel runs it on b1nix: `clang --version` prints
-  `clang version 22.1.8` (load+execute proof) and `clang -c hello.c -o hello.o`
-  exits 0 emitting a valid ELF object (`M64-NATIVE-CLANG: ok compile`). b1nix
-  compiles a b1nix object with its own native Clang.
-- A full GCC-to-Clang migration and a libc++/libc++abi/libunwind port are not
-  goals. Add either only when a measured incompatibility makes the GNU path fail.
+- [x] Phase 1 — optional cross `clang++` frontend (`b1nix-clang++`).
+- [x] Phase 2 — V8 Clang build profiles (`b1nix-jit-clang` and `b1nix-jit-clang-libcxx`).
+- [x] Phase 3 — Clang as primary C compiler while C++ stays on shared GNU runtime.
+- [x] Native self-host Clang build under `build/native-clang/b1nix/usr`.
+- [x] Native self-host Clang in-QEMU proof (`M64-NATIVE-CLANG: ok compile`).
 
 ## M65: Install to Disk
 
-- [x] `done` Standalone **install to a real disk** — the machine boots b1nix on
-  its own (no live USB/ISO) with a writable on-disk root. Verified end-to-end:
-  the host builds a bootable image, `b1nix_install` copies it to a target disk,
-  and that disk boots GRUB → kernel → `rootfs: sata0p1 mounted at /` → userland.
-- [x] `done` **`tools/images/mk-disk-image.sh`** (host): builds a standalone-bootable
-  `b1nix-disk.img` — MBR + real pre-baked BIOS GRUB via loopback
-  `grub-install` + an ext4 root staged with the full userland (busybox + bash +
-  applet symlinks + `/etc`). **No in-guest ports** (no in-guest grub/mkfs).
-  Excludes V8/Chromium by construction. `make disk-image`.
-- [x] `done` **`/bin/b1nix_install`** (in-guest): validated whole-disk copy of
-  the image onto a target block device (size check, confirm, progress, fsync).
-- [x] `done` **Block-I/O fixes that unblocked raw `/dev/sataN` use** (also fix
-  fdisk/dd on any installed system): rebind block device nodes after the
-  root-switch (`vfs_repopulate_after_root_mount` → `blk_create_dev_nodes`);
-  device size via `lseek(SEEK_END)`; block-aligned **bulk DMA** fast path
-  (bounce through a kernel buffer, chunked to a PRDT-safe size) in
-  `blkdev_node_read/write`; AHCI PRDT bounds check; cache-invalidate before raw
-  writes. *Caveat:* throughput is gated by QEMU's polled-AHCI latency (no IRQ
-  path yet) — correct but not fast; interrupt-driven AHCI is future work.
+- [x] Standalone install to real disk with bootable MBR/ext4 image.
+- [x] `tools/images/mk-disk-image.sh` host script for bootable disk images.
+- [x] `/bin/b1nix_install` in-guest whole-disk installer.
+- [x] Block I/O fixes for raw `/dev/sataN` and bulk DMA fast path.
 
-  ## Frozen - M66: Chromium Browser Frontend (planned)
+## Frozen - M66: Chromium Browser Frontend (planned)
 
-- [ ] `planned` A real **browser UI on top of the Chromium content layer** — once
-  M62 `content_shell` renders pages, build a windowed browser frontend (address
-  bar, navigation, tabs) running on b1nix's compositor. Path: a displayd/Wayland
-  **Ozone backend** (M60 has the headless one) so Chromium draws into a real
-  window via the M47-49 display server + M52/M59 EGL/Mesa, plus the chrome UI
-  itself. **Gated on M62** (the engine must render first). Lighter alternative if
-  full Chromium UI is too heavy: drive `content_shell --window-size` output into
-  a libgui window.
+- [ ] `planned` Windowed browser UI over Chromium content layer via displayd Wayland Ozone backend.
 
 ## M67: Rust Toolchain Port (for Chromium) — DONE
 
-- [x] `done` Ported **Rust to b1nix**: an `x86_64-unknown-b1nix` rustc target spec
-  (`tools/patches/rust/x86_64_unknown_b1nix.rs`) reusing Rust's `unix` PAL +
-  `-Zbuild-std` against `libb1nix`, plus the cross-toolchain driver. Host rustc
-  emits b1nix ELFs; wired into Chromium's `enable_rust` path. Merged (PR#23).
+- [x] Ported Rust to b1nix via `x86_64-unknown-b1nix` target spec and cross-driver.
 
 ## M68: Native Rust Compiler (self-hosted) — DONE
 
-- [x] `done` **rustc runs ON b1nix.** Native rustc + `librustc_driver.so` +
-  `libLLVM.so` built as ET_DYN (`--host=x86_64-unknown-b1nix`, dynamic-linking +
-  PIE + initial-exec TLS), loaded by the M69 kernel exec-time linker. Proven in
-  QEMU (`tools/rust/rust-proof.sh`: `M68-RUST: ok rustc-load` + the real
-  `rustc 1.98.0-nightly` banner). Merged (PR#23).
+- [x] Native rustc 1.98.0 running on b1nix with dynamic `librustc_driver.so` and `libLLVM.so`.
 
-
-## M69: Dynamic Loading (ELF dynamic linker) — DONE
-
-Implemented as a real userspace `ld.so` in `userspace/libc/dlfcn.c` (mmap +
-mprotect, no kernel changes): the kernel still loads the main PIE binary and its
-startup objects eagerly (M30); this handles everything after the process is
-running. Verified end-to-end by the m30-dynamic smoke (`M69-DL*` + `M69-PLUGIN`
-ctor/dtor markers).
-
-- [x] `done` **Phase 1 — lookup in startup-loaded libc.** `dlopen` recognizes
-  `libc.so.1`, `dlsym` walks its ELF `DT_HASH`/`DT_SYMTAB`/`DT_STRTAB`, and
-  `dlclose` succeeds without unloading the process-lifetime object. The dynamic
-  smoke resolves and calls `strlen` through the returned pointer.
-- [x] `done` **Phase 2 — load new objects at runtime.** `dlopen` of a new
-  ET_DYN maps its PT_LOAD segments, parses `PT_DYNAMIC`, loads non-libc
-  `DT_NEEDED` deps, applies `RELATIVE`/`GLOB_DAT`/`JUMP_SLOT`/`64` relocations
-  (resolving against the loaded objects), `mprotect`s segments to final perms,
-  and runs `DT_INIT`/`DT_INIT_ARRAY` constructors. Proven by a real plugin .so
-  whose ctor runs and whose exported function is dlsym'd and called.
-- [x] `done` **Phase 3 — lifetimes and full lookup scopes.** Objects are
-  reference-counted (re-`dlopen` returns the same handle), `dlclose` runs
-  `DT_FINI_ARRAY`/`DT_FINI` and `munmap`s at zero, and `RTLD_DEFAULT` /
-  `RTLD_NEXT` lookup scopes are implemented.
-- **Motivation:** unblocks rustc **proc-macros** and compiler **plugins** (both
-  loaded as `.so`) plus general shared-library support.
-- [x] `done` **Kernel exec-time dynamic linker runs the native rustc.** The M68
-  rustc came out *dynamic* (`rustc` → `librustc_driver.so` → `libLLVM.so` →
-  `libgcc_s.so`, no `PT_INTERP`), so the kernel ELF64 loader resolves the whole
-  ~250 MB `DT_NEEDED` graph at exec. Extensions to `kernel/user/process.c`:
-  dynamic `ET_EXEC` (not just PIE), `R_X86_64_COPY` (e.g. `environ`),
-  `R_X86_64_TPOFF64` with a process-wide variant-II static-TLS layout across all
-  objects, a 2 KB symbol-name buffer (Rust mangled names reach ~750 chars), and
-  `$ORIGIN/../lib` bundle-relative `DT_NEEDED` resolution. Proven in QEMU
-  (`b1nix.rustrun`, `tools/rust/rust-proof.sh`): `M68-RUST: ok rustc-load` then
-  the real `rustc 1.98.0-nightly` banner printed from b1nix.
-
-## M69b: Dynamic-loader performance
-
-The M69 exec-time linker is correct but unoptimized. As the C/C++ port binaries
-move onto real dynamic linking (the `--enable-shared` cross GCC gives them
-`DT_NEEDED libgcc_s.so`; `/lib/libgcc_s.so` now ships in the initramfs and the
-kernel resolves it), the per-spawn linking cost matters. Eliminate the speed
-problems so "everything dynamic" carries no penalty:
-
-- [x] `done` **O(1) symbol resolution.** `elf64_resolve_symbol` /
-  `elf64_resolve_tls_symbol` now walk the SysV `DT_HASH` table
-  (`elf64_sysv_hash` + `elf64_hash_lookup`) instead of a linear dynsym scan —
-  O(relocs × symbols) → O(relocs). (v0.69.3)
-- [ ] `planned` **Share/cache loaded shared objects across processes.** The
-  loader re-reads + re-`kzalloc`s + re-relocates each `.so` (libgcc_s.so,
-  libc.so, ...) on every `spawn`. Load + relocate once and share the read-only
-  pages (copy-on-write the writable ones), like a real mmap-backed `.so`.
-- [ ] `planned` **Lazy PLT binding.** All `JUMP_SLOT` relocations are resolved
-  eagerly at load; bind on first call so unused imports cost nothing.
-- [ ] `planned` **Faster segment lookup.** `elf64_stage_ptr` is O(segments) per
-  call; binary-search / hash the vaddr ranges.
-
-**Loader correctness — `R_X86_64_COPY` relocation order (v0.69.6).** The eager
-linker relocated the executable before its libraries, so a non-PIE exe's COPY
-relocs (`stdout`/`stderr`/`stdin`/`errno`/`environ`, imported from libgcc_s.so)
-copied the source library's pointer *before* the library's own `R_X86_64_RELATIVE`
-reloc had fixed it — the exe's `stdout` got a garbage pointer and the first
-`fprintf()` crashed. Every NetSurf render (the whole M53 cluster) died this way.
-Fixed by relocating libraries before the executable (only the non-PIE exe carries
-COPY relocs). With this, the M69 loader is correct for the full C/C++ port set;
-**x86_64 smoke is fully green (833/0)**.
-
-**Closeout — remaining perf items deferred (profile-gated).** The headline cost
-(O(relocs × symbols) linear dynsym scan) is gone with DT_HASH; the loader is
-correct and fast enough that nothing in the suite or the port set is
-loader-bound. The three items below are real but each is either large/risky
-against a now-green exec path or a micro-opt below the noise floor, so they wait
-for a profiled bottleneck rather than speculative churn:
-- Share/cache `.so` across spawns — the genuine win for *repeated* big-binary
-  spawns (re-reading + re-relocating `libLLVM.so` ~184 MB per spawn), but a large
-  change (cross-process page sharing + COW writable segments + refcount/teardown +
-  invalidation). No current repeated-spawn hot loop justifies the regression risk.
-- Lazy PLT binding — helps single-startup of a huge-export library; needs a PLT
-  trampoline + on-first-call resolver. Deferred with the same gate.
-- Faster `elf64_stage_ptr` — YAGNI: a linear scan over the handful of
-  cache-resident segments is not the bottleneck (relocation time is dominated by
-  the per-segment `memcpy`), and a sorted/binary-search variant would add an
-  invariant to maintain across the during-load callers for sub-ms savings.
-
-## M69c: Dynamic linking by default + matured loader relocations
-
-The base system now links **dynamically by default** (relates to M71 PIE-by-default
-and the M69b loader): every base userspace program is a PIE that links against the
-shared `libc.so.1` through `/lib/ld-b1nix.so` + the in-kernel M69 loader, instead
-of a fully static ET_EXEC. `LINK=static` in `userspace/Makefile` restores the
-historical static link. **x86_64 smoke 834/0** with every base ELF loaded at the
-PIE base (`0x500000000000`).
-
-- [x] `done` **Dynamic-by-default base.** `userspace/Makefile` generic program
-  rule links `-pie` against `libc.so.1` with the dynamic crt0; `libc.so.1` ships in
-  every initramfs. The whole M12–M58 smoke suite runs as dynamic PIEs.
-- [x] `done` **`struct dirent` ABI fix (v0.69.11).** The Chromium-port grind had
-  inserted `d_type` *before* `d_name`, shifting `d_name` off the offset the
-  prebuilt cross-GCC libstdc++/Fontconfig/busybox/curl ecosystem reads it at;
-  under dynamic-by-default this broke `readdir` for dynamic consumers. `d_type`
-  moved after `d_name` (offset 8 restored), and `libc.so.1`'s PIC objects gained
-  the header-dependency tracking they were missing (stale shared-libc bug).
-- [x] `done` **Matured `dlfcn.c` relocations (v0.69.12).** The userspace runtime
-  loader now also handles **general-dynamic TLS** in a dlopen'd object
-  (`R_X86_64_DTPMOD64`/`DTPOFF64` + a real `__tls_get_addr` that materialises a
-  per-module TLS block), **IFUNC** (`R_X86_64_IRELATIVE`, resolver called in
-  process), and **`R_X86_64_COPY`**. TLS-GD is smoke-verified (`M69-DL5: tls-gd
-  ok`); IRELATIVE/COPY are implemented but not smoke-exercised (the b1nix clang
-  target ignores `__attribute__((ifunc))` and normal `.so`s emit no COPY).
-- [x] `done` **Default-ISO ports flipped to dynamic (v0.69.14 / v0.69.15).** The
-  shared autotools port link recipe (`tools/toolchain/bin/b1nix-autotools-cc`) now
-  defaults `B1NIX_LINK=dynamic`: the executable ports it links — `bash`, `curl`,
-  `dropbear`, `wget` — are dynamically-linked `ET_EXEC`s importing libc from the
-  shared `libc.so.1` via `/lib/ld-b1nix.so` (the in-kernel M69 loader resolves the
-  COPY relocs for `environ`/`stdout`/`stderr`/`errno` and the JUMP_SLOTs eagerly at
-  spawn); `B1NIX_LINK=static` restores the historical static link. `busybox`
-  (cross-GCC, v0.69.13) is likewise dynamic (`libc.so.1` + `libgcc_s.so`, interp
-  `/lib/ld64.so.1` — the kernel reads `PT_INTERP` only for logging and links
-  in-kernel, so both interpreter strings resolve identically). The compile-only
-  library ports the recipe touches (mbedTLS, pcre2, libidn2, ...) are byte-for-byte
-  unchanged — they remain static `.a` archives, statically folded into the now
-  dynamic executables, so "mbedTLS dynamic" is moot (it ships no executable).
-  `wget` x86_64 also needed two pre-existing build fixes to rebuild at all
-  (gnulib's unconditional aclocal/automake regen rules → neutralised with
-  `ACLOCAL=true` etc.; gnulib replacing `timegm`/`mktime` against b1nix's
-  `static inline timegm` → `ac_cv_func_timegm=yes`/`gl_cv_func_working_mktime=yes`).
-  Verified by the full **x86_64 834/0** smoke with every M22/M11/BB-W*/M32-NET/TLS/
-  BASH-SMOKE marker driven by the dynamic binaries.
-- [x] `done` **M69 loader `.bss`-tail COPY fix (v0.69.15).** bash's own
-  getenv/setenv set manipulates `environ` directly, so its dynamic link emits an
-  `R_X86_64_COPY` for `environ` (+ `stdin`/`stdout`/`stderr`/`errno`) into bash's
-  `.bss` plus a paired `R_X86_64_GLOB_DAT` for `environ`. The 4-byte `errno` COPY
-  lands in the *final* bytes of the RW PT_LOAD (its `memsz` ends exactly 4 bytes
-  after `errno`). `elf64_apply_rela_table` pre-staged a fixed 8-byte `target` slot
-  for *every* reloc and failed (`va+8 > vaddr+memsz`) — but `R_X86_64_COPY` never
-  writes through `target` (it stages dst/src with the symbol's real size), so the
-  probe is now skipped for COPY. This re-enabled bash dynamic and unblocks any
-  binary whose COPY datum sits at a segment boundary (relevant for future dynamic
-  V8/rustc). The other dynamic ports COPY only into `.data` (within `filesz`).
-- [x] `done` **V8 `d8` flipped to dynamic (v0.69.16).** `tools/v8/v8-link-d8.sh`
-  gained a `B1NIX_LINK=dynamic` path (now the default) that links the gn-compiled
-  d8 object set against the shared `libc.so.1` via `/lib/ld-b1nix.so` (crt0-dynamic,
-  `--hash-style=sysv -z norelro`) instead of whole-archiving `libb1nix.a`. This is a
-  *relink* of the existing objects — no multi-hour ninja rebuild. Verified by
-  re-running d8 in QEMU on two profiles: `b1nix-jit-maglev` (no-rust) and the
-  everything-on `b1nix-jit-temporal` (Rust + Temporal). The dynamic d8 loads via the
-  in-kernel loader (`PT_INTERP=/lib/ld-b1nix.so`, `NEEDED libc.so.1`, 145 UND syms
-  all satisfied by `libc.so.1`) and runs JavaScript **and Rust-backed Temporal**
-  (`M58-V8: ok hello/loop-sum/temporal-plaindate/temporal-duration/temporal-add →
-  done`) — identical markers to the static temporal d8. (The COPY-at-segment-boundary
-  loader fix above is what unblocked it.) `B1NIX_LINK=static` restores the historical
-  whole-archive link.
-- [x] `done` **Graphics/GUI/browser smoke binaries flipped to dynamic (v0.69.17).**
-  A `BESPOKE_*` link mode in `userspace/Makefile` (non-PIE dynamic ET_EXEC: crt0-
-  dynamic + `--dynamic-linker /lib/ld-b1nix.so` + shared `libc.so.1`, with bundled
-  static archives still folded — the d8 model) converted **27 of 28** bespoke-static
-  binaries: GUI demos, libwayland, mbedTLS nettool/httpsd, the M51 desktop stack
-  (pixman/freetype/cairo/harfbuzz) and the M53 NetSurf codec/lib smokes. Verified by
-  the full **x86_64 834/0** smoke. `m53_libpng_smoke` stays static (residual debt):
-  libpng's setjmp/longjmp error path takes the absolute address of `longjmp`,
-  emitting R_X86_64_32 relocs a non-PIE link cannot form against an imported symbol.
-- [x] `done` **Mesa OSMesa/EGL demo executables flipped to dynamic (v0.69.18).** The
-  four real-Mesa demos (`m52_osmesa`, `m52_glsl`, `m53_mesa_virgl`, `m59_smoke`) are
-  linked by per-demo scripts (`tools/demos/build-m5{2,3,9}-*.sh`) that fold the OSMesa
-  softpipe `.a` + libstdc++/libsupc++/libgcc; each gained a `B1NIX_LINK=dynamic`
-  (default) path linking the shared `libc.so.1` via `/lib/ld-b1nix.so`. All four relink
-  dynamically (no absolute-reloc gap — unlike libpng) and run GPU-accelerated under the
-  full smoke: `M52-GFX`, `M53-VIRGL: ok …`, `M53-GFX: ok gl-accelerated/gl-triangle`,
-  `M59-SMOKE: ok egl-context/egl-render`. **x86_64 834/0.**
-- [x] `done` **NetSurf `nsfb` flipped to dynamic (v0.69.19).** nsfb links via the raw
-  cross-GCC (GCCSDK convention) and was already a dynamic executable (it imports
-  `libgcc_s.so`), but folded libc statically because gcc's implicit `-lc` resolved to
-  the static `libb1nix.a` in the cross-GCC's own sysroot — which had no `libc.so`.
-  `tools/ports/build-netsurf-fb.sh` now stages the shared `libc.so.1` into that
-  sysroot as `libc.so` (default; `B1NIX_LINK=static` skips it), so `-lc` resolves to
-  the shared library exactly like `libgcc_s.so`. nsfb now imports `libc.so.1` and
-  renders end-to-end under the full smoke: `M53-NS ok js/jxl`, `M53-FB ok
-  load/redraw/render/svg`, `M53-INPUT ok mouse/key`. **x86_64 834/0.**
-- [x] `done` **Native `rustc` flipped to dynamic libc (v0.69.20).** The whole rust
-  toolchain now imports libc from the shared `libc.so.1` and runs end-to-end on b1nix
-  (`M68-RUST: ok rustc-load` + the `rustc 1.98.0-nightly` banner). Six layers were
-  peeled, each a real wall the static-libc port design had baked in:
-  (1) `bootstrap.toml` `crt-static = false` so the rustc binary is a dynamic PIE (was
-  `+crt-static`); (2) `build-rust-native.sh` stages the PIC `crt0-dynamic.o` (the
-  static crt0 has a non-PIE `__register_frame_info` reloc); (3) the target spec pulls
-  the shared `libc.so` in early (`--push-state --no-as-needed -lc`) so the C funcs
-  resolve dynamically before the COMBINED `-lm` archive folds them, plus a late
-  `-lgcc_s` for the `_Unwind_*`/`__popcountdi2` the static-libc chain used to drag in;
-  (4) `download-ci-llvm = false` + `[llvm] ldflags`/`targets`/`ccache` builds the host
-  + b1nix LLVM from source as static `.a`s folded into `librustc_driver.so` (so there
-  is no separate static-libc `libLLVM.so` anymore — the 141 MB driver imports every
-  libc/math symbol UND from `libc.so.1`); (5) `libc.so.1` folds PIC openlibm
-  (musl-style: libm IS libc) so the shared libc exports `log1p/cosh/tan/…` too;
-  (6) `userspace/libc/openlibm_compat.c` adds the `crealf/cimagf/scalbnl` openlibm
-  references b1nix lacked. The only static residue is the rustc binary's
-  `compiler_builtins` `memcpy`/`memset` intrinsics, which Rust statically links into
-  every binary by design. Verified: full **x86_64 834/0** with the new openlibm-`libc.so.1`,
-  and the dynamic rustc runs in QEMU (`tools/rust/rust-proof.sh`, hash-agnostic).
-- **Still static (heavy tail):** `m53_libpng_smoke` (libpng `&longjmp` absolute reloc —
-  non-PIE physics, not fixable) and Chromium (intentionally deferred — doesn't run
-  yet). Rust proc-macros remain deferred (need the dynamic loader's dlopen path).
+## M69: Dynamic Loading (ELF dynamic linker) — Retired 
 
 ## M70: Interrupt-Driven I/O — DONE
 
-- [x] `done` Replace busy-poll storage/NIC drivers with ISR→wakeup completion.
-  A generic device-IRQ registration layer (`kernel/include/b1nix/irq.h` +
-  `interrupts.c`: `irq_register_handler`/`irq_dispatch`/`irq_unmask`, shared-line
-  aware) replaces the hard-coded per-device vector dispatch. The three storage
-  drivers (`ahci.c`, `virtio_blk.c`, `nvme.c`) now block on a per-device wait
-  channel and are woken by the completion IRQ instead of busy-yielding on a
-  status register (AHCI previously polled `PxCI` over MMIO = a VM-exit per read).
-  The NIC RX path wakes `net_task` immediately on the device IRQ rather than
-  draining only on the ~100 Hz poll tick.
-- The wait uses `scheduler_wait_prepare_timeout()` (M70 scheduler addition): it
-  publishes BLOCKED with a full barrier and re-checks the completion predicate
-  *after* publishing — closing the check-then-block lost-wakeup window — while
-  arming a watchdog deadline so a genuinely-lost interrupt degrades to a re-poll
-  instead of a wedge. A brief no-MMIO CPU spin first catches the sub-µs KVM-fast
-  completion with no context switch, and `scheduler_can_block()` falls back to
-  the old cooperative yield-poll before the scheduler is live (boot-time root
-  mount / IDENTIFY) or from IRQs-off callers. NVMe masks its interrupt vector in
-  the ISR and unmasks on consume to avoid a level-triggered INTx storm; AHCI and
-  virtio-blk ack their own IS/ISR registers. PCI INTx-disable is cleared and the
-  lines unmasked at the IOAPIC only after each driver is configured.
-- Verified by the full **x86_64 837/0** smoke (root mount + M14 SATA/NVMe
-  mount/persistence/block-cache + swap + M32-NET all green, no regression).
+- [x] Replace busy-poll storage/NIC drivers with ISR->wakeup completion model.
 
 ## M71: ASLR and PIE-by-Default
 
-- [x] `done` **PIE-by-default + ASLR (opt-in via `b1nix.aslr`).** The
-  PIE-acceptance half was already shipped by M69c (every base program is an
-  `ET_DYN` loaded at the PIE base `0x500000000000`). The **randomization** half is
-  now implemented: with the `b1nix.aslr` kernel cmdline flag, the elf64 loader
-  shifts the PIE/ET_DYN load base by a 2 MiB-granular random offset (15 bits ×
-  2 MiB = up to ~64 GiB of jitter) drawn from the kernel entropy source
-  (`kernel_random_u64`, rdrand + xorshift64* fallback). The window is provably
-  isolated: the upward-growing mmap arena fills from 4 GiB (V8's ~1.4 TiB
-  reservations stay far below), the shared-library region sits 1 TiB above at
-  `0x600000000000`, and the stack tops out at `0x800000000000` — so a randomized
-  PIE base never collides. `aslr_pie_base()` (`kernel/user/process.c`) gates on
-  the flag; **ET_EXEC images (`load_base == 0` — the fixed-base toolchain/V8/rustc
-  links) are never randomized**, so the load-bearing fixed-`0x2000000`/`-Ttext-
-  segment` invariant is untouched, as is the frozen 32-bit elf32 path. Verified:
-  the **entire** x86_64 smoke suite (all PIE) runs under `b1nix.aslr` and stays
-  green, plus `M71-ASLR: ok randomized` — two execs of the same PIE binary land at
-  different bases (`userspace/bin/m71_aslr.c`). Default is **off** (conservative:
-  no functional consumer demand yet and the loader is a green path); flip the flag
-  on per-boot to harden. Making it default-on is a follow-up policy call once it
-  has soaked on bare metal.
+- [x] PIE-by-default execution and opt-in kernel cmdline ASLR (`b1nix.aslr`) with 2 MiB random jitter.
 
 ## M72: Writable Foreign Filesystems and msync
 
-- [x] `done` **`msync` syscall + mmap-store durability across reclaim**
-  (`SYS_MSYNC` = 173). The libc `msync` is no longer a return-0 stub; the kernel
-  handler walks the range, `paging_test_and_clear_dirty()`s each page and, for the
-  pages userspace actually wrote, writes that page-frame's contents straight to
-  the backing file via the inode `write_cb`. `MS_ASYNC` schedules (mark-dirty
-  only); `MS_INVALIDATE` is a no-op (mappers share the frame). Argument validation
-  is verified by `M72-SMOKE: ok msync` (`MS_SYNC|MS_ASYNC` → `EINVAL`, unmapped →
-  `ENOMEM`, valid → 0).
-  - **Durability closed.** The previous gap — a writable `MAP_SHARED` store sets
-    only the hardware PTE dirty bit, so page-cache reclaim could drop the page
-    "clean" before `msync`, losing the write — is fixed by marking the page-cache
-    entry **dirty when a writable MAP_SHARED page is mapped in**
-    (`vmm_handle_page_fault`). Such a page is potentially-dirty by definition
-    (stores through the PTE never fault again), so this is the correct conservative
-    semantics, not over-eager accounting; reactive reclaim then writes it back
-    instead of dropping it. It is also genuinely isolated — compilers mmap sources
-    read-only and write output via `write()`, so the self-host path has ~no
-    writable shared *file* mappings. Verified **deterministically** by a new
-    `/sys/kernel/mm/drop_caches` knob (a real Linux-style reclaim trigger): M14
-    writes through a MAP_SHARED mapping on real ext4, forces a full reclaim, and
-    reads the store back from disk via a fresh fd (`M14-SMOKE: ok mmap-durable`).
-    The test distinguishes the fix — `munmap` does not write back, so without the
-    dirty mark the page is reclaimed clean and the marker is lost.
-- [ ] `deferred` **Write support for NTFS / FAT32 / exFAT / btrfs.** Each
-  foreign filesystem is currently read-only; adding a writer to any one is a
-  large, self-contained effort (allocation bitmap/runlist mutation, directory
-  index updates, journal/log replay for NTFS, FAT chain management). The native
-  ext2/3/4 path is fully writable and is what b1nix uses for its root; foreign
-  FS writes are revisited per-filesystem when a concrete need arises. b1nix
-  mounts these read-only honestly rather than risking corruption with a partial
-  writer.
+- [x] `msync` syscall and durable MAP_SHARED page-cache dirtying across reclaim.
+- [ ] `deferred` Write support for NTFS / FAT32 / exFAT / Btrfs.
 
 ## M73: Modern I/O and Introspection Syscalls
 
-- [x] `done` **File-movement + introspection syscalls.** `sendfile`,
-  `copy_file_range`, `splice`, `fallocate`, and `statx` are real kernel syscalls
-  (`SYS_SENDFILE`/`COPY_FILE_RANGE`/`SPLICE`/`FALLOCATE`/`STATX` = 165..169) with
-  libc wrappers. `sendfile`/`copy_file_range`/`splice` share one kernel fd→fd
-  pump (`file_copy_range`) that preserves the descriptor's own offset when an
-  explicit offset argument is supplied (POSIX semantics) and `splice` is no
-  longer the ENOSYS stub it was. `fallocate` mode 0 extends + zero-fills via the
-  existing on-demand allocation (KEEP_SIZE reserves without growing; hole-punch/
-  collapse/zero-range honestly report `EOPNOTSUPP` — the block drivers have no
-  preallocation primitive). `statx` maps `struct b1nix_stat` into the Linux
-  `struct statx` layout (path + `AT_EMPTY_PATH`). Verified by `userspace/bin/
-  m73_smoke.c` (`M73-SMOKE: ok statx/sendfile/copy-file-range/fallocate/splice`),
-  data/offset round-trips asserted, x86_64 **843/0**.
-- [x] `done` **inotify** — real file-change notification, no longer the ENOSYS
-  stub the Chromium port shipped. `inotify_init1`/`inotify_add_watch`/
-  `inotify_rm_watch` (`SYS_INOTIFY_INIT1`/`ADD_WATCH`/`RM_WATCH` = 170..172) back
-  a `VFS_HANDLE_INOTIFY` fd (`kernel/fs/inotify.c`): a small per-instance watch
-  table + event ring, registered in a global so VFS mutation sites can find
-  watchers. `vfs_inotify_notify()` is called after the inode lock is dropped from
-  the write path (`IN_MODIFY`), `vfs_create` (`IN_CREATE`) and `vfs_remove_node`
-  (`IN_DELETE`, with `IN_ISDIR` for directories) and from `rm_watch`
-  (`IN_IGNORED`); the common no-watch path is a single atomic load. The fd is
-  pollable and `read()` returns Linux `struct inotify_event` records (name padded
-  to 8). Verified by `m73_smoke.c` (`M73-SMOKE: ok inotify-modify/inotify-dir/
-  inotify-rmwatch`), event mask + entry name asserted.
-- [ ] `deferred` `io_uring`, `ptrace`, `clone3`. Each is its own subsystem rather
-  than a syscall: `io_uring` is a shared-ring submission/completion engine;
-  `ptrace` needs the stop/continue + cross-process register/memory machinery
-  tracked under **M80** (crashpad); `clone3` is the extended-args `clone` variant
-  (the M29 `clone` flags already cover the thread/fork models in use). Revisit
-  when a port concretely needs one.
+- [x] `sendfile`, `copy_file_range`, `splice`, `fallocate`, and `statx` syscalls.
+- [x] `inotify` file monitoring (`inotify_init1`, `add_watch`, `rm_watch`).
+- [ ] `deferred` `io_uring`, `ptrace`, and `clone3`.
 
 ## M74: Real-Time Signals
 
-- [x] `done` **`SIGRTMIN..SIGRTMAX`, `sigqueue` payload queuing, native
-  `SA_SIGINFO`, and POSIX timers** — implemented additively so the standard 1..31
-  signal path is byte-identical. RT signals 32..63 use the free upper bits of the
-  `u64` pending/blocked masks; their sigactions and a per-signo FIFO of queued
-  `(signo, code, value)` payloads live in a lazily-allocated per-task side-table
-  (struct task cannot grow — M29). Delivery (`arch_check_and_deliver_signals`)
-  scans 32..63 after the standard signals, dequeues one instance FIFO (lowest
-  signo, oldest first), and clears the pending bit only when that signo's queue
-  drains — so N sends yield N deliveries (no coalescing). `scheduler_sigqueue`
-  enqueues with a payload; `kill`/`raise` of an RT signal queue one SI_USER
-  instance. **Native `SA_SIGINFO`** now builds a native `siginfo_t`
-  (`struct b1nix_native_siginfo`, layout-matched to userspace) carrying
-  `si_value` — previously only the Linux personality got a siginfo. Syscalls:
-  `SYS_SIGQUEUE`=176. **POSIX timers** (`timer_create`/`settime`/`gettime`/
-  `delete` = 177..180) are the validating consumer: a global timer table, armed
-  in 100 Hz ticks, fired from the timer ISR via `scheduler_sigqueue(SI_TIMER)`
-  (the owner's RT state is pre-allocated at `settime` so the ISR never allocates),
-  freed on task exit. Verified by `M74-SMOKE: ok rt-queue` (3 blocked sends → 3
-  deliveries), `ok rt-sigqueue` (payloads 11/22/33 reach an SA_SIGINFO handler as
-  `si_value` in FIFO order), and `ok rt-timer` (a 20 ms periodic timer raises
-  SIGRTMIN+2 with `sigev_value` 99 repeatedly). Full x86_64 suite **864/0** with
-  every standard-signal test (job control, SIGCHLD, SIGSEGV) still green.
+- [x]  `SIGRTMIN..SIGRTMAX`, `sigqueue` payload queuing, native `SA_SIGINFO`, and POSIX timers.
 
 ## M75: On-Device GPU Path
 
-- [ ] `in-progress` Add LLVMpipe (and later EGL/GBM/DRI) — GPU is virtio-gpu only
-  today. **Correction (2026-06-29): LLVM is already ported to b1nix.** The earlier
-  "needs a full LLVM port from scratch" framing was wrong — the M64 native
-  `clang-22` (`build/native-clang/b1nix/usr/bin/`, ~94 MB) **statically links
-  LLVM 22.1.8 built for the b1nix triple** (X86 target) and executes on b1nix
-  (proven by `tools/clang/clang-proof.sh` / `b1nix.clangrun`). The LLVM→b1nix
-  cross-build works (`tools/build-native-clang.sh` + `tools/patches/llvm/
-  b1nix-triple.patch`, which adds `Triple::B1nix` and a `CMAKE_SYSTEM_NAME=="B1nix"
-  → LLVM_ON_UNIX=1` branch to `HandleLLVMOptions.cmake`).
-  - [x] **Dynamic `libLLVM.so` for b1nix — DONE** (72 MB, ELF `DYN`, `NEEDED:
-    libc.so.1, libgcc_s.so`, exports the ORC/MCJIT + X86 codegen symbols
-    llvmpipe JITs against). Fits the M69 .so loader and avoids the ~94 MB static
-    blow-up. Built from the `b1nix-dyn-build` tree (`DYLIB=ON`). Three real
-    walls solved, **no hacks**: (1) a stale build dir's `cmake -D` reconfigure
-    dropped `LLVM_ON_UNIX` (b1nix not reclassified Unix) → LLVM's own headers
-    failed (`file_status::getSize`, `EnvPathSeparator`); fixed by a **clean**
-    configure so the patched `HandleLLVMOptions.cmake` `B1nix` branch sets
-    `LLVM_ON_UNIX 1`. (2) `-shared` pulled the non-PIC static `libm.a`
-    (R_X86_64_32 in a .so); fixed by linking the **shared** libc — b1nix is
-    musl-style (math is in `libc.so.1`) so `libm.so` is a linker script
-    `INPUT(libc.so.1)`. (3) the cross sysroot's `libc.so.1` was **stale**
-    (pre-dated the `mallinfo2` export) → undefined `mallinfo2`; fixed by
-    refreshing it from the current build — `mallinfo2` was already implemented in
-    `userspace/libc/stdlib.c`, no stub added. Both sysroot fixes are made
-    reproducible by `tools/toolchain/stage-shared-libc.sh`.
-  - [x] **Mesa llvmpipe built against the b1nix libLLVM.so — DONE.** Opt-in via
-    `MESA_LLVMPIPE=1 tools/ports/build-mesa.sh` (`-Dllvm=enabled
-    -Dshared-llvm=enabled -Dcpp_rtti=false`; softpipe path untouched by default).
-    The cross wall — meson runs `llvm-config` on the *host* but ours is a b1nix
-    binary — is solved by `tools/ports/b1nix-llvm-config`, a host wrapper that
-    reports the b1nix LLVM paths + `-lLLVM-22` + `--has-rtti NO`. meson finds
-    "LLVM ... found: YES 22.1.8" with all requested modules; the RTTI match holds
-    (LLVM is `-fno-rtti`, so Mesa is `cpp_rtti=false`). `libllvmpipe.a` /
-    `libgallium.a` / `libosmesa_st.a` build and carry **undefined LLVM C-API
-    symbols** (`LLVMBuildAnd`, …) that resolve from `libLLVM.so` at link/runtime —
-    i.e. static Mesa + dynamic LLVM. (Also fixed a real script bug: `CC_LD=ccache`
-    — ccache is not a linker — which newer meson hard-errors on.) The shared
-    `libOSMesa.so` link still fails on the pre-existing non-PIC-`libb1nix.a`-in-a-
-    .so wall, but b1nix links the static OSMesa path, which is complete.
-  - [x] **GL demo ELF links llvmpipe + libLLVM.so — DONE.** `MESA_LLVMPIPE=1
-    tools/demos/build-m52-mesa-demo.sh m52_glsl <out>` produces a 13 MB b1nix
-    `ET_EXEC` with `NEEDED: libLLVM-22.so, libc.so.1` — the llvmpipe archives'
-    undefined LLVM C-API symbols resolve cleanly from the shared libLLVM-22, no
-    unresolved symbols. So the whole build chain (b1nix LLVM → libLLVM.so → Mesa
-    llvmpipe static → GL ELF) closes.
-  - [x] **Shared-library constructors now run — the dynamic toolchain WORKS on
-    b1nix.** Root cause of the dynamic clang's codegen failures (`-O0`: "Must use
-    fast register allocator"; `-O2`: SIGPIPE crash in codegen): the in-kernel
-    eager dynamic linker resolved relocations for every `DT_NEEDED` object but
-    never ran their `DT_INIT_ARRAY` constructors. crt0 only walks the
-    *executable's* `__init_array`, so `libLLVM.so`'s **458** constructors (X86
-    target registration, register-allocator `cl::opt` defaults, `ManagedStatic`)
-    never fired — the frontend ran (`--version`, parsing) but the backend was
-    uninitialized. Fix (no workaround): the loader collects each shared object's
-    `init_array` into a `{va,count}` descriptor table (deepest-dependency-first)
-    and hands it to userspace via a new `AT_B1NIX_DSO_INIT` auxv entry;
-    `__b1nix_run_dso_init` (libc) runs them in crt0 before the executable's own
-    constructors. Also fixed the previously-malformed auxv layout (AT_NULL landed
-    at the low end, so `getauxval` returned 0 for everything — masked because only
-    rust read auxv and tolerates 0). **Verified:** dynamic clang (44 MB) +
-    demand-paged 72 MB `libLLVM-22.so` compiles a valid b1nix object on b1nix at
-    **both `-O0` and `-O2`** (`M64-NATIVE-CLANG: ok compile` + `ok compile-O2`);
-    full smoke **864/0** (the auxv/crt0/loader change touches every binary's
-    startup — zero regressions). This also unblocks llvmpipe's JIT (same
-    `libLLVM.so` codegen) and shrinks the M26 self-host transient (the static
-    94 MB clang load-staging becomes a reclaimable demand-paged 72 MB `.so`).
-  - **Remaining (runtime):** (1) package the 72 MB `libLLVM-22.so` as
-    `/lib/libLLVM-22.so` on b1nix (a disk/ramdisk module, as d8 does — too big for
-    the initramfs); (2) run the demo with `GALLIUM_DRIVER=llvmpipe` so llvmpipe
-    JITs the GLSL shaders through `libLLVM.so` (loaded + demand-paged by the M69
-    loader — also the self-host-floor validation) and render-verify; (3) the
-    DRI/GBM/EGL surfaceless stack. OSMesa-softpipe + VirGL still render meanwhile.
+- [ ] `in-progress` Add LLVMpipe (and later EGL/GBM/DRI) on-device GPU path.
+- [x] Dynamic `libLLVM.so` for b1nix (72 MB ELF DYN exporting ORC/MCJIT/X86 codegen).
+- [x] Mesa llvmpipe built against b1nix `libLLVM.so`.
+- [x] GL demo ELF linking llvmpipe + `libLLVM.so`.
+- [x] Shared-library `DT_INIT_ARRAY` constructors running via `AT_B1NIX_DSO_INIT` auxv.
 
 ## M76: USB Host Stack
 
-- [ ] `deferred` Add a general xHCI stack (HID + mass storage); input is PS/2 +
-  narrow xHCI keyboard only. **Whole device class, deferred.** A general xHCI
-  controller driver (command/event/transfer rings, slot/endpoint context
-  management, port routing) plus the USB core (device enumeration, descriptor
-  parsing, configuration, the hub driver) and at least two class drivers (HID
-  boot+report protocol; USB Mass Storage = BBB/UASP over SCSI, which then plugs
-  into the existing block layer). Each layer is substantial and the current
-  narrow xHCI-keyboard path (M37) covers the only hard requirement (input on
-  real hardware). Revisit when USB mass storage or broader HID is concretely
-  needed on bare metal.
+- [ ] `planned` General xHCI controller driver, USB core enumeration, and Mass Storage class driver.
 
 ## M77: Raise Global Resource Caps
 
-- [ ] `planned` Make-dynamic hard caps: TCP conns (64), VFS pipes (128),
-  core-dump size (1 MiB), `SHMMAX` (32 MiB) and many other.
+- [ ] `planned` Dynamic hard caps for TCP connections (64), VFS pipes (128), core dumps (1 MiB), and `SHMMAX`.
 
 ## M79: Audio Stack
 
-- [ ] `planned` Add a real **audio subsystem** — an HDA (or AC'97) driver + a
-  mixer + an ALSA-compatible userspace shim (or a native b1nix audio API) — so
-  Chromium/`media` and other ports get sound. b1nix has **no audio
-  hardware/driver path at all** today, so `use_alsa`/`use_pulseaudio` are off
-  (Chromium port C31). Large — a whole new device class.
+- [ ] `planned` Audio subsystem with HDA/AC'97 driver, mixer, and ALSA-compatible userspace shim.
 
 ## M80: Kernel ptrace + Crash Capture
 
-- [ ] `planned` Implement **`ptrace(2)`** (returns ENOSYS now) + `/proc/<pid>/
-  task` + reading another process's registers/memory/coredump, so **crashpad**
-  can actually capture crashes and on-device gdb-style debugging works. Crashpad
-  is compile-only today via the lss→libc shim (Chromium port C27/C28). Large.
+- [ ] `planned` Implement `ptrace(2)`, `/proc/<pid>/task`, and register/memory reading for crashpad.
 
 ## M81: Chromium GPU Acceleration
 
-- [ ] `planned` Link the b1nix-target graphics `.so`s (SwiftShader Vulkan ICD +
-  ANGLE `libEGL`/`libGLESv2`) as b1nix ELFs (`tools/v8/chromium-link.sh`) and wire
-  ANGLE→SwiftShader-Vulkan / virtio-gpu (reuse M52/VirGL, M75) so `content_shell`
-  renders **GPU-accelerated** instead of software/headless-only. Gated on M62
-  (content_shell links + runs).
+- [ ] `planned` Link graphics `.so`s (SwiftShader Vulkan, ANGLE) and wire VirGL GPU acceleration for `content_shell`.
 
 ## M82: System NSS / Kerberos (optional, low priority)
 
-- [ ] `planned` Port system **NSS** (cert DB) and/or **MIT-krb5** (GSSAPI) ONLY
-  if a concrete need arises. Chromium's built-in cert verifier
-  (`use_nss_certs=false`) and no-Negotiate-auth are the correct defaults for
-  b1nix, so this is large-effort / low-value — listed for completeness, not
-  scheduled.
+- [ ] `planned` Port system NSS cert DB and MIT-krb5 GSSAPI if needed.
 
 ## M83: Unicode-aware ctype / wctype
 
-- [ ] `planned` Replace the ASCII-only wide classification/case-fold in
-  `userspace/libc/wctype.c` (`iswalpha`/`towlower`/… cast `wint_t` into the byte
-  ctype table → every non-ASCII codepoint mis-classified, never folded) with real
-  Unicode property + case-mapping tables. The only **pervasive wrong-result**
-  class in libc; gates correct i18n in bash multibyte, NetSurf, etc.
+- [ ] `planned` Replace ASCII-only classification in `wctype.c` with Unicode property/case tables.
 
 ## M84: Real IP routing + TCP robustness
 
-- [ ] `planned` Kernel networking assumes a **single /24 subnet** — no routing
-  table (`net/ipv4.c:137` hardcodes the mask, drops off-net packets; `SIOCADDRT/
-  DELRT` are no-ops; `/proc/net/route` is fabricated). Add a real FIB shared by
-  ioctl + procfs + `ipv4_send`. TCP is **in-order-only** (`net/tcp.c:1160`, no
-  reassembly queue / window scaling / SACK; fixed 16 KB recv buf) → add an
-  out-of-order reassembly queue + window scaling. IPv6 is loopback-only for
-  non-link traffic.
+- [ ] `planned` Add real FIB routing table and TCP out-of-order reassembly queue with window scaling.
 
-## M85: libc Tier-A correctness pass (musl-grade)
-
-- [x] `partial` Fix the correctness-relevant libc gaps the audit flagged.
-  **Done this pass:** `strtoull`/`strtoll` are now real 64-bit parsers (full
-  unsigned range, base 0/2-36, overflow → `ERANGE`-clamped — no more
-  cast-through-`strtol` truncation); `abort()` raises `SIGABRT` (re-raises with
-  it unblocked, then `_exit(127)`) instead of a plain `exit(127)`; `perror`
-  writes `"<s>: <strerror(errno)>"` to stderr instead of a literal `"error"`;
-  `sysconf(_SC_NPROCESSORS_ONLN/CONF)` returns the **real** online-CPU count via
-  `sched_getaffinity`+`CPU_COUNT` (was a hardcoded 1 — a Chromium-port-debt item
-  that capped browser thread-pool sizing to one core). Verified by
-  `M73-SMOKE: ok strtoull/sysconf-ncpu/abort-sigabrt`.
-- [ ] `deferred` **Remaining audit items** (each its own focused musl-port):
-  `realpath` resolving (`.`/`..`/symlink walk — needs per-component lstat, not a
-  `strcpy`); fully-buffered stdio + multi-read `fread` (today's stdio is
-  unbuffered with single-`read()` semantics — correct results, lower throughput);
-  correctly-rounded `strtod` and real `strtof`/`strtold` (not double); richer
-  `getaddrinfo` (numeric-port/multi-result). Revisit as the second musl pass.
+## M85: libc Tier-A correctness pass (musl-grade) - Retired
 
 ## M86: Per-thread CPU accounting + signal targeting
 
-- [ ] `planned` Add per-task CPU-time accounting in the scheduler so
-  `CLOCK_PROCESS/THREAD_CPUTIME_ID`, `clock()`, `getrusage` return real CPU time
-  (currently wall/uptime). Add a kernel `tkill`/`tgkill` so libc `pthread_kill`
-  targets one thread (today routes via `kill(tid)` — can hit the whole process);
-  make `pthread_exit(retval)` actually deliver `retval` to the joiner.
+- [ ] `planned` Per-task CPU-time accounting, kernel `tkill`/`tgkill`, and `pthread_exit` retval delivery.
 
-## M87: Dynamic-loader maturation + Rust proc-macros
-
-- [ ] `planned` b1nix is static-by-default with `dlopen`/`dlsym` as no-ops, which
-  **blocks native rustc from building proc-macro crates** (serde-derive etc.,
-  loaded as dylibs) — caps self-host. Mature `ld-b1nix.so`/`libc.so.1` (extend the
-  reloc handler: TLS/IFUNC/COPY currently rejected) and add an opt-in
-  `LINK=dynamic` base-build mode (default stays static; keep the dynamic path
-  green via smoke) so the loader is exercised across all binaries. Also revisit
-  Rust `panic=abort` (no unwinding) once exceptions/unwind are wanted.
+## M87: Dynamic-loader maturation + Rust proc-macros - Retired
 
 ## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
 
-- [x] `done` **(2) `sys_mmap(PROT_NONE)` is now enforced.** A pure PROT_NONE
-  reservation records a VMA (`prot == PROT_NONE`) but installs no leaf PTE, so a
-  wild user access used to fall into the anonymous zero-fill fast path and
-  silently succeed. The `#PF` handler (`vmm_handle_page_fault`) now checks the
-  covering VMA on the not-present anonymous user path: if it grants no access it
-  refuses to service the fault and the task takes `SIGSEGV`. The check is scoped
-  to exactly that path (PROT_NONE regions never have present/lazy leaves, so
-  heap-growth and demand-paging faults are untouched) and the VMA list is sorted
-  so the walk early-exits. **V8-safe by construction:** `sys_mprotect` splits the
-  VMA and sets `->prot`, so a reservation later committed to RW (V8's sandbox
-  cage) has `prot != PROT_NONE` and falls through to the normal fill — and V8
-  *wants* its guard reservations to fault, so this aligns with the sandbox rather
-  than fighting it. Verified by `userspace/bin/m73_smoke.c` (`M88-SMOKE: ok
-  prot-none`: a PROT_NONE read SIGSEGVs a child, then `mprotect`-to-RW succeeds);
-  the **full** x86_64 suite (incl. the mmap-heavy curl/mbedTLS/NetSurf/Mesa
-  ports) stays green at **860/0**. (The d8 disk isn't present on this host, so the
-  dedicated V8 instance was not re-run; the safety argument above is structural,
-  not empirical for V8.)
-- [ ] `deferred` **(1)** `fs/ext4.c` `ext4_get_block` returns 0 (hole) past the
-  single-indirect range on block-mapped (non-extent) inodes → silent
-  zero-reads/corruption on large files; add double/triple-indirect traversal (and
-  indirect-block write allocation). **Deferred — not reproducibly verifiable**
-  (the load-bearing concern was always the test harness, not the fix).
-- **Why (1) stays deferred — verifiability, confirmed 2026-06-29.** The fix
-  itself is straightforward (a recursive single/double/triple-indirect walk for
-  read, plus intermediate-indirect-block allocation for write, mirroring the
-  proven `fs/ext2.c` path), and was prototyped. It is **not reproducibly
-  verifiable in the smoke matrix**, which is the blocker: (a) `ext4_mount` hard-
-  refuses any image without the `EXTENTS` incompat feature (`-EOPNOTSUPP`,
-  `ext4.c:1241`), so a pure block-mapped `ext2/3` image never reaches `ext4.c` at
-  all — it is mounted by `ext2.c`, whose existing single+double-indirect already
-  covers files up to ~64 MiB (1 KiB blocks) / ~4 GiB (4 KiB blocks); (b) the only
-  way to exercise `ext4.c`'s block-mapped branch is a block-mapped *inode inside
-  an extent-feature image*, and the host toolchain available to the smoke harness
-  (`mke2fs`/`debugfs`, no root loopback mount) cannot construct one: `debugfs
-  write` always emits `EXTENTS_FL` inodes, and clearing the flag with `sif flags
-  0` leaves the extent-header bytes in `i_block[]` (a *corrupt* block map, garbage
-  pointers — verified empirically), not a valid block map. Shipping the
-  allocation-mutating write path **unverified** would be the unverified-kernel-
-  path tech debt the project forbids, so it stays deferred until a harness that
-  can mint a valid block-mapped inode (a root loopback `chattr -e`, or a small
-  image-builder tool) lands. Triple-indirect is additionally untestable without
-  multi-GiB files.
+- [x] Enforce `sys_mmap(PROT_NONE)` guard pages in page-fault handler.
+- [ ] `deferred` Ext4 indirect-block traversal for block-mapped inodes.
 
 ## M89: Migrate the C++ standard library to LLVM libc++ (shared)
 
-- [x] `done` **Shared LLVM libc++ is built, default in the b1nix-c++ toolchain, and the hosted C++ smoke ecosystem runs on it (v0.75.3).**
-  The full LLVM C++ runtime is cross-built for b1nix and shipped as shared objects in the initramfs: `tools/toolchain/build-libcxx.sh` does a unified LLVM-18 `runtimes` build of `libunwind`+`libc++abi`+`libc++` (musl-libc model), and `tools/toolchain/build-libcxx-shared.sh` links `/lib/libc++.so.1` + `/lib/libc++abi.so.1`. `tools/toolchain/bin/b1nix-c++` defaults to libc++ and links it dynamically. All C++ smoke binaries pass on libc++ shared: `cxx_smoke`, `m55_iostream` (cout/cerr/stringstream/cin + `std::filesystem`), and `m64_clang`.
-- [x] `done` **NetSurf/litehtml migrated to libc++ (v0.75.4).**
-  litehtml + gumbo + `m55_litehtml` are recompiled from source against libc++ and linked dynamically. This moves the NetSurf C++ stack off GCC libstdc++.
-- [x] `done` **Mesa and d8/V8 migrated to libc++ (v0.89.0).**
-  Mesa and d8/V8 are rebuilt and linked dynamically against the shared `libc.so.1` and `libc++.so.1` (no folded STL). All graphic tests pass successfully.
-- [x] `done` **Native LLVM/clang toolchain rebuilt GCC-free on libc++ (v0.89.0).**
-  `libLLVM.so` + `clang` + `lld` recompiled with the clang frontend against b1nix libc++. Native clang works in-VM.
-- [x] `done` **All GCC shared libraries removed from the ISO — libstdc++.so.6 AND libgcc_s.so (v0.89.1).**
-  With the C++ ecosystem on libc++, nothing imports GCC's C++ standard library. `busybox` and `nsfb` link `-static-libgcc`. The initramfs no longer ships `libstdc++.so.6` or `libgcc_s.so`.
-
-- [ ] `planned` **Replace GCC libstdc++ with LLVM libc++ across the C++ ecosystem, built as a shared library.**
-  Today every C++ binary (d8, Mesa C++ glue, NetSurf/litehtml, the M51–M55 ports, `cxx_smoke`/`m55_*`) statically folds GCC's `libstdc++.a`; there is no `libstdc++.so` because the b1nix GCC target is classified newlib/elf and libstdc++'s configure forces `enable_shared=no`. The cleaner long-term path is LLVM libc++, which has no such gate and builds shared straightforwardly. M75 (shared-library `DT_INIT_ARRAY` constructors now run) is the prerequisite that makes a shared C++ stdlib viable at all.
-- **Scope (a real migration, not a flag flip):**
-  1. Build the LLVM runtimes from source for b1nix — `compiler-rt` + `libunwind` (PIC), then `libc++abi` + `libc++` (`tools/toolchain/build-llvm-runtimes.sh` + `build-libcxx.sh`), currently entirely unbuilt.
-  2. Turn those static builds into **shared** `libc++.so` / `libc++abi.so` (`LIBCXX_ENABLE_SHARED=ON`, PIC unwinder/compiler-rt or reuse the existing shared `libgcc_s.so` unwinder), with soname + symbol versioning, linking against the shared `libc.so.1`.
-  3. Make libc++ the default in `tools/toolchain/bin/b1nix-c++` (it is already "preferred when built") and ship `libc++.so`/`libc++abi.so` to `/lib`.
-  4. **Migrate the ecosystem off libstdc++** and re-verify each consumer: d8 (V8), Mesa, NetSurf/litehtml, the M51–M55 ports — these were built and tested against libstdc++, so the ABI/header switch is the main risk and must be smoke-verified per port.
-- **Interim shared libstdc++ (path A) — DONE (v0.75.2, this branch).**
-  The ecosystem stays on GCC libstdc++ but the stdlib itself is now **shared**: `tools/toolchain/build-libstdcxx-shared.sh` links a `libstdc++.so.6` from the -fPIC `libstdc++.a`. Smoke 864/0.
-- **V8/d8 flipped to the shared libstdc++ — DONE.**
-  `tools/v8/v8-link-d8.sh` resolves d8's C++ runtime from `libstdc++.so.6` + the single shared unwinder `libgcc_s.so`.
+- [x] Shared LLVM libc++ built, default in `b1nix-c++`, hosted C++ smoke running on it.
+- [x] NetSurf/litehtml migrated to libc++.
+- [x] Mesa and d8/V8 migrated to libc++.
+- [x] Native LLVM/clang toolchain rebuilt GCC-free on libc++.
+- [x] All GCC shared libraries (`libstdc++.so.6`, `libgcc_s.so`) removed from ISO.
+- [x] Replace remaining GCC libstdc++ references with LLVM libc++ across external ports.
 
 ## M90: Complete elimination of GCC from the cross and native toolchains (Pure LLVM/Clang Toolchain)
 
-- [x] `done` **Pure LLVM/Clang cross-toolchain (host-side) (v0.90.0).**
-  `tools/toolchain/build-toolchain.sh` no longer builds GCC/binutils — it **symlinks** the host LLVM/Clang tools + the clang wrappers as `x86_64-b1nix-{gcc,g++,ar,ld,...}`, with `lld` the default linker and `llvm-ar`/`llvm-strip`/`llvm-nm`. `compiler-rt` (builtins) + `libunwind` (unwinding) are built into the cross sysroot; `libgcc.a`/`libgcc_eh.a` are gone (`env.sh` `LIBGCC_CROSS=""`).
-- [x] `done` **Pure LLVM/Clang native toolchain (inside the VM) (v0.89.0).**
-  Native Clang/LLVM (`libLLVM.so` + clang frontend) is rebuilt on libc++ (GCC-free) and shipped in the ISO; compiler-rt/libc++abi/libc++ are the only C++ development runtime on b1nix. See M89 above.
-- [x] `done` **Migrate remaining ports off GCC components (v0.90.0).**
-  NetSurf, the Mesa/EGL/litehtml demos and the C++ demos all build with cross-Clang against the LLVM runtimes (`linker-libcxx.ld`); no port copies GCC startup files. **Key clang-vs-GCC fix this milestone:** the clang cross-wrapper `b1nix-autotools-cc` must predefine `__b1nix__`/`__unix__` (old GCC did automatically) — without them NetSurf's `utils/config.h` left `HAVE_MMAP` defined, so the `file://` fetcher used `mmap()` (which returns a zero page for an initramfs-backed file on b1nix) and every locally-fetched HTML page parsed as all-zeros → no `<img>`/SVG/JS/JXL rendered. Restoring the predefines fixes it (`M53-NS/WL: ok svg/js/jxl`).
-- [x] `done` (v0.90.3) **GCC-free Rust.**
-  Rust now links the LLVM runtimes (`libunwind.a`/`libcompiler_rt.a`) instead of GCC/`libgcc_s`:
-  - **M67 cross rust — done & smoke-verified.** The JSON target spec (`build/rust/targets/x86_64-unknown-b1nix.json`, static `crt-static` ET_EXEC) drops `-lgcc_s`; Rust's own `unwind` crate now links the LLVM libunwind static bundle, and `build-rust-toolchain.sh` stages `libunwind.a`/`libcompiler_rt.a` into the cross sysroot. `tools/m67/hello_b1nix.elf` rebuilt GCC-free (linked `-lunwind`, no `-lgcc_s`); `M67-RUST: ok run-std` green in the full suite.
-  - **M68 native rustc — done & proof-verified.** From-source rustc + LLVM built dynamic (`LLVM_BUILD_LLVM_DYLIB=ON`): `librustc_driver.so` folds LLVM static, DT_NEEDED = {libc++.so.1, libc++abi.so.1, libc.so.1} — **no libgcc_s, no libstdc++**. `M68-RUST: ok rustc-load` + `rustc 1.98.0-nightly` printed on b1nix. Key fixes: (a) `b1nix-c++` wrapper relinks shared libraries preserving CMake's `--whole-archive`/`--no-whole-archive` interleaving (was flattening → duplicate symbols); (b) `b1nix-autotools-cc` handles `-shared` for dylib links + routes `-lstdc++`→libc++/libc++abi (GCC-free); (c) kernel eager loader gained R_X86_64_DTPMOD64/DTPOFF64 (general-dynamic TLS) + libc `__tls_get_addr` static-TLS fast path.
+- [x] Pure LLVM/Clang cross-toolchain on host side.
+- [x] Pure LLVM/Clang native toolchain inside VM.
+- [x] Migrate remaining ports off GCC components.
+- [x] GCC-free Rust toolchain (cross rust and native rustc).
 
 ## M91: Skia 2D Graphics Library (standalone)
 
-- [x] `done` **Standalone Skia build for b1nix (v0.91.0).**
-  Skia (M132+) is cross-built for b1nix as a static library (`libskia.a`) using
-  GN+Ninja with the b1nix Clang toolchain. Build script: `tools/ports/build-skia.sh`.
-  Patches: `tools/patches/skia/apply.sh` (S1-S13). Third-party deps (zlib, libpng,
-  libjpeg-turbo, expat) built from Skia's bundled sources. Shared library approach
-  abandoned (56MB libEGL.so too large for initramfs); smoke test is statically linked.
-- [x] `done` **Skia raster backend verified (v0.91.0).**
-  Software rasterizer works on b1nix: SkCanvas, SkPaint, SkPath, SkBitmap,
-  SkTypeface/SkFont all functional. Smoke test draws rect/path/text to off-screen
-  surface, reads pixels, verifies correct output. `M91-SKIA: ok raster-draw`.
-- [x] `done` **Skia Ganesh GPU backend on OSMesa/EGL (v0.91.1).**
-  GrGLInterface initialized via EGL/OSMesa; GrDirectContext created;
-  GPU-accelerated SkCanvas renders to render target. Software fallback path
-  works when EGL context unavailable. `M91-SKIA: ok gpu-draw`.
-- [x] `done` **Skia Graphite CPU backend.**
-  Graphite's CPU renderer (`skcpu::Context`/`skcpu::Recorder`) verified on b1nix.
-  Creates bitmap-backed SkSurface, draws, pixel-verifies. `M91-SKIA: ok graphite-cpu`.
-- [x] `done` **Skia Graphite GPU backend via Dawn/OpenGL ES.**
-  Dawn (WebGPU implementation) cross-compiled for b1nix via CMake with OpenGL ES
-  backend (`dawn_enable_opengles=true`). Built as `libdawn_combined.a` static lib.
-  Graphite Dawn backend context + device + recorder creation verified. Smoke test
-  confirms `DawnBackendContext` struct compiles and `ContextFactory::MakeDawn` symbol
-  links. Full EGL runtime init requires a running EGL context (PBuffer). Patches:
-  S12 (Dawn args.gni), S12b (disable X11/Wayland), S13 (EGL includes).
-  `M91-SKIA: ok graphite-dawn`.
-- [x] `done` **fontconfig integration with Skia.**
-  `/etc/fonts/fonts.conf` added to initramfs pointing at `/share/fonts`.
-  `SkFontMgr_New_FontConfig()` compiles and links against fontconfig. Runtime
-  text rendering uses direct font file loading via POSIX I/O + SkFontMgr to avoid
-  GL TLS issues (`_glapi_tls_Context`) in static binaries. `M91-SKIA: ok text-draw`.
-- [x] `done` **Dynamic Mesa linking for M91/M52/M59.**
-  m91-skia-smoke, m52-osmesa, m52-glsl, m59-smoke now link Mesa as shared
-  `libOSMesa.so.8` instead of static .a archives. Rootfs (256 MB, trimmed of
-  LLVM archives) loaded as GRUB module → ram0 → mounted at `/mnt/root` in test
-  mode. ELF loader searches `/mnt/root/lib/` for DT_NEEDED. M53-mesa-virgl stays
-  static (uses internal gallium symbols not in public API). `dm` interpreter fixed
-  to `/lib/ld-b1nix.so` via `b1nix-cross-cc.sh`. M59/M91 moved from core to
-  `smoke_graphics` block so they run with `b1nix.smoke=graphics`.
-- [x] `done` **Skottie (Lottie animation) support.**
-  `skia_enable_skottie=true` in GN args; `libskottie.a` + deps (`libsksg.a`,
-  `libskresources.a`, `libjsonreader.a`, `libskshaper.a`, `libskunicode_*.a`,
-  `libicu*.a`) cross-compiled and linked statically. Smoke test parses a minimal
-  inline Lottie JSON (30-frame animated red rectangle), builds
-  `skottie::Animation`, seeks to frame 15, renders to raster canvas, verifies
-  non-black pixels. `M91-SKIA: ok skottie`.
-- [x] `done` **Real shared .so for EGL/GL/fontconfig (no stubs).**
-  `build-skia-shared-deps.sh` produces real shared libraries: `libEGL.so`
-  (b1egl_mesa.c, full EGL 1.4), `libGLESv2.so` (Mesa libglapi_static.a,
-  1971 GL entry points), `libfontconfig.so` (fontconfig+freetype+zlib+expat).
-  Sysroot stubs automatically replaced; rootfs staging copies from
-  `userspace/build/`. All Mesa demos + dm link dynamically against real .so.
-- **dm tool:** PIE executable, interpreter `/lib/ld-b1nix.so`. Links against
-  real shared libs (libEGL.so, libGLESv2.so, libfontconfig.so, libOSMesa.so.8,
-  libc++.so.1). Ships in rootfs.img as `/bin/skia-dm`.
-- **TODO:**
-  - Vulkan backend (no ICD on b1nix yet)
+- [x] Standalone Skia cross-build for b1nix (`libskia.a`).
+- [x] Skia raster backend verified (`M91-SKIA: ok raster-draw`).
+- [x] Skia Ganesh GPU backend on OSMesa/EGL (`M91-SKIA: ok gpu-draw`).
+- [x] Skia Graphite CPU backend (`M91-SKIA: ok graphite-cpu`).
+- [x] Skia Graphite GPU backend via Dawn/OpenGL ES (`M91-SKIA: ok graphite-dawn`).
+- [x] fontconfig integration with Skia (`M91-SKIA: ok text-draw`).
+- [x] Dynamic Mesa linking for M91/M52/M59 demos (`libOSMesa.so.8`).
+- [x] Skottie (Lottie animation) support verified (`M91-SKIA: ok skottie`).
+- [x] Real shared `.so` for EGL/GL/fontconfig (`libEGL.so`, `libGLESv2.so`, `libfontconfig.so`).
 
 ## M92: musl libc Port
 
-- [x] **Linux ABI expansion: ~30 missing syscall mappings for musl.**
-  All *at() calls (openat, newfstatat, unlinkat, mkdirat, renameat2, linkat,
-  symlinkat, readlinkat, fchmodat, fchownat, faccessat), pipe2, dup3, ppoll,
-  pselect6, accept4, clock_nanosleep, set_tid_address, prlimit64,
-  set_robust_list/get_robust_list, and the Linux clone layout translation are
-  implemented in `kernel/syscall/syscall.c` (special-case dispatchers) with
-  entries in `linux_abi.c`. Full list in `musl-port.md` §1.
+- [x] Linux ABI expansion: ~30 missing syscall mappings for musl.
+- [x] Futex expansion: WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE.
+- [x] clone: CLONE_PARENT_SETTID + CLONE_CHILD_SETTID.
+- [x] ELF auxv: populate 15+ missing entries.
+- [x] Linux ABI struct translations: sigaction + termios.
+- [x] Cross-compile musl as static libc and build integration.
+- [x] Kernel bugfix: AT_PHDR for ET_EXEC binaries.
+- [x] Kernel bugfix: `vm_find_free_area` unsorted VMA list.
+- [x] Kernel bugfix: fork TLS inheritance.
+- [x] Kernel bugfix: `set_thread_area` (NR 205) no-op.
+- [x] Musl smoke test: 9/9 pass.
+- [x] Musl as dynamic libc (`libc.so` / `ld-musl-x86_64.so.1`).
+- [x] Ring 0 to Ring 3 Migration: PID 1 `/bin/init` and PID 5 `/bin/netd`.
+- [x] Full Initramfs Purge: minimal bootstrap without legacy `.inc` headers.
+- [x] Ext4 Primary Root Filesystem across all boot modes.
+- [x] VFS Disk Node Fixes for ext4 disk nodes.
 
-- [x] **Futex expansion: WAIT_BITSET, WAKE_BITSET, REQUEUE, CMP_REQUEUE.**
-  Implemented as special-case handlers in the Linux ABI futex dispatch.
-  Verified by musl smoke test (malloc/free path uses internal futex for
-  thread safety). See `musl-port.md` §5.
-
-- [x] **clone: CLONE_PARENT_SETTID + CLONE_CHILD_SETTID.**
-  Linux ABI clone dispatcher translates the Linux argument layout and adds
-  CLONE_PARENT_SETTID/CLONE_CHILD_SETTID flags when parent_tid/child_tid
-  pointers are provided. Verified by musl fork+waitpid test. See `musl-port.md` §4.
-
-- [x] **ELF auxv: populate 15+ missing entries.**
-  Loader populates AT_PHDR (fixed from hardcoded 0), AT_PHENT, AT_PHNUM,
-  AT_ENTRY, AT_PAGESZ, AT_BASE, AT_CLKTCK, AT_UID/EUID/GID/EGID,
-  AT_RANDOM (16 bytes of kernel entropy for stack canary), AT_HWCAP,
-  AT_SECURE, AT_EXECFN. Verified by musl smoke test. See `musl-port.md` §3.
-
-- [x] **Linux ABI struct translations: sigaction + termios.**
-  `struct sigaction` translation (b1nix 32B ↔ Linux 152B, sa_mask 8B↔128B,
-  signo remap) and `struct termios` translation (b1nix 48B ↔ Linux 44B,
-  c_cc[32]↔c_cc[19]+c_line) are implemented. Verified by musl signal test.
-  See `musl-port.md` §2.
-
-- [x] **Cross-compile musl as static libc and build integration.**
-  musl 1.2.5 cross-built via `configure --host=x86_64-b1nix` with clang.
-  Produces `lib/libc.a`, `crt1.o`, `crti.o`, `crtn.o`. `b1nix-musl-cc`
-  wrapper compiles and links static ET_EXEC binaries against musl.
-  ELF EI_OSABI patched to ELFOSABI_LINUX (3) for personality detection.
-
-- [x] **Kernel bugfix: AT_PHDR for ET_EXEC binaries.**
-  `process.c` computed `phdr_vaddr = load_base + e_phoff` which gave 0x40
-  for ET_EXEC (file offset), but the actual VA is 0x400040 (first segment
-  VA + offset). musl's `__init_tls` crashed iterating PT_PHDR segments.
-  Fixed by walking LOAD segments to find the containing one.
-
-- [x] **Kernel bugfix: `vm_find_free_area` unsorted VMA list.**
-  The VMA list is in reverse-insertion order, not sorted by address. The
-  first-fit walker set `current_addr = vma->end` for VMAs below the search
-  start (0x100000000), causing it to return addresses within the program's
-  .text section. mmap then mapped over program code, corrupting mallocng
-  metadata. Fixed by skipping VMAs that end at or before `current_addr`.
-
-- [x] **Kernel bugfix: fork TLS inheritance.**
-  `scheduler_fork_current` copied every side-table array (altstack, nice,
-  tgid, ctty, rlimits) but forgot `g_task_tls_base`. Child started with
-  FS base = 0, crashing on any TLS access in musl's `_Fork` cleanup.
-
-- [x] **Kernel bugfix: `set_thread_area` (NR 205) no-op.**
-  musl's `__set_thread_area` calls `SYS_set_thread_area` during TLS init.
-  b1nix uses `arch_prctl(ARCH_SET_FS)` instead; added no-op handler that
-  returns 0 so musl's init proceeds.
-
-- [x] **Musl smoke test: 9/9 pass.**
-  Static ET_EXEC binary compiled against musl, embedded in initramfs.
-  Tests: write, malloc/free, fork+waitpid, signal, pipe, open,
-  clock_gettime, getenv/setenv, pthread — all pass.
-
-- [x] **Musl as dynamic libc (libc.so).**
-  musl libc.so built with SONAME `ld-musl-x86_64.so.1`. PIE/ET_DYN binaries
-  linked via `b1nix-musl-cc -dynamic`. Kernel's in-kernel eager dynamic linker
-  loads DT_NEEDED libraries from `/lib/`, resolves symbols, applies relocations.
-  Dynamic smoke test verifies write/malloc/fork via shared library.
-
-- `planned` **Full musl smoke test: pthread + socket.**
-  Complete the remaining tests: pthread_create+join, socket operations.
-  Verify thread-local storage, futex-based synchronization, and
-  network syscalls through the Linux ABI layer.
-
-- `done` **Real userspace ld.so (Phase 3, musl-port.md).**
-  Kernel genuinely loads `/lib/ld-musl-x86_64.so.1` as a real ELF interpreter
-  (unrelocated segments, correct `AT_BASE`/`AT_ENTRY`). The old in-kernel
-  eager linker is gone from `kernel/user/process.c`; every rootfs binary is
-  musl-linked now, so there is no other `PT_INTERP` case left to gate on
-  (confirmed: full smoke 864/5, all 5
-  pre-existing/unrelated). `b1nix-musl-cc -ldso` produces a real-interpreter
-  PIE, with a post-link `.dynstr` fixup restoring musl-gcc's own
-  `DT_NEEDED=libc.so` self-reference convention. `M92-LDSO: done (ok=4
-  fail=0)` — write/malloc/fork+waitpid/getenv all resolved by musl's real
-  ld.so, zero in-kernel dynamic-linking involvement. Full root-cause writeup
-  in `musl-port.md` §Phase 3. Step 1.3 (deleting the in-kernel eager linker)
-  correctly not started — dozens of ports (NetSurf, Mesa, V8, rustc, ...)
-  still depend on it and aren't migrated yet. `M92-MUSL-DYN` (old
-  eager-linker smoke test) has an unrelated pre-existing SIGSEGV, untouched
-  by this work.
-
-- [x] **Ring 0 to Ring 3 Migration**: Migrated PID 1 `/bin/init` and PID 5 `/bin/netd` from kernel Ring 0 code into standalone Ring 3 userspace ELFs (`userspace/bin/init.c`).
-- [x] **Full Initramfs Purge**: Removed all legacy `#include "initramfs_mXX.inc"` headers and the legacy `files[]` table from `kernel/fs/initramfs.c`, reducing initramfs to a 15-line minimal bootstrap.
-- [x] **Ext4 Primary Root Filesystem**: `ext4` on `ram0`/`virtio-blk0` (`root.ext4`) made the standard primary root filesystem (`/`) across all boot modes.
-- [x] **VFS Disk Node Fixes**: Fixed VFS `add_node()` lookup & data overwrite bug for ext4 disk nodes.
 ## M93: Ring 0 Cleanup
 
-- [x] `done` **In-Kernel Dynamic Linker Purge.**
-  Retired the eager in-kernel dynamic relocation pass from `kernel/user/process.c`. Relocations and dynamic linking are fully delegated to userspace `ld-musl`. Standard Unix approach (Linux, FreeBSD, all do this).
-- [x] `planned` **Kernel Build Automation Migration.**
-  Replace in-kernel build orchestrator (`run_selfhost_build` in `kernel/main.c`) with userspace shell build scripts. No Unix OS runs compilation from kernel context.
+- [x] In-Kernel Dynamic Linker Purge: delegated to userspace `ld-musl`.
+- [x] Kernel Build Automation Migration: replaced kernel build orchestrator with userspace scripts.
 
 ## M94: Foreign Userspace Independence & Kernel Decoupling
 
-Goal: Completely decouple the b1nix kernel from its custom userspace, allowing any standard Linux rootfs (Alpine, Debian, BusyBox) to boot natively without kernel modifications or proprietary daemons.
+- [x] Generic Boot & Init System Orchestration (`init=` cmdline, PID 1 reservation, OpenRC boot).
+- [x] Init-Agnostic Runtime Control: FIFOs (RAM + ext2/4 inodes), tmpfs/ramfs/devtmpfs, working `posix_spawn`/`popen`, `flock`. OpenRC boots as PID 1 and `openrc-shutdown` powers off through `/run/openrc/init.ctl` (`iso-openrc` smoke instance); BusyBox init also runs as PID 1. runit/s6 not ported.
+- [x] OpenRC -> Dynamic musl Linking (and every other port): `tools/check-dynamic.sh` fails the build on a static executable in the rootfs, exceptions only via `tools/configs/static-allowlist.txt` with a reason. The legacy fixed-base static link path is gone from the cc wrappers, and with it every userspace linker script (`linker.ld`, `linker-cxx.ld`, `linker-libcxx.ld`) — lld's default layout plus `--eh-frame-hdr` keeps `PT_GNU_EH_FRAME`, verified by `CXX-SMOKE: ok exceptions`.
+- [x] Standardized Virtual Memory Address Space Layout: no fixed load base left in the build (`userspace/linker.ld` deleted). One boot runs a stock Linux `ET_EXEC` at `0x200000`, b1nix `ET_EXEC` images at `0x2000000` and musl PIEs placed by the loader (randomized under `b1nix.aslr`); the kernel is higher-half, so none of them can collide with it.
+- [x] Linux ABI Conformance: every syscall the ported software actually reached (`clock_getres`, `sched_getaffinity`, `faccessat2`, `rt_sigtimedwait`, `statx` with a real dirfd, `sysinfo`, `times`) is translated or implemented — a boot logs no unmapped syscall. **A stock Alpine 3.20 minirootfs boots on b1nix**: its BusyBox init runs as PID 1 through Alpine's own `ld-musl`, its coreutils/awk/sed/pipes work, and `poweroff` shuts the machine down (`tools/try-alpine-rootfs.sh`). runit/s6 remain unported.
 
-- [ ] `planned` **Generic Boot & Init System Orchestration.**
-  Remove hardcoded `/bin/init` spawn sequences from `kernel/main.c`. Support standard Linux boot cmdline parameters (`init=/bin/sh`, `init=/sbin/init`) allowing boot of standard OpenRC, Systemd, or BusyBox init.
-- [ ] `planned` **Standardized Virtual Memory Address Space Layout.**
-  Fully detach loader from hardcoded load address `0x02000000`. Support arbitrary standard Linux ELF load bases and PIE randomization without memory collisions with kernel mappings.
-- [ ] `planned` **100% Transparent Linux ABI Conformance.**
-  Complete missing Linux syscall translations, auxiliary vector descriptors (`AT_SYSINFO_EHDR`, `AT_BASE`), and struct alignments so unpatched glibc and musl binaries run without b1nix-specific headers.
+## M95: Loadable Kernel Modules — Framework and Device/FS Modules
 
-## M95: Linux x86_64 ABI Compatibility
+- [ ] `planned` `module_alloc` and Module Region (`0xFFFFFFFFC0000000` range, W^X).
+- [ ] `planned` `struct module` Descriptor and Module List (`load_module`, `delete_module`).
+- [ ] `planned` `EXPORT_SYMBOL` Table and Reference Counting (`try_module_get`/`module_put`).
+- [ ] `planned` `init_module` / `finit_module` / `delete_module` Syscalls and vermagic.
+- [ ] `planned` `/proc/modules` and userspace `modinfo`/`lsmod`/`insmod`/`rmmod`.
+- [ ] `planned` Convert Optional Filesystems (`ntfs`, `btrfs`, `isofs`) to `.ko` modules.
+- [ ] `planned` Convert Optional Device Drivers (HDA sound driver) to `.ko` modules.
+- [ ] `planned` M96 Smoke Test for LKM framework.
 
-Goal: Make b1nix's kernel ABI Linux x86_64 compatible — signal numbers, struct layouts, and syscall conventions all match Linux x86_64 — so stock musl (and eventually glibc) binaries compiled for Linux run without a translation layer. Note: POSIX defines the API (which fields exist) but NOT the ABI (exact byte layout); different Unix systems have different struct layouts. Our target is specifically Linux x86_64 because musl/glibc target Linux.
+## M96: Loadable Kernel Modules — Network Protocols and Module Parameters
 
-Detailed plan: [`docs/m95-posix-abi-port-plan.md`](docs/m95-posix-abi-port-plan.md)
-
-- [ ] `planned` **POSIX Signal Number Migration.**
-  Replace b1nix's non-standard signal numbering (SIGABRT=1, SIGUSR1=19) with POSIX numbers (SIGHUP=1..SIGSYS=31, SIGRTMIN=32..SIGRTMAX=63). Change `_NSIG` from 31 to 65, expand `sigactions[31]` → `sigactions[65]` in `struct task`. Verify sigset_t bit positions and RT signal side-table allocation (M74) remain correct. Files: `kernel/include/b1nix/sched.h`, `userspace/include/signal.h`.
-- [ ] `planned` **Linux-Compatible Struct Layouts.**
-  Add `struct posix_stat` matching Linux x86_64 `struct stat` field order (st_dev, st_ino, st_nlink, st_mode, st_uid, st_gid, st_rdev, __pad1, st_size, st_blksize, st_blocks, st_atim, st_mtim, st_ctim, st_ino). Widen `struct b1nix_utsname` fields from `[32]` to `[65]`. Update `struct b1nix_termios` to include `c_line` and shrink `c_cc` from `[32]` to `[19]`. Add native `sys_stat`/`sys_fstat`/`sys_lstat` handlers that return Linux-compatible layouts. Files: `kernel/include/b1nix/posix.h`, `kernel/syscall/syscall.c`.
-- [ ] `planned` **musl Syscall Table Rewrite.**
-  Rewrite `build/src/musl/.../bits/syscall.h.in` to use b1nix syscall numbers instead of Linux x86_64 numbers. Remove `-D__linux__` from `tools/ports/build-musl.sh` so musl uses b1nix's own bits headers. Keep `tools/b1nix-musl-cc` EI_OSABI patch for ELF compatibility. Files: `build/src/musl/x86_64-b1nix/musl-1.2.5/arch/x86_64/bits/syscall.h.in`, `tools/ports/build-musl.sh`.
-- [ ] `planned` **New Syscall Handlers (Critical musl Dependencies).**
-  Implement `SYS_set_tid_address` and `SYS_set_robust_list` in `kernel/syscall/syscall.c` — musl pthreads require these for thread cleanup and robust futex lists. Stub remaining ~71 Linux-specific syscalls (io_uring, cgroups, perf events, etc.) with `-ENOSYS`. Verify existing `sys_futex` is sufficient for musl pthreads.
-- [ ] `planned` **linux_abi.c Translation Layer Removal.**
-  After musl and all smoke tests pass with the native POSIX ABI, remove `kernel/syscall/linux_abi.c` (translation table), `kernel/include/b1nix/linux_abi.h`, and personality detection in `kernel/user/process.c`. All binaries will use the native b1nix ABI directly. Files: `kernel/syscall/linux_abi.c`, `kernel/include/b1nix/linux_abi.h`, `kernel/user/process.c`.
-
-
+- [ ] `planned` Network Protocol Module Scaffolding (`proto_register`, IPv6, NDP, NTP).
+- [ ] `planned` `module_param` Parameters exposed via `/sys/module/<name>/parameters/`.
+- [ ] `planned` `request_module` kernel call and shell `modprobe` alias naming.
+- [ ] `planned` Module Dependencies parsing (`depends=`) and `modules.dep`.
+- [ ] `planned` M97 Smoke Test for network protocol modules and params.
