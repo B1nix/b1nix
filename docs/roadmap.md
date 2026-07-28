@@ -363,7 +363,7 @@ Status:
 - [x] Linux process startup: full auxv (AT_PHDR/BASE/ENTRY/RANDOM/EXECFN/UID…), `arch_prctl`, signal delivery with signo remap, and `rt_sigreturn`.
 - [x] Linux-compatible `/proc` and `/sys`: `/proc/<pid>/{environ,statm,limits,cwd,root,mounts}`, `/proc/{swaps,modules,sys/kernel/*,sys/fs/*}`, `/sys/class/net/<if>/*`.
 - [x] Detect Linux ELFs through personality (`EI_OSABI` and `NT_GNU_ABI_TAG`).
-- Deliberately unimplemented (each returns `-ENOSYS`, listed in `kernel/syscall/syscall.c`): `ptrace`, SysV semaphores/message queues, `chroot`, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, file handles, `rseq`.
+- [x] The rest of the surface, implemented rather than stubbed: `ptrace` (TRACEME/ATTACH/GETREGS/SETREGS/PEEK/POKE/CONT/SINGLESTEP/DETACH/KILL), SysV semaphores (with SEM_UNDO) and message queues (type-selective receive), `chroot` with a real per-task root, runtime `swapon`/`swapoff`, `tee`/`vmsplice`, `ioprio_*`, `name_to_handle_at`/`open_by_handle_at`, `rseq` (live `cpu_id` plus critical-section abort), and legacy `getdents`.
 
 ## M41: Large Physical Memory
 

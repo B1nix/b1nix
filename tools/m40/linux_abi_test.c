@@ -64,6 +64,31 @@ typedef int i32;
 #define SYS_unshare         272
 #define SYS_syncfs          306
 #define SYS_preadv          295
+#define SYS_getdents        78
+#define SYS_getpid          39
+#define SYS_semget          64
+#define SYS_semop           65
+#define SYS_semctl          66
+#define SYS_msgget          68
+#define SYS_msgsnd          69
+#define SYS_msgrcv          70
+#define SYS_msgctl          71
+#define SYS_ptrace          101
+#define SYS_ioprio_set      251
+#define SYS_ioprio_get      252
+#define SYS_tee             276
+#define SYS_vmsplice        278
+#define SYS_pipe2           293
+#define SYS_name_to_handle_at 303
+#define SYS_open_by_handle_at 304
+#define SYS_rseq            334
+#define SYS_swapon          167
+#define SYS_swapoff         168
+#define SYS_fork            57
+#define SYS_wait4           61
+#define SYS_mkdir           83
+#define SYS_rmdir           84
+#define SYS_unlink          87
 
 #define O_RDONLY 0
 #define O_WRONLY 1
@@ -430,10 +455,10 @@ static void test_procfs_sysfs(void) {
 }
 
 static void test_documented_gaps(void) {
-  /* chroot is one of the calls b1nix deliberately does not implement: it must
-   * report ENOSYS (38), not succeed and silently do nothing. */
-  long r = sys1(SYS_chroot, "/");
-  check("chroot-enosys", r == -38, r);
+  /* An unassigned syscall number must report ENOSYS (38) rather than being
+   * silently accepted — that is what tells a libc to use its fallback. */
+  long r = sys0(1000);
+  check("enosys-unmapped", r == -38, r);
 }
 
 static void test_epoll(void) {
@@ -458,6 +483,304 @@ __attribute__((naked)) void _start(void) {
                    "hlt");
 }
 
+
+/* ── the calls closed in the M40 follow-up ─────────────────────────────── */
+
+static void test_getdents_legacy(void) {
+  long fd = sys3(SYS_open, "/etc", O_RDONLY, 0);
+  if (fd < 0) {
+    fail("getdents-legacy", fd);
+    return;
+  }
+  char buf[1024];
+  long n = sys3(SYS_getdents, fd, buf, sizeof(buf));
+  sys1(SYS_close, fd);
+  if (n <= 0) {
+    fail("getdents-legacy", n);
+    return;
+  }
+  /* Walk the records: d_reclen at offset 16, name at 18, type in the last
+   * byte. A directory must contain at least one entry with a plausible
+   * record length and a NUL-terminated name. */
+  int entries = 0, sane = 1;
+  long off = 0;
+  while (off < n) {
+    unsigned short reclen = *(unsigned short *)&buf[off + 16];
+    if (reclen < 20 || off + reclen > n) {
+      sane = 0;
+      break;
+    }
+    if (buf[off + 18] == '\0')
+      sane = 0;
+    entries++;
+    off += reclen;
+  }
+  check("getdents-legacy", sane && entries > 0 && off == n, (long)entries);
+}
+
+static void test_pipe_tee_vmsplice(void) {
+  int a[2], b[2];
+  long r1 = sys2(SYS_pipe2, a, 0);
+  long r2 = sys2(SYS_pipe2, b, 0);
+  if (r1 < 0 || r2 < 0) {
+    fail("tee", r1 < 0 ? r1 : r2);
+    return;
+  }
+  /* vmsplice INTO pipe a. */
+  struct lx_iovec iov = {(void *)"teedata", 7};
+  long vs = sys4(SYS_vmsplice, a[1], &iov, 1, 0);
+
+  /* tee copies to pipe b without consuming a. */
+  long t = sys4(SYS_tee, a[0], b[1], 16, 0);
+
+  char x[8], y[8];
+  long rx = sys3(SYS_read, a[0], x, 7);
+  long ry = sys3(SYS_read, b[0], y, 7);
+  x[rx > 0 ? rx : 0] = '\0';
+  y[ry > 0 ? ry : 0] = '\0';
+
+  check("vmsplice", vs == 7, vs);
+  check("tee", t == 7 && rx == 7 && ry == 7 && seq(x, "teedata") &&
+                   seq(y, "teedata"),
+        t);
+  sys1(SYS_close, a[0]);
+  sys1(SYS_close, a[1]);
+  sys1(SYS_close, b[0]);
+  sys1(SYS_close, b[1]);
+}
+
+static void test_ioprio(void) {
+  /* IOPRIO_PRIO_VALUE(IOPRIO_CLASS_BE=2, level 4) */
+  int want = (2 << 13) | 4;
+  long sr = sys3(SYS_ioprio_set, 1 /* IOPRIO_WHO_PROCESS */, 0, want);
+  long gr = sys2(SYS_ioprio_get, 1, 0);
+  check("ioprio", sr == 0 && gr == want, gr);
+}
+
+static void test_sysv_sem(void) {
+  long id = sys3(SYS_semget, 0 /* IPC_PRIVATE */, 2, 0600 | 01000 /* IPC_CREAT */);
+  if (id < 0) {
+    fail("sysv-sem", id);
+    return;
+  }
+  long sv = sys4(SYS_semctl, id, 0, 16 /* SETVAL */, 1);
+  long v0 = sys4(SYS_semctl, id, 0, 12 /* GETVAL */, 0);
+
+  /* Take the semaphore, then check it reads back as 0, then give it back. */
+  struct {
+    unsigned short num;
+    short op;
+    short flg;
+  } down = {0, -1, 0}, up = {0, 1, 0};
+  long d = sys3(SYS_semop, id, &down, 1);
+  long v1 = sys4(SYS_semctl, id, 0, 12 /* GETVAL */, 0);
+  long u = sys3(SYS_semop, id, &up, 1);
+  long v2 = sys4(SYS_semctl, id, 0, 12, 0);
+
+  /* A blocking-down on the already-zero second semaphore with IPC_NOWAIT must
+   * report EAGAIN rather than hang. */
+  struct {
+    unsigned short num;
+    short op;
+    short flg;
+  } nowait = {1, -1, 04000 /* IPC_NOWAIT */};
+  long nw = sys3(SYS_semop, id, &nowait, 1);
+
+  long rm = sys4(SYS_semctl, id, 0, 0 /* IPC_RMID */, 0);
+  check("sysv-sem", sv == 0 && v0 == 1 && d == 0 && v1 == 0 && u == 0 &&
+                        v2 == 1 && nw == -11 /* EAGAIN */ && rm == 0,
+        v1);
+}
+
+static void test_sysv_msg(void) {
+  long id = sys2(SYS_msgget, 0 /* IPC_PRIVATE */, 0600 | 01000 /* IPC_CREAT */);
+  if (id < 0) {
+    fail("sysv-msg", id);
+    return;
+  }
+  struct {
+    long mtype;
+    char text[16];
+  } m;
+
+  m.mtype = 7;
+  for (int i = 0; i < 5; i++)
+    m.text[i] = "seven"[i];
+  long s1 = sys4(SYS_msgsnd, id, &m, 5, 0);
+  m.mtype = 3;
+  for (int i = 0; i < 5; i++)
+    m.text[i] = "three"[i];
+  long s2 = sys4(SYS_msgsnd, id, &m, 5, 0);
+
+  /* Type-selective receive: ask for 7, get "seven" even though 3 is queued
+   * behind it — that selection is the whole point of a SysV queue. */
+  for (int i = 0; i < 16; i++)
+    m.text[i] = 0;
+  long r1 = sys5(SYS_msgrcv, id, &m, 16, 7, 0);
+  int got_seven = (r1 == 5 && m.mtype == 7 && m.text[0] == 's');
+  long r2 = sys5(SYS_msgrcv, id, &m, 16, 0, 0);
+  int got_three = (r2 == 5 && m.mtype == 3 && m.text[0] == 't');
+  /* Nothing left: IPC_NOWAIT must report ENOMSG rather than block. */
+  long r3 = sys5(SYS_msgrcv, id, &m, 16, 0, 04000 /* IPC_NOWAIT */);
+  long rm = sys3(SYS_msgctl, id, 0 /* IPC_RMID */, 0);
+  check("sysv-msg", s1 == 5 && s2 == 5 && got_seven && got_three &&
+                        r3 == -42 /* ENOMSG */ && rm == 0,
+        r1);
+}
+
+static void test_file_handles(void) {
+  /* struct file_handle { u32 handle_bytes; int handle_type; u8 f_handle[]; } */
+  struct {
+    unsigned handle_bytes;
+    int handle_type;
+    unsigned payload;
+  } fh = {sizeof(unsigned), 0, 0};
+  int mount_id = 0;
+  long r = sys5(SYS_name_to_handle_at, AT_FDCWD, "/etc/m40-smoke.sh", &fh,
+                &mount_id, 0);
+  if (r < 0) {
+    fail("file-handle", r);
+    return;
+  }
+  long fd = sys3(SYS_open_by_handle_at, AT_FDCWD, &fh, O_RDONLY);
+  char c[4];
+  long n = fd >= 0 ? sys3(SYS_read, fd, c, 2) : fd;
+  if (fd >= 0)
+    sys1(SYS_close, fd);
+  check("file-handle", fd >= 0 && n == 2 && c[0] == '#', fd < 0 ? fd : n);
+}
+
+/* struct rseq is 32 bytes and must be 32-byte aligned. */
+struct lx_rseq {
+  unsigned cpu_id_start;
+  unsigned cpu_id;
+  unsigned long rseq_cs;
+  unsigned flags;
+  unsigned pad[3];
+} __attribute__((aligned(32)));
+
+static struct lx_rseq g_rseq_area;
+
+static void test_rseq(void) {
+  g_rseq_area.cpu_id = 0xffffffffu;
+  g_rseq_area.cpu_id_start = 0xffffffffu;
+  g_rseq_area.rseq_cs = 0;
+  long reg = sys4(SYS_rseq, &g_rseq_area, sizeof(struct lx_rseq), 0, 0x53053053);
+  /* Any syscall is a return to userspace, so the cpu ids must be live now. */
+  sys0(SYS_getpid);
+  unsigned cpu = g_rseq_area.cpu_id;
+  long unreg = sys4(SYS_rseq, &g_rseq_area, sizeof(struct lx_rseq),
+                    1 /* RSEQ_FLAG_UNREGISTER */, 0x53053053);
+  check("rseq", reg == 0 && cpu != 0xffffffffu && cpu < 64 && unreg == 0,
+        reg ? reg : (long)cpu);
+}
+
+static void test_swap_cycle(void) {
+  /* Detach and re-attach the swap device. swapoff must page everything back
+   * in first, so a successful round trip proves both halves. */
+  long off = sys1(SYS_swapoff, "/dev/sata1");
+  if (off < 0) {
+    /* No swap device on this instance: the wiring is still checked by the
+     * error path (a device that does not exist reports ENODEV). */
+    long bogus = sys2(SYS_swapon, "/dev/nosuchdisk", 0);
+    check("swapon-swapoff", bogus == -19 /* ENODEV */, bogus);
+    return;
+  }
+  long on = sys2(SYS_swapon, "/dev/sata1", 0);
+  check("swapon-swapoff", on == 0, on);
+}
+
+static void test_chroot(void) {
+  /* chroot is irreversible for the calling task, so run it in a child. */
+  sys2(SYS_mkdir, "/tmp/m40jail", 0755);
+  long fd = sys3(SYS_open, "/tmp/m40jail/inside", O_WRONLY | O_CREAT | O_TRUNC,
+                 0644);
+  if (fd >= 0) {
+    sys3(SYS_write, fd, "x", 1);
+    sys1(SYS_close, fd);
+  }
+
+  long pid = sys0(SYS_fork);
+  if (pid == 0) {
+    /* Child: inside the jail, "/inside" must exist and "/etc" must not, and
+     * ".." must not climb out of it. */
+    long cr = sys1(SYS_chroot, "/tmp/m40jail");
+    int ok_status = 0;
+    if (cr == 0) {
+      long f1 = sys3(SYS_open, "/inside", O_RDONLY, 0);
+      long f2 = sys3(SYS_open, "/etc/m40-smoke.sh", O_RDONLY, 0);
+      long f3 = sys3(SYS_open, "/../../etc/m40-smoke.sh", O_RDONLY, 0);
+      if (f1 >= 0)
+        sys1(SYS_close, f1);
+      ok_status = (f1 >= 0 && f2 < 0 && f3 < 0) ? 0 : 1;
+    } else {
+      ok_status = 2;
+    }
+    sys1(SYS_exit_group, ok_status);
+    for (;;)
+      ;
+  }
+  int status = -1;
+  long w = sys4(SYS_wait4, pid, &status, 0, 0);
+  check("chroot", pid > 0 && w == pid && (status & 0xff00) == 0,
+        pid > 0 ? (long)status : pid);
+
+  sys3(SYS_unlinkat, AT_FDCWD, "/tmp/m40jail/inside", 0);
+  sys1(SYS_rmdir, "/tmp/m40jail");
+}
+
+static void test_ptrace(void) {
+  long pid = sys0(SYS_fork);
+  if (pid == 0) {
+    sys4(SYS_ptrace, 0 /* PTRACE_TRACEME */, 0, 0, 0);
+    /* Announce ourselves as traced, then stop for the tracer. */
+    sys3(SYS_write, 1, "", 0);
+    /* Raise SIGUSR1 (Linux 10) on ourselves — the tracer sees the stop. */
+    sys2(62 /* kill */, sys0(SYS_getpid), 10);
+    sys1(SYS_exit_group, 0);
+    for (;;)
+      ;
+  }
+  if (pid < 0) {
+    fail("ptrace", pid);
+    return;
+  }
+  int status = 0;
+  long w = sys4(SYS_wait4, pid, &status, 2 /* WUNTRACED */, 0);
+  int stopped = (w == pid) && ((status & 0xff) == 0x7f);
+
+  /* Read the stopped child's registers: rip must be a plausible userspace
+   * address inside the test binary. */
+  struct {
+    unsigned long r[27];
+  } regs;
+  long gr = sys4(SYS_ptrace, 12 /* PTRACE_GETREGS */, pid, 0, &regs);
+  unsigned long rip = regs.r[16];
+  int rip_ok = (gr == 0 && rip > 0x200000UL && rip < 0x400000UL);
+
+  /* Peek the word at the child's rip — it must match this process's own copy
+   * of the same code, since both run the same binary image. */
+  long peeked = sys4(SYS_ptrace, 2 /* PTRACE_PEEKDATA */, pid, rip, 0);
+  int peek_ok = (rip_ok && peeked == *(long *)rip);
+
+  long cont = sys4(SYS_ptrace, 7 /* PTRACE_CONT */, pid, 0, 0);
+  int exited = 0;
+  for (int i = 0; i < 100; i++) {
+    status = 0;
+    long r = sys4(SYS_wait4, pid, &status, 0, 0);
+    if (r == pid) {
+      exited = 1;
+      break;
+    }
+    if (r < 0)
+      break;
+  }
+  check("ptrace-stop", stopped, w);
+  check("ptrace-getregs", rip_ok, gr);
+  check("ptrace-peek", peek_ok, peeked);
+  check("ptrace-cont", cont == 0 && exited, cont);
+}
+
 void abi_main(void) {
   out("M40-ABI: start\n");
 
@@ -470,6 +793,16 @@ void abi_main(void) {
   test_hostname();
   test_procfs_sysfs();
   test_epoll();
+  test_getdents_legacy();
+  test_pipe_tee_vmsplice();
+  test_ioprio();
+  test_sysv_sem();
+  test_sysv_msg();
+  test_file_handles();
+  test_rseq();
+  test_swap_cycle();
+  test_chroot();
+  test_ptrace();
   test_documented_gaps();
 
   /* "done" is emitted ONLY when every check passed — the harness greps for it
