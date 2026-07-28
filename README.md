@@ -14,7 +14,7 @@ also archived.
 
 ## Current Capabilities
 
-- Multiboot2 boot through GRUB on BIOS and UEFI systems.
+- Multiboot2 boot through the Limine bootloader on BIOS and UEFI systems.
 - 64-bit x86 kernel selected with `ARCH=x86_64`.
 - Preemptive SMP scheduling, per-CPU state, process groups, job control,
   signals, futexes, pthreads, and copy-on-write `fork()`.
@@ -52,7 +52,7 @@ The basic build expects:
 - Clang
 - LLVM `ld.lld`, `llvm-ar`, and related tools
 - `xxd`
-- GRUB `grub-mkrescue` or `grub2-mkrescue`
+- Limine (`limine`) and `xorriso`
 - `xorriso`
 - QEMU `qemu-system-x86_64`
 - `mke2fs` from e2fsprogs
@@ -61,7 +61,7 @@ The basic build expects:
 On macOS with Homebrew:
 
 ```sh
-brew install llvm lld qemu grub xorriso e2fsprogs
+brew install llvm lld qemu limine xorriso e2fsprogs
 export PATH="/opt/homebrew/opt/llvm/bin:$PATH"
 ```
 
@@ -293,7 +293,7 @@ still limited and some controller-specific quirks remain unverified.
 ```text
 kernel/             kernel core, architecture code, drivers, VFS, networking
 userspace/          libc, headers, crt, native programs, and TinyCC
-boot/               GRUB configuration
+boot/               Limine bootloader configuration
 tools/              build, porting, packaging, and self-hosting tools
 tests/              QEMU smoke and persistence tests
 docs/               roadmap, ABI, porting notes, and subsystem documentation

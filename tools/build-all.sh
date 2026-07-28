@@ -44,7 +44,7 @@
 # Each flag has an env equivalent (WITH_NATIVE_CLANG=1, WITH_V8=1, ...).
 # Other passthrough env:
 #     ARCH=x86_64             target arch (do not change; x86 is frozen)
-#     KERNEL_CMDLINE          grub cmdline for the final ISO (default b1nix.test=1)
+#     KERNEL_CMDLINE          kernel cmdline for the final ISO (default b1nix.test=1)
 #     ISO_TARGET              make iso target (default: iso)
 #
 # The cross toolchain and the kernel/ISO are the only mandatory stages; the cross

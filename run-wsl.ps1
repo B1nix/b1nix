@@ -39,12 +39,12 @@ function Test-WslTool ($toolName) {
 function Install-WslDependencies {
     Write-Host "`nInstalling OS-build dependencies in Arch Linux (WSL)..." -ForegroundColor Cyan
     Write-Host "Running installation as root inside WSL..." -ForegroundColor Yellow
-    wsl -d $distro -u root pacman -Syu --needed --noconfirm lld llvm grub xorriso xxd mtools dosfstools
+    wsl -d $distro -u root pacman -Syu --needed --noconfirm lld llvm limine xorriso xxd mtools dosfstools
     if ($LASTEXITCODE -eq 0) {
         Write-Host "All dependencies installed successfully!" -ForegroundColor Green
     } else {
         Write-Host "Error installing dependencies. Please run this command manually in Arch Linux:" -ForegroundColor Red
-        Write-Host "  pacman -Syu --needed lld grub xorriso xxd mtools dosfstools" -ForegroundColor Yellow
+        Write-Host "  pacman -Syu --needed lld limine xorriso xxd mtools dosfstools" -ForegroundColor Yellow
     }
 }
 
@@ -113,7 +113,7 @@ while ($running) {
     switch ($choice) {
         "1" {
             $missing = @()
-            $tools = @("clang", "ld.lld", "make", "grub-mkrescue", "xorriso", "mke2fs", "xxd")
+            $tools = @("clang", "ld.lld", "make", "limine", "xorriso", "mke2fs", "xxd")
             foreach ($t in $tools) {
                 if (-not (Test-WslTool $t)) {
                     $missing += $t
@@ -121,7 +121,7 @@ while ($running) {
             }
             
             if ($missing.Count -eq 0) {
-                Write-Host "All build tools (clang, lld, make, grub, xorriso, mke2fs, xxd) are found in WSL!" -ForegroundColor Green
+                Write-Host "All build tools (clang, lld, make, limine, xorriso, mke2fs, xxd) are found in WSL!" -ForegroundColor Green
             } else {
                 Write-Host "Missing tools in WSL: $($missing -join ', ')" -ForegroundColor Yellow
                 $confirm = Read-Host "Would you like to install them automatically? (Y/N)"

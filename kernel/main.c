@@ -725,7 +725,7 @@ void kernel_main(usize arg0, usize arg1)
 	console_write(init_log);
 
 	/* M58 V8 run phase: d8 (x86_64) is too big for the xxd-embedded initramfs,
-	 * so it ships inside the SAME ISO as a GRUB Multiboot2 module (grub.cfg
+	 * so it ships inside the SAME ISO as a Multiboot2 module (limine.conf
 	 * `module2 /boot/v8.img`), which the kernel exposes as the ram0 block device
 	 * (kernel/dev/ramdisk.c). When booted with b1nix.v8run, mount ram0 and launch
 	 * d8 to prove the V8 engine runs on b1nix — no separate QEMU -drive needed,
@@ -770,8 +770,8 @@ void kernel_main(usize arg0, usize arg1)
 
 	/* M68 native-Rust proof: the rustc ELF + librustc_driver.so (LLVM folded in) +
 	 * the std sysroot (~hundreds of MB) are far too big for the
-	 * xxd-embedded initramfs, so — like d8 above — they ship as a GRUB
-	 * Multiboot2 module (grub.cfg `module2 /boot/rust.img`) exposed as the ram0
+	 * xxd-embedded initramfs, so — like d8 above — they ship as a
+	 * Multiboot2 module (limine.conf `module_path .../rust.img`) exposed as the ram0
 	 * ext4 block device. With b1nix.rustrun the kernel mounts it and launches
 	 * /bin/rustc. rustc has librustc_driver.so/libLLVM.so as DT_NEEDED (no
 	 * PT_INTERP), so just loading the binary exercises the M69 recursive
@@ -804,7 +804,7 @@ void kernel_main(usize arg0, usize arg1)
 
 	/* M64 native self-host Clang. The b1nix-native clang-22 (a ~94MB ELF that
 	 * statically links LLVM + libstdc++, NEEDED only libc.so.1) ships inside a
-	 * self-contained ISO as a GRUB Multiboot2 module (ext4) exposed as ram0 —
+	 * self-contained ISO as a Multiboot2 module (ext4) exposed as ram0 —
 	 * exactly like rustc/d8 above. With b1nix.clangrun the kernel mounts ram0
 	 * -> /mnt/clang and exercises the compiler two ways: `clang --version`
 	 * proves the loaded compiler executes on b1nix (it prints its real version
@@ -892,7 +892,7 @@ void kernel_main(usize arg0, usize arg1)
 	}
 
 	/* M26 native-Clang KERNEL self-host. The self-host module (clang + ld.lld +
-	 * kernel source + the flat TU list) ships as the ram0 ext4 GRUB module. With
+	 * kernel source + the flat TU list) ships as the ram0 ext4 Multiboot2 module. With
 	 * b1nix.selfhostbuild the kernel mounts it and compiles+links its own kernel
 	 * in-guest with its own clang+ld.lld (the same toolchain the host uses), the
 	 * real M26 self-host. Gated by a cmdline flag so it never fires in the
@@ -900,7 +900,7 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.selfhostbuild")) {
 		vfs_mkdir("/mnt/build", 0755);
 		/* b1nix.selfhostdisk sources the toolchain from a real SATA disk (sata0)
-		 * instead of the ram0 GRUB module. The module is a ramdisk: its ~217 MB
+		 * instead of the ram0 Multiboot2 module. The module is a ramdisk: its ~217 MB
 		 * stay pinned in RAM for the whole build. A disk leaves that 217 MB free
 		 * — the toolchain streams off AHCI through the (now read-ahead) block
 		 * cache — so the self-host fits in far less RAM. */
