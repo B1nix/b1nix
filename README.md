@@ -6,8 +6,8 @@ its own kernel, libc, shell, filesystems, network stack, drivers, and native
 development toolchain, and can rebuild its kernel from inside B1NIX.
 
 The active target is `x86_64`. The old 32-bit `i686` port is archived after its
-last green smoke run (`804/0`, 2026-06-23), and the old AArch64 experiment is
-also archived.
+last green smoke run (`804/0`, 2026-06-23). The AArch64 (`ARCH=aarch64`) port is under
+active restoration and development on the `feature/aarch64` branch.
 
 > B1NIX is a research and hobby operating system, not a production system.
 > Interfaces, disk formats, security behavior, and build workflows may change.
@@ -18,8 +18,7 @@ also archived.
 - 64-bit x86 kernel selected with `ARCH=x86_64`.
 - Preemptive SMP scheduling, per-CPU state, process groups, job control,
   signals, futexes, pthreads, and copy-on-write `fork()`.
-- Native ELF64 userspace with isolated page tables, `mmap`, shared file
-  mappings, PIE loading, core dumps, and a POSIX-oriented syscall ABI.
+- Native ELF64 userspace targeting **musl libc 1.2.5** and **LLVM libc++** with isolated page tables, `mmap`, shared file mappings, PIE loading, core dumps, and a POSIX-oriented syscall ABI.
 - VFS with dynamic descriptor tables, pipes, PTYs, file locking, AIO,
   `/proc`, `/sys`, initramfs, a page cache, and persistent root filesystems.
 - Read/write ext2, ext3, and ext4; FAT32 and ext1 support; read-only ISO9660,
@@ -28,15 +27,10 @@ also archived.
   r8169, PS/2 input, xHCI USB keyboard and mass-storage paths.
 - IPv4 and IPv6, ARP, NDP, ICMP, UDP, TCP, Unix sockets, DHCP, DNS, NTP,
   `select`/`poll`, and passive TCP services.
-- Framebuffer console, a small compositor, a text editor, and a two-panel file
-  manager.
-- A shell with pipelines, redirection, scripts, globbing, command and
-  arithmetic substitution, here-documents, functions, loops, `case`, arrays,
-  traps, and foreground/background job control.
-- Native utilities plus curl, GNU Wget, Dropbear SSH, TinyCC, and an optional
-  upstream BusyBox 1.38.0 port.
-- Ported binutils, GCC, libstdc++, and GNU Make. The x86_64 kernel can be
-  compiled and linked from inside B1NIX.
+- Framebuffer console, Mesa 3D graphics renderer, NetSurf FB web browser, a small compositor, a text editor, and a two-panel file manager.
+- A shell (`zsh` interactive, `ash` `/bin/sh`) with pipelines, redirection, scripts, globbing, command and arithmetic substitution, here-documents, functions, loops, `case`, arrays, traps, and foreground/background job control.
+- Native utilities plus musl libc, LLVM libc++, zsh, curl, Dropbear SSH, TinyCC, Duktape, bmake, samurai, Mesa 3D, openlibm, and BusyBox 1.38.0.
+- Ported binutils, GCC, libstdc++, bmake, samurai, and native build toolchain. The x86_64 kernel can be compiled and linked from inside B1NIX.
 - Automated QEMU coverage for boot, SMP, memory, storage, filesystems,
   networking, SSH, graphics, libc, shell, and userspace behavior.
 
@@ -53,10 +47,9 @@ The basic build expects:
 - LLVM `ld.lld`, `llvm-ar`, and related tools
 - `xxd`
 - Limine (`limine`) and `xorriso`
-- `xorriso`
 - QEMU `qemu-system-x86_64`
 - `mke2fs` from e2fsprogs
-- curl or Wget for downloading third-party source archives
+- `curl` for downloading third-party source archives
 
 On macOS with Homebrew:
 
