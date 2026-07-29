@@ -66,7 +66,6 @@ $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
-INITRAMFS_TCC_FILES_INC := $(INC_DIR)/initramfs_tcc_files.inc
 # b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus)
 INITRAMFS_B1CC_M34_INC := $(INC_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
@@ -519,7 +518,7 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke build-all test-b1cc
 
-all: check-b1cc-sync check-tcc-sync $(KERNEL_ELF)
+all: check-b1cc-sync $(KERNEL_ELF)
 
 # build-all — one orchestrator that builds the whole working system in dependency
 # order by reusing the existing build scripts (see tools/build-all.sh). Forwards
@@ -624,7 +623,6 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*.c) $(wildcard userspace/bin/*.S) \
 	$(wildcard userspace/b1cc/src/*.c) \
 	$(wildcard userspace/displayd/*.c) \
-	$(wildcard userspace/tcc/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
 	$(PCRE2_LIB) \
@@ -660,12 +658,6 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
-
-$(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/*.h) $(wildcard userspace/tcc/include/*.h) $(wildcard userspace/tcc/lib/*.c) $(wildcard userspace/tcc/lib/*.S)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
-	@$(MAKE) -C userspace build/$(ARCH)/tcc/libtcc1.a
-	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) sh tools/images/gen_tcc_initramfs.sh $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1309,7 +1301,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
+iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
@@ -1392,12 +1384,9 @@ iso-test: root-image check-dynamic $(KERNEL_ELF)
 
 userspace: $(USERSPACE_DEPS)
 
-.PHONY: check-b1cc-sync check-tcc-sync
+.PHONY: check-b1cc-sync
 check-b1cc-sync:
 	@tools/check-b1cc-sync.sh
-
-check-tcc-sync:
-	@tools/check-tcc-sync.sh
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install

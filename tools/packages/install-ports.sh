@@ -3,7 +3,7 @@
 #
 # Download mode installs EVERY arch-matching entry from the index, which now
 # includes the 'dev' sysroot package (static libs + crt0 + headers), so the
-# resulting rootfs is build-capable (tcc/make can compile + link on-target).
+# resulting rootfs is build-capable (b1cc/make can compile + link on-target).
 set -eu
 
 ROOTFS="$1"
@@ -162,18 +162,25 @@ overlay_local_ports() {
 	return 0
 }
 
-# The published package index still carries GNU bash, and download mode installs
-# every arch-matching entry it finds. bash was retired in M98 (zsh is the
-# interactive/login shell), so drop it after extraction rather than shipping a
-# GPLv3 shell nothing references — the index lives in a separate repo and cannot
-# be fixed from here. Also clears the rootfs staging dir of a bash left behind
-# by an earlier build, since that directory is populated incrementally.
-purge_retired_bash() {
+# The published package index still carries retired components, and download
+# mode installs every arch-matching entry it finds: GNU bash (replaced by zsh)
+# and TinyCC (replaced by b1cc as the native compiler). The index lives in a
+# separate repo and cannot be fixed from here, so drop them after extraction
+# rather than shipping software nothing references. This also clears the rootfs
+# staging directory, which is populated incrementally and therefore keeps
+# whatever an earlier build left behind.
+purge_retired_components() {
 	if [ -e "$ROOTFS/bin/bash" ]; then
 		rm -f "$ROOTFS/bin/bash"
 		echo "PURGE bash (retired in M98; /bin/zsh is the shell) [$PKG_ARCH]"
 	fi
 	rm -f "$ROOTFS/etc/bash-smoke.sh"
+	if [ -e "$ROOTFS/bin/tcc" ]; then
+		rm -f "$ROOTFS/bin/tcc"
+		echo "PURGE tcc (retired; /bin/b1cc is the native compiler) [$PKG_ARCH]"
+	fi
+	rm -rf "$ROOTFS/lib/tcc"
+	rm -f "$ROOTFS/lib/libtcc1.a"
 	return 0
 }
 
@@ -184,5 +191,5 @@ case "$MODE" in
 	*) echo "install-ports: mode must be 'download' or 'local'" >&2; exit 2 ;;
 esac
 
-purge_retired_bash
+purge_retired_components
 stage_netsurf_assets

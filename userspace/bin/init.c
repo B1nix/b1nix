@@ -54,7 +54,7 @@ static const char *const excluded[] = {
     "halt", "reboot", "poweroff", "shutdown", "setfattr",
     "bpkg", "curl",
     "mc", "ne", "b1fetch", "gpuinfo", "meminfo",
-    "js", "tcc",
+    "js",
     "m40-linux-hello", "m40-linux-abi", "m67-rust", /* driven by their *-smoke.sh wrappers below */
     "m53_httpd", "m53_httpsd", /* server daemons — block on accept(), must not run via discovery */
     "netsurf-fb", /* browser: needs -f/-T/URL arguments, driven by the M53 smoke */

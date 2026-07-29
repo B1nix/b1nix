@@ -18,8 +18,8 @@ The full LGPL version 3 text is in `LICENSE.LGPL-3.0`. LGPL version 3
 incorporates the terms of GPL version 3 and adds permissions for use of the
 library by other applications.
 
-Files under `userspace/tcc/` and all other third-party material retain their
-own copyright notices and licenses. See `THIRD_PARTY_NOTICES.md`.
+Third-party material retains its own copyright notices and licenses. See
+`THIRD_PARTY_NOTICES.md`.
 
 ## SPDX Identifiers
 
