@@ -670,12 +670,25 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
    * ~57 MB .text segment allocation. All error paths jump to `cleanup`. */
   struct elf64_ehdr ehdr_storage;
   struct elf64_ehdr *ehdr = &ehdr_storage;
-  if (user_read_at(fd, 0, ehdr, sizeof(*ehdr)) != 0)
+  /* These rejections used to be silent, so "failed to load" covered a short
+   * read and a genuinely foreign file alike — indistinguishable in a log. */
+  if (user_read_at(fd, 0, ehdr, sizeof(*ehdr)) != 0) {
+    console_write("ELF load: cannot read ELF header: ");
+    console_write(path);
+    console_write("\n");
     goto cleanup;
+  }
 
   if (ehdr->e_ident[0] != ELF_MAGIC0 || ehdr->e_ident[1] != ELF_MAGIC1 ||
-      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3)
+      ehdr->e_ident[2] != ELF_MAGIC2 || ehdr->e_ident[3] != ELF_MAGIC3) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "ELF load: bad magic %02x %02x %02x %02x in %s\n",
+             ehdr->e_ident[0], ehdr->e_ident[1], ehdr->e_ident[2],
+             ehdr->e_ident[3], path);
+    console_write(line);
     goto cleanup;
+  }
   if (ehdr->e_ident[4] != ELF_CLASS_64 || ehdr->e_ident[5] != ELF_DATA_LE)
     goto cleanup;
   if (ehdr->e_type != ELF_TYPE_EXEC && ehdr->e_type != ELF_TYPE_DYN)
@@ -1341,7 +1354,16 @@ static struct user_loaded_image *user_load_image(const char *path, int argc,
     return image;
   }
 
-  console_write("user_load_image: failed to load\n");
+  /* Report how much memory was left: an image that loads in one boot and not in
+   * another is far more often a resource failure than a malformed ELF, and the
+   * bare message gave no way to tell the two apart. */
+  {
+    char line[128];
+    snprintf(line, sizeof(line),
+             "user_load_image: failed to load %s (free frames %lu)\n",
+             path, (unsigned long)pmm_free_frame_count());
+    console_write(line);
+  }
   user_image_free(image);
   return 0;
 }
@@ -2023,7 +2045,10 @@ resolve:
 
   struct user_loaded_image *image = user_load_image(path, 0, argv, envp, 0, 0);
   if (!image)
-    return -1;
+    /* -1 here reached userspace as -errno, i.e. EPERM ("operation not
+     * permitted") for what is really "this image could not be loaded" — the
+     * error every failed exec reported, no matter the cause. */
+    return -ENOEXEC;
 
   free_kernel_array((char **)argv);
   free_kernel_array((char **)envp);
