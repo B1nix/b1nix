@@ -1,3 +1,19 @@
+/* The native C compiler is b1cc (M98 retired the TCC port).
+ *
+ * --target is passed explicitly: without it b1cc does not select its native
+ * b1nix path and tries to drive a host `cc` for the runtime objects, which does
+ * not exist inside the guest. The host-side b1cc rules in userspace/Makefile
+ * pass the same flag. */
+#define B1CC_PATH "/bin/b1cc"
+#define B1CC_TARGET "--target=x86_64-b1nix"
+/* Everything in the image is a musl PIE against the shared libc; b1cc's output
+ * is no exception. -fPIC -pie selects its dynamic link path, which stamps
+ * PT_INTERP + DT_NEEDED=libc.so so the loader resolves the program's libc
+ * calls. The static path would mean a second, retired object model. */
+#define B1CC_PIC "-fPIC"
+#define B1CC_PIE "-pie"
+
+#include <errno.h>
 #include <fcntl.h>
 #include <math.h>
 #include <stdio.h>
@@ -54,6 +70,59 @@ static int run_cmd_stderr_to_file(const char *path, char *const argv[],
     return -1;
   }
   return -1;
+}
+
+/* Run a compile and, on failure, surface the compiler's own diagnostics — a
+ * bare "fail compile-X (rc=N)" says nothing about which construct it choked on. */
+static int compile_with_diag(char *const argv[], const char *what) {
+  int pipefd[2];
+  if (pipe(pipefd) < 0)
+    return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    close(pipefd[0]);
+    dup2(pipefd[1], 1);
+    dup2(pipefd[1], 2);
+    close(pipefd[1]);
+    execv(B1CC_PATH, argv);
+    /* Report why exec itself failed; the bare 127 below says only "it did". */
+    {
+      char e[64];
+      int n = snprintf(e, sizeof(e), "exec failed errno=%d\n", errno);
+      write(1, e, (size_t)n);
+    }
+    _exit(127);
+  }
+  close(pipefd[1]);
+  char out[512];
+  size_t used = 0;
+  for (;;) {
+    char buf[128];
+    ssize_t n = read(pipefd[0], buf, sizeof(buf));
+    if (n <= 0)
+      break;
+    if (used + (size_t)n < sizeof(out) - 1) {
+      memcpy(out + used, buf, (size_t)n);
+      used += (size_t)n;
+    }
+  }
+  out[used] = '\0';
+  close(pipefd[0]);
+  int status = 0;
+  if (waitpid(pid, &status, 0) < 0)
+    return -1;
+  int rc = WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+  if (rc != 0) {
+    char diag[640];
+    snprintf(diag, sizeof(diag), "M25-DEBUG: %s rc=%d out=[%.400s]\n", what, rc, out);
+    marker(diag);
+  }
+  return rc;
 }
 
 static void dump_elf(const char *path) {
@@ -147,14 +216,14 @@ static void dump_elf(const char *path) {
 int main(void) {
   marker("M25-SMOKE: start\n");
 
-  // 1. Check if TCC is present
-  int tcc_fd = open("/bin/tcc", O_RDONLY);
-  if (tcc_fd < 0) {
-    marker("M25-SMOKE: fail tcc-launch\n");
+  // 1. Check that the native compiler is present
+  int cc_fd = open(B1CC_PATH, O_RDONLY);
+  if (cc_fd < 0) {
+    marker("M25-SMOKE: fail cc-launch\n");
     return 1;
   }
-  close(tcc_fd);
-  marker("M25-SMOKE: ok tcc-launch\n");
+  close(cc_fd);
+  marker("M25-SMOKE: ok cc-launch\n");
 
   // 2. Write a small hello.c
   int hello_fd = open("/tmp/hello.c", O_CREAT | O_WRONLY | O_TRUNC, 0666);
@@ -165,15 +234,15 @@ int main(void) {
   const char *hello_src =
       "#include <stdio.h>\n"
       "int main(void) {\n"
-      "  printf(\"M25-HELLO: hello from native tcc\\n\");\n"
+      "  printf(\"M25-HELLO: hello from native b1cc\\n\");\n"
       "  return 0;\n"
       "}\n";
   write(hello_fd, hello_src, strlen(hello_src));
   close(hello_fd);
 
   // 3. Compile hello.c using /bin/tcc
-  char *tcc_hello_argv[] = {"tcc", "/tmp/hello.c", "-o", "/tmp/hello", NULL};
-  int compile_rc = run_cmd("/bin/tcc", tcc_hello_argv);
+  char *tcc_hello_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/hello.c", "-o", "/tmp/hello", NULL};
+  int compile_rc = compile_with_diag(tcc_hello_argv, "compile-hello");
   if (compile_rc != 0) {
     char errbuf[64];
     snprintf(errbuf, sizeof(errbuf), "M25-SMOKE: fail compile-hello (rc=%d)\n", compile_rc);
@@ -219,8 +288,8 @@ int main(void) {
   close(echo_fd);
 
   // Compile mini-echo
-  char *tcc_echo_argv[] = {"tcc", "/tmp/mini-echo.c", "-o", "/tmp/mini-echo", NULL};
-  int compile_echo_rc = run_cmd("/bin/tcc", tcc_echo_argv);
+  char *tcc_echo_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/mini-echo.c", "-o", "/tmp/mini-echo", NULL};
+  int compile_echo_rc = compile_with_diag(tcc_echo_argv, "compile-utility");
   if (compile_echo_rc != 0) {
     marker("M25-SMOKE: fail compile-utility\n");
     return 1;
@@ -276,9 +345,9 @@ int main(void) {
   write(argv_fd, argv_src, strlen(argv_src));
   close(argv_fd);
 
-  char *tcc_argv_check_argv[] = {"tcc", "/tmp/argv-check.c", "-o",
+  char *tcc_argv_check_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/argv-check.c", "-o",
                                  "/tmp/argv-check", NULL};
-  if (run_cmd("/bin/tcc", tcc_argv_check_argv) != 0) {
+  if (compile_with_diag(tcc_argv_check_argv, "compile-argv-check") != 0) {
     marker("M25-SMOKE: fail compile-argv-check\n");
     return 1;
   }
@@ -315,15 +384,15 @@ int main(void) {
   const char *stderr_src =
       "#include <stdio.h>\n"
       "int main(void) {\n"
-      "  fprintf(stderr, \"M25-STDERR: native tcc stderr path\\n\");\n"
+      "  fprintf(stderr, \"M25-STDERR: native b1cc stderr path\\n\");\n"
       "  return 0;\n"
       "}\n";
   write(stderr_fd, stderr_src, strlen(stderr_src));
   close(stderr_fd);
 
-  char *tcc_stderr_argv[] = {"tcc", "/tmp/stderr-check.c", "-o",
+  char *tcc_stderr_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/stderr-check.c", "-o",
                              "/tmp/stderr-check", NULL};
-  if (run_cmd("/bin/tcc", tcc_stderr_argv) != 0) {
+  if (compile_with_diag(tcc_stderr_argv, "compile-stderr-check") != 0) {
     marker("M25-SMOKE: fail compile-stderr-check\n");
     return 1;
   }
@@ -347,7 +416,7 @@ int main(void) {
     return 1;
   }
   stderr_outbuf[stderr_out_n] = '\0';
-  if (strcmp(stderr_outbuf, "M25-STDERR: native tcc stderr path\n") != 0) {
+  if (strcmp(stderr_outbuf, "M25-STDERR: native b1cc stderr path\n") != 0) {
     marker("M25-SMOKE: fail verify-stderr-check\n");
     return 1;
   }
@@ -366,8 +435,8 @@ int main(void) {
   write(exit_fd, exit_src, strlen(exit_src));
   close(exit_fd);
 
-  char *tcc_exit_argv[] = {"tcc", "/tmp/exit37.c", "-o", "/tmp/exit37", NULL};
-  if (run_cmd("/bin/tcc", tcc_exit_argv) != 0) {
+  char *tcc_exit_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/exit37.c", "-o", "/tmp/exit37", NULL};
+  if (compile_with_diag(tcc_exit_argv, "compile-exit-check") != 0) {
     marker("M25-SMOKE: fail compile-exit-check\n");
     return 1;
   }
@@ -422,13 +491,19 @@ int main(void) {
   write(float_fd, float_src, strlen(float_src));
   close(float_fd);
 
-  char *tcc_float_argv[] = {"tcc", "/tmp/float-check.c", "-o", "/tmp/float-check", NULL};
-  if (run_cmd("/bin/tcc", tcc_float_argv) != 0) {
+  char *tcc_float_argv[] = {"b1cc", (char *)B1CC_TARGET, (char *)B1CC_PIC, (char *)B1CC_PIE, "/tmp/float-check.c", "-o", "/tmp/float-check", NULL};
+  if (compile_with_diag(tcc_float_argv, "compile-float-check") != 0) {
     marker("M25-SMOKE: fail compile-float-check\n");
     return 1;
   }
   char *float_argv[] = {"float-check", NULL};
-  if (run_cmd("/tmp/float-check", float_argv) != 0) {
+  int float_rc = run_cmd("/tmp/float-check", float_argv);
+  if (float_rc != 0) {
+    /* The program returns a distinct code per assertion (1..14), so the exit
+     * status says which one gave way rather than just that something did. */
+    char fbuf[80];
+    snprintf(fbuf, sizeof(fbuf), "M25-DEBUG: float-check failed assertion rc=%d\n", float_rc);
+    marker(fbuf);
     marker("M25-SMOKE: fail run-float-check\n");
     return 1;
   }

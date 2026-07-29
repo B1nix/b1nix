@@ -1069,7 +1069,7 @@ if [ "$ARCH" = "x86_64" ]; then
 	check_output "$LOG" "M67-RUST: done" "M67 Rust smoke completes"
 fi
 
-# ── M25 Native Toolchain ──
+# ── M25 Native C compiler (b1cc) ──
 section "M94 Linux ABI conformance (through musl)"
 # Each of these reached the kernel as "unmapped syscall -> -ENOSYS" before the
 # translation table gained them, so a regression shows up here rather than as a
@@ -1092,17 +1092,17 @@ check_output "$LOG" "MUSL-POSIX: done" "the musl POSIX smoke completes"
 check_output "$LOG" "M40-LINUX: hello from a static linux x86_64 binary" "a stock Linux ET_EXEC runs at its own load base (0x200000), not at a b1nix-fixed address"
 check_output "$LOG" "PIE base=" "musl PIE images are placed by the loader, not by a fixed link address"
 
-section "M25 Native C Toolchain"
+section "M25 Native C compiler (b1cc)"
 check_output "$LOG" "M25-SMOKE: start" "M25 smoke starts"
-check_output "$LOG" "M25-SMOKE: ok tcc-launch" "tcc launches"
-check_output "$LOG" "M25-SMOKE: ok compile-hello" "tcc compiles hello.c"
+check_output "$LOG" "M25-SMOKE: ok cc-launch" "the native C compiler /bin/b1cc is present"
+check_output "$LOG" "M25-SMOKE: ok compile-hello" "b1cc compiles hello.c on the target"
 check_output "$LOG" "M25-SMOKE: ok run-hello" "compiled hello program runs"
-check_output "$LOG" "M25-HELLO: hello from native tcc" "hello program outputs correct greeting"
-check_output "$LOG" "M25-SMOKE: ok compile-utility" "tcc compiles and runs mini-echo utility"
+check_output "$LOG" "M25-HELLO: hello from native b1cc" "hello program outputs correct greeting"
+check_output "$LOG" "M25-SMOKE: ok compile-utility" "b1cc compiles and runs a mini-echo utility"
 check_output "$LOG" "M25-SMOKE: ok argv-check" "compiled program receives argc/argv"
 check_output "$LOG" "M25-SMOKE: ok stderr-check" "compiled program stderr path works"
 check_output "$LOG" "M25-SMOKE: ok exit-check" "compiled program non-zero exit status propagates"
-check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program float/double parsing works"
+check_output "$LOG" "M25-SMOKE: ok float-check" "compiled program does real double arithmetic (SSE/x87 encodings)"
 check_output "$LOG" "M25-FLOAT: all float tests passed" "float program outputs correct results"
 check_output "$LOG" "M25-SMOKE: ok scanf" "libc scanf/sscanf format parsing works"
 check_output "$LOG" "M25-SMOKE: ok frexp" "libc frexp decomposes correctly"
