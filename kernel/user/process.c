@@ -719,17 +719,33 @@ static int user_load_elf64(struct user_loaded_image *image, const char *path) {
 #endif
   /* phentsize must match so phdr-table reads and `&phdrs[i]` indexing are
    * well-formed; e_phnum must be non-zero for an executable. */
-  if (ehdr->e_phentsize != sizeof(struct elf64_phdr) || ehdr->e_phnum == 0)
+  if (ehdr->e_phentsize != sizeof(struct elf64_phdr) || ehdr->e_phnum == 0) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "ELF load: bad phdr table (phentsize %u, phnum %u) in %s\n",
+             (unsigned)ehdr->e_phentsize, (unsigned)ehdr->e_phnum, path);
+    console_write(line);
     goto cleanup;
+  }
 
   /* Read the program-header table. A file truncated before the declared table
    * makes user_read_at fail here — this replaces the old file_size bound. */
   phdrs = kmalloc((usize)ehdr->e_phnum * sizeof(struct elf64_phdr));
-  if (!phdrs)
+  if (!phdrs) {
+    console_write("ELF load: out of memory for the phdr table: ");
+    console_write(path);
+    console_write("\n");
     goto cleanup;
+  }
   if (user_read_at(fd, ehdr->e_phoff, phdrs,
-                   (usize)ehdr->e_phnum * sizeof(struct elf64_phdr)) != 0)
+                   (usize)ehdr->e_phnum * sizeof(struct elf64_phdr)) != 0) {
+    char line[160];
+    snprintf(line, sizeof(line),
+             "ELF load: cannot read %u phdrs at offset %lu in %s\n",
+             (unsigned)ehdr->e_phnum, (unsigned long)ehdr->e_phoff, path);
+    console_write(line);
     goto cleanup;
+  }
 
   image->kind = USER_IMAGE_ELF64;
   image->path = kernel_strdup(path);
