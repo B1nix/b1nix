@@ -88,8 +88,8 @@ static void page_cache_process_deferred_free(void) {
  * inode slab pool reuses addresses, and pointer-keyed entries of a destroyed
  * inode would collide with a later inode landing at the same address (observed:
  * ld.so mapping libOSMesa got another file's cached page for offset 0). */
-static u32 pc_hash(u64 ino, u64 offset) {
-  u64 val = ino ^ (offset >> 12);
+static u32 pc_hash(struct vfs_inode *inode, u64 offset) {
+  u64 val = (u64)(usize)inode ^ (offset >> 12);
   val ^= val >> 16;
   return (u32)(val % PC_HASH_SIZE);
 }
@@ -156,12 +156,12 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
   if (to_free_list) {
     page_cache_process_deferred_free();
   }
-  u32 h = pc_hash(inode->ino, offset);
+  u32 h = pc_hash(inode, offset);
 
   lock_pc();
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
-    if (curr->key_ino == inode->ino && curr->offset == offset) {
+    if (curr->inode == inode && curr->offset == offset) {
       curr->refcount++;
       /* A second reference (a re-fault, or another process sharing this file
        * page) promotes the page to the active working set; a page already
@@ -220,7 +220,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
     }
   }
 
-  u32 h = pc_hash(inode->ino, offset);
+  u32 h = pc_hash(inode, offset);
 
   struct page_cache_entry *new_entry = kmalloc(sizeof(struct page_cache_entry));
   if (!new_entry) return -ENOMEM;
@@ -236,7 +236,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
   // Check if it was added concurrently
   struct page_cache_entry *curr = hash_table[h];
   while (curr) {
-    if (curr->key_ino == inode->ino && curr->offset == offset) {
+    if (curr->inode == inode && curr->offset == offset) {
       unlock_pc();
       kfree(new_entry);
       return -EEXIST;
@@ -244,6 +244,7 @@ int page_cache_add_page(struct vfs_inode *inode, u64 offset, u64 frame) {
     curr = curr->hash_next;
   }
   
+  pmm_ref_frame(new_entry->frame);
   new_entry->hash_next = hash_table[h];
   hash_table[h] = new_entry;
 
@@ -335,8 +336,8 @@ void page_cache_invalidate_inode(struct vfs_inode *inode) {
     struct page_cache_entry *curr = heads[li];
     while (curr) {
       struct page_cache_entry *next = curr->lru_next;
-      if (curr->key_ino == inode->ino) {
-        u32 h = pc_hash(curr->key_ino, curr->offset);
+      if (curr->inode == inode) {
+        u32 h = pc_hash(curr->inode, curr->offset);
         struct page_cache_entry **prev = &hash_table[h];
         struct page_cache_entry *hcurr = *prev;
         while (hcurr) {
@@ -390,14 +391,14 @@ void page_cache_truncate_inode(struct vfs_inode *inode, u64 new_size) {
    struct page_cache_entry *curr = heads[li];
    while (curr) {
     struct page_cache_entry *next = curr->lru_next;
-    if (curr->key_ino == inode->ino && curr->offset + PAGE_SIZE > new_size) {
+    if (curr->inode == inode && curr->offset + PAGE_SIZE > new_size) {
       void *virt = (void *)(usize)(curr->frame + vmm_direct_map_base());
       if (curr->offset >= new_size) {
         /* Page lies fully beyond the new EOF. Drop it so a later re-grow
          * reads zeros instead of resurrecting pre-truncate contents. If a
          * reader still holds a reference, neutralize in place instead. */
         if (curr->refcount == 0) {
-          u32 h = pc_hash(curr->key_ino, curr->offset);
+          u32 h = pc_hash(curr->inode, curr->offset);
           struct page_cache_entry **prev = &hash_table[h];
           struct page_cache_entry *hcurr = *prev;
           while (hcurr) {
@@ -479,7 +480,7 @@ usize page_cache_evict_clean(usize target_pages) {
         break;
       continue;
     }
-    u32 h = pc_hash(victim->key_ino, victim->offset);
+    u32 h = pc_hash(victim->inode, victim->offset);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
@@ -558,7 +559,7 @@ usize page_cache_evict(usize target_pages) {
 
     /* Evict the clean victim: unlink from the hash chain + LRU, free its frame,
      * and defer the entry's kfree. */
-    u32 h = pc_hash(victim->key_ino, victim->offset);
+    u32 h = pc_hash(victim->inode, victim->offset);
     struct page_cache_entry **prev = &hash_table[h];
     struct page_cache_entry *hcurr = *prev;
     while (hcurr) {
