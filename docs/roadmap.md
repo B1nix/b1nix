@@ -395,8 +395,6 @@ Status:
 - [x] Fix AHCI page-crossing DMA, ext2 xattr parsing, and exFAT filename case.
 - [x] Add read-only NTFS driver with resident/non-resident data and indexes.
 - [x] Creation at runtime mountpoints supported and verified.
-- [ ] `planned` Add exFAT and NTFS write support.
-- [ ] `planned` Populate large filesystem directory trees lazily.
 
 ## M44: BusyBox 1.38.0
 
@@ -406,12 +404,7 @@ Status:
 - [x] Promote remaining utilities and retire duplicate native implementations.
 - [x] Retire in-kernel shell and utility table.
 
-## M45: GNU bash
-
-- [x] Cross-build upstream GNU bash 5.2.37 and embed as `/bin/bash`.
-- [x] Make bash login shell everywhere (console terminal and SSH sessions).
-- [x] Add required libc surface (`sigsetjmp`, `getgrent`, `setlinebuf`, `ffs`).
-- [x] Add UTF-8 wide-character libc module (`wchar.c`) for `HANDLE_MULTIBYTE`.
+## M45: GNU bash - Retired 
 
 ## M46: VFS Integrity and POSIX Process Conformance
 
@@ -601,7 +594,7 @@ Status:
 
 - [x] `sendfile`, `copy_file_range`, `splice`, `fallocate`, and `statx` syscalls.
 - [x] `inotify` file monitoring (`inotify_init1`, `add_watch`, `rm_watch`).
-- [ ] `deferred` `io_uring`, `ptrace`, and `clone3`.
+- [x] `ptrace` implemented in `kernel/sched/ptrace.c`; `io_uring` and `clone3` deferred.
 
 ## M74: Real-Time Signals
 
@@ -617,7 +610,7 @@ Status:
 
 ## M76: USB Host Stack
 
-- [ ] `planned` General xHCI controller driver, USB core enumeration, and Mass Storage class driver.
+- [x] General xHCI controller driver, USB core enumeration, and Mass Storage class driver.
 
 ## M77: Raise Global Resource Caps
 
@@ -629,7 +622,8 @@ Status:
 
 ## M80: Kernel ptrace + Crash Capture
 
-- [ ] `planned` Implement `ptrace(2)`, `/proc/<pid>/task`, and register/memory reading for crashpad.
+- [x] Implement `ptrace(2)` and register/memory reading (`PTRACE_PEEKTEXT`, `PTRACE_GETREGS`, etc.).
+- [ ] `planned` `/proc/<pid>/task` and crashpad integration.
 
 ## M81: Chromium GPU Acceleration
 
@@ -641,7 +635,7 @@ Status:
 
 ## M83: Unicode-aware ctype / wctype
 
-- [ ] `planned` Replace ASCII-only classification in `wctype.c` with Unicode property/case tables.
+- [x] Unicode property/case tables provided natively via musl libc port (M92).
 
 ## M84: Real IP routing + TCP robustness
 
@@ -658,7 +652,7 @@ Status:
 ## M88: Kernel correctness fixes (ext4 indirect-block, PROT_NONE guard)
 
 - [x] Enforce `sys_mmap(PROT_NONE)` guard pages in page-fault handler.
-- [ ] `deferred` Ext4 indirect-block traversal for block-mapped inodes.
+- [x] Ext4 single and double-indirect block traversal and allocation for block-mapped inodes in `kernel/fs/ext2.c`.
 
 ## M89: Migrate the C++ standard library to LLVM libc++ (shared)
 
