@@ -1511,7 +1511,7 @@ static isize sys_sigtimedwait_kernel(u64 set, const struct timespec *user_ts) {
         __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE);
     u64 wanted = pending & set;
     if (wanted) {
-      for (int sig = 1; sig <= NSIG; sig++) {
+      for (int sig = 1; sig < NSIG; sig++) {
         if (!(wanted & (1ULL << (sig - 1))))
           continue;
         __atomic_fetch_and(&current_task->pending_signals,
@@ -1557,7 +1557,7 @@ static u64 sigsuspend_with_mask(u64 mask) {
   while (1) {
     u64 pending = __atomic_load_n(&current_task->pending_signals, __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
     int has_deliverable = 0;
-    for (int i = 1; i <= NSIG; i++) {
+    for (int i = 1; i < NSIG; i++) {
       if (pending & (1ULL << (i - 1))) {
         sighandler_t handler = current_task->sigactions[i - 1].sa_handler;
         if (handler == SIG_IGN || (handler == SIG_DFL && (i == SIGCHLD || i == SIGURG || i == SIGWINCH || (i == SIGCONT && current_task->state != TASK_STOPPED)))) {

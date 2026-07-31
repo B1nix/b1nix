@@ -216,7 +216,7 @@ void arch_check_and_deliver_signals(struct interrupt_frame *frame) {
       klog_debug_category("signal", sigbuf);
     }
 
-    for (int i = 1; i <= NSIG; i++) {
+    for (int i = 1; i < NSIG; i++) {
         if (pending & (1ULL << (i - 1))) {
             /* ptrace(2): a traced task stops here instead of acting on the
              * signal, and its tracer decides whether the signal is delivered,

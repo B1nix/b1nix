@@ -471,88 +471,51 @@ static void lx_field_copy(char dst[65], const char *src) {
 		dst[i] = '\0';
 }
 
-/* Linux x86_64 signal number -> b1nix signal number (b1nix uses a different
- * numbering, e.g. Linux SIGUSR1=10 but b1nix=19). Indexed by Linux signo; 0
- * means "no b1nix equivalent" (e.g. Linux SIGSTKFLT=16). Built by name. */
-static const u8 lx_signo_to_b1nix_tbl[32] = {
-	[1] = 7,   /* SIGHUP   */ [2] = 9,   /* SIGINT  */
-	[3] = 12,  /* SIGQUIT  */ [4] = 8,   /* SIGILL  */
-	[5] = 22,  /* SIGTRAP  */ [6] = 1,   /* SIGABRT */
-	[7] = 3,   /* SIGBUS   */ [8] = 6,   /* SIGFPE  */
-	[9] = 10,  /* SIGKILL  */ [10] = 19, /* SIGUSR1 */
-	[11] = 13, /* SIGSEGV  */ [12] = 20, /* SIGUSR2 */
-	[13] = 11, /* SIGPIPE  */ [14] = 2,  /* SIGALRM */
-	[15] = 15, /* SIGTERM  */ [16] = 0,  /* SIGSTKFLT (none) */
-	[17] = 4,  /* SIGCHLD  */ [18] = 5,  /* SIGCONT */
-	[19] = 14, /* SIGSTOP  */ [20] = 16, /* SIGTSTP */
-	[21] = 17, /* SIGTTIN  */ [22] = 18, /* SIGTTOU */
-	[23] = 23, /* SIGURG   */ [24] = 24, /* SIGXCPU */
-	[25] = 25, /* SIGXFSZ  */ [26] = 26, /* SIGVTALRM */
-	[27] = 27, /* SIGPROF  */ [28] = 28, /* SIGWINCH */
-	[29] = 29, /* SIGIO    */ [30] = 30, /* SIGPWR  */
-	[31] = 21, /* SIGSYS   */
-};
+/* Signal numbers: b1nix now uses the Linux x86_64 standard numbering
+ * (SIGHUP=1 .. SIGSYS=31), so standard signals are an identity map.
+ * SIGSTKFLT=16 exists in Linux but has no b1nix fault source; it is
+ * accepted and treated as SIG_DFL (ignore) by the scheduler.
+ * RT signals keep the offset: Linux 34..64 <-> b1nix 32..62. */
 
 int linux_signo_to_b1nix(int lx) {
+	/* Standard signals 1..31: identity (b1nix == Linux now). */
 	if (lx >= 1 && lx <= 31)
-		return lx_signo_to_b1nix_tbl[lx];
-	/* Linux RT signals: __SIGRTMIN=34 .. 64  →  b1nix 32 .. 62.
-	 * The offset is -2 (Linux reserves 32,33 for SIGCANCEL/SIGSETXID
-	 * internally but those are Linux RT signals, not standard signals). */
+		return lx;
+	/* Linux RT signals: __SIGRTMIN=34 .. 64  ->  b1nix 32 .. 62.
+	 * Linux reserves 32,33 for internal SIGCANCEL/SIGSETXID. */
 	if (lx >= 34 && lx <= 64)
 		return lx - 2;
 	return 0;
 }
 
 int b1nix_signo_to_linux(int b) {
-	for (int lx = 1; lx <= 31; lx++)
-		if (lx_signo_to_b1nix_tbl[lx] == b)
-			return lx;
-	/* Reverse-map RT signals: b1nix 32..62  →  Linux 34..64 */
+	/* Standard signals 1..31: identity. */
+	if (b >= 1 && b <= 31)
+		return b;
+	/* Reverse-map RT signals: b1nix 32..62  ->  Linux 34..64 */
 	if (b >= 32 && b <= 62)
 		return b + 2;
 	return 0;
 }
 
-/* Remap a sigset_t: bit (signo-1) is set for signo, and the signo numbering
- * differs between Linux and b1nix, so the bit positions must be translated. */
+/* sigset_t translation: standard signals 1..31 are now an identity map
+ * (same bit positions in both Linux and b1nix).  Only the RT-signal bits
+ * need the -2 offset adjustment (Linux 34..63 -> b1nix 32..61). */
 u64 linux_sigset_to_b1nix(u64 lx) {
-	u64 b = 0;
-	/* Standard signals 1..31 */
-	for (int l = 1; l <= 31; l++) {
-		if (lx & (1ULL << (l - 1))) {
-			int bs = linux_signo_to_b1nix(l);
-			if (bs)
-				b |= (1ULL << (bs - 1));
-		}
-	}
-	/* RT signals: Linux 34..63  →  b1nix 32..61 */
-	for (int l = 34; l <= 63; l++) {
-		if (lx & (1ULL << (l - 1))) {
-			int bs = l - 2;
-			b |= (1ULL << (bs - 1));
-		}
-	}
+	/* Standard signals 1..31: bits 0..30 are identical. */
+	u64 b = lx & 0x7fffffffULL;
+	/* RT signals: Linux bits 33..62 (signals 34..63) -> b1nix bits 31..60 */
+	u64 rt = (lx >> 33) & 0x3fffffffULL;
+	b |= rt << 31;
 	return b;
 }
 
 u64 b1nix_sigset_to_linux(u64 b) {
-	u64 lx = 0;
-	/* Standard signals 1..31 */
-	for (int bs = 1; bs <= 31; bs++) {
-		if (b & (1ULL << (bs - 1))) {
-			int l = b1nix_signo_to_linux(bs);
-			if (l)
-				lx |= (1ULL << (l - 1));
-		}
-	}
-	/* RT signals: b1nix 32..62  →  Linux 34..64 */
-	for (int bs = 32; bs <= 62; bs++) {
-		if (b & (1ULL << (bs - 1))) {
-			int l = bs + 2;
-			lx |= (1ULL << (l - 1));
-		}
-	}
+	/* Standard signals 1..31: bits 0..30 are identical. */
+	u64 lx = b & 0x7fffffffULL;
+	/* RT signals: b1nix bits 31..60 (signals 32..61) -> Linux bits 33..62 */
+	u64 rt = (b >> 31) & 0x3fffffffULL;
+	lx |= rt << 33;
 	return lx;
 }
 

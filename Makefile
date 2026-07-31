@@ -98,7 +98,6 @@ APPLET_SYMLINKS_INC := $(INC_DIR)/initramfs_applet_symlinks.inc
 APPLET_REGISTRATION_INC := $(INC_DIR)/initramfs_applet_registration.inc
 
 EMBEDDED_USER_PROGRAMS := \
-	init \
 	hello \
 	m8_aio_test \
 	m12_smoke \
@@ -269,7 +268,6 @@ endif
 # Bootstrap initramfs: init, sh, and essential boot loader binaries
 # are embedded; all other apps, libraries, and tests live on the ext4 rootfs.
 INITRAMFS_INCS := \
-	$(INC_DIR)/initramfs_init.inc \
 	$(INITRAMFS_NATIVE_SMOKE_INC) \
 	$(INITRAMFS_LD_MUSL_INC)
 GENERATED_INCS := $(AP_TRAMPOLINE_INC) $(INITRAMFS_INCS) $(APPLET_SYMLINKS_INC) $(APPLET_REGISTRATION_INC)

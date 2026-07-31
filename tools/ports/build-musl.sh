@@ -153,7 +153,7 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
   echo "build-musl.sh: configuring musl" >&2
   (
     cd "$SRC_DIR"
-    CC="$MUSL_CC --target=$B1NIX_TRIPLET $MUSL_BASE_CFLAGS" \
+    CC="$MUSL_CC --target=x86_64-unknown-linux-gnu $MUSL_BASE_CFLAGS" \
     AR="$MUSL_AR" \
     RANLIB="${RANLIB:-$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)}" \
     CFLAGS="$MUSL_BASE_CFLAGS" \
@@ -176,19 +176,20 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
 
   # --- post-configure fixups for freestanding LLVM cross-toolchain ---
   if [ -f "$SRC_DIR/config.mak" ]; then
+    sed -i.bak "s|^CC = .*|CC = $MUSL_CC --target=x86_64-unknown-linux-gnu|" "$SRC_DIR/config.mak"
     # 1. musl's configure detects -lgcc/-lgcc_eh via the host compiler and adds
     #    them to LIBCC. We don't have libgcc — replace with compiler-rt builtins
     #    which provides __mulxc3/__muldc3/__mulsc3 (complex math helpers musl needs).
     CRT_BUILTINS=$(ls /usr/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a 2>/dev/null | tail -1)
     if [ -n "$CRT_BUILTINS" ]; then
-      sed -i "s|^LIBCC = .*|LIBCC = $CRT_BUILTINS|" "$SRC_DIR/config.mak"
+      sed -i.bak "s|^LIBCC = .*|LIBCC = $CRT_BUILTINS|" "$SRC_DIR/config.mak"
     else
-      sed -i 's/^LIBCC = .*/LIBCC =/' "$SRC_DIR/config.mak"
+      sed -i.bak 's/^LIBCC = .*/LIBCC =/' "$SRC_DIR/config.mak"
     fi
 
     # 2. -Wa,--noexecstack is a GNU assembler flag; clang's integrated assembler
     #    rejects it. Remove from CFLAGS_C99FSE.
-    sed -i 's/-Wa,--noexecstack//' "$SRC_DIR/config.mak"
+    sed -i.bak 's/-Wa,--noexecstack//' "$SRC_DIR/config.mak"
 
     # 3. Force clang to use lld as the linker driver.
     #    musl Makefile: $(CC) $(CFLAGS_ALL) $(LDFLAGS_ALL) -nostdlib -shared ...
@@ -197,9 +198,10 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     #    Also set a DT_SONAME on libc.so: without it, consumers (libc++abi.so.1,
     #    libc++.so.1) linked with `-l:libc.so` record the *absolute* install path
     #    as their DT_NEEDED, which breaks load-time resolution under b1nix's
-    #    musl ld.so (it tries the host path verbatim → ENOENT). A soname makes
+    #    musl ld.so (it tries the host path verbatim -> ENOENT). A soname makes
     #    lld emit the bare basename instead.
-    sed -i 's/^LDFLAGS_AUTO = /LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=lld -Wl,-soname,libc.so /' "$SRC_DIR/config.mak"
+    LLD_PATH="$(command -v ld.lld || echo /opt/homebrew/bin/ld.lld)"
+    sed -i.bak "s|^LDFLAGS_AUTO = |LDFLAGS_AUTO = -Wl,-z,now -fuse-ld=$LLD_PATH -Wl,-soname,libc.so |" "$SRC_DIR/config.mak"
 
     echo "build-musl.sh: patched config.mak (LIBCC cleared, noexecstack removed, lld linker, eager PLT, libc.so soname)" >&2
   fi

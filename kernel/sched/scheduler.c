@@ -3366,7 +3366,7 @@ static int wait_interrupted_by_signal(void) {
                                 __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
   if (pending == 0)
     return 0;
-  for (int sig = 1; sig <= NSIG; sig++) {
+  for (int sig = 1; sig < NSIG; sig++) {
     if (sig == SIGCHLD)
       continue;
     if (!(pending & (1ULL << (sig - 1))))
@@ -5250,7 +5250,7 @@ int scheduler_signal_pending(void) {
                                 __ATOMIC_ACQUIRE) & ~current_task->blocked_signals;
   if (pending == 0)
     return 0;
-  for (int i = 1; i <= NSIG; i++) {
+  for (int i = 1; i < NSIG; i++) {
     if (!(pending & (1ULL << (i - 1))))
       continue;
     sighandler_t h = current_task->sigactions[i - 1].sa_handler;

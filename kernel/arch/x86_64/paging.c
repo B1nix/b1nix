@@ -143,6 +143,29 @@ static u64 *alloc_page_table(void) {
   return table;
 }
 
+static u64 *split_huge_page(u64 *pd, usize index) {
+  u64 entry = pd[index];
+  u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
+  u64 flags = entry & ~PAGE_ENTRY_ADDRESS_MASK;
+  flags &= ~HUGE_PAGE_FLAG;
+
+  /* The 2MB huge page entry in pd may have had VMM_USER set before split.
+   * Strip VMM_USER when creating the 512 4KB leaf PTEs so the 511 identity-mapped
+   * neighbor PTEs remain supervisor-only. The caller (vmm_map_page_locked /
+   * vmm_set_lazy) will explicitly add VMM_USER to the single leaf PTE it maps.
+   * This prevents free_table() during process teardown from treating identity-mapped
+   * physical memory frames as user allocations and wrongly freeing them to PMM. */
+  u64 leaf_flags = flags & ~VMM_USER;
+
+  u64 *pt = alloc_page_table();
+  for (usize i = 0; i < 512; i++) {
+    pt[i] = (base + i * PAGE_SIZE) | leaf_flags;
+  }
+
+  pd[index] = table_to_phys(pt) | flags;
+  return pt;
+}
+
 static u64 *ensure_child_table(u64 *parent, usize index) {
   if (!parent || (direct_map_ready && (u64)parent < DIRECT_MAP_BASE) || !is_canonical((u64)parent)) {
     console_write("ensure_child_table: INVALID parent: 0x");
@@ -168,6 +191,8 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
     u64 *child = alloc_page_table();
     parent[index] = table_to_phys(child) | VMM_PRESENT | VMM_WRITABLE;
     result = child;
+  } else if ((parent[index] & HUGE_PAGE_FLAG) != 0) {
+    result = split_huge_page(parent, index);
   } else {
     result = table_from_entry(parent[index]);
   }
@@ -184,21 +209,6 @@ static u64 *ensure_child_table(u64 *parent, usize index) {
     console_write("\n");
   }
   return result;
-}
-
-static u64 *split_huge_page(u64 *pd, usize index) {
-  u64 entry = pd[index];
-  u64 base = entry & PAGE_ENTRY_ADDRESS_MASK;
-  u64 flags = entry & ~PAGE_ENTRY_ADDRESS_MASK;
-  flags &= ~HUGE_PAGE_FLAG;
-
-  u64 *pt = alloc_page_table();
-  for (usize i = 0; i < 512; i++) {
-    pt[i] = (base + i * PAGE_SIZE) | flags;
-  }
-
-  pd[index] = table_to_phys(pt) | flags;
-  return pt;
 }
 
 void vmm_map_page_in_table(u64 *pml4, u64 virtual_address, u64 physical_address, u64 flags) {

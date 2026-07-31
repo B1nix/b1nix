@@ -1,0 +1,47 @@
+#!/usr/bin/env python3
+import sys, fcntl, subprocess
+
+args = sys.argv[1:]
+exclusive = True
+nonblocking = False
+fd_or_file = None
+cmd = []
+
+i = 0
+while i < len(args):
+    arg = args[i]
+    if arg in ('-x', '-e', '--exclusive'):
+        exclusive = True
+    elif arg in ('-s', '--shared'):
+        exclusive = False
+    elif arg in ('-n', '--nonblock', '--nb'):
+        nonblocking = True
+    elif arg in ('-u', '--unlock'):
+        pass
+    elif arg.startswith('-'):
+        pass
+    else:
+        if fd_or_file is None:
+            fd_or_file = arg
+        else:
+            cmd = args[i:]
+            break
+    i += 1
+
+if fd_or_file is None:
+    sys.exit(1)
+
+flags = fcntl.LOCK_EX if exclusive else fcntl.LOCK_SH
+if nonblocking:
+    flags |= fcntl.LOCK_NB
+
+try:
+    fd = int(fd_or_file)
+    fcntl.flock(fd, flags)
+except ValueError:
+    f = open(fd_or_file, 'a')
+    fcntl.flock(f.fileno(), flags)
+
+if cmd:
+    res = subprocess.run(cmd)
+    sys.exit(res.returncode)

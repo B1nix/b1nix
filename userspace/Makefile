@@ -489,7 +489,7 @@ $(BUILD)/bin/m49_libwayland_server: bin/m49_libwayland_server.c $(BESPOKE_LIBDEP
 $(BUILD)/bin/native_smoke: bin/native_smoke.S
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -c $< -o $(BUILD)/bin/native_smoke.o
-	$(LD) $(LDFLAGS) -T $(LINKER) -o $@ $(BUILD)/bin/native_smoke.o
+	$(LD) $(LDFLAGS) $(if $(LINKER),-T $(LINKER)) -o $@ $(BUILD)/bin/native_smoke.o
 
 # m32_nettool gains an mbedTLS loopback HTTPS server when the static mbedTLS
 # archives are present (built by tools/ports/build-curl.sh with B1NIX_TLS=mbedtls).
@@ -617,7 +617,7 @@ $(BUILD)/bin/m52_gl_smoke: bin/m52_gl_smoke.c $(GUI_LIB) $(BESPOKE_LIBDEP) \
 		$(TINYGL_DIR)/lib/libEGL.a
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) -I $(TINYGL_DIR)/include -c $< -o $(BUILD)/bin/m52_gl_smoke.o
-	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m52_gl_smoke.o \
+	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m52_gl_smoke.o \
 	  $(TINYGL_DIR)/lib/libEGL.a $(TINYGL_DIR)/lib/libTinyGL.a \
 	  $(LIBM_DIR)/lib/libm.a \
 	  --whole-archive $(GUI_LIB) --no-whole-archive $(BESPOKE_LIBC)
@@ -1040,5 +1040,6 @@ endif
 
 clean:
 	rm -rf $(BUILD)
+	-$(MAKE) -C $(B1CC_DIR) clean
 
 -include $(DEPS) $(GUI_OBJS:.o=.d)
