@@ -493,10 +493,11 @@ isize unix_recv_control(struct vfs_socket_state *s, void *buf, usize len,
           ctl = candidate;
       }
       for (usize i = 0; i < to_copy; i++) {
-        ((char *)buf)[i] = u->rb_buffer[u->rb_head];
-        if (!(flags & B1NIX_MSG_PEEK))
-          u->rb_head = (u->rb_head + 1) % UNIX_RB_SIZE;
+        usize idx = (u->rb_head + i) % UNIX_RB_SIZE;
+        ((char *)buf)[i] = u->rb_buffer[idx];
       }
+      if (!(flags & B1NIX_MSG_PEEK))
+        u->rb_head = (u->rb_head + to_copy) % UNIX_RB_SIZE;
       if (!(flags & B1NIX_MSG_PEEK)) {
         u->rb_count -= to_copy;
         u->read_seq += to_copy;

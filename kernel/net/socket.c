@@ -772,6 +772,8 @@ int vfs_socket(int domain, int type, int protocol) {
  * sockets tear down independently through socket_release -> unix_free_state,
  * so closing one wakes the other and releases any in-flight SCM_RIGHTS fds. */
 int vfs_socketpair(int domain, int type, int protocol, int sv[2]) {
+  int sock_flags = type & (SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
+  type &= ~(SOCK_TYPE_CLOEXEC | SOCK_TYPE_NONBLOCK);
   if (domain != B1NIX_AF_UNIX)
     return -EAFNOSUPPORT;
   if (type != B1NIX_SOCK_STREAM && type != B1NIX_SOCK_DGRAM)
@@ -804,10 +806,20 @@ int vfs_socketpair(int domain, int type, int protocol, int sv[2]) {
   vfs_socket_init_handle(hb, sb);
   sa = sb = 0; /* ownership transferred to the handles */
 
+  if (sock_flags & SOCK_TYPE_NONBLOCK) {
+    ha->flags |= B1NIX_O_NONBLOCK;
+    hb->flags |= B1NIX_O_NONBLOCK;
+  }
+
   fda = scheduler_fd_alloc(ha);
   if (fda < 0) goto fail;
   fdb = scheduler_fd_alloc(hb);
   if (fdb < 0) goto fail;
+
+  if (sock_flags & SOCK_TYPE_CLOEXEC) {
+    scheduler_fd_flags_set(fda, B1NIX_FD_CLOEXEC);
+    scheduler_fd_flags_set(fdb, B1NIX_FD_CLOEXEC);
+  }
 
   sv[0] = fda;
   sv[1] = fdb;

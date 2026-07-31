@@ -266,7 +266,7 @@ endif
 
 # /bin/js has a custom multi-source rule (duktape.c + js.c) — exclude it from
 # the generic single-source BIN_OBJS pattern.
-BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
+BIN_OBJS := $(patsubst $(BUILD)/bin/%,$(BUILD)/bin/%.o,$(filter-out $(BUILD)/bin/native_smoke $(BUILD)/bin/m30_pie $(BUILD)/bin/m30_dynamic $(BUILD)/bin/js $(BUILD)/bin/b1cc $(BUILD)/bin/b1cc_selfsmoke $(addprefix $(BUILD)/bin/,$(B1CC_BINS)) $(BUILD)/bin/mc $(BUILD)/bin/ne $(BUILD)/bin/m16_smoke $(BUILD)/bin/m57_smoke $(BUILD)/bin/m53_httpsd,$(BINARIES)))
 DEPS := $(BIN_OBJS:.o=.d)
 
 .PHONY: all clean install install-headers-libs
@@ -385,6 +385,23 @@ $(BUILD)/bin/m16_smoke: bin/m16_smoke.c $(BUILD)/src/tui_common.o $(GEN_LIBDEP) 
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/m16_smoke.c -o $(BUILD)/bin/m16_smoke.o
 	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m16_smoke.o $(BUILD)/src/tui_common.o $(GEN_LINK_LIBS)
+ifeq ($(GEN_MUSL_POSTLINK),1)
+	python3 -c "\
+import sys; f=sys.argv[1]; \
+d=open(f,'rb').read(); \
+d=d.replace(b'\x00ld-musl-x86_64.so.1\x00',b'\x00libc.so\x00'+b'\x00'*12); \
+open(f,'wb').write(d); \
+fh=open(f,'r+b'); fh.seek(7); fh.write(bytes([3])); fh.close()" $@ 2>/dev/null || true
+endif
+
+$(BUILD)/src/mojo_core.o: src/mojo_core.c include/mojo/mojo.h include/mojo.h
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c $< -o $@
+
+$(BUILD)/bin/m57_smoke: bin/m57_smoke.c $(BUILD)/src/mojo_core.o $(GEN_LIBDEP) $(GEN_CRT0)
+	@mkdir -p $(dir $@)
+	$(CC) $(CFLAGS) $(GEN_PIC) -c bin/m57_smoke.c -o $(BUILD)/bin/m57_smoke.o
+	$(LD) $(LDFLAGS) $(GEN_LINK_EXTRA) -o $@ $(GEN_CRT0) $(BUILD)/bin/m57_smoke.o $(BUILD)/src/mojo_core.o $(GEN_LINK_LIBS)
 ifeq ($(GEN_MUSL_POSTLINK),1)
 	python3 -c "\
 import sys; f=sys.argv[1]; \
@@ -982,7 +999,7 @@ endif
 	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
 	@chmod 4755 $(ROOTFS)/bin/su 2>/dev/null || true
 	@chmod 4755 $(ROOTFS)/bin/passwd 2>/dev/null || true
-	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke; do \
+	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke m57_smoke:m57-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done

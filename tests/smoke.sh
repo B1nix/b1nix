@@ -1717,6 +1717,10 @@ check_output "$LOG" "M57-SMOKE: ok exec-inherit" "non-CLOEXEC fd and dup2-stdio 
 check_output "$LOG" "M57-SMOKE: ok fd-broker" "socketpair + SCM_RIGHTS hands a live fd to a forked child"
 check_output "$LOG" "M57-SMOKE: ok fd-broker-death" "in-flight passed fd survives sender close and peer hangup is reported"
 check_output "$LOG" "M57-SMOKE: ok dupfd-cloexec" "F_DUPFD_CLOEXEC sets FD_CLOEXEC while F_DUPFD leaves it clear"
+check_output "$LOG" "M57-SMOKE: ok mojo-pipe" "Mojo message pipe write/read and handle passing work"
+check_output "$LOG" "M57-SMOKE: ok mojo-shm" "Mojo shared buffer create/duplicate/map/unmap over memfd work"
+check_output "$LOG" "M57-SMOKE: ok mojo-watcher" "Mojo watcher event loop integration over epoll works"
+check_output "$LOG" "M57-SMOKE: ok mojo-broker" "Mojo IPC brokering across process boundaries over SCM_RIGHTS works"
 check_output "$LOG" "M57-SMOKE: done" "M57 broker-primitive suite completes"
 # ── M73: modern I/O & introspection syscalls ──
 check_output "$LOG" "M73-SMOKE: ok statx" "statx returns size/mode/nlink/ino matching fstat (path + AT_EMPTY_PATH)"

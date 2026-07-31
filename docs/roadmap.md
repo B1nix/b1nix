@@ -507,7 +507,7 @@ Status:
 ## M57: Multiprocess Model
 
 - [x] COW fork/exec, FD inheritance, `SCM_RIGHTS` brokering, `socketpair`, and `F_DUPFD_CLOEXEC`.
-- [ ] `planned` Bring up a minimal Mojo core over M56 primitives.
+- [x] Bring up a minimal Mojo core over M56 primitives.
 
 ## M58: V8
 
@@ -548,7 +548,7 @@ Status:
 - [x] Classic seccomp-bpf syscall filtering with `PR_SET_NO_NEW_PRIVS`.
 - [ ] `deferred` User/PID/net namespaces and setuid-sandbox helper.
 
-## M64: Optional Clang/LLVM Toolchain — DONE
+## M64: Optional Clang/LLVM Toolchain
 
 - [x] Phase 1 — optional cross `clang++` frontend (`b1nix-clang++`).
 - [x] Phase 2 — V8 Clang build profiles (`b1nix-jit-clang` and `b1nix-jit-clang-libcxx`).
@@ -585,10 +585,9 @@ Status:
 
 - [x] PIE-by-default execution and opt-in kernel cmdline ASLR (`b1nix.aslr`) with 2 MiB random jitter.
 
-## M72: Writable Foreign Filesystems and msync
+## M72: msync
 
 - [x] `msync` syscall and durable MAP_SHARED page-cache dirtying across reclaim.
-- [ ] `deferred` Write support for NTFS / FAT32 / exFAT / Btrfs.
 
 ## M73: Modern I/O and Introspection Syscalls
 

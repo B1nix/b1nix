@@ -30,6 +30,8 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <mojo/mojo.h>
+
 static int g_fail;
 
 static void marker(const char *s) {
@@ -373,12 +375,268 @@ static void test_dupfd_cloexec(void) {
     fail("dupfd-cloexec", ok1 ? 0 : d1, ok2 ? 0 : d2);
 }
 
+/* ---- Mojo Core: Message Pipe write/read --------------------------------- */
+static void test_mojo_pipe(void) {
+  MojoHandle h0 = MOJO_HANDLE_INVALID, h1 = MOJO_HANDLE_INVALID;
+  if (MojoCreateMessagePipe(NULL, &h0, &h1) != MOJO_RESULT_OK) {
+    fail("mojo-pipe", 1, 0);
+    return;
+  }
+
+  const char *msg = "HELLO MOJO PIPE";
+  uint32_t len = strlen(msg) + 1;
+
+  if (MojoWriteMessage(h0, msg, len, NULL, 0, MOJO_WRITE_MESSAGE_FLAG_NONE) != MOJO_RESULT_OK) {
+    fail("mojo-pipe", 2, 0);
+    MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  char rx_buf[64] = {0};
+  uint32_t rx_len = sizeof(rx_buf);
+  uint32_t rx_handles_cnt = 0;
+
+  MojoResult rd_res = MOJO_RESULT_SHOULD_WAIT;
+  for (int i = 0; i < 50 && rd_res == MOJO_RESULT_SHOULD_WAIT; i++) {
+    rd_res = MojoReadMessage(h1, rx_buf, &rx_len, NULL, &rx_handles_cnt, MOJO_READ_MESSAGE_FLAG_NONE);
+    if (rd_res == MOJO_RESULT_SHOULD_WAIT) usleep(1000);
+  }
+
+  if (rd_res != MOJO_RESULT_OK) {
+    fail("mojo-pipe", rd_res, 0);
+    MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  if (strcmp(rx_buf, "HELLO MOJO PIPE") != 0 || rx_len != len) {
+    fail("mojo-pipe", 4, 0);
+    MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  MojoClose(h0);
+  MojoClose(h1);
+  ok("mojo-pipe");
+}
+
+/* ---- Mojo Core: Shared Buffer over memfd -------------------------------- */
+static void test_mojo_shm(void) {
+  MojoHandle shm_h = MOJO_HANDLE_INVALID;
+  if (MojoCreateSharedBuffer(4096, NULL, &shm_h) != MOJO_RESULT_OK) {
+    fail("mojo-shm", 1, 0);
+    return;
+  }
+
+  void *ptr1 = NULL;
+  if (MojoMapBuffer(shm_h, 0, 4096, NULL, &ptr1) != MOJO_RESULT_OK || !ptr1) {
+    fail("mojo-shm", 2, 0);
+    MojoClose(shm_h);
+    return;
+  }
+
+  strcpy((char *)ptr1, "MOJO SHM DATA 123");
+
+  MojoHandle dup_h = MOJO_HANDLE_INVALID;
+  if (MojoDuplicateBufferHandle(shm_h, NULL, &dup_h) != MOJO_RESULT_OK) {
+    fail("mojo-shm", 3, 0);
+    MojoUnmapBuffer(ptr1);
+    MojoClose(shm_h);
+    return;
+  }
+
+  void *ptr2 = NULL;
+  if (MojoMapBuffer(dup_h, 0, 4096, NULL, &ptr2) != MOJO_RESULT_OK || !ptr2) {
+    fail("mojo-shm", 4, 0);
+    MojoUnmapBuffer(ptr1);
+    MojoClose(shm_h); MojoClose(dup_h);
+    return;
+  }
+
+  int match = (strcmp((char *)ptr2, "MOJO SHM DATA 123") == 0);
+
+  MojoUnmapBuffer(ptr1);
+  MojoUnmapBuffer(ptr2);
+  MojoClose(shm_h);
+  MojoClose(dup_h);
+
+  if (match) {
+    ok("mojo-shm");
+  } else {
+    fail("mojo-shm", 5, 0);
+  }
+}
+
+/* ---- Mojo Core: Watcher over epoll -------------------------------------- */
+static void test_mojo_watcher(void) {
+  MojoHandle h0 = MOJO_HANDLE_INVALID, h1 = MOJO_HANDLE_INVALID;
+  if (MojoCreateMessagePipe(NULL, &h0, &h1) != MOJO_RESULT_OK) {
+    fail("mojo-watcher", 1, 0);
+    return;
+  }
+
+  MojoHandle watcher = MOJO_HANDLE_INVALID;
+  if (MojoCreateWatcher(NULL, NULL, &watcher) != MOJO_RESULT_OK) {
+    fail("mojo-watcher", 2, 0);
+    MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  uintptr_t ctx = 0x12345;
+  if (MojoWatch(watcher, h1, MOJO_HANDLE_SIGNAL_READABLE, ctx, NULL) != MOJO_RESULT_OK) {
+    fail("mojo-watcher", 3, 0);
+    MojoClose(watcher); MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  /* No message sent yet: watcher must return 0 ready contexts */
+  uint32_t num_ready = 4;
+  uintptr_t ready_ctxs[4];
+  MojoResult ready_res[4];
+  MojoHandleSignals ready_sigs[4];
+
+  if (MojoArmWatcher(watcher, &num_ready, ready_ctxs, ready_res, ready_sigs) != MOJO_RESULT_OK || num_ready != 0) {
+    fail("mojo-watcher", 4, (long)num_ready);
+    MojoClose(watcher); MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  /* Write a message to h0, making h1 readable */
+  const char *pkt = "PING";
+  MojoWriteMessage(h0, pkt, 4, NULL, 0, MOJO_WRITE_MESSAGE_FLAG_NONE);
+
+  num_ready = 4;
+  if (MojoArmWatcher(watcher, &num_ready, ready_ctxs, ready_res, ready_sigs) != MOJO_RESULT_OK || num_ready != 1) {
+    fail("mojo-watcher", 5, (long)num_ready);
+    MojoClose(watcher); MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  if (ready_ctxs[0] != ctx || !(ready_sigs[0] & MOJO_HANDLE_SIGNAL_READABLE)) {
+    fail("mojo-watcher", 6, 0);
+    MojoClose(watcher); MojoClose(h0); MojoClose(h1);
+    return;
+  }
+
+  MojoClose(watcher);
+  MojoClose(h0);
+  MojoClose(h1);
+  ok("mojo-watcher");
+}
+
+/* ---- Mojo Core: Multiprocess Brokering over UNIX Socket ------------------ */
+static void test_mojo_broker(void) {
+  int sv[2];
+  if (socketpair(AF_UNIX, SOCK_STREAM, 0, sv) < 0) {
+    fail("mojo-broker", 1, 0);
+    return;
+  }
+
+  /* Parent creates a Mojo message pipe (p0, p1) */
+  MojoHandle p0 = MOJO_HANDLE_INVALID, p1 = MOJO_HANDLE_INVALID;
+  if (MojoCreateMessagePipe(NULL, &p0, &p1) != MOJO_RESULT_OK) {
+    fail("mojo-broker", 2, 0);
+    close(sv[0]); close(sv[1]);
+    return;
+  }
+
+  pid_t pid = fork();
+  if (pid < 0) {
+    fail("mojo-broker", 3, 0);
+    close(sv[0]); close(sv[1]);
+    MojoClose(p0); MojoClose(p1);
+    return;
+  }
+
+  if (pid == 0) {
+    /* Child process */
+    close(sv[0]);
+    MojoClose(p0); /* Child only uses p1 sent over sv[1] */
+
+    int child_fd = recv_fd(sv[1]);
+    close(sv[1]);
+
+    if (child_fd < 0) _exit(1);
+
+    MojoHandle child_p1 = MOJO_HANDLE_INVALID;
+    if (MojoWrapPlatformHandle(child_fd, &child_p1) != MOJO_RESULT_OK) _exit(2);
+
+    /* Read message from parent */
+    char rx_buf[64] = {0};
+    uint32_t rx_len = sizeof(rx_buf);
+    MojoResult child_rd = MOJO_RESULT_SHOULD_WAIT;
+    for (int i = 0; i < 50 && child_rd == MOJO_RESULT_SHOULD_WAIT; i++) {
+      child_rd = MojoReadMessage(child_p1, rx_buf, &rx_len, NULL, NULL, MOJO_READ_MESSAGE_FLAG_NONE);
+      if (child_rd == MOJO_RESULT_SHOULD_WAIT) usleep(2000);
+    }
+    if (child_rd != MOJO_RESULT_OK) _exit(3);
+
+    if (strcmp(rx_buf, "MOJO PARENT REQ") != 0) _exit(4);
+
+    /* Send reply back to parent */
+    const char *reply = "MOJO CHILD RESP";
+    if (MojoWriteMessage(child_p1, reply, strlen(reply) + 1, NULL, 0, MOJO_WRITE_MESSAGE_FLAG_NONE) != MOJO_RESULT_OK) _exit(5);
+
+    MojoClose(child_p1);
+    _exit(0);
+  }
+
+  /* Parent process */
+  close(sv[1]);
+  int p1_fd = -1;
+  if (MojoUnwrapPlatformHandle(p1, &p1_fd) != MOJO_RESULT_OK) {
+    fail("mojo-broker", 4, 0);
+    close(sv[0]); MojoClose(p0);
+    return;
+  }
+
+  /* Send p1_fd to child over socketpair */
+  if (send_fd(sv[0], p1_fd) < 0) {
+    fail("mojo-broker", 5, 0);
+    close(p1_fd); close(sv[0]); MojoClose(p0);
+    return;
+  }
+  close(p1_fd);
+  close(sv[0]);
+
+  /* Write request message to child over Mojo p0 */
+  const char *req = "MOJO PARENT REQ";
+  if (MojoWriteMessage(p0, req, strlen(req) + 1, NULL, 0, MOJO_WRITE_MESSAGE_FLAG_NONE) != MOJO_RESULT_OK) {
+    fail("mojo-broker", 6, 0);
+    MojoClose(p0);
+    return;
+  }
+
+  /* Read reply message from child */
+  char reply_buf[64] = {0};
+  uint32_t reply_len = sizeof(reply_buf);
+
+  int read_ok = 0;
+  for (int i = 0; i < 50; i++) {
+    if (MojoReadMessage(p0, reply_buf, &reply_len, NULL, NULL, MOJO_READ_MESSAGE_FLAG_NONE) == MOJO_RESULT_OK) {
+      read_ok = 1;
+      break;
+    }
+    usleep(10000);
+  }
+
+  MojoClose(p0);
+
+  int status = 0;
+  waitpid(pid, &status, 0);
+
+  if (read_ok && strcmp(reply_buf, "MOJO CHILD RESP") == 0 && WIFEXITED(status) && WEXITSTATUS(status) == 0) {
+    ok("mojo-broker");
+  } else {
+    fail("mojo-broker", read_ok ? WEXITSTATUS(status) : -1, 0);
+  }
+}
+
 int main(int argc, char **argv) {
   if (argc >= 2 && argv[1] && strcmp(argv[1], "execchild") == 0)
     return exec_child_main(argc, argv);
 
   const char *self = (argc > 0 && argv[0] && argv[0][0] == '/') ? argv[0]
-                                                                : "/bin/m57-smoke";
+                                                                : "/bin/m57_smoke";
 
   test_fork_fdshare();
   test_cloexec_flag();
@@ -386,6 +644,11 @@ int main(int argc, char **argv) {
   test_fd_broker();
   test_fd_broker_death();
   test_dupfd_cloexec();
+
+  test_mojo_pipe();
+  test_mojo_shm();
+  test_mojo_watcher();
+  test_mojo_broker();
 
   unlink(SCRATCH);
 

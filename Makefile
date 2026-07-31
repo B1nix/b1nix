@@ -611,6 +611,7 @@ $(BUILD_DIR)/.userspace-headers-installed: \
 # libwebp, libvpx, all NetSurf platform libs, tinygl, libidn2).
 $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*.c) $(wildcard userspace/bin/*.S) \
+	$(wildcard userspace/src/*.c) \
 	$(wildcard userspace/b1cc/src/*.c) \
 	$(wildcard userspace/displayd/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
@@ -1477,7 +1478,7 @@ run-root: iso userspace-install root-image
 		-drive file=$(BUILD_DIR)/root.ext4,format=raw,if=virtio \
 		-netdev user,id=n0 -device virtio-net-pci,netdev=n0
 
-root-image: $(KERNEL_ELF) install-ports $(M91_SHARED_DEPS_STAMP)
+root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAMP)
 	@mkdir -p $(BUILD_DIR)/rootfs/bin $(BUILD_DIR)/rootfs/etc $(BUILD_DIR)/rootfs/dev $(BUILD_DIR)/rootfs/home $(BUILD_DIR)/rootfs/tmp $(BUILD_DIR)/rootfs/var
 	@mkdir -p $(BUILD_DIR)/rootfs/proc $(BUILD_DIR)/rootfs/sys $(BUILD_DIR)/rootfs/mnt
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
