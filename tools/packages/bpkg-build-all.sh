@@ -23,13 +23,13 @@ PUBLISH="$HERE/bpkg-publish.sh"
 # The 4th field (comma-separated dependency package names) is OPTIONAL.
 #
 # 'dev' is the compile-capable sysroot: static libs + crt0 + the full headers
-# tree + tcc's own runtime headers. With it installed, an on-target tcc/make can
-# actually build and link programs. tcc and make therefore depend on 'dev', so
-# `bpkg install tcc` pulls the sysroot transitively.
+# tree. With it installed, an on-target b1cc/make can actually build and link
+# programs. b1cc and make therefore depend on 'dev', so `bpkg install b1cc`
+# pulls the sysroot transitively.
 MANIFEST='
-dev|1.0|lib/libc.a lib/libm.a lib/libb1nix.a lib/libb1gui.a lib/libunwind.a? lib/crt0.o lib/tcc? include|
-bash|5.2|bin/bash|
-tcc|0.9.27|bin/tcc|dev
+dev|1.0|lib/libc.a lib/libm.a lib/libb1nix.a lib/libb1gui.a lib/libunwind.a? lib/crt0.o lib/b1cc? include|
+zsh|5.9|bin/zsh|
+b1cc|1.0|bin/b1cc|dev
 js|1.0|bin/js|
 hello|1.0|bin/hello|
 gpaint|1.0|bin/gpaint|

@@ -2,7 +2,3 @@
 	path = userspace/b1cc
 	url = https://github.com/B1nix/b1cc.git
 	branch = main
-[submodule "userspace/tcc"]
-	path = userspace/tcc
-	url = https://github.com/B1nix/b1tinycc.git
-	branch = b1nix-main

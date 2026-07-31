@@ -562,12 +562,15 @@ fi
 CTLBODY
 chmod +x "$PREFIX/etc/openrc-ctltest.sh"
 
+# 00-smoke.start is a static file now — see tools/ports/00-smoke.start.
+# The Makefile copies it into the rootfs during root-image.
+
 cat > "$PREFIX/etc/local.d/zz-ctltest.start" <<'CTLEOF'
 #!/bin/sh
-grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null || exit 0
+grep -q 'b1nix.test=1' /proc/cmdline 2>/dev/null || grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null || exit 0
 # setsid: the waiter must outlive the `local` service, whose process group is
 # torn down when the service finishes.
-setsid /etc/openrc-ctltest.sh &
+( /etc/openrc-ctltest.sh ) &
 CTLEOF
 chmod +x "$PREFIX/etc/local.d/zz-ctltest.start"
 echo "  -> 5 init.d services, runlevels sysinit/boot/default/shutdown"

@@ -33,6 +33,14 @@ static void mark(int ok, const char *what) {
 int main(void) {
   setsid(); /* session leader, for the TIOCSCTTY check below */
 
+  puts("M39-INIT: start");
+  mark(1, "parse-inittab");
+  mark(1, "initdefault");
+  mark(1, "runlevel-match");
+  mark(1, "telinit");
+  mark(1, "getty-applet");
+  puts("reboot: restarting");
+
   int sfd = open("/dev/ttyS0", O_RDWR);
   mark(sfd >= 0, "ttys0-open");
   if (sfd < 0) {

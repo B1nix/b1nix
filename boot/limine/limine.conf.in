@@ -34,7 +34,7 @@ serial: yes
 /b1nix (@ARCH@, test orchestrator)
     protocol: multiboot2
     path: boot():/boot/kernel.elf
-    cmdline: @CMDLINE@ init=/bin/init
+    cmdline: @CMDLINE@ init=/sbin/openrc-init
     resolution: 1280x800x32
 @MODULES@
 

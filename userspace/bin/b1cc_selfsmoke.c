@@ -2,7 +2,7 @@
  * process, compiles a C source AND links it with its own internal linker (no
  * host ld.lld / b1nix-cc), and the produced executable runs and exits 42.
  *
- * Mirrors m25_smoke (the tcc analog): write source to /tmp, spawn the compiler,
+ * Mirrors m25_smoke: write source to /tmp, spawn the compiler,
  * spawn the output, check the exit status. On-device b1cc defaults to the
  * internal static linker and reads crt0.o + libb1nix.a from /lib/b1cc/.
  */

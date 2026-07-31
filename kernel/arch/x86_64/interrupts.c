@@ -434,6 +434,13 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
      * LAPIC unblocks immediately, then run the (preemptible) tick work. */
     lapic_eoi();
     scheduler_charge_tick(frame->cs == 0x1B || frame->cs == 0x23);
+    /* Record the user RIP the tick preempted, so the silence watchdog's task
+     * dump can name the exact user function a wedged thread group spins in
+     * (a thread group burning CPU in the same address forever is a lockup;
+     * the RIP distinguishes that from mere slow progress). */
+    if (frame->cs == 0x1B || frame->cs == 0x23) {
+      task_set_user_rip(current_task, frame->rip);
+    }
     if (is_bsp) {
       timer_ticks++;
       if (timer_ticks % 50 == 0) {

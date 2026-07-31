@@ -66,7 +66,6 @@ $(LITEHTML_LIB) $(MBEDTLS_LIB) $(UNISTRING_LIB): $(USERSPACE_HDR_DEPS)
 
 KERNEL_ELF := $(BUILD_DIR)/kernel.elf
 INITRAMFS_NATIVE_SMOKE_INC := $(INC_DIR)/initramfs_native_smoke.inc
-INITRAMFS_TCC_FILES_INC := $(INC_DIR)/initramfs_tcc_files.inc
 # b1cc (in-tree C compiler + its M5/M32-M34 smoke corpus)
 INITRAMFS_B1CC_M34_INC := $(INC_DIR)/initramfs_b1cc_m34.inc
 INITRAMFS_CURL_INC := $(INC_DIR)/initramfs_curl.inc
@@ -512,14 +511,14 @@ analyze: $(GENERATED_INCS) $(KERNEL_SOURCES) $(ASM_SOURCES)
 	@echo "Analysis results in $(ANALYZE_DIR)"
 	@find $(ANALYZE_DIR) -name '*.plist' -exec echo "  {}" \;
 
-.PHONY: all analyze objects FORCE iso iso-core iso-graphics iso-shell iso-openrc iso-live iso-test iso-full check-dynamic \
+.PHONY: all analyze objects FORCE iso iso-sys iso-gfx iso-posix iso-blk iso-openrc iso-live iso-test iso-full check-dynamic \
 	check-ports \
 	userspace userspace-install busybox-package busybox-iso \
 	install-native-toolchain install-kernel-source install-ports root-image disk-image \
 	run run-graphics run-x86_64 run-root check-tools clean distclean \
 	smoke smoke-quick graphics-smoke memory-smoke build-all test-b1cc
 
-all: check-b1cc-sync check-tcc-sync $(KERNEL_ELF)
+all: check-b1cc-sync $(KERNEL_ELF)
 
 # build-all — one orchestrator that builds the whole working system in dependency
 # order by reusing the existing build scripts (see tools/build-all.sh). Forwards
@@ -624,7 +623,6 @@ $(BUILD_DIR)/.userspace-bins-built: $(BUILD_DIR)/.userspace-headers-installed \
 	$(wildcard userspace/bin/*.c) $(wildcard userspace/bin/*.S) \
 	$(wildcard userspace/b1cc/src/*.c) \
 	$(wildcard userspace/displayd/*.c) \
-	$(wildcard userspace/tcc/*.c) \
 	$(wildcard userspace/duktape/duktape.c) \
 	$(LIBM_LIB) \
 	$(PCRE2_LIB) \
@@ -660,12 +658,6 @@ $(INITRAMFS_NATIVE_SMOKE_INC): userspace/bin/native_smoke.S $(USERSPACE_DEPS)
 	@$(MAKE) -C userspace build/$(ARCH)/bin/native_smoke
 	@mkdir -p $(dir $@)
 	xxd -i -n vfs_native_smoke_elf userspace/build/$(ARCH)/bin/native_smoke > $@
-
-$(INITRAMFS_TCC_FILES_INC): $(USERSPACE_DEPS) tools/images/gen_tcc_initramfs.sh $(wildcard userspace/tcc/*.c) $(wildcard userspace/tcc/*.h) $(wildcard userspace/tcc/include/*.h) $(wildcard userspace/tcc/lib/*.c) $(wildcard userspace/tcc/lib/*.S)
-	@$(MAKE) -C userspace build/$(ARCH)/bin/tcc
-	@$(MAKE) -C userspace build/$(ARCH)/tcc/libtcc1.a
-	@mkdir -p $(dir $@)
-	B1NIX_ARCH=$(ARCH) sh tools/images/gen_tcc_initramfs.sh $@
 
 $(INITRAMFS_B1CC_M34_INC): tools/images/gen_b1cc_m34_initramfs.sh userspace/bin/b1cc_m34_corpus.c userspace/Makefile $(wildcard userspace/b1cc/tests/*.c) $(USERSPACE_DEPS)
 	@mkdir -p $(dir $@)
@@ -1309,7 +1301,7 @@ $(BUILD_DIR)/%.o: %.S
 	@mkdir -p $(dir $@)
 	$(CC) $(COMMON_CFLAGS) $(ARCH_CFLAGS) -c $< -o $@
 
-iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
+iso: check-b1cc-sync root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso --out $(BUILD_DIR)/b1nix.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
 	    --cmdline "$(KERNEL_CMDLINE)" --module $(BUILD_DIR)/root.ext4:rootfs.img
@@ -1322,32 +1314,21 @@ iso: check-b1cc-sync check-tcc-sync root-image check-dynamic $(KERNEL_ELF)
 	fi
 	@echo "============================================================"
 
-iso-core: root-image check-dynamic $(KERNEL_ELF)
-	@$(MKISO) --stage $(BUILD_DIR)/iso-core --out $(BUILD_DIR)/b1nix-core.iso \
-	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=core" \
-	    --module $(BUILD_DIR)/root.ext4:rootfs.img
+# Smoke-suite ISOs: single pattern rule for all categories.
+# Each suite gets its own cmdline; kernel ELF + root.ext4 are shared.
+SMOKE_CMDLINE_sys=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=sys
+SMOKE_CMDLINE_gfx=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=gfx
+SMOKE_CMDLINE_posix=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=posix
+SMOKE_CMDLINE_blk=init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=blk
+# OpenRC ctltest: boots the real init system as PID 1 and drives sysinit/boot/default,
+# then a local.d hook asks PID 1 to power off through /run/openrc/init.ctl — the
+# control-FIFO path openrc-shutdown and telinit use. A clean poweroff proves the channel works.
+SMOKE_CMDLINE_openrc=init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest
 
-iso-graphics: root-image check-dynamic $(KERNEL_ELF)
-	@$(MKISO) --stage $(BUILD_DIR)/iso-graphics --out $(BUILD_DIR)/b1nix-graphics.iso \
+iso-sys iso-gfx iso-posix iso-blk iso-openrc: root-image check-dynamic $(KERNEL_ELF)
+	@$(MKISO) --stage $(BUILD_DIR)/$@ --out $(BUILD_DIR)/b1nix-$(@:iso-%=%).iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=graphics" \
-	    --module $(BUILD_DIR)/root.ext4:rootfs.img
-
-# OpenRC instance: boots the real init system as PID 1 (no test orchestrator) and
-# lets it drive sysinit/boot/default, then a local.d hook asks PID 1 to power the
-# machine off through /run/openrc/init.ctl — the control-FIFO path openrc-shutdown
-# and telinit use. A clean poweroff is the proof that the channel works.
-iso-openrc: root-image check-dynamic $(KERNEL_ELF)
-	@$(MKISO) --stage $(BUILD_DIR)/iso-openrc --out $(BUILD_DIR)/b1nix-openrc.iso \
-	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/sbin/openrc-init b1nix.test=1 b1nix.openrc-ctltest" \
-	    --module $(BUILD_DIR)/root.ext4:rootfs.img
-
-iso-shell: root-image check-dynamic $(KERNEL_ELF)
-	@$(MKISO) --stage $(BUILD_DIR)/iso-shell --out $(BUILD_DIR)/b1nix-shell.iso \
-	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 b1nix.aslr b1nix.smoke=shell" \
+	    --cmdline "$(SMOKE_CMDLINE_$(@:iso-%=%))" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 # V8 run instance: the kernel hook (gated by b1nix.v8run) mounts sata0 -> /mnt/v8
@@ -1360,7 +1341,7 @@ iso-shell: root-image check-dynamic $(KERNEL_ELF)
 iso-v8: $(KERNEL_ELF) root-image
 	@$(MKISO) --stage $(BUILD_DIR)/iso-v8 --out $(BUILD_DIR)/b1nix-v8.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "init=/bin/init b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
+	    --cmdline "init=/sbin/openrc-init b1nix.test=1 b1nix.v8run b1nix.smoke=v8" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img \
 	    --module $(BUILD_ROOT)/v8-out/v8-ext4.img:v8.img
 # NOTE: the smoke v8 instance runs JITLESS (no b1nix.v8jit) — that is the proven
@@ -1387,17 +1368,14 @@ disk-iso: disk-image iso-live
 iso-test: root-image check-dynamic $(KERNEL_ELF)
 	@$(MKISO) --stage $(BUILD_DIR)/iso-test --out $(BUILD_DIR)/b1nix-test.iso \
 	    --arch $(ARCH) --kernel $(KERNEL_ELF) --timeout $(BOOT_TIMEOUT) \
-	    --cmdline "$(KERNEL_CMDLINE) init=/bin/init b1nix.test=1" \
+	    --cmdline "$(KERNEL_CMDLINE) init=/sbin/openrc-init b1nix.test=1" \
 	    --module $(BUILD_DIR)/root.ext4:rootfs.img
 
 userspace: $(USERSPACE_DEPS)
 
-.PHONY: check-b1cc-sync check-tcc-sync
+.PHONY: check-b1cc-sync
 check-b1cc-sync:
 	@tools/check-b1cc-sync.sh
-
-check-tcc-sync:
-	@tools/check-tcc-sync.sh
 
 userspace-install: userspace
 	@$(MAKE) -C userspace B1NIX_ARCH=$(ARCH) install
@@ -1515,6 +1493,10 @@ root-image: $(KERNEL_ELF) install-ports $(M91_SHARED_DEPS_STAMP)
 	@mkdir -p $(BUILD_DIR)/rootfs/mnt/ext1 $(BUILD_DIR)/rootfs/mnt/ext2 $(BUILD_DIR)/rootfs/mnt/ext3 $(BUILD_DIR)/rootfs/mnt/ext4 $(BUILD_DIR)/rootfs/mnt/ext4nvme
 	@ln -sfn . $(BUILD_DIR)/rootfs/persist
 	@echo "b1nix persistent root" > $(BUILD_DIR)/rootfs/etc/motd
+	@# Smoke test runner (static file, not generated — edit tools/ports/00-smoke.start)
+	@mkdir -p $(BUILD_DIR)/rootfs/etc/local.d
+	@cp tools/ports/00-smoke.start $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
+	@chmod +x $(BUILD_DIR)/rootfs/etc/local.d/00-smoke.start
 	@# M51 test font. The FreeType/HarfBuzz/Cairo/Fontconfig smokes open
 	@# /share/fonts/B1nixMono-Regular.ttf; it used to arrive via the xxd
 	@# initramfs (bootstrap-only since the ext4-root migration), so stage it

@@ -156,12 +156,14 @@ Useful commands include:
 help        b1fetch     uname       dmesg      meminfo
 ls          cat         grep        find       mount
 ps          top         free        sysctl     ifconfig
-ping        nc          curl        wget       tcc
+ping        nc          curl        wget       b1cc
 mc          ne          shutdown    reboot
 ```
 
-TinyCC is installed as `/bin/tcc`. When a persistent root image is attached,
-headers, `crt0.o`, and `libb1nix.a` are installed under `/include` and `/lib`.
+b1nix's own C compiler is installed as `/bin/b1cc`; it compiles and links on the
+target, producing musl PIEs like every other binary in the image. When a
+persistent root image is attached, headers and the start files are installed
+under `/include` and `/lib`.
 Work under `/persist` to retain files across boots.
 
 Common kernel command-line options:

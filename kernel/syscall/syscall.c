@@ -4616,11 +4616,44 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
       if (number == LX_FUTEX) {
         int op = (int)arg1;
         int base_op = op & 0x7F; /* strip PRIVATE_FLAG (0x80) */
-        /* FUTEX_WAIT_BITSET(9) → treat as WAIT, ignoring val3 (signal mask). */
-        if (base_op == 9)
-          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)arg2, arg3);
-        /* FUTEX_WAKE_BITSET(10) → treat as WAKE. */
-        if (base_op == 10)
+        /* Plain FUTEX_WAIT(0)/FUTEX_WAKE(1), including the PRIVATE_FLAG
+         * forms (0x80/0x81) that musl always uses for its internal
+         * synchronization. These must be routed with the PRIVATE flag
+         * stripped: scheduler_futex only knows B1NIX_FUTEX_WAIT=0/WAKE=1
+         * and otherwise returns -EINVAL, which makes musl __wait/__lock
+         * busy-spin forever instead of parking (the b1cc pthread wedge). */
+        /* FUTEX_WAIT(0) / FUTEX_WAIT_BITSET(9): arg3 is a pointer to struct timespec
+         * (or NULL for infinite wait). We MUST copy and parse the timespec from
+         * userspace instead of passing the raw pointer address as timeout_ms,
+         * which caused 4400-year timeouts for every timed futex wait. */
+        if (base_op == 0 || base_op == 9) {
+          u64 timeout_ms = 0;
+          if (arg3) {
+            u64 tv_sec = 0, tv_nsec = 0;
+            if (syscall_copyin(&tv_sec, (void *)(usize)arg3, sizeof(tv_sec)) == 0 &&
+                syscall_copyin(&tv_nsec, (void *)(usize)(arg3 + 8), sizeof(tv_nsec)) == 0) {
+              if (base_op == 9) {
+                u64 req_ms = tv_sec * 1000 + tv_nsec / 1000000;
+                u64 now_ms = 0;
+                if (op & 256) {
+                  now_ms = vfs_get_unix_time() * 1000;
+                } else {
+                  now_ms = scheduler_get_uptime_ticks() * 10;
+                }
+                if (req_ms > now_ms)
+                  timeout_ms = req_ms - now_ms;
+                else
+                  timeout_ms = 1;
+              } else {
+                timeout_ms = tv_sec * 1000 + tv_nsec / 1000000;
+                if (timeout_ms == 0)
+                  timeout_ms = 1;
+              }
+            }
+          }
+          return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAIT, (int)arg2, timeout_ms);
+        }
+        if (base_op == 1 || base_op == 10)
           return (u64)scheduler_futex(arg0, B1NIX_FUTEX_WAKE, (int)arg2, 0);
         /* FUTEX_REQUEUE(4): wake val waiters on uaddr, requeue val2 to uaddr2. */
         if (base_op == 4) {

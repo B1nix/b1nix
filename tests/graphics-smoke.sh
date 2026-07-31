@@ -15,7 +15,7 @@ else
 fi
 
 cd "$PROJECT_DIR"
-make -j"$NPROC" ARCH="$ARCH" KERNEL_CMDLINE="init=/bin/init b1nix.test=1" iso >/dev/null 2>&1
+make -j"$NPROC" ARCH="$ARCH" KERNEL_CMDLINE="init=/sbin/openrc-init b1nix.test=1" iso >/dev/null 2>&1
 
 if [ "$ARCH" = "x86" ]; then
   QEMU=qemu-system-i386

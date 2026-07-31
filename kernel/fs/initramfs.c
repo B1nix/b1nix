@@ -13,14 +13,11 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 #include "initramfs_native_smoke.inc"
-#include "initramfs_init.inc"
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_x86_64_so_1.inc"
 #endif
 
 static const struct initramfs_file files[] = {
-    {"/bin/init", (const char *)vfs_init_elf, sizeof(vfs_init_elf),
-     INITRAMFS_EXECUTABLE},
     {"/bin/native-smoke", (const char *)vfs_native_smoke_elf,
      sizeof(vfs_native_smoke_elf), INITRAMFS_EXECUTABLE},
 #ifdef B1NIX_MUSL

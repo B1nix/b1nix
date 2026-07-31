@@ -14,7 +14,7 @@
 #
 # Example:
 #   tools/packages/bpkg-publish.sh ./hello-root hello 1.0 x86_64 myuser/b1nix-pkgs@main
-#   tools/packages/bpkg-publish.sh ./tcc-root tcc 0.9.27 x86_64 "" "" dev   # depends on dev
+#   tools/packages/bpkg-publish.sh ./b1cc-root b1cc 1.0 x86_64 "" "" dev   # depends on dev
 #
 # Arguments:
 #   srcdir       directory tree to package (its contents are tar'd from inside it,

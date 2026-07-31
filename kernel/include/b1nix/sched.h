@@ -328,6 +328,11 @@ u64  task_utime(const struct task *t);
 u64  task_stime(const struct task *t);
 u64  task_cutime(const struct task *t);
 u64  task_cstime(const struct task *t);
+/* Last userspace RIP at the moment the LAPIC timer tick preempted this task
+ * (0 for kernel tasks / never-preempted). Watchdog diagnostic: names the user
+ * function a wedged thread group is spinning in. */
+u64  task_user_rip(const struct task *t);
+void task_set_user_rip(struct task *t, u64 rip);
 int  scheduler_getrlimit(int resource, struct rlimit *rlim);
 int  scheduler_getrlimit_task(const struct task *t, int resource,
                               struct rlimit *rlim);
