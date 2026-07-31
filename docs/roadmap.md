@@ -601,7 +601,7 @@ Status:
 
 ## M75: On-Device GPU Path
 
-- [ ] `in-progress` Add LLVMpipe (and later EGL/GBM/DRI) on-device GPU path.
+- [x] Add LLVMpipe (and later EGL/GBM/DRI) on-device GPU path.
 - [x] Dynamic `libLLVM.so` for b1nix (72 MB ELF DYN exporting ORC/MCJIT/X86 codegen).
 - [x] Mesa llvmpipe built against b1nix `libLLVM.so`.
 - [x] GL demo ELF linking llvmpipe + `libLLVM.so`.

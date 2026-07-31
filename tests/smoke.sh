@@ -1722,6 +1722,12 @@ check_output "$LOG" "M57-SMOKE: ok mojo-shm" "Mojo shared buffer create/duplicat
 check_output "$LOG" "M57-SMOKE: ok mojo-watcher" "Mojo watcher event loop integration over epoll works"
 check_output "$LOG" "M57-SMOKE: ok mojo-broker" "Mojo IPC brokering across process boundaries over SCM_RIGHTS works"
 check_output "$LOG" "M57-SMOKE: done" "M57 broker-primitive suite completes"
+# ── M75: On-Device GPU Path (LLVMpipe / Mesa / DSO init) ──
+check_output "$LOG" "M75-GPU: ok dso-constructors" "M75: shared-library DT_INIT_ARRAY constructors run via AT_B1NIX_DSO_INIT"
+check_output "$LOG" "M75-GPU: ok llvmpipe-init" "M75: LLVMpipe software GL JIT state machine initializes"
+check_output "$LOG" "M75-GPU: ok gl-context" "M75: offscreen GL context creation succeeds"
+check_output "$LOG" "M75-GPU: ok llvmpipe-render" "M75: software LLVMpipe GL rasterizer renders offscreen frame and passes pixel validation"
+check_output "$LOG" "M75-GPU: done" "M75 on-device GPU path test completes"
 # ── M73: modern I/O & introspection syscalls ──
 check_output "$LOG" "M73-SMOKE: ok statx" "statx returns size/mode/nlink/ino matching fstat (path + AT_EMPTY_PATH)"
 check_output "$LOG" "M73-SMOKE: ok sendfile" "sendfile copies a range, advances the explicit offset, leaves the src fd offset"

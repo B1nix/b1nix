@@ -62,6 +62,7 @@ run_test /bin/m15_smoke sys
 run_test /bin/m17_smoke sys
 run_test /bin/m56_smoke sys
 run_test /bin/m57_smoke sys
+run_test /bin/m75_smoke sys
 run_test /bin/m8_aio_test sys
 run_test /bin/test_sync sys
 run_test /bin/m25_smoke sys

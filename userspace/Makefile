@@ -220,6 +220,7 @@ BINARIES += $(BUILD)/bin/cxx_smoke
 BINARIES += $(BUILD)/bin/m55_iostream
 BINARIES += $(BUILD)/bin/m64_clang_smoke
 BINARIES += $(BUILD)/bin/m57_smoke
+BINARIES += $(BUILD)/bin/m75_smoke
 BINARIES += $(BUILD)/bin/m73_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
@@ -999,7 +1000,7 @@ endif
 	@chmod 4755 $(ROOTFS)/bin/m31_setuid 2>/dev/null || true
 	@chmod 4755 $(ROOTFS)/bin/su 2>/dev/null || true
 	@chmod 4755 $(ROOTFS)/bin/passwd 2>/dev/null || true
-	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke m57_smoke:m57-smoke; do \
+	@for b in m12_smoke:m12-smoke m13_smoke:m13-smoke m13_job_control:m13-job-control m14_smoke:m14-smoke m15_smoke:m15-smoke m17_smoke:m17-smoke m24b_smoke:m24b-smoke m25_smoke:m25-smoke m26_smoke:m26-smoke m27_smoke:m27-smoke m29_smoke:m29-smoke m31_smoke:m31-smoke m31_setuid:m31-setuid m32_smoke:m32-smoke m34_smoke:m34-smoke m35_smoke:m35-smoke m36_smoke:m36-smoke m47_smoke:m47-smoke m48_smoke:m48-smoke m49_smoke:m49-smoke m50_smoke:m50-smoke m51_smoke:m51-smoke m52_gl_smoke:m52-gl-smoke m57_smoke:m57-smoke m75_smoke:m75-smoke; do \
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done
