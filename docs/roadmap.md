@@ -743,3 +743,38 @@ See [`docs/gnu-less-plan.md`](gnu-less-plan.md) for the full inventory.
 - [x] Gnulib left the tree with bash — it was only ever bundled inside it.
 
 **The shipped ISO is now GNU-free**: bootloader, shell, build tools, downloader, libc, C++ runtime and toolchain all carry BSD/MIT/Apache/0BSD licences.
+
+## M99: Driver Infrastructure (netconsole, memory typing, modern PCI)
+
+See [`docs/gpu-drm-plan.md`](gpu-drm-plan.md) for the full M99-M103 plan.
+
+- [ ] `planned` `netconsole` — klog over UDP (`b1nix.netconsole=<ip>:<port>`); the test laptop has no serial port.
+- [ ] `planned` `IA32_PAT` + `VMM_WC` mappings; `clflush` / `wbinvd` / `mfence` primitives.
+- [ ] `planned` PCI BAR enumeration + sizing, bus-master enable, capability walk, MSI/MSI-X.
+- [ ] `planned` Intel stolen memory (DSM/GSM) from host-bridge config `0x5C`/`0x70`.
+
+## M100: linuxkpi Compatibility Layer (own MIT headers)
+
+- [ ] `planned` `kernel/include/lkpi/` written from scratch — Linux `include/linux/*.h` is GPL, the drivers themselves are MIT.
+- [ ] `planned` `idr`, `completion`, workqueue over `kthread_create`, `scatterlist`, `request_firmware` over VFS.
+- [ ] `planned` `ioremap` / dma-mapping / lock wrappers over existing kernel primitives.
+
+## M101: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
+
+- [ ] `planned` `dma-fence` + minimal `drm_gpu_scheduler`; convert `vgpu_submit_stream` off `virtio_gpu_wait_used`.
+- [ ] `planned` GEM with sg-backed discontiguous BOs (today: contiguous `pmm_alloc_frames` only).
+- [ ] `planned` Split `drm_ioctl` (cyclomatic 56 / cognitive 161 in one switch).
+
+## M102: Intel i915 (Gen8/Gen9.5) + Mesa iris
+
+- [ ] `planned` GTT/PPGTT, execlists submission, contexts; no firmware needed on Gen8/Gen9.
+- [ ] `planned` Bare metal on the Pavilion's Gen8, logs over netconsole (the guaranteed path — no OS on the laptop, ISO boots from USB).
+- [ ] `planned` *If VT-d and BIOS ever allow it:* KVM + VFIO passthrough for a faster loop (keeps virtual COM1).
+- [ ] `planned` `EXECBUFFER2` softpin-only + Mesa `iris` (own NIR backend — no LLVM rebuild).
+
+## M103: amdgpu on RX 6600 (render-only) + radeonsi
+
+- [ ] `planned` Build without DC: scanout stays on the GOP framebuffer, render offscreen and blit.
+- [ ] `planned` PSP (`psp_v11_0`) firmware loading, SMU 11 mailbox, GFX10.3 KIQ/MQD, GPUVM.
+- [ ] `planned` Visible/invisible VRAM windowing (8 GB behind a 256 MB BAR without ReBAR).
+- [ ] `planned` `libdrm_amdgpu` + `libLLVM.so` rebuilt with the AMDGPU target (currently X86 only).
