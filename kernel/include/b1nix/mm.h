@@ -131,6 +131,9 @@ void pmm_init(const struct boot_info *boot_info);
 void kswapd_init(void);
 u64 pmm_alloc_frame(void);
 u64 pmm_alloc_frames(usize count);
+/* Physical address of the single shared zero page (zero-page dedup). Reserved
+ * for the kernel's lifetime; pmm_free_frame() ignores it. */
+u64 pmm_zero_page(void);
 void pmm_ref_frame(u64 frame);
 void pmm_unref_frame(u64 frame);
 void pmm_free_frame(u64 frame);

@@ -24,17 +24,9 @@ struct pmm_state {
   usize bitmap_bytes;
   u8 *bitmap;
   u16 *frame_refcounts;
-  /* O(1) single-frame allocator. free_list_head is an intrusive LIFO stack of
-   * free frames: each free frame's first 8 bytes (via the direct map) hold the
-   * next frame's physical address; 0 terminates (frame 0 is always reserved, so
-   * it is a safe sentinel). free_list_bitmap tracks which frames are currently
-   * linked so a push is idempotent: a frame taken by a contiguous bitmap scan
-   * stays linked (stale) until popped, and re-freeing it must not link it twice
-   * (which would create a cycle). The used-bitmap stays the source of truth for
-   * "free vs used"; a popped frame whose used-bit is set is stale and skipped. */
-  u64 free_list_head;
-  u8 *free_list_bitmap;
-  int free_list_ready;
+  /* Free-page inventory lives in the buddy allocator (see below): free blocks
+   * hang off per-order free lists, and the used-bitmap stays the authoritative
+   * "free vs used" map that reclaim / watermarks / free_frames all read. */
 };
 
 static struct pmm_state pmm;
@@ -83,9 +75,15 @@ static usize kswapd_high_watermark(void) {
   return high;
 }
 
+static void pmm_scrub_quarantine(void);
+
 static void kswapd_thread(void *arg) {
   (void)arg;
   for (;;) {
+    /* Idle-time quarantine scrub: age freed pages out of quarantine and into
+     * the pre-zeroed pool, catching UAF/OOB poison corruption. Runs before
+     * reclaim so promotion never competes with it for this iteration. */
+    pmm_scrub_quarantine();
     usize high = kswapd_high_watermark();
     /* Reclaim toward the high watermark in bounded batches, yielding between
      * them so kswapd never monopolises a CPU. Stop when nothing more is
@@ -184,72 +182,186 @@ static void bitmap_clear(usize index) {
   pmm.bitmap[index / BITS_PER_BYTE] &= (u8) ~(1u << (index % BITS_PER_BYTE));
 }
 
-static int onlist_get(usize index) {
-  return (pmm.free_list_bitmap[index / BITS_PER_BYTE] &
-          (1u << (index % BITS_PER_BYTE))) != 0;
+/* ─────────────────────────── Buddy allocator ─────────────────────────────
+ * The intrusive LIFO free stack and the O(N) bitmap scan for contiguous runs
+ * are replaced by a classic buddy allocator:
+ *   - free blocks of order k (2^k pages) hang off free_area[k] as a doubly
+ *     linked list; the block's first page (via the direct map) stores next /
+ *     prev frame links, its own order and a magic canary.
+ *   - alloc pops the smallest suitable block, splitting higher-order blocks as
+ *     needed; a request for `count` pages that is not a power of two gets the
+ *     block's excess tail pages released back to the tree.
+ *   - free returns the block, then merges it with its buddy (frame XOR block
+ *     size) while the buddy is also a free block of the same order. Merging
+ *     always yields a correctly aligned, larger block (buddy pairs share an
+ *     aligned boundary by construction).
+ * The used-bitmap stays the authoritative "free vs used" source for reclaim,
+ * watermarks and free_frames; the buddy lists are a consistent cache of free
+ * runs on top of it. A magic/order mismatch in a block header is treated as
+ * corruption: the list is truncated and the caller falls back to the bitmap
+ * scan, so no free memory is ever lost (same graceful-degradation guarantee
+ * the old free stack had).
+ * ──────────────────────────────────────────────────────────────────────── */
+#define BUDDY_MAX_ORDER 18   /* 2^18 pages = 1 GiB largest free block */
+#define BUDDY_MAGIC 0xB000500ULL
+
+struct buddy_block {
+  u64 next;   /* frame of the next free block, or 0 */
+  u64 prev;   /* frame of the previous free block, or 0 */
+  u64 order;  /* this block's order */
+  u64 magic;
+};
+
+static u64 free_area[BUDDY_MAX_ORDER + 1]; /* head frame of each order's list */
+static int buddy_ready;
+
+/* Shared zero page for zero-page dedup: one reserved physical frame mapped
+ * read-only (+COW) into every fresh anonymous page's PTE until first write.
+ * Allocated in pmm_switch_to_direct_map, freed never. */
+static u64 zero_page_frame;
+
+static usize buddy_pages(int order) { return (usize)1 << order; }
+static u64 buddy_bytes(int order) { return (u64)buddy_pages(order) * PAGE_SIZE; }
+
+static struct buddy_block *buddy_hdr(u64 frame) {
+  return (struct buddy_block *)(usize)(frame + DIRECT_MAP_BASE);
 }
 
-static void onlist_set(usize index) {
-  pmm.free_list_bitmap[index / BITS_PER_BYTE] |= (u8)(1u << (index % BITS_PER_BYTE));
-}
-
-static void onlist_clear(usize index) {
-  pmm.free_list_bitmap[index / BITS_PER_BYTE] &=
-      (u8) ~(1u << (index % BITS_PER_BYTE));
-}
-
-/* Link a frame onto the free stack. Idempotent: a frame already on the list is
- * left untouched, so it can never be linked twice. Requires the direct map. */
-static void freelist_push(u64 frame) {
-  usize index = frame_index(frame);
-  if (onlist_get(index)) {
-    return;
-  }
-  *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pmm.free_list_head;
-  pmm.free_list_head = frame;
-  onlist_set(index);
-}
-
-/* A frame is usable as a freelist node only if it is page-aligned, within
- * usable RAM and reachable through the direct map (its first 8 bytes hold the
- * intrusive "next" pointer). A frame that is written to after being freed
- * corrupts that pointer; validating before the dereference turns a fatal
- * GP-fault in the allocator into a survivable, logged event. */
-static int freelist_node_valid(u64 frame) {
-  if (frame == 0) return 0;
-  if (frame & (PAGE_SIZE - 1)) return 0;
-  if (frame >= pmm.max_address) return 0;
-  if (frame >= g_direct_map_size) return 0;
-  if (frame_index(frame) >= (usize)pmm.bitmap_bytes * BITS_PER_BYTE) return 0;
+/* A block is a valid free-node site only if it is block-aligned, within usable
+ * RAM and reachable through the direct map (its first page holds the intrusive
+ * list header). Validating before dereference turns a corrupt free-list entry
+ * into a logged, survivable event instead of a fatal GP fault. */
+static int buddy_region_valid(u64 frame, int order) {
+  if (order < 0 || order > BUDDY_MAX_ORDER) return 0;
+  u64 bytes = buddy_bytes(order);
+  if (frame & (bytes - 1)) return 0;             /* must be block-aligned */
+  if (frame + bytes > pmm.max_address) return 0;
+  if (frame + bytes > g_direct_map_size) return 0;
+  if (frame_index(frame) + buddy_pages(order) >
+      (usize)pmm.bitmap_bytes * BITS_PER_BYTE) return 0;
   return 1;
 }
 
-/* Pop the next genuinely-free frame, discarding stale entries (frames that were
- * linked but later taken by a contiguous bitmap scan). Returns 0 if empty.
- *
- * If the intrusive list is found corrupt (a freed frame's next pointer was
- * clobbered by a use-after-free), truncate it and return 0: the used-bitmap is
- * the authoritative source of truth, so the caller falls back to the bitmap
- * scan and no free memory is lost. This degrades gracefully instead of
- * dereferencing a garbage pointer and panicking the kernel. */
-static u64 freelist_pop(void) {
-  while (pmm.free_list_head != 0) {
-    u64 frame = pmm.free_list_head;
-    if (!freelist_node_valid(frame)) {
-      static int reported;
-      if (!reported) {
-        reported = 1;
-        console_write("pmm: free-list corruption (bad node ");
-        console_write_hex64(frame);
-        console_write(") — truncating; bitmap scan recovers free frames\n");
+static void buddy_insert(u64 frame, int order) {
+  struct buddy_block *b = buddy_hdr(frame);
+  b->order = (u64)order;
+  b->magic = BUDDY_MAGIC;
+  b->next = free_area[order];
+  b->prev = 0;
+  if (b->next) buddy_hdr(b->next)->prev = frame;
+  free_area[order] = frame;
+}
+
+static void buddy_unlink(u64 frame, int order) {
+  struct buddy_block *b = buddy_hdr(frame);
+  if (b->prev) buddy_hdr(b->prev)->next = b->next;
+  else if (free_area[order] == frame) free_area[order] = b->next;
+  if (b->next) buddy_hdr(b->next)->prev = b->prev;
+  b->next = b->prev = 0;
+}
+
+/* All of `frame`'s order-k pages must be clear in the authoritative bitmap.
+ * Used to keep the tree consistent with the bitmap: a stale block (orphaned by
+ * a contiguous bitmap-scan fallback) or a claimed page carrying a leftover
+ * header must never be treated as free. Caller holds pmm_lock. */
+static int buddy_pages_free(u64 frame, int order) {
+  if (!buddy_region_valid(frame, order)) return 0;
+  usize idx = frame_index(frame);
+  usize npages = buddy_pages(order);
+  for (usize i = 0; i < npages; i++)
+    if (bitmap_get(idx + i)) return 0;
+  return 1;
+}
+
+/* Merge `frame`'s order-k block with a free same-order buddy while possible,
+ * then insert it. Does NOT touch the bitmap — the caller has already marked
+ * the block's pages free. A buddy is only merged when it is genuinely free:
+ * its header must be a valid tree node AND its pages must be clear in the
+ * authoritative bitmap — a claimed/PCP-cached page can still carry a leftover
+ * header from a previous tree life, and trusting it here would fold a live
+ * page into a free block (double allocation). Caller holds pmm_lock. */
+static void buddy_merge_insert(u64 frame, int order) {
+  if (!buddy_region_valid(frame, order)) return;
+  while (order < BUDDY_MAX_ORDER) {
+    u64 bytes = buddy_bytes(order);
+    u64 buddy = frame ^ bytes;
+    if (buddy_region_valid(buddy, order) && buddy_pages_free(buddy, order)) {
+      struct buddy_block *bh = buddy_hdr(buddy);
+      if (bh->magic == BUDDY_MAGIC && bh->order == (u64)order) {
+        buddy_unlink(buddy, order);
+        if (buddy < frame) frame = buddy;
+        order++;
+        continue;
       }
-      pmm.free_list_head = 0; /* drop the corrupt list; bitmap is authoritative */
-      return 0;
     }
-    usize index = frame_index(frame);
-    pmm.free_list_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
-    onlist_clear(index);
-    if (!bitmap_get(index)) {
+    break;
+  }
+  buddy_insert(frame, order);
+}
+
+/* Mark an order-k block's pages free in the bitmap/refcounts and return it to
+ * the tree. Returns 0 on success, -1 if any page was already free (double
+ * free / corrupt state — nothing is modified). Caller holds pmm_lock. */
+static int buddy_release(u64 frame, int order) {
+  if (!buddy_region_valid(frame, order)) return -1;
+  usize idx = frame_index(frame);
+  usize npages = buddy_pages(order);
+  for (usize i = 0; i < npages; i++)
+    if (!bitmap_get(idx + i)) return -1;  /* page already free (double free) */
+  for (usize i = 0; i < npages; i++) {
+    bitmap_clear(idx + i);
+    if (pmm.frame_refcounts) pmm.frame_refcounts[idx + i] = 0;
+  }
+  pmm.free_frames += npages;
+  buddy_merge_insert(frame, order);
+  return 0;
+}
+
+/* Allocate a block of `order` pages, splitting higher-order blocks as needed.
+ * Claims the pages (bitmap set, refcount=1, free_frames decremented). Returns
+ * the block's base frame, or 0 if no block is available. On free-list
+ * corruption the offending list is truncated (the bitmap is authoritative) and
+ * 0 is returned so the caller can fall back to the bitmap scan. Caller holds
+ * pmm_lock. */
+static u64 buddy_alloc(int order) {
+  if (order < 0 || order > BUDDY_MAX_ORDER) return 0;
+  for (int k = order; k <= BUDDY_MAX_ORDER; k++) {
+    /* Pop each order's list head. A block whose header is corrupt truncates
+     * the list; a block whose pages are no longer free in the bitmap (a
+     * leftover from a contiguous bitmap-scan fallback that orphaned it) is
+     * discarded and the search continues. Discarding is always safe — the
+     * bitmap is authoritative, so no free page is ever lost and a used page
+     * can never be handed out or folded into a free block. The whole block is
+     * verified before splitting so an intermediate half can never carry a
+     * used page into the tree. */
+    while (free_area[k] != 0) {
+      u64 frame = free_area[k];
+      struct buddy_block *b = buddy_hdr(frame);
+      if (b->magic != BUDDY_MAGIC || b->order != (u64)k ||
+          !buddy_region_valid(frame, k)) {
+        static int reported;
+        if (!reported) {
+          reported = 1;
+          console_write("pmm: buddy free-list corruption at order ");
+          console_write_dec(k);
+          console_write(" — truncating; bitmap scan recovers free frames\n");
+        }
+        free_area[k] = 0;
+        break;
+      }
+      buddy_unlink(frame, k);
+      if (!buddy_pages_free(frame, k)) continue; /* stale: drop, keep looking */
+      while (k > order) {
+        k--;
+        buddy_insert(frame + buddy_bytes(k), k); /* top half becomes free */
+      }
+      usize idx = frame_index(frame);
+      usize npages = buddy_pages(order);
+      for (usize i = 0; i < npages; i++) {
+        bitmap_set(idx + i);
+        if (pmm.frame_refcounts) pmm.frame_refcounts[idx + i] = 1;
+      }
+      pmm.free_frames -= npages;
       return frame;
     }
   }
@@ -262,9 +374,9 @@ static void mark_frame_free(u64 frame) {
   if (bitmap_get(index)) {
     bitmap_clear(index);
     pmm.free_frames++;
-  }
-  if (pmm.free_list_ready) {
-    freelist_push(frame);
+    if (buddy_ready) {
+      buddy_merge_insert(frame, 0);
+    }
   }
 }
 
@@ -274,7 +386,7 @@ static void mark_frame_free(u64 frame) {
  * Pre-condition: every bitmap bit in [start_idx, end_idx) is currently SET
  * (the bitmap was just memset(0xff)'d in pmm_init); the bulk clear is the
  * inverse — memset(0) for the byte-aligned interior, bit-clear at the edges.
- * Caller may not depend on free_list_ready here (it is false during init). */
+ * Caller may not depend on buddy_ready here (it is false during init). */
 static void mark_frames_free_range(usize start_idx, usize end_idx) {
   if (end_idx <= start_idx) return;
   usize count = end_idx - start_idx;
@@ -421,18 +533,14 @@ void pmm_init(const struct boot_info *boot_info) {
   pmm.bitmap_bytes = align_up_u64((frame_count + 7) / 8, PAGE_SIZE);
   usize refcounts_bytes = align_up_u64(frame_count * sizeof(u16), PAGE_SIZE);
 
-  pmm.free_list_head = 0;
-  pmm.free_list_ready = 0;
+  for (int i = 0; i <= BUDDY_MAX_ORDER; i++) free_area[i] = 0;
+  buddy_ready = 0;
 
-  u64 early_mem = find_early_mem(
-      boot_info, pmm.bitmap_bytes * 2 + refcounts_bytes);
+  u64 early_mem = find_early_mem(boot_info, pmm.bitmap_bytes + refcounts_bytes);
   pmm.bitmap = (u8 *)(usize)early_mem;
-  pmm.free_list_bitmap = (u8 *)(usize)(early_mem + pmm.bitmap_bytes);
-  pmm.frame_refcounts =
-      (u16 *)(usize)(early_mem + pmm.bitmap_bytes * 2);
+  pmm.frame_refcounts = (u16 *)(usize)(early_mem + pmm.bitmap_bytes);
 
   memset(pmm.bitmap, 0xff, pmm.bitmap_bytes);
-  memset(pmm.free_list_bitmap, 0, pmm.bitmap_bytes);
   memset(pmm.frame_refcounts, 0, refcounts_bytes);
 
   console_write("pmm: kernel 0x");
@@ -485,12 +593,6 @@ void pmm_init(const struct boot_info *boot_info) {
 
   for (u64 frame = (u64)(usize)pmm.bitmap;
        frame < (u64)(usize)pmm.bitmap + pmm.bitmap_bytes; frame += PAGE_SIZE) {
-    mark_frame_used(frame);
-  }
-
-  for (u64 frame = (u64)(usize)pmm.free_list_bitmap;
-       frame < (u64)(usize)pmm.free_list_bitmap + pmm.bitmap_bytes;
-       frame += PAGE_SIZE) {
     mark_frame_used(frame);
   }
 
@@ -566,20 +668,58 @@ void pmm_ref_frame(u64 frame) {
  * inventory — fine in steady state; under hard pressure we drain caches
  * before declaring OOM.
  * ──────────────────────────────────────────────────────────────────────── */
+/* Each CPU keeps three private buckets:
+ *   - head/count: the plain free stack (frames to be zeroed by the caller).
+ *   - zero_head/zero_count: pre-zeroed frames, returned without a memset.
+ *   - q_head/q_tail/q_count: the QUARANTINE queue. Every freed page lands here
+ *     FIRST, poisoned with a canary pattern, and only becomes reallocatable
+ *     after the kswapd scrubber ages it out (or the bucket overflows). UAF
+ *     reads see poison, double-frees trip the canary check, and OOB writes
+ *     into a parked page are reported by the scrubber — instead of the old
+ *     silent "GP fault in freelist_pop" corruption.
+ * The quarantine is a FIFO (q_tail) so the head is always the OLDEST victim:
+ * aging "N allocs" is implemented by only promoting the head once Q_AGE more
+ * frames have piled up behind it. */
 struct pmm_pcp {
   u64 head;       /* intrusive stack head, same on-frame link layout as global */
   u32 count;      /* number of frames currently parked */
   u32 _pad;
+  u64 zero_head;  /* intrusive stack head of PRE-ZEROED frames (zeroed by scrubber) */
+  u32 zero_count; /* number of pre-zeroed frames parked */
+  u32 _pad2;
+  u64 q_head;     /* oldest quarantined frame, or 0 (promote from here) */
+  u64 q_tail;     /* newest quarantined frame, or 0 (new frees go here) */
+  u32 q_count;    /* number of frames currently quarantined */
+  u32 _pad3;
 } __attribute__((aligned(64)));
 
-#define PMM_PCP_LIMIT  128   /* drain to global once cache exceeds */
-#define PMM_PCP_REFILL  32   /* pull this many on miss */
-#define PMM_PCP_DRAIN   64   /* push this many back on overflow */
+#define PMM_PCP_LIMIT    128  /* drain to global once cache exceeds */
+#define PMM_PCP_REFILL    32  /* pull this many on miss */
+#define PMM_PCP_ZERO_LIMIT 64 /* zeroed-bucket cap; overflow drains to global */
+#define PMM_PCP_ZERO_DRAIN 32
+#define PMM_PCP_Q_LIMIT   32  /* quarantine bucket cap per CPU */
+#define PMM_PCP_Q_AGE     16  /* promote head once Q_AGE+1 frees piled behind it */
+#define PMM_PCP_Q_SCRUB    8  /* max promotions per scrubber pass */
+
+/* Poison layout inside a parked frame (frame + DIRECT_MAP_BASE):
+ *   [0,  8)  intrusive list link (next frame or FIFO tail)
+ *   [8, 16)  PMM_POISON_CANARY — double-free trips this on a second free
+ *   [16,24)  PMM_ZERO_MAGIC — set while parked in the zero bucket, so freeing
+ *            a page that is still parked there is also caught
+ *   [24,4096) filled with PMM_POISON_BYTE; OOB writes here are caught by the
+ *            scrubber
+ * Both markers are cleared by the memset every allocator hands a page out with,
+ * so a legitimately-owned frame can never carry them. */
+#define PMM_POISON_BYTE       0xDF
+#define PMM_POISON_CANARY     0xCAFE0DF00DFACEFEULL
+#define PMM_ZERO_MAGIC        0x5A1DE4E4E4E45A11ULL
+#define PMM_POISON_CANARY_OFF 8
+#define PMM_ZERO_MAGIC_OFF    16
 
 static struct pmm_pcp pmm_pcp[MAX_CPUS];
 
 static inline int pmm_pcp_ready(void) {
-  if (!pmm.free_list_ready) return 0;
+  if (!buddy_ready) return 0;
   struct percpu *p = get_percpu();
   return p && p->cpu_id < MAX_CPUS;
 }
@@ -595,12 +735,8 @@ static void pmm_pcp_refill(struct pmm_pcp *pcp) {
   u64 flags;
   pmm_acquire(&flags);
   for (int i = 0; i < PMM_PCP_REFILL && pcp->count < PMM_PCP_LIMIT; i++) {
-    u64 frame = freelist_pop();
+    u64 frame = buddy_alloc(0);   /* claims bitmap + refcount=1 */
     if (frame == 0) break;
-    usize idx = frame_index(frame);
-    if (bitmap_get(idx)) continue; /* stale entry, skip */
-    bitmap_set(idx);
-    pmm.free_frames--;
     *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->head;
     pcp->head = frame;
     pcp->count++;
@@ -608,45 +744,156 @@ static void pmm_pcp_refill(struct pmm_pcp *pcp) {
   pmm_release(flags);
 }
 
-static void pmm_pcp_drain(struct pmm_pcp *pcp) {
+static void pmm_pcp_zero_drain(struct pmm_pcp *pcp) {
   u64 flags;
   pmm_acquire(&flags);
-  for (int i = 0; i < PMM_PCP_DRAIN && pcp->count > 0; i++) {
-    u64 frame = pcp->head;
-    pcp->head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
-    pcp->count--;
-    usize idx = frame_index(frame);
-    if (bitmap_get(idx)) {
-      bitmap_clear(idx);
-      pmm.free_frames++;
+  for (int i = 0; i < PMM_PCP_ZERO_DRAIN && pcp->zero_count > 0; i++) {
+    u64 frame = pcp->zero_head;
+    pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    pcp->zero_count--;
+    if (buddy_release(frame, 0) != 0) {
+      usize idx = frame_index(frame);
+      if (bitmap_get(idx)) {
+        bitmap_clear(idx);
+        pmm.free_frames++;
+      }
+      if (pmm.frame_refcounts) pmm.frame_refcounts[idx] = 0;
+      buddy_merge_insert(frame, 0);
     }
-    freelist_push(frame);
   }
   pmm_release(flags);
+}
+
+/* FIFO push/pop for the quarantine queue. The list link lives in the frame's
+ * first 8 bytes (direct map); the poison canary at offset 8 and the zero
+ * marker at offset 16 are never overwritten by these. Caller must hold IRQs
+ * off (per-CPU ownership). */
+static void q_push(struct pmm_pcp *pcp, u64 frame) {
+  *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = 0;
+  if (pcp->q_tail) {
+    *(u64 *)(usize)(pcp->q_tail + DIRECT_MAP_BASE) = frame;
+  } else {
+    pcp->q_head = frame;
+  }
+  pcp->q_tail = frame;
+  pcp->q_count++;
+}
+
+static u64 q_pop(struct pmm_pcp *pcp) {
+  if (!pcp->q_head) return 0;
+  u64 frame = pcp->q_head;
+  pcp->q_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+  if (!pcp->q_head) pcp->q_tail = 0;
+  pcp->q_count--;
+  return frame;
+}
+
+/* LIFO push onto the pre-zeroed stack (frame must already be all-zeros). */
+static void zero_push(struct pmm_pcp *pcp, u64 frame) {
+  *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->zero_head;
+  pcp->zero_head = frame;
+  pcp->zero_count++;
 }
 
 static void pmm_pcp_drain_all(void) {
   for (int c = 0; c < MAX_CPUS; c++) {
     struct pmm_pcp *pcp = &pmm_pcp[c];
-    if (pcp->count == 0) continue;
+    if (pcp->count == 0 && pcp->zero_count == 0 && pcp->q_count == 0) continue;
     u64 flags;
     pmm_acquire(&flags);
     while (pcp->count > 0) {
       u64 frame = pcp->head;
       pcp->head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
       pcp->count--;
-      usize idx = frame_index(frame);
-      if (bitmap_get(idx)) {
-        bitmap_clear(idx);
-        pmm.free_frames++;
+      if (buddy_release(frame, 0) != 0) {
+        usize idx = frame_index(frame);
+        if (bitmap_get(idx)) {
+          bitmap_clear(idx);
+          pmm.free_frames++;
+        }
+        if (pmm.frame_refcounts) pmm.frame_refcounts[idx] = 0;
+        buddy_merge_insert(frame, 0);
       }
-      freelist_push(frame);
+    }
+    while (pcp->q_count > 0) {
+      u64 frame = q_pop(pcp);
+      /* Quarantined pages are poisoned — zero them before they reach the
+       * global pool so no one can read the poison through a fresh allocation
+       * window. */
+      memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
+      if (buddy_release(frame, 0) != 0) {
+        usize idx = frame_index(frame);
+        if (bitmap_get(idx)) {
+          bitmap_clear(idx);
+          pmm.free_frames++;
+        }
+        if (pmm.frame_refcounts) pmm.frame_refcounts[idx] = 0;
+        buddy_merge_insert(frame, 0);
+      }
+    }
+    while (pcp->zero_count > 0) {
+      u64 frame = pcp->zero_head;
+      pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+      pcp->zero_count--;
+      if (buddy_release(frame, 0) != 0) {
+        usize idx = frame_index(frame);
+        if (bitmap_get(idx)) {
+          bitmap_clear(idx);
+          pmm.free_frames++;
+        }
+        if (pmm.frame_refcounts) pmm.frame_refcounts[idx] = 0;
+        buddy_merge_insert(frame, 0);
+      }
     }
     pmm_release(flags);
   }
 }
 
+/* Background quarantine scrubber. Runs from kswapd's idle time (every ~500 ms
+ * loop) and handles ONLY the CPU it currently runs on: the bucket is owned by
+ * that CPU under IRQs-off, so this is race-free with no lock. Pages are aged
+ * out oldest-first once Q_AGE more frees have piled up behind them (FIFO head
+ * = oldest), zeroed, and promoted to the zero bucket — never released to
+ * global, so the "parked before reallocatable" guarantee holds through the
+ * handover. A page whose canary or poison fill is corrupt was written into
+ * after free (UAF/OOB) — reported, then recycled. */
+static void pmm_scrub_quarantine(void) {
+  if (!pmm_pcp_ready()) return;
+  u64 flags = irq_save_cli();
+  struct percpu *p = get_percpu();
+  struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+  int done = 0;
+  while (pcp->q_count > PMM_PCP_Q_AGE && done < PMM_PCP_Q_SCRUB) {
+    u64 frame = q_pop(pcp);
+    u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    if (marker[PMM_POISON_CANARY_OFF / 8] != PMM_POISON_CANARY) {
+      static unsigned corrupted;
+      if (corrupted < 8) {
+        console_write("pmm: quarantine poison corrupted at 0x");
+        console_write_hex64(frame);
+        console_write("\n");
+        klog_warn("pmm: quarantine poison corrupted (UAF/OOB write into freed page)");
+        corrupted++;
+      }
+    }
+    memset((void *)(usize)(frame + DIRECT_MAP_BASE), 0, PAGE_SIZE);
+    marker[PMM_ZERO_MAGIC_OFF / 8] = PMM_ZERO_MAGIC;
+    if (pcp->zero_count >= PMM_PCP_ZERO_LIMIT) {
+      pmm_pcp_zero_drain(pcp);
+    }
+    zero_push(pcp, frame);
+    done++;
+  }
+  irq_restore(flags);
+}
+
 void pmm_free_frame(u64 frame) {
+  if (zero_page_frame && frame == zero_page_frame) {
+    /* Shared zero page: reserved for the kernel's whole lifetime (its single
+     * allocation refcount is never released). Unmaps of read-only+COW
+     * zero-page PTEs — from any address space — land here. */
+    return;
+  }
   if ((frame & (PAGE_SIZE - 1)) != 0 || frame >= pmm.max_address) {
     /* Out-of-range or misaligned frames reach here legitimately: unmapping a
      * shared/device mapping (e.g. the virtio-gpu framebuffer at ~0xfe000000,
@@ -684,17 +931,48 @@ void pmm_free_frame(u64 frame) {
     u64 ifl = irq_save_cli();
     struct percpu *p = get_percpu();
     struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
-    if (pcp->count >= PMM_PCP_LIMIT) {
-      /* Overflowing — drain half back to global. pmm_pcp_drain takes the
-       * spinlock internally (which save/restores the flag we already
-       * cleared); the inner cli is a no-op. */
-      pmm_pcp_drain(pcp);
+
+    /* Double-free check: a page that is still parked somewhere (quarantine or
+     * zero bucket) carries its poison/zero marker. It is bitmap-USED and owned
+     * by a bucket, so freeing it again would corrupt the lists — refuse the
+     * free and report instead. Any genuinely owned frame has been memset by
+     * the allocator, so its marker slots are 0. */
+    u64 *marker = (u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    if (marker[PMM_POISON_CANARY_OFF / 8] == PMM_POISON_CANARY ||
+        marker[PMM_ZERO_MAGIC_OFF / 8] == PMM_ZERO_MAGIC) {
+      irq_restore(ifl);
+      static unsigned df_reported;
+      if (df_reported < 8) {
+        console_write("pmm: double free detected at 0x");
+        console_write_hex64(frame);
+        console_write("\n");
+        klog_warn("pmm_free_frame: double free (page already parked in a bucket)");
+        df_reported++;
+      }
+      return;
     }
-    /* Frame stays bitmap-USED while it sits in the cache; the link goes
-     * in the frame's own first 8 bytes via the direct map. */
-    *(u64 *)(usize)(frame + DIRECT_MAP_BASE) = pcp->head;
-    pcp->head = frame;
-    pcp->count++;
+
+    /* Poison and park in the quarantine queue, NOT the zero bucket: a freed
+     * page must age out of quarantine before it is reallocatable, so a UAF
+     * read hits poison instead of stale data and the scrubber can catch OOB
+     * writes into it. The scrubber (below) zeroes aged frames and moves them
+     * to the zero bucket. */
+    memset((void *)(usize)(frame + DIRECT_MAP_BASE), PMM_POISON_BYTE, PAGE_SIZE);
+    marker[PMM_POISON_CANARY_OFF / 8] = PMM_POISON_CANARY;
+    q_push(pcp, frame);
+    if (pcp->q_count > PMM_PCP_Q_LIMIT) {
+      /* Bucket full — promote the OLDEST victim (the head) to the zero bucket
+       * instead of releasing it to global: it stays withheld from allocation,
+       * only its parking spot changes. */
+      u64 oldest = q_pop(pcp);
+      memset((void *)(usize)(oldest + DIRECT_MAP_BASE), 0, PAGE_SIZE);
+      *(u64 *)(usize)(oldest + DIRECT_MAP_BASE + PMM_ZERO_MAGIC_OFF) =
+          PMM_ZERO_MAGIC;
+      if (pcp->zero_count >= PMM_PCP_ZERO_LIMIT) {
+        pmm_pcp_zero_drain(pcp);
+      }
+      zero_push(pcp, oldest);
+    }
     irq_restore(ifl);
     return;
   }
@@ -729,6 +1007,21 @@ u64 pmm_alloc_frame(void) {
   u64 flags = irq_save_cli();
   struct percpu *p = get_percpu();
   struct pmm_pcp *pcp = &pmm_pcp[p->cpu_id];
+
+  /* Pre-zeroed bucket first: frames parked here were memset at free time, so
+   * this fast path skips the per-allocation memset entirely — the zero-page
+   * COW write path, calloc, and fresh anonymous pages all benefit. */
+  if (pcp->zero_count > 0) {
+    u64 frame = pcp->zero_head;
+    pcp->zero_head = *(u64 *)(usize)(frame + DIRECT_MAP_BASE);
+    pcp->zero_count--;
+    /* Clear the "parked in zero bucket" marker so a later free of this page
+     * is not mistaken for a double free. One store vs a full memset. */
+    *(u64 *)(usize)(frame + DIRECT_MAP_BASE + PMM_ZERO_MAGIC_OFF) = 0;
+    if (pmm.frame_refcounts) pmm.frame_refcounts[frame_index(frame)] = 1;
+    irq_restore(flags);
+    return frame;  /* already zeroed by the scrubber / overflow promotion */
+  }
 
   if (pcp->count == 0) {
     /* Local empty — refill under global lock. pmm_pcp_refill itself does
@@ -838,11 +1131,11 @@ u64 pmm_alloc_frames(usize count) {
     u64 free_snapshot = 0;
     pmm_acquire(&flags);
 
-    /* Single-frame fast path: pop the free-list stack in O(1). */
-    if (count == 1 && pmm.free_list_ready) {
-      u64 frame = freelist_pop();
+    /* Single-frame fast path: pop an order-0 block off the buddy tree in
+     * O(1) amortised. */
+    if (count == 1 && buddy_ready) {
+      u64 frame = buddy_alloc(0);
       if (frame != 0) {
-        claim_frame(frame_index(frame));
         zero_frames(frame, 1);
         pmm_release(flags);
         if (reclaim_attempts == 0) {
@@ -857,9 +1150,10 @@ u64 pmm_alloc_frames(usize count) {
         }
         return frame;
       }
-      /* List empty. If the bitmap still shows free frames, the list missed
-       * some (it must not): fall back to the authoritative scan. Skip the scan
-       * when nothing is free so the OOM path stays O(1) instead of O(N). */
+      /* Buddy tree empty. If the bitmap still shows free frames, the tree
+       * missed some (it must not): fall back to the authoritative scan. Skip
+       * the scan when nothing is free so the OOM path stays O(1) instead of
+       * O(N). */
       if (pmm.free_frames > 0) {
         frame = bitmap_scan_alloc(1);
         if (frame != 0) {
@@ -877,8 +1171,59 @@ u64 pmm_alloc_frames(usize count) {
           return frame;
         }
       }
+    } else if (count > 1) {
+      /* Contiguous multi-frame request: buddy alloc of the smallest power of
+       * two covering `count`, then release the excess tail pages back to the
+       * tree (they merge into it). */
+      int order = 0;
+      while (((usize)1 << order) < count) order++;
+      u64 frame = buddy_ready ? buddy_alloc(order) : 0;
+      if (frame != 0) {
+        usize npages = (usize)1 << order;
+        if (npages > count) {
+          for (usize e = count; e < npages; e++) {
+            usize eidx = frame_index(frame) + e;
+            bitmap_clear(eidx);
+            if (pmm.frame_refcounts) pmm.frame_refcounts[eidx] = 0;
+            pmm.free_frames++;
+            buddy_merge_insert(frame + e * PAGE_SIZE, 0);
+          }
+        }
+        zero_frames(frame, count);
+        pmm_release(flags);
+        if (reclaim_attempts == 0) {
+          /* Healthy fast-path success. After a stretch of these, the
+           * pressure episode is over — re-arm the warning. */
+          if (++pmm_clean_alloc_streak >= 128) {
+            pmm_warned_pressure = 0;
+            pmm_oom_reported = 0;
+            pmm_total_reclaims = 0;
+            pmm_clean_alloc_streak = 0;
+          }
+        }
+        return frame;
+      }
+      if (pmm.free_frames > 0) {
+        frame = bitmap_scan_alloc(count);
+        if (frame != 0) {
+          pmm_release(flags);
+          if (reclaim_attempts == 0) {
+          /* Healthy fast-path success. After a stretch of these, the
+           * pressure episode is over — re-arm the warning. */
+          if (++pmm_clean_alloc_streak >= 128) {
+            pmm_warned_pressure = 0;
+            pmm_oom_reported = 0;
+            pmm_total_reclaims = 0;
+            pmm_clean_alloc_streak = 0;
+          }
+        }
+          return frame;
+        }
+      }
     } else {
-      u64 frame = bitmap_scan_alloc(count);
+      /* count == 1 before the buddy tree exists (early boot): the bitmap scan
+       * is the only allocator. */
+      u64 frame = bitmap_scan_alloc(1);
       if (frame != 0) {
         pmm_release(flags);
         if (reclaim_attempts == 0) {
@@ -1028,38 +1373,64 @@ u64 pmm_free_memory_estimate(void) { return pmm.free_frames * PAGE_SIZE; }
 
 usize pmm_free_frame_count(void) { return (usize)pmm.free_frames; }
 
+u64 pmm_zero_page(void) { return zero_page_frame; }
+
 void pmm_switch_to_direct_map(void) {
   if (pmm.bitmap) {
     pmm.bitmap = (u8 *)((u64)(usize)pmm.bitmap + DIRECT_MAP_BASE);
-  }
-  if (pmm.free_list_bitmap) {
-    pmm.free_list_bitmap =
-        (u8 *)((u64)(usize)pmm.free_list_bitmap + DIRECT_MAP_BASE);
   }
   if (pmm.frame_refcounts) {
     pmm.frame_refcounts = (u16 *)((u64)(usize)pmm.frame_refcounts + DIRECT_MAP_BASE);
   }
 
-  /* The direct map now exists, so free frames can hold the intrusive list link.
-   * Seed the stack with every currently-free frame (one-time O(frame_count)
-   * walk); from here on alloc/free maintain it incrementally. Skip whole
-   * all-used 64-bit bitmap words — for typical layouts a chunk of low memory,
-   * the kernel, and the bitmap/refcount pages are all used, so word-stride
-   * skipping cuts the seed cost a lot at large RAM under TCG. */
+  /* The direct map now exists, so free blocks can hold their intrusive list
+   * header. Seed the buddy tree with every currently-free frame (one-time
+   * walk), decomposing each contiguous free run into maximal aligned blocks
+   * (largest order first) — the canonical buddy representation. From here on
+   * alloc/free maintain the tree incrementally. Skip whole all-used 64-bit
+   * bitmap words — for typical layouts a chunk of low memory, the kernel, and
+   * the bitmap/refcount pages are all used, so word-stride skipping cuts the
+   * seed cost a lot at large RAM under TCG. */
   u64 flags;
   pmm_acquire(&flags);
   usize frame_count = (usize)(pmm.max_address / PAGE_SIZE);
   const u64 *words = (const u64 *)pmm.bitmap;
-  for (usize idx = 0; idx < frame_count;) {
+  usize idx = 0;
+  while (idx < frame_count) {
     if ((idx & 63) == 0 && idx + 64 <= frame_count && words[idx / 64] == ~0ULL) {
       idx += 64;
       continue;
     }
-    if (!bitmap_get(idx)) {
-      freelist_push(frame_from_index(idx));
+    if (bitmap_get(idx)) {
+      idx++;
+      continue;
     }
-    idx++;
+    /* Free run [idx, end). */
+    usize end = idx + 1;
+    while (end < frame_count && !bitmap_get(end)) end++;
+    /* Emit maximal aligned blocks within the run, largest first. */
+    usize pos = idx;
+    while (pos < end) {
+      int order = 0;
+      while (order < BUDDY_MAX_ORDER) {
+        usize pages = (usize)1 << (order + 1);
+        if (pos + pages > end) break;
+        if (pos & (pages - 1)) break;
+        order++;
+      }
+      buddy_insert(frame_from_index(pos), order);
+      pos += (usize)1 << order;
+    }
+    idx = end;
   }
-  pmm.free_list_ready = 1;
+  buddy_ready = 1;
   pmm_release(flags);
+
+  /* Reserve the shared zero page now that the buddy tree is live. It gets a
+   * normal allocation (refcount 1) and is never released — pmm_free_frame
+   * ignores it, so it can never be reallocated or swapped (it is also never
+   * registered in the eviction ring). */
+  zero_page_frame = pmm_alloc_frame();
+  if (!zero_page_frame)
+    panic("pmm: failed to reserve shared zero page");
 }

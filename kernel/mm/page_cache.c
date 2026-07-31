@@ -152,6 +152,70 @@ void page_cache_init(void) {
   pc_lock = 0;
 }
 
+/* ── File-level sequential readahead ────────────────────────────────────────
+ * A small per-inode cursor table detects a sequential access pattern in
+ * page_cache_get_page. On a sequential cache MISS it prefetches the next
+ * RA_PREFETCH pages so a file read sequentially (the in-guest self-host build
+ * reading sources/headers, or a sequential mmap scan) stops paying one
+ * blocking block read per page. Best-effort by design: a cold table, a
+ * non-file inode, no read_cb, or memory pressure simply skips the burst. */
+#define RA_STREAMS   256
+#define RA_PREFETCH    4
+#define RA_WARMUP      1  /* sequential misses seen before the first burst */
+
+struct ra_stream {
+  u64 ino;
+  u32 fsid;
+  u64 next; /* next file page expected for this stream (in PAGE_SIZE units) */
+  u32 seq;  /* consecutive sequential misses observed */
+};
+
+static struct ra_stream ra_streams[RA_STREAMS];
+static int ra_in_prefetch; /* re-entrancy guard (best-effort, mirrors the
+                              proactive-evict guard) */
+
+static u32 ra_hash(const struct vfs_inode *inode) {
+  u32 h = (u32)(inode->ino ^ (inode->ino >> 32));
+  h ^= (u32)inode->fs_id;
+  h ^= h >> 10;
+  return h % RA_STREAMS;
+}
+
+/* Prefetch RA_PREFETCH pages starting at (offset+1). Must be called with
+ * pc_lock RELEASED: it allocates frames and issues blocking read_cb I/O. It
+ * re-enters page_cache_get_page/page_cache_add_page; those re-entries observe
+ * ra_in_prefetch and never schedule a nested burst. */
+static void pc_readahead(struct vfs_inode *inode, u64 offset) {
+  if (ra_in_prefetch || !inode->read_cb)
+    return;
+  ra_in_prefetch = 1;
+  struct vfs_node dummy;
+  memset(&dummy, 0, sizeof(dummy));
+  dummy.inode = inode;
+  for (u64 po = offset + 1; po <= offset + RA_PREFETCH; po++) {
+    u64 poff = po * PAGE_SIZE;
+    if (poff >= inode->size)
+      break; /* don't read past EOF */
+    struct page_cache_entry *pe = page_cache_get_page(inode, poff);
+    if (pe) {
+      page_cache_put_page(pe); /* already resident — drop the pin */
+      continue;
+    }
+    u64 frame = pmm_alloc_frame();
+    if (!frame)
+      break; /* memory pressure — drop the rest of the burst */
+    void *virt = (void *)(usize)(frame + vmm_direct_map_base());
+    memset(virt, 0, PAGE_SIZE);
+    if (inode->read_cb(&dummy, poff, virt, PAGE_SIZE, 0) < 0) {
+      pmm_free_frame(frame);
+      break;
+    }
+    if (page_cache_add_page(inode, poff, frame) < 0)
+      pmm_free_frame(frame); /* raced with another reader — keep their page */
+  }
+  ra_in_prefetch = 0;
+}
+
 struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset) {
   if (to_free_list) {
     page_cache_process_deferred_free();
@@ -170,12 +234,43 @@ struct page_cache_entry *page_cache_get_page(struct vfs_inode *inode, u64 offset
        * off the inactive list. */
       lru_remove(curr);
       active_append(curr);
+      /* Hit: a sequential reader landing on an already-prefetched page advances
+       * the cursor (so the next burst fires at the right place) without
+       * scheduling — the earlier burst already filled this window. */
+      if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
+        struct ra_stream *r = &ra_streams[ra_hash(inode)];
+        if (r->ino == inode->ino && r->fsid == inode->fs_id &&
+            offset == r->next)
+          r->next = offset + 1;
+      }
       unlock_pc();
       return curr;
     }
     curr = curr->hash_next;
   }
+
+  /* Miss: sequential-stream bookkeeping under the lock; the actual prefetch
+   * (blocking I/O) runs after it is released. */
+  int do_ra = 0;
+  if (!ra_in_prefetch && inode->read_cb && inode->type == VFS_FILE) {
+    struct ra_stream *r = &ra_streams[ra_hash(inode)];
+    if (r->ino == inode->ino && r->fsid == inode->fs_id &&
+        offset == r->next) {
+      r->next = offset + 1;
+      if (++r->seq >= RA_WARMUP)
+        do_ra = 1;
+    } else {
+      /* New stream or a jump — restart the cursor, no burst yet (warm-up). */
+      r->ino = inode->ino;
+      r->fsid = inode->fs_id;
+      r->next = offset + 1;
+      r->seq = 0;
+    }
+  }
   unlock_pc();
+
+  if (do_ra)
+    pc_readahead(inode, offset);
   return 0;
 }
 

@@ -482,6 +482,15 @@ void paging_mprotect_page(u64 virtual_address, u64 flags) {
 
   if (pte & VMM_PRESENT) {
     u64 nf = flags;
+    /* The shared zero page must never become directly writable through
+     * mprotect — even after a PROT_READ downgrade dropped its COW marker — or
+     * a store would corrupt the one frame mapped into every address space.
+     * Re-arm COW so the first write materialises a private page. */
+    if ((nf & VMM_WRITABLE) &&
+        (pte & PAGE_ENTRY_ADDRESS_MASK) == pmm_zero_page()) {
+      nf &= ~VMM_WRITABLE;
+      nf |= VMM_COW;
+    }
     /* Never let mprotect(PROT_WRITE) flip a COW page (fork-shared anon, or a
      * MAP_PRIVATE view of a page-cache frame) to directly-writable — that
      * would let stores corrupt the shared frame. Keep the COW marker and
@@ -678,6 +687,27 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
         }
       }
     }
+    /* Zero-page dedup: a fresh anonymous heap page has no content, so point
+     * the mapping at the single shared read-only zero page instead of
+     * allocating a frame. The first store faults into the COW path and
+     * materialises a private frame (served from the pre-zeroed pool — no
+     * memset). Capacity win: brk/mmap regions stay unbacked until written. */
+    u64 zero_pg = pmm_zero_page();
+    if (zero_pg) {
+      u64 cflags;
+      vmm_write_acquire(&cflags);
+      u64 *slot = pf_leaf_pte_ptr(page_aligned);
+      if (slot && (*slot & VMM_PRESENT)) {
+        vmm_write_release(cflags);
+        return 0; /* already serviced concurrently */
+      }
+      vmm_map_page_locked(page_aligned, zero_pg,
+                          VMM_PRESENT | VMM_COW | VMM_USER);
+      vmm_write_release(cflags);
+      /* Not registered in the eviction ring: one shared frame, read-only, and
+       * swap must never evict a frame mapped in many address spaces. */
+      return 0;
+    }
     // Prepare a zeroed frame OUTSIDE the lock (alloc may run reclaim/swap).
     u64 frame = pmm_alloc_frame();
     if (!frame) {
@@ -731,6 +761,44 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
 
   // Case 1: Lazy page (VMM_LAZY leaf, not present) — anonymous or file-backed.
   if (!(pte & VMM_PRESENT) && (pte & VMM_LAZY)) {
+    /* Zero-page dedup: classify the faulting address up front. If it is
+     * anonymous (no covering file-backed VMA), map the single shared zero
+     * page read-only (+COW when the mapping is writable) instead of allocating
+     * a frame — the first store materialises a private page via the COW path.
+     * File-backed faults skip this and run the normal allocate+fill below. */
+    int anon_page = 1;
+    struct vm_area *va = current_task->vma_list;
+    while (va) {
+      if (page_aligned >= va->start && page_aligned < va->end) {
+        if (va->node && va->node->inode) {
+          struct vfs_inode *in = va->node->inode;
+          if (in->type == VFS_FILE || in->read_cb || in->data)
+            anon_page = 0;
+        }
+        break;
+      }
+      va = va->next;
+    }
+    if (anon_page && pmm_zero_page()) {
+      u64 cflags;
+      vmm_write_acquire(&cflags);
+      u64 *slot = pf_leaf_pte_ptr(page_aligned);
+      if (!slot || (*slot & VMM_PRESENT) || !(*slot & VMM_LAZY)) {
+        /* Another CPU serviced it (or it was torn down). */
+        vmm_write_release(cflags);
+        return (slot && (*slot & VMM_PRESENT)) ? 0 : -1;
+      }
+      u64 zflags = VMM_PRESENT;
+      if (*slot & VMM_WRITABLE) zflags |= VMM_COW; /* first store COWs */
+      if (*slot & VMM_USER) zflags |= VMM_USER;
+      if (*slot & VMM_NO_EXECUTE) zflags |= VMM_NO_EXECUTE;
+      *slot = pmm_zero_page() | zflags;
+      invalidate_page(page_aligned);
+      vmm_write_release(cflags);
+      /* Shared frame: never registered in the eviction ring (swap must not
+       * evict a page mapped read-only in many address spaces). */
+      return 0;
+    }
     u64 frame = pmm_alloc_frame();
     if (!frame) {
       eviction_evict_page();
@@ -921,6 +989,18 @@ int vmm_handle_page_fault(u64 fault_addr, u64 error_code) {
     new_flags &= ~VMM_COW;
     new_flags |= VMM_PRESENT | VMM_WRITABLE;
 
+    if (old_frame == pmm_zero_page()) {
+      /* First write to the shared zero page (zero-page dedup): the spare frame
+       * is already zero-filled, so there is nothing to copy, and the zero page
+       * must never be unreferenced or eviction-unregistered (it is shared and
+       * has a permanent reservation). */
+      *slot = new_frame | new_flags;
+      invalidate_page(page_aligned);
+      vmm_write_release(cflags);
+      eviction_register_page(current_task, page_aligned, new_frame);
+      return 0;
+    }
+
     if (pmm_get_refcount(old_frame) == 1) {
       // Sole owner now — just flip to writable in place, no copy needed.
       *slot = old_frame | new_flags;
@@ -1040,7 +1120,10 @@ static void clone_table(u64 *src_table, u64 *dst_table, int level) {
         }
 
         dst_table[i] = entry;
-        if (frame) {
+        if (frame && frame != pmm_zero_page()) {
+          /* The shared zero page keeps its permanent reservation refcount; a
+           * fork of an untouched (still shared) anonymous page adds no
+           * reference, and pmm_free_frame ignores it on teardown anyway. */
           pmm_ref_frame(frame);
         }
       } else {
