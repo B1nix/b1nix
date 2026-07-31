@@ -21,7 +21,7 @@
 #         dropbear, busybox, netsurf, the M40 Linux + M67 rust artifacts, etc.)
 #
 # OPT-IN heavy/optional components (each just calls its existing script):
-#     --with-cross            force-rebuild the cross GCC/binutils even if present
+#     --with-cross            force-rebuild the cross toolchain even if present
 #                             (tools/toolchain/build-toolchain.sh)
 #     --with-native-toolchain native GCC/binutils that run inside b1nix (M26)
 #                             (tools/toolchain/build-native-toolchain.sh

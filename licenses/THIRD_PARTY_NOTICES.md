@@ -1,6 +1,6 @@
 # Third-Party Software Notices & License Inventory
 
-The GPL and LGPL licenses described in `LICENSING.md` apply to original B1NIX material. They do not replace or override third-party software licenses. This document provides a complete inventory of all third-party libraries, toolchains, runtimes, and applications integrated or ported for B1NIX.
+The MIT license described in `LICENSING.md` applies to original B1NIX material. It does not replace or override third-party software licenses. This document provides a complete inventory of all third-party libraries, toolchains, runtimes, and applications integrated or ported for B1NIX.
 
 ---
 
@@ -20,10 +20,14 @@ The GPL and LGPL licenses described in `LICENSING.md` apply to original B1NIX ma
 | **musl libc** | 1.2.5 | MIT License | Primary C standard library (`libc.so`, `ld-musl-x86_64.so.1`, `libc.a`) |
 | **LLVM libc++ / libc++abi / libunwind** | 22.1.8 | Apache-2.0 WITH LLVM-exception | Modern C++ standard library, ABI & unwinder for b1nix |
 | **openlibm** | 0.8.3 | BSD-2-Clause / Freely redistributable | High-performance standalone C math library (`libopenlibm.a`) |
+| **Brotli** | 1.1.0 | MIT License | Generic lossless data compression library (`libbrotli`) |
+| **libffi** | 3.5.2 | MIT License | Portable Foreign Function Interface library (`libffi.a`) |
+| **libutf8proc** | 2.9.0 | MIT License | Clean C library for processing UTF-8 Unicode data |
+| **libharu** | 2.4.4 | Zlib / libpng License | Cross-platform C library for generating PDF files |
 
 ---
 
-## 3. ISO Bootloader, Shells & System Build Tools (Milestone M98 GNU-Free Environment)
+## 3. ISO Bootloader, Shells, Service Managers & System Build Tools (Milestone M98 GNU-Free Environment)
 
 Following Milestone M98 (GNU-free ISO), GNU GRUB, GNU bash, GNU Wget, and GNU Make were replaced in the default ISO distribution by permissively-licensed tools:
 
@@ -33,6 +37,8 @@ Following Milestone M98 (GNU-free ISO), GNU GRUB, GNU bash, GNU Wget, and GNU Ma
 | **zsh (Z Shell)** | 5.9 | Zsh License / MIT-style | Primary interactive login shell (`/bin/zsh`) |
 | **netbsd-curses** | 9.0 | BSD-3-Clause | Lightweight NetBSD curses/terminfo library for zsh |
 | **BusyBox** | 1.38.0 | GNU GPL version 2 | POSIX core utilities & default `/bin/sh` (`ash`) |
+| **OpenRC** | 0.54 | BSD-2-Clause | Dependency-based init & service management system |
+| **runit** | 2.1.2 | BSD-3-Clause / Public Domain | UNIX init scheme with service supervision |
 | **bmake** | current | BSD-3-Clause | NetBSD Make build automation tool (`/bin/make`) |
 | **samurai** | 1.2 | 0BSD | C reimplementation of the Ninja build system (`/bin/samu`, `/bin/ninja`) |
 
@@ -59,10 +65,17 @@ Following Milestone M98 (GNU-free ISO), GNU GRUB, GNU bash, GNU Wget, and GNU Ma
 | Component | Version | License Summary | Description |
 | --- | ---: | --- | --- |
 | **Mesa 3D** | 24.1.0 | MIT License | OpenGL / Gallium software & hardware graphics renderer |
+| **Skia** | m124 | BSD-3-Clause | Complete 2D graphic library for drawing text, geometries, and images |
+| **TinyGL** | 0.4 | Zlib / MIT License | Small software implementation of a subset of OpenGL |
 | **NetSurf FB** | 3.11 | GPL-2.0-only / MIT (libraries) | Framebuffer web browser for b1nix |
+| **NetSurf Libraries** | 0.9 / 0.4 | MIT License | Support libraries (`libcss`, `libdom`, `libhubbub`, `libparserutils`, `libwapcaplet`, `libnsbmp`, `libnsgif`, `libnslog`, `libnsutils`, `librosprite`, `libsvgtiny`) |
+| **litehtml** | 0.9 | MIT License | Fast and lightweight HTML rendering engine |
 | **zlib** | 1.3.1 | zlib License | Data compression library |
 | **libpng** | 1.6.43 | libpng License | PNG image decoding/encoding |
 | **libjpeg-turbo** | 3.0.3 | IJG / BSD-3-Clause | Accelerated JPEG image decoding/encoding |
+| **libwebp** | 1.4.0 | BSD-3-Clause | WebP image format decoding and encoding library |
+| **libvpx** | 1.14.1 | BSD-3-Clause | VP8/VP9 video codec library |
+| **libjxl** | 0.11.1 | BSD-3-Clause | JPEG XL reference implementation |
 | **FreeType** | 2.13.2 | FTL (BSD-style) / GPL-2.0 | Font rendering engine |
 | **Fontconfig** | 2.15.0 | MIT License | Font configuration and discovery |
 | **Pixman** | 0.43.4 | MIT License | Low-level pixel manipulation library |
@@ -71,8 +84,6 @@ Following Milestone M98 (GNU-free ISO), GNU GRUB, GNU bash, GNU Wget, and GNU Ma
 | **libwayland** | 1.23.0 | MIT License | Display server protocol support |
 | **libxkbcommon** | 1.7.0 | MIT License | Keyboard keymap handling library |
 | **HarfBuzz** | 8.5.0 | MIT License | Text shaping engine |
-
----
 
 ## 6. Binary Distribution & Compliance Requirements
 

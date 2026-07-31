@@ -281,9 +281,7 @@ B1NIX_TLS ?= mbedtls
 PORTS_SOURCE ?= download
 PACKAGE_INDEX_URL ?= https://cdn.jsdelivr.net/gh/B1nix/b1nix-pkgs@main/pkgs/index
 
-# Kernel build toolchain selector. Default is clang; `make TOOLCHAIN=gcc ...`
-# builds the kernel with the ported cross x86_64-b1nix-gcc/ld (toward M26
-# self-host). CC/LD are assigned below, after CROSS_TOOLCHAIN_ROOT is known.
+# Kernel build toolchain selector (Clang/LLVM).
 TOOLCHAIN ?= clang
 MKE2FS := $(shell command -v mke2fs 2>/dev/null || command -v /sbin/mke2fs 2>/dev/null || printf '%s' /opt/homebrew/opt/e2fsprogs/sbin/mke2fs)
 # ISO builder. Limine (BSD-2-Clause) + xorriso replaced GRUB's grub-mkrescue
@@ -368,13 +366,7 @@ COMMON_CFLAGS := \
 
 ifeq ($(ARCH),x86_64)
 TARGET := x86_64-elf
-# clang needs --target to cross-compile; the b1nix-gcc cross compiler already
-# targets x86_64 natively, so it must NOT receive --target (it is clang-only).
-ifeq ($(TOOLCHAIN),gcc)
-ARCH_CFLAGS := -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
-else
 ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -mno-3dnow
-endif
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S

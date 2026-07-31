@@ -30,7 +30,7 @@ active restoration and development on the `feature/aarch64` branch.
 - Framebuffer console, Mesa 3D graphics renderer, NetSurf FB web browser, a small compositor, a text editor, and a two-panel file manager.
 - A shell (`zsh` interactive, `ash` `/bin/sh`) with pipelines, redirection, scripts, globbing, command and arithmetic substitution, here-documents, functions, loops, `case`, arrays, traps, and foreground/background job control.
 - Native utilities plus musl libc, LLVM libc++, zsh, curl, Dropbear SSH, TinyCC, Duktape, bmake, samurai, Mesa 3D, openlibm, and BusyBox 1.38.0.
-- Ported binutils, GCC, libstdc++, bmake, samurai, and native build toolchain. The x86_64 kernel can be compiled and linked from inside B1NIX.
+- Ported LLVM/Clang toolchain, bmake, samurai, b1cc, and native build environment. The x86_64 kernel can be compiled and linked from inside B1NIX.
 - Automated QEMU coverage for boot, SMP, memory, storage, filesystems,
   networking, SSH, graphics, libc, shell, and userspace behavior.
 
@@ -324,12 +324,9 @@ smoke_run/          generated test logs, captures, and temporary images
 
 ## License
 
-Original B1NIX code is licensed under
-[GPL-3.0-or-later](LICENSE). The original B1NIX userspace C library, headers,
-and C runtime are licensed under
-[LGPL-3.0-or-later](LICENSE.LGPL-3.0), allowing applications under other
-licenses to use the library subject to the LGPL conditions.
+Original B1NIX code is licensed under the
+[MIT License](LICENSE).
 
-See [LICENSING.md](LICENSING.md) for the exact scope. TinyCC and all other
+See [licenses/LICENSING.md](licenses/LICENSING.md) for the exact scope. TinyCC and all other
 third-party components retain their own licenses; see
-[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+[licenses/THIRD_PARTY_NOTICES.md](licenses/THIRD_PARTY_NOTICES.md).
