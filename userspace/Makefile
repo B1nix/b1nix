@@ -146,7 +146,6 @@ GUI_BINARIES := $(BUILD)/bin/gclock $(BUILD)/bin/gterm $(BUILD)/bin/gpaint \
 
 
 BINARIES := \
-	$(BUILD)/bin/init \
 	$(BUILD)/bin/hello \
 	$(BUILD)/bin/native_smoke \
 	$(BUILD)/bin/m12_smoke \
@@ -330,6 +329,12 @@ $(addprefix $(BUILD)/bin/,$(B1CC_BINS)): $(BUILD)/bin/%: bin/%.c
 # ELF linker and reads its CRT/archives from /lib/b1cc, instead of shelling out
 # to a host `cc`/ld.lld that does not exist inside the guest. Without it the
 # on-device compiler dies with "sh: cc: not found" on the first link.
+# The guest b1cc builds with the full parallel pthread emit pool. The m25
+# float-check wedge (17 emit threads spinning forever) was NOT a b1cc bug: it
+# was the kernel's Linux-ABI futex dispatch returning -EINVAL for musl's
+# FUTEX_WAIT/WAKE|FUTEX_PRIVATE (0x80/0x81) ops, so musl __wait/__lock never
+# parked and busy-spun instead. That is fixed in the kernel LX futex dispatch
+# (kernel/syscall/syscall.c) — do not reintroduce -DB1CC_SERIAL_EMIT here.
 $(BUILD)/bin/b1cc: $(B1CC_SELF_SRCS)
 	@mkdir -p $(dir $@)
 	B1NIX_ARCH=$(B1NIX_ARCH) $(MUSL_CC) -std=gnu2x -Db1nix $(B1CC_SELF_SRCS) -o $@

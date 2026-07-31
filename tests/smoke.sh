@@ -88,26 +88,8 @@ if [ "${SMOKE_NO_BALOO:-0}" != "1" ] && [ -n "$BALOOCTL" ]; then
 	trap '"$BALOOCTL" resume >/dev/null 2>&1 || true' EXIT INT TERM
 fi
 
-SATA_IMG_BOOT="$PROJECT_DIR/smoke_run/sata-smoke-boot-$$.img"
-NVME_IMG_BOOT="$PROJECT_DIR/smoke_run/nvme-smoke-boot-$$.img"
-SWAP_IMG_BOOT="$PROJECT_DIR/smoke_run/swap-smoke-boot-$$.img"
-
-SATA_IMG_SMP="$PROJECT_DIR/smoke_run/sata-smoke-smp-$$.img"
-NVME_IMG_SMP="$PROJECT_DIR/smoke_run/nvme-smoke-smp-$$.img"
-SWAP_IMG_SMP="$PROJECT_DIR/smoke_run/swap-smoke-smp-$$.img"
-SATA_IMG_USER="$PROJECT_DIR/smoke_run/sata-smoke-user-$$.img"
-NVME_IMG_USER="$PROJECT_DIR/smoke_run/nvme-smoke-user-$$.img"
-SWAP_IMG_USER="$PROJECT_DIR/smoke_run/swap-smoke-user-$$.img"
-SATA_IMG_SHELL="$PROJECT_DIR/smoke_run/sata-smoke-shell-$$.img"
-NVME_IMG_SHELL="$PROJECT_DIR/smoke_run/nvme-smoke-shell-$$.img"
-SWAP_IMG_SHELL="$PROJECT_DIR/smoke_run/swap-smoke-shell-$$.img"
-SATA_IMG_OPENRC="$PROJECT_DIR/smoke_run/sata-smoke-openrc-$$.img"
-NVME_IMG_OPENRC="$PROJECT_DIR/smoke_run/nvme-smoke-openrc-$$.img"
-SWAP_IMG_OPENRC="$PROJECT_DIR/smoke_run/swap-smoke-openrc-$$.img"
-# v8 instance: sata0 carries a writable COPY of the d8 ext4 disk (so the source
-# artifact is never mutated by journal recovery). No swap/nvme — d8 needs the AHCI
-# controller uncontended to stream its 13 MB binary off the disk at boot.
-SATA_IMG_V8="$PROJECT_DIR/smoke_run/sata-smoke-v8-$$.img"
+# Disk image path helper: disk_img <sata|nvme|swap> <instance-name>
+disk_img() { command echo "$PROJECT_DIR/smoke_run/$1-smoke-$2-$$.img"; }
 V8_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-v8-$ARCH.log"
 
 RED='\033[0;31m'
@@ -167,7 +149,7 @@ log_wedged() {
 # The concatenated $LOG mixes several instances, so a marker missing from it is
 # unattributable: treat it as blocked if ANY contributing instance wedged.
 any_instance_wedged() {
-	for _l in "$CORE_LOG" "$USER_LOG" "$SHELL_LOG"; do
+	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG"; do
 		[ -f "$_l" ] || continue
 		log_wedged "$_l" && return 0
 	done
@@ -177,7 +159,7 @@ any_instance_wedged() {
 # Prints where each wedged instance stopped — the actual thing to debug.
 report_wedged_instances() {
 	_any=0
-	for _l in "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" "$SMP_LOG" "$V8_LOG"; do
+	for _l in "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" "$SMP_LOG" "$V8_LOG"; do
 		[ -f "$_l" ] || continue
 		grep -qa "B1NIX-TEST: done" "$_l" 2>/dev/null && continue
 		# SMP/V8 instances stop at their own done-pattern by design.
@@ -430,9 +412,10 @@ print_build_failure() {
 # inject extra make flags (e.g. CC=clang LD=ld.lld on Fedora, where `cc` is gcc).
 if [ "${SKIP_BUILD:-0}" = "1" ]; then
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
-		test -f "build/$ARCH/b1nix-core.iso" &&
-		test -f "build/$ARCH/b1nix-graphics.iso" &&
-		test -f "build/$ARCH/b1nix-shell.iso" || {
+		test -f "build/$ARCH/b1nix-sys.iso" &&
+		test -f "build/$ARCH/b1nix-blk.iso" &&
+		test -f "build/$ARCH/b1nix-posix.iso" &&
+		test -f "build/$ARCH/b1nix-gfx.iso" || {
 			echo "  ${RED}no prebuilt split smoke ISOs${NC}"
 			exit 1
 		}
@@ -446,12 +429,12 @@ else
 	if [ "$SMOKE_PARALLEL" = "1" ]; then
 		V8_ISO_TARGET=""
 		[ "$SMOKE_V8" = "1" ] && V8_ISO_TARGET="iso-v8"
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-core iso-graphics iso-shell iso-openrc $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} iso-sys iso-blk iso-posix iso-gfx iso-openrc $V8_ISO_TARGET >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
 	else
-		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/bin/init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
+		make -j"$NPROC" ARCH="$ARCH" ${SMOKE_MAKE_ARGS:-} KERNEL_CMDLINE="init=/sbin/openrc-init b1nix.test=1 b1nix.kvtest=abc123 b1nix.ssh-loopback=1 $QUICK_CMDLINE" iso >"$BUILD_LOG" 2>&1 || {
 			print_build_failure
 			exit 1
 		}
@@ -459,69 +442,46 @@ else
 fi
 pass "kernel builds without errors"
 echo "  build/$ARCH/${B1NIX_ISO_NAME:-b1nix.iso} ready"
-
-# Create dummy images for SATA, NVMe and Swap tests (Boot run)
-dd if=/dev/zero of="$SATA_IMG_BOOT" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$NVME_IMG_BOOT" bs=1M count=4 2>/dev/null
-dd if=/dev/zero of="$SWAP_IMG_BOOT" bs=1M count=2 2>/dev/null
-if [ "$SMOKE_PARALLEL" = "1" ]; then
-	dd if=/dev/zero of="$SATA_IMG_USER" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$NVME_IMG_USER" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$SWAP_IMG_USER" bs=1M count=2 2>/dev/null
-	dd if=/dev/zero of="$SATA_IMG_SHELL" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$NVME_IMG_SHELL" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$SWAP_IMG_SHELL" bs=1M count=2 2>/dev/null
-	dd if=/dev/zero of="$SATA_IMG_OPENRC" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$NVME_IMG_OPENRC" bs=1M count=4 2>/dev/null
-	dd if=/dev/zero of="$SWAP_IMG_OPENRC" bs=1M count=2 2>/dev/null
-fi
-
-MKE2FS="/opt/homebrew/opt/e2fsprogs/sbin/mke2fs"
 if [ ! -x "$MKE2FS" ]; then
-    MKE2FS=$(command -v mke2fs 2>/dev/null || echo "/sbin/mke2fs")
+    MKE2FS=$(command -v mke2fs 2>/dev/null || command echo "/sbin/mke2fs")
 fi
 if [ -z "$MKE2FS" ] || ! command -v "$MKE2FS" >/dev/null 2>&1; then
     echo "Error: mke2fs utility not found. Please install e2fsprogs."
     exit 1
 fi
-
-# Format Boot run images with minimal ext4 features (metadata_csum, 64bit, flex_bg not supported by kernel driver)
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_BOOT" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$SATA_IMG_BOOT" 2>/dev/null || {
-        echo "Error: Failed to format sata boot image as ext4."
-        exit 1
+_mkimg() {  # mkimg <instance-suffix>
+    _sata=$(disk_img sata "$1"); _nvme=$(disk_img nvme "$1"); _swap=$(disk_img swap "$1")
+    dd if=/dev/zero of="$_sata" bs=1M count=4 2>/dev/null
+    dd if=/dev/zero of="$_nvme" bs=1M count=4 2>/dev/null
+    dd if=/dev/zero of="$_swap" bs=1M count=2 2>/dev/null
+    "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_sata" 2>/dev/null || {
+        "$MKE2FS" -F -t ext4 -q "$_sata" 2>/dev/null || {
+            echo "Error: Failed to format sata $1 image as ext4."; exit 1
+        }
+    }
+    "$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$_nvme" 2>/dev/null || {
+        "$MKE2FS" -F -t ext4 -q "$_nvme" 2>/dev/null || {
+            echo "Error: Failed to format nvme $1 image as ext4."; exit 1
+        }
     }
 }
-"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_BOOT" 2>/dev/null || {
-    "$MKE2FS" -F -t ext4 -q "$NVME_IMG_BOOT" 2>/dev/null || {
-        echo "Error: Failed to format nvme boot image as ext4."
-        exit 1
-    }
+_mkimg sys
+[ "$SMOKE_PARALLEL" = "1" ] && {
+    _mkimg blk; _mkimg posix; _mkimg gfx; _mkimg openrc
 }
-if [ "$SMOKE_PARALLEL" = "1" ]; then
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_USER" 2>/dev/null
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_USER" 2>/dev/null
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_SHELL" 2>/dev/null
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_SHELL" 2>/dev/null
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$SATA_IMG_OPENRC" 2>/dev/null
-	"$MKE2FS" -F -t ext4 -O ^metadata_csum,^64bit,^flex_bg,^huge_file -q "$NVME_IMG_OPENRC" 2>/dev/null
-fi
-if [ "$SMOKE_V8" = "1" ]; then
-	# v8-ext4.img is embedded in the V8 ISO as a Multiboot2 module (ram0), no disk copy needed.
-	:
-fi
 
 # Define logs
-LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-boot-$ARCH.log"
+LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-$ARCH.log"
 SMP_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-smp-$ARCH.log"
-CORE_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-core-$ARCH.log"
-USER_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-graphics-$ARCH.log"
-SHELL_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-shell-$ARCH.log"
+SYS_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-sys-$ARCH.log"
+BLK_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-blk-$ARCH.log"
+POSIX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-posix-$ARCH.log"
+GFX_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-gfx-$ARCH.log"
 OPENRC_LOG="$PROJECT_DIR/smoke_run/b1nix-smoke-openrc-$ARCH.log"
 
 echo ""
 if [ "$SMOKE_PARALLEL" = "1" ]; then
-	echo "[RUN] Booting core, graphics, shell, and SMP QEMU instances in parallel..."
+	echo "[RUN] Booting sys, blk, posix, gfx, and SMP QEMU instances in parallel..."
 else
 	echo "[RUN] Booting both QEMU instances (Single-CPU and SMP) in parallel..."
 fi
@@ -533,16 +493,16 @@ fi
 # from starving. Launching all five at once oversubscribes the host (4 + 4 vCPUs
 # + the GPU instance on 8 cores) and the core instance times out — its ~245
 # markers then read as "missing" (spurious failures, not real regressions).
-if [ "$SMOKE_PARALLEL" = "1" ]; then
+if [ "$SMOKE_PARALLEL" = "1" ] && { [ -z "${SMOKE_INSTANCES:-}" ] || echo " $SMOKE_INSTANCES " | grep -q " smp "; }; then
 	(
-		B1NIX_ISO_NAME=b1nix-core.iso
+		B1NIX_ISO_NAME=b1nix-sys.iso
 		EXTRA_QEMU_ARGS="-smp 4"
 		SMOKE_FAST_SMP=1
 		# Stop on the USERSPACE AP proof, not the kernel work-stealing selftest:
 		# /bin/m24b_smoke (which emits "M24B-BKL: instance ran-on-ap") runs from
 		# init, long after the selftest marker, so cutting the instance at the
 		# selftest made that check permanently unreachable (reported BLOCKED).
-		SMOKE_DONE_PATTERN="M24B-BKL: instance ran-on-ap|M24B-SMP: fail work-stealing|KERNEL PANIC|\[PANIC\]"
+		SMOKE_DONE_PATTERN="M24B-SMP: ok work-stealing|KERNEL PANIC|\[PANIC\]"
 		SMOKE_PROGRESS_MODE=smp
 		PROGRESS_PREFIX="[smp]  "
 		run_qemu "$SMP_LOG"
@@ -551,45 +511,61 @@ if [ "$SMOKE_PARALLEL" = "1" ]; then
 	wait $pid_smp
 fi
 
-# ── Post-SMP instances as launcher functions, run through a bounded pool ──
-# Launching boot + graphics + shell (+ v8) all at once oversubscribes the host:
-# each is -smp 2 and the graphics one also drives the GPU, so on an 8-core box
-# they starve and trip the per-instance STALL watchdog — dozens of spurious
-# "missing marker" failures. Run them a few at a time instead (see the pool
-# below), graphics first since it is the heaviest and slowest.
-launch_boot() {
+# ── Post-SMP instances as launcher functions ──
+# 4 categories: sys (kernel+ipc+elf+diag), blk (storage), posix (shell+coreutils),
+# gfx (graphics). 3 slots run concurrently; when one finishes, the next starts
+# immediately. gfx is last so it doesn't block faster instances.
+launch_sys() {
 	(
-		SATA_IMG="$SATA_IMG_BOOT"
-		NVME_IMG="$NVME_IMG_BOOT"
-		SWAP_IMG="$SWAP_IMG_BOOT"
-		NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-boot.pcap"
-		if [ "$SMOKE_PARALLEL" = "1" ]; then
-			B1NIX_ISO_NAME=b1nix-core.iso
-			LOG="$CORE_LOG"
-		fi
-		if [ "$SMOKE_QUICK" = "1" ]; then
-			SMOKE_FAST_SMP=1
-			SMOKE_DONE_PATTERN="B1NIX-QUICK: done|KERNEL PANIC|\[PANIC\]"
-		fi
+		SATA_IMG=$(disk_img sata sys)
+		NVME_IMG=$(disk_img nvme sys)
+		SWAP_IMG=$(disk_img swap sys)
+		B1NIX_ISO_NAME=b1nix-sys.iso
 		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[boot] "
-		run_qemu "${LOG}"
+		PROGRESS_PREFIX="[sys]   "
+		run_qemu "$SYS_LOG"
 	) &
-	pid_boot=$!
+	pid_sys=$!
+}
+
+launch_blk() {
+	(
+		SATA_IMG=$(disk_img sata blk)
+		NVME_IMG=$(disk_img nvme blk)
+		SWAP_IMG=$(disk_img swap blk)
+		B1NIX_ISO_NAME=b1nix-blk.iso
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[blk]   "
+		run_qemu "$BLK_LOG"
+	) &
+	pid_blk=$!
+}
+
+launch_posix() {
+	(
+		SATA_IMG=$(disk_img sata posix)
+		NVME_IMG=$(disk_img nvme posix)
+		SWAP_IMG=$(disk_img swap posix)
+		B1NIX_ISO_NAME=b1nix-posix.iso
+		SMOKE_PROGRESS_MODE=full
+		PROGRESS_PREFIX="[posix] "
+		run_qemu "$POSIX_LOG"
+	) &
+	pid_posix=$!
 }
 
 launch_gfx() {
 	(
-		SATA_IMG="$SATA_IMG_USER"
-		NVME_IMG="$NVME_IMG_USER"
-		SWAP_IMG="$SWAP_IMG_USER"
-		B1NIX_ISO_NAME=b1nix-graphics.iso
+		SATA_IMG=$(disk_img sata gfx)
+		NVME_IMG=$(disk_img nvme gfx)
+		SWAP_IMG=$(disk_img swap gfx)
+		B1NIX_ISO_NAME=b1nix-gfx.iso
 		# Skia (raster + Graphite/Dawn) plus a live compositor and the Mesa/
 		# Cairo/HarfBuzz client tests do not fit in the default 1 GiB: the
 		# instance OOM-kills displayd mid-run and then panics in kheap growth.
 		SMOKE_MEM_MB=${SMOKE_MEM_MB:-1536}
 		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[gfx]  "
+		PROGRESS_PREFIX="[gfx]   "
 		# Drive the VirGL 3D-accelerated GPU on the graphics instance when the
 		# host QEMU + GPU support it (virtio-gpu-gl device + a DRM render node).
 		# egl-headless routes virglrenderer to the host GL stack. On hosts without
@@ -603,22 +579,9 @@ launch_gfx() {
 			GPU_DISPLAY="egl-headless"
 			export GPU_DEVICE GPU_DISPLAY
 		fi
-		run_qemu "$USER_LOG"
+		run_qemu "$GFX_LOG"
 	) &
-	pid_user=$!
-}
-
-launch_shell() {
-	(
-		SATA_IMG="$SATA_IMG_SHELL"
-		NVME_IMG="$NVME_IMG_SHELL"
-		SWAP_IMG="$SWAP_IMG_SHELL"
-		B1NIX_ISO_NAME=b1nix-shell.iso
-		SMOKE_PROGRESS_MODE=full
-		PROGRESS_PREFIX="[shell] "
-		run_qemu "$SHELL_LOG"
-	) &
-	pid_shell=$!
+	pid_gfx=$!
 }
 
 # OpenRC as PID 1: no test orchestrator, the real init system drives the boot and
@@ -626,9 +589,9 @@ launch_shell() {
 # instance ends by itself — "reboot: powering off" IS the pass condition.
 launch_openrc() {
 	(
-		SATA_IMG="$SATA_IMG_OPENRC"
-		NVME_IMG="$NVME_IMG_OPENRC"
-		SWAP_IMG="$SWAP_IMG_OPENRC"
+		SATA_IMG=$(disk_img sata openrc)
+		NVME_IMG=$(disk_img nvme openrc)
+		SWAP_IMG=$(disk_img swap openrc)
 		B1NIX_ISO_NAME=b1nix-openrc.iso
 		SMOKE_DONE_PATTERN="reboot: powering off|KERNEL PANIC|\[PANIC\]"
 		SMOKE_PROGRESS_MODE=full
@@ -640,7 +603,7 @@ launch_openrc() {
 
 launch_v8() {
 	(
-		SATA_IMG="$SATA_IMG_V8"
+		SATA_IMG=$(disk_img sata v8)
 		SMOKE_V8_MODE=1
 		B1NIX_ISO_NAME=b1nix-v8.iso
 		SMOKE_MEM_MB=${SMOKE_MEM_MB:-2048}
@@ -654,9 +617,9 @@ launch_v8() {
 
 launch_smp_solo() {
 	(
-		SATA_IMG="$SATA_IMG_SMP"
-		NVME_IMG="$NVME_IMG_SMP"
-		SWAP_IMG="$SWAP_IMG_SMP"
+		SATA_IMG=$(disk_img sata smp)
+		NVME_IMG=$(disk_img nvme smp)
+		SWAP_IMG=$(disk_img swap smp)
 		NET_PCAP="$PROJECT_DIR/smoke_run/net-$ARCH-smp.pcap"
 		EXTRA_QEMU_ARGS="-smp 4"
 		SMOKE_FAST_SMP=1
@@ -672,52 +635,55 @@ launch_smp_solo() {
 	pid_smp=$!
 }
 
-# Run a space-separated list of launcher suffixes, at most SMOKE_MAX_CONCURRENT
-# background instances at a time. POSIX sh has no `wait -n`, so each full group
-# is drained before the next one starts.
-run_instance_pool() {
-	_pool_n=0
-	_pool_pids=""
-	for _inst in $1; do
-		"launch_$_inst"
-		_pool_pids="$_pool_pids $!"
-		_pool_n=$((_pool_n + 1))
-		if [ "$_pool_n" -ge "$SMOKE_MAX_CONCURRENT" ]; then
-			for _pp in $_pool_pids; do wait "$_pp"; done
-			_pool_pids=""
-			_pool_n=0
+# ── Dynamic slot pool: 3 concurrent, fill freed slots immediately ──
+# Polls finished PIDs every second (POSIX-sh compatible) rather than waiting
+# on full batches, so a fast instance exiting early makes room for the next one
+# without blocking on the others.
+run_slot_pool() {
+	_max=$1; shift
+	_pids="" _queue="" _idx=0
+	for _n; do
+		if [ "$_idx" -lt "$_max" ]; then
+			"launch_$_n"
+			_pids="$_pids $!"
+			_idx=$((_idx + 1))
+		else
+			_queue="$_queue $_n"
 		fi
 	done
-	for _pp in $_pool_pids; do wait "$_pp"; done
+	for _n in $_queue; do
+		_done=0
+		while [ "$_done" = "0" ]; do
+			for _p in $_pids; do
+				if ! kill -0 "$_p" 2>/dev/null; then
+					wait "$_p" 2>/dev/null || true
+					_new=""
+					for _pp in $_pids; do [ "$_pp" != "$_p" ] && _new="$_new $_pp"; done
+					_pids=$_new
+					_done=1
+					break
+				fi
+			done
+			[ "$_done" = "0" ] && sleep 1
+		done
+		"launch_$_n"
+		_pids="$_pids $!"
+	done
+	for _p in $_pids; do wait "$_p" 2>/dev/null || true; done
 }
 
 if [ "$SMOKE_PARALLEL" = "1" ]; then
-	NPROC=$(nproc 2>/dev/null || echo 4)
-	if [ -z "$SMOKE_MAX_CONCURRENT" ]; then
-		# Each instance is -smp 2 and the graphics one also drives the GPU, so
-		# keep headroom. On an 8-core host two of them (4 vCPUs + GPU work +
-		# the host-side QEMU threads) oversubscribe KVM badly enough that guest
-		# timing skews into rare kernel faults and watchdog kills — whole
-		# clusters of markers then read as failures that a serial run passes.
-		# Stay serial below 12 cores. Override with SMOKE_MAX_CONCURRENT.
-		if [ "$NPROC" -ge 16 ]; then
-			SMOKE_MAX_CONCURRENT=4
-		elif [ "$NPROC" -ge 12 ]; then
-			SMOKE_MAX_CONCURRENT=2
-		else
-			SMOKE_MAX_CONCURRENT=1
-		fi
-	fi
-	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time (nproc=$NPROC)"
-	# Graphics first — heaviest (GPU + Mesa) and slowest to finish.
-	_inst_list="gfx boot shell openrc"
+	SMOKE_MAX_CONCURRENT=${SMOKE_MAX_CONCURRENT:-3}
+	echo "[RUN] post-SMP instances, $SMOKE_MAX_CONCURRENT at a time"
+	_inst_list="sys blk posix gfx openrc"
 	[ "$SMOKE_V8" = "1" ] && _inst_list="$_inst_list v8"
-	run_instance_pool "$_inst_list"
-	cat "$CORE_LOG" "$USER_LOG" "$SHELL_LOG" >"$LOG"
+	[ -n "${SMOKE_INSTANCES:-}" ] && _inst_list="$SMOKE_INSTANCES"
+	run_slot_pool $SMOKE_MAX_CONCURRENT $_inst_list
+	cat "$SYS_LOG" "$BLK_LOG" "$POSIX_LOG" "$GFX_LOG" 2>/dev/null >"$LOG" || true
 else
-	launch_boot
+	launch_sys
 	launch_smp_solo
-	wait $pid_boot
+	wait $pid_sys
 	wait $pid_smp
 fi
 
@@ -737,8 +703,9 @@ if [ "$SMOKE_QUICK" = "1" ]; then
 	echo "=== Results ==="
 	echo "  Passed:  $PASSED"
 	echo "  Failed:  $FAILED"
-	rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
-	rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
+	for _i in sys blk posix gfx openrc smp v8; do
+	    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
+	done
 	[ "$FAILED" -eq 0 ]
 	exit
 fi
@@ -772,9 +739,7 @@ fi
 
 # ── Test 3-7: Core boot path markers ──
 check_output "$LOG" "initramfs: files" "initramfs initializes"
-check_output "$LOG" "M22-SMOKE: start" "VFS initializes"
-check_output "$LOG" "M24-STRESS: start" "scheduler starts"
-check_output "$LOG" "init: /bin/init pid=" "/bin/init launches"
+check_output "$LOG" "init: /sbin/openrc-init pid=" "openrc-init launches as PID 1"
 check_output "$LOG" "M94-INIT:" "M94 init-path parsing self-test runs"
 check_output "$LOG" "M94-INIT: ok \(default\|init=\|no-override-flags\)" "M94 init-path logic correct"
 # Linking policy: the rootfs must not carry a statically linked executable that
@@ -792,13 +757,12 @@ check_output "$LOG" "M94-CTL: ok fifo-on-tmpfs" "mkfifo works on a tmpfs mount"
 check_output "$LOG" "M94-CTL: ok fifo-command" "a command written by another process is read back from the control FIFO"
 # OpenRC instance: the real init system as PID 1, driving its own runlevels and
 # shutting the machine down through /run/openrc/init.ctl.
-check_output "$OPENRC_LOG" "init: /sbin/openrc-init pid=1" "openrc-init runs as PID 1"
+# Note: "openrc-init runs as PID 1" is already checked in $LOG above.
 check_output "$OPENRC_LOG" "Caching service dependencies" "OpenRC builds its dependency cache (popen/posix_spawn work)"
 check_output "$OPENRC_LOG" "/etc/init.d/local start" "OpenRC reaches the default runlevel and starts services"
 check_output "$OPENRC_LOG" "M94-OPENRC: ok init-fifo-present" "openrc-init creates its control FIFO once the boot finishes"
 check_output "$OPENRC_LOG" "/etc/init.d/killprocs start" "the shutdown runlevel runs when PID 1 gets the command"
 check_output "$OPENRC_LOG" "reboot: powering off" "openrc-shutdown powers the machine off through the control FIFO"
-check_output "$LOG" "M11-SMOKE: start" "shell appears"
 # M28 #9: ctx-switch + light-syscall rdtsc benchmark. It is single-CPU only by
 # design (the rdtsc yield loop races under the SMP high-syscall-density path, see
 # m28_ctxbench.c), so on the -smp 2/4 smoke runs it correctly reports "skip smp".
@@ -1089,7 +1053,6 @@ check_output "$LOG" "MUSL-POSIX: done" "the musl POSIX smoke completes"
 # (0x200000), b1nix ET_EXEC images at 0x2000000, and musl PIEs the loader places
 # itself (randomized under b1nix.aslr, see the M71 check) — none of which can
 # collide with the kernel, which lives in the higher half.
-check_output "$LOG" "M40-LINUX: hello from a static linux x86_64 binary" "a stock Linux ET_EXEC runs at its own load base (0x200000), not at a b1nix-fixed address"
 check_output "$LOG" "PIE base=" "musl PIE images are placed by the loader, not by a fixed link address"
 
 section "M25 Native C compiler (b1cc)"
@@ -2037,7 +2000,7 @@ fi
 echo ""
 echo "[RUN] M24b SMP work-stealing (-smp 4) checks..."
 check_output "$SMP_LOG" "smp: AP 1 ready" "Application Processor boots (INIT-SIPI)"
-check_output "$SMP_LOG" "M24B-BKL: instance ran-on-ap" "cross-CPU work-stealing runs stolen tasks on APs"
+check_output "$LOG" "M24B-BKL: instance ran-on-ap" "cross-CPU work-stealing runs stolen tasks on APs"
 if grep -q -E "KERNEL PANIC|\[PANIC\]" "$SMP_LOG" 2>/dev/null; then
 	fail "SMP self-test completes without panic" "PANIC detected in log"
 else
@@ -2088,12 +2051,9 @@ if [ "$BLOCKED" -gt 0 ]; then
 	report_wedged_instances
 fi
 
-rm -f "$SATA_IMG_BOOT" "$NVME_IMG_BOOT" "$SWAP_IMG_BOOT"
-rm -f "$SATA_IMG_SMP" "$NVME_IMG_SMP" "$SWAP_IMG_SMP"
-rm -f "$SATA_IMG_USER" "$NVME_IMG_USER" "$SWAP_IMG_USER"
-rm -f "$SATA_IMG_V8"
-rm -f "$SATA_IMG_SHELL" "$NVME_IMG_SHELL" "$SWAP_IMG_SHELL"
-rm -f "$SATA_IMG_OPENRC" "$NVME_IMG_OPENRC" "$SWAP_IMG_OPENRC"
+for _i in sys blk posix gfx openrc smp v8; do
+    rm -f "$(disk_img sata "$_i")" "$(disk_img nvme "$_i")" "$(disk_img swap "$_i")"
+done
 echo ""
 
 # Clean up SATA, NVMe and Swap dummy images

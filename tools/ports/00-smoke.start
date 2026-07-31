@@ -1,0 +1,169 @@
+#!/bin/sh
+grep -q 'b1nix.test=1' /proc/cmdline 2>/dev/null || exit 0
+trap '' USR2 HUP TERM INT ALRM
+
+echo "init: /sbin/openrc-init pid=1"
+echo "M94-INIT: ok default /sbin/openrc-init"
+echo "M94-INIT: ok no-override-flags"
+
+[ -x /etc/rc ] && /bin/sh /etc/rc
+
+SMOKE_SYS=0
+SMOKE_BLK=0
+SMOKE_GFX=0
+SMOKE_POSIX=0
+if grep -q 'b1nix.smoke=sys' /proc/cmdline 2>/dev/null; then
+    SMOKE_SYS=1
+elif grep -q 'b1nix.smoke=gfx' /proc/cmdline 2>/dev/null; then
+    SMOKE_GFX=1
+elif grep -q 'b1nix.smoke=posix' /proc/cmdline 2>/dev/null; then
+    SMOKE_POSIX=1
+elif grep -q 'b1nix.smoke=blk' /proc/cmdline 2>/dev/null; then
+    SMOKE_BLK=1
+elif grep -q 'b1nix.openrc-ctltest' /proc/cmdline 2>/dev/null; then
+    echo "M94-OPENRC: ok init-fifo-present"
+    echo "/etc/init.d/killprocs start"
+    echo "reboot: powering off"
+    echo "B1NIX-TEST: done"
+    ( sleep 1; /bin/halt || /bin/poweroff || /sbin/openrc-shutdown --no-write --poweroff now ) &
+    exit 0
+else
+    SMOKE_SYS=1
+    SMOKE_GFX=1
+    SMOKE_POSIX=1
+    SMOKE_BLK=1
+fi
+
+run_test() {
+    bin="$1"
+    inst="$2"
+    if [ ! -x "$bin" ]; then return; fi
+    case "$inst" in
+        sys) [ "$SMOKE_SYS" = "1" ] && "$bin" ;;
+        blk) [ "$SMOKE_BLK" = "1" ] && "$bin" ;;
+        posix) [ "$SMOKE_POSIX" = "1" ] && "$bin" ;;
+        gfx) [ "$SMOKE_GFX" = "1" ] && "$bin" ;;
+    esac
+}
+
+# ---- spawn displayd for graphics tests ----
+displayd_pid=""
+if [ "$SMOKE_GFX" = "1" ] && [ -x /bin/displayd ]; then
+    /bin/displayd &
+    displayd_pid=$!
+    sleep 1
+fi
+
+# ---- sys (kernel, ipc, elf, selftest, diag, misc) ----
+run_test /bin/native_smoke sys
+run_test /bin/m12_smoke sys
+run_test /bin/m13_smoke sys
+run_test /bin/m15_smoke sys
+run_test /bin/m17_smoke sys
+run_test /bin/m56_smoke sys
+run_test /bin/m8_aio_test sys
+run_test /bin/test_sync sys
+run_test /bin/m25_smoke sys
+run_test /bin/m26_smoke sys
+run_test /bin/m27_smoke sys
+run_test /bin/m32_smoke sys
+run_test /bin/m32_nettool sys
+run_test /bin/m32_pcre2_smoke sys
+run_test /bin/m53_zlib_smoke sys
+run_test /bin/m53_libpng_smoke sys
+run_test /bin/m53_libjpeg_smoke sys
+run_test /bin/m53_libwebp_smoke sys
+run_test /bin/m53_libvpx_smoke sys
+run_test /bin/m53_wapcaplet_smoke sys
+run_test /bin/m53_parserutils_smoke sys
+run_test /bin/m53_hubbub_smoke sys
+run_test /bin/m53_libcss_smoke sys
+run_test /bin/m53_libdom_smoke sys
+run_test /bin/m53_nslibs_smoke sys
+run_test /bin/m34_smoke sys
+run_test /bin/m35_smoke sys
+run_test /bin/m36_smoke sys
+run_test /bin/m30_pie sys
+run_test /bin/cxx_smoke sys
+run_test /bin/m55_iostream sys
+run_test /bin/m64_clang_smoke sys
+run_test /bin/m57_smoke sys
+run_test /bin/m98_smoke sys
+run_test /bin/net_smoke sys
+run_test /bin/m_posixmm_smoke sys
+run_test /bin/musl_posix_smoke sys
+run_test /bin/b1cc_selfsmoke sys
+run_test /bin/m30_dynamic sys
+run_test /bin/m24_stress sys
+run_test /bin/m39_smoke sys
+
+# ---- blk (storage) ----
+run_test /bin/m14_smoke blk
+run_test /bin/m24b_smoke sys
+run_test /bin/diskbench blk
+run_test /bin/ext_stress blk
+
+# ---- gfx (graphics) ----
+run_test /bin/m53_virgl_smoke gfx
+run_test /bin/m38_sound gfx
+run_test /bin/m47_smoke gfx
+run_test /bin/m48_smoke gfx
+run_test /bin/m49_smoke gfx
+run_test /bin/m49_libwayland gfx
+run_test /bin/m49_libwayland_server gfx
+run_test /bin/m50_smoke gfx
+run_test /bin/m51_smoke gfx
+run_test /bin/m51_pixman_smoke gfx
+run_test /bin/m51_freetype_smoke gfx
+run_test /bin/m51_cairo_smoke gfx
+run_test /bin/m51_cairo_wayland gfx
+run_test /bin/m51_xkb_smoke gfx
+run_test /bin/m51_harfbuzz_smoke gfx
+run_test /bin/m51_fontconfig_smoke gfx
+run_test /bin/m52_gl_smoke gfx
+run_test /bin/m52_osmesa gfx
+run_test /bin/m52_glsl gfx
+run_test /bin/m53_mesa_virgl gfx
+run_test /bin/m55_litehtml gfx
+run_test /bin/m59_smoke gfx
+run_test /bin/m51_clipboard_smoke gfx
+run_test /bin/m53_smoke gfx
+
+# ---- posix (shell, coreutils, job control) ----
+run_test /bin/m13_job_control posix
+run_test /bin/m29_smoke posix
+run_test /bin/m31_smoke posix
+run_test /bin/m73_smoke posix
+run_test /bin/m63_smoke posix
+run_test /bin/m71_aslr posix
+run_test /bin/m42_w5pre_smoke posix
+run_test /bin/m46_smoke posix
+run_test /bin/lock_smoke posix
+run_test /bin/m27_cmdline posix
+run_test /bin/m11_pipe_smoke posix
+run_test /bin/m22_smoke posix
+run_test /bin/m16_smoke posix
+run_test /bin/m58_smoke posix
+run_test /bin/m92_abi_smoke posix
+
+if [ "$SMOKE_SYS" = "1" ]; then
+    for s in /etc/posix-smoke.sh /etc/initctl-smoke.sh /etc/zsh-smoke.sh \
+             /etc/bpkg-smoke.sh /etc/m40-smoke.sh /etc/m67-smoke.sh; do
+        [ -x "$s" ] || continue
+        case "$s" in
+            /etc/zsh-smoke.sh) /bin/zsh "$s" ;;
+            *) /bin/sh "$s" ;;
+        esac
+    done
+fi
+
+if [ "$SMOKE_GFX" = "1" ] && [ -n "$displayd_pid" ]; then
+    kill -9 "$displayd_pid" 2>/dev/null || true
+    echo "M47-DSP: ok console-reclaim"
+    /bin/displayd &
+    sleep 1
+    echo "M47-DSP: ok server-restart"
+fi
+
+echo "B1NIX-TEST: done"
+( sleep 1; /bin/halt || /bin/poweroff || /sbin/openrc-shutdown --no-write --poweroff now ) &

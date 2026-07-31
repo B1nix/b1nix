@@ -199,6 +199,11 @@ static u64   g_task_cutime[MAX_TASKS];
 static u64   g_task_cstime[MAX_TASKS];
 static u64   g_task_pass[MAX_TASKS];
 static u64   g_min_pass = 0;
+/* Last userspace RIP of each task, captured by the LAPIC timer tick when it
+ * preempts a ring-3 task (see task_set_user_rip). Consumed by the silence
+ * watchdog task dump to name the user function a wedged thread group spins
+ * in. */
+static u64   g_task_user_rip[MAX_TASKS];
 /* M63: seccomp-bpf per-task state (side-tables — struct task cannot grow, see
  * the M29 LAPIC-PT note). g_task_seccomp holds the installed filter chain
  * (opaque to the scheduler; defined in seccomp.c); g_task_nnp is no_new_privs. */
@@ -1611,6 +1616,19 @@ void task_set_alarm_ticks(struct task *t, u64 ticks) {
 usize task_tgid(const struct task *t) {
   if (!t) return 0;
   return g_task_tgid[task_index(t)];
+}
+/* Last userspace RIP captured at timer-tick preemption (side-table; struct
+ * task cannot grow — see the M29 LAPIC-PT note). Lets the silence watchdog's
+ * task dump name the exact user function a wedged thread group is spinning
+ * in, and lets the kernel tell a CPU-bound but progressing thread group from
+ * one stuck in the same user address forever. */
+u64 task_user_rip(const struct task *t) {
+  if (!t) return 0;
+  return g_task_user_rip[task_index(t)];
+}
+void task_set_user_rip(struct task *t, u64 rip) {
+  if (!t) return;
+  g_task_user_rip[task_index(t)] = rip;
 }
 u64 task_utime(const struct task *t) {
   if (!t) return 0;
@@ -3932,6 +3950,10 @@ void scheduler_dump_tasks(void) {
       console_write(g_task_fdlock_site[i] ? g_task_fdlock_site[i] : "-");
       console_write(" lease_site=");
       console_write(g_task_lease_site[i] ? g_task_lease_site[i] : "-");
+      /* User RIP at last timer-tick preemption: names the user function a
+       * wedged (spinning) thread group is stuck in. 0 for kernel tasks. */
+      console_write(" user_rip=0x");
+      console_write_hex64(g_task_user_rip[i]);
       console_write("\t");
       console_write(T(i)->name);
       console_write("\n");
