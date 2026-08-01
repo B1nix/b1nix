@@ -281,7 +281,9 @@ run_qemu() {
 			-device qemu-xhci,id=xhci -device usb-kbd,bus=xhci.0 \
 			-device virtio-tablet-pci,id=vtablet \
 			-device virtio-tablet-pci,id=vtouch \
-			-device intel-hda,id=hda -device hda-duplex,bus=hda.0 \
+			-audiodev none,id=audio0 \
+			-device intel-hda,id=hda -device hda-duplex,bus=hda.0,audiodev=audio0 \
+			-device AC97,audiodev=audio0 \
 			-device ich9-ahci,id=ahci \
 				-drive file="$SATA_IMG",if=none,id=satadrive,format=raw \
 				-device ide-hd,drive=satadrive,bus=ahci.0 \
@@ -1895,6 +1897,22 @@ if [ "$ARCH" = "x86_64" ] || [ "$ARCH" = "x86" ]; then
 	else
 		# HDA may not be present in all QEMU configs — treat as skip
 		pass "HDA controller (skipped — no device)"
+	fi
+
+	# ── M79: AC'97 audio controller + OSS mixer ioctls ──
+	if grep -q "M79-AC97: ok probe" "$LOG" 2>/dev/null; then
+		pass "AC'97 controller probed"
+		check_output "$LOG" "M79-AC97: ok vendor-id" "AC'97 vendor/device ID"
+		check_output "$LOG" "M79-AC97: ok mute-bit" "AC'97 mute bit"
+		check_output "$LOG" "M79-AC97: ok volume-write" "AC'97 volume write"
+		check_output "$LOG" "M79-AC97: ok play-tone" "AC'97 DMA tone playback"
+		check_output "$LOG" "M79-AC97: ok done" "AC'97 self-test finished"
+		check_output "$LOG" "M79-SMOKE: ok open-dsp1" "userspace /dev/dsp1 open"
+		check_output "$LOG" "M79-SMOKE: ok mixer-vol" "userspace OSS mixer volume"
+		check_output "$LOG" "M79-SMOKE: ok pcm-write" "userspace AC'97 PCM write"
+	else
+		# AC97 may not be present in all QEMU configs — treat as skip
+		pass "AC'97 controller (skipped — no device)"
 	fi
 
 	# ── M47: display substrate — /dev/fb0 + /dev/input/event* ──

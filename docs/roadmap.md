@@ -613,7 +613,7 @@ Status:
 
 ## M77: Raise Global Resource Caps
 
-- [x] `done` Dynamic hard caps for TCP connections (64), VFS pipes (128), core dumps (1 MiB), and `SHMMAX` — now runtime-tunable via writable `/proc/sys/kernel/{tcp-max-conns,pipe-max-count,coredump-max-bytes,shmmax}` sysctls (clamped to per-resource ceilings), sized at boot from usable RAM and re-tunable with `echo N > ...`; enforced in the TCP connection table, VFS pipe pool, shmget, and the core-dump collector (which also clamps to RLIMIT_CORE). Smoke-verified that lowered caps actually bite: floors to the minimum and proves the pool refuses beyond it (pipes/`pipe(2)`, TCP listeners + a pool-full async `connect()` → `ECONNREFUSED`, oversized `shmget`). Also fixed a real slot leak: closing a listening socket now reclaims its connection slot (`tcp_listen` returns the conn, stored on the socket, freed by `tcp_close`).
+- [x] `done` Dynamic hard caps for TCP connections (64), VFS pipes (128), core dumps (1 MiB), and `SHMMAX`
 
 ## M79: Audio Stack
 
@@ -732,9 +732,7 @@ Status:
 - [ ] `planned` Module Dependencies parsing (`depends=`) and `modules.dep`.
 - [ ] `planned` M97 Smoke Test for network protocol modules and params.
 
-## M98: GNU-Free ISO (Limine bootloader + BSD build tools)
-
-See [`docs/gnu-less-plan.md`](gnu-less-plan.md) for the full inventory.
+## M97: GNU-Free ISO (Limine bootloader + BSD build tools)
 
 - [x] Bootloader GNU GRUB -> **Limine** (BSD-2-Clause): `tools/mkiso.sh` (Limine + xorriso) replaced `grub-mkrescue` for all nine ISO targets and both in-guest proof harnesses; `boot/limine/limine.conf.in` replaced `boot/grub/grub.cfg`. The disk image gained a side benefit — `limine bios-install` writes the boot stages into the image file, so `mk-disk-image.sh` no longer needs root/losetup/mount.
 - [x] Build automation GNU Make -> **bmake** (BSD 3-clause, `/bin/make`) + **samurai** (0BSD Ninja, `/bin/samu`, `/bin/ninja`). `tools/toolchain/build-make.sh` is deleted, `/bin/make` left the static allowlist, and `tools/inguest/Makefile` is now portable BSD make. Verified in-guest by `M98-SMOKE`.
@@ -742,37 +740,33 @@ See [`docs/gnu-less-plan.md`](gnu-less-plan.md) for the full inventory.
 - [x] Shell GNU bash -> **zsh** (MIT-like) as `/bin/zsh`, the login shell in `/etc/passwd`, with BusyBox `ash` as `/bin/sh`. zsh needs a terminal library, which b1nix never had (bash carried its own bundled termcap), so **netbsd-curses** (BSD) was ported alongside it. `tools/ports/build-bash.sh` is deleted and the packaged bash is purged from the rootfs by `install-ports.sh`. Verified by `ZSH-SMOKE` (12 checks, the same feature surface `BASH-SMOKE` covered).
 - [x] Gnulib left the tree with bash — it was only ever bundled inside it.
 
-**The shipped ISO is now GNU-free**: bootloader, shell, build tools, downloader, libc, C++ runtime and toolchain all carry BSD/MIT/Apache/0BSD licences.
-
-## M99: Driver Infrastructure (netconsole, memory typing, modern PCI)
-
-See [`docs/gpu-drm-plan.md`](gpu-drm-plan.md) for the full M99-M103 plan.
+## M98: Driver Infrastructure (netconsole, memory typing, modern PCI)
 
 - [ ] `planned` `netconsole` — klog over UDP (`b1nix.netconsole=<ip>:<port>`); the test laptop has no serial port.
 - [ ] `planned` `IA32_PAT` + `VMM_WC` mappings; `clflush` / `wbinvd` / `mfence` primitives.
 - [ ] `planned` PCI BAR enumeration + sizing, bus-master enable, capability walk, MSI/MSI-X.
 - [ ] `planned` Intel stolen memory (DSM/GSM) from host-bridge config `0x5C`/`0x70`.
 
-## M100: linuxkpi Compatibility Layer (own MIT headers)
+## M99: linuxkpi Compatibility Layer (own MIT headers)
 
 - [ ] `planned` `kernel/include/lkpi/` written from scratch — Linux `include/linux/*.h` is GPL, the drivers themselves are MIT.
 - [ ] `planned` `idr`, `completion`, workqueue over `kthread_create`, `scatterlist`, `request_firmware` over VFS.
 - [ ] `planned` `ioremap` / dma-mapping / lock wrappers over existing kernel primitives.
 
-## M101: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
+## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
 - [ ] `planned` `dma-fence` + minimal `drm_gpu_scheduler`; convert `vgpu_submit_stream` off `virtio_gpu_wait_used`.
 - [ ] `planned` GEM with sg-backed discontiguous BOs (today: contiguous `pmm_alloc_frames` only).
 - [ ] `planned` Split `drm_ioctl` (cyclomatic 56 / cognitive 161 in one switch).
 
-## M102: Intel i915 (Gen8/Gen9.5) + Mesa iris
+## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 
 - [ ] `planned` GTT/PPGTT, execlists submission, contexts; no firmware needed on Gen8/Gen9.
 - [ ] `planned` Bare metal on the Pavilion's Gen8, logs over netconsole (the guaranteed path — no OS on the laptop, ISO boots from USB).
 - [ ] `planned` *If VT-d and BIOS ever allow it:* KVM + VFIO passthrough for a faster loop (keeps virtual COM1).
 - [ ] `planned` `EXECBUFFER2` softpin-only + Mesa `iris` (own NIR backend — no LLVM rebuild).
 
-## M103: amdgpu on RX 6600 (render-only) + radeonsi
+## M102: amdgpu on RX 6600 (render-only) + radeonsi
 
 - [ ] `planned` Build without DC: scanout stays on the GOP framebuffer, render offscreen and blit.
 - [ ] `planned` PSP (`psp_v11_0`) firmware loading, SMU 11 mailbox, GFX10.3 KIQ/MQD, GPUVM.

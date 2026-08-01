@@ -108,6 +108,7 @@ run_test /bin/ext_stress blk
 # ---- gfx (graphics) ----
 run_test /bin/m53_virgl_smoke gfx
 run_test /bin/m38_sound gfx
+run_test /bin/m79_sound gfx
 run_test /bin/m47_smoke gfx
 run_test /bin/m48_smoke gfx
 run_test /bin/m49_smoke gfx

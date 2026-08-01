@@ -2165,6 +2165,8 @@ extern void fb_dev_init(void);
 extern void input_init(void);
 extern void drm_dev_init(void);
 extern void virtio_gpu_dev_init(void);
+extern void hda_dev_init(void);
+extern void ac97_dev_init(void);
 
 void vfs_repopulate_after_root_mount(void) {
   struct vfs_node *node;
@@ -2231,6 +2233,11 @@ void vfs_repopulate_after_root_mount(void) {
   input_init();
   drm_dev_init();
   virtio_gpu_dev_init();
+
+  /* Sound device nodes (/dev/dsp, /dev/dsp1) created by hda_init/ac97_init
+   * land on the initramfs root and are re-registered here, like fb/input. */
+  hda_dev_init();
+  ac97_dev_init();
 
   node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) vfs_node_put(node);

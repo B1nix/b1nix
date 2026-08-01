@@ -97,6 +97,25 @@ struct hda_bdle {
 #define HDA_VERB(codec, nid, verb, payload) \
 	(((u32)(codec) << 28) | ((u32)(nid) << 20) | ((u32)(verb) << 8) | (u32)(payload))
 
+/* 4/16-form verb: 4-bit verb in bits 19:16 with a 16-bit payload. This is
+ * how SET/GET_AMP_GAIN_MUTE are encoded — QEMU's codec decodes verbs in the
+ * 0x000..0x6FF / 0x800..0xEFF range this way, so the older 12/8-form volume
+ * verbs were silently rejected. */
+#define HDA_VERB16(codec, nid, verb, payload) \
+	(((u32)(codec) << 28) | ((u32)(nid) << 20) | ((u32)(verb) << 16) | (u32)(payload))
+
+/* Amp command payload bits (HDA spec 7.3.3.8 / 7.3.3.9). */
+#define AC_AMP_SET_OUTPUT (1u << 15) /* target the output amplifier */
+#define AC_AMP_SET_INPUT  (1u << 14) /* target the input amplifier  */
+#define AC_AMP_SET_LEFT   (1u << 13) /* apply to the left channel   */
+#define AC_AMP_SET_RIGHT  (1u << 12) /* apply to the right channel  */
+#define AC_AMP_GET_LEFT   (1u << 13) /* query the left channel      */
+#define AC_AMP_GAIN_MASK  0x7F
+#define AC_AMP_MUTE       (1u << 7)
+
+/* QEMU hda-duplex codec amp range: 74 steps (0x4a), mute capable. */
+#define HDA_AMP_STEPS     74
+
 #define HDA_PARAM_AUDIO_FG_CAP   0xF00
 #define HDA_PARAM_NODE_COUNT      0xF04
 #define HDA_PARAM_NODE_LIST       0xF08
@@ -143,21 +162,10 @@ static volatile int hda_play_lock;
 /* VFS /dev/dsp node */
 static struct sound_device hda_sound_dev;
 
-/* ── Sound device registry ───────────────────────────────────────────────── */
-#define SOUND_MAX_DEVICES 4
-static struct sound_device *sound_devices[SOUND_MAX_DEVICES];
-static int sound_device_count;
-
-void sound_register(struct sound_device *dev) {
-	if (sound_device_count < SOUND_MAX_DEVICES)
-		sound_devices[sound_device_count++] = dev;
-}
-
-struct sound_device *sound_get_default(void) {
-	if (sound_device_count > 0)
-		return sound_devices[0];
-	return 0;
-}
+/* Mixer volume state (0..100 per channel) mirrored to the codec amp. */
+static int hda_vol_left = 100;
+static int hda_vol_right = 100;
+static int hda_muted;
 
 /* ── Coarse delay via wall clock ─────────────────────────────────────────── */
 static inline u32 hda_wallclock(void) { return *(volatile u32 *)(hda_regs + HDA_WALLCLK); }
@@ -415,9 +423,13 @@ static void hda_configure_output(void) {
 	hda_sample_rate = 48000;
 	hda_fmt_word = 0x01F3;
 
-	/* Unmute the output converter volume (both L and R to 0 dB) */
-	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0xB02, 0)); /* Set L Volume */
-	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0xB12, 0)); /* Set R Volume */
+	/* Unmute the output converter amp at full gain (0 dB). Uses the 4/16
+	 * form of SET_AMP_GAIN_MUTE (verb 0x3 in bits 19:16, 16-bit payload);
+	 * QEMU's codec rejects the 12/8-form volume verbs used pre-M79. */
+	hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0x3,
+		AC_AMP_SET_OUTPUT | AC_AMP_SET_LEFT | HDA_AMP_STEPS));
+	hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0x3,
+		AC_AMP_SET_OUTPUT | AC_AMP_SET_RIGHT | HDA_AMP_STEPS));
 
 	/* Power widget: set D0 for the output converter */
 	hda_corb_send_wait(HDA_VERB(hda_codec_addr, hda_output_nid, 0xF50, 0x00)); /* Power State D0 */
@@ -630,6 +642,56 @@ static int hda_sound_ready(struct sound_device *dev) {
 	return hda_inited;
 }
 
+/* ── Mixer: codec amp volume control (M79) ──────────────────────────────── */
+static int hda_sound_set_volume(struct sound_device *dev, int left, int right,
+                                int muted) {
+	(void)dev;
+	if (!hda_inited || !hda_output_nid)
+		return -ENXIO;
+
+	if (left < 0) left = hda_vol_left;
+	if (right < 0) right = hda_vol_right;
+	if (muted < 0) muted = hda_muted;
+	if (left > 100) left = 100;
+	if (right > 100) right = 100;
+	hda_vol_left = left;
+	hda_vol_right = right;
+	hda_muted = muted;
+
+	u32 gl = (u32)left * HDA_AMP_STEPS / 100;
+	u32 gr = (u32)right * HDA_AMP_STEPS / 100;
+	u32 m = muted ? AC_AMP_MUTE : 0;
+
+	hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0x3,
+		AC_AMP_SET_OUTPUT | AC_AMP_SET_LEFT | gl | m));
+	hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0x3,
+		AC_AMP_SET_OUTPUT | AC_AMP_SET_RIGHT | gr | m));
+	return 0;
+}
+
+static int hda_sound_get_volume(struct sound_device *dev, int *left, int *right,
+                                int *muted) {
+	(void)dev;
+	if (!hda_inited || !hda_output_nid)
+		return -ENXIO;
+
+	u32 rl = hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0xB,
+		AC_AMP_SET_OUTPUT | AC_AMP_GET_LEFT));
+	u32 rr = hda_corb_send_wait(HDA_VERB16(hda_codec_addr, hda_output_nid, 0xB,
+		AC_AMP_SET_OUTPUT));
+
+	if (left) *left = (int)((rl & AC_AMP_GAIN_MASK) * 100u / HDA_AMP_STEPS);
+	if (right) *right = (int)((rr & AC_AMP_GAIN_MASK) * 100u / HDA_AMP_STEPS);
+	if (muted) *muted = ((rl | rr) & AC_AMP_MUTE) ? 1 : 0;
+	return 0;
+}
+
+/* OSS mixer ioctls on /dev/dsp route to the generic sound-mixer layer. */
+static int hda_dsp_ioctl(struct vfs_node *node, u64 request, void *arg) {
+	(void)node;
+	return sound_mixer_ioctl(&hda_sound_dev, request, arg);
+}
+
 /* ── Device init ─────────────────────────────────────────────────────────── */
 void hda_init(void) {
 	struct pci_device_info pci;
@@ -706,16 +768,6 @@ void hda_init(void) {
 
 	hda_inited = 1;
 
-	/* Create /dev/dsp */
-	struct vfs_node *dsp = vfs_add_node("/dev/dsp", VFS_DEVICE, 0, 0, 0);
-	if (dsp && !IS_ERR(dsp)) {
-		dsp->inode->mode = 0644;
-		dsp->inode->read_cb  = hda_dsp_read;
-		dsp->inode->write_cb = hda_dsp_write;
-		dsp->inode->release_cb = hda_dsp_release;
-		vfs_node_put(dsp);
-	}
-
 	/* Register the sound device interface */
 	hda_sound_dev.name = "hda";
 	hda_sound_dev.sample_rate = hda_sample_rate;
@@ -727,9 +779,32 @@ void hda_init(void) {
 	hda_sound_dev.write = hda_sound_write;
 	hda_sound_dev.get_position = hda_sound_get_position;
 	hda_sound_dev.ready = hda_sound_ready;
+	hda_sound_dev.vol_left = 100;
+	hda_sound_dev.vol_right = 100;
+	hda_sound_dev.muted = 0;
+	hda_sound_dev.set_volume = hda_sound_set_volume;
+	hda_sound_dev.get_volume = hda_sound_get_volume;
 	sound_register(&hda_sound_dev);
 
 	console_write("hda: initialized 48kHz stereo 16-bit, /dev/dsp ready\n");
+}
+
+/* Re-register /dev/dsp after the real root is mounted. The node created by
+ * hda_init() lands on the initramfs root, which becomes unreachable when "/"
+ * redirects to the ext4 root; vfs_repopulate_after_root_mount() calls this so
+ * the device node stays visible to userspace. Idempotent. */
+void hda_dev_init(void) {
+	if (!hda_inited)
+		return;
+	struct vfs_node *dsp = vfs_add_node("/dev/dsp", VFS_DEVICE, 0, 0, 0);
+	if (dsp && !IS_ERR(dsp)) {
+		dsp->inode->mode = 0644;
+		dsp->inode->read_cb  = hda_dsp_read;
+		dsp->inode->write_cb = hda_dsp_write;
+		dsp->inode->release_cb = hda_dsp_release;
+		dsp->inode->ioctl_cb = hda_dsp_ioctl;
+		vfs_node_put(dsp);
+	}
 }
 
 /* ── Self-test (test mode) ──────────────────────────────────────────────── */

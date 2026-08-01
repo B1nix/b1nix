@@ -1,0 +1,50 @@
+#ifndef B1NIX_MIXER_H
+#define B1NIX_MIXER_H
+
+#include <b1nix/types.h>
+
+/* OSS mixer device indices (Linux <linux/soundcard.h> ABI). */
+enum {
+	SOUND_MIXER_VOLUME = 0,
+	SOUND_MIXER_BASS = 1,
+	SOUND_MIXER_TREBLE = 2,
+	SOUND_MIXER_SYNTH = 3,
+	SOUND_MIXER_PCM = 4,
+	SOUND_MIXER_SPEAKER = 5,
+	SOUND_MIXER_LINE = 6,
+	SOUND_MIXER_MIC = 7,
+	SOUND_MIXER_CD = 8,
+	SOUND_MIXER_IMIX = 9,
+	SOUND_MIXER_ALTPCM = 10,
+	SOUND_MIXER_RECLEV = 11,
+	SOUND_MIXER_IGAIN = 12,
+	SOUND_MIXER_OGAIN = 13,
+	SOUND_MIXER_LINE1 = 14,
+	SOUND_MIXER_LINE2 = 15,
+	SOUND_MIXER_LINE3 = 16,
+	SOUND_MIXER_DIGITAL1 = 17,
+	SOUND_MIXER_DIGITAL2 = 18,
+	SOUND_MIXER_DIGITAL3 = 19,
+	SOUND_MIXER_PHONEIN = 20,
+	SOUND_MIXER_PHONEOUT = 21,
+	SOUND_MIXER_VIDEO = 22,
+	SOUND_MIXER_RADIO = 23,
+	SOUND_MIXER_MONITOR = 24,
+	SOUND_MIXER_MUTE = 30,
+	SOUND_MIXER_ENHANCE = 31,
+	SOUND_MIXER_LAST = 31,
+};
+
+/* Mask-only query indices (MIXER_READ only). */
+#define SOUND_MIXER_DEVMASK    0x10
+#define SOUND_MIXER_RECMASK    0x11
+#define SOUND_MIXER_RECSRC     0x12
+#define SOUND_MIXER_STEREODEVS 0x13
+
+/* OSS ioctls: MIXER_READ(dev) = _IOR('M', dev, int) and
+ * MIXER_WRITE(dev) = _IOWR('M', dev, int) under the Linux _IOC layout
+ * (dir 2 bits at bit 30, type 8 bits at bit 16, nr 8 bits at bit 0). */
+#define B1NIX_MIXER_READ(dev)  (0x80004D00u | (u32)(dev))
+#define B1NIX_MIXER_WRITE(dev) (0xC0004D00u | (u32)(dev))
+
+#endif

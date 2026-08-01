@@ -56,6 +56,8 @@ extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
 extern void fb_console_init(void);
 extern void hda_init(void);
+extern void ac97_init(void);
+extern void ac97_selftest(void);
 extern void input_init(void);
 extern void input_gfxtest_start(void);
 extern void input_m47_inject_start(void);
@@ -308,6 +310,7 @@ void kernel_main(usize arg0, usize arg1)
 		input_m47_inject_start(); /* M47 smoke: mouse event burst for readers */
 	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
 	hda_init();   /* M38: Intel HDA sound controller (/dev/dsp) */
+	ac97_init();  /* M79: Intel 82801AA AC'97 controller (/dev/dsp1) */
 	video_init();
 	virtio_gpu_init();
 	virtio_input_init(); /* absolute pointer (virtio-tablet) — grab-free mouse */
@@ -645,6 +648,18 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.test=1")) {
 		e1000_selftest();
 		usb_selftest();
+		/* M38/M79 audio device self-tests. Dropped with the ring-3
+		 * migration's kernel/user/programs.c test driver, which silenced
+		 * the whole M38-SOUND marker set; revived here. Both are no-ops
+		 * outside b1nix.test=1 / without the device.  Re-register the
+		 * /dev/dsp* nodes here too: the nodes created at early boot land
+		 * on the initramfs root which becomes unreachable after the ext4
+		 * root is mounted, so a second vfs_add_node here (on the live
+		 * root) is what makes /dev/dsp /dev/dsp1 visible to userspace. */
+		hda_dev_init();
+		ac97_dev_init();
+		hda_selftest();
+		ac97_selftest();
 		/* ioprio(2): the block layer's admission policy — better priority
 		 * first, and a starving idle-class request ages past a stream of
 		 * best-effort ones. Drives the real chooser with synthetic waiters. */
