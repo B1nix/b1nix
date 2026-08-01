@@ -112,6 +112,7 @@ SRCS = \
   kernel/sched/scheduler.c \
   kernel/sched/uidgid.c \
   kernel/syscall/syscall.c \
+  kernel/syscall/resource_caps.c \
   kernel/user/busybox.c \
   kernel/user/editor.c \
   kernel/user/mc.c \

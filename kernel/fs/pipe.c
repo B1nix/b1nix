@@ -1,13 +1,14 @@
 #include <b1nix/vfs.h>
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/arch.h>
 #include <b1nix/spinlock.h>
 #include <stdlib.h>
 #include <string.h>
 
-struct vfs_pipe pipes[MAX_VFS_PIPES];
+struct vfs_pipe pipes[MAX_VFS_PIPES_CEIL];
 /* Guards the pipes[] free-slot search in vfs_pipe(). Without it, two CPUs
  * racing through vfs_pipe at the same instant could each pick the same
  * `!used` slot — both then memset()+used=1 on the SAME struct, sharing one
@@ -211,7 +212,7 @@ static struct vfs_pipe *pipe_pool_claim(void) {
   struct vfs_pipe *pipe = 0;
   u64 flags;
   spin_lock_irqsave(&pipe_pool_lock, &flags);
-  for (usize i = 0; i < MAX_VFS_PIPES; i++) {
+  for (usize i = 0; i < resource_caps_pipe_max(); i++) {
     if (!pipes[i].used) {
       pipe = &pipes[i];
       pipe->used = 1; /* claim atomically under the pool lock */

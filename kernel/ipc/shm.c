@@ -1,6 +1,7 @@
 #include <string.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/shm.h>
 #include <b1nix/spinlock.h>
@@ -58,7 +59,7 @@ void shm_init(void)
     console_write("shm: initialized (max ");
     console_write_dec(SHMMNI);
     console_write(" segments, ");
-    console_write_dec(SHMMAX / 1024);
+    console_write_dec(g_resource_caps.shmmax_bytes / 1024);
     console_write(" KB max size)\n");
 }
 
@@ -110,13 +111,13 @@ static int find_proc_attach_slot(struct proc_attachments *pa)
 int shmget(u32 key, usize size, int shmflg)
 {
     if (size < SHMMIN) size = SHMMIN;
-    if (size > SHMMAX) return -1;
+    if (size > g_resource_caps.shmmax_bytes) return -1;
 
     int create = (shmflg & IPC_CREAT) != 0;
     int excl   = (shmflg & IPC_EXCL) != 0;
 
     int npages = (size + PAGE_SIZE - 1) / PAGE_SIZE;
-    if (npages > (int)(SHMMAX / PAGE_SIZE)) return -1;
+    if (npages > (int)(g_resource_caps.shmmax_bytes / PAGE_SIZE)) return -1;
 
     usize pid = scheduler_get_pid();
 
@@ -149,6 +150,15 @@ int shmget(u32 key, usize size, int shmflg)
     seg->used = 1;
     seg->key = key;
 
+    /* Allocate the page-frame table up front (M77: segment size is a runtime
+     * cap now, so the table is per-segment heap, not a fixed array). */
+    seg->physical_pages = kmalloc((usize)npages * sizeof(u64));
+    if (!seg->physical_pages) {
+        seg->used = 0;
+        spin_unlock_irqrestore(&shm_lock, flags);
+        return -1;
+    }
+
     /* Allocate physical pages. ponytail: pmm_alloc runs under shm_lock — fine
      * for typical small segments; a multi-MiB segment holds the lock across a
      * long alloc loop. Split with a not-ready flag if that ever matters. */
@@ -158,6 +168,8 @@ int shmget(u32 key, usize size, int shmflg)
             for (int q = 0; q < p; q++) {
                 pmm_free_frame(seg->physical_pages[q]);
             }
+            kfree(seg->physical_pages);
+            seg->physical_pages = 0;
             seg->used = 0;
             spin_unlock_irqrestore(&shm_lock, flags);
             return -1;
@@ -394,6 +406,8 @@ int shmctl(int shmid, int cmd, struct shmid_ds *buf)
             pmm_free_frame(seg->physical_pages[p]);
             seg->physical_pages[p] = 0;
         }
+        kfree(seg->physical_pages);
+        seg->physical_pages = 0;
         memset(seg, 0, sizeof(*seg));
         removed = 1;
         rc = 0;

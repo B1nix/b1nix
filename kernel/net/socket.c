@@ -916,19 +916,29 @@ int vfs_listen(int fd, int backlog) {
   struct vfs_socket_state *s = (struct vfs_socket_state *)h->private_data;
   s->backlog = backlog < 0 ? 0 : backlog;
   if (s->domain == B1NIX_AF_UNIX) return unix_listen(s, backlog);
-  
+
+  /* Re-listening on an already-listening socket is a no-op (Linux returns 0)
+   * and must NOT claim a second pool slot. */
+  if (s->listening) return 0;
+
   if (s->domain == B1NIX_AF_INET && s->type == B1NIX_SOCK_STREAM) {
     u16 port = ntoh16(s->local.in.sin_port);
-    int res = tcp_listen(port, backlog);
-    if (res == 0) s->listening = 1;
-    return res;
+    struct tcp_conn *conn = tcp_listen(port, backlog);
+    if (conn) {
+      s->listening = 1;
+      s->tcp_conn = conn;
+    }
+    return conn ? 0 : -1;
   }
 
   if (s->domain == B1NIX_AF_INET6 && s->type == B1NIX_SOCK_STREAM) {
     u16 port = ntoh16(s->local.in6.sin6_port);
-    int res = tcp_listen(port, backlog);
-    if (res == 0) s->listening = 1;
-    return res;
+    struct tcp_conn *conn = tcp_listen(port, backlog);
+    if (conn) {
+      s->listening = 1;
+      s->tcp_conn = conn;
+    }
+    return conn ? 0 : -1;
   }
 
   return -ENOPROTOOPT;

@@ -21,10 +21,14 @@
 #define SHM_EXEC    0x8000  /* Allow execution */
 
 /* Limits */
-#define SHMMAX      0x2000000 /* Max segment size (32 MB) — large enough for
-                               * full-screen graphics/framebuffer buffers
-                               * (1280x800x4 = 4 MB) and several windows. Backing
-                               * is allocated on demand, not pre-reserved. */
+#define SHMMAX      0x2000000 /* Default max segment size (32 MB) — large enough
+                                * for full-screen graphics/framebuffer buffers
+                                * (1280x800x4 = 4 MB) and several windows. Backing
+                                * is allocated on demand, not pre-reserved. M77:
+                                * the ENFORCED runtime cap is
+                                * g_resource_caps.shmmax_bytes (tunable via
+                                * /proc/sys/kernel/shmmax); SHMMAX remains the
+                                * boot-time default and the value shm_init prints. */
 #define SHMMIN      1         /* Min segment size */
 #define SHMMNI      32        /* Max number of shared memory segments system-wide */
 #define SHMSEG      8         /* Max segments per process */
@@ -62,7 +66,10 @@ struct shm_segment {
     int   used;
     u32   key;                /* IPC key */
     struct shmid_ds ds;
-    u64   physical_pages[SHMMAX / PAGE_SIZE]; /* Array of physical page frames */
+    /* Array of physical page frames backing the segment. Allocated (kmalloc)
+     * on shmget to the segment's actual size — M77 made SHMMAX a runtime cap,
+     * so the compile-time fixed array is gone. */
+    u64   *physical_pages;
     int   page_count;
 };
 

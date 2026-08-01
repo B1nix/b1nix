@@ -67,6 +67,7 @@
 /tmp/kbuild/kernel/sched/scheduler.o
 /tmp/kbuild/kernel/sched/uidgid.o
 /tmp/kbuild/kernel/syscall/syscall.o
+/tmp/kbuild/kernel/syscall/resource_caps.o
 /tmp/kbuild/kernel/user/busybox.o
 /tmp/kbuild/kernel/user/editor.o
 /tmp/kbuild/kernel/user/mc.o

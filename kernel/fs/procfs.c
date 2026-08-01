@@ -25,6 +25,7 @@
 #include <b1nix/klog.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/user.h>
 #include <b1nix/vfs.h>
@@ -100,9 +101,13 @@ static isize procfs_emit(const char *buf, usize len, u64 offset, char *out,
  * Stashed in inode->data. We never set VFS_NODE_OWNS_DATA, and procfs nodes
  * are permanent, so the VFS never frees this. */
 typedef int (*procfs_render)(usize pid, struct sbuf *s);
+/* M77 writable sysctl: parse a write to a /proc/sys file. Returns the number of
+ * bytes consumed on success (the whole write), or a negative errno. */
+typedef int (*procfs_writer)(usize pid, const char *buf, usize len);
 
 struct procfs_node {
   procfs_render render; /* content generator */
+  procfs_writer write;  /* optional sysctl setter (M77) */
   usize pid;            /* 0 = system file / derive from parent for pid files */
 };
 
@@ -147,6 +152,22 @@ static isize procfs_read_cb(struct vfs_node *node, u64 offset, char *buffer,
   return res;
 }
 
+/* M77: writable sysctl write_cb. Routes a whole-file write to the node's
+ * procfs_writer, which parses the value and clamps via the resource-caps
+ * setters. Mirrors the sysfs drop_caches write pattern. */
+static isize procfs_write_cb(struct vfs_node *node, u64 offset,
+                             const char *buffer, usize size, int flags) {
+  (void)offset;
+  (void)flags;
+  struct procfs_node *pn = pn_of(node);
+  if (!pn || !pn->write)
+    return -EINVAL;
+  if (size == 0)
+    return 0;
+  usize pid = pn->pid ? pn->pid : pid_from_parent(node);
+  return (isize)pn->write(pid, buffer, size);
+}
+
 /* ── node construction ── */
 static struct vfs_node *procfs_root;
 
@@ -178,6 +199,22 @@ static struct vfs_node *procfs_mkchild(struct vfs_node *parent,
   n->parent = parent;
   n->refcount++;
   vfs_attach_child(parent, n);
+  return n;
+}
+
+/* Create a writable sysctl pseudo-file (mode 0644, read_cb + write_cb). */
+static struct vfs_node *procfs_mkchild_writable(struct vfs_node *parent,
+                                                const char *name,
+                                                procfs_render render,
+                                                procfs_writer write) {
+  struct vfs_node *n = procfs_mkchild(parent, name, VFS_DEVICE, render, 0);
+  if (!n)
+    return 0;
+  struct procfs_node *pn = pn_of(n);
+  if (pn)
+    pn->write = write;
+  n->inode->mode = 0644;
+  n->inode->write_cb = procfs_write_cb;
   return n;
 }
 
@@ -381,6 +418,93 @@ static int r_sys_file_max(usize pid, struct sbuf *s) {
     v = (unsigned long)rl.rlim_max;
   sb_addf(s, "%lu\n", v);
   return 0;
+}
+
+/* ── M77 writable resource caps (runtime-tunable hard caps) ── */
+
+static int r_sys_shmmax(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)g_resource_caps.shmmax_bytes);
+  return 0;
+}
+
+static int r_sys_tcp_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)resource_caps_tcp_max());
+  return 0;
+}
+
+static int r_sys_pipe_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)resource_caps_pipe_max());
+  return 0;
+}
+
+static int r_sys_coredump_max(usize pid, struct sbuf *s) {
+  (void)pid;
+  sb_addf(s, "%lu\n", (unsigned long)g_resource_caps.coredump_max_bytes);
+  return 0;
+}
+
+/* Parse an unsigned decimal from a sysctl write; only trailing whitespace is
+ * allowed after the digits. Returns 0 and fills *out, or -1. */
+static int sysctl_parse_u64(const char *buf, usize len, u64 *out) {
+  usize i = 0;
+  while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' ||
+                     buf[i] == '\n'))
+    i++;
+  if (i >= len || buf[i] < '0' || buf[i] > '9')
+    return -1;
+  u64 v = 0;
+  while (i < len && buf[i] >= '0' && buf[i] <= '9') {
+    u64 d = (u64)(buf[i] - '0');
+    if (v > (0xFFFFFFFFFFFFFFFFULL - d) / 10)
+      return -1; /* overflow */
+    v = v * 10 + d;
+    i++;
+  }
+  while (i < len && (buf[i] == ' ' || buf[i] == '\t' || buf[i] == '\r' ||
+                     buf[i] == '\n'))
+    i++;
+  if (i != len)
+    return -1;
+  *out = v;
+  return 0;
+}
+
+static int w_sys_shmmax(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+  if (sysctl_parse_u64(buf, len, &v) < 0 || resource_caps_set_shmmax(v) < 0)
+    return -EINVAL;
+  return (int)len;
+}
+
+static int w_sys_tcp_max(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+  if (sysctl_parse_u64(buf, len, &v) < 0 || v > 0xFFFFFFFFULL ||
+      resource_caps_set_tcp_max((u32)v) < 0)
+    return -EINVAL;
+  return (int)len;
+}
+
+static int w_sys_pipe_max(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+  if (sysctl_parse_u64(buf, len, &v) < 0 || v > 0xFFFFFFFFULL ||
+      resource_caps_set_max_pipes((u32)v) < 0)
+    return -EINVAL;
+  return (int)len;
+}
+
+static int w_sys_coredump_max(usize pid, const char *buf, usize len) {
+  (void)pid;
+  u64 v;
+  if (sysctl_parse_u64(buf, len, &v) < 0 ||
+      resource_caps_set_coredump_max(v) < 0)
+    return -EINVAL;
+  return (int)len;
 }
 
 static int r_filesystems(usize pid, struct sbuf *s) {
@@ -1128,6 +1252,14 @@ static struct vfs_node *procfs_mount_cb(const char *source, u64 flags,
       procfs_mkchild(kern, "osrelease", VFS_DEVICE, r_sys_osrelease, 0);
       procfs_mkchild(kern, "version", VFS_DEVICE, r_version, 0);
       procfs_mkchild(kern, "pid_max", VFS_DEVICE, r_sys_pid_max, 0);
+      /* M77: writable global resource caps. */
+      procfs_mkchild_writable(kern, "shmmax", r_sys_shmmax, w_sys_shmmax);
+      procfs_mkchild_writable(kern, "tcp-max-conns", r_sys_tcp_max,
+                              w_sys_tcp_max);
+      procfs_mkchild_writable(kern, "pipe-max-count", r_sys_pipe_max,
+                              w_sys_pipe_max);
+      procfs_mkchild_writable(kern, "coredump-max-bytes", r_sys_coredump_max,
+                              w_sys_coredump_max);
     }
     struct vfs_node *fsd = procfs_mkchild(sysd, "fs", VFS_DIRECTORY, 0, 0);
     if (fsd)

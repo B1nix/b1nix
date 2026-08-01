@@ -197,8 +197,9 @@ BINARIES := \
 	$(BUILD)/bin/telinit \
 	$(BUILD)/bin/m30_pie \
 	$(BUILD)/bin/m38_sound \
-	$(BUILD)/bin/m39_smoke
-BINARIES += $(BUILD)/bin/m47_smoke
+	$(BUILD)/bin/m39_smoke \
+	$(BUILD)/bin/m77_smoke \
+	$(BUILD)/bin/m47_smoke
 BINARIES += $(BUILD)/bin/m48_smoke
 BINARIES += $(BUILD)/bin/m49_libwayland
 BINARIES += $(BUILD)/bin/m49_libwayland_server

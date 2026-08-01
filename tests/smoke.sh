@@ -1669,6 +1669,18 @@ check_output "$LOG" "M35-CORE: ok crash-signal" "faulting child is terminated by
 check_output "$LOG" "M35-CORE: ok core-elf" "/tmp/core is an ET_CORE x86_64 ELF"
 check_output "$LOG" "M35-CORE: ok core-prstatus" "core carries a PT_NOTE register file"
 check_output "$LOG" "M35-CORE: done" "M35 core-dump smoke completes"
+# ── M77 writable global resource caps ──
+check_output "$LOG" "M77-CAPS: start" "M77 resource-cap sysctls present"
+check_output "$LOG" "M77-CAPS: ok shmmax" "shmmax sysctl reads, writes back, clamps and restores"
+check_output "$LOG" "M77-CAPS: ok tcp-max-conns" "tcp-max-conns sysctl reads, writes back, clamps and restores"
+check_output "$LOG" "M77-CAPS: ok pipe-max-count" "pipe-max-count sysctl reads, writes back, clamps and restores"
+check_output "$LOG" "M77-CAPS: ok coredump-max-bytes" "coredump-max-bytes sysctl reads, writes back, clamps and restores"
+check_output "$LOG" "M77-CAPS: ok sysctl-shmmax" "busybox sysctl -w kernel.shmmax sets the cap"
+check_output "$LOG" "M77-CAPS: ok sysctl-coredump" "busybox sysctl -w kernel.coredump-max-bytes (hyphenated key) sets the cap"
+check_output "$LOG" "M77-CAPS: ok enforce-shmmax" "a lowered SHMMAX cap rejects an oversized shmget"
+check_output "$LOG" "M77-CAPS: ok enforce-pipe-max" "a lowered pipe-max-count caps the VFS pipe pool (16) and opens again after restore"
+check_output "$LOG" "M77-CAPS: ok enforce-tcp-max" "a lowered tcp-max-conns caps listeners at 16 and an async connect gets ECONNREFUSED"
+check_output "$LOG" "M77-CAPS: done" "M77 writable resource-cap sysctls complete"
 
 # ── M42 wave-5 prerequisites: POSIX limits, VFS, pattern matching & signal /
 #    job control (the gate before enabling the upstream ash shell) ──

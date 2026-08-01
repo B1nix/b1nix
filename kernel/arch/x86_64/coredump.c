@@ -18,6 +18,7 @@
 #include <b1nix/arch_x86_64.h>
 #include <b1nix/mm.h>
 #include <b1nix/posix.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/vfs.h>
 #include <string.h>
@@ -65,9 +66,12 @@ struct e64_nhdr {
   u32 n_type;
 } __attribute__((packed));
 
-/* Bounds so a runaway address space can't produce an enormous dump. */
+/* Bounds so a runaway address space can't produce an enormous dump. The byte
+ * cap is the runtime coredump_max (min of the global cap and this task's
+ * RLIMIT_CORE soft limit, see coredump_write) — a process can shrink (or zero)
+ * its own core with setrlimit, and the global /proc/sys/kernel/coredump-max
+ * bounds everyone. */
 #define CORE_MAX_SEGS 32
-#define CORE_MAX_BYTES (1024 * 1024)
 
 struct core_seg {
   u64 vaddr;
@@ -102,15 +106,16 @@ static int core_emit(int fd, const void *buf, usize len) {
 }
 
 /* Collect mapped page-runs from the task's VMAs into segs[]. Returns the run
- * count; *total receives the byte sum. */
-static int collect_segs(struct task *t, struct core_seg *segs, u64 *total) {
+ * count; *total receives the byte sum. Runs are capped at max_bytes total. */
+static int collect_segs(struct task *t, struct core_seg *segs, u64 *total,
+                        u64 max_bytes) {
   int n = 0;
   u64 sum = 0;
   for (struct vm_area *v = t->vma_list; v && n < CORE_MAX_SEGS; v = v->next) {
     u32 flags = ((v->prot & 0x1) ? PF_R : 0) | ((v->prot & 0x2) ? PF_W : 0) |
                 ((v->prot & 0x4) ? PF_X : 0);
     u64 a = v->start & ~(u64)(PAGE_SIZE - 1);
-    while (a < v->end && n < CORE_MAX_SEGS && sum < CORE_MAX_BYTES) {
+    while (a < v->end && n < CORE_MAX_SEGS && sum < max_bytes) {
       /* Extend a contiguous run of mapped pages. */
       if (vmm_virt_to_phys((void *)(usize)a) == 0) {
         a += PAGE_SIZE;
@@ -118,7 +123,7 @@ static int collect_segs(struct task *t, struct core_seg *segs, u64 *total) {
       }
       u64 run_start = a;
       while (a < v->end && vmm_virt_to_phys((void *)(usize)a) != 0 &&
-             sum + (a - run_start) < CORE_MAX_BYTES) {
+             sum + (a - run_start) < max_bytes) {
         a += PAGE_SIZE;
       }
       u64 run_len = a - run_start;
@@ -141,9 +146,18 @@ void coredump_write(struct interrupt_frame *frame, int sig) {
     return;
   (void)sig;
 
+  /* Enforced cap: min(global coredump_max, this task's RLIMIT_CORE soft). A
+   * process that set RLIMIT_CORE to 0 gets no core at all. */
+  u64 core_max = g_resource_caps.coredump_max_bytes;
+  struct rlimit rl = {0, 0};
+  if (scheduler_getrlimit(RLIMIT_CORE, &rl) == 0 && rl.rlim_cur < core_max)
+    core_max = rl.rlim_cur;
+  if (core_max == 0)
+    return;
+
   struct core_seg segs[CORE_MAX_SEGS];
   u64 total = 0;
-  int nseg = collect_segs(t, segs, &total);
+  int nseg = collect_segs(t, segs, &total, core_max);
 
   /* Note: NT_PRSTATUS with name "CORE". */
   u8 desc[PRSTATUS_SIZE];

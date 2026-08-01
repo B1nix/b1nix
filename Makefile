@@ -394,6 +394,7 @@ KERNEL_SOURCES := \
 	kernel/sched/scheduler.c \
 	kernel/syscall/syscall.c \
 	kernel/syscall/linux_abi.c \
+	kernel/syscall/resource_caps.c \
 	kernel/fs/initramfs.c \
 	kernel/fs/vfs.c \
 	kernel/fs/aio.c \

@@ -84,6 +84,7 @@ run_test /bin/m53_libdom_smoke sys
 run_test /bin/m53_nslibs_smoke sys
 run_test /bin/m34_smoke sys
 run_test /bin/m35_smoke sys
+run_test /bin/m77_smoke sys
 run_test /bin/m36_smoke sys
 run_test /bin/m30_pie sys
 run_test /bin/cxx_smoke sys

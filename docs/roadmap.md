@@ -613,7 +613,7 @@ Status:
 
 ## M77: Raise Global Resource Caps
 
-- [ ] `planned` Dynamic hard caps for TCP connections (64), VFS pipes (128), core dumps (1 MiB), and `SHMMAX`.
+- [x] `done` Dynamic hard caps for TCP connections (64), VFS pipes (128), core dumps (1 MiB), and `SHMMAX` — now runtime-tunable via writable `/proc/sys/kernel/{tcp-max-conns,pipe-max-count,coredump-max-bytes,shmmax}` sysctls (clamped to per-resource ceilings), sized at boot from usable RAM and re-tunable with `echo N > ...`; enforced in the TCP connection table, VFS pipe pool, shmget, and the core-dump collector (which also clamps to RLIMIT_CORE). Smoke-verified that lowered caps actually bite: floors to the minimum and proves the pool refuses beyond it (pipes/`pipe(2)`, TCP listeners + a pool-full async `connect()` → `ECONNREFUSED`, oversized `shmget`). Also fixed a real slot leak: closing a listening socket now reclaims its connection slot (`tcp_listen` returns the conn, stored on the socket, freed by `tcp_close`).
 
 ## M79: Audio Stack
 

@@ -35,6 +35,7 @@
 #include <b1nix/loop.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/shm.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sysv_ipc.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/lapic.h>
@@ -212,6 +213,11 @@ void kernel_main(usize arg0, usize arg1)
 
 	pmm_init(bootinfo_get());
 	console_write("Step 2: PMM initialized\n");
+
+	/* M77: runtime-tunable global resource caps (TCP slots, pipes, SHMMAX,
+	 * coredump). Sized from usable RAM here, after PMM knows how much memory
+	 * exists; subsystems read the values back at allocation time. */
+	resource_caps_init();
 
 	u64 frame = pmm_alloc_frame();
 	console_write("Step 3: PMM probe frame: 0x");

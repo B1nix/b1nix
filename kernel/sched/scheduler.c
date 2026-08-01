@@ -468,6 +468,9 @@ static struct task *find_unused_task(void) {
       }
       g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
       g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
+      /* M77: default core-dump soft cap of 1 MiB (the kernel's coredump path
+       * further clamps to the global /proc/sys/kernel/coredump-max). */
+      g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
       T(i)->state = TASK_BLOCKED;
       T(i)->id = claim_task_id();
       tasks_unlock(flags);
@@ -505,6 +508,8 @@ static struct task *find_unused_task(void) {
   }
   g_task_rlimits[i][RLIMIT_NOFILE].rlim_cur = 1024;
   g_task_rlimits[i][RLIMIT_NOFILE].rlim_max = 1024;
+  /* M77: default core-dump soft cap of 1 MiB. */
+  g_task_rlimits[i][RLIMIT_CORE].rlim_cur = 1024 * 1024;
   T(i)->state = TASK_BLOCKED;
   T(i)->id = claim_task_id();
   tasks_unlock(flags);
@@ -901,6 +906,8 @@ void scheduler_init(void) {
   }
   g_task_rlimits[0][RLIMIT_NOFILE].rlim_cur = 1024;
   g_task_rlimits[0][RLIMIT_NOFILE].rlim_max = 1024;
+  /* M77: default core-dump soft cap of 1 MiB (boot task). */
+  g_task_rlimits[0][RLIMIT_CORE].rlim_cur = 1024 * 1024;
   current_task = boot;
   scheduler_started = 1;
 

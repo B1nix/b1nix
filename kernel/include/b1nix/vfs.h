@@ -411,7 +411,10 @@ struct vfs_file_ops {
 };
 
 #define MAX_VFS_NODES 4096
-#define MAX_VFS_PIPES 128
+/* Compile-time ceiling of the pipes[] pool. The pool search (pipe_pool_claim)
+ * only walks g_resource_caps.max_pipes slots (M77), so the runtime cap is
+ * adjustable via /proc/sys/kernel/pipe-max-count without reallocating. */
+#define MAX_VFS_PIPES_CEIL 1024
 #define MAX_MOUNTS 32
 #define PIPE_BUFFER_SIZE 4096
 #define TTY_INPUT_SIZE 256

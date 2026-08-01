@@ -2,6 +2,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
 #include <b1nix/arch.h>
@@ -52,13 +53,18 @@ struct tcp_pseudo {
   u16 tcp_length;
 } __attribute__((packed));
 
-/* 32, not 16: b1nix now runs a fork-per-connection SSH daemon. A single SSH
+/* Compile-time ceiling of the tcp_conns[] array. The number of slots actually
+ * used is the runtime cap g_resource_caps.tcp_max_conns (M77), sized from RAM
+ * and adjustable via /proc/sys/kernel/tcp-max-conns. The array keeps the
+ * ceiling so a sysctl write can raise the cap without reallocation.
+ *
+ * 32, not 16: b1nix now runs a fork-per-connection SSH daemon. A single SSH
  * session occupies several slots at once (client conn + server listener +
  * accepted child conn), and a SIGKILLed client/server leaves connections that
  * sit in TIME_WAIT for ~2s, so the M32b SSH smoke's three back-to-back logins
  * plus the white-box kernel TCP tests that run right after would otherwise
  * exhaust a 16-slot table and fail to allocate (tcp_accept -> NULL). */
-#define MAX_TCP_CONNS 64
+#define MAX_TCP_CONNS_CEIL 256
 /* Receive buffer / advertised window. Sized to hold a full 16 KiB TLS record
  * (and a typical TLS handshake cert flight) so HTTPS handshakes don't have to
  * be drained in 4 KiB chunks. Combined with the window-update ACK in
@@ -122,7 +128,7 @@ struct tcp_conn {
   struct tcp_retransmit_pkt *retransmit_queue;
 };
 
-static struct tcp_conn tcp_conns[MAX_TCP_CONNS];
+static struct tcp_conn tcp_conns[MAX_TCP_CONNS_CEIL];
 static u16 next_local_port = 1025;
 static u32 tcp_iss_counter = 0;
 static volatile int tcp_queue_lock;
@@ -278,7 +284,7 @@ static u16 tcp_alloc_port(void) {
 static struct tcp_conn *tcp_find_conn_af(u8 family, struct ipv4_addr v4,
                                          const struct in6_addr_k *v6,
                                          u16 remote_port, u16 local_port) {
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (!tcp_conns[i].used)
       continue;
     if (tcp_conns[i].remote_port != remote_port ||
@@ -316,7 +322,7 @@ static struct tcp_conn *tcp_connect_start_af(u8 family, struct ipv4_addr v4,
   tcp_lock();
 
   struct tcp_conn *conn = 0;
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (!tcp_conns[i].used) {
       conn = &tcp_conns[i];
       break;
@@ -519,31 +525,32 @@ int tcp_is_closed(struct tcp_conn *conn) {
 
 
 /* ── TCP Listen ── */
-int tcp_listen(u16 local_port, int backlog) {
+struct tcp_conn *tcp_listen(u16 local_port, int backlog) {
   (void)backlog;
   u64 irq = irq_save();
   tcp_lock();
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (!tcp_conns[i].used) {
       memset(&tcp_conns[i], 0, sizeof(struct tcp_conn));
       tcp_conns[i].used = 1;
       tcp_conns[i].state = TCP_LISTEN;
       tcp_conns[i].local_port = local_port;
+      struct tcp_conn *res = &tcp_conns[i];
       tcp_unlock();
       irq_restore(irq);
-      return 0;
+      return res;
     }
   }
   tcp_unlock();
   irq_restore(irq);
-  return -1;
+  return 0;
 }
 
 /* ── Check for pending connections (for poll) ── */
 int tcp_pending_connections(u16 local_port) {
   u64 irq = irq_save();
   tcp_lock();
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port && !tcp_conns[i].handed_to_user) {
       tcp_unlock();
@@ -560,7 +567,7 @@ struct tcp_conn *tcp_accept(u16 local_port, struct ipv4_addr *client_ip,
                             u16 *client_port) {
   u64 irq = irq_save();
   tcp_lock();
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port &&
         tcp_conns[i].family == B1NIX_AF_INET &&
@@ -585,7 +592,7 @@ struct tcp_conn *tcp_accept6(u16 local_port, struct in6_addr_k *client_ip6,
                              u16 *client_port) {
   u64 irq = irq_save();
   tcp_lock();
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     if (tcp_conns[i].used && tcp_conns[i].state == TCP_ESTABLISHED &&
         tcp_conns[i].local_port == local_port &&
         tcp_conns[i].family == B1NIX_AF_INET6 &&
@@ -786,6 +793,33 @@ int tcp_close(struct tcp_conn *conn) {
   if (!conn || !conn->used)
     return -1;
 
+  u64 irq = irq_save();
+  tcp_lock();
+
+  if (!conn->used) {
+    tcp_unlock();
+    irq_restore(irq);
+    return -1;
+  }
+
+  if (conn->state == TCP_LISTEN) {
+    /* A listening socket has no peer and never queued retransmits: reclaim the
+     * pool slot immediately instead of running the FIN/close handshake. Before
+     * this, a closed listener leaked its slot forever (nothing stored the conn
+     * on the socket, so teardown never reached tcp_close). */
+    conn->used = 0;
+    tcp_unlock();
+    irq_restore(irq);
+    return 0;
+  }
+
+  if (conn->state == TCP_CLOSE_WAIT) {
+    conn->state = TCP_LAST_ACK;
+  }
+
+  tcp_unlock();
+  irq_restore(irq);
+
   struct tcp_retransmit_pkt *rp = kmalloc(sizeof(struct tcp_retransmit_pkt));
   if (!rp)
     return -1;
@@ -795,19 +829,17 @@ int tcp_close(struct tcp_conn *conn) {
     return -1;
   }
 
-  u64 irq = irq_save();
+  irq = irq_save();
   tcp_lock();
 
   if (!conn->used) {
+    /* Freed by the retransmit/connect-abort paths between the two lock
+     * acquisitions (the allocations above run outside the lock). */
     tcp_unlock();
     irq_restore(irq);
     kfree(rp->data);
     kfree(rp);
     return -1;
-  }
-
-  if (conn->state == TCP_CLOSE_WAIT) {
-    conn->state = TCP_LAST_ACK;
   }
 
   /* Send FIN */
@@ -970,12 +1002,12 @@ static void tcp_input(u8 family, struct ipv4_addr v4src,
 
   if (!conn && (flags & TCP_SYN)) {
     /* Check for listener */
-    for (int i = 0; i < MAX_TCP_CONNS; i++) {
+    for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
       if (tcp_conns[i].used && tcp_conns[i].state == TCP_LISTEN &&
           tcp_conns[i].local_port == dst_port) {
         /* Found a listener, create a new connection for the client */
         struct tcp_conn *new_conn = 0;
-        for (int j = 0; j < MAX_TCP_CONNS; j++) {
+        for (int j = 0; j < (int)resource_caps_tcp_max(); j++) {
           if (!tcp_conns[j].used) {
             new_conn = &tcp_conns[j];
             break;
@@ -1303,7 +1335,7 @@ void tcp_timer_tick(void) {
     return;
   }
   u64 now = scheduler_get_uptime_ticks();
-  for (int i = 0; i < MAX_TCP_CONNS; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max(); i++) {
     struct tcp_conn *conn = &tcp_conns[i];
     
     u64 irq = irq_save();
@@ -1400,7 +1432,7 @@ usize tcp_conn_snapshot(struct net_sock_info *out, usize max) {
   struct ipv4_addr myip = net_get_ip();
   u64 irq = irq_save();
   tcp_lock();
-  for (int i = 0; i < MAX_TCP_CONNS && n < max; i++) {
+  for (int i = 0; i < (int)resource_caps_tcp_max() && n < max; i++) {
     if (!tcp_conns[i].used)
       continue;
     struct net_sock_info *e = &out[n++];
