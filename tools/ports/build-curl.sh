@@ -21,6 +21,8 @@ if [ ! -f "$MBEDTLS_PREFIX/lib/libmbedtls.a" ]; then
 fi
 # curl's configure auto-detects the mbedTLS lib set; export the include/lib paths
 # and the archive list so its link probes (and the final link) resolve.
+# (build-mbedtls.sh folds compiler-rt's __udivti3 etc. straight into
+# libmbedcrypto.a, so nothing extra is needed here for that.)
 export CPPFLAGS="-I$MBEDTLS_PREFIX/include ${CPPFLAGS:-}"
 export LDFLAGS="-L$MBEDTLS_PREFIX/lib ${LDFLAGS:-}"
 export LIBS="-lmbedtls -lmbedx509 -lmbedcrypto ${LIBS:-}"

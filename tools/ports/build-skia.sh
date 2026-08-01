@@ -39,7 +39,7 @@ fi
 
 # Ensure cross sysroot has usr/include symlink
 CROSS="$TOOLCHAIN_BUILD_HOME/cross"
-AR_BIN="${AR_BIN:-$(command -v llvm-ar 2>/dev/null || echo "$CROSS/bin/llvm-ar")}"
+AR_BIN="${AR_BIN:-$(command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || echo "$CROSS/bin/x86_64-b1nix-ar")}"
 SYSROOT="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install"
 if [ ! -d "$CROSS/usr/include" ]; then
   mkdir -p "$CROSS/usr"

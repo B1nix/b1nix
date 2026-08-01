@@ -334,6 +334,13 @@ ifeq ($(TOOLCHAIN),clang)
 ifeq ($(origin LD),default)
 LD := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/lld/bin/ld.lld)
 endif
+# Bare `llvm-readelf` is often not on PATH (Homebrew LLVM isn't linked into
+# /opt/homebrew/bin by default) — the SONAME-detection steps below silently
+# get an empty string and skip creating the SONAME-named .so copy, which
+# then makes the dynamic linker report the library "not found" even though
+# a same-named-but-unversioned copy sits right next to it. Point at the real
+# binary explicitly instead of assuming it resolves.
+READELF := $(shell command -v llvm-readelf 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-readelf)
 # Default CC is clang for the clang toolchain. macOS aliases `cc`->clang, but on
 # Linux make's built-in `cc` is gcc, which rejects clang-only flags like
 # --target=x86_64-elf. Only override make's built-in default; an explicit
@@ -1516,7 +1523,7 @@ root-image: $(KERNEL_ELF) $(USERSPACE_DEPS) install-ports $(M91_SHARED_DEPS_STAM
 	@MESA_LIB_DIR=build/$(ARCH)/ports/mesa/install/lib; \
 	for so in "$$MESA_LIB_DIR"/libOSMesa.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.8.0.0 "$$MESA_LIB_DIR"/libglapi.so.0.0.0; do \
 		if [ -f "$$so" ]; then \
-			base=$$(basename "$$so"); soname=$$(llvm-readelf -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//' ); \
+			base=$$(basename "$$so"); soname=$$($(READELF) -d "$$so" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//' ); \
 			cp -f "$$so" $(BUILD_DIR)/rootfs/lib/; \
 			if [ -n "$$soname" ] && [ "$$soname" != "$$base" ]; then \
 				cp -f "$$so" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
@@ -1574,7 +1581,7 @@ endif
 	@# Create SONAME hard copies for any .so.N.M files in rootfs/lib
 	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
-		soname=$$(llvm-readelf -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
+		soname=$$($(READELF) -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
 		if [ -n "$$soname" ] && ! [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
 			cp -f "$$f" "$(BUILD_DIR)/rootfs/lib/$$soname"; \
 		fi; \
@@ -1654,7 +1661,7 @@ endif
 	@# Remove .so.N.M files whose SONAME copy already exists (avoid duplicates)
 	@for f in $(BUILD_DIR)/rootfs/lib/lib*.so.*.*.*; do \
 		[ -f "$$f" ] || continue; \
-		soname=$$(llvm-readelf -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
+		soname=$$($(READELF) -d "$$f" 2>/dev/null | grep SONAME | sed 's/.*\[//;s/\].*//'); \
 		if [ -n "$$soname" ] && [ "$$soname" != "$$(basename $$f)" ] && [ -e "$(BUILD_DIR)/rootfs/lib/$$soname" ]; then \
 			rm -f "$$f"; \
 		fi; \

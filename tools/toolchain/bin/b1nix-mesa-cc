@@ -17,6 +17,18 @@ PROJECT_DIR="$(cd "$SCRIPT_DIR/../../.." && pwd)"
 . "$PROJECT_DIR/tools/toolchain/env.sh"
 CROSS="$TOOLCHAIN_BUILD_HOME/cross"
 
+# Without an explicit --target, clang compiles for whatever its own default
+# is. This build was previously only ever reproduced on a Linux x86_64 host,
+# where that default already happens to match — so the missing --target went
+# unnoticed. On any other host (e.g. macOS/arm64) clang silently defaults to
+# the *host* triple instead: object code comes out in the host's own
+# architecture/format, and any real link step additionally picks the host's
+# native (here, Darwin) link driver, which then rejects the GNU/ELF link
+# flags this build passes. Pin the target explicitly so the build no longer
+# depends on the host's own defaults matching what we want.
+CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+LLD_PATH="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/ld.lld)"
+
 USING_CXX=0
 IS_LINK=1
 for arg in "$@"; do
@@ -27,11 +39,11 @@ for arg in "$@"; do
 done
 
 B1NIX_INC="$CROSS/$B1NIX_TRIPLET/include"
-EXTRA_FLAGS=""
+EXTRA_FLAGS="--target=$CLANG_TARGET_TRIPLE"
 MUSL_INC="$PROJECT_DIR/build/$B1NIX_ARCH/ports/musl/install/include"
 ZLIB_INC="$PROJECT_DIR/build/$B1NIX_ARCH/ports/zlib/install/include"
 ROOTFS_INC="$PROJECT_DIR/build/$B1NIX_ARCH/rootfs/include"
-CLANG_INC="$(clang -print-resource-dir 2>/dev/null)/include"
+CLANG_INC="$("$real" -print-resource-dir 2>/dev/null)/include"
 
 PORTS_INC=""
 [ -d "$ZLIB_INC" ] && PORTS_INC="$PORTS_INC -isystem $ZLIB_INC"
@@ -44,20 +56,20 @@ fi
 
 if [ "$USING_CXX" -eq 1 ]; then
   if [ -d "$MUSL_INC" ]; then
-    EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $MUSL_INC $PORTS_INC -idirafter $B1NIX_INC"
+    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc++ -isystem $LIBCXX_HDR -isystem $MUSL_INC $PORTS_INC -idirafter $B1NIX_INC"
   else
-    EXTRA_FLAGS="-nostdinc++ -isystem $LIBCXX_HDR -isystem $B1NIX_INC $PORTS_INC"
+    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc++ -isystem $LIBCXX_HDR -isystem $B1NIX_INC $PORTS_INC"
   fi
 else
   if [ -d "$MUSL_INC" ]; then
-    EXTRA_FLAGS="-nostdinc -isystem $CLANG_INC -isystem $MUSL_INC $PORTS_INC -idirafter $B1NIX_INC"
+    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CLANG_INC -isystem $MUSL_INC $PORTS_INC -idirafter $B1NIX_INC"
   else
-    EXTRA_FLAGS="-nostdinc -isystem $CLANG_INC -isystem $B1NIX_INC $PORTS_INC"
+    EXTRA_FLAGS="$EXTRA_FLAGS -nostdinc -isystem $CLANG_INC -isystem $B1NIX_INC $PORTS_INC"
   fi
 fi
 
 if [ "$IS_LINK" -eq 1 ]; then
-  EXTRA_FLAGS="$EXTRA_FLAGS -fuse-ld=lld -Wl,--sysroot=$CROSS"
+  EXTRA_FLAGS="$EXTRA_FLAGS -fuse-ld=$LLD_PATH -Wl,--sysroot=$CROSS"
 fi
 
 # shellcheck disable=SC2086

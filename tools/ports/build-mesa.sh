@@ -29,12 +29,25 @@ SRC_DIR="$SRC_PARENT/mesa-${MESA_VERSION}"
 BUILD_DIR="$ROOT_DIR/build/$B1NIX_ARCH/ports/mesa"
 MESON_BUILD="$BUILD_DIR/meson"
 INSTALL_DIR="$BUILD_DIR/install"
-CROSS="$(ls -d "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/llvm/cross" "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/cross" 2>/dev/null | head -1)"
-CLANGXX_BIN="${B1NIX_CLANGXX:-$(command -v clang++ 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/clang++)}"
+# Both legacy candidate layouts, plus the current real one
+# ($TOOLCHAIN_BUILD_HOME/cross, from env.sh — where build-llvm-runtimes.sh
+# actually installs headers/libs today). Without a match CROSS silently
+# resolves to "" and every consumer downstream (--sysroot=$CROSS,
+# -L$CROSS/$B1NIX_TRIPLET/lib) goes quietly wrong instead of failing loudly.
+CROSS="$(ls -d "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/llvm/cross" "$ROOT_DIR/build/$B1NIX_ARCH/toolchain/$B1NIX_TRIPLET/cross" "$TOOLCHAIN_BUILD_HOME/cross" 2>/dev/null | head -1)"
+if [ -z "$CROSS" ]; then
+  echo "build-mesa.sh: ERROR — could not locate the cross toolchain dir (checked legacy paths and \$TOOLCHAIN_BUILD_HOME/cross=$TOOLCHAIN_BUILD_HOME/cross)" >&2
+  exit 1
+fi
+CLANGXX_BIN="${B1NIX_CLANGXX:-$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)}"
 
-REAL_CC="${B1NIX_CC:-$(command -v clang 2>/dev/null || echo clang)}"
+# Prefer the real (Homebrew) LLVM clang over Apple's /usr/bin/clang: the
+# latter only implements the Darwin link driver and mishandles link steps
+# for any triple it doesn't recognise as Apple's own (see build-llvm-
+# runtimes.sh for the fuller writeup of this same issue).
+REAL_CC="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo clang)}"
 REAL_CXX="$CLANGXX_BIN"
-STRIP_BIN="$(command -v llvm-strip 2>/dev/null || command -v strip 2>/dev/null || echo strip)"
+STRIP_BIN="$(command -v llvm-strip 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-strip 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-strip)"
 
 if [ "$B1NIX_ARCH" = "x86" ]; then
   LDEMU="elf_i386"; MCPU="x86"; MFAM="x86"
@@ -181,15 +194,15 @@ if [ "$B1NIX_ARCH" = "x86" ]; then
   SEDI "s/    with_asm_arch = 'x86'/    with_asm_arch = '' # b1nix: no i386 asm dispatch/" "$SRC_DIR/meson.build"
   SEDI "/    pre_args += \['-DUSE_X86_ASM'\]/d" "$SRC_DIR/meson.build"
 fi
-# x86_64: the generated glapi x86-64 asm dispatch (glapi_x86-64.S) accesses
-# _glapi_tls_Dispatch via @GOTTPOFF — an initial-exec TLS reloc (R_X86_64_TPOFF64)
-# that b1nix's musl ld.so cannot satisfy for the dynamically-loaded libOSMesa.so
-# (load fails, m52-osmesa exits 127 before main). Neutralise the x86_64 asm so
-# glapi uses portable C dispatch (general-dynamic TLS) — fine for a software port.
-if [ "$B1NIX_ARCH" = "x86_64" ]; then
-  SEDI "s/    with_asm_arch = 'x86_64'/    with_asm_arch = '' # b1nix: no x86_64 asm dispatch (IE-TLS)/" "$SRC_DIR/meson.build"
-  SEDI "/    pre_args += \['-DUSE_X86_64_ASM'\]/d" "$SRC_DIR/meson.build"
-fi
+# x86_64: previously neutralised the generated glapi x86-64 asm dispatch
+# (glapi_x86-64.S, which accesses _glapi_tls_Dispatch via @GOTTPOFF — an
+# initial-exec TLS reloc) because b1nix's ld.so allegedly could not satisfy
+# IE-TLS for a dynamically-loaded libOSMesa.so. That was a build-side downgrade
+# to general-dynamic TLS, not a real fix — and it does not scale to prebuilt
+# third-party (e.g. Alpine) .so packages we cannot re-patch. Left un-neutralised
+# so the real failure (if any) surfaces and can be root-caused/fixed in the
+# kernel/ld.so instead. If this reintroduces the "exits 127 before main"
+# failure, see docs/ for the investigation before re-adding a workaround here.
 
 # b1nix Mesa source changes (e.g. the VirGL winsys for /dev/virtio-gpu, M53
 # variant B) live in this repo, NOT in the extracted tarball, so they are
@@ -252,7 +265,7 @@ if [ ! -f "$MESON_BUILD/build.ninja" ]; then
   # Fix: meson's has_function probe detects qsort_s from the host compiler,
   # but b1nix libc doesn't have it. Replace -D with -U in the generated ninja.
   if [ -f "$MESON_BUILD/build.ninja" ]; then
-    sed -i 's/-DHAVE_QSORT_S/-UHAVE_QSORT_S/g' "$MESON_BUILD/build.ninja"
+    SEDI 's/-DHAVE_QSORT_S/-UHAVE_QSORT_S/g' "$MESON_BUILD/build.ninja"
   fi
 fi
 

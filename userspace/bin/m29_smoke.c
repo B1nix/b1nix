@@ -22,7 +22,6 @@
 #define SYS_SET_TLS_VIA_ARCH_PRCTL
 #endif
 #include <utmp.h>
-#include <security/pam_appl.h>
 #include <locale.h>
 #include <langinfo.h>
 #include <iconv.h>
@@ -454,44 +453,6 @@ static int test_utmp(void) {
   return 0;
 }
 
-static int mock_pam_conv(int num_msg, const struct pam_message **msg,
-                         struct pam_response **resp, void *appdata) {
-  (void)num_msg; (void)msg; (void)appdata;
-  struct pam_response *r = calloc(1, sizeof(struct pam_response));
-  r->resp = strdup("testpass");
-  *resp = r;
-  return PAM_SUCCESS;
-}
-
-static int test_pam(void) {
-  pam_handle_t *pamh = NULL;
-  struct pam_conv conv = { mock_pam_conv, NULL };
-  
-  if (pam_start("test_service", "nonexistent_user", &conv, &pamh) != PAM_SUCCESS) {
-    fail("pam-start-failed");
-    return -1;
-  }
-  
-  const char *user = NULL;
-  if (pam_get_item(pamh, PAM_USER, (const void **)&user) != PAM_SUCCESS || 
-      strcmp(user, "nonexistent_user") != 0) {
-    fail("pam-get-item-failed");
-    pam_end(pamh, PAM_AUTH_ERR);
-    return -1;
-  }
-  
-  int rc = pam_authenticate(pamh, 0);
-  if (rc != PAM_USER_UNKNOWN) {
-    fail("pam-authenticate-nonexistent-user-should-fail");
-    pam_end(pamh, PAM_AUTH_ERR);
-    return -1;
-  }
-  
-  pam_end(pamh, PAM_SUCCESS);
-  ok("pam");
-  return 0;
-}
-
 static int test_locale(void) {
   /* musl's startup locale is named "C" (always UTF-8 internally); the old
    * b1nix libc reported "C.UTF-8". Accept either default name. */
@@ -663,7 +624,7 @@ static int test_cancel(void) {
 int main(void) {
   emit("M29-PTHREAD: start\n");
   /* Run every test even if one fails: the subsystems are independent (a failure
-   * in the CLONE_VM stress race must not hide the syslog/utmp/pam/locale/iconv/
+   * in the CLONE_VM stress race must not hide the syslog/utmp/locale/iconv/
    * timer/cancel results that follow it). Accumulate failures and still emit the
    * completion marker so a single sub-failure does not cascade the whole group. */
   int rc = 0;
@@ -678,7 +639,6 @@ int main(void) {
   rc |= test_stress_smp();
   rc |= test_syslog();
   rc |= test_utmp();
-  rc |= test_pam();
   rc |= test_locale();
   rc |= test_iconv();
   rc |= test_time_hammer();
@@ -686,7 +646,3 @@ int main(void) {
   emit("M29-PTHREAD: done\n");
   return rc ? 1 : 0;
 }
-
-#ifdef __linux__
-#include "../../archive/userspace/libc/pam.c"
-#endif

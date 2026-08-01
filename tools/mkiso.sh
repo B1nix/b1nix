@@ -25,6 +25,13 @@ set -eu
 
 ROOT_DIR="$(cd "$(dirname "$0")/.." && pwd)"
 
+# The @MODULES@ template expansion below passes a multi-line value via
+# `awk -v var=...`. BSD/"one true" awk (macOS's /usr/bin/awk) rejects a
+# literal newline inside a -v assignment ("newline in string"); GNU awk
+# accepts it. Prefer gawk when present rather than assuming the platform's
+# awk is GNU awk.
+AWK_BIN="$(command -v gawk 2>/dev/null || command -v awk)"
+
 STAGE=""; OUT=""; ARCH="x86_64"; KERNEL=""; CMDLINE=""; TIMEOUT="0"
 MODULES=""   # newline-separated "path:name" entries
 
@@ -106,7 +113,7 @@ MODULE_BLOCK="${MODULE_BLOCK%
 # ── expand the config template ─────────────────────────────────────────────
 # @MODULES@ is a whole-line placeholder standing for a multi-line block, so it
 # is expanded with awk rather than sed (portable across GNU/BSD sed).
-awk -v timeout="$TIMEOUT" -v arch="$ARCH" -v cmdline="$CMDLINE" -v modules="$MODULE_BLOCK" '
+"$AWK_BIN" -v timeout="$TIMEOUT" -v arch="$ARCH" -v cmdline="$CMDLINE" -v modules="$MODULE_BLOCK" '
   {
     line = $0
     if (line == "@MODULES@") { if (modules != "") print modules; next }

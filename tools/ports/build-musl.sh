@@ -180,7 +180,13 @@ if [ ! -f "$BUILD_DIR/Makefile" ]; then
     # 1. musl's configure detects -lgcc/-lgcc_eh via the host compiler and adds
     #    them to LIBCC. We don't have libgcc — replace with compiler-rt builtins
     #    which provides __mulxc3/__muldc3/__mulsc3 (complex math helpers musl needs).
-    CRT_BUILTINS=$(ls /usr/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a 2>/dev/null | tail -1)
+    #    /usr/lib/clang/*/lib/linux/... is where a Linux clang installs this —
+    #    it never exists on macOS, so this glob always missed here, silently
+    #    clearing LIBCC (see build-llvm-runtimes.sh for the sibling bug: the
+    #    same class of "assumed a Linux host" path miss). Use our own built
+    #    cross compiler-rt archive instead.
+    CRT_BUILTINS="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+    [ -f "$CRT_BUILTINS" ] || CRT_BUILTINS=$(ls /usr/lib/clang/*/lib/linux/libclang_rt.builtins-x86_64.a 2>/dev/null | tail -1)
     if [ -n "$CRT_BUILTINS" ]; then
       sed -i.bak "s|^LIBCC = .*|LIBCC = $CRT_BUILTINS|" "$SRC_DIR/config.mak"
     else

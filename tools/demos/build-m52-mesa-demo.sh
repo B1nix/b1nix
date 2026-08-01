@@ -37,7 +37,10 @@ make B1NIX_ARCH="$B1NIX_ARCH" LINK=musl -C "$ROOT_DIR/userspace" -s \
 
 OBJ="$(dirname "$OUT")/$DEMO.o"
 mkdir -p "$(dirname "$OUT")"
-CC_CROSS="${B1NIX_CC:-$(command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-cc")}"
+# Apple's /usr/bin/clang only implements the Darwin toolchain driver (see
+# build-llvm-runtimes.sh for the fuller writeup) — prefer the real Homebrew
+# LLVM clang.
+CC_CROSS="${B1NIX_CC:-$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo "$CROSS/bin/$B1NIX_TRIPLET-cc")}"
 CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 # shellcheck disable=SC2086
 "$CC_CROSS" --target="$B1NIX_TRIPLET" -O2 -fPIC -ffunction-sections -fdata-sections -Db1nix \
@@ -46,7 +49,11 @@ CC_RES="$("$CC_CROSS" -print-resource-dir 2>/dev/null || true)"
 
 # Link the executable against the real musl dynamic loader and libc.
 MUSL_LIB="$ROOT_DIR/build/$B1NIX_ARCH/ports/musl/install/lib"
-BUILTINS_LIB="$(clang -print-resource-dir)/lib/linux/libclang_rt.builtins-x86_64.a"
+# Use our own already-built cross compiler-rt archive rather than deriving a
+# path from `clang -print-resource-dir` — that reflects whichever clang
+# happens to be first on PATH (often Apple's, whose resource dir is Darwin-
+# only and has no lib/linux/ subdirectory at all).
+BUILTINS_LIB="$TOOLCHAIN_BUILD_HOME/llvm-runtimes-build/install/lib/libcompiler_rt.a"
 DYN_CRT0="$MUSL_LIB/Scrt1.o"
 DYN_FLAGS="-pie -z norelro --hash-style=sysv --dynamic-linker /lib/ld-musl-x86_64.so.1 -L$MUSL_LIB"
 DYN_LIBC="$MUSL_LIB/crti.o -lc $MUSL_LIB/crtn.o $BUILTINS_LIB"

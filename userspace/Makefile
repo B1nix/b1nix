@@ -17,8 +17,13 @@ B1NIX_TRIPLET := x86_64-b1nix
 endif
 # Prefix ccache when present so userspace ELFs recompile from cache after a
 # `make clean` (explicit `make CC=...` still wins — command-line beats `:=`).
+# Apple's /usr/bin/clang only implements the Darwin link driver and its
+# `-print-resource-dir` has no lib/linux/ subdirectory (see build-llvm-
+# runtimes.sh for the fuller writeup) — prefer the real Homebrew LLVM clang
+# so BUILTINS_LIB below actually resolves to a usable compiler-rt archive.
+CLANG_BIN := $(shell command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo clang)
 CCACHE   := $(shell command -v ccache 2>/dev/null)
-CC       := $(if $(CCACHE),$(CCACHE) clang,clang)
+CC       := $(if $(CCACHE),$(CCACHE) $(CLANG_BIN),$(CLANG_BIN))
 LD       := $(shell command -v ld.lld 2>/dev/null || echo /opt/homebrew/bin/ld.lld)
 AR       := $(shell command -v llvm-ar 2>/dev/null || command -v /opt/homebrew/opt/llvm/bin/llvm-ar 2>/dev/null || command -v ar 2>/dev/null || echo ar)
 LINK ?= musl
@@ -54,12 +59,17 @@ LIBCXX_INCLUDE := $(firstword $(wildcard \
   ../build/$(B1NIX_ARCH)/toolchain/$(B1NIX_TRIPLET)/llvm-runtimes-build-musl/libcxx-install/include/c++/v1))
 # compiler-rt builtins: the helpers the compiler emits calls to but no library
 # defines (128-bit division __udivti3 and friends). Linking through ld.lld
-# directly means nothing supplies them implicitly, so name the archive. Asking
-# clang for its own resource dir keeps this pinned to the compiler in use.
-CLANG_RES_DIR := $(shell $(CC) -print-resource-dir 2>/dev/null)
+# directly means nothing supplies them implicitly, so name the archive.
+# `clang -print-resource-dir` used to pin this to whichever compiler is in
+# use, but that only works when the compiler's own resource dir actually
+# ships a builtins archive for our *target* — Homebrew's LLVM resource dir
+# ships none at all (it's built for compiling for the host, arm64-apple-
+# darwin, not our x86_64-linux cross target). Use our own cross-built
+# compiler-rt directly instead (see tools/toolchain/build-llvm-runtimes.sh).
 BUILTINS_LIB  := $(firstword $(wildcard \
-                   $(CLANG_RES_DIR)/lib/*/libclang_rt.builtins-x86_64.a \
-                   $(CLANG_RES_DIR)/lib/libclang_rt.builtins-x86_64.a))
+                   ../build/$(B1NIX_ARCH)/toolchain/sysroot/usr/lib/libcompiler_rt.a \
+                   ../build/$(B1NIX_ARCH)/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a \
+                   ../build/$(B1NIX_ARCH)/toolchain/cross/$(B1NIX_TRIPLET)/lib/libcompiler_rt.a))
 
 # NOTE: -MD (not -MMD). Our headers live under `include/`, pulled in via
 # `-isystem include`, which makes them *system* headers — and -MMD omits system
@@ -133,7 +143,9 @@ BESPOKE_LINKER :=
 BESPOKE_LIBDEP := $(MUSL_LIBSO) $(MUSL_CRT1) $(UTMP_OBJ)
 BESPOKE_PIC    := -fPIC
 BESPOKE_MUSL_POSTLINK := 1
-CXX            := $(if $(CCACHE),$(CCACHE) clang++,clang++)
+# Same reasoning as CLANG_BIN/CC above: prefer the real Homebrew LLVM clang++.
+CLANGXX_BIN    := $(shell command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)
+CXX            := $(if $(CCACHE),$(CCACHE) $(CLANGXX_BIN),$(CLANGXX_BIN))
 CXXFLAGS       := --target=x86_64-unknown-elf -ffreestanding -nostdinc++ \
                   -isystem $(LIBCXX_INCLUDE) -nostdinc -isystem $(MUSL_INCLUDE) \
                   -isystem $(CLANG_RES_DIR)/include -idirafter include -Wall -Wextra -O2 -msoft-float -mno-implicit-float -Db1nix \
@@ -521,8 +533,10 @@ $(BUILD)/bin/m32_nettool: bin/m32_nettool.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LIN
 	  echo "  CC+TLS  m32_nettool"; \
 	  $(CC) $(CFLAGS) $(BESPOKE_PIC) -DB1NIX_HAVE_MBEDTLS -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m32_nettool.o; \
 	  $(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m32_nettool.o \
+	    --start-group \
 	    $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
-	    $(BESPOKE_LIBC); \
+	    $(BESPOKE_LIBC) \
+	    --end-group; \
 	else \
 	  echo "  CC      m32_nettool (HTTP-only, no mbedTLS)"; \
 	  $(CC) $(CFLAGS) $(BESPOKE_PIC) -c $< -o $(BUILD)/bin/m32_nettool.o; \
@@ -543,8 +557,10 @@ $(BUILD)/bin/m53_httpsd: bin/m53_httpsd.c $(BESPOKE_LIBDEP) $(if $(BESPOKE_LINKE
 	@mkdir -p $(dir $@)
 	$(CC) $(CFLAGS) $(BESPOKE_PIC) -I $(MBEDTLS_DIR)/include -c $< -o $(BUILD)/bin/m53_httpsd.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(if $(BESPOKE_LINKER),-T $(BESPOKE_LINKER)) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m53_httpsd.o \
+	  --start-group \
 	  $(MBEDTLS_DIR)/lib/libmbedtls.a $(MBEDTLS_DIR)/lib/libmbedx509.a $(MBEDTLS_DIR)/lib/libmbedcrypto.a \
-	  $(BESPOKE_LIBC)
+	  $(BESPOKE_LIBC) \
+	  --end-group
 	$(if $(BESPOKE_MUSL_POSTLINK), \
 	  python3 -c "\
 	  import sys; f=sys.argv[1]; \
@@ -679,9 +695,19 @@ $(BUILD)/bin/m64_clang_smoke: bin/m64_clang_smoke.cpp $(BESPOKE_LIBDEP) $(BESPOK
 
 # M55: std::iostream (std::cout/cerr + locale facets) + std::filesystem over the
 # b1nix VFS, built against LLVM libc++ via tools/toolchain/bin/b1nix-c++.
+# -ffreestanding (in $(CXXFLAGS), inherited from the kernel's own build flags)
+# makes clang define __STDC_HOSTED__=0, which makes libc++ define
+# _LIBCPP_FREESTANDING and compile <filesystem> down to an empty namespace —
+# appropriate for bare-metal kernel code with no OS underneath, but wrong
+# here: userspace on b1nix has a real musl libc and real syscalls, i.e. is
+# genuinely hosted. Override it back for this one target rather than
+# touching the shared $(CXXFLAGS) (other translation units may rely on the
+# freestanding semantics, e.g. to avoid clang assuming a specific main()
+# signature/builtin behavior — this file specifically needs the hosted
+# standard-library facilities that flag suppresses).
 $(BUILD)/bin/m55_iostream: bin/m55_iostream.cpp $(BESPOKE_LIBDEP) $(BESPOKE_LIBCXX_EXTRA)
 	@mkdir -p $(dir $@)
-	$(CXX) $(CXXFLAGS) -c $< -o $(BUILD)/bin/m55_iostream.o
+	$(CXX) $(CXXFLAGS) -U__STDC_HOSTED__ -D__STDC_HOSTED__=1 -c $< -o $(BUILD)/bin/m55_iostream.o
 	$(LD) $(LDFLAGS) $(BESPOKE_EXTRA) $(BESPOKE_CXX_EXTRA) -o $@ $(BESPOKE_CRT0) $(BUILD)/bin/m55_iostream.o \
 	  -l:libc++.so.1 -l:libc++abi.so.1 $(BESPOKE_LIBCXX_EXTRA) $(BESPOKE_LIBC)
 	$(if $(BESPOKE_MUSL_POSTLINK), \

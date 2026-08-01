@@ -61,8 +61,17 @@ port_build() {
       CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
       libtomcrypt/libtomcrypt.a libtommath/libtommath.a 1>&2
   else
+    # curve25519/libtomcrypt bignum code needs compiler-rt's 128-bit division
+    # helper (__udivti3) — without it the final dropbearmulti link fails (see
+    # userspace/Makefile's m32_nettool/m53_httpsd rules and build-curl.sh for
+    # the same requirement).
+    # A `make LIBS=...` command-line override replaces (not appends to) the
+    # Makefile's own `LIBS+=@LIBS@` (which configure filled with -lz), so
+    # keep -lz alongside the compiler-rt archive rather than dropping it.
+    BUILTINS_LIB="$ROOT_DIR/build/${B1NIX_ARCH:-x86_64}/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a"
     make -C "$BUILD_DIR" -j"${JOBS:-4}" \
       CC="$AUTOTOOLS_CC" AR="$AR_BIN" RANLIB="$RANLIB_BIN" \
+      LIBS="-lz $BUILTINS_LIB" \
       PROGRAMS="dropbear dbclient dropbearkey dropbearconvert" \
       MULTI=1 dropbearmulti 1>&2
   fi

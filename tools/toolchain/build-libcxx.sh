@@ -52,15 +52,24 @@ if [ "$OS" = "Darwin" ]; then NPROC=$(sysctl -n hw.ncpu); else NPROC=$(nproc); f
 # Verify prerequisites
 [ -d "$SRC_DIR" ] || { echo "LLVM sources not found at $SRC_DIR — run build-llvm-runtimes.sh first" >&2; exit 1; }
 [ -f "$BUILD_HOME/install/lib/libcompiler_rt.a" ] || { echo "compiler-rt not found — run build-llvm-runtimes.sh first" >&2; exit 1; }
-[ -d "$SRC_DIR/runtimes" ] || { echo "llvm-project/runtimes missing in $SRC_DIR" >&2; exit 1; }
+[ -d "$SRC_DIR/llvm" ] || { echo "llvm-project/llvm missing in $SRC_DIR" >&2; exit 1; }
 [ -f "$SYSROOT/include/pthread.h" ] || { echo "b1nix sysroot headers not staged — run build-toolchain.sh first" >&2; exit 1; }
 
 mkdir -p "$INSTALL_DIR/lib" "$INSTALL_DIR/include"
 
-CLANG_BIN="$(command -v clang 2>/dev/null || echo clang)"
-CLANGXX_BIN="$(command -v clang++ 2>/dev/null || echo clang++)"
+# Apple's /usr/bin/clang only implements the Darwin link driver (see
+# build-llvm-runtimes.sh for the fuller writeup) — prefer the real Homebrew
+# LLVM clang so any linking this bootstrap does (try_compile probes, etc.)
+# doesn't silently default to Mach-O.
+CLANG_BIN="$(command -v /opt/homebrew/opt/llvm/bin/clang 2>/dev/null || command -v clang 2>/dev/null || echo clang)"
+CLANGXX_BIN="$(command -v /opt/homebrew/opt/llvm/bin/clang++ 2>/dev/null || command -v clang++ 2>/dev/null || echo clang++)"
 AR_BIN="$(command -v llvm-ar 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ar)"
 RANLIB_BIN="$(command -v llvm-ranlib 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/llvm-ranlib)"
+# b1nix's own triple has no OS component, which makes clang's driver fall
+# back to the Darwin toolchain for anything that links (see
+# build-llvm-runtimes.sh). Use a real ELF/Linux triple for codegen instead.
+CLANG_TARGET_TRIPLE="x86_64-unknown-linux-gnu"
+LLD_PATH="$(command -v ld.lld 2>/dev/null || echo /opt/homebrew/opt/llvm/bin/ld.lld)"
 
 # b1nix-specific defines needed by libc++/libc++abi/libunwind:
 #   _POSIX_THREADS / _POSIX_C_SOURCE — POSIX pthread + .1-2008 APIs
@@ -72,6 +81,14 @@ if [ ! -f "$INSTALL_DIR/lib/libc++.a" ] || [ "${REBUILD:-0}" = "1" ]; then
     echo "Configuring LLVM runtimes (libunwind;libcxxabi;libcxx) for $B1NIX_TRIPLET..."
     rm -rf "$RT_BUILD"
     mkdir -p "$RT_BUILD"
+    # Earlier debugging in this session chased "runtimes/ is gone in LLVM 22"
+    # and "host tblgen not found" as if they were real API/version changes —
+    # they weren't. The actual cause was a truncated/interrupted tar
+    # extraction of llvm-project-*.src.tar.xz that silently left both
+    # utils/TableGen/ and runtimes/ missing from the tree; a clean
+    # re-extraction restored both. Back to the original, lighter invocation
+    # (configuring only runtimes/, not the whole llvm/ project — no LLVMCodeGen
+    # etc. dragged in as a "host tools" build).
     cmake -G "Unix Makefiles" \
         -S "$SRC_DIR/runtimes" -B "$RT_BUILD" \
         -DCMAKE_SYSTEM_NAME=Linux \
@@ -80,14 +97,20 @@ if [ ! -f "$INSTALL_DIR/lib/libc++.a" ] || [ "${REBUILD:-0}" = "1" ]; then
         -DCMAKE_CXX_COMPILER="$CLANGXX_BIN" \
         -DCMAKE_AR="$AR_BIN" \
         -DCMAKE_RANLIB="$RANLIB_BIN" \
-        -DCMAKE_C_COMPILER_TARGET="$B1NIX_TRIPLET" \
-        -DCMAKE_CXX_COMPILER_TARGET="$B1NIX_TRIPLET" \
+        -DCMAKE_C_COMPILER_TARGET="$CLANG_TARGET_TRIPLE" \
+        -DCMAKE_CXX_COMPILER_TARGET="$CLANG_TARGET_TRIPLE" \
         -DCMAKE_ASM_COMPILER="$CLANG_BIN" \
-        -DCMAKE_ASM_COMPILER_TARGET="$B1NIX_TRIPLET" \
+        -DCMAKE_ASM_COMPILER_TARGET="$CLANG_TARGET_TRIPLE" \
         -DCMAKE_SYSROOT="$SYSROOT" \
+        -DCMAKE_EXE_LINKER_FLAGS="-fuse-ld=$LLD_PATH" \
+        -DCMAKE_SHARED_LINKER_FLAGS="-fuse-ld=$LLD_PATH" \
+        -DCMAKE_MODULE_LINKER_FLAGS="-fuse-ld=$LLD_PATH" \
         -DCMAKE_TRY_COMPILE_TARGET_TYPE=STATIC_LIBRARY \
         -DCMAKE_BUILD_TYPE=Release \
         -DCMAKE_INSTALL_PREFIX="$INSTALL_DIR" \
+        -DLLVM_FORCE_USE_OLD_TOOLCHAIN=ON \
+        -DCMAKE_C_COMPILER_WORKS=1 \
+        -DCMAKE_CXX_COMPILER_WORKS=1 \
         -DCMAKE_C_FLAGS="$B1NIX_DEFINES" \
         -DCMAKE_CXX_FLAGS="$B1NIX_DEFINES" \
         -DCMAKE_POSITION_INDEPENDENT_CODE=ON \

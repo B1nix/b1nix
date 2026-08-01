@@ -62,4 +62,20 @@ cp "$SRC_DIR"/library/libmbed*.a "$INSTALL_DIR/lib/"
 cp -R "$SRC_DIR/include/mbedtls" "$INSTALL_DIR/include/"
 cp -R "$SRC_DIR/include/psa" "$INSTALL_DIR/include/"
 
+# mbedTLS's bignum code (mbedtls_mpi_div_mpi, used by every RSA/ECC/DH
+# operation) calls compiler-rt's 128-bit division helper (__udivti3), which
+# no library here defines implicitly when linking through ld.lld directly.
+# Every consumer (curl, dropbear, NetSurf, the M32 smoke nettool, ...) hit
+# the same "undefined symbol: __udivti3" independently; fix it once here by
+# folding compiler-rt's object files straight into libmbedcrypto.a, so
+# `-lmbedcrypto` alone is always sufficient.
+BUILTINS_LIB="$ROOT_DIR/build/$B1NIX_ARCH/toolchain/llvm-runtimes-build/install/lib/libcompiler_rt.a"
+if [ -f "$BUILTINS_LIB" ]; then
+  MERGE_DIR="$BUILD_DIR/compiler-rt-merge"
+  rm -rf "$MERGE_DIR"
+  mkdir -p "$MERGE_DIR"
+  ( cd "$MERGE_DIR" && "$AR_BIN" x "$BUILTINS_LIB" )
+  "$AR_BIN" rcs "$INSTALL_DIR/lib/libmbedcrypto.a" "$MERGE_DIR"/*.o
+fi
+
 echo "$INSTALL_DIR"
