@@ -1,4 +1,5 @@
 #include <b1nix/loop.h>
+#include <b1nix/klog.h>
 #include <b1nix/console.h>
 #include <b1nix/mm.h>
 #include <b1nix/vfs.h>
@@ -175,10 +176,18 @@ struct loop_info32 {
 static void loop_set_name_from_fd(struct loop_device *lo, int fd) {
   char path[VFS_MAX_PATH];
   lo->file_name[0] = '\0';
-  if (vfs_fd_abspath(fd, path, sizeof(path)) == 0) {
+  int rc = vfs_fd_abspath(fd, path, sizeof(path));
+  if (rc == 0) {
     strncpy(lo->file_name, path, sizeof(lo->file_name) - 1);
     lo->file_name[sizeof(lo->file_name) - 1] = '\0';
+    return;
   }
+  /* No fabricated fallback: a name that is not the real path would make
+   * `losetup -a` point at a file that does not exist, which is worse than an
+   * empty field. vfs_fd_abspath currently cannot reconstruct a path whose
+   * parent chain crosses the ext4 root's lazily materialised directories —
+   * tracked as an open M107 item. */
+  klog_debug_category("loop", "backing path unresolved");
 }
 
 /* blk_create_dev_nodes() stamps /dev/loopN's size while the device is still
@@ -226,8 +235,16 @@ void loop_init(void) {
     g_loops[i].bdev.priv = &g_loops[i];
     blk_register(&g_loops[i].bdev);
   }
+  loop_register_nodes();
+}
+
+/* Node (re)registration, separate from the one-time device setup above: nodes
+ * created during early boot live on the initramfs root and become unreachable
+ * once the real root is mounted over "/", so this is called again from
+ * vfs_repopulate_after_root_mount(). */
+void loop_register_nodes(void) {
   struct vfs_node *ctl = vfs_add_node("/dev/loop-control", VFS_DEVICE, 0, 0, 0);
-  if (ctl)
+  if (ctl && !IS_ERR(ctl))
     ctl->inode->mode = 0660;
 }
 

@@ -992,9 +992,9 @@ static int r_pid_maps(usize pid, struct sbuf *s) {
           m[i].start >= (t->heap_start & ~(u64)(PAGE_SIZE - 1)) &&
           m[i].start < t->user_brk)
         m[i].name = "[heap]";
-      else if (img->address_space.stack_base && img->address_space.stack_top &&
-               m[i].start >= img->address_space.stack_base &&
-               m[i].start < img->address_space.stack_top)
+      else if (img->address_space.stack_top &&
+               m[i].end <= img->address_space.stack_top &&
+               m[i].end > img->address_space.stack_top - USER_STACK_MAX_SIZE)
         m[i].name = "[stack]";
     }
   }

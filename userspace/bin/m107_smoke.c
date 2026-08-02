@@ -981,6 +981,9 @@ static void test_loop(void) {
                    b0[1] == (unsigned char)~0 && b3[0] == 3 &&
                    b3[1] == (unsigned char)~3;
   int name_ok = strcmp((char *)info.lo_file_name, LOOP_IMG) == 0;
+  if (!name_ok)
+    printf("M107-SMOKE: loop lo_file_name=\"%s\" want=\"%s\"\n",
+           (char *)info.lo_file_name, LOOP_IMG);
   int num_ok = (int)info.lo_number == idx;
   check("loop-attach",
         set == 0 && st == 0 && content_ok && name_ok && num_ok,
@@ -1052,13 +1055,14 @@ static void test_proc_fd_path(void) {
 static void test_proc_maps_labels(void) {
   int local = 42;
   unsigned long stack_addr = (unsigned long)&local;
-  /* musl's allocator never touches brk, so grow the heap explicitly: the
-   * [heap] label describes the brk region and there would otherwise be no
-   * brk region to describe. */
-  void *base = sbrk(0);
-  void *grown = sbrk(2 * 4096);
-  unsigned long heap_addr =
-      (grown == (void *)-1) ? 0 : (unsigned long)grown;
+  /* musl's allocator never touches brk, and its sbrk() refuses every non-zero
+   * increment outright (it is a stub that returns ENOMEM by design), so the
+   * break has to be grown through the syscall — otherwise there is no brk
+   * region for [heap] to describe and this would test the libc, not b1nix. */
+  unsigned long base = (unsigned long)syscall(12 /* SYS_brk */, 0);
+  unsigned long want = base + 2 * 4096;
+  unsigned long got = (unsigned long)syscall(12, want);
+  unsigned long heap_addr = (got == want) ? base : 0;
 
   FILE *f = fopen("/proc/self/maps", "r");
   if (!f) {
@@ -1080,7 +1084,17 @@ static void test_proc_maps_labels(void) {
       heap_ok = 1;
   }
   fclose(f);
-  (void)base;
+  if (!stack_ok || !heap_ok) {
+    printf("M107-SMOKE: maps-probe brk=0x%lx..0x%lx stack=0x%lx\n", base, got,
+           stack_addr);
+    FILE *g = fopen("/proc/self/maps", "r");
+    if (g) {
+      char l[512];
+      while (fgets(l, sizeof(l), g))
+        printf("M107-SMOKE: maps| %s", l);
+      fclose(g);
+    }
+  }
   check("proc-maps-labels", stack_ok && heap_ok,
         (long)(stack_ok * 10 + heap_ok));
 }

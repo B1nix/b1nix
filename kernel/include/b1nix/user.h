@@ -20,6 +20,9 @@
 #ifdef __x86_64__
 #define USER_SPACE_LIMIT 0x0000800000000000ULL
 #define USER_STACK_TOP 0x0000800000000000ULL
+/* Stack growth window reserved below USER_STACK_TOP. The loader describes it
+ * with one VMA and procfs labels that VMA [stack], so both must agree. */
+#define USER_STACK_MAX_SIZE (8ULL * 1024ULL * 1024ULL)
 #else
 /* 32-bit layout: user [0, 2 GiB), kernel [2 GiB, 4 GiB). The kernel direct-maps
  * physical RAM at DIRECT_MAP_BASE (0x80000000) for up to DIRECT_MAP_MAX (1 GiB),

@@ -206,7 +206,6 @@ struct elf64_shdr {
   u64 sh_entsize;
 } __attribute__((packed));
 
-static const u64 USER_STACK_MAX_SIZE = 8ULL * 1024ULL * 1024ULL;
 static int user_image_read_vfs_file(const char *path, char **out_data,
                                     usize *out_size);
 
@@ -1904,6 +1903,35 @@ static int user_run_elf_image(struct user_loaded_image *image) {
    * translations on every CPU before a freshly loaded image can migrate. */
   extern void tlb_shootdown_all(void);
   tlb_shootdown_all();
+
+  /* The stack must be described by a VMA before the process runs: the loader
+   * adds one, but an image with a PT_INTERP rebuilds its address space after
+   * that point and the description is lost — /proc/<pid>/maps then has no line
+   * covering the stack at all, so pmap and lsof cannot see it and [stack]
+   * has nothing to label. Re-add it here, where every path (static, PIE,
+   * interpreted) has converged and the final stack_top is known. */
+  if (current_task) {
+    u64 stack_top = image->address_space.stack_top;
+    u64 probe = stack_top - 1;
+    int covered = 0;
+    for (struct vm_area *v = current_task->vma_list; v; v = v->next) {
+      if (probe >= v->start && probe < v->end) {
+        covered = 1;
+        break;
+      }
+    }
+    if (!covered) {
+      struct vm_area *sv = kzalloc(sizeof(struct vm_area));
+      if (sv) {
+        sv->start = stack_top - USER_STACK_MAX_SIZE;
+        sv->end = stack_top;
+        sv->prot = PROT_READ | PROT_WRITE;
+        sv->flags = MAP_PRIVATE | MAP_ANONYMOUS;
+        sv->next = current_task->vma_list;
+        current_task->vma_list = sv;
+      }
+    }
+  }
 
   /* M86: from here on the CPU runs ring-3 code — close the kernel-time
    * interval so the process's first user instructions are charged as user

@@ -2347,6 +2347,17 @@ void vfs_repopulate_after_root_mount(void) {
   sound_module_dev_init();
   ac97_dev_init();
 
+  /* M107 device nodes — virtual terminals, /dev/kmsg, /dev/rtc*, /dev/watchdog,
+   * /dev/loop-control and the SMBus adapter. Same reason as everything above:
+   * these drivers probe at early boot, so without this their nodes stay on the
+   * initramfs root and every ioctl against them reports ENOENT. */
+  vt_register_nodes();
+  kmsg_register_nodes();
+  rtc_dev_register_nodes();
+  watchdog_register_nodes();
+  loop_register_nodes();
+  i2c_register_nodes();
+
   node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);
   if (node && !IS_ERR(node)) vfs_node_put(node);
 

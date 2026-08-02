@@ -44,7 +44,14 @@ mkdir -p "$(dirname "$LOCKFILE")"
 
 (
   flock -x 9
-  if [ -f "$INSTALL_DIR/lib/libc.a" ] && [ -f "$INSTALL_DIR/lib/libc.so" ]; then
+  # The uapi headers this script emits (linux/{kd,keyboard,rtc,watchdog,i2c,
+  # i2c-dev,vt}.h, M107) are written further down, AFTER this fast path — so a
+  # tree whose musl was built before they existed would never receive them, and
+  # the BusyBox applets that include them fail to compile with no hint that the
+  # libc is simply stale. Treat the newest header as part of what "already
+  # built" means: a tree missing it rebuilds once and is fast again after.
+  if [ -f "$INSTALL_DIR/lib/libc.a" ] && [ -f "$INSTALL_DIR/lib/libc.so" ] &&
+     [ -f "$INSTALL_DIR/include/linux/i2c-dev.h" ]; then
     echo "$INSTALL_DIR"
     exit 0
   fi

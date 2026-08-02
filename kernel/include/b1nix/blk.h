@@ -67,4 +67,7 @@ void blk_sync_all(void);
 void blk_cache_invalidate(struct block_device *dev);
 int blk_cache_lock_is_held(void);
 
+/* M107 loop devices: (re)register /dev/loop-control after a root mount. */
+void loop_register_nodes(void);
+
 #endif
