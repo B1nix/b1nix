@@ -230,6 +230,52 @@ static const struct acpi_madt *find_madt_via_xsdt(u64 xsdt_phys) {
     return (const struct acpi_madt *)0;
 }
 
+/* ── Generic table lookup ──────────────────────────────────────── */
+
+/* Root table addresses captured at acpi_init so later subsystems (M98's PCI
+ * ECAM, which needs MCFG) can find their own tables without re-scanning for the
+ * RSDP. Zero when ACPI was not found. */
+static u64 g_rsdt_phys;
+static u64 g_xsdt_phys;
+
+const struct acpi_sdt_header *acpi_find_table(const char *signature) {
+    if (!signature)
+        return (const struct acpi_sdt_header *)0;
+
+    if (g_xsdt_phys) {
+        const struct acpi_sdt_header *xsdt = map_sdt(g_xsdt_phys);
+        if (xsdt && sig_eq(xsdt->signature, "XSDT", 4)) {
+            int n = (int)((xsdt->length - sizeof(*xsdt)) / sizeof(u64));
+            const u8 *base = (const u8 *)xsdt + sizeof(*xsdt);
+            for (int i = 0; i < n; i++) {
+                u64 phys = 0;
+                for (int b = 0; b < 8; b++)
+                    phys |= ((u64)base[i * 8 + b]) << (b * 8);
+                if (phys > 0xFFFFFFFFULL)
+                    continue;
+                const struct acpi_sdt_header *t = map_sdt(phys);
+                if (t && sig_eq(t->signature, signature, 4))
+                    return t;
+            }
+        }
+    }
+
+    if (g_rsdt_phys) {
+        const struct acpi_sdt_header *rsdt = map_sdt(g_rsdt_phys);
+        if (rsdt && sig_eq(rsdt->signature, "RSDT", 4)) {
+            int n = (int)((rsdt->length - sizeof(*rsdt)) / sizeof(u32));
+            const u32 *entries = (const u32 *)((const u8 *)rsdt + sizeof(*rsdt));
+            for (int i = 0; i < n; i++) {
+                const struct acpi_sdt_header *t = map_sdt((u64)entries[i]);
+                if (t && sig_eq(t->signature, signature, 4))
+                    return t;
+            }
+        }
+    }
+
+    return (const struct acpi_sdt_header *)0;
+}
+
 /* ── Public API ────────────────────────────────────────────────── */
 
 int acpi_init(void) {
@@ -244,8 +290,11 @@ int acpi_init(void) {
     console_write("\n");
 
     const struct acpi_madt *madt = (const struct acpi_madt *)0;
+    g_rsdt_phys = rsdp->rsdt_address;
     if (rsdp->revision >= 2) {
         const struct acpi_rsdp_v2 *r2 = (const struct acpi_rsdp_v2 *)rsdp;
+        if (r2->xsdt_address && r2->xsdt_address <= 0xFFFFFFFFULL)
+            g_xsdt_phys = r2->xsdt_address;
         if (r2->xsdt_address)
             madt = find_madt_via_xsdt(r2->xsdt_address);
     }

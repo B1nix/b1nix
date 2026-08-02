@@ -1347,6 +1347,27 @@ u64 paging_user_phys(u64 pml4_phys, u64 vaddr) {
   return (pte & 0x000FFFFFFFFFF000ULL) + (vaddr & 0xFFFULL);
 }
 
+/* Raw 4 KiB leaf PTE backing `virtual_address`, or 0 when the address is not
+ * mapped by a 4 KiB leaf (unmapped, or covered by a 1 GiB / 2 MiB page). The
+ * memory-type bits (PAT/PCD/PWT) live in this entry, so M98's WC self-test
+ * reads it back rather than trusting the flags it passed to vmm_map_page. */
+u64 paging_leaf_pte(u64 virtual_address) {
+  u64 *pml4 = get_current_pml4();
+  u64 pml4e = pml4[pml4_index(virtual_address)];
+  if (!(pml4e & VMM_PRESENT))
+    return 0;
+  u64 *pdpt = table_from_entry(pml4e);
+  u64 pdpte = pdpt[pdpt_index(virtual_address)];
+  if (!(pdpte & VMM_PRESENT) || (pdpte & HUGE_PAGE_FLAG))
+    return 0;
+  u64 *pd = table_from_entry(pdpte);
+  u64 pde = pd[pd_index(virtual_address)];
+  if (!(pde & VMM_PRESENT) || (pde & HUGE_PAGE_FLAG))
+    return 0;
+  u64 *pt = table_from_entry(pde);
+  return pt[pt_index(virtual_address)];
+}
+
 void paging_dump_entries(u64 virtual_address) {
   u64 *pml4 = get_current_pml4();
   u64 pml4e = pml4[pml4_index(virtual_address)];

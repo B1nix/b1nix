@@ -1,0 +1,596 @@
+/*
+ * SPDX-License-Identifier: MIT
+ *
+ * M99 linuxkpi self-test.
+ *
+ * Every check compares the layer's behaviour against something established
+ * independently of it: pointers the test allocated itself, frames whose
+ * physical addresses came straight from the page allocator, bytes written to a
+ * file through the VFS, and data read back through a *different* mapping than
+ * the one under test. A marker is printed only after the corresponding
+ * operation ran and its result was verified.
+ */
+
+#include <b1nix/bootinfo.h>
+#include <b1nix/console.h>
+#include <b1nix/mm.h>
+#include <b1nix/posix.h>
+#include <b1nix/sched.h>
+#include <b1nix/vfs.h>
+#include <lkpi/lkpi.h>
+#include <string.h>
+
+static void lkpi_report(const char *name, int ok, u64 detail)
+{
+	console_write(ok ? "M99-SMOKE: ok " : "M99-SMOKE: FAIL ");
+	console_write(name);
+	if (!ok) {
+		console_write(" detail=");
+		console_write_dec(detail);
+	}
+	console_write("\n");
+}
+
+/* ── idr ────────────────────────────────────────────────────────── */
+
+static int idr_walk_cb(u32 id, void *ptr, void *data)
+{
+	u32 *seen = data;
+	(void)id;
+	(void)ptr;
+	(*seen)++;
+	return 0;
+}
+
+static void test_idr(void)
+{
+	struct idr idr;
+	idr_init_base(&idr, 1);
+
+	/* 64 distinct objects, each identified by its own address. */
+	static u32 objects[64];
+	int ids[64];
+	int ok = 1;
+	for (int i = 0; i < 64; i++) {
+		objects[i] = 0xAB0000u + (u32)i;
+		ids[i] = idr_alloc(&idr, &objects[i], 0, 0);
+		if (ids[i] < 0)
+			ok = 0;
+	}
+	/* Ids must be unique and start at the configured base. */
+	for (int i = 0; i < 64 && ok; i++) {
+		if (ids[i] < 1)
+			ok = 0;
+		for (int j = i + 1; j < 64; j++)
+			if (ids[i] == ids[j])
+				ok = 0;
+	}
+	/* Lookup must return the exact pointer that was stored, checked by
+	 * reading the value the test wrote into the object. */
+	for (int i = 0; i < 64 && ok; i++) {
+		u32 *p = idr_find(&idr, (u32)ids[i]);
+		if (p != &objects[i] || *p != 0xAB0000u + (u32)i)
+			ok = 0;
+	}
+	if (idr_count(&idr) != 64)
+		ok = 0;
+
+	u32 seen = 0;
+	idr_for_each(&idr, idr_walk_cb, &seen);
+	if (seen != 64)
+		ok = 0;
+
+	/* Removal returns the stored pointer and makes the id miss. */
+	void *removed = idr_remove(&idr, (u32)ids[7]);
+	if (removed != &objects[7] || idr_find(&idr, (u32)ids[7]) != 0 ||
+	    idr_count(&idr) != 63)
+		ok = 0;
+
+	/* The freed id is the one handed out next (dense reuse). */
+	int reused = idr_alloc(&idr, &objects[7], 0, 0);
+	if (reused != ids[7])
+		ok = 0;
+
+	/* Explicit placement and its conflict case. */
+	if (idr_alloc_at(&idr, &objects[0], 9999) != 0)
+		ok = 0;
+	if (idr_alloc_at(&idr, &objects[1], 9999) != -EBUSY)
+		ok = 0;
+	if (idr_find(&idr, 9999) != &objects[0])
+		ok = 0;
+
+	/* A bounded range must be honoured. */
+	int bounded = idr_alloc(&idr, &objects[2], 5000, 5001);
+	if (bounded != 5000)
+		ok = 0;
+	int full = idr_alloc(&idr, &objects[3], 5000, 5001);
+	if (full != -ENOSPC)
+		ok = 0;
+
+	idr_destroy(&idr);
+	lkpi_report("idr", ok, 0);
+}
+
+/* ── completion ─────────────────────────────────────────────────── */
+
+struct comp_test {
+	struct completion done;
+	struct completion started;
+	volatile u32 payload;
+};
+
+static struct comp_test g_comp;
+
+static void comp_thread(void *arg)
+{
+	(void)arg;
+	wait_for_completion(&g_comp.started);
+	/* Publish the payload BEFORE completing: a waiter that returns from
+	 * wait_for_completion must observe it. */
+	g_comp.payload = 0x5EED1234u;
+	complete(&g_comp.done);
+	scheduler_exit_current(0);
+}
+
+static void test_completion(void)
+{
+	int ok = 1;
+	init_completion(&g_comp.done);
+	init_completion(&g_comp.started);
+	g_comp.payload = 0;
+
+	if (completion_done(&g_comp.done))
+		ok = 0;
+	if (try_wait_for_completion(&g_comp.done))
+		ok = 0;
+
+	if (kthread_create("lkpi-comp", comp_thread, 0) < 0) {
+		lkpi_report("completion", 0, 1);
+		return;
+	}
+
+	complete(&g_comp.started);
+	u64 left = wait_for_completion_timeout(&g_comp.done, 500);
+	if (left == 0)
+		ok = 0;
+	/* The ordering guarantee is the point: the payload the other thread wrote
+	 * before complete() must be visible now. */
+	if (g_comp.payload != 0x5EED1234u)
+		ok = 0;
+	/* The completion was consumed. */
+	if (try_wait_for_completion(&g_comp.done))
+		ok = 0;
+
+	/* A timeout on a completion nobody signals must actually time out. */
+	struct completion never;
+	init_completion(&never);
+	if (wait_for_completion_timeout(&never, 2) != 0)
+		ok = 0;
+
+	/* complete_all releases repeatedly until reinit. */
+	struct completion all;
+	init_completion(&all);
+	complete_all(&all);
+	if (!try_wait_for_completion(&all) || !try_wait_for_completion(&all))
+		ok = 0;
+	reinit_completion(&all);
+	if (try_wait_for_completion(&all))
+		ok = 0;
+
+	lkpi_report("completion", ok, 0);
+}
+
+/* ── workqueue ──────────────────────────────────────────────────── */
+
+#define WQ_ITEMS 8
+struct wq_item {
+	struct work_struct work;
+	u32 index;
+};
+static struct wq_item g_wq_items[WQ_ITEMS];
+static volatile u32 g_wq_order[WQ_ITEMS];
+static volatile u32 g_wq_ran;
+static struct delayed_work g_wq_delayed;
+static volatile u32 g_wq_delayed_ran;
+static volatile u64 g_wq_delayed_tick;
+
+static void wq_handler(struct work_struct *w)
+{
+	struct wq_item *item = (struct wq_item *)w;
+	u32 slot = g_wq_ran;
+	if (slot < WQ_ITEMS)
+		g_wq_order[slot] = item->index;
+	g_wq_ran = slot + 1;
+}
+
+static void wq_delayed_handler(struct work_struct *w)
+{
+	(void)w;
+	g_wq_delayed_tick = scheduler_get_ticks();
+	g_wq_delayed_ran = 1;
+}
+
+static void test_workqueue(void)
+{
+	int ok = 1;
+	struct workqueue_struct *wq = alloc_workqueue("lkpi-test");
+	if (!wq) {
+		lkpi_report("workqueue", 0, 1);
+		return;
+	}
+
+	g_wq_ran = 0;
+	for (u32 i = 0; i < WQ_ITEMS; i++) {
+		INIT_WORK(&g_wq_items[i].work, wq_handler);
+		g_wq_items[i].index = 0xF00u + i;
+		g_wq_order[i] = 0;
+		if (!queue_work(wq, &g_wq_items[i].work))
+			ok = 0;
+	}
+	/* Re-queuing a pending item coalesces instead of duplicating. */
+	if (queue_work(wq, &g_wq_items[0].work) != 0)
+		ok = 0;
+
+	flush_workqueue(wq);
+
+	/* Exactly WQ_ITEMS handlers ran, in submission order, each exactly once. */
+	if (g_wq_ran != WQ_ITEMS)
+		ok = 0;
+	for (u32 i = 0; i < WQ_ITEMS && ok; i++) {
+		if (g_wq_order[i] != 0xF00u + i)
+			ok = 0;
+		/* Each item's own completion counter proves it ran exactly once — the
+		 * coalesced re-queue above must not have produced a second run. */
+		if (g_wq_items[i].work.seq != 1)
+			ok = 0;
+	}
+
+	lkpi_report("workqueue", ok, g_wq_ran);
+
+	/* Delayed work must not run before its deadline. */
+	int dok = 1;
+	u64 armed_at = scheduler_get_ticks();
+	INIT_DELAYED_WORK(&g_wq_delayed, wq_delayed_handler);
+	g_wq_delayed_ran = 0;
+	g_wq_delayed_tick = 0;
+	if (!queue_delayed_work(wq, &g_wq_delayed, 5))
+		dok = 0;
+	if (g_wq_delayed_ran)
+		dok = 0;
+	for (int i = 0; i < 200 && !g_wq_delayed_ran; i++)
+		scheduler_sleep_ticks(1);
+	if (!g_wq_delayed_ran)
+		dok = 0;
+	else if (g_wq_delayed_tick < armed_at + 5)
+		dok = 0; /* fired early */
+
+	/* Cancelling a still-armed item stops it from ever running. */
+	static struct delayed_work cancelled;
+	INIT_DELAYED_WORK(&cancelled, wq_delayed_handler);
+	if (!queue_delayed_work(wq, &cancelled, 1000))
+		dok = 0;
+	if (!cancel_delayed_work(&cancelled))
+		dok = 0;
+
+	lkpi_report("workqueue-delayed", dok, 0);
+	destroy_workqueue(wq);
+}
+
+/* ── scatterlist ────────────────────────────────────────────────── */
+
+static void test_scatterlist(void)
+{
+	int ok = 1;
+	const u32 npages = 8;
+	u64 frames[8];
+
+	/* Allocate page by page so the runs are whatever the frame allocator
+	 * hands back — exactly how a discontiguous GEM object is built. */
+	for (u32 i = 0; i < npages; i++) {
+		frames[i] = pmm_alloc_frame();
+		if (!frames[i])
+			ok = 0;
+	}
+	if (!ok) {
+		lkpi_report("scatterlist", 0, 1);
+		return;
+	}
+
+	struct sg_table sgt;
+	if (sg_alloc_table_from_pages(&sgt, frames, npages) < 0) {
+		for (u32 i = 0; i < npages; i++)
+			pmm_free_frame(frames[i]);
+		lkpi_report("scatterlist", 0, 2);
+		return;
+	}
+
+	if (sgt.total_bytes != (u64)npages * PAGE_SIZE)
+		ok = 0;
+	/* Coalescing invariant: the entry count must equal the number of maximal
+	 * adjacent runs among the frames, computed here independently. */
+	u32 expect_ents = 1;
+	for (u32 i = 1; i < npages; i++)
+		if (frames[i] != frames[i - 1] + PAGE_SIZE)
+			expect_ents++;
+	if (sgt.nents != expect_ents)
+		ok = 0;
+	if (sg_is_contiguous(&sgt) != (expect_ents == 1))
+		ok = 0;
+
+	/* Offset lookup must agree with the frame list for every page. */
+	for (u32 i = 0; i < npages && ok; i++)
+		if (sg_phys_at(&sgt, (u64)i * PAGE_SIZE) != frames[i])
+			ok = 0;
+	if (sg_phys_at(&sgt, sgt.total_bytes) != 0)
+		ok = 0;
+
+	/* Write a per-page pattern through the sg copy helper and read it back
+	 * through the direct map — a different path than the one that wrote it. */
+	u32 pattern[8];
+	for (u32 i = 0; i < npages; i++)
+		pattern[i] = 0x1000u + i;
+	for (u32 i = 0; i < npages; i++)
+		sg_copy_from_buffer(&sgt, (u64)i * PAGE_SIZE, &pattern[i], sizeof(u32));
+	for (u32 i = 0; i < npages && ok; i++) {
+		volatile u32 *page =
+		    (volatile u32 *)(usize)(frames[i] + vmm_direct_map_base());
+		if (page[0] != pattern[i])
+			ok = 0;
+	}
+	/* And the reverse direction, across a run boundary. */
+	u8 spill[16];
+	memset(spill, 0, sizeof(spill));
+	usize got = sg_copy_to_buffer(&sgt, PAGE_SIZE - 8, spill, sizeof(spill));
+	if (got != sizeof(spill))
+		ok = 0;
+	else if (*(u32 *)(spill + 8) != pattern[1])
+		ok = 0;
+
+	sg_free_table(&sgt);
+	for (u32 i = 0; i < npages; i++)
+		pmm_free_frame(frames[i]);
+	lkpi_report("scatterlist", ok, 0);
+}
+
+/* ── ioremap ────────────────────────────────────────────────────── */
+
+static void test_ioremap(void)
+{
+	int ok = 1;
+	u64 frame = pmm_alloc_frame();
+	if (!frame) {
+		lkpi_report("ioremap", 0, 1);
+		return;
+	}
+	volatile u32 *direct = (volatile u32 *)(usize)(frame + vmm_direct_map_base());
+	for (int i = 0; i < 8; i++)
+		direct[i] = 0xDEAD0000u + (u32)i;
+
+	volatile u32 *io = ioremap(frame, PAGE_SIZE);
+	if (!io) {
+		lkpi_report("ioremap", 0, 2);
+		return;
+	}
+	/* A genuinely new mapping, not the direct-map alias handed back. */
+	if ((usize)io == (usize)direct)
+		ok = 0;
+	/* Reads through the device mapping must see what the direct map wrote. */
+	for (int i = 0; i < 8 && ok; i++)
+		if (readl((const volatile void *)&io[i]) != 0xDEAD0000u + (u32)i)
+			ok = 0;
+	/* And writes through it must be visible on the other side. */
+	writel(0x600DBEEFu, (volatile void *)&io[3]);
+	if (direct[3] != 0x600DBEEFu)
+		ok = 0;
+
+	/* A write-combining mapping of the same frame must carry the WC page
+	 * attribute in its installed PTE, verified from the page tables. */
+	volatile u32 *wc = ioremap_wc(frame, PAGE_SIZE);
+	if (!wc) {
+		ok = 0;
+	} else {
+		u64 pte = paging_leaf_pte((u64)(usize)wc);
+		if (!(pte & VMM_PRESENT) ||
+		    (pte & (VMM_PAT | VMM_PCD | VMM_PWT)) != VMM_WC)
+			ok = 0;
+		writel(0xCAFEF00Du, (volatile void *)&wc[5]);
+		mb();
+		if (direct[5] != 0xCAFEF00Du)
+			ok = 0;
+	}
+
+	lkpi_report("ioremap", ok, 0);
+	/* The MMIO aliases are permanent, so the frame stays owned by them. */
+}
+
+/* ── dma-mapping ────────────────────────────────────────────────── */
+
+static void test_dma(void)
+{
+	int ok = 1;
+	dma_addr_t handle = 0;
+	usize size = 3 * PAGE_SIZE;
+	void *cpu = dma_alloc_coherent(size, &handle);
+	if (!cpu || !handle) {
+		lkpi_report("dma-mapping", 0, 1);
+		return;
+	}
+	/* The device address must be the physical address of the CPU pointer,
+	 * cross-checked with the VMM's own translation. */
+	if (vmm_virt_to_phys(cpu) != handle)
+		ok = 0;
+	if (handle & (PAGE_SIZE - 1))
+		ok = 0;
+	if (handle + size > dma_addressable_limit())
+		ok = 0;
+	/* dma_alloc_coherent promises zeroed memory. */
+	const u8 *bytes = cpu;
+	for (usize i = 0; i < size; i += 512)
+		if (bytes[i] != 0)
+			ok = 0;
+
+	/* Round-trip an existing kernel buffer. */
+	u32 *buf = kmalloc(256);
+	if (!buf) {
+		ok = 0;
+	} else {
+		buf[0] = 0x11223344u;
+		dma_addr_t h2 = dma_map_single(buf, 256, DMA_TO_DEVICE);
+		if (h2 != vmm_virt_to_phys(buf))
+			ok = 0;
+		/* The mapping must not have disturbed the data. */
+		if (buf[0] != 0x11223344u)
+			ok = 0;
+		dma_unmap_single(h2, 256, DMA_TO_DEVICE);
+		kfree(buf);
+	}
+
+	/* An sg table maps entry-for-entry. */
+	u64 frames[4];
+	for (int i = 0; i < 4; i++)
+		frames[i] = pmm_alloc_frame();
+	struct sg_table sgt;
+	if (sg_alloc_table_from_pages(&sgt, frames, 4) == 0) {
+		if (dma_map_sg(&sgt, DMA_BIDIRECTIONAL) != sgt.nents)
+			ok = 0;
+		dma_unmap_sg(&sgt, DMA_BIDIRECTIONAL);
+		sg_free_table(&sgt);
+	} else {
+		ok = 0;
+	}
+	for (int i = 0; i < 4; i++)
+		if (frames[i])
+			pmm_free_frame(frames[i]);
+
+	dma_free_coherent(size, cpu, handle);
+	lkpi_report("dma-mapping", ok, 0);
+}
+
+/* ── request_firmware ───────────────────────────────────────────── */
+
+static void test_firmware(void)
+{
+	int ok = 1;
+	static const char blob[] =
+	    "b1nix-lkpi-firmware-blob\x00\x01\x02\x03 trailing bytes";
+	const usize blob_len = sizeof(blob) - 1;
+
+	vfs_mkdir("/lib", 0755);
+	vfs_mkdir("/lib/firmware", 0755);
+	int fd = vfs_open_flags_mode("/lib/firmware/lkpi-test.bin",
+	                             B1NIX_O_WRONLY | B1NIX_O_CREAT | B1NIX_O_TRUNC,
+	                             0644);
+	if (fd < 0) {
+		lkpi_report("request-firmware", 0, 1);
+		return;
+	}
+	isize wrote = vfs_write(fd, blob, blob_len);
+	vfs_close(fd);
+	if (wrote != (isize)blob_len) {
+		lkpi_report("request-firmware", 0, 2);
+		return;
+	}
+
+	const struct firmware *fw = 0;
+	if (request_firmware(&fw, "lkpi-test.bin") != 0 || !fw) {
+		lkpi_report("request-firmware", 0, 3);
+		return;
+	}
+	/* Size and every byte must match what was written — including the
+	 * embedded NUL, which a string-based loader would truncate at. */
+	if (fw->size != blob_len)
+		ok = 0;
+	else if (memcmp(fw->data, blob, blob_len) != 0)
+		ok = 0;
+	release_firmware(fw);
+
+	/* A missing blob must report ENOENT rather than an empty success. */
+	const struct firmware *missing = (const struct firmware *)1;
+	if (firmware_request_nowarn(&missing, "definitely-not-here.bin") != -ENOENT ||
+	    missing != 0)
+		ok = 0;
+
+	lkpi_report("request-firmware", ok, 0);
+}
+
+/* ── locks ──────────────────────────────────────────────────────── */
+
+static struct lkpi_mutex g_mutex;
+static volatile u32 g_mutex_counter;
+static volatile int g_mutex_thread_done;
+
+static void mutex_thread(void *arg)
+{
+	(void)arg;
+	for (int i = 0; i < 200; i++) {
+		lkpi_mutex_lock(&g_mutex);
+		u32 v = g_mutex_counter;
+		scheduler_yield();
+		g_mutex_counter = v + 1;
+		lkpi_mutex_unlock(&g_mutex);
+	}
+	g_mutex_thread_done = 1;
+	scheduler_exit_current(0);
+}
+
+static void test_locks(void)
+{
+	int ok = 1;
+	struct lkpi_spinlock sl;
+	lkpi_spin_lock_init(&sl);
+	lkpi_spin_lock(&sl);
+	lkpi_spin_unlock(&sl);
+	/* Re-acquirable after release: a leaked flags word would deadlock here. */
+	lkpi_spin_lock(&sl);
+	lkpi_spin_unlock(&sl);
+
+	lkpi_mutex_init(&g_mutex);
+	if (!lkpi_mutex_trylock(&g_mutex))
+		ok = 0;
+	if (lkpi_mutex_trylock(&g_mutex))
+		ok = 0; /* already held: trylock must fail */
+	if (!lkpi_mutex_is_locked_by_current(&g_mutex))
+		ok = 0;
+	lkpi_mutex_unlock(&g_mutex);
+	if (lkpi_mutex_is_locked_by_current(&g_mutex))
+		ok = 0;
+
+	/* Mutual exclusion under a real race: two contexts each increment a
+	 * non-atomic counter 200 times with a yield inside the critical section.
+	 * Without exclusion the yield loses updates and the total is short. */
+	g_mutex_counter = 0;
+	g_mutex_thread_done = 0;
+	if (kthread_create("lkpi-mutex", mutex_thread, 0) < 0) {
+		ok = 0;
+	} else {
+		for (int i = 0; i < 200; i++) {
+			lkpi_mutex_lock(&g_mutex);
+			u32 v = g_mutex_counter;
+			scheduler_yield();
+			g_mutex_counter = v + 1;
+			lkpi_mutex_unlock(&g_mutex);
+		}
+		for (int i = 0; i < 2000 && !g_mutex_thread_done; i++)
+			scheduler_sleep_ticks(1);
+		if (!g_mutex_thread_done || g_mutex_counter != 400)
+			ok = 0;
+	}
+
+	lkpi_report("locks", ok, g_mutex_counter);
+}
+
+void lkpi_selftest(void)
+{
+	if (!bootinfo_has_flag("b1nix.test=1"))
+		return;
+
+	test_idr();
+	test_completion();
+	test_workqueue();
+	test_scatterlist();
+	test_ioremap();
+	test_dma();
+	test_firmware();
+	test_locks();
+	console_write("M99-SMOKE: done\n");
+}

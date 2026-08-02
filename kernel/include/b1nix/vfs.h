@@ -180,6 +180,13 @@ struct vfs_inode {
                       u64 *out_phys);
   int (*mmap_handle_phys_cb)(struct vfs_handle *handle, u64 offset,
                              usize length, u64 *out_phys);
+  /* M100: per-page variant. mmap_handle_phys_cb answers with a single base and
+   * sys_mmap then assumes the rest of the range is physically contiguous after
+   * it — which a scatter-gather GEM buffer object is not. A device that backs
+   * its mappings with discontiguous pages sets this instead; sys_mmap then asks
+   * for one page at a time. The two are mutually exclusive; this one wins. */
+  int (*mmap_handle_page_phys_cb)(struct vfs_handle *handle, u64 offset,
+                                  u64 *out_phys);
   /* Mapping-lifetime hooks. Called once per VMA, including fork copies and
    * VMA splits, with a matching close on munmap/exec/exit. */
   void (*mmap_open_cb)(struct vfs_node *node);

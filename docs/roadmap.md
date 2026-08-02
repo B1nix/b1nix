@@ -838,22 +838,27 @@ Status:
 
 ## M98: Driver Infrastructure (netconsole, memory typing, modern PCI)
 
-- [ ] `planned` `netconsole` — klog over UDP (`b1nix.netconsole=<ip>:<port>`); the test laptop has no serial port.
-- [ ] `planned` `IA32_PAT` + `VMM_WC` mappings; `clflush` / `wbinvd` / `mfence` primitives.
-- [ ] `planned` PCI BAR enumeration + sizing, bus-master enable, capability walk, MSI/MSI-X.
-- [ ] `planned` Intel stolen memory (DSM/GSM) from host-bridge config `0x5C`/`0x70`.
+- [x] `netconsole` (`kernel/dev/netconsole.c`) — the klog ring drained by a kthread and shipped as UDP datagrams, configured with `b1nix.netconsole=<ip>:<port>`. Draining from a thread rather than inside `console_write` is what keeps it off the console lock, which is held IRQs-off from interrupt context. Host collector: `tools/netconsole-collect.sh`.
+- [x] `IA32_PAT` programming (`kernel/arch/x86_64/memtype.c`) on the BSP and every AP, a `VMM_WC` flag threaded through `vmm_map_page`/`vmm_map_mmio`, and `clflush`/`wbinvd`/`mfence`/`sfence` primitives with a range-flush helper. Only PAT slot 5 is rewritten, so no live mapping changes meaning.
+- [x] PCI BAR enumeration and sizing (decode-disabled, register restored), bus-master and decode enables, standard capability walk, PCIe extended capabilities over ACPI-MCFG ECAM, and MSI / MSI-X programming.
+- [x] Intel stolen memory read from the **host bridge** GGC `0x50` / BDSM `0x5C` / BGSM `0x70`. Reports absence on the QEMU bridges, which is the correct answer there; the decode path is exercised for real only on Intel graphics hardware.
+- Markers: `M98-DRV-SMOKE: ok {netconsole-cmdline,netconsole-udp,pat-msr,pat-wc,clflush,bar-enum,bar-restore,cap-walk,bus-master,msi-config,msix-config,stolen}`. Details: `docs/driver-infrastructure.md`.
 
 ## M99: linuxkpi Compatibility Layer (own MIT headers)
 
-- [ ] `planned` `kernel/include/lkpi/` written from scratch — Linux `include/linux/*.h` is GPL, the drivers themselves are MIT.
-- [ ] `planned` `idr`, `completion`, workqueue over `kthread_create`, `scatterlist`, `request_firmware` over VFS.
-- [ ] `planned` `ioremap` / dma-mapping / lock wrappers over existing kernel primitives.
+- [x] `kernel/include/lkpi/` written from scratch (MIT): `types.h`, `idr.h`, `completion.h`, `workqueue.h`, `scatterlist.h`, `firmware.h`, `io.h`, `dma-mapping.h`, `lock.h`. No Linux header text is copied — those are GPL and the drivers this layer will carry are MIT.
+- [x] `idr` (flat growable table with a rotating hint), `completion` over the scheduler's two-phase wait, workqueue over `kthread_create` with FIFO ordering and delayed items, `scatterlist` with run coalescing, `request_firmware` over the VFS.
+- [x] `ioremap`/`ioremap_wc`/`ioremap_wb` over `vmm_map_mmio`, dma-mapping (coherent alloc, single/sg map, cache sync for non-snooping devices), and spinlock/sleeping-mutex wrappers that keep b1nix's "never sleep under a spinlock" rule visible in the type.
+- Markers: `M99-SMOKE: ok {idr,completion,workqueue,workqueue-delayed,scatterlist,ioremap,dma-mapping,request-firmware,locks}`. Details: `docs/driver-infrastructure.md`.
 
 ## M100: DRM Core — dma-fence, scheduler, GEM (proven on virtio-gpu)
 
-- [ ] `planned` `dma-fence` + minimal `drm_gpu_scheduler`; convert `vgpu_submit_stream` off `virtio_gpu_wait_used`.
-- [ ] `planned` GEM with sg-backed discontiguous BOs (today: contiguous `pmm_alloc_frames` only).
-- [ ] `planned` Split `drm_ioctl` (cyclomatic 56 / cognitive 161 in one switch).
+- [x] `dma-fence` (`kernel/drm/dma_fence.c`) — refcounted, one-shot, callback lists, error propagation, sleeping and timed waits.
+- [x] Minimal `drm_gpu_scheduler` (`kernel/drm/gpu_scheduler.c`) — one thread owns the ring, per-entity FIFOs, round-robin between entities, job dependencies resolved in the scheduler thread.
+- [x] `vgpu_submit_stream` converted off `virtio_gpu_wait_used`: userspace VirGL submissions now queue a scheduler job and park on its fence instead of busy-spinning on the virtqueue used index with `vgpu_udev_lock` held IRQs-off. The synchronous path remains only as a pre-scheduler fallback.
+- [x] GEM buffer objects are scatter-gather backed — pages allocated individually, described by an `sg_table`, mapped linearly into a per-object kernel window for scanout and one page at a time into userspace through the new `mmap_handle_page_phys_cb`. Handles moved onto an `idr`.
+- [x] `drm_ioctl` split into one handler per command (was cyclomatic 56 / cognitive 161 in a single switch), behaviour unchanged.
+- Markers: `M100-SMOKE: ok {fence-signal,fence-error,fence-refcount,sched-submit,sched-fairness,gem-sg,gem-create,gem-info,gem-map,gem-mmap-pages,gem-scanout,gem-destroy,gem-handle-reuse}`. Details: `docs/driver-infrastructure.md`.
 
 ## M101: Intel i915 (Gen8/Gen9.5) + Mesa iris
 

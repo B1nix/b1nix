@@ -161,6 +161,7 @@ EMBEDDED_USER_PROGRAMS := \
 	m49_libwayland_server \
 	m_posixmm_smoke \
 	m50_smoke \
+	m100_smoke \
 	m51_smoke \
 	m51_pixman_smoke \
 	m51_freetype_smoke \
@@ -391,7 +392,7 @@ ARCH_CFLAGS := --target=$(TARGET) -mcmodel=kernel -mno-sse -mno-mmx -mno-sse2 -m
 ARCH_LDFLAGS := -m elf_x86_64 -z max-page-size=0x1000
 LINKER_SCRIPT := kernel/arch/x86_64/linker.ld
 ASM_SOURCES := kernel/arch/x86_64/boot.S kernel/arch/x86_64/context_switch.S kernel/arch/x86_64/isr.S kernel/arch/x86_64/user_jump.S kernel/arch/x86_64/syscall_entry.S kernel/arch/x86_64/fpu.S
-ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c
+ARCH_SOURCES := kernel/arch/x86_64/arch.c kernel/arch/x86_64/console.c kernel/arch/x86_64/fb_console.c kernel/arch/x86_64/interrupts.c kernel/arch/x86_64/io.c kernel/arch/x86_64/paging.c kernel/arch/x86_64/serial.c kernel/arch/x86_64/rtc.c kernel/arch/x86_64/signal.c kernel/arch/x86_64/lapic.c kernel/arch/x86_64/tlb.c kernel/arch/x86_64/coredump.c kernel/arch/x86_64/gdbstub.c kernel/arch/x86_64/memtype.c
 else
 $(error Unsupported ARCH=$(ARCH). Active builds support ARCH=x86_64 only; i686 and AArch64 are archived)
 endif
@@ -482,6 +483,17 @@ KERNEL_SOURCES += \
  	kernel/dev/virtio_gpu.c \
  	kernel/dev/virtio_input.c \
 	kernel/dev/drm.c \
+	kernel/dev/netconsole.c \
+	kernel/lkpi/lkpi_core.c \
+	kernel/lkpi/idr.c \
+	kernel/lkpi/completion.c \
+	kernel/lkpi/workqueue.c \
+	kernel/lkpi/scatterlist.c \
+	kernel/lkpi/firmware.c \
+	kernel/lkpi/lkpi_test.c \
+	kernel/drm/dma_fence.c \
+	kernel/drm/gpu_scheduler.c \
+	kernel/drm/drm_selftest.c \
 	kernel/dev/fb.c \
 	kernel/dev/input.c \
 	kernel/net/net.c \

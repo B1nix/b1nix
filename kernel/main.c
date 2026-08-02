@@ -64,6 +64,12 @@ extern void input_gfxtest_start(void);
 extern void input_m47_inject_start(void);
 extern void fb_dev_init(void);
 extern void drm_dev_init(void);
+#include <b1nix/dma_fence.h>
+#include <b1nix/gpu_scheduler.h>
+#include <b1nix/memtype.h>
+#include <b1nix/netconsole.h>
+#include <b1nix/pci.h>
+#include <lkpi/lkpi.h>
 
 extern void bootinfo_init_from_fdt(u64 dtb_address);
 
@@ -303,6 +309,7 @@ void kernel_main(usize arg0, usize arg1)
 	sysv_ipc_init(); /* SysV semaphores + message queues */
 	swap_init();
 	net_init();
+	netconsole_init(); /* M98: klog over UDP, b1nix.netconsole=<ip>:<port> */
 	ps2_kbd_init();
 	ps2_mouse_init();
 	input_init(); /* M47: /dev/input/event* (PS/2 kbd + mouse event streams) */
@@ -677,6 +684,12 @@ void kernel_main(usize arg0, usize arg1)
 		}
 		m36_gdb_selftest();
 		m36_ftrace_selftest();
+		/* M98 driver infrastructure: PAT/write-combining, modern PCI
+		 * (BAR sizing, capability walk, bus master, MSI/MSI-X, Intel
+		 * stolen memory) and the netconsole UDP log path. */
+		memtype_selftest();
+		pci_selftest();
+		netconsole_selftest();
 		/* M32 IPv6 self-tests: loopback (::1) ICMPv6 + MLD, and real-link
 		 * SLAAC + ping over QEMU usernet.  Both were in kernel/user/
 		 * programs.c before the ring-3 migration; with that file gone
@@ -726,6 +739,16 @@ void kernel_main(usize arg0, usize arg1)
 	 * filesystems are up — kswapd keeps a free-frame headroom so userspace
 	 * allocations rarely stall in synchronous reclaim. */
 	kswapd_init();
+
+	/* M99/M100 self-tests run here rather than in the block above: they create
+	 * kernel threads and park on wait channels, which needs the full
+	 * cooperative scheduler (the earlier block runs while the APs are still
+	 * confined to the work-stealing-only loop). */
+	if (bootinfo_has_flag("b1nix.test=1")) {
+		lkpi_selftest();      /* M99: idr, completion, workqueue, sg, dma, fw */
+		dma_fence_selftest(); /* M100: dma-fence */
+		drm_sched_selftest(); /* M100: GPU scheduler + scatter-gather BOs */
+	}
 
 	userspace_init();
 

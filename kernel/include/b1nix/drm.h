@@ -93,6 +93,19 @@ struct drm_event_vblank {
 #define DRM_IOCTL_MODE_DESTROY_DUMB                                            \
   DRM_IOWR(0xB4, struct drm_mode_destroy_dumb)
 
+/* M100: report how a GEM object is physically backed. b1nix-specific (there is
+ * no Linux ioctl for this) and read-only, so it cannot change driver state; its
+ * purpose is to let a test assert that a buffer really is scatter-gather backed
+ * rather than one contiguous allocation that happens to work. */
+struct drm_b1nix_gem_info {
+  u32 handle;
+  u32 nents;      /* scatter-gather entries describing the object */
+  u32 npages;     /* pages the object occupies */
+  u32 contiguous; /* 1 when those pages form a single physical run */
+  u64 size;
+};
+#define DRM_IOCTL_B1NIX_GEM_INFO DRM_IOWR(0xC0, struct drm_b1nix_gem_info)
+
 void drm_dev_init(void);
 int drm_dev_open(int flags);
 

@@ -1,6 +1,7 @@
 #include <b1nix/arch.h>
 #include <b1nix/console.h>
 #include <b1nix/lapic.h>
+#include <b1nix/memtype.h>
 #include <b1nix/mm.h>
 #include <b1nix/types.h>
 
@@ -265,6 +266,8 @@ void arch_init(void) {
   x86_syscall_init();
   x86_enable_write_protect();
   x86_enable_sse();
+  /* M98: program this CPU's IA32_PAT so VMM_WC means write-combining. */
+  pat_init_cpu();
   __asm__ volatile("sti");
   console_write("arch: x86_64 initialized (syscalls enabled)\n");
 }
@@ -298,6 +301,7 @@ void x86_ap_arch_init(int cpu) {
   x86_tss_init_cpu(cpu);  /* this CPU's TSS + ltr (ring-3 interrupts need rsp0) */
   x86_syscall_init();     /* per-CPU SYSCALL MSRs: EFER.SCE, STAR, LSTAR, FMASK */
   x86_enable_sse();       /* per-CPU CR0/CR4 for fxsave/fxrstor in ctx switch */
+  pat_init_cpu();         /* per-CPU IA32_PAT: WC PTEs mean WC on this core too */
   x86_enable_write_protect();
   /* Software-enable this AP's LAPIC + TPR/LVT setup. Without this the AP's
    * LAPIC stays in its reset (software-disabled) state and every locally-
