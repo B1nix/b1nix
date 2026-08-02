@@ -45,6 +45,21 @@ struct sound_device {
 /* Register a sound device */
 void sound_register(struct sound_device *dev);
 
+/* Withdraw a sound device (a driver module being unloaded). */
+void sound_unregister(struct sound_device *dev);
+
+/* Hooks a loadable sound driver publishes so the core can re-create its device
+ * nodes after the real root is mounted and run its self-test in test mode,
+ * without naming the driver. */
+struct sound_driver_hooks {
+	void (*dev_init)(void);
+	void (*selftest)(void);
+};
+void sound_register_hooks(const struct sound_driver_hooks *hooks);
+void sound_unregister_hooks(const struct sound_driver_hooks *hooks);
+void sound_module_dev_init(void);
+void sound_module_selftest(void);
+
 /* Find the first registered sound device (or NULL) */
 struct sound_device *sound_get_default(void);
 
@@ -53,13 +68,10 @@ struct sound_device *sound_get_default(void);
  * the `arg` of the ioctl syscall. Returns 0 or a negative errno. */
 int sound_mixer_ioctl(struct sound_device *dev, u64 request, void *arg);
 
-/* Initialize HDA driver — called from main.c */
+/* Intel HDA lives in hda.ko (M95); these are its module-internal entry
+ * points, published to the core through struct sound_driver_hooks. */
 void hda_init(void);
-
-/* Re-register /dev/dsp after the real root is mounted (see vfs.c) */
 void hda_dev_init(void);
-
-/* Self-test — called from main.c in test mode */
 void hda_selftest(void);
 
 /* Initialize AC'97 driver — called from main.c */

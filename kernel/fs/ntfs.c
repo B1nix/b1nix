@@ -553,3 +553,23 @@ static struct vfs_fs ntfs_vfs = {
 };
 
 void ntfs_init(void) { vfs_register_fs(&ntfs_vfs); }
+
+/* ── M95: ntfs is a loadable module ──────────────────────────────────────── */
+#include <b1nix/module.h>
+
+MODULE_NAME("ntfs");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("NTFS read-only filesystem");
+MODULE_ALIAS("fs-ntfs");
+MODULE_ALIAS("fs-ntfs3");
+
+static int ntfs_module_init(void) {
+	ntfs_init();
+	return 0;
+}
+
+static void ntfs_module_exit(void) { vfs_unregister_fs(&ntfs_vfs); }
+
+module_init(ntfs_module_init);
+module_exit(ntfs_module_exit);

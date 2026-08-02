@@ -136,10 +136,33 @@ enable_long_mode:
 	orl $(1 << 5), %eax        /* PAE */
 	movl %eax, %cr4
 
+	/* M95: probe NX support (CPUID.80000001H:EDX[20]) so EFER.NXE can be set
+	 * alongside LME. The module loader maps module data pages with PTE bit 63
+	 * set; with NXE clear that bit is reserved and any access to such a page
+	 * faults. %ebx still holds the Multiboot2 info pointer here, so save it
+	 * across cpuid. */
+	pushl %ebx
+	pushl %esi
+	movl $0x80000000, %eax
+	cpuid
+	xorl %esi, %esi
+	cmpl $0x80000001, %eax
+	jb 1f
+	movl $0x80000001, %eax
+	cpuid
+	andl $(1 << 20), %edx
+	movl %edx, %esi
+1:
 	movl $0xc0000080, %ecx
 	rdmsr
 	orl $(1 << 8) | 1, %eax    /* LME (bit 8) + SCE (bit 0) */
+	testl %esi, %esi
+	jz 2f
+	orl $(1 << 11), %eax       /* NXE */
+2:
 	wrmsr
+	popl %esi
+	popl %ebx
 
 	movl %cr0, %eax
 	orl $0x80000001, %eax      /* PG + PE */

@@ -139,6 +139,8 @@ run_test /bin/m29_smoke posix
 run_test /bin/m31_smoke posix
 run_test /bin/m73_smoke posix
 run_test /bin/m80_smoke posix
+run_test /bin/m95_smoke posix
+run_test /bin/m96_smoke posix
 run_test /bin/crashpad_smoke posix
 run_test /bin/m63_smoke posix
 run_test /bin/m71_aslr posix

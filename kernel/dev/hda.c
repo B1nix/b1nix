@@ -148,6 +148,10 @@ static u64 hda_bdl_phys;
 static u8  *hda_dam_buf;             /* Audio data ring buffer */
 static u64 hda_dam_buf_phys;
 static u32 hda_dam_buf_sz;           /* size in bytes */
+/* M95 module parameter (writable): how long hda_selftest lets its test tone
+ * run before it checks the stream. Declared here so the self-test can read it;
+ * exported to /sys/module/hda/parameters at the bottom of this file. */
+static int hda_tone_ms = 10;
 
 /* CORB / RIRB */
 static u32 *hda_corb;
@@ -872,7 +876,7 @@ void hda_selftest(void) {
 
 		u32 ctl0 = hda_r32(sdo_off + HDA_SDO_CTL0);
 		hda_w32(sdo_off + HDA_SDO_CTL0, ctl0 | HDA_SDO_CTL0_RUN);
-		hda_delay_ms(10);
+		hda_delay_ms(hda_tone_ms);
 		console_write("M38-SOUND: ok play-sine\n");
 	} else {
 		console_write("M38-SOUND: ok play-sine (no-codec)\n");
@@ -880,3 +884,48 @@ void hda_selftest(void) {
 
 	console_write("M38-SOUND: ok done\n");
 }
+
+/* ── M95: the Intel HDA controller driver is a loadable module ───────────── */
+#include <b1nix/module.h>
+
+MODULE_NAME("hda");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("Intel High Definition Audio controller (/dev/dsp)");
+MODULE_ALIAS("sound-hda");
+MODULE_ALIAS("snd-hda-intel");
+
+/* Sample rate the output stream is programmed for, and the DMA ring size.
+ * Both are read-only knobs: the stream descriptor is configured from them
+ * once during init, so they report what the hardware actually runs at. */
+module_param_desc(hda_sample_rate, MODULE_PARAM_UINT, 0444,
+                  "PCM sample rate in Hz");
+module_param_desc(hda_dam_buf_sz, MODULE_PARAM_UINT, 0444,
+                  "DMA ring buffer size in bytes");
+
+/* Writable knob: milliseconds hda_selftest lets the test tone play. */
+module_param_desc(hda_tone_ms, MODULE_PARAM_INT, 0644,
+                  "self-test tone duration in milliseconds");
+
+static const struct sound_driver_hooks hda_hooks = {
+	.dev_init = hda_dev_init,
+	.selftest = hda_selftest,
+};
+
+static int hda_module_init(void) {
+	hda_init();
+	sound_register_hooks(&hda_hooks);
+	/* An absent controller is not a load failure: the module stays resident
+	 * with hda_inited == 0 and every entry point reports "no device". */
+	return 0;
+}
+
+static void hda_module_exit(void) {
+	sound_unregister_hooks(&hda_hooks);
+	if (hda_inited)
+		sound_unregister(&hda_sound_dev);
+	hda_inited = 0;
+}
+
+module_init(hda_module_init);
+module_exit(hda_module_exit);

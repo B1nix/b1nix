@@ -26,6 +26,58 @@ void sound_register(struct sound_device *dev) {
 		sound_devices[sound_device_count++] = dev;
 }
 
+void sound_unregister(struct sound_device *dev) {
+	for (int i = 0; i < sound_device_count; i++) {
+		if (sound_devices[i] != dev)
+			continue;
+		for (int j = i; j + 1 < sound_device_count; j++)
+			sound_devices[j] = sound_devices[j + 1];
+		sound_devices[--sound_device_count] = 0;
+		return;
+	}
+}
+
+/* ── Loadable sound-driver hooks (M95) ──────────────────────────────────
+ * The HDA controller driver is a module (hda.ko). The two call sites that
+ * used to name it directly — vfs_repopulate_after_root_mount(), which has to
+ * re-create /dev/dsp on the real root, and the test-mode self-test driver in
+ * kernel_main() — now go through this registry, so a kernel booted without
+ * hda.ko simply does neither. */
+static const struct sound_driver_hooks *sound_hooks[SOUND_MAX_DEVICES];
+static int sound_hook_count;
+
+void sound_register_hooks(const struct sound_driver_hooks *hooks) {
+	if (!hooks || sound_hook_count >= SOUND_MAX_DEVICES)
+		return;
+	for (int i = 0; i < sound_hook_count; i++)
+		if (sound_hooks[i] == hooks)
+			return;
+	sound_hooks[sound_hook_count++] = hooks;
+}
+
+void sound_unregister_hooks(const struct sound_driver_hooks *hooks) {
+	for (int i = 0; i < sound_hook_count; i++) {
+		if (sound_hooks[i] != hooks)
+			continue;
+		for (int j = i; j + 1 < sound_hook_count; j++)
+			sound_hooks[j] = sound_hooks[j + 1];
+		sound_hooks[--sound_hook_count] = 0;
+		return;
+	}
+}
+
+void sound_module_dev_init(void) {
+	for (int i = 0; i < sound_hook_count; i++)
+		if (sound_hooks[i]->dev_init)
+			sound_hooks[i]->dev_init();
+}
+
+void sound_module_selftest(void) {
+	for (int i = 0; i < sound_hook_count; i++)
+		if (sound_hooks[i]->selftest)
+			sound_hooks[i]->selftest();
+}
+
 struct sound_device *sound_get_default(void) {
 	if (sound_device_count > 0)
 		return sound_devices[0];

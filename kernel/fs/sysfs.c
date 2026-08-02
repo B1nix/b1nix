@@ -10,6 +10,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/lapic.h>
 #include <b1nix/mm.h>
+#include <b1nix/module.h>
 #include <b1nix/page_cache.h>
 #include <b1nix/netdev.h>
 #include <b1nix/posix.h>
@@ -419,11 +420,16 @@ static struct vfs_node *sysfs_mount_cb(const char *source, u64 flags,
 
   sysfs_build_block(root);
   sysfs_build_net(root);
+  /* M96: /sys/module/<name>/ — refcnt, initstate and a parameters directory —
+   * for whatever is loaded now; later loads and unloads maintain the tree
+   * themselves. */
+  module_sysfs_attach_root(root);
   return root;
 }
 
 void sysfs_init(void) {
   sysfs_fs.name = "sysfs";
   sysfs_fs.mount = sysfs_mount_cb;
+  sysfs_fs.flags = VFS_FS_NODEV;
   vfs_register_fs(&sysfs_fs);
 }

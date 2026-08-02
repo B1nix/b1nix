@@ -23,6 +23,7 @@
 #include <b1nix/syscall.h>
 #include <b1nix/uidgid.h>
 #include <b1nix/user.h>
+#include <b1nix/module.h>
 #include <b1nix/vfs.h>
 #include <b1nix/filelock.h>
 #include <b1nix/aio.h>
@@ -1538,6 +1539,101 @@ static isize sys_sigtimedwait(const u64 *user_set,
   if (syscall_copyin(&set, user_set, sizeof(u64)) < 0)
     return -EFAULT;
   return sys_sigtimedwait_kernel(set, user_ts);
+}
+
+
+/* ── M95: init_module(2) / finit_module(2) / delete_module(2) ────────────────
+ * Loading code into ring 0 is the most privileged operation there is, so all
+ * three require CAP_SYS_MODULE (root has it through the full capability set).
+ * A .ko is a few tens of KiB; the ceiling keeps a bogus length from asking the
+ * heap for gigabytes (kmalloc panics on OOM in this kernel). */
+#define MODULE_IMAGE_MAX (16ULL * 1024ULL * 1024ULL)
+#define MODULE_PARAMS_MAX 256
+
+static int module_caller_privileged(void) {
+  struct cred *c = scheduler_get_current_cred();
+  return c && (c->euid == ROOT_UID || cred_has_cap(c, CAP_SYS_MODULE));
+}
+
+/* Copy the (optional) NUL-terminated parameter string in from userspace. */
+static int module_copy_params(const char *user_params, char *out, usize cap) {
+  out[0] = '\0';
+  if (!user_params)
+    return 0;
+  if (syscall_copyinstr(out, cap, user_params) < 0)
+    return -EFAULT;
+  return 0;
+}
+
+static isize sys_init_module(const void *user_image, u64 len,
+                             const char *user_params) {
+  if (!module_caller_privileged())
+    return -EPERM;
+  if (!user_image || len == 0 || len > MODULE_IMAGE_MAX)
+    return -EINVAL;
+  char params[MODULE_PARAMS_MAX];
+  int rc = module_copy_params(user_params, params, sizeof(params));
+  if (rc != 0)
+    return rc;
+  char *image = kmalloc((usize)len);
+  if (!image)
+    return -ENOMEM;
+  if (syscall_copyin(image, user_image, (usize)len) < 0) {
+    kfree(image);
+    return -EFAULT;
+  }
+  rc = module_load_image(image, (usize)len, params);
+  kfree(image);
+  return rc;
+}
+
+static isize sys_finit_module(int fd, const char *user_params, u32 flags) {
+  (void)flags;
+  if (!module_caller_privileged())
+    return -EPERM;
+  char params[MODULE_PARAMS_MAX];
+  int rc = module_copy_params(user_params, params, sizeof(params));
+  if (rc != 0)
+    return rc;
+
+  struct b1nix_stat st;
+  if (vfs_fstat(fd, &st) != 0)
+    return -EBADF;
+  if (st.st_size == 0 || (u64)st.st_size > MODULE_IMAGE_MAX)
+    return -EINVAL;
+  usize size = (usize)st.st_size;
+  char *image = kmalloc(size);
+  if (!image)
+    return -ENOMEM;
+  usize got = 0;
+  while (got < size) {
+    isize n = vfs_pread(fd, image + got, size - got, (u64)got);
+    if (n < 0) {
+      kfree(image);
+      return -EIO;
+    }
+    if (n == 0)
+      break;
+    got += (usize)n;
+  }
+  if (got != size) {
+    kfree(image);
+    return -EIO;
+  }
+  rc = module_load_image(image, size, params);
+  kfree(image);
+  return rc;
+}
+
+static isize sys_delete_module(const char *user_name, u32 flags) {
+  if (!module_caller_privileged())
+    return -EPERM;
+  char name[MODULE_NAME_MAX];
+  if (!user_name)
+    return -EFAULT;
+  if (syscall_copyinstr(name, sizeof(name), user_name) < 0)
+    return -EFAULT;
+  return module_unload(name, flags);
 }
 
 /* Suspend until a deliverable signal arrives, running with `mask` blocked.
@@ -5947,6 +6043,15 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
   case SYS_SIGTIMEDWAIT:
     return (u64)sys_sigtimedwait((const u64 *)(usize)arg0,
                                  (const struct timespec *)(usize)arg2);
+  /* M95: loadable kernel modules. */
+  case SYS_INIT_MODULE:
+    return (u64)sys_init_module((const void *)(usize)arg0, arg1,
+                                (const char *)(usize)arg2);
+  case SYS_DELETE_MODULE:
+    return (u64)sys_delete_module((const char *)(usize)arg0, (u32)arg1);
+  case SYS_FINIT_MODULE:
+    return (u64)sys_finit_module((int)arg0, (const char *)(usize)arg1,
+                                 (u32)arg2);
   case SYS_FLOCK:
     /* Whole-file advisory lock. OpenRC's openrc-run takes one per service
      * before it runs any of its actions, so without this no service starts. */

@@ -209,12 +209,27 @@ struct vfs_node {
   struct vfs_node *next_sibling;
 };
 
+/* A filesystem that needs no block device (procfs, sysfs, tmpfs, ...). Only
+ * affects how /proc/filesystems labels the entry, exactly as Linux does. */
+#define VFS_FS_NODEV 0x1
+
 struct vfs_fs {
   const char *name;
   struct vfs_node *(*mount)(const char *source, u64 flags, void *data);
   int (*umount)(struct vfs_node *root_node);
+  u32 flags;
   struct vfs_fs *next;
 };
+
+/* Snapshot of the registered filesystem types, in registration order (newest
+ * first, the order find_fs searches). Fills up to `max` entries and returns the
+ * number written. Backs /proc/filesystems, which used to be a hardcoded list
+ * and therefore could not show a filesystem that arrived with a module. */
+struct vfs_fs_info {
+  const char *name;
+  u32 flags;
+};
+usize vfs_list_filesystems(struct vfs_fs_info *out, usize max);
 
 u64 vfs_get_unix_time(void);
 void vfs_init(void);
@@ -236,6 +251,10 @@ struct vfs_node *vfs_node_get(struct vfs_node *node);
 void vfs_node_put(struct vfs_node *node);
 struct vfs_node *vfs_create_node(enum vfs_node_type type);
 void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child);
+/* Unlink `child` from `parent`'s sibling list. Used by synthetic filesystems
+ * whose tree changes at runtime (a module removing its /sys/module entry).
+ * The caller still owns its reference on the child. */
+void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child);
 /* Device number of the filesystem a node belongs to, resolved through its
  * ancestors when the node itself predates the mount stamp. */
 u32 vfs_node_dev(struct vfs_node *node);
@@ -279,6 +298,9 @@ int vfs_mount(const char *source, const char *target, const char *fstype,
               u64 flags);
 int vfs_umount(const char *target);
 void vfs_register_fs(struct vfs_fs *fs);
+/* Withdraw a filesystem type. A module that registered a filesystem must call
+ * this from its exit path, or the VFS keeps a pointer into freed module text. */
+void vfs_unregister_fs(struct vfs_fs *fs);
 void vfs_set_currently_mounting_root(struct vfs_node *root);
 isize vfs_mounts(struct b1nix_mount_entry *out, usize max_entries);
 int vfs_sync(void);

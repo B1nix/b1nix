@@ -99,6 +99,9 @@ void udp_receive(struct ipv4_addr src, const void *data, usize size);
 void udp_send_net(struct ipv4_addr dst, u16 src_port_net, u16 dst_port_net, const void *payload, usize size);
 void udp_send(struct ipv4_addr dst, u16 src_port, u16 dst_port, const void *payload, usize size);
 int udp_register_handler(u16 port, udp_port_handler_t handler);
+/* Drop a port handler. A protocol module that registered one must call this
+ * from its exit path, or a later datagram jumps into freed module text. */
+void udp_unregister_handler(u16 port);
 
 // DHCP
 void dhcp_init(void);

@@ -224,6 +224,10 @@ enum {
   SYS_FLOCK             = 240, /* flock(fd, operation) */
   SYS_CLOCK_GETRES      = 241, /* clock_getres(clk_id, res) */
   SYS_SIGTIMEDWAIT      = 242, /* sigtimedwait(set, info, timeout) */
+  /* --- M95: loadable kernel modules --- */
+  SYS_INIT_MODULE       = 243, /* init_module(image, len, params) */
+  SYS_DELETE_MODULE     = 244, /* delete_module(name, flags) */
+  SYS_FINIT_MODULE      = 245, /* finit_module(fd, params, flags) */
 };
 
 /* PT_TLS template for the running image, returned by SYS_GET_TLS_INFO so the

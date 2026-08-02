@@ -6,6 +6,8 @@
 #include <b1nix/initramfs.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
+#include <b1nix/module.h>
 #include <b1nix/netdev.h>
 #include <b1nix/panic.h>
 #include <b1nix/sched.h>
@@ -55,7 +57,6 @@ extern void virtio_gpu_init(void);
 extern void virtio_gpu_dev_init(void);
 extern void virtio_input_init(void);
 extern void fb_console_init(void);
-extern void hda_init(void);
 extern void ac97_init(void);
 extern void ac97_selftest(void);
 extern void input_init(void);
@@ -288,13 +289,14 @@ void kernel_main(usize arg0, usize arg1)
 	ext4_init();
 	ahci_init();
 	nvme_init();
-	btrfs_init();
-	isofs_init();
 	exfat_init();
-	ntfs_init();
 	tmpfs_init();
 	procfs_init();
 	sysfs_init();
+	/* M95: load the optional filesystems, the HDA sound driver and the IPv6
+	 * protocol modules from /lib/modules in the initramfs. Each is optional —
+	 * the kernel boots and passes its tests with any of them absent. */
+	module_init_builtin_deps();
 	filelock_init();
 	mqueue_init();
 	shm_init();
@@ -309,7 +311,6 @@ void kernel_main(usize arg0, usize arg1)
 	if (bootinfo_has_flag("b1nix.test=1"))
 		input_m47_inject_start(); /* M47 smoke: mouse event burst for readers */
 	xhci_probe(); /* M37: USB xHCI controller + HID boot keyboard (real-HW input) */
-	hda_init();   /* M38: Intel HDA sound controller (/dev/dsp) */
 	ac97_init();  /* M79: Intel 82801AA AC'97 controller (/dev/dsp1) */
 	video_init();
 	virtio_gpu_init();
@@ -656,9 +657,9 @@ void kernel_main(usize arg0, usize arg1)
 		 * on the initramfs root which becomes unreachable after the ext4
 		 * root is mounted, so a second vfs_add_node here (on the live
 		 * root) is what makes /dev/dsp /dev/dsp1 visible to userspace. */
-		hda_dev_init();
+		sound_module_dev_init();
 		ac97_dev_init();
-		hda_selftest();
+		sound_module_selftest();
 		ac97_selftest();
 		/* ioprio(2): the block layer's admission policy — better priority
 		 * first, and a starving idle-class request ages past a stream of
@@ -680,8 +681,9 @@ void kernel_main(usize arg0, usize arg1)
 		 * SLAAC + ping over QEMU usernet.  Both were in kernel/user/
 		 * programs.c before the ring-3 migration; with that file gone
 		 * they run here alongside the other hardware self-tests. */
-		ipv6_loopback_smoke();
-		ipv6_realink_smoke();
+		/* M96: run through the protocol registry — the IPv6 self-tests
+		 * live in ipv6.ko and are absent when it is not loaded. */
+		net_proto_selftest();
 
 		/* M94: init-path parsing self-test. Verify bootinfo_get_kv
 		 * correctly extracts the `init=` parameter (or falls back to

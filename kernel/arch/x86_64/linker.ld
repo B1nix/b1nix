@@ -43,6 +43,19 @@ SECTIONS
 	}
 	. = ALIGN(512K);  /* Pad .data to 512K boundary — stabilises layout */
 
+	/* M95: EXPORT_SYMBOL table — one { u64 value; const char *name; } record
+	 * per exported kernel symbol, plus the name strings. The module loader
+	 * walks __ksymtab_start..__ksymtab_end to resolve a .ko's undefined
+	 * symbols. Placed after the 512K-padded .text/.rodata/.data so growing it
+	 * never shifts a function address. */
+	.ksymtab ALIGN(8) : AT(ADDR(.ksymtab) - KERNEL_VMA) {
+		__ksymtab_start = .;
+		KEEP(*(.ksymtab))
+		__ksymtab_end = .;
+		KEEP(*(.ksymtab_strings))
+	}
+	. = ALIGN(4K);
+
 	/* M35: kallsyms symbol blob, generated post-link and appended on a second
 	 * link pass. Placed AFTER .text/.rodata/.data (whose addresses are frozen
 	 * by the 512K padding above) so adding it never shifts a function address. */

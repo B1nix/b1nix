@@ -7,10 +7,16 @@
  */
 
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/mm.h>
 #include <b1nix/console.h>
 #include <b1nix/sched.h>
 #include <string.h>
+
+/* M96 module parameter: hop limit for non-ND traffic (ND is fixed at 255 by
+ * RFC 4861). Declared here so ipv6_send can read it; published to
+ * /sys/module/ipv6/parameters at the bottom of this file. */
+int ipv6_hop_limit = 64;
 
 #define IP6_NH_TCP    6
 #define IP6_NH_UDP    17
@@ -161,11 +167,13 @@ void ipv6_receive(const void *data, usize size)
 		                    payload_len) != 0)
 			return;
 		u8 type = ((const u8 *)payload)[0];
-		if (type >= 133 && type <= 136) {
-			ndp_receive(hdr->src, hdr->dst, type, payload, payload_len);
-		} else if (type == ICMP6_MLD_QUERY || type == ICMP6_MLD_REPORT ||
-		           type == ICMP6_MLD_DONE || type == ICMP6_MLDV2_REPORT) {
-			mld_receive(hdr->src, hdr->dst, type, payload, payload_len);
+		if ((type >= 133 && type <= 136) || type == ICMP6_MLD_QUERY ||
+		    type == ICMP6_MLD_REPORT || type == ICMP6_MLD_DONE ||
+		    type == ICMP6_MLDV2_REPORT) {
+			/* M96: Neighbour Discovery and MLD both live in ndp.ko,
+			 * which sorts the message out by type. */
+			ndp_dispatch_receive(hdr->src, hdr->dst, type, payload,
+			                     payload_len);
 		} else {
 			icmpv6_receive(&hdr->src, &hdr->dst, payload, payload_len);
 		}
@@ -275,7 +283,7 @@ static void ipv6_link_output(struct in6_addr_k dst, const u8 *frame,
 	}
 
 	for (int tries = 0; tries < 25; tries++) {
-		if (ndp_resolve(next_hop, &mac)) {
+		if (ndp_dispatch_resolve(next_hop, &mac)) {
 			net_send_ethernet(mac, 0x86DD, frame, total);
 			return;
 		}
@@ -298,7 +306,8 @@ void ipv6_send(struct in6_addr_k dst, u8 next_header, const void *payload,
 	hdr->next_header = next_header;
 	/* Neighbor Discovery requires hop limit 255; harmless for other traffic on
 	 * a directly-attached link. */
-	hdr->hop_limit = (next_header == IP6_NH_ICMPV6) ? 255 : 64;
+	hdr->hop_limit = (next_header == IP6_NH_ICMPV6) ? 255
+	                                                : (u8)ipv6_hop_limit;
 	struct in6_addr_k src = ipv6_select_source(&dst);
 	hdr->src = src;
 	hdr->dst = dst;
@@ -374,7 +383,6 @@ void ipv6_loopback_smoke(void)
 	else
 		console_write("M32-IP6: fail icmpv6-errors\n");
 
-	mld_smoke();
 }
 
 /* Real-link IPv6 over QEMU usernet: wait for SLAAC (RS->RA gives a prefix and
@@ -427,3 +435,44 @@ void ipv6_realink_smoke(void)
 	else
 		console_write("M32-IP6: unsupported real-link-ping\n");
 }
+
+/* ── M96: the IPv6 datapath is a loadable module ─────────────────────────── */
+#include <b1nix/module.h>
+
+MODULE_NAME("ipv6");
+MODULE_LICENSE("MIT");
+MODULE_AUTHOR("b1nix");
+MODULE_DESCRIPTION("IPv6 datapath: loopback, ICMPv6 echo, real-link send");
+MODULE_ALIAS("net-pf-10");
+MODULE_ALIAS("ethertype-0x86dd");
+
+/* Hop limit written into every outgoing IPv6 header (see ipv6_send). Writable
+ * at runtime so a link with an unusual topology can be probed without a
+ * rebuild. */
+module_param_desc(ipv6_hop_limit, MODULE_PARAM_INT, 0644,
+                  "hop limit for outgoing IPv6 datagrams");
+
+static void ipv6_module_selftest(void) {
+	ipv6_loopback_smoke();
+	ipv6_realink_smoke();
+}
+
+static struct net_proto ipv6_proto = {
+	.name = "ipv6",
+	.ether_type = 0x86DD,
+	.receive = ipv6_receive,
+	.send6 = ipv6_send,
+	.icmp6_unreach = icmpv6_send_dest_unreachable,
+	.selftest = ipv6_module_selftest,
+};
+
+static int ipv6_module_init(void) { return proto_register(&ipv6_proto); }
+static void ipv6_module_exit(void) { proto_unregister(&ipv6_proto); }
+
+module_init(ipv6_module_init);
+module_exit(ipv6_module_exit);
+
+/* Consumed by ndp.ko, which builds its solicitations on top of this datapath —
+ * that reference is what makes modules.dep record "ndp: ipv6". */
+EXPORT_SYMBOL(ipv6_send);
+EXPORT_SYMBOL(ipv6_receive);

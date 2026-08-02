@@ -13,6 +13,16 @@
 #include <b1nix/vfs.h>
 #include <string.h>
 #include "initramfs_native_smoke.inc"
+/* M95: the .ko images plus the generated modules.dep / modules.alias. Modules
+ * must live in the initramfs, not the ext4 rootfs: the kernel loads the
+ * filesystem, sound and IPv6 modules during early boot, long before a real
+ * root is mounted. The RAM-constrained self-host build stages neither the .inc
+ * nor the modules and simply runs without them. */
+#ifndef MINIMAL_INITRAMFS
+#include "initramfs_modules.inc"
+#else
+#define B1NIX_MODULE_INITRAMFS_FILES
+#endif
 #ifdef B1NIX_MUSL
 #include "initramfs_ld_musl_x86_64_so_1.inc"
 #endif
@@ -25,6 +35,7 @@ static const struct initramfs_file files[] = {
      sizeof(vfs_ld_musl_x86_64_so_1), INITRAMFS_EXECUTABLE},
     {"/lib/libc.so", "/lib/ld-musl-x86_64.so.1", 25, INITRAMFS_SYMLINK},
 #endif
+    B1NIX_MODULE_INITRAMFS_FILES
     {"/sbin/.keep", "", 0, 0},
     {"/etc/init.d/.keep", "", 0, 0},
     {"/etc/conf.d/.keep", "", 0, 0},
@@ -86,6 +97,7 @@ static struct vfs_node *initramfs_mount_cb(const char *source, u64 flags,
 static struct vfs_fs initramfs_fs = {
     .name = "initramfs",
     .mount = initramfs_mount_cb,
+    .flags = VFS_FS_NODEV,
 };
 
 void initramfs_init(void) {

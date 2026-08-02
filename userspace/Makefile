@@ -240,6 +240,11 @@ BINARIES += $(BUILD)/bin/m73_smoke
 BINARIES += $(BUILD)/bin/m104_pam_smoke
 # M80: ptrace register sets, /proc/<pid>/task|auxv|mem, crash capture.
 BINARIES += $(BUILD)/bin/m80_smoke
+# M95/M96: the module utilities (multi-call: insmod/rmmod/lsmod/modinfo/modprobe)
+# and the two loadable-kernel-module smoke tests.
+BINARIES += $(BUILD)/bin/kmod
+BINARIES += $(BUILD)/bin/m95_smoke
+BINARIES += $(BUILD)/bin/m96_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke
@@ -1063,6 +1068,14 @@ endif
 		src=$${b%%:*}; dst=$${b##*:}; \
 		ln -sfn $$src $(ROOTFS)/bin/$$dst; \
 	done
+	@# M95: kmod is a multi-call binary; each utility is a name for it.
+	@mkdir -p $(ROOTFS)/sbin
+	@for b in insmod rmmod lsmod modinfo modprobe; do \
+		ln -sfn kmod $(ROOTFS)/bin/$$b; \
+	done
+	@ln -sfn /bin/kmod $(ROOTFS)/sbin/modprobe
+	@ln -sfn /bin/kmod $(ROOTFS)/sbin/insmod
+	@ln -sfn /bin/kmod $(ROOTFS)/sbin/rmmod
 	@mkdir -p $(ROOTFS)/home
 	cp hello_native.c $(ROOTFS)/home/
 	@if [ -f ../build/$(B1NIX_ARCH)/ports/musl/install/usr/lib/Scrt1.o ]; then \

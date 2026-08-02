@@ -170,6 +170,30 @@ void vfs_register_fs(struct vfs_fs *fs) {
   filesystems = fs;
 }
 
+usize vfs_list_filesystems(struct vfs_fs_info *out, usize max) {
+  usize n = 0;
+  for (struct vfs_fs *f = filesystems; f && n < max; f = f->next) {
+    out[n].name = f->name;
+    out[n].flags = f->flags;
+    n++;
+  }
+  return n;
+}
+
+void vfs_unregister_fs(struct vfs_fs *fs) {
+  if (!fs)
+    return;
+  struct vfs_fs **pp = &filesystems;
+  while (*pp) {
+    if (*pp == fs) {
+      *pp = fs->next;
+      fs->next = 0;
+      return;
+    }
+    pp = &(*pp)->next;
+  }
+}
+
 static struct vfs_fs *find_fs(const char *name) {
   struct vfs_fs *curr = filesystems;
   while (curr) {
@@ -1680,6 +1704,25 @@ void vfs_attach_child(struct vfs_node *parent, struct vfs_node *child) {
   vfs_tree_write_release(flags);
 }
 
+void vfs_detach_child(struct vfs_node *parent, struct vfs_node *child) {
+  if (!parent || !child)
+    return;
+  u64 flags;
+  vfs_tree_write_acquire(&flags);
+  struct vfs_node **pp = &parent->first_child;
+  while (*pp) {
+    if (*pp == child) {
+      *pp = child->next_sibling;
+      child->next_sibling = 0;
+      break;
+    }
+    pp = &(*pp)->next_sibling;
+  }
+  vfs_tree_write_release(flags);
+  /* A cached name→node entry would still resolve after the unlink. */
+  dcache_invalidate(parent, child->name);
+}
+
 isize vfs_readdir_children(struct vfs_node *dir, usize offset,
                            struct dirent *buf, usize max_entries) {
   if (!dir || !buf)
@@ -2208,7 +2251,7 @@ extern void fb_dev_init(void);
 extern void input_init(void);
 extern void drm_dev_init(void);
 extern void virtio_gpu_dev_init(void);
-extern void hda_dev_init(void);
+extern void sound_module_dev_init(void);
 extern void ac97_dev_init(void);
 
 void vfs_repopulate_after_root_mount(void) {
@@ -2279,7 +2322,7 @@ void vfs_repopulate_after_root_mount(void) {
 
   /* Sound device nodes (/dev/dsp, /dev/dsp1) created by hda_init/ac97_init
    * land on the initramfs root and are re-registered here, like fb/input. */
-  hda_dev_init();
+  sound_module_dev_init();
   ac97_dev_init();
 
   node = add_node("/home", VFS_DIRECTORY, 0, 0, 0);

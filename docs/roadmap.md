@@ -763,22 +763,19 @@ Status:
 
 ## M95: Loadable Kernel Modules — Framework and Device/FS Modules
 
-- [ ] `planned` `module_alloc` and Module Region (`0xFFFFFFFFC0000000` range, W^X).
-- [ ] `planned` `struct module` Descriptor and Module List (`load_module`, `delete_module`).
-- [ ] `planned` `EXPORT_SYMBOL` Table and Reference Counting (`try_module_get`/`module_put`).
-- [ ] `planned` `init_module` / `finit_module` / `delete_module` Syscalls and vermagic.
-- [ ] `planned` `/proc/modules` and userspace `modinfo`/`lsmod`/`insmod`/`rmmod`.
-- [ ] `planned` Convert Optional Filesystems (`ntfs`, `btrfs`, `isofs`) to `.ko` modules.
-- [ ] `planned` Convert Optional Device Drivers (HDA sound driver) to `.ko` modules.
-- [ ] `planned` M96 Smoke Test for LKM framework.
+- [x] Module region at `0xFFFFFFFFC0000000` (128 MiB, PML4 slot 511 so every address space shares its page tables) with real W^X: `module_alloc` hands out RW+NX pages, the loader re-protects the text span RX once relocation is done. Needed EFER.NXE, now enabled on the BSP (`boot.S`) and every AP (`ap_trampoline.S`, `x86_syscall_init`) behind a CPUID check.
+- [x] `ET_REL` (`.ko`) loader in `kernel/module/module.c`: section layout, symbol resolution against the kernel's `EXPORT_SYMBOL` table plus already-loaded modules, R_X86_64_{64,PC32,PLT32,32,32S,PC64,GOTPCRELX} relocations, `.modinfo` vermagic gate, `struct module` list with `try_module_get`/`module_put` (a referenced module cannot be removed).
+- [x] `init_module(2)` / `finit_module(2)` / `delete_module(2)` — native 243/245/244 and the Linux ABI numbers 175/313/176 — all gated on `CAP_SYS_MODULE`. `/proc/modules` is real, `/proc/filesystems` now enumerates the live registry instead of a hardcoded list, and `/bin/kmod` is a multi-call `insmod`/`rmmod`/`lsmod`/`modinfo`/`modprobe`.
+- [x] `ntfs`, `btrfs`, `isofs` and the Intel HDA sound driver ship as `.ko` in the initramfs and the rootfs; the kernel loads them at boot through `request_module`, and boots and passes its tests with any of them absent. `tools/kernel/check-module-syms.sh` fails the build (not the insmod) on an unexported symbol.
+- [x] `M95-SMOKE` covers the framework end to end, including a vermagic-corrupted module being rejected and an unprivileged `delete_module` reporting `EPERM`.
 
 ## M96: Loadable Kernel Modules — Network Protocols and Module Parameters
 
-- [ ] `planned` Network Protocol Module Scaffolding (`proto_register`, IPv6, NDP, NTP).
-- [ ] `planned` `module_param` Parameters exposed via `/sys/module/<name>/parameters/`.
-- [ ] `planned` `request_module` kernel call and shell `modprobe` alias naming.
-- [ ] `planned` Module Dependencies parsing (`depends=`) and `modules.dep`.
-- [ ] `planned` M97 Smoke Test for network protocol modules and params.
+- [x] `proto_register` scaffolding (`kernel/net/proto.c` + `<b1nix/netproto.h>`): the L2 demux, the net daemon's tick, the loopback drain and the IPv6 transmit path all dispatch through the registry, so IPv6, NDP and NTP could move into `ipv6.ko`, `ndp.ko` and `ntp.ko`. Unregistration drains in-flight dispatches before the module's text is freed.
+- [x] `module_param` exposed at `/sys/module/<name>/parameters/<name>`, readable and — where the permission bits allow — writable (`ipv6_hop_limit`, `ntp_server_name`, `hda_tone_ms` writable; `hda_sample_rate`, `hda_dam_buf_sz` read-only). Parameters can also be set on the `insmod` command line; an unknown name fails the load.
+- [x] In-kernel `request_module` (loads from `/lib/modules`, resolving aliases and dependencies) plus a userspace `modprobe` with `-r`, both reading the same index files.
+- [x] `modules.dep` and `modules.alias` are generated from the objects themselves (`tools/kernel/gen_modules_initramfs.sh`) — a dependency is an undefined symbol another module `EXPORT_SYMBOL`s, so `ndp: ipv6` falls out of the code rather than a hand-written list.
+- [x] `M96-SMOKE` covers protocol modules, sysfs parameters (read, write, read-only rejection, insmod-time), `modules.dep`, alias resolution and dependency-ordered `modprobe`.
 
 ## M97: GNU-Free ISO (Limine bootloader + BSD build tools)
 

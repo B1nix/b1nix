@@ -1,4 +1,5 @@
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/netdev.h>
 #include <b1nix/console.h>
 
@@ -28,6 +29,7 @@ void ethernet_receive(const void *data, usize size)
 	} else if (ethertype == ETHERTYPE_IPV4) {
 		ipv4_receive(payload, payload_size);
 	} else if (ethertype == ETHERTYPE_IPV6) {
-		ipv6_receive(payload, payload_size);
+		/* M96: served by ipv6.ko when it is loaded. */
+		proto_deliver_ether(ETHERTYPE_IPV6, payload, payload_size);
 	}
 }

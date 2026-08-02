@@ -2,6 +2,7 @@
 #include <b1nix/errno.h>
 #include <b1nix/mm.h>
 #include <b1nix/net.h>
+#include <b1nix/netproto.h>
 #include <b1nix/resource_caps.h>
 #include <b1nix/sched.h>
 #include <b1nix/posix.h>
@@ -245,7 +246,7 @@ static void tcp_l3_send(u8 family, struct ipv4_addr v4,
                         const struct in6_addr_k *v6, const void *pkt,
                         usize len) {
   if (family == B1NIX_AF_INET6)
-    ipv6_send(*v6, IP_PROTO_TCP, pkt, len);
+    net_proto_ipv6_send(*v6, IP_PROTO_TCP, pkt, len);
   else
     ipv4_send(v4, IP_PROTO_TCP, pkt, len);
 }
