@@ -35,6 +35,13 @@ struct vfs_handle;
 #define IN_ISDIR         0x40000000
 #define IN_ALL_EVENTS    0x00000fff
 
+/* Watch-add modifiers (Linux ABI). */
+#define IN_ONLYDIR       0x01000000
+#define IN_DONT_FOLLOW   0x02000000
+#define IN_EXCL_UNLINK   0x04000000
+#define IN_MASK_ADD      0x20000000
+#define IN_ONESHOT       0x80000000
+
 /* inotify_init1 / fd flags (Linux ABI). */
 #define IN_CLOEXEC  0x00080000
 #define IN_NONBLOCK 0x00000800
@@ -57,3 +64,8 @@ int vfs_inotify_rm_watch(int fd, int wd);
  * directory for create/delete with `name` set). Cheap no-op when no inotify
  * instances are active. */
 void vfs_inotify_notify(struct vfs_node *node, u32 mask, const char *name);
+/* Rename: the two halves share a cookie so a watcher can pair them, which is
+ * the whole point of IN_MOVED_FROM/IN_MOVED_TO. */
+void vfs_inotify_notify_move(struct vfs_node *old_dir, const char *old_name,
+                             struct vfs_node *new_dir, const char *new_name,
+                             int is_dir);

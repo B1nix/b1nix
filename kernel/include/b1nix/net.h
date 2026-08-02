@@ -54,6 +54,26 @@ int arp_resolve(struct ipv4_addr ip, struct mac_addr *mac);
 int arp_resolve_dev(struct ipv4_addr ip, struct mac_addr *mac,
                     struct netdev *dev);
 
+/* M107: neighbour-table enumeration and administration, shared by the IPv4 ARP
+ * cache. (The IPv6 NDP cache has no enumeration API yet, so `ip -6 neigh`
+ * reports an empty table rather than a fabricated one.) `permanent` marks an
+ * entry installed by hand (`ip neigh add`) rather than learned from the wire:
+ * it reports NUD_PERMANENT and is never overwritten by a learned reply. */
+struct neigh_info {
+	u8 family; /* B1NIX_AF_INET or B1NIX_AF_INET6 */
+	u8 addr[16];
+	u8 addr_len; /* 4 or 16 */
+	u8 permanent;
+	struct mac_addr mac;
+	int oif;
+};
+
+usize arp_snapshot(struct neigh_info *out, usize max);
+/* Install (or replace) a neighbour entry. `permanent` != 0 pins it. */
+int arp_neigh_set(struct ipv4_addr ip, struct mac_addr mac, int permanent);
+/* Remove one entry; 0 on success, -ESRCH when the address is not cached. */
+int arp_neigh_del(struct ipv4_addr ip);
+
 // IPv4
 void ipv4_receive(const void *data, usize size);
 void ipv4_send(struct ipv4_addr dst, u8 protocol, const void *payload, usize size);

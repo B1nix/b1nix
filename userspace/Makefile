@@ -242,6 +242,9 @@ BINARIES += $(BUILD)/bin/m104_pam_smoke
 BINARIES += $(BUILD)/bin/m80_smoke
 # M86: per-thread CPU accounting, tkill/tgkill, pthread_exit return values.
 BINARIES += $(BUILD)/bin/m86_smoke
+# M107: netlink, VTs/console fonts, loop devices, /proc fd+maps, kmsg/syslog,
+# inotify, RTC + watchdog, i2c.
+BINARIES += $(BUILD)/bin/m107_smoke
 # M98: GNU-free build tools (bmake as /bin/make, samurai as /bin/samu|ninja).
 BINARIES += $(BUILD)/bin/m98_smoke
 BINARIES += $(BUILD)/bin/m63_smoke

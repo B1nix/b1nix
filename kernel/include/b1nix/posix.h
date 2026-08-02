@@ -181,6 +181,16 @@ struct b1nix_sockaddr_un {
   char sun_path[108];
 };
 
+/* AF_NETLINK address (12 bytes). getsockname() must report exactly this size:
+ * libnetlink's rtnl_open() compares the returned length against
+ * sizeof(struct sockaddr_nl) and gives up when it differs. */
+struct b1nix_sockaddr_nl {
+  u16 nl_family;
+  u16 nl_pad;
+  u32 nl_pid;
+  u32 nl_groups;
+};
+
 struct b1nix_utsname {
   char sysname[32];
   char nodename[32];

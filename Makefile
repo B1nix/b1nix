@@ -465,6 +465,11 @@ KERNEL_SOURCES += \
 	kernel/dev/ahci.c \
 	kernel/dev/nvme.c \
 	kernel/dev/ps2_kbd.c \
+	kernel/dev/vt.c \
+	kernel/dev/kmsg.c \
+	kernel/dev/rtc_dev.c \
+	kernel/dev/watchdog.c \
+	kernel/dev/i2c.c \
 	kernel/dev/ps2_mouse.c \
 	kernel/dev/usb_xhci.c \
 	kernel/dev/hda.c \
@@ -479,6 +484,7 @@ KERNEL_SOURCES += \
 	kernel/dev/input.c \
 	kernel/net/net.c \
 	kernel/net/socket.c \
+	kernel/net/netlink.c \
 	kernel/net/unix.c \
 	kernel/net/arp.c \
 	kernel/net/ethernet.c \

@@ -20,6 +20,7 @@ void coredump_write(struct interrupt_frame *frame, int sig);
 #include <b1nix/sched.h>
 #include <b1nix/spinlock.h>
 #include <b1nix/serial_tty.h>
+#include <b1nix/watchdog.h>
 #include <b1nix/net.h>
 #include <b1nix/tlb.h>
 #include <b1nix/types.h>
@@ -445,6 +446,8 @@ static void x86_irq_handler_inner(struct interrupt_frame *frame) {
       if (timer_ticks % 50 == 0) {
         fb_console_blink_cursor();
       }
+      /* M107: /dev/watchdog is a real deadline, checked once per tick. */
+      watchdog_tick();
 
       /* Drain input BEFORE scheduler_on_timer_tick: the tick may context-
        * switch away (T8) and delay anything placed after it. */

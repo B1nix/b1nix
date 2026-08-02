@@ -5,6 +5,7 @@
 #include <b1nix/initramfs.h>
 #include <b1nix/io.h>
 #include <b1nix/klog.h>
+#include <b1nix/kmsg.h>
 #include <b1nix/linux_abi.h>
 #include <b1nix/mm.h>
 #include <b1nix/mqueue.h>
@@ -4207,28 +4208,13 @@ static u64 syscall_dispatch_impl_inner(u64 number, u64 arg0, u64 arg1, u64 arg2,
         }
         return 0;
       }
-      /* klogctl(103)(type, bufp, len): busybox dmesg. Map the READ actions onto
-       * klog_read (the native SYS_DMESG path), report the ring capacity for
-       * SIZE_BUFFER, and accept the console-control actions as no-ops. */
+      /* klogctl(103)(type, bufp, len): dmesg, klogd and logread. Served from
+       * the structured record ring (kernel/dev/kmsg.c) so a reader gets whole
+       * messages with priorities and sequence numbers, and READ really
+       * consumes what it returns. */
       if (number == 103) {
         int type = (int)arg0;
-        if (type == 10) /* SYSLOG_ACTION_SIZE_BUFFER */
-          return (u64)KLOG_BUF_SIZE;
-        if (type == 2 || type == 3 || type == 4) { /* READ / READ_ALL / READ_CLEAR */
-          u64 buf = arg1, len = arg2;
-          if (!buf || len == 0)
-            return (u64)-EINVAL;
-          if (len > KLOG_BUF_SIZE)
-            len = KLOG_BUF_SIZE;
-          if (!is_user_range_valid((const void *)(usize)buf, len, 1))
-            return (u64)-EFAULT;
-          static char klogctl_tmp[KLOG_BUF_SIZE];
-          usize copied = klog_read(klogctl_tmp, (usize)len);
-          if (syscall_copyout((void *)(usize)buf, klogctl_tmp, copied) != 0)
-            return (u64)-EFAULT;
-          return (u64)copied;
-        }
-        return 0; /* open(1)/close(0)/console-level actions: accept */
+        return (u64)kmsg_syslog(type, (char *)(usize)arg1, (int)arg2);
       }
 
       /* --- M92: *at() syscall emulation for musl ---

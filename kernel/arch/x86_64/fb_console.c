@@ -125,13 +125,54 @@ void fb_console_clear(void)
 
 static const u32 FONT_SCALE = 1;
 
+/* M107: the console face is replaceable at runtime (setfont / PIO_FONT /
+ * KDFONTOP). The builtin 8x8 bitmap is the default; a loaded face is 8 pixels
+ * wide, up to FB_FONT_MAX_H rows tall, and carries up to 256 glyphs. `stride`
+ * is the per-glyph byte pitch in the caller's buffer: 32 for the PIO_FONT
+ * layout, equal to the height for a packed one. */
+#define FB_FONT_MAX_H 16
+static const u8 *g_font = &font8x8_basic[0][0];
+static u32 g_font_h = 8;
+static u32 g_font_stride = 8;
+static u32 g_font_count = 128;
+
+/* Cell height in pixels — the vertical advance and the scroll unit. */
+#define FB_CELL_H (g_font_h * FONT_SCALE)
+
+const u8 *fb_console_builtin_font(void) { return &font8x8_basic[0][0]; }
+
+void fb_console_font_metrics(u32 *height, u32 *count)
+{
+	if (height) *height = g_font_h;
+	if (count) *count = g_font_count;
+}
+
+int fb_console_set_font(const u8 *glyphs, u32 height, u32 stride, u32 count)
+{
+	if (!glyphs) {
+		g_font = &font8x8_basic[0][0];
+		g_font_h = 8;
+		g_font_stride = 8;
+		g_font_count = 128;
+		return 0;
+	}
+	if (height == 0 || height > FB_FONT_MAX_H || stride < height ||
+	    count == 0 || count > 256)
+		return -1;
+	g_font = glyphs;
+	g_font_h = height;
+	g_font_stride = stride;
+	g_font_count = count;
+	return 0;
+}
+
 static void fb_draw_char(char c, u32 x, u32 y)
 {
-    if ((unsigned char)c > 127) c = '?';
-    const u8 *glyph = font8x8_basic[(int)c];
+    if ((unsigned char)c >= g_font_count) c = '?';
+    const u8 *glyph = g_font + (usize)(unsigned char)c * g_font_stride;
     u32 bytes_per_px = fb.bpp / 8;
 
-    for (u32 cy = 0; cy < 8; cy++) {
+    for (u32 cy = 0; cy < g_font_h; cy++) {
         for (u32 dy = 0; dy < FONT_SCALE; dy++) {
             u32 py = y + cy * FONT_SCALE + dy;
             if (py >= fb.height) continue;
@@ -155,7 +196,7 @@ static void fb_draw_char(char c, u32 x, u32 y)
 
 static void fb_console_scroll(void)
 {
-    u32 line_height = 8 * FONT_SCALE;
+    u32 line_height = FB_CELL_H;
     if (fb.height < line_height) return;
 
     u32 bytes_per_line = fb.pitch;
@@ -187,7 +228,7 @@ static void fb_console_erase_cursor(void)
 {
     if (!fb_ptr || !cursor_visible) return;
     
-    u32 y_base = cursor_y + 7 * FONT_SCALE;
+    u32 y_base = cursor_y + (g_font_h - 1) * FONT_SCALE;
     for (u32 dy = 0; dy < FONT_SCALE; dy++) {
         for (u32 dx = 0; dx < 8 * FONT_SCALE; dx++) {
             u32 px = cursor_x + dx;
@@ -214,7 +255,7 @@ void fb_console_blink_cursor(void)
     cursor_visible = !cursor_visible;
     u32 color = cursor_visible ? fg_color : bg_color;
 
-    u32 y_base = cursor_y + 7 * FONT_SCALE;
+    u32 y_base = cursor_y + (g_font_h - 1) * FONT_SCALE;
     for (u32 dy = 0; dy < FONT_SCALE; dy++) {
         for (u32 dx = 0; dx < 8 * FONT_SCALE; dx++) {
             u32 px = cursor_x + dx;
@@ -255,7 +296,7 @@ void fb_console_putchar(char c)
             } else if (c == 'H') {
                 int row = ansi_params[0] > 0 ? ansi_params[0] - 1 : 0;
                 int col = ansi_params[1] > 0 ? ansi_params[1] - 1 : 0;
-                cursor_y = row * 8 * FONT_SCALE;
+                cursor_y = row * FB_CELL_H;
                 cursor_x = col * 8 * FONT_SCALE;
             } else if (c == 'm') {
                 for (int i = 0; i <= ansi_param_idx; i++) {
@@ -294,7 +335,7 @@ void fb_console_putchar(char c)
 
     if (c == '\n') {
         cursor_x = 0;
-        cursor_y += 8 * FONT_SCALE;
+        cursor_y += FB_CELL_H;
     } else if (c == '\r') {
         cursor_x = 0;
     } else if (c == '\b') {
@@ -306,11 +347,11 @@ void fb_console_putchar(char c)
         cursor_x += 8 * FONT_SCALE;
         if (cursor_x >= fb.width) {
             cursor_x = 0;
-            cursor_y += 8 * FONT_SCALE;
+            cursor_y += FB_CELL_H;
         }
     }
 
-    while (cursor_y + 8 * FONT_SCALE > fb.height) {
+    while (cursor_y + FB_CELL_H > fb.height) {
         fb_console_scroll();
     }
 }

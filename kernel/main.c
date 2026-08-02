@@ -33,6 +33,15 @@
 #include <b1nix/errno.h>
 #include <b1nix/isofs.h>
 #include <b1nix/loop.h>
+#include <b1nix/vt.h>
+#include <b1nix/rtc.h>
+#include <b1nix/kmsg.h>
+#include <b1nix/watchdog.h>
+#include <b1nix/i2c.h>
+#include <b1nix/vt.h>
+#include <b1nix/kmsg.h>
+#include <b1nix/watchdog.h>
+#include <b1nix/i2c.h>
 #include <b1nix/mqueue.h>
 #include <b1nix/shm.h>
 #include <b1nix/resource_caps.h>
@@ -319,6 +328,11 @@ void kernel_main(usize arg0, usize arg1)
 	virtio_gpu_dev_init(); /* M53: /dev/virtio-gpu userspace VirGL 3D transport */
 	ramdisk_init();
 	loop_init();            /* loop block devices + /dev/loop-control */
+	vt_init();              /* M107 virtual terminals + console font/keymap */
+	kmsg_init();            /* M107 /dev/kmsg record ring */
+	rtc_dev_init();         /* M107 /dev/rtc0 */
+	watchdog_init();        /* M107 /dev/watchdog */
+	i2c_init();             /* M107 SMBus host controller, if one exists */
 	blk_create_dev_nodes(); /* /dev/<blkdev> nodes for blkid/fdisk/loopN */
 	if (bootinfo_has_flag("b1nix.diskbench")) {
 		const char *db_argv[] = {"diskbench", 0};
